@@ -1,0 +1,87 @@
+[package]
+name = "locus"
+version = "0.1.0"
+description = "A opensource unity dev agent"
+authors = ["dot"]
+edition = "2021"
+license = "GPL-3.0-or-later"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "locus_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+aisdk = { version = "0.5.2", features = ["openrouter"] }
+rusqlite = { version = "0.38.0", features = ["bundled"] }
+uuid = { version = "1.22.0", features = ["v4", "serde"] }
+futures = "0.3.32"
+walkdir = "2.5.0"
+ignore = "0.4"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json", "stream", "blocking", "native-tls", "http2", "gzip", "deflate"], default-features = false }
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+hyper-util = { version = "0.1", features = ["client-proxy", "client-proxy-system", "client-legacy", "tokio"] }
+native-tls = "0.2"
+tokio-native-tls = "0.3"
+tower-service = "0.3"
+url = "2"
+http = "1"
+glob = "0.3"
+regex = "1"
+sha2 = "0.10"
+base64 = "0.22"
+rand = "0.8"
+dirs = "5"
+chrono = { version = "0.4", features = ["serde"] }
+tauri-plugin-dialog = "2.6.0"
+rayon = "1.10"
+blake3 = "1"
+notify = "8"
+dunce = "1"
+keyring = { version = "3", features = ["windows-native", "apple-native", "sync-secret-service"] }
+anyhow = "1"
+thiserror = "2"
+similar = "2"
+indexmap = { version = "2", features = ["serde"] }
+tantivy = "0.26"
+font-kit = "0.14"
+fastembed = { version = "5.13.2", default-features = false, features = ["hf-hub-native-tls", "ort-download-binaries-native-tls", "directml"] }
+hf-hub = { version = "0.4.3", default-features = false, features = ["ureq", "native-tls"] }
+ureq = { version = "2.12.1", default-features = false, features = ["native-tls"] }
+tree-sitter = "0.25"
+# Pinned: the parser in src/unity_csharp/parser.rs depends on the named-node
+# layout (`modifier`, `attribute_list`, `variable_declaration`, etc.) of this
+# specific grammar release. A patch bump can silently rename or restructure
+# nodes, which would cause `collect_modifiers` and friends to return empty
+# without any compile error. Re-run the unity_csharp tests after bumping.
+tree-sitter-c-sharp = "=0.23.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "std"] }
+html2md = "0.2.15"
+zip = { version = "2.2.0", default-features = false, features = ["deflate"] }
+ndarray = "0.17.2"
+tokenizers = { version = "0.22.2", default-features = false, features = ["onig"] }
+socket2 = "0.5"
+sys-locale = "0.3.2"
+
+# Keep this pinned to rc.11 because fastembed 5.13.2 still depends on the same
+# ort/ort-sys pair upstream; rc.12 would create an unresolved onnxruntime links conflict.
+[target.'cfg(windows)'.dependencies]
+ort = { version = "=2.0.0-rc.11", default-features = false, features = ["directml", "copy-dylibs", "preload-dylibs"] }
+windows = { version = "0.61.3", features = ["Win32_Graphics_Dxgi", "Win32_Storage_FileSystem"] }
+
+[dev-dependencies]
+tempfile = "3"

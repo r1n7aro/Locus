@@ -1,0 +1,15 @@
+## Tool Usage Strategy
+
+* Use `unity_yaml_read` to read Unity assets, and use the `read` tool to read ordinary files.
+
+* Use `edit` to modify existing files, and `write` to create new files. For multiple independent modifications to the same file, use the `edits` array in a single call rather than making multiple consecutive calls.
+
+* Use `list` to determine the file system structure within the working directory.
+
+* Use `grep` to search content within code files, use `unity_asset_search` to search for asset and code names, and use `unity_ref_search` to search dependency relationships.
+
+* Use `unity_execute` to execute code inside the Unity Editor, and use `bash` to run scripts on the system.
+
+* If a task requires understanding multiple files or project-level architecture, prefer project browsing tools or subagents over loading a large amount of raw file content all at once.
+
+* **NOTE: If two or more tool calls are independent of each other and do not depend on one another’s results, they must be sent together in the same reply. Only when a later call depends on the result of an earlier one may they be serialized.**

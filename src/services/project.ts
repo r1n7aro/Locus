@@ -1,0 +1,63 @@
+import { ipcInvoke } from "./ipc";
+
+export interface DirEntry {
+  relPath: string;
+  name: string;
+  isDir: boolean;
+}
+
+export interface DirEntriesPage {
+  entries: DirEntry[];
+  totalCount: number;
+  nextOffset: number;
+  hasMore: boolean;
+}
+
+export interface WorkspaceSearchEntry {
+  relPath: string;
+  name: string;
+  parentPath: string;
+  isDir: boolean;
+  matchScore: number;
+}
+
+export function getWorkingDir(): Promise<string> {
+  return ipcInvoke<string>("get_working_dir");
+}
+
+export function setWorkingDir(path: string): Promise<string> {
+  return ipcInvoke<string>("set_working_dir", { path });
+}
+
+export function listRecentDirs(): Promise<string[]> {
+  return ipcInvoke<string[]>("list_recent_dirs");
+}
+
+export function listDirEntries(subPath: string): Promise<DirEntry[]> {
+  return ipcInvoke<DirEntry[]>("list_dir_entries", { subPath });
+}
+
+export function listDirEntriesPage(
+  subPath: string,
+  offset = 0,
+  limit = 200,
+  excludeMeta = false,
+): Promise<DirEntriesPage> {
+  return ipcInvoke<DirEntriesPage>("list_dir_entries_page", {
+    subPath,
+    offset,
+    limit,
+    excludeMeta,
+  });
+}
+
+export function searchWorkspaceEntries(
+  query: string,
+  limit = 200,
+): Promise<WorkspaceSearchEntry[]> {
+  return ipcInvoke<WorkspaceSearchEntry[]>("search_workspace_entries", { query, limit });
+}
+
+export function resetAllConfig(): Promise<void> {
+  return ipcInvoke("reset_all_config");
+}

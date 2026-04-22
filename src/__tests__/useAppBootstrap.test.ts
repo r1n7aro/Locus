@@ -1,0 +1,348 @@
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { reactive } from "vue";
+import { useAppBootstrap } from "../composables/useAppBootstrap";
+
+let uiStoreMock: any;
+let authStoreMock: any;
+let agentStoreMock: any;
+let modelStoreMock: any;
+let projectStoreMock: any;
+let chatStoreMock: any;
+let notificationStoreMock: any;
+let loadSkillsMock: ReturnType<typeof vi.fn>;
+
+vi.mock("@tauri-apps/api/event", () => ({
+  listen: vi.fn(),
+}));
+
+vi.mock("@tauri-apps/api/webviewWindow", () => ({
+  WebviewWindow: class {
+    constructor(..._args: any[]) {}
+    once(..._args: any[]) {}
+  },
+}));
+
+vi.mock("../services/canvas", () => ({
+  canvasSetSpec: vi.fn(),
+}));
+
+vi.mock("../stores/ui", () => ({
+  useUiStore: () => uiStoreMock,
+}));
+
+vi.mock("../stores/auth", () => ({
+  useAuthStore: () => authStoreMock,
+}));
+
+vi.mock("../stores/agent", () => ({
+  useAgentStore: () => agentStoreMock,
+}));
+
+vi.mock("../stores/model", () => ({
+  useModelStore: () => modelStoreMock,
+}));
+
+vi.mock("../stores/project", () => ({
+  useProjectStore: () => projectStoreMock,
+}));
+
+vi.mock("../stores/chat", () => ({
+  useChatStore: () => chatStoreMock,
+}));
+
+vi.mock("../stores/notification", () => ({
+  useNotificationStore: () => notificationStoreMock,
+}));
+
+vi.mock("../composables/useSkills", () => ({
+  useSkills: () => ({
+    skillItems: [],
+    loadSkills: loadSkillsMock,
+  }),
+}));
+
+vi.mock("../services/errors", () => ({
+  normalizeAppError: (error: unknown) => error,
+}));
+
+vi.mock("../composables/warmupCache", () => ({
+  setScope: vi.fn(),
+  setWarmup: vi.fn(),
+  clearWarmup: vi.fn(),
+}));
+
+vi.mock("../services/auth", () => ({
+  getProviders: vi.fn(),
+  codexStatus: vi.fn(),
+}));
+
+vi.mock("../services/model", () => ({
+  getModelDefaults: vi.fn(),
+  getCustomEndpoints: vi.fn(),
+}));
+
+vi.mock("../services/permissions", () => ({
+  getToolPermissions: vi.fn(),
+}));
+
+vi.mock("../services/git", () => ({
+  gitProbe: vi.fn(),
+  gitHistorySnapshot: vi.fn(),
+  gitStatus: vi.fn(),
+  gitBranches: vi.fn(),
+  gitSubmodules: vi.fn(),
+}));
+
+vi.mock("../services/knowledge", () => ({
+  knowledgeList: vi.fn(),
+  knowledgeListPage: vi.fn().mockResolvedValue({
+    items: [],
+    nextCursor: null,
+  }),
+  knowledgeGetLexicalRebuildStatus: vi.fn().mockResolvedValue({
+    running: false,
+    stage: null,
+    detail: null,
+    currentFile: null,
+    processedDocs: null,
+    totalDocs: null,
+    error: null,
+    startedAt: null,
+    completedAt: null,
+  }),
+}));
+
+vi.mock("../services/knowledgeLexicalProgressWindow", () => ({
+  getKnowledgeLexicalProgressRunKey: vi.fn().mockReturnValue(""),
+  isKnowledgeLexicalProgressWindowLocation: () => false,
+  openKnowledgeLexicalProgressWindow: vi.fn().mockResolvedValue(undefined),
+  shouldAutoOpenKnowledgeLexicalProgressWindow: vi.fn().mockReturnValue(false),
+}));
+
+vi.mock("../services/agent", () => ({
+  listAgents: vi.fn(),
+  listSubagentDefs: vi.fn(),
+}));
+
+vi.mock("../config/providerVisibility", () => ({
+  filterVisibleProviders: (providers: unknown) => providers,
+}));
+
+describe("useAppBootstrap onboarding completion", () => {
+  beforeEach(() => {
+    loadSkillsMock = vi.fn().mockResolvedValue(undefined);
+
+    uiStoreMock = reactive({
+      activeTab: "chat",
+      completeOnboarding: vi.fn(),
+      init: vi.fn().mockResolvedValue(undefined),
+      setTab: vi.fn(),
+      cleanup: vi.fn(),
+    });
+
+    authStoreMock = reactive({
+      checkAuth: vi.fn().mockResolvedValue([]),
+    });
+
+    agentStoreMock = reactive({
+      selectedAgentId: "",
+      agents: [],
+      loadAgents: vi.fn().mockResolvedValue(undefined),
+    });
+
+    modelStoreMock = reactive({
+      effort: "none",
+      loadModelDefaults: vi.fn().mockResolvedValue(undefined),
+      loadLastModel: vi.fn().mockResolvedValue(undefined),
+      loadLastEffort: vi.fn().mockResolvedValue(undefined),
+      loadCustomEndpoints: vi.fn().mockResolvedValue(undefined),
+      loadCodexModelConfig: vi.fn().mockResolvedValue(undefined),
+      resolveSelectedModel: vi.fn(),
+    });
+
+    projectStoreMock = reactive({
+      workingDir: "",
+      loadWorkingDir: vi.fn().mockResolvedValue(undefined),
+      loadRecentDirs: vi.fn().mockResolvedValue(undefined),
+      checkUnityConnection: vi.fn().mockResolvedValue(undefined),
+      checkUnityPlugin: vi.fn().mockResolvedValue(undefined),
+      loadAssetDbStatus: vi.fn().mockResolvedValue(undefined),
+    });
+
+    chatStoreMock = reactive({
+      refreshSessions: vi.fn().mockResolvedValue(undefined),
+      loadToolPermissionMode: vi.fn().mockResolvedValue(undefined),
+      setCanvasAutoOpenCallback: vi.fn(),
+      cleanupAnim: vi.fn(),
+    });
+
+    notificationStoreMock = {
+      addNotice: vi.fn(),
+    };
+  });
+
+  it("reloads sessions after onboarding completes", async () => {
+    const { onOnboardingCompleted } = useAppBootstrap();
+
+    await onOnboardingCompleted();
+
+    expect(uiStoreMock.completeOnboarding).toHaveBeenCalledTimes(1);
+    expect(modelStoreMock.loadLastEffort).toHaveBeenCalledTimes(1);
+    expect(chatStoreMock.refreshSessions).toHaveBeenCalledTimes(1);
+    expect(projectStoreMock.loadWorkingDir).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows sticky startup banners when auth restore fails", async () => {
+    authStoreMock.checkAuth.mockResolvedValue([
+      {
+        target: "providers",
+        error: {
+          code: "providers_failed",
+          message: "keychain unavailable",
+          retryable: false,
+          severity: "error",
+        },
+      },
+      {
+        target: "codex",
+        error: {
+          code: "codex_failed",
+          message: "device auth missing",
+          retryable: false,
+          severity: "error",
+        },
+      },
+    ]);
+
+    const { bootstrapCritical } = useAppBootstrap();
+
+    await bootstrapCritical();
+
+    expect(notificationStoreMock.addNotice).toHaveBeenNthCalledWith(
+      1,
+      "error",
+      expect.stringContaining("keychain unavailable"),
+      expect.objectContaining({
+        code: "providers_failed",
+        operation: "startup-auth-providers",
+        sticky: true,
+        replaceOperation: true,
+      }),
+    );
+    expect(notificationStoreMock.addNotice).toHaveBeenNthCalledWith(
+      2,
+      "error",
+      expect.stringContaining("device auth missing"),
+      expect.objectContaining({
+        code: "codex_failed",
+        operation: "startup-auth-codex",
+        sticky: true,
+        replaceOperation: true,
+      }),
+    );
+  });
+
+  it("treats missing auth failure results as an empty list", async () => {
+    authStoreMock.checkAuth.mockResolvedValue(undefined);
+
+    const { bootstrapCritical } = useAppBootstrap();
+
+    await expect(bootstrapCritical()).resolves.toBeUndefined();
+    expect(notificationStoreMock.addNotice).not.toHaveBeenCalled();
+  });
+
+  it("loads the global tool permission mode before auth unlocks the main shell", async () => {
+    const { bootstrapCritical } = useAppBootstrap();
+
+    await bootstrapCritical();
+
+    expect(chatStoreMock.loadToolPermissionMode).toHaveBeenCalledTimes(1);
+    expect(modelStoreMock.loadLastEffort).toHaveBeenCalledTimes(1);
+    expect(
+      agentStoreMock.loadAgents.mock.invocationCallOrder[0],
+    ).toBeLessThan(modelStoreMock.loadLastEffort.mock.invocationCallOrder[0]);
+    expect(
+      chatStoreMock.loadToolPermissionMode.mock.invocationCallOrder[0],
+    ).toBeLessThan(authStoreMock.checkAuth.mock.invocationCallOrder[0]);
+  });
+
+  it("auto-opens the lexical progress window only once per rebuild run", async () => {
+    vi.useFakeTimers();
+
+    try {
+      projectStoreMock.workingDir = "F:/Project";
+
+      const eventModule = await import("@tauri-apps/api/event");
+      const knowledgeModule = await import("../services/knowledge");
+      const progressWindowModule =
+        await import("../services/knowledgeLexicalProgressWindow");
+
+      (
+        eventModule.listen as unknown as ReturnType<typeof vi.fn>
+      ).mockResolvedValue(vi.fn());
+      (
+        knowledgeModule.knowledgeGetLexicalRebuildStatus as unknown as ReturnType<
+          typeof vi.fn
+        >
+      )
+        .mockResolvedValueOnce({
+          running: true,
+          stage: "preparing",
+          detail: "Preparing docs",
+          currentFile: null,
+          processedDocs: 24,
+          totalDocs: 4096,
+          error: null,
+          startedAt: "2026-04-16T00:00:00Z",
+          completedAt: null,
+        })
+        .mockResolvedValueOnce({
+          running: true,
+          stage: "committing",
+          detail: "Committing docs",
+          currentFile: null,
+          processedDocs: 4096,
+          totalDocs: 4096,
+          error: null,
+          startedAt: "2026-04-16T00:00:00Z",
+          completedAt: null,
+        });
+      (
+        progressWindowModule.shouldAutoOpenKnowledgeLexicalProgressWindow as unknown as ReturnType<
+          typeof vi.fn
+        >
+      ).mockReturnValue(true);
+      (
+        progressWindowModule.getKnowledgeLexicalProgressRunKey as unknown as ReturnType<
+          typeof vi.fn
+        >
+      ).mockImplementation(
+        (
+          status:
+            | { running?: boolean; startedAt?: string | null }
+            | null
+            | undefined,
+        ) => (status?.running ? (status.startedAt ?? "active") : ""),
+      );
+
+      const { registerListeners, cleanup } = useAppBootstrap();
+      await registerListeners();
+
+      vi.advanceTimersByTime(180);
+      await Promise.resolve();
+      expect(
+        progressWindowModule.openKnowledgeLexicalProgressWindow,
+      ).toHaveBeenCalledTimes(1);
+
+      vi.advanceTimersByTime(700);
+      await Promise.resolve();
+      expect(
+        progressWindowModule.openKnowledgeLexicalProgressWindow,
+      ).toHaveBeenCalledTimes(1);
+
+      cleanup();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});

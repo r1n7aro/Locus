@@ -1,0 +1,263 @@
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+
+const CONFIG_FILE_NAME: &str = "config.json";
+
+mod serde_atomic_bool {
+    use super::*;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &Arc<AtomicBool>, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_bool(v.load(Ordering::Relaxed))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Arc<AtomicBool>, D::Error> {
+        let b = bool::deserialize(d)?;
+        Ok(Arc::new(AtomicBool::new(b)))
+    }
+}
+
+fn default_debug_flag() -> Arc<AtomicBool> {
+    Arc::new(AtomicBool::new(false))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppConfig {
+    pub model: String,
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default = "default_debug_flag", with = "serde_atomic_bool")]
+    pub debug: Arc<AtomicBool>,
+    #[serde(skip)]
+    config_path: Arc<Mutex<Option<PathBuf>>>,
+}
+
+impl AppConfig {
+    pub fn load(data_dir: &Path) -> Self {
+        let primary_path = stable_config_path(data_dir);
+        Self::load_from_path(&primary_path)
+    }
+
+    fn load_from_path(primary_path: &Path) -> Self {
+        if let Some(mut config) = Self::try_load_file(primary_path) {
+            println!(
+                "[Locus] config loaded from persistent path: {:?}",
+                dunce::canonicalize(primary_path).unwrap_or(primary_path.to_path_buf())
+            );
+            config.set_config_path(primary_path.to_path_buf());
+            return config;
+        }
+
+        println!("[Locus] config not found in any path, creating defaults");
+
+        let model = std::env::var("LOCUS_MODEL")
+            .unwrap_or_else(|_| "openrouter/claude-sonnet-4.6".to_string());
+
+        let base_url = std::env::var("LOCUS_BASE_URL").ok();
+
+        let debug = std::env::var("LOCUS_DEBUG")
+            .map(|v| v == "1" || v == "true")
+            .unwrap_or(false);
+
+        let config = AppConfig {
+            model,
+            base_url,
+            debug: Arc::new(AtomicBool::new(debug)),
+            config_path: Arc::new(Mutex::new(Some(primary_path.to_path_buf()))),
+        };
+
+        if let Err(err) = Self::persist_to_path(&config, primary_path) {
+            eprintln!(
+                "[Locus] failed to write default config to '{}': {}",
+                primary_path.display(),
+                err
+            );
+        } else {
+            println!(
+                "[Locus] default config written to {:?}",
+                dunce::canonicalize(primary_path).unwrap_or(primary_path.to_path_buf())
+            );
+        }
+
+        config
+    }
+
+    fn try_load_file(path: &Path) -> Option<Self> {
+        let content = fs::read_to_string(path).ok()?;
+        let (config, scrubbed_legacy_secret) = Self::parse_content(&content).ok()?;
+        if scrubbed_legacy_secret {
+            if let Err(err) = Self::persist_to_path(&config, path) {
+                eprintln!(
+                    "[Locus] failed to scrub legacy api_key from '{}': {}",
+                    path.display(),
+                    err
+                );
+            } else {
+                println!(
+                    "[Locus] scrubbed legacy api_key from config: {:?}",
+                    dunce::canonicalize(path).unwrap_or(path.to_path_buf())
+                );
+            }
+        }
+        Some(config)
+    }
+
+    fn parse_content(content: &str) -> Result<(Self, bool), String> {
+        let mut value: Value =
+            serde_json::from_str(content).map_err(|e| format!("failed to parse config: {}", e))?;
+        let scrubbed_legacy_secret = Self::remove_legacy_api_key(&mut value);
+        let config = serde_json::from_value::<AppConfig>(value)
+            .map_err(|e| format!("failed to deserialize config: {}", e))?;
+        Ok((config, scrubbed_legacy_secret))
+    }
+
+    fn remove_legacy_api_key(value: &mut Value) -> bool {
+        let Some(obj) = value.as_object_mut() else {
+            return false;
+        };
+        let removed_snake = obj.remove("api_key").is_some();
+        let removed_camel = obj.remove("apiKey").is_some();
+        removed_snake || removed_camel
+    }
+
+    fn set_config_path(&mut self, path: PathBuf) {
+        if let Ok(mut guard) = self.config_path.lock() {
+            *guard = Some(path);
+        }
+    }
+
+    pub fn debug_enabled(&self) -> bool {
+        self.debug.load(Ordering::Relaxed)
+    }
+
+    pub fn set_debug_enabled(&self, value: bool) -> Result<(), String> {
+        self.debug.store(value, Ordering::Relaxed);
+        self.persist()
+    }
+
+    fn persist(&self) -> Result<(), String> {
+        let path = self
+            .config_path
+            .lock()
+            .map_err(|e| format!("config path lock poisoned: {}", e))?
+            .clone();
+        let Some(path) = path else {
+            return Err("config path is unknown; cannot persist".to_string());
+        };
+        Self::persist_to_path(self, &path)
+    }
+
+    fn persist_to_path(&self, path: &Path) -> Result<(), String> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| {
+                format!("failed to create config dir '{}': {}", parent.display(), e)
+            })?;
+        }
+        let json = serde_json::to_string_pretty(self)
+            .map_err(|e| format!("failed to serialize config: {}", e))?;
+        fs::write(path, json)
+            .map_err(|e| format!("failed to write config '{}': {}", path.display(), e))?;
+        Ok(())
+    }
+}
+
+fn stable_config_path(data_dir: &Path) -> PathBuf {
+    crate::commands::persistent_config_dir()
+        .map(|dir| dir.join(CONFIG_FILE_NAME))
+        .unwrap_or_else(|err| {
+            eprintln!(
+                "[Locus] failed to resolve persistent config dir, falling back to runtime storage: {}",
+                err
+            );
+            data_dir.join(CONFIG_FILE_NAME)
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    static ENV_LOCK: StdMutex<()> = StdMutex::new(());
+
+    struct EnvGuard {
+        saved: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl EnvGuard {
+        fn set(vars: &[(&'static str, Option<&str>)]) -> Self {
+            let saved = vars
+                .iter()
+                .map(|(key, value)| {
+                    let previous = std::env::var(key).ok();
+                    match value {
+                        Some(next) => std::env::set_var(key, next),
+                        None => std::env::remove_var(key),
+                    }
+                    (*key, previous)
+                })
+                .collect();
+            Self { saved }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in self.saved.drain(..).rev() {
+                match value {
+                    Some(previous) => std::env::set_var(key, previous),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn load_from_path_does_not_persist_openrouter_key_from_env() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock");
+        let _env_guard = EnvGuard::set(&[
+            ("OPENROUTER_API_KEY", Some("or-secret-value")),
+            ("LOCUS_MODEL", Some("test-model")),
+            ("LOCUS_BASE_URL", None),
+            ("LOCUS_DEBUG", Some("0")),
+        ]);
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("config.json");
+
+        let config = AppConfig::load_from_path(&config_path);
+        let written = fs::read_to_string(&config_path).expect("written config");
+
+        assert_eq!(config.model, "test-model");
+        assert!(!written.contains("api_key"));
+        assert!(!written.contains("or-secret-value"));
+    }
+
+    #[test]
+    fn load_from_path_scrubs_legacy_api_key_from_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("config.json");
+        fs::write(
+            &config_path,
+            r#"{
+  "api_key": "or-legacy-secret",
+  "model": "legacy-model",
+  "base_url": "https://example.com",
+  "debug": true
+}"#,
+        )
+        .expect("legacy config");
+
+        let config = AppConfig::load_from_path(&config_path);
+        let written = fs::read_to_string(&config_path).expect("scrubbed config");
+
+        assert_eq!(config.model, "legacy-model");
+        assert_eq!(config.base_url.as_deref(), Some("https://example.com"));
+        assert!(config.debug_enabled());
+        assert!(!written.contains("api_key"));
+        assert!(!written.contains("or-legacy-secret"));
+    }
+}

@@ -1,0 +1,25 @@
+{
+  "description": "Execute a shell command and return its output (stdout + stderr combined).\n- You MUST set workdir explicitly; never rely on the current process directory\n- Commands time out after 120s by default\n- Common uses: run EditMode tests, show git status, find asmdef references\n- Use the description field to briefly describe what the command does",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "command": {
+        "type": "string",
+        "description": "The shell command to execute"
+      },
+      "description": {
+        "type": "string",
+        "description": "Brief description of what this command does, e.g. 'Run EditMode tests', 'Show git status', 'Find asmdef references'"
+      },
+      "timeout": {
+        "type": "integer",
+        "description": "Timeout in milliseconds (default 120000)"
+      },
+      "workdir": {
+        "type": "string",
+        "description": "Working directory to run the command in. Required."
+      }
+    },
+    "required": ["command", "description", "workdir"]
+  }
+}

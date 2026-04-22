@@ -1,0 +1,21 @@
+{
+  "description": "Read the contents of a text file.\n- Returns file content (up to 2000 lines by default)\n- Use offset and limit to page through large files\n- This tool only reads files; use list for directories",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "filePath": {
+        "type": "string",
+        "description": "Absolute or relative path to the file to read"
+      },
+      "offset": {
+        "type": "integer",
+        "description": "Line number to start reading from (1-indexed)"
+      },
+      "limit": {
+        "type": "integer",
+        "description": "Max number of lines to read (default 2000)"
+      }
+    },
+    "required": ["filePath"]
+  }
+}

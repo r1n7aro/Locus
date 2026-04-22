@@ -1,0 +1,64 @@
+---
+title: Usage Suggestions
+---
+
+## View AI Capabilities Objectively and Dynamically
+
+To some extent, you can treat it as a technical designer or client engineer coworker with basically no game aesthetic sense.
+
+**Current frontier models outperform the vast majority of programmers on concrete and well-defined programming tasks (and on math problems)**, but as language models they still do not understand Game Feel, and they do not understand what kind of UI layout is reasonable.
+
+In small projects, you can ignore all the logic it writes and rapidly iterate on prototypes in a pure form of "vibe coding".
+
+But for serious large projects, you should review the technical decisions it makes and understand what it is doing. If you cannot understand what it is doing, then once something goes wrong you can only ask it to fix things by "making wishes". If it still cannot fix it, the life of the project ends there.
+
+In large projects, we recommend that engineers mainly use it to build the framework, and non-technical designers use the "SKILL" written by engineers to build gameplay features. Do not let a designer directly make framework-level changes, such as "I want places where you step on snow, help me write a virtual texture" type engineering-architecture changes. At the same time, the iteration speed of current base AI models is getting faster and faster (the release cadence of frontier model companies has moved from yearly and half-yearly to every two months).
+
+The usage paradigm of agents will evolve quickly along with it. Just over a year ago, when model context windows were extremely short, it was hard to let them independently execute the kinds of agent tasks they can handle today. The rules written here may be outdated again two months later.
+
+It is normal for current AI to make mistakes. You can test in Unity and ask it to revise. In many cases it can fix things after several rounds. If it just cannot get it right, start a new conversation and have a new AI evaluate the previous implementation and analyze the bug. That is often more effective.
+
+We will later write two blog posts to explain our view of game development agents more concretely
+
+- Harness Engineering for Game Projects
+- Building Dev Agent for Game Engines
+
+## Concrete and Correct Instructions > Vague Instructions > Concrete and Wrong Instructions
+
+Provide enough context so the AI can understand your needs as clearly as possible.
+
+- I want to build a feature: what is this feature for, and what design details do I want
+- I want to build a gameplay mechanic: what should it feel like to play, what might it be similar to, and what are the design details
+- I want to modify an existing feature in the project: what it was like before, why I want to change it, and what the possible modification plans are
+
+If you are a designer or artist who does not understand code, or if you do not have a clear grasp of the technical implementation for the current requirement, do not describe an overly specific and detailed technical route to the AI. That can push it further and further down the wrong path.
+
+## For Complex Tasks, Let It Write a Proposal for Review Before Execution
+
+Many game logic implementations that sound very short are actually very complex. Friends who work in game design and gameplay engineering know this well.
+
+For example, even a simple "jump" feature in a side-scrolling platformer may include questions such as "Should the character action logic use a state machine or state tree?", "Should there be coyote time?", and "How should the takeoff and landing speed parameters change?".
+
+In many cases, gameplay engineers are responsible for communicating with designers and turning many things that are never written in the design document into actual code. But by default, the AI's goal is "finish the requirement as fast as possible". If you ask it to implement a feature with only one sentence, the result may not match what you want. It is better to first ask it not to modify files and instead clarify the requirement with you through conversation.
+
+Even though it does not understand Game Feel, it is familiar with how earlier games were implemented. If you are building something that already exists, you can also ask it "how can I improve the feel?" (for example, a programmer who has not studied side-scrolling platformers may never have heard of "coyote time").
+
+At the same time, in the past, if a designer wanted to implement a feature, they had to communicate fully with programmers because implementation cost was high. Now we can implement features very quickly, so designers may no longer need to spend as much time polishing their design documents and persuading programmers to build features or iterate on gameplay.
+
+## Maintain the Knowledge Base Regularly
+
+We gave Locus the ability to maintain the knowledge base automatically because we want it to understand the project better and better while chatting with you.
+
+Among them, `Design` is the part you need to pay the most attention to. It represents the AI's summary of your requirements, and it will treat that as your requirements. Making sure those requirements are correct is therefore part of the user's duty and responsibility.
+
+`Memory` is summarized by the AI itself from experience extracted from the project. You can also open it to check whether it is correct and manually modify or delete some files.
+
+We will soon provide a Skill that helps the AI maintain your knowledge base.
+
+## Independent Tasks Should Be Completed in Independent Contexts (New Sessions)
+
+There is a bar in the lower right of the interface. It represents the amount of context you are currently using.
+
+At present, the amount of language that language models can handle is still very limited. After a certain threshold, capability drops very sharply (`Claude 1M` / `GPT-5.4` both decay badly after `400k`). So even though the model will forget earlier conversation content, independent tasks should still be started in independent contexts whenever possible. At the same time, a longer context means a longer cache read, and the cost of each tool call also becomes higher.
+
+To improve model capability and reduce cost, you should split independent tasks apart whenever possible.

@@ -1,0 +1,23 @@
+{
+  "description": "Move a unified knowledge document or directory within its knowledge type tree. Returns a plain-text status line.",
+  "parameters": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "kind": {
+        "type": "string",
+        "enum": ["document", "directory"],
+        "description": "Whether the target is a knowledge document or a knowledge directory."
+      },
+      "path": {
+        "type": "string",
+        "description": "Current type-prefixed path."
+      },
+      "newPath": {
+        "type": "string",
+        "description": "Target type-prefixed path. Keep it inside the same top-level type tree."
+      }
+    },
+    "required": ["kind", "path", "newPath"]
+  }
+}

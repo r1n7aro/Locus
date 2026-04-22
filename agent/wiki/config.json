@@ -1,0 +1,9 @@
+{
+  "name": "Wiki",
+  "description": "Audit and maintain Tech Wiki doc-source coverage and freshness.",
+  "tools": ["read", "list", "grep", "bash", "explore", "todowrite", "ask_user_question", "unity_execute", "unity_asset_search", "unity_ref_search", "unity_yaml_read", "knowledge_list_dir", "knowledge_query", "knowledge_read"],
+  "sub_agents": [],
+  "default": false,
+  "default_effort": "medium",
+  "model_recommendation": "large"
+}

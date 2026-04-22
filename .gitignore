@@ -1,0 +1,42 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Local workspace caches and artifacts
+.cache/
+.codex/
+codex-artifacts/
+tmp/
+debug/
+
+node_modules
+dist
+dist-ssr
+*.local
+site/
+.venv/
+.venv-docs/
+docs/.home.html
+
+# Editor directories and files
+.vscode/
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Claude Code
+.claude
+
+# Workspace-only directories
+experiments/
+ref
+AGENTS.md

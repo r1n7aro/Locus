@@ -1,0 +1,1140 @@
+
+<script setup lang="ts">
+import { ref, shallowRef, onMounted, onUnmounted, watch } from "vue";
+import type { Component, ShallowRef } from "vue";
+import { open, save } from "@tauri-apps/plugin-dialog";
+import { t } from "./i18n";
+import { normalizeAppError } from "./services/errors";
+import { saveRawContext as saveCtx } from "./services/session";
+import type { EffortLevel, SaveRawContextRequest } from "./types";
+import { useUiStore } from "./stores/ui";
+import { useAuthStore } from "./stores/auth";
+import { useAgentStore } from "./stores/agent";
+import { useModelStore } from "./stores/model";
+import { useProjectStore } from "./stores/project";
+import { useChatStore } from "./stores/chat";
+import { useNotificationStore } from "./stores/notification";
+import { useChatChangesStore } from "./stores/chatChanges";
+import { useAppBootstrap } from "./composables/useAppBootstrap";
+
+// Static imports — first-screen critical or special-case first-screen
+import ChatView from "./components/ChatView.vue";
+import CanvasView from "./components/CanvasView.vue";
+import KnowledgeDownloadProgressWindow from "./components/KnowledgeDownloadProgressWindow.vue";
+import KnowledgeLexicalProgressWindow from "./components/KnowledgeLexicalProgressWindow.vue";
+import FeishuReferenceImportProgressWindow from "./components/FeishuReferenceImportProgressWindow.vue";
+import UnityReferenceImportProgressWindow from "./components/UnityReferenceImportProgressWindow.vue";
+import ReferenceExternalImportWindow from "./components/ReferenceExternalImportWindow.vue";
+import OnboardingView from "./components/OnboardingView.vue";
+import ThinkingPanel from "./components/ThinkingPanel.vue";
+import ChatSidebarPanel from "./components/ChatSidebarPanel.vue";
+import FileDiffOverlay from "./components/diff/FileDiffOverlay.vue";
+import TopBannerHost from "./components/TopBannerHost.vue";
+
+import { provideDiffOverlay } from "./composables/useDiffOverlay";
+import { initTheme } from "./composables/useTheme";
+import { initFonts } from "./composables/useDisplaySettings";
+import { isKnowledgeDownloadWindowLocation } from "./services/knowledgeDownloadWindow";
+import { isKnowledgeLexicalProgressWindowLocation } from "./services/knowledgeLexicalProgressWindow";
+import { isFeishuReferenceImportWindowLocation } from "./services/feishuReferenceImportWindow";
+import { isUnityReferenceImportWindowLocation } from "./services/unityReferenceImportWindow";
+import { isReferenceExternalImportWindowLocation } from "./services/referenceExternalImportWindow";
+const isCanvasWindow = window.location.pathname === '/canvas'
+                    || window.location.search.includes('specId=');
+const isKnowledgeDownloadWindow = isKnowledgeDownloadWindowLocation();
+const isKnowledgeLexicalProgressWindow = isKnowledgeLexicalProgressWindowLocation();
+const isFeishuReferenceImportWindow = isFeishuReferenceImportWindowLocation();
+const isUnityReferenceImportWindow = isUnityReferenceImportWindowLocation();
+const isReferenceExternalImportWindow = isReferenceExternalImportWindowLocation();
+const isStandaloneWindow = isCanvasWindow
+  || isKnowledgeDownloadWindow
+  || isKnowledgeLexicalProgressWindow
+  || isFeishuReferenceImportWindow
+  || isUnityReferenceImportWindow
+  || isReferenceExternalImportWindow;
+
+// Initialize theme & fonts for main window only; Canvas keeps its own styles.
+if (!isCanvasWindow) {
+  initTheme();
+  initFonts();
+}
+
+// -- Stores --
+const uiStore = useUiStore();
+const authStore = useAuthStore();
+const agentStore = useAgentStore();
+const modelStore = useModelStore();
+const projectStore = useProjectStore();
+const chatStore = useChatStore();
+const notificationStore = useNotificationStore();
+const chatChangesStore = useChatChangesStore();
+
+// -- Diff overlay provider (must be called in App setup so all children can inject) --
+provideDiffOverlay();
+const { skillItems, bootstrapCritical, bootstrapDeferred, preloadTabsInBackground, registerListeners, cleanup, applyWorkingDir, closeSettings, onOnboardingCompleted } = useAppBootstrap();
+
+function createLazyViewState(
+  loader: () => Promise<{ default: Component }>,
+  operation: string,
+) {
+  const component: ShallowRef<Component | null> = shallowRef(null);
+  const loading = ref(false);
+  const error = ref<string | null>(null);
+  let pending: Promise<void> | null = null;
+
+  function ensureLoaded() {
+    if (component.value) {
+      return Promise.resolve();
+    }
+    if (pending) {
+      return pending;
+    }
+
+    loading.value = true;
+    error.value = null;
+    pending = loader()
+      .then((module) => {
+        component.value = module.default;
+      })
+      .catch((loadError: unknown) => {
+        const err = normalizeAppError(loadError);
+        error.value = err.message;
+        notificationStore.addNotice("error", err.message, {
+          code: err.code,
+          operation,
+        });
+        pending = null;
+        throw loadError;
+      })
+      .finally(() => {
+        loading.value = false;
+      });
+
+    return pending;
+  }
+
+  return {
+    component,
+    loading,
+    error,
+    ensureLoaded,
+  };
+}
+
+const collabView = createLazyViewState(
+  () => import("./components/CollabView.vue"),
+  "loadCollabView",
+);
+const knowledgeView = createLazyViewState(
+  () => import("./components/KnowledgeView.vue"),
+  "loadKnowledgeView",
+);
+const assetView = createLazyViewState(
+  () => import("./components/AssetView.vue"),
+  "loadAssetView",
+);
+const agentView = createLazyViewState(
+  () => import("./components/AgentView.vue"),
+  "loadAgentView",
+);
+const settingsView = createLazyViewState(
+  () => import("./components/SettingsView.vue"),
+  "loadSettingsView",
+);
+
+const collabViewComponent = collabView.component;
+const collabViewLoading = collabView.loading;
+const collabViewError = collabView.error;
+
+const knowledgeViewComponent = knowledgeView.component;
+const knowledgeViewLoading = knowledgeView.loading;
+const knowledgeViewError = knowledgeView.error;
+
+const assetViewComponent = assetView.component;
+const assetViewLoading = assetView.loading;
+const assetViewError = assetView.error;
+
+const agentViewComponent = agentView.component;
+const agentViewLoading = agentView.loading;
+const agentViewError = agentView.error;
+
+const settingsViewComponent = settingsView.component;
+const settingsViewLoading = settingsView.loading;
+const settingsViewError = settingsView.error;
+
+watch(() => uiStore.collabMounted, (mounted) => {
+  if (!mounted) return;
+  void collabView.ensureLoaded();
+}, { immediate: true });
+
+watch(() => uiStore.knowledgeMounted, (mounted) => {
+  if (!mounted) return;
+  void knowledgeView.ensureLoaded();
+}, { immediate: true });
+
+watch(() => uiStore.assetMounted, (mounted) => {
+  if (!mounted) return;
+  void assetView.ensureLoaded();
+}, { immediate: true });
+
+watch(() => uiStore.agentMounted, (mounted) => {
+  if (!mounted) return;
+  void agentView.ensureLoaded();
+}, { immediate: true });
+
+watch(() => uiStore.settingsMounted, (mounted) => {
+  if (!mounted) return;
+  void settingsView.ensureLoaded();
+}, { immediate: true });
+
+// -- Workspace dropdown (local UI) --
+const showDirDropdown = ref(false);
+const dirDropdownRef = ref<HTMLElement | null>(null);
+
+function shortDir(dir: string): string {
+  if (!dir) return t("app.dir.notSet");
+  const parts = dir.replace(/\\/g, "/").split("/").filter(Boolean);
+  return parts.length > 0 ? parts[parts.length - 1] : dir;
+}
+
+function parentPath(dir: string): string {
+  const parts = dir.replace(/\\/g, "/").split("/").filter(Boolean);
+  if (parts.length <= 1) return "";
+  return parts.slice(0, -1).join("/");
+}
+
+function toggleDirDropdown() {
+  showDirDropdown.value = !showDirDropdown.value;
+}
+
+async function selectRecentDir(dir: string) {
+  showDirDropdown.value = false;
+  if (dir !== projectStore.workingDir) {
+    await applyWorkingDir(dir);
+  }
+}
+
+async function browseFromDropdown() {
+  showDirDropdown.value = false;
+  try {
+    const selected = await open({ directory: true, multiple: false, defaultPath: projectStore.workingDir || undefined });
+    if (selected && typeof selected === "string") {
+      await applyWorkingDir(selected);
+    }
+  } catch (e) {
+    const err = normalizeAppError(e);
+    console.error("browse_working_dir failed:", e);
+    notificationStore.addNotice("error", err.message, {
+      operation: "browseWorkingDir",
+      skipConsoleLog: true,
+    });
+  }
+}
+
+function handleDirClickOutside(e: MouseEvent) {
+  if (dirDropdownRef.value && !dirDropdownRef.value.contains(e.target as Node)) {
+    showDirDropdown.value = false;
+  }
+}
+
+async function saveRawContext(request?: string | SaveRawContextRequest) {
+  const sid = typeof request === "string"
+    ? request
+    : request?.sessionId || chatStore.activeSessionId;
+  const includeSystemPrompt = typeof request === "string"
+    ? true
+    : request?.includeSystemPrompt ?? true;
+  if (!sid) return;
+  try {
+    const filePath = await save({
+      defaultPath: includeSystemPrompt
+        ? `context_${sid.slice(0, 8)}_with_system_prompt.md`
+        : `context_${sid.slice(0, 8)}_without_system_prompt.md`,
+      filters: [{ name: "Markdown", extensions: ["md"] }],
+    });
+    if (!filePath) return;
+    await saveCtx(sid, filePath, includeSystemPrompt);
+  } catch (e) {
+    const err = normalizeAppError(e);
+    console.error("save_raw_context failed:", e);
+    notificationStore.addNotice("error", t("app.saveFailed", err.message), {
+      code: err.code,
+      operation: "saveRawContext",
+      skipConsoleLog: true,
+    });
+  }
+}
+
+function onResetOnboarding() {
+  showDirDropdown.value = false;
+  projectStore.resetWorkspaceState();
+  chatStore.resetWorkspaceScope();
+  uiStore.resetOnboarding();
+}
+
+// -- Lifecycle --
+onMounted(async () => {
+  if (isStandaloneWindow) return;
+  document.addEventListener("click", handleDirClickOutside, true);
+  await bootstrapCritical();
+  await registerListeners();
+  // Sessions page is now interactive — kick off background work
+  preloadTabsInBackground();
+  bootstrapDeferred(); // fire-and-forget
+});
+
+onUnmounted(() => {
+  if (isStandaloneWindow) return;
+  document.removeEventListener("click", handleDirClickOutside, true);
+  cleanup();
+});
+</script>
+
+<template>
+  <CanvasView v-if="isCanvasWindow" />
+  <KnowledgeDownloadProgressWindow v-else-if="isKnowledgeDownloadWindow" />
+  <KnowledgeLexicalProgressWindow v-else-if="isKnowledgeLexicalProgressWindow" />
+  <FeishuReferenceImportProgressWindow v-else-if="isFeishuReferenceImportWindow" />
+  <UnityReferenceImportProgressWindow v-else-if="isUnityReferenceImportWindow" />
+  <ReferenceExternalImportWindow v-else-if="isReferenceExternalImportWindow" />
+  <OnboardingView v-else-if="authStore.authChecked && uiStore.showOnboarding" @completed="onOnboardingCompleted" />
+  <div
+    class="app-layout"
+    :class="{ 'is-window-resizing': uiStore.isWindowResizing }"
+    v-else-if="authStore.authChecked"
+    @contextmenu.prevent
+  >
+    <div class="main-area">
+      <div class="tab-bar">
+        <span class="tab-brand">Locus</span>
+        <button
+          class="tab-item"
+          :class="{ active: uiStore.activeTab === 'chat' }"
+          @click="uiStore.setTab('chat')"
+        >{{ t("app.tab.dev") }}</button>
+        <button
+          class="tab-item"
+          :class="{ active: uiStore.activeTab === 'knowledge' }"
+          @click="uiStore.setTab('knowledge')"
+        >{{ t("app.tab.knowledge") }}</button>
+        <button
+          class="tab-item"
+          :class="{ active: uiStore.activeTab === 'collab' }"
+          @click="uiStore.setTab('collab')"
+        >{{ t("app.tab.collab") }}</button>
+        <button
+          class="tab-item"
+          :class="{ active: uiStore.activeTab === 'asset' }"
+          @click="uiStore.setTab('asset')"
+        >{{ t("app.tab.asset") }}</button>
+        <button
+          class="tab-item"
+          :class="{ active: uiStore.activeTab === 'agent' }"
+          @click="uiStore.setTab('agent')"
+        >{{ t("app.tab.agent") }}</button>
+        <button
+          class="tab-item"
+          :class="{ active: uiStore.activeTab === 'settings' }"
+          @click="uiStore.setTab('settings')"
+        >{{ t("app.tab.settings") }}</button>
+        <div v-if="projectStore.pluginToast" class="tab-plugin-warn" @click="projectStore.installPlugin">
+          <span class="tab-plugin-dot"></span>
+          <span class="tab-plugin-label">
+            {{ projectStore.pluginToast === "missing" ? t("app.plugin.notInstalled") : t("app.plugin.needUpdate") }}
+          </span>
+          <span class="tab-plugin-action">
+            {{ projectStore.pluginInstalling ? t("app.plugin.installing") : projectStore.pluginToast === "missing" ? t("app.plugin.clickInstall") : t("app.plugin.clickUpdate") }}
+          </span>
+        </div>
+        <div class="tab-spacer"></div>
+        <div class="workspace-selector" ref="dirDropdownRef">
+          <button
+            class="workspace-btn"
+            :title="projectStore.workingDir || t('app.dir.notSetTitle')"
+            @click="toggleDirDropdown"
+          >
+            <svg class="ws-icon" viewBox="0 0 16 16" fill="currentColor" width="14" height="14">
+              <path d="M1 3.5A1.5 1.5 0 0 1 2.5 2h3.879a1.5 1.5 0 0 1 1.06.44l1.122 1.12A1.5 1.5 0 0 0 9.62 4H13.5A1.5 1.5 0 0 1 15 5.5v7a1.5 1.5 0 0 1-1.5 1.5h-11A1.5 1.5 0 0 1 1 12.5v-9z"/>
+            </svg>
+            <span class="ws-name">{{ shortDir(projectStore.workingDir) }}</span>
+            <svg class="ws-chevron" :class="{ open: showDirDropdown }" viewBox="0 0 16 16" fill="currentColor" width="10" height="10">
+              <path d="M4.427 5.427a.75.75 0 0 1 1.06-.013L8 7.867l2.513-2.453a.75.75 0 1 1 1.047 1.073l-3 2.927a.75.75 0 0 1-1.047 0l-3-2.927a.75.75 0 0 1-.013-1.06z"/>
+            </svg>
+          </button>
+          <Transition name="dropdown">
+            <div v-if="showDirDropdown" class="dir-dropdown">
+              <div class="dropdown-label">{{ t("app.dir.recentDirs") }}</div>
+              <div
+                v-for="dir in projectStore.recentDirs"
+                :key="dir"
+                class="dir-item"
+                :class="{ active: dir === projectStore.workingDir }"
+                @click="selectRecentDir(dir)"
+                :title="dir"
+              >
+                <svg class="dir-item-icon" viewBox="0 0 16 16" fill="currentColor" width="12" height="12">
+                  <path d="M1 3.5A1.5 1.5 0 0 1 2.5 2h3.879a1.5 1.5 0 0 1 1.06.44l1.122 1.12A1.5 1.5 0 0 0 9.62 4H13.5A1.5 1.5 0 0 1 15 5.5v7a1.5 1.5 0 0 1-1.5 1.5h-11A1.5 1.5 0 0 1 1 12.5v-9z"/>
+                </svg>
+                <div class="dir-item-text">
+                  <span class="dir-item-name">{{ shortDir(dir) }}</span>
+                  <span class="dir-item-path">{{ parentPath(dir) }}</span>
+                </div>
+                <span v-if="dir === projectStore.workingDir" class="dir-check">&#10003;</span>
+              </div>
+              <div v-if="projectStore.recentDirs.length === 0" class="dropdown-empty">{{ t("app.dir.noRecords") }}</div>
+              <div class="dropdown-divider"></div>
+              <div class="dir-item browse" @click="browseFromDropdown">
+                <svg class="dir-item-icon" viewBox="0 0 16 16" fill="currentColor" width="12" height="12">
+                  <path d="M8 2a.75.75 0 0 1 .75.75v4.5h4.5a.75.75 0 0 1 0 1.5h-4.5v4.5a.75.75 0 0 1-1.5 0v-4.5h-4.5a.75.75 0 0 1 0-1.5h4.5v-4.5A.75.75 0 0 1 8 2z"/>
+                </svg>
+                <span class="dir-item-name">{{ t("app.dir.browseOther") }}</span>
+              </div>
+            </div>
+          </Transition>
+        </div>
+        <div class="window-controls">
+          <button
+            class="win-ctrl-btn"
+            :class="{ 'win-pinned': uiStore.alwaysOnTop }"
+            :title="uiStore.alwaysOnTop ? t('app.pin.unpin') : t('app.pin.pin')"
+            @click="uiStore.toggleAlwaysOnTop"
+          >
+            <svg viewBox="0 0 16 16" width="12" height="12" fill="currentColor" :style="{ transform: uiStore.alwaysOnTop ? 'rotate(0deg)' : 'rotate(45deg)' }">
+              <path d="M9.828 1.282a.75.75 0 0 1 .955.073l3.862 3.862a.75.75 0 0 1-.564 1.272h-.862L11.2 8.507a2.25 2.25 0 0 1-.039 2.994l-.56.56a.75.75 0 0 1-1.06 0L7.05 9.57l-3.72 3.72a.75.75 0 1 1-1.06-1.06l3.72-3.72L3.5 6.02a.75.75 0 0 1 0-1.06l.56-.56a2.25 2.25 0 0 1 2.994-.04L9.07 2.342V1.48a.75.75 0 0 1 .758-.198z"/>
+            </svg>
+          </button>
+          <button class="win-ctrl-btn" @click="uiStore.winMinimize" :title="t('app.win.minimize')">
+            <svg viewBox="0 0 12 12" width="12" height="12"><rect x="1" y="5.5" width="10" height="1" fill="currentColor"/></svg>
+          </button>
+          <button class="win-ctrl-btn" @click="uiStore.winToggleMaximize" :title="t('app.win.maximize')">
+            <svg v-if="!uiStore.isMaximized" viewBox="0 0 12 12" width="12" height="12"><rect x="1.5" y="1.5" width="9" height="9" rx="1" fill="none" stroke="currentColor" stroke-width="1.2"/></svg>
+            <svg v-else viewBox="0 0 12 12" width="12" height="12"><rect x="2.5" y="0.5" width="8" height="8" rx="1" fill="none" stroke="currentColor" stroke-width="1.1"/><rect x="0.5" y="2.5" width="8" height="8" rx="1" fill="var(--sidebar-bg)" stroke="currentColor" stroke-width="1.1"/></svg>
+          </button>
+          <button class="win-ctrl-btn win-close" @click="uiStore.winClose" :title="t('app.win.close')">
+            <svg viewBox="0 0 12 12" width="12" height="12"><path d="M2 2l8 8M10 2l-8 8" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>
+          </button>
+        </div>
+      </div>
+      <TopBannerHost />
+
+      <div class="tab-content">
+        <ChatView
+          v-show="uiStore.activeTab === 'chat'"
+          :messages="chatStore.messages"
+          :streaming-text="chatStore.streamingText"
+          :is-streaming="chatStore.isStreaming"
+          :is-thinking="chatStore.isThinking"
+          :has-thinking="chatStore.streamingThinking.length > 0"
+          :thinking-text="chatStore.streamingThinking"
+          :thinking-duration="chatStore.thinkingDuration"
+          :active-tool-calls="chatStore.activeToolCalls"
+          :agents="agentStore.agents"
+          :selected-agent-id="agentStore.selectedAgentId"
+          :agent-locked="chatStore.sessionAgentLocked"
+          :models="modelStore.availableModels"
+          :selected-model-id="modelStore.selectedModelId"
+          :codex-transport="modelStore.codexTransport"
+          :effort="modelStore.effort"
+          :effort-supported="modelStore.effortSupported"
+          :effort-levels="modelStore.availableEfforts"
+          :token-usage="chatStore.tokenUsage"
+          :pending-question="chatStore.pendingQuestion"
+          :pending-tool-confirms="chatStore.pendingToolConfirms"
+          :sessions="chatStore.sessions"
+          :active-session-id="chatStore.activeSessionId"
+          :unity-connected="projectStore.unityConnected"
+          :scan-phase="projectStore.scanPhase"
+          :last-scan-stats="projectStore.lastScanStats"
+          :is-unity-project="projectStore.isUnityProject"
+          :skills="skillItems"
+          :streaming-session-ids="chatStore.streamingSessionIds"
+          :undoable-message-ids="chatStore.undoableMessageIds"
+          @send="chatStore.sendMessage"
+          @cancel="chatStore.cancelChat"
+          @select-agent="(id: string) => agentStore.selectAgent(id)"
+          @select-model="(id: string) => modelStore.selectModel(id)"
+          @select-effort="(level: EffortLevel) => modelStore.effort = level"
+          @save-raw-context="saveRawContext"
+          @answer-question="chatStore.answerQuestion"
+          @answer-tool-confirm="chatStore.answerToolConfirm"
+          @answer-all-tool-confirms="chatStore.answerAllToolConfirms"
+          @open-thinking="chatStore.openThinkingPanel"
+          @select-session="chatStore.selectSession"
+          @new-chat="chatStore.newChat"
+          @rename-session="chatStore.renameSession"
+          @archive-session="chatStore.archiveSession"
+          @delete-session="chatStore.deleteSession"
+          @start-scan="projectStore.startScan"
+        />
+        <ThinkingPanel
+          v-if="uiStore.activeTab === 'chat' && chatStore.showThinkingPanel"
+          :thinking="chatStore.thinkingPanelContent || chatStore.streamingThinking"
+          :is-thinking="chatStore.isThinking && !chatStore.thinkingPanelContent"
+          @close="chatStore.showThinkingPanel = false"
+        />
+        <ChatSidebarPanel
+          v-if="uiStore.activeTab === 'chat' && (chatStore.showTodoPanel || chatChangesStore.currentPanelVisible)"
+          :todos="chatStore.todos"
+          :is-streaming="chatStore.isStreaming"
+          :todo-write-version="chatStore.todoWriteVersion"
+        />
+
+        <component
+          :is="collabViewComponent"
+          v-if="uiStore.collabMounted && collabViewComponent"
+          v-show="uiStore.activeTab === 'collab'"
+          :working-dir="projectStore.workingDir"
+          :is-active="uiStore.activeTab === 'collab'"
+          :selected-model-id="modelStore.selectedModelId"
+          :selected-agent-id="agentStore.selectedAgentId"
+          :models="modelStore.availableModels"
+          @select-model="(id: string) => modelStore.selectModel(id)"
+        />
+        <div
+          v-else-if="uiStore.collabMounted && uiStore.activeTab === 'collab'"
+          class="tab-loading-state"
+          :class="{ 'is-loading': collabViewLoading, 'is-error': !!collabViewError }"
+        >
+          {{ collabViewError || t("common.loading") }}
+        </div>
+
+        <component
+          :is="knowledgeViewComponent"
+          v-if="uiStore.knowledgeMounted && knowledgeViewComponent"
+          v-show="uiStore.activeTab === 'knowledge'"
+          :working-dir="projectStore.workingDir"
+          :selected-model-id="modelStore.selectedModelId"
+          :model-defaults="modelStore.modelDefaults"
+        />
+        <div
+          v-else-if="uiStore.knowledgeMounted && uiStore.activeTab === 'knowledge'"
+          class="tab-loading-state"
+          :class="{ 'is-loading': knowledgeViewLoading, 'is-error': !!knowledgeViewError }"
+        >
+          {{ knowledgeViewError || t("common.loading") }}
+        </div>
+
+        <component
+          :is="assetViewComponent"
+          v-if="uiStore.assetMounted && assetViewComponent"
+          v-show="uiStore.activeTab === 'asset'"
+          :working-dir="projectStore.workingDir"
+        />
+        <div
+          v-else-if="uiStore.assetMounted && uiStore.activeTab === 'asset'"
+          class="tab-loading-state"
+          :class="{ 'is-loading': assetViewLoading, 'is-error': !!assetViewError }"
+        >
+          {{ assetViewError || t("common.loading") }}
+        </div>
+
+        <component
+          :is="agentViewComponent"
+          v-if="uiStore.agentMounted && agentViewComponent"
+          v-show="uiStore.activeTab === 'agent'"
+          :working-dir="projectStore.workingDir"
+          :agent-list="[...agentStore.agents, ...agentStore.subagents]"
+        />
+        <div
+          v-else-if="uiStore.agentMounted && uiStore.activeTab === 'agent'"
+          class="tab-loading-state"
+          :class="{ 'is-loading': agentViewLoading, 'is-error': !!agentViewError }"
+        >
+          {{ agentViewError || t("common.loading") }}
+        </div>
+
+        <component
+          :is="settingsViewComponent"
+          v-if="uiStore.settingsMounted && settingsViewComponent"
+          v-show="uiStore.activeTab === 'settings'"
+          :all-models="modelStore.availableModels"
+          :agents="agentStore.agents"
+          :subagents="agentStore.subagents"
+          @close="closeSettings"
+          @auth-changed="authStore.loadProviderStatus"
+          @model-defaults-changed="modelStore.applyModelDefaults"
+          @codex-transport-changed="modelStore.applyCodexModelConfig"
+          @custom-endpoints-changed="modelStore.applyCustomEndpoints"
+          @reset-onboarding="onResetOnboarding"
+        />
+        <div
+          v-else-if="uiStore.settingsMounted && uiStore.activeTab === 'settings'"
+          class="tab-loading-state"
+          :class="{ 'is-loading': settingsViewLoading, 'is-error': !!settingsViewError }"
+        >
+          {{ settingsViewError || t("common.loading") }}
+        </div>
+      </div>
+    </div>
+  </div>
+  <FileDiffOverlay />
+</template>
+
+<style>
+:root {
+  --bg-color: #f6f7f8;
+  --sidebar-bg: #f3f4f6;
+  --panel-bg: #ffffff;
+  --surface-elevated: #ffffff;
+  --text-color: #111318;
+  --text-secondary: #5b6270;
+  --text-tertiary: #7b8393;
+  --radius-badge: 8px;
+  --border-color: #e3e5e8;
+  --border-strong: #d4d7dd;
+  --hover-bg: #eef1f4;
+  --active-bg: #e7ebf0;
+  --input-bg: #f8f9fb;
+  --msg-user-bg: var(--bg-color);
+  --msg-assistant-bg: #f9fafb;
+  --msg-divider: color-mix(in srgb, var(--border-strong) 74%, var(--border-color) 26%);
+  --msg-user-role: color-mix(in srgb, var(--text-color) 76%, var(--text-secondary) 24%);
+  --accent-color: #4c5bd4;
+  --accent-soft: rgba(76, 91, 212, 0.10);
+  --accent-border: rgba(76, 91, 212, 0.22);
+
+  --git-surface-nav: #f5f7fb;
+  --git-surface-history: #fbfcfe;
+  --git-surface-detail: #ffffff;
+  --git-surface-header: #eef2f8;
+  --git-surface-subheader: #f6f8fc;
+  --git-surface-terminal: #f9fbfd;
+  --git-row-hover: #eef4fb;
+  --git-row-selected: #e4edfb;
+  --git-divider: #d7dee8;
+  --git-divider-strong: #b8c6d8;
+  --git-text-primary: #18212b;
+  --git-text-secondary: #526173;
+  --git-text-tertiary: #748397;
+  --git-focus: #2f6df6;
+  --git-status-added: #2ea043;
+  --git-status-modified: #d29b00;
+  --git-status-deleted: #e15759;
+  --git-status-renamed: #5d83b4;
+  --git-status-stash: #8a63d2;
+  --git-status-conflict: #e28a2e;
+  --git-section-staged-bg: #f3fbf7;
+  --git-section-staged-border: #69b587;
+  --git-section-unstaged-bg: #fff8ef;
+  --git-section-unstaged-border: #d4a658;
+  --git-section-conflict-bg: #ffebe7;
+  --git-section-conflict-border: #e7a18f;
+
+  --status-good-fg: #18794e;
+  --status-good-bg: rgba(24, 121, 78, 0.10);
+  --status-good-border: rgba(24, 121, 78, 0.18);
+  --status-warn-fg: #a16207;
+  --status-warn-bg: rgba(202, 138, 4, 0.10);
+  --status-warn-border: rgba(202, 138, 4, 0.18);
+  --status-danger-fg: #b42318;
+  --status-danger-bg: rgba(217, 45, 32, 0.10);
+  --status-danger-border: rgba(217, 45, 32, 0.18);
+
+  font-family: var(--font-ui);
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--text-color);
+  background: var(--bg-color);
+
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+:root[data-theme="dark"] {
+  --bg-color: #1d1d21;
+  --sidebar-bg: #17181c;
+  --panel-bg: #111216;
+  --surface-elevated: #1a1b20;
+  --text-color: #f3f3f5;
+  --text-secondary: #a1a4ad;
+  --text-tertiary: #787b84;
+  --border-color: #26282e;
+  --border-strong: #31333b;
+  --hover-bg: #1d1f25;
+  --active-bg: #23252c;
+  --input-bg: #181a20;
+  --msg-user-bg: var(--bg-color);
+  --msg-assistant-bg: #17181d;
+  --msg-divider: color-mix(in srgb, var(--border-strong) 76%, var(--border-color) 24%);
+  --msg-user-role: color-mix(in srgb, var(--text-color) 74%, var(--text-secondary) 26%);
+  --accent-color: #6f77f6;
+  --accent-soft: rgba(111, 119, 246, 0.12);
+  --accent-border: rgba(111, 119, 246, 0.24);
+
+  --git-surface-nav: #17181c;
+  --git-surface-history: #141519;
+  --git-surface-detail: #17181d;
+  --git-surface-header: #1b1d23;
+  --git-surface-subheader: #16181d;
+  --git-surface-terminal: #121318;
+  --git-row-hover: #1f2128;
+  --git-row-selected: #262932;
+  --git-divider: #2c2f36;
+  --git-divider-strong: #383c46;
+  --git-text-primary: #f3f3f5;
+  --git-text-secondary: #c0c4cc;
+  --git-text-tertiary: #9498a1;
+  --git-focus: #7c84ff;
+  --git-status-added: #7fd39b;
+  --git-status-modified: #f2c56b;
+  --git-status-deleted: #ff9698;
+  --git-status-renamed: #a9c2e6;
+  --git-status-stash: #ccb8ff;
+  --git-status-conflict: #f6b267;
+  --git-section-staged-bg: #17261f;
+  --git-section-staged-border: #4f8d68;
+  --git-section-unstaged-bg: #342716;
+  --git-section-unstaged-border: #b68035;
+  --git-section-conflict-bg: #311919;
+  --git-section-conflict-border: #a65e50;
+
+  --status-good-fg: #6dcf9b;
+  --status-good-bg: rgba(109, 207, 155, 0.14);
+  --status-good-border: rgba(109, 207, 155, 0.28);
+  --status-warn-fg: #f1c069;
+  --status-warn-bg: rgba(241, 192, 105, 0.14);
+  --status-warn-border: rgba(241, 192, 105, 0.28);
+  --status-danger-fg: #ff8a8a;
+  --status-danger-bg: rgba(255, 138, 138, 0.14);
+  --status-danger-border: rgba(255, 138, 138, 0.30);
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+/* Global scrollbar styling */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(0, 0, 0, 0.15);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(0, 0, 0, 0.25);
+}
+
+:root[data-theme="dark"] ::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.15);
+}
+
+:root[data-theme="dark"] ::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.25);
+}
+
+body {
+  overflow: hidden;
+  background: var(--bg-color);
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+body.is-dragging-select-lock,
+body.is-dragging-select-lock * {
+  user-select: none !important;
+}
+
+.app-layout {
+  display: flex;
+  width: 100vw;
+  height: 100vh;
+  position: relative;
+}
+
+.app-layout.is-window-resizing .tab-content {
+  pointer-events: none;
+}
+
+.app-layout.is-window-resizing .tab-content,
+.app-layout.is-window-resizing .tab-content * {
+  filter: none !important;
+  backdrop-filter: none !important;
+}
+
+.app-layout.is-window-resizing .tab-content *,
+.app-layout.is-window-resizing .tab-content *::before,
+.app-layout.is-window-resizing .tab-content *::after {
+  transition-duration: 0s !important;
+  transition-delay: 0s !important;
+  animation-duration: 0s !important;
+  animation-delay: 0s !important;
+}
+
+.ui-select-none {
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.ui-select-text,
+.selectable-text,
+:where(pre, code),
+:is(input, textarea, [contenteditable="true"]) {
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+.main-area {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  position: relative;
+}
+
+.tab-bar {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  padding: 0 0 0 16px;
+  height: 38px;
+  flex-shrink: 0;
+  position: relative;
+  background: var(--sidebar-bg);
+  border-bottom: 1px solid var(--border-color);
+  z-index: 20;
+  overflow: visible;
+  -webkit-app-region: drag;
+}
+
+.tab-item {
+  -webkit-app-region: no-drag;
+  position: relative;
+  padding: 0 14px;
+  height: 100%;
+  border: none;
+  background: none;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: color 0.15s ease;
+  line-height: 38px;
+}
+
+.tab-item:hover {
+  color: var(--text-color);
+}
+
+.tab-item.active {
+  color: var(--text-color);
+}
+
+.tab-item.active::after {
+  content: "";
+  position: absolute;
+  bottom: 1px;
+  left: 14px;
+  right: 14px;
+  height: 1px;
+  background: var(--accent-color);
+  border-radius: 999px;
+  opacity: 0.72;
+}
+
+.tab-brand {
+  -webkit-app-region: no-drag;
+  font-size: 14px;
+  font-weight: 650;
+  letter-spacing: -0.2px;
+  margin-right: 10px;
+  color: var(--text-color);
+}
+
+.tab-spacer {
+  flex: 1;
+}
+
+.window-controls {
+  -webkit-app-region: no-drag;
+  display: flex;
+  align-items: center;
+  margin-left: 10px;
+  height: 100%;
+}
+
+.win-ctrl-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 42px;
+  height: 100%;
+  border: none;
+  background: none;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: background 0.1s, color 0.1s;
+}
+
+.win-ctrl-btn:hover {
+  background: var(--hover-bg);
+  color: var(--text-color);
+}
+
+.win-ctrl-btn.win-pinned {
+  color: var(--accent-color);
+}
+
+.win-ctrl-btn.win-close:hover {
+  background: #e81123;
+  color: #fff;
+}
+
+.workspace-selector {
+  -webkit-app-region: no-drag;
+  position: relative;
+  margin-right: 6px;
+}
+
+.workspace-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  padding: 0 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--panel-bg) 78%, var(--sidebar-bg) 22%);
+  color: var(--text-color);
+  font-size: 12px;
+  line-height: 21px;
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease, color 0.15s ease;
+  min-width: 200px;
+  max-width: 320px;
+  height: 23px;
+}
+
+.workspace-btn:hover {
+  background: var(--hover-bg);
+  border-color: var(--border-strong);
+}
+
+.ws-icon {
+  opacity: 0.7;
+  flex-shrink: 0;
+}
+
+.workspace-btn:hover .ws-icon {
+  opacity: 1;
+}
+
+.ws-name {
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-weight: 500;
+  text-align: center;
+}
+
+.ws-chevron {
+  opacity: 0.4;
+  flex-shrink: 0;
+  margin-left: auto;
+  transition: transform 0.2s;
+}
+
+.ws-chevron.open {
+  transform: rotate(180deg);
+}
+
+.dir-dropdown {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 6px);
+  width: 280px;
+  background: var(--surface-elevated);
+  border: 1px solid var(--border-color);
+  border-radius: 10px;
+  box-shadow: 0 10px 28px rgba(15, 17, 21, 0.12);
+  z-index: 200;
+  padding: 4px;
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+:root[data-theme="dark"] .dir-dropdown {
+  box-shadow: 0 14px 32px rgba(0, 0, 0, 0.34);
+}
+
+.dropdown-label {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-secondary);
+  padding: 6px 8px 4px;
+}
+
+.dir-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.12s;
+  font-size: 12px;
+  color: var(--text-color);
+}
+
+.dir-item:hover {
+  background: var(--hover-bg);
+}
+
+.dir-item.active {
+  background: var(--active-bg);
+}
+
+.dir-item-icon {
+  opacity: 0.45;
+  flex-shrink: 0;
+}
+
+.dir-item:hover .dir-item-icon {
+  opacity: 0.7;
+}
+
+.dir-item-text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.dir-item-name {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-weight: 500;
+}
+
+.dir-item-path {
+  font-size: 10px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.dir-check {
+  font-size: 11px;
+  color: var(--accent-color);
+  flex-shrink: 0;
+  opacity: 0.72;
+}
+
+.dropdown-empty {
+  text-align: center;
+  font-size: 11px;
+  color: var(--text-secondary);
+  padding: 8px;
+}
+
+.dropdown-divider {
+  height: 1px;
+  background: var(--border-color);
+  margin: 4px 4px;
+}
+
+.dir-item.browse {
+  color: var(--text-secondary);
+}
+
+.dir-item.browse:hover {
+  color: var(--text-color);
+}
+
+.dropdown-enter-active,
+.dropdown-leave-active {
+  transition: opacity 0.15s ease, transform 0.15s ease;
+}
+
+.dropdown-enter-from,
+.dropdown-leave-to {
+  opacity: 0;
+  transform: translateY(-4px);
+}
+
+.tab-content {
+  flex: 1;
+  display: flex;
+  position: relative;
+  z-index: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.tab-content > :is(.chat-view-layout, .collab-view, .knowledge-view, .asset-view, .agent-view, .settings-panel) {
+  min-width: 0;
+  min-height: 0;
+  contain: layout paint;
+}
+
+.tab-loading-state {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--panel-bg);
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.tab-loading-state.is-error {
+  color: var(--status-danger-fg);
+}
+
+.tab-plugin-warn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 10px;
+  height: 23px;
+  margin-left: 8px;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--panel-bg) 68%, var(--sidebar-bg) 32%);
+  border: 1px solid var(--border-color);
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease, color 0.15s ease;
+}
+
+.tab-plugin-warn:hover {
+  background: var(--hover-bg);
+  border-color: var(--border-strong);
+}
+
+.tab-plugin-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent-color);
+  flex-shrink: 0;
+  opacity: 0.8;
+}
+
+.tab-plugin-label {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-color);
+  white-space: nowrap;
+}
+
+.tab-plugin-action {
+  font-size: 11px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+</style>

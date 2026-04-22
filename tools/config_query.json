@@ -1,0 +1,13 @@
+{
+  "description": "Query Locus application configuration. Returns each setting's name, description, current value, and storage path. Use this to help users understand or troubleshoot their Locus configuration.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "category": {
+        "type": "string",
+        "enum": ["general", "display", "api", "models", "permissions", "knowledge"],
+        "description": "Filter by category. Omit to return all settings."
+      }
+    }
+  }
+}

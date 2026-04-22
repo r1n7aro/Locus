@@ -1,0 +1,27 @@
+{
+  "description": "Search Unity assets in the pre-built index. Use this to find prefabs, scenes, materials, textures, scripts, animations, etc.\n\nQuery syntax: space-separated predicates, AND semantics between predicates.\nIMPORTANT: Use | (pipe) within ANY predicate value for OR semantics. This works for BOTH type and name fields. Always combine related types/names into a single call instead of making separate calls.\nExample: 't:prefab|script n:player|hero' searches prefabs AND scripts whose name contains 'player' or 'hero' — in ONE call.\n\nAll name predicates (n=, n^, n$, n:) are CASE-INSENSITIVE.\n\nSupported predicates:\n  t:<type|type2>   — filter by asset type (OR with pipe)\n  n=<name|name2>   — exact filename match, case-insensitive (OR with pipe)\n  n^<pfx|pfx2>     — filename starts with, case-insensitive (OR with pipe)\n  n$<sfx|sfx2>     — filename ends with, case-insensitive (OR with pipe)\n  n:<sub|sub2>     — filename contains substring, case-insensitive (OR with pipe)\n  under:<pathPfx>  — asset path starts with prefix (e.g. 'Assets/UI')\n  guid:<guid>      — exact GUID match (32-hex)\n\nAsset types: scene, prefab, material, animation, animatorController, genericAsset, script, texture, audio, shader, model, otherYaml, metaOnly\n\nExamples:\n  't:prefab under:Assets/UI'                      — all prefabs under Assets/UI\n  't:scene'                                        — all scenes\n  't:prefab n:Player|Protagonist|Character|Hero'   — prefabs with name containing any of the terms\n  't:prefab|scene'                                 — all prefabs and scenes\n  't:material n:Metal'                              — materials containing 'Metal' in name\n\nOutput format: plain text, one line per result.\nFirst line is always: total:<N> showing:<start>-<end>\nSubsequent lines: field values separated by tab, one result per line.\nWhen `tp` is requested, ScriptableObject-style `genericAsset` results render as `ClassName(genericAsset)`.\nDefault fields: p (path only). Request more with 'fields' param.\nPass range '0' to return only the total count.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "q": {
+        "type": "string",
+        "description": "Query string with space-separated predicates. Example: 't:prefab under:Assets/UI n^Player'"
+      },
+      "range": {
+        "type": "string",
+        "description": "Row range as '<start>-<end>' (1-indexed, max 200 rows). Examples: '1-20' (first 20), '21-40' (next 20), '0' (count only). Default: '1-20'.",
+        "default": "1-20"
+      },
+      "fields": {
+        "type": "array",
+        "description": "Fields per result line (tab-separated). Fewer fields = fewer tokens. Available: tp, n, p, guid. `tp` shows `ClassName(genericAsset)` for ScriptableObject assets when indexed script metadata is available.",
+        "items": {
+          "type": "string",
+          "enum": ["tp", "n", "p", "guid"]
+        },
+        "default": ["p"]
+      }
+    },
+    "required": ["q"]
+  }
+}

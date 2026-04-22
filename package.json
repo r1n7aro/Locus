@@ -1,0 +1,49 @@
+{
+  "name": "locus",
+  "private": true,
+  "license": "GPL-3.0-or-later",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "typecheck": "vue-tsc --noEmit -p tsconfig.app.json",
+    "typecheck:test": "vue-tsc --noEmit -p tsconfig.test.json",
+    "build": "bun run typecheck && vite build",
+    "build:tauri": "bun run licenses:bundle && bun run build",
+    "licenses:bundle": "bun run scripts/generate-third-party-bundle.mjs",
+    "preview": "vite preview",
+    "tauri": "tauri",
+    "docs:dev": "cd docs && bun run dev",
+    "docs:validate": "cd docs && bun run validate",
+    "docs:broken-links": "cd docs && bun run broken-links",
+    "docs:build": "cd docs && bun run build",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2",
+    "@tauri-apps/plugin-dialog": "^2.6.0",
+    "@tauri-apps/plugin-opener": "^2",
+    "@types/three": "^0.183.1",
+    "@types/turndown": "^5.0.6",
+    "ag-psd": "^30.1.0",
+    "highlight.js": "^11.11.1",
+    "marked": "^17.0.4",
+    "marked-highlight": "^2.2.3",
+    "pinia": "^3.0.4",
+    "three": "^0.183.2",
+    "turndown": "^7.2.4",
+    "turndown-plugin-gfm": "^1.0.2",
+    "vditor": "^3.11.2",
+    "vue": "^3.5.13"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2",
+    "@vitejs/plugin-vue": "^5.2.1",
+    "typescript": "~5.6.2",
+    "vite": "^6.0.3",
+    "vite-plugin-static-copy": "^4.0.1",
+    "vitest": "^4.1.2",
+    "vue-tsc": "^2.1.10"
+  }
+}

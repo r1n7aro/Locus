@@ -1,0 +1,69 @@
+---
+title: Install and Setup
+description: Install and configure Locus quickly
+---
+
+<br/>
+<div style={{ textAlign: 'center', color: '#8f2f2f' }}>
+  **Before you let Locus make any changes, please make sure you have backed up your project files.**<br />
+  **AI Agents may not always be reliable when executing tasks**
+</div>
+
+<br/>
+
+## Configure Model Services
+
+Locus must be configured with a remote AI service as its "brain", and **the capability of the remote model directly determines how well it works**.
+
+> **Subscription services and message formats currently supported by Locus**
+> - OpenAI subscription
+> - Anthropic subscription (Anthropic has explicitly stated that subscriptions are not supported through third-party clients, and you use it at your own risk)
+> - OpenAI Response API
+> - Anthropic Messages API
+> - OpenAI ChatCompeletions API
+
+Aside from the remote model service you configure, Locus is a pure client application. Other than model calls, no information is sent to the internet.
+
+We recommend installing from our installer package. After installation, the first launch will show the onboarding flow:
+
+## Select a Project and Install the Plugin
+
+![img](/images/overview/install-and-setup/unity-plugin-2.png)
+
+Locus communicates with the Unity Editor through a Unity plugin. This is how it detects editor state, executes C# code, and so on.
+
+The plugin is installed to `Assets/Locus` by default (it may later move under `Packages`). You can manually move the plugin inside your project.
+
+## Version Control / Git Configuration
+
+![img](/images/overview/install-and-setup/git-config.png)
+
+Locus uses version control software to provide features such as "undo" and "change analysis".
+
+We also provide a graphical interface for Git.
+
+> We plan to support more version control systems such as P4 and SVN in the future, but only Git is supported right now
+
+## Scan the Asset Database
+
+![img](/images/overview/install-and-setup/asset-scan.png)
+
+Locus does not analyze assets through the Unity Editor. Instead, it directly reads Unity's serialized files on disk to analyze reference relationships.
+
+## Try Your First Conversation
+
+<br/>
+<div style={{ textAlign: 'center', color: '#8f2f2f' }}>
+  **Before you let Locus make any changes, please make sure you have backed up your project files.**<br />
+  **AI Agents may not always be reliable when executing tasks**
+</div>
+
+Locus setup is now complete. You can adjust these settings later in the Settings tab.
+
+You can try prompts like:
+
+- Help me analyze the code structure of the project and point out places that can be optimized?
+- I want to create a side-scrolling platformer. Please write a simple 2D side-scrolling controller and place a few test platforms in the current scene
+- Help me commit the current changes to Git in batches
+- I want to create my own custom render pipeline with a cartoon style. Draft a plan for me to review before implementation
+- Generate localized strings for the description field of every 'Item' asset in the project and fill them into a table

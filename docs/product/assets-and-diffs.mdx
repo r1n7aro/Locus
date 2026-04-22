@@ -1,0 +1,43 @@
+---
+title: 资产图谱与语义差异
+description: 围绕 Unity 资源数据库、引用图和语义 diff 建立的工作能力。
+sidebarTitle: 资产与 Diff
+---
+
+Locus 把 Unity 资产组织成图谱级工作对象，并为关键资源类型提供更贴近 Unity 结构的语义 diff 与 merge 视图。
+
+## 资产数据库与引用图
+
+当前实现已经覆盖：
+
+- 扫描 `Assets` 与 `Packages`
+- 解析 `.meta`、YAML 资产和脚本信息
+- 建立资产节点与引用边
+- 提供依赖、反向引用、GUID 解析和路径解析
+- 输出资产风险报告
+- 识别失效引用、`Missing Script`、解析失败和重复 GUID
+- 通过文件系统 watcher 增量更新索引
+
+这让 Locus 能回答很多 Unity 项目里的高价值问题：
+
+- 这个 Prefab 被谁引用
+- 一个 ScriptableObject 改动会影响哪些资源
+- 当前项目里哪里存在重复 GUID 风险
+- 哪些资源已经出现 Missing Script
+
+## 语义 diff 与 merge
+
+仓库里的 diff / merge 模块已经覆盖：
+
+- Scene 层级与 Inspector 结构展示
+- `PrefabInstance` 的语义目标构建
+- 材质、粒子系统等常见对象的分组化字段展示
+- 语义 diff 与文本 diff 双视图
+- 面向 Unity 资源的 merge semantic session 与 target materialization
+- 冲突解决工作流与合并面板
+
+## 适合的使用场景
+
+- 资产排障和影响范围分析
+- Scene、Prefab、Material、ParticleSystem 改动审查
+- Unity 资源冲突处理和合并辅助

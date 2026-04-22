@@ -1,0 +1,1598 @@
+
+<script setup lang="ts">
+import { computed, onMounted, onUnmounted, ref, watch } from "vue";
+import { listen } from "@tauri-apps/api/event";
+import { open } from "@tauri-apps/plugin-dialog";
+import { openUrl } from "@tauri-apps/plugin-opener";
+import type { UnlistenFn } from "@tauri-apps/api/event";
+import type { GitProbeResult, PluginStatus, AssetDbScanEvent, ScanStats } from "../types";
+import { t, setLocale, locale, type Locale } from "../i18n";
+import { useTheme, type ThemePreference } from "../composables/useTheme";
+import { useCopyFeedback } from "../composables/useCopyFeedback";
+import { normalizeAppError } from "../services/errors";
+import { useUiStore } from "../stores/ui";
+import {
+  getProviders, codexStatus, saveProviderKey, getAuthUrl,
+  exchangeAuthCode, codexStartLogin, codexPollLogin,
+  type ProviderStatus,
+} from "../services/auth";
+import { setWorkingDir, getWorkingDir } from "../services/project";
+import { checkUnityPlugin, installUnityPlugin } from "../services/unity";
+import { gitCheckUserConfig, gitInitUnity, gitProbe, gitSetUserConfig } from "../services/git";
+import { assetDbScan } from "../services/asset";
+import BaseSegmented from "./ui/BaseSegmented.vue";
+import GitMissingHelp from "./git/GitMissingHelp.vue";
+import {
+  canInitOnboardingGit,
+  resolveOnboardingGitInitTargetPath,
+  resolveOnboardingVcsStepState,
+} from "./onboarding/onboardingVcs";
+import SubscriptionDisclaimerModal from "./SubscriptionDisclaimerModal.vue";
+
+const emit = defineEmits<{ completed: [] }>();
+const uiStore = useUiStore();
+
+const step = ref(0); // 0=welcome, 1=auth, 2=project, 3=plugin, 4=vcs, 5=scan
+const TOTAL_STEPS = 6;
+const direction = ref(1);
+const titlebarStepText = computed(() => t("onboarding.step", step.value + 1, TOTAL_STEPS));
+
+function goNext() {
+  direction.value = 1;
+  step.value++;
+}
+function goBack() {
+  direction.value = -1;
+  step.value--;
+}
+function skipAll() {
+  emit("completed");
+}
+
+function selectLanguage(lang: Locale) {
+  setLocale(lang);
+}
+
+const { preference: themePreference, setThemePreference } = useTheme();
+const languageOptions = [
+  { value: "zh", label: "中文" },
+  { value: "en", label: "English" },
+] as const;
+const themeOptionDefs: { value: ThemePreference; labelKey: string }[] = [
+  { value: "system", labelKey: "settings.display.themeSystem" },
+  { value: "light",  labelKey: "settings.display.themeLight" },
+  { value: "dark",   labelKey: "settings.display.themeDark" },
+];
+const themeOptions = computed(() =>
+  themeOptionDefs.map((opt) => ({
+    value: opt.value,
+    label: t(opt.labelKey),
+  })),
+);
+
+function handleLanguageChange(value: string) {
+  selectLanguage(value as Locale);
+}
+
+function handleThemeChange(value: string) {
+  setThemePreference(value as ThemePreference);
+}
+
+const providers = ref<ProviderStatus[]>([]);
+const authExpanded = ref<"openrouter" | "anthropic" | "codex" | null>(null);
+const authError = ref("");
+const authSuccess = ref("");
+
+// OpenRouter
+const apiKeyInput = ref("");
+const apiKeySaving = ref(false);
+
+// Anthropic OAuth
+const oauthStep = ref<"idle" | "waiting_code" | "exchanging">("idle");
+const oauthCode = ref("");
+
+// OpenAI Codex
+type CodexStep = "idle" | "opening" | "waiting" | "success";
+const codexStep = ref<CodexStep>("idle");
+const codexAuthenticated = ref(false);
+const codexUserCode = ref("");
+const codexUrl = ref("");
+const codexDeviceAuthId = ref("");
+const codexInterval = ref(5);
+const { copied: codexCodeCopied, copyText: copyCodexText, reset: resetCodexCopyState } = useCopyFeedback();
+let codexTimer: ReturnType<typeof setTimeout> | null = null;
+let codexPollInFlight = false;
+
+const hasAnyProvider = ref(false);
+
+// Subscription disclaimer
+const showDisclaimer = ref(false);
+const disclaimerTarget = ref<"anthropic" | null>(null);
+
+function showAnthropicDisclaimer() {
+  disclaimerTarget.value = "anthropic";
+  showDisclaimer.value = true;
+}
+
+function confirmDisclaimer() {
+  const target = disclaimerTarget.value;
+  showDisclaimer.value = false;
+  disclaimerTarget.value = null;
+  if (target === "anthropic") startOAuth();
+}
+
+function cancelDisclaimer() {
+  showDisclaimer.value = false;
+  disclaimerTarget.value = null;
+}
+
+async function loadProviders() {
+  codexAuthenticated.value = false;
+  hasAnyProvider.value = false;
+  try {
+    providers.value = await getProviders();
+    hasAnyProvider.value = providers.value.some(p => p.hasKey);
+    try {
+      const cs = await codexStatus();
+      codexAuthenticated.value = cs.authenticated;
+      if (cs.authenticated) hasAnyProvider.value = true;
+    } catch { /* ignore */ }
+  } catch { /* ignore */ }
+}
+
+async function saveApiKey() {
+  const key = apiKeyInput.value.trim();
+  if (!key) return;
+  apiKeySaving.value = true;
+  authError.value = "";
+  try {
+    await saveProviderKey("openrouter", key);
+    authSuccess.value = t("settings.provider.saved");
+    apiKeyInput.value = "";
+    await loadProviders();
+    hasAnyProvider.value = true;
+    setTimeout(() => { authSuccess.value = ""; }, 2000);
+  } catch (e) {
+    authError.value = t("settings.provider.saveFailed", normalizeAppError(e).message);
+  } finally {
+    apiKeySaving.value = false;
+  }
+}
+
+async function startOAuth() {
+  authError.value = "";
+  try {
+    const info = await getAuthUrl();
+    await openUrl(info.url);
+    oauthStep.value = "waiting_code";
+  } catch (e) {
+    authError.value = t("settings.anthropic.authUrlFailed", normalizeAppError(e).message);
+  }
+}
+
+async function submitOAuthCode() {
+  const code = oauthCode.value.trim();
+  if (!code) return;
+  authError.value = "";
+  oauthStep.value = "exchanging";
+  try {
+    await exchangeAuthCode(code);
+    authSuccess.value = t("settings.anthropic.loginSuccess");
+    oauthStep.value = "idle";
+    oauthCode.value = "";
+    await loadProviders();
+    hasAnyProvider.value = true;
+    setTimeout(() => { authSuccess.value = ""; }, 2000);
+  } catch (e) {
+    authError.value = t("settings.anthropic.exchangeFailed", normalizeAppError(e).message);
+    oauthStep.value = "waiting_code";
+  }
+}
+
+function cancelOAuth() {
+  oauthStep.value = "idle";
+  oauthCode.value = "";
+  authError.value = "";
+}
+
+async function startCodexLogin() {
+  if (codexStep.value === "opening" || codexStep.value === "waiting") return;
+  stopCodexPolling();
+  resetCodexCopyState();
+  authError.value = "";
+  codexStep.value = "opening";
+  try {
+    const info = await codexStartLogin();
+    codexUserCode.value = info.userCode;
+    codexUrl.value = info.url;
+    codexDeviceAuthId.value = info.deviceAuthId;
+    codexInterval.value = Math.max(info.interval, 5);
+    codexStep.value = "waiting";
+    void openUrl(info.url).catch(() => undefined);
+    scheduleCodexPoll();
+  } catch (e) {
+    codexStep.value = "idle";
+    authError.value = t("settings.codex.loginFailed", normalizeAppError(e).message);
+  }
+}
+
+function stopCodexPolling() {
+  if (codexTimer) {
+    clearTimeout(codexTimer);
+    codexTimer = null;
+  }
+  codexPollInFlight = false;
+}
+
+function scheduleCodexPoll(delayMs = codexInterval.value * 1000) {
+  if (codexTimer) clearTimeout(codexTimer);
+  codexTimer = setTimeout(() => {
+    codexTimer = null;
+    void pollCodex();
+  }, delayMs);
+}
+
+async function pollCodex() {
+  if (codexPollInFlight || codexStep.value !== "waiting") return;
+  codexPollInFlight = true;
+  try {
+    const result = await codexPollLogin(codexDeviceAuthId.value, codexUserCode.value);
+    if (result.status === "success") {
+      stopCodexPolling();
+      codexStep.value = "success";
+      codexAuthenticated.value = true;
+      hasAnyProvider.value = true;
+      authSuccess.value = t("settings.codex.loginSuccess");
+      setTimeout(() => { authSuccess.value = ""; codexStep.value = "idle"; }, 2000);
+    } else if (result.status === "failed") {
+      stopCodexPolling();
+      codexStep.value = "idle";
+      authError.value = result.message ?? t("settings.codex.authFailed");
+    } else if (codexStep.value === "waiting") {
+      scheduleCodexPoll();
+    }
+  } catch {
+    if (codexStep.value === "waiting") {
+      scheduleCodexPoll();
+    }
+  } finally {
+    codexPollInFlight = false;
+  }
+}
+
+function cancelCodexLogin() {
+  stopCodexPolling();
+  resetCodexCopyState();
+  codexStep.value = "idle";
+}
+
+async function copyCodexCode() {
+  await copyCodexText(codexUserCode.value);
+}
+
+function handleApiKeyKeydown(e: KeyboardEvent) {
+  if (e.key === "Enter") { e.preventDefault(); saveApiKey(); }
+}
+
+function handleOAuthKeydown(e: KeyboardEvent) {
+  if (e.key === "Enter") { e.preventDefault(); submitOAuthCode(); }
+  else if (e.key === "Escape") cancelOAuth();
+}
+
+const projectPath = ref("");
+const projectError = ref("");
+const projectValid = ref(false);
+
+async function browseProject() {
+  try {
+    const selected = await open({ directory: true, multiple: false });
+    if (selected && typeof selected === "string") {
+      projectError.value = "";
+      try {
+        await setWorkingDir(selected);
+        projectPath.value = selected;
+        projectValid.value = true;
+      } catch (e) {
+        projectError.value = normalizeAppError(e).message;
+        projectValid.value = false;
+      }
+    }
+  } catch { /* cancelled */ }
+}
+
+const pluginStatus = ref<PluginStatus | null>(null);
+const pluginInstalling = ref(false);
+const pluginError = ref("");
+let unlistenPlugin: UnlistenFn | null = null;
+
+async function checkPlugin() {
+  pluginError.value = "";
+  try {
+    pluginStatus.value = await checkUnityPlugin();
+  } catch {
+    pluginStatus.value = null;
+  }
+}
+
+async function installPlugin() {
+  pluginInstalling.value = true;
+  pluginError.value = "";
+  try {
+    await installUnityPlugin();
+    pluginStatus.value = { status: "upToDate" };
+  } catch (e) {
+    pluginError.value = normalizeAppError(e).message;
+  } finally {
+    pluginInstalling.value = false;
+  }
+}
+
+// ── Step 4: VCS ──
+const gitProbeState = ref<GitProbeResult | null>(null);
+const gitInitLoading = ref(false);
+const gitError = ref("");
+
+const gitConfigName = ref("");
+const gitConfigEmail = ref("");
+const gitConfigLoadedName = ref("");
+const gitConfigLoadedEmail = ref("");
+const gitConfigSaving = ref(false);
+const gitConfigError = ref("");
+const gitUserMissing = ref(false);
+
+const gitInitAvailable = computed(() => !!gitProbeState.value?.available);
+const gitInitTargetPath = computed(() => resolveOnboardingGitInitTargetPath(projectPath.value, projectValid.value));
+const gitVcsStepState = computed(() => resolveOnboardingVcsStepState(gitInitTargetPath.value, gitProbeState.value));
+const gitCanInit = computed(() => canInitOnboardingGit(gitInitTargetPath.value, gitProbeState.value));
+const gitConfigComplete = computed(() => !!gitConfigName.value.trim() && !!gitConfigEmail.value.trim());
+const gitConfigDirty = computed(() => (
+  gitConfigName.value.trim() !== gitConfigLoadedName.value
+  || gitConfigEmail.value.trim() !== gitConfigLoadedEmail.value
+));
+const gitHelpText = computed(() => {
+  const probe = gitProbeState.value;
+  if (!probe) return "";
+  if (!probe.available) {
+    return probe.envOverride
+      ? t("git.detect.invalidOverride", probe.envOverride)
+      : t("git.detect.missing");
+  }
+  if (!probe.inPath && probe.path) {
+    return t("git.detect.foundOutsidePath", probe.path);
+  }
+  return "";
+});
+
+function syncGitConfigForm(cfg: { name: string; email: string }) {
+  const name = cfg.name.trim();
+  const email = cfg.email.trim();
+  gitConfigName.value = name;
+  gitConfigEmail.value = email;
+  gitConfigLoadedName.value = name;
+  gitConfigLoadedEmail.value = email;
+  gitUserMissing.value = !name || !email;
+}
+
+function resetGitConfigForm() {
+  gitConfigName.value = "";
+  gitConfigEmail.value = "";
+  gitConfigLoadedName.value = "";
+  gitConfigLoadedEmail.value = "";
+  gitConfigError.value = "";
+  gitUserMissing.value = false;
+}
+
+async function checkGit() {
+  gitError.value = "";
+  gitConfigError.value = "";
+  try {
+    gitProbeState.value = await gitProbe();
+    if (gitProbeState.value?.available) {
+      try {
+        syncGitConfigForm(await gitCheckUserConfig());
+      } catch { /* ignore — non-fatal */ }
+    } else {
+      resetGitConfigForm();
+    }
+  } catch (e) {
+    resetGitConfigForm();
+    gitProbeState.value = {
+      available: false,
+      inPath: false,
+      isRepo: false,
+    };
+    gitError.value = normalizeAppError(e).message;
+  }
+}
+
+async function persistGitConfig(): Promise<boolean> {
+  const name = gitConfigName.value.trim();
+  const email = gitConfigEmail.value.trim();
+  if (!name || !email) {
+    gitUserMissing.value = true;
+    gitConfigError.value = t("git.config.required");
+    return false;
+  }
+
+  gitConfigSaving.value = true;
+  gitConfigError.value = "";
+  try {
+    await gitSetUserConfig(name, email);
+    syncGitConfigForm({ name, email });
+    return true;
+  } catch (e) {
+    gitConfigError.value = normalizeAppError(e).message;
+    return false;
+  } finally {
+    gitConfigSaving.value = false;
+  }
+}
+
+async function saveGitConfig() {
+  gitError.value = "";
+  await persistGitConfig();
+}
+
+async function checkGitConfigAndInit() {
+  gitError.value = "";
+  if (!gitInitTargetPath.value) {
+    gitError.value = t("onboarding.vcs.needProject");
+    return;
+  }
+  if (!gitInitAvailable.value) {
+    gitError.value = gitHelpText.value || t("git.detect.missing");
+    return;
+  }
+  try {
+    if (!gitConfigComplete.value) {
+      gitUserMissing.value = true;
+      gitConfigError.value = t("git.config.required");
+      return;
+    }
+    if (gitUserMissing.value || gitConfigDirty.value) {
+      const saved = await persistGitConfig();
+      if (!saved) return;
+    }
+    await doInitGit();
+  } catch (e) {
+    gitError.value = normalizeAppError(e).message;
+  }
+}
+
+async function doInitGit() {
+  gitInitLoading.value = true;
+  gitError.value = "";
+  try {
+    await gitInitUnity();
+    await checkGit();
+  } catch (e) {
+    gitError.value = normalizeAppError(e).message;
+  } finally {
+    gitInitLoading.value = false;
+  }
+}
+
+const scanPhase = ref<AssetDbScanEvent | null>(null);
+const scanDone = ref(false);
+const scanStats = ref<ScanStats | null>(null);
+let unlistenScan: UnlistenFn | null = null;
+
+async function startScan() {
+  scanPhase.value = { phase: "dirScan" };
+  scanDone.value = false;
+  try {
+    unlistenScan = await listen<AssetDbScanEvent>("ref-graph-scan", (e) => {
+      scanPhase.value = e.payload;
+      if (e.payload.phase === "done") {
+        scanStats.value = e.payload.stats;
+        scanDone.value = true;
+      }
+    });
+    await assetDbScan();
+  } catch (e) {
+    scanPhase.value = { phase: "error", error: normalizeAppError(e) };
+  }
+}
+
+watch(step, async (s) => {
+  if (s === 1) await loadProviders();
+  if (s === 3) {
+    await checkPlugin();
+    if (!unlistenPlugin) {
+      unlistenPlugin = await listen<PluginStatus>("unity-plugin-status", (e) => {
+        pluginStatus.value = e.payload;
+      });
+    }
+  }
+  if (s === 4) await checkGit();
+});
+
+function scanProgressText(): string {
+  if (!scanPhase.value) return "";
+  switch (scanPhase.value.phase) {
+    case "dirScan": return t("chat.assetDb.scanning.dirScan");
+    case "metaParse": return t("chat.assetDb.scanning.metaParse", scanPhase.value.completed, scanPhase.value.total);
+    case "yamlParse": return t("chat.assetDb.scanning.yamlParse", scanPhase.value.completed, scanPhase.value.total);
+    case "dbWrite": return t("chat.assetDb.scanning.dbWrite");
+    case "done": return t("onboarding.scan.complete", scanPhase.value.stats.nodesAdded, scanPhase.value.stats.edgesAdded);
+    case "error": return t("chat.assetDb.scanning.error", scanPhase.value.error.message);
+    default: return "";
+  }
+}
+
+onMounted(async () => {
+  try {
+    const dir = await getWorkingDir();
+    if (dir && dir.trim() !== "") {
+      projectPath.value = dir;
+      projectValid.value = true;
+    }
+  } catch { /* ignore */ }
+});
+
+onUnmounted(() => {
+  unlistenScan?.();
+  unlistenPlugin?.();
+  stopCodexPolling();
+});
+</script>
+
+<template>
+  <div class="onboarding-container">
+    <div class="onboarding-titlebar">
+      <div class="onboarding-titlebar-left">
+        <div class="onboarding-titlebar-logo" aria-hidden="true">
+          <svg viewBox="0 0 32 32" width="18" height="18" fill="none">
+            <rect width="32" height="32" rx="8" fill="var(--accent-color)"/>
+            <text x="16" y="22" text-anchor="middle" font-size="16" font-weight="bold" fill="var(--bg-color)">L</text>
+          </svg>
+        </div>
+        <span class="onboarding-titlebar-brand">Locus</span>
+        <span class="onboarding-titlebar-caption">{{ titlebarStepText }}</span>
+      </div>
+
+      <div class="onboarding-titlebar-actions">
+        <button v-if="step > 0" class="skip-all-btn" @click.stop="skipAll">{{ t("onboarding.skip") }}</button>
+        <div class="window-controls">
+          <button class="win-ctrl-btn" @click="uiStore.winMinimize" :title="t('app.win.minimize')">
+            <svg viewBox="0 0 12 12" width="12" height="12"><rect x="1" y="5.5" width="10" height="1" fill="currentColor"/></svg>
+          </button>
+          <button class="win-ctrl-btn" @click="uiStore.winToggleMaximize" :title="t('app.win.maximize')">
+            <svg v-if="!uiStore.isMaximized" viewBox="0 0 12 12" width="12" height="12"><rect x="1.5" y="1.5" width="9" height="9" rx="1" fill="none" stroke="currentColor" stroke-width="1.2"/></svg>
+            <svg v-else viewBox="0 0 12 12" width="12" height="12"><rect x="2.5" y="0.5" width="8" height="8" rx="1" fill="none" stroke="currentColor" stroke-width="1.1"/><rect x="0.5" y="2.5" width="8" height="8" rx="1" fill="var(--sidebar-bg)" stroke="currentColor" stroke-width="1.1"/></svg>
+          </button>
+          <button class="win-ctrl-btn win-close" @click="uiStore.winClose" :title="t('app.win.close')">
+            <svg viewBox="0 0 12 12" width="12" height="12"><path d="M2 2l8 8M10 2l-8 8" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <div class="onboarding-body">
+      <div class="step-indicator" v-if="step > 0">
+        <div
+          v-for="i in TOTAL_STEPS"
+          :key="i"
+          class="step-dot"
+          :class="{ active: i - 1 === step, done: i - 1 < step }"
+        />
+      </div>
+
+    <div v-if="step === 0" class="step-card welcome-card">
+      <div class="welcome-logo">
+        <svg viewBox="0 0 32 32" width="48" height="48" fill="none">
+          <rect width="32" height="32" rx="8" fill="var(--accent-color)"/>
+          <text x="16" y="22" text-anchor="middle" font-size="16" font-weight="bold" fill="var(--bg-color)">L</text>
+        </svg>
+      </div>
+      <h1 class="welcome-title">{{ t("onboarding.welcome.title") }}</h1>
+      <p class="welcome-subtitle">{{ t("onboarding.welcome.subtitle") }}</p>
+
+      <div class="welcome-preferences">
+        <section class="welcome-section">
+          <p class="welcome-section-label">{{ t("onboarding.welcome.selectLang") }}</p>
+          <BaseSegmented
+            class="welcome-segmented"
+            :model-value="locale"
+            :options="[...languageOptions]"
+            @update:model-value="handleLanguageChange"
+          />
+        </section>
+
+        <section class="welcome-section">
+          <p class="welcome-section-label">{{ t("settings.display.themeTitle") }}</p>
+          <BaseSegmented
+            class="welcome-segmented"
+            :model-value="themePreference"
+            :options="themeOptions"
+            @update:model-value="handleThemeChange"
+          />
+        </section>
+      </div>
+
+      <div class="step-actions welcome-actions">
+        <button class="ob-btn primary welcome-next-btn" @click="goNext">{{ t("onboarding.next") }}</button>
+      </div>
+    </div>
+
+    <div v-else-if="step === 1" class="step-card">
+      <h2 class="step-title">{{ t("onboarding.auth.title") }}</h2>
+      <div class="step-desc auth-desc-lines">
+        <p>{{ t("onboarding.auth.desc1") }}</p>
+        <p>{{ t("onboarding.auth.desc2") }}</p>
+        <p>{{ t("onboarding.auth.desc3") }}</p>
+      </div>
+
+      <div v-if="authSuccess" class="msg success">{{ authSuccess }}</div>
+      <div v-if="authError" class="msg error">{{ authError }}</div>
+
+      <!-- OpenRouter -->
+      <div class="provider-card" :class="{ expanded: authExpanded === 'openrouter' }">
+        <div class="provider-header" @click="authExpanded = authExpanded === 'openrouter' ? null : 'openrouter'">
+          <div class="provider-left">
+            <span class="provider-name">{{ t("onboarding.auth.openrouter") }}</span>
+            <span class="provider-desc-text">{{ t("onboarding.auth.openrouterDesc") }}</span>
+          </div>
+          <span class="provider-badge" :class="{ configured: providers.find(p => p.id === 'openrouter')?.hasKey }">
+            {{ providers.find(p => p.id === 'openrouter')?.hasKey ? t("onboarding.auth.configured") : t("onboarding.auth.notConfigured") }}
+          </span>
+        </div>
+        <div v-if="authExpanded === 'openrouter'" class="provider-body" @click.stop>
+          <div class="input-row">
+            <input
+              v-model="apiKeyInput"
+              class="ob-input"
+              type="password"
+              placeholder="sk-or-..."
+              @keydown="handleApiKeyKeydown"
+            />
+            <button class="ob-btn primary" :disabled="apiKeySaving || !apiKeyInput.trim()" @click="saveApiKey">
+              {{ apiKeySaving ? "..." : t("settings.provider.save") }}
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Anthropic -->
+      <div class="provider-card" :class="{ expanded: authExpanded === 'anthropic' }">
+        <div class="provider-header" @click="authExpanded = authExpanded === 'anthropic' ? null : 'anthropic'">
+          <div class="provider-left">
+            <span class="provider-name">{{ t("onboarding.auth.anthropic") }}</span>
+            <span class="provider-desc-text">{{ t("onboarding.auth.anthropicDesc") }}</span>
+          </div>
+          <span class="provider-badge" :class="{ configured: providers.find(p => p.id === 'anthropic')?.hasKey }">
+            {{ providers.find(p => p.id === 'anthropic')?.hasKey ? t("onboarding.auth.configured") : t("onboarding.auth.notConfigured") }}
+          </span>
+        </div>
+        <div v-if="authExpanded === 'anthropic'" class="provider-body" @click.stop>
+          <template v-if="providers.find(p => p.id === 'anthropic')?.hasKey">
+            <div class="status-row ok">{{ t("settings.anthropic.loggedIn") }}</div>
+          </template>
+          <template v-else-if="oauthStep === 'idle'">
+            <button class="ob-btn primary" @click="showAnthropicDisclaimer">{{ t("settings.anthropic.loginBtn") }}</button>
+            <span class="hint-text">{{ t("settings.anthropic.hint") }}</span>
+          </template>
+          <template v-else-if="oauthStep === 'waiting_code'">
+            <p class="instruction-text">{{ t("settings.anthropic.instruction") }}</p>
+            <div class="input-row">
+              <input v-model="oauthCode" class="ob-input" :placeholder="t('settings.anthropic.codePlaceholder')" @keydown="handleOAuthKeydown" />
+              <button class="ob-btn primary" :disabled="!oauthCode.trim()" @click="submitOAuthCode">{{ t("settings.anthropic.confirm") }}</button>
+              <button class="ob-btn secondary" @click="cancelOAuth">{{ t("settings.anthropic.cancel") }}</button>
+            </div>
+          </template>
+          <template v-else-if="oauthStep === 'exchanging'">
+            <div class="status-row loading">{{ t("settings.anthropic.verifying") }}</div>
+          </template>
+        </div>
+      </div>
+
+      <!-- OpenAI Codex -->
+      <div class="provider-card" :class="{ expanded: authExpanded === 'codex' }">
+        <div class="provider-header" @click="authExpanded = authExpanded === 'codex' ? null : 'codex'">
+          <div class="provider-left">
+            <span class="provider-name">{{ t("onboarding.auth.codex") }}</span>
+            <span class="provider-desc-text">{{ t("onboarding.auth.codexDesc") }}</span>
+          </div>
+          <span class="provider-badge" :class="{ configured: codexAuthenticated || codexStep === 'success' }">
+            {{ codexAuthenticated || codexStep === 'success' ? t("onboarding.auth.configured") : t("onboarding.auth.notConfigured") }}
+          </span>
+        </div>
+        <div v-if="authExpanded === 'codex'" class="provider-body" @click.stop>
+          <template v-if="codexAuthenticated && codexStep === 'idle'">
+            <div class="status-row ok">{{ t("settings.codex.loggedIn") }}</div>
+          </template>
+          <template v-else-if="codexStep === 'idle'">
+            <button class="ob-btn primary" @click="startCodexLogin">{{ t("settings.codex.loginBtn") }}</button>
+            <span class="hint-text">{{ t("settings.codex.hint") }}</span>
+          </template>
+          <template v-else-if="codexStep === 'opening'">
+            <button class="ob-btn primary" type="button" disabled>{{ t("settings.codex.opening") }}</button>
+            <span class="hint-text">{{ t("settings.codex.hint") }}</span>
+          </template>
+          <template v-else-if="codexStep === 'waiting'">
+            <p class="instruction-text">{{ t("settings.codex.instruction") }}</p>
+            <button
+              class="codex-code-row"
+              :class="{ copied: codexCodeCopied }"
+              type="button"
+              :title="codexCodeCopied ? t('common.copied') : t('common.clickToCopy')"
+              @click="copyCodexCode"
+            >
+              <code class="codex-code">{{ codexUserCode }}</code>
+              <span class="codex-copy-indicator">
+                {{ codexCodeCopied ? t("common.copied") : t("common.clickToCopy") }}
+              </span>
+            </button>
+            <div class="status-row loading">{{ t("settings.codex.waiting") }}</div>
+            <button class="ob-btn secondary" @click="cancelCodexLogin">{{ t("settings.codex.cancel") }}</button>
+          </template>
+          <template v-else-if="codexStep === 'success'">
+            <div class="status-row ok">{{ t("settings.codex.loginSuccess") }}</div>
+          </template>
+        </div>
+      </div>
+
+      <p class="skip-hint">{{ t("onboarding.auth.skipHint") }}</p>
+
+      <div class="step-actions">
+        <button class="ob-btn secondary" @click="goBack">{{ t("onboarding.back") }}</button>
+        <button class="ob-btn primary" @click="goNext">{{ t("onboarding.next") }}</button>
+      </div>
+    </div>
+
+    <div v-else-if="step === 2" class="step-card">
+      <h2 class="step-title">{{ t("onboarding.project.title") }}</h2>
+      <p class="step-desc">{{ t("onboarding.project.desc") }}</p>
+
+      <div class="project-area">
+        <button class="browse-btn" @click="browseProject">
+          <svg viewBox="0 0 16 16" fill="currentColor" width="20" height="20">
+            <path d="M1 3.5A1.5 1.5 0 0 1 2.5 2h3.879a1.5 1.5 0 0 1 1.06.44l1.122 1.12A1.5 1.5 0 0 0 9.62 4H13.5A1.5 1.5 0 0 1 15 5.5v7a1.5 1.5 0 0 1-1.5 1.5h-11A1.5 1.5 0 0 1 1 12.5v-9z"/>
+          </svg>
+          {{ t("onboarding.project.browse") }}
+        </button>
+        <div v-if="projectPath" class="project-selected" :class="{ valid: projectValid, invalid: !projectValid }">
+          <svg v-if="projectValid" class="status-icon ok" viewBox="0 0 16 16" fill="currentColor" width="16" height="16">
+            <path d="M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L2.22 9.28a.75.75 0 0 1 1.06-1.06L6 10.94l6.72-6.72a.75.75 0 0 1 1.06 0z"/>
+          </svg>
+          <span class="project-path">{{ projectPath }}</span>
+        </div>
+        <div v-if="projectError" class="msg error">{{ projectError }}</div>
+      </div>
+
+      <p class="skip-hint">{{ t("onboarding.project.skipHint") }}</p>
+
+      <div class="step-actions">
+        <button class="ob-btn secondary" @click="goBack">{{ t("onboarding.back") }}</button>
+        <button class="ob-btn primary" @click="goNext">{{ t("onboarding.next") }}</button>
+      </div>
+    </div>
+
+    <div v-else-if="step === 3" class="step-card">
+      <h2 class="step-title">{{ t("onboarding.plugin.title") }}</h2>
+      <p class="step-desc">{{ t("onboarding.plugin.desc") }}</p>
+
+      <div class="status-area">
+        <template v-if="!projectValid">
+          <div class="status-row warn">{{ t("onboarding.plugin.needProject") }}</div>
+        </template>
+        <template v-else-if="pluginStatus === null">
+          <div class="status-row loading">{{ t("common.loading") }}</div>
+        </template>
+        <template v-else-if="pluginStatus.status === 'upToDate'">
+          <div class="status-row ok">
+            <svg class="status-icon" viewBox="0 0 16 16" fill="currentColor" width="16" height="16">
+              <path d="M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L2.22 9.28a.75.75 0 0 1 1.06-1.06L6 10.94l6.72-6.72a.75.75 0 0 1 1.06 0z"/>
+            </svg>
+            {{ t("onboarding.plugin.installed") }}
+          </div>
+        </template>
+        <template v-else>
+          <div class="status-row warn">
+            {{ pluginStatus.status === 'missing' ? t("onboarding.plugin.missing") : t("onboarding.plugin.outdated") }}
+          </div>
+          <button
+            class="ob-btn primary"
+            :disabled="pluginInstalling"
+            @click="installPlugin"
+          >
+            {{ pluginInstalling ? t("onboarding.plugin.installing") : pluginStatus.status === 'missing' ? t("onboarding.plugin.install") : t("onboarding.plugin.update") }}
+          </button>
+        </template>
+        <div v-if="pluginError" class="msg error">{{ pluginError }}</div>
+      </div>
+
+      <div class="step-actions">
+        <button class="ob-btn secondary" @click="goBack">{{ t("onboarding.back") }}</button>
+        <button class="ob-btn primary" @click="goNext">{{ t("onboarding.next") }}</button>
+      </div>
+    </div>
+
+    <div v-else-if="step === 4" class="step-card">
+      <h2 class="step-title">{{ t("onboarding.vcs.title") }}</h2>
+      <div class="step-desc">
+        <p>{{ t("onboarding.vcs.desc1") }}</p>
+        <p>{{ t("onboarding.vcs.desc2") }}</p>
+      </div>
+
+      <div class="status-area">
+        <template v-if="gitVcsStepState === 'loading'">
+          <div class="status-row loading">{{ t("common.loading") }}</div>
+        </template>
+        <template v-else-if="gitVcsStepState === 'detected'">
+          <div class="status-row ok">
+            <svg class="status-icon" viewBox="0 0 16 16" fill="currentColor" width="16" height="16">
+              <path d="M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L2.22 9.28a.75.75 0 0 1 1.06-1.06L6 10.94l6.72-6.72a.75.75 0 0 1 1.06 0z"/>
+            </svg>
+            {{ t("onboarding.vcs.detected") }}
+          </div>
+        </template>
+        <template v-else>
+          <div class="status-row warn">
+            {{
+              gitVcsStepState === "needProject"
+                ? t("onboarding.vcs.needProject")
+                : gitVcsStepState === "notRepo"
+                  ? t("onboarding.vcs.notRepo", gitInitTargetPath)
+                  : t("onboarding.vcs.gitMissing")
+            }}
+          </div>
+        </template>
+
+        <div v-if="gitProbeState && gitProbeState.available" class="git-config-panel">
+          <div class="git-config-panel-header">
+            <span class="git-config-panel-title">{{ t("git.config.title") }}</span>
+            <p class="git-config-panel-desc">{{ t("git.config.desc") }}</p>
+          </div>
+          <div v-if="gitUserMissing" class="status-row warn compact">{{ t("onboarding.vcs.userMissing") }}</div>
+          <p
+            v-else-if="gitConfigLoadedName && gitConfigLoadedEmail"
+            class="hint-text git-config-summary"
+          >
+            {{ t("onboarding.vcs.userConfigured", gitConfigLoadedName, gitConfigLoadedEmail) }}
+          </p>
+          <div class="git-config-fields">
+            <div class="git-config-field">
+              <label class="git-config-label">{{ t("git.config.name") }}</label>
+              <input
+                v-model="gitConfigName"
+                class="git-config-input"
+                :placeholder="t('git.config.namePlaceholder')"
+                @keydown.enter="saveGitConfig"
+              />
+            </div>
+            <div class="git-config-field">
+              <label class="git-config-label">{{ t("git.config.email") }}</label>
+              <input
+                v-model="gitConfigEmail"
+                type="email"
+                class="git-config-input"
+                :placeholder="t('git.config.emailPlaceholder')"
+                @keydown.enter="saveGitConfig"
+              />
+            </div>
+          </div>
+          <div class="git-config-actions">
+            <button
+              class="ob-btn secondary"
+              :disabled="gitConfigSaving || !gitConfigComplete || !gitConfigDirty"
+              @click="saveGitConfig"
+            >
+              {{ gitConfigSaving ? t("git.config.saving") : t("common.save") }}
+            </button>
+          </div>
+          <div v-if="gitConfigError" class="msg error">{{ t("git.config.saveFailed", gitConfigError) }}</div>
+        </div>
+
+        <template v-if="gitCanInit">
+          <button
+            class="ob-btn primary"
+            :disabled="gitInitLoading"
+            @click="checkGitConfigAndInit"
+          >
+            {{ gitInitLoading ? t("onboarding.vcs.initializing") : t("onboarding.vcs.init") }}
+          </button>
+        </template>
+        <div v-if="gitHelpText" class="hint-text">{{ gitHelpText }}</div>
+        <div v-if="gitError" class="msg error">{{ gitError }}</div>
+        <GitMissingHelp
+          v-if="gitProbeState && !gitProbeState.available"
+          :probe="gitProbeState"
+          @resolved="checkGit"
+        />
+      </div>
+
+      <p class="skip-hint">{{ t("onboarding.vcs.skipHint") }}</p>
+
+      <div class="step-actions">
+        <button class="ob-btn secondary" @click="goBack">{{ t("onboarding.back") }}</button>
+        <button class="ob-btn primary" @click="goNext">{{ t("onboarding.next") }}</button>
+      </div>
+    </div>
+
+    <div v-else-if="step === 5" class="step-card">
+      <h2 class="step-title">{{ t("onboarding.scan.title") }}</h2>
+      <p class="step-desc">{{ t("onboarding.scan.desc") }}</p>
+
+      <div class="status-area">
+        <template v-if="!scanPhase">
+          <button class="ob-btn primary" @click="startScan" :disabled="!projectValid">
+            {{ t("onboarding.scan.start") }}
+          </button>
+          <p v-if="!projectValid" class="skip-hint">{{ t("onboarding.scan.needProject") }}</p>
+        </template>
+        <template v-else>
+          <div class="scan-progress">
+            <div class="scan-phase-text">{{ scanProgressText() }}</div>
+            <div v-if="!scanDone && scanPhase.phase !== 'error'" class="scan-bar">
+              <div class="scan-bar-inner" />
+            </div>
+          </div>
+        </template>
+      </div>
+
+      <div class="step-actions">
+        <button class="ob-btn secondary" @click="goBack">{{ t("onboarding.back") }}</button>
+        <button class="ob-btn primary finish" @click="emit('completed')">
+          {{ t("onboarding.finish") }}
+        </button>
+      </div>
+    </div>
+    </div>
+  </div>
+
+  <SubscriptionDisclaimerModal
+    :open="showDisclaimer"
+    @cancel="cancelDisclaimer"
+    @confirm="confirmDisclaimer"
+  />
+</template>
+
+<style scoped>
+.onboarding-container {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  background: var(--bg-color);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.onboarding-titlebar {
+  display: flex;
+  align-items: stretch;
+  justify-content: space-between;
+  gap: 12px;
+  padding-left: 16px;
+  height: 40px;
+  flex-shrink: 0;
+  background: var(--sidebar-bg);
+  border-bottom: 1px solid var(--border-color);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+  -webkit-app-region: drag;
+}
+
+.onboarding-titlebar-left {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  height: 100%;
+}
+
+.onboarding-titlebar-logo {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  flex-shrink: 0;
+}
+
+.onboarding-titlebar-brand {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text-color);
+}
+
+.onboarding-titlebar-caption {
+  font-size: 12px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.onboarding-titlebar-actions {
+  display: flex;
+  align-items: center;
+  align-self: stretch;
+  gap: 0;
+  height: 100%;
+  min-width: 0;
+  -webkit-app-region: no-drag;
+}
+
+.onboarding-body {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  overflow-y: auto;
+  box-sizing: border-box;
+}
+
+.skip-all-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: none;
+  border: none;
+  color: var(--text-secondary);
+  font-size: 13px;
+  cursor: pointer;
+  padding: 0 14px;
+  border-radius: 6px;
+  transition: color 0.15s, background 0.15s;
+  height: 100%;
+  font-family: inherit;
+  line-height: 1;
+  -webkit-app-region: no-drag;
+}
+.skip-all-btn:hover {
+  color: var(--text-color);
+  background: var(--hover-bg);
+}
+
+.window-controls {
+  display: flex;
+  align-items: center;
+  height: 100%;
+  flex-shrink: 0;
+  -webkit-app-region: no-drag;
+}
+
+.win-ctrl-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 48px;
+  min-width: 48px;
+  height: 100%;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: background 0.1s, color 0.1s;
+  -webkit-app-region: no-drag;
+}
+
+.win-ctrl-btn svg {
+  pointer-events: none;
+}
+
+.win-ctrl-btn:hover {
+  background: var(--hover-bg);
+  color: var(--text-color);
+}
+
+.win-ctrl-btn.win-close:hover {
+  background: #e81123;
+  color: #fff;
+}
+
+.step-indicator {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 24px;
+}
+.step-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--border-color);
+  transition: background 0.2s, transform 0.2s;
+}
+.step-dot.active {
+  background: var(--accent-color);
+  transform: scale(1.25);
+}
+.step-dot.done {
+  background: var(--accent-color);
+  opacity: 0.5;
+}
+
+.step-card {
+  width: 100%;
+  max-width: 520px;
+  background: var(--sidebar-bg);
+  border: 1px solid var(--border-color);
+  border-radius: 16px;
+  padding: 32px;
+  animation: stepIn 0.25s ease;
+}
+@keyframes stepIn {
+  from { opacity: 0; transform: translateY(12px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.step-title {
+  font-size: 20px;
+  font-weight: 600;
+  color: var(--text-color);
+  margin: 0 0 8px;
+}
+.step-desc {
+  font-size: 14px;
+  color: var(--text-secondary);
+  margin: 0 0 20px;
+  line-height: 1.5;
+}
+.auth-desc-lines p {
+  margin: 0;
+  line-height: 1.8;
+}
+
+.welcome-card {
+  max-width: 520px;
+  min-height: 460px;
+  padding: 44px 32px 22px;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  text-align: center;
+}
+.welcome-logo {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin: 0 auto 18px;
+}
+.welcome-title {
+  font-size: 28px;
+  font-weight: 700;
+  color: var(--text-color);
+  margin: 0 0 8px;
+  line-height: 1.15;
+}
+.welcome-subtitle {
+  font-size: 14px;
+  color: var(--text-secondary);
+  margin: 0 0 32px;
+  line-height: 1.6;
+}
+.welcome-preferences {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+  align-items: center;
+}
+.welcome-section {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: 100%;
+  align-items: center;
+}
+.welcome-section-label {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  line-height: 1.4;
+}
+.welcome-segmented {
+  width: auto;
+  max-width: 100%;
+}
+.welcome-segmented :deep(.base-segmented-item) {
+  justify-content: center;
+  white-space: nowrap;
+}
+.step-actions.welcome-actions {
+  justify-content: flex-end;
+  margin-top: auto;
+  padding-top: 16px;
+  border-top: 1px solid var(--border-color);
+}
+.welcome-next-btn {
+  min-width: 120px;
+}
+
+.provider-card {
+  border: 1px solid var(--border-color);
+  border-radius: 10px;
+  margin-bottom: 10px;
+  overflow: hidden;
+  transition: border-color 0.15s;
+}
+.provider-card.expanded {
+  border-color: var(--accent-color);
+}
+.provider-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+.provider-header:hover {
+  background: var(--hover-bg);
+}
+.provider-left {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.provider-name {
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--text-color);
+}
+.provider-desc-text {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+.provider-badge {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: var(--hover-bg);
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+.provider-badge.configured {
+  background: color-mix(in srgb, #22c55e 15%, transparent);
+  color: #22c55e;
+}
+.provider-body {
+  padding: 0 16px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.input-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.ob-input {
+  flex: 1;
+  padding: 8px 12px;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: var(--input-bg);
+  color: var(--text-color);
+  font-size: 13px;
+  outline: none;
+  transition: border-color 0.15s;
+}
+.ob-input:focus {
+  border-color: var(--accent-color);
+}
+
+.ob-btn {
+  padding: 8px 16px;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  border: 1px solid transparent;
+  transition: all 0.15s;
+  white-space: nowrap;
+}
+.ob-btn.primary {
+  background: var(--accent-color);
+  color: var(--bg-color);
+  border-color: var(--accent-color);
+}
+.ob-btn.primary:hover:not(:disabled) {
+  filter: brightness(1.1);
+}
+.ob-btn.primary:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.ob-btn.secondary {
+  background: transparent;
+  color: var(--text-secondary);
+  border-color: var(--border-color);
+}
+.ob-btn.secondary:hover {
+  color: var(--text-color);
+  background: var(--hover-bg);
+}
+.ob-btn.small {
+  padding: 4px 10px;
+  font-size: 12px;
+}
+.ob-btn.finish {
+  min-width: 120px;
+}
+
+/* ── Step actions ── */
+.step-actions {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 24px;
+  gap: 12px;
+}
+
+@media (max-width: 760px) {
+  .welcome-card {
+    min-height: 0;
+    padding: 24px 20px 20px;
+  }
+
+  .welcome-preferences {
+    gap: 20px;
+  }
+
+  .step-actions.welcome-actions {
+    justify-content: stretch;
+  }
+
+  .welcome-next-btn {
+    width: 100%;
+  }
+}
+
+.status-area {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-bottom: 4px;
+}
+.status-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  border-radius: 8px;
+  font-size: 13px;
+}
+.status-row.ok {
+  background: color-mix(in srgb, #22c55e 10%, transparent);
+  color: #22c55e;
+}
+.status-row.warn {
+  background: color-mix(in srgb, #eab308 10%, transparent);
+  color: #eab308;
+}
+.status-row.loading {
+  background: var(--hover-bg);
+  color: var(--text-secondary);
+}
+.status-icon {
+  flex-shrink: 0;
+}
+.status-icon.ok {
+  color: #22c55e;
+}
+
+.msg {
+  padding: 8px 12px;
+  border-radius: 8px;
+  font-size: 13px;
+}
+.msg.error {
+  background: color-mix(in srgb, #ef4444 10%, transparent);
+  color: #ef4444;
+}
+.msg.success {
+  background: color-mix(in srgb, #22c55e 10%, transparent);
+  color: #22c55e;
+}
+
+.skip-hint {
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin: 12px 0 0;
+  text-align: center;
+}
+.hint-text {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+.instruction-text {
+  font-size: 13px;
+  color: var(--text-secondary);
+  line-height: 1.5;
+  margin: 0;
+}
+
+.project-area {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.browse-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  width: 100%;
+  padding: 24px;
+  border: 2px dashed var(--border-color);
+  border-radius: 12px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 15px;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.browse-btn:hover {
+  border-color: var(--accent-color);
+  color: var(--accent-color);
+  background: color-mix(in srgb, var(--accent-color) 5%, transparent);
+}
+.project-selected {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  border-radius: 8px;
+  font-size: 13px;
+  word-break: break-all;
+}
+.project-selected.valid {
+  background: color-mix(in srgb, #22c55e 10%, transparent);
+  color: #22c55e;
+}
+.project-selected.invalid {
+  background: color-mix(in srgb, #ef4444 10%, transparent);
+  color: #ef4444;
+}
+.project-path {
+  font-family: var(--font-mono-identifier);
+  font-size: 12px;
+}
+
+.codex-code-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  padding: 8px 12px;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: var(--input-bg);
+  color: inherit;
+  cursor: pointer;
+  text-align: left;
+  box-shadow: none;
+  transition: border-color 0.15s, background 0.15s;
+}
+.codex-code-row:hover {
+  background: var(--hover-bg);
+  border-color: var(--accent-color);
+}
+.codex-code-row:focus-visible {
+  outline: none;
+  border-color: var(--accent-color);
+}
+.codex-code-row.copied {
+  border-color: var(--status-good-border, #22c55e);
+  background: var(--status-good-bg, color-mix(in srgb, #22c55e 10%, transparent));
+}
+.codex-code {
+  font-family: var(--font-mono-display);
+  font-size: 20px;
+  font-weight: 600;
+  color: var(--accent-color);
+  letter-spacing: 2px;
+}
+.codex-copy-indicator {
+  flex-shrink: 0;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+.codex-code-row.copied .codex-copy-indicator {
+  color: var(--status-good-fg, #22c55e);
+}
+
+.scan-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.scan-phase-text {
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+.scan-bar {
+  height: 4px;
+  border-radius: 2px;
+  background: var(--border-color);
+  overflow: hidden;
+}
+.scan-bar-inner {
+  height: 100%;
+  width: 40%;
+  background: var(--accent-color);
+  border-radius: 2px;
+  animation: scanSlide 1.5s ease-in-out infinite;
+}
+@keyframes scanSlide {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(350%); }
+}
+
+/* ── Git Config Panel ── */
+.git-config-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px;
+  border: 1px solid var(--border-color);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--sidebar-bg) 88%, var(--hover-bg));
+}
+.git-config-panel-header {
+  display: flex;
+  flex-direction: column;
+}
+.git-config-panel-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-color);
+}
+.git-config-panel-desc {
+  margin: 4px 0 0;
+  font-size: 12px;
+  color: var(--text-secondary);
+  line-height: 1.5;
+}
+.git-config-summary {
+  margin: 0;
+}
+.git-config-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.git-config-field {
+  display: flex;
+  flex-direction: column;
+}
+.git-config-label {
+  display: block;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  margin-bottom: 4px;
+}
+.git-config-input {
+  width: 100%;
+  padding: 8px 12px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: var(--input-bg, var(--bg-color));
+  color: var(--text-primary);
+  font-size: 14px;
+  box-sizing: border-box;
+  outline: none;
+  transition: border-color 0.15s;
+}
+.git-config-input:focus {
+  border-color: var(--accent-color);
+}
+.git-config-actions {
+  display: flex;
+  justify-content: flex-start;
+  gap: 8px;
+}
+.status-row.compact {
+  padding: 8px 12px;
+}
+
+</style>

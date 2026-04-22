@@ -1,0 +1,69 @@
+name: Docs
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/docs.yml"
+      - "docs/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install docs dependencies
+        working-directory: docs
+        run: bun install --frozen-lockfile
+
+      - name: Validate docs
+        working-directory: docs
+        run: bun run validate
+
+      - name: Check broken links
+        working-directory: docs
+        run: bun run broken-links
+
+      - name: Export static site
+        working-directory: docs
+        run: |
+          mkdir -p ../site
+          bun ./node_modules/mint/index.js export --output ../site/export.zip
+
+      - name: Unpack exported site
+        run: |
+          rm -rf site/exported
+          mkdir -p site/exported
+          unzip -q site/export.zip -d site/exported
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: site/exported
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

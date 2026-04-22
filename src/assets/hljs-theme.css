@@ -1,0 +1,90 @@
+
+@import "highlight.js/styles/github.css";
+
+:root {
+  --md-code-bg: color-mix(in srgb, var(--sidebar-bg, var(--panel-bg)) 76%, transparent);
+  --md-code-fg: var(--text-color);
+  --md-syntax-keyword: color-mix(in srgb, var(--accent-color) 78%, var(--text-color));
+  --md-syntax-type: color-mix(in srgb, var(--accent-color) 68%, var(--text-color));
+  --md-syntax-builtin: color-mix(in srgb, var(--status-good-fg) 74%, var(--text-color));
+  --md-syntax-title: color-mix(in srgb, var(--status-good-fg) 62%, var(--text-color));
+  --md-syntax-function: color-mix(in srgb, var(--status-warn-fg) 72%, var(--text-color));
+  --md-syntax-string: #b86a33;
+  --md-syntax-number: #6f7f24;
+  --md-syntax-comment: color-mix(in srgb, var(--text-secondary) 88%, transparent);
+  --md-syntax-variable: color-mix(in srgb, var(--accent-color) 46%, var(--text-color));
+  --md-syntax-literal: color-mix(in srgb, var(--accent-color) 72%, var(--text-color));
+  --md-syntax-meta: color-mix(in srgb, var(--text-secondary) 62%, var(--accent-color));
+  --md-syntax-selector: #8a5db6;
+  --md-syntax-regexp: #b45163;
+}
+
+:root[data-theme="dark"] {
+  --md-code-bg: color-mix(in srgb, var(--sidebar-bg, var(--panel-bg)) 82%, #0f1014 18%);
+  --md-syntax-string: #d29a6f;
+  --md-syntax-number: #98b46d;
+  --md-syntax-selector: #b99adf;
+  --md-syntax-regexp: #d78694;
+}
+
+:root .hljs {
+  color: var(--md-code-fg);
+  background: var(--md-code-bg);
+}
+:root .hljs-keyword,
+:root .hljs-type {
+  color: var(--md-syntax-keyword);
+}
+:root .hljs-built_in {
+  color: var(--md-syntax-builtin);
+}
+:root .hljs-title.class_,
+:root .hljs-title {
+  color: var(--md-syntax-title);
+}
+:root .hljs-title.function_ {
+  color: var(--md-syntax-function);
+}
+:root .hljs-string {
+  color: var(--md-syntax-string);
+}
+:root .hljs-number {
+  color: var(--md-syntax-number);
+}
+:root .hljs-comment {
+  color: var(--md-syntax-comment);
+  font-style: italic;
+}
+:root .hljs-variable,
+:root .hljs-params {
+  color: var(--md-syntax-variable);
+}
+:root .hljs-literal {
+  color: var(--md-syntax-literal);
+}
+:root .hljs-meta {
+  color: var(--md-syntax-meta);
+}
+:root .hljs-attr {
+  color: var(--md-syntax-variable);
+}
+:root .hljs-property {
+  color: var(--md-syntax-variable);
+}
+:root .hljs-operator {
+  color: var(--md-code-fg);
+}
+:root .hljs-punctuation {
+  color: var(--md-code-fg);
+}
+:root .hljs-doctag {
+  color: var(--md-syntax-builtin);
+}
+:root .hljs-regexp {
+  color: var(--md-syntax-regexp);
+}
+:root .hljs-selector-class,
+:root .hljs-selector-id,
+:root .hljs-selector-tag {
+  color: var(--md-syntax-selector);
+}

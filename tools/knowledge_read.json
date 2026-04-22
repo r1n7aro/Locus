@@ -1,0 +1,20 @@
+{
+  "description": "Read a unified knowledge document by type-prefixed path. This tool returns plain-text document content in markdown form, not knowledge metadata or directory config.",
+  "parameters": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "path": {
+        "type": "string",
+        "description": "The type-prefixed knowledge document path, for example `design/core-loop.md` or `skill/unity/import-pipeline.md`."
+      },
+      "part": {
+        "type": "string",
+        "enum": ["full", "summary", "body"],
+        "description": "Which content section to read. `full` returns the markdown document body, `summary` returns the summary text only, and `body` returns the body text only.",
+        "default": "full"
+      }
+    },
+    "required": ["path"]
+  }
+}

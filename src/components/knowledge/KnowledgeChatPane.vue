@@ -1,0 +1,212 @@
+<script setup lang="ts">
+import { computed, ref } from "vue";
+import { t } from "../../i18n";
+import type { KnowledgeDocument, KnowledgeEditMode, KnowledgeDocumentType, KnowledgeDocumentScope } from "../../types";
+import EmbeddedChatPane from "../chat/EmbeddedChatPane.vue";
+import AgentSelector from "../AgentSelector.vue";
+import ModelSelector from "../ModelSelector.vue";
+import ThinkingSelector from "../ThinkingSelector.vue";
+import { useEmbeddedChatSession } from "../../composables/useEmbeddedChatSession";
+import { useSkills } from "../../composables/useSkills";
+import { useAgentStore } from "../../stores/agent";
+import { useModelStore } from "../../stores/model";
+import { useProjectStore } from "../../stores/project";
+import { getKnowledgeEditMode } from "./knowledgeEditMode";
+
+const BODY_CONTEXT_LIMIT = 6000;
+
+const props = defineProps<{
+  document: KnowledgeDocument;
+}>();
+
+const agentStore = useAgentStore();
+const modelStore = useModelStore();
+const projectStore = useProjectStore();
+const { skillItems } = useSkills();
+
+const sessionKey = computed(() => `${projectStore.workingDir}::knowledge::${props.document.path}`);
+const sessionTitle = computed(() => `Knowledge: ${props.document.title || props.document.path}`);
+const editMode = computed<KnowledgeEditMode>(() => getKnowledgeEditMode(props.document));
+const manualKnowledgeAgentId = ref("");
+const knowledgeDefaultAgentId = computed(() => {
+  if (agentStore.agents.some((agent) => agent.id === "knowledge")) return "knowledge";
+  const selectedAgentId = agentStore.selectedAgentId.trim();
+  if (selectedAgentId && agentStore.agents.some((agent) => agent.id === selectedAgentId)) {
+    return selectedAgentId;
+  }
+  return agentStore.agents[0]?.id || null;
+});
+const knowledgeAgentId = computed(() => {
+  const manualSelectedId = manualKnowledgeAgentId.value.trim();
+  if (manualSelectedId && agentStore.agents.some((agent) => agent.id === manualSelectedId)) {
+    return manualSelectedId;
+  }
+  return knowledgeDefaultAgentId.value;
+});
+
+const placeholder = computed(() => (
+  props.document.readOnly
+    ? t("knowledge.chat.readOnlyPlaceholder")
+    : t("knowledge.chat.placeholder")
+));
+
+const {
+  inputText,
+  messages,
+  streamingText,
+  thinkingText,
+  isStreaming,
+  isThinking,
+  thinkingDuration,
+  activeToolCalls,
+  pendingQuestion,
+  pendingToolConfirms,
+  errorMessage,
+  send,
+  cancel,
+  answerQuestion,
+  answerToolConfirm,
+  answerAllToolConfirms,
+  applyKnowledgeProposal,
+  ignoreKnowledgeProposal,
+  resetSession,
+} = useEmbeddedChatSession({
+  sessionKey,
+  sessionType: "knowledge",
+  sessionTitle,
+  selectedModelId: computed(() => modelStore.selectedModelId),
+  selectedAgentId: knowledgeAgentId,
+  effort: computed(() => modelStore.effort),
+  effortSupported: computed(() => modelStore.effortSupported),
+  buildRequest(input) {
+    const summary = props.document.summaryEnabled ? props.document.summary?.trim() : "";
+    const rules = props.document.explicitMaintenanceRules ? props.document.maintenanceRules?.trim() : "";
+    const body = trimmedContext(props.document.body?.trim() ?? "", BODY_CONTEXT_LIMIT);
+    const lines = [
+      "你正在知识页面的嵌入式对话中协助编辑一份知识文档。",
+      `目标文档标题：${props.document.title || props.document.path}`,
+      `目标文档路径：${props.document.path}`,
+      `文档类型：${typeLabel(props.document.type)}`,
+      `文档范围：${scopeLabel(props.document.scope)}`,
+      `编辑模式：${editModeLabel(editMode.value)}`,
+    ];
+
+    if (summary) {
+      lines.push("当前摘要：");
+      lines.push(summary);
+    }
+    if (rules) {
+      lines.push("当前维护规则：");
+      lines.push(rules);
+    }
+    if (body) {
+      lines.push("当前正文：");
+      lines.push(body);
+    }
+
+    lines.push("要求：");
+    lines.push("- 优先围绕当前目标文档工作");
+    lines.push("- 需要改动文档时，直接生成知识提案或更新该文档");
+    lines.push("- 保持现有文档结构、术语语义与约束一致");
+    lines.push("用户请求：");
+    lines.push(input);
+
+    return {
+      text: lines.join("\n"),
+      displayText: input,
+    };
+  },
+});
+
+function typeLabel(type: KnowledgeDocumentType) {
+  return t(`knowledge.type.${type}`);
+}
+
+function scopeLabel(scope: KnowledgeDocumentScope) {
+  return t(`knowledge.scope.${scope}`);
+}
+
+function editModeLabel(mode: KnowledgeEditMode) {
+  if (mode === "inherit_parent") return t("knowledge.meta.editMode.inheritParent");
+  if (mode === "auto") return t("knowledge.meta.editMode.auto");
+  if (mode === "proposal") return t("knowledge.meta.editMode.proposal");
+  return t("knowledge.meta.editMode.readOnly");
+}
+
+function trimmedContext(value: string, limit: number) {
+  if (!value) return "";
+  if (value.length <= limit) return value;
+  return `${value.slice(0, limit)}\n\n[内容已截断，保留前 ${limit} 个字符]`;
+}
+
+function handleSelectAgent(agentId: string) {
+  manualKnowledgeAgentId.value = agentId;
+}
+</script>
+
+<template>
+  <EmbeddedChatPane
+    :messages="messages"
+    :streaming-text="streamingText"
+    :thinking-text="thinkingText"
+    :is-streaming="isStreaming"
+    :is-thinking="isThinking"
+    :thinking-duration="thinkingDuration"
+    :active-tool-calls="activeToolCalls"
+    :pending-question="pendingQuestion"
+    :pending-tool-confirms="pendingToolConfirms"
+    :tool-confirm-layout-key="sessionKey"
+    :input-value="inputText"
+    :placeholder="placeholder"
+    :empty-title="t('knowledge.chat.emptyTitle')"
+    :empty-hint="t('knowledge.chat.emptyHint')"
+    :error-message="errorMessage"
+    :send-label="t('knowledge.chat.send')"
+    :cancel-label="t('common.cancel')"
+    :user-label="t('knowledge.chat.user')"
+    :assistant-label="t('knowledge.chat.assistant')"
+    :thinking-label="t('knowledge.chat.thinking')"
+    :waiting-label="t('chat.transcript.waiting')"
+    :thought-duration-label="t('chat.transcript.thoughtDuration', '{0}')"
+    :thought-moment-label="t('chat.transcript.thoughtMoment')"
+    :running-label="t('knowledge.chat.running')"
+    :selected-agent-id="knowledgeAgentId || ''"
+    :skills="skillItems"
+    enable-intent-badges
+    show-user-images
+    user-content-mode="asset"
+    @update:input-value="inputText = $event"
+    @send="send"
+    @cancel="cancel"
+    @clear="resetSession"
+    @answer-question="answerQuestion"
+    @answer-tool-confirm="answerToolConfirm"
+    @answer-all-tool-confirms="answerAllToolConfirms"
+    @apply-knowledge-proposal="applyKnowledgeProposal"
+    @ignore-knowledge-proposal="ignoreKnowledgeProposal"
+  >
+    <template #composer-start>
+      <AgentSelector
+        :agents="agentStore.agents"
+        :selected-id="knowledgeAgentId || ''"
+        :disabled="isStreaming"
+        @select="handleSelectAgent"
+      />
+    </template>
+    <template #composer-actions>
+      <ModelSelector
+        :models="modelStore.availableModels"
+        :selected-id="modelStore.selectedModelId"
+        :disabled="isStreaming"
+        @select="modelStore.selectModel"
+      />
+      <ThinkingSelector
+        v-if="modelStore.effortSupported"
+        :effort="modelStore.effort"
+        :efforts="modelStore.availableEfforts"
+        :disabled="isStreaming"
+        @select="modelStore.effort = $event"
+      />
+    </template>
+  </EmbeddedChatPane>
+</template>

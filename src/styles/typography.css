@@ -1,0 +1,18 @@
+:root {
+  --font-stack-sans: "Noto Sans SC", "Source Han Sans SC", "PingFang SC",
+    "Hiragino Sans GB", "Microsoft YaHei UI", "Microsoft YaHei",
+    "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+  --font-stack-mono: ui-monospace, "SF Mono", SFMono-Regular, "Cascadia Mono",
+    "Cascadia Code", "JetBrains Mono", "Fira Code", Menlo, Monaco, Consolas,
+    "Liberation Mono", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei UI",
+    "Microsoft YaHei", "Noto Sans Mono CJK SC", "Noto Sans CJK SC",
+    "Source Han Sans SC", monospace;
+
+  --font-ui: var(--font-stack-mono);
+  --font-prose: var(--font-stack-mono);
+  --font-mono-inline: var(--font-stack-mono);
+  --font-mono-identifier: var(--font-stack-mono);
+  --font-mono-block: var(--font-stack-mono);
+  --font-mono-editor: var(--font-stack-mono);
+  --font-mono-display: var(--font-stack-mono);
+}

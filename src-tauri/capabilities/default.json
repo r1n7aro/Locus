@@ -1,0 +1,32 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Capability for the main window, canvas windows, and auxiliary progress windows",
+  "windows": [
+    "main",
+    "canvas-*",
+    "knowledge-download-progress",
+    "knowledge-lexical-progress",
+    "unity-reference-import-progress",
+    "feishu-reference-import-progress",
+    "reference-external-import"
+  ],
+  "permissions": [
+    "core:default",
+    "core:webview:allow-create-webview-window",
+    "core:window:allow-create",
+    "core:window:allow-set-focus",
+    "core:webview:allow-set-webview-focus",
+    "core:window:allow-set-always-on-top",
+    "core:window:allow-minimize",
+    "core:window:allow-toggle-maximize",
+    "core:window:allow-is-maximized",
+    "core:window:allow-close",
+    "opener:default",
+    {
+      "identifier": "opener:allow-open-path",
+      "allow": [{ "path": "$TEMP/**" }]
+    },
+    "dialog:default"
+  ]
+}

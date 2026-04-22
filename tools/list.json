@@ -1,0 +1,33 @@
+{
+  "description": "List directory contents in the Unity project.\nUse this tool for directories; use read for files.\nUseful for exploring project structure before using more targeted tools like unity_asset_search, unity_ref_search, or read.\n\nOutput format: tree-style indented listing. Directories end with /. Plain entries without a trailing / are files. When include_files is false, all returned entries are directories.\nItems exceeding the per-directory limit are indicated with '... and N more'.\n\nNote: root-level generated directories such as Library/, Temp/, Obj/, Logs/, and Build*/ are automatically excluded from output. .meta files are also excluded because they are Unity-generated metadata and not useful for exploration.\nYou MUST set path explicitly; never rely on the current process directory or an implicit Assets/ default.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "path": {
+        "type": "string",
+        "description": "Root directory to list. Required. Pass an absolute path or a path relative to the selected project root."
+      },
+      "depth": {
+        "type": "integer",
+        "description": "Maximum depth of recursion. 1 = only immediate children, 2 = children and grandchildren, etc. Default: 2.",
+        "default": 2
+      },
+      "max_items": {
+        "type": "integer",
+        "description": "Maximum number of child entries to show per directory. Excess entries are summarized. Default: 500.",
+        "default": 500
+      },
+      "max_total": {
+        "type": "integer",
+        "description": "Maximum total number of entries across all directories. When reached, recursion stops early. Default: 1000.",
+        "default": 1000
+      },
+      "include_files": {
+        "type": "boolean",
+        "description": "If true, list files in addition to directories. Default: false (directories only).",
+        "default": false
+      }
+    },
+    "required": ["path"]
+  }
+}

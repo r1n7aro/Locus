@@ -1,0 +1,24 @@
+{
+  "description": "Edit an existing unified knowledge document by type-prefixed path. This tool only updates document content sections; knowledge metadata and directory config use dedicated knowledge tools. Returns a plain-text status line.",
+  "parameters": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "path": {
+        "type": "string",
+        "description": "Current type-prefixed document path, for example `memory/preferences/editor.md`."
+      },
+      "document": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Document content patch. Provide one or more sections to update.",
+        "properties": {
+          "summary": { "type": ["string", "null"] },
+          "body": { "type": "string" },
+          "maintenanceRules": { "type": ["string", "null"] }
+        }
+      }
+    },
+    "required": ["path", "document"]
+  }
+}

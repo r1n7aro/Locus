@@ -1,0 +1,47 @@
+{
+  "description": "Edits an existing file by replacing specific strings with new ones. Supports both single and batch edits.\n\nUsage:\n- oldString must match exactly (including whitespace and indentation)\n- If oldString appears multiple times, provide more surrounding context to make it unique\n- Set replaceAll=true to replace every occurrence\n- Read the file first to understand its current content before editing\n- For multiple edits to the same file, use the 'edits' array to apply all changes in one call\n- When using 'edits', do NOT provide top-level oldString/newString\n- Edits are applied sequentially, so later edits see the result of earlier ones",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "filePath": {
+        "type": "string",
+        "description": "Absolute or relative path to the file to modify"
+      },
+      "oldString": {
+        "type": "string",
+        "description": "The exact text to find and replace (for single edit mode)"
+      },
+      "newString": {
+        "type": "string",
+        "description": "The text to replace it with (for single edit mode)"
+      },
+      "replaceAll": {
+        "type": "boolean",
+        "description": "Replace all occurrences (default: false, for single edit mode)"
+      },
+      "edits": {
+        "type": "array",
+        "description": "Array of edit operations to apply sequentially to the same file (batch edit mode)",
+        "items": {
+          "type": "object",
+          "properties": {
+            "oldString": {
+              "type": "string",
+              "description": "The exact text to find and replace"
+            },
+            "newString": {
+              "type": "string",
+              "description": "The text to replace it with"
+            },
+            "replaceAll": {
+              "type": "boolean",
+              "description": "Replace all occurrences (default: false)"
+            }
+          },
+          "required": ["oldString", "newString"]
+        }
+      }
+    },
+    "required": ["filePath"]
+  }
+}

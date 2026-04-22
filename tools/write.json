@@ -1,0 +1,17 @@
+{
+  "description": "Creates a new file on the local filesystem and writes the provided content.\n\nUsage:\n- This tool only creates new files. It will reject any path that already exists.\n- Use the edit tool for any change to an existing file.\n- Parent directories will be created automatically if they don't exist.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "filePath": {
+        "type": "string",
+        "description": "Absolute or relative path to the file to write"
+      },
+      "content": {
+        "type": "string",
+        "description": "The full content to write to the file"
+      }
+    },
+    "required": ["filePath", "content"]
+  }
+}

@@ -1,0 +1,42 @@
+---
+title: Maturity and Fit
+description: Product maturity and suitable team range observed from the current repository implementation.
+sidebarTitle: Maturity
+---
+
+From the current repository snapshot, Locus already has the product skeleton of a complete desktop workspace, low-level runtime capabilities, and part of the stability work.
+
+## Maturity Signals at the Code Level
+
+- The frontend main interface is organized around six workspaces
+- The Rust backend is split into modules such as `agent / asset_db / diff / merge / knowledge_index / unity_bridge / llm / session / vcs`
+- The Unity plugin side already has an independent bridge implementation
+- There are currently 93 test files under `src/__tests__`
+- The session persistence schema has clearly evolved to `v10`, with explicit migration logic retained
+
+## Teams It Fits Better
+
+- Teams using Unity for game development
+- Teams using Git to manage projects
+- Teams that want AI truly embedded into their daily development workflow
+- Teams that need unified management for project knowledge, standards, and external reference materials
+
+## Current Product Focus
+
+- Unity first
+- Git first
+- Local desktop workflow first
+- Long-term project collaboration
+
+## Basis for This Assessment
+
+This judgment mainly comes from the following modules in the current repository:
+
+- App shell: `src/App.vue`
+- Session and agent UI: `src/components/ChatView.vue`, `src/components/AgentView.vue`
+- Assets workspace: `src/components/AssetView.vue`, `src-tauri/src/asset_db/*`, `src-tauri/src/commands/asset.rs`
+- Collaboration workspace: `src/components/CollabView.vue`, `src-tauri/src/merge/*`, `src-tauri/src/diff/*`
+- Knowledge workspace: `src/components/KnowledgeView.vue`, `src-tauri/src/knowledge_index/*`, `src-tauri/src/knowledge_store.rs`
+- Unity bridge: `src-tauri/src/unity_bridge/*`, `locus_unity/Editor/LocusBridge*.cs`
+- Models and runtime: `src/stores/model.ts`, `src-tauri/src/llm/*`, `src-tauri/src/auth/*`
+- Session persistence and migration: `src-tauri/src/session/store.rs`

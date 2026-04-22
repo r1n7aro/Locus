@@ -1,0 +1,160 @@
+<script setup lang="ts">
+import { computed, ref, onMounted } from "vue";
+import { t } from "../../i18n";
+import { useTheme, type ThemePreference } from "../../composables/useTheme";
+import { useDisplaySettings, type FontSlot } from "../../composables/useDisplaySettings";
+import { ipcInvoke } from "../../services/ipc";
+import BaseSegmented from "../ui/BaseSegmented.vue";
+import BaseSwitch from "../ui/BaseSwitch.vue";
+
+const { preference, setThemePreference } = useTheme();
+const { state: display, set: setDisplay, setFont } = useDisplaySettings();
+
+const options: { value: ThemePreference; labelKey: string }[] = [
+  { value: "system", labelKey: "settings.display.themeSystem" },
+  { value: "light",  labelKey: "settings.display.themeLight" },
+  { value: "dark",   labelKey: "settings.display.themeDark" },
+];
+
+const themeOptions = computed(() =>
+  options.map((opt) => ({
+    value: opt.value,
+    label: t(opt.labelKey),
+  })),
+);
+
+const fontSlots: { slot: FontSlot; labelKey: string; mono: boolean }[] = [
+  { slot: "ui",        labelKey: "settings.display.fontUi",        mono: false },
+  { slot: "prose",     labelKey: "settings.display.fontProse",     mono: false },
+  { slot: "monoInline", labelKey: "settings.display.fontMonoInline", mono: true },
+  { slot: "monoBlock", labelKey: "settings.display.fontMonoBlock", mono: true },
+  { slot: "monoEditor", labelKey: "settings.display.fontMonoEditor", mono: true },
+];
+
+const systemFonts = ref<string[]>([]);
+
+onMounted(async () => {
+  try {
+    systemFonts.value = await ipcInvoke<string[]>("get_system_fonts");
+  } catch { /* fallback: empty list, user can still type */ }
+});
+</script>
+
+<template>
+  <div class="settings-section">
+    <div class="section-label">{{ t("settings.display.themeTitle") }}</div>
+    <p class="section-desc">{{ t("settings.display.themeDesc") }}</p>
+    <BaseSegmented
+      :model-value="preference"
+      :options="themeOptions"
+      @update:model-value="setThemePreference($event as ThemePreference)"
+    />
+  </div>
+
+  <div class="settings-section">
+    <div class="section-label">{{ t("settings.display.panelBehaviorTitle") }}</div>
+    <p class="section-desc">{{ t("settings.display.panelBehaviorDesc") }}</p>
+
+    <label class="toggle-row">
+      <BaseSwitch
+        :model-value="display.todoAutoOpen"
+        :aria-label="t('settings.display.todoAutoOpen')"
+        @update:model-value="setDisplay('todoAutoOpen', $event)"
+      />
+      <span>{{ t("settings.display.todoAutoOpen") }}</span>
+    </label>
+
+    <label class="toggle-row">
+      <BaseSwitch
+        :model-value="display.changesAutoOpen"
+        :aria-label="t('settings.display.changesAutoOpen')"
+        @update:model-value="setDisplay('changesAutoOpen', $event)"
+      />
+      <span>{{ t("settings.display.changesAutoOpen") }}</span>
+    </label>
+
+    <label class="toggle-row">
+      <BaseSwitch
+        :model-value="display.changesAutoClose"
+        :aria-label="t('settings.display.changesAutoClose')"
+        @update:model-value="setDisplay('changesAutoClose', $event)"
+      />
+      <span>{{ t("settings.display.changesAutoClose") }}</span>
+    </label>
+
+    <label class="toggle-row">
+      <BaseSwitch
+        :model-value="display.compactToolCalls"
+        :aria-label="t('settings.display.compactToolCalls')"
+        @update:model-value="setDisplay('compactToolCalls', $event)"
+      />
+      <span>{{ t("settings.display.compactToolCalls") }}</span>
+    </label>
+  </div>
+
+  <div class="settings-section">
+    <div class="section-label">{{ t("settings.display.fontTitle") }}</div>
+    <p class="section-desc">{{ t("settings.display.fontDesc") }}</p>
+
+    <div class="font-grid">
+      <template v-for="f in fontSlots" :key="f.slot">
+        <label class="font-label">{{ t(f.labelKey) }}</label>
+        <select
+          class="font-select"
+          :value="display.fonts[f.slot]"
+          @change="setFont(f.slot, ($event.target as HTMLSelectElement).value)"
+        >
+          <option value="">{{ t("settings.display.fontDefault") }}</option>
+          <option
+            v-for="name in systemFonts"
+            :key="name"
+            :value="name"
+            :style="{ fontFamily: name }"
+          >{{ name }}</option>
+        </select>
+      </template>
+    </div>
+  </div>
+</template>
+
+<style scoped>
+.toggle-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 0;
+  font-size: 13px;
+  color: var(--text-color);
+}
+
+.font-grid {
+  display: grid;
+  grid-template-columns: 100px 1fr;
+  gap: 6px 10px;
+  align-items: center;
+  margin-top: 8px;
+}
+
+.font-label {
+  font-size: 13px;
+  color: var(--text-secondary);
+  text-align: right;
+  white-space: nowrap;
+}
+
+.font-select {
+  padding: 5px 8px;
+  border: 1px solid var(--border-color);
+  border-radius: 5px;
+  background: var(--input-bg);
+  color: var(--text-color);
+  font-size: 13px;
+  outline: none;
+  cursor: pointer;
+  transition: border-color 0.15s;
+}
+
+.font-select:focus {
+  border-color: var(--accent-color);
+}
+</style>

@@ -1,0 +1,32 @@
+{
+  "description": "Create a unified knowledge document or knowledge directory. New documents and folders inherit inject mode and AI edit config from the parent directory by default, and top-level folders inherit the type defaults. Document creation may include initial content. Directory creation only creates the folder structure; metadata and config use dedicated knowledge tools. Returns a plain-text status line.",
+  "parameters": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "kind": {
+        "type": "string",
+        "enum": ["document", "directory"],
+        "description": "Whether to create a knowledge document or a knowledge directory."
+      },
+      "path": {
+        "type": "string",
+        "description": "Target type-prefixed path, for example `design/combat/hit-reaction.md` or `skill/build/release.md`."
+      },
+      "document": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Document-only initial content. Omit it to create with path-derived defaults and empty content sections.",
+        "properties": {
+          "summary": { "type": ["string", "null"] },
+          "body": { "type": "string" },
+          "maintenanceRules": {
+            "type": ["string", "null"],
+            "description": "Optional document-level maintenance rules. Omit it to keep inheriting the parent directory AI config on create."
+          }
+        }
+      }
+    },
+    "required": ["kind", "path"]
+  }
+}

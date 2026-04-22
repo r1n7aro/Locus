@@ -1,0 +1,263 @@
+<script setup lang="ts">
+import { computed, ref, useSlots, watch } from "vue";
+import { t } from "../../i18n";
+import {
+  shouldSubmitOnEnter,
+  type ChatSubmitMode,
+} from "../../composables/useChatInputSettings";
+
+const props = withDefaults(defineProps<{
+  modelValue: string;
+  placeholder?: string;
+  disabled?: boolean;
+  isStreaming?: boolean;
+  canSend?: boolean;
+  sendLabel?: string;
+  cancelLabel?: string;
+  maxHeight?: number;
+  submitMode?: ChatSubmitMode;
+}>(), {
+  placeholder: "",
+  disabled: false,
+  isStreaming: false,
+  canSend: false,
+  sendLabel: "",
+  cancelLabel: "",
+  maxHeight: 200,
+  submitMode: "enter-send",
+});
+
+const emit = defineEmits<{
+  (e: "update:modelValue", value: string): void;
+  (e: "send"): void;
+  (e: "cancel"): void;
+  (e: "keydown", event: KeyboardEvent): void;
+  (e: "keyup", event: KeyboardEvent): void;
+  (e: "input", event: Event): void;
+  (e: "paste", event: ClipboardEvent): void;
+  (e: "click", event: MouseEvent): void;
+  (e: "mouseup", event: MouseEvent): void;
+  (e: "focus", event: FocusEvent): void;
+}>();
+
+const slots = useSlots();
+const textareaRef = ref<HTMLTextAreaElement | null>(null);
+
+const hasHeader = computed(() => !!slots.header);
+const textareaDisabled = computed(() => props.disabled || props.isStreaming);
+const textareaStyle = computed(() => ({
+  maxHeight: `${props.maxHeight}px`,
+}));
+const actionLabel = computed(() => (
+  props.isStreaming
+    ? (props.cancelLabel || t("common.cancel"))
+    : (props.sendLabel || t("common.send"))
+));
+
+function resizeTextarea(textarea: HTMLTextAreaElement | null = textareaRef.value) {
+  if (!textarea) return;
+  textarea.style.height = "auto";
+  const contentHeight = textarea.scrollHeight;
+  textarea.style.height = `${Math.min(contentHeight, props.maxHeight)}px`;
+  textarea.style.overflowY = contentHeight > props.maxHeight ? "auto" : "hidden";
+}
+
+function handleInput(event: Event) {
+  const target = event.target as HTMLTextAreaElement;
+  resizeTextarea(target);
+  emit("update:modelValue", target.value);
+  emit("input", event);
+}
+
+function handleKeydown(event: KeyboardEvent) {
+  emit("keydown", event);
+  if (event.defaultPrevented) return;
+  if (!shouldSubmitOnEnter(event, props.submitMode)) return;
+  event.preventDefault();
+  if (textareaDisabled.value || !props.canSend) return;
+  emit("send");
+}
+
+function handleActionClick() {
+  if (props.isStreaming) {
+    emit("cancel");
+    return;
+  }
+  if (textareaDisabled.value || !props.canSend) return;
+  emit("send");
+}
+
+function focus() {
+  textareaRef.value?.focus();
+}
+
+function setSelectionRange(start: number, end: number) {
+  textareaRef.value?.setSelectionRange(start, end);
+}
+
+function getTextarea() {
+  return textareaRef.value;
+}
+
+defineExpose({
+  focus,
+  setSelectionRange,
+  resizeTextarea,
+  getTextarea,
+});
+
+watch(() => props.modelValue, () => {
+  resizeTextarea();
+}, {
+  immediate: true,
+  flush: "post",
+});
+
+watch(() => props.maxHeight, () => {
+  resizeTextarea();
+}, {
+  flush: "post",
+});
+</script>
+
+<template>
+  <div class="chat-composer">
+    <div v-if="hasHeader" class="chat-composer-header">
+      <slot name="header" />
+    </div>
+
+    <div class="chat-composer-body">
+      <textarea
+        ref="textareaRef"
+        class="chat-composer-input"
+        :value="modelValue"
+        :style="textareaStyle"
+        :disabled="textareaDisabled"
+        :placeholder="placeholder"
+        rows="1"
+        @input="handleInput"
+        @keydown="handleKeydown"
+        @keyup="emit('keyup', $event as KeyboardEvent)"
+        @paste="emit('paste', $event as ClipboardEvent)"
+        @click="emit('click', $event as MouseEvent)"
+        @mouseup="emit('mouseup', $event as MouseEvent)"
+        @focus="emit('focus', $event as FocusEvent)"
+      />
+      <button
+        class="chat-composer-action ui-select-none"
+        :class="{ 'is-cancel': isStreaming }"
+        :disabled="!isStreaming && (disabled || !canSend)"
+        :title="actionLabel"
+        :aria-label="actionLabel"
+        type="button"
+        @click="handleActionClick"
+      >
+        <span v-if="isStreaming" class="chat-composer-stop-icon" aria-hidden="true">&#9632;</span>
+        <span v-else class="chat-composer-send-icon" aria-hidden="true">&#8593;</span>
+      </button>
+    </div>
+  </div>
+</template>
+
+<style scoped>
+.chat-composer {
+  display: flex;
+  flex-direction: column;
+  background: var(--input-bg);
+  border: 1px solid var(--border-color);
+  border-radius: 12px;
+  padding: 8px 12px;
+  transition: border-color 0.2s ease;
+}
+
+.chat-composer:focus-within {
+  border-color: var(--accent-color);
+}
+
+.chat-composer-header {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.chat-composer-header:empty {
+  margin-bottom: 0;
+}
+
+.chat-composer-body {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+}
+
+.chat-composer-input {
+  flex: 1;
+  min-width: 0;
+  min-height: 24px;
+  overflow-y: hidden;
+  padding: 4px 0;
+  border: none;
+  outline: none;
+  resize: none;
+  background: transparent;
+  color: var(--text-color);
+  font: inherit;
+  font-size: 14px;
+  line-height: 1.5;
+  box-shadow: none;
+  transition: height 0.1s ease;
+}
+
+.chat-composer-input::placeholder {
+  color: var(--text-secondary);
+}
+
+.chat-composer-action {
+  width: 32px;
+  height: 32px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: var(--accent-color);
+  color: var(--text-on-accent, #fff);
+  cursor: pointer;
+  box-shadow: none;
+  transition: opacity 0.15s ease, filter 0.15s ease, background 0.15s ease, border-color 0.15s ease;
+}
+
+.chat-composer-action:hover:not(:disabled) {
+  filter: brightness(1.06);
+}
+
+.chat-composer-action:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.chat-composer-action.is-cancel {
+  background: var(--status-danger-fg);
+  border-color: var(--status-danger-fg);
+  color: var(--text-on-accent, #fff);
+  opacity: 1;
+}
+
+.chat-composer-action.is-cancel:hover:not(:disabled) {
+  filter: brightness(0.94);
+}
+
+.chat-composer-send-icon {
+  font-size: 16px;
+  font-weight: 600;
+  line-height: 1;
+}
+
+.chat-composer-stop-icon {
+  font-size: 12px;
+  line-height: 1;
+}
+</style>

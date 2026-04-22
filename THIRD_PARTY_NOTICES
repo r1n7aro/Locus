@@ -1,0 +1,43 @@
+# Third-Party Notices
+
+This file records third-party components that need explicit redistribution handling in this repository and in the desktop application bundle.
+
+## Repository License
+
+The Locus source tree is distributed under `GPL-3.0-or-later`. See [LICENSE](LICENSE).
+
+## Desktop Application Bundle
+
+- The Tauri desktop application bundle includes `agent/`, `knowledge/`, `locus_unity/`, `LICENSE`, this notice file, and a generated `licenses/third_party/` bundle through [src-tauri/tauri.conf.json](src-tauri/tauri.conf.json).
+- The generated `licenses/third_party/` bundle contains:
+  - Frontend runtime dependency license texts and notices copied from `node_modules/`
+  - Native desktop runtime crate license texts and notices copied from the Cargo registry cache
+  - Fallback SPDX license texts for registry crates that publish only license expressions and omit standalone license files
+  - The bundled dependency manifests and lockfiles used to identify the shipped dependency set
+  - Legal texts for the ONNX Runtime `1.23.2` runtime and the DirectML `1.15.4` redistributable used by the embedding stack
+- `locus_unity/Editor/Roslyn` contains precompiled Roslyn and .NET assemblies used inside the Unity Editor integration.
+- Redistribution of the bundled Roslyn files must keep:
+  - [locus_unity/Editor/Roslyn/THIRD_PARTY.md](locus_unity/Editor/Roslyn/THIRD_PARTY.md)
+  - The full `locus_unity/Editor/Roslyn/licenses/` directory
+
+## Application Dependency Manifests
+
+- Frontend application dependencies are declared in [package.json](package.json) and resolved in `bun.lock`.
+- Native desktop application dependencies are declared in [src-tauri/Cargo.toml](src-tauri/Cargo.toml) and resolved in `src-tauri/Cargo.lock`.
+- The generated bundle copies those manifest and lock files under `licenses/third_party/manifests/`.
+- `html2md` is a direct Rust dependency used in the desktop application runtime and is licensed under `GPL-3.0+`.
+
+## Documentation Build Toolchain
+
+- `docs/` contains the documentation source tree and a local Mint-based build toolchain used for preview, validation, and site generation.
+- The documentation toolchain is declared in [docs/package.json](docs/package.json) and resolved in `docs/bun.lock`.
+- The desktop application release bundle does not ship the Mint CLI or `docs/node_modules`.
+- Each documentation build dependency remains available under its own license terms. The current toolchain includes `mint` and several `@mintlify/*` packages under `Elastic-2.0`.
+
+## Redistribution Checklist
+
+1. Keep [LICENSE](LICENSE).
+2. Keep this file.
+3. Keep the generated `licenses/third_party/` bundle.
+4. Keep [locus_unity/Editor/Roslyn/THIRD_PARTY.md](locus_unity/Editor/Roslyn/THIRD_PARTY.md).
+5. Keep the full `locus_unity/Editor/Roslyn/licenses/` directory.

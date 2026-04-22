@@ -1,0 +1,21 @@
+{
+  "description": "- Fast content search tool for Unity project codebases of any size\n- Searches file contents using regular expressions\n- Supports full regex syntax (eg. \"MonoBehaviour\", \"ScriptableObject\", \"SceneManager\\\\.sceneLoaded\")\n- Filter files by pattern with the include parameter (eg. \"*.cs\", \"Assets/**/Editor/*.cs\")\n- By default, skips root-level generated directories such as Library/, Temp/, Obj/, Logs/, and Build*/\n- Returns file paths and line numbers with at least one match sorted by path and line number\n- You MUST set path explicitly; never rely on the current process directory\n- Use this tool when you need to find scripts, callbacks, or other code patterns quickly",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "pattern": {
+        "type": "string",
+        "description": "The regex pattern to search for in file contents"
+      },
+      "path": {
+        "type": "string",
+        "description": "The directory to search in. Required."
+      },
+      "include": {
+        "type": "string",
+        "description": "File pattern to include in the search (e.g. \"*.cs\", \"Assets/**/Editor/*.cs\")"
+      }
+    },
+    "required": ["pattern", "path"]
+  }
+}

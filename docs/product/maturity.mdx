@@ -1,0 +1,42 @@
+---
+title: 成熟度与适用团队
+description: 从当前仓库实现观察 Locus 的产品成熟度与适用范围。
+sidebarTitle: 成熟度
+---
+
+从当前仓库快照看，Locus 已经具备完整桌面工作台的产品骨架、底层运行时和一部分稳定性建设。
+
+## 代码层面的成熟度信号
+
+- 前端主界面围绕六个工作区组织
+- Rust 后端拆分出 `agent / asset_db / diff / merge / knowledge_index / unity_bridge / llm / session / vcs` 等独立模块
+- Unity 插件侧已有独立桥接实现
+- `src/__tests__` 下当前有 93 个测试文件
+- 会话持久化 schema 已明确演进到 `v10`，并保留显式迁移逻辑
+
+## 更适合的团队
+
+- 使用 Unity 进行游戏研发
+- 使用 Git 管理项目
+- 希望把 AI 真正嵌入日常开发流程
+- 需要统一管理项目知识、规范和外部参考资料
+
+## 当前产品重心
+
+- Unity first
+- Git first
+- 本地桌面工作流 first
+- 面向长期项目协作
+
+## 实现依据
+
+本文判断主要来自当前仓库里的这些模块：
+
+- 应用主框架：`src/App.vue`
+- 会话与 Agent UI：`src/components/ChatView.vue`、`src/components/AgentView.vue`
+- 资产工作区：`src/components/AssetView.vue`、`src-tauri/src/asset_db/*`、`src-tauri/src/commands/asset.rs`
+- 协作工作区：`src/components/CollabView.vue`、`src-tauri/src/merge/*`、`src-tauri/src/diff/*`
+- 知识工作区：`src/components/KnowledgeView.vue`、`src-tauri/src/knowledge_index/*`、`src-tauri/src/knowledge_store.rs`
+- Unity 桥接：`src-tauri/src/unity_bridge/*`、`locus_unity/Editor/LocusBridge*.cs`
+- 模型与运行时：`src/stores/model.ts`、`src-tauri/src/llm/*`、`src-tauri/src/auth/*`
+- 会话持久化与迁移：`src-tauri/src/session/store.rs`

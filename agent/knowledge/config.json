@@ -1,0 +1,26 @@
+{
+  "name": "Knowledge",
+  "description": "Maintain unified design, memory, skill, and reference documents for Unity projects.",
+  "tools": [
+    "read",
+    "list",
+    "grep",
+    "task",
+    "todowrite",
+    "ask_user_question",
+    "unity_asset_search",
+    "unity_ref_search",
+    "unity_yaml_read",
+    "knowledge_list",
+    "knowledge_query",
+    "knowledge_read",
+    "knowledge_create",
+    "knowledge_edit",
+    "knowledge_move",
+    "knowledge_delete"
+  ],
+  "sub_agents": ["explorer"],
+  "default": false,
+  "default_effort": "medium",
+  "model_recommendation": "large"
+}

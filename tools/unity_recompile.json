@@ -1,0 +1,18 @@
+{
+  "description": "Trigger Unity script recompilation and wait for it to complete.\n\nUse this tool AFTER modifying C# script files (.cs) in the Unity project. Unity's auto domain reload is disabled by default — you MUST call this tool to apply your code changes.\n\nWhat happens:\n1. Unity Editor is brought to the foreground\n2. Script compilation is triggered\n3. If compilation succeeds: domain reload occurs (Unity plugin reconnects automatically)\n4. If compilation fails: compile errors are returned\n\nIMPORTANT:\n- Always call this tool after editing .cs files before using unity_execute, so that your changes take effect.\n- This tool may take 10-60 seconds depending on the project size.\n- Do NOT call this tool while `editor_status` is `playing` or `playing_paused`.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "project_path": {
+        "type": "string",
+        "description": "Absolute path to the Unity project root. Required."
+      },
+      "editor_status": {
+        "type": "string",
+        "enum": ["disconnected", "editing", "playing", "playing_paused"],
+        "description": "The canonical Unity Editor status from the Environment section's `Unity Editor Status`. Allowed values: `disconnected`, `editing`, `playing`, `playing_paused`. You MUST read the current status and pass it exactly. `unity_recompile` only runs when the actual status is `editing`."
+      }
+    },
+    "required": ["project_path", "editor_status"]
+  }
+}

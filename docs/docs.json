@@ -1,0 +1,147 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "mint",
+  "name": "Locus",
+  "logo": {
+    "light": "/images/logo-light.svg",
+    "dark": "/images/logo-dark.svg"
+  },
+  "description": "Documentation for the Locus Unity Dev Agent workspace.",
+  "colors": {
+    "primary": "#5d7285",
+    "light": "#748fa4",
+    "dark": "#4b6375"
+  },
+  "appearance": {
+    "default": "system"
+  },
+  "navigation": {
+    "languages": [
+      {
+        "language": "zh-Hans",
+        "default": true,
+        "tabs": [
+          {
+            "tab": "概览",
+            "groups": [
+              {
+                "group": "概览",
+                "pages": [
+                  "index",
+                  "overview/advantages-over-generic-agents"
+                ]
+              },
+              {
+                "group": "快速开始",
+                "pages": [
+                  "overview/install-and-setup",
+                  "overview/page-tour",
+                  "overview/usage-guidance"
+                ]
+              },
+              {
+                "group": "规划",
+                "pages": [
+                  "overview/roadmap"
+                ]
+              }
+            ]
+          },
+          {
+            "tab": "知识",
+            "groups": [
+              {
+                "group": "知识",
+                "pages": [
+                  "knowledge/index"
+                ]
+              }
+            ]
+          },
+          {
+            "tab": "协作",
+            "groups": [
+              {
+                "group": "协作",
+                "pages": [
+                  "collaboration/index"
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "language": "en",
+        "tabs": [
+          {
+            "tab": "Overview",
+            "groups": [
+              {
+                "group": "Overview",
+                "pages": [
+                  "en/index",
+                  "en/overview/advantages-over-generic-agents"
+                ]
+              },
+              {
+                "group": "First steps",
+                "pages": [
+                  "en/overview/install-and-setup",
+                  "en/overview/page-tour",
+                  "en/overview/usage-guidance"
+                ]
+              },
+              {
+                "group": "Planning",
+                "pages": [
+                  "en/overview/roadmap"
+                ]
+              }
+            ]
+          },
+          {
+            "tab": "Knowledge",
+            "groups": [
+              {
+                "group": "Knowledge",
+                "pages": [
+                  "en/knowledge/index"
+                ]
+              }
+            ]
+          },
+          {
+            "tab": "Collaboration",
+            "groups": [
+              {
+                "group": "Collaboration",
+                "pages": [
+                  "en/collaboration/index"
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "redirects": [
+    {
+      "source": "/product",
+      "destination": "/"
+    },
+    {
+      "source": "/locus-product-intro-for-game-developers-zh",
+      "destination": "/"
+    },
+    {
+      "source": "/en/product",
+      "destination": "/en"
+    },
+    {
+      "source": "/en/locus-product-intro-for-game-developers",
+      "destination": "/en"
+    }
+  ]
+}
