@@ -195,8 +195,8 @@
 }
 
 .showcase-card-description {
-  margin: -6px 0 0 !important;
-  margin-block-start: -6px !important;
+  margin: 8px 0 0 !important;
+  margin-block-start: 8px !important;
   margin-block-end: 0 !important;
   padding: 0 2px;
   font-size: 0.82rem;
