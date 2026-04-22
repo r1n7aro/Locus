@@ -15,6 +15,19 @@
   "appearance": {
     "default": "system"
   },
+  "navbar": {
+    "links": [
+      {
+        "label": "GitHub",
+        "href": "https://github.com/r1n7aro/Locus",
+        "icon": {
+          "library": "fontawesome",
+          "name": "github",
+          "style": "brands"
+        }
+      }
+    ]
+  },
   "navigation": {
     "languages": [
       {
@@ -40,8 +53,9 @@
                 ]
               },
               {
-                "group": "规划",
+                "group": "版本与规划",
                 "pages": [
+                  "overview/latest-version",
                   "overview/roadmap"
                 ]
               }
@@ -95,6 +109,7 @@
               {
                 "group": "Planning",
                 "pages": [
+                  "en/overview/latest-version",
                   "en/overview/roadmap"
                 ]
               }

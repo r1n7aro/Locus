@@ -4,8 +4,10 @@
   "description": "Documentation source and local build toolchain for Locus.",
   "type": "module",
   "scripts": {
+    "release:generate": "bun run scripts/generate-update-manifest.mjs",
+    "release:validate-metadata": "bun run scripts/validate-release-notes-metadata.mjs",
     "dev": "mint dev --no-open",
-    "validate": "mint validate",
+    "validate": "bun run release:validate-metadata && mint validate",
     "broken-links": "mint broken-links",
     "build": "bun run validate"
   },
