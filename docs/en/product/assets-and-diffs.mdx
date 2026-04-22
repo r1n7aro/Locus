@@ -1,10 +1,10 @@
 ---
 title: Asset Graph and Semantic Diff
-description: Work capabilities built around the Unity asset database, reference graph, and semantic diff.
+description: Working capabilities built around the Unity asset database, reference graph, and semantic diff.
 sidebarTitle: Assets and Diff
 ---
 
-Locus organizes Unity assets as graph-level working objects and provides semantic diff and merge views that are closer to Unity structure for important resource types.
+Locus organizes Unity assets as graph-level working objects and provides semantic diff and merge views for key asset types that are closer to Unity structure.
 
 ## Asset Database and Reference Graph
 
@@ -13,31 +13,31 @@ The current implementation already covers:
 - Scanning `Assets` and `Packages`
 - Parsing `.meta`, YAML assets, and script information
 - Building asset nodes and reference edges
-- Providing dependencies, reverse references, GUID resolution, and path resolution
-- Outputting asset risk reports
-- Detecting broken references, `Missing Script`, parse failures, and duplicate GUIDs
-- Incrementally updating indexes through a filesystem watcher
+- Providing dependency lookup, reverse reference lookup, GUID resolution, and path resolution
+- Asset risk reports
+- Detection of broken references, `Missing Script`, parse failures, and duplicate GUIDs
+- Incremental index updates through a file system watcher
 
-This lets Locus answer many high-value questions in Unity projects:
+This allows Locus to answer many high-value questions in Unity projects:
 
-- Which assets reference this Prefab
-- Which resources are affected by a ScriptableObject change
-- Where duplicate GUID risk exists in the current project
-- Which assets already contain `Missing Script`
+- Who references this Prefab
+- Which assets will be affected by a ScriptableObject change
+- Where duplicate GUID risks exist in the current project
+- Which assets already contain Missing Script
 
 ## Semantic Diff and Merge
 
-The diff / merge modules in the repository already cover:
+The diff and merge modules in the repository already cover:
 
-- Scene hierarchy and Inspector-structured views
+- Scene hierarchy and Inspector structure views
 - Semantic target construction for `PrefabInstance`
-- Grouped field presentation for common object types such as materials and particle systems
+- Grouped field presentation for common objects such as materials and particle systems
 - Dual views for semantic diff and text diff
 - Merge semantic sessions and target materialization for Unity assets
-- Conflict resolution workflow and merge panel
+- Conflict-resolution workflows and merge panels
 
-## Suitable Use Cases
+## Suitable Usage Scenarios
 
 - Asset troubleshooting and impact analysis
 - Review of Scene, Prefab, Material, and ParticleSystem changes
-- Conflict handling and merge assistance for Unity resources
+- Unity asset conflict handling and merge assistance

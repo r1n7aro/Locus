@@ -1,69 +1,70 @@
 ---
-title: Install and Setup
+title: Installation and Setup
 description: Install and configure Locus quickly
 ---
 
 <br/>
 <div style={{ textAlign: 'center', color: '#8f2f2f' }}>
-  **Before you let Locus make any changes, please make sure you have backed up your project files.**<br />
-  **AI Agents may not always be reliable when executing tasks**
+  **Before you use Locus to perform any modification, make sure you have backed up your project files.**<br />
+  **AI Agents may involve uncertainty while executing tasks. Use them with caution.**
 </div>
 
 <br/>
 
 ## Configure Model Services
 
-Locus must be configured with a remote AI service as its "brain", and **the capability of the remote model directly determines how well it works**.
+Locus requires a remote AI service as its inference engine. **The performance of the remote large model will directly affect the effectiveness of Locus.**
 
 > **Subscription services and message formats currently supported by Locus**
 > - OpenAI subscription
-> - Anthropic subscription (Anthropic has explicitly stated that subscriptions are not supported through third-party clients, and you use it at your own risk)
+> - Anthropic subscription (Anthropic has explicitly prohibited third-party clients from accessing its subscription service. You assume the related risk when using this method.)
 > - OpenAI Response API
 > - Anthropic Messages API
-> - OpenAI ChatCompeletions API
+> - OpenAI Chat Completions API
 
-Aside from the remote model service you configure, Locus is a pure client application. Other than model calls, no information is sent to the internet.
+Other than the configured remote model service calls, Locus is a pure client-side application. No other information will be uploaded to the internet.
 
-We recommend installing from our installer package. After installation, the first launch will show the onboarding flow:
+We recommend installing the official package. After installation, the app will automatically enter the onboarding flow on first launch.
 
 ## Select a Project and Install the Plugin
 
 ![img](/images/overview/install-and-setup/unity-plugin-2.png)
 
-Locus communicates with the Unity Editor through a Unity plugin. This is how it detects editor state, executes C# code, and so on.
+Locus communicates with the Unity Editor through a Unity plugin to detect editor state, execute C# code, and more.
 
-The plugin is installed to `Packages/com.farlocus.locus` by default. If Locus finds a legacy `Assets/Locus` install, clicking update migrates it to the package path automatically.
+The default plugin installation path is `Packages/com.farlocus.locus`. If an older `Assets/Locus` installation is detected, clicking update will automatically migrate it to the new package path.
 
 ## Version Control / Git Configuration
 
 ![img](/images/overview/install-and-setup/git-config.png)
 
-Locus uses version control software to provide features such as "undo" and "change analysis".
+Locus relies on version control tools to provide functions such as undo and change analysis.
 
-We also provide a graphical interface for Git.
+In addition, Locus provides a graphical interface for Git.
 
-> We plan to support more version control systems such as P4 and SVN in the future, but only Git is supported right now
+> We plan to support version control tools such as Perforce (P4) and SVN in the future. The current version supports Git only.
 
 ## Scan the Asset Database
 
 ![img](/images/overview/install-and-setup/asset-scan.png)
 
-Locus does not analyze assets through the Unity Editor. Instead, it directly reads Unity's serialized files on disk to analyze reference relationships.
+Locus does not parse assets through the Unity Editor. Instead, it reads Unity serialized files directly from disk to analyze reference relationships between assets.
 
 ## Try Your First Conversation
 
 <br/>
 <div style={{ textAlign: 'center', color: '#8f2f2f' }}>
-  **Before you let Locus make any changes, please make sure you have backed up your project files.**<br />
-  **AI Agents may not always be reliable when executing tasks**
+  **Before you use Locus to perform any modification, make sure you have backed up your project files.**<br />
+  **AI Agents may involve uncertainty while executing tasks. Use them with caution.**
 </div>
 
-Locus setup is now complete. You can adjust these settings later in the Settings tab.
 
-You can try prompts like:
+The basic configuration of Locus is now complete. You can adjust the settings above later on the Settings page.
 
-- Help me analyze the code structure of the project and point out places that can be optimized?
-- I want to create a side-scrolling platformer. Please write a simple 2D side-scrolling controller and place a few test platforms in the current scene
-- Help me commit the current changes to Git in batches
-- I want to create my own custom render pipeline with a cartoon style. Draft a plan for me to review before implementation
-- Generate localized strings for the description field of every 'Item' asset in the project and fill them into a table
+You can now try the following example conversations:
+
+- Analyze the project's code structure and point out areas that can be optimized.
+- Create a side-scrolling platformer: write a simple 2D side-scrolling jump controller and place several test platforms in the current scene.
+- Commit the current modifications to Git in batches.
+- Create a custom render pipeline in a cartoon style: draft an implementation plan and execute it after review.
+- Generate corresponding localized text for the description strings under all `Item` assets in the project and fill them into a table.

@@ -1,5 +1,5 @@
 ---
-title: Page Notes
+title: Page Guide
 description: Brief usage notes for each page
 ---
 
@@ -7,45 +7,54 @@ description: Brief usage notes for each page
 
 ![img](/images/overview/page-tour/session.png)
 
-- You can input images in the message box (a multimodal model is required; GPT and Claude both work)
-- Before using it, first make sure the asset database and Unity Editor in the upper left are working normally
-- New conversation: click the `[+]` in the upper left or `[CTRL+N]` (the shortcut can be configured in Settings)
-- The `[AUTO]` button in the lower right: in auto mode it will not ask for permission on every tool call. After switching it off, each modifying action will ask for permission. This is safer and more cumbersome
-- The `[Model]` button in the lower right: select a model
-- Send message: `[Enter]` by default. You can change it to `[CTRL+ENTER]` in Settings
-- The session list on the left can be expanded by clicking the `[>]` on the left (to view subagents), and it supports the right-click menu (archive, delete) and multi-select while holding `SHIFT`
+Before sending a message, make sure the `Asset Database` and `Unity Editor Connection` in the upper-left corner are working properly.
+
+- **Multimodal input**: the input box supports image upload and parsing. You can paste with `CTRL+V`.
+- **Create a new session**: click the `+` icon in the upper-left corner or use the shortcut `CTRL+N` (the shortcut can be customized on the Settings page).
+- **Execution permission control**: located in the lower-right corner. When auto mode is enabled, the Agent's tool calls will run without approval. When it is disabled, any modification by the Agent will request permission from the user. This mode is safer, but it requires manual confirmation.
+- **Model switching**: located in the lower-right corner and used to switch the AI model for the current session.
+- **Send message**: the default shortcut is `ENTER`. You can change it to `CTRL+ENTER` on the Settings page.
+- **Session list management**: click `>` next to an item in the list on the left to expand the detailed execution process of a Subagent. List items support a right-click menu for actions such as archive and delete, and they support batch multi-selection while holding `SHIFT`.
 
 ## Collaboration
 
 ![img](/images/overview/page-tour/collaboration.png)
 
-- You can type Git commands or natural language directly into the command line at the bottom
-- You can right-click commits and modified files to open some actions (the current set may still be incomplete; you can tell us what to add)
-- Click the file list on the right (`commit`, `stash`, `unstaged/staged`) to view changes, including Unity YAML assets (`Scene`, `Prefab`, `ScriptableObject`, and so on)
-- Field-by-field semantic merge is supported during conflicts
-- Files marked as Locus are Locus knowledge/configuration files. If you do not want to commit them to Git, add them to `.gitignore`
+- **Version control interaction**: the terminal area at the bottom supports directly entering standard Git commands or giving instructions to AI in natural language.
+- **Context menu**: right-click a commit record or a modified file to open the extended function menu. The feature matrix is still evolving, and feedback is welcome.
+- **Change preview and parsing**: click the file list on the right, including the Commit, Stash, and Unstaged/Staged areas, to preview diffs. The system natively supports visual parsing of Unity YAML asset files such as Scene, Prefab, and ScriptableObject.
+- **Conflict resolution**: when merge conflicts occur, the system supports context-based semantic merging at the field level.
+- **Locus-related file markers**: files marked as related to Locus are the Agent's own knowledge or configuration files. If you do not want them included in project version control, we recommend manually adding their paths to `.gitignore`
 
 ## Knowledge
 
 ![img](/images/overview/page-tour/knowledge-types.png)
 
-Knowledge is currently divided into four categories:
+### Knowledge Categories
 
-- `Design`: design requirement documents and fact sources. AI will automatically edit them after it receives requirements in a conversation (with your approval), and you can also write them yourself
-- `Memory`: memory maintained automatically by AI. By default we provide three parts (user preferences, mistake notebook, project understanding). You can also create new documents and write maintenance rules, and AI will maintain them according to those rules
-- `Skill`: the same kind of Agent Skill used by general agents. If you need the agent to execute the same process many times, you can write that process to the AI in natural language and let it follow the Skill every time
-- `Reference`: external read-only documents. Right now you can import the Unity API Reference and Feishu docs
+The knowledge base is the core source from which the Agent obtains project context. The current knowledge system is divided into the following four categories:
 
-Documents support a **lexical index** (enabled by default) and a **semantic index** (enable it in the retrieval settings below)
+- **Design**: records project design requirements and factual baselines. AI can automatically update this document during a conversation according to business requirements, with user approval. Users can also edit and maintain it manually at any time.
+- **Memory**: dynamic context automatically maintained by AI. The system provides three built-in modules by default: user preferences, a mistake notebook, and project understanding. Users can create documents and define exclusive maintenance rules. AI will iterate on them automatically according to those rules.
+- **Skill**: used to solidify standardized high-frequency workflows. Users can describe a specific process in natural language and instruct the Agent to follow this Skill when it encounters a similar scenario.
+- **Reference**: an external read-only document library. It currently supports importing local documentation such as the Unity API Reference or connecting to external collaboration platforms such as Feishu Docs.
 
-> Lexical index: the AI searches document content using a few keywords
->
-> Semantic index: the AI outputs a passage, and we search for document chunks with similar meaning
+### Retrieval Strategy
+
+The system supports the following two document retrieval mechanisms:
+
+- **Lexical indexing (enabled by default)**: exact text matching based on keyword extraction.
+- **Semantic indexing (enable it in the retrieval settings below)**: based on text vectorization. The system retrieves semantically similar paragraphs from the document library according to semantic fragments produced on the AI side. It is suitable for fuzzy document queries.
 
 ![img](/images/overview/page-tour/knowledge-search.png)
 
 ## Settings
 
-You can configure models here, including custom endpoints and subscription sign-in.
+The Settings page is used to manage global system settings.
+
+
+### Model Configuration
+
+It supports customizing model parameters, configuring third-party API endpoints, and managing the sign-in and authorization status of subscription accounts.
 
 ![img](/images/overview/page-tour/settings.png)
