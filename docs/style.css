@@ -172,19 +172,26 @@
   border-radius: 10px;
   background: transparent;
   line-height: 0;
+  aspect-ratio: 16 / 10;
+}
+
+.showcase-thumb > span,
+.showcase-thumb [data-rmiz-content],
+.showcase-thumb picture {
+  display: block !important;
+  width: 100%;
+  height: 100%;
 }
 
 .showcase-thumb img {
   width: 100%;
+  height: 100%;
   object-fit: cover;
   display: block;
   border: 0;
   background: transparent;
   vertical-align: top;
-}
-
-.showcase-thumb img {
-  aspect-ratio: 16 / 10;
+  max-width: none;
 }
 
 .showcase-card-description {
