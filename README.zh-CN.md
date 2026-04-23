@@ -2,15 +2,31 @@
 
 [English](README.md) | 简体中文
 
-Locus for Unity 是一个面向 Unity 项目的开源 AI Agent。它不仅能够像常规 Coding Agent 一样编写代码，还能够自主读入 Unity 编辑器上下文、修改场景与资产，并结合内置的自动记忆系统、可视化版本管理完成完整开发流程。
+规模化地提升游戏开发的效率，将创作者从繁琐的事务性工作中解放
 
-[文档](docs/index.mdx)
+## 概览
+
+`Locus for Unity`是一个面向Unity项目的**开源**AI Agent。
+
+- **编辑器内操作**：编写C#代码、读入并修改Unity对象与资产，完成完整功能开发流程
+- **自动化知识系统**：自动将对话需求总结成设计文档，并将项目理解保存在长期记忆中
+- **可视化版本管理**：提供可视化的版本管理界面，支持Unity YAML资产的语义化差异分析与冲突处理
+- **高度优化的提示词**：针对于Unity项目优化提示词，提高Agent能力，规避常见错误
+- **多种模型支持**：支持订阅帐号登录，并兼容多种LLM API能力
+
+![Locus for Unity](docs/images/home.png)
+
+## 快速入口
+
+- [WIKI](https://unity.farlocus.com/)
+- [快速开始](https://unity.farlocus.com/overview/install-and-setup)：快速安装Locus，在几分钟内完整配置
+- [路线图](https://unity.farlocus.com/overview/roadmap)：查看我们正在实施以及计划中的功能
 
 ## 安装
 
 目前仅支持 Windows 系统，我们很快会完善针对 macOS 的支持。
 
-我们推荐使用 Releases 中的安装包安装，安装后的配置流程见 [快速开始](docs/overview/install-and-setup.mdx)。
+我们推荐使用 Releases 中的安装包安装，安装后的配置流程见 [快速开始](https://unity.farlocus.com/overview/install-and-setup)。
 
 ## 从源代码构建
 
@@ -31,6 +47,10 @@ bun tauri build
 ```
 
 该命令会完成前端构建、生成第三方许可证 bundle，并打包桌面应用。当前默认输出 Windows `NSIS` 安装包，产物位于 `src-tauri/target/release/bundle/nsis/`。
+
+## 发布版本
+
+发布安装包与版本说明见 [GitHub Releases](https://github.com/r1n7aro/Locus/releases)。
 
 ## 许可证
 

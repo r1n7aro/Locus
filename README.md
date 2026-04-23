@@ -1,16 +1,37 @@
 # Locus for Unity - Open Source Unity Dev Agent
 
+[![Docs](https://img.shields.io/badge/docs-unity.farlocus.com-5d7285)](https://unity.farlocus.com/en)
+[![Release](https://img.shields.io/github/v/release/r1n7aro/Locus?display_name=tag)](https://github.com/r1n7aro/Locus/releases)
+[![License](https://img.shields.io/badge/license-GPL--3.0--or--later-4b6375)](LICENSE)
+[![Platform](https://img.shields.io/badge/platform-Windows-2d6cdf)](https://github.com/r1n7aro/Locus/releases)
+
 English | [简体中文](README.zh-CN.md)
 
-Locus for Unity is an open source AI agent for Unity projects. It can write code like a standard coding agent, read Unity Editor context, modify scenes and assets, and combine built-in automatic memory with visual version control to support the full development workflow.
+Scale game development efficiency and free creators from tedious, repetitive work.
 
-[Documentation](docs/en/index.mdx)
+## Overview
+
+`Locus for Unity` is an open-source AI Agent for Unity projects.
+
+- **In-editor operations**: write C# code, read and modify Unity objects and assets, and complete the full feature development workflow
+- **Automated knowledge system**: automatically summarize conversation requirements into design documents and preserve project understanding in long-term memory
+- **Visual version control**: provide a visual version control interface with semantic diff analysis and conflict handling for Unity YAML assets
+- **Highly optimized prompts**: optimize prompts for Unity projects, improve Agent capability, and avoid common mistakes
+- **Multiple model support**: support subscription account sign-in and compatibility with multiple LLM API capabilities
+
+![Locus for Unity](docs/images/home.png)
+
+## Quick Links
+
+- [WIKI](https://unity.farlocus.com/en)
+- [Quick Start](https://unity.farlocus.com/en/overview/install-and-setup): Install Locus quickly and complete the full setup in minutes
+- [Roadmap](https://unity.farlocus.com/en/overview/roadmap): See the features we are implementing and planning
 
 ## Installation
 
 Windows is currently the only supported platform. We plan to add macOS support soon.
 
-We recommend installing from the Releases build. For the post-installation setup flow, see [Quick Start](docs/en/overview/install-and-setup.mdx).
+We recommend installing from the Releases build. For the post-installation setup flow, see [Quick Start](https://unity.farlocus.com/en/overview/install-and-setup).
 
 ## Build from Source
 
@@ -31,6 +52,10 @@ bun tauri build
 ```
 
 This command builds the frontend, generates the third-party license bundle, and packages the desktop app. The default output is a Windows `NSIS` installer under `src-tauri/target/release/bundle/nsis/`.
+
+## Releases
+
+See [GitHub Releases](https://github.com/r1n7aro/Locus/releases) for published installers and release notes.
 
 ## License
 
