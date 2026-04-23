@@ -5,7 +5,7 @@
 [![Docs](https://img.shields.io/badge/DOCS-unity.farlocus.com-f2c230?style=for-the-badge&labelColor=4a4a4a)](https://unity.farlocus.com/en)
 [![Release](https://img.shields.io/badge/RELEASE-GitHub-5d7285?style=for-the-badge&labelColor=4a4a4a)](https://github.com/r1n7aro/Locus/releases)
 [![License](https://img.shields.io/badge/LICENSE-GPL--3.0--or--later-88b000?style=for-the-badge&labelColor=4a4a4a)](LICENSE)
-[![Platform](https://img.shields.io/badge/PLATFORM-Windows-2d6cdf?style=for-the-badge&labelColor=4a4a4a)](https://github.com/r1n7aro/Locus/releases)
+[![Roadmap](https://img.shields.io/badge/ROADMAP-View-2d6cdf?style=for-the-badge&labelColor=4a4a4a)](https://unity.farlocus.com/en/overview/roadmap)
 
 English | [简体中文](README.zh-CN.md)
 
@@ -18,6 +18,8 @@ English | [简体中文](README.zh-CN.md)
 - **Visual version control**: provide a visual version control interface with semantic diff analysis and conflict handling for Unity YAML assets
 - **Highly optimized prompts**: optimize prompts for Unity projects, improve Agent capability, and avoid common mistakes
 - **Multiple model support**: support subscription account sign-in and compatibility with multiple LLM API capabilities
+
+Locus is currently in early testing (`v0.1.1`). We welcome you to try it and share feedback through Issues. Your input is highly valuable to us.
 
 ## Installation
 

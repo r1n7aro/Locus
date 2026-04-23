@@ -5,7 +5,7 @@
 [![文档](https://img.shields.io/badge/DOCS-unity.farlocus.com-f2c230?style=for-the-badge&labelColor=4a4a4a)](https://unity.farlocus.com/)
 [![发布](https://img.shields.io/badge/RELEASE-GitHub-5d7285?style=for-the-badge&labelColor=4a4a4a)](https://github.com/r1n7aro/Locus/releases)
 [![许可证](https://img.shields.io/badge/LICENSE-GPL--3.0--or--later-88b000?style=for-the-badge&labelColor=4a4a4a)](LICENSE)
-[![平台](https://img.shields.io/badge/PLATFORM-Windows-2d6cdf?style=for-the-badge&labelColor=4a4a4a)](https://github.com/r1n7aro/Locus/releases)
+[![路线图](https://img.shields.io/badge/ROADMAP-View-2d6cdf?style=for-the-badge&labelColor=4a4a4a)](https://unity.farlocus.com/overview/roadmap)
 
 [English](README.md) | 简体中文
 
@@ -18,6 +18,8 @@
 - **可视化版本管理**：提供可视化的版本管理界面，支持Unity YAML资产的语义化差异分析与冲突处理
 - **高度优化的提示词**：针对于Unity项目优化提示词，提高Agent能力，规避常见错误
 - **多种模型支持**：支持订阅帐号登录，并兼容多种LLM API能力
+
+Locus 目前仍然处于早期测试状态（v0.1.1），欢迎您试用并通过Issue提出反馈，您的意见对我们非常重要！
 
 ## 安装
 

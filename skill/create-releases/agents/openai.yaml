@@ -1,4 +1,0 @@
-interface:
-  display_name: "Create Releases"
-  short_description: "Draft changelog and publish GitHub releases"
-  default_prompt: "Use $create-releases to compare the last release on main with the current commit, draft the changelog, sync release files, and publish the next GitHub release."
