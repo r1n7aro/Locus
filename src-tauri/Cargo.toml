@@ -2,7 +2,7 @@
 name = "locus"
 version = "0.1.0"
 description = "A opensource unity dev agent"
-authors = ["dot"]
+authors = ["FarLocus"]
 edition = "2021"
 license = "GPL-3.0-or-later"
 
@@ -76,12 +76,15 @@ ndarray = "0.17.2"
 tokenizers = { version = "0.22.2", default-features = false, features = ["onig"] }
 socket2 = "0.5"
 sys-locale = "0.3.2"
+tauri-plugin-notification = "2.3.3"
 
 # Keep this pinned to rc.11 because fastembed 5.13.2 still depends on the same
 # ort/ort-sys pair upstream; rc.12 would create an unresolved onnxruntime links conflict.
 [target.'cfg(windows)'.dependencies]
 ort = { version = "=2.0.0-rc.11", default-features = false, features = ["directml", "copy-dylibs", "preload-dylibs"] }
+tauri-winrt-notification = "0.7.2"
 windows = { version = "0.61.3", features = ["Win32_Graphics_Dxgi", "Win32_Storage_FileSystem"] }
+winreg = "0.55.0"
 
 [dev-dependencies]
 tempfile = "3"

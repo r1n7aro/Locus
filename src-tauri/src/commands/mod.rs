@@ -11,9 +11,10 @@ mod ref_graph;
 mod session;
 mod skill;
 mod storage;
+mod system;
 mod undo;
-mod workspace;
 mod update;
+mod workspace;
 
 use serde::{Deserialize, Serialize};
 
@@ -237,6 +238,7 @@ pub use ref_graph::*;
 pub use session::*;
 pub use skill::*;
 pub use storage::*;
+pub use system::*;
 pub use undo::*;
-pub use workspace::*;
 pub use update::*;
+pub use workspace::*;

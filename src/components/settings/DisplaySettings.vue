@@ -23,6 +23,10 @@ const themeOptions = computed(() =>
   })),
 );
 
+const systemNotificationOptionsDisabled = computed(
+  () => !display.systemNotificationsEnabled,
+);
+
 const fontSlots: { slot: FontSlot; labelKey: string; mono: boolean }[] = [
   { slot: "ui",        labelKey: "settings.display.fontUi",        mono: false },
   { slot: "prose",     labelKey: "settings.display.fontProse",     mono: false },
@@ -84,11 +88,86 @@ onMounted(async () => {
 
     <label class="toggle-row">
       <BaseSwitch
+        :model-value="display.rightAlignUserMessages"
+        :aria-label="t('settings.display.rightAlignUserMessages')"
+        @update:model-value="setDisplay('rightAlignUserMessages', $event)"
+      />
+      <span>{{ t("settings.display.rightAlignUserMessages") }}</span>
+    </label>
+
+    <label class="toggle-row">
+      <BaseSwitch
         :model-value="display.compactToolCalls"
         :aria-label="t('settings.display.compactToolCalls')"
         @update:model-value="setDisplay('compactToolCalls', $event)"
       />
       <span>{{ t("settings.display.compactToolCalls") }}</span>
+    </label>
+  </div>
+
+  <div class="settings-section">
+    <div class="section-label">{{ t("settings.display.notificationsTitle") }}</div>
+    <p class="section-desc">{{ t("settings.display.notificationsDesc") }}</p>
+
+    <label class="toggle-row">
+      <BaseSwitch
+        :model-value="display.systemNotificationsEnabled"
+        :aria-label="t('settings.display.systemNotificationsEnabled')"
+        @update:model-value="setDisplay('systemNotificationsEnabled', $event)"
+      />
+      <span>{{ t("settings.display.systemNotificationsEnabled") }}</span>
+    </label>
+
+    <label
+      class="toggle-row"
+      :class="{ disabled: systemNotificationOptionsDisabled }"
+    >
+      <BaseSwitch
+        :model-value="display.notifyOnChatDone"
+        :disabled="systemNotificationOptionsDisabled"
+        :aria-label="t('settings.display.notifyOnChatDone')"
+        @update:model-value="setDisplay('notifyOnChatDone', $event)"
+      />
+      <span>{{ t("settings.display.notifyOnChatDone") }}</span>
+    </label>
+
+    <label
+      class="toggle-row"
+      :class="{ disabled: systemNotificationOptionsDisabled }"
+    >
+      <BaseSwitch
+        :model-value="display.notifyOnAskUser"
+        :disabled="systemNotificationOptionsDisabled"
+        :aria-label="t('settings.display.notifyOnAskUser')"
+        @update:model-value="setDisplay('notifyOnAskUser', $event)"
+      />
+      <span>{{ t("settings.display.notifyOnAskUser") }}</span>
+    </label>
+
+    <label
+      class="toggle-row"
+      :class="{ disabled: systemNotificationOptionsDisabled }"
+    >
+      <BaseSwitch
+        :model-value="display.notifyOnChatError"
+        :disabled="systemNotificationOptionsDisabled"
+        :aria-label="t('settings.display.notifyOnChatError')"
+        @update:model-value="setDisplay('notifyOnChatError', $event)"
+      />
+      <span>{{ t("settings.display.notifyOnChatError") }}</span>
+    </label>
+
+    <label
+      class="toggle-row"
+      :class="{ disabled: systemNotificationOptionsDisabled }"
+    >
+      <BaseSwitch
+        :model-value="display.notifyOnToolConfirm"
+        :disabled="systemNotificationOptionsDisabled"
+        :aria-label="t('settings.display.notifyOnToolConfirm')"
+        @update:model-value="setDisplay('notifyOnToolConfirm', $event)"
+      />
+      <span>{{ t("settings.display.notifyOnToolConfirm") }}</span>
     </label>
   </div>
 
@@ -125,6 +204,10 @@ onMounted(async () => {
   padding: 7px 0;
   font-size: 13px;
   color: var(--text-color);
+}
+
+.toggle-row.disabled {
+  color: var(--text-secondary);
 }
 
 .font-grid {

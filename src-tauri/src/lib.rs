@@ -143,8 +143,16 @@ pub fn run() {
         })
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         .setup(move |app| {
             log_store_for_setup.attach_app_handle(app.handle().clone());
+            if let Err(error) = commands::ensure_windows_notification_identity(&app.handle().clone())
+            {
+                eprintln!(
+                    "[Locus] warning: failed to prepare Windows notification identity: {}",
+                    error
+                );
+            }
             let data_dir = commands::prepare_runtime_storage_dir(&app.handle().clone())
                 .map_err(|e| format!("Failed to prepare app storage dir: {}", e))?;
             commands::restore_saved_git_override(&app.handle().clone());
@@ -412,6 +420,8 @@ pub fn run() {
             };
 
             let watcher_handle: AssetDbWatcherHandle = Arc::new(std::sync::Mutex::new(None));
+            let knowledge_watcher_handle: KnowledgeFsWatcherHandle =
+                Arc::new(std::sync::Mutex::new(None));
             let watcher_tuning = Arc::new(crate::asset_db::watcher::WatcherTuning::new());
 
             if ref_graph_state.0.lock().unwrap().is_some() {
@@ -420,8 +430,6 @@ pub fn run() {
                 match AssetDbWatcher::start(watcher_root, graph_arc, watcher_tuning.clone()) {
                     Ok(w) => {
                         *watcher_handle.lock().unwrap() = Some(w);
-            let knowledge_watcher_handle: KnowledgeFsWatcherHandle =
-                Arc::new(std::sync::Mutex::new(None));
                         eprintln!("[Locus] ref_graph watcher started (from existing DB)");
                     }
                     Err(e) => {
@@ -430,14 +438,6 @@ pub fn run() {
                 }
             }
 
-            app.manage(config);
-            app.manage(auth_state);
-            app.manage(codex_state);
-            app.manage(api_key_state);
-            app.manage(app_knowledge_dir);
-            app.manage(app_agent_dir);
-            app.manage(provider_keys);
-            app.manage(store);
             if !initial_working_dir_copy.trim().is_empty() {
                 if let Err(error) =
                     crate::knowledge_store::ensure_knowledge_roots(&initial_working_dir_copy)
@@ -466,6 +466,14 @@ pub fn run() {
                 }
             }
 
+            app.manage(config);
+            app.manage(auth_state);
+            app.manage(codex_state);
+            app.manage(api_key_state);
+            app.manage(app_knowledge_dir);
+            app.manage(app_agent_dir);
+            app.manage(provider_keys);
+            app.manage(store);
             app.manage(registry);
             app.manage(tool_registry);
             app.manage(workspace.clone());
@@ -474,6 +482,7 @@ pub fn run() {
             app.manage(unity_monitor.clone());
             app.manage(ref_graph_state);
             app.manage(watcher_handle);
+            app.manage(knowledge_watcher_handle);
             app.manage(crate::asset_db::watcher::WatcherTuningState(watcher_tuning));
             app.manage(last_scan_info_state);
             app.manage(scan_phase_state);
@@ -482,7 +491,6 @@ pub fn run() {
             app.manage(question_store);
             app.manage(knowledge_proposal_drafts);
             app.manage(canvas_spec_store);
-            app.manage(knowledge_watcher_handle);
             app.manage(undo_manager);
             app.manage(tool_permission_mode);
             app.manage(tool_permissions);
@@ -749,6 +757,8 @@ pub fn run() {
             commands::reset_all_config,
             commands::save_plan_artifact,
             commands::get_system_fonts,
+            commands::get_system_locale,
+            commands::send_system_notification,
             commands::get_config_registry,
             commands::get_log_entries,
             commands::clear_log_entries,

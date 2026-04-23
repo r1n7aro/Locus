@@ -9,8 +9,20 @@ export interface DisplaySettings {
   changesAutoOpen: boolean;
   /** Auto-close file changes panel when a new round starts */
   changesAutoClose: boolean;
+  /** Right-align user messages in the session transcript */
+  rightAlignUserMessages: boolean;
   /** Collapse completed tool call batches in chat transcript */
   compactToolCalls: boolean;
+  /** Enable desktop notifications when the app is not focused */
+  systemNotificationsEnabled: boolean;
+  /** Notify when a chat run completes */
+  notifyOnChatDone: boolean;
+  /** Notify when the agent asks the user a question */
+  notifyOnAskUser: boolean;
+  /** Notify when a chat run fails */
+  notifyOnChatError: boolean;
+  /** Notify when tool approval is required */
+  notifyOnToolConfirm: boolean;
   /** Per-slot font-family overrides (empty string = use default) */
   fonts: Record<FontSlot, string>;
 }
@@ -29,7 +41,13 @@ const defaults: DisplaySettings = {
   todoAutoOpen: true,
   changesAutoOpen: true,
   changesAutoClose: true,
+  rightAlignUserMessages: false,
   compactToolCalls: true,
+  systemNotificationsEnabled: true,
+  notifyOnChatDone: true,
+  notifyOnAskUser: true,
+  notifyOnChatError: true,
+  notifyOnToolConfirm: true,
   fonts: { ...defaultFonts },
 };
 

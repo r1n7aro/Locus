@@ -122,6 +122,31 @@ fn collect_display(out: &mut Vec<ConfigEntry>) {
             "Auto-close Changes Panel",
             "Automatically close the file-changes panel when a new tool-call round starts.",
         ),
+        (
+            "system_notifications_enabled",
+            "Background System Notifications",
+            "Enable desktop notifications for key chat events while the app is unfocused.",
+        ),
+        (
+            "notify_on_chat_done",
+            "Notify on Chat Complete",
+            "Send a desktop notification when a chat run completes.",
+        ),
+        (
+            "notify_on_ask_user",
+            "Notify on User Input Request",
+            "Send a desktop notification when the agent asks the user for input.",
+        ),
+        (
+            "notify_on_chat_error",
+            "Notify on Chat Error",
+            "Send a desktop notification when a chat run fails.",
+        ),
+        (
+            "notify_on_tool_confirm",
+            "Notify on Tool Approval",
+            "Send a desktop notification when a tool action waits for approval.",
+        ),
     ] {
         out.push(ConfigEntry {
             key: format!("display.{}", key_suffix),
