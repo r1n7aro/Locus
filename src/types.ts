@@ -188,6 +188,52 @@ export interface AuthUrlInfo {
   url: string;
 }
 
+export interface AppUpdateChangeGroup {
+  title: string;
+  items: string[];
+}
+
+export interface AppUpdateDownloadChannel {
+  label: string;
+  url: string;
+}
+
+export interface AppUpdateLocaleEntry {
+  title: string;
+  summary: string;
+  changelogUrl: string;
+  changes: AppUpdateChangeGroup[];
+  downloadChannels?: AppUpdateDownloadChannel[];
+}
+
+export interface AppUpdateManifest {
+  version: string;
+  releasedAt: string;
+  channel: string;
+  locales: Record<string, AppUpdateLocaleEntry>;
+}
+
+export type AppUpdateSourceKind = "local" | "remote";
+
+export interface AppUpdateManifestFetchResult {
+  manifest: AppUpdateManifest;
+  sourceKind: AppUpdateSourceKind;
+  sourceBaseUrl: string;
+}
+
+export interface AppUpdateInfo {
+  currentVersion: string;
+  latestVersion: string;
+  releasedAt: string;
+  channel: string;
+  title: string;
+  summary: string;
+  changelogUrl: string;
+  changes: AppUpdateChangeGroup[];
+  sourceKind: AppUpdateSourceKind;
+  sourceBaseUrl: string;
+}
+
 export interface TokenUsage {
   totalInputTokens: number;
   totalOutputTokens: number;

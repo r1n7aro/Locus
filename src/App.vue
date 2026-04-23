@@ -1,8 +1,9 @@
 
 <script setup lang="ts">
-import { ref, shallowRef, onMounted, onUnmounted, watch } from "vue";
+import { computed, ref, shallowRef, onMounted, onUnmounted, watch } from "vue";
 import type { Component, ShallowRef } from "vue";
 import { open, save } from "@tauri-apps/plugin-dialog";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { t } from "./i18n";
 import { normalizeAppError } from "./services/errors";
 import { saveRawContext as saveCtx } from "./services/session";
@@ -15,6 +16,7 @@ import { useProjectStore } from "./stores/project";
 import { useChatStore } from "./stores/chat";
 import { useNotificationStore } from "./stores/notification";
 import { useChatChangesStore } from "./stores/chatChanges";
+import { useAppUpdateStore } from "./stores/appUpdate";
 import { useAppBootstrap } from "./composables/useAppBootstrap";
 
 // Static imports — first-screen critical or special-case first-screen
@@ -30,6 +32,7 @@ import ThinkingPanel from "./components/ThinkingPanel.vue";
 import ChatSidebarPanel from "./components/ChatSidebarPanel.vue";
 import FileDiffOverlay from "./components/diff/FileDiffOverlay.vue";
 import TopBannerHost from "./components/TopBannerHost.vue";
+import AppUpdateModal from "./components/AppUpdateModal.vue";
 
 import { provideDiffOverlay } from "./composables/useDiffOverlay";
 import { initTheme } from "./composables/useTheme";
@@ -68,6 +71,7 @@ const projectStore = useProjectStore();
 const chatStore = useChatStore();
 const notificationStore = useNotificationStore();
 const chatChangesStore = useChatChangesStore();
+const appUpdateStore = useAppUpdateStore();
 
 // -- Diff overlay provider (must be called in App setup so all children can inject) --
 provideDiffOverlay();
@@ -190,6 +194,15 @@ watch(() => uiStore.settingsMounted, (mounted) => {
 // -- Workspace dropdown (local UI) --
 const showDirDropdown = ref(false);
 const dirDropdownRef = ref<HTMLElement | null>(null);
+const showAppUpdateModal = computed(() =>
+  Boolean(
+    appUpdateStore.updateInfo
+    && !appUpdateStore.dialogDismissed
+    && authStore.authChecked
+    && !uiStore.showOnboarding,
+  ),
+);
+
 
 function shortDir(dir: string): string {
   if (!dir) return t("app.dir.notSet");
@@ -272,6 +285,27 @@ function onResetOnboarding() {
   uiStore.resetOnboarding();
 }
 
+function closeAppUpdateModal() {
+  appUpdateStore.dismissDialog();
+}
+
+async function openAppUpdateChangelog() {
+  const updateInfo = appUpdateStore.updateInfo;
+  if (!updateInfo) return;
+
+  try {
+    await openUrl(updateInfo.changelogUrl);
+    appUpdateStore.dismissDialog();
+  } catch (error) {
+    const err = normalizeAppError(error);
+    notificationStore.addNotice("error", t("app.update.openFailed", err.message), {
+      code: err.code,
+      operation: "openAppUpdateChangelog",
+      skipConsoleLog: true,
+    });
+  }
+}
+
 // -- Lifecycle --
 onMounted(async () => {
   if (isStandaloneWindow) return;
@@ -280,7 +314,8 @@ onMounted(async () => {
   await registerListeners();
   // Sessions page is now interactive — kick off background work
   preloadTabsInBackground();
-  bootstrapDeferred(); // fire-and-forget
+  void bootstrapDeferred();
+  void appUpdateStore.checkForUpdates({ silent: true });
 });
 
 onUnmounted(() => {
@@ -567,6 +602,12 @@ onUnmounted(() => {
       </div>
     </div>
   </div>
+  <AppUpdateModal
+    :open="showAppUpdateModal"
+    :info="appUpdateStore.updateInfo"
+    @close="closeAppUpdateModal"
+    @view="openAppUpdateChangelog"
+  />
   <FileDiffOverlay />
 </template>
 

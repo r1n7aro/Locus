@@ -1,11 +1,38 @@
 <script setup lang="ts">
-import packageJson from "../../../package.json";
-import { t } from "../../i18n";
+import { computed, onMounted } from "vue";
+import { locale, t } from "../../i18n";
+import { useAppUpdateStore } from "../../stores/appUpdate";
+import BaseButton from "../ui/BaseButton.vue";
 
 const APP_NAME = "Locus";
 const ORGANIZATION = "FarLocus";
 const CONTACT_EMAIL = "open@farlocus.com";
-const APP_VERSION = packageJson.version;
+const appUpdateStore = useAppUpdateStore();
+
+const lastCheckedLabel = computed(() => {
+  if (!appUpdateStore.lastCheckedAt) {
+    return t("settings.about.neverChecked");
+  }
+
+  return new Date(appUpdateStore.lastCheckedAt).toLocaleString(
+    locale.value === "zh" ? "zh-CN" : "en-US",
+    {
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+    },
+  );
+});
+
+onMounted(async () => {
+  await appUpdateStore.ensureCurrentVersion();
+});
+
+async function checkForUpdates() {
+  await appUpdateStore.checkForUpdates();
+}
 </script>
 
 <template>
@@ -26,7 +53,7 @@ const APP_VERSION = packageJson.version;
         </div>
         <div class="about-row">
           <dt class="about-label">{{ t("settings.about.version") }}</dt>
-          <dd class="about-value mono">v{{ APP_VERSION }}</dd>
+          <dd class="about-value mono">v{{ appUpdateStore.currentVersion || "-" }}</dd>
         </div>
         <div class="about-row">
           <dt class="about-label">{{ t("settings.about.organization") }}</dt>
@@ -35,6 +62,27 @@ const APP_VERSION = packageJson.version;
         <div class="about-row">
           <dt class="about-label">{{ t("settings.about.contact") }}</dt>
           <dd class="about-value mono">{{ CONTACT_EMAIL }}</dd>
+        </div>
+        <div class="about-row">
+          <dt class="about-label">{{ t("settings.about.versionSource") }}</dt>
+          <dd class="about-value">{{ appUpdateStore.sourceLabel }}</dd>
+        </div>
+        <div class="about-row about-row-actions">
+          <dt class="about-label">{{ t("settings.about.lastChecked") }}</dt>
+          <dd class="about-update-controls">
+            <span class="about-value">{{ lastCheckedLabel }}</span>
+            <BaseButton
+              size="md"
+              :disabled="appUpdateStore.checking"
+              @click="checkForUpdates"
+            >
+              {{
+                appUpdateStore.checking
+                  ? t("settings.about.checkingUpdates")
+                  : t("settings.about.checkUpdates")
+              }}
+            </BaseButton>
+          </dd>
         </div>
       </dl>
     </div>
@@ -85,6 +133,10 @@ const APP_VERSION = packageJson.version;
   align-items: baseline;
 }
 
+.about-row-actions {
+  align-items: center;
+}
+
 .about-label {
   font-size: 12px;
   color: var(--text-secondary);
@@ -100,5 +152,14 @@ const APP_VERSION = packageJson.version;
 .about-value.mono {
   font-family: var(--font-mono-identifier);
   word-break: break-all;
+}
+
+.about-update-controls {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin: 0;
+  min-width: 0;
 }
 </style>

@@ -13,6 +13,7 @@ mod skill;
 mod storage;
 mod undo;
 mod workspace;
+mod update;
 
 use serde::{Deserialize, Serialize};
 
@@ -238,3 +239,4 @@ pub use skill::*;
 pub use storage::*;
 pub use undo::*;
 pub use workspace::*;
+pub use update::*;

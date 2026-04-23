@@ -22,16 +22,26 @@ describe("AboutSettings layout", () => {
 
   it("renders app identity, organization, and contact details", () => {
     const source = read("src/components/settings/AboutSettings.vue");
+    const appUpdateStore = read("src/stores/appUpdate.ts");
 
-    expect(source).toContain('import packageJson from "../../../package.json"');
+    expect(source).toContain('import { useAppUpdateStore } from "../../stores/appUpdate"');
+    expect(source).toContain('import BaseButton from "../ui/BaseButton.vue"');
     expect(source).toContain('const APP_NAME = "Locus"');
     expect(source).toContain('const ORGANIZATION = "FarLocus"');
     expect(source).toContain('const CONTACT_EMAIL = "open@farlocus.com"');
-    expect(source).toContain('const APP_VERSION = packageJson.version');
+    expect(source).toContain("await appUpdateStore.ensureCurrentVersion();");
     expect(source).toContain("Unity Dev Agent");
-    expect(source).toContain('<dd class="about-value mono">v{{ APP_VERSION }}</dd>');
+    expect(source).toContain('<dd class="about-value mono">v{{ appUpdateStore.currentVersion || "-" }}</dd>');
+    expect(source).toContain('t("settings.about.versionSource")');
+    expect(source).toContain("{{ appUpdateStore.sourceLabel }}");
+    expect(source).toContain('t("settings.about.lastChecked")');
+    expect(source).toContain('t("settings.about.checkUpdates")');
+    expect(source).toContain("await appUpdateStore.checkForUpdates();");
     expect(source).toContain('t("settings.about.organization")');
     expect(source).toContain('t("settings.about.contact")');
+    expect(appUpdateStore).toContain("export const useAppUpdateStore = defineStore(\"appUpdate\", () => {");
+    expect(appUpdateStore).toContain("const lastCheckedAt = ref<number | null>(loadLastCheckedAt());");
+    expect(appUpdateStore).toContain("async function checkForUpdates(options?: { silent?: boolean }): Promise<AppUpdateInfo | null> {");
   });
 
   it("defines localized about labels", () => {
@@ -41,8 +51,16 @@ describe("AboutSettings layout", () => {
     expect(zh).toContain('"settings.tab.about": "关于"');
     expect(zh).toContain('"settings.about.organization": "开发组织"');
     expect(zh).toContain('"settings.about.contact": "联络邮箱"');
+    expect(zh).toContain('"settings.about.versionSource": "版本来源"');
+    expect(zh).toContain('"settings.about.versionSourceLocal": "本地服务器 ({0})"');
+    expect(zh).toContain('"settings.about.lastChecked": "上次检查"');
+    expect(zh).toContain('"settings.about.checkUpdates": "检查更新"');
     expect(en).toContain('"settings.tab.about": "About"');
     expect(en).toContain('"settings.about.organization": "Organization"');
     expect(en).toContain('"settings.about.contact": "Contact Email"');
+    expect(en).toContain('"settings.about.versionSource": "Version source"');
+    expect(en).toContain('"settings.about.versionSourceLocal": "Local server ({0})"');
+    expect(en).toContain('"settings.about.lastChecked": "Last checked"');
+    expect(en).toContain('"settings.about.checkUpdates": "Check for updates"');
   });
 });

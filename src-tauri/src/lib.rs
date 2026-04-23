@@ -752,6 +752,7 @@ pub fn run() {
             commands::get_config_registry,
             commands::get_log_entries,
             commands::clear_log_entries,
+            commands::fetch_app_update_manifest,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
