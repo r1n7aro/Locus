@@ -8,6 +8,7 @@ const props = defineProps<{
   todos: TodoItem[];
   isStreaming: boolean;
   todoWriteVersion: number;
+  celebrationEnabled: boolean;
   embedded?: boolean;
   showClose?: boolean;
 }>();
@@ -19,7 +20,6 @@ const emit = defineEmits<{
 const closing = ref(false);
 const AUTO_CLOSE_DELAY_MS = 3200;
 const CELEBRATION_RESET_DELAY_MS = 400;
-
 function clearCloseTimer() {
   if (closeTimer) {
     clearTimeout(closeTimer);
@@ -53,6 +53,7 @@ const allCompleted = computed(() => {
   return props.todos.length > 0 &&
     props.todos.every(item => item.status === "completed" || item.status === "cancelled");
 });
+const emptyText = computed(() => t("todo.emptyCurrent"));
 
 const showCelebration = ref(false);
 let closeTimer: ReturnType<typeof setTimeout> | null = null;
@@ -60,6 +61,10 @@ let closeTimer: ReturnType<typeof setTimeout> | null = null;
 // Trigger celebration as soon as the latest todowrite marks everything done.
 watch(() => props.todoWriteVersion, (version, previousVersion) => {
   if (version === previousVersion) return;
+  if (!props.celebrationEnabled) {
+    cancelCelebration();
+    return;
+  }
   if (allCompleted.value) {
     triggerCelebration();
   } else {
@@ -70,14 +75,18 @@ watch(() => props.todoWriteVersion, (version, previousVersion) => {
 // Keep the old end-of-stream behavior as a fallback for sessions that finish
 // without another todowrite after the final completion update.
 watch(() => props.isStreaming, (streaming, wasStreaming) => {
+  if (!props.celebrationEnabled) {
+    cancelCelebration();
+    return;
+  }
   if (wasStreaming && !streaming && allCompleted.value && !showCelebration.value) {
     triggerCelebration();
   }
 });
 
 // Also trigger if all tasks become completed while not streaming (e.g. loaded session)
-watch(allCompleted, (done) => {
-  if (!done) {
+watch([allCompleted, () => props.celebrationEnabled], ([done, enabled]) => {
+  if (!enabled || !done) {
     cancelCelebration();
     return;
   }
@@ -130,7 +139,7 @@ onBeforeUnmount(() => {
         <span class="todo-content">{{ todo.content }}</span>
         <span class="todo-priority" :class="`priority-${todo.priority}`">{{ priorityLabel[todo.priority] || todo.priority }}</span>
       </div>
-      <div v-if="props.todos.length === 0" class="empty-hint">{{ t("todo.empty") }}</div>
+      <div v-if="props.todos.length === 0" class="empty-hint">{{ emptyText }}</div>
     </div>
 
     <!-- Celebration overlay -->
@@ -196,19 +205,21 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 16px;
+  padding: 12px 16px;
   border-bottom: 1px solid var(--border-color);
 }
 
 .panel-title {
+  flex: 1;
   font-size: 14px;
   font-weight: 600;
+  white-space: nowrap;
 }
 
 .todo-count {
-  flex: 1;
   font-size: 11px;
   color: var(--text-secondary);
+  white-space: nowrap;
 }
 
 .close-btn {

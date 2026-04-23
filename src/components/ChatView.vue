@@ -6,7 +6,6 @@ import type { WorkspaceFilePreview } from "../services/unity";
 // undoPreview removed — undo UI moved to ChatChangesPanel
 import type { ChatComposerSendPayload, ChatMessage, AgentInfo, TokenUsage, ModelOption, PendingQuestion, PendingToolConfirm, EffortLevel, SessionSummary, AssetDbScanEvent, ScanStats, ImageAttachment, SkillManifest, UserIntentMeta, SaveRawContextRequest, CodexTransportMode } from "../types";
 import type { ToolCallDisplay } from "../types";
-import AgentSelector from "./AgentSelector.vue";
 import ModelSelector from "./ModelSelector.vue";
 import ThinkingSelector from "./ThinkingSelector.vue";
 import SessionPanel from "./chat/SessionPanel.vue";
@@ -33,7 +32,6 @@ import {
 import {
   createCoalescedScrollScheduler,
   createSettledScrollScheduler,
-  findTrailingAssistantToolMessageId,
   shouldAutoScrollToBottom,
   shouldShowWaitingPlaceholder,
 } from "../composables/chatViewStability";
@@ -47,6 +45,7 @@ import {
   getChatSubmitModifierLabel,
   useChatInputSettings,
 } from "../composables/useChatInputSettings";
+import { logToolCollapseTrace, previewTraceText } from "../services/toolCollapseTrace";
 
 const chatChangesStore = useChatChangesStore();
 const chatStore = useChatStore();
@@ -75,6 +74,7 @@ const chatInputPlaceholder = computed(() => {
 const showInlineDiff = computed(() =>
   !!chatChangesStore.inlineDiffPayload || chatChangesStore.inlineDiffLoading || !!chatChangesStore.inlineDiffError,
 );
+const hasPanelToggleRow = computed(() => chatChangesStore.currentFileCount > 0);
 
 const chatDiffViewerRef = ref<InstanceType<typeof FileDiffViewer> | null>(null);
 const chatDiffMode = ref<"unified" | "side-by-side">("unified");
@@ -361,7 +361,6 @@ watch(inputText, (value) => {
   storeComposerDraft(props.activeSessionId, value);
 });
 
-const recentlyCompletedToolMessageId = ref<string | null>(null);
 const hasStreamingContent = computed(
   () => !!displayedStreamingText.value || props.activeToolCalls.length > 0
 );
@@ -411,6 +410,7 @@ const showWelcomeState = computed(
 const pendingRestoreSessionId = ref<string | null>(null);
 const pendingRestoreMessagesRef = ref<ChatMessage[] | null>(null);
 const isRestoringSessionView = ref(false);
+const toolHandoffViewportQuiet = ref(false);
 let suppressScrollCapture = false;
 const displayedStreamingText = ref("");
 let pendingStreamingText = "";
@@ -432,20 +432,48 @@ function clearSessionRestoreRevealFrame() {
 }
 
 function flushDisplayedStreamingText() {
+  logToolCollapseTrace("chat-view", "flushDisplayedStreamingText", {
+    pendingLen: pendingStreamingText.length,
+    pendingPreview: previewTraceText(pendingStreamingText, 64),
+    previousDisplayedLen: displayedStreamingText.value.length,
+  });
   displayedStreamingText.value = pendingStreamingText;
   streamingTextFlushTimer = null;
 }
 
 watch(
   () => props.streamingText,
-  (nextText) => {
+  (nextText, previousText = "") => {
     pendingStreamingText = nextText;
+    logToolCollapseTrace("chat-view", "sourceStreamingTextChanged", {
+      previousLen: previousText.length,
+      nextLen: nextText.length,
+      displayedLen: displayedStreamingText.value.length,
+      hasFlushTimer: !!streamingTextFlushTimer,
+      nextPreview: nextText ? previewTraceText(nextText, 64) : "",
+    });
     if (!nextText || nextText.length < displayedStreamingText.value.length) {
       clearStreamingTextFlushTimer();
+      logToolCollapseTrace("chat-view", "syncDisplayedStreamingTextImmediately", {
+        reason: !nextText ? "empty" : "shrinking",
+        nextLen: nextText.length,
+        previousDisplayedLen: displayedStreamingText.value.length,
+      });
       displayedStreamingText.value = nextText;
       return;
     }
-    if (streamingTextFlushTimer) return;
+    if (streamingTextFlushTimer) {
+      logToolCollapseTrace("chat-view", "skipStreamingTextReschedule", {
+        pendingLen: pendingStreamingText.length,
+        displayedLen: displayedStreamingText.value.length,
+      });
+      return;
+    }
+    logToolCollapseTrace("chat-view", "scheduleDisplayedStreamingTextFlush", {
+      delayMs: STREAMING_TEXT_RENDER_DELAY_MS,
+      nextLen: nextText.length,
+      displayedLen: displayedStreamingText.value.length,
+    });
     streamingTextFlushTimer = setTimeout(flushDisplayedStreamingText, STREAMING_TEXT_RENDER_DELAY_MS);
   },
   { immediate: true },
@@ -562,7 +590,29 @@ const streamEndScrollScheduler = createSettledScrollScheduler(
   STREAM_END_SCROLL_SETTLE_MS,
 );
 
+function handleToolHandoffQuietChange(quiet: boolean) {
+  logToolCollapseTrace("chat-view", "toolHandoffQuietChange", {
+    quiet,
+    displayedStreamingLen: displayedStreamingText.value.length,
+    isStreaming: props.isStreaming,
+  });
+  toolHandoffViewportQuiet.value = quiet;
+}
+
+watch(toolHandoffViewportQuiet, (quiet, previousQuiet) => {
+  if (quiet) {
+    scrollToBottomScheduler.cancel();
+    preserveScrollAnchorScheduler.cancel();
+    streamEndScrollScheduler.cancel();
+    return;
+  }
+  if (previousQuiet) {
+    reconcileViewport();
+  }
+});
+
 function reconcileViewport(forceBottom = false) {
+  if (toolHandoffViewportQuiet.value) return;
   if (pendingRestoreSessionId.value && pendingRestoreSessionId.value === props.activeSessionId) {
     restorePendingSessionScroll();
     return;
@@ -581,6 +631,7 @@ function reconcileViewport(forceBottom = false) {
 }
 
 function settleStreamEndScroll() {
+  if (toolHandoffViewportQuiet.value) return;
   const el = getMessagesElement();
   if (!el) return;
 
@@ -642,7 +693,7 @@ function connectTranscriptResizeObserver() {
   if (!scrollEl && !contentEl) return;
 
   transcriptResizeObserver = new ResizeObserver(() => {
-    if (suppressScrollCapture) return;
+    if (suppressScrollCapture || toolHandoffViewportQuiet.value) return;
     if (pendingRestoreSessionId.value && pendingRestoreSessionId.value === props.activeSessionId) {
       restorePendingSessionScroll();
       return;
@@ -659,41 +710,11 @@ function connectTranscriptResizeObserver() {
 }
 
 watch(
-  () => [props.activeSessionId, props.activeToolCalls.length, props.messages.length, props.isStreaming] as const,
-  ([sessionId, activeToolCallCount, _messageCount, isStreaming], previous) => {
-    const previousSessionId = previous?.[0] ?? null;
-    const previousActiveToolCallCount = previous?.[1] ?? 0;
-
-    if (sessionId !== previousSessionId) {
-      recentlyCompletedToolMessageId.value = null;
-      return;
-    }
-
-    if (!isStreaming) {
-      recentlyCompletedToolMessageId.value = null;
-      return;
-    }
-
-    if (activeToolCallCount === 0 && previousActiveToolCallCount > 0) {
-      recentlyCompletedToolMessageId.value = findTrailingAssistantToolMessageId(props.messages);
-      return;
-    }
-
-    if (
-      recentlyCompletedToolMessageId.value
-      && findTrailingAssistantToolMessageId(props.messages) !== recentlyCompletedToolMessageId.value
-    ) {
-      recentlyCompletedToolMessageId.value = null;
-    }
-  },
-  { flush: "post" },
-);
-
-watch(
   () => props.activeSessionId,
   (nextSessionId, previousSessionId) => {
     streamEndScrollScheduler.cancel();
     preserveScrollAnchorScheduler.cancel();
+    toolHandoffViewportQuiet.value = false;
     if (previousSessionId) {
       rememberScrollForSession(previousSessionId);
     }
@@ -736,6 +757,14 @@ watch(() => props.activeToolCalls, () => reconcileViewport(), { deep: true });
 watch(
   () => props.isStreaming,
   (nextStreaming, previousStreaming) => {
+    logToolCollapseTrace("chat-view", "isStreamingChanged", {
+      previous: previousStreaming,
+      next: nextStreaming,
+      displayedStreamingLen: displayedStreamingText.value.length,
+      sourceStreamingLen: props.streamingText.length,
+      activeToolCallCount: props.activeToolCalls.length,
+      quiet: toolHandoffViewportQuiet.value,
+    });
     if (nextStreaming) {
       streamEndScrollScheduler.cancel();
       return;
@@ -992,7 +1021,6 @@ onUnmounted(() => {
           :has-thinking="hasThinking"
           :thinking-duration="thinkingDuration"
           :active-tool-calls="activeToolCalls"
-          :pinned-tool-message-id="recentlyCompletedToolMessageId"
           user-label="You"
           assistant-label="Locus"
           :handoff-label="t('chat.transcript.handoff')"
@@ -1011,7 +1039,9 @@ onUnmounted(() => {
           @open-image="openLightbox"
           @apply-knowledge-proposal="chatStore.applyKnowledgeProposal"
           @ignore-knowledge-proposal="chatStore.ignoreKnowledgeProposal"
-        />
+          @tool-handoff-quiet-change="handleToolHandoffQuietChange"
+        >
+        </ChatTranscript>
         <div v-if="showWelcomeState" class="chat-empty-overlay">
           <div class="empty-state">
             <div class="empty-icon">L</div>
@@ -1062,38 +1092,10 @@ onUnmounted(() => {
       </div>
     </div>
 
-    <div v-if="!isViewingSubagent" class="input-area">
-      <div
-        v-if="!isStreaming && (chatStore.todos.length > 0 || chatChangesStore.hasAnyChanges)"
-        class="panel-toggle-row"
-      >
-        <BaseButton
-          v-if="chatStore.todos.length > 0"
-          class="changes-toggle-btn-inline ui-select-none"
-          :variant="chatStore.showTodoPanel ? 'primary' : 'neutral'"
-          @click="chatStore.toggleTodoPanel()"
-        >
-          <svg viewBox="0 0 16 16" fill="currentColor" width="11" height="11">
-            <path d="M2.5 3a.5.5 0 0 1 .5-.5h2a.5.5 0 0 1 0 1H3v2a.5.5 0 0 1-1 0V3zm3.65 1.15a.5.5 0 0 1 .7 0l.9.9 2.4-2.4a.5.5 0 1 1 .7.7l-2.75 2.75a.5.5 0 0 1-.7 0l-1.25-1.25a.5.5 0 0 1 0-.7zM7.5 5a.5.5 0 0 1 .5-.5h5a.5.5 0 0 1 0 1H8a.5.5 0 0 1-.5-.5zm-5 6a.5.5 0 0 1 .5-.5h2a.5.5 0 0 1 0 1H3v2a.5.5 0 0 1-1 0v-2.5zm3.65.15a.5.5 0 0 1 .7 0l.9.9 2.4-2.4a.5.5 0 1 1 .7.7l-2.75 2.75a.5.5 0 0 1-.7 0l-1.25-1.25a.5.5 0 0 1 0-.7zM7.5 12a.5.5 0 0 1 .5-.5h5a.5.5 0 0 1 0 1H8a.5.5 0 0 1-.5-.5z"/>
-          </svg>
-          {{ t('todo.title') }}
-          <span class="changes-badge">{{ chatStore.todos.length }}</span>
-        </BaseButton>
-
-        <BaseButton
-          v-if="chatChangesStore.hasAnyChanges"
-          class="changes-toggle-btn-inline ui-select-none"
-          :variant="chatChangesStore.currentPanelVisible ? 'primary' : 'neutral'"
-          @click="chatChangesStore.togglePanel()"
-        >
-          <svg viewBox="0 0 16 16" fill="currentColor" width="11" height="11">
-            <path d="M2 3.5A1.5 1.5 0 0 1 3.5 2h2A1.5 1.5 0 0 1 7 3.5v1A1.5 1.5 0 0 1 5.5 6h-2A1.5 1.5 0 0 1 2 4.5v-1zm0 8A1.5 1.5 0 0 1 3.5 10h2A1.5 1.5 0 0 1 7 11.5v1A1.5 1.5 0 0 1 5.5 14h-2A1.5 1.5 0 0 1 2 12.5v-1zM9.5 2h4a.5.5 0 0 1 0 1h-4a.5.5 0 0 1 0-1zm0 3h4a.5.5 0 0 1 0 1h-4a.5.5 0 0 1 0-1zm0 5h4a.5.5 0 0 1 0 1h-4a.5.5 0 0 1 0-1zm0 3h4a.5.5 0 0 1 0 1h-4a.5.5 0 0 1 0-1z"/>
-          </svg>
-          {{ t('chat.changes.toggle') }}
-          <span class="changes-badge">{{ chatChangesStore.currentFileCount }}</span>
-        </BaseButton>
-      </div>
-
+    <div
+      v-if="!isViewingSubagent"
+      class="input-area"
+    >
       <RichChatInput
         ref="composerPanelRef"
         v-model="inputText"
@@ -1108,15 +1110,6 @@ onUnmounted(() => {
         @cancel="emit('cancel')"
       >
         <template #top-start>
-          <AgentSelector
-            v-if="agents.length > 1"
-            :agents="agents"
-            :selected-id="selectedAgentId"
-            :disabled="isStreaming || agentLocked"
-            @select="emit('selectAgent', $event)"
-          />
-        </template>
-        <template #top-end>
           <ModelSelector
             :models="models"
             :selected-id="selectedModelId"
@@ -1143,6 +1136,21 @@ onUnmounted(() => {
               <path d="M8 1a3.5 3.5 0 0 0-3.5 3.5v1H3.25A1.25 1.25 0 0 0 2 6.75v7A1.25 1.25 0 0 0 3.25 15h9.5A1.25 1.25 0 0 0 14 13.75v-7A1.25 1.25 0 0 0 12.75 5.5H11.5v-1A3.5 3.5 0 0 0 8 1zm-2 4.5v-1a2 2 0 1 1 4 0v1H6z"/>
             </svg>
             <span>{{ toolPermMode === 'auto' ? 'Auto' : 'Ask' }}</span>
+          </BaseButton>
+        </template>
+        <template #top-end>
+          <BaseButton
+            v-if="!isViewingSubagent && hasPanelToggleRow"
+            class="changes-toggle-btn ui-select-none"
+            :variant="chatChangesStore.currentPanelVisible ? 'primary' : 'neutral'"
+            :disabled="isStreaming"
+            @click="chatChangesStore.togglePanel()"
+          >
+            <svg viewBox="0 0 16 16" fill="currentColor" width="11" height="11">
+              <path d="M2 3.5A1.5 1.5 0 0 1 3.5 2h2A1.5 1.5 0 0 1 7 3.5v1A1.5 1.5 0 0 1 5.5 6h-2A1.5 1.5 0 0 1 2 4.5v-1zm0 8A1.5 1.5 0 0 1 3.5 10h2A1.5 1.5 0 0 1 7 11.5v1A1.5 1.5 0 0 1 5.5 14h-2A1.5 1.5 0 0 1 2 12.5v-1zM9.5 2h4a.5.5 0 0 1 0 1h-4a.5.5 0 0 1 0-1zm0 3h4a.5.5 0 0 1 0 1h-4a.5.5 0 0 1 0-1zm0 5h4a.5.5 0 0 1 0 1h-4a.5.5 0 0 1 0-1zm0 3h4a.5.5 0 0 1 0 1h-4a.5.5 0 0 1 0-1z"/>
+            </svg>
+            {{ t('chat.changes.toggle') }}
+            <span class="changes-badge">{{ chatChangesStore.currentFileCount }}</span>
           </BaseButton>
         </template>
         <template #footer>
@@ -1636,7 +1644,6 @@ onUnmounted(() => {
   font-size: 12px;
   font-family: inherit;
   font-weight: 500;
-  margin-left: 6px;
   white-space: nowrap;
   min-height: 28px;
   padding: 0 8px;
@@ -1655,25 +1662,13 @@ onUnmounted(() => {
   filter: none;
 }
 
-.panel-toggle-row {
-  position: absolute;
-  right: 48px;
-  bottom: calc(100% + 8px);
-  display: inline-flex;
-  gap: 8px;
-  align-items: center;
-  width: max-content;
-  max-width: calc(100% - 96px);
-  z-index: 2;
-}
-
-.changes-toggle-btn-inline {
+.changes-toggle-btn {
   gap: 4px;
-  font-size: 11px;
+  font-size: 12px;
   font-family: inherit;
   font-weight: 500;
-  min-height: 24px;
-  padding: 0 8px;
+  min-height: 28px;
+  padding: 0 10px;
 }
 
 .changes-badge {

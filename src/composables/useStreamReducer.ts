@@ -38,7 +38,7 @@ export type StreamMutation =
   | { type: "setQuestion"; question: PendingQuestion | null }
   | { type: "enqueueToolConfirm"; confirm: PendingToolConfirm }
   | { type: "addUndoable"; messageId: string }
-  | { type: "setTodos"; todos: TodoItem[] }
+  | { type: "setTodos"; runId: string; todos: TodoItem[] }
   | { type: "setStreaming"; value: boolean }
   | { type: "canvasAutoOpen"; toolCallId: string; spec: unknown };
 
@@ -92,7 +92,7 @@ export function reduceStreamEvent(state: StreamState, event: StreamEvent): Strea
         if (jsonStart >= 0) {
           try {
             const parsed = JSON.parse(event.output.slice(jsonStart)) as TodoItem[];
-            mutations.push({ type: "setTodos", todos: parsed });
+            mutations.push({ type: "setTodos", runId: event.runId, todos: parsed });
           } catch { /* ignore */ }
         }
       }

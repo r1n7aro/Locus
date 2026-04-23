@@ -3,6 +3,7 @@ import { computed, ref, watch } from "vue";
 import { useDisplaySettings } from "../composables/useDisplaySettings";
 import { summarizeToolCallBatch } from "../composables/toolCallBatches";
 import { t } from "../i18n";
+import { logToolCollapseTrace } from "../services/toolCollapseTrace";
 
 import type { ToolCallDisplay } from "../types";
 
@@ -14,6 +15,9 @@ const props = withDefaults(defineProps<{
   allowCollapse: true,
   collapseEnabled: true,
 });
+const emit = defineEmits<{
+  (e: "collapseFinished"): void;
+}>();
 
 const { state: displaySettings } = useDisplaySettings();
 const expanded = ref(false);
@@ -21,11 +25,11 @@ const panelVisible = ref(false);
 const panelTransitionCleanup = new WeakMap<HTMLElement, () => void>();
 
 const PANEL_TRANSITION = [
-  "height 220ms cubic-bezier(0.2, 0, 0, 1)",
-  "opacity 160ms ease",
-  "transform 220ms cubic-bezier(0.2, 0, 0, 1)",
+  "height 320ms cubic-bezier(0.2, 0, 0, 1)",
+  "opacity 220ms ease",
+  "transform 320ms cubic-bezier(0.2, 0, 0, 1)",
 ].join(", ");
-const PANEL_TRANSITION_TIMEOUT_MS = 280;
+const PANEL_TRANSITION_TIMEOUT_MS = 380;
 
 const batchState = computed(() =>
   summarizeToolCallBatch(
@@ -54,6 +58,19 @@ const toggleLabel = computed(() =>
 const summaryOpen = computed(() =>
   batchState.value.canCollapse && (expanded.value || panelVisible.value),
 );
+
+function traceCollection(event: string, detail?: Record<string, unknown>) {
+  logToolCollapseTrace("tool-collection", event, {
+    firstToolCallId: props.toolCalls[0]?.id ?? "",
+    total: props.toolCalls.length,
+    allowCollapse: props.allowCollapse,
+    collapseEnabled: props.collapseEnabled,
+    canCollapse: batchState.value.canCollapse,
+    expanded: expanded.value,
+    panelVisible: panelVisible.value,
+    ...detail,
+  });
+}
 
 function clearPanelTransitionListener(element: HTMLElement) {
   const cleanup = panelTransitionCleanup.get(element);
@@ -114,6 +131,9 @@ function runOnNextFrame(callback: () => void) {
 
 function onPanelEnter(element: Element, done: () => void) {
   const panel = element as HTMLElement;
+  traceCollection("panelEnter", {
+    heightBefore: panel.scrollHeight,
+  });
   panelVisible.value = true;
   preparePanelTransition(panel);
   panel.style.height = "0px";
@@ -129,15 +149,22 @@ function onPanelEnter(element: Element, done: () => void) {
 }
 
 function onPanelAfterEnter(element: Element) {
+  traceCollection("panelAfterEnter", {
+    heightAfter: (element as HTMLElement).scrollHeight,
+  });
   resetPanelTransition(element as HTMLElement);
 }
 
 function onPanelEnterCancelled(element: Element) {
+  traceCollection("panelEnterCancelled");
   resetPanelTransition(element as HTMLElement);
 }
 
 function onPanelLeave(element: Element, done: () => void) {
   const panel = element as HTMLElement;
+  traceCollection("panelLeave", {
+    heightBefore: panel.scrollHeight,
+  });
   panelVisible.value = true;
   preparePanelTransition(panel);
   panel.style.height = `${panel.scrollHeight}px`;
@@ -153,11 +180,14 @@ function onPanelLeave(element: Element, done: () => void) {
 }
 
 function onPanelAfterLeave(element: Element) {
+  traceCollection("panelAfterLeave");
   panelVisible.value = false;
   resetPanelTransition(element as HTMLElement);
+  emit("collapseFinished");
 }
 
 function onPanelLeaveCancelled(element: Element) {
+  traceCollection("panelLeaveCancelled");
   panelVisible.value = true;
   resetPanelTransition(element as HTMLElement);
 }
@@ -165,9 +195,38 @@ function onPanelLeaveCancelled(element: Element) {
 watch(
   () => ({
     firstId: props.toolCalls[0]?.id ?? "",
+    total: props.toolCalls.length,
+    allowCollapse: props.allowCollapse,
+    collapseEnabled: props.collapseEnabled,
+    canCollapse: batchState.value.canCollapse,
+    summaryOpen: summaryOpen.value,
+  }),
+  (next, prev) => {
+    traceCollection("stateChanged", {
+      previous: prev ?? null,
+      next,
+    });
+  },
+  { immediate: true },
+);
+
+watch(expanded, (value, previousValue) => {
+  traceCollection("expandedChanged", {
+    previous: previousValue,
+    next: value,
+  });
+});
+
+watch(
+  () => ({
+    firstId: props.toolCalls[0]?.id ?? "",
     canCollapse: batchState.value.canCollapse,
   }),
   (next, prev) => {
+    traceCollection("collapseResetCheck", {
+      previous: prev ?? null,
+      next,
+    });
     if (!prev || next.firstId !== prev.firstId || (!prev.canCollapse && next.canCollapse)) {
       expanded.value = false;
     }

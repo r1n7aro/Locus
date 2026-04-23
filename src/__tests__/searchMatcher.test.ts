@@ -53,4 +53,27 @@ describe("useCommandRegistry", () => {
 
     expect(results[0]?.name).toBe("/custom-skill");
   });
+
+  it("keeps bare slash as the command palette query and ignores natural-language slash text", () => {
+    const skills = ref<SkillManifest[]>([
+      {
+        name: "create-skill",
+        description: "Create a new reusable skill",
+        argumentHint: "Describe the skill",
+        dirName: "create-skill",
+        source: "project",
+        relPath: ".skills/create-skill",
+        updatedAt: Date.now(),
+        skillEnabled: true,
+        skillSurface: "both",
+        skillDescription: "Create or update skills",
+        commandTrigger: "/custom-skill",
+      },
+    ]);
+    const agentId = ref("dev");
+    const { filteredCommands } = useCommandRegistry(skills, agentId);
+
+    expect(filteredCommands("/").map((command) => command.name)).toContain("/custom-skill");
+    expect(filteredCommands("/创建三步任务")).toEqual([]);
+  });
 });

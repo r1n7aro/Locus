@@ -208,6 +208,7 @@ describe("reduceStreamEvent", () => {
       const todoMut = mutations.find((m) => m.type === "setTodos");
       expect(todoMut).toBeDefined();
       if (todoMut?.type === "setTodos") {
+        expect(todoMut.runId).toBe("test-run");
         expect(todoMut.todos).toHaveLength(1);
         expect(todoMut.todos[0].content).toBe("do thing");
       }

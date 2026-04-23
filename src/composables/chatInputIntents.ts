@@ -36,6 +36,7 @@ export interface InlineIntentParseResult {
 }
 
 const TOKEN_BOUNDARY_RE = /[\s,，。！？!?:：;；()[\]{}<>《》「」『』"“”'‘’]/;
+const SLASH_COMMAND_CHAR_RE = /[A-Za-z0-9_-]/;
 const EMAIL_LOCAL_RE = /[A-Za-z0-9._%+-]/;
 const EMAIL_DOMAIN_RE = /[A-Za-z0-9.-]/;
 
@@ -43,28 +44,30 @@ function isTokenBoundary(char: string | undefined): boolean {
   return !char || TOKEN_BOUNDARY_RE.test(char);
 }
 
+function isSlashCommandChar(char: string | undefined): boolean {
+  return !!char && SLASH_COMMAND_CHAR_RE.test(char);
+}
+
 function detectSlashOperator(text: string, safeCursor: number): ActiveOperator | null {
-  let start = safeCursor;
-  while (start > 0 && !isTokenBoundary(text[start - 1])) {
-    start -= 1;
+  let queryStart = safeCursor;
+  while (queryStart > 0 && isSlashCommandChar(text[queryStart - 1])) {
+    queryStart -= 1;
   }
 
-  const end = safeCursor;
-  if (start >= end) return null;
-  const token = text.slice(start, end);
-  if (!token.startsWith("/") || !isTokenBoundary(text[start - 1])) {
+  const slashIndex = queryStart - 1;
+  if (slashIndex < 0 || text[slashIndex] !== "/" || !isTokenBoundary(text[slashIndex - 1])) {
     return null;
   }
 
-  if (token.startsWith("//")) return null;
-  if (text[start - 1] === ":") return null;
+  if (text[slashIndex + 1] === "/") return null;
+  if (text[slashIndex - 1] === ":") return null;
 
   return {
     kind: "slash",
-    start,
-    end,
-    token,
-    query: text.slice(start + 1, safeCursor),
+    start: slashIndex,
+    end: safeCursor,
+    token: text.slice(slashIndex, safeCursor),
+    query: text.slice(queryStart, safeCursor),
   };
 }
 

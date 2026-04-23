@@ -271,7 +271,7 @@ function buildIntentBadges(
   for (const skill of intent.skills || []) {
     badges.push({
       key: `${skill.source}:${skill.dirName}`,
-      label: `Skill: ${skill.name}`,
+      label: `SKILL: ${skill.name}`,
       kind: "skill",
       skill,
     });

@@ -12,6 +12,7 @@ const props = defineProps<{
   todos: TodoItem[];
   isStreaming: boolean;
   todoWriteVersion: number;
+  celebrationEnabled: boolean;
 }>();
 
 const chatStore = useChatStore();
@@ -126,6 +127,7 @@ onUnmounted(() => {
         :todos="props.todos"
         :is-streaming="props.isStreaming"
         :todo-write-version="props.todoWriteVersion"
+        :celebration-enabled="props.celebrationEnabled"
         embedded
         :show-close="false"
         @close="chatStore.closeTodoPanel()"

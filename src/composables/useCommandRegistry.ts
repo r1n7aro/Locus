@@ -1,7 +1,7 @@
 import { computed, type Ref } from "vue";
 import type { SkillManifest } from "../types";
 import type { CommandDef } from "./chatInputIntents";
-import { rankSearchResults, scoreSearchFields } from "./searchMatcher";
+import { rankSearchResults, scoreSearchFields, splitSearchTerms } from "./searchMatcher";
 import { resolveSkillCommandTrigger, skillHasCommandEnabled } from "./skillCommands";
 
 export const COMPACT_INSTRUCTION =
@@ -62,6 +62,7 @@ export function useCommandRegistry(
   ): CommandDef[] {
     const normalized = token.trim().toLowerCase();
     if (!normalized.startsWith("/")) return [];
+    if (normalized !== "/" && splitSearchTerms(normalized).length === 0) return [];
 
     const candidates = availableCommands.value.filter((command) => {
       if (!options?.includeActions && command.commandKind === "action") return false;

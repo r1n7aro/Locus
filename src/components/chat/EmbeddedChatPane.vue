@@ -115,6 +115,7 @@ const hasComposerActions = computed(() => !!slots["composer-actions"]);
 const viewportStates = new Map<string, SessionScrollState>();
 let suppressScrollCapture = false;
 let transcriptResizeObserver: ResizeObserver | null = null;
+const toolHandoffViewportQuiet = ref(false);
 const STREAM_END_SCROLL_SETTLE_MS = 320;
 
 function updateInput(value: string) {
@@ -206,6 +207,22 @@ const streamEndScrollScheduler = createSettledScrollScheduler(
   STREAM_END_SCROLL_SETTLE_MS,
 );
 
+function handleToolHandoffQuietChange(quiet: boolean) {
+  toolHandoffViewportQuiet.value = quiet;
+}
+
+watch(toolHandoffViewportQuiet, (quiet, previousQuiet) => {
+  if (quiet) {
+    scrollToBottomScheduler.cancel();
+    preserveScrollAnchorScheduler.cancel();
+    streamEndScrollScheduler.cancel();
+    return;
+  }
+  if (previousQuiet) {
+    reconcileViewport();
+  }
+});
+
 function scrollToBottom(force = false) {
   scrollToBottomScheduler.schedule(force);
 }
@@ -215,6 +232,7 @@ function preserveScrollAnchor() {
 }
 
 function reconcileViewport(forceBottom = false) {
+  if (toolHandoffViewportQuiet.value) return;
   const el = getTranscriptElement();
   if (!el) return;
 
@@ -267,7 +285,7 @@ function connectTranscriptResizeObserver() {
   if (!scrollEl && !contentEl) return;
 
   transcriptResizeObserver = new ResizeObserver(() => {
-    if (suppressScrollCapture) return;
+    if (suppressScrollCapture || toolHandoffViewportQuiet.value) return;
     reconcileViewport();
   });
 
@@ -288,6 +306,7 @@ const keepBatchToolConfirmLayout = ref(false);
 watch(
   () => props.toolConfirmLayoutKey ?? "",
   (nextKey, previousKey) => {
+    toolHandoffViewportQuiet.value = false;
     rememberViewportState(getViewportStateKey(previousKey));
     preserveScrollAnchorScheduler.cancel();
     streamEndScrollScheduler.cancel();
@@ -351,6 +370,7 @@ watch(
       return;
     }
     if (previousStreaming) {
+      if (toolHandoffViewportQuiet.value) return;
       const el = getTranscriptElement();
       const remembered = el ? viewportStates.get(getViewportStateKey()) ?? null : null;
       if (el && !shouldAutoScrollToBottom({ metrics: readTranscriptMetrics(el), remembered })) {
@@ -437,6 +457,7 @@ onUnmounted(() => {
       @scroll="handleTranscriptScroll"
       @apply-knowledge-proposal="emit('applyKnowledgeProposal', $event)"
       @ignore-knowledge-proposal="emit('ignoreKnowledgeProposal', $event)"
+      @tool-handoff-quiet-change="handleToolHandoffQuietChange"
     />
 
     <div class="embedded-chat-bottom">

@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createPinia, setActivePinia } from "pinia";
 import { useChatStore } from "../stores/chat";
 import { useChatChangesStore } from "../stores/chatChanges";
+import type { TodoItem, TodoSnapshot } from "../types";
 
 const sessionServiceMocks = vi.hoisted(() => ({
   applyKnowledgeProposal: vi.fn(),
@@ -28,6 +29,7 @@ const displaySettingsState = vi.hoisted(() => ({
   todoAutoOpen: true,
   changesAutoOpen: true,
   changesAutoClose: true,
+  rightAlignUserMessages: false,
   compactToolCalls: true,
 }));
 
@@ -91,7 +93,7 @@ function emptyUsage() {
   };
 }
 
-function makeTodo(content = "Do thing") {
+function makeTodo(content = "Do thing"): TodoItem {
   return {
     content,
     status: "pending",
@@ -127,7 +129,7 @@ function makeUndoEntry(
 }
 
 describe("chat session panel state", () => {
-  let todoData: Record<string, ReturnType<typeof makeTodo>[]>;
+  let todoData: Record<string, TodoSnapshot>;
   let undoData: Record<string, ReturnType<typeof makeUndoEntry>[]>;
   let latestCompletedRunIdData: Record<string, string | null>;
 
@@ -138,11 +140,12 @@ describe("chat session panel state", () => {
     displaySettingsState.todoAutoOpen = true;
     displaySettingsState.changesAutoOpen = true;
     displaySettingsState.changesAutoClose = true;
+    displaySettingsState.rightAlignUserMessages = false;
     displaySettingsState.compactToolCalls = true;
 
     todoData = {
-      s1: [makeTodo("Todo from history")],
-      s2: [],
+      s1: { items: [makeTodo("Todo from history")], latestRunId: "run-history" },
+      s2: { items: [], latestRunId: null },
     };
     undoData = {
       s1: [makeUndoEntry("s1")],
@@ -170,7 +173,9 @@ describe("chat session panel state", () => {
     sessionServiceMocks.cancelChat.mockResolvedValue(undefined);
     sessionServiceMocks.deleteSession.mockResolvedValue(undefined);
     sessionServiceMocks.getSessionUsage.mockImplementation(async () => emptyUsage());
-    sessionServiceMocks.getTodos.mockImplementation(async (sessionId: string) => todoData[sessionId] ?? []);
+    sessionServiceMocks.getTodos.mockImplementation(async (sessionId: string) => (
+      todoData[sessionId] ?? { items: [], latestRunId: null }
+    ));
     sessionServiceMocks.ignoreKnowledgeProposal.mockResolvedValue(undefined);
     sessionServiceMocks.listArchivedSessions.mockImplementation(async () => []);
     sessionServiceMocks.listSessions.mockImplementation(async () => []);
@@ -186,6 +191,8 @@ describe("chat session panel state", () => {
     await chatStore.selectSession("s1");
 
     expect(chatStore.todos).toHaveLength(1);
+    expect(chatStore.visibleTodos).toHaveLength(0);
+    expect(chatStore.todoMode).toBe("current");
     expect(chatStore.showTodoPanel).toBe(false);
 
     chatStore.toggleTodoPanel();
@@ -202,7 +209,7 @@ describe("chat session panel state", () => {
       sessionId: "s1",
       toolCallId: "tc-1",
       toolName: "todowrite",
-      output: `Todos updated: ${JSON.stringify(todoData.s1)}`,
+      output: `Todos updated: ${JSON.stringify(todoData.s1.items)}`,
       outcome: "done",
     });
     expect(chatStore.showTodoPanel).toBe(true);
@@ -778,6 +785,116 @@ describe("chat session panel state", () => {
     expect(chatStore.isStreaming).toBe(true);
     expect(chatStore.activeToolCalls).toHaveLength(1);
     expect(chatStore.activeToolCalls[0]?.status).toBe("running");
+  });
+
+  it("shows an empty current task round when the latest completed run has no todowrite", async () => {
+    const chatStore = useChatStore();
+
+    todoData.s1 = {
+      items: [makeTodo("历史任务")],
+      latestRunId: "run-change",
+    };
+    latestCompletedRunIdData.s1 = "run-noop";
+
+    await chatStore.selectSession("s1");
+
+    expect(chatStore.hasAnyTodos).toBe(true);
+    expect(chatStore.visibleTodos).toEqual([]);
+    expect(chatStore.visibleTodoCount).toBe(0);
+    expect(chatStore.todoCelebrationEnabled).toBe(false);
+    expect(chatStore.todoCelebrationVersion).toBe(0);
+    chatStore.setTodoMode("all");
+    expect(chatStore.todoMode).toBe("current");
+    expect(chatStore.visibleTodos).toEqual([]);
+  });
+
+  it("clears current-round tasks during a new noop run while keeping the task panel pinned to current", async () => {
+    const chatStore = useChatStore();
+
+    todoData.s1 = {
+      items: [makeTodo("已完成的旧任务"), { ...makeTodo("另一个旧任务"), status: "completed" }],
+      latestRunId: "run-old",
+    };
+    latestCompletedRunIdData.s1 = "run-old";
+
+    await chatStore.selectSession("s1");
+
+    expect(chatStore.visibleTodos).toHaveLength(2);
+    expect(chatStore.todoCelebrationEnabled).toBe(true);
+
+    chatStore.isStreaming = true;
+    chatStore.handleStreamEvent({
+      runId: "run-next",
+      type: "runStart",
+      sessionId: "s1",
+    });
+
+    expect(chatStore.visibleTodos).toEqual([]);
+    expect(chatStore.todoCelebrationEnabled).toBe(false);
+    expect(chatStore.todoCelebrationVersion).toBe(0);
+
+    chatStore.setTodoMode("all");
+    expect(chatStore.todoMode).toBe("current");
+    expect(chatStore.visibleTodos).toEqual([]);
+
+    chatStore.setTodoMode("current");
+    chatStore.handleStreamEvent({
+      runId: "run-next",
+      type: "done",
+      sessionId: "s1",
+      messageId: "msg-noop",
+      fullText: "这一轮没有任务",
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(chatStore.visibleTodos).toEqual([]);
+    expect(chatStore.todoCelebrationEnabled).toBe(false);
+    expect(chatStore.todoCelebrationVersion).toBe(0);
+  });
+
+  it("cancels every requested streaming session during a workspace-scoped stop", async () => {
+    const chatStore = useChatStore();
+
+    chatStore.streamingSessionIds = new Set(["s1", "s2"]);
+    chatStore.activeSessionId = "s1";
+    chatStore.currentRunId = "run-1";
+    chatStore.isStreaming = true;
+    chatStore.sessions = [
+      {
+        id: "s1",
+        title: "Main session",
+        agentId: null,
+        sessionType: "chat",
+        updatedAt: 1,
+      },
+      {
+        id: "s2",
+        title: "Background session",
+        agentId: null,
+        sessionType: "chat",
+        updatedAt: 2,
+      },
+    ] as any;
+    chatStore.pendingQuestion = {
+      questionId: "q-1",
+      prompt: "Continue?",
+      options: [],
+      createdAt: 1,
+    } as any;
+    chatStore.pendingToolConfirms = [
+      {
+        questionId: "tc-1",
+        toolName: "read",
+        argsText: "{}",
+      } as any,
+    ];
+
+    await chatStore.cancelSessions(["s1", "s2"]);
+
+    expect(sessionServiceMocks.cancelChat).toHaveBeenNthCalledWith(1, "s1");
+    expect(sessionServiceMocks.cancelChat).toHaveBeenNthCalledWith(2, "s2");
+    expect(chatStore.pendingQuestion).toBeNull();
+    expect(chatStore.pendingToolConfirms).toEqual([]);
   });
 
   it("stops streaming cleanly when a server-tool-only round ends with a terminal done event", async () => {

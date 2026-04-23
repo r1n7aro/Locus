@@ -13,6 +13,7 @@ import type { SessionScrollState } from "../composables/chatScrollState";
 import { t } from "../i18n";
 import { useChatChangesStore } from "./chatChanges";
 import { useDisplaySettings } from "../composables/useDisplaySettings";
+import { logToolCollapseTrace, previewTraceText } from "../services/toolCollapseTrace";
 import type {
   SessionSummary, SessionDetail, ChatMessage, TokenUsage,
   TodoItem, StreamEvent, ImageAttachment, ToolCallDisplay,
@@ -20,6 +21,8 @@ import type {
   UserIntentMeta,
   KnowledgeProposalStatus,
   UndoConflictInfo,
+  TodoSnapshot,
+  TodoPanelMode,
 } from "../types";
 
 type ToolPermissionMode = "auto" | "ask";
@@ -78,6 +81,9 @@ export const useChatStore = defineStore("chat", () => {
   const todoWriteVersion = ref(0);
   const showTodoPanel = ref(false);
   const todoPanelVisibility = ref(new Map<string, boolean>());
+  const todoMode = ref<TodoPanelMode>("current");
+  const sessionLatestTodoRunIds = ref(new Map<string, string | null>());
+  const sessionLatestCompletedRunIds = ref(new Map<string, string | null>());
   const pendingQuestion = ref<PendingQuestion | null>(null);
   const pendingToolConfirms = ref<PendingToolConfirm[]>([]);
   const streamingSessionIds = ref(new Set<string>());
@@ -87,6 +93,31 @@ export const useChatStore = defineStore("chat", () => {
   const sessionAgentId = ref<string | null>(null);
   const toolPermissionMode = ref<ToolPermissionMode>("auto");
   const sessionAgentLocked = computed(() => !!activeSessionId.value && !!sessionAgentId.value);
+  const todoRunBoundaryId = computed(() => {
+    const sessionId = activeSessionId.value;
+    if (!sessionId) return null;
+    if (isStreaming.value) return currentRunId.value;
+    return sessionLatestCompletedRunIds.value.get(sessionId) ?? null;
+  });
+  const latestTodoRunId = computed(() => {
+    const sessionId = activeSessionId.value;
+    if (!sessionId) return null;
+    return sessionLatestTodoRunIds.value.get(sessionId) ?? null;
+  });
+  const currentTodos = computed(() => {
+    if (!todoRunBoundaryId.value) return [];
+    if (latestTodoRunId.value !== todoRunBoundaryId.value) return [];
+    return todos.value;
+  });
+  const visibleTodos = computed(() => currentTodos.value);
+  const hasAnyTodos = computed(() => todos.value.length > 0);
+  const visibleTodoCount = computed(() => visibleTodos.value.length);
+  const todoCelebrationEnabled = computed(() => (
+    !!todoRunBoundaryId.value && latestTodoRunId.value === todoRunBoundaryId.value
+  ));
+  const todoCelebrationVersion = computed(() => (
+    todoCelebrationEnabled.value ? todoWriteVersion.value : 0
+  ));
 
   // Plan run tracking (bound to runId + sessionId to avoid stale state)
   const pendingPlanRun = ref<{
@@ -138,13 +169,15 @@ export const useChatStore = defineStore("chat", () => {
   function applySessionData(
     detail: SessionDetail,
     usage: TokenUsage,
-    sessionTodos: TodoItem[],
+    sessionTodos: TodoSnapshot,
     undoEntries: Array<{ assistantMessageId: string }>,
   ) {
     messages.value = hydrateMessages(detail.messages);
     tokenUsage.value = { ...usage, contextTokens: 0, contextLimit: 0 };
-    todos.value = sessionTodos;
-    restoreTodoPanelState(detail.id, sessionTodos.length > 0);
+    todos.value = sessionTodos.items;
+    sessionLatestTodoRunIds.value.set(detail.id, sessionTodos.latestRunId);
+    sessionLatestCompletedRunIds.value.set(detail.id, detail.latestCompletedRunId ?? null);
+    restoreTodoPanelState(detail.id, sessionTodos.items.length > 0);
     undoableMessageIds.value = new Set(undoEntries.map((e) => e.assistantMessageId));
     sessionAgentId.value = detail.agentId ?? null;
     activeSessionType.value = detail.sessionType;
@@ -159,6 +192,7 @@ export const useChatStore = defineStore("chat", () => {
     todos.value = [];
     todoWriteVersion.value = 0;
     showTodoPanel.value = false;
+    todoMode.value = "current";
     undoableMessageIds.value = new Set();
     sessionAgentId.value = null;
     activeSessionType.value = null;
@@ -258,7 +292,12 @@ export const useChatStore = defineStore("chat", () => {
     todoPanelVisibility.value.set(sessionId, visible);
   }
 
+  function setTodoMode(_mode: TodoPanelMode, _sessionId: string | null = activeSessionId.value) {
+    todoMode.value = "current";
+  }
+
   function restoreTodoPanelState(sessionId: string, hasTodos: boolean) {
+    todoMode.value = "current";
     if (!hasTodos) {
       setTodoPanelVisible(false, sessionId);
       return;
@@ -269,6 +308,8 @@ export const useChatStore = defineStore("chat", () => {
   function clearTodoPanelState(sessionId: string | null) {
     if (!sessionId) return;
     todoPanelVisibility.value.delete(sessionId);
+    sessionLatestTodoRunIds.value.delete(sessionId);
+    sessionLatestCompletedRunIds.value.delete(sessionId);
   }
 
   async function loadToolPermissionMode() {
@@ -431,11 +472,24 @@ export const useChatStore = defineStore("chat", () => {
   }
 
   function applyMutation(m: StreamMutation) {
-    switch (m.type) {
+      switch (m.type) {
       case "appendRawText":
-        rawStreamText.value += m.text;
-        if (!streamingText.value) streamingText.value = rawStreamText.value.charAt(0);
-        startStreamAnim();
+        {
+          const rawLenBefore = rawStreamText.value.length;
+          const streamingLenBefore = streamingText.value.length;
+          rawStreamText.value += m.text;
+          if (!streamingText.value) streamingText.value = rawStreamText.value.charAt(0);
+          logToolCollapseTrace("chat-store", "appendRawText", {
+            deltaLen: m.text.length,
+            deltaPreview: previewTraceText(m.text, 48),
+            rawLenBefore,
+            rawLenAfter: rawStreamText.value.length,
+            streamingLenBefore,
+            streamingLenAfter: streamingText.value.length,
+            injectedFirstVisibleChar: streamingLenBefore === 0 && streamingText.value.length > 0,
+          });
+          startStreamAnim();
+        }
         break;
       case "appendThinking":
         streamingThinking.value += m.text;
@@ -476,6 +530,14 @@ export const useChatStore = defineStore("chat", () => {
       }
       case "pushMessage":
         messages.value.push(m.message);
+        if (m.message.role === "assistant") {
+          logToolCollapseTrace("chat-store", "pushMessage", {
+            messageId: m.message.id,
+            contentLen: m.message.content.length,
+            toolCallCount: m.message.toolCalls?.length ?? 0,
+            thinkingLen: m.message.thinkingContent?.length ?? 0,
+          });
+        }
         break;
       case "upsertMessage":
         messages.value = replaceMessageById(messages.value, m.message);
@@ -484,6 +546,10 @@ export const useChatStore = defineStore("chat", () => {
         messages.value = hydrateMessages(m.messages);
         break;
       case "pushToolResults":
+        logToolCollapseTrace("chat-store", "pushToolResults", {
+          toolCallCount: activeToolCalls.value.length,
+          toolCallIds: activeToolCalls.value.map((toolCall) => toolCall.id),
+        });
         for (const tc of activeToolCalls.value) {
           if (tc.output !== undefined) {
             messages.value.push({
@@ -497,6 +563,13 @@ export const useChatStore = defineStore("chat", () => {
         }
         break;
       case "resetRound":
+        logToolCollapseTrace("chat-store", "resetRound", {
+          rawStreamLen: rawStreamText.value.length,
+          streamingLen: streamingText.value.length,
+          thinkingLen: streamingThinking.value.length,
+          activeToolCallCount: activeToolCalls.value.length,
+          activeToolCallIds: activeToolCalls.value.map((toolCall) => toolCall.id),
+        });
         resetStreamAnim();
         streamingThinking.value = "";
         thinkingStartTime.value = 0;
@@ -525,6 +598,9 @@ export const useChatStore = defineStore("chat", () => {
         break;
       case "setTodos":
         todos.value = m.todos;
+        if (activeSessionId.value) {
+          sessionLatestTodoRunIds.value.set(activeSessionId.value, m.runId);
+        }
         todoWriteVersion.value += 1;
         if (m.todos.length > 0 && useDisplaySettings().state.todoAutoOpen) {
           setTodoPanelVisible(true);
@@ -533,6 +609,12 @@ export const useChatStore = defineStore("chat", () => {
         }
         break;
       case "setStreaming":
+        if (isStreaming.value !== m.value) {
+          logToolCollapseTrace("chat-store", "setStreaming", {
+            previous: isStreaming.value,
+            next: m.value,
+          });
+        }
         isStreaming.value = m.value;
         break;
       case "canvasAutoOpen":
@@ -542,7 +624,7 @@ export const useChatStore = defineStore("chat", () => {
   }
 
   // -- Stream event handler --
-  function handleStreamEvent(event: StreamEvent) {
+  function handleStreamEvent(event: StreamEvent): boolean {
     if (event.type === "runStart") {
       const closedRunId = closedRunIds.get(event.sessionId);
       if (closedRunId && closedRunId === event.runId) {
@@ -551,7 +633,7 @@ export const useChatStore = defineStore("chat", () => {
           runId: event.runId,
           closedRunId,
         });
-        return;
+        return false;
       }
 
       const expectedRunId = sessionRunIds.value.get(event.sessionId);
@@ -561,7 +643,7 @@ export const useChatStore = defineStore("chat", () => {
           runId: event.runId,
           expectedRunId,
         });
-        return;
+        return false;
       }
 
       closedRunIds.delete(event.sessionId);
@@ -619,14 +701,14 @@ export const useChatStore = defineStore("chat", () => {
         managedStreaming: managedStreamingSessionIds.has(event.sessionId),
         streamingSessionIds: Array.from(streamingSessionIds.value),
       });
-      return;
+      return true;
     }
 
     if (event.type === "knowledgeProposal") {
       if (event.sessionId === activeSessionId.value) {
         applyMutation({ type: "upsertMessage", message: event.message });
       }
-      return;
+      return true;
     }
 
     // Session auto-assignment
@@ -645,7 +727,7 @@ export const useChatStore = defineStore("chat", () => {
         eventType: event.type,
         closedRunId,
       });
-      return;
+      return false;
     }
 
     const expectedRunId = sessionRunIds.value.get(event.sessionId)
@@ -657,7 +739,7 @@ export const useChatStore = defineStore("chat", () => {
         expectedRunId,
         eventType: event.type,
       });
-      return;
+      return false;
     }
 
     if (event.type === "done" || event.type === "error" || event.type === "cancelled") {
@@ -702,11 +784,12 @@ export const useChatStore = defineStore("chat", () => {
     }
 
     if (event.type === "done") {
+      sessionLatestCompletedRunIds.value.set(event.sessionId, event.runId);
       useChatChangesStore().setLatestCompletedRunId(event.sessionId, event.runId);
       void useChatChangesStore().refresh(event.sessionId, { allowAutoOpen: false });
     }
 
-    if (event.sessionId !== activeSessionId.value) return;
+    if (event.sessionId !== activeSessionId.value) return true;
 
     const shouldUseIncrementalReducer =
       managedStreamingSessionIds.has(event.sessionId) || resolveSessionType(event.sessionId) === "chat";
@@ -727,7 +810,7 @@ export const useChatStore = defineStore("chat", () => {
           operation: "chat",
         });
       }
-      return;
+      return true;
     }
 
     // Build current state snapshot for reducer
@@ -748,6 +831,40 @@ export const useChatStore = defineStore("chat", () => {
       pendingToolConfirms: pendingToolConfirms.value,
       undoableMessageIds: undoableMessageIds.value,
     };
+
+    switch (event.type) {
+      case "textDelta":
+        logToolCollapseTrace("chat-store", "handleStreamEvent:textDelta", {
+          sessionId: event.sessionId,
+          runId: event.runId,
+          textLen: event.text.length,
+          textPreview: previewTraceText(event.text, 48),
+          activeToolCallCount: activeToolCalls.value.length,
+          isStreaming: isStreaming.value,
+        });
+        break;
+      case "toolCallRoundDone":
+        logToolCollapseTrace("chat-store", "handleStreamEvent:toolCallRoundDone", {
+          sessionId: event.sessionId,
+          runId: event.runId,
+          messageId: event.messageId,
+          fullTextLen: event.fullText.length,
+          toolCallCount: event.toolCalls.length,
+          activeToolCallCount: activeToolCalls.value.length,
+        });
+        break;
+      case "done":
+        logToolCollapseTrace("chat-store", "handleStreamEvent:done", {
+          sessionId: event.sessionId,
+          runId: event.runId,
+          messageId: event.messageId,
+          fullTextLen: event.fullText.length,
+          rawStreamLen: rawStreamText.value.length,
+          streamingLen: streamingText.value.length,
+          activeToolCallCount: activeToolCalls.value.length,
+        });
+        break;
+    }
 
     const mutations = reduceStreamEvent(state, event);
     for (const m of mutations) {
@@ -777,6 +894,8 @@ export const useChatStore = defineStore("chat", () => {
         ).catch((e) => console.warn("[plan] save artifact failed:", e));
       }
     }
+
+    return true;
   }
 
   // -- Actions --
@@ -803,6 +922,7 @@ export const useChatStore = defineStore("chat", () => {
     thinkingPanelContent.value = "";
     todoWriteVersion.value = 0;
     showTodoPanel.value = false;
+    todoMode.value = "current";
     await loadSessionState(id);
   }
 
@@ -824,6 +944,7 @@ export const useChatStore = defineStore("chat", () => {
     todos.value = [];
     todoWriteVersion.value = 0;
     showTodoPanel.value = false;
+    todoMode.value = "current";
     showThinkingPanel.value = false;
     thinkingPanelContent.value = "";
     undoableMessageIds.value = new Set();
@@ -859,6 +980,9 @@ export const useChatStore = defineStore("chat", () => {
     todoWriteVersion.value = 0;
     showTodoPanel.value = false;
     todoPanelVisibility.value = new Map();
+    todoMode.value = "current";
+    sessionLatestTodoRunIds.value = new Map();
+    sessionLatestCompletedRunIds.value = new Map();
     showThinkingPanel.value = false;
     thinkingPanelContent.value = "";
     sessionAgentId.value = null;
@@ -1060,23 +1184,39 @@ export const useChatStore = defineStore("chat", () => {
     }
   }
 
-  async function cancelChat() {
-    if (!activeSessionId.value || !isStreaming.value) return;
-    const sessionId = activeSessionId.value;
-    const currentRun = currentRunId.value;
-    if (currentRun && cancelRequestedRunIds.get(sessionId) === currentRun) return;
-    if (currentRunId.value) {
-      cancelRequestedRunIds.set(sessionId, currentRunId.value);
+  async function cancelSession(sessionId: string) {
+    if (!sessionId) return;
+    const trackedRunId = sessionRunIds.value.get(sessionId)
+      ?? (activeSessionId.value === sessionId ? currentRunId.value : null);
+    if (trackedRunId && cancelRequestedRunIds.get(sessionId) === trackedRunId) return;
+    if (trackedRunId) {
+      cancelRequestedRunIds.set(sessionId, trackedRunId);
     }
-    pendingPlanRun.value = null;
+    if (pendingPlanRun.value?.sessionId === sessionId) {
+      pendingPlanRun.value = null;
+    }
     try {
       await sessionService.cancelChat(sessionId);
-      pendingQuestion.value = null;
-      pendingToolConfirms.value = [];
+      if (activeSessionId.value === sessionId) {
+        pendingQuestion.value = null;
+        pendingToolConfirms.value = [];
+      }
     } catch (e) {
       console.error("cancel_chat failed:", e);
       cancelRequestedRunIds.delete(sessionId);
+      throw e;
     }
+  }
+
+  async function cancelSessions(sessionIds: string[]) {
+    const targets = Array.from(new Set(sessionIds.filter((sessionId) => !!sessionId)));
+    if (targets.length === 0) return;
+    await Promise.all(targets.map((sessionId) => cancelSession(sessionId)));
+  }
+
+  async function cancelChat() {
+    if (!activeSessionId.value || !isStreaming.value) return;
+    await cancelSession(activeSessionId.value);
   }
 
   async function answerQuestion(answer: string) {
@@ -1172,6 +1312,10 @@ export const useChatStore = defineStore("chat", () => {
         activeSessionId.value,
         detail.latestCompletedRunId ?? null,
       );
+      sessionLatestCompletedRunIds.value.set(
+        activeSessionId.value,
+        detail.latestCompletedRunId ?? null,
+      );
       messages.value = hydrateMessages(detail.messages);
       undoableMessageIds.value = new Set(undoEntries.map((e) => e.assistantMessageId));
       activeSessionType.value = detail.sessionType;
@@ -1206,10 +1350,18 @@ export const useChatStore = defineStore("chat", () => {
     activeToolCalls,
     tokenUsage,
     todos,
+    currentTodos,
+    visibleTodos,
+    hasAnyTodos,
+    visibleTodoCount,
     todoWriteVersion,
+    todoCelebrationVersion,
+    todoCelebrationEnabled,
+    todoMode,
     showTodoPanel,
     closeTodoPanel,
     toggleTodoPanel,
+    setTodoMode,
     pendingQuestion,
     pendingToolConfirms,
     streamingSessionIds,
@@ -1236,6 +1388,8 @@ export const useChatStore = defineStore("chat", () => {
     archiveSession,
     deleteSession,
     sendMessage,
+    cancelSession,
+    cancelSessions,
     cancelChat,
     answerQuestion,
     answerToolConfirm,

@@ -5202,7 +5202,7 @@ impl AgentInstance {
             self.await_tool_result(self.execute_ask(app_handle, &tc.id, args, run_id))
                 .await
         } else if tc.name == "todowrite" {
-            ExecutedToolResult::from_tool_result(self.execute_todowrite(store, args))
+            ExecutedToolResult::from_tool_result(self.execute_todowrite(store, args, run_id))
         } else if tc.name == "config_query" {
             ExecutedToolResult::from_tool_result(self.execute_config_query(app_handle, args))
         } else if tc.name == "knowledge_list" {
@@ -5245,7 +5245,12 @@ impl AgentInstance {
         }
     }
 
-    fn execute_todowrite(&self, store: &SessionStore, args: &serde_json::Value) -> ToolResult {
+    fn execute_todowrite(
+        &self,
+        store: &SessionStore,
+        args: &serde_json::Value,
+        run_id: &str,
+    ) -> ToolResult {
         let todos_value = match args.get("todos") {
             Some(v) => v,
             None => {
@@ -5295,7 +5300,7 @@ impl AgentInstance {
             });
         }
 
-        match store.update_todos(&self.session_id, &items) {
+        match store.update_todos(&self.session_id, Some(run_id), &items) {
             Ok(()) => {
                 let pending_count = items
                     .iter()

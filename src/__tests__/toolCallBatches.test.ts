@@ -2,8 +2,12 @@ import { describe, expect, it } from "vitest";
 import {
   buildMessageToolCalls,
   collectToolCallDisplayIds,
+  collectToolCallDisplayMatchState,
   filterToolCallsByActiveIds,
+  filterToolCallsByMatchState,
   mergeSequentialAssistantToolCalls,
+  mergeToolCallDisplaysWithoutDuplicates,
+  resolveToolCallInfosForRender,
   summarizeToolCallBatch,
 } from "../composables/toolCallBatches";
 
@@ -158,6 +162,143 @@ describe("toolCallBatches", () => {
     expect(merged).toHaveLength(2);
     expect(merged[0]?.displayToolCalls).toBeUndefined();
     expect(merged[1]?.displayToolCalls).toBeUndefined();
+  });
+
+  it("keeps resolved empty display tool calls hidden instead of falling back to persisted history", () => {
+    const merged = mergeSequentialAssistantToolCalls([
+      {
+        id: "m1",
+        content: "",
+        toolCalls: filterToolCallsByMatchState(
+          [makeToolInfo("task-1", "task")],
+          collectToolCallDisplayMatchState([makeToolCall("done", "task-1")]),
+        ),
+      },
+    ]);
+
+    expect(
+      resolveToolCallInfosForRender({
+        messageToolCalls: [makeToolInfo("task-1", "task")],
+        displayToolCalls: merged[0]?.displayToolCalls,
+      }),
+    ).toBeUndefined();
+  });
+
+  it("falls back to persisted history only when no resolved display tool calls exist", () => {
+    expect(
+      resolveToolCallInfosForRender({
+        messageToolCalls: [makeToolInfo("task-1", "task")],
+      }),
+    ).toEqual([makeToolInfo("task-1", "task")]);
+  });
+
+  it("filters historical tool calls that match the transient copy even when ids differ", () => {
+    const hiddenState = collectToolCallDisplayMatchState([
+      {
+        id: "active-1",
+        name: "read",
+        arguments: "{\"path\":\"Assets/Scripts/TestMonoA.cs\"}",
+        status: "done",
+      },
+    ]);
+
+    const filtered = filterToolCallsByMatchState(
+      [
+        {
+          id: "history-1",
+          name: "read",
+          arguments: "{\"path\":\"Assets/Scripts/TestMonoA.cs\"}",
+        },
+        {
+          id: "history-2",
+          name: "read",
+          arguments: "{\"path\":\"Assets/Scripts/TestMonoB.cs\"}",
+        },
+      ],
+      hiddenState,
+    );
+
+    expect(filtered).toEqual([
+      {
+        id: "history-2",
+        name: "read",
+        arguments: "{\"path\":\"Assets/Scripts/TestMonoB.cs\"}",
+      },
+    ]);
+  });
+
+  it("merges transient and promoted history tool calls without duplicating semantic matches", () => {
+    const merged = mergeToolCallDisplaysWithoutDuplicates(
+      [
+        {
+          id: "history-1",
+          name: "read",
+          arguments: "{\"path\":\"Assets/Scripts/TestMonoA.cs\"}",
+          status: "done",
+        },
+      ],
+      [
+        {
+          id: "active-1",
+          name: "read",
+          arguments: "{\"path\":\"Assets/Scripts/TestMonoA.cs\"}",
+          status: "done",
+        },
+        {
+          id: "active-2",
+          name: "read",
+          arguments: "{\"path\":\"Assets/Scripts/TestMonoB.cs\"}",
+          status: "done",
+        },
+      ],
+    );
+
+    expect(merged.map((toolCall) => toolCall.id)).toEqual(["history-1", "active-2"]);
+  });
+
+  it("deduplicates read tool calls when path aliases differ across transient and history copies", () => {
+    const filtered = filterToolCallsByMatchState(
+      [
+        {
+          id: "history-1",
+          name: "read",
+          arguments: "{\"filePath\":\"Assets\\\\Scripts\\\\TestMonoA.cs\"}",
+        },
+      ],
+      collectToolCallDisplayMatchState([
+        {
+          id: "active-1",
+          name: "read",
+          arguments: "{\"path\":\"Assets/Scripts/TestMonoA.cs\"}",
+          status: "done",
+        },
+      ]),
+    );
+
+    expect(filtered).toBeUndefined();
+  });
+
+  it("deduplicates edit tool calls when camelCase and snake_case aliases mix", () => {
+    const merged = mergeToolCallDisplaysWithoutDuplicates(
+      [
+        {
+          id: "history-1",
+          name: "edit",
+          arguments: "{\"file_path\":\"Assets/Test.cs\",\"old_string\":\"a\",\"new_string\":\"b\",\"replace_all\":true}",
+          status: "done",
+        },
+      ],
+      [
+        {
+          id: "active-1",
+          name: "edit",
+          arguments: "{\"filePath\":\"Assets/Test.cs\",\"oldString\":\"a\",\"newString\":\"b\",\"replaceAll\":true}",
+          status: "done",
+        },
+      ],
+    );
+
+    expect(merged.map((toolCall) => toolCall.id)).toEqual(["history-1"]);
   });
 
   it("collapses completed tool batches when compact mode is enabled", () => {

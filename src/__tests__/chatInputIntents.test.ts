@@ -57,6 +57,20 @@ describe("detectActiveOperator", () => {
     });
   });
 
+  it("stops slash detection once the cursor moves into natural-language text", () => {
+    const text = "/plan继续修复这里的逻辑";
+    const operator = detectActiveOperator(text, text.length);
+
+    expect(operator).toBeNull();
+  });
+
+  it("does not treat slash-prefixed Chinese text as a command query", () => {
+    const text = "/创建三步任务";
+    const operator = detectActiveOperator(text, text.length);
+
+    expect(operator).toBeNull();
+  });
+
   it("detects mentions anywhere in the composer", () => {
     const text = "先 /plan 再参考 @Assets/UI/Main.prefab";
     const operator = detectActiveOperator(text, text.length);

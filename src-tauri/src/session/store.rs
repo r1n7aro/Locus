@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use super::models::{
     ChatMessage, KnowledgeProposal, KnowledgeProposalStatus, MessageRole, SessionDetail,
-    SessionSummary, TodoItem, ToolCallInfo,
+    SessionSummary, TodoItem, TodoSnapshot, ToolCallInfo,
 };
 use crate::commands::TokenUsage;
 
@@ -175,7 +175,7 @@ impl SessionStore {
     ///
     /// Do not rely on ad-hoc `ALTER TABLE ... .ok()` fallbacks or silent
     /// schema drift. Session data must migrate deterministically.
-    const SCHEMA_VERSION: i32 = 12;
+    const SCHEMA_VERSION: i32 = 13;
 
     pub fn new(data_dir: &Path) -> Result<Self, String> {
         let db_path = data_dir.join("locus.db");
@@ -313,7 +313,16 @@ impl SessionStore {
             )?;
         }
 
-        debug_assert_eq!(Self::SCHEMA_VERSION, 12, "add a new migration block above");
+        if current < 13 {
+            Self::migrate(conn, 13, "add latest_todo_run_id to sessions", |conn| {
+                if !Self::table_has_column(conn, "sessions", "latest_todo_run_id")? {
+                    conn.execute_batch("ALTER TABLE sessions ADD COLUMN latest_todo_run_id TEXT;")?;
+                }
+                Ok(())
+            })?;
+        }
+
+        debug_assert_eq!(Self::SCHEMA_VERSION, 13, "add a new migration block above");
         Ok(())
     }
 
@@ -328,6 +337,7 @@ impl SessionStore {
                 agent_id TEXT,
                 archived_at INTEGER,
                 latest_completed_run_id TEXT,
+                latest_todo_run_id TEXT,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             );
@@ -1229,7 +1239,12 @@ impl SessionStore {
         }
     }
 
-    pub fn update_todos(&self, session_id: &str, todos: &[TodoItem]) -> Result<(), String> {
+    pub fn update_todos(
+        &self,
+        session_id: &str,
+        latest_run_id: Option<&str>,
+        todos: &[TodoItem],
+    ) -> Result<(), String> {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
 
         conn.execute("BEGIN", [])
@@ -1255,13 +1270,22 @@ impl SessionStore {
             })?;
         }
 
+        conn.execute(
+            "UPDATE sessions SET latest_todo_run_id = ?1, updated_at = ?2 WHERE id = ?3",
+            params![latest_run_id, Self::now_ts(), session_id],
+        )
+        .map_err(|e| {
+            let _ = conn.execute("ROLLBACK", []);
+            format!("Failed to update todo run boundary: {}", e)
+        })?;
+
         conn.execute("COMMIT", [])
             .map_err(|e| format!("Failed to commit transaction: {}", e))?;
 
         Ok(())
     }
 
-    pub fn get_todos(&self, session_id: &str) -> Result<Vec<TodoItem>, String> {
+    pub fn get_todos(&self, session_id: &str) -> Result<TodoSnapshot, String> {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
         let mut stmt = conn
             .prepare("SELECT content, status, priority FROM todos WHERE session_id = ?1 ORDER BY position ASC")
@@ -1281,7 +1305,19 @@ impl SessionStore {
         for row in rows {
             todos.push(row.map_err(|e| format!("Failed to read todo row: {}", e))?);
         }
-        Ok(todos)
+        let latest_run_id = conn
+            .query_row(
+                "SELECT latest_todo_run_id FROM sessions WHERE id = ?1",
+                params![session_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(|e| format!("Failed to query todo run boundary: {}", e))?
+            .flatten();
+        Ok(TodoSnapshot {
+            items: todos,
+            latest_run_id,
+        })
     }
 
     pub fn compact_messages(
@@ -1751,7 +1787,9 @@ impl SessionStore {
 #[cfg(test)]
 mod tests {
     use super::SessionStore;
-    use crate::session::models::{ChatMessage, KnowledgeProposalStatus, MessageRole, ToolCallInfo};
+    use crate::session::models::{
+        ChatMessage, KnowledgeProposalStatus, MessageRole, TodoItem, ToolCallInfo,
+    };
     use rusqlite::{params, Connection};
     use tempfile::tempdir;
 
@@ -2329,6 +2367,113 @@ mod tests {
 
         let detail = store.load_session(&session_id).expect("reload session");
         assert_eq!(detail.latest_completed_run_id, None);
+    }
+
+    #[test]
+    fn v12_database_is_migrated_forward_with_latest_todo_run_id() {
+        let dir = tempdir().expect("create temp dir");
+        let db_path = dir.path().join("locus.db");
+        let conn = Connection::open(&db_path).expect("create db");
+
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                parent_session_id TEXT REFERENCES sessions(id) ON DELETE CASCADE,
+                workspace_id TEXT,
+                session_type TEXT NOT NULL DEFAULT 'chat',
+                agent_id TEXT,
+                archived_at INTEGER,
+                latest_completed_run_id TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+             );
+             CREATE INDEX idx_sessions_parent ON sessions(parent_session_id);
+             CREATE INDEX idx_sessions_workspace ON sessions(workspace_id);
+
+             CREATE TABLE messages (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                prompt_prefix TEXT,
+                prompt_suffix TEXT,
+                tool_calls TEXT,
+                tool_call_id TEXT,
+                images TEXT,
+                thinking_content TEXT,
+                thinking_duration INTEGER,
+                thinking_signature TEXT,
+                metadata_json TEXT,
+                include_in_prompt INTEGER NOT NULL DEFAULT 1
+             );
+             CREATE INDEX idx_messages_session ON messages(session_id);
+
+             CREATE TABLE token_usage (
+                session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+                total_input_tokens INTEGER NOT NULL DEFAULT 0,
+                total_output_tokens INTEGER NOT NULL DEFAULT 0,
+                total_cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+                total_cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+                total_cost_usd REAL NOT NULL DEFAULT 0,
+                priced_rounds INTEGER NOT NULL DEFAULT 0
+             );
+
+             CREATE TABLE todos (
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                position INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                priority TEXT NOT NULL DEFAULT 'medium',
+                PRIMARY KEY (session_id, position)
+             );
+             CREATE INDEX idx_todos_session ON todos(session_id);
+             PRAGMA user_version = 12;",
+        )
+        .expect("create v12 schema");
+
+        drop(conn);
+
+        let store = SessionStore::new(dir.path()).expect("migrate store");
+        let sessions = store
+            .list_sessions(None)
+            .expect("list sessions after migration");
+        assert_eq!(sessions.len(), 0);
+
+        let conn = Connection::open(&db_path).expect("reopen db");
+        let version: i32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read schema version");
+        assert_eq!(version, SessionStore::SCHEMA_VERSION);
+        assert!(SessionStore::table_has_column(&conn, "sessions", "latest_todo_run_id").unwrap());
+    }
+
+    #[test]
+    fn update_todos_persists_latest_todo_run_id() {
+        let dir = tempdir().expect("create temp dir");
+        let store = SessionStore::new(dir.path()).expect("initialize store");
+        let session_id = store
+            .create_session("Todo Boundary", None, None, "chat", None)
+            .expect("create session");
+
+        store
+            .update_todos(
+                &session_id,
+                Some("run-todo"),
+                &[TodoItem {
+                    content: "Track current run".to_string(),
+                    status: "completed".to_string(),
+                    priority: "medium".to_string(),
+                }],
+            )
+            .expect("persist todos");
+
+        let snapshot = store.get_todos(&session_id).expect("load todo snapshot");
+        assert_eq!(snapshot.latest_run_id.as_deref(), Some("run-todo"));
+        assert_eq!(snapshot.items.len(), 1);
+        assert_eq!(snapshot.items[0].content, "Track current run");
     }
 
     #[test]

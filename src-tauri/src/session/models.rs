@@ -126,6 +126,13 @@ pub struct TodoItem {
     pub priority: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TodoSnapshot {
+    pub items: Vec<TodoItem>,
+    pub latest_run_id: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum KnowledgeProposalVerify {

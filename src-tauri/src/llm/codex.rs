@@ -971,6 +971,7 @@ struct PartialToolCall {
     arguments_done: bool,
     item_done: bool,
     notified: bool,
+    start_order: Option<usize>,
 }
 
 impl PartialToolCall {
@@ -978,16 +979,27 @@ impl PartialToolCall {
         self.arguments_done || self.item_done
     }
 
-    fn notify_started<H>(&mut self, on_tool_call_start: &H)
+    fn notify_started<H>(&mut self, next_tool_start_order: &mut usize, on_tool_call_start: &H)
     where
         H: Fn(String, String) + Send,
     {
         if self.notified || self.call_id.is_empty() || self.name.is_empty() {
             return;
         }
+        self.start_order = Some(*next_tool_start_order);
+        *next_tool_start_order += 1;
         on_tool_call_start(self.call_id.clone(), self.name.clone());
         self.notified = true;
     }
+
+    fn display_order(&self) -> usize {
+        self.start_order.unwrap_or(usize::MAX)
+    }
+}
+
+struct OrderedToolCall {
+    start_order: usize,
+    tool_call: ToolCallInfo,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -998,26 +1010,31 @@ enum ReasoningContentKind {
 
 fn collect_complete_tool_calls(
     tool_calls_map: &std::collections::HashMap<String, PartialToolCall>,
-) -> (Vec<ToolCallInfo>, usize) {
+) -> (Vec<OrderedToolCall>, usize) {
     let mut collected = Vec::new();
     let mut incomplete = 0usize;
 
     for tc in tool_calls_map.values() {
         if tc.is_complete() {
-            collected.push(ToolCallInfo {
-                id: tc.call_id.clone(),
-                name: tc.name.clone(),
-                arguments: tc.arguments.clone(),
-                server_tool: None,
-                server_tool_output: None,
-                outcome: None,
-                recorded_output: None,
-                nested_tool_calls: None,
+            collected.push(OrderedToolCall {
+                start_order: tc.display_order(),
+                tool_call: ToolCallInfo {
+                    id: tc.call_id.clone(),
+                    name: tc.name.clone(),
+                    arguments: tc.arguments.clone(),
+                    server_tool: None,
+                    server_tool_output: None,
+                    outcome: None,
+                    recorded_output: None,
+                    nested_tool_calls: None,
+                },
             });
         } else {
             incomplete += 1;
         }
     }
+
+    collected.sort_by_key(|entry| entry.start_order);
 
     (collected, incomplete)
 }
@@ -1029,8 +1046,10 @@ struct CodexStreamState {
     thinking_started_at: Option<Instant>,
     thinking_duration_secs: u32,
     tool_calls_map: std::collections::HashMap<String, PartialToolCall>,
+    next_tool_start_order: usize,
+    pending_server_tool_start_orders: std::collections::HashMap<String, usize>,
     /// Completed web_search_call server tool calls (no local execution needed).
-    web_search_tool_calls: Vec<ToolCallInfo>,
+    web_search_tool_calls: Vec<OrderedToolCall>,
     finish_reason: String,
     input_tokens: u32,
     output_tokens: u32,
@@ -1049,6 +1068,8 @@ impl CodexStreamState {
             thinking_started_at: None,
             thinking_duration_secs: 0,
             tool_calls_map: std::collections::HashMap::new(),
+            next_tool_start_order: 0,
+            pending_server_tool_start_orders: std::collections::HashMap::new(),
             web_search_tool_calls: Vec::new(),
             finish_reason: "stop".to_string(),
             input_tokens: 0,
@@ -1129,6 +1150,12 @@ impl CodexStreamState {
                 on_thinking_delta(suffix.to_string());
             }
         }
+    }
+
+    fn allocate_tool_start_order(&mut self) -> usize {
+        let order = self.next_tool_start_order;
+        self.next_tool_start_order += 1;
+        order
     }
 }
 
@@ -1285,6 +1312,7 @@ where
                                     arguments_done: false,
                                     item_done: false,
                                     notified: false,
+                                    start_order: None,
                                 },
                             );
                         } else if item_type == Some("web_search_call") {
@@ -1295,7 +1323,11 @@ where
                                 .unwrap_or("")
                                 .to_string();
                             if !id.is_empty() {
-                                on_tool_call_start(id, "web_search".to_string());
+                                let start_order = state.allocate_tool_start_order();
+                                on_tool_call_start(id.clone(), "web_search".to_string());
+                                state
+                                    .pending_server_tool_start_orders
+                                    .insert(id, start_order);
                             }
                         }
                     }
@@ -1306,7 +1338,7 @@ where
                     if let Some(tc) = state.tool_calls_map.get_mut(item_id) {
                         tc.arguments.push_str(delta);
                         if !delta.is_empty() {
-                            tc.notify_started(on_tool_call_start);
+                            tc.notify_started(&mut state.next_tool_start_order, on_tool_call_start);
                         }
                     }
                 }
@@ -1316,7 +1348,7 @@ where
                         if let Some(tc) = state.tool_calls_map.get_mut(item_id) {
                             tc.arguments = arguments.to_string();
                             tc.arguments_done = true;
-                            tc.notify_started(on_tool_call_start);
+                            tc.notify_started(&mut state.next_tool_start_order, on_tool_call_start);
                         }
                     }
                 }
@@ -1331,11 +1363,17 @@ where
                                 if let Some(tc) = state.tool_calls_map.get_mut(item_id) {
                                     tc.arguments = arguments.to_string();
                                     tc.item_done = true;
-                                    tc.notify_started(on_tool_call_start);
+                                    tc.notify_started(
+                                        &mut state.next_tool_start_order,
+                                        on_tool_call_start,
+                                    );
                                 }
                             } else if let Some(tc) = state.tool_calls_map.get_mut(item_id) {
                                 tc.item_done = true;
-                                tc.notify_started(on_tool_call_start);
+                                tc.notify_started(
+                                    &mut state.next_tool_start_order,
+                                    on_tool_call_start,
+                                );
                             }
                         } else if item_type == Some("web_search_call") {
                             // Server-side web search completed. Extract query from action.
@@ -1373,15 +1411,23 @@ where
                                 _ => format!("Web search completed: {}", query),
                             };
 
-                            state.web_search_tool_calls.push(ToolCallInfo {
-                                id: id.clone(),
-                                name: "web_search".to_string(),
-                                arguments: serde_json::json!({"query": query}).to_string(),
-                                server_tool: Some(ServerToolKind::WebSearch),
-                                server_tool_output: Some(detail),
-                                outcome: None,
-                                recorded_output: None,
-                                nested_tool_calls: None,
+                            let start_order = state
+                                .pending_server_tool_start_orders
+                                .remove(&id)
+                                .unwrap_or_else(|| state.allocate_tool_start_order());
+
+                            state.web_search_tool_calls.push(OrderedToolCall {
+                                start_order,
+                                tool_call: ToolCallInfo {
+                                    id: id.clone(),
+                                    name: "web_search".to_string(),
+                                    arguments: serde_json::json!({"query": query}).to_string(),
+                                    server_tool: Some(ServerToolKind::WebSearch),
+                                    server_tool_output: Some(detail),
+                                    outcome: None,
+                                    recorded_output: None,
+                                    nested_tool_calls: None,
+                                },
                             });
                         }
                     }
@@ -2022,8 +2068,11 @@ where
     // Merge server-side web_search_call results into collected tool calls.
     let mut collected = collected;
     collected.extend(stream_state.web_search_tool_calls.drain(..));
+    collected.sort_by_key(|entry| entry.start_order);
+    let tool_calls: Vec<ToolCallInfo> =
+        collected.into_iter().map(|entry| entry.tool_call).collect();
 
-    if !collected.is_empty() {
+    if !tool_calls.is_empty() {
         stream_state.finish_reason = "tool_calls".to_string();
     }
 
@@ -2032,13 +2081,13 @@ where
             "[DEBUG][OpenAI Codex] response complete: finish_reason={}, text_len={}, tool_calls={}",
             stream_state.finish_reason,
             stream_state.full_text.len(),
-            collected.len()
+            tool_calls.len()
         );
     }
 
     Ok(LlmResponse {
         text: stream_state.full_text,
-        tool_calls: collected,
+        tool_calls,
         finish_reason: stream_state.finish_reason,
         response_id: stream_state.response_id,
         input_tokens: stream_state.input_tokens,
@@ -2421,8 +2470,11 @@ where
 
     let mut collected = collected;
     collected.extend(stream_state.web_search_tool_calls.drain(..));
+    collected.sort_by_key(|entry| entry.start_order);
+    let tool_calls: Vec<ToolCallInfo> =
+        collected.into_iter().map(|entry| entry.tool_call).collect();
 
-    if !collected.is_empty() {
+    if !tool_calls.is_empty() {
         stream_state.finish_reason = "tool_calls".to_string();
     }
 
@@ -2431,13 +2483,13 @@ where
             "[DEBUG][OpenAI Codex][websocket] response complete: finish_reason={}, text_len={}, tool_calls={}",
             stream_state.finish_reason,
             stream_state.full_text.len(),
-            collected.len()
+            tool_calls.len()
         );
     }
 
     Ok(CodexWebsocketAttempt::Response(LlmResponse {
         text: stream_state.full_text,
-        tool_calls: collected,
+        tool_calls,
         finish_reason: stream_state.finish_reason,
         response_id: stream_state.response_id,
         input_tokens: stream_state.input_tokens,
@@ -2622,6 +2674,7 @@ mod tests {
                 arguments_done: true,
                 item_done: false,
                 notified: true,
+                start_order: Some(0),
             },
         );
         tool_calls.insert(
@@ -2633,13 +2686,51 @@ mod tests {
                 arguments_done: false,
                 item_done: false,
                 notified: false,
+                start_order: None,
             },
         );
 
         let (collected, incomplete) = collect_complete_tool_calls(&tool_calls);
         assert_eq!(collected.len(), 1);
-        assert_eq!(collected[0].id, "call_complete");
+        assert_eq!(collected[0].tool_call.id, "call_complete");
         assert_eq!(incomplete, 1);
+    }
+
+    #[test]
+    fn collects_complete_tool_calls_in_start_order() {
+        let mut tool_calls = std::collections::HashMap::new();
+        tool_calls.insert(
+            "second".to_string(),
+            PartialToolCall {
+                call_id: "call_second".to_string(),
+                name: "write".to_string(),
+                arguments: r#"{"filePath":"Assets/Second.cs"}"#.to_string(),
+                arguments_done: true,
+                item_done: false,
+                notified: true,
+                start_order: Some(1),
+            },
+        );
+        tool_calls.insert(
+            "first".to_string(),
+            PartialToolCall {
+                call_id: "call_first".to_string(),
+                name: "read".to_string(),
+                arguments: r#"{"path":"Assets/First.cs"}"#.to_string(),
+                arguments_done: true,
+                item_done: false,
+                notified: true,
+                start_order: Some(0),
+            },
+        );
+
+        let (collected, incomplete) = collect_complete_tool_calls(&tool_calls);
+        let ids: Vec<_> = collected
+            .into_iter()
+            .map(|entry| entry.tool_call.id)
+            .collect();
+        assert_eq!(ids, vec!["call_first", "call_second"]);
+        assert_eq!(incomplete, 0);
     }
 
     #[test]
@@ -2756,8 +2847,11 @@ mod tests {
         assert_eq!(state.output_tokens, 4);
         assert_eq!(state.cached_tokens, 3);
         assert_eq!(collected.len(), 1);
-        assert_eq!(collected[0].id, "call_1");
-        assert_eq!(collected[0].arguments, r#"{"path":"Assets/Test.cs"}"#);
+        assert_eq!(collected[0].tool_call.id, "call_1");
+        assert_eq!(
+            collected[0].tool_call.arguments,
+            r#"{"path":"Assets/Test.cs"}"#
+        );
         assert_eq!(incomplete, 0);
     }
 
@@ -2785,7 +2879,67 @@ mod tests {
         assert!(stopped);
         assert!(state.got_terminal_event);
         assert_eq!(collected.len(), 1);
-        assert_eq!(collected[0].arguments, r#"{"path":"Assets/Test.cs"}"#);
+        assert_eq!(
+            collected[0].tool_call.arguments,
+            r#"{"path":"Assets/Test.cs"}"#
+        );
+        assert_eq!(incomplete, 0);
+    }
+
+    #[test]
+    fn keeps_server_tool_calls_in_started_order_when_mixed_with_function_calls() {
+        let mut state = CodexStreamState::new();
+
+        process_sse_event_block(
+            "data: {\"type\":\"response.output_item.added\",\"item\":{\"id\":\"ws_1\",\"type\":\"web_search_call\"}}",
+            false,
+            &mut state,
+            &ignore_text,
+            &ignore_thinking,
+            &ignore_tool,
+        )
+        .expect("web search add should parse");
+
+        process_sse_event_block(
+            "data: {\"type\":\"response.output_item.added\",\"item\":{\"id\":\"item_1\",\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"read\",\"arguments\":\"\"}}",
+            false,
+            &mut state,
+            &ignore_text,
+            &ignore_thinking,
+            &ignore_tool,
+        )
+        .expect("function call add should parse");
+
+        process_sse_event_block(
+            "data: {\"type\":\"response.function_call_arguments.done\",\"item_id\":\"item_1\",\"arguments\":\"{\\\"path\\\":\\\"Assets/Test.cs\\\"}\"}",
+            false,
+            &mut state,
+            &ignore_text,
+            &ignore_thinking,
+            &ignore_tool,
+        )
+        .expect("function call done should parse");
+
+        process_sse_event_block(
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"id\":\"ws_1\",\"type\":\"web_search_call\",\"action\":{\"type\":\"search\",\"query\":\"unity\"}}}",
+            false,
+            &mut state,
+            &ignore_text,
+            &ignore_thinking,
+            &ignore_tool,
+        )
+        .expect("web search done should parse");
+
+        let (mut collected, incomplete) = collect_complete_tool_calls(&state.tool_calls_map);
+        collected.extend(state.web_search_tool_calls.drain(..));
+        collected.sort_by_key(|entry| entry.start_order);
+
+        let ids: Vec<_> = collected
+            .into_iter()
+            .map(|entry| entry.tool_call.id)
+            .collect();
+
+        assert_eq!(ids, vec!["ws_1", "call_1"]);
         assert_eq!(incomplete, 0);
     }
 

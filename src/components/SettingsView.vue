@@ -496,12 +496,14 @@ function toggleBetaFlag(ep: import("../types").CustomEndpoint, flag: string) {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 6px 10px;
+  padding: 8px 10px;
+  min-height: 34px;
   border: none;
   border-radius: 6px;
   background: transparent;
   color: var(--text-secondary);
-  font-size: 12px;
+  font-size: 13px;
+  line-height: 1.3;
   font-weight: 500;
   cursor: pointer;
   transition: background 0.15s ease, color 0.15s ease;

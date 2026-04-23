@@ -9,21 +9,25 @@ function read(relPath: string) {
 }
 
 describe("selector dropdown alignment", () => {
-  it("anchors the model selector dropdown to the trigger's trailing edge", () => {
+  it("anchors the model selector dropdown to the trigger's leading edge", () => {
     const source = read("src/components/ModelSelector.vue");
 
+    expect(source).toContain(".model-trigger {");
+    expect(source).toContain("min-height: 28px;");
     expect(source).toContain(".model-dropdown {");
-    expect(source).toContain("right: 0;");
-    expect(source).toContain("left: auto;");
-    expect(source).toContain("transform-origin: bottom right;");
+    expect(source).toContain("left: 0;");
+    expect(source).toContain("right: auto;");
+    expect(source).toContain("transform-origin: bottom left;");
   });
 
-  it("anchors the thinking selector dropdown to the trigger's trailing edge", () => {
+  it("anchors the thinking selector dropdown to the trigger's leading edge", () => {
     const source = read("src/components/ThinkingSelector.vue");
 
+    expect(source).toContain(".thinking-trigger {");
+    expect(source).toContain("min-height: 28px;");
     expect(source).toContain(".thinking-dropdown {");
-    expect(source).toContain("right: 0;");
-    expect(source).toContain("left: auto;");
-    expect(source).toContain("transform-origin: bottom right;");
+    expect(source).toContain("left: 0;");
+    expect(source).toContain("right: auto;");
+    expect(source).toContain("transform-origin: bottom left;");
   });
 });

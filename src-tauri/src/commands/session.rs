@@ -19,7 +19,7 @@ use crate::knowledge_store::{self, KnowledgeDocument, KnowledgeInjectMode, Knowl
 use crate::session::models::{
     ChatMessage, ImageData, KnowledgeProposalItem, KnowledgeProposalItemKind,
     KnowledgeProposalStatus, SessionDetail, SessionRuntimeStatus, SessionSummary, TodoItem,
-    UserIntentPayload,
+    TodoSnapshot, UserIntentPayload,
 };
 use crate::session::store::SessionStore;
 use crate::tool::ToolRegistry;
@@ -932,7 +932,7 @@ pub async fn get_session_usage(
 pub async fn get_todos(
     session_id: String,
     store: State<'_, Arc<SessionStore>>,
-) -> Result<Vec<TodoItem>, AppError> {
+) -> Result<TodoSnapshot, AppError> {
     store.get_todos(&session_id).map_err(Into::into)
 }
 
@@ -1200,7 +1200,10 @@ pub async fn save_raw_context(
         (markdown, "raw-rounds")
     } else {
         let detail = store.load_session(&session_id)?;
-        let todos = store.get_todos(&session_id).unwrap_or_default();
+        let todos = store
+            .get_todos(&session_id)
+            .map(|snapshot| snapshot.items)
+            .unwrap_or_default();
         let system_prompt = if include_system_prompt {
             resolve_export_system_prompt(registry.inner(), detail.agent_id.as_deref())
         } else {

@@ -32,6 +32,7 @@ import ThinkingPanel from "./components/ThinkingPanel.vue";
 import ChatSidebarPanel from "./components/ChatSidebarPanel.vue";
 import FileDiffOverlay from "./components/diff/FileDiffOverlay.vue";
 import TopBannerHost from "./components/TopBannerHost.vue";
+import BaseButton from "./components/ui/BaseButton.vue";
 import AppUpdateModal from "./components/AppUpdateModal.vue";
 
 import { provideDiffOverlay } from "./composables/useDiffOverlay";
@@ -194,6 +195,12 @@ watch(() => uiStore.settingsMounted, (mounted) => {
 // -- Workspace dropdown (local UI) --
 const showDirDropdown = ref(false);
 const dirDropdownRef = ref<HTMLElement | null>(null);
+const pendingWorkspaceSwitchPath = ref<string | null>(null);
+const workspaceSwitchBusy = ref(false);
+const runningSessionCount = computed(() => chatStore.streamingSessionIds.size);
+const workspaceSwitchTargetName = computed(() =>
+  pendingWorkspaceSwitchPath.value ? shortDir(pendingWorkspaceSwitchPath.value) : "",
+);
 const showAppUpdateModal = computed(() =>
   Boolean(
     appUpdateStore.updateInfo
@@ -202,7 +209,6 @@ const showAppUpdateModal = computed(() =>
     && !uiStore.showOnboarding,
   ),
 );
-
 
 function shortDir(dir: string): string {
   if (!dir) return t("app.dir.notSet");
@@ -220,11 +226,70 @@ function toggleDirDropdown() {
   showDirDropdown.value = !showDirDropdown.value;
 }
 
+function closeWorkspaceSwitchDialog() {
+  if (workspaceSwitchBusy.value) return;
+  pendingWorkspaceSwitchPath.value = null;
+}
+
+function reportWorkingDirSwitchError(error: unknown) {
+  const err = normalizeAppError(error);
+  notificationStore.addNotice("error", err.message, {
+    code: err.code,
+    operation: "switchWorkingDir",
+    replaceOperation: true,
+    skipConsoleLog: true,
+  });
+}
+
+function notifyCancelledWorkspaceSessions(count: number) {
+  if (count <= 0) return;
+  notificationStore.addNotice("info", t("app.dir.runningCancelledNotice", String(count)), {
+    operation: "workspaceSwitchCancelled",
+    replaceOperation: true,
+  });
+}
+
+async function performWorkingDirChange(dir: string, cancelledSessionCount = 0) {
+  try {
+    await applyWorkingDir(dir);
+    notifyCancelledWorkspaceSessions(cancelledSessionCount);
+    return true;
+  } catch (error) {
+    reportWorkingDirSwitchError(error);
+    return false;
+  }
+}
+
+async function requestWorkingDirChange(dir: string) {
+  if (!dir || dir === projectStore.workingDir || workspaceSwitchBusy.value) return;
+  if (runningSessionCount.value > 0) {
+    pendingWorkspaceSwitchPath.value = dir;
+    return;
+  }
+  await performWorkingDirChange(dir);
+}
+
+async function confirmWorkspaceSwitch() {
+  const target = pendingWorkspaceSwitchPath.value;
+  if (!target || workspaceSwitchBusy.value) return;
+  workspaceSwitchBusy.value = true;
+  try {
+    const sessionIds = Array.from(chatStore.streamingSessionIds);
+    await chatStore.cancelSessions(sessionIds);
+    const switched = await performWorkingDirChange(target, sessionIds.length);
+    if (switched) {
+      pendingWorkspaceSwitchPath.value = null;
+    }
+  } catch (error) {
+    reportWorkingDirSwitchError(error);
+  } finally {
+    workspaceSwitchBusy.value = false;
+  }
+}
+
 async function selectRecentDir(dir: string) {
   showDirDropdown.value = false;
-  if (dir !== projectStore.workingDir) {
-    await applyWorkingDir(dir);
-  }
+  await requestWorkingDirChange(dir);
 }
 
 async function browseFromDropdown() {
@@ -232,7 +297,7 @@ async function browseFromDropdown() {
   try {
     const selected = await open({ directory: true, multiple: false, defaultPath: projectStore.workingDir || undefined });
     if (selected && typeof selected === "string") {
-      await applyWorkingDir(selected);
+      await requestWorkingDirChange(selected);
     }
   } catch (e) {
     const err = normalizeAppError(e);
@@ -509,9 +574,10 @@ onUnmounted(() => {
         />
         <ChatSidebarPanel
           v-if="uiStore.activeTab === 'chat' && (chatStore.showTodoPanel || chatChangesStore.currentPanelVisible)"
-          :todos="chatStore.todos"
+          :todos="chatStore.visibleTodos"
           :is-streaming="chatStore.isStreaming"
-          :todo-write-version="chatStore.todoWriteVersion"
+          :todo-write-version="chatStore.todoCelebrationVersion"
+          :celebration-enabled="chatStore.todoCelebrationEnabled"
         />
 
         <component
@@ -608,6 +674,56 @@ onUnmounted(() => {
     @close="closeAppUpdateModal"
     @view="openAppUpdateChangelog"
   />
+  <Transition name="workspace-switch-modal">
+    <div
+      v-if="pendingWorkspaceSwitchPath"
+      class="workspace-switch-overlay"
+      @click.self="closeWorkspaceSwitchDialog"
+    >
+      <div
+        class="workspace-switch-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="workspace-switch-title"
+      >
+        <div class="workspace-switch-header">
+          <span id="workspace-switch-title" class="workspace-switch-title">
+            {{ t("app.dir.runningConfirmTitle") }}
+          </span>
+          <button
+            class="workspace-switch-close"
+            :disabled="workspaceSwitchBusy"
+            @click="closeWorkspaceSwitchDialog"
+          >
+            <svg viewBox="0 0 16 16" fill="currentColor" width="14" height="14">
+              <path d="M3.72 3.72a.75.75 0 0 1 1.06 0L8 6.94l3.22-3.22a.75.75 0 1 1 1.06 1.06L9.06 8l3.22 3.22a.75.75 0 1 1-1.06 1.06L8 9.06l-3.22 3.22a.75.75 0 0 1-1.06-1.06L6.94 8 3.72 4.78a.75.75 0 0 1 0-1.06z"/>
+            </svg>
+          </button>
+        </div>
+        <div class="workspace-switch-body">
+          <p class="workspace-switch-message">
+            {{ t("app.dir.runningConfirmMessage", String(runningSessionCount), workspaceSwitchTargetName) }}
+          </p>
+          <div class="workspace-switch-path">{{ pendingWorkspaceSwitchPath }}</div>
+          <p class="workspace-switch-warning">
+            {{ t("app.dir.runningConfirmWarning") }}
+          </p>
+        </div>
+        <div class="workspace-switch-footer">
+          <BaseButton :disabled="workspaceSwitchBusy" @click="closeWorkspaceSwitchDialog">
+            {{ t("common.cancel") }}
+          </BaseButton>
+          <BaseButton
+            variant="primary"
+            :disabled="workspaceSwitchBusy"
+            @click="confirmWorkspaceSwitch"
+          >
+            {{ t("app.dir.runningConfirmAction") }}
+          </BaseButton>
+        </div>
+      </div>
+    </div>
+  </Transition>
   <FileDiffOverlay />
 </template>
 
@@ -626,7 +742,7 @@ onUnmounted(() => {
   --hover-bg: #eef1f4;
   --active-bg: #e7ebf0;
   --input-bg: #f8f9fb;
-  --msg-user-bg: var(--bg-color);
+  --msg-user-bg: #eff0f1;
   --msg-assistant-bg: #f9fafb;
   --msg-divider: color-mix(in srgb, var(--border-strong) 74%, var(--border-color) 26%);
   --msg-user-role: color-mix(in srgb, var(--text-color) 76%, var(--text-secondary) 24%);
@@ -694,7 +810,7 @@ onUnmounted(() => {
   --hover-bg: #1d1f25;
   --active-bg: #23252c;
   --input-bg: #181a20;
-  --msg-user-bg: var(--bg-color);
+  --msg-user-bg: #212125;
   --msg-assistant-bg: #17181d;
   --msg-divider: color-mix(in srgb, var(--border-strong) 76%, var(--border-color) 24%);
   --msg-user-role: color-mix(in srgb, var(--text-color) 74%, var(--text-secondary) 26%);
@@ -1107,6 +1223,138 @@ body.is-dragging-select-lock * {
 .dropdown-leave-to {
   opacity: 0;
   transform: translateY(-4px);
+}
+
+.workspace-switch-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 320;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(10, 12, 16, 0.32);
+  backdrop-filter: blur(2px);
+}
+
+.workspace-switch-dialog {
+  width: 420px;
+  max-width: min(420px, calc(100vw - 32px));
+  border-radius: 10px;
+  border: 1px solid var(--border-color);
+  background: var(--surface-elevated);
+  box-shadow: 0 16px 34px rgba(15, 17, 21, 0.18);
+  overflow: hidden;
+}
+
+:root[data-theme="dark"] .workspace-switch-dialog {
+  box-shadow: 0 18px 36px rgba(0, 0, 0, 0.4);
+}
+
+.workspace-switch-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 16px 12px;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.workspace-switch-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-color);
+}
+
+.workspace-switch-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease, opacity 0.15s ease;
+}
+
+.workspace-switch-close:hover:not(:disabled) {
+  background: var(--hover-bg);
+  color: var(--text-color);
+}
+
+.workspace-switch-close:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.workspace-switch-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px 16px;
+}
+
+.workspace-switch-message,
+.workspace-switch-warning {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.workspace-switch-message {
+  color: var(--text-secondary);
+}
+
+.workspace-switch-path {
+  padding: 8px 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--panel-bg) 72%, var(--sidebar-bg) 28%);
+  color: var(--text-color);
+  font-size: 12px;
+  line-height: 1.5;
+  font-family: var(--font-mono-identifier);
+  word-break: break-all;
+}
+
+.workspace-switch-warning {
+  padding: 8px 10px;
+  border: 1px solid var(--status-warn-border);
+  border-radius: 6px;
+  background: var(--status-warn-bg);
+  color: var(--status-warn-fg);
+}
+
+.workspace-switch-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 12px 16px 16px;
+  border-top: 1px solid var(--border-color);
+}
+
+.workspace-switch-modal-enter-active,
+.workspace-switch-modal-leave-active {
+  transition: opacity 0.16s ease;
+}
+
+.workspace-switch-modal-enter-active .workspace-switch-dialog,
+.workspace-switch-modal-leave-active .workspace-switch-dialog {
+  transition: transform 0.16s ease, opacity 0.16s ease;
+}
+
+.workspace-switch-modal-enter-from,
+.workspace-switch-modal-leave-to {
+  opacity: 0;
+}
+
+.workspace-switch-modal-enter-from .workspace-switch-dialog,
+.workspace-switch-modal-leave-to .workspace-switch-dialog {
+  opacity: 0;
+  transform: translateY(6px) scale(0.98);
 }
 
 .tab-content {

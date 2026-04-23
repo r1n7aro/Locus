@@ -1,5 +1,5 @@
 import { ipcInvoke } from "./ipc";
-import type { SessionSummary, SessionDetail, TokenUsage, TodoItem, ImageAttachment, UserIntentMeta } from "../types";
+import type { SessionSummary, SessionDetail, TokenUsage, TodoSnapshot, ImageAttachment, UserIntentMeta } from "../types";
 
 export interface ChatParams {
   sessionId?: string | null;
@@ -89,8 +89,8 @@ export function getSessionUsage(sessionId: string): Promise<TokenUsage> {
   return ipcInvoke<TokenUsage>("get_session_usage", { sessionId });
 }
 
-export function getTodos(sessionId: string): Promise<TodoItem[]> {
-  return ipcInvoke<TodoItem[]>("get_todos", { sessionId });
+export function getTodos(sessionId: string): Promise<TodoSnapshot> {
+  return ipcInvoke<TodoSnapshot>("get_todos", { sessionId });
 }
 
 export function answerQuestion(questionId: string, answer: string): Promise<void> {

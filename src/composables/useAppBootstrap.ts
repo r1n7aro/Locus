@@ -12,6 +12,10 @@ import { useChatStore } from "../stores/chat";
 import { useNotificationStore } from "../stores/notification";
 import { useSkills } from "./useSkills";
 import { normalizeAppError } from "../services/errors";
+import {
+  maybeNotifyStreamEvent,
+  resetSystemNotificationState,
+} from "../services/systemNotifications";
 import { setScope, setWarmup, clearWarmup } from "./warmupCache";
 import {
   getProviders,
@@ -125,7 +129,6 @@ export function useAppBootstrap() {
   // -- Bootstrap: Critical (first-screen minimum) --
   async function bootstrapCritical() {
     await uiStore.init();
-    uiStore.setTab("chat");
     await Promise.all([
       chatStore.loadToolPermissionMode(),
       modelStore.loadModelDefaults(),
@@ -377,7 +380,12 @@ export function useAppBootstrap() {
   // -- Event listener registration --
   async function registerListeners() {
     unlisten = await listen<StreamEvent>("stream-event", (e) => {
-      chatStore.handleStreamEvent(e.payload);
+      const handled = chatStore.handleStreamEvent(e.payload);
+      if (!handled) return;
+
+      const sessionTitle =
+        chatStore.sessions.find((session) => session.id === e.payload.sessionId)?.title ?? null;
+      void maybeNotifyStreamEvent(e.payload, { sessionTitle });
     });
     unlistenUnity = await listen<boolean>("unity-connection-status", (e) => {
       projectStore.unityConnected = e.payload;
@@ -417,6 +425,7 @@ export function useAppBootstrap() {
     clearLexicalProgressPoll();
     lexicalProgressPollInFlight = false;
     lastAutoOpenedLexicalProgressRun = "";
+    resetSystemNotificationState();
     uiStore.cleanup();
     chatStore.cleanupAnim();
   }
@@ -425,6 +434,7 @@ export function useAppBootstrap() {
   async function applyWorkingDir(path: string) {
     clearWarmup(); // invalidate warmup cache for previous workingDir
     lastAutoOpenedLexicalProgressRun = "";
+    resetSystemNotificationState();
     _wpCollab = null;
     _wpKnowledge = null;
     _wpAsset = null;

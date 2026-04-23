@@ -115,6 +115,7 @@ onUnmounted(() => document.removeEventListener("click", onClickOutside));
   display: flex;
   align-items: center;
   gap: 4px;
+  min-height: 28px;
   padding: 4px 8px;
   border: 1px solid var(--border-color);
   border-radius: 8px;
@@ -164,8 +165,8 @@ onUnmounted(() => document.removeEventListener("click", onClickOutside));
 .thinking-dropdown {
   position: absolute;
   bottom: calc(100% + 6px);
-  right: 0;
-  left: auto;
+  left: 0;
+  right: auto;
   min-width: 180px;
   max-width: min(240px, calc(100vw - 24px));
   background: var(--bg-color);
@@ -174,7 +175,7 @@ onUnmounted(() => document.removeEventListener("click", onClickOutside));
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.12);
   padding: 4px;
   z-index: 100;
-  transform-origin: bottom right;
+  transform-origin: bottom left;
 }
 
 :root[data-theme="dark"] .thinking-dropdown {

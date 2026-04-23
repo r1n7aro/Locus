@@ -253,6 +253,13 @@ export interface TodoItem {
   priority: "high" | "medium" | "low";
 }
 
+export interface TodoSnapshot {
+  items: TodoItem[];
+  latestRunId: string | null;
+}
+
+export type TodoPanelMode = "current" | "all";
+
 export interface DuplicateGuidOverview {
   groupCount: number;
   pathCount: number;
@@ -297,6 +304,12 @@ export interface KnowledgeChangedEvent {
   workingDir: string;
   source: string;
   changedAt: number;
+  docType?: "design" | "memory" | "skill" | "reference";
+  path?: string | null;
+  parentPath?: string | null;
+  targetKind?: "document" | "directory" | "type" | "workspace";
+  changeKind?: "content" | "structure" | "config";
+  subtree?: boolean;
 }
 
 /** Every StreamEvent is wrapped in an envelope that carries a runId for filtering stale events. */
@@ -350,12 +363,6 @@ export type StreamEvent = { runId: string } & (
       toolCalls: ToolCallInfo[];
     }
   | { type: "knowledgeProposal"; sessionId: string; message: ChatMessage }
-  docType?: "design" | "memory" | "skill" | "reference";
-  path?: string | null;
-  parentPath?: string | null;
-  targetKind?: "document" | "directory" | "type" | "workspace";
-  changeKind?: "content" | "structure" | "config";
-  subtree?: boolean;
   | {
       type: "usageUpdate";
       sessionId: string;

@@ -1,6 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { reactive } from "vue";
-import { useAppBootstrap } from "../composables/useAppBootstrap";
 
 let uiStoreMock: any;
 let authStoreMock: any;
@@ -10,6 +9,8 @@ let projectStoreMock: any;
 let chatStoreMock: any;
 let notificationStoreMock: any;
 let loadSkillsMock: ReturnType<typeof vi.fn>;
+let maybeNotifyStreamEventMock: any;
+let resetSystemNotificationStateMock: any;
 
 vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn(),
@@ -63,6 +64,11 @@ vi.mock("../composables/useSkills", () => ({
 
 vi.mock("../services/errors", () => ({
   normalizeAppError: (error: unknown) => error,
+}));
+
+vi.mock("../services/systemNotifications", () => ({
+  maybeNotifyStreamEvent: (...args: unknown[]) => maybeNotifyStreamEventMock(...args),
+  resetSystemNotificationState: (...args: unknown[]) => resetSystemNotificationStateMock(...args),
 }));
 
 vi.mock("../composables/warmupCache", () => ({
@@ -128,9 +134,21 @@ vi.mock("../config/providerVisibility", () => ({
   filterVisibleProviders: (providers: unknown) => providers,
 }));
 
+vi.mock("../i18n", () => ({
+  t: (key: string, ...args: (string | number)[]) =>
+    args.length > 0 ? `${key}: ${args.join(" ")}` : key,
+}));
+
+async function loadUseAppBootstrap() {
+  const mod = await import("../composables/useAppBootstrap");
+  return mod.useAppBootstrap;
+}
+
 describe("useAppBootstrap onboarding completion", () => {
   beforeEach(() => {
     loadSkillsMock = vi.fn().mockResolvedValue(undefined);
+    maybeNotifyStreamEventMock = vi.fn().mockResolvedValue(undefined);
+    resetSystemNotificationStateMock = vi.fn();
 
     uiStoreMock = reactive({
       activeTab: "chat",
@@ -170,9 +188,11 @@ describe("useAppBootstrap onboarding completion", () => {
     });
 
     chatStoreMock = reactive({
+      sessions: [],
       refreshSessions: vi.fn().mockResolvedValue(undefined),
       loadToolPermissionMode: vi.fn().mockResolvedValue(undefined),
       setCanvasAutoOpenCallback: vi.fn(),
+      handleStreamEvent: vi.fn().mockReturnValue(true),
       cleanupAnim: vi.fn(),
     });
 
@@ -182,6 +202,7 @@ describe("useAppBootstrap onboarding completion", () => {
   });
 
   it("reloads sessions after onboarding completes", async () => {
+    const useAppBootstrap = await loadUseAppBootstrap();
     const { onOnboardingCompleted } = useAppBootstrap();
 
     await onOnboardingCompleted();
@@ -214,6 +235,7 @@ describe("useAppBootstrap onboarding completion", () => {
       },
     ]);
 
+    const useAppBootstrap = await loadUseAppBootstrap();
     const { bootstrapCritical } = useAppBootstrap();
 
     await bootstrapCritical();
@@ -245,6 +267,7 @@ describe("useAppBootstrap onboarding completion", () => {
   it("treats missing auth failure results as an empty list", async () => {
     authStoreMock.checkAuth.mockResolvedValue(undefined);
 
+    const useAppBootstrap = await loadUseAppBootstrap();
     const { bootstrapCritical } = useAppBootstrap();
 
     await expect(bootstrapCritical()).resolves.toBeUndefined();
@@ -252,6 +275,7 @@ describe("useAppBootstrap onboarding completion", () => {
   });
 
   it("loads the global tool permission mode before auth unlocks the main shell", async () => {
+    const useAppBootstrap = await loadUseAppBootstrap();
     const { bootstrapCritical } = useAppBootstrap();
 
     await bootstrapCritical();
@@ -325,6 +349,7 @@ describe("useAppBootstrap onboarding completion", () => {
         ) => (status?.running ? (status.startedAt ?? "active") : ""),
       );
 
+      const useAppBootstrap = await loadUseAppBootstrap();
       const { registerListeners, cleanup } = useAppBootstrap();
       await registerListeners();
 
@@ -344,5 +369,66 @@ describe("useAppBootstrap onboarding completion", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("dispatches system notifications only after the chat store accepts a stream event", async () => {
+    const eventModule = await import("@tauri-apps/api/event");
+    const listenMock = eventModule.listen as unknown as ReturnType<typeof vi.fn>;
+    const handlers = new Map<string, (event: { payload: any }) => void>();
+
+    listenMock.mockImplementation(
+      async (name: string, handler: (event: { payload: any }) => void) => {
+        handlers.set(name, handler);
+        return vi.fn();
+      },
+    );
+
+    chatStoreMock.sessions = [{ id: "session-1", title: "Session A" }];
+
+    const useAppBootstrap = await loadUseAppBootstrap();
+    const { registerListeners } = useAppBootstrap();
+    await registerListeners();
+
+    const streamHandler = handlers.get("stream-event");
+    expect(streamHandler).toBeTypeOf("function");
+
+    streamHandler?.({
+      payload: {
+        type: "done",
+        runId: "run-1",
+        sessionId: "session-1",
+        messageId: "message-1",
+        fullText: "Completed response",
+      },
+    });
+
+    expect(chatStoreMock.handleStreamEvent).toHaveBeenCalledTimes(1);
+    expect(maybeNotifyStreamEventMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "done",
+        runId: "run-1",
+        sessionId: "session-1",
+      }),
+      { sessionTitle: "Session A" },
+    );
+
+    maybeNotifyStreamEventMock.mockClear();
+    chatStoreMock.handleStreamEvent.mockReturnValue(false);
+
+    streamHandler?.({
+      payload: {
+        type: "error",
+        runId: "run-2",
+        sessionId: "session-1",
+        error: {
+          code: "failed",
+          message: "nope",
+          retryable: false,
+          severity: "error",
+        },
+      },
+    });
+
+    expect(maybeNotifyStreamEventMock).not.toHaveBeenCalled();
   });
 });

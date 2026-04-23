@@ -21,6 +21,22 @@ const tauriWindowMocks = vi.hoisted(() => {
   };
 });
 
+const localStorageMock = vi.hoisted(() => {
+  let storage = new Map<string, string>();
+  return {
+    getItem: vi.fn((key: string) => storage.get(key) ?? null),
+    setItem: vi.fn((key: string, value: string) => {
+      storage.set(key, String(value));
+    }),
+    removeItem: vi.fn((key: string) => {
+      storage.delete(key);
+    }),
+    clear: vi.fn(() => {
+      storage = new Map<string, string>();
+    }),
+  };
+});
+
 vi.mock("@tauri-apps/api/window", () => ({
   getCurrentWindow: () => ({
     isMaximized: tauriWindowMocks.isMaximized,
@@ -37,10 +53,13 @@ describe("ui store window resize sync", () => {
     setActivePinia(createPinia());
     vi.useFakeTimers();
     vi.clearAllMocks();
+    vi.stubGlobal("localStorage", localStorageMock as unknown as Storage);
+    localStorageMock.clear();
     tauriWindowMocks.isMaximized.mockResolvedValue(false);
   });
 
   afterEach(() => {
+    vi.unstubAllGlobals();
     vi.useRealTimers();
   });
 
@@ -93,5 +112,15 @@ describe("ui store window resize sync", () => {
 
     expect(store.isMaximized).toBe(false);
     expect(tauriWindowMocks.onResized).toHaveBeenCalledTimes(1);
+  });
+
+  it("restores the last active tab after init", async () => {
+    localStorage.setItem("locus-active-tab", "knowledge");
+    const store = useUiStore();
+
+    await store.init();
+
+    expect(store.activeTab).toBe("knowledge");
+    expect(store.knowledgeMounted).toBe(true);
   });
 });

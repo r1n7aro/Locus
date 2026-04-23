@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from "vue";
+import { computed, nextTick, onUnmounted, ref, useSlots, watch } from "vue";
 import type { ChatMessage, ToolCallDisplay, ToolCallInfo, UserIntentMeta } from "../../types";
 import {
   collectPendingContinuationToolItemIds,
@@ -9,9 +9,18 @@ import {
 import {
   buildMessageToolCalls,
   collectToolCallDisplayIds,
-  filterToolCallsByActiveIds,
+  collectToolCallDisplayMatchState,
+  filterToolCallsByMatchState,
+  getToolCallInfoFingerprint,
   mergeSequentialAssistantToolCalls,
+  mergeToolCallDisplaysWithoutDuplicates,
+  mergeToolCallMatchStates,
+  resolveToolCallInfosForRender,
+  summarizeToolCallBatch,
 } from "../../composables/toolCallBatches";
+import type { ToolCallMatchState } from "../../composables/toolCallBatches";
+import { useDisplaySettings } from "../../composables/useDisplaySettings";
+import { logToolCollapseTrace, previewTraceText } from "../../services/toolCollapseTrace";
 import MarkdownRenderer from "../MarkdownRenderer.vue";
 import ToolCallCollection from "../ToolCallCollection.vue";
 import ToolCallBlock from "../ToolCallBlock.vue";
@@ -36,6 +45,24 @@ interface MessageRenderItem {
   displayToolCalls?: ToolCallInfo[];
 }
 
+interface ToolCallHandoffState {
+  renderKey: string;
+  createdAt: number;
+  toolCalls: ToolCallDisplay[];
+  toolCallIds: Set<string>;
+  toolCallMatchState: ToolCallMatchState;
+  willAutoCollapse: boolean;
+  collapseArmed: boolean;
+  collapseFinished: boolean;
+}
+
+interface PromotedHistoryToolCallsState {
+  itemIds: Set<string>;
+  toolCallIds: Set<string>;
+  toolCallMatchState: ToolCallMatchState;
+  toolCalls: ToolCallDisplay[];
+}
+
 const props = withDefaults(defineProps<{
   messages: ChatMessage[];
   streamingText: string;
@@ -58,7 +85,6 @@ const props = withDefaults(defineProps<{
   enableIntentBadges?: boolean;
   showUserImages?: boolean;
   userContentMode?: UserContentMode;
-  pinnedToolMessageId?: string | null;
 }>(), {
   variant: "embedded",
   hasThinking: undefined,
@@ -76,7 +102,6 @@ const props = withDefaults(defineProps<{
   enableIntentBadges: false,
   showUserImages: false,
   userContentMode: "plain",
-  pinnedToolMessageId: null,
 });
 
 const emit = defineEmits<{
@@ -88,10 +113,13 @@ const emit = defineEmits<{
   (e: "contentClick", event: MouseEvent): void;
   (e: "contentMouseover", event: MouseEvent): void;
   (e: "contentMouseout", event: MouseEvent): void;
+  (e: "toolHandoffQuietChange", quiet: boolean): void;
 }>();
 
 const scrollRef = ref<HTMLElement | null>(null);
 const contentRef = ref<HTMLElement | null>(null);
+const { state: displaySettings } = useDisplaySettings();
+const slots = useSlots();
 
 defineExpose({
   getScrollElement: () => scrollRef.value,
@@ -102,6 +130,8 @@ defineExpose({
     element.scrollTop = element.scrollHeight;
   },
 });
+
+const TOOL_HANDOFF_MIN_VISIBLE_MS = 160;
 
 const ASSET_REF_RE = /@((?:[^\s@]+\/)+[^\s@]+)/g;
 
@@ -141,7 +171,7 @@ function buildIntentBadges(
   for (const skill of intent.skills || []) {
     badges.push({
       key: `${skill.source}:${skill.dirName}`,
-      label: `Skill: ${skill.name}`,
+      label: `SKILL: ${skill.name}`,
       kind: "skill",
     });
   }
@@ -180,13 +210,358 @@ const visibleMessages = computed(() =>
   }),
 );
 
-const activeToolCallIds = computed(() => collectToolCallDisplayIds(props.activeToolCalls));
+const toolCallHandoff = ref<ToolCallHandoffState | null>(null);
+const toolCallHandoffQuiet = ref(false);
+let toolCallHandoffSequence = 0;
+let toolCallHandoffArmTimer: ReturnType<typeof setTimeout> | null = null;
+let toolCallHandoffFrameA = 0;
+let toolCallHandoffFrameB = 0;
 
-function messageToolCallsForDisplay(message: Pick<ChatMessage, "toolCalls">) {
-  return filterToolCallsByActiveIds(message.toolCalls, activeToolCallIds.value);
+function requestToolHandoffFrame(callback: () => void): number {
+  if (typeof requestAnimationFrame === "function") {
+    return requestAnimationFrame(() => callback());
+  }
+  if (typeof window !== "undefined") {
+    return window.setTimeout(callback, 16);
+  }
+  return globalThis.setTimeout(callback, 16) as unknown as number;
 }
 
-const groupedMessages = computed<MessageGroup[]>(() => {
+function cancelToolHandoffFrame(handle: number) {
+  if (typeof cancelAnimationFrame === "function") {
+    cancelAnimationFrame(handle);
+    return;
+  }
+  clearTimeout(handle);
+}
+
+function setToolCallHandoffQuiet(quiet: boolean) {
+  if (toolCallHandoffQuiet.value === quiet) return;
+  toolCallHandoffQuiet.value = quiet;
+  emit("toolHandoffQuietChange", quiet);
+}
+
+function clearToolCallHandoffTimers() {
+  if (toolCallHandoffArmTimer) {
+    clearTimeout(toolCallHandoffArmTimer);
+    toolCallHandoffArmTimer = null;
+  }
+  if (toolCallHandoffFrameA) {
+    cancelToolHandoffFrame(toolCallHandoffFrameA);
+    toolCallHandoffFrameA = 0;
+  }
+  if (toolCallHandoffFrameB) {
+    cancelToolHandoffFrame(toolCallHandoffFrameB);
+    toolCallHandoffFrameB = 0;
+  }
+}
+
+function cloneToolCallDisplay(toolCall: ToolCallDisplay): ToolCallDisplay {
+  return {
+    id: toolCall.id,
+    name: toolCall.name,
+    arguments: toolCall.arguments,
+    status: toolCall.status,
+    output: toolCall.output,
+    nestedToolCalls: toolCall.nestedToolCalls?.map((nestedToolCall) => cloneToolCallDisplay(nestedToolCall)),
+  };
+}
+
+function cloneToolCallDisplays(toolCalls: ToolCallDisplay[]) {
+  return toolCalls.map((toolCall) => cloneToolCallDisplay(toolCall));
+}
+
+function traceToolCollapse(event: string, detail?: Record<string, unknown>) {
+  logToolCollapseTrace(`transcript:${props.variant}`, event, detail);
+}
+
+function clearToolCallHandoff(reason = "clear") {
+  const handoff = toolCallHandoff.value;
+  if (handoff) {
+    traceToolCollapse("clearToolCallHandoff", {
+      reason,
+      renderKey: handoff.renderKey,
+      toolCallCount: handoff.toolCalls.length,
+      collapseArmed: handoff.collapseArmed,
+      collapseFinished: handoff.collapseFinished,
+    });
+  }
+  clearToolCallHandoffTimers();
+  toolCallHandoff.value = null;
+  setToolCallHandoffQuiet(false);
+}
+
+const hasVisibleStreamingText = computed(() => props.streamingText.trim().length > 0);
+const shouldArmToolCallHandoffCollapse = computed(
+  () => hasVisibleStreamingText.value || !props.isStreaming,
+);
+
+function scheduleToolCallHandoffCollapse() {
+  const handoff = toolCallHandoff.value;
+  if (!handoff || handoff.collapseArmed) return;
+
+  traceToolCollapse("scheduleToolCallHandoffCollapse", {
+    renderKey: handoff.renderKey,
+    createdAt: handoff.createdAt,
+    toolCallCount: handoff.toolCalls.length,
+    visibleStreamingText: hasVisibleStreamingText.value,
+    streamingTextLen: props.streamingText.length,
+    isStreaming: props.isStreaming,
+  });
+
+  clearToolCallHandoffTimers();
+  const targetRenderKey = handoff.renderKey;
+
+  nextTick(() => {
+    toolCallHandoffFrameA = requestToolHandoffFrame(() => {
+      toolCallHandoffFrameA = 0;
+      toolCallHandoffFrameB = requestToolHandoffFrame(() => {
+        toolCallHandoffFrameB = 0;
+        const current = toolCallHandoff.value;
+        if (!current || current.renderKey !== targetRenderKey) return;
+
+        const remainingDelay = Math.max(
+          TOOL_HANDOFF_MIN_VISIBLE_MS - (Date.now() - current.createdAt),
+          0,
+        );
+        traceToolCollapse("scheduleToolCallHandoffCollapse:armed-delay", {
+          renderKey: current.renderKey,
+          remainingDelay,
+          ageMs: Date.now() - current.createdAt,
+        });
+        toolCallHandoffArmTimer = setTimeout(() => {
+          toolCallHandoffArmTimer = null;
+          const nextHandoff = toolCallHandoff.value;
+          if (!nextHandoff || nextHandoff.renderKey !== targetRenderKey) return;
+
+          if (!transientToolCallsCanCollapse.value) {
+            traceToolCollapse("collapseSkipped", {
+              renderKey: nextHandoff.renderKey,
+              toolCallCount: transientCollapseCandidateToolCalls.value.length,
+              promotableHistoryToolCallCount: promotableHistoryToolCalls.value.toolCalls.length,
+            });
+            clearToolCallHandoff("not-auto-collapsible");
+            return;
+          }
+
+          setToolCallHandoffQuiet(true);
+          traceToolCollapse("collapseArmed", {
+            renderKey: nextHandoff.renderKey,
+            toolCallIds: Array.from(nextHandoff.toolCallIds),
+            collapseCandidateToolCallCount: transientCollapseCandidateToolCalls.value.length,
+            promotableHistoryToolCallCount: promotableHistoryToolCalls.value.toolCalls.length,
+            streamingTextLen: props.streamingText.length,
+            isStreaming: props.isStreaming,
+          });
+          toolCallHandoff.value = {
+            ...nextHandoff,
+            collapseArmed: true,
+            collapseFinished: false,
+          };
+        }, remainingDelay);
+      });
+    });
+  });
+}
+
+function beginToolCallHandoff(previousToolCalls: ToolCallDisplay[]) {
+  const toolCalls = previousToolCalls.map((toolCall) => cloneToolCallDisplay(toolCall));
+  if (toolCalls.length === 0) {
+    clearToolCallHandoff("begin-empty");
+    return;
+  }
+
+  clearToolCallHandoffTimers();
+  setToolCallHandoffQuiet(false);
+  toolCallHandoff.value = {
+    renderKey: `tool-handoff-${++toolCallHandoffSequence}:${toolCalls.map((toolCall) => toolCall.id).join(",")}`,
+    createdAt: Date.now(),
+    toolCalls,
+    toolCallIds: collectToolCallDisplayIds(toolCalls),
+    toolCallMatchState: collectToolCallDisplayMatchState(toolCalls),
+    willAutoCollapse: summarizeToolCallBatch(toolCalls, displaySettings.compactToolCalls).canCollapse,
+    collapseArmed: false,
+    collapseFinished: false,
+  };
+
+  traceToolCollapse("beginToolCallHandoff", {
+    renderKey: toolCallHandoff.value.renderKey,
+    toolCallCount: toolCalls.length,
+    toolCallIds: Array.from(toolCallHandoff.value.toolCallIds),
+    willAutoCollapse: toolCallHandoff.value.willAutoCollapse,
+    streamingTextLen: props.streamingText.length,
+    isStreaming: props.isStreaming,
+  });
+
+  if (shouldArmToolCallHandoffCollapse.value) {
+    scheduleToolCallHandoffCollapse();
+  }
+}
+
+function toolCallTreeHasAnyIds(
+  toolCalls: ToolCallInfo[] | undefined,
+  targetMatchState: ToolCallMatchState,
+): boolean {
+  if (
+    !toolCalls
+    || toolCalls.length === 0
+    || (targetMatchState.ids.size === 0 && targetMatchState.fingerprintCounts.size === 0)
+  ) {
+    return false;
+  }
+  return toolCalls.some((toolCall) =>
+    targetMatchState.ids.has(toolCall.id)
+    || targetMatchState.fingerprintCounts.has(getToolCallInfoFingerprint(toolCall))
+    || toolCallTreeHasAnyIds(toolCall.nestedToolCalls, targetMatchState),
+  );
+}
+
+watch(
+  () => props.activeToolCalls,
+  (activeToolCalls, previousToolCalls) => {
+    if (activeToolCalls.length === 0 && previousToolCalls && previousToolCalls.length > 0) {
+      traceToolCollapse("activeToolCallsCleared", {
+        previousCount: previousToolCalls.length,
+        previousIds: previousToolCalls.map((toolCall) => toolCall.id),
+        streamingTextLen: props.streamingText.length,
+        isStreaming: props.isStreaming,
+      });
+      beginToolCallHandoff(previousToolCalls);
+    }
+  },
+  { flush: "sync" },
+);
+
+watch(
+  () => props.activeToolCalls.length,
+  (activeToolCallCount) => {
+    if (activeToolCallCount > 0 && toolCallHandoff.value) {
+      clearToolCallHandoff("active-tool-calls-resumed");
+    }
+  },
+  { flush: "sync" },
+);
+
+let lastShouldArmToolCallHandoffCollapse = shouldArmToolCallHandoffCollapse.value;
+
+watch(shouldArmToolCallHandoffCollapse, (shouldArm) => {
+  traceToolCollapse("shouldArmToolCallHandoffCollapseChanged", {
+    previous: lastShouldArmToolCallHandoffCollapse,
+    next: shouldArm,
+    hasVisibleStreamingText: hasVisibleStreamingText.value,
+    streamingTextLen: props.streamingText.length,
+    isStreaming: props.isStreaming,
+    hasHandoff: !!toolCallHandoff.value,
+  });
+  lastShouldArmToolCallHandoffCollapse = shouldArm;
+  if (shouldArm && toolCallHandoff.value) {
+    scheduleToolCallHandoffCollapse();
+  }
+});
+
+watch(
+  () => props.messages,
+  (messages, previous) => {
+    if (messages === previous || !toolCallHandoff.value) return;
+    if (messages.some((message) => toolCallTreeHasAnyIds(message.toolCalls, toolCallHandoff.value!.toolCallMatchState))) {
+      return;
+    }
+    clearToolCallHandoff("handoff-ids-missing-from-messages");
+  },
+  { flush: "sync" },
+);
+
+watch(hasVisibleStreamingText, (visible, previousVisible) => {
+  traceToolCollapse("hasVisibleStreamingTextChanged", {
+    previous: previousVisible,
+    next: visible,
+    streamingTextLen: props.streamingText.length,
+    streamingTextPreview: props.streamingText ? previewTraceText(props.streamingText, 64) : "",
+    isStreaming: props.isStreaming,
+  });
+});
+
+watch(
+  () => props.isStreaming,
+  (isStreaming, previousStreaming) => {
+    const handoff = toolCallHandoff.value;
+    traceToolCollapse("isStreamingChanged", {
+      previous: previousStreaming,
+      next: isStreaming,
+      hasHandoff: !!handoff,
+      collapseArmed: handoff?.collapseArmed ?? false,
+      collapseFinished: handoff?.collapseFinished ?? false,
+    });
+    if (isStreaming || !handoff?.collapseFinished) return;
+    clearToolCallHandoff("stream-ended-after-collapse");
+  },
+  { flush: "sync" },
+);
+
+onUnmounted(() => {
+  clearToolCallHandoff("unmount");
+});
+
+const activeToolCallMatchState = computed<ToolCallMatchState>(() => {
+  if (props.activeToolCalls.length > 0) {
+    return collectToolCallDisplayMatchState(props.activeToolCalls);
+  }
+  return toolCallHandoff.value?.toolCallMatchState ?? {
+    ids: new Set<string>(),
+    fingerprintCounts: new Map<string, number>(),
+  };
+});
+
+function messageToolCallsForDisplay(
+  message: Pick<ChatMessage, "toolCalls">,
+  hiddenToolCallMatchState: ToolCallMatchState,
+) {
+  return filterToolCallsByMatchState(message.toolCalls, hiddenToolCallMatchState);
+}
+
+function toolCallsForRenderItem(item: Pick<MessageRenderItem, "message" | "displayToolCalls">) {
+  return buildMessageToolCalls(
+    {
+      toolCalls: resolveToolCallInfosForRender({
+        messageToolCalls: item.message.toolCalls,
+        displayToolCalls: item.displayToolCalls,
+      }),
+    },
+    toolOutputMap.value,
+  );
+}
+
+function shouldRenderItem(item: MessageRenderItem) {
+  if (item.message.knowledgeProposal) return true;
+
+  if (item.message.role === "user") {
+    return !!(
+      item.message.content
+      || (props.showUserImages && item.message.images && item.message.images.length > 0)
+      || (props.enableIntentBadges && messageIntentBadges(item.message).length > 0)
+    );
+  }
+
+  return !!(
+    item.message.content
+    || item.message.thinkingContent
+    || toolCallsForRenderItem(item).length > 0
+    || item.attachedKnowledgeProposals.length > 0
+  );
+}
+
+function isToolOnlyRenderItem(item: MessageRenderItem) {
+  if (item.message.role !== "assistant" || item.message.knowledgeProposal) return false;
+
+  const hasContent = item.message.content.trim().length > 0;
+  const hasThinking = !!item.message.thinkingContent?.trim();
+  const hasAttachedKnowledgeProposals = item.attachedKnowledgeProposals.length > 0;
+  const hasToolCalls = toolCallsForRenderItem(item).length > 0;
+
+  return !hasContent && !hasThinking && !hasAttachedKnowledgeProposals && hasToolCalls;
+}
+
+function buildGroupedMessages(hiddenToolCallMatchState: ToolCallMatchState): MessageGroup[] {
   const groups: MessageGroup[] = [];
   const flatItems: MessageRenderItem[] = [];
   let order = 0;
@@ -239,7 +614,7 @@ const groupedMessages = computed<MessageGroup[]>(() => {
                   ...item,
                   content: item.message.content,
                   thinkingContent: item.message.thinkingContent,
-                  toolCalls: messageToolCallsForDisplay(item.message),
+                  toolCalls: messageToolCallsForDisplay(item.message, hiddenToolCallMatchState),
                   attachedKnowledgeProposalCount: item.attachedKnowledgeProposals.length,
                   isKnowledgeProposal: !!item.message.knowledgeProposal,
                 })),
@@ -260,10 +635,143 @@ const groupedMessages = computed<MessageGroup[]>(() => {
       items: group.items.filter((item) => shouldRenderItem(item)),
     }))
     .filter((group) => group.items.length > 0);
+}
+
+const baseGroupedMessages = computed<MessageGroup[]>(() => buildGroupedMessages(activeToolCallMatchState.value));
+
+function emptyPromotedHistoryToolCalls(): PromotedHistoryToolCallsState {
+  return {
+    itemIds: new Set<string>(),
+    toolCallIds: new Set<string>(),
+    toolCallMatchState: {
+      ids: new Set<string>(),
+      fingerprintCounts: new Map<string, number>(),
+    },
+    toolCalls: [],
+  };
+}
+
+const promotableHistoryToolCalls = computed<PromotedHistoryToolCallsState>(() => {
+  if (!toolCallHandoff.value) return emptyPromotedHistoryToolCalls();
+
+  const lastGroup = baseGroupedMessages.value[baseGroupedMessages.value.length - 1];
+  if (!lastGroup || lastGroup.role !== "assistant") {
+    return emptyPromotedHistoryToolCalls();
+  }
+
+  const collectedItemIds = new Set<string>();
+  const collectedBatches: ToolCallDisplay[][] = [];
+
+  for (let index = lastGroup.items.length - 1; index >= 0; index -= 1) {
+    const item = lastGroup.items[index];
+    if (!item || !isToolOnlyRenderItem(item)) break;
+    const itemToolCalls = toolCallsForRenderItem(item);
+    if (itemToolCalls.length === 0) break;
+    collectedItemIds.add(item.id);
+    collectedBatches.unshift(cloneToolCallDisplays(itemToolCalls));
+  }
+
+  if (collectedBatches.length === 0) return emptyPromotedHistoryToolCalls();
+
+  const toolCalls = collectedBatches.flat();
+  return {
+    itemIds: collectedItemIds,
+    toolCallIds: collectToolCallDisplayIds(toolCalls),
+    toolCallMatchState: collectToolCallDisplayMatchState(toolCalls),
+    toolCalls,
+  };
 });
 
+const transientOwnedToolCalls = computed(() =>
+  props.activeToolCalls.length > 0
+    ? props.activeToolCalls
+    : (toolCallHandoff.value?.toolCalls ?? []),
+);
+
+const transientCollapseCandidateToolCalls = computed(() => {
+  if (!toolCallHandoff.value || promotableHistoryToolCalls.value.toolCalls.length === 0) {
+    return transientOwnedToolCalls.value;
+  }
+  return mergeToolCallDisplaysWithoutDuplicates(
+    promotableHistoryToolCalls.value.toolCalls,
+    transientOwnedToolCalls.value,
+  );
+});
+
+const transientToolCallsCanCollapse = computed(() =>
+  summarizeToolCallBatch(transientCollapseCandidateToolCalls.value, displaySettings.compactToolCalls).canCollapse,
+);
+
+const historyHiddenToolCallMatchState = computed<ToolCallMatchState>(() => {
+  if (!toolCallHandoff.value?.collapseArmed) {
+    return activeToolCallMatchState.value;
+  }
+  return mergeToolCallMatchStates(
+    activeToolCallMatchState.value,
+    promotableHistoryToolCalls.value.toolCallMatchState,
+  );
+});
+
+const groupedMessages = computed<MessageGroup[]>(() => buildGroupedMessages(historyHiddenToolCallMatchState.value));
+
+const transientToolCalls = computed(() => {
+  if (!toolCallHandoff.value?.collapseArmed || promotableHistoryToolCalls.value.toolCalls.length === 0) {
+    return transientOwnedToolCalls.value;
+  }
+  return transientCollapseCandidateToolCalls.value;
+});
+
+const transientToolCallsAllowCollapse = computed(
+  () => !!toolCallHandoff.value && transientToolCallsCanCollapse.value,
+);
+const transientToolCallsCollapseEnabled = computed(
+  () => !!toolCallHandoff.value?.collapseArmed && transientToolCallsCanCollapse.value,
+);
+
+watch(promotableHistoryToolCalls, (nextState, previousState) => {
+  traceToolCollapse("promotableHistoryToolCallsChanged", {
+    previousItemCount: previousState?.itemIds.size ?? 0,
+    nextItemCount: nextState.itemIds.size,
+    nextToolCallCount: nextState.toolCalls.length,
+    nextToolCallIds: Array.from(nextState.toolCallIds),
+    hasHandoff: !!toolCallHandoff.value,
+  });
+});
+
+watch(transientToolCallsCollapseEnabled, (enabled, previousEnabled) => {
+  traceToolCollapse("transientToolCallsCollapseEnabledChanged", {
+    previous: previousEnabled,
+    next: enabled,
+    transientToolCallCount: transientToolCalls.value.length,
+    hasHandoff: !!toolCallHandoff.value,
+  });
+});
+
+function onTransientToolCallsCollapseFinished() {
+  if (!toolCallHandoff.value?.collapseArmed) return;
+  traceToolCollapse("onTransientToolCallsCollapseFinished", {
+    renderKey: toolCallHandoff.value.renderKey,
+    toolCallCount: transientToolCalls.value.length,
+    isStreaming: props.isStreaming,
+  });
+  setToolCallHandoffQuiet(false);
+
+  if (!toolCallHandoff.value.collapseFinished) {
+    toolCallHandoff.value = {
+      ...toolCallHandoff.value,
+      collapseFinished: true,
+    };
+  }
+
+  if (!props.isStreaming) {
+    clearToolCallHandoff("collapse-finished-after-stream-end");
+  }
+}
+
 const hasThinkingContent = computed(() => props.hasThinking ?? !!props.thinkingText);
-const hasStreamingContent = computed(() => !!props.streamingText || props.activeToolCalls.length > 0);
+const hasLiveToolCalls = computed(() => props.activeToolCalls.length > 0);
+const hasToolCallHandoff = computed(() => transientToolCalls.value.length > 0 && !hasLiveToolCalls.value);
+const hasStreamingContent = computed(() => hasVisibleStreamingText.value || hasLiveToolCalls.value);
 const isWaitingForResponse = computed(
   () => shouldShowWaitingPlaceholder({
     isStreaming: props.isStreaming,
@@ -273,7 +781,12 @@ const isWaitingForResponse = computed(
   }),
 );
 const hasTransientAssistantMessage = computed(
-  () => hasStreamingContent.value || props.isThinking || hasThinkingContent.value || isWaitingForResponse.value,
+  () =>
+    hasStreamingContent.value
+    || hasToolCallHandoff.value
+    || props.isThinking
+    || hasThinkingContent.value
+    || isWaitingForResponse.value,
 );
 
 const isStreamingContinuation = computed(() => {
@@ -285,7 +798,11 @@ const isStreamingContinuation = computed(() => {
 });
 
 const pendingContinuationToolItemIds = computed(() => {
-  const groups = groupedMessages.value;
+  if (toolCallHandoff.value?.collapseArmed) {
+    return new Set<string>();
+  }
+
+  const groups = baseGroupedMessages.value;
   const lastGroup = groups[groups.length - 1];
 
   return collectPendingContinuationToolItemIds({
@@ -304,14 +821,12 @@ const pendingContinuationToolItemIds = computed(() => {
 });
 
 const nonCollapsibleToolItemIds = computed(() => {
-  const ids = new Set(pendingContinuationToolItemIds.value);
-  if (props.pinnedToolMessageId) {
-    ids.add(props.pinnedToolMessageId);
-  }
-  return ids;
+  return new Set(pendingContinuationToolItemIds.value);
 });
 
-const collapseCompletedToolCalls = computed(() => !props.isStreaming);
+function shouldKeepToolItemExpanded(itemId: string) {
+  return nonCollapsibleToolItemIds.value.has(itemId);
+}
 
 function formatThoughtSummary(duration?: number) {
   if (duration && duration > 0) {
@@ -328,30 +843,25 @@ function messageGroupLabel(group: MessageGroup) {
       : props.assistantLabel;
 }
 
-function toolCallsForRenderItem(item: Pick<MessageRenderItem, "message" | "displayToolCalls">) {
-  return buildMessageToolCalls(
-    { toolCalls: item.displayToolCalls ?? messageToolCallsForDisplay(item.message) },
-    toolOutputMap.value,
-  );
+function shouldRightAlignUserMessageGroup(group: Pick<MessageGroup, "role">) {
+  return props.variant === "session" && displaySettings.rightAlignUserMessages && group.role === "user";
 }
 
-function shouldRenderItem(item: MessageRenderItem) {
-  if (item.message.knowledgeProposal) return true;
+function shouldShowSessionRoundDivider(group: Pick<MessageGroup, "role">, index: number) {
+  return props.variant === "session" && group.role === "user" && index > 0;
+}
 
-  if (item.message.role === "user") {
-    return !!(
-      item.message.content
-      || (props.showUserImages && item.message.images && item.message.images.length > 0)
-      || (props.enableIntentBadges && messageIntentBadges(item.message).length > 0)
-    );
-  }
+const hasFooterSlot = computed(() => !!slots.footer);
+const showSessionFooter = computed(
+  () =>
+    props.variant === "session"
+    && hasFooterSlot.value
+    && (groupedMessages.value.length > 0 || hasTransientAssistantMessage.value),
+);
 
-  return !!(
-    item.message.content
-    || item.message.thinkingContent
-    || toolCallsForRenderItem(item).length > 0
-    || item.attachedKnowledgeProposals.length > 0
-  );
+function shouldTightenToolOnlyGap(items: MessageRenderItem[], index: number) {
+  if (index <= 0) return false;
+  return isToolOnlyRenderItem(items[index - 1]!) && isToolOnlyRenderItem(items[index]!);
 }
 
 function imageDataUrl(message: ChatMessage, index: number) {
@@ -412,8 +922,10 @@ function openImage(src: string) {
             `is-${variant}`,
             group.role,
             {
+              'has-round-divider': shouldShowSessionRoundDivider(group, idx),
               'before-continuation': isStreamingContinuation && idx === groupedMessages.length - 1,
               'compact-handoff': group.items.some((item) => isCompactHandoffMessage(item.message)),
+              'user-align-right': shouldRightAlignUserMessageGroup(group),
             },
           ]"
         >
@@ -423,11 +935,17 @@ function openImage(src: string) {
 
           <div class="chat-transcript-message-content" :class="`is-${variant}`">
             <div
-              v-for="item in group.items"
+              v-for="(item, itemIdx) in group.items"
               v-show="shouldRenderItem(item)"
               :key="item.id"
               class="chat-transcript-item-stack"
-              :class="`is-${variant}`"
+              :class="[
+                `is-${variant}`,
+                {
+                  'tool-only': isToolOnlyRenderItem(item),
+                  'tool-only-followup': shouldTightenToolOnlyGap(group.items, itemIdx),
+                },
+              ]"
               :data-scroll-anchor-id="item.id"
             >
               <template v-if="item.message.role === 'user'">
@@ -505,11 +1023,14 @@ function openImage(src: string) {
                   <div v-if="toolCallsForRenderItem(item).length > 0" class="chat-transcript-tool-calls-group">
                     <ToolCallCollection
                       :tool-calls="toolCallsForRenderItem(item)"
-                      :allow-collapse="!nonCollapsibleToolItemIds.has(item.id)"
-                      :collapse-enabled="collapseCompletedToolCalls"
+                      :allow-collapse="!shouldKeepToolItemExpanded(item.id)"
+                      :collapse-enabled="!shouldKeepToolItemExpanded(item.id)"
                     >
                       <template #default="{ toolCall }">
-                        <ToolCallBlock :tool-call="toolCall" :collapse-enabled="collapseCompletedToolCalls" />
+                        <ToolCallBlock
+                          :tool-call="toolCall"
+                          :collapse-enabled="!shouldKeepToolItemExpanded(item.id)"
+                        />
                       </template>
                     </ToolCallCollection>
                   </div>
@@ -554,13 +1075,6 @@ function openImage(src: string) {
           </div>
 
           <div class="chat-transcript-message-content" :class="`is-${variant}`">
-            <div v-if="isWaitingForResponse" class="chat-transcript-thinking-block">
-              <div class="chat-transcript-thinking-header active">
-                <span class="chat-transcript-thinking-spinner" />
-                <span class="chat-transcript-thinking-title">{{ waitingLabel }}</span>
-              </div>
-            </div>
-
             <div v-if="isThinking || hasThinkingContent" class="chat-transcript-thinking-block">
               <button
                 v-if="variant === 'session'"
@@ -589,12 +1103,24 @@ function openImage(src: string) {
               </div>
             </div>
 
-            <div v-if="activeToolCalls.length > 0" class="chat-transcript-tool-calls-group">
-              <ToolCallCollection :tool-calls="activeToolCalls" :allow-collapse="false" :collapse-enabled="false">
+            <div v-if="transientToolCalls.length > 0" class="chat-transcript-tool-calls-group">
+              <ToolCallCollection
+                :tool-calls="transientToolCalls"
+                :allow-collapse="transientToolCallsAllowCollapse"
+                :collapse-enabled="transientToolCallsCollapseEnabled"
+                @collapse-finished="onTransientToolCallsCollapseFinished"
+              >
                 <template #default="{ toolCall }">
-                  <ToolCallBlock :tool-call="toolCall" :collapse-enabled="false" />
+                  <ToolCallBlock :tool-call="toolCall" :collapse-enabled="transientToolCallsCollapseEnabled" />
                 </template>
               </ToolCallCollection>
+            </div>
+
+            <div v-if="isWaitingForResponse" class="chat-transcript-thinking-block">
+              <div class="chat-transcript-thinking-header active">
+                <span class="chat-transcript-thinking-spinner" />
+                <span class="chat-transcript-thinking-title">{{ waitingLabel }}</span>
+              </div>
             </div>
 
             <MarkdownRenderer
@@ -604,6 +1130,14 @@ function openImage(src: string) {
               enable-file-refs
             />
           </div>
+        </div>
+
+        <div
+          v-if="showSessionFooter"
+          class="chat-transcript-footer"
+          :class="`is-${variant}`"
+        >
+          <slot name="footer" />
         </div>
       </template>
     </div>
@@ -678,7 +1212,6 @@ function openImage(src: string) {
 
 .chat-transcript-message.is-session.assistant {
   background: var(--msg-assistant-bg);
-  border-top: 1px solid var(--msg-divider);
 }
 
 .chat-transcript-message.is-session.assistant.transient.continuation {
@@ -686,9 +1219,11 @@ function openImage(src: string) {
 }
 
 .chat-transcript-message.is-session.user {
-  background: var(--msg-user-bg);
-  border-top: 1px solid var(--msg-divider);
-  border-bottom: 1px solid var(--msg-divider);
+  background: var(--msg-assistant-bg);
+}
+
+.chat-transcript-message.is-session.has-round-divider {
+  border-top: 2px solid var(--msg-divider);
 }
 
 .chat-transcript-message.is-session.assistant.transient.waiting-placeholder {
@@ -741,6 +1276,14 @@ function openImage(src: string) {
   border-top: none;
 }
 
+.chat-transcript-footer.is-session {
+  display: flex;
+  justify-content: flex-start;
+  align-items: center;
+  padding: 10px 48px 12px;
+  background: var(--msg-assistant-bg);
+}
+
 .chat-transcript-message-role {
   color: var(--text-secondary);
   text-transform: uppercase;
@@ -761,6 +1304,10 @@ function openImage(src: string) {
   color: var(--msg-user-role);
 }
 
+.chat-transcript-message.is-session.user.user-align-right .chat-transcript-message-role.is-session {
+  text-align: right;
+}
+
 .chat-transcript-message-role.is-embedded {
   margin-bottom: 5px;
   font-size: 11px;
@@ -775,6 +1322,10 @@ function openImage(src: string) {
   min-width: 0;
   font-size: 14px;
   line-height: 1.6;
+}
+
+.chat-transcript-message.is-session.user.user-align-right .chat-transcript-message-content.is-session {
+  align-items: flex-end;
 }
 
 .chat-transcript-message-content.is-embedded {
@@ -797,8 +1348,22 @@ function openImage(src: string) {
   gap: 10px;
 }
 
+.chat-transcript-message.is-session.user.user-align-right .chat-transcript-item-stack.is-session {
+  width: fit-content;
+  max-width: min(100%, 78ch);
+  align-items: flex-end;
+}
+
 .chat-transcript-item-stack.is-embedded {
   gap: 9px;
+}
+
+.chat-transcript-item-stack.is-session.tool-only-followup {
+  margin-top: -8px;
+}
+
+.chat-transcript-item-stack.is-embedded.tool-only-followup {
+  margin-top: -6px;
 }
 
 .chat-transcript-intent-row {
@@ -833,6 +1398,20 @@ function openImage(src: string) {
 .chat-transcript-plain-text {
   white-space: pre-wrap;
   word-break: break-word;
+}
+
+.chat-transcript-message.is-session.user .chat-transcript-plain-text {
+  align-self: flex-start;
+  width: fit-content;
+  max-width: min(100%, 78ch);
+  padding: 6px 12px;
+  border-radius: 8px;
+  background: var(--msg-user-bg);
+}
+
+.chat-transcript-message.is-session.user.user-align-right .chat-transcript-plain-text {
+  align-self: flex-end;
+  text-align: left;
 }
 
 .chat-transcript-user-images {
