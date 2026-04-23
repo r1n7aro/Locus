@@ -1,29 +1,34 @@
 {
-  "version": "0.1.0",
+  "version": "0.1.1",
   "releasedAt": "2026-04-23",
   "channel": "stable",
   "locales": {
     "zh": {
       "title": "发现新版本",
-      "summary": "Locus v0.1.0 (2026-04-23)",
+      "summary": "Locus v0.1.1 (2026-04-23)",
       "changelogUrl": "/overview/latest-version",
       "changes": [
         {
           "title": "新增",
           "items": [
-            "测试功能"
+            "支持检查新版本，发现更新后会在应用内直接显示更新说明和入口。",
+            "新增后台通知，可在聊天完成、需要输入、需要确认或运行失败时接收提醒。",
+            "知识库目录发生变化后，会自动刷新受影响的文档和目录。",
+            "Unity 插件默认安装到 `Packages/com.farlocus.locus`，并支持从旧目录自动迁移。"
           ]
         },
         {
           "title": "修复",
           "items": [
-            "测试修复"
+            "优化版本比较和发布信息校验，应用版本、更新信息和发布文档会保持一致。",
+            "调整会话里的 Todo 和消息展示，当前轮次的任务范围更清楚，工具调用顺序更稳定。",
+            "更新中英文文档和安装说明，插件路径与当前产品能力保持一致。"
           ]
         },
         {
           "title": "删除",
           "items": [
-            "测试删除"
+            "旧版 Unity 插件安装路径 `Assets/Locus` 和 `Assets/Plugins/Locus` 退出默认安装流程。"
           ]
         }
       ],
@@ -36,25 +41,30 @@
     },
     "en": {
       "title": "Update available",
-      "summary": "Locus v0.1.0 (2026-04-23)",
+      "summary": "Locus v0.1.1 (2026-04-23)",
       "changelogUrl": "/en/overview/latest-version",
       "changes": [
         {
           "title": "Added",
           "items": [
-            "Test feature"
+            "Added update checks in the app, with release notes and an update entry shown directly when a newer version is available.",
+            "Added background notifications for completed chats, input requests, approvals, and failed runs.",
+            "Knowledge documents and directories now refresh automatically after files change on disk.",
+            "The Unity plugin now installs to `Packages/com.farlocus.locus` by default and can migrate existing installs from the old locations."
           ]
         },
         {
           "title": "Fixed",
           "items": [
-            "Test fix"
+            "Improved version comparison and release metadata validation so the app version, update manifest, and release notes stay aligned.",
+            "Refined session TODO and transcript behavior so the current run scope is clearer and tool calls render in a more stable order.",
+            "Updated the Chinese and English docs and install guide to match the current plugin path and product behavior."
           ]
         },
         {
           "title": "Removed",
           "items": [
-            "Test removal"
+            "Removed the old default Unity plugin install flow for `Assets/Locus` and `Assets/Plugins/Locus`."
           ]
         }
       ],

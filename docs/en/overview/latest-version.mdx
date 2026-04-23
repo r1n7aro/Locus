@@ -1,8 +1,8 @@
 ---
 title: "Latest Version"
-description: "Locus v0.1.0 (2026-04-23)"
+description: "Locus v0.1.1 (2026-04-23)"
 sidebarTitle: "Latest Version"
-version: "0.1.0"
+version: "0.1.1"
 releasedAt: "2026-04-23"
 channel: "stable"
 updateTitle: "Update available"
@@ -17,12 +17,17 @@ changelogUrl: "/en/overview/latest-version"
 
 ### Added
 
-- Test feature
+- Added update checks in the app, with release notes and an update entry shown directly when a newer version is available.
+- Added background notifications for completed chats, input requests, approvals, and failed runs.
+- Knowledge documents and directories now refresh automatically after files change on disk.
+- The Unity plugin now installs to `Packages/com.farlocus.locus` by default and can migrate existing installs from the old locations.
 
 ### Fixed
 
-- Test fix
+- Improved version comparison and release metadata validation so the app version, update manifest, and release notes stay aligned.
+- Refined session TODO and transcript behavior so the current run scope is clearer and tool calls render in a more stable order.
+- Updated the Chinese and English docs and install guide to match the current plugin path and product behavior.
 
 ### Removed
 
-- Test removal
+- Removed the old default Unity plugin install flow for `Assets/Locus` and `Assets/Plugins/Locus`.

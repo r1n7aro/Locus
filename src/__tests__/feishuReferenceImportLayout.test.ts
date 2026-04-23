@@ -5,7 +5,7 @@ import { describe, expect, it } from "vitest";
 const cwd = process.cwd();
 
 function read(relPath: string) {
-  return readFileSync(resolve(cwd, relPath), "utf8");
+  return readFileSync(resolve(cwd, relPath), "utf8").replace(/\r\n/g, "\n");
 }
 
 describe("FeishuReferenceImportProgressWindow layout", () => {

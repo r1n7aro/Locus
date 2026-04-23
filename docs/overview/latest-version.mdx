@@ -1,8 +1,8 @@
 ---
 title: "当前版本"
-description: "Locus v0.1.0 (2026-04-23)"
+description: "Locus v0.1.1 (2026-04-23)"
 sidebarTitle: "当前版本"
-version: "0.1.0"
+version: "0.1.1"
 releasedAt: "2026-04-23"
 channel: "stable"
 updateTitle: "发现新版本"
@@ -17,12 +17,17 @@ changelogUrl: "/overview/latest-version"
 
 ### 新增
 
-- 测试功能 
+- 支持检查新版本，发现更新后会在应用内直接显示更新说明和入口。
+- 新增后台通知，可在聊天完成、需要输入、需要确认或运行失败时接收提醒。
+- 知识库目录发生变化后，会自动刷新受影响的文档和目录。
+- Unity 插件默认安装到 `Packages/com.farlocus.locus`，并支持从旧目录自动迁移。
 
 ### 修复
 
-- 测试修复
+- 优化版本比较和发布信息校验，应用版本、更新信息和发布文档会保持一致。
+- 调整会话里的 Todo 和消息展示，当前轮次的任务范围更清楚，工具调用顺序更稳定。
+- 更新中英文文档和安装说明，插件路径与当前产品能力保持一致。
 
 ### 删除
 
-- 测试删除
+- 旧版 Unity 插件安装路径 `Assets/Locus` 和 `Assets/Plugins/Locus` 退出默认安装流程。
