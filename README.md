@@ -68,3 +68,7 @@ See [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES) for root-level third-party notice
 For Roslyn and related .NET dependency license and distribution notes inside `locus_unity/Editor/Roslyn`, see [locus_unity/Editor/Roslyn/THIRD_PARTY.md](locus_unity/Editor/Roslyn/THIRD_PARTY.md).
 
 Published installers include the root license file, the root third-party notices, the generated `licenses/third_party/` bundle, and the Roslyn notices under `locus_unity/`.
+
+## Disclaimer
+
+This project is a free and open-source tool for the Unity Editor, and is not affiliated with Unity Technologies.

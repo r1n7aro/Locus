@@ -68,3 +68,7 @@ bun tauri build
 `locus_unity/Editor/Roslyn` 中 Roslyn 与相关 .NET 依赖的许可证和分发说明见 [locus_unity/Editor/Roslyn/THIRD_PARTY.md](locus_unity/Editor/Roslyn/THIRD_PARTY.md)。
 
 发布安装包时会同时携带根级许可证文件、根级第三方说明、生成的 `licenses/third_party/` bundle 与 `locus_unity/` 目录中的 Roslyn notices。
+
+## 免责声明
+
+本项目是一个面向 Unity Editor 的免费开源工具，与 Unity Technologies 无关联。
