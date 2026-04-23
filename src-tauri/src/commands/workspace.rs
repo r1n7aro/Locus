@@ -13,6 +13,7 @@ use crate::keychain;
 use crate::unity_bridge::UnityMonitorHandle;
 use crate::workspace::Workspace;
 use crate::AssetDbWatcherHandle;
+use crate::KnowledgeFsWatcherHandle;
 
 /// Returns a stable app config directory inside the OS config root.
 /// On Windows this resolves under `%APPDATA%\\locus`, which keeps model config
@@ -51,12 +52,14 @@ pub async fn set_working_dir(
     unity_monitor: State<'_, UnityMonitorHandle>,
     ref_graph_state: State<'_, AssetDbState>,
     watcher_handle: State<'_, AssetDbWatcherHandle>,
+    knowledge_watcher_handle: State<'_, KnowledgeFsWatcherHandle>,
     last_scan_info: State<'_, LastScanInfoState>,
     scan_phase_state: State<'_, ScanPhaseState>,
     preview_cache: State<'_, WorkspacePreviewCache>,
     dir_entries_cache: State<'_, DirEntriesPageCache>,
     watcher_tuning: State<'_, crate::asset_db::watcher::WatcherTuningState>,
     knowledge_index_state: State<'_, Arc<crate::knowledge_index::KnowledgeIndexState>>,
+    app_knowledge_dir: State<'_, crate::commands::AppKnowledgeDir>,
     app_handle: AppHandle,
 ) -> Result<String, AppError> {
     let path = path.trim().to_string();
@@ -149,6 +152,39 @@ pub async fn set_working_dir(
                 eprintln!("[Locus] knowledge reconcile error: {}", e);
             }
         });
+    }
+
+    if is_real_switch {
+        if let Err(error) = crate::knowledge_store::ensure_knowledge_roots(&canonical) {
+            eprintln!(
+                "[Locus] warning: failed to prepare knowledge roots for new working dir: {}",
+                error
+            );
+        }
+        let mut knowledge_watcher = knowledge_watcher_handle
+            .lock()
+            .map_err(|e| format!("Lock error: {}", e))?;
+        if let Some(old) = knowledge_watcher.take() {
+            old.stop();
+            eprintln!("[Locus] stopped knowledge watcher (working dir changed)");
+        }
+        match crate::knowledge_watcher::KnowledgeFsWatcher::start(
+            app_handle.clone(),
+            canonical.clone(),
+            app_knowledge_dir.0.as_ref().as_ref().cloned(),
+            knowledge_index_state.inner().clone(),
+        ) {
+            Ok(watcher) => {
+                *knowledge_watcher = Some(watcher);
+                eprintln!("[Locus] knowledge watcher started for new working dir");
+            }
+            Err(error) => {
+                eprintln!(
+                    "[Locus] warning: failed to start knowledge watcher: {}",
+                    error
+                );
+            }
+        }
     }
 
     {

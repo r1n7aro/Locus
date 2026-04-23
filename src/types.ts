@@ -304,6 +304,12 @@ export type StreamEvent = { runId: string } & (
       toolCalls: ToolCallInfo[];
     }
   | { type: "knowledgeProposal"; sessionId: string; message: ChatMessage }
+  docType?: "design" | "memory" | "skill" | "reference";
+  path?: string | null;
+  parentPath?: string | null;
+  targetKind?: "document" | "directory" | "type" | "workspace";
+  changeKind?: "content" | "structure" | "config";
+  subtree?: boolean;
   | {
       type: "usageUpdate";
       sessionId: string;

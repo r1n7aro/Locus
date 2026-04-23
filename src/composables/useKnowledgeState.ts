@@ -23,6 +23,7 @@ import {
   knowledgeInspectLocalEmbeddingModelDirectory,
   knowledgeEdit,
   knowledgeList,
+  knowledgeListDirectoryDocuments,
   knowledgeListDirectoryDocumentsPage,
   knowledgeListExternalReferenceDirectories,
   knowledgeListUnityManagedDirectoryStats,
@@ -520,6 +521,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
 
   let searchTimer: ReturnType<typeof setTimeout> | null = null;
   let externalRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+  let pendingExternalChanges: KnowledgeChangedEvent[] = [];
   let retrievalStatusPollTimer: ReturnType<typeof setTimeout> | null = null;
   let feishuReferenceStatusPollTimer: ReturnType<typeof setTimeout> | null =
     null;
@@ -931,6 +933,79 @@ export function useKnowledgeState(props: KnowledgeProps) {
     documents.value = Array.from(merged.values());
   }
 
+  function isDocumentInDirectory(
+    document: KnowledgeDocumentSummary,
+    directoryPath: string,
+  ): boolean {
+    const documentParent = parentDirectoryPath(document.path) ?? "";
+    return documentParent === directoryPath;
+  }
+
+  function pathMatchesSubtree(path: string, prefix: string): boolean {
+    if (!prefix) return true;
+    return path === prefix || path.startsWith(`${prefix}/`);
+  }
+
+  function replaceDocumentPath(
+    type: KnowledgeDocumentType,
+    path: string,
+    nextDocuments: KnowledgeDocumentSummary[],
+  ) {
+    const merged = new Map<string, KnowledgeDocumentSummary>();
+    for (const document of documents.value) {
+      if (document.type === type && document.path === path) continue;
+      merged.set(`${document.type}:${document.path}`, document);
+    }
+    for (const document of nextDocuments) {
+      merged.set(`${document.type}:${document.path}`, document);
+    }
+    documents.value = Array.from(merged.values());
+  }
+
+  function replaceDirectoryDocuments(
+    type: KnowledgeDocumentType,
+    directoryPath: string,
+    nextDocuments: KnowledgeDocumentSummary[],
+  ) {
+    const normalizedDirectory = normalizeDirectorySelectionPath(directoryPath);
+    const merged = new Map<string, KnowledgeDocumentSummary>();
+    for (const document of documents.value) {
+      if (
+        document.type === type &&
+        isDocumentInDirectory(document, normalizedDirectory)
+      ) {
+        continue;
+      }
+      merged.set(`${document.type}:${document.path}`, document);
+    }
+    for (const document of nextDocuments) {
+      merged.set(`${document.type}:${document.path}`, document);
+    }
+    documents.value = Array.from(merged.values());
+  }
+
+  function replaceDocumentSubtree(
+    type: KnowledgeDocumentType,
+    pathPrefix: string,
+    nextDocuments: KnowledgeDocumentSummary[],
+  ) {
+    const normalizedPrefix = pathPrefix.trim().replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+    const merged = new Map<string, KnowledgeDocumentSummary>();
+    for (const document of documents.value) {
+      if (
+        document.type === type &&
+        pathMatchesSubtree(document.path, normalizedPrefix)
+      ) {
+        continue;
+      }
+      merged.set(`${document.type}:${document.path}`, document);
+    }
+    for (const document of nextDocuments) {
+      merged.set(`${document.type}:${document.path}`, document);
+    }
+    documents.value = Array.from(merged.values());
+  }
+
   function getDirectoryPageCursor(
     type: KnowledgeDocumentType,
     path: string | null | undefined,
@@ -988,11 +1063,218 @@ export function useKnowledgeState(props: KnowledgeProps) {
     };
   }
 
-  function scheduleExternalRefresh() {
+  function markKnowledgeTypeDirty(
+    type: KnowledgeDocumentType,
+    options?: { documents?: boolean; directories?: boolean },
+  ) {
+    if (options?.documents !== false) {
+      dirtyDocumentTypes.add(type);
+    }
+    if (options?.directories !== false) {
+      dirtyDirectoryTypes.add(type);
+    }
+  }
+
+  function clearSelectedDocumentState() {
+    selectedDocument.value = null;
+    selectedDocumentId.value = null;
+    selectedDocumentLoading.value = false;
+  }
+
+  function clearSelectedDirectoryState() {
+    selectedDirectoryPath.value = null;
+    selectedDirectoryConfig.value = null;
+    selectedDirectoryLoading.value = false;
+  }
+
+  async function refreshExternalDocumentPath(
+    type: KnowledgeDocumentType,
+    path: string,
+  ) {
+    const exactDocuments = (await knowledgeList({
+      type,
+      pathPrefix: path,
+    })).filter((document) => document.path === path);
+    replaceDocumentPath(type, path, exactDocuments);
+    loadedDocumentTypes.add(type);
+    dirtyDocumentTypes.delete(type);
+
+    if (selectedDocument.value?.type === type && selectedDocument.value.path === path) {
+      if (exactDocuments.length === 0) {
+        clearSelectedDocumentState();
+      } else {
+        await loadSelectedDocument(exactDocuments[0]);
+      }
+    }
+  }
+
+  async function refreshExternalDirectoryDocuments(
+    type: KnowledgeDocumentType,
+    directoryPath: string,
+  ) {
+    const normalizedDirectory = normalizeDirectorySelectionPath(directoryPath);
+    const nextDocuments = await knowledgeListDirectoryDocuments(
+      type,
+      normalizedDirectory,
+    );
+    replaceDirectoryDocuments(type, normalizedDirectory, nextDocuments);
+    loadedDirectoryDocumentPaths[type].add(normalizedDirectory);
+    loadedDocumentTypes.add(type);
+    dirtyDocumentTypes.delete(type);
+    setDirectoryPageCursor(type, normalizedDirectory, null);
+  }
+
+  async function refreshExternalSubtree(
+    type: KnowledgeDocumentType,
+    pathPrefix: string,
+  ) {
+    const normalizedPrefix = pathPrefix
+      .trim()
+      .replace(/\\/g, "/")
+      .replace(/^\/+|\/+$/g, "");
+    const nextDocuments = (await knowledgeList({
+      type,
+      pathPrefix: normalizedPrefix,
+    })).filter((document) => pathMatchesSubtree(document.path, normalizedPrefix));
+    replaceDocumentSubtree(type, normalizedPrefix, nextDocuments);
+    loadedDocumentTypes.add(type);
+    dirtyDocumentTypes.delete(type);
+  }
+
+  async function applyExternalKnowledgeChange(change: KnowledgeChangedEvent) {
+    const type = change.docType;
+    const targetKind = change.targetKind;
+    const path = (change.path ?? "")
+      .trim()
+      .replace(/\\/g, "/")
+      .replace(/^\/+|\/+$/g, "");
+    const parentPath = normalizeDirectorySelectionPath(
+      change.parentPath ?? parentDirectoryPath(path) ?? "",
+    );
+    const isStructureChange = change.changeKind === "structure";
+    const isConfigChange = change.changeKind === "config";
+    const affectsSubtree = !!change.subtree || isConfigChange;
+
+    if (!type || !targetKind) {
+      markKnowledgeDataDirty();
+      await refreshKnowledgeData();
+      return;
+    }
+
+    markKnowledgeTypeDirty(type, {
+      directories: isStructureChange || isConfigChange || targetKind === "directory",
+    });
+
+    if (type !== activeType.value) {
+      return;
+    }
+
+    if (targetKind === "document" && path) {
+      if (isStructureChange && type === "reference") {
+        await refreshExternalDirectoryDocuments(type, parentPath);
+        if (selectedDocument.value?.type === type && selectedDocument.value.path === path) {
+          const selectedMatch = documents.value.find(
+            (document) => document.type === type && document.path === path,
+          );
+          if (selectedMatch) {
+            await loadSelectedDocument(selectedMatch);
+          } else {
+            clearSelectedDocumentState();
+          }
+        }
+      } else {
+        await refreshExternalDocumentPath(type, path);
+      }
+
+      if (
+        selectedDirectoryPath.value &&
+        normalizeDirectorySelectionPath(selectedDirectoryPath.value) === parentPath &&
+        (isStructureChange || isConfigChange)
+      ) {
+        await loadSelectedDirectoryConfig(selectedDirectoryPath.value);
+      }
+
+      if (isStructureChange) {
+        await loadDirectories(type);
+        dirtyDirectoryTypes.delete(type);
+      }
+      return;
+    }
+
+    if (targetKind === "directory" && path) {
+      if (affectsSubtree) {
+        await refreshExternalSubtree(type, path);
+      } else {
+        await refreshExternalDirectoryDocuments(type, path);
+      }
+      await loadDirectories(type);
+      dirtyDirectoryTypes.delete(type);
+
+      const normalizedSelectedDirectory = selectedDirectoryPath.value
+        ? normalizeDirectorySelectionPath(selectedDirectoryPath.value)
+        : "";
+      if (
+        normalizedSelectedDirectory &&
+        pathMatchesSubtree(normalizedSelectedDirectory, path)
+      ) {
+        if (directoryGroups.value[type].includes(normalizedSelectedDirectory)) {
+          await loadSelectedDirectoryConfig(selectedDirectoryPath.value);
+        } else {
+          clearSelectedDirectoryState();
+        }
+      }
+
+      if (
+        selectedDocument.value?.type === type &&
+        pathMatchesSubtree(selectedDocument.value.path, path)
+      ) {
+        const selectedMatch = documents.value.find(
+          (document) =>
+            document.type === type && document.path === selectedDocument.value?.path,
+        );
+        if (selectedMatch) {
+          await loadSelectedDocument(selectedMatch);
+        } else {
+          clearSelectedDocumentState();
+        }
+      } else if (
+        selectedDocumentSummary.value?.type === type &&
+        pathMatchesSubtree(selectedDocumentSummary.value.path, path)
+      ) {
+        await loadSelectedDocument(selectedDocumentSummary.value);
+      }
+      return;
+    }
+
     markKnowledgeDataDirty();
+    await refreshKnowledgeData();
+  }
+
+  async function flushExternalRefreshQueue() {
+    const queued = pendingExternalChanges;
+    pendingExternalChanges = [];
+    if (queued.length === 0) {
+      await refreshKnowledgeData();
+      return;
+    }
+    for (const change of queued) {
+      await applyExternalKnowledgeChange(change);
+    }
+  }
+
+  function scheduleExternalRefresh(change?: KnowledgeChangedEvent) {
+    if (change) {
+      pendingExternalChanges.push(change);
+    } else {
+      markKnowledgeDataDirty();
+    }
+    if (externalRefreshTimer) {
+      clearTimeout(externalRefreshTimer);
+      externalRefreshTimer = null;
+    }
     externalRefreshTimer = setTimeout(() => {
       externalRefreshTimer = null;
-      void refreshKnowledgeData();
+      void flushExternalRefreshQueue();
     }, 80);
   }
 
@@ -1001,6 +1283,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
       clearTimeout(externalRefreshTimer);
       externalRefreshTimer = null;
     }
+    pendingExternalChanges = [];
     dirtyDocumentTypes = new Set(DEFAULT_TYPE_ORDER);
     dirtyDirectoryTypes = new Set(DEFAULT_TYPE_ORDER);
   }
@@ -1050,6 +1333,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
     unityReferenceImportPending.value = false;
     unityReferenceDeletePending.value = false;
     pendingSelectionPath.value = null;
+    pendingExternalChanges = [];
     loadedDirectoryDocumentPaths = emptyLoadedDirectoryDocumentPaths();
     loadedDocumentTypes = new Set<KnowledgeDocumentType>();
     loadedDirectoryTypes = new Set<KnowledgeDocumentType>();
@@ -1066,6 +1350,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
       reset?: boolean;
       limit?: number;
       replaceTypeDocuments?: boolean;
+      replaceDirectoryDocuments?: boolean;
       silent?: boolean;
     },
   ) {
@@ -1095,10 +1380,14 @@ export function useKnowledgeState(props: KnowledgeProps) {
       );
       if (reset && options?.replaceTypeDocuments) {
         replaceTypeDocuments(type, page.items);
+      } else if (reset && options?.replaceDirectoryDocuments) {
+        replaceDirectoryDocuments(type, normalizedPath, page.items);
       } else if (page.items.length) {
         mergeDocuments(page.items);
       } else if (reset && options?.replaceTypeDocuments) {
         replaceTypeDocuments(type, []);
+      } else if (reset && options?.replaceDirectoryDocuments) {
+        replaceDirectoryDocuments(type, normalizedPath, []);
       }
       loadedDirectoryDocumentPaths[type].add(normalizedPath);
       setDirectoryPageCursor(type, normalizedPath, page.nextCursor ?? null);
@@ -2961,7 +3250,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
         );
         const currentWorkingDir = normalizeWorkspacePath(props.workingDir);
         if (!eventWorkingDir || eventWorkingDir !== currentWorkingDir) return;
-        scheduleExternalRefresh();
+        scheduleExternalRefresh(event.payload);
       },
     );
 
@@ -2976,6 +3265,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
     destroyed = true;
     if (searchTimer) clearTimeout(searchTimer);
     if (externalRefreshTimer) clearTimeout(externalRefreshTimer);
+    pendingExternalChanges = [];
     stopRetrievalStatusPoll();
     stopFeishuReferenceStatusPoll();
     stopUnityReferenceStatusPoll();

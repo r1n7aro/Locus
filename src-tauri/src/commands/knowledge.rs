@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::io::BufRead;
 use std::sync::Arc;
 use std::time::Instant;
@@ -46,6 +47,32 @@ pub struct KnowledgeChangedEvent {
     pub working_dir: String,
     pub source: String,
     pub changed_at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub doc_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub change_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub subtree: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct KnowledgeChangedTarget {
+    pub doc_type: Option<KnowledgeType>,
+    pub path: Option<String>,
+    pub parent_path: Option<String>,
+    pub target_kind: Option<&'static str>,
+    pub change_kind: Option<&'static str>,
+    pub subtree: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,10 +84,30 @@ pub struct KnowledgeListPageResponse {
 }
 
 pub(crate) fn emit_knowledge_changed(app_handle: &AppHandle, working_dir: &str, source: &str) {
+    emit_knowledge_changed_with_target(
+        app_handle,
+        working_dir,
+        source,
+        KnowledgeChangedTarget::default(),
+    );
+}
+
+pub(crate) fn emit_knowledge_changed_with_target(
+    app_handle: &AppHandle,
+    working_dir: &str,
+    source: &str,
+    target: KnowledgeChangedTarget,
+) {
     let payload = KnowledgeChangedEvent {
         working_dir: working_dir.to_string(),
         source: source.to_string(),
         changed_at: chrono::Utc::now().timestamp_millis(),
+        doc_type: target.doc_type.map(|value| value.as_str().to_string()),
+        path: target.path,
+        parent_path: target.parent_path,
+        target_kind: target.target_kind.map(str::to_string),
+        change_kind: target.change_kind.map(str::to_string),
+        subtree: target.subtree,
     };
     if let Err(error) = app_handle.emit(KNOWLEDGE_CHANGED_EVENT, payload) {
         eprintln!(
@@ -137,6 +184,93 @@ async fn restore_visible_document_for_path(
     )
     .await
     .map_err(AppError::from)
+}
+
+pub(crate) async fn sync_visible_document_for_path(
+    app_handle: &AppHandle,
+    working_dir: &str,
+    knowledge_index_state: Arc<KnowledgeIndexState>,
+    doc_type: KnowledgeType,
+    path: &str,
+) -> Result<(), AppError> {
+    let app_knowledge_dir: State<'_, AppKnowledgeDir> = app_handle.state();
+    match knowledge_store::load_document_by_path_with_app_root(
+        working_dir,
+        app_knowledge_dir.0.as_ref().as_ref(),
+        doc_type,
+        path,
+    ) {
+        Ok(document) => {
+            remove_shadowed_documents_for_path(
+                knowledge_index_state.clone(),
+                doc_type,
+                path,
+                Some(&document.id),
+            )?;
+            knowledge_index::upsert_document(
+                knowledge_index_state,
+                working_dir,
+                app_knowledge_dir.0.as_ref().as_ref(),
+                document,
+            )
+            .await
+            .map_err(AppError::from)?;
+        }
+        Err(_) => {
+            remove_shadowed_documents_for_path(knowledge_index_state, doc_type, path, None)?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) async fn sync_visible_documents_for_prefix(
+    app_handle: &AppHandle,
+    working_dir: &str,
+    knowledge_index_state: Arc<KnowledgeIndexState>,
+    doc_type: KnowledgeType,
+    path_prefix: &str,
+) -> Result<(), AppError> {
+    let app_knowledge_dir: State<'_, AppKnowledgeDir> = app_handle.state();
+    let app_root = app_knowledge_dir.0.as_ref().as_ref();
+    let visible_documents = knowledge_store::load_documents_with_app_root(
+        working_dir,
+        app_root,
+        Some(doc_type),
+        Some(path_prefix),
+    )
+    .map_err(AppError::from)?;
+    let existing_rows = knowledge_index_state
+        .db()
+        .list_document_catalog_entries_with_prefix(doc_type.as_str(), path_prefix)
+        .map_err(AppError::from)?;
+
+    let mut visible_paths = HashSet::with_capacity(visible_documents.len());
+    for document in visible_documents {
+        visible_paths.insert(document.path.clone());
+        remove_shadowed_documents_for_path(
+            knowledge_index_state.clone(),
+            doc_type,
+            &document.path,
+            Some(&document.id),
+        )?;
+        knowledge_index::upsert_document(
+            knowledge_index_state.clone(),
+            working_dir,
+            app_root,
+            document,
+        )
+        .await
+        .map_err(AppError::from)?;
+    }
+
+    let stale_doc_ids = existing_rows
+        .into_iter()
+        .filter(|row| !visible_paths.contains(&row.doc_path))
+        .map(|row| row.doc_id)
+        .collect::<Vec<_>>();
+    knowledge_index::remove_documents(knowledge_index_state, &stale_doc_ids)
+        .map_err(AppError::from)?;
+    Ok(())
 }
 
 pub fn resolve_app_knowledge_dir(data_dir: &std::path::Path) -> Option<std::path::PathBuf> {

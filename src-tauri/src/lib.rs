@@ -22,6 +22,7 @@ mod feishu_docs;
 pub mod keychain;
 pub mod knowledge_index;
 pub mod knowledge_store;
+mod knowledge_watcher;
 mod llm;
 pub(crate) mod merge;
 pub mod process_util;
@@ -49,6 +50,8 @@ use commands::{CanvasSpecStore, CodexAuthStateHandle};
 use config::AppConfig;
 
 pub type AssetDbWatcherHandle = Arc<std::sync::Mutex<Option<AssetDbWatcher>>>;
+pub type KnowledgeFsWatcherHandle =
+    Arc<std::sync::Mutex<Option<knowledge_watcher::KnowledgeFsWatcher>>>;
 use session::store::SessionStore;
 use tool::ToolRegistry;
 use unity_bridge::UnityMonitorHandle;
@@ -417,6 +420,8 @@ pub fn run() {
                 match AssetDbWatcher::start(watcher_root, graph_arc, watcher_tuning.clone()) {
                     Ok(w) => {
                         *watcher_handle.lock().unwrap() = Some(w);
+            let knowledge_watcher_handle: KnowledgeFsWatcherHandle =
+                Arc::new(std::sync::Mutex::new(None));
                         eprintln!("[Locus] ref_graph watcher started (from existing DB)");
                     }
                     Err(e) => {
@@ -433,6 +438,34 @@ pub fn run() {
             app.manage(app_agent_dir);
             app.manage(provider_keys);
             app.manage(store);
+            if !initial_working_dir_copy.trim().is_empty() {
+                if let Err(error) =
+                    crate::knowledge_store::ensure_knowledge_roots(&initial_working_dir_copy)
+                {
+                    eprintln!(
+                        "[Locus] warning: failed to prepare knowledge roots before watcher start: {}",
+                        error
+                    );
+                }
+                match knowledge_watcher::KnowledgeFsWatcher::start(
+                    app.handle().clone(),
+                    initial_working_dir_copy.clone(),
+                    app_knowledge_dir.0.as_ref().as_ref().cloned(),
+                    knowledge_index_state.clone(),
+                ) {
+                    Ok(watcher) => {
+                        *knowledge_watcher_handle.lock().unwrap() = Some(watcher);
+                        eprintln!("[Locus] knowledge fs watcher started");
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "[Locus] warning: failed to start knowledge fs watcher: {}",
+                            error
+                        );
+                    }
+                }
+            }
+
             app.manage(registry);
             app.manage(tool_registry);
             app.manage(workspace.clone());
@@ -449,6 +482,7 @@ pub fn run() {
             app.manage(question_store);
             app.manage(knowledge_proposal_drafts);
             app.manage(canvas_spec_store);
+            app.manage(knowledge_watcher_handle);
             app.manage(undo_manager);
             app.manage(tool_permission_mode);
             app.manage(tool_permissions);
