@@ -161,6 +161,44 @@ namespace Locus
             return "locus_unity_" + sanitized;
         }
 
+        private static bool IsProjectAssetPath(string path)
+        {
+            if (string.IsNullOrEmpty(path))
+                return false;
+
+            string normalized = path.Replace('\\', '/');
+            return normalized.StartsWith("Assets/", StringComparison.OrdinalIgnoreCase)
+                || normalized.StartsWith("Packages/", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool IsProjectPrefabPath(string path)
+        {
+            return IsProjectAssetPath(path)
+                && path.Replace('\\', '/').EndsWith(".prefab", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static string TrimToProjectAssetPath(string path)
+        {
+            if (string.IsNullOrEmpty(path))
+                return path;
+
+            string normalized = path.Replace('\\', '/');
+            if (IsProjectAssetPath(normalized))
+                return normalized;
+
+            string[] prefixes = { "Assets/", "Packages/" };
+            foreach (string prefix in prefixes)
+            {
+                int idx = normalized.IndexOf(prefix, StringComparison.OrdinalIgnoreCase);
+                if (idx < 0)
+                    continue;
+                if (idx == 0 || normalized[idx - 1] == '/')
+                    return normalized.Substring(idx);
+            }
+
+            return null;
+        }
+
         public static void Start()
         {
             if (_serverTask != null && !_serverTask.IsCompleted)

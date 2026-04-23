@@ -8,6 +8,7 @@ const LOCUS_PATH_PREFIXES = [
   "Library/Locus",
   "Assets/Locus",
   "Assets/Plugins/Locus",
+  "Packages/com.farlocus.locus",
 ] as const;
 
 function normalizeRepoPath(path: string | undefined | null): string {

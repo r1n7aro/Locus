@@ -80,7 +80,7 @@ namespace Locus
                     SetPropertyValue(prop, valueObj, valueType);
                     so.ApplyModifiedProperties();
 
-                    if (goPath.StartsWith("Assets/") && goPath.EndsWith(".prefab"))
+                    if (IsProjectPrefabPath(goPath))
                     {
                         EditorUtility.SetDirty(component);
                         AssetDatabase.SaveAssetIfDirty(component);
@@ -195,7 +195,7 @@ namespace Locus
         {
             if (string.IsNullOrEmpty(path)) return null;
 
-            if (path.StartsWith("Assets/") && path.EndsWith(".prefab"))
+            if (IsProjectPrefabPath(path))
             {
                 return AssetDatabase.LoadAssetAtPath<GameObject>(path);
             }
@@ -379,7 +379,7 @@ namespace Locus
                     if (prop.objectReferenceValue == null)
                         return (null, "object_ref");
                     string path = GetObjectPath(prop.objectReferenceValue);
-                    string type = path.StartsWith("Assets/") ? "asset_ref" : "object_ref";
+                    string type = IsProjectAssetPath(path) ? "asset_ref" : "object_ref";
                     return (path, type);
                 }
                 default:

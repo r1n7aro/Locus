@@ -1,0 +1,16 @@
+{
+  "name": "com.farlocus.locus",
+  "displayName": "Locus",
+  "version": "0.1.0",
+  "description": "Unity Editor bridge package for Locus.",
+  "license": "GPL-3.0-or-later",
+  "keywords": [
+    "locus",
+    "unity",
+    "editor",
+    "agent"
+  ],
+  "author": {
+    "name": "dot"
+  }
+}

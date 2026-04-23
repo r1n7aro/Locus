@@ -1,5 +1,5 @@
 {
-  "description": "Read the contents of a text file.\n- Returns file content (up to 2000 lines by default)\n- Use offset and limit to page through large files\n- This tool only reads files; use list for directories",
+  "description": "Read the contents of a workspace text file.\n- Returns file content (up to 2000 lines by default)\n- Use offset and limit to page through large files\n- This tool only reads files; use list for directories\n- Do not use this tool for documents under Locus/knowledge, including Memory. Use knowledge_list, knowledge_query, or knowledge_read instead",
   "parameters": {
     "type": "object",
     "properties": {

@@ -78,19 +78,9 @@ namespace Locus
         /// </summary>
         private static string ExecuteReadYaml(ReadYamlArgs args)
         {
-            string filePath = args.file_path;
-
-            if (!filePath.StartsWith("Assets/", StringComparison.OrdinalIgnoreCase)
-                && !filePath.StartsWith("Assets\\", StringComparison.OrdinalIgnoreCase))
-            {
-                int idx = filePath.IndexOf("Assets/", StringComparison.OrdinalIgnoreCase);
-                if (idx < 0)
-                    idx = filePath.IndexOf("Assets\\", StringComparison.OrdinalIgnoreCase);
-                if (idx >= 0)
-                    filePath = filePath.Substring(idx);
-                else
-                    return "__ERROR__: file_path must be under Assets/: " + filePath;
-            }
+            string filePath = TrimToProjectAssetPath(args.file_path);
+            if (string.IsNullOrEmpty(filePath))
+                return "__ERROR__: file_path must be under Assets/ or Packages/: " + args.file_path;
 
             string ext = System.IO.Path.GetExtension(filePath).ToLowerInvariant();
             bool isScene = ext == ".unity";

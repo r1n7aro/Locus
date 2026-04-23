@@ -16,6 +16,7 @@ describe("locusManagedFiles", () => {
     expect(isLocusManagedPath("Assets/Locus.meta")).toBe(true);
     expect(isLocusManagedPath("Assets/Plugins/Locus/Editor/LocusBridge.cs")).toBe(true);
     expect(isLocusManagedPath("Assets/Plugins/Locus.meta")).toBe(true);
+    expect(isLocusManagedPath("Packages/com.farlocus.locus/Editor/LocusBridge.cs")).toBe(true);
   });
 
   it("does not treat arbitrary external docs as Locus-managed", () => {
@@ -33,8 +34,9 @@ describe("locusManagedFiles", () => {
     expect(countLocusManagedFiles([
       { path: "Locus/memory/state.json" },
       { path: "Assets/Locus/Editor/LocusBridge.cs" },
+      { path: "Packages/com.farlocus.locus/package.json" },
       { path: "Assets/Scripts/Player.cs" },
       { path: "docs/Combat/Combat.md" },
-    ])).toBe(2);
+    ])).toBe(3);
   });
 });
