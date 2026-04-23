@@ -19,12 +19,6 @@ English | [简体中文](README.zh-CN.md)
 - **Highly optimized prompts**: optimize prompts for Unity projects, improve Agent capability, and avoid common mistakes
 - **Multiple model support**: support subscription account sign-in and compatibility with multiple LLM API capabilities
 
-## Quick Links
-
-- [WIKI](https://unity.farlocus.com/en)
-- [Quick Start](https://unity.farlocus.com/en/overview/install-and-setup): Install Locus quickly and complete the full setup in minutes
-- [Roadmap](https://unity.farlocus.com/en/overview/roadmap): See the features we are implementing and planning
-
 ## Installation
 
 Windows is currently the only supported platform. We plan to add macOS support soon.

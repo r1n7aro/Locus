@@ -19,12 +19,6 @@
 - **高度优化的提示词**：针对于Unity项目优化提示词，提高Agent能力，规避常见错误
 - **多种模型支持**：支持订阅帐号登录，并兼容多种LLM API能力
 
-## 快速入口
-
-- [WIKI](https://unity.farlocus.com/)
-- [快速开始](https://unity.farlocus.com/overview/install-and-setup)：快速安装Locus，在几分钟内完整配置
-- [路线图](https://unity.farlocus.com/overview/roadmap)：查看我们正在实施以及计划中的功能
-
 ## 安装
 
 目前仅支持 Windows 系统，我们很快会完善针对 macOS 的支持。
