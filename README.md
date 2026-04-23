@@ -1,13 +1,13 @@
 # Locus for Unity - Open Source Unity Dev Agent
 
-[![Docs](https://img.shields.io/badge/docs-unity.farlocus.com-5d7285)](https://unity.farlocus.com/en)
-[![Release](https://img.shields.io/github/v/release/r1n7aro/Locus?display_name=tag)](https://github.com/r1n7aro/Locus/releases)
-[![License](https://img.shields.io/badge/license-GPL--3.0--or--later-4b6375)](LICENSE)
-[![Platform](https://img.shields.io/badge/platform-Windows-2d6cdf)](https://github.com/r1n7aro/Locus/releases)
+> Scale game development efficiency and free creators from tedious, repetitive work.
+
+[![Docs](https://img.shields.io/badge/DOCS-unity.farlocus.com-f2c230?style=for-the-badge&labelColor=4a4a4a)](https://unity.farlocus.com/en)
+[![Release](https://img.shields.io/badge/RELEASE-GitHub-5d7285?style=for-the-badge&labelColor=4a4a4a)](https://github.com/r1n7aro/Locus/releases)
+[![License](https://img.shields.io/badge/LICENSE-GPL--3.0--or--later-88b000?style=for-the-badge&labelColor=4a4a4a)](LICENSE)
+[![Platform](https://img.shields.io/badge/PLATFORM-Windows-2d6cdf?style=for-the-badge&labelColor=4a4a4a)](https://github.com/r1n7aro/Locus/releases)
 
 English | [简体中文](README.zh-CN.md)
-
-Scale game development efficiency and free creators from tedious, repetitive work.
 
 ## Overview
 
@@ -18,8 +18,6 @@ Scale game development efficiency and free creators from tedious, repetitive wor
 - **Visual version control**: provide a visual version control interface with semantic diff analysis and conflict handling for Unity YAML assets
 - **Highly optimized prompts**: optimize prompts for Unity projects, improve Agent capability, and avoid common mistakes
 - **Multiple model support**: support subscription account sign-in and compatibility with multiple LLM API capabilities
-
-![Locus for Unity](docs/images/home.png)
 
 ## Quick Links
 
