@@ -16,6 +16,7 @@ import {
   maybeNotifyStreamEvent,
   resetSystemNotificationState,
 } from "../services/systemNotifications";
+import { hasTauriWindowRuntime } from "../services/tauriRuntime";
 import { setScope, setWarmup, clearWarmup } from "./warmupCache";
 import {
   getProviders,
@@ -155,6 +156,7 @@ export function useAppBootstrap() {
         },
       );
     }
+    await modelStore.loadCodexAvailableModels();
     modelStore.resolveSelectedModel(true);
 
     await Promise.all([
@@ -379,6 +381,7 @@ export function useAppBootstrap() {
 
   // -- Event listener registration --
   async function registerListeners() {
+    if (!hasTauriWindowRuntime()) return;
     unlisten = await listen<StreamEvent>("stream-event", (e) => {
       const handled = chatStore.handleStreamEvent(e.payload);
       if (!handled) return;
@@ -456,6 +459,7 @@ export function useAppBootstrap() {
   async function closeSettings() {
     uiStore.setTab("chat");
     await authStore.checkAuth();
+    await modelStore.loadCodexAvailableModels();
     modelStore.resolveSelectedModel(true);
   }
 
@@ -469,6 +473,7 @@ export function useAppBootstrap() {
       modelStore.loadCustomEndpoints(),
       modelStore.loadCodexModelConfig(),
     ]);
+    await modelStore.loadCodexAvailableModels();
     modelStore.resolveSelectedModel(true);
     await Promise.all([
       chatStore.refreshSessions(),

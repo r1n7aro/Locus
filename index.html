@@ -5,6 +5,39 @@
     <link rel="icon" type="image/svg+xml" href="/vite.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Locus</title>
+    <style>
+      html,
+      body,
+      #app {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+      }
+
+      body {
+        background: #f6f7f8;
+        color: #5b6270;
+        font-family: var(--font-ui, ui-monospace, "SF Mono", SFMono-Regular, "Cascadia Mono", "Cascadia Code", "JetBrains Mono", "Fira Code", Menlo, Monaco, Consolas, "Liberation Mono", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei UI", "Microsoft YaHei", monospace);
+        font-size: 14px;
+      }
+
+      html[data-theme="dark"] body {
+        background: #1d1d21;
+        color: #a1a4ad;
+      }
+
+      #app:empty {
+        position: fixed;
+        inset: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+
+      #app:empty::before {
+        content: "Locus";
+      }
+    </style>
   </head>
 
   <body>

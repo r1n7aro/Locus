@@ -71,6 +71,10 @@ vi.mock("../services/systemNotifications", () => ({
   resetSystemNotificationState: (...args: unknown[]) => resetSystemNotificationStateMock(...args),
 }));
 
+vi.mock("../services/tauriRuntime", () => ({
+  hasTauriWindowRuntime: () => true,
+}));
+
 vi.mock("../composables/warmupCache", () => ({
   setScope: vi.fn(),
   setWarmup: vi.fn(),
@@ -175,6 +179,7 @@ describe("useAppBootstrap onboarding completion", () => {
       loadLastEffort: vi.fn().mockResolvedValue(undefined),
       loadCustomEndpoints: vi.fn().mockResolvedValue(undefined),
       loadCodexModelConfig: vi.fn().mockResolvedValue(undefined),
+      loadCodexAvailableModels: vi.fn().mockResolvedValue(undefined),
       resolveSelectedModel: vi.fn(),
     });
 

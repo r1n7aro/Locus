@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { DebugConsoleEntry, DebugConsoleLevel } from "../types";
+import { hasTauriWindowRuntime } from "./tauriRuntime";
 
 const MAX_ENTRIES = 2_000;
 const BACKEND_EVENT_NAME = "app-log";
@@ -193,6 +194,7 @@ async function fetchBackendSnapshot() {
 }
 
 async function ensureBackendBridge() {
+  if (!hasTauriWindowRuntime()) return;
   if (!backendReady) {
     backendUnlisten = await listen<DebugConsoleEntry>(BACKEND_EVENT_NAME, (event) => {
       pushEntries([event.payload]);

@@ -4,8 +4,7 @@ import { useUiStore } from "../stores/ui";
 
 const tauriWindowMocks = vi.hoisted(() => {
   let resizedHandler: ((event: { payload: { width: number; height: number } }) => void) | null = null;
-
-  return {
+  const windowMock = {
     isMaximized: vi.fn<() => Promise<boolean>>(),
     onResized: vi.fn(async (handler: (event: { payload: { width: number; height: number } }) => void) => {
       resizedHandler = handler;
@@ -15,6 +14,11 @@ const tauriWindowMocks = vi.hoisted(() => {
     minimize: vi.fn(async () => undefined),
     toggleMaximize: vi.fn(async () => undefined),
     close: vi.fn(async () => undefined),
+  };
+
+  return {
+    ...windowMock,
+    getCurrentWindow: vi.fn(() => windowMock),
     emitResize() {
       resizedHandler?.({ payload: { width: 1440, height: 900 } });
     },
@@ -37,15 +41,16 @@ const localStorageMock = vi.hoisted(() => {
   };
 });
 
+const tauriRuntimeMocks = vi.hoisted(() => ({
+  hasTauriWindowRuntime: vi.fn(() => true),
+}));
+
 vi.mock("@tauri-apps/api/window", () => ({
-  getCurrentWindow: () => ({
-    isMaximized: tauriWindowMocks.isMaximized,
-    onResized: tauriWindowMocks.onResized,
-    setAlwaysOnTop: tauriWindowMocks.setAlwaysOnTop,
-    minimize: tauriWindowMocks.minimize,
-    toggleMaximize: tauriWindowMocks.toggleMaximize,
-    close: tauriWindowMocks.close,
-  }),
+  getCurrentWindow: tauriWindowMocks.getCurrentWindow,
+}));
+
+vi.mock("../services/tauriRuntime", () => ({
+  hasTauriWindowRuntime: tauriRuntimeMocks.hasTauriWindowRuntime,
 }));
 
 describe("ui store window resize sync", () => {
@@ -55,6 +60,7 @@ describe("ui store window resize sync", () => {
     vi.clearAllMocks();
     vi.stubGlobal("localStorage", localStorageMock as unknown as Storage);
     localStorageMock.clear();
+    tauriRuntimeMocks.hasTauriWindowRuntime.mockReturnValue(true);
     tauriWindowMocks.isMaximized.mockResolvedValue(false);
   });
 
@@ -114,13 +120,26 @@ describe("ui store window resize sync", () => {
     expect(tauriWindowMocks.onResized).toHaveBeenCalledTimes(1);
   });
 
-  it("restores the last active tab after init", async () => {
+  it("starts on the chat tab even when a previous tab was stored", async () => {
     localStorage.setItem("locus-active-tab", "knowledge");
     const store = useUiStore();
 
     await store.init();
 
-    expect(store.activeTab).toBe("knowledge");
-    expect(store.knowledgeMounted).toBe(true);
+    expect(store.activeTab).toBe("chat");
+    expect(store.knowledgeMounted).toBe(false);
+  });
+
+  it("initializes local UI state when the Tauri window runtime is unavailable", async () => {
+    tauriRuntimeMocks.hasTauriWindowRuntime.mockReturnValue(false);
+    localStorage.setItem("locus-active-tab", "knowledge");
+    const store = useUiStore();
+
+    await expect(store.init()).resolves.toBeUndefined();
+
+    expect(tauriWindowMocks.getCurrentWindow).not.toHaveBeenCalled();
+    expect(store.isMaximized).toBe(false);
+    expect(store.activeTab).toBe("chat");
+    expect(store.knowledgeMounted).toBe(false);
   });
 });

@@ -6,19 +6,21 @@ import "./styles/typography.css";
 import { initDebugConsole } from "./services/debugConsole";
 import { bootstrapLocale } from "./i18n";
 import { getSystemLocale } from "./services/system";
+import { installTauriDevtoolsHotkeys } from "./services/tauriRuntime";
 
 void initDebugConsole();
+installTauriDevtoolsHotkeys();
 
-async function bootstrapApp() {
-  let systemLocale: string | null = null;
+const app = createApp(App);
+app.use(createPinia());
+app.mount("#app");
+
+async function syncSystemLocale() {
   try {
-    systemLocale = await getSystemLocale();
+    bootstrapLocale(await getSystemLocale());
   } catch {
-    systemLocale = null;
+    bootstrapLocale(null);
   }
-
-  bootstrapLocale(systemLocale);
-  createApp(App).use(createPinia()).mount("#app");
 }
 
-void bootstrapApp();
+void syncSystemLocale();

@@ -1,21 +1,11 @@
 import { ref } from "vue";
 import { defineStore } from "pinia";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import type { Window as TauriWindow } from "@tauri-apps/api/window";
 import type { UnlistenFn } from "@tauri-apps/api/event";
+import { hasTauriWindowRuntime } from "../services/tauriRuntime";
 
 const WINDOW_RESIZE_SETTLE_DELAY_MS = 120;
-const ACTIVE_TAB_STORAGE_KEY = "locus-active-tab";
-
-function isValidTab(
-  value: string | null,
-): value is "chat" | "collab" | "knowledge" | "asset" | "agent" | "settings" {
-  return value === "chat"
-    || value === "collab"
-    || value === "knowledge"
-    || value === "asset"
-    || value === "agent"
-    || value === "settings";
-}
 
 export const useUiStore = defineStore("ui", () => {
   const activeTab = ref<"chat" | "collab" | "knowledge" | "asset" | "agent" | "settings">("chat");
@@ -37,10 +27,22 @@ export const useUiStore = defineStore("ui", () => {
   const agentMounted = ref(false);
   const settingsMounted = ref(false);
 
-  const appWindow = getCurrentWindow();
+  let appWindow: TauriWindow | null = null;
   let unlistenResize: UnlistenFn | null = null;
   let resizeSettleTimer: ReturnType<typeof setTimeout> | null = null;
   let maximizedSyncSeq = 0;
+
+  function resolveAppWindow(): TauriWindow | null {
+    if (appWindow) return appWindow;
+    if (!hasTauriWindowRuntime()) return null;
+    try {
+      appWindow = getCurrentWindow();
+      return appWindow;
+    } catch (error) {
+      console.warn("Failed to resolve current Tauri window:", error);
+      return null;
+    }
+  }
 
   function errorMessage(error: unknown): string {
     if (typeof error === "string") return error;
@@ -61,8 +63,13 @@ export const useUiStore = defineStore("ui", () => {
 
   async function syncMaximizedState() {
     const syncSeq = ++maximizedSyncSeq;
+    const window = resolveAppWindow();
+    if (!window) {
+      isMaximized.value = false;
+      return;
+    }
     try {
-      const nextValue = await appWindow.isMaximized();
+      const nextValue = await window.isMaximized();
       if (syncSeq !== maximizedSyncSeq) return;
       isMaximized.value = nextValue;
     } catch (error) {
@@ -85,16 +92,18 @@ export const useUiStore = defineStore("ui", () => {
 
   async function init() {
     await syncMaximizedState();
-    unlistenResize = await appWindow.onResized(() => {
-      scheduleWindowResizeSettle();
-    });
-    try {
-      const storedTab = localStorage.getItem(ACTIVE_TAB_STORAGE_KEY);
-      if (isValidTab(storedTab)) {
-        setTab(storedTab);
-      } else {
-        setTab("chat");
+    const window = resolveAppWindow();
+    if (window) {
+      try {
+        unlistenResize = await window.onResized(() => {
+          scheduleWindowResizeSettle();
+        });
+      } catch (error) {
+        console.error("Failed to listen for window resize:", error);
       }
+    }
+    try {
+      setTab("chat");
       showOnboarding.value = !localStorage.getItem("locus-onboarding-completed");
     } catch {
       setTab("chat");
@@ -112,11 +121,6 @@ export const useUiStore = defineStore("ui", () => {
 
   function setTab(tab: typeof activeTab.value) {
     activeTab.value = tab;
-    try {
-      localStorage.setItem(ACTIVE_TAB_STORAGE_KEY, tab);
-    } catch {
-      /* ignore */
-    }
     if (tab === "collab") collabMounted.value = true;
     if (tab === "knowledge") knowledgeMounted.value = true;
     if (tab === "asset") assetMounted.value = true;
@@ -160,9 +164,11 @@ export const useUiStore = defineStore("ui", () => {
   }
 
   async function toggleAlwaysOnTop() {
+    const window = resolveAppWindow();
+    if (!window) return;
     alwaysOnTop.value = !alwaysOnTop.value;
     try {
-      await appWindow.setAlwaysOnTop(alwaysOnTop.value);
+      await window.setAlwaysOnTop(alwaysOnTop.value);
     } catch (e) {
       console.error("Failed to set always on top:", e);
       alwaysOnTop.value = !alwaysOnTop.value;
@@ -170,16 +176,16 @@ export const useUiStore = defineStore("ui", () => {
   }
 
   async function winMinimize() {
-    await appWindow.minimize();
+    await resolveAppWindow()?.minimize();
   }
   async function winToggleMaximize() {
-    await appWindow.toggleMaximize();
+    await resolveAppWindow()?.toggleMaximize();
     clearResizeSettleTimer();
     isWindowResizing.value = false;
     await syncMaximizedState();
   }
   async function winClose() {
-    await appWindow.close();
+    await resolveAppWindow()?.close();
   }
 
   function completeOnboarding() {

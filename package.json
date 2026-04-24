@@ -15,7 +15,7 @@
     "build:tauri": "bun run licenses:bundle && bun run build",
     "licenses:bundle": "bun run scripts/generate-third-party-bundle.mjs",
     "preview": "vite preview",
-    "tauri": "tauri",
+    "tauri": "bun run scripts/run-tauri.mjs",
     "docs:dev": "cd docs && bun run dev",
     "docs:validate": "cd docs && bun run validate",
     "docs:broken-links": "cd docs && bun run broken-links",

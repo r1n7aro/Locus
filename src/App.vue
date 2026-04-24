@@ -1,6 +1,6 @@
 
 <script setup lang="ts">
-import { computed, ref, shallowRef, onMounted, onUnmounted, watch } from "vue";
+import { computed, defineAsyncComponent, ref, shallowRef, onMounted, onUnmounted, watch } from "vue";
 import type { Component, ShallowRef } from "vue";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -19,18 +19,6 @@ import { useChatChangesStore } from "./stores/chatChanges";
 import { useAppUpdateStore } from "./stores/appUpdate";
 import { useAppBootstrap } from "./composables/useAppBootstrap";
 
-// Static imports — first-screen critical or special-case first-screen
-import ChatView from "./components/ChatView.vue";
-import CanvasView from "./components/CanvasView.vue";
-import KnowledgeDownloadProgressWindow from "./components/KnowledgeDownloadProgressWindow.vue";
-import KnowledgeLexicalProgressWindow from "./components/KnowledgeLexicalProgressWindow.vue";
-import FeishuReferenceImportProgressWindow from "./components/FeishuReferenceImportProgressWindow.vue";
-import UnityReferenceImportProgressWindow from "./components/UnityReferenceImportProgressWindow.vue";
-import ReferenceExternalImportWindow from "./components/ReferenceExternalImportWindow.vue";
-import OnboardingView from "./components/OnboardingView.vue";
-import ThinkingPanel from "./components/ThinkingPanel.vue";
-import ChatSidebarPanel from "./components/ChatSidebarPanel.vue";
-import FileDiffOverlay from "./components/diff/FileDiffOverlay.vue";
 import TopBannerHost from "./components/TopBannerHost.vue";
 import BaseButton from "./components/ui/BaseButton.vue";
 import AppUpdateModal from "./components/AppUpdateModal.vue";
@@ -57,6 +45,17 @@ const isStandaloneWindow = isCanvasWindow
   || isUnityReferenceImportWindow
   || isReferenceExternalImportWindow;
 
+const CanvasView = defineAsyncComponent(() => import("./components/CanvasView.vue"));
+const KnowledgeDownloadProgressWindow = defineAsyncComponent(() => import("./components/KnowledgeDownloadProgressWindow.vue"));
+const KnowledgeLexicalProgressWindow = defineAsyncComponent(() => import("./components/KnowledgeLexicalProgressWindow.vue"));
+const FeishuReferenceImportProgressWindow = defineAsyncComponent(() => import("./components/FeishuReferenceImportProgressWindow.vue"));
+const UnityReferenceImportProgressWindow = defineAsyncComponent(() => import("./components/UnityReferenceImportProgressWindow.vue"));
+const ReferenceExternalImportWindow = defineAsyncComponent(() => import("./components/ReferenceExternalImportWindow.vue"));
+const OnboardingView = defineAsyncComponent(() => import("./components/OnboardingView.vue"));
+const ThinkingPanel = defineAsyncComponent(() => import("./components/ThinkingPanel.vue"));
+const ChatSidebarPanel = defineAsyncComponent(() => import("./components/ChatSidebarPanel.vue"));
+const FileDiffOverlay = defineAsyncComponent(() => import("./components/diff/FileDiffOverlay.vue"));
+
 // Initialize theme & fonts for main window only; Canvas keeps its own styles.
 if (!isCanvasWindow) {
   initTheme();
@@ -75,7 +74,7 @@ const chatChangesStore = useChatChangesStore();
 const appUpdateStore = useAppUpdateStore();
 
 // -- Diff overlay provider (must be called in App setup so all children can inject) --
-provideDiffOverlay();
+const diffOverlay = provideDiffOverlay();
 const { skillItems, bootstrapCritical, bootstrapDeferred, preloadTabsInBackground, registerListeners, cleanup, applyWorkingDir, closeSettings, onOnboardingCompleted } = useAppBootstrap();
 
 function createLazyViewState(
@@ -126,6 +125,10 @@ function createLazyViewState(
   };
 }
 
+const chatView = createLazyViewState(
+  () => import("./components/ChatView.vue"),
+  "loadChatView",
+);
 const collabView = createLazyViewState(
   () => import("./components/CollabView.vue"),
   "loadCollabView",
@@ -147,6 +150,10 @@ const settingsView = createLazyViewState(
   "loadSettingsView",
 );
 
+const chatViewComponent = chatView.component;
+const chatViewLoading = chatView.loading;
+const chatViewError = chatView.error;
+
 const collabViewComponent = collabView.component;
 const collabViewLoading = collabView.loading;
 const collabViewError = collabView.error;
@@ -166,6 +173,11 @@ const agentViewError = agentView.error;
 const settingsViewComponent = settingsView.component;
 const settingsViewLoading = settingsView.loading;
 const settingsViewError = settingsView.error;
+
+watch(() => uiStore.activeTab, (tab) => {
+  if (tab !== "chat") return;
+  void chatView.ensureLoaded();
+}, { immediate: true });
 
 watch(() => uiStore.collabMounted, (mounted) => {
   if (!mounted) return;
@@ -350,6 +362,12 @@ function onResetOnboarding() {
   uiStore.resetOnboarding();
 }
 
+async function handleSettingsAuthChanged() {
+  await authStore.loadProviderStatus();
+  await modelStore.loadCodexAvailableModels();
+  modelStore.resolveSelectedModel(true);
+}
+
 function closeAppUpdateModal() {
   appUpdateStore.dismissDialog();
 }
@@ -397,6 +415,9 @@ onUnmounted(() => {
   <FeishuReferenceImportProgressWindow v-else-if="isFeishuReferenceImportWindow" />
   <UnityReferenceImportProgressWindow v-else-if="isUnityReferenceImportWindow" />
   <ReferenceExternalImportWindow v-else-if="isReferenceExternalImportWindow" />
+  <div v-else-if="!authStore.authChecked" class="app-startup-state">
+    <span>{{ t("common.loading") }}</span>
+  </div>
   <OnboardingView v-else-if="authStore.authChecked && uiStore.showOnboarding" @completed="onOnboardingCompleted" />
   <div
     class="app-layout"
@@ -518,7 +539,9 @@ onUnmounted(() => {
       <TopBannerHost />
 
       <div class="tab-content">
-        <ChatView
+        <component
+          :is="chatViewComponent"
+          v-if="chatViewComponent"
           v-show="uiStore.activeTab === 'chat'"
           :messages="chatStore.messages"
           :streaming-text="chatStore.streamingText"
@@ -566,6 +589,13 @@ onUnmounted(() => {
           @delete-session="chatStore.deleteSession"
           @start-scan="projectStore.startScan"
         />
+        <div
+          v-else-if="uiStore.activeTab === 'chat'"
+          class="tab-loading-state"
+          :class="{ 'is-loading': chatViewLoading, 'is-error': !!chatViewError }"
+        >
+          {{ chatViewError || t("common.loading") }}
+        </div>
         <ThinkingPanel
           v-if="uiStore.activeTab === 'chat' && chatStore.showThinkingPanel"
           :thinking="chatStore.thinkingPanelContent || chatStore.streamingThinking"
@@ -652,7 +682,7 @@ onUnmounted(() => {
           :agents="agentStore.agents"
           :subagents="agentStore.subagents"
           @close="closeSettings"
-          @auth-changed="authStore.loadProviderStatus"
+          @auth-changed="handleSettingsAuthChanged"
           @model-defaults-changed="modelStore.applyModelDefaults"
           @codex-transport-changed="modelStore.applyCodexModelConfig"
           @custom-endpoints-changed="modelStore.applyCustomEndpoints"
@@ -724,7 +754,7 @@ onUnmounted(() => {
       </div>
     </div>
   </Transition>
-  <FileDiffOverlay />
+  <FileDiffOverlay v-if="diffOverlay.visible.value" />
 </template>
 
 <style>
@@ -947,6 +977,17 @@ body.is-dragging-select-lock * {
   min-width: 0;
   min-height: 0;
   position: relative;
+}
+
+.app-startup-state {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100vw;
+  height: 100vh;
+  background: var(--bg-color);
+  color: var(--text-secondary);
+  font-size: 13px;
 }
 
 .tab-bar {
