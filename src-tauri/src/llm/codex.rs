@@ -1,5 +1,6 @@
 use super::openai_reasoning::{apply_reasoning_effort, apply_text_verbosity_default};
 use super::openrouter::LlmResponse;
+use super::CODEX_CLIENT_VERSION;
 use crate::commands::CodexTransportMode;
 use crate::session::models::{ChatMessage, ImageData, MessageRole, ServerToolKind, ToolCallInfo};
 use futures::{SinkExt, StreamExt};
@@ -486,7 +487,7 @@ fn build_codex_websocket_handshake_request(
     );
     request.headers_mut().insert(
         "version",
-        http::HeaderValue::from_static(env!("CARGO_PKG_VERSION")),
+        http::HeaderValue::from_static(CODEX_CLIENT_VERSION),
     );
     if let Some(turn_state) = turn_state {
         request.headers_mut().insert(
@@ -1781,6 +1782,7 @@ where
             ("Authorization", "Bearer <token>"),
             ("Content-Type", "application/json"),
             ("originator", CODEX_ORIGINATOR_HEADER_VALUE),
+            ("version", CODEX_CLIENT_VERSION),
         ];
         if let Some(aid) = account_id {
             headers.push(("ChatGPT-Account-ID", aid));
@@ -1793,6 +1795,7 @@ where
         .header("Authorization", format!("Bearer {}", access_token))
         .header("Content-Type", "application/json")
         .header("originator", CODEX_ORIGINATOR_HEADER_VALUE)
+        .header("version", CODEX_CLIENT_VERSION)
         .json(&request_body);
 
     if let Some(aid) = account_id {
@@ -2161,7 +2164,7 @@ where
             ("Content-Type", "application/json"),
             ("OpenAI-Beta", RESPONSES_WEBSOCKETS_V2_BETA_HEADER_VALUE),
             ("originator", CODEX_ORIGINATOR_HEADER_VALUE),
-            ("version", env!("CARGO_PKG_VERSION")),
+            ("version", CODEX_CLIENT_VERSION),
         ];
         if cached_turn_state.is_some() {
             headers.push((X_CODEX_TURN_STATE_HEADER, "<sticky>"));
@@ -2517,6 +2520,7 @@ mod tests {
         LastWebsocketResponse, PartialToolCall, CODEX_ORIGINATOR_HEADER_VALUE,
         RESPONSES_WEBSOCKETS_V2_BETA_HEADER_VALUE, X_CODEX_TURN_STATE_HEADER,
     };
+    use crate::llm::CODEX_CLIENT_VERSION;
     use crate::session::models::{
         ChatMessage, ImageData, MessageRole, ServerToolKind, ToolCallInfo,
     };
@@ -3159,6 +3163,15 @@ mod tests {
                 .to_str()
                 .ok(),
             Some(CODEX_ORIGINATOR_HEADER_VALUE)
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get("version")
+                .expect("version header")
+                .to_str()
+                .ok(),
+            Some(CODEX_CLIENT_VERSION)
         );
         assert_eq!(
             request

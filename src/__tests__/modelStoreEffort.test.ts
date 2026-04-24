@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createPinia, setActivePinia } from "pinia";
 import { nextTick } from "vue";
 import { useModelStore } from "../stores/model";
+import { useAuthStore } from "../stores/auth";
 
 const modelServiceMocks = vi.hoisted(() => ({
   getModelDefaults: vi.fn(),
@@ -9,6 +10,7 @@ const modelServiceMocks = vi.hoisted(() => ({
   getLastEffort: vi.fn(),
   getCustomEndpoints: vi.fn(),
   getCodexModelConfig: vi.fn(),
+  getCodexAvailableModels: vi.fn(),
   saveLastModel: vi.fn(),
   saveLastEffort: vi.fn(),
 }));
@@ -28,14 +30,67 @@ describe("useModelStore OpenAI effort mapping", () => {
     modelServiceMocks.getLastEffort.mockResolvedValue("");
     modelServiceMocks.getCustomEndpoints.mockResolvedValue([]);
     modelServiceMocks.getCodexModelConfig.mockResolvedValue({ transport: "websocket" });
+    modelServiceMocks.getCodexAvailableModels.mockResolvedValue([]);
     modelServiceMocks.saveLastModel.mockResolvedValue(undefined);
     modelServiceMocks.saveLastEffort.mockResolvedValue(undefined);
   });
 
-  it("exposes xhigh and hides none for GPT-5.4", () => {
+  it("uses GPT-5.4 as the Codex fallback catalog", () => {
+    const authStore = useAuthStore();
+    authStore.codexAuthenticated = true;
     const modelStore = useModelStore();
 
-    modelStore.selectedModelId = "openai/gpt-5.4";
+    expect(modelStore.availableModels.some((model) => model.id === "openai/gpt-5.4")).toBe(true);
+    expect(modelStore.availableModels.some((model) => model.id === "openai/gpt-5.5")).toBe(false);
+  });
+
+  it("exposes GPT-5.5 only after the remote Codex catalog returns it", async () => {
+    const authStore = useAuthStore();
+    authStore.codexAuthenticated = true;
+    modelServiceMocks.getCodexAvailableModels.mockResolvedValue([
+      {
+        id: "openai/gpt-5.5",
+        name: "GPT-5.5",
+        provider: "openai_codex",
+        defaultEffort: "medium",
+        supportedEfforts: ["low", "medium", "high", "xhigh"],
+      },
+    ]);
+    const modelStore = useModelStore();
+
+    await modelStore.loadCodexAvailableModels();
+
+    expect(modelStore.availableModels.some((model) => model.id === "openai/gpt-5.5")).toBe(true);
+    expect(modelStore.availableModels.some((model) => model.id === "openai/gpt-5.4")).toBe(false);
+  });
+
+  it("normalizes remote Codex model labels from model slugs", async () => {
+    const authStore = useAuthStore();
+    authStore.codexAuthenticated = true;
+    modelServiceMocks.getCodexAvailableModels.mockResolvedValue([
+      { id: "openai/gpt-5.4", name: "gpt-5.4", provider: "openai_codex" },
+      { id: "openai/gpt-5.5", name: "GPT-5.5", provider: "openai_codex" },
+      { id: "openai/gpt-5.4-mini", name: "GPT-5.4-Mini", provider: "openai_codex" },
+      { id: "openai/gpt-5.3-codex", name: "gpt-5.3-codex", provider: "openai_codex" },
+      { id: "openai/gpt-5.3-codex-spark", name: "GPT-5.3 Codex-Spark", provider: "openai_codex" },
+    ]);
+    const modelStore = useModelStore();
+
+    await modelStore.loadCodexAvailableModels();
+
+    expect(modelStore.codexModels.map((model) => model.name)).toEqual([
+      "GPT-5.4",
+      "GPT-5.5",
+      "GPT-5.4 Mini",
+      "GPT-5.3 Codex",
+      "GPT-5.3 Codex Spark",
+    ]);
+  });
+
+  it("exposes xhigh and hides none for GPT-5.5", () => {
+    const modelStore = useModelStore();
+
+    modelStore.selectedModelId = "openai/gpt-5.5";
 
     expect(modelStore.availableEfforts).toEqual(["low", "medium", "high", "xhigh"]);
     expect(modelStore.effortSupported).toBe(true);
@@ -61,7 +116,7 @@ describe("useModelStore OpenAI effort mapping", () => {
 
   it("loads the saved effort selection from persistence", async () => {
     const modelStore = useModelStore();
-    modelStore.selectedModelId = "openai/gpt-5.4";
+    modelStore.selectedModelId = "openai/gpt-5.5";
     modelServiceMocks.getLastEffort.mockResolvedValue("high");
 
     await modelStore.loadLastEffort();

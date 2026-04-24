@@ -52,7 +52,9 @@ pub(super) fn model_context_limit(model: &str) -> u32 {
     let m = m.to_ascii_lowercase();
     // Locus follows the effective context budget currently surfaced by Codex
     // for ChatGPT subscription models, not the larger public API model-page limits.
-    if matches_versioned_model(&m, "gpt-5.4")
+    if matches_versioned_model(&m, "gpt-5.5")
+        || matches_versioned_model(&m, "gpt-5.5-pro")
+        || matches_versioned_model(&m, "gpt-5.4")
         || matches_versioned_model(&m, "gpt-5.4-pro")
         || matches_versioned_model(&m, "gpt-5.3-codex")
     {
@@ -90,6 +92,18 @@ mod tests {
 
     #[test]
     fn uses_codex_runtime_context_limits_for_openai_subscription_models() {
+        assert_eq!(
+            model_context_limit("openai/gpt-5.5"),
+            OPENAI_CODEX_CONTEXT_LIMIT
+        );
+        assert_eq!(
+            model_context_limit("gpt-5.5-2026-04-24"),
+            OPENAI_CODEX_CONTEXT_LIMIT
+        );
+        assert_eq!(
+            model_context_limit("gpt-5.5-pro"),
+            OPENAI_CODEX_CONTEXT_LIMIT
+        );
         assert_eq!(
             model_context_limit("openai/gpt-5.4"),
             OPENAI_CODEX_CONTEXT_LIMIT

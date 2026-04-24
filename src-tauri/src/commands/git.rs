@@ -3146,6 +3146,52 @@ pub struct GitUserConfig {
     pub email: String,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum GitConfigScope {
+    Repo,
+    Global,
+}
+
+impl GitConfigScope {
+    fn flag(self) -> &'static str {
+        match self {
+            GitConfigScope::Repo => "--local",
+            GitConfigScope::Global => "--global",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            GitConfigScope::Repo => "repo",
+            GitConfigScope::Global => "global",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitConfigEntry {
+    pub key: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitConfigScopeSnapshot {
+    pub scope: GitConfigScope,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    pub entries: Vec<GitConfigEntry>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitConfigSnapshot {
+    pub repo: GitConfigScopeSnapshot,
+    pub global: GitConfigScopeSnapshot,
+}
+
 fn read_git_config_value(
     args: &[&str],
     cwd: Option<&str>,
@@ -3167,6 +3213,210 @@ fn read_git_config_value(
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn run_git_config(
+    scope: GitConfigScope,
+    cwd: Option<&str>,
+    args: &[&str],
+    label: &str,
+) -> Result<std::process::Output, AppError> {
+    let mut cmd = command("git");
+    cmd.arg("config")
+        .arg(scope.flag())
+        .args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    if let Some(dir) = cwd.filter(|value| !value.trim().is_empty()) {
+        cmd.current_dir(dir);
+    }
+
+    cmd.output()
+        .map_err(|e| AppError::new("git.config.exec", format!("{}: {}", label, e)))
+}
+
+fn parse_git_config_list(output: &[u8]) -> Vec<GitConfigEntry> {
+    String::from_utf8_lossy(output)
+        .split('\0')
+        .filter_map(|raw| {
+            let raw = raw.trim_end_matches('\r');
+            if raw.is_empty() {
+                return None;
+            }
+
+            if let Some((key, value)) = raw.split_once('\n') {
+                return Some(GitConfigEntry {
+                    key: key.trim().to_string(),
+                    value: value.to_string(),
+                });
+            }
+
+            raw.split_once('=').map(|(key, value)| GitConfigEntry {
+                key: key.trim().to_string(),
+                value: value.to_string(),
+            })
+        })
+        .filter(|entry| !entry.key.is_empty())
+        .collect()
+}
+
+fn read_git_config_origin(scope: GitConfigScope, cwd: Option<&str>) -> Option<String> {
+    let output = run_git_config(
+        scope,
+        cwd,
+        &["--show-origin", "--list"],
+        "Failed to read git config origin",
+    )
+    .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout.lines().find_map(|line| {
+        let source = line
+            .split_once('\t')
+            .map(|(origin, _)| origin)
+            .or_else(|| line.split_once(' ').map(|(origin, _)| origin))?
+            .trim();
+        if source.is_empty() {
+            return None;
+        }
+        Some(source.strip_prefix("file:").unwrap_or(source).to_string())
+    })
+}
+
+fn read_git_config_entries(
+    scope: GitConfigScope,
+    cwd: Option<&str>,
+) -> Result<Vec<GitConfigEntry>, AppError> {
+    if scope == GitConfigScope::Repo && !cwd.map(is_git_repo_dir).unwrap_or(false) {
+        return Err(AppError::new(
+            "git.no_repo",
+            "Current workspace is not a Git repository",
+        ));
+    }
+
+    let label = format!("Failed to read {} git config", scope.label());
+    let output = run_git_config(scope, cwd, &["--list", "--null"], &label)?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if scope == GitConfigScope::Global
+            && (stderr.is_empty()
+                || stderr.contains("unable to read config file")
+                || stderr.contains("No such file"))
+        {
+            return Ok(vec![]);
+        }
+        return Err(AppError::new(
+            "git.config.read_failed",
+            format!("{}: {}", label, stderr),
+        ));
+    }
+
+    Ok(parse_git_config_list(&output.stdout))
+}
+
+fn read_git_config_scope_snapshot(
+    scope: GitConfigScope,
+    cwd: Option<&str>,
+) -> Result<GitConfigScopeSnapshot, AppError> {
+    Ok(GitConfigScopeSnapshot {
+        scope,
+        path: read_git_config_origin(scope, cwd),
+        entries: read_git_config_entries(scope, cwd)?,
+    })
+}
+
+fn is_safe_git_config_key(key: &str) -> bool {
+    if key.is_empty() || key.starts_with('-') || !key.contains('.') {
+        return false;
+    }
+
+    key.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '/' | ':'))
+}
+
+fn normalize_git_config_entries(
+    entries: Vec<GitConfigEntry>,
+) -> Result<Vec<GitConfigEntry>, AppError> {
+    let mut normalized = Vec::with_capacity(entries.len());
+
+    for entry in entries {
+        let key = entry.key.trim().to_string();
+        if !is_safe_git_config_key(&key) {
+            return Err(AppError::new(
+                "git.config.invalid_key",
+                format!("Invalid git config key: {}", entry.key),
+            ));
+        }
+        if key.contains('\0') || entry.value.contains('\0') || key.contains('\n') {
+            return Err(AppError::new(
+                "git.config.invalid_value",
+                "Git config keys and values must not contain NUL characters",
+            ));
+        }
+        normalized.push(GitConfigEntry {
+            key,
+            value: entry.value,
+        });
+    }
+
+    Ok(normalized)
+}
+
+fn write_git_config_entries(
+    scope: GitConfigScope,
+    cwd: Option<&str>,
+    entries: Vec<GitConfigEntry>,
+) -> Result<GitConfigScopeSnapshot, AppError> {
+    if scope == GitConfigScope::Repo && !cwd.map(is_git_repo_dir).unwrap_or(false) {
+        return Err(AppError::new(
+            "git.no_repo",
+            "Current workspace is not a Git repository",
+        ));
+    }
+
+    let entries = normalize_git_config_entries(entries)?;
+    let existing = read_git_config_entries(scope, cwd)?;
+    let mut keys = std::collections::BTreeSet::new();
+
+    for entry in existing.iter().chain(entries.iter()) {
+        keys.insert(entry.key.clone());
+    }
+
+    for key in keys {
+        let _ = run_git_config(
+            scope,
+            cwd,
+            &["--unset-all", key.as_str()],
+            "Failed to unset git config key",
+        );
+    }
+
+    for entry in &entries {
+        let output = run_git_config(
+            scope,
+            cwd,
+            &["--add", entry.key.as_str(), entry.value.as_str()],
+            "Failed to write git config key",
+        )?;
+        if !output.status.success() {
+            return Err(AppError::new(
+                "git.config.write_failed",
+                format!(
+                    "Failed to write {}: {}",
+                    entry.key,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ),
+            ));
+        }
+    }
+
+    read_git_config_scope_snapshot(scope, cwd)
 }
 
 fn is_git_repo_dir(cwd: &str) -> bool {
@@ -3219,6 +3469,48 @@ pub async fn git_check_user_config(
     let email = read_git_user_config_value(cwd, "user.email")?;
 
     Ok(GitUserConfig { name, email })
+}
+
+#[tauri::command]
+pub async fn git_config_snapshot(
+    workspace: State<'_, Arc<Workspace>>,
+) -> Result<GitConfigSnapshot, AppError> {
+    let cwd = workspace.path.read().await.clone();
+    let cwd = cwd.trim();
+    if cwd.is_empty() {
+        return Err(AppError::new(
+            "git.no_workspace",
+            "No working directory set",
+        ));
+    }
+
+    Ok(GitConfigSnapshot {
+        repo: read_git_config_scope_snapshot(GitConfigScope::Repo, Some(cwd))?,
+        global: read_git_config_scope_snapshot(GitConfigScope::Global, None)?,
+    })
+}
+
+#[tauri::command]
+pub async fn git_save_config(
+    workspace: State<'_, Arc<Workspace>>,
+    scope: GitConfigScope,
+    entries: Vec<GitConfigEntry>,
+) -> Result<GitConfigScopeSnapshot, AppError> {
+    let cwd = workspace.path.read().await.clone();
+    let cwd = cwd.trim();
+    let cwd = if scope == GitConfigScope::Repo {
+        if cwd.is_empty() {
+            return Err(AppError::new(
+                "git.no_workspace",
+                "No working directory set",
+            ));
+        }
+        Some(cwd)
+    } else {
+        None
+    };
+
+    write_git_config_entries(scope, cwd, entries)
 }
 
 #[tauri::command]
@@ -4806,6 +5098,121 @@ mod git_discard_tests {
 
         assert!(!repo.path().join("added.txt").exists());
         assert_eq!(git_stdout(repo.path(), &["status", "--short"]), "");
+    }
+}
+
+#[cfg(test)]
+mod git_config_tests {
+    use super::{
+        parse_git_config_list, read_git_config_entries, write_git_config_entries, GitConfigEntry,
+        GitConfigScope,
+    };
+    use crate::process_util::command;
+    use tempfile::tempdir;
+
+    fn git(cwd: &std::path::Path, args: &[&str]) {
+        let output = command("git")
+            .args(args)
+            .current_dir(cwd)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .expect("git command should run");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn git_stdout_lines(cwd: &std::path::Path, args: &[&str]) -> Vec<String> {
+        let output = command("git")
+            .args(args)
+            .current_dir(cwd)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .expect("git command should run");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(|line| line.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn parse_git_config_list_reads_null_separated_entries() {
+        let entries = parse_git_config_list(b"user.name\nJane\0remote.origin.fetch\n+refs/*\0");
+
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| (entry.key.as_str(), entry.value.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("user.name", "Jane"), ("remote.origin.fetch", "+refs/*")]
+        );
+    }
+
+    #[test]
+    fn write_git_config_entries_updates_values_and_preserves_multivalue_keys() {
+        let repo = tempdir().expect("temp dir");
+        git(repo.path(), &["init", "-b", "main"]);
+        git(repo.path(), &["config", "user.name", "Old User"]);
+        git(repo.path(), &["config", "user.email", "old@example.com"]);
+        git(
+            repo.path(),
+            &[
+                "config",
+                "--add",
+                "remote.origin.fetch",
+                "+refs/heads/main:refs/remotes/origin/main",
+            ],
+        );
+
+        let mut entries = read_git_config_entries(
+            GitConfigScope::Repo,
+            Some(repo.path().to_str().expect("repo path")),
+        )
+        .expect("read config");
+
+        for entry in &mut entries {
+            if entry.key == "user.name" {
+                entry.value = "New User".to_string();
+            }
+        }
+        entries.push(GitConfigEntry {
+            key: "remote.origin.fetch".to_string(),
+            value: "+refs/tags/*:refs/tags/*".to_string(),
+        });
+
+        write_git_config_entries(
+            GitConfigScope::Repo,
+            Some(repo.path().to_str().expect("repo path")),
+            entries,
+        )
+        .expect("write config");
+
+        assert_eq!(
+            git_stdout_lines(
+                repo.path(),
+                &["config", "--local", "--get-all", "user.name"],
+            ),
+            vec!["New User".to_string()]
+        );
+        assert_eq!(
+            git_stdout_lines(
+                repo.path(),
+                &["config", "--local", "--get-all", "remote.origin.fetch"]
+            ),
+            vec![
+                "+refs/heads/main:refs/remotes/origin/main".to_string(),
+                "+refs/tags/*:refs/tags/*".to_string(),
+            ]
+        );
     }
 }
 

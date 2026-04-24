@@ -3,6 +3,10 @@ import type {
   GitActionResult,
   GitStageAllResult,
   GitBranchesResult,
+  GitConfigEntry,
+  GitConfigScope,
+  GitConfigScopeSnapshot,
+  GitConfigSnapshot,
   GitFileChange,
   GitHistorySnapshot,
   GitInstallHelp,
@@ -118,6 +122,14 @@ export function gitCheckUserConfig(): Promise<{ name: string; email: string }> {
 
 export function gitSetUserConfig(name: string, email: string): Promise<void> {
   return ipcInvoke("git_set_user_config", { name, email });
+}
+
+export function gitConfigSnapshot(): Promise<GitConfigSnapshot> {
+  return ipcInvoke<GitConfigSnapshot>("git_config_snapshot");
+}
+
+export function gitSaveConfig(scope: GitConfigScope, entries: GitConfigEntry[]): Promise<GitConfigScopeSnapshot> {
+  return ipcInvoke<GitConfigScopeSnapshot>("git_save_config", { scope, entries });
 }
 
 export function gitInitUnity(): Promise<string> {

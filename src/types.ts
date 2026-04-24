@@ -139,6 +139,10 @@ export interface ModelOption {
     | "anthropic_sdk"
     | "openai_codex"
     | "custom";
+  defaultEffort?: EffortLevel | null;
+  supportedEfforts?: EffortLevel[];
+  additionalSpeedTiers?: string[];
+  isDefault?: boolean;
 }
 
 export type ApiFormat =
@@ -1596,6 +1600,24 @@ export interface GitInstallHelp {
   packageManagers: GitInstallManager[];
   officialUrl: string;
   chinaMirrorUrl?: string;
+}
+
+export type GitConfigScope = "repo" | "global";
+
+export interface GitConfigEntry {
+  key: string;
+  value: string;
+}
+
+export interface GitConfigScopeSnapshot {
+  scope: GitConfigScope;
+  path?: string | null;
+  entries: GitConfigEntry[];
+}
+
+export interface GitConfigSnapshot {
+  repo: GitConfigScopeSnapshot;
+  global: GitConfigScopeSnapshot;
 }
 
 export interface GitFileChange {

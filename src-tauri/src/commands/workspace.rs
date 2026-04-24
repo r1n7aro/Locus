@@ -460,6 +460,29 @@ pub async fn get_codex_model_config() -> Result<CodexModelConfig, AppError> {
 }
 
 #[tauri::command]
+pub async fn get_codex_available_models(
+    codex: State<'_, crate::commands::auth::CodexAuthStateHandle>,
+    config: State<'_, Arc<crate::config::AppConfig>>,
+) -> Result<Vec<crate::llm::codex_models::CodexAvailableModel>, AppError> {
+    let cache_dir = persistent_config_dir().map_err(AppError::from)?;
+    let (access_token, account_id) = {
+        let mut codex_guard = codex.lock().await;
+        let access_token = codex_guard.access_token().await.map_err(AppError::from)?;
+        let account_id = codex_guard.account_id();
+        (access_token, account_id)
+    };
+
+    crate::llm::codex_models::list_codex_available_models(
+        &access_token,
+        account_id.as_deref(),
+        config.base_url.as_deref(),
+        &cache_dir,
+    )
+    .await
+    .map_err(AppError::from)
+}
+
+#[tauri::command]
 pub async fn save_codex_model_config(config: CodexModelConfig) -> Result<(), AppError> {
     let path = codex_model_config_path().map_err(AppError::from)?;
     let json = serde_json::to_string_pretty(&config)

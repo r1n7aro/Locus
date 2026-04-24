@@ -22,7 +22,18 @@ const builtinModels: ModelOption[] = [
   { id: "claude-opus-4.6", name: "Claude Opus 4.6", provider: "anthropic" },
   { id: "anthropic_sdk/claude-sonnet-4.6", name: "Claude Sonnet 4.6", provider: "anthropic_sdk" },
   { id: "anthropic_sdk/claude-opus-4.6", name: "Claude Opus 4.6", provider: "anthropic_sdk" },
-  { id: "openai/gpt-5.4", name: "GPT-5.4", provider: "openai_codex" },
+];
+
+const codexFallbackModels: ModelOption[] = [
+  {
+    id: "openai/gpt-5.4",
+    name: "GPT-5.4",
+    provider: "openai_codex",
+    defaultEffort: "medium",
+    supportedEfforts: ["low", "medium", "high", "xhigh"],
+    additionalSpeedTiers: ["fast"],
+    isDefault: true,
+  },
 ];
 
 const effortLevels: EffortLevel[] = ["none", "low", "medium", "high", "xhigh"];
@@ -35,6 +46,11 @@ function isEffortLevel(value: string): value is EffortLevel {
   return effortLevels.includes(value as EffortLevel);
 }
 
+function normalizeEfforts(values?: EffortLevel[] | null): EffortLevel[] {
+  if (!Array.isArray(values)) return [];
+  return values.filter(isEffortLevel);
+}
+
 function supportsOpenAiReasoningModel(model: string): boolean {
   const m = normalizeOpenAiReasoningModel(model);
   return m.includes("codex") || m.includes("gpt-5");
@@ -42,11 +58,11 @@ function supportsOpenAiReasoningModel(model: string): boolean {
 
 function openAiReasoningLevels(model: string): EffortLevel[] {
   const m = normalizeOpenAiReasoningModel(model);
-  if (m.includes("gpt-5.4-pro") || m.includes("gpt-5.2-pro")) return ["medium", "high"];
+  if (m.includes("gpt-5.5-pro") || m.includes("gpt-5.4-pro") || m.includes("gpt-5.2-pro")) return ["medium", "high"];
   if (m.includes("gpt-5-pro")) return ["high"];
   if (m.includes("gpt-5.1-codex-mini")) return ["medium", "high"];
   if (m.includes("codex")) return ["low", "medium", "high", "xhigh"];
-  if (m.includes("gpt-5.4") || m.includes("gpt-5.2") || m.includes("gpt-5.1")) {
+  if (m.includes("gpt-5.5") || m.includes("gpt-5.4") || m.includes("gpt-5.2") || m.includes("gpt-5.1")) {
     return ["low", "medium", "high", "xhigh"];
   }
   if (m.includes("gpt-5")) return ["low", "medium", "high", "xhigh"];
@@ -57,10 +73,58 @@ function normalizeCodexTransport(config?: Partial<CodexModelConfig> | null): Cod
   return config?.transport === "http" ? "http" : "websocket";
 }
 
+function formatCodexModelName(id: string, fallbackName?: string): string {
+  const slug = id.startsWith("openai/") ? id.slice("openai/".length) : id;
+  const parts = slug
+    .trim()
+    .toLowerCase()
+    .split("-")
+    .filter(Boolean);
+  const formatPart = (part: string): string => {
+    if (part === "gpt") return "GPT";
+    if (part === "codex") return "Codex";
+    if (part === "mini") return "Mini";
+    if (part === "spark") return "Spark";
+    if (part === "pro") return "Pro";
+    if (/^\d/.test(part)) return part;
+    return part.charAt(0).toUpperCase() + part.slice(1);
+  };
+
+  if (parts[0] === "gpt" && parts[1]) {
+    const head = `GPT-${parts[1]}`;
+    const tail = parts.slice(2).map(formatPart).join(" ");
+    return tail ? `${head} ${tail}` : head;
+  }
+
+  const formatted = parts.map(formatPart).join(" ");
+  return formatted || fallbackName?.trim() || id;
+}
+
+function normalizeCodexModels(models?: ModelOption[] | null): ModelOption[] {
+  if (!Array.isArray(models)) return [];
+  const seen = new Set<string>();
+  const normalized: ModelOption[] = [];
+  for (const model of models) {
+    const id = typeof model.id === "string" ? model.id.trim() : "";
+    if (!id.startsWith("openai/") || seen.has(id)) continue;
+    seen.add(id);
+    const name = formatCodexModelName(id, model.name);
+    normalized.push({
+      ...model,
+      id,
+      name,
+      provider: "openai_codex",
+      supportedEfforts: normalizeEfforts(model.supportedEfforts),
+    });
+  }
+  return normalized;
+}
+
 export const useModelStore = defineStore("model", () => {
   const authStore = useAuthStore();
 
   const customEndpoints = ref<CustomEndpoint[]>([]);
+  const codexRemoteModels = ref<ModelOption[]>([]);
   const codexTransport = ref<CodexTransportMode>("websocket");
   const selectedModelId = ref("");
   const lastModelId = ref("");
@@ -70,13 +134,17 @@ export const useModelStore = defineStore("model", () => {
 
   // -- Getters --
 
+  const codexModels = computed<ModelOption[]>(() =>
+    codexRemoteModels.value.length > 0 ? codexRemoteModels.value : codexFallbackModels
+  );
+
   const allModels = computed<ModelOption[]>(() => {
     const customs: ModelOption[] = customEndpoints.value.map((ep) => ({
       id: `custom/${ep.id}`,
       name: ep.name,
       provider: "custom" as const,
     }));
-    return filterVisibleModels([...builtinModels, ...customs]);
+    return filterVisibleModels([...builtinModels, ...codexModels.value, ...customs]);
   });
 
   const availableModels = computed(() => {
@@ -91,6 +159,10 @@ export const useModelStore = defineStore("model", () => {
 
   const selectedCustomEndpoint = computed<CustomEndpoint | null>(() =>
     customEndpoints.value.find((ep) => `custom/${ep.id}` === selectedModelId.value) ?? null
+  );
+
+  const selectedModelOption = computed<ModelOption | null>(() =>
+    allModels.value.find((model) => model.id === selectedModelId.value) ?? null
   );
 
   const selectedOpenAiReasoningModel = computed<string | null>(() => {
@@ -112,6 +184,8 @@ export const useModelStore = defineStore("model", () => {
     if (m.includes("claude")) return ["none", "low", "medium", "high"];
     const openAiModel = selectedOpenAiReasoningModel.value;
     if (!openAiModel || !supportsOpenAiReasoningModel(openAiModel)) return [];
+    const catalogEfforts = selectedModelOption.value?.supportedEfforts ?? [];
+    if (catalogEfforts.length > 0) return catalogEfforts;
     return openAiReasoningLevels(openAiModel);
   });
 
@@ -189,6 +263,19 @@ export const useModelStore = defineStore("model", () => {
     }
   }
 
+  async function loadCodexAvailableModels() {
+    if (!authStore.codexAuthenticated) {
+      codexRemoteModels.value = [];
+      return;
+    }
+    try {
+      codexRemoteModels.value = normalizeCodexModels(await modelService.getCodexAvailableModels());
+    } catch (e: unknown) {
+      console.warn("[model] get_codex_available_models:", e);
+      codexRemoteModels.value = [];
+    }
+  }
+
   function resolveSelectedModel(force = false) {
     const models = availableModels.value;
     if (models.length === 0) {
@@ -228,6 +315,7 @@ export const useModelStore = defineStore("model", () => {
 
   return {
     customEndpoints,
+    codexRemoteModels,
     codexTransport,
     selectedModelId,
     lastModelId,
@@ -235,6 +323,7 @@ export const useModelStore = defineStore("model", () => {
     modelDefaults,
     allModels,
     availableModels,
+    codexModels,
     selectedCustomEndpoint,
     selectedOpenAiReasoningModel,
     availableEfforts,
@@ -244,6 +333,7 @@ export const useModelStore = defineStore("model", () => {
     loadLastEffort,
     loadCustomEndpoints,
     loadCodexModelConfig,
+    loadCodexAvailableModels,
     resolveSelectedModel,
     selectModel,
     applyModelDefaults,

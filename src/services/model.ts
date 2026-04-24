@@ -1,5 +1,5 @@
 import { ipcInvoke } from "./ipc";
-import type { ModelDefaults, CustomEndpoint, CodexModelConfig } from "../types";
+import type { ModelDefaults, CustomEndpoint, CodexModelConfig, ModelOption } from "../types";
 
 export function getModelDefaults(): Promise<ModelDefaults> {
   return ipcInvoke<ModelDefaults>("get_model_defaults");
@@ -11,6 +11,10 @@ export function saveModelDefaults(defaults: ModelDefaults): Promise<void> {
 
 export function getCodexModelConfig(): Promise<CodexModelConfig> {
   return ipcInvoke<CodexModelConfig>("get_codex_model_config");
+}
+
+export function getCodexAvailableModels(): Promise<ModelOption[]> {
+  return ipcInvoke<ModelOption[]>("get_codex_available_models");
 }
 
 export function saveCodexModelConfig(config: CodexModelConfig): Promise<void> {

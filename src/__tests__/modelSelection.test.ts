@@ -5,6 +5,7 @@ import type { ModelDefaults, ModelOption } from "../types";
 const models: ModelOption[] = [
   { id: "openrouter/claude-sonnet-4.6", name: "Claude Sonnet 4.6", provider: "openrouter" },
   { id: "claude-sonnet-4.6", name: "Claude Sonnet 4.6", provider: "anthropic" },
+  { id: "openai/gpt-5.5", name: "GPT-5.5", provider: "openai_codex" },
   { id: "openai/gpt-5.4", name: "GPT-5.4", provider: "openai_codex" },
 ];
 
@@ -22,10 +23,10 @@ describe("pickPreferredModelId", () => {
     expect(
       pickPreferredModelId(
         models,
-        defaults({ mainModel: "openai/gpt-5.4" }),
+        defaults({ mainModel: "openai/gpt-5.5" }),
         "claude-sonnet-4.6",
       ),
-    ).toBe("openai/gpt-5.4");
+    ).toBe("openai/gpt-5.5");
   });
 
   it("falls back to last remembered model when mainModel is unavailable", () => {
@@ -46,7 +47,7 @@ describe("pickPreferredModelId", () => {
 
   it("returns empty when there are no available models", () => {
     expect(
-      pickPreferredModelId([], defaults({ mainModel: "openai/gpt-5.4" }), "claude-sonnet-4.6"),
+      pickPreferredModelId([], defaults({ mainModel: "openai/gpt-5.5" }), "claude-sonnet-4.6"),
     ).toBe("");
   });
 });

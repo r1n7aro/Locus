@@ -53,6 +53,7 @@ pub fn reasoning_effort_for_model(
         "low" if supported.low => Some("low"),
         "medium" if supported.medium => Some("medium"),
         "high" if supported.high => Some("high"),
+        "xhigh" if supported.xhigh => Some("xhigh"),
         _ => None,
     }
 }
@@ -69,20 +70,15 @@ struct SupportedEfforts {
     low: bool,
     medium: bool,
     high: bool,
+    xhigh: bool,
 }
 
-const NONE_LOW_MEDIUM_HIGH: SupportedEfforts = SupportedEfforts {
-    none: true,
-    low: true,
-    medium: true,
-    high: true,
-};
-
-const LOW_MEDIUM_HIGH: SupportedEfforts = SupportedEfforts {
+const LOW_MEDIUM_HIGH_XHIGH: SupportedEfforts = SupportedEfforts {
     none: false,
     low: true,
     medium: true,
     high: true,
+    xhigh: true,
 };
 
 const MEDIUM_HIGH: SupportedEfforts = SupportedEfforts {
@@ -90,6 +86,7 @@ const MEDIUM_HIGH: SupportedEfforts = SupportedEfforts {
     low: false,
     medium: true,
     high: true,
+    xhigh: false,
 };
 
 const HIGH_ONLY: SupportedEfforts = SupportedEfforts {
@@ -97,6 +94,7 @@ const HIGH_ONLY: SupportedEfforts = SupportedEfforts {
     low: false,
     medium: false,
     high: true,
+    xhigh: false,
 };
 
 const UNSUPPORTED: SupportedEfforts = SupportedEfforts {
@@ -104,25 +102,36 @@ const UNSUPPORTED: SupportedEfforts = SupportedEfforts {
     low: false,
     medium: false,
     high: false,
+    xhigh: false,
 };
 
 fn supported_efforts(model: &str) -> SupportedEfforts {
     let model = model.trim().to_ascii_lowercase();
 
-    if model.contains("gpt-5.4-pro") || model.contains("gpt-5.2-pro") {
+    if model.contains("gpt-5.5-pro")
+        || model.contains("gpt-5.4-pro")
+        || model.contains("gpt-5.2-pro")
+    {
         return MEDIUM_HIGH;
     }
     if model.contains("gpt-5-pro") {
         return HIGH_ONLY;
     }
-    if model.contains("codex") {
-        return LOW_MEDIUM_HIGH;
+    if model.contains("gpt-5.1-codex-mini") {
+        return MEDIUM_HIGH;
     }
-    if model.contains("gpt-5.4") || model.contains("gpt-5.2") || model.contains("gpt-5.1") {
-        return NONE_LOW_MEDIUM_HIGH;
+    if model.contains("codex") {
+        return LOW_MEDIUM_HIGH_XHIGH;
+    }
+    if model.contains("gpt-5.5")
+        || model.contains("gpt-5.4")
+        || model.contains("gpt-5.2")
+        || model.contains("gpt-5.1")
+    {
+        return LOW_MEDIUM_HIGH_XHIGH;
     }
     if model.contains("gpt-5") {
-        return LOW_MEDIUM_HIGH;
+        return LOW_MEDIUM_HIGH_XHIGH;
     }
 
     UNSUPPORTED
@@ -136,15 +145,16 @@ mod tests {
     };
 
     #[test]
-    fn gpt54_accepts_none() {
+    fn gpt55_accepts_xhigh_and_hides_none() {
         assert_eq!(
-            reasoning_effort_for_model("gpt-5.4", Some("none")),
-            Some("none")
+            reasoning_effort_for_model("gpt-5.5", Some("xhigh")),
+            Some("xhigh")
         );
+        assert_eq!(reasoning_effort_for_model("gpt-5.5", Some("none")), None);
     }
 
     #[test]
-    fn codex_accepts_low_medium_high_only() {
+    fn codex_accepts_low_medium_high_xhigh_only() {
         assert_eq!(
             reasoning_effort_for_model("gpt-5.3-codex", Some("low")),
             Some("low")
@@ -152,6 +162,10 @@ mod tests {
         assert_eq!(
             reasoning_effort_for_model("gpt-5.3-codex", Some("high")),
             Some("high")
+        );
+        assert_eq!(
+            reasoning_effort_for_model("gpt-5.3-codex", Some("xhigh")),
+            Some("xhigh")
         );
         assert_eq!(
             reasoning_effort_for_model("gpt-5.3-codex", Some("none")),
@@ -166,6 +180,7 @@ mod tests {
 
     #[test]
     fn gpt5_models_default_to_low_text_verbosity() {
+        assert_eq!(default_text_verbosity_for_model("gpt-5.5"), Some("low"));
         assert_eq!(default_text_verbosity_for_model("gpt-5.4"), Some("low"));
         assert_eq!(
             default_text_verbosity_for_model("openai/gpt-5.3-codex"),
@@ -177,14 +192,14 @@ mod tests {
     #[test]
     fn injects_reasoning_effort_into_request_body() {
         let mut body = serde_json::json!({
-            "model": "gpt-5.4",
+            "model": "gpt-5.5",
             "input": [],
             "stream": true,
         });
 
-        apply_reasoning_effort(&mut body, "gpt-5.4", Some("none"));
+        apply_reasoning_effort(&mut body, "gpt-5.5", Some("xhigh"));
 
-        assert_eq!(body["reasoning"], serde_json::json!({ "effort": "none" }));
+        assert_eq!(body["reasoning"], serde_json::json!({ "effort": "xhigh" }));
     }
 
     #[test]
