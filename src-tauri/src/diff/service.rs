@@ -4,12 +4,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 use tauri::AppHandle;
 
 use crate::asset_db::AssetDbState;
-use crate::error::{AppError, AppResult};
+use crate::error::AppResult;
 
-use super::content::{
-    is_binary, is_unity_yaml, lang_from_path, unity_asset_kind, ContentPair, SideContentState,
-};
-use super::context::{DiffBuildContext, SideFileSource};
+use super::content::{is_binary, is_unity_yaml, lang_from_path, SideContentState};
+use super::context::DiffBuildContext;
 use super::profiler::{DiffPhase, DiffProfiler};
 use super::semantic;
 use super::text::{
@@ -69,19 +67,12 @@ pub(crate) fn get_semantic_session(key: &str) -> Option<Arc<SemanticSession>> {
     Some(session)
 }
 
-pub(crate) fn build_semantic_payload(
-    session: &SemanticSession,
-    detail: DiffDetail,
-) -> SemanticDiff {
-    let inspector = if detail == DiffDetail::Full {
-        session
-            .default_target_id
-            .as_ref()
-            .and_then(|target_id| session.changed_inspectors.get(target_id))
-            .cloned()
-    } else {
-        None
-    };
+pub(crate) fn build_semantic_payload(session: &SemanticSession) -> SemanticDiff {
+    let inspector = session
+        .default_target_id
+        .as_ref()
+        .and_then(|target_id| session.changed_inspectors.get(target_id))
+        .cloned();
 
     SemanticDiff {
         engine: "unityYaml".into(),
@@ -90,16 +81,12 @@ pub(crate) fn build_semantic_payload(
         summary: session.summary.clone(),
         default_target_id: session.default_target_id.clone(),
         script_class_name: session.script_class_name.clone(),
-        tree: if detail == DiffDetail::Full
-            && matches!(session.layout, SemanticLayout::SceneHierarchyInspector)
-        {
+        tree: if matches!(session.layout, SemanticLayout::SceneHierarchyInspector) {
             Some(session.tree.clone())
         } else {
             None
         },
-        targets: if detail == DiffDetail::Full
-            && matches!(session.layout, SemanticLayout::AssetInspector)
-        {
+        targets: if matches!(session.layout, SemanticLayout::AssetInspector) {
             Some(session.targets.clone())
         } else {
             None
@@ -385,7 +372,8 @@ pub(crate) async fn build_file_diff_payload(
         (Some(TextDiffResult { hunks }), stats)
     };
 
-    let semantic_result = if is_unity {
+    let should_build_semantic = is_unity && !(detail == DiffDetail::Preview && is_large);
+    let semantic_result = if should_build_semantic {
         eprintln!("[diff] Unity YAML detected: {}", request.file_path);
         let build_ctx = DiffBuildContext::from_sources(
             request.source.clone(),
@@ -406,7 +394,7 @@ pub(crate) async fn build_file_diff_payload(
                 "[diff] Semantic session built: {} targets, {} fields",
                 session.summary.changed_targets, session.summary.changed_fields
             );
-            let payload = build_semantic_payload(&session, detail);
+            let payload = build_semantic_payload(&session);
             cache_semantic_session(&key, session);
             Some(payload)
         } else {
@@ -414,6 +402,12 @@ pub(crate) async fn build_file_diff_payload(
             None
         }
     } else {
+        if is_unity && detail == DiffDetail::Preview && is_large {
+            eprintln!(
+                "[diff] Unity YAML preview skipped semantic diff for large file: {}",
+                request.file_path
+            );
+        }
         None
     };
 

@@ -14,10 +14,14 @@ import FileDiffPopover from "./diff/FileDiffPopover.vue";
 import type { GitFileChange, FileDiffPayload, UndoConflictInfo } from "../types";
 import type { ChatMergedFileItem } from "../services/chatChanges";
 import { useHideMeta, isMetaFile, canOpenInEditor } from "../composables/useHideMeta";
+import { buildStagingTreeRows, collectStagingFolderPaths } from "./collab/stagingTree";
+import type { StagingTreeRow } from "./collab/stagingTree";
+import type { StagingViewMode } from "./collab/stagingLayout";
 
 const { hideMeta } = useHideMeta();
 const projectStore = useProjectStore();
 const notificationStore = useNotificationStore();
+const CHAT_CHANGES_VIEW_MODE_STORAGE_KEY = "locus.chat.changesViewMode";
 
 const emit = defineEmits<{ close: [] }>();
 const props = defineProps<{
@@ -30,11 +34,14 @@ const changesStore = useChatChangesStore();
 const uiStore = useUiStore();
 
 const mode = computed(() => changesStore.currentMode);
+const fileViewMode = ref<StagingViewMode>(readStoredChatChangesViewMode());
+const collapsedFolders = ref(new Set<string>());
 
 // Close any stale diff UI when session changes and invalidate in-flight click requests.
 let clickSeq = 0;
 watch(() => chatStore.activeSessionId, () => {
   clickSeq++;
+  collapsedFolders.value = new Set();
   changesStore.closeInlineDiff();
 });
 
@@ -65,6 +72,10 @@ interface DisplayItem {
   assistantMessageId: string;
   roundCount?: number;
 }
+
+type DisplayTreeFile = GitFileChange & {
+  displayItem: DisplayItem;
+};
 
 const currentModeItems = computed<DisplayItem[]>(() => {
   const turnRounds = changesStore.latestTurnRounds;
@@ -97,7 +108,45 @@ const displayItems = computed(() => {
   return hideMeta.value ? items.filter((item) => !isMetaFile(item.fileChange.path)) : items;
 });
 
+const treeFiles = computed<DisplayTreeFile[]>(() =>
+  displayItems.value.map((item) => ({
+    ...item.fileChange,
+    displayItem: item,
+  })),
+);
+
+const treeRows = computed<StagingTreeRow<DisplayTreeFile>[]>(() =>
+  buildStagingTreeRows(treeFiles.value, collapsedFolders.value, (file) => file.displayItem.key),
+);
+
+watch(treeFiles, (files) => {
+  pruneCollapsedFolders(collectStagingFolderPaths(files));
+});
+
+watch(fileViewMode, (nextMode) => {
+  persistChatChangesViewMode(nextMode);
+});
+
 // ── Helpers ──
+
+function readStoredChatChangesViewMode(): StagingViewMode {
+  try {
+    const raw = localStorage.getItem(CHAT_CHANGES_VIEW_MODE_STORAGE_KEY);
+    if (raw === "tree") return "tree";
+    if (raw === "list") return "list";
+  } catch {
+    // Use the default list view when local storage is unavailable.
+  }
+  return "list";
+}
+
+function persistChatChangesViewMode(nextMode: StagingViewMode) {
+  try {
+    localStorage.setItem(CHAT_CHANGES_VIEW_MODE_STORAGE_KEY, nextMode);
+  } catch {
+    // The current in-memory view mode still applies.
+  }
+}
 
 function fileName(path: string): string {
   const parts = path.replace(/\\/g, "/").split("/");
@@ -119,6 +168,57 @@ function buildRequest(item: DisplayItem, detail: "preview" | "full") {
     assistantMessageId: item.assistantMessageId,
     detail,
   };
+}
+
+function fileStatusLabel(status: string): string {
+  switch (status) {
+    case "M": return "M";
+    case "A": return "A";
+    case "?": return "A";
+    case "D": return "D";
+    case "R": return "R";
+    default: return status;
+  }
+}
+
+function fileStatusClass(status: string): string {
+  switch (status) {
+    case "M": return "status-modified";
+    case "A": case "?": return "status-added";
+    case "D": return "status-deleted";
+    case "R": return "status-renamed";
+    default: return "status-modified";
+  }
+}
+
+function treeIndentPx(depth: number) {
+  if (depth <= 0) return 10;
+  return 10 + depth * 20;
+}
+
+function toggleFileViewMode(nextMode: StagingViewMode) {
+  fileViewMode.value = nextMode;
+}
+
+function toggleTreeFolder(chainPaths: readonly string[], expanded: boolean) {
+  const next = new Set(collapsedFolders.value);
+  if (expanded) {
+    const collapsedPath = chainPaths[chainPaths.length - 1];
+    if (collapsedPath) next.add(collapsedPath);
+  } else {
+    for (const path of chainPaths) {
+      next.delete(path);
+    }
+  }
+  collapsedFolders.value = next;
+}
+
+function pruneCollapsedFolders(validPaths: Set<string>) {
+  if (collapsedFolders.value.size === 0) return;
+  const next = new Set([...collapsedFolders.value].filter((path) => validPaths.has(path)));
+  if (next.size !== collapsedFolders.value.size) {
+    collapsedFolders.value = next;
+  }
 }
 
 // ── Hover ──
@@ -247,6 +347,7 @@ function onOpenInEditor(ev: MouseEvent, path: string) {
       <span class="panel-title">{{ t("chat.changes.title") }}</span>
       <div class="mode-tabs">
         <button
+          type="button"
           class="mode-tab"
           :class="{ active: mode === 'current' }"
           @click="changesStore.setMode('current')"
@@ -254,6 +355,7 @@ function onOpenInEditor(ev: MouseEvent, path: string) {
           {{ t("chat.changes.modeCurrent") }}
         </button>
         <button
+          type="button"
           class="mode-tab"
           :class="{ active: mode === 'all' }"
           @click="changesStore.setMode('all')"
@@ -261,35 +363,141 @@ function onOpenInEditor(ev: MouseEvent, path: string) {
           {{ t("chat.changes.modeAll") }}
         </button>
       </div>
-      <button
-        class="hide-meta-btn"
-        :class="{ active: hideMeta }"
-        @click="hideMeta = !hideMeta"
-        :title="t('common.hideMeta')"
-      >.meta</button>
-      <button v-if="props.showClose ?? true" class="close-btn" @click="emit('close')" :title="t('todo.close')">&times;</button>
+      <div class="panel-actions">
+        <button
+          type="button"
+          class="view-toggle-btn"
+          :class="{ active: fileViewMode === 'tree' }"
+          :aria-pressed="fileViewMode === 'tree'"
+          :title="fileViewMode === 'tree' ? t('collab.view.list') : t('collab.view.tree')"
+          @click="toggleFileViewMode(fileViewMode === 'tree' ? 'list' : 'tree')"
+        >
+          <svg v-if="fileViewMode === 'tree'" viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true">
+            <path d="M2.75 3a.75.75 0 0 0 0 1.5h10.5a.75.75 0 0 0 0-1.5H2.75zm0 4.25a.75.75 0 0 0 0 1.5h10.5a.75.75 0 0 0 0-1.5H2.75zm0 4.25a.75.75 0 0 0 0 1.5h10.5a.75.75 0 0 0 0-1.5H2.75z"/>
+          </svg>
+          <svg v-else viewBox="0 0 16 16" width="14" height="14" fill="none" aria-hidden="true">
+            <path d="M3 3.5a1 1 0 1 1 2 0 1 1 0 0 1-2 0zm8.25 0a.75.75 0 0 0 0 1.5h2a.75.75 0 0 0 0-1.5h-2zM5 4.25h2.5v3H11a1.75 1.75 0 0 1 1.75 1.75v1.75h.5a.75.75 0 0 1 0 1.5h-2a.75.75 0 0 1 0-1.5h.5V9A.25.25 0 0 0 11 8.75H7.5v2A1.75 1.75 0 0 1 5.75 12.5h-.5a1 1 0 1 1 0-1.5h.5a.25.25 0 0 0 .25-.25v-6.5H5z" fill="currentColor"/>
+          </svg>
+        </button>
+        <button
+          type="button"
+          class="hide-meta-btn"
+          :class="{ active: hideMeta }"
+          @click="hideMeta = !hideMeta"
+          :title="t('common.hideMeta')"
+        >.meta</button>
+        <button v-if="props.showClose ?? true" type="button" class="close-btn" @click="emit('close')" :title="t('todo.close')">&times;</button>
+      </div>
     </div>
-    <div class="file-list">
+    <div class="file-list" :class="{ 'changes-tree-list': fileViewMode === 'tree' }">
       <div v-if="changesStore.currentLoading" class="empty-hint">{{ t("chat.changes.loading") }}</div>
       <div v-else-if="changesStore.currentError" class="empty-hint error">{{ changesStore.currentError }}</div>
       <div v-else-if="displayItems.length === 0" class="empty-hint">{{ t("chat.changes.empty") }}</div>
+      <template v-else-if="fileViewMode === 'tree'">
+        <div
+          v-for="row in treeRows"
+          :key="row.key"
+        >
+          <div v-if="row.kind === 'folder'" class="changes-tree-row changes-tree-folder-row">
+            <button
+              type="button"
+              class="changes-tree-folder-btn"
+              :style="{ paddingLeft: `${treeIndentPx(row.depth)}px` }"
+              :title="row.path"
+              :aria-label="row.expanded ? t('merge.tree.toggleCollapse', row.name) : t('merge.tree.toggleExpand', row.name)"
+              @click="toggleTreeFolder(row.chainPaths, row.expanded)"
+            >
+              <span class="changes-tree-branch" :class="{ open: row.expanded }" aria-hidden="true">
+                <svg class="changes-tree-chevron" viewBox="0 0 16 16" width="10" height="10" fill="currentColor">
+                  <path d="M6.22 3.22a.75.75 0 0 1 1.06 0l4.25 4.25a.75.75 0 0 1 0 1.06l-4.25 4.25a.75.75 0 0 1-1.06-1.06L9.94 8 6.22 4.28a.75.75 0 0 1 0-1.06z"/>
+                </svg>
+              </span>
+              <span class="changes-tree-folder-icon" :class="{ open: row.expanded }" aria-hidden="true">
+                <svg viewBox="0 0 16 16" width="13" height="13" fill="none">
+                  <path
+                    v-if="!row.expanded"
+                    d="M2.25 4.5A1.25 1.25 0 0 1 3.5 3.25h2.1c.32 0 .62.13.84.36l.8.82c.14.15.34.23.55.23h4.71A1.25 1.25 0 0 1 13.75 5.9v5.6a1.25 1.25 0 0 1-1.25 1.25H3.5a1.25 1.25 0 0 1-1.25-1.25V4.5Z"
+                    fill="currentColor"
+                  />
+                  <path
+                    v-else
+                    d="M2.5 4.5a1.25 1.25 0 0 1 1.25-1.25h1.9c.28 0 .55.11.74.31l.98.98c.2.2.46.31.74.31h4.14a1.25 1.25 0 0 1 1.25 1.25v5.1a1.25 1.25 0 0 1-1.25 1.25h-8.5A1.25 1.25 0 0 1 2.5 11.2V4.5Z"
+                    stroke="currentColor"
+                    stroke-width="1.2"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                  />
+                </svg>
+              </span>
+              <span class="changes-tree-folder-name">{{ row.name }}</span>
+            </button>
+          </div>
+
+          <div
+            v-else
+            class="file-row changes-file-row"
+            @mouseenter="onItemMouseEnter($event, row.file.displayItem)"
+            @mouseleave="onItemMouseLeave"
+          >
+            <button
+              type="button"
+              class="file-item changes-file-main changes-tree-file-main"
+              :style="{ paddingLeft: `${treeIndentPx(row.depth)}px` }"
+              :title="row.file.path"
+              @click="onItemClick(row.file.displayItem)"
+            >
+              <span class="file-status" :class="fileStatusClass(row.file.status)">
+                {{ fileStatusLabel(row.file.status) }}
+              </span>
+              <span class="file-name">{{ fileName(row.file.path) }}</span>
+            </button>
+            <span class="file-actions">
+              <button
+                v-if="projectStore.unityConnected"
+                type="button"
+                class="file-action-btn"
+                :title="t('common.selectInUnity')"
+                @click="onSelectInUnity($event, row.file.path)"
+              >
+                <svg viewBox="0 0 16 16" width="12" height="12" fill="currentColor"><path d="M6.4 1L1 8l5.4 7h3.2L6.2 9.5H15v-3H6.2L9.6 1H6.4z"/></svg>
+              </button>
+              <button
+                v-if="canOpenInEditor(row.file.path)"
+                type="button"
+                class="file-action-btn"
+                :title="t('common.openInEditor')"
+                @click="onOpenInEditor($event, row.file.path)"
+              >
+                <svg viewBox="0 0 16 16" width="12" height="12" fill="currentColor"><path d="M8 1C4.1 1 1 4.1 1 8s3.1 7 7 7 7-3.1 7-7-3.1-7-7-7zm0 12.5c-3 0-5.5-2.5-5.5-5.5S5 2.5 8 2.5s5.5 2.5 5.5 5.5-2.5 5.5-5.5 5.5zM6 5l6 3-6 3V5z"/></svg>
+              </button>
+            </span>
+          </div>
+        </div>
+      </template>
       <template v-else>
         <div
           v-for="item in displayItems"
           :key="item.key"
-          class="file-item"
+          class="file-row changes-file-row"
           @mouseenter="onItemMouseEnter($event, item)"
           @mouseleave="onItemMouseLeave"
-          @click="onItemClick(item)"
         >
-          <span class="file-status" :class="'status-' + item.fileChange.status.charAt(0).toLowerCase()">
-            {{ item.fileChange.status }}
-          </span>
-          <span class="file-name">{{ fileName(item.fileChange.path) }}</span>
-          <span class="file-dir">{{ dirPath(item.fileChange.path) }}</span>
+          <button
+            type="button"
+            class="file-item changes-file-main"
+            :title="item.fileChange.path"
+            @click="onItemClick(item)"
+          >
+            <span class="file-status" :class="fileStatusClass(item.fileChange.status)">
+              {{ fileStatusLabel(item.fileChange.status) }}
+            </span>
+            <span class="file-name">{{ fileName(item.fileChange.path) }}</span>
+            <span class="file-dir">{{ dirPath(item.fileChange.path) }}</span>
+          </button>
           <span class="file-actions">
             <button
               v-if="projectStore.unityConnected"
+              type="button"
               class="file-action-btn"
               :title="t('common.selectInUnity')"
               @click="onSelectInUnity($event, item.fileChange.path)"
@@ -298,6 +506,7 @@ function onOpenInEditor(ev: MouseEvent, path: string) {
             </button>
             <button
               v-if="canOpenInEditor(item.fileChange.path)"
+              type="button"
               class="file-action-btn"
               :title="t('common.openInEditor')"
               @click="onOpenInEditor($event, item.fileChange.path)"
@@ -311,7 +520,7 @@ function onOpenInEditor(ev: MouseEvent, path: string) {
 
     <!-- Undo footer -->
     <div v-if="displayItems.length > 0 && !chatStore.isStreaming" class="panel-footer">
-      <button class="undo-btn" :disabled="checkingUndoConflicts" @click="onUndoClick">
+      <button type="button" class="undo-btn" :disabled="checkingUndoConflicts" @click="onUndoClick">
         {{ mode === 'current' ? t('chat.changes.undoCurrent') : t('chat.changes.undoAll') }}
       </button>
     </div>
@@ -324,8 +533,8 @@ function onOpenInEditor(ev: MouseEvent, path: string) {
             {{ mode === 'current' ? t('chat.changes.undoCurrentConfirm') : t('chat.changes.undoAllConfirm') }}
           </p>
           <div class="confirm-actions">
-            <button class="confirm-cancel" @click="cancelUndo">{{ t('chat.changes.cancel') }}</button>
-            <button class="confirm-ok" @click="confirmUndo()">{{ t('chat.changes.confirmOk') }}</button>
+            <button type="button" class="confirm-cancel" @click="cancelUndo">{{ t('chat.changes.cancel') }}</button>
+            <button type="button" class="confirm-ok" @click="confirmUndo()">{{ t('chat.changes.confirmOk') }}</button>
           </div>
         </div>
       </div>
@@ -344,8 +553,8 @@ function onOpenInEditor(ev: MouseEvent, path: string) {
             </div>
           </div>
           <div class="confirm-actions">
-            <button class="confirm-cancel" @click="cancelUndo">{{ t('chat.changes.cancel') }}</button>
-            <button class="confirm-ok" @click="confirmUndo(true)">{{ t('chat.changes.undoConflictForce') }}</button>
+            <button type="button" class="confirm-cancel" @click="cancelUndo">{{ t('chat.changes.cancel') }}</button>
+            <button type="button" class="confirm-ok" @click="confirmUndo(true)">{{ t('chat.changes.undoConflictForce') }}</button>
           </div>
         </div>
       </div>
@@ -385,6 +594,7 @@ function onOpenInEditor(ev: MouseEvent, path: string) {
   gap: 8px;
   padding: 12px 16px;
   border-bottom: 1px solid var(--border-color);
+  min-width: 0;
 }
 
 .panel-title {
@@ -395,6 +605,7 @@ function onOpenInEditor(ev: MouseEvent, path: string) {
 
 .mode-tabs {
   flex: 1;
+  min-width: 0;
   display: flex;
   gap: 2px;
   background: var(--input-bg);
@@ -404,6 +615,7 @@ function onOpenInEditor(ev: MouseEvent, path: string) {
 
 .mode-tab {
   flex: 1;
+  min-width: 0;
   border: none;
   background: transparent;
   color: var(--text-secondary);
@@ -412,6 +624,8 @@ function onOpenInEditor(ev: MouseEvent, path: string) {
   border-radius: 3px;
   cursor: pointer;
   white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .mode-tab.active {
@@ -420,7 +634,49 @@ function onOpenInEditor(ev: MouseEvent, path: string) {
   font-weight: 500;
 }
 
+.panel-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.view-toggle-btn {
+  width: 24px;
+  height: 24px;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  transition: background 0.15s, border-color 0.15s, color 0.15s;
+}
+
+.view-toggle-btn:hover {
+  background: var(--hover-bg);
+  color: var(--text-color);
+}
+
+.view-toggle-btn.active {
+  background: var(--active-bg);
+  color: var(--text-color);
+  border-color: color-mix(in srgb, var(--accent-color) 24%, var(--border-color));
+}
+
+.view-toggle-btn:focus-visible,
+.hide-meta-btn:focus-visible,
+.close-btn:focus-visible,
+.file-action-btn:focus-visible {
+  outline: 2px solid var(--accent-color);
+  outline-offset: -2px;
+}
+
 .hide-meta-btn {
+  height: 24px;
   border: 1px solid var(--border-color);
   border-radius: 4px;
   background: transparent;
@@ -471,51 +727,82 @@ function onOpenInEditor(ev: MouseEvent, path: string) {
 .file-list {
   flex: 1;
   overflow-y: auto;
-  padding: 4px;
+  padding: 4px 0;
+}
+
+.changes-tree-list {
+  padding: 4px 0;
+}
+
+.file-row {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  border-radius: 4px;
+}
+
+.file-row:hover {
+  background: var(--hover-bg);
 }
 
 .file-item {
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 6px 10px;
+  padding: 6px 10px 6px 12px;
   border-radius: 4px;
   cursor: pointer;
   font-size: 12px;
-}
-
-.file-item:hover {
-  background: var(--hover-bg);
-}
-
-.file-item:hover .file-actions {
-  opacity: 1;
+  min-width: 0;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  overflow: hidden;
+  flex: 1 1 auto;
 }
 
 .file-status {
   flex-shrink: 0;
   font-size: 10px;
-  font-weight: 600;
+  font-weight: 700;
   width: 16px;
   text-align: center;
+  line-height: 1;
 }
 
-.status-m { color: #d69e2e; }
-.status-a { color: #38a169; }
-.status-d { color: #e53e3e; }
-.status-r { color: #805ad5; }
+.status-modified {
+  color: var(--git-status-modified);
+}
+
+.status-added {
+  color: var(--git-status-added);
+}
+
+.status-deleted {
+  color: var(--git-status-deleted);
+}
+
+.status-renamed {
+  color: var(--git-status-renamed);
+}
 
 .file-name {
   font-size: 12px;
+  font-family: var(--font-mono-identifier);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  color: var(--text-color);
 }
 
 .file-dir {
   flex: 1;
   font-size: 11px;
+  font-family: var(--font-mono-identifier);
   color: var(--text-secondary);
+  opacity: 0.55;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -525,10 +812,17 @@ function onOpenInEditor(ev: MouseEvent, path: string) {
 
 .file-actions {
   display: flex;
+  align-items: center;
   gap: 2px;
   flex-shrink: 0;
   opacity: 0;
   transition: opacity 0.1s;
+  padding-right: 8px;
+}
+
+.file-row:hover .file-actions,
+.file-actions:focus-within {
+  opacity: 1;
 }
 
 .file-action-btn {
@@ -546,8 +840,84 @@ function onOpenInEditor(ev: MouseEvent, path: string) {
 }
 
 .file-action-btn:hover {
-  background: var(--active-bg, rgba(255, 255, 255, 0.1));
+  background: var(--active-bg);
   color: var(--text-color);
+}
+
+.changes-tree-row {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+
+.changes-tree-folder-btn {
+  width: 100%;
+  min-height: 28px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 12px;
+  border: none;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+}
+
+.changes-tree-folder-btn:hover {
+  background: var(--hover-bg);
+  color: var(--text-color);
+}
+
+.changes-tree-folder-btn:focus-visible,
+.file-item:focus-visible {
+  outline: 2px solid var(--accent-color);
+  outline-offset: -2px;
+}
+
+.changes-tree-branch,
+.changes-tree-folder-icon {
+  width: 14px;
+  height: 14px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.changes-tree-branch {
+  color: var(--text-secondary);
+}
+
+.changes-tree-chevron {
+  transition: transform 0.15s ease;
+}
+
+.changes-tree-branch.open .changes-tree-chevron {
+  transform: rotate(90deg);
+}
+
+.changes-tree-folder-icon {
+  color: color-mix(in srgb, var(--text-secondary) 82%, var(--text-color));
+}
+
+.changes-tree-folder-icon.open {
+  color: var(--text-color);
+}
+
+.changes-tree-folder-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-color);
+  font-size: 12px;
+  font-family: var(--font-mono-identifier);
+}
+
+.changes-tree-file-main {
+  gap: 6px;
 }
 
 .empty-hint {
@@ -558,7 +928,7 @@ function onOpenInEditor(ev: MouseEvent, path: string) {
 }
 
 .empty-hint.error {
-  color: #e53e3e;
+  color: var(--status-danger-fg);
 }
 
 /* ── Undo footer ── */
@@ -571,10 +941,10 @@ function onOpenInEditor(ev: MouseEvent, path: string) {
 .undo-btn {
   width: 100%;
   padding: 6px 0;
-  border: 1px solid #e53e3e;
+  border: 1px solid var(--status-danger-fg);
   border-radius: 4px;
   background: none;
-  color: #e53e3e;
+  color: var(--status-danger-fg);
   font-size: 12px;
   cursor: pointer;
 }
@@ -585,7 +955,7 @@ function onOpenInEditor(ev: MouseEvent, path: string) {
 }
 
 .undo-btn:hover {
-  background: rgba(229, 62, 62, 0.1);
+  background: var(--status-danger-bg);
 }
 
 /* ── Confirm dialog ── */
@@ -675,13 +1045,13 @@ function onOpenInEditor(ev: MouseEvent, path: string) {
 }
 
 .confirm-ok {
-  background: #e53e3e;
-  color: #fff;
-  border-color: #e53e3e;
+  background: var(--status-danger-fg);
+  color: var(--bg-color);
+  border-color: var(--status-danger-fg);
 }
 
 .confirm-ok:hover {
-  background: #c53030;
+  filter: brightness(0.92);
 }
 
 /* Transition */

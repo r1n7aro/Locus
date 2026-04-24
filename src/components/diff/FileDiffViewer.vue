@@ -158,6 +158,21 @@ const hasSemanticAndText = computed(
   () => !!props.payload.semantic && (!!effectiveText.value || props.payload.isLarge),
 );
 
+const hasSemanticDetails = computed(() => {
+  const semantic = props.payload.semantic;
+  if (!semantic) return false;
+  if (semantic.layout === "sceneHierarchyInspector") {
+    return (semantic.tree?.length ?? 0) > 0;
+  }
+  return (semantic.targets?.length ?? 0) > 0 || !!semantic.inspector;
+});
+
+const largeFallbackText = computed(() =>
+  props.compact
+    ? "Too large"
+    : props.payload.previewSummary?.[0] ?? "File too large for diff",
+);
+
 /** Strip fileID from labels like "StateSO (fileID:11400000)" */
 function cleanLabel(label: string): string {
   return label.replace(/\s*\(fileID:\d+\)\s*/g, "").trim();
@@ -437,12 +452,12 @@ defineExpose({ activeTab, hasSemanticAndText });
       </button>
       <p v-if="lfsPullError" class="lfs-error">{{ lfsPullError }}</p>
     </div>
-    <div v-else-if="payload.isLarge && !payload.semantic && !effectiveText" class="diff-fallback">
-      <p>{{ payload.previewSummary?.[0] ?? 'File too large for diff' }}</p>
-      <button class="lfs-pull-btn" :disabled="lazyTextLoading" @click="loadTextDiff">
+    <div v-else-if="payload.isLarge && !payload.semantic && !effectiveText" class="diff-fallback" :class="{ compact }">
+      <p>{{ largeFallbackText }}</p>
+      <button v-if="!compact" class="lfs-pull-btn" :disabled="lazyTextLoading" @click="loadTextDiff">
         {{ lazyTextLoading ? 'Computing...' : 'Load text diff' }}
       </button>
-      <p v-if="lazyTextError" class="lfs-error">{{ lazyTextError }}</p>
+      <p v-if="!compact && lazyTextError" class="lfs-error">{{ lazyTextError }}</p>
     </div>
     <template v-else>
       <div v-if="hasSemanticAndText && !hideBuiltinTabs" class="diff-tabs">
@@ -461,16 +476,16 @@ defineExpose({ activeTab, hasSemanticAndText });
             <span v-if="payload.semantic?.summary.changedFields" class="summary-text">{{ t('diff.summary.fields', payload.semantic.summary.changedFields) }}</span>
           </template>
           <span v-else class="summary-text">{{ semanticSummary.join(" · ") }}</span>
-          <span class="summary-spacer"></span>
-          <button class="summary-toggle-btn" :class="{ active: includeUnchanged }" @click="toggleIncludeUnchanged">
+          <span v-if="!compact" class="summary-spacer"></span>
+          <button v-if="!compact" class="summary-toggle-btn" :class="{ active: includeUnchanged }" @click="toggleIncludeUnchanged">
             {{ t('diff.fields.showUnchanged') }}
           </button>
-          <button class="summary-toggle-btn" :class="{ active: displayMode === 'full' }" @click="toggleDisplayMode">
+          <button v-if="!compact" class="summary-toggle-btn" :class="{ active: displayMode === 'full' }" @click="toggleDisplayMode">
             {{ t('diff.mode.full') }}
           </button>
         </div>
 
-        <div v-if="compact || !payload.semantic.tree && !payload.semantic.targets" class="semantic-preview">
+        <div v-if="!hasSemanticDetails" class="semantic-preview">
           Semantic summary is available in full diff view.
         </div>
 
@@ -480,6 +495,8 @@ defineExpose({ activeTab, hasSemanticAndText });
               <UnityHierarchyPane
                 :nodes="treeNodes()"
                 :selected-id="selectedTargetId"
+                :hide-title="compact"
+                :auto-collapse-when-overflow="compact"
                 @select="onSelectTarget"
               />
             </div>
@@ -554,12 +571,12 @@ defineExpose({ activeTab, hasSemanticAndText });
       </div>
 
       <!-- On-demand text diff loading for large files -->
-      <div v-if="!effectiveText && (activeTab === 'text' || !payload.semantic)" class="diff-fallback">
-        <p>{{ payload.previewSummary?.[0] ?? 'File too large for diff' }}</p>
-        <button class="lfs-pull-btn" :disabled="lazyTextLoading" @click="loadTextDiff">
+      <div v-if="!effectiveText && (activeTab === 'text' || !payload.semantic)" class="diff-fallback" :class="{ compact }">
+        <p>{{ largeFallbackText }}</p>
+        <button v-if="!compact" class="lfs-pull-btn" :disabled="lazyTextLoading" @click="loadTextDiff">
           {{ lazyTextLoading ? 'Computing...' : 'Load text diff' }}
         </button>
-        <p v-if="lazyTextError" class="lfs-error">{{ lazyTextError }}</p>
+        <p v-if="!compact && lazyTextError" class="lfs-error">{{ lazyTextError }}</p>
       </div>
       <div v-if="effectiveText && (activeTab === 'text' || !payload.semantic)" ref="textScrollEl" class="diff-text" :class="[mode]" @scroll="onTextScroll">
         <!-- Loading indicator while preparing large text -->
@@ -630,6 +647,12 @@ defineExpose({ activeTab, hasSemanticAndText });
   color: var(--text-secondary);
 }
 
+.diff-fallback.compact {
+  padding: 28px 16px;
+  font-size: 12px;
+  text-transform: lowercase;
+}
+
 .diff-binary-shell {
   flex: 1;
   display: flex;
@@ -698,8 +721,13 @@ defineExpose({ activeTab, hasSemanticAndText });
 .semantic-summary {
   display: flex;
   align-items: center;
+  gap: 8px;
   padding: 8px 14px;
   border-bottom: 1px solid var(--border-color);
+}
+
+.diff-viewer.compact .semantic-summary {
+  padding: 6px 10px;
 }
 
 .summary-asset-name {
@@ -793,10 +821,19 @@ defineExpose({ activeTab, hasSemanticAndText });
   height: 100%;
 }
 
+.diff-viewer.compact .semantic-layout {
+  min-height: 170px;
+}
+
 .scene-layout .hierarchy-column {
   width: 32%;
   min-width: 240px;
   max-width: 360px;
+}
+
+.diff-viewer.compact .scene-layout .hierarchy-column {
+  width: 38%;
+  min-width: 150px;
 }
 
 .scene-layout .inspector-column {
@@ -814,6 +851,11 @@ defineExpose({ activeTab, hasSemanticAndText });
   width: 32%;
   min-width: 200px;
   max-width: 320px;
+}
+
+.diff-viewer.compact .asset-sidebar-layout > .asset-sidebar {
+  width: 38%;
+  min-width: 150px;
 }
 
 .asset-sidebar-layout > .inspector-column {
