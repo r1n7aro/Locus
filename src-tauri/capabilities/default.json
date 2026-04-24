@@ -9,7 +9,8 @@
     "knowledge-lexical-progress",
     "unity-reference-import-progress",
     "feishu-reference-import-progress",
-    "reference-external-import"
+    "reference-external-import",
+    "unity-embed"
   ],
   "permissions": [
     "core:default",

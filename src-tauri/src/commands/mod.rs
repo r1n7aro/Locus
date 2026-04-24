@@ -13,6 +13,7 @@ mod skill;
 mod storage;
 mod system;
 mod undo;
+mod unity_embed;
 mod update;
 mod workspace;
 
@@ -240,5 +241,6 @@ pub use skill::*;
 pub use storage::*;
 pub use system::*;
 pub use undo::*;
+pub use unity_embed::*;
 pub use update::*;
 pub use workspace::*;

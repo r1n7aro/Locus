@@ -499,6 +499,7 @@ pub fn run() {
             app.manage(unity_reference_import_state);
             app.manage(feishu_reference_import_state);
             app.manage(log_store_for_setup.clone());
+            commands::start_unity_embed_control_server(app.handle().clone());
 
             let app_handle = app.handle().clone();
             let workspace_for_unity = workspace.clone();
@@ -569,6 +570,8 @@ pub fn run() {
             commands::unarchive_session,
             commands::delete_session,
             commands::get_session_usage,
+            commands::get_session_active_run,
+            commands::list_session_events,
             commands::get_auth_status,
             commands::get_auth_url,
             commands::exchange_auth_code,
@@ -765,6 +768,7 @@ pub fn run() {
             commands::get_config_registry,
             commands::get_log_entries,
             commands::clear_log_entries,
+            commands::unity_embed_status,
             commands::fetch_app_update_manifest,
         ])
         .run(tauri::generate_context!())
