@@ -2,6 +2,7 @@
 import { computed, onMounted, onUnmounted, ref } from "vue";
 import { t } from "../../i18n";
 import type { SessionSummary } from "../../types";
+import { formatShortcut, useKeyboardShortcuts } from "../../composables/useKeyboardShortcuts";
 
 const MAX_RECENT_SESSIONS = 12;
 
@@ -9,15 +10,18 @@ const props = defineProps<{
   sessions: SessionSummary[];
   activeSessionId: string | null;
   streamingSessionIds?: Set<string>;
+  showExpandPanelButton?: boolean;
 }>();
 
 const emit = defineEmits<{
   selectSession: [id: string];
   newChat: [];
+  expandPanel: [];
 }>();
 
 const open = ref(false);
 const pickerRef = ref<HTMLElement | null>(null);
+const { state: shortcutState } = useKeyboardShortcuts();
 
 const sortedSessions = computed(() =>
   [...props.sessions].sort((a, b) => b.updatedAt - a.updatedAt),
@@ -34,6 +38,8 @@ const activeSession = computed(() =>
 const currentTitle = computed(() =>
   activeSession.value?.title || t("chat.session.newSession"),
 );
+const showNewButton = computed(() => props.activeSessionId !== null);
+const newChatShortcutLabel = computed(() => formatShortcut(shortcutState.newChat));
 
 function formatSessionTime(ts: number): string {
   const nowTs = Math.floor(Date.now() / 1000);
@@ -87,19 +93,31 @@ onUnmounted(() => document.removeEventListener("click", onClickOutside));
 <template>
   <div ref="pickerRef" class="session-compact-picker">
     <button
+      v-if="props.showExpandPanelButton"
+      type="button"
+      class="session-compact-expand"
+      :title="t('chat.session.expandList')"
+      :aria-label="t('chat.session.expandList')"
+      @click="emit('expandPanel')"
+    >
+      <svg viewBox="0 0 16 16" width="13" height="13" fill="currentColor" aria-hidden="true">
+        <path d="M3 3.75A1.75 1.75 0 0 1 4.75 2h6.5A1.75 1.75 0 0 1 13 3.75v8.5A1.75 1.75 0 0 1 11.25 14h-6.5A1.75 1.75 0 0 1 3 12.25v-8.5Zm1.5 0v8.5c0 .14.11.25.25.25H6.5v-9H4.75a.25.25 0 0 0-.25.25Zm3.5-.25v9h3.25c.14 0 .25-.11.25-.25v-8.5a.25.25 0 0 0-.25-.25H8Z"/>
+      </svg>
+    </button>
+    <button
       type="button"
       class="session-compact-trigger"
       :class="{ open }"
       :title="currentTitle"
       @click="toggle"
     >
-      <span class="session-compact-label">{{ t("chat.session.title") }}</span>
       <span class="session-compact-title">{{ currentTitle }}</span>
       <svg class="session-compact-chevron" viewBox="0 0 16 16" fill="currentColor" width="10" height="10" aria-hidden="true">
         <path d="M4.427 5.427a.75.75 0 0 1 1.06-.013L8 7.867l2.513-2.453a.75.75 0 1 1 1.047 1.073l-3 2.927a.75.75 0 0 1-1.047 0l-3-2.927a.75.75 0 0 1-.013-1.06z"/>
       </svg>
     </button>
     <button
+      v-if="showNewButton"
       type="button"
       class="session-compact-new"
       :title="t('chat.session.new')"
@@ -116,8 +134,9 @@ onUnmounted(() => document.removeEventListener("click", onClickOutside));
           :class="{ active: activeSessionId === null }"
           @click="newChat"
         >
-          <span class="session-compact-option-dot"></span>
+          <span class="session-compact-option-plus" aria-hidden="true">+</span>
           <span class="session-compact-option-title">{{ t("chat.session.newSession") }}</span>
+          <span class="session-compact-option-shortcut">{{ newChatShortcutLabel }}</span>
         </button>
         <div class="session-compact-divider"></div>
         <div v-if="recentSessions.length === 0" class="session-compact-empty">
@@ -161,6 +180,7 @@ onUnmounted(() => document.removeEventListener("click", onClickOutside));
 
 .session-compact-trigger,
 .session-compact-new,
+.session-compact-expand,
 .session-compact-option {
   font-family: inherit;
 }
@@ -172,8 +192,8 @@ onUnmounted(() => document.removeEventListener("click", onClickOutside));
   min-width: 0;
   max-width: min(360px, calc(100vw - 72px));
   min-height: 26px;
-  padding: 0 8px;
-  border: 1px solid var(--border-color);
+  padding: 0 4px;
+  border: 1px solid transparent;
   border-radius: 6px;
   background: transparent;
   color: var(--text-secondary);
@@ -185,15 +205,8 @@ onUnmounted(() => document.removeEventListener("click", onClickOutside));
 .session-compact-trigger:hover,
 .session-compact-trigger.open {
   background: var(--hover-bg);
-  border-color: var(--border-strong);
+  border-color: transparent;
   color: var(--text-color);
-}
-
-.session-compact-label {
-  flex-shrink: 0;
-  font-size: 11px;
-  font-weight: 600;
-  color: var(--text-secondary);
 }
 
 .session-compact-title {
@@ -201,7 +214,8 @@ onUnmounted(() => document.removeEventListener("click", onClickOutside));
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: 12px;
+  font-size: 14px;
+  font-weight: 600;
   color: var(--text-color);
 }
 
@@ -215,26 +229,50 @@ onUnmounted(() => document.removeEventListener("click", onClickOutside));
   transform: rotate(180deg);
 }
 
-.session-compact-new {
+.session-compact-new,
+.session-compact-expand {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 26px;
-  height: 26px;
-  border: 1px solid var(--border-color);
+  width: 28px;
+  height: 28px;
+  border: 1px solid transparent;
   border-radius: 6px;
   background: transparent;
-  color: var(--text-color);
-  font-size: 16px;
+  color: var(--text-secondary);
+  font-size: 18px;
   line-height: 1;
   cursor: pointer;
   box-shadow: none;
   transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
 }
 
-.session-compact-new:hover {
+.session-compact-new:hover,
+.session-compact-new:focus-visible,
+.session-compact-expand:hover,
+.session-compact-expand:focus-visible {
   background: var(--hover-bg);
   border-color: var(--border-strong);
+  color: var(--text-color);
+  outline: none;
+}
+
+.session-compact-expand svg {
+  width: 15px;
+  height: 15px;
+}
+
+.session-compact-trigger {
+  order: 1;
+}
+
+.session-compact-new {
+  order: 2;
+}
+
+.session-compact-expand {
+  order: 3;
+  margin-left: auto;
 }
 
 .session-compact-dropdown {
@@ -290,6 +328,16 @@ onUnmounted(() => document.removeEventListener("click", onClickOutside));
   flex-shrink: 0;
 }
 
+.session-compact-option-plus {
+  width: 8px;
+  flex-shrink: 0;
+  color: var(--text-secondary);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1;
+  text-align: center;
+}
+
 .session-compact-option.running .session-compact-option-dot {
   width: 6px;
   height: 6px;
@@ -308,6 +356,13 @@ onUnmounted(() => document.removeEventListener("click", onClickOutside));
 }
 
 .session-compact-option-time {
+  flex-shrink: 0;
+  font-size: 11px;
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+.session-compact-option-shortcut {
   flex-shrink: 0;
   font-size: 11px;
   color: var(--text-secondary);

@@ -12,12 +12,14 @@ interface ToolPermissionItem {
 }
 
 const props = defineProps<{
+  toolPermissionMode: ToolMode;
   toolList: ToolPermissionItem[];
   toolPermissions: Record<string, ToolMode>;
   permSaveMsg: string;
 }>();
 
 const emit = defineEmits<{
+  setGlobalPermissionMode: [mode: ToolMode];
   setPermission: [name: string, mode: ToolMode];
 }>();
 
@@ -50,6 +52,22 @@ function getToolMode(name: string): ToolMode {
             {{ permSaveMsg }}
           </div>
         </Transition>
+      </div>
+
+      <div class="perm-mode-row">
+        <div class="perm-mode-copy">
+          <span class="perm-mode-label">{{ t("settings.perms.globalMode") }}</span>
+          <span class="perm-mode-desc">{{ t("settings.perms.globalModeDesc") }}</span>
+        </div>
+
+        <div class="perm-mode-control">
+          <BaseSegmented
+            size="sm"
+            :model-value="toolPermissionMode"
+            :options="[...permissionOptions]"
+            @update:model-value="emit('setGlobalPermissionMode', $event as ToolMode)"
+          />
+        </div>
       </div>
 
       <div class="perm-card">
@@ -110,6 +128,52 @@ function getToolMode(name: string): ToolMode {
   font-weight: 600;
   line-height: 1;
   pointer-events: none;
+}
+
+.perm-mode-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 16px;
+  align-items: center;
+  margin-bottom: 12px;
+  padding: 12px 16px;
+  border: 1px solid var(--border-color);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--panel-bg) 84%, var(--sidebar-bg) 16%);
+}
+
+.perm-mode-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.perm-mode-label {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-color);
+}
+
+.perm-mode-desc {
+  font-size: 12px;
+  color: var(--text-secondary);
+  line-height: 1.45;
+}
+
+.perm-mode-control {
+  width: 116px;
+  flex-shrink: 0;
+}
+
+.perm-mode-control :deep(.base-segmented) {
+  display: flex;
+  width: 100%;
+}
+
+.perm-mode-control :deep(.base-segmented-item) {
+  flex: 1;
+  justify-content: center;
 }
 
 .perm-card {
@@ -204,6 +268,15 @@ function getToolMode(name: string): ToolMode {
 
   .perm-table-head {
     display: none;
+  }
+
+  .perm-mode-row {
+    grid-template-columns: 1fr;
+    gap: 10px;
+  }
+
+  .perm-mode-control {
+    width: 100%;
   }
 
   .perm-row {

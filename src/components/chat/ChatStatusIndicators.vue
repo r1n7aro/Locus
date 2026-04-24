@@ -17,6 +17,7 @@ interface StatusItem {
   icon: StatusIcon;
   title: string;
   summary: string;
+  inlineLabel: string;
   tone: StatusTone;
   rows: StatusDetailRow[];
   actionLabel?: string;
@@ -69,7 +70,7 @@ const scanSummary = computed(() => {
 const assetStatusLabel = computed(() => {
   if (isScanning.value) return scanLabel.value;
   if (scanError.value) return scanError.value.message;
-  if (scanSummary.value) return scanSummary.value;
+  if (scanSummary.value) return t("chat.assetDb.ready");
   return props.isUnityProject ? t("chat.assetDb.notBuilt") : t("chat.status.assetDb.noWorkspace");
 });
 
@@ -148,6 +149,7 @@ const statusItems = computed<StatusItem[]>(() => [
     icon: "database",
     title: t("chat.status.assetDb.title"),
     summary: assetStatusLabel.value,
+    inlineLabel: assetStatusLabel.value,
     tone: assetTone.value,
     rows: assetRows.value,
     actionLabel: assetActionLabel.value,
@@ -159,6 +161,7 @@ const statusItems = computed<StatusItem[]>(() => [
     icon: "unity",
     title: t("chat.status.unity.title"),
     summary: props.unityConnected ? t("chat.unity.connected") : t("chat.unity.disconnected"),
+    inlineLabel: props.unityConnected ? t("chat.unity.connected") : t("chat.unity.disconnected"),
     tone: props.unityConnected ? "success" : "danger",
     rows: unityRows.value,
   },
@@ -202,8 +205,7 @@ onUnmounted(() => {
         type="button"
         class="chat-status-icon-btn ui-select-none"
         :class="[`tone-${item.tone}`, { active: activePopover === item.id }]"
-        :title="item.summary"
-        :aria-label="item.title"
+        :aria-label="`${item.title}: ${item.summary}`"
         :aria-expanded="activePopover === item.id"
         @click="togglePopover(item.id)"
       >
@@ -231,6 +233,7 @@ onUnmounted(() => {
           <path d="M8 1.4v5.2m5.8-1.9L8 6.6m-5.8-1.9L8 6.6m0 8V9.4" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" />
           <path d="m2.2 11.3 3.1-1.8m8.5 1.8-3.1-1.8" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" />
         </svg>
+        <span class="chat-status-icon-label">{{ item.inlineLabel }}</span>
       </button>
     </div>
 
@@ -284,6 +287,7 @@ onUnmounted(() => {
 }
 
 .chat-status-icon-btn {
+  position: relative;
   width: 24px;
   height: 24px;
   min-width: 24px;
@@ -301,9 +305,43 @@ onUnmounted(() => {
 }
 
 .chat-status-icon-btn:hover,
-.chat-status-icon-btn.active {
+.chat-status-icon-btn.active,
+.chat-status-icon-btn:focus-visible {
   background: var(--hover-bg);
   border-color: color-mix(in srgb, currentColor 22%, transparent);
+}
+
+.chat-status-icon-btn svg {
+  flex: 0 0 auto;
+}
+
+.chat-status-icon-label {
+  position: absolute;
+  left: 50%;
+  bottom: calc(100% + 6px);
+  z-index: 35;
+  max-width: 180px;
+  padding: 4px 7px;
+  border: 1px solid var(--border-color);
+  border-radius: 5px;
+  background: var(--surface-elevated, var(--panel-bg));
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.16);
+  color: currentColor;
+  pointer-events: none;
+  overflow: hidden;
+  font-size: 11px;
+  line-height: 1.3;
+  opacity: 0;
+  transform: translate(-50%, 3px);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  transition: opacity 0.1s ease, transform 0.1s ease;
+}
+
+.chat-status-icon-btn:not(.active):hover .chat-status-icon-label,
+.chat-status-icon-btn:not(.active):focus-visible .chat-status-icon-label {
+  opacity: 1;
+  transform: translate(-50%, 0);
 }
 
 .chat-status-icon-btn.tone-success {

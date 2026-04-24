@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onUnmounted, ref, useSlots, watch } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, ref, useSlots, watch } from "vue";
 import type { ComponentPublicInstance } from "vue";
 import { t } from "../../i18n";
 import { searchWorkspaceAssets } from "../../services/asset";
@@ -72,6 +72,8 @@ const props = withDefaults(defineProps<{
   maxImages?: number;
   showTopPlanBadge?: boolean;
   showSkillBadges?: boolean;
+  compact?: boolean;
+  showAction?: boolean;
 }>(), {
   skills: () => [],
   placeholder: "",
@@ -83,6 +85,8 @@ const props = withDefaults(defineProps<{
   maxImages: 5,
   showTopPlanBadge: true,
   showSkillBadges: true,
+  compact: false,
+  showAction: true,
 });
 
 const emit = defineEmits<{
@@ -108,6 +112,7 @@ const {
 const pastedContent = ref("");
 const showPasteEditor = ref(false);
 const imageAttachments = ref<ImageAttachment[]>([]);
+const previewImageIndex = ref<number | null>(null);
 const composerIntent = ref<ComposerIntentState>(emptyComposerIntent());
 const activeOperator = ref<ActiveOperator | null>(null);
 const dismissedOperatorKey = ref<string | null>(null);
@@ -137,10 +142,17 @@ const canSend = computed(() =>
   || !!pastedContent.value
   || imageAttachments.value.length > 0,
 );
-const hasTopStart = computed(() =>
-  !!slots["top-start"] || (!!props.showTopPlanBadge && !!composerPlanBadge.value),
+const hasHeaderStart = computed(() =>
+  !!slots["header-start"]
+  || (!!props.showTopPlanBadge && !!composerPlanBadge.value)
+  || (!!props.showSkillBadges && composerSkillBadges.value.length > 0),
 );
-const hasTopEnd = computed(() => !!slots["top-end"]);
+const hasHeaderEnd = computed(() => !!slots["header-end"]);
+const hasHeaderContent = computed(() => hasHeaderStart.value || hasHeaderEnd.value);
+const hasFooterStart = computed(() => !!slots["footer-start"] || !!slots["top-start"]);
+const hasFooterEnd = computed(() =>
+  !!slots["footer-end"] || !!slots["top-end"] || !!slots.footer,
+);
 
 const commandToken = computed(() =>
   activeOperator.value?.kind === "slash" ? activeOperator.value.token : "",
@@ -164,6 +176,13 @@ const composerPlanBadge = computed(() =>
 );
 const composerSkillBadges = computed(() =>
   composerBadges.value.filter((badge) => badge.kind === "skill"),
+);
+const previewImage = computed(() => {
+  const index = previewImageIndex.value;
+  return index == null ? null : imageAttachments.value[index] ?? null;
+});
+const previewImageSrc = computed(() =>
+  previewImage.value ? imagePreviewUrl(previewImage.value) : "",
 );
 
 const mentionBreadcrumbs = computed(() => {
@@ -687,6 +706,7 @@ function resetDraft() {
   setInputValue("");
   pastedContent.value = "";
   imageAttachments.value = [];
+  closeImagePreview();
   composerIntent.value = emptyComposerIntent();
   activeOperator.value = null;
   dismissedOperatorKey.value = null;
@@ -766,7 +786,9 @@ function handleSend() {
 
   const mergedIntent = mergeComposerIntent(composerIntent.value, parsed.intent);
   const cleanedInput = normalizeComposerText(parsed.cleanedText);
-  const images = props.allowImages ? [...imageAttachments.value] : [];
+  const images: ImageAttachment[] = props.allowImages
+    ? imageAttachments.value.map(({ data, mimeType }) => ({ data, mimeType }))
+    : [];
 
   if (!cleanedInput && !pastedContent.value && images.length === 0) {
     if (hasComposerIntent(mergedIntent)) {
@@ -896,10 +918,11 @@ function handlePaste(event: ClipboardEvent) {
   if (props.allowImages && items) {
     for (let index = 0; index < items.length; index += 1) {
       const item = items[index];
-      if (!item.type.startsWith("image/")) continue;
+      const file = item.kind === "file" ? item.getAsFile() : null;
+      const mimeType = item.type || file?.type || "";
+      if (!file || !mimeType.startsWith("image/")) continue;
       event.preventDefault();
-      const file = item.getAsFile();
-      if (file) addImageFile(file);
+      addImageFile(file);
       return;
     }
   }
@@ -927,11 +950,26 @@ function addImageFile(file: File) {
 }
 
 function removeImage(index: number) {
+  closeImagePreview();
   imageAttachments.value.splice(index, 1);
 }
 
 function imagePreviewUrl(image: ImageAttachment): string {
   return `data:${image.mimeType};base64,${image.data}`;
+}
+
+function openImagePreview(index: number) {
+  previewImageIndex.value = index;
+}
+
+function closeImagePreview() {
+  previewImageIndex.value = null;
+}
+
+function handleDocumentKeydown(event: KeyboardEvent) {
+  if (event.key === "Escape" && previewImageIndex.value != null) {
+    closeImagePreview();
+  }
 }
 
 function openPasteEditor() {
@@ -998,7 +1036,12 @@ watch(
   },
 );
 
+onMounted(() => {
+  document.addEventListener("keydown", handleDocumentKeydown);
+});
+
 onUnmounted(() => {
+  document.removeEventListener("keydown", handleDocumentKeydown);
   clearMentionDebounce();
   invalidateMentionRequests();
 });
@@ -1023,23 +1066,6 @@ defineExpose({
 
 <template>
   <ChatInputShell>
-    <template v-if="hasTopStart" #top-start>
-      <slot name="top-start" />
-      <button
-        v-if="showTopPlanBadge && composerPlanBadge"
-        type="button"
-        class="composer-badge composer-top-badge plan ui-select-none"
-        @click="removePlanBadge"
-      >
-        <span>{{ composerPlanBadge.label }}</span>
-        <span class="composer-badge-remove">&times;</span>
-      </button>
-    </template>
-
-    <template v-if="hasTopEnd" #top-end>
-      <slot name="top-end" />
-    </template>
-
     <template #floating>
       <Transition name="cmd-popup">
         <div
@@ -1088,19 +1114,6 @@ defineExpose({
 
     <template #before-composer>
       <Transition name="paste-preview">
-        <div v-if="imageAttachments.length > 0" class="image-preview-bar">
-          <div
-            v-for="(image, index) in imageAttachments"
-            :key="index"
-            class="image-preview-item"
-          >
-            <img :src="imagePreviewUrl(image)" class="image-preview-thumb" />
-            <button class="image-preview-remove ui-select-none" @click="removeImage(index)">&times;</button>
-          </div>
-        </div>
-      </Transition>
-
-      <Transition name="paste-preview">
         <div v-if="pastedContent" class="paste-preview">
           <div
             class="paste-preview-body"
@@ -1128,6 +1141,10 @@ defineExpose({
       :send-label="sendLabel"
       :cancel-label="cancelLabel"
       :submit-mode="chatInputSettings.submitMode"
+      :compact="compact"
+      :show-action="showAction"
+      :show-header="hasHeaderContent"
+      :extend-top="imageAttachments.length > 0"
       @update:model-value="setInputValue"
       @keydown="handleKeydown"
       @paste="handlePaste"
@@ -1138,25 +1155,73 @@ defineExpose({
       @send="handleSend"
       @cancel="emit('cancel')"
     >
-      <template #header>
-        <div v-if="showSkillBadges && composerSkillBadges.length > 0" class="composer-badge-row">
-          <button
-            v-for="badge in composerSkillBadges"
-            :key="badge.key"
-            type="button"
-            class="composer-badge skill ui-select-none"
-            @click="badge.skill ? removeSkillBadge(badge.skill) : undefined"
+      <template #overlay>
+        <div v-if="imageAttachments.length > 0" class="image-attachment-list">
+          <div
+            v-for="(image, index) in imageAttachments"
+            :key="index"
+            class="image-attachment-item"
           >
-            <span>{{ badge.label }}</span>
-            <span class="composer-badge-remove">&times;</span>
-          </button>
+            <button
+              class="image-attachment-thumb-button ui-select-none"
+              type="button"
+              :aria-label="t('chat.paste.previewImage')"
+              @click="openImagePreview(index)"
+            >
+              <img :src="imagePreviewUrl(image)" class="image-attachment-thumb" alt="" />
+            </button>
+            <button
+              class="image-attachment-remove ui-select-none"
+              type="button"
+              :aria-label="t('chat.paste.remove')"
+              @click="removeImage(index)"
+            >
+              &times;
+            </button>
+          </div>
         </div>
       </template>
+      <template #header>
+        <div class="composer-header-row">
+          <div v-if="hasHeaderStart" class="composer-header-start">
+            <slot name="header-start" />
+            <button
+              v-if="showTopPlanBadge && composerPlanBadge"
+              type="button"
+              class="composer-badge composer-top-badge plan ui-select-none"
+              @click="removePlanBadge"
+            >
+              <span>{{ composerPlanBadge.label }}</span>
+              <span class="composer-badge-remove">&times;</span>
+            </button>
+            <div v-if="showSkillBadges && composerSkillBadges.length > 0" class="composer-badge-row">
+              <button
+                v-for="badge in composerSkillBadges"
+                :key="badge.key"
+                type="button"
+                class="composer-badge skill ui-select-none"
+                @click="badge.skill ? removeSkillBadge(badge.skill) : undefined"
+              >
+                <span>{{ badge.label }}</span>
+                <span class="composer-badge-remove">&times;</span>
+              </button>
+            </div>
+          </div>
+          <div v-if="hasHeaderEnd" class="composer-header-end">
+            <slot name="header-end" />
+          </div>
+        </div>
+      </template>
+      <template v-if="hasFooterStart" #footer-start>
+        <slot name="footer-start" />
+        <slot name="top-start" />
+      </template>
+      <template v-if="hasFooterEnd" #footer-end>
+        <slot name="footer-end" />
+        <slot name="top-end" />
+        <slot name="footer" />
+      </template>
     </ChatComposer>
-
-    <template v-if="$slots.footer" #footer>
-      <slot name="footer" />
-    </template>
   </ChatInputShell>
 
   <Teleport to="body">
@@ -1183,6 +1248,28 @@ defineExpose({
               </button>
             </div>
           </div>
+        </div>
+      </div>
+    </Transition>
+  </Teleport>
+
+  <Teleport to="body">
+    <Transition name="image-preview-overlay">
+      <div
+        v-if="previewImageSrc"
+        class="image-preview-overlay"
+        @click.self="closeImagePreview"
+      >
+        <div class="image-preview-dialog" role="dialog" :aria-label="t('chat.paste.previewImage')">
+          <button
+            class="image-preview-close ui-select-none"
+            type="button"
+            :aria-label="t('common.close')"
+            @click="closeImagePreview"
+          >
+            &times;
+          </button>
+          <img :src="previewImageSrc" class="image-preview-dialog-img" alt="" />
         </div>
       </div>
     </Transition>
@@ -1529,55 +1616,148 @@ defineExpose({
   font-size: 11px;
 }
 
-.image-preview-bar {
+.image-attachment-list {
   display: flex;
-  gap: 8px;
-  padding: 8px 12px;
-  background: var(--input-bg);
-  border: 1px solid var(--border-color);
-  border-radius: 12px;
-  overflow-x: auto;
+  align-items: flex-start;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+  max-width: 100%;
+  overflow: visible;
+  padding: 1px 8px 0 0;
+  pointer-events: auto;
 }
 
-.image-preview-item {
+.image-attachment-item {
   position: relative;
-  flex-shrink: 0;
-  width: 64px;
-  height: 64px;
-  border-radius: 8px;
-  overflow: hidden;
+  flex: 0 0 auto;
+  width: 28px;
+  height: 28px;
   border: 1px solid var(--border-color);
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--panel-bg) 72%, var(--input-bg) 28%);
 }
 
-.image-preview-thumb {
+.image-attachment-thumb-button {
+  display: block;
+  width: 100%;
+  height: 100%;
+  padding: 0;
+  border: none;
+  border-radius: 6px;
+  overflow: hidden;
+  background: color-mix(in srgb, var(--input-bg) 80%, var(--panel-bg) 20%);
+  cursor: zoom-in;
+}
+
+.image-attachment-thumb-button:focus-visible {
+  outline: 1px solid var(--accent-color);
+  outline-offset: 1px;
+}
+
+.image-attachment-thumb {
+  display: block;
   width: 100%;
   height: 100%;
   object-fit: cover;
-  display: block;
 }
 
-.image-preview-remove {
+.image-attachment-remove {
   position: absolute;
-  top: 2px;
-  right: 2px;
-  width: 18px;
-  height: 18px;
-  border-radius: 50%;
-  border: none;
-  background: rgba(0, 0, 0, 0.6);
-  color: #fff;
-  font-size: 12px;
-  line-height: 1;
-  cursor: pointer;
+  top: -6px;
+  right: -6px;
+  width: 16px;
+  height: 16px;
   display: flex;
   align-items: center;
   justify-content: center;
+  padding: 0;
+  border: 1px solid color-mix(in srgb, var(--border-color) 82%, transparent);
+  border-radius: 50%;
+  background: var(--panel-bg);
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
   opacity: 0;
-  transition: opacity 0.15s;
+  transition: opacity 0.12s ease, color 0.12s ease, background 0.12s ease, border-color 0.12s ease;
 }
 
-.image-preview-item:hover .image-preview-remove {
+.image-attachment-item:hover .image-attachment-remove,
+.image-attachment-remove:focus-visible {
   opacity: 1;
+}
+
+.image-attachment-remove:hover,
+.image-attachment-remove:focus-visible {
+  color: var(--text-color);
+  background: var(--hover-bg);
+  border-color: color-mix(in srgb, var(--border-color) 82%, transparent);
+}
+
+.image-preview-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 32px;
+  background: rgba(0, 0, 0, 0.46);
+}
+
+.image-preview-dialog {
+  position: relative;
+  max-width: min(76vw, 920px);
+  max-height: min(78vh, 720px);
+  padding: 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: var(--surface-elevated, var(--panel-bg));
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.34);
+}
+
+.image-preview-dialog-img {
+  display: block;
+  max-width: calc(min(76vw, 920px) - 20px);
+  max-height: calc(min(78vh, 720px) - 20px);
+  border-radius: 5px;
+  object-fit: contain;
+}
+
+.image-preview-close {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 1px solid color-mix(in srgb, var(--border-color) 82%, transparent);
+  border-radius: 6px;
+  background: var(--surface-elevated, var(--panel-bg));
+  color: var(--text-secondary);
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.image-preview-close:hover,
+.image-preview-close:focus-visible {
+  color: var(--text-color);
+  background: var(--hover-bg);
+}
+
+.image-preview-overlay-enter-active,
+.image-preview-overlay-leave-active {
+  transition: opacity 0.12s ease;
+}
+
+.image-preview-overlay-enter-from,
+.image-preview-overlay-leave-to {
+  opacity: 0;
 }
 
 .paste-preview {
@@ -1808,6 +1988,31 @@ defineExpose({
 .paste-editor-overlay-leave-to .paste-editor-modal {
   opacity: 0;
   transform: scale(0.95) translateY(10px);
+}
+
+.composer-header-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  width: 100%;
+  min-width: 0;
+}
+
+.composer-header-start {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.composer-header-end {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
 }
 
 .composer-badge-row {

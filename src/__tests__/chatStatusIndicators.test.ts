@@ -9,13 +9,14 @@ function read(relPath: string) {
 }
 
 describe("chat status indicators", () => {
-  it("moves Unity and asset database status into the composer footer", () => {
+  it("moves Unity and asset database status onto the input backdrop", () => {
     const chatView = read("src/components/ChatView.vue");
     const sessionPanel = read("src/components/chat/SessionPanel.vue");
     const indicators = read("src/components/chat/ChatStatusIndicators.vue");
 
     expect(chatView).toContain('import ChatStatusIndicators from "./chat/ChatStatusIndicators.vue"');
-    expect(chatView).toMatch(/<template #footer>[\s\S]*<ChatStatusIndicators[\s\S]*<div class="footer-spacer"><\/div>[\s\S]*<TokenUsageBar/);
+    expect(chatView).toMatch(/<div v-if="!inputControlsCollapsed" class="input-backdrop-status">[\s\S]*<ChatStatusIndicators/);
+    expect(chatView).toMatch(/<template v-if="!inputControlsCollapsed" #footer-start>[\s\S]*<ModelEffortSelector[\s\S]*\/>\s*<TokenUsageBar/);
     expect(chatView).toContain('@start-scan="emit(\'startScan\')"');
     expect(sessionPanel).not.toContain("sp-unity-status");
     expect(sessionPanel).not.toContain("sp-scan-status");
@@ -23,13 +24,20 @@ describe("chat status indicators", () => {
     expect(indicators).toContain('id: "unity"');
   });
 
-  it("uses icon-only triggers with hover titles and click popovers", () => {
+  it("uses fixed icon triggers with top hover labels and click popovers", () => {
     const indicators = read("src/components/chat/ChatStatusIndicators.vue");
 
     expect(indicators).toContain('icon: "database"');
     expect(indicators).toContain('icon: "unity"');
     expect(indicators).toContain('class="chat-status-icon-btn ui-select-none"');
-    expect(indicators).toContain(':title="item.summary"');
+    expect(indicators).toContain('class="chat-status-icon-label"');
+    expect(indicators).toContain("{{ item.inlineLabel }}");
+    expect(indicators).toContain('bottom: calc(100% + 6px);');
+    expect(indicators).toContain('left: 50%;');
+    expect(indicators).toContain('transform: translate(-50%, 3px);');
+    expect(indicators).toContain('color: currentColor;');
+    expect(indicators).toContain('width: 24px;');
+    expect(indicators).toContain(':aria-label="`${item.title}: ${item.summary}`"');
     expect(indicators).toContain('class="chat-status-popover"');
     expect(indicators).toContain('role="dialog"');
     expect(indicators).toContain("tone-danger");

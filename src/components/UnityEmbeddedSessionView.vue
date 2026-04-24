@@ -41,6 +41,7 @@ withDefaults(defineProps<{
   min-height: 0;
   overflow: hidden;
   background: var(--bg-color);
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--border-color) 82%, var(--text-secondary) 18%);
   color: var(--text-color);
 }
 

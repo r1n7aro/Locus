@@ -11,6 +11,18 @@ function makeSession(overrides: Partial<SessionSummary> & Pick<SessionSummary, "
 }
 
 describe("buildSessionTree", () => {
+  it("sorts root sessions by latest update time", () => {
+    const sessions = [
+      makeSession({ id: "older", title: "Older", sessionType: "chat", updatedAt: 100 }),
+      makeSession({ id: "newer", title: "Newer", sessionType: "chat", updatedAt: 180 }),
+      makeSession({ id: "middle", title: "Middle", sessionType: "chat", updatedAt: 140 }),
+    ];
+
+    const tree = buildSessionTree({ sessions });
+
+    expect(tree.map((node) => node.sourceSessionId)).toEqual(["newer", "middle", "older"]);
+  });
+
   it("keeps folder sessions explicit instead of grouping all doc sessions together", () => {
     const sessions = [
       makeSession({ id: "folder-1", title: "Doc Batch 1", sessionType: "folder", updatedAt: 10 }),

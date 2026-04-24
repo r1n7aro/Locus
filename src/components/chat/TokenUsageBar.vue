@@ -2,7 +2,6 @@
 <script setup lang="ts">
 import { computed } from "vue";
 import type { TokenUsage } from "../../types";
-import { buildTokenUsageMetrics } from "./tokenUsageDisplay";
 
 const props = defineProps<{
   tokenUsage: TokenUsage;
@@ -20,57 +19,138 @@ function formatUsd(n: number): string {
   return `$${n.toFixed(6)}`;
 }
 
-const tokenMetrics = computed(() => buildTokenUsageMetrics(props.tokenUsage));
 const hasPrice = computed(() => props.tokenUsage.pricedRounds > 0);
 
 const contextTokens = computed(() => props.tokenUsage.contextTokens);
 const contextLimit = computed(() => props.tokenUsage.contextLimit);
 const hasContext = computed(() => contextTokens.value > 0 && contextLimit.value > 0);
-const hasVisibleMeta = computed(() => hasContext.value || hasPrice.value);
 const contextPercent = computed(() =>
   contextLimit.value > 0 ? Math.min(100, (contextTokens.value / contextLimit.value) * 100) : 0
 );
-const contextBarColor = computed(() => {
+const contextIndicatorColor = computed(() => {
   const pct = contextPercent.value;
   if (pct >= 80) return "var(--context-danger, #e53e3e)";
   if (pct >= 60) return "var(--context-warning, #d69e2e)";
-  return "var(--context-normal, #38a169)";
+  return "var(--text-secondary)";
 });
 
-const usageTooltip = computed(() => {
+const contextTooltip = computed(() => {
   const u = props.tokenUsage;
-  let lines: string[] = [];
-  if (hasContext.value) {
-    lines.push(`上下文: ${formatTokens(contextTokens.value)} / ${formatTokens(contextLimit.value)} (${contextPercent.value.toFixed(1)}%)`);
-    lines.push("");
-  }
-  lines.push("Token 消耗 (含子Agent):");
-  for (const metric of tokenMetrics.value) {
-    lines.push(`  ${metric.tooltipLabel}: ${metric.value} tokens`);
-  }
+  const parts = [
+    `上下文 ${formatTokens(contextTokens.value)} / ${formatTokens(contextLimit.value)} (${contextPercent.value.toFixed(1)}%)`,
+  ];
   if (hasPrice.value) {
-    lines.push(`  Cost: ${formatUsd(u.totalCostUsd)}`);
+    parts.push(`Cost ${formatUsd(u.totalCostUsd)}`);
   }
-  return lines.join('\n');
+  return parts.join(" · ");
 });
 
 </script>
 
 <template>
-  <div v-if="hasVisibleMeta" class="token-usage-group" :title="usageTooltip">
-    <div v-if="hasContext" class="context-usage">
-      <span class="context-label">ctx</span>
-      <div class="context-bar-track">
-        <div
-          class="context-bar-fill"
-          :style="{ width: contextPercent + '%', background: contextBarColor }"
-        />
-      </div>
-      <span class="context-text">{{ formatTokens(contextTokens) }}<span class="context-sep">/</span>{{ formatTokens(contextLimit) }}</span>
-    </div>
-    <div v-if="hasPrice" class="token-price">
-      <span class="price-label">cost</span>
-      <span class="price-total">{{ formatUsd(tokenUsage.totalCostUsd) }}</span>
-    </div>
+  <div
+    v-if="hasContext"
+    class="token-usage-group"
+    role="meter"
+    aria-valuemin="0"
+    aria-valuemax="100"
+    :aria-valuenow="contextPercent.toFixed(1)"
+    :aria-label="contextTooltip"
+    :aria-valuetext="contextTooltip"
+    :style="{ color: contextIndicatorColor }"
+    tabindex="0"
+  >
+    <svg
+      class="context-progress-ring"
+      viewBox="0 0 16 16"
+      aria-hidden="true"
+    >
+      <circle
+        class="context-progress-track"
+        cx="8"
+        cy="8"
+        r="5.2"
+        pathLength="100"
+      />
+      <circle
+        class="context-progress-value"
+        cx="8"
+        cy="8"
+        r="5.2"
+        pathLength="100"
+        :stroke-dasharray="`${contextPercent} 100`"
+      />
+    </svg>
+    <span class="context-usage-label">{{ contextTooltip }}</span>
   </div>
 </template>
+
+<style scoped>
+.token-usage-group {
+  position: relative;
+  width: 24px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  align-self: center;
+  color: var(--text-secondary);
+  cursor: default;
+  line-height: 0;
+  outline: none;
+}
+
+.context-progress-ring {
+  width: 15px;
+  height: 15px;
+  display: block;
+  flex-shrink: 0;
+  transform: translateY(1px) rotate(-90deg);
+}
+
+.context-progress-track,
+.context-progress-value {
+  fill: none;
+  stroke-width: 2;
+}
+
+.context-progress-track {
+  stroke: color-mix(in srgb, currentColor 28%, transparent);
+}
+
+.context-progress-value {
+  stroke: currentColor;
+  stroke-linecap: round;
+  transition: stroke-dasharray 0.2s ease, stroke 0.2s ease;
+}
+
+.context-usage-label {
+  position: absolute;
+  left: 50%;
+  bottom: calc(100% + 6px);
+  z-index: 35;
+  max-width: 240px;
+  padding: 4px 7px;
+  border: 1px solid var(--border-color);
+  border-radius: 5px;
+  background: var(--surface-elevated, var(--panel-bg));
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.16);
+  color: currentColor;
+  pointer-events: none;
+  overflow: hidden;
+  font-size: 11px;
+  line-height: 1.3;
+  opacity: 0;
+  transform: translate(-50%, 3px);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  transition: opacity 0.1s ease, transform 0.1s ease;
+}
+
+.token-usage-group:hover .context-usage-label,
+.token-usage-group:focus-visible .context-usage-label {
+  opacity: 1;
+  transform: translate(-50%, 0);
+}
+
+</style>

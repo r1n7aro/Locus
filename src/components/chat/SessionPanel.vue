@@ -30,6 +30,7 @@ const emit = defineEmits<{
   deleteSession: [id: string];
   renameSession: [id: string, title: string];
   saveRawContext: [request: SaveRawContextRequest];
+  togglePanelCollapsed: [];
 }>();
 
 function loadExpandedState(): Record<string, boolean> {
@@ -368,10 +369,38 @@ function ctxArchive() {
   <div class="session-panel" :style="{ width: sessionPanelWidth + 'px', minWidth: sessionPanelWidth + 'px' }">
     <div class="sp-header">
       <span class="sp-title">{{ t('chat.session.title') }}</span>
-      <button class="sp-new-btn" @click="emit('newChat')" :title="newChatTitle">+</button>
+      <div class="sp-header-actions">
+        <button
+          type="button"
+          class="sp-collapse-btn"
+          :title="t('chat.session.collapseList')"
+          :aria-label="t('chat.session.collapseList')"
+          @click="emit('togglePanelCollapsed')"
+        >
+          <svg viewBox="0 0 16 16" width="13" height="13" fill="currentColor" aria-hidden="true">
+            <path d="M7.78 12.53a.75.75 0 0 1-1.06 0L2.47 8.28a.75.75 0 0 1 0-1.06l4.25-4.25a.75.75 0 0 1 1.06 1.06L4.81 7h7.44a.75.75 0 0 1 0 1.5H4.81l2.97 2.97a.75.75 0 0 1 0 1.06z"/>
+          </svg>
+        </button>
+      </div>
     </div>
 
     <div class="sp-session-list">
+      <button
+        type="button"
+        class="sp-session-item sp-new-session-item"
+        :class="{ active: activeSessionId === null }"
+        :title="newChatTitle"
+        @click="emit('newChat')"
+      >
+        <span class="sp-expand-spacer">
+          <span class="sp-new-session-plus" aria-hidden="true">+</span>
+        </span>
+        <div class="sp-session-info">
+          <div class="sp-session-main">
+            <span class="sp-session-title">{{ t('chat.session.createNew') }}</span>
+          </div>
+        </div>
+      </button>
       <div
         v-for="row in visibleRows"
         :key="row.node.key"

@@ -16,6 +16,10 @@ const props = withDefaults(defineProps<{
   cancelLabel?: string;
   maxHeight?: number;
   submitMode?: ChatSubmitMode;
+  compact?: boolean;
+  showAction?: boolean;
+  showHeader?: boolean | null;
+  extendTop?: boolean;
 }>(), {
   placeholder: "",
   disabled: false,
@@ -25,6 +29,10 @@ const props = withDefaults(defineProps<{
   cancelLabel: "",
   maxHeight: 200,
   submitMode: "enter-send",
+  compact: false,
+  showAction: true,
+  showHeader: null,
+  extendTop: false,
 });
 
 const emit = defineEmits<{
@@ -43,7 +51,13 @@ const emit = defineEmits<{
 const slots = useSlots();
 const textareaRef = ref<HTMLTextAreaElement | null>(null);
 
-const hasHeader = computed(() => !!slots.header);
+const hasHeader = computed(() => props.showHeader ?? !!slots.header);
+const hasOverlay = computed(() => props.extendTop && !!slots.overlay);
+const hasFooterStart = computed(() => !!slots["footer-start"]);
+const hasFooterEnd = computed(() => !!slots["footer-end"]);
+const hasFooter = computed(() =>
+  !props.compact && (hasFooterStart.value || hasFooterEnd.value || props.showAction),
+);
 const textareaDisabled = computed(() => props.disabled || props.isStreaming);
 const textareaStyle = computed(() => ({
   maxHeight: `${props.maxHeight}px`,
@@ -121,7 +135,11 @@ watch(() => props.maxHeight, () => {
 </script>
 
 <template>
-  <div class="chat-composer">
+  <div class="chat-composer" :class="{ 'is-compact': compact, 'has-top-extension': extendTop }">
+    <div v-if="hasOverlay" class="chat-composer-overlay">
+      <slot name="overlay" />
+    </div>
+
     <div v-if="hasHeader" class="chat-composer-header">
       <slot name="header" />
     </div>
@@ -143,42 +161,80 @@ watch(() => props.maxHeight, () => {
         @mouseup="emit('mouseup', $event as MouseEvent)"
         @focus="emit('focus', $event as FocusEvent)"
       />
-      <button
-        class="chat-composer-action ui-select-none"
-        :class="{ 'is-cancel': isStreaming }"
-        :disabled="!isStreaming && (disabled || !canSend)"
-        :title="actionLabel"
-        :aria-label="actionLabel"
-        type="button"
-        @click="handleActionClick"
-      >
-        <span v-if="isStreaming" class="chat-composer-stop-icon" aria-hidden="true">&#9632;</span>
-        <span v-else class="chat-composer-send-icon" aria-hidden="true">&#8593;</span>
-      </button>
+    </div>
+
+    <div v-if="hasFooter" class="chat-composer-footer">
+      <div class="chat-composer-footer-start" :class="{ empty: !hasFooterStart }">
+        <slot name="footer-start" />
+      </div>
+      <div class="chat-composer-footer-end" :class="{ empty: !hasFooterEnd }">
+        <slot name="footer-end" />
+        <button
+          v-if="showAction"
+          class="chat-composer-action ui-select-none"
+          :class="{ 'is-cancel': isStreaming }"
+          :disabled="!isStreaming && (disabled || !canSend)"
+          :title="actionLabel"
+          :aria-label="actionLabel"
+          type="button"
+          @click="handleActionClick"
+        >
+          <span v-if="isStreaming" class="chat-composer-stop-icon" aria-hidden="true">&#9632;</span>
+          <span v-else class="chat-composer-send-icon" aria-hidden="true">&#8593;</span>
+        </button>
+      </div>
     </div>
   </div>
 </template>
 
 <style scoped>
 .chat-composer {
+  position: relative;
   display: flex;
   flex-direction: column;
+  overflow: visible;
   background: var(--input-bg);
   border: 1px solid var(--border-color);
   border-radius: 12px;
-  padding: 8px 12px;
+  min-height: 118px;
+  padding: 10px 12px;
   transition: border-color 0.2s ease;
+}
+
+.chat-composer-overlay {
+  position: relative;
+  z-index: 2;
+  display: flex;
+  align-items: flex-start;
+  max-width: 100%;
+  min-height: 30px;
+  margin-bottom: 2px;
+  pointer-events: none;
+}
+
+.chat-composer.has-top-extension {
+  min-height: 148px;
 }
 
 .chat-composer:focus-within {
   border-color: var(--accent-color);
 }
 
+.chat-composer.is-compact {
+  min-height: 44px;
+  padding: 7px 10px;
+}
+
+.chat-composer.is-compact.has-top-extension {
+  min-height: 82px;
+}
+
 .chat-composer-header {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
-  margin-bottom: 8px;
+  margin-bottom: 6px;
+  min-height: 24px;
 }
 
 .chat-composer-header:empty {
@@ -187,16 +243,22 @@ watch(() => props.maxHeight, () => {
 
 .chat-composer-body {
   display: flex;
-  align-items: flex-end;
-  gap: 8px;
+  flex: 1 1 auto;
+  align-items: flex-start;
+  min-height: 44px;
+}
+
+.chat-composer.is-compact .chat-composer-body {
+  align-items: center;
+  min-height: 28px;
 }
 
 .chat-composer-input {
   flex: 1;
   min-width: 0;
-  min-height: 24px;
+  min-height: 42px;
   overflow-y: hidden;
-  padding: 4px 0;
+  padding: 4px 0 0;
   border: none;
   outline: none;
   resize: none;
@@ -213,16 +275,56 @@ watch(() => props.maxHeight, () => {
   color: var(--text-secondary);
 }
 
+.chat-composer-footer {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 32px;
+  margin-top: 8px;
+}
+
+.chat-composer.is-compact .chat-composer-input {
+  min-height: 28px;
+  padding-top: 3px;
+}
+
+.chat-composer-footer-start {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.chat-composer-footer-start.empty {
+  gap: 0;
+}
+
+.chat-composer-footer-end {
+  flex: 0 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.chat-composer-footer-end.empty {
+  gap: 0;
+}
+
 .chat-composer-action {
-  width: 32px;
-  height: 32px;
+  width: 28px;
+  height: 28px;
   flex-shrink: 0;
   display: flex;
   align-items: center;
   justify-content: center;
   padding: 0;
   border: 1px solid transparent;
-  border-radius: 8px;
+  border-radius: 6px;
   background: var(--accent-color);
   color: var(--text-on-accent, #fff);
   cursor: pointer;

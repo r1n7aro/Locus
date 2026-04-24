@@ -46,6 +46,7 @@ describe("EmbeddedChatPane contract", () => {
     expect(pane).toContain("<ToolConfirmCard");
     expect(pane).toContain('class="embedded-chat-pane"');
     expect(knowledgePane).toContain("<AgentSelector");
+    expect(knowledgePane).toContain("<ModelEffortSelector");
     expect(knowledgePane).toContain("<template #composer-start>");
     expect(knowledgePane).toContain('agent.id === "knowledge"');
     expect(knowledgePane).toContain("show-user-images");

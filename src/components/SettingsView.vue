@@ -21,6 +21,7 @@ import ToolPermissions from "./settings/ToolPermissions.vue";
 import ArchivedSessionsSettings from "./settings/ArchivedSessionsSettings.vue";
 import SubscriptionDisclaimerModal from "./SubscriptionDisclaimerModal.vue";
 import { useUiStore } from "../stores/ui";
+import { useChatStore } from "../stores/chat";
 
 defineProps<{
   allModels: ModelOption[];
@@ -51,6 +52,7 @@ const {
 } = useSettingsState(emit);
 
 const uiStore = useUiStore();
+const chatStore = useChatStore();
 
 watch(
   () => uiStore.settingsCategoryHint,
@@ -255,9 +257,11 @@ function toggleBetaFlag(ep: import("../types").CustomEndpoint, flag: string) {
 
       <template v-if="activeCategory === 'permissions'">
         <ToolPermissions
+          :tool-permission-mode="chatStore.toolPermissionMode"
           :tool-list="toolList"
           :tool-permissions="toolPermissions"
           :perm-save-msg="permSaveMsg"
+          @set-global-permission-mode="chatStore.setToolPermissionMode"
           @set-permission="setToolPermission"
         />
       </template>

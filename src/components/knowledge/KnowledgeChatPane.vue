@@ -4,8 +4,7 @@ import { t } from "../../i18n";
 import type { KnowledgeDocument, KnowledgeEditMode, KnowledgeDocumentType, KnowledgeDocumentScope } from "../../types";
 import EmbeddedChatPane from "../chat/EmbeddedChatPane.vue";
 import AgentSelector from "../AgentSelector.vue";
-import ModelSelector from "../ModelSelector.vue";
-import ThinkingSelector from "../ThinkingSelector.vue";
+import ModelEffortSelector from "../ModelEffortSelector.vue";
 import { useEmbeddedChatSession } from "../../composables/useEmbeddedChatSession";
 import { useSkills } from "../../composables/useSkills";
 import { useAgentStore } from "../../stores/agent";
@@ -194,18 +193,15 @@ function handleSelectAgent(agentId: string) {
       />
     </template>
     <template #composer-actions>
-      <ModelSelector
+      <ModelEffortSelector
         :models="modelStore.availableModels"
         :selected-id="modelStore.selectedModelId"
-        :disabled="isStreaming"
-        @select="modelStore.selectModel"
-      />
-      <ThinkingSelector
-        v-if="modelStore.effortSupported"
         :effort="modelStore.effort"
         :efforts="modelStore.availableEfforts"
+        :effort-supported="modelStore.effortSupported"
         :disabled="isStreaming"
-        @select="modelStore.effort = $event"
+        @select-model="modelStore.selectModel"
+        @select-effort="modelStore.effort = $event"
       />
     </template>
   </EmbeddedChatPane>

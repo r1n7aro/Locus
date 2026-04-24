@@ -23,6 +23,7 @@ describe("Unity embedded session view", () => {
     expect(app).toContain("await registerListeners();");
     expect(view).toContain("<ChatWorkspaceView");
     expect(view).toContain("layout-mode=\"auto\"");
+    expect(view).toContain("box-shadow: inset 0 1px 0 color-mix(in srgb, var(--border-color) 82%, var(--text-secondary) 18%);");
     expect(workspace).toContain("<ChatView");
     expect(workspace).toContain("<ThinkingPanel");
     expect(workspace).toContain("<ChatSidebarPanel");

@@ -6,8 +6,7 @@ import type { WorkspaceFilePreview } from "../services/unity";
 // undoPreview removed — undo UI moved to ChatChangesPanel
 import type { ChatComposerSendPayload, ChatMessage, AgentInfo, TokenUsage, ModelOption, PendingQuestion, PendingToolConfirm, EffortLevel, SessionSummary, AssetDbScanEvent, ScanStats, ImageAttachment, SkillManifest, UserIntentMeta, SaveRawContextRequest, CodexTransportMode } from "../types";
 import type { ToolCallDisplay } from "../types";
-import ModelSelector from "./ModelSelector.vue";
-import ThinkingSelector from "./ThinkingSelector.vue";
+import ModelEffortSelector from "./ModelEffortSelector.vue";
 import SessionPanel from "./chat/SessionPanel.vue";
 import SessionCompactPicker from "./chat/SessionCompactPicker.vue";
 import ChatTranscript from "./chat/ChatTranscript.vue";
@@ -78,6 +77,31 @@ const chatInputPlaceholder = computed(() => {
   }
   return t("chat.input.placeholder");
 });
+const inputControlsCollapsed = ref(false);
+const inputControlsSwitching = ref(false);
+const INPUT_CONTROLS_SWITCH_VISIBLE_MS = 120;
+const inputControlsToggleTitle = computed(() => (
+  inputControlsCollapsed.value
+    ? t("chat.input.showControls")
+    : t("chat.input.hideControls")
+));
+let inputControlsSwitchTimer: ReturnType<typeof setTimeout> | null = null;
+
+function clearInputControlsSwitchTimer() {
+  if (!inputControlsSwitchTimer) return;
+  clearTimeout(inputControlsSwitchTimer);
+  inputControlsSwitchTimer = null;
+}
+
+function toggleInputControlsCollapsed() {
+  inputControlsCollapsed.value = !inputControlsCollapsed.value;
+  inputControlsSwitching.value = true;
+  clearInputControlsSwitchTimer();
+  inputControlsSwitchTimer = setTimeout(() => {
+    inputControlsSwitching.value = false;
+    inputControlsSwitchTimer = null;
+  }, INPUT_CONTROLS_SWITCH_VISIBLE_MS);
+}
 
 const showInlineDiff = computed(() =>
   !!chatChangesStore.inlineDiffPayload || chatChangesStore.inlineDiffLoading || !!chatChangesStore.inlineDiffError,
@@ -931,8 +955,10 @@ function handleComposerSend(payload: ChatComposerSendPayload) {
 }
 
 const STORAGE_KEY_SESSION_WIDTH = "locus:sessionPanelWidth";
+const STORAGE_KEY_SESSION_COLLAPSED = "locus:sessionPanelCollapsed";
 const AUTO_VERTICAL_MIN_CHAT_WIDTH = 560;
 const sessionPanelWidth = ref(220); // px
+const sessionPanelCollapsed = ref(false);
 const isDraggingSession = ref(false);
 const layoutRef = ref<HTMLElement | null>(null);
 const layoutWidth = ref(0);
@@ -942,12 +968,17 @@ let layoutResizeObserver: ResizeObserver | null = null;
 const resolvedLayoutMode = computed<ResolvedChatLayoutMode>(() => {
   if (props.layoutMode === "vertical") return "vertical";
   if (props.layoutMode === "horizontal") return "horizontal";
-  if (layoutWidth.value > 0 && layoutWidth.value < sessionPanelWidth.value + AUTO_VERTICAL_MIN_CHAT_WIDTH) {
+  const sessionNavWidth = sessionPanelCollapsed.value ? 0 : sessionPanelWidth.value;
+  if (layoutWidth.value > 0 && layoutWidth.value < sessionNavWidth + AUTO_VERTICAL_MIN_CHAT_WIDTH) {
     return "vertical";
   }
   return "horizontal";
 });
 const isVerticalLayout = computed(() => resolvedLayoutMode.value === "vertical");
+const showSessionPanel = computed(() =>
+  !showInlineDiff.value && !isVerticalLayout.value && !sessionPanelCollapsed.value,
+);
+const showSessionCompactPicker = computed(() => isVerticalLayout.value || sessionPanelCollapsed.value);
 
 watch(
   resolvedLayoutMode,
@@ -974,7 +1005,7 @@ function connectLayoutResizeObserver() {
 
 function onSessionSplitterMouseDown(e: MouseEvent) {
   e.preventDefault();
-  if (isVerticalLayout.value) return;
+  if (isVerticalLayout.value || sessionPanelCollapsed.value) return;
   isDraggingSession.value = true;
   releaseSessionSelectionLock?.();
   releaseSessionSelectionLock = acquireSelectionLock();
@@ -998,11 +1029,9 @@ function onSessionSplitterMouseUp() {
   try { localStorage.setItem(STORAGE_KEY_SESSION_WIDTH, String(sessionPanelWidth.value)); } catch {}
 }
 
-/* ── Tool Permission Mode (Auto / Ask) ── */
-const toolPermMode = computed(() => chatStore.toolPermissionMode);
-
-async function toggleToolPermMode() {
-  await chatStore.toggleToolPermissionMode();
+function setSessionPanelCollapsed(value: boolean) {
+  sessionPanelCollapsed.value = value;
+  try { localStorage.setItem(STORAGE_KEY_SESSION_COLLAPSED, value ? "1" : "0"); } catch {}
 }
 
 function onGlobalChatKeydown(e: KeyboardEvent) {
@@ -1023,6 +1052,9 @@ onMounted(() => {
     const saved = localStorage.getItem(STORAGE_KEY_SESSION_WIDTH);
     if (saved) sessionPanelWidth.value = Math.max(140, Math.min(480, Number(saved)));
   } catch {}
+  try {
+    sessionPanelCollapsed.value = localStorage.getItem(STORAGE_KEY_SESSION_COLLAPSED) === "1";
+  } catch {}
   nextTick(() => {
     connectLayoutResizeObserver();
     connectTranscriptResizeObserver();
@@ -1032,6 +1064,7 @@ onMounted(() => {
 onUnmounted(() => {
   window.removeEventListener("keydown", onGlobalChatKeydown);
   rememberScrollForSession();
+  clearInputControlsSwitchTimer();
   scrollToBottomScheduler.cancel();
   preserveScrollAnchorScheduler.cancel();
   streamEndScrollScheduler.cancel();
@@ -1132,7 +1165,7 @@ onUnmounted(() => {
     </div>
 
     <SessionPanel
-      v-show="!showInlineDiff && !isVerticalLayout"
+      v-show="showSessionPanel"
       :sessions="sessions"
       :active-session-id="activeSessionId"
       :streaming-session-ids="streamingSessionIds"
@@ -1143,9 +1176,10 @@ onUnmounted(() => {
       @archive-session="emit('archiveSession', $event)"
       @delete-session="emit('deleteSession', $event)"
       @save-raw-context="emit('saveRawContext', $event)"
+      @toggle-panel-collapsed="setSessionPanelCollapsed(true)"
     />
 
-    <div v-show="!showInlineDiff && !isVerticalLayout" class="session-divider" @mousedown="onSessionSplitterMouseDown"></div>
+    <div v-show="showSessionPanel" class="session-divider" @mousedown="onSessionSplitterMouseDown"></div>
 
     <div
       v-show="!showInlineDiff"
@@ -1153,12 +1187,14 @@ onUnmounted(() => {
       :class="{ 'is-vertical-layout': isVerticalLayout }"
     >
       <SessionCompactPicker
-        v-if="isVerticalLayout"
+        v-if="showSessionCompactPicker"
         :sessions="sessions"
         :active-session-id="activeSessionId"
         :streaming-session-ids="streamingSessionIds"
+        :show-expand-panel-button="sessionPanelCollapsed && !isVerticalLayout"
         @select-session="emit('selectSession', $event)"
         @new-chat="handleNewChatRequest"
+        @expand-panel="setSessionPanelCollapsed(false)"
       />
       <div class="chat-main">
         <ChatTranscript
@@ -1248,7 +1284,73 @@ onUnmounted(() => {
     <div
       v-if="!isViewingSubagent"
       class="input-area"
+      :class="{
+        'is-controls-collapsed': inputControlsCollapsed,
+        'is-controls-switching': inputControlsSwitching,
+      }"
     >
+      <div class="input-controls-toggle-zone">
+        <button
+          class="input-controls-toggle ui-select-none"
+          :class="{ 'is-collapsed': inputControlsCollapsed }"
+          type="button"
+          :title="inputControlsToggleTitle"
+          :aria-label="inputControlsToggleTitle"
+          :aria-pressed="inputControlsCollapsed"
+          @click="toggleInputControlsCollapsed"
+        >
+          <svg
+            v-if="inputControlsCollapsed"
+            class="input-controls-toggle-icon"
+            viewBox="0 0 16 16"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.8"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            aria-hidden="true"
+          >
+            <path d="M4 10l4-4 4 4" />
+          </svg>
+          <svg
+            v-else
+            class="input-controls-toggle-icon"
+            viewBox="0 0 16 16"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.8"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            aria-hidden="true"
+          >
+            <path d="M4 6l4 4 4-4" />
+          </svg>
+        </button>
+      </div>
+      <div v-if="!inputControlsCollapsed" class="input-backdrop-row">
+        <div v-if="!inputControlsCollapsed" class="input-backdrop-status">
+          <ChatStatusIndicators
+            :unity-connected="unityConnected"
+            :is-unity-project="isUnityProject"
+            :scan-phase="scanPhase"
+            :last-scan-stats="lastScanStats"
+            @start-scan="emit('startScan')"
+          />
+        </div>
+        <div class="input-backdrop-action">
+          <button
+            v-if="!isViewingSubagent && hasPanelToggleRow"
+            class="changes-toggle-btn ui-select-none"
+            :class="{ 'is-active': chatChangesStore.currentPanelVisible }"
+            type="button"
+            :disabled="isStreaming"
+            :aria-pressed="chatChangesStore.currentPanelVisible"
+            @click="chatChangesStore.togglePanel()"
+          >
+            {{ t('chat.changes.toggle') }}
+          </button>
+        </div>
+      </div>
       <RichChatInput
         ref="composerPanelRef"
         v-model="inputText"
@@ -1258,63 +1360,24 @@ onUnmounted(() => {
         :is-streaming="isStreaming"
         :send-label="t('common.send')"
         :cancel-label="t('common.cancel')"
+        :compact="inputControlsCollapsed"
+        :show-action="!inputControlsCollapsed"
         @send="handleComposerSend"
         @clear="handleNewChatRequest"
         @cancel="emit('cancel')"
       >
-        <template #top-start>
-          <ModelSelector
+        <template v-if="!inputControlsCollapsed" #footer-start>
+          <ModelEffortSelector
+            align="start"
             :models="models"
             :selected-id="selectedModelId"
-            :disabled="isStreaming"
-            @select="emit('selectModel', $event)"
-          />
-          <ThinkingSelector
-            v-if="effortSupported"
             :effort="effort"
             :efforts="effortLevels"
+            :effort-supported="effortSupported"
             :disabled="isStreaming"
-            @select="emit('selectEffort', $event)"
+            @select-model="emit('selectModel', $event)"
+            @select-effort="emit('selectEffort', $event)"
           />
-          <BaseButton
-            class="perm-toggle-btn ui-select-none"
-            :class="{ 'is-auto': toolPermMode === 'auto' }"
-            :title="toolPermMode === 'auto' ? t('chat.perm.autoTitle') : t('chat.perm.askTitle')"
-            @click="toggleToolPermMode"
-          >
-            <svg v-if="toolPermMode === 'auto'" viewBox="0 0 16 16" fill="currentColor" width="12" height="12">
-              <path d="M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L2.22 9.28a.75.75 0 0 1 1.06-1.06L6 10.94l6.72-6.72a.75.75 0 0 1 1.06 0z"/>
-            </svg>
-            <svg v-else viewBox="0 0 16 16" fill="currentColor" width="12" height="12">
-              <path d="M8 1a3.5 3.5 0 0 0-3.5 3.5v1H3.25A1.25 1.25 0 0 0 2 6.75v7A1.25 1.25 0 0 0 3.25 15h9.5A1.25 1.25 0 0 0 14 13.75v-7A1.25 1.25 0 0 0 12.75 5.5H11.5v-1A3.5 3.5 0 0 0 8 1zm-2 4.5v-1a2 2 0 1 1 4 0v1H6z"/>
-            </svg>
-            <span>{{ toolPermMode === 'auto' ? 'Auto' : 'Ask' }}</span>
-          </BaseButton>
-        </template>
-        <template #top-end>
-          <BaseButton
-            v-if="!isViewingSubagent && hasPanelToggleRow"
-            class="changes-toggle-btn ui-select-none"
-            :variant="chatChangesStore.currentPanelVisible ? 'primary' : 'neutral'"
-            :disabled="isStreaming"
-            @click="chatChangesStore.togglePanel()"
-          >
-            <svg viewBox="0 0 16 16" fill="currentColor" width="11" height="11">
-              <path d="M2 3.5A1.5 1.5 0 0 1 3.5 2h2A1.5 1.5 0 0 1 7 3.5v1A1.5 1.5 0 0 1 5.5 6h-2A1.5 1.5 0 0 1 2 4.5v-1zm0 8A1.5 1.5 0 0 1 3.5 10h2A1.5 1.5 0 0 1 7 11.5v1A1.5 1.5 0 0 1 5.5 14h-2A1.5 1.5 0 0 1 2 12.5v-1zM9.5 2h4a.5.5 0 0 1 0 1h-4a.5.5 0 0 1 0-1zm0 3h4a.5.5 0 0 1 0 1h-4a.5.5 0 0 1 0-1zm0 5h4a.5.5 0 0 1 0 1h-4a.5.5 0 0 1 0-1zm0 3h4a.5.5 0 0 1 0 1h-4a.5.5 0 0 1 0-1z"/>
-            </svg>
-            {{ t('chat.changes.toggle') }}
-            <span class="changes-badge">{{ chatChangesStore.currentFileCount }}</span>
-          </BaseButton>
-        </template>
-        <template #footer>
-          <ChatStatusIndicators
-            :unity-connected="unityConnected"
-            :is-unity-project="isUnityProject"
-            :scan-phase="scanPhase"
-            :last-scan-stats="lastScanStats"
-            @start-scan="emit('startScan')"
-          />
-          <div class="footer-spacer"></div>
           <TokenUsageBar
             :token-usage="tokenUsage"
           />
@@ -1354,6 +1417,8 @@ onUnmounted(() => {
 }
 
 :deep(.session-panel) {
+  position: relative;
+  z-index: 1;
   display: flex;
   flex-direction: column;
   background: var(--sidebar-bg);
@@ -1392,25 +1457,59 @@ onUnmounted(() => {
   color: var(--text-secondary);
 }
 
-:deep(.sp-new-btn) {
+:deep(.sp-header-actions) {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+:deep(.sp-collapse-btn) {
   width: 24px;
   height: 24px;
   border-radius: 6px;
-  border: 1px solid var(--border-color);
+  border: none;
   background: transparent;
-  color: var(--text-color);
-  font-size: 16px;
+  color: var(--text-secondary);
   cursor: pointer;
   display: flex;
   align-items: center;
   justify-content: center;
-  transition: background 0.15s;
+  transition: background 0.15s ease, color 0.15s ease;
   box-shadow: none;
   padding: 0;
 }
 
-:deep(.sp-new-btn:hover) {
+:deep(.sp-collapse-btn:hover),
+:deep(.sp-collapse-btn:focus-visible) {
   background: var(--hover-bg);
+  color: var(--text-color);
+}
+
+:deep(.sp-collapse-btn:focus-visible) {
+  outline: none;
+}
+
+:deep(.sp-new-session-item) {
+  width: 100%;
+  font-family: inherit;
+  text-align: left;
+  color: var(--text-secondary);
+}
+
+:deep(.sp-new-session-item.active) {
+  color: var(--text-color);
+}
+
+:deep(.sp-new-session-plus) {
+  width: 12px;
+  height: 12px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: currentColor;
+  font-size: 13px;
+  line-height: 1;
+  opacity: 0.72;
 }
 
 :deep(.sp-session-list) {
@@ -1569,16 +1668,17 @@ onUnmounted(() => {
 }
 
 .chat-view {
+  z-index: 2;
   flex: 1;
   display: flex;
   flex-direction: column;
   height: 100%;
   min-width: 0;
   min-height: 0;
-  overflow: hidden;
+  overflow: visible;
   position: relative;
   background: var(--msg-assistant-bg);
-  contain: layout paint;
+  contain: layout;
 }
 
 .chat-view.is-vertical-layout {
@@ -1636,13 +1736,118 @@ onUnmounted(() => {
 
 .input-area {
   position: relative;
-  padding: 12px 48px 24px;
+  padding: 12px 24px 18px;
   border-top: 1px solid var(--border-color);
   background: var(--bg-color);
 }
 
+.input-area.is-controls-collapsed {
+  padding-bottom: 14px;
+}
+
+.input-backdrop-row {
+  position: relative;
+  z-index: 3;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  align-items: center;
+  min-height: 24px;
+  margin: 0 4px 6px;
+}
+
+.input-area.is-controls-collapsed .input-backdrop-row {
+  min-height: 20px;
+  margin-bottom: 4px;
+}
+
+.input-controls-toggle-zone {
+  position: absolute;
+  top: 10px;
+  left: 0;
+  z-index: 2;
+  width: 28px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.input-area.is-controls-collapsed .input-controls-toggle-zone {
+  top: 20px;
+  left: 0;
+}
+
+.input-controls-toggle {
+  width: 20px;
+  height: 20px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: none;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.2s ease, color 0.12s ease, background 0.12s ease;
+}
+
+.input-controls-toggle-zone:hover .input-controls-toggle,
+.input-area.is-controls-switching .input-controls-toggle,
+.input-controls-toggle:focus-visible {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.input-controls-toggle:hover,
+.input-controls-toggle.is-collapsed:hover {
+  color: var(--text-color);
+  background: var(--hover-bg);
+}
+
+.input-controls-toggle.is-collapsed {
+  color: var(--accent-color);
+}
+
+.input-controls-toggle-icon {
+  width: 14px;
+  height: 14px;
+  display: block;
+}
+
+.input-backdrop-status {
+  grid-column: 1;
+  justify-self: start;
+  display: flex;
+  align-items: center;
+}
+
+.input-backdrop-action {
+  grid-column: 2;
+  justify-self: end;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  min-width: 0;
+}
+
 .chat-view.is-vertical-layout .input-area {
   padding: 10px 12px 12px;
+}
+
+.chat-view.is-vertical-layout .input-backdrop-row {
+  margin-inline: 2px;
+}
+
+.chat-view.is-vertical-layout .input-controls-toggle-zone {
+  top: 8px;
+  left: 0;
+}
+
+.chat-view.is-vertical-layout .input-area.is-controls-collapsed .input-controls-toggle-zone {
+  top: 18px;
 }
 
 .chat-pending-stack {
@@ -1662,25 +1867,21 @@ onUnmounted(() => {
   padding: 8px 16px 10px;
 }
 
-.chat-view.is-vertical-layout :deep(.chat-input-shell-topbar) {
-  align-items: flex-start;
+.chat-view.is-vertical-layout :deep(.chat-composer-footer) {
+  align-items: flex-end;
   flex-wrap: wrap;
 }
 
-.chat-view.is-vertical-layout :deep(.chat-input-shell-topbar-start) {
-  flex: 1 1 320px;
-  flex-wrap: wrap;
-}
-
-.chat-view.is-vertical-layout :deep(.chat-input-shell-topbar-end) {
+.chat-view.is-vertical-layout :deep(.chat-composer-footer-start) {
   flex: 1 1 auto;
-  justify-content: flex-start;
-  flex-wrap: wrap;
 }
 
-.chat-view.is-vertical-layout :deep(.token-usage-group) {
-  flex-wrap: wrap;
-  justify-content: flex-start;
+.chat-view.is-vertical-layout :deep(.chat-composer-footer-end) {
+  flex: 0 1 auto;
+  align-self: flex-end;
+  justify-content: flex-end;
+  margin-left: auto;
+  flex-wrap: nowrap;
 }
 
 .chat-view.is-vertical-layout :deep(.ask-user-card),
@@ -1734,125 +1935,46 @@ onUnmounted(() => {
   min-height: 28px;
 }
 
-.perm-toggle-btn {
-  gap: 4px;
-  font-size: 12px;
-  font-family: inherit;
-  font-weight: 500;
-  white-space: nowrap;
-  min-height: 28px;
-  padding: 0 8px;
-}
-
-.perm-toggle-btn.is-auto {
-  background: color-mix(in srgb, var(--accent-soft) 72%, var(--panel-bg) 28%);
-  border-color: color-mix(in srgb, var(--accent-color) 22%, var(--border-color));
-  color: color-mix(in srgb, var(--accent-color) 88%, var(--text-color) 12%);
-}
-
-.perm-toggle-btn.is-auto:hover:not(:disabled) {
-  background: color-mix(in srgb, var(--accent-soft) 84%, var(--panel-bg) 16%);
-  border-color: color-mix(in srgb, var(--accent-color) 28%, var(--border-color));
-  color: var(--accent-color);
-  filter: none;
-}
-
 .changes-toggle-btn {
-  gap: 4px;
-  font-size: 12px;
-  font-family: inherit;
-  font-weight: 500;
-  min-height: 28px;
-  padding: 0 10px;
-}
-
-.changes-badge {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  min-width: 14px;
-  height: 14px;
-  padding: 0 3px;
-  border-radius: 7px;
-  background: color-mix(in srgb, currentColor 18%, transparent);
-  color: inherit;
-  font-size: 9px;
-  font-weight: 600;
-  line-height: 1;
-}
-
-.footer-spacer {
-  flex: 1;
-}
-
-:deep(.token-usage-group) {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  cursor: default;
-  justify-content: flex-end;
-  white-space: nowrap;
-}
-
-:deep(.context-usage) {
-  display: flex;
-  align-items: center;
-  gap: 5px;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text-secondary);
   font-size: 12px;
-  color: var(--text-secondary);
-}
-
-:deep(.context-label) {
-  font-size: 11px;
+  font-family: inherit;
   font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.3px;
-  opacity: 0.6;
+  height: 24px;
+  min-height: 24px;
+  line-height: 1;
+  padding: 0 8px;
+  cursor: pointer;
+  box-shadow: none;
+  white-space: nowrap;
+  transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease, opacity 0.12s ease;
 }
 
-:deep(.context-bar-track) {
-  width: 48px;
-  height: 4px;
-  border-radius: 2px;
-  background: var(--border-color);
-  overflow: hidden;
-}
-
-:deep(.context-bar-fill) {
-  height: 100%;
-  border-radius: 2px;
-  transition: width 0.3s ease, background 0.3s ease;
-}
-
-:deep(.context-text) {
-  font-size: 11px;
-  font-variant-numeric: tabular-nums;
-  color: var(--text-secondary);
-}
-
-:deep(.context-sep) {
-  opacity: 0.4;
-  margin: 0 1px;
-}
-
-:deep(.token-price) {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  font-size: 11px;
-  color: var(--text-secondary);
-}
-
-:deep(.price-label) {
-  text-transform: uppercase;
-  letter-spacing: 0.3px;
-  opacity: 0.5;
-}
-
-:deep(.price-total) {
-  font-variant-numeric: tabular-nums;
+.changes-toggle-btn.is-active {
+  background: var(--active-bg);
+  border-color: color-mix(in srgb, var(--accent-color) 22%, var(--border-color));
   color: var(--text-color);
-  opacity: 0.8;
+}
+
+.changes-toggle-btn:hover:not(:disabled),
+.changes-toggle-btn:focus-visible {
+  background: var(--hover-bg);
+  color: var(--text-color);
+}
+
+.changes-toggle-btn:focus-visible {
+  outline: none;
+}
+
+.changes-toggle-btn:disabled {
+  opacity: 0.48;
+  cursor: not-allowed;
 }
 
 /* ── Ask User Card ── */

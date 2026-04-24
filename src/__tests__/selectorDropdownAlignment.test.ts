@@ -30,4 +30,21 @@ describe("selector dropdown alignment", () => {
     expect(source).toContain("right: auto;");
     expect(source).toContain("transform-origin: bottom left;");
   });
+
+  it("anchors the combined model effort selector to the trailing edge", () => {
+    const source = read("src/components/ModelEffortSelector.vue");
+
+    expect(source).toContain(".model-effort-trigger {");
+    expect(source).toContain("min-height: 28px;");
+    expect(source).toContain("border: 1px solid transparent;");
+    expect(source).toContain(".model-effort-dropdown {");
+    expect(source).toContain("right: 0;");
+    expect(source).toContain("transform-origin: bottom right;");
+    expect(source).toContain(".model-effort-dropdown.has-effort {");
+    expect(source).toContain("grid-template-columns: minmax(0, 1fr) 142px;");
+    expect(source).toContain(".model-effort-effort-panel {");
+    expect(source).toContain("border-left: 1px solid var(--border-color);");
+    expect(source).toContain("selectModel: [id: string]");
+    expect(source).toContain("selectEffort: [level: EffortLevel]");
+  });
 });

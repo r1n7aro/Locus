@@ -9,17 +9,97 @@ function read(relPath: string) {
 }
 
 describe("chat panel toggle layout", () => {
-  it("renders the file changes toggle in the composer action row instead of the transcript footer", () => {
+  it("renders status and changes toggle on the input backdrop and controls inside the input frame", () => {
     const chatView = read("src/components/ChatView.vue");
+    const composer = read("src/components/chat/ChatComposer.vue");
+    const tokenUsageBar = read("src/components/chat/TokenUsageBar.vue");
     const transcript = read("src/components/chat/ChatTranscript.vue");
 
     expect(chatView).toContain("const hasPanelToggleRow = computed(() => chatChangesStore.currentFileCount > 0);");
-    expect(chatView).toContain("<template #top-start>");
-    expect(chatView).toMatch(/<RichChatInput[\s\S]*<template #top-start>[\s\S]*<ModelSelector[\s\S]*@select="emit\('selectModel', \$event\)"/);
-    expect(chatView).toMatch(/<RichChatInput[\s\S]*<template #top-start>[\s\S]*<ThinkingSelector[\s\S]*@select="emit\('selectEffort', \$event\)"/);
-    expect(chatView).toMatch(/<RichChatInput[\s\S]*<template #top-start>[\s\S]*<ThinkingSelector[\s\S]*@select="emit\('selectEffort', \$event\)"[\s\S]*class="perm-toggle-btn ui-select-none"/);
-    expect(chatView).toContain("<template #top-end>");
-    expect(chatView).toMatch(/<RichChatInput[\s\S]*<template #top-end>[\s\S]*v-if="!isViewingSubagent && hasPanelToggleRow"[\s\S]*class="changes-toggle-btn ui-select-none"/);
+    expect(chatView).toContain("const inputControlsCollapsed = ref(false);");
+    expect(chatView).toContain("const inputControlsSwitching = ref(false);");
+    expect(chatView).toContain("const INPUT_CONTROLS_SWITCH_VISIBLE_MS = 120;");
+    expect(chatView).toContain("function toggleInputControlsCollapsed()");
+    expect(chatView).toContain("inputControlsSwitching.value = true;");
+    expect(chatView).toContain("clearInputControlsSwitchTimer();");
+    expect(chatView).toContain("}, INPUT_CONTROLS_SWITCH_VISIBLE_MS);");
+    expect(chatView).toMatch(/<div v-if="!inputControlsCollapsed" class="input-backdrop-status">[\s\S]*<ChatStatusIndicators/);
+    expect(chatView).not.toContain('class="input-backdrop-context"');
+    expect(chatView).not.toMatch(/<RichChatInput[\s\S]*<template #header-start>[\s\S]*<ChatStatusIndicators/);
+    expect(chatView).toContain('class="input-controls-toggle-zone"');
+    expect(chatView).toContain('class="input-controls-toggle ui-select-none"');
+    expect(chatView).toContain("'is-controls-switching': inputControlsSwitching");
+    expect(chatView).toContain('@click="toggleInputControlsCollapsed"');
+    expect(chatView).toMatch(/<div class="input-controls-toggle-zone">[\s\S]*<button[\s\S]*class="input-controls-toggle ui-select-none"[\s\S]*<\/button>\s*<\/div>\s*<div v-if="!inputControlsCollapsed" class="input-backdrop-row">/);
+    expect(chatView).toMatch(/<svg[\s\S]*v-if="inputControlsCollapsed"[\s\S]*class="input-controls-toggle-icon"[\s\S]*<path d="M4 10l4-4 4 4" \/>/);
+    expect(chatView).toMatch(/<svg[\s\S]*v-else[\s\S]*class="input-controls-toggle-icon"[\s\S]*<path d="M4 6l4 4 4-4" \/>/);
+    expect(chatView).not.toContain("padding-left: 26px;");
+    expect(chatView).toMatch(/\.input-backdrop-row \{[\s\S]*display: grid;[\s\S]*grid-template-columns: minmax\(0, 1fr\) minmax\(0, 1fr\);/);
+    expect(chatView).not.toContain(".input-backdrop-context {");
+    expect(chatView).toMatch(/<div class="input-backdrop-action">[\s\S]*v-if="!isViewingSubagent && hasPanelToggleRow"[\s\S]*class="changes-toggle-btn ui-select-none"[\s\S]*{{ t\('chat\.changes\.toggle'\) }}/);
+    expect(chatView).toContain(":class=\"{ 'is-active': chatChangesStore.currentPanelVisible }\"");
+    expect(chatView).toMatch(/\.input-backdrop-action \{[\s\S]*grid-column: 2;[\s\S]*justify-self: end;/);
+    expect(chatView).toMatch(/\.input-controls-toggle-zone \{[\s\S]*position: absolute;[\s\S]*top: 10px;[\s\S]*left: 0;/);
+    expect(chatView).toMatch(/\.input-area\.is-controls-collapsed \.input-controls-toggle-zone \{[\s\S]*top: 20px;[\s\S]*left: 0;/);
+    expect(chatView).toMatch(/\.chat-view\.is-vertical-layout \.input-area\.is-controls-collapsed \.input-controls-toggle-zone \{[\s\S]*top: 18px;/);
+    expect(chatView).toMatch(/\.input-controls-toggle \{[\s\S]*border: none;[\s\S]*background: transparent;/);
+    expect(chatView).toContain("transition: opacity 0.2s ease");
+    expect(chatView).toContain(".input-controls-toggle-zone:hover .input-controls-toggle");
+    expect(chatView).toContain(".input-area.is-controls-switching .input-controls-toggle");
+    expect(chatView).toMatch(/\.input-controls-toggle-icon \{[\s\S]*width: 14px;[\s\S]*height: 14px;/);
+    expect(chatView).not.toContain(".input-area:hover .input-controls-toggle");
+    expect(chatView).toContain(':compact="inputControlsCollapsed"');
+    expect(chatView).toContain(':show-action="!inputControlsCollapsed"');
+    expect(chatView).toContain('<template v-if="!inputControlsCollapsed" #footer-start>');
+    expect(chatView).toMatch(/<RichChatInput[\s\S]*<template v-if="!inputControlsCollapsed" #footer-start>[\s\S]*<ModelEffortSelector[\s\S]*align="start"/);
+    expect(chatView).toMatch(/<RichChatInput[\s\S]*<template v-if="!inputControlsCollapsed" #footer-start>[\s\S]*<ModelEffortSelector[\s\S]*\/>\s*<TokenUsageBar/);
+    expect(chatView).not.toMatch(/<RichChatInput[\s\S]*<template v-if="!inputControlsCollapsed" #footer-start>[\s\S]*class="changes-toggle-btn ui-select-none"/);
+    expect(chatView).not.toMatch(/<RichChatInput[\s\S]*<template v-if="!inputControlsCollapsed" #footer-end>[\s\S]*<TokenUsageBar/);
+    expect(tokenUsageBar).toContain("width: 24px;");
+    expect(tokenUsageBar).toContain("height: 28px;");
+    expect(tokenUsageBar).toContain("align-self: center;");
+    expect(tokenUsageBar).toContain("line-height: 0;");
+    expect(tokenUsageBar).toContain('class="context-progress-ring"');
+    expect(tokenUsageBar).toContain("width: 15px;");
+    expect(tokenUsageBar).toContain("height: 15px;");
+    expect(tokenUsageBar).toContain("transform: translateY(1px) rotate(-90deg);");
+    expect(tokenUsageBar).toContain('class="context-progress-track"');
+    expect(tokenUsageBar).toContain('class="context-progress-value"');
+    expect(tokenUsageBar).toContain(':stroke-dasharray="`${contextPercent} 100`"');
+    expect(tokenUsageBar).toContain('class="context-usage-label"');
+    expect(tokenUsageBar).toContain('role="meter"');
+    expect(tokenUsageBar).toContain(".token-usage-group:hover .context-usage-label");
+    expect(tokenUsageBar).not.toContain("@keyframes");
+    expect(tokenUsageBar).not.toContain("animation:");
+    expect(tokenUsageBar).not.toContain("context-bar-track");
+    expect(tokenUsageBar).not.toContain("context-bar-fill");
+    expect(tokenUsageBar).not.toContain('class="context-usage-kicker"');
+    expect(tokenUsageBar).not.toContain(">CTX</span>");
+    expect(tokenUsageBar).not.toContain('class="context-label"');
+    expect(tokenUsageBar).not.toContain('class="context-text"');
+    expect(tokenUsageBar).not.toContain('class="token-price"');
+    expect(tokenUsageBar).not.toContain(':title="usageTooltip"');
+    expect(chatView).toContain('@select-model="emit(\'selectModel\', $event)"');
+    expect(chatView).toContain('@select-effort="emit(\'selectEffort\', $event)"');
+    expect(chatView).not.toContain("perm-toggle-btn");
+    expect(chatView).not.toContain("toggleToolPermMode");
+    expect(chatView).not.toContain("<ModelSelector");
+    expect(chatView).not.toContain("<ThinkingSelector");
+    expect(chatView).not.toContain("ToolPermissionSelector");
+    expect(chatView).not.toContain("changes-badge");
+    expect(composer).toContain("min-height: 118px;");
+    expect(composer).toContain("min-height: 42px;");
+    expect(composer).toContain("width: 28px;");
+    expect(composer).toContain("height: 28px;");
+    expect(composer).toContain("border-radius: 6px;");
+    expect(composer).toContain("chat-composer-action ui-select-none");
+    expect(composer).toContain("compact?: boolean;");
+    expect(composer).toContain("showAction?: boolean;");
+    expect(composer).toContain("!props.compact && (hasFooterStart.value || hasFooterEnd.value || props.showAction)");
+    expect(composer).toContain('v-if="hasFooter"');
+    expect(composer).toContain('v-if="showAction"');
+    expect(composer).toContain(".chat-composer.is-compact {");
+    expect(chatView).toMatch(/\.chat-view\.is-vertical-layout :deep\(\.chat-composer-footer-end\) \{[\s\S]*align-self: flex-end;[\s\S]*justify-content: flex-end;[\s\S]*margin-left: auto;/);
     expect(chatView).not.toMatch(/<ChatTranscript[\s\S]*<template #footer>[\s\S]*hasPanelToggleRow/);
     expect(chatView).not.toContain("<AgentSelector");
     expect(chatView).not.toContain("{{ t('todo.title') }}");
@@ -31,17 +111,34 @@ describe("chat panel toggle layout", () => {
     expect(transcript).toContain("justify-content: flex-start;");
     expect(transcript).not.toContain(".chat-transcript-footer.is-session.has-divider {");
     expect(chatView).toContain(".changes-toggle-btn {");
-    expect(chatView).toContain("min-height: 28px;");
-    expect(chatView).toContain("padding: 0 10px;");
+    expect(chatView).toMatch(/\.changes-toggle-btn \{[\s\S]*background: transparent;[\s\S]*color: var\(--text-secondary\);/);
+    expect(chatView).toContain("min-height: 24px;");
+    expect(chatView).toContain("height: 24px;");
+    expect(chatView).toContain("line-height: 1;");
+    expect(chatView).toMatch(/\.changes-toggle-btn\.is-active \{[\s\S]*background: var\(--active-bg\);/);
+    expect(chatView).toContain("padding: 0 8px;");
+    expect(chatView).toMatch(/\.changes-toggle-btn:hover:not\(:disabled\),[\s\S]*\.changes-toggle-btn:focus-visible \{[\s\S]*background: var\(--hover-bg\);/);
+    expect(chatView).toContain("contain: layout;");
   });
 
-  it("keeps the toggle mounted during streaming and leaves the footer focused on token usage", () => {
+  it("keeps the global tool permission mode in settings", () => {
+    const settingsView = read("src/components/SettingsView.vue");
+    const toolPermissions = read("src/components/settings/ToolPermissions.vue");
+
+    expect(settingsView).toContain(':tool-permission-mode="chatStore.toolPermissionMode"');
+    expect(settingsView).toContain('@set-global-permission-mode="chatStore.setToolPermissionMode"');
+    expect(toolPermissions).toContain("settings.perms.globalMode");
+    expect(toolPermissions).toContain("settings.perms.globalModeDesc");
+    expect(toolPermissions).toContain("emit('setGlobalPermissionMode', $event as ToolMode)");
+  });
+
+  it("keeps the toggle mounted during streaming and keeps token usage next to the model selector", () => {
     const chatView = read("src/components/ChatView.vue");
 
     expect(chatView).toContain("v-if=\"!isViewingSubagent && hasPanelToggleRow\"");
     expect(chatView).toContain(":disabled=\"isStreaming\"");
-    expect(chatView).toMatch(/<template #footer>[\s\S]*<div class="footer-spacer"><\/div>[\s\S]*<TokenUsageBar/);
-    expect(chatView).not.toMatch(/<template #footer>[\s\S]*class="perm-toggle-btn ui-select-none"/);
+    expect(chatView).toMatch(/<template v-if="!inputControlsCollapsed" #footer-start>[\s\S]*<ModelEffortSelector[\s\S]*\/>\s*<TokenUsageBar/);
+    expect(chatView).not.toContain("hasVisibleTokenUsage");
     expect(chatView).not.toContain("v-if=\"!isStreaming && chatChangesStore.currentFileCount > 0\"");
   });
 });
