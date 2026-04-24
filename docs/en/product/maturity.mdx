@@ -1,24 +1,24 @@
 ---
 title: Maturity and Team Fit
-description: The product maturity and applicable team scope of Locus observed from the current repository implementation.
+description: Locus's product maturity and best-fit team profile, observed from the current implementation
 sidebarTitle: Maturity
 ---
 
-From the current repository snapshot, Locus already has the skeleton of a complete desktop workspace, the underlying runtime, and a portion of its stability work.
+Looking at the current snapshot, Locus already has the skeleton of a full desktop workspace, the underlying runtime, and a fair amount of stability work in place.
 
 ## Maturity Signals at the Code Level
 
-- The main frontend is organized around six workspaces
-- The Rust backend has been split into independent modules such as `agent / asset_db / diff / merge / knowledge_index / unity_bridge / llm / session / vcs`
-- The Unity plugin already has an independent bridge implementation
-- There are currently 93 test files under `src/__tests__`
-- The session persistence schema has clearly evolved to `v10`, with explicit migration logic retained
+- The frontend is organized around six workspaces
+- The Rust backend is split into independent modules: `agent / asset_db / diff / merge / knowledge_index / unity_bridge / llm / session / vcs`
+- The Unity plugin has its own bridge implementation
+- 93 test files currently live under `src/__tests__`
+- The session persistence schema has reached `v10`, with explicit migration logic kept around
 
-## Teams It Fits Better
+## Teams It Fits Best
 
-- Develop games with Unity
-- Use Git to manage the project
-- Want to truly embed AI into the daily development workflow
+- Build games in Unity
+- Use Git for version control
+- Want to actually embed AI into daily development
 - Need to manage project knowledge, conventions, and external references in one place
 
 ## Current Product Focus
@@ -26,13 +26,13 @@ From the current repository snapshot, Locus already has the skeleton of a comple
 - Unity first
 - Git first
 - Local desktop workflow first
-- Long-term project collaboration oriented
+- Built around long-term project collaboration
 
 ## Implementation Basis
 
-The judgments in this page mainly come from the following modules in the current repository:
+The claims on this page come from these modules in the current repository:
 
-- Application shell: `src/App.vue`
+- App shell: `src/App.vue`
 - Session and Agent UI: `src/components/ChatView.vue`, `src/components/AgentView.vue`
 - Asset workspace: `src/components/AssetView.vue`, `src-tauri/src/asset_db/*`, `src-tauri/src/commands/asset.rs`
 - Collaboration workspace: `src/components/CollabView.vue`, `src-tauri/src/merge/*`, `src-tauri/src/diff/*`

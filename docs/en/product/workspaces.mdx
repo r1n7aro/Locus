@@ -1,38 +1,38 @@
 ---
 title: Core Workspaces
-description: The responsibilities of Locus's six main workspaces and the recommended reading path.
+description: What each of Locus's six workspaces is for, and a recommended reading path
 ---
 
-Locus currently organizes product capabilities around six main workspaces. They serve one shared goal: allowing the Agent to work continuously inside the real context of a Unity project.
+Locus organizes its product capabilities around six workspaces. They share one goal: let the Agent work continuously inside the real context of a Unity project.
 
 ## Session
 
-The Session workspace carries daily conversation, task execution, tool call confirmation, and context export. This is the main entry point where the Agent enters the project.
+Daily conversation, task execution, tool-call confirmation, and context export all happen here. This is the Agent's main entry point into the project.
 
 ## Knowledge
 
-The Knowledge workspace is responsible for centrally managing the four document types `Design`, `Memory`, `Skill`, and `Reference`, and it provides retrieval, injection preview, external material import, and maintenance entry points.
+Centralizes the four document types—`Design`, `Memory`, `Skill`, and `Reference`—and provides retrieval, injection preview, external imports, and maintenance entry points.
 
 ## Collaboration
 
-The Collaboration workspace brings Git into the main workflow. It covers the history graph, staging area, conflict handling, semantic diff, and commit details, and it is suitable for reviewing changes when multiple people modify Unity project assets in parallel.
+Brings Git into the main workflow. Covers the history graph, staging area, conflict handling, semantic diff, and commit details. Useful when several people are touching Unity assets in parallel.
 
 ## Assets
 
-The Assets workspace is built around the Unity asset database and reference graph. It is suitable for checking dependencies, reverse references, risk reports, and asset previews.
+Built around the Unity asset database and reference graph. Use it to inspect dependencies, reverse references, risk reports, and asset previews.
 
 ## Agent
 
-The Agent workspace aggregates models, rules, system prompts, tool schema, and runtime injection information. It is suitable for governing development Agents used over the long term.
+Aggregates models, rules, system prompts, tool schemas, and runtime injection. The control surface for governing development Agents over the long run.
 
 ## Settings
 
-The Settings workspace is responsible for provider settings, model defaults, display preferences, shortcuts, knowledge configuration, and runtime parameters. It is the foundational configuration layer of the entire desktop workspace.
+Provider settings, model defaults, display preferences, shortcuts, knowledge configuration, runtime parameters—the foundation underneath everything else.
 
 ## Recommended Reading Path
 
-When you first learn about Locus, start with Session, Knowledge, and Collaboration. When you begin applying it in a real Unity project, go deeper into Assets and Agent.
+Start with Session, Knowledge, and Collaboration. Once you start applying Locus to a real Unity project, dive into Assets and Agent.
 
-- If you care about the Unity implementation loop: continue with [Unity Editor Loop](/product/unity-editor-loop)
-- If you care about asset review and troubleshooting: continue with [Asset Graph and Semantic Diff](/product/assets-and-diffs)
-- If you care about team accumulation and governance: continue with [Knowledge System](/product/knowledge-system) and [Agent Governance](/product/agent-governance)
+- For the Unity execution loop: [Unity Editor Loop](/en/product/unity-editor-loop)
+- For asset review and troubleshooting: [Asset Graph and Semantic Diff](/en/product/assets-and-diffs)
+- For team accumulation and governance: [Knowledge System](/en/product/knowledge-system) and [Agent Governance](/en/product/agent-governance)

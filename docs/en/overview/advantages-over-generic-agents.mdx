@@ -1,14 +1,14 @@
 ---
-title: Compared with Generic Agents
-description: The advantages of using Locus over generic coding Agents
+title: vs. Generic Agents
+description: Why Locus beats a generic coding agent inside Unity
 ---
 
-Locus is more than a simple wrapper around LLM APIs. We have done a great deal of work to maximize Agent capability.
+Locus is more than a thin wrapper around an LLM API. We've put serious work into pushing Agent capability further.
 
-- We implemented JIT execution for C# code inside the Unity Editor. Based on this capability, Locus can semantically modify Unity scenes and assets through scripts, without directly operating on large YAML files on disk and without manually choosing the correct tool from a large collection of editor MCP tools.
-- We designed an intermediate representation for Unity assets and components based on the idea of progressive expansion. With this representation, Locus can navigate and browse within hierarchical structures and load only the required content on demand, instead of reading and parsing an entire large file at once by itself.
-- We built a complete knowledge system for game projects. It supports automatic design-document summarization, long-term memory maintenance, Skill loading, and external document import such as the Unity API Reference and Feishu Docs. The system supports both lexical retrieval and semantic retrieval, and it natively integrates a local embedding runtime that can run on local CPU or GPU environments out of the box.
-- We implemented a highly parallel Unity YAML semantic parser in Rust. With this parser, Locus can directly and efficiently read multiple large files from disk semantically, and it supports semantic-level diff and merge in version-control workflows.
-- We implemented a highly parallel Unity asset database in Rust. Based on this database, Locus can efficiently search asset files in the project and maintain complete bidirectional dependency relationships, which supports direct queries for references and dependencies.
+- **JIT C# execution inside the Unity Editor.** With this, Locus modifies scenes and assets through scripts—no need to wrestle with giant YAML files on disk, and no need to pick from a sea of editor MCP tools.
+- **Progressive-expansion intermediate representation for Unity assets and components.** Locus walks the hierarchy and loads only what it needs, instead of slurping and parsing whole files up front.
+- **A full knowledge system built for game projects.** Auto-summarized design docs, long-term memory, Skill loading, and external imports (Unity API Reference, Feishu Docs, and more). Lexical and semantic retrieval ship side by side, with a local embedding runtime that runs out of the box on CPU or GPU.
+- **A highly parallel Unity YAML semantic parser, written in Rust.** Locus reads many large files straight from disk semantically, and the same parser powers semantic diff and merge in version control.
+- **A highly parallel Unity asset database, also in Rust.** Fast search across project assets and a complete bidirectional dependency graph, with direct queries for references and dependencies.
 
-We plan to publish a technical blog soon to introduce the implementation of Locus, along with the experience and reflections accumulated through the process, in a more systematic way.
+We're planning a technical blog post that walks through how Locus is built, along with the lessons we picked up along the way.

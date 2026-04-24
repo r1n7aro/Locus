@@ -1,30 +1,30 @@
 ---
 title: Page Notes
-description: Brief usage notes for each page
+description: Quick orientation for each page
 ---
 
 ## Session
 
 ![img](/images/overview/page-tour/session.png)
 
-Before sending a message, make sure the `Asset Database` and `Unity Editor Connection` in the upper-left corner are both working properly.
+Before sending a message, check that the `Asset Database` and `Unity Editor Connection` indicators (top-left) are both green.
 
-- **Multimodal input**: the input box supports image upload and parsing. You can paste with `CTRL+V`.
-- **Create a new session**: click the `+` icon in the upper-left corner or use the shortcut `CTRL+N` (the shortcut can be customized on the Settings page).
-- **Execution permission control**: located in the lower-right corner. When auto mode is enabled, the Agent's tool calls will run without approval. When it is disabled, any modification by the Agent will request permission from the user. This mode is safer, but it requires manual confirmation.
-- **Model switching**: located in the lower-right corner and used to switch the AI model for the current session.
-- **Send message**: the default shortcut is `ENTER`. You can change it to `CTRL+ENTER` on the Settings page.
-- **Session list management**: click `>` next to an item in the list on the left to expand the detailed execution process of a Subagent. List items support a right-click menu for actions such as archive and delete, and they support batch multi-selection while holding `SHIFT`.
+- **Multimodal input**: drop or paste images into the input box with `CTRL+V`.
+- **New session**: click `+` in the top-left, or hit `CTRL+N` (remappable in Settings).
+- **Auto-approval mode** (bottom-right): when on, the Agent runs tools without asking. When off, every modification needs your approval—safer, but slower.
+- **Model switcher** (bottom-right): change the model used by the current session.
+- **Send**: `ENTER` by default; switch to `CTRL+ENTER` in Settings.
+- **Session list**: click `>` to expand a Subagent's run. Right-click for archive/delete; hold `SHIFT` for multi-select.
 
 ## Collaboration
 
 ![img](/images/overview/page-tour/collaboration.png)
 
-- **Version control interaction**: the terminal area at the bottom supports directly entering standard Git commands or giving instructions to AI in natural language.
-- **Context menu**: right-click a commit record or a modified file to open the extended function menu. The feature matrix is still evolving, and feedback is welcome.
-- **Change preview and parsing**: click the file list on the right, including the Commit, Stash, and Unstaged/Staged areas, to preview diffs. The system natively supports visual parsing of Unity YAML asset files such as Scene, Prefab, and ScriptableObject.
-- **Conflict resolution**: when merge conflicts occur, the system supports context-based semantic merging at the field level.
-- **Locus-related file markers**: files marked as related to Locus are the Agent's own knowledge or configuration files. If you do not want them included in project version control, we recommend manually adding their paths to `.gitignore`
+- **Terminal at the bottom**: type standard Git commands, or hand instructions to the AI in plain English.
+- **Right-click menu**: available on commits and modified files; the action set is still growing—feedback welcome.
+- **Change preview**: click any file in the Commit, Stash, or Unstaged/Staged lists to see the diff. Unity YAML assets (Scene, Prefab, ScriptableObject) get a structured visual diff.
+- **Conflict resolution**: field-level semantic merge when conflicts hit Unity YAML.
+- **Locus-tagged files**: knowledge and config files owned by the Agent. If you don't want them under version control, add their paths to `.gitignore`.
 
 ## Knowledge
 
@@ -32,29 +32,29 @@ Before sending a message, make sure the `Asset Database` and `Unity Editor Conne
 
 ### Knowledge Categories
 
-The knowledge base is the core source from which the Agent obtains project context. The current knowledge system is divided into the following four categories:
+The knowledge base is where the Agent picks up project context. Knowledge is split into four categories:
 
-- **Design**: records project design requirements and factual baselines. AI can automatically update this document during a conversation according to business requirements, with user approval. Users can also edit and maintain it manually at any time.
-- **Memory**: dynamic context automatically maintained by AI. The system provides three built-in modules by default: user preferences, a mistake notebook, and project understanding. Users can create documents and define exclusive maintenance rules. AI will iterate on them automatically according to those rules.
-- **Skill**: used to solidify standardized high-frequency workflows. Users can describe a specific process in natural language and instruct the Agent to follow this Skill when it encounters a similar scenario.
-- **Reference**: an external read-only document library. It currently supports importing local documentation such as the Unity API Reference or connecting to external collaboration platforms such as Feishu Docs.
+- **Design**: project requirements and ground truth. The AI proposes updates during a conversation (subject to your approval); you can also edit it manually any time.
+- **Memory**: dynamic context maintained by the AI. Three modules ship by default—user preferences, mistake notebook, and project understanding. You can add your own and define how the AI updates them.
+- **Skill**: codifies repeatable workflows. Describe a process in natural language, and the Agent will follow it next time the same situation comes up.
+- **Reference**: read-only external docs. Today: local files like the Unity API Reference, plus connectors for platforms like Feishu Docs.
 
 ### Retrieval Strategy
 
-The system supports the following two document retrieval mechanisms:
+Two retrieval modes are available:
 
-- **Lexical indexing (enabled by default)**: exact text matching based on keyword extraction.
-- **Semantic indexing (enable it in the retrieval settings below)**: based on text vectorization. The system retrieves semantically similar paragraphs from the document library according to semantic fragments produced on the AI side. It is suitable for fuzzy document queries.
+- **Lexical indexing** (on by default): keyword-based exact text matching.
+- **Semantic indexing** (enable in retrieval settings): vector-based fuzzy matching against the AI's queries—useful when wording doesn't line up exactly.
 
 ![img](/images/overview/page-tour/knowledge-search.png)
 
 ## Settings
 
-The Settings page is used to manage global system settings.
+The Settings page holds global configuration.
 
 
 ### Model Configuration
 
-It supports customizing model parameters, configuring third-party API endpoints, and managing the sign-in and authorization status of subscription accounts.
+Customize model parameters, configure third-party API endpoints, and manage subscription account sign-in and authorization.
 
 ![img](/images/overview/page-tour/settings.png)

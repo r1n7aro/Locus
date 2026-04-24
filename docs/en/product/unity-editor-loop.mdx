@@ -1,34 +1,34 @@
 ---
 title: Unity Editor Loop
-description: The core execution chain that connects the file layer, editor layer, and compilation layer.
+description: The core execution chain that links the file layer, editor layer, and compile layer
 sidebarTitle: Unity Loop
 ---
 
-Locus connects the file layer, editor layer, and compilation layer into one complete chain. This chain determines whether the Agent can truly participate in actual Unity project development.
+Locus stitches the file layer, the editor layer, and the compile layer into one chain. This chain decides whether the Agent can actually take part in Unity development, instead of just touching files.
 
-## Key Capabilities Already Covered
+## Capabilities Already Covered
 
 - Detect Unity Editor connection state and distinguish `editing / playing / playing_paused / disconnected`
-- Select Unity assets from the desktop side and locate them in the Editor
+- Pick a Unity asset on the desktop side and locate it inside the Editor
 - Execute C# code on the Unity side
-- Request recompilation after script changes and wait for domain reload to complete
-- Batch-import changed assets before recompilation
-- Perform safety checks in Play Mode, on disconnect, and under inconsistent state
+- Request a recompile after script changes and wait for domain reload to finish
+- Batch-import changed assets before recompile
+- Run safety checks for Play Mode, disconnects, and inconsistent state
 
-## Why This Chain Matters
+## Why the Chain Matters
 
-Many real tasks are not just about editing files. They usually involve a full execution chain:
+Real tasks usually aren't single file edits. They tend to look like:
 
-1. Modify scripts or assets.
-2. Make Unity perceive those changes correctly.
-3. Wait for compile results or domain reload.
-4. Return to the Editor for continued validation.
+1. Change scripts or assets.
+2. Get Unity to register the change.
+3. Wait for the compile result or domain reload.
+4. Return to the Editor to verify.
 
-Locus has already turned this chain into a product capability, so it is closer to a real Unity development loop.
+Locus has already made this loop a first-class product capability, so it sits much closer to a real Unity development cycle.
 
-## Tasks It Can Take On Well
+## Tasks It Handles Well
 
-- Request Unity recompilation immediately after script changes
-- Trigger import after batch-processing asset changes
-- Handle state awareness between runtime and edit mode
-- Send error messages, state changes, and validation results directly back into the session
+- Trigger a Unity recompile right after a script change
+- Trigger an import after batch-processing asset changes
+- Stay aware of state across runtime and edit mode
+- Pipe errors, state changes, and verification results back into the session
