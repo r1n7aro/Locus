@@ -53,6 +53,7 @@ describe("AboutSettings layout", () => {
     expect(zh).toContain('"settings.about.contact": "联络邮箱"');
     expect(zh).toContain('"settings.about.versionSource": "版本来源"');
     expect(zh).toContain('"settings.about.versionSourceLocal": "本地服务器 ({0})"');
+    expect(zh).toContain('"settings.about.versionSourceRemote": "{0}"');
     expect(zh).toContain('"settings.about.lastChecked": "上次检查"');
     expect(zh).toContain('"settings.about.checkUpdates": "检查更新"');
     expect(en).toContain('"settings.tab.about": "About"');
@@ -60,6 +61,7 @@ describe("AboutSettings layout", () => {
     expect(en).toContain('"settings.about.contact": "Contact Email"');
     expect(en).toContain('"settings.about.versionSource": "Version source"');
     expect(en).toContain('"settings.about.versionSourceLocal": "Local server ({0})"');
+    expect(en).toContain('"settings.about.versionSourceRemote": "{0}"');
     expect(en).toContain('"settings.about.lastChecked": "Last checked"');
     expect(en).toContain('"settings.about.checkUpdates": "Check for updates"');
   });

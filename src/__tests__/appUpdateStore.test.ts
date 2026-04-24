@@ -133,5 +133,6 @@ describe("app update store", () => {
 
     expect(info).toBeNull();
     expect(store.hasUpdate).toBe(false);
+    expect(store.sourceLabel).toBe("unity.farlocus.com");
   });
 });
