@@ -1,34 +1,31 @@
 {
-  "version": "0.1.1",
-  "releasedAt": "2026-04-23",
+  "version": "0.1.2",
+  "releasedAt": "2026-04-24",
   "channel": "stable",
   "locales": {
     "zh": {
       "title": "发现新版本",
-      "summary": "Locus v0.1.1 (2026-04-23)",
+      "summary": "Locus v0.1.2 (2026-04-24)",
       "changelogUrl": "/overview/latest-version",
       "changes": [
         {
           "title": "新增",
           "items": [
-            "支持检查新版本，发现更新后会在应用内直接显示更新说明和入口。",
-            "新增后台通知，可在聊天完成、需要输入、需要确认或运行失败时接收提醒。",
-            "知识库目录发生变化后，会自动刷新受影响的文档和目录。",
-            "Unity 插件默认安装到 `Packages/com.farlocus.locus`，并支持从旧目录自动迁移。"
+            "Collab 新增 Git 配置编辑器，可编辑仓库级和全局 Git config。",
+            "Collab 侧栏支持选择分支和标签，并可跳转到对应历史记录。",
+            "Chat 变更文件新增树形视图，并会记住列表/树形模式。",
+            "Codex 模型列表会从账号可用模型中刷新，并显示支持的 reasoning effort。"
           ]
         },
         {
           "title": "修复",
           "items": [
-            "优化版本比较和发布信息校验，应用版本、更新信息和发布文档会保持一致。",
-            "调整会话里的 Todo 和消息展示，当前轮次的任务范围更清楚，工具调用顺序更稳定。",
-            "更新中英文文档和安装说明，插件路径与当前产品能力保持一致。"
-          ]
-        },
-        {
-          "title": "删除",
-          "items": [
-            "旧版 Unity 插件安装路径 `Assets/Locus` 和 `Assets/Plugins/Locus` 退出默认安装流程。"
+            "工具调用折叠或展开时，Chat 视口会保持在原位置。",
+            "改进连续和嵌套工具调用展示，减少重复或错位的工具调用记录。",
+            "应用更新检查改为读取 JSON 更新清单，发布文档与应用内更新内容保持一致。",
+            "应用初始加载界面更稳定。",
+            "更新 Git 配置和模型选择相关中英文文案。",
+            "降低 Asset 视图中文件夹图标的强调色。"
           ]
         }
       ],
@@ -41,30 +38,27 @@
     },
     "en": {
       "title": "Update available",
-      "summary": "Locus v0.1.1 (2026-04-23)",
+      "summary": "Locus v0.1.2 (2026-04-24)",
       "changelogUrl": "/en/overview/latest-version",
       "changes": [
         {
           "title": "Added",
           "items": [
-            "Added update checks in the app, with release notes and an update entry shown directly when a newer version is available.",
-            "Added background notifications for completed chats, input requests, approvals, and failed runs.",
-            "Knowledge documents and directories now refresh automatically after files change on disk.",
-            "The Unity plugin now installs to `Packages/com.farlocus.locus` by default and can migrate existing installs from the old locations."
+            "Added a Git config editor in Collab for repo and global Git config entries.",
+            "Collab now lets branch and tag selections jump to matching history entries.",
+            "Chat change files now support a tree view and remember the selected list/tree mode.",
+            "Codex model lists now refresh from the account's available models and show supported reasoning efforts."
           ]
         },
         {
           "title": "Fixed",
           "items": [
-            "Improved version comparison and release metadata validation so the app version, update manifest, and release notes stay aligned.",
-            "Refined session TODO and transcript behavior so the current run scope is clearer and tool calls render in a more stable order.",
-            "Updated the Chinese and English docs and install guide to match the current plugin path and product behavior."
-          ]
-        },
-        {
-          "title": "Removed",
-          "items": [
-            "Removed the old default Unity plugin install flow for `Assets/Locus` and `Assets/Plugins/Locus`."
+            "Chat now preserves the viewport while tool call groups collapse or expand.",
+            "Improved continuous and nested tool call rendering to reduce duplicate or misplaced tool call records.",
+            "App update checks now read the JSON update manifest, keeping release notes aligned with the in-app update view.",
+            "Improved the initial app loading surface.",
+            "Updated Chinese and English copy for Git config and model selection.",
+            "Reduced folder icon accent colors in Asset views."
           ]
         }
       ],
