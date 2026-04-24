@@ -2,6 +2,11 @@ import { describe, expect, it } from "vitest";
 import type { GitCommitInfo, GitGraphRef, GitStashEntry } from "../types";
 import { collectUnanchoredStashHashes, normalizeHistoryGraph } from "../components/collab/graph/normalize";
 import { layoutHistoryGraph } from "../components/collab/graph/layout";
+import {
+  HISTORY_GRAPH_REF_CONNECTOR_GAP,
+  historyGraphNodeOuterRadius,
+  historyGraphRefConnectorRunout,
+} from "../components/collab/graph/geometry";
 import { collapseDisplayRefsForRail } from "../components/collab/graph/refs";
 import type { HistoryGraphInput } from "../components/collab/graph/types";
 
@@ -66,6 +71,18 @@ function remoteRef(name: string, targetHash: string, remoteName = "origin"): Git
     isCurrent: false,
     branchName: name,
     remoteName,
+  };
+}
+
+function tagRef(name: string, targetHash: string): GitGraphRef {
+  return {
+    fullName: `refs/tags/${name}`,
+    shortName: name,
+    targetHash,
+    kind: "tag",
+    isCurrent: false,
+    branchName: null,
+    remoteName: null,
   };
 }
 
@@ -810,6 +827,33 @@ describe("history graph normalize/layout", () => {
 
     expect(layout.rails.refsWidth).toBeLessThan(116);
     expect(layout.rails.refsWidth).toBeGreaterThanOrEqual(88);
+  });
+
+  it("stops ref connectors before the commit node edge", () => {
+    const scene = normalizeHistoryGraph({
+      commits: [
+        commit("c1", ["c2"], "head"),
+        commit("c2", [], "tagged root"),
+      ],
+      stashes: [],
+      refs: [
+        localRef("main", "c1", true),
+        tagRef("v0.1", "c2"),
+      ],
+      headState: { hash: "c1", kind: "attached", refName: "main" },
+      selectedHistory: { kind: "commit", hash: "c1" },
+      workspaceChangeCount: 0,
+    });
+
+    const layout = layoutHistoryGraph(scene);
+    const head = layout.commits.find(commit => commit.commit.hash === "c1")!;
+    const taggedRoot = layout.commits.find(commit => commit.commit.hash === "c2")!;
+
+    expect(taggedRoot.refs.map(ref => ref.text)).toEqual(["v0.1"]);
+    expect(historyGraphRefConnectorRunout(taggedRoot)).toBeLessThan(taggedRoot.x);
+    expect(taggedRoot.x - historyGraphRefConnectorRunout(taggedRoot) - historyGraphNodeOuterRadius(taggedRoot))
+      .toBeCloseTo(HISTORY_GRAPH_REF_CONNECTOR_GAP, 5);
+    expect(historyGraphNodeOuterRadius(head)).toBeGreaterThan(historyGraphNodeOuterRadius(taggedRoot));
   });
 
   it("keeps an outer branch color stable even when an inner unnamed lane stays active", () => {

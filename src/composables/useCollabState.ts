@@ -177,6 +177,7 @@ export function useCollabState(props: CollabProps, options: CollabStateOptions =
   const gitConfigEmail = ref("");
   const gitConfigSaving = ref(false);
   const gitConfigError = ref("");
+  const currentGitAuthor = ref("");
 
   // ── File change lists ───────────────────────────────────────────
   const unstagedFiles = ref<GitFileChange[]>([]);
@@ -207,6 +208,11 @@ export function useCollabState(props: CollabProps, options: CollabStateOptions =
   const remoteBranches = ref<[string, GitRemoteBranch[]][]>([]);
   const stashes = ref<GitStashEntry[]>([]);
   const submodules = ref<GitSubmoduleInfo[]>([]);
+  const tags = computed(() =>
+    graphRefs.value
+      .filter(ref => ref.kind === "tag")
+      .sort((left, right) => left.shortName.localeCompare(right.shortName)),
+  );
 
   // ── Sidebar UI toggles ─────────────────────────────────────────
   const sidebarCollapsed = ref(false);
@@ -214,6 +220,7 @@ export function useCollabState(props: CollabProps, options: CollabStateOptions =
   const expandRemotes = ref(true);
   const expandedRemoteNames = ref<Set<string>>(new Set());
   const expandStashes = ref(true);
+  const expandTags = ref(true);
   const expandSubmodules = ref(true);
 
   // ── Resize / layout ─────────────────────────────────────────────
@@ -500,6 +507,37 @@ export function useCollabState(props: CollabProps, options: CollabStateOptions =
     }
   }
 
+  async function loadGitUserConfig(token: number, workingDir: string) {
+    if (!workingDir) {
+      if (isCurrentGitRefresh(token, workingDir)) {
+        currentGitAuthor.value = "";
+      }
+      return;
+    }
+    if (gitProbeState.value && !gitProbeState.value.available) {
+      if (isCurrentGitRefresh(token, workingDir)) {
+        currentGitAuthor.value = "";
+      }
+      return;
+    }
+
+    const t0 = perfNow();
+    try {
+      const cfg = await gitCheckUserConfig();
+      if (!isCurrentGitRefresh(token, workingDir)) return;
+      const name = cfg.name.trim();
+      const email = cfg.email.trim();
+      currentGitAuthor.value = name || email;
+    } catch {
+      if (!isCurrentGitRefresh(token, workingDir)) return;
+      currentGitAuthor.value = "";
+    } finally {
+      if (isCurrentGitRefresh(token, workingDir)) {
+        perfLog("gitCheckUserConfig", t0);
+      }
+    }
+  }
+
   function resetGitData() {
     logLoadedOnce = false;
     statusLoadedOnce = false;
@@ -529,6 +567,7 @@ export function useCollabState(props: CollabProps, options: CollabStateOptions =
     mergeOperation.value = null;
     pendingStagePaths.value = new Set();
     pendingUnstagePaths.value = new Set();
+    currentGitAuthor.value = "";
   }
 
   async function loadGitAvailability(token: number, workingDir: string) {
@@ -575,9 +614,10 @@ export function useCollabState(props: CollabProps, options: CollabStateOptions =
       loadHistorySnapshot(token, workingDir),
       loadGitStatus(token, workingDir),
       loadSidebarData(token, workingDir),
+      loadGitUserConfig(token, workingDir),
     ]);
     if (!isCurrentGitRefresh(token, workingDir)) return;
-    perfLog("parallel [gitHistorySnapshot + gitStatus + sidebar]", t1);
+    perfLog("parallel [gitHistorySnapshot + gitStatus + sidebar + userConfig]", t1);
     perfLog("refreshGitData (total)", t0);
   }
 
@@ -590,6 +630,7 @@ export function useCollabState(props: CollabProps, options: CollabStateOptions =
     }
     try {
       const cfg = await gitCheckUserConfig();
+      currentGitAuthor.value = cfg.name.trim() || cfg.email.trim();
       if (!cfg.name || !cfg.email) {
         gitConfigName.value = cfg.name;
         gitConfigEmail.value = cfg.email;
@@ -607,6 +648,7 @@ export function useCollabState(props: CollabProps, options: CollabStateOptions =
     gitConfigError.value = "";
     try {
       await gitSetUserConfig(gitConfigName.value, gitConfigEmail.value);
+      currentGitAuthor.value = gitConfigName.value.trim() || gitConfigEmail.value.trim();
       showGitConfigModal.value = false;
       await doInitGitUnity();
     } catch (e) {
@@ -820,7 +862,7 @@ export function useCollabState(props: CollabProps, options: CollabStateOptions =
 
   function onRefresh() {
     clearScheduledGitRefresh();
-    void refreshGitData();
+    return refreshGitData();
   }
 
   // ── Computed ────────────────────────────────────────────────────
@@ -1151,6 +1193,7 @@ export function useCollabState(props: CollabProps, options: CollabStateOptions =
     gitConfigEmail,
     gitConfigSaving,
     gitConfigError,
+    currentGitAuthor,
 
     // file changes
     unstagedFiles,
@@ -1173,6 +1216,7 @@ export function useCollabState(props: CollabProps, options: CollabStateOptions =
     localBranches,
     remoteBranches,
     stashes,
+    tags,
     submodules,
 
     // sidebar toggles
@@ -1181,6 +1225,7 @@ export function useCollabState(props: CollabProps, options: CollabStateOptions =
     expandRemotes,
     expandedRemoteNames,
     expandStashes,
+    expandTags,
     expandSubmodules,
 
     // layout / resize

@@ -98,4 +98,20 @@ describe("stagingTree", () => {
       "Assets/Locus/Editor/Roslyn/THIRD_PARTY.md",
     ]);
   });
+
+  it("keeps custom file keys for duplicate final paths", () => {
+    const rows = buildStagingTreeRows(
+      [
+        { ...makeFile("Assets/Config.asset"), displayKey: "first-touch" },
+        { ...makeFile("Assets/Config.asset"), displayKey: "second-touch" },
+      ],
+      new Set<string>(),
+      (file) => file.displayKey,
+    );
+
+    expect(rows.filter((row) => row.kind === "file").map((row) => row.key)).toEqual([
+      "file:first-touch",
+      "file:second-touch",
+    ]);
+  });
 });

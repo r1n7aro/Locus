@@ -457,10 +457,6 @@
   background: var(--active-bg);
 }
 
-.file-item.selected .file-stage-btn {
-  opacity: 1;
-}
-
 .files-section-title {
   flex-shrink: 0;
 }
@@ -768,12 +764,10 @@
 }
 
 .staging-file-row:hover .staging-row-actions,
-.staging-file-row.selected .staging-row-actions,
 .staging-file-row.pending .staging-row-actions,
-.staging-file-row:focus-within .staging-row-actions,
 .staging-tree-folder-row:hover .staging-row-actions,
 .staging-tree-folder-row.pending .staging-row-actions,
-.staging-tree-folder-row:focus-within .staging-row-actions {
+.staging-row-actions:focus-within {
   max-width: 168px;
   margin-right: 12px;
   padding-left: 8px;
@@ -781,7 +775,6 @@
   pointer-events: auto;
 }
 
-.staging-row-actions .file-action-btn,
 .staging-row-actions .file-stage-btn {
   opacity: 1;
 }
@@ -1085,17 +1078,11 @@
   white-space: nowrap;
 }
 
-.file-item:hover .file-stage-btn {
-  opacity: 1;
-}
-
 .staging-file-row.pending .file-stage-btn,
-.staging-file-row.selected .file-stage-btn,
-.staging-file-row:focus-within .file-stage-btn {
+.staging-row-actions:focus-within .file-stage-btn {
   opacity: 1;
 }
 
-.file-item.pending .file-stage-btn,
 .file-stage-btn.is-pending {
   opacity: 1;
 }
@@ -1120,9 +1107,6 @@
 
 .file-stage-btn:disabled {
   cursor: default;
-}
-
-.file-item:hover .file-stage-btn:disabled {
   opacity: 0.45;
 }
 

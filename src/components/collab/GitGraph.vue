@@ -20,11 +20,20 @@ import type {
   HistoryGraphRowLayout,
 } from "./graph/types";
 import { collapseDisplayRefsForRail } from "./graph/refs";
+import {
+  HISTORY_GRAPH_AUX_RADIUS as AUX_R,
+  HISTORY_GRAPH_DOT_RADIUS as DOT_R,
+  HISTORY_GRAPH_HEAD_RING_RADIUS as HEAD_RING_R,
+  HISTORY_GRAPH_SELECTED_HEAD_RING_RADIUS as SELECTED_HEAD_RING_R,
+  historyGraphRefConnectorRunout,
+} from "./graph/geometry";
+import type {
+  GitGraphPublicApi,
+  GitGraphScrollOptions,
+  GitGraphSelectionTarget,
+  GitGraphSelectOptions,
+} from "./gitGraphSelection";
 
-const DOT_R = 5.5;
-const AUX_R = 4.5;
-const HEAD_RING_R = DOT_R + 2.1;
-const SELECTED_HEAD_RING_R = DOT_R + 4.2;
 const VIRTUAL_ROW_BUFFER = 12;
 const GRAPH_COLUMN_STORAGE_KEY = "locus.collab.gitGraph.columns.v1";
 
@@ -37,6 +46,7 @@ const props = defineProps<{
   loadingMore: boolean;
   hasMoreCommits: boolean;
   currentBranch: string;
+  currentAuthor: string;
   stashes: GitStashEntry[];
   workspaceChangeCount: number;
   isMerging?: boolean;
@@ -124,6 +134,13 @@ function onScroll() {
 function refreshViewport() {
   syncViewport();
   maybeLoadMore();
+}
+
+function clampScrollTopValue(value: number): number {
+  const el = scrollRef.value;
+  if (!el) return 0;
+  const maxTop = Math.max(0, el.scrollHeight - el.clientHeight);
+  return Math.max(0, Math.min(maxTop, value));
 }
 
 function reconnectObservers() {
@@ -334,6 +351,71 @@ function onColumnResizeStart(event: MouseEvent, column: HistoryGraphResizableCol
   releaseColumnResizeSelectionLock = acquireSelectionLock();
 }
 
+function findSelectionRow(target: GitGraphSelectionTarget): HistoryGraphRowLayout | null {
+  if (target.kind === "workspace") {
+    return layout.value.auxNodes.find(node => node.kind === "workspace") ?? null;
+  }
+  if (target.kind === "stash") {
+    return layout.value.auxNodes.find(node => node.kind === "stash" && node.hash === target.hash) ?? null;
+  }
+  return layout.value.commits.find(row => row.commit.hash === target.hash) ?? null;
+}
+
+function isSelectionActive(target: GitGraphSelectionTarget): boolean {
+  if (target.kind === "workspace") {
+    return workspaceSelected.value;
+  }
+  return selectedHash.value === target.hash;
+}
+
+function targetSelectionHash(target: GitGraphSelectionTarget): string | null {
+  return target.kind === "workspace" ? null : target.hash;
+}
+
+function scrollToSelectionRow(row: HistoryGraphRowLayout, options: GitGraphScrollOptions = {}): boolean {
+  const el = scrollRef.value;
+  if (!el) return false;
+
+  const bodyViewportHeight = Math.max(
+    layout.value.rails.rowHeight,
+    el.clientHeight - headerHeight.value,
+  );
+  const targetTop = headerHeight.value + row.top + row.height / 2 - bodyViewportHeight / 2;
+  const top = clampScrollTopValue(targetTop);
+  el.scrollTo({
+    top,
+    behavior: options.behavior ?? "auto",
+  });
+  scrollTop.value = top;
+  return true;
+}
+
+async function scrollToHistory(
+  target: GitGraphSelectionTarget,
+  options: GitGraphScrollOptions = {},
+): Promise<boolean> {
+  await nextTick();
+  refreshViewport();
+  const row = findSelectionRow(target);
+  if (!row) return false;
+  return scrollToSelectionRow(row, options);
+}
+
+async function selectHistory(
+  target: GitGraphSelectionTarget,
+  options: GitGraphSelectOptions = {},
+): Promise<boolean> {
+  const shouldClear = options.toggle === true && isSelectionActive(target);
+  emit("selectCommit", shouldClear ? null : targetSelectionHash(target));
+  if (shouldClear || options.scroll === false) return false;
+  return scrollToHistory(target, options);
+}
+
+defineExpose<GitGraphPublicApi>({
+  selectHistory,
+  scrollToHistory,
+});
+
 function formatDate(ts: number): string {
   const now = Date.now() / 1000;
   const diff = now - ts;
@@ -381,7 +463,7 @@ function rowTitle(row: HistoryGraphRowLayout): string {
 }
 
 function rowMetaPrimary(row: HistoryGraphRowLayout): string {
-  if (row.kind === "workspace") return "";
+  if (row.kind === "workspace") return props.currentAuthor;
   if (row.kind === "stash") {
     return row.stash?.author ?? "";
   }
@@ -395,7 +477,6 @@ function rowMetaSecondary(row: HistoryGraphRowLayout): string {
 }
 
 function rowMetaText(row: HistoryGraphRowLayout): string {
-  if (row.kind === "workspace") return "";
   const primary = rowMetaPrimary(row).trim();
   const secondary = rowMetaSecondary(row).trim();
   if (primary && secondary) return `${primary} / ${secondary}`;
@@ -447,10 +528,10 @@ function showRowConnector(row: HistoryGraphRowLayout): boolean {
   return row.refs.length > 0;
 }
 
-function rowConnectorStyle(row: HistoryGraphRowLayout) {
+function rowRefConnectorStyle(row: HistoryGraphRowLayout) {
   return {
-    width: `${Math.max(0, row.x)}px`,
-    borderColor: row.color,
+    "--graph-connector-color": row.color,
+    "--graph-connector-runout": `${historyGraphRefConnectorRunout(row)}px`,
   };
 }
 </script>
@@ -727,17 +808,11 @@ function rowConnectorStyle(row: HistoryGraphRowLayout) {
                 <span
                   v-if="showRowConnector(entry.row)"
                   class="graph-row-ref-connector"
-                  :style="{ borderColor: entry.row.color }"
+                  :style="rowRefConnectorStyle(entry.row)"
                 />
               </div>
 
-              <div class="graph-row-track">
-                <span
-                  v-if="showRowConnector(entry.row)"
-                  class="graph-row-connector"
-                  :style="rowConnectorStyle(entry.row)"
-                />
-              </div>
+              <div class="graph-row-track" />
 
               <div class="graph-row-message">
                 <span class="graph-row-title">{{ rowTitle(entry.row) }}</span>
@@ -748,7 +823,7 @@ function rowConnectorStyle(row: HistoryGraphRowLayout) {
               </div>
 
               <div class="graph-row-meta">
-                <span v-if="entry.row.kind !== 'workspace'" class="graph-row-meta-text">{{ rowMetaText(entry.row) }}</span>
+                <span v-if="rowMetaText(entry.row)" class="graph-row-meta-text">{{ rowMetaText(entry.row) }}</span>
               </div>
             </button>
             <div

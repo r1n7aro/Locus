@@ -1,4 +1,4 @@
-import type { GitBranchInfo, GitBranchTarget } from "../../types";
+import type { GitBranchInfo, GitBranchTarget, GitGraphRef } from "../../types";
 
 export interface BranchDblclickAction {
   action: "switch" | "checkoutTracking";
@@ -34,4 +34,35 @@ export function resolveBranchDblclickAction(
     branchName: `${target.remoteName}/${target.branch.name}`,
     targetKind: "remote",
   };
+}
+
+export function resolveBranchTargetHash(
+  target: GitBranchTarget,
+  graphRefs: GitGraphRef[],
+): string | null {
+  const branchName = target.branch.name;
+
+  if (target.kind === "localBranch") {
+    const ref = graphRefs.find(ref =>
+      ref.kind === "localBranch"
+      && (
+        ref.branchName === branchName
+        || ref.shortName === branchName
+        || ref.fullName === `refs/heads/${branchName}`
+      )
+    );
+    return ref?.targetHash ?? null;
+  }
+
+  const fullRemoteName = `${target.remoteName}/${branchName}`;
+  const fullRefName = `refs/remotes/${target.remoteName}/${branchName}`;
+  const ref = graphRefs.find(ref =>
+    ref.kind === "remoteBranch"
+    && (
+      (ref.remoteName === target.remoteName && ref.branchName === branchName)
+      || ref.shortName === fullRemoteName
+      || ref.fullName === fullRefName
+    )
+  );
+  return ref?.targetHash ?? null;
 }

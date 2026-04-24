@@ -1,23 +1,25 @@
 import type { GitFileChange } from "../../types";
 
-type StagingTreeChild =
+type StagingTreeFile = Pick<GitFileChange, "path">;
+
+type StagingTreeChild<TFile extends StagingTreeFile = GitFileChange> =
   | {
       kind: "folder";
-      node: StagingTreeNode;
+      node: StagingTreeNode<TFile>;
     }
   | {
       kind: "file";
-      file: GitFileChange;
+      file: TFile;
     };
 
-interface StagingTreeNode {
+interface StagingTreeNode<TFile extends StagingTreeFile = GitFileChange> {
   path: string;
   name: string;
-  children: StagingTreeChild[];
-  folderMap: Map<string, StagingTreeNode>;
+  children: StagingTreeChild<TFile>[];
+  folderMap: Map<string, StagingTreeNode<TFile>>;
 }
 
-export type StagingTreeRow =
+export type StagingTreeRow<TFile extends StagingTreeFile = GitFileChange> =
   | {
       kind: "folder";
       key: string;
@@ -31,15 +33,15 @@ export type StagingTreeRow =
       kind: "file";
       key: string;
       depth: number;
-      file: GitFileChange;
+      file: TFile;
     };
 
-function createNode(path: string, name: string): StagingTreeNode {
+function createNode<TFile extends StagingTreeFile>(path: string, name: string): StagingTreeNode<TFile> {
   return {
     path,
     name,
     children: [],
-    folderMap: new Map<string, StagingTreeNode>(),
+    folderMap: new Map<string, StagingTreeNode<TFile>>(),
   };
 }
 
@@ -47,8 +49,8 @@ function splitPath(path: string): string[] {
   return path.split("/").filter(Boolean);
 }
 
-function buildTree(files: readonly GitFileChange[]): StagingTreeNode {
-  const root = createNode("", "");
+function buildTree<TFile extends StagingTreeFile>(files: readonly TFile[]): StagingTreeNode<TFile> {
+  const root = createNode<TFile>("", "");
 
   for (const file of files) {
     const segments = splitPath(file.path);
@@ -62,7 +64,7 @@ function buildTree(files: readonly GitFileChange[]): StagingTreeNode {
       currentPath = currentPath ? `${currentPath}/${segment}` : segment;
       let childNode = current.folderMap.get(segment);
       if (!childNode) {
-        childNode = createNode(currentPath, segment);
+        childNode = createNode<TFile>(currentPath, segment);
         current.folderMap.set(segment, childNode);
         current.children.push({
           kind: "folder",
@@ -81,13 +83,13 @@ function buildTree(files: readonly GitFileChange[]): StagingTreeNode {
   return root;
 }
 
-function getFolderChildren(node: StagingTreeNode): StagingTreeNode[] {
+function getFolderChildren<TFile extends StagingTreeFile>(node: StagingTreeNode<TFile>): StagingTreeNode<TFile>[] {
   return node.children
-    .filter((child): child is Extract<StagingTreeChild, { kind: "folder" }> => child.kind === "folder")
+    .filter((child): child is Extract<StagingTreeChild<TFile>, { kind: "folder" }> => child.kind === "folder")
     .map((child) => child.node);
 }
 
-function hasFileChildren(node: StagingTreeNode): boolean {
+function hasFileChildren<TFile extends StagingTreeFile>(node: StagingTreeNode<TFile>): boolean {
   return node.children.some((child) => child.kind === "file");
 }
 
@@ -135,12 +137,22 @@ export function buildStagingFolderFileMap(
 
 export function buildStagingTreeRows(
   files: readonly GitFileChange[],
+  collapsedPaths?: ReadonlySet<string>,
+): StagingTreeRow[];
+export function buildStagingTreeRows<TFile extends StagingTreeFile>(
+  files: readonly TFile[],
+  collapsedPaths: ReadonlySet<string>,
+  getFileKey: (file: TFile) => string,
+): StagingTreeRow<TFile>[];
+export function buildStagingTreeRows<TFile extends StagingTreeFile = GitFileChange>(
+  files: readonly TFile[],
   collapsedPaths: ReadonlySet<string> = new Set<string>(),
-): StagingTreeRow[] {
+  getFileKey: (file: TFile) => string = (file) => file.path,
+): StagingTreeRow<TFile>[] {
   const root = buildTree(files);
-  const rows: StagingTreeRow[] = [];
+  const rows: StagingTreeRow<TFile>[] = [];
 
-  function walk(children: readonly StagingTreeChild[], depth: number) {
+  function walk(children: readonly StagingTreeChild<TFile>[], depth: number) {
     for (const child of children) {
       if (child.kind === "folder") {
         let visibleNode = child.node;
@@ -173,7 +185,7 @@ export function buildStagingTreeRows(
 
       rows.push({
         kind: "file",
-        key: `file:${child.file.path}`,
+        key: `file:${getFileKey(child.file)}`,
         depth,
         file: child.file,
       });

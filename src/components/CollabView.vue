@@ -1,11 +1,12 @@
 
 <script setup lang="ts">
-import { ref, computed, watch } from "vue";
-import type { ModelOption, GitFileChange, DiffSource, FileDiffPayload, UnmergedFileEntry, GitHistoryTarget, GitBranchTarget, GitStashEntry } from "../types";
+import { ref, computed, nextTick, watch } from "vue";
+import type { ModelOption, GitFileChange, DiffSource, FileDiffPayload, UnmergedFileEntry, GitHistoryTarget, GitBranchTarget, GitStashEntry, GitGraphRef } from "../types";
 import { gitCommitAction, gitBranchAction, gitStashAction, gitDiscardFile } from "../services/git";
 import GitTerminal from "./GitTerminal.vue";
 import GitInitOverlay from "./collab/GitInitOverlay.vue";
 import GitSidebar from "./collab/GitSidebar.vue";
+import GitConfigPopover from "./collab/GitConfigPopover.vue";
 import GitGraph from "./collab/GitGraph.vue";
 import StagingArea from "./collab/StagingArea.vue";
 import CommitDetail from "./collab/CommitDetail.vue";
@@ -31,7 +32,9 @@ import {
 import { resolveHistorySelectionKind } from "./collab/historySelection";
 import { collectUnanchoredStashHashes } from "./collab/graph/normalize";
 import { extractLocalBranchNamesForHash } from "./collab/graph/refs";
-import { resolveBranchDblclickAction } from "./collab/branchInteraction";
+import { resolveBranchDblclickAction, resolveBranchTargetHash } from "./collab/branchInteraction";
+import type { GitGraphPublicApi, GitGraphSelectionTarget, GitGraphSelectOptions } from "./collab/gitGraphSelection";
+import { clampFloatingPosition } from "./ui/floatingPosition";
 
 const props = defineProps<{
   workingDir: string;
@@ -50,16 +53,18 @@ const notificationStore = useNotificationStore();
 const { hideMeta } = useHideMeta();
 const hasWorkspace = computed(() => !!props.workingDir.trim());
 const terminalRef = ref<InstanceType<typeof GitTerminal> | null>(null);
+const gitGraphRef = ref<GitGraphPublicApi | null>(null);
+const gitConfigPopoverOpen = ref(false);
 
 const {
   isRepo, commits, graphRefs, headState, loading, selectedHistory, selectedCommitHash, hasMoreCommits, loadingMore,
   initLoading, initError, gitProbeState, gitAvailable, gitHelpText,
-  showGitConfigModal, gitConfigName, gitConfigEmail, gitConfigSaving, gitConfigError,
+  showGitConfigModal, gitConfigName, gitConfigEmail, gitConfigSaving, gitConfigError, currentGitAuthor,
   unstagedFiles, stagedFiles, blockedFiles, commitFiles, commitBody, filesLoading,
   pendingStagePaths, pendingUnstagePaths, stageOperationBusy,
   unmergedFiles, mergeOperation, isMerging, hasUnresolvedFiles,
-  localBranches, remoteBranches, stashes, submodules,
-  sidebarCollapsed, expandLocal, expandRemotes, expandedRemoteNames, expandStashes, expandSubmodules,
+  localBranches, remoteBranches, stashes, tags, submodules,
+  sidebarCollapsed, expandLocal, expandRemotes, expandedRemoteNames, expandStashes, expandTags, expandSubmodules,
   containerRef, leftAreaRef, leftColRef, gitSidebarWidth, leftColWidth, terminalHeight, draggingClass,
   currentBranch, selectedCommit, totalChanges, workspaceChangeCount,
   initGitUnity, saveGitConfigAndInit, cancelGitConfig, toggleRemote,
@@ -110,6 +115,9 @@ const diffLoading = ref(false);
 const activeFilePath = ref<string | null>(null);
 const activeDiffSource = ref<DiffSource | null>(null);
 const activeDiffCommitHash = ref<string | null>(null);
+const pendingDiscardPaths = ref<Set<string>>(new Set());
+const discardOperationBusy = computed(() => pendingDiscardPaths.value.size > 0);
+const workspaceMutationBusy = computed(() => stageOperationBusy.value || discardOperationBusy.value);
 const diffProgress = useDiffProgress();
 const diffProgressWidth = computed(() => `${diffProgress.progress.value * 100}%`);
 const mergeResolutionRef = ref<{ confirmDiscardChanges?: () => Promise<boolean> } | null>(null);
@@ -211,6 +219,18 @@ function closeDiff() {
   activeDiffCommitHash.value = null;
 }
 
+function openGitConfigPopover() {
+  gitConfigPopoverOpen.value = true;
+}
+
+function closeGitConfigPopover() {
+  gitConfigPopoverOpen.value = false;
+}
+
+function onGitConfigSaved() {
+  void onRefresh();
+}
+
 watch(hasConflictState, (active, wasActive) => {
   if (!active || wasActive) return;
   selectedCommitHash.value = null;
@@ -270,12 +290,20 @@ async function runGitOp<T>(label: string, command: string, fn: () => Promise<T>)
 // ── Context menu ─────────────────────────────────────────────────
 
 type GitFileTarget = { kind: "file"; file: GitFileChange; source: "gitUnstaged" | "gitStaged"; selectedFiles: GitFileChange[] };
-
-const ctxMenu = ref<{
+type CollabContextMenuTarget = GitHistoryTarget | GitBranchTarget | GitFileTarget;
+type CollabContextMenuState = {
   x: number;
   y: number;
-  target: GitHistoryTarget | GitBranchTarget | GitFileTarget;
-} | null>(null);
+  target: CollabContextMenuTarget;
+};
+
+const CONTEXT_MENU_VIEWPORT_MARGIN = 8;
+const ctxMenu = ref<CollabContextMenuState | null>(null);
+const ctxMenuRef = ref<HTMLElement | null>(null);
+const ctxMenuStyle = computed(() => ({
+  left: `${ctxMenu.value?.x ?? 0}px`,
+  top: `${ctxMenu.value?.y ?? 0}px`,
+}));
 
 const promptDialog = ref<{
   title: string;
@@ -294,18 +322,60 @@ const confirmDialog = ref<{
 
 function closeCtxMenu() { ctxMenu.value = null; }
 
+function viewportSize() {
+  return {
+    width: window.innerWidth || document.documentElement.clientWidth,
+    height: window.innerHeight || document.documentElement.clientHeight,
+  };
+}
+
+function updateCtxMenuPosition() {
+  const menu = ctxMenu.value;
+  const el = ctxMenuRef.value;
+  if (!menu || !el) return;
+
+  const rect = el.getBoundingClientRect();
+  const next = clampFloatingPosition(
+    { x: menu.x, y: menu.y },
+    { width: rect.width, height: rect.height },
+    viewportSize(),
+    CONTEXT_MENU_VIEWPORT_MARGIN,
+  );
+  if (next.x === menu.x && next.y === menu.y) return;
+  ctxMenu.value = { ...menu, x: next.x, y: next.y };
+}
+
+function openCtxMenu(event: MouseEvent, target: CollabContextMenuTarget) {
+  ctxMenu.value = { x: event.clientX, y: event.clientY, target };
+  void nextTick(updateCtxMenuPosition);
+}
+
+function addPendingDiscardPaths(paths: string[]) {
+  if (paths.length === 0) return;
+  const next = new Set(pendingDiscardPaths.value);
+  for (const path of paths) next.add(path);
+  pendingDiscardPaths.value = next;
+}
+
+function removePendingDiscardPaths(paths: string[]) {
+  if (paths.length === 0) return;
+  const next = new Set(pendingDiscardPaths.value);
+  for (const path of paths) next.delete(path);
+  pendingDiscardPaths.value = next;
+}
+
 function onHistoryContextMenu(e: MouseEvent, target: GitHistoryTarget) {
   e.preventDefault();
   e.stopPropagation();
   if (target.kind === "commit") selectedCommitHash.value = target.commit.hash;
   if (target.kind === "stash") selectedCommitHash.value = target.stash.hash;
-  ctxMenu.value = { x: e.clientX, y: e.clientY, target };
+  openCtxMenu(e, target);
 }
 
 function onBranchContextMenu(e: MouseEvent, target: GitBranchTarget) {
   e.preventDefault();
   e.stopPropagation();
-  ctxMenu.value = { x: e.clientX, y: e.clientY, target };
+  openCtxMenu(e, target);
 }
 
 function onStashContextMenu(e: MouseEvent, target: GitHistoryTarget) {
@@ -314,11 +384,38 @@ function onStashContextMenu(e: MouseEvent, target: GitHistoryTarget) {
   if (target.kind === "stash" && (target.selectedStashes?.length ?? 1) <= 1) {
     selectedCommitHash.value = target.stash.hash;
   }
-  ctxMenu.value = { x: e.clientX, y: e.clientY, target };
+  openCtxMenu(e, target);
+}
+
+function targetHistoryHash(target: GitGraphSelectionTarget): string | null {
+  return target.kind === "workspace" ? null : target.hash;
+}
+
+function selectHistoryInGraph(target: GitGraphSelectionTarget, options: GitGraphSelectOptions = {}) {
+  const graph = gitGraphRef.value;
+  if (graph) {
+    return graph.selectHistory(target, options);
+  }
+
+  const targetHash = targetHistoryHash(target);
+  selectedCommitHash.value = options.toggle && selectedCommitHash.value === targetHash
+    ? null
+    : targetHash;
+  return Promise.resolve(false);
 }
 
 function onSelectStash(stash: GitStashEntry) {
-  selectedCommitHash.value = selectedCommitHash.value === stash.hash ? null : stash.hash;
+  void selectHistoryInGraph({ kind: "stash", hash: stash.hash }, { toggle: true });
+}
+
+function onSelectTag(tag: GitGraphRef) {
+  void selectHistoryInGraph({ kind: "commit", hash: tag.targetHash });
+}
+
+function onSelectBranch(target: GitBranchTarget) {
+  const hash = resolveBranchTargetHash(target, graphRefs.value);
+  if (!hash) return;
+  void selectHistoryInGraph({ kind: "commit", hash });
 }
 
 function onFileContextMenu(e: MouseEvent, file: GitFileChange, source: "gitUnstaged" | "gitStaged", selectedPaths: Set<string>) {
@@ -327,11 +424,11 @@ function onFileContextMenu(e: MouseEvent, file: GitFileChange, source: "gitUnsta
   const selectedFiles = selectedPaths.has(file.path)
     ? allFiles.filter((f) => selectedPaths.has(f.path))
     : [file];
-  ctxMenu.value = { x: e.clientX, y: e.clientY, target: { kind: "file", file, source, selectedFiles } };
+  openCtxMenu(e, { kind: "file", file, source, selectedFiles });
 }
 
 function confirmDiscardFile() {
-  if (stageOperationBusy.value) return;
+  if (workspaceMutationBusy.value) return;
   const target = ctxMenu.value?.target;
   if (target?.kind !== "file") return;
   const { source, selectedFiles } = target;
@@ -366,6 +463,7 @@ function confirmDiscardFile() {
         : t("collab.discardLocusWarnMulti", locusManagedCount),
     danger: true,
     action: async () => {
+      addPendingDiscardPaths(expandedPaths);
       try {
         if (source === "gitStaged") {
           await unstageFiles(expandedPaths);
@@ -379,14 +477,19 @@ function confirmDiscardFile() {
           code: err.code,
           operation: "collabDiscard",
         });
+      } finally {
+        try {
+          await onRefresh();
+        } finally {
+          removePendingDiscardPaths(expandedPaths);
+        }
       }
-      onRefresh();
     },
   };
 }
 
 function doFileStage() {
-  if (stageOperationBusy.value) return;
+  if (workspaceMutationBusy.value) return;
   const target = ctxMenu.value?.target;
   if (target?.kind !== "file") return;
   closeCtxMenu();
@@ -398,7 +501,7 @@ function doFileStage() {
 }
 
 function doFileUnstage() {
-  if (stageOperationBusy.value) return;
+  if (workspaceMutationBusy.value) return;
   const target = ctxMenu.value?.target;
   if (target?.kind !== "file") return;
   closeCtxMenu();
@@ -688,6 +791,7 @@ function copyBranchName() {
           :remote-branches="remoteBranches"
           :stashes="stashes"
           :unanchored-stash-hashes="unanchoredStashHashes"
+          :tags="tags"
           :submodules="submodules"
           :selected-history-hash="selectedCommitHash"
           :sidebar-collapsed="sidebarCollapsed"
@@ -695,17 +799,22 @@ function copyBranchName() {
           :expand-remotes="expandRemotes"
           :expanded-remote-names="expandedRemoteNames"
           :expand-stashes="expandStashes"
+          :expand-tags="expandTags"
           :expand-submodules="expandSubmodules"
           @toggle-sidebar="sidebarCollapsed = !sidebarCollapsed"
           @toggle-local="expandLocal = !expandLocal"
           @toggle-remotes="expandRemotes = !expandRemotes"
           @toggle-remote-name="toggleRemote"
           @toggle-stashes="expandStashes = !expandStashes"
+          @toggle-tags="expandTags = !expandTags"
           @toggle-submodules="expandSubmodules = !expandSubmodules"
           @select-stash="onSelectStash"
+          @select-tag="onSelectTag"
+          @select-branch="onSelectBranch"
           @branch-contextmenu="onBranchContextMenu"
           @branch-dblclick="onBranchDblclick"
           @stash-contextmenu="onStashContextMenu"
+          @open-git-config="openGitConfigPopover"
         />
       </div>
       <div
@@ -716,6 +825,7 @@ function copyBranchName() {
 
       <div class="left-column" ref="leftColRef">
         <GitGraph
+          ref="gitGraphRef"
           :commits="commits"
           :graph-refs="graphRefs"
           :head-state="headState"
@@ -724,6 +834,7 @@ function copyBranchName() {
           :loading-more="loadingMore"
           :has-more-commits="hasMoreCommits"
           :current-branch="currentBranch"
+          :current-author="currentGitAuthor"
           :stashes="stashes"
           :workspace-change-count="workspaceChangeCount"
           :is-merging="hasConflictState"
@@ -749,6 +860,12 @@ function copyBranchName() {
           />
         </div>
       </div>
+
+      <GitConfigPopover
+        :open="gitConfigPopoverOpen"
+        @close="closeGitConfigPopover"
+        @saved="onGitConfigSaved"
+      />
 
       <!-- Merge resolution overlay: covers sidebar + left column -->
       <div v-if="selectedConflictFile" class="inline-diff-panel">
@@ -862,7 +979,8 @@ function copyBranchName() {
       :active-file-path="activeWorkspaceFilePath"
       :pending-stage-paths="pendingStagePaths"
       :pending-unstage-paths="pendingUnstagePaths"
-      :stage-operation-busy="stageOperationBusy"
+      :pending-discard-paths="pendingDiscardPaths"
+      :stage-operation-busy="workspaceMutationBusy"
       @stage="stageFile"
       @unstage="unstageFile"
       @stage-many="stageFiles"
@@ -881,7 +999,7 @@ function copyBranchName() {
     <!-- Context menu -->
     <Teleport to="body">
       <div v-if="ctxMenu" class="ctx-backdrop" @click="closeCtxMenu" @contextmenu.prevent="closeCtxMenu">
-        <div class="ctx-menu" :style="{ left: ctxMenu.x + 'px', top: ctxMenu.y + 'px' }" @click.stop>
+        <div ref="ctxMenuRef" class="ctx-menu" :style="ctxMenuStyle" @click.stop>
           <!-- disabled reason hint -->
           <div v-if="hasConflictState" class="ctx-item ctx-hint">{{ conflictActionHint }}</div>
           <div v-if="hasConflictState" class="ctx-sep" />
@@ -936,19 +1054,19 @@ function copyBranchName() {
             <div
               v-if="ctxMenu.target.source === 'gitUnstaged'"
               class="ctx-item"
-              :class="{ disabled: stageOperationBusy }"
+              :class="{ disabled: workspaceMutationBusy }"
               @click="doFileStage()"
             >{{ ctxMenu.target.selectedFiles.length > 1 ? `Stage ${ctxMenu.target.selectedFiles.length} Files` : 'Stage' }}</div>
             <div
               v-else
               class="ctx-item"
-              :class="{ disabled: stageOperationBusy }"
+              :class="{ disabled: workspaceMutationBusy }"
               @click="doFileUnstage()"
             >{{ ctxMenu.target.selectedFiles.length > 1 ? `Unstage ${ctxMenu.target.selectedFiles.length} Files` : 'Unstage' }}</div>
             <div class="ctx-sep" />
             <div
               class="ctx-item ctx-danger"
-              :class="{ disabled: stageOperationBusy }"
+              :class="{ disabled: workspaceMutationBusy }"
               @click="confirmDiscardFile()"
             >{{ ctxMenu.target.selectedFiles.length > 1 ? `Discard ${ctxMenu.target.selectedFiles.length} Files` : 'Discard Changes' }}</div>
           </template>
@@ -1375,11 +1493,10 @@ function copyBranchName() {
 }
 
 :deep(.graph-row-ref-connector) {
+  position: relative;
   flex: 1;
   min-width: 0;
-  height: 0;
-  border-top: 1px solid currentColor;
-  opacity: 0.5;
+  height: var(--graph-row-height);
 }
 
 :deep(.graph-row-track) {
@@ -1387,13 +1504,15 @@ function copyBranchName() {
   position: relative;
 }
 
-:deep(.graph-row-connector) {
+:deep(.graph-row-ref-connector::before) {
+  content: "";
   position: absolute;
   left: 0;
+  right: calc(-1 * var(--graph-connector-runout, 0px));
   top: 50%;
-  transform: translateY(-50%);
-  border-top: 1px solid currentColor;
-  opacity: 0.5;
+  height: 0;
+  border-top: 1px solid var(--graph-connector-color);
+  transform: translateY(-0.5px);
 }
 
 :deep(.graph-row-message) {
@@ -1916,6 +2035,41 @@ function copyBranchName() {
   overflow-x: hidden;
 }
 
+:deep(.sidebar-footer) {
+  flex-shrink: 0;
+  padding: 6px 8px;
+  border-top: 1px solid var(--border-color);
+}
+
+:deep(.sidebar-config-btn) {
+  width: 100%;
+  min-height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 7px;
+  padding: 0 8px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}
+
+:deep(.sidebar-config-btn:hover) {
+  background: var(--hover-bg);
+  color: var(--text-color);
+  border-color: var(--border-color);
+}
+
+:deep(.sidebar-config-icon) {
+  flex-shrink: 0;
+  opacity: 0.7;
+}
+
 :deep(.sidebar-collapsed) {
   width: 28px;
   display: flex;
@@ -2025,7 +2179,9 @@ function copyBranchName() {
   background: var(--active-bg);
 }
 
-:deep(.sidebar-item.stash-item) {
+:deep(.sidebar-item.stash-item),
+:deep(.sidebar-item.tag-item),
+:deep(.sidebar-item.branch-item) {
   cursor: pointer;
 }
 
@@ -3077,7 +3233,11 @@ function copyBranchName() {
 }
 .ctx-menu {
   position: fixed;
-  min-width: 180px;
+  box-sizing: border-box;
+  min-width: min(180px, calc(100vw - 16px));
+  max-width: calc(100vw - 16px);
+  max-height: calc(100vh - 16px);
+  overflow: auto;
   background: var(--sidebar-bg, #1e1e2e);
   border: 1px solid var(--border-color, #333);
   border-radius: 8px;
@@ -3091,6 +3251,8 @@ function copyBranchName() {
   cursor: pointer;
   color: var(--text-color, #ccc);
   white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
   border-radius: 4px;
   margin: 1px 4px;
   transition: background 0.15s ease, color 0.15s ease;

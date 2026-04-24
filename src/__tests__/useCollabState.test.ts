@@ -160,6 +160,10 @@ describe("useCollabState", () => {
     gitServiceMocks.gitSubmodules.mockResolvedValue([]);
     gitServiceMocks.gitCommitBody.mockResolvedValue("");
     gitServiceMocks.gitCommitFiles.mockResolvedValue([]);
+    gitServiceMocks.gitCheckUserConfig.mockResolvedValue({
+      name: "Global User",
+      email: "global@example.com",
+    });
   });
 
   afterEach(() => {
@@ -275,6 +279,58 @@ describe("useCollabState", () => {
     expect(state.hasMoreCommits.value).toBe(true);
   });
 
+  it("derives sorted sidebar tags from graph refs", async () => {
+    gitServiceMocks.gitHistorySnapshot.mockResolvedValue(
+      snapshot([], "aaaaaaa", {
+        refs: [
+          {
+            fullName: "refs/tags/v2.0.0",
+            shortName: "v2.0.0",
+            targetHash: "bbbbbbb",
+            kind: "tag",
+            isCurrent: false,
+            remoteName: null,
+            branchName: null,
+          },
+          {
+            fullName: "refs/heads/main",
+            shortName: "main",
+            targetHash: "aaaaaaa",
+            kind: "localBranch",
+            isCurrent: true,
+            remoteName: null,
+            branchName: "main",
+          },
+          {
+            fullName: "refs/tags/v1.0.0",
+            shortName: "v1.0.0",
+            targetHash: "aaaaaaa",
+            kind: "tag",
+            isCurrent: false,
+            remoteName: null,
+            branchName: null,
+          },
+        ],
+      }),
+    );
+
+    const props = reactive({
+      workingDir: "",
+      isActive: false,
+      selectedModelId: "",
+      selectedAgentId: "",
+      models: [],
+    });
+
+    const state = useCollabState(props);
+
+    props.workingDir = "F:/repo";
+    await nextTick();
+    await flushPromises();
+
+    expect(state.tags.value.map(tag => tag.shortName)).toEqual(["v1.0.0", "v2.0.0"]);
+  });
+
   it("counts unique workspace changes across staged, unstaged, untracked, and unmerged files", async () => {
     gitServiceMocks.gitHistorySnapshot.mockResolvedValue(snapshot([{ hash: "aaaaaaa", shortHash: "aaaaaaa", parents: [], author: "tester", date: 1, message: "repo a", refs: [], isStash: false }], "aaaaaaa"));
     gitServiceMocks.gitStatus.mockResolvedValue({
@@ -347,6 +403,32 @@ describe("useCollabState", () => {
     await flushPromises();
 
     expect(state.currentBranch.value).toBe("HEAD (detached)");
+  });
+
+  it("loads current git author from user config", async () => {
+    gitServiceMocks.gitCheckUserConfig.mockResolvedValue({
+      name: "Repo User",
+      email: "repo@example.com",
+    });
+    gitServiceMocks.gitHistorySnapshot.mockResolvedValue(
+      snapshot([{ hash: "aaaaaaa", shortHash: "aaaaaaa", parents: [], author: "tester", date: 1, message: "repo a", refs: [], isStash: false }], "aaaaaaa"),
+    );
+
+    const props = reactive({
+      workingDir: "",
+      isActive: false,
+      selectedModelId: "",
+      selectedAgentId: "",
+      models: [],
+    });
+
+    const state = useCollabState(props);
+
+    props.workingDir = "F:/repo";
+    await nextTick();
+    await flushPromises();
+
+    expect(state.currentGitAuthor.value).toBe("Repo User");
   });
 
   it("keeps files in place until stage is confirmed by a fresh git status", async () => {

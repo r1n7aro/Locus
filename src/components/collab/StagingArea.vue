@@ -2,12 +2,10 @@
 import { ref, computed, watch, onBeforeUnmount } from "vue";
 import type { GitBlockedPath, GitFileChange, ModelOption } from "../../types";
 import { gitCommit, gitGenerateCommitMessage } from "../../services/git";
-import { selectUnityAsset, openFileExternal } from "../../services/unity";
-import { useProjectStore } from "../../stores/project";
 import { t } from "../../i18n";
 import { normalizeAppError } from "../../services/errors";
-import { useHideMeta, isMetaFile, canOpenInEditor, partitionMetaPaths } from "../../composables/useHideMeta";
-import { isLocusManagedFile } from "../../composables/locusManagedFiles";
+import { useHideMeta, isMetaFile, partitionMetaPaths } from "../../composables/useHideMeta";
+import { getLocusManagedTagKind, type LocusManagedFileLike } from "../../composables/locusManagedFiles";
 import { acquireSelectionLock } from "../../composables/useSelectionLock";
 import { resolveStagingFileSelection } from "./stagingSelection";
 import {
@@ -35,6 +33,7 @@ const props = defineProps<{
   activeFilePath: string | null;
   pendingStagePaths: Set<string>;
   pendingUnstagePaths: Set<string>;
+  pendingDiscardPaths: Set<string>;
   stageOperationBusy: boolean;
 }>();
 
@@ -52,7 +51,6 @@ const emit = defineEmits<{
 }>();
 
 const { hideMeta } = useHideMeta();
-const projectStore = useProjectStore();
 
 const layoutHorizontal = ref(readStoredStagingLayout());
 const fileViewMode = ref<StagingViewMode>(readStoredStagingViewMode());
@@ -79,8 +77,19 @@ function isUnstagePending(path: string) {
   return props.pendingUnstagePaths.has(path);
 }
 
+function isDiscardPending(path: string) {
+  return props.pendingDiscardPaths.has(path);
+}
+
 function isFilePending(path: string) {
-  return isStagePending(path) || isUnstagePending(path);
+  return isStagePending(path) || isUnstagePending(path) || isDiscardPending(path);
+}
+
+function fileActionLabel(path: string, idleKey: "collab.stage" | "collab.unstage") {
+  if (isDiscardPending(path)) return t("collab.discarding");
+  if (isStagePending(path)) return t("collab.staging");
+  if (isUnstagePending(path)) return t("collab.unstaging");
+  return t(idleKey);
 }
 
 function readStoredSplit(key: string, fallback: number) {
@@ -502,6 +511,11 @@ function fileDir(path: string): string {
   return parts.slice(0, -1).join("/") + "/";
 }
 
+function locusBadgeLabel(file: LocusManagedFileLike): string | null {
+  const kind = getLocusManagedTagKind(file);
+  return kind ? t(`collab.locusTag.${kind}`) : null;
+}
+
 function formatBlockedReason(file: GitBlockedPath): string {
   switch (file.reason) {
     case "windowsReservedName":
@@ -587,7 +601,7 @@ function formatBlockedReason(file: GitBlockedPath): string {
                 <span class="blocked-file-copy">
                   <span class="blocked-file-title">
                     <span class="file-name">{{ fileName(f.path) }}</span>
-                    <span v-if="isLocusManagedFile(f)" class="locus-badge">{{ t("collab.locusTag") }}</span>
+                    <span v-if="locusBadgeLabel(f)" class="locus-badge">{{ locusBadgeLabel(f) }}</span>
                     <span v-if="blockedOrphanMetaPaths.has(f.path)" class="orphan-meta-badge" :title="t('collab.orphanMetaHint')">{{ t("collab.orphanMetaTag") }}</span>
                   </span>
                   <span class="blocked-file-meta">
@@ -669,26 +683,20 @@ function formatBlockedReason(file: GitBlockedPath): string {
                     <span class="file-status" :class="fileStatusClass(row.file.status)">{{ fileStatusLabel(row.file.status) }}</span>
                     <span class="staging-file-copy">
                       <span class="file-name">{{ fileName(row.file.path) }}</span>
-                      <span v-if="isLocusManagedFile(row.file)" class="locus-badge">{{ t("collab.locusTag") }}</span>
+                      <span v-if="locusBadgeLabel(row.file)" class="locus-badge">{{ locusBadgeLabel(row.file) }}</span>
                       <span v-if="row.file.lfs" class="lfs-badge">LFS</span>
                       <span v-if="unstagedWithMeta.has(row.file.path)" class="meta-badge" title=".meta file included">.meta</span>
                       <span v-if="unstagedOrphanMetaPaths.has(row.file.path)" class="orphan-meta-badge" :title="t('collab.orphanMetaHint')">{{ t("collab.orphanMetaTag") }}</span>
                     </span>
                   </button>
                   <div class="file-row-actions staging-row-actions">
-                    <button v-if="projectStore.unityConnected" class="file-action-btn unity-btn" @click.stop="selectUnityAsset(row.file.path)" :title="t('common.selectInUnity')">
-                      <svg viewBox="0 0 16 16" width="12" height="12" fill="currentColor"><path d="M6.4 1L1 8l5.4 7h3.2L6.2 9.5H15v-3H6.2L9.6 1H6.4z"/></svg>
-                    </button>
-                    <button v-if="canOpenInEditor(row.file.path)" class="file-action-btn open-btn" @click.stop="openFileExternal(row.file.path)" :title="t('common.openInEditor')">
-                      <svg viewBox="0 0 16 16" width="12" height="12" fill="currentColor"><path d="M8 1C4.1 1 1 4.1 1 8s3.1 7 7 7 7-3.1 7-7-3.1-7-7-7zm0 12.5c-3 0-5.5-2.5-5.5-5.5S5 2.5 8 2.5s5.5 2.5 5.5 5.5-2.5 5.5-5.5 5.5zM6 5l6 3-6 3V5z"/></svg>
-                    </button>
                     <button
                       class="file-stage-btn stage"
-                      :class="{ 'is-pending': isStagePending(row.file.path) }"
+                      :class="{ 'is-pending': isFilePending(row.file.path) }"
                       :disabled="props.stageOperationBusy"
                       @click.stop="emit('stage', row.file.path)"
-                      :title="isStagePending(row.file.path) ? t('collab.staging') : t('collab.stage')"
-                    >{{ isStagePending(row.file.path) ? t("collab.staging") : t("collab.stage") }}</button>
+                      :title="fileActionLabel(row.file.path, 'collab.stage')"
+                    >{{ fileActionLabel(row.file.path, "collab.stage") }}</button>
                   </div>
                 </div>
               </div>
@@ -712,7 +720,7 @@ function formatBlockedReason(file: GitBlockedPath): string {
                   <span class="file-status" :class="fileStatusClass(f.status)">{{ fileStatusLabel(f.status) }}</span>
                   <span class="staging-file-copy">
                     <span class="file-name">{{ fileName(f.path) }}</span>
-                    <span v-if="isLocusManagedFile(f)" class="locus-badge">{{ t("collab.locusTag") }}</span>
+                    <span v-if="locusBadgeLabel(f)" class="locus-badge">{{ locusBadgeLabel(f) }}</span>
                     <span v-if="f.lfs" class="lfs-badge">LFS</span>
                     <span v-if="unstagedWithMeta.has(f.path)" class="meta-badge" title=".meta file included">.meta</span>
                     <span v-if="unstagedOrphanMetaPaths.has(f.path)" class="orphan-meta-badge" :title="t('collab.orphanMetaHint')">{{ t("collab.orphanMetaTag") }}</span>
@@ -720,19 +728,13 @@ function formatBlockedReason(file: GitBlockedPath): string {
                   </span>
                 </button>
                 <div class="file-row-actions staging-row-actions">
-                  <button v-if="projectStore.unityConnected" class="file-action-btn unity-btn" @click.stop="selectUnityAsset(f.path)" :title="t('common.selectInUnity')">
-                    <svg viewBox="0 0 16 16" width="12" height="12" fill="currentColor"><path d="M6.4 1L1 8l5.4 7h3.2L6.2 9.5H15v-3H6.2L9.6 1H6.4z"/></svg>
-                  </button>
-                  <button v-if="canOpenInEditor(f.path)" class="file-action-btn open-btn" @click.stop="openFileExternal(f.path)" :title="t('common.openInEditor')">
-                    <svg viewBox="0 0 16 16" width="12" height="12" fill="currentColor"><path d="M8 1C4.1 1 1 4.1 1 8s3.1 7 7 7 7-3.1 7-7-3.1-7-7-7zm0 12.5c-3 0-5.5-2.5-5.5-5.5S5 2.5 8 2.5s5.5 2.5 5.5 5.5-2.5 5.5-5.5 5.5zM6 5l6 3-6 3V5z"/></svg>
-                  </button>
                   <button
                     class="file-stage-btn stage"
-                    :class="{ 'is-pending': isStagePending(f.path) }"
+                    :class="{ 'is-pending': isFilePending(f.path) }"
                     :disabled="props.stageOperationBusy"
                     @click.stop="emit('stage', f.path)"
-                    :title="isStagePending(f.path) ? t('collab.staging') : t('collab.stage')"
-                  >{{ isStagePending(f.path) ? t("collab.staging") : t("collab.stage") }}</button>
+                    :title="fileActionLabel(f.path, 'collab.stage')"
+                  >{{ fileActionLabel(f.path, "collab.stage") }}</button>
                 </div>
               </div>
             </template>
@@ -825,26 +827,20 @@ function formatBlockedReason(file: GitBlockedPath): string {
                     <span class="file-status" :class="fileStatusClass(row.file.status)">{{ fileStatusLabel(row.file.status) }}</span>
                     <span class="staging-file-copy">
                       <span class="file-name">{{ fileName(row.file.path) }}</span>
-                      <span v-if="isLocusManagedFile(row.file)" class="locus-badge">{{ t("collab.locusTag") }}</span>
+                      <span v-if="locusBadgeLabel(row.file)" class="locus-badge">{{ locusBadgeLabel(row.file) }}</span>
                       <span v-if="row.file.lfs" class="lfs-badge">LFS</span>
                       <span v-if="stagedWithMeta.has(row.file.path)" class="meta-badge" title=".meta file included">.meta</span>
                       <span v-if="stagedOrphanMetaPaths.has(row.file.path)" class="orphan-meta-badge" :title="t('collab.orphanMetaHint')">{{ t("collab.orphanMetaTag") }}</span>
                     </span>
                   </button>
                   <div class="file-row-actions staging-row-actions">
-                    <button v-if="projectStore.unityConnected" class="file-action-btn unity-btn" @click.stop="selectUnityAsset(row.file.path)" :title="t('common.selectInUnity')">
-                      <svg viewBox="0 0 16 16" width="12" height="12" fill="currentColor"><path d="M6.4 1L1 8l5.4 7h3.2L6.2 9.5H15v-3H6.2L9.6 1H6.4z"/></svg>
-                    </button>
-                    <button v-if="canOpenInEditor(row.file.path)" class="file-action-btn open-btn" @click.stop="openFileExternal(row.file.path)" :title="t('common.openInEditor')">
-                      <svg viewBox="0 0 16 16" width="12" height="12" fill="currentColor"><path d="M8 1C4.1 1 1 4.1 1 8s3.1 7 7 7 7-3.1 7-7-3.1-7-7-7zm0 12.5c-3 0-5.5-2.5-5.5-5.5S5 2.5 8 2.5s5.5 2.5 5.5 5.5-2.5 5.5-5.5 5.5zM6 5l6 3-6 3V5z"/></svg>
-                    </button>
                     <button
                       class="file-stage-btn unstage"
-                      :class="{ 'is-pending': isUnstagePending(row.file.path) }"
+                      :class="{ 'is-pending': isFilePending(row.file.path) }"
                       :disabled="props.stageOperationBusy"
                       @click.stop="emit('unstage', row.file.path)"
-                      :title="isUnstagePending(row.file.path) ? t('collab.unstaging') : t('collab.unstage')"
-                    >{{ isUnstagePending(row.file.path) ? t("collab.unstaging") : t("collab.unstage") }}</button>
+                      :title="fileActionLabel(row.file.path, 'collab.unstage')"
+                    >{{ fileActionLabel(row.file.path, "collab.unstage") }}</button>
                   </div>
                 </div>
               </div>
@@ -868,7 +864,7 @@ function formatBlockedReason(file: GitBlockedPath): string {
                   <span class="file-status" :class="fileStatusClass(f.status)">{{ fileStatusLabel(f.status) }}</span>
                   <span class="staging-file-copy">
                     <span class="file-name">{{ fileName(f.path) }}</span>
-                    <span v-if="isLocusManagedFile(f)" class="locus-badge">{{ t("collab.locusTag") }}</span>
+                    <span v-if="locusBadgeLabel(f)" class="locus-badge">{{ locusBadgeLabel(f) }}</span>
                     <span v-if="f.lfs" class="lfs-badge">LFS</span>
                     <span v-if="stagedWithMeta.has(f.path)" class="meta-badge" title=".meta file included">.meta</span>
                     <span v-if="stagedOrphanMetaPaths.has(f.path)" class="orphan-meta-badge" :title="t('collab.orphanMetaHint')">{{ t("collab.orphanMetaTag") }}</span>
@@ -876,19 +872,13 @@ function formatBlockedReason(file: GitBlockedPath): string {
                   </span>
                 </button>
                 <div class="file-row-actions staging-row-actions">
-                  <button v-if="projectStore.unityConnected" class="file-action-btn unity-btn" @click.stop="selectUnityAsset(f.path)" :title="t('common.selectInUnity')">
-                    <svg viewBox="0 0 16 16" width="12" height="12" fill="currentColor"><path d="M6.4 1L1 8l5.4 7h3.2L6.2 9.5H15v-3H6.2L9.6 1H6.4z"/></svg>
-                  </button>
-                  <button v-if="canOpenInEditor(f.path)" class="file-action-btn open-btn" @click.stop="openFileExternal(f.path)" :title="t('common.openInEditor')">
-                    <svg viewBox="0 0 16 16" width="12" height="12" fill="currentColor"><path d="M8 1C4.1 1 1 4.1 1 8s3.1 7 7 7 7-3.1 7-7-3.1-7-7-7zm0 12.5c-3 0-5.5-2.5-5.5-5.5S5 2.5 8 2.5s5.5 2.5 5.5 5.5-2.5 5.5-5.5 5.5zM6 5l6 3-6 3V5z"/></svg>
-                  </button>
                   <button
                     class="file-stage-btn unstage"
-                    :class="{ 'is-pending': isUnstagePending(f.path) }"
+                    :class="{ 'is-pending': isFilePending(f.path) }"
                     :disabled="props.stageOperationBusy"
                     @click.stop="emit('unstage', f.path)"
-                    :title="isUnstagePending(f.path) ? t('collab.unstaging') : t('collab.unstage')"
-                  >{{ isUnstagePending(f.path) ? t("collab.unstaging") : t("collab.unstage") }}</button>
+                    :title="fileActionLabel(f.path, 'collab.unstage')"
+                  >{{ fileActionLabel(f.path, "collab.unstage") }}</button>
                 </div>
               </div>
             </template>

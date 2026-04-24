@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   countLocusManagedFiles,
+  getLocusManagedTagKind,
+  getLocusManagedTagKindForPath,
   isLocusManagedFile,
   isLocusManagedPath,
 } from "../composables/locusManagedFiles";
@@ -28,6 +30,25 @@ describe("locusManagedFiles", () => {
       path: "Assets/Notes/design.md",
       oldPath: "Locus/knowledge/design/docs/Design/design.md",
     })).toBe(true);
+  });
+
+  it("resolves semantic tags for knowledge files", () => {
+    expect(getLocusManagedTagKindForPath("Locus/knowledge/design/system/主要玩法.md")).toBe("design");
+    expect(getLocusManagedTagKindForPath("Locus/knowledge/memory/unity-project-understanding/12.md")).toBe("memory");
+    expect(getLocusManagedTagKindForPath("Locus/knowledge/skill/create-skill.md")).toBe("skill");
+    expect(getLocusManagedTagKindForPath("Locus/knowledge/reference/unity/api.md")).toBe("reference");
+    expect(getLocusManagedTagKindForPath("Locus/memory/project-understanding.md")).toBe("memory");
+  });
+
+  it("falls back to the generic tag for non-knowledge Locus files", () => {
+    expect(getLocusManagedTagKindForPath("Assets/Locus/Editor/Locus.Editor.asmdef")).toBe("locus");
+  });
+
+  it("uses the semantic tag from renamed knowledge files", () => {
+    expect(getLocusManagedTagKind({
+      path: "Assets/Notes/design.md",
+      oldPath: "Locus/knowledge/design/docs/Design/design.md",
+    })).toBe("design");
   });
 
   it("counts only Locus-managed entries", () => {

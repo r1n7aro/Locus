@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, watch } from "vue";
-import type { GitBranchInfo, GitBranchTarget, GitHistoryTarget, GitRemoteBranch, GitStashEntry, GitSubmoduleInfo } from "../../types";
+import type { GitBranchInfo, GitBranchTarget, GitGraphRef, GitHistoryTarget, GitRemoteBranch, GitStashEntry, GitSubmoduleInfo } from "../../types";
 import { t } from "../../i18n";
 
 const props = defineProps<{
@@ -8,6 +8,7 @@ const props = defineProps<{
   remoteBranches: [string, GitRemoteBranch[]][];
   stashes: GitStashEntry[];
   unanchoredStashHashes: Set<string>;
+  tags: GitGraphRef[];
   submodules: GitSubmoduleInfo[];
   selectedHistoryHash: string | null;
   sidebarCollapsed: boolean;
@@ -15,6 +16,7 @@ const props = defineProps<{
   expandRemotes: boolean;
   expandedRemoteNames: Set<string>;
   expandStashes: boolean;
+  expandTags: boolean;
   expandSubmodules: boolean;
 }>();
 
@@ -24,11 +26,15 @@ const emit = defineEmits<{
   (e: "toggleRemotes"): void;
   (e: "toggleRemoteName", name: string): void;
   (e: "toggleStashes"): void;
+  (e: "toggleTags"): void;
   (e: "toggleSubmodules"): void;
   (e: "selectStash", stash: GitStashEntry): void;
+  (e: "selectTag", tag: GitGraphRef): void;
+  (e: "selectBranch", target: GitBranchTarget): void;
   (e: "branchContextmenu", event: MouseEvent, target: GitBranchTarget): void;
   (e: "branchDblclick", target: GitBranchTarget): void;
   (e: "stashContextmenu", event: MouseEvent, target: GitHistoryTarget): void;
+  (e: "openGitConfig", event: MouseEvent): void;
 }>();
 
 const selectedStashHashes = ref<Set<string>>(new Set());
@@ -112,6 +118,12 @@ function unanchoredStashTitle(): string {
   return t("collab.stash.unanchoredTooltip");
 }
 
+function isSelectedBranch(branch: GitBranchInfo | GitRemoteBranch): boolean {
+  const selectedHash = props.selectedHistoryHash;
+  const branchHash = branch.shortHash.trim();
+  return !!selectedHash && !!branchHash && selectedHash.startsWith(branchHash);
+}
+
 watch(
   () => props.stashes,
   (list) => {
@@ -168,8 +180,9 @@ watch(
         <div v-if="props.expandLocal" class="sidebar-section-body">
           <div
             v-for="b in props.localBranches" :key="b.name"
-            class="sidebar-item" :class="{ active: b.isCurrent }"
+            class="sidebar-item branch-item" :class="{ active: b.isCurrent || isSelectedBranch(b) }"
             :title="b.shortHash + ' ' + b.message"
+            @click="emit('selectBranch', { kind: 'localBranch', branch: b })"
             @dblclick="emit('branchDblclick', { kind: 'localBranch', branch: b })"
             @contextmenu.prevent="emit('branchContextmenu', $event, { kind: 'localBranch', branch: b })"
           >
@@ -205,8 +218,10 @@ watch(
             <template v-if="props.expandedRemoteNames.has(remoteName)">
               <div
                 v-for="rb in branches" :key="remoteName + '/' + rb.name"
-                class="sidebar-item nested"
+                class="sidebar-item nested branch-item"
+                :class="{ active: isSelectedBranch(rb) }"
                 :title="rb.shortHash + ' ' + rb.message"
+                @click="emit('selectBranch', { kind: 'remoteBranch', remoteName, branch: rb })"
                 @dblclick="emit('branchDblclick', { kind: 'remoteBranch', remoteName, branch: rb })"
                 @contextmenu.prevent="emit('branchContextmenu', $event, { kind: 'remoteBranch', remoteName, branch: rb })"
               >
@@ -254,8 +269,34 @@ watch(
         </div>
       </div>
 
+      <!-- TAGS -->
+      <div v-if="props.tags.length > 0" class="sidebar-section">
+        <div class="sidebar-section-header" @click="emit('toggleTags')">
+          <span class="chevron" :class="{ expanded: props.expandTags }">&#9654;</span>
+          <svg class="section-icon" viewBox="0 0 16 16" width="14" height="14" fill="currentColor">
+            <path d="M1 7.775V2.75C1 1.784 1.784 1 2.75 1h5.025c.464 0 .91.184 1.238.513l5.474 5.474a1.75 1.75 0 0 1 0 2.475l-5.025 5.025a1.75 1.75 0 0 1-2.475 0L1.513 9.013A1.75 1.75 0 0 1 1 7.775zM2.75 2.5a.25.25 0 0 0-.25.25v5.025c0 .066.026.13.073.177l5.475 5.475a.25.25 0 0 0 .353 0l5.026-5.026a.25.25 0 0 0 0-.353L7.952 2.573a.25.25 0 0 0-.177-.073H2.75zM6 5a1 1 0 1 1-2 0 1 1 0 0 1 2 0z"/>
+          </svg>
+          <span class="section-label">TAGS</span>
+          <span class="section-count">{{ props.tags.length }}</span>
+        </div>
+        <div v-if="props.expandTags" class="sidebar-section-body">
+          <div
+            v-for="tag in props.tags" :key="tag.fullName"
+            class="sidebar-item tag-item"
+            :class="{ active: props.selectedHistoryHash === tag.targetHash }"
+            :title="tag.shortName + ' @ ' + tag.targetHash.slice(0, 7)"
+            @click="emit('selectTag', tag)"
+          >
+            <svg class="item-icon tag-icon" viewBox="0 0 16 16" width="12" height="12" fill="currentColor">
+              <path d="M1 7.775V2.75C1 1.784 1.784 1 2.75 1h5.025c.464 0 .91.184 1.238.513l5.474 5.474a1.75 1.75 0 0 1 0 2.475l-5.025 5.025a1.75 1.75 0 0 1-2.475 0L1.513 9.013A1.75 1.75 0 0 1 1 7.775zM2.75 2.5a.25.25 0 0 0-.25.25v5.025c0 .066.026.13.073.177l5.475 5.475a.25.25 0 0 0 .353 0l5.026-5.026a.25.25 0 0 0 0-.353L7.952 2.573a.25.25 0 0 0-.177-.073H2.75zM6 5a1 1 0 1 1-2 0 1 1 0 0 1 2 0z"/>
+            </svg>
+            <span class="item-label">{{ tag.shortName }}</span>
+          </div>
+        </div>
+      </div>
+
       <!-- SUBMODULES -->
-      <div class="sidebar-section">
+      <div v-if="props.submodules.length > 0" class="sidebar-section">
         <div class="sidebar-section-header" @click="emit('toggleSubmodules')">
           <span class="chevron" :class="{ expanded: props.expandSubmodules }">&#9654;</span>
           <svg class="section-icon" viewBox="0 0 16 16" width="14" height="14" fill="currentColor">
@@ -286,10 +327,22 @@ watch(
             </svg>
             <span class="item-label">{{ m.name }}</span>
           </div>
-          <div v-if="props.submodules.length === 0" class="sidebar-empty">{{ t("collab.noSubmodule") }}</div>
         </div>
       </div>
 
+    </div>
+    <div class="sidebar-footer">
+      <button
+        type="button"
+        class="sidebar-config-btn"
+        :title="t('git.config.open')"
+        @click="emit('openGitConfig', $event)"
+      >
+        <svg class="sidebar-config-icon" viewBox="0 0 16 16" width="13" height="13" fill="currentColor" aria-hidden="true">
+          <path d="M6.32 1.1a.75.75 0 0 1 .72-.55h1.92a.75.75 0 0 1 .72.55l.3 1.05c.38.15.74.36 1.07.62l1.06-.29a.75.75 0 0 1 .85.34l.96 1.66a.75.75 0 0 1-.13.91l-.78.77c.03.2.05.41.05.63s-.02.43-.05.64l.78.76a.75.75 0 0 1 .13.91l-.96 1.66a.75.75 0 0 1-.85.34l-1.06-.29c-.33.26-.69.47-1.07.62l-.3 1.05a.75.75 0 0 1-.72.55H7.04a.75.75 0 0 1-.72-.55l-.3-1.05a4.56 4.56 0 0 1-1.07-.62l-1.06.29a.75.75 0 0 1-.85-.34l-.96-1.66a.75.75 0 0 1 .13-.91l.78-.76a4.34 4.34 0 0 1 0-1.27l-.78-.77a.75.75 0 0 1-.13-.91l.96-1.66a.75.75 0 0 1 .85-.34l1.06.29c.33-.26.69-.47 1.07-.62l.3-1.05zM8 5.25a2.75 2.75 0 1 0 0 5.5 2.75 2.75 0 0 0 0-5.5z"/>
+        </svg>
+        <span>{{ t("git.config.open") }}</span>
+      </button>
     </div>
   </div>
 

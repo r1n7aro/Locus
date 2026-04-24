@@ -5,7 +5,7 @@ import { selectUnityAsset, openFileExternal } from "../../services/unity";
 import { useProjectStore } from "../../stores/project";
 import { t } from "../../i18n";
 import { useHideMeta, canOpenInEditor, partitionMetaPaths } from "../../composables/useHideMeta";
-import { isLocusManagedFile } from "../../composables/locusManagedFiles";
+import { getLocusManagedTagKind, type LocusManagedFileLike } from "../../composables/locusManagedFiles";
 import {
   persistStagingViewMode,
   readStoredStagingViewMode,
@@ -163,6 +163,11 @@ function fileDir(path: string): string {
   const parts = path.split("/");
   if (parts.length <= 1) return "";
   return parts.slice(0, -1).join("/") + "/";
+}
+
+function locusBadgeLabel(file: LocusManagedFileLike): string | null {
+  const kind = getLocusManagedTagKind(file);
+  return kind ? t(`collab.locusTag.${kind}`) : null;
 }
 
 function treeIndentPx(depth: number) {
@@ -347,7 +352,7 @@ function toggleTreeFolder(chainPaths: readonly string[], expanded: boolean) {
               <span class="file-status ui-select-none" :class="fileStatusClass(row.file.status)">{{ fileStatusLabel(row.file.status) }}</span>
               <span class="staging-file-copy">
                 <span class="file-name ui-select-text">{{ fileName(row.file.path) }}</span>
-                <span v-if="isLocusManagedFile(row.file)" class="locus-badge ui-select-none">{{ t("collab.locusTag") }}</span>
+                <span v-if="locusBadgeLabel(row.file)" class="locus-badge ui-select-none">{{ locusBadgeLabel(row.file) }}</span>
                 <span v-if="row.file.lfs" class="lfs-badge ui-select-none">LFS</span>
                 <span v-if="orphanMetaPaths.has(row.file.path)" class="orphan-meta-badge ui-select-none" :title="t('collab.orphanMetaHint')">{{ t("collab.orphanMetaTag") }}</span>
               </span>
@@ -372,7 +377,7 @@ function toggleTreeFolder(chainPaths: readonly string[], expanded: boolean) {
           >
             <span class="file-status ui-select-none" :class="fileStatusClass(f.status)">{{ fileStatusLabel(f.status) }}</span>
             <span class="file-name ui-select-text">{{ fileName(f.path) }}</span>
-            <span v-if="isLocusManagedFile(f)" class="locus-badge ui-select-none">{{ t("collab.locusTag") }}</span>
+            <span v-if="locusBadgeLabel(f)" class="locus-badge ui-select-none">{{ locusBadgeLabel(f) }}</span>
             <span v-if="f.lfs" class="lfs-badge ui-select-none">LFS</span>
             <span v-if="orphanMetaPaths.has(f.path)" class="orphan-meta-badge ui-select-none" :title="t('collab.orphanMetaHint')">{{ t("collab.orphanMetaTag") }}</span>
             <span class="file-dir ui-select-text">{{ fileDir(f.path) }}</span>
