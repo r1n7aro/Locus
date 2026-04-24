@@ -92,6 +92,7 @@ export function useSettingsState(emit: SettingsEmit) {
       localStorage.removeItem("locus-theme-preference");
       localStorage.removeItem("locus:sessionPanelWidth");
       localStorage.removeItem("locus:chatSidebarWidth");
+      localStorage.removeItem("locus:chatSidebarHeight");
       localStorage.removeItem("locus:collabLeftColWidth");
       localStorage.removeItem("locus:collabTerminalHeight");
     } catch { /* ignore */ }

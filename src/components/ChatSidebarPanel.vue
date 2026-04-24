@@ -8,12 +8,15 @@ import { acquireSelectionLock } from "../composables/useSelectionLock";
 import TodoPanel from "./TodoPanel.vue";
 import ChatChangesPanel from "./ChatChangesPanel.vue";
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   todos: TodoItem[];
   isStreaming: boolean;
   todoWriteVersion: number;
   celebrationEnabled: boolean;
-}>();
+  layout?: "side" | "bottom";
+}>(), {
+  layout: "side",
+});
 
 const chatStore = useChatStore();
 const changesStore = useChatChangesStore();
@@ -23,22 +26,41 @@ const showChangesSection = computed(() => changesStore.currentPanelVisible);
 const hasBothSections = computed(() => showTodoSection.value && showChangesSection.value);
 
 const STORAGE_KEY_SIDEBAR_WIDTH = "locus:chatSidebarWidth";
+const STORAGE_KEY_SIDEBAR_HEIGHT = "locus:chatSidebarHeight";
 const DEFAULT_SIDEBAR_WIDTH = 280;
+const DEFAULT_SIDEBAR_HEIGHT = 260;
 const MIN_SIDEBAR_WIDTH = 240;
 const MAX_SIDEBAR_WIDTH = 520;
+const MIN_SIDEBAR_HEIGHT = 180;
+const MAX_SIDEBAR_HEIGHT = 460;
 
 const shellRef = ref<HTMLElement | null>(null);
 const sidebarWidth = ref(DEFAULT_SIDEBAR_WIDTH);
+const sidebarHeight = ref(DEFAULT_SIDEBAR_HEIGHT);
 const isDraggingSidebar = ref(false);
 let releaseSidebarSelectionLock: (() => void) | null = null;
 
-const sidebarStyle = computed(() => ({
-  width: `${sidebarWidth.value}px`,
-  minWidth: `${sidebarWidth.value}px`,
-}));
+const sidebarStyle = computed(() => {
+  if (props.layout === "bottom") {
+    return {
+      width: "100%",
+      minWidth: "0",
+      height: `${sidebarHeight.value}px`,
+      minHeight: `${sidebarHeight.value}px`,
+    };
+  }
+  return {
+    width: `${sidebarWidth.value}px`,
+    minWidth: `${sidebarWidth.value}px`,
+  };
+});
 
 function clampSidebarWidth(next: number) {
   return Math.max(MIN_SIDEBAR_WIDTH, Math.min(MAX_SIDEBAR_WIDTH, next));
+}
+
+function clampSidebarHeight(next: number) {
+  return Math.max(MIN_SIDEBAR_HEIGHT, Math.min(MAX_SIDEBAR_HEIGHT, next));
 }
 
 function closeSidebar() {
@@ -53,12 +75,16 @@ function onSidebarResizeMouseDown(event: MouseEvent) {
   releaseSidebarSelectionLock = acquireSelectionLock();
   document.addEventListener("mousemove", onSidebarResizeMouseMove);
   document.addEventListener("mouseup", onSidebarResizeMouseUp);
-  document.body.style.cursor = "col-resize";
+  document.body.style.cursor = props.layout === "bottom" ? "row-resize" : "col-resize";
 }
 
 function onSidebarResizeMouseMove(event: MouseEvent) {
   if (!isDraggingSidebar.value || !shellRef.value) return;
   const rect = shellRef.value.getBoundingClientRect();
+  if (props.layout === "bottom") {
+    sidebarHeight.value = clampSidebarHeight(rect.bottom - event.clientY);
+    return;
+  }
   const nextWidth = rect.right - event.clientX;
   sidebarWidth.value = clampSidebarWidth(nextWidth);
 }
@@ -73,7 +99,11 @@ function stopSidebarResize(persist: boolean) {
   releaseSidebarSelectionLock = null;
   if (!persist) return;
   try {
-    localStorage.setItem(STORAGE_KEY_SIDEBAR_WIDTH, String(Math.round(sidebarWidth.value)));
+    if (props.layout === "bottom") {
+      localStorage.setItem(STORAGE_KEY_SIDEBAR_HEIGHT, String(Math.round(sidebarHeight.value)));
+    } else {
+      localStorage.setItem(STORAGE_KEY_SIDEBAR_WIDTH, String(Math.round(sidebarWidth.value)));
+    }
   } catch {
     // ignore persistence failures
   }
@@ -85,6 +115,7 @@ function onSidebarResizeMouseUp() {
 
 function onWindowResize() {
   sidebarWidth.value = clampSidebarWidth(sidebarWidth.value);
+  sidebarHeight.value = clampSidebarHeight(sidebarHeight.value);
 }
 
 onMounted(() => {
@@ -93,10 +124,15 @@ onMounted(() => {
     if (savedWidth) {
       sidebarWidth.value = clampSidebarWidth(Number(savedWidth));
     }
+    const savedHeight = localStorage.getItem(STORAGE_KEY_SIDEBAR_HEIGHT);
+    if (savedHeight) {
+      sidebarHeight.value = clampSidebarHeight(Number(savedHeight));
+    }
   } catch {
     // ignore persistence failures
   }
   sidebarWidth.value = clampSidebarWidth(sidebarWidth.value);
+  sidebarHeight.value = clampSidebarHeight(sidebarHeight.value);
   window.addEventListener("resize", onWindowResize);
 });
 
@@ -107,7 +143,14 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div ref="shellRef" class="chat-sidebar-shell" :class="{ 'dragging-sidebar': isDraggingSidebar }">
+  <div
+    ref="shellRef"
+    class="chat-sidebar-shell"
+    :class="[
+      `layout-${layout}`,
+      { 'dragging-sidebar': isDraggingSidebar },
+    ]"
+  >
     <div class="chat-sidebar-resize-handle" @mousedown="onSidebarResizeMouseDown"></div>
 
     <aside
@@ -154,12 +197,25 @@ onUnmounted(() => {
   flex-shrink: 0;
 }
 
+.chat-sidebar-shell.layout-bottom {
+  width: 100%;
+  height: auto;
+  min-width: 0;
+  flex-direction: column;
+}
+
 .chat-sidebar-resize-handle {
   width: 3px;
   flex-shrink: 0;
   cursor: col-resize;
   background: var(--border-color);
   transition: background 0.15s ease;
+}
+
+.chat-sidebar-shell.layout-bottom .chat-sidebar-resize-handle {
+  width: 100%;
+  height: 3px;
+  cursor: row-resize;
 }
 
 .chat-sidebar-resize-handle:hover,
@@ -178,6 +234,13 @@ onUnmounted(() => {
   position: relative;
   overflow: hidden;
   flex-shrink: 0;
+}
+
+.chat-sidebar-shell.layout-bottom .chat-sidebar-panel {
+  width: 100%;
+  min-width: 0;
+  height: 260px;
+  min-height: 180px;
 }
 
 .chat-sidebar-section {

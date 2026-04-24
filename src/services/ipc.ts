@@ -1,7 +1,7 @@
-import { invoke } from "@tauri-apps/api/core";
 import type { NotificationLevel } from "../types";
 import { normalizeAppError } from "./errors";
 import { useNotificationStore } from "../stores/notification";
+import { getLocusRuntime } from "./locusRuntime";
 
 interface IpcOptions {
   operation?: string;
@@ -16,7 +16,7 @@ export async function ipcInvoke<T>(
   options?: IpcOptions,
 ): Promise<T> {
   try {
-    return await invoke<T>(cmd, args);
+    return await getLocusRuntime().invoke<T>(cmd, args);
   } catch (e) {
     const normalized = normalizeAppError(e);
     if (options?.operation) normalized.operation = options.operation;

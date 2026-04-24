@@ -2,12 +2,10 @@
 <script setup lang="ts">
 import { computed, defineAsyncComponent, ref, shallowRef, onMounted, onUnmounted, watch } from "vue";
 import type { Component, ShallowRef } from "vue";
-import { open, save } from "@tauri-apps/plugin-dialog";
+import { open } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { t } from "./i18n";
 import { normalizeAppError } from "./services/errors";
-import { saveRawContext as saveCtx } from "./services/session";
-import type { EffortLevel, SaveRawContextRequest } from "./types";
 import { useUiStore } from "./stores/ui";
 import { useAuthStore } from "./stores/auth";
 import { useAgentStore } from "./stores/agent";
@@ -15,7 +13,6 @@ import { useModelStore } from "./stores/model";
 import { useProjectStore } from "./stores/project";
 import { useChatStore } from "./stores/chat";
 import { useNotificationStore } from "./stores/notification";
-import { useChatChangesStore } from "./stores/chatChanges";
 import { useAppUpdateStore } from "./stores/appUpdate";
 import { useAppBootstrap } from "./composables/useAppBootstrap";
 
@@ -31,14 +28,20 @@ import { isKnowledgeLexicalProgressWindowLocation } from "./services/knowledgeLe
 import { isFeishuReferenceImportWindowLocation } from "./services/feishuReferenceImportWindow";
 import { isUnityReferenceImportWindowLocation } from "./services/unityReferenceImportWindow";
 import { isReferenceExternalImportWindowLocation } from "./services/referenceExternalImportWindow";
+import { isUnityHostLocation } from "./services/locusRuntime";
 const isCanvasWindow = window.location.pathname === '/canvas'
                     || window.location.search.includes('specId=');
+const isUnityEmbedTestWindow = window.location.pathname === "/unity-embed-test";
+const isUnityEmbedWindow = !isUnityEmbedTestWindow
+  && (window.location.pathname === "/unity-embed" || isUnityHostLocation());
 const isKnowledgeDownloadWindow = isKnowledgeDownloadWindowLocation();
 const isKnowledgeLexicalProgressWindow = isKnowledgeLexicalProgressWindowLocation();
 const isFeishuReferenceImportWindow = isFeishuReferenceImportWindowLocation();
 const isUnityReferenceImportWindow = isUnityReferenceImportWindowLocation();
 const isReferenceExternalImportWindow = isReferenceExternalImportWindowLocation();
 const isStandaloneWindow = isCanvasWindow
+  || isUnityEmbedWindow
+  || isUnityEmbedTestWindow
   || isKnowledgeDownloadWindow
   || isKnowledgeLexicalProgressWindow
   || isFeishuReferenceImportWindow
@@ -51,9 +54,9 @@ const KnowledgeLexicalProgressWindow = defineAsyncComponent(() => import("./comp
 const FeishuReferenceImportProgressWindow = defineAsyncComponent(() => import("./components/FeishuReferenceImportProgressWindow.vue"));
 const UnityReferenceImportProgressWindow = defineAsyncComponent(() => import("./components/UnityReferenceImportProgressWindow.vue"));
 const ReferenceExternalImportWindow = defineAsyncComponent(() => import("./components/ReferenceExternalImportWindow.vue"));
+const UnityEmbeddedSessionView = defineAsyncComponent(() => import("./components/UnityEmbeddedSessionView.vue"));
+const UnityEmbedTestView = defineAsyncComponent(() => import("./components/UnityEmbedTestView.vue"));
 const OnboardingView = defineAsyncComponent(() => import("./components/OnboardingView.vue"));
-const ThinkingPanel = defineAsyncComponent(() => import("./components/ThinkingPanel.vue"));
-const ChatSidebarPanel = defineAsyncComponent(() => import("./components/ChatSidebarPanel.vue"));
 const FileDiffOverlay = defineAsyncComponent(() => import("./components/diff/FileDiffOverlay.vue"));
 
 // Initialize theme & fonts for main window only; Canvas keeps its own styles.
@@ -70,12 +73,13 @@ const modelStore = useModelStore();
 const projectStore = useProjectStore();
 const chatStore = useChatStore();
 const notificationStore = useNotificationStore();
-const chatChangesStore = useChatChangesStore();
 const appUpdateStore = useAppUpdateStore();
+const unityEmbedBootstrapped = ref(false);
+const unityEmbedBootstrapError = ref<string | null>(null);
 
 // -- Diff overlay provider (must be called in App setup so all children can inject) --
 const diffOverlay = provideDiffOverlay();
-const { skillItems, bootstrapCritical, bootstrapDeferred, preloadTabsInBackground, registerListeners, cleanup, applyWorkingDir, closeSettings, onOnboardingCompleted } = useAppBootstrap();
+const { bootstrapCritical, bootstrapDeferred, preloadTabsInBackground, registerListeners, cleanup, applyWorkingDir, closeSettings, onOnboardingCompleted } = useAppBootstrap();
 
 function createLazyViewState(
   loader: () => Promise<{ default: Component }>,
@@ -126,8 +130,8 @@ function createLazyViewState(
 }
 
 const chatView = createLazyViewState(
-  () => import("./components/ChatView.vue"),
-  "loadChatView",
+  () => import("./components/ChatWorkspaceView.vue"),
+  "loadChatWorkspaceView",
 );
 const collabView = createLazyViewState(
   () => import("./components/CollabView.vue"),
@@ -327,34 +331,6 @@ function handleDirClickOutside(e: MouseEvent) {
   }
 }
 
-async function saveRawContext(request?: string | SaveRawContextRequest) {
-  const sid = typeof request === "string"
-    ? request
-    : request?.sessionId || chatStore.activeSessionId;
-  const includeSystemPrompt = typeof request === "string"
-    ? true
-    : request?.includeSystemPrompt ?? true;
-  if (!sid) return;
-  try {
-    const filePath = await save({
-      defaultPath: includeSystemPrompt
-        ? `context_${sid.slice(0, 8)}_with_system_prompt.md`
-        : `context_${sid.slice(0, 8)}_without_system_prompt.md`,
-      filters: [{ name: "Markdown", extensions: ["md"] }],
-    });
-    if (!filePath) return;
-    await saveCtx(sid, filePath, includeSystemPrompt);
-  } catch (e) {
-    const err = normalizeAppError(e);
-    console.error("save_raw_context failed:", e);
-    notificationStore.addNotice("error", t("app.saveFailed", err.message), {
-      code: err.code,
-      operation: "saveRawContext",
-      skipConsoleLog: true,
-    });
-  }
-}
-
 function onResetOnboarding() {
   showDirDropdown.value = false;
   projectStore.resetWorkspaceState();
@@ -391,6 +367,22 @@ async function openAppUpdateChangelog() {
 
 // -- Lifecycle --
 onMounted(async () => {
+  if (isUnityEmbedWindow) {
+    try {
+      await bootstrapCritical();
+      await registerListeners();
+    } catch (error) {
+      const err = normalizeAppError(error);
+      unityEmbedBootstrapError.value = err.message;
+      notificationStore.addNotice("error", err.message, {
+        code: err.code,
+        operation: "unityEmbedBootstrap",
+      });
+    } finally {
+      unityEmbedBootstrapped.value = true;
+    }
+    return;
+  }
   if (isStandaloneWindow) return;
   document.addEventListener("click", handleDirClickOutside, true);
   await bootstrapCritical();
@@ -402,6 +394,10 @@ onMounted(async () => {
 });
 
 onUnmounted(() => {
+  if (isUnityEmbedWindow) {
+    cleanup();
+    return;
+  }
   if (isStandaloneWindow) return;
   document.removeEventListener("click", handleDirClickOutside, true);
   cleanup();
@@ -410,6 +406,12 @@ onUnmounted(() => {
 
 <template>
   <CanvasView v-if="isCanvasWindow" />
+  <UnityEmbeddedSessionView
+    v-else-if="isUnityEmbedWindow"
+    :bootstrapped="unityEmbedBootstrapped"
+    :bootstrap-error="unityEmbedBootstrapError"
+  />
+  <UnityEmbedTestView v-else-if="isUnityEmbedTestWindow" />
   <KnowledgeDownloadProgressWindow v-else-if="isKnowledgeDownloadWindow" />
   <KnowledgeLexicalProgressWindow v-else-if="isKnowledgeLexicalProgressWindow" />
   <FeishuReferenceImportProgressWindow v-else-if="isFeishuReferenceImportWindow" />
@@ -543,51 +545,8 @@ onUnmounted(() => {
           :is="chatViewComponent"
           v-if="chatViewComponent"
           v-show="uiStore.activeTab === 'chat'"
-          :messages="chatStore.messages"
-          :streaming-text="chatStore.streamingText"
-          :is-streaming="chatStore.isStreaming"
-          :is-thinking="chatStore.isThinking"
-          :has-thinking="chatStore.streamingThinking.length > 0"
-          :thinking-text="chatStore.streamingThinking"
-          :thinking-duration="chatStore.thinkingDuration"
-          :active-tool-calls="chatStore.activeToolCalls"
-          :agents="agentStore.agents"
-          :selected-agent-id="agentStore.selectedAgentId"
-          :agent-locked="chatStore.sessionAgentLocked"
-          :models="modelStore.availableModels"
-          :selected-model-id="modelStore.selectedModelId"
-          :codex-transport="modelStore.codexTransport"
-          :effort="modelStore.effort"
-          :effort-supported="modelStore.effortSupported"
-          :effort-levels="modelStore.availableEfforts"
-          :token-usage="chatStore.tokenUsage"
-          :pending-question="chatStore.pendingQuestion"
-          :pending-tool-confirms="chatStore.pendingToolConfirms"
-          :sessions="chatStore.sessions"
-          :active-session-id="chatStore.activeSessionId"
-          :unity-connected="projectStore.unityConnected"
-          :scan-phase="projectStore.scanPhase"
-          :last-scan-stats="projectStore.lastScanStats"
-          :is-unity-project="projectStore.isUnityProject"
-          :skills="skillItems"
-          :streaming-session-ids="chatStore.streamingSessionIds"
-          :undoable-message-ids="chatStore.undoableMessageIds"
-          @send="chatStore.sendMessage"
-          @cancel="chatStore.cancelChat"
-          @select-agent="(id: string) => agentStore.selectAgent(id)"
-          @select-model="(id: string) => modelStore.selectModel(id)"
-          @select-effort="(level: EffortLevel) => modelStore.effort = level"
-          @save-raw-context="saveRawContext"
-          @answer-question="chatStore.answerQuestion"
-          @answer-tool-confirm="chatStore.answerToolConfirm"
-          @answer-all-tool-confirms="chatStore.answerAllToolConfirms"
-          @open-thinking="chatStore.openThinkingPanel"
-          @select-session="chatStore.selectSession"
-          @new-chat="chatStore.newChat"
-          @rename-session="chatStore.renameSession"
-          @archive-session="chatStore.archiveSession"
-          @delete-session="chatStore.deleteSession"
-          @start-scan="projectStore.startScan"
+          :active="uiStore.activeTab === 'chat'"
+          layout-mode="auto"
         />
         <div
           v-else-if="uiStore.activeTab === 'chat'"
@@ -596,20 +555,6 @@ onUnmounted(() => {
         >
           {{ chatViewError || t("common.loading") }}
         </div>
-        <ThinkingPanel
-          v-if="uiStore.activeTab === 'chat' && chatStore.showThinkingPanel"
-          :thinking="chatStore.thinkingPanelContent || chatStore.streamingThinking"
-          :is-thinking="chatStore.isThinking && !chatStore.thinkingPanelContent"
-          @close="chatStore.showThinkingPanel = false"
-        />
-        <ChatSidebarPanel
-          v-if="uiStore.activeTab === 'chat' && (chatStore.showTodoPanel || chatChangesStore.currentPanelVisible)"
-          :todos="chatStore.visibleTodos"
-          :is-streaming="chatStore.isStreaming"
-          :todo-write-version="chatStore.todoCelebrationVersion"
-          :celebration-enabled="chatStore.todoCelebrationEnabled"
-        />
-
         <component
           :is="collabViewComponent"
           v-if="uiStore.collabMounted && collabViewComponent"
@@ -1407,7 +1352,7 @@ body.is-dragging-select-lock * {
   overflow: hidden;
 }
 
-.tab-content > :is(.chat-view-layout, .collab-view, .knowledge-view, .asset-view, .agent-view, .settings-panel) {
+.tab-content > :is(.chat-workspace-view, .chat-view-layout, .collab-view, .knowledge-view, .asset-view, .agent-view, .settings-panel) {
   min-width: 0;
   min-height: 0;
   contain: layout paint;

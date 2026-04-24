@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import type { SessionSummary, AssetDbScanEvent, ScanStats, SaveRawContextRequest } from "../../types";
+import type { SessionSummary, SaveRawContextRequest } from "../../types";
 import type { SessionTreeNode, SessionTreeSessionNode } from "./sessionTree";
 import { computed, ref, nextTick } from "vue";
 import { t } from "../../i18n";
@@ -19,10 +19,6 @@ const STORAGE_KEY_EXPANDED = "locus:sessionPanelExpanded";
 const props = defineProps<{
   sessions: SessionSummary[];
   activeSessionId: string | null;
-  unityConnected?: boolean;
-  isUnityProject?: boolean;
-  scanPhase?: AssetDbScanEvent | null;
-  lastScanStats?: ScanStats | null;
   streamingSessionIds?: Set<string>;
   sessionPanelWidth: number;
 }>();
@@ -33,7 +29,6 @@ const emit = defineEmits<{
   archiveSession: [id: string];
   deleteSession: [id: string];
   renameSession: [id: string, title: string];
-  startScan: [];
   saveRawContext: [request: SaveRawContextRequest];
 }>();
 
@@ -57,35 +52,6 @@ function persistExpandedState() {
     // ignore persistence failures
   }
 }
-
-const isScanning = computed(() => {
-  const p = props.scanPhase;
-  return p != null && p.phase !== "done" && p.phase !== "error";
-});
-
-const scanLabel = computed(() => {
-  const p = props.scanPhase;
-  if (!p) return "";
-  switch (p.phase) {
-    case "dirScan": return t("chat.assetDb.scanning.dirScan");
-    case "metaParse": return t("chat.assetDb.scanning.metaParse", p.completed, p.total);
-    case "yamlParse": return t("chat.assetDb.scanning.yamlParse", p.completed, p.total);
-    case "dbWrite": return t("chat.assetDb.scanning.dbWrite");
-    case "done": return "";
-    case "error": return t("chat.assetDb.scanning.error", p.error.message);
-  }
-});
-
-const scanError = computed(() => {
-  const p = props.scanPhase;
-  return p != null && p.phase === "error" ? p.error.message : null;
-});
-
-const scanSummary = computed(() => {
-  const s = props.lastScanStats;
-  if (!s) return "";
-  return t("chat.assetDb.summary", s.nodesAdded, s.edgesAdded);
-});
 
 const { state: shortcutState } = useKeyboardShortcuts();
 const newChatTitle = computed(() =>
@@ -400,29 +366,6 @@ function ctxArchive() {
 
 <template>
   <div class="session-panel" :style="{ width: sessionPanelWidth + 'px', minWidth: sessionPanelWidth + 'px' }">
-    <div class="sp-unity-status" :class="{ connected: props.unityConnected }">
-      <span class="sp-unity-dot"></span>
-      <span class="sp-unity-label">{{ props.unityConnected ? t('chat.unity.connected') : t('chat.unity.disconnected') }}</span>
-    </div>
-
-    <div v-if="props.isUnityProject" class="sp-scan-status">
-      <div class="sp-scan-row">
-        <span class="sp-scan-dot" :class="{ scanning: isScanning, error: !!scanError, done: !isScanning && !scanError && !!scanSummary }"></span>
-        <span v-if="isScanning" class="sp-scan-label">{{ scanLabel }}</span>
-        <span v-else-if="scanError" class="sp-scan-label sp-scan-error" :title="scanError">{{ scanError }}</span>
-        <span v-else-if="scanSummary" class="sp-scan-label sp-scan-done">{{ scanSummary }}</span>
-        <span v-else class="sp-scan-label sp-scan-idle">{{ t('chat.assetDb.notBuilt') }}</span>
-        <button
-          v-if="!isScanning"
-          class="sp-scan-btn"
-          @click="emit('startScan')"
-          :title="scanSummary ? t('chat.assetDb.reScanTitle') : t('chat.assetDb.buildTitle')"
-        >
-          {{ scanError ? t('chat.assetDb.retry') : (scanSummary ? t('chat.assetDb.rescan') : t('chat.assetDb.scan')) }}
-        </button>
-      </div>
-    </div>
-
     <div class="sp-header">
       <span class="sp-title">{{ t('chat.session.title') }}</span>
       <button class="sp-new-btn" @click="emit('newChat')" :title="newChatTitle">+</button>

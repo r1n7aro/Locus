@@ -10,13 +10,14 @@ function read(relPath: string) {
 
 describe("chat sidebar layout", () => {
   it("uses a single right sidebar that stacks todos above file changes", () => {
-    const app = read("src/App.vue");
+    const workspace = read("src/components/ChatWorkspaceView.vue");
     const sidebar = read("src/components/ChatSidebarPanel.vue");
     const todoPanel = read("src/components/TodoPanel.vue");
     const changesPanel = read("src/components/ChatChangesPanel.vue");
     const settingsState = read("src/composables/useSettingsState.ts");
 
-    expect(app).toContain("<ChatSidebarPanel");
+    expect(workspace).toContain("<ChatSidebarPanel");
+    expect(workspace).toContain(":layout=\"isVerticalLayout ? 'bottom' : 'side'\"");
     expect(sidebar).toContain("<TodoPanel");
     expect(sidebar).toContain("<ChatChangesPanel");
     expect(sidebar).toContain("class=\"chat-sidebar-panel\"");
@@ -27,15 +28,19 @@ describe("chat sidebar layout", () => {
     expect(sidebar).toContain("chat-sidebar-close");
     expect(sidebar).toContain("has-both-sections");
     expect(sidebar).toContain("STORAGE_KEY_SIDEBAR_WIDTH = \"locus:chatSidebarWidth\"");
+    expect(sidebar).toContain("STORAGE_KEY_SIDEBAR_HEIGHT = \"locus:chatSidebarHeight\"");
     expect(sidebar).toContain(":show-close=\"false\"");
     expect(sidebar).toContain("onSidebarResizeMouseDown");
     expect(sidebar).toContain("localStorage.setItem(STORAGE_KEY_SIDEBAR_WIDTH");
+    expect(sidebar).toContain("localStorage.setItem(STORAGE_KEY_SIDEBAR_HEIGHT");
+    expect(sidebar).toContain("layout-bottom");
     expect(sidebar).toContain(".todo-panel.embedded.chat-sidebar-section-todo.closing");
     expect(todoPanel).toContain("embedded?: boolean;");
     expect(todoPanel).toContain("props.embedded ? \"max-height\" : \"width\"");
     expect(changesPanel).toContain("embedded?: boolean;");
     expect(changesPanel).toContain(":class=\"{ embedded: props.embedded }\"");
     expect(settingsState).toContain("localStorage.removeItem(\"locus:chatSidebarWidth\")");
+    expect(settingsState).toContain("localStorage.removeItem(\"locus:chatSidebarHeight\")");
   });
 
   it("keeps non-user chat surfaces on the assistant background", () => {

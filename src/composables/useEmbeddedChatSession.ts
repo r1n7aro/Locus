@@ -1,5 +1,3 @@
-import { listen } from "@tauri-apps/api/event";
-import type { UnlistenFn } from "@tauri-apps/api/event";
 import {
   computed,
   onMounted,
@@ -12,6 +10,7 @@ import {
 } from "vue";
 import { t } from "../i18n";
 import { normalizeAppError } from "../services/errors";
+import { getLocusRuntime, type RuntimeUnsubscribe } from "../services/locusRuntime";
 import * as sessionService from "../services/session";
 import {
   buildToolResultMessages,
@@ -474,12 +473,12 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     syncActiveState(key);
   }, { immediate: true });
 
-  let unlisten: UnlistenFn | null = null;
+  let unlisten: RuntimeUnsubscribe | null = null;
   let destroyed = false;
 
   onMounted(async () => {
-    const release = await listen<StreamEvent>("stream-event", (event) => {
-      handleStreamEvent(event.payload);
+    const release = await getLocusRuntime().subscribe<StreamEvent>("stream-event", (payload) => {
+      handleStreamEvent(payload);
     });
     if (destroyed) {
       release();

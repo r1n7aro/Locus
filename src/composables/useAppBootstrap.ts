@@ -1,8 +1,6 @@
 import { watch } from "vue";
-import { listen } from "@tauri-apps/api/event";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { canvasSetSpec } from "../services/canvas";
-import type { UnlistenFn } from "@tauri-apps/api/event";
 import { useUiStore } from "../stores/ui";
 import { useAuthStore } from "../stores/auth";
 import { useAgentStore } from "../stores/agent";
@@ -16,7 +14,7 @@ import {
   maybeNotifyStreamEvent,
   resetSystemNotificationState,
 } from "../services/systemNotifications";
-import { hasTauriWindowRuntime } from "../services/tauriRuntime";
+import { getLocusRuntime, type RuntimeUnsubscribe } from "../services/locusRuntime";
 import { setScope, setWarmup, clearWarmup } from "./warmupCache";
 import {
   getProviders,
@@ -63,11 +61,11 @@ export function useAppBootstrap() {
 
   const notificationStore = useNotificationStore();
 
-  let unlisten: UnlistenFn | null = null;
-  let unlistenUnity: UnlistenFn | null = null;
-  let unlistenScan: UnlistenFn | null = null;
-  let unlistenPlugin: UnlistenFn | null = null;
-  let unlistenAppError: UnlistenFn | null = null;
+  let unlisten: RuntimeUnsubscribe | null = null;
+  let unlistenUnity: RuntimeUnsubscribe | null = null;
+  let unlistenScan: RuntimeUnsubscribe | null = null;
+  let unlistenPlugin: RuntimeUnsubscribe | null = null;
+  let unlistenAppError: RuntimeUnsubscribe | null = null;
   let lexicalProgressPollTimer: ReturnType<typeof setTimeout> | null = null;
   let lexicalProgressPollInFlight = false;
   let lastAutoOpenedLexicalProgressRun = "";
@@ -381,31 +379,32 @@ export function useAppBootstrap() {
 
   // -- Event listener registration --
   async function registerListeners() {
-    if (!hasTauriWindowRuntime()) return;
-    unlisten = await listen<StreamEvent>("stream-event", (e) => {
-      const handled = chatStore.handleStreamEvent(e.payload);
+    const runtime = getLocusRuntime();
+    if ((runtime.kind === "browser" || runtime.kind === "unity") && !runtime.unityBridgeUrl) return;
+    unlisten = await runtime.subscribe<StreamEvent>("stream-event", (payload) => {
+      const handled = chatStore.handleStreamEvent(payload);
       if (!handled) return;
 
       const sessionTitle =
-        chatStore.sessions.find((session) => session.id === e.payload.sessionId)?.title ?? null;
-      void maybeNotifyStreamEvent(e.payload, { sessionTitle });
+        chatStore.sessions.find((session) => session.id === payload.sessionId)?.title ?? null;
+      void maybeNotifyStreamEvent(payload, { sessionTitle });
     });
-    unlistenUnity = await listen<boolean>("unity-connection-status", (e) => {
-      projectStore.unityConnected = e.payload;
-      if (e.payload) {
+    unlistenUnity = await runtime.subscribe<boolean>("unity-connection-status", (payload) => {
+      projectStore.unityConnected = payload;
+      if (payload) {
         console.log("[Locus] Unity Editor connected!");
       } else {
         console.log("[Locus] Unity Editor disconnected.");
       }
     });
-    unlistenScan = await listen<AssetDbScanEvent>("ref-graph-scan", (e) => {
-      projectStore.handleScanEvent(e.payload);
+    unlistenScan = await runtime.subscribe<AssetDbScanEvent>("ref-graph-scan", (payload) => {
+      projectStore.handleScanEvent(payload);
     });
-    unlistenPlugin = await listen<PluginStatus>("unity-plugin-status", (e) => {
-      projectStore.handlePluginStatus(e.payload);
+    unlistenPlugin = await runtime.subscribe<PluginStatus>("unity-plugin-status", (payload) => {
+      projectStore.handlePluginStatus(payload);
     });
-    unlistenAppError = await listen<AppErrorPayload>("app-error", (e) => {
-      const payload = normalizeAppError(e.payload);
+    unlistenAppError = await runtime.subscribe<AppErrorPayload>("app-error", (eventPayload) => {
+      const payload = normalizeAppError(eventPayload);
       notificationStore.addNotice(payload.severity, payload.message, {
         code: payload.code,
         operation: payload.operation,

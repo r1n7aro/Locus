@@ -9,7 +9,9 @@ import type { ToolCallDisplay } from "../types";
 import ModelSelector from "./ModelSelector.vue";
 import ThinkingSelector from "./ThinkingSelector.vue";
 import SessionPanel from "./chat/SessionPanel.vue";
+import SessionCompactPicker from "./chat/SessionCompactPicker.vue";
 import ChatTranscript from "./chat/ChatTranscript.vue";
+import ChatStatusIndicators from "./chat/ChatStatusIndicators.vue";
 import RichChatInput from "./chat/RichChatInput.vue";
 import TokenUsageBar from "./chat/TokenUsageBar.vue";
 import AskUserCard from "./chat/AskUserCard.vue";
@@ -49,6 +51,9 @@ import {
   useChatInputSettings,
 } from "../composables/useChatInputSettings";
 import { logToolCollapseTrace, previewTraceText } from "../services/toolCollapseTrace";
+
+type ChatLayoutMode = "auto" | "horizontal" | "vertical";
+type ResolvedChatLayoutMode = "horizontal" | "vertical";
 
 const chatChangesStore = useChatChangesStore();
 const chatStore = useChatStore();
@@ -135,6 +140,7 @@ const props = defineProps<{
   skills?: SkillManifest[];
   streamingSessionIds?: Set<string>;
   undoableMessageIds?: Set<string>;
+  layoutMode?: ChatLayoutMode;
 }>();
 
 
@@ -155,6 +161,7 @@ const emit = defineEmits<{
   archiveSession: [id: string];
   deleteSession: [id: string];
   startScan: [];
+  layoutModeChange: [mode: ResolvedChatLayoutMode];
 }>();
 
 
@@ -924,13 +931,50 @@ function handleComposerSend(payload: ChatComposerSendPayload) {
 }
 
 const STORAGE_KEY_SESSION_WIDTH = "locus:sessionPanelWidth";
+const AUTO_VERTICAL_MIN_CHAT_WIDTH = 560;
 const sessionPanelWidth = ref(220); // px
 const isDraggingSession = ref(false);
 const layoutRef = ref<HTMLElement | null>(null);
+const layoutWidth = ref(0);
 let releaseSessionSelectionLock: (() => void) | null = null;
+let layoutResizeObserver: ResizeObserver | null = null;
+
+const resolvedLayoutMode = computed<ResolvedChatLayoutMode>(() => {
+  if (props.layoutMode === "vertical") return "vertical";
+  if (props.layoutMode === "horizontal") return "horizontal";
+  if (layoutWidth.value > 0 && layoutWidth.value < sessionPanelWidth.value + AUTO_VERTICAL_MIN_CHAT_WIDTH) {
+    return "vertical";
+  }
+  return "horizontal";
+});
+const isVerticalLayout = computed(() => resolvedLayoutMode.value === "vertical");
+
+watch(
+  resolvedLayoutMode,
+  (mode) => emit("layoutModeChange", mode),
+  { immediate: true },
+);
+
+function updateLayoutWidth() {
+  layoutWidth.value = layoutRef.value?.clientWidth ?? 0;
+}
+
+function disconnectLayoutResizeObserver() {
+  layoutResizeObserver?.disconnect();
+  layoutResizeObserver = null;
+}
+
+function connectLayoutResizeObserver() {
+  disconnectLayoutResizeObserver();
+  updateLayoutWidth();
+  if (typeof ResizeObserver === "undefined" || !layoutRef.value) return;
+  layoutResizeObserver = new ResizeObserver(() => updateLayoutWidth());
+  layoutResizeObserver.observe(layoutRef.value);
+}
 
 function onSessionSplitterMouseDown(e: MouseEvent) {
   e.preventDefault();
+  if (isVerticalLayout.value) return;
   isDraggingSession.value = true;
   releaseSessionSelectionLock?.();
   releaseSessionSelectionLock = acquireSelectionLock();
@@ -980,6 +1024,7 @@ onMounted(() => {
     if (saved) sessionPanelWidth.value = Math.max(140, Math.min(480, Number(saved)));
   } catch {}
   nextTick(() => {
+    connectLayoutResizeObserver();
     connectTranscriptResizeObserver();
   });
 });
@@ -992,6 +1037,7 @@ onUnmounted(() => {
   streamEndScrollScheduler.cancel();
   clearToolViewportAnchor();
   clearStreamingTextFlushTimer();
+  disconnectLayoutResizeObserver();
   disconnectTranscriptResizeObserver();
   document.removeEventListener("mousemove", onSessionSplitterMouseMove);
   document.removeEventListener("mouseup", onSessionSplitterMouseUp);
@@ -1001,7 +1047,15 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div class="chat-view-layout" ref="layoutRef" :class="{ 'dragging-session': isDraggingSession }">
+  <div
+    class="chat-view-layout"
+    ref="layoutRef"
+    :class="{
+      'dragging-session': isDraggingSession,
+      'is-vertical-layout': isVerticalLayout,
+      'is-horizontal-layout': !isVerticalLayout,
+    }"
+  >
 
     <!-- Inline diff panel — covers entire chat layout (session panel + chat area) -->
     <div v-if="showInlineDiff" class="diff-inline-panel">
@@ -1078,13 +1132,9 @@ onUnmounted(() => {
     </div>
 
     <SessionPanel
-      v-show="!showInlineDiff"
+      v-show="!showInlineDiff && !isVerticalLayout"
       :sessions="sessions"
       :active-session-id="activeSessionId"
-      :unity-connected="unityConnected"
-      :is-unity-project="isUnityProject"
-      :scan-phase="scanPhase"
-      :last-scan-stats="lastScanStats"
       :streaming-session-ids="streamingSessionIds"
       :session-panel-width="sessionPanelWidth"
       @select-session="emit('selectSession', $event)"
@@ -1092,13 +1142,24 @@ onUnmounted(() => {
       @rename-session="(id: string, title: string) => emit('renameSession', id, title)"
       @archive-session="emit('archiveSession', $event)"
       @delete-session="emit('deleteSession', $event)"
-      @start-scan="emit('startScan')"
       @save-raw-context="emit('saveRawContext', $event)"
     />
 
-    <div v-show="!showInlineDiff" class="session-divider" @mousedown="onSessionSplitterMouseDown"></div>
+    <div v-show="!showInlineDiff && !isVerticalLayout" class="session-divider" @mousedown="onSessionSplitterMouseDown"></div>
 
-    <div v-show="!showInlineDiff" class="chat-view">
+    <div
+      v-show="!showInlineDiff"
+      class="chat-view"
+      :class="{ 'is-vertical-layout': isVerticalLayout }"
+    >
+      <SessionCompactPicker
+        v-if="isVerticalLayout"
+        :sessions="sessions"
+        :active-session-id="activeSessionId"
+        :streaming-session-ids="streamingSessionIds"
+        @select-session="emit('selectSession', $event)"
+        @new-chat="handleNewChatRequest"
+      />
       <div class="chat-main">
         <ChatTranscript
           ref="transcriptRef"
@@ -1246,6 +1307,13 @@ onUnmounted(() => {
           </BaseButton>
         </template>
         <template #footer>
+          <ChatStatusIndicators
+            :unity-connected="unityConnected"
+            :is-unity-project="isUnityProject"
+            :scan-phase="scanPhase"
+            :last-scan-stats="lastScanStats"
+            @start-scan="emit('startScan')"
+          />
           <div class="footer-spacer"></div>
           <TokenUsageBar
             :token-usage="tokenUsage"
@@ -1277,6 +1345,14 @@ onUnmounted(() => {
   cursor: col-resize;
 }
 
+.chat-view-layout.is-vertical-layout {
+  flex-direction: column;
+}
+
+.chat-view-layout.is-vertical-layout.dragging-session {
+  cursor: default;
+}
+
 :deep(.session-panel) {
   display: flex;
   flex-direction: column;
@@ -1299,124 +1375,6 @@ onUnmounted(() => {
 .session-divider:hover,
 .chat-view-layout.dragging-session .session-divider {
   background: var(--text-secondary);
-}
-
-:deep(.sp-unity-status) {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 8px 14px;
-  border-bottom: 1px solid var(--border-color);
-  font-size: 11px;
-  color: #ef4444;
-}
-
-:deep(.sp-unity-status.connected) {
-  color: #22c55e;
-}
-
-:deep(.sp-unity-dot) {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: #ef4444;
-  flex-shrink: 0;
-  opacity: 1;
-}
-
-:deep(.sp-unity-status.connected .sp-unity-dot) {
-  background: #22c55e;
-  opacity: 1;
-}
-
-:deep(.sp-unity-label) {
-  font-weight: 500;
-}
-
-:deep(.sp-scan-status) {
-  padding: 6px 14px;
-  border-bottom: 1px solid var(--border-color);
-  font-size: 11px;
-  color: var(--text-secondary);
-}
-
-:deep(.sp-scan-row) {
-  display: flex;
-  align-items: center;
-  gap: 5px;
-}
-
-:deep(.sp-scan-dot) {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  flex-shrink: 0;
-  background: var(--text-secondary);
-  opacity: 0.4;
-}
-
-:deep(.sp-scan-dot.scanning) {
-  background: var(--accent-color);
-  opacity: 1;
-  animation: sp-scan-pulse 1.2s ease-in-out infinite;
-}
-
-:deep(.sp-scan-dot.done) {
-  background: #22c55e;
-  opacity: 1;
-}
-
-:deep(.sp-scan-dot.error) {
-  background: #e55;
-  opacity: 1;
-}
-
-@keyframes sp-scan-pulse {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.3; }
-}
-
-:deep(.sp-scan-label) {
-  flex: 1;
-  font-weight: 500;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-:deep(.sp-scan-label.sp-scan-done) {
-  color: #22c55e;
-}
-
-:deep(.sp-scan-label.sp-scan-idle) {
-  opacity: 0.6;
-}
-
-:deep(.sp-scan-label.sp-scan-error) {
-  color: #e55;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-
-:deep(.sp-scan-btn) {
-  flex-shrink: 0;
-  padding: 1px 6px;
-  border: 1px solid var(--border-color);
-  border-radius: 4px;
-  background: transparent;
-  color: var(--text-secondary);
-  font-size: 10px;
-  cursor: pointer;
-  transition: all 0.15s;
-  box-shadow: none;
-}
-
-:deep(.sp-scan-btn:hover) {
-  background: var(--hover-bg);
-  color: var(--text-color);
-  border-color: var(--text-secondary);
 }
 
 :deep(.sp-header) {
@@ -1623,6 +1581,10 @@ onUnmounted(() => {
   contain: layout paint;
 }
 
+.chat-view.is-vertical-layout {
+  width: 100%;
+}
+
 .chat-main {
   position: relative;
   flex: 1;
@@ -1679,8 +1641,53 @@ onUnmounted(() => {
   background: var(--bg-color);
 }
 
+.chat-view.is-vertical-layout .input-area {
+  padding: 10px 12px 12px;
+}
+
 .chat-pending-stack {
   min-width: 0;
+}
+
+.chat-view.is-vertical-layout :deep(.chat-transcript-scroll.is-session) {
+  padding: 14px 0;
+}
+
+.chat-view.is-vertical-layout :deep(.chat-transcript-message.is-session) {
+  padding-left: 16px;
+  padding-right: 16px;
+}
+
+.chat-view.is-vertical-layout :deep(.chat-transcript-footer.is-session) {
+  padding: 8px 16px 10px;
+}
+
+.chat-view.is-vertical-layout :deep(.chat-input-shell-topbar) {
+  align-items: flex-start;
+  flex-wrap: wrap;
+}
+
+.chat-view.is-vertical-layout :deep(.chat-input-shell-topbar-start) {
+  flex: 1 1 320px;
+  flex-wrap: wrap;
+}
+
+.chat-view.is-vertical-layout :deep(.chat-input-shell-topbar-end) {
+  flex: 1 1 auto;
+  justify-content: flex-start;
+  flex-wrap: wrap;
+}
+
+.chat-view.is-vertical-layout :deep(.token-usage-group) {
+  flex-wrap: wrap;
+  justify-content: flex-start;
+}
+
+.chat-view.is-vertical-layout :deep(.ask-user-card),
+.chat-view.is-vertical-layout :deep(.knowledge-confirm-card),
+.chat-view.is-vertical-layout :deep(.tool-confirm-batch-card) {
+  margin-left: 12px;
+  margin-right: 12px;
 }
 
 /* ── Mode selector ── */
