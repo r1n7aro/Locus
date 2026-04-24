@@ -451,18 +451,21 @@ export function mergeSequentialAssistantToolCalls<T extends AssistantToolMergeCa
   items: T[],
 ): Array<AssistantToolMergeResult<T>> {
   const merged: Array<AssistantToolMergeResult<T>> = [];
-  let pendingToolOnlyItems: T[] = [];
+  let pendingToolOnlyItem: T | null = null;
   let pendingToolCalls: ToolCallInfo[] = [];
 
-  const flushPendingToolOnlyItems = () => {
-    if (pendingToolOnlyItems.length === 0) return;
-    for (const pendingItem of pendingToolOnlyItems) {
-      merged.push({
-        ...pendingItem,
-        displayToolCalls: pendingItem.toolCalls ? [...pendingItem.toolCalls] : undefined,
-      });
-    }
-    pendingToolOnlyItems = [];
+  const clearPendingToolOnlyItem = () => {
+    pendingToolOnlyItem = null;
+    pendingToolCalls = [];
+  };
+
+  const flushPendingToolOnlyItem = () => {
+    if (!pendingToolOnlyItem) return;
+    merged.push({
+      ...pendingToolOnlyItem,
+      displayToolCalls: pendingToolCalls.length > 0 ? [...pendingToolCalls] : undefined,
+    });
+    pendingToolOnlyItem = null;
     pendingToolCalls = [];
   };
 
@@ -472,11 +475,12 @@ export function mergeSequentialAssistantToolCalls<T extends AssistantToolMergeCa
     const isToolOnlyRound =
       !item.isKnowledgeProposal
       && !hasResponseText
+      && (item.attachedKnowledgeProposalCount ?? 0) === 0
       && currentToolCalls.length > 0;
     const canAbsorbPendingRounds = !item.isKnowledgeProposal && hasResponseText;
 
     if (isToolOnlyRound) {
-      pendingToolOnlyItems.push(item);
+      pendingToolOnlyItem ??= item;
       pendingToolCalls.push(...currentToolCalls);
       continue;
     }
@@ -486,12 +490,11 @@ export function mergeSequentialAssistantToolCalls<T extends AssistantToolMergeCa
         ...item,
         displayToolCalls: [...pendingToolCalls, ...currentToolCalls],
       });
-      pendingToolOnlyItems = [];
-      pendingToolCalls = [];
+      clearPendingToolOnlyItem();
       continue;
     }
 
-    flushPendingToolOnlyItems();
+    flushPendingToolOnlyItem();
 
     merged.push({
       ...item,
@@ -499,7 +502,7 @@ export function mergeSequentialAssistantToolCalls<T extends AssistantToolMergeCa
     });
   }
 
-  flushPendingToolOnlyItems();
+  flushPendingToolOnlyItem();
 
   return merged;
 }

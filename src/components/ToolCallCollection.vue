@@ -246,7 +246,7 @@ watch(
       previous: prev ?? null,
       next,
     });
-    if (!prev || next.firstId !== prev.firstId || (!prev.canCollapse && next.canCollapse)) {
+    if (!prev || next.firstId !== prev.firstId) {
       expanded.value = false;
     }
   },
@@ -321,15 +321,11 @@ watch(
 .tool-call-collection {
   display: flex;
   flex-direction: column;
-  gap: 6px;
-}
-
-.tool-call-collection.is-collapsible {
-  margin-left: -8px;
+  gap: 4px;
 }
 
 .tool-call-collection.is-expanded {
-  gap: 0;
+  gap: 4px;
 }
 
 .tool-call-collection-panel {
@@ -362,10 +358,15 @@ watch(
 }
 
 .tool-call-batch-summary.open {
-  border-color: color-mix(in srgb, var(--accent-color) 26%, var(--border-color));
-  border-bottom-color: color-mix(in srgb, var(--border-color) 76%, transparent);
-  border-radius: 8px 8px 0 0;
-  background: color-mix(in srgb, var(--msg-assistant-bg) 76%, var(--panel-bg) 24%);
+  border-color: transparent;
+  border-radius: 6px;
+  background: transparent;
+}
+
+.tool-call-batch-summary.open:hover,
+.tool-call-batch-summary.open:focus-visible {
+  border-color: color-mix(in srgb, var(--accent-color) 18%, var(--border-color));
+  background: color-mix(in srgb, var(--hover-bg) 72%, var(--msg-assistant-bg));
 }
 
 .tool-call-batch-summary:focus-visible {
@@ -419,7 +420,7 @@ watch(
 .tool-call-collection-list {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 2px;
 }
 
 .tool-call-collection-list.with-summary {
@@ -427,10 +428,9 @@ watch(
 }
 
 .tool-call-collection-list.with-summary.open {
-  padding: 8px;
-  border: 1px solid color-mix(in srgb, var(--accent-color) 22%, var(--border-color));
-  border-top: none;
-  border-radius: 0 0 8px 8px;
-  background: color-mix(in srgb, var(--panel-bg) 82%, var(--msg-assistant-bg) 18%);
+  padding: 2px 0 0 12px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
 }
 </style>

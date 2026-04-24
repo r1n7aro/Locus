@@ -488,7 +488,7 @@ describe("toolCallBatches", () => {
     expect(merged[1]?.displayToolCalls?.map((toolCall) => toolCall.id)).toEqual(["tc-list"]);
   });
 
-  it("keeps trailing tool-only assistant rounds separate before text arrives", () => {
+  it("keeps trailing tool-only assistant rounds in one append-only list before text arrives", () => {
     const merged = mergeSequentialAssistantToolCalls([
       {
         id: "m1",
@@ -507,11 +507,29 @@ describe("toolCallBatches", () => {
       },
     ]);
 
-    expect(merged).toHaveLength(3);
-    expect(merged.map((item) => item.id)).toEqual(["m1", "m2", "m3"]);
-    expect(merged[0]?.displayToolCalls?.map((toolCall) => toolCall.id)).toEqual(["tc-1"]);
-    expect(merged[1]?.displayToolCalls?.map((toolCall) => toolCall.id)).toEqual(["tc-2"]);
-    expect(merged[2]?.displayToolCalls?.map((toolCall) => toolCall.id)).toEqual(["tc-3"]);
+    expect(merged).toHaveLength(1);
+    expect(merged[0]?.id).toBe("m1");
+    expect(merged[0]?.displayToolCalls?.map((toolCall) => toolCall.id)).toEqual(["tc-1", "tc-2", "tc-3"]);
+  });
+
+  it("keeps proposal-bearing tool rounds on their own render item", () => {
+    const merged = mergeSequentialAssistantToolCalls([
+      {
+        id: "m1",
+        content: "",
+        toolCalls: [makeToolInfo("tc-proposal", "knowledge_edit")],
+        attachedKnowledgeProposalCount: 1,
+      },
+      {
+        id: "m2",
+        content: "",
+        toolCalls: [makeToolInfo("tc-read")],
+      },
+    ]);
+
+    expect(merged).toHaveLength(2);
+    expect(merged[0]?.displayToolCalls?.map((toolCall) => toolCall.id)).toEqual(["tc-proposal"]);
+    expect(merged[1]?.displayToolCalls?.map((toolCall) => toolCall.id)).toEqual(["tc-read"]);
   });
 
   it("waits for actual text instead of thinking-only state before merging", () => {

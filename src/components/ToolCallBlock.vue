@@ -137,15 +137,6 @@ const statusIcon = computed(() => {
   }
 });
 
-const statusLabel = computed(() => {
-  switch (props.toolCall.status) {
-    case "running": return t("tool.status.running");
-    case "done": return t("tool.status.done");
-    case "error": return t("tool.status.error");
-    case "interrupted": return t("tool.status.interrupted");
-  }
-});
-
 const displayName = computed(() => {
   if (props.toolCall.name === "task") {
     try {
@@ -416,20 +407,15 @@ const highlightedOutput = computed(() => {
 </script>
 
 <template>
-  <div ref="rootRef" class="tool-call-block" :class="toolCall.status">
-    <div ref="headerRef" class="tool-call-header ui-select-none" @click="toggleExpanded">
+  <div ref="rootRef" class="tool-call-block" :class="[toolCall.status, { 'is-expanded': expanded }]">
+    <button ref="headerRef" type="button" class="tool-call-header ui-select-none" @click="toggleExpanded">
       <span class="tool-call-icon" :class="statusIcon">
         <span v-if="toolCall.status === 'running'" class="spinner-anim"></span>
-        <span v-else-if="toolCall.status === 'done'">&#10003;</span>
-        <span v-else>&#10007;</span>
+        <span v-else class="tool-call-status-dot"></span>
       </span>
       <span class="tool-call-name">{{ displayName }}</span>
       <span v-if="argsSummary" class="tool-call-summary">{{ argsSummary }}</span>
-      <span class="tool-call-right">
-        <span class="tool-call-status">{{ statusLabel }}</span>
-        <span class="tool-call-chevron" :class="{ open: expanded }">&#9656;</span>
-      </span>
-    </div>
+    </button>
     <div v-if="toolCall.name === 'unity_recompile' && toolCall.status === 'running'" class="recompile-hint">
       <div class="recompile-hint-main">{{ t("tool.recompile.hint") }}</div>
       <div class="recompile-hint-sub">{{ t("tool.recompile.sub") }}</div>
@@ -530,56 +516,96 @@ const highlightedOutput = computed(() => {
 
 <style scoped>
 .tool-call-block {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  width: 100%;
+  max-width: 100%;
   margin: 0;
-  border-radius: 6px;
-  border: 1px solid var(--border-color);
-  overflow: hidden;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  overflow: visible;
   font-size: 13px;
 }
 
+.tool-call-block.is-expanded {
+  width: 100%;
+}
+
 .tool-call-header {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  width: 100%;
+  max-width: 100%;
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 4px 10px;
+  padding: 1px 4px;
+  border-radius: 4px;
   cursor: pointer;
   user-select: none;
-  transition: background 0.15s;
-  min-height: 28px;
+  min-height: 22px;
+  text-align: left;
+  transition: color 0.12s ease, background 0.12s ease;
 }
 
 .tool-call-header:hover {
-  background: var(--hover-bg);
+  background: color-mix(in srgb, var(--hover-bg) 76%, transparent);
+}
+
+.tool-call-header:focus-visible {
+  outline: 1px solid color-mix(in srgb, var(--accent-color) 36%, transparent);
+  outline-offset: 1px;
 }
 
 .tool-call-icon {
-  width: 16px;
-  height: 16px;
-  border-radius: 50%;
+  width: 14px;
+  height: 14px;
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 10px;
   flex-shrink: 0;
 }
 
 .tool-call-icon.spinner {
-  color: #4a9eff;
+  color: var(--accent-color);
 }
 
 .tool-call-icon.check {
-  color: #3fb950;
+  color: var(--text-secondary);
 }
 
 .tool-call-icon.error {
-  color: #f85149;
+  color: var(--status-danger-fg);
+}
+
+.tool-call-status-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: currentColor;
+  opacity: 0.7;
+}
+
+.tool-call-icon.check .tool-call-status-dot {
+  opacity: 0.46;
+}
+
+.tool-call-icon.error .tool-call-status-dot {
+  width: 6px;
+  height: 6px;
+  opacity: 0.78;
 }
 
 .spinner-anim {
-  width: 12px;
-  height: 12px;
-  border: 1.5px solid transparent;
-  border-top-color: #4a9eff;
+  width: 10px;
+  height: 10px;
+  border: 1.5px solid color-mix(in srgb, var(--accent-color) 18%, transparent);
+  border-top-color: var(--accent-color);
   border-radius: 50%;
   animation: tool-spin 0.8s linear infinite;
   display: inline-block;
@@ -607,33 +633,10 @@ const highlightedOutput = computed(() => {
   min-width: 0;
 }
 
-.tool-call-right {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  margin-left: auto;
-  flex-shrink: 0;
-}
-
-.tool-call-status {
-  color: var(--text-secondary);
-  font-size: 11px;
-}
-
-.tool-call-chevron {
-  font-size: 10px;
-  color: var(--text-secondary);
-  transition: transform 0.2s;
-  transform: rotate(0deg);
-}
-
-.tool-call-chevron.open {
-  transform: rotate(90deg);
-}
-
 .tool-call-detail {
-  border-top: 1px solid var(--border-color);
-  padding: 6px 10px;
+  align-self: stretch;
+  margin-top: 4px;
+  padding: 6px 0 0 26px;
 }
 
 .tool-call-section {
@@ -784,8 +787,14 @@ const highlightedOutput = computed(() => {
 }
 
 .nested-tool-calls :deep(.tool-call-batch-summary.open) {
-  border-color: rgba(128, 128, 128, 0.24);
-  border-radius: 6px 6px 0 0;
+  border-color: transparent;
+  border-radius: 6px;
+  background: transparent;
+}
+
+.nested-tool-calls :deep(.tool-call-batch-summary.open:hover),
+.nested-tool-calls :deep(.tool-call-batch-summary.open:focus-visible) {
+  border-color: rgba(128, 128, 128, 0.2);
 }
 
 .nested-tool-calls :deep(.tool-call-batch-chevron) {
@@ -808,9 +817,9 @@ const highlightedOutput = computed(() => {
 }
 
 .nested-tool-calls :deep(.tool-call-collection-list.with-summary.open) {
-  padding: 6px;
-  border-color: rgba(128, 128, 128, 0.24);
-  border-radius: 0 0 6px 6px;
+  padding: 2px 0 0 10px;
+  border: 0;
+  border-radius: 0;
 }
 
 .error-output {

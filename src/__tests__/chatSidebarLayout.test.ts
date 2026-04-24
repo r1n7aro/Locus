@@ -140,7 +140,8 @@ describe("chat sidebar layout", () => {
     const transcript = read("src/components/chat/ChatTranscript.vue");
 
     expect(transcript).toContain("const hasLiveToolCalls = computed(() => props.activeToolCalls.length > 0);");
-    expect(transcript).toContain("const hasToolCallHandoff = computed(() => transientToolCalls.value.length > 0 && !hasLiveToolCalls.value);");
+    expect(transcript).toContain("const hasTransientToolCalls = computed(() => transientToolCalls.value.length > 0);");
+    expect(transcript).toContain("const hasToolCallHandoff = computed(() => hasTransientToolCalls.value && !hasLiveToolCalls.value);");
     expect(transcript).toContain("const hasStreamingContent = computed(() => hasVisibleStreamingText.value || hasLiveToolCalls.value);");
     expect(transcript).toContain("const activeToolCallMatchState = computed<ToolCallMatchState>(() => {");
     expect(transcript).toContain("return toolCallHandoff.value?.toolCallMatchState ?? {");
@@ -162,26 +163,32 @@ describe("chat sidebar layout", () => {
     expect(chatView).toContain("if (suppressScrollCapture || toolHandoffViewportQuiet.value) return;");
   });
 
-  it("renders the waiting placeholder after the transient tool list", () => {
+  it("keeps handoff waiting inside the transient tool group", () => {
     const transcript = read("src/components/chat/ChatTranscript.vue");
-    const waitingIndex = transcript.indexOf("<div v-if=\"isWaitingForResponse\" class=\"chat-transcript-thinking-block\">");
+    const toolWaitingIndex = transcript.indexOf("<div v-if=\"isToolWaitingForResponse\" class=\"chat-transcript-tool-waiting-row\">");
+    const standaloneWaitingIndex = transcript.indexOf("<div v-if=\"isStandaloneWaitingPlaceholder\" class=\"chat-transcript-thinking-block\">");
     const toolGroupIndex = transcript.indexOf("<div v-if=\"transientToolCalls.length > 0\" class=\"chat-transcript-tool-calls-group\">");
 
     expect(toolGroupIndex).toBeGreaterThan(-1);
-    expect(waitingIndex).toBeGreaterThan(toolGroupIndex);
+    expect(toolWaitingIndex).toBeGreaterThan(toolGroupIndex);
+    expect(toolWaitingIndex).toBeLessThan(standaloneWaitingIndex);
+    expect(transcript).toContain("'waiting-placeholder': isStandaloneWaitingPlaceholder");
+    expect(transcript).toContain("const isToolWaitingForResponse = computed(() => isWaitingForResponse.value && hasTransientToolCalls.value);");
+    expect(transcript).toContain("const isStandaloneWaitingPlaceholder = computed(() => isWaitingForResponse.value && !hasTransientToolCalls.value);");
+    expect(transcript).toContain(".chat-transcript-tool-waiting-row {");
+    expect(transcript).not.toContain("'waiting-placeholder': isWaitingForResponse");
   });
 
-  it("tightens spacing between consecutive tool-only assistant rounds", () => {
+  it("coalesces consecutive tool-only assistant rounds before rendering", () => {
     const transcript = read("src/components/chat/ChatTranscript.vue");
+    const batches = read("src/composables/toolCallBatches.ts");
 
-    expect(transcript).toContain("function isToolOnlyRenderItem(item: MessageRenderItem) {");
-    expect(transcript).toContain("function shouldTightenToolOnlyGap(items: MessageRenderItem[], index: number) {");
+    expect(batches).toContain("let pendingToolOnlyItem: T | null = null;");
+    expect(batches).toContain("pendingToolOnlyItem ??= item;");
+    expect(batches).toContain("displayToolCalls: pendingToolCalls.length > 0 ? [...pendingToolCalls] : undefined");
     expect(transcript).toContain("'tool-only': isToolOnlyRenderItem(item),");
-    expect(transcript).toContain("'tool-only-followup': shouldTightenToolOnlyGap(group.items, itemIdx),");
-    expect(transcript).toContain(".chat-transcript-item-stack.is-session.tool-only-followup {");
-    expect(transcript).toContain("margin-top: -8px;");
-    expect(transcript).toContain(".chat-transcript-item-stack.is-embedded.tool-only-followup {");
-    expect(transcript).toContain("margin-top: -6px;");
+    expect(transcript).not.toContain("tool-only-followup");
+    expect(transcript).not.toContain("shouldTightenToolOnlyGap");
   });
 
   it("attaches knowledge proposals only inside their assistant message group", () => {

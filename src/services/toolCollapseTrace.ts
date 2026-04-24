@@ -3,6 +3,10 @@ const traceStartMs =
     ? performance.now()
     : Date.now();
 
+const TOOL_COLLAPSE_VERIFICATION_EVENTS = new Set([
+  "waitingLayoutStateChanged",
+]);
+
 function nowMs() {
   return typeof performance !== "undefined" && typeof performance.now === "function"
     ? performance.now()
@@ -24,6 +28,8 @@ export function logToolCollapseTrace(
   event: string,
   detail?: Record<string, unknown>,
 ) {
+  if (!TOOL_COLLAPSE_VERIFICATION_EVENTS.has(event)) return;
+
   const prefix = `[tool-collapse][+${elapsedMs()}ms][${scope}] ${event}`;
   if (!detail || Object.keys(detail).length === 0) {
     console.info(prefix);

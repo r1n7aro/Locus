@@ -837,7 +837,8 @@ function onTransientToolCallsCollapseFinished() {
 
 const hasThinkingContent = computed(() => props.hasThinking ?? !!props.thinkingText);
 const hasLiveToolCalls = computed(() => props.activeToolCalls.length > 0);
-const hasToolCallHandoff = computed(() => transientToolCalls.value.length > 0 && !hasLiveToolCalls.value);
+const hasTransientToolCalls = computed(() => transientToolCalls.value.length > 0);
+const hasToolCallHandoff = computed(() => hasTransientToolCalls.value && !hasLiveToolCalls.value);
 const hasStreamingContent = computed(() => hasVisibleStreamingText.value || hasLiveToolCalls.value);
 const isWaitingForResponse = computed(
   () => shouldShowWaitingPlaceholder({
@@ -847,6 +848,8 @@ const isWaitingForResponse = computed(
     hasThinkingContent: hasThinkingContent.value,
   }),
 );
+const isToolWaitingForResponse = computed(() => isWaitingForResponse.value && hasTransientToolCalls.value);
+const isStandaloneWaitingPlaceholder = computed(() => isWaitingForResponse.value && !hasTransientToolCalls.value);
 const hasTransientAssistantMessage = computed(
   () =>
     hasStreamingContent.value
@@ -854,6 +857,22 @@ const hasTransientAssistantMessage = computed(
     || props.isThinking
     || hasThinkingContent.value
     || isWaitingForResponse.value,
+);
+
+watch(
+  () => `${Number(isStandaloneWaitingPlaceholder.value)}:${Number(isToolWaitingForResponse.value)}:${transientToolCalls.value.length}`,
+  (next, previous) => {
+    traceToolCollapse("waitingLayoutStateChanged", {
+      previous,
+      next,
+      standaloneWaiting: isStandaloneWaitingPlaceholder.value,
+      toolWaiting: isToolWaitingForResponse.value,
+      transientToolCallCount: transientToolCalls.value.length,
+      hasHandoff: !!toolCallHandoff.value,
+      streamingTextLen: props.streamingText.length,
+      isStreaming: props.isStreaming,
+    });
+  },
 );
 
 const isStreamingContinuation = computed(() => {
@@ -925,11 +944,6 @@ const showSessionFooter = computed(
     && hasFooterSlot.value
     && (groupedMessages.value.length > 0 || hasTransientAssistantMessage.value),
 );
-
-function shouldTightenToolOnlyGap(items: MessageRenderItem[], index: number) {
-  if (index <= 0) return false;
-  return isToolOnlyRenderItem(items[index - 1]!) && isToolOnlyRenderItem(items[index]!);
-}
 
 function imageDataUrl(message: ChatMessage, index: number) {
   const image = message.images?.[index];
@@ -1010,7 +1024,7 @@ function openImage(src: string) {
 
           <div class="chat-transcript-message-content" :class="`is-${variant}`">
             <div
-              v-for="(item, itemIdx) in group.items"
+              v-for="item in group.items"
               v-show="shouldRenderItem(item)"
               :key="item.id"
               class="chat-transcript-item-stack"
@@ -1018,7 +1032,6 @@ function openImage(src: string) {
                 `is-${variant}`,
                 {
                   'tool-only': isToolOnlyRenderItem(item),
-                  'tool-only-followup': shouldTightenToolOnlyGap(group.items, itemIdx),
                 },
               ]"
               :data-scroll-anchor-id="item.id"
@@ -1140,7 +1153,7 @@ function openImage(src: string) {
             `is-${variant}`,
             {
               continuation: isStreamingContinuation,
-              'waiting-placeholder': isWaitingForResponse,
+              'waiting-placeholder': isStandaloneWaitingPlaceholder,
             },
           ]"
           data-scroll-anchor-id="__transient__"
@@ -1200,9 +1213,13 @@ function openImage(src: string) {
                   />
                 </template>
               </ToolCallCollection>
+              <div v-if="isToolWaitingForResponse" class="chat-transcript-tool-waiting-row">
+                <span class="chat-transcript-thinking-spinner compact" />
+                <span class="chat-transcript-thinking-title">{{ waitingLabel }}</span>
+              </div>
             </div>
 
-            <div v-if="isWaitingForResponse" class="chat-transcript-thinking-block">
+            <div v-if="isStandaloneWaitingPlaceholder" class="chat-transcript-thinking-block">
               <div class="chat-transcript-thinking-header active">
                 <span class="chat-transcript-thinking-spinner" />
                 <span class="chat-transcript-thinking-title">{{ waitingLabel }}</span>
@@ -1444,14 +1461,6 @@ function openImage(src: string) {
   gap: 9px;
 }
 
-.chat-transcript-item-stack.is-session.tool-only-followup {
-  margin-top: -8px;
-}
-
-.chat-transcript-item-stack.is-embedded.tool-only-followup {
-  margin-top: -6px;
-}
-
 .chat-transcript-intent-row {
   display: flex;
   flex-wrap: wrap;
@@ -1484,6 +1493,7 @@ function openImage(src: string) {
 .chat-transcript-plain-text {
   white-space: pre-wrap;
   word-break: break-word;
+  color: var(--text-color);
 }
 
 .chat-transcript-message.is-session.user .chat-transcript-plain-text {
@@ -1608,5 +1618,21 @@ function openImage(src: string) {
   display: flex;
   flex-direction: column;
   gap: 6px;
+  margin-left: -4px;
+}
+
+.chat-transcript-message-content > .chat-transcript-item-stack.tool-only:first-child {
+  margin-top: 4px;
+}
+
+.chat-transcript-tool-waiting-row {
+  display: inline-flex;
+  align-items: center;
+  align-self: flex-start;
+  gap: 6px;
+  min-height: 22px;
+  padding: 1px 4px;
+  color: var(--text-secondary);
+  font-size: 13px;
 }
 </style>
