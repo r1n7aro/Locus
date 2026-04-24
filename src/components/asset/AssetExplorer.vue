@@ -378,12 +378,12 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
 }
 
 .ax-kind-icon {
-  color: color-mix(in srgb, var(--accent-color) 38%, var(--text-secondary) 62%);
+  color: color-mix(in srgb, var(--text-secondary) 82%, var(--text-color));
   transition: color 0.15s ease;
 }
 
 .ax-kind-icon.open {
-  color: color-mix(in srgb, var(--accent-color) 54%, var(--text-secondary) 46%);
+  color: var(--text-color);
 }
 
 .ax-kind-icon-muted {

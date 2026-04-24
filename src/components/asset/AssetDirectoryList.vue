@@ -219,7 +219,7 @@ function isFolder(node: AssetExplorerNode): node is AssetFolderNode {
 }
 
 .adl-kind-icon.folder {
-  color: color-mix(in srgb, var(--accent-color) 40%, var(--text-secondary) 60%);
+  color: color-mix(in srgb, var(--text-secondary) 82%, var(--text-color));
 }
 
 .adl-kind-icon.file {
