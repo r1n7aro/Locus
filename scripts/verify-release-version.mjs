@@ -40,11 +40,12 @@ function stableStringify(value) {
 const docsDir = path.join(repoRoot, "docs");
 const parsedReleaseNotes = await parseAllReleaseNotes(docsDir);
 const generatedUpdateJson = await buildUpdateJson(docsDir);
-const existingUpdateJson = await readJson("docs/update.txt");
+const updateManifestPath = "docs/data/update.json";
+const existingUpdateJson = await readJson(updateManifestPath);
 const versions = {
   "docs/overview/latest-version.mdx": parsedReleaseNotes.zh.version,
   "docs/en/overview/latest-version.mdx": parsedReleaseNotes.en.version,
-  "docs/update.txt": existingUpdateJson.version,
+  [updateManifestPath]: existingUpdateJson.version,
   "package.json": (await readJson("package.json")).version,
   "src-tauri/tauri.conf.json": (await readJson("src-tauri/tauri.conf.json")).version,
   "src-tauri/Cargo.toml": await readCargoVersion("src-tauri/Cargo.toml"),
@@ -66,7 +67,7 @@ if (uniqueVersions.length !== 1) {
 }
 
 if (stableStringify(existingUpdateJson) !== stableStringify(generatedUpdateJson)) {
-  throw new Error("docs/update.txt 与 latest-version.mdx 生成结果不一致，请先运行 bun run release:generate");
+  throw new Error(`${updateManifestPath} 与 latest-version.mdx 生成结果不一致，请先运行 bun run release:generate`);
 }
 
 console.log(`版本校验通过：${uniqueVersions[0]}`);

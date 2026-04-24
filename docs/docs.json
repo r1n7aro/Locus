@@ -143,6 +143,10 @@
   },
   "redirects": [
     {
+      "source": "/update.txt",
+      "destination": "/data/update.json"
+    },
+    {
       "source": "/product",
       "destination": "/"
     },

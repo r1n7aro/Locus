@@ -6,7 +6,8 @@ use serde::{Deserialize, Serialize};
 use crate::error::AppError;
 
 const PUBLIC_UPDATE_BASE_URL: &str = "https://unity.farlocus.com";
-const PUBLIC_UPDATE_MANIFEST_URL: &str = "https://unity.farlocus.com/update.txt";
+const UPDATE_MANIFEST_PATH: &str = "/data/update.json";
+const PUBLIC_UPDATE_MANIFEST_URL: &str = "https://unity.farlocus.com/data/update.json";
 const LOCAL_UPDATE_PORT_RANGE: std::ops::RangeInclusive<u16> = 3000..=3005;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,7 +78,7 @@ fn build_update_sources() -> Vec<AppUpdateSource> {
             let base_url = format!("http://localhost:{}", port);
             sources.push(AppUpdateSource {
                 kind: AppUpdateSourceKind::Local,
-                manifest_url: format!("{}/update.txt", base_url),
+                manifest_url: format!("{}{}", base_url, UPDATE_MANIFEST_PATH),
                 base_url,
                 connect_timeout: Duration::from_millis(180),
                 request_timeout: Duration::from_millis(450),
