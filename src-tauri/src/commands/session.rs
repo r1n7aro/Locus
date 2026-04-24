@@ -6,10 +6,10 @@ use std::sync::Arc;
 use futures::FutureExt;
 use serde::Serialize;
 use serde_json::json;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, State};
 
 use super::auth::CodexAuthStateHandle;
-use super::{StreamEvent, StreamEventEnvelope, TokenUsage};
+use super::{StreamEvent, TokenUsage};
 use crate::agent::definition::{canonical_agent_id, is_hidden_legacy_agent_id, AgentDefRegistry};
 use crate::agent::instance::{AgentInstance, AgentSystemPromptStats, LlmBackend, RawContextStore};
 use crate::auth::AuthState;
@@ -18,8 +18,8 @@ use crate::error::AppError;
 use crate::knowledge_store::{self, KnowledgeDocument, KnowledgeInjectMode, KnowledgeType};
 use crate::session::models::{
     ChatMessage, ImageData, KnowledgeProposalItem, KnowledgeProposalItemKind,
-    KnowledgeProposalStatus, SessionDetail, SessionRuntimeStatus, SessionSummary, TodoItem,
-    TodoSnapshot, UserIntentPayload,
+    KnowledgeProposalStatus, SessionDetail, SessionEventRecord, SessionRunSummary,
+    SessionRuntimeStatus, SessionSummary, TodoItem, TodoSnapshot, UserIntentPayload,
 };
 use crate::session::store::SessionStore;
 use crate::tool::ToolRegistry;
@@ -45,9 +45,10 @@ pub struct ChatLaunch {
     pub run_id: String,
 }
 
-fn emit_session_stream(app_handle: &AppHandle, event: StreamEvent) {
+fn emit_session_stream(app_handle: &AppHandle, store: &SessionStore, event: StreamEvent) {
     emit_session_stream_with_run_id(
         app_handle,
+        store,
         format!(
             "knowledge_{}",
             std::time::SystemTime::now()
@@ -59,8 +60,13 @@ fn emit_session_stream(app_handle: &AppHandle, event: StreamEvent) {
     );
 }
 
-fn emit_session_stream_with_run_id(app_handle: &AppHandle, run_id: String, event: StreamEvent) {
-    let _ = app_handle.emit("stream-event", StreamEventEnvelope { run_id, event });
+fn emit_session_stream_with_run_id(
+    app_handle: &AppHandle,
+    store: &SessionStore,
+    run_id: String,
+    event: StreamEvent,
+) {
+    crate::session::gateway::emit_stream(app_handle, store, &run_id, event);
 }
 
 fn generate_chat_run_id(session_id: &str) -> String {
@@ -74,6 +80,27 @@ fn generate_chat_run_id(session_id: &str) -> String {
     )
 }
 
+fn session_run_locked_error(detail: impl Into<String>) -> AppError {
+    AppError::new(
+        "session.run_locked",
+        "Session already has an active run. Wait until the current run stops before sending another message.",
+    )
+    .detail(detail)
+    .operation("chat")
+    .retryable(true)
+}
+
+fn runtime_status_from_run_status(status: &str) -> SessionRuntimeStatus {
+    match status {
+        "queued" => SessionRuntimeStatus::Queued,
+        "starting" => SessionRuntimeStatus::Starting,
+        "waiting_input" => SessionRuntimeStatus::WaitingInput,
+        "cancelling" => SessionRuntimeStatus::Cancelling,
+        "error" => SessionRuntimeStatus::Error,
+        _ => SessionRuntimeStatus::Running,
+    }
+}
+
 fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
     if let Some(message) = payload.downcast_ref::<&str>() {
         (*message).to_string()
@@ -84,9 +111,15 @@ fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
     }
 }
 
-fn emit_knowledge_proposal_message(app_handle: &AppHandle, session_id: &str, message: ChatMessage) {
+fn emit_knowledge_proposal_message(
+    app_handle: &AppHandle,
+    store: &SessionStore,
+    session_id: &str,
+    message: ChatMessage,
+) {
     emit_session_stream(
         app_handle,
+        store,
         StreamEvent::KnowledgeProposal {
             session_id: session_id.to_string(),
             message,
@@ -604,7 +637,7 @@ pub async fn chat(
 
     let stale_messages = store.stale_pending_knowledge_proposals(&sid)?;
     for message in stale_messages {
-        emit_knowledge_proposal_message(&app_handle, &sid, message);
+        emit_knowledge_proposal_message(&app_handle, store.inner().as_ref(), &sid, message);
     }
 
     // Enforce session-agent binding: if session already has an agent, use it
@@ -758,19 +791,44 @@ pub async fn chat(
         .unwrap_or_else(|| "build".to_string());
 
     let handle = app_handle.clone();
-    let store = store.inner().clone();
     let run_id = generate_chat_run_id(&sid);
+    if active_tasks.lock().await.contains_key(&sid) {
+        return Err(session_run_locked_error(format!(
+            "Session {} is already present in active task registry",
+            sid
+        )));
+    }
+    store.try_start_run(&sid, &run_id).map_err(|error| {
+        if error.contains("active run") {
+            session_run_locked_error(error)
+        } else {
+            AppError::new("session.run_start_failed", "Failed to start session run.")
+                .detail(error)
+                .operation("chat")
+        }
+    })?;
+    let store = store.inner().clone();
     let sid_clone = sid.clone();
     let tasks = active_tasks.inner().clone();
     let sid_for_cleanup = sid.clone();
     let images_for_task = images.unwrap_or_default();
     let user_intent_for_task = user_intent;
     let run_id_for_task = run_id.clone();
+    let store_for_task = store.clone();
+    let (start_tx, start_rx) = tokio::sync::oneshot::channel::<()>();
 
     let join_handle = tauri::async_runtime::spawn(async move {
+        if start_rx.await.is_err() {
+            eprintln!(
+                "[Locus] session {} run {} start gate dropped before execution",
+                sid_clone, run_id_for_task
+            );
+            return;
+        }
+
         let task_result = AssertUnwindSafe(instance.run_with_run_id(
             &handle,
-            &store,
+            &store_for_task,
             &text,
             if images_for_task.is_empty() {
                 None
@@ -794,6 +852,7 @@ pub async fn chat(
                 eprintln!("[Locus] session {} panicked: {}", sid_clone, panic_message);
                 emit_session_stream_with_run_id(
                     &handle,
+                    store_for_task.as_ref(),
                     run_id_for_task.clone(),
                     StreamEvent::Error {
                         session_id: sid_clone.clone(),
@@ -805,7 +864,15 @@ pub async fn chat(
                 );
             }
         }
-        let removed = tasks.lock().await.remove(&sid_for_cleanup).is_some();
+        let removed = {
+            let mut guard = tasks.lock().await;
+            match guard.get(&sid_for_cleanup) {
+                Some(task) if task.run_id == run_id_for_task => {
+                    guard.remove(&sid_for_cleanup).is_some()
+                }
+                _ => false,
+            }
+        };
         eprintln!(
             "[Locus] active task cleared for session {} run {} removed={}",
             sid_for_cleanup, run_id_for_task, removed
@@ -813,15 +880,33 @@ pub async fn chat(
         let _ = done_tx.send(true);
     });
 
-    active_tasks.lock().await.insert(
-        sid.clone(),
-        ActiveTaskHandle {
-            run_id: run_id.clone(),
-            cancel_tx,
-            done_rx,
-            join_handle,
-        },
-    );
+    {
+        let mut task_guard = active_tasks.lock().await;
+        if task_guard.contains_key(&sid) {
+            join_handle.abort();
+            let detail = format!(
+                "Session {} became active before run {} was registered",
+                sid, run_id
+            );
+            if let Err(error) = store.update_run_status(&run_id, "error", Some(&detail)) {
+                eprintln!(
+                    "[Locus] failed to mark unregistered session {} run {} as error: {}",
+                    sid, run_id, error
+                );
+            }
+            return Err(session_run_locked_error(format!("{}", detail)));
+        }
+        task_guard.insert(
+            sid.clone(),
+            ActiveTaskHandle {
+                run_id: run_id.clone(),
+                cancel_tx,
+                done_rx,
+                join_handle,
+            },
+        );
+    }
+    let _ = start_tx.send(());
     eprintln!(
         "[Locus] active task registered for session {} run {}",
         sid, run_id
@@ -859,7 +944,12 @@ pub async fn list_sessions(
     let active_session_ids: HashSet<String> = active_tasks.lock().await.keys().cloned().collect();
     for session in &mut sessions {
         session.runtime_status = if active_session_ids.contains(&session.id) {
-            Some(SessionRuntimeStatus::Running)
+            store
+                .active_run_for_session(&session.id)
+                .ok()
+                .flatten()
+                .map(|run| runtime_status_from_run_status(&run.status))
+                .or(Some(SessionRuntimeStatus::Running))
         } else {
             None
         };
@@ -929,6 +1019,28 @@ pub async fn get_session_usage(
 }
 
 #[tauri::command]
+pub async fn get_session_active_run(
+    session_id: String,
+    store: State<'_, Arc<SessionStore>>,
+) -> Result<Option<SessionRunSummary>, AppError> {
+    store
+        .active_run_for_session(&session_id)
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn list_session_events(
+    session_id: String,
+    after_seq: Option<i64>,
+    limit: Option<u32>,
+    store: State<'_, Arc<SessionStore>>,
+) -> Result<Vec<SessionEventRecord>, AppError> {
+    store
+        .list_session_events(&session_id, after_seq, limit)
+        .map_err(Into::into)
+}
+
+#[tauri::command]
 pub async fn get_todos(
     session_id: String,
     store: State<'_, Arc<SessionStore>>,
@@ -940,6 +1052,7 @@ pub async fn get_todos(
 pub async fn cancel_chat(
     session_id: String,
     app_handle: AppHandle,
+    store: State<'_, Arc<SessionStore>>,
     active_tasks: State<'_, ActiveTasks>,
 ) -> Result<(), AppError> {
     let graceful_wait = {
@@ -956,6 +1069,17 @@ pub async fn cancel_chat(
 
     if *done_rx.borrow() {
         return Ok(());
+    }
+
+    if let Err(error) = store.update_run_status(
+        &run_id,
+        crate::session::gateway::RUN_STATUS_CANCELLING,
+        None,
+    ) {
+        eprintln!(
+            "[Locus] failed to mark session {} run {} as cancelling: {}",
+            session_id, run_id, error
+        );
     }
 
     let graceful_finished =
@@ -982,7 +1106,12 @@ pub async fn cancel_chat(
             session_id
         );
         crate::llm::codex::reset_cached_session_window(&session_id).await;
-        emit_session_stream_with_run_id(&app_handle, run_id, StreamEvent::Cancelled { session_id });
+        emit_session_stream_with_run_id(
+            &app_handle,
+            store.inner().as_ref(),
+            run_id,
+            StreamEvent::Cancelled { session_id },
+        );
     }
 
     Ok(())
@@ -996,7 +1125,7 @@ pub async fn stale_knowledge_proposals(
 ) -> Result<(), AppError> {
     let updated = store.stale_pending_knowledge_proposals(&session_id)?;
     for message in updated {
-        emit_knowledge_proposal_message(&app_handle, &session_id, message);
+        emit_knowledge_proposal_message(&app_handle, store.inner().as_ref(), &session_id, message);
     }
     Ok(())
 }
@@ -1014,7 +1143,7 @@ pub async fn ignore_knowledge_proposal(
         KnowledgeProposalStatus::Invalidated,
     )?;
     if let Some(message) = updated {
-        emit_knowledge_proposal_message(&app_handle, &session_id, message);
+        emit_knowledge_proposal_message(&app_handle, store.inner().as_ref(), &session_id, message);
     }
     Ok(())
 }
@@ -1093,7 +1222,12 @@ pub async fn apply_knowledge_proposal(
         &proposal_id,
         KnowledgeProposalStatus::Applying,
     )? {
-        emit_knowledge_proposal_message(&app_handle, &session_id, applying_message);
+        emit_knowledge_proposal_message(
+            &app_handle,
+            store.inner().as_ref(),
+            &session_id,
+            applying_message,
+        );
     }
 
     let mut apply_error: Option<String> = None;
@@ -1131,7 +1265,12 @@ pub async fn apply_knowledge_proposal(
                 &proposal_id,
                 KnowledgeProposalStatus::Applied,
             )? {
-                emit_knowledge_proposal_message(&app_handle, &session_id, message);
+                emit_knowledge_proposal_message(
+                    &app_handle,
+                    store.inner().as_ref(),
+                    &session_id,
+                    message,
+                );
             }
             Ok(())
         }
@@ -1157,7 +1296,12 @@ pub async fn apply_knowledge_proposal(
             if let Some(message) =
                 store.update_knowledge_proposal_status(&session_id, &proposal_id, next_status)?
             {
-                emit_knowledge_proposal_message(&app_handle, &session_id, message);
+                emit_knowledge_proposal_message(
+                    &app_handle,
+                    store.inner().as_ref(),
+                    &session_id,
+                    message,
+                );
             }
             if rollback_errors.is_empty() {
                 Err(error.into())

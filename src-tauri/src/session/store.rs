@@ -1,20 +1,56 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, Connection, OptionalExtension};
 use uuid::Uuid;
 
 use super::models::{
     ChatMessage, KnowledgeProposal, KnowledgeProposalStatus, MessageRole, SessionDetail,
-    SessionSummary, TodoItem, TodoSnapshot, ToolCallInfo,
+    SessionEventRecord, SessionRunSummary, SessionSummary, TodoItem, TodoSnapshot, ToolCallInfo,
 };
 use crate::commands::TokenUsage;
 
+#[derive(Clone)]
 pub struct SessionStore {
     conn: Arc<Mutex<Connection>>,
     data_dir: PathBuf,
+    event_writer: Arc<SessionEventWriter>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionEventAppend {
+    pub session_id: String,
+    pub run_id: String,
+    pub event_type: String,
+    pub payload_json: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionEventMerge {
+    pub key: String,
+    pub field: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionRunStatusUpdate {
+    pub run_id: String,
+    pub status: String,
+    pub error_message: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct QueuedSessionEvent {
+    event: SessionEventAppend,
+    merge: Option<SessionEventMerge>,
+    status_updates: Vec<SessionRunStatusUpdate>,
+}
+
+struct SessionEventWriter {
+    sender: mpsc::Sender<QueuedSessionEvent>,
 }
 
 const TOOL_RESULTS_DIR: &str = "tool-results";
@@ -22,6 +58,123 @@ const TOOL_RESULT_PREVIEW_CHARS: usize = 2_000;
 const DEFAULT_MAX_RESULT_SIZE_CHARS: usize = 50_000;
 const LARGE_RESULT_TAG_OPEN: &str = "<persisted-output>";
 const LARGE_RESULT_TAG_CLOSE: &str = "</persisted-output>";
+const RUN_STATUS_QUEUED: &str = "queued";
+const RUN_STATUS_STARTING: &str = "starting";
+const RUN_STATUS_RUNNING: &str = "running";
+const RUN_STATUS_WAITING_INPUT: &str = "waiting_input";
+const RUN_STATUS_CANCELLING: &str = "cancelling";
+const RUN_STATUS_DONE: &str = "done";
+const RUN_STATUS_CANCELLED: &str = "cancelled";
+const RUN_STATUS_ERROR: &str = "error";
+
+impl SessionEventWriter {
+    const FLUSH_INTERVAL: Duration = Duration::from_millis(25);
+    const MAX_BATCH_SIZE: usize = 128;
+
+    fn new(conn: Arc<Mutex<Connection>>) -> Self {
+        let (sender, receiver) = mpsc::channel::<QueuedSessionEvent>();
+        thread::Builder::new()
+            .name("locus-session-event-writer".to_string())
+            .spawn(move || Self::run(conn, receiver))
+            .expect("spawn session event writer");
+        Self { sender }
+    }
+
+    fn enqueue(&self, event: QueuedSessionEvent) -> Result<(), String> {
+        self.sender
+            .send(event)
+            .map_err(|e| format!("Failed to queue session event: {}", e))
+    }
+
+    fn run(conn: Arc<Mutex<Connection>>, receiver: mpsc::Receiver<QueuedSessionEvent>) {
+        let mut batch = Vec::with_capacity(Self::MAX_BATCH_SIZE);
+        while let Ok(first) = receiver.recv() {
+            batch.clear();
+            batch.push(first);
+
+            while batch.len() < Self::MAX_BATCH_SIZE {
+                match receiver.recv_timeout(Self::FLUSH_INTERVAL) {
+                    Ok(event) => batch.push(event),
+                    Err(mpsc::RecvTimeoutError::Timeout) => break,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+
+            let coalesced = Self::coalesce_batch(&batch);
+            let events = coalesced
+                .iter()
+                .map(|item| item.event.clone())
+                .collect::<Vec<_>>();
+
+            if let Err(error) = SessionStore::append_session_events_batch_on_conn(&conn, &events) {
+                eprintln!("[Locus] failed to flush session event batch: {}", error);
+            }
+
+            for status in coalesced.iter().flat_map(|item| item.status_updates.iter()) {
+                if let Err(error) = SessionStore::update_run_status_on_conn(
+                    &conn,
+                    &status.run_id,
+                    &status.status,
+                    status.error_message.as_deref(),
+                ) {
+                    eprintln!(
+                        "[Locus] failed to flush session run status {} for run {}: {}",
+                        status.status, status.run_id, error
+                    );
+                }
+            }
+        }
+    }
+
+    fn coalesce_batch(batch: &[QueuedSessionEvent]) -> Vec<QueuedSessionEvent> {
+        let mut out: Vec<QueuedSessionEvent> = Vec::with_capacity(batch.len());
+
+        for item in batch {
+            if let Some(merge) = item.merge.as_ref() {
+                if let Some(last) = out.last_mut() {
+                    let same_key = last
+                        .merge
+                        .as_ref()
+                        .map(|last_merge| last_merge.key.as_str())
+                        == Some(merge.key.as_str());
+
+                    if same_key
+                        && Self::append_payload_field(
+                            &mut last.event.payload_json,
+                            &merge.field,
+                            &merge.value,
+                        )
+                    {
+                        last.status_updates.extend(item.status_updates.clone());
+                        continue;
+                    }
+                }
+            }
+
+            out.push(item.clone());
+        }
+
+        out
+    }
+
+    fn append_payload_field(payload_json: &mut String, field: &str, value: &str) -> bool {
+        let Ok(mut payload) = serde_json::from_str::<serde_json::Value>(payload_json) else {
+            return false;
+        };
+        let Some(existing) = payload.get(field).and_then(|value| value.as_str()) else {
+            return false;
+        };
+        let merged = format!("{}{}", existing, value);
+        payload[field] = serde_json::Value::String(merged);
+        match serde_json::to_string(&payload) {
+            Ok(next) => {
+                *payload_json = next;
+                true
+            }
+            Err(_) => false,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct PersistedToolResult {
@@ -175,7 +328,7 @@ impl SessionStore {
     ///
     /// Do not rely on ad-hoc `ALTER TABLE ... .ok()` fallbacks or silent
     /// schema drift. Session data must migrate deterministically.
-    const SCHEMA_VERSION: i32 = 13;
+    const SCHEMA_VERSION: i32 = 14;
 
     pub fn new(data_dir: &Path) -> Result<Self, String> {
         let db_path = data_dir.join("locus.db");
@@ -210,10 +363,15 @@ impl SessionStore {
             .map_err(|e| format!("Failed to enable foreign keys: {}", e))?;
 
         Self::run_migrations(&conn)?;
+        Self::mark_nonterminal_runs_cancelled(&conn)?;
+
+        let conn = Arc::new(Mutex::new(conn));
+        let event_writer = Arc::new(SessionEventWriter::new(conn.clone()));
 
         Ok(SessionStore {
-            conn: Arc::new(Mutex::new(conn)),
+            conn,
             data_dir: data_dir.to_path_buf(),
+            event_writer,
         })
     }
 
@@ -322,7 +480,13 @@ impl SessionStore {
             })?;
         }
 
-        debug_assert_eq!(Self::SCHEMA_VERSION, 13, "add a new migration block above");
+        if current < 14 {
+            Self::migrate(conn, 14, "add session run and event log tables", |conn| {
+                Self::create_session_sync_schema(conn)
+            })?;
+        }
+
+        debug_assert_eq!(Self::SCHEMA_VERSION, 14, "add a new migration block above");
         Ok(())
     }
 
@@ -383,6 +547,35 @@ impl SessionStore {
             );
             CREATE INDEX IF NOT EXISTS idx_todos_session ON todos(session_id);",
         )
+        .and_then(|_| Self::create_session_sync_schema(conn))
+    }
+
+    fn create_session_sync_schema(conn: &Connection) -> rusqlite::Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS session_runs (
+                run_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                status TEXT NOT NULL,
+                started_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                finished_at INTEGER,
+                error_message TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_session_runs_session ON session_runs(session_id, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_session_runs_status ON session_runs(status);
+
+            CREATE TABLE IF NOT EXISTS session_events (
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                run_id TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                event_type TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (session_id, seq)
+            );
+            CREATE INDEX IF NOT EXISTS idx_session_events_run ON session_events(run_id, seq);
+            CREATE INDEX IF NOT EXISTS idx_session_events_session_seq ON session_events(session_id, seq);",
+        )
     }
 
     fn table_has_column(conn: &Connection, table: &str, col: &str) -> rusqlite::Result<bool> {
@@ -392,6 +585,29 @@ impl SessionStore {
             .query_map([], |row| row.get::<_, String>(1))?
             .any(|r| r.map(|name| name == col).unwrap_or(false));
         Ok(found)
+    }
+
+    fn mark_nonterminal_runs_cancelled(conn: &Connection) -> Result<(), String> {
+        let now = Self::now_ts();
+        conn.execute(
+            "UPDATE session_runs
+             SET status = ?1,
+                 updated_at = ?2,
+                 finished_at = COALESCE(finished_at, ?2),
+                 error_message = COALESCE(error_message, 'Interrupted by application restart')
+             WHERE status IN (?3, ?4, ?5, ?6, ?7)",
+            params![
+                RUN_STATUS_CANCELLED,
+                now,
+                RUN_STATUS_QUEUED,
+                RUN_STATUS_STARTING,
+                RUN_STATUS_RUNNING,
+                RUN_STATUS_WAITING_INPUT,
+                RUN_STATUS_CANCELLING,
+            ],
+        )
+        .map_err(|e| format!("Failed to normalize interrupted session runs: {}", e))?;
+        Ok(())
     }
 
     /// Run a single migration step inside a transaction, setting user_version on success.
@@ -497,6 +713,310 @@ impl SessionStore {
         )
         .map_err(|e| format!("Failed to create session: {}", e))?;
         Ok(id)
+    }
+
+    pub fn try_start_run(&self, session_id: &str, run_id: &str) -> Result<(), String> {
+        let now = Self::now_ts();
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+
+        conn.execute("BEGIN IMMEDIATE", [])
+            .map_err(|e| format!("Failed to begin run transaction: {}", e))?;
+
+        let active_run = conn
+            .query_row(
+                "SELECT run_id FROM session_runs
+                 WHERE session_id = ?1 AND status IN (?2, ?3, ?4, ?5, ?6)
+                 ORDER BY updated_at DESC
+                 LIMIT 1",
+                params![
+                    session_id,
+                    RUN_STATUS_QUEUED,
+                    RUN_STATUS_STARTING,
+                    RUN_STATUS_RUNNING,
+                    RUN_STATUS_WAITING_INPUT,
+                    RUN_STATUS_CANCELLING,
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| {
+                let _ = conn.execute("ROLLBACK", []);
+                format!("Failed to query active run: {}", e)
+            })?;
+
+        if let Some(active_run) = active_run {
+            let _ = conn.execute("ROLLBACK", []);
+            return Err(format!("Session already has an active run: {}", active_run));
+        }
+
+        conn.execute(
+            "INSERT INTO session_runs (run_id, session_id, status, started_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?4)",
+            params![run_id, session_id, RUN_STATUS_STARTING, now],
+        )
+        .map_err(|e| {
+            let _ = conn.execute("ROLLBACK", []);
+            format!("Failed to start session run: {}", e)
+        })?;
+
+        conn.execute("COMMIT", [])
+            .map_err(|e| format!("Failed to commit run transaction: {}", e))?;
+        Ok(())
+    }
+
+    pub fn update_run_status(
+        &self,
+        run_id: &str,
+        status: &str,
+        error_message: Option<&str>,
+    ) -> Result<(), String> {
+        Self::update_run_status_on_conn(&self.conn, run_id, status, error_message)
+    }
+
+    fn update_run_status_on_conn(
+        conn: &Arc<Mutex<Connection>>,
+        run_id: &str,
+        status: &str,
+        error_message: Option<&str>,
+    ) -> Result<(), String> {
+        let now = Self::now_ts();
+        let is_terminal = matches!(
+            status,
+            RUN_STATUS_DONE | RUN_STATUS_CANCELLED | RUN_STATUS_ERROR
+        );
+        let is_terminal_flag = if is_terminal { 1i64 } else { 0i64 };
+        let conn = conn.lock().map_err(|e| e.to_string())?;
+        conn.execute(
+            "UPDATE session_runs
+             SET status = ?1,
+                 updated_at = ?2,
+                 finished_at = CASE WHEN ?3 = 1 THEN COALESCE(finished_at, ?2) ELSE finished_at END,
+                 error_message = COALESCE(?4, error_message)
+             WHERE run_id = ?5
+               AND status NOT IN (?6, ?7, ?8)
+               AND NOT (status = ?9 AND ?3 = 0)",
+            params![
+                status,
+                now,
+                is_terminal_flag,
+                error_message,
+                run_id,
+                RUN_STATUS_DONE,
+                RUN_STATUS_CANCELLED,
+                RUN_STATUS_ERROR,
+                RUN_STATUS_CANCELLING,
+            ],
+        )
+        .map_err(|e| format!("Failed to update session run status: {}", e))?;
+        Ok(())
+    }
+
+    pub fn active_run_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<SessionRunSummary>, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        conn.query_row(
+            "SELECT run_id, session_id, status, started_at, updated_at, finished_at, error_message
+             FROM session_runs
+             WHERE session_id = ?1 AND status IN (?2, ?3, ?4, ?5, ?6)
+             ORDER BY updated_at DESC
+             LIMIT 1",
+            params![
+                session_id,
+                RUN_STATUS_QUEUED,
+                RUN_STATUS_STARTING,
+                RUN_STATUS_RUNNING,
+                RUN_STATUS_WAITING_INPUT,
+                RUN_STATUS_CANCELLING,
+            ],
+            |row| {
+                Ok(SessionRunSummary {
+                    run_id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    status: row.get(2)?,
+                    started_at: row.get(3)?,
+                    updated_at: row.get(4)?,
+                    finished_at: row.get(5)?,
+                    error_message: row.get(6)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|e| format!("Failed to query active session run: {}", e))
+    }
+
+    pub fn append_session_event(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        event_type: &str,
+        payload_json: &str,
+    ) -> Result<i64, String> {
+        let seqs = self.append_session_events_batch(&[SessionEventAppend {
+            session_id: session_id.to_string(),
+            run_id: run_id.to_string(),
+            event_type: event_type.to_string(),
+            payload_json: payload_json.to_string(),
+        }])?;
+        seqs.first()
+            .copied()
+            .ok_or_else(|| "Session event batch unexpectedly produced no sequence".to_string())
+    }
+
+    pub fn enqueue_session_event(
+        &self,
+        event: SessionEventAppend,
+        merge: Option<SessionEventMerge>,
+        status: Option<SessionRunStatusUpdate>,
+    ) -> Result<(), String> {
+        self.event_writer.enqueue(QueuedSessionEvent {
+            event,
+            merge,
+            status_updates: status.into_iter().collect(),
+        })
+    }
+
+    pub fn append_session_events_batch(
+        &self,
+        records: &[SessionEventAppend],
+    ) -> Result<Vec<i64>, String> {
+        Self::append_session_events_batch_on_conn(&self.conn, records)
+    }
+
+    fn append_session_events_batch_on_conn(
+        conn: &Arc<Mutex<Connection>>,
+        records: &[SessionEventAppend],
+    ) -> Result<Vec<i64>, String> {
+        if records.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let now = Self::now_ts();
+        let conn = conn.lock().map_err(|e| e.to_string())?;
+
+        conn.execute("BEGIN IMMEDIATE", [])
+            .map_err(|e| format!("Failed to begin session event transaction: {}", e))?;
+
+        let result = (|| -> Result<Vec<i64>, String> {
+            let mut next_seq_by_session: HashMap<String, i64> = HashMap::new();
+            for record in records {
+                if next_seq_by_session.contains_key(&record.session_id) {
+                    continue;
+                }
+                let next_seq = conn
+                    .query_row(
+                        "SELECT COALESCE(MAX(seq), 0) + 1 FROM session_events WHERE session_id = ?1",
+                        params![record.session_id.as_str()],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .map_err(|e| format!("Failed to allocate session event sequence: {}", e))?;
+                next_seq_by_session.insert(record.session_id.clone(), next_seq);
+            }
+
+            let mut seqs = Vec::with_capacity(records.len());
+            {
+                let mut insert = conn
+                    .prepare(
+                        "INSERT INTO session_events (session_id, run_id, seq, event_type, payload_json, created_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    )
+                    .map_err(|e| format!("Failed to prepare session event insert: {}", e))?;
+
+                for record in records {
+                    let seq_ref =
+                        next_seq_by_session
+                            .get_mut(&record.session_id)
+                            .ok_or_else(|| {
+                                "Session event sequence allocation was missing".to_string()
+                            })?;
+                    let seq = *seq_ref;
+                    *seq_ref += 1;
+
+                    insert
+                        .execute(params![
+                            record.session_id.as_str(),
+                            record.run_id.as_str(),
+                            seq,
+                            record.event_type.as_str(),
+                            record.payload_json.as_str(),
+                            now
+                        ])
+                        .map_err(|e| format!("Failed to append session event: {}", e))?;
+                    seqs.push(seq);
+                }
+            }
+
+            Ok(seqs)
+        })();
+
+        let seqs = match result {
+            Ok(seqs) => seqs,
+            Err(error) => {
+                let _ = conn.execute("ROLLBACK", []);
+                return Err(error);
+            }
+        };
+
+        conn.execute("COMMIT", [])
+            .map_err(|e| format!("Failed to commit session event transaction: {}", e))?;
+
+        Ok(seqs)
+    }
+
+    pub fn list_session_events(
+        &self,
+        session_id: &str,
+        after_seq: Option<i64>,
+        limit: Option<u32>,
+    ) -> Result<Vec<SessionEventRecord>, String> {
+        let after_seq = after_seq.unwrap_or(0);
+        let limit = i64::from(limit.unwrap_or(500).clamp(1, 2_000));
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT session_id, run_id, seq, event_type, payload_json, created_at
+                 FROM session_events
+                 WHERE session_id = ?1 AND seq > ?2
+                 ORDER BY seq ASC
+                 LIMIT ?3",
+            )
+            .map_err(|e| format!("Failed to prepare session event query: {}", e))?;
+        let rows = stmt
+            .query_map(params![session_id, after_seq, limit], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })
+            .map_err(|e| format!("Failed to query session events: {}", e))?;
+
+        let mut events = Vec::new();
+        for row in rows {
+            let (session_id, run_id, seq, event_type, payload_json, created_at) =
+                row.map_err(|e| format!("Failed to read session event row: {}", e))?;
+            let payload =
+                serde_json::from_str::<serde_json::Value>(&payload_json).map_err(|e| {
+                    format!(
+                        "Failed to parse session event payload for session {} seq {}: {}",
+                        session_id, seq, e
+                    )
+                })?;
+            events.push(SessionEventRecord {
+                session_id,
+                run_id,
+                seq,
+                event_type,
+                payload,
+                created_at,
+            });
+        }
+
+        Ok(events)
     }
 
     pub fn list_sessions(&self, workspace_id: Option<&str>) -> Result<Vec<SessionSummary>, String> {
@@ -1790,8 +2310,19 @@ mod tests {
     use crate::session::models::{
         ChatMessage, KnowledgeProposalStatus, MessageRole, TodoItem, ToolCallInfo,
     };
-    use rusqlite::{params, Connection};
+    use rusqlite::{params, Connection, OptionalExtension};
     use tempfile::tempdir;
+
+    fn table_exists(conn: &Connection, table: &str) -> bool {
+        conn.query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            params![table],
+            |_| Ok(()),
+        )
+        .optional()
+        .expect("query sqlite master")
+        .is_some()
+    }
 
     #[test]
     fn knowledge_proposal_status_transition_is_closed() {
@@ -1837,6 +2368,8 @@ mod tests {
         assert!(SessionStore::table_has_column(&conn, "messages", "prompt_prefix").unwrap());
         assert!(SessionStore::table_has_column(&conn, "messages", "prompt_suffix").unwrap());
         assert!(SessionStore::table_has_column(&conn, "messages", "include_in_prompt").unwrap());
+        assert!(table_exists(&conn, "session_runs"));
+        assert!(table_exists(&conn, "session_events"));
     }
 
     #[test]
@@ -2451,6 +2984,95 @@ mod tests {
     }
 
     #[test]
+    fn v13_database_is_migrated_forward_with_session_sync_tables() {
+        let dir = tempdir().expect("create temp dir");
+        let db_path = dir.path().join("locus.db");
+        let conn = Connection::open(&db_path).expect("create db");
+
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                parent_session_id TEXT REFERENCES sessions(id) ON DELETE CASCADE,
+                workspace_id TEXT,
+                session_type TEXT NOT NULL DEFAULT 'chat',
+                agent_id TEXT,
+                archived_at INTEGER,
+                latest_completed_run_id TEXT,
+                latest_todo_run_id TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+             );
+             CREATE INDEX idx_sessions_parent ON sessions(parent_session_id);
+             CREATE INDEX idx_sessions_workspace ON sessions(workspace_id);
+
+             CREATE TABLE messages (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                prompt_prefix TEXT,
+                prompt_suffix TEXT,
+                tool_calls TEXT,
+                tool_call_id TEXT,
+                images TEXT,
+                thinking_content TEXT,
+                thinking_duration INTEGER,
+                thinking_signature TEXT,
+                metadata_json TEXT,
+                include_in_prompt INTEGER NOT NULL DEFAULT 1
+             );
+             CREATE INDEX idx_messages_session ON messages(session_id);
+
+             CREATE TABLE token_usage (
+                session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+                total_input_tokens INTEGER NOT NULL DEFAULT 0,
+                total_output_tokens INTEGER NOT NULL DEFAULT 0,
+                total_cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+                total_cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+                total_cost_usd REAL NOT NULL DEFAULT 0,
+                priced_rounds INTEGER NOT NULL DEFAULT 0
+             );
+
+             CREATE TABLE todos (
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                position INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                priority TEXT NOT NULL DEFAULT 'medium',
+                PRIMARY KEY (session_id, position)
+             );
+             CREATE INDEX idx_todos_session ON todos(session_id);
+             PRAGMA user_version = 13;",
+        )
+        .expect("create v13 schema");
+
+        conn.execute(
+            "INSERT INTO sessions (id, title, parent_session_id, workspace_id, session_type, agent_id, archived_at, latest_completed_run_id, latest_todo_run_id, created_at, updated_at)
+             VALUES (?1, ?2, NULL, NULL, 'chat', NULL, NULL, NULL, NULL, 100, 100)",
+            params!["session-1", "Migrated Session"],
+        )
+        .expect("insert session");
+        drop(conn);
+
+        let store = SessionStore::new(dir.path()).expect("migrate store");
+        let detail = store.load_session("session-1").expect("load session");
+        assert_eq!(detail.title, "Migrated Session");
+
+        let conn = Connection::open(&db_path).expect("reopen db");
+        let version: i32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read schema version");
+        assert_eq!(version, SessionStore::SCHEMA_VERSION);
+        assert!(table_exists(&conn, "session_runs"));
+        assert!(SessionStore::table_has_column(&conn, "session_runs", "status").unwrap());
+        assert!(table_exists(&conn, "session_events"));
+        assert!(SessionStore::table_has_column(&conn, "session_events", "payload_json").unwrap());
+    }
+
+    #[test]
     fn update_todos_persists_latest_todo_run_id() {
         let dir = tempdir().expect("create temp dir");
         let store = SessionStore::new(dir.path()).expect("initialize store");
@@ -2474,6 +3096,144 @@ mod tests {
         assert_eq!(snapshot.latest_run_id.as_deref(), Some("run-todo"));
         assert_eq!(snapshot.items.len(), 1);
         assert_eq!(snapshot.items[0].content, "Track current run");
+    }
+
+    #[test]
+    fn try_start_run_blocks_active_run_and_allows_after_terminal_status() {
+        let dir = tempdir().expect("create temp dir");
+        let store = SessionStore::new(dir.path()).expect("initialize store");
+        let session_id = store
+            .create_session("Run Lock", None, None, "chat", None)
+            .expect("create session");
+
+        store
+            .try_start_run(&session_id, "run-1")
+            .expect("start first run");
+        let active = store
+            .active_run_for_session(&session_id)
+            .expect("load active run")
+            .expect("active run");
+        assert_eq!(active.run_id, "run-1");
+        assert_eq!(active.status, "starting");
+
+        let locked = store.try_start_run(&session_id, "run-2");
+        assert!(locked.is_err());
+
+        store
+            .update_run_status("run-1", "done", None)
+            .expect("finish first run");
+        assert!(store
+            .active_run_for_session(&session_id)
+            .expect("load active run")
+            .is_none());
+        store
+            .try_start_run(&session_id, "run-2")
+            .expect("start second run");
+    }
+
+    #[test]
+    fn terminal_run_status_is_not_overwritten_by_late_nonterminal_update() {
+        let dir = tempdir().expect("create temp dir");
+        let store = SessionStore::new(dir.path()).expect("initialize store");
+        let session_id = store
+            .create_session("Run Status", None, None, "chat", None)
+            .expect("create session");
+
+        store
+            .try_start_run(&session_id, "run-1")
+            .expect("start run");
+        store
+            .update_run_status("run-1", "done", None)
+            .expect("mark done");
+        store
+            .update_run_status("run-1", "cancelling", None)
+            .expect("ignore late cancelling");
+
+        let conn = store.conn.lock().expect("lock store connection");
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM session_runs WHERE run_id = 'run-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read run status");
+        assert_eq!(status, "done");
+    }
+
+    #[test]
+    fn cancelling_run_status_is_not_overwritten_by_late_running_update() {
+        let dir = tempdir().expect("create temp dir");
+        let store = SessionStore::new(dir.path()).expect("initialize store");
+        let session_id = store
+            .create_session("Run Cancelling", None, None, "chat", None)
+            .expect("create session");
+
+        store
+            .try_start_run(&session_id, "run-1")
+            .expect("start run");
+        store
+            .update_run_status("run-1", "cancelling", None)
+            .expect("mark cancelling");
+        store
+            .update_run_status("run-1", "running", None)
+            .expect("ignore late running");
+
+        let conn = store.conn.lock().expect("lock store connection");
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM session_runs WHERE run_id = 'run-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read run status");
+        assert_eq!(status, "cancelling");
+    }
+
+    #[test]
+    fn session_events_allocate_monotonic_sequence() {
+        let dir = tempdir().expect("create temp dir");
+        let store = SessionStore::new(dir.path()).expect("initialize store");
+        let session_id = store
+            .create_session("Event Log", None, None, "chat", None)
+            .expect("create session");
+
+        store
+            .try_start_run(&session_id, "run-1")
+            .expect("start run");
+        let first_seq = store
+            .append_session_event(
+                &session_id,
+                "run-1",
+                "runStart",
+                r#"{"type":"runStart","sessionId":"session"}"#,
+            )
+            .expect("append first event");
+        let second_seq = store
+            .append_session_event(
+                &session_id,
+                "run-1",
+                "textDelta",
+                r#"{"type":"textDelta","sessionId":"session","text":"hello"}"#,
+            )
+            .expect("append second event");
+
+        assert_eq!(first_seq, 1);
+        assert_eq!(second_seq, 2);
+
+        let events = store
+            .list_session_events(&session_id, Some(0), Some(10))
+            .expect("list events");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].seq, 1);
+        assert_eq!(events[0].event_type, "runStart");
+        assert_eq!(events[1].seq, 2);
+        assert_eq!(events[1].payload["text"].as_str(), Some("hello"));
+
+        let tail = store
+            .list_session_events(&session_id, Some(1), Some(10))
+            .expect("list tail");
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].seq, 2);
     }
 
     #[test]

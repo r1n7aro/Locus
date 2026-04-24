@@ -15,12 +15,12 @@ use std::{
     time::Instant,
 };
 
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Manager};
 
 use crate::agent::definition::{AgentDef, AgentDefRegistry};
 use crate::commands::{
     BasicToolConfirmDisplay, KnowledgeToolConfirmDirectoryMode, KnowledgeToolConfirmOperation,
-    KnowledgeToolConfirmPreview, StreamEvent, StreamEventEnvelope, ToolConfirmDisplay,
+    KnowledgeToolConfirmPreview, StreamEvent, ToolConfirmDisplay,
 };
 use crate::compact;
 use crate::llm::{anthropic, codex, openrouter, responses};
@@ -55,15 +55,10 @@ async fn resolve_codex_request_auth(
     Ok((access_token, guard.account_id()))
 }
 
-/// Emit a StreamEvent wrapped in an envelope with the given run_id.
+/// Emit a StreamEvent through the session gateway with the given run_id.
 fn emit_stream(handle: &AppHandle, run_id: &str, event: StreamEvent) {
-    let _ = handle.emit(
-        "stream-event",
-        StreamEventEnvelope {
-            run_id: run_id.to_string(),
-            event,
-        },
-    );
+    let store: tauri::State<'_, Arc<SessionStore>> = handle.state();
+    crate::session::gateway::emit_stream(handle, store.inner().as_ref(), run_id, event);
 }
 
 fn log_stage_elapsed(
@@ -3616,15 +3611,20 @@ impl AgentInstance {
         user_intent: Option<crate::session::models::UserIntentPayload>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send + 'a>>
     {
-        self.run_with_run_id(
-            app_handle,
-            store,
-            user_text,
-            images,
-            initial_mode,
-            user_intent,
-            self.new_run_id(),
-        )
+        Box::pin(async move {
+            let run_id = self.new_run_id();
+            store.try_start_run(&self.session_id, &run_id)?;
+            self.run_with_run_id(
+                app_handle,
+                store,
+                user_text,
+                images,
+                initial_mode,
+                user_intent,
+                run_id,
+            )
+            .await
+        })
     }
 
     pub fn run_with_run_id<'a>(

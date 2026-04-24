@@ -1,5 +1,14 @@
 import { ipcInvoke } from "./ipc";
-import type { SessionSummary, SessionDetail, TokenUsage, TodoSnapshot, ImageAttachment, UserIntentMeta } from "../types";
+import type {
+  SessionSummary,
+  SessionDetail,
+  SessionEventRecord,
+  SessionRunSummary,
+  TokenUsage,
+  TodoSnapshot,
+  ImageAttachment,
+  UserIntentMeta,
+} from "../types";
 
 export interface ChatParams {
   sessionId?: string | null;
@@ -87,6 +96,22 @@ export function deleteSession(sessionId: string): Promise<void> {
 
 export function getSessionUsage(sessionId: string): Promise<TokenUsage> {
   return ipcInvoke<TokenUsage>("get_session_usage", { sessionId });
+}
+
+export function getSessionActiveRun(sessionId: string): Promise<SessionRunSummary | null> {
+  return ipcInvoke<SessionRunSummary | null>("get_session_active_run", { sessionId });
+}
+
+export function listSessionEvents(
+  sessionId: string,
+  afterSeq?: number | null,
+  limit?: number | null,
+): Promise<SessionEventRecord[]> {
+  return ipcInvoke<SessionEventRecord[]>("list_session_events", {
+    sessionId,
+    afterSeq: afterSeq ?? null,
+    limit: limit ?? null,
+  });
 }
 
 export function getTodos(sessionId: string): Promise<TodoSnapshot> {

@@ -23,6 +23,8 @@ import type {
   UndoConflictInfo,
   TodoSnapshot,
   TodoPanelMode,
+  SessionEventRecord,
+  SessionRunSummary,
 } from "../types";
 
 type ToolPermissionMode = "auto" | "ask";
@@ -48,7 +50,41 @@ function replaceMessageById(list: ChatMessage[], message: ChatMessage): ChatMess
 }
 
 function isActiveRuntimeStatus(status: SessionSummary["runtimeStatus"]): boolean {
-  return status === "running" || status === "starting" || status === "queued";
+  return status === "running"
+    || status === "waiting_input"
+    || status === "cancelling"
+    || status === "starting"
+    || status === "queued";
+}
+
+function isActiveRunStatus(status: SessionRunSummary["status"] | null | undefined): boolean {
+  return status === "running"
+    || status === "waiting_input"
+    || status === "cancelling"
+    || status === "starting"
+    || status === "queued";
+}
+
+function streamEventFromRecord(record: SessionEventRecord): StreamEvent | null {
+  if (!record.payload || typeof record.payload !== "object") return null;
+  const payload = record.payload as Record<string, unknown>;
+  if (typeof payload.type !== "string") return null;
+  return {
+    ...payload,
+    runId: record.runId,
+  } as StreamEvent;
+}
+
+function activeReplayEvents(
+  records: SessionEventRecord[],
+  afterSeq: number,
+): SessionEventRecord[] {
+  if (afterSeq > 0) return records;
+  const lastCompletedRoundIndex = records
+    .map((record) => record.eventType)
+    .lastIndexOf("toolCallRoundDone");
+  if (lastCompletedRoundIndex < 0) return records;
+  return records.slice(lastCompletedRoundIndex + 1);
 }
 
 function normalizeToolPermissionMode(mode: string | null | undefined): ToolPermissionMode {
@@ -89,6 +125,7 @@ export const useChatStore = defineStore("chat", () => {
   const streamingSessionIds = ref(new Set<string>());
   const undoableMessageIds = ref(new Set<string>());
   const sessionRunIds = ref(new Map<string, string>());
+  const replayedSessionEventSeqs = new Map<string, number>();
   const sessionScrollStates = ref(new Map<string, SessionScrollState>());
   const sessionAgentId = ref<string | null>(null);
   const toolPermissionMode = ref<ToolPermissionMode>("auto");
@@ -137,6 +174,7 @@ export const useChatStore = defineStore("chat", () => {
   const managedStreamingSessionIds = new Set<string>();
   const closedRunIds = new Map<string, string>();
   const cancelRequestedRunIds = new Map<string, string>();
+  let streamReplayDepth = 0;
   const isCancelling = computed(() => {
     if (!activeSessionId.value || !currentRunId.value) return false;
     return cancelRequestedRunIds.get(activeSessionId.value) === currentRunId.value;
@@ -200,6 +238,130 @@ export const useChatStore = defineStore("chat", () => {
     pendingToolConfirms.value = [];
   }
 
+  function runEventReplayKey(sessionId: string, runId: string): string {
+    return `${sessionId}\u{0}${runId}`;
+  }
+
+  function forgetRunReplaySeq(sessionId: string, runId?: string | null) {
+    if (runId) {
+      replayedSessionEventSeqs.delete(runEventReplayKey(sessionId, runId));
+      return;
+    }
+    for (const key of Array.from(replayedSessionEventSeqs.keys())) {
+      if (key.startsWith(`${sessionId}\u{0}`)) {
+        replayedSessionEventSeqs.delete(key);
+      }
+    }
+  }
+
+  function trackActiveRun(sessionId: string, runId: string) {
+    streamingSessionIds.value.add(sessionId);
+    sessionRunIds.value.set(sessionId, runId);
+    closedRunIds.delete(sessionId);
+    if (activeSessionId.value === sessionId) {
+      currentRunId.value = runId;
+      isStreaming.value = true;
+    }
+  }
+
+  function clearTrackedRun(sessionId: string, runId?: string | null) {
+    streamingSessionIds.value.delete(sessionId);
+    sessionRunIds.value.delete(sessionId);
+    cancelRequestedRunIds.delete(sessionId);
+    managedStreamingSessionIds.delete(sessionId);
+    forgetRunReplaySeq(sessionId, runId);
+  }
+
+  async function listRunEvents(sessionId: string, runId: string, afterSeq: number) {
+    const all: SessionEventRecord[] = [];
+    let cursor = afterSeq;
+    const pageSize = 2_000;
+
+    for (;;) {
+      const page = await sessionService.listSessionEvents(sessionId, cursor, pageSize);
+      const runEvents = page.filter((record) => record.runId === runId);
+      all.push(...runEvents);
+      if (page.length === 0) break;
+      cursor = Math.max(cursor, ...page.map((record) => record.seq));
+      if (page.length < pageSize) break;
+    }
+
+    return all;
+  }
+
+  async function replayActiveRunEvents(sessionId: string, runId: string) {
+    const key = runEventReplayKey(sessionId, runId);
+    const afterSeq = replayedSessionEventSeqs.get(key) ?? 0;
+    const records = await listRunEvents(sessionId, runId, afterSeq);
+    if (records.length === 0) return;
+
+    replayedSessionEventSeqs.set(
+      key,
+      Math.max(afterSeq, ...records.map((record) => record.seq)),
+    );
+
+    const events = activeReplayEvents(records, afterSeq)
+      .map(streamEventFromRecord)
+      .filter((event): event is StreamEvent => !!event);
+    if (events.length === 0) return;
+
+    streamReplayDepth += 1;
+    try {
+      for (const event of events) {
+        handleStreamEvent(event);
+      }
+    } finally {
+      streamReplayDepth -= 1;
+    }
+  }
+
+  async function hydrateSessionActiveRun(
+    sessionId: string,
+    replay: boolean,
+    options: { clearMissing?: boolean } = {},
+  ) {
+    try {
+      const run = await sessionService.getSessionActiveRun(sessionId);
+      if (!run || !isActiveRunStatus(run.status)) {
+        if (options.clearMissing === false && sessionRunIds.value.has(sessionId)) {
+          return;
+        }
+        const previousRunId = sessionRunIds.value.get(sessionId);
+        clearTrackedRun(sessionId, previousRunId);
+        if (activeSessionId.value === sessionId) {
+          currentRunId.value = null;
+          isStreaming.value = false;
+        }
+        return;
+      }
+
+      const previousRunId = sessionRunIds.value.get(sessionId);
+      trackActiveRun(sessionId, run.runId);
+      if (previousRunId && previousRunId !== run.runId) {
+        forgetRunReplaySeq(sessionId, previousRunId);
+      }
+
+      if (replay && activeSessionId.value === sessionId) {
+        await replayActiveRunEvents(sessionId, run.runId);
+      }
+    } catch (e) {
+      console.warn("hydrate active session run failed:", e);
+    }
+  }
+
+  async function hydrateActiveRuns(nextSessions: SessionSummary[]) {
+    const activeSessions = nextSessions.filter((session) =>
+      isActiveRuntimeStatus(session.runtimeStatus ?? null));
+    await Promise.all(activeSessions.map(async (session) => {
+      const alreadyTracked = sessionRunIds.value.has(session.id);
+      await hydrateSessionActiveRun(
+        session.id,
+        activeSessionId.value === session.id && !alreadyTracked,
+        { clearMissing: false },
+      );
+    }));
+  }
+
   async function loadSessionState(id: string) {
     const loadSeq = ++sessionLoadSeq;
     isStreaming.value = streamingSessionIds.value.has(id);
@@ -220,6 +382,7 @@ export const useChatStore = defineStore("chat", () => {
         detail.latestCompletedRunId ?? null,
       );
       applySessionData(detail, usage, sessionTodos, undoEntries);
+      await hydrateSessionActiveRun(id, true);
     } catch (e) {
       if (loadSeq !== sessionLoadSeq || activeSessionId.value !== id) return;
       console.error("load_session failed:", e);
@@ -411,10 +574,9 @@ export const useChatStore = defineStore("chat", () => {
 
     for (const sessionId of staleIds) {
       nextStreamingSessionIds.delete(sessionId);
-      sessionRunIds.value.delete(sessionId);
+      const staleRunId = sessionRunIds.value.get(sessionId) ?? null;
+      clearTrackedRun(sessionId, staleRunId);
       closedRunIds.delete(sessionId);
-      cancelRequestedRunIds.delete(sessionId);
-      managedStreamingSessionIds.delete(sessionId);
 
       if (pendingManagedSessionId === sessionId) {
         pendingManagedSessionId = null;
@@ -608,7 +770,9 @@ export const useChatStore = defineStore("chat", () => {
         isStreaming.value = m.value;
         break;
       case "canvasAutoOpen":
-        canvasAutoOpenCallback?.(m.toolCallId, m.spec);
+        if (streamReplayDepth === 0) {
+          canvasAutoOpenCallback?.(m.toolCallId, m.spec);
+        }
         break;
     }
   }
@@ -735,11 +899,8 @@ export const useChatStore = defineStore("chat", () => {
     if (event.type === "done" || event.type === "error" || event.type === "cancelled") {
       const trackedRunId = sessionRunIds.value.get(event.sessionId) ?? null;
       const wasStreaming = streamingSessionIds.value.has(event.sessionId);
-      streamingSessionIds.value.delete(event.sessionId);
-      sessionRunIds.value.delete(event.sessionId);
+      clearTrackedRun(event.sessionId, trackedRunId ?? event.runId);
       closedRunIds.set(event.sessionId, event.runId);
-      cancelRequestedRunIds.delete(event.sessionId);
-      managedStreamingSessionIds.delete(event.sessionId);
       if (pendingManagedSessionId === event.sessionId) {
         pendingManagedSessionId = null;
       }
@@ -894,6 +1055,7 @@ export const useChatStore = defineStore("chat", () => {
       const rawSessions = await sessionService.listSessions();
       const nextSessions = normalizeSessionRuntimeStatuses(rawSessions);
       sessions.value = nextSessions;
+      await hydrateActiveRuns(nextSessions);
       reconcileStreamingSessions(nextSessions);
     } catch (e) {
       console.error("list_sessions failed:", e);
@@ -927,6 +1089,7 @@ export const useChatStore = defineStore("chat", () => {
     pendingManagedUnboundSession = false;
     closedRunIds.clear();
     cancelRequestedRunIds.clear();
+    replayedSessionEventSeqs.clear();
     messages.value = [];
     resetStreamRuntimeState();
     isStreaming.value = false;
@@ -957,6 +1120,7 @@ export const useChatStore = defineStore("chat", () => {
     pendingManagedUnboundSession = false;
     closedRunIds.clear();
     cancelRequestedRunIds.clear();
+    replayedSessionEventSeqs.clear();
     sessions.value = [];
     messages.value = [];
     resetStreamRuntimeState();
@@ -1009,10 +1173,8 @@ export const useChatStore = defineStore("chat", () => {
     try {
       await sessionService.archiveSession(id);
       useChatChangesStore().clear(id);
-      sessionRunIds.value.delete(id);
+      clearTrackedRun(id, sessionRunIds.value.get(id) ?? null);
       closedRunIds.delete(id);
-      cancelRequestedRunIds.delete(id);
-      streamingSessionIds.value.delete(id);
       clearSessionScrollState(id);
       if (activeSessionId.value === id) {
         newChat();
@@ -1031,10 +1193,8 @@ export const useChatStore = defineStore("chat", () => {
     try {
       await sessionService.deleteSession(id);
       useChatChangesStore().clear(id);
-      sessionRunIds.value.delete(id);
+      clearTrackedRun(id, sessionRunIds.value.get(id) ?? null);
       closedRunIds.delete(id);
-      cancelRequestedRunIds.delete(id);
-      streamingSessionIds.value.delete(id);
       clearSessionScrollState(id);
       if (activeSessionId.value === id) {
         newChat();
@@ -1128,8 +1288,12 @@ export const useChatStore = defineStore("chat", () => {
         pendingManagedSessionId,
       });
 
+      const previousRunId = sessionRunIds.value.get(sid) ?? null;
       streamingSessionIds.value.add(sid);
       sessionRunIds.value.set(sid, runId);
+      if (previousRunId && previousRunId !== runId) {
+        forgetRunReplaySeq(sid, previousRunId);
+      }
       closedRunIds.delete(sid);
       cancelRequestedRunIds.delete(sid);
       pendingSessionId = null;

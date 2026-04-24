@@ -1,6 +1,12 @@
 import type { SessionSummary } from "../../types";
 
-export type SessionTreeStatus = "running" | "queued" | "starting" | "error";
+export type SessionTreeStatus =
+  | "running"
+  | "queued"
+  | "starting"
+  | "waiting_input"
+  | "cancelling"
+  | "error";
 
 export interface SessionTreeFolderNode {
   kind: "folder";
@@ -56,6 +62,9 @@ function normalizeSessionTitle(title: string, sessionType: string, isChild: bool
 function statusPriority(status: SessionTreeStatus | null): number {
   switch (status) {
     case "running":
+    case "waiting_input":
+      return 5;
+    case "cancelling":
       return 4;
     case "starting":
       return 3;

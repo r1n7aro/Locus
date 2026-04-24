@@ -575,6 +575,23 @@ impl AgentInstance {
             )?;
         }
 
+        if let Err(error) = store.set_latest_completed_run_id(&self.session_id, Some(run_id)) {
+            eprintln!(
+                "[Agent {}] failed to persist latest completed run id for session {} run {}: {}",
+                self.id, self.session_id, run_id, error
+            );
+            crate::error::AppError::emit_background(
+                app_handle,
+                &crate::error::AppError::new(
+                    "session.latest_run_persist_failed",
+                    "Latest run boundary may be unavailable for this session.",
+                )
+                .detail(error)
+                .operation("session")
+                .severity(crate::error::ErrorSeverity::Warning),
+            );
+        }
+
         emit_stream(
             app_handle,
             run_id,

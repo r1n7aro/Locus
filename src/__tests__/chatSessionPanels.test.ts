@@ -11,8 +11,10 @@ const sessionServiceMocks = vi.hoisted(() => ({
   cancelChat: vi.fn(),
   deleteSession: vi.fn(),
   getSessionUsage: vi.fn(),
+  getSessionActiveRun: vi.fn(),
   getTodos: vi.fn(),
   ignoreKnowledgeProposal: vi.fn(),
+  listSessionEvents: vi.fn(),
   listArchivedSessions: vi.fn(),
   listSessions: vi.fn(),
   loadSession: vi.fn(),
@@ -135,7 +137,7 @@ describe("chat session panel state", () => {
 
   beforeEach(() => {
     setActivePinia(createPinia());
-    vi.clearAllMocks();
+    vi.resetAllMocks();
 
     displaySettingsState.todoAutoOpen = true;
     displaySettingsState.changesAutoOpen = true;
@@ -173,10 +175,12 @@ describe("chat session panel state", () => {
     sessionServiceMocks.cancelChat.mockResolvedValue(undefined);
     sessionServiceMocks.deleteSession.mockResolvedValue(undefined);
     sessionServiceMocks.getSessionUsage.mockImplementation(async () => emptyUsage());
+    sessionServiceMocks.getSessionActiveRun.mockResolvedValue(null);
     sessionServiceMocks.getTodos.mockImplementation(async (sessionId: string) => (
       todoData[sessionId] ?? { items: [], latestRunId: null }
     ));
     sessionServiceMocks.ignoreKnowledgeProposal.mockResolvedValue(undefined);
+    sessionServiceMocks.listSessionEvents.mockResolvedValue([]);
     sessionServiceMocks.listArchivedSessions.mockImplementation(async () => []);
     sessionServiceMocks.listSessions.mockImplementation(async () => []);
     sessionServiceMocks.renameSession.mockResolvedValue(undefined);
@@ -501,6 +505,147 @@ describe("chat session panel state", () => {
 
     expect(chatStore.isStreaming).toBe(false);
     expect(chatStore.streamingSessionIds.has("s1")).toBe(false);
+  });
+
+  it("hydrates active backend runs and replays current stream events on refresh", async () => {
+    const chatStore = useChatStore();
+
+    chatStore.activeSessionId = "s1";
+    sessionServiceMocks.listSessions.mockResolvedValueOnce([
+      {
+        id: "s1",
+        title: "Running session",
+        agentId: null,
+        sessionType: "chat",
+        updatedAt: 2,
+        runtimeStatus: "running",
+      },
+    ]);
+    sessionServiceMocks.getSessionActiveRun.mockResolvedValueOnce({
+      runId: "run-1",
+      sessionId: "s1",
+      status: "running",
+      startedAt: 1,
+      updatedAt: 2,
+      finishedAt: null,
+      errorMessage: null,
+    });
+    sessionServiceMocks.listSessionEvents.mockResolvedValueOnce([
+      {
+        sessionId: "s1",
+        runId: "run-1",
+        seq: 1,
+        eventType: "runStart",
+        payload: { type: "runStart", sessionId: "s1" },
+        createdAt: 1,
+      },
+      {
+        sessionId: "s1",
+        runId: "run-1",
+        seq: 2,
+        eventType: "toolCallStart",
+        payload: {
+          type: "toolCallStart",
+          sessionId: "s1",
+          toolCallId: "tc-active",
+          toolName: "read",
+          arguments: "{}",
+        },
+        createdAt: 2,
+      },
+    ]);
+
+    await chatStore.refreshSessions();
+
+    expect(chatStore.streamingSessionIds.has("s1")).toBe(true);
+    expect(chatStore.currentRunId).toBe("run-1");
+    expect(chatStore.isStreaming).toBe(true);
+    expect(chatStore.activeToolCalls).toHaveLength(1);
+    expect(chatStore.activeToolCalls[0]?.id).toBe("tc-active");
+  });
+
+  it("replays only the unfinished active round after loading persisted messages", async () => {
+    const chatStore = useChatStore();
+
+    sessionServiceMocks.loadSession.mockResolvedValueOnce({
+      id: "s1",
+      title: "Session s1",
+      messages: [
+        {
+          id: "msg-round",
+          role: "assistant",
+          content: "persisted round",
+          createdAt: 1,
+          toolCalls: [{ id: "tc-old", name: "read", arguments: "{}" }],
+        },
+      ],
+      agentId: null,
+      sessionType: "chat",
+      parentSessionId: null,
+      latestCompletedRunId: null,
+      createdAt: 0,
+      updatedAt: 0,
+    });
+    sessionServiceMocks.getSessionActiveRun.mockResolvedValueOnce({
+      runId: "run-1",
+      sessionId: "s1",
+      status: "running",
+      startedAt: 1,
+      updatedAt: 2,
+      finishedAt: null,
+      errorMessage: null,
+    });
+    sessionServiceMocks.listSessionEvents.mockResolvedValueOnce([
+      {
+        sessionId: "s1",
+        runId: "run-1",
+        seq: 1,
+        eventType: "toolCallStart",
+        payload: {
+          type: "toolCallStart",
+          sessionId: "s1",
+          toolCallId: "tc-old",
+          toolName: "read",
+          arguments: "{}",
+        },
+        createdAt: 1,
+      },
+      {
+        sessionId: "s1",
+        runId: "run-1",
+        seq: 2,
+        eventType: "toolCallRoundDone",
+        payload: {
+          type: "toolCallRoundDone",
+          sessionId: "s1",
+          messageId: "msg-round",
+          fullText: "persisted round",
+          toolCalls: [{ id: "tc-old", name: "read", arguments: "{}" }],
+        },
+        createdAt: 2,
+      },
+      {
+        sessionId: "s1",
+        runId: "run-1",
+        seq: 3,
+        eventType: "toolCallStart",
+        payload: {
+          type: "toolCallStart",
+          sessionId: "s1",
+          toolCallId: "tc-current",
+          toolName: "grep",
+          arguments: "{}",
+        },
+        createdAt: 3,
+      },
+    ]);
+
+    await chatStore.selectSession("s1");
+
+    expect(chatStore.messages).toHaveLength(1);
+    expect(chatStore.messages[0]?.id).toBe("msg-round");
+    expect(chatStore.activeToolCalls).toHaveLength(1);
+    expect(chatStore.activeToolCalls[0]?.id).toBe("tc-current");
   });
 
   it("suppresses stale backend running status after a terminal event", async () => {

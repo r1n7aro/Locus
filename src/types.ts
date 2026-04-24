@@ -1,4 +1,10 @@
-export type SessionRuntimeStatus = "running" | "queued" | "starting" | "error";
+export type SessionRuntimeStatus =
+  | "running"
+  | "queued"
+  | "starting"
+  | "waiting_input"
+  | "cancelling"
+  | "error";
 
 export interface SessionSummary {
   id: string;
@@ -109,6 +115,35 @@ export interface SessionDetail {
   createdAt: number;
   updatedAt: number;
   messages: ChatMessage[];
+}
+
+export type SessionRunStatus =
+  | "queued"
+  | "starting"
+  | "running"
+  | "waiting_input"
+  | "cancelling"
+  | "done"
+  | "cancelled"
+  | "error";
+
+export interface SessionRunSummary {
+  runId: string;
+  sessionId: string;
+  status: SessionRunStatus;
+  startedAt: number;
+  updatedAt: number;
+  finishedAt?: number | null;
+  errorMessage?: string | null;
+}
+
+export interface SessionEventRecord {
+  sessionId: string;
+  runId: string;
+  seq: number;
+  eventType: string;
+  payload: Record<string, unknown>;
+  createdAt: number;
 }
 
 export interface SaveRawContextRequest {
