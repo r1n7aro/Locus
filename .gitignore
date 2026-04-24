@@ -10,6 +10,7 @@ lerna-debug.log*
 # Local workspace caches and artifacts
 .cache/
 .codex/
+.tmp/
 codex-artifacts/
 tmp/
 debug/
