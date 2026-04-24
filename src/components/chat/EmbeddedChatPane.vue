@@ -16,9 +16,12 @@ import RichChatInput from "./RichChatInput.vue";
 import { forwardWheelToElement } from "../../composables/chatWheelPassthrough";
 import {
   captureScrollAnchor,
+  captureLiveScrollAnchor,
   captureSessionScrollState,
   resolveSessionScrollTop,
+  restoreLiveScrollAnchor,
   restoreScrollAnchor,
+  type LiveScrollAnchorSnapshot,
   type SessionScrollState,
 } from "../../composables/chatScrollState";
 import {
@@ -116,6 +119,8 @@ const viewportStates = new Map<string, SessionScrollState>();
 let suppressScrollCapture = false;
 let transcriptResizeObserver: ResizeObserver | null = null;
 const toolHandoffViewportQuiet = ref(false);
+let activeToolViewportAnchor: LiveScrollAnchorSnapshot | null = null;
+let toolViewportAnchorFrame = 0;
 const STREAM_END_SCROLL_SETTLE_MS = 320;
 
 function updateInput(value: string) {
@@ -162,6 +167,81 @@ function runProgrammaticScrollUpdate(update: (el: HTMLElement) => void, key = ge
 
   requestAnimationFrame(() => {
     suppressScrollCapture = false;
+  });
+}
+
+function requestViewportFrame(callback: () => void): number {
+  if (typeof requestAnimationFrame === "function") {
+    return requestAnimationFrame(() => callback());
+  }
+  return window.setTimeout(callback, 16);
+}
+
+function cancelViewportFrame(handle: number) {
+  if (typeof cancelAnimationFrame === "function") {
+    cancelAnimationFrame(handle);
+    return;
+  }
+  window.clearTimeout(handle);
+}
+
+function clearToolViewportAnchorFrame() {
+  if (!toolViewportAnchorFrame) return;
+  cancelViewportFrame(toolViewportAnchorFrame);
+  toolViewportAnchorFrame = 0;
+}
+
+function clearToolViewportAnchor() {
+  clearToolViewportAnchorFrame();
+  activeToolViewportAnchor = null;
+}
+
+function restoreToolViewportAnchor() {
+  const anchorState = activeToolViewportAnchor;
+  const el = getTranscriptElement();
+  if (!anchorState || !el) return false;
+  if (!el.contains(anchorState.anchor)) {
+    clearToolViewportAnchor();
+    return false;
+  }
+
+  suppressScrollCapture = true;
+  const restored = restoreLiveScrollAnchor(el, anchorState);
+  if (restored) {
+    viewportStates.set(getViewportStateKey(), captureViewportState(el));
+  }
+
+  requestViewportFrame(() => {
+    suppressScrollCapture = false;
+  });
+
+  if (!restored) {
+    clearToolViewportAnchor();
+  }
+  return restored;
+}
+
+function handleToolViewportAnchorStart(anchor: HTMLElement) {
+  const el = getTranscriptElement();
+  if (!el || !el.contains(anchor)) return;
+
+  scrollToBottomScheduler.cancel();
+  preserveScrollAnchorScheduler.cancel();
+  streamEndScrollScheduler.cancel();
+  clearToolViewportAnchorFrame();
+  activeToolViewportAnchor = captureLiveScrollAnchor(el, anchor);
+  restoreToolViewportAnchor();
+}
+
+function handleToolViewportAnchorEnd(anchor: HTMLElement) {
+  if (!activeToolViewportAnchor || activeToolViewportAnchor.anchor !== anchor) return;
+
+  restoreToolViewportAnchor();
+  clearToolViewportAnchorFrame();
+  toolViewportAnchorFrame = requestViewportFrame(() => {
+    toolViewportAnchorFrame = 0;
+    restoreToolViewportAnchor();
+    activeToolViewportAnchor = null;
   });
 }
 
@@ -233,6 +313,7 @@ function preserveScrollAnchor() {
 
 function reconcileViewport(forceBottom = false) {
   if (toolHandoffViewportQuiet.value) return;
+  if (restoreToolViewportAnchor()) return;
   const el = getTranscriptElement();
   if (!el) return;
 
@@ -286,6 +367,7 @@ function connectTranscriptResizeObserver() {
 
   transcriptResizeObserver = new ResizeObserver(() => {
     if (suppressScrollCapture || toolHandoffViewportQuiet.value) return;
+    if (restoreToolViewportAnchor()) return;
     reconcileViewport();
   });
 
@@ -306,6 +388,7 @@ const keepBatchToolConfirmLayout = ref(false);
 watch(
   () => props.toolConfirmLayoutKey ?? "",
   (nextKey, previousKey) => {
+    clearToolViewportAnchor();
     toolHandoffViewportQuiet.value = false;
     rememberViewportState(getViewportStateKey(previousKey));
     preserveScrollAnchorScheduler.cancel();
@@ -408,6 +491,7 @@ onUnmounted(() => {
   scrollToBottomScheduler.cancel();
   preserveScrollAnchorScheduler.cancel();
   streamEndScrollScheduler.cancel();
+  clearToolViewportAnchor();
   disconnectTranscriptResizeObserver();
 });
 </script>
@@ -436,6 +520,7 @@ onUnmounted(() => {
     <ChatTranscript
       ref="transcriptRef"
       variant="embedded"
+      :session-key="getViewportStateKey()"
       :messages="messages"
       :streaming-text="streamingText"
       :is-streaming="isStreaming"
@@ -458,6 +543,8 @@ onUnmounted(() => {
       @apply-knowledge-proposal="emit('applyKnowledgeProposal', $event)"
       @ignore-knowledge-proposal="emit('ignoreKnowledgeProposal', $event)"
       @tool-handoff-quiet-change="handleToolHandoffQuietChange"
+      @tool-viewport-anchor-start="handleToolViewportAnchorStart"
+      @tool-viewport-anchor-end="handleToolViewportAnchorEnd"
     />
 
     <div class="embedded-chat-bottom">

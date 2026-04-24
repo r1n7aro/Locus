@@ -8,9 +8,10 @@ import {
 } from "../../composables/chatViewStability";
 import {
   buildMessageToolCalls,
+  cloneToolCallMatchState,
   collectToolCallDisplayIds,
   collectToolCallDisplayMatchState,
-  filterToolCallsByMatchState,
+  filterToolCallsByConsumableMatchState,
   getToolCallInfoFingerprint,
   mergeSequentialAssistantToolCalls,
   mergeToolCallDisplaysWithoutDuplicates,
@@ -85,6 +86,7 @@ const props = withDefaults(defineProps<{
   enableIntentBadges?: boolean;
   showUserImages?: boolean;
   userContentMode?: UserContentMode;
+  sessionKey?: string | null;
 }>(), {
   variant: "embedded",
   hasThinking: undefined,
@@ -102,6 +104,7 @@ const props = withDefaults(defineProps<{
   enableIntentBadges: false,
   showUserImages: false,
   userContentMode: "plain",
+  sessionKey: null,
 });
 
 const emit = defineEmits<{
@@ -114,6 +117,8 @@ const emit = defineEmits<{
   (e: "contentMouseover", event: MouseEvent): void;
   (e: "contentMouseout", event: MouseEvent): void;
   (e: "toolHandoffQuietChange", quiet: boolean): void;
+  (e: "toolViewportAnchorStart", anchor: HTMLElement): void;
+  (e: "toolViewportAnchorEnd", anchor: HTMLElement): void;
 }>();
 
 const scrollRef = ref<HTMLElement | null>(null);
@@ -290,6 +295,15 @@ function clearToolCallHandoff(reason = "clear") {
   toolCallHandoff.value = null;
   setToolCallHandoffQuiet(false);
 }
+
+watch(
+  () => props.sessionKey,
+  (sessionKey, previousSessionKey) => {
+    if (sessionKey === previousSessionKey) return;
+    clearToolCallHandoff("session-key-changed");
+  },
+  { flush: "sync" },
+);
 
 const hasVisibleStreamingText = computed(() => props.streamingText.trim().length > 0);
 const shouldArmToolCallHandoffCollapse = computed(
@@ -509,15 +523,9 @@ const activeToolCallMatchState = computed<ToolCallMatchState>(() => {
   return toolCallHandoff.value?.toolCallMatchState ?? {
     ids: new Set<string>(),
     fingerprintCounts: new Map<string, number>(),
+    idFingerprints: new Map<string, string>(),
   };
 });
-
-function messageToolCallsForDisplay(
-  message: Pick<ChatMessage, "toolCalls">,
-  hiddenToolCallMatchState: ToolCallMatchState,
-) {
-  return filterToolCallsByMatchState(message.toolCalls, hiddenToolCallMatchState);
-}
 
 function toolCallsForRenderItem(item: Pick<MessageRenderItem, "message" | "displayToolCalls">) {
   return buildMessageToolCalls(
@@ -548,6 +556,56 @@ function shouldRenderItem(item: MessageRenderItem) {
     || toolCallsForRenderItem(item).length > 0
     || item.attachedKnowledgeProposals.length > 0
   );
+}
+
+function hasToolCallMatchState(state: ToolCallMatchState) {
+  return state.ids.size > 0 || state.fingerprintCounts.size > 0;
+}
+
+function toolCallMatchEntryCount(state: ToolCallMatchState) {
+  let fingerprintCount = 0;
+  for (const count of state.fingerprintCounts.values()) {
+    fingerprintCount += count;
+  }
+  return state.ids.size + fingerprintCount;
+}
+
+function buildTailHiddenToolCallMap(
+  groups: MessageGroup[],
+  hiddenToolCallMatchState: ToolCallMatchState,
+) {
+  const hiddenToolCallsByItemId = new Map<string, ToolCallInfo[] | undefined>();
+  if (!hasToolCallMatchState(hiddenToolCallMatchState)) return hiddenToolCallsByItemId;
+
+  const tailGroup = groups[groups.length - 1];
+  if (!tailGroup || tailGroup.role !== "assistant") return hiddenToolCallsByItemId;
+
+  const consumableMatchState = cloneToolCallMatchState(hiddenToolCallMatchState);
+  for (let index = tailGroup.items.length - 1; index >= 0; index -= 1) {
+    if (!hasToolCallMatchState(consumableMatchState)) break;
+    const item = tailGroup.items[index];
+    if (
+      !item
+      || item.hidden
+      || item.message.knowledgeProposal
+      || item.message.role !== "assistant"
+      || !item.message.toolCalls
+      || item.message.toolCalls.length === 0
+    ) {
+      continue;
+    }
+
+    const previousMatchEntryCount = toolCallMatchEntryCount(consumableMatchState);
+    const toolCalls = filterToolCallsByConsumableMatchState(
+      item.message.toolCalls,
+      consumableMatchState,
+    );
+    if (toolCallMatchEntryCount(consumableMatchState) !== previousMatchEntryCount) {
+      hiddenToolCallsByItemId.set(item.id, toolCalls);
+    }
+  }
+
+  return hiddenToolCallsByItemId;
 }
 
 function isToolOnlyRenderItem(item: MessageRenderItem) {
@@ -584,23 +642,29 @@ function buildGroupedMessages(hiddenToolCallMatchState: ToolCallMatchState): Mes
     }
   }
 
-  for (const item of flatItems) {
-    if (!item.message.knowledgeProposal) continue;
-    const nextRequestTool = flatItems.find((candidate) =>
-      candidate.order > item.order
-      && !candidate.message.knowledgeProposal
-      && hasKnowledgeMutationToolCall(candidate.message),
-    );
-    const prevRequestTool = [...flatItems].reverse().find((candidate) =>
-      candidate.order < item.order
-      && !candidate.message.knowledgeProposal
-      && hasKnowledgeMutationToolCall(candidate.message),
-    );
-    const target = nextRequestTool ?? prevRequestTool;
-    if (!target) continue;
-    target.attachedKnowledgeProposals.push(item.message);
-    item.hidden = true;
+  for (const group of groups) {
+    if (group.role !== "assistant") continue;
+    for (let index = 0; index < group.items.length; index += 1) {
+      const item = group.items[index];
+      if (!item?.message.knowledgeProposal) continue;
+      const nextRequestTool = group.items.find((candidate, candidateIndex) =>
+        candidateIndex > index
+        && !candidate.message.knowledgeProposal
+        && hasKnowledgeMutationToolCall(candidate.message),
+      );
+      const prevRequestTool = [...group.items].reverse().find((candidate) =>
+        candidate.order < item.order
+        && !candidate.message.knowledgeProposal
+        && hasKnowledgeMutationToolCall(candidate.message),
+      );
+      const target = nextRequestTool ?? prevRequestTool;
+      if (!target) continue;
+      target.attachedKnowledgeProposals.push(item.message);
+      item.hidden = true;
+    }
   }
+
+  const hiddenToolCallsByItemId = buildTailHiddenToolCallMap(groups, hiddenToolCallMatchState);
 
   return groups
     .map((group) => ({
@@ -614,7 +678,9 @@ function buildGroupedMessages(hiddenToolCallMatchState: ToolCallMatchState): Mes
                   ...item,
                   content: item.message.content,
                   thinkingContent: item.message.thinkingContent,
-                  toolCalls: messageToolCallsForDisplay(item.message, hiddenToolCallMatchState),
+                  toolCalls: hiddenToolCallsByItemId.has(item.id)
+                    ? hiddenToolCallsByItemId.get(item.id)
+                    : item.message.toolCalls,
                   attachedKnowledgeProposalCount: item.attachedKnowledgeProposals.length,
                   isKnowledgeProposal: !!item.message.knowledgeProposal,
                 })),
@@ -646,6 +712,7 @@ function emptyPromotedHistoryToolCalls(): PromotedHistoryToolCallsState {
     toolCallMatchState: {
       ids: new Set<string>(),
       fingerprintCounts: new Map<string, number>(),
+      idFingerprints: new Map<string, string>(),
     },
     toolCalls: [],
   };
@@ -886,6 +953,14 @@ function emitContentMouseout(event: MouseEvent) {
   emit("contentMouseout", event);
 }
 
+function emitToolViewportAnchorStart(anchor: HTMLElement) {
+  emit("toolViewportAnchorStart", anchor);
+}
+
+function emitToolViewportAnchorEnd(anchor: HTMLElement) {
+  emit("toolViewportAnchorEnd", anchor);
+}
+
 function openImage(src: string) {
   if (!src) return;
   emit("openImage", src);
@@ -1025,11 +1100,15 @@ function openImage(src: string) {
                       :tool-calls="toolCallsForRenderItem(item)"
                       :allow-collapse="!shouldKeepToolItemExpanded(item.id)"
                       :collapse-enabled="!shouldKeepToolItemExpanded(item.id)"
+                      @viewport-anchor-start="emitToolViewportAnchorStart"
+                      @viewport-anchor-end="emitToolViewportAnchorEnd"
                     >
                       <template #default="{ toolCall }">
                         <ToolCallBlock
                           :tool-call="toolCall"
                           :collapse-enabled="!shouldKeepToolItemExpanded(item.id)"
+                          @tool-viewport-anchor-start="emitToolViewportAnchorStart"
+                          @tool-viewport-anchor-end="emitToolViewportAnchorEnd"
                         />
                       </template>
                     </ToolCallCollection>
@@ -1109,9 +1188,16 @@ function openImage(src: string) {
                 :allow-collapse="transientToolCallsAllowCollapse"
                 :collapse-enabled="transientToolCallsCollapseEnabled"
                 @collapse-finished="onTransientToolCallsCollapseFinished"
+                @viewport-anchor-start="emitToolViewportAnchorStart"
+                @viewport-anchor-end="emitToolViewportAnchorEnd"
               >
                 <template #default="{ toolCall }">
-                  <ToolCallBlock :tool-call="toolCall" :collapse-enabled="transientToolCallsCollapseEnabled" />
+                  <ToolCallBlock
+                    :tool-call="toolCall"
+                    :collapse-enabled="transientToolCallsCollapseEnabled"
+                    @tool-viewport-anchor-start="emitToolViewportAnchorStart"
+                    @tool-viewport-anchor-end="emitToolViewportAnchorEnd"
+                  />
                 </template>
               </ToolCallCollection>
             </div>

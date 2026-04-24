@@ -122,8 +122,10 @@ describe("chat sidebar layout", () => {
     expect(transcript).toContain(":allow-collapse=\"!shouldKeepToolItemExpanded(item.id)\"");
     expect(transcript).toContain(":collapse-enabled=\"!shouldKeepToolItemExpanded(item.id)\"");
     expect(toolBlock).toContain("collapseEnabled?: boolean;");
-    expect(toolBlock).toContain("<ToolCallCollection :tool-calls=\"toolCall.nestedToolCalls\" :collapse-enabled=\"collapseEnabled\">");
-    expect(toolBlock).toContain("<ToolCallBlock :tool-call=\"nestedToolCall\" :collapse-enabled=\"collapseEnabled\" />");
+    expect(toolBlock).toContain(":tool-calls=\"toolCall.nestedToolCalls\"");
+    expect(toolBlock).toContain(":collapse-enabled=\"collapseEnabled\"");
+    expect(toolBlock).toContain("@viewport-anchor-start=\"emitToolViewportAnchorStart\"");
+    expect(toolBlock).toContain("@tool-viewport-anchor-start=\"emitToolViewportAnchorStart\"");
     expect(toolCollection).toContain("collapseEnabled?: boolean;");
     expect(toolCollection).toContain("props.allowCollapse && props.collapseEnabled");
   });
@@ -142,7 +144,10 @@ describe("chat sidebar layout", () => {
     expect(transcript).toContain("return mergeToolCallMatchStates(");
     expect(transcript).toContain("const groupedMessages = computed<MessageGroup[]>(() => buildGroupedMessages(historyHiddenToolCallMatchState.value));");
     expect(transcript).toContain("toolCallTreeHasAnyIds(message.toolCalls, toolCallHandoff.value!.toolCallMatchState)");
-    expect(transcript).toContain("return filterToolCallsByMatchState(message.toolCalls, hiddenToolCallMatchState);");
+    expect(transcript).toContain("function buildTailHiddenToolCallMap(");
+    expect(transcript).toContain("filterToolCallsByConsumableMatchState(");
+    expect(transcript).toContain("cloneToolCallMatchState(hiddenToolCallMatchState)");
+    expect(chatView).toContain(":session-key=\"activeSessionId || NEW_CHAT_DRAFT_KEY\"");
     expect(transcript).toContain("function shouldKeepToolItemExpanded(itemId: string) {");
     expect(transcript).toContain("return nonCollapsibleToolItemIds.value.has(itemId);");
     expect(transcript).toContain("if (toolCallHandoff.value?.collapseArmed) {");
@@ -172,5 +177,14 @@ describe("chat sidebar layout", () => {
     expect(transcript).toContain("margin-top: -8px;");
     expect(transcript).toContain(".chat-transcript-item-stack.is-embedded.tool-only-followup {");
     expect(transcript).toContain("margin-top: -6px;");
+  });
+
+  it("attaches knowledge proposals only inside their assistant message group", () => {
+    const transcript = read("src/components/chat/ChatTranscript.vue");
+
+    expect(transcript).toContain("for (const group of groups) {");
+    expect(transcript).toContain("if (group.role !== \"assistant\") continue;");
+    expect(transcript).toContain("const nextRequestTool = group.items.find(");
+    expect(transcript).toContain("const prevRequestTool = [...group.items].reverse().find(");
   });
 });

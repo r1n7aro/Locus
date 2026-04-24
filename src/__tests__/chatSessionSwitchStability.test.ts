@@ -9,18 +9,19 @@ function read(relPath: string) {
 }
 
 describe("chat session switch stability", () => {
-  it("hides the transcript until session scroll restoration completes", () => {
+  it("keeps the transcript visible while waiting for the target session messages", () => {
     const chatView = read("src/components/ChatView.vue");
 
-    expect(chatView).toContain("const isRestoringSessionView = ref(false)");
-    expect(chatView).toContain("let sessionRestoreRevealFrame = 0;");
-    expect(chatView).toContain("clearSessionRestoreRevealFrame()");
+    expect(chatView).toContain("function isPendingSessionRestoreAwaitingMessages()");
+    expect(chatView).toContain("if (isPendingSessionRestoreAwaitingMessages()) return;");
+    expect(chatView).toContain("function finishPendingSessionRestore(targetSessionId: string)");
     expect(chatView).toContain("const shouldRestoreImmediately = !!nextSessionId && previousSessionId === null && !showWelcomeState.value;");
-    expect(chatView).toContain("isRestoringSessionView.value = !!nextSessionId && !shouldRestoreImmediately;");
+    expect(chatView).toContain("scrollToBottomScheduler.cancel();");
+    expect(chatView).toContain("pendingRestoreMessagesRef.value = nextSessionId && !shouldRestoreImmediately ? props.messages : null;");
     expect(chatView).toContain("if (shouldRestoreImmediately) {");
+    expect(chatView).toContain("restorePendingSessionScroll({ defer: true });");
     expect(chatView).toContain("restorePendingSessionScroll();");
-    expect(chatView).toContain(":class=\"{ 'chat-transcript-restoring': isRestoringSessionView }\"");
-    expect(chatView).toContain(".chat-transcript-scroll.chat-transcript-restoring");
-    expect(chatView).toContain("visibility: hidden;");
+    expect(chatView).not.toContain("chat-transcript-restoring");
+    expect(chatView).not.toContain("visibility: hidden;");
   });
 });

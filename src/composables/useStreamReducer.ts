@@ -42,6 +42,21 @@ export type StreamMutation =
   | { type: "setStreaming"; value: boolean }
   | { type: "canvasAutoOpen"; toolCallId: string; spec: unknown };
 
+export function buildToolResultMessages(
+  activeToolCalls: ToolCallDisplay[],
+  createdAt = Date.now() / 1000,
+): ChatMessage[] {
+  return activeToolCalls
+    .filter((toolCall) => toolCall.output !== undefined)
+    .map((toolCall): ChatMessage => ({
+      id: `tool_result_${toolCall.id}`,
+      role: "tool",
+      content: toolCall.output ?? "",
+      createdAt,
+      toolCallId: toolCall.id,
+    }));
+}
+
 export function reduceStreamEvent(state: StreamState, event: StreamEvent): StreamMutation[] {
   const mutations: StreamMutation[] = [];
 

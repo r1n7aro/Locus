@@ -25,9 +25,12 @@ import { useChatStore } from "../stores/chat";
 import { useUiStore } from "../stores/ui";
 import {
   captureScrollAnchor,
+  captureLiveScrollAnchor,
   captureSessionScrollState,
   resolveSessionScrollTop,
+  restoreLiveScrollAnchor,
   restoreScrollAnchor,
+  type LiveScrollAnchorSnapshot,
 } from "../composables/chatScrollState";
 import {
   createCoalescedScrollScheduler,
@@ -409,13 +412,13 @@ const showWelcomeState = computed(
 
 const pendingRestoreSessionId = ref<string | null>(null);
 const pendingRestoreMessagesRef = ref<ChatMessage[] | null>(null);
-const isRestoringSessionView = ref(false);
 const toolHandoffViewportQuiet = ref(false);
 let suppressScrollCapture = false;
+let activeToolViewportAnchor: LiveScrollAnchorSnapshot | null = null;
+let toolViewportAnchorFrame = 0;
 const displayedStreamingText = ref("");
 let pendingStreamingText = "";
 let streamingTextFlushTimer: ReturnType<typeof setTimeout> | null = null;
-let sessionRestoreRevealFrame = 0;
 const STREAMING_TEXT_RENDER_DELAY_MS = 80;
 const STREAM_END_SCROLL_SETTLE_MS = 320;
 
@@ -423,12 +426,6 @@ function clearStreamingTextFlushTimer() {
   if (!streamingTextFlushTimer) return;
   clearTimeout(streamingTextFlushTimer);
   streamingTextFlushTimer = null;
-}
-
-function clearSessionRestoreRevealFrame() {
-  if (!sessionRestoreRevealFrame) return;
-  cancelAnimationFrame(sessionRestoreRevealFrame);
-  sessionRestoreRevealFrame = 0;
 }
 
 function flushDisplayedStreamingText() {
@@ -528,6 +525,81 @@ function runProgrammaticScrollUpdate(
   });
 }
 
+function requestViewportFrame(callback: () => void): number {
+  if (typeof requestAnimationFrame === "function") {
+    return requestAnimationFrame(() => callback());
+  }
+  return window.setTimeout(callback, 16);
+}
+
+function cancelViewportFrame(handle: number) {
+  if (typeof cancelAnimationFrame === "function") {
+    cancelAnimationFrame(handle);
+    return;
+  }
+  window.clearTimeout(handle);
+}
+
+function clearToolViewportAnchorFrame() {
+  if (!toolViewportAnchorFrame) return;
+  cancelViewportFrame(toolViewportAnchorFrame);
+  toolViewportAnchorFrame = 0;
+}
+
+function clearToolViewportAnchor() {
+  clearToolViewportAnchorFrame();
+  activeToolViewportAnchor = null;
+}
+
+function restoreToolViewportAnchor() {
+  const anchorState = activeToolViewportAnchor;
+  const el = getMessagesElement();
+  if (!anchorState || !el) return false;
+  if (!el.contains(anchorState.anchor)) {
+    clearToolViewportAnchor();
+    return false;
+  }
+
+  suppressScrollCapture = true;
+  const restored = restoreLiveScrollAnchor(el, anchorState);
+  if (restored && props.activeSessionId) {
+    chatStore.rememberSessionScrollState(props.activeSessionId, captureCurrentSessionScrollState(el));
+  }
+
+  requestViewportFrame(() => {
+    suppressScrollCapture = false;
+  });
+
+  if (!restored) {
+    clearToolViewportAnchor();
+  }
+  return restored;
+}
+
+function handleToolViewportAnchorStart(anchor: HTMLElement) {
+  const el = getMessagesElement();
+  if (!el || !el.contains(anchor)) return;
+
+  scrollToBottomScheduler.cancel();
+  preserveScrollAnchorScheduler.cancel();
+  streamEndScrollScheduler.cancel();
+  clearToolViewportAnchorFrame();
+  activeToolViewportAnchor = captureLiveScrollAnchor(el, anchor);
+  restoreToolViewportAnchor();
+}
+
+function handleToolViewportAnchorEnd(anchor: HTMLElement) {
+  if (!activeToolViewportAnchor || activeToolViewportAnchor.anchor !== anchor) return;
+
+  restoreToolViewportAnchor();
+  clearToolViewportAnchorFrame();
+  toolViewportAnchorFrame = requestViewportFrame(() => {
+    toolViewportAnchorFrame = 0;
+    restoreToolViewportAnchor();
+    activeToolViewportAnchor = null;
+  });
+}
+
 function setMessagesScrollTop(scrollTop: number, sessionId: string | null = props.activeSessionId) {
   runProgrammaticScrollUpdate((el) => {
     el.scrollTop = scrollTop;
@@ -549,7 +621,16 @@ function restoreMessagesScrollState(
   }, sessionId);
 }
 
+function isPendingSessionRestoreAwaitingMessages() {
+  const targetSessionId = pendingRestoreSessionId.value;
+  return !!targetSessionId
+    && targetSessionId === props.activeSessionId
+    && pendingRestoreMessagesRef.value === props.messages;
+}
+
 function scrollToBottomNow(force = false) {
+  if (isPendingSessionRestoreAwaitingMessages()) return;
+
   const el = getMessagesElement();
   if (!el) return;
 
@@ -570,6 +651,8 @@ const scrollToBottomScheduler = createCoalescedScrollScheduler((force) => {
 
 const preserveScrollAnchorScheduler = createCoalescedScrollScheduler(() => {
   nextTick(() => {
+    if (isPendingSessionRestoreAwaitingMessages()) return;
+
     const sessionId = props.activeSessionId;
     const remembered = sessionId ? chatStore.getSessionScrollState(sessionId) : null;
     if (!remembered || remembered.mode === "bottom") return;
@@ -613,6 +696,7 @@ watch(toolHandoffViewportQuiet, (quiet, previousQuiet) => {
 
 function reconcileViewport(forceBottom = false) {
   if (toolHandoffViewportQuiet.value) return;
+  if (restoreToolViewportAnchor()) return;
   if (pendingRestoreSessionId.value && pendingRestoreSessionId.value === props.activeSessionId) {
     restorePendingSessionScroll();
     return;
@@ -645,26 +729,32 @@ function settleStreamEndScroll() {
   streamEndScrollScheduler.schedule();
 }
 
-function restorePendingSessionScroll() {
+function finishPendingSessionRestore(targetSessionId: string) {
+  if (pendingRestoreSessionId.value !== targetSessionId || props.activeSessionId !== targetSessionId) return;
+  pendingRestoreSessionId.value = null;
+  pendingRestoreMessagesRef.value = null;
+}
+
+function restorePendingSessionScroll(options: { defer?: boolean } = {}) {
   const targetSessionId = pendingRestoreSessionId.value;
   if (!targetSessionId || targetSessionId !== props.activeSessionId) return;
+  if (isPendingSessionRestoreAwaitingMessages()) return;
 
-  clearSessionRestoreRevealFrame();
-  nextTick(() => {
+  const restore = () => {
     const el = getMessagesElement();
     if (!el || pendingRestoreSessionId.value !== props.activeSessionId) return;
 
     const remembered = chatStore.getSessionScrollState(targetSessionId);
     restoreMessagesScrollState(remembered, targetSessionId);
+    finishPendingSessionRestore(targetSessionId);
+  };
 
-    sessionRestoreRevealFrame = requestAnimationFrame(() => {
-      sessionRestoreRevealFrame = 0;
-      if (pendingRestoreSessionId.value !== targetSessionId || props.activeSessionId !== targetSessionId) return;
-      isRestoringSessionView.value = false;
-      pendingRestoreSessionId.value = null;
-      pendingRestoreMessagesRef.value = null;
-    });
-  });
+  if (options.defer) {
+    nextTick(restore);
+    return;
+  }
+
+  restore();
 }
 
 function onMessagesScroll() {
@@ -694,6 +784,7 @@ function connectTranscriptResizeObserver() {
 
   transcriptResizeObserver = new ResizeObserver(() => {
     if (suppressScrollCapture || toolHandoffViewportQuiet.value) return;
+    if (restoreToolViewportAnchor()) return;
     if (pendingRestoreSessionId.value && pendingRestoreSessionId.value === props.activeSessionId) {
       restorePendingSessionScroll();
       return;
@@ -712,6 +803,8 @@ function connectTranscriptResizeObserver() {
 watch(
   () => props.activeSessionId,
   (nextSessionId, previousSessionId) => {
+    clearToolViewportAnchor();
+    scrollToBottomScheduler.cancel();
     streamEndScrollScheduler.cancel();
     preserveScrollAnchorScheduler.cancel();
     toolHandoffViewportQuiet.value = false;
@@ -719,14 +812,12 @@ watch(
       rememberScrollForSession(previousSessionId);
     }
 
-    pendingRestoreSessionId.value = nextSessionId;
-    pendingRestoreMessagesRef.value = props.messages;
     const shouldRestoreImmediately = !!nextSessionId && previousSessionId === null && !showWelcomeState.value;
-    isRestoringSessionView.value = !!nextSessionId && !shouldRestoreImmediately;
-    clearSessionRestoreRevealFrame();
+    pendingRestoreSessionId.value = nextSessionId;
+    pendingRestoreMessagesRef.value = nextSessionId && !shouldRestoreImmediately ? props.messages : null;
     void restoreComposerDraft(nextSessionId ?? null);
     if (shouldRestoreImmediately) {
-      restorePendingSessionScroll();
+      restorePendingSessionScroll({ defer: true });
     }
   },
   { flush: "sync" },
@@ -737,7 +828,6 @@ watch(
   (messages) => {
     if (!pendingRestoreSessionId.value || pendingRestoreSessionId.value !== props.activeSessionId) return;
     if (messages === pendingRestoreMessagesRef.value) return;
-    isRestoringSessionView.value = true;
     restorePendingSessionScroll();
   },
   { flush: "post" },
@@ -900,8 +990,8 @@ onUnmounted(() => {
   scrollToBottomScheduler.cancel();
   preserveScrollAnchorScheduler.cancel();
   streamEndScrollScheduler.cancel();
+  clearToolViewportAnchor();
   clearStreamingTextFlushTimer();
-  clearSessionRestoreRevealFrame();
   disconnectTranscriptResizeObserver();
   document.removeEventListener("mousemove", onSessionSplitterMouseMove);
   document.removeEventListener("mouseup", onSessionSplitterMouseUp);
@@ -1012,8 +1102,8 @@ onUnmounted(() => {
       <div class="chat-main">
         <ChatTranscript
           ref="transcriptRef"
-          :class="{ 'chat-transcript-restoring': isRestoringSessionView }"
           variant="session"
+          :session-key="activeSessionId || NEW_CHAT_DRAFT_KEY"
           :messages="messages"
           :streaming-text="displayedStreamingText"
           :is-streaming="isStreaming"
@@ -1040,6 +1130,8 @@ onUnmounted(() => {
           @apply-knowledge-proposal="chatStore.applyKnowledgeProposal"
           @ignore-knowledge-proposal="chatStore.ignoreKnowledgeProposal"
           @tool-handoff-quiet-change="handleToolHandoffQuietChange"
+          @tool-viewport-anchor-start="handleToolViewportAnchorStart"
+          @tool-viewport-anchor-end="handleToolViewportAnchorEnd"
         >
         </ChatTranscript>
         <div v-if="showWelcomeState" class="chat-empty-overlay">
@@ -1529,10 +1621,6 @@ onUnmounted(() => {
   position: relative;
   background: var(--msg-assistant-bg);
   contain: layout paint;
-}
-
-:deep(.chat-transcript-scroll.chat-transcript-restoring) {
-  visibility: hidden;
 }
 
 .chat-main {

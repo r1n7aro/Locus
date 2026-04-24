@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { reduceStreamEvent, type StreamState } from "../composables/useStreamReducer";
+import { buildToolResultMessages, reduceStreamEvent, type StreamState } from "../composables/useStreamReducer";
 import type { StreamEvent, ToolCallDisplay } from "../types";
 
 function makeState(overrides?: Partial<StreamState>): StreamState {
@@ -33,6 +33,34 @@ function makeState(overrides?: Partial<StreamState>): StreamState {
 }
 
 describe("reduceStreamEvent", () => {
+  describe("buildToolResultMessages", () => {
+    it("materializes completed tool outputs as hidden tool result messages", () => {
+      expect(buildToolResultMessages([
+        {
+          id: "tc-1",
+          name: "read",
+          arguments: "{}",
+          status: "done",
+          output: "file contents",
+        },
+        {
+          id: "tc-2",
+          name: "grep",
+          arguments: "{}",
+          status: "running",
+        },
+      ], 123)).toEqual([
+        {
+          id: "tool_result_tc-1",
+          role: "tool",
+          content: "file contents",
+          createdAt: 123,
+          toolCallId: "tc-1",
+        },
+      ]);
+    });
+  });
+
   describe("textDelta", () => {
     it("appends text without auto-activating streaming (streaming controlled by chat store)", () => {
       const state = makeState();

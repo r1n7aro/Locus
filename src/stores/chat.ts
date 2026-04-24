@@ -7,7 +7,7 @@ import { normalizeAppError } from "../services/errors";
 import { getToolPermissionMode, saveToolPermissionMode } from "../services/permissions";
 import * as sessionService from "../services/session";
 import * as undoService from "../services/undo";
-import { reduceStreamEvent, type StreamMutation } from "../composables/useStreamReducer";
+import { buildToolResultMessages, reduceStreamEvent, type StreamMutation } from "../composables/useStreamReducer";
 import { hydrateChatMessagesIntent } from "../composables/chatInputIntents";
 import type { SessionScrollState } from "../composables/chatScrollState";
 import { t } from "../i18n";
@@ -550,17 +550,7 @@ export const useChatStore = defineStore("chat", () => {
           toolCallCount: activeToolCalls.value.length,
           toolCallIds: activeToolCalls.value.map((toolCall) => toolCall.id),
         });
-        for (const tc of activeToolCalls.value) {
-          if (tc.output !== undefined) {
-            messages.value.push({
-              id: `tool_result_${tc.id}`,
-              role: "tool",
-              content: tc.output,
-              createdAt: Date.now() / 1000,
-              toolCallId: tc.id,
-            });
-          }
-        }
+        messages.value.push(...buildToolResultMessages(activeToolCalls.value));
         break;
       case "resetRound":
         logToolCollapseTrace("chat-store", "resetRound", {

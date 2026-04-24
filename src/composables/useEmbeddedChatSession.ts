@@ -13,7 +13,12 @@ import {
 import { t } from "../i18n";
 import { normalizeAppError } from "../services/errors";
 import * as sessionService from "../services/session";
-import { reduceStreamEvent, type StreamMutation, type StreamState } from "./useStreamReducer";
+import {
+  buildToolResultMessages,
+  reduceStreamEvent,
+  type StreamMutation,
+  type StreamState,
+} from "./useStreamReducer";
 import type {
   ChatMessage,
   EffortLevel,
@@ -226,6 +231,8 @@ function applyMutation(state: EmbeddedChatState, mutation: StreamMutation) {
       state.isStreaming = mutation.value;
       break;
     case "pushToolResults":
+      state.messages.push(...buildToolResultMessages(state.activeToolCalls));
+      break;
     case "setTodos":
     case "addUndoable":
     case "canvasAutoOpen":

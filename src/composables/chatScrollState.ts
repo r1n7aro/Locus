@@ -10,6 +10,12 @@ export interface ScrollAnchorSnapshot {
   fallbackScrollTop: number;
 }
 
+export interface LiveScrollAnchorSnapshot {
+  anchor: HTMLElement;
+  offsetTop: number;
+  fallbackScrollTop: number;
+}
+
 export type SessionScrollState =
   | { mode: "bottom" }
   | { mode: "anchor"; anchorId: string; offsetTop: number; fallbackScrollTop: number }
@@ -110,6 +116,45 @@ export function restoreScrollAnchor(
 
   const containerRect = container.getBoundingClientRect();
   const anchorRect = anchor.getBoundingClientRect();
+  const delta = (anchorRect.top - containerRect.top) - state.offsetTop;
+  if (Math.abs(delta) < 0.5) return true;
+
+  const maxScrollTop = Math.max(0, container.scrollHeight - container.clientHeight);
+  const nextScrollTop = Math.max(0, Math.min(maxScrollTop, container.scrollTop + delta));
+  if (nextScrollTop === container.scrollTop) return true;
+
+  container.scrollTop = nextScrollTop;
+  return true;
+}
+
+export function captureLiveScrollAnchor(
+  container: Pick<HTMLElement, "scrollTop" | "getBoundingClientRect"> & Partial<Pick<HTMLElement, "contains">>,
+  anchor: HTMLElement | null | undefined,
+): LiveScrollAnchorSnapshot | null {
+  if (!anchor) return null;
+  if (container.contains && !container.contains(anchor)) return null;
+
+  const containerRect = container.getBoundingClientRect();
+  const anchorRect = anchor.getBoundingClientRect();
+  return {
+    anchor,
+    offsetTop: anchorRect.top - containerRect.top,
+    fallbackScrollTop: Math.max(0, container.scrollTop),
+  };
+}
+
+export function restoreLiveScrollAnchor(
+  container: Pick<
+    HTMLElement,
+    "scrollTop" | "scrollHeight" | "clientHeight" | "getBoundingClientRect"
+  > & Partial<Pick<HTMLElement, "contains">>,
+  state: LiveScrollAnchorSnapshot | null | undefined,
+): boolean {
+  if (!state?.anchor) return false;
+  if (container.contains && !container.contains(state.anchor)) return false;
+
+  const containerRect = container.getBoundingClientRect();
+  const anchorRect = state.anchor.getBoundingClientRect();
   const delta = (anchorRect.top - containerRect.top) - state.offsetTop;
   if (Math.abs(delta) < 0.5) return true;
 

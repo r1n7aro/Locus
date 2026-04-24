@@ -16,6 +16,7 @@ describe("EmbeddedChatPane contract", () => {
     const knowledgePane = read("src/components/knowledge/KnowledgeChatPane.vue");
     const transcript = read("src/components/chat/ChatTranscript.vue");
     const chatView = read("src/components/ChatView.vue");
+    const embeddedSession = read("src/composables/useEmbeddedChatSession.ts");
 
     expect(inputShell).toContain('<slot name="top-start" />');
     expect(inputShell).toContain('<slot name="top-end" />');
@@ -39,6 +40,8 @@ describe("EmbeddedChatPane contract", () => {
     expect(pane).toContain("watch(() => props.activeToolCalls, () => reconcileViewport(), { deep: true });");
     expect(pane).toContain("@tool-handoff-quiet-change=\"handleToolHandoffQuietChange\"");
     expect(pane).toContain("@scroll=\"handleTranscriptScroll\"");
+    expect(pane).toContain(":session-key=\"getViewportStateKey()\"");
+    expect(embeddedSession).toContain("buildToolResultMessages(state.activeToolCalls)");
     expect(pane).toContain("<AskUserCard");
     expect(pane).toContain("<ToolConfirmCard");
     expect(pane).toContain('class="embedded-chat-pane"');

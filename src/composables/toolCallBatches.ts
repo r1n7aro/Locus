@@ -40,6 +40,7 @@ const PATH_LIKE_ARGUMENT_KEYS = new Set([
 export interface ToolCallMatchState {
   ids: Set<string>;
   fingerprintCounts: Map<string, number>;
+  idFingerprints: Map<string, string>;
 }
 
 export interface ToolCallBatchState {
@@ -203,11 +204,14 @@ export function collectToolCallDisplayIds(toolCalls: ToolCallDisplay[]): Set<str
 export function collectToolCallDisplayMatchState(toolCalls: ToolCallDisplay[]): ToolCallMatchState {
   const ids = new Set<string>();
   const fingerprintCounts = new Map<string, number>();
+  const idFingerprints = new Map<string, string>();
 
   const visit = (items: ToolCallDisplay[]) => {
     for (const toolCall of items) {
+      const fingerprint = getToolCallDisplayFingerprint(toolCall);
       ids.add(toolCall.id);
-      incrementCount(fingerprintCounts, getToolCallDisplayFingerprint(toolCall));
+      idFingerprints.set(toolCall.id, fingerprint);
+      incrementCount(fingerprintCounts, fingerprint);
       if (toolCall.nestedToolCalls && toolCall.nestedToolCalls.length > 0) {
         visit(toolCall.nestedToolCalls);
       }
@@ -215,62 +219,110 @@ export function collectToolCallDisplayMatchState(toolCalls: ToolCallDisplay[]): 
   };
 
   visit(toolCalls);
-  return { ids, fingerprintCounts };
+  return { ids, fingerprintCounts, idFingerprints };
 }
 
 export function mergeToolCallMatchStates(...states: ToolCallMatchState[]): ToolCallMatchState {
   const ids = new Set<string>();
   const fingerprintCounts = new Map<string, number>();
+  const idFingerprints = new Map<string, string>();
 
   for (const state of states) {
     for (const id of state.ids) {
       ids.add(id);
+    }
+    for (const [id, fingerprint] of state.idFingerprints) {
+      idFingerprints.set(id, fingerprint);
     }
     for (const [fingerprint, count] of state.fingerprintCounts) {
       fingerprintCounts.set(fingerprint, (fingerprintCounts.get(fingerprint) ?? 0) + count);
     }
   }
 
-  return { ids, fingerprintCounts };
+  return { ids, fingerprintCounts, idFingerprints };
 }
 
-function cloneMatchState(state: ToolCallMatchState): ToolCallMatchState {
+export function cloneToolCallMatchState(state: ToolCallMatchState): ToolCallMatchState {
   return {
     ids: new Set(state.ids),
     fingerprintCounts: new Map(state.fingerprintCounts),
+    idFingerprints: new Map(state.idFingerprints),
   };
+}
+
+function consumeFingerprintMatch(state: ToolCallMatchState, fingerprint: string): boolean {
+  const remaining = state.fingerprintCounts.get(fingerprint) ?? 0;
+  if (remaining <= 0) return false;
+  if (remaining === 1) {
+    state.fingerprintCounts.delete(fingerprint);
+  } else {
+    state.fingerprintCounts.set(fingerprint, remaining - 1);
+  }
+  return true;
+}
+
+function consumeIdMatch(state: ToolCallMatchState, id: string, fallbackFingerprint: string): boolean {
+  if (!state.ids.has(id)) return false;
+  const fingerprint = state.idFingerprints.get(id) ?? fallbackFingerprint;
+  state.ids.delete(id);
+  state.idFingerprints.delete(id);
+  consumeFingerprintMatch(state, fingerprint);
+  return true;
+}
+
+function consumeFingerprintAndOneId(state: ToolCallMatchState, fingerprint: string): boolean {
+  if (!consumeFingerprintMatch(state, fingerprint)) return false;
+  for (const [id, storedFingerprint] of state.idFingerprints) {
+    if (storedFingerprint !== fingerprint) continue;
+    state.ids.delete(id);
+    state.idFingerprints.delete(id);
+    break;
+  }
+  return true;
+}
+
+function consumeInfoTreeMatchState(toolCall: ToolCallInfo, state: ToolCallMatchState) {
+  const fingerprint = getToolCallInfoFingerprint(toolCall);
+  if (!consumeIdMatch(state, toolCall.id, fingerprint)) {
+    consumeFingerprintAndOneId(state, fingerprint);
+  }
+  for (const nestedToolCall of toolCall.nestedToolCalls ?? []) {
+    consumeInfoTreeMatchState(nestedToolCall, state);
+  }
+}
+
+function consumeDisplayTreeMatchState(toolCall: ToolCallDisplay, state: ToolCallMatchState) {
+  const fingerprint = getToolCallDisplayFingerprint(toolCall);
+  if (!consumeIdMatch(state, toolCall.id, fingerprint)) {
+    consumeFingerprintAndOneId(state, fingerprint);
+  }
+  for (const nestedToolCall of toolCall.nestedToolCalls ?? []) {
+    consumeDisplayTreeMatchState(nestedToolCall, state);
+  }
 }
 
 function consumeInfoMatch(
   toolCall: ToolCallInfo,
   state: ToolCallMatchState,
 ): boolean {
-  if (state.ids.has(toolCall.id)) return true;
   const fingerprint = getToolCallInfoFingerprint(toolCall);
-  const remaining = state.fingerprintCounts.get(fingerprint) ?? 0;
-  if (remaining <= 0) return false;
-  if (remaining === 1) {
-    state.fingerprintCounts.delete(fingerprint);
-  } else {
-    state.fingerprintCounts.set(fingerprint, remaining - 1);
+  if (state.ids.has(toolCall.id) || (state.fingerprintCounts.get(fingerprint) ?? 0) > 0) {
+    consumeInfoTreeMatchState(toolCall, state);
+    return true;
   }
-  return true;
+  return false;
 }
 
 function consumeDisplayMatch(
   toolCall: ToolCallDisplay,
   state: ToolCallMatchState,
 ): boolean {
-  if (state.ids.has(toolCall.id)) return true;
   const fingerprint = getToolCallDisplayFingerprint(toolCall);
-  const remaining = state.fingerprintCounts.get(fingerprint) ?? 0;
-  if (remaining <= 0) return false;
-  if (remaining === 1) {
-    state.fingerprintCounts.delete(fingerprint);
-  } else {
-    state.fingerprintCounts.set(fingerprint, remaining - 1);
+  if (state.ids.has(toolCall.id) || (state.fingerprintCounts.get(fingerprint) ?? 0) > 0) {
+    consumeDisplayTreeMatchState(toolCall, state);
+    return true;
   }
-  return true;
+  return false;
 }
 
 function filterToolCallInfoArray(
@@ -311,7 +363,18 @@ export function filterToolCallsByMatchState(
   if (!toolCalls || toolCalls.length === 0) return undefined;
   if (hiddenState.ids.size === 0 && hiddenState.fingerprintCounts.size === 0) return [...toolCalls];
 
-  const filtered = filterToolCallInfoArray(toolCalls, cloneMatchState(hiddenState));
+  const filtered = filterToolCallInfoArray(toolCalls, cloneToolCallMatchState(hiddenState));
+  return filtered.length > 0 ? filtered : undefined;
+}
+
+export function filterToolCallsByConsumableMatchState(
+  toolCalls: ToolCallInfo[] | undefined,
+  hiddenState: ToolCallMatchState,
+): ToolCallInfo[] | undefined {
+  if (!toolCalls || toolCalls.length === 0) return undefined;
+  if (hiddenState.ids.size === 0 && hiddenState.fingerprintCounts.size === 0) return [...toolCalls];
+
+  const filtered = filterToolCallInfoArray(toolCalls, hiddenState);
   return filtered.length > 0 ? filtered : undefined;
 }
 
@@ -324,7 +387,7 @@ export function mergeToolCallDisplaysWithoutDuplicates(
 
   const result = [...primary];
   const primaryState = collectToolCallDisplayMatchState(primary);
-  const remainingState = cloneMatchState(primaryState);
+  const remainingState = cloneToolCallMatchState(primaryState);
 
   for (const toolCall of secondary) {
     if (consumeDisplayMatch(toolCall, remainingState)) continue;
@@ -477,8 +540,6 @@ export function summarizeToolCallBatch(
     canCollapse:
       compactEnabled
       && total >= 2
-      && runningCount === 0
-      && errorCount === 0
-      && interruptedCount === 0,
+      && runningCount === 0,
   };
 }

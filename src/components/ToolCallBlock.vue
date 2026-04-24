@@ -18,8 +18,14 @@ const props = withDefaults(defineProps<{
 }>(), {
   collapseEnabled: true,
 });
+const emit = defineEmits<{
+  (e: "toolViewportAnchorStart", anchor: HTMLElement): void;
+  (e: "toolViewportAnchorEnd", anchor: HTMLElement): void;
+}>();
 
 const expanded = ref(props.toolCall.name === "explore" || props.toolCall.name === "task");
+const rootRef = ref<HTMLElement | null>(null);
+const headerRef = ref<HTMLElement | null>(null);
 const outputPre = ref<HTMLPreElement | null>(null);
 
 watch(
@@ -41,6 +47,34 @@ const isSubagentTool = computed(() => {
 });
 
 const isCanvasTool = computed(() => props.toolCall.name === "canvas");
+
+function runOnNextFrame(callback: () => void) {
+  if (typeof requestAnimationFrame === "function") {
+    requestAnimationFrame(() => callback());
+    return;
+  }
+  setTimeout(callback, 16);
+}
+
+function emitToolViewportAnchorStart(anchor: HTMLElement) {
+  emit("toolViewportAnchorStart", anchor);
+}
+
+function emitToolViewportAnchorEnd(anchor: HTMLElement) {
+  emit("toolViewportAnchorEnd", anchor);
+}
+
+function toggleExpanded() {
+  const anchor = headerRef.value ?? rootRef.value;
+  if (anchor) emitToolViewportAnchorStart(anchor);
+  expanded.value = !expanded.value;
+
+  if (anchor) {
+    nextTick(() => {
+      runOnNextFrame(() => emitToolViewportAnchorEnd(anchor));
+    });
+  }
+}
 
 const canvasInfo = computed(() => {
   if (!isCanvasTool.value) return null;
@@ -382,8 +416,8 @@ const highlightedOutput = computed(() => {
 </script>
 
 <template>
-  <div class="tool-call-block" :class="toolCall.status">
-    <div class="tool-call-header ui-select-none" @click="expanded = !expanded">
+  <div ref="rootRef" class="tool-call-block" :class="toolCall.status">
+    <div ref="headerRef" class="tool-call-header ui-select-none" @click="toggleExpanded">
       <span class="tool-call-icon" :class="statusIcon">
         <span v-if="toolCall.status === 'running'" class="spinner-anim"></span>
         <span v-else-if="toolCall.status === 'done'">&#10003;</span>
@@ -461,9 +495,19 @@ const highlightedOutput = computed(() => {
         <template v-if="toolCall.output || (isSubagentTool && toolCall.nestedToolCalls && toolCall.nestedToolCalls.length > 0)">
           <div v-if="isSubagentTool && toolCall.status !== 'error'" class="subagent-output ui-select-text" :class="{ 'streaming-output': toolCall.status === 'running' }" ref="outputPre">
             <div v-if="toolCall.nestedToolCalls && toolCall.nestedToolCalls.length > 0" class="nested-tool-calls">
-              <ToolCallCollection :tool-calls="toolCall.nestedToolCalls" :collapse-enabled="collapseEnabled">
+              <ToolCallCollection
+                :tool-calls="toolCall.nestedToolCalls"
+                :collapse-enabled="collapseEnabled"
+                @viewport-anchor-start="emitToolViewportAnchorStart"
+                @viewport-anchor-end="emitToolViewportAnchorEnd"
+              >
                 <template #default="{ toolCall: nestedToolCall }">
-                  <ToolCallBlock :tool-call="nestedToolCall" :collapse-enabled="collapseEnabled" />
+                  <ToolCallBlock
+                    :tool-call="nestedToolCall"
+                    :collapse-enabled="collapseEnabled"
+                    @tool-viewport-anchor-start="emitToolViewportAnchorStart"
+                    @tool-viewport-anchor-end="emitToolViewportAnchorEnd"
+                  />
                 </template>
               </ToolCallCollection>
             </div>

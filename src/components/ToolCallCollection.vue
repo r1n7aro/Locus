@@ -17,11 +17,14 @@ const props = withDefaults(defineProps<{
 });
 const emit = defineEmits<{
   (e: "collapseFinished"): void;
+  (e: "viewportAnchorStart", anchor: HTMLElement): void;
+  (e: "viewportAnchorEnd", anchor: HTMLElement): void;
 }>();
 
 const { state: displaySettings } = useDisplaySettings();
 const expanded = ref(false);
 const panelVisible = ref(false);
+const summaryRef = ref<HTMLElement | null>(null);
 const panelTransitionCleanup = new WeakMap<HTMLElement, () => void>();
 
 const PANEL_TRANSITION = [
@@ -38,17 +41,18 @@ const batchState = computed(() =>
   ),
 );
 
-const batchSummary = computed(() => t("tool.batch.summary", batchState.value.total));
-
-const batchMeta = computed(() => {
-  const parts: string[] = [];
-  if (batchState.value.errorCount > 0) {
-    parts.push(t("tool.batch.failedCount", batchState.value.errorCount));
+const batchSummary = computed(() => {
+  const { total, errorCount, interruptedCount } = batchState.value;
+  if (errorCount > 0 && interruptedCount > 0) {
+    return t("tool.batch.summaryWithIssues", total, errorCount, interruptedCount);
   }
-  if (batchState.value.interruptedCount > 0) {
-    parts.push(t("tool.batch.interruptedCount", batchState.value.interruptedCount));
+  if (errorCount > 0) {
+    return t("tool.batch.summaryWithErrors", total, errorCount);
   }
-  return parts.join(" · ");
+  if (interruptedCount > 0) {
+    return t("tool.batch.summaryWithInterrupted", total, interruptedCount);
+  }
+  return t("tool.batch.summary", total);
 });
 
 const toggleLabel = computed(() =>
@@ -129,6 +133,17 @@ function runOnNextFrame(callback: () => void) {
   setTimeout(callback, 16);
 }
 
+function emitViewportAnchorEnd() {
+  const anchor = summaryRef.value;
+  if (anchor) emit("viewportAnchorEnd", anchor);
+}
+
+function toggleExpanded() {
+  const anchor = summaryRef.value;
+  if (anchor) emit("viewportAnchorStart", anchor);
+  expanded.value = !expanded.value;
+}
+
 function onPanelEnter(element: Element, done: () => void) {
   const panel = element as HTMLElement;
   traceCollection("panelEnter", {
@@ -153,11 +168,13 @@ function onPanelAfterEnter(element: Element) {
     heightAfter: (element as HTMLElement).scrollHeight,
   });
   resetPanelTransition(element as HTMLElement);
+  emitViewportAnchorEnd();
 }
 
 function onPanelEnterCancelled(element: Element) {
   traceCollection("panelEnterCancelled");
   resetPanelTransition(element as HTMLElement);
+  emitViewportAnchorEnd();
 }
 
 function onPanelLeave(element: Element, done: () => void) {
@@ -183,6 +200,7 @@ function onPanelAfterLeave(element: Element) {
   traceCollection("panelAfterLeave");
   panelVisible.value = false;
   resetPanelTransition(element as HTMLElement);
+  emitViewportAnchorEnd();
   emit("collapseFinished");
 }
 
@@ -190,6 +208,7 @@ function onPanelLeaveCancelled(element: Element) {
   traceCollection("panelLeaveCancelled");
   panelVisible.value = true;
   resetPanelTransition(element as HTMLElement);
+  emitViewportAnchorEnd();
 }
 
 watch(
@@ -245,13 +264,14 @@ watch(
   >
     <button
       v-if="batchState.canCollapse"
+      ref="summaryRef"
       type="button"
       class="tool-call-batch-summary ui-select-none"
       :class="{ open: summaryOpen }"
       :title="toggleLabel"
       :aria-label="toggleLabel"
       :aria-expanded="expanded"
-      @click="expanded = !expanded"
+      @click="toggleExpanded"
     >
       <span class="tool-call-batch-chevron" :class="{ open: summaryOpen }" aria-hidden="true">
         <svg viewBox="0 0 12 12" width="10" height="10">
@@ -266,7 +286,6 @@ watch(
         </svg>
       </span>
       <span class="tool-call-batch-title">{{ batchSummary }}</span>
-      <span v-if="batchMeta" class="tool-call-batch-meta">{{ batchMeta }}</span>
     </button>
 
     <Transition

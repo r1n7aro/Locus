@@ -3,6 +3,7 @@ import {
   buildMessageToolCalls,
   collectToolCallDisplayIds,
   collectToolCallDisplayMatchState,
+  filterToolCallsByConsumableMatchState,
   filterToolCallsByActiveIds,
   filterToolCallsByMatchState,
   mergeSequentialAssistantToolCalls,
@@ -227,6 +228,67 @@ describe("toolCallBatches", () => {
     ]);
   });
 
+  it("consumes transient semantic matches once across a transcript tail", () => {
+    const hiddenState = collectToolCallDisplayMatchState([
+      {
+        id: "active-1",
+        name: "read",
+        arguments: "{\"path\":\"Assets/Scripts/TestMonoA.cs\"}",
+        status: "done",
+      },
+    ]);
+    const repeatedHistoryCall = {
+      id: "history-1",
+      name: "read",
+      arguments: "{\"path\":\"Assets/Scripts/TestMonoA.cs\"}",
+    };
+
+    expect(filterToolCallsByConsumableMatchState([repeatedHistoryCall], hiddenState)).toBeUndefined();
+    expect(filterToolCallsByConsumableMatchState([
+      {
+        ...repeatedHistoryCall,
+        id: "history-2",
+      },
+    ], hiddenState)).toEqual([
+      {
+        ...repeatedHistoryCall,
+        id: "history-2",
+      },
+    ]);
+  });
+
+  it("consumes an id match together with its semantic fingerprint", () => {
+    const hiddenState = collectToolCallDisplayMatchState([
+      {
+        id: "tc-1",
+        name: "read",
+        arguments: "{\"path\":\"Assets/Scripts/TestMonoA.cs\"}",
+        status: "done",
+      },
+    ]);
+
+    expect(filterToolCallsByConsumableMatchState([
+      {
+        id: "tc-1",
+        name: "read",
+        arguments: "{\"path\":\"Assets/Scripts/TestMonoA.cs\"}",
+      },
+    ], hiddenState)).toBeUndefined();
+    expect(filterToolCallsByConsumableMatchState([
+      {
+        id: "history-2",
+        name: "read",
+        arguments: "{\"path\":\"Assets/Scripts/TestMonoA.cs\"}",
+      },
+    ], hiddenState)).toEqual([
+      {
+        id: "history-2",
+        name: "read",
+        arguments: "{\"path\":\"Assets/Scripts/TestMonoA.cs\"}",
+      },
+    ]);
+  });
+
   it("merges transient and promoted history tool calls without duplicating semantic matches", () => {
     const merged = mergeToolCallDisplaysWithoutDuplicates(
       [
@@ -337,23 +399,23 @@ describe("toolCallBatches", () => {
     expect(batch.runningCount).toBe(1);
   });
 
-  it("keeps failed tool batches expanded", () => {
+  it("collapses terminal tool batches with failed calls", () => {
     const batch = summarizeToolCallBatch(
       [makeToolCall("done", "tc-1"), makeToolCall("error", "tc-2")],
       true,
     );
 
-    expect(batch.canCollapse).toBe(false);
+    expect(batch.canCollapse).toBe(true);
     expect(batch.errorCount).toBe(1);
   });
 
-  it("keeps interrupted tool batches expanded", () => {
+  it("collapses terminal tool batches with interrupted calls", () => {
     const batch = summarizeToolCallBatch(
       [makeToolCall("done", "tc-1"), makeToolCall("interrupted", "tc-2")],
       true,
     );
 
-    expect(batch.canCollapse).toBe(false);
+    expect(batch.canCollapse).toBe(true);
     expect(batch.interruptedCount).toBe(1);
   });
 

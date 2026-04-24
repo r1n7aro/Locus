@@ -1,9 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
   CHAT_SCROLL_BOTTOM_THRESHOLD,
+  captureLiveScrollAnchor,
   captureScrollAnchor,
   captureSessionScrollState,
   isNearBottom,
+  restoreLiveScrollAnchor,
   resolveSessionScrollTop,
   restoreScrollAnchor,
   type SessionScrollState,
@@ -138,5 +140,33 @@ describe("chatScrollState", () => {
       fallbackScrollTop: 240,
     })).toBe(true);
     expect(container.scrollTop).toBe(280);
+  });
+
+  it("keeps a live element anchored while surrounding content changes", () => {
+    const anchor = {
+      getBoundingClientRect: () => ({ top: 120, bottom: 150, height: 30 }),
+    };
+    const container = {
+      scrollTop: 240,
+      clientHeight: 300,
+      scrollHeight: 1200,
+      contains: (candidate: unknown) => candidate === anchor,
+      getBoundingClientRect: () => ({
+        top: 100,
+        bottom: 400,
+      }),
+    } as any;
+
+    const state = captureLiveScrollAnchor(container, anchor as any);
+    expect(state).toEqual({
+      anchor,
+      offsetTop: 20,
+      fallbackScrollTop: 240,
+    });
+
+    anchor.getBoundingClientRect = () => ({ top: 260, bottom: 290, height: 30 });
+
+    expect(restoreLiveScrollAnchor(container, state)).toBe(true);
+    expect(container.scrollTop).toBe(380);
   });
 });
