@@ -75,6 +75,30 @@ where
         }
         match req.send().await {
             Ok(resp) => {
+                let status = resp.status();
+                if is_retryable_response_status(status) {
+                    let error_body = resp.text().await.unwrap_or_default();
+                    last_error = format!("Responses API error ({}): {}", status, error_body);
+                    if debug {
+                        eprintln!(
+                            "[DEBUG][Responses] retryable API error (status={}):\n{}",
+                            status, error_body
+                        );
+                    }
+                    if attempt < MAX_RETRIES {
+                        let delay = BASE_DELAY_MS * 2u64.pow(attempt);
+                        eprintln!(
+                            "[Responses] HTTP {} (attempt {}/{}, retrying in {}ms)",
+                            status.as_u16(),
+                            attempt + 1,
+                            MAX_RETRIES + 1,
+                            delay
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                        continue;
+                    }
+                    continue;
+                }
                 response = Some(resp);
                 break;
             }
@@ -746,6 +770,10 @@ where
     Ok(())
 }
 
+fn is_retryable_response_status(status: reqwest::StatusCode) -> bool {
+    status.is_server_error()
+}
+
 #[derive(Debug, Deserialize)]
 struct TextDeltaEvent {
     delta: String,
@@ -809,11 +837,12 @@ struct InputTokensDetails {
 mod tests {
     use super::{
         build_input_messages, build_request_body, build_request_input, drain_sse_buffer,
-        ResponsesStreamState,
+        is_retryable_response_status, ResponsesStreamState,
     };
     use crate::session::models::{
         ChatMessage, ImageData, MessageRole, ServerToolKind, ToolCallInfo,
     };
+    use reqwest::StatusCode;
     use std::sync::{Arc, Mutex};
 
     fn ignore_text(_: String) {}
@@ -1105,5 +1134,22 @@ mod tests {
 
         assert!(request_input.previous_response_id.is_none());
         assert_eq!(request_input.input.len(), 3);
+    }
+
+    #[test]
+    fn retryable_response_statuses_cover_5xx_only() {
+        assert!(is_retryable_response_status(
+            StatusCode::INTERNAL_SERVER_ERROR
+        ));
+        assert!(is_retryable_response_status(StatusCode::BAD_GATEWAY));
+        assert!(is_retryable_response_status(
+            StatusCode::SERVICE_UNAVAILABLE
+        ));
+        assert!(is_retryable_response_status(StatusCode::GATEWAY_TIMEOUT));
+        assert!(is_retryable_response_status(
+            StatusCode::from_u16(529).expect("529 should be a valid extension status")
+        ));
+        assert!(!is_retryable_response_status(StatusCode::TOO_MANY_REQUESTS));
+        assert!(!is_retryable_response_status(StatusCode::BAD_REQUEST));
     }
 }

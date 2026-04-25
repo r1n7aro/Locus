@@ -88,7 +88,7 @@ pub(super) fn model_context_limit(model: &str) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{model_context_limit, OPENAI_CODEX_CONTEXT_LIMIT};
+    use super::{is_retryable_llm_error, model_context_limit, OPENAI_CODEX_CONTEXT_LIMIT};
 
     #[test]
     fn uses_codex_runtime_context_limits_for_openai_subscription_models() {
@@ -132,6 +132,22 @@ mod tests {
         assert_eq!(model_context_limit("minimax-m2.5"), 196_608);
         assert_eq!(model_context_limit("unknown-model"), 128_000);
     }
+
+    #[test]
+    fn retries_custom_responses_5xx_status_errors() {
+        assert!(is_retryable_llm_error(
+            r#"Responses API error (502 Bad Gateway): {"error":{"code":"upstream_error","message":"Upstream request failed"}}"#
+        ));
+        assert!(is_retryable_llm_error(
+            r#"Responses API error (503 Service Unavailable): temporarily unavailable"#
+        ));
+        assert!(is_retryable_llm_error(
+            r#"Responses API error (529): {"error":{"message":"overloaded"}}"#
+        ));
+        assert!(!is_retryable_llm_error(
+            r#"Responses API error (400 Bad Request): invalid request"#
+        ));
+    }
 }
 
 /// Retry only when the transport failed before we can trust the streamed payload.
@@ -151,9 +167,23 @@ pub(super) fn is_retryable_llm_error(error: &str) -> bool {
         || error.contains("overloaded")
         || error.contains("529")
         || error.contains("server error")
+        || is_retryable_responses_api_status_error(error)
         // reqwest transport errors (no partial output)
         || error.contains("error sending request")
         || error.contains("Request failed:")
+}
+
+fn is_retryable_responses_api_status_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    if !lower.contains("responses api error (") {
+        return false;
+    }
+
+    lower.contains("responses api error (5")
+        || lower.contains("bad gateway")
+        || lower.contains("upstream_error")
+        || lower.contains("upstream error")
+        || lower.contains("upstream request failed")
 }
 
 pub(super) fn is_prompt_too_long_error(error: &str) -> bool {
@@ -235,6 +265,7 @@ pub(super) fn normalize_tool_args(args: &mut serde_json::Value) {
         ("new_string", "newString"),
         ("replace_all", "replaceAll"),
         ("editor_status", "editorStatus"),
+        ("request_editor_status", "requestEditorStatus"),
         ("asset_path", "assetPath"),
         ("max_depth", "maxDepth"),
         ("type_filter", "typeFilter"),
