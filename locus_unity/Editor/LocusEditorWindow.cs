@@ -2,6 +2,7 @@ using UnityEngine;
 using UnityEditor;
 
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.IO.Pipes;
@@ -9,6 +10,9 @@ using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading.Tasks;
+#if UNITY_EDITOR_WIN
+using Microsoft.Win32;
+#endif
 
 namespace Locus
 {
@@ -18,6 +22,7 @@ namespace Locus
         private const string FullPipeName = @"\\.\pipe\locus_tauri_unity_embed";
         private const double SyncIntervalSeconds = 0.12d;
         private const double HeartbeatIntervalSeconds = 2d;
+        private const double DesktopProbeIntervalSeconds = 2d;
         private const int PipeConnectTimeoutMs = 500;
 
         private static readonly Encoding Utf8NoBom = new UTF8Encoding(false);
@@ -44,6 +49,10 @@ namespace Locus
         private int _lastSentHeight;
         private bool _lastSentVisible;
         private long _lastSentParentHwnd;
+        private double _nextDesktopProbeAt;
+        private LocusDesktopInstall _desktopInstall = LocusDesktopInstall.NotFound;
+        private bool _desktopProcessRunning;
+        private volatile bool _desktopLaunchInFlight;
 
         [Serializable]
         private sealed class EmbedControlMessage
@@ -55,6 +64,20 @@ namespace Locus
             public int height;
             public bool visible;
             public long parentHwnd;
+        }
+
+        private sealed class LocusDesktopInstall
+        {
+            public static readonly LocusDesktopInstall NotFound = new LocusDesktopInstall(false, "");
+
+            public readonly bool IsInstalled;
+            public readonly string ExecutablePath;
+
+            public LocusDesktopInstall(bool isInstalled, string executablePath)
+            {
+                IsInstalled = isInstalled;
+                ExecutablePath = executablePath ?? "";
+            }
         }
 
         [MenuItem("Window/Locus")]
@@ -70,6 +93,7 @@ namespace Locus
         {
             titleContent = CreateTitleContent();
             minSize = new Vector2(360f, 420f);
+            RefreshDesktopState(true);
             EditorApplication.update += SyncOverlay;
             SendOpenOrUpdate(true);
         }
@@ -89,6 +113,7 @@ namespace Locus
         private void OnGUI()
         {
             UpdateScreenRectFromGUI();
+            RefreshDesktopState(false);
             DrawPlaceholder();
 
             if (Event.current.type == EventType.Repaint)
@@ -102,7 +127,11 @@ namespace Locus
                 return;
 
             _nextSyncAt = now + SyncIntervalSeconds;
+            RefreshDesktopState(false);
             SendOpenOrUpdate(false);
+
+            if (_failedSends > 0 || ShouldShowStartButton() || _desktopLaunchInFlight)
+                Repaint();
         }
 
         private void SendOpenOrUpdate(bool force)
@@ -291,11 +320,346 @@ namespace Locus
                 rect.height - 38f);
             Rect statusRect = new Rect(inner.x, titleRect.yMax + 8f, inner.width, 34f);
             Rect pipeRect = new Rect(inner.x, statusRect.yMax + 10f, inner.width, 18f);
+            Rect buttonRect = new Rect(
+                inner.x,
+                pipeRect.yMax + 12f,
+                Mathf.Min(116f, inner.width),
+                24f);
 
             GUI.Label(titleRect, "Locus", EditorStyles.boldLabel);
             GUI.Label(statusRect, _statusMessage, EditorStyles.wordWrappedLabel);
             EditorGUI.SelectableLabel(pipeRect, FullPipeName, EditorStyles.miniLabel);
+
+            if (ShouldShowStartButton())
+            {
+                using (new EditorGUI.DisabledScope(_desktopLaunchInFlight))
+                {
+                    if (GUI.Button(buttonRect, _desktopLaunchInFlight ? "启动中..." : "启动 Locus"))
+                        StartLocusDesktop();
+                }
+            }
         }
+
+        private void RefreshDesktopState(bool force)
+        {
+            double now = EditorApplication.timeSinceStartup;
+            if (!force && now < _nextDesktopProbeAt)
+                return;
+
+            _nextDesktopProbeAt = now + DesktopProbeIntervalSeconds;
+            _desktopInstall = FindLocusDesktopInstall();
+            _desktopProcessRunning = IsLocusDesktopProcessRunning(_desktopInstall.ExecutablePath);
+        }
+
+        private bool ShouldShowStartButton()
+        {
+            return _desktopInstall.IsInstalled && !_desktopProcessRunning;
+        }
+
+        private void StartLocusDesktop()
+        {
+            if (_desktopLaunchInFlight)
+                return;
+
+            RefreshDesktopState(true);
+            if (!_desktopInstall.IsInstalled)
+            {
+                _statusMessage = "Locus desktop install was not found.";
+                return;
+            }
+
+            if (_desktopProcessRunning)
+            {
+                _statusMessage = "Locus desktop is running.";
+                SendOpenOrUpdate(true);
+                return;
+            }
+
+            string executablePath = _desktopInstall.ExecutablePath;
+            if (string.IsNullOrEmpty(executablePath) || !File.Exists(executablePath))
+            {
+                _statusMessage = "Locus desktop executable was not found.";
+                return;
+            }
+
+            _desktopLaunchInFlight = true;
+            _statusMessage = "Starting Locus desktop.";
+
+            Task.Run(async () =>
+            {
+                try
+                {
+                    ProcessStartInfo startInfo = new ProcessStartInfo
+                    {
+                        FileName = executablePath,
+                        WorkingDirectory = Path.GetDirectoryName(executablePath),
+                        UseShellExecute = true
+                    };
+
+                    Process.Start(startInfo);
+                    _desktopProcessRunning = true;
+                    await Task.Delay(2000);
+                }
+                catch (Exception ex)
+                {
+                    _statusMessage = "Failed to start Locus desktop: " + ex.Message;
+                }
+                finally
+                {
+                    _desktopLaunchInFlight = false;
+                }
+            });
+        }
+
+        private static LocusDesktopInstall FindLocusDesktopInstall()
+        {
+#if UNITY_EDITOR_WIN
+            string executablePath = FindWindowsLocusExecutable();
+            if (!string.IsNullOrEmpty(executablePath))
+                return new LocusDesktopInstall(true, executablePath);
+#endif
+
+            return LocusDesktopInstall.NotFound;
+        }
+
+        private static bool IsLocusDesktopProcessRunning(string executablePath)
+        {
+            string processName = "locus";
+            if (!string.IsNullOrEmpty(executablePath))
+            {
+                try
+                {
+                    string fileName = Path.GetFileNameWithoutExtension(executablePath);
+                    if (!string.IsNullOrEmpty(fileName))
+                        processName = fileName;
+                }
+                catch
+                {
+                }
+            }
+
+            if (HasProcessByName(processName))
+                return true;
+
+            return !string.Equals(processName, "locus", StringComparison.OrdinalIgnoreCase)
+                && HasProcessByName("locus");
+        }
+
+        private static bool HasProcessByName(string processName)
+        {
+            if (string.IsNullOrEmpty(processName))
+                return false;
+
+            try
+            {
+                Process[] processes = Process.GetProcessesByName(processName);
+                bool found = processes.Length > 0;
+                for (int i = 0; i < processes.Length; i++)
+                    processes[i].Dispose();
+                return found;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+#if UNITY_EDITOR_WIN
+        private static string FindWindowsLocusExecutable()
+        {
+            foreach (string path in GetWindowsRegistryExecutableCandidates())
+            {
+                string normalized = NormalizeLocusExecutablePath(path);
+                if (!string.IsNullOrEmpty(normalized))
+                    return normalized;
+            }
+
+            foreach (string path in GetWindowsFileSystemExecutableCandidates())
+            {
+                string normalized = NormalizeLocusExecutablePath(path);
+                if (!string.IsNullOrEmpty(normalized))
+                    return normalized;
+            }
+
+            return "";
+        }
+
+        private static IEnumerable<string> GetWindowsRegistryExecutableCandidates()
+        {
+            List<string> candidates = new List<string>();
+
+            foreach (RegistryHive hive in new[] { RegistryHive.CurrentUser, RegistryHive.LocalMachine })
+            {
+                foreach (RegistryView view in new[] { RegistryView.Registry64, RegistryView.Registry32 })
+                {
+                    RegistryKey baseKey = null;
+                    try
+                    {
+                        baseKey = RegistryKey.OpenBaseKey(hive, view);
+                    }
+                    catch
+                    {
+                    }
+
+                    if (baseKey == null)
+                        continue;
+
+                    try
+                    {
+                        AddWindowsRegistryExecutableCandidates(candidates, baseKey);
+                    }
+                    finally
+                    {
+                        baseKey.Dispose();
+                    }
+                }
+            }
+
+            return candidates;
+        }
+
+        private static void AddWindowsRegistryExecutableCandidates(
+            List<string> candidates,
+            RegistryKey baseKey)
+        {
+            AddWindowsAppPathCandidates(candidates, baseKey);
+            AddWindowsUninstallCandidates(candidates, baseKey);
+        }
+
+        private static void AddWindowsAppPathCandidates(
+            List<string> candidates,
+            RegistryKey baseKey)
+        {
+            using (RegistryKey key = baseKey.OpenSubKey(
+                @"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\locus.exe"))
+            {
+                if (key == null)
+                    return;
+
+                candidates.Add(Convert.ToString(key.GetValue("")));
+                candidates.Add(Convert.ToString(key.GetValue("Path")));
+            }
+        }
+
+        private static void AddWindowsUninstallCandidates(
+            List<string> candidates,
+            RegistryKey baseKey)
+        {
+            using (RegistryKey uninstallKey = baseKey.OpenSubKey(
+                @"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"))
+            {
+                if (uninstallKey == null)
+                    return;
+
+                string[] subKeyNames;
+                try
+                {
+                    subKeyNames = uninstallKey.GetSubKeyNames();
+                }
+                catch
+                {
+                    return;
+                }
+
+                for (int i = 0; i < subKeyNames.Length; i++)
+                {
+                    using (RegistryKey appKey = uninstallKey.OpenSubKey(subKeyNames[i]))
+                    {
+                        if (appKey == null || !IsLocusUninstallEntry(appKey))
+                            continue;
+
+                        candidates.Add(Convert.ToString(appKey.GetValue("DisplayIcon")));
+                        candidates.Add(Convert.ToString(appKey.GetValue("InstallLocation")));
+                    }
+                }
+            }
+        }
+
+        private static bool IsLocusUninstallEntry(RegistryKey appKey)
+        {
+            string displayName = Convert.ToString(appKey.GetValue("DisplayName")) ?? "";
+            string publisher = Convert.ToString(appKey.GetValue("Publisher")) ?? "";
+
+            if (string.Equals(displayName, "locus", StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            return displayName.IndexOf("Locus", StringComparison.OrdinalIgnoreCase) >= 0
+                && publisher.IndexOf("FarLocus", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        private static IEnumerable<string> GetWindowsFileSystemExecutableCandidates()
+        {
+            string localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            string programFiles = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
+            string programFilesX86 = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86);
+
+            foreach (string root in new[] { localAppData, programFiles, programFilesX86 })
+            {
+                if (string.IsNullOrEmpty(root))
+                    continue;
+
+                yield return Path.Combine(root, "locus", "locus.exe");
+                yield return Path.Combine(root, "Locus", "locus.exe");
+                yield return Path.Combine(root, "Programs", "locus", "locus.exe");
+                yield return Path.Combine(root, "Programs", "Locus", "locus.exe");
+            }
+        }
+
+        private static string NormalizeLocusExecutablePath(string rawPath)
+        {
+            string path = ExtractWindowsPath(rawPath);
+            if (string.IsNullOrEmpty(path))
+                return "";
+
+            try
+            {
+                path = Environment.ExpandEnvironmentVariables(path);
+
+                if (Directory.Exists(path))
+                    path = Path.Combine(path, "locus.exe");
+
+                if (!File.Exists(path))
+                    return "";
+
+                if (!string.Equals(Path.GetFileName(path), "locus.exe", StringComparison.OrdinalIgnoreCase))
+                    return "";
+
+                return Path.GetFullPath(path);
+            }
+            catch
+            {
+                return "";
+            }
+        }
+
+        private static string ExtractWindowsPath(string rawPath)
+        {
+            if (string.IsNullOrEmpty(rawPath))
+                return "";
+
+            string path = rawPath.Trim();
+            if (path.Length == 0)
+                return "";
+
+            if (path[0] == '"')
+            {
+                int endQuote = path.IndexOf('"', 1);
+                path = endQuote > 1 ? path.Substring(1, endQuote - 1) : path.Trim('"');
+            }
+            else
+            {
+                int exeIndex = path.IndexOf(".exe", StringComparison.OrdinalIgnoreCase);
+                if (exeIndex >= 0)
+                    path = path.Substring(0, exeIndex + 4);
+            }
+
+            int iconSuffixIndex = path.LastIndexOf(',');
+            if (iconSuffixIndex > 0)
+                path = path.Substring(0, iconSuffixIndex);
+
+            return path.Trim();
+        }
+#endif
 
         private static long GetUnityMainHwnd()
         {
