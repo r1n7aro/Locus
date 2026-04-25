@@ -213,6 +213,18 @@ function applyMutation(state: EmbeddedChatState, mutation: StreamMutation) {
     case "resetRound":
       resetRoundState(state);
       break;
+    case "clearPendingInputs":
+      state.pendingQuestion = null;
+      state.pendingToolConfirms = [];
+      break;
+    case "clearPendingInput":
+      if (state.pendingQuestion?.questionId === mutation.questionId) {
+        state.pendingQuestion = null;
+      }
+      state.pendingToolConfirms = state.pendingToolConfirms.filter(
+        (item) => item.questionId !== mutation.questionId,
+      );
+      break;
     case "updateUsage":
       state.tokenUsage = mutation.usage;
       break;

@@ -10,6 +10,7 @@ const sessionServiceMocks = vi.hoisted(() => ({
   chat: vi.fn(),
   cancelChat: vi.fn(),
   deleteSession: vi.fn(),
+  getActiveSessionSelection: vi.fn(),
   getSessionUsage: vi.fn(),
   getSessionActiveRun: vi.fn(),
   getTodos: vi.fn(),
@@ -19,6 +20,7 @@ const sessionServiceMocks = vi.hoisted(() => ({
   listSessions: vi.fn(),
   loadSession: vi.fn(),
   renameSession: vi.fn(),
+  saveActiveSessionSelection: vi.fn(),
   staleKnowledgeProposals: vi.fn(),
 }));
 
@@ -174,6 +176,7 @@ describe("chat session panel state", () => {
     sessionServiceMocks.chat.mockResolvedValue({ sessionId: "s1", runId: "run-default" });
     sessionServiceMocks.cancelChat.mockResolvedValue(undefined);
     sessionServiceMocks.deleteSession.mockResolvedValue(undefined);
+    sessionServiceMocks.getActiveSessionSelection.mockResolvedValue(null);
     sessionServiceMocks.getSessionUsage.mockImplementation(async () => emptyUsage());
     sessionServiceMocks.getSessionActiveRun.mockResolvedValue(null);
     sessionServiceMocks.getTodos.mockImplementation(async (sessionId: string) => (
@@ -184,6 +187,7 @@ describe("chat session panel state", () => {
     sessionServiceMocks.listArchivedSessions.mockImplementation(async () => []);
     sessionServiceMocks.listSessions.mockImplementation(async () => []);
     sessionServiceMocks.renameSession.mockResolvedValue(undefined);
+    sessionServiceMocks.saveActiveSessionSelection.mockResolvedValue(undefined);
     sessionServiceMocks.staleKnowledgeProposals.mockResolvedValue(undefined);
     undoServiceMocks.undoList.mockImplementation(async (sessionId: string) => undoData[sessionId] ?? []);
     undoServiceMocks.undoPerform.mockResolvedValue(undefined);
@@ -201,6 +205,27 @@ describe("chat session panel state", () => {
 
     chatStore.toggleTodoPanel();
     expect(chatStore.showTodoPanel).toBe(true);
+  });
+
+  it("restores the persisted active session after refreshing sessions", async () => {
+    const chatStore = useChatStore();
+
+    sessionServiceMocks.getActiveSessionSelection.mockResolvedValue("s1");
+    sessionServiceMocks.listSessions.mockResolvedValue([
+      {
+        id: "s1",
+        title: "Persisted",
+        agentId: null,
+        sessionType: "chat",
+        updatedAt: 1,
+      },
+    ]);
+
+    await chatStore.refreshSessions();
+
+    expect(chatStore.activeSessionId).toBe("s1");
+    expect(sessionServiceMocks.loadSession).toHaveBeenCalledWith("s1");
+    expect(sessionServiceMocks.saveActiveSessionSelection).not.toHaveBeenCalled();
   });
 
   it("remembers todo panel visibility per session", async () => {
@@ -815,6 +840,60 @@ describe("chat session panel state", () => {
     });
 
     expect(chatStore.pendingQuestion).toBeNull();
+    expect(chatStore.pendingToolConfirms).toEqual([]);
+  });
+
+  it("clears answered pending input cards from replayed stream events", () => {
+    const chatStore = useChatStore();
+
+    chatStore.sessions = [
+      {
+        id: "s1",
+        title: "Reloading Unity",
+        agentId: null,
+        sessionType: "chat",
+        updatedAt: 1,
+      },
+    ] as any;
+    chatStore.activeSessionId = "s1";
+    chatStore.currentRunId = "run-1";
+    chatStore.isStreaming = true;
+    chatStore.streamingSessionIds = new Set(["s1"]);
+    chatStore.pendingQuestion = {
+      questionId: "q1",
+      toolCallId: "tc-recompile",
+      question: "Exit play mode?",
+      options: [{ label: "Confirm", description: "Exit play mode and recompile" }],
+    } as any;
+    chatStore.pendingToolConfirms = [
+      {
+        questionId: "q2",
+        toolCallId: "tc-write",
+        display: {
+          kind: "basic",
+          toolName: "write",
+          arguments: "{}",
+        },
+      },
+    ] as any;
+
+    chatStore.handleStreamEvent({
+      runId: "run-1",
+      type: "inputAnswered",
+      sessionId: "s1",
+      questionId: "q1",
+    });
+
+    expect(chatStore.pendingQuestion).toBeNull();
+    expect(chatStore.pendingToolConfirms).toHaveLength(1);
+
+    chatStore.handleStreamEvent({
+      runId: "run-1",
+      type: "inputAnswered",
+      sessionId: "s1",
+      questionId: "q2",
+    });
+
     expect(chatStore.pendingToolConfirms).toEqual([]);
   });
 

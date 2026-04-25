@@ -545,6 +545,43 @@ describe("reduceStreamEvent", () => {
     });
   });
 
+  describe("inputAnswered", () => {
+    it("clears the matching pending input by question id", () => {
+      const state = makeState({
+        pendingQuestion: {
+          questionId: "q1",
+          toolCallId: "ask-1",
+          question: "Continue?",
+          options: [],
+        },
+        pendingToolConfirms: [
+          {
+            questionId: "q2",
+            toolCallId: "tc1",
+            display: {
+              kind: "basic",
+              toolName: "write",
+              arguments: "{}",
+            },
+          },
+        ],
+      });
+      const event: StreamEvent = {
+        runId: "test-run",
+        type: "inputAnswered",
+        sessionId: "s1",
+        questionId: "q2",
+      };
+
+      const mutations = reduceStreamEvent(state, event);
+
+      expect(mutations).toContainEqual({
+        type: "clearPendingInput",
+        questionId: "q2",
+      });
+    });
+  });
+
   describe("undoAvailable", () => {
     it("adds message id to undoable set", () => {
       const state = makeState({ isStreaming: true });

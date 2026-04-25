@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use futures::FutureExt;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tauri::{AppHandle, State};
 
@@ -43,6 +43,73 @@ pub struct AgentInfo {
 pub struct ChatLaunch {
     pub session_id: String,
     pub run_id: String,
+}
+
+const ACTIVE_SESSION_SELECTION_FILE: &str = "active_session_selection.json";
+const ACTIVE_SESSION_GLOBAL_WORKSPACE_KEY: &str = "__global__";
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ActiveSessionSelectionState {
+    #[serde(default)]
+    by_workspace: HashMap<String, String>,
+}
+
+fn active_session_selection_path(app_handle: &AppHandle) -> Result<std::path::PathBuf, String> {
+    Ok(super::resolve_runtime_storage_dir(app_handle)?.join(ACTIVE_SESSION_SELECTION_FILE))
+}
+
+fn read_active_session_selection_state(
+    app_handle: &AppHandle,
+) -> Result<ActiveSessionSelectionState, String> {
+    let path = active_session_selection_path(app_handle)?;
+    if !path.exists() {
+        return Ok(ActiveSessionSelectionState::default());
+    }
+
+    match std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<ActiveSessionSelectionState>(&raw).ok())
+    {
+        Some(mut state) => {
+            state
+                .by_workspace
+                .retain(|key, value| !key.trim().is_empty() && !value.trim().is_empty());
+            Ok(state)
+        }
+        None => {
+            eprintln!(
+                "[Locus] warning: ignored invalid active session selection state at {}",
+                path.display()
+            );
+            Ok(ActiveSessionSelectionState::default())
+        }
+    }
+}
+
+fn write_active_session_selection_state(
+    app_handle: &AppHandle,
+    state: &ActiveSessionSelectionState,
+) -> Result<(), String> {
+    let path = active_session_selection_path(app_handle)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create storage dir: {}", e))?;
+    }
+    let json = serde_json::to_string_pretty(state)
+        .map_err(|e| format!("Failed to serialize active session selection: {}", e))?;
+    std::fs::write(&path, json)
+        .map_err(|e| format!("Failed to save active session selection: {}", e))
+}
+
+async fn active_session_workspace_key(workspace: &State<'_, Arc<Workspace>>) -> String {
+    workspace
+        .workspace_id
+        .read()
+        .await
+        .clone()
+        .filter(|id| !id.trim().is_empty())
+        .unwrap_or_else(|| ACTIVE_SESSION_GLOBAL_WORKSPACE_KEY.to_string())
 }
 
 fn emit_session_stream(app_handle: &AppHandle, store: &SessionStore, event: StreamEvent) {
@@ -971,6 +1038,46 @@ pub async fn list_archived_sessions(
     store
         .list_archived_sessions(ws_id.as_deref())
         .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn get_active_session_selection(
+    app_handle: AppHandle,
+    workspace: State<'_, Arc<Workspace>>,
+) -> Result<Option<String>, AppError> {
+    let key = active_session_workspace_key(&workspace).await;
+    let state = read_active_session_selection_state(&app_handle)?;
+    Ok(state
+        .by_workspace
+        .get(&key)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty()))
+}
+
+#[tauri::command]
+pub async fn save_active_session_selection(
+    session_id: Option<String>,
+    app_handle: AppHandle,
+    workspace: State<'_, Arc<Workspace>>,
+) -> Result<(), AppError> {
+    let key = active_session_workspace_key(&workspace).await;
+    let mut state = read_active_session_selection_state(&app_handle).unwrap_or_default();
+    let normalized_session_id = session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    match normalized_session_id {
+        Some(value) => {
+            state.by_workspace.insert(key, value.to_string());
+        }
+        None => {
+            state.by_workspace.remove(&key);
+        }
+    }
+
+    write_active_session_selection_state(&app_handle, &state)?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -3181,16 +3288,37 @@ fn response_tool_call_key(event: &serde_json::Value) -> Option<String> {
 pub async fn answer_question(
     question_id: String,
     answer: String,
+    app_handle: AppHandle,
     question_store: State<'_, QuestionStore>,
+    store: State<'_, Arc<SessionStore>>,
 ) -> Result<(), AppError> {
-    let sender = {
+    let pending = {
         let mut store = question_store.lock().await;
         store.remove(&question_id)
     };
-    match sender {
-        Some(tx) => tx
-            .send(answer)
-            .map_err(|_| "Question receiver dropped".to_string().into()),
+    match pending {
+        Some(pending) => {
+            let crate::PendingQuestionResponse {
+                session_id,
+                run_id,
+                tx,
+            } = pending;
+
+            tx.send(answer)
+                .map_err(|_| "Question receiver dropped".to_string())?;
+
+            crate::session::gateway::emit_stream(
+                &app_handle,
+                store.inner().as_ref(),
+                &run_id,
+                StreamEvent::InputAnswered {
+                    session_id,
+                    question_id,
+                },
+            );
+
+            Ok(())
+        }
         None => Err(format!("Question '{}' not found or already answered", question_id).into()),
     }
 }

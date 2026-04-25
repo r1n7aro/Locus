@@ -34,6 +34,7 @@ export type StreamMutation =
   | { type: "pushToolResults" }
   | { type: "resetRound" }
   | { type: "clearPendingInputs" }
+  | { type: "clearPendingInput"; questionId: string }
   | { type: "updateUsage"; usage: TokenUsage }
   | { type: "setQuestion"; question: PendingQuestion | null }
   | { type: "enqueueToolConfirm"; confirm: PendingToolConfirm }
@@ -234,6 +235,10 @@ export function reduceStreamEvent(state: StreamState, event: StreamEvent): Strea
           display: event.display,
         },
       });
+      break;
+
+    case "inputAnswered":
+      mutations.push({ type: "clearPendingInput", questionId: event.questionId });
       break;
 
     case "undoAvailable":

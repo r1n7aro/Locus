@@ -74,6 +74,14 @@ export function listArchivedSessions(): Promise<SessionSummary[]> {
   return ipcInvoke<SessionSummary[]>("list_archived_sessions");
 }
 
+export function getActiveSessionSelection(): Promise<string | null> {
+  return ipcInvoke<string | null>("get_active_session_selection");
+}
+
+export function saveActiveSessionSelection(sessionId: string | null): Promise<void> {
+  return ipcInvoke("save_active_session_selection", { sessionId });
+}
+
 export function loadSession(sessionId: string): Promise<SessionDetail> {
   return ipcInvoke<SessionDetail>("load_session", { sessionId });
 }

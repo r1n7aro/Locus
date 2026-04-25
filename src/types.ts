@@ -433,6 +433,7 @@ export type StreamEvent = { runId: string } & (
       toolCallId: string;
       display: ToolConfirmDisplay;
     }
+  | { type: "inputAnswered"; sessionId: string; questionId: string }
   | { type: "undoAvailable"; sessionId: string; assistantMessageId: string }
   | {
       type: "compactStart";
@@ -505,9 +506,17 @@ export interface KnowledgeToolConfirmPreview {
   structureAfterPaths?: string[];
 }
 
+export interface UnityEditorStatusChangeToolConfirmDisplay {
+  kind: "unityEditorStatusChange";
+  toolName: string;
+  currentStatus: string;
+  requestedStatus: string;
+}
+
 export type ToolConfirmDisplay =
   | BasicToolConfirmDisplay
-  | KnowledgeToolConfirmPreview;
+  | KnowledgeToolConfirmPreview
+  | UnityEditorStatusChangeToolConfirmDisplay;
 
 /**
  * Skill 触发方式（单一三态）：

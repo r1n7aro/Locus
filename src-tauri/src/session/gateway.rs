@@ -28,6 +28,7 @@ fn event_session_id(event: &StreamEvent) -> &str {
         | StreamEvent::UsageUpdate { session_id, .. }
         | StreamEvent::AskUser { session_id, .. }
         | StreamEvent::ToolConfirm { session_id, .. }
+        | StreamEvent::InputAnswered { session_id, .. }
         | StreamEvent::UndoAvailable { session_id, .. }
         | StreamEvent::CompactStart { session_id, .. }
         | StreamEvent::CompactDone { session_id, .. }
@@ -52,6 +53,7 @@ fn event_type(event: &StreamEvent) -> &'static str {
         StreamEvent::UsageUpdate { .. } => "usageUpdate",
         StreamEvent::AskUser { .. } => "askUser",
         StreamEvent::ToolConfirm { .. } => "toolConfirm",
+        StreamEvent::InputAnswered { .. } => "inputAnswered",
         StreamEvent::UndoAvailable { .. } => "undoAvailable",
         StreamEvent::CompactStart { .. } => "compactStart",
         StreamEvent::CompactDone { .. } => "compactDone",
@@ -72,6 +74,7 @@ fn run_status_for_event(event: &StreamEvent) -> Option<(&'static str, Option<Str
         | StreamEvent::SubagentToolCallDone { .. }
         | StreamEvent::ToolCallRoundDone { .. }
         | StreamEvent::UsageUpdate { .. }
+        | StreamEvent::InputAnswered { .. }
         | StreamEvent::UndoAvailable { .. }
         | StreamEvent::CompactStart { .. }
         | StreamEvent::CompactDone { .. } => Some((RUN_STATUS_RUNNING, None)),

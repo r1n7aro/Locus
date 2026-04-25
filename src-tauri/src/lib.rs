@@ -70,8 +70,13 @@ pub type ApiKeyState = Arc<tokio::sync::RwLock<String>>;
 
 pub type ProviderKeysState = Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>>;
 
-pub type QuestionStore =
-    Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<String>>>>;
+pub struct PendingQuestionResponse {
+    pub session_id: String,
+    pub run_id: String,
+    pub tx: tokio::sync::oneshot::Sender<String>,
+}
+
+pub type QuestionStore = Arc<tokio::sync::Mutex<HashMap<String, PendingQuestionResponse>>>;
 
 #[derive(Debug, Clone)]
 pub struct PendingKnowledgeProposalDraft {
@@ -565,6 +570,8 @@ pub fn run() {
             commands::load_session,
             commands::list_sessions,
             commands::list_archived_sessions,
+            commands::get_active_session_selection,
+            commands::save_active_session_selection,
             commands::rename_session,
             commands::archive_session,
             commands::unarchive_session,

@@ -175,6 +175,8 @@ export const useChatStore = defineStore("chat", () => {
   const closedRunIds = new Map<string, string>();
   const cancelRequestedRunIds = new Map<string, string>();
   let streamReplayDepth = 0;
+  let activeSessionSelectionRestoreAttempted = false;
+  let activeSessionSelectionPersistSeq = 0;
   const isCancelling = computed(() => {
     if (!activeSessionId.value || !currentRunId.value) return false;
     return cancelRequestedRunIds.get(activeSessionId.value) === currentRunId.value;
@@ -191,6 +193,52 @@ export const useChatStore = defineStore("chat", () => {
       return activeSessionType.value;
     }
     return sessions.value.find((session) => session.id === sessionId)?.sessionType ?? null;
+  }
+
+  function persistActiveSessionSelection(sessionId: string | null) {
+    const seq = ++activeSessionSelectionPersistSeq;
+    sessionService.saveActiveSessionSelection(sessionId).catch((e) => {
+      if (seq !== activeSessionSelectionPersistSeq) return;
+      console.warn("save_active_session_selection failed:", e);
+    });
+  }
+
+  function setActiveSessionSelection(
+    sessionId: string | null,
+    options: { persist?: boolean } = {},
+  ) {
+    activeSessionId.value = sessionId;
+    if (options.persist !== false) {
+      persistActiveSessionSelection(sessionId);
+    }
+  }
+
+  async function restoreActiveSessionSelection(nextSessions: SessionSummary[]) {
+    if (activeSessionSelectionRestoreAttempted || activeSessionId.value) return;
+    activeSessionSelectionRestoreAttempted = true;
+
+    let savedSessionId: string | null = null;
+    try {
+      savedSessionId = await sessionService.getActiveSessionSelection();
+    } catch (e) {
+      console.warn("get_active_session_selection failed:", e);
+      return;
+    }
+
+    const normalizedSessionId = savedSessionId?.trim();
+    if (!normalizedSessionId) return;
+
+    const restoredSession = nextSessions.find((session) => session.id === normalizedSessionId);
+    if (!restoredSession) {
+      persistActiveSessionSelection(null);
+      return;
+    }
+
+    if (activeSessionId.value) return;
+    setActiveSessionSelection(normalizedSessionId, { persist: false });
+    activeSessionType.value = restoredSession.sessionType ?? null;
+    currentRunId.value = sessionRunIds.value.get(normalizedSessionId) ?? null;
+    await loadSessionState(normalizedSessionId);
   }
 
   function resetStreamRuntimeState() {
@@ -733,6 +781,14 @@ export const useChatStore = defineStore("chat", () => {
         pendingQuestion.value = null;
         pendingToolConfirms.value = [];
         break;
+      case "clearPendingInput":
+        if (pendingQuestion.value?.questionId === m.questionId) {
+          pendingQuestion.value = null;
+        }
+        pendingToolConfirms.value = pendingToolConfirms.value.filter(
+          (item) => item.questionId !== m.questionId,
+        );
+        break;
       case "updateUsage":
         tokenUsage.value = m.usage;
         break;
@@ -823,7 +879,7 @@ export const useChatStore = defineStore("chat", () => {
 
       if (!activeSessionId.value && isStreaming.value && pendingSessionId === null) {
         pendingSessionId = event.sessionId;
-        activeSessionId.value = event.sessionId;
+        setActiveSessionSelection(event.sessionId);
         if (managedStreamingSessionIds.has(event.sessionId)) {
           activeSessionType.value = "chat";
         }
@@ -868,7 +924,7 @@ export const useChatStore = defineStore("chat", () => {
     // Session auto-assignment
     if (!activeSessionId.value && isStreaming.value && pendingSessionId === null) {
       pendingSessionId = event.sessionId;
-      activeSessionId.value = event.sessionId;
+      setActiveSessionSelection(event.sessionId);
       streamingSessionIds.value.add(event.sessionId);
       refreshSessions();
     }
@@ -1055,6 +1111,7 @@ export const useChatStore = defineStore("chat", () => {
       const rawSessions = await sessionService.listSessions();
       const nextSessions = normalizeSessionRuntimeStatuses(rawSessions);
       sessions.value = nextSessions;
+      await restoreActiveSessionSelection(nextSessions);
       await hydrateActiveRuns(nextSessions);
       reconcileStreamingSessions(nextSessions);
     } catch (e) {
@@ -1065,7 +1122,7 @@ export const useChatStore = defineStore("chat", () => {
   async function selectSession(id: string) {
     if (id === activeSessionId.value) return;
     persistTodoPanelState();
-    activeSessionId.value = id;
+    setActiveSessionSelection(id);
     activeSessionType.value = sessions.value.find((session) => session.id === id)?.sessionType ?? null;
     currentRunId.value = sessionRunIds.value.get(id) ?? null;
     pendingPlanRun.value = null;
@@ -1078,10 +1135,13 @@ export const useChatStore = defineStore("chat", () => {
     await loadSessionState(id);
   }
 
-  function newChat() {
+  function newChat(options: { persistSelection?: boolean } = {}) {
     const oldSessionId = activeSessionId.value;
     persistTodoPanelState(oldSessionId);
-    activeSessionId.value = null;
+    setActiveSessionSelection(null, { persist: options.persistSelection !== false });
+    if (options.persistSelection === false) {
+      activeSessionSelectionRestoreAttempted = false;
+    }
     activeSessionType.value = null;
     currentRunId.value = null;
     pendingSessionId = null;
@@ -1112,7 +1172,8 @@ export const useChatStore = defineStore("chat", () => {
   function resetWorkspaceScope() {
     const oldSessionId = activeSessionId.value;
     persistTodoPanelState(oldSessionId);
-    activeSessionId.value = null;
+    setActiveSessionSelection(null);
+    activeSessionSelectionRestoreAttempted = false;
     activeSessionType.value = null;
     currentRunId.value = null;
     pendingSessionId = null;
@@ -1309,7 +1370,7 @@ export const useChatStore = defineStore("chat", () => {
         };
       }
       if (!activeSessionId.value || activeSessionId.value === sid) {
-        activeSessionId.value = sid;
+        setActiveSessionSelection(sid);
         activeSessionType.value = resolveSessionType(sid) ?? "chat";
         currentRunId.value = runId;
         sessionAgentId.value = agentStore.selectedAgentId || null;
