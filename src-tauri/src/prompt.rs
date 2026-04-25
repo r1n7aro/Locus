@@ -18,6 +18,7 @@ pub mod tools {
     pub const WEBFETCH: &str = include_str!("../../tools/webfetch.json");
     pub const TODOWRITE: &str = include_str!("../../tools/todowrite.json");
     pub const UNITY_EXECUTE: &str = include_str!("../../tools/unity_execute.json");
+    pub const UNITY_RUN_STATES: &str = include_str!("../../tools/unity_run_states.json");
     pub const UNITY_REF_SEARCH: &str = include_str!("../../tools/unity_ref_search.json");
     pub const UNITY_ASSET_SEARCH: &str = include_str!("../../tools/unity_asset_search.json");
     pub const UNITY_YAML_READ: &str = include_str!("../../tools/unity_yaml_read.json");
@@ -79,6 +80,7 @@ mod tests {
             ("webfetch", tools::WEBFETCH),
             ("todowrite", tools::TODOWRITE),
             ("unity_execute", tools::UNITY_EXECUTE),
+            ("unity_run_states", tools::UNITY_RUN_STATES),
             ("unity_ref_search", tools::UNITY_REF_SEARCH),
             ("unity_asset_search", tools::UNITY_ASSET_SEARCH),
             ("unity_yaml_read", tools::UNITY_YAML_READ),

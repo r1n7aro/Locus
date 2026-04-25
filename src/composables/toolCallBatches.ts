@@ -7,6 +7,7 @@ const GENERIC_ARGUMENT_ALIAS_GROUPS: Array<readonly [string, readonly string[]]>
   ["newString", ["newString", "new_string"]],
   ["replaceAll", ["replaceAll", "replace_all"]],
   ["editorStatus", ["editorStatus", "editor_status"]],
+  ["requestEditorStatus", ["requestEditorStatus", "request_editor_status"]],
   ["assetPath", ["assetPath", "asset_path"]],
   ["maxDepth", ["maxDepth", "max_depth"]],
   ["typeFilter", ["typeFilter", "type_filter"]],

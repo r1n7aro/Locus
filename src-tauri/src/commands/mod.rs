@@ -126,6 +126,11 @@ pub enum StreamEvent {
         display: ToolConfirmDisplay,
     },
     #[serde(rename_all = "camelCase")]
+    InputAnswered {
+        session_id: String,
+        question_id: String,
+    },
+    #[serde(rename_all = "camelCase")]
     UndoAvailable {
         session_id: String,
         assistant_message_id: String,
@@ -209,10 +214,19 @@ pub struct KnowledgeToolConfirmPreview {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnityEditorStatusChangeConfirmDisplay {
+    pub tool_name: String,
+    pub current_status: String,
+    pub requested_status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum ToolConfirmDisplay {
     Basic(BasicToolConfirmDisplay),
     Knowledge(KnowledgeToolConfirmPreview),
+    UnityEditorStatusChange(UnityEditorStatusChangeConfirmDisplay),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -66,9 +66,18 @@ function summarizeText(text: string | null | undefined, maxLength = 140): string
   return `${normalized.slice(0, maxLength - 3).trimEnd()}...`;
 }
 
+function summarizeUnityStatusChange(requestedStatus: string): string {
+  const key = `chat.toolConfirm.unityStatus.title.${requestedStatus}`;
+  const title = t(key);
+  return title === key ? t("chat.toolConfirm.unityStatus.title") : title;
+}
+
 function summarizeToolConfirmDisplay(display: ToolConfirmDisplay): string {
   if (display.kind === "basic") {
     return summarizeText(display.toolName);
+  }
+  if (display.kind === "unityEditorStatusChange") {
+    return summarizeUnityStatusChange(display.requestedStatus);
   }
   return summarizeText(display.path);
 }

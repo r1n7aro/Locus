@@ -9,6 +9,7 @@ import FileDiffViewer from "./diff/FileDiffViewer.vue";
 import hljs, { langFromPath } from "../hljs";
 import { diffStrings } from "../services/diff";
 import { t } from "../i18n";
+import { resolveToolBlockOverride } from "./tool-block-overrides/toolBlockOverrides";
 
 import type { ToolCallDisplay, FileDiffPayload } from "../types";
 
@@ -47,6 +48,7 @@ const isSubagentTool = computed(() => {
 });
 
 const isCanvasTool = computed(() => props.toolCall.name === "canvas");
+const toolBlockOverride = computed(() => resolveToolBlockOverride(props.toolCall.name));
 
 function runOnNextFrame(callback: () => void) {
   if (typeof requestAnimationFrame === "function") {
@@ -407,7 +409,15 @@ const highlightedOutput = computed(() => {
 </script>
 
 <template>
-  <div ref="rootRef" class="tool-call-block" :class="[toolCall.status, { 'is-expanded': expanded }]">
+  <component
+    :is="toolBlockOverride"
+    v-if="toolBlockOverride"
+    :tool-call="toolCall"
+    :collapse-enabled="collapseEnabled"
+    @tool-viewport-anchor-start="emitToolViewportAnchorStart"
+    @tool-viewport-anchor-end="emitToolViewportAnchorEnd"
+  />
+  <div v-else ref="rootRef" class="tool-call-block" :class="[toolCall.status, { 'is-expanded': expanded }]">
     <button ref="headerRef" type="button" class="tool-call-header ui-select-none" @click="toggleExpanded">
       <span class="tool-call-icon" :class="statusIcon">
         <span v-if="toolCall.status === 'running'" class="spinner-anim"></span>
@@ -787,14 +797,13 @@ const highlightedOutput = computed(() => {
 }
 
 .nested-tool-calls :deep(.tool-call-batch-summary.open) {
-  border-color: transparent;
-  border-radius: 6px;
-  background: transparent;
+  border-color: rgba(128, 128, 128, 0.24);
+  border-radius: 6px 6px 0 0;
 }
 
-.nested-tool-calls :deep(.tool-call-batch-summary.open:hover),
-.nested-tool-calls :deep(.tool-call-batch-summary.open:focus-visible) {
-  border-color: rgba(128, 128, 128, 0.2);
+.nested-tool-calls :deep(.tool-call-batch-summary.open.closing) {
+  border-color: transparent;
+  border-radius: 6px;
 }
 
 .nested-tool-calls :deep(.tool-call-batch-chevron) {
@@ -817,9 +826,9 @@ const highlightedOutput = computed(() => {
 }
 
 .nested-tool-calls :deep(.tool-call-collection-list.with-summary.open) {
-  padding: 2px 0 0 10px;
-  border: 0;
-  border-radius: 0;
+  padding: 6px;
+  border-color: rgba(128, 128, 128, 0.24);
+  border-radius: 0 0 6px 6px;
 }
 
 .error-output {

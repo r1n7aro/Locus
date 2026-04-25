@@ -206,10 +206,11 @@ mod windows_impl {
         Ok(new_conn)
     }
 
-    pub async fn send_message(
+    async fn send_message_inner(
         project_path: &str,
         msg_type: &str,
         message: &str,
+        timeout: Option<Duration>,
     ) -> Result<PipeResponse, String> {
         let conn = get_or_connect(project_path).await?;
         let request_id = next_request_id();
@@ -258,14 +259,24 @@ mod windows_impl {
             return Err(err);
         }
 
-        let env = match tokio::time::timeout(Duration::from_secs(35), rx).await {
-            Ok(Ok(Ok(env))) => env,
-            Ok(Ok(Err(e))) => return Err(e),
-            Ok(Err(_)) => return Err("Unity response failed: response channel closed".to_string()),
-            Err(_) => {
-                let mut pending = conn.pending.lock().await;
-                pending.remove(&request_id);
-                return Err("Unity response timed out".to_string());
+        let env = if let Some(timeout) = timeout {
+            match tokio::time::timeout(timeout, rx).await {
+                Ok(Ok(Ok(env))) => env,
+                Ok(Ok(Err(e))) => return Err(e),
+                Ok(Err(_)) => {
+                    return Err("Unity response failed: response channel closed".to_string())
+                }
+                Err(_) => {
+                    let mut pending = conn.pending.lock().await;
+                    pending.remove(&request_id);
+                    return Err("Unity response timed out".to_string());
+                }
+            }
+        } else {
+            match rx.await {
+                Ok(Ok(env)) => env,
+                Ok(Err(e)) => return Err(e),
+                Err(_) => return Err("Unity response failed: response channel closed".to_string()),
             }
         };
 
@@ -274,6 +285,31 @@ mod windows_impl {
             error: env.error,
             message: env.message,
         })
+    }
+
+    pub async fn send_message_with_timeout(
+        project_path: &str,
+        msg_type: &str,
+        message: &str,
+        timeout: Duration,
+    ) -> Result<PipeResponse, String> {
+        send_message_inner(project_path, msg_type, message, Some(timeout)).await
+    }
+
+    pub async fn send_message_without_timeout(
+        project_path: &str,
+        msg_type: &str,
+        message: &str,
+    ) -> Result<PipeResponse, String> {
+        send_message_inner(project_path, msg_type, message, None).await
+    }
+
+    pub async fn send_message(
+        project_path: &str,
+        msg_type: &str,
+        message: &str,
+    ) -> Result<PipeResponse, String> {
+        send_message_with_timeout(project_path, msg_type, message, Duration::from_secs(35)).await
     }
 
     pub async fn disconnect(project_path: &str) {
@@ -296,8 +332,46 @@ pub async fn send_message(
     windows_impl::send_message(project_path, msg_type, message).await
 }
 
+#[cfg(target_os = "windows")]
+pub async fn send_message_with_timeout(
+    project_path: &str,
+    msg_type: &str,
+    message: &str,
+    timeout: Duration,
+) -> Result<PipeResponse, String> {
+    windows_impl::send_message_with_timeout(project_path, msg_type, message, timeout).await
+}
+
+#[cfg(target_os = "windows")]
+pub async fn send_message_without_timeout(
+    project_path: &str,
+    msg_type: &str,
+    message: &str,
+) -> Result<PipeResponse, String> {
+    windows_impl::send_message_without_timeout(project_path, msg_type, message).await
+}
+
 #[cfg(not(target_os = "windows"))]
 pub async fn send_message(
+    _project_path: &str,
+    _msg_type: &str,
+    _message: &str,
+) -> Result<PipeResponse, String> {
+    Err("Unity bridge is only supported on Windows (named pipes)".to_string())
+}
+
+#[cfg(not(target_os = "windows"))]
+pub async fn send_message_with_timeout(
+    _project_path: &str,
+    _msg_type: &str,
+    _message: &str,
+    _timeout: Duration,
+) -> Result<PipeResponse, String> {
+    Err("Unity bridge is only supported on Windows (named pipes)".to_string())
+}
+
+#[cfg(not(target_os = "windows"))]
+pub async fn send_message_without_timeout(
     _project_path: &str,
     _msg_type: &str,
     _message: &str,

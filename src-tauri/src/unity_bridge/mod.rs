@@ -4,7 +4,7 @@ mod transport;
 
 use std::{
     collections::HashMap,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, OnceLock},
     time::Duration,
 };
@@ -17,7 +17,7 @@ pub use plugin::{
     check_plugin_status, emit_plugin_status, find_plugin_source_dir, install_or_update_plugin,
     PluginStatus,
 };
-pub use transport::send_message;
+pub use transport::{send_message, send_message_with_timeout, send_message_without_timeout};
 
 pub type UnityMonitorHandle = Arc<tokio::sync::Mutex<Option<tauri::async_runtime::JoinHandle<()>>>>;
 
@@ -169,6 +169,248 @@ pub async fn exit_play_mode(project_path: &str) -> Result<(), String> {
         if status == UNITY_EDITOR_STATUS_EDITING {
             return Ok(());
         }
+    }
+}
+
+pub async fn set_editor_status(project_path: &str, desired_status: &str) -> Result<(), String> {
+    if !is_known_editor_status(desired_status) || desired_status == UNITY_EDITOR_STATUS_DISCONNECTED
+    {
+        return Err(format!(
+            "Invalid requested Unity Editor status: {}",
+            desired_status
+        ));
+    }
+
+    let resp = send_message(project_path, "set_editor_status", desired_status).await?;
+    if !resp.ok {
+        return Err(resp
+            .error
+            .unwrap_or_else(|| "set_editor_status failed".to_string()));
+    }
+
+    let max_wait = Duration::from_secs(30);
+    let start = std::time::Instant::now();
+    loop {
+        if start.elapsed() > max_wait {
+            return Err(format!(
+                "Timed out waiting for Unity Editor status '{}' (30s)",
+                desired_status
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let (_connected, status, _) = query_unity_status(project_path).await;
+        if status == desired_status {
+            return Ok(());
+        }
+    }
+}
+
+const RUN_STATES_INLINE_PRINT_LIMIT_TOKENS: u64 = 100_000;
+const RUN_STATES_HARD_PRINT_LIMIT_TOKENS: u64 = 1_000_000;
+const RUN_STATES_TOKEN_BYTE_RATIO: u64 = 4;
+
+#[derive(Debug, Clone, Copy)]
+struct RunStatesPrintStats {
+    lines: u64,
+    tokens: u64,
+}
+
+fn estimate_run_states_tokens(byte_count: u64) -> u64 {
+    if byte_count == 0 {
+        0
+    } else {
+        (byte_count + RUN_STATES_TOKEN_BYTE_RATIO - 1) / RUN_STATES_TOKEN_BYTE_RATIO
+    }
+}
+
+fn parse_run_states_u64_field(output: &str, key: &str) -> Option<u64> {
+    let prefix = format!("{key}:");
+    output.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix(&prefix)
+            .and_then(|value| value.trim().parse::<u64>().ok())
+    })
+}
+
+fn compute_run_states_print_stats(output: &str) -> RunStatesPrintStats {
+    let mut found_prints = false;
+    let mut lines = 0u64;
+    let mut bytes = 0u64;
+
+    for line in output.lines() {
+        if found_prints {
+            lines += 1;
+            bytes = bytes.saturating_add(line.as_bytes().len() as u64 + 1);
+            continue;
+        }
+
+        if line.trim().eq_ignore_ascii_case("prints:") {
+            found_prints = true;
+        }
+    }
+
+    RunStatesPrintStats {
+        lines: parse_run_states_u64_field(output, "print_lines").unwrap_or(lines),
+        tokens: parse_run_states_u64_field(output, "print_tokens_estimate")
+            .unwrap_or_else(|| estimate_run_states_tokens(bytes)),
+    }
+}
+
+fn run_states_output_header(output: &str) -> String {
+    let mut lines = Vec::new();
+    for line in output.lines() {
+        if line.trim().eq_ignore_ascii_case("prints:") {
+            break;
+        }
+        lines.push(line.trim_end_matches('\r'));
+    }
+    lines.join("\n")
+}
+
+fn run_states_has_field(output: &str, key: &str) -> bool {
+    let prefix = format!("{key}:");
+    output
+        .lines()
+        .any(|line| line.trim_start().starts_with(&prefix))
+}
+
+fn push_run_states_field_if_missing(summary: &mut String, header: &str, key: &str, value: &str) {
+    if !run_states_has_field(header, key) {
+        summary.push_str(key);
+        summary.push_str(": ");
+        summary.push_str(value);
+        summary.push('\n');
+    }
+}
+
+fn run_states_result_dir(project_path: &str) -> PathBuf {
+    Path::new(project_path)
+        .join("Library")
+        .join("Locus")
+        .join("RunStates")
+}
+
+fn persist_run_states_result(project_path: &str, output: &str) -> Result<PathBuf, String> {
+    let dir = run_states_result_dir(project_path);
+    std::fs::create_dir_all(&dir).map_err(|error| {
+        format!(
+            "Failed to create unity_run_states result dir '{}': {}",
+            dir.display(),
+            error
+        )
+    })?;
+
+    let path = dir.join(format!("run-states-{}.txt", uuid::Uuid::new_v4()));
+    std::fs::write(&path, output).map_err(|error| {
+        format!(
+            "Failed to save unity_run_states result to '{}': {}",
+            path.display(),
+            error
+        )
+    })?;
+    Ok(path)
+}
+
+fn build_run_states_large_summary(
+    output: &str,
+    stats: RunStatesPrintStats,
+    result_file: Option<&Path>,
+) -> String {
+    let header = run_states_output_header(output);
+    let mut summary = header.trim_end().to_string();
+    if !summary.is_empty() {
+        summary.push('\n');
+    }
+
+    push_run_states_field_if_missing(
+        &mut summary,
+        &header,
+        "print_lines",
+        &stats.lines.to_string(),
+    );
+    push_run_states_field_if_missing(
+        &mut summary,
+        &header,
+        "print_tokens_estimate",
+        &stats.tokens.to_string(),
+    );
+    push_run_states_field_if_missing(&mut summary, &header, "print_output", "too large");
+
+    if let Some(path) = result_file {
+        push_run_states_field_if_missing(
+            &mut summary,
+            &header,
+            "result_file",
+            &path.display().to_string(),
+        );
+        push_run_states_field_if_missing(
+            &mut summary,
+            &header,
+            "print_output_message",
+            &format!(
+                "print output exceeded {} estimated tokens; full result saved to result_file.",
+                RUN_STATES_INLINE_PRINT_LIMIT_TOKENS
+            ),
+        );
+    } else {
+        push_run_states_field_if_missing(
+            &mut summary,
+            &header,
+            "print_output_message",
+            &format!(
+                "print output exceeded hard limit of {} estimated tokens; result was not saved.",
+                RUN_STATES_HARD_PRINT_LIMIT_TOKENS
+            ),
+        );
+    }
+
+    summary.trim_end().to_string()
+}
+
+fn rewrite_run_states_output_for_size(
+    project_path: &str,
+    output: String,
+) -> Result<String, String> {
+    let stats = compute_run_states_print_stats(&output);
+    if stats.tokens <= RUN_STATES_INLINE_PRINT_LIMIT_TOKENS {
+        return Ok(output);
+    }
+
+    if stats.tokens > RUN_STATES_HARD_PRINT_LIMIT_TOKENS {
+        return Err(build_run_states_large_summary(&output, stats, None));
+    }
+
+    let path = persist_run_states_result(project_path, &output).map_err(|error| {
+        format!(
+            "print_output: too large\nprint_lines: {}\nprint_tokens_estimate: {}\nprint_output_message: {}\n{}",
+            stats.lines,
+            stats.tokens,
+            "print output exceeded inline limit and could not be saved.",
+            error
+        )
+    })?;
+    Ok(build_run_states_large_summary(&output, stats, Some(&path)))
+}
+
+pub async fn unity_run_states(
+    project_path: &str,
+    request: &serde_json::Value,
+) -> Result<String, String> {
+    let payload = serde_json::to_string(request)
+        .map_err(|error| format!("Failed to serialize unity_run_states request: {}", error))?;
+    let resp = send_message_without_timeout(project_path, "run_states", &payload).await?;
+    let output = if resp.ok {
+        resp.message.unwrap_or_default()
+    } else {
+        resp.error
+            .unwrap_or_else(|| "unity_run_states failed".to_string())
+    };
+
+    let rewritten = rewrite_run_states_output_for_size(project_path, output)?;
+    if resp.ok {
+        Ok(rewritten)
+    } else {
+        Err(rewritten)
     }
 }
 
@@ -419,5 +661,82 @@ pub async fn stop_unity_monitor(monitor: &UnityMonitorHandle) {
     if let Some(handle) = monitor.lock().await.take() {
         handle.abort();
         eprintln!("[Locus] Unity connection monitor stopped");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rewrite_run_states_output_for_size;
+
+    fn result_file(summary: &str) -> String {
+        summary
+            .lines()
+            .find_map(|line| line.strip_prefix("result_file: "))
+            .expect("result_file field")
+            .to_string()
+    }
+
+    #[test]
+    fn run_states_small_print_output_stays_inline() {
+        let output = [
+            "status: ok",
+            "final_state: done",
+            "print_lines: 2",
+            "print_tokens_estimate: 2",
+            "prints:",
+            "a",
+            "b",
+        ]
+        .join("\n");
+
+        let rewritten = rewrite_run_states_output_for_size("C:/Project", output.clone()).unwrap();
+        assert_eq!(rewritten, output);
+    }
+
+    #[test]
+    fn run_states_large_print_output_is_saved_under_project_library() {
+        let project = tempfile::tempdir().expect("temp project");
+        let output = [
+            "status: ok",
+            "final_state: done",
+            "print_lines: 12000",
+            "print_tokens_estimate: 100001",
+            "prints:",
+            "large output",
+        ]
+        .join("\n");
+
+        let rewritten =
+            rewrite_run_states_output_for_size(&project.path().to_string_lossy(), output.clone())
+                .unwrap();
+        assert!(rewritten.contains("print_output: too large"));
+        assert!(rewritten.contains("print_lines: 12000"));
+        assert!(rewritten.contains("print_tokens_estimate: 100001"));
+
+        let path = result_file(&rewritten);
+        assert!(path
+            .replace('\\', "/")
+            .contains("/Library/Locus/RunStates/"));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), output);
+    }
+
+    #[test]
+    fn run_states_hard_limit_returns_too_large_without_saving() {
+        let project = tempfile::tempdir().expect("temp project");
+        let output = [
+            "status: error",
+            "final_state: done",
+            "print_lines: 90000",
+            "print_tokens_estimate: 1000001",
+            "print_output: too large",
+        ]
+        .join("\n");
+
+        let error = rewrite_run_states_output_for_size(&project.path().to_string_lossy(), output)
+            .unwrap_err();
+        assert!(error.contains("print_output: too large"));
+        assert!(error.contains("print_lines: 90000"));
+        assert!(error.contains("result was not saved"));
+        assert!(!project.path().join("Library").join("Locus").exists());
     }
 }

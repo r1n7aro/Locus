@@ -98,6 +98,75 @@ pub(super) fn unity_execute() -> ToolDef {
     }
 }
 
+// ─── unity_run_states ───────────────────────────────────────────────────────
+
+pub(super) fn unity_run_states() -> ToolDef {
+    let prompt = crate::prompt::parse_tool_prompt(crate::prompt::tools::UNITY_RUN_STATES);
+    ToolDef {
+        name: "unity_run_states".to_string(),
+        description: prompt.description,
+        parameters: prompt.parameters,
+        execute: make_exec(|args, ctx| {
+            Box::pin(async move {
+                let project_path = match ctx.working_dir {
+                    Some(path) if !path.trim().is_empty() => path,
+                    _ => {
+                        return ToolResult {
+                            output: "Tool 'unity_run_states' requires a selected Unity project working directory.".to_string(),
+                            is_error: true,
+                        };
+                    }
+                };
+
+                let requested_status = match args
+                    .get("request_editor_status")
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    Some(status) => status,
+                    None => {
+                        return ToolResult {
+                            output: "Missing required parameter: request_editor_status".to_string(),
+                            is_error: true,
+                        };
+                    }
+                };
+
+                let (connected, actual_status, _) =
+                    crate::unity_bridge::query_unity_status(&project_path).await;
+                if !connected {
+                    return ToolResult {
+                        output: "Unity Editor not connected".to_string(),
+                        is_error: true,
+                    };
+                }
+
+                if actual_status != requested_status {
+                    return ToolResult {
+                        output: format!(
+                            "Unity Editor status is \"{}\". `unity_run_states` requires \"{}\".",
+                            actual_status, requested_status
+                        ),
+                        is_error: true,
+                    };
+                }
+
+                match crate::unity_bridge::unity_run_states(&project_path, &args).await {
+                    Ok(output) => ToolResult {
+                        output: output.trim().to_string(),
+                        is_error: false,
+                    },
+                    Err(e) => ToolResult {
+                        output: e,
+                        is_error: true,
+                    },
+                }
+            })
+        }),
+    }
+}
+
 // ─── unity_ref_search ──────────────────────────────────────────────────────
 
 pub(super) fn unity_ref_search() -> ToolDef {

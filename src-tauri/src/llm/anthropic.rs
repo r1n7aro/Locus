@@ -1473,6 +1473,7 @@ fn oauth_public_tool_name(internal_name: &str) -> String {
         "todowrite" => "TodoWrite".to_string(),
         "unity_asset_search" => "UnityAssetSearch".to_string(),
         "unity_execute" => "UnityExecute".to_string(),
+        "unity_run_states" => "UnityRunStates".to_string(),
         "unity_recompile" => "UnityRecompile".to_string(),
         "unity_ref_search" => "UnityRefSearch".to_string(),
         "unity_yaml_read" => "UnityYamlRead".to_string(),

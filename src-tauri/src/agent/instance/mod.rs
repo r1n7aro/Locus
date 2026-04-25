@@ -21,6 +21,7 @@ use crate::agent::definition::{AgentDef, AgentDefRegistry};
 use crate::commands::{
     BasicToolConfirmDisplay, KnowledgeToolConfirmDirectoryMode, KnowledgeToolConfirmOperation,
     KnowledgeToolConfirmPreview, StreamEvent, ToolConfirmDisplay,
+    UnityEditorStatusChangeConfirmDisplay,
 };
 use crate::compact;
 use crate::llm::{anthropic, codex, openrouter, responses};
@@ -1850,9 +1851,9 @@ impl AgentInstance {
                 require_non_empty("project_path", "to be set explicitly")
                     .or_else(|| require_absolute_without_workspace("project_path"))
             }
-            "unity_ref_search" | "unity_asset_search" | "unity_yaml_read" | "knowledge_list"
-            | "knowledge_query" | "knowledge_read" | "knowledge_create" | "knowledge_delete"
-            | "knowledge_move" | "knowledge_edit" => {
+            "unity_run_states" | "unity_ref_search" | "unity_asset_search" | "unity_yaml_read"
+            | "knowledge_list" | "knowledge_query" | "knowledge_read" | "knowledge_create"
+            | "knowledge_delete" | "knowledge_move" | "knowledge_edit" => {
                 if has_working_dir {
                     None
                 } else {
@@ -4377,7 +4378,9 @@ impl AgentInstance {
                 let needs_undo = prepared
                     .iter()
                     .any(|(tc, _)| Self::needs_undo_tracking(&tc.name));
-                let has_unity_execute = prepared.iter().any(|(tc, _)| tc.name == "unity_execute");
+                let has_unity_execute = prepared
+                    .iter()
+                    .any(|(tc, _)| tc.name == "unity_execute" || tc.name == "unity_run_states");
 
                 let pre_checkpoint = if needs_undo {
                     if let Some(ref undo_mgr) = self.undo_manager {
@@ -4838,6 +4841,7 @@ impl AgentInstance {
         matches!(
             name,
             "unity_execute"
+                | "unity_run_states"
                 | "write"
                 | "edit"
                 | "bash"
@@ -5032,7 +5036,14 @@ impl AgentInstance {
         {
             let question_store: tauri::State<crate::QuestionStore> = app_handle.state();
             let mut store = question_store.lock().await;
-            store.insert(question_id.clone(), tx);
+            store.insert(
+                question_id.clone(),
+                crate::PendingQuestionResponse {
+                    session_id: self.session_id.clone(),
+                    run_id: run_id.to_string(),
+                    tx,
+                },
+            );
         }
 
         emit_stream(
@@ -5087,6 +5098,94 @@ impl AgentInstance {
                 eprintln!(
                     "[Agent {}] tool confirm: interrupted for '{}' (question_id={})",
                     self.id, tool_name, question_id
+                );
+                ToolConfirmDecision::Deny { feedback: None }
+            }
+        }
+    }
+
+    async fn request_unity_editor_status_change_confirm(
+        &self,
+        app_handle: &AppHandle,
+        tool_call_id: &str,
+        current_status: &str,
+        requested_status: &str,
+        run_id: &str,
+    ) -> ToolConfirmDecision {
+        let question_id = uuid::Uuid::new_v4().to_string();
+        let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+
+        {
+            let question_store: tauri::State<crate::QuestionStore> = app_handle.state();
+            let mut store = question_store.lock().await;
+            store.insert(
+                question_id.clone(),
+                crate::PendingQuestionResponse {
+                    session_id: self.session_id.clone(),
+                    run_id: run_id.to_string(),
+                    tx,
+                },
+            );
+        }
+
+        emit_stream(
+            app_handle,
+            run_id,
+            crate::commands::StreamEvent::ToolConfirm {
+                session_id: self.session_id.clone(),
+                question_id: question_id.clone(),
+                tool_call_id: tool_call_id.to_string(),
+                display: ToolConfirmDisplay::UnityEditorStatusChange(
+                    UnityEditorStatusChangeConfirmDisplay {
+                        tool_name: "unity_run_states".to_string(),
+                        current_status: current_status.to_string(),
+                        requested_status: requested_status.to_string(),
+                    },
+                ),
+            },
+        );
+
+        eprintln!(
+            "[Agent {}] unity_run_states status change confirm: waiting for user approval (question_id={})",
+            self.id, question_id
+        );
+
+        let mut cancel_rx = self.cancel_waiter();
+        let answer_result = tokio::select! {
+            result = rx => Some(result),
+            _ = cancel_rx.changed() => None,
+        };
+
+        match answer_result {
+            Some(Ok(answer)) => {
+                let decision = Self::parse_tool_confirm_answer(&answer);
+                let status = match &decision {
+                    ToolConfirmDecision::Allow => "allowed".to_string(),
+                    ToolConfirmDecision::Deny {
+                        feedback: Some(feedback),
+                    } => format!("rejected with feedback: {}", feedback),
+                    ToolConfirmDecision::Deny { feedback: None } => "denied".to_string(),
+                };
+                eprintln!(
+                    "[Agent {}] unity_run_states status change confirm: user {} (question_id={})",
+                    self.id, status, question_id
+                );
+                decision
+            }
+            Some(Err(_)) => {
+                eprintln!(
+                    "[Agent {}] unity_run_states status change confirm: cancelled (question_id={})",
+                    self.id, question_id
+                );
+                ToolConfirmDecision::Deny { feedback: None }
+            }
+            None => {
+                let question_store: tauri::State<crate::QuestionStore> = app_handle.state();
+                let mut store = question_store.lock().await;
+                store.remove(&question_id);
+                eprintln!(
+                    "[Agent {}] unity_run_states status change confirm: interrupted (question_id={})",
+                    self.id, question_id
                 );
                 ToolConfirmDecision::Deny { feedback: None }
             }
@@ -5226,6 +5325,9 @@ impl AgentInstance {
                 .await
         } else if tc.name == "unity_recompile" {
             self.await_tool_result(self.execute_unity_recompile(app_handle, &tc.id, args, run_id))
+                .await
+        } else if tc.name == "unity_run_states" {
+            self.await_tool_result(self.execute_unity_run_states(app_handle, &tc.id, args, run_id))
                 .await
         } else if tc.name == "unity_ref_search" {
             ExecutedToolResult::from_tool_result(self.execute_unity_ref_search(app_handle, args))
@@ -5914,7 +6016,14 @@ impl AgentInstance {
         {
             let question_store: tauri::State<crate::QuestionStore> = app_handle.state();
             let mut store = question_store.lock().await;
-            store.insert(question_id.clone(), tx);
+            store.insert(
+                question_id.clone(),
+                crate::PendingQuestionResponse {
+                    session_id: self.session_id.clone(),
+                    run_id: run_id.to_string(),
+                    tx,
+                },
+            );
         }
 
         emit_stream(
@@ -6018,6 +6127,110 @@ impl AgentInstance {
             },
             Err(e) => ToolResult {
                 output: format!("Compilation failed:\n{}", e),
+                is_error: true,
+            },
+        }
+    }
+
+    async fn execute_unity_run_states(
+        &self,
+        app_handle: &AppHandle,
+        tool_call_id: &str,
+        args: &serde_json::Value,
+        run_id: &str,
+    ) -> ToolResult {
+        if !self.has_selected_working_dir() {
+            return ToolResult {
+                output: "unity_run_states requires a selected Unity project working directory."
+                    .to_string(),
+                is_error: true,
+            };
+        }
+
+        let requested_status = match args
+            .get("request_editor_status")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            Some(status) => status,
+            None => {
+                return ToolResult {
+                    output: "Missing required parameter: request_editor_status".to_string(),
+                    is_error: true,
+                };
+            }
+        };
+
+        if requested_status == crate::unity_bridge::UNITY_EDITOR_STATUS_DISCONNECTED
+            || !crate::unity_bridge::is_known_editor_status(requested_status)
+        {
+            return ToolResult {
+                output: format!(
+                    "Invalid request_editor_status: '{}'. Allowed values: editing, playing, playing_paused.",
+                    requested_status
+                ),
+                is_error: true,
+            };
+        }
+
+        let (connected, current_status, _) =
+            crate::unity_bridge::query_unity_status(&self.working_dir).await;
+        if !connected {
+            return ToolResult {
+                output: "Unity Editor not connected".to_string(),
+                is_error: true,
+            };
+        }
+
+        if current_status != requested_status {
+            match self
+                .request_unity_editor_status_change_confirm(
+                    app_handle,
+                    tool_call_id,
+                    &current_status,
+                    requested_status,
+                    run_id,
+                )
+                .await
+            {
+                ToolConfirmDecision::Allow => {}
+                ToolConfirmDecision::Deny { feedback } => {
+                    let output = match feedback {
+                        Some(feedback) => format!(
+                            "Unity Editor status change was rejected by user feedback.\nUser feedback: {}",
+                            feedback
+                        ),
+                        None => "user_denied_editor_state_change".to_string(),
+                    };
+                    return ToolResult {
+                        output,
+                        is_error: true,
+                    };
+                }
+            }
+
+            if let Err(error) =
+                crate::unity_bridge::set_editor_status(&self.working_dir, requested_status).await
+            {
+                return ToolResult {
+                    output: format!("Failed to change Unity Editor status: {}", error),
+                    is_error: true,
+                };
+            }
+        }
+
+        match crate::unity_bridge::unity_run_states(&self.working_dir, args).await {
+            Ok(output) => ToolResult {
+                output: if output.trim().is_empty() {
+                    "unity_run_states completed with no output.".to_string()
+                } else {
+                    output
+                },
+                is_error: false,
+            },
+            Err(error) => ToolResult {
+                output: error,
                 is_error: true,
             },
         }

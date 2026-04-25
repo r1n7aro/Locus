@@ -40,6 +40,7 @@ namespace Locus
         private static readonly object _connectionLock = new object();
         private static readonly SemaphoreSlim _writeLock = new SemaphoreSlim(1, 1);
         private static readonly SemaphoreSlim _executeCodeLock = new SemaphoreSlim(1, 1);
+        private static readonly SemaphoreSlim _runStatesLock = new SemaphoreSlim(1, 1);
 
         private static NamedPipeServerStream _currentServer;
         private static StreamWriter _currentWriter;
@@ -487,6 +488,8 @@ namespace Locus
             _isPaused = EditorApplication.isPaused;
             _activeScenePath = EditorSceneManager.GetActiveScene().path ?? "";
 
+            PumpRunStates();
+
             // Detect "no compilation started" after request_recompile
             if (_recompileCheckFrames >= 0)
             {
@@ -836,8 +839,14 @@ namespace Locus
                         return OkResponse(reqId, "exit_play_mode_requested");
                     }
 
+                    case "set_editor_status":
+                        return await HandleSetEditorStatus(reqId, msg.message);
+
                     case "execute_code":
                         return await HandleExecuteCode(reqId, msg.message);
+
+                    case "run_states":
+                        return await HandleRunStates(reqId, msg.message);
 
                     case "request_recompile":
                     {

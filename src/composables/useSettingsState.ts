@@ -91,8 +91,12 @@ export function useSettingsState(emit: SettingsEmit) {
       localStorage.removeItem("locus-locale");
       localStorage.removeItem("locus-theme-preference");
       localStorage.removeItem("locus:sessionPanelWidth");
+      localStorage.removeItem("locus:unity:sessionPanelWidth");
+      localStorage.removeItem("locus:unity:sessionPanelCollapsed");
       localStorage.removeItem("locus:chatSidebarWidth");
       localStorage.removeItem("locus:chatSidebarHeight");
+      localStorage.removeItem("locus:unity:chatSidebarWidth");
+      localStorage.removeItem("locus:unity:chatSidebarHeight");
       localStorage.removeItem("locus:collabLeftColWidth");
       localStorage.removeItem("locus:collabTerminalHeight");
     } catch { /* ignore */ }
@@ -553,6 +557,7 @@ export function useSettingsState(emit: SettingsEmit) {
     { name: "webfetch",           label: "webfetch",           desc: t("tool.desc.webfetch"),           defaultMode: "ask"  as const },
     { name: "canvas",             label: "canvas",             desc: t("tool.desc.canvas"),             defaultMode: "auto" as const },
     { name: "unity_execute",      label: "unity_execute",      desc: t("tool.desc.unity_execute"),      defaultMode: "ask"  as const },
+    { name: "unity_run_states",   label: "unity_run_states",   desc: t("tool.desc.unity_run_states"),   defaultMode: "ask"  as const },
     { name: "unity_recompile",    label: "unity_recompile",    desc: t("tool.desc.unity_recompile"),    defaultMode: "auto" as const },
     { name: "unity_ref_search",   label: "unity_ref_search",   desc: t("tool.desc.unity_ref_search"),   defaultMode: "auto" as const },
     { name: "unity_asset_search", label: "unity_asset_search", desc: t("tool.desc.unity_asset_search"), defaultMode: "auto" as const },

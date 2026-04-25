@@ -24,6 +24,7 @@ pub fn register_all(registry: &mut ToolRegistry) {
 
     registry.register(filesystem::list());
     registry.register(unity::unity_execute());
+    registry.register(unity::unity_run_states());
     registry.register(unity::unity_recompile());
     registry.register(unity::unity_ref_search());
     registry.register(unity::unity_yaml_read());
