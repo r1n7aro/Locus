@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use rusqlite::{params, Connection, Transaction};
@@ -10,7 +11,7 @@ const CURRENT_PARSER_VERSION: u32 = 1;
 /// Schema version. Bump on any incompatible asset-table schema change. Mismatch
 /// at `open_db` time triggers a full DB delete + rebuild — `locus.db` is a
 /// pure cache and we never migrate it.
-pub const ASSET_DB_VERSION: u32 = 5;
+pub const ASSET_DB_VERSION: u32 = 6;
 
 pub(crate) fn db_path(project_root: &Path) -> PathBuf {
     project_root.join("Library").join("Locus").join("locus.db")
@@ -139,6 +140,12 @@ fn create_tables(conn: &Connection) -> Result<(), String> {
             owner_guid BLOB
         );
 
+        CREATE TABLE IF NOT EXISTS script_inheritance_terms (
+            term TEXT NOT NULL,
+            script_guid BLOB NOT NULL,
+            PRIMARY KEY(term, script_guid)
+        );
+
         CREATE INDEX IF NOT EXISTS idx_assets_path ON assets(path);
         CREATE INDEX IF NOT EXISTS idx_assets_kind_stem
             ON assets(exists_on_disk, kind, stem_lower);
@@ -157,6 +164,8 @@ fn create_tables(conn: &Connection) -> Result<(), String> {
         CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(src_guid);
         CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(dst_guid);
         CREATE INDEX IF NOT EXISTS idx_files_owner_guid ON files(owner_guid);
+        CREATE INDEX IF NOT EXISTS idx_script_inheritance_terms_guid
+            ON script_inheritance_terms(script_guid);
 
         -- FTS5 trigram virtual table. Only consumed by
         -- `search_assets_for_command` (the asset-page free-text path).
@@ -242,10 +251,56 @@ pub fn clear_all_in_tx(tx: &Transaction) -> Result<(), String> {
         "DELETE FROM edges;
          DELETE FROM assets;
          DELETE FROM files;
+         DELETE FROM script_inheritance_terms;
          DELETE FROM asset_scan_metrics;",
     )
     .map_err(|e| format!("Failed to clear tables: {}", e))?;
     asset_fts::clear_all(tx)?;
+    Ok(())
+}
+
+fn script_inheritance_terms(asset: &AssetNode) -> Vec<String> {
+    if asset.kind != AssetKind::Script || !asset.exists_on_disk {
+        return Vec::new();
+    }
+
+    let mut terms = Vec::new();
+    let mut seen = HashSet::new();
+    for term in asset.script_inheritance_search.split_whitespace() {
+        let normalized = term.trim().to_ascii_lowercase();
+        if normalized.is_empty() || !seen.insert(normalized.clone()) {
+            continue;
+        }
+        terms.push(normalized);
+    }
+    terms
+}
+
+fn insert_script_inheritance_terms(tx: &Transaction, asset: &AssetNode) -> Result<(), String> {
+    let terms = script_inheritance_terms(asset);
+    if terms.is_empty() {
+        return Ok(());
+    }
+
+    let mut stmt = tx
+        .prepare_cached(
+            "INSERT OR IGNORE INTO script_inheritance_terms (term, script_guid)
+             VALUES (?1, ?2)",
+        )
+        .map_err(|e| format!("Failed to prepare script inheritance term insert: {}", e))?;
+    for term in terms {
+        stmt.execute(params![term, asset.guid.as_slice()])
+            .map_err(|e| format!("Failed to insert script inheritance term: {}", e))?;
+    }
+    Ok(())
+}
+
+fn delete_script_inheritance_terms(tx: &Transaction, guid: &Guid) -> Result<(), String> {
+    tx.execute(
+        "DELETE FROM script_inheritance_terms WHERE script_guid = ?1",
+        params![guid.as_slice()],
+    )
+    .map_err(|e| format!("Failed to delete script inheritance terms: {}", e))?;
     Ok(())
 }
 
@@ -476,6 +531,7 @@ pub fn batch_insert_assets(tx: &Transaction, assets: &[AssetNode]) -> Result<u64
                     a.script_type_search.as_str(),
                 ])
                 .map_err(|e| format!("Failed to insert asset_search_fts row: {}", e))?;
+            insert_script_inheritance_terms(tx, a)?;
             count += 1;
         }
     }
@@ -1199,27 +1255,25 @@ pub fn find_script_descendant_paths(
         return Ok(Vec::new());
     }
 
-    let clauses: Vec<String> = lowered
-        .iter()
-        .map(|_| "(' ' || script_inheritance_search || ' ') LIKE ?".to_string())
-        .collect();
+    let placeholders: Vec<&str> = lowered.iter().map(|_| "?").collect();
     let sql = format!(
-        "SELECT path
-         FROM assets
-         WHERE exists_on_disk = 1
-           AND kind = ?1
-           AND guid != ?2
-           AND ({})
-         ORDER BY path",
-        clauses.join(" OR ")
+        "SELECT DISTINCT a.path
+         FROM script_inheritance_terms t
+         JOIN assets a ON a.guid = t.script_guid
+         WHERE t.term IN ({})
+           AND a.exists_on_disk = 1
+           AND a.kind = ?
+           AND a.guid != ?
+         ORDER BY a.path",
+        placeholders.join(",")
     );
 
     let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+    for name in lowered {
+        params_vec.push(Box::new(name));
+    }
     params_vec.push(Box::new(AssetKind::Script as i32));
     params_vec.push(Box::new(exclude_guid.to_vec()));
-    for name in lowered {
-        params_vec.push(Box::new(format!("% {} %", name)));
-    }
 
     let refs: Vec<&dyn rusqlite::types::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
     let mut stmt = conn
@@ -1848,15 +1902,13 @@ pub fn delete_missing_asset_path(conn: &mut Connection, asset_path: &str) -> Res
 
     if let Some(guid) = canonical_guid {
         let g = guid.as_slice();
-        tx.execute(
-            "DELETE FROM edges WHERE src_guid = ?1 OR dst_guid = ?1",
-            params![g],
-        )
-        .map_err(|e| format!("Failed to delete edges: {}", e))?;
+        tx.execute("DELETE FROM edges WHERE src_guid = ?1", params![g])
+            .map_err(|e| format!("Failed to delete outgoing edges: {}", e))?;
         tx.execute("DELETE FROM files WHERE owner_guid = ?1", params![g])
             .map_err(|e| format!("Failed to delete files: {}", e))?;
         tx.execute("DELETE FROM assets WHERE guid = ?1", params![g])
             .map_err(|e| format!("Failed to delete asset: {}", e))?;
+        delete_script_inheritance_terms(&tx, &guid)?;
         asset_fts::delete_by_guid(&tx, &guid_to_hex(&guid))?;
     }
 
@@ -1961,6 +2013,9 @@ pub fn atomic_update_asset(
             asset.script_type_search.as_str(),
         )?;
     }
+
+    delete_script_inheritance_terms(&tx, &asset.guid)?;
+    insert_script_inheritance_terms(&tx, asset)?;
 
     {
         let mut stmt = tx
@@ -2077,6 +2132,42 @@ pub fn get_all_meta_asset_mtimes(conn: &Connection) -> Result<Vec<(String, u64)>
     Ok(result)
 }
 
+#[derive(Debug, Clone)]
+pub struct AssetMtimeRecord {
+    pub path: String,
+    pub mtime_ns: u64,
+    pub kind: AssetKind,
+    pub exists_on_disk: bool,
+}
+
+pub fn get_all_asset_mtime_records(conn: &Connection) -> Result<Vec<AssetMtimeRecord>, String> {
+    let mut stmt = conn
+        .prepare("SELECT path, mtime_ns, kind, exists_on_disk FROM assets")
+        .map_err(|e| format!("Failed to prepare mtime record query: {}", e))?;
+
+    let rows = stmt
+        .query_map([], |row| {
+            let path: String = row.get(0)?;
+            let mtime: i64 = row.get(1)?;
+            let kind: i32 = row.get(2)?;
+            let exists: i32 = row.get(3)?;
+            Ok(AssetMtimeRecord {
+                path,
+                mtime_ns: mtime as u64,
+                kind: AssetKind::from_i32(kind),
+                exists_on_disk: exists != 0,
+            })
+        })
+        .map_err(|e| format!("Failed to query mtime records: {}", e))?;
+
+    let mut result = Vec::new();
+    for row in rows {
+        result.push(row.map_err(|e| format!("Failed to read mtime record row: {}", e))?);
+    }
+    Ok(result)
+}
+
+#[allow(dead_code)]
 pub fn get_all_asset_mtimes(conn: &Connection) -> Result<Vec<(String, u64)>, String> {
     let mut stmt = conn
         .prepare("SELECT path, mtime_ns FROM assets")
@@ -2273,6 +2364,49 @@ mod tests {
             meta_rows,
             vec![("Assets/Game/Canonical.prefab".to_string(), 10)]
         );
+    }
+
+    #[test]
+    fn delete_missing_asset_path_preserves_incoming_missing_reference_edges() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+
+        let src = test_asset("Assets/Scenes/Main.prefab", AssetKind::Prefab, "");
+        let dst = test_script_asset(
+            "Assets/Scripts/MissingBehaviour.cs",
+            "MissingBehaviour",
+            "",
+            "missingbehaviour monobehaviour",
+            "monobehaviour",
+        );
+        seed_assets(&mut conn, &[src.clone(), dst.clone()]);
+
+        let tx = conn.transaction().unwrap();
+        batch_insert_edges(
+            &tx,
+            &[RefEdge {
+                src_guid: src.guid,
+                dst_guid: dst.guid,
+                dst_file_id: Some(11500000),
+                class_id_hint: Some(114),
+                field_hint: Some("m_Script".to_string()),
+                ref_path: Some("m_Component[0].component".to_string()),
+            }],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let removed =
+            delete_missing_asset_path(&mut conn, "Assets/Scripts/MissingBehaviour.cs").unwrap();
+        assert!(removed);
+
+        let counts = get_missing_reference_counts(&conn).unwrap();
+        assert_eq!(counts.missing_scripts, 1);
+        assert_eq!(counts.broken_references, 0);
+
+        let incoming = get_direct_refs(&conn, &dst.guid).unwrap();
+        assert_eq!(incoming.len(), 1);
+        assert_eq!(incoming[0].src_guid, src.guid);
     }
 
     #[test]

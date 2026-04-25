@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
@@ -18,6 +19,7 @@ use super::AssetDb;
 use crate::unity_yaml;
 
 const MTIME_SCAN_INTERVAL_SECS: u64 = 60;
+const NEW_META_DISCOVERY_INTERVAL_SECS: u64 = 10 * 60;
 
 /// Default per-item debounce in milliseconds. Tunable at runtime via
 /// [`WatcherTuning::debounce_ms`]. Stepless on the frontend slider, range
@@ -426,11 +428,31 @@ fn file_mtime_ns(path: &Path) -> u64 {
         .unwrap_or(0)
 }
 
+fn sleep_interruptible(duration: Duration, stop: &AtomicBool) -> bool {
+    let tick = Duration::from_millis(50);
+    let mut slept = Duration::ZERO;
+    while slept < duration {
+        if stop.load(Ordering::Relaxed) {
+            return true;
+        }
+        let remaining = duration.saturating_sub(slept);
+        let slice = remaining.min(tick);
+        std::thread::sleep(slice);
+        slept += slice;
+    }
+    stop.load(Ordering::Relaxed)
+}
+
 fn process_dirty_asset(
     asset_rel_path: &str,
     project_root: &Path,
     graph_state: &Arc<Mutex<Option<AssetDb>>>,
+    stop: &AtomicBool,
 ) -> Result<Vec<QueueEnqueueRequest>, String> {
+    if stop.load(Ordering::Relaxed) {
+        return Ok(Vec::new());
+    }
+
     let meta_abs = project_root.join(format!("{}.meta", asset_rel_path));
     let asset_abs = project_root.join(asset_rel_path);
 
@@ -438,6 +460,9 @@ fn process_dirty_asset(
     let asset_exists = asset_abs.is_file();
 
     if !meta_exists {
+        if stop.load(Ordering::Relaxed) {
+            return Ok(Vec::new());
+        }
         let mut guard = graph_state
             .lock()
             .map_err(|e| format!("Lock error: {}", e))?;
@@ -457,6 +482,9 @@ fn process_dirty_asset(
         return Ok(Vec::new());
     }
 
+    if stop.load(Ordering::Relaxed) {
+        return Ok(Vec::new());
+    }
     let meta_content = std::fs::read(&meta_abs)
         .map_err(|e| format!("Failed to read {}: {}", meta_abs.display(), e))?;
     let guid = meta_parser::extract_guid(&meta_content)
@@ -672,6 +700,10 @@ fn process_dirty_asset(
         ));
     }
 
+    if stop.load(Ordering::Relaxed) {
+        return Ok(Vec::new());
+    }
+
     let mut guard = graph_state
         .lock()
         .map_err(|e| format!("Lock error: {}", e))?;
@@ -749,11 +781,14 @@ fn worker_loop(
         }
 
         let debounce_ms = tuning.debounce_ms.load(Ordering::Relaxed);
-        if debounce_ms > 0 {
-            std::thread::sleep(Duration::from_millis(debounce_ms));
+        if debounce_ms > 0 && sleep_interruptible(Duration::from_millis(debounce_ms), &stop) {
+            if let Ok(mut slot) = current.lock() {
+                *slot = None;
+            }
+            break;
         }
 
-        match process_dirty_asset(&rel_path, &project_root, &state) {
+        match process_dirty_asset(&rel_path, &project_root, &state, &stop) {
             Ok(extra_paths) => {
                 for extra_path in extra_paths {
                     enqueue_with_activity(
@@ -816,18 +851,32 @@ fn mtime_scanner_loop(
     project_root: PathBuf,
     activity: Arc<RecentQueueActivityLog>,
 ) {
-    mtime_scan_once(&queue, &stop, &state, &project_root, &activity);
+    mtime_scan_once(&queue, &stop, &state, &project_root, &activity, true);
 
-    let mut elapsed = Duration::ZERO;
-    let interval = Duration::from_secs(MTIME_SCAN_INTERVAL_SECS);
+    let mut mtime_elapsed = Duration::ZERO;
+    let mut discovery_elapsed = Duration::ZERO;
+    let mtime_interval = Duration::from_secs(MTIME_SCAN_INTERVAL_SECS);
+    let discovery_interval = Duration::from_secs(NEW_META_DISCOVERY_INTERVAL_SECS);
     let tick = Duration::from_secs(1);
 
     while !stop.load(Ordering::Relaxed) {
         std::thread::sleep(tick);
-        elapsed += tick;
-        if elapsed >= interval {
-            elapsed = Duration::ZERO;
-            mtime_scan_once(&queue, &stop, &state, &project_root, &activity);
+        mtime_elapsed += tick;
+        discovery_elapsed += tick;
+        if mtime_elapsed >= mtime_interval {
+            mtime_elapsed = Duration::ZERO;
+            let discover_new_meta = discovery_elapsed >= discovery_interval;
+            if discover_new_meta {
+                discovery_elapsed = Duration::ZERO;
+            }
+            mtime_scan_once(
+                &queue,
+                &stop,
+                &state,
+                &project_root,
+                &activity,
+                discover_new_meta,
+            );
         }
     }
 }
@@ -838,20 +887,21 @@ fn mtime_scan_once(
     state: &Arc<Mutex<Option<AssetDb>>>,
     project_root: &Path,
     activity: &RecentQueueActivityLog,
+    discover_new_meta: bool,
 ) {
     if stop.load(Ordering::Relaxed) {
         return;
     }
 
-    let (db_mtimes, indexed_meta_mtimes): (HashMap<String, u64>, HashMap<String, u64>) = {
+    let (asset_records, indexed_meta_mtimes): (Vec<db::AssetMtimeRecord>, HashMap<String, u64>) = {
         let guard = match state.lock() {
             Ok(g) => g,
             Err(_) => return,
         };
         match &*guard {
             Some(graph) => {
-                let mtimes = match db::get_all_asset_mtimes(&graph.conn) {
-                    Ok(v) => v.into_iter().collect(),
+                let mtimes = match db::get_all_asset_mtime_records(&graph.conn) {
+                    Ok(v) => v,
                     Err(e) => {
                         eprintln!("[AssetDb Watcher] mtime query error: {}", e);
                         return;
@@ -870,17 +920,17 @@ fn mtime_scan_once(
         }
     };
 
-    if db_mtimes.is_empty() && indexed_meta_mtimes.is_empty() {
+    if asset_records.is_empty() && indexed_meta_mtimes.is_empty() {
         return;
     }
 
-    for (asset_path, db_mtime) in &db_mtimes {
+    for record in &asset_records {
         if stop.load(Ordering::Relaxed) {
             break;
         }
 
-        let meta_path = project_root.join(format!("{}.meta", asset_path));
-        let content_path = project_root.join(asset_path);
+        let meta_path = project_root.join(format!("{}.meta", record.path));
+        let content_path = project_root.join(&record.path);
 
         let meta_exists = meta_path.is_file();
         let content_exists = content_path.is_file();
@@ -895,12 +945,14 @@ fn mtime_scan_once(
             0
         };
         let disk_mtime = meta_mtime.max(content_mtime);
+        let content_should_exist = record.exists_on_disk && record.kind != AssetKind::MetaOnly;
+        let content_missing = content_should_exist && !content_exists;
 
-        if !meta_exists || disk_mtime > *db_mtime {
+        if !meta_exists || content_missing || disk_mtime > record.mtime_ns {
             enqueue_with_activity(
                 queue,
                 activity,
-                asset_path.clone(),
+                record.path.clone(),
                 QueueEnqueueReason::MtimeResync,
                 None,
             );
@@ -929,6 +981,10 @@ fn mtime_scan_once(
                 None,
             );
         }
+    }
+
+    if !discover_new_meta {
+        return;
     }
 
     let scan_roots = ["Assets", "Packages"];
@@ -999,11 +1055,18 @@ fn queue_summary_logger_loop(
 ) {
     eprintln!("[AssetDb Watcher] queue summary logger started");
     let interval = Duration::from_secs(QUEUE_SUMMARY_LOG_INTERVAL_SECS);
+    let tick = Duration::from_millis(250);
+    let mut elapsed = Duration::ZERO;
     while !stop.load(Ordering::Relaxed) {
-        std::thread::sleep(interval);
+        std::thread::sleep(tick);
         if stop.load(Ordering::Relaxed) {
             break;
         }
+        elapsed += tick;
+        if elapsed < interval {
+            continue;
+        }
+        elapsed = Duration::ZERO;
 
         let pending = queue.len();
         let current_file = current.lock().ok().and_then(|slot| slot.clone());
@@ -1058,7 +1121,8 @@ pub struct AssetDbWatcher {
     current_file: CurrentFileSlot,
     recent_activity: Arc<RecentQueueActivityLog>,
     tuning: Arc<WatcherTuning>,
-    _os_watcher: RecommendedWatcher,
+    os_watcher: Option<RecommendedWatcher>,
+    threads: Vec<JoinHandle<()>>,
 }
 
 impl AssetDbWatcher {
@@ -1071,6 +1135,7 @@ impl AssetDbWatcher {
         let dirty_queue = Arc::new(DirtyQueue::new());
         let current_file: CurrentFileSlot = Arc::new(Mutex::new(None));
         let recent_activity = Arc::new(RecentQueueActivityLog::new());
+        let mut threads = Vec::new();
 
         let (tx, rx) = std::sync::mpsc::channel();
         let mut os_watcher = RecommendedWatcher::new(tx, Config::default())
@@ -1090,23 +1155,25 @@ impl AssetDbWatcher {
         let stop_ev = stop.clone();
         let root_ev = project_root.clone();
         let activity_ev = recent_activity.clone();
-        std::thread::Builder::new()
+        let event_thread = std::thread::Builder::new()
             .name("refgraph-events".into())
             .spawn(move || {
                 event_receiver_loop(rx, queue_ev, stop_ev, root_ev, activity_ev);
             })
             .map_err(|e| format!("Failed to spawn event thread: {}", e))?;
+        threads.push(event_thread);
 
         let queue_log = dirty_queue.clone();
         let stop_log = stop.clone();
         let current_log = current_file.clone();
         let activity_log = recent_activity.clone();
-        std::thread::Builder::new()
+        let log_thread = std::thread::Builder::new()
             .name("refgraph-queue-log".into())
             .spawn(move || {
                 queue_summary_logger_loop(queue_log, current_log, activity_log, stop_log);
             })
             .map_err(|e| format!("Failed to spawn queue summary logger thread: {}", e))?;
+        threads.push(log_thread);
 
         for index in 0..MAX_WORKER_THREADS {
             let queue_wk = dirty_queue.clone();
@@ -1116,7 +1183,7 @@ impl AssetDbWatcher {
             let current_wk = current_file.clone();
             let tuning_wk = tuning.clone();
             let activity_wk = recent_activity.clone();
-            std::thread::Builder::new()
+            let worker_thread = std::thread::Builder::new()
                 .name(format!("refgraph-worker-{}", index))
                 .spawn(move || {
                     worker_loop(
@@ -1131,6 +1198,7 @@ impl AssetDbWatcher {
                     );
                 })
                 .map_err(|e| format!("Failed to spawn worker thread {}: {}", index, e))?;
+            threads.push(worker_thread);
         }
 
         let queue_mt = dirty_queue.clone();
@@ -1138,12 +1206,13 @@ impl AssetDbWatcher {
         let state_mt = graph_state.clone();
         let root_mt = project_root.clone();
         let activity_mt = recent_activity.clone();
-        std::thread::Builder::new()
+        let mtime_thread = std::thread::Builder::new()
             .name("refgraph-mtime".into())
             .spawn(move || {
                 mtime_scanner_loop(queue_mt, stop_mt, state_mt, root_mt, activity_mt);
             })
             .map_err(|e| format!("Failed to spawn mtime scanner thread: {}", e))?;
+        threads.push(mtime_thread);
 
         eprintln!("[AssetDb Watcher] started for {}", project_root.display());
 
@@ -1153,7 +1222,8 @@ impl AssetDbWatcher {
             current_file,
             recent_activity,
             tuning,
-            _os_watcher: os_watcher,
+            os_watcher: Some(os_watcher),
+            threads,
         })
     }
 
@@ -1161,10 +1231,34 @@ impl AssetDbWatcher {
         &self.tuning
     }
 
-    pub fn stop(&self) {
-        self.stop.store(true, Ordering::Relaxed);
+    fn request_stop(&self) {
+        let was_stopped = self.stop.swap(true, Ordering::Relaxed);
         self.dirty_queue.condvar.notify_all();
-        eprintln!("[AssetDb Watcher] stop signal sent");
+        if !was_stopped {
+            eprintln!("[AssetDb Watcher] stop signal sent");
+        }
+    }
+
+    fn join_threads(&mut self) {
+        self.os_watcher.take();
+        let current_id = std::thread::current().id();
+        for handle in self.threads.drain(..) {
+            if handle.thread().id() == current_id {
+                continue;
+            }
+            if let Err(err) = handle.join() {
+                eprintln!("[AssetDb Watcher] worker thread join failed: {:?}", err);
+            }
+        }
+    }
+
+    pub fn stop(&self) {
+        self.request_stop();
+    }
+
+    pub fn stop_and_join(mut self) {
+        self.request_stop();
+        self.join_threads();
     }
 
     pub fn queue_len(&self) -> usize {
@@ -1185,7 +1279,8 @@ impl AssetDbWatcher {
 
 impl Drop for AssetDbWatcher {
     fn drop(&mut self) {
-        self.stop();
+        self.request_stop();
+        self.join_threads();
     }
 }
 
@@ -1265,7 +1360,7 @@ mod tests {
         let stop = AtomicBool::new(false);
         let state = Arc::new(Mutex::new(Some(graph)));
         let activity = RecentQueueActivityLog::new();
-        mtime_scan_once(&queue, &stop, &state, &root, &activity);
+        mtime_scan_once(&queue, &stop, &state, &root, &activity, true);
 
         assert_eq!(queue.len(), 1);
         assert_eq!(
@@ -1330,9 +1425,119 @@ mod tests {
         let stop = AtomicBool::new(false);
         let state = Arc::new(Mutex::new(Some(graph)));
         let activity = RecentQueueActivityLog::new();
-        mtime_scan_once(&queue, &stop, &state, &root, &activity);
+        mtime_scan_once(&queue, &stop, &state, &root, &activity, true);
 
         assert_eq!(queue.len(), 0);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mtime_scan_once_resyncs_deleted_content_with_unchanged_meta() {
+        let root =
+            std::env::temp_dir().join(format!("locus-watcher-content-delete-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("Assets/Game")).expect("create temp assets");
+
+        let asset_path = "Assets/Game/Hud.prefab";
+        let asset_abs = root.join(asset_path);
+        let meta_abs = root.join(format!("{}.meta", asset_path));
+        let guid = parse_guid_hex("11111111111111111111111111111111").unwrap();
+        let meta_bytes = b"fileFormatVersion: 2\nguid: 11111111111111111111111111111111\n";
+        let content_bytes = b"%YAML 1.1\n--- !u!1 &1000\nGameObject:\n  m_Name: Hud\n";
+        std::fs::write(&meta_abs, meta_bytes).expect("write meta");
+        std::fs::write(&asset_abs, content_bytes).expect("write asset");
+
+        let meta_mtime = file_mtime_ns(&meta_abs);
+        let asset_mtime = file_mtime_ns(&asset_abs);
+        let meta_size = std::fs::metadata(&meta_abs).expect("meta metadata").len();
+        let asset_size = std::fs::metadata(&asset_abs).expect("asset metadata").len();
+        let meta_hash = hash128(meta_bytes);
+        let content_hash = hash128(content_bytes);
+
+        let mut graph = AssetDb::open(&root).expect("open asset db");
+        let node = AssetNode {
+            guid,
+            path: asset_path.to_string(),
+            ext: "prefab".to_string(),
+            kind: AssetKind::Prefab,
+            exists_on_disk: true,
+            mtime_ns: meta_mtime.max(asset_mtime),
+            size: asset_size,
+            content_hash,
+            meta_hash,
+            parser_version: 1,
+            script_class_name: None,
+            script_class_lower: String::new(),
+            script_namespace_lower: String::new(),
+            script_full_name_lower: String::new(),
+            script_type_search: String::new(),
+            script_inheritance_search: String::new(),
+        };
+        db::atomic_update_asset(
+            &mut graph.conn,
+            &node,
+            &[],
+            &[
+                (
+                    format!("{}.meta", asset_path),
+                    FileRole::Meta,
+                    meta_mtime,
+                    meta_size,
+                    meta_hash,
+                ),
+                (
+                    asset_path.to_string(),
+                    FileRole::YamlAsset,
+                    asset_mtime,
+                    asset_size,
+                    content_hash,
+                ),
+            ],
+        )
+        .expect("seed asset");
+
+        std::fs::remove_file(&asset_abs).expect("delete content asset");
+
+        let queue = DirtyQueue::new();
+        let stop = AtomicBool::new(false);
+        let state = Arc::new(Mutex::new(Some(graph)));
+        let activity = RecentQueueActivityLog::new();
+        mtime_scan_once(&queue, &stop, &state, &root, &activity, false);
+
+        assert_eq!(queue.len(), 1);
+        assert_eq!(
+            queue.dequeue(&AtomicBool::new(false)),
+            Some(asset_path.to_string())
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn process_dirty_asset_respects_stop_before_db_write() {
+        let root = std::env::temp_dir().join(format!("locus-watcher-stop-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("Assets/Game")).expect("create temp assets");
+
+        let asset_path = "Assets/Game/Stopped.prefab";
+        std::fs::write(
+            root.join(format!("{}.meta", asset_path)),
+            b"fileFormatVersion: 2\nguid: 22222222222222222222222222222222\n",
+        )
+        .expect("write meta");
+        std::fs::write(root.join(asset_path), b"%YAML 1.1\n").expect("write asset");
+
+        let graph = AssetDb::open(&root).expect("open asset db");
+        let state = Arc::new(Mutex::new(Some(graph)));
+        let stop = AtomicBool::new(true);
+
+        process_dirty_asset(asset_path, &root, &state, &stop).expect("stopped processing");
+
+        let guard = state.lock().expect("lock state");
+        let graph = guard.as_ref().expect("graph still present");
+        assert_eq!(
+            db::resolve_guid_by_path(&graph.conn, asset_path).unwrap(),
+            None
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

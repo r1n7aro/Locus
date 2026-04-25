@@ -64,7 +64,7 @@ pub async fn ref_graph_scan(
             .lock()
             .map_err(|e| format!("Lock error: {}", e))?;
         if let Some(old) = wh.take() {
-            old.stop();
+            old.stop_and_join();
             eprintln!("[AssetDb] stopped previous watcher before rescan");
         }
     }
