@@ -115,6 +115,11 @@ pub async fn set_working_dir(
         *wid = Some(ws_id.clone());
     }
 
+    if is_real_switch {
+        super::reset_unity_embed_control_window(&app_handle);
+        super::refresh_unity_embed_control_server(app_handle.clone());
+    }
+
     if let Ok(data_dir) = super::resolve_runtime_storage_dir(&app_handle) {
         let file: std::path::PathBuf = data_dir.join("working_dir.txt");
         let _ = std::fs::write(&file, &canonical);
@@ -192,7 +197,7 @@ pub async fn set_working_dir(
             .lock()
             .map_err(|e| format!("Lock error: {}", e))?;
         if let Some(old) = wh.take() {
-            old.stop();
+            old.stop_and_join();
             eprintln!("[Locus] stopped ref_graph watcher (working dir changed)");
         }
     }
@@ -1398,6 +1403,7 @@ pub async fn reset_all_config(
         "provider_key_ids.json",
         "working_dir.txt",
         "recent_dirs.json",
+        "active_session_selection.json",
         "tool_permission_mode.txt",
         "tool_permissions.json",
         "git_path_override.txt",
@@ -1437,7 +1443,7 @@ pub async fn reset_all_config(
             .lock()
             .map_err(|e| format!("Lock error: {}", e))?;
         if let Some(old) = wh.take() {
-            old.stop();
+            old.stop_and_join();
             eprintln!("[Locus] stopped ref_graph watcher during reset");
         }
     }
@@ -1457,6 +1463,8 @@ pub async fn reset_all_config(
 
     *workspace.path.write().await = String::new();
     *workspace.workspace_id.write().await = None;
+    super::reset_unity_embed_control_window(&app_handle);
+    super::refresh_unity_embed_control_server(app_handle.clone());
     let no_workspace_library_dir = crate::knowledge_index::no_workspace_library_dir();
     knowledge_index_state
         .rebuild(&no_workspace_library_dir, &data_dir)

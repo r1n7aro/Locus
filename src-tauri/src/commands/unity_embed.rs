@@ -1,13 +1,15 @@
-use std::sync::{Mutex, OnceLock};
+use std::path::Path;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, PhysicalPosition, PhysicalSize, WebviewUrl};
 
 use crate::error::AppError;
+use crate::workspace::Workspace;
 
 const WINDOW_LABEL: &str = "unity-embed";
-const CONTROL_PIPE_NAME: &str = r"\\.\pipe\locus_tauri_unity_embed";
+const CONTROL_PIPE_NAME_PREFIX: &str = r"\\.\pipe\locus_tauri_unity_embed_";
 const EMBED_URL: &str = "/unity-embed?host=tauri-overlay";
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -190,13 +192,74 @@ fn control_snapshot() -> UnityEmbedControlSnapshot {
     UnityEmbedControlSnapshot::default()
 }
 
+fn strip_extended_path_prefix(path: &str) -> &str {
+    path.strip_prefix(r"\\?\").unwrap_or(path)
+}
+
+fn normalize_pipe_project_path(path: &str) -> String {
+    let trimmed = strip_extended_path_prefix(path).trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    let normalized_path = dunce::canonicalize(trimmed)
+        .unwrap_or_else(|_| Path::new(trimmed).to_path_buf())
+        .to_string_lossy()
+        .to_string();
+    let normalized_path = strip_extended_path_prefix(&normalized_path);
+
+    normalized_path
+        .trim_end_matches(|ch| ch == '/' || ch == '\\')
+        .replace('\\', "_")
+        .replace('/', "_")
+        .replace(':', "_")
+        .replace(' ', "_")
+}
+
+fn control_pipe_name_for_project_path(project_path: &str) -> String {
+    let sanitized = normalize_pipe_project_path(project_path);
+    let suffix = if sanitized.is_empty() {
+        "unknown".to_string()
+    } else {
+        sanitized
+    };
+    format!("{CONTROL_PIPE_NAME_PREFIX}{suffix}")
+}
+
+async fn current_workspace_path(app_handle: &AppHandle) -> String {
+    match app_handle.try_state::<Arc<Workspace>>() {
+        Some(workspace) => workspace.path.read().await.clone(),
+        None => String::new(),
+    }
+}
+
+async fn current_control_pipe_name(app_handle: &AppHandle) -> Option<String> {
+    let current_project_path = current_workspace_path(app_handle).await;
+    if current_project_path.trim().is_empty() {
+        None
+    } else {
+        Some(control_pipe_name_for_project_path(&current_project_path))
+    }
+}
+
+async fn is_current_control_pipe(app_handle: &AppHandle, pipe_name: &str) -> bool {
+    current_control_pipe_name(app_handle)
+        .await
+        .as_deref()
+        .map(|current| current == pipe_name)
+        .unwrap_or(false)
+}
+
 #[tauri::command]
-pub async fn unity_embed_status() -> Result<UnityEmbedStatus, AppError> {
+pub async fn unity_embed_status(app_handle: AppHandle) -> Result<UnityEmbedStatus, AppError> {
+    let pipe_name = current_control_pipe_name(&app_handle)
+        .await
+        .unwrap_or_default();
     Ok(UnityEmbedStatus {
         ok: true,
         runtime: "tauri".to_string(),
         message: "pong".to_string(),
-        pipe_name: CONTROL_PIPE_NAME.to_string(),
+        pipe_name,
         window_label: WINDOW_LABEL.to_string(),
         control: control_snapshot(),
     })
@@ -209,6 +272,30 @@ pub(crate) fn start_unity_embed_control_server(app_handle: AppHandle) {
     #[cfg(not(target_os = "windows"))]
     {
         let _ = app_handle;
+    }
+}
+
+pub(crate) fn refresh_unity_embed_control_server(app_handle: AppHandle) {
+    #[cfg(target_os = "windows")]
+    windows_impl::refresh(app_handle);
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = app_handle;
+    }
+}
+
+pub(crate) fn reset_unity_embed_control_window(app_handle: &AppHandle) {
+    let app_for_main = app_handle.clone();
+    if let Err(error) = app_handle.run_on_main_thread(move || {
+        if let Some(window) = app_for_main.get_webview_window(WINDOW_LABEL) {
+            if let Err(close_error) = window.destroy().or_else(|_| window.close()) {
+                eprintln!("[Locus] failed to reset Unity embed window: {close_error}");
+            }
+        }
+        record_window_destroyed();
+    }) {
+        eprintln!("[Locus] failed to dispatch Unity embed reset: {error}");
     }
 }
 
@@ -408,48 +495,110 @@ mod windows_impl {
         snapshot: PopupSyncSnapshot,
     }
 
+    #[derive(Default)]
+    struct ControlServerState {
+        pipe_name: String,
+        handle: Option<tauri::async_runtime::JoinHandle<()>>,
+    }
+
     fn popup_sync_state() -> &'static Mutex<PopupSyncState> {
         static STATE: OnceLock<Mutex<PopupSyncState>> = OnceLock::new();
         STATE.get_or_init(|| Mutex::new(PopupSyncState::default()))
     }
 
+    fn control_server_state() -> &'static Mutex<ControlServerState> {
+        static STATE: OnceLock<Mutex<ControlServerState>> = OnceLock::new();
+        STATE.get_or_init(|| Mutex::new(ControlServerState::default()))
+    }
+
     pub(super) fn start(app_handle: AppHandle) {
-        tauri::async_runtime::spawn(async move {
-            popup_sync_loop().await;
-        });
+        static POPUP_SYNC_STARTED: OnceLock<()> = OnceLock::new();
+        if POPUP_SYNC_STARTED.set(()).is_ok() {
+            tauri::async_runtime::spawn(async move {
+                popup_sync_loop().await;
+            });
+        }
 
+        refresh(app_handle);
+    }
+
+    pub(super) fn refresh(app_handle: AppHandle) {
         tauri::async_runtime::spawn(async move {
-            if let Err(error) = server_loop(app_handle).await {
-                eprintln!("[Locus] Unity embed control pipe stopped: {error}");
+            let next_pipe_name = current_control_pipe_name(&app_handle)
+                .await
+                .unwrap_or_default();
+
+            let mut state = match control_server_state().lock() {
+                Ok(state) => state,
+                Err(error) => {
+                    eprintln!("[Locus] Unity embed control state lock failed: {error}");
+                    return;
+                }
+            };
+
+            let running_same_pipe = state.pipe_name == next_pipe_name && state.handle.is_some();
+            if running_same_pipe {
+                return;
             }
+
+            if let Some(handle) = state.handle.take() {
+                handle.abort();
+            }
+
+            state.pipe_name = next_pipe_name.clone();
+            if next_pipe_name.is_empty() {
+                return;
+            }
+
+            let app_for_server = app_handle.clone();
+            let pipe_for_server = next_pipe_name.clone();
+            state.handle = Some(tauri::async_runtime::spawn(async move {
+                if let Err(error) =
+                    server_loop(app_for_server.clone(), pipe_for_server.clone()).await
+                {
+                    eprintln!(
+                        "[Locus] Unity embed control pipe stopped ({}): {error}",
+                        pipe_for_server
+                    );
+                }
+                if let Ok(mut state) = control_server_state().lock() {
+                    if state.pipe_name == pipe_for_server {
+                        state.handle = None;
+                    }
+                }
+            }));
         });
     }
 
-    fn create_server() -> io::Result<NamedPipeServer> {
-        ServerOptions::new()
-            .max_instances(16)
-            .create(CONTROL_PIPE_NAME)
+    fn create_server(pipe_name: &str) -> io::Result<NamedPipeServer> {
+        ServerOptions::new().max_instances(16).create(pipe_name)
     }
 
-    async fn server_loop(app_handle: AppHandle) -> io::Result<()> {
-        let mut server = create_server()?;
-        eprintln!("[Locus] Unity embed control pipe listening: {CONTROL_PIPE_NAME}");
+    async fn server_loop(app_handle: AppHandle, pipe_name: String) -> io::Result<()> {
+        let mut server = create_server(&pipe_name)?;
+        eprintln!("[Locus] Unity embed control pipe listening: {pipe_name}");
 
         loop {
             server.connect().await?;
-            let next_server = create_server()?;
+            let next_server = create_server(&pipe_name)?;
             let connected = std::mem::replace(&mut server, next_server);
             let app_for_client = app_handle.clone();
+            let pipe_for_client = pipe_name.clone();
 
             tauri::async_runtime::spawn(async move {
-                if let Err(error) = handle_client(app_for_client, connected).await {
+                if let Err(error) = handle_client(app_for_client, connected, pipe_for_client).await
+                {
                     eprintln!("[Locus] Unity embed control client error: {error}");
                 }
             });
         }
     }
 
-    async fn handle_client(app_handle: AppHandle, server: NamedPipeServer) -> io::Result<()> {
+    async fn handle_client(
+        app_handle: AppHandle,
+        server: NamedPipeServer,
+        pipe_name: String,
+    ) -> io::Result<()> {
         let mut reader = BufReader::new(server);
         let mut line = String::new();
 
@@ -474,6 +623,10 @@ mod windows_impl {
                     continue;
                 }
             };
+
+            if !is_current_control_pipe(&app_handle, &pipe_name).await {
+                continue;
+            }
 
             if let Err(error) = apply_control_message(app_handle.clone(), msg).await {
                 eprintln!("[Locus] failed to apply Unity embed control message: {error}");
@@ -768,5 +921,26 @@ mod windows_impl {
 
     fn rects_intersect(a: RECT, b: RECT) -> bool {
         a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{control_pipe_name_for_project_path, normalize_pipe_project_path};
+
+    #[test]
+    fn pipe_project_path_normalizes_windows_slashes_and_extended_prefix() {
+        assert_eq!(
+            normalize_pipe_project_path(r#"\\?\F:\Game\Project\"#),
+            "F__Game_Project"
+        );
+    }
+
+    #[test]
+    fn control_pipe_name_includes_project_path_suffix() {
+        assert_eq!(
+            control_pipe_name_for_project_path(r"F:\Game\Project"),
+            r"\\.\pipe\locus_tauri_unity_embed_F__Game_Project"
+        );
     }
 }

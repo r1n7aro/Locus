@@ -2,10 +2,15 @@ import { ref, computed } from "vue";
 import { defineStore } from "pinia";
 import * as projectService from "../services/project";
 import * as unityService from "../services/unity";
-import { assetDbScan, assetDbStatus } from "../services/asset";
+import { assetDbOverview, assetDbScan } from "../services/asset";
 import { normalizeAppError } from "../services/errors";
 import { useNotificationStore } from "./notification";
-import type { AssetDbScanEvent, ScanStats, PluginStatus } from "../types";
+import { t } from "../i18n";
+import type { AssetDbOverview, AssetDbScanEvent, ScanStats, PluginStatus } from "../types";
+
+type PluginNoticeStatus = "missing" | "outdated";
+
+const PLUGIN_STATUS_NOTICE_OPERATION = "unity-plugin-status";
 
 export const useProjectStore = defineStore("project", () => {
   const workingDir = ref("");
@@ -15,8 +20,56 @@ export const useProjectStore = defineStore("project", () => {
   const lastScanStats = ref<ScanStats | null>(null);
   const pluginToast = ref<"missing" | "outdated" | null>(null);
   const pluginInstalling = ref(false);
+  let scanInFlight = false;
 
   const isUnityProject = computed(() => workingDir.value.length > 0);
+
+  function pluginStatusLabel(status: PluginNoticeStatus): string {
+    return status === "missing" ? t("app.plugin.notInstalled") : t("app.plugin.needUpdate");
+  }
+
+  function setPluginToast(status: PluginNoticeStatus | null) {
+    pluginToast.value = status;
+    const notificationStore = useNotificationStore();
+    if (status) {
+      notificationStore.addNotice("error", pluginStatusLabel(status), {
+        operation: PLUGIN_STATUS_NOTICE_OPERATION,
+        replaceOperation: true,
+        skipConsoleLog: true,
+      });
+    } else {
+      notificationStore.clearByOperation(PLUGIN_STATUS_NOTICE_OPERATION);
+    }
+  }
+
+  function isScanRunning(phase: AssetDbScanEvent | null): boolean {
+    return phase != null && phase.phase !== "done" && phase.phase !== "error";
+  }
+
+  function minimalStatsFromOverview(overview: AssetDbOverview): ScanStats {
+    return {
+      dirsScanned: 0,
+      metaFilesFound: 0,
+      yamlAssetsFound: 0,
+      nodesAdded: overview.nodes,
+      edgesAdded: overview.edges,
+      nodesUpdated: 0,
+      nodesDeleted: 0,
+      parseFailures:
+        overview.assetRisks.find((entry) => entry.kind === "parseFailures")?.count ?? 0,
+      elapsedMs: overview.lastScanDurationMs ?? 0,
+      duplicateGuids: overview.duplicateGuids,
+    };
+  }
+
+  function shouldAutoBuildFromOverview(overview: AssetDbOverview): boolean {
+    if (!workingDir.value.trim()) return false;
+    if (scanInFlight || isScanRunning(scanPhase.value)) return false;
+    if (overview.status === "none") return true;
+    const phase = overview.currentScanPhase;
+    return phase?.phase === "error"
+      && phase.error.code.startsWith("ref_graph.rescan_required.");
+  }
 
   async function loadWorkingDir() {
     try {
@@ -43,6 +96,8 @@ export const useProjectStore = defineStore("project", () => {
   }
 
   async function startScan() {
+    if (scanInFlight || isScanRunning(scanPhase.value)) return;
+    scanInFlight = true;
     scanPhase.value = { phase: "dirScan" };
     try {
       const stats = await assetDbScan();
@@ -56,6 +111,8 @@ export const useProjectStore = defineStore("project", () => {
         operation: "ref_graph_scan",
         skipConsoleLog: true,
       });
+    } finally {
+      scanInFlight = false;
     }
   }
 
@@ -70,9 +127,9 @@ export const useProjectStore = defineStore("project", () => {
   async function checkUnityPlugin() {
     try {
       const ps = await unityService.checkUnityPlugin();
-      pluginToast.value = (ps.status === "missing" || ps.status === "outdated") ? ps.status : null;
+      setPluginToast((ps.status === "missing" || ps.status === "outdated") ? ps.status : null);
     } catch {
-      pluginToast.value = null;
+      setPluginToast(null);
     }
   }
 
@@ -89,14 +146,41 @@ export const useProjectStore = defineStore("project", () => {
 
   async function loadAssetDbStatus() {
     try {
-      const stats = await assetDbStatus();
-      if (stats) {
-        lastScanStats.value = stats;
-        console.log("[AssetDb] loaded from existing DB:", stats.nodesAdded, "assets,", stats.edgesAdded, "edges");
-      } else {
+      const overview = await assetDbOverview();
+      const currentPhase = overview.currentScanPhase ?? null;
+
+      if (currentPhase) {
+        scanPhase.value = currentPhase;
+      } else if (!isScanRunning(scanPhase.value)) {
+        scanPhase.value = null;
+      }
+
+      if (overview.lastScanStats) {
+        lastScanStats.value = overview.lastScanStats;
+      } else if (overview.status === "indexed") {
+        lastScanStats.value = minimalStatsFromOverview(overview);
+      } else if (overview.status === "none") {
         lastScanStats.value = null;
       }
-    } catch { /* ignore */ }
+
+      if (overview.status === "indexed") {
+        console.log(
+          "[AssetDb] loaded from existing DB:",
+          overview.nodes,
+          "assets,",
+          overview.edges,
+          "edges",
+        );
+      }
+
+      if (shouldAutoBuildFromOverview(overview)) {
+        void startScan();
+      }
+    } catch {
+      if (!isScanRunning(scanPhase.value)) {
+        lastScanStats.value = null;
+      }
+    }
   }
 
   function resetWorkspaceState() {
@@ -105,15 +189,18 @@ export const useProjectStore = defineStore("project", () => {
     unityConnected.value = false;
     scanPhase.value = null;
     lastScanStats.value = null;
-    pluginToast.value = null;
+    scanInFlight = false;
+    setPluginToast(null);
     pluginInstalling.value = false;
   }
 
   function handleScanEvent(event: AssetDbScanEvent) {
     scanPhase.value = event;
     if (event.phase === "done") {
+      scanInFlight = false;
       lastScanStats.value = event.stats;
     } else if (event.phase === "error") {
+      scanInFlight = false;
       console.error("[AssetDb] scan error:", event.error);
       useNotificationStore().addNotice("error", event.error.message, {
         code: event.error.code,
@@ -126,9 +213,9 @@ export const useProjectStore = defineStore("project", () => {
   function handlePluginStatus(status: PluginStatus) {
     const s = status.status;
     if (s === "missing" || s === "outdated") {
-      pluginToast.value = s;
+      setPluginToast(s);
     } else {
-      pluginToast.value = null;
+      setPluginToast(null);
     }
   }
 

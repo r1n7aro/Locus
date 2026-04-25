@@ -9,14 +9,16 @@ function read(relPath: string) {
 }
 
 describe("chat responsive layout", () => {
-  it("lets the shared chat view collapse sessions into a recent-session dropdown", () => {
+  it("keeps the shared chat view stable unless the user explicitly collapses sessions", () => {
     const chatView = read("src/components/ChatView.vue");
     const picker = read("src/components/chat/SessionCompactPicker.vue");
     const sessionPanel = read("src/components/chat/SessionPanel.vue");
 
     expect(chatView).toContain('layoutMode?: ChatLayoutMode;');
     expect(chatView).toContain("layoutModeChange: [mode: ResolvedChatLayoutMode]");
-    expect(chatView).toContain("AUTO_VERTICAL_MIN_CHAT_WIDTH");
+    expect(chatView).toContain('if (props.layoutMode === "vertical") return "vertical";');
+    expect(chatView).toContain('return "horizontal";');
+    expect(chatView).not.toContain("AUTO_VERTICAL_MIN_CHAT_WIDTH");
     expect(chatView).toContain("<SessionCompactPicker");
     expect(chatView).toContain("showSessionPanel");
     expect(chatView).toContain("showSessionCompactPicker");
@@ -61,8 +63,18 @@ describe("chat responsive layout", () => {
     expect(unityView).toContain("<ChatWorkspaceView");
     expect(workspace).toContain("<ChatView");
     expect(workspace).toContain(":layout=\"isVerticalLayout ? 'bottom' : 'side'\"");
+    expect(workspace).toContain("const workspaceRef = ref<HTMLElement | null>(null);");
+    expect(workspace).toContain("ASSISTANT_PANEL_MIN_CHAT_WIDTH");
+    expect(workspace).toContain('const isVerticalLayout = computed(() => props.layoutMode === "vertical");');
+    expect(workspace).not.toContain("canKeepAuxiliaryPanelOnSide");
+    expect(workspace).not.toContain("canRestoreAuxiliaryPanelOnSide");
+    expect(workspace).toContain("assistantSidebarMaxSideWidth");
+    expect(workspace).toContain(":max-side-width=\"assistantSidebarMaxSideWidth\"");
+    expect(workspace).toContain("workspaceResizeObserver = new ResizeObserver(scheduleWorkspaceWidthUpdate)");
     expect(workspace).toContain("saveRawContext");
     expect(sidebar).toContain("layout?: \"side\" | \"bottom\"");
+    expect(sidebar).toContain("maxSideWidth?: number;");
+    expect(sidebar).toContain("effectiveSidebarWidth");
     expect(sidebar).toContain("document.body.style.cursor = props.layout === \"bottom\" ? \"row-resize\" : \"col-resize\"");
   });
 });

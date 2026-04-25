@@ -5,17 +5,16 @@ import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import type { UnlistenFn } from "@tauri-apps/api/event";
-import type { GitProbeResult, PluginStatus, AssetDbScanEvent, ScanStats } from "../types";
+import type { ApiFormat, CustomEndpoint, GitProbeResult, PluginStatus, AssetDbScanEvent, ScanStats } from "../types";
 import { t, setLocale, locale, type Locale } from "../i18n";
 import { useTheme, type ThemePreference } from "../composables/useTheme";
 import { useCopyFeedback } from "../composables/useCopyFeedback";
 import { normalizeAppError } from "../services/errors";
 import { useUiStore } from "../stores/ui";
 import {
-  getProviders, codexStatus, saveProviderKey, getAuthUrl,
-  exchangeAuthCode, codexStartLogin, codexPollLogin,
-  type ProviderStatus,
+  codexStatus, codexStartLogin, codexPollLogin,
 } from "../services/auth";
+import { getCustomEndpoints, saveCustomEndpoints } from "../services/model";
 import { setWorkingDir, getWorkingDir } from "../services/project";
 import { checkUnityPlugin, installUnityPlugin } from "../services/unity";
 import { gitCheckUserConfig, gitInitUnity, gitProbe, gitSetUserConfig } from "../services/git";
@@ -27,7 +26,6 @@ import {
   resolveOnboardingGitInitTargetPath,
   resolveOnboardingVcsStepState,
 } from "./onboarding/onboardingVcs";
-import SubscriptionDisclaimerModal from "./SubscriptionDisclaimerModal.vue";
 
 const emit = defineEmits<{ completed: [] }>();
 const uiStore = useUiStore();
@@ -78,18 +76,37 @@ function handleThemeChange(value: string) {
   setThemePreference(value as ThemePreference);
 }
 
-const providers = ref<ProviderStatus[]>([]);
-const authExpanded = ref<"openrouter" | "anthropic" | "codex" | null>(null);
+const authExpanded = ref<"custom" | "codex" | null>("custom");
 const authError = ref("");
 const authSuccess = ref("");
 
-// OpenRouter
-const apiKeyInput = ref("");
-const apiKeySaving = ref(false);
+const customEndpoints = ref<CustomEndpoint[]>([]);
+const customEndpointSaving = ref(false);
+const customApiFormatOptions = computed(() => [
+  { value: "openai_chat" as ApiFormat, label: t("settings.custom.formatOpenaiChat") },
+  { value: "openai_responses" as ApiFormat, label: t("settings.custom.formatOpenaiResponses") },
+  { value: "anthropic_messages" as ApiFormat, label: t("settings.custom.formatAnthropicMessages") },
+]);
 
-// Anthropic OAuth
-const oauthStep = ref<"idle" | "waiting_code" | "exchanging">("idle");
-const oauthCode = ref("");
+function newCustomEndpoint(): CustomEndpoint {
+  return {
+    id: crypto.randomUUID(),
+    name: "",
+    apiModel: "",
+    endpoint: "",
+    apiFormat: "openai_chat",
+    apiKey: "",
+    contextLength: 128000,
+    betaFlags: [],
+  };
+}
+
+const customEndpointForm = ref<CustomEndpoint>(newCustomEndpoint());
+const customEndpointConfigured = computed(() => customEndpoints.value.length > 0);
+const customEndpointReady = computed(() => {
+  const ep = customEndpointForm.value;
+  return !!ep.name.trim() && !!ep.apiModel.trim() && !!ep.endpoint.trim();
+});
 
 // OpenAI Codex
 type CodexStep = "idle" | "opening" | "waiting" | "success";
@@ -103,96 +120,15 @@ const { copied: codexCodeCopied, copyText: copyCodexText, reset: resetCodexCopyS
 let codexTimer: ReturnType<typeof setTimeout> | null = null;
 let codexPollInFlight = false;
 
-const hasAnyProvider = ref(false);
-
-// Subscription disclaimer
-const showDisclaimer = ref(false);
-const disclaimerTarget = ref<"anthropic" | null>(null);
-
-function showAnthropicDisclaimer() {
-  disclaimerTarget.value = "anthropic";
-  showDisclaimer.value = true;
-}
-
-function confirmDisclaimer() {
-  const target = disclaimerTarget.value;
-  showDisclaimer.value = false;
-  disclaimerTarget.value = null;
-  if (target === "anthropic") startOAuth();
-}
-
-function cancelDisclaimer() {
-  showDisclaimer.value = false;
-  disclaimerTarget.value = null;
-}
-
-async function loadProviders() {
+async function loadModelConfigState() {
   codexAuthenticated.value = false;
-  hasAnyProvider.value = false;
   try {
-    providers.value = await getProviders();
-    hasAnyProvider.value = providers.value.some(p => p.hasKey);
-    try {
-      const cs = await codexStatus();
-      codexAuthenticated.value = cs.authenticated;
-      if (cs.authenticated) hasAnyProvider.value = true;
-    } catch { /* ignore */ }
+    customEndpoints.value = await getCustomEndpoints();
   } catch { /* ignore */ }
-}
-
-async function saveApiKey() {
-  const key = apiKeyInput.value.trim();
-  if (!key) return;
-  apiKeySaving.value = true;
-  authError.value = "";
   try {
-    await saveProviderKey("openrouter", key);
-    authSuccess.value = t("settings.provider.saved");
-    apiKeyInput.value = "";
-    await loadProviders();
-    hasAnyProvider.value = true;
-    setTimeout(() => { authSuccess.value = ""; }, 2000);
-  } catch (e) {
-    authError.value = t("settings.provider.saveFailed", normalizeAppError(e).message);
-  } finally {
-    apiKeySaving.value = false;
-  }
-}
-
-async function startOAuth() {
-  authError.value = "";
-  try {
-    const info = await getAuthUrl();
-    await openUrl(info.url);
-    oauthStep.value = "waiting_code";
-  } catch (e) {
-    authError.value = t("settings.anthropic.authUrlFailed", normalizeAppError(e).message);
-  }
-}
-
-async function submitOAuthCode() {
-  const code = oauthCode.value.trim();
-  if (!code) return;
-  authError.value = "";
-  oauthStep.value = "exchanging";
-  try {
-    await exchangeAuthCode(code);
-    authSuccess.value = t("settings.anthropic.loginSuccess");
-    oauthStep.value = "idle";
-    oauthCode.value = "";
-    await loadProviders();
-    hasAnyProvider.value = true;
-    setTimeout(() => { authSuccess.value = ""; }, 2000);
-  } catch (e) {
-    authError.value = t("settings.anthropic.exchangeFailed", normalizeAppError(e).message);
-    oauthStep.value = "waiting_code";
-  }
-}
-
-function cancelOAuth() {
-  oauthStep.value = "idle";
-  oauthCode.value = "";
-  authError.value = "";
+    const cs = await codexStatus();
+    codexAuthenticated.value = cs.authenticated;
+  } catch { /* ignore */ }
 }
 
 async function startCodexLogin() {
@@ -241,7 +177,6 @@ async function pollCodex() {
       stopCodexPolling();
       codexStep.value = "success";
       codexAuthenticated.value = true;
-      hasAnyProvider.value = true;
       authSuccess.value = t("settings.codex.loginSuccess");
       setTimeout(() => { authSuccess.value = ""; codexStep.value = "idle"; }, 2000);
     } else if (result.status === "failed") {
@@ -270,13 +205,64 @@ async function copyCodexCode() {
   await copyCodexText(codexUserCode.value);
 }
 
-function handleApiKeyKeydown(e: KeyboardEvent) {
-  if (e.key === "Enter") { e.preventDefault(); saveApiKey(); }
+function normalizedCustomEndpoint(): CustomEndpoint | null {
+  const ep = customEndpointForm.value;
+  const name = ep.name.trim();
+  const apiModel = ep.apiModel.trim();
+  const endpoint = ep.endpoint.trim();
+  if (!name) {
+    authError.value = t("settings.custom.nameRequired");
+    return null;
+  }
+  if (!apiModel) {
+    authError.value = t("settings.custom.apiModelRequired");
+    return null;
+  }
+  if (!endpoint) {
+    authError.value = t("settings.custom.endpointRequired");
+    return null;
+  }
+  const contextLength = Number(ep.contextLength);
+  return {
+    ...ep,
+    name,
+    apiModel,
+    endpoint,
+    apiKey: ep.apiKey.trim(),
+    contextLength: Number.isFinite(contextLength) && contextLength >= 1024 ? contextLength : 128000,
+    betaFlags: ep.betaFlags ?? [],
+  };
 }
 
-function handleOAuthKeydown(e: KeyboardEvent) {
-  if (e.key === "Enter") { e.preventDefault(); submitOAuthCode(); }
-  else if (e.key === "Escape") cancelOAuth();
+async function saveCustomEndpoint() {
+  const ep = normalizedCustomEndpoint();
+  if (!ep) return;
+  customEndpointSaving.value = true;
+  authError.value = "";
+  try {
+    const list = [...customEndpoints.value];
+    const idx = list.findIndex((item) => item.id === ep.id);
+    if (idx >= 0) list[idx] = ep;
+    else list.push(ep);
+    await saveCustomEndpoints(list);
+    customEndpoints.value = list;
+    customEndpointForm.value = newCustomEndpoint();
+    authSuccess.value = t("settings.custom.saved");
+    setTimeout(() => { authSuccess.value = ""; }, 2000);
+  } catch (e) {
+    authError.value = t("settings.custom.saveFailed", normalizeAppError(e).message);
+  } finally {
+    customEndpointSaving.value = false;
+  }
+}
+
+function handleCustomEndpointKeydown(e: KeyboardEvent) {
+  if (e.key === "Enter") {
+    e.preventDefault();
+    void saveCustomEndpoint();
+  } else if (e.key === "Escape") {
+    authError.value = "";
+  }
 }
 
 const projectPath = ref("");
@@ -495,7 +481,7 @@ async function startScan() {
 }
 
 watch(step, async (s) => {
-  if (s === 1) await loadProviders();
+  if (s === 1) await loadModelConfigState();
   if (s === 3) {
     await checkPlugin();
     if (!unlistenPlugin) {
@@ -626,63 +612,84 @@ onUnmounted(() => {
       <div v-if="authSuccess" class="msg success">{{ authSuccess }}</div>
       <div v-if="authError" class="msg error">{{ authError }}</div>
 
-      <!-- OpenRouter -->
-      <div class="provider-card" :class="{ expanded: authExpanded === 'openrouter' }">
-        <div class="provider-header" @click="authExpanded = authExpanded === 'openrouter' ? null : 'openrouter'">
+      <!-- Custom endpoint -->
+      <div class="provider-card" :class="{ expanded: authExpanded === 'custom' }">
+        <div class="provider-header" @click="authExpanded = authExpanded === 'custom' ? null : 'custom'">
           <div class="provider-left">
-            <span class="provider-name">{{ t("onboarding.auth.openrouter") }}</span>
-            <span class="provider-desc-text">{{ t("onboarding.auth.openrouterDesc") }}</span>
+            <span class="provider-name">{{ t("onboarding.auth.customEndpoint") }}</span>
+            <span class="provider-desc-text">{{ t("onboarding.auth.customEndpointDesc") }}</span>
           </div>
-          <span class="provider-badge" :class="{ configured: providers.find(p => p.id === 'openrouter')?.hasKey }">
-            {{ providers.find(p => p.id === 'openrouter')?.hasKey ? t("onboarding.auth.configured") : t("onboarding.auth.notConfigured") }}
+          <span class="provider-badge" :class="{ configured: customEndpointConfigured }">
+            {{ customEndpointConfigured ? t("onboarding.auth.configured") : t("onboarding.auth.notConfigured") }}
           </span>
         </div>
-        <div v-if="authExpanded === 'openrouter'" class="provider-body" @click.stop>
-          <div class="input-row">
-            <input
-              v-model="apiKeyInput"
-              class="ob-input"
-              type="password"
-              placeholder="sk-or-..."
-              @keydown="handleApiKeyKeydown"
-            />
-            <button class="ob-btn primary" :disabled="apiKeySaving || !apiKeyInput.trim()" @click="saveApiKey">
-              {{ apiKeySaving ? "..." : t("settings.provider.save") }}
+        <div v-if="authExpanded === 'custom'" class="provider-body custom-endpoint-body" @click.stop>
+          <div class="custom-endpoint-fields">
+            <label class="custom-endpoint-field">
+              <span class="custom-endpoint-label">{{ t("settings.custom.name") }}</span>
+              <input
+                v-model="customEndpointForm.name"
+                class="ob-input"
+                type="text"
+                :placeholder="t('settings.custom.namePlaceholder')"
+                @keydown="handleCustomEndpointKeydown"
+              />
+            </label>
+            <label class="custom-endpoint-field">
+              <span class="custom-endpoint-label">{{ t("settings.custom.apiModel") }}</span>
+              <input
+                v-model="customEndpointForm.apiModel"
+                class="ob-input"
+                type="text"
+                :placeholder="t('settings.custom.apiModelPlaceholder')"
+                @keydown="handleCustomEndpointKeydown"
+              />
+            </label>
+            <label class="custom-endpoint-field">
+              <span class="custom-endpoint-label">{{ t("settings.custom.endpoint") }}</span>
+              <input
+                v-model="customEndpointForm.endpoint"
+                class="ob-input"
+                type="text"
+                :placeholder="t('settings.custom.endpointPlaceholder')"
+                @keydown="handleCustomEndpointKeydown"
+              />
+            </label>
+            <label class="custom-endpoint-field">
+              <span class="custom-endpoint-label">{{ t("settings.custom.apiFormat") }}</span>
+              <select v-model="customEndpointForm.apiFormat" class="ob-input ob-select">
+                <option
+                  v-for="option in customApiFormatOptions"
+                  :key="option.value"
+                  :value="option.value"
+                >
+                  {{ option.label }}
+                </option>
+              </select>
+            </label>
+            <label class="custom-endpoint-field">
+              <span class="custom-endpoint-label">
+                {{ t("settings.custom.apiKey") }}
+                <span class="custom-endpoint-hint">{{ t("settings.custom.apiKeyOptional") }}</span>
+              </span>
+              <input
+                v-model="customEndpointForm.apiKey"
+                class="ob-input"
+                type="password"
+                :placeholder="t('settings.custom.apiKeyPlaceholder')"
+                @keydown="handleCustomEndpointKeydown"
+              />
+            </label>
+          </div>
+          <div class="input-row custom-endpoint-actions">
+            <button
+              class="ob-btn primary"
+              :disabled="customEndpointSaving || !customEndpointReady"
+              @click="saveCustomEndpoint"
+            >
+              {{ customEndpointSaving ? "..." : t("settings.custom.save") }}
             </button>
           </div>
-        </div>
-      </div>
-
-      <!-- Anthropic -->
-      <div class="provider-card" :class="{ expanded: authExpanded === 'anthropic' }">
-        <div class="provider-header" @click="authExpanded = authExpanded === 'anthropic' ? null : 'anthropic'">
-          <div class="provider-left">
-            <span class="provider-name">{{ t("onboarding.auth.anthropic") }}</span>
-            <span class="provider-desc-text">{{ t("onboarding.auth.anthropicDesc") }}</span>
-          </div>
-          <span class="provider-badge" :class="{ configured: providers.find(p => p.id === 'anthropic')?.hasKey }">
-            {{ providers.find(p => p.id === 'anthropic')?.hasKey ? t("onboarding.auth.configured") : t("onboarding.auth.notConfigured") }}
-          </span>
-        </div>
-        <div v-if="authExpanded === 'anthropic'" class="provider-body" @click.stop>
-          <template v-if="providers.find(p => p.id === 'anthropic')?.hasKey">
-            <div class="status-row ok">{{ t("settings.anthropic.loggedIn") }}</div>
-          </template>
-          <template v-else-if="oauthStep === 'idle'">
-            <button class="ob-btn primary" @click="showAnthropicDisclaimer">{{ t("settings.anthropic.loginBtn") }}</button>
-            <span class="hint-text">{{ t("settings.anthropic.hint") }}</span>
-          </template>
-          <template v-else-if="oauthStep === 'waiting_code'">
-            <p class="instruction-text">{{ t("settings.anthropic.instruction") }}</p>
-            <div class="input-row">
-              <input v-model="oauthCode" class="ob-input" :placeholder="t('settings.anthropic.codePlaceholder')" @keydown="handleOAuthKeydown" />
-              <button class="ob-btn primary" :disabled="!oauthCode.trim()" @click="submitOAuthCode">{{ t("settings.anthropic.confirm") }}</button>
-              <button class="ob-btn secondary" @click="cancelOAuth">{{ t("settings.anthropic.cancel") }}</button>
-            </div>
-          </template>
-          <template v-else-if="oauthStep === 'exchanging'">
-            <div class="status-row loading">{{ t("settings.anthropic.verifying") }}</div>
-          </template>
         </div>
       </div>
 
@@ -941,11 +948,6 @@ onUnmounted(() => {
     </div>
   </div>
 
-  <SubscriptionDisclaimerModal
-    :open="showDisclaimer"
-    @cancel="cancelDisclaimer"
-    @confirm="confirmDisclaimer"
-  />
 </template>
 
 <style scoped>
@@ -1258,6 +1260,37 @@ onUnmounted(() => {
   flex-direction: column;
   gap: 10px;
 }
+.custom-endpoint-fields {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+.custom-endpoint-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+.custom-endpoint-field:nth-child(3) {
+  grid-column: 1 / -1;
+}
+.custom-endpoint-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+.custom-endpoint-hint {
+  font-weight: 400;
+  color: var(--text-secondary);
+  opacity: 0.8;
+}
+.custom-endpoint-actions {
+  justify-content: flex-end;
+}
 
 .input-row {
   display: flex;
@@ -1277,6 +1310,9 @@ onUnmounted(() => {
 }
 .ob-input:focus {
   border-color: var(--accent-color);
+}
+.ob-select {
+  min-height: 35px;
 }
 
 .ob-btn {
@@ -1341,6 +1377,22 @@ onUnmounted(() => {
   }
 
   .welcome-next-btn {
+    width: 100%;
+  }
+
+  .custom-endpoint-fields {
+    grid-template-columns: 1fr;
+  }
+
+  .custom-endpoint-field:nth-child(3) {
+    grid-column: auto;
+  }
+
+  .custom-endpoint-actions {
+    justify-content: stretch;
+  }
+
+  .custom-endpoint-actions .ob-btn {
     width: 100%;
   }
 }

@@ -41,7 +41,7 @@ const defaults: DisplaySettings = {
   todoAutoOpen: true,
   changesAutoOpen: true,
   changesAutoClose: true,
-  rightAlignUserMessages: false,
+  rightAlignUserMessages: true,
   compactToolCalls: true,
   systemNotificationsEnabled: true,
   notifyOnChatDone: true,

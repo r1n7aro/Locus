@@ -158,6 +158,9 @@ const props = defineProps<{
   sessions: SessionSummary[];
   activeSessionId: string | null;
   unityConnected?: boolean;
+  unityPluginStatus?: "missing" | "outdated" | null;
+  unityPluginInstalling?: boolean;
+  workingDir?: string;
   scanPhase?: AssetDbScanEvent | null;
   lastScanStats?: ScanStats | null;
   isUnityProject?: boolean;
@@ -165,6 +168,8 @@ const props = defineProps<{
   streamingSessionIds?: Set<string>;
   undoableMessageIds?: Set<string>;
   layoutMode?: ChatLayoutMode;
+  defaultSessionPanelCollapsed?: boolean;
+  sessionPanelStorageScope?: string;
 }>();
 
 
@@ -185,10 +190,9 @@ const emit = defineEmits<{
   archiveSession: [id: string];
   deleteSession: [id: string];
   startScan: [];
+  installPlugin: [];
   layoutModeChange: [mode: ResolvedChatLayoutMode];
 }>();
-
-
 
 const lightboxSrc = ref("");
 function openLightbox(src: string) {
@@ -956,22 +960,25 @@ function handleComposerSend(payload: ChatComposerSendPayload) {
 
 const STORAGE_KEY_SESSION_WIDTH = "locus:sessionPanelWidth";
 const STORAGE_KEY_SESSION_COLLAPSED = "locus:sessionPanelCollapsed";
-const AUTO_VERTICAL_MIN_CHAT_WIDTH = 560;
 const sessionPanelWidth = ref(220); // px
-const sessionPanelCollapsed = ref(false);
+const sessionPanelCollapsed = ref(!!props.defaultSessionPanelCollapsed);
 const isDraggingSession = ref(false);
 const layoutRef = ref<HTMLElement | null>(null);
-const layoutWidth = ref(0);
 let releaseSessionSelectionLock: (() => void) | null = null;
-let layoutResizeObserver: ResizeObserver | null = null;
+
+const sessionPanelWidthStorageKey = computed(() =>
+  props.sessionPanelStorageScope
+    ? `locus:${props.sessionPanelStorageScope}:sessionPanelWidth`
+    : STORAGE_KEY_SESSION_WIDTH,
+);
+const sessionPanelCollapsedStorageKey = computed(() =>
+  props.sessionPanelStorageScope
+    ? `locus:${props.sessionPanelStorageScope}:sessionPanelCollapsed`
+    : STORAGE_KEY_SESSION_COLLAPSED,
+);
 
 const resolvedLayoutMode = computed<ResolvedChatLayoutMode>(() => {
   if (props.layoutMode === "vertical") return "vertical";
-  if (props.layoutMode === "horizontal") return "horizontal";
-  const sessionNavWidth = sessionPanelCollapsed.value ? 0 : sessionPanelWidth.value;
-  if (layoutWidth.value > 0 && layoutWidth.value < sessionNavWidth + AUTO_VERTICAL_MIN_CHAT_WIDTH) {
-    return "vertical";
-  }
   return "horizontal";
 });
 const isVerticalLayout = computed(() => resolvedLayoutMode.value === "vertical");
@@ -985,23 +992,6 @@ watch(
   (mode) => emit("layoutModeChange", mode),
   { immediate: true },
 );
-
-function updateLayoutWidth() {
-  layoutWidth.value = layoutRef.value?.clientWidth ?? 0;
-}
-
-function disconnectLayoutResizeObserver() {
-  layoutResizeObserver?.disconnect();
-  layoutResizeObserver = null;
-}
-
-function connectLayoutResizeObserver() {
-  disconnectLayoutResizeObserver();
-  updateLayoutWidth();
-  if (typeof ResizeObserver === "undefined" || !layoutRef.value) return;
-  layoutResizeObserver = new ResizeObserver(() => updateLayoutWidth());
-  layoutResizeObserver.observe(layoutRef.value);
-}
 
 function onSessionSplitterMouseDown(e: MouseEvent) {
   e.preventDefault();
@@ -1026,12 +1016,12 @@ function onSessionSplitterMouseUp() {
   document.removeEventListener("mouseup", onSessionSplitterMouseUp);
   releaseSessionSelectionLock?.();
   releaseSessionSelectionLock = null;
-  try { localStorage.setItem(STORAGE_KEY_SESSION_WIDTH, String(sessionPanelWidth.value)); } catch {}
+  try { localStorage.setItem(sessionPanelWidthStorageKey.value, String(sessionPanelWidth.value)); } catch {}
 }
 
 function setSessionPanelCollapsed(value: boolean) {
   sessionPanelCollapsed.value = value;
-  try { localStorage.setItem(STORAGE_KEY_SESSION_COLLAPSED, value ? "1" : "0"); } catch {}
+  try { localStorage.setItem(sessionPanelCollapsedStorageKey.value, value ? "1" : "0"); } catch {}
 }
 
 function onGlobalChatKeydown(e: KeyboardEvent) {
@@ -1049,14 +1039,16 @@ function onGlobalChatKeydown(e: KeyboardEvent) {
 onMounted(() => {
   window.addEventListener("keydown", onGlobalChatKeydown);
   try {
-    const saved = localStorage.getItem(STORAGE_KEY_SESSION_WIDTH);
+    const saved = localStorage.getItem(sessionPanelWidthStorageKey.value);
     if (saved) sessionPanelWidth.value = Math.max(140, Math.min(480, Number(saved)));
   } catch {}
   try {
-    sessionPanelCollapsed.value = localStorage.getItem(STORAGE_KEY_SESSION_COLLAPSED) === "1";
+    const saved = localStorage.getItem(sessionPanelCollapsedStorageKey.value);
+    sessionPanelCollapsed.value = saved === null
+      ? !!props.defaultSessionPanelCollapsed
+      : saved === "1";
   } catch {}
   nextTick(() => {
-    connectLayoutResizeObserver();
     connectTranscriptResizeObserver();
   });
 });
@@ -1070,7 +1062,6 @@ onUnmounted(() => {
   streamEndScrollScheduler.cancel();
   clearToolViewportAnchor();
   clearStreamingTextFlushTimer();
-  disconnectLayoutResizeObserver();
   disconnectTranscriptResizeObserver();
   document.removeEventListener("mousemove", onSessionSplitterMouseMove);
   document.removeEventListener("mouseup", onSessionSplitterMouseUp);
@@ -1331,10 +1322,14 @@ onUnmounted(() => {
         <div v-if="!inputControlsCollapsed" class="input-backdrop-status">
           <ChatStatusIndicators
             :unity-connected="unityConnected"
+            :unity-plugin-status="unityPluginStatus"
+            :unity-plugin-installing="unityPluginInstalling"
+            :working-dir="workingDir"
             :is-unity-project="isUnityProject"
             :scan-phase="scanPhase"
             :last-scan-stats="lastScanStats"
             @start-scan="emit('startScan')"
+            @install-plugin="emit('installPlugin')"
           />
         </div>
         <div class="input-backdrop-action">

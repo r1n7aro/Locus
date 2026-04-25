@@ -27,6 +27,7 @@ withDefaults(defineProps<{
       class="unity-session-workspace"
       active
       layout-mode="auto"
+      session-panel-storage-scope="unity"
     />
   </main>
 </template>

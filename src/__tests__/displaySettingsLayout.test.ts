@@ -9,7 +9,7 @@ function read(relPath: string) {
 }
 
 describe("display settings transcript alignment", () => {
-  it("adds a session user message right-align toggle that defaults to off", () => {
+  it("adds a session user message right-align toggle that defaults to on", () => {
     const displaySettings = read("src/composables/useDisplaySettings.ts");
     const displayPanel = read("src/components/settings/DisplaySettings.vue");
     const transcript = read("src/components/chat/ChatTranscript.vue");
@@ -17,7 +17,7 @@ describe("display settings transcript alignment", () => {
     const en = read("src/language/en.json");
 
     expect(displaySettings).toContain("rightAlignUserMessages: boolean;");
-    expect(displaySettings).toContain("rightAlignUserMessages: false,");
+    expect(displaySettings).toContain("rightAlignUserMessages: true,");
 
     expect(displayPanel).toContain(":model-value=\"display.rightAlignUserMessages\"");
     expect(displayPanel).toContain(":aria-label=\"t('settings.display.rightAlignUserMessages')\"");

@@ -14,8 +14,11 @@ const props = withDefaults(defineProps<{
   todoWriteVersion: number;
   celebrationEnabled: boolean;
   layout?: "side" | "bottom";
+  maxSideWidth?: number;
+  storageScope?: string;
 }>(), {
   layout: "side",
+  storageScope: "",
 });
 
 const chatStore = useChatStore();
@@ -40,6 +43,19 @@ const sidebarHeight = ref(DEFAULT_SIDEBAR_HEIGHT);
 const isDraggingSidebar = ref(false);
 let releaseSidebarSelectionLock: (() => void) | null = null;
 
+const sidebarWidthStorageKey = computed(() => scopedSidebarStorageKey(STORAGE_KEY_SIDEBAR_WIDTH));
+const sidebarHeightStorageKey = computed(() => scopedSidebarStorageKey(STORAGE_KEY_SIDEBAR_HEIGHT));
+const effectiveMaxSideWidth = computed(() => {
+  const maxWidth = props.maxSideWidth;
+  if (typeof maxWidth !== "number" || !Number.isFinite(maxWidth)) {
+    return MAX_SIDEBAR_WIDTH;
+  }
+  return Math.max(MIN_SIDEBAR_WIDTH, Math.min(MAX_SIDEBAR_WIDTH, Math.floor(maxWidth)));
+});
+const effectiveSidebarWidth = computed(() =>
+  clampSidebarWidth(sidebarWidth.value, effectiveMaxSideWidth.value),
+);
+
 const sidebarStyle = computed(() => {
   if (props.layout === "bottom") {
     return {
@@ -49,14 +65,27 @@ const sidebarStyle = computed(() => {
       minHeight: `${sidebarHeight.value}px`,
     };
   }
+  const width = effectiveSidebarWidth.value;
   return {
-    width: `${sidebarWidth.value}px`,
-    minWidth: `${sidebarWidth.value}px`,
+    width: `${width}px`,
+    minWidth: `${width}px`,
   };
 });
 
-function clampSidebarWidth(next: number) {
-  return Math.max(MIN_SIDEBAR_WIDTH, Math.min(MAX_SIDEBAR_WIDTH, next));
+function scopedSidebarStorageKey(baseKey: string) {
+  const scope = props.storageScope.trim();
+  if (!scope) return baseKey;
+  return baseKey.replace("locus:", `locus:${scope}:`);
+}
+
+function clampSidebarWidth(next: number, maxWidth = MAX_SIDEBAR_WIDTH) {
+  const normalizedNext = Number.isFinite(next) ? next : DEFAULT_SIDEBAR_WIDTH;
+  const normalizedMax = Number.isFinite(maxWidth) ? maxWidth : MAX_SIDEBAR_WIDTH;
+  const upperBound = Math.max(
+    MIN_SIDEBAR_WIDTH,
+    Math.min(MAX_SIDEBAR_WIDTH, Math.floor(normalizedMax)),
+  );
+  return Math.max(MIN_SIDEBAR_WIDTH, Math.min(upperBound, normalizedNext));
 }
 
 function clampSidebarHeight(next: number) {
@@ -86,7 +115,7 @@ function onSidebarResizeMouseMove(event: MouseEvent) {
     return;
   }
   const nextWidth = rect.right - event.clientX;
-  sidebarWidth.value = clampSidebarWidth(nextWidth);
+  sidebarWidth.value = clampSidebarWidth(nextWidth, effectiveMaxSideWidth.value);
 }
 
 function stopSidebarResize(persist: boolean) {
@@ -100,9 +129,9 @@ function stopSidebarResize(persist: boolean) {
   if (!persist) return;
   try {
     if (props.layout === "bottom") {
-      localStorage.setItem(STORAGE_KEY_SIDEBAR_HEIGHT, String(Math.round(sidebarHeight.value)));
+      localStorage.setItem(sidebarHeightStorageKey.value, String(Math.round(sidebarHeight.value)));
     } else {
-      localStorage.setItem(STORAGE_KEY_SIDEBAR_WIDTH, String(Math.round(sidebarWidth.value)));
+      localStorage.setItem(sidebarWidthStorageKey.value, String(Math.round(effectiveSidebarWidth.value)));
     }
   } catch {
     // ignore persistence failures
@@ -120,11 +149,11 @@ function onWindowResize() {
 
 onMounted(() => {
   try {
-    const savedWidth = localStorage.getItem(STORAGE_KEY_SIDEBAR_WIDTH);
+    const savedWidth = localStorage.getItem(sidebarWidthStorageKey.value);
     if (savedWidth) {
       sidebarWidth.value = clampSidebarWidth(Number(savedWidth));
     }
-    const savedHeight = localStorage.getItem(STORAGE_KEY_SIDEBAR_HEIGHT);
+    const savedHeight = localStorage.getItem(sidebarHeightStorageKey.value);
     if (savedHeight) {
       sidebarHeight.value = clampSidebarHeight(Number(savedHeight));
     }

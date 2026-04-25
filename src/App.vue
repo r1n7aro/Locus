@@ -225,6 +225,23 @@ const showAppUpdateModal = computed(() =>
     && !uiStore.showOnboarding,
   ),
 );
+const pluginToastLabel = computed(() => {
+  if (projectStore.pluginToast === "missing") return t("app.plugin.notInstalled");
+  if (projectStore.pluginToast === "outdated") return t("app.plugin.needUpdate");
+  return "";
+});
+const pluginToastAction = computed(() => {
+  if (!projectStore.pluginToast) return "";
+  if (projectStore.pluginInstalling) return t("app.plugin.installing");
+  return projectStore.pluginToast === "missing"
+    ? t("app.plugin.clickInstall")
+    : t("app.plugin.clickUpdate");
+});
+const pluginToastTitle = computed(() =>
+  pluginToastLabel.value && pluginToastAction.value
+    ? `${pluginToastLabel.value} - ${pluginToastAction.value}`
+    : pluginToastLabel.value,
+);
 
 function shortDir(dir: string): string {
   if (!dir) return t("app.dir.notSet");
@@ -460,15 +477,30 @@ onUnmounted(() => {
           :class="{ active: uiStore.activeTab === 'settings' }"
           @click="uiStore.setTab('settings')"
         >{{ t("app.tab.settings") }}</button>
-        <div v-if="projectStore.pluginToast" class="tab-plugin-warn" @click="projectStore.installPlugin">
-          <span class="tab-plugin-dot"></span>
-          <span class="tab-plugin-label">
-            {{ projectStore.pluginToast === "missing" ? t("app.plugin.notInstalled") : t("app.plugin.needUpdate") }}
-          </span>
-          <span class="tab-plugin-action">
-            {{ projectStore.pluginInstalling ? t("app.plugin.installing") : projectStore.pluginToast === "missing" ? t("app.plugin.clickInstall") : t("app.plugin.clickUpdate") }}
-          </span>
-        </div>
+        <button
+          v-if="projectStore.pluginToast"
+          class="tab-plugin-warn"
+          type="button"
+          :title="pluginToastTitle"
+          :aria-label="pluginToastTitle"
+          :disabled="projectStore.pluginInstalling"
+          @click="projectStore.installPlugin"
+        >
+          <span v-if="projectStore.pluginInstalling" class="tab-plugin-spinner" aria-hidden="true"></span>
+          <svg
+            v-else
+            class="tab-plugin-icon"
+            viewBox="0 0 16 16"
+            width="14"
+            height="14"
+            fill="currentColor"
+            aria-hidden="true"
+          >
+            <path d="M8 1a7 7 0 1 0 0 14A7 7 0 0 0 8 1zm-.75 4a.75.75 0 0 1 1.5 0v3a.75.75 0 0 1-1.5 0V5zm.75 6.5a.75.75 0 1 1 0-1.5.75.75 0 0 1 0 1.5z"/>
+          </svg>
+          <span class="tab-plugin-label">{{ pluginToastLabel }}</span>
+          <span class="tab-plugin-action">{{ pluginToastAction }}</span>
+        </button>
         <div class="tab-spacer"></div>
         <div class="workspace-selector" ref="dirDropdownRef">
           <button
@@ -952,6 +984,10 @@ body.is-dragging-select-lock * {
 
 .tab-item {
   -webkit-app-region: no-drag;
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   position: relative;
   padding: 0 14px;
   height: 100%;
@@ -962,7 +998,8 @@ body.is-dragging-select-lock * {
   font-weight: 500;
   cursor: pointer;
   transition: color 0.15s ease;
-  line-height: 38px;
+  line-height: 1;
+  white-space: nowrap;
 }
 
 .tab-item:hover {
@@ -987,19 +1024,23 @@ body.is-dragging-select-lock * {
 
 .tab-brand {
   -webkit-app-region: no-drag;
+  flex: 0 0 auto;
   font-size: 14px;
   font-weight: 650;
   letter-spacing: -0.2px;
   margin-right: 10px;
   color: var(--text-color);
+  white-space: nowrap;
 }
 
 .tab-spacer {
-  flex: 1;
+  flex: 1 1 8px;
+  min-width: 8px;
 }
 
 .window-controls {
   -webkit-app-region: no-drag;
+  flex: 0 0 auto;
   display: flex;
   align-items: center;
   margin-left: 10px;
@@ -1035,6 +1076,9 @@ body.is-dragging-select-lock * {
 
 .workspace-selector {
   -webkit-app-region: no-drag;
+  flex: 1 1 160px;
+  min-width: 120px;
+  max-width: 320px;
   position: relative;
   margin-right: 6px;
 }
@@ -1053,8 +1097,9 @@ body.is-dragging-select-lock * {
   line-height: 21px;
   cursor: pointer;
   transition: border-color 0.15s ease, background 0.15s ease, color 0.15s ease;
-  min-width: 200px;
-  max-width: 320px;
+  width: 100%;
+  min-width: 0;
+  max-width: none;
   height: 23px;
 }
 
@@ -1074,6 +1119,7 @@ body.is-dragging-select-lock * {
 
 .ws-name {
   flex: 1;
+  min-width: 0;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -1373,6 +1419,8 @@ body.is-dragging-select-lock * {
 }
 
 .tab-plugin-warn {
+  -webkit-app-region: no-drag;
+  flex: 0 0 auto;
   display: flex;
   align-items: center;
   gap: 6px;
@@ -1380,36 +1428,62 @@ body.is-dragging-select-lock * {
   height: 23px;
   margin-left: 8px;
   border-radius: 6px;
-  background: color-mix(in srgb, var(--panel-bg) 68%, var(--sidebar-bg) 32%);
-  border: 1px solid var(--border-color);
+  background: color-mix(in srgb, var(--status-danger-bg) 78%, var(--panel-bg) 22%);
+  border: 1px solid color-mix(in srgb, var(--status-danger-border) 72%, var(--border-color) 28%);
+  color: var(--status-danger-fg);
   cursor: pointer;
+  font: inherit;
+  box-shadow: 0 4px 12px rgba(15, 23, 42, 0.08);
   transition: border-color 0.15s ease, background 0.15s ease, color 0.15s ease;
+  white-space: nowrap;
 }
 
-.tab-plugin-warn:hover {
-  background: var(--hover-bg);
-  border-color: var(--border-strong);
+.tab-plugin-warn:hover:not(:disabled),
+.tab-plugin-warn:focus-visible {
+  background: color-mix(in srgb, var(--status-danger-bg) 88%, var(--panel-bg) 12%);
+  border-color: color-mix(in srgb, var(--status-danger-fg) 42%, var(--status-danger-border) 58%);
 }
 
-.tab-plugin-dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--accent-color);
+.tab-plugin-warn:focus-visible {
+  outline: none;
+}
+
+.tab-plugin-warn:disabled {
+  cursor: progress;
+  opacity: 0.82;
+}
+
+.tab-plugin-icon {
   flex-shrink: 0;
-  opacity: 0.8;
+  opacity: 0.86;
+}
+
+.tab-plugin-spinner {
+  width: 13px;
+  height: 13px;
+  flex-shrink: 0;
+  border-radius: 999px;
+  border: 2px solid color-mix(in srgb, currentColor 18%, transparent);
+  border-top-color: currentColor;
+  animation: tab-plugin-spin 0.8s linear infinite;
 }
 
 .tab-plugin-label {
   font-size: 12px;
   font-weight: 500;
-  color: var(--text-color);
+  color: currentColor;
   white-space: nowrap;
 }
 
 .tab-plugin-action {
   font-size: 11px;
-  color: var(--text-secondary);
+  color: color-mix(in srgb, currentColor 76%, var(--text-secondary) 24%);
   white-space: nowrap;
+}
+
+@keyframes tab-plugin-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 </style>

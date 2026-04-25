@@ -2,14 +2,17 @@
 import { computed, onMounted, onUnmounted, ref } from "vue";
 import { t } from "../../i18n";
 import type { AssetDbScanEvent, ScanStats } from "../../types";
+import BaseButton from "../ui/BaseButton.vue";
 
 type StatusId = "assetDb" | "unity";
 type StatusTone = "success" | "danger" | "accent" | "muted";
 type StatusIcon = "database" | "unity";
+type UnityPluginNotice = "missing" | "outdated";
 
 interface StatusDetailRow {
   label: string;
   value: string;
+  mono?: boolean;
 }
 
 interface StatusItem {
@@ -27,6 +30,9 @@ interface StatusItem {
 
 const props = defineProps<{
   unityConnected?: boolean;
+  unityPluginStatus?: UnityPluginNotice | null;
+  unityPluginInstalling?: boolean;
+  workingDir?: string;
   isUnityProject?: boolean;
   scanPhase?: AssetDbScanEvent | null;
   lastScanStats?: ScanStats | null;
@@ -34,6 +40,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   startScan: [];
+  installPlugin: [];
 }>();
 
 const activePopover = ref<StatusId | null>(null);
@@ -67,6 +74,45 @@ const scanSummary = computed(() => {
   return t("chat.assetDb.summary", s.nodesAdded, s.edgesAdded);
 });
 
+const unityWorkingDir = computed(() => props.workingDir?.trim() ?? "");
+
+function stripExtendedPathPrefix(path: string) {
+  return path.startsWith("\\\\?\\") ? path.slice(4) : path;
+}
+
+function unityPipeNameForWorkingDir(workingDir: string) {
+  const normalized = stripExtendedPathPrefix(workingDir).trim();
+  if (!normalized) return "";
+  const sanitized = normalized.replace(/[\\/: ]/g, "_");
+  return `\\\\.\\pipe\\locus_unity_${sanitized}`;
+}
+
+const unityPipeName = computed(() =>
+  props.unityConnected ? unityPipeNameForWorkingDir(unityWorkingDir.value) : "",
+);
+
+const unityPluginLabel = computed(() => {
+  if (props.unityPluginStatus === "missing") return t("app.plugin.notInstalled");
+  if (props.unityPluginStatus === "outdated") return t("app.plugin.needUpdate");
+  return "";
+});
+
+const unitySummary = computed(() =>
+  unityPluginLabel.value || (props.unityConnected ? t("chat.unity.connected") : t("chat.unity.disconnected")),
+);
+
+const unityTone = computed<StatusTone>(() =>
+  props.unityPluginStatus ? "danger" : props.unityConnected ? "success" : "danger",
+);
+
+const unityActionLabel = computed(() => {
+  if (!props.unityPluginStatus) return "";
+  if (props.unityPluginInstalling) return t("app.plugin.installing");
+  return props.unityPluginStatus === "missing"
+    ? t("app.plugin.clickInstall")
+    : t("app.plugin.clickUpdate");
+});
+
 const assetStatusLabel = computed(() => {
   if (isScanning.value) return scanLabel.value;
   if (scanError.value) return scanError.value.message;
@@ -78,7 +124,7 @@ const assetTone = computed<StatusTone>(() => {
   if (scanError.value) return "danger";
   if (isScanning.value) return "accent";
   if (scanSummary.value) return "success";
-  return "muted";
+  return props.isUnityProject ? "danger" : "muted";
 });
 
 const assetActionLabel = computed(() => {
@@ -107,9 +153,7 @@ function scanProgressRow(phase: AssetDbScanEvent | null | undefined): StatusDeta
 }
 
 const assetRows = computed<StatusDetailRow[]>(() => {
-  const rows: StatusDetailRow[] = [
-    { label: t("chat.status.detail.status"), value: assetStatusLabel.value },
-  ];
+  const rows: StatusDetailRow[] = [];
 
   const progress = scanProgressRow(props.scanPhase);
   if (progress) rows.push(progress);
@@ -136,12 +180,24 @@ const assetRows = computed<StatusDetailRow[]>(() => {
   return rows;
 });
 
-const unityRows = computed<StatusDetailRow[]>(() => [
-  {
-    label: t("chat.status.detail.status"),
-    value: props.unityConnected ? t("chat.unity.connected") : t("chat.unity.disconnected"),
-  },
-]);
+const unityRows = computed<StatusDetailRow[]>(() => {
+  const rows: StatusDetailRow[] = [];
+  if (unityPipeName.value) {
+    rows.push({
+      label: t("chat.status.unity.pipe"),
+      value: unityPipeName.value,
+      mono: true,
+    });
+  }
+  if (unityWorkingDir.value) {
+    rows.push({
+      label: t("chat.status.unity.workingDir"),
+      value: unityWorkingDir.value,
+      mono: true,
+    });
+  }
+  return rows;
+});
 
 const statusItems = computed<StatusItem[]>(() => [
   {
@@ -160,10 +216,13 @@ const statusItems = computed<StatusItem[]>(() => [
     id: "unity",
     icon: "unity",
     title: t("chat.status.unity.title"),
-    summary: props.unityConnected ? t("chat.unity.connected") : t("chat.unity.disconnected"),
-    inlineLabel: props.unityConnected ? t("chat.unity.connected") : t("chat.unity.disconnected"),
-    tone: props.unityConnected ? "success" : "danger",
+    summary: unitySummary.value,
+    inlineLabel: unitySummary.value,
+    tone: unityTone.value,
     rows: unityRows.value,
+    actionLabel: unityActionLabel.value,
+    actionTitle: unityActionLabel.value,
+    actionDisabled: props.unityPluginInstalling,
   },
 ]);
 
@@ -177,6 +236,15 @@ function togglePopover(id: StatusId) {
 
 function closePopover() {
   activePopover.value = null;
+}
+
+function runStatusAction(item: StatusItem) {
+  if (item.id === "assetDb") {
+    emit("startScan");
+  } else if (item.id === "unity") {
+    emit("installPlugin");
+  }
+  closePopover();
 }
 
 function onDocumentKeydown(event: KeyboardEvent) {
@@ -204,7 +272,13 @@ onUnmounted(() => {
         :key="item.id"
         type="button"
         class="chat-status-icon-btn ui-select-none"
-        :class="[`tone-${item.tone}`, { active: activePopover === item.id }]"
+        :class="[
+          `tone-${item.tone}`,
+          {
+            active: activePopover === item.id,
+            'is-scanning': item.id === 'assetDb' && isScanning,
+          },
+        ]"
         :aria-label="`${item.title}: ${item.summary}`"
         :aria-expanded="activePopover === item.id"
         @click="togglePopover(item.id)"
@@ -241,32 +315,34 @@ onUnmounted(() => {
       <div
         v-if="activeItem"
         class="chat-status-popover"
+        :class="{ 'has-details': activeItem.rows.length > 0 }"
         role="dialog"
         :aria-label="activeItem.title"
         @click.stop
       >
         <div class="chat-status-popover-head">
-          <span class="chat-status-popover-title">{{ activeItem.title }}</span>
-          <span class="chat-status-popover-summary" :class="`tone-${activeItem.tone}`">
-            {{ activeItem.summary }}
-          </span>
+          <div class="chat-status-popover-heading">
+            <span class="chat-status-popover-summary" :class="`tone-${activeItem.tone}`">
+              {{ activeItem.summary }}
+            </span>
+          </div>
+          <BaseButton
+            v-if="activeItem.actionLabel"
+            class="chat-status-action ui-select-none"
+            size="sm"
+            :disabled="activeItem.actionDisabled"
+            :title="activeItem.actionTitle"
+            @click="runStatusAction(activeItem)"
+          >
+            {{ activeItem.actionLabel }}
+          </BaseButton>
         </div>
-        <dl class="chat-status-detail-list">
+        <dl v-if="activeItem.rows.length > 0" class="chat-status-detail-list">
           <template v-for="row in activeItem.rows" :key="`${row.label}:${row.value}`">
             <dt>{{ row.label }}</dt>
-            <dd>{{ row.value }}</dd>
+            <dd :class="{ 'is-mono': row.mono }">{{ row.value }}</dd>
           </template>
         </dl>
-        <button
-          v-if="activeItem.id === 'assetDb' && activeItem.actionLabel"
-          type="button"
-          class="chat-status-action ui-select-none"
-          :disabled="activeItem.actionDisabled"
-          :title="activeItem.actionTitle"
-          @click="emit('startScan'); closePopover()"
-        >
-          {{ activeItem.actionLabel }}
-        </button>
       </div>
     </Transition>
   </div>
@@ -356,6 +432,11 @@ onUnmounted(() => {
   color: var(--accent-color);
 }
 
+.chat-status-icon-btn.is-scanning > svg {
+  animation: chat-status-icon-breathe 1.35s ease-in-out infinite;
+  transform-origin: center;
+}
+
 .chat-status-popover {
   position: absolute;
   left: 0;
@@ -372,23 +453,29 @@ onUnmounted(() => {
 
 .chat-status-popover-head {
   display: flex;
-  align-items: flex-start;
-  gap: 8px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.chat-status-popover.has-details .chat-status-popover-head {
   padding-bottom: 8px;
   border-bottom: 1px solid var(--border-color);
 }
 
-.chat-status-popover-title {
+.chat-status-popover-heading {
   flex: 1;
   min-width: 0;
-  font-size: 12px;
-  font-weight: 600;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
 }
 
 .chat-status-popover-summary {
   min-width: 0;
-  max-width: 190px;
-  font-size: 11px;
+  font-size: 12px;
+  line-height: 1.35;
+  font-weight: 600;
   color: var(--text-secondary);
   white-space: nowrap;
   overflow: hidden;
@@ -426,27 +513,14 @@ onUnmounted(() => {
   overflow-wrap: anywhere;
 }
 
+.chat-status-detail-list dd.is-mono {
+  font-family: var(--font-mono-identifier);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
 .chat-status-action {
-  margin-top: 10px;
-  min-height: 26px;
-  padding: 0 10px;
-  border: 1px solid var(--border-color);
-  border-radius: 6px;
-  background: transparent;
-  color: var(--text-color);
-  font-size: 12px;
-  cursor: pointer;
-  box-shadow: none;
-}
-
-.chat-status-action:hover:not(:disabled) {
-  background: var(--hover-bg);
-  border-color: var(--border-strong, var(--border-color));
-}
-
-.chat-status-action:disabled {
-  cursor: not-allowed;
-  opacity: 0.5;
+  flex: 0 0 auto;
 }
 
 .status-popover-enter-active,
@@ -458,5 +532,17 @@ onUnmounted(() => {
 .status-popover-leave-to {
   opacity: 0;
   transform: translateY(4px);
+}
+
+@keyframes chat-status-icon-breathe {
+  0%,
+  100% {
+    opacity: 0.72;
+    transform: scale(0.96);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.04);
+  }
 }
 </style>

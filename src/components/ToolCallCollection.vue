@@ -24,6 +24,7 @@ const emit = defineEmits<{
 const { state: displaySettings } = useDisplaySettings();
 const expanded = ref(false);
 const panelVisible = ref(false);
+const panelLeaving = ref(false);
 const summaryRef = ref<HTMLElement | null>(null);
 const panelTransitionCleanup = new WeakMap<HTMLElement, () => void>();
 
@@ -72,6 +73,7 @@ function traceCollection(event: string, detail?: Record<string, unknown>) {
     canCollapse: batchState.value.canCollapse,
     expanded: expanded.value,
     panelVisible: panelVisible.value,
+    panelLeaving: panelLeaving.value,
     ...detail,
   });
 }
@@ -149,6 +151,7 @@ function onPanelEnter(element: Element, done: () => void) {
   traceCollection("panelEnter", {
     heightBefore: panel.scrollHeight,
   });
+  panelLeaving.value = false;
   panelVisible.value = true;
   preparePanelTransition(panel);
   panel.style.height = "0px";
@@ -167,12 +170,14 @@ function onPanelAfterEnter(element: Element) {
   traceCollection("panelAfterEnter", {
     heightAfter: (element as HTMLElement).scrollHeight,
   });
+  panelLeaving.value = false;
   resetPanelTransition(element as HTMLElement);
   emitViewportAnchorEnd();
 }
 
 function onPanelEnterCancelled(element: Element) {
   traceCollection("panelEnterCancelled");
+  panelLeaving.value = false;
   resetPanelTransition(element as HTMLElement);
   emitViewportAnchorEnd();
 }
@@ -182,6 +187,7 @@ function onPanelLeave(element: Element, done: () => void) {
   traceCollection("panelLeave", {
     heightBefore: panel.scrollHeight,
   });
+  panelLeaving.value = true;
   panelVisible.value = true;
   preparePanelTransition(panel);
   panel.style.height = `${panel.scrollHeight}px`;
@@ -199,6 +205,7 @@ function onPanelLeave(element: Element, done: () => void) {
 function onPanelAfterLeave(element: Element) {
   traceCollection("panelAfterLeave");
   panelVisible.value = false;
+  panelLeaving.value = false;
   resetPanelTransition(element as HTMLElement);
   emitViewportAnchorEnd();
   emit("collapseFinished");
@@ -206,6 +213,7 @@ function onPanelAfterLeave(element: Element) {
 
 function onPanelLeaveCancelled(element: Element) {
   traceCollection("panelLeaveCancelled");
+  panelLeaving.value = false;
   panelVisible.value = true;
   resetPanelTransition(element as HTMLElement);
   emitViewportAnchorEnd();
@@ -260,6 +268,7 @@ watch(
     :class="{
       'is-collapsible': batchState.canCollapse,
       'is-expanded': batchState.canCollapse && summaryOpen,
+      'is-collapsing': batchState.canCollapse && panelLeaving,
     }"
   >
     <button
@@ -267,13 +276,13 @@ watch(
       ref="summaryRef"
       type="button"
       class="tool-call-batch-summary ui-select-none"
-      :class="{ open: summaryOpen }"
+      :class="{ open: summaryOpen, closing: panelLeaving }"
       :title="toggleLabel"
       :aria-label="toggleLabel"
       :aria-expanded="expanded"
       @click="toggleExpanded"
     >
-      <span class="tool-call-batch-chevron" :class="{ open: summaryOpen }" aria-hidden="true">
+      <span class="tool-call-batch-chevron" :class="{ open: expanded }" aria-hidden="true">
         <svg viewBox="0 0 12 12" width="10" height="10">
           <path
             d="M4 2.5L8 6 4 9.5"
@@ -306,6 +315,7 @@ watch(
           :class="{
             'with-summary': batchState.canCollapse,
             open: batchState.canCollapse && summaryOpen,
+            closing: batchState.canCollapse && panelLeaving,
           }"
         >
           <template v-for="toolCall in toolCalls" :key="toolCall.id">
@@ -321,11 +331,11 @@ watch(
 .tool-call-collection {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 6px;
 }
 
 .tool-call-collection.is-expanded {
-  gap: 4px;
+  gap: 0;
 }
 
 .tool-call-collection-panel {
@@ -348,7 +358,7 @@ watch(
   font: inherit;
   text-align: left;
   cursor: pointer;
-  transition: background 0.15s, border-color 0.15s, color 0.15s;
+  transition: background 0.18s, border-color 0.18s, border-radius 0.24s, color 0.15s;
 }
 
 .tool-call-batch-summary:hover,
@@ -358,15 +368,16 @@ watch(
 }
 
 .tool-call-batch-summary.open {
+  border-color: color-mix(in srgb, var(--accent-color) 26%, var(--border-color));
+  border-bottom-color: color-mix(in srgb, var(--border-color) 76%, transparent);
+  border-radius: 8px 8px 0 0;
+  background: color-mix(in srgb, var(--msg-assistant-bg) 76%, var(--panel-bg) 24%);
+}
+
+.tool-call-batch-summary.open.closing {
   border-color: transparent;
   border-radius: 6px;
   background: transparent;
-}
-
-.tool-call-batch-summary.open:hover,
-.tool-call-batch-summary.open:focus-visible {
-  border-color: color-mix(in srgb, var(--accent-color) 18%, var(--border-color));
-  background: color-mix(in srgb, var(--hover-bg) 72%, var(--msg-assistant-bg));
 }
 
 .tool-call-batch-summary:focus-visible {
@@ -420,7 +431,7 @@ watch(
 .tool-call-collection-list {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 6px;
 }
 
 .tool-call-collection-list.with-summary {
@@ -428,9 +439,10 @@ watch(
 }
 
 .tool-call-collection-list.with-summary.open {
-  padding: 2px 0 0 12px;
-  border: 0;
-  border-radius: 0;
-  background: transparent;
+  padding: 8px;
+  border: 1px solid color-mix(in srgb, var(--accent-color) 22%, var(--border-color));
+  border-top: none;
+  border-radius: 0 0 8px 8px;
+  background: color-mix(in srgb, var(--panel-bg) 82%, var(--msg-assistant-bg) 18%);
 }
 </style>

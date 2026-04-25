@@ -18,9 +18,12 @@ namespace Locus
 {
     public sealed class LocusEditorWindow : EditorWindow
     {
-        private const string PipeName = "locus_tauri_unity_embed";
-        private const string FullPipeName = @"\\.\pipe\locus_tauri_unity_embed";
+        private const bool OverlaySyncEnabled = true;
+        private const string PipeNamePrefix = "locus_tauri_unity_embed_";
+        private const string FullPipeNamePrefix = @"\\.\pipe\";
         private const double SyncIntervalSeconds = 0.12d;
+        private const double ResizeSyncIntervalSeconds = 1d / 60d;
+        private const double ResizeBoostDurationSeconds = 0.35d;
         private const double HeartbeatIntervalSeconds = 2d;
         private const double DesktopProbeIntervalSeconds = 2d;
         private const int PipeConnectTimeoutMs = 500;
@@ -29,6 +32,7 @@ namespace Locus
         private static Texture2D _titleIcon;
 
         private double _nextSyncAt;
+        private double _resizeBoostUntil;
         private volatile bool _sendInFlight;
         private volatile bool _sentOpen;
         private volatile int _failedSends;
@@ -53,6 +57,7 @@ namespace Locus
         private LocusDesktopInstall _desktopInstall = LocusDesktopInstall.NotFound;
         private bool _desktopProcessRunning;
         private volatile bool _desktopLaunchInFlight;
+        private string _connectedPipeName = "";
 
         [Serializable]
         private sealed class EmbedControlMessage
@@ -94,20 +99,27 @@ namespace Locus
             titleContent = CreateTitleContent();
             minSize = new Vector2(360f, 420f);
             RefreshDesktopState(true);
-            EditorApplication.update += SyncOverlay;
-            SendOpenOrUpdate(true);
+            if (OverlaySyncEnabled)
+            {
+                EditorApplication.update += SyncOverlay;
+                SendOpenOrUpdate(true);
+            }
         }
 
         private void OnDisable()
         {
-            EditorApplication.update -= SyncOverlay;
-            SendClose();
+            if (OverlaySyncEnabled)
+            {
+                EditorApplication.update -= SyncOverlay;
+                SendClose();
+            }
             DisconnectPipe();
         }
 
         private void OnFocus()
         {
-            SendOpenOrUpdate(true);
+            if (OverlaySyncEnabled)
+                SendOpenOrUpdate(true);
         }
 
         private void OnGUI()
@@ -116,7 +128,7 @@ namespace Locus
             RefreshDesktopState(false);
             DrawPlaceholder();
 
-            if (Event.current.type == EventType.Repaint)
+            if (OverlaySyncEnabled && Event.current.type == EventType.Repaint)
                 SendOpenOrUpdate(false);
         }
 
@@ -126,7 +138,8 @@ namespace Locus
             if (now < _nextSyncAt)
                 return;
 
-            _nextSyncAt = now + SyncIntervalSeconds;
+            bool resizeBoostActive = IsResizeSyncBoostActive(now);
+            _nextSyncAt = now + (resizeBoostActive ? ResizeSyncIntervalSeconds : SyncIntervalSeconds);
             RefreshDesktopState(false);
             SendOpenOrUpdate(false);
 
@@ -216,11 +229,37 @@ namespace Locus
         private void StoreScreenRect(Vector2 topLeft, Vector2 bottomRight)
         {
             float scale = EditorGUIUtility.pixelsPerPoint;
-            _screenX = Mathf.RoundToInt(topLeft.x * scale);
-            _screenY = Mathf.RoundToInt(topLeft.y * scale);
-            _screenWidth = Mathf.Max(1, Mathf.RoundToInt((bottomRight.x - topLeft.x) * scale));
-            _screenHeight = Mathf.Max(1, Mathf.RoundToInt((bottomRight.y - topLeft.y) * scale));
+            int nextX = Mathf.RoundToInt(topLeft.x * scale);
+            int nextY = Mathf.RoundToInt(topLeft.y * scale);
+            int nextWidth = Mathf.Max(1, Mathf.RoundToInt((bottomRight.x - topLeft.x) * scale));
+            int nextHeight = Mathf.Max(1, Mathf.RoundToInt((bottomRight.y - topLeft.y) * scale));
+            bool changed = !_hasScreenRect
+                || _screenX != nextX
+                || _screenY != nextY
+                || _screenWidth != nextWidth
+                || _screenHeight != nextHeight;
+
+            _screenX = nextX;
+            _screenY = nextY;
+            _screenWidth = nextWidth;
+            _screenHeight = nextHeight;
             _hasScreenRect = true;
+
+            if (changed)
+                MarkResizeSyncBoost();
+        }
+
+        private void MarkResizeSyncBoost()
+        {
+            double now = EditorApplication.timeSinceStartup;
+            _resizeBoostUntil = Math.Max(_resizeBoostUntil, now + ResizeBoostDurationSeconds);
+            if (_nextSyncAt > now)
+                _nextSyncAt = now;
+        }
+
+        private bool IsResizeSyncBoostActive(double now)
+        {
+            return now < _resizeBoostUntil;
         }
 
         private void SendControlMessage(EmbedControlMessage message, bool force)
@@ -276,16 +315,21 @@ namespace Locus
 
         private void EnsurePipeConnected()
         {
-            if (_pipeClient != null && _pipeClient.IsConnected && _pipeWriter != null)
+            string pipeName = GetControlPipeName();
+            if (_pipeClient != null
+                && _pipeClient.IsConnected
+                && _pipeWriter != null
+                && string.Equals(_connectedPipeName, pipeName, StringComparison.Ordinal))
                 return;
 
             DisconnectPipe();
             _pipeClient = new NamedPipeClientStream(
                 ".",
-                PipeName,
+                pipeName,
                 PipeDirection.Out,
                 PipeOptions.Asynchronous);
             _pipeClient.Connect(PipeConnectTimeoutMs);
+            _connectedPipeName = pipeName;
             _pipeWriter = new StreamWriter(_pipeClient, Utf8NoBom, 4096)
             {
                 NewLine = "\n",
@@ -301,6 +345,7 @@ namespace Locus
                 try { if (_pipeClient != null) _pipeClient.Dispose(); } catch { }
                 _pipeWriter = null;
                 _pipeClient = null;
+                _connectedPipeName = "";
             }
         }
 
@@ -320,15 +365,36 @@ namespace Locus
                 rect.height - 38f);
             Rect statusRect = new Rect(inner.x, titleRect.yMax + 8f, inner.width, 34f);
             Rect pipeRect = new Rect(inner.x, statusRect.yMax + 10f, inner.width, 18f);
+            GUIStyle executablePathStyle = new GUIStyle(EditorStyles.miniLabel)
+            {
+                wordWrap = true,
+                clipping = TextClipping.Clip
+            };
+            string executablePathText = GetDesktopExecutablePathText();
+            float executablePathHeight = string.IsNullOrEmpty(executablePathText)
+                ? 0f
+                : Mathf.Max(
+                    18f,
+                    executablePathStyle.CalcHeight(new GUIContent(executablePathText), inner.width));
+            Rect executablePathRect = new Rect(
+                inner.x,
+                pipeRect.yMax + 8f,
+                inner.width,
+                executablePathHeight);
+            float buttonY = string.IsNullOrEmpty(executablePathText)
+                ? pipeRect.yMax + 12f
+                : executablePathRect.yMax + 10f;
             Rect buttonRect = new Rect(
                 inner.x,
-                pipeRect.yMax + 12f,
+                buttonY,
                 Mathf.Min(116f, inner.width),
                 24f);
 
             GUI.Label(titleRect, "Locus", EditorStyles.boldLabel);
             GUI.Label(statusRect, _statusMessage, EditorStyles.wordWrappedLabel);
-            EditorGUI.SelectableLabel(pipeRect, FullPipeName, EditorStyles.miniLabel);
+            EditorGUI.SelectableLabel(pipeRect, GetFullControlPipeName(), EditorStyles.miniLabel);
+            if (!string.IsNullOrEmpty(executablePathText))
+                EditorGUI.SelectableLabel(executablePathRect, executablePathText, executablePathStyle);
 
             if (ShouldShowStartButton())
             {
@@ -354,6 +420,14 @@ namespace Locus
         private bool ShouldShowStartButton()
         {
             return _desktopInstall.IsInstalled && !_desktopProcessRunning;
+        }
+
+        private string GetDesktopExecutablePathText()
+        {
+            if (!_desktopInstall.IsInstalled || string.IsNullOrEmpty(_desktopInstall.ExecutablePath))
+                return "";
+
+            return "EXE: " + _desktopInstall.ExecutablePath;
         }
 
         private void StartLocusDesktop()
@@ -383,7 +457,7 @@ namespace Locus
             }
 
             _desktopLaunchInFlight = true;
-            _statusMessage = "Starting Locus desktop.";
+            _statusMessage = "Starting Locus desktop: " + executablePath;
 
             Task.Run(async () =>
             {
@@ -684,6 +758,39 @@ namespace Locus
             }
 
             return hwnd.ToInt64();
+        }
+
+        private static string GetProjectPath()
+        {
+            try
+            {
+                DirectoryInfo projectDir = Directory.GetParent(Application.dataPath);
+                return projectDir != null ? projectDir.FullName : "";
+            }
+            catch
+            {
+                return "";
+            }
+        }
+
+        private static string GetControlPipeName()
+        {
+            string projectPath = GetProjectPath();
+            string sanitized = string.IsNullOrEmpty(projectPath)
+                ? "unknown"
+                : projectPath
+                    .TrimEnd('\\', '/')
+                    .Replace('\\', '_')
+                    .Replace('/', '_')
+                    .Replace(':', '_')
+                    .Replace(' ', '_');
+
+            return PipeNamePrefix + sanitized;
+        }
+
+        private static string GetFullControlPipeName()
+        {
+            return FullPipeNamePrefix + GetControlPipeName();
         }
 
         private static GUIContent CreateTitleContent()

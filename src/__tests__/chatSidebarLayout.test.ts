@@ -16,8 +16,15 @@ describe("chat sidebar layout", () => {
     const changesPanel = read("src/components/ChatChangesPanel.vue");
     const settingsState = read("src/composables/useSettingsState.ts");
 
+    expect(workspace).toContain(":css=\"false\"");
+    expect(workspace).toContain("@before-leave=\"beforeLeaveSidebarPanel\"");
+    expect(workspace).toContain("@leave=\"leaveSidebarPanel\"");
     expect(workspace).toContain("<ChatSidebarPanel");
     expect(workspace).toContain(":layout=\"isVerticalLayout ? 'bottom' : 'side'\"");
+    expect(workspace).toContain("shell.style.width = \"0px\";");
+    expect(workspace).toContain("shell.style.minWidth = \"0px\";");
+    expect(workspace).toContain('shell.style.transform = "translateX(100%)";');
+    expect(workspace).not.toContain("@enter=");
     expect(sidebar).toContain("<TodoPanel");
     expect(sidebar).toContain("<ChatChangesPanel");
     expect(sidebar).toContain("class=\"chat-sidebar-panel\"");
@@ -29,10 +36,13 @@ describe("chat sidebar layout", () => {
     expect(sidebar).toContain("has-both-sections");
     expect(sidebar).toContain("STORAGE_KEY_SIDEBAR_WIDTH = \"locus:chatSidebarWidth\"");
     expect(sidebar).toContain("STORAGE_KEY_SIDEBAR_HEIGHT = \"locus:chatSidebarHeight\"");
+    expect(sidebar).toContain("storageScope?: string;");
+    expect(sidebar).toContain("scopedSidebarStorageKey");
+    expect(sidebar).toContain("effectiveMaxSideWidth");
     expect(sidebar).toContain(":show-close=\"false\"");
     expect(sidebar).toContain("onSidebarResizeMouseDown");
-    expect(sidebar).toContain("localStorage.setItem(STORAGE_KEY_SIDEBAR_WIDTH");
-    expect(sidebar).toContain("localStorage.setItem(STORAGE_KEY_SIDEBAR_HEIGHT");
+    expect(sidebar).toContain("localStorage.setItem(sidebarWidthStorageKey.value");
+    expect(sidebar).toContain("localStorage.setItem(sidebarHeightStorageKey.value");
     expect(sidebar).toContain("layout-bottom");
     expect(sidebar).toContain(".todo-panel.embedded.chat-sidebar-section-todo.closing");
     expect(todoPanel).toContain("embedded?: boolean;");
@@ -41,6 +51,8 @@ describe("chat sidebar layout", () => {
     expect(changesPanel).toContain(":class=\"{ embedded: props.embedded }\"");
     expect(settingsState).toContain("localStorage.removeItem(\"locus:chatSidebarWidth\")");
     expect(settingsState).toContain("localStorage.removeItem(\"locus:chatSidebarHeight\")");
+    expect(settingsState).toContain("localStorage.removeItem(\"locus:unity:chatSidebarWidth\")");
+    expect(settingsState).toContain("localStorage.removeItem(\"locus:unity:chatSidebarHeight\")");
   });
 
   it("keeps non-user chat surfaces on the assistant background", () => {
@@ -84,6 +96,7 @@ describe("chat sidebar layout", () => {
     const toolCollection = read("src/components/ToolCallCollection.vue");
 
     expect(toolCollection).toContain("const panelVisible = ref(false);");
+    expect(toolCollection).toContain("const panelLeaving = ref(false);");
     expect(toolCollection).toContain("const summaryOpen = computed(() =>");
     expect(toolCollection).toContain("height 320ms cubic-bezier(0.2, 0, 0, 1)");
     expect(toolCollection).toContain("transformOrigin = \"top center\"");
@@ -93,6 +106,9 @@ describe("chat sidebar layout", () => {
     expect(toolCollection).toContain("emit(\"collapseFinished\");");
     expect(toolCollection).toContain("translateY(-4px) scaleY(0.97)");
     expect(toolCollection).toContain("class=\"tool-call-collection-panel\"");
+    expect(toolCollection).toContain("'is-collapsing': batchState.canCollapse && panelLeaving");
+    expect(toolCollection).toContain(":class=\"{ open: expanded }\"");
+    expect(toolCollection).toContain(".tool-call-batch-summary.open.closing");
   });
 
   it("keeps tool batches on a shared transient handoff path until the collapse leave finishes", () => {

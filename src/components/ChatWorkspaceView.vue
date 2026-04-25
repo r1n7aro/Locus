@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, ref } from "vue";
 import { save } from "@tauri-apps/plugin-dialog";
 import { t } from "../i18n";
 import { normalizeAppError } from "../services/errors";
@@ -22,9 +22,13 @@ type ResolvedChatLayoutMode = "horizontal" | "vertical";
 const props = withDefaults(defineProps<{
   active?: boolean;
   layoutMode?: ChatLayoutMode;
+  defaultSessionPanelCollapsed?: boolean;
+  sessionPanelStorageScope?: string;
 }>(), {
   active: true,
   layoutMode: "auto",
+  defaultSessionPanelCollapsed: false,
+  sessionPanelStorageScope: "",
 });
 
 const agentStore = useAgentStore();
@@ -35,14 +39,149 @@ const notificationStore = useNotificationStore();
 const projectStore = useProjectStore();
 const { skillItems } = useSkills();
 
-const resolvedLayoutMode = ref<ResolvedChatLayoutMode>("horizontal");
-const isVerticalLayout = computed(() => resolvedLayoutMode.value === "vertical");
+const workspaceRef = ref<HTMLElement | null>(null);
+const workspaceWidth = ref(0);
+const isVerticalLayout = computed(() => props.layoutMode === "vertical");
 const showAssistantSidebar = computed(() =>
   props.active && (chatStore.showTodoPanel || chatChangesStore.currentPanelVisible),
 );
+const ASSISTANT_PANEL_MIN_CHAT_WIDTH = 560;
+const ASSISTANT_SIDEBAR_SIDE_MAX_WIDTH = 520;
+const ASSISTANT_SIDEBAR_RESIZE_HANDLE_WIDTH = 3;
+const ASSISTANT_SIDEBAR_MAX_WORKSPACE_RATIO = 0.34;
+const THINKING_PANEL_SIDE_WIDTH = 340;
+const SIDEBAR_EXIT_TRANSITION_MS = 180;
+const fixedAuxiliarySideWidth = computed(() =>
+  chatStore.showThinkingPanel ? THINKING_PANEL_SIDE_WIDTH : 0,
+);
+const assistantSidebarMaxSideWidth = computed(() => {
+  const width = workspaceWidth.value;
+  if (!showAssistantSidebar.value || width <= 0) {
+    return ASSISTANT_SIDEBAR_SIDE_MAX_WIDTH;
+  }
 
-function handleLayoutModeChange(mode: ResolvedChatLayoutMode) {
-  resolvedLayoutMode.value = mode;
+  const remainingWidthBound = width
+    - fixedAuxiliarySideWidth.value
+    - ASSISTANT_SIDEBAR_RESIZE_HANDLE_WIDTH
+    - ASSISTANT_PANEL_MIN_CHAT_WIDTH;
+  const ratioBound = Math.floor(width * ASSISTANT_SIDEBAR_MAX_WORKSPACE_RATIO);
+  return Math.max(
+    0,
+    Math.min(ASSISTANT_SIDEBAR_SIDE_MAX_WIDTH, remainingWidthBound, ratioBound),
+  );
+});
+let workspaceResizeObserver: ResizeObserver | null = null;
+let workspaceResizeFrame = 0;
+
+function handleLayoutModeChange(_mode: ResolvedChatLayoutMode) {}
+
+function beforeLeaveSidebarPanel(element: Element) {
+  const shell = element as HTMLElement;
+  const isBottomLayout = shell.classList.contains("layout-bottom");
+  const rect = shell.getBoundingClientRect();
+  shell.dataset.exitAxis = isBottomLayout ? "vertical" : "horizontal";
+  shell.style.pointerEvents = "none";
+  shell.style.overflow = "hidden";
+  shell.style.opacity = "1";
+  shell.style.transform = "translate(0, 0)";
+  shell.style.willChange = "width, min-width, max-width, height, min-height, max-height, transform, opacity";
+
+  if (isBottomLayout) {
+    shell.style.height = `${rect.height}px`;
+    shell.style.minHeight = `${rect.height}px`;
+    shell.style.maxHeight = `${rect.height}px`;
+    return;
+  }
+
+  shell.style.width = `${rect.width}px`;
+  shell.style.minWidth = `${rect.width}px`;
+  shell.style.maxWidth = `${rect.width}px`;
+}
+
+function leaveSidebarPanel(element: Element, done: () => void) {
+  const shell = element as HTMLElement;
+  const isBottomLayout = shell.dataset.exitAxis === "vertical";
+  let finished = false;
+  let fallbackTimer = 0;
+  const finish = () => {
+    if (finished) return;
+    finished = true;
+    window.clearTimeout(fallbackTimer);
+    shell.removeEventListener("transitionend", onTransitionEnd);
+    done();
+  };
+  const onTransitionEnd = (event: TransitionEvent) => {
+    if (event.target !== shell) return;
+    if (isBottomLayout && event.propertyName === "height") finish();
+    if (!isBottomLayout && event.propertyName === "width") finish();
+  };
+
+  shell.addEventListener("transitionend", onTransitionEnd);
+  shell.getBoundingClientRect();
+  shell.style.transition = [
+    `width ${SIDEBAR_EXIT_TRANSITION_MS}ms cubic-bezier(0.2, 0, 0, 1)`,
+    `min-width ${SIDEBAR_EXIT_TRANSITION_MS}ms cubic-bezier(0.2, 0, 0, 1)`,
+    `max-width ${SIDEBAR_EXIT_TRANSITION_MS}ms cubic-bezier(0.2, 0, 0, 1)`,
+    `height ${SIDEBAR_EXIT_TRANSITION_MS}ms cubic-bezier(0.2, 0, 0, 1)`,
+    `min-height ${SIDEBAR_EXIT_TRANSITION_MS}ms cubic-bezier(0.2, 0, 0, 1)`,
+    `max-height ${SIDEBAR_EXIT_TRANSITION_MS}ms cubic-bezier(0.2, 0, 0, 1)`,
+    `transform ${SIDEBAR_EXIT_TRANSITION_MS}ms cubic-bezier(0.2, 0, 0, 1)`,
+    "opacity 140ms ease",
+  ].join(", ");
+
+  requestAnimationFrame(() => {
+    shell.style.opacity = "0";
+    if (isBottomLayout) {
+      shell.style.height = "0px";
+      shell.style.minHeight = "0px";
+      shell.style.maxHeight = "0px";
+      shell.style.transform = "translateY(100%)";
+      return;
+    }
+    shell.style.width = "0px";
+    shell.style.minWidth = "0px";
+    shell.style.maxWidth = "0px";
+    shell.style.transform = "translateX(100%)";
+  });
+
+  fallbackTimer = window.setTimeout(finish, SIDEBAR_EXIT_TRANSITION_MS + 80);
+}
+
+function afterLeaveSidebarPanel(element: Element) {
+  const shell = element as HTMLElement;
+  delete shell.dataset.exitAxis;
+  shell.removeAttribute("style");
+}
+
+function updateWorkspaceWidth() {
+  workspaceWidth.value = workspaceRef.value?.clientWidth ?? 0;
+}
+
+function cancelWorkspaceWidthUpdate() {
+  if (!workspaceResizeFrame) return;
+  cancelAnimationFrame(workspaceResizeFrame);
+  workspaceResizeFrame = 0;
+}
+
+function scheduleWorkspaceWidthUpdate() {
+  if (workspaceResizeFrame) return;
+  workspaceResizeFrame = requestAnimationFrame(() => {
+    workspaceResizeFrame = 0;
+    updateWorkspaceWidth();
+  });
+}
+
+function disconnectWorkspaceResizeObserver() {
+  workspaceResizeObserver?.disconnect();
+  workspaceResizeObserver = null;
+}
+
+function connectWorkspaceResizeObserver() {
+  disconnectWorkspaceResizeObserver();
+  updateWorkspaceWidth();
+  if (typeof ResizeObserver === "undefined" || !workspaceRef.value) return;
+  workspaceResizeObserver = new ResizeObserver(scheduleWorkspaceWidthUpdate);
+  workspaceResizeObserver.observe(workspaceRef.value);
 }
 
 async function saveRawContext(request?: string | SaveRawContextRequest) {
@@ -72,10 +211,20 @@ async function saveRawContext(request?: string | SaveRawContextRequest) {
     });
   }
 }
+
+onMounted(() => {
+  nextTick(connectWorkspaceResizeObserver);
+});
+
+onUnmounted(() => {
+  cancelWorkspaceWidthUpdate();
+  disconnectWorkspaceResizeObserver();
+});
 </script>
 
 <template>
   <div
+    ref="workspaceRef"
     class="chat-workspace-view"
     :class="{
       'is-horizontal-layout': !isVerticalLayout,
@@ -85,6 +234,8 @@ async function saveRawContext(request?: string | SaveRawContextRequest) {
     <ChatView
       v-show="active"
       :layout-mode="layoutMode"
+      :default-session-panel-collapsed="defaultSessionPanelCollapsed"
+      :session-panel-storage-scope="sessionPanelStorageScope"
       :messages="chatStore.messages"
       :streaming-text="chatStore.streamingText"
       :is-streaming="chatStore.isStreaming"
@@ -108,6 +259,9 @@ async function saveRawContext(request?: string | SaveRawContextRequest) {
       :sessions="chatStore.sessions"
       :active-session-id="chatStore.activeSessionId"
       :unity-connected="projectStore.unityConnected"
+      :unity-plugin-status="projectStore.pluginToast"
+      :unity-plugin-installing="projectStore.pluginInstalling"
+      :working-dir="projectStore.workingDir"
       :scan-phase="projectStore.scanPhase"
       :last-scan-stats="projectStore.lastScanStats"
       :is-unity-project="projectStore.isUnityProject"
@@ -130,6 +284,7 @@ async function saveRawContext(request?: string | SaveRawContextRequest) {
       @archive-session="chatStore.archiveSession"
       @delete-session="chatStore.deleteSession"
       @start-scan="projectStore.startScan"
+      @install-plugin="projectStore.installPlugin"
       @layout-mode-change="handleLayoutModeChange"
     />
     <ThinkingPanel
@@ -138,14 +293,23 @@ async function saveRawContext(request?: string | SaveRawContextRequest) {
       :is-thinking="chatStore.isThinking && !chatStore.thinkingPanelContent"
       @close="chatStore.showThinkingPanel = false"
     />
-    <ChatSidebarPanel
-      v-if="showAssistantSidebar"
-      :layout="isVerticalLayout ? 'bottom' : 'side'"
-      :todos="chatStore.visibleTodos"
-      :is-streaming="chatStore.isStreaming"
-      :todo-write-version="chatStore.todoCelebrationVersion"
-      :celebration-enabled="chatStore.todoCelebrationEnabled"
-    />
+    <Transition
+      :css="false"
+      @before-leave="beforeLeaveSidebarPanel"
+      @leave="leaveSidebarPanel"
+      @after-leave="afterLeaveSidebarPanel"
+    >
+      <ChatSidebarPanel
+        v-if="showAssistantSidebar"
+        :layout="isVerticalLayout ? 'bottom' : 'side'"
+        :max-side-width="assistantSidebarMaxSideWidth"
+        :storage-scope="sessionPanelStorageScope"
+        :todos="chatStore.visibleTodos"
+        :is-streaming="chatStore.isStreaming"
+        :todo-write-version="chatStore.todoCelebrationVersion"
+        :celebration-enabled="chatStore.todoCelebrationEnabled"
+      />
+    </Transition>
   </div>
 </template>
 

@@ -443,7 +443,7 @@ export function useAppBootstrap() {
     _wpAgent = null;
     _wpSettings = null;
     await projectStore.setWorkingDir(path);
-    chatStore.newChat();
+    chatStore.newChat({ persistSelection: false });
     await Promise.all([
       chatStore.refreshSessions(),
       projectStore.loadRecentDirs(),
