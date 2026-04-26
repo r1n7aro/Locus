@@ -318,7 +318,14 @@ unsafe fn sync_from_changing_window_pos(hwnd: HWND, state: &mut ResizeSyncState,
         state.resize_target_active = false;
         unsafe {
             publish_native_client_size(state, current_client_width, current_client_height);
-            sync_webview_bounds_at(state, 0, 0, current_client_width, current_client_height, true);
+            sync_webview_bounds_at(
+                state,
+                0,
+                0,
+                current_client_width,
+                current_client_height,
+                true,
+            );
         }
         return;
     }
@@ -350,7 +357,14 @@ unsafe fn sync_from_changing_window_pos(hwnd: HWND, state: &mut ResizeSyncState,
         state.resize_target_active = false;
         unsafe {
             publish_native_client_size(state, current_client_width, current_client_height);
-            sync_webview_bounds_at(state, 0, 0, current_client_width, current_client_height, true);
+            sync_webview_bounds_at(
+                state,
+                0,
+                0,
+                current_client_width,
+                current_client_height,
+                true,
+            );
         }
         return;
     }
@@ -442,9 +456,10 @@ unsafe fn publish_native_client_size(state: &mut ResizeSyncState, width: i32, he
     }
     state.last_native_width = width;
     state.last_native_height = height;
-    let _ = state
-        .app_handle
-        .emit(NATIVE_CLIENT_SIZE_EVENT, NativeWindowClientSize { width, height });
+    let _ = state.app_handle.emit(
+        NATIVE_CLIENT_SIZE_EVENT,
+        NativeWindowClientSize { width, height },
+    );
 }
 
 unsafe fn sync_webview_bounds_at(
