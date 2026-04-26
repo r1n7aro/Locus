@@ -4,7 +4,7 @@ import { computed } from "vue";
 import { Marked } from "marked";
 import { markedHighlight } from "marked-highlight";
 import hljs from "../hljs";
-import { injectAssetChips, injectFileRefs, injectWorkspaceMentions } from "../composables/markdownInject";
+import { injectAssetRefs, injectFileRefs, injectWorkspaceMentions } from "../composables/markdownInject";
 import { normalizeMarkdownForRender } from "../composables/markdownRender";
 import { wrapMarkdownTables } from "../composables/markdownTableHtml";
 
@@ -150,7 +150,7 @@ const renderedHtml = computed(() => {
   if (!props.content) return "";
   try {
     let html = md.parse(normalizeMarkdownForRender(props.content)) as string;
-    html = injectAssetChips(html);
+    html = injectAssetRefs(html);
     html = injectWorkspaceMentions(html);
     if (props.enableFileRefs) {
       html = injectFileRefs(html);
@@ -479,18 +479,26 @@ const renderedHtml = computed(() => {
 .md-file-ref {
   display: inline-flex;
   align-items: center;
-  gap: 3px;
-  padding: 1px 7px;
+  gap: 2px;
+  padding: 1px 6px;
   border-radius: 4px;
   background: color-mix(in srgb, var(--sidebar-bg, var(--hover-bg)) 52%, transparent);
-  border: 1px solid color-mix(in srgb, var(--border-color) 82%, transparent);
+  border: 1px solid color-mix(in srgb, var(--border-color) 78%, transparent);
   cursor: pointer;
-  font-size: 0.88em;
-  line-height: 1.5;
-  vertical-align: baseline;
+  font-family: var(--font-mono-inline);
+  font-size: 0.92em;
+  line-height: 1.42;
+  vertical-align: middle;
   transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
-  font-weight: 500;
-  color: var(--text-secondary);
+  font-weight: 400;
+  color: color-mix(in srgb, var(--text-color) 90%, var(--text-secondary) 10%);
+}
+
+.md-unity-asset-ref,
+.md-unity-scene-object-ref {
+  background: color-mix(in srgb, var(--sidebar-bg, var(--hover-bg)) 54%, transparent);
+  border-color: color-mix(in srgb, var(--border-color) 78%, transparent);
+  color: color-mix(in srgb, var(--text-color) 90%, var(--text-secondary) 10%);
 }
 
 .md-workspace-ref {
@@ -504,16 +512,25 @@ const renderedHtml = computed(() => {
   cursor: pointer;
   font-size: 0.88em;
   line-height: 1.5;
-  vertical-align: baseline;
+  vertical-align: middle;
   transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
   font-weight: 500;
   color: var(--text-secondary);
 }
 
-.md-file-ref:hover {
-  background: var(--hover-bg);
+.md-file-ref:hover,
+.md-file-ref:active {
+  background: color-mix(in srgb, var(--hover-bg) 78%, var(--sidebar-bg, var(--hover-bg)) 22%);
   border-color: var(--border-strong);
   color: var(--text-color);
+}
+
+.md-unity-asset-ref:hover,
+.md-unity-asset-ref:active,
+.md-unity-scene-object-ref:hover,
+.md-unity-scene-object-ref:active {
+  background: color-mix(in srgb, var(--accent-color) 5%, var(--hover-bg) 95%);
+  border-color: color-mix(in srgb, var(--accent-color) 18%, var(--border-strong) 82%);
 }
 
 .md-workspace-ref:hover {
@@ -527,9 +544,29 @@ const renderedHtml = computed(() => {
   opacity: 0.58;
 }
 
-.md-file-ref-icon {
-  font-size: 10px;
-  opacity: 0.55;
+.md-workspace-ref-icon {
+  margin-right: 2px;
+}
+
+.md-ref-label {
+  min-width: 0;
+}
+
+.md-ref-icon {
+  display: block;
+  width: 16px;
+  min-width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+  object-fit: contain;
+  max-width: none;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  opacity: 0.82;
+  cursor: inherit;
+  pointer-events: none;
+  user-select: none;
 }
 
 .streaming-cursor {

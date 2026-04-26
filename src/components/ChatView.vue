@@ -1,8 +1,15 @@
 
 <script setup lang="ts">
 import { ref, nextTick, watch, computed, onMounted, onUnmounted } from "vue";
-import { selectUnityAsset, openFileExternal, previewWorkspaceFile, showInFolder } from "../services/unity";
-import type { WorkspaceFilePreview } from "../services/unity";
+import {
+  selectUnityAsset,
+  openUnityAssetInspector,
+  selectUnitySceneObject,
+  openUnitySceneObjectInspector,
+  classifyUnitySceneObjectError,
+  openFileExternal,
+  showInFolder,
+} from "../services/unity";
 // undoPreview removed — undo UI moved to ChatChangesPanel
 import type { ChatComposerSendPayload, ChatMessage, AgentInfo, TokenUsage, ModelOption, PendingQuestion, PendingToolConfirm, EffortLevel, SessionSummary, AssetDbScanEvent, ScanStats, ImageAttachment, SkillManifest, UserIntentMeta, SaveRawContextRequest, CodexTransportMode } from "../types";
 import type { ToolCallDisplay } from "../types";
@@ -19,11 +26,12 @@ import ToolConfirmBatchCard from "./chat/ToolConfirmBatchCard.vue";
 import FileDiffViewer from "./diff/FileDiffViewer.vue";
 import BaseButton from "./ui/BaseButton.vue";
 import BaseSegmented from "./ui/BaseSegmented.vue";
-import { refetchDiffByKey, createRequestToken, isTokenStale } from "../services/diff";
+import { refetchDiffByKey } from "../services/diff";
 import { t } from "../i18n";
 import { useChatChangesStore } from "../stores/chatChanges";
 import { useChatStore } from "../stores/chat";
 import { useUiStore } from "../stores/ui";
+import { useNotificationStore } from "../stores/notification";
 import {
   captureScrollAnchor,
   captureLiveScrollAnchor,
@@ -40,24 +48,25 @@ import {
   shouldShowWaitingPlaceholder,
 } from "../composables/chatViewStability";
 import { forwardWheelToElement } from "../composables/chatWheelPassthrough";
-import { useProjectStore } from "../stores/project";
 import { canOpenInEditor } from "../composables/useHideMeta";
 import { useDiffProgress } from "../composables/useDiffProgress";
 import { acquireSelectionLock } from "../composables/useSelectionLock";
 import { matchesShortcut, useKeyboardShortcuts } from "../composables/useKeyboardShortcuts";
+import { getLocusRuntime } from "../services/locusRuntime";
 import {
   getChatSubmitModifierLabel,
   useChatInputSettings,
 } from "../composables/useChatInputSettings";
 import { logToolCollapseTrace, previewTraceText } from "../services/toolCollapseTrace";
+import { recordLayoutDiagnostic } from "../services/layoutDiagnostics";
 
 type ChatLayoutMode = "auto" | "horizontal" | "vertical";
 type ResolvedChatLayoutMode = "horizontal" | "vertical";
 
 const chatChangesStore = useChatChangesStore();
 const chatStore = useChatStore();
-const projectStore = useProjectStore();
 const uiStore = useUiStore();
+const notificationStore = useNotificationStore();
 const { state: shortcutState } = useKeyboardShortcuts();
 const { state: chatInputSettings } = useChatInputSettings();
 
@@ -109,15 +118,10 @@ const showInlineDiff = computed(() =>
 const hasPanelToggleRow = computed(() => chatChangesStore.currentFileCount > 0);
 
 const chatDiffViewerRef = ref<InstanceType<typeof FileDiffViewer> | null>(null);
-const chatDiffMode = ref<"unified" | "side-by-side">("unified");
 const chatDiffTabOptions = computed(() => [
   { value: "semantic", label: t("diff.tabs.semantic") },
   { value: "text", label: t("diff.tabs.text") },
 ]);
-
-function toggleChatDiffMode() {
-  chatDiffMode.value = chatDiffMode.value === "unified" ? "side-by-side" : "unified";
-}
 
 watch(() => chatChangesStore.inlineDiffLoading, (loading) => {
   if (loading) diffProgress.reset();
@@ -201,6 +205,42 @@ function openLightbox(src: string) {
 function closeLightbox() {
   lightboxSrc.value = "";
 }
+
+function isUnityRuntime() {
+  return getLocusRuntime().kind === "unity";
+}
+
+function isUnityEmbeddedWindow() {
+  if (isUnityRuntime()) return true;
+  if (typeof window === "undefined") return false;
+  return window.location.pathname === "/unity-embed";
+}
+
+function isUnityAssetPath(filePath: string) {
+  return /^(Assets|Packages)\//.test(filePath.replace(/\\/g, "/"));
+}
+
+function shouldSelectUnityAsset(filePath: string) {
+  return isUnityAssetPath(filePath) && (props.unityConnected || isUnityRuntime());
+}
+
+function shouldOpenUnityAssetInspector(e: MouseEvent, filePath: string) {
+  return (e.ctrlKey || e.metaKey)
+    && isUnityEmbeddedWindow()
+    && isUnityAssetPath(filePath)
+    && !canOpenInEditor(filePath);
+}
+
+function shouldUseUnitySceneObjectRef(scenePath: string, objectPath: string) {
+  return /\.unity$/i.test(scenePath.replace(/\\/g, "/"))
+    && objectPath.trim().length > 0
+    && (props.unityConnected || isUnityRuntime());
+}
+
+function shouldOpenUnitySceneObjectInspector(e: MouseEvent, scenePath: string, objectPath: string) {
+  return (e.ctrlKey || e.metaKey) && shouldUseUnitySceneObjectRef(scenePath, objectPath);
+}
+
 function handleContentClick(e: MouseEvent) {
   const target = e.target as HTMLElement;
   if (target.tagName === "IMG") {
@@ -226,8 +266,25 @@ function handleContentClick(e: MouseEvent) {
     e.preventDefault();
     const assetPath = chip.dataset.assetPath;
     if (assetPath) {
+      if (shouldOpenUnityAssetInspector(e, assetPath)) {
+        handleUnityAssetInspectorClick(assetPath);
+        return;
+      }
       handleFileRefClick(assetPath);
     }
+    return;
+  }
+  const sceneObjectRef = target.closest(".md-unity-scene-object-ref") as HTMLElement | null;
+  if (sceneObjectRef) {
+    e.preventDefault();
+    const scenePath = sceneObjectRef.dataset.scenePath;
+    const objectPath = sceneObjectRef.dataset.sceneObjectPath;
+    if (!scenePath || !objectPath) return;
+    if (shouldOpenUnitySceneObjectInspector(e, scenePath, objectPath)) {
+      handleUnitySceneObjectInspectorClick(scenePath, objectPath);
+      return;
+    }
+    handleUnitySceneObjectClick(scenePath, objectPath);
     return;
   }
   const fileRef = target.closest(".md-file-ref") as HTMLElement | null;
@@ -235,8 +292,49 @@ function handleContentClick(e: MouseEvent) {
     e.preventDefault();
     const filePath = fileRef.dataset.filePath;
     if (!filePath) return;
+    const assetPath = fileRef.dataset.assetPath || filePath;
+    if (shouldOpenUnityAssetInspector(e, assetPath)) {
+      handleUnityAssetInspectorClick(assetPath);
+      return;
+    }
     handleFileRefClick(filePath);
   }
+}
+
+function handleUnityAssetInspectorClick(filePath: string) {
+  openUnityAssetInspector(filePath).catch((e: unknown) => {
+    console.warn("openUnityAssetInspector failed:", e);
+    handleFileRefClick(filePath);
+  });
+}
+
+function handleUnitySceneObjectInspectorClick(scenePath: string, objectPath: string) {
+  openUnitySceneObjectInspector(scenePath, objectPath).catch((e: unknown) => {
+    console.warn("openUnitySceneObjectInspector failed:", e);
+    notifyUnitySceneObjectError(e, scenePath, objectPath);
+  });
+}
+
+function handleUnitySceneObjectClick(scenePath: string, objectPath: string) {
+  if (!shouldUseUnitySceneObjectRef(scenePath, objectPath)) return;
+  selectUnitySceneObject(scenePath, objectPath).catch((e: unknown) => {
+    console.warn("selectUnitySceneObject failed:", e);
+    notifyUnitySceneObjectError(e, scenePath, objectPath);
+  });
+}
+
+function notifyUnitySceneObjectError(error: unknown, scenePath: string, objectPath: string) {
+  const kind = classifyUnitySceneObjectError(error);
+  const message = kind === "sceneNotLoaded"
+    ? t("chat.sceneObject.sceneNotLoaded", scenePath)
+    : kind === "objectMissing"
+      ? t("chat.sceneObject.objectMissing", objectPath)
+      : t("chat.sceneObject.openFailed", `${scenePath}/${objectPath}`);
+  notificationStore.addNotice("warning", message, {
+    operation: "unitySceneObjectRef",
+    code: `unity.sceneObject.${kind}`,
+    replaceOperation: true,
+  });
 }
 
 function handleFileRefClick(filePath: string) {
@@ -244,7 +342,7 @@ function handleFileRefClick(filePath: string) {
     openFileExternal(filePath).catch((e: unknown) => console.warn("openFileExternal failed:", e));
     return;
   }
-  if (props.unityConnected && filePath.startsWith("Assets/")) {
+  if (shouldSelectUnityAsset(filePath)) {
     selectUnityAsset(filePath).catch((e: unknown) => console.warn("selectUnityAsset failed:", e));
     return;
   }
@@ -252,81 +350,11 @@ function handleFileRefClick(filePath: string) {
 }
 
 function handleFolderRefClick(folderPath: string) {
-  if (props.unityConnected && (folderPath.startsWith("Assets/") || folderPath.startsWith("Packages/"))) {
+  if (shouldSelectUnityAsset(folderPath)) {
     selectUnityAsset(folderPath).catch((e: unknown) => console.warn("selectUnityAsset failed:", e));
     return;
   }
   showInFolder(folderPath).catch((e: unknown) => console.warn("showInFolder failed:", e));
-}
-
-// ── File preview hover state ──
-
-const filePreviewState = ref<{
-  anchor: HTMLElement;
-  preview: WorkspaceFilePreview;
-} | null>(null);
-
-let fileHoverTimer: ReturnType<typeof setTimeout> | null = null;
-let fileCloseTimer: ReturnType<typeof setTimeout> | null = null;
-let currentFileRefEl: HTMLElement | null = null;
-
-function handleFileRefMouseOver(e: MouseEvent) {
-  const target = (e.target as HTMLElement).closest(".md-file-ref") as HTMLElement | null;
-
-  if (!target) {
-    // Mouse left a file-ref area — schedule close
-    if (currentFileRefEl) {
-      currentFileRefEl = null;
-      if (fileHoverTimer) { clearTimeout(fileHoverTimer); fileHoverTimer = null; }
-      scheduleFilePreviewClose();
-    }
-    return;
-  }
-
-  // Same element — no action needed
-  if (target === currentFileRefEl) return;
-
-  // New file-ref — cancel any pending close, start hover timer
-  currentFileRefEl = target;
-  cancelFilePreviewClose();
-  if (fileHoverTimer) { clearTimeout(fileHoverTimer); fileHoverTimer = null; }
-
-  fileHoverTimer = setTimeout(async () => {
-    const filePath = target.dataset.filePath;
-    if (!filePath) return;
-    const line = target.dataset.fileLine ? Number(target.dataset.fileLine) : undefined;
-    const token = createRequestToken();
-    try {
-      const preview = await previewWorkspaceFile(filePath, line);
-      if (isTokenStale(token)) return;
-      if (!preview.exists) return;
-      filePreviewState.value = { anchor: target, preview };
-    } catch (err) {
-      if (!isTokenStale(token)) {
-        console.warn("preview failed:", err);
-      }
-    }
-  }, 300);
-}
-
-function scheduleFilePreviewClose() {
-  if (fileCloseTimer) clearTimeout(fileCloseTimer);
-  fileCloseTimer = setTimeout(() => {
-    filePreviewState.value = null;
-    currentFileRefEl = null;
-  }, 200);
-}
-
-function cancelFilePreviewClose() {
-  if (fileCloseTimer) { clearTimeout(fileCloseTimer); fileCloseTimer = null; }
-}
-
-function closeFilePreview() {
-  if (fileHoverTimer) { clearTimeout(fileHoverTimer); fileHoverTimer = null; }
-  if (fileCloseTimer) { clearTimeout(fileCloseTimer); fileCloseTimer = null; }
-  createRequestToken(); // invalidate in-flight requests
-  filePreviewState.value = null;
-  currentFileRefEl = null;
 }
 
 function handleQuestionAnswer(answer: string) {
@@ -798,13 +826,95 @@ function onMessagesScroll() {
   preserveScrollAnchorScheduler.cancel();
   streamEndScrollScheduler.cancel();
   rememberScrollForSession();
-  // Close file preview popover on scroll
-  if (filePreviewState.value) closeFilePreview();
 }
 
 let transcriptResizeObserver: ResizeObserver | null = null;
+let transcriptResizeFrame = 0;
+let transcriptResizeReconcilePending = false;
+let transcriptObservedViewportWidth = 0;
+
+function readTranscriptViewportWidth() {
+  if (typeof window === "undefined") return 0;
+  return Math.max(1, Math.round(window.innerWidth || document.documentElement?.clientWidth || 0));
+}
+
+function isLiveResizeInProgress() {
+  return uiStore.isWindowResizing || isDraggingSession.value;
+}
+
+function noteTranscriptViewportResize() {
+  const width = readTranscriptViewportWidth();
+  if (!width) return false;
+  const previousWidth = transcriptObservedViewportWidth;
+  transcriptObservedViewportWidth = width;
+  if (previousWidth > 0 && Math.abs(width - previousWidth) >= 1) {
+    recordLayoutDiagnostic("chat.transcript.viewportResize", { width, previousWidth });
+    return true;
+  }
+  return false;
+}
+
+function cancelTranscriptResizeReconcileFrame() {
+  if (!transcriptResizeFrame) return;
+  cancelViewportFrame(transcriptResizeFrame);
+  transcriptResizeFrame = 0;
+}
+
+function performTranscriptResizeReconcile() {
+  if (suppressScrollCapture || toolHandoffViewportQuiet.value) return;
+  if (restoreToolViewportAnchor()) return;
+  if (pendingRestoreSessionId.value && pendingRestoreSessionId.value === props.activeSessionId) {
+    restorePendingSessionScroll();
+    return;
+  }
+  reconcileViewport();
+}
+
+function scheduleTranscriptResizeReconcile(reason: string) {
+  transcriptResizeReconcilePending = true;
+  if (transcriptResizeFrame) return;
+
+  transcriptResizeFrame = requestViewportFrame(() => {
+    transcriptResizeFrame = 0;
+    if (!transcriptResizeReconcilePending) return;
+    if (isLiveResizeInProgress()) {
+      recordLayoutDiagnostic("chat.transcript.resize.deferred", {
+        reason,
+        windowResizing: uiStore.isWindowResizing,
+        sessionDragging: isDraggingSession.value,
+      });
+      return;
+    }
+
+    transcriptResizeReconcilePending = false;
+    recordLayoutDiagnostic("chat.transcript.resize.reconcile", { reason });
+    performTranscriptResizeReconcile();
+  });
+}
+
+function handleTranscriptResize() {
+  const viewportResizing = noteTranscriptViewportResize();
+  if (viewportResizing || isLiveResizeInProgress()) {
+    transcriptResizeReconcilePending = true;
+    recordLayoutDiagnostic("chat.transcript.resize.defer", {
+      windowResizing: uiStore.isWindowResizing,
+      sessionDragging: isDraggingSession.value,
+      viewportResizing,
+    });
+    return;
+  }
+
+  scheduleTranscriptResizeReconcile("observer");
+}
+
+function flushPendingTranscriptResizeReconcile(reason: string) {
+  if (!transcriptResizeReconcilePending) return;
+  scheduleTranscriptResizeReconcile(reason);
+}
 
 function disconnectTranscriptResizeObserver() {
+  cancelTranscriptResizeReconcileFrame();
+  transcriptResizeReconcilePending = false;
   transcriptResizeObserver?.disconnect();
   transcriptResizeObserver = null;
 }
@@ -816,16 +926,9 @@ function connectTranscriptResizeObserver() {
   const scrollEl = getMessagesElement();
   const contentEl = getMessagesContentElement();
   if (!scrollEl && !contentEl) return;
+  transcriptObservedViewportWidth = readTranscriptViewportWidth();
 
-  transcriptResizeObserver = new ResizeObserver(() => {
-    if (suppressScrollCapture || toolHandoffViewportQuiet.value) return;
-    if (restoreToolViewportAnchor()) return;
-    if (pendingRestoreSessionId.value && pendingRestoreSessionId.value === props.activeSessionId) {
-      restorePendingSessionScroll();
-      return;
-    }
-    reconcileViewport();
-  });
+  transcriptResizeObserver = new ResizeObserver(handleTranscriptResize);
 
   if (scrollEl) {
     transcriptResizeObserver.observe(scrollEl);
@@ -965,6 +1068,9 @@ const sessionPanelCollapsed = ref(!!props.defaultSessionPanelCollapsed);
 const isDraggingSession = ref(false);
 const layoutRef = ref<HTMLElement | null>(null);
 let releaseSessionSelectionLock: (() => void) | null = null;
+let sessionSplitterLayoutLeft = 0;
+let pendingSessionPanelWidth: number | null = null;
+let sessionSplitterFrame = 0;
 
 const sessionPanelWidthStorageKey = computed(() =>
   props.sessionPanelStorageScope
@@ -993,9 +1099,56 @@ watch(
   { immediate: true },
 );
 
+watch(
+  () => uiStore.isWindowResizing,
+  (resizing) => {
+    if (resizing) return;
+    transcriptObservedViewportWidth = readTranscriptViewportWidth();
+    flushPendingTranscriptResizeReconcile("window-resize-settled");
+  },
+);
+
+watch(isDraggingSession, (dragging) => {
+  if (dragging) return;
+  flushPendingTranscriptResizeReconcile("session-drag-settled");
+});
+
+function clampSessionPanelWidth(width: number) {
+  return Math.max(140, Math.min(480, Math.round(width)));
+}
+
+function commitSessionPanelWidth(width: number) {
+  const nextWidth = clampSessionPanelWidth(width);
+  if (sessionPanelWidth.value === nextWidth) return;
+  sessionPanelWidth.value = nextWidth;
+}
+
+function cancelSessionSplitterFrame() {
+  if (!sessionSplitterFrame) return;
+  cancelViewportFrame(sessionSplitterFrame);
+  sessionSplitterFrame = 0;
+}
+
+function flushSessionSplitterWidth() {
+  cancelSessionSplitterFrame();
+  if (pendingSessionPanelWidth === null) return;
+  commitSessionPanelWidth(pendingSessionPanelWidth);
+  recordLayoutDiagnostic("chat.sessionSplitter.width", {
+    width: clampSessionPanelWidth(pendingSessionPanelWidth),
+  });
+  pendingSessionPanelWidth = null;
+}
+
+function scheduleSessionPanelWidth(width: number) {
+  pendingSessionPanelWidth = width;
+  if (sessionSplitterFrame) return;
+  sessionSplitterFrame = requestViewportFrame(flushSessionSplitterWidth);
+}
+
 function onSessionSplitterMouseDown(e: MouseEvent) {
   e.preventDefault();
   if (isVerticalLayout.value || sessionPanelCollapsed.value) return;
+  sessionSplitterLayoutLeft = layoutRef.value?.getBoundingClientRect().left ?? 0;
   isDraggingSession.value = true;
   releaseSessionSelectionLock?.();
   releaseSessionSelectionLock = acquireSelectionLock();
@@ -1004,13 +1157,13 @@ function onSessionSplitterMouseDown(e: MouseEvent) {
 }
 
 function onSessionSplitterMouseMove(e: MouseEvent) {
-  if (!isDraggingSession.value || !layoutRef.value) return;
-  const rect = layoutRef.value.getBoundingClientRect();
-  const x = e.clientX - rect.left;
-  sessionPanelWidth.value = Math.max(140, Math.min(480, x));
+  if (!isDraggingSession.value) return;
+  const x = e.clientX - sessionSplitterLayoutLeft;
+  scheduleSessionPanelWidth(x);
 }
 
 function onSessionSplitterMouseUp() {
+  flushSessionSplitterWidth();
   isDraggingSession.value = false;
   document.removeEventListener("mousemove", onSessionSplitterMouseMove);
   document.removeEventListener("mouseup", onSessionSplitterMouseUp);
@@ -1062,6 +1215,7 @@ onUnmounted(() => {
   streamEndScrollScheduler.cancel();
   clearToolViewportAnchor();
   clearStreamingTextFlushTimer();
+  cancelSessionSplitterFrame();
   disconnectTranscriptResizeObserver();
   document.removeEventListener("mousemove", onSessionSplitterMouseMove);
   document.removeEventListener("mouseup", onSessionSplitterMouseUp);
@@ -1085,9 +1239,6 @@ onUnmounted(() => {
     <div v-if="showInlineDiff" class="diff-inline-panel">
       <template v-if="chatChangesStore.inlineDiffPayload">
         <div class="diff-inline-header">
-          <button class="diff-back-btn ui-select-none" @click="chatChangesStore.closeInlineDiff()" title="Back">
-            <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor"><path d="M7.78 12.53a.75.75 0 0 1-1.06 0L2.47 8.28a.75.75 0 0 1 0-1.06l4.25-4.25a.75.75 0 0 1 1.06 1.06L4.56 7.25h7.69a.75.75 0 0 1 0 1.5H4.56l3.22 3.22a.75.75 0 0 1 0 1.06z"/></svg>
-          </button>
           <span class="diff-inline-status" :class="'status-' + (chatChangesStore.inlineDiffPayload.status ?? '').toLowerCase()">
             {{ chatChangesStore.inlineDiffPayload.status }}
           </span>
@@ -1097,28 +1248,19 @@ onUnmounted(() => {
           <span v-else class="diff-inline-path" :title="chatChangesStore.inlineDiffPayload.filePath">
             {{ chatChangesStore.inlineDiffPayload.filePath }}
           </span>
+          <BaseSegmented
+            v-if="chatDiffViewerRef?.hasSemanticAndText"
+            class="diff-inline-tab-group"
+            size="sm"
+            :model-value="chatDiffViewerRef.activeTab"
+            :options="chatDiffTabOptions"
+            @update:model-value="chatDiffViewerRef.activeTab = $event as 'semantic' | 'text'"
+          />
           <span class="diff-inline-stats">
             <span class="stat-add">+{{ chatChangesStore.inlineDiffPayload.stats.additions }}</span>
             <span class="stat-del">-{{ chatChangesStore.inlineDiffPayload.stats.deletions }}</span>
           </span>
           <span class="diff-inline-actions">
-            <BaseSegmented
-              v-if="chatDiffViewerRef?.hasSemanticAndText"
-              class="diff-inline-tab-group"
-              size="sm"
-              :model-value="chatDiffViewerRef.activeTab"
-              :options="chatDiffTabOptions"
-              @update:model-value="chatDiffViewerRef.activeTab = $event as 'semantic' | 'text'"
-            />
-            <BaseButton
-              v-if="projectStore.unityConnected"
-              class="diff-inline-action-btn ui-select-none"
-              :title="t('common.selectInUnity')"
-              @click="selectUnityAsset(chatChangesStore.inlineDiffPayload!.filePath)"
-            >
-              <svg viewBox="0 0 16 16" width="12" height="12" fill="currentColor"><path d="M6.4 1L1 8l5.4 7h3.2L6.2 9.5H15v-3H6.2L9.6 1H6.4z"/></svg>
-              {{ t('common.selectInUnity') }}
-            </BaseButton>
             <BaseButton
               v-if="!chatChangesStore.inlineDiffPayload!.isBinary && canOpenInEditor(chatChangesStore.inlineDiffPayload!.filePath)"
               class="diff-inline-action-btn ui-select-none"
@@ -1128,9 +1270,6 @@ onUnmounted(() => {
               <svg viewBox="0 0 16 16" width="12" height="12" fill="currentColor"><path d="M8 1C4.1 1 1 4.1 1 8s3.1 7 7 7 7-3.1 7-7-3.1-7-7-7zm0 12.5c-3 0-5.5-2.5-5.5-5.5S5 2.5 8 2.5s5.5 2.5 5.5 5.5-2.5 5.5-5.5 5.5zM6 5l6 3-6 3V5z"/></svg>
               {{ t('common.openInEditor') }}
             </BaseButton>
-            <BaseButton class="diff-inline-action-btn ui-select-none" @click="toggleChatDiffMode" :title="chatDiffMode === 'unified' ? 'Side-by-side' : 'Unified'">
-              {{ chatDiffMode === "unified" ? "Side-by-side" : "Unified" }}
-            </BaseButton>
           </span>
           <button class="diff-close-btn ui-select-none" @click="chatChangesStore.closeInlineDiff()">&times;</button>
         </div>
@@ -1138,7 +1277,6 @@ onUnmounted(() => {
           <FileDiffViewer
             ref="chatDiffViewerRef"
             :payload="chatChangesStore.inlineDiffPayload"
-            :mode="chatDiffMode"
             :hide-builtin-tabs="true"
             @lfs-pulled="onChatDiffLfsPulled"
           />
@@ -1211,8 +1349,6 @@ onUnmounted(() => {
           user-content-mode="asset"
           @scroll="onMessagesScroll"
           @content-click="handleContentClick"
-          @content-mouseover="handleFileRefMouseOver"
-          @content-mouseout="handleFileRefMouseOver"
           @open-thinking="emit('openThinking', $event)"
           @open-image="openLightbox"
           @apply-knowledge-proposal="chatStore.applyKnowledgeProposal"
@@ -1391,8 +1527,9 @@ onUnmounted(() => {
 
 <style scoped>
 .chat-view-layout {
-  flex: 1;
+  flex: 1 1 0;
   display: flex;
+  width: 100%;
   min-width: 0;
   min-height: 0;
   height: 100%;
@@ -1664,9 +1801,10 @@ onUnmounted(() => {
 
 .chat-view {
   z-index: 2;
-  flex: 1;
+  flex: 1 1 0;
   display: flex;
   flex-direction: column;
+  width: 0;
   height: 100%;
   min-width: 0;
   min-height: 0;
@@ -1678,12 +1816,15 @@ onUnmounted(() => {
 
 .chat-view.is-vertical-layout {
   width: 100%;
+  flex-basis: auto;
 }
 
 .chat-main {
   position: relative;
-  flex: 1;
+  flex: 1 1 0;
+  width: 100%;
   min-height: 0;
+  min-width: 0;
   display: flex;
 }
 
@@ -1731,6 +1872,9 @@ onUnmounted(() => {
 
 .input-area {
   position: relative;
+  flex: 0 0 auto;
+  width: 100%;
+  min-width: 0;
   padding: 12px 24px 18px;
   border-top: 1px solid var(--border-color);
   background: var(--bg-color);
@@ -2184,19 +2328,6 @@ onUnmounted(() => {
   padding: 8px 12px;
   border-bottom: 1px solid var(--border-color);
   flex-shrink: 0;
-}
-.diff-back-btn {
-  background: none;
-  border: 1px solid var(--border-color);
-  border-radius: 4px;
-  padding: 2px 8px;
-  color: var(--text-secondary);
-  cursor: pointer;
-  font-size: 14px;
-}
-.diff-back-btn:hover {
-  color: var(--text-color);
-  border-color: var(--text-secondary);
 }
 .diff-inline-path {
   font-family: var(--font-mono-identifier);

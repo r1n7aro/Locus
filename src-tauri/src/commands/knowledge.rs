@@ -2679,7 +2679,11 @@ pub struct WorkspaceFilePreview {
     pub preferred_action: String, // "editor" | "unity" | "external"
     pub file_size: Option<u64>,
     pub snippet_start_line: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preview_suppressed: Option<String>,
 }
+
+const HOVER_PREVIEW_MAX_FILE_BYTES: u64 = 256 * 1024;
 
 #[tauri::command]
 pub async fn preview_workspace_file(
@@ -2702,6 +2706,7 @@ pub async fn preview_workspace_file(
                 preferred_action: "external".into(),
                 file_size: None,
                 snippet_start_line: 1,
+                preview_suppressed: None,
             });
         }
     };
@@ -2718,6 +2723,7 @@ pub async fn preview_workspace_file(
             preferred_action: "external".into(),
             file_size: None,
             snippet_start_line: 1,
+            preview_suppressed: None,
         });
     }
 
@@ -2730,8 +2736,9 @@ pub async fn preview_workspace_file(
     let is_code = is_code_ext(&ext);
     let language = lang_from_ext(&ext).map(|s| s.to_string());
 
-    // Unity asset: under Assets/ but not a code file
-    let is_unity_asset = file_path.starts_with("Assets/") && !is_code;
+    // Unity asset: under Assets/ or Packages/ but not a code file
+    let is_unity_asset =
+        (file_path.starts_with("Assets/") || file_path.starts_with("Packages/")) && !is_code;
 
     let preferred_action = if is_code {
         "editor"
@@ -2740,6 +2747,22 @@ pub async fn preview_workspace_file(
     } else {
         "external"
     };
+
+    if file_size > HOVER_PREVIEW_MAX_FILE_BYTES {
+        return Ok(WorkspaceFilePreview {
+            display_path: file_path,
+            exists: true,
+            kind: if is_binary { "binary" } else { "text" }.into(),
+            language,
+            snippet: None,
+            truncated: true,
+            is_unity_asset,
+            preferred_action: preferred_action.into(),
+            file_size: Some(file_size),
+            snippet_start_line: 1,
+            preview_suppressed: Some("largeFile".into()),
+        });
+    }
 
     if is_binary {
         return Ok(WorkspaceFilePreview {
@@ -2753,6 +2776,7 @@ pub async fn preview_workspace_file(
             preferred_action: preferred_action.into(),
             file_size: Some(file_size),
             snippet_start_line: 1,
+            preview_suppressed: None,
         });
     }
 
@@ -2804,6 +2828,7 @@ pub async fn preview_workspace_file(
         preferred_action: preferred_action.into(),
         file_size: Some(file_size),
         snippet_start_line: (start_idx + 1) as u32,
+        preview_suppressed: None,
     })
 }
 

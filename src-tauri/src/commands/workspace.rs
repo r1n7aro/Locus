@@ -1339,18 +1339,45 @@ pub async fn send_unity_log(
 #[tauri::command]
 pub async fn select_unity_asset(
     asset_path: String,
+    focus_project_window: Option<bool>,
     workspace: State<'_, Arc<Workspace>>,
 ) -> Result<String, AppError> {
     let cwd = workspace.path.read().await.clone();
-    let resp = crate::unity_bridge::send_message(&cwd, "select_asset", &asset_path).await?;
-    if resp.ok {
-        Ok("ok".to_string())
-    } else {
-        Err(resp
-            .error
-            .unwrap_or_else(|| "unknown error".to_string())
-            .into())
-    }
+    crate::unity_bridge::select_asset(&cwd, &asset_path, focus_project_window.unwrap_or(true))
+        .await?;
+    Ok("ok".to_string())
+}
+
+#[tauri::command]
+pub async fn open_unity_asset_inspector(
+    asset_path: String,
+    workspace: State<'_, Arc<Workspace>>,
+) -> Result<String, AppError> {
+    let cwd = workspace.path.read().await.clone();
+    crate::unity_bridge::open_asset_inspector(&cwd, &asset_path).await?;
+    Ok("ok".to_string())
+}
+
+#[tauri::command]
+pub async fn select_unity_scene_object(
+    scene_path: String,
+    object_path: String,
+    workspace: State<'_, Arc<Workspace>>,
+) -> Result<String, AppError> {
+    let cwd = workspace.path.read().await.clone();
+    crate::unity_bridge::select_scene_object(&cwd, &scene_path, &object_path).await?;
+    Ok("ok".to_string())
+}
+
+#[tauri::command]
+pub async fn open_unity_scene_object_inspector(
+    scene_path: String,
+    object_path: String,
+    workspace: State<'_, Arc<Workspace>>,
+) -> Result<String, AppError> {
+    let cwd = workspace.path.read().await.clone();
+    crate::unity_bridge::open_scene_object_inspector(&cwd, &scene_path, &object_path).await?;
+    Ok("ok".to_string())
 }
 
 #[tauri::command]

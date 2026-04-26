@@ -1,4 +1,5 @@
 import { ipcInvoke } from "./ipc";
+import { getLocusRuntime } from "./locusRuntime";
 import type { PluginStatus } from "../types";
 
 export interface AssetSearchResult {
@@ -20,8 +21,87 @@ export function installUnityPlugin(): Promise<string> {
   return ipcInvoke<string>("install_unity_plugin");
 }
 
-export function selectUnityAsset(assetPath: string): Promise<void> {
-  return ipcInvoke("select_unity_asset", { assetPath });
+export interface SelectUnityAssetOptions {
+  focusProjectWindow?: boolean;
+}
+
+export function selectUnityAsset(
+  assetPath: string,
+  options: SelectUnityAssetOptions = {},
+): Promise<void> {
+  const focusProjectWindow = options.focusProjectWindow ?? getLocusRuntime().kind !== "unity";
+  return ipcInvoke("select_unity_asset", { assetPath, focusProjectWindow });
+}
+
+export function openUnityAssetInspector(assetPath: string): Promise<void> {
+  return ipcInvoke("open_unity_asset_inspector", { assetPath });
+}
+
+export function selectUnitySceneObject(
+  scenePath: string,
+  objectPath: string,
+): Promise<void> {
+  return ipcInvoke("select_unity_scene_object", { scenePath, objectPath });
+}
+
+export function openUnitySceneObjectInspector(
+  scenePath: string,
+  objectPath: string,
+): Promise<void> {
+  return ipcInvoke("open_unity_scene_object_inspector", { scenePath, objectPath });
+}
+
+export function setUnityEmbedMouseActivationSuppressed(suppressed: boolean): Promise<void> {
+  const runtime = getLocusRuntime();
+  if (runtime.kind !== "tauri") return Promise.resolve();
+  return runtime.invoke("unity_embed_set_mouse_activation_suppressed", { suppressed });
+}
+
+export function activateUnityEmbedForInput(): Promise<void> {
+  const runtime = getLocusRuntime();
+  if (runtime.kind !== "tauri") return Promise.resolve();
+  return runtime.invoke("unity_embed_activate_for_input");
+}
+
+export interface UnityEmbedFocusDebugSnapshot {
+  ok: boolean;
+  reason: string;
+  foregroundHwnd: number;
+  foregroundTitle: string;
+  overlayHwnd: number;
+  overlayTitle: string;
+  overlayVisible: boolean;
+  overlayForeground: boolean;
+  overlayChildWindow: boolean;
+  overlayParentHwnd: number;
+  overlayNoActivate: boolean;
+  activationGuardEnabled: boolean;
+  mouseActivateHookInstalled: boolean;
+  mouseActivateHookedHwndCount: number;
+  mouseActivateBlockCount: number;
+  mouseActivationSuppressed: boolean;
+  parentHwnd: number;
+  parentTitle: string;
+  parentVisible: boolean;
+  parentForeground: boolean;
+}
+
+export function getUnityEmbedFocusDebugSnapshot(): Promise<UnityEmbedFocusDebugSnapshot | null> {
+  const runtime = getLocusRuntime();
+  if (runtime.kind !== "tauri") return Promise.resolve(null);
+  return runtime.invoke<UnityEmbedFocusDebugSnapshot>("unity_embed_focus_debug_snapshot");
+}
+
+export type UnitySceneObjectErrorKind = "sceneNotLoaded" | "objectMissing" | "unknown";
+
+export function classifyUnitySceneObjectError(error: unknown): UnitySceneObjectErrorKind {
+  const message = typeof error === "object" && error !== null && "message" in error
+    ? String((error as { message?: unknown }).message ?? "")
+    : String(error ?? "");
+
+  if (/scene is not loaded/i.test(message)) return "sceneNotLoaded";
+  if (/gameobject was not found/i.test(message)) return "objectMissing";
+  return "unknown";
 }
 
 export function searchAssets(query: string): Promise<AssetSearchResult[]> {
@@ -51,6 +131,7 @@ export interface WorkspaceFilePreview {
   preferredAction: "editor" | "unity" | "external";
   fileSize?: number;
   snippetStartLine: number;
+  previewSuppressed?: "largeFile" | string;
 }
 
 export function previewWorkspaceFile(

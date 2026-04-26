@@ -1,7 +1,14 @@
 
 <script setup lang="ts">
 import { computed } from "vue";
-import { selectUnityAsset } from "../services/unity";
+import {
+  selectUnityAsset,
+  selectUnitySceneObject,
+  openUnitySceneObjectInspector,
+  classifyUnitySceneObjectError,
+} from "../services/unity";
+import { t } from "../i18n";
+import { useNotificationStore } from "../stores/notification";
 
 const props = defineProps<{
   path: string;
@@ -12,20 +19,36 @@ const emit = defineEmits<{
   remove: [];
 }>();
 
+const notificationStore = useNotificationStore();
+
+const sceneObjectRef = computed(() => {
+  const normalized = props.path.trim().replace(/\\/g, "/").replace(/\/+$/, "");
+  const match = normalized.match(/^((?:Assets|Packages)\/.+?\.unity)\/(.+)$/i);
+  if (!match) return null;
+  const objectPath = match[2].replace(/^\/+|\/+$/g, "");
+  if (!match[1] || !objectPath) return null;
+  return {
+    scenePath: match[1],
+    objectPath,
+  };
+});
+
 const displayName = computed(() => {
-  const parts = props.path.split("/");
+  const parts = (sceneObjectRef.value?.objectPath ?? props.path).split("/");
   const fileName = parts[parts.length - 1] || props.path;
   const dotIdx = fileName.lastIndexOf(".");
   return dotIdx > 0 ? fileName.substring(0, dotIdx) : fileName;
 });
 
 const ext = computed(() => {
+  if (sceneObjectRef.value) return "unity-scene-object";
   const dotIdx = props.path.lastIndexOf(".");
   return dotIdx > 0 ? props.path.substring(dotIdx + 1).toLowerCase() : "";
 });
 
 const typeIcon = computed(() => {
   switch (ext.value) {
+    case "unity-scene-object": return "□";
     case "prefab": return "◆";
     case "unity": return "◈";
     case "asset": return "◇";
@@ -40,11 +63,37 @@ const typeIcon = computed(() => {
   }
 });
 
-async function handleClick() {
+async function handleClick(e: MouseEvent) {
   try {
+    if (sceneObjectRef.value) {
+      const { scenePath, objectPath } = sceneObjectRef.value;
+      if (e.ctrlKey || e.metaKey) {
+        await openUnitySceneObjectInspector(scenePath, objectPath);
+        return;
+      }
+      await selectUnitySceneObject(scenePath, objectPath);
+      return;
+    }
     await selectUnityAsset(props.path);
-  } catch {
+  } catch (error) {
+    if (sceneObjectRef.value) {
+      notifyUnitySceneObjectError(error, sceneObjectRef.value.scenePath, sceneObjectRef.value.objectPath);
+    }
   }
+}
+
+function notifyUnitySceneObjectError(error: unknown, scenePath: string, objectPath: string) {
+  const kind = classifyUnitySceneObjectError(error);
+  const message = kind === "sceneNotLoaded"
+    ? t("chat.sceneObject.sceneNotLoaded", scenePath)
+    : kind === "objectMissing"
+      ? t("chat.sceneObject.objectMissing", objectPath)
+      : t("chat.sceneObject.openFailed", `${scenePath}/${objectPath}`);
+  notificationStore.addNotice("warning", message, {
+    operation: "unitySceneObjectRef",
+    code: `unity.sceneObject.${kind}`,
+    replaceOperation: true,
+  });
 }
 </script>
 
