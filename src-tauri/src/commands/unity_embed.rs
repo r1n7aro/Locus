@@ -152,9 +152,9 @@ fn needs_geometry_apply(msg: &UnityEmbedControlMessage) -> bool {
     true
 }
 
-fn needs_visibility_apply(msg: &UnityEmbedControlMessage) -> bool {
+fn needs_visibility_apply(visible: bool) -> bool {
     if let Ok(state) = applied_state().lock() {
-        return !state.has_window || state.visible != msg.visible;
+        return !state.has_window || state.visible != visible;
     }
 
     true
@@ -495,18 +495,13 @@ fn apply_control_message_on_main(
                 record_applied_geometry(&msg);
             }
 
-            if created || needs_visibility_apply(&msg) {
-                if should_show_window_now(&window, &msg) {
-                    show_embed_window(&window)?;
-                } else {
-                    window
-                        .hide()
-                        .map_err(|error| format!("Failed to hide Unity embed window: {error}"))?;
-                }
-                record_applied_visibility(msg.visible);
-                #[cfg(target_os = "windows")]
-                windows_impl::set_popup_sync_visible(msg.visible);
+            let desired_visible = should_show_window_now(&window, &msg);
+            if created || needs_visibility_apply(desired_visible) {
+                apply_embed_window_visibility(&window, desired_visible)?;
+                record_applied_visibility(desired_visible);
             }
+            #[cfg(target_os = "windows")]
+            windows_impl::set_popup_sync_visible(msg.visible);
             Ok(())
         }
         "close" => {
@@ -565,17 +560,26 @@ fn apply_window_geometry(
     apply_overlay_geometry(window, msg)
 }
 
-fn show_embed_window(window: &tauri::WebviewWindow) -> Result<(), String> {
+fn apply_embed_window_visibility(
+    window: &tauri::WebviewWindow,
+    visible: bool,
+) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
-        return windows_impl::show_window_no_activate(window);
+        return windows_impl::set_window_visible_no_activate(window, visible);
     }
 
     #[cfg(not(target_os = "windows"))]
     {
-        window
-            .show()
-            .map_err(|error| format!("Failed to show Unity embed window: {error}"))
+        if visible {
+            window
+                .show()
+                .map_err(|error| format!("Failed to show Unity embed window: {error}"))
+        } else {
+            window
+                .hide()
+                .map_err(|error| format!("Failed to hide Unity embed window: {error}"))
+        }
     }
 }
 
@@ -831,12 +835,15 @@ mod windows_impl {
             .unwrap_or(true)
     }
 
-    pub(super) fn show_window_no_activate(window: &tauri::WebviewWindow) -> Result<(), String> {
+    pub(super) fn set_window_visible_no_activate(
+        window: &tauri::WebviewWindow,
+        visible: bool,
+    ) -> Result<(), String> {
         let hwnd = window
             .hwnd()
             .map_err(|error| format!("Failed to read Tauri window handle: {error}"))?;
         unsafe {
-            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            let _ = ShowWindow(hwnd, if visible { SW_SHOWNOACTIVATE } else { SW_HIDE });
         }
         Ok(())
     }

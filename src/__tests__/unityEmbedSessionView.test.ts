@@ -101,8 +101,12 @@ describe("Unity embedded session view", () => {
     expect(command).toContain("WM_MOUSEACTIVATE");
     expect(command).toContain("MA_NOACTIVATE");
     expect(command).toContain("WS_EX_NOACTIVATE");
-    expect(command).toContain("show_window_no_activate");
+    expect(command).toContain("set_window_visible_no_activate");
     expect(command).toContain("SW_SHOWNOACTIVATE");
+    expect(command).toContain("SW_HIDE");
+    expect(command).toContain("let desired_visible = should_show_window_now(&window, &msg);");
+    expect(command).toContain("needs_visibility_apply(desired_visible)");
+    expect(command).toContain("record_applied_visibility(desired_visible)");
     expect(command).toContain("collect_descendant_windows");
     expect(command).toContain("GW_CHILD");
     expect(command).toContain("mouse_hook_sync_loop");
