@@ -53,7 +53,11 @@ const panelEntries = computed(() => {
 
   return inspector.panels
     .map((panel, index) => ({ panel, index }))
-    .filter(({ panel }) => !(unityHeaderLayout.value && panel.panelKind === "gameObjectHeader"));
+    .filter(({ panel }) => !(unityHeaderLayout.value && panel.panelKind === "gameObjectHeader"))
+    .sort((left, right) => {
+      const rankDiff = panelOrderRank(left.panel) - panelOrderRank(right.panel);
+      return rankDiff !== 0 ? rankDiff : left.index - right.index;
+    });
 });
 const objectDisplayName = computed(() =>
   gameObjectSummary.value.name ?? cleanTitle(props.inspector?.title ?? ""),
@@ -154,6 +158,18 @@ function changeIcon(kind: string): string {
 
 function panelDisplayTitle(panel: InspectorPanel): string {
   return getInspectorPanelDisplayTitle(panel);
+}
+
+function panelOrderRank(panel: InspectorPanel): number {
+  if (panel.panelKind === "gameObjectHeader") return 0;
+  if (isTransformPanel(panel)) return 1;
+  return 2;
+}
+
+function isTransformPanel(panel: InspectorPanel): boolean {
+  if (panel.panelKind !== "component") return false;
+  const title = getInspectorPanelDisplayTitle(panel);
+  return title === "Transform" || title === "RectTransform";
 }
 
 function panelInferenceBadge(panel: InspectorPanel): string {

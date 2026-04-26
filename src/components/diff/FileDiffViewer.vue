@@ -13,7 +13,6 @@ import type {
   SemanticTargetInspector,
   SemanticTargetSummary,
   SemanticTreeNode,
-  SemanticDisplayMode,
 } from "../../types";
 import UnityHierarchyPane from "./UnityHierarchyPane.vue";
 import UnityInspectorPane from "./UnityInspectorPane.vue";
@@ -59,9 +58,9 @@ async function pullLfsObject() {
 }
 
 const activeTab = ref<"text" | "semantic">(props.payload.semantic ? "semantic" : "text");
+const textDisplayMode = ref<"unified" | "side-by-side">(props.mode);
 const selectedTargetId = ref<string | null>(null);
 const includeUnchanged = ref(false);
-const displayMode = ref<SemanticDisplayMode>("optimized");
 const semanticLoading = ref(false);
 const semanticError = ref<string | null>(null);
 const activeInspector = ref<SemanticTargetInspector | null>(props.payload.semantic?.inspector ?? null);
@@ -223,8 +222,8 @@ watch(
   () => props.payload,
   (payload) => {
     activeTab.value = payload.semantic ? "semantic" : "text";
+    textDisplayMode.value = props.mode;
     includeUnchanged.value = false;
-    displayMode.value = "optimized";
     semanticError.value = null;
     semanticLoading.value = false;
     lazyText.value = null;
@@ -246,6 +245,13 @@ watch(
     }
   },
   { immediate: true },
+);
+
+watch(
+  () => props.mode,
+  (mode) => {
+    textDisplayMode.value = mode;
+  },
 );
 
 watch(activeTab, (tab) => {
@@ -306,8 +312,8 @@ async function toggleIncludeUnchanged() {
   }
 }
 
-function toggleDisplayMode() {
-  displayMode.value = displayMode.value === "optimized" ? "full" : "optimized";
+function toggleTextDisplayMode() {
+  textDisplayMode.value = textDisplayMode.value === "unified" ? "side-by-side" : "unified";
 }
 
 function escapeHtml(source: string): string {
@@ -480,9 +486,6 @@ defineExpose({ activeTab, hasSemanticAndText });
           <button v-if="!compact" class="summary-toggle-btn" :class="{ active: includeUnchanged }" @click="toggleIncludeUnchanged">
             {{ t('diff.fields.showUnchanged') }}
           </button>
-          <button v-if="!compact" class="summary-toggle-btn" :class="{ active: displayMode === 'full' }" @click="toggleDisplayMode">
-            {{ t('diff.mode.full') }}
-          </button>
         </div>
 
         <div v-if="!hasSemanticDetails" class="semantic-preview">
@@ -506,10 +509,8 @@ defineExpose({ activeTab, hasSemanticAndText });
                 :loading="semanticLoading"
                 :error="semanticError"
                 :include-unchanged="includeUnchanged"
-                :display-mode="displayMode"
                 :hide-toolbar="true"
                 @toggle-unchanged="toggleIncludeUnchanged"
-                @toggle-display-mode="toggleDisplayMode"
               />
             </div>
           </div>
@@ -543,10 +544,8 @@ defineExpose({ activeTab, hasSemanticAndText });
                 :loading="semanticLoading"
                 :error="semanticError"
                 :include-unchanged="includeUnchanged"
-                :display-mode="displayMode"
                 :hide-toolbar="true"
                 @toggle-unchanged="toggleIncludeUnchanged"
-                @toggle-display-mode="toggleDisplayMode"
               />
             </div>
           </div>
@@ -560,10 +559,8 @@ defineExpose({ activeTab, hasSemanticAndText });
                 :loading="semanticLoading"
                 :error="semanticError"
                 :include-unchanged="includeUnchanged"
-                :display-mode="displayMode"
                 :hide-toolbar="true"
                 @toggle-unchanged="toggleIncludeUnchanged"
-                @toggle-display-mode="toggleDisplayMode"
               />
             </div>
           </div>
@@ -578,7 +575,13 @@ defineExpose({ activeTab, hasSemanticAndText });
         </button>
         <p v-if="!compact && lazyTextError" class="lfs-error">{{ lazyTextError }}</p>
       </div>
-      <div v-if="effectiveText && (activeTab === 'text' || !payload.semantic)" ref="textScrollEl" class="diff-text" :class="[mode]" @scroll="onTextScroll">
+      <div v-if="effectiveText && (activeTab === 'text' || !payload.semantic) && !compact" class="diff-view-controls">
+        <span class="summary-spacer"></span>
+        <button class="summary-toggle-btn" :class="{ active: textDisplayMode === 'side-by-side' }" @click="toggleTextDisplayMode">
+          {{ t('diff.mode.sideBySide') }}
+        </button>
+      </div>
+      <div v-if="effectiveText && (activeTab === 'text' || !payload.semantic)" ref="textScrollEl" class="diff-text" :class="[textDisplayMode]" @scroll="onTextScroll">
         <!-- Loading indicator while preparing large text -->
         <div v-if="!textReady" class="diff-loading">Loading…</div>
         <template v-else>
@@ -587,7 +590,7 @@ defineExpose({ activeTab, hasSemanticAndText });
               <span class="diff-hunk-header">{{ hunk.header }}</span>
             </div>
 
-            <template v-if="mode === 'unified'">
+            <template v-if="textDisplayMode === 'unified'">
               <div
                 v-for="(line, lineIndex) in filterLines(highlightHunk(hunk, payload.filePath, totalLineCount > HIGHLIGHT_LINE_LIMIT))"
                 :key="`${originalIndex}-${lineIndex}`"
@@ -718,7 +721,8 @@ defineExpose({ activeTab, hasSemanticAndText });
   height: 100%;
 }
 
-.semantic-summary {
+.semantic-summary,
+.diff-view-controls {
   display: flex;
   align-items: center;
   gap: 8px;
@@ -971,6 +975,8 @@ defineExpose({ activeTab, hasSemanticAndText });
 
 
 .diff-text {
+  flex: 1;
+  min-height: 0;
   overflow: auto;
 }
 

@@ -12,12 +12,7 @@ const projectStore = useProjectStore();
 
 const overlay = useDiffOverlay();
 
-const mode = ref<"unified" | "side-by-side">("unified");
 const confirmAction = ref<DiffOverlayHeaderAction | null>(null);
-
-function toggleMode() {
-  mode.value = mode.value === "unified" ? "side-by-side" : "unified";
-}
 
 // Clear stale confirm dialog when overlay closes or reopens
 watch(() => overlay.visible.value, (visible) => {
@@ -117,9 +112,6 @@ async function onLfsPulled() {
               >
                 {{ action.label }}
               </button>
-              <button class="diff-overlay-btn" @click="toggleMode" :title="mode === 'unified' ? 'Switch to side-by-side' : 'Switch to unified'">
-                {{ mode === "unified" ? "Side-by-side" : "Unified" }}
-              </button>
               <button class="diff-overlay-btn close-btn" @click="overlay.close()">&#x2715;</button>
             </div>
           </div>
@@ -128,7 +120,6 @@ async function onLfsPulled() {
             <FileDiffViewer
               v-if="overlay.payload.value"
               :payload="overlay.payload.value"
-              :mode="mode"
               @lfs-pulled="onLfsPulled"
             />
           </div>
