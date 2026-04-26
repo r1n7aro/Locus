@@ -13,7 +13,11 @@ describe("ChatComposer autosize", () => {
     const source = read("src/components/chat/ChatComposer.vue");
 
     expect(source).toContain("function resizeTextarea(textarea: HTMLTextAreaElement | null = textareaRef.value) {");
+    expect(source).toContain("const DEFAULT_TEXTAREA_MIN_HEIGHT = 42;");
+    expect(source).toContain("const COMPACT_TEXTAREA_MIN_HEIGHT = 28;");
+    expect(source).toContain("const minHeight = props.compact ? COMPACT_TEXTAREA_MIN_HEIGHT : DEFAULT_TEXTAREA_MIN_HEIGHT;");
     expect(source).toContain('textarea.style.height = "auto";');
+    expect(source).toContain("Math.max(minHeight, Math.min(contentHeight, props.maxHeight))");
     expect(source).toContain("resizeTextarea(target);");
     expect(source).toContain('flush: "post"');
   });

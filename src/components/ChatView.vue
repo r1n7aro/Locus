@@ -1492,7 +1492,6 @@ onUnmounted(() => {
         :send-label="t('common.send')"
         :cancel-label="t('common.cancel')"
         :compact="inputControlsCollapsed"
-        :show-action="!inputControlsCollapsed"
         @send="handleComposerSend"
         @clear="handleNewChatRequest"
         @cancel="emit('cancel')"

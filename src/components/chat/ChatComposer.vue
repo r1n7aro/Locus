@@ -50,6 +50,8 @@ const emit = defineEmits<{
 
 const slots = useSlots();
 const textareaRef = ref<HTMLTextAreaElement | null>(null);
+const DEFAULT_TEXTAREA_MIN_HEIGHT = 42;
+const COMPACT_TEXTAREA_MIN_HEIGHT = 28;
 
 const hasHeader = computed(() => props.showHeader ?? !!slots.header);
 const hasOverlay = computed(() => props.extendTop && !!slots.overlay);
@@ -58,7 +60,9 @@ const hasFooterEnd = computed(() => !!slots["footer-end"]);
 const hasFooter = computed(() =>
   !props.compact && (hasFooterStart.value || hasFooterEnd.value || props.showAction),
 );
+const showInlineAction = computed(() => props.compact && props.showAction);
 const textareaDisabled = computed(() => props.disabled || props.isStreaming);
+const actionDisabled = computed(() => !props.isStreaming && (props.disabled || !props.canSend));
 const textareaStyle = computed(() => ({
   maxHeight: `${props.maxHeight}px`,
 }));
@@ -70,9 +74,10 @@ const actionLabel = computed(() => (
 
 function resizeTextarea(textarea: HTMLTextAreaElement | null = textareaRef.value) {
   if (!textarea) return;
+  const minHeight = props.compact ? COMPACT_TEXTAREA_MIN_HEIGHT : DEFAULT_TEXTAREA_MIN_HEIGHT;
   textarea.style.height = "auto";
   const contentHeight = textarea.scrollHeight;
-  textarea.style.height = `${Math.min(contentHeight, props.maxHeight)}px`;
+  textarea.style.height = `${Math.max(minHeight, Math.min(contentHeight, props.maxHeight))}px`;
   textarea.style.overflowY = contentHeight > props.maxHeight ? "auto" : "hidden";
 }
 
@@ -97,7 +102,7 @@ function handleActionClick() {
     emit("cancel");
     return;
   }
-  if (textareaDisabled.value || !props.canSend) return;
+  if (actionDisabled.value) return;
   emit("send");
 }
 
@@ -132,6 +137,12 @@ watch(() => props.maxHeight, () => {
 }, {
   flush: "post",
 });
+
+watch(() => props.compact, () => {
+  resizeTextarea();
+}, {
+  flush: "post",
+});
 </script>
 
 <template>
@@ -152,6 +163,7 @@ watch(() => props.maxHeight, () => {
         :style="textareaStyle"
         :disabled="textareaDisabled"
         :placeholder="placeholder"
+        wrap="soft"
         rows="1"
         @input="handleInput"
         @keydown="handleKeydown"
@@ -161,6 +173,19 @@ watch(() => props.maxHeight, () => {
         @mouseup="emit('mouseup', $event as MouseEvent)"
         @focus="emit('focus', $event as FocusEvent)"
       />
+      <button
+        v-if="showInlineAction"
+        class="chat-composer-action chat-composer-inline-action ui-select-none"
+        :class="{ 'is-cancel': isStreaming }"
+        :disabled="actionDisabled"
+        :title="actionLabel"
+        :aria-label="actionLabel"
+        type="button"
+        @click="handleActionClick"
+      >
+        <span v-if="isStreaming" class="chat-composer-stop-icon" aria-hidden="true">&#9632;</span>
+        <span v-else class="chat-composer-send-icon" aria-hidden="true">&#8593;</span>
+      </button>
     </div>
 
     <div v-if="hasFooter" class="chat-composer-footer">
@@ -173,7 +198,7 @@ watch(() => props.maxHeight, () => {
           v-if="showAction"
           class="chat-composer-action ui-select-none"
           :class="{ 'is-cancel': isStreaming }"
-          :disabled="!isStreaming && (disabled || !canSend)"
+          :disabled="actionDisabled"
           :title="actionLabel"
           :aria-label="actionLabel"
           type="button"
@@ -198,8 +223,8 @@ watch(() => props.maxHeight, () => {
   background: var(--input-bg);
   border: 1px solid var(--border-color);
   border-radius: 12px;
-  min-height: 118px;
-  padding: 10px 12px;
+  min-height: 92px;
+  padding: 8px 12px;
   transition: border-color 0.2s ease;
 }
 
@@ -215,7 +240,7 @@ watch(() => props.maxHeight, () => {
 }
 
 .chat-composer.has-top-extension {
-  min-height: 148px;
+  min-height: 122px;
 }
 
 .chat-composer:focus-within {
@@ -248,11 +273,12 @@ watch(() => props.maxHeight, () => {
   display: flex;
   flex: 1 1 auto;
   align-items: flex-start;
-  min-height: 44px;
+  min-height: 42px;
 }
 
 .chat-composer.is-compact .chat-composer-body {
-  align-items: center;
+  align-items: flex-end;
+  gap: 8px;
   min-height: 28px;
 }
 
@@ -282,12 +308,13 @@ watch(() => props.maxHeight, () => {
   display: flex;
   align-items: center;
   gap: 8px;
-  min-height: 32px;
-  margin-top: 8px;
+  min-height: 28px;
+  margin-top: 4px;
 }
 
 .chat-composer.is-compact .chat-composer-input {
   min-height: 28px;
+  overflow: hidden;
   padding-top: 3px;
 }
 
@@ -333,6 +360,12 @@ watch(() => props.maxHeight, () => {
   cursor: pointer;
   box-shadow: none;
   transition: opacity 0.15s ease, filter 0.15s ease, background 0.15s ease, border-color 0.15s ease;
+}
+
+.chat-composer-inline-action {
+  width: 28px;
+  height: 28px;
+  border-radius: 6px;
 }
 
 .chat-composer-action:hover:not(:disabled) {
