@@ -36,6 +36,8 @@ pub mod unity_yaml;
 pub mod vcs;
 #[cfg(target_os = "windows")]
 mod windows_resize_sync;
+#[cfg(target_os = "windows")]
+mod windows_window_frame;
 mod workspace;
 
 use agent::definition::AgentDefRegistry;
@@ -521,6 +523,10 @@ pub fn run() {
             app.manage(feishu_reference_import_state);
             app.manage(log_store_for_setup.clone());
             commands::start_unity_embed_control_server(app.handle().clone());
+            #[cfg(target_os = "windows")]
+            if let Err(error) = windows_window_frame::restore_main_window_frame(app) {
+                eprintln!("[Locus] warning: failed to restore main window frame: {error}");
+            }
             #[cfg(target_os = "windows")]
             if let Err(error) = windows_resize_sync::install_for_main_window(app) {
                 eprintln!("[Locus] warning: failed to install WebView2 resize sync: {error}");

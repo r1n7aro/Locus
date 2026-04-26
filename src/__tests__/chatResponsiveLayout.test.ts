@@ -110,7 +110,7 @@ describe("chat responsive layout", () => {
     const tauriConfig = read("src-tauri/tauri.conf.json");
     const capabilities = read("src-tauri/capabilities/default.json");
 
-    expect(tauriConfig).toContain('"shadow": false');
+    expect(tauriConfig).toContain('"shadow": true');
     expect(tauriConfig).toContain('"backgroundColor": "#1d1d21"');
     expect(capabilities).toContain("core:window:allow-set-background-color");
     expect(capabilities).toContain("core:webview:allow-set-webview-background-color");

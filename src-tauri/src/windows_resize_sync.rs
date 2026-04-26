@@ -6,7 +6,8 @@ use tauri::Manager;
 use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Controller;
 use windows::core::BOOL;
 use windows::Win32::{
-    Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM},
+    Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
+    Graphics::Gdi::ClientToScreen,
     UI::{
         Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
         WindowsAndMessaging::{
@@ -50,6 +51,15 @@ struct ResizeSyncState {
     last_native_width: i32,
     last_native_height: i32,
     live_resize: bool,
+}
+
+struct WindowClientMetrics {
+    window_width: i32,
+    window_height: i32,
+    client_width: i32,
+    client_height: i32,
+    frame_width: i32,
+    frame_height: i32,
 }
 
 pub fn install_for_main_window(app: &tauri::App) -> Result<(), String> {
@@ -170,9 +180,6 @@ unsafe extern "system" fn resize_sync_subclass_proc(
         WM_WINDOWPOSCHANGING => unsafe {
             sync_from_changing_window_pos(hwnd, state, lparam);
         },
-        WM_WINDOWPOSCHANGED => unsafe {
-            sync_from_window_pos(state, lparam, false);
-        },
         WM_SIZE => {
             if wparam.0 != SIZE_MINIMIZED as usize {
                 let (width, height) = size_from_lparam(lparam);
@@ -291,27 +298,35 @@ unsafe fn sync_from_changing_window_pos(hwnd: HWND, state: &mut ResizeSyncState,
         return;
     }
 
-    if window_pos.cx < MIN_SYNC_WIDTH_PX || window_pos.cy < MIN_SYNC_HEIGHT_PX {
+    let Some(metrics) = (unsafe { window_client_metrics(hwnd) }) else {
+        return;
+    };
+    let current_width = metrics.window_width;
+    let current_height = metrics.window_height;
+    let current_client_width = metrics.client_width;
+    let current_client_height = metrics.client_height;
+    let proposed_client_width = proposed_client_dimension(window_pos.cx, metrics.frame_width);
+    let proposed_client_height = proposed_client_dimension(window_pos.cy, metrics.frame_height);
+    if proposed_client_width < MIN_SYNC_WIDTH_PX || proposed_client_height < MIN_SYNC_HEIGHT_PX {
         return;
     }
-    let mut window_rect = RECT::default();
-    if unsafe { GetWindowRect(hwnd, &mut window_rect) }.is_err() {
-        return;
-    }
-    let current_width = window_rect.right - window_rect.left;
-    let current_height = window_rect.bottom - window_rect.top;
+
     let width_changed = window_pos.cx != current_width;
     let height_changed = window_pos.cy != current_height;
     if !width_changed && !height_changed {
         state.live_resize = false;
         state.resize_target_active = false;
         unsafe {
-            publish_native_client_size(state, current_width, current_height);
-            sync_webview_bounds_at(state, 0, 0, current_width, current_height, true);
+            publish_native_client_size(state, current_client_width, current_client_height);
+            sync_webview_bounds_at(state, 0, 0, current_client_width, current_client_height, true);
         }
         return;
     }
 
+    let mut window_rect = RECT::default();
+    if unsafe { GetWindowRect(hwnd, &mut window_rect) }.is_err() {
+        return;
+    }
     let proposed_left = if contains_set_window_pos_flag(window_pos.flags, SWP_NOMOVE) {
         window_rect.left
     } else {
@@ -334,8 +349,8 @@ unsafe fn sync_from_changing_window_pos(hwnd: HWND, state: &mut ResizeSyncState,
         state.live_resize = false;
         state.resize_target_active = false;
         unsafe {
-            publish_native_client_size(state, current_width, current_height);
-            sync_webview_bounds_at(state, 0, 0, current_width, current_height, true);
+            publish_native_client_size(state, current_client_width, current_client_height);
+            sync_webview_bounds_at(state, 0, 0, current_client_width, current_client_height, true);
         }
         return;
     }
@@ -347,17 +362,17 @@ unsafe fn sync_from_changing_window_pos(hwnd: HWND, state: &mut ResizeSyncState,
     let child_x = 0;
     let child_y = 0;
     let child_width = if width_changed && right_stable && !left_stable {
-        current_width.max(window_pos.cx)
+        current_client_width.max(proposed_client_width)
     } else {
-        window_pos.cx
+        proposed_client_width
     };
     let child_height = if height_changed && bottom_stable && !top_stable {
-        current_height.max(window_pos.cy)
+        current_client_height.max(proposed_client_height)
     } else {
-        window_pos.cy
+        proposed_client_height
     };
     unsafe {
-        publish_native_client_size(state, window_pos.cx, window_pos.cy);
+        publish_native_client_size(state, proposed_client_width, proposed_client_height);
         sync_webview_bounds_at(state, child_x, child_y, child_width, child_height, false);
     }
 }
@@ -376,13 +391,39 @@ unsafe fn sync_from_window_pos(state: &mut ResizeSyncState, lparam: LPARAM, forc
         return;
     }
     unsafe {
-        publish_native_client_size(state, window_pos.cx, window_pos.cy);
-        sync_webview_bounds_at(state, 0, 0, window_pos.cx, window_pos.cy, force);
+        sync_from_client_rect(state.parent_hwnd, state, force);
     }
 }
 
 fn contains_set_window_pos_flag(flags: SET_WINDOW_POS_FLAGS, flag: SET_WINDOW_POS_FLAGS) -> bool {
     flags & flag == flag
+}
+
+unsafe fn window_client_metrics(hwnd: HWND) -> Option<WindowClientMetrics> {
+    let mut window_rect = RECT::default();
+    let mut client_rect = RECT::default();
+    if unsafe { GetWindowRect(hwnd, &mut window_rect) }.is_err()
+        || unsafe { GetClientRect(hwnd, &mut client_rect) }.is_err()
+    {
+        return None;
+    }
+
+    let window_width = window_rect.right - window_rect.left;
+    let window_height = window_rect.bottom - window_rect.top;
+    let client_width = client_rect.right - client_rect.left;
+    let client_height = client_rect.bottom - client_rect.top;
+    Some(WindowClientMetrics {
+        window_width,
+        window_height,
+        client_width,
+        client_height,
+        frame_width: (window_width - client_width).max(0),
+        frame_height: (window_height - client_height).max(0),
+    })
+}
+
+fn proposed_client_dimension(proposed_window_dimension: i32, frame_dimension: i32) -> i32 {
+    (proposed_window_dimension - frame_dimension).max(1)
 }
 
 unsafe fn sync_webview_bounds(state: &mut ResizeSyncState, width: i32, height: i32, force: bool) {
@@ -575,24 +616,33 @@ unsafe fn clamp_child_window_to_parent_client(state: &ResizeSyncState, hwnd: HWN
         return;
     };
 
-    let mut parent_rect = RECT::default();
+    let Some(client_origin) = (unsafe { parent_client_origin(state.parent_hwnd) }) else {
+        return;
+    };
     let mut child_rect = RECT::default();
-    if unsafe { GetWindowRect(state.parent_hwnd, &mut parent_rect) }.is_err()
-        || unsafe { GetWindowRect(hwnd, &mut child_rect) }.is_err()
-    {
+    if unsafe { GetWindowRect(hwnd, &mut child_rect) }.is_err() {
         return;
     }
 
-    if child_rect.left == parent_rect.left + x
-        && child_rect.top == parent_rect.top + y
-        && child_rect.right == parent_rect.left + x + width
-        && child_rect.bottom == parent_rect.top + y + height
+    if child_rect.left == client_origin.x + x
+        && child_rect.top == client_origin.y + y
+        && child_rect.right == client_origin.x + x + width
+        && child_rect.bottom == client_origin.y + y + height
     {
         return;
     }
 
     unsafe {
         sync_child_window(hwnd, x, y, width, height);
+    }
+}
+
+unsafe fn parent_client_origin(parent_hwnd: HWND) -> Option<POINT> {
+    let mut point = POINT { x: 0, y: 0 };
+    if unsafe { ClientToScreen(parent_hwnd, &mut point) }.as_bool() {
+        Some(point)
+    } else {
+        None
     }
 }
 
