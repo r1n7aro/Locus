@@ -168,8 +168,8 @@ function panelOrderRank(panel: InspectorPanel): number {
 
 function isTransformPanel(panel: InspectorPanel): boolean {
   if (panel.panelKind !== "component") return false;
-  const title = getInspectorPanelDisplayTitle(panel);
-  return title === "Transform" || title === "RectTransform";
+  const componentType = panel.componentType ?? getInspectorPanelDisplayTitle(panel);
+  return componentType === "Transform" || componentType === "RectTransform";
 }
 
 function panelInferenceBadge(panel: InspectorPanel): string {

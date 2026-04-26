@@ -18,8 +18,14 @@ export function cleanInspectorPanelTitle(title: string): string {
 
 export function getInspectorPanelDisplayTitle(panel: InspectorPanelDisplayLike): string {
   if (panel.scriptClass) return panel.scriptClass;
-  if (panel.componentType) return panel.componentType;
-  return cleanInspectorPanelTitle(panel.title);
+  const cleanedTitle = cleanInspectorPanelTitle(panel.title);
+  if (panel.componentType) {
+    const titleAddsTargetContext = cleanedTitle
+      && cleanedTitle !== panel.componentType
+      && !GENERIC_COMPONENT_TITLE_RE.test(cleanedTitle);
+    return titleAddsTargetContext ? cleanedTitle : panel.componentType;
+  }
+  return cleanedTitle;
 }
 
 export function getInspectorPanelResolveReason(panel: InspectorPanelDisplayLike): string | null {

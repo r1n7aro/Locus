@@ -1118,6 +1118,39 @@ fn prefab_panel_sort_key(
     (panel_rank, component_rank, order_index, source_file_id)
 }
 
+fn prefab_panel_titles_for_targets(
+    source_file_ids: &[i64],
+    source_info: Option<&SourcePrefabInfo>,
+    primary_local_info: Option<&PrefabInstanceLocalInfo>,
+    secondary_local_info: Option<&PrefabInstanceLocalInfo>,
+) -> HashMap<i64, String> {
+    let mut raw_titles = Vec::with_capacity(source_file_ids.len());
+    let mut counts: HashMap<String, usize> = HashMap::new();
+
+    for source_file_id in source_file_ids {
+        let title = prefab_panel_title(
+            *source_file_id,
+            source_info,
+            primary_local_info,
+            secondary_local_info,
+        );
+        *counts.entry(title.clone()).or_insert(0) += 1;
+        raw_titles.push((*source_file_id, title));
+    }
+
+    raw_titles
+        .into_iter()
+        .map(|(source_file_id, title)| {
+            let disambiguated = if counts.get(&title).copied().unwrap_or(0) > 1 {
+                format!("{} [fileID:{}]", title, source_file_id)
+            } else {
+                title
+            };
+            (source_file_id, disambiguated)
+        })
+        .collect()
+}
+
 fn prefab_component_resolve_reason(
     source_file_id: i64,
     source_info: Option<&SourcePrefabInfo>,
@@ -1404,6 +1437,12 @@ fn build_prefab_instance_panels(
     sorted_target_ids.sort_by_key(|source_file_id| {
         prefab_panel_sort_key(*source_file_id, source_info, new_local_info, old_local_info)
     });
+    let panel_titles = prefab_panel_titles_for_targets(
+        &sorted_target_ids,
+        source_info,
+        new_local_info,
+        old_local_info,
+    );
 
     // Build one panel per source target
     for src_fid in sorted_target_ids {
@@ -1423,7 +1462,9 @@ fn build_prefab_instance_panels(
             continue;
         }
 
-        let title = prefab_panel_title(src_fid, source_info, new_local_info, old_local_info);
+        let title = panel_titles.get(&src_fid).cloned().unwrap_or_else(|| {
+            prefab_panel_title(src_fid, source_info, new_local_info, old_local_info)
+        });
         let (
             mut panel_kind,
             class_id,
@@ -1665,6 +1706,12 @@ fn build_prefab_instance_panels_pair(
     sorted_target_ids.sort_by_key(|source_file_id| {
         prefab_panel_sort_key(*source_file_id, source_info, new_local_info, old_local_info)
     });
+    let panel_titles = prefab_panel_titles_for_targets(
+        &sorted_target_ids,
+        source_info,
+        new_local_info,
+        old_local_info,
+    );
 
     for src_fid in sorted_target_ids {
         let old_overrides = old_grouped
@@ -1683,7 +1730,9 @@ fn build_prefab_instance_panels_pair(
             continue;
         }
 
-        let title = prefab_panel_title(src_fid, source_info, new_local_info, old_local_info);
+        let title = panel_titles.get(&src_fid).cloned().unwrap_or_else(|| {
+            prefab_panel_title(src_fid, source_info, new_local_info, old_local_info)
+        });
         let (
             mut panel_kind,
             class_id,
@@ -3542,6 +3591,53 @@ PrefabInstance:
             &mut env,
             true, // include unchanged so single-side fixtures still produce panels
         )
+    }
+
+    #[test]
+    fn prefab_instance_panels_disambiguate_repeated_source_component_labels() {
+        let first_rect: i64 = 881729730001825605;
+        let second_rect: i64 = 2658705397569961675;
+        let prefab = build_model_instance_prefab_yaml_with_paths(&[
+            (first_rect, "m_AnchorMax.y"),
+            (second_rect, "m_AnchorMin.y"),
+        ]);
+
+        let mut component_label_by_file_id = HashMap::new();
+        component_label_by_file_id.insert(first_rect, "RectTransform".to_string());
+        component_label_by_file_id.insert(second_rect, "RectTransform".to_string());
+
+        let mut class_id_by_file_id = HashMap::new();
+        class_id_by_file_id.insert(first_rect, 224);
+        class_id_by_file_id.insert(second_rect, 224);
+
+        let mut order_index_by_file_id = HashMap::new();
+        order_index_by_file_id.insert(first_rect, 0);
+        order_index_by_file_id.insert(second_rect, 1);
+
+        let info = SourcePrefabInfo {
+            docs: Vec::new(),
+            lines: Vec::new(),
+            doc_by_file_id: HashMap::new(),
+            hierarchy_path_by_file_id: HashMap::new(),
+            owner_go_by_component: HashMap::new(),
+            component_label_by_file_id,
+            class_id_by_file_id,
+            order_index_by_file_id,
+            loaded_from_new_side: true,
+            backing_kind: SourcePrefabBacking::YamlPrefab,
+        };
+
+        let panels = build_panels_with_source_info(&prefab, Some(&info));
+
+        assert_eq!(panels.len(), 2);
+        assert_eq!(panels[0].title, "RectTransform [fileID:881729730001825605]");
+        assert_eq!(
+            panels[1].title,
+            "RectTransform [fileID:2658705397569961675]"
+        );
+        assert!(panels
+            .iter()
+            .all(|panel| panel.component_type.as_deref() == Some("RectTransform")));
     }
 
     #[test]

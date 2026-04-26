@@ -33,6 +33,28 @@ describe("inspectorPanelDisplay", () => {
     expect(getInspectorPanelResolveReason(panel)).toBeNull();
   });
 
+  it("keeps prefab target context when the backend title is more specific than the component type", () => {
+    const panel = makePanel({
+      title: "SettingsMenu/Buttons/Start/RectTransform",
+      componentType: "RectTransform",
+      componentClassId: 224,
+      componentSource: "builtin",
+    });
+
+    expect(getInspectorPanelDisplayTitle(panel)).toBe("SettingsMenu/Buttons/Start/RectTransform");
+  });
+
+  it("keeps backend fileID disambiguation for repeated prefab override component titles", () => {
+    const panel = makePanel({
+      title: "RectTransform [fileID:881729730001825605]",
+      componentType: "RectTransform",
+      componentClassId: 224,
+      componentSource: "builtin",
+    });
+
+    expect(getInspectorPanelDisplayTitle(panel)).toBe("RectTransform [fileID:881729730001825605]");
+  });
+
   it("reports a fallback reason when the component still has no concrete name", () => {
     const panel = makePanel({
       title: "Component (fileID:-42)",
