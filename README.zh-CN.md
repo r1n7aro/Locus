@@ -45,7 +45,7 @@ bun tauri dev
 bun tauri build
 ```
 
-该命令会完成前端构建、生成第三方许可证 bundle，并打包桌面应用。当前默认输出 Windows `NSIS` 安装包，产物位于 `src-tauri/target/release/bundle/nsis/`。
+该命令会重新生成合并后的 Roslyn DLL、完成前端构建、生成第三方许可证 bundle，并打包桌面应用。当前默认输出 Windows `NSIS` 安装包，产物位于 `src-tauri/target/release/bundle/nsis/`。
 
 ## 发布版本
 

@@ -17,7 +17,6 @@ pub enum PluginStatus {
 const PLUGIN_DEFAULT_INSTALL_DIR: &str = "Packages/com.farlocus.locus";
 const PLUGIN_ASMDEF_NAME: &str = "Locus.Editor.asmdef";
 const PLUGIN_HASH_FILE: &str = ".locus_plugin_hash";
-const UNITY_PROJECT_VERSION_FILE: &str = "ProjectSettings/ProjectVersion.txt";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PluginInstallLocation {
@@ -29,30 +28,6 @@ enum PluginInstallLocation {
 struct InstalledPluginDir {
     root: PathBuf,
     location: PluginInstallLocation,
-}
-
-#[derive(Debug, Clone, Default)]
-struct PluginCopyPlan {
-    skip_dll_names: BTreeSet<String>,
-}
-
-impl PluginCopyPlan {
-    fn skips(&self, rel: &Path) -> bool {
-        let Some(file_name) = rel.file_name().and_then(|name| name.to_str()) else {
-            return false;
-        };
-
-        let file_name = file_name.to_ascii_lowercase();
-        if file_name.ends_with(".dll") {
-            return self.skip_dll_names.contains(&file_name);
-        }
-
-        if let Some(dll_name) = file_name.strip_suffix(".meta") {
-            return dll_name.ends_with(".dll") && self.skip_dll_names.contains(dll_name);
-        }
-
-        false
-    }
 }
 
 pub fn find_plugin_source_dir() -> Option<std::path::PathBuf> {
@@ -100,109 +75,6 @@ fn normalize_path_key(path: &Path) -> String {
 
 fn expected_install_dir(project_path: &Path) -> PathBuf {
     project_path.join(PLUGIN_DEFAULT_INSTALL_DIR)
-}
-
-fn parse_unity_major_version(contents: &str) -> Option<u32> {
-    contents.lines().find_map(|line| {
-        let version = line.strip_prefix("m_EditorVersion:")?.trim();
-        let major = version
-            .chars()
-            .take_while(|ch| ch.is_ascii_digit())
-            .collect::<String>();
-        major.parse().ok()
-    })
-}
-
-fn unity_major_version(project_path: &Path) -> Option<u32> {
-    let path = project_path.join(UNITY_PROJECT_VERSION_FILE);
-    let contents = std::fs::read_to_string(&path).ok()?;
-    parse_unity_major_version(&contents)
-}
-
-fn path_is_under_key(path_key: &str, root_key: &str) -> bool {
-    path_key == root_key
-        || path_key
-            .strip_prefix(root_key)
-            .is_some_and(|suffix| suffix.starts_with('/'))
-}
-
-fn collect_dll_names_under(root: &Path, ignored_root_keys: &BTreeSet<String>) -> BTreeSet<String> {
-    if !root.is_dir() {
-        return BTreeSet::new();
-    }
-
-    walkdir::WalkDir::new(root)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|entry| entry.file_type().is_file())
-        .filter_map(|entry| {
-            let path_key = normalize_path_key(entry.path());
-            if ignored_root_keys
-                .iter()
-                .any(|root_key| path_is_under_key(&path_key, root_key))
-            {
-                return None;
-            }
-
-            let file_name = entry.file_name().to_str()?.to_ascii_lowercase();
-            file_name.ends_with(".dll").then_some(file_name)
-        })
-        .collect()
-}
-
-fn collect_project_dll_names(
-    project_path: &Path,
-    ignored_root_keys: &BTreeSet<String>,
-) -> BTreeSet<String> {
-    let roots = [
-        project_path.join("Assets"),
-        project_path.join("Packages"),
-        project_path.join("Library/PackageCache"),
-    ];
-
-    roots
-        .iter()
-        .flat_map(|root| collect_dll_names_under(root, ignored_root_keys))
-        .collect()
-}
-
-fn collect_source_dll_names(source_dir: &Path) -> BTreeSet<String> {
-    collect_dll_names_under(source_dir, &BTreeSet::new())
-}
-
-fn build_copy_plan(
-    source_dir: &Path,
-    project_path: &Path,
-    installed_dirs: &[InstalledPluginDir],
-) -> PluginCopyPlan {
-    let Some(major) = unity_major_version(project_path) else {
-        return PluginCopyPlan::default();
-    };
-    if major > 2021 {
-        return PluginCopyPlan::default();
-    }
-
-    let mut ignored_root_keys = BTreeSet::new();
-    ignored_root_keys.insert(normalize_path_key(&expected_install_dir(project_path)));
-    for dir in installed_dirs {
-        ignored_root_keys.insert(normalize_path_key(&dir.root));
-    }
-
-    let source_dll_names = collect_source_dll_names(source_dir);
-    let project_dll_names = collect_project_dll_names(project_path, &ignored_root_keys);
-    let skip_dll_names = source_dll_names
-        .intersection(&project_dll_names)
-        .cloned()
-        .collect::<BTreeSet<_>>();
-
-    if !skip_dll_names.is_empty() {
-        eprintln!(
-            "[Locus] Unity {} project has duplicate DLLs; skipping Locus copies: {:?}",
-            major, skip_dll_names
-        );
-    }
-
-    PluginCopyPlan { skip_dll_names }
 }
 
 fn find_installed_plugin_dirs(project_path: &Path) -> Vec<InstalledPluginDir> {
@@ -277,11 +149,7 @@ fn remove_plugin_dir(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn copy_plugin_dir_with_plan(
-    source_dir: &Path,
-    install_dir: &Path,
-    plan: &PluginCopyPlan,
-) -> Result<(), String> {
+fn copy_plugin_dir(source_dir: &Path, install_dir: &Path) -> Result<(), String> {
     for entry in walkdir::WalkDir::new(source_dir)
         .into_iter()
         .filter_map(|e| e.ok())
@@ -291,10 +159,6 @@ fn copy_plugin_dir_with_plan(
             .strip_prefix(source_dir)
             .map_err(|e| format!("strip_prefix: {}", e))?;
         let dest = install_dir.join(rel);
-
-        if entry.file_type().is_file() && plan.skips(rel) {
-            continue;
-        }
 
         if entry.file_type().is_dir() {
             std::fs::create_dir_all(&dest)
@@ -311,11 +175,6 @@ fn copy_plugin_dir_with_plan(
     }
 
     Ok(())
-}
-
-#[cfg(test)]
-fn copy_plugin_dir(source_dir: &Path, install_dir: &Path) -> Result<(), String> {
-    copy_plugin_dir_with_plan(source_dir, install_dir, &PluginCopyPlan::default())
 }
 
 fn check_plugin_status_with_source_dir(
@@ -356,8 +215,7 @@ fn check_plugin_status_with_source_dir(
         return Ok(PluginStatus::Outdated);
     }
 
-    let copy_plan = build_copy_plan(source_dir, project_path, &installed_dirs);
-    let source_hash = compute_dir_hash_with_plan(source_dir, &copy_plan)?;
+    let source_hash = compute_dir_hash(source_dir)?;
     let hash_file = install_dir.root.join(PLUGIN_HASH_FILE);
     let installed_hash = std::fs::read_to_string(&hash_file).unwrap_or_default();
 
@@ -384,7 +242,6 @@ fn install_or_update_plugin_with_source_dir(
 ) -> Result<String, String> {
     let install_dir = expected_install_dir(project_path);
     let installed_dirs = find_installed_plugin_dirs(project_path);
-    let copy_plan = build_copy_plan(source_dir, project_path, &installed_dirs);
 
     for dir in installed_dirs {
         remove_plugin_dir(&dir.root)?;
@@ -394,9 +251,9 @@ fn install_or_update_plugin_with_source_dir(
         remove_plugin_dir(&install_dir)?;
     }
 
-    copy_plugin_dir_with_plan(source_dir, &install_dir, &copy_plan)?;
+    copy_plugin_dir(source_dir, &install_dir)?;
 
-    let hash = compute_dir_hash_with_plan(source_dir, &copy_plan)?;
+    let hash = compute_dir_hash(source_dir)?;
     std::fs::write(install_dir.join(PLUGIN_HASH_FILE), &hash)
         .map_err(|e| format!("Failed to write hash file: {}", e))?;
 
@@ -407,15 +264,7 @@ fn install_or_update_plugin_with_source_dir(
     Ok(hash)
 }
 
-#[cfg(test)]
 fn compute_dir_hash(dir: &std::path::Path) -> Result<String, String> {
-    compute_dir_hash_with_plan(dir, &PluginCopyPlan::default())
-}
-
-fn compute_dir_hash_with_plan(
-    dir: &std::path::Path,
-    plan: &PluginCopyPlan,
-) -> Result<String, String> {
     let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
 
     for entry in walkdir::WalkDir::new(dir)
@@ -430,9 +279,6 @@ fn compute_dir_hash_with_plan(
             .path()
             .strip_prefix(dir)
             .map_err(|e| format!("strip_prefix failed: {}", e))?;
-        if plan.skips(rel_path) {
-            continue;
-        }
         let rel = rel_path.to_string_lossy().replace('\\', "/");
         let content = std::fs::read(entry.path()).map_err(|e| format!("read {}: {}", rel, e))?;
         entries.push((rel, content));
@@ -492,7 +338,6 @@ mod tests {
 
     fn create_unity_project(project_root: &Path) {
         std::fs::create_dir_all(project_root.join("Assets")).unwrap();
-        std::fs::create_dir_all(project_root.join("ProjectSettings")).unwrap();
     }
 
     fn write_file(path: &Path, contents: &[u8]) {
@@ -500,22 +345,6 @@ mod tests {
             std::fs::create_dir_all(parent).unwrap();
         }
         std::fs::write(path, contents).unwrap();
-    }
-
-    fn write_project_version(project_root: &Path, version: &str) {
-        write_file(
-            &project_root.join(UNITY_PROJECT_VERSION_FILE),
-            format!("m_EditorVersion: {}\n", version).as_bytes(),
-        );
-    }
-
-    fn write_external_unsafe_dll(project_root: &Path) {
-        write_file(
-            &project_root.join(
-                "Assets/Packages/System.Runtime.CompilerServices.Unsafe.4.7.0/lib/netstandard2.0/System.Runtime.CompilerServices.Unsafe.dll",
-            ),
-            b"external unsafe dll",
-        );
     }
 
     #[test]
@@ -585,12 +414,10 @@ mod tests {
     }
 
     #[test]
-    fn unity_2021_install_skips_locus_duplicate_dlls() {
+    fn install_copies_merged_roslyn_without_original_inputs() {
         let temp = tempfile::tempdir().unwrap();
         let source_dir = fixture_source_dir();
         create_unity_project(temp.path());
-        write_project_version(temp.path(), "2021.3.45f1");
-        write_external_unsafe_dll(temp.path());
 
         install_or_update_plugin_with_source_dir(&source_dir, temp.path()).unwrap();
 
@@ -602,46 +429,28 @@ mod tests {
             .join("Editor/Roslyn/System.Runtime.CompilerServices.Unsafe.dll.meta")
             .exists());
         assert!(installed_root
-            .join("Editor/Roslyn/Microsoft.CodeAnalysis.dll")
+            .join("Editor/Roslyn/Locus.Roslyn.dll")
             .is_file());
+        assert!(!installed_root
+            .join("Editor/Roslyn/Microsoft.CodeAnalysis.dll")
+            .exists());
 
         let status = check_plugin_status_with_source_dir(&source_dir, temp.path()).unwrap();
         assert!(matches!(status, PluginStatus::UpToDate));
     }
 
     #[test]
-    fn unity_2022_install_keeps_locus_duplicate_dlls() {
+    fn update_from_old_plugin_keeps_merged_roslyn() {
         let temp = tempfile::tempdir().unwrap();
         let source_dir = fixture_source_dir();
         create_unity_project(temp.path());
-        write_project_version(temp.path(), "2022.3.58f1");
-        write_external_unsafe_dll(temp.path());
-
-        install_or_update_plugin_with_source_dir(&source_dir, temp.path()).unwrap();
-
-        assert!(temp
-            .path()
-            .join(
-                "Packages/com.farlocus.locus/Editor/Roslyn/System.Runtime.CompilerServices.Unsafe.dll",
-            )
-            .is_file());
-    }
-
-    #[test]
-    fn unity_2021_update_keeps_locus_dll_when_only_old_plugin_has_it() {
-        let temp = tempfile::tempdir().unwrap();
-        let source_dir = fixture_source_dir();
-        create_unity_project(temp.path());
-        write_project_version(temp.path(), "2021.3.45f1");
 
         copy_plugin_dir(&source_dir, &temp.path().join("Assets/Locus")).unwrap();
         install_or_update_plugin_with_source_dir(&source_dir, temp.path()).unwrap();
 
         assert!(temp
             .path()
-            .join(
-                "Packages/com.farlocus.locus/Editor/Roslyn/System.Runtime.CompilerServices.Unsafe.dll",
-            )
+            .join("Packages/com.farlocus.locus/Editor/Roslyn/Locus.Roslyn.dll",)
             .is_file());
     }
 }

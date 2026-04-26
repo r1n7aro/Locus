@@ -45,7 +45,7 @@ This command starts the Vite development server and opens the Tauri desktop app.
 bun tauri build
 ```
 
-This command builds the frontend, generates the third-party license bundle, and packages the desktop app. The default output is a Windows `NSIS` installer under `src-tauri/target/release/bundle/nsis/`.
+This command rebuilds the merged Roslyn DLL, builds the frontend, generates the third-party license bundle, and packages the desktop app. The default output is a Windows `NSIS` installer under `src-tauri/target/release/bundle/nsis/`.
 
 ## Releases
 

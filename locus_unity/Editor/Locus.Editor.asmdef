@@ -9,13 +9,7 @@
     "allowUnsafeCode": false,
     "overrideReferences": true,
     "precompiledReferences": [
-        "Microsoft.CodeAnalysis.dll",
-        "Microsoft.CodeAnalysis.CSharp.dll",
-        "Microsoft.CodeAnalysis.Scripting.dll",
-        "Microsoft.CodeAnalysis.CSharp.Scripting.dll",
-        "System.Collections.Immutable.dll",
-        "System.Reflection.Metadata.dll",
-        "System.Runtime.CompilerServices.Unsafe.dll"
+        "Locus.Roslyn.dll"
     ],
     "autoReferenced": false,
     "defineConstraints": [],
