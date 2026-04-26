@@ -926,17 +926,16 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
                 "
               >
                 <span
-                  v-if="entry.row.node.kind === 'folder'"
+                  v-if="
+                    entry.row.node.kind === 'folder' &&
+                    entry.row.directChildCount > 0
+                  "
                   class="kx-branch-slot"
-                  :class="{ 'is-empty': entry.row.directChildCount === 0 }"
                   @click.stop="toggleExpansion(entry.row)"
                 >
                   <svg
                     class="kx-chevron"
-                    :class="{
-                      open: entry.row.expanded,
-                      empty: entry.row.directChildCount === 0,
-                    }"
+                    :class="{ open: entry.row.expanded }"
                     viewBox="0 0 16 16"
                     width="10"
                     height="10"
@@ -947,6 +946,11 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
                     />
                   </svg>
                 </span>
+                <span
+                  v-else-if="entry.row.node.kind === 'folder'"
+                  class="kx-branch-spacer"
+                  aria-hidden="true"
+                ></span>
                 <span
                   v-if="entry.row.node.kind === 'folder'"
                   class="kx-kind-icon folder"
@@ -1497,10 +1501,6 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
 
 .kx-chevron.open {
   transform: rotate(90deg);
-}
-
-.kx-chevron.empty {
-  opacity: 0.24;
 }
 
 .kx-kind-icon {

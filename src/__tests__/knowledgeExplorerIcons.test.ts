@@ -18,4 +18,13 @@ describe("KnowledgeExplorer row icons", () => {
     expect(explorer).toContain('<span class="kx-bullet"></span>');
     expect(explorer).toContain(".kx-kind-icon.folder {");
   });
+
+  it("uses a spacer instead of a chevron for folders without child rows", () => {
+    const explorer = read("src/components/knowledge/KnowledgeExplorer.vue");
+
+    expect(explorer).toContain("entry.row.directChildCount > 0");
+    expect(explorer).toContain('class="kx-branch-spacer"');
+    expect(explorer).not.toContain("empty: entry.row.directChildCount === 0");
+    expect(explorer).not.toContain(".kx-chevron.empty");
+  });
 });
