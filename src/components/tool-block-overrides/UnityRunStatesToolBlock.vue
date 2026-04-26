@@ -87,6 +87,7 @@ const statusIcon = computed(() => {
 });
 
 const hasPrints = computed(() => (runtimePreview.value?.printText.trim().length ?? 0) > 0);
+const showRuntimePrintText = computed(() => props.toolCall.status === "running" && hasPrints.value);
 
 const runtimeProgressSummary = computed(() => {
   const runtime = runtimePreview.value;
@@ -112,7 +113,10 @@ const printFallback = computed(() =>
 
 const showFinalSections = computed(() => props.toolCall.status !== "running");
 const hasInfoDetail = computed(() => showFinalSections.value);
-const isFramed = computed(() => infoExpanded.value || Boolean(runtimePreview.value));
+const headerSummary = computed(() => (showFinalSections.value ? runtimeProgressSummary.value : ""));
+const showRuntimeProgressLine = computed(() => props.toolCall.status === "running" && Boolean(runtimePreview.value));
+const isFramed = computed(() => infoExpanded.value || showRuntimeProgressLine.value);
+const showRuntimePrintFallback = computed(() => showRuntimeProgressLine.value && !showRuntimePrintText.value);
 </script>
 
 <template>
@@ -129,13 +133,14 @@ const isFramed = computed(() => infoExpanded.value || Boolean(runtimePreview.val
         <span v-else class="tool-call-status-dot"></span>
       </span>
       <span class="tool-call-name">{{ toolCall.name }}</span>
+      <span v-if="headerSummary" class="tool-call-summary">{{ headerSummary }}</span>
     </button>
 
-    <div v-if="runtimePreview" class="tool-call-progress-line" aria-live="polite">
+    <div v-if="showRuntimeProgressLine" class="tool-call-progress-line" aria-live="polite">
       <div class="unity-run-progress">
         <div v-if="runtimeProgressSummary" class="unity-run-progress-summary">{{ runtimeProgressSummary }}</div>
-        <pre v-if="hasPrints" class="unity-run-print-text ui-select-text">{{ runtimePreview.printText }}</pre>
-        <div v-else class="unity-run-empty">{{ printFallback }}</div>
+        <pre v-if="showRuntimePrintText" class="unity-run-print-text ui-select-text">{{ runtimePreview?.printText ?? "" }}</pre>
+        <div v-else-if="showRuntimePrintFallback" class="unity-run-empty">{{ printFallback }}</div>
       </div>
     </div>
 
@@ -152,7 +157,6 @@ const isFramed = computed(() => infoExpanded.value || Boolean(runtimePreview.val
           <UnityRunStatesOutputPreview
             v-if="outputPreview"
             :preview="outputPreview"
-            hide-prints
           />
           <pre v-else class="tool-call-pre ui-select-text" :class="{ 'error-output': toolCall.status === 'error' }">{{ displayOutput }}</pre>
         </div>
@@ -170,10 +174,10 @@ const isFramed = computed(() => infoExpanded.value || Boolean(runtimePreview.val
   max-width: 100%;
   margin: 0;
   padding: 0;
-  border: 1px solid transparent;
-  border-radius: 6px;
+  border: 0;
+  border-radius: 0;
   background: transparent;
-  overflow: hidden;
+  overflow: visible;
   font-size: 13px;
   transition: background 0.18s ease, border-color 0.18s ease, border-radius 0.18s ease, padding 0.18s ease;
 }
