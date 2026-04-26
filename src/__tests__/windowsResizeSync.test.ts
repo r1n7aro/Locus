@@ -37,7 +37,7 @@ describe("native Windows resize sync", () => {
     expect(sync).toContain("proposed_client_dimension(window_pos.cx, metrics.frame_width)");
     expect(sync).toContain("proposed_client_dimension(window_pos.cy, metrics.frame_height)");
     expect(sync).toContain("publish_native_client_size");
-    expect(sync).toContain(".emit(NATIVE_CLIENT_SIZE_EVENT");
+    expect(sync).toMatch(/\.emit\(\s*NATIVE_CLIENT_SIZE_EVENT/);
     expect(sync).toContain("publish_native_client_size(state, proposed_client_width, proposed_client_height)");
     expect(sync).toContain("resize_target_active");
     expect(sync).toContain("state.resize_target_left = proposed_left;");
@@ -57,7 +57,9 @@ describe("native Windows resize sync", () => {
     expect(sync).toContain("if !width_changed && !height_changed");
     expect(sync).toContain("let horizontal_resize = width_changed && (right_stable || left_stable);");
     expect(sync).toContain("let vertical_resize = height_changed && (bottom_stable || top_stable);");
-    expect(sync).toContain("sync_webview_bounds_at(state, 0, 0, current_client_width, current_client_height, true)");
+    expect(sync).toMatch(
+      /sync_webview_bounds_at\(\s*state,\s*0,\s*0,\s*current_client_width,\s*current_client_height,\s*true,?\s*\)/,
+    );
     expect(sync).toContain("sync_from_client_rect(state.parent_hwnd, state, true)");
     expect(sync).toContain("sync_from_client_rect(state.parent_hwnd, state, force)");
     expect(sync).toContain("let result = unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) };");
