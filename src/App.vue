@@ -1182,10 +1182,10 @@ body.is-dragging-select-lock * {
 
 .workspace-selector {
   -webkit-app-region: no-drag;
-  flex: 0 1 280px;
-  width: 280px;
+  flex: 0 1 220px;
+  width: 220px;
   min-width: 120px;
-  max-width: 280px;
+  max-width: 220px;
   position: relative;
   margin-right: 6px;
 }
