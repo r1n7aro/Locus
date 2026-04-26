@@ -354,6 +354,7 @@ export interface KnowledgeChangedEvent {
 /** Every StreamEvent is wrapped in an envelope that carries a runId for filtering stale events. */
 export type StreamEvent = { runId: string } & (
   | { type: "runStart"; sessionId: string }
+  | { type: "userMessage"; sessionId: string; message: ChatMessage }
   | { type: "textDelta"; sessionId: string; text: string }
   | { type: "thinkingDelta"; sessionId: string; text: string }
   | {

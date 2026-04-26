@@ -1,4 +1,5 @@
-import type { StreamEvent, ChatMessage, TokenUsage, TodoItem, ToolCallDisplay, PendingQuestion, PendingToolConfirm } from "../types";
+import { hydrateChatMessageIntent } from "./chatInputIntents";
+import type { StreamEvent, ChatMessage, TokenUsage, TodoItem, ToolCallDisplay, PendingQuestion, PendingToolConfirm, ImageAttachment } from "../types";
 
 export interface StreamState {
   messages: ChatMessage[];
@@ -30,6 +31,7 @@ export type StreamMutation =
   | { type: "appendToolDelta"; id: string; delta: string }
   | { type: "pushMessage"; message: ChatMessage }
   | { type: "upsertMessage"; message: ChatMessage }
+  | { type: "upsertUserMessage"; message: ChatMessage }
   | { type: "replaceMessages"; messages: ChatMessage[] }
   | { type: "pushToolResults" }
   | { type: "resetRound" }
@@ -58,6 +60,43 @@ export function buildToolResultMessages(
     }));
 }
 
+function pendingUserMessageId(id: string): boolean {
+  return id.startsWith("user_pending_") || id.startsWith("embedded_user_");
+}
+
+function imageFingerprint(images: ImageAttachment[] | undefined): string {
+  return (images ?? [])
+    .map((image) => `${image.mimeType}\u{0}${image.data}`)
+    .join("\u{1}");
+}
+
+function isMatchingPendingUserMessage(candidate: ChatMessage, message: ChatMessage): boolean {
+  if (candidate.role !== "user" || !pendingUserMessageId(candidate.id)) return false;
+  if (imageFingerprint(candidate.images) !== imageFingerprint(message.images)) return false;
+  if (candidate.content === message.content) return true;
+  if (candidate.thinkingSignature && candidate.thinkingSignature === message.thinkingSignature) return true;
+  return Math.abs(candidate.createdAt - message.createdAt) <= 60;
+}
+
+export function mergeUserMessage(messages: ChatMessage[], incoming: ChatMessage): ChatMessage[] {
+  const message = hydrateChatMessageIntent(incoming);
+  const existingIndex = messages.findIndex((item) => item.id === message.id);
+  if (existingIndex >= 0) {
+    const next = [...messages];
+    next.splice(existingIndex, 1, message);
+    return next;
+  }
+
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (!isMatchingPendingUserMessage(messages[index]!, message)) continue;
+    const next = [...messages];
+    next.splice(index, 1, message);
+    return next;
+  }
+
+  return [...messages, message];
+}
+
 export function reduceStreamEvent(state: StreamState, event: StreamEvent): StreamMutation[] {
   const mutations: StreamMutation[] = [];
 
@@ -66,6 +105,10 @@ export function reduceStreamEvent(state: StreamState, event: StreamEvent): Strea
   // cancelled run are filtered by runId in the chat store.
 
   switch (event.type) {
+    case "userMessage":
+      mutations.push({ type: "upsertUserMessage", message: event.message });
+      break;
+
     case "textDelta":
       mutations.push({ type: "appendRawText", text: event.text });
       if (state.isThinking && state.thinkingStartTime > 0) {

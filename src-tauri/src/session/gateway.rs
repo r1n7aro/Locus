@@ -15,6 +15,7 @@ const RUN_STATUS_ERROR: &str = "error";
 fn event_session_id(event: &StreamEvent) -> &str {
     match event {
         StreamEvent::RunStart { session_id }
+        | StreamEvent::UserMessage { session_id, .. }
         | StreamEvent::TextDelta { session_id, .. }
         | StreamEvent::ThinkingDelta { session_id, .. }
         | StreamEvent::ToolCallStart { session_id, .. }
@@ -40,6 +41,7 @@ fn event_session_id(event: &StreamEvent) -> &str {
 fn event_type(event: &StreamEvent) -> &'static str {
     match event {
         StreamEvent::RunStart { .. } => "runStart",
+        StreamEvent::UserMessage { .. } => "userMessage",
         StreamEvent::TextDelta { .. } => "textDelta",
         StreamEvent::ThinkingDelta { .. } => "thinkingDelta",
         StreamEvent::ToolCallStart { .. } => "toolCallStart",
@@ -65,6 +67,7 @@ fn event_type(event: &StreamEvent) -> &'static str {
 fn run_status_for_event(event: &StreamEvent) -> Option<(&'static str, Option<String>)> {
     match event {
         StreamEvent::RunStart { .. }
+        | StreamEvent::UserMessage { .. }
         | StreamEvent::TextDelta { .. }
         | StreamEvent::ThinkingDelta { .. }
         | StreamEvent::ToolCallStart { .. }

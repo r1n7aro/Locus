@@ -22,25 +22,28 @@ pub(super) fn unity_execute() -> ToolDef {
                     }
                 };
 
-                let claimed_status = match args.get("editor_status").and_then(|v| v.as_str()) {
-                    Some(s) => s.to_string(),
+                let requested_status = match args
+                    .get("request_editor_status")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    Some(status) => status,
                     None => {
                         return ToolResult {
-                            output: format!(
-                                "Missing required parameter: editor_status. You must pass the current Unity Editor status ({}) exactly as shown in the Environment section.",
-                                crate::unity_bridge::UNITY_EDITOR_STATUS_SCHEMA
-                            ),
+                            output: "Missing required parameter: request_editor_status".to_string(),
                             is_error: true,
                         }
                     }
                 };
 
-                if !crate::unity_bridge::is_known_editor_status(&claimed_status) {
+                if requested_status == crate::unity_bridge::UNITY_EDITOR_STATUS_DISCONNECTED
+                    || !crate::unity_bridge::is_known_editor_status(requested_status)
+                {
                     return ToolResult {
                         output: format!(
-                            "Invalid editor_status: \"{}\". Allowed values: {}.",
-                            claimed_status,
-                            crate::unity_bridge::UNITY_EDITOR_STATUS_SCHEMA
+                            "Invalid request_editor_status: '{}'. Allowed values: editing, playing, playing_paused.",
+                            requested_status
                         ),
                         is_error: true,
                     };
@@ -56,22 +59,21 @@ pub(super) fn unity_execute() -> ToolDef {
                     }
                 };
 
-                // Verify editor_status matches actual Unity state
-                let (_connected, actual_status, _scene) =
+                let (connected, actual_status, _scene) =
                     crate::unity_bridge::query_unity_status(&project_path).await;
-                if claimed_status != actual_status {
+                if !connected {
                     return ToolResult {
-                        output: format!(
-                            "editor_status mismatch: you claimed \"{}\", but the actual editor status is \"{}\". Re-read the current editor state and try again.",
-                            claimed_status, actual_status
-                        ),
+                        output: "Unity Editor not connected".to_string(),
                         is_error: true,
                     };
                 }
 
-                if actual_status == crate::unity_bridge::UNITY_EDITOR_STATUS_DISCONNECTED {
+                if actual_status != requested_status {
                     return ToolResult {
-                        output: "Unity Editor status is \"disconnected\". `unity_execute` is unavailable until the Editor reconnects.".to_string(),
+                        output: format!(
+                            "Unity Editor status is \"{}\". `unity_execute` requires \"{}\".",
+                            actual_status, requested_status
+                        ),
                         is_error: true,
                     };
                 }

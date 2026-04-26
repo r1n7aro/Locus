@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { buildToolResultMessages, reduceStreamEvent, type StreamState } from "../composables/useStreamReducer";
+import { buildToolResultMessages, mergeUserMessage, reduceStreamEvent, type StreamState } from "../composables/useStreamReducer";
 import type { StreamEvent, ToolCallDisplay } from "../types";
 
 function makeState(overrides?: Partial<StreamState>): StreamState {
@@ -311,6 +311,52 @@ describe("reduceStreamEvent", () => {
         type: "upsertMessage",
         message: event.message,
       });
+    });
+  });
+
+  describe("userMessage", () => {
+    it("emits a dedicated mutation for persisted user messages", () => {
+      const event: StreamEvent = {
+        runId: "test-run",
+        type: "userMessage",
+        sessionId: "s1",
+        message: {
+          id: "user-1",
+          role: "user",
+          content: "hello",
+          createdAt: 10,
+        },
+      };
+
+      expect(reduceStreamEvent(makeState(), event)).toContainEqual({
+        type: "upsertUserMessage",
+        message: event.message,
+      });
+    });
+
+    it("replaces the optimistic pending user message with the persisted message", () => {
+      const messages = mergeUserMessage([
+        {
+          id: "user_pending_1",
+          role: "user",
+          content: "hello",
+          createdAt: 10,
+        },
+      ], {
+        id: "user-1",
+        role: "user",
+        content: "hello",
+        createdAt: 10,
+      });
+
+      expect(messages).toEqual([
+        {
+          id: "user-1",
+          role: "user",
+          content: "hello",
+          createdAt: 10,
+        },
+      ]);
     });
   });
 

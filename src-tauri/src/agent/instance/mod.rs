@@ -3740,7 +3740,7 @@ impl AgentInstance {
         } else {
             None
         };
-        let _current_message_id = store.add_message_with_images_and_signature(
+        let current_message_id = store.add_message_with_images_and_signature(
             &self.session_id,
             MessageRole::User,
             &actual_user_text,
@@ -3756,6 +3756,20 @@ impl AgentInstance {
                 env_prompt_prefix.as_deref(),
             )?;
         }
+        let current_user_message = store
+            .get_messages(&self.session_id)?
+            .into_iter()
+            .find(|message| message.id == current_message_id)
+            .ok_or_else(|| {
+                format!(
+                    "Persisted user message not found: session={} message={}",
+                    self.session_id, current_message_id
+                )
+            })?;
+        emit_stream(app_handle, &run_id, StreamEvent::UserMessage {
+            session_id: self.session_id.clone(),
+            message: current_user_message,
+        });
         eprintln!(
             "[Agent {}] user message persisted: session={} run={} elapsed_ms={} prefix_chars={} suffix_chars={} updated_first_message_prefix={}",
             self.id,
@@ -5105,6 +5119,7 @@ impl AgentInstance {
     async fn request_unity_editor_status_change_confirm(
         &self,
         app_handle: &AppHandle,
+        tool_name: &str,
         tool_call_id: &str,
         current_status: &str,
         requested_status: &str,
@@ -5135,7 +5150,7 @@ impl AgentInstance {
                 tool_call_id: tool_call_id.to_string(),
                 display: ToolConfirmDisplay::UnityEditorStatusChange(
                     UnityEditorStatusChangeConfirmDisplay {
-                        tool_name: "unity_run_states".to_string(),
+                        tool_name: tool_name.to_string(),
                         current_status: current_status.to_string(),
                         requested_status: requested_status.to_string(),
                     },
@@ -5144,8 +5159,8 @@ impl AgentInstance {
         );
 
         eprintln!(
-            "[Agent {}] unity_run_states status change confirm: waiting for user approval (question_id={})",
-            self.id, question_id
+            "[Agent {}] {} status change confirm: waiting for user approval (question_id={})",
+            self.id, tool_name, question_id
         );
 
         let mut cancel_rx = self.cancel_waiter();
@@ -5165,15 +5180,15 @@ impl AgentInstance {
                     ToolConfirmDecision::Deny { feedback: None } => "denied".to_string(),
                 };
                 eprintln!(
-                    "[Agent {}] unity_run_states status change confirm: user {} (question_id={})",
-                    self.id, status, question_id
+                    "[Agent {}] {} status change confirm: user {} (question_id={})",
+                    self.id, tool_name, status, question_id
                 );
                 decision
             }
             Some(Err(_)) => {
                 eprintln!(
-                    "[Agent {}] unity_run_states status change confirm: cancelled (question_id={})",
-                    self.id, question_id
+                    "[Agent {}] {} status change confirm: cancelled (question_id={})",
+                    self.id, tool_name, question_id
                 );
                 ToolConfirmDecision::Deny { feedback: None }
             }
@@ -5182,8 +5197,8 @@ impl AgentInstance {
                 let mut store = question_store.lock().await;
                 store.remove(&question_id);
                 eprintln!(
-                    "[Agent {}] unity_run_states status change confirm: interrupted (question_id={})",
-                    self.id, question_id
+                    "[Agent {}] {} status change confirm: interrupted (question_id={})",
+                    self.id, tool_name, question_id
                 );
                 ToolConfirmDecision::Deny { feedback: None }
             }
@@ -6088,25 +6103,28 @@ impl AgentInstance {
             }
         };
 
-        let claimed_status = match args.get("editor_status").and_then(|value| value.as_str()) {
+        let requested_status = match args
+            .get("request_editor_status")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
             Some(status) => status,
             None => {
                 return ToolResult {
-                    output: format!(
-                        "Missing required parameter: editor_status. You must pass the current Unity Editor status ({}) exactly as shown in the Environment section.",
-                        crate::unity_bridge::UNITY_EDITOR_STATUS_SCHEMA
-                    ),
+                    output: "Missing required parameter: request_editor_status".to_string(),
                     is_error: true,
                 };
             }
         };
 
-        if !crate::unity_bridge::is_known_editor_status(claimed_status) {
+        if requested_status == crate::unity_bridge::UNITY_EDITOR_STATUS_DISCONNECTED
+            || !crate::unity_bridge::is_known_editor_status(requested_status)
+        {
             return ToolResult {
                 output: format!(
-                    "Invalid editor_status: \"{}\". Allowed values: {}.",
-                    claimed_status,
-                    crate::unity_bridge::UNITY_EDITOR_STATUS_SCHEMA
+                    "Invalid request_editor_status: '{}'. Allowed values: editing, playing, playing_paused.",
+                    requested_status
                 ),
                 is_error: true,
             };
@@ -6120,25 +6138,51 @@ impl AgentInstance {
             };
         }
 
-        let (_connected, actual_status, _scene) =
+        let (connected, current_status, _scene) =
             crate::unity_bridge::query_unity_status(&self.working_dir).await;
-        if claimed_status != actual_status {
+        if !connected {
             return ToolResult {
-                output: format!(
-                    "editor_status mismatch: you claimed \"{}\", but the actual editor status is \"{}\". Re-read the current editor state and try again.",
-                    claimed_status, actual_status
-                ),
+                output: "Unity Editor not connected".to_string(),
                 is_error: true,
             };
         }
 
-        if actual_status == crate::unity_bridge::UNITY_EDITOR_STATUS_DISCONNECTED {
-            return ToolResult {
-                output:
-                    "Unity Editor status is \"disconnected\". `unity_execute` is unavailable until the Editor reconnects."
-                        .to_string(),
-                is_error: true,
-            };
+        if current_status != requested_status {
+            match self
+                .request_unity_editor_status_change_confirm(
+                    app_handle,
+                    "unity_execute",
+                    tool_call_id,
+                    current_status,
+                    requested_status,
+                    run_id,
+                )
+                .await
+            {
+                ToolConfirmDecision::Allow => {}
+                ToolConfirmDecision::Deny { feedback } => {
+                    let output = match feedback {
+                        Some(feedback) => format!(
+                            "Unity Editor status change was rejected by user feedback.\nUser feedback: {}",
+                            feedback
+                        ),
+                        None => "user_denied_editor_state_change".to_string(),
+                    };
+                    return ToolResult {
+                        output,
+                        is_error: true,
+                    };
+                }
+            }
+
+            if let Err(error) =
+                crate::unity_bridge::set_editor_status(&self.working_dir, requested_status).await
+            {
+                return ToolResult {
+                    output: format!("Failed to change Unity Editor status: {}", error),
+                    is_error: true,
+                };
+            }
         }
 
         let handle = app_handle.clone();
@@ -6298,6 +6342,7 @@ impl AgentInstance {
             match self
                 .request_unity_editor_status_change_confirm(
                     app_handle,
+                    "unity_run_states",
                     tool_call_id,
                     &current_status,
                     requested_status,

@@ -14,6 +14,7 @@ import { getLocusRuntime, type RuntimeUnsubscribe } from "../services/locusRunti
 import * as sessionService from "../services/session";
 import {
   buildToolResultMessages,
+  mergeUserMessage,
   reduceStreamEvent,
   type StreamMutation,
   type StreamState,
@@ -207,6 +208,9 @@ function applyMutation(state: EmbeddedChatState, mutation: StreamMutation) {
       }
       break;
     }
+    case "upsertUserMessage":
+      state.messages = mergeUserMessage(state.messages, mutation.message);
+      break;
     case "replaceMessages":
       state.messages = [...mutation.messages];
       break;

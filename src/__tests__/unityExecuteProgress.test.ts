@@ -68,6 +68,17 @@ describe("unityExecuteProgress", () => {
     expect(read("tools/unity_execute.json")).toContain("reports progress to the Locus tool call panel");
   });
 
+  it("requires unity_execute request_editor_status like unity_run_states", () => {
+    const unityExecuteDefinition = JSON.parse(read("tools/unity_execute.json"));
+    const unityRunStatesDefinition = JSON.parse(read("tools/unity_run_states.json"));
+
+    expect(unityExecuteDefinition.parameters.properties.request_editor_status).toEqual(
+      unityRunStatesDefinition.parameters.properties.request_editor_status,
+    );
+    expect(unityExecuteDefinition.parameters.required).toContain("request_editor_status");
+    expect(unityExecuteDefinition.parameters.required).not.toContain("editor_status");
+  });
+
   it("keeps unity_execute progress above the collapsible tool details", () => {
     const source = read("src/components/tool-block-overrides/UnityExecuteToolBlock.vue");
     const headerIndex = source.indexOf("class=\"tool-call-header");

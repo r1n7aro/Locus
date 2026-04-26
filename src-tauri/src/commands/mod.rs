@@ -35,6 +35,11 @@ pub enum StreamEvent {
     #[serde(rename_all = "camelCase")]
     RunStart { session_id: String },
     #[serde(rename_all = "camelCase")]
+    UserMessage {
+        session_id: String,
+        message: crate::session::models::ChatMessage,
+    },
+    #[serde(rename_all = "camelCase")]
     TextDelta { session_id: String, text: String },
     #[serde(rename_all = "camelCase")]
     ThinkingDelta { session_id: String, text: String },

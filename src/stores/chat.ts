@@ -7,7 +7,7 @@ import { normalizeAppError } from "../services/errors";
 import { getToolPermissionMode, saveToolPermissionMode } from "../services/permissions";
 import * as sessionService from "../services/session";
 import * as undoService from "../services/undo";
-import { buildToolResultMessages, reduceStreamEvent, type StreamMutation } from "../composables/useStreamReducer";
+import { buildToolResultMessages, mergeUserMessage, reduceStreamEvent, type StreamMutation } from "../composables/useStreamReducer";
 import { hydrateChatMessagesIntent } from "../composables/chatInputIntents";
 import type { SessionScrollState } from "../composables/chatScrollState";
 import { t } from "../i18n";
@@ -751,6 +751,9 @@ export const useChatStore = defineStore("chat", () => {
         break;
       case "upsertMessage":
         messages.value = replaceMessageById(messages.value, m.message);
+        break;
+      case "upsertUserMessage":
+        messages.value = mergeUserMessage(messages.value, m.message);
         break;
       case "replaceMessages":
         messages.value = hydrateMessages(m.messages);
