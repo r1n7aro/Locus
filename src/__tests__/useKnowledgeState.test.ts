@@ -1,10 +1,12 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { nextTick, reactive } from "vue";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createRenderer, defineComponent, nextTick, reactive } from "vue";
 import { createPinia, setActivePinia } from "pinia";
 import { useKnowledgeState } from "../composables/useKnowledgeState";
 import type {
   FeishuReferenceImportStatus,
+  KnowledgeChangedEvent,
   KnowledgeDocumentSummary,
+  KnowledgeSearchResult,
   UnityReferenceImportStatus,
 } from "../types";
 
@@ -22,6 +24,10 @@ const feishuReferenceImportWindowMocks = vi.hoisted(() => ({
 
 const unityReferenceImportWindowMocks = vi.hoisted(() => ({
   openUnityReferenceImportProgressWindow: vi.fn(),
+}));
+
+const tauriEventMocks = vi.hoisted(() => ({
+  listen: vi.fn(),
 }));
 
 const knowledgeMocks = vi.hoisted(() => ({
@@ -97,9 +103,7 @@ vi.mock("../composables/warmupCache", () => ({
 vi.mock("../stores/notification", () => ({
   useNotificationStore: () => notificationStoreMocks,
 }));
-vi.mock("@tauri-apps/api/event", () => ({
-  listen: vi.fn(async () => () => {}),
-}));
+vi.mock("@tauri-apps/api/event", () => tauriEventMocks);
 vi.mock("@tauri-apps/api/window", () => ({
   getCurrentWindow: () => ({
     isMaximized: async () => false,
@@ -193,10 +197,86 @@ async function flushPromises(rounds = 4) {
   }
 }
 
+type KnowledgeStateProps = {
+  workingDir: string;
+  selectedModelId: string;
+  modelDefaults: any;
+};
+
+type TauriEventHandler<T> = (event: { payload: T }) => void;
+
+let tauriEventHandlers: Record<string, TauriEventHandler<any>[]> = {};
+
+function emitTauriEvent<T>(eventName: string, payload: T) {
+  for (const handler of tauriEventHandlers[eventName] ?? []) {
+    handler({ payload });
+  }
+}
+
+const testRenderer = createRenderer<any, any>({
+  patchProp() {},
+  insert(child, parent) {
+    parent.children ??= [];
+    parent.children.push(child);
+  },
+  remove() {},
+  createElement(type) {
+    return { type, children: [] };
+  },
+  createText(text) {
+    return { text };
+  },
+  createComment(text) {
+    return { comment: text };
+  },
+  setText(node, text) {
+    node.text = text;
+  },
+  setElementText(node, text) {
+    node.text = text;
+  },
+  parentNode() {
+    return null;
+  },
+  nextSibling() {
+    return null;
+  },
+});
+
+function mountKnowledgeState(props: KnowledgeStateProps) {
+  let state: ReturnType<typeof useKnowledgeState> | null = null;
+  const Root = defineComponent({
+    setup() {
+      state = useKnowledgeState(props);
+      return () => null;
+    },
+  });
+  const app = testRenderer.createApp(Root);
+  app.mount({ children: [] });
+  if (!state) throw new Error("useKnowledgeState did not mount");
+  return {
+    state,
+    unmount: () => app.unmount(),
+  };
+}
+
 describe("useKnowledgeState", () => {
   beforeEach(() => {
     setActivePinia(createPinia());
     vi.clearAllMocks();
+    vi.useRealTimers();
+    tauriEventHandlers = {};
+    tauriEventMocks.listen.mockImplementation(
+      async (eventName: string, handler: TauriEventHandler<any>) => {
+        tauriEventHandlers[eventName] ??= [];
+        tauriEventHandlers[eventName].push(handler);
+        return () => {
+          tauriEventHandlers[eventName] = (
+            tauriEventHandlers[eventName] ?? []
+          ).filter((entry) => entry !== handler);
+        };
+      },
+    );
     knowledgeDownloadWindowMocks.openKnowledgeDownloadProgressWindow.mockResolvedValue(
       undefined,
     );
@@ -682,6 +762,10 @@ describe("useKnowledgeState", () => {
     }));
   });
 
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   it("loads unified knowledge documents and computes catalog stats", async () => {
     const state = useKnowledgeState(
       reactive({
@@ -703,6 +787,190 @@ describe("useKnowledgeState", () => {
       kind: "folder",
       name: "combat",
     });
+  });
+
+  it("reloads the active knowledge list when the workspace changes", async () => {
+    let currentDocs: KnowledgeDocumentSummary[] = [
+      {
+        id: "design-a",
+        type: "design",
+        path: "repo-a.md",
+        title: "Repo A",
+        scope: "project",
+        injectMode: "excerpt",
+        summaryEnabled: true,
+        commandEnabled: false,
+        readOnly: false,
+        aiMaintained: false,
+        explicitMaintenanceRules: false,
+        summary: "A",
+        createdAt: 1,
+        updatedAt: 2,
+        hasSummary: true,
+      },
+    ];
+    knowledgeMocks.knowledgeList.mockImplementation(async () => currentDocs);
+    knowledgeMocks.knowledgeListDirectories.mockResolvedValue([]);
+    const props = reactive({
+      workingDir: "F:/repo-a",
+      selectedModelId: "",
+      modelDefaults: {} as any,
+    });
+    const state = useKnowledgeState(props);
+
+    await state.refreshKnowledgeData({ includeOverview: false });
+    expect(state.documents.value.map((doc) => doc.path)).toEqual([
+      "repo-a.md",
+    ]);
+
+    currentDocs = [
+      {
+        id: "design-b",
+        type: "design",
+        path: "repo-b.md",
+        title: "Repo B",
+        scope: "project",
+        injectMode: "excerpt",
+        summaryEnabled: true,
+        commandEnabled: false,
+        readOnly: false,
+        aiMaintained: false,
+        explicitMaintenanceRules: false,
+        summary: "B",
+        createdAt: 3,
+        updatedAt: 4,
+        hasSummary: true,
+      },
+    ];
+    props.workingDir = "F:/repo-b";
+    await nextTick();
+    await flushPromises(8);
+
+    expect(state.documents.value.map((doc) => doc.path)).toEqual([
+      "repo-b.md",
+    ]);
+    expect(knowledgeMocks.knowledgeList).toHaveBeenCalledTimes(2);
+  });
+
+  it("drops queued external knowledge changes after the workspace changes", async () => {
+    vi.useFakeTimers();
+    const props = reactive({
+      workingDir: "F:/repo-a",
+      selectedModelId: "",
+      modelDefaults: {} as any,
+    });
+    const mounted = mountKnowledgeState(props);
+    await flushPromises(8);
+    knowledgeMocks.knowledgeList.mockClear();
+
+    emitTauriEvent<KnowledgeChangedEvent>("knowledge-changed", {
+      workingDir: "F:/repo-a",
+      source: "knowledge_fs_watcher",
+      changedAt: 1,
+      docType: "design",
+      path: "old-project.md",
+      parentPath: "",
+      targetKind: "document",
+      changeKind: "content",
+      subtree: false,
+    });
+
+    props.workingDir = "F:/repo-b";
+    await nextTick();
+    await flushPromises(4);
+    vi.advanceTimersByTime(100);
+    await flushPromises(8);
+
+    expect(knowledgeMocks.knowledgeList).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "design",
+        pathPrefix: "old-project.md",
+      }),
+    );
+    mounted.unmount();
+  });
+
+  it("drops in-flight search results after the workspace changes", async () => {
+    vi.useFakeTimers();
+    const searchDeferred: {
+      resolve?: (results: KnowledgeSearchResult[]) => void;
+    } = {};
+    knowledgeMocks.knowledgeQuery.mockImplementationOnce(
+      () =>
+        new Promise<KnowledgeSearchResult[]>((resolve) => {
+          searchDeferred.resolve = resolve;
+        }),
+    );
+    const props = reactive({
+      workingDir: "F:/repo-a",
+      selectedModelId: "",
+      modelDefaults: {} as any,
+    });
+    const state = useKnowledgeState(props);
+
+    state.searchQuery.value = "old project";
+    await nextTick();
+    vi.advanceTimersByTime(220);
+    await flushPromises(4);
+    expect(knowledgeMocks.knowledgeQuery).toHaveBeenCalledTimes(1);
+
+    props.workingDir = "F:/repo-b";
+    await nextTick();
+    await flushPromises(4);
+    searchDeferred.resolve!([
+      {
+        id: "old-result",
+        type: "design",
+        path: "old-project.md",
+        title: "Old Project",
+        scope: "project",
+        injectMode: "excerpt",
+        aiMaintained: false,
+        snippet: "stale",
+        matchKind: "lexical",
+        score: 1,
+      },
+    ]);
+    await flushPromises(8);
+
+    expect(state.searchResults.value).toEqual([]);
+    expect(state.searching.value).toBe(false);
+  });
+
+  it("drops stale reference status refresh results after the workspace changes", async () => {
+    const statusDeferred: {
+      resolve?: (status: FeishuReferenceImportStatus) => void;
+    } = {};
+    knowledgeMocks.knowledgeGetFeishuReferenceImportStatus.mockImplementationOnce(
+      () =>
+        new Promise<FeishuReferenceImportStatus>((resolve) => {
+          statusDeferred.resolve = resolve;
+        }),
+    );
+    const props = reactive({
+      workingDir: "F:/repo-a",
+      selectedModelId: "",
+      modelDefaults: {} as any,
+    });
+    const state = useKnowledgeState(props);
+
+    const pending = state.refreshFeishuReferenceImportStatus();
+    props.workingDir = "F:/repo-b";
+    await nextTick();
+    await flushPromises(4);
+    statusDeferred.resolve!(
+      createFeishuReferenceImportStatus({
+        state: "running",
+        stage: "listing_nodes",
+        running: true,
+        message: "old workspace",
+      }),
+    );
+    await pending;
+    await flushPromises(4);
+
+    expect(state.feishuReferenceImportStatus.value).toBeNull();
+    expect(state.feishuReferenceImportPending.value).toBe(false);
   });
 
   it("loads local embedding model catalog alongside retrieval state", async () => {

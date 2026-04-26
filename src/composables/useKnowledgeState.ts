@@ -521,7 +521,15 @@ export function useKnowledgeState(props: KnowledgeProps) {
 
   let searchTimer: ReturnType<typeof setTimeout> | null = null;
   let externalRefreshTimer: ReturnType<typeof setTimeout> | null = null;
-  let pendingExternalChanges: KnowledgeChangedEvent[] = [];
+  type WorkspaceRequestSnapshot = {
+    workspaceKey: string;
+    requestVersion: number;
+  };
+  type QueuedKnowledgeChange = {
+    change: KnowledgeChangedEvent;
+    request: WorkspaceRequestSnapshot;
+  };
+  let pendingExternalChanges: QueuedKnowledgeChange[] = [];
   let retrievalStatusPollTimer: ReturnType<typeof setTimeout> | null = null;
   let feishuReferenceStatusPollTimer: ReturnType<typeof setTimeout> | null =
     null;
@@ -540,6 +548,66 @@ export function useKnowledgeState(props: KnowledgeProps) {
   let dirtyDirectoryTypes = new Set<KnowledgeDocumentType>();
   const directoryDocumentNextCursor = ref(emptyDirectoryPageCursorState());
   const directoryDocumentLoading = ref(emptyDirectoryPageLoadingState());
+  let workspaceRequestVersion = 0;
+
+  function currentWorkspaceKey(): string {
+    return normalizeWorkspacePath(props.workingDir);
+  }
+
+  function isCurrentWorkspaceRequest(
+    request: WorkspaceRequestSnapshot,
+  ): boolean {
+    return (
+      !destroyed &&
+      !!request.workspaceKey &&
+      request.workspaceKey === currentWorkspaceKey() &&
+      request.requestVersion === workspaceRequestVersion
+    );
+  }
+
+  function captureWorkspaceRequest(): WorkspaceRequestSnapshot {
+    return {
+      workspaceKey: currentWorkspaceKey(),
+      requestVersion: workspaceRequestVersion,
+    };
+  }
+
+  function isCurrentWorkspaceChange(
+    change: KnowledgeChangedEvent,
+    request: WorkspaceRequestSnapshot,
+  ): boolean {
+    const eventWorkspaceKey = normalizeWorkspacePath(change.workingDir);
+    return (
+      !!eventWorkspaceKey &&
+      eventWorkspaceKey === request.workspaceKey &&
+      isCurrentWorkspaceRequest(request)
+    );
+  }
+
+  function clearExternalRefreshQueue() {
+    if (externalRefreshTimer) {
+      clearTimeout(externalRefreshTimer);
+      externalRefreshTimer = null;
+    }
+    pendingExternalChanges = [];
+  }
+
+  function clearSearchTimer() {
+    if (!searchTimer) return;
+    clearTimeout(searchTimer);
+    searchTimer = null;
+  }
+
+  function resetSearchRuntimeState() {
+    clearSearchTimer();
+    searchSeq += 1;
+    selectedSearchContext.value = null;
+    searchResults.value = [];
+    searching.value = false;
+    searchLatencyMs.value = null;
+    searchMode.value = null;
+    recentQueryTokens.value = null;
+  }
 
   const documentsByType = computed<
     Record<KnowledgeDocumentType, KnowledgeDocumentSummary[]>
@@ -716,11 +784,14 @@ export function useKnowledgeState(props: KnowledgeProps) {
 
   async function refreshRetrievalRuntimeStatus() {
     if (!hasWorkspace.value) return;
+    const request = captureWorkspaceRequest();
+    if (!request.workspaceKey) return;
     try {
       const [nextEmbeddingStatus, nextLexicalStatus] = await Promise.all([
         knowledgeGetEmbeddingStatus(),
         knowledgeGetLexicalRebuildStatus(),
       ]);
+      if (!isCurrentWorkspaceRequest(request)) return;
       embeddingStatus.value = nextEmbeddingStatus;
       lexicalRebuildStatus.value = nextLexicalStatus;
       if (
@@ -731,15 +802,19 @@ export function useKnowledgeState(props: KnowledgeProps) {
         scheduleRetrievalStatusPoll();
       }
     } catch {
+      if (!isCurrentWorkspaceRequest(request)) return;
       stopRetrievalStatusPoll();
     }
   }
 
   async function refreshFeishuReferenceImportStatus(handleTransition = false) {
     if (!hasWorkspace.value) return;
+    const request = captureWorkspaceRequest();
+    if (!request.workspaceKey) return;
     const previous = feishuReferenceImportStatus.value;
     try {
       const nextStatus = await knowledgeGetFeishuReferenceImportStatus();
+      if (!isCurrentWorkspaceRequest(request)) return;
       feishuReferenceImportStatus.value = nextStatus;
       feishuReferenceImportPending.value = nextStatus.running;
       if (nextStatus.running || nextStatus.stage === "authorizing") {
@@ -789,6 +864,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
         }
       }
     } catch (cause) {
+      if (!isCurrentWorkspaceRequest(request)) return;
       feishuReferenceImportPending.value = false;
       stopFeishuReferenceStatusPoll();
       if (handleTransition) {
@@ -799,9 +875,12 @@ export function useKnowledgeState(props: KnowledgeProps) {
 
   async function refreshUnityReferenceImportStatus(handleTransition = false) {
     if (!hasWorkspace.value) return;
+    const request = captureWorkspaceRequest();
+    if (!request.workspaceKey) return;
     const previous = unityReferenceImportStatus.value;
     try {
       const nextStatus = await knowledgeGetUnityReferenceImportStatus();
+      if (!isCurrentWorkspaceRequest(request)) return;
       unityReferenceImportStatus.value = nextStatus;
       unityReferenceImportPending.value = nextStatus.running;
       if (nextStatus.running) {
@@ -851,6 +930,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
         }
       }
     } catch (cause) {
+      if (!isCurrentWorkspaceRequest(request)) return;
       unityReferenceImportPending.value = false;
       stopUnityReferenceStatusPoll();
       if (handleTransition) {
@@ -1090,11 +1170,14 @@ export function useKnowledgeState(props: KnowledgeProps) {
   async function refreshExternalDocumentPath(
     type: KnowledgeDocumentType,
     path: string,
+    request: WorkspaceRequestSnapshot,
   ) {
+    if (!isCurrentWorkspaceRequest(request)) return;
     const exactDocuments = (await knowledgeList({
       type,
       pathPrefix: path,
     })).filter((document) => document.path === path);
+    if (!isCurrentWorkspaceRequest(request)) return;
     replaceDocumentPath(type, path, exactDocuments);
     loadedDocumentTypes.add(type);
     dirtyDocumentTypes.delete(type);
@@ -1111,12 +1194,15 @@ export function useKnowledgeState(props: KnowledgeProps) {
   async function refreshExternalDirectoryDocuments(
     type: KnowledgeDocumentType,
     directoryPath: string,
+    request: WorkspaceRequestSnapshot,
   ) {
+    if (!isCurrentWorkspaceRequest(request)) return;
     const normalizedDirectory = normalizeDirectorySelectionPath(directoryPath);
     const nextDocuments = await knowledgeListDirectoryDocuments(
       type,
       normalizedDirectory,
     );
+    if (!isCurrentWorkspaceRequest(request)) return;
     replaceDirectoryDocuments(type, normalizedDirectory, nextDocuments);
     loadedDirectoryDocumentPaths[type].add(normalizedDirectory);
     loadedDocumentTypes.add(type);
@@ -1127,7 +1213,9 @@ export function useKnowledgeState(props: KnowledgeProps) {
   async function refreshExternalSubtree(
     type: KnowledgeDocumentType,
     pathPrefix: string,
+    request: WorkspaceRequestSnapshot,
   ) {
+    if (!isCurrentWorkspaceRequest(request)) return;
     const normalizedPrefix = pathPrefix
       .trim()
       .replace(/\\/g, "/")
@@ -1136,12 +1224,17 @@ export function useKnowledgeState(props: KnowledgeProps) {
       type,
       pathPrefix: normalizedPrefix,
     })).filter((document) => pathMatchesSubtree(document.path, normalizedPrefix));
+    if (!isCurrentWorkspaceRequest(request)) return;
     replaceDocumentSubtree(type, normalizedPrefix, nextDocuments);
     loadedDocumentTypes.add(type);
     dirtyDocumentTypes.delete(type);
   }
 
-  async function applyExternalKnowledgeChange(change: KnowledgeChangedEvent) {
+  async function applyExternalKnowledgeChange(
+    change: KnowledgeChangedEvent,
+    request: WorkspaceRequestSnapshot,
+  ) {
+    if (!isCurrentWorkspaceChange(change, request)) return;
     const type = change.docType;
     const targetKind = change.targetKind;
     const path = (change.path ?? "")
@@ -1171,7 +1264,8 @@ export function useKnowledgeState(props: KnowledgeProps) {
 
     if (targetKind === "document" && path) {
       if (isStructureChange && type === "reference") {
-        await refreshExternalDirectoryDocuments(type, parentPath);
+        await refreshExternalDirectoryDocuments(type, parentPath, request);
+        if (!isCurrentWorkspaceRequest(request)) return;
         if (selectedDocument.value?.type === type && selectedDocument.value.path === path) {
           const selectedMatch = documents.value.find(
             (document) => document.type === type && document.path === path,
@@ -1183,8 +1277,9 @@ export function useKnowledgeState(props: KnowledgeProps) {
           }
         }
       } else {
-        await refreshExternalDocumentPath(type, path);
+        await refreshExternalDocumentPath(type, path, request);
       }
+      if (!isCurrentWorkspaceRequest(request)) return;
 
       if (
         selectedDirectoryPath.value &&
@@ -1192,10 +1287,12 @@ export function useKnowledgeState(props: KnowledgeProps) {
         (isStructureChange || isConfigChange)
       ) {
         await loadSelectedDirectoryConfig(selectedDirectoryPath.value);
+        if (!isCurrentWorkspaceRequest(request)) return;
       }
 
       if (isStructureChange) {
         await loadDirectories(type);
+        if (!isCurrentWorkspaceRequest(request)) return;
         dirtyDirectoryTypes.delete(type);
       }
       return;
@@ -1203,11 +1300,13 @@ export function useKnowledgeState(props: KnowledgeProps) {
 
     if (targetKind === "directory" && path) {
       if (affectsSubtree) {
-        await refreshExternalSubtree(type, path);
+        await refreshExternalSubtree(type, path, request);
       } else {
-        await refreshExternalDirectoryDocuments(type, path);
+        await refreshExternalDirectoryDocuments(type, path, request);
       }
+      if (!isCurrentWorkspaceRequest(request)) return;
       await loadDirectories(type);
+      if (!isCurrentWorkspaceRequest(request)) return;
       dirtyDirectoryTypes.delete(type);
 
       const normalizedSelectedDirectory = selectedDirectoryPath.value
@@ -1219,6 +1318,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
       ) {
         if (directoryGroups.value[type].includes(normalizedSelectedDirectory)) {
           await loadSelectedDirectoryConfig(selectedDirectoryPath.value);
+          if (!isCurrentWorkspaceRequest(request)) return;
         } else {
           clearSelectedDirectoryState();
         }
@@ -1234,6 +1334,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
         );
         if (selectedMatch) {
           await loadSelectedDocument(selectedMatch);
+          if (!isCurrentWorkspaceRequest(request)) return;
         } else {
           clearSelectedDocumentState();
         }
@@ -1242,6 +1343,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
         pathMatchesSubtree(selectedDocumentSummary.value.path, path)
       ) {
         await loadSelectedDocument(selectedDocumentSummary.value);
+        if (!isCurrentWorkspaceRequest(request)) return;
       }
       return;
     }
@@ -1257,14 +1359,18 @@ export function useKnowledgeState(props: KnowledgeProps) {
       await refreshKnowledgeData();
       return;
     }
-    for (const change of queued) {
-      await applyExternalKnowledgeChange(change);
+    for (const item of queued) {
+      if (!isCurrentWorkspaceChange(item.change, item.request)) continue;
+      await applyExternalKnowledgeChange(item.change, item.request);
     }
   }
 
   function scheduleExternalRefresh(change?: KnowledgeChangedEvent) {
+    const request = captureWorkspaceRequest();
+    if (!request.workspaceKey) return;
     if (change) {
-      pendingExternalChanges.push(change);
+      if (!isCurrentWorkspaceChange(change, request)) return;
+      pendingExternalChanges.push({ change, request });
     } else {
       markKnowledgeDataDirty();
     }
@@ -1279,16 +1385,14 @@ export function useKnowledgeState(props: KnowledgeProps) {
   }
 
   function markKnowledgeDataDirty() {
-    if (externalRefreshTimer) {
-      clearTimeout(externalRefreshTimer);
-      externalRefreshTimer = null;
-    }
-    pendingExternalChanges = [];
+    clearExternalRefreshQueue();
     dirtyDocumentTypes = new Set(DEFAULT_TYPE_ORDER);
     dirtyDirectoryTypes = new Set(DEFAULT_TYPE_ORDER);
   }
 
   function resetWorkspaceState() {
+    workspaceRequestVersion += 1;
+    clearExternalRefreshQueue();
     stopRetrievalStatusPoll();
     stopFeishuReferenceStatusPoll();
     stopUnityReferenceStatusPoll();
@@ -1312,11 +1416,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
     creatingDocument.value = false;
     deletingDocument.value = false;
     searchQuery.value = "";
-    searchResults.value = [];
-    searching.value = false;
-    searchLatencyMs.value = null;
-    searchMode.value = null;
-    recentQueryTokens.value = null;
+    resetSearchRuntimeState();
     overviewLoading.value = false;
     retrievalOverview.value = null;
     generalConfig.value = null;
@@ -1333,7 +1433,6 @@ export function useKnowledgeState(props: KnowledgeProps) {
     unityReferenceImportPending.value = false;
     unityReferenceDeletePending.value = false;
     pendingSelectionPath.value = null;
-    pendingExternalChanges = [];
     loadedDirectoryDocumentPaths = emptyLoadedDirectoryDocumentPaths();
     loadedDocumentTypes = new Set<KnowledgeDocumentType>();
     loadedDirectoryTypes = new Set<KnowledgeDocumentType>();
@@ -1354,6 +1453,8 @@ export function useKnowledgeState(props: KnowledgeProps) {
       silent?: boolean;
     },
   ) {
+    const request = captureWorkspaceRequest();
+    if (!request.workspaceKey) return;
     const normalizedPath = normalizeDirectorySelectionPath(directoryPath);
     const reset = options?.reset ?? false;
     if (!reset && isDirectoryPageLoading(type, normalizedPath)) return;
@@ -1378,6 +1479,9 @@ export function useKnowledgeState(props: KnowledgeProps) {
           limit: options?.limit ?? REFERENCE_DOCUMENT_PAGE_SIZE,
         },
       );
+      if (!isCurrentWorkspaceRequest(request)) {
+        return;
+      }
       if (reset && options?.replaceTypeDocuments) {
         replaceTypeDocuments(type, page.items);
       } else if (reset && options?.replaceDirectoryDocuments) {
@@ -1393,12 +1497,17 @@ export function useKnowledgeState(props: KnowledgeProps) {
       setDirectoryPageCursor(type, normalizedPath, page.nextCursor ?? null);
       loadedDocumentTypes.add(type);
     } catch (cause) {
+      if (!isCurrentWorkspaceRequest(request)) {
+        return;
+      }
       if (!options?.silent) {
         notifyError("knowledge_list_directory_documents_page", cause);
       }
       throw cause;
     } finally {
-      setDirectoryPageLoading(type, normalizedPath, false);
+      if (isCurrentWorkspaceRequest(request)) {
+        setDirectoryPageLoading(type, normalizedPath, false);
+      }
     }
   }
 
@@ -1407,6 +1516,8 @@ export function useKnowledgeState(props: KnowledgeProps) {
       resetWorkspaceState();
       return;
     }
+    const request = captureWorkspaceRequest();
+    if (!request.workspaceKey) return;
     loading.value = true;
     error.value = "";
     const normalizedPrefix = input.pathPrefix?.trim() ?? "";
@@ -1427,6 +1538,9 @@ export function useKnowledgeState(props: KnowledgeProps) {
         });
       } else {
         const docs = await knowledgeList(input);
+        if (!isCurrentWorkspaceRequest(request)) {
+          return;
+        }
         if (isFullLoad) {
           documents.value = docs;
           loadedDirectoryDocumentPaths = emptyLoadedDirectoryDocumentPaths();
@@ -1444,6 +1558,9 @@ export function useKnowledgeState(props: KnowledgeProps) {
           mergeDocuments(docs);
         }
       }
+      if (!isCurrentWorkspaceRequest(request)) {
+        return;
+      }
       if (selectedDocumentId.value) {
         const stillExists = documents.value.some(
           (doc) => doc.id === selectedDocumentId.value,
@@ -1454,6 +1571,9 @@ export function useKnowledgeState(props: KnowledgeProps) {
         }
       }
     } catch (cause) {
+      if (!isCurrentWorkspaceRequest(request)) {
+        return;
+      }
       if (isFullLoad) {
         documents.value = [];
         loadedDirectoryDocumentPaths = emptyLoadedDirectoryDocumentPaths();
@@ -1470,7 +1590,9 @@ export function useKnowledgeState(props: KnowledgeProps) {
       }
       notifyError("knowledge_list", cause);
     } finally {
-      loading.value = false;
+      if (isCurrentWorkspaceRequest(request)) {
+        loading.value = false;
+      }
     }
   }
 
@@ -1555,6 +1677,8 @@ export function useKnowledgeState(props: KnowledgeProps) {
       return;
     }
 
+    const request = captureWorkspaceRequest();
+    if (!request.workspaceKey) return;
     try {
       const [paths, externalBindings, unityManagedStats] = await Promise.all([
         knowledgeListDirectories(type),
@@ -1579,6 +1703,9 @@ export function useKnowledgeState(props: KnowledgeProps) {
           return result.directory;
         }),
       );
+      if (!isCurrentWorkspaceRequest(request)) {
+        return;
+      }
       const configs = settled.reduce<
         Record<string, KnowledgeDirectoryConfigRecord>
       >((acc, entry) => {
@@ -1614,6 +1741,9 @@ export function useKnowledgeState(props: KnowledgeProps) {
         }, {});
       }
     } catch (cause) {
+      if (!isCurrentWorkspaceRequest(request)) {
+        return;
+      }
       directoryGroups.value = {
         ...directoryGroups.value,
         [type]: [],
@@ -1645,6 +1775,8 @@ export function useKnowledgeState(props: KnowledgeProps) {
       return;
     }
 
+    const request = captureWorkspaceRequest();
+    if (!request.workspaceKey) return;
     overviewLoading.value = true;
     try {
       const [
@@ -1671,6 +1803,9 @@ export function useKnowledgeState(props: KnowledgeProps) {
             nextEmbeddingConfig.localModelPath,
           )
         : embeddingLocalDirectoryInspection.value;
+      if (!isCurrentWorkspaceRequest(request)) {
+        return;
+      }
       retrievalOverview.value = nextOverview;
       generalConfig.value = nextGeneralConfig;
       embeddingConfig.value = nextEmbeddingConfig;
@@ -1703,12 +1838,17 @@ export function useKnowledgeState(props: KnowledgeProps) {
         stopUnityReferenceStatusPoll();
       }
     } catch (cause) {
+      if (!isCurrentWorkspaceRequest(request)) {
+        return;
+      }
       notifyError("knowledge_get_overview", cause);
       retrievalOverview.value = null;
       stopRetrievalStatusPoll();
       stopUnityReferenceStatusPoll();
     } finally {
-      overviewLoading.value = false;
+      if (isCurrentWorkspaceRequest(request)) {
+        overviewLoading.value = false;
+      }
     }
   }
 
@@ -1716,6 +1856,8 @@ export function useKnowledgeState(props: KnowledgeProps) {
     target?: KnowledgeDocumentSummary | KnowledgeDocument | null,
   ) {
     if (!hasWorkspace.value) return;
+    const request = captureWorkspaceRequest();
+    if (!request.workspaceKey) return;
     const refTarget = target ?? selectedDocumentSummary.value;
     if (!refTarget) {
       selectedDocument.value = null;
@@ -1734,6 +1876,9 @@ export function useKnowledgeState(props: KnowledgeProps) {
       });
       const doc = result.document;
       if (!doc) throw new Error("knowledge_read returned no document");
+      if (!isCurrentWorkspaceRequest(request)) {
+        return;
+      }
       selectedDocument.value = doc;
       selectedDocumentId.value = doc.id;
       activeType.value = doc.type;
@@ -1746,14 +1891,21 @@ export function useKnowledgeState(props: KnowledgeProps) {
       }
       expandAncestors(fullDocumentPath(doc.type, doc.path));
     } catch (cause) {
+      if (!isCurrentWorkspaceRequest(request)) {
+        return;
+      }
       notifyError("knowledge_read", cause);
     } finally {
-      selectedDocumentLoading.value = false;
+      if (isCurrentWorkspaceRequest(request)) {
+        selectedDocumentLoading.value = false;
+      }
     }
   }
 
   async function loadSelectedDirectoryConfig(targetPath?: string | null) {
     if (!hasWorkspace.value) return;
+    const request = captureWorkspaceRequest();
+    if (!request.workspaceKey) return;
     const refPath = normalizeDirectorySelectionPath(
       targetPath ?? selectedDirectoryPath.value ?? "",
     );
@@ -1774,13 +1926,21 @@ export function useKnowledgeState(props: KnowledgeProps) {
       const config = result.directory;
       if (!config)
         throw new Error("knowledge_read returned no directory config");
+      if (!isCurrentWorkspaceRequest(request)) {
+        return;
+      }
       selectedDirectoryPath.value = config.path;
       selectedDirectoryConfig.value = config;
       expandAncestors(fullDocumentPath(config.type, config.path));
     } catch (cause) {
+      if (!isCurrentWorkspaceRequest(request)) {
+        return;
+      }
       notifyError("knowledge_read.directory", cause);
     } finally {
-      selectedDirectoryLoading.value = false;
+      if (isCurrentWorkspaceRequest(request)) {
+        selectedDirectoryLoading.value = false;
+      }
     }
   }
 
@@ -1809,6 +1969,8 @@ export function useKnowledgeState(props: KnowledgeProps) {
       return;
     }
 
+    const request = captureWorkspaceRequest();
+    if (!request.workspaceKey) return;
     const force = options?.force ?? true;
     const includeOverview = options?.includeOverview ?? true;
     consumePendingUiSelection();
@@ -1816,6 +1978,9 @@ export function useKnowledgeState(props: KnowledgeProps) {
       force,
       includeOverview,
     });
+    if (!isCurrentWorkspaceRequest(request)) {
+      return;
+    }
     if (pendingSelectionPath.value) {
       const pendingPath = pendingSelectionPath.value;
       const next = documents.value.find((doc) => doc.path === pendingPath);
@@ -2062,22 +2227,14 @@ export function useKnowledgeState(props: KnowledgeProps) {
 
   async function searchKnowledge() {
     if (!hasWorkspace.value) {
-      selectedSearchContext.value = null;
-      searchResults.value = [];
-      searching.value = false;
-      searchLatencyMs.value = null;
-      searchMode.value = null;
-      recentQueryTokens.value = null;
+      resetSearchRuntimeState();
       return;
     }
+    const request = captureWorkspaceRequest();
+    if (!request.workspaceKey) return;
     const query = searchQuery.value.trim();
     if (!query) {
-      selectedSearchContext.value = null;
-      searchResults.value = [];
-      searching.value = false;
-      searchLatencyMs.value = null;
-      searchMode.value = null;
-      recentQueryTokens.value = null;
+      resetSearchRuntimeState();
       return;
     }
 
@@ -2089,7 +2246,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
         query,
         limit: 30,
       });
-      if (seq !== searchSeq) return;
+      if (seq !== searchSeq || !isCurrentWorkspaceRequest(request)) return;
       searchResults.value = results;
       searchLatencyMs.value = Math.max(1, Date.now() - startedAt);
       searchMode.value = deriveSearchMode(results);
@@ -2097,31 +2254,38 @@ export function useKnowledgeState(props: KnowledgeProps) {
         .slice(0, 3)
         .reduce((total, result) => total + (result.estimatedTokens ?? 0), 0);
     } catch (cause) {
-      if (seq !== searchSeq) return;
+      if (seq !== searchSeq || !isCurrentWorkspaceRequest(request)) return;
       notifyError("knowledge_query", cause);
       searchResults.value = [];
       searchLatencyMs.value = null;
       searchMode.value = null;
       recentQueryTokens.value = null;
     } finally {
-      if (seq === searchSeq) searching.value = false;
+      if (seq === searchSeq && isCurrentWorkspaceRequest(request)) {
+        searching.value = false;
+      }
     }
   }
 
   function scheduleSearch() {
-    if (searchTimer) clearTimeout(searchTimer);
+    clearSearchTimer();
+    if (!searchQuery.value.trim()) {
+      resetSearchRuntimeState();
+      return;
+    }
+    const request = captureWorkspaceRequest();
+    if (!request.workspaceKey) return;
     searchTimer = setTimeout(() => {
+      searchTimer = null;
+      if (!isCurrentWorkspaceRequest(request)) return;
       void searchKnowledge();
     }, 220);
   }
 
   function clearSearch() {
+    resetSearchRuntimeState();
     selectedSearchContext.value = null;
     searchQuery.value = "";
-    searchResults.value = [];
-    searchLatencyMs.value = null;
-    searchMode.value = null;
-    recentQueryTokens.value = null;
   }
 
   async function refreshRetrievalState() {
@@ -3263,9 +3427,8 @@ export function useKnowledgeState(props: KnowledgeProps) {
 
   onUnmounted(() => {
     destroyed = true;
-    if (searchTimer) clearTimeout(searchTimer);
-    if (externalRefreshTimer) clearTimeout(externalRefreshTimer);
-    pendingExternalChanges = [];
+    clearSearchTimer();
+    clearExternalRefreshQueue();
     stopRetrievalStatusPoll();
     stopFeishuReferenceStatusPoll();
     stopUnityReferenceStatusPoll();
@@ -3275,12 +3438,21 @@ export function useKnowledgeState(props: KnowledgeProps) {
 
   watch(
     () => props.workingDir,
-    (workingDir) => {
-      if (!workingDir.trim()) {
+    (workingDir, previousWorkingDir) => {
+      const nextWorkspaceKey = normalizeWorkspacePath(workingDir);
+      if (!nextWorkspaceKey) {
         resetWorkspaceState();
         return;
       }
-      void refreshKnowledgeData({ force: false, includeOverview: false });
+      const previousWorkspaceKey = normalizeWorkspacePath(
+        previousWorkingDir ?? "",
+      );
+      if (nextWorkspaceKey !== previousWorkspaceKey) {
+        const preservedActiveType = activeType.value;
+        resetWorkspaceState();
+        activeType.value = preservedActiveType;
+      }
+      void refreshKnowledgeData({ force: true, includeOverview: false });
     },
   );
 

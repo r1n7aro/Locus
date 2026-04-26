@@ -14,4 +14,12 @@ describe("KnowledgeView state persistence", () => {
 
     expect(view).not.toMatch(/watch\(\s*\(\)\s*=>\s*uiStore\.activeTab[\s\S]*clearSelection\(\)/);
   });
+
+  it("refreshes retrieval settings when the workspace changes on the retrieval page", () => {
+    const view = read("src/components/KnowledgeView.vue");
+
+    expect(view).toContain('specialPage.value !== "retrieval"');
+    expect(view).toContain("void refreshRetrievalState();");
+    expect(view).toContain("normalizeWorkspaceKey(workingDir)");
+  });
 });

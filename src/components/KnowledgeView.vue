@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onUnmounted, ref } from "vue";
+import { computed, onUnmounted, ref, watch } from "vue";
 import type {
   KnowledgeDocumentPatch,
   ModelDefaults,
@@ -226,6 +226,25 @@ function openInjectionPreview() {
   clearSearch();
   specialPage.value = "injection";
 }
+
+function normalizeWorkspaceKey(path: string): string {
+  return path.trim().replace(/\\/g, "/").replace(/\/+$/g, "").toLowerCase();
+}
+
+watch(
+  () => props.workingDir,
+  (workingDir, previousWorkingDir) => {
+    if (specialPage.value !== "retrieval") return;
+    const nextWorkspace = normalizeWorkspaceKey(workingDir);
+    if (
+      !nextWorkspace ||
+      nextWorkspace === normalizeWorkspaceKey(previousWorkingDir ?? "")
+    ) {
+      return;
+    }
+    void refreshRetrievalState();
+  },
+);
 
 function hasMoreActiveFolderDocuments(path: string): boolean {
   return hasMoreDirectoryDocuments(activeType.value, path);
