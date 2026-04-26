@@ -268,13 +268,14 @@ namespace Locus
                 return;
 
             string json = JsonUtility.ToJson(message);
+            string pipeName = GetControlPipeName();
             _sendInFlight = true;
 
             Task.Run(() =>
             {
                 try
                 {
-                    WritePipeLine(json);
+                    WritePipeLine(pipeName, json);
 
                     if (message.type != "close")
                     {
@@ -303,19 +304,18 @@ namespace Locus
             });
         }
 
-        private void WritePipeLine(string json)
+        private void WritePipeLine(string pipeName, string json)
         {
             lock (_pipeLock)
             {
-                EnsurePipeConnected();
+                EnsurePipeConnected(pipeName);
                 _pipeWriter.WriteLine(json);
                 _pipeWriter.Flush();
             }
         }
 
-        private void EnsurePipeConnected()
+        private void EnsurePipeConnected(string pipeName)
         {
-            string pipeName = GetControlPipeName();
             if (_pipeClient != null
                 && _pipeClient.IsConnected
                 && _pipeWriter != null
