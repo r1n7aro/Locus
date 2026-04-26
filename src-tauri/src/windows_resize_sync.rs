@@ -401,10 +401,9 @@ unsafe fn publish_native_client_size(state: &mut ResizeSyncState, width: i32, he
     }
     state.last_native_width = width;
     state.last_native_height = height;
-    let _ = state.app_handle.emit(
-        NATIVE_CLIENT_SIZE_EVENT,
-        NativeWindowClientSize { width, height },
-    );
+    let _ = state
+        .app_handle
+        .emit(NATIVE_CLIENT_SIZE_EVENT, NativeWindowClientSize { width, height });
 }
 
 unsafe fn sync_webview_bounds_at(
