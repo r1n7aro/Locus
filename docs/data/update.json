@@ -1,36 +1,27 @@
 {
-  "version": "0.2.0",
+  "version": "0.2.1",
   "releasedAt": "2026-04-26",
   "channel": "stable",
   "locales": {
     "zh": {
       "title": "发现新版本",
-      "summary": "Locus v0.2.0 (2026-04-26)",
+      "summary": "Locus v0.2.1 (2026-04-26)",
       "changelogUrl": "/overview/latest-version",
       "changes": [
         {
           "title": "新增",
           "items": [
-            "【嵌入式窗口】可在 Unity Editor 的 `Window/Locus` 中打开 Locus 会话，检测并启动桌面端，并同步窗口状态、输入焦点、资产选择与 Inspector 打开。",
-            "【运行时调试状态机，实验性】新增 `unity_run_states` 工具，可在 Unity 中运行按帧推进的 C# 状态机，用于测试输入与捕获运行时状态。",
-            "Markdown 中的 Unity 资产和场景对象引用会渲染为可交互引用；点击会在 Unity 中跳转，Ctrl+点击会打开独立 Inspector 窗口检查。",
-            "`unity_execute` 支持异步执行、跨帧等待、取消检查和进度上报，长任务进度会显示在工具调用面板中。",
-            "增强控制台浏览能力，支持前端/后端日志筛选、搜索、自动滚动、刷新和清空。"
+            "Unity 插件安装包改为内置合并后的 Roslyn 运行组件，减少项目内依赖冲突。"
           ]
         },
         {
           "title": "修复",
           "items": [
-            "修复 NSIS 安装包升级兼容性，更新安装时会复用历史安装位置。",
-            "Responses API 遇到服务端错误时会进行重试，减少偶发请求失败。",
-            "加强资产引用图监听器，降低资产数据库监听和重扫中的不稳定情况。",
-            "修复 Unity 嵌入窗口焦点、鼠标激活、窗口尺寸同步和 Windows 窗口边框相关问题。",
-            "Unity 插件安装流程会适配 Unity 2021 项目中的 DLL 冲突，降低插件安装后的编译冲突概率。",
-            "修复 `unity_run_states` 运行中 Print 输出不可见的问题。",
-            "改进 Chat 响应式布局、紧凑输入区和工具调用交接渲染。",
-            "改进 Diff 查看器控件，并为 Prefab 面板标题增加 fileID 区分。",
-            "修复 Knowledge 在切换工作区后的状态重置、搜索结果刷新和空文件夹行对齐问题。",
-            "更新中英文界面文案。"
+            "修复部分 Unity 项目安装插件后出现 Roslyn 相关编译冲突的问题。",
+            "修复应用更新后 Unity 插件资源可能沿用旧文件的问题。",
+            "修复 Unity 嵌入窗口在父窗口隐藏、切换或恢复时仍可能显示的问题。",
+            "修复 Unity Editor 快速发送窗口同步消息时偶发连接到旧控制通道的问题。",
+            "Diff 预览会忽略仅由 Windows/macOS 行尾差异造成的改动，减少无意义的变更噪音。"
           ]
         }
       ],
@@ -43,32 +34,23 @@
     },
     "en": {
       "title": "Update available",
-      "summary": "Locus v0.2.0 (2026-04-26)",
+      "summary": "Locus v0.2.1 (2026-04-26)",
       "changelogUrl": "/en/overview/latest-version",
       "changes": [
         {
           "title": "Added",
           "items": [
-            "Added an embedded Locus window for Unity Editor under `Window/Locus`, with desktop app detection and launch, window state sync, input focus handling, asset selection sync, and Inspector opening.",
-            "Added the experimental `unity_run_states` tool for running frame-driven C# state machines in Unity to test input flows and capture runtime state.",
-            "Unity asset and scene object references in Markdown now render as interactive references. Click jumps to Unity, and Ctrl+click opens a separate Inspector window.",
-            "`unity_execute` now supports async execution, cross-frame waits, cancellation checks, and progress reporting. Long-running task progress appears in the tool call panel.",
-            "Improved console browsing with frontend/backend log source filters, search, auto-scroll, refresh, and clear actions."
+            "The Unity plugin package now includes a merged Roslyn runtime component to reduce dependency conflicts inside Unity projects."
           ]
         },
         {
           "title": "Fixed",
           "items": [
-            "Fixed NSIS installer upgrade compatibility so updates reuse the previous install location.",
-            "Responses API requests now retry on server errors to reduce transient failures.",
-            "Hardened the asset reference graph watcher to reduce instability during asset database watching and rescans.",
-            "Fixed Unity embedded window focus, mouse activation, window size sync, and Windows frame handling.",
-            "Unity plugin installation now handles DLL conflicts in Unity 2021 projects to reduce compile conflicts after install.",
-            "Fixed missing Print output while `unity_run_states` is running.",
-            "Improved Chat responsive layout, compact input layout, and tool call handoff rendering.",
-            "Improved Diff viewer controls and added fileID disambiguation to Prefab panel titles.",
-            "Fixed Knowledge state reset after workspace switches, search result refresh, and empty folder row alignment.",
-            "Updated Chinese and English UI copy."
+            "Fixed Roslyn-related compile conflicts that could appear after installing the Unity plugin in some projects.",
+            "Fixed app updates leaving older bundled Unity plugin files in place.",
+            "Fixed cases where the Unity embedded window could remain visible after its parent window was hidden, switched, or restored.",
+            "Fixed an occasional Unity Editor control-channel mismatch when window sync messages were sent quickly.",
+            "Diff previews now ignore changes caused only by Windows/macOS line endings, reducing noisy file changes."
           ]
         }
       ],
