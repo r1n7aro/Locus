@@ -36,6 +36,8 @@ const hasFooter = computed(() => !!slots.footer);
 .chat-input-shell {
   display: flex;
   flex-direction: column;
+  width: 100%;
+  min-width: 0;
 }
 
 .chat-input-shell-topbar {
@@ -65,12 +67,16 @@ const hasFooter = computed(() => !!slots.footer);
 
 .chat-input-shell-body {
   position: relative;
+  width: 100%;
+  min-width: 0;
 }
 
 .chat-input-shell-stack {
   display: flex;
   flex-direction: column;
   gap: 8px;
+  width: 100%;
+  min-width: 0;
 }
 
 .chat-input-shell-footer {

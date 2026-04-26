@@ -1250,12 +1250,16 @@ function openImage(src: string) {
 <style scoped>
 .chat-transcript-scroll {
   flex: 1;
+  width: 100%;
+  min-width: 0;
   min-height: 0;
   overflow-y: auto;
   scrollbar-gutter: stable;
 }
 
 .chat-transcript-content {
+  width: 100%;
+  min-width: 0;
   min-height: 100%;
 }
 

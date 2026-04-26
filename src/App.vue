@@ -212,10 +212,24 @@ watch(() => uiStore.settingsMounted, (mounted) => {
 const showDirDropdown = ref(false);
 const dirDropdownRef = ref<HTMLElement | null>(null);
 const pendingWorkspaceSwitchPath = ref<string | null>(null);
+const switchingWorkspacePath = ref<string | null>(null);
 const workspaceSwitchBusy = ref(false);
 const runningSessionCount = computed(() => chatStore.streamingSessionIds.size);
 const workspaceSwitchTargetName = computed(() =>
   pendingWorkspaceSwitchPath.value ? shortDir(pendingWorkspaceSwitchPath.value) : "",
+);
+const workspaceButtonTitle = computed(() => {
+  if (switchingWorkspacePath.value) {
+    return t(
+      "app.dir.switchingTitle",
+      shortDir(switchingWorkspacePath.value),
+      switchingWorkspacePath.value,
+    );
+  }
+  return projectStore.workingDir || t("app.dir.notSetTitle");
+});
+const workspaceButtonLabel = computed(() =>
+  switchingWorkspacePath.value ? t("app.dir.switching") : shortDir(projectStore.workingDir),
 );
 const showAppUpdateModal = computed(() =>
   Boolean(
@@ -242,6 +256,15 @@ const pluginToastTitle = computed(() =>
     ? `${pluginToastLabel.value} - ${pluginToastAction.value}`
     : pluginToastLabel.value,
 );
+const appLayoutStyle = computed(() => {
+  if (!uiStore.isWindowResizing || !uiStore.nativeWindowWidth || !uiStore.nativeWindowHeight) {
+    return undefined;
+  }
+  return {
+    width: `${uiStore.nativeWindowWidth}px`,
+    height: `${uiStore.nativeWindowHeight}px`,
+  };
+});
 
 function shortDir(dir: string): string {
   if (!dir) return t("app.dir.notSet");
@@ -256,6 +279,7 @@ function parentPath(dir: string): string {
 }
 
 function toggleDirDropdown() {
+  if (workspaceSwitchBusy.value) return;
   showDirDropdown.value = !showDirDropdown.value;
 }
 
@@ -299,13 +323,21 @@ async function requestWorkingDirChange(dir: string) {
     pendingWorkspaceSwitchPath.value = dir;
     return;
   }
-  await performWorkingDirChange(dir);
+  workspaceSwitchBusy.value = true;
+  switchingWorkspacePath.value = dir;
+  try {
+    await performWorkingDirChange(dir);
+  } finally {
+    switchingWorkspacePath.value = null;
+    workspaceSwitchBusy.value = false;
+  }
 }
 
 async function confirmWorkspaceSwitch() {
   const target = pendingWorkspaceSwitchPath.value;
   if (!target || workspaceSwitchBusy.value) return;
   workspaceSwitchBusy.value = true;
+  switchingWorkspacePath.value = target;
   try {
     const sessionIds = Array.from(chatStore.streamingSessionIds);
     await chatStore.cancelSessions(sessionIds);
@@ -316,16 +348,19 @@ async function confirmWorkspaceSwitch() {
   } catch (error) {
     reportWorkingDirSwitchError(error);
   } finally {
+    switchingWorkspacePath.value = null;
     workspaceSwitchBusy.value = false;
   }
 }
 
 async function selectRecentDir(dir: string) {
+  if (workspaceSwitchBusy.value) return;
   showDirDropdown.value = false;
   await requestWorkingDirChange(dir);
 }
 
 async function browseFromDropdown() {
+  if (workspaceSwitchBusy.value) return;
   showDirDropdown.value = false;
   try {
     const selected = await open({ directory: true, multiple: false, defaultPath: projectStore.workingDir || undefined });
@@ -441,11 +476,13 @@ onUnmounted(() => {
   <div
     class="app-layout"
     :class="{ 'is-window-resizing': uiStore.isWindowResizing }"
+    :style="appLayoutStyle"
     v-else-if="authStore.authChecked"
     @contextmenu.prevent
   >
     <div class="main-area">
       <div class="tab-bar">
+        <div class="tab-drag-region" aria-hidden="true"></div>
         <span class="tab-brand">Locus</span>
         <button
           class="tab-item"
@@ -505,14 +542,18 @@ onUnmounted(() => {
         <div class="workspace-selector" ref="dirDropdownRef">
           <button
             class="workspace-btn"
-            :title="projectStore.workingDir || t('app.dir.notSetTitle')"
+            :class="{ 'is-switching': workspaceSwitchBusy }"
+            :title="workspaceButtonTitle"
+            :disabled="workspaceSwitchBusy"
+            :aria-busy="workspaceSwitchBusy"
             @click="toggleDirDropdown"
           >
             <svg class="ws-icon" viewBox="0 0 16 16" fill="currentColor" width="14" height="14">
               <path d="M1 3.5A1.5 1.5 0 0 1 2.5 2h3.879a1.5 1.5 0 0 1 1.06.44l1.122 1.12A1.5 1.5 0 0 0 9.62 4H13.5A1.5 1.5 0 0 1 15 5.5v7a1.5 1.5 0 0 1-1.5 1.5h-11A1.5 1.5 0 0 1 1 12.5v-9z"/>
             </svg>
-            <span class="ws-name">{{ shortDir(projectStore.workingDir) }}</span>
-            <svg class="ws-chevron" :class="{ open: showDirDropdown }" viewBox="0 0 16 16" fill="currentColor" width="10" height="10">
+            <span class="ws-name">{{ workspaceButtonLabel }}</span>
+            <span v-if="workspaceSwitchBusy" class="workspace-switch-spinner" aria-hidden="true"></span>
+            <svg v-else class="ws-chevron" :class="{ open: showDirDropdown }" viewBox="0 0 16 16" fill="currentColor" width="10" height="10">
               <path d="M4.427 5.427a.75.75 0 0 1 1.06-.013L8 7.867l2.513-2.453a.75.75 0 1 1 1.047 1.073l-3 2.927a.75.75 0 0 1-1.047 0l-3-2.927a.75.75 0 0 1-.013-1.06z"/>
             </svg>
           </button>
@@ -869,6 +910,21 @@ onUnmounted(() => {
   box-sizing: border-box;
 }
 
+html,
+body,
+#app {
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--bg-color);
+}
+
+#app {
+  display: flex;
+}
+
 /* Global scrollbar styling */
 ::-webkit-scrollbar {
   width: 8px;
@@ -910,26 +966,61 @@ body.is-dragging-select-lock * {
 
 .app-layout {
   display: flex;
-  width: 100vw;
-  height: 100vh;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
   position: relative;
+  overflow: hidden;
+  background: var(--bg-color);
 }
 
 .app-layout.is-window-resizing .tab-content {
   pointer-events: none;
 }
 
-.app-layout.is-window-resizing .tab-content,
-.app-layout.is-window-resizing .tab-content * {
-  filter: none !important;
-  backdrop-filter: none !important;
+.app-layout.is-window-resizing :is(
+  .chat-workspace-view,
+  .chat-view-layout,
+  .chat-view,
+  .chat-main,
+  .input-area,
+  .chat-input-shell,
+  .chat-input-shell-body,
+  .chat-input-shell-stack,
+  .chat-composer,
+  .chat-transcript-scroll,
+  .chat-transcript-content
+) {
+  transition: none !important;
 }
 
-.app-layout.is-window-resizing .tab-content *,
-.app-layout.is-window-resizing .tab-content *::before,
-.app-layout.is-window-resizing .tab-content *::after {
+.app-layout.is-window-resizing .chat-transcript-message.is-session {
+  content-visibility: visible;
+  contain-intrinsic-size: auto;
+}
+
+.app-layout.is-window-resizing :is(
+  .workspace-btn,
+  .tab-item,
+  .win-ctrl-btn,
+  .session-divider,
+  .input-controls-toggle,
+  .changes-toggle-btn,
+  .sp-collapse-btn,
+  .sp-session-item
+) {
   transition-duration: 0s !important;
   transition-delay: 0s !important;
+}
+
+.app-layout.is-window-resizing :is(
+  .tab-plugin-spinner,
+  .workspace-switch-spinner,
+  .chat-transcript-thinking-spinner,
+  .sp-session-dot.is-running,
+  .sp-expand-btn.is-running svg
+) {
   animation-duration: 0s !important;
   animation-delay: 0s !important;
 }
@@ -968,6 +1059,7 @@ body.is-dragging-select-lock * {
 }
 
 .tab-bar {
+  --window-resize-hit-area: 6px;
   display: flex;
   align-items: center;
   gap: 0;
@@ -979,7 +1071,19 @@ body.is-dragging-select-lock * {
   border-bottom: 1px solid var(--border-color);
   z-index: 20;
   overflow: visible;
+  -webkit-app-region: no-drag;
+}
+
+.tab-drag-region {
+  position: absolute;
+  inset: var(--window-resize-hit-area) var(--window-resize-hit-area) 0 var(--window-resize-hit-area);
+  z-index: 0;
   -webkit-app-region: drag;
+}
+
+.tab-bar > :not(.tab-drag-region) {
+  position: relative;
+  z-index: 1;
 }
 
 .tab-item {
@@ -1034,8 +1138,10 @@ body.is-dragging-select-lock * {
 }
 
 .tab-spacer {
-  flex: 1 1 8px;
+  -webkit-app-region: drag;
+  flex: 1 1 auto;
   min-width: 8px;
+  align-self: stretch;
 }
 
 .window-controls {
@@ -1076,7 +1182,8 @@ body.is-dragging-select-lock * {
 
 .workspace-selector {
   -webkit-app-region: no-drag;
-  flex: 1 1 160px;
+  flex: 0 1 320px;
+  width: 320px;
   min-width: 120px;
   max-width: 320px;
   position: relative;
@@ -1108,6 +1215,15 @@ body.is-dragging-select-lock * {
   border-color: var(--border-strong);
 }
 
+.workspace-btn:disabled {
+  cursor: progress;
+  opacity: 0.86;
+}
+
+.workspace-btn.is-switching {
+  color: var(--text-secondary);
+}
+
 .ws-icon {
   opacity: 0.7;
   flex-shrink: 0;
@@ -1136,6 +1252,16 @@ body.is-dragging-select-lock * {
 
 .ws-chevron.open {
   transform: rotate(180deg);
+}
+
+.workspace-switch-spinner {
+  width: 12px;
+  height: 12px;
+  flex-shrink: 0;
+  border-radius: 999px;
+  border: 2px solid color-mix(in srgb, currentColor 18%, transparent);
+  border-top-color: currentColor;
+  animation: workspace-switch-spin 0.8s linear infinite;
 }
 
 .dir-dropdown {
@@ -1482,6 +1608,12 @@ body.is-dragging-select-lock * {
 }
 
 @keyframes tab-plugin-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes workspace-switch-spin {
   to {
     transform: rotate(360deg);
   }

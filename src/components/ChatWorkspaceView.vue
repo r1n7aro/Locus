@@ -50,6 +50,7 @@ const ASSISTANT_SIDEBAR_SIDE_MAX_WIDTH = 520;
 const ASSISTANT_SIDEBAR_RESIZE_HANDLE_WIDTH = 3;
 const ASSISTANT_SIDEBAR_MAX_WORKSPACE_RATIO = 0.34;
 const THINKING_PANEL_SIDE_WIDTH = 340;
+const SIDEBAR_ENTER_TRANSITION_MS = 200;
 const SIDEBAR_EXIT_TRANSITION_MS = 180;
 const fixedAuxiliarySideWidth = computed(() =>
   chatStore.showThinkingPanel ? THINKING_PANEL_SIDE_WIDTH : 0,
@@ -71,9 +72,128 @@ const assistantSidebarMaxSideWidth = computed(() => {
   );
 });
 let workspaceResizeObserver: ResizeObserver | null = null;
-let workspaceResizeFrame = 0;
 
 function handleLayoutModeChange(_mode: ResolvedChatLayoutMode) {}
+
+function beforeEnterSidebarPanel(element: Element) {
+  const shell = element as HTMLElement;
+  const isBottomLayout = shell.classList.contains("layout-bottom");
+  shell.dataset.enterAxis = isBottomLayout ? "vertical" : "horizontal";
+  shell.style.pointerEvents = "none";
+  shell.style.overflow = "hidden";
+  shell.style.opacity = "0";
+  shell.style.transform = isBottomLayout ? "translateY(8px)" : "translateX(12px)";
+  shell.style.willChange = "width, min-width, max-width, height, min-height, max-height, transform, opacity";
+
+  if (isBottomLayout) {
+    shell.style.height = "0px";
+    shell.style.minHeight = "0px";
+    shell.style.maxHeight = "0px";
+    return;
+  }
+
+  shell.style.width = "0px";
+  shell.style.minWidth = "0px";
+  shell.style.maxWidth = "0px";
+}
+
+function enterSidebarPanel(element: Element, done: () => void) {
+  const shell = element as HTMLElement;
+  const isBottomLayout = shell.dataset.enterAxis === "vertical";
+  let finished = false;
+  let fallbackTimer = 0;
+  let measureFrame = 0;
+  let enterFrame = 0;
+  let finishFrame = 0;
+  const finish = () => {
+    if (finished) return;
+    finished = true;
+    cancelAnimationFrame(measureFrame);
+    cancelAnimationFrame(enterFrame);
+    cancelAnimationFrame(finishFrame);
+    window.clearTimeout(fallbackTimer);
+    shell.removeEventListener("transitionend", onTransitionEnd);
+    done();
+  };
+  const queueFinish = () => {
+    if (finishFrame) return;
+    finishFrame = requestAnimationFrame(finish);
+  };
+  const onTransitionEnd = (event: TransitionEvent) => {
+    if (event.target !== shell) return;
+    if (isBottomLayout && event.propertyName === "height") queueFinish();
+    if (!isBottomLayout && event.propertyName === "width") queueFinish();
+  };
+
+  const startEnterTransition = () => {
+    if (finished) return;
+    shell.style.transition = "none";
+    if (isBottomLayout) {
+      shell.style.height = "";
+      shell.style.minHeight = "";
+      shell.style.maxHeight = "";
+    } else {
+      shell.style.width = "";
+      shell.style.minWidth = "";
+      shell.style.maxWidth = "";
+    }
+
+    const rect = shell.getBoundingClientRect();
+    const targetSize = isBottomLayout ? rect.height : rect.width;
+    if (targetSize <= 0) {
+      finish();
+      return;
+    }
+
+    if (isBottomLayout) {
+      shell.style.height = "0px";
+      shell.style.minHeight = "0px";
+      shell.style.maxHeight = "0px";
+    } else {
+      shell.style.width = "0px";
+      shell.style.minWidth = "0px";
+      shell.style.maxWidth = "0px";
+    }
+    shell.getBoundingClientRect();
+    shell.addEventListener("transitionend", onTransitionEnd);
+    shell.style.transition = [
+      `width ${SIDEBAR_ENTER_TRANSITION_MS}ms cubic-bezier(0.2, 0, 0, 1)`,
+      `min-width ${SIDEBAR_ENTER_TRANSITION_MS}ms cubic-bezier(0.2, 0, 0, 1)`,
+      `max-width ${SIDEBAR_ENTER_TRANSITION_MS}ms cubic-bezier(0.2, 0, 0, 1)`,
+      `height ${SIDEBAR_ENTER_TRANSITION_MS}ms cubic-bezier(0.2, 0, 0, 1)`,
+      `min-height ${SIDEBAR_ENTER_TRANSITION_MS}ms cubic-bezier(0.2, 0, 0, 1)`,
+      `max-height ${SIDEBAR_ENTER_TRANSITION_MS}ms cubic-bezier(0.2, 0, 0, 1)`,
+      `transform ${SIDEBAR_ENTER_TRANSITION_MS}ms cubic-bezier(0.2, 0, 0, 1)`,
+      "opacity 160ms ease",
+    ].join(", ");
+
+    enterFrame = requestAnimationFrame(() => {
+      shell.style.opacity = "1";
+      shell.style.transform = "translate(0, 0)";
+      if (isBottomLayout) {
+        shell.style.height = `${targetSize}px`;
+        shell.style.minHeight = `${targetSize}px`;
+        shell.style.maxHeight = `${targetSize}px`;
+        return;
+      }
+      shell.style.width = `${targetSize}px`;
+      shell.style.minWidth = `${targetSize}px`;
+      shell.style.maxWidth = `${targetSize}px`;
+    });
+
+    fallbackTimer = window.setTimeout(finish, SIDEBAR_ENTER_TRANSITION_MS + 100);
+  };
+
+  void nextTick(() => {
+    measureFrame = requestAnimationFrame(startEnterTransition);
+  });
+}
+
+function afterEnterSidebarPanel(element: Element) {
+  const shell = element as HTMLElement;
+  delete shell.dataset.enterAxis;
+  shell.removeAttribute("style");
+}
 
 function beforeLeaveSidebarPanel(element: Element) {
   const shell = element as HTMLElement;
@@ -153,22 +273,19 @@ function afterLeaveSidebarPanel(element: Element) {
   shell.removeAttribute("style");
 }
 
+function setWorkspaceWidth(width: number) {
+  const nextWidth = Math.max(0, Math.round(width));
+  if (workspaceWidth.value === nextWidth) return;
+  workspaceWidth.value = nextWidth;
+}
+
 function updateWorkspaceWidth() {
-  workspaceWidth.value = workspaceRef.value?.clientWidth ?? 0;
+  setWorkspaceWidth(workspaceRef.value?.clientWidth ?? 0);
 }
 
-function cancelWorkspaceWidthUpdate() {
-  if (!workspaceResizeFrame) return;
-  cancelAnimationFrame(workspaceResizeFrame);
-  workspaceResizeFrame = 0;
-}
-
-function scheduleWorkspaceWidthUpdate() {
-  if (workspaceResizeFrame) return;
-  workspaceResizeFrame = requestAnimationFrame(() => {
-    workspaceResizeFrame = 0;
-    updateWorkspaceWidth();
-  });
+function handleWorkspaceResize(entries: ResizeObserverEntry[]) {
+  const width = entries[0]?.contentRect.width ?? workspaceRef.value?.clientWidth ?? 0;
+  setWorkspaceWidth(width);
 }
 
 function disconnectWorkspaceResizeObserver() {
@@ -180,7 +297,7 @@ function connectWorkspaceResizeObserver() {
   disconnectWorkspaceResizeObserver();
   updateWorkspaceWidth();
   if (typeof ResizeObserver === "undefined" || !workspaceRef.value) return;
-  workspaceResizeObserver = new ResizeObserver(scheduleWorkspaceWidthUpdate);
+  workspaceResizeObserver = new ResizeObserver(handleWorkspaceResize);
   workspaceResizeObserver.observe(workspaceRef.value);
 }
 
@@ -217,7 +334,6 @@ onMounted(() => {
 });
 
 onUnmounted(() => {
-  cancelWorkspaceWidthUpdate();
   disconnectWorkspaceResizeObserver();
 });
 </script>
@@ -295,6 +411,9 @@ onUnmounted(() => {
     />
     <Transition
       :css="false"
+      @before-enter="beforeEnterSidebarPanel"
+      @enter="enterSidebarPanel"
+      @after-enter="afterEnterSidebarPanel"
       @before-leave="beforeLeaveSidebarPanel"
       @leave="leaveSidebarPanel"
       @after-leave="afterLeaveSidebarPanel"
@@ -315,7 +434,7 @@ onUnmounted(() => {
 
 <style scoped>
 .chat-workspace-view {
-  flex: 1;
+  flex: 1 1 0;
   display: flex;
   width: 100%;
   height: 100%;

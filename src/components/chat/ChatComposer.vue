@@ -192,6 +192,8 @@ watch(() => props.maxHeight, () => {
   position: relative;
   display: flex;
   flex-direction: column;
+  width: 100%;
+  min-width: 0;
   overflow: visible;
   background: var(--input-bg);
   border: 1px solid var(--border-color);
@@ -221,6 +223,7 @@ watch(() => props.maxHeight, () => {
 }
 
 .chat-composer.is-compact {
+  box-sizing: border-box;
   min-height: 44px;
   padding: 7px 10px;
 }

@@ -2,10 +2,19 @@ import { ref } from "vue";
 import { defineStore } from "pinia";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { Window as TauriWindow } from "@tauri-apps/api/window";
+import { listen } from "@tauri-apps/api/event";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { hasTauriWindowRuntime } from "../services/tauriRuntime";
 
-const WINDOW_RESIZE_SETTLE_DELAY_MS = 120;
+const WINDOW_RESIZE_SETTLE_DELAY_MS = 420;
+const MIN_TRACKABLE_WINDOW_WIDTH_PX = 320;
+const MIN_TRACKABLE_WINDOW_HEIGHT_PX = 120;
+const NATIVE_WINDOW_CLIENT_SIZE_EVENT = "locus-native-window-client-size";
+
+interface NativeWindowClientSizeEvent {
+  width: number;
+  height: number;
+}
 
 export const useUiStore = defineStore("ui", () => {
   const activeTab = ref<"chat" | "collab" | "knowledge" | "asset" | "agent" | "settings">("chat");
@@ -13,6 +22,8 @@ export const useUiStore = defineStore("ui", () => {
   const alwaysOnTop = ref(false);
   const isMaximized = ref(false);
   const isWindowResizing = ref(false);
+  const nativeWindowWidth = ref<number | null>(null);
+  const nativeWindowHeight = ref<number | null>(null);
   const showOnboarding = ref(false);
   const pendingChatPrefill = ref<{ id: number; text: string } | null>(null);
   const pendingKnowledgeSelection = ref<{
@@ -29,6 +40,7 @@ export const useUiStore = defineStore("ui", () => {
 
   let appWindow: TauriWindow | null = null;
   let unlistenResize: UnlistenFn | null = null;
+  let unlistenNativeClientSize: UnlistenFn | null = null;
   let resizeSettleTimer: ReturnType<typeof setTimeout> | null = null;
   let maximizedSyncSeq = 0;
 
@@ -61,6 +73,23 @@ export const useUiStore = defineStore("ui", () => {
     resizeSettleTimer = null;
   }
 
+  function devicePixelRatioScale(): number {
+    if (typeof window === "undefined") return 1;
+    return Number.isFinite(window.devicePixelRatio) && window.devicePixelRatio > 0
+      ? window.devicePixelRatio
+      : 1;
+  }
+
+  function normalizeNativeDimension(value?: number): number | undefined {
+    if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return undefined;
+    return Math.max(1, Math.round(value / devicePixelRatioScale()));
+  }
+
+  function isTrackableWindowSize(width: number | undefined, height?: number): width is number {
+    if (width === undefined || width < MIN_TRACKABLE_WINDOW_WIDTH_PX) return false;
+    return height === undefined || height >= MIN_TRACKABLE_WINDOW_HEIGHT_PX;
+  }
+
   async function syncMaximizedState() {
     const syncSeq = ++maximizedSyncSeq;
     const window = resolveAppWindow();
@@ -80,14 +109,32 @@ export const useUiStore = defineStore("ui", () => {
     }
   }
 
-  function scheduleWindowResizeSettle() {
+  function markWindowResizeInProgress() {
     isWindowResizing.value = true;
     clearResizeSettleTimer();
     resizeSettleTimer = setTimeout(() => {
       resizeSettleTimer = null;
       isWindowResizing.value = false;
+      nativeWindowWidth.value = null;
+      nativeWindowHeight.value = null;
       void syncMaximizedState();
     }, WINDOW_RESIZE_SETTLE_DELAY_MS);
+  }
+
+  function scheduleWindowResizeSettle(width?: number, height?: number) {
+    const observedWidth = normalizeNativeDimension(width);
+    const observedHeight = normalizeNativeDimension(height);
+    if (width !== undefined && !isTrackableWindowSize(observedWidth, observedHeight)) return;
+    markWindowResizeInProgress();
+  }
+
+  function applyNativeWindowClientSize(width: number, height: number) {
+    const observedWidth = normalizeNativeDimension(width);
+    const observedHeight = normalizeNativeDimension(height);
+    if (observedHeight === undefined || !isTrackableWindowSize(observedWidth, observedHeight)) return;
+    nativeWindowWidth.value = observedWidth;
+    nativeWindowHeight.value = observedHeight;
+    markWindowResizeInProgress();
   }
 
   async function init() {
@@ -95,11 +142,23 @@ export const useUiStore = defineStore("ui", () => {
     const window = resolveAppWindow();
     if (window) {
       try {
-        unlistenResize = await window.onResized(() => {
-          scheduleWindowResizeSettle();
+        unlistenResize = await window.onResized((event) => {
+          scheduleWindowResizeSettle(event.payload.width, event.payload.height);
         });
       } catch (error) {
         console.error("Failed to listen for window resize:", error);
+      }
+    }
+    if (hasTauriWindowRuntime()) {
+      try {
+        unlistenNativeClientSize = await listen<NativeWindowClientSizeEvent>(
+          NATIVE_WINDOW_CLIENT_SIZE_EVENT,
+          (event) => {
+            applyNativeWindowClientSize(event.payload.width, event.payload.height);
+          },
+        );
+      } catch (error) {
+        console.error("Failed to listen for native window client size:", error);
       }
     }
     try {
@@ -114,9 +173,13 @@ export const useUiStore = defineStore("ui", () => {
   function cleanup() {
     clearResizeSettleTimer();
     isWindowResizing.value = false;
+    nativeWindowWidth.value = null;
+    nativeWindowHeight.value = null;
     maximizedSyncSeq += 1;
     unlistenResize?.();
     unlistenResize = null;
+    unlistenNativeClientSize?.();
+    unlistenNativeClientSize = null;
   }
 
   function setTab(tab: typeof activeTab.value) {
@@ -182,6 +245,8 @@ export const useUiStore = defineStore("ui", () => {
     await resolveAppWindow()?.toggleMaximize();
     clearResizeSettleTimer();
     isWindowResizing.value = false;
+    nativeWindowWidth.value = null;
+    nativeWindowHeight.value = null;
     await syncMaximizedState();
   }
   async function winClose() {
@@ -205,6 +270,8 @@ export const useUiStore = defineStore("ui", () => {
     alwaysOnTop,
     isMaximized,
     isWindowResizing,
+    nativeWindowWidth,
+    nativeWindowHeight,
     showOnboarding,
     pendingChatPrefill,
     pendingKnowledgeSelection,

@@ -99,6 +99,7 @@ describe("chat panel toggle layout", () => {
     expect(composer).toContain('v-if="hasFooter"');
     expect(composer).toContain('v-if="showAction"');
     expect(composer).toContain(".chat-composer.is-compact {");
+    expect(composer).toMatch(/\.chat-composer\.is-compact \{[\s\S]*box-sizing: border-box;[\s\S]*min-height: 44px;/);
     expect(chatView).toMatch(/\.chat-view\.is-vertical-layout :deep\(\.chat-composer-footer-end\) \{[\s\S]*align-self: flex-end;[\s\S]*justify-content: flex-end;[\s\S]*margin-left: auto;/);
     expect(chatView).not.toMatch(/<ChatTranscript[\s\S]*<template #footer>[\s\S]*hasPanelToggleRow/);
     expect(chatView).not.toContain("<AgentSelector");

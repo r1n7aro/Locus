@@ -19,8 +19,30 @@ const tauriWindowMocks = vi.hoisted(() => {
   return {
     ...windowMock,
     getCurrentWindow: vi.fn(() => windowMock),
-    emitResize() {
-      resizedHandler?.({ payload: { width: 1440, height: 900 } });
+    emitResize(width = 1440, height = 900) {
+      resizedHandler?.({ payload: { width, height } });
+    },
+  };
+});
+
+const tauriEventMocks = vi.hoisted(() => {
+  let listeners = new Map<string, (event: { payload: { width: number; height: number } }) => void>();
+
+  return {
+    listen: vi.fn(async (
+      eventName: string,
+      handler: (event: { payload: { width: number; height: number } }) => void,
+    ) => {
+      listeners.set(eventName, handler);
+      return () => {
+        listeners.delete(eventName);
+      };
+    }),
+    emitNativeClientSize(width = 1440, height = 900) {
+      listeners.get("locus-native-window-client-size")?.({ payload: { width, height } });
+    },
+    reset() {
+      listeners = new Map<string, (event: { payload: { width: number; height: number } }) => void>();
     },
   };
 });
@@ -49,6 +71,10 @@ vi.mock("@tauri-apps/api/window", () => ({
   getCurrentWindow: tauriWindowMocks.getCurrentWindow,
 }));
 
+vi.mock("@tauri-apps/api/event", () => ({
+  listen: tauriEventMocks.listen,
+}));
+
 vi.mock("../services/tauriRuntime", () => ({
   hasTauriWindowRuntime: tauriRuntimeMocks.hasTauriWindowRuntime,
 }));
@@ -60,6 +86,7 @@ describe("ui store window resize sync", () => {
     vi.clearAllMocks();
     vi.stubGlobal("localStorage", localStorageMock as unknown as Storage);
     localStorageMock.clear();
+    tauriEventMocks.reset();
     tauriRuntimeMocks.hasTauriWindowRuntime.mockReturnValue(true);
     tauriWindowMocks.isMaximized.mockResolvedValue(false);
   });
@@ -83,13 +110,23 @@ describe("ui store window resize sync", () => {
 
     expect(tauriWindowMocks.isMaximized).toHaveBeenCalledTimes(1);
     expect(store.isWindowResizing).toBe(true);
+    expect(store.nativeWindowWidth).toBeNull();
+    expect(store.nativeWindowHeight).toBeNull();
+
+    tauriEventMocks.emitNativeClientSize();
+
+    expect(store.isWindowResizing).toBe(true);
+    expect(store.nativeWindowWidth).toBe(1440);
+    expect(store.nativeWindowHeight).toBe(900);
 
     tauriWindowMocks.isMaximized.mockResolvedValueOnce(true);
-    await vi.advanceTimersByTimeAsync(120);
+    await vi.advanceTimersByTimeAsync(420);
 
     expect(tauriWindowMocks.isMaximized).toHaveBeenCalledTimes(2);
     expect(store.isMaximized).toBe(true);
     expect(store.isWindowResizing).toBe(false);
+    expect(store.nativeWindowWidth).toBeNull();
+    expect(store.nativeWindowHeight).toBeNull();
   });
 
   it("refreshes maximized state immediately after toggling maximize", async () => {
@@ -128,6 +165,63 @@ describe("ui store window resize sync", () => {
 
     expect(store.activeTab).toBe("chat");
     expect(store.knowledgeMounted).toBe(false);
+  });
+
+  it("does not derive layout offsets from unstable WebView screen coordinates", async () => {
+    const windowMock = {
+      innerWidth: 1200,
+      innerHeight: 900,
+      devicePixelRatio: 2,
+      screenX: 100,
+      screenLeft: 100,
+    };
+    vi.stubGlobal("window", windowMock);
+    const store = useUiStore();
+
+    await store.init();
+
+    windowMock.innerWidth = 1200;
+    windowMock.screenX = 160;
+    windowMock.screenLeft = 160;
+    tauriWindowMocks.emitResize(2280);
+
+    expect("windowResizeAnchor" in store).toBe(false);
+    expect("resizeAnchorWidth" in store).toBe(false);
+    expect(store.isWindowResizing).toBe(true);
+    expect(store.nativeWindowWidth).toBeNull();
+
+    tauriEventMocks.emitNativeClientSize(2280, 1800);
+
+    expect(store.nativeWindowWidth).toBe(1140);
+    expect(store.nativeWindowHeight).toBe(900);
+
+    windowMock.innerWidth = 1140;
+    tauriWindowMocks.isMaximized.mockResolvedValueOnce(false);
+    await vi.advanceTimersByTimeAsync(420);
+
+    expect(store.isWindowResizing).toBe(false);
+  });
+
+  it("ignores minimized offscreen resize dimensions", async () => {
+    const windowMock = {
+      innerWidth: 1200,
+      innerHeight: 900,
+      devicePixelRatio: 1,
+    };
+    vi.stubGlobal("window", windowMock);
+    const store = useUiStore();
+
+    await store.init();
+
+    tauriWindowMocks.emitResize(160, 28);
+    await vi.advanceTimersByTimeAsync(420);
+
+    expect(store.isWindowResizing).toBe(false);
+
+    windowMock.innerWidth = 1274;
+    tauriWindowMocks.emitResize(1274, 900);
+
+    expect(store.isWindowResizing).toBe(true);
   });
 
   it("initializes local UI state when the Tauri window runtime is unavailable", async () => {

@@ -1,10 +1,17 @@
 import { ref, onMounted, onUnmounted } from "vue";
+import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
+import { hasTauriWindowRuntime } from "../services/tauriRuntime";
 
 export type ThemePreference = "system" | "light" | "dark";
 
 const STORAGE_KEY = "locus-theme-preference";
+const THEME_BACKGROUND_COLOR: Record<"light" | "dark", string> = {
+  light: "#f6f7f8",
+  dark: "#1d1d21",
+};
 
 const preference = ref<ThemePreference>(readPreference());
+let lastNativeBackgroundColor: string | null = null;
 
 function readPreference(): ThemePreference {
   try {
@@ -21,6 +28,18 @@ function resolveTheme(pref: ThemePreference): "light" | "dark" {
 
 function applyTheme(theme: "light" | "dark") {
   document.documentElement.setAttribute("data-theme", theme);
+  syncNativeBackgroundColor(theme);
+}
+
+function syncNativeBackgroundColor(theme: "light" | "dark") {
+  if (!hasTauriWindowRuntime()) return;
+  const color = THEME_BACKGROUND_COLOR[theme];
+  if (lastNativeBackgroundColor === color) return;
+  lastNativeBackgroundColor = color;
+  void getCurrentWebviewWindow().setBackgroundColor(color).catch((error) => {
+    lastNativeBackgroundColor = null;
+    console.warn("Failed to sync native window background color:", error);
+  });
 }
 
 let mediaQuery: MediaQueryList | null = null;

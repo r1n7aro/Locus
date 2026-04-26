@@ -17,14 +17,17 @@ describe("chat sidebar layout", () => {
     const settingsState = read("src/composables/useSettingsState.ts");
 
     expect(workspace).toContain(":css=\"false\"");
+    expect(workspace).toContain("@before-enter=\"beforeEnterSidebarPanel\"");
+    expect(workspace).toContain("@enter=\"enterSidebarPanel\"");
+    expect(workspace).toContain("@after-enter=\"afterEnterSidebarPanel\"");
     expect(workspace).toContain("@before-leave=\"beforeLeaveSidebarPanel\"");
     expect(workspace).toContain("@leave=\"leaveSidebarPanel\"");
+    expect(workspace).toContain("SIDEBAR_ENTER_TRANSITION_MS");
     expect(workspace).toContain("<ChatSidebarPanel");
     expect(workspace).toContain(":layout=\"isVerticalLayout ? 'bottom' : 'side'\"");
     expect(workspace).toContain("shell.style.width = \"0px\";");
     expect(workspace).toContain("shell.style.minWidth = \"0px\";");
     expect(workspace).toContain('shell.style.transform = "translateX(100%)";');
-    expect(workspace).not.toContain("@enter=");
     expect(sidebar).toContain("<TodoPanel");
     expect(sidebar).toContain("<ChatChangesPanel");
     expect(sidebar).toContain("class=\"chat-sidebar-panel\"");

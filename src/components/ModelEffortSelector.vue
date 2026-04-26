@@ -222,8 +222,9 @@ onUnmounted(() => document.removeEventListener("click", onClickOutside));
   display: flex;
   align-items: center;
   gap: 5px;
+  min-width: 0;
   min-height: 28px;
-  max-width: 280px;
+  max-width: min(280px, 100%);
   padding: 4px 7px;
   border: 1px solid transparent;
   border-radius: 6px;
@@ -253,6 +254,7 @@ onUnmounted(() => document.removeEventListener("click", onClickOutside));
 }
 
 .model-effort-model {
+  flex: 1 1 auto;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
