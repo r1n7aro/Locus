@@ -179,7 +179,7 @@ namespace Locus
                 width = _screenWidth,
                 height = _screenHeight,
                 visible = visible && _screenWidth > 12 && _screenHeight > 12 && IsSelectedDockTab(),
-                parentHwnd = GetUnityMainHwnd()
+                parentHwnd = GetUnityHostHwnd(_screenX, _screenY, _screenWidth, _screenHeight)
             };
         }
 
@@ -735,6 +735,17 @@ namespace Locus
         }
 #endif
 
+        private static long GetUnityHostHwnd(int screenX, int screenY, int width, int height)
+        {
+#if UNITY_EDITOR_WIN
+            IntPtr host = FindUnityHostWindowForRect(screenX, screenY, width, height);
+            if (host != IntPtr.Zero)
+                return host.ToInt64();
+#endif
+
+            return GetUnityMainHwnd();
+        }
+
         private static long GetUnityMainHwnd()
         {
             IntPtr hwnd = IntPtr.Zero;
@@ -759,6 +770,76 @@ namespace Locus
 
             return hwnd.ToInt64();
         }
+
+#if UNITY_EDITOR_WIN
+        private static IntPtr FindUnityHostWindowForRect(int screenX, int screenY, int width, int height)
+        {
+            if (width <= 0 || height <= 0)
+                return IntPtr.Zero;
+
+            uint unityProcessId = (uint)Process.GetCurrentProcess().Id;
+            NativeRect target = new NativeRect
+            {
+                left = screenX,
+                top = screenY,
+                right = screenX + width,
+                bottom = screenY + height
+            };
+            IntPtr bestHwnd = IntPtr.Zero;
+            long bestIntersection = 0;
+            long bestArea = long.MaxValue;
+
+            EnumWindows(delegate (IntPtr hwnd, IntPtr lParam)
+            {
+                if (!IsWindowVisible(hwnd))
+                    return true;
+
+                uint processId;
+                GetWindowThreadProcessId(hwnd, out processId);
+                if (processId != unityProcessId)
+                    return true;
+
+                NativeRect rect;
+                if (!GetWindowRect(hwnd, out rect))
+                    return true;
+
+                long intersection = IntersectionArea(target, rect);
+                if (intersection <= 0)
+                    return true;
+
+                long area = RectArea(rect);
+                if (intersection > bestIntersection
+                    || (intersection == bestIntersection && area < bestArea))
+                {
+                    bestHwnd = hwnd;
+                    bestIntersection = intersection;
+                    bestArea = area;
+                }
+
+                return true;
+            }, IntPtr.Zero);
+
+            return bestHwnd;
+        }
+
+        private static long IntersectionArea(NativeRect a, NativeRect b)
+        {
+            int left = Math.Max(a.left, b.left);
+            int top = Math.Max(a.top, b.top);
+            int right = Math.Min(a.right, b.right);
+            int bottom = Math.Min(a.bottom, b.bottom);
+            if (right <= left || bottom <= top)
+                return 0;
+            return (long)(right - left) * (bottom - top);
+        }
+
+        private static long RectArea(NativeRect rect)
+        {
+            int width = Math.Max(0, rect.right - rect.left);
+            int height = Math.Max(0, rect.bottom - rect.top);
+            return (long)width * height;
+        }
+#endif
 
         private static string GetProjectPath()
         {
@@ -917,5 +998,33 @@ namespace Locus
 
         [DllImport("user32.dll")]
         private static extern IntPtr GetAncestor(IntPtr hwnd, uint gaFlags);
+
+#if UNITY_EDITOR_WIN
+        private delegate bool EnumWindowsProc(IntPtr hwnd, IntPtr lParam);
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct NativeRect
+        {
+            public int left;
+            public int top;
+            public int right;
+            public int bottom;
+        }
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool IsWindowVisible(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GetWindowRect(IntPtr hWnd, out NativeRect lpRect);
+#endif
     }
 }

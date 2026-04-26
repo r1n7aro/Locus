@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
-use tauri::Manager;
+use tauri::{Manager, WindowEvent};
 
 mod agent;
 pub mod asset_db;
@@ -34,11 +34,15 @@ pub mod unity_csharp;
 mod unity_docs;
 pub mod unity_yaml;
 pub mod vcs;
+#[cfg(target_os = "windows")]
+mod windows_resize_sync;
 mod workspace;
 
 use agent::definition::AgentDefRegistry;
 use agent::instance::RawContextStore;
 use commands::AppKnowledgeDir;
+
+const MAIN_WINDOW_LABEL: &str = "main";
 
 #[derive(Clone)]
 pub struct AppAgentDir(pub Arc<Option<std::path::PathBuf>>);
@@ -149,6 +153,18 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
+        .on_window_event(|window, event| {
+            if window.label() != MAIN_WINDOW_LABEL {
+                return;
+            }
+
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let app_handle = window.app_handle().clone();
+                commands::destroy_unity_embed_control_window_on_main(&app_handle);
+                app_handle.exit(0);
+            }
+        })
         .setup(move |app| {
             log_store_for_setup.attach_app_handle(app.handle().clone());
             if let Err(error) = commands::ensure_windows_notification_identity(&app.handle().clone())
@@ -505,6 +521,10 @@ pub fn run() {
             app.manage(feishu_reference_import_state);
             app.manage(log_store_for_setup.clone());
             commands::start_unity_embed_control_server(app.handle().clone());
+            #[cfg(target_os = "windows")]
+            if let Err(error) = windows_resize_sync::install_for_main_window(app) {
+                eprintln!("[Locus] warning: failed to install WebView2 resize sync: {error}");
+            }
 
             let app_handle = app.handle().clone();
             let workspace_for_unity = workspace.clone();
@@ -609,6 +629,9 @@ pub fn run() {
             commands::install_unity_plugin,
             commands::send_unity_log,
             commands::select_unity_asset,
+            commands::open_unity_asset_inspector,
+            commands::select_unity_scene_object,
+            commands::open_unity_scene_object_inspector,
             commands::ref_graph_status,
             commands::ref_graph_scan,
             commands::asset_db_overview,
@@ -776,6 +799,9 @@ pub fn run() {
             commands::get_log_entries,
             commands::clear_log_entries,
             commands::unity_embed_status,
+            commands::unity_embed_set_mouse_activation_suppressed,
+            commands::unity_embed_activate_for_input,
+            commands::unity_embed_focus_debug_snapshot,
             commands::fetch_app_update_manifest,
         ])
         .run(tauri::generate_context!())
