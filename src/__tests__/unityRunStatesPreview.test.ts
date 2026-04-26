@@ -161,4 +161,32 @@ describe("unityRunStatesPreview", () => {
     expect(read("src/components/tool-block-overrides/UnityRunStatesToolBlock.vue")).toContain("showFinalSections");
     expect(read("src/components/chat/ToolConfirmCard.vue")).toContain("<UnityRunStatesPreview");
   });
+
+  it("keeps unity_run_states runtime progress above the collapsible tool details", () => {
+    const source = read("src/components/tool-block-overrides/UnityRunStatesToolBlock.vue");
+    const headerIndex = source.indexOf("class=\"tool-call-header");
+    const progressIndex = source.indexOf("class=\"tool-call-progress-line");
+    const detailIndex = source.indexOf("class=\"tool-call-detail");
+
+    expect(headerIndex).toBeGreaterThanOrEqual(0);
+    expect(progressIndex).toBeGreaterThanOrEqual(0);
+    expect(detailIndex).toBeGreaterThanOrEqual(0);
+    expect(headerIndex).toBeLessThan(progressIndex);
+    expect(progressIndex).toBeLessThan(detailIndex);
+    expect(source).toContain("v-if=\"runtimePreview\"");
+    expect(source).toContain("v-if=\"infoExpanded && hasInfoDetail\"");
+    expect(source).toContain("const isFramed = computed(() => infoExpanded.value || Boolean(runtimePreview.value))");
+    expect(source).toContain("'is-framed': isFramed");
+    expect(source).toContain("const infoExpanded = ref(false)");
+    expect(source).not.toContain("collapseTimer");
+    expect(source).not.toContain("1400");
+    expect(source).toContain("class=\"unity-tool-call-block unity-run-tool-block\"");
+    expect(source).not.toContain("class=\"tool-call-block unity-run-tool-block\"");
+    expect(source).toMatch(/\.unity-tool-call-block\s*\{[\s\S]*border:\s*1px solid transparent/);
+    expect(source).toMatch(/\.unity-tool-call-block\.is-framed\s*\{[\s\S]*border:\s*1px solid color-mix\(in srgb, #8b7cf6 46%, var\(--border-color\)\)/);
+    expect(source).toMatch(/\.tool-call-detail\s*\{[\s\S]*padding:\s*6px 2px 0 20px/);
+    expect(source).toMatch(/\.tool-call-progress-line\s*\{[\s\S]*padding:\s*5px 2px 0 20px/);
+    expect(source).toMatch(/\.tool-call-progress-line\s*\{[\s\S]*border-top:\s*1px solid color-mix\(in srgb, var\(--border-color\) 58%, transparent\)/);
+    expect(source).toMatch(/\.unity-run-progress\s*\{[\s\S]*background:\s*transparent/);
+  });
 });

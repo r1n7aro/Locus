@@ -36,6 +36,36 @@ pub struct PipeResponse {
     pub message: Option<String>,
 }
 
+pub const UNITY_EXECUTE_PROGRESS_TAG: &str = "locus-unity-progress";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnityExecuteProgressSnapshot {
+    #[serde(default)]
+    pub active: bool,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub info: String,
+    #[serde(default)]
+    pub progress: f32,
+    #[serde(default)]
+    pub revision: u64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SelectAssetRequest<'a> {
+    asset_path: &'a str,
+    focus_project_window: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SceneObjectRequest<'a> {
+    scene_path: &'a str,
+    object_path: &'a str,
+}
+
 type ProjectUnityOpLock = Arc<Mutex<()>>;
 
 fn unity_operation_locks() -> &'static Mutex<HashMap<String, ProjectUnityOpLock>> {
@@ -127,6 +157,96 @@ pub async fn is_unity_connected(project_path: &str) -> bool {
     match send_message(project_path, "ping", "").await {
         Ok(resp) => resp.ok,
         Err(_) => false,
+    }
+}
+
+pub async fn select_asset(
+    project_path: &str,
+    asset_path: &str,
+    focus_project_window: bool,
+) -> Result<(), String> {
+    let op_lock = project_unity_op_lock(project_path).await;
+    let _guard = op_lock.lock().await;
+    let _prev_foreground = if focus_project_window {
+        focus::bring_unity_to_foreground()
+    } else {
+        None
+    };
+    let payload = serde_json::to_string(&SelectAssetRequest {
+        asset_path,
+        focus_project_window,
+    })
+    .map_err(|e| e.to_string())?;
+    let resp = send_message(project_path, "select_asset", &payload).await?;
+    if resp.ok {
+        Ok(())
+    } else {
+        Err(resp
+            .error
+            .unwrap_or_else(|| "select_asset failed".to_string()))
+    }
+}
+
+pub async fn open_asset_inspector(project_path: &str, asset_path: &str) -> Result<(), String> {
+    let op_lock = project_unity_op_lock(project_path).await;
+    let _guard = op_lock.lock().await;
+    let payload = serde_json::to_string(&SelectAssetRequest {
+        asset_path,
+        focus_project_window: false,
+    })
+    .map_err(|e| e.to_string())?;
+    let resp = send_message(project_path, "open_asset_inspector", &payload).await?;
+    if resp.ok {
+        Ok(())
+    } else {
+        Err(resp
+            .error
+            .unwrap_or_else(|| "open_asset_inspector failed".to_string()))
+    }
+}
+
+pub async fn select_scene_object(
+    project_path: &str,
+    scene_path: &str,
+    object_path: &str,
+) -> Result<(), String> {
+    let op_lock = project_unity_op_lock(project_path).await;
+    let _guard = op_lock.lock().await;
+    let _prev_foreground = focus::bring_unity_to_foreground();
+    let payload = serde_json::to_string(&SceneObjectRequest {
+        scene_path,
+        object_path,
+    })
+    .map_err(|e| e.to_string())?;
+    let resp = send_message(project_path, "select_scene_object", &payload).await?;
+    if resp.ok {
+        Ok(())
+    } else {
+        Err(resp
+            .error
+            .unwrap_or_else(|| "select_scene_object failed".to_string()))
+    }
+}
+
+pub async fn open_scene_object_inspector(
+    project_path: &str,
+    scene_path: &str,
+    object_path: &str,
+) -> Result<(), String> {
+    let op_lock = project_unity_op_lock(project_path).await;
+    let _guard = op_lock.lock().await;
+    let payload = serde_json::to_string(&SceneObjectRequest {
+        scene_path,
+        object_path,
+    })
+    .map_err(|e| e.to_string())?;
+    let resp = send_message(project_path, "open_scene_object_inspector", &payload).await?;
+    if resp.ok {
+        Ok(())
+    } else {
+        Err(resp
+            .error
+            .unwrap_or_else(|| "open_scene_object_inspector failed".to_string()))
     }
 }
 
@@ -500,10 +620,78 @@ pub fn import_assets_fire_and_forget(project_path: &str, asset_paths: Vec<String
     });
 }
 
+pub fn format_unity_execute_progress_delta(snapshot: &UnityExecuteProgressSnapshot) -> String {
+    let payload = serde_json::to_string(snapshot).unwrap_or_else(|_| {
+        "{\"active\":false,\"title\":\"\",\"info\":\"\",\"progress\":0,\"revision\":0}".to_string()
+    });
+    format!(
+        "<{tag}>{payload}</{tag}>\n",
+        tag = UNITY_EXECUTE_PROGRESS_TAG,
+        payload = payload
+    )
+}
+
+async fn query_unity_execute_progress(project_path: &str) -> Option<UnityExecuteProgressSnapshot> {
+    let resp = send_message_with_timeout(
+        project_path,
+        "execute_code_progress",
+        "",
+        Duration::from_secs(2),
+    )
+    .await
+    .ok()?;
+
+    if !resp.ok {
+        return None;
+    }
+
+    let message = resp.message?;
+    serde_json::from_str(&message).ok()
+}
+
+pub async fn unity_execute_code_with_progress<F>(
+    project_path: &str,
+    code: &str,
+    mut on_progress: F,
+) -> Result<String, String>
+where
+    F: FnMut(UnityExecuteProgressSnapshot) + Send,
+{
+    let op_lock = project_unity_op_lock(project_path).await;
+    let _guard = op_lock.lock().await;
+
+    let execute = send_message_without_timeout(project_path, "execute_code", code);
+    tokio::pin!(execute);
+
+    let mut progress_tick = tokio::time::interval(Duration::from_millis(250));
+    progress_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_progress_revision = 0u64;
+
+    let resp = loop {
+        tokio::select! {
+            result = &mut execute => break result?,
+            _ = progress_tick.tick() => {
+                if let Some(snapshot) = query_unity_execute_progress(project_path).await {
+                    if snapshot.revision != last_progress_revision {
+                        last_progress_revision = snapshot.revision;
+                        on_progress(snapshot);
+                    }
+                }
+            }
+        }
+    };
+
+    if resp.ok {
+        Ok(resp.message.unwrap_or_default())
+    } else {
+        Err(resp.error.unwrap_or_else(|| "unknown error".to_string()))
+    }
+}
+
 pub async fn unity_execute_code(project_path: &str, code: &str) -> Result<String, String> {
     let op_lock = project_unity_op_lock(project_path).await;
     let _guard = op_lock.lock().await;
-    let resp = send_message(project_path, "execute_code", code).await?;
+    let resp = send_message_without_timeout(project_path, "execute_code", code).await?;
     if resp.ok {
         Ok(resp.message.unwrap_or_default())
     } else {

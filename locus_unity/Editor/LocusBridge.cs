@@ -73,16 +73,6 @@ namespace Locus
         private static bool _metadataReferencesReady;
         private static int _snippetAssemblyCounter;
 
-        private sealed class CompiledSnippet
-        {
-            public readonly Func<ScriptGlobals, object> Executor;
-
-            public CompiledSnippet(Func<ScriptGlobals, object> executor)
-            {
-                Executor = executor;
-            }
-        }
-
         // ───────────────── Agent-controlled recompile ─────────────────
 
         private const string SessionKey_RecompileInProgress = "Locus_RecompileInProgress";
@@ -489,6 +479,7 @@ namespace Locus
             _activeScenePath = EditorSceneManager.GetActiveScene().path ?? "";
 
             PumpRunStates();
+            PumpExecuteCodeAsyncRuntime();
 
             // Detect "no compilation started" after request_recompile
             if (_recompileCheckFrames >= 0)
@@ -779,6 +770,71 @@ namespace Locus
             };
         }
 
+        private static SelectAssetRequest ParseSelectAssetRequest(string message)
+        {
+            string payload = (message ?? "").Trim();
+            if (payload.StartsWith("{", StringComparison.Ordinal))
+            {
+                try
+                {
+                    SelectAssetRequest request = JsonUtility.FromJson<SelectAssetRequest>(payload);
+                    if (request != null && !string.IsNullOrEmpty(request.assetPath))
+                    {
+                        request.assetPath = request.assetPath.Trim().Replace('\\', '/');
+                        return request;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogWarning("[Locus] Failed to parse select_asset payload: " + ex.Message);
+                }
+            }
+
+            return new SelectAssetRequest
+            {
+                assetPath = payload.Replace('\\', '/'),
+                focusProjectWindow = true
+            };
+        }
+
+        private static SceneObjectRequest ParseSceneObjectRequest(string message)
+        {
+            string payload = (message ?? "").Trim();
+            if (!payload.StartsWith("{", StringComparison.Ordinal))
+            {
+                string normalized = payload.Replace('\\', '/');
+                int marker = normalized.IndexOf(".unity/", StringComparison.OrdinalIgnoreCase);
+                if (marker >= 0)
+                {
+                    int split = marker + ".unity".Length;
+                    return new SceneObjectRequest
+                    {
+                        scenePath = normalized.Substring(0, split),
+                        objectPath = normalized.Substring(split + 1)
+                    };
+                }
+
+                return new SceneObjectRequest();
+            }
+
+            try
+            {
+                SceneObjectRequest request = JsonUtility.FromJson<SceneObjectRequest>(payload);
+                if (request != null)
+                {
+                    request.scenePath = (request.scenePath ?? "").Trim().Replace('\\', '/');
+                    request.objectPath = (request.objectPath ?? "").Trim().Replace('\\', '/').Trim('/');
+                    return request;
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning("[Locus] Failed to parse scene object payload: " + ex.Message);
+            }
+
+            return new SceneObjectRequest();
+        }
+
         // ───────────────── Message dispatch ─────────────────
 
         /// <summary>
@@ -844,6 +900,9 @@ namespace Locus
 
                     case "execute_code":
                         return await HandleExecuteCode(reqId, msg.message);
+
+                    case "execute_code_progress":
+                        return OkResponse(reqId, GetExecuteCodeProgressJson());
 
                     case "run_states":
                         return await HandleRunStates(reqId, msg.message);
@@ -962,18 +1021,78 @@ namespace Locus
 
                     case "select_asset":
                     {
-                        string assetPath = msg.message ?? "";
+                        SelectAssetRequest request = ParseSelectAssetRequest(msg.message);
                         PostToMainThread(delegate
                         {
-                            var obj = AssetDatabase.LoadMainAssetAtPath(assetPath);
+                            var obj = AssetDatabase.LoadMainAssetAtPath(request.assetPath);
                             if (obj != null)
                             {
                                 Selection.activeObject = obj;
-                                EditorGUIUtility.PingObject(obj);
-                                EditorUtility.FocusProjectWindow();
+                                if (request.focusProjectWindow)
+                                {
+                                    EditorGUIUtility.PingObject(obj);
+                                    EditorUtility.FocusProjectWindow();
+                                }
                             }
                         });
                         return OkResponse(reqId);
+                    }
+
+                    case "open_asset_inspector":
+                    {
+                        SelectAssetRequest request = ParseSelectAssetRequest(msg.message);
+                        var tcs = new TaskCompletionSource<PipeEnvelope>();
+                        PostToMainThread(delegate
+                        {
+                            try
+                            {
+                                LocusAssetInspectorUtility.OpenLockedInspector(request.assetPath);
+                                tcs.SetResult(OkResponse(reqId, "ok"));
+                            }
+                            catch (Exception ex)
+                            {
+                                tcs.SetResult(ErrorResponse(reqId, ex.Message));
+                            }
+                        });
+                        return await tcs.Task;
+                    }
+
+                    case "select_scene_object":
+                    {
+                        SceneObjectRequest request = ParseSceneObjectRequest(msg.message);
+                        var tcs = new TaskCompletionSource<PipeEnvelope>();
+                        PostToMainThread(delegate
+                        {
+                            try
+                            {
+                                LocusSceneObjectUtility.SelectSceneObject(request.scenePath, request.objectPath);
+                                tcs.SetResult(OkResponse(reqId, "ok"));
+                            }
+                            catch (Exception ex)
+                            {
+                                tcs.SetResult(ErrorResponse(reqId, ex.Message));
+                            }
+                        });
+                        return await tcs.Task;
+                    }
+
+                    case "open_scene_object_inspector":
+                    {
+                        SceneObjectRequest request = ParseSceneObjectRequest(msg.message);
+                        var tcs = new TaskCompletionSource<PipeEnvelope>();
+                        PostToMainThread(delegate
+                        {
+                            try
+                            {
+                                LocusSceneObjectUtility.OpenSceneObjectInspector(request.scenePath, request.objectPath);
+                                tcs.SetResult(OkResponse(reqId, "ok"));
+                            }
+                            catch (Exception ex)
+                            {
+                                tcs.SetResult(ErrorResponse(reqId, ex.Message));
+                            }
+                        });
+                        return await tcs.Task;
                     }
 
                     case "read_yaml":

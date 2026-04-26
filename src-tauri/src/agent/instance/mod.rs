@@ -1847,13 +1847,11 @@ impl AgentInstance {
             "read" | "write" | "edit" => require_non_empty("filePath", "to be set explicitly")
                 .or_else(|| require_absolute_without_workspace("filePath"))
                 .or_else(|| require_workspace_bound("filePath")),
-            "unity_execute" | "unity_recompile" => {
-                require_non_empty("project_path", "to be set explicitly")
-                    .or_else(|| require_absolute_without_workspace("project_path"))
-            }
-            "unity_run_states" | "unity_ref_search" | "unity_asset_search" | "unity_yaml_read"
-            | "knowledge_list" | "knowledge_query" | "knowledge_read" | "knowledge_create"
-            | "knowledge_delete" | "knowledge_move" | "knowledge_edit" => {
+            "unity_recompile" => require_non_empty("project_path", "to be set explicitly")
+                .or_else(|| require_absolute_without_workspace("project_path")),
+            "unity_execute" | "unity_run_states" | "unity_ref_search" | "unity_asset_search"
+            | "unity_yaml_read" | "knowledge_list" | "knowledge_query" | "knowledge_read"
+            | "knowledge_create" | "knowledge_delete" | "knowledge_move" | "knowledge_edit" => {
                 if has_working_dir {
                     None
                 } else {
@@ -2492,7 +2490,7 @@ impl AgentInstance {
                     }
                 }
             }
-            "unity_log" | "unity_execute" | "unity_recompile" => {
+            "unity_log" | "unity_recompile" => {
                 if let Some(path) = args.get("project_path").and_then(|v| v.as_str()) {
                     if let Some(resolved) = self.resolve_path_against_working_dir(path) {
                         args["project_path"] = serde_json::Value::String(resolved);
@@ -5323,6 +5321,9 @@ impl AgentInstance {
         } else if tc.name == "knowledge_delete" {
             self.await_tool_result(self.execute_knowledge_delete(app_handle, args))
                 .await
+        } else if tc.name == "unity_execute" {
+            self.await_tool_result(self.execute_unity_execute(app_handle, &tc.id, args, run_id))
+                .await
         } else if tc.name == "unity_recompile" {
             self.await_tool_result(self.execute_unity_recompile(app_handle, &tc.id, args, run_id))
                 .await
@@ -6067,6 +6068,116 @@ impl AgentInstance {
                 store.remove(&question_id);
                 Self::interrupted_tool_result().into_tool_result()
             }
+        }
+    }
+
+    async fn execute_unity_execute(
+        &self,
+        app_handle: &AppHandle,
+        tool_call_id: &str,
+        args: &serde_json::Value,
+        run_id: &str,
+    ) -> ToolResult {
+        let code = match args.get("code").and_then(|value| value.as_str()) {
+            Some(code) => code,
+            None => {
+                return ToolResult {
+                    output: "Missing required parameter: code".to_string(),
+                    is_error: true,
+                };
+            }
+        };
+
+        let claimed_status = match args.get("editor_status").and_then(|value| value.as_str()) {
+            Some(status) => status,
+            None => {
+                return ToolResult {
+                    output: format!(
+                        "Missing required parameter: editor_status. You must pass the current Unity Editor status ({}) exactly as shown in the Environment section.",
+                        crate::unity_bridge::UNITY_EDITOR_STATUS_SCHEMA
+                    ),
+                    is_error: true,
+                };
+            }
+        };
+
+        if !crate::unity_bridge::is_known_editor_status(claimed_status) {
+            return ToolResult {
+                output: format!(
+                    "Invalid editor_status: \"{}\". Allowed values: {}.",
+                    claimed_status,
+                    crate::unity_bridge::UNITY_EDITOR_STATUS_SCHEMA
+                ),
+                is_error: true,
+            };
+        }
+
+        if !self.has_selected_working_dir() {
+            return ToolResult {
+                output: "Tool 'unity_execute' requires a selected Unity project working directory."
+                    .to_string(),
+                is_error: true,
+            };
+        }
+
+        let (_connected, actual_status, _scene) =
+            crate::unity_bridge::query_unity_status(&self.working_dir).await;
+        if claimed_status != actual_status {
+            return ToolResult {
+                output: format!(
+                    "editor_status mismatch: you claimed \"{}\", but the actual editor status is \"{}\". Re-read the current editor state and try again.",
+                    claimed_status, actual_status
+                ),
+                is_error: true,
+            };
+        }
+
+        if actual_status == crate::unity_bridge::UNITY_EDITOR_STATUS_DISCONNECTED {
+            return ToolResult {
+                output:
+                    "Unity Editor status is \"disconnected\". `unity_execute` is unavailable until the Editor reconnects."
+                        .to_string(),
+                is_error: true,
+            };
+        }
+
+        let handle = app_handle.clone();
+        let session_id = self.session_id.clone();
+        let tool_call_id = tool_call_id.to_string();
+        let run_id = run_id.to_string();
+
+        match crate::unity_bridge::unity_execute_code_with_progress(
+            &self.working_dir,
+            code,
+            move |snapshot| {
+                emit_stream(
+                    &handle,
+                    &run_id,
+                    StreamEvent::ToolCallDelta {
+                        session_id: session_id.clone(),
+                        tool_call_id: tool_call_id.clone(),
+                        delta: crate::unity_bridge::format_unity_execute_progress_delta(&snapshot),
+                    },
+                );
+            },
+        )
+        .await
+        {
+            Ok(output) => {
+                let trimmed = output.trim();
+                ToolResult {
+                    output: if trimmed.is_empty() {
+                        "Code executed successfully (no output).".to_string()
+                    } else {
+                        trimmed.to_string()
+                    },
+                    is_error: false,
+                }
+            }
+            Err(error) => ToolResult {
+                output: error,
+                is_error: true,
+            },
         }
     }
 

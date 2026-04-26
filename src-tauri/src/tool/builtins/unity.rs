@@ -10,7 +10,7 @@ pub(super) fn unity_execute() -> ToolDef {
         name: "unity_execute".to_string(),
         description: prompt.description,
         parameters: prompt.parameters,
-        execute: make_exec(|args, _ctx| {
+        execute: make_exec(|args, ctx| {
             Box::pin(async move {
                 let code = match args.get("code").and_then(|v| v.as_str()) {
                     Some(c) => c.to_string(),
@@ -46,11 +46,11 @@ pub(super) fn unity_execute() -> ToolDef {
                     };
                 }
 
-                let project_path = match args.get("project_path").and_then(|v| v.as_str()) {
+                let project_path = match ctx.working_dir {
                     Some(path) if !path.trim().is_empty() => path.trim().to_string(),
                     _ => {
                         return ToolResult {
-                            output: "Missing required parameter: project_path".to_string(),
+                            output: "Tool 'unity_execute' requires a selected Unity project working directory.".to_string(),
                             is_error: true,
                         }
                     }
