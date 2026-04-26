@@ -1,9 +1,9 @@
 ---
 title: "当前版本"
-description: "Locus v0.1.2 (2026-04-24)"
+description: "Locus v0.2.0 (2026-04-26)"
 sidebarTitle: "当前版本"
-version: "0.1.2"
-releasedAt: "2026-04-24"
+version: "0.2.0"
+releasedAt: "2026-04-26"
 channel: "stable"
 updateTitle: "发现新版本"
 changelogUrl: "/overview/latest-version"
@@ -17,16 +17,21 @@ changelogUrl: "/overview/latest-version"
 
 ### 新增
 
-- Collab 新增 Git 配置编辑器，可编辑仓库级和全局 Git config。
-- Collab 侧栏支持选择分支和标签，并可跳转到对应历史记录。
-- Chat 变更文件新增树形视图，并会记住列表/树形模式。
-- Codex 模型列表会从账号可用模型中刷新，并显示支持的 reasoning effort。
+- 【嵌入式窗口】可在 Unity Editor 的 `Window/Locus` 中打开 Locus 会话，检测并启动桌面端，并同步窗口状态、输入焦点、资产选择与 Inspector 打开。
+- 【运行时调试状态机，实验性】新增 `unity_run_states` 工具，可在 Unity 中运行按帧推进的 C# 状态机，用于测试输入与捕获运行时状态。
+- Markdown 中的 Unity 资产和场景对象引用会渲染为可交互引用；点击会在 Unity 中跳转，Ctrl+点击会打开独立 Inspector 窗口检查。
+- `unity_execute` 支持异步执行、跨帧等待、取消检查和进度上报，长任务进度会显示在工具调用面板中。
+- 增强控制台浏览能力，支持前端/后端日志筛选、搜索、自动滚动、刷新和清空。
 
 ### 修复
 
-- 工具调用折叠或展开时，Chat 视口会保持在原位置。
-- 改进连续和嵌套工具调用展示，减少重复或错位的工具调用记录。
-- 应用更新检查改为读取 JSON 更新清单，发布文档与应用内更新内容保持一致。
-- 应用初始加载界面更稳定。
-- 更新 Git 配置和模型选择相关中英文文案。
-- 降低 Asset 视图中文件夹图标的强调色。
+- 修复 NSIS 安装包升级兼容性，更新安装时会复用历史安装位置。
+- Responses API 遇到服务端错误时会进行重试，减少偶发请求失败。
+- 加强资产引用图监听器，降低资产数据库监听和重扫中的不稳定情况。
+- 修复 Unity 嵌入窗口焦点、鼠标激活、窗口尺寸同步和 Windows 窗口边框相关问题。
+- Unity 插件安装流程会适配 Unity 2021 项目中的 DLL 冲突，降低插件安装后的编译冲突概率。
+- 修复 `unity_run_states` 运行中 Print 输出不可见的问题。
+- 改进 Chat 响应式布局、紧凑输入区和工具调用交接渲染。
+- 改进 Diff 查看器控件，并为 Prefab 面板标题增加 fileID 区分。
+- 修复 Knowledge 在切换工作区后的状态重置、搜索结果刷新和空文件夹行对齐问题。
+- 更新中英文界面文案。

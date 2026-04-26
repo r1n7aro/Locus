@@ -1,9 +1,9 @@
 ---
 title: "Latest Version"
-description: "Locus v0.1.2 (2026-04-24)"
+description: "Locus v0.2.0 (2026-04-26)"
 sidebarTitle: "Latest Version"
-version: "0.1.2"
-releasedAt: "2026-04-24"
+version: "0.2.0"
+releasedAt: "2026-04-26"
 channel: "stable"
 updateTitle: "Update available"
 changelogUrl: "/en/overview/latest-version"
@@ -17,16 +17,21 @@ changelogUrl: "/en/overview/latest-version"
 
 ### Added
 
-- Added a Git config editor in Collab for repo and global Git config entries.
-- Collab now lets branch and tag selections jump to matching history entries.
-- Chat change files now support a tree view and remember the selected list/tree mode.
-- Codex model lists now refresh from the account's available models and show supported reasoning efforts.
+- Added an embedded Locus window for Unity Editor under `Window/Locus`, with desktop app detection and launch, window state sync, input focus handling, asset selection sync, and Inspector opening.
+- Added the experimental `unity_run_states` tool for running frame-driven C# state machines in Unity to test input flows and capture runtime state.
+- Unity asset and scene object references in Markdown now render as interactive references. Click jumps to Unity, and Ctrl+click opens a separate Inspector window.
+- `unity_execute` now supports async execution, cross-frame waits, cancellation checks, and progress reporting. Long-running task progress appears in the tool call panel.
+- Improved console browsing with frontend/backend log source filters, search, auto-scroll, refresh, and clear actions.
 
 ### Fixed
 
-- Chat now preserves the viewport while tool call groups collapse or expand.
-- Improved continuous and nested tool call rendering to reduce duplicate or misplaced tool call records.
-- App update checks now read the JSON update manifest, keeping release notes aligned with the in-app update view.
-- Improved the initial app loading surface.
-- Updated Chinese and English copy for Git config and model selection.
-- Reduced folder icon accent colors in Asset views.
+- Fixed NSIS installer upgrade compatibility so updates reuse the previous install location.
+- Responses API requests now retry on server errors to reduce transient failures.
+- Hardened the asset reference graph watcher to reduce instability during asset database watching and rescans.
+- Fixed Unity embedded window focus, mouse activation, window size sync, and Windows frame handling.
+- Unity plugin installation now handles DLL conflicts in Unity 2021 projects to reduce compile conflicts after install.
+- Fixed missing Print output while `unity_run_states` is running.
+- Improved Chat responsive layout, compact input layout, and tool call handoff rendering.
+- Improved Diff viewer controls and added fileID disambiguation to Prefab panel titles.
+- Fixed Knowledge state reset after workspace switches, search result refresh, and empty folder row alignment.
+- Updated Chinese and English UI copy.
