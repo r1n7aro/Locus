@@ -30,6 +30,54 @@ describe("ConsoleSettings layout", () => {
     expect(source).toMatch(/\.console-column-handle\s*\{[\s\S]*cursor:\s*col-resize;/);
   });
 
+  it("renders newest logs first and keeps auto-scroll pinned to the latest row", () => {
+    const source = read("src/components/settings/ConsoleSettings.vue");
+
+    expect(source).toContain(".map((entry, index) => ({ entry, index }))");
+    expect(source).toContain("right.entry.timestampMs - left.entry.timestampMs || right.index - left.index");
+    expect(source).toContain("function scrollToLatest()");
+    expect(source).toContain("listRef.value.scrollTop = 0");
+    expect(source).toContain("filteredEntries.value[0]?.id");
+  });
+
+  it("caps very long log messages with an expandable preview", () => {
+    const source = read("src/components/settings/ConsoleSettings.vue");
+    const zh = read("src/language/zh.json");
+    const en = read("src/language/en.json");
+
+    expect(source).toContain("const CONSOLE_MESSAGE_MAX_HEIGHT = 132");
+    expect(source).toContain("const CONSOLE_MESSAGE_PREVIEW_LIMIT = 4_000");
+    expect(source).toContain("const expandedEntryIds = ref<Set<string>>(new Set())");
+    expect(source).toContain("function displayMessage(entry: DebugConsoleEntry): string");
+    expect(source).toContain("return entry.message.slice(0, CONSOLE_MESSAGE_PREVIEW_LIMIT)");
+    expect(source).toContain('class="console-message-cell"');
+    expect(source).toContain('class="console-message-meta"');
+    expect(source).toContain('class="console-message-toggle"');
+    expect(source).toMatch(/\.console-message\s*\{[\s\S]*max-height:\s*var\(--console-message-max-height\);[\s\S]*overflow:\s*auto;/);
+    expect(zh).toContain('"settings.console.hiddenChars": "已隐藏 {0} 个字符"');
+    expect(zh).toContain('"settings.console.expandMessage": "展开全部"');
+    expect(zh).toContain('"settings.console.collapseMessage": "收起"');
+    expect(en).toContain('"settings.console.hiddenChars": "{0} chars hidden"');
+    expect(en).toContain('"settings.console.expandMessage": "Show All"');
+    expect(en).toContain('"settings.console.collapseMessage": "Collapse"');
+  });
+
+  it("highlights visible search matches in log rows", () => {
+    const source = read("src/components/settings/ConsoleSettings.vue");
+
+    expect(source).toContain("interface HighlightSegment");
+    expect(source).toContain("const highlightPattern = computed<RegExp | null>");
+    expect(source).toContain("function escapeRegExp(value: string): string");
+    expect(source).toContain("function highlightSegments(text: string): HighlightSegment[]");
+    expect(source).toContain("visibleSource.includes(query)");
+    expect(source).toContain("highlightSegments(formatSource(entry.source))");
+    expect(source).toContain("highlightSegments(entry.module)");
+    expect(source).toContain("highlightSegments(displayMessage(entry))");
+    expect(source).toContain('class="console-search-hit"');
+    expect(source).toMatch(/\.console-search-hit\s*\{[\s\S]*background:\s*color-mix\(in srgb,\s*var\(--accent-color\)\s*38%,\s*transparent\);/);
+    expect(source).toMatch(/\.console-search-hit\s*\{[\s\S]*color:\s*inherit;/);
+  });
+
   it("formats timestamps to seconds instead of milliseconds", () => {
     const source = read("src/components/settings/ConsoleSettings.vue");
 
