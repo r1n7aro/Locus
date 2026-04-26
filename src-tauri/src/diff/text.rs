@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::time::Duration;
 
 use similar::{Algorithm, ChangeTag, TextDiff};
@@ -11,7 +12,19 @@ const GUARDED_TEXT_DIFF_LINE_THRESHOLD: usize = 4_000;
 const GUARDED_TEXT_DIFF_BYTE_THRESHOLD: usize = 512 * 1024;
 const GUARDED_TEXT_DIFF_TIMEOUT: Duration = Duration::from_millis(750);
 
+fn normalize_for_text_diff(text: &str) -> Cow<'_, str> {
+    if text.as_bytes().contains(&b'\r') {
+        Cow::Owned(crate::eol::normalize_lf(text))
+    } else {
+        Cow::Borrowed(text)
+    }
+}
+
 pub fn compute_hunks(old: &str, new: &str, context: usize) -> Vec<DiffHunk> {
+    let old = normalize_for_text_diff(old);
+    let new = normalize_for_text_diff(new);
+    let old = old.as_ref();
+    let new = new.as_ref();
     let max_lines = old.lines().count().max(new.lines().count());
     let combined_bytes = old.len().saturating_add(new.len());
     let diff = if max_lines >= GUARDED_TEXT_DIFF_LINE_THRESHOLD
@@ -140,6 +153,36 @@ pub(crate) fn count_stats(hunks: &[DiffHunk]) -> DiffStats {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn compute_hunks_ignores_line_ending_only_changes() {
+        let hunks = compute_hunks("alpha\r\nbeta\r\ngamma\r\n", "alpha\nbeta\ngamma\n", 3);
+
+        assert!(hunks.is_empty());
+    }
+
+    #[test]
+    fn compute_hunks_keeps_content_changes_when_line_endings_differ() {
+        let hunks = compute_hunks("alpha\r\nbeta\r\ngamma\r\n", "alpha\nBETA\ngamma\n", 3);
+        let stats = count_stats(&hunks);
+        let deletes: Vec<&str> = hunks
+            .iter()
+            .flat_map(|hunk| hunk.lines.iter())
+            .filter(|line| matches!(line.kind, DiffLineKind::Delete))
+            .map(|line| line.content.as_str())
+            .collect();
+        let adds: Vec<&str> = hunks
+            .iter()
+            .flat_map(|hunk| hunk.lines.iter())
+            .filter(|line| matches!(line.kind, DiffLineKind::Add))
+            .map(|line| line.content.as_str())
+            .collect();
+
+        assert_eq!(stats.additions, 1);
+        assert_eq!(stats.deletions, 1);
+        assert_eq!(deletes, vec!["beta\n"]);
+        assert_eq!(adds, vec!["BETA\n"]);
+    }
 
     #[test]
     fn compute_hunks_bounds_runtime_for_large_distinct_inputs() {
