@@ -29,7 +29,7 @@ describe("plugin status notice", () => {
 
     expect(app).toMatch(/\.tab-item\s*\{[\s\S]*flex:\s*0 0 auto;[\s\S]*white-space:\s*nowrap;/);
     expect(app).toMatch(/\.tab-plugin-warn\s*\{[\s\S]*flex:\s*0 0 auto;[\s\S]*white-space:\s*nowrap;/);
-    expect(app).toMatch(/\.workspace-selector\s*\{[\s\S]*flex:\s*0 1 320px;[\s\S]*width:\s*320px;[\s\S]*min-width:\s*120px;[\s\S]*max-width:\s*320px;/);
+    expect(app).toMatch(/\.workspace-selector\s*\{[\s\S]*flex:\s*0 1 280px;[\s\S]*width:\s*280px;[\s\S]*min-width:\s*120px;[\s\S]*max-width:\s*280px;/);
     expect(app).toMatch(/\.workspace-btn\s*\{[\s\S]*width:\s*100%;[\s\S]*min-width:\s*0;[\s\S]*max-width:\s*none;/);
     expect(app).toMatch(/\.ws-name\s*\{[\s\S]*flex:\s*1;[\s\S]*min-width:\s*0;[\s\S]*text-overflow:\s*ellipsis;/);
   });

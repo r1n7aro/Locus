@@ -59,9 +59,9 @@ const UnityEmbedTestView = defineAsyncComponent(() => import("./components/Unity
 const OnboardingView = defineAsyncComponent(() => import("./components/OnboardingView.vue"));
 const FileDiffOverlay = defineAsyncComponent(() => import("./components/diff/FileDiffOverlay.vue"));
 
-// Initialize theme & fonts for main window only; Canvas keeps its own styles.
+// Initialize theme & fonts for app-token windows; Canvas keeps its own styles.
 if (!isCanvasWindow) {
-  initTheme();
+  initTheme(isUnityEmbedWindow ? "unityEmbed" : "main");
   initFonts();
 }
 
@@ -1182,10 +1182,10 @@ body.is-dragging-select-lock * {
 
 .workspace-selector {
   -webkit-app-region: no-drag;
-  flex: 0 1 320px;
-  width: 320px;
+  flex: 0 1 280px;
+  width: 280px;
   min-width: 120px;
-  max-width: 320px;
+  max-width: 280px;
   position: relative;
   margin-right: 6px;
 }

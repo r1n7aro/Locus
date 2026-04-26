@@ -90,6 +90,7 @@ export function useSettingsState(emit: SettingsEmit) {
       localStorage.removeItem("locus-onboarding-completed");
       localStorage.removeItem("locus-locale");
       localStorage.removeItem("locus-theme-preference");
+      localStorage.removeItem("locus-unity-embed-theme-preference");
       localStorage.removeItem("locus:sessionPanelWidth");
       localStorage.removeItem("locus:unity:sessionPanelWidth");
       localStorage.removeItem("locus:unity:sessionPanelCollapsed");

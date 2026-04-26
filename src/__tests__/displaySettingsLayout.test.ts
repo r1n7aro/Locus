@@ -9,6 +9,37 @@ function read(relPath: string) {
 }
 
 describe("display settings transcript alignment", () => {
+  it("keeps main and Unity embed color styles separately configurable", () => {
+    const theme = read("src/composables/useTheme.ts");
+    const displayPanel = read("src/components/settings/DisplaySettings.vue");
+    const app = read("src/App.vue");
+    const html = read("index.html");
+    const zh = read("src/language/zh.json");
+    const en = read("src/language/en.json");
+
+    expect(theme).toContain('export type ThemeScope = "main" | "unityEmbed";');
+    expect(theme).toContain('unityEmbed: "locus-unity-embed-theme-preference"');
+    expect(theme).toContain('unityEmbed: "dark"');
+    expect(theme).toContain("unityEmbedPreference");
+    expect(theme).toContain("setThemePreference(scope: ThemeScope, pref: ThemePreference)");
+
+    expect(app).toContain('initTheme(isUnityEmbedWindow ? "unityEmbed" : "main")');
+    expect(html).toContain("locus-unity-embed-theme-preference");
+    expect(html).toContain("var fallback=isUnityEmbed?'dark':'system';");
+
+    expect(displayPanel).toContain("mainPreference");
+    expect(displayPanel).toContain("unityEmbedPreference");
+    expect(displayPanel).toContain("settings.display.themeMainWindow");
+    expect(displayPanel).toContain("settings.display.themeUnityEmbedWindow");
+    expect(displayPanel).toContain("setThemePreference('main', $event as ThemePreference)");
+    expect(displayPanel).toContain("setThemePreference('unityEmbed', $event as ThemePreference)");
+
+    expect(zh).toContain('"settings.display.themeMainWindow": "主窗口"');
+    expect(zh).toContain('"settings.display.themeUnityEmbedWindow": "Unity 嵌入窗口"');
+    expect(en).toContain('"settings.display.themeMainWindow": "Main Window"');
+    expect(en).toContain('"settings.display.themeUnityEmbedWindow": "Unity Embedded Window"');
+  });
+
   it("adds a session user message right-align toggle that defaults to on", () => {
     const displaySettings = read("src/composables/useDisplaySettings.ts");
     const displayPanel = read("src/components/settings/DisplaySettings.vue");

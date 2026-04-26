@@ -98,11 +98,21 @@ fn collect_general(out: &mut Vec<ConfigEntry>) {
 
 fn collect_display(out: &mut Vec<ConfigEntry>) {
     out.push(ConfigEntry {
-        key: "display.theme".into(),
+        key: "display.theme.main_window".into(),
         category: "display".into(),
-        label: "Theme".into(),
-        description: "Color theme: system, light, or dark.".into(),
+        label: "Main Window Theme".into(),
+        description: "Color theme for the main window: system, light, or dark.".into(),
         storage: "localStorage: locus-theme-preference".into(),
+        current_value: "(frontend-only)".into(),
+    });
+    out.push(ConfigEntry {
+        key: "display.theme.unity_embed_window".into(),
+        category: "display".into(),
+        label: "Unity Embedded Window Theme".into(),
+        description:
+            "Color theme for the Unity embedded window: system, light, or dark. Default is dark."
+                .into(),
+        storage: "localStorage: locus-unity-embed-theme-preference".into(),
         current_value: "(frontend-only)".into(),
     });
 

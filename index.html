@@ -43,10 +43,16 @@
   <body>
     <script>
       // Apply theme before Vue mounts to prevent flash of wrong theme.
-      // Canvas windows (/canvas or ?specId=) skip this — they keep their own styles.
+      // Canvas windows (/canvas or ?specId=) keep their own styles.
       (function(){
         if(/\/canvas|specId=/.test(location.pathname+location.search))return;
-        var p;try{p=localStorage.getItem('locus-theme-preference')}catch(e){}
+        var params=new URLSearchParams(location.search);
+        var isUnityEmbed=location.pathname!=='/unity-embed-test'&&
+          (location.pathname==='/unity-embed'||params.get('host')==='unity');
+        var key=isUnityEmbed?'locus-unity-embed-theme-preference':'locus-theme-preference';
+        var fallback=isUnityEmbed?'dark':'system';
+        var p;try{p=localStorage.getItem(key)}catch(e){}
+        p=p==='light'||p==='dark'||p==='system'?p:fallback;
         var t=p==='light'?'light':p==='dark'?'dark':
           (window.matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light');
         document.documentElement.setAttribute('data-theme',t);
