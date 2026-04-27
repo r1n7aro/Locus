@@ -135,9 +135,9 @@ function readStoredChatChangesViewMode(): StagingViewMode {
     if (raw === "tree") return "tree";
     if (raw === "list") return "list";
   } catch {
-    // Use the default list view when local storage is unavailable.
+    // Use the default tree view when local storage is unavailable.
   }
-  return "list";
+  return "tree";
 }
 
 function persistChatChangesViewMode(nextMode: StagingViewMode) {

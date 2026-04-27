@@ -55,8 +55,8 @@ describe("staging layout persistence", () => {
     expect(localStorage.getItem(STAGING_LAYOUT_STORAGE_KEY)).toBe("false");
   });
 
-  it("defaults to list view when no stored view mode exists", () => {
-    expect(readStoredStagingViewMode()).toBe("list");
+  it("defaults to tree view when no stored view mode exists", () => {
+    expect(readStoredStagingViewMode()).toBe("tree");
   });
 
   it("restores the stored view mode", () => {

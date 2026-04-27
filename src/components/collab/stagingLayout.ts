@@ -28,9 +28,9 @@ export function readStoredStagingViewMode(): StagingViewMode {
     if (raw === "tree") return "tree";
     if (raw === "list") return "list";
   } catch {
-    // Ignore storage read failures and fall back to the default list view.
+    // Ignore storage read failures and fall back to the default tree view.
   }
-  return "list";
+  return "tree";
 }
 
 export function persistStagingViewMode(mode: StagingViewMode) {

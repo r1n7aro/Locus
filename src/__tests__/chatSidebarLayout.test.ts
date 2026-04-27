@@ -9,6 +9,15 @@ function read(relPath: string) {
 }
 
 describe("chat sidebar layout", () => {
+  it("defaults chat file changes to tree view", () => {
+    const changesPanel = read("src/components/ChatChangesPanel.vue");
+
+    expect(changesPanel).toContain("const CHAT_CHANGES_VIEW_MODE_STORAGE_KEY = \"locus.chat.changesViewMode\";");
+    expect(changesPanel).toMatch(
+      /function readStoredChatChangesViewMode\(\): StagingViewMode \{[\s\S]*if \(raw === "tree"\) return "tree";[\s\S]*if \(raw === "list"\) return "list";[\s\S]*return "tree";[\s\S]*\}/,
+    );
+  });
+
   it("uses a single right sidebar that stacks todos above file changes", () => {
     const workspace = read("src/components/ChatWorkspaceView.vue");
     const sidebar = read("src/components/ChatSidebarPanel.vue");
