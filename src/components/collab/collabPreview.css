@@ -617,6 +617,26 @@
   font-size: 10px;
 }
 
+.staging-tree-status-spacer {
+  pointer-events: none;
+}
+
+.staging-tree-file-icon.is-git-status-icon.status-modified {
+  color: var(--git-status-modified);
+}
+
+.staging-tree-file-icon.is-git-status-icon.status-added {
+  color: var(--git-status-added);
+}
+
+.staging-tree-file-icon.is-git-status-icon.status-deleted {
+  color: var(--git-status-deleted);
+}
+
+.staging-tree-file-icon.is-git-status-icon.status-renamed {
+  color: var(--git-status-renamed);
+}
+
 .blocked-files-warning {
   background: color-mix(in srgb, var(--status-warn-bg) 64%, var(--panel-bg) 36%);
 }
@@ -936,23 +956,23 @@
 }
 
 .status-modified {
-  color: #d29b00;
+  color: var(--git-status-modified);
 }
 
 .status-added {
-  color: #2ea043;
+  color: var(--git-status-added);
 }
 
 .status-deleted {
-  color: #e15759;
+  color: var(--git-status-deleted);
 }
 
 .status-renamed {
-  color: #388bfd;
+  color: var(--git-status-renamed);
 }
 
 .status-conflict {
-  color: #d29b00;
+  color: var(--git-status-modified);
 }
 
 .file-path-text {

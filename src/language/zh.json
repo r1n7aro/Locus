@@ -694,6 +694,8 @@
   "settings.display.changesAutoClose": "发送新消息时自动关闭文件修改面板",
   "settings.display.rightAlignUserMessages": "会话窗口中将用户消息右对齐",
   "settings.display.compactToolCalls": "折叠已完成的工具调用",
+  "settings.display.gitViewTitle": "Git 视图",
+  "settings.display.mergeGitTreeStatusIcon": "层级视图用彩色图标显示修改状态",
   "settings.display.notificationsTitle": "系统通知",
   "settings.display.notificationsDesc": "当窗口未聚焦时，为关键对话事件发送系统通知",
   "settings.display.systemNotificationsEnabled": "启用后台系统通知",

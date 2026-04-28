@@ -125,6 +125,19 @@ onMounted(async () => {
   </div>
 
   <div class="settings-section">
+    <div class="section-label">{{ t("settings.display.gitViewTitle") }}</div>
+
+    <div class="toggle-row">
+      <BaseSwitch
+        :model-value="display.mergeGitTreeStatusIcon"
+        :aria-label="t('settings.display.mergeGitTreeStatusIcon')"
+        @update:model-value="setDisplay('mergeGitTreeStatusIcon', $event)"
+      />
+      <span>{{ t("settings.display.mergeGitTreeStatusIcon") }}</span>
+    </div>
+  </div>
+
+  <div class="settings-section">
     <div class="section-label">{{ t("settings.display.notificationsTitle") }}</div>
     <p class="section-desc">{{ t("settings.display.notificationsDesc") }}</p>
 

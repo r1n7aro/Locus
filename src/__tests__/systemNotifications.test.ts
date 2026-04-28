@@ -27,6 +27,7 @@ function createDisplayState(): DisplaySettings {
     changesAutoClose: true,
     rightAlignUserMessages: false,
     compactToolCalls: true,
+    mergeGitTreeStatusIcon: true,
     systemNotificationsEnabled: true,
     notifyOnChatDone: true,
     notifyOnAskUser: true,
@@ -87,6 +88,7 @@ describe("systemNotifications", () => {
     displayState.changesAutoOpen = true;
     displayState.changesAutoClose = true;
     displayState.compactToolCalls = true;
+    displayState.mergeGitTreeStatusIcon = true;
     displayState.systemNotificationsEnabled = true;
     displayState.notifyOnChatDone = true;
     displayState.notifyOnAskUser = true;

@@ -4,6 +4,7 @@ import { ChevronRight } from "lucide";
 import type { GitBlockedPath, GitFileChange, ModelOption } from "../../types";
 import { gitCommit, gitGenerateCommitMessage } from "../../services/git";
 import { t } from "../../i18n";
+import { useDisplaySettings } from "../../composables/useDisplaySettings";
 import { normalizeAppError } from "../../services/errors";
 import { useHideMeta, isMetaFile, partitionMetaPaths } from "../../composables/useHideMeta";
 import {
@@ -63,6 +64,7 @@ const emit = defineEmits<{
 }>();
 
 const { hideMeta } = useHideMeta();
+const { state: displaySettings } = useDisplaySettings();
 
 const layoutHorizontal = ref(readStoredStagingLayout());
 const fileViewMode = ref<StagingViewMode>(readStoredStagingViewMode());
@@ -537,6 +539,14 @@ function fileTreeIconClass(path: string) {
   return unityAssetIconClassForPath(path, { isFolder: false });
 }
 
+function fileTreeIconClasses(file: GitFileChange) {
+  const classes = [fileTreeIconClass(file.path)];
+  if (displaySettings.mergeGitTreeStatusIcon) {
+    classes.push("is-git-status-icon", fileStatusClass(file.status));
+  }
+  return classes;
+}
+
 function formatBlockedReason(file: GitBlockedPath): string {
   switch (file.reason) {
     case "windowsReservedName":
@@ -690,10 +700,11 @@ function formatBlockedReason(file: GitBlockedPath): string {
                     @click="onFileClick($event, row.file, 'gitUnstaged')"
                     @contextmenu.prevent="onFileContextMenu($event, row.file, 'gitUnstaged')"
                   >
-                    <span class="file-status" :class="fileStatusClass(row.file.status)">{{ fileStatusLabel(row.file.status) }}</span>
+                    <span v-if="!displaySettings.mergeGitTreeStatusIcon" class="file-status" :class="fileStatusClass(row.file.status)">{{ fileStatusLabel(row.file.status) }}</span>
+                    <span v-else class="file-status staging-tree-status-spacer" aria-hidden="true"></span>
                     <LucideIcon
                       class="staging-tree-file-icon"
-                      :class="fileTreeIconClass(row.file.path)"
+                      :class="fileTreeIconClasses(row.file)"
                       :icon="unityAssetIconNodeForPath(row.file.path, { isFolder: false })"
                       :size="14"
                     />
@@ -829,10 +840,11 @@ function formatBlockedReason(file: GitBlockedPath): string {
                     @click="onFileClick($event, row.file, 'gitStaged')"
                     @contextmenu.prevent="onFileContextMenu($event, row.file, 'gitStaged')"
                   >
-                    <span class="file-status" :class="fileStatusClass(row.file.status)">{{ fileStatusLabel(row.file.status) }}</span>
+                    <span v-if="!displaySettings.mergeGitTreeStatusIcon" class="file-status" :class="fileStatusClass(row.file.status)">{{ fileStatusLabel(row.file.status) }}</span>
+                    <span v-else class="file-status staging-tree-status-spacer" aria-hidden="true"></span>
                     <LucideIcon
                       class="staging-tree-file-icon"
-                      :class="fileTreeIconClass(row.file.path)"
+                      :class="fileTreeIconClasses(row.file)"
                       :icon="unityAssetIconNodeForPath(row.file.path, { isFolder: false })"
                       :size="14"
                     />

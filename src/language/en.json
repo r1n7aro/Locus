@@ -694,6 +694,8 @@
   "settings.display.changesAutoClose": "Auto-close file changes panel when sending a new message",
   "settings.display.rightAlignUserMessages": "Right-align user messages in the session view",
   "settings.display.compactToolCalls": "Collapse completed tool calls",
+  "settings.display.gitViewTitle": "Git View",
+  "settings.display.mergeGitTreeStatusIcon": "Use colored icons for Git tree status",
   "settings.display.notificationsTitle": "System Notifications",
   "settings.display.notificationsDesc": "Send desktop notifications for key chat events when the app is not focused",
   "settings.display.systemNotificationsEnabled": "Enable background system notifications",

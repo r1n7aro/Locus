@@ -70,4 +70,37 @@ describe("display settings transcript alignment", () => {
     expect(zh).toContain('"settings.display.rightAlignUserMessages": "会话窗口中将用户消息右对齐"');
     expect(en).toContain('"settings.display.rightAlignUserMessages": "Right-align user messages in the session view"');
   });
+
+  it("adds a Git tree status icon merge toggle", () => {
+    const displaySettings = read("src/composables/useDisplaySettings.ts");
+    const displayPanel = read("src/components/settings/DisplaySettings.vue");
+    const stagingArea = read("src/components/collab/StagingArea.vue");
+    const commitDetail = read("src/components/collab/CommitDetail.vue");
+    const collabStyles = read("src/components/collab/collabPreview.css");
+    const zh = read("src/language/zh.json");
+    const en = read("src/language/en.json");
+
+    expect(displaySettings).toContain("mergeGitTreeStatusIcon: boolean;");
+    expect(displaySettings).toContain("mergeGitTreeStatusIcon: true,");
+
+    expect(displayPanel).toContain("settings.display.gitViewTitle");
+    expect(displayPanel).toContain(":model-value=\"display.mergeGitTreeStatusIcon\"");
+    expect(displayPanel).toContain(":aria-label=\"t('settings.display.mergeGitTreeStatusIcon')\"");
+    expect(displayPanel).toContain("@update:model-value=\"setDisplay('mergeGitTreeStatusIcon', $event)\"");
+
+    for (const component of [stagingArea, commitDetail]) {
+      expect(component).toContain("const { state: displaySettings } = useDisplaySettings();");
+      expect(component).toContain("displaySettings.mergeGitTreeStatusIcon");
+      expect(component).toContain("fileTreeIconClasses(row.file)");
+      expect(component).toContain("staging-tree-status-spacer");
+    }
+
+    expect(collabStyles).toContain(".staging-tree-file-icon.is-git-status-icon.status-modified");
+    expect(collabStyles).toContain("color: var(--git-status-modified);");
+    expect(collabStyles).toContain("color: var(--git-status-added);");
+    expect(collabStyles).toContain("color: var(--git-status-deleted);");
+
+    expect(zh).toContain('"settings.display.mergeGitTreeStatusIcon": "层级视图用彩色图标显示修改状态"');
+    expect(en).toContain('"settings.display.mergeGitTreeStatusIcon": "Use colored icons for Git tree status"');
+  });
 });

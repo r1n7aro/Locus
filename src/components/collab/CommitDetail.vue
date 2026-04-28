@@ -6,6 +6,7 @@ import { selectUnityAsset, openFileExternal } from "../../services/unity";
 import { useProjectStore } from "../../stores/project";
 import { t } from "../../i18n";
 import { useHideMeta, canOpenInEditor, partitionMetaPaths } from "../../composables/useHideMeta";
+import { useDisplaySettings } from "../../composables/useDisplaySettings";
 import {
   getLocusManagedTagKind,
   getLocusManagedTagKindForPath,
@@ -29,6 +30,7 @@ import {
 } from "../icons/unityAssetIcons";
 
 const { hideMeta } = useHideMeta();
+const { state: displaySettings } = useDisplaySettings();
 const projectStore = useProjectStore();
 const hashCopied = ref(false);
 const bodyRef = ref<HTMLElement | null>(null);
@@ -189,6 +191,14 @@ function folderLocusBadgeLabel(path: string): string | null {
 
 function fileTreeIconClass(path: string) {
   return unityAssetIconClassForPath(path, { isFolder: false });
+}
+
+function fileTreeIconClasses(file: GitFileChange) {
+  const classes = [fileTreeIconClass(file.path)];
+  if (displaySettings.mergeGitTreeStatusIcon) {
+    classes.push("is-git-status-icon", fileStatusClass(file.status));
+  }
+  return classes;
 }
 
 function treeIndentPx(depth: number) {
@@ -359,10 +369,11 @@ function toggleTreeFolder(chainPaths: readonly string[], expanded: boolean) {
               :title="row.file.path"
               @click="emit('selectFile', row.file)"
             >
-              <span class="file-status ui-select-none" :class="fileStatusClass(row.file.status)">{{ fileStatusLabel(row.file.status) }}</span>
+              <span v-if="!displaySettings.mergeGitTreeStatusIcon" class="file-status ui-select-none" :class="fileStatusClass(row.file.status)">{{ fileStatusLabel(row.file.status) }}</span>
+              <span v-else class="file-status staging-tree-status-spacer ui-select-none" aria-hidden="true"></span>
               <LucideIcon
                 class="staging-tree-file-icon"
-                :class="fileTreeIconClass(row.file.path)"
+                :class="fileTreeIconClasses(row.file)"
                 :icon="unityAssetIconNodeForPath(row.file.path, { isFolder: false })"
                 :size="14"
               />

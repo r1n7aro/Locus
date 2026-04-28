@@ -35,6 +35,7 @@ const displaySettingsState = vi.hoisted(() => ({
   changesAutoClose: true,
   rightAlignUserMessages: false,
   compactToolCalls: true,
+  mergeGitTreeStatusIcon: true,
 }));
 
 const agentStoreMocks = vi.hoisted(() => ({
@@ -146,6 +147,7 @@ describe("chat session panel state", () => {
     displaySettingsState.changesAutoClose = true;
     displaySettingsState.rightAlignUserMessages = false;
     displaySettingsState.compactToolCalls = true;
+    displaySettingsState.mergeGitTreeStatusIcon = true;
 
     todoData = {
       s1: { items: [makeTodo("Todo from history")], latestRunId: "run-history" },
