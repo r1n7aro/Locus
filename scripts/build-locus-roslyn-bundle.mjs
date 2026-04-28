@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -17,6 +17,8 @@ const ilRepackExe = path.join(ilRepackDir, "tools", "ILRepack.exe");
 const stubDir = path.join(tmpRoot, "stub");
 const stubProject = path.join(stubDir, "Locus.Roslyn.csproj");
 const stubDll = path.join(stubDir, "bin", "Release", "netstandard2.0", "Locus.Roslyn.dll");
+const bundleOutputDir = path.join(tmpRoot, "bundle-output");
+const tmpOutputDll = path.join(bundleOutputDir, "Locus.Roslyn.dll");
 const sourceDir = path.join(repoRoot, "third_party", `roslyn-${roslynVersion}`, "assemblies");
 const outputDir = path.join(repoRoot, "locus_unity", "Editor", "Roslyn");
 const outputDll = path.join(outputDir, "Locus.Roslyn.dll");
@@ -152,27 +154,45 @@ async function validateInputs() {
   }
 }
 
+async function cleanupOutputArtifacts() {
+  const entries = await readdir(outputDir, { withFileTypes: true });
+
+  await Promise.all(
+    entries
+      .filter(
+        (entry) =>
+          entry.name.startsWith("ILRepack-") ||
+          (entry.name.startsWith("Locus.Roslyn.dll.") && entry.name !== "Locus.Roslyn.dll.meta"),
+      )
+      .map((entry) => rm(path.join(outputDir, entry.name), { recursive: true, force: true })),
+  );
+}
+
 async function buildBundle() {
   await validateInputs();
   await ensureIlRepack();
   await buildStub();
-  await rm(outputDll, { force: true });
+  await rm(bundleOutputDir, { recursive: true, force: true });
+  await mkdir(bundleOutputDir, { recursive: true });
 
   run(ilRepackExe, [
     "/target:library",
     "/ndebug",
     "/parallel",
     "/allowduplicateresources",
-    `/out:${outputDll}`,
+    `/out:${tmpOutputDll}`,
     `/lib:${sourceDir}`,
     stubDll,
     ...inputDlls.map((fileName) => path.join(sourceDir, fileName)),
   ]);
 
-  const output = await readFile(outputDll);
-  if (output.length === 0) {
+  const output = await stat(tmpOutputDll);
+  if (output.size === 0) {
     throw new Error("Locus.Roslyn.dll was generated as an empty file");
   }
+
+  await rename(tmpOutputDll, outputDll);
+  await cleanupOutputArtifacts();
 }
 
 await buildBundle();
