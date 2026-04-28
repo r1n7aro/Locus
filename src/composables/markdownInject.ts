@@ -1,3 +1,12 @@
+import {
+  UNITY_ASSET_ICON_FILE_EXTENSIONS,
+  type UnityAssetIconKind,
+  unityAssetIconClassForKind,
+  unityAssetIconKindForPath,
+  unityAssetIconNodeForKind,
+  unityFolderIconClass,
+} from "../components/icons/unityAssetIcons";
+
 /**
  * Pure functions for injecting interactive elements (asset chips, file refs)
  * into rendered Markdown HTML. Extracted for testability.
@@ -29,30 +38,16 @@ export function walkHtmlText(html: string, transform: (text: string) => string):
 const ASSET_ROOT_RE = /^(?:Assets|Packages)\//;
 const SCENE_OBJECT_ROOT_RE = /^(?:Assets|Packages)\/.+?\.unity\/.+/i;
 const QUOTED_SCENE_OBJECT_REF_RE = /(["'])@?((?:Assets|Packages)\/(?:(?!\1).)*?\.unity\/(?:(?!\1).)*?)\s*\1/g;
-const QUOTED_ASSET_REF_RE = /(["'])@?((?:Assets|Packages)\/[\w.\/-]*[\w.-]\/?)\s*\1/g;
+const QUOTED_ASSET_REF_RE = /(["'])@?((?:Assets|Packages)\/(?:(?!\1).)+?)\s*\1/g;
+const BRACED_UNITY_REF_RE = /\{@?((?:Assets|Packages)\/[^{}\r\n]+?)\}/g;
+const PARENTHESIZED_UNITY_ASSET_REF_RE = /\(@?((?:Assets|Packages)\/[^()\r\n]+?\.[A-Za-z0-9][^()\r\n]*?(?:#fileID:-?\d+)?)\)/gi;
 const ASSET_REF_RE = /@((?:Assets|Packages)\/[\w.\/-]*[\w.-])(?!\/)/g;
-const INLINE_CODE_ASSET_REF_RE = /^@?((?:Assets|Packages)\/[\w.\/-]*[\w.-]\/?)(?::(\d+)|#L(\d+))?$/;
+const INLINE_CODE_ASSET_REF_RE = /^@?((?:Assets|Packages)\/.+?)(?::(\d+)|#L(\d+)|#fileID:-?\d+)?$/i;
 const UNQUOTED_SCENE_OBJECT_START_RE = /@(?:Assets|Packages)\//g;
+const UNQUOTED_UNITY_ASSET_START_RE = /@(?:Assets|Packages)\//g;
+const BARE_UNITY_ASSET_START_RE = /(?<![@`\/])(?:Assets|Packages)\//g;
 const WORKSPACE_MENTION_RE = /@((?:[^\s@<]+\/)+[^\s@<]*)/g;
 const UNITY_ASSET_ICON_BASE = "/unity-asset-icons";
-
-type UnityAssetKind =
-  | "scene"
-  | "prefab"
-  | "material"
-  | "script"
-  | "shader"
-  | "texture"
-  | "model"
-  | "animation"
-  | "audio"
-  | "font"
-  | "video"
-  | "text"
-  | "meta"
-  | "gameobject"
-  | "folder"
-  | "asset";
 
 function escapeAttr(source: string): string {
   return source
@@ -69,56 +64,52 @@ function displayFileRef(filePath: string, line = ""): string {
   return line ? `${fileName}:${line}` : fileName;
 }
 
+function normalizeUnityAssetRefPath(filePath: string): string {
+  const normalized = filePath
+    .trim()
+    .replace(/\\/g, "/")
+    .replace(/#fileID:-?\d+$/i, "");
+  return normalized.replace(/\/+$/, "") || normalized;
+}
+
 function displaySceneObjectRef(objectPath: string): string {
   const normalized = objectPath.replace(/\/+$/, "") || objectPath;
   const segments = normalized.split("/").filter(Boolean);
   return segments[segments.length - 1] || normalized;
 }
 
-function unityAssetKind(filePath: string): UnityAssetKind {
-  const normalized = filePath.replace(/\/+$/, "");
-  const fileName = (normalized.split("/").pop() || normalized || filePath).toLowerCase();
-  if (filePath.endsWith("/") || !fileName.includes(".")) return "folder";
-  if (fileName.endsWith(".unity")) return "scene";
-  if (fileName.endsWith(".prefab")) return "prefab";
-  if (
-    fileName.endsWith(".mat")
-    || fileName.endsWith(".physicmaterial")
-    || fileName.endsWith(".physicsmaterial2d")
-  ) return "material";
-  if (fileName.endsWith(".cs") || fileName.endsWith(".asmdef") || fileName.endsWith(".asmref")) {
-    return "script";
-  }
-  if (
-    fileName.endsWith(".shader")
-    || fileName.endsWith(".shadergraph")
-    || fileName.endsWith(".compute")
-    || fileName.endsWith(".hlsl")
-    || fileName.endsWith(".cginc")
-  ) return "shader";
-  if (
-    /\.(png|jpe?g|tga|psd|bmp|gif|tiff?|exr|hdr|dds|svg|webp)$/.test(fileName)
-  ) return "texture";
-  if (/\.(fbx|obj|blend|dae|3ds|ma|mb|max)$/.test(fileName)) return "model";
-  if (/\.(anim|controller|overridecontroller|mask)$/.test(fileName)) return "animation";
-  if (/\.(wav|mp3|ogg|aiff?|flac|xm|mod|it|s3m)$/.test(fileName)) return "audio";
-  if (/\.(ttf|otf|fontsettings)$/.test(fileName)) return "font";
-  if (/\.(mp4|mov|webm|avi|mpeg|mpg)$/.test(fileName)) return "video";
-  if (/\.(txt|md|json|xml|ya?ml|csv|bytes|uxml|uss)$/.test(fileName)) return "text";
-  if (fileName.endsWith(".meta")) return "meta";
-  return "asset";
+function unityAssetKind(filePath: string): UnityAssetIconKind {
+  return unityAssetIconKindForPath(filePath, { fallbackKind: "asset" });
 }
 
-function unityAssetIconSrc(kind: UnityAssetKind | "file" | "folder"): string {
+function unityAssetIconSrc(kind: UnityAssetIconKind): string {
   return `${UNITY_ASSET_ICON_BASE}/${kind}.svg`;
 }
 
-function renderRefIcon(kind: UnityAssetKind | "file" | "folder" = "file", classes = ""): string {
-  const className = ["md-ref-icon", classes].filter(Boolean).join(" ");
-  return `<img class="${className}" src="${unityAssetIconSrc(kind)}" alt="" aria-hidden="true" draggable="false" loading="lazy">`;
+function renderSvgAttrs(attrs: Record<string, string | number | undefined>): string {
+  return Object.entries(attrs)
+    .filter((entry): entry is [string, string | number] => entry[1] !== undefined)
+    .map(([key, value]) => ` ${key}="${escapeAttr(String(value))}"`)
+    .join("");
 }
 
-function renderUnityAssetIcon(kind: UnityAssetKind): string {
+function renderLucideRefIcon(kind: UnityAssetIconKind, classes = ""): string {
+  const iconNode = unityAssetIconNodeForKind(kind);
+  const sharedClasses = kind === "folder" ? unityFolderIconClass(false) : unityAssetIconClassForKind(kind);
+  const className = ["md-ref-icon", "md-ref-icon-lucide", sharedClasses, classes].filter(Boolean).join(" ");
+  const children = iconNode
+    .map(([tag, attrs]) => `<${tag}${renderSvgAttrs(attrs)} />`)
+    .join("");
+  return `<svg class="${className}" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">${children}</svg>`;
+}
+
+function renderRefIcon(kind: UnityAssetIconKind = "file", classes = ""): string {
+  const className = ["md-ref-icon", "md-ref-icon-image", classes].filter(Boolean).join(" ");
+  const image = `<img class="${className}" src="${unityAssetIconSrc(kind)}" alt="" aria-hidden="true" draggable="false" loading="lazy">`;
+  return `${image}${renderLucideRefIcon(kind, classes)}`;
+}
+
+function renderUnityAssetIcon(kind: UnityAssetIconKind): string {
   return renderRefIcon(kind, `md-unity-asset-icon md-unity-asset-icon--${kind}`);
 }
 
@@ -131,15 +122,15 @@ function renderFileRef(
 ): string {
   const escaped = escapeAttr(filePath);
   const lineAttr = line ? ` data-file-line="${escapeAttr(line)}"` : "";
-  const title = `${escaped}${line ? ":" + escapeAttr(line) : ""}`;
+  const label = `${escaped}${line ? ":" + escapeAttr(line) : ""}`;
   const className = ["md-file-ref", classes, "ui-select-text"].filter(Boolean).join(" ");
-  return `<span class="${className}" data-file-path="${escaped}"${lineAttr}${attrs} title="${title}">${icon}<span class="md-ref-label">${displayFileRef(filePath, line)}</span></span>`;
+  return `<span class="${className}" data-file-path="${escaped}"${lineAttr}${attrs} aria-label="${label}">${icon}<span class="md-ref-label">${displayFileRef(filePath, line)}</span></span>`;
 }
 
 function renderUnityAssetRef(filePath: string, line = ""): string {
-  const normalizedPath = filePath.replace(/\/+$/, "") || filePath;
+  const normalizedPath = normalizeUnityAssetRefPath(filePath);
   const escaped = escapeAttr(normalizedPath);
-  const kind = unityAssetKind(filePath);
+  const kind = unityAssetKind(normalizedPath);
   return renderFileRef(
     normalizedPath,
     line,
@@ -173,11 +164,31 @@ function renderUnitySceneObjectRef(filePath: string): string {
   const escapedObjectPath = escapeAttr(ref.objectPath);
   const escapedLabel = escapeAttr(displaySceneObjectRef(ref.objectPath));
   const icon = renderRefIcon("gameobject", "md-unity-gameobject-icon");
-  return `<span class="md-file-ref md-unity-scene-object-ref ui-select-text" data-file-path="${escapedFullPath}" data-scene-path="${escapedScenePath}" data-scene-object-path="${escapedObjectPath}" title="${escapedFullPath}">${icon}<span class="md-ref-label">${escapedLabel}</span></span>`;
+  return `<span class="md-file-ref md-unity-scene-object-ref ui-select-text" data-file-path="${escapedFullPath}" data-scene-path="${escapedScenePath}" data-scene-object-path="${escapedObjectPath}" aria-label="${escapedFullPath}">${icon}<span class="md-ref-label">${escapedLabel}</span></span>`;
 }
 
 function isSceneObjectRefTerminator(ch: string): boolean {
   return /[\r\n<>"'`，。；、？！]/.test(ch);
+}
+
+export function findUnitySceneObjectPathEnd(text: string, start: number): number {
+  const lower = text.toLowerCase();
+  const sceneMarker = lower.indexOf(".unity/", start);
+  if (sceneMarker < 0 || text.slice(start, sceneMarker).includes("@")) {
+    return -1;
+  }
+
+  let end = sceneMarker + ".unity/".length;
+  while (end < text.length && !isSceneObjectRefTerminator(text[end])) {
+    end++;
+  }
+
+  const sceneObjectPath = text.slice(start, end).trimEnd();
+  if (!splitSceneObjectRef(sceneObjectPath)) {
+    return -1;
+  }
+
+  return start + sceneObjectPath.length;
 }
 
 function replaceUnquotedSceneObjectRefs(
@@ -186,32 +197,98 @@ function replaceUnquotedSceneObjectRefs(
 ): string {
   let result = "";
   let cursor = 0;
-  const lower = text.toLowerCase();
   UNQUOTED_SCENE_OBJECT_START_RE.lastIndex = 0;
 
   let match: RegExpExecArray | null;
   while ((match = UNQUOTED_SCENE_OBJECT_START_RE.exec(text)) !== null) {
     const markerStart = match.index;
     const pathStart = markerStart + 1;
-    const sceneMarker = lower.indexOf(".unity/", pathStart);
-    if (sceneMarker < 0 || text.slice(pathStart, sceneMarker).includes("@")) {
-      continue;
-    }
-
-    let end = sceneMarker + ".unity/".length;
-    while (end < text.length && !isSceneObjectRefTerminator(text[end])) {
-      end++;
-    }
-
+    const end = findUnitySceneObjectPathEnd(text, pathStart);
+    if (end < 0) continue;
     const sceneObjectPath = text.slice(pathStart, end).trimEnd();
-    if (!splitSceneObjectRef(sceneObjectPath)) {
-      continue;
-    }
 
     result += text.slice(cursor, markerStart);
     result += render(sceneObjectPath);
     cursor = end;
     UNQUOTED_SCENE_OBJECT_START_RE.lastIndex = end;
+  }
+
+  return result + text.slice(cursor);
+}
+
+function isUnityAssetPathBoundaryAt(text: string, index: number): boolean {
+  const ch = text[index];
+  if (!ch) return true;
+  if (ch === ":" && /\d/.test(text[index + 1] ?? "")) return false;
+  return /[\s\r\n<>"'`，。；、？！,;:\])}）】》」』]/.test(ch);
+}
+
+function readUnityFileIdSuffixEnd(text: string, start: number): number {
+  const suffix = text.slice(start).match(/^#fileID:-?\d+/i);
+  return suffix ? start + suffix[0].length : start;
+}
+
+export function findUnityAssetPathEnd(text: string, start: number): number {
+  const lower = text.toLowerCase();
+  let bestEnd = -1;
+
+  for (const extension of UNITY_ASSET_ICON_FILE_EXTENSIONS) {
+    let searchStart = start;
+    while (searchStart < text.length) {
+      const extStart = lower.indexOf(extension, searchStart);
+      if (extStart < 0) break;
+      const extEnd = extStart + extension.length;
+      const end = readUnityFileIdSuffixEnd(text, extEnd);
+      if (isUnityAssetPathBoundaryAt(text, end)) {
+        if (bestEnd < 0 || end < bestEnd) {
+          bestEnd = end;
+        }
+        break;
+      }
+      searchStart = extStart + 1;
+    }
+  }
+
+  return bestEnd;
+}
+
+function renderUnityPathRef(filePath: string): string {
+  const normalized = filePath.trim().replace(/\\/g, "/");
+  const sceneObjectRef = splitSceneObjectRef(normalized);
+  if (sceneObjectRef) {
+    return renderUnitySceneObjectRef(`${sceneObjectRef.scenePath}/${sceneObjectRef.objectPath}`);
+  }
+  return renderUnityAssetRef(normalized);
+}
+
+function replaceLooseUnityAssetRefs(
+  text: string,
+  render: (path: string) => string,
+  startRe: RegExp,
+  markerOffset: number,
+): string {
+  let result = "";
+  let cursor = 0;
+  startRe.lastIndex = 0;
+
+  let match: RegExpExecArray | null;
+  while ((match = startRe.exec(text)) !== null) {
+    const markerStart = match.index;
+    const pathStart = markerStart + markerOffset;
+    const end = findUnityAssetPathEnd(text, pathStart);
+    if (end < 0) {
+      continue;
+    }
+
+    const assetPath = text.slice(pathStart, end).trimEnd();
+    if (!ASSET_ROOT_RE.test(assetPath)) {
+      continue;
+    }
+
+    result += text.slice(cursor, markerStart);
+    result += render(assetPath);
+    cursor = end;
+    startRe.lastIndex = end;
   }
 
   return result + text.slice(cursor);
@@ -287,8 +364,17 @@ export function injectAssetRefs(html: string): string {
       (path) => stashRef(renderUnitySceneObjectRef(path)),
     );
 
-    const injected = sceneRefsInjected
-      .replace(QUOTED_ASSET_REF_RE, (_match, _quote, path) => stashRef(renderUnityAssetRef(path)))
+    const delimitedRefsInjected = sceneRefsInjected
+      .replace(BRACED_UNITY_REF_RE, (_match, path) => stashRef(renderUnityPathRef(path)))
+      .replace(PARENTHESIZED_UNITY_ASSET_REF_RE, (_match, path) => stashRef(renderUnityAssetRef(path)))
+      .replace(QUOTED_ASSET_REF_RE, (_match, _quote, path) => stashRef(renderUnityAssetRef(path)));
+
+    const injected = replaceLooseUnityAssetRefs(
+      delimitedRefsInjected,
+      (path) => stashRef(renderUnityAssetRef(path)),
+      UNQUOTED_UNITY_ASSET_START_RE,
+      1,
+    )
       .replace(ASSET_REF_RE, (_match, path) => stashRef(renderUnityAssetRef(path)));
 
     return injected.replace(/\u0000mdref:(\d+)\u0000/g, (_match, index) => refs[Number(index)] ?? "");
@@ -319,9 +405,11 @@ export function injectWorkspaceMentions(html: string): string {
       const title = `${escapedPath}${isDir ? "/" : ""}`;
       const fileAttr = isDir ? "" : ` data-file-path="${escapedPath}"`;
       const classes = isDir ? "md-workspace-ref md-folder-ref" : "md-workspace-ref md-file-ref";
-      const icon = isDir ? renderRefIcon("folder", "md-workspace-ref-icon") : "";
+      const icon = isDir
+        ? renderRefIcon("folder", "md-workspace-ref-icon")
+        : renderLucideRefIcon("file", "md-workspace-ref-icon md-workspace-file-icon");
 
-      return `<span class="${classes} ui-select-text" data-workspace-path="${escapedPath}" data-entry-kind="${isDir ? "folder" : "file"}"${fileAttr} title="${title}">${icon}<span class="md-workspace-ref-prefix">@</span>${name}${isDir ? "/" : ""}</span>`;
+      return `<span class="${classes} ui-select-text" data-workspace-path="${escapedPath}" data-entry-kind="${isDir ? "folder" : "file"}"${fileAttr} aria-label="${title}">${icon}<span class="md-workspace-ref-prefix">@</span>${name}${isDir ? "/" : ""}</span>`;
     }),
   );
 }
@@ -338,7 +426,21 @@ export function injectFileRefs(html: string): string {
   return walkHtmlText(html, (text) => {
     // Skip text inside already-injected refs.
     if (text.includes("data-asset-path") || text.includes("data-workspace-path")) return text;
-    return text.replace(FILE_REF_RE, (match, lineColon, lineHash, offset, fullText) => {
+    const refs: string[] = [];
+    const stashRef = (refHtml: string) => {
+      const key = `\u0000mdref:${refs.length}\u0000`;
+      refs.push(refHtml);
+      return key;
+    };
+
+    const looseUnityRefs = replaceLooseUnityAssetRefs(
+      text,
+      (path) => stashRef(renderUnityPathRef(path)),
+      BARE_UNITY_ASSET_START_RE,
+      0,
+    );
+
+    const injected = looseUnityRefs.replace(FILE_REF_RE, (match, lineColon, lineHash, offset, fullText) => {
       // Skip matches that are part of a URL
       const preceding = fullText.slice(0, offset);
       if (URL_CONTEXT_RE.test(preceding)) return match;
@@ -355,5 +457,6 @@ export function injectFileRefs(html: string): string {
       }
       return renderFileRef(filePath, line);
     });
+    return injected.replace(/\u0000mdref:(\d+)\u0000/g, (_match, index) => refs[Number(index)] ?? "");
   });
 }

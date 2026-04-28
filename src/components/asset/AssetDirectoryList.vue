@@ -3,6 +3,13 @@ import { computed } from "vue";
 import { t } from "../../i18n";
 import type { AssetExplorerNode } from "../../composables/useAssetState";
 import FileTreeList from "../explorer/FileTreeList.vue";
+import LucideIcon from "../icons/LucideIcon.vue";
+import {
+  unityAssetIconClassForPath,
+  unityAssetIconNodeForPath,
+  unityFolderIconClass,
+  unityFolderIconNode,
+} from "../icons/unityAssetIcons";
 
 type AssetFolderNode = Extract<AssetExplorerNode, { kind: "folder" }>;
 
@@ -63,6 +70,12 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
 function isFolder(node: AssetExplorerNode): node is AssetFolderNode {
   return node.kind === "folder";
 }
+
+function iconClass(node: AssetExplorerNode) {
+  return isFolder(node)
+    ? unityFolderIconClass(false)
+    : unityAssetIconClassForPath(node.path, { isFolder: false });
+}
 </script>
 
 <template>
@@ -90,45 +103,24 @@ function isFolder(node: AssetExplorerNode): node is AssetFolderNode {
             <span
               v-if="isFolder(entry.node)"
               class="adl-kind-icon folder"
+              :class="iconClass(entry.node)"
               aria-hidden="true"
             >
-              <svg
-                viewBox="0 0 16 16"
-                width="14"
-                height="14"
-                fill="none"
-              >
-                <path
-                  d="M2.25 4.5A1.25 1.25 0 0 1 3.5 3.25h2.1c.32 0 .62.13.84.36l.8.82c.14.15.34.23.55.23h4.71A1.25 1.25 0 0 1 13.75 5.9v5.6a1.25 1.25 0 0 1-1.25 1.25H3.5a1.25 1.25 0 0 1-1.25-1.25V4.5Z"
-                  fill="currentColor"
-                />
-              </svg>
+              <LucideIcon
+                :icon="unityFolderIconNode(false)"
+                :size="14"
+              />
             </span>
             <span
               v-else
               class="adl-kind-icon file"
+              :class="iconClass(entry.node)"
               aria-hidden="true"
             >
-              <svg
-                viewBox="0 0 16 16"
-                width="14"
-                height="14"
-                fill="none"
-              >
-                <path
-                  d="M5 2.75h4.55c.3 0 .58.12.8.33l1.57 1.57c.21.22.33.5.33.8V12A1.25 1.25 0 0 1 11 13.25H5A1.25 1.25 0 0 1 3.75 12V4A1.25 1.25 0 0 1 5 2.75Z"
-                  stroke="currentColor"
-                  stroke-width="1.2"
-                  stroke-linejoin="round"
-                />
-                <path
-                  d="M9.5 2.9V5a.5.5 0 0 0 .5.5h2.1"
-                  stroke="currentColor"
-                  stroke-width="1.2"
-                  stroke-linecap="round"
-                  stroke-linejoin="round"
-                />
-              </svg>
+              <LucideIcon
+                :icon="unityAssetIconNodeForPath(entry.node.path, { isFolder: false })"
+                :size="14"
+              />
             </span>
 
             <span class="adl-name">
@@ -137,18 +129,11 @@ function isFolder(node: AssetExplorerNode): node is AssetFolderNode {
           </button>
 
           <div v-else class="adl-load-row">
-            <span class="adl-load-icon" aria-hidden="true">
-              <svg
-                viewBox="0 0 16 16"
-                width="14"
-                height="14"
-                fill="none"
-              >
-                <path
-                  d="M2.25 4.5A1.25 1.25 0 0 1 3.5 3.25h2.1c.32 0 .62.13.84.36l.8.82c.14.15.34.23.55.23h4.71A1.25 1.25 0 0 1 13.75 5.9v5.6a1.25 1.25 0 0 1-1.25 1.25H3.5a1.25 1.25 0 0 1-1.25-1.25V4.5Z"
-                  fill="currentColor"
-                />
-              </svg>
+            <span class="adl-load-icon" :class="unityFolderIconClass(false)" aria-hidden="true">
+              <LucideIcon
+                :icon="unityFolderIconNode(false)"
+                :size="14"
+              />
             </span>
             <span class="adl-load-label">
               {{ loading ? t("asset.explorer.loadingMore") : t("asset.explorer.loadMore") }}
@@ -216,14 +201,6 @@ function isFolder(node: AssetExplorerNode): node is AssetFolderNode {
   min-width: 16px;
   height: 16px;
   flex-shrink: 0;
-}
-
-.adl-kind-icon.folder {
-  color: color-mix(in srgb, var(--text-secondary) 82%, var(--text-color));
-}
-
-.adl-kind-icon.file {
-  color: color-mix(in srgb, var(--text-secondary) 84%, transparent);
 }
 
 .adl-load-icon {

@@ -460,7 +460,6 @@ const renderedHtml = computed(() => {
   font-size: 0.88em;
   line-height: 1.5;
   vertical-align: baseline;
-  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
   font-weight: 500;
   color: var(--text-secondary);
 }
@@ -479,17 +478,18 @@ const renderedHtml = computed(() => {
 .md-file-ref {
   display: inline-flex;
   align-items: center;
-  gap: 2px;
-  padding: 1px 6px;
+  gap: 4px;
+  min-height: 22px;
+  padding: 1px 6px 1px 5px;
+  box-sizing: border-box;
   border-radius: 4px;
   background: color-mix(in srgb, var(--sidebar-bg, var(--hover-bg)) 52%, transparent);
   border: 1px solid color-mix(in srgb, var(--border-color) 78%, transparent);
   cursor: pointer;
   font-family: var(--font-mono-inline);
   font-size: 0.92em;
-  line-height: 1.42;
-  vertical-align: middle;
-  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+  line-height: 18px;
+  vertical-align: -2px;
   font-weight: 400;
   color: color-mix(in srgb, var(--text-color) 90%, var(--text-secondary) 10%);
 }
@@ -504,18 +504,20 @@ const renderedHtml = computed(() => {
 .md-workspace-ref {
   display: inline-flex;
   align-items: center;
-  gap: 0;
-  padding: 1px 7px;
+  gap: 4px;
+  min-height: 22px;
+  padding: 1px 6px 1px 5px;
+  box-sizing: border-box;
   border-radius: 4px;
   background: color-mix(in srgb, var(--sidebar-bg, var(--hover-bg)) 52%, transparent);
   border: 1px solid color-mix(in srgb, var(--border-color) 82%, transparent);
   cursor: pointer;
-  font-size: 0.88em;
-  line-height: 1.5;
-  vertical-align: middle;
-  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
-  font-weight: 500;
-  color: var(--text-secondary);
+  font-family: var(--font-mono-inline);
+  font-size: 0.92em;
+  line-height: 18px;
+  vertical-align: -2px;
+  font-weight: 400;
+  color: color-mix(in srgb, var(--text-color) 86%, var(--text-secondary) 14%);
 }
 
 .md-file-ref:hover,
@@ -550,13 +552,16 @@ const renderedHtml = computed(() => {
 
 .md-ref-label {
   min-width: 0;
+  display: block;
+  line-height: 18px;
 }
 
 .md-ref-icon {
   display: block;
-  width: 16px;
-  min-width: 16px;
-  height: 16px;
+  width: 14px;
+  min-width: 14px;
+  height: 14px;
+  align-self: center;
   flex-shrink: 0;
   object-fit: contain;
   max-width: none;
@@ -567,6 +572,20 @@ const renderedHtml = computed(() => {
   cursor: inherit;
   pointer-events: none;
   user-select: none;
+}
+
+.md-ref-icon-lucide {
+  display: block;
+  opacity: 0.95;
+  filter: none;
+}
+
+img.md-ref-icon-image {
+  display: none;
+}
+
+.md-workspace-ref-prefix {
+  display: none;
 }
 
 .streaming-cursor {

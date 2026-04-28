@@ -1,8 +1,11 @@
 <script setup lang="ts">
 import { computed } from "vue";
+import { ChevronRight } from "lucide";
 import { t } from "../../i18n";
 import type { AssetExplorerNode } from "../../composables/useAssetState";
 import FileTreeList from "../explorer/FileTreeList.vue";
+import LucideIcon from "../icons/LucideIcon.vue";
+import { unityFolderIconClass, unityFolderIconNode } from "../icons/unityAssetIcons";
 
 type AssetFolderNode = Extract<AssetExplorerNode, { kind: "folder" }>;
 
@@ -166,16 +169,11 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
                 :aria-label="entry.expanded ? t('merge.tree.toggleCollapse', entry.node.name) : t('merge.tree.toggleExpand', entry.node.name)"
                 @click.stop="emit('toggle', entry.node.path)"
               >
-                <svg
+                <LucideIcon
                   class="ax-branch-icon"
-                  viewBox="0 0 16 16"
-                  width="10"
-                  height="10"
-                  fill="currentColor"
-                  aria-hidden="true"
-                >
-                  <path d="M6.22 3.22a.75.75 0 0 1 1.06 0l4.25 4.25a.75.75 0 0 1 0 1.06l-4.25 4.25a.75.75 0 0 1-1.06-1.06L9.94 8 6.22 4.28a.75.75 0 0 1 0-1.06z" />
-                </svg>
+                  :icon="ChevronRight"
+                  :size="10"
+                />
               </button>
               <span v-else class="ax-branch-spacer" aria-hidden="true"></span>
 
@@ -186,30 +184,13 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
               >
                 <span
                   class="ax-kind-icon folder"
-                  :class="{ open: entry.folderOpen }"
+                  :class="[{ open: entry.folderOpen }, unityFolderIconClass(entry.folderOpen)]"
                   aria-hidden="true"
                 >
-                  <svg
-                    viewBox="0 0 16 16"
-                    width="13"
-                    height="13"
-                    fill="none"
-                  >
-                    <path
-                      v-if="!entry.folderOpen"
-                      d="M2.25 4.5A1.25 1.25 0 0 1 3.5 3.25h2.1c.32 0 .62.13.84.36l.8.82c.14.15.34.23.55.23h4.71A1.25 1.25 0 0 1 13.75 5.9v5.6a1.25 1.25 0 0 1-1.25 1.25H3.5a1.25 1.25 0 0 1-1.25-1.25V4.5Z"
-                      fill="currentColor"
-                    />
-                    <template v-else>
-                      <path
-                        d="M2.5 4.5a1.25 1.25 0 0 1 1.25-1.25h1.9c.28 0 .55.11.74.31l.98.98c.2.2.46.31.74.31h4.14a1.25 1.25 0 0 1 1.25 1.25v5.1a1.25 1.25 0 0 1-1.25 1.25h-8.5A1.25 1.25 0 0 1 2.5 11.2V4.5Z"
-                        stroke="currentColor"
-                        stroke-width="1.2"
-                        stroke-linecap="round"
-                        stroke-linejoin="round"
-                      />
-                    </template>
-                  </svg>
+                  <LucideIcon
+                    :icon="unityFolderIconNode(entry.folderOpen)"
+                    :size="13"
+                  />
                 </span>
 
                 <span class="ax-name" :class="{ 'ax-name-root': entry.node.isRoot }">
@@ -232,18 +213,15 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
             :style="{ paddingLeft: `${loadMoreIndentPx(entry.depth)}px` }"
           >
             <span class="ax-branch-spacer" aria-hidden="true"></span>
-            <span class="ax-kind-icon ax-kind-icon-muted" aria-hidden="true">
-              <svg
-                viewBox="0 0 16 16"
-                width="13"
-                height="13"
-                fill="none"
-              >
-                <path
-                  d="M2.25 4.5A1.25 1.25 0 0 1 3.5 3.25h2.1c.32 0 .62.13.84.36l.8.82c.14.15.34.23.55.23h4.71A1.25 1.25 0 0 1 13.75 5.9v5.6a1.25 1.25 0 0 1-1.25 1.25H3.5a1.25 1.25 0 0 1-1.25-1.25V4.5Z"
-                  fill="currentColor"
-                />
-              </svg>
+            <span
+              class="ax-kind-icon ax-kind-icon-muted"
+              :class="unityFolderIconClass(false)"
+              aria-hidden="true"
+            >
+              <LucideIcon
+                :icon="unityFolderIconNode(false)"
+                :size="13"
+              />
             </span>
             <span class="ax-load-label">{{ loadMoreLabel(entry.folder) }}</span>
           </div>
@@ -378,12 +356,7 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
 }
 
 .ax-kind-icon {
-  color: color-mix(in srgb, var(--text-secondary) 82%, var(--text-color));
   transition: color 0.15s ease;
-}
-
-.ax-kind-icon.open {
-  color: var(--text-color);
 }
 
 .ax-kind-icon-muted {

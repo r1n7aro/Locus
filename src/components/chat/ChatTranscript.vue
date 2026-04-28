@@ -21,6 +21,7 @@ import {
 } from "../../composables/toolCallBatches";
 import type { ToolCallMatchState } from "../../composables/toolCallBatches";
 import { useDisplaySettings } from "../../composables/useDisplaySettings";
+import { parseChatAssetRefs } from "../../composables/chatAssetRefs";
 import { logToolCollapseTrace, previewTraceText } from "../../services/toolCollapseTrace";
 import MarkdownRenderer from "../MarkdownRenderer.vue";
 import ToolCallCollection from "../ToolCallCollection.vue";
@@ -114,8 +115,6 @@ const emit = defineEmits<{
   (e: "openImage", src: string): void;
   (e: "scroll", event: Event): void;
   (e: "contentClick", event: MouseEvent): void;
-  (e: "contentMouseover", event: MouseEvent): void;
-  (e: "contentMouseout", event: MouseEvent): void;
   (e: "toolHandoffQuietChange", quiet: boolean): void;
   (e: "toolViewportAnchorStart", anchor: HTMLElement): void;
   (e: "toolViewportAnchorEnd", anchor: HTMLElement): void;
@@ -137,31 +136,6 @@ defineExpose({
 });
 
 const TOOL_HANDOFF_MIN_VISIBLE_MS = 160;
-
-const ASSET_REF_RE = /@((?:[^\s@]+\/)+[^\s@]+)/g;
-
-interface ContentSegment {
-  type: "text" | "asset";
-  value: string;
-}
-
-function parseAssetRefs(text: string): ContentSegment[] {
-  const segments: ContentSegment[] = [];
-  let lastIndex = 0;
-  ASSET_REF_RE.lastIndex = 0;
-  let match: RegExpExecArray | null;
-  while ((match = ASSET_REF_RE.exec(text)) !== null) {
-    if (match.index > lastIndex) {
-      segments.push({ type: "text", value: text.slice(lastIndex, match.index) });
-    }
-    segments.push({ type: "asset", value: match[1] });
-    lastIndex = ASSET_REF_RE.lastIndex;
-  }
-  if (lastIndex < text.length) {
-    segments.push({ type: "text", value: text.slice(lastIndex) });
-  }
-  return segments;
-}
 
 function buildIntentBadges(
   intent: Pick<UserIntentMeta, "mode" | "skills"> | null | undefined,
@@ -959,14 +933,6 @@ function emitContentClick(event: MouseEvent) {
   emit("contentClick", event);
 }
 
-function emitContentMouseover(event: MouseEvent) {
-  emit("contentMouseover", event);
-}
-
-function emitContentMouseout(event: MouseEvent) {
-  emit("contentMouseout", event);
-}
-
 function emitToolViewportAnchorStart(anchor: HTMLElement) {
   emit("toolViewportAnchorStart", anchor);
 }
@@ -988,8 +954,6 @@ function openImage(src: string) {
     :class="`is-${variant}`"
     @scroll="emitScroll"
     @click="emitContentClick"
-    @mouseover="emitContentMouseover"
-    @mouseout="emitContentMouseout"
   >
     <div ref="contentRef" class="chat-transcript-content">
       <div
@@ -1067,7 +1031,7 @@ function openImage(src: string) {
                 <div v-if="item.message.content" class="chat-transcript-plain-text ui-select-text">
                   <template
                     v-for="(segment, segmentIdx) in userContentMode === 'asset'
-                      ? parseAssetRefs(item.message.content)
+                      ? parseChatAssetRefs(item.message.content)
                       : [{ type: 'text', value: item.message.content }]"
                     :key="segmentIdx"
                   >

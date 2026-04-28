@@ -9,6 +9,12 @@ import {
 } from "../services/unity";
 import { t } from "../i18n";
 import { useNotificationStore } from "../stores/notification";
+import LucideIcon from "./icons/LucideIcon.vue";
+import {
+  unityAssetIconClassForKind,
+  unityAssetIconKindForPath,
+  unityAssetIconNodeForKind,
+} from "./icons/unityAssetIcons";
 
 const props = defineProps<{
   path: string;
@@ -40,28 +46,14 @@ const displayName = computed(() => {
   return dotIdx > 0 ? fileName.substring(0, dotIdx) : fileName;
 });
 
-const ext = computed(() => {
-  if (sceneObjectRef.value) return "unity-scene-object";
-  const dotIdx = props.path.lastIndexOf(".");
-  return dotIdx > 0 ? props.path.substring(dotIdx + 1).toLowerCase() : "";
-});
+const iconKind = computed(() =>
+  unityAssetIconKindForPath(props.path, {
+    isSceneObject: !!sceneObjectRef.value,
+    fallbackKind: "asset",
+  }),
+);
 
-const typeIcon = computed(() => {
-  switch (ext.value) {
-    case "unity-scene-object": return "□";
-    case "prefab": return "◆";
-    case "unity": return "◈";
-    case "asset": return "◇";
-    case "mat": return "●";
-    case "cs": return "#";
-    case "shader": case "shadergraph": return "◎";
-    case "png": case "jpg": case "jpeg": case "tga": case "psd": return "▣";
-    case "fbx": case "obj": case "blend": return "△";
-    case "anim": case "controller": return "▶";
-    case "mp3": case "wav": case "ogg": return "♪";
-    default: return "◇";
-  }
-});
+const iconNode = computed(() => unityAssetIconNodeForKind(iconKind.value));
 
 async function handleClick(e: MouseEvent) {
   try {
@@ -99,7 +91,11 @@ function notifyUnitySceneObjectError(error: unknown, scenePath: string, objectPa
 
 <template>
   <span class="asset-chip" :title="path" @click.stop="handleClick">
-    <span class="asset-chip-icon">{{ typeIcon }}</span>
+    <LucideIcon
+      class="asset-chip-icon"
+      :class="unityAssetIconClassForKind(iconKind)"
+      :icon="iconNode"
+    />
     <span class="asset-chip-name">{{ displayName }}</span>
     <button v-if="removable" class="asset-chip-remove" @click.stop="emit('remove')">&times;</button>
   </span>
@@ -129,9 +125,12 @@ function notifyUnitySceneObjectError(error: unknown, scenePath: string, objectPa
 }
 
 .asset-chip-icon {
-  font-size: 11px;
-  opacity: 0.7;
+  width: 14px;
+  min-width: 14px;
+  height: 14px;
+  opacity: 0.95;
   flex-shrink: 0;
+  display: block;
 }
 
 .asset-chip-name {

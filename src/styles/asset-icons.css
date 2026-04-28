@@ -1,0 +1,26 @@
+.unity-asset-icon {
+  display: block;
+  flex-shrink: 0;
+  color: color-mix(in srgb, var(--text-secondary) 74%, var(--text-color) 26%);
+}
+
+.unity-asset-icon.unity-asset-icon--tone-primary {
+  color: color-mix(in srgb, var(--accent-color) 58%, var(--text-color) 42%);
+}
+
+.unity-asset-icon.unity-asset-icon--tone-resource {
+  color: color-mix(in srgb, var(--status-good-fg) 62%, var(--text-color) 38%);
+}
+
+.unity-asset-icon.unity-asset-icon--tone-media {
+  color: color-mix(in srgb, var(--status-warn-fg) 62%, var(--text-color) 38%);
+}
+
+.unity-asset-icon.unity-asset-icon--prefab path:first-child,
+.unity-asset-icon.unity-asset-icon--folder-solid path:first-child {
+  fill: currentColor;
+}
+
+.unity-asset-icon.unity-asset-icon--prefab path:not(:first-child) {
+  stroke: color-mix(in srgb, var(--panel-bg) 86%, transparent);
+}

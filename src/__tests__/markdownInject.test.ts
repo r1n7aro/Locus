@@ -66,6 +66,30 @@ describe("injectAssetRefs", () => {
     expect(result).not.toContain("'Assets/WIP");
   });
 
+  it("converts quoted asset paths with spaces", () => {
+    const html = "Config: 'Assets/Data/Enemy Configs/Elite Guard.asset'";
+    const result = injectAssetRefs(html);
+    expect(result).toContain("md-unity-asset-ref");
+    expect(result).toContain('data-file-path="Assets/Data/Enemy Configs/Elite Guard.asset"');
+    expect(result).toContain("Elite Guard.asset");
+  });
+
+  it("converts braced Unity object refs and strips fileID suffixes", () => {
+    const html = "  Enemy Config: {Assets/Data/Enemy Configs/Elite Guard.asset#fileID:11400000}";
+    const result = injectAssetRefs(html);
+    expect(result).toContain("md-unity-asset-ref");
+    expect(result).toContain('data-file-path="Assets/Data/Enemy Configs/Elite Guard.asset"');
+    expect(result).not.toContain('data-file-path="Assets/Data/Enemy Configs/Elite Guard.asset#fileID');
+    expect(result).toContain("Elite Guard.asset");
+  });
+
+  it("converts parenthesized Unity asset refs from object labels", () => {
+    const html = "Enemy Config (Assets/Data/Enemy Configs/Elite Guard.asset)";
+    const result = injectAssetRefs(html);
+    expect(result).toContain("md-unity-asset-ref");
+    expect(result).toContain('data-file-path="Assets/Data/Enemy Configs/Elite Guard.asset"');
+  });
+
   it("assigns Unity-style asset icon kinds by extension", () => {
     const html = [
       "@Assets/Scenes/Main.unity",
@@ -247,12 +271,27 @@ describe("injectFileRefs", () => {
     expect(result).toContain('data-file-path="utils/helpers.ts"');
   });
 
+  it("converts bare Unity asset file refs with spaces", () => {
+    const html = "Uses Assets/Data/Enemy Configs/Elite Guard.asset in the scene";
+    const result = injectFileRefs(html);
+    expect(result).toContain("md-unity-asset-ref");
+    expect(result).toContain('data-file-path="Assets/Data/Enemy Configs/Elite Guard.asset"');
+  });
+
   it("handles :line suffix", () => {
     const html = "Error at src/main.ts:42";
     const result = injectFileRefs(html);
     expect(result).toContain('data-file-path="src/main.ts"');
     expect(result).toContain('data-file-line="42"');
     expect(result).toContain("main.ts:42");
+  });
+
+  it("keeps line suffixes on Unity asset file refs", () => {
+    const html = "Error at Assets/Scripts/Player.cs:42";
+    const result = injectFileRefs(html);
+    expect(result).toContain('data-file-path="Assets/Scripts/Player.cs"');
+    expect(result).toContain('data-file-line="42"');
+    expect(result).toContain("Player.cs:42");
   });
 
   it("handles #Lline suffix", () => {
