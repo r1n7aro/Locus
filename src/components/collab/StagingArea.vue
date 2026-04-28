@@ -1,11 +1,16 @@
 <script setup lang="ts">
 import { ref, computed, watch, onBeforeUnmount } from "vue";
+import { ChevronRight } from "lucide";
 import type { GitBlockedPath, GitFileChange, ModelOption } from "../../types";
 import { gitCommit, gitGenerateCommitMessage } from "../../services/git";
 import { t } from "../../i18n";
 import { normalizeAppError } from "../../services/errors";
 import { useHideMeta, isMetaFile, partitionMetaPaths } from "../../composables/useHideMeta";
-import { getLocusManagedTagKind, type LocusManagedFileLike } from "../../composables/locusManagedFiles";
+import {
+  getLocusManagedTagKind,
+  getLocusManagedTagKindForPath,
+  type LocusManagedFileLike,
+} from "../../composables/locusManagedFiles";
 import { acquireSelectionLock } from "../../composables/useSelectionLock";
 import { resolveStagingFileSelection } from "./stagingSelection";
 import {
@@ -21,6 +26,13 @@ import {
   collectStagingFolderPaths,
   type StagingTreeRow,
 } from "./stagingTree";
+import LucideIcon from "../icons/LucideIcon.vue";
+import {
+  unityAssetIconClassForPath,
+  unityFolderIconClass,
+  unityAssetIconNodeForPath,
+  unityFolderIconNode,
+} from "../icons/unityAssetIcons";
 
 const props = defineProps<{
   unstagedFiles: GitFileChange[];
@@ -516,6 +528,15 @@ function locusBadgeLabel(file: LocusManagedFileLike): string | null {
   return kind ? t(`collab.locusTag.${kind}`) : null;
 }
 
+function folderLocusBadgeLabel(path: string): string | null {
+  const kind = getLocusManagedTagKindForPath(path);
+  return kind ? t(`collab.locusTag.${kind}`) : null;
+}
+
+function fileTreeIconClass(path: string) {
+  return unityAssetIconClassForPath(path, { isFolder: false });
+}
+
 function formatBlockedReason(file: GitBlockedPath): string {
   switch (file.reason) {
     case "windowsReservedName":
@@ -632,28 +653,17 @@ function formatBlockedReason(file: GitBlockedPath): string {
                     @click="toggleTreeFolder('unstaged', row.chainPaths, row.expanded)"
                   >
                     <span class="staging-tree-branch" :class="{ open: row.expanded }" aria-hidden="true">
-                      <svg class="staging-tree-chevron" viewBox="0 0 16 16" width="10" height="10" fill="currentColor">
-                        <path d="M6.22 3.22a.75.75 0 0 1 1.06 0l4.25 4.25a.75.75 0 0 1 0 1.06l-4.25 4.25a.75.75 0 0 1-1.06-1.06L9.94 8 6.22 4.28a.75.75 0 0 1 0-1.06z"/>
-                      </svg>
+                      <LucideIcon class="staging-tree-chevron" :icon="ChevronRight" :size="10" />
                     </span>
-                    <span class="staging-tree-folder-icon" :class="{ open: row.expanded }" aria-hidden="true">
-                      <svg viewBox="0 0 16 16" width="13" height="13" fill="none">
-                        <path
-                          v-if="!row.expanded"
-                          d="M2.25 4.5A1.25 1.25 0 0 1 3.5 3.25h2.1c.32 0 .62.13.84.36l.8.82c.14.15.34.23.55.23h4.71A1.25 1.25 0 0 1 13.75 5.9v5.6a1.25 1.25 0 0 1-1.25 1.25H3.5a1.25 1.25 0 0 1-1.25-1.25V4.5Z"
-                          fill="currentColor"
-                        />
-                        <path
-                          v-else
-                          d="M2.5 4.5a1.25 1.25 0 0 1 1.25-1.25h1.9c.28 0 .55.11.74.31l.98.98c.2.2.46.31.74.31h4.14a1.25 1.25 0 0 1 1.25 1.25v5.1a1.25 1.25 0 0 1-1.25 1.25h-8.5A1.25 1.25 0 0 1 2.5 11.2V4.5Z"
-                          stroke="currentColor"
-                          stroke-width="1.2"
-                          stroke-linecap="round"
-                          stroke-linejoin="round"
-                        />
-                      </svg>
+                    <span
+                      class="staging-tree-folder-icon"
+                      :class="[{ open: row.expanded }, unityFolderIconClass(row.expanded)]"
+                      aria-hidden="true"
+                    >
+                      <LucideIcon :icon="unityFolderIconNode(row.expanded)" :size="13" />
                     </span>
                     <span class="staging-tree-folder-name">{{ row.name }}</span>
+                    <span v-if="folderLocusBadgeLabel(row.path)" class="locus-badge">{{ folderLocusBadgeLabel(row.path) }}</span>
                   </button>
                   <div class="file-row-actions staging-row-actions">
                     <button
@@ -681,6 +691,12 @@ function formatBlockedReason(file: GitBlockedPath): string {
                     @contextmenu.prevent="onFileContextMenu($event, row.file, 'gitUnstaged')"
                   >
                     <span class="file-status" :class="fileStatusClass(row.file.status)">{{ fileStatusLabel(row.file.status) }}</span>
+                    <LucideIcon
+                      class="staging-tree-file-icon"
+                      :class="fileTreeIconClass(row.file.path)"
+                      :icon="unityAssetIconNodeForPath(row.file.path, { isFolder: false })"
+                      :size="14"
+                    />
                     <span class="staging-file-copy">
                       <span class="file-name">{{ fileName(row.file.path) }}</span>
                       <span v-if="locusBadgeLabel(row.file)" class="locus-badge">{{ locusBadgeLabel(row.file) }}</span>
@@ -776,28 +792,17 @@ function formatBlockedReason(file: GitBlockedPath): string {
                     @click="toggleTreeFolder('staged', row.chainPaths, row.expanded)"
                   >
                     <span class="staging-tree-branch" :class="{ open: row.expanded }" aria-hidden="true">
-                      <svg class="staging-tree-chevron" viewBox="0 0 16 16" width="10" height="10" fill="currentColor">
-                        <path d="M6.22 3.22a.75.75 0 0 1 1.06 0l4.25 4.25a.75.75 0 0 1 0 1.06l-4.25 4.25a.75.75 0 0 1-1.06-1.06L9.94 8 6.22 4.28a.75.75 0 0 1 0-1.06z"/>
-                      </svg>
+                      <LucideIcon class="staging-tree-chevron" :icon="ChevronRight" :size="10" />
                     </span>
-                    <span class="staging-tree-folder-icon" :class="{ open: row.expanded }" aria-hidden="true">
-                      <svg viewBox="0 0 16 16" width="13" height="13" fill="none">
-                        <path
-                          v-if="!row.expanded"
-                          d="M2.25 4.5A1.25 1.25 0 0 1 3.5 3.25h2.1c.32 0 .62.13.84.36l.8.82c.14.15.34.23.55.23h4.71A1.25 1.25 0 0 1 13.75 5.9v5.6a1.25 1.25 0 0 1-1.25 1.25H3.5a1.25 1.25 0 0 1-1.25-1.25V4.5Z"
-                          fill="currentColor"
-                        />
-                        <path
-                          v-else
-                          d="M2.5 4.5a1.25 1.25 0 0 1 1.25-1.25h1.9c.28 0 .55.11.74.31l.98.98c.2.2.46.31.74.31h4.14a1.25 1.25 0 0 1 1.25 1.25v5.1a1.25 1.25 0 0 1-1.25 1.25h-8.5A1.25 1.25 0 0 1 2.5 11.2V4.5Z"
-                          stroke="currentColor"
-                          stroke-width="1.2"
-                          stroke-linecap="round"
-                          stroke-linejoin="round"
-                        />
-                      </svg>
+                    <span
+                      class="staging-tree-folder-icon"
+                      :class="[{ open: row.expanded }, unityFolderIconClass(row.expanded)]"
+                      aria-hidden="true"
+                    >
+                      <LucideIcon :icon="unityFolderIconNode(row.expanded)" :size="13" />
                     </span>
                     <span class="staging-tree-folder-name">{{ row.name }}</span>
+                    <span v-if="folderLocusBadgeLabel(row.path)" class="locus-badge">{{ folderLocusBadgeLabel(row.path) }}</span>
                   </button>
                   <div class="file-row-actions staging-row-actions">
                     <button
@@ -825,6 +830,12 @@ function formatBlockedReason(file: GitBlockedPath): string {
                     @contextmenu.prevent="onFileContextMenu($event, row.file, 'gitStaged')"
                   >
                     <span class="file-status" :class="fileStatusClass(row.file.status)">{{ fileStatusLabel(row.file.status) }}</span>
+                    <LucideIcon
+                      class="staging-tree-file-icon"
+                      :class="fileTreeIconClass(row.file.path)"
+                      :icon="unityAssetIconNodeForPath(row.file.path, { isFolder: false })"
+                      :size="14"
+                    />
                     <span class="staging-file-copy">
                       <span class="file-name">{{ fileName(row.file.path) }}</span>
                       <span v-if="locusBadgeLabel(row.file)" class="locus-badge">{{ locusBadgeLabel(row.file) }}</span>

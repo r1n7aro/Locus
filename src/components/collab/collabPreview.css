@@ -591,14 +591,6 @@
   transform: rotate(90deg);
 }
 
-.staging-tree-folder-icon {
-  color: color-mix(in srgb, var(--text-secondary) 82%, var(--text-color));
-}
-
-.staging-tree-folder-icon.open {
-  color: var(--text-color);
-}
-
 .staging-tree-folder-name {
   min-width: 0;
   overflow: hidden;
@@ -611,6 +603,12 @@
 
 .staging-tree-file-main {
   gap: 6px;
+}
+
+.staging-tree-file-icon {
+  width: 14px;
+  height: 14px;
+  flex: 0 0 14px;
 }
 
 .staging-tree-file-main .file-status {
