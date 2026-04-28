@@ -45,7 +45,6 @@ interface KnowledgeReadPayload {
   type: KnowledgeDocument["type"];
   path: string;
   title: string;
-  scope: KnowledgeDocument["scope"];
   injectMode: KnowledgeDocument["injectMode"];
   inheritInjectMode?: boolean;
   injectModeSource?: KnowledgeConfigSource | null;
@@ -53,6 +52,7 @@ interface KnowledgeReadPayload {
   commandEnabled: boolean;
   readOnly: boolean;
   aiMaintained: boolean;
+  storageSource?: KnowledgeDocument["storageSource"];
   inheritAiConfig?: boolean;
   aiConfigSource?: KnowledgeConfigSource | null;
   explicitMaintenanceRules: boolean;
@@ -76,7 +76,7 @@ interface KnowledgeQueryPayload {
   type: KnowledgeSearchResult["type"];
   path: string;
   title: string;
-  scope: KnowledgeSearchResult["scope"];
+  storageSource?: KnowledgeSearchResult["storageSource"];
   injectMode: KnowledgeSearchResult["injectMode"];
   aiMaintained: KnowledgeSearchResult["aiMaintained"];
   score: number;
@@ -197,7 +197,6 @@ function normalizeDocument(payload: KnowledgeReadPayload): KnowledgeDocument {
     type: payload.type,
     path: payload.path,
     title: payload.title,
-    scope: payload.scope,
     injectMode: payload.injectMode,
     inheritInjectMode: payload.inheritInjectMode ?? false,
     injectModeSource: payload.injectModeSource ?? { kind: "self", path: null },
@@ -205,6 +204,7 @@ function normalizeDocument(payload: KnowledgeReadPayload): KnowledgeDocument {
     commandEnabled: payload.commandEnabled,
     readOnly: payload.readOnly,
     aiMaintained: payload.aiMaintained,
+    storageSource: payload.storageSource ?? "project",
     inheritAiConfig: payload.inheritAiConfig ?? false,
     aiConfigSource: payload.aiConfigSource ?? { kind: "self", path: null },
     explicitMaintenanceRules: payload.explicitMaintenanceRules ?? false,
@@ -378,7 +378,6 @@ export async function knowledgeQuery(
     limit: input.limit,
     types: input.types,
     pathPrefix: input.pathPrefix,
-    scopes: input.scopes,
   });
 
   return results.map((result) => ({
@@ -386,7 +385,7 @@ export async function knowledgeQuery(
     type: result.type,
     path: result.path,
     title: result.title,
-    scope: result.scope,
+    storageSource: result.storageSource ?? "project",
     injectMode: result.injectMode,
     aiMaintained: result.aiMaintained,
     score: result.score,

@@ -307,7 +307,6 @@ fn apply_knowledge_target(
                 doc_type,
                 path: rel_path,
                 title: knowledge_title_from_path(target),
-                scope: crate::knowledge_store::KnowledgeScope::Project,
                 inject_mode: knowledge_default_inject_mode(doc_type),
                 inherit_inject_mode: true,
                 inject_mode_source: Default::default(),
@@ -315,6 +314,7 @@ fn apply_knowledge_target(
                 command_enabled: false,
                 read_only: false,
                 ai_maintained: crate::knowledge_store::default_ai_maintained_for_type(doc_type),
+                storage_source: crate::knowledge_store::KnowledgeStorageSource::Project,
                 inherit_ai_config: true,
                 ai_config_source: Default::default(),
                 explicit_maintenance_rules:
@@ -853,6 +853,7 @@ pub async fn chat(
         subagent_models.unwrap_or_default(),
         cancel_rx,
     );
+    let partial_assistant = instance.partial_assistant_state();
     let effective_mode = mode
         .or_else(|| user_intent.as_ref().map(|intent| intent.mode.clone()))
         .unwrap_or_else(|| "build".to_string());
@@ -969,6 +970,7 @@ pub async fn chat(
                 run_id: run_id.clone(),
                 cancel_tx,
                 done_rx,
+                partial_assistant,
                 join_handle,
             },
         );
@@ -1207,6 +1209,12 @@ pub async fn cancel_chat(
 
     let handle = active_tasks.lock().await.remove(&session_id);
     if let Some(task) = handle {
+        let interrupted = AgentInstance::persist_interrupted_assistant_snapshot(
+            store.inner().as_ref(),
+            &session_id,
+            &task.partial_assistant.snapshot(),
+        );
+        task.partial_assistant.reset();
         task.join_handle.abort();
         eprintln!(
             "[Locus] cancellation timed out; aborted task for session {}",
@@ -1217,7 +1225,19 @@ pub async fn cancel_chat(
             &app_handle,
             store.inner().as_ref(),
             run_id,
-            StreamEvent::Cancelled { session_id },
+            StreamEvent::Cancelled {
+                session_id,
+                message_id: interrupted
+                    .as_ref()
+                    .map(|message| message.message_id.clone()),
+                full_text: interrupted
+                    .as_ref()
+                    .map(|message| message.full_text.clone()),
+                thinking_content: interrupted
+                    .as_ref()
+                    .and_then(|message| message.thinking_content.clone()),
+                thinking_duration: interrupted.and_then(|message| message.thinking_duration),
+            },
         );
     }
 

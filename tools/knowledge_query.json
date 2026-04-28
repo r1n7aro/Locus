@@ -1,5 +1,5 @@
 {
-  "description": "Search the unified knowledge store. Provide at least one of `lexicalQuery` or `semanticQuery`. Returns plain-text ranked results with path, title, match metadata, and snippets from summary or body.",
+  "description": "Search the unified knowledge store. Provide at least one of `lexicalQuery` or `semanticQuery`. Returns plain-text ranked results with canonical type-prefixed `.md` document path, title, match metadata, and snippets from summary or body.",
   "parameters": {
     "type": "object",
     "additionalProperties": false,
@@ -19,7 +19,7 @@
       },
       "pathPrefix": {
         "type": "string",
-        "description": "Optional type-prefixed path prefix such as `memory/agent/` or `reference/unity/`."
+        "description": "Optional type-prefixed directory path prefix such as `memory/agent/` or `reference/unity/`. Directory prefixes do not end with `.md`."
       }
     }
   }

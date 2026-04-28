@@ -1,5 +1,5 @@
 {
-  "description": "Move a unified knowledge document or directory within its knowledge type tree. Returns a plain-text status line.",
+  "description": "Move a unified knowledge document or directory within its knowledge type tree. Document paths must end with `.md`; directory paths do not. Returns a plain-text status line.",
   "parameters": {
     "type": "object",
     "additionalProperties": false,
@@ -11,11 +11,11 @@
       },
       "path": {
         "type": "string",
-        "description": "Current type-prefixed path."
+        "description": "Current type-prefixed path. Use a `.md` suffix for `kind=document`; omit `.md` for `kind=directory`."
       },
       "newPath": {
         "type": "string",
-        "description": "Target type-prefixed path. Keep it inside the same top-level type tree."
+        "description": "Target type-prefixed path. Use a `.md` suffix for `kind=document`; omit `.md` for `kind=directory`. Keep it inside the same top-level type tree."
       }
     },
     "required": ["kind", "path", "newPath"]

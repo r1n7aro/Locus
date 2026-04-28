@@ -673,6 +673,87 @@ describe("chat session panel state", () => {
     expect(chatStore.activeToolCalls[0]?.id).toBe("tc-current");
   });
 
+  it("replaces a loaded assistant tool round when the live round-done event arrives", async () => {
+    const chatStore = useChatStore();
+
+    sessionServiceMocks.loadSession.mockResolvedValueOnce({
+      id: "s1",
+      title: "Session s1",
+      messages: [
+        {
+          id: "msg-round",
+          role: "assistant",
+          content: "",
+          createdAt: 1,
+          toolCalls: [{ id: "tc-run", name: "unity_run_states", arguments: "{}" }],
+        },
+      ],
+      agentId: null,
+      sessionType: "chat",
+      parentSessionId: null,
+      latestCompletedRunId: null,
+      createdAt: 0,
+      updatedAt: 0,
+    });
+    sessionServiceMocks.getSessionActiveRun.mockResolvedValueOnce({
+      runId: "run-1",
+      sessionId: "s1",
+      status: "running",
+      startedAt: 1,
+      updatedAt: 2,
+      finishedAt: null,
+      errorMessage: null,
+    });
+    sessionServiceMocks.listSessionEvents.mockResolvedValueOnce([
+      {
+        sessionId: "s1",
+        runId: "run-1",
+        seq: 1,
+        eventType: "toolCallStart",
+        payload: {
+          type: "toolCallStart",
+          sessionId: "s1",
+          toolCallId: "tc-run",
+          toolName: "unity_run_states",
+          arguments: "{}",
+        },
+        createdAt: 1,
+      },
+    ]);
+
+    await chatStore.selectSession("s1");
+    chatStore.handleStreamEvent({
+      runId: "run-1",
+      type: "toolCallDone",
+      sessionId: "s1",
+      toolCallId: "tc-run",
+      toolName: "unity_run_states",
+      output: "status: ok",
+      outcome: "done",
+    });
+    chatStore.handleStreamEvent({
+      runId: "run-1",
+      type: "toolCallRoundDone",
+      sessionId: "s1",
+      messageId: "msg-round",
+      fullText: "profile done",
+      toolCalls: [
+        {
+          id: "tc-run",
+          name: "unity_run_states",
+          arguments: "{}",
+          outcome: "done",
+        },
+      ],
+    });
+
+    const assistantRounds = chatStore.messages.filter((message) => message.id === "msg-round");
+    expect(assistantRounds).toHaveLength(1);
+    expect(assistantRounds[0]?.content).toBe("profile done");
+    expect(assistantRounds[0]?.toolCalls?.[0]?.outcome).toBe("done");
+    expect(chatStore.messages.filter((message) => message.role === "tool")).toHaveLength(1);
+  });
+
   it("suppresses stale backend running status after a terminal event", async () => {
     const chatStore = useChatStore();
 

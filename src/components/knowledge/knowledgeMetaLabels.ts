@@ -223,8 +223,8 @@ export function buildExternalFolderTag(
     text: textForExternalFolderTag(providers),
     tone: "external",
     title: providerLabels.length
-      ? `${t("knowledge.scope.external")} · ${providerLabels.join(" / ")}`
-      : t("knowledge.scope.external"),
+      ? `${t("knowledge.source.external")} · ${providerLabels.join(" / ")}`
+      : t("knowledge.source.external"),
   };
 }
 

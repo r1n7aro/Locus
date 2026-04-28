@@ -46,6 +46,7 @@ const NSIS_UPDATE_PAGE_MARKER = "; Locus: upgrade-compatible NSIS installs updat
 const NSIS_UPDATE_LEAVE_MARKER = "; Locus: keep upgrade path on update mode.";
 const NSIS_LOCATION_MARKER = "; Locus: read install locations from historical metadata keys.";
 const NSIS_UNITY_PACKAGE_MARKER = "; Locus: replace bundled Unity package resources.";
+const NSIS_LEGACY_BUILTIN_SKILL_MARKER = "; Locus: remove legacy root-level bundled skill resources.";
 
 const args = process.argv.slice(2);
 const shouldRunDevWithMcp = args[0] === DEV_WITH_MCP_COMMAND;
@@ -332,6 +333,26 @@ function patchNsisUnityPackageCleanup(content) {
   );
 }
 
+function patchNsisLegacyBuiltinSkillCleanup(content) {
+  if (content.includes(NSIS_LEGACY_BUILTIN_SKILL_MARKER)) {
+    return content;
+  }
+
+  return replaceOnce(
+    content,
+    /Section Install\r?\n  SetOutPath \$INSTDIR/,
+    [
+      "Section Install",
+      "  SetOutPath $INSTDIR",
+      `  ${NSIS_LEGACY_BUILTIN_SKILL_MARKER}`,
+      '  Delete "$INSTDIR\\knowledge\\skill\\create-skill.md"',
+      '  Delete "$INSTDIR\\knowledge\\skill\\unity-editor-tooling.md"',
+      '  Delete "$INSTDIR\\knowledge\\skill\\unity-project-setup.md"',
+    ],
+    "Unable to find the NSIS install section to patch.",
+  );
+}
+
 function patchNsisInstallerScript(scriptPath) {
   const original = readFileSync(scriptPath, "utf8");
   const productName = readNsisDefine(original, "PRODUCTNAME");
@@ -344,8 +365,10 @@ function patchNsisInstallerScript(scriptPath) {
   }
 
   const next = patchNsisUnityPackageCleanup(
-    patchNsisInstallLocation(
-      patchNsisUpdateLeave(patchNsisUpdatePage(original)),
+    patchNsisLegacyBuiltinSkillCleanup(
+      patchNsisInstallLocation(
+        patchNsisUpdateLeave(patchNsisUpdatePage(original)),
+      ),
     ),
   );
 

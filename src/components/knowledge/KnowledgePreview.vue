@@ -4,7 +4,6 @@ import type {
   KnowledgeDocument,
   KnowledgeDocumentPatch,
   KnowledgeEditMode,
-  KnowledgeDocumentScope,
   KnowledgeDocumentSection,
   KnowledgeSearchMatchSection,
   KnowledgeSearchSelectionContext,
@@ -161,7 +160,7 @@ const documentDisplayPath = computed(() => formatDocumentDisplayPath(props.docum
 const documentTitle = computed(() => currentDocumentFileStem.value || t("knowledge.preview.untitled"));
 const titleMeasureText = computed(() => fileNameDraft.value || " ");
 const typeLabel = computed(() => labelForType(props.document?.type));
-const scopeLabel = computed(() => labelForScope(props.document?.scope));
+const scopeLabel = computed(() => labelForStoredScope(props.document));
 const injectMode = computed(() => props.document?.injectMode ?? "none");
 const injectModeSelection = computed<InjectModeSelection>(() => (
   props.document?.inheritInjectMode ? "inherit_parent" : (props.document?.injectMode ?? "none")
@@ -253,7 +252,11 @@ const rulesHint = computed(() => (
 
 const sourceSummary = computed(() => {
   const source = props.document?.externalSource;
-  if (!source) return t("knowledge.meta.internalSource");
+  if (!source) {
+    return props.document?.storageSource === "app"
+      ? t("knowledge.meta.storageSourceApp")
+      : t("knowledge.meta.storageSourceProject");
+  }
   const locator = source.locator?.trim();
   return [labelForProvider(source.provider), locator].filter(Boolean).join(" · ");
 });
@@ -360,6 +363,9 @@ const currentSkillCommandTrigger = computed(() => {
 });
 const skillCommandInputDisabled = computed(() =>
   isReadOnly.value || props.saveLoading || !skillEnabled.value || !skillSurfaceAllowsCommand(currentSkillSurface.value),
+);
+const showSkillCommandFields = computed(() =>
+  isSkillDocument.value && skillEnabled.value && skillSurfaceAllowsCommand(currentSkillSurface.value),
 );
 const sideRailStyle = computed(() => {
   if (metaCollapsed.value) {
@@ -1349,17 +1355,11 @@ function labelForType(type?: KnowledgeDocumentType | null): string {
   }
 }
 
-function labelForScope(scope?: KnowledgeDocumentScope | null): string {
-  switch (scope) {
-    case "project":
-      return t("knowledge.scope.project");
-    case "user":
-      return t("knowledge.scope.user");
-    case "external":
-      return t("knowledge.scope.external");
-    default:
-      return "—";
-  }
+function labelForStoredScope(document?: KnowledgeDocument | null): string {
+  if (!document) return "—";
+  return document.storageSource === "app"
+    ? t("knowledge.scope.user")
+    : t("knowledge.scope.project");
 }
 
 function labelForProvider(provider?: string | null): string {
@@ -1741,7 +1741,7 @@ function labelForProvider(provider?: string | null): string {
                     />
                   </div>
                 </div>
-                <div v-if="document.type === 'skill'" class="meta-row meta-row-control">
+                <div v-if="showSkillCommandFields" class="meta-row meta-row-control">
                   <span class="meta-label">{{ t("knowledge.skill.commandTrigger") }}</span>
                   <div class="meta-control">
                     <input
@@ -1755,7 +1755,7 @@ function labelForProvider(provider?: string | null): string {
                     />
                   </div>
                 </div>
-                <div v-if="document.type === 'skill'" class="meta-row meta-row-control">
+                <div v-if="showSkillCommandFields" class="meta-row meta-row-control">
                   <span class="meta-label">{{ t("knowledge.skill.argumentHint") }}</span>
                   <div class="meta-control">
                     <input

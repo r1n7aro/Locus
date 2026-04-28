@@ -449,7 +449,14 @@ export type StreamEvent = { runId: string } & (
       messagesAfter: number;
       messages: ChatMessage[];
     }
-  | { type: "cancelled"; sessionId: string }
+  | {
+      type: "cancelled";
+      sessionId: string;
+      messageId?: string | null;
+      fullText?: string | null;
+      thinkingContent?: string | null;
+      thinkingDuration?: number | null;
+    }
   | { type: "done"; sessionId: string; messageId: string; fullText: string }
   | { type: "error"; sessionId: string; error: AppErrorPayload }
 );
@@ -563,7 +570,7 @@ export interface SkillConfig {
 // ---------------------------------------------------------------------------
 
 export type KnowledgeDocumentType = "design" | "memory" | "skill" | "reference";
-export type KnowledgeDocumentScope = "project" | "user" | "external";
+export type KnowledgeStorageSource = "project" | "app";
 export type KnowledgeInjectMode = "none" | "path" | "excerpt" | "full" | "rule";
 export type KnowledgeEditMode =
   | "inherit_parent"
@@ -601,7 +608,6 @@ export interface KnowledgeDocumentSummary {
   type: KnowledgeDocumentType;
   path: string;
   title: string;
-  scope: KnowledgeDocumentScope;
   injectMode: KnowledgeInjectMode;
   inheritInjectMode?: boolean;
   injectModeSource?: KnowledgeConfigSource | null;
@@ -609,6 +615,7 @@ export interface KnowledgeDocumentSummary {
   commandEnabled: boolean;
   readOnly: boolean;
   aiMaintained: boolean;
+  storageSource?: KnowledgeStorageSource;
   inheritAiConfig?: boolean;
   aiConfigSource?: KnowledgeConfigSource | null;
   explicitMaintenanceRules: boolean;
@@ -691,7 +698,7 @@ export interface KnowledgeSearchResult {
   type: KnowledgeDocumentType;
   path: string;
   title: string;
-  scope: KnowledgeDocumentScope;
+  storageSource?: KnowledgeStorageSource;
   injectMode: KnowledgeInjectMode;
   aiMaintained: boolean;
   snippet: string;
@@ -876,7 +883,7 @@ export interface FeishuReferenceImportStatus {
 export interface KnowledgeCatalogStats {
   total: number;
   byType: Record<KnowledgeDocumentType, number>;
-  byScope: Record<KnowledgeDocumentScope, number>;
+  byStorageSource: Record<KnowledgeStorageSource, number>;
   commandEnabled: number;
   aiMaintained: number;
   fullInjectable: number;
@@ -891,7 +898,6 @@ export interface KnowledgeDocumentPatch {
   id?: string;
   type?: KnowledgeDocumentType;
   title?: string;
-  scope?: KnowledgeDocumentScope;
   injectMode?: KnowledgeInjectMode;
   inheritInjectMode?: boolean;
   summaryEnabled?: boolean;
@@ -1001,7 +1007,6 @@ export interface KnowledgeDocumentQueryInput {
   limit?: number;
   types?: KnowledgeDocumentType[];
   pathPrefix?: string;
-  scopes?: KnowledgeDocumentScope[];
 }
 
 // ---------------------------------------------------------------------------

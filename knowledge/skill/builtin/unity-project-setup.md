@@ -1,9 +1,8 @@
 ---
 id: kd_skill_unity_project_setup
 type: skill
-path: unity-project-setup.md
+path: builtin/unity-project-setup.md
 title: Unity Project Setup
-scope: project
 injectMode: none
 summaryEnabled: true
 commandEnabled: true

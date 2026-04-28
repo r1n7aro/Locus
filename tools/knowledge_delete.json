@@ -1,5 +1,5 @@
 {
-  "description": "Delete a unified knowledge document or directory by path. Returns a plain-text status line.",
+  "description": "Delete a unified knowledge document or directory by path. Document paths must end with `.md`; directory paths do not. Returns a plain-text status line.",
   "parameters": {
     "type": "object",
     "additionalProperties": false,
@@ -11,7 +11,7 @@
       },
       "path": {
         "type": "string",
-        "description": "Current type-prefixed path, for example `reference/render-pipeline/urp-notes.md`."
+        "description": "Current type-prefixed path. Use a `.md` suffix for `kind=document`, for example `reference/render-pipeline/urp-notes.md`; omit `.md` for `kind=directory`."
       }
     },
     "required": ["kind", "path"]

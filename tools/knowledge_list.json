@@ -1,12 +1,12 @@
 {
-  "description": "List knowledge documents in the unified knowledge store. Use this to browse the four top-level types: design, memory, skill, and reference. Returns plain text with one type-prefixed `path` per line, such as `skill/build-pipeline.md`.",
+  "description": "List knowledge documents in the unified knowledge store. Use this to browse the four top-level types: design, memory, skill, and reference. Returns plain text with one canonical type-prefixed `.md` document path per line, such as `skill/build-pipeline.md`.",
   "parameters": {
     "type": "object",
     "additionalProperties": false,
     "properties": {
       "pathPrefix": {
         "type": "string",
-        "description": "Optional type-prefixed path prefix such as `design/`, `design/combat/`, or `skill/unity/`. When omitted, all knowledge types are listed."
+        "description": "Optional type-prefixed directory path prefix such as `design/`, `design/combat/`, or `skill/unity/`. Directory prefixes do not end with `.md`. When omitted, all knowledge types are listed."
       }
     }
   }

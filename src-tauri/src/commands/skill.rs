@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, State};
+use walkdir::WalkDir;
 
 use crate::error::AppError;
 use crate::knowledge_index::KnowledgeIndexState;
@@ -59,7 +60,15 @@ pub fn lookup_skill_config(
     dir_name: &str,
 ) -> SkillConfig {
     let new_key = config_key(source, dir_name);
-    configs.get(&new_key).cloned().unwrap_or_default()
+    configs
+        .get(&new_key)
+        .cloned()
+        .or_else(|| {
+            dir_name
+                .strip_prefix("builtin/")
+                .and_then(|legacy_name| configs.get(&config_key(source, legacy_name)).cloned())
+        })
+        .unwrap_or_default()
 }
 
 // ── Scanning ─────────────────────────────────────────────────
@@ -79,35 +88,42 @@ fn scan_skill_dir(
         None => return Vec::new(),
     };
 
-    let entries = match std::fs::read_dir(&skill_dir) {
-        Ok(e) => e,
-        Err(_) => return Vec::new(),
-    };
-
     let mut manifests = Vec::new();
+    let mut files = WalkDir::new(&skill_dir)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            if !path.is_file() || path.extension().and_then(|value| value.to_str()) != Some("md") {
+                return None;
+            }
+            let relative_path = path
+                .strip_prefix(&skill_dir)
+                .ok()?
+                .to_string_lossy()
+                .replace('\\', "/");
+            let dir_name = relative_path.strip_suffix(".md")?.to_string();
+            if dir_name.trim().is_empty() {
+                return None;
+            }
+            Some((path.to_path_buf(), relative_path, dir_name))
+        })
+        .collect::<Vec<_>>();
+    files.sort_by(|left, right| left.1.cmp(&right.1));
 
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let name = entry.file_name().to_string_lossy().to_string();
-
-        if !path.is_file() || path.extension().and_then(|value| value.to_str()) != Some("md") {
-            continue;
-        }
-
-        let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
+    for (path, document_path, dir_name) in files {
+        let rel_path = format!("{}/{}", SKILL_DIR_NAME, document_path);
+        let Ok(document) = knowledge_store::load_document_by_root(
+            knowledge_dir,
+            KnowledgeType::Skill,
+            &document_path,
+        ) else {
             continue;
         };
-
-        let rel_path = format!("{}/{}", SKILL_DIR_NAME, name);
-        let Ok(document) =
-            knowledge_store::load_document_by_root(knowledge_dir, KnowledgeType::Skill, &name)
-        else {
-            continue;
-        };
-        let cfg = (source == "app").then(|| lookup_skill_config(configs, source, stem));
+        let cfg = (source == "app").then(|| lookup_skill_config(configs, source, &dir_name));
         manifests.push(build_skill_manifest(
             &document,
-            stem,
+            &dir_name,
             source,
             &rel_path,
             get_updated_at(&path),
@@ -215,7 +231,7 @@ pub fn list_skills_sync(
     if project_dir.is_dir() {
         let project_skills = scan_skill_dir(&project_dir, "project", &configs);
         for ps in project_skills {
-            manifests.retain(|m| m.dir_name != ps.dir_name);
+            manifests.retain(|m| !skill_manifest_overridden_by_project(m, &ps));
             manifests.push(ps);
         }
     }
@@ -224,15 +240,39 @@ pub fn list_skills_sync(
     manifests
 }
 
+fn skill_manifest_overridden_by_project(existing: &SkillManifest, project: &SkillManifest) -> bool {
+    if existing.dir_name == project.dir_name {
+        return true;
+    }
+    existing.source == "app" && existing.dir_name == format!("builtin/{}", project.dir_name)
+}
+
+fn normalize_skill_manifest_name(dir_name: &str) -> Result<String, String> {
+    let normalized = dir_name.trim().replace('\\', "/");
+    let normalized = normalized.trim_matches('/');
+    if normalized.is_empty()
+        || normalized.contains("..")
+        || normalized.split('/').any(|segment| {
+            segment.is_empty()
+                || segment == "."
+                || segment == ".."
+                || !segment.chars().all(|ch| {
+                    ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-' || ch == '_'
+                })
+        })
+    {
+        return Err("Invalid skill name".to_string());
+    }
+    Ok(normalized.to_string())
+}
+
 pub fn resolve_skill_manifest_path_sync(
     working_dir: &str,
     app_knowledge_dir: Option<&std::path::PathBuf>,
     dir_name: &str,
     source: Option<&str>,
 ) -> Result<std::path::PathBuf, String> {
-    if dir_name.contains("..") || dir_name.contains('/') || dir_name.contains('\\') {
-        return Err("Invalid skill name".to_string());
-    }
+    let normalized_dir_name = normalize_skill_manifest_name(dir_name)?;
 
     let src = source.unwrap_or("project");
     let knowledge_dir = if src == "app" {
@@ -247,12 +287,21 @@ pub fn resolve_skill_manifest_path_sync(
 
     let file_path = knowledge_dir
         .join(SKILL_DIR_NAME)
-        .join(format!("{}.md", dir_name));
+        .join(format!("{}.md", normalized_dir_name));
     if file_path.is_file() {
         return Ok(file_path);
     }
+    if src == "app" && !normalized_dir_name.contains('/') {
+        let builtin_file_path = knowledge_dir
+            .join(SKILL_DIR_NAME)
+            .join("builtin")
+            .join(format!("{}.md", normalized_dir_name));
+        if builtin_file_path.is_file() {
+            return Ok(builtin_file_path);
+        }
+    }
 
-    Err(format!("Skill not found: {}", dir_name))
+    Err(format!("Skill not found: {}", normalized_dir_name))
 }
 
 pub fn read_skill_manifest_sync(
@@ -334,7 +383,6 @@ pub async fn create_skill_scaffold(
         doc_type: KnowledgeType::Skill,
         path: format!("{}.md", name),
         title,
-        scope: knowledge_store::KnowledgeScope::Project,
         inject_mode: knowledge_store::KnowledgeInjectMode::None,
         inherit_inject_mode: true,
         inject_mode_source: Default::default(),
@@ -342,6 +390,7 @@ pub async fn create_skill_scaffold(
         command_enabled: true,
         read_only: false,
         ai_maintained: false,
+        storage_source: knowledge_store::KnowledgeStorageSource::Project,
         inherit_ai_config: true,
         ai_config_source: Default::default(),
         explicit_maintenance_rules: false,
@@ -382,7 +431,7 @@ pub async fn create_skill_scaffold(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_valid_skill_scaffold_name, list_skills_sync};
+    use super::{is_valid_skill_scaffold_name, list_skills_sync, read_skill_manifest_sync};
     use tempfile::TempDir;
 
     #[test]
@@ -439,5 +488,61 @@ Create a project skill.
         assert_eq!(skills[0].dir_name, "create-skill");
         assert_eq!(skills[0].source, "project");
         assert_eq!(skills[0].command_trigger, "/create-skill");
+    }
+
+    #[test]
+    fn list_skills_sync_reads_nested_app_builtin_skill() {
+        let temp = TempDir::new().unwrap();
+        let working_dir = temp.path().join("workspace");
+        let app_knowledge_dir = temp.path().join("app-knowledge");
+        let skill_dir = app_knowledge_dir.join("skill").join("builtin");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+
+        let raw = r#"---
+id: kd_skill_create_skill
+type: skill
+path: builtin/create-skill.md
+title: Create Skill
+injectMode: none
+summaryEnabled: true
+commandEnabled: true
+readOnly: true
+aiMaintained: false
+skillEnabled: true
+skillSurface: command
+commandTrigger: /create-skill
+argumentHint: <skill-name>
+createdAt: 1
+updatedAt: 1
+---
+
+# Create Skill
+
+## Summary
+Create a project skill.
+
+## Content
+## When to use
+
+- Reuse a workflow.
+        "#;
+        std::fs::write(skill_dir.join("create-skill.md"), raw).unwrap();
+
+        let working_dir = working_dir.to_string_lossy().to_string();
+        let skills = list_skills_sync(&working_dir, Some(&app_knowledge_dir));
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].dir_name, "builtin/create-skill");
+        assert_eq!(skills[0].source, "app");
+        assert_eq!(skills[0].rel_path, "skill/builtin/create-skill.md");
+        assert_eq!(skills[0].command_trigger, "/create-skill");
+
+        let content = read_skill_manifest_sync(
+            &working_dir,
+            Some(&app_knowledge_dir),
+            "create-skill",
+            Some("app"),
+        )
+        .expect("read legacy app builtin skill name");
+        assert!(content.contains("path: builtin/create-skill.md"));
     }
 }

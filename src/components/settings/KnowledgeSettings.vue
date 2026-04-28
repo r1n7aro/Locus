@@ -32,10 +32,9 @@ function emptyStats(): KnowledgeCatalogStats {
       skill: 0,
       reference: 0,
     },
-    byScope: {
+    byStorageSource: {
       project: 0,
-      user: 0,
-      external: 0,
+      app: 0,
     },
     commandEnabled: 0,
     aiMaintained: 0,
@@ -50,14 +49,14 @@ const stats = computed<KnowledgeCatalogStats>(() => {
   for (const doc of documents.value) {
     next.total += 1;
     next.byType[doc.type] += 1;
-    next.byScope[doc.scope] += 1;
+    next.byStorageSource[doc.storageSource ?? "project"] += 1;
     if (doc.commandEnabled) next.commandEnabled += 1;
     if (doc.aiMaintained) next.aiMaintained += 1;
     if ((doc.type === "design" || doc.type === "memory") && doc.injectMode === "full") {
       next.fullInjectable += 1;
     }
     if (doc.summaryEnabled && !doc.hasSummary) next.summaryMissing += 1;
-    if (doc.scope === "external") next.external += 1;
+    if (doc.externalSource) next.external += 1;
   }
   return next;
 });
@@ -108,17 +107,10 @@ function openKnowledge(document?: KnowledgeDocumentSummary) {
   uiStore.setTab("knowledge");
 }
 
-function labelForScope(scope: KnowledgeDocumentSummary["scope"]): string {
-  switch (scope) {
-    case "project":
-      return t("knowledge.scope.project");
-    case "user":
-      return t("knowledge.scope.user");
-    case "external":
-      return t("knowledge.scope.external");
-    default:
-      return "—";
-  }
+function labelForStoredScope(document: KnowledgeDocumentSummary): string {
+  return document.storageSource === "app"
+    ? t("knowledge.scope.user")
+    : t("knowledge.scope.project");
 }
 
 function labelForInject(mode: KnowledgeDocumentSummary["injectMode"]): string {
@@ -212,15 +204,11 @@ watch(() => project.workingDir, () => {
         <div class="type-lines compact">
           <div class="type-line">
             <span>{{ t("knowledge.scope.project") }}</span>
-            <span>{{ stats.byScope.project }}</span>
+            <span>{{ stats.byStorageSource.project }}</span>
           </div>
           <div class="type-line">
             <span>{{ t("knowledge.scope.user") }}</span>
-            <span>{{ stats.byScope.user }}</span>
-          </div>
-          <div class="type-line">
-            <span>{{ t("knowledge.scope.external") }}</span>
-            <span>{{ stats.byScope.external }}</span>
+            <span>{{ stats.byStorageSource.app }}</span>
           </div>
         </div>
       </section>
@@ -255,7 +243,7 @@ watch(() => project.workingDir, () => {
             <span class="recent-path">{{ `${document.type}/${document.path}` }}</span>
           </span>
           <span class="recent-meta">
-            {{ labelForScope(document.scope) }} · {{ labelForInject(document.injectMode) }}
+            {{ labelForStoredScope(document) }} · {{ labelForInject(document.injectMode) }}
           </span>
         </button>
       </div>

@@ -35,7 +35,8 @@ describe("locusManagedFiles", () => {
   it("resolves semantic tags for knowledge files", () => {
     expect(getLocusManagedTagKindForPath("Locus/knowledge/design/system/主要玩法.md")).toBe("design");
     expect(getLocusManagedTagKindForPath("Locus/knowledge/memory/unity-project-understanding/12.md")).toBe("memory");
-    expect(getLocusManagedTagKindForPath("Locus/knowledge/skill/create-skill.md")).toBe("skill");
+    expect(getLocusManagedTagKindForPath("Locus/knowledge/memory/unity-project-understanding")).toBe("memory");
+    expect(getLocusManagedTagKindForPath("Locus/knowledge/skill/builtin/create-skill.md")).toBe("skill");
     expect(getLocusManagedTagKindForPath("Locus/knowledge/reference/unity/api.md")).toBe("reference");
     expect(getLocusManagedTagKindForPath("Locus/memory/project-understanding.md")).toBe("memory");
   });

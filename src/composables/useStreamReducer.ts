@@ -313,11 +313,39 @@ export function reduceStreamEvent(state: StreamState, event: StreamEvent): Strea
       break;
     }
 
-    case "cancelled":
+    case "cancelled": {
+      const hasInterruptedMessage =
+        !!event.messageId
+        && (
+          event.fullText !== undefined
+          || event.thinkingContent !== undefined
+          || state.rawStreamText.length > 0
+          || state.streamingThinking.length > 0
+        );
+      if (hasInterruptedMessage) {
+        const existingMessage = state.messages.find((message) => message.id === event.messageId);
+        const content = event.fullText ?? state.rawStreamText;
+        const thinkingContent = (event.thinkingContent ?? state.streamingThinking) || undefined;
+        const thinkingDuration =
+          event.thinkingDuration ?? (state.thinkingDuration > 0 ? state.thinkingDuration : undefined);
+        mutations.push({
+          type: "upsertMessage",
+          message: {
+            ...existingMessage,
+            id: event.messageId!,
+            role: "assistant",
+            content,
+            createdAt: existingMessage?.createdAt ?? Date.now() / 1000,
+            thinkingContent,
+            thinkingDuration,
+          },
+        });
+      }
       mutations.push({ type: "resetRound" });
       mutations.push({ type: "clearPendingInputs" });
       mutations.push({ type: "setStreaming", value: false });
       break;
+    }
 
     case "error":
       mutations.push({ type: "resetRound" });

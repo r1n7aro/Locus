@@ -739,5 +739,36 @@ describe("reduceStreamEvent", () => {
       expect(mutations).toContainEqual({ type: "setStreaming", value: false });
       expect(mutations.find((m) => m.type === "pushMessage")).toBeUndefined();
     });
+
+    it("keeps interrupted assistant text when cancellation persists a message", () => {
+      const state = makeState({
+        isStreaming: true,
+        rawStreamText: "partial answer",
+        streamingThinking: "partial thought",
+        thinkingDuration: 2,
+      });
+      const event: StreamEvent = {
+        runId: "test-run",
+        type: "cancelled",
+        sessionId: "s1",
+        messageId: "m-cancelled",
+        fullText: "partial answer",
+        thinkingContent: "partial thought",
+        thinkingDuration: 2,
+      };
+      const mutations = reduceStreamEvent(state, event);
+
+      const upsert = mutations.find((m) => m.type === "upsertMessage");
+      expect(upsert).toBeDefined();
+      if (upsert?.type === "upsertMessage") {
+        expect(upsert.message.id).toBe("m-cancelled");
+        expect(upsert.message.role).toBe("assistant");
+        expect(upsert.message.content).toBe("partial answer");
+        expect(upsert.message.thinkingContent).toBe("partial thought");
+        expect(upsert.message.thinkingDuration).toBe(2);
+      }
+      expect(mutations).toContainEqual({ type: "resetRound" });
+      expect(mutations).toContainEqual({ type: "setStreaming", value: false });
+    });
   });
 });

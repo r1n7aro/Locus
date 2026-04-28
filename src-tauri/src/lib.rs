@@ -41,7 +41,7 @@ mod windows_window_frame;
 mod workspace;
 
 use agent::definition::AgentDefRegistry;
-use agent::instance::RawContextStore;
+use agent::instance::{AssistantStreamState, RawContextStore};
 use commands::AppKnowledgeDir;
 
 const MAIN_WINDOW_LABEL: &str = "main";
@@ -67,6 +67,7 @@ pub struct ActiveTaskHandle {
     pub run_id: String,
     pub cancel_tx: tokio::sync::watch::Sender<bool>,
     pub done_rx: tokio::sync::watch::Receiver<bool>,
+    pub partial_assistant: Arc<AssistantStreamState>,
     pub join_handle: tauri::async_runtime::JoinHandle<()>,
 }
 
@@ -633,6 +634,7 @@ pub fn run() {
             commands::check_unity_connection,
             commands::check_unity_plugin,
             commands::install_unity_plugin,
+            commands::launch_unity_project,
             commands::send_unity_log,
             commands::select_unity_asset,
             commands::open_unity_asset_inspector,

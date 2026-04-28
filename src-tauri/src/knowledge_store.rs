@@ -72,36 +72,6 @@ impl Default for SkillSurface {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
-pub enum KnowledgeScope {
-    Project,
-    User,
-    External,
-}
-
-impl KnowledgeScope {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Project => "project",
-            Self::User => "user",
-            Self::External => "external",
-        }
-    }
-}
-
-impl std::fmt::Display for KnowledgeScope {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str((*self).as_str())
-    }
-}
-
-impl Default for KnowledgeScope {
-    fn default() -> Self {
-        Self::Project
-    }
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
-#[serde(rename_all = "snake_case")]
 pub enum KnowledgeInjectMode {
     None,
     Path,
@@ -182,6 +152,14 @@ pub struct KnowledgeExternalSource {
     pub sync_enabled: bool,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum KnowledgeStorageSource {
+    #[default]
+    Project,
+    App,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum KnowledgeConfigSourceKind {
@@ -208,7 +186,6 @@ pub struct KnowledgeDocument {
     pub doc_type: KnowledgeType,
     pub path: String,
     pub title: String,
-    pub scope: KnowledgeScope,
     pub inject_mode: KnowledgeInjectMode,
     #[serde(default)]
     pub inherit_inject_mode: bool,
@@ -217,6 +194,8 @@ pub struct KnowledgeDocument {
     pub command_enabled: bool,
     pub read_only: bool,
     pub ai_maintained: bool,
+    #[serde(default, skip_deserializing)]
+    pub storage_source: KnowledgeStorageSource,
     #[serde(default)]
     pub inherit_ai_config: bool,
     pub ai_config_source: KnowledgeConfigSource,
@@ -249,7 +228,6 @@ struct KnowledgeFrontmatter {
     #[serde(default)]
     pub path: String,
     pub title: String,
-    pub scope: KnowledgeScope,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inject_mode: Option<KnowledgeInjectMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -294,13 +272,14 @@ pub struct KnowledgeListItem {
     pub doc_type: KnowledgeType,
     pub path: String,
     pub title: String,
-    pub scope: KnowledgeScope,
     pub inject_mode: KnowledgeInjectMode,
     pub summary_enabled: bool,
     pub command_enabled: bool,
     pub read_only: bool,
     pub ai_maintained: bool,
     pub explicit_maintenance_rules: bool,
+    #[serde(default)]
+    pub storage_source: KnowledgeStorageSource,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_source: Option<KnowledgeExternalSource>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -554,8 +533,6 @@ pub struct KnowledgeDocumentPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub scope: Option<KnowledgeScope>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inject_mode: Option<KnowledgeInjectMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inherit_inject_mode: Option<bool>,
@@ -718,7 +695,8 @@ pub struct KnowledgeSearchHit {
     pub doc_type: KnowledgeType,
     pub path: String,
     pub title: String,
-    pub scope: KnowledgeScope,
+    #[serde(default)]
+    pub storage_source: KnowledgeStorageSource,
     pub inject_mode: KnowledgeInjectMode,
     pub ai_maintained: bool,
     pub score: f32,
@@ -774,8 +752,6 @@ pub struct KnowledgeUpdateRequest {
     pub doc_type: Option<KnowledgeType>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub scope: Option<KnowledgeScope>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inject_mode: Option<KnowledgeInjectMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -977,7 +953,6 @@ struct MemoryBuiltinSeed {
     id: &'static str,
     path: &'static str,
     title: &'static str,
-    scope: KnowledgeScope,
     inject_mode: KnowledgeInjectMode,
     maintenance_rules: &'static str,
 }
@@ -995,7 +970,6 @@ fn memory_builtin_seeds() -> &'static [MemoryBuiltinSeed] {
             id: "kd_builtin_memory_project_mistake_note",
             path: MEMORY_PROJECT_MISTAKE_NOTE_PATH,
             title: "错题本",
-            scope: KnowledgeScope::Project,
             inject_mode: KnowledgeInjectMode::Full,
             maintenance_rules: MEMORY_PROJECT_MISTAKE_NOTE_RULES,
         },
@@ -1003,7 +977,6 @@ fn memory_builtin_seeds() -> &'static [MemoryBuiltinSeed] {
             id: "kd_builtin_memory_user_preference",
             path: MEMORY_USER_PREFERENCE_PATH,
             title: "用户偏好",
-            scope: KnowledgeScope::User,
             inject_mode: KnowledgeInjectMode::Rule,
             maintenance_rules: MEMORY_USER_PREFERENCE_RULES,
         },
@@ -1026,7 +999,6 @@ fn memory_document_payload_matches(left: &KnowledgeDocument, right: &KnowledgeDo
 
 fn memory_builtin_documents_match(left: &KnowledgeDocument, right: &KnowledgeDocument) -> bool {
     memory_document_payload_matches(left, right)
-        && left.scope == right.scope
         && left.inject_mode == right.inject_mode
         && left
             .maintenance_rules
@@ -1403,7 +1375,6 @@ pub fn ensure_memory_builtin_documents(working_dir: &str) -> Result<(), String> 
                 doc_type: KnowledgeType::Memory,
                 path: seed.path.to_string(),
                 title: seed.title.to_string(),
-                scope: seed.scope,
                 inject_mode: seed.inject_mode,
                 inherit_inject_mode: false,
                 inject_mode_source: self_config_source(),
@@ -1411,6 +1382,7 @@ pub fn ensure_memory_builtin_documents(working_dir: &str) -> Result<(), String> 
                 command_enabled: false,
                 read_only: false,
                 ai_maintained: true,
+                storage_source: KnowledgeStorageSource::Project,
                 inherit_ai_config: false,
                 ai_config_source: self_config_source(),
                 explicit_maintenance_rules: true,
@@ -2845,9 +2817,6 @@ pub fn edit_document(
     if let Some(doc_type) = patch.doc_type {
         doc.doc_type = doc_type;
     }
-    if let Some(scope) = patch.scope {
-        doc.scope = scope;
-    }
     if let Some(inject_mode) = patch.inject_mode {
         doc.inject_mode = inject_mode;
     }
@@ -3215,7 +3184,6 @@ fn render_frontmatter(doc: &KnowledgeDocument) -> Result<String, String> {
         doc_type: doc.doc_type,
         path: doc.path.clone(),
         title: doc.title.clone(),
-        scope: doc.scope,
         inject_mode: (!doc.inherit_inject_mode).then_some(doc.inject_mode),
         inherit_inject_mode: doc.inherit_inject_mode.then_some(true),
         summary_enabled: Some(doc.summary_enabled),
@@ -3353,12 +3321,6 @@ fn validate_document(doc: &KnowledgeDocument) -> Result<(), String> {
             "skill/reference documents cannot use injectMode=full or injectMode=rule".to_string(),
         );
     }
-    if doc.scope == KnowledgeScope::External && doc.external_source.is_none() {
-        return Err("scope=external requires externalSource".to_string());
-    }
-    if doc.scope != KnowledgeScope::External && doc.external_source.is_some() {
-        return Err("externalSource is only allowed when scope=external".to_string());
-    }
     if doc.doc_type == KnowledgeType::Skill {
         if doc.skill_enabled.is_none() || doc.skill_surface.is_none() {
             return Err("skill documents require skillEnabled and skillSurface".to_string());
@@ -3406,7 +3368,6 @@ fn parse_document(content: &str, path_hint: Option<&str>) -> Result<KnowledgeDoc
         doc_type: frontmatter.doc_type,
         path,
         title,
-        scope: frontmatter.scope,
         inject_mode: frontmatter
             .inject_mode
             .unwrap_or_else(|| default_document_inject_mode_for_type(frontmatter.doc_type)),
@@ -3422,6 +3383,7 @@ fn parse_document(content: &str, path_hint: Option<&str>) -> Result<KnowledgeDoc
         ai_maintained: frontmatter
             .ai_maintained
             .unwrap_or_else(|| default_ai_maintained_for_type(frontmatter.doc_type)),
+        storage_source: KnowledgeStorageSource::Project,
         inherit_ai_config,
         ai_config_source: if inherit_ai_config {
             type_default_config_source()
@@ -3920,7 +3882,8 @@ pub fn load_document_by_root(
     Ok(document)
 }
 
-fn overlay_app_document_read_only(document: &mut KnowledgeDocument) {
+fn overlay_app_document_metadata(document: &mut KnowledgeDocument) {
+    document.storage_source = KnowledgeStorageSource::App;
     document.read_only = true;
 }
 
@@ -3968,13 +3931,13 @@ fn document_to_list_item(doc: KnowledgeDocument) -> KnowledgeListItem {
         doc_type: doc.doc_type,
         path: doc.path,
         title: doc.title,
-        scope: doc.scope,
         inject_mode: doc.inject_mode,
         summary_enabled: doc.summary_enabled,
         command_enabled: doc.command_enabled,
         read_only: doc.read_only,
         ai_maintained: doc.ai_maintained,
         explicit_maintenance_rules: doc.explicit_maintenance_rules,
+        storage_source: doc.storage_source,
         external_source: doc.external_source,
         skill_enabled: doc.skill_enabled,
         skill_surface: doc.skill_surface,
@@ -3997,6 +3960,7 @@ fn collect_document_snapshots_from_root(
     normalized_prefix: Option<&str>,
     excluded_prefixes: Option<&[String]>,
     app_read_only: bool,
+    storage_source: KnowledgeStorageSource,
     seen: &mut std::collections::HashSet<String>,
     items: &mut Vec<KnowledgeDocument>,
 ) -> Result<(), String> {
@@ -4038,8 +4002,10 @@ fn collect_document_snapshots_from_root(
         if !seen.insert(key) {
             continue;
         }
-        if app_read_only {
-            overlay_app_document_read_only(&mut doc);
+        if storage_source == KnowledgeStorageSource::App {
+            overlay_app_document_metadata(&mut doc);
+        } else if app_read_only {
+            doc.read_only = true;
         }
         items.push(doc);
     }
@@ -4175,7 +4141,7 @@ pub fn load_document_by_path_with_app_root(
         let app_path = document_path_in_root(app_root, doc_type, &normalized_path)?;
         if app_path.is_file() {
             let mut document = load_document_by_root(app_root, doc_type, &normalized_path)?;
-            overlay_app_document_read_only(&mut document);
+            overlay_app_document_metadata(&mut document);
             return Ok(document);
         }
     }
@@ -4341,6 +4307,7 @@ pub fn load_documents_with_app_root_excluding_prefixes(
                     .get(&ty)
                     .map(|prefixes| prefixes.as_slice()),
                 true,
+                KnowledgeStorageSource::App,
                 &mut seen,
                 &mut documents,
             )?;
@@ -4744,23 +4711,16 @@ pub fn query_documents(
     working_dir: &str,
     query: &str,
     types: Option<&[KnowledgeType]>,
-    scopes: Option<&[KnowledgeScope]>,
     limit: usize,
 ) -> Result<Vec<KnowledgeSearchHit>, String> {
     let mut items = Vec::new();
     let query_types = types
         .map(|values| values.to_vec())
         .unwrap_or_else(|| KnowledgeType::all().to_vec());
-    let query_scopes = scopes.map(|values| values.to_vec());
 
     for ty in query_types {
         let docs = list_documents(working_dir, Some(ty), None)?;
         for item in docs {
-            if let Some(ref scopes) = query_scopes {
-                if !scopes.contains(&item.scope) {
-                    continue;
-                }
-            }
             let Ok(doc) = load_document_by_path(working_dir, ty, &item.path) else {
                 continue;
             };
@@ -4772,7 +4732,7 @@ pub fn query_documents(
                 doc_type: doc.doc_type,
                 path: doc.path,
                 title: doc.title,
-                scope: doc.scope,
+                storage_source: doc.storage_source,
                 inject_mode: doc.inject_mode,
                 ai_maintained: doc.ai_maintained,
                 score,
@@ -5087,7 +5047,6 @@ pub fn update_document(
             let title = request
                 .title
                 .ok_or_else(|| "create requires title".to_string())?;
-            let scope = request.scope.unwrap_or(KnowledgeScope::Project);
             let inherit_inject_mode = request
                 .inherit_inject_mode
                 .unwrap_or(request.inject_mode.is_none());
@@ -5123,7 +5082,6 @@ pub fn update_document(
                 doc_type,
                 path: normalize_relative_path(&request.path)?,
                 title,
-                scope,
                 inject_mode,
                 inherit_inject_mode,
                 inject_mode_source: if inherit_inject_mode {
@@ -5135,6 +5093,7 @@ pub fn update_document(
                 command_enabled: request.command_enabled.unwrap_or(false),
                 read_only: request.read_only.unwrap_or(false),
                 ai_maintained,
+                storage_source: KnowledgeStorageSource::Project,
                 inherit_ai_config,
                 ai_config_source: if inherit_ai_config {
                     type_default_config_source()
@@ -5172,7 +5131,6 @@ pub fn update_document(
                 id: request.id,
                 doc_type: request.doc_type,
                 title: request.title,
-                scope: request.scope,
                 inject_mode: request.inject_mode,
                 inherit_inject_mode: request.inherit_inject_mode,
                 summary_enabled: request.summary_enabled,
@@ -5218,9 +5176,6 @@ pub fn update_document(
             let old_path = doc.path.clone();
             if let Some(doc_type) = request.doc_type {
                 doc.doc_type = doc_type;
-            }
-            if let Some(scope) = request.scope {
-                doc.scope = scope;
             }
             if let Some(inject_mode) = request.inject_mode {
                 doc.inject_mode = inject_mode;
@@ -5632,7 +5587,6 @@ mod tests {
             doc_type: KnowledgeType::Design,
             path: "gameplay/core-loop.md".to_string(),
             title: "Core Loop".to_string(),
-            scope: KnowledgeScope::Project,
             inject_mode: KnowledgeInjectMode::Excerpt,
             inherit_inject_mode: false,
             inject_mode_source: self_config_source(),
@@ -5640,6 +5594,7 @@ mod tests {
             command_enabled: true,
             read_only: false,
             ai_maintained: false,
+            storage_source: KnowledgeStorageSource::Project,
             inherit_ai_config: false,
             ai_config_source: self_config_source(),
             explicit_maintenance_rules: false,
@@ -5682,7 +5637,6 @@ mod tests {
             doc_type: KnowledgeType::Reference,
             path: "unity-official-docs/manual/ExecutionOrder.md".to_string(),
             title: "Execution Order".to_string(),
-            scope: KnowledgeScope::External,
             inject_mode: KnowledgeInjectMode::None,
             inherit_inject_mode: false,
             inject_mode_source: self_config_source(),
@@ -5690,6 +5644,7 @@ mod tests {
             command_enabled: false,
             read_only: true,
             ai_maintained: false,
+            storage_source: KnowledgeStorageSource::Project,
             inherit_ai_config: false,
             ai_config_source: self_config_source(),
             explicit_maintenance_rules: false,
@@ -5720,7 +5675,6 @@ mod tests {
             doc_type: KnowledgeType::Memory,
             path: MEMORY_USER_PREFERENCE_PATH.to_string(),
             title: "用户偏好".to_string(),
-            scope: KnowledgeScope::User,
             inject_mode: KnowledgeInjectMode::Full,
             inherit_inject_mode: false,
             inject_mode_source: self_config_source(),
@@ -5728,6 +5682,7 @@ mod tests {
             command_enabled: false,
             read_only: false,
             ai_maintained: false,
+            storage_source: KnowledgeStorageSource::Project,
             inherit_ai_config: false,
             ai_config_source: self_config_source(),
             explicit_maintenance_rules: true,
@@ -5942,7 +5897,6 @@ Body content
             doc_type: KnowledgeType::Skill,
             path: "create-skill.md".to_string(),
             title: "Create Skill".to_string(),
-            scope: KnowledgeScope::Project,
             inject_mode: KnowledgeInjectMode::None,
             inherit_inject_mode: false,
             inject_mode_source: self_config_source(),
@@ -5950,6 +5904,7 @@ Body content
             command_enabled: true,
             read_only: false,
             ai_maintained: false,
+            storage_source: KnowledgeStorageSource::Project,
             inherit_ai_config: false,
             ai_config_source: self_config_source(),
             explicit_maintenance_rules: false,
@@ -5977,7 +5932,6 @@ Body content
     #[test]
     fn read_only_is_derived_from_external_source_provider() {
         let mut doc = sample_doc();
-        doc.scope = KnowledgeScope::External;
         doc.read_only = false;
         doc.external_source = Some(KnowledgeExternalSource {
             provider: KnowledgeSourceProvider::Feishu,
@@ -5987,8 +5941,29 @@ Body content
         });
 
         let rendered = render_document(&doc).expect("render");
+        assert!(!rendered.contains("\nscope:"));
         let parsed = parse_document(&rendered, Some("gameplay/core-loop.md")).expect("parse");
         assert!(parsed.read_only);
+    }
+
+    #[test]
+    fn legacy_scope_frontmatter_is_ignored() {
+        let temp = TempDir::new().unwrap();
+        let working_dir = temp.path().to_string_lossy().to_string();
+        let doc = sample_doc();
+        let raw = render_document(&doc)
+            .expect("render")
+            .replace("title: Core Loop\n", "title: Core Loop\nscope: external\n");
+
+        let parsed = parse_document(&raw, Some("gameplay/core-loop.md")).expect("parse");
+        save_document(&working_dir, parsed).expect("save legacy scope doc");
+        let rewritten = std::fs::read_to_string(
+            document_path(&working_dir, KnowledgeType::Design, "gameplay/core-loop.md")
+                .expect("document path"),
+        )
+        .expect("read rewritten doc");
+
+        assert!(!rewritten.contains("\nscope:"));
     }
 
     #[test]
@@ -6597,7 +6572,6 @@ Body content
         doc.doc_type = KnowledgeType::Reference;
         doc.path = "samplegame-old/gameplay/Gameplay.md".to_string();
         doc.title = "Gameplay".to_string();
-        doc.scope = KnowledgeScope::External;
         doc.read_only = true;
         doc.external_source = Some(KnowledgeExternalSource {
             provider: KnowledgeSourceProvider::LocalFolder,
@@ -6818,7 +6792,6 @@ Body content
             MEMORY_USER_PREFERENCE_PATH,
         )
         .expect("load user preference");
-        assert_eq!(user_pref.scope, KnowledgeScope::User);
         assert_eq!(user_pref.inject_mode, KnowledgeInjectMode::Rule);
         assert!(user_pref.ai_maintained);
         assert!(user_pref.body.is_empty());
@@ -6999,19 +6972,17 @@ Body content
         let temp = TempDir::new().unwrap();
         let working_dir = temp.path().to_string_lossy().to_string();
 
-        for (id, path, title, scope, rules) in [
+        for (id, path, title, rules) in [
             (
                 "kd_builtin_memory_project_mistake_note",
                 MEMORY_PROJECT_MISTAKE_NOTE_LEGACY_PATH,
                 "错题本",
-                KnowledgeScope::Project,
                 MEMORY_PROJECT_MISTAKE_NOTE_RULES_V6,
             ),
             (
                 "kd_builtin_memory_user_preference",
                 MEMORY_USER_PREFERENCE_LEGACY_PATH,
                 "用户偏好",
-                KnowledgeScope::User,
                 MEMORY_USER_PREFERENCE_RULES_V6,
             ),
         ] {
@@ -7022,7 +6993,6 @@ Body content
                     doc_type: KnowledgeType::Memory,
                     path: path.to_string(),
                     title: title.to_string(),
-                    scope,
                     inject_mode: KnowledgeInjectMode::Full,
                     inherit_inject_mode: false,
                     inject_mode_source: self_config_source(),
@@ -7030,6 +7000,7 @@ Body content
                     command_enabled: false,
                     read_only: false,
                     ai_maintained: true,
+                    storage_source: KnowledgeStorageSource::Project,
                     inherit_ai_config: false,
                     ai_config_source: self_config_source(),
                     explicit_maintenance_rules: true,
@@ -7088,7 +7059,6 @@ Body content
                 doc_type: KnowledgeType::Memory,
                 path: MEMORY_PROJECT_MISTAKE_NOTE_PATH.to_string(),
                 title: "错题本".to_string(),
-                scope: KnowledgeScope::Project,
                 inject_mode: KnowledgeInjectMode::Full,
                 inherit_inject_mode: false,
                 inject_mode_source: self_config_source(),
@@ -7096,6 +7066,7 @@ Body content
                 command_enabled: false,
                 read_only: false,
                 ai_maintained: true,
+                storage_source: KnowledgeStorageSource::Project,
                 inherit_ai_config: false,
                 ai_config_source: self_config_source(),
                 explicit_maintenance_rules: true,
@@ -7140,7 +7111,6 @@ Body content
                 doc_type: KnowledgeType::Memory,
                 path: MEMORY_USER_PREFERENCE_LEGACY_PATH.to_string(),
                 title: "用户偏好".to_string(),
-                scope: KnowledgeScope::User,
                 inject_mode: KnowledgeInjectMode::Full,
                 inherit_inject_mode: false,
                 inject_mode_source: self_config_source(),
@@ -7148,6 +7118,7 @@ Body content
                 command_enabled: false,
                 read_only: false,
                 ai_maintained: true,
+                storage_source: KnowledgeStorageSource::Project,
                 inherit_ai_config: false,
                 ai_config_source: self_config_source(),
                 explicit_maintenance_rules: true,
@@ -7197,7 +7168,6 @@ Body content
                 doc_type: KnowledgeType::Memory,
                 path: MEMORY_USER_PREFERENCE_PATH.to_string(),
                 title: "用户偏好".to_string(),
-                scope: KnowledgeScope::User,
                 inject_mode: KnowledgeInjectMode::Full,
                 inherit_inject_mode: false,
                 inject_mode_source: self_config_source(),
@@ -7205,6 +7175,7 @@ Body content
                 command_enabled: false,
                 read_only: false,
                 ai_maintained: true,
+                storage_source: KnowledgeStorageSource::Project,
                 inherit_ai_config: false,
                 ai_config_source: self_config_source(),
                 explicit_maintenance_rules: true,
@@ -7270,12 +7241,11 @@ Body content
         )
         .expect("seed v9 builtin directory rules");
 
-        for (id, path, title, scope, inject_mode, rules) in [
+        for (id, path, title, inject_mode, rules) in [
             (
                 "kd_builtin_memory_project_mistake_note",
                 MEMORY_PROJECT_MISTAKE_NOTE_PATH,
                 "错题本",
-                KnowledgeScope::Project,
                 KnowledgeInjectMode::Full,
                 MEMORY_PROJECT_MISTAKE_NOTE_RULES_V9,
             ),
@@ -7283,7 +7253,6 @@ Body content
                 "kd_builtin_memory_user_preference",
                 MEMORY_USER_PREFERENCE_PATH,
                 "用户偏好",
-                KnowledgeScope::User,
                 KnowledgeInjectMode::Rule,
                 MEMORY_USER_PREFERENCE_RULES_V9,
             ),
@@ -7295,7 +7264,6 @@ Body content
                     doc_type: KnowledgeType::Memory,
                     path: path.to_string(),
                     title: title.to_string(),
-                    scope,
                     inject_mode,
                     inherit_inject_mode: false,
                     inject_mode_source: self_config_source(),
@@ -7303,6 +7271,7 @@ Body content
                     command_enabled: false,
                     read_only: false,
                     ai_maintained: true,
+                    storage_source: KnowledgeStorageSource::Project,
                     inherit_ai_config: false,
                     ai_config_source: self_config_source(),
                     explicit_maintenance_rules: true,
@@ -7370,7 +7339,6 @@ Body content
                 doc_type: KnowledgeType::Memory,
                 path: "project-understanding.md".to_string(),
                 title: "自定义项目理解".to_string(),
-                scope: KnowledgeScope::Project,
                 inject_mode: KnowledgeInjectMode::Full,
                 inherit_inject_mode: false,
                 inject_mode_source: self_config_source(),
@@ -7378,6 +7346,7 @@ Body content
                 command_enabled: false,
                 read_only: false,
                 ai_maintained: true,
+                storage_source: KnowledgeStorageSource::Project,
                 inherit_ai_config: false,
                 ai_config_source: self_config_source(),
                 explicit_maintenance_rules: true,
@@ -7723,7 +7692,6 @@ Body content
         let mut doc = sample_doc();
         doc.doc_type = KnowledgeType::Reference;
         doc.path = "manual/2d-introduction.md".to_string();
-        doc.scope = KnowledgeScope::External;
         doc.inject_mode = KnowledgeInjectMode::None;
         doc.summary_enabled = false;
         doc.command_enabled = false;
@@ -7762,7 +7730,6 @@ Body content
         let mut doc = sample_doc();
         doc.doc_type = KnowledgeType::Reference;
         doc.path = "manual/gameplay.md".to_string();
-        doc.scope = KnowledgeScope::External;
         doc.inject_mode = KnowledgeInjectMode::None;
         doc.summary_enabled = false;
         doc.command_enabled = false;
@@ -7813,6 +7780,20 @@ Body content
         assert_eq!(app_items.len(), 1);
         assert_eq!(app_items[0].id, "kd_app_skill");
         assert!(app_items[0].read_only);
+        assert_eq!(app_items[0].storage_source, KnowledgeStorageSource::App);
+
+        let app_read = read_document_with_app_root(
+            &working_dir,
+            Some(&app_root),
+            KnowledgeType::Skill,
+            "shared.md",
+            "full",
+        )
+        .expect("read app doc");
+        assert_eq!(
+            app_read.document.storage_source,
+            KnowledgeStorageSource::App
+        );
 
         let mut workspace_doc = sample_doc();
         workspace_doc.id = "kd_workspace_skill".to_string();
@@ -7831,6 +7812,23 @@ Body content
         assert_eq!(merged_items.len(), 1);
         assert_eq!(merged_items[0].id, "kd_workspace_skill");
         assert!(!merged_items[0].read_only);
+        assert_eq!(
+            merged_items[0].storage_source,
+            KnowledgeStorageSource::Project
+        );
+
+        let workspace_read = read_document_with_app_root(
+            &working_dir,
+            Some(&app_root),
+            KnowledgeType::Skill,
+            "shared.md",
+            "full",
+        )
+        .expect("read workspace override");
+        assert_eq!(
+            workspace_read.document.storage_source,
+            KnowledgeStorageSource::Project
+        );
     }
 
     #[test]

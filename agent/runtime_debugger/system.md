@@ -56,6 +56,7 @@ Debug.Log($"[Locus] State: {info.shortNameHash}, NormalizedTime: {info.normalize
 
 * Lead with the key finding: what is wrong and why.
 * Include the actual runtime values you observed as evidence.
+* When the user asks to display, list, show, output, or otherwise present results, tool output is intermediate context only. Restate, summarize, or organize the relevant results in your final user-facing response.
 * Suggest a concrete fix with file path and line reference when applicable.
 * If the issue requires code changes, describe the fix but let the user switch to the Dev agent for implementation, or ask if they want you to apply it.
 

@@ -156,6 +156,18 @@ describe("KnowledgePreview layout", () => {
     expect(preview).not.toContain("BaseCheckbox");
   });
 
+  it("shows skill command fields only for command-capable skill surfaces", () => {
+    const preview = read("src/components/knowledge/KnowledgePreview.vue");
+
+    expect(preview).toContain("const showSkillCommandFields = computed(() =>");
+    expect(preview).toContain("isSkillDocument.value && skillEnabled.value && skillSurfaceAllowsCommand(currentSkillSurface.value)");
+    expect(preview).toContain('v-if="showSkillCommandFields" class="meta-row meta-row-control"');
+    expect(preview).toContain('t("knowledge.skill.commandTrigger")');
+    expect(preview).toContain('t("knowledge.skill.argumentHint")');
+    expect(preview).not.toContain(`v-if="document.type === 'skill'" class="meta-row meta-row-control">
+                  <span class="meta-label">{{ t("knowledge.skill.commandTrigger") }}</span>`);
+  });
+
   it("renders file metadata below the document config block", () => {
     const preview = read("src/components/knowledge/KnowledgePreview.vue");
 
@@ -173,6 +185,14 @@ describe("KnowledgePreview layout", () => {
     expect(preview).toMatch(/\.meta-stack\s*\{[\s\S]*flex:\s*1;[\s\S]*min-height:\s*100%;[\s\S]*display:\s*flex;[\s\S]*flex-direction:\s*column;/);
     expect(preview).toMatch(/\.meta-group-file\s*\{[\s\S]*margin-top:\s*auto;/);
     expect(preview).toMatch(/\.meta-value-wrap\s*\{[\s\S]*white-space:\s*normal;[\s\S]*overflow-wrap:\s*anywhere;/);
+  });
+
+  it("labels app-backed documents separately from project documents", () => {
+    const preview = read("src/components/knowledge/KnowledgePreview.vue");
+
+    expect(preview).toContain('props.document?.storageSource === "app"');
+    expect(preview).toContain('t("knowledge.meta.storageSourceApp")');
+    expect(preview).toContain('t("knowledge.meta.storageSourceProject")');
   });
 
   it("renders subtle search-hit cues inside the matched preview section", () => {

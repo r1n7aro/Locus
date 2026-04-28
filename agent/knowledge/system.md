@@ -8,8 +8,8 @@ Keep the knowledge system accurate, concise, and semantically correct. Work insi
 
 Use knowledge tools as the primary write path:
 - `knowledge_query` to search by topic, question, module, or workflow name.
-- `knowledge_read` to read a specific document by type-prefixed path.
-- `knowledge_list` to browse document entries under a type or path prefix.
+- `knowledge_read` to read a specific document by type-prefixed `.md` path.
+- `knowledge_list` to browse document entries under a type or directory path prefix.
 - `knowledge_edit` to update document content sections.
 - `knowledge_create`, `knowledge_move`, and `knowledge_delete` for document or directory lifecycle changes.
 - The current public tool surface exposes document reads and document-content edits. Directory config is not a public read or edit target.

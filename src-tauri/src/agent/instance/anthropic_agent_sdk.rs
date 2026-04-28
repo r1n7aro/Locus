@@ -1,9 +1,11 @@
 use std::collections::{HashSet, VecDeque};
+use std::sync::Arc;
 
 use tauri::AppHandle;
 
 use super::{
-    emit_stream, finalize_tool_call_record, normalize_tool_args, AgentInstance, ExecutedToolResult,
+    emit_stream, finalize_tool_call_record, normalize_tool_args, AgentInstance,
+    AssistantStreamState, ExecutedToolResult,
 };
 use crate::commands::{StreamEvent, ToolCallOutcome};
 use crate::llm::anthropic_agent_sdk::{
@@ -27,6 +29,7 @@ struct ClaudeSdkRoundHost<'a> {
     run_id: &'a str,
     mode: &'a str,
     streamed_text: String,
+    partial_assistant: Arc<AssistantStreamState>,
     started_tool_calls: VecDeque<(String, String)>,
     known_tool_calls: VecDeque<ToolCallInfo>,
     completed_tool_ids: HashSet<String>,
@@ -131,6 +134,7 @@ impl<'a> ClaudeSdkRoundHost<'a> {
                     tool_calls: round.tool_calls,
                 },
             );
+            self.partial_assistant.reset();
         }
     }
 
@@ -216,6 +220,7 @@ impl<'a> ClaudeSdkRoundHost<'a> {
 impl<'a> ClaudeSdkHost for ClaudeSdkRoundHost<'a> {
     fn on_text_delta(&mut self, delta: String) {
         self.streamed_text.push_str(&delta);
+        self.partial_assistant.append_text(&delta);
         emit_stream(
             self.app_handle,
             self.run_id,
@@ -238,6 +243,7 @@ impl<'a> ClaudeSdkHost for ClaudeSdkRoundHost<'a> {
     }
 
     fn on_thinking_delta(&mut self, delta: String) {
+        self.partial_assistant.append_thinking(&delta);
         emit_stream(
             self.app_handle,
             self.run_id,
@@ -299,6 +305,12 @@ impl<'a> ClaudeSdkHost for ClaudeSdkRoundHost<'a> {
             None,
             None,
         )?;
+        self.partial_assistant.mark_persisted(
+            message_id.clone(),
+            message.text.clone(),
+            thinking_text.map(str::to_string),
+            None,
+        );
 
         let remaining: HashSet<String> = message
             .tool_calls
@@ -426,6 +438,7 @@ impl AgentInstance {
             run_id,
             mode: initial_mode,
             streamed_text: String::new(),
+            partial_assistant: self.partial_assistant_state(),
             started_tool_calls: VecDeque::new(),
             known_tool_calls: VecDeque::new(),
             completed_tool_ids: HashSet::new(),
@@ -531,7 +544,7 @@ impl AgentInstance {
 
         if self.is_cancel_requested() {
             self.clear_pending_knowledge_proposal(app_handle).await;
-            self.emit_cancelled(app_handle, run_id);
+            self.emit_cancelled(app_handle, store, run_id);
             return Ok(String::new());
         }
 
@@ -573,6 +586,12 @@ impl AgentInstance {
                 None,
                 None,
             )?;
+            self.partial_assistant.mark_persisted(
+                done_message_id.clone(),
+                final_text.clone(),
+                thinking_text.map(str::to_string),
+                None,
+            );
         }
 
         if let Err(error) = store.set_latest_completed_run_id(&self.session_id, Some(run_id)) {
@@ -601,6 +620,7 @@ impl AgentInstance {
                 full_text: final_text.clone(),
             },
         );
+        self.partial_assistant.reset();
 
         if let Err(error) = self
             .flush_pending_knowledge_proposal(app_handle, store, run_id)

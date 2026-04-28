@@ -98,6 +98,14 @@ function createState(key: string): EmbeddedChatState {
   });
 }
 
+function replaceMessageById(list: ChatMessage[], message: ChatMessage): ChatMessage[] {
+  const index = list.findIndex((item) => item.id === message.id);
+  if (index < 0) return [...list, message];
+  const next = [...list];
+  next.splice(index, 1, message);
+  return next;
+}
+
 function clearState(state: EmbeddedChatState) {
   state.sessionId = null;
   state.currentRunId = null;
@@ -195,17 +203,10 @@ function applyMutation(state: EmbeddedChatState, mutation: StreamMutation) {
       break;
     }
     case "pushMessage":
-      state.messages.push(mutation.message);
+      state.messages = replaceMessageById(state.messages, mutation.message);
       break;
     case "upsertMessage": {
-      const index = state.messages.findIndex((item) => item.id === mutation.message.id);
-      if (index >= 0) {
-        const next = [...state.messages];
-        next.splice(index, 1, mutation.message);
-        state.messages = next;
-      } else {
-        state.messages = [...state.messages, mutation.message];
-      }
+      state.messages = replaceMessageById(state.messages, mutation.message);
       break;
     }
     case "upsertUserMessage":

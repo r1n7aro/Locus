@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-const KNOWLEDGE_DB_VERSION: u32 = 5;
+const KNOWLEDGE_DB_VERSION: u32 = 6;
 
 #[derive(Debug, Clone)]
 pub struct DocumentCatalogRow {
@@ -11,7 +11,6 @@ pub struct DocumentCatalogRow {
     pub doc_type: String,
     pub doc_path: String,
     pub parent_path: Option<String>,
-    pub scope: String,
     pub title: String,
     pub updated_at: i64,
     pub estimated_tokens: u64,
@@ -417,7 +416,7 @@ impl KnowledgeDb {
         let conn = self.conn.lock().unwrap();
         let (sql, params) = if let Some(doc_type) = doc_type {
             (
-                "SELECT doc_id, doc_type, doc_path, parent_path, scope, title, updated_at, estimated_tokens, payload_json
+                "SELECT doc_id, doc_type, doc_path, parent_path, title, updated_at, estimated_tokens, payload_json
                  FROM document_catalog
                  WHERE doc_type = ?1
                  ORDER BY doc_type, doc_path, title, doc_id"
@@ -426,7 +425,7 @@ impl KnowledgeDb {
             )
         } else {
             (
-                "SELECT doc_id, doc_type, doc_path, parent_path, scope, title, updated_at, estimated_tokens, payload_json
+                "SELECT doc_id, doc_type, doc_path, parent_path, title, updated_at, estimated_tokens, payload_json
                  FROM document_catalog
                  ORDER BY doc_type, doc_path, title, doc_id"
                     .to_string(),
@@ -452,7 +451,7 @@ impl KnowledgeDb {
                 let (exact_prefix, like_prefix) = doc_path_prefix_params(path_prefix);
                 let mut stmt = conn
                     .prepare(
-                        "SELECT doc_id, doc_type, doc_path, parent_path, scope, title, updated_at, estimated_tokens, payload_json
+                        "SELECT doc_id, doc_type, doc_path, parent_path, title, updated_at, estimated_tokens, payload_json
                          FROM document_catalog
                          WHERE doc_type = ?1 AND (doc_path = ?2 OR doc_path LIKE ?3)
                          ORDER BY doc_type, doc_path, title, doc_id",
@@ -466,7 +465,7 @@ impl KnowledgeDb {
             (Some(doc_type), None) => {
                 let mut stmt = conn
                     .prepare(
-                        "SELECT doc_id, doc_type, doc_path, parent_path, scope, title, updated_at, estimated_tokens, payload_json
+                        "SELECT doc_id, doc_type, doc_path, parent_path, title, updated_at, estimated_tokens, payload_json
                          FROM document_catalog
                          WHERE doc_type = ?1
                          ORDER BY doc_type, doc_path, title, doc_id",
@@ -478,7 +477,7 @@ impl KnowledgeDb {
                 let (exact_prefix, like_prefix) = doc_path_prefix_params(path_prefix);
                 let mut stmt = conn
                     .prepare(
-                        "SELECT doc_id, doc_type, doc_path, parent_path, scope, title, updated_at, estimated_tokens, payload_json
+                        "SELECT doc_id, doc_type, doc_path, parent_path, title, updated_at, estimated_tokens, payload_json
                          FROM document_catalog
                          WHERE doc_path = ?1 OR doc_path LIKE ?2
                          ORDER BY doc_type, doc_path, title, doc_id",
@@ -506,7 +505,7 @@ impl KnowledgeDb {
                 let (exact_prefix, like_prefix) = doc_path_prefix_params(path_prefix);
                 let mut stmt = conn
                     .prepare(
-                        "SELECT doc_id, doc_type, doc_path, parent_path, scope, title, updated_at, estimated_tokens, payload_json
+                        "SELECT doc_id, doc_type, doc_path, parent_path, title, updated_at, estimated_tokens, payload_json
                          FROM document_catalog
                          WHERE doc_type = ?1 AND (doc_path = ?2 OR doc_path LIKE ?3)
                          ORDER BY doc_type, doc_path, title, doc_id
@@ -527,7 +526,7 @@ impl KnowledgeDb {
             (Some(doc_type), None) => {
                 let mut stmt = conn
                     .prepare(
-                        "SELECT doc_id, doc_type, doc_path, parent_path, scope, title, updated_at, estimated_tokens, payload_json
+                        "SELECT doc_id, doc_type, doc_path, parent_path, title, updated_at, estimated_tokens, payload_json
                          FROM document_catalog
                          WHERE doc_type = ?1
                          ORDER BY doc_type, doc_path, title, doc_id
@@ -540,7 +539,7 @@ impl KnowledgeDb {
                 let (exact_prefix, like_prefix) = doc_path_prefix_params(path_prefix);
                 let mut stmt = conn
                     .prepare(
-                        "SELECT doc_id, doc_type, doc_path, parent_path, scope, title, updated_at, estimated_tokens, payload_json
+                        "SELECT doc_id, doc_type, doc_path, parent_path, title, updated_at, estimated_tokens, payload_json
                          FROM document_catalog
                          WHERE doc_path = ?1 OR doc_path LIKE ?2
                          ORDER BY doc_type, doc_path, title, doc_id
@@ -555,7 +554,7 @@ impl KnowledgeDb {
             (None, None) => {
                 let mut stmt = conn
                     .prepare(
-                        "SELECT doc_id, doc_type, doc_path, parent_path, scope, title, updated_at, estimated_tokens, payload_json
+                        "SELECT doc_id, doc_type, doc_path, parent_path, title, updated_at, estimated_tokens, payload_json
                          FROM document_catalog
                          ORDER BY doc_type, doc_path, title, doc_id
                          LIMIT ?1 OFFSET ?2",
@@ -576,7 +575,7 @@ impl KnowledgeDb {
 
         let placeholders = sql_placeholders(doc_ids.len());
         let sql = format!(
-            "SELECT doc_id, doc_type, doc_path, parent_path, scope, title, updated_at, estimated_tokens, payload_json
+            "SELECT doc_id, doc_type, doc_path, parent_path, title, updated_at, estimated_tokens, payload_json
              FROM document_catalog
              WHERE doc_id IN ({})
              ORDER BY doc_type, doc_path, title, doc_id",
@@ -595,7 +594,7 @@ impl KnowledgeDb {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
-                "SELECT doc_id, doc_type, doc_path, parent_path, scope, title, updated_at, estimated_tokens, payload_json
+                "SELECT doc_id, doc_type, doc_path, parent_path, title, updated_at, estimated_tokens, payload_json
                  FROM document_catalog
                  WHERE doc_type = ?1 AND doc_path = ?2
                  ORDER BY updated_at DESC, title, doc_id",
@@ -613,7 +612,7 @@ impl KnowledgeDb {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
-                "SELECT doc_id, doc_type, doc_path, parent_path, scope, title, updated_at, estimated_tokens, payload_json
+                "SELECT doc_id, doc_type, doc_path, parent_path, title, updated_at, estimated_tokens, payload_json
                  FROM document_catalog
                  WHERE doc_type = ?1 AND (doc_path = ?2 OR doc_path LIKE ?3)
                  ORDER BY doc_path, title, doc_id",
@@ -631,7 +630,7 @@ impl KnowledgeDb {
         let rows = if let Some(parent_path) = parent_path {
             let mut stmt = conn
                 .prepare(
-                    "SELECT doc_id, doc_type, doc_path, parent_path, scope, title, updated_at, estimated_tokens, payload_json
+                    "SELECT doc_id, doc_type, doc_path, parent_path, title, updated_at, estimated_tokens, payload_json
                      FROM document_catalog
                      WHERE doc_type = ?1 AND parent_path = ?2
                      ORDER BY doc_path, title, doc_id",
@@ -641,7 +640,7 @@ impl KnowledgeDb {
         } else {
             let mut stmt = conn
                 .prepare(
-                    "SELECT doc_id, doc_type, doc_path, parent_path, scope, title, updated_at, estimated_tokens, payload_json
+                    "SELECT doc_id, doc_type, doc_path, parent_path, title, updated_at, estimated_tokens, payload_json
                      FROM document_catalog
                      WHERE doc_type = ?1 AND parent_path IS NULL
                      ORDER BY doc_path, title, doc_id",
@@ -665,7 +664,7 @@ impl KnowledgeDb {
         if let Some(parent_path) = parent_path {
             let mut stmt = conn
                 .prepare(
-                    "SELECT doc_id, doc_type, doc_path, parent_path, scope, title, updated_at, estimated_tokens, payload_json
+                    "SELECT doc_id, doc_type, doc_path, parent_path, title, updated_at, estimated_tokens, payload_json
                      FROM document_catalog
                      WHERE doc_type = ?1 AND parent_path = ?2
                      ORDER BY doc_path, title, doc_id
@@ -679,7 +678,7 @@ impl KnowledgeDb {
         } else {
             let mut stmt = conn
                 .prepare(
-                    "SELECT doc_id, doc_type, doc_path, parent_path, scope, title, updated_at, estimated_tokens, payload_json
+                    "SELECT doc_id, doc_type, doc_path, parent_path, title, updated_at, estimated_tokens, payload_json
                      FROM document_catalog
                      WHERE doc_type = ?1 AND parent_path IS NULL
                      ORDER BY doc_path, title, doc_id
@@ -704,13 +703,12 @@ impl KnowledgeDb {
             let mut stmt = tx
                 .prepare(
                     "INSERT INTO document_catalog
-                     (doc_id, doc_type, doc_path, parent_path, scope, title, updated_at, estimated_tokens, payload_json)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                     (doc_id, doc_type, doc_path, parent_path, title, updated_at, estimated_tokens, payload_json)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                      ON CONFLICT(doc_id) DO UPDATE SET
                         doc_type = excluded.doc_type,
                         doc_path = excluded.doc_path,
                         parent_path = excluded.parent_path,
-                        scope = excluded.scope,
                         title = excluded.title,
                         updated_at = excluded.updated_at,
                         estimated_tokens = excluded.estimated_tokens,
@@ -723,7 +721,6 @@ impl KnowledgeDb {
                     entry.doc_type,
                     entry.doc_path,
                     entry.parent_path,
-                    entry.scope,
                     entry.title,
                     entry.updated_at,
                     entry.estimated_tokens as i64,
@@ -1401,7 +1398,6 @@ fn create_tables(conn: &Connection) -> Result<(), String> {
             doc_type TEXT NOT NULL,
             doc_path TEXT NOT NULL,
             parent_path TEXT,
-            scope TEXT NOT NULL,
             title TEXT NOT NULL,
             updated_at INTEGER NOT NULL,
             estimated_tokens INTEGER NOT NULL DEFAULT 0,
@@ -1460,7 +1456,6 @@ fn migrate_schema(conn: &Connection, schema_version: u32) -> Result<(), String> 
                 doc_type TEXT NOT NULL,
                 doc_path TEXT NOT NULL,
                 parent_path TEXT,
-                scope TEXT NOT NULL,
                 title TEXT NOT NULL,
                 updated_at INTEGER NOT NULL,
                 estimated_tokens INTEGER NOT NULL DEFAULT 0,
@@ -1511,6 +1506,10 @@ fn migrate_schema(conn: &Connection, schema_version: u32) -> Result<(), String> 
         ensure_document_catalog_parent_path_column(conn)?;
     }
 
+    if schema_version < 6 {
+        remove_document_catalog_scope_column(conn)?;
+    }
+
     conn.execute_batch(&format!("PRAGMA user_version = {}", KNOWLEDGE_DB_VERSION))
         .map_err(|e| format!("Failed to set knowledge db schema version: {}", e))
 }
@@ -1521,11 +1520,10 @@ fn map_document_catalog_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Documen
         doc_type: row.get(1)?,
         doc_path: row.get(2)?,
         parent_path: row.get(3)?,
-        scope: row.get(4)?,
-        title: row.get(5)?,
-        updated_at: row.get(6)?,
-        estimated_tokens: row.get::<_, i64>(7)?.max(0) as u64,
-        payload_json: row.get(8)?,
+        title: row.get(4)?,
+        updated_at: row.get(5)?,
+        estimated_tokens: row.get::<_, i64>(6)?.max(0) as u64,
+        payload_json: row.get(7)?,
     })
 }
 
@@ -1581,6 +1579,49 @@ fn ensure_document_catalog_parent_path_column(conn: &Connection) -> Result<(), S
             ON document_catalog(doc_type, parent_path, doc_path);",
     )
     .map_err(|e| format!("Failed to create document_catalog parent_path index: {}", e))
+}
+
+fn remove_document_catalog_scope_column(conn: &Connection) -> Result<(), String> {
+    let has_scope_column = conn
+        .prepare("PRAGMA table_info(document_catalog)")
+        .map_err(|e| e.to_string())?
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|e| e.to_string())?
+        .filter_map(Result::ok)
+        .any(|name| name == "scope");
+    if !has_scope_column {
+        return Ok(());
+    }
+
+    conn.execute_batch(
+        "DROP INDEX IF EXISTS idx_document_catalog_type_path;
+         DROP INDEX IF EXISTS idx_document_catalog_type_parent_path;
+
+         CREATE TABLE document_catalog_next (
+            doc_id TEXT PRIMARY KEY,
+            doc_type TEXT NOT NULL,
+            doc_path TEXT NOT NULL,
+            parent_path TEXT,
+            title TEXT NOT NULL,
+            updated_at INTEGER NOT NULL,
+            estimated_tokens INTEGER NOT NULL DEFAULT 0,
+            payload_json TEXT NOT NULL
+         );
+
+         INSERT INTO document_catalog_next
+            (doc_id, doc_type, doc_path, parent_path, title, updated_at, estimated_tokens, payload_json)
+         SELECT doc_id, doc_type, doc_path, parent_path, title, updated_at, estimated_tokens, payload_json
+         FROM document_catalog;
+
+         DROP TABLE document_catalog;
+         ALTER TABLE document_catalog_next RENAME TO document_catalog;
+
+         CREATE INDEX IF NOT EXISTS idx_document_catalog_type_path
+            ON document_catalog(doc_type, doc_path);
+         CREATE INDEX IF NOT EXISTS idx_document_catalog_type_parent_path
+            ON document_catalog(doc_type, parent_path, doc_path);",
+    )
+    .map_err(|e| format!("Failed to remove document_catalog.scope: {}", e))
 }
 
 fn sql_placeholders(count: usize) -> String {
@@ -1762,7 +1803,6 @@ mod tests {
             doc_type: "reference".to_string(),
             doc_path: "unity/api/application.md".to_string(),
             parent_path: Some("unity/api".to_string()),
-            scope: "external".to_string(),
             title: "application".to_string(),
             updated_at: 42,
             estimated_tokens: 128,
@@ -1798,7 +1838,7 @@ mod tests {
                 "doc-1",
                 "reference",
                 "unity/api/application.md",
-                "external",
+                "project",
                 "application",
                 42_i64,
                 128_i64,

@@ -11,7 +11,6 @@ function makeDocument(overrides: Partial<KnowledgeDocument> = {}): KnowledgeDocu
     type: "design",
     path: "combat/core-loop.md",
     title: "核心循环",
-    scope: "project",
     injectMode: "excerpt",
     summaryEnabled: true,
     commandEnabled: false,

@@ -20,6 +20,8 @@ describe("KnowledgeExplorer root retrieval tags", () => {
 
     expect(explorer).toContain("rootDirectoryConfigs: Record<string, KnowledgeDirectoryConfigRecord>;");
     expect(explorer).toContain("externalDirectorySources: Record<string, KnowledgeExternalSource[]>;");
+    expect(explorer).toContain("if (isBuiltinSkillGroupFolder(node)) return tags;");
+    expect(explorer).toContain('props.activeType === "skill" && node.depth === 1 && node.relativePath === "builtin"');
     expect(explorer).toContain("if (node.depth !== 1) return tags;");
     expect(explorer).toContain("buildExternalFolderTag(");
     expect(explorer).toContain("buildFolderListTags({");

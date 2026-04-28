@@ -23,8 +23,8 @@ use crate::knowledge_store::{
     KnowledgeDirectoryConfigPatch, KnowledgeDirectoryConfigRecord, KnowledgeDocumentPatch,
     KnowledgeEditRequest, KnowledgeExternalDirectoryBinding, KnowledgeListItem,
     KnowledgeMoveRequest, KnowledgeMutationResponse, KnowledgeReadRequest, KnowledgeReadResponse,
-    KnowledgeScope, KnowledgeSearchHit, KnowledgeSourceProvider, KnowledgeTargetKind,
-    KnowledgeType, KnowledgeUpdateOp, KnowledgeUpdateRequest, SkillSurface,
+    KnowledgeSearchHit, KnowledgeSourceProvider, KnowledgeTargetKind, KnowledgeType,
+    KnowledgeUpdateOp, KnowledgeUpdateRequest, SkillSurface,
 };
 use crate::unity_docs::{
     self, UnityManagedDirectoryStat, UnityReferenceImportState, UnityReferenceImportStatus,
@@ -414,15 +414,6 @@ fn parse_knowledge_type(value: &str) -> Result<KnowledgeType, String> {
     }
 }
 
-fn parse_knowledge_scope(value: &str) -> Result<KnowledgeScope, String> {
-    match value.trim() {
-        "project" => Ok(KnowledgeScope::Project),
-        "user" => Ok(KnowledgeScope::User),
-        "external" => Ok(KnowledgeScope::External),
-        other => Err(format!("Unsupported knowledge scope: {}", other)),
-    }
-}
-
 fn parse_knowledge_type_from_path(path: &str) -> Option<KnowledgeType> {
     let normalized = path.replace('\\', "/");
     let normalized = normalized
@@ -470,6 +461,31 @@ fn normalize_knowledge_path(path: &str) -> Result<String, String> {
         .or_else(|| normalized.strip_prefix("reference/"))
         .unwrap_or(&normalized);
     knowledge_store::ensure_document_path(stripped)
+}
+
+pub(crate) fn require_knowledge_document_path_suffix(path: &str) -> Result<(), String> {
+    let normalized = path.trim().replace('\\', "/");
+    let normalized = normalized
+        .trim_matches('/')
+        .strip_prefix("Locus/knowledge/")
+        .unwrap_or(normalized.trim_matches('/'))
+        .trim_matches('/');
+    let stripped = normalized
+        .strip_prefix("design/")
+        .or_else(|| normalized.strip_prefix("memory/"))
+        .or_else(|| normalized.strip_prefix("skill/"))
+        .or_else(|| normalized.strip_prefix("reference/"))
+        .unwrap_or(normalized)
+        .trim_matches('/');
+
+    if stripped.ends_with(".md") {
+        Ok(())
+    } else {
+        Err(
+            "knowledge document paths must end with .md; use paths without .md only for directory operations"
+                .to_string(),
+        )
+    }
 }
 
 fn normalize_knowledge_directory_path(path: &str) -> Result<String, String> {
@@ -587,6 +603,7 @@ fn resolve_knowledge_document_target(
         }
     }
 
+    require_knowledge_document_path_suffix(raw_path)?;
     let normalized_path = normalize_knowledge_path(raw_path)?;
     Ok((doc_type, normalized_path))
 }
@@ -667,9 +684,6 @@ fn merge_document_create_patch(
     }
     if let Some(title) = patch.title {
         base.title = Some(title);
-    }
-    if let Some(scope) = patch.scope {
-        base.scope = Some(scope);
     }
     if let Some(inject_mode) = patch.inject_mode {
         base.inject_mode = Some(inject_mode);
@@ -842,7 +856,6 @@ pub(crate) fn execute_knowledge_create_request(
                     id: document_patch.id.take(),
                     doc_type: Some(doc_type),
                     title: document_patch.title.take(),
-                    scope: document_patch.scope,
                     inject_mode: document_patch.inject_mode,
                     inherit_inject_mode: document_patch.inherit_inject_mode,
                     summary_enabled: document_patch.summary_enabled,
@@ -1083,7 +1096,6 @@ pub async fn knowledge_query(
     limit: Option<usize>,
     types: Option<Vec<String>>,
     path_prefix: Option<String>,
-    scopes: Option<Vec<String>>,
     workspace: State<'_, Arc<Workspace>>,
     app_knowledge_dir: State<'_, AppKnowledgeDir>,
     knowledge_index_state: State<'_, Arc<KnowledgeIndexState>>,
@@ -1113,15 +1125,6 @@ pub async fn knowledge_query(
                 .collect::<Vec<_>>()
         })
         .filter(|values| !values.is_empty());
-    let parsed_scopes = scopes
-        .as_ref()
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(|value| parse_knowledge_scope(value).ok())
-                .collect::<Vec<_>>()
-        })
-        .filter(|values| !values.is_empty());
     let (prefix_type, normalized_prefix) =
         resolve_knowledge_path_filter(None, path_prefix.as_deref())?;
 
@@ -1144,7 +1147,6 @@ pub async fn knowledge_query(
         semantic_query.as_deref(),
         parsed_types.as_deref(),
         normalized_prefix.as_deref(),
-        parsed_scopes.as_deref(),
         limit.unwrap_or(5),
         knowledge_index_state.inner().clone(),
     )
@@ -3297,6 +3299,18 @@ mod tests {
     }
 
     #[test]
+    fn resolve_knowledge_document_target_requires_md_suffix() {
+        let (doc_type, path) = resolve_knowledge_document_target(None, "skill/builtin/profiler.md")
+            .expect("resolve document path");
+        assert_eq!(doc_type, KnowledgeType::Skill);
+        assert_eq!(path, "builtin/profiler.md");
+
+        let err = resolve_knowledge_document_target(None, "skill/builtin/profiler")
+            .expect_err("document path without suffix should fail");
+        assert!(err.contains(".md"));
+    }
+
+    #[test]
     fn execute_knowledge_create_allows_path_only_document_creation() {
         let temp = TempDir::new().unwrap();
         let working_dir = temp.path().to_string_lossy().to_string();
@@ -3329,6 +3343,24 @@ mod tests {
         assert!(!doc.summary_enabled);
         assert!(!doc.explicit_maintenance_rules);
         assert!(doc.maintenance_rules.is_none());
+    }
+
+    #[test]
+    fn execute_knowledge_create_rejects_document_path_without_md_suffix() {
+        let temp = TempDir::new().unwrap();
+        let working_dir = temp.path().to_string_lossy().to_string();
+
+        let err = execute_knowledge_create_request(
+            &working_dir,
+            KnowledgeCreateRequest {
+                kind: KnowledgeTargetKind::Document,
+                path: "design/core-loop".to_string(),
+                ..Default::default()
+            },
+        )
+        .expect_err("document path without suffix should fail");
+
+        assert!(err.contains(".md"));
     }
 
     #[test]

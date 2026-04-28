@@ -25,7 +25,7 @@ vi.mock("../i18n", () => ({
     "knowledge.directoryConfig.semanticRuleDisableHint": "停用 SM。",
     "knowledge.folder.ruleEnable": "开启",
     "knowledge.folder.ruleDisable": "关闭",
-    "knowledge.scope.external": "外部",
+    "knowledge.source.external": "外部来源",
     "knowledge.source.localFolder": "本地文件夹",
     "knowledge.source.feishu": "飞书",
     "knowledge.source.url": "链接",
@@ -121,21 +121,21 @@ describe("knowledgeMetaLabels", () => {
     ).toEqual({
       text: "FEISHU",
       tone: "external",
-      title: "外部 · 飞书",
+      title: "外部来源 · 飞书",
     });
     expect(
       buildExternalFolderTag([{ provider: "unity" }]),
     ).toEqual({
       text: "UNITY-DOC",
       tone: "external",
-      title: "外部 · Unity",
+      title: "外部来源 · Unity",
     });
     expect(
       buildExternalFolderTag([{ provider: "local_folder" }]),
     ).toEqual({
       text: "EXT",
       tone: "external",
-      title: "外部 · 本地文件夹",
+      title: "外部来源 · 本地文件夹",
     });
   });
 

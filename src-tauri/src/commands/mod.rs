@@ -154,7 +154,17 @@ pub enum StreamEvent {
         messages: Vec<crate::session::models::ChatMessage>,
     },
     #[serde(rename_all = "camelCase")]
-    Cancelled { session_id: String },
+    Cancelled {
+        session_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        full_text: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        thinking_content: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        thinking_duration: Option<u32>,
+    },
     #[serde(rename_all = "camelCase")]
     Error { session_id: String, error: AppError },
 }

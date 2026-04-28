@@ -29,17 +29,10 @@ function labelForType(type: KnowledgeSearchResult["type"]): string {
   }
 }
 
-function labelForScope(scope: KnowledgeSearchResult["scope"]): string {
-  switch (scope) {
-    case "project":
-      return t("knowledge.scope.project");
-    case "user":
-      return t("knowledge.scope.user");
-    case "external":
-      return t("knowledge.scope.external");
-    default:
-      return scope;
-  }
+function labelForStoredScope(result: KnowledgeSearchResult): string {
+  return result.storageSource === "app"
+    ? t("knowledge.scope.user")
+    : t("knowledge.scope.project");
 }
 
 function labelForMatchMode(kind: KnowledgeSearchResult["matchKind"]): string {
@@ -76,7 +69,7 @@ function labelForMatchMode(kind: KnowledgeSearchResult["matchKind"]): string {
       >
         <div class="result-header">
           <span class="result-title">{{ result.title }}</span>
-          <span class="result-meta">{{ labelForType(result.type) }} · {{ labelForScope(result.scope) }}</span>
+          <span class="result-meta">{{ labelForType(result.type) }} · {{ labelForStoredScope(result) }}</span>
         </div>
         <div class="result-submeta">
           <span class="result-subpath">{{ result.path }}</span>

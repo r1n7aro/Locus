@@ -10,7 +10,7 @@ use std::{
     collections::BTreeMap,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::Instant,
 };
@@ -100,7 +100,79 @@ pub struct AgentInstance {
     undo_manager: Option<Arc<crate::vcs::UndoManager>>,
     subagent_model_overrides: std::collections::HashMap<String, String>,
     tool_runtime_state: Arc<ToolRuntimeState>,
+    partial_assistant: Arc<AssistantStreamState>,
     cancel_rx: tokio::sync::watch::Receiver<bool>,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct AssistantStreamSnapshot {
+    pub text: String,
+    pub thinking_content: String,
+    pub thinking_duration: Option<u32>,
+    pub persisted_message_id: Option<String>,
+}
+
+#[derive(Debug, Default)]
+pub struct AssistantStreamState {
+    inner: Mutex<AssistantStreamSnapshot>,
+}
+
+#[derive(Debug, Clone)]
+pub struct InterruptedAssistantMessage {
+    pub message_id: String,
+    pub full_text: String,
+    pub thinking_content: Option<String>,
+    pub thinking_duration: Option<u32>,
+}
+
+impl AssistantStreamState {
+    pub fn append_text(&self, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.persisted_message_id = None;
+            inner.text.push_str(delta);
+        }
+    }
+
+    pub fn append_thinking(&self, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.persisted_message_id = None;
+            inner.thinking_content.push_str(delta);
+        }
+    }
+
+    pub fn mark_persisted(
+        &self,
+        message_id: String,
+        text: String,
+        thinking_content: Option<String>,
+        thinking_duration: Option<u32>,
+    ) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.text = text;
+            inner.thinking_content = thinking_content.unwrap_or_default();
+            inner.thinking_duration = thinking_duration;
+            inner.persisted_message_id = Some(message_id);
+        }
+    }
+
+    pub fn reset(&self) {
+        if let Ok(mut inner) = self.inner.lock() {
+            *inner = AssistantStreamSnapshot::default();
+        }
+    }
+
+    pub fn snapshot(&self) -> AssistantStreamSnapshot {
+        self.inner
+            .lock()
+            .map(|inner| inner.clone())
+            .unwrap_or_default()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -370,6 +442,7 @@ fn resolve_knowledge_document_target(
     let normalized = raw_path.trim().replace('\\', "/");
     let doc_type = crate::knowledge_store::guess_type_from_path(&normalized)
         .ok_or_else(|| "knowledge document target requires a type-prefixed path.".to_string())?;
+    crate::commands::require_knowledge_document_path_suffix(&normalized)?;
     let rel_path = crate::knowledge_store::ensure_document_path(
         AgentInstance::strip_knowledge_type_prefix(&normalized),
     )?;
@@ -574,9 +647,6 @@ fn build_knowledge_document_create_preview(
         doc_type,
         path: normalized_path.clone(),
         title,
-        scope: patch
-            .scope
-            .unwrap_or(crate::knowledge_store::KnowledgeScope::Project),
         inject_mode: patch.inject_mode.unwrap_or_else(|| {
             crate::knowledge_store::default_document_inject_mode_for_type(doc_type)
         }),
@@ -591,6 +661,7 @@ fn build_knowledge_document_create_preview(
         ai_maintained: patch
             .ai_maintained
             .unwrap_or_else(|| crate::knowledge_store::default_ai_maintained_for_type(doc_type)),
+        storage_source: crate::knowledge_store::KnowledgeStorageSource::Project,
         inherit_ai_config: patch.inherit_ai_config.unwrap_or(true),
         ai_config_source: Default::default(),
         explicit_maintenance_rules: patch.explicit_maintenance_rules.unwrap_or_else(|| {
@@ -1249,8 +1320,8 @@ fn build_search_section() -> String {
     [
         "### Search",
         "1. Start with `knowledge_query` and split exact terms into `lexicalQuery` and intent-style retrieval into `semanticQuery` when useful.",
-        "2. Use `knowledge_read` when you know the target path or need a specific document.",
-        "3. Use `knowledge_list` to browse entries under a type-prefixed path prefix such as `design/` or `skill/unity/`.",
+        "2. Use `knowledge_read` when you know the target `.md` document path or need a specific document.",
+        "3. Use `knowledge_list` to browse entries under a type-prefixed directory path prefix such as `design/` or `skill/unity/`.",
     ]
     .join("\n")
 }
@@ -1269,12 +1340,12 @@ fn build_tools_section() -> String {
     [
         "### Tools",
         "- `knowledge_query`: Search knowledge with separate `lexicalQuery` and `semanticQuery` inputs, plus an optional type-prefixed `pathPrefix`.",
-        "- `knowledge_read`: Read a specific document by type-prefixed path.",
-        "- `knowledge_list`: Browse entries under a type-prefixed path prefix.",
-        "- `knowledge_edit`: Update an existing document's content sections by type-prefixed path.",
-        "- `knowledge_create`: Create a new document or folder at a type-prefixed path. Document creation only accepts initial content.",
-        "- `knowledge_move`: Move a document or folder using type-prefixed paths.",
-        "- `knowledge_delete`: Delete an obsolete document or folder by type-prefixed path.",
+        "- `knowledge_read`: Read a specific document by type-prefixed `.md` path.",
+        "- `knowledge_list`: Browse entries under a type-prefixed directory path prefix.",
+        "- `knowledge_edit`: Update an existing document's content sections by type-prefixed `.md` path.",
+        "- `knowledge_create`: Create a new document or folder at a type-prefixed path. Document paths end with `.md`; directory paths do not. Document creation only accepts initial content.",
+        "- `knowledge_move`: Move a document or folder using type-prefixed paths. Document paths end with `.md`; directory paths do not.",
+        "- `knowledge_delete`: Delete an obsolete document or folder by type-prefixed path. Document paths end with `.md`; directory paths do not.",
     ]
     .join("\n")
 }
@@ -1973,8 +2044,13 @@ impl AgentInstance {
             undo_manager,
             subagent_model_overrides,
             tool_runtime_state: Arc::new(ToolRuntimeState::default()),
+            partial_assistant: Arc::new(AssistantStreamState::default()),
             cancel_rx,
         }
+    }
+
+    pub fn partial_assistant_state(&self) -> Arc<AssistantStreamState> {
+        self.partial_assistant.clone()
     }
 
     async fn build_tool_execution_context(&self, tool_name: &str) -> ToolExecutionContext {
@@ -3510,15 +3586,11 @@ impl AgentInstance {
             &self.working_dir,
             self.app_knowledge_dir.as_ref().as_ref(),
         );
+        let app_knowledge_dir = self.app_knowledge_dir.as_ref().as_ref();
 
         for skill in &intent.skills {
-            let rel_path = skills
-                .iter()
-                .find(|manifest| {
-                    manifest.source == skill.source && manifest.dir_name == skill.dir_name
-                })
-                .map(|manifest| manifest.rel_path.clone())
-                .unwrap_or_else(|| format!("skill/{}.md", skill.dir_name));
+            let rel_path =
+                Self::resolve_selected_skill_reminder_path(&skills, app_knowledge_dir, skill);
             lines.push(format!(
                 "- {} ({}) => `{}`",
                 skill.name, skill.source, rel_path
@@ -3530,9 +3602,62 @@ impl AgentInstance {
         }
 
         format!(
-            "<system-reminder>\nThe user explicitly selected skill bundles for this request.\nBefore following any selected skill, call `knowledge_read` with the relevant `path` and `part=body`.\n\n{}\n</system-reminder>",
+            "<system-reminder>\nThe user explicitly selected skill bundles for this request.\nBefore following any selected skill, call `knowledge_read` with the relevant `.md` path and `part=body`.\n\n{}\n</system-reminder>",
             lines.join("\n"),
         )
+    }
+
+    fn intent_skill_source_matches(manifest_source: &str, intent_source: &str) -> bool {
+        manifest_source == intent_source
+            || (manifest_source == "app" && matches!(intent_source, "builtin" | "builtIn"))
+    }
+
+    fn find_selected_skill_manifest<'a>(
+        skills: &'a [crate::commands::SkillManifest],
+        skill: &crate::session::models::UserIntentSkill,
+    ) -> Option<&'a crate::commands::SkillManifest> {
+        skills
+            .iter()
+            .find(|manifest| {
+                Self::intent_skill_source_matches(&manifest.source, &skill.source)
+                    && manifest.dir_name == skill.dir_name
+            })
+            .or_else(|| {
+                let legacy_app_skill = Self::intent_skill_source_matches("app", &skill.source)
+                    && !skill.dir_name.contains('/');
+                if !legacy_app_skill {
+                    return None;
+                }
+                let builtin_dir_name = format!("builtin/{}", skill.dir_name);
+                skills.iter().find(|manifest| {
+                    manifest.source == "app" && manifest.dir_name == builtin_dir_name
+                })
+            })
+    }
+
+    fn resolve_selected_skill_reminder_path(
+        skills: &[crate::commands::SkillManifest],
+        app_knowledge_dir: Option<&std::path::PathBuf>,
+        skill: &crate::session::models::UserIntentSkill,
+    ) -> String {
+        if let Some(manifest) = Self::find_selected_skill_manifest(skills, skill) {
+            return manifest.rel_path.clone();
+        }
+
+        let normalized_dir_name = skill.dir_name.trim().trim_matches('/').replace('\\', "/");
+        if Self::intent_skill_source_matches("app", &skill.source)
+            && !normalized_dir_name.is_empty()
+            && !normalized_dir_name.contains('/')
+        {
+            if let Some(app_root) = app_knowledge_dir {
+                let builtin_rel_path = format!("skill/builtin/{}.md", normalized_dir_name);
+                if app_root.join(&builtin_rel_path).is_file() {
+                    return builtin_rel_path;
+                }
+            }
+        }
+
+        format!("skill/{}.md", normalized_dir_name)
     }
 
     fn build_user_prompt_suffix(
@@ -3586,7 +3711,59 @@ impl AgentInstance {
         }
     }
 
-    fn emit_cancelled(&self, app_handle: &AppHandle, run_id: &str) {
+    pub fn persist_interrupted_assistant_snapshot(
+        store: &SessionStore,
+        session_id: &str,
+        snapshot: &AssistantStreamSnapshot,
+    ) -> Option<InterruptedAssistantMessage> {
+        if snapshot.text.is_empty() && snapshot.thinking_content.is_empty() {
+            return None;
+        }
+
+        let thinking_content =
+            (!snapshot.thinking_content.is_empty()).then(|| snapshot.thinking_content.clone());
+        if let Some(message_id) = snapshot.persisted_message_id.as_ref() {
+            return Some(InterruptedAssistantMessage {
+                message_id: message_id.clone(),
+                full_text: snapshot.text.clone(),
+                thinking_content,
+                thinking_duration: snapshot.thinking_duration,
+            });
+        }
+
+        match store.add_message_with_thinking(
+            session_id,
+            MessageRole::Assistant,
+            &snapshot.text,
+            thinking_content.as_deref(),
+            snapshot.thinking_duration,
+            None,
+            None,
+            None,
+        ) {
+            Ok(message_id) => Some(InterruptedAssistantMessage {
+                message_id,
+                full_text: snapshot.text.clone(),
+                thinking_content,
+                thinking_duration: snapshot.thinking_duration,
+            }),
+            Err(error) => {
+                eprintln!(
+                    "[Locus] failed to persist interrupted assistant message for session {}: {}",
+                    session_id, error
+                );
+                None
+            }
+        }
+    }
+
+    fn emit_cancelled(&self, app_handle: &AppHandle, store: &SessionStore, run_id: &str) {
+        let interrupted = Self::persist_interrupted_assistant_snapshot(
+            store,
+            &self.session_id,
+            &self.partial_assistant.snapshot(),
+        );
+        self.partial_assistant.reset();
         eprintln!(
             "[Agent {}] emitting Cancelled for session {} run {}",
             self.id, self.session_id, run_id
@@ -3596,6 +3773,16 @@ impl AgentInstance {
             run_id,
             StreamEvent::Cancelled {
                 session_id: self.session_id.clone(),
+                message_id: interrupted
+                    .as_ref()
+                    .map(|message| message.message_id.clone()),
+                full_text: interrupted
+                    .as_ref()
+                    .map(|message| message.full_text.clone()),
+                thinking_content: interrupted
+                    .as_ref()
+                    .and_then(|message| message.thinking_content.clone()),
+                thinking_duration: interrupted.and_then(|message| message.thinking_duration),
             },
         );
     }
@@ -3639,6 +3826,7 @@ impl AgentInstance {
     {
         Box::pin(async move {
             let run_started_at = Instant::now();
+            self.partial_assistant.reset();
             eprintln!(
                 "[Agent {}] run pipeline start: session={} run={} mode={} images={} has_user_intent={}",
                 self.id,
@@ -3875,7 +4063,7 @@ impl AgentInstance {
 
             if self.is_cancel_requested() {
                 self.clear_pending_knowledge_proposal(app_handle).await;
-                self.emit_cancelled(app_handle, &run_id);
+                self.emit_cancelled(app_handle, store, &run_id);
                 return Ok(String::new());
             }
 
@@ -3972,6 +4160,7 @@ impl AgentInstance {
                 let hdl = handle.clone();
                 let ptc = parent_tc.clone();
                 let rid = run_id.clone();
+                let partial_for_text = self.partial_assistant.clone();
                 let agent_id_for_text = self.id.clone();
                 let first_text_delta_logged = Arc::new(AtomicBool::new(false));
                 let first_text_delta_logged_for_cb = first_text_delta_logged.clone();
@@ -3979,6 +4168,7 @@ impl AgentInstance {
                 let sid2 = session_id.clone();
                 let hdl2 = handle.clone();
                 let rid2 = run_id.clone();
+                let partial_for_thinking = self.partial_assistant.clone();
                 let agent_id_for_thinking = self.id.clone();
                 let first_thinking_delta_logged = Arc::new(AtomicBool::new(false));
                 let first_thinking_delta_logged_for_cb = first_thinking_delta_logged.clone();
@@ -4017,6 +4207,7 @@ impl AgentInstance {
                                 session_id: sid.clone(),
                                 text: delta.clone(),
                             });
+                            partial_for_text.append_text(&delta);
                             if let Some((ref parent_sid, ref tc_id)) = ptc {
                                 emit_stream(&hdl, &rid, StreamEvent::ToolCallDelta {
                                     session_id: parent_sid.clone(),
@@ -4041,8 +4232,9 @@ impl AgentInstance {
                             }
                             emit_stream(&hdl2, &rid2, StreamEvent::ThinkingDelta {
                                 session_id: sid2.clone(),
-                                text: thinking,
+                                text: thinking.clone(),
                             });
+                            partial_for_thinking.append_thinking(&thinking);
                         },
                         move |tool_call_id, tool_name| {
                             if !first_tool_call_logged_for_cb.swap(true, Ordering::Relaxed) {
@@ -4093,7 +4285,7 @@ impl AgentInstance {
                             llm_call_started_at.elapsed().as_millis()
                         );
                         self.clear_pending_knowledge_proposal(app_handle).await;
-                        self.emit_cancelled(app_handle, &run_id);
+                        self.emit_cancelled(app_handle, store, &run_id);
                         return Ok(String::new());
                     }
                     Some(Ok(resp)) => {
@@ -4326,6 +4518,12 @@ impl AgentInstance {
                     response.response_id.as_deref(),
                     response.continuation_request.as_ref(),
                 )?;
+                self.partial_assistant.mark_persisted(
+                    assistant_msg_id.clone(),
+                    response.text.clone(),
+                    thinking_opt.map(str::to_string),
+                    thinking_dur,
+                );
 
                 let mut prepared: Vec<(ToolCallInfo, serde_json::Value)> = Vec::new();
                 for tc in &response.tool_calls {
@@ -4640,10 +4838,11 @@ impl AgentInstance {
                     full_text: response.text.clone(),
                     tool_calls: finalized_tool_calls,
                 });
+                self.partial_assistant.reset();
 
                 if self.is_cancel_requested() {
                     self.clear_pending_knowledge_proposal(app_handle).await;
-                    self.emit_cancelled(app_handle, &run_id);
+                    self.emit_cancelled(app_handle, store, &run_id);
                     return Ok(String::new());
                 }
 
@@ -4698,6 +4897,12 @@ impl AgentInstance {
                 final_response_id.as_deref(),
                 final_continuation_request.as_ref(),
             )?;
+            self.partial_assistant.mark_persisted(
+                msg_id.clone(),
+                final_text.clone(),
+                thinking_opt.map(str::to_string),
+                thinking_dur,
+            );
 
             if let Err(error) = store.set_latest_completed_run_id(&self.session_id, Some(&run_id)) {
                 eprintln!(
@@ -4733,6 +4938,7 @@ impl AgentInstance {
                     full_text: final_text.clone(),
                 },
             );
+            self.partial_assistant.reset();
         } else {
             // Server-tool-only rounds already persisted their assistant message via
             // ToolCallRoundDone. The explicit Done event still needs to fire with the
@@ -4774,6 +4980,7 @@ impl AgentInstance {
                     full_text: final_text.clone(),
                 },
             );
+            self.partial_assistant.reset();
         }
 
         if let Err(error) = self
@@ -5663,7 +5870,6 @@ impl AgentInstance {
             semantic_query.as_deref(),
             parsed_types.as_deref(),
             normalized_prefix.as_deref(),
-            None,
             parsed.limit.unwrap_or(5).min(20),
             knowledge_index_state,
         )
@@ -6325,6 +6531,22 @@ impl AgentInstance {
                     "Invalid request_editor_status: '{}'. Allowed values: editing, playing, playing_paused.",
                     requested_status
                 ),
+                is_error: true,
+            };
+        }
+
+        let (connected, _current_status, _) =
+            crate::unity_bridge::query_unity_status(&self.working_dir).await;
+        if !connected {
+            return ToolResult {
+                output: "Unity Editor not connected".to_string(),
+                is_error: true,
+            };
+        }
+
+        if let Err(error) = crate::unity_bridge::compile_run_states(&self.working_dir, args).await {
+            return ToolResult {
+                output: error,
                 is_error: true,
             };
         }
@@ -7715,10 +7937,9 @@ mod tests {
     use crate::knowledge_store::{
         create_directory, default_directory_config_for_type, save_document,
         update_directory_config, KnowledgeDocument, KnowledgeInjectMode, KnowledgeReadResponse,
-        KnowledgeReadResult, KnowledgeScope, KnowledgeSearchMatchSection, KnowledgeTargetKind,
-        KnowledgeType,
+        KnowledgeReadResult, KnowledgeSearchMatchSection, KnowledgeTargetKind, KnowledgeType,
     };
-    use crate::session::models::ToolCallInfo;
+    use crate::session::models::{ToolCallInfo, UserIntentPayload, UserIntentSkill};
     use crate::tool::{ToolRegistry, ToolResult};
     use crate::unity_docs::seed_managed_documents_for_tests;
     use serde_json::json;
@@ -8017,7 +8238,7 @@ PrefabInstance:
         assert!(AgentInstance::path_targets_knowledge_root(
             "C:/Repo",
             None,
-            "C:/Repo/Locus/knowledge/skill/create-skill.md"
+            "C:/Repo/Locus/knowledge/skill/builtin/create-skill.md"
         ));
         assert!(AgentInstance::path_targets_knowledge_root(
             "C:/Repo",
@@ -8037,7 +8258,7 @@ PrefabInstance:
         assert!(AgentInstance::shell_command_mentions_knowledge_root(
             "C:/Repo",
             Some(&app_root),
-            "mv knowledge/skill/create-skill.md knowledge/skill/new-skill.md"
+            "mv knowledge/skill/builtin/create-skill.md knowledge/skill/builtin/new-skill.md"
         ));
         assert!(AgentInstance::shell_command_mentions_knowledge_root(
             "C:/Repo",
@@ -8051,10 +8272,11 @@ PrefabInstance:
         ));
     }
 
-    fn test_agent_instance_with_prompts(
+    fn test_agent_instance_with_prompts_and_app_knowledge_dir(
         working_dir: String,
         system_prompt: &str,
         env_template: &str,
+        app_knowledge_dir: Option<std::path::PathBuf>,
     ) -> AgentInstance {
         let (_, cancel_rx) = tokio::sync::watch::channel(false);
         AgentInstance::new(
@@ -8081,7 +8303,7 @@ PrefabInstance:
             None,
             "test-model".to_string(),
             None,
-            Arc::new(None),
+            Arc::new(app_knowledge_dir),
             Arc::new(None),
             None,
             HashMap::new(),
@@ -8089,8 +8311,86 @@ PrefabInstance:
         )
     }
 
+    fn test_agent_instance_with_prompts(
+        working_dir: String,
+        system_prompt: &str,
+        env_template: &str,
+    ) -> AgentInstance {
+        test_agent_instance_with_prompts_and_app_knowledge_dir(
+            working_dir,
+            system_prompt,
+            env_template,
+            None,
+        )
+    }
+
     fn test_agent_instance(working_dir: String) -> AgentInstance {
         test_agent_instance_with_prompts(working_dir, "", "")
+    }
+
+    #[test]
+    fn selected_skill_reminder_maps_legacy_app_builtin_skill_path() {
+        let root = tempdir().expect("temp dir");
+        let workspace = root.path().join("workspace");
+        let app_knowledge_dir = root.path().join("app-knowledge");
+        let skill_dir = app_knowledge_dir.join("skill").join("builtin");
+        std::fs::create_dir_all(&workspace).expect("create workspace");
+        std::fs::create_dir_all(&skill_dir).expect("create skill dir");
+        std::fs::write(
+            skill_dir.join("profiler.md"),
+            r#"---
+id: kd_skill_builtin_profiler
+type: skill
+path: builtin/profiler.md
+title: Unity Profiler Runtime Sampling
+injectMode: none
+summaryEnabled: true
+commandEnabled: false
+readOnly: true
+aiMaintained: false
+skillEnabled: true
+skillSurface: auto
+commandTrigger:
+argumentHint:
+createdAt: 1
+updatedAt: 1
+---
+
+# Unity Profiler Runtime Sampling
+
+## Summary
+Profiler helper skill.
+
+## Content
+Use profiler helpers.
+"#,
+        )
+        .expect("write profiler skill");
+
+        let agent = test_agent_instance_with_prompts_and_app_knowledge_dir(
+            workspace.to_string_lossy().to_string(),
+            "",
+            "",
+            Some(app_knowledge_dir),
+        );
+        let intent = UserIntentPayload {
+            kind: "user_intent_v1".to_string(),
+            mode: "build".to_string(),
+            skills: vec![UserIntentSkill {
+                dir_name: "profiler".to_string(),
+                source: "app".to_string(),
+                name: "Unity Profiler Runtime Sampling".to_string(),
+            }],
+        };
+
+        let reminder = agent.build_selected_skill_reminder(&intent);
+
+        assert!(
+            reminder.contains("`skill/builtin/profiler.md`"),
+            "{}",
+            reminder
+        );
+        assert!(!reminder.contains("`skill/profiler.md`"), "{}", reminder);
     }
 
     fn sample_agent_knowledge_document(path: &str, title: &str) -> KnowledgeDocument {
@@ -8099,7 +8399,6 @@ PrefabInstance:
             doc_type: KnowledgeType::Design,
             path: path.to_string(),
             title: title.to_string(),
-            scope: KnowledgeScope::Project,
             inject_mode: KnowledgeInjectMode::Excerpt,
             inherit_inject_mode: false,
             inject_mode_source: Default::default(),
@@ -8107,6 +8406,7 @@ PrefabInstance:
             command_enabled: true,
             read_only: false,
             ai_maintained: true,
+            storage_source: crate::knowledge_store::KnowledgeStorageSource::Project,
             inherit_ai_config: false,
             ai_config_source: Default::default(),
             explicit_maintenance_rules: true,
@@ -8310,7 +8610,6 @@ PrefabInstance:
                 doc_type: KnowledgeType::Design,
                 path: "combat/core-loop.md".to_string(),
                 title: "Core Loop".to_string(),
-                scope: KnowledgeScope::Project,
                 inject_mode: KnowledgeInjectMode::Excerpt,
                 inherit_inject_mode: false,
                 inject_mode_source: Default::default(),
@@ -8318,6 +8617,7 @@ PrefabInstance:
                 command_enabled: false,
                 read_only: false,
                 ai_maintained: false,
+                storage_source: crate::knowledge_store::KnowledgeStorageSource::Project,
                 inherit_ai_config: false,
                 ai_config_source: Default::default(),
                 explicit_maintenance_rules: false,
@@ -8456,7 +8756,6 @@ PrefabInstance:
                 doc_type: KnowledgeType::Design,
                 path: "combat/core-loop.md".to_string(),
                 title: "Combat Core Loop".to_string(),
-                scope: KnowledgeScope::Project,
                 inject_mode: KnowledgeInjectMode::Excerpt,
                 inherit_inject_mode: false,
                 inject_mode_source: Default::default(),
@@ -8464,6 +8763,7 @@ PrefabInstance:
                 command_enabled: false,
                 read_only: false,
                 ai_maintained: false,
+                storage_source: crate::knowledge_store::KnowledgeStorageSource::Project,
                 inherit_ai_config: false,
                 ai_config_source: Default::default(),
                 explicit_maintenance_rules: false,
@@ -8507,7 +8807,6 @@ PrefabInstance:
                 doc_type: KnowledgeType::Design,
                 path: "combat/core-loop.md".to_string(),
                 title: "Combat Core Loop".to_string(),
-                scope: KnowledgeScope::Project,
                 inject_mode: KnowledgeInjectMode::Excerpt,
                 inherit_inject_mode: false,
                 inject_mode_source: Default::default(),
@@ -8515,6 +8814,7 @@ PrefabInstance:
                 command_enabled: false,
                 read_only: false,
                 ai_maintained: false,
+                storage_source: crate::knowledge_store::KnowledgeStorageSource::Project,
                 inherit_ai_config: false,
                 ai_config_source: Default::default(),
                 explicit_maintenance_rules: false,
@@ -8579,7 +8879,6 @@ PrefabInstance:
             doc_type: KnowledgeType::Reference,
             path: "unity-official-docs/manual/ExecutionOrder.md".to_string(),
             title: "Execution Order".to_string(),
-            scope: KnowledgeScope::External,
             inject_mode: KnowledgeInjectMode::None,
             inherit_inject_mode: false,
             inject_mode_source: Default::default(),
@@ -8587,6 +8886,7 @@ PrefabInstance:
             command_enabled: false,
             read_only: true,
             ai_maintained: false,
+            storage_source: crate::knowledge_store::KnowledgeStorageSource::Project,
             inherit_ai_config: false,
             ai_config_source: Default::default(),
             explicit_maintenance_rules: false,
@@ -8696,7 +8996,6 @@ PrefabInstance:
                 doc_type: KnowledgeType::Memory,
                 path: "empty-memory.md".to_string(),
                 title: "Empty Memory".to_string(),
-                scope: KnowledgeScope::Project,
                 inject_mode: KnowledgeInjectMode::Rule,
                 inherit_inject_mode: false,
                 inject_mode_source: Default::default(),
@@ -8704,6 +9003,7 @@ PrefabInstance:
                 command_enabled: false,
                 read_only: false,
                 ai_maintained: false,
+                storage_source: crate::knowledge_store::KnowledgeStorageSource::Project,
                 inherit_ai_config: false,
                 ai_config_source: Default::default(),
                 explicit_maintenance_rules: false,
@@ -8739,7 +9039,6 @@ PrefabInstance:
                 doc_type: crate::knowledge_store::KnowledgeType::Memory,
                 path: "heading-map.md".to_string(),
                 title: "Heading Map".to_string(),
-                scope: crate::knowledge_store::KnowledgeScope::Project,
                 inject_mode: crate::knowledge_store::KnowledgeInjectMode::Rule,
                 inherit_inject_mode: false,
                 inject_mode_source: Default::default(),
@@ -8747,6 +9046,7 @@ PrefabInstance:
                 command_enabled: false,
                 read_only: false,
                 ai_maintained: false,
+                storage_source: crate::knowledge_store::KnowledgeStorageSource::Project,
                 inherit_ai_config: false,
                 ai_config_source: Default::default(),
                 explicit_maintenance_rules: false,
@@ -8964,7 +9264,6 @@ PrefabInstance:
                     doc_type: KnowledgeType::Design,
                     path: "design/project-overview.md".to_string(),
                     title: "Project Overview".to_string(),
-                    scope: KnowledgeScope::Project,
                     inject_mode: KnowledgeInjectMode::Excerpt,
                     inherit_inject_mode: false,
                     inject_mode_source: Default::default(),
@@ -8972,6 +9271,7 @@ PrefabInstance:
                     command_enabled: true,
                     read_only: false,
                     ai_maintained: true,
+                    storage_source: crate::knowledge_store::KnowledgeStorageSource::Project,
                     inherit_ai_config: false,
                     ai_config_source: Default::default(),
                     explicit_maintenance_rules: true,

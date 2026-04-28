@@ -19,7 +19,7 @@ use crate::knowledge_store::{
     self, default_directory_config_for_type, delete_directory_config_sidecars,
     update_directory_config, update_directory_external_sources, FolderIndexRuleSetting,
     KnowledgeDirectoryConfig, KnowledgeDocument, KnowledgeExternalSource, KnowledgeInjectMode,
-    KnowledgeScope, KnowledgeSourceProvider, KnowledgeType,
+    KnowledgeSourceProvider, KnowledgeType,
 };
 
 pub const UNITY_REFERENCE_MANAGED_DIR: &str = "unity-official-docs";
@@ -1984,7 +1984,6 @@ fn build_reference_document_from_raw_html(
         doc_type: KnowledgeType::Reference,
         path: final_path,
         title,
-        scope: KnowledgeScope::External,
         inject_mode: KnowledgeInjectMode::None,
         inherit_inject_mode: false,
         inject_mode_source: knowledge_store::KnowledgeConfigSource {
@@ -1995,6 +1994,7 @@ fn build_reference_document_from_raw_html(
         command_enabled: false,
         read_only: true,
         ai_maintained: false,
+        storage_source: knowledge_store::KnowledgeStorageSource::Project,
         inherit_ai_config: false,
         ai_config_source: knowledge_store::KnowledgeConfigSource {
             kind: knowledge_store::KnowledgeConfigSourceKind::SelfValue,
@@ -4258,8 +4258,8 @@ mod tests {
     };
     use crate::knowledge_store::{
         self, FolderIndexRuleSetting, KnowledgeConfigSource, KnowledgeConfigSourceKind,
-        KnowledgeDocument, KnowledgeExternalSource, KnowledgeInjectMode, KnowledgeScope,
-        KnowledgeSourceProvider, KnowledgeType,
+        KnowledgeDocument, KnowledgeExternalSource, KnowledgeInjectMode, KnowledgeSourceProvider,
+        KnowledgeType,
     };
 
     fn test_unity_document(path: &str, title: &str) -> KnowledgeDocument {
@@ -4268,7 +4268,6 @@ mod tests {
             doc_type: KnowledgeType::Reference,
             path: path.to_string(),
             title: title.to_string(),
-            scope: KnowledgeScope::External,
             inject_mode: KnowledgeInjectMode::None,
             inherit_inject_mode: false,
             inject_mode_source: KnowledgeConfigSource {
@@ -4279,6 +4278,7 @@ mod tests {
             command_enabled: false,
             read_only: true,
             ai_maintained: false,
+            storage_source: knowledge_store::KnowledgeStorageSource::Project,
             inherit_ai_config: false,
             ai_config_source: KnowledgeConfigSource {
                 kind: KnowledgeConfigSourceKind::SelfValue,

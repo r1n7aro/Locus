@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
 import { t } from "../../i18n";
-import type { KnowledgeDocument, KnowledgeEditMode, KnowledgeDocumentType, KnowledgeDocumentScope } from "../../types";
+import type { KnowledgeDocument, KnowledgeEditMode, KnowledgeDocumentType } from "../../types";
 import EmbeddedChatPane from "../chat/EmbeddedChatPane.vue";
 import AgentSelector from "../AgentSelector.vue";
 import ModelEffortSelector from "../ModelEffortSelector.vue";
@@ -86,7 +86,7 @@ const {
       `目标文档标题：${props.document.title || props.document.path}`,
       `目标文档路径：${props.document.path}`,
       `文档类型：${typeLabel(props.document.type)}`,
-      `文档范围：${scopeLabel(props.document.scope)}`,
+      `文档作用域：${scopeLabel(props.document)}`,
       `编辑模式：${editModeLabel(editMode.value)}`,
     ];
 
@@ -121,8 +121,10 @@ function typeLabel(type: KnowledgeDocumentType) {
   return t(`knowledge.type.${type}`);
 }
 
-function scopeLabel(scope: KnowledgeDocumentScope) {
-  return t(`knowledge.scope.${scope}`);
+function scopeLabel(document: KnowledgeDocument) {
+  return document.storageSource === "app"
+    ? t("knowledge.scope.user")
+    : t("knowledge.scope.project");
 }
 
 function editModeLabel(mode: KnowledgeEditMode) {

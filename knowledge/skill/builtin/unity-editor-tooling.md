@@ -1,9 +1,8 @@
 ---
 id: kd_skill_unity_editor_tooling
 type: skill
-path: unity-editor-tooling.md
+path: builtin/unity-editor-tooling.md
 title: Unity Editor UI Skill
-scope: project
 injectMode: none
 summaryEnabled: true
 commandEnabled: true

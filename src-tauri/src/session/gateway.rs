@@ -33,7 +33,7 @@ fn event_session_id(event: &StreamEvent) -> &str {
         | StreamEvent::UndoAvailable { session_id, .. }
         | StreamEvent::CompactStart { session_id, .. }
         | StreamEvent::CompactDone { session_id, .. }
-        | StreamEvent::Cancelled { session_id }
+        | StreamEvent::Cancelled { session_id, .. }
         | StreamEvent::Error { session_id, .. } => session_id,
     }
 }

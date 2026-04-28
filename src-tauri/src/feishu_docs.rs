@@ -26,8 +26,7 @@ use crate::keychain;
 use crate::knowledge_index::KnowledgeIndexState;
 use crate::knowledge_store::{
     self, KnowledgeConfigSource, KnowledgeConfigSourceKind, KnowledgeDocument,
-    KnowledgeExternalSource, KnowledgeInjectMode, KnowledgeScope, KnowledgeSourceProvider,
-    KnowledgeType,
+    KnowledgeExternalSource, KnowledgeInjectMode, KnowledgeSourceProvider, KnowledgeType,
 };
 
 pub const FEISHU_REFERENCE_MANAGED_DIR: &str = "feishu-knowledge-base";
@@ -3527,7 +3526,6 @@ async fn run_feishu_reference_import(
             doc_type: KnowledgeType::Reference,
             path: planned_doc.relative_path.clone(),
             title: planned_doc.title.clone(),
-            scope: KnowledgeScope::External,
             inject_mode: KnowledgeInjectMode::None,
             inherit_inject_mode: false,
             inject_mode_source: KnowledgeConfigSource {
@@ -3538,6 +3536,7 @@ async fn run_feishu_reference_import(
             command_enabled: false,
             read_only: true,
             ai_maintained: false,
+            storage_source: knowledge_store::KnowledgeStorageSource::Project,
             inherit_ai_config: false,
             ai_config_source: KnowledgeConfigSource {
                 kind: KnowledgeConfigSourceKind::SelfValue,

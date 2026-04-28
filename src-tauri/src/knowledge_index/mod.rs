@@ -17,8 +17,8 @@ use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
 use crate::knowledge_store::{
-    self, DirectorySearchAccess, KnowledgeDocument, KnowledgeListItem, KnowledgeScope,
-    KnowledgeSearchHit, KnowledgeSearchMatchSection, KnowledgeType,
+    self, DirectorySearchAccess, KnowledgeDocument, KnowledgeListItem, KnowledgeSearchHit,
+    KnowledgeSearchMatchSection, KnowledgeType,
 };
 use crate::unity_docs;
 
@@ -3117,7 +3117,6 @@ pub async fn query_documents(
     semantic_query: Option<&str>,
     types: Option<&[KnowledgeType]>,
     path_prefix: Option<&str>,
-    scopes: Option<&[KnowledgeScope]>,
     limit: usize,
     state: Arc<KnowledgeIndexState>,
 ) -> Result<Vec<KnowledgeSearchHit>, String> {
@@ -3174,7 +3173,7 @@ pub async fn query_documents(
     let mut access_cache = HashMap::new();
     let mut filtered_lexical = Vec::new();
     for hit in lexical_hits {
-        if !cached_doc_allowed(&doc_map, &hit.doc_id, types, path_prefix, scopes) {
+        if !cached_doc_allowed(&doc_map, &hit.doc_id, types, path_prefix) {
             continue;
         }
         let Some(document) = doc_map.get(&hit.doc_id) else {
@@ -3193,7 +3192,7 @@ pub async fn query_documents(
 
     let mut filtered_semantic = Vec::new();
     for hit in semantic_hits {
-        if !cached_doc_allowed(&doc_map, &hit.doc_id, types, path_prefix, scopes) {
+        if !cached_doc_allowed(&doc_map, &hit.doc_id, types, path_prefix) {
             continue;
         }
         let Some(document) = doc_map.get(&hit.doc_id) else {
@@ -3287,7 +3286,7 @@ pub async fn query_documents(
                 doc_type: document.item.doc_type,
                 path: document.item.path.clone(),
                 title: document.item.title.clone(),
-                scope: document.item.scope,
+                storage_source: document.item.storage_source,
                 inject_mode: document.item.inject_mode,
                 ai_maintained: document.item.ai_maintained,
                 score: score as f32,
@@ -3755,7 +3754,6 @@ fn build_document_catalog_row(
         doc_type: item.doc_type.as_str().to_string(),
         doc_path: item.path.clone(),
         parent_path: document_parent_directory(&item.path),
-        scope: item.scope.as_str().to_string(),
         title: item.title.clone(),
         updated_at: item.updated_at,
         estimated_tokens: estimate_document_tokens(document),
@@ -3772,13 +3770,13 @@ fn build_list_item(
         doc_type: document.doc_type,
         path: document.path.clone(),
         title: document.title.clone(),
-        scope: document.scope,
         inject_mode: document.inject_mode,
         summary_enabled: document.summary_enabled,
         command_enabled: document.command_enabled,
         read_only: document.read_only,
         ai_maintained: document.ai_maintained,
         explicit_maintenance_rules: document.explicit_maintenance_rules,
+        storage_source: document.storage_source,
         external_source: document.external_source.clone(),
         skill_enabled: document.skill_enabled,
         skill_surface: document.skill_surface,
@@ -4218,7 +4216,6 @@ fn cached_doc_allowed(
     doc_id: &str,
     types: Option<&[KnowledgeType]>,
     path_prefix: Option<&str>,
-    scopes: Option<&[KnowledgeScope]>,
 ) -> bool {
     let Some(document) = docs.get(doc_id) else {
         return false;
@@ -4230,11 +4227,6 @@ fn cached_doc_allowed(
     }
     if let Some(path_prefix) = path_prefix {
         if !document.item.path.starts_with(path_prefix) {
-            return false;
-        }
-    }
-    if let Some(scopes) = scopes {
-        if !scopes.contains(&document.item.scope) {
             return false;
         }
     }
@@ -4362,8 +4354,8 @@ mod tests {
     use crate::knowledge_store::{
         default_directory_config_for_type, save_document, update_directory_config,
         FolderIndexRuleSetting, KnowledgeConfigSource, KnowledgeConfigSourceKind,
-        KnowledgeDocument, KnowledgeExternalSource, KnowledgeInjectMode, KnowledgeScope,
-        KnowledgeSourceProvider, KnowledgeType,
+        KnowledgeDocument, KnowledgeExternalSource, KnowledgeInjectMode, KnowledgeSourceProvider,
+        KnowledgeStorageSource, KnowledgeType,
     };
     use crate::unity_docs;
     use std::{path::Path, sync::Arc, time::Duration};
@@ -4502,7 +4494,6 @@ mod tests {
                 doc_type: KnowledgeType::Design,
                 path: "combat/core-loop.md".to_string(),
                 title: "核心循环".to_string(),
-                scope: KnowledgeScope::Project,
                 inject_mode: KnowledgeInjectMode::Path,
                 inherit_inject_mode: false,
                 inject_mode_source: KnowledgeConfigSource {
@@ -4513,6 +4504,7 @@ mod tests {
                 command_enabled: false,
                 read_only: false,
                 ai_maintained: false,
+                storage_source: KnowledgeStorageSource::Project,
                 inherit_ai_config: false,
                 ai_config_source: KnowledgeConfigSource {
                     kind: KnowledgeConfigSourceKind::SelfValue,
@@ -4542,7 +4534,6 @@ mod tests {
                 doc_type: KnowledgeType::Reference,
                 path: "unity-official-docs/manual/ExecutionOrder.md".to_string(),
                 title: "Execution Order".to_string(),
-                scope: KnowledgeScope::External,
                 inject_mode: KnowledgeInjectMode::None,
                 inherit_inject_mode: false,
                 inject_mode_source: KnowledgeConfigSource {
@@ -4553,6 +4544,7 @@ mod tests {
                 command_enabled: false,
                 read_only: true,
                 ai_maintained: false,
+                storage_source: KnowledgeStorageSource::Project,
                 inherit_ai_config: false,
                 ai_config_source: KnowledgeConfigSource {
                     kind: KnowledgeConfigSourceKind::SelfValue,
@@ -4635,7 +4627,6 @@ mod tests {
                     index
                 ),
                 title: format!("Unity Manual {:03}", index),
-                scope: KnowledgeScope::External,
                 inject_mode: KnowledgeInjectMode::None,
                 inherit_inject_mode: false,
                 inject_mode_source: KnowledgeConfigSource {
@@ -4646,6 +4637,7 @@ mod tests {
                 command_enabled: false,
                 read_only: true,
                 ai_maintained: false,
+                storage_source: KnowledgeStorageSource::Project,
                 inherit_ai_config: false,
                 ai_config_source: KnowledgeConfigSource {
                     kind: KnowledgeConfigSourceKind::SelfValue,
@@ -4939,7 +4931,6 @@ mod tests {
                 doc_type: KnowledgeType::Design,
                 path: "combat/hit-stop.md".to_string(),
                 title: "Hit Stop".to_string(),
-                scope: KnowledgeScope::Project,
                 inject_mode: KnowledgeInjectMode::Path,
                 inherit_inject_mode: false,
                 inject_mode_source: KnowledgeConfigSource {
@@ -4950,6 +4941,7 @@ mod tests {
                 command_enabled: false,
                 read_only: false,
                 ai_maintained: false,
+                storage_source: KnowledgeStorageSource::Project,
                 inherit_ai_config: false,
                 ai_config_source: KnowledgeConfigSource {
                     kind: KnowledgeConfigSourceKind::SelfValue,

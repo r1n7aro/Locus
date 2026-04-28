@@ -1,12 +1,12 @@
 {
-  "description": "Read a unified knowledge document by type-prefixed path. This tool returns plain-text document content in markdown form, not knowledge metadata or directory config.",
+  "description": "Read a unified knowledge document by type-prefixed `.md` path. This tool returns plain-text document content in markdown form, not knowledge metadata or directory config.",
   "parameters": {
     "type": "object",
     "additionalProperties": false,
     "properties": {
       "path": {
         "type": "string",
-        "description": "The type-prefixed knowledge document path, for example `design/core-loop.md` or `skill/unity/import-pipeline.md`."
+        "description": "The exact type-prefixed knowledge document path. Preserve every directory segment from `knowledge_list` results. Document paths must end with `.md`, for example `design/core-loop.md`, `skill/unity/import-pipeline.md`, or `skill/builtin/profiler.md`."
       },
       "part": {
         "type": "string",

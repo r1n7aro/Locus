@@ -42,6 +42,8 @@ describe("EmbeddedChatPane contract", () => {
     expect(pane).toContain("@scroll=\"handleTranscriptScroll\"");
     expect(pane).toContain(":session-key=\"getViewportStateKey()\"");
     expect(embeddedSession).toContain("buildToolResultMessages(state.activeToolCalls)");
+    expect(embeddedSession).toContain("function replaceMessageById");
+    expect(embeddedSession).toContain("state.messages = replaceMessageById(state.messages, mutation.message)");
     expect(pane).toContain("<AskUserCard");
     expect(pane).toContain("<ToolConfirmCard");
     expect(pane).toContain('class="embedded-chat-pane"');

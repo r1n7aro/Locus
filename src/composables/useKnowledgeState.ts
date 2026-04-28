@@ -59,6 +59,7 @@ import type {
   KnowledgeSearchMatchKind,
   KnowledgeSearchSelectionContext,
   KnowledgeSearchResult,
+  KnowledgeStorageSource,
   LexicalRebuildStatus,
   ModelDefaults,
   UnityReferenceImportStatus,
@@ -125,11 +126,10 @@ function emptyTypeStats(): Record<KnowledgeDocumentType, number> {
   };
 }
 
-function emptyScopeStats(): Record<"project" | "user" | "external", number> {
+function emptyStorageSourceStats(): Record<KnowledgeStorageSource, number> {
   return {
     project: 0,
-    user: 0,
-    external: 0,
+    app: 0,
   };
 }
 
@@ -677,7 +677,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
 
   const catalogStats = computed<KnowledgeCatalogStats>(() => {
     const byType = emptyTypeStats();
-    const byScope = emptyScopeStats();
+    const byStorageSource = emptyStorageSourceStats();
     let commandEnabled = 0;
     let aiMaintained = 0;
     let fullInjectable = 0;
@@ -686,7 +686,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
 
     for (const doc of documents.value) {
       byType[doc.type] += 1;
-      byScope[doc.scope] += 1;
+      byStorageSource[doc.storageSource ?? "project"] += 1;
       if (doc.commandEnabled) commandEnabled += 1;
       if (doc.aiMaintained) aiMaintained += 1;
       if (
@@ -696,13 +696,13 @@ export function useKnowledgeState(props: KnowledgeProps) {
         fullInjectable += 1;
       }
       if (doc.summaryEnabled && !doc.hasSummary) summaryMissing += 1;
-      if (doc.scope === "external") external += 1;
+      if (doc.externalSource) external += 1;
     }
 
     return {
       total: documents.value.length,
       byType,
-      byScope,
+      byStorageSource,
       commandEnabled,
       aiMaintained,
       fullInjectable,
@@ -1993,7 +1993,6 @@ export function useKnowledgeState(props: KnowledgeProps) {
           path: pendingPath,
           title: pendingPath.split("/").pop() ?? pendingPath,
           type: activeType.value,
-          scope: activeType.value === "reference" ? "external" : "project",
           injectMode: "excerpt",
           summaryEnabled: defaultSummaryEnabledForType(activeType.value),
           commandEnabled: false,
@@ -2200,7 +2199,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
         path: result.path,
         title: result.title,
         type: result.type,
-        scope: result.scope,
+        storageSource: result.storageSource ?? "project",
         injectMode: result.injectMode,
         summaryEnabled: defaultSummaryEnabledForType(result.type),
         commandEnabled: false,

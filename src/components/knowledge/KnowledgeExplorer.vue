@@ -780,6 +780,7 @@ function folderTags(node: FolderNode) {
     props.externalDirectorySources[node.relativePath],
   );
   if (externalTag) tags.push(externalTag);
+  if (isBuiltinSkillGroupFolder(node)) return tags;
   if (node.depth !== 1) return tags;
   const config = props.rootDirectoryConfigs[node.relativePath];
   if (!config) return tags;
@@ -791,6 +792,10 @@ function folderTags(node: FolderNode) {
     }),
   );
   return tags;
+}
+
+function isBuiltinSkillGroupFolder(node: FolderNode): boolean {
+  return props.activeType === "skill" && node.depth === 1 && node.relativePath === "builtin";
 }
 
 function deleteMenuLabel(

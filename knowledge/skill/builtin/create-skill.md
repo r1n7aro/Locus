@@ -1,9 +1,8 @@
 ---
 id: kd_skill_create_skill
 type: skill
-path: create-skill.md
+path: builtin/create-skill.md
 title: Create Skill
-scope: project
 injectMode: none
 summaryEnabled: true
 commandEnabled: true
@@ -49,8 +48,8 @@ Create a new unified Skill document in the project's knowledge store, using the 
    - Use a human-readable Title Case title.
 
 3. Use the current knowledge semantics.
-   - Default to `scope: project`.
-   - Use `scope: user` only when the workflow is intentionally personal and should follow the same user across projects.
+   - Project skills live under the project knowledge root.
+   - APP-installed built-in skills live under `skill/builtin/` in the APP knowledge root and are treated as user-level workflows.
    - Keep skills focused on SOPs, execution order, checks, and output requirements.
 
 4. Prefer the unified knowledge tools.
@@ -76,7 +75,6 @@ id: kd_skill_<slug_with_underscores>
 type: skill
 path: <relative-path>.md
 title: <Title Case Name>
-scope: project
 injectMode: none
 summaryEnabled: true
 commandEnabled: true

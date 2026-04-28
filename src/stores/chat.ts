@@ -739,7 +739,7 @@ export const useChatStore = defineStore("chat", () => {
         break;
       }
       case "pushMessage":
-        messages.value.push(m.message);
+        messages.value = replaceMessageById(messages.value, m.message);
         if (m.message.role === "assistant") {
           logToolCollapseTrace("chat-store", "pushMessage", {
             messageId: m.message.id,
