@@ -19,7 +19,7 @@ English | [简体中文](README.zh-CN.md)
 - **Highly optimized prompts**: optimize prompts for Unity projects, improve Agent capability, and avoid common mistakes
 - **Multiple model support**: support subscription account sign-in and compatibility with multiple LLM API capabilities
 
-Locus is currently in early testing (`v0.1.1`). We welcome you to try it and share feedback through Issues. Your input is highly valuable to us.
+Locus is currently in early testing (`v0.2.2`). We welcome you to try it and share feedback through Issues. Your input is highly valuable to us.
 
 ## Installation
 

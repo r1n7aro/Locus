@@ -1,9 +1,9 @@
 ---
 title: "当前版本"
-description: "Locus v0.2.1 (2026-04-26)"
+description: "Locus v0.2.2 (2026-04-28)"
 sidebarTitle: "当前版本"
-version: "0.2.1"
-releasedAt: "2026-04-26"
+version: "0.2.2"
+releasedAt: "2026-04-28"
 channel: "stable"
 updateTitle: "发现新版本"
 changelogUrl: "/overview/latest-version"
@@ -17,12 +17,25 @@ changelogUrl: "/overview/latest-version"
 
 ### 新增
 
-- Unity 插件安装包改为内置合并后的 Roslyn 运行组件，减少项目内依赖冲突。
+- `unity_run_states` 新增 Unity 运行时 Profiler 辅助能力，支持指标采样、尖峰记录、Profiler 帧导出、CSV 输出和 JSON 摘要。
+- 新增内置 Profiler Skill：`skill/builtin/profiler.md`。
+- Chat 的 Unity 状态弹层新增启动当前 Unity 项目的操作，并显示启动中、等待连接状态。
+- Markdown 引用、资产 chip、文件树和 Git 变更列表新增 Unity 资产类型图标。
+- Unity Inspector Diff 新增紧凑的 Vector 与 Quaternion 展示，并支持 Euler / Quaternion 切换。
+- 显示设置新增“层级视图用彩色图标显示修改状态”。
 
 ### 修复
 
-- 修复部分 Unity 项目安装插件后出现 Roslyn 相关编译冲突的问题。
-- 修复应用更新后 Unity 插件资源可能沿用旧文件的问题。
-- 修复 Unity 嵌入窗口在父窗口隐藏、切换或恢复时仍可能显示的问题。
-- 修复 Unity Editor 快速发送窗口同步消息时偶发连接到旧控制通道的问题。
-- Diff 预览会忽略仅由 Windows/macOS 行尾差异造成的改动，减少无意义的变更噪音。
+- 文件变更默认使用树视图，并在 staged / commit detail 树中显示 Locus 管理目录标记。
+- 取消对话时会保留已流式输出的部分回复和 thinking 内容。
+- Knowledge 工具现在明确区分 `.md` 文档路径和目录路径。
+- 内置 Skill 可从 `skill/builtin/` 正确发现和读取，并兼容旧的 app skill 选择。
+- Knowledge 统计和元信息改为显示项目文档与 App 内置文档来源。
+- 主界面默认主题改为深色。
+- Roslyn bundle 构建改为隔离输出目录，并清理临时 ILRepack 产物。
+- NSIS 更新会清理旧版本遗留的根级内置 Skill 文件。
+
+### 移除
+
+- Knowledge catalog 和工具返回结构移除旧的 `scope` 字段。
+- 内置 Skill 移除根级文件路径，统一迁移到 `skill/builtin/`。
