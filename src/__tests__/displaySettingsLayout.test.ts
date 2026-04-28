@@ -12,6 +12,7 @@ describe("display settings transcript alignment", () => {
   it("keeps main and Unity embed color styles separately configurable", () => {
     const theme = read("src/composables/useTheme.ts");
     const displayPanel = read("src/components/settings/DisplaySettings.vue");
+    const settingsState = read("src/composables/useSettingsState.ts");
     const app = read("src/App.vue");
     const html = read("index.html");
     const zh = read("src/language/zh.json");
@@ -19,13 +20,14 @@ describe("display settings transcript alignment", () => {
 
     expect(theme).toContain('export type ThemeScope = "main" | "unityEmbed";');
     expect(theme).toContain('unityEmbed: "locus-unity-embed-theme-preference"');
+    expect(theme).toContain('main: "dark"');
     expect(theme).toContain('unityEmbed: "dark"');
     expect(theme).toContain("unityEmbedPreference");
     expect(theme).toContain("setThemePreference(scope: ThemeScope, pref: ThemePreference)");
 
     expect(app).toContain('initTheme(isUnityEmbedWindow ? "unityEmbed" : "main")');
     expect(html).toContain("locus-unity-embed-theme-preference");
-    expect(html).toContain("var fallback=isUnityEmbed?'dark':'system';");
+    expect(html).toContain("var fallback='dark';");
 
     expect(displayPanel).toContain("mainPreference");
     expect(displayPanel).toContain("unityEmbedPreference");
@@ -33,6 +35,8 @@ describe("display settings transcript alignment", () => {
     expect(displayPanel).toContain("settings.display.themeUnityEmbedWindow");
     expect(displayPanel).toContain("setThemePreference('main', $event as ThemePreference)");
     expect(displayPanel).toContain("setThemePreference('unityEmbed', $event as ThemePreference)");
+    expect(settingsState).toContain('setThemePreference("main", "dark");');
+    expect(settingsState).toContain('setThemePreference("unityEmbed", "dark");');
 
     expect(zh).toContain('"settings.display.themeMainWindow": "主窗口"');
     expect(zh).toContain('"settings.display.themeUnityEmbedWindow": "Unity 嵌入窗口"');

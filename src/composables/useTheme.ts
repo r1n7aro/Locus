@@ -11,7 +11,7 @@ const STORAGE_KEYS: Record<ThemeScope, string> = {
 };
 
 const DEFAULT_PREFERENCES: Record<ThemeScope, ThemePreference> = {
-  main: "system",
+  main: "dark",
   unityEmbed: "dark",
 };
 

@@ -40,6 +40,7 @@ import type {
 import { t } from "../i18n";
 import { filterVisibleProviders } from "../config/providerVisibility";
 import { useCopyFeedback } from "./useCopyFeedback";
+import { setThemePreference } from "./useTheme";
 
 export interface ProviderStatus {
   id: string;
@@ -101,6 +102,8 @@ export function useSettingsState(emit: SettingsEmit) {
       localStorage.removeItem("locus:collabLeftColWidth");
       localStorage.removeItem("locus:collabTerminalHeight");
     } catch { /* ignore */ }
+    setThemePreference("main", "dark");
+    setThemePreference("unityEmbed", "dark");
     try {
       await resetAllConfig();
     } catch (e) {

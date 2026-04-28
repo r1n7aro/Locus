@@ -57,9 +57,9 @@ const languageOptions = [
   { value: "en", label: "English" },
 ] as const;
 const themeOptionDefs: { value: ThemePreference; labelKey: string }[] = [
-  { value: "system", labelKey: "settings.display.themeSystem" },
-  { value: "light",  labelKey: "settings.display.themeLight" },
   { value: "dark",   labelKey: "settings.display.themeDark" },
+  { value: "light",  labelKey: "settings.display.themeLight" },
+  { value: "system", labelKey: "settings.display.themeSystem" },
 ];
 const themeOptions = computed(() =>
   themeOptionDefs.map((opt) => ({
