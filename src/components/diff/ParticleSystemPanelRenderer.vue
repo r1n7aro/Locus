@@ -209,7 +209,7 @@ function clamp01(value: number): number {
   font-size: 11px;
   font-weight: 600;
   color: var(--text-secondary);
-  background: var(--bg-tertiary);
+  background: var(--unity-field-section-bg, color-mix(in srgb, var(--sidebar-bg) 62%, var(--panel-bg) 38%));
   text-transform: uppercase;
   letter-spacing: 0.5px;
 }
@@ -226,7 +226,8 @@ function clamp01(value: number): number {
   gap: 10px;
   min-height: 28px;
   padding: 4px 14px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+  border-bottom: 1px solid color-mix(in srgb, var(--border-color) 56%, transparent);
+  background: var(--unity-field-row-bg, color-mix(in srgb, var(--panel-bg) 88%, var(--bg-color) 12%));
 }
 
 .ps-summary-row:last-child {
@@ -242,15 +243,15 @@ function clamp01(value: number): number {
 }
 
 .ps-change-bar.added {
-  background: #38a169;
+  background: var(--git-status-added);
 }
 
 .ps-change-bar.removed {
-  background: #e53e3e;
+  background: var(--git-status-deleted);
 }
 
 .ps-change-bar.modified {
-  background: #d69e2e;
+  background: var(--git-status-modified);
 }
 
 .ps-label {
@@ -315,8 +316,8 @@ function clamp01(value: number): number {
   font-weight: 600;
   color: var(--text-secondary);
   opacity: 0.72;
-  background: color-mix(in srgb, var(--bg-tertiary) 65%, transparent);
-  border-top: 1px solid rgba(255, 255, 255, 0.03);
+  background: color-mix(in srgb, var(--unity-field-section-bg, var(--sidebar-bg)) 65%, transparent);
+  border-top: 1px solid color-mix(in srgb, var(--border-color) 42%, transparent);
 }
 
 .other-fields .section-header {

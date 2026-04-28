@@ -4,6 +4,7 @@ import hljs, { langFromPath } from "../../hljs";
 import { diffSemanticTarget, diffTextForLarge, invalidateDiffCache } from "../../services/diff";
 import { gitExecute } from "../../services/git";
 import { t } from "../../i18n";
+import { useResizablePanel } from "../../composables/useResizablePanel";
 import type {
   FileDiffPayload,
   FileDiffRequest,
@@ -107,6 +108,17 @@ const HIGHLIGHT_LINE_LIMIT = 5000;
 const textReady = ref(false);
 const renderLimit = ref(CHUNK_SIZE);
 const textScrollEl = ref<HTMLElement | null>(null);
+const sceneLayoutRef = ref<HTMLElement | null>(null);
+const {
+  size: hierarchyWidth,
+  isDragging: resizingHierarchy,
+  onMouseDown: onHierarchyResizeMouseDown,
+} = useResizablePanel(sceneLayoutRef, {
+  storageKey: "locus:diff:scene-hierarchy-width",
+  defaultSize: 280,
+  minSize: 180,
+  maxSize: (container) => Math.max(220, Math.min(520, container.clientWidth * 0.55)),
+});
 
 const effectiveText = computed(() => lazyText.value ?? props.payload.text);
 
@@ -217,6 +229,10 @@ const semanticSummary = computed(() => {
   if (semantic.summary.changedFields) parts.push(t("diff.summary.fields", semantic.summary.changedFields));
   return parts;
 });
+
+const hierarchyColumnStyle = computed(() =>
+  props.compact ? undefined : { width: `${hierarchyWidth.value}px` },
+);
 
 watch(
   () => props.payload,
@@ -493,8 +509,12 @@ defineExpose({ activeTab, hasSemanticAndText });
         </div>
 
         <template v-else-if="payload.semantic.layout === 'sceneHierarchyInspector'">
-          <div class="semantic-layout scene-layout">
-            <div class="hierarchy-column">
+          <div
+            ref="sceneLayoutRef"
+            class="semantic-layout scene-layout"
+            :class="{ 'resizing-hierarchy': resizingHierarchy }"
+          >
+            <div class="hierarchy-column" :style="hierarchyColumnStyle">
               <UnityHierarchyPane
                 :nodes="treeNodes()"
                 :selected-id="selectedTargetId"
@@ -503,6 +523,13 @@ defineExpose({ activeTab, hasSemanticAndText });
                 @select="onSelectTarget"
               />
             </div>
+            <div
+              v-if="!compact"
+              class="hierarchy-resize-handle"
+              role="separator"
+              aria-orientation="vertical"
+              @mousedown="onHierarchyResizeMouseDown"
+            />
             <div class="inspector-column">
               <UnityInspectorPane
                 :inspector="activeInspector"
@@ -825,19 +852,47 @@ defineExpose({ activeTab, hasSemanticAndText });
   height: 100%;
 }
 
+.semantic-layout.resizing-hierarchy {
+  cursor: col-resize;
+}
+
 .diff-viewer.compact .semantic-layout {
   min-height: 170px;
 }
 
 .scene-layout .hierarchy-column {
-  width: 32%;
+  width: 280px;
   min-width: 240px;
-  max-width: 360px;
+  max-width: 520px;
+  flex-shrink: 0;
+  overflow: hidden;
 }
 
 .diff-viewer.compact .scene-layout .hierarchy-column {
   width: 38%;
   min-width: 150px;
+  max-width: 360px;
+}
+
+.hierarchy-resize-handle {
+  position: relative;
+  width: 5px;
+  flex-shrink: 0;
+  cursor: col-resize;
+  background: color-mix(in srgb, var(--border-color) 70%, transparent);
+}
+
+.hierarchy-resize-handle::before {
+  content: "";
+  position: absolute;
+  inset: 0 2px;
+  background: transparent;
+  transition: background 0.15s;
+}
+
+.hierarchy-resize-handle:hover::before,
+.scene-layout.resizing-hierarchy .hierarchy-resize-handle::before {
+  background: var(--accent-color);
 }
 
 .scene-layout .inspector-column {

@@ -178,7 +178,7 @@ const isEmpty = computed(() =>
   font-size: 11px;
   font-weight: 600;
   color: var(--text-secondary);
-  background: var(--bg-tertiary);
+  background: var(--unity-field-section-bg, color-mix(in srgb, var(--sidebar-bg) 62%, var(--panel-bg) 38%));
   text-transform: uppercase;
   letter-spacing: 0.5px;
 }

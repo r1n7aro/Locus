@@ -192,7 +192,7 @@ onUnmounted(() => {
           'no-inspector': !row.node.hasInspector,
         },
       ]"
-      :style="{ paddingLeft: `${10 + row.depth * 16}px` }"
+      :style="{ paddingLeft: `${12 + row.depth * 20}px` }"
       :title="row.node.hasInspector ? row.node.path : t('merge.tree.aggregateNode', row.node.path)"
       :role="row.node.hasInspector ? 'button' : undefined"
       :tabindex="row.node.hasInspector ? 0 : undefined"
@@ -209,7 +209,11 @@ onUnmounted(() => {
         :aria-expanded="row.expanded"
         :aria-label="row.expanded ? t('merge.tree.toggleCollapse', row.node.label) : t('merge.tree.toggleExpand', row.node.label)"
         @click.stop="toggleNode(row.node)"
-      />
+      >
+        <svg class="row-toggle-chevron" viewBox="0 0 16 16" width="10" height="10" fill="currentColor" aria-hidden="true">
+          <path d="M6.22 3.22a.75.75 0 0 1 1.06 0l4.25 4.25a.75.75 0 0 1 0 1.06l-4.25 4.25a.75.75 0 0 1-1.06-1.06L9.94 8 6.22 4.28a.75.75 0 0 1 0-1.06z"/>
+        </svg>
+      </button>
       <span v-else class="row-toggle-spacer" />
 
       <div class="row-select">
@@ -230,23 +234,24 @@ onUnmounted(() => {
 .unity-hierarchy-pane {
   height: 100%;
   overflow: auto;
-  border-right: 1px solid var(--border-color);
-  background: var(--bg-secondary, rgba(255, 255, 255, 0.02));
-  font-family: var(--font-ui);
+  border-right: 1px solid color-mix(in srgb, var(--border-color) 78%, var(--text-secondary) 22%);
+  background: color-mix(in srgb, var(--sidebar-bg) 86%, var(--bg-color) 14%);
+  font-family: var(--font-mono-identifier);
 }
 
 .hierarchy-title {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
-  padding: 8px 12px;
+  gap: 6px;
+  padding: 6px 12px;
   font-size: 11px;
-  font-weight: 700;
+  font-weight: 600;
   text-transform: uppercase;
-  letter-spacing: 0.5px;
+  letter-spacing: 0.02em;
   color: var(--text-secondary);
-  border-bottom: 1px solid var(--border-color);
+  border-bottom: 1px solid color-mix(in srgb, var(--border-color) 78%, transparent);
+  background: color-mix(in srgb, var(--sidebar-bg) 92%, var(--panel-bg) 8%);
 }
 
 .hierarchy-title-label {
@@ -285,14 +290,19 @@ onUnmounted(() => {
   align-items: center;
   gap: 6px;
   min-height: 28px;
-  padding: 4px 10px;
+  padding: 3px 12px;
   cursor: default;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.03);
-  font-size: 12.5px;
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.35;
+  color: var(--text-color);
+  border-bottom: 1px solid color-mix(in srgb, var(--border-color) 38%, transparent);
+  transition: background 0.1s;
+  user-select: none;
 }
 
 .hierarchy-row:hover {
-  background: rgba(255, 255, 255, 0.04);
+  background: var(--hover-bg);
 }
 
 .hierarchy-row.no-inspector {
@@ -304,71 +314,72 @@ onUnmounted(() => {
 }
 
 .hierarchy-row.selected {
-  background: rgba(56, 161, 105, 0.14);
+  background: color-mix(in srgb, var(--active-bg) 78%, var(--sidebar-bg) 22%);
+  box-shadow: inset 2px 0 0 var(--accent-color);
+}
+
+.hierarchy-row.selected:hover {
+  background: var(--active-bg);
 }
 
 .row-change-bar {
-  position: absolute;
-  left: 0;
-  top: 0;
-  bottom: 0;
-  width: 3px;
+  display: none;
 }
 
 .row-change-bar.added {
-  background: #38a169;
+  background: var(--git-status-added);
 }
 
 .row-change-bar.removed {
-  background: #e53e3e;
+  background: var(--git-status-deleted);
 }
 
 .row-change-bar.modified {
-  background: #d69e2e;
+  background: var(--git-status-modified);
 }
 
 .row-change-bar.conflict {
-  background: #dd6b20;
+  background: var(--git-status-conflict);
 }
 
 .row-change-bar.partial {
-  background: #d69e2e;
+  background: var(--git-status-conflict);
 }
 
 .row-change-bar.resolved,
 .row-change-bar.autoResolved {
-  background: #38a169;
+  background: var(--git-status-added);
 }
 
 .row-change-bar.oursOnly {
-  background: #4299e1;
+  background: var(--git-status-renamed);
 }
 
 .row-change-bar.theirsOnly {
-  background: #9f7aea;
+  background: var(--git-status-stash);
 }
 
 .row-toggle,
 .row-toggle-spacer {
-  width: 18px;
-  height: 18px;
+  width: 14px;
+  height: 14px;
   flex-shrink: 0;
 }
 
 .row-toggle {
   padding: 0;
-  border: 1px solid var(--border-color);
-  border-radius: 4px;
+  border: none;
   background: transparent;
   color: var(--text-secondary);
   cursor: pointer;
   font-size: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
 }
 
 .row-toggle:hover {
   color: var(--text-color);
-  border-color: var(--text-secondary);
-  background: var(--hover-bg);
 }
 
 .hierarchy-row:focus-visible,
@@ -377,13 +388,12 @@ onUnmounted(() => {
   outline-offset: -2px;
 }
 
-.row-toggle::before {
-  content: "▶";
-  font-size: 9px;
+.row-toggle-chevron {
+  transition: transform 0.15s ease;
 }
 
-.row-toggle[aria-expanded="true"]::before {
-  content: "▼";
+.row-toggle[aria-expanded="true"] .row-toggle-chevron {
+  transform: rotate(90deg);
 }
 
 .row-select {
@@ -404,59 +414,58 @@ onUnmounted(() => {
   overflow: hidden;
   text-overflow: ellipsis;
   color: var(--text-color);
+  font-family: var(--font-mono-identifier);
+  font-size: 12px;
+  font-weight: 400;
+}
+
+.hierarchy-row.no-inspector .row-label {
+  color: var(--text-secondary);
 }
 
 .row-change-icon {
   flex-shrink: 0;
-  width: 16px;
-  height: 16px;
+  width: 14px;
+  height: 14px;
   display: flex;
   align-items: center;
   justify-content: center;
-  border-radius: 3px;
   font-size: 10px;
   font-weight: 700;
+  line-height: 1;
 }
 
 .row-change-icon.added {
-  color: #38a169;
-  background: rgba(56, 161, 105, 0.14);
+  color: var(--git-status-added);
 }
 
 .row-change-icon.removed {
-  color: #e53e3e;
-  background: rgba(229, 62, 62, 0.14);
+  color: var(--git-status-deleted);
 }
 
 .row-change-icon.modified {
-  color: #d69e2e;
-  background: rgba(214, 158, 46, 0.14);
+  color: var(--git-status-modified);
 }
 
 .row-change-icon.conflict {
-  color: #dd6b20;
-  background: rgba(221, 107, 32, 0.14);
+  color: var(--git-status-conflict);
 }
 
 .row-change-icon.partial {
-  color: #d69e2e;
-  background: rgba(214, 158, 46, 0.14);
+  color: var(--git-status-conflict);
 }
 
 .row-change-icon.resolved,
 .row-change-icon.autoResolved {
-  color: #38a169;
-  background: rgba(56, 161, 105, 0.14);
+  color: var(--git-status-added);
 }
 
 .row-change-icon.oursOnly {
-  color: #4299e1;
-  background: rgba(66, 153, 225, 0.14);
+  color: var(--git-status-renamed);
 }
 
 .row-change-icon.theirsOnly {
-  color: #9f7aea;
-  background: rgba(159, 122, 234, 0.14);
+  color: var(--git-status-stash);
 }
 
 .row-target-actions {

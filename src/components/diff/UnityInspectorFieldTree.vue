@@ -1,7 +1,14 @@
 <script setup lang="ts">
-import { ref } from "vue";
+import { computed, ref } from "vue";
 import type { InspectorField } from "../../types";
 import { shouldAutoCollapseField } from "./unityInspectorFieldState";
+import {
+  detectVectorComponents,
+  formatQuaternionEulerTuple,
+  formatVectorTuple,
+  isFullyModifiedVector,
+  isQuaternionField,
+} from "./vectorDisplay";
 
 defineOptions({ name: "UnityInspectorFieldTree" });
 
@@ -140,36 +147,71 @@ function changeLabel(kind: string): string {
 }
 
 /** ── Inline vector detection ── */
-const VECTOR_LABELS = new Set(["x", "y", "z", "w", "r", "g", "b", "a"]);
-
-interface VectorComponent {
-  label: string;
-  before: string | undefined;
-  after: string | undefined;
-  changeKind: string;
-}
-
-/**
- * Detect if a group field is a vector (2-4 scalar children named x/y/z/w or r/g/b/a).
- * Returns ordered components or null.
- */
-function detectVector(field: InspectorField): VectorComponent[] | null {
-  const children = field.children;
-  if (!children || children.length < 2 || children.length > 4) return null;
-  for (const child of children) {
-    if (child.children?.length) return null;
-    if (!VECTOR_LABELS.has(child.label.toLowerCase())) return null;
-  }
-  return children.map(c => ({
-    label: c.label.toUpperCase(),
-    before: c.before ?? undefined,
-    after: c.after ?? undefined,
-    changeKind: c.changeKind,
-  }));
-}
-
-const vectorComponents = hasChildren ? detectVector(props.field) : null;
+const vectorComponents = hasChildren ? detectVectorComponents(props.field) : null;
 const isVector = vectorComponents !== null;
+const rotationDisplayMode = ref<"euler" | "quaternion">("euler");
+const isQuaternionVector = vectorComponents !== null && isQuaternionField(props.field, vectorComponents);
+const canShowQuaternionEuler = computed(() =>
+  isQuaternionVector
+  && vectorComponents !== null
+  && (
+    formatQuaternionEulerTuple(vectorComponents, "before", fmt) !== null
+    || formatQuaternionEulerTuple(vectorComponents, "after", fmt) !== null
+  ),
+);
+
+function toggleRotationDisplayMode() {
+  rotationDisplayMode.value = rotationDisplayMode.value === "euler" ? "quaternion" : "euler";
+}
+
+function handleRowClick() {
+  if (canShowQuaternionEuler.value) {
+    toggleRotationDisplayMode();
+    return;
+  }
+  if (!isVector) toggle();
+}
+
+function rawVectorTuple(side: "before" | "after"): string {
+  return formatVectorTuple(vectorComponents ?? [], side, (value) => parseValue(value).name);
+}
+
+const compactVectorDisplay = computed<{
+  kind: InspectorField["changeKind"];
+  before?: string;
+  after?: string;
+  single?: string;
+} | null>(() => {
+  if (!vectorComponents) return null;
+
+  if (isQuaternionVector && rotationDisplayMode.value === "euler") {
+    const before = formatQuaternionEulerTuple(vectorComponents, "before", fmt) ?? undefined;
+    const after = formatQuaternionEulerTuple(vectorComponents, "after", fmt) ?? undefined;
+    if (props.field.changeKind === "modified" && before && after) {
+      return { kind: "modified", before, after };
+    }
+    if (props.field.changeKind === "added" && after) {
+      return { kind: "added", single: after };
+    }
+    if (props.field.changeKind === "removed" && before) {
+      return { kind: "removed", single: before };
+    }
+    if (before || after) {
+      return { kind: props.field.changeKind, single: after ?? before };
+    }
+    return null;
+  }
+
+  if (isFullyModifiedVector(vectorComponents)) {
+    return {
+      kind: "modified",
+      before: rawVectorTuple("before"),
+      after: rawVectorTuple("after"),
+    };
+  }
+
+  return null;
+});
 
 /** Effective type hint to display: prefer C# fieldType, fall back to inferred valueType for numbers */
 const displayTypeHint = (() => {
@@ -189,9 +231,9 @@ const displayTypeHint = (() => {
   <div class="field-node">
     <div
       class="field-row"
-      :class="[field.changeKind, { collapsible: hasChildren && !isVector, collapsed }]"
+      :class="[field.changeKind, { collapsible: hasChildren && !isVector, collapsed, 'mode-toggle-row': canShowQuaternionEuler }]"
       :style="{ paddingLeft: `${12 + (depth ?? 0) * 14}px` }"
-      @click="toggle"
+      @click="handleRowClick"
     >
       <!-- Left color bar -->
       <span v-if="field.changeKind !== 'unchanged'" class="change-bar" :class="field.changeKind" />
@@ -214,26 +256,54 @@ const displayTypeHint = (() => {
         {{ changeLabel(field.changeKind) }}
       </span>
 
-      <!-- ── Inline vector display (e.g. X 85.15→85.26  Y 0.00→-0.05  Z 70.46→70.49) ── -->
+      <!-- ── Inline vector display ── -->
       <template v-if="isVector">
         <span class="vector-inline">
-          <span v-for="vc in vectorComponents" :key="vc.label" class="vector-comp" :class="vc.changeKind">
-            <span class="vector-label">{{ vc.label }}</span>
-            <template v-if="vc.changeKind === 'unchanged'">
-              <span class="val-name">{{ parseValue(vc.after ?? vc.before).name }}</span>
-            </template>
-            <template v-else-if="vc.changeKind === 'added'">
-              <span class="val-name highlight-add">{{ parseValue(vc.after).name }}</span>
-            </template>
-            <template v-else-if="vc.changeKind === 'removed'">
-              <span class="val-name strikethrough">{{ parseValue(vc.before).name }}</span>
-            </template>
-            <template v-else>
-              <span class="val-name vec-before">{{ parseValue(vc.before).name }}</span>
-              <span class="field-arrow">&rarr;</span>
-              <span class="val-name highlight-mod">{{ parseValue(vc.after).name }}</span>
-            </template>
-          </span>
+          <template v-if="compactVectorDisplay">
+            <span class="vector-compact" :class="compactVectorDisplay.kind">
+              <template v-if="compactVectorDisplay.kind === 'modified'">
+                <span class="val-name vec-before">{{ compactVectorDisplay.before }}</span>
+                <span class="field-arrow">&rarr;</span>
+                <span class="val-name highlight-mod">{{ compactVectorDisplay.after }}</span>
+              </template>
+              <template v-else-if="compactVectorDisplay.kind === 'added'">
+                <span class="val-name highlight-add">{{ compactVectorDisplay.single }}</span>
+              </template>
+              <template v-else-if="compactVectorDisplay.kind === 'removed'">
+                <span class="val-name strikethrough">{{ compactVectorDisplay.single }}</span>
+              </template>
+              <template v-else>
+                <span class="val-name">{{ compactVectorDisplay.single }}</span>
+              </template>
+            </span>
+          </template>
+          <template v-else>
+            <span v-for="vc in vectorComponents" :key="vc.label" class="vector-comp" :class="vc.changeKind">
+              <span class="vector-label">{{ vc.label }}</span>
+              <template v-if="vc.changeKind === 'unchanged'">
+                <span class="val-name">{{ parseValue(vc.after ?? vc.before).name }}</span>
+              </template>
+              <template v-else-if="vc.changeKind === 'added'">
+                <span class="val-name highlight-add">{{ parseValue(vc.after).name }}</span>
+              </template>
+              <template v-else-if="vc.changeKind === 'removed'">
+                <span class="val-name strikethrough">{{ parseValue(vc.before).name }}</span>
+              </template>
+              <template v-else>
+                <span class="val-name vec-before">{{ parseValue(vc.before).name }}</span>
+                <span class="field-arrow">&rarr;</span>
+                <span class="val-name highlight-mod">{{ parseValue(vc.after).name }}</span>
+              </template>
+            </span>
+          </template>
+          <button
+            v-if="canShowQuaternionEuler"
+            type="button"
+            class="vector-mode-toggle"
+            @click.stop="toggleRotationDisplayMode"
+          >
+            {{ rotationDisplayMode === 'euler' ? 'Euler' : 'Quat' }}
+          </button>
         </span>
       </template>
 
@@ -338,17 +408,27 @@ const displayTypeHint = (() => {
   min-height: 26px;
   padding: 3px 12px;
   padding-right: 12px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+  border-bottom: 1px solid color-mix(in srgb, var(--border-color) 56%, transparent);
+  background: var(--unity-field-row-bg, color-mix(in srgb, var(--panel-bg) 88%, var(--bg-color) 12%));
   font-size: 12.5px;
   line-height: 1.4;
 }
 
 .field-row.collapsible {
+  background: var(--unity-field-group-row-bg, color-mix(in srgb, var(--panel-bg) 78%, var(--bg-color) 22%));
   cursor: pointer;
 }
 
 .field-row.collapsible:hover {
-  background: rgba(255, 255, 255, 0.03);
+  background: var(--unity-field-row-hover-bg, color-mix(in srgb, var(--hover-bg) 64%, var(--panel-bg) 36%));
+}
+
+.field-row.mode-toggle-row {
+  cursor: pointer;
+}
+
+.field-row.mode-toggle-row:hover {
+  background: var(--unity-field-row-hover-bg, color-mix(in srgb, var(--hover-bg) 64%, var(--panel-bg) 36%));
 }
 
 /* ── Left color bar ── */
@@ -360,9 +440,9 @@ const displayTypeHint = (() => {
   width: 3px;
 }
 
-.change-bar.added { background: #38a169; }
-.change-bar.removed { background: #e53e3e; }
-.change-bar.modified { background: #d69e2e; }
+.change-bar.added { background: var(--git-status-added); }
+.change-bar.removed { background: var(--git-status-deleted); }
+.change-bar.modified { background: var(--git-status-modified); }
 
 /* ── Fold arrow ── */
 .fold-arrow {
@@ -420,9 +500,20 @@ const displayTypeHint = (() => {
   line-height: 16px;
 }
 
-.change-badge.added { color: #38a169; background: rgba(56, 161, 105, 0.14); }
-.change-badge.removed { color: #e53e3e; background: rgba(229, 62, 62, 0.14); }
-.change-badge.modified { color: #d69e2e; background: rgba(214, 158, 46, 0.14); }
+.change-badge.added {
+  color: var(--git-status-added);
+  background: color-mix(in srgb, var(--git-status-added) 14%, transparent);
+}
+
+.change-badge.removed {
+  color: var(--git-status-deleted);
+  background: color-mix(in srgb, var(--git-status-deleted) 14%, transparent);
+}
+
+.change-badge.modified {
+  color: var(--git-status-modified);
+  background: color-mix(in srgb, var(--git-status-modified) 14%, transparent);
+}
 
 /* ── Value cell ── */
 .value-cell {
@@ -453,6 +544,11 @@ const displayTypeHint = (() => {
   opacity: 0.65;
 }
 
+.val-name.strikethrough {
+  text-decoration: line-through;
+  opacity: 0.65;
+}
+
 /* Highlighted value names for actual changes */
 .val-name.highlight-add {
   color: var(--text-color);
@@ -460,9 +556,9 @@ const displayTypeHint = (() => {
 }
 
 .val-name.highlight-mod {
-  color: #fbd38d;
+  color: color-mix(in srgb, var(--git-status-modified) 82%, var(--text-color));
   font-weight: 700;
-  background: rgba(214, 158, 46, 0.12);
+  background: color-mix(in srgb, var(--git-status-modified) 14%, transparent);
   padding: 1px 5px;
   border-radius: 3px;
 }
@@ -523,6 +619,12 @@ const displayTypeHint = (() => {
   gap: 3px;
 }
 
+.vector-compact {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
 .vector-label {
   font-weight: 600;
   font-size: 10px;
@@ -531,12 +633,37 @@ const displayTypeHint = (() => {
   min-width: 10px;
 }
 
-.vector-comp .val-name.vec-before {
+.vector-comp .val-name.vec-before,
+.vector-compact .val-name.vec-before {
   color: var(--text-secondary);
 }
 
 .vector-comp .field-arrow {
   margin: 0 1px;
+}
+
+.vector-mode-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 38px;
+  height: 18px;
+  padding: 0 6px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 10px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.vector-mode-toggle:hover,
+.vector-mode-toggle:focus-visible {
+  border-color: var(--border-color);
+  background: color-mix(in srgb, var(--hover-bg) 68%, transparent);
+  color: var(--text-color);
+  outline: none;
 }
 
 /* ── Stale reference indicator ── */

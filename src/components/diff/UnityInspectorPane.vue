@@ -378,7 +378,15 @@ function gameObjectFieldLabel(propertyPath: string, fallback: string): string {
 .unity-inspector-pane {
   height: 100%;
   overflow: auto;
-  background: var(--bg-color);
+  background: var(--panel-bg);
+  --unity-inspector-surface: color-mix(in srgb, var(--panel-bg) 92%, var(--bg-color) 8%);
+  --unity-inspector-divider: color-mix(in srgb, var(--border-color) 78%, transparent);
+  --unity-component-row-bg: color-mix(in srgb, var(--hover-bg) 72%, var(--sidebar-bg) 28%);
+  --unity-component-row-hover-bg: color-mix(in srgb, var(--hover-bg) 84%, var(--active-bg) 16%);
+  --unity-field-section-bg: color-mix(in srgb, var(--sidebar-bg) 62%, var(--panel-bg) 38%);
+  --unity-field-row-bg: color-mix(in srgb, var(--panel-bg) 88%, var(--bg-color) 12%);
+  --unity-field-group-row-bg: color-mix(in srgb, var(--panel-bg) 78%, var(--bg-color) 22%);
+  --unity-field-row-hover-bg: color-mix(in srgb, var(--hover-bg) 64%, var(--panel-bg) 36%);
 }
 
 /* ── Toolbar ── */
@@ -400,7 +408,7 @@ function gameObjectFieldLabel(propertyPath: string, fallback: string): string {
   padding: 4px 10px;
   border: 1px solid var(--border-color);
   border-radius: 6px;
-  background: var(--bg-secondary);
+  background: color-mix(in srgb, var(--panel-bg) 80%, var(--bg-color) 20%);
   color: var(--text-secondary);
   font-size: 11px;
   cursor: pointer;
@@ -425,7 +433,7 @@ function gameObjectFieldLabel(propertyPath: string, fallback: string): string {
 }
 
 .inspector-state.error {
-  color: #f56565;
+  color: var(--status-danger-fg);
 }
 
 /* ── Body ── */
@@ -433,7 +441,7 @@ function gameObjectFieldLabel(propertyPath: string, fallback: string): string {
   display: flex;
   flex-direction: column;
   gap: 1px;
-  background: var(--bg-secondary);
+  background: var(--unity-inspector-divider);
 }
 
 /* ── Inspector header — like Unity's top bar showing the object ── */
@@ -442,8 +450,8 @@ function gameObjectFieldLabel(propertyPath: string, fallback: string): string {
   align-items: center;
   gap: 10px;
   padding: 10px 14px;
-  background: var(--bg-color);
-  border-bottom: 1px solid var(--border-color);
+  background: var(--unity-inspector-surface);
+  border-bottom: 1px solid var(--unity-inspector-divider);
 }
 
 .inspector-header.unity-layout {
@@ -457,7 +465,7 @@ function gameObjectFieldLabel(propertyPath: string, fallback: string): string {
   align-items: center;
   justify-content: center;
   border-radius: 6px;
-  background: var(--bg-tertiary);
+  background: color-mix(in srgb, var(--sidebar-bg) 64%, var(--panel-bg) 36%);
   color: var(--text-secondary);
   font-size: 14px;
   flex-shrink: 0;
@@ -515,12 +523,12 @@ function gameObjectFieldLabel(propertyPath: string, fallback: string): string {
   flex-shrink: 0;
   border: 1px solid color-mix(in srgb, var(--border-color) 88%, var(--text-secondary));
   border-radius: 4px;
-  background: color-mix(in srgb, var(--bg-secondary) 70%, var(--bg-color));
+  background: color-mix(in srgb, var(--input-bg) 70%, var(--panel-bg) 30%);
 }
 
 .unity-active-toggle.inactive,
 .unity-active-toggle.unknown {
-  background: var(--bg-color);
+  background: var(--panel-bg);
 }
 
 .unity-active-check {
@@ -550,7 +558,7 @@ function gameObjectFieldLabel(propertyPath: string, fallback: string): string {
   padding: 5px 8px;
   border: 1px solid color-mix(in srgb, var(--border-color) 88%, var(--bg-color));
   border-radius: 6px;
-  background: color-mix(in srgb, var(--bg-secondary) 48%, var(--bg-color));
+  background: color-mix(in srgb, var(--input-bg) 72%, var(--panel-bg) 28%);
   font-size: 12.5px;
   font-weight: 600;
   color: var(--text-color);
@@ -603,7 +611,7 @@ function gameObjectFieldLabel(propertyPath: string, fallback: string): string {
   padding: 5px 8px;
   border: 1px solid color-mix(in srgb, var(--border-color) 88%, var(--bg-color));
   border-radius: 6px;
-  background: color-mix(in srgb, var(--bg-secondary) 44%, var(--bg-color));
+  background: color-mix(in srgb, var(--input-bg) 72%, var(--panel-bg) 28%);
   font-size: 12px;
   color: var(--text-color);
   white-space: nowrap;
@@ -624,7 +632,7 @@ function gameObjectFieldLabel(propertyPath: string, fallback: string): string {
 
 /* ── Panel card ── */
 .panel-card {
-  background: var(--bg-color);
+  background: var(--unity-inspector-surface);
 }
 
 /* ── Panel header — Unity gray component bar ── */
@@ -634,13 +642,13 @@ function gameObjectFieldLabel(propertyPath: string, fallback: string): string {
   align-items: center;
   gap: 8px;
   padding: 7px 12px;
-  background: var(--bg-tertiary);
-  border-bottom: 1px solid var(--border-color);
+  background: var(--unity-component-row-bg);
+  border-bottom: 1px solid var(--unity-inspector-divider);
   cursor: pointer;
 }
 
 .panel-header:hover {
-  background: var(--bg-hover);
+  background: var(--unity-component-row-hover-bg);
 }
 
 /* Left change bar on panel */
@@ -744,7 +752,7 @@ function gameObjectFieldLabel(propertyPath: string, fallback: string): string {
   color: var(--text-secondary);
   padding: 1px 6px;
   border-radius: 4px;
-  background: var(--bg-secondary);
+  background: color-mix(in srgb, var(--panel-bg) 72%, var(--hover-bg) 28%);
   flex-shrink: 0;
 }
 
@@ -775,7 +783,8 @@ function gameObjectFieldLabel(propertyPath: string, fallback: string): string {
 
 /* ── Panel body ── */
 .panel-body {
-  border-bottom: 1px solid var(--border-color);
+  background: var(--unity-field-row-bg);
+  border-bottom: 1px solid var(--unity-inspector-divider);
 }
 
 .panel-empty {
