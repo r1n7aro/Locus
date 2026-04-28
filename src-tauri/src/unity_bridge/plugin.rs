@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
@@ -17,6 +18,13 @@ pub enum PluginStatus {
 const PLUGIN_DEFAULT_INSTALL_DIR: &str = "Packages/com.farlocus.locus";
 const PLUGIN_ASMDEF_NAME: &str = "Locus.Editor.asmdef";
 const PLUGIN_HASH_FILE: &str = ".locus_plugin_hash";
+const PLUGIN_LEGACY_ASSETS_INSTALL_DIRS: &[&str] = &["Assets/Locus", "Assets/Plugins/Locus"];
+const PLUGIN_REQUIRED_SOURCE_FILES: &[&str] = &[
+    "package.json",
+    "Editor/Locus.Editor.asmdef",
+    "Editor/Roslyn/Locus.Roslyn.dll",
+    "Editor/Roslyn/Locus.Roslyn.dll.meta",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PluginInstallLocation {
@@ -77,6 +85,28 @@ fn expected_install_dir(project_path: &Path) -> PathBuf {
     project_path.join(PLUGIN_DEFAULT_INSTALL_DIR)
 }
 
+fn plugin_meta_path(path: &Path) -> PathBuf {
+    let mut meta = path.as_os_str().to_os_string();
+    meta.push(".meta");
+    PathBuf::from(meta)
+}
+
+fn plugin_dir_or_meta_exists(path: &Path) -> bool {
+    path.exists() || plugin_meta_path(path).exists()
+}
+
+fn push_installed_plugin_dir(
+    results: &mut Vec<InstalledPluginDir>,
+    seen: &mut BTreeSet<String>,
+    root: PathBuf,
+    location: PluginInstallLocation,
+) {
+    let key = normalize_path_key(&root);
+    if seen.insert(key) {
+        results.push(InstalledPluginDir { root, location });
+    }
+}
+
 fn find_installed_plugin_dirs(project_path: &Path) -> Vec<InstalledPluginDir> {
     let search_roots = [
         (
@@ -88,6 +118,23 @@ fn find_installed_plugin_dirs(project_path: &Path) -> Vec<InstalledPluginDir> {
 
     let mut results = Vec::new();
     let mut seen = BTreeSet::new();
+
+    let expected_dir = expected_install_dir(project_path);
+    if plugin_dir_or_meta_exists(&expected_dir) {
+        push_installed_plugin_dir(
+            &mut results,
+            &mut seen,
+            expected_dir,
+            PluginInstallLocation::Packages,
+        );
+    }
+
+    for legacy_dir in PLUGIN_LEGACY_ASSETS_INSTALL_DIRS {
+        let root = project_path.join(legacy_dir);
+        if plugin_dir_or_meta_exists(&root) {
+            push_installed_plugin_dir(&mut results, &mut seen, root, PluginInstallLocation::Assets);
+        }
+    }
 
     for (search_root, location) in search_roots {
         if !search_root.is_dir() {
@@ -116,13 +163,7 @@ fn find_installed_plugin_dirs(project_path: &Path) -> Vec<InstalledPluginDir> {
                 continue;
             }
 
-            let key = normalize_path_key(plugin_root);
-            if seen.insert(key) {
-                results.push(InstalledPluginDir {
-                    root: plugin_root.to_path_buf(),
-                    location,
-                });
-            }
+            push_installed_plugin_dir(&mut results, &mut seen, plugin_root.to_path_buf(), location);
         }
     }
 
@@ -135,7 +176,7 @@ fn remove_plugin_dir(path: &Path) -> Result<(), String> {
             .map_err(|e| format!("Failed to remove old plugin directory: {}", e))?;
     }
 
-    let meta_path = PathBuf::from(format!("{}.meta", path.display()));
+    let meta_path = plugin_meta_path(path);
     if meta_path.exists() {
         std::fs::remove_file(&meta_path).map_err(|e| {
             format!(
@@ -149,9 +190,55 @@ fn remove_plugin_dir(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn plugin_source_rel_key(source_dir: &Path, path: &Path) -> Result<String, String> {
+    let rel_path = path
+        .strip_prefix(source_dir)
+        .map_err(|e| format!("strip_prefix failed: {}", e))?;
+    Ok(rel_path.to_string_lossy().replace('\\', "/"))
+}
+
+fn should_skip_plugin_source_entry(source_dir: &Path, path: &Path) -> bool {
+    let Ok(rel) = plugin_source_rel_key(source_dir, path) else {
+        return false;
+    };
+
+    if rel.is_empty() {
+        return false;
+    }
+
+    if rel == PLUGIN_HASH_FILE {
+        return true;
+    }
+
+    if rel.starts_with("Editor/Roslyn/ILRepack-") {
+        return true;
+    }
+
+    rel.starts_with("Editor/Roslyn/Locus.Roslyn.dll.")
+        && rel != "Editor/Roslyn/Locus.Roslyn.dll.meta"
+}
+
+fn validate_plugin_source_dir(source_dir: &Path) -> Result<(), String> {
+    let missing = PLUGIN_REQUIRED_SOURCE_FILES
+        .iter()
+        .filter(|rel| !source_dir.join(rel).is_file())
+        .map(|rel| source_dir.join(rel).display().to_string())
+        .collect::<Vec<_>>();
+
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    Err(format!(
+        "Locus Unity plugin source is incomplete. Missing required file(s): {}",
+        missing.join(", ")
+    ))
+}
+
 fn copy_plugin_dir(source_dir: &Path, install_dir: &Path) -> Result<(), String> {
     for entry in walkdir::WalkDir::new(source_dir)
         .into_iter()
+        .filter_entry(|e| !should_skip_plugin_source_entry(source_dir, e.path()))
         .filter_map(|e| e.ok())
     {
         let rel = entry
@@ -177,6 +264,22 @@ fn copy_plugin_dir(source_dir: &Path, install_dir: &Path) -> Result<(), String> 
     Ok(())
 }
 
+fn unique_staging_dir(project_path: &Path) -> PathBuf {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+
+    project_path
+        .join("Temp")
+        .join("LocusPluginInstall")
+        .join(format!(
+            "com.farlocus.locus-{}-{}",
+            std::process::id(),
+            timestamp
+        ))
+}
+
 fn check_plugin_status_with_source_dir(
     source_dir: &Path,
     project_path: &Path,
@@ -190,6 +293,8 @@ fn check_plugin_status_with_source_dir(
         );
         return Ok(PluginStatus::Missing);
     }
+
+    validate_plugin_source_dir(source_dir)?;
 
     if installed_dirs.len() > 1 {
         eprintln!(
@@ -240,8 +345,36 @@ fn install_or_update_plugin_with_source_dir(
     source_dir: &Path,
     project_path: &Path,
 ) -> Result<String, String> {
+    validate_plugin_source_dir(source_dir)?;
+
     let install_dir = expected_install_dir(project_path);
     let installed_dirs = find_installed_plugin_dirs(project_path);
+    let staging_dir = unique_staging_dir(project_path);
+    if let Some(parent) = staging_dir.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            format!(
+                "Failed to create plugin staging directory {}: {}",
+                parent.display(),
+                e
+            )
+        })?;
+    }
+    if staging_dir.exists() {
+        std::fs::remove_dir_all(&staging_dir).map_err(|e| {
+            format!(
+                "Failed to remove stale plugin staging directory {}: {}",
+                staging_dir.display(),
+                e
+            )
+        })?;
+    }
+
+    copy_plugin_dir(source_dir, &staging_dir)?;
+    validate_plugin_source_dir(&staging_dir)?;
+
+    let hash = compute_dir_hash(source_dir)?;
+    std::fs::write(staging_dir.join(PLUGIN_HASH_FILE), &hash)
+        .map_err(|e| format!("Failed to write staged hash file: {}", e))?;
 
     for dir in installed_dirs {
         remove_plugin_dir(&dir.root)?;
@@ -251,11 +384,17 @@ fn install_or_update_plugin_with_source_dir(
         remove_plugin_dir(&install_dir)?;
     }
 
-    copy_plugin_dir(source_dir, &install_dir)?;
-
-    let hash = compute_dir_hash(source_dir)?;
-    std::fs::write(install_dir.join(PLUGIN_HASH_FILE), &hash)
-        .map_err(|e| format!("Failed to write hash file: {}", e))?;
+    if let Some(parent) = install_dir.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create directory {}: {}", parent.display(), e))?;
+    }
+    std::fs::rename(&staging_dir, &install_dir).map_err(|e| {
+        format!(
+            "Failed to move staged plugin into {}: {}",
+            install_dir.display(),
+            e
+        )
+    })?;
 
     eprintln!(
         "[Locus] locus_unity plugin installed/updated at: {}",
@@ -269,17 +408,11 @@ fn compute_dir_hash(dir: &std::path::Path) -> Result<String, String> {
 
     for entry in walkdir::WalkDir::new(dir)
         .into_iter()
+        .filter_entry(|e| !should_skip_plugin_source_entry(dir, e.path()))
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
     {
-        if entry.file_name() == PLUGIN_HASH_FILE {
-            continue;
-        }
-        let rel_path = entry
-            .path()
-            .strip_prefix(dir)
-            .map_err(|e| format!("strip_prefix failed: {}", e))?;
-        let rel = rel_path.to_string_lossy().replace('\\', "/");
+        let rel = plugin_source_rel_key(dir, entry.path())?;
         let content = std::fs::read(entry.path()).map_err(|e| format!("read {}: {}", rel, e))?;
         entries.push((rel, content));
     }
@@ -347,6 +480,16 @@ mod tests {
         std::fs::write(path, contents).unwrap();
     }
 
+    fn create_minimal_plugin_source(source_root: &Path) {
+        write_file(&source_root.join("package.json"), b"{}");
+        write_file(&source_root.join("Editor/Locus.Editor.asmdef"), b"{}");
+        write_file(&source_root.join("Editor/Roslyn/Locus.Roslyn.dll"), b"dll");
+        write_file(
+            &source_root.join("Editor/Roslyn/Locus.Roslyn.dll.meta"),
+            b"meta",
+        );
+    }
+
     #[test]
     fn missing_when_plugin_is_not_installed() {
         let temp = tempfile::tempdir().unwrap();
@@ -411,6 +554,82 @@ mod tests {
 
         let status = check_plugin_status_with_source_dir(&source_dir, temp.path()).unwrap();
         assert!(matches!(status, PluginStatus::Outdated));
+    }
+
+    #[test]
+    fn stale_assets_plugins_locus_skeleton_is_removed_on_install() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_dir = fixture_source_dir();
+        create_unity_project(temp.path());
+
+        write_file(
+            &temp.path().join("Assets/Plugins/Locus.meta"),
+            b"legacy-meta",
+        );
+        write_file(
+            &temp.path().join("Assets/Plugins/Locus/Editor.meta"),
+            b"legacy-editor-meta",
+        );
+        write_file(
+            &temp.path().join("Assets/Plugins/Locus/Editor/Roslyn.meta"),
+            b"legacy-roslyn-meta",
+        );
+
+        install_or_update_plugin_with_source_dir(&source_dir, temp.path()).unwrap();
+
+        assert!(!temp.path().join("Assets/Plugins/Locus").exists());
+        assert!(!temp.path().join("Assets/Plugins/Locus.meta").exists());
+        assert!(temp
+            .path()
+            .join("Packages/com.farlocus.locus/package.json")
+            .is_file());
+    }
+
+    #[test]
+    fn install_rejects_incomplete_source_without_merged_roslyn() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = tempfile::tempdir().unwrap();
+        create_unity_project(temp.path());
+
+        write_file(&source.path().join("package.json"), b"{}");
+        write_file(&source.path().join("Editor/Locus.Editor.asmdef"), b"{}");
+        write_file(
+            &source.path().join("Editor/Roslyn/Locus.Roslyn.dll.meta"),
+            b"meta",
+        );
+
+        let error =
+            install_or_update_plugin_with_source_dir(source.path(), temp.path()).unwrap_err();
+        assert!(error.contains("Locus.Roslyn.dll"));
+        assert!(!temp.path().join("Packages/com.farlocus.locus").exists());
+    }
+
+    #[test]
+    fn copy_plugin_dir_skips_ilrepack_temp_artifacts() {
+        let source = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+
+        create_minimal_plugin_source(source.path());
+        write_file(
+            &source.path().join("Editor/Roslyn/ILRepack-123456/temp.dll"),
+            b"temp",
+        );
+        write_file(
+            &source.path().join("Editor/Roslyn/Locus.Roslyn.dll.tmp"),
+            b"temp",
+        );
+
+        copy_plugin_dir(source.path(), target.path()).unwrap();
+
+        assert!(target
+            .path()
+            .join("Editor/Roslyn/Locus.Roslyn.dll")
+            .is_file());
+        assert!(!target.path().join("Editor/Roslyn/ILRepack-123456").exists());
+        assert!(!target
+            .path()
+            .join("Editor/Roslyn/Locus.Roslyn.dll.tmp")
+            .exists());
     }
 
     #[test]

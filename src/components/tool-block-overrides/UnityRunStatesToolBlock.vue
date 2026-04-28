@@ -94,16 +94,15 @@ const runtimeProgressSummary = computed(() => {
   if (!runtime) return "";
   const parts: string[] = [];
   if (runtime.currentState) {
-    parts.push(`${t("tool.unityRunStates.currentState")} ${runtime.currentState}`);
-  }
-  if (runtime.promptText) {
-    parts.push(`${t("tool.unityRunStates.userPrompt")} ${runtime.promptText}`);
+    parts.push(runtime.currentState);
   }
   if (runtime.isFinal && runtime.printCount > 0) {
     parts.push(t("tool.unityRunStates.printCount", runtime.printCount));
   }
   return parts.join(" · ");
 });
+
+const runtimePromptText = computed(() => runtimePreview.value?.promptText.trim() ?? "");
 
 const printFallback = computed(() =>
   props.toolCall.status === "running"
@@ -113,9 +112,10 @@ const printFallback = computed(() =>
 
 const showFinalSections = computed(() => props.toolCall.status !== "running");
 const hasInfoDetail = computed(() => showFinalSections.value);
-const headerSummary = computed(() => (showFinalSections.value ? runtimeProgressSummary.value : ""));
+const headerSummary = computed(() => runtimeProgressSummary.value);
 const showRuntimeProgressLine = computed(() => props.toolCall.status === "running" && Boolean(runtimePreview.value));
 const isFramed = computed(() => infoExpanded.value || showRuntimeProgressLine.value);
+const showRuntimePromptText = computed(() => props.toolCall.status === "running" && Boolean(runtimePromptText.value));
 const showRuntimePrintFallback = computed(() => showRuntimeProgressLine.value && !showRuntimePrintText.value);
 </script>
 
@@ -138,7 +138,7 @@ const showRuntimePrintFallback = computed(() => showRuntimeProgressLine.value &&
 
     <div v-if="showRuntimeProgressLine" class="tool-call-progress-line" aria-live="polite">
       <div class="unity-run-progress">
-        <div v-if="runtimeProgressSummary" class="unity-run-progress-summary">{{ runtimeProgressSummary }}</div>
+        <div v-if="showRuntimePromptText" class="unity-run-prompt-text ui-select-text">{{ runtimePromptText }}</div>
         <pre v-if="showRuntimePrintText" class="unity-run-print-text ui-select-text">{{ runtimePreview?.printText ?? "" }}</pre>
         <div v-else-if="showRuntimePrintFallback" class="unity-run-empty">{{ printFallback }}</div>
       </div>
@@ -345,14 +345,13 @@ const showRuntimePrintFallback = computed(() => showRuntimeProgressLine.value &&
   background: transparent;
 }
 
-.unity-run-progress-summary {
+.unity-run-prompt-text {
   min-width: 0;
-  color: var(--text-secondary);
+  color: var(--text-color);
   font-size: 12px;
-  line-height: 1.4;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .unity-run-print-text {

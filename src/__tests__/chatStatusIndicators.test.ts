@@ -22,12 +22,18 @@ describe("chat status indicators", () => {
     expect(chatView).toContain(':unity-plugin-status="unityPluginStatus"');
     expect(chatView).toContain(':unity-plugin-installing="unityPluginInstalling"');
     expect(chatView).toContain('@install-plugin="emit(\'installPlugin\')"');
+    expect(chatView).toContain('@launch-unity-project="emit(\'launchUnityProject\')"');
+    expect(chatView).toContain(':unity-launching="unityLaunching"');
+    expect(chatView).toContain(':unity-launch-state="unityLaunchState"');
     expect(chatView).toContain("workingDir?: string;");
     expect(chatView).toContain(':working-dir="workingDir"');
     expect(workspace).toContain(':working-dir="projectStore.workingDir"');
     expect(workspace).toContain(':unity-plugin-status="projectStore.pluginToast"');
     expect(workspace).toContain(':unity-plugin-installing="projectStore.pluginInstalling"');
+    expect(workspace).toContain(':unity-launching="projectStore.unityLaunching"');
+    expect(workspace).toContain(':unity-launch-state="projectStore.unityLaunchState"');
     expect(workspace).toContain('@install-plugin="projectStore.installPlugin"');
+    expect(workspace).toContain('@launch-unity-project="projectStore.launchUnityProject"');
     expect(sessionPanel).not.toContain("sp-unity-status");
     expect(sessionPanel).not.toContain("sp-scan-status");
     expect(indicators).toContain('id: "assetDb"');
@@ -74,9 +80,43 @@ describe("chat status indicators", () => {
 
     expect(indicators).toContain('unityPluginStatus?: UnityPluginNotice | null;');
     expect(indicators).toContain('if (props.unityPluginStatus === "outdated") return t("app.plugin.needUpdate");');
-    expect(indicators).toContain('props.unityPluginStatus ? "danger" : props.unityConnected ? "success" : "danger"');
+    expect(indicators).toContain('props.unityPluginStatus');
+    expect(indicators).toContain('? "danger"');
+    expect(indicators).toContain(': props.unityConnected');
     expect(indicators).toContain('props.unityPluginStatus === "missing"');
     expect(indicators).toContain('emit("installPlugin");');
+    expect(indicators).toContain('emit("launchUnityProject");');
     expect(indicators).toContain('@click="runStatusAction(activeItem)"');
+  });
+
+  it("offers a launch action when the Unity plugin is ready and the editor is disconnected", () => {
+    const indicators = read("src/components/chat/ChatStatusIndicators.vue");
+    const projectStore = read("src/stores/project.ts");
+    const unityService = read("src/services/unity.ts");
+    const bootstrap = read("src/composables/useAppBootstrap.ts");
+    const zh = read("src/language/zh.json");
+
+    expect(indicators).toContain("unityLaunching?: boolean;");
+    expect(indicators).toContain('type UnityLaunchState = "idle" | "starting" | "waitingConnection";');
+    expect(indicators).toContain("unityLaunchState?: UnityLaunchState;");
+    expect(indicators).toContain('const unityCanLaunch = computed(() =>');
+    expect(indicators).toContain('!props.unityConnected && !props.unityPluginStatus');
+    expect(indicators).toContain('const effectiveUnityLaunchState = computed<UnityLaunchState>(() =>');
+    expect(indicators).toContain('if (effectiveUnityLaunchState.value === "starting") return t("chat.unity.launching");');
+    expect(indicators).toContain('return t("chat.status.unity.waitingConnection");');
+    expect(indicators).toContain(':variant="activeItem.actionVariant"');
+    expect(indicators).toContain('actionVariant: props.unityPluginStatus ? "neutral" : "primary"');
+    expect(projectStore).toContain('const unityLaunchState = ref<UnityLaunchState>("idle");');
+    expect(projectStore).toContain('const unityLaunching = computed(() => unityLaunchState.value === "starting");');
+    expect(projectStore).toContain("async function launchUnityProject()");
+    expect(projectStore).toContain("await unityService.launchUnityProject();");
+    expect(projectStore).toContain('unityLaunchState.value = "starting";');
+    expect(projectStore).toContain('unityLaunchState.value = "waitingConnection";');
+    expect(projectStore).toContain("function handleUnityConnectionStatus(connected: boolean)");
+    expect(bootstrap).toContain("projectStore.handleUnityConnectionStatus(payload);");
+    expect(unityService).toContain('return ipcInvoke<UnityLaunchResult>("launch_unity_project");');
+    expect(zh).toContain('"chat.status.unity.launch": "启动"');
+    expect(zh).toContain('"chat.status.unity.waitingConnection": "等待连接"');
+    expect(zh).toContain('"chat.status.unity.launchTitle": "启动 Unity 项目"');
   });
 });

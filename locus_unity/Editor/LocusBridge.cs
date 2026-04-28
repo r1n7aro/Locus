@@ -907,6 +907,9 @@ namespace Locus
                     case "run_states":
                         return await HandleRunStates(reqId, msg.message);
 
+                    case "compile_run_states":
+                        return await HandleCompileRunStates(reqId, msg.message);
+
                     case "request_recompile":
                     {
                         PostToMainThread(delegate

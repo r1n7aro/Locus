@@ -135,6 +135,24 @@ pub(super) fn unity_run_states() -> ToolDef {
                     }
                 };
 
+                let (connected, _actual_status, _) =
+                    crate::unity_bridge::query_unity_status(&project_path).await;
+                if !connected {
+                    return ToolResult {
+                        output: "Unity Editor not connected".to_string(),
+                        is_error: true,
+                    };
+                }
+
+                if let Err(error) =
+                    crate::unity_bridge::compile_run_states(&project_path, &args).await
+                {
+                    return ToolResult {
+                        output: error,
+                        is_error: true,
+                    };
+                }
+
                 let (connected, actual_status, _) =
                     crate::unity_bridge::query_unity_status(&project_path).await;
                 if !connected {

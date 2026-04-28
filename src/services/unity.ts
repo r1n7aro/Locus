@@ -21,6 +21,16 @@ export function installUnityPlugin(): Promise<string> {
   return ipcInvoke<string>("install_unity_plugin");
 }
 
+export interface UnityLaunchResult {
+  editorPath: string;
+  projectPath: string;
+  projectVersion: string;
+}
+
+export function launchUnityProject(): Promise<UnityLaunchResult> {
+  return ipcInvoke<UnityLaunchResult>("launch_unity_project");
+}
+
 export interface SelectUnityAssetOptions {
   focusProjectWindow?: boolean;
 }

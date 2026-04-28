@@ -390,7 +390,7 @@ export function useAppBootstrap() {
       void maybeNotifyStreamEvent(payload, { sessionTitle });
     });
     unlistenUnity = await runtime.subscribe<boolean>("unity-connection-status", (payload) => {
-      projectStore.unityConnected = payload;
+      projectStore.handleUnityConnectionStatus(payload);
       if (payload) {
         console.log("[Locus] Unity Editor connected!");
       } else {

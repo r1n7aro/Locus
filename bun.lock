@@ -13,6 +13,7 @@
         "@types/turndown": "^5.0.6",
         "ag-psd": "^30.1.0",
         "highlight.js": "^11.11.1",
+        "lucide": "^1.11.0",
         "marked": "^17.0.4",
         "marked-highlight": "^2.2.3",
         "pinia": "^3.0.4",
@@ -325,6 +326,8 @@
     "is-what": ["is-what@5.5.0", "https://registry.npmmirror.com/is-what/-/is-what-5.5.0.tgz", {}, "sha512-oG7cgbmg5kLYae2N5IVd3jm2s+vldjxJzK1pcu9LfpGuQ93MQSzo0okvRna+7y5ifrD+20FE8FvjusyGaz14fw=="],
 
     "jiti": ["jiti@1.21.7", "https://registry.npmmirror.com/jiti/-/jiti-1.21.7.tgz", { "bin": { "jiti": "bin/jiti.js" } }, "sha512-/imKNG4EbWNrVjoNC/1H5/9GFy+tqjGBHCaSsN+P2RnPqjsLmv6UD3Ej+Kj8nBWaRAwyk7kK5ZUc+OEatnTR3A=="],
+
+    "lucide": ["lucide@1.11.0", "https://registry.npmmirror.com/lucide/-/lucide-1.11.0.tgz", {}, "sha512-2uvbGlcztUY+z0Ef++YCaxD6mtzrPsUJ1qWbIfqZrZGRxZBCL3icE6g2nzRTtJ6YywOoXC5blL/NmkLI66en5g=="],
 
     "magic-string": ["magic-string@0.30.21", "https://registry.npmmirror.com/magic-string/-/magic-string-0.30.21.tgz", { "dependencies": { "@jridgewell/sourcemap-codec": "^1.5.5" } }, "sha512-vd2F4YUyEXKGcLHoq+TEyCjxueSeHnFxyyjNp80yg0XV4vUhnDer/lvvlqM/arB5bXQN5K2/3oinyCRyx8T2CQ=="],
 

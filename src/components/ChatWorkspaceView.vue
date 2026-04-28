@@ -377,6 +377,8 @@ onUnmounted(() => {
       :unity-connected="projectStore.unityConnected"
       :unity-plugin-status="projectStore.pluginToast"
       :unity-plugin-installing="projectStore.pluginInstalling"
+      :unity-launching="projectStore.unityLaunching"
+      :unity-launch-state="projectStore.unityLaunchState"
       :working-dir="projectStore.workingDir"
       :scan-phase="projectStore.scanPhase"
       :last-scan-stats="projectStore.lastScanStats"
@@ -401,6 +403,7 @@ onUnmounted(() => {
       @delete-session="chatStore.deleteSession"
       @start-scan="projectStore.startScan"
       @install-plugin="projectStore.installPlugin"
+      @launch-unity-project="projectStore.launchUnityProject"
       @layout-mode-change="handleLayoutModeChange"
     />
     <ThinkingPanel

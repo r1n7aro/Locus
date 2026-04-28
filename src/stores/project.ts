@@ -9,8 +9,11 @@ import { t } from "../i18n";
 import type { AssetDbOverview, AssetDbScanEvent, ScanStats, PluginStatus } from "../types";
 
 type PluginNoticeStatus = "missing" | "outdated";
+export type UnityLaunchState = "idle" | "starting" | "waitingConnection";
 
 const PLUGIN_STATUS_NOTICE_OPERATION = "unity-plugin-status";
+const UNITY_LAUNCH_CONNECTION_POLL_MS = 1500;
+const UNITY_LAUNCH_WAIT_TIMEOUT_MS = 120_000;
 
 export const useProjectStore = defineStore("project", () => {
   const workingDir = ref("");
@@ -20,7 +23,11 @@ export const useProjectStore = defineStore("project", () => {
   const lastScanStats = ref<ScanStats | null>(null);
   const pluginToast = ref<"missing" | "outdated" | null>(null);
   const pluginInstalling = ref(false);
+  const unityLaunchState = ref<UnityLaunchState>("idle");
+  const unityLaunching = computed(() => unityLaunchState.value === "starting");
   let scanInFlight = false;
+  let unityLaunchPollTimer: ReturnType<typeof globalThis.setTimeout> | null = null;
+  let unityLaunchWaitStartedAt = 0;
 
   const isUnityProject = computed(() => workingDir.value.length > 0);
 
@@ -44,6 +51,51 @@ export const useProjectStore = defineStore("project", () => {
 
   function isScanRunning(phase: AssetDbScanEvent | null): boolean {
     return phase != null && phase.phase !== "done" && phase.phase !== "error";
+  }
+
+  function clearUnityLaunchPoll() {
+    if (unityLaunchPollTimer) {
+      globalThis.clearTimeout(unityLaunchPollTimer);
+      unityLaunchPollTimer = null;
+    }
+    unityLaunchWaitStartedAt = 0;
+  }
+
+  function resetUnityLaunchState() {
+    clearUnityLaunchPoll();
+    unityLaunchState.value = "idle";
+  }
+
+  function setUnityConnected(connected: boolean) {
+    unityConnected.value = connected;
+    if (connected) {
+      resetUnityLaunchState();
+    }
+  }
+
+  function scheduleUnityLaunchConnectionCheck(delayMs = UNITY_LAUNCH_CONNECTION_POLL_MS) {
+    if (unityLaunchPollTimer) {
+      globalThis.clearTimeout(unityLaunchPollTimer);
+    }
+    unityLaunchPollTimer = globalThis.setTimeout(() => {
+      unityLaunchPollTimer = null;
+      void checkUnityConnectionAfterLaunch();
+    }, delayMs);
+  }
+
+  async function checkUnityConnectionAfterLaunch() {
+    await checkUnityConnection();
+    if (unityConnected.value || unityLaunchState.value !== "waitingConnection") return;
+
+    if (
+      unityLaunchWaitStartedAt > 0
+      && Date.now() - unityLaunchWaitStartedAt >= UNITY_LAUNCH_WAIT_TIMEOUT_MS
+    ) {
+      resetUnityLaunchState();
+      return;
+    }
+
+    scheduleUnityLaunchConnectionCheck();
   }
 
   function minimalStatsFromOverview(overview: AssetDbOverview): ScanStats {
@@ -81,6 +133,7 @@ export const useProjectStore = defineStore("project", () => {
 
   async function setWorkingDir(path: string): Promise<string> {
     const result = await projectService.setWorkingDir(path);
+    resetUnityLaunchState();
     workingDir.value = result;
     scanPhase.value = null;
     lastScanStats.value = null;
@@ -118,9 +171,9 @@ export const useProjectStore = defineStore("project", () => {
 
   async function checkUnityConnection() {
     try {
-      unityConnected.value = await unityService.checkUnityConnection();
+      setUnityConnected(await unityService.checkUnityConnection());
     } catch {
-      unityConnected.value = false;
+      setUnityConnected(false);
     }
   }
 
@@ -141,6 +194,31 @@ export const useProjectStore = defineStore("project", () => {
       console.error("install_unity_plugin failed:", e);
     } finally {
       pluginInstalling.value = false;
+    }
+  }
+
+  async function launchUnityProject() {
+    if (unityLaunchState.value !== "idle" || unityConnected.value) return;
+    clearUnityLaunchPoll();
+    unityLaunchState.value = "starting";
+    try {
+      await unityService.launchUnityProject();
+      if (unityConnected.value) {
+        resetUnityLaunchState();
+        return;
+      }
+      unityLaunchState.value = "waitingConnection";
+      unityLaunchWaitStartedAt = Date.now();
+      scheduleUnityLaunchConnectionCheck();
+    } catch (e) {
+      resetUnityLaunchState();
+      const err = normalizeAppError(e);
+      console.error("launch_unity_project failed:", err);
+      useNotificationStore().addNotice("error", t("app.unityLaunchFailed", err.message), {
+        code: err.code,
+        operation: "launch_unity_project",
+        skipConsoleLog: true,
+      });
     }
   }
 
@@ -192,6 +270,11 @@ export const useProjectStore = defineStore("project", () => {
     scanInFlight = false;
     setPluginToast(null);
     pluginInstalling.value = false;
+    resetUnityLaunchState();
+  }
+
+  function handleUnityConnectionStatus(connected: boolean) {
+    setUnityConnected(connected);
   }
 
   function handleScanEvent(event: AssetDbScanEvent) {
@@ -227,6 +310,8 @@ export const useProjectStore = defineStore("project", () => {
     lastScanStats,
     pluginToast,
     pluginInstalling,
+    unityLaunchState,
+    unityLaunching,
     isUnityProject,
     loadWorkingDir,
     setWorkingDir,
@@ -235,8 +320,10 @@ export const useProjectStore = defineStore("project", () => {
     checkUnityConnection,
     checkUnityPlugin,
     installPlugin,
+    launchUnityProject,
     loadAssetDbStatus,
     resetWorkspaceState,
+    handleUnityConnectionStatus,
     handleScanEvent,
     handlePluginStatus,
   };

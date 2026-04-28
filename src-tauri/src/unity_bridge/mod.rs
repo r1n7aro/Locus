@@ -38,6 +38,14 @@ pub struct PipeResponse {
 
 pub const UNITY_EXECUTE_PROGRESS_TAG: &str = "locus-unity-progress";
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnityLaunchResult {
+    pub editor_path: String,
+    pub project_path: String,
+    pub project_version: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UnityExecuteProgressSnapshot {
     #[serde(default)]
@@ -101,6 +109,250 @@ pub fn is_unity_project(path: &str) -> bool {
     p.join("Assets").is_dir() && p.join("ProjectSettings").is_dir()
 }
 
+pub fn read_project_unity_version(project_path: &str) -> Result<Option<String>, String> {
+    let version_path = Path::new(strip_extended_path_prefix(project_path))
+        .join("ProjectSettings")
+        .join("ProjectVersion.txt");
+    if !version_path.is_file() {
+        return Ok(None);
+    }
+
+    let content = std::fs::read_to_string(&version_path).map_err(|error| {
+        format!(
+            "Failed to read Unity project version file '{}': {}",
+            version_path.display(),
+            error
+        )
+    })?;
+
+    Ok(content.lines().find_map(|line| {
+        line.strip_prefix("m_EditorVersion:")
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    }))
+}
+
+fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if paths.iter().any(|existing| existing == &path) {
+        return;
+    }
+    paths.push(path);
+}
+
+fn push_editor_install_root_candidates(paths: &mut Vec<PathBuf>, root: PathBuf) {
+    #[cfg(target_os = "windows")]
+    {
+        push_unique_path(paths, root.join("Editor").join("Unity.exe"));
+        push_unique_path(paths, root.join("Unity.exe"));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        push_unique_path(
+            paths,
+            root.join("Unity.app")
+                .join("Contents")
+                .join("MacOS")
+                .join("Unity"),
+        );
+        push_unique_path(paths, root.join("Contents").join("MacOS").join("Unity"));
+    }
+
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    {
+        push_unique_path(paths, root.join("Editor").join("Unity"));
+        push_unique_path(paths, root.join("Unity"));
+    }
+}
+
+fn push_env_editor_candidates(paths: &mut Vec<PathBuf>) {
+    let Some(raw_path) = std::env::var_os("LOCUS_UNITY_EDITOR_PATH") else {
+        return;
+    };
+    let path = PathBuf::from(raw_path);
+    if path.is_file() {
+        push_unique_path(paths, path);
+    } else {
+        push_editor_install_root_candidates(paths, path);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn push_windows_registry_editor_candidates(paths: &mut Vec<PathBuf>, version: &str) {
+    use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
+    use winreg::RegKey;
+
+    let subkeys = [
+        format!(r"SOFTWARE\Unity Technologies\Installer\Unity {version}"),
+        format!(r"SOFTWARE\WOW6432Node\Unity Technologies\Installer\Unity {version}"),
+    ];
+    let hives = [
+        RegKey::predef(HKEY_CURRENT_USER),
+        RegKey::predef(HKEY_LOCAL_MACHINE),
+    ];
+
+    for hive in hives {
+        for subkey in &subkeys {
+            let Ok(key) = hive.open_subkey(subkey) else {
+                continue;
+            };
+            for value_name in ["Location x64", "Location"] {
+                let Ok(location) = key.get_value::<String, _>(value_name) else {
+                    continue;
+                };
+                let location = location.trim();
+                if !location.is_empty() {
+                    push_editor_install_root_candidates(paths, PathBuf::from(location));
+                }
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn push_windows_registry_editor_candidates(_paths: &mut Vec<PathBuf>, _version: &str) {}
+
+fn push_default_editor_candidates(paths: &mut Vec<PathBuf>, version: &str) {
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(program_files) = std::env::var_os("ProgramFiles") {
+            push_editor_install_root_candidates(
+                paths,
+                PathBuf::from(program_files)
+                    .join("Unity")
+                    .join("Hub")
+                    .join("Editor")
+                    .join(version),
+            );
+        }
+        if let Some(program_files_x86) = std::env::var_os("ProgramFiles(x86)") {
+            push_editor_install_root_candidates(
+                paths,
+                PathBuf::from(program_files_x86)
+                    .join("Unity")
+                    .join("Hub")
+                    .join("Editor")
+                    .join(version),
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        push_editor_install_root_candidates(
+            paths,
+            PathBuf::from("/Applications")
+                .join("Unity")
+                .join("Hub")
+                .join("Editor")
+                .join(version),
+        );
+        push_editor_install_root_candidates(paths, PathBuf::from("/Applications").join("Unity"));
+    }
+
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    {
+        if let Some(home_dir) = dirs::home_dir() {
+            push_editor_install_root_candidates(
+                paths,
+                home_dir
+                    .join("Unity")
+                    .join("Hub")
+                    .join("Editor")
+                    .join(version),
+            );
+        }
+        push_editor_install_root_candidates(
+            paths,
+            PathBuf::from("/opt")
+                .join("Unity")
+                .join("Hub")
+                .join("Editor")
+                .join(version),
+        );
+    }
+}
+
+pub fn resolve_unity_editor_executable(version: &str) -> Result<PathBuf, String> {
+    let version = version.trim();
+    if version.is_empty() {
+        return Err("Unity project version is empty".to_string());
+    }
+
+    let mut candidates = Vec::new();
+    push_env_editor_candidates(&mut candidates);
+    push_windows_registry_editor_candidates(&mut candidates, version);
+    push_default_editor_candidates(&mut candidates, version);
+
+    for candidate in &candidates {
+        if candidate.is_file() {
+            return Ok(candidate.clone());
+        }
+    }
+
+    let checked = candidates
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join("; ");
+    Err(format!(
+        "Unity Editor {} was not found. Checked: {}",
+        version, checked
+    ))
+}
+
+fn normalized_project_path_for_launch(project_path: &str) -> PathBuf {
+    let trimmed = strip_extended_path_prefix(project_path).trim();
+    dunce::canonicalize(trimmed).unwrap_or_else(|_| Path::new(trimmed).to_path_buf())
+}
+
+pub fn launch_project(project_path: &str) -> Result<UnityLaunchResult, String> {
+    if !is_unity_project(project_path) {
+        return Err("Current working directory is not a Unity project".to_string());
+    }
+
+    let project_version = read_project_unity_version(project_path)?
+        .ok_or_else(|| "Current Unity project is missing ProjectVersion.txt".to_string())?;
+    let editor_path = resolve_unity_editor_executable(&project_version)?;
+    let project_path = normalized_project_path_for_launch(project_path);
+
+    let mut command = std::process::Command::new(&editor_path);
+    command
+        .arg("-projectPath")
+        .arg(&project_path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    command.spawn().map_err(|error| {
+        format!(
+            "Failed to launch Unity Editor '{}': {}",
+            editor_path.display(),
+            error
+        )
+    })?;
+
+    eprintln!(
+        "[Locus] launched Unity Editor: editor='{}', project='{}'",
+        editor_path.display(),
+        project_path.display()
+    );
+
+    Ok(UnityLaunchResult {
+        editor_path: editor_path.display().to_string(),
+        project_path: project_path.display().to_string(),
+        project_version,
+    })
+}
+
 // ── Public API (cross-platform, routes through transport) ────────────
 
 pub fn normalize_editor_status(status: &str) -> &'static str {
@@ -127,6 +379,26 @@ pub fn is_play_mode_status(status: &str) -> bool {
         normalize_editor_status(status),
         UNITY_EDITOR_STATUS_PLAYING | UNITY_EDITOR_STATUS_PLAYING_PAUSED
     )
+}
+
+fn requested_run_states_editor_status(request: &serde_json::Value) -> Result<&str, String> {
+    let requested_status = request
+        .get("request_editor_status")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "Missing required parameter: request_editor_status".to_string())?;
+
+    if requested_status == UNITY_EDITOR_STATUS_DISCONNECTED
+        || !is_known_editor_status(requested_status)
+    {
+        return Err(format!(
+            "Invalid request_editor_status: '{}'. Allowed values: editing, playing, playing_paused.",
+            requested_status
+        ));
+    }
+
+    Ok(requested_status)
 }
 
 pub fn format_editor_status_for_prompt(status: &str) -> &'static str {
@@ -212,7 +484,6 @@ pub async fn select_scene_object(
 ) -> Result<(), String> {
     let op_lock = project_unity_op_lock(project_path).await;
     let _guard = op_lock.lock().await;
-    let _prev_foreground = focus::bring_unity_to_foreground();
     let payload = serde_json::to_string(&SceneObjectRequest {
         scene_path,
         object_path,
@@ -220,6 +491,7 @@ pub async fn select_scene_object(
     .map_err(|e| e.to_string())?;
     let resp = send_message(project_path, "select_scene_object", &payload).await?;
     if resp.ok {
+        let _ = focus::bring_unity_to_foreground();
         Ok(())
     } else {
         Err(resp
@@ -516,6 +788,8 @@ pub async fn unity_run_states(
     project_path: &str,
     request: &serde_json::Value,
 ) -> Result<String, String> {
+    requested_run_states_editor_status(request)?;
+
     let payload = serde_json::to_string(request)
         .map_err(|error| format!("Failed to serialize unity_run_states request: {}", error))?;
     let resp = send_message_without_timeout(project_path, "run_states", &payload).await?;
@@ -531,6 +805,28 @@ pub async fn unity_run_states(
         Ok(rewritten)
     } else {
         Err(rewritten)
+    }
+}
+
+pub async fn compile_run_states(
+    project_path: &str,
+    request: &serde_json::Value,
+) -> Result<String, String> {
+    requested_run_states_editor_status(request)?;
+
+    let payload = serde_json::to_string(request).map_err(|error| {
+        format!(
+            "Failed to serialize unity_run_states compilation request: {}",
+            error
+        )
+    })?;
+    let resp = send_message_without_timeout(project_path, "compile_run_states", &payload).await?;
+    if resp.ok {
+        Ok(resp.message.unwrap_or_default())
+    } else {
+        Err(resp
+            .error
+            .unwrap_or_else(|| "unity_run_states compilation failed".to_string()))
     }
 }
 
@@ -854,7 +1150,11 @@ pub async fn stop_unity_monitor(monitor: &UnityMonitorHandle) {
 
 #[cfg(test)]
 mod tests {
-    use super::rewrite_run_states_output_for_size;
+    use super::{
+        read_project_unity_version, requested_run_states_editor_status,
+        rewrite_run_states_output_for_size,
+    };
+    use serde_json::json;
 
     fn result_file(summary: &str) -> String {
         summary
@@ -862,6 +1162,51 @@ mod tests {
             .find_map(|line| line.strip_prefix("result_file: "))
             .expect("result_file field")
             .to_string()
+    }
+
+    #[test]
+    fn read_project_unity_version_extracts_editor_version() {
+        let project = tempfile::tempdir().expect("temp project");
+        let settings_dir = project.path().join("ProjectSettings");
+        std::fs::create_dir_all(&settings_dir).expect("create settings dir");
+        std::fs::write(
+            settings_dir.join("ProjectVersion.txt"),
+            "m_EditorVersion: 2022.3.47f1\nm_EditorVersionWithRevision: 2022.3.47f1 (88c277b85d21)\n",
+        )
+        .expect("write version");
+
+        let version =
+            read_project_unity_version(&project.path().to_string_lossy()).expect("read version");
+        assert_eq!(version.as_deref(), Some("2022.3.47f1"));
+    }
+
+    #[test]
+    fn run_states_requested_editor_status_accepts_supported_statuses() {
+        let request = json!({ "request_editor_status": " playing_paused " });
+
+        assert_eq!(
+            requested_run_states_editor_status(&request).unwrap(),
+            "playing_paused"
+        );
+    }
+
+    #[test]
+    fn run_states_requested_editor_status_rejects_missing_or_invalid_status() {
+        assert!(requested_run_states_editor_status(&json!({}))
+            .unwrap_err()
+            .contains("Missing required parameter"));
+
+        assert!(requested_run_states_editor_status(&json!({
+            "request_editor_status": "disconnected"
+        }))
+        .unwrap_err()
+        .contains("Invalid request_editor_status"));
+
+        assert!(requested_run_states_editor_status(&json!({
+            "request_editor_status": "compiling"
+        }))
+        .unwrap_err()
+        .contains("Invalid request_editor_status"));
     }
 
     #[test]

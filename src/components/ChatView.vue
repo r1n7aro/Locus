@@ -164,6 +164,8 @@ const props = defineProps<{
   unityConnected?: boolean;
   unityPluginStatus?: "missing" | "outdated" | null;
   unityPluginInstalling?: boolean;
+  unityLaunching?: boolean;
+  unityLaunchState?: "idle" | "starting" | "waitingConnection";
   workingDir?: string;
   scanPhase?: AssetDbScanEvent | null;
   lastScanStats?: ScanStats | null;
@@ -195,6 +197,7 @@ const emit = defineEmits<{
   deleteSession: [id: string];
   startScan: [];
   installPlugin: [];
+  launchUnityProject: [];
   layoutModeChange: [mode: ResolvedChatLayoutMode];
 }>();
 
@@ -1460,12 +1463,15 @@ onUnmounted(() => {
             :unity-connected="unityConnected"
             :unity-plugin-status="unityPluginStatus"
             :unity-plugin-installing="unityPluginInstalling"
+            :unity-launching="unityLaunching"
+            :unity-launch-state="unityLaunchState"
             :working-dir="workingDir"
             :is-unity-project="isUnityProject"
             :scan-phase="scanPhase"
             :last-scan-stats="lastScanStats"
             @start-scan="emit('startScan')"
             @install-plugin="emit('installPlugin')"
+            @launch-unity-project="emit('launchUnityProject')"
           />
         </div>
         <div class="input-backdrop-action">

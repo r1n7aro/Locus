@@ -540,7 +540,11 @@ export function buildUnityRunStatesRuntimePreview(
   const hints = collectRuntimeHints(rawArguments);
   if (!hints) return null;
 
-  const outputPreview = rawOutput ? parseUnityRunStatesOutput(rawOutput) : null;
+  const outputText = rawOutput ?? "";
+  const hasOutput = !!outputText.trim();
+  if (toolStatus === "running" && !hasOutput) return null;
+
+  const outputPreview = hasOutput ? parseUnityRunStatesOutput(outputText) : null;
   const finalState = outputField(outputPreview, "final_state");
   const currentState = finalState || hints.initialState;
   const statePrompts = hints.prompts.filter((prompt) => prompt.stateName === currentState);
