@@ -50,6 +50,7 @@ describe("injectAssetRefs", () => {
     expect(result).toContain('data-file-path="Assets/Prefabs/Player.prefab"');
     expect(result).toContain('data-asset-path="Assets/Prefabs/Player.prefab"');
     expect(result).toContain('data-asset-kind="prefab"');
+    expect(result).toContain('title="Assets/Prefabs/Player.prefab"');
     expect(result).toContain("md-unity-asset-icon--prefab");
     expect(result).toContain('src="/unity-asset-icons/prefab.svg"');
     expect(result).toContain("Player.prefab");
@@ -83,6 +84,16 @@ describe("injectAssetRefs", () => {
     expect(result).toContain("Elite Guard.asset");
   });
 
+  it("converts braced Unity asset refs with spaces", () => {
+    const html = "音频 {@Assets/Space Shooter/GameRes/Audio/sound weapon player.wav} 需要检查";
+    const result = injectAssetRefs(html);
+    expect(result).toContain("md-unity-asset-ref");
+    expect(result).toContain('data-file-path="Assets/Space Shooter/GameRes/Audio/sound weapon player.wav"');
+    expect(result).toContain("sound weapon player.wav");
+    expect(result).not.toContain("{@Assets/Space Shooter");
+    expect(result).toContain(" 需要检查");
+  });
+
   it("converts parenthesized Unity asset refs from object labels", () => {
     const html = "Enemy Config (Assets/Data/Enemy Configs/Elite Guard.asset)";
     const result = injectAssetRefs(html);
@@ -111,6 +122,7 @@ describe("injectAssetRefs", () => {
     expect(result).toContain('data-file-path="Assets/Scenes/Main.unity/Environment/SpawnPoint"');
     expect(result).toContain('data-scene-path="Assets/Scenes/Main.unity"');
     expect(result).toContain('data-scene-object-path="Environment/SpawnPoint"');
+    expect(result).toContain('title="Assets/Scenes/Main.unity/Environment/SpawnPoint"');
     expect(result).toContain('src="/unity-asset-icons/gameobject.svg"');
     expect(result).toContain("SpawnPoint");
   });
@@ -122,6 +134,17 @@ describe("injectAssetRefs", () => {
     expect(result).toContain('data-scene-path="Assets/Scenes/Main Menu.unity"');
     expect(result).toContain('data-scene-object-path="Canvas Root/Start Button"');
     expect(result).toContain("Start Button");
+  });
+
+  it("converts braced scene/object references with spaces", () => {
+    const html = "调整 {@Assets/Scenes/Main Menu.unity/Canvas Root/Spot Light (2)} 的阴影";
+    const result = injectAssetRefs(html);
+    expect(result).toContain("md-unity-scene-object-ref");
+    expect(result).toContain('data-scene-path="Assets/Scenes/Main Menu.unity"');
+    expect(result).toContain('data-scene-object-path="Canvas Root/Spot Light (2)"');
+    expect(result).toContain("Spot Light (2)");
+    expect(result).not.toContain("{@Assets/Scenes");
+    expect(result).toContain(" 的阴影");
   });
 
   it("keeps unquoted scene object names with spaces and separators intact", () => {
@@ -167,12 +190,37 @@ describe("injectAssetRefs", () => {
     expect(result).toContain('data-file-path="Assets/Prefabs/Characters/PigChef.prefab"');
   });
 
+  it("converts legacy braced asset paths inside inline code", () => {
+    const html = "当前场景 <code>{@Assets/Assets/Scenes/EventScene/E0002/E0002.unity}</code>";
+    const result = injectAssetRefs(html);
+    expect(result).toContain("md-unity-asset-ref");
+    expect(result).toContain('data-file-path="Assets/Assets/Scenes/EventScene/E0002/E0002.unity"');
+    expect(result).not.toContain("<code>");
+    expect(result).not.toContain("{@Assets/Assets/Scenes");
+  });
+
   it("converts scene/object references inside inline code", () => {
     const html = "<code>Assets/Scenes/Main.unity/UI/HUD</code>";
     const result = injectAssetRefs(html);
     expect(result).toContain("md-unity-scene-object-ref");
     expect(result).toContain('data-scene-path="Assets/Scenes/Main.unity"');
     expect(result).toContain('data-scene-object-path="UI/HUD"');
+  });
+
+  it("converts scene/object references with spaces inside inline code", () => {
+    const html = "<code>Assets/Scenes/Main Menu.unity/Canvas Root/Spot Light (2)</code>";
+    const result = injectAssetRefs(html);
+    expect(result).toContain("md-unity-scene-object-ref");
+    expect(result).toContain('data-scene-path="Assets/Scenes/Main Menu.unity"');
+    expect(result).toContain('data-scene-object-path="Canvas Root/Spot Light (2)"');
+  });
+
+  it("converts ProjectSettings paths inside inline code", () => {
+    const html = "<code>ProjectSettings/Tag Manager.asset</code>";
+    const result = injectAssetRefs(html);
+    expect(result).toContain("md-workspace-ref");
+    expect(result).toContain('data-workspace-path="ProjectSettings/Tag Manager.asset"');
+    expect(result).not.toContain("<code>");
   });
 
   it("does not convert asset paths inside fenced code blocks", () => {
@@ -182,11 +230,12 @@ describe("injectAssetRefs", () => {
     expect(result).toContain("<pre><code>@Assets/Prefabs/Player.prefab</code></pre>");
   });
 
-  it("does not convert non-asset inline code", () => {
+  it("converts workspace file paths inside inline code", () => {
     const html = "<code>src/main.ts</code>";
     const result = injectAssetRefs(html);
-    expect(result).not.toContain("md-file-ref");
-    expect(result).toContain("<code>src/main.ts</code>");
+    expect(result).toContain("md-file-ref");
+    expect(result).toContain('data-workspace-path="src/main.ts"');
+    expect(result).not.toContain("<code>");
   });
 
   it("does not convert generic workspace mentions", () => {
@@ -204,6 +253,7 @@ describe("injectWorkspaceMentions", () => {
     expect(result).toContain("md-file-ref");
     expect(result).toContain('data-workspace-path="UIElementsSchema/UnityEditor.Overlays.xsd"');
     expect(result).toContain('data-entry-kind="file"');
+    expect(result).toContain('title="UIElementsSchema/UnityEditor.Overlays.xsd"');
     expect(result).toContain("@</span>UnityEditor.Overlays.xsd");
   });
 
@@ -231,6 +281,25 @@ describe("injectWorkspaceMentions", () => {
     expect(result).toContain("md-folder-ref");
     expect(result).toContain('data-workspace-path="Assets/Scripts"');
   });
+
+  it("converts braced workspace mentions with spaces", () => {
+    const html = "Inspect {@UI Elements Schema/Unity Editor Overlays.xsd} now";
+    const result = injectWorkspaceMentions(html);
+    expect(result).toContain("md-workspace-ref");
+    expect(result).toContain("md-file-ref");
+    expect(result).toContain('data-workspace-path="UI Elements Schema/Unity Editor Overlays.xsd"');
+    expect(result).toContain("@</span>Unity Editor Overlays.xsd");
+    expect(result).not.toContain("{@UI Elements Schema");
+    expect(result).toContain(" now");
+  });
+
+  it("converts braced ProjectSettings mentions with spaces", () => {
+    const html = "Inspect {@ProjectSettings/Tag Manager.asset}";
+    const result = injectWorkspaceMentions(html);
+    expect(result).toContain("md-workspace-ref");
+    expect(result).toContain('data-workspace-path="ProjectSettings/Tag Manager.asset"');
+    expect(result).toContain("@</span>Tag Manager.asset");
+  });
 });
 
 describe("injectFileRefs", () => {
@@ -240,6 +309,7 @@ describe("injectFileRefs", () => {
     expect(result).toContain("md-file-ref");
     expect(result).toContain("ui-select-text");
     expect(result).toContain('data-file-path="src/components/ChatView.vue"');
+    expect(result).toContain('title="src/components/ChatView.vue"');
     expect(result).toContain("ChatView.vue");
   });
 

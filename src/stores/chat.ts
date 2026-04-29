@@ -104,6 +104,9 @@ export const useChatStore = defineStore("chat", () => {
   const streamingText = ref("");
   const rawStreamText = ref("");
   const streamingThinking = ref("");
+  const streamSequence = ref(0);
+  const streamingTextOrder = ref(0);
+  const thinkingOrder = ref(0);
   const isStreaming = ref(false);
   const currentRunId = ref<string | null>(null);
   const isThinking = ref(false);
@@ -244,6 +247,9 @@ export const useChatStore = defineStore("chat", () => {
   function resetStreamRuntimeState() {
     resetStreamAnim();
     streamingThinking.value = "";
+    streamSequence.value = 0;
+    streamingTextOrder.value = 0;
+    thinkingOrder.value = 0;
     isThinking.value = false;
     thinkingStartTime.value = 0;
     thinkingDuration.value = 0;
@@ -704,6 +710,15 @@ export const useChatStore = defineStore("chat", () => {
       case "appendThinking":
         streamingThinking.value += m.text;
         break;
+      case "setStreamSequence":
+        streamSequence.value = Math.max(streamSequence.value, m.value);
+        break;
+      case "setStreamingTextOrder":
+        streamingTextOrder.value = m.order;
+        break;
+      case "setThinkingOrder":
+        thinkingOrder.value = m.order;
+        break;
       case "setThinking":
         isThinking.value = m.value;
         if (m.startTime !== undefined) thinkingStartTime.value = m.startTime;
@@ -775,6 +790,8 @@ export const useChatStore = defineStore("chat", () => {
         });
         resetStreamAnim();
         streamingThinking.value = "";
+        streamingTextOrder.value = 0;
+        thinkingOrder.value = 0;
         thinkingStartTime.value = 0;
         thinkingDuration.value = 0;
         isThinking.value = false;
@@ -1029,6 +1046,9 @@ export const useChatStore = defineStore("chat", () => {
       streamingText: streamingText.value,
       rawStreamText: rawStreamText.value,
       streamingThinking: streamingThinking.value,
+      streamSequence: streamSequence.value,
+      streamingTextOrder: streamingTextOrder.value,
+      thinkingOrder: thinkingOrder.value,
       isStreaming: isStreaming.value,
       isThinking: isThinking.value,
       thinkingStartTime: thinkingStartTime.value,
@@ -1557,6 +1577,9 @@ export const useChatStore = defineStore("chat", () => {
     streamingText,
     rawStreamText,
     streamingThinking,
+    streamSequence,
+    streamingTextOrder,
+    thinkingOrder,
     isStreaming,
     currentRunId,
     isCancelling,

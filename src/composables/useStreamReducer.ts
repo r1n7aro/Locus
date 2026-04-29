@@ -6,6 +6,9 @@ export interface StreamState {
   streamingText: string;
   rawStreamText: string;
   streamingThinking: string;
+  streamSequence: number;
+  streamingTextOrder: number;
+  thinkingOrder: number;
   isStreaming: boolean;
   isThinking: boolean;
   thinkingStartTime: number;
@@ -22,6 +25,9 @@ export interface StreamState {
 export type StreamMutation =
   | { type: "appendRawText"; text: string }
   | { type: "appendThinking"; text: string }
+  | { type: "setStreamSequence"; value: number }
+  | { type: "setStreamingTextOrder"; order: number }
+  | { type: "setThinkingOrder"; order: number }
   | { type: "setThinking"; value: boolean; startTime?: number }
   | { type: "updateThinkingDuration"; duration: number }
   | { type: "addToolCall"; toolCall: ToolCallDisplay }
@@ -100,6 +106,44 @@ export function mergeUserMessage(messages: ChatMessage[], incoming: ChatMessage)
 export function reduceStreamEvent(state: StreamState, event: StreamEvent): StreamMutation[] {
   const mutations: StreamMutation[] = [];
 
+  const nextStreamOrder = () => state.streamSequence + 1;
+
+  const markStreamSequence = (order: number) => {
+    if (order > state.streamSequence) {
+      mutations.push({ type: "setStreamSequence", value: order });
+    }
+  };
+
+  const markTextOrder = () => {
+    if (state.streamingTextOrder > 0 || state.rawStreamText.length > 0) return;
+    const order = nextStreamOrder();
+    mutations.push({ type: "setStreamingTextOrder", order });
+    markStreamSequence(order);
+  };
+
+  const markThinkingOrder = () => {
+    if (state.thinkingOrder > 0 || state.streamingThinking.length > 0) return;
+    const order = nextStreamOrder();
+    mutations.push({ type: "setThinkingOrder", order });
+    markStreamSequence(order);
+  };
+
+  const markToolOrder = (existing?: ToolCallDisplay) => {
+    if (existing?.order && existing.order > 0) return existing.order;
+    const order = nextStreamOrder();
+    markStreamSequence(order);
+    return order;
+  };
+
+  const finishThinkingBeforeTools = () => {
+    if (state.isThinking && state.thinkingStartTime > 0) {
+      mutations.push({ type: "updateThinkingDuration", duration: Math.round((Date.now() - state.thinkingStartTime) / 1000) });
+    }
+    if (state.isThinking) {
+      mutations.push({ type: "setThinking", value: false });
+    }
+  };
+
   // Note: auto-reactivation of streaming removed — streaming is now controlled
   // exclusively by explicit sendChat/cancelChat actions. Late events from a
   // cancelled run are filtered by runId in the chat store.
@@ -110,6 +154,7 @@ export function reduceStreamEvent(state: StreamState, event: StreamEvent): Strea
       break;
 
     case "textDelta":
+      markTextOrder();
       mutations.push({ type: "appendRawText", text: event.text });
       if (state.isThinking && state.thinkingStartTime > 0) {
         mutations.push({ type: "updateThinkingDuration", duration: Math.round((Date.now() - state.thinkingStartTime) / 1000) });
@@ -118,6 +163,7 @@ export function reduceStreamEvent(state: StreamState, event: StreamEvent): Strea
       break;
 
     case "thinkingDelta":
+      markThinkingOrder();
       mutations.push({ type: "appendThinking", text: event.text });
       if (!state.isThinking) {
         mutations.push({ type: "setThinking", value: true, startTime: Date.now() });
@@ -125,15 +171,24 @@ export function reduceStreamEvent(state: StreamState, event: StreamEvent): Strea
       break;
 
     case "toolCallStart": {
+      finishThinkingBeforeTools();
       const existing = state.activeToolCalls.find((t) => t.id === event.toolCallId);
       if (existing) {
+        const updates: Partial<ToolCallDisplay> = {};
         if (event.arguments) {
-          mutations.push({ type: "updateToolCall", id: event.toolCallId, updates: { arguments: event.arguments } });
+          updates.arguments = event.arguments;
+        }
+        if (!existing.order || existing.order <= 0) {
+          updates.order = markToolOrder(existing);
+        }
+        if (Object.keys(updates).length > 0) {
+          mutations.push({ type: "updateToolCall", id: event.toolCallId, updates });
         }
       } else {
+        const order = markToolOrder();
         mutations.push({
           type: "addToolCall",
-          toolCall: { id: event.toolCallId, name: event.toolName, arguments: event.arguments, status: "running" },
+          toolCall: { id: event.toolCallId, name: event.toolName, arguments: event.arguments, status: "running", order },
         });
       }
       break;

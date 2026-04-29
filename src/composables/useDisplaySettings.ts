@@ -13,6 +13,8 @@ export interface DisplaySettings {
   rightAlignUserMessages: boolean;
   /** Collapse completed tool call batches in chat transcript */
   compactToolCalls: boolean;
+  /** Hide completed thinking blocks in chat transcript */
+  hideThinkingBlocks: boolean;
   /** Merge Git tree status letters into colored file icons */
   mergeGitTreeStatusIcon: boolean;
   /** Enable desktop notifications when the app is not focused */
@@ -45,6 +47,7 @@ const defaults: DisplaySettings = {
   changesAutoClose: true,
   rightAlignUserMessages: true,
   compactToolCalls: true,
+  hideThinkingBlocks: true,
   mergeGitTreeStatusIcon: true,
   systemNotificationsEnabled: true,
   notifyOnChatDone: true,

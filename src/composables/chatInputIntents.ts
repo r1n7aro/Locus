@@ -219,6 +219,10 @@ export function replaceTextRange(text: string, start: number, end: number, repla
   return text.slice(0, start) + replacement + text.slice(end);
 }
 
+export function formatInlineMention(relPath: string): string {
+  return `\`${relPath}\``;
+}
+
 export function insertInlineMention(
   text: string,
   start: number,
@@ -229,7 +233,7 @@ export function insertInlineMention(
   const safeEnd = Math.max(safeStart, Math.min(end, text.length));
   const before = text.slice(0, safeStart);
   const after = text.slice(safeEnd);
-  const mention = `@${relPath}`;
+  const mention = formatInlineMention(relPath);
   const leadingSpace = before && !isTokenBoundary(before[before.length - 1]) ? " " : "";
   const trailingSpace = after && !isTokenBoundary(after[0]) ? " " : "";
   const nextText = before + leadingSpace + mention + trailingSpace + after;

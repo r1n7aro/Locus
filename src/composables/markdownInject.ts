@@ -42,10 +42,14 @@ const QUOTED_ASSET_REF_RE = /(["'])@?((?:Assets|Packages)\/(?:(?!\1).)+?)\s*\1/g
 const BRACED_UNITY_REF_RE = /\{@?((?:Assets|Packages)\/[^{}\r\n]+?)\}/g;
 const PARENTHESIZED_UNITY_ASSET_REF_RE = /\(@?((?:Assets|Packages)\/[^()\r\n]+?\.[A-Za-z0-9][^()\r\n]*?(?:#fileID:-?\d+)?)\)/gi;
 const ASSET_REF_RE = /@((?:Assets|Packages)\/[\w.\/-]*[\w.-])(?!\/)/g;
-const INLINE_CODE_ASSET_REF_RE = /^@?((?:Assets|Packages)\/.+?)(?::(\d+)|#L(\d+)|#fileID:-?\d+)?$/i;
+const INLINE_CODE_BRACED_REF_RE = /^\{@?([^{}\r\n]+\/[^{}\r\n]*)\}$/;
+const INLINE_CODE_PATH_SUFFIX_RE = /^(.+?)(?::(\d+)|#L(\d+)|#fileID:-?\d+)?$/i;
+const INLINE_WORKSPACE_ROOT_RE = /^(?:ProjectSettings|src|src-tauri|Library|Editor)\//i;
+const INLINE_GENERIC_FILE_PATH_RE = /^(?:[^/\r\n]+\/)+[^/\r\n]+\.[A-Za-z0-9][^/\r\n]*$/;
 const UNQUOTED_SCENE_OBJECT_START_RE = /@(?:Assets|Packages)\//g;
 const UNQUOTED_UNITY_ASSET_START_RE = /@(?:Assets|Packages)\//g;
 const BARE_UNITY_ASSET_START_RE = /(?<![@`\/])(?:Assets|Packages)\//g;
+const BRACED_WORKSPACE_MENTION_RE = /\{@([^{}\r\n]*\/[^{}\r\n]*)\}/g;
 const WORKSPACE_MENTION_RE = /@((?:[^\s@<]+\/)+[^\s@<]*)/g;
 const UNITY_ASSET_ICON_BASE = "/unity-asset-icons";
 
@@ -124,7 +128,7 @@ function renderFileRef(
   const lineAttr = line ? ` data-file-line="${escapeAttr(line)}"` : "";
   const label = `${escaped}${line ? ":" + escapeAttr(line) : ""}`;
   const className = ["md-file-ref", classes, "ui-select-text"].filter(Boolean).join(" ");
-  return `<span class="${className}" data-file-path="${escaped}"${lineAttr}${attrs} aria-label="${label}">${icon}<span class="md-ref-label">${displayFileRef(filePath, line)}</span></span>`;
+  return `<span class="${className}" data-file-path="${escaped}"${lineAttr}${attrs} title="${label}" aria-label="${label}">${icon}<span class="md-ref-label">${displayFileRef(filePath, line)}</span></span>`;
 }
 
 function renderUnityAssetRef(filePath: string, line = ""): string {
@@ -138,6 +142,30 @@ function renderUnityAssetRef(filePath: string, line = ""): string {
     ` data-asset-path="${escaped}" data-asset-kind="${kind}"`,
     renderUnityAssetIcon(kind),
   );
+}
+
+function renderWorkspaceMention(path: string, match: string): string {
+  const isDir = path.endsWith("/");
+  if (/^(Assets|Packages)\//.test(path) && !isDir) {
+    return match;
+  }
+
+  const normalizedPath = path.replace(/\/+$/, "");
+  if (!normalizedPath) {
+    return match;
+  }
+
+  const escapedPath = escapeAttr(normalizedPath);
+  const segments = normalizedPath.split("/").filter(Boolean);
+  const name = segments[segments.length - 1] || normalizedPath;
+  const title = `${escapedPath}${isDir ? "/" : ""}`;
+  const fileAttr = isDir ? "" : ` data-file-path="${escapedPath}"`;
+  const classes = isDir ? "md-workspace-ref md-folder-ref" : "md-workspace-ref md-file-ref";
+  const icon = isDir
+    ? renderRefIcon("folder", "md-workspace-ref-icon")
+    : renderLucideRefIcon("file", "md-workspace-ref-icon md-workspace-file-icon");
+
+  return `<span class="${classes} ui-select-text" data-workspace-path="${escapedPath}" data-entry-kind="${isDir ? "folder" : "file"}"${fileAttr} title="${title}" aria-label="${title}">${icon}<span class="md-workspace-ref-prefix">@</span>${escapeAttr(name)}${isDir ? "/" : ""}</span>`;
 }
 
 interface SceneObjectRefParts {
@@ -164,11 +192,11 @@ function renderUnitySceneObjectRef(filePath: string): string {
   const escapedObjectPath = escapeAttr(ref.objectPath);
   const escapedLabel = escapeAttr(displaySceneObjectRef(ref.objectPath));
   const icon = renderRefIcon("gameobject", "md-unity-gameobject-icon");
-  return `<span class="md-file-ref md-unity-scene-object-ref ui-select-text" data-file-path="${escapedFullPath}" data-scene-path="${escapedScenePath}" data-scene-object-path="${escapedObjectPath}" aria-label="${escapedFullPath}">${icon}<span class="md-ref-label">${escapedLabel}</span></span>`;
+  return `<span class="md-file-ref md-unity-scene-object-ref ui-select-text" data-file-path="${escapedFullPath}" data-scene-path="${escapedScenePath}" data-scene-object-path="${escapedObjectPath}" title="${escapedFullPath}" aria-label="${escapedFullPath}">${icon}<span class="md-ref-label">${escapedLabel}</span></span>`;
 }
 
 function isSceneObjectRefTerminator(ch: string): boolean {
-  return /[\r\n<>"'`，。；、？！]/.test(ch);
+  return /[\r\n<>"'`{}，。；、？！]/.test(ch);
 }
 
 export function findUnitySceneObjectPathEnd(text: string, start: number): number {
@@ -304,14 +332,56 @@ function decodeCodeText(source: string): string {
     .replace(/&amp;/g, "&");
 }
 
-function assetRefFromInlineCode(source: string): string | null {
+function normalizeInlineCodeRefText(source: string): string {
   const decoded = decodeCodeText(source).trim();
-  const sceneObjectRef = splitSceneObjectRef(decoded.replace(/^@/, ""));
-  if (sceneObjectRef) return renderUnitySceneObjectRef(`${sceneObjectRef.scenePath}/${sceneObjectRef.objectPath}`);
-  const match = decoded.match(INLINE_CODE_ASSET_REF_RE);
+  const braced = decoded.match(INLINE_CODE_BRACED_REF_RE);
+  const unwrapped = braced ? braced[1].trim() : decoded;
+  return unwrapped.replace(/^@(?=[^@\r\n]*\/)/, "");
+}
+
+function splitInlineCodePathSuffix(source: string): { path: string; line: string } | null {
+  const match = source.match(INLINE_CODE_PATH_SUFFIX_RE);
   if (!match) return null;
-  const [, filePath, lineColon, lineHash] = match;
-  return renderUnityAssetRef(filePath, lineColon || lineHash || "");
+  const path = match[1].trim().replace(/\\/g, "/");
+  if (!path.includes("/")) return null;
+  return {
+    path,
+    line: match[2] || match[3] || "",
+  };
+}
+
+function isWorkspaceInlineRefPath(filePath: string): boolean {
+  const normalized = filePath.trim().replace(/\\/g, "/");
+  if (!normalized.includes("/")) return false;
+  if (ASSET_ROOT_RE.test(normalized)) return true;
+  if (INLINE_WORKSPACE_ROOT_RE.test(normalized)) return true;
+  if (normalized.endsWith("/")) return true;
+  return INLINE_GENERIC_FILE_PATH_RE.test(normalized);
+}
+
+function renderWorkspaceInlineRef(filePath: string, line = ""): string {
+  const normalizedPath = filePath.trim().replace(/\\/g, "/");
+  if (line) {
+    return renderFileRef(normalizedPath.replace(/\/+$/, ""), line);
+  }
+  return renderWorkspaceMention(normalizedPath, normalizedPath);
+}
+
+function assetRefFromInlineCode(source: string): string | null {
+  const refText = normalizeInlineCodeRefText(source);
+  const parsed = splitInlineCodePathSuffix(refText);
+  if (!parsed || !isWorkspaceInlineRefPath(parsed.path)) return null;
+
+  const sceneObjectRef = splitSceneObjectRef(parsed.path);
+  if (sceneObjectRef) {
+    return renderUnitySceneObjectRef(`${sceneObjectRef.scenePath}/${sceneObjectRef.objectPath}`);
+  }
+
+  if (ASSET_ROOT_RE.test(parsed.path)) {
+    return renderUnityAssetRef(parsed.path, parsed.line);
+  }
+
+  return renderWorkspaceInlineRef(parsed.path, parsed.line);
 }
 
 function injectInlineCodeAssetRefs(html: string): string {
@@ -359,13 +429,16 @@ export function injectAssetRefs(html: string): string {
       return key;
     };
 
+    const delimitedSceneRefsInjected = text
+      .replace(QUOTED_SCENE_OBJECT_REF_RE, (_match, _quote, path) => stashRef(renderUnitySceneObjectRef(path)))
+      .replace(BRACED_UNITY_REF_RE, (_match, path) => stashRef(renderUnityPathRef(path)));
+
     const sceneRefsInjected = replaceUnquotedSceneObjectRefs(
-      text.replace(QUOTED_SCENE_OBJECT_REF_RE, (_match, _quote, path) => stashRef(renderUnitySceneObjectRef(path))),
+      delimitedSceneRefsInjected,
       (path) => stashRef(renderUnitySceneObjectRef(path)),
     );
 
     const delimitedRefsInjected = sceneRefsInjected
-      .replace(BRACED_UNITY_REF_RE, (_match, path) => stashRef(renderUnityPathRef(path)))
       .replace(PARENTHESIZED_UNITY_ASSET_REF_RE, (_match, path) => stashRef(renderUnityAssetRef(path)))
       .replace(QUOTED_ASSET_REF_RE, (_match, _quote, path) => stashRef(renderUnityAssetRef(path)));
 
@@ -387,31 +460,24 @@ export function injectAssetChips(html: string): string {
 }
 
 export function injectWorkspaceMentions(html: string): string {
-  return walkHtmlText(html, (text) =>
-    text.replace(WORKSPACE_MENTION_RE, (match, path) => {
-      const isDir = path.endsWith("/");
-      if (/^(Assets|Packages|ProjectSettings)\//.test(path) && !isDir) {
-        return match;
-      }
+  return walkHtmlText(html, (text) => {
+    const refs: string[] = [];
+    const stashRef = (refHtml: string) => {
+      const key = `\u0000mdref:${refs.length}\u0000`;
+      refs.push(refHtml);
+      return key;
+    };
 
-      const normalizedPath = path.replace(/\/+$/, "");
-      if (!normalizedPath) {
-        return match;
-      }
+    const braced = text.replace(BRACED_WORKSPACE_MENTION_RE, (match, path) =>
+      stashRef(renderWorkspaceMention(path, match)),
+    );
 
-      const escapedPath = normalizedPath.replace(/"/g, "&quot;");
-      const segments = normalizedPath.split("/").filter(Boolean);
-      const name = segments[segments.length - 1] || normalizedPath;
-      const title = `${escapedPath}${isDir ? "/" : ""}`;
-      const fileAttr = isDir ? "" : ` data-file-path="${escapedPath}"`;
-      const classes = isDir ? "md-workspace-ref md-folder-ref" : "md-workspace-ref md-file-ref";
-      const icon = isDir
-        ? renderRefIcon("folder", "md-workspace-ref-icon")
-        : renderLucideRefIcon("file", "md-workspace-ref-icon md-workspace-file-icon");
+    const injected = braced.replace(WORKSPACE_MENTION_RE, (match, path) =>
+      stashRef(renderWorkspaceMention(path, match)),
+    );
 
-      return `<span class="${classes} ui-select-text" data-workspace-path="${escapedPath}" data-entry-kind="${isDir ? "folder" : "file"}"${fileAttr} aria-label="${title}">${icon}<span class="md-workspace-ref-prefix">@</span>${name}${isDir ? "/" : ""}</span>`;
-    }),
-  );
+    return injected.replace(/\u0000mdref:(\d+)\u0000/g, (_match, index) => refs[Number(index)] ?? "");
+  });
 }
 
 // Match project-relative file paths, optionally with :line or #Lline suffix.

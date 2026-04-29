@@ -8,6 +8,9 @@ function makeState(overrides?: Partial<StreamState>): StreamState {
     streamingText: "",
     rawStreamText: "",
     streamingThinking: "",
+    streamSequence: 0,
+    streamingTextOrder: 0,
+    thinkingOrder: 0,
     isStreaming: false,
     isThinking: false,
     thinkingStartTime: 0,
@@ -62,6 +65,15 @@ describe("reduceStreamEvent", () => {
   });
 
   describe("textDelta", () => {
+    it("marks the first visible text with a stream order", () => {
+      const state = makeState({ isStreaming: true, streamSequence: 2 });
+      const event: StreamEvent = { runId: "test-run", type: "textDelta", sessionId: "s1", text: "hello" };
+      const mutations = reduceStreamEvent(state, event);
+
+      expect(mutations).toContainEqual({ type: "setStreamingTextOrder", order: 3 });
+      expect(mutations).toContainEqual({ type: "setStreamSequence", value: 3 });
+    });
+
     it("appends text without auto-activating streaming (streaming controlled by chat store)", () => {
       const state = makeState();
       const event: StreamEvent = { runId: "test-run", type: "textDelta", sessionId: "s1", text: "hello" };
@@ -96,6 +108,15 @@ describe("reduceStreamEvent", () => {
   });
 
   describe("thinkingDelta", () => {
+    it("marks the first thinking block with a stream order", () => {
+      const state = makeState({ isStreaming: true });
+      const event: StreamEvent = { runId: "test-run", type: "thinkingDelta", sessionId: "s1", text: "thinking..." };
+      const mutations = reduceStreamEvent(state, event);
+
+      expect(mutations).toContainEqual({ type: "setThinkingOrder", order: 1 });
+      expect(mutations).toContainEqual({ type: "setStreamSequence", value: 1 });
+    });
+
     it("appends thinking and starts thinking mode", () => {
       const state = makeState({ isStreaming: true });
       const event: StreamEvent = { runId: "test-run", type: "thinkingDelta", sessionId: "s1", text: "thinking..." };
@@ -118,9 +139,60 @@ describe("reduceStreamEvent", () => {
       expect(mutations).toContainEqual({ type: "appendThinking", text: "more" });
       expect(mutations.find((m) => m.type === "setThinking")).toBeUndefined();
     });
+
+    it("starts a later thinking block after tools have started", () => {
+      const state = makeState({
+        isStreaming: true,
+        streamSequence: 1,
+        activeToolCalls: [{ id: "tc1", name: "read", arguments: "{}", status: "running", order: 1 }],
+      });
+      const event: StreamEvent = { runId: "test-run", type: "thinkingDelta", sessionId: "s1", text: "late" };
+      const mutations = reduceStreamEvent(state, event);
+
+      expect(mutations).toContainEqual({ type: "setThinkingOrder", order: 2 });
+      expect(mutations).toContainEqual({ type: "setStreamSequence", value: 2 });
+      expect(mutations).toContainEqual({ type: "appendThinking", text: "late" });
+      const setThinking = mutations.find((m) => m.type === "setThinking");
+      expect(setThinking).toBeDefined();
+      if (setThinking?.type === "setThinking") {
+        expect(setThinking.value).toBe(true);
+        expect(setThinking.startTime).toBeGreaterThan(0);
+      }
+    });
+
+    it("keeps an already active thinking block when tools are present", () => {
+      const state = makeState({
+        isStreaming: true,
+        isThinking: true,
+        thinkingStartTime: Date.now() - 3000,
+        activeToolCalls: [{ id: "tc1", name: "read", arguments: "{}", status: "running" }],
+      });
+      const event: StreamEvent = { runId: "test-run", type: "thinkingDelta", sessionId: "s1", text: "late" };
+      const mutations = reduceStreamEvent(state, event);
+
+      expect(mutations).toContainEqual({ type: "appendThinking", text: "late" });
+      expect(mutations.find((m) => m.type === "setThinking")).toBeUndefined();
+      expect(mutations.find((m) => m.type === "updateThinkingDuration")).toBeUndefined();
+    });
   });
 
   describe("toolCallStart", () => {
+    it("marks top-level tool calls with stream order", () => {
+      const state = makeState({ isStreaming: true, streamSequence: 1 });
+      const event: StreamEvent = { runId: "test-run",
+        type: "toolCallStart",
+        sessionId: "s1",
+        toolCallId: "tc1",
+        toolName: "read",
+        arguments: '{"path":"foo.ts"}',
+      };
+      const mutations = reduceStreamEvent(state, event);
+      const addMut = mutations.find((m) => m.type === "addToolCall");
+
+      expect(mutations).toContainEqual({ type: "setStreamSequence", value: 2 });
+      expect(addMut?.type === "addToolCall" ? addMut.toolCall.order : 0).toBe(2);
+    });
+
     it("adds a new tool call", () => {
       const state = makeState({ isStreaming: true });
       const event: StreamEvent = { runId: "test-run",
@@ -141,6 +213,26 @@ describe("reduceStreamEvent", () => {
       }
     });
 
+    it("closes active thinking before adding a tool call", () => {
+      const state = makeState({ isStreaming: true, isThinking: true, thinkingStartTime: Date.now() - 4000 });
+      const event: StreamEvent = { runId: "test-run",
+        type: "toolCallStart",
+        sessionId: "s1",
+        toolCallId: "tc1",
+        toolName: "read",
+        arguments: '{"path":"foo.ts"}',
+      };
+      const mutations = reduceStreamEvent(state, event);
+      const updateIndex = mutations.findIndex((m) => m.type === "updateThinkingDuration");
+      const stopIndex = mutations.findIndex((m) => m.type === "setThinking");
+      const addIndex = mutations.findIndex((m) => m.type === "addToolCall");
+
+      expect(updateIndex).toBeGreaterThanOrEqual(0);
+      expect(stopIndex).toBeGreaterThan(updateIndex);
+      expect(addIndex).toBeGreaterThan(stopIndex);
+      expect(mutations[stopIndex]).toEqual({ type: "setThinking", value: false });
+    });
+
     it("updates existing tool call arguments", () => {
       const existingTc: ToolCallDisplay = { id: "tc1", name: "read", arguments: "{}", status: "running" };
       const state = makeState({ isStreaming: true, activeToolCalls: [existingTc] });
@@ -154,11 +246,13 @@ describe("reduceStreamEvent", () => {
       const mutations = reduceStreamEvent(state, event);
 
       expect(mutations.find((m) => m.type === "addToolCall")).toBeUndefined();
-      expect(mutations).toContainEqual({
-        type: "updateToolCall",
-        id: "tc1",
-        updates: { arguments: '{"path":"bar.ts"}' },
-      });
+      const update = mutations.find((m) => m.type === "updateToolCall");
+      expect(update).toBeDefined();
+      if (update?.type === "updateToolCall") {
+        expect(update.id).toBe("tc1");
+        expect(update.updates.arguments).toBe('{"path":"bar.ts"}');
+        expect(update.updates.order).toBe(1);
+      }
     });
   });
 

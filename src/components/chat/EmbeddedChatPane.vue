@@ -41,7 +41,9 @@ const props = withDefaults(defineProps<{
   metaRows?: MetaRow[];
   messages: ChatMessage[];
   streamingText: string;
+  streamingTextOrder?: number;
   thinkingText?: string;
+  thinkingOrder?: number;
   isStreaming: boolean;
   isThinking: boolean;
   thinkingDuration?: number;
@@ -523,9 +525,11 @@ onUnmounted(() => {
       :session-key="getViewportStateKey()"
       :messages="messages"
       :streaming-text="streamingText"
+      :streaming-text-order="streamingTextOrder"
       :is-streaming="isStreaming"
       :is-thinking="isThinking"
       :thinking-text="thinkingText"
+      :thinking-order="thinkingOrder"
       :thinking-duration="thinkingDuration"
       :active-tool-calls="activeToolCalls"
       :empty-title="emptyTitle"

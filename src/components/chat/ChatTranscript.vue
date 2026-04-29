@@ -22,6 +22,7 @@ import {
 import type { ToolCallMatchState } from "../../composables/toolCallBatches";
 import { useDisplaySettings } from "../../composables/useDisplaySettings";
 import { parseChatAssetRefs } from "../../composables/chatAssetRefs";
+import { displayUserMessageContent } from "../../composables/chatUserMessageDisplay";
 import { logToolCollapseTrace, previewTraceText } from "../../services/toolCollapseTrace";
 import MarkdownRenderer from "../MarkdownRenderer.vue";
 import ToolCallCollection from "../ToolCallCollection.vue";
@@ -45,6 +46,8 @@ interface MessageRenderItem {
   attachedKnowledgeProposals: ChatMessage[];
   hidden: boolean;
   displayToolCalls?: ToolCallInfo[];
+  displayToolCallsBeforeContent?: ToolCallInfo[];
+  displayToolCallsAfterContent?: ToolCallInfo[];
 }
 
 interface ToolCallHandoffState {
@@ -68,10 +71,12 @@ interface PromotedHistoryToolCallsState {
 const props = withDefaults(defineProps<{
   messages: ChatMessage[];
   streamingText: string;
+  streamingTextOrder?: number;
   isStreaming: boolean;
   isThinking: boolean;
   hasThinking?: boolean;
   thinkingText?: string;
+  thinkingOrder?: number;
   thinkingDuration?: number;
   activeToolCalls: ToolCallDisplay[];
   variant?: TranscriptVariant;
@@ -91,7 +96,9 @@ const props = withDefaults(defineProps<{
 }>(), {
   variant: "embedded",
   hasThinking: undefined,
+  streamingTextOrder: 0,
   thinkingText: "",
+  thinkingOrder: 0,
   thinkingDuration: 0,
   emptyTitle: "",
   emptyHint: "",
@@ -160,6 +167,17 @@ function buildIntentBadges(
 
 function messageIntentBadges(message: ChatMessage) {
   return buildIntentBadges(message.intentMeta ?? null);
+}
+
+function userMessageDisplayContent(message: ChatMessage) {
+  return displayUserMessageContent(message.content);
+}
+
+function userMessageDisplaySegments(message: ChatMessage) {
+  const content = userMessageDisplayContent(message);
+  return props.userContentMode === "asset"
+    ? parseChatAssetRefs(content)
+    : [{ type: "text" as const, value: content }];
 }
 
 function isCompactHandoffMessage(msg: ChatMessage) {
@@ -241,6 +259,7 @@ function cloneToolCallDisplay(toolCall: ToolCallDisplay): ToolCallDisplay {
     name: toolCall.name,
     arguments: toolCall.arguments,
     status: toolCall.status,
+    order: toolCall.order,
     output: toolCall.output,
     nestedToolCalls: toolCall.nestedToolCalls?.map((nestedToolCall) => cloneToolCallDisplay(nestedToolCall)),
   };
@@ -513,12 +532,38 @@ function toolCallsForRenderItem(item: Pick<MessageRenderItem, "message" | "displ
   );
 }
 
+function toolCallsFromInfos(toolCalls: ToolCallInfo[] | undefined) {
+  return buildMessageToolCalls({ toolCalls }, toolOutputMap.value);
+}
+
+function toolCallsBeforeContentForRenderItem(item: MessageRenderItem) {
+  if (Object.prototype.hasOwnProperty.call(item, "displayToolCallsBeforeContent")) {
+    return toolCallsFromInfos(item.displayToolCallsBeforeContent);
+  }
+  return item.message.content.trim().length > 0 ? [] : toolCallsForRenderItem(item);
+}
+
+function toolCallsAfterContentForRenderItem(item: MessageRenderItem) {
+  if (Object.prototype.hasOwnProperty.call(item, "displayToolCallsAfterContent")) {
+    return toolCallsFromInfos(item.displayToolCallsAfterContent);
+  }
+  return item.message.content.trim().length > 0 ? toolCallsForRenderItem(item) : [];
+}
+
+function shouldHideThinkingBlocks() {
+  return displaySettings.hideThinkingBlocks !== false;
+}
+
+function shouldRenderHistoryThinkingBlock(item: Pick<MessageRenderItem, "message">) {
+  return !shouldHideThinkingBlocks() && !!item.message.thinkingContent?.trim();
+}
+
 function shouldRenderItem(item: MessageRenderItem) {
   if (item.message.knowledgeProposal) return true;
 
   if (item.message.role === "user") {
     return !!(
-      item.message.content
+      userMessageDisplayContent(item.message)
       || (props.showUserImages && item.message.images && item.message.images.length > 0)
       || (props.enableIntentBadges && messageIntentBadges(item.message).length > 0)
     );
@@ -526,7 +571,7 @@ function shouldRenderItem(item: MessageRenderItem) {
 
   return !!(
     item.message.content
-    || item.message.thinkingContent
+    || shouldRenderHistoryThinkingBlock(item)
     || toolCallsForRenderItem(item).length > 0
     || item.attachedKnowledgeProposals.length > 0
   );
@@ -586,7 +631,7 @@ function isToolOnlyRenderItem(item: MessageRenderItem) {
   if (item.message.role !== "assistant" || item.message.knowledgeProposal) return false;
 
   const hasContent = item.message.content.trim().length > 0;
-  const hasThinking = !!item.message.thinkingContent?.trim();
+  const hasThinking = shouldRenderHistoryThinkingBlock(item);
   const hasAttachedKnowledgeProposals = item.attachedKnowledgeProposals.length > 0;
   const hasToolCalls = toolCallsForRenderItem(item).length > 0;
 
@@ -810,6 +855,8 @@ function onTransientToolCallsCollapseFinished() {
 }
 
 const hasThinkingContent = computed(() => props.hasThinking ?? !!props.thinkingText);
+const hasVisibleCompletedThinkingContent = computed(() => !shouldHideThinkingBlocks() && hasThinkingContent.value);
+const hasVisibleTransientThinkingBlock = computed(() => props.isThinking || hasVisibleCompletedThinkingContent.value);
 const hasLiveToolCalls = computed(() => props.activeToolCalls.length > 0);
 const hasTransientToolCalls = computed(() => transientToolCalls.value.length > 0);
 const hasToolCallHandoff = computed(() => hasTransientToolCalls.value && !hasLiveToolCalls.value);
@@ -819,7 +866,7 @@ const isWaitingForResponse = computed(
     isStreaming: props.isStreaming,
     hasStreamingContent: hasStreamingContent.value,
     isThinking: props.isThinking,
-    hasThinkingContent: hasThinkingContent.value,
+    hasThinkingContent: hasVisibleCompletedThinkingContent.value,
   }),
 );
 const isToolWaitingForResponse = computed(() => isWaitingForResponse.value && hasTransientToolCalls.value);
@@ -828,8 +875,7 @@ const hasTransientAssistantMessage = computed(
   () =>
     hasStreamingContent.value
     || hasToolCallHandoff.value
-    || props.isThinking
-    || hasThinkingContent.value
+    || hasVisibleTransientThinkingBlock.value
     || isWaitingForResponse.value,
 );
 
@@ -887,6 +933,150 @@ const nonCollapsibleToolItemIds = computed(() => {
 function shouldKeepToolItemExpanded(itemId: string) {
   return nonCollapsibleToolItemIds.value.has(itemId);
 }
+
+type HistoryRenderSegment =
+  | { type: "thinking"; key: string; content: string; duration?: number }
+  | { type: "toolCalls"; key: string; itemId: string; toolCalls: ToolCallDisplay[] }
+  | { type: "content"; key: string; content: string }
+  | { type: "knowledgeProposal"; key: string; message: ChatMessage };
+
+type TransientRenderSegment =
+  | { type: "thinking"; key: string; order: number }
+  | { type: "toolCalls"; key: string; order: number; toolCalls: ToolCallDisplay[] }
+  | { type: "waiting"; key: string; order: number; withinToolGroup: boolean }
+  | { type: "content"; key: string; order: number; content: string };
+
+const TRANSIENT_FALLBACK_ORDER: Record<TransientRenderSegment["type"], number> = {
+  thinking: 10,
+  toolCalls: 20,
+  waiting: 30,
+  content: 40,
+};
+
+const TRANSIENT_ORDER_TIEBREAK: Record<TransientRenderSegment["type"], number> = {
+  thinking: 0,
+  toolCalls: 1,
+  waiting: 2,
+  content: 3,
+};
+
+function historyRenderSegments(item: MessageRenderItem): HistoryRenderSegment[] {
+  const segments: HistoryRenderSegment[] = [];
+  const beforeToolCalls = toolCallsBeforeContentForRenderItem(item);
+  const afterToolCalls = toolCallsAfterContentForRenderItem(item);
+
+  if (shouldRenderHistoryThinkingBlock(item)) {
+    segments.push({
+      type: "thinking",
+      key: `${item.id}:thinking`,
+      content: item.message.thinkingContent ?? "",
+      duration: item.message.thinkingDuration,
+    });
+  }
+
+  if (beforeToolCalls.length > 0) {
+    segments.push({
+      type: "toolCalls",
+      key: `${item.id}:tools:before`,
+      itemId: item.id,
+      toolCalls: beforeToolCalls,
+    });
+  }
+
+  if (item.message.content) {
+    segments.push({
+      type: "content",
+      key: `${item.id}:content`,
+      content: item.message.content,
+    });
+  }
+
+  if (afterToolCalls.length > 0) {
+    segments.push({
+      type: "toolCalls",
+      key: `${item.id}:tools:after`,
+      itemId: item.id,
+      toolCalls: afterToolCalls,
+    });
+  }
+
+  for (const proposalMsg of item.attachedKnowledgeProposals) {
+    segments.push({
+      type: "knowledgeProposal",
+      key: proposalMsg.id,
+      message: proposalMsg,
+    });
+  }
+
+  return segments;
+}
+
+function firstToolCallOrder(toolCalls: ToolCallDisplay[]) {
+  let order = Number.POSITIVE_INFINITY;
+  const visit = (items: ToolCallDisplay[]) => {
+    for (const toolCall of items) {
+      if (typeof toolCall.order === "number" && toolCall.order > 0) {
+        order = Math.min(order, toolCall.order);
+      }
+      if (toolCall.nestedToolCalls && toolCall.nestedToolCalls.length > 0) {
+        visit(toolCall.nestedToolCalls);
+      }
+    }
+  };
+  visit(toolCalls);
+  return Number.isFinite(order) ? order : 0;
+}
+
+const transientToolCallsOrder = computed(() => firstToolCallOrder(transientToolCalls.value));
+
+const transientRenderSegments = computed<TransientRenderSegment[]>(() => {
+  const segments: TransientRenderSegment[] = [];
+  const toolOrder = transientToolCallsOrder.value || TRANSIENT_FALLBACK_ORDER.toolCalls;
+
+  if (hasVisibleTransientThinkingBlock.value) {
+    segments.push({
+      type: "thinking",
+      key: "transient:thinking",
+      order: props.thinkingOrder && props.thinkingOrder > 0
+        ? props.thinkingOrder
+        : TRANSIENT_FALLBACK_ORDER.thinking,
+    });
+  }
+
+  if (transientToolCalls.value.length > 0) {
+    segments.push({
+      type: "toolCalls",
+      key: "transient:tools",
+      order: toolOrder,
+      toolCalls: transientToolCalls.value,
+    });
+  }
+
+  if (isStandaloneWaitingPlaceholder.value) {
+    segments.push({
+      type: "waiting",
+      key: "transient:waiting",
+      order: TRANSIENT_FALLBACK_ORDER.waiting,
+      withinToolGroup: false,
+    });
+  }
+
+  if (props.streamingText) {
+    segments.push({
+      type: "content",
+      key: "transient:content",
+      order: props.streamingTextOrder && props.streamingTextOrder > 0
+        ? props.streamingTextOrder
+        : TRANSIENT_FALLBACK_ORDER.content,
+      content: props.streamingText,
+    });
+  }
+
+  return segments.sort((left, right) =>
+    left.order - right.order
+    || TRANSIENT_ORDER_TIEBREAK[left.type] - TRANSIENT_ORDER_TIEBREAK[right.type],
+  );
+});
 
 function formatThoughtSummary(duration?: number) {
   if (duration && duration > 0) {
@@ -1028,11 +1218,9 @@ function openImage(src: string) {
                   />
                 </div>
 
-                <div v-if="item.message.content" class="chat-transcript-plain-text ui-select-text">
+                <div v-if="userMessageDisplayContent(item.message)" class="chat-transcript-plain-text ui-select-text">
                   <template
-                    v-for="(segment, segmentIdx) in userContentMode === 'asset'
-                      ? parseChatAssetRefs(item.message.content)
-                      : [{ type: 'text', value: item.message.content }]"
+                    v-for="(segment, segmentIdx) in userMessageDisplaySegments(item.message)"
                     :key="segmentIdx"
                   >
                     <AssetChip v-if="segment.type === 'asset'" :path="segment.value" />
@@ -1050,60 +1238,64 @@ function openImage(src: string) {
                 />
 
                 <template v-else>
-                  <div v-if="item.message.thinkingContent" class="chat-transcript-thinking-block">
-                    <button
-                      v-if="variant === 'session'"
-                      type="button"
-                      class="chat-transcript-thinking-header is-clickable"
-                      @click="emit('openThinking', item.message.thinkingContent)"
-                    >
-                      <svg class="chat-transcript-thinking-chevron" viewBox="0 0 16 16" fill="currentColor" width="12" height="12">
-                        <path d="M6 3l5 5-5 5V3z" />
-                      </svg>
-                      <span class="chat-transcript-thinking-title">
-                        {{ formatThoughtSummary(item.message.thinkingDuration) }}
-                      </span>
-                    </button>
+                  <template
+                    v-for="segment in historyRenderSegments(item)"
+                    :key="segment.key"
+                  >
+                    <div v-if="segment.type === 'thinking'" class="chat-transcript-thinking-block">
+                      <button
+                        v-if="variant === 'session'"
+                        type="button"
+                        class="chat-transcript-thinking-header is-clickable"
+                        @click="emit('openThinking', segment.content)"
+                      >
+                        <svg class="chat-transcript-thinking-chevron" viewBox="0 0 16 16" fill="currentColor" width="12" height="12">
+                          <path d="M6 3l5 5-5 5V3z" />
+                        </svg>
+                        <span class="chat-transcript-thinking-title">
+                          {{ formatThoughtSummary(segment.duration) }}
+                        </span>
+                      </button>
 
-                    <div v-else class="chat-transcript-thinking-chip">
-                      <span class="chat-transcript-thinking-title">
-                        {{ formatThoughtSummary(item.message.thinkingDuration) }}
-                      </span>
+                      <div v-else class="chat-transcript-thinking-chip">
+                        <span class="chat-transcript-thinking-title">
+                          {{ formatThoughtSummary(segment.duration) }}
+                        </span>
+                      </div>
                     </div>
-                  </div>
 
-                  <div v-if="toolCallsForRenderItem(item).length > 0" class="chat-transcript-tool-calls-group">
-                    <ToolCallCollection
-                      :tool-calls="toolCallsForRenderItem(item)"
-                      :allow-collapse="!shouldKeepToolItemExpanded(item.id)"
-                      :collapse-enabled="!shouldKeepToolItemExpanded(item.id)"
-                      @viewport-anchor-start="emitToolViewportAnchorStart"
-                      @viewport-anchor-end="emitToolViewportAnchorEnd"
-                    >
-                      <template #default="{ toolCall }">
-                        <ToolCallBlock
-                          :tool-call="toolCall"
-                          :collapse-enabled="!shouldKeepToolItemExpanded(item.id)"
-                          @tool-viewport-anchor-start="emitToolViewportAnchorStart"
-                          @tool-viewport-anchor-end="emitToolViewportAnchorEnd"
-                        />
-                      </template>
-                    </ToolCallCollection>
-                  </div>
+                    <div v-else-if="segment.type === 'toolCalls'" class="chat-transcript-tool-calls-group">
+                      <ToolCallCollection
+                        :tool-calls="segment.toolCalls"
+                        :allow-collapse="!shouldKeepToolItemExpanded(segment.itemId)"
+                        :collapse-enabled="!shouldKeepToolItemExpanded(segment.itemId)"
+                        @viewport-anchor-start="emitToolViewportAnchorStart"
+                        @viewport-anchor-end="emitToolViewportAnchorEnd"
+                      >
+                        <template #default="{ toolCall }">
+                          <ToolCallBlock
+                            :tool-call="toolCall"
+                            :collapse-enabled="!shouldKeepToolItemExpanded(segment.itemId)"
+                            @tool-viewport-anchor-start="emitToolViewportAnchorStart"
+                            @tool-viewport-anchor-end="emitToolViewportAnchorEnd"
+                          />
+                        </template>
+                      </ToolCallCollection>
+                    </div>
 
-                  <MarkdownRenderer
-                    v-if="item.message.content"
-                    :content="item.message.content"
-                    enable-file-refs
-                  />
+                    <MarkdownRenderer
+                      v-else-if="segment.type === 'content'"
+                      :content="segment.content"
+                      enable-file-refs
+                    />
 
-                  <KnowledgeProposalCard
-                    v-for="proposalMsg in item.attachedKnowledgeProposals"
-                    :key="proposalMsg.id"
-                    :proposal="proposalMsg.knowledgeProposal!"
-                    @apply="emit('applyKnowledgeProposal', $event)"
-                    @ignore="emit('ignoreKnowledgeProposal', $event)"
-                  />
+                    <KnowledgeProposalCard
+                      v-else-if="segment.type === 'knowledgeProposal'"
+                      :proposal="segment.message.knowledgeProposal!"
+                      @apply="emit('applyKnowledgeProposal', $event)"
+                      @ignore="emit('ignoreKnowledgeProposal', $event)"
+                    />
+                  </template>
                 </template>
               </template>
             </div>
@@ -1131,71 +1323,76 @@ function openImage(src: string) {
           </div>
 
           <div class="chat-transcript-message-content" :class="`is-${variant}`">
-            <div v-if="isThinking || hasThinkingContent" class="chat-transcript-thinking-block">
-              <button
-                v-if="variant === 'session'"
-                type="button"
-                class="chat-transcript-thinking-header"
-                :class="{ active: isThinking, 'is-clickable': true }"
-                @click="emit('openThinking', '')"
-              >
-                <svg class="chat-transcript-thinking-chevron" viewBox="0 0 16 16" fill="currentColor" width="12" height="12">
-                  <path d="M6 3l5 5-5 5V3z" />
-                </svg>
-                <template v-if="isThinking">
+            <template
+              v-for="segment in transientRenderSegments"
+              :key="segment.key"
+            >
+              <div v-if="segment.type === 'thinking'" class="chat-transcript-thinking-block">
+                <button
+                  v-if="variant === 'session'"
+                  type="button"
+                  class="chat-transcript-thinking-header"
+                  :class="{ active: isThinking, 'is-clickable': true }"
+                  @click="emit('openThinking', '')"
+                >
+                  <svg class="chat-transcript-thinking-chevron" viewBox="0 0 16 16" fill="currentColor" width="12" height="12">
+                    <path d="M6 3l5 5-5 5V3z" />
+                  </svg>
+                  <template v-if="isThinking">
+                    <span class="chat-transcript-thinking-spinner" />
+                    <span class="chat-transcript-thinking-title">{{ thinkingActiveLabel }}</span>
+                  </template>
+                  <template v-else>
+                    <span class="chat-transcript-thinking-title">{{ formatThoughtSummary(thinkingDuration) }}</span>
+                  </template>
+                </button>
+
+                <div v-else class="chat-transcript-thinking-chip" :class="{ active: isThinking }">
+                  <span v-if="isThinking" class="chat-transcript-thinking-spinner compact" />
+                  <span class="chat-transcript-thinking-title">
+                    {{ isThinking ? thinkingActiveLabel : formatThoughtSummary(thinkingDuration) }}
+                  </span>
+                </div>
+              </div>
+
+              <div v-else-if="segment.type === 'toolCalls'" class="chat-transcript-tool-calls-group">
+                <ToolCallCollection
+                  :tool-calls="segment.toolCalls"
+                  :allow-collapse="transientToolCallsAllowCollapse"
+                  :collapse-enabled="transientToolCallsCollapseEnabled"
+                  @collapse-finished="onTransientToolCallsCollapseFinished"
+                  @viewport-anchor-start="emitToolViewportAnchorStart"
+                  @viewport-anchor-end="emitToolViewportAnchorEnd"
+                >
+                  <template #default="{ toolCall }">
+                    <ToolCallBlock
+                      :tool-call="toolCall"
+                      :collapse-enabled="transientToolCallsCollapseEnabled"
+                      @tool-viewport-anchor-start="emitToolViewportAnchorStart"
+                      @tool-viewport-anchor-end="emitToolViewportAnchorEnd"
+                    />
+                  </template>
+                </ToolCallCollection>
+                <div v-if="isToolWaitingForResponse" class="chat-transcript-tool-waiting-row">
+                  <span class="chat-transcript-thinking-spinner compact" />
+                  <span class="chat-transcript-thinking-title">{{ waitingLabel }}</span>
+                </div>
+              </div>
+
+              <div v-else-if="segment.type === 'waiting'" class="chat-transcript-thinking-block">
+                <div class="chat-transcript-thinking-header active">
                   <span class="chat-transcript-thinking-spinner" />
-                  <span class="chat-transcript-thinking-title">{{ thinkingActiveLabel }}</span>
-                </template>
-                <template v-else>
-                  <span class="chat-transcript-thinking-title">{{ formatThoughtSummary(thinkingDuration) }}</span>
-                </template>
-              </button>
-
-              <div v-else class="chat-transcript-thinking-chip" :class="{ active: isThinking }">
-                <span v-if="isThinking" class="chat-transcript-thinking-spinner compact" />
-                <span class="chat-transcript-thinking-title">
-                  {{ isThinking ? thinkingActiveLabel : formatThoughtSummary(thinkingDuration) }}
-                </span>
+                  <span class="chat-transcript-thinking-title">{{ waitingLabel }}</span>
+                </div>
               </div>
-            </div>
 
-            <div v-if="transientToolCalls.length > 0" class="chat-transcript-tool-calls-group">
-              <ToolCallCollection
-                :tool-calls="transientToolCalls"
-                :allow-collapse="transientToolCallsAllowCollapse"
-                :collapse-enabled="transientToolCallsCollapseEnabled"
-                @collapse-finished="onTransientToolCallsCollapseFinished"
-                @viewport-anchor-start="emitToolViewportAnchorStart"
-                @viewport-anchor-end="emitToolViewportAnchorEnd"
-              >
-                <template #default="{ toolCall }">
-                  <ToolCallBlock
-                    :tool-call="toolCall"
-                    :collapse-enabled="transientToolCallsCollapseEnabled"
-                    @tool-viewport-anchor-start="emitToolViewportAnchorStart"
-                    @tool-viewport-anchor-end="emitToolViewportAnchorEnd"
-                  />
-                </template>
-              </ToolCallCollection>
-              <div v-if="isToolWaitingForResponse" class="chat-transcript-tool-waiting-row">
-                <span class="chat-transcript-thinking-spinner compact" />
-                <span class="chat-transcript-thinking-title">{{ waitingLabel }}</span>
-              </div>
-            </div>
-
-            <div v-if="isStandaloneWaitingPlaceholder" class="chat-transcript-thinking-block">
-              <div class="chat-transcript-thinking-header active">
-                <span class="chat-transcript-thinking-spinner" />
-                <span class="chat-transcript-thinking-title">{{ waitingLabel }}</span>
-              </div>
-            </div>
-
-            <MarkdownRenderer
-              v-if="streamingText"
-              :content="streamingText"
-              cursor
-              enable-file-refs
-            />
+              <MarkdownRenderer
+                v-else-if="segment.type === 'content'"
+                :content="segment.content"
+                cursor
+                enable-file-refs
+              />
+            </template>
           </div>
         </div>
 

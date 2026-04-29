@@ -54,6 +54,8 @@ const {
   messages,
   streamingText,
   thinkingText,
+  streamingTextOrder,
+  thinkingOrder,
   isStreaming,
   isThinking,
   thinkingDuration,
@@ -149,7 +151,9 @@ function handleSelectAgent(agentId: string) {
   <EmbeddedChatPane
     :messages="messages"
     :streaming-text="streamingText"
+    :streaming-text-order="streamingTextOrder"
     :thinking-text="thinkingText"
+    :thinking-order="thinkingOrder"
     :is-streaming="isStreaming"
     :is-thinking="isThinking"
     :thinking-duration="thinkingDuration"

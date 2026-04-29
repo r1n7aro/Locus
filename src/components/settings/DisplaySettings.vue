@@ -122,6 +122,15 @@ onMounted(async () => {
       />
       <span>{{ t("settings.display.compactToolCalls") }}</span>
     </div>
+
+    <div class="toggle-row">
+      <BaseSwitch
+        :model-value="display.hideThinkingBlocks"
+        :aria-label="t('settings.display.hideThinkingBlocks')"
+        @update:model-value="setDisplay('hideThinkingBlocks', $event)"
+      />
+      <span>{{ t("settings.display.hideThinkingBlocks") }}</span>
+    </div>
   </div>
 
   <div class="settings-section">

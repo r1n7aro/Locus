@@ -152,8 +152,8 @@ describe("insertInlineMention", () => {
   it("inserts an inline asset mention before existing text without swallowing it", () => {
     const result = insertInlineMention("@As请继续处理", 0, 3, "Assets/UI/Main.prefab");
 
-    expect(result.text).toBe("@Assets/UI/Main.prefab 请继续处理");
-    expect(result.cursor).toBe("@Assets/UI/Main.prefab ".length);
+    expect(result.text).toBe("`Assets/UI/Main.prefab` 请继续处理");
+    expect(result.cursor).toBe("`Assets/UI/Main.prefab` ".length);
   });
 
   it("adds separators when inserting a mention in the middle of text", () => {
@@ -161,14 +161,26 @@ describe("insertInlineMention", () => {
     const start = text.indexOf("@");
     const result = insertInlineMention(text, start, start + 3, "Assets/UI/Main.prefab");
 
-    expect(result.text).toBe("请修复 @Assets/UI/Main.prefab 这里的逻辑");
-    expect(result.cursor).toBe("请修复 @Assets/UI/Main.prefab ".length);
+    expect(result.text).toBe("请修复 `Assets/UI/Main.prefab` 这里的逻辑");
+    expect(result.cursor).toBe("请修复 `Assets/UI/Main.prefab` ".length);
   });
 
   it("preserves trailing slash when inserting a folder mention", () => {
     const result = insertInlineMention("@UIE继续处理", 0, 4, "UIElementsSchema/");
 
-    expect(result.text).toBe("@UIElementsSchema/ 继续处理");
-    expect(result.cursor).toBe("@UIElementsSchema/ ".length);
+    expect(result.text).toBe("`UIElementsSchema/` 继续处理");
+    expect(result.cursor).toBe("`UIElementsSchema/` ".length);
+  });
+
+  it("wraps scene object mentions so spaces stay inside the path", () => {
+    const result = insertInlineMention(
+      "@Main继续处理",
+      0,
+      5,
+      "Assets/Scenes/Main Menu.unity/Canvas Root/Spot Light (2)",
+    );
+
+    expect(result.text).toBe("`Assets/Scenes/Main Menu.unity/Canvas Root/Spot Light (2)` 继续处理");
+    expect(result.cursor).toBe("`Assets/Scenes/Main Menu.unity/Canvas Root/Spot Light (2)` ".length);
   });
 });

@@ -103,4 +103,30 @@ describe("display settings transcript alignment", () => {
     expect(zh).toContain('"settings.display.mergeGitTreeStatusIcon": "层级视图用彩色图标显示修改状态"');
     expect(en).toContain('"settings.display.mergeGitTreeStatusIcon": "Use colored icons for Git tree status"');
   });
+
+  it("adds a completed thinking block visibility toggle that defaults to hidden", () => {
+    const displaySettings = read("src/composables/useDisplaySettings.ts");
+    const displayPanel = read("src/components/settings/DisplaySettings.vue");
+    const transcript = read("src/components/chat/ChatTranscript.vue");
+    const zh = read("src/language/zh.json");
+    const en = read("src/language/en.json");
+
+    expect(displaySettings).toContain("hideThinkingBlocks: boolean;");
+    expect(displaySettings).toContain("hideThinkingBlocks: true,");
+
+    expect(displayPanel).toContain(":model-value=\"display.hideThinkingBlocks\"");
+    expect(displayPanel).toContain(":aria-label=\"t('settings.display.hideThinkingBlocks')\"");
+    expect(displayPanel).toContain("@update:model-value=\"setDisplay('hideThinkingBlocks', $event)\"");
+    expect(displayPanel).toContain("{{ t(\"settings.display.hideThinkingBlocks\") }}");
+
+    expect(transcript).toContain("function shouldHideThinkingBlocks()");
+    expect(transcript).toContain("return displaySettings.hideThinkingBlocks !== false;");
+    expect(transcript).toContain("return !shouldHideThinkingBlocks() && !!item.message.thinkingContent?.trim();");
+    expect(transcript).toContain("const hasVisibleCompletedThinkingContent = computed(() => !shouldHideThinkingBlocks() && hasThinkingContent.value);");
+    expect(transcript).toContain("const hasVisibleTransientThinkingBlock = computed(() => props.isThinking || hasVisibleCompletedThinkingContent.value);");
+    expect(transcript).toContain("hasThinkingContent: hasVisibleCompletedThinkingContent.value,");
+
+    expect(zh).toContain('"settings.display.hideThinkingBlocks": "隐藏已完成思考块"');
+    expect(en).toContain('"settings.display.hideThinkingBlocks": "Hide completed thinking blocks"');
+  });
 });

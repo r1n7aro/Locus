@@ -64,6 +64,8 @@ export interface AssistantToolMergeCandidate {
 
 export type AssistantToolMergeResult<T> = T & {
   displayToolCalls?: ToolCallInfo[];
+  displayToolCallsBeforeContent?: ToolCallInfo[];
+  displayToolCallsAfterContent?: ToolCallInfo[];
 };
 
 export interface ToolCallInfoRenderSource {
@@ -462,9 +464,11 @@ export function mergeSequentialAssistantToolCalls<T extends AssistantToolMergeCa
 
   const flushPendingToolOnlyItem = () => {
     if (!pendingToolOnlyItem) return;
+    const displayToolCalls = pendingToolCalls.length > 0 ? [...pendingToolCalls] : undefined;
     merged.push({
       ...pendingToolOnlyItem,
-      displayToolCalls: pendingToolCalls.length > 0 ? [...pendingToolCalls] : undefined,
+      displayToolCalls,
+      displayToolCallsBeforeContent: displayToolCalls,
     });
     pendingToolOnlyItem = null;
     pendingToolCalls = [];
@@ -487,9 +491,13 @@ export function mergeSequentialAssistantToolCalls<T extends AssistantToolMergeCa
     }
 
     if (pendingToolCalls.length > 0 && canAbsorbPendingRounds) {
+      const beforeContentToolCalls = [...pendingToolCalls];
+      const afterContentToolCalls = currentToolCalls.length > 0 ? [...currentToolCalls] : undefined;
       merged.push({
         ...item,
-        displayToolCalls: [...pendingToolCalls, ...currentToolCalls],
+        displayToolCalls: [...beforeContentToolCalls, ...currentToolCalls],
+        displayToolCallsBeforeContent: beforeContentToolCalls,
+        displayToolCallsAfterContent: afterContentToolCalls,
       });
       clearPendingToolOnlyItem();
       continue;
@@ -500,6 +508,10 @@ export function mergeSequentialAssistantToolCalls<T extends AssistantToolMergeCa
     merged.push({
       ...item,
       displayToolCalls: currentToolCalls.length > 0 ? [...currentToolCalls] : undefined,
+      displayToolCallsBeforeContent:
+        !hasResponseText && currentToolCalls.length > 0 ? [...currentToolCalls] : undefined,
+      displayToolCallsAfterContent:
+        hasResponseText && currentToolCalls.length > 0 ? [...currentToolCalls] : undefined,
     });
   }
 

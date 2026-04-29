@@ -84,6 +84,9 @@ function createState(key: string): EmbeddedChatState {
     streamingText: "",
     rawStreamText: "",
     streamingThinking: "",
+    streamSequence: 0,
+    streamingTextOrder: 0,
+    thinkingOrder: 0,
     isStreaming: false,
     isThinking: false,
     thinkingStartTime: 0,
@@ -119,6 +122,7 @@ function clearState(state: EmbeddedChatState) {
   state.todos = [];
   state.showTodoPanel = false;
   state.undoableMessageIds = new Set<string>();
+  state.streamSequence = 0;
   resetRoundState(state);
 }
 
@@ -150,6 +154,8 @@ function resetRoundState(state: EmbeddedChatState) {
   state.streamingText = "";
   state.rawStreamText = "";
   state.streamingThinking = "";
+  state.streamingTextOrder = 0;
+  state.thinkingOrder = 0;
   state.isThinking = false;
   state.thinkingStartTime = 0;
   state.thinkingDuration = 0;
@@ -164,6 +170,15 @@ function applyMutation(state: EmbeddedChatState, mutation: StreamMutation) {
       break;
     case "appendThinking":
       state.streamingThinking += mutation.text;
+      break;
+    case "setStreamSequence":
+      state.streamSequence = Math.max(state.streamSequence, mutation.value);
+      break;
+    case "setStreamingTextOrder":
+      state.streamingTextOrder = mutation.order;
+      break;
+    case "setThinkingOrder":
+      state.thinkingOrder = mutation.order;
       break;
     case "setThinking":
       state.isThinking = mutation.value;
@@ -356,6 +371,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     state.error = null;
     state.pendingQuestion = null;
     state.pendingToolConfirms = [];
+    state.streamSequence = 0;
     resetRoundState(state);
     state.isStreaming = true;
     state.pendingRun = true;
@@ -477,6 +493,8 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
   const messages = computed(() => activeState.value.messages);
   const streamingText = computed(() => activeState.value.streamingText);
   const thinkingText = computed(() => activeState.value.streamingThinking);
+  const streamingTextOrder = computed(() => activeState.value.streamingTextOrder);
+  const thinkingOrder = computed(() => activeState.value.thinkingOrder);
   const isStreaming = computed(() => activeState.value.isStreaming);
   const isThinking = computed(() => activeState.value.isThinking);
   const thinkingDuration = computed(() => activeState.value.thinkingDuration);
@@ -514,6 +532,8 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     messages,
     streamingText,
     thinkingText,
+    streamingTextOrder,
+    thinkingOrder,
     isStreaming,
     isThinking,
     thinkingDuration,

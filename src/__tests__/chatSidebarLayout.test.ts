@@ -146,14 +146,14 @@ describe("chat sidebar layout", () => {
     expect(transcript).toContain("const transientCollapseCandidateToolCalls = computed(() => {");
     expect(transcript).toContain("const transientToolCallsCanCollapse = computed(() =>");
     expect(transcript).toContain("@collapse-finished=\"onTransientToolCallsCollapseFinished\"");
-    expect(transcript).toContain(":tool-calls=\"transientToolCalls\"");
+    expect(transcript).toContain(":tool-calls=\"segment.toolCalls\"");
     expect(transcript).toContain(":allow-collapse=\"transientToolCallsAllowCollapse\"");
     expect(transcript).toContain(":collapse-enabled=\"transientToolCallsCollapseEnabled\"");
     expect(chatView).toContain("const toolHandoffViewportQuiet = ref(false);");
     expect(chatView).toContain("function handleToolHandoffQuietChange(quiet: boolean) {");
     expect(chatView).toContain("@tool-handoff-quiet-change=\"handleToolHandoffQuietChange\"");
-    expect(transcript).toContain(":allow-collapse=\"!shouldKeepToolItemExpanded(item.id)\"");
-    expect(transcript).toContain(":collapse-enabled=\"!shouldKeepToolItemExpanded(item.id)\"");
+    expect(transcript).toContain(":allow-collapse=\"!shouldKeepToolItemExpanded(segment.itemId)\"");
+    expect(transcript).toContain(":collapse-enabled=\"!shouldKeepToolItemExpanded(segment.itemId)\"");
     expect(toolBlock).toContain("collapseEnabled?: boolean;");
     expect(toolBlock).toContain(":tool-calls=\"toolCall.nestedToolCalls\"");
     expect(toolBlock).toContain(":collapse-enabled=\"collapseEnabled\"");
@@ -194,8 +194,8 @@ describe("chat sidebar layout", () => {
   it("keeps handoff waiting inside the transient tool group", () => {
     const transcript = read("src/components/chat/ChatTranscript.vue");
     const toolWaitingIndex = transcript.indexOf("<div v-if=\"isToolWaitingForResponse\" class=\"chat-transcript-tool-waiting-row\">");
-    const standaloneWaitingIndex = transcript.indexOf("<div v-if=\"isStandaloneWaitingPlaceholder\" class=\"chat-transcript-thinking-block\">");
-    const toolGroupIndex = transcript.indexOf("<div v-if=\"transientToolCalls.length > 0\" class=\"chat-transcript-tool-calls-group\">");
+    const standaloneWaitingIndex = transcript.indexOf("<div v-else-if=\"segment.type === 'waiting'\" class=\"chat-transcript-thinking-block\">");
+    const toolGroupIndex = transcript.indexOf("<div v-else-if=\"segment.type === 'toolCalls'\" class=\"chat-transcript-tool-calls-group\">");
 
     expect(toolGroupIndex).toBeGreaterThan(-1);
     expect(toolWaitingIndex).toBeGreaterThan(toolGroupIndex);
@@ -213,7 +213,7 @@ describe("chat sidebar layout", () => {
 
     expect(batches).toContain("let pendingToolOnlyItem: T | null = null;");
     expect(batches).toContain("pendingToolOnlyItem ??= item;");
-    expect(batches).toContain("displayToolCalls: pendingToolCalls.length > 0 ? [...pendingToolCalls] : undefined");
+    expect(batches).toContain("const displayToolCalls = pendingToolCalls.length > 0 ? [...pendingToolCalls] : undefined;");
     expect(transcript).toContain("'tool-only': isToolOnlyRenderItem(item),");
     expect(transcript).not.toContain("tool-only-followup");
     expect(transcript).not.toContain("shouldTightenToolOnlyGap");

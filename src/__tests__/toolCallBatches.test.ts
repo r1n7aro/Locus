@@ -467,6 +467,16 @@ describe("toolCallBatches", () => {
       "tc-read-3",
       "tc-read-4",
     ]);
+    expect(merged[0]?.displayToolCallsBeforeContent?.map((toolCall) => toolCall.id)).toEqual([
+      "tc-ask",
+      "tc-list",
+    ]);
+    expect(merged[0]?.displayToolCallsAfterContent?.map((toolCall) => toolCall.id)).toEqual([
+      "tc-read-1",
+      "tc-read-2",
+      "tc-read-3",
+      "tc-read-4",
+    ]);
   });
 
   it("keeps visible assistant rounds separate", () => {
@@ -486,6 +496,8 @@ describe("toolCallBatches", () => {
     expect(merged).toHaveLength(2);
     expect(merged[0]?.displayToolCalls?.map((toolCall) => toolCall.id)).toEqual(["tc-ask"]);
     expect(merged[1]?.displayToolCalls?.map((toolCall) => toolCall.id)).toEqual(["tc-list"]);
+    expect(merged[0]?.displayToolCallsAfterContent?.map((toolCall) => toolCall.id)).toEqual(["tc-ask"]);
+    expect(merged[1]?.displayToolCallsAfterContent?.map((toolCall) => toolCall.id)).toEqual(["tc-list"]);
   });
 
   it("keeps trailing tool-only assistant rounds in one append-only list before text arrives", () => {

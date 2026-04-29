@@ -141,10 +141,12 @@ async function onChatDiffLfsPulled() {
 const props = defineProps<{
   messages: ChatMessage[];
   streamingText: string;
+  streamingTextOrder?: number;
   isStreaming: boolean;
   isThinking: boolean;
   hasThinking: boolean;
   thinkingText: string;
+  thinkingOrder?: number;
   thinkingDuration: number;
   activeToolCalls: ToolCallDisplay[];
   agents: AgentInfo[];
@@ -1335,9 +1337,11 @@ onUnmounted(() => {
           :session-key="activeSessionId || NEW_CHAT_DRAFT_KEY"
           :messages="messages"
           :streaming-text="displayedStreamingText"
+          :streaming-text-order="streamingTextOrder"
           :is-streaming="isStreaming"
           :is-thinking="isThinking"
           :has-thinking="hasThinking"
+          :thinking-order="thinkingOrder"
           :thinking-duration="thinkingDuration"
           :active-tool-calls="activeToolCalls"
           user-label="You"

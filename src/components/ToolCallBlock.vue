@@ -47,7 +47,12 @@ const isSubagentTool = computed(() => {
   return name === "explore" || name === "task";
 });
 
+const waitingLabel = computed(() => (
+  isSubagentTool.value ? t("tool.subagentWaiting") : t("tool.waiting")
+));
+
 const isCanvasTool = computed(() => props.toolCall.name === "canvas");
+const showRecompileHint = computed(() => props.toolCall.name === "unity_recompile" && props.toolCall.status === "running");
 const toolBlockOverride = computed(() => resolveToolBlockOverride(props.toolCall.name));
 
 function runOnNextFrame(callback: () => void) {
@@ -417,7 +422,12 @@ const highlightedOutput = computed(() => {
     @tool-viewport-anchor-start="emitToolViewportAnchorStart"
     @tool-viewport-anchor-end="emitToolViewportAnchorEnd"
   />
-  <div v-else ref="rootRef" class="tool-call-block" :class="[toolCall.status, { 'is-expanded': expanded }]">
+  <div
+    v-else
+    ref="rootRef"
+    class="tool-call-block"
+    :class="[toolCall.status, { 'is-expanded': expanded, 'is-recompile-attention': showRecompileHint }]"
+  >
     <button ref="headerRef" type="button" class="tool-call-header ui-select-none" @click="toggleExpanded">
       <span class="tool-call-icon" :class="statusIcon">
         <span v-if="toolCall.status === 'running'" class="spinner-anim"></span>
@@ -426,7 +436,7 @@ const highlightedOutput = computed(() => {
       <span class="tool-call-name">{{ displayName }}</span>
       <span v-if="argsSummary" class="tool-call-summary">{{ argsSummary }}</span>
     </button>
-    <div v-if="toolCall.name === 'unity_recompile' && toolCall.status === 'running'" class="recompile-hint">
+    <div v-if="showRecompileHint" class="recompile-hint">
       <div class="recompile-hint-main">{{ t("tool.recompile.hint") }}</div>
       <div class="recompile-hint-sub">{{ t("tool.recompile.sub") }}</div>
     </div>
@@ -515,7 +525,7 @@ const highlightedOutput = computed(() => {
         <template v-else>
           <div v-if="toolCall.status === 'running'" class="tool-call-waiting">
             <span class="waiting-dots"></span>
-            <span class="waiting-text">{{ t("tool.waiting") }}</span>
+            <span class="waiting-text">{{ waitingLabel }}</span>
           </div>
           <pre v-else class="tool-call-pre ui-select-text">{{ t("tool.noOutput") }}</pre>
         </template>
@@ -541,6 +551,17 @@ const highlightedOutput = computed(() => {
 
 .tool-call-block.is-expanded {
   width: 100%;
+}
+
+.tool-call-block.is-recompile-attention {
+  align-items: stretch;
+  padding: 4px 6px 6px;
+  border: 1px solid var(--status-warn-border);
+  border-left-width: 3px;
+  border-left-color: var(--status-warn-fg);
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--status-warn-bg) 82%, var(--panel-bg) 18%);
+  overflow: hidden;
 }
 
 .tool-call-header {
@@ -570,6 +591,10 @@ const highlightedOutput = computed(() => {
 .tool-call-header:focus-visible {
   outline: 1px solid color-mix(in srgb, var(--accent-color) 36%, transparent);
   outline-offset: 1px;
+}
+
+.tool-call-block.is-recompile-attention .tool-call-icon.spinner {
+  color: var(--status-warn-fg);
 }
 
 .tool-call-icon {
@@ -903,21 +928,21 @@ const highlightedOutput = computed(() => {
 }
 
 .recompile-hint {
-  padding: 8px 12px;
-  border-top: 1px solid var(--border-color);
-  background: #2a2520;
-  border-left: 3px solid #e8a838;
+  align-self: stretch;
+  margin-top: 4px;
+  padding: 6px 2px 0 20px;
+  border-top: 1px solid color-mix(in srgb, var(--status-warn-border) 72%, transparent);
 }
 
 .recompile-hint-main {
   font-size: 13px;
   font-weight: 600;
-  color: #e8a838;
+  color: var(--status-warn-fg);
 }
 
 .recompile-hint-sub {
   font-size: 11px;
-  color: #9a8a70;
+  color: color-mix(in srgb, var(--status-warn-fg) 48%, var(--text-secondary));
   margin-top: 2px;
 }
 
