@@ -18,6 +18,27 @@ describe("chat sidebar layout", () => {
     );
   });
 
+  it("locks the chat changes undo action while undo is running", () => {
+    const changesPanel = read("src/components/ChatChangesPanel.vue");
+    const zh = read("src/language/zh.json");
+    const en = read("src/language/en.json");
+
+    expect(changesPanel).toContain("const isUndoing = ref(false);");
+    expect(changesPanel).toContain("const undoButtonBusy = computed(() => checkingUndoConflicts.value || isUndoing.value);");
+    expect(changesPanel).toContain("if (isUndoing.value) return t(\"chat.changes.undoing\");");
+    expect(changesPanel).toContain("if (!targetId || isUndoing.value) return;");
+    expect(changesPanel).toContain("isUndoing.value = true;");
+    expect(changesPanel).toContain("isUndoing.value = false;");
+    expect(changesPanel).toContain("if (isUndoing.value) return;");
+    expect(changesPanel).toContain(":disabled=\"undoButtonBusy\"");
+    expect(changesPanel).toContain("{{ undoButtonLabel }}");
+    expect(changesPanel).toContain(":disabled=\"isUndoing\" @click=\"cancelUndo\"");
+    expect(changesPanel).toContain("{{ isUndoing ? t('chat.changes.undoing') : t('chat.changes.confirmOk') }}");
+    expect(changesPanel).toContain("{{ isUndoing ? t('chat.changes.undoing') : t('chat.changes.undoConflictForce') }}");
+    expect(zh).toContain("\"chat.changes.undoing\": \"正在撤销中\"");
+    expect(en).toContain("\"chat.changes.undoing\": \"Undoing\"");
+  });
+
   it("uses a single right sidebar that stacks todos above file changes", () => {
     const workspace = read("src/components/ChatWorkspaceView.vue");
     const sidebar = read("src/components/ChatSidebarPanel.vue");

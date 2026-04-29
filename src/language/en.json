@@ -351,6 +351,7 @@
   "chat.changes.undo": "Undo",
   "chat.changes.undoCurrent": "Undo Current Round",
   "chat.changes.undoAll": "Undo All Changes",
+  "chat.changes.undoing": "Undoing",
   "chat.changes.undoCurrentConfirm": "This will undo all file changes from the current round and roll back the corresponding chat history. Continue?",
   "chat.changes.undoAllConfirm": "This will undo all file changes from this entire conversation and roll back all related chat history. Continue?",
   "chat.changes.undoConflictMessage": "Undo would overwrite newer changes from other sessions. Review the conflicting files below before forcing it.",

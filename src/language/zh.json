@@ -351,6 +351,7 @@
   "chat.changes.undo": "撤销",
   "chat.changes.undoCurrent": "撤销本轮修改",
   "chat.changes.undoAll": "撤销全部修改",
+  "chat.changes.undoing": "正在撤销中",
   "chat.changes.undoCurrentConfirm": "将撤销当前轮次的所有文件修改，并回退对应的对话记录，确定继续？",
   "chat.changes.undoAllConfirm": "将撤销本次对话中的全部文件修改，并回退所有相关的对话记录，确定继续？",
   "chat.changes.undoConflictMessage": "本次撤销会覆盖其他会话里更新的文件。请先确认下面的冲突文件，再决定是否强制撤销。",

@@ -264,6 +264,7 @@ async function onItemClick(item: DisplayItem) {
 const showUndoConfirm = ref(false);
 const showUndoConflictConfirm = ref(false);
 const checkingUndoConflicts = ref(false);
+const isUndoing = ref(false);
 const undoConflicts = ref<UndoConflictInfo[]>([]);
 
 /** The assistantMessageId to undo — depends on mode */
@@ -283,6 +284,13 @@ const undoRestoreText = computed(() => {
   return findUndoRestoreUserText(chatStore.messages, undoTargetId.value);
 });
 
+const undoButtonBusy = computed(() => checkingUndoConflicts.value || isUndoing.value);
+
+const undoButtonLabel = computed(() => {
+  if (isUndoing.value) return t("chat.changes.undoing");
+  return mode.value === "current" ? t("chat.changes.undoCurrent") : t("chat.changes.undoAll");
+});
+
 function sessionLabel(conflict: UndoConflictInfo): string {
   return conflict.sessionTitle?.trim() || conflict.sessionId;
 }
@@ -292,7 +300,7 @@ function conflictFilesLabel(conflict: UndoConflictInfo): string {
 }
 
 async function onUndoClick() {
-  if (!undoTargetId.value) return;
+  if (!undoTargetId.value || undoButtonBusy.value) return;
   checkingUndoConflicts.value = true;
   try {
     undoConflicts.value = await chatStore.checkUndoConflicts(undoTargetId.value);
@@ -313,18 +321,26 @@ async function onUndoClick() {
 }
 
 async function confirmUndo(force = false) {
-  if (!undoTargetId.value) return;
+  const targetId = undoTargetId.value;
+  if (!targetId || isUndoing.value) return;
   const restoreText = undoRestoreText.value;
-  showUndoConfirm.value = false;
-  showUndoConflictConfirm.value = false;
+  isUndoing.value = true;
   changesStore.closeInlineDiff();
-  const undone = await chatStore.performUndo(undoTargetId.value, { force });
-  if (undone && restoreText) {
-    uiStore.stageChatPrefill(restoreText);
+  try {
+    const undone = await chatStore.performUndo(targetId, { force });
+    if (undone && restoreText) {
+      uiStore.stageChatPrefill(restoreText);
+    }
+  } finally {
+    isUndoing.value = false;
+    showUndoConfirm.value = false;
+    showUndoConflictConfirm.value = false;
+    undoConflicts.value = [];
   }
 }
 
 function cancelUndo() {
+  if (isUndoing.value) return;
   showUndoConfirm.value = false;
   showUndoConflictConfirm.value = false;
   undoConflicts.value = [];
@@ -520,8 +536,8 @@ function onOpenInEditor(ev: MouseEvent, path: string) {
 
     <!-- Undo footer -->
     <div v-if="displayItems.length > 0 && !chatStore.isStreaming" class="panel-footer">
-      <button type="button" class="undo-btn" :disabled="checkingUndoConflicts" @click="onUndoClick">
-        {{ mode === 'current' ? t('chat.changes.undoCurrent') : t('chat.changes.undoAll') }}
+      <button type="button" class="undo-btn" :disabled="undoButtonBusy" @click="onUndoClick">
+        {{ undoButtonLabel }}
       </button>
     </div>
 
@@ -533,8 +549,10 @@ function onOpenInEditor(ev: MouseEvent, path: string) {
             {{ mode === 'current' ? t('chat.changes.undoCurrentConfirm') : t('chat.changes.undoAllConfirm') }}
           </p>
           <div class="confirm-actions">
-            <button type="button" class="confirm-cancel" @click="cancelUndo">{{ t('chat.changes.cancel') }}</button>
-            <button type="button" class="confirm-ok" @click="confirmUndo()">{{ t('chat.changes.confirmOk') }}</button>
+            <button type="button" class="confirm-cancel" :disabled="isUndoing" @click="cancelUndo">{{ t('chat.changes.cancel') }}</button>
+            <button type="button" class="confirm-ok" :disabled="isUndoing" @click="confirmUndo()">
+              {{ isUndoing ? t('chat.changes.undoing') : t('chat.changes.confirmOk') }}
+            </button>
           </div>
         </div>
       </div>
@@ -553,8 +571,10 @@ function onOpenInEditor(ev: MouseEvent, path: string) {
             </div>
           </div>
           <div class="confirm-actions">
-            <button type="button" class="confirm-cancel" @click="cancelUndo">{{ t('chat.changes.cancel') }}</button>
-            <button type="button" class="confirm-ok" @click="confirmUndo(true)">{{ t('chat.changes.undoConflictForce') }}</button>
+            <button type="button" class="confirm-cancel" :disabled="isUndoing" @click="cancelUndo">{{ t('chat.changes.cancel') }}</button>
+            <button type="button" class="confirm-ok" :disabled="isUndoing" @click="confirmUndo(true)">
+              {{ isUndoing ? t('chat.changes.undoing') : t('chat.changes.undoConflictForce') }}
+            </button>
           </div>
         </div>
       </div>
@@ -954,7 +974,7 @@ function onOpenInEditor(ev: MouseEvent, path: string) {
   cursor: wait;
 }
 
-.undo-btn:hover {
+.undo-btn:not(:disabled):hover {
   background: var(--status-danger-bg);
 }
 
@@ -1040,17 +1060,23 @@ function onOpenInEditor(ev: MouseEvent, path: string) {
   color: var(--text-color);
 }
 
-.confirm-cancel:hover {
-  background: var(--hover-bg);
-}
-
 .confirm-ok {
   background: var(--status-danger-fg);
   color: var(--bg-color);
   border-color: var(--status-danger-fg);
 }
 
-.confirm-ok:hover {
+.confirm-cancel:disabled,
+.confirm-ok:disabled {
+  opacity: 0.6;
+  cursor: wait;
+}
+
+.confirm-cancel:not(:disabled):hover {
+  background: var(--hover-bg);
+}
+
+.confirm-ok:not(:disabled):hover {
   filter: brightness(0.92);
 }
 
