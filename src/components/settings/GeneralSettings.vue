@@ -1,10 +1,10 @@
 <script setup lang="ts">
-import { onMounted, ref } from "vue";
+import { computed, onMounted, ref } from "vue";
 import { t } from "../../i18n";
 import type { Locale } from "../../i18n";
 import BaseSegmented from "../ui/BaseSegmented.vue";
 import BaseSwitch from "../ui/BaseSwitch.vue";
-import { getDebugMode, setDebugMode } from "../../services/permissions";
+import { getCachedDebugMode, getDebugMode, setDebugMode } from "../../services/permissions";
 import {
   clearAppStorageMigration,
   getAppStorageInfo,
@@ -29,7 +29,9 @@ const emit = defineEmits<{
 }>();
 
 const notificationStore = useNotificationStore();
-const debugEnabled = ref(false);
+const initialDebugMode = getCachedDebugMode();
+const debugEnabled = ref(initialDebugMode ?? false);
+const debugReady = ref(initialDebugMode !== null);
 const debugBusy = ref(false);
 const storageInfo = ref<AppStorageInfo | null>(null);
 const storageBusy = ref(false);
@@ -41,21 +43,30 @@ const languageOptions = [
   { value: "en", label: "English" },
 ] as const;
 
+const debugStatusLabel = computed(() => {
+  if (!debugReady.value) return t("common.loading");
+  return debugEnabled.value
+    ? t("settings.general.debugModeOn")
+    : t("settings.general.debugModeOff");
+});
+
 onMounted(async () => {
   try {
     debugEnabled.value = await getDebugMode();
+    debugReady.value = true;
   } catch (e) {
     const err = normalizeAppError(e);
     notificationStore.addNotice("error", err.message, {
       code: err.code,
       operation: "loadDebugMode",
     });
+    debugReady.value = true;
   }
   await refreshStorageInfo();
 });
 
 async function toggleDebug() {
-  if (debugBusy.value) return;
+  if (!debugReady.value || debugBusy.value) return;
   debugBusy.value = true;
   const next = !debugEnabled.value;
   try {
@@ -219,14 +230,16 @@ async function cancelStorageMigration() {
   <div class="settings-section">
     <div class="section-label">{{ t("settings.general.debugMode") }}</div>
     <p class="section-desc">{{ t("settings.general.debugModeDesc") }}</p>
-    <label class="debug-toggle">
+    <label class="debug-toggle" :aria-busy="!debugReady">
       <BaseSwitch
+        v-if="debugReady"
         :model-value="debugEnabled"
         :disabled="debugBusy"
         :aria-label="t('settings.general.debugMode')"
         @update:model-value="toggleDebug"
       />
-      <span class="debug-toggle-label">{{ debugEnabled ? t("settings.general.debugModeOn") : t("settings.general.debugModeOff") }}</span>
+      <span v-else class="debug-toggle-placeholder" aria-hidden="true" />
+      <span class="debug-toggle-label">{{ debugStatusLabel }}</span>
     </label>
   </div>
 
@@ -316,6 +329,15 @@ async function cancelStorageMigration() {
   gap: 10px;
   color: var(--text-color);
   user-select: none;
+}
+.debug-toggle-placeholder {
+  flex-shrink: 0;
+  width: 34px;
+  height: 18px;
+  border: 1px solid color-mix(in srgb, var(--border-strong) 82%, var(--text-secondary) 18%);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--input-bg) 76%, var(--hover-bg) 24%);
+  opacity: 0.55;
 }
 .debug-toggle-label {
   font-size: 13px;

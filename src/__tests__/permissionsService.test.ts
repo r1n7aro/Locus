@@ -6,7 +6,12 @@ vi.mock("../services/ipc", () => ({
   ipcInvoke: ipcInvokeMock,
 }));
 
-import { saveToolPermissionMode } from "../services/permissions";
+import {
+  getCachedDebugMode,
+  getDebugMode,
+  saveToolPermissionMode,
+  setDebugMode,
+} from "../services/permissions";
 
 describe("permissions service", () => {
   beforeEach(() => {
@@ -19,6 +24,28 @@ describe("permissions service", () => {
 
     expect(ipcInvokeMock).toHaveBeenCalledWith("save_tool_permission_mode", {
       value: "ask",
+    });
+  });
+
+  it("caches loaded debug mode for remounted settings panels", async () => {
+    ipcInvokeMock.mockResolvedValueOnce(true);
+
+    await expect(getDebugMode()).resolves.toBe(true);
+    await expect(getDebugMode()).resolves.toBe(true);
+
+    expect(getCachedDebugMode()).toBe(true);
+    expect(ipcInvokeMock).toHaveBeenCalledTimes(1);
+    expect(ipcInvokeMock).toHaveBeenCalledWith("get_debug_mode");
+  });
+
+  it("updates the cached debug mode after saving", async () => {
+    await setDebugMode(false);
+
+    expect(getCachedDebugMode()).toBe(false);
+    await expect(getDebugMode()).resolves.toBe(false);
+    expect(ipcInvokeMock).toHaveBeenCalledTimes(1);
+    expect(ipcInvokeMock).toHaveBeenCalledWith("set_debug_mode", {
+      value: false,
     });
   });
 });
