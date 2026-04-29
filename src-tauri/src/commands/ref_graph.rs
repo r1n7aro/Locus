@@ -104,6 +104,11 @@ pub async fn ref_graph_scan(
                 *g = Some(phase.clone());
             }
         })?;
+        let (graph, reconcile_stats) = crate::asset_db::watcher::reconcile_loaded_db(&root, graph)?;
+        eprintln!(
+            "[AssetDb] post-scan reconcile complete: queued={}, processed={}, failed={}",
+            reconcile_stats.queued, reconcile_stats.processed, reconcile_stats.failed
+        );
         Ok::<(AssetDb, ScanStats), String>((graph, stats))
     })
     .await

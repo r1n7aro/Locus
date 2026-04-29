@@ -389,27 +389,59 @@ pub fn run() {
                 &initial_working_dir_copy,
             )) {
                 asset_db::LoadExistingAssetDb::Ready(graph) => {
-                    match commands::asset::read_persisted_last_scan_info(std::path::Path::new(
-                        &initial_working_dir_copy,
-                    )) {
-                        Ok(Some(info)) => last_scan_info_state.set(info),
-                        Ok(None) => {}
-                        Err(err) => {
+                    let project_root = std::path::Path::new(&initial_working_dir_copy);
+                    match asset_db::watcher::reconcile_loaded_db(project_root, graph) {
+                        Ok((graph, stats)) => {
                             eprintln!(
-                                "[Locus] warning: failed to load persisted asset scan info: {}",
+                                "[Locus] existing ref_graph DB reconciled: queued={}, processed={}, failed={}",
+                                stats.queued, stats.processed, stats.failed
+                            );
+                            match commands::asset::read_persisted_last_scan_info(
+                                std::path::Path::new(&initial_working_dir_copy),
+                            ) {
+                                Ok(Some(info)) => last_scan_info_state.set(info),
+                                Ok(None) => {}
+                                Err(err) => {
+                                    eprintln!(
+                                        "[Locus] warning: failed to load persisted asset scan info: {}",
+                                        err
+                                    );
+                                }
+                            }
+                            let db_path = std::path::Path::new(&initial_working_dir_copy)
+                                .join("Library")
+                                .join("Locus")
+                                .join("locus.db");
+                            eprintln!(
+                                "[Locus] existing ref_graph DB loaded: {}",
+                                db_path.display()
+                            );
+                            AssetDbState(Arc::new(std::sync::Mutex::new(Some(graph))))
+                        }
+                        Err(err) => {
+                            if let Err(clear_err) =
+                                commands::asset::delete_persisted_last_scan_info(project_root)
+                            {
+                                eprintln!(
+                                    "[Locus] warning: failed to clear stale asset scan info: {}",
+                                    clear_err
+                                );
+                            }
+                            eprintln!(
+                                "[Locus] existing ref_graph DB reconcile failed, rescan required: {}",
                                 err
                             );
+                            scan_phase_state.set(Some(asset_db::types::ScanPhase::Error {
+                                error: error::AppError::new(
+                                    "ref_graph.rescan_required.reconcile_failed",
+                                    "Persisted asset database could not be reconciled. Run a rescan to rebuild it.",
+                                )
+                                .detail(err)
+                                .retryable(true),
+                            }));
+                            AssetDbState(Arc::new(std::sync::Mutex::new(None)))
                         }
                     }
-                    let db_path = std::path::Path::new(&initial_working_dir_copy)
-                        .join("Library")
-                        .join("Locus")
-                        .join("locus.db");
-                    eprintln!(
-                        "[Locus] existing ref_graph DB loaded: {}",
-                        db_path.display()
-                    );
-                    AssetDbState(Arc::new(std::sync::Mutex::new(Some(graph))))
                 }
                 asset_db::LoadExistingAssetDb::NeedsRescan(issue) => {
                     if let Err(err) = commands::asset::delete_persisted_last_scan_info(

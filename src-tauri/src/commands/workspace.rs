@@ -204,51 +204,89 @@ pub async fn set_working_dir(
 
     match AssetDb::load_existing(std::path::Path::new(&canonical)) {
         LoadExistingAssetDb::Ready(graph) => {
-            let db_path = std::path::Path::new(&canonical)
-                .join("Library")
-                .join("Locus")
-                .join("locus.db");
-            eprintln!(
-                "[Locus] ref_graph DB loaded for new working dir: {}",
-                db_path.display()
-            );
-            *ref_graph_state
-                .0
-                .lock()
-                .map_err(|e| format!("Lock error: {}", e))? = Some(graph);
-            match read_persisted_last_scan_info(std::path::Path::new(&canonical)) {
-                Ok(Some(info)) => last_scan_info.set(info),
-                Ok(None) => {
-                    if is_real_switch {
-                        last_scan_info.clear();
+            match crate::asset_db::watcher::reconcile_loaded_db(
+                std::path::Path::new(&canonical),
+                graph,
+            ) {
+                Ok((graph, stats)) => {
+                    eprintln!(
+                        "[Locus] ref_graph DB reconciled for new working dir: queued={}, processed={}, failed={}",
+                        stats.queued, stats.processed, stats.failed
+                    );
+                    let db_path = std::path::Path::new(&canonical)
+                        .join("Library")
+                        .join("Locus")
+                        .join("locus.db");
+                    eprintln!(
+                        "[Locus] ref_graph DB loaded for new working dir: {}",
+                        db_path.display()
+                    );
+                    *ref_graph_state
+                        .0
+                        .lock()
+                        .map_err(|e| format!("Lock error: {}", e))? = Some(graph);
+                    match read_persisted_last_scan_info(std::path::Path::new(&canonical)) {
+                        Ok(Some(info)) => last_scan_info.set(info),
+                        Ok(None) => {
+                            if is_real_switch {
+                                last_scan_info.clear();
+                            }
+                        }
+                        Err(err) => {
+                            eprintln!(
+                                "[Locus] warning: failed to load persisted asset scan info: {}",
+                                err
+                            );
+                            if is_real_switch {
+                                last_scan_info.clear();
+                            }
+                        }
+                    }
+
+                    let graph_arc = ref_graph_state.0.clone();
+                    let watcher_root = std::path::PathBuf::from(&canonical);
+                    match crate::asset_db::watcher::AssetDbWatcher::start(
+                        watcher_root,
+                        graph_arc,
+                        watcher_tuning.0.clone(),
+                    ) {
+                        Ok(w) => {
+                            *watcher_handle
+                                .lock()
+                                .map_err(|e| format!("Lock error: {}", e))? = Some(w);
+                            eprintln!("[Locus] ref_graph watcher started for new working dir");
+                        }
+                        Err(e) => {
+                            eprintln!("[Locus] warning: failed to start ref_graph watcher: {}", e);
+                        }
                     }
                 }
                 Err(err) => {
                     eprintln!(
-                        "[Locus] warning: failed to load persisted asset scan info: {}",
+                        "[Locus] ref_graph DB reconcile failed for new working dir, rescan required: {}",
                         err
                     );
-                    if is_real_switch {
-                        last_scan_info.clear();
+                    last_scan_info.clear();
+                    if let Err(clear_err) =
+                        delete_persisted_last_scan_info(std::path::Path::new(&canonical))
+                    {
+                        eprintln!(
+                            "[Locus] warning: failed to clear stale asset scan info: {}",
+                            clear_err
+                        );
                     }
-                }
-            }
-
-            let graph_arc = ref_graph_state.0.clone();
-            let watcher_root = std::path::PathBuf::from(&canonical);
-            match crate::asset_db::watcher::AssetDbWatcher::start(
-                watcher_root,
-                graph_arc,
-                watcher_tuning.0.clone(),
-            ) {
-                Ok(w) => {
-                    *watcher_handle
+                    *ref_graph_state
+                        .0
                         .lock()
-                        .map_err(|e| format!("Lock error: {}", e))? = Some(w);
-                    eprintln!("[Locus] ref_graph watcher started for new working dir");
-                }
-                Err(e) => {
-                    eprintln!("[Locus] warning: failed to start ref_graph watcher: {}", e);
+                        .map_err(|e| format!("Lock error: {}", e))? = None;
+                    scan_phase_state.set(Some(crate::asset_db::types::ScanPhase::Error {
+                        error: crate::error::AppError::new(
+                            "ref_graph.rescan_required.reconcile_failed",
+                            "Persisted asset database could not be reconciled. Run a rescan to rebuild it.",
+                        )
+                        .detail(err)
+                        .retryable(true),
+                    }));
                 }
             }
         }
@@ -504,6 +542,15 @@ pub enum ApiFormat {
     AnthropicMessages,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CustomReasoningParamFormat {
+    None,
+    OpenaiChatReasoningEffort,
+    OpenaiResponsesReasoningEffort,
+    AnthropicThinking,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CustomEndpoint {
@@ -518,10 +565,52 @@ pub struct CustomEndpoint {
     pub context_length: u32,
     #[serde(default)]
     pub beta_flags: Vec<String>,
+    #[serde(default = "default_supported_reasoning_efforts")]
+    pub supported_reasoning_efforts: Vec<String>,
+    #[serde(default)]
+    pub reasoning_param_format: Option<CustomReasoningParamFormat>,
 }
 
 fn default_context_length() -> u32 {
     128_000
+}
+
+fn default_supported_reasoning_efforts() -> Vec<String> {
+    ["low", "medium", "high", "max"]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
+fn default_reasoning_param_format(api_format: &ApiFormat) -> CustomReasoningParamFormat {
+    match api_format {
+        ApiFormat::OpenaiResponses => CustomReasoningParamFormat::OpenaiResponsesReasoningEffort,
+        ApiFormat::AnthropicMessages => CustomReasoningParamFormat::AnthropicThinking,
+        ApiFormat::OpenaiChat => CustomReasoningParamFormat::OpenaiChatReasoningEffort,
+    }
+}
+
+fn normalize_reasoning_effort(value: &str) -> Option<String> {
+    let trimmed = value.trim().to_ascii_lowercase();
+    match trimmed.as_str() {
+        "low" | "medium" | "high" | "xhigh" | "max" => Some(trimmed),
+        _ => None,
+    }
+}
+
+pub(crate) fn normalize_custom_endpoint_config(endpoint: &mut CustomEndpoint) {
+    endpoint.supported_reasoning_efforts = endpoint
+        .supported_reasoning_efforts
+        .iter()
+        .filter_map(|value| normalize_reasoning_effort(value))
+        .collect();
+    if endpoint.supported_reasoning_efforts.is_empty() {
+        endpoint.supported_reasoning_efforts = default_supported_reasoning_efforts();
+    }
+    if endpoint.reasoning_param_format.is_none() {
+        endpoint.reasoning_param_format =
+            Some(default_reasoning_param_format(&endpoint.api_format));
+    }
 }
 
 #[tauri::command]
@@ -533,6 +622,7 @@ pub async fn get_custom_endpoints(app_handle: AppHandle) -> Result<Vec<CustomEnd
         .unwrap_or_default();
 
     for ep in &mut endpoints {
+        normalize_custom_endpoint_config(ep);
         if let Ok(Some(key)) = keychain::get_secret(&keychain::endpoint_key_name(&ep.id)) {
             ep.api_key = key;
         }
@@ -557,6 +647,7 @@ pub async fn save_custom_endpoints(
 
     let mut stripped = endpoints;
     for ep in &mut stripped {
+        normalize_custom_endpoint_config(ep);
         ep.api_key = String::new();
     }
 

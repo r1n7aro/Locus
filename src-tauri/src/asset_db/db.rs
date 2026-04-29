@@ -11,7 +11,7 @@ const CURRENT_PARSER_VERSION: u32 = 1;
 /// Schema version. Bump on any incompatible asset-table schema change. Mismatch
 /// at `open_db` time triggers a full DB delete + rebuild — `locus.db` is a
 /// pure cache and we never migrate it.
-pub const ASSET_DB_VERSION: u32 = 6;
+pub const ASSET_DB_VERSION: u32 = 7;
 
 pub(crate) fn db_path(project_root: &Path) -> PathBuf {
     project_root.join("Library").join("Locus").join("locus.db")
@@ -146,7 +146,7 @@ fn create_tables(conn: &Connection) -> Result<(), String> {
             PRIMARY KEY(term, script_guid)
         );
 
-        CREATE INDEX IF NOT EXISTS idx_assets_path ON assets(path);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_assets_path ON assets(path);
         CREATE INDEX IF NOT EXISTS idx_assets_kind_stem
             ON assets(exists_on_disk, kind, stem_lower);
         CREATE INDEX IF NOT EXISTS idx_assets_root_stem
@@ -301,6 +301,63 @@ fn delete_script_inheritance_terms(tx: &Transaction, guid: &Guid) -> Result<(), 
         params![guid.as_slice()],
     )
     .map_err(|e| format!("Failed to delete script inheritance terms: {}", e))?;
+    Ok(())
+}
+
+/// Incremental updates are keyed by the new meta GUID. If a path is reimported
+/// with a different GUID, remove the stale canonical row for that path so mtime
+/// scans converge instead of requeueing the same asset forever.
+fn delete_same_path_asset_conflicts(tx: &Transaction, asset: &AssetNode) -> Result<(), String> {
+    let stale_guids = {
+        let mut stmt = tx
+            .prepare_cached("SELECT guid FROM assets WHERE path = ?1 AND guid != ?2")
+            .map_err(|e| format!("Failed to prepare same-path asset conflict query: {}", e))?;
+        let rows = stmt
+            .query_map(params![asset.path.as_str(), asset.guid.as_slice()], |row| {
+                let blob: Vec<u8> = row.get(0)?;
+                Ok(blob_to_guid(&blob))
+            })
+            .map_err(|e| format!("Failed to query same-path asset conflicts: {}", e))?;
+
+        let mut guids = Vec::new();
+        for row in rows {
+            guids.push(row.map_err(|e| format!("Failed to read same-path asset conflict: {}", e))?);
+        }
+        guids
+    };
+
+    if stale_guids.is_empty() {
+        return Ok(());
+    }
+
+    let meta_path = format!("{}.meta", asset.path);
+    for stale_guid in stale_guids {
+        let stale_guid_hex = guid_to_hex(&stale_guid);
+        tx.execute(
+            "DELETE FROM edges WHERE src_guid = ?1",
+            params![stale_guid.as_slice()],
+        )
+        .map_err(|e| format!("Failed to delete stale outgoing edges: {}", e))?;
+        tx.execute(
+            "DELETE FROM files
+             WHERE owner_guid = ?1
+               AND (path = ?2 OR path = ?3)",
+            params![
+                stale_guid.as_slice(),
+                asset.path.as_str(),
+                meta_path.as_str()
+            ],
+        )
+        .map_err(|e| format!("Failed to delete stale same-path file bookkeeping: {}", e))?;
+        tx.execute(
+            "DELETE FROM assets WHERE guid = ?1",
+            params![stale_guid.as_slice()],
+        )
+        .map_err(|e| format!("Failed to delete stale same-path asset: {}", e))?;
+        delete_script_inheritance_terms(tx, &stale_guid)?;
+        asset_fts::delete_by_guid(tx, &stale_guid_hex)?;
+    }
+
     Ok(())
 }
 
@@ -1210,9 +1267,9 @@ pub fn get_stored_script_metadata_for_base_type(
     )
 }
 
-pub fn find_scriptable_asset_paths_for_script(
+pub fn find_asset_paths_referencing_guid(
     conn: &Connection,
-    script_guid: &Guid,
+    target_guid: &Guid,
 ) -> Result<Vec<String>, String> {
     let mut stmt = conn
         .prepare(
@@ -1220,23 +1277,20 @@ pub fn find_scriptable_asset_paths_for_script(
              FROM edges e
              JOIN assets a ON a.guid = e.src_guid
              WHERE e.dst_guid = ?1
-               AND e.field_hint = 'm_Script'
                AND a.exists_on_disk = 1
-               AND a.kind = ?2
              ORDER BY a.path",
         )
-        .map_err(|e| format!("Failed to prepare script referrer query: {}", e))?;
+        .map_err(|e| format!("Failed to prepare asset referrer query: {}", e))?;
 
     let rows = stmt
-        .query_map(
-            params![script_guid.as_slice(), AssetKind::GenericAsset as i32],
-            |row| row.get::<_, String>(0),
-        )
-        .map_err(|e| format!("Failed to query script referrers: {}", e))?;
+        .query_map(params![target_guid.as_slice()], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(|e| format!("Failed to query asset referrers: {}", e))?;
 
     let mut paths = Vec::new();
     for row in rows {
-        paths.push(row.map_err(|e| format!("Failed to read script referrer row: {}", e))?);
+        paths.push(row.map_err(|e| format!("Failed to read asset referrer row: {}", e))?);
     }
     Ok(paths)
 }
@@ -1928,6 +1982,8 @@ pub fn atomic_update_asset(
         .transaction()
         .map_err(|e| format!("Failed to begin tx: {}", e))?;
 
+    delete_same_path_asset_conflicts(&tx, asset)?;
+
     tx.execute(
         "DELETE FROM edges WHERE src_guid = ?1",
         params![asset.guid.as_slice()],
@@ -2108,6 +2164,7 @@ pub fn get_kind_counts(conn: &Connection) -> Result<Vec<(i32, u64)>, String> {
     Ok(out)
 }
 
+#[cfg(test)]
 pub fn get_all_meta_asset_mtimes(conn: &Connection) -> Result<Vec<(String, u64)>, String> {
     let mut stmt = conn
         .prepare("SELECT path, mtime_ns FROM files WHERE file_role = ?1")
@@ -2136,24 +2193,30 @@ pub fn get_all_meta_asset_mtimes(conn: &Connection) -> Result<Vec<(String, u64)>
 pub struct AssetMtimeRecord {
     pub path: String,
     pub mtime_ns: u64,
+    pub size: u64,
+    pub content_hash: [u8; 16],
     pub kind: AssetKind,
     pub exists_on_disk: bool,
 }
 
 pub fn get_all_asset_mtime_records(conn: &Connection) -> Result<Vec<AssetMtimeRecord>, String> {
     let mut stmt = conn
-        .prepare("SELECT path, mtime_ns, kind, exists_on_disk FROM assets")
+        .prepare("SELECT path, mtime_ns, size, content_hash, kind, exists_on_disk FROM assets")
         .map_err(|e| format!("Failed to prepare mtime record query: {}", e))?;
 
     let rows = stmt
         .query_map([], |row| {
             let path: String = row.get(0)?;
             let mtime: i64 = row.get(1)?;
-            let kind: i32 = row.get(2)?;
-            let exists: i32 = row.get(3)?;
+            let size: i64 = row.get(2)?;
+            let content_hash_blob: Vec<u8> = row.get(3)?;
+            let kind: i32 = row.get(4)?;
+            let exists: i32 = row.get(5)?;
             Ok(AssetMtimeRecord {
                 path,
                 mtime_ns: mtime as u64,
+                size: size as u64,
+                content_hash: blob_to_guid(&content_hash_blob),
                 kind: AssetKind::from_i32(kind),
                 exists_on_disk: exists != 0,
             })
@@ -2163,6 +2226,44 @@ pub fn get_all_asset_mtime_records(conn: &Connection) -> Result<Vec<AssetMtimeRe
     let mut result = Vec::new();
     for row in rows {
         result.push(row.map_err(|e| format!("Failed to read mtime record row: {}", e))?);
+    }
+    Ok(result)
+}
+
+#[derive(Debug, Clone)]
+pub struct FileMtimeRecord {
+    pub path: String,
+    pub file_role: FileRole,
+    pub mtime_ns: u64,
+    pub size: u64,
+    pub hash128: [u8; 16],
+}
+
+pub fn get_all_file_mtime_records(conn: &Connection) -> Result<Vec<FileMtimeRecord>, String> {
+    let mut stmt = conn
+        .prepare("SELECT path, file_role, mtime_ns, size, hash128 FROM files")
+        .map_err(|e| format!("Failed to prepare file mtime record query: {}", e))?;
+
+    let rows = stmt
+        .query_map([], |row| {
+            let path: String = row.get(0)?;
+            let role: i32 = row.get(1)?;
+            let mtime: i64 = row.get(2)?;
+            let size: i64 = row.get(3)?;
+            let hash_blob: Vec<u8> = row.get(4)?;
+            Ok(FileMtimeRecord {
+                path,
+                file_role: FileRole::from_i32(role),
+                mtime_ns: mtime as u64,
+                size: size as u64,
+                hash128: blob_to_guid(&hash_blob),
+            })
+        })
+        .map_err(|e| format!("Failed to query file mtime records: {}", e))?;
+
+    let mut result = Vec::new();
+    for row in rows {
+        result.push(row.map_err(|e| format!("Failed to read file mtime record row: {}", e))?);
     }
     Ok(result)
 }
@@ -2407,6 +2508,91 @@ mod tests {
         let incoming = get_direct_refs(&conn, &dst.guid).unwrap();
         assert_eq!(incoming.len(), 1);
         assert_eq!(incoming[0].src_guid, src.guid);
+    }
+
+    #[test]
+    fn atomic_update_asset_removes_stale_same_path_guid() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+
+        let old_guid = parse_guid_hex("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        let new_guid = parse_guid_hex("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
+        let path = "Packages/com.farlocus.locus/Editor";
+        let meta_path = format!("{}.meta", path);
+        let mut stale = test_asset(path, AssetKind::MetaOnly, "");
+        stale.guid = old_guid;
+        stale.ext = String::new();
+        stale.exists_on_disk = false;
+        stale.mtime_ns = 1;
+        stale.meta_hash = hash128(b"old-meta");
+        let target = test_asset("Assets/Scenes/Main.prefab", AssetKind::Prefab, "");
+        seed_assets(&mut conn, &[stale.clone(), target.clone()]);
+
+        let tx = conn.transaction().unwrap();
+        batch_insert_files(
+            &tx,
+            &[(
+                meta_path.clone(),
+                FileRole::Meta,
+                1,
+                8,
+                hash128(b"old-meta"),
+                Some(old_guid),
+            )],
+        )
+        .unwrap();
+        batch_insert_edges(
+            &tx,
+            &[RefEdge {
+                src_guid: old_guid,
+                dst_guid: target.guid,
+                dst_file_id: None,
+                class_id_hint: None,
+                field_hint: None,
+                ref_path: None,
+            }],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let mut fresh = stale.clone();
+        fresh.guid = new_guid;
+        fresh.mtime_ns = 20;
+        fresh.meta_hash = hash128(b"new-meta");
+        atomic_update_asset(
+            &mut conn,
+            &fresh,
+            &[],
+            &[(
+                meta_path.clone(),
+                FileRole::Meta,
+                20,
+                8,
+                hash128(b"new-meta"),
+            )],
+        )
+        .unwrap();
+
+        assert_eq!(resolve_guid_by_path(&conn, path).unwrap(), Some(new_guid));
+        assert_eq!(resolve_path_by_guid(&conn, &old_guid).unwrap(), None);
+        assert!(get_direct_deps(&conn, &old_guid).unwrap().is_empty());
+
+        let rows = get_all_asset_mtime_records(&conn).unwrap();
+        let same_path_rows = rows
+            .iter()
+            .filter(|record| record.path == path)
+            .collect::<Vec<_>>();
+        assert_eq!(same_path_rows.len(), 1);
+        assert_eq!(same_path_rows[0].mtime_ns, 20);
+
+        let old_fts_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM asset_search_fts WHERE guid_hex = ?1",
+                rusqlite::params![guid_to_hex(&old_guid)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_fts_count, 0);
     }
 
     #[test]

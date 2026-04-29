@@ -111,6 +111,16 @@ pub enum FileRole {
     YamlAsset = 1,
 }
 
+impl FileRole {
+    pub fn from_i32(value: i32) -> Self {
+        match value {
+            0 => Self::Meta,
+            1 => Self::YamlAsset,
+            _ => Self::YamlAsset,
+        }
+    }
+}
+
 /// Low-level root partition for the `assets` table. Lives here so the `db`
 /// layer never needs to reach into `commands::asset`. The command-layer
 /// `AssetSearchRoot` is a thin shell around this enum and provides 1:1

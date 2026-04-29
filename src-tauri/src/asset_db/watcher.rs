@@ -38,6 +38,20 @@ const RECENT_ENQUEUE_SAMPLE_LIMIT: usize = 8;
 const RECENT_ENQUEUE_BUFFER_LIMIT: usize = 512;
 const QUEUE_SUMMARY_LOG_INTERVAL_SECS: u64 = 3;
 
+#[derive(Debug, Clone, Copy)]
+struct MtimeScanOptions {
+    discover_new_meta: bool,
+    verify_hashes: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartupReconcileStats {
+    pub queued: u64,
+    pub processed: u64,
+    pub failed: u64,
+}
+
 /// Compute the default number of active worker threads as ¼ of the host's
 /// available parallelism, clamped to `[1, MAX_WORKER_THREADS]`. Falls back to
 /// `1` when the OS does not report parallelism (e.g. some sandboxed runners).
@@ -326,6 +340,13 @@ impl DirtyQueue {
         }
     }
 
+    fn try_dequeue(&self) -> Option<String> {
+        let mut inner = self.inner.lock().unwrap();
+        let path = inner.queue.pop_front()?;
+        inner.set.remove(&path);
+        Some(path)
+    }
+
     pub fn len(&self) -> usize {
         self.inner.lock().unwrap().queue.len()
     }
@@ -443,6 +464,26 @@ fn sleep_interruptible(duration: Duration, stop: &AtomicBool) -> bool {
     stop.load(Ordering::Relaxed)
 }
 
+fn resolve_guid_paths_for_content(
+    content: &[u8],
+    graph_state: &Arc<Mutex<Option<AssetDb>>>,
+) -> Result<HashMap<Guid, String>, String> {
+    let text = String::from_utf8_lossy(content);
+    let lines: Vec<&str> = text.lines().collect();
+    let guids = unity_yaml::collect_guids_from_lines(&lines, 0, lines.len());
+    if guids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let guard = graph_state
+        .lock()
+        .map_err(|e| format!("Lock error: {}", e))?;
+    match guard.as_ref() {
+        Some(graph) => db::batch_resolve_paths(&graph.conn, &guids),
+        None => Ok(HashMap::new()),
+    }
+}
+
 fn process_dirty_asset(
     asset_rel_path: &str,
     project_root: &Path,
@@ -522,7 +563,8 @@ fn process_dirty_asset(
     if asset_exists && is_yaml_asset_ext(&ext) {
         let content = std::fs::read(&asset_abs)
             .map_err(|e| format!("Failed to read {}: {}", asset_abs.display(), e))?;
-        let refs = unity_yaml::extract_refs(&content);
+        let guid_to_path = resolve_guid_paths_for_content(&content, graph_state)?;
+        let refs = unity_yaml::extract_refs_with_resolver(&content, Some(&guid_to_path));
         content_hash = hash128(&content);
         let metadata = std::fs::metadata(&asset_abs).ok();
         asset_mtime = metadata.as_ref().map(scanner::get_mtime_ns).unwrap_or(0);
@@ -712,7 +754,7 @@ fn process_dirty_asset(
         db::atomic_update_asset(&mut graph.conn, &node, &edges, &file_records)?;
         if ext == "cs" {
             let source_path = Some(asset_rel_path.to_string());
-            for path in db::find_scriptable_asset_paths_for_script(&graph.conn, &guid)? {
+            for path in db::find_asset_paths_referencing_guid(&graph.conn, &guid)? {
                 cascade_paths.push(QueueEnqueueRequest {
                     rel_path: path,
                     reason: QueueEnqueueReason::ScriptCascade,
@@ -815,6 +857,14 @@ fn worker_loop(
     eprintln!("[AssetDb Watcher] worker {} thread stopped", index);
 }
 
+fn should_hash_asset_content(kind: AssetKind) -> bool {
+    matches!(kind, AssetKind::Script)
+}
+
+fn file_hash128(path: &Path) -> Option<[u8; 16]> {
+    std::fs::read(path).ok().map(|content| hash128(&content))
+}
+
 fn event_receiver_loop(
     rx: std::sync::mpsc::Receiver<Result<notify::Event, notify::Error>>,
     queue: Arc<DirtyQueue>,
@@ -889,11 +939,32 @@ fn mtime_scan_once(
     activity: &RecentQueueActivityLog,
     discover_new_meta: bool,
 ) {
+    mtime_scan_once_with_options(
+        queue,
+        stop,
+        state,
+        project_root,
+        activity,
+        MtimeScanOptions {
+            discover_new_meta,
+            verify_hashes: false,
+        },
+    );
+}
+
+fn mtime_scan_once_with_options(
+    queue: &DirtyQueue,
+    stop: &AtomicBool,
+    state: &Arc<Mutex<Option<AssetDb>>>,
+    project_root: &Path,
+    activity: &RecentQueueActivityLog,
+    options: MtimeScanOptions,
+) {
     if stop.load(Ordering::Relaxed) {
         return;
     }
 
-    let (asset_records, indexed_meta_mtimes): (Vec<db::AssetMtimeRecord>, HashMap<String, u64>) = {
+    let (asset_records, file_records): (Vec<db::AssetMtimeRecord>, Vec<db::FileMtimeRecord>) = {
         let guard = match state.lock() {
             Ok(g) => g,
             Err(_) => return,
@@ -907,20 +978,20 @@ fn mtime_scan_once(
                         return;
                     }
                 };
-                let meta_assets = match db::get_all_meta_asset_mtimes(&graph.conn) {
+                let file_records = match db::get_all_file_mtime_records(&graph.conn) {
                     Ok(v) => v.into_iter().collect(),
                     Err(e) => {
-                        eprintln!("[AssetDb Watcher] meta mtime query error: {}", e);
+                        eprintln!("[AssetDb Watcher] file mtime query error: {}", e);
                         return;
                     }
                 };
-                (mtimes, meta_assets)
+                (mtimes, file_records)
             }
             None => return,
         }
     };
 
-    if asset_records.is_empty() && indexed_meta_mtimes.is_empty() {
+    if asset_records.is_empty() && file_records.is_empty() {
         return;
     }
 
@@ -947,8 +1018,26 @@ fn mtime_scan_once(
         let disk_mtime = meta_mtime.max(content_mtime);
         let content_should_exist = record.exists_on_disk && record.kind != AssetKind::MetaOnly;
         let content_missing = content_should_exist && !content_exists;
+        let content_size_changed = content_should_exist
+            && content_exists
+            && std::fs::metadata(&content_path)
+                .map(|metadata| metadata.len() != record.size)
+                .unwrap_or(false);
+        let content_hash_changed = options.verify_hashes
+            && content_should_exist
+            && content_exists
+            && should_hash_asset_content(record.kind)
+            && !content_size_changed
+            && file_hash128(&content_path)
+                .map(|hash| hash != record.content_hash)
+                .unwrap_or(false);
 
-        if !meta_exists || content_missing || disk_mtime > record.mtime_ns {
+        if !meta_exists
+            || content_missing
+            || disk_mtime > record.mtime_ns
+            || content_size_changed
+            || content_hash_changed
+        {
             enqueue_with_activity(
                 queue,
                 activity,
@@ -959,20 +1048,40 @@ fn mtime_scan_once(
         }
     }
 
-    for (asset_path, stored_meta_mtime) in &indexed_meta_mtimes {
+    let mut indexed_meta_paths = HashSet::new();
+    for record in &file_records {
         if stop.load(Ordering::Relaxed) {
             break;
         }
 
-        let meta_path = project_root.join(format!("{}.meta", asset_path));
-        let meta_exists = meta_path.is_file();
-        let meta_mtime = if meta_exists {
-            file_mtime_ns(&meta_path)
+        let asset_path = record
+            .path
+            .strip_suffix(".meta")
+            .unwrap_or(&record.path)
+            .to_string();
+        if record.file_role == FileRole::Meta {
+            indexed_meta_paths.insert(asset_path.clone());
+        }
+
+        let abs_path = project_root.join(&record.path);
+        let file_exists = abs_path.is_file();
+        let file_mtime = if file_exists {
+            file_mtime_ns(&abs_path)
         } else {
             0
         };
+        let file_size_changed = file_exists
+            && std::fs::metadata(&abs_path)
+                .map(|metadata| metadata.len() != record.size)
+                .unwrap_or(false);
+        let file_hash_changed = options.verify_hashes
+            && file_exists
+            && !file_size_changed
+            && file_hash128(&abs_path)
+                .map(|hash| hash != record.hash128)
+                .unwrap_or(false);
 
-        if !meta_exists || meta_mtime > *stored_meta_mtime {
+        if !file_exists || file_mtime > record.mtime_ns || file_size_changed || file_hash_changed {
             enqueue_with_activity(
                 queue,
                 activity,
@@ -983,7 +1092,7 @@ fn mtime_scan_once(
         }
     }
 
-    if !discover_new_meta {
+    if !options.discover_new_meta {
         return;
     }
 
@@ -1034,7 +1143,7 @@ fn mtime_scan_once(
                 .replace('\\', "/");
             let asset_path = rel.strip_suffix(".meta").unwrap_or(&rel).to_string();
 
-            if !indexed_meta_mtimes.contains_key(&asset_path) {
+            if !indexed_meta_paths.contains(&asset_path) {
                 enqueue_with_activity(
                     queue,
                     activity,
@@ -1057,6 +1166,7 @@ fn queue_summary_logger_loop(
     let interval = Duration::from_secs(QUEUE_SUMMARY_LOG_INTERVAL_SECS);
     let tick = Duration::from_millis(250);
     let mut elapsed = Duration::ZERO;
+    let mut last_logged_event_at: Option<u64> = None;
     while !stop.load(Ordering::Relaxed) {
         std::thread::sleep(tick);
         if stop.load(Ordering::Relaxed) {
@@ -1072,8 +1182,15 @@ fn queue_summary_logger_loop(
         let current_file = current.lock().ok().and_then(|slot| slot.clone());
         let snapshot = activity.snapshot(RECENT_ENQUEUE_WINDOW_MS, RECENT_ENQUEUE_SAMPLE_LIMIT);
 
-        if pending == 0 && current_file.is_none() && snapshot.total_added == 0 {
-            continue;
+        if pending == 0 && current_file.is_none() {
+            let already_logged = snapshot
+                .last_event_at
+                .zip(last_logged_event_at)
+                .map(|(last_event_at, logged_at)| last_event_at <= logged_at)
+                .unwrap_or(false);
+            if snapshot.last_event_at.is_none() || already_logged {
+                continue;
+            }
         }
 
         let reasons = if snapshot.reasons.is_empty() {
@@ -1107,6 +1224,14 @@ fn queue_summary_logger_loop(
                 None => eprintln!("  - {} [{}]", file.path, file.reason.log_label()),
             }
         }
+
+        if let Some(last_event_at) = snapshot.last_event_at {
+            last_logged_event_at = Some(
+                last_logged_event_at
+                    .map(|logged_at| logged_at.max(last_event_at))
+                    .unwrap_or(last_event_at),
+            );
+        }
     }
     eprintln!("[AssetDb Watcher] queue summary logger stopped");
 }
@@ -1114,6 +1239,66 @@ fn queue_summary_logger_loop(
 /// Holds the relative path of the asset the worker thread is currently
 /// processing, or `None` when the worker is idle. Cleared after each item.
 pub type CurrentFileSlot = Arc<Mutex<Option<String>>>;
+
+pub fn reconcile_loaded_db(
+    project_root: &Path,
+    graph: AssetDb,
+) -> Result<(AssetDb, StartupReconcileStats), String> {
+    let stop = AtomicBool::new(false);
+    let queue = DirtyQueue::new();
+    let activity = RecentQueueActivityLog::new();
+    let state = Arc::new(Mutex::new(Some(graph)));
+    let mut stats = StartupReconcileStats::default();
+
+    mtime_scan_once_with_options(
+        &queue,
+        &stop,
+        &state,
+        project_root,
+        &activity,
+        MtimeScanOptions {
+            discover_new_meta: true,
+            verify_hashes: true,
+        },
+    );
+    stats.queued = queue.len() as u64;
+
+    while let Some(rel_path) = queue.try_dequeue() {
+        stats.processed += 1;
+        match process_dirty_asset(&rel_path, project_root, &state, &stop) {
+            Ok(cascade_paths) => {
+                for request in cascade_paths {
+                    if enqueue_with_activity(
+                        &queue,
+                        &activity,
+                        request.rel_path,
+                        request.reason,
+                        request.source_path,
+                    ) {
+                        stats.queued += 1;
+                    }
+                }
+            }
+            Err(error) => {
+                stats.failed += 1;
+                eprintln!(
+                    "[AssetDb Watcher] startup reconcile failed for {}: {}",
+                    rel_path, error
+                );
+            }
+        }
+    }
+
+    let mut guard = state.lock().map_err(|e| format!("Lock error: {}", e))?;
+    let graph = guard
+        .take()
+        .ok_or_else(|| "AssetDb disappeared during startup reconcile".to_string())?;
+    eprintln!(
+        "[AssetDb Watcher] startup reconcile complete: queued={}, processed={}, failed={}",
+        stats.queued, stats.processed, stats.failed
+    );
+    Ok((graph, stats))
+}
 
 pub struct AssetDbWatcher {
     stop: Arc<AtomicBool>,
@@ -1289,6 +1474,25 @@ mod tests {
     use super::*;
     use uuid::Uuid;
 
+    fn write_asset(root: &Path, rel_path: &str, content: &[u8], guid_hex: &str) {
+        let abs_path = root.join(rel_path);
+        if let Some(parent) = abs_path.parent() {
+            std::fs::create_dir_all(parent).expect("create asset parent");
+        }
+        std::fs::write(&abs_path, content).expect("write asset");
+        std::fs::write(
+            root.join(format!("{}.meta", rel_path)),
+            format!("fileFormatVersion: 2\nguid: {}\n", guid_hex),
+        )
+        .expect("write asset meta");
+    }
+
+    fn scan_test_graph(root: &Path) -> AssetDb {
+        let mut graph = AssetDb::open(root).expect("open asset db");
+        graph.full_scan(|_| {}).expect("scan asset db");
+        graph
+    }
+
     #[test]
     fn recent_queue_activity_snapshot_groups_and_limits() {
         let log = RecentQueueActivityLog::new();
@@ -1428,6 +1632,247 @@ mod tests {
         mtime_scan_once(&queue, &stop, &state, &root, &activity, true);
 
         assert_eq!(queue.len(), 0);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mtime_resync_converges_after_same_path_guid_replacement() {
+        let root =
+            std::env::temp_dir().join(format!("locus-watcher-stale-guid-{}", Uuid::new_v4()));
+        let asset_path = "Packages/com.farlocus.locus/Editor";
+        let folder_path = root.join(asset_path);
+        std::fs::create_dir_all(&folder_path).expect("create package folder");
+
+        let meta_path = root.join(format!("{}.meta", asset_path));
+        let meta_bytes =
+            b"fileFormatVersion: 2\nguid: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nfolderAsset: yes\n";
+        std::fs::write(&meta_path, meta_bytes).expect("write folder meta");
+        let meta_mtime = file_mtime_ns(&meta_path);
+        let stale_mtime = meta_mtime.saturating_sub(1);
+        let stale_guid = parse_guid_hex("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+
+        let mut graph = AssetDb::open(&root).expect("open asset db");
+        let stale_node = AssetNode {
+            guid: stale_guid,
+            path: asset_path.to_string(),
+            ext: String::new(),
+            kind: AssetKind::MetaOnly,
+            exists_on_disk: false,
+            mtime_ns: stale_mtime,
+            size: 0,
+            content_hash: [0u8; 16],
+            meta_hash: hash128(b"old-meta"),
+            parser_version: 1,
+            script_class_name: None,
+            script_class_lower: String::new(),
+            script_namespace_lower: String::new(),
+            script_full_name_lower: String::new(),
+            script_type_search: String::new(),
+            script_inheritance_search: String::new(),
+        };
+        db::atomic_update_asset(
+            &mut graph.conn,
+            &stale_node,
+            &[],
+            &[(
+                format!("{}.meta", asset_path),
+                FileRole::Meta,
+                stale_mtime,
+                meta_bytes.len() as u64,
+                hash128(b"old-meta"),
+            )],
+        )
+        .expect("seed stale same-path asset");
+
+        let queue = DirtyQueue::new();
+        let stop = AtomicBool::new(false);
+        let state = Arc::new(Mutex::new(Some(graph)));
+        let activity = RecentQueueActivityLog::new();
+        mtime_scan_once(&queue, &stop, &state, &root, &activity, true);
+
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue.dequeue(&stop), Some(asset_path.to_string()));
+        process_dirty_asset(asset_path, &root, &state, &stop).expect("process stale resync");
+
+        mtime_scan_once(&queue, &stop, &state, &root, &activity, true);
+        assert_eq!(queue.len(), 0);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn startup_reconcile_updates_moved_asset_path_and_keeps_incoming_refs() {
+        let root = std::env::temp_dir().join(format!("locus-watcher-move-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("Assets")).expect("create temp assets");
+        let target_guid = parse_guid_hex("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        let scene_guid = parse_guid_hex("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
+        let target_content = b"%YAML 1.1\n--- !u!1 &1000\nGameObject:\n  m_Name: Target\n";
+        let scene_content = b"%YAML 1.1\n--- !u!1 &1000\nGameObject:\n  m_Name: Root\n--- !u!114 &2000\nMonoBehaviour:\n  m_GameObject: {fileID: 1000}\n  target: {fileID: 100100000, guid: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa, type: 3}\n";
+        write_asset(
+            &root,
+            "Assets/Prefabs/Target.prefab",
+            target_content,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        );
+        write_asset(
+            &root,
+            "Assets/Scenes/Main.unity",
+            scene_content,
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        );
+
+        let graph = scan_test_graph(&root);
+        std::fs::create_dir_all(root.join("Assets/Moved")).expect("create moved dir");
+        std::fs::rename(
+            root.join("Assets/Prefabs/Target.prefab"),
+            root.join("Assets/Moved/Target.prefab"),
+        )
+        .expect("move asset");
+        std::fs::rename(
+            root.join("Assets/Prefabs/Target.prefab.meta"),
+            root.join("Assets/Moved/Target.prefab.meta"),
+        )
+        .expect("move asset meta");
+
+        let (graph, stats) = reconcile_loaded_db(&root, graph).expect("reconcile loaded db");
+        assert!(stats.processed >= 2);
+        assert_eq!(
+            graph
+                .resolve_guid_by_path("Assets/Prefabs/Target.prefab")
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            graph
+                .resolve_guid_by_path("Assets/Moved/Target.prefab")
+                .unwrap(),
+            Some(target_guid)
+        );
+        assert_eq!(
+            graph.resolve_path_by_guid(&target_guid).unwrap().as_deref(),
+            Some("Assets/Moved/Target.prefab")
+        );
+
+        let refs = graph.get_direct_refs(&target_guid).unwrap();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].src_guid, scene_guid);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn startup_reconcile_detects_same_mtime_same_size_yaml_hash_change() {
+        let root = std::env::temp_dir().join(format!("locus-watcher-hash-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("Assets")).expect("create temp assets");
+        let source_guid = parse_guid_hex("cccccccccccccccccccccccccccccccc").unwrap();
+        let old_target_guid = parse_guid_hex("dddddddddddddddddddddddddddddddd").unwrap();
+        let new_target_guid = parse_guid_hex("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee").unwrap();
+        let target_content = b"%YAML 1.1\n--- !u!1 &1000\nGameObject:\n  m_Name: Target\n";
+        let old_source = b"%YAML 1.1\n--- !u!1 &1000\nGameObject:\n  m_Name: Root\n--- !u!114 &2000\nMonoBehaviour:\n  m_GameObject: {fileID: 1000}\n  target: {fileID: 100100000, guid: dddddddddddddddddddddddddddddddd, type: 3}\n";
+        let new_source = b"%YAML 1.1\n--- !u!1 &1000\nGameObject:\n  m_Name: Root\n--- !u!114 &2000\nMonoBehaviour:\n  m_GameObject: {fileID: 1000}\n  target: {fileID: 100100000, guid: eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee, type: 3}\n";
+        assert_eq!(old_source.len(), new_source.len());
+        write_asset(
+            &root,
+            "Assets/Prefabs/OldTarget.prefab",
+            target_content,
+            "dddddddddddddddddddddddddddddddd",
+        );
+        write_asset(
+            &root,
+            "Assets/Prefabs/NewTarget.prefab",
+            target_content,
+            "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        );
+        write_asset(
+            &root,
+            "Assets/Scenes/Main.unity",
+            old_source,
+            "cccccccccccccccccccccccccccccccc",
+        );
+
+        let graph = scan_test_graph(&root);
+        let source_abs = root.join("Assets/Scenes/Main.unity");
+        std::fs::write(&source_abs, new_source).expect("replace source content");
+        let current_mtime = file_mtime_ns(&source_abs);
+        let old_hash = hash128(old_source);
+        graph
+            .conn
+            .execute(
+                "UPDATE assets
+                 SET mtime_ns = ?1, size = ?2, content_hash = ?3
+                 WHERE path = ?4",
+                rusqlite::params![
+                    current_mtime as i64,
+                    new_source.len() as i64,
+                    old_hash.as_slice(),
+                    "Assets/Scenes/Main.unity"
+                ],
+            )
+            .expect("force stale asset mtime");
+        graph
+            .conn
+            .execute(
+                "UPDATE files
+                 SET mtime_ns = ?1, size = ?2, hash128 = ?3
+                 WHERE path = ?4",
+                rusqlite::params![
+                    current_mtime as i64,
+                    new_source.len() as i64,
+                    old_hash.as_slice(),
+                    "Assets/Scenes/Main.unity"
+                ],
+            )
+            .expect("force stale file mtime");
+
+        let (graph, stats) = reconcile_loaded_db(&root, graph).expect("reconcile loaded db");
+        assert!(stats.processed >= 1);
+
+        let deps = graph.get_direct_deps(&source_guid).unwrap();
+        assert!(deps.iter().any(|edge| edge.dst_guid == new_target_guid));
+        assert!(!deps.iter().any(|edge| edge.dst_guid == old_target_guid));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn incremental_yaml_update_keeps_script_class_in_ref_path() {
+        let root = std::env::temp_dir().join(format!("locus-watcher-refpath-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("Assets")).expect("create temp assets");
+        let script_guid = parse_guid_hex("1234567890abcdef1234567890abcdef").unwrap();
+        let prefab_guid = parse_guid_hex("abcdef1234567890abcdef1234567890").unwrap();
+        let script_content = b"public class FooBehaviour : UnityEngine.MonoBehaviour {}\n";
+        let prefab_content = b"%YAML 1.1\n--- !u!1 &1000\nGameObject:\n  m_Name: Root\n--- !u!114 &2000\nMonoBehaviour:\n  m_GameObject: {fileID: 1000}\n  m_Script: {fileID: 11500000, guid: 1234567890abcdef1234567890abcdef, type: 3}\n";
+        write_asset(
+            &root,
+            "Assets/Scripts/FooBehaviour.cs",
+            script_content,
+            "1234567890abcdef1234567890abcdef",
+        );
+        write_asset(
+            &root,
+            "Assets/Prefabs/Root.prefab",
+            prefab_content,
+            "abcdef1234567890abcdef1234567890",
+        );
+
+        let graph = scan_test_graph(&root);
+        let state = Arc::new(Mutex::new(Some(graph)));
+        let stop = AtomicBool::new(false);
+        process_dirty_asset("Assets/Prefabs/Root.prefab", &root, &state, &stop)
+            .expect("process prefab");
+
+        let guard = state.lock().expect("lock graph");
+        let graph = guard.as_ref().expect("graph exists");
+        let deps = graph.get_direct_deps(&prefab_guid).unwrap();
+        let script_edge = deps
+            .iter()
+            .find(|edge| edge.dst_guid == script_guid)
+            .expect("script edge");
+        assert_eq!(
+            script_edge.ref_path.as_deref(),
+            Some("Root/FooBehaviour/m_Script")
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
