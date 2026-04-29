@@ -69,6 +69,31 @@ describe("Unity embedded session view", () => {
     expect(unityWindow).toContain("MarkResizeSyncBoost();");
   });
 
+  it("keeps the Unity embed WebView alive across domain reloads", () => {
+    const unityWindow = read("locus_unity/Editor/LocusEditorWindow.cs");
+    const command = read("src-tauri/src/commands/unity_embed.rs");
+
+    expect(unityWindow).toContain('private const string CloseReasonDomainReload = "domainReload";');
+    expect(unityWindow).toContain("AssemblyReloadEvents.beforeAssemblyReload += OnBeforeAssemblyReload;");
+    expect(unityWindow).toContain("AssemblyReloadEvents.afterAssemblyReload += OnAfterAssemblyReload;");
+    expect(unityWindow).toContain("EditorApplication.quitting += OnEditorQuitting;");
+    expect(unityWindow).toContain("SendClose(GetCloseReason())");
+    expect(unityWindow).toContain("if (_assemblyReloadInProgress)");
+    expect(unityWindow).toContain("return CloseReasonDomainReload;");
+    expect(unityWindow).toContain("public string reason;");
+    expect(unityWindow).toContain("reason = reason ?? \"\"");
+    expect(command).toContain('const CLOSE_REASON_DOMAIN_RELOAD: &str = "domainReload";');
+    expect(command).toContain("const TRANSIENT_CLOSE_DESTROY_DELAY: Duration = Duration::from_secs(30);");
+    expect(command).toContain("struct UnityEmbedTransientCloseState");
+    expect(command).toContain("fn schedule_transient_close_destroy");
+    expect(command).toContain("tokio::time::sleep(TRANSIENT_CLOSE_DESTROY_DELAY).await;");
+    expect(command).toContain("fn is_transient_close_reason");
+    expect(command).toContain("reason == CLOSE_REASON_DOMAIN_RELOAD");
+    expect(command).toContain("if is_transient_close_reason(&msg.reason)");
+    expect(command).toContain("schedule_transient_close_destroy(app_handle);");
+    expect(command).toContain("cancel_transient_close_destroy();");
+  });
+
   it("suppresses Windows mouse activation for the embedded overlay outside the composer", () => {
     const view = read("src/components/UnityEmbeddedSessionView.vue");
     const service = read("src/services/unity.ts");

@@ -1,6 +1,6 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, PhysicalPosition, PhysicalSize, WebviewUrl};
@@ -11,6 +11,8 @@ use crate::workspace::Workspace;
 const WINDOW_LABEL: &str = "unity-embed";
 const CONTROL_PIPE_NAME_PREFIX: &str = r"\\.\pipe\locus_tauri_unity_embed_";
 const EMBED_URL: &str = "/unity-embed?host=tauri-overlay";
+const CLOSE_REASON_DOMAIN_RELOAD: &str = "domainReload";
+const TRANSIENT_CLOSE_DESTROY_DELAY: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -25,6 +27,8 @@ struct UnityEmbedControlMessage {
     visible: bool,
     #[serde(default)]
     parent_hwnd: i64,
+    #[serde(default)]
+    reason: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -101,6 +105,11 @@ struct UnityEmbedAppliedState {
     visible: bool,
 }
 
+#[derive(Debug, Default)]
+struct UnityEmbedTransientCloseState {
+    generation: u64,
+}
+
 fn default_visible() -> bool {
     true
 }
@@ -113,6 +122,11 @@ fn control_state() -> &'static Mutex<UnityEmbedControlState> {
 fn applied_state() -> &'static Mutex<UnityEmbedAppliedState> {
     static STATE: OnceLock<Mutex<UnityEmbedAppliedState>> = OnceLock::new();
     STATE.get_or_init(|| Mutex::new(UnityEmbedAppliedState::default()))
+}
+
+fn transient_close_state() -> &'static Mutex<UnityEmbedTransientCloseState> {
+    static STATE: OnceLock<Mutex<UnityEmbedTransientCloseState>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(UnityEmbedTransientCloseState::default()))
 }
 
 fn record_control_message(msg: &UnityEmbedControlMessage) {
@@ -137,6 +151,51 @@ fn record_mount_result(mounted: bool, error: Option<String>) {
         state.last_mounted = mounted;
         state.last_error = error.unwrap_or_default();
     }
+}
+
+fn next_transient_close_generation() -> u64 {
+    transient_close_state()
+        .lock()
+        .map(|mut state| {
+            state.generation = state.generation.saturating_add(1);
+            state.generation
+        })
+        .unwrap_or(0)
+}
+
+fn cancel_transient_close_destroy() {
+    let _ = next_transient_close_generation();
+}
+
+fn is_transient_close_generation_current(generation: u64) -> bool {
+    transient_close_state()
+        .lock()
+        .map(|state| state.generation == generation)
+        .unwrap_or(false)
+}
+
+fn is_transient_close_reason(reason: &str) -> bool {
+    reason == CLOSE_REASON_DOMAIN_RELOAD
+}
+
+fn schedule_transient_close_destroy(app_handle: &AppHandle) {
+    let generation = next_transient_close_generation();
+    let app_for_timer = app_handle.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(TRANSIENT_CLOSE_DESTROY_DELAY).await;
+        if !is_transient_close_generation_current(generation) {
+            return;
+        }
+
+        let app_for_main = app_for_timer.clone();
+        if let Err(error) = app_for_timer.run_on_main_thread(move || {
+            if is_transient_close_generation_current(generation) {
+                destroy_unity_embed_control_window_on_main(&app_for_main);
+            }
+        }) {
+            eprintln!("[Locus] failed to dispatch Unity embed transient close cleanup: {error}");
+        }
+    });
 }
 
 fn needs_geometry_apply(msg: &UnityEmbedControlMessage) -> bool {
@@ -421,6 +480,7 @@ pub(crate) fn reset_unity_embed_control_window(app_handle: &AppHandle) {
 }
 
 pub(crate) fn destroy_unity_embed_control_window_on_main(app_handle: &AppHandle) {
+    cancel_transient_close_destroy();
     if let Some(window) = app_handle.get_webview_window(WINDOW_LABEL) {
         if let Err(close_error) = window.destroy().or_else(|_| window.close()) {
             eprintln!("[Locus] failed to destroy Unity embed window: {close_error}");
@@ -488,6 +548,7 @@ fn apply_control_message_on_main(
     record_control_message(&msg);
     match msg.kind.as_str() {
         "open" | "update" => {
+            cancel_transient_close_destroy();
             let (window, created) = ensure_embed_window(app_handle, &msg)?;
 
             if created || needs_geometry_apply(&msg) {
@@ -505,6 +566,12 @@ fn apply_control_message_on_main(
             Ok(())
         }
         "close" => {
+            if is_transient_close_reason(&msg.reason) {
+                schedule_transient_close_destroy(app_handle);
+                return Ok(());
+            }
+
+            cancel_transient_close_destroy();
             if let Some(window) = app_handle.get_webview_window(WINDOW_LABEL) {
                 window
                     .destroy()

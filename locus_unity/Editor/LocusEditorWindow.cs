@@ -27,9 +27,15 @@ namespace Locus
         private const double HeartbeatIntervalSeconds = 2d;
         private const double DesktopProbeIntervalSeconds = 2d;
         private const int PipeConnectTimeoutMs = 500;
+        private const string CloseReasonWindowClosed = "windowClosed";
+        private const string CloseReasonEditorQuit = "editorQuit";
+        private const string CloseReasonDomainReload = "domainReload";
 
         private static readonly Encoding Utf8NoBom = new UTF8Encoding(false);
         private static Texture2D _titleIcon;
+        private static bool _lifecycleHooksRegistered;
+        private static bool _assemblyReloadInProgress;
+        private static bool _editorQuitting;
 
         private double _nextSyncAt;
         private double _resizeBoostUntil;
@@ -69,6 +75,7 @@ namespace Locus
             public int height;
             public bool visible;
             public long parentHwnd;
+            public string reason;
         }
 
         private sealed class LocusDesktopInstall
@@ -94,8 +101,35 @@ namespace Locus
             window.Show();
         }
 
+        private static void EnsureLifecycleHooks()
+        {
+            if (_lifecycleHooksRegistered)
+                return;
+
+            _lifecycleHooksRegistered = true;
+            AssemblyReloadEvents.beforeAssemblyReload += OnBeforeAssemblyReload;
+            AssemblyReloadEvents.afterAssemblyReload += OnAfterAssemblyReload;
+            EditorApplication.quitting += OnEditorQuitting;
+        }
+
+        private static void OnBeforeAssemblyReload()
+        {
+            _assemblyReloadInProgress = true;
+        }
+
+        private static void OnAfterAssemblyReload()
+        {
+            _assemblyReloadInProgress = false;
+        }
+
+        private static void OnEditorQuitting()
+        {
+            _editorQuitting = true;
+        }
+
         private void OnEnable()
         {
+            EnsureLifecycleHooks();
             titleContent = CreateTitleContent();
             minSize = new Vector2(360f, 420f);
             RefreshDesktopState(true);
@@ -111,7 +145,7 @@ namespace Locus
             if (OverlaySyncEnabled)
             {
                 EditorApplication.update -= SyncOverlay;
-                SendClose();
+                SendClose(GetCloseReason());
             }
             DisconnectPipe();
         }
@@ -160,13 +194,22 @@ namespace Locus
             SendControlMessage(message, false);
         }
 
-        private void SendClose()
+        private void SendClose(string reason)
         {
-            SendControlMessage(BuildMessage("close", false), true);
+            SendControlMessage(BuildMessage("close", false, reason), true);
             _sentOpen = false;
         }
 
-        private EmbedControlMessage BuildMessage(string type, bool visible)
+        private string GetCloseReason()
+        {
+            if (_editorQuitting)
+                return CloseReasonEditorQuit;
+            if (_assemblyReloadInProgress)
+                return CloseReasonDomainReload;
+            return CloseReasonWindowClosed;
+        }
+
+        private EmbedControlMessage BuildMessage(string type, bool visible, string reason = "")
         {
             if (!_hasScreenRect)
                 UpdateScreenRectFromPosition();
@@ -179,7 +222,8 @@ namespace Locus
                 width = _screenWidth,
                 height = _screenHeight,
                 visible = visible && _screenWidth > 12 && _screenHeight > 12 && IsSelectedDockTab(),
-                parentHwnd = GetUnityHostHwnd(_screenX, _screenY, _screenWidth, _screenHeight)
+                parentHwnd = GetUnityHostHwnd(_screenX, _screenY, _screenWidth, _screenHeight),
+                reason = reason ?? ""
             };
         }
 
