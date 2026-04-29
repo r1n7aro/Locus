@@ -1,7 +1,7 @@
 {
   "name": "Dev",
   "description": "Unity project development, debugging, and optimization.",
-  "tools": ["read", "write", "edit", "bash", "grep", "list", "task", "todowrite", "ask_user_question", "unity_execute", "unity_run_states", "unity_recompile", "unity_asset_search", "unity_ref_search", "unity_yaml_read", "knowledge_list", "knowledge_query", "knowledge_read", "knowledge_create", "knowledge_edit", "knowledge_move", "knowledge_delete"],
+  "tools": ["read", "write", "edit", "bash", "grep", "list", "task", "todowrite", "ask_user_question", "unity_execute", "unity_run_states", "unity_recompile", "unity_asset_search", "unity_ref_search", "unity_yaml_list", "unity_yaml_search", "unity_yaml_read", "knowledge_list", "knowledge_query", "knowledge_read", "knowledge_create", "knowledge_edit", "knowledge_move", "knowledge_delete"],
   "sub_agents": ["explorer"],
   "default": true,
   "default_effort": "medium",

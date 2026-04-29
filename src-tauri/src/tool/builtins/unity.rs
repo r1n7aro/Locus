@@ -225,23 +225,40 @@ pub(super) fn unity_asset_search() -> ToolDef {
     }
 }
 
-// ─── unity_yaml_read ────────────────────────────────────────────────────────
+// ─── Unity YAML tools ────────────────────────────────────────────────────────
 
-pub(super) fn unity_yaml_read() -> ToolDef {
-    let prompt = crate::prompt::parse_tool_prompt(crate::prompt::tools::UNITY_YAML_READ);
+fn intercepted_unity_yaml_tool(name: &str, prompt_json: &str) -> ToolDef {
+    let prompt = crate::prompt::parse_tool_prompt(prompt_json);
+    let tool_name = name.to_string();
     ToolDef {
-        name: "unity_yaml_read".to_string(),
+        name: tool_name.clone(),
         description: prompt.description,
         parameters: prompt.parameters,
-        execute: Arc::new(|_args, _ctx| {
-            Box::pin(async {
+        execute: Arc::new(move |_args, _ctx| {
+            let tool_name = tool_name.clone();
+            Box::pin(async move {
                 ToolResult {
-                    output: "Error: unity_yaml_read should be intercepted by agent loop, not executed directly".to_string(),
+                    output: format!(
+                        "Error: {} should be intercepted by agent loop, not executed directly",
+                        tool_name
+                    ),
                     is_error: true,
                 }
             })
         }),
     }
+}
+
+pub(super) fn unity_yaml_list() -> ToolDef {
+    intercepted_unity_yaml_tool("unity_yaml_list", crate::prompt::tools::UNITY_YAML_LIST)
+}
+
+pub(super) fn unity_yaml_search() -> ToolDef {
+    intercepted_unity_yaml_tool("unity_yaml_search", crate::prompt::tools::UNITY_YAML_SEARCH)
+}
+
+pub(super) fn unity_yaml_read() -> ToolDef {
+    intercepted_unity_yaml_tool("unity_yaml_read", crate::prompt::tools::UNITY_YAML_READ)
 }
 
 // ─── unity_recompile ─────────────────────────────────────────────────────────

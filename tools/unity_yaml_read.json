@@ -1,5 +1,5 @@
 {
-  "description": "Read a Unity YAML file (scene, prefab, material, animation, etc.) with intelligent structure parsing.\n\nThree modes of operation:\n\n1. **Hierarchy mode** (no object_path): For scene/prefab files, outputs an **aggregated hierarchy summary** designed for efficient AI consumption:\n   - **File stats**: top-level object count, unique prefab sources, total prefab instances\n   - **Structured hierarchy folding**: sibling objects fold only when their normalized names, component signatures, annotations, and ordered child subtrees all match\n   - **Folded group context**: each folded group keeps an `Instances:` sample line plus one expanded `Shared subtree:` so important child names stay visible\n   - **Notable prefab overrides**: only prefabs with significant overrides shown, aggregated by source prefab. Override classification: transform-only (suppressed), light custom, heavy, mesh-heavy (⚠). Mesh/poly/normals data auto-folded into counts\n   - **Suppressed info summary**: counts of transform-only instances, clean instances, and other hidden details\n   - **Drill-down hints**: use exact names from `Instances:` lines in object_path to expand specific objects or PrefabInstances\n\n2. **Detail mode for GameObjects** (object_path → a regular GameObject): Reads the specific GameObject and all its attached components, showing full YAML content with references resolved to human-readable asset paths.\n   - `{fileID: X, guid: Y, type: Z}` → replaced with the actual asset file path\n   - `{fileID: X}` (internal ref) → replaced with the referenced object's name within the file\n\n3. **Detail mode for PrefabInstances** (object_path → a PrefabInstance name): Shows structured override detail grouped by target object, including:\n   - All property overrides per target (propertyPath = value)\n   - Object reference overrides resolved to asset paths\n   - Stripped ref mappings (local fileID → source fileID)\n   - Removed components list\n   Use this when you need to see exactly what a PrefabInstance overrides.\n\nExample object_path: 'Player', 'Environment/Buildings/House01', or a PrefabInstance name like 'PigChef'\n\nFor non-hierarchical files (materials, ScriptableObjects, etc.), the full content is returned with references resolved, regardless of object_path.\n\nThe tool resolves GUIDs by scanning .meta files in the project if the reference graph database is not available.",
+  "description": "Read precise Unity asset detail after locating the target with unity_yaml_list or unity_yaml_search.\n\nFor .unity/.prefab files, provide `object_path`. Component and prefab override reads use live Unity Editor state through the locus_unity plugin first so unsaved scene or prefab changes are visible, then fall back to direct text YAML parsing when the Editor path is unavailable. Live Editor reads return Inspector-style GameObject and component fields plus PrefabUtility property modifications for prefab instance roots. Live Editor component reads expand Generic serialized fields such as arrays, structs, Serializable classes, and UnityEvents with bounded depth and item limits. Direct YAML fallback returns serialized YAML fields with references resolved to human-readable asset paths or in-file object names; PrefabInstance fallback includes structured source target overrides, resolved object reference overrides, stripped ref mappings, and removed components.\n\nUse `detail=document` when you need direct serialized YAML document fields. For non-hierarchical YAML assets such as materials, animation clips, animator controllers, and ScriptableObjects, omit `object_path` to read all YAML documents. The tool resolves GUIDs through the asset database when available and scans project metadata when needed.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -9,7 +9,24 @@
       },
       "object_path": {
         "type": "string",
-        "description": "Optional hierarchy path to a specific GameObject or PrefabInstance name (e.g. 'Player', 'Root/Child/GrandChild', or 'PigChef'). When a hierarchy summary shows a folded `Instances:` line, use one of those exact names here for drill-down. When targeting a PrefabInstance, outputs structured override detail instead of raw YAML. When omitted for scene/prefab files, outputs the aggregated hierarchy summary with structured folding and notable override summary."
+        "description": "Optional hierarchy path to a specific GameObject or PrefabInstance, such as 'Player', 'Environment/Buildings/House01', or a returned duplicate-safe path like 'Root/Enemy[2]'. Use paths returned by unity_yaml_list or unity_yaml_search."
+      },
+      "detail": {
+        "type": "string",
+        "enum": ["components", "prefab_overrides", "document"],
+        "description": "Optional detail mode. 'components' reads a GameObject and its attached component YAML fields with references resolved. 'prefab_overrides' reads structured PrefabInstance override detail. 'document' reads only the targeted YAML document fields with references resolved and internal ids omitted. Defaults to the natural detail for the target."
+      },
+      "max_field_depth": {
+        "type": "integer",
+        "minimum": 1,
+        "default": 2,
+        "description": "Optional live Editor component-field expansion depth for Generic serialized fields such as arrays, structs, Serializable classes, and UnityEvents. Defaults to 2 and is clamped to 6."
+      },
+      "max_array_items": {
+        "type": "integer",
+        "minimum": 1,
+        "default": 20,
+        "description": "Optional live Editor array/list item limit when expanding Generic serialized fields. Defaults to 20 and is clamped to 200."
       }
     },
     "required": ["file_path"]

@@ -1238,20 +1238,101 @@ fn format_node(out: &mut String, node: &HierarchyNode, prefix: &str, is_last: bo
     }
 }
 
-pub fn find_go_by_path(roots: &[HierarchyNode], path: &str) -> Option<i64> {
-    let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+fn parse_path_segment(segment: &str) -> (&str, Option<usize>) {
+    if let Some(base) = segment.strip_suffix(']').and_then(|value| {
+        let bracket = value.rfind('[')?;
+        let ordinal = value[bracket + 1..].parse::<usize>().ok()?;
+        if ordinal == 0 || bracket == 0 {
+            return None;
+        }
+        Some((&value[..bracket], ordinal))
+    }) {
+        return (base.0, Some(base.1));
+    }
+
+    (segment, None)
+}
+
+fn find_node_in_siblings<'a>(
+    siblings: &'a [HierarchyNode],
+    segment: &str,
+) -> Option<&'a HierarchyNode> {
+    let (name, ordinal) = parse_path_segment(segment);
+    if let Some(ordinal) = ordinal {
+        if let Some(node) = siblings
+            .iter()
+            .filter(|node| node.name == name)
+            .nth(ordinal.saturating_sub(1))
+        {
+            return Some(node);
+        }
+    }
+
+    siblings.iter().find(|node| node.name == segment)
+}
+
+pub fn find_hierarchy_node_by_path<'a>(
+    roots: &'a [HierarchyNode],
+    path: &str,
+) -> Option<&'a HierarchyNode> {
+    let parts: Vec<&str> = path
+        .split('/')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
     if parts.is_empty() {
         return None;
     }
 
-    let root = roots.iter().find(|r| r.name == parts[0])?;
+    let root = find_node_in_siblings(roots, parts[0])?;
     let mut current = root;
 
     for &part in &parts[1..] {
-        current = current.children.iter().find(|c| c.name == part)?;
+        current = find_node_in_siblings(&current.children, part)?;
     }
 
+    Some(current)
+}
+
+pub fn find_go_by_path(roots: &[HierarchyNode], path: &str) -> Option<i64> {
+    let current = find_hierarchy_node_by_path(roots, path)?;
     Some(current.file_id)
+}
+
+pub fn build_hierarchy_path_map(roots: &[HierarchyNode]) -> HashMap<i64, String> {
+    fn collect_siblings(
+        nodes: &[HierarchyNode],
+        parent_path: &str,
+        paths: &mut HashMap<i64, String>,
+    ) {
+        let mut totals: HashMap<&str, usize> = HashMap::new();
+        for node in nodes {
+            *totals.entry(node.name.as_str()).or_insert(0) += 1;
+        }
+
+        let mut ordinals: HashMap<&str, usize> = HashMap::new();
+        for node in nodes {
+            let total = totals.get(node.name.as_str()).copied().unwrap_or(0);
+            let segment = if total > 1 {
+                let ordinal = ordinals.entry(node.name.as_str()).or_insert(0);
+                *ordinal += 1;
+                format!("{}[{}]", node.name, *ordinal)
+            } else {
+                node.name.clone()
+            };
+            let path = if parent_path.is_empty() {
+                segment
+            } else {
+                format!("{}/{}", parent_path, segment)
+            };
+            paths.insert(node.file_id, path.clone());
+            collect_siblings(&node.children, &path, paths);
+        }
+    }
+
+    let mut paths = HashMap::new();
+    collect_siblings(roots, "", &mut paths);
+    paths
 }
 
 pub fn get_components_for_go(docs: &[YamlDoc], go_file_id: i64) -> Vec<usize> {
@@ -1511,16 +1592,11 @@ fn resolve_single_ref(
         if let Some(guid_str) = extract_value(block, "guid:") {
             let guid_hex = guid_str.trim().trim_end_matches(',');
             if let Some(path) = guid_resolver(guid_hex) {
-                let file_id_str = extract_value(block, "fileID:")
-                    .map(|v| v.trim().trim_end_matches(',').to_string())
-                    .unwrap_or_default();
-                if file_id_str.is_empty() || file_id_str == "0" {
-                    return format!("{{{}}}", path);
-                }
-                return format!("{{{}#fileID:{}}}", path, file_id_str);
+                return format!("{{{}}}", path);
             }
+            return format!("{{guid:{}}}", guid_hex);
         }
-        block.to_string()
+        "{unresolved external ref}".to_string()
     } else if has_file_id {
         if let Some(fid_str) = extract_value(block, "fileID:") {
             let fid_str = fid_str.trim().trim_end_matches(',');
@@ -1533,7 +1609,7 @@ fn resolve_single_ref(
                 }
             }
         }
-        block.to_string()
+        "{unresolved internal ref}".to_string()
     } else {
         block.to_string()
     }
@@ -1541,19 +1617,7 @@ fn resolve_single_ref(
 
 pub fn build_internal_id_map(docs: &[YamlDoc]) -> HashMap<i64, String> {
     let tree = build_go_tree(docs);
-    let mut go_paths: HashMap<i64, String> = HashMap::new();
-    fn collect_paths(nodes: &[HierarchyNode], prefix: &str, paths: &mut HashMap<i64, String>) {
-        for node in nodes {
-            let path = if prefix.is_empty() {
-                node.name.clone()
-            } else {
-                format!("{}/{}", prefix, node.name)
-            };
-            paths.insert(node.file_id, path.clone());
-            collect_paths(&node.children, &path, paths);
-        }
-    }
-    collect_paths(&tree, "", &mut go_paths);
+    let go_paths = build_hierarchy_path_map(&tree);
 
     let go_names: HashMap<i64, &str> = docs
         .iter()

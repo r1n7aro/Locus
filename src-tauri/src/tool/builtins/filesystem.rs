@@ -87,7 +87,7 @@ pub(super) fn read() -> ToolDef {
                     if ctx.should_redirect_unity_asset_read(&file_path) {
                         return ToolResult {
                             output: format!(
-                                "Direct file reads are not recommended for Unity YAML asset '{}'. Use `unity_yaml_read` while the Unity Editor is connected. If you still need the raw file content, repeat the same `read` call once more.",
+                                "Direct file reads are not recommended for Unity YAML asset '{}'. Use `unity_yaml_list`, `unity_yaml_search`, or `unity_yaml_read` for semantic Unity YAML access. If you still need the raw file content, repeat the same `read` call once more.",
                                 file_path
                             ),
                             is_error: true,

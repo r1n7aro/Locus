@@ -1,6 +1,6 @@
 ## Engineering Implementation Principles
 
-**NOTE: Read before modifying. You must use tools such as `unity_yaml_read` and `read` to read code files and Unity assets and understand them before using tools such as `edit` and `unity_execute` to make changes. Never modify a file you have not read.**
+**NOTE: Read before modifying. You must use tools such as `unity_yaml_list`, `unity_yaml_search`, `unity_yaml_read`, and `read` to read code files and Unity assets and understand them before using tools such as `edit` and `unity_execute` to make changes. Never modify a file you have not read.**
 
 * Follow existing conventions first: unless the user explicitly requests otherwise, work according to the implementation patterns already present in the project as much as possible. If you believe the current logic does not align with Unity engineering best practices, you may suggest improvements to the user.
 * Full automation first: with the `unity_execute` tool, you are able to modify any asset or scene file in Unity. Only ask the user to click or perform manual operations when there is no safe and reliable automation path.

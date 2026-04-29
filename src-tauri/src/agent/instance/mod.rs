@@ -24,7 +24,7 @@ use crate::commands::{
     UnityEditorStatusChangeConfirmDisplay,
 };
 use crate::compact;
-use crate::llm::{anthropic, codex, openrouter, responses};
+use crate::llm::{anthropic, chat_completions, codex, openrouter, responses};
 use crate::session::models::{MessageRole, TodoItem, ToolCallInfo};
 use crate::session::store::SessionStore;
 use crate::tool::{ToolExecutionContext, ToolRegistry, ToolResult, ToolRuntimeState};
@@ -1921,8 +1921,9 @@ impl AgentInstance {
             "unity_recompile" => require_non_empty("project_path", "to be set explicitly")
                 .or_else(|| require_absolute_without_workspace("project_path")),
             "unity_execute" | "unity_run_states" | "unity_ref_search" | "unity_asset_search"
-            | "unity_yaml_read" | "knowledge_list" | "knowledge_query" | "knowledge_read"
-            | "knowledge_create" | "knowledge_delete" | "knowledge_move" | "knowledge_edit" => {
+            | "unity_yaml_list" | "unity_yaml_search" | "unity_yaml_read" | "knowledge_list"
+            | "knowledge_query" | "knowledge_read" | "knowledge_create" | "knowledge_delete"
+            | "knowledge_move" | "knowledge_edit" => {
                 if has_working_dir {
                     None
                 } else {
@@ -3133,6 +3134,7 @@ impl AgentInstance {
                     None, // api_path: defaults to /api/v1/chat/completions
                     None, // provider_tag
                     &[],  // extra_headers
+                    None, // reasoning_effort
                     self.debug,
                     on_text_delta,
                     on_tool_call_start,
@@ -3286,24 +3288,42 @@ impl AgentInstance {
                 endpoint,
                 api_format,
                 beta_flags,
+                supported_reasoning_efforts,
+                reasoning_param_format,
                 ..
             } => {
-                use crate::commands::ApiFormat;
+                use crate::commands::{ApiFormat, CustomReasoningParamFormat};
+                let custom_reasoning_effort = crate::llm::openai_reasoning::custom_reasoning_effort(
+                    self.effort.as_deref(),
+                    supported_reasoning_efforts,
+                );
                 match api_format {
                     ApiFormat::OpenaiChat => {
                         let system_prompt = system_parts.join("\n\n");
-                        let resp = openrouter::stream_chat(
+                        let reasoning_effort = matches!(
+                            reasoning_param_format,
+                            CustomReasoningParamFormat::OpenaiChatReasoningEffort
+                        )
+                        .then_some(custom_reasoning_effort.as_deref())
+                        .flatten();
+                        let thinking_level = matches!(
+                            reasoning_param_format,
+                            CustomReasoningParamFormat::OpenaiChatReasoningEffort
+                        )
+                        .then_some(self.effort.as_deref())
+                        .flatten();
+                        let resp = chat_completions::stream_chat(
                             api_key,
                             api_model,
                             &system_prompt,
                             messages,
                             api_tools,
-                            Some(endpoint.as_str()),
-                            Some("/chat/completions"),
-                            Some("Custom"),
-                            &[],
+                            endpoint.as_str(),
+                            reasoning_effort,
+                            thinking_level,
                             self.debug,
                             on_text_delta,
+                            on_thinking_delta,
                             on_tool_call_start,
                         )
                         .await?;
@@ -3327,6 +3347,12 @@ impl AgentInstance {
                     }
                     ApiFormat::OpenaiResponses => {
                         let system_prompt = system_parts.join("\n\n");
+                        let reasoning_effort = matches!(
+                            reasoning_param_format,
+                            CustomReasoningParamFormat::OpenaiResponsesReasoningEffort
+                        )
+                        .then_some(custom_reasoning_effort.as_deref())
+                        .flatten();
                         let resp = responses::stream_chat(
                             api_key,
                             api_model,
@@ -3335,6 +3361,7 @@ impl AgentInstance {
                             api_tools,
                             endpoint.as_str(),
                             self.effort.as_deref(),
+                            reasoning_effort,
                             self.debug,
                             Some(&self.session_id),
                             on_text_delta,
@@ -3362,6 +3389,12 @@ impl AgentInstance {
                     }
                     ApiFormat::AnthropicMessages => {
                         let system_prompt = system_parts.join("\n\n");
+                        let thinking_level = matches!(
+                            reasoning_param_format,
+                            CustomReasoningParamFormat::AnthropicThinking
+                        )
+                        .then_some(custom_reasoning_effort.as_deref())
+                        .flatten();
                         let resp = anthropic::stream_chat_native(
                             api_key,
                             api_model,
@@ -3370,6 +3403,7 @@ impl AgentInstance {
                             api_tools,
                             endpoint.as_str(),
                             beta_flags,
+                            thinking_level,
                             Some(&self.session_id),
                             "Custom(Anthropic)",
                             on_text_delta,
@@ -5046,6 +5080,8 @@ impl AgentInstance {
                 | "todowrite"
                 | "unity_ref_search"
                 | "unity_asset_search"
+                | "unity_yaml_list"
+                | "unity_yaml_search"
                 | "unity_yaml_read"
                 | "unity_recompile"
                 | "canvas"
@@ -5556,6 +5592,12 @@ impl AgentInstance {
             ExecutedToolResult::from_tool_result(self.execute_unity_ref_search(app_handle, args))
         } else if tc.name == "unity_asset_search" {
             ExecutedToolResult::from_tool_result(self.execute_unity_asset_search(app_handle, args))
+        } else if tc.name == "unity_yaml_list" {
+            self.await_tool_result(self.execute_unity_yaml_list(app_handle, args))
+                .await
+        } else if tc.name == "unity_yaml_search" {
+            self.await_tool_result(self.execute_unity_yaml_search(app_handle, args))
+                .await
         } else if tc.name == "unity_yaml_read" {
             self.await_tool_result(self.execute_unity_yaml_read(app_handle, args))
                 .await
@@ -6943,87 +6985,538 @@ impl AgentInstance {
         }
     }
 
-    async fn execute_unity_yaml_read(
-        &self,
-        app_handle: &AppHandle,
+    fn parse_unity_yaml_summary_options(
         args: &serde_json::Value,
-    ) -> ToolResult {
-        use crate::asset_db::AssetDbState;
-        use crate::unity_yaml as yaml_parser;
+    ) -> crate::unity_yaml::HierarchySummaryOptions {
+        fn positive_usize(args: &serde_json::Value, key: &str) -> Option<usize> {
+            args.get(key)
+                .and_then(|value| value.as_u64())
+                .filter(|value| *value > 0)
+                .map(|value| value as usize)
+        }
 
-        let file_path_arg = match args.get("file_path").and_then(|v| v.as_str()) {
-            Some(p) => p.to_string(),
-            None => {
-                return ToolResult {
-                    output: "Missing required parameter: file_path".to_string(),
-                    is_error: true,
-                };
+        fn trimmed_string(args: &serde_json::Value, key: &str) -> Option<String> {
+            args.get(key)
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| value.to_string())
+        }
+
+        fn push_component_filters(out: &mut Vec<String>, value: &str) {
+            out.extend(
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|entry| !entry.is_empty())
+                    .map(|entry| entry.to_string()),
+            );
+        }
+
+        let mut component_filters = Vec::new();
+        match args.get("component_filter") {
+            Some(serde_json::Value::String(value)) => {
+                push_component_filters(&mut component_filters, value);
             }
-        };
+            Some(serde_json::Value::Array(values)) => {
+                for value in values {
+                    if let Some(text) = value.as_str() {
+                        push_component_filters(&mut component_filters, text);
+                    }
+                }
+            }
+            _ => {}
+        }
 
-        let object_path = args
-            .get("object_path")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
+        crate::unity_yaml::HierarchySummaryOptions {
+            max_depth: positive_usize(args, "max_depth"),
+            max_nodes: positive_usize(args, "max_nodes"),
+            query: trimmed_string(args, "query"),
+            component_filters,
+            path_prefix: trimmed_string(args, "path_prefix"),
+        }
+    }
 
-        let ref_graph_state: Option<tauri::State<'_, AssetDbState>> = app_handle.try_state();
+    fn parse_unity_yaml_search_options(
+        args: &serde_json::Value,
+    ) -> crate::unity_yaml::HierarchySearchOptions {
+        fn positive_usize(args: &serde_json::Value, key: &str) -> Option<usize> {
+            args.get(key)
+                .and_then(|value| value.as_u64())
+                .filter(|value| *value > 0)
+                .map(|value| value as usize)
+        }
+
+        fn trimmed_string(args: &serde_json::Value, key: &str) -> Option<String> {
+            args.get(key)
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| value.to_string())
+        }
+
+        fn push_csv_values(out: &mut Vec<String>, value: &str) {
+            out.extend(
+                value
+                    .split([',', '|'])
+                    .map(str::trim)
+                    .filter(|entry| !entry.is_empty())
+                    .map(|entry| entry.to_string()),
+            );
+        }
+
+        let mut component_filters = Vec::new();
+        match args.get("component_filter") {
+            Some(serde_json::Value::String(value)) => {
+                push_csv_values(&mut component_filters, value);
+            }
+            Some(serde_json::Value::Array(values)) => {
+                for value in values {
+                    if let Some(text) = value.as_str() {
+                        push_csv_values(&mut component_filters, text);
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        let mut match_fields = Vec::new();
+        match args.get("match_fields") {
+            Some(serde_json::Value::String(value)) => {
+                push_csv_values(&mut match_fields, value);
+            }
+            Some(serde_json::Value::Array(values)) => {
+                for value in values {
+                    if let Some(text) = value.as_str() {
+                        push_csv_values(&mut match_fields, text);
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        crate::unity_yaml::HierarchySearchOptions {
+            query: trimmed_string(args, "query"),
+            component_filters,
+            match_fields,
+            path_prefix: trimmed_string(args, "path_prefix"),
+            limit: positive_usize(args, "limit"),
+        }
+    }
+
+    fn unity_yaml_project_context<'a>(
+        &self,
+        app_handle: &'a AppHandle,
+        file_path_arg: &str,
+    ) -> (
+        Option<tauri::State<'a, crate::asset_db::AssetDbState>>,
+        Option<std::path::PathBuf>,
+        std::path::PathBuf,
+    ) {
+        let ref_graph_state: Option<tauri::State<'_, crate::asset_db::AssetDbState>> =
+            app_handle.try_state();
 
         let project_root: Option<std::path::PathBuf> = ref_graph_state
             .as_ref()
             .and_then(|s| s.0.lock().ok())
             .and_then(|g| g.as_ref().map(|rg| rg.project_root().to_path_buf()));
 
-        let abs_path = if std::path::Path::new(&file_path_arg).is_absolute() {
-            std::path::PathBuf::from(&file_path_arg)
+        let abs_path = if std::path::Path::new(file_path_arg).is_absolute() {
+            std::path::PathBuf::from(file_path_arg)
         } else if let Some(ref root) = project_root {
-            root.join(&file_path_arg)
+            root.join(file_path_arg)
         } else {
-            std::path::PathBuf::from(&file_path_arg)
+            std::path::PathBuf::from(file_path_arg)
         };
 
-        let ext = abs_path
+        (ref_graph_state, project_root, abs_path)
+    }
+
+    fn read_unity_yaml_content(abs_path: &std::path::Path) -> Result<Vec<u8>, ToolResult> {
+        std::fs::read(abs_path).map_err(|e| ToolResult {
+            output: format!("Failed to read file '{}': {}", abs_path.display(), e),
+            is_error: true,
+        })
+    }
+
+    fn is_unity_yaml_content(content: &[u8]) -> bool {
+        let header = String::from_utf8_lossy(&content[..content.len().min(128)]);
+        header.contains("%YAML") || header.contains("!u!") || header.contains("--- !u!")
+    }
+
+    fn format_plain_text_excerpt(content: &[u8]) -> String {
+        let text = String::from_utf8_lossy(content);
+        let lines: Vec<&str> = text.lines().collect();
+        let limit = 2000;
+        let mut out = String::new();
+        for (i, line) in lines.iter().take(limit).enumerate() {
+            out.push_str(&format!("{:>5}\t{}\n", i + 1, line));
+        }
+        if lines.len() > limit {
+            out.push_str(&format!("... ({} more lines)\n", lines.len() - limit));
+        }
+        out
+    }
+
+    fn unity_yaml_file_path_arg(args: &serde_json::Value) -> Result<String, ToolResult> {
+        args.get("file_path")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string())
+            .ok_or_else(|| ToolResult {
+                output: "Missing required parameter: file_path".to_string(),
+                is_error: true,
+            })
+    }
+
+    fn unity_yaml_file_extension(abs_path: &std::path::Path) -> String {
+        abs_path
             .extension()
             .unwrap_or_default()
             .to_string_lossy()
-            .to_lowercase();
-        let mut unity_plugin_error: Option<String> = None;
-        if matches!(ext.as_str(), "unity" | "prefab") {
+            .to_lowercase()
+    }
+
+    fn is_unity_editor_yaml_candidate(abs_path: &std::path::Path) -> bool {
+        matches!(
+            Self::unity_yaml_file_extension(abs_path).as_str(),
+            "unity" | "prefab"
+        )
+    }
+
+    async fn try_unity_yaml_editor_tool(
+        &self,
+        message_type: &str,
+        payload: serde_json::Value,
+    ) -> Result<ToolResult, String> {
+        let payload_text =
+            serde_json::to_string(&payload).map_err(|e| format!("invalid tool payload: {}", e))?;
+        let resp =
+            crate::unity_bridge::send_message(&self.working_dir, message_type, &payload_text)
+                .await?;
+
+        if !resp.ok {
+            return Err(resp
+                .error
+                .unwrap_or_else(|| format!("{} failed", message_type)));
+        }
+
+        let output = resp
+            .message
+            .filter(|message| !message.trim().is_empty())
+            .ok_or_else(|| format!("{} returned an empty response", message_type))?;
+
+        Ok(ToolResult {
+            output: output.trim_end().to_string(),
+            is_error: false,
+        })
+    }
+
+    fn unity_yaml_list_editor_payload(
+        file_path_arg: &str,
+        options: &crate::unity_yaml::HierarchySummaryOptions,
+    ) -> serde_json::Value {
+        let mut payload = serde_json::json!({ "file_path": file_path_arg });
+        if let Some(path_prefix) = options.path_prefix.as_deref() {
+            payload["path_prefix"] = serde_json::json!(path_prefix);
+        }
+        if let Some(max_depth) = options.max_depth {
+            payload["max_depth"] = serde_json::json!(max_depth);
+        }
+        if let Some(max_nodes) = options.max_nodes {
+            payload["max_nodes"] = serde_json::json!(max_nodes);
+        }
+        payload
+    }
+
+    fn unity_yaml_search_editor_payload(
+        file_path_arg: &str,
+        options: &crate::unity_yaml::HierarchySearchOptions,
+    ) -> serde_json::Value {
+        let mut payload = serde_json::json!({ "file_path": file_path_arg });
+        if let Some(query) = options.query.as_deref() {
+            payload["query"] = serde_json::json!(query);
+        }
+        if !options.component_filters.is_empty() {
+            payload["component_filter"] = serde_json::json!(options.component_filters.join(","));
+        }
+        if !options.match_fields.is_empty() {
+            payload["match_fields"] = serde_json::json!(options.match_fields.join(","));
+        }
+        if let Some(path_prefix) = options.path_prefix.as_deref() {
+            payload["path_prefix"] = serde_json::json!(path_prefix);
+        }
+        if let Some(limit) = options.limit {
+            payload["limit"] = serde_json::json!(limit);
+        }
+        payload
+    }
+
+    fn unity_yaml_read_editor_payload(
+        file_path_arg: &str,
+        object_path: &str,
+        args: &serde_json::Value,
+    ) -> serde_json::Value {
+        let mut payload = serde_json::json!({
+            "file_path": file_path_arg,
+            "object_path": object_path,
+        });
+        if let Some(max_field_depth) = args
+            .get("max_field_depth")
+            .and_then(|value| value.as_u64())
+            .filter(|value| *value > 0)
+        {
+            payload["max_field_depth"] = serde_json::json!(max_field_depth.min(6));
+        }
+        if let Some(max_array_items) = args
+            .get("max_array_items")
+            .and_then(|value| value.as_u64())
+            .filter(|value| *value > 0)
+        {
+            payload["max_array_items"] = serde_json::json!(max_array_items.min(200));
+        }
+        payload
+    }
+
+    async fn execute_unity_yaml_list(
+        &self,
+        app_handle: &AppHandle,
+        args: &serde_json::Value,
+    ) -> ToolResult {
+        use crate::unity_yaml as yaml_parser;
+
+        let file_path_arg = match Self::unity_yaml_file_path_arg(args) {
+            Ok(value) => value,
+            Err(result) => return result,
+        };
+        let summary_options = Self::parse_unity_yaml_summary_options(args);
+        let (ref_graph_state, _project_root, abs_path) =
+            self.unity_yaml_project_context(app_handle, &file_path_arg);
+        if Self::is_unity_editor_yaml_candidate(&abs_path) {
+            let payload = Self::unity_yaml_list_editor_payload(&file_path_arg, &summary_options);
+            match self.try_unity_yaml_editor_tool("list_yaml", payload).await {
+                Ok(result) => return result,
+                Err(err) => eprintln!(
+                    "[unity_yaml_list] Unity plugin path unavailable for '{}': {}",
+                    file_path_arg, err
+                ),
+            }
+        }
+
+        let content = match Self::read_unity_yaml_content(&abs_path) {
+            Ok(content) => content,
+            Err(result) => return result,
+        };
+        if !Self::is_unity_yaml_content(&content) {
+            return ToolResult {
+                output: format!(
+                    "unity_yaml_list only supports Unity text-serialized .unity/.prefab YAML files. '{}' does not look like Unity YAML.",
+                    file_path_arg
+                ),
+                is_error: true,
+            };
+        }
+
+        let ext = Self::unity_yaml_file_extension(&abs_path);
+        if !yaml_parser::is_hierarchical_file(&ext) {
+            return ToolResult {
+                output: format!(
+                    "unity_yaml_list only supports scene/prefab hierarchy files. Use unity_yaml_read for '{}'.",
+                    file_path_arg
+                ),
+                is_error: true,
+            };
+        }
+
+        let docs = yaml_parser::parse_yaml_docs(&content);
+        let text = String::from_utf8_lossy(&content);
+        let lines: Vec<&str> = text.lines().collect();
+        let tree = yaml_parser::build_go_tree(&docs);
+        if tree.is_empty() {
+            return ToolResult {
+                output: format!(
+                    "No GameObjects found in '{}'. The file may be empty or not a scene/prefab.",
+                    file_path_arg
+                ),
+                is_error: false,
+            };
+        }
+
+        let has_prefab_instances = docs.iter().any(|d| d.class_id == 1001 && !d.is_stripped);
+        let guid_map = if has_prefab_instances {
+            self.build_guid_map_for_docs(app_handle, &ref_graph_state, &docs, &lines)
+        } else {
+            std::collections::HashMap::new()
+        };
+        let guid_resolver =
+            |guid: &crate::asset_db::types::Guid| -> Option<String> { guid_map.get(guid).cloned() };
+
+        ToolResult {
+            output: yaml_parser::format_scene_summary_with_options(
+                &tree,
+                &docs,
+                &lines,
+                &guid_resolver,
+                &file_path_arg,
+                &summary_options,
+            ),
+            is_error: false,
+        }
+    }
+
+    async fn execute_unity_yaml_search(
+        &self,
+        app_handle: &AppHandle,
+        args: &serde_json::Value,
+    ) -> ToolResult {
+        use crate::unity_yaml as yaml_parser;
+
+        let file_path_arg = match Self::unity_yaml_file_path_arg(args) {
+            Ok(value) => value,
+            Err(result) => return result,
+        };
+        let search_options = Self::parse_unity_yaml_search_options(args);
+        if !search_options.has_search_filters() {
+            return ToolResult {
+                output: "unity_yaml_search requires query or component_filter. Use unity_yaml_list to inspect a subtree without a search filter.".to_string(),
+                is_error: true,
+            };
+        }
+
+        let (ref_graph_state, _project_root, abs_path) =
+            self.unity_yaml_project_context(app_handle, &file_path_arg);
+        if Self::is_unity_editor_yaml_candidate(&abs_path) {
+            let payload = Self::unity_yaml_search_editor_payload(&file_path_arg, &search_options);
             match self
-                .try_read_yaml_via_unity(&file_path_arg, &object_path)
+                .try_unity_yaml_editor_tool("search_yaml", payload)
                 .await
             {
                 Ok(result) => return result,
-                Err(reason) => {
-                    eprintln!("[unity_yaml_read] Unity plugin failed for '{}': {}, falling back to local YAML parsing", file_path_arg, reason);
-                    unity_plugin_error = Some(reason);
+                Err(err) => eprintln!(
+                    "[unity_yaml_search] Unity plugin path unavailable for '{}': {}",
+                    file_path_arg, err
+                ),
+            }
+        }
+
+        let content = match Self::read_unity_yaml_content(&abs_path) {
+            Ok(content) => content,
+            Err(result) => return result,
+        };
+        if !Self::is_unity_yaml_content(&content) {
+            return ToolResult {
+                output: format!(
+                    "unity_yaml_search only supports Unity text-serialized .unity/.prefab YAML files. '{}' does not look like Unity YAML.",
+                    file_path_arg
+                ),
+                is_error: true,
+            };
+        }
+
+        let ext = Self::unity_yaml_file_extension(&abs_path);
+        if !yaml_parser::is_hierarchical_file(&ext) {
+            return ToolResult {
+                output: format!(
+                    "unity_yaml_search only supports scene/prefab hierarchy files. Use unity_yaml_read for '{}'.",
+                    file_path_arg
+                ),
+                is_error: true,
+            };
+        }
+
+        let docs = yaml_parser::parse_yaml_docs(&content);
+        let text = String::from_utf8_lossy(&content);
+        let lines: Vec<&str> = text.lines().collect();
+        let tree = yaml_parser::build_go_tree(&docs);
+        if tree.is_empty() {
+            return ToolResult {
+                output: format!(
+                    "No GameObjects found in '{}'. The file may be empty or not a scene/prefab.",
+                    file_path_arg
+                ),
+                is_error: false,
+            };
+        }
+
+        let has_prefab_instances = docs.iter().any(|d| d.class_id == 1001 && !d.is_stripped);
+        let guid_map = if has_prefab_instances {
+            self.build_guid_map_for_docs(app_handle, &ref_graph_state, &docs, &lines)
+        } else {
+            std::collections::HashMap::new()
+        };
+        let guid_resolver =
+            |guid: &crate::asset_db::types::Guid| -> Option<String> { guid_map.get(guid).cloned() };
+
+        ToolResult {
+            output: yaml_parser::format_hierarchy_search_results(
+                &tree,
+                &docs,
+                &lines,
+                &guid_resolver,
+                &file_path_arg,
+                &search_options,
+            ),
+            is_error: false,
+        }
+    }
+
+    async fn execute_unity_yaml_read(
+        &self,
+        app_handle: &AppHandle,
+        args: &serde_json::Value,
+    ) -> ToolResult {
+        use crate::unity_yaml as yaml_parser;
+
+        let file_path_arg = match Self::unity_yaml_file_path_arg(args) {
+            Ok(value) => value,
+            Err(result) => return result,
+        };
+        let object_path = args
+            .get("object_path")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|s| s.to_string());
+        let detail = args
+            .get("detail")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("");
+
+        let (ref_graph_state, project_root, abs_path) =
+            self.unity_yaml_project_context(app_handle, &file_path_arg);
+        let ext = Self::unity_yaml_file_extension(&abs_path);
+        let is_hierarchical = yaml_parser::is_hierarchical_file(&ext);
+
+        if is_hierarchical && object_path.is_none() {
+            return ToolResult {
+                output: "unity_yaml_read requires object_path for .unity/.prefab files. Use unity_yaml_list for hierarchy listing or unity_yaml_search to locate a target.".to_string(),
+                is_error: true,
+            };
+        }
+
+        if Self::is_unity_editor_yaml_candidate(&abs_path) && detail != "document" {
+            if let Some(obj_path) = object_path.as_deref() {
+                let payload = Self::unity_yaml_read_editor_payload(&file_path_arg, obj_path, args);
+                match self.try_unity_yaml_editor_tool("read_yaml", payload).await {
+                    Ok(result) => return result,
+                    Err(err) => eprintln!(
+                        "[unity_yaml_read] Unity plugin path unavailable for '{}': {}",
+                        file_path_arg, err
+                    ),
                 }
             }
         }
 
-        let content = match std::fs::read(&abs_path) {
-            Ok(c) => c,
-            Err(e) => {
-                return ToolResult {
-                    output: format!("Failed to read file '{}': {}", abs_path.display(), e),
-                    is_error: true,
-                };
-            }
+        let content = match Self::read_unity_yaml_content(&abs_path) {
+            Ok(content) => content,
+            Err(result) => return result,
         };
-
-        let header = String::from_utf8_lossy(&content[..content.len().min(128)]);
-        if !header.contains("%YAML") && !header.contains("!u!") && !header.contains("--- !u!") {
-            let text = String::from_utf8_lossy(&content);
-            let lines: Vec<&str> = text.lines().collect();
-            let limit = 2000;
-            let mut out = String::new();
-            for (i, line) in lines.iter().take(limit).enumerate() {
-                out.push_str(&format!("{:>5}\t{}\n", i + 1, line));
-            }
-            if lines.len() > limit {
-                out.push_str(&format!("... ({} more lines)\n", lines.len() - limit));
-            }
+        if !Self::is_unity_yaml_content(&content) {
             return ToolResult {
-                output: out,
+                output: Self::format_plain_text_excerpt(&content),
                 is_error: false,
             };
         }
@@ -7033,58 +7526,7 @@ impl AgentInstance {
         let lines: Vec<&str> = text.lines().collect();
         let world_transform_map = yaml_parser::build_world_transform_map(&docs, &lines);
 
-        let ext = abs_path
-            .extension()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_lowercase();
-        let is_hierarchical = yaml_parser::is_hierarchical_file(&ext);
-
-        if is_hierarchical && object_path.is_none() {
-            let tree = yaml_parser::build_go_tree(&docs);
-            if tree.is_empty() {
-                return ToolResult {
-                    output: format!(
-                        "No GameObjects found in '{}'. The file may be empty or not a scene/prefab.",
-                        file_path_arg
-                    ),
-                    is_error: false,
-                };
-            }
-            let has_prefab_instances = docs.iter().any(|d| d.class_id == 1001 && !d.is_stripped);
-            let guid_map = if has_prefab_instances {
-                self.build_guid_map_for_docs(app_handle, &ref_graph_state, &docs, &lines)
-            } else {
-                std::collections::HashMap::new()
-            };
-            let guid_resolver = |guid: &crate::asset_db::types::Guid| -> Option<String> {
-                guid_map.get(guid).cloned()
-            };
-
-            let mut output = yaml_parser::format_scene_summary(
-                &tree,
-                &docs,
-                &lines,
-                &guid_resolver,
-                &file_path_arg,
-            );
-
-            if let Some(err) = &unity_plugin_error {
-                let notice = format!(
-                    "[Note: Unity plugin read failed ({}), fell back to YAML parsing]\n\n",
-                    err
-                );
-                output.insert_str(0, &notice);
-            }
-
-            return ToolResult {
-                output,
-                is_error: false,
-            };
-        }
-
         let guid_map = self.build_guid_map_for_docs(app_handle, &ref_graph_state, &docs, &lines);
-
         let internal_map = yaml_parser::build_internal_id_map(&docs);
         let internal_resolver = |fid: i64| -> Option<String> { internal_map.get(&fid).cloned() };
         let transform_hierarchy_labels = if is_hierarchical {
@@ -7093,10 +7535,10 @@ impl AgentInstance {
             std::collections::HashMap::new()
         };
 
-        let (output_header, doc_ranges, _is_prefab_instance_detail) = if is_hierarchical {
-            let obj_path = object_path.as_deref().unwrap();
+        let (output_header, doc_ranges): (String, Vec<usize>) = if is_hierarchical {
             let tree = yaml_parser::build_go_tree(&docs);
-            let go_file_id = match yaml_parser::find_go_by_path(&tree, obj_path) {
+            let obj_path = object_path.as_deref().unwrap();
+            let target_file_id = match yaml_parser::find_go_by_path(&tree, obj_path) {
                 Some(id) => id,
                 None => {
                     let roots: Vec<&str> = tree.iter().map(|n| n.name.as_str()).collect();
@@ -7112,59 +7554,92 @@ impl AgentInstance {
                 }
             };
 
-            let is_pi = docs
-                .iter()
-                .any(|d| d.file_id == go_file_id && d.class_id == 1001);
+            let target_doc_idx = docs.iter().position(|d| d.file_id == target_file_id);
+            let Some(target_doc_idx) = target_doc_idx else {
+                return ToolResult {
+                    output: format!(
+                        "Target '{}' was found in the hierarchy but its YAML document was unavailable in '{}'.",
+                        obj_path, file_path_arg
+                    ),
+                    is_error: true,
+                };
+            };
+            let target_doc = &docs[target_doc_idx];
+            let label = obj_path.to_string();
 
-            if is_pi {
+            if detail == "document" {
+                (
+                    format!("Document fields of '{}' ({}):\n", label, file_path_arg),
+                    vec![target_doc_idx],
+                )
+            } else if target_doc.class_id == 1001 || detail == "prefab_overrides" {
+                if target_doc.class_id != 1001 {
+                    return ToolResult {
+                        output: format!(
+                            "Target '{}' is {}, not a PrefabInstance.",
+                            label, target_doc.type_name
+                        ),
+                        is_error: true,
+                    };
+                }
                 let irs = yaml_parser::extract_prefab_instance_irs(&docs, &lines);
-                if let Some(ir) = irs.iter().find(|ir| ir.local_file_id == go_file_id) {
+                if let Some(ir) = irs.iter().find(|ir| ir.local_file_id == target_file_id) {
                     let guid_resolver_fn = |guid: &crate::asset_db::types::Guid| -> Option<String> {
                         guid_map.get(guid).cloned()
                     };
-
                     let source_ctx = self.load_source_prefab_context(
                         &ir.source_prefab_guid,
                         &guid_map,
                         &project_root,
                     );
-
+                    let stripped = yaml_parser::extract_stripped_mappings(&docs, &lines);
                     let detail = yaml_parser::format_prefab_instance_detail(
                         ir,
                         &guid_resolver_fn,
                         source_ctx.as_ref(),
+                        &stripped,
                     );
                     return ToolResult {
                         output: detail,
                         is_error: false,
                     };
                 }
-            }
-
-            let component_indices = yaml_parser::get_components_for_go(&docs, go_file_id);
-            if component_indices.is_empty() {
                 return ToolResult {
-                    output: format!("No components found for '{}'.", obj_path),
-                    is_error: false,
+                    output: format!("PrefabInstance '{}' could not be parsed.", label),
+                    is_error: true,
+                };
+            } else if target_doc.class_id == 1 {
+                let component_indices = yaml_parser::get_components_for_go(&docs, target_file_id);
+                if component_indices.is_empty() {
+                    return ToolResult {
+                        output: format!("No components found for '{}'.", label),
+                        is_error: false,
+                    };
+                }
+                (
+                    format!("Components of '{}' ({}):\n", label, file_path_arg),
+                    component_indices,
+                )
+            } else {
+                (
+                    format!("YAML document '{}' ({}):\n", label, file_path_arg),
+                    vec![target_doc_idx],
+                )
+            }
+        } else {
+            if detail == "prefab_overrides" {
+                return ToolResult {
+                    output: "detail='prefab_overrides' only applies to PrefabInstance targets in scene/prefab YAML files.".to_string(),
+                    is_error: true,
                 };
             }
-
-            let ranges: Vec<usize> = component_indices;
-            (
-                format!("Components of '{}' ({}):\n", obj_path, file_path_arg),
-                ranges,
-                false,
-            )
-        } else {
-            let ranges: Vec<usize> = (0..docs.len()).collect();
             (
                 format!(
                     "Content of '{}' ({} documents):\n",
                     file_path_arg,
                     docs.len()
                 ),
-                ranges,
-                false,
+                (0..docs.len()).collect(),
             )
         };
 
@@ -7174,17 +7649,18 @@ impl AgentInstance {
         };
 
         let mut output = output_header;
+        let mut wrote_transform_hierarchy = false;
         for &idx in &doc_ranges {
             let doc = &docs[idx];
-            output.push_str(&format!(
-                "\n--- {} (fileID: {})\n",
-                doc.type_name, doc.file_id
-            ));
+            if !wrote_transform_hierarchy && (doc.class_id == 4 || doc.class_id == 224) {
+                output.push_str(&Self::format_transform_hierarchy_section(
+                    doc,
+                    &transform_hierarchy_labels,
+                ));
+                wrote_transform_hierarchy = true;
+            }
+            output.push_str(&format!("\n--- {} ---\n", doc.type_name));
             output.push_str(&yaml_parser::format_doc_state_lines(doc));
-            output.push_str(&Self::format_transform_hierarchy_lines(
-                doc,
-                &transform_hierarchy_labels,
-            ));
             if let Some(info) = world_transform_map.get(&doc.file_id) {
                 if doc.class_id == 4 || doc.class_id == 224 {
                     output.push_str(&Self::format_world_transform_lines(info));
@@ -7207,14 +7683,6 @@ impl AgentInstance {
             output.push_str(&resolved);
         }
 
-        if let Some(err) = &unity_plugin_error {
-            let notice = format!(
-                "[Note: Unity plugin read failed ({}), fell back to YAML parsing]\n\n",
-                err
-            );
-            output.insert_str(0, &notice);
-        }
-
         ToolResult {
             output,
             is_error: false,
@@ -7224,7 +7692,8 @@ impl AgentInstance {
     fn build_transform_hierarchy_labels(
         docs: &[crate::unity_yaml::YamlDoc],
         internal_map: &std::collections::HashMap<i64, String>,
-    ) -> std::collections::HashMap<i64, (Option<String>, Vec<String>)> {
+    ) -> std::collections::HashMap<i64, (Option<String>, Option<String>, Vec<i64>)> {
+        let node_label_map = Self::build_hierarchy_node_label_map(docs);
         let mut transform_to_owner: std::collections::HashMap<i64, i64> =
             std::collections::HashMap::new();
 
@@ -7249,12 +7718,21 @@ impl AgentInstance {
                 continue;
             }
 
+            let current = transform_to_owner.get(&doc.file_id).and_then(|owner_id| {
+                Self::format_hierarchy_node_label_for_owner(
+                    *owner_id,
+                    internal_map,
+                    &node_label_map,
+                )
+            });
+
             let parent = doc
                 .m_father_id
                 .filter(|id| *id != 0)
                 .and_then(|transform_id| transform_to_owner.get(&transform_id))
-                .and_then(|owner_id| internal_map.get(owner_id))
-                .cloned();
+                .and_then(|owner_id| {
+                    Self::format_hierarchy_owner_name(*owner_id, internal_map, &node_label_map)
+                });
 
             let mut seen = std::collections::HashSet::new();
             let mut children = Vec::new();
@@ -7262,49 +7740,214 @@ impl AgentInstance {
                 let Some(owner_id) = transform_to_owner.get(child_transform_id) else {
                     continue;
                 };
-                let Some(label) = internal_map.get(owner_id) else {
-                    continue;
-                };
                 if seen.insert(*owner_id) {
-                    children.push(label.clone());
+                    children.push(*child_transform_id);
                 }
             }
 
-            result.insert(doc.file_id, (parent, children));
+            result.insert(doc.file_id, (current, parent, children));
         }
 
         result
     }
 
-    fn format_transform_hierarchy_lines(
+    fn format_transform_hierarchy_section(
         doc: &crate::unity_yaml::YamlDoc,
-        transform_hierarchy_labels: &std::collections::HashMap<i64, (Option<String>, Vec<String>)>,
+        transform_hierarchy_labels: &std::collections::HashMap<
+            i64,
+            (Option<String>, Option<String>, Vec<i64>),
+        >,
     ) -> String {
         if doc.class_id != 4 && doc.class_id != 224 {
             return String::new();
         }
 
-        let (parent, children) = transform_hierarchy_labels
+        let (current, parent, children) = transform_hierarchy_labels
             .get(&doc.file_id)
             .cloned()
-            .unwrap_or_else(|| (None, Vec::new()));
+            .unwrap_or_else(|| (None, None, Vec::new()));
 
         let mut out = String::new();
+        out.push_str("\n--- Hierarchy ---\n");
         match parent {
-            Some(label) => out.push_str(&format!("  parent: {{{}}}\n", label)),
-            None => out.push_str("  parent: {none}\n"),
+            Some(label) => out.push_str(&format!("  parent: {}\n", label)),
+            None => out.push_str("  parent: none\n"),
         }
 
-        if children.is_empty() {
-            out.push_str("  children: []\n");
-            return out;
+        if let Some(label) = current {
+            out.push_str(&format!("  {}\n", label));
         }
 
-        out.push_str("  children:\n");
-        for child in children {
-            out.push_str(&format!("    - {{{}}}\n", child));
+        for (idx, child_transform_id) in children.iter().copied().enumerate() {
+            let is_last = idx + 1 == children.len();
+            let branch = if is_last { "└─" } else { "├─" };
+            let child_label = transform_hierarchy_labels
+                .get(&child_transform_id)
+                .and_then(|(label, _, _)| label.as_deref())
+                .unwrap_or("?");
+
+            out.push_str(&format!("  {} {}\n", branch, child_label));
+
+            let mut visiting = std::collections::HashSet::new();
+            visiting.insert(doc.file_id);
+            let hidden = Self::count_transform_hierarchy_descendants(
+                transform_hierarchy_labels,
+                child_transform_id,
+                &mut visiting,
+            );
+            if hidden > 0 {
+                let continuation = if is_last { "   " } else { "│  " };
+                out.push_str(&format!(
+                    "  {}... ({} child nodes hidden by max_depth)\n",
+                    continuation, hidden
+                ));
+            }
         }
         out
+    }
+
+    fn build_hierarchy_node_label_map(
+        docs: &[crate::unity_yaml::YamlDoc],
+    ) -> std::collections::HashMap<i64, String> {
+        fn visit(
+            node: &crate::unity_yaml::HierarchyNode,
+            out: &mut std::collections::HashMap<i64, String>,
+        ) {
+            out.insert(
+                node.file_id,
+                AgentInstance::format_hierarchy_node_label(node),
+            );
+            for child in &node.children {
+                visit(child, out);
+            }
+        }
+
+        let mut out = std::collections::HashMap::new();
+        for root in crate::unity_yaml::build_go_tree(docs) {
+            visit(&root, &mut out);
+        }
+        out
+    }
+
+    fn count_transform_hierarchy_descendants(
+        transform_hierarchy_labels: &std::collections::HashMap<
+            i64,
+            (Option<String>, Option<String>, Vec<i64>),
+        >,
+        transform_id: i64,
+        visiting: &mut std::collections::HashSet<i64>,
+    ) -> usize {
+        if !visiting.insert(transform_id) {
+            return 0;
+        }
+
+        let count = transform_hierarchy_labels
+            .get(&transform_id)
+            .map(|(_, _, children)| {
+                children
+                    .iter()
+                    .map(|child_id| {
+                        1 + Self::count_transform_hierarchy_descendants(
+                            transform_hierarchy_labels,
+                            *child_id,
+                            visiting,
+                        )
+                    })
+                    .sum()
+            })
+            .unwrap_or(0);
+
+        visiting.remove(&transform_id);
+        count
+    }
+
+    fn format_hierarchy_node_label(node: &crate::unity_yaml::HierarchyNode) -> String {
+        let mut label = node.name.clone();
+        if !node.components.is_empty() {
+            label.push_str(&format!(" ({})", node.components.join(", ")));
+        }
+
+        let annotations = Self::format_hierarchy_node_annotations(node);
+        if !annotations.is_empty() {
+            label.push_str(&annotations);
+        }
+        label
+    }
+
+    fn format_hierarchy_node_annotations(node: &crate::unity_yaml::HierarchyNode) -> String {
+        let mut parts = Vec::new();
+        if node.is_static {
+            parts.push("Static".to_string());
+        }
+        if !node.is_active {
+            parts.push("Inactive".to_string());
+        }
+        if let Some(tag) = &node.tag {
+            parts.push(format!("Tag:{}", tag));
+        }
+        if let Some(layer) = node.layer {
+            let layer_name = Self::unity_layer_name(layer);
+            if layer_name.is_empty() {
+                parts.push(format!("Layer:{}", layer));
+            } else {
+                parts.push(format!("Layer:{}", layer_name));
+            }
+        }
+
+        if parts.is_empty() {
+            String::new()
+        } else {
+            format!("  [{}]", parts.join(", "))
+        }
+    }
+
+    fn unity_layer_name(layer: i32) -> &'static str {
+        match layer {
+            0 => "Default",
+            1 => "TransparentFX",
+            2 => "Ignore Raycast",
+            3 => "Layer3",
+            4 => "Water",
+            5 => "UI",
+            6 => "Layer6",
+            7 => "Layer7",
+            _ => "",
+        }
+    }
+
+    fn format_hierarchy_node_label_for_owner(
+        owner_id: i64,
+        internal_map: &std::collections::HashMap<i64, String>,
+        node_label_map: &std::collections::HashMap<i64, String>,
+    ) -> Option<String> {
+        node_label_map.get(&owner_id).cloned().or_else(|| {
+            internal_map
+                .get(&owner_id)
+                .map(|label| Self::format_hierarchy_leaf_label(label).to_string())
+        })
+    }
+
+    fn format_hierarchy_owner_name(
+        owner_id: i64,
+        internal_map: &std::collections::HashMap<i64, String>,
+        node_label_map: &std::collections::HashMap<i64, String>,
+    ) -> Option<String> {
+        internal_map
+            .get(&owner_id)
+            .map(|label| Self::format_hierarchy_leaf_label(label).to_string())
+            .or_else(|| node_label_map.get(&owner_id).cloned())
+    }
+
+    fn format_hierarchy_display_label(label: &str) -> &str {
+        label
+            .strip_prefix("GO:")
+            .or_else(|| label.strip_prefix("Prefab:"))
+            .unwrap_or(label)
+    }
+
+    fn format_hierarchy_leaf_label(label: &str) -> &str {
+        let display = Self::format_hierarchy_display_label(label);
+        display.rsplit('/').next().unwrap_or(display)
     }
 
     fn format_world_transform_lines(info: &crate::unity_yaml::TransformWorldInfo) -> String {
@@ -7332,54 +7975,6 @@ impl AgentInstance {
             format!("{:.0}", rounded)
         } else {
             format!("{:.2}", rounded)
-        }
-    }
-
-    async fn try_read_yaml_via_unity(
-        &self,
-        file_path: &str,
-        object_path: &Option<String>,
-    ) -> Result<ToolResult, String> {
-        if !crate::unity_bridge::is_unity_connected(&self.working_dir).await {
-            return Err("Unity Editor not connected".to_string());
-        }
-
-        let msg = if let Some(obj_path) = object_path {
-            serde_json::json!({
-                "file_path": file_path,
-                "object_path": obj_path,
-            })
-        } else {
-            serde_json::json!({
-                "file_path": file_path,
-                "object_path": "",
-            })
-        };
-
-        match crate::unity_bridge::send_message(&self.working_dir, "read_yaml", &msg.to_string())
-            .await
-        {
-            Ok(resp) if resp.ok => {
-                let output = resp.message.unwrap_or_default();
-                if output.is_empty() {
-                    Err("Unity plugin returned empty response".to_string())
-                } else {
-                    eprintln!(
-                        "[unity_yaml_read] Successfully read '{}' via Unity plugin ({} chars)",
-                        file_path,
-                        output.len()
-                    );
-                    Ok(ToolResult {
-                        output,
-                        is_error: false,
-                    })
-                }
-            }
-            Ok(resp) => {
-                let err = resp.error.unwrap_or_default();
-                Err(format!("Unity plugin error: {}", err))
-            }
-            Err(e) => Err(format!("pipe communication failed: {}", e)),
         }
     }
 
@@ -7429,6 +8024,21 @@ impl AgentInstance {
 
         match graph.full_scan(|_phase| { /* silent scan, no events */ }) {
             Ok(stats) => {
+                match crate::asset_db::watcher::reconcile_loaded_db(project_root, graph) {
+                    Ok((reconciled, reconcile_stats)) => {
+                        graph = reconciled;
+                        eprintln!(
+                            "[unity_yaml_read] auto-scan reconcile complete: queued={}, processed={}, failed={}",
+                            reconcile_stats.queued,
+                            reconcile_stats.processed,
+                            reconcile_stats.failed
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("[unity_yaml_read] auto-scan reconcile failed: {}", e);
+                        return;
+                    }
+                }
                 eprintln!(
                     "[unity_yaml_read] auto-scan complete: {} nodes, {} edges, {}ms",
                     stats.nodes_added, stats.edges_added, stats.elapsed_ms
@@ -8049,8 +8659,17 @@ GameObject:
 --- !u!4 &21
 Transform:
   m_GameObject: {fileID: 20}
-  m_Children: []
+  m_Children:
+  - {fileID: 31}
   m_Father: {fileID: 11}
+--- !u!1 &30
+GameObject:
+  m_Name: Grandchild
+--- !u!4 &31
+Transform:
+  m_GameObject: {fileID: 30}
+  m_Children: []
+  m_Father: {fileID: 21}
 "#;
 
         let docs = crate::unity_yaml::parse_yaml_docs(yaml);
@@ -8067,12 +8686,12 @@ Transform:
             .expect("child transform");
 
         assert_eq!(
-            AgentInstance::format_transform_hierarchy_lines(root_transform, &labels),
-            "  parent: {none}\n  children:\n    - {GO:Root/Child}\n"
+            AgentInstance::format_transform_hierarchy_section(root_transform, &labels),
+            "\n--- Hierarchy ---\n  parent: none\n  Root\n  └─ Child\n     ... (1 child nodes hidden by max_depth)\n"
         );
         assert_eq!(
-            AgentInstance::format_transform_hierarchy_lines(child_transform, &labels),
-            "  parent: {GO:Root}\n  children: []\n"
+            AgentInstance::format_transform_hierarchy_section(child_transform, &labels),
+            "\n--- Hierarchy ---\n  parent: Root\n  Child\n  └─ Grandchild\n"
         );
     }
 
@@ -8113,8 +8732,8 @@ PrefabInstance:
             .expect("root transform");
 
         assert_eq!(
-            AgentInstance::format_transform_hierarchy_lines(root_transform, &labels),
-            "  parent: {none}\n  children:\n    - {Prefab:Root/ChildPrefab}\n"
+            AgentInstance::format_transform_hierarchy_section(root_transform, &labels),
+            "\n--- Hierarchy ---\n  parent: none\n  Root\n  └─ ChildPrefab\n"
         );
     }
 

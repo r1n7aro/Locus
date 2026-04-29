@@ -72,6 +72,6 @@ For complex multi-step debugging sessions:
 * `unity_execute` — primary tool for all runtime queries
 * `read` / `grep` / `list` — for reading source code to understand the implementation behind runtime behavior
 * `unity_asset_search` / `unity_ref_search` — for finding related assets and references
-* `unity_yaml_read` — for reading scene/prefab structure (Editor-side, not runtime)
+* `unity_yaml_list` / `unity_yaml_search` / `unity_yaml_read` — for inspecting scene/prefab YAML structure (Editor-side, not runtime)
 
 Prefer `unity_execute` for any question about current runtime state. Use file-reading tools only to understand the code that drives the runtime behavior.

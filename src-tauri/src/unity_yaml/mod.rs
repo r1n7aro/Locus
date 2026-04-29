@@ -25,10 +25,11 @@ mod tests;
 mod tokenizer;
 
 pub use parser::{
-    build_go_tree, build_internal_id_map, build_world_transform_map, collect_guids_from_lines,
-    collect_guids_from_ranges, find_go_by_path, format_doc_state_lines, format_hierarchy_tree,
-    get_components_for_go, is_hierarchical_file, parse_yaml_docs, resolve_references_in_lines,
-    resolve_references_in_lines_skipping_fields, HierarchyNode, TransformWorldInfo, YamlDoc,
+    build_go_tree, build_hierarchy_path_map, build_internal_id_map, build_world_transform_map,
+    collect_guids_from_lines, collect_guids_from_ranges, find_go_by_path, format_doc_state_lines,
+    format_hierarchy_tree, get_components_for_go, is_hierarchical_file, parse_yaml_docs,
+    resolve_references_in_lines, resolve_references_in_lines_skipping_fields, HierarchyNode,
+    TransformWorldInfo, YamlDoc,
 };
 
 pub use prefab::{extract_prefab_instance_irs, extract_stripped_mappings};
@@ -36,9 +37,11 @@ pub use prefab::{extract_prefab_instance_irs, extract_stripped_mappings};
 pub use references::{extract_refs, extract_refs_with_resolver};
 
 pub use aggregation::{
-    format_hierarchy_summary, format_override_summary, format_prefab_file_summary,
-    format_prefab_instance_detail, format_scene_summary, summarize_prefab_instance,
-    SourcePrefabContext,
+    format_hierarchy_search_results, format_hierarchy_summary,
+    format_hierarchy_summary_with_options, format_override_summary, format_prefab_file_summary,
+    format_prefab_instance_detail, format_scene_summary, format_scene_summary_with_options,
+    summarize_prefab_instance, HierarchySearchOptions, HierarchySummaryOptions,
+    SourcePrefabContext, DEFAULT_HIERARCHY_MAX_NODES,
 };
 
 pub use index::{UnityYamlDocs, UnityYamlFile};

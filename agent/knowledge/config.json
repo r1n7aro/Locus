@@ -10,6 +10,8 @@
     "ask_user_question",
     "unity_asset_search",
     "unity_ref_search",
+    "unity_yaml_list",
+    "unity_yaml_search",
     "unity_yaml_read",
     "knowledge_list",
     "knowledge_query",

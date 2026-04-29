@@ -1,0 +1,28 @@
+{
+  "description": "List the hierarchy of a Unity scene or prefab for efficient AI inspection before modification.\n\nFor .unity/.prefab files, this tool reads live Unity Editor state through the locus_unity plugin first so unsaved scene or prefab changes are visible, then falls back to direct text YAML parsing when the Editor path is unavailable. The hierarchy output uses tree guide characters and keeps important object information visible, including component names, active/static state, Tag, Layer, prefab instance markers, and drill-down paths. Sibling objects may be structurally folded only when their normalized names, component signatures, annotations, and ordered child subtrees match; folded groups keep an `Instances:` line with exact object paths. When sibling names repeat, paths use a 1-based segment ordinal such as `Root/Enemy[2]`.\n\nFor large scenes, use `path_prefix`, `max_depth`, and `max_nodes` to narrow the hierarchy while preserving the same per-node information.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "file_path": {
+        "type": "string",
+        "description": "Path to the Unity .unity or .prefab YAML file, relative to the project root (e.g. 'Assets/Scenes/Main.unity') or absolute path."
+      },
+      "path_prefix": {
+        "type": "string",
+        "description": "Optional hierarchy path prefix for listing one subtree, such as 'Environment/Lighting' or a returned duplicate-safe path like 'Root/Enemy[2]'."
+      },
+      "max_depth": {
+        "type": "integer",
+        "minimum": 1,
+        "description": "Optional limit for expanded hierarchy depth. Root objects are depth 1. Hidden descendants are summarized instead of expanded."
+      },
+      "max_nodes": {
+        "type": "integer",
+        "minimum": 1,
+        "default": 1000,
+        "description": "Optional limit for the number of hierarchy entries printed. Defaults to 1000. Extra entries are counted and hidden to keep large scenes readable."
+      }
+    },
+    "required": ["file_path"]
+  }
+}

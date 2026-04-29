@@ -1,7 +1,7 @@
 {
   "name": "Explorer",
   "description": "Fast project exploration, file search, and keyword lookup.",
-  "tools": ["read", "list", "grep", "unity_asset_search", "unity_ref_search", "unity_yaml_read"],
+  "tools": ["read", "list", "grep", "unity_asset_search", "unity_ref_search", "unity_yaml_list", "unity_yaml_search", "unity_yaml_read"],
   "sub_agents": [],
   "default": false,
   "default_effort": "none",

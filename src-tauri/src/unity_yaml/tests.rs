@@ -3,11 +3,13 @@ use super::prefab::{extract_prefab_instance_irs, extract_stripped_mappings};
 use super::references::extract_refs;
 use super::tokenizer::parse_doc_header_full;
 use super::{
-    build_go_tree, build_internal_id_map, build_world_transform_map, find_go_by_path,
-    format_doc_state_lines, format_hierarchy_summary, format_hierarchy_tree,
+    build_go_tree, build_hierarchy_path_map, build_internal_id_map, build_world_transform_map,
+    find_go_by_path, format_doc_state_lines, format_hierarchy_search_results,
+    format_hierarchy_summary, format_hierarchy_summary_with_options, format_hierarchy_tree,
     format_override_summary, format_prefab_instance_detail, get_components_for_go, parse_yaml_docs,
     resolve_references_in_lines, resolve_references_in_lines_skipping_fields,
-    summarize_prefab_instance, HierarchyNode,
+    summarize_prefab_instance, HierarchyNode, HierarchySearchOptions, HierarchySummaryOptions,
+    DEFAULT_HIERARCHY_MAX_NODES,
 };
 use crate::asset_db::types::guid_to_hex;
 use crate::asset_db::types::Guid;
@@ -408,6 +410,36 @@ Transform:
     assert_eq!(find_go_by_path(&tree, "Root/Child"), Some(20));
     assert_eq!(find_go_by_path(&tree, "Root/NonExistent"), None);
     assert_eq!(find_go_by_path(&tree, "NonExistent"), None);
+}
+
+#[test]
+fn test_find_go_by_path_accepts_sibling_ordinal_paths() {
+    let roots = vec![HierarchyNode {
+        name: "Root".to_string(),
+        file_id: 1,
+        is_active: true,
+        children: vec![
+            HierarchyNode {
+                name: "Enemy".to_string(),
+                file_id: 2,
+                is_active: true,
+                ..Default::default()
+            },
+            HierarchyNode {
+                name: "Enemy".to_string(),
+                file_id: 3,
+                is_active: true,
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    }];
+
+    let paths = build_hierarchy_path_map(&roots);
+    assert_eq!(paths.get(&2).map(String::as_str), Some("Root/Enemy[1]"));
+    assert_eq!(paths.get(&3).map(String::as_str), Some("Root/Enemy[2]"));
+    assert_eq!(find_go_by_path(&roots, "Root/Enemy[1]"), Some(2));
+    assert_eq!(find_go_by_path(&roots, "Root/Enemy[2]"), Some(3));
 }
 
 #[test]
@@ -1039,11 +1071,17 @@ PrefabInstance:
     let ir = &irs[0];
 
     let resolver = |_: &Guid| -> Option<String> { None };
-    let detail = format_prefab_instance_detail(ir, &resolver, None);
+    let stripped = extract_stripped_mappings(&docs, &lines);
+    let detail = format_prefab_instance_detail(ir, &resolver, None, &stripped);
 
     assert!(detail.contains("=== Detail: DetailTest"));
     assert!(detail.contains("m_Name = DetailTest"));
     assert!(detail.contains("m_IsActive = 0"));
+    assert!(
+        !detail.contains("fileID"),
+        "detail leaked fileID:\n{}",
+        detail
+    );
 }
 
 #[test]
@@ -1215,6 +1253,440 @@ fn test_hierarchy_summary_keeps_different_subtrees_unfolded() {
         summary.contains("LevelRoom (LevelRoom)") && summary.contains("LevelRoom (1) (LevelRoom)"),
         "Each distinct room should stay visible: {}",
         summary
+    );
+}
+
+#[test]
+fn test_hierarchy_summary_filters_by_query_with_ancestor_context() {
+    let roots = vec![HierarchyNode {
+        name: "Environment".to_string(),
+        file_id: 1,
+        is_active: true,
+        children: vec![
+            HierarchyNode {
+                name: "Road".to_string(),
+                file_id: 2,
+                is_active: true,
+                children: vec![HierarchyNode {
+                    name: "StreetLight_A".to_string(),
+                    file_id: 3,
+                    components: vec!["Light".to_string()],
+                    is_active: true,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            HierarchyNode {
+                name: "Building".to_string(),
+                file_id: 4,
+                is_active: true,
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    }];
+
+    let summary = format_hierarchy_summary_with_options(
+        &roots,
+        &HierarchySummaryOptions {
+            query: Some("streetlight".to_string()),
+            ..Default::default()
+        },
+    );
+
+    assert!(
+        summary.contains("Environment"),
+        "ancestor should remain: {}",
+        summary
+    );
+    assert!(
+        summary.contains("Road"),
+        "parent should remain: {}",
+        summary
+    );
+    assert!(
+        summary.contains("StreetLight_A (Light)"),
+        "matching node should remain: {}",
+        summary
+    );
+    assert!(
+        !summary.contains("Building"),
+        "unmatched sibling should be filtered out: {}",
+        summary
+    );
+
+    let regex_summary = format_hierarchy_summary_with_options(
+        &roots,
+        &HierarchySummaryOptions {
+            query: Some("re:StreetLight_[A-Z]".to_string()),
+            ..Default::default()
+        },
+    );
+    assert!(
+        regex_summary.contains("StreetLight_A (Light)"),
+        "regex query should match hierarchy nodes: {}",
+        regex_summary
+    );
+}
+
+#[test]
+fn test_hierarchy_summary_limits_depth_and_nodes() {
+    let roots = vec![
+        HierarchyNode {
+            name: "RootA".to_string(),
+            file_id: 1,
+            is_active: true,
+            children: vec![HierarchyNode {
+                name: "ChildA".to_string(),
+                file_id: 2,
+                is_active: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        HierarchyNode {
+            name: "RootB".to_string(),
+            file_id: 3,
+            is_active: true,
+            ..Default::default()
+        },
+    ];
+
+    let depth_summary = format_hierarchy_summary_with_options(
+        &roots,
+        &HierarchySummaryOptions {
+            max_depth: Some(1),
+            ..Default::default()
+        },
+    );
+    assert!(
+        depth_summary.contains("RootA"),
+        "root should remain: {}",
+        depth_summary
+    );
+    assert!(
+        !depth_summary.contains("ChildA\n"),
+        "child should be folded by max_depth: {}",
+        depth_summary
+    );
+    assert!(
+        depth_summary.contains("hidden by max_depth"),
+        "depth fold count should be shown: {}",
+        depth_summary
+    );
+
+    let node_summary = format_hierarchy_summary_with_options(
+        &roots,
+        &HierarchySummaryOptions {
+            max_nodes: Some(1),
+            ..Default::default()
+        },
+    );
+    assert!(
+        node_summary.contains("RootA"),
+        "first node should remain: {}",
+        node_summary
+    );
+    assert!(
+        !node_summary.contains("RootB"),
+        "second root should be hidden by max_nodes: {}",
+        node_summary
+    );
+    assert!(
+        node_summary.contains("hidden by max_nodes"),
+        "node limit count should be shown: {}",
+        node_summary
+    );
+}
+
+#[test]
+fn test_hierarchy_summary_defaults_to_1000_nodes() {
+    let roots: Vec<HierarchyNode> = (0..=DEFAULT_HIERARCHY_MAX_NODES)
+        .map(|idx| HierarchyNode {
+            name: format!("Root{}", idx),
+            file_id: idx as i64 + 1,
+            is_active: true,
+            ..Default::default()
+        })
+        .collect();
+
+    let summary =
+        format_hierarchy_summary_with_options(&roots, &HierarchySummaryOptions::default());
+
+    assert!(
+        summary.contains("Root999"),
+        "the 1000th root should be printed by default: {}",
+        summary
+    );
+    assert!(
+        !summary.contains("Root1000"),
+        "nodes beyond the default max_nodes should be hidden: {}",
+        summary
+    );
+    assert!(
+        summary.contains("1 hierarchy nodes hidden by max_nodes"),
+        "hidden count should reflect the default max_nodes limit: {}",
+        summary
+    );
+}
+
+#[test]
+fn test_hierarchy_summary_uses_tree_guides_without_dropping_labels() {
+    let roots = vec![HierarchyNode {
+        name: "E0002美术".to_string(),
+        file_id: 1,
+        is_active: true,
+        children: vec![HierarchyNode {
+            name: "场景模型".to_string(),
+            file_id: 2,
+            is_active: true,
+            children: vec![
+                HierarchyNode {
+                    name: "路灯".to_string(),
+                    file_id: 3,
+                    components: vec!["Light".to_string()],
+                    is_active: true,
+                    ..Default::default()
+                },
+                HierarchyNode {
+                    name: "破碎路灯".to_string(),
+                    file_id: 4,
+                    tag: Some("Environment".to_string()),
+                    layer: Some(0),
+                    is_active: true,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        }],
+        ..Default::default()
+    }];
+
+    let summary =
+        format_hierarchy_summary_with_options(&roots, &HierarchySummaryOptions::default());
+
+    assert!(
+        summary.contains("E0002美术\n└─ 场景模型"),
+        "root child should use a tree guide: {}",
+        summary
+    );
+    assert!(
+        summary.contains("   ├─ 路灯 (Light)"),
+        "component labels should remain after tree prefix: {}",
+        summary
+    );
+    assert!(
+        summary.contains("   └─ 破碎路灯  [Tag:Environment, Layer:Default]"),
+        "tag/layer annotations should remain after tree prefix: {}",
+        summary
+    );
+}
+
+#[test]
+fn test_hierarchy_summary_filters_by_component_and_path_prefix() {
+    let roots = vec![HierarchyNode {
+        name: "CanvasRoot".to_string(),
+        file_id: 1,
+        is_active: true,
+        children: vec![
+            HierarchyNode {
+                name: "BattleUI".to_string(),
+                file_id: 2,
+                components: vec!["Canvas".to_string()],
+                is_active: true,
+                children: vec![HierarchyNode {
+                    name: "HpText".to_string(),
+                    file_id: 3,
+                    components: vec!["TextMeshProUGUI".to_string()],
+                    is_active: true,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            HierarchyNode {
+                name: "MenuUI".to_string(),
+                file_id: 4,
+                components: vec!["Canvas".to_string()],
+                is_active: true,
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    }];
+
+    let summary = format_hierarchy_summary_with_options(
+        &roots,
+        &HierarchySummaryOptions {
+            path_prefix: Some("CanvasRoot/BattleUI".to_string()),
+            component_filters: vec!["TextMeshPro".to_string()],
+            ..Default::default()
+        },
+    );
+
+    assert!(
+        summary.contains("BattleUI"),
+        "path prefix root should remain: {}",
+        summary
+    );
+    assert!(
+        summary.contains("HpText (TextMeshProUGUI)"),
+        "component match should remain: {}",
+        summary
+    );
+    assert!(
+        !summary.contains("MenuUI"),
+        "sibling outside path_prefix should be excluded: {}",
+        summary
+    );
+}
+
+#[test]
+fn test_hierarchy_search_uses_ordinal_paths_without_file_ids() {
+    let roots = vec![HierarchyNode {
+        name: "Root".to_string(),
+        file_id: 1,
+        is_active: true,
+        children: vec![
+            HierarchyNode {
+                name: "Enemy".to_string(),
+                file_id: 2,
+                components: vec!["NavMeshAgent".to_string()],
+                tag: Some("Enemy".to_string()),
+                layer: Some(5),
+                is_active: true,
+                ..Default::default()
+            },
+            HierarchyNode {
+                name: "Enemy".to_string(),
+                file_id: 3,
+                components: vec!["Animator".to_string()],
+                is_active: true,
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    }];
+    let docs = Vec::new();
+    let lines = Vec::new();
+    let resolver = |_: &Guid| -> Option<String> { None };
+
+    let results = format_hierarchy_search_results(
+        &roots,
+        &docs,
+        &lines,
+        &resolver,
+        "Assets/Scenes/Test.unity",
+        &HierarchySearchOptions {
+            query: Some("Enemy".to_string()),
+            ..Default::default()
+        },
+    );
+
+    assert!(results.contains("Root/Enemy[1]"));
+    assert!(results.contains("Root/Enemy[2]"));
+    assert!(
+        results.contains("- Root/Enemy[1] (NavMeshAgent)  [Tag:Enemy, Layer:UI]"),
+        "search should show components/tag/layer inline:\n{}",
+        results
+    );
+    assert!(
+        !results.contains("Components:"),
+        "search should avoid separate component lines:\n{}",
+        results
+    );
+    assert!(
+        !results.contains("State:"),
+        "search should avoid separate state lines:\n{}",
+        results
+    );
+    assert!(
+        !results.contains("fileID"),
+        "search leaked fileID:\n{}",
+        results
+    );
+}
+
+#[test]
+fn test_hierarchy_search_can_match_serialized_field_names_and_values() {
+    let yaml = br#"--- !u!1 &100
+GameObject:
+  m_Name: Root
+  m_Component:
+  - component: {fileID: 101}
+  - component: {fileID: 114}
+  m_Layer: 0
+  m_TagString: Untagged
+  m_IsActive: 1
+--- !u!4 &101
+Transform:
+  m_GameObject: {fileID: 100}
+  m_Children: []
+  m_Father: {fileID: 0}
+--- !u!114 &114
+MonoBehaviour:
+  m_GameObject: {fileID: 100}
+  m_Enabled: 1
+  storyNode: E0002_TEST_TEACHER
+  nested:
+    displayName: Teacher
+"#;
+    let docs = parse_yaml_docs(yaml);
+    let text = String::from_utf8_lossy(yaml);
+    let lines: Vec<&str> = text.lines().collect();
+    let roots = build_go_tree(&docs);
+    let resolver = |_: &Guid| -> Option<String> { None };
+
+    let default_results = format_hierarchy_search_results(
+        &roots,
+        &docs,
+        &lines,
+        &resolver,
+        "Assets/Scenes/Test.unity",
+        &HierarchySearchOptions {
+            query: Some("E0002_TEST_TEACHER".to_string()),
+            ..Default::default()
+        },
+    );
+    assert!(
+        default_results.contains("No hierarchy nodes matched filters."),
+        "serialized fields should not match by default:\n{}",
+        default_results
+    );
+
+    let value_results = format_hierarchy_search_results(
+        &roots,
+        &docs,
+        &lines,
+        &resolver,
+        "Assets/Scenes/Test.unity",
+        &HierarchySearchOptions {
+            query: Some("E0002_TEST_TEACHER".to_string()),
+            match_fields: vec!["field_value".to_string()],
+            ..Default::default()
+        },
+    );
+    assert!(
+        value_results.contains("- Root"),
+        "field_value should match serialized values:\n{}",
+        value_results
+    );
+
+    let name_results = format_hierarchy_search_results(
+        &roots,
+        &docs,
+        &lines,
+        &resolver,
+        "Assets/Scenes/Test.unity",
+        &HierarchySearchOptions {
+            query: Some("storyNode".to_string()),
+            match_fields: vec!["field_name".to_string()],
+            ..Default::default()
+        },
+    );
+    assert!(
+        name_results.contains("- Root"),
+        "field_name should match serialized names:\n{}",
+        name_results
     );
 }
 

@@ -21,6 +21,8 @@ pub mod tools {
     pub const UNITY_RUN_STATES: &str = include_str!("../../tools/unity_run_states.json");
     pub const UNITY_REF_SEARCH: &str = include_str!("../../tools/unity_ref_search.json");
     pub const UNITY_ASSET_SEARCH: &str = include_str!("../../tools/unity_asset_search.json");
+    pub const UNITY_YAML_LIST: &str = include_str!("../../tools/unity_yaml_list.json");
+    pub const UNITY_YAML_SEARCH: &str = include_str!("../../tools/unity_yaml_search.json");
     pub const UNITY_YAML_READ: &str = include_str!("../../tools/unity_yaml_read.json");
     pub const UNITY_RECOMPILE: &str = include_str!("../../tools/unity_recompile.json");
     pub const LIST: &str = include_str!("../../tools/list.json");
@@ -83,6 +85,8 @@ mod tests {
             ("unity_run_states", tools::UNITY_RUN_STATES),
             ("unity_ref_search", tools::UNITY_REF_SEARCH),
             ("unity_asset_search", tools::UNITY_ASSET_SEARCH),
+            ("unity_yaml_list", tools::UNITY_YAML_LIST),
+            ("unity_yaml_search", tools::UNITY_YAML_SEARCH),
             ("unity_yaml_read", tools::UNITY_YAML_READ),
             ("unity_recompile", tools::UNITY_RECOMPILE),
             ("list", tools::LIST),

@@ -68,6 +68,8 @@ If some recent raw messages remain after this summary, assume they will appear b
 #[derive(Debug, Clone, Copy)]
 enum RestorableToolKind {
     Read,
+    UnityYamlList,
+    UnityYamlSearch,
     UnityYamlRead,
 }
 
@@ -78,6 +80,9 @@ struct RestorableToolRequest {
     offset: usize,
     limit: usize,
     object_path: Option<String>,
+    detail: Option<String>,
+    summary_options: crate::unity_yaml::HierarchySummaryOptions,
+    search_options: crate::unity_yaml::HierarchySearchOptions,
 }
 
 #[derive(Debug, Clone)]
@@ -271,7 +276,9 @@ pub fn extract_summary(raw_response: &str) -> String {
 fn parse_restorable_tool_request(tc: &ToolCallInfo) -> Option<RestorableToolRequest> {
     match tc.name.as_str() {
         "read" => parse_read_tool_request(tc),
-        "unity_yaml_read" => parse_unity_yaml_read_tool_request(tc),
+        "unity_yaml_list" | "unity_yaml_search" | "unity_yaml_read" => {
+            parse_unity_yaml_tool_request(tc)
+        }
         _ => None,
     }
 }
@@ -304,11 +311,17 @@ fn parse_read_tool_request(tc: &ToolCallInfo) -> Option<RestorableToolRequest> {
         offset,
         limit,
         object_path: None,
+        detail: None,
+        summary_options: crate::unity_yaml::HierarchySummaryOptions::default(),
+        search_options: crate::unity_yaml::HierarchySearchOptions::default(),
     })
 }
 
-fn parse_unity_yaml_read_tool_request(tc: &ToolCallInfo) -> Option<RestorableToolRequest> {
-    if tc.name != "unity_yaml_read" {
+fn parse_unity_yaml_tool_request(tc: &ToolCallInfo) -> Option<RestorableToolRequest> {
+    if !matches!(
+        tc.name.as_str(),
+        "unity_yaml_list" | "unity_yaml_search" | "unity_yaml_read"
+    ) {
         return None;
     }
 
@@ -324,13 +337,98 @@ fn parse_unity_yaml_read_tool_request(tc: &ToolCallInfo) -> Option<RestorableToo
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(|value| value.to_string());
+    let detail = parsed
+        .get("detail")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string());
+
+    fn positive_usize(parsed: &serde_json::Value, key: &str) -> Option<usize> {
+        parsed
+            .get(key)
+            .and_then(|value| value.as_u64())
+            .filter(|value| *value > 0)
+            .map(|value| value as usize)
+    }
+
+    fn trimmed_string(parsed: &serde_json::Value, key: &str) -> Option<String> {
+        parsed
+            .get(key)
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string())
+    }
+
+    fn push_csv_values(out: &mut Vec<String>, value: &str) {
+        out.extend(
+            value
+                .split([',', '|'])
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .map(|entry| entry.to_string()),
+        );
+    }
+
+    let mut component_filters = Vec::new();
+    match parsed.get("component_filter") {
+        Some(serde_json::Value::String(value)) => {
+            push_csv_values(&mut component_filters, value);
+        }
+        Some(serde_json::Value::Array(values)) => {
+            for value in values {
+                if let Some(text) = value.as_str() {
+                    push_csv_values(&mut component_filters, text);
+                }
+            }
+        }
+        _ => {}
+    }
+
+    let mut match_fields = Vec::new();
+    match parsed.get("match_fields") {
+        Some(serde_json::Value::String(value)) => {
+            push_csv_values(&mut match_fields, value);
+        }
+        Some(serde_json::Value::Array(values)) => {
+            for value in values {
+                if let Some(text) = value.as_str() {
+                    push_csv_values(&mut match_fields, text);
+                }
+            }
+        }
+        _ => {}
+    }
+
+    let kind = match tc.name.as_str() {
+        "unity_yaml_list" => RestorableToolKind::UnityYamlList,
+        "unity_yaml_search" => RestorableToolKind::UnityYamlSearch,
+        "unity_yaml_read" => RestorableToolKind::UnityYamlRead,
+        _ => return None,
+    };
 
     Some(RestorableToolRequest {
-        kind: RestorableToolKind::UnityYamlRead,
+        kind,
         file_path: file_path.to_string(),
         offset: 1,
         limit: 2000,
         object_path,
+        detail,
+        summary_options: crate::unity_yaml::HierarchySummaryOptions {
+            max_depth: positive_usize(&parsed, "max_depth"),
+            max_nodes: positive_usize(&parsed, "max_nodes"),
+            query: None,
+            component_filters: Vec::new(),
+            path_prefix: trimmed_string(&parsed, "path_prefix"),
+        },
+        search_options: crate::unity_yaml::HierarchySearchOptions {
+            query: trimmed_string(&parsed, "query"),
+            component_filters,
+            match_fields,
+            path_prefix: trimmed_string(&parsed, "path_prefix"),
+            limit: positive_usize(&parsed, "limit"),
+        },
     })
 }
 
@@ -410,7 +508,9 @@ fn prior_tool_result_excerpt(content: &str, kind: &RestorableToolKind) -> Option
                 POST_COMPACT_MAX_TOKENS_PER_FILE,
             ))
         }
-        RestorableToolKind::UnityYamlRead => {
+        RestorableToolKind::UnityYamlList
+        | RestorableToolKind::UnityYamlSearch
+        | RestorableToolKind::UnityYamlRead => {
             if raw_output.trim().is_empty() {
                 return None;
             }
@@ -517,7 +617,12 @@ fn read_current_unity_yaml_excerpt(
         .to_lowercase();
     let is_hierarchical = crate::unity_yaml::is_hierarchical_file(&ext);
 
-    if is_hierarchical && request.object_path.is_none() {
+    if is_hierarchical
+        && matches!(
+            request.kind,
+            RestorableToolKind::UnityYamlList | RestorableToolKind::UnityYamlSearch
+        )
+    {
         let tree = crate::unity_yaml::build_go_tree(&docs);
         if tree.is_empty() {
             return Some(format!(
@@ -527,17 +632,37 @@ fn read_current_unity_yaml_excerpt(
         }
 
         let guid_resolver = |_guid: &crate::asset_db::types::Guid| -> Option<String> { None };
-        let output = crate::unity_yaml::format_scene_summary(
-            &tree,
-            &docs,
-            &lines,
-            &guid_resolver,
-            display_path,
-        );
+        let output = match request.kind {
+            RestorableToolKind::UnityYamlList => {
+                crate::unity_yaml::format_scene_summary_with_options(
+                    &tree,
+                    &docs,
+                    &lines,
+                    &guid_resolver,
+                    display_path,
+                    &request.summary_options,
+                )
+            }
+            RestorableToolKind::UnityYamlSearch => {
+                crate::unity_yaml::format_hierarchy_search_results(
+                    &tree,
+                    &docs,
+                    &lines,
+                    &guid_resolver,
+                    display_path,
+                    &request.search_options,
+                )
+            }
+            _ => unreachable!(),
+        };
         return Some(truncate_for_token_budget(
             &output,
             POST_COMPACT_MAX_TOKENS_PER_FILE,
         ));
+    }
+
+    if is_hierarchical && request.object_path.is_none() {
+        return Some("unity_yaml_read requires object_path for .unity/.prefab files.".to_string());
     }
 
     let internal_map = crate::unity_yaml::build_internal_id_map(&docs);
@@ -559,38 +684,55 @@ fn read_current_unity_yaml_excerpt(
             }
         };
 
-        let is_prefab_instance = docs
-            .iter()
-            .any(|doc| doc.file_id == go_file_id && doc.class_id == 1001);
-        if is_prefab_instance {
-            let prefab_instances = crate::unity_yaml::extract_prefab_instance_irs(&docs, &lines);
-            if let Some(prefab_instance) = prefab_instances
-                .iter()
-                .find(|instance| instance.local_file_id == go_file_id)
-            {
-                let guid_resolver =
-                    |_guid: &crate::asset_db::types::Guid| -> Option<String> { None };
-                let detail = crate::unity_yaml::format_prefab_instance_detail(
-                    prefab_instance,
-                    &guid_resolver,
-                    None,
-                );
-                return Some(truncate_for_token_budget(
-                    &detail,
-                    POST_COMPACT_MAX_TOKENS_PER_FILE,
+        let target_doc_idx = docs.iter().position(|doc| doc.file_id == go_file_id);
+        if request.detail.as_deref() == Some("document") {
+            let Some(target_doc_idx) = target_doc_idx else {
+                return Some(format!(
+                    "Target '{}' was found in the hierarchy but its YAML document was unavailable in '{}'.",
+                    object_path, display_path
                 ));
+            };
+            (
+                format!("Document fields of '{}' ({}):\n", object_path, display_path),
+                vec![target_doc_idx],
+            )
+        } else {
+            let is_prefab_instance = docs
+                .iter()
+                .any(|doc| doc.file_id == go_file_id && doc.class_id == 1001);
+            if is_prefab_instance {
+                let prefab_instances =
+                    crate::unity_yaml::extract_prefab_instance_irs(&docs, &lines);
+                if let Some(prefab_instance) = prefab_instances
+                    .iter()
+                    .find(|instance| instance.local_file_id == go_file_id)
+                {
+                    let guid_resolver =
+                        |_guid: &crate::asset_db::types::Guid| -> Option<String> { None };
+                    let stripped = crate::unity_yaml::extract_stripped_mappings(&docs, &lines);
+                    let detail = crate::unity_yaml::format_prefab_instance_detail(
+                        prefab_instance,
+                        &guid_resolver,
+                        None,
+                        &stripped,
+                    );
+                    return Some(truncate_for_token_budget(
+                        &detail,
+                        POST_COMPACT_MAX_TOKENS_PER_FILE,
+                    ));
+                }
             }
-        }
 
-        let component_indices = crate::unity_yaml::get_components_for_go(&docs, go_file_id);
-        if component_indices.is_empty() {
-            return Some(format!("No components found for '{}'.", object_path));
-        }
+            let component_indices = crate::unity_yaml::get_components_for_go(&docs, go_file_id);
+            if component_indices.is_empty() {
+                return Some(format!("No components found for '{}'.", object_path));
+            }
 
-        (
-            format!("Components of '{}' ({}):\n", object_path, display_path),
-            component_indices,
-        )
+            (
+                format!("Components of '{}' ({}):\n", object_path, display_path),
+                component_indices,
+            )
+        }
     } else {
         (
             format!(
@@ -606,10 +748,7 @@ fn read_current_unity_yaml_excerpt(
     let mut output = output_header;
     for idx in doc_ranges {
         let doc = &docs[idx];
-        output.push_str(&format!(
-            "\n--- {} (fileID: {})\n",
-            doc.type_name, doc.file_id
-        ));
+        output.push_str(&format!("\n--- {} ---\n", doc.type_name));
         output.push_str(&crate::unity_yaml::format_doc_state_lines(doc));
         let content_start = (doc.line_start + 2).min(doc.line_end);
         let skipped_fields = if doc.m_enabled.is_some() {
@@ -684,6 +823,12 @@ pub fn build_post_compact_restored_files_section(
                         RestorableToolKind::Read => {
                             "Source: exact file excerpt preserved from the pre-compact read result."
                         }
+                        RestorableToolKind::UnityYamlList => {
+                            "Source: exact `unity_yaml_list` result preserved from the pre-compact tool output."
+                        }
+                        RestorableToolKind::UnityYamlSearch => {
+                            "Source: exact `unity_yaml_search` result preserved from the pre-compact tool output."
+                        }
                         RestorableToolKind::UnityYamlRead => {
                             "Source: exact `unity_yaml_read` result preserved from the pre-compact tool output."
                         }
@@ -697,7 +842,9 @@ pub fn build_post_compact_restored_files_section(
                             request.limit,
                             &display_path,
                         ),
-                        RestorableToolKind::UnityYamlRead => {
+                        RestorableToolKind::UnityYamlList
+                        | RestorableToolKind::UnityYamlSearch
+                        | RestorableToolKind::UnityYamlRead => {
                             read_current_unity_yaml_excerpt(&resolved_path, &request, &display_path)
                         }
                     };
@@ -708,6 +855,12 @@ pub fn build_post_compact_restored_files_section(
                     let source_note = match request.kind {
                         RestorableToolKind::Read => {
                             "Source: original read result had already been compacted, so this was refreshed from the current file state."
+                        }
+                        RestorableToolKind::UnityYamlList => {
+                            "Source: original `unity_yaml_list` result was unavailable, so this was refreshed from the current file state."
+                        }
+                        RestorableToolKind::UnityYamlSearch => {
+                            "Source: original `unity_yaml_search` result was unavailable, so this was refreshed from the current file state."
                         }
                         RestorableToolKind::UnityYamlRead => {
                             "Source: original `unity_yaml_read` result was unavailable, so this was refreshed from the current file state."
@@ -723,7 +876,9 @@ pub fn build_post_compact_restored_files_section(
                         request.limit,
                         &display_path,
                     ),
-                    RestorableToolKind::UnityYamlRead => {
+                    RestorableToolKind::UnityYamlList
+                    | RestorableToolKind::UnityYamlSearch
+                    | RestorableToolKind::UnityYamlRead => {
                         read_current_unity_yaml_excerpt(&resolved_path, &request, &display_path)
                     }
                 };
@@ -734,6 +889,12 @@ pub fn build_post_compact_restored_files_section(
                 let source_note = match request.kind {
                     RestorableToolKind::Read => {
                         "Source: rebuilt from the current file state because no pre-compact tool result was available."
+                    }
+                    RestorableToolKind::UnityYamlList => {
+                        "Source: rebuilt from the current file state because no pre-compact `unity_yaml_list` result was available."
+                    }
+                    RestorableToolKind::UnityYamlSearch => {
+                        "Source: rebuilt from the current file state because no pre-compact `unity_yaml_search` result was available."
                     }
                     RestorableToolKind::UnityYamlRead => {
                         "Source: rebuilt from the current file state because no pre-compact `unity_yaml_read` result was available."
@@ -1063,7 +1224,7 @@ mod tests {
             make_message(
                 "tool-1",
                 MessageRole::Tool,
-                "Content of 'Assets/Data/Test.asset' (1 documents):\n\n--- MonoBehaviour (fileID: 11400000)\n  m_Name: TestAsset\n  value: 42\n",
+                "Content of 'Assets/Data/Test.asset' (1 documents):\n\n--- MonoBehaviour ---\n  m_Name: TestAsset\n  value: 42\n",
                 2,
                 None,
                 Some("tc-unity-read"),
@@ -1089,7 +1250,7 @@ mod tests {
         let persisted_path = temp_root.join("tool-results/unity.txt");
         std::fs::write(
             &persisted_path,
-            "Content of 'Assets/Data/Test.asset' (1 documents):\n\n--- MonoBehaviour (fileID: 11400000)\n  m_Name: PersistedAsset\n",
+            "Content of 'Assets/Data/Test.asset' (1 documents):\n\n--- MonoBehaviour ---\n  m_Name: PersistedAsset\n",
         )
         .expect("persisted output should be written");
 

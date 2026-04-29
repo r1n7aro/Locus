@@ -5,7 +5,10 @@ use crate::asset_db::types::{
     PrefabSourceRef, PropertyOverride, RendererOverrideSummary, TransformOverrideSummary,
 };
 
-use super::parser::{format_go_annotations, round_decimal_str, HierarchyNode, YamlDoc};
+use super::parser::{
+    build_hierarchy_path_map, find_hierarchy_node_by_path, format_go_annotations,
+    round_decimal_str, HierarchyNode, YamlDoc,
+};
 use super::prefab::{extract_prefab_instance_irs, extract_stripped_mappings};
 
 pub struct SourcePrefabContext {
@@ -20,6 +23,8 @@ const TRANSFORM_PROPS: &[&str] = &[
     "m_LocalEulerAnglesHint.",
     "m_RootOrder",
 ];
+
+pub const DEFAULT_HIERARCHY_MAX_NODES: usize = 1000;
 
 const RENDERER_PROPS: &[&str] = &[
     "m_Materials.",
@@ -223,8 +228,8 @@ pub fn format_override_summary(summary: &OverrideSummary) -> String {
             summary.transform_overrides.len()
         ));
         let show = summary.transform_overrides.len().min(5);
-        for ts in &summary.transform_overrides[..show] {
-            let fallback = format!("fileID:{}", ts.target.source_file_id);
+        for (idx, ts) in summary.transform_overrides[..show].iter().enumerate() {
+            let fallback = format!("target #{}", idx + 1);
             let label = ts.label.as_deref().unwrap_or(&fallback);
             let mut parts = Vec::new();
             if ts.position.is_some() {
@@ -254,8 +259,8 @@ pub fn format_override_summary(summary: &OverrideSummary) -> String {
             "\n[Renderer/Material overrides] ({} objects)\n",
             summary.renderer_overrides.len()
         ));
-        for r in &summary.renderer_overrides {
-            let fallback = format!("fileID:{}", r.target.source_file_id);
+        for (idx, r) in summary.renderer_overrides.iter().enumerate() {
+            let fallback = format!("target #{}", idx + 1);
             let label = r.label.as_deref().unwrap_or(&fallback);
             let props: Vec<&str> = r.overrides.iter().map(|(p, _)| p.as_str()).collect();
             out.push_str(&format!("  {} → {}\n", label, props.join(", ")));
@@ -322,13 +327,13 @@ pub fn format_prefab_instance_detail(
     ir: &PrefabInstanceIR,
     guid_resolver: &dyn Fn(&Guid) -> Option<String>,
     source_ctx: Option<&SourcePrefabContext>,
+    stripped_mappings: &[crate::asset_db::types::StrippedMapping],
 ) -> String {
     let mut out = String::new();
 
     out.push_str(&format!(
-        "=== Detail: {} (fileID: {}) ===\n",
-        ir.instance_name.as_deref().unwrap_or("?"),
-        ir.local_file_id
+        "=== Detail: {} ===\n",
+        ir.instance_name.as_deref().unwrap_or("?")
     ));
 
     if let Some(path) = guid_resolver(&ir.source_prefab_guid) {
@@ -388,16 +393,13 @@ pub fn format_prefab_instance_detail(
     targets.sort_by_key(|t| t.source_file_id);
 
     out.push_str("\n── Overrides ──\n");
-    for target in &targets {
+    for (idx, target) in targets.iter().enumerate() {
         let ovs = &by_target[target];
         let label = target_labels
             .get(&target.source_file_id)
-            .map(|l| format!(" ({})", l))
-            .unwrap_or_default();
-        out.push_str(&format!(
-            "\n--- target fileID:{}{} ---\n",
-            target.source_file_id, label,
-        ));
+            .cloned()
+            .unwrap_or_else(|| format!("target #{}", idx + 1));
+        out.push_str(&format!("\n--- {} ---\n", label));
 
         let formatted = merge_override_vector_components(ovs, guid_resolver);
         out.push_str(&formatted);
@@ -409,12 +411,27 @@ pub fn format_prefab_instance_detail(
             "\n--- Removed components ({}) ---\n",
             ir.removed_components.len()
         ));
-        for rc in &ir.removed_components {
+        for (idx, rc) in ir.removed_components.iter().enumerate() {
             let label = target_labels
                 .get(&rc.target.source_file_id)
-                .map(|l| format!(" ({})", l))
-                .unwrap_or_default();
-            out.push_str(&format!("  fileID:{}{}\n", rc.target.source_file_id, label,));
+                .cloned()
+                .unwrap_or_else(|| format!("target #{}", idx + 1));
+            out.push_str(&format!("  {}\n", label));
+        }
+    }
+
+    let mappings: Vec<_> = stripped_mappings
+        .iter()
+        .filter(|mapping| mapping.prefab_instance_id == ir.local_file_id)
+        .collect();
+    if !mappings.is_empty() {
+        out.push_str(&format!("\n--- Stripped refs ({}) ---\n", mappings.len()));
+        for mapping in mappings {
+            let source_label = target_labels
+                .get(&mapping.source.source_file_id)
+                .cloned()
+                .unwrap_or_else(|| mapping.type_name.clone());
+            out.push_str(&format!("  {} -> {}\n", mapping.type_name, source_label));
         }
     }
 
@@ -562,14 +579,7 @@ pub(super) fn normalize_instance_name(name: &str) -> &str {
     name
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OverrideClass {
-    Clean,
-    TransformOnly,
-    LightCustom,
-    Heavy,
-}
-
+#[cfg(test)]
 const MESH_BLACKLIST_PREFIXES: &[&str] = &[
     "m_PolyMesh.",
     "normals.Array.",
@@ -588,154 +598,295 @@ const MESH_BLACKLIST_PREFIXES: &[&str] = &[
     "m_BakedLightmapTag",
 ];
 
-const CLEAN_PROPS: &[&str] = &["m_Name", "m_IsActive"];
-
+#[cfg(test)]
 pub(super) fn is_mesh_data_property(prop: &str) -> bool {
     MESH_BLACKLIST_PREFIXES
         .iter()
         .any(|prefix| prop.starts_with(prefix))
 }
 
-fn is_transform_prop(prop: &str) -> bool {
-    TRANSFORM_PROPS.iter().any(|p| prop.starts_with(p))
-}
-
-fn is_clean_prop(prop: &str) -> bool {
-    CLEAN_PROPS.iter().any(|p| prop == *p)
-}
-
-fn classify_instance_overrides(ir: &PrefabInstanceIR) -> (OverrideClass, usize, bool) {
-    let total = ir.property_overrides.len();
-    let mut mesh_count = 0usize;
-    let mut transform_count = 0usize;
-    let mut clean_count = 0usize;
-    let mut has_scale = false;
-
-    for ov in &ir.property_overrides {
-        let pp = &ov.property_path;
-        if is_mesh_data_property(pp) {
-            mesh_count += 1;
-        } else if is_transform_prop(pp) {
-            transform_count += 1;
-            if pp.starts_with("m_LocalScale.") {
-                has_scale = true;
-            }
-        } else if is_clean_prop(pp) {
-            clean_count += 1;
-        }
-    }
-
-    let non_trivial = total.saturating_sub(transform_count + clean_count + mesh_count);
-
-    let class = if !ir.removed_components.is_empty() || mesh_count > 0 || total >= 30 {
-        OverrideClass::Heavy
-    } else if non_trivial == 0 {
-        if transform_count == 0 {
-            OverrideClass::Clean
-        } else {
-            OverrideClass::TransformOnly
-        }
-    } else {
-        OverrideClass::LightCustom
-    };
-
-    (class, mesh_count, has_scale)
-}
-
-struct PrefabSourceStats {
-    source_path: Option<String>,
-    #[allow(dead_code)]
-    source_guid: Guid,
-    instance_count: usize,
-    transform_only_count: usize,
-    clean_count: usize,
-    #[allow(dead_code)]
-    has_scale_count: usize,
-    light_custom_count: usize,
-    heavy_count: usize,
-    total_override_max: usize,
-    mesh_override_total: usize,
-    has_removed_components: bool,
-}
-
-fn aggregate_prefab_sources(
-    irs: &[PrefabInstanceIR],
-    guid_resolver: &dyn Fn(&Guid) -> Option<String>,
-) -> Vec<PrefabSourceStats> {
-    let mut order: Vec<Guid> = Vec::new();
-    let mut by_source: HashMap<Guid, Vec<&PrefabInstanceIR>> = HashMap::new();
-    for ir in irs {
-        let entry = by_source.entry(ir.source_prefab_guid).or_default();
-        if entry.is_empty() {
-            order.push(ir.source_prefab_guid);
-        }
-        entry.push(ir);
-    }
-
-    let mut result: Vec<PrefabSourceStats> = order
-        .into_iter()
-        .map(|guid| {
-            let instances = &by_source[&guid];
-            let source_path = guid_resolver(&guid);
-            let mut transform_only = 0usize;
-            let mut clean = 0usize;
-            let mut has_scale_cnt = 0usize;
-            let mut light_custom = 0usize;
-            let mut heavy = 0usize;
-            let mut max_overrides = 0usize;
-            let mut mesh_total = 0usize;
-            let mut has_removed = false;
-
-            for ir in instances {
-                let (class, mesh_count, scale) = classify_instance_overrides(ir);
-                match class {
-                    OverrideClass::Clean => clean += 1,
-                    OverrideClass::TransformOnly => transform_only += 1,
-                    OverrideClass::LightCustom => light_custom += 1,
-                    OverrideClass::Heavy => heavy += 1,
-                }
-                if scale {
-                    has_scale_cnt += 1;
-                }
-                if ir.property_overrides.len() > max_overrides {
-                    max_overrides = ir.property_overrides.len();
-                }
-                mesh_total += mesh_count;
-                if !ir.removed_components.is_empty() {
-                    has_removed = true;
-                }
-            }
-
-            PrefabSourceStats {
-                source_path,
-                source_guid: guid,
-                instance_count: instances.len(),
-                transform_only_count: transform_only,
-                clean_count: clean,
-                has_scale_count: has_scale_cnt,
-                light_custom_count: light_custom,
-                heavy_count: heavy,
-                total_override_max: max_overrides,
-                mesh_override_total: mesh_total,
-                has_removed_components: has_removed,
-            }
-        })
-        .collect();
-
-    result.sort_by(|a, b| {
-        let a_notable = (a.heavy_count > 0 || a.mesh_override_total > 0) as u8;
-        let b_notable = (b.heavy_count > 0 || b.mesh_override_total > 0) as u8;
-        b_notable
-            .cmp(&a_notable)
-            .then(b.total_override_max.cmp(&a.total_override_max))
-    });
-
-    result
-}
-
 struct GroupedHierarchyNodes<'a> {
     representative: &'a HierarchyNode,
     members: Vec<&'a HierarchyNode>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HierarchySummaryOptions {
+    pub max_depth: Option<usize>,
+    pub max_nodes: Option<usize>,
+    pub query: Option<String>,
+    pub component_filters: Vec<String>,
+    pub path_prefix: Option<String>,
+}
+
+impl HierarchySummaryOptions {
+    fn effective_max_nodes(&self) -> usize {
+        self.max_nodes.unwrap_or(DEFAULT_HIERARCHY_MAX_NODES)
+    }
+
+    fn has_search_filters(&self) -> bool {
+        self.query
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+            || self
+                .component_filters
+                .iter()
+                .any(|value| !value.trim().is_empty())
+    }
+
+    fn has_any_option(&self) -> bool {
+        self.max_depth.is_some()
+            || self.max_nodes.is_some()
+            || self
+                .path_prefix
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|value| !value.is_empty())
+            || self.has_search_filters()
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HierarchySearchOptions {
+    pub query: Option<String>,
+    pub component_filters: Vec<String>,
+    pub match_fields: Vec<String>,
+    pub path_prefix: Option<String>,
+    pub limit: Option<usize>,
+}
+
+impl HierarchySearchOptions {
+    pub fn has_search_filters(&self) -> bool {
+        self.query
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+            || self
+                .component_filters
+                .iter()
+                .any(|value| !value.trim().is_empty())
+    }
+}
+
+struct PreparedHierarchyFilters {
+    query: Option<QueryMatcher>,
+    component_filters: Vec<String>,
+    match_fields: SearchMatchFields,
+}
+
+enum QueryMatcher {
+    Plain(String),
+    Regex(regex::Regex),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SearchMatchFields {
+    path: bool,
+    name: bool,
+    component: bool,
+    annotation: bool,
+    tag: bool,
+    layer: bool,
+    prefab_source: bool,
+    field_name: bool,
+    field_value: bool,
+    explicit_labels: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SearchableSerializedFields {
+    names: Vec<String>,
+    values: Vec<String>,
+}
+
+impl Default for SearchMatchFields {
+    fn default() -> Self {
+        Self {
+            path: true,
+            name: true,
+            component: true,
+            annotation: true,
+            tag: true,
+            layer: true,
+            prefab_source: true,
+            field_name: false,
+            field_value: false,
+            explicit_labels: Vec::new(),
+        }
+    }
+}
+
+impl PreparedHierarchyFilters {
+    fn from_options(options: &HierarchySummaryOptions) -> Self {
+        Self::from_parts(
+            options.query.as_deref(),
+            options.component_filters.iter().map(String::as_str),
+            std::iter::empty::<&str>(),
+        )
+    }
+
+    fn from_search_options(options: &HierarchySearchOptions) -> Self {
+        Self::from_parts(
+            options.query.as_deref(),
+            options.component_filters.iter().map(String::as_str),
+            options.match_fields.iter().map(String::as_str),
+        )
+    }
+
+    fn from_parts<'a>(
+        query: Option<&str>,
+        component_filters: impl Iterator<Item = &'a str>,
+        match_fields: impl Iterator<Item = &'a str>,
+    ) -> Self {
+        let query = query
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| {
+                if let Some(pattern) = value.strip_prefix("re:").filter(|value| !value.is_empty()) {
+                    regex::RegexBuilder::new(pattern)
+                        .case_insensitive(true)
+                        .build()
+                        .map(QueryMatcher::Regex)
+                        .unwrap_or_else(|_| QueryMatcher::Plain(value.to_ascii_lowercase()))
+                } else {
+                    QueryMatcher::Plain(value.to_ascii_lowercase())
+                }
+            });
+        let component_filters = component_filters
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_ascii_lowercase())
+            .collect();
+        let match_fields = SearchMatchFields::from_values(match_fields);
+        Self {
+            query,
+            component_filters,
+            match_fields,
+        }
+    }
+}
+
+impl SearchMatchFields {
+    fn from_values<'a>(values: impl Iterator<Item = &'a str>) -> Self {
+        let mut parsed = SearchMatchFields::default();
+        let mut saw_value = false;
+        for value in values {
+            for part in value.split([',', '|']) {
+                let normalized = part.trim().to_ascii_lowercase().replace('-', "_");
+                if normalized.is_empty() {
+                    continue;
+                }
+                if !saw_value {
+                    parsed = SearchMatchFields {
+                        path: false,
+                        name: false,
+                        component: false,
+                        annotation: false,
+                        tag: false,
+                        layer: false,
+                        prefab_source: false,
+                        field_name: false,
+                        field_value: false,
+                        explicit_labels: Vec::new(),
+                    };
+                    saw_value = true;
+                }
+                parsed.enable(&normalized);
+            }
+        }
+        parsed
+    }
+
+    fn enable(&mut self, normalized: &str) {
+        match normalized {
+            "default" => {
+                self.path = true;
+                self.name = true;
+                self.component = true;
+                self.annotation = true;
+                self.tag = true;
+                self.layer = true;
+                self.prefab_source = true;
+                self.push_label("default");
+            }
+            "all" => {
+                self.path = true;
+                self.name = true;
+                self.component = true;
+                self.annotation = true;
+                self.tag = true;
+                self.layer = true;
+                self.prefab_source = true;
+                self.field_name = true;
+                self.field_value = true;
+                self.push_label("all");
+            }
+            "path" => {
+                self.path = true;
+                self.push_label("path");
+            }
+            "name" => {
+                self.name = true;
+                self.push_label("name");
+            }
+            "component" | "components" => {
+                self.component = true;
+                self.push_label("component");
+            }
+            "annotation" | "annotations" | "state" => {
+                self.annotation = true;
+                self.push_label("annotation");
+            }
+            "tag" => {
+                self.tag = true;
+                self.push_label("tag");
+            }
+            "layer" => {
+                self.layer = true;
+                self.push_label("layer");
+            }
+            "prefab" | "prefab_source" | "source_prefab" => {
+                self.prefab_source = true;
+                self.push_label("prefab_source");
+            }
+            "field" | "fields" => {
+                self.field_name = true;
+                self.field_value = true;
+                self.push_label("field_name");
+                self.push_label("field_value");
+            }
+            "field_name" | "field_names" | "property_name" | "property_path" => {
+                self.field_name = true;
+                self.push_label("field_name");
+            }
+            "field_value" | "field_values" | "property_value" => {
+                self.field_value = true;
+                self.push_label("field_value");
+            }
+            _ => {}
+        }
+    }
+
+    fn push_label(&mut self, label: &str) {
+        if !self
+            .explicit_labels
+            .iter()
+            .any(|existing| existing == label)
+        {
+            self.explicit_labels.push(label.to_string());
+        }
+    }
+
+    fn needs_serialized_fields(&self) -> bool {
+        self.field_name || self.field_value
+    }
+}
+
+#[derive(Default)]
+struct HierarchyWriteState {
+    printed_nodes: usize,
+    hidden_by_max_nodes: usize,
 }
 
 fn component_signature(components: &[String]) -> String {
@@ -809,27 +960,296 @@ fn group_children_by_structure<'a>(
     groups
 }
 
-fn format_node_label(node: &HierarchyNode, collapsed: bool) -> String {
+fn count_hierarchy_nodes(nodes: &[HierarchyNode]) -> usize {
+    nodes
+        .iter()
+        .map(|node| 1 + count_hierarchy_nodes(&node.children))
+        .sum()
+}
+
+fn count_group_nodes(group: &GroupedHierarchyNodes<'_>) -> usize {
+    group
+        .members
+        .iter()
+        .map(|node| 1 + count_hierarchy_nodes(&node.children))
+        .sum()
+}
+
+fn select_path_prefix_roots(roots: &[HierarchyNode], path_prefix: &str) -> Vec<HierarchyNode> {
+    if path_prefix
+        .split('/')
+        .map(str::trim)
+        .all(|value| value.is_empty())
+    {
+        return roots.to_vec();
+    }
+
+    find_hierarchy_node_by_path(roots, path_prefix)
+        .cloned()
+        .into_iter()
+        .collect()
+}
+
+fn filter_hierarchy_nodes(
+    nodes: &[HierarchyNode],
+    filters: &PreparedHierarchyFilters,
+    prefab_source_paths: &HashMap<i64, String>,
+    path_map: &HashMap<i64, String>,
+    serialized_fields: Option<&HashMap<i64, SearchableSerializedFields>>,
+) -> Vec<HierarchyNode> {
+    nodes
+        .iter()
+        .filter_map(|node| {
+            filter_hierarchy_node(
+                node,
+                filters,
+                prefab_source_paths,
+                path_map,
+                serialized_fields,
+            )
+        })
+        .collect()
+}
+
+fn filter_hierarchy_node(
+    node: &HierarchyNode,
+    filters: &PreparedHierarchyFilters,
+    prefab_source_paths: &HashMap<i64, String>,
+    path_map: &HashMap<i64, String>,
+    serialized_fields: Option<&HashMap<i64, SearchableSerializedFields>>,
+) -> Option<HierarchyNode> {
+    let path = path_map
+        .get(&node.file_id)
+        .map(String::as_str)
+        .unwrap_or(node.name.as_str());
+    let children = filter_hierarchy_nodes(
+        &node.children,
+        filters,
+        prefab_source_paths,
+        path_map,
+        serialized_fields,
+    );
+    if node_matches_filters(node, path, filters, prefab_source_paths, serialized_fields)
+        || !children.is_empty()
+    {
+        let mut cloned = node.clone();
+        cloned.children = children;
+        Some(cloned)
+    } else {
+        None
+    }
+}
+
+fn contains_ignore_ascii_case(haystack: &str, needle_lower: &str) -> bool {
+    haystack.to_ascii_lowercase().contains(needle_lower)
+}
+
+fn query_matches(value: &str, matcher: &QueryMatcher) -> bool {
+    match matcher {
+        QueryMatcher::Plain(needle_lower) => contains_ignore_ascii_case(value, needle_lower),
+        QueryMatcher::Regex(regex) => regex.is_match(value),
+    }
+}
+
+fn node_layer_search_text(layer: i32) -> String {
+    match layer {
+        0 => "Default 0".to_string(),
+        1 => "TransparentFX 1".to_string(),
+        2 => "Ignore Raycast 2".to_string(),
+        3 => "Layer3 3".to_string(),
+        4 => "Water 4".to_string(),
+        5 => "UI 5".to_string(),
+        6 => "Layer6 6".to_string(),
+        7 => "Layer7 7".to_string(),
+        _ => layer.to_string(),
+    }
+}
+
+fn serialized_field_matches(
+    file_id: i64,
+    filters: &PreparedHierarchyFilters,
+    query: &QueryMatcher,
+    serialized_fields: Option<&HashMap<i64, SearchableSerializedFields>>,
+) -> bool {
+    if !filters.match_fields.needs_serialized_fields() {
+        return false;
+    }
+
+    let Some(fields) = serialized_fields.and_then(|fields| fields.get(&file_id)) else {
+        return false;
+    };
+
+    (filters.match_fields.field_name && fields.names.iter().any(|name| query_matches(name, query)))
+        || (filters.match_fields.field_value
+            && fields
+                .values
+                .iter()
+                .any(|value| query_matches(value, query)))
+}
+
+fn node_matches_filters(
+    node: &HierarchyNode,
+    path: &str,
+    filters: &PreparedHierarchyFilters,
+    prefab_source_paths: &HashMap<i64, String>,
+    serialized_fields: Option<&HashMap<i64, SearchableSerializedFields>>,
+) -> bool {
+    let query_matches = if let Some(query) = &filters.query {
+        (filters.match_fields.path && query_matches(path, query))
+            || (filters.match_fields.name && query_matches(&node.name, query))
+            || (filters.match_fields.component
+                && node
+                    .components
+                    .iter()
+                    .any(|component| query_matches(component, query)))
+            || (filters.match_fields.annotation
+                && query_matches(&format_go_annotations(node), query))
+            || (filters.match_fields.tag
+                && node
+                    .tag
+                    .as_deref()
+                    .is_some_and(|tag| query_matches(tag, query)))
+            || (filters.match_fields.layer
+                && node
+                    .layer
+                    .is_some_and(|layer| query_matches(&node_layer_search_text(layer), query)))
+            || (filters.match_fields.prefab_source
+                && prefab_source_paths
+                    .get(&node.file_id)
+                    .is_some_and(|path| query_matches(path, query)))
+            || serialized_field_matches(node.file_id, filters, query, serialized_fields)
+    } else {
+        true
+    };
+
+    if !query_matches {
+        return false;
+    }
+
+    if filters.component_filters.is_empty() {
+        return true;
+    }
+
+    node.components.iter().any(|component| {
+        filters
+            .component_filters
+            .iter()
+            .any(|filter| contains_ignore_ascii_case(component, filter))
+    })
+}
+
+fn apply_hierarchy_options(
+    roots: &[HierarchyNode],
+    options: &HierarchySummaryOptions,
+    prefab_source_paths: &HashMap<i64, String>,
+) -> Vec<HierarchyNode> {
+    let scoped_roots = options
+        .path_prefix
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|path| select_path_prefix_roots(roots, path))
+        .unwrap_or_else(|| roots.to_vec());
+
+    if !options.has_search_filters() {
+        return scoped_roots;
+    }
+
+    let path_map = build_hierarchy_path_map(roots);
+    let filters = PreparedHierarchyFilters::from_options(options);
+    filter_hierarchy_nodes(
+        &scoped_roots,
+        &filters,
+        prefab_source_paths,
+        &path_map,
+        None,
+    )
+}
+
+fn option_summary_line(options: &HierarchySummaryOptions) -> Option<String> {
+    if !options.has_any_option() {
+        return None;
+    }
+
+    let mut parts = Vec::new();
+    if let Some(path_prefix) = options
+        .path_prefix
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        parts.push(format!("path_prefix=\"{}\"", path_prefix));
+    }
+    if let Some(query) = options
+        .query
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        parts.push(format!("query=\"{}\"", query));
+    }
+
+    let component_filters: Vec<&str> = options
+        .component_filters
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .collect();
+    if !component_filters.is_empty() {
+        parts.push(format!(
+            "component_filter=\"{}\"",
+            component_filters.join(",")
+        ));
+    }
+
+    if let Some(max_depth) = options.max_depth {
+        parts.push(format!("max_depth={}", max_depth));
+    }
+    if let Some(max_nodes) = options.max_nodes {
+        parts.push(format!("max_nodes={}", max_nodes));
+    }
+
+    Some(format!("Hierarchy filters: {}", parts.join(", ")))
+}
+
+fn path_needs_hint(node: &HierarchyNode, path: &str) -> bool {
+    path.rsplit('/')
+        .next()
+        .is_some_and(|segment| segment != node.name)
+}
+
+fn format_node_label(node: &HierarchyNode, collapsed: bool, path: Option<&str>) -> String {
     let name = if collapsed {
         normalize_instance_name(&node.name)
     } else {
         node.name.as_str()
     };
-    format!(
+    let mut base = format!(
         "{}{}{}",
         name,
         format_component_suffix(node),
         format_go_annotations(node)
-    )
+    );
+    if !collapsed {
+        if let Some(path) = path.filter(|path| path_needs_hint(node, path)) {
+            base.push_str(&format!("  {{object_path: {}}}", path));
+        }
+    }
+    base
 }
 
-fn format_instance_sample(members: &[&HierarchyNode]) -> String {
+fn format_instance_sample(members: &[&HierarchyNode], path_map: &HashMap<i64, String>) -> String {
     const SAMPLE_LIMIT: usize = 5;
 
-    let sample: Vec<&str> = members
+    let sample: Vec<String> = members
         .iter()
         .take(SAMPLE_LIMIT)
-        .map(|node| node.name.as_str())
+        .map(|node| {
+            path_map
+                .get(&node.file_id)
+                .cloned()
+                .unwrap_or_else(|| node.name.clone())
+        })
         .collect();
 
     if members.len() <= SAMPLE_LIMIT {
@@ -846,52 +1266,402 @@ fn format_instance_sample(members: &[&HierarchyNode]) -> String {
 fn write_grouped_nodes(
     out: &mut String,
     nodes: &[HierarchyNode],
-    depth: usize,
+    prefix: &str,
+    top_level: bool,
+    logical_depth: usize,
     signature_map: &HashMap<i64, String>,
+    options: &HierarchySummaryOptions,
+    path_map: &HashMap<i64, String>,
+    state: &mut HierarchyWriteState,
 ) {
-    for group in group_children_by_structure(nodes, signature_map) {
-        let indent = "  ".repeat(depth);
+    let groups = group_children_by_structure(nodes, signature_map);
+    for (idx, group) in groups.iter().enumerate() {
+        if state.printed_nodes >= options.effective_max_nodes() {
+            state.hidden_by_max_nodes += count_group_nodes(group);
+            continue;
+        }
+
+        let is_last = idx + 1 == groups.len();
+        let line_prefix = tree_line_prefix(prefix, is_last, top_level);
+        let child_prefix = tree_child_prefix(prefix, is_last, top_level);
+        let metadata_prefix = format!("{}  ", child_prefix);
         let representative = group.representative;
+        state.printed_nodes += 1;
 
         if group.members.len() > 1 {
-            out.push_str(&indent);
-            out.push_str(&format_node_label(representative, true));
+            out.push_str(&line_prefix);
+            out.push_str(&format_node_label(representative, true, None));
             out.push_str(&format!(" ×{}\n", group.members.len()));
 
-            out.push_str(&indent);
-            out.push_str("  Instances: ");
-            out.push_str(&format_instance_sample(&group.members));
+            out.push_str(&metadata_prefix);
+            out.push_str("Instances: ");
+            out.push_str(&format_instance_sample(&group.members, path_map));
             out.push('\n');
 
             if !representative.children.is_empty() {
-                out.push_str(&indent);
-                out.push_str("  Shared subtree:\n");
-                write_grouped_nodes(out, &representative.children, depth + 2, signature_map);
+                if options
+                    .max_depth
+                    .is_some_and(|max_depth| logical_depth >= max_depth)
+                {
+                    let hidden: usize = group
+                        .members
+                        .iter()
+                        .map(|node| count_hierarchy_nodes(&node.children))
+                        .sum();
+                    out.push_str(&metadata_prefix);
+                    out.push_str(&format!(
+                        "... ({} child nodes hidden by max_depth)\n",
+                        hidden
+                    ));
+                } else {
+                    out.push_str(&metadata_prefix);
+                    out.push_str("Shared subtree:\n");
+                    let shared_prefix = format!("{}  ", child_prefix);
+                    write_grouped_nodes(
+                        out,
+                        &representative.children,
+                        &shared_prefix,
+                        false,
+                        logical_depth + 1,
+                        signature_map,
+                        options,
+                        path_map,
+                        state,
+                    );
+                }
             }
             continue;
         }
 
-        out.push_str(&indent);
-        out.push_str(&format_node_label(representative, false));
+        out.push_str(&line_prefix);
+        out.push_str(&format_node_label(
+            representative,
+            false,
+            path_map.get(&representative.file_id).map(String::as_str),
+        ));
         out.push('\n');
 
         if !representative.children.is_empty() {
-            write_grouped_nodes(out, &representative.children, depth + 1, signature_map);
+            if options
+                .max_depth
+                .is_some_and(|max_depth| logical_depth >= max_depth)
+            {
+                out.push_str(&metadata_prefix);
+                out.push_str(&format!(
+                    "... ({} child nodes hidden by max_depth)\n",
+                    count_hierarchy_nodes(&representative.children)
+                ));
+            } else {
+                write_grouped_nodes(
+                    out,
+                    &representative.children,
+                    &child_prefix,
+                    false,
+                    logical_depth + 1,
+                    signature_map,
+                    options,
+                    path_map,
+                    state,
+                );
+            }
         }
     }
 }
 
+fn tree_line_prefix(prefix: &str, is_last: bool, top_level: bool) -> String {
+    if top_level {
+        String::new()
+    } else if is_last {
+        format!("{}└─ ", prefix)
+    } else {
+        format!("{}├─ ", prefix)
+    }
+}
+
+fn tree_child_prefix(prefix: &str, is_last: bool, top_level: bool) -> String {
+    if top_level {
+        String::new()
+    } else if is_last {
+        format!("{}   ", prefix)
+    } else {
+        format!("{}│  ", prefix)
+    }
+}
+
 pub fn format_hierarchy_summary(roots: &[HierarchyNode]) -> String {
+    format_hierarchy_summary_with_options(roots, &HierarchySummaryOptions::default())
+}
+
+pub fn format_hierarchy_summary_with_options(
+    roots: &[HierarchyNode],
+    options: &HierarchySummaryOptions,
+) -> String {
+    let prefab_source_paths = HashMap::new();
+    format_hierarchy_summary_with_metadata(roots, options, &prefab_source_paths)
+}
+
+fn format_hierarchy_summary_with_metadata(
+    roots: &[HierarchyNode],
+    options: &HierarchySummaryOptions,
+    prefab_source_paths: &HashMap<i64, String>,
+) -> String {
     let mut out = String::new();
-    let signature_map = build_structure_signature_map(roots);
-    write_grouped_nodes(&mut out, roots, 0, &signature_map);
+    let scoped_roots = apply_hierarchy_options(roots, options, prefab_source_paths);
+    if scoped_roots.is_empty() {
+        out.push_str("No hierarchy nodes matched filters.\n");
+        return out;
+    }
+
+    let path_map = build_hierarchy_path_map(roots);
+    let signature_map = build_structure_signature_map(&scoped_roots);
+    let mut state = HierarchyWriteState::default();
+    write_grouped_nodes(
+        &mut out,
+        &scoped_roots,
+        "",
+        true,
+        1,
+        &signature_map,
+        options,
+        &path_map,
+        &mut state,
+    );
+    if state.hidden_by_max_nodes > 0 {
+        out.push_str(&format!(
+            "... ({} hierarchy nodes hidden by max_nodes)\n",
+            state.hidden_by_max_nodes
+        ));
+    }
     out
 }
 
-fn short_prefab_name(path: &str) -> &str {
-    let filename = path.rsplit('/').next().unwrap_or(path);
-    let filename = filename.rsplit('\\').next().unwrap_or(filename);
-    filename.strip_suffix(".prefab").unwrap_or(filename)
+fn search_options_summary_line(options: &HierarchySearchOptions) -> String {
+    let mut parts = Vec::new();
+    if let Some(path_prefix) = options
+        .path_prefix
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        parts.push(format!("path_prefix=\"{}\"", path_prefix));
+    }
+    if let Some(query) = options
+        .query
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        parts.push(format!("query=\"{}\"", query));
+    }
+    let component_filters: Vec<&str> = options
+        .component_filters
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .collect();
+    if !component_filters.is_empty() {
+        parts.push(format!(
+            "component_filter=\"{}\"",
+            component_filters.join(",")
+        ));
+    }
+    if !options.match_fields.is_empty() {
+        let match_fields: Vec<&str> = options
+            .match_fields
+            .iter()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .collect();
+        if !match_fields.is_empty() {
+            parts.push(format!("match_fields=\"{}\"", match_fields.join(",")));
+        }
+    }
+    if let Some(limit) = options.limit {
+        parts.push(format!("limit={}", limit));
+    }
+
+    if parts.is_empty() {
+        "Search filters: none".to_string()
+    } else {
+        format!("Search filters: {}", parts.join(", "))
+    }
+}
+
+fn collect_matching_nodes<'a>(
+    nodes: &'a [HierarchyNode],
+    filters: &PreparedHierarchyFilters,
+    prefab_source_paths: &HashMap<i64, String>,
+    path_map: &HashMap<i64, String>,
+    serialized_fields: Option<&HashMap<i64, SearchableSerializedFields>>,
+    out: &mut Vec<&'a HierarchyNode>,
+) {
+    for node in nodes {
+        let path = path_map
+            .get(&node.file_id)
+            .map(String::as_str)
+            .unwrap_or(node.name.as_str());
+        if node_matches_filters(node, path, filters, prefab_source_paths, serialized_fields) {
+            out.push(node);
+        }
+        collect_matching_nodes(
+            &node.children,
+            filters,
+            prefab_source_paths,
+            path_map,
+            serialized_fields,
+            out,
+        );
+    }
+}
+
+fn format_search_result_node(
+    out: &mut String,
+    node: &HierarchyNode,
+    path_map: &HashMap<i64, String>,
+) {
+    let path = path_map
+        .get(&node.file_id)
+        .map(String::as_str)
+        .unwrap_or(node.name.as_str());
+    out.push_str("- ");
+    out.push_str(path);
+    out.push_str(&format_component_suffix(node));
+    out.push_str(&format_go_annotations(node));
+    out.push('\n');
+}
+
+fn build_serialized_field_search_index(
+    docs: &[YamlDoc],
+    lines: &[&str],
+) -> HashMap<i64, SearchableSerializedFields> {
+    let mut index: HashMap<i64, SearchableSerializedFields> = HashMap::new();
+    for doc in docs {
+        let go_file_id = if doc.class_id == 1 {
+            Some(doc.file_id)
+        } else {
+            doc.m_game_object_id
+        };
+        let Some(go_file_id) = go_file_id else {
+            continue;
+        };
+
+        let entry = index.entry(go_file_id).or_default();
+        collect_doc_serialized_search_fields(doc, lines, entry);
+    }
+    index
+}
+
+fn collect_doc_serialized_search_fields(
+    doc: &YamlDoc,
+    lines: &[&str],
+    entry: &mut SearchableSerializedFields,
+) {
+    let start = (doc.line_start + 2).min(doc.line_end);
+    for line in lines.iter().take(doc.line_end).skip(start) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("---") || trimmed.starts_with('%') {
+            continue;
+        }
+
+        if let Some((name, value)) = parse_serialized_search_field_line(trimmed) {
+            if let Some(name) = name.filter(|value| !value.is_empty()) {
+                entry.names.push(name.to_string());
+            }
+            if let Some(value) = value.filter(|value| !value.is_empty()) {
+                entry.values.push(value.to_string());
+            }
+        }
+    }
+}
+
+fn parse_serialized_search_field_line(line: &str) -> Option<(Option<&str>, Option<&str>)> {
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+
+    let list_value = line.strip_prefix("- ").map(str::trim);
+    let candidate = list_value.unwrap_or(line);
+    if let Some(colon) = candidate.find(':') {
+        let name = candidate[..colon].trim();
+        let value = candidate[colon + 1..].trim();
+        let value = value
+            .trim_matches(',')
+            .trim_matches('"')
+            .trim_matches('\'')
+            .trim();
+        return Some((Some(name), Some(value)));
+    }
+
+    list_value.map(|value| (None, Some(value)))
+}
+
+pub fn format_hierarchy_search_results(
+    roots: &[HierarchyNode],
+    docs: &[YamlDoc],
+    lines: &[&str],
+    guid_resolver: &dyn Fn(&Guid) -> Option<String>,
+    file_path: &str,
+    options: &HierarchySearchOptions,
+) -> String {
+    let irs = if docs.iter().any(|d| d.class_id == 1001 && !d.is_stripped) {
+        extract_prefab_instance_irs(docs, lines)
+    } else {
+        Vec::new()
+    };
+    let prefab_source_paths: HashMap<i64, String> = irs
+        .iter()
+        .filter_map(|ir| guid_resolver(&ir.source_prefab_guid).map(|path| (ir.local_file_id, path)))
+        .collect();
+    let scoped_roots = options
+        .path_prefix
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|path| select_path_prefix_roots(roots, path))
+        .unwrap_or_else(|| roots.to_vec());
+    let path_map = build_hierarchy_path_map(roots);
+    let filters = PreparedHierarchyFilters::from_search_options(options);
+    let serialized_fields =
+        if filters.query.is_some() && filters.match_fields.needs_serialized_fields() {
+            Some(build_serialized_field_search_index(docs, lines))
+        } else {
+            None
+        };
+    let mut matches = Vec::new();
+    collect_matching_nodes(
+        &scoped_roots,
+        &filters,
+        &prefab_source_paths,
+        &path_map,
+        serialized_fields.as_ref(),
+        &mut matches,
+    );
+
+    let mut out = String::new();
+    out.push_str(&format!("Search: {}\n", file_path));
+    out.push_str(&search_options_summary_line(options));
+    out.push('\n');
+    out.push_str(&format!("Total matches: {}\n", matches.len()));
+
+    if matches.is_empty() {
+        out.push_str("\nNo hierarchy nodes matched filters.\n");
+        return out;
+    }
+
+    let limit = options.limit.unwrap_or(50);
+    let shown = matches.len().min(limit);
+    out.push_str(&format!("Showing: 1-{}\n\n", shown));
+    for node in matches.iter().take(limit) {
+        format_search_result_node(&mut out, node, &path_map);
+    }
+    if matches.len() > shown {
+        out.push_str(&format!(
+            "\n... ({} more matches hidden by limit)\n",
+            matches.len() - shown
+        ));
+    }
+    out
 }
 
 pub fn format_scene_summary(
@@ -900,6 +1670,24 @@ pub fn format_scene_summary(
     lines: &[&str],
     guid_resolver: &dyn Fn(&Guid) -> Option<String>,
     file_path: &str,
+) -> String {
+    format_scene_summary_with_options(
+        roots,
+        docs,
+        lines,
+        guid_resolver,
+        file_path,
+        &HierarchySummaryOptions::default(),
+    )
+}
+
+pub fn format_scene_summary_with_options(
+    roots: &[HierarchyNode],
+    docs: &[YamlDoc],
+    lines: &[&str],
+    guid_resolver: &dyn Fn(&Guid) -> Option<String>,
+    file_path: &str,
+    options: &HierarchySummaryOptions,
 ) -> String {
     let mut out = String::new();
     let has_prefab_instances = docs.iter().any(|d| d.class_id == 1001 && !d.is_stripped);
@@ -925,100 +1713,31 @@ pub fn format_scene_summary(
         ));
         out.push_str(&format!("Total prefab instances: {}\n", irs.len()));
     }
+    if let Some(summary_line) = option_summary_line(options) {
+        out.push_str(&summary_line);
+        out.push('\n');
+    }
 
     // ── B. Hierarchy ──
     out.push_str("\n── Hierarchy ──\n\n");
-    out.push_str(&format_hierarchy_summary(roots));
+    let prefab_source_paths: HashMap<i64, String> = irs
+        .iter()
+        .filter_map(|ir| guid_resolver(&ir.source_prefab_guid).map(|path| (ir.local_file_id, path)))
+        .collect();
+    out.push_str(&format_hierarchy_summary_with_metadata(
+        roots,
+        options,
+        &prefab_source_paths,
+    ));
 
-    // ── C. Notable Prefab Overrides ──
     if !irs.is_empty() {
-        let aggregated = aggregate_prefab_sources(&irs, guid_resolver);
-
-        let notable: Vec<&PrefabSourceStats> = aggregated
-            .iter()
-            .filter(|s| s.heavy_count > 0 || s.light_custom_count > 0 || s.has_removed_components)
-            .collect();
-
-        if !notable.is_empty() {
-            out.push_str("\n── Notable Prefab Overrides ──\n\n");
-            for stats in &notable {
-                let name = stats
-                    .source_path
-                    .as_deref()
-                    .map(short_prefab_name)
-                    .unwrap_or("unknown");
-
-                let mut desc = Vec::new();
-
-                if stats.mesh_override_total > 0 {
-                    desc.push(format!(
-                        "{} mesh-data overrides ⚠",
-                        stats.mesh_override_total
-                    ));
-                }
-
-                if stats.heavy_count > 0 {
-                    if stats.instance_count == 1 {
-                        desc.push(format!("{} overrides", stats.total_override_max));
-                    } else {
-                        desc.push(format!(
-                            "{} heavy instance(s), max {} overrides",
-                            stats.heavy_count, stats.total_override_max
-                        ));
-                    }
-                }
-
-                if stats.light_custom_count > 0 {
-                    desc.push(format!("{} custom-edited", stats.light_custom_count));
-                }
-
-                if stats.has_removed_components {
-                    desc.push("removed components".to_string());
-                }
-
-                if stats.instance_count > 1 {
-                    out.push_str(&format!(
-                        "- {} ×{}: {}\n",
-                        name,
-                        stats.instance_count,
-                        desc.join(", ")
-                    ));
-                } else {
-                    out.push_str(&format!("- {}: {}\n", name, desc.join(", ")));
-                }
-            }
-        }
-
-        // ── D. Suppressed ──
-        let transform_only_total: usize = aggregated.iter().map(|s| s.transform_only_count).sum();
-        let clean_total: usize = aggregated.iter().map(|s| s.clean_count).sum();
-
-        out.push_str("\n── Suppressed ──\n\n");
-        if transform_only_total > 0 {
-            out.push_str(&format!(
-                "- {} transform-only prefab instances\n",
-                transform_only_total
-            ));
-        }
-        if clean_total > 0 {
-            out.push_str(&format!(
-                "- {} clean (name/active-only) prefab instances\n",
-                clean_total
-            ));
-        }
-        out.push_str("- Per-instance transform details\n");
-        out.push_str("- Per-instance source path repeats\n");
-        if aggregated.iter().any(|s| s.mesh_override_total > 0) {
-            out.push_str("- Raw mesh/poly/normals override entries\n");
-        }
-
-        // ── E. Drill-down hints ──
         out.push_str("\nDrill down with object_path:\n");
-        out.push_str("- \"InstanceName\" → structured override detail for a PrefabInstance\n");
-        out.push_str("- \"Parent/Child\" → GameObject components\n");
-        out.push_str(
-            "- Use exact names from \"Instances\" lines when a folded group has duplicates\n",
-        );
+        out.push_str("- Use paths from the hierarchy or Instances lines for object_path\n");
+        out.push_str("- PrefabInstance targets return structured override detail\n");
+    }
+    if irs.is_empty() {
+        out.push_str("\nDrill down with object_path:\n");
+        out.push_str("- Use paths from the hierarchy for object_path\n");
     }
 
     out

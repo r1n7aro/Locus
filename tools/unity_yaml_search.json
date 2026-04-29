@@ -1,0 +1,34 @@
+{
+  "description": "Search within a Unity scene or prefab hierarchy and return precise object paths for later unity_yaml_read calls.\n\nFor .unity/.prefab files, this tool reads live Unity Editor state through the locus_unity plugin first so unsaved scene or prefab changes are visible, then falls back to direct text YAML parsing when the Editor path is unavailable. Use this when you know a name, component, tag/layer clue, prefab source, serialized field clue, or subtree but need the exact object path. Results preserve important list-view information inline on each result row: full path, component names, active/static state, Tag, and Layer. Prefab source paths and serialized field matches participate in query matching when selected but are omitted from result rows. When sibling names repeat, paths use a 1-based segment ordinal such as `Root/Enemy[2]`.\n\n`query` searches the fields selected by `match_fields`. By default it searches object paths, object names, component names, annotations, tags, layers, and resolved prefab source paths. It defaults to case-insensitive substring matching; prefix with `re:` for a case-insensitive regular expression. Include `field_name` and/or `field_value` in `match_fields` to search serialized component fields. Field matching is more expensive on large scenes; use it with `path_prefix` when possible. `component_filter` supports one component name or comma-separated component names for OR matching. If both query and component_filter are provided, a result must satisfy both.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "file_path": {
+        "type": "string",
+        "description": "Path to the Unity .unity or .prefab YAML file, relative to the project root (e.g. 'Assets/Scenes/Main.unity') or absolute path."
+      },
+      "query": {
+        "type": "string",
+        "description": "Optional text search over object paths, names, component names, annotations, and resolved prefab source paths. Use 're:<pattern>' for a case-insensitive regular expression."
+      },
+      "component_filter": {
+        "type": "string",
+        "description": "Optional component filter. Use a component name such as 'Light' or 'Canvas', or comma-separated component names for OR matching."
+      },
+      "match_fields": {
+        "type": "string",
+        "description": "Optional comma-separated query scope. Supported values: path, name, component, annotation, tag, layer, prefab_source, field_name, field_value, default, all. Omit to use default matching. Use field_name or field_value only when you need serialized component field matching."
+      },
+      "path_prefix": {
+        "type": "string",
+        "description": "Optional hierarchy path prefix for searching one subtree, such as 'Environment/Lighting' or a returned duplicate-safe path like 'Root/Enemy[2]'."
+      },
+      "limit": {
+        "type": "integer",
+        "minimum": 1,
+        "description": "Optional maximum number of search results to print. Defaults to 50."
+      }
+    },
+    "required": ["file_path"]
+  }
+}

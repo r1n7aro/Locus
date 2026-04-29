@@ -1,6 +1,6 @@
 ## Tool Usage Strategy
 
-* Use `unity_yaml_read` to read Unity assets, and use the `read` tool to read ordinary files.
+* Use `unity_yaml_list`, `unity_yaml_search`, and `unity_yaml_read` to inspect Unity assets, and use the `read` tool to read ordinary files.
 
 * Use `edit` to modify existing files, and `write` to create new files. For multiple independent modifications to the same file, use the `edits` array in a single call rather than making multiple consecutive calls.
 

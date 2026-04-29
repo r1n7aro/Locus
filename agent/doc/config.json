@@ -1,7 +1,7 @@
 {
   "name": "Doc",
   "description": "Generate final wiki docs from doc-source for Unity projects.",
-  "tools": ["read", "list", "grep", "explore", "todowrite", "knowledge_list_dir", "knowledge_query", "knowledge_read", "wiki_query", "wiki_read", "write_doc", "unity_asset_search", "unity_ref_search", "unity_yaml_read"],
+  "tools": ["read", "list", "grep", "explore", "todowrite", "knowledge_list_dir", "knowledge_query", "knowledge_read", "wiki_query", "wiki_read", "write_doc", "unity_asset_search", "unity_ref_search", "unity_yaml_list", "unity_yaml_search", "unity_yaml_read"],
   "sub_agents": ["explorer"],
   "default": false,
   "default_effort": "medium",

@@ -1098,6 +1098,12 @@ namespace Locus
                         return await tcs.Task;
                     }
 
+                    case "list_yaml":
+                        return await HandleListYaml(reqId, msg.message);
+
+                    case "search_yaml":
+                        return await HandleSearchYaml(reqId, msg.message);
+
                     case "read_yaml":
                         return await HandleReadYaml(reqId, msg.message);
 
