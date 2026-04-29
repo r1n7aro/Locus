@@ -489,10 +489,12 @@ async fn resolve_model_backend(
                 .ok()
                 .and_then(|s| serde_json::from_str(&s).ok())
                 .unwrap_or_default();
-        let endpoint = endpoints
+        let mut endpoint = endpoints
             .iter()
             .find(|item| item.id == endpoint_id)
+            .cloned()
             .ok_or_else(|| format!("Custom endpoint config not found: {}", endpoint_id))?;
+        crate::commands::workspace::normalize_custom_endpoint_config(&mut endpoint);
         let endpoint_api_key =
             crate::keychain::get_secret(&crate::keychain::endpoint_key_name(&endpoint.id))
                 .ok()
@@ -505,6 +507,11 @@ async fn resolve_model_backend(
             api_format: endpoint.api_format.clone(),
             context_length: endpoint.context_length,
             beta_flags: endpoint.beta_flags.clone(),
+            supported_reasoning_efforts: endpoint.supported_reasoning_efforts.clone(),
+            reasoning_param_format: endpoint
+                .reasoning_param_format
+                .clone()
+                .unwrap_or(crate::commands::CustomReasoningParamFormat::OpenaiChatReasoningEffort),
         });
     }
 
@@ -751,10 +758,12 @@ pub async fn chat(
                 .ok()
                 .and_then(|s| serde_json::from_str(&s).ok())
                 .unwrap_or_default();
-        let ep = endpoints
+        let mut ep = endpoints
             .iter()
             .find(|e| e.id == endpoint_id)
+            .cloned()
             .ok_or_else(|| format!("Custom endpoint config not found: {}", endpoint_id))?;
+        crate::commands::workspace::normalize_custom_endpoint_config(&mut ep);
         // Load API key from keychain (JSON file no longer stores it)
         let ep_api_key = crate::keychain::get_secret(&crate::keychain::endpoint_key_name(&ep.id))
             .ok()
@@ -767,6 +776,11 @@ pub async fn chat(
             api_format: ep.api_format.clone(),
             context_length: ep.context_length,
             beta_flags: ep.beta_flags.clone(),
+            supported_reasoning_efforts: ep.supported_reasoning_efforts.clone(),
+            reasoning_param_format: ep
+                .reasoning_param_format
+                .clone()
+                .unwrap_or(crate::commands::CustomReasoningParamFormat::OpenaiChatReasoningEffort),
         }
     } else if is_openrouter {
         let api_key = api_key_state.read().await.clone();
@@ -2428,6 +2442,23 @@ mod tests {
     }
 
     #[test]
+    fn parse_sse_response_supports_openai_reasoning_content() {
+        let mut out = String::new();
+        parse_sse_response(
+            &mut out,
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"Think.\"},\"finish_reason\":null}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"Answer.\"},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n"
+            ),
+        );
+
+        assert!(out.contains("<details><summary>Thinking</summary>"));
+        assert!(out.contains("Think."));
+        assert!(out.contains("Answer."));
+    }
+
+    #[test]
     fn session_export_marks_missing_optional_fields_as_empty() {
         let detail = SessionDetail {
             id: "session-1".to_string(),
@@ -2813,6 +2844,7 @@ fn parse_sse_response(out: &mut String, raw_sse: &str) {
         arguments: String,
     }
 
+    let mut openai_thinking = String::new();
     let mut openai_text = String::new();
     let mut openai_tool_calls: HashMap<i64, (String, String)> = HashMap::new(); // index -> (name, arguments)
     let mut saw_openai_chat_format = false;
@@ -2844,6 +2876,12 @@ fn parse_sse_response(out: &mut String, raw_sse: &str) {
                 if let Some(choices) = event.get("choices").and_then(|value| value.as_array()) {
                     for choice in choices {
                         if let Some(delta) = choice.get("delta") {
+                            if let Some(reasoning) = delta
+                                .get("reasoning_content")
+                                .and_then(|value| value.as_str())
+                            {
+                                openai_thinking.push_str(reasoning);
+                            }
                             if let Some(content) =
                                 delta.get("content").and_then(|value| value.as_str())
                             {
@@ -3130,6 +3168,10 @@ fn parse_sse_response(out: &mut String, raw_sse: &str) {
         .saturating_add(1);
 
     if saw_openai_chat_format {
+        if !openai_thinking.is_empty() {
+            finished_blocks.push((append_index, ContentBlock::Thinking(openai_thinking)));
+            append_index += 1;
+        }
         if !openai_text.is_empty() {
             finished_blocks.push((append_index, ContentBlock::Text(openai_text)));
             append_index += 1;

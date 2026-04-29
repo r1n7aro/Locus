@@ -108,10 +108,32 @@ describe("useModelStore OpenAI effort mapping", () => {
       apiKey: "",
       contextLength: 128000,
       betaFlags: [],
+      supportedReasoningEfforts: ["medium", "high"],
+      reasoningParamFormat: "openai_responses_reasoning_effort",
     }]);
     modelStore.selectedModelId = "custom/endpoint-1";
 
     expect(modelStore.availableEfforts).toEqual(["medium", "high"]);
+  });
+
+  it("defaults custom endpoints to low medium high max reasoning controls", () => {
+    const modelStore = useModelStore();
+
+    modelStore.applyCustomEndpoints([{
+      id: "endpoint-1",
+      name: "Custom Chat",
+      apiModel: "deepseek-v4-pro",
+      endpoint: "https://example.com/v1",
+      apiFormat: "openai_chat",
+      apiKey: "",
+      contextLength: 128000,
+      betaFlags: [],
+      reasoningParamFormat: "openai_chat_reasoning_effort",
+    } as any]);
+    modelStore.selectedModelId = "custom/endpoint-1";
+
+    expect(modelStore.availableEfforts).toEqual(["low", "medium", "high", "max"]);
+    expect(modelStore.effortSupported).toBe(true);
   });
 
   it("loads the saved effort selection from persistence", async () => {

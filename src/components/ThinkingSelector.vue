@@ -30,10 +30,11 @@ const levels = computed<LevelOption[]>(() => {
     medium: { value: "medium", label: "Med", desc: t("thinking.level.medium") },
     high: { value: "high", label: "High", desc: t("thinking.level.high") },
     xhigh: { value: "xhigh", label: "XHigh", desc: t("thinking.level.xhigh") },
+    max: { value: "max", label: "Max", desc: t("thinking.level.max") },
   };
   const values: EffortLevel[] = props.efforts?.length
     ? props.efforts
-    : ["none", "low", "medium", "high", "xhigh"];
+    : ["none", "low", "medium", "high", "xhigh", "max"];
   return values.map((value) => defs[value]);
 });
 
@@ -45,6 +46,7 @@ const levelColor = computed(() => {
     case "medium": return "var(--thinking-medium, #d69e2e)";
     case "high": return "var(--thinking-high, #dd6b20)";
     case "xhigh": return "var(--thinking-xhigh, #c05621)";
+    case "max": return "var(--thinking-xhigh, #c05621)";
     default: return "var(--text-secondary)";
   }
 });

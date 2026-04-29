@@ -6,6 +6,9 @@ import type {
   ModelDefaults,
   AgentInfo,
   CustomEndpoint,
+  EffortLevel,
+  ApiFormat,
+  ReasoningParamFormat,
   CodexModelConfig,
 } from "../types";
 import { t, locale, setLocale } from "../i18n";
@@ -86,6 +89,44 @@ function toggleBetaFlag(ep: import("../types").CustomEndpoint, flag: string) {
     ep.betaFlags.splice(idx, 1);
   } else {
     ep.betaFlags.push(flag);
+  }
+}
+
+const customReasoningEffortOptions = [
+  { value: "low", label: "Low" },
+  { value: "medium", label: "Med" },
+  { value: "high", label: "High" },
+  { value: "max", label: "Max" },
+] satisfies Array<{ value: EffortLevel; label: string }>;
+
+const customReasoningFormatOptions = [
+  { value: "none", label: t("settings.custom.reasoningNone") },
+  { value: "openai_chat_reasoning_effort", label: t("settings.custom.reasoningOpenaiChat") },
+  { value: "openai_responses_reasoning_effort", label: t("settings.custom.reasoningOpenaiResponses") },
+  { value: "anthropic_thinking", label: t("settings.custom.reasoningAnthropic") },
+] satisfies Array<{ value: ReasoningParamFormat; label: string }>;
+
+function defaultReasoningParamFormat(apiFormat: ApiFormat): ReasoningParamFormat {
+  switch (apiFormat) {
+    case "openai_responses": return "openai_responses_reasoning_effort";
+    case "anthropic_messages": return "anthropic_thinking";
+    default: return "openai_chat_reasoning_effort";
+  }
+}
+
+function updateEndpointApiFormat(ep: CustomEndpoint, event: Event) {
+  const apiFormat = (event.target as HTMLSelectElement).value as ApiFormat;
+  ep.apiFormat = apiFormat;
+  ep.reasoningParamFormat = defaultReasoningParamFormat(apiFormat);
+}
+
+function toggleReasoningEffort(ep: CustomEndpoint, effort: EffortLevel) {
+  if (!ep.supportedReasoningEfforts) ep.supportedReasoningEfforts = [];
+  const idx = ep.supportedReasoningEfforts.indexOf(effort);
+  if (idx >= 0) {
+    ep.supportedReasoningEfforts.splice(idx, 1);
+  } else {
+    ep.supportedReasoningEfforts.push(effort);
   }
 }
 </script>
@@ -350,7 +391,11 @@ function toggleBetaFlag(ep: import("../types").CustomEndpoint, flag: string) {
             </div>
             <div class="custom-form-row">
               <label class="custom-form-label">{{ t("settings.custom.apiFormat") }}</label>
-              <select v-model="editingEndpoint.apiFormat" class="model-select">
+              <select
+                :value="editingEndpoint.apiFormat"
+                class="model-select"
+                @change="updateEndpointApiFormat(editingEndpoint, $event)"
+              >
                 <option value="openai_chat">{{ t("settings.custom.formatOpenaiChat") }}</option>
                 <option value="openai_responses">{{ t("settings.custom.formatOpenaiResponses") }}</option>
                 <option value="anthropic_messages">{{ t("settings.custom.formatAnthropicMessages") }}</option>
@@ -383,6 +428,40 @@ function toggleBetaFlag(ep: import("../types").CustomEndpoint, flag: string) {
                 placeholder="128000"
                 @keydown="handleEndpointKeydown"
               />
+            </div>
+            <div class="custom-form-row">
+              <label class="custom-form-label">
+                {{ t("settings.custom.reasoningFormat") }}
+              </label>
+              <select v-model="editingEndpoint.reasoningParamFormat" class="model-select">
+                <option
+                  v-for="option in customReasoningFormatOptions"
+                  :key="option.value"
+                  :value="option.value"
+                >
+                  {{ option.label }}
+                </option>
+              </select>
+            </div>
+            <div v-if="editingEndpoint.reasoningParamFormat !== 'none'" class="custom-form-row">
+              <label class="custom-form-label">
+                {{ t("settings.custom.reasoningEfforts") }}
+                <span class="custom-form-hint">{{ t("settings.custom.reasoningEffortsHint") }}</span>
+              </label>
+              <div class="beta-flags-list">
+                <label
+                  v-for="option in customReasoningEffortOptions"
+                  :key="option.value"
+                  class="beta-flag-item"
+                >
+                  <input
+                    type="checkbox"
+                    :checked="editingEndpoint.supportedReasoningEfforts?.includes(option.value)"
+                    @change="toggleReasoningEffort(editingEndpoint, option.value)"
+                  />
+                  <span class="beta-flag-name">{{ option.label }}</span>
+                </label>
+              </div>
             </div>
             <div v-if="editingEndpoint.apiFormat === 'anthropic_messages'" class="custom-form-row">
               <label class="custom-form-label">

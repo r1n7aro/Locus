@@ -1,4 +1,6 @@
-use super::openai_reasoning::{apply_reasoning_effort, apply_text_verbosity_default};
+use super::openai_reasoning::{
+    apply_explicit_reasoning_effort, apply_reasoning_effort, apply_text_verbosity_default,
+};
 use futures::StreamExt;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -15,6 +17,7 @@ pub async fn stream_chat<F, G, H>(
     tools: &[serde_json::Value],
     base_url: &str,
     thinking_level: Option<&str>,
+    explicit_reasoning_effort: Option<&str>,
     debug: bool,
     session_id: Option<&str>,
     on_text_delta: F,
@@ -38,6 +41,7 @@ where
         history,
         tools,
         thinking_level,
+        explicit_reasoning_effort,
         session_id,
     );
 
@@ -244,6 +248,7 @@ fn build_request_body(
     history: &[ChatMessage],
     tools: &[serde_json::Value],
     thinking_level: Option<&str>,
+    explicit_reasoning_effort: Option<&str>,
     session_id: Option<&str>,
 ) -> serde_json::Value {
     let request_input = build_request_input(history);
@@ -266,7 +271,11 @@ fn build_request_body(
         body["instructions"] = serde_json::json!(system_prompt);
     }
 
-    apply_reasoning_effort(&mut body, model, thinking_level);
+    if explicit_reasoning_effort.is_some() {
+        apply_explicit_reasoning_effort(&mut body, explicit_reasoning_effort);
+    } else {
+        apply_reasoning_effort(&mut body, model, thinking_level);
+    }
     apply_text_verbosity_default(&mut body, model);
 
     if !tools.is_empty() {
@@ -1001,9 +1010,25 @@ mod tests {
             &[],
             None,
             None,
+            None,
         );
 
         assert_eq!(body["text"]["verbosity"].as_str(), Some("low"));
+    }
+
+    #[test]
+    fn build_request_body_includes_explicit_custom_reasoning_effort() {
+        let body = build_request_body(
+            "deepseek-v4-pro",
+            "You are Codex",
+            &[user_message_with_images("hello", vec![])],
+            &[],
+            Some("high"),
+            Some("max"),
+            None,
+        );
+
+        assert_eq!(body["reasoning"], serde_json::json!({ "effort": "max" }));
     }
 
     #[test]

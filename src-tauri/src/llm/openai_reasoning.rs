@@ -8,6 +8,32 @@ pub fn apply_reasoning_effort(
     }
 }
 
+pub fn apply_explicit_reasoning_effort(body: &mut serde_json::Value, effort: Option<&str>) {
+    if let Some(effort) = effort.and_then(normalize_explicit_reasoning_effort) {
+        body["reasoning"] = serde_json::json!({ "effort": effort });
+    }
+}
+
+pub fn custom_reasoning_effort(
+    thinking_level: Option<&str>,
+    supported_efforts: &[String],
+) -> Option<String> {
+    let level = normalize_explicit_reasoning_effort(thinking_level?)?;
+    let supported = supported_efforts
+        .iter()
+        .filter_map(|value| normalize_explicit_reasoning_effort(value))
+        .collect::<std::collections::HashSet<_>>();
+    supported.contains(&level).then_some(level)
+}
+
+fn normalize_explicit_reasoning_effort(value: &str) -> Option<String> {
+    let level = value.trim().to_ascii_lowercase();
+    match level.as_str() {
+        "low" | "medium" | "high" | "xhigh" | "max" => Some(level),
+        _ => None,
+    }
+}
+
 pub fn apply_text_verbosity_default(body: &mut serde_json::Value, model: &str) {
     let Some(verbosity) = default_text_verbosity_for_model(model) else {
         return;
@@ -140,8 +166,8 @@ fn supported_efforts(model: &str) -> SupportedEfforts {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_reasoning_effort, apply_text_verbosity_default, default_text_verbosity_for_model,
-        reasoning_effort_for_model,
+        apply_explicit_reasoning_effort, apply_reasoning_effort, apply_text_verbosity_default,
+        custom_reasoning_effort, default_text_verbosity_for_model, reasoning_effort_for_model,
     };
 
     #[test]
@@ -200,6 +226,24 @@ mod tests {
         apply_reasoning_effort(&mut body, "gpt-5.5", Some("xhigh"));
 
         assert_eq!(body["reasoning"], serde_json::json!({ "effort": "xhigh" }));
+    }
+
+    #[test]
+    fn custom_reasoning_accepts_explicit_max_effort() {
+        let supported = vec![
+            "low".to_string(),
+            "medium".to_string(),
+            "high".to_string(),
+            "max".to_string(),
+        ];
+        assert_eq!(
+            custom_reasoning_effort(Some("max"), &supported),
+            Some("max".to_string())
+        );
+
+        let mut body = serde_json::json!({ "model": "deepseek-v4-pro" });
+        apply_explicit_reasoning_effort(&mut body, Some("max"));
+        assert_eq!(body["reasoning"], serde_json::json!({ "effort": "max" }));
     }
 
     #[test]

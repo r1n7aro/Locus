@@ -161,7 +161,7 @@ export interface AgentInfo {
   source: string;
 }
 
-export type EffortLevel = "none" | "low" | "medium" | "high" | "xhigh";
+export type EffortLevel = "none" | "low" | "medium" | "high" | "xhigh" | "max";
 export type ThinkingLevel = EffortLevel;
 export type ModelRecommendation = "small" | "large";
 
@@ -185,6 +185,12 @@ export type ApiFormat =
   | "openai_responses"
   | "anthropic_messages";
 
+export type ReasoningParamFormat =
+  | "none"
+  | "openai_chat_reasoning_effort"
+  | "openai_responses_reasoning_effort"
+  | "anthropic_thinking";
+
 export interface CustomEndpoint {
   id: string;
   name: string;
@@ -194,6 +200,8 @@ export interface CustomEndpoint {
   apiKey: string;
   contextLength: number;
   betaFlags: string[];
+  supportedReasoningEfforts: EffortLevel[];
+  reasoningParamFormat: ReasoningParamFormat;
 }
 
 export interface ModelDefaults {
@@ -1966,6 +1974,7 @@ export interface ToolCallDisplay {
   name: string;
   arguments: string;
   status: "running" | "done" | "error" | "interrupted";
+  order?: number;
   output?: string;
   nestedToolCalls?: ToolCallDisplay[];
 }

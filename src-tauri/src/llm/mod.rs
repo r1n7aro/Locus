@@ -1,5 +1,6 @@
 pub mod anthropic;
 pub mod anthropic_agent_sdk;
+pub mod chat_completions;
 pub mod codex;
 pub mod codex_models;
 pub mod debug;

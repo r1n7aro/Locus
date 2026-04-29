@@ -88,20 +88,37 @@ const customApiFormatOptions = computed(() => [
   { value: "anthropic_messages" as ApiFormat, label: t("settings.custom.formatAnthropicMessages") },
 ]);
 
+function defaultReasoningParamFormat(apiFormat: ApiFormat): CustomEndpoint["reasoningParamFormat"] {
+  switch (apiFormat) {
+    case "openai_responses": return "openai_responses_reasoning_effort";
+    case "anthropic_messages": return "anthropic_thinking";
+    default: return "openai_chat_reasoning_effort";
+  }
+}
+
 function newCustomEndpoint(): CustomEndpoint {
+  const apiFormat: ApiFormat = "openai_chat";
   return {
     id: crypto.randomUUID(),
     name: "",
     apiModel: "",
     endpoint: "",
-    apiFormat: "openai_chat",
+    apiFormat,
     apiKey: "",
     contextLength: 128000,
     betaFlags: [],
+    supportedReasoningEfforts: ["low", "medium", "high", "max"],
+    reasoningParamFormat: defaultReasoningParamFormat(apiFormat),
   };
 }
 
 const customEndpointForm = ref<CustomEndpoint>(newCustomEndpoint());
+watch(
+  () => customEndpointForm.value.apiFormat,
+  (apiFormat) => {
+    customEndpointForm.value.reasoningParamFormat = defaultReasoningParamFormat(apiFormat);
+  },
+);
 const customEndpointConfigured = computed(() => customEndpoints.value.length > 0);
 const customEndpointReady = computed(() => {
   const ep = customEndpointForm.value;
@@ -231,6 +248,10 @@ function normalizedCustomEndpoint(): CustomEndpoint | null {
     apiKey: ep.apiKey.trim(),
     contextLength: Number.isFinite(contextLength) && contextLength >= 1024 ? contextLength : 128000,
     betaFlags: ep.betaFlags ?? [],
+    supportedReasoningEfforts: ep.supportedReasoningEfforts?.length
+      ? ep.supportedReasoningEfforts
+      : ["low", "medium", "high", "max"],
+    reasoningParamFormat: ep.reasoningParamFormat || defaultReasoningParamFormat(ep.apiFormat),
   };
 }
 

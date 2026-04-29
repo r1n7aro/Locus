@@ -438,6 +438,7 @@ pub async fn stream_chat_native<F, G, H>(
     tools: &[serde_json::Value],
     base_url: &str,
     extra_beta_flags: &[String],
+    thinking_level: Option<&str>,
     request_session_id: Option<&str>,
     tag: &str,
     on_text_delta: F,
@@ -481,13 +482,22 @@ where
         "text": system_prompt,
     }]);
 
+    let (thinking_field, output_config, standard_max_tokens) =
+        build_thinking_params(model, thinking_level);
     let mut body = serde_json::json!({
         "model": model,
-        "max_tokens": 16384,
+        "max_tokens": u64::from(standard_max_tokens),
         "system": system_blocks,
         "messages": messages,
         "stream": true,
     });
+
+    if let Some(thinking) = thinking_field {
+        body["thinking"] = thinking;
+    }
+    if let Some(oc) = output_config {
+        body["output_config"] = oc;
+    }
 
     if !anthropic_tools.is_empty() {
         body["tools"] = serde_json::json!(anthropic_tools);
@@ -996,6 +1006,7 @@ fn build_thinking_params(
         let thinking = serde_json::json!({ "type": "adaptive" });
         let output_config = match level {
             "low" | "medium" | "high" => Some(serde_json::json!({ "effort": level })),
+            "max" => Some(serde_json::json!({ "effort": "high" })),
             _ => None,
         };
         (Some(thinking), output_config, 32000)
@@ -1004,6 +1015,7 @@ fn build_thinking_params(
             "low" => (2048, 8192),
             "medium" => (5000, 12000),
             "high" => (16000, 32000),
+            "max" => (24000, 32000),
             _ => return (None, None, 16384),
         };
         let thinking = serde_json::json!({
@@ -1476,6 +1488,8 @@ fn oauth_public_tool_name(internal_name: &str) -> String {
         "unity_run_states" => "UnityRunStates".to_string(),
         "unity_recompile" => "UnityRecompile".to_string(),
         "unity_ref_search" => "UnityRefSearch".to_string(),
+        "unity_yaml_list" => "UnityYamlList".to_string(),
+        "unity_yaml_search" => "UnityYamlSearch".to_string(),
         "unity_yaml_read" => "UnityYamlRead".to_string(),
         "webfetch" => "WebFetch".to_string(),
         other => oauth_pascal_case(other),

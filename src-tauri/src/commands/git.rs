@@ -4362,6 +4362,7 @@ pub async fn git_generate_commit_message(
             None,
             Some("OpenRouter"),
             &[],
+            None,
             config.debug_enabled(),
             |_| {},
             |_, _| {},

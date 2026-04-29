@@ -34,6 +34,9 @@ import { useNotificationStore } from "../stores/notification";
 import type {
   ModelDefaults,
   CustomEndpoint,
+  EffortLevel,
+  ApiFormat,
+  ReasoningParamFormat,
   CodexTransportMode,
   CodexModelConfig,
 } from "../types";
@@ -565,6 +568,8 @@ export function useSettingsState(emit: SettingsEmit) {
     { name: "unity_recompile",    label: "unity_recompile",    desc: t("tool.desc.unity_recompile"),    defaultMode: "auto" as const },
     { name: "unity_ref_search",   label: "unity_ref_search",   desc: t("tool.desc.unity_ref_search"),   defaultMode: "auto" as const },
     { name: "unity_asset_search", label: "unity_asset_search", desc: t("tool.desc.unity_asset_search"), defaultMode: "auto" as const },
+    { name: "unity_yaml_list",    label: "unity_yaml_list",    desc: t("tool.desc.unity_yaml_list"),    defaultMode: "auto" as const },
+    { name: "unity_yaml_search",  label: "unity_yaml_search",  desc: t("tool.desc.unity_yaml_search"),  defaultMode: "auto" as const },
     { name: "unity_yaml_read",    label: "unity_yaml_read",    desc: t("tool.desc.unity_yaml_read"),    defaultMode: "auto" as const },
     { name: "knowledge_list",     label: "knowledge_list",     desc: t("tool.desc.knowledge_list"),     defaultMode: "auto" as const },
     { name: "knowledge_query",    label: "knowledge_query",    desc: t("tool.desc.knowledge_query"),    defaultMode: "auto" as const },
@@ -631,23 +636,52 @@ export function useSettingsState(emit: SettingsEmit) {
   const isAddingEndpoint = ref(false);
   const testStatus = ref<"idle" | "testing" | "success" | "error">("idle");
   const testResult = ref("");
+  const defaultReasoningEfforts: EffortLevel[] = ["low", "medium", "high", "max"];
+  const reasoningEffortSet = new Set<EffortLevel>(["none", "low", "medium", "high", "xhigh", "max"]);
+
+  function defaultReasoningParamFormat(apiFormat: ApiFormat): ReasoningParamFormat {
+    switch (apiFormat) {
+      case "openai_responses": return "openai_responses_reasoning_effort";
+      case "anthropic_messages": return "anthropic_thinking";
+      default: return "openai_chat_reasoning_effort";
+    }
+  }
+
+  function normalizeReasoningEfforts(values?: EffortLevel[] | null): EffortLevel[] {
+    const normalized = Array.isArray(values)
+      ? values.filter((value): value is EffortLevel => reasoningEffortSet.has(value))
+      : [];
+    return normalized.length > 0 ? normalized : [...defaultReasoningEfforts];
+  }
+
+  function normalizeCustomEndpoint(ep: CustomEndpoint): CustomEndpoint {
+    return {
+      ...ep,
+      betaFlags: ep.betaFlags ?? [],
+      supportedReasoningEfforts: normalizeReasoningEfforts(ep.supportedReasoningEfforts),
+      reasoningParamFormat: ep.reasoningParamFormat ?? defaultReasoningParamFormat(ep.apiFormat),
+    };
+  }
 
   function newEmptyEndpoint(): CustomEndpoint {
+    const apiFormat: ApiFormat = "openai_chat";
     return {
       id: crypto.randomUUID(),
       name: "",
       apiModel: "",
       endpoint: "",
-      apiFormat: "openai_chat",
+      apiFormat,
       apiKey: "",
       contextLength: 128000,
       betaFlags: [],
+      supportedReasoningEfforts: [...defaultReasoningEfforts],
+      reasoningParamFormat: defaultReasoningParamFormat(apiFormat),
     };
   }
 
   async function loadCustomEndpoints() {
     try {
-      customEndpoints.value = await getCustomEndpoints();
+      customEndpoints.value = (await getCustomEndpoints()).map(normalizeCustomEndpoint);
     } catch (e) {
       const err = normalizeAppError(e);
       useNotificationStore().addNotice("error", t("settings.custom.loadFailed", err.message), {
@@ -665,7 +699,7 @@ export function useSettingsState(emit: SettingsEmit) {
   }
 
   function startEditEndpoint(ep: CustomEndpoint) {
-    editingEndpoint.value = { ...ep, betaFlags: ep.betaFlags ?? [] };
+    editingEndpoint.value = normalizeCustomEndpoint(ep);
     isAddingEndpoint.value = false;
     testStatus.value = "idle";
     testResult.value = "";
@@ -678,7 +712,7 @@ export function useSettingsState(emit: SettingsEmit) {
 
   async function saveEndpoint() {
     if (!editingEndpoint.value) return;
-    const ep = editingEndpoint.value;
+    const ep = normalizeCustomEndpoint(editingEndpoint.value);
     if (!ep.name.trim()) { errorMsg.value = t("settings.custom.nameRequired"); return; }
     if (!ep.apiModel.trim()) { errorMsg.value = t("settings.custom.apiModelRequired"); return; }
     if (!ep.endpoint.trim()) { errorMsg.value = t("settings.custom.endpointRequired"); return; }
@@ -728,7 +762,7 @@ export function useSettingsState(emit: SettingsEmit) {
 
   async function testEndpoint() {
     if (!editingEndpoint.value) return;
-    const ep = editingEndpoint.value;
+    const ep = normalizeCustomEndpoint(editingEndpoint.value);
     if (!ep.apiModel.trim() || !ep.endpoint.trim()) {
       testStatus.value = "error";
       testResult.value = t("settings.custom.testMissingFields");
@@ -779,7 +813,7 @@ export function useSettingsState(emit: SettingsEmit) {
       await loadToolPermissions();
     }
 
-    if (cachedEndpoints) customEndpoints.value = cachedEndpoints;
+    if (cachedEndpoints) customEndpoints.value = cachedEndpoints.map(normalizeCustomEndpoint);
     else await loadCustomEndpoints();
   });
 

@@ -36,7 +36,8 @@ const codexFallbackModels: ModelOption[] = [
   },
 ];
 
-const effortLevels: EffortLevel[] = ["none", "low", "medium", "high", "xhigh"];
+const effortLevels: EffortLevel[] = ["none", "low", "medium", "high", "xhigh", "max"];
+const customDefaultReasoningEfforts: EffortLevel[] = ["low", "medium", "high", "max"];
 
 function normalizeOpenAiReasoningModel(model: string): string {
   return model.trim().toLowerCase();
@@ -49,6 +50,11 @@ function isEffortLevel(value: string): value is EffortLevel {
 function normalizeEfforts(values?: EffortLevel[] | null): EffortLevel[] {
   if (!Array.isArray(values)) return [];
   return values.filter(isEffortLevel);
+}
+
+function normalizeCustomReasoningEfforts(values?: EffortLevel[] | null): EffortLevel[] {
+  const normalized = normalizeEfforts(values).filter((value) => value !== "none");
+  return normalized.length > 0 ? normalized : [...customDefaultReasoningEfforts];
 }
 
 function supportsOpenAiReasoningModel(model: string): boolean {
@@ -143,6 +149,7 @@ export const useModelStore = defineStore("model", () => {
       id: `custom/${ep.id}`,
       name: ep.name,
       provider: "custom" as const,
+      supportedEfforts: normalizeCustomReasoningEfforts(ep.supportedReasoningEfforts),
     }));
     return filterVisibleModels([...builtinModels, ...codexModels.value, ...customs]);
   });
@@ -181,6 +188,11 @@ export const useModelStore = defineStore("model", () => {
 
   const availableEfforts = computed<EffortLevel[]>(() => {
     const m = selectedModelId.value.toLowerCase();
+    if (selectedModelId.value.startsWith("custom/")) {
+      const endpoint = selectedCustomEndpoint.value;
+      if (!endpoint || endpoint.reasoningParamFormat === "none") return [];
+      return normalizeCustomReasoningEfforts(endpoint.supportedReasoningEfforts);
+    }
     if (m.includes("claude")) return ["none", "low", "medium", "high"];
     const openAiModel = selectedOpenAiReasoningModel.value;
     if (!openAiModel || !supportsOpenAiReasoningModel(openAiModel)) return [];

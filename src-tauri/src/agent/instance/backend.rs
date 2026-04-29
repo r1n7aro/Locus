@@ -228,6 +228,8 @@ pub enum LlmBackend {
         api_format: crate::commands::ApiFormat,
         context_length: u32,
         beta_flags: Vec<String>,
+        supported_reasoning_efforts: Vec<String>,
+        reasoning_param_format: crate::commands::CustomReasoningParamFormat,
     },
 }
 

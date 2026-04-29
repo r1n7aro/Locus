@@ -34,6 +34,7 @@ pub async fn stream_chat<F, H>(
     api_path: Option<&str>,
     provider_tag: Option<&str>,
     extra_headers: &[(&str, &str)],
+    reasoning_effort: Option<&str>,
     debug: bool,
     on_text_delta: F,
     on_tool_call_start: H,
@@ -51,7 +52,7 @@ where
 
     let messages = build_api_messages(system_prompt, history);
 
-    let body = build_request_body(model, messages, tools);
+    let body = build_request_body(model, messages, tools, reasoning_effort);
 
     let raw_request = serde_json::to_string_pretty(&body).unwrap_or_else(|_| format!("{:?}", body));
 
@@ -453,6 +454,7 @@ fn build_request_body(
     model: &str,
     messages: Vec<serde_json::Value>,
     tools: &[serde_json::Value],
+    reasoning_effort: Option<&str>,
 ) -> serde_json::Value {
     let mut body = serde_json::json!({
         "model": model,
@@ -465,6 +467,13 @@ fn build_request_body(
 
     if !tools.is_empty() {
         body["tools"] = serde_json::json!(tools);
+    }
+
+    if let Some(effort) = reasoning_effort
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        body["reasoning_effort"] = serde_json::json!(effort);
     }
 
     body
@@ -753,13 +762,20 @@ mod tests {
 
     #[test]
     fn chat_completion_requests_enable_stream_usage() {
-        let body = build_request_body("model-x", Vec::new(), &[]);
+        let body = build_request_body("model-x", Vec::new(), &[], None);
 
         assert_eq!(body["stream"], serde_json::json!(true));
         assert_eq!(
             body["stream_options"],
             serde_json::json!({ "include_usage": true })
         );
+    }
+
+    #[test]
+    fn chat_completion_requests_include_custom_reasoning_effort() {
+        let body = build_request_body("model-x", Vec::new(), &[], Some("max"));
+
+        assert_eq!(body["reasoning_effort"], serde_json::json!("max"));
     }
 
     #[test]
