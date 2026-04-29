@@ -1,42 +1,32 @@
 {
-  "version": "0.2.2",
-  "releasedAt": "2026-04-28",
+  "version": "0.2.3",
+  "releasedAt": "2026-04-29",
   "channel": "stable",
   "locales": {
     "zh": {
       "title": "发现新版本",
-      "summary": "Locus v0.2.2 (2026-04-28)",
+      "summary": "Locus v0.2.3 (2026-04-29)",
       "changelogUrl": "/overview/latest-version",
       "changes": [
         {
           "title": "新增",
           "items": [
-            "`unity_run_states` 新增 Unity 运行时 Profiler 辅助能力，支持指标采样、尖峰记录、Profiler 帧导出、CSV 输出和 JSON 摘要。",
-            "新增内置 Profiler Skill：`skill/builtin/profiler.md`。",
-            "Chat 的 Unity 状态弹层新增启动当前 Unity 项目的操作，并显示启动中、等待连接状态。",
-            "Markdown 引用、资产 chip、文件树和 Git 变更列表新增 Unity 资产类型图标。",
-            "Unity Inspector Diff 新增紧凑的 Vector 与 Quaternion 展示，并支持 Euler / Quaternion 切换。",
-            "显示设置新增“层级视图用彩色图标显示修改状态”。"
+            "新增 `unity_yaml_list` 和 `unity_yaml_search`，用于在读取对象详情前检查 Unity 场景与 Prefab 层级。",
+            "`unity_yaml_read` 新增更细的详情模式，支持实时 Editor 读取、Prefab override、序列化字段和重复名称安全路径。",
+            "Chat 会话渲染新增隐藏已完成 thinking 的显示设置，并按真实顺序展示 thinking、工具调用和流式文本。",
+            "Markdown 与 Chat 资产引用支持更多 Unity、工作区和 `ProjectSettings` 路径格式。"
           ]
         },
         {
           "title": "修复",
           "items": [
-            "文件变更默认使用树视图，并在 staged / commit detail 树中显示 Locus 管理目录标记。",
-            "取消对话时会保留已流式输出的部分回复和 thinking 内容。",
-            "Knowledge 工具现在明确区分 `.md` 文档路径和目录路径。",
-            "内置 Skill 可从 `skill/builtin/` 正确发现和读取，并兼容旧的 app skill 选择。",
-            "Knowledge 统计和元信息改为显示项目文档与 App 内置文档来源。",
-            "主界面默认主题改为深色。",
-            "Roslyn bundle 构建改为隔离输出目录，并清理临时 ILRepack 产物。",
-            "NSIS 更新会清理旧版本遗留的根级内置 Skill 文件。"
-          ]
-        },
-        {
-          "title": "移除",
-          "items": [
-            "Knowledge catalog 和工具返回结构移除旧的 `scope` 字段。",
-            "内置 Skill 移除根级文件路径，统一迁移到 `skill/builtin/`。"
+            "修复自定义模型端点的推理参数配置，OpenAI Chat、OpenAI Responses、Anthropic 兼容端点现在可以发送正确的推理参数格式，并显示可用推理强度。",
+            "启动和切换工作区时会校准已加载的资产数据库，处理过期引用图、同路径 GUID 冲突、大小/哈希变化和脚本级联更新。",
+            "Unity 域重载期间保留嵌入式 WebView，并对临时关闭执行延迟清理。",
+            "Knowledge lexical rebuild 进度改为接收状态事件推送。",
+            "Settings 会缓存调试模式状态，重新挂载设置面板时保持开关状态稳定。",
+            "Chat 文件变更撤销执行中会锁定撤销按钮，避免重复触发。",
+            "改进 Subagent 和 Unity recompile 工具调用的等待状态展示。"
           ]
         }
       ],
@@ -49,38 +39,28 @@
     },
     "en": {
       "title": "Update available",
-      "summary": "Locus v0.2.2 (2026-04-28)",
+      "summary": "Locus v0.2.3 (2026-04-29)",
       "changelogUrl": "/en/overview/latest-version",
       "changes": [
         {
           "title": "Added",
           "items": [
-            "Added Unity runtime profiler helpers for `unity_run_states`, including metric sampling, spike capture, profiler frame export, CSV output, and JSON summaries.",
-            "Added a built-in profiler skill at `skill/builtin/profiler.md`.",
-            "Added Unity project launch from the chat Unity status popover, with launching and waiting-for-connection states.",
-            "Added Unity asset-aware icons for Markdown references, asset chips, file trees, and Git change lists.",
-            "Added compact vector and quaternion display in Unity inspector diffs, including Euler/Quaternion switching.",
-            "Added a display setting for merging Git tree status into colored file icons."
+            "Added `unity_yaml_list` and `unity_yaml_search` for inspecting Unity scene and prefab hierarchies before reading object detail.",
+            "Added richer `unity_yaml_read` detail modes for live Editor reads, prefab overrides, serialized fields, and duplicate-safe object paths.",
+            "Added chat transcript controls for hiding completed thinking blocks and preserving the actual order of thinking, tool calls, and streamed text.",
+            "Added broader Markdown and chat asset reference handling for Unity, workspace, and `ProjectSettings` paths."
           ]
         },
         {
           "title": "Fixed",
           "items": [
-            "File changes now default to tree view and show Locus-managed folder badges in staging and commit detail trees.",
-            "Cancelled assistant runs preserve interrupted streamed text and thinking content when a partial response exists.",
-            "Knowledge tools now require `.md` suffixes for document paths and directory paths for directory operations.",
-            "Built-in skills now resolve correctly from nested `skill/builtin/` paths, including legacy app skill selections.",
-            "Knowledge catalog storage source labels now separate project and app built-in documents.",
-            "The main app theme now defaults to dark.",
-            "Roslyn bundle generation now writes through an isolated output directory and cleans transient ILRepack artifacts.",
-            "NSIS updates clean legacy root-level built-in skill files after the built-in skill move."
-          ]
-        },
-        {
-          "title": "Removed",
-          "items": [
-            "Removed the legacy `scope` field from knowledge catalog indexing and tool-facing document metadata.",
-            "Removed root-level bundled skill file paths in favor of `skill/builtin/`."
+            "Fixed custom endpoint reasoning configuration so OpenAI Chat, OpenAI Responses, and Anthropic-compatible endpoints can send the correct reasoning parameter format and expose supported effort levels.",
+            "Reconciled loaded asset databases on startup and workspace switch so stale reference graph rows, same-path GUID conflicts, size/hash changes, and script cascades are detected.",
+            "Kept the Unity embedded WebView alive during Unity domain reloads, with delayed cleanup for transient reload closes.",
+            "Updated Knowledge lexical rebuild progress to use pushed status events instead of polling.",
+            "Cached debug mode state in Settings so remounted settings panels keep the correct toggle state.",
+            "Locked chat file-change undo while an undo operation is already running.",
+            "Improved subagent and Unity recompile tool-call waiting states."
           ]
         }
       ],

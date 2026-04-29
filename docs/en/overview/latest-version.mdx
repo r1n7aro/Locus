@@ -1,9 +1,9 @@
 ---
 title: "Latest Version"
-description: "Locus v0.2.2 (2026-04-28)"
+description: "Locus v0.2.3 (2026-04-29)"
 sidebarTitle: "Latest Version"
-version: "0.2.2"
-releasedAt: "2026-04-28"
+version: "0.2.3"
+releasedAt: "2026-04-29"
 channel: "stable"
 updateTitle: "Update available"
 changelogUrl: "/en/overview/latest-version"
@@ -17,25 +17,17 @@ changelogUrl: "/en/overview/latest-version"
 
 ### Added
 
-- Added Unity runtime profiler helpers for `unity_run_states`, including metric sampling, spike capture, profiler frame export, CSV output, and JSON summaries.
-- Added a built-in profiler skill at `skill/builtin/profiler.md`.
-- Added Unity project launch from the chat Unity status popover, with launching and waiting-for-connection states.
-- Added Unity asset-aware icons for Markdown references, asset chips, file trees, and Git change lists.
-- Added compact vector and quaternion display in Unity inspector diffs, including Euler/Quaternion switching.
-- Added a display setting for merging Git tree status into colored file icons.
+- Added `unity_yaml_list` and `unity_yaml_search` for inspecting Unity scene and prefab hierarchies before reading object detail.
+- Added richer `unity_yaml_read` detail modes for live Editor reads, prefab overrides, serialized fields, and duplicate-safe object paths.
+- Added chat transcript controls for hiding completed thinking blocks and preserving the actual order of thinking, tool calls, and streamed text.
+- Added broader Markdown and chat asset reference handling for Unity, workspace, and `ProjectSettings` paths.
 
 ### Fixed
 
-- File changes now default to tree view and show Locus-managed folder badges in staging and commit detail trees.
-- Cancelled assistant runs preserve interrupted streamed text and thinking content when a partial response exists.
-- Knowledge tools now require `.md` suffixes for document paths and directory paths for directory operations.
-- Built-in skills now resolve correctly from nested `skill/builtin/` paths, including legacy app skill selections.
-- Knowledge catalog storage source labels now separate project and app built-in documents.
-- The main app theme now defaults to dark.
-- Roslyn bundle generation now writes through an isolated output directory and cleans transient ILRepack artifacts.
-- NSIS updates clean legacy root-level built-in skill files after the built-in skill move.
-
-### Removed
-
-- Removed the legacy `scope` field from knowledge catalog indexing and tool-facing document metadata.
-- Removed root-level bundled skill file paths in favor of `skill/builtin/`.
+- Fixed custom endpoint reasoning configuration so OpenAI Chat, OpenAI Responses, and Anthropic-compatible endpoints can send the correct reasoning parameter format and expose supported effort levels.
+- Reconciled loaded asset databases on startup and workspace switch so stale reference graph rows, same-path GUID conflicts, size/hash changes, and script cascades are detected.
+- Kept the Unity embedded WebView alive during Unity domain reloads, with delayed cleanup for transient reload closes.
+- Updated Knowledge lexical rebuild progress to use pushed status events instead of polling.
+- Cached debug mode state in Settings so remounted settings panels keep the correct toggle state.
+- Locked chat file-change undo while an undo operation is already running.
+- Improved subagent and Unity recompile tool-call waiting states.
