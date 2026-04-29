@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tauri::{AppHandle, Emitter};
 use walkdir::WalkDir;
 
 use crate::knowledge_store::{
@@ -49,6 +50,7 @@ const UNITY_IMPORT_BULK_MAX_DOCS_PER_COMMIT: usize = 1024;
 const UNITY_IMPORT_BULK_MAX_CHUNKS_PER_COMMIT: usize = 8192;
 const KNOWLEDGE_RUNTIME_LOCK_RETRY_ATTEMPTS: usize = 20;
 const KNOWLEDGE_RUNTIME_LOCK_RETRY_DELAY_MS: u64 = 50;
+pub const KNOWLEDGE_LEXICAL_REBUILD_STATUS_EVENT: &str = "knowledge-lexical-rebuild-status";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -164,6 +166,7 @@ pub struct KnowledgeIndexState {
     embedding_mgr: RwLock<Arc<tokio::sync::Mutex<EmbeddingManager>>>,
     embedding_status: RwLock<Arc<StdMutex<EmbeddingStatus>>>,
     lexical_rebuild_status: RwLock<Arc<StdMutex<LexicalRebuildStatus>>>,
+    app_handle: Option<AppHandle>,
     embedding_download_cancel_requested: Arc<AtomicBool>,
     catalog_bootstrapped_workspaces: Arc<tokio::sync::Mutex<HashSet<String>>>,
 }
@@ -182,6 +185,24 @@ impl KnowledgeIndexState {
         tantivy_inst: KnowledgeTantivyIndex,
         embedding_mgr: EmbeddingManager,
     ) -> Self {
+        Self::new_with_optional_app_handle(db_inst, tantivy_inst, embedding_mgr, None)
+    }
+
+    pub fn new_with_app_handle(
+        db_inst: KnowledgeDb,
+        tantivy_inst: KnowledgeTantivyIndex,
+        embedding_mgr: EmbeddingManager,
+        app_handle: AppHandle,
+    ) -> Self {
+        Self::new_with_optional_app_handle(db_inst, tantivy_inst, embedding_mgr, Some(app_handle))
+    }
+
+    fn new_with_optional_app_handle(
+        db_inst: KnowledgeDb,
+        tantivy_inst: KnowledgeTantivyIndex,
+        embedding_mgr: EmbeddingManager,
+        app_handle: Option<AppHandle>,
+    ) -> Self {
         let embedding_status = embedding_mgr.status();
         Self {
             db: RwLock::new(Arc::new(db_inst)),
@@ -191,6 +212,7 @@ impl KnowledgeIndexState {
             lexical_rebuild_status: RwLock::new(Arc::new(StdMutex::new(
                 LexicalRebuildStatus::default(),
             ))),
+            app_handle,
             embedding_download_cancel_requested: Arc::new(AtomicBool::new(false)),
             catalog_bootstrapped_workspaces: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
         }
@@ -231,7 +253,15 @@ impl KnowledgeIndexState {
     }
 
     pub fn set_lexical_rebuild_status(&self, status: LexicalRebuildStatus) {
-        *self.lexical_rebuild_status.read().unwrap().lock().unwrap() = status;
+        *self.lexical_rebuild_status.read().unwrap().lock().unwrap() = status.clone();
+        if let Some(app_handle) = &self.app_handle {
+            if let Err(error) = app_handle.emit(KNOWLEDGE_LEXICAL_REBUILD_STATUS_EVENT, status) {
+                eprintln!(
+                    "[KnowledgeIndex] failed to emit {}: {}",
+                    KNOWLEDGE_LEXICAL_REBUILD_STATUS_EVENT, error
+                );
+            }
+        }
     }
 
     pub fn reset_embedding_download_cancel(&self) {

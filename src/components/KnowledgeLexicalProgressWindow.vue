@@ -4,8 +4,10 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { t } from "../i18n";
 import { normalizeAppError } from "../services/errors";
+import { getLocusRuntime, type RuntimeUnsubscribe } from "../services/locusRuntime";
 import { knowledgeGetLexicalRebuildStatus } from "../services/knowledge";
 import {
+  KNOWLEDGE_LEXICAL_REBUILD_STATUS_EVENT,
   KNOWLEDGE_LEXICAL_PROGRESS_WINDOW_TITLE,
 } from "../services/knowledgeLexicalProgressWindow";
 import type { LexicalRebuildStatus } from "../types";
@@ -15,18 +17,12 @@ type CloseReason = "success" | "error" | null;
 const appWindow = getCurrentWindow();
 const statusSnapshot = ref<LexicalRebuildStatus | null>(null);
 const closeReason = ref<CloseReason>(null);
-const pollError = ref("");
+const statusError = ref("");
 
-let pollTimer: ReturnType<typeof setTimeout> | null = null;
 let closeTimer: ReturnType<typeof setTimeout> | null = null;
 let closeRequestUnlisten: UnlistenFn | null = null;
+let statusUnlisten: RuntimeUnsubscribe | null = null;
 let allowWindowClose = false;
-
-function clearPollTimer() {
-  if (!pollTimer) return;
-  clearTimeout(pollTimer);
-  pollTimer = null;
-}
 
 function clearCloseTimer() {
   if (!closeTimer) return;
@@ -42,20 +38,13 @@ function formatPercent(value: number): string {
   return `${Math.round(value * 100)}%`;
 }
 
-function schedulePoll(delay = 260) {
-  clearPollTimer();
-  pollTimer = setTimeout(() => {
-    pollTimer = null;
-    void refreshStatus();
-  }, delay);
-}
-
 async function destroyWindow() {
-  clearPollTimer();
   clearCloseTimer();
   allowWindowClose = true;
   closeRequestUnlisten?.();
   closeRequestUnlisten = null;
+  statusUnlisten?.();
+  statusUnlisten = null;
   try {
     await appWindow.setClosable(true);
   } catch {
@@ -77,7 +66,6 @@ async function destroyWindow() {
 function scheduleAutoClose(reason: Exclude<CloseReason, null>) {
   if (closeReason.value === reason || closeTimer) return;
   closeReason.value = reason;
-  clearPollTimer();
   closeTimer = setTimeout(() => {
     closeTimer = null;
     void destroyWindow();
@@ -103,32 +91,32 @@ function stageLabel(stage: string | null | undefined): string {
   }
 }
 
-async function refreshStatus() {
+function applyStatus(nextStatus: LexicalRebuildStatus) {
+  statusSnapshot.value = nextStatus;
+  statusError.value = "";
+
+  if (nextStatus.running) {
+    closeReason.value = null;
+    clearCloseTimer();
+    return;
+  }
+
+  if (nextStatus.stage === "completed") {
+    scheduleAutoClose("success");
+    return;
+  }
+
+  if (nextStatus.stage === "error" || nextStatus.error) {
+    scheduleAutoClose("error");
+  }
+}
+
+async function loadInitialStatus() {
   try {
     const nextStatus = await knowledgeGetLexicalRebuildStatus();
-    statusSnapshot.value = nextStatus;
-    pollError.value = "";
-
-    if (nextStatus.running) {
-      closeReason.value = null;
-      schedulePoll();
-      return;
-    }
-
-    if (nextStatus.stage === "completed") {
-      scheduleAutoClose("success");
-      return;
-    }
-
-    if (nextStatus.stage === "error" || nextStatus.error) {
-      scheduleAutoClose("error");
-      return;
-    }
-
-    schedulePoll(520);
+    applyStatus(nextStatus);
   } catch (cause) {
-    pollError.value = normalizeAppError(cause).message;
-    schedulePoll(800);
+    statusError.value = normalizeAppError(cause).message;
   }
 }
 
@@ -180,7 +168,7 @@ const statusHeading = computed(() => {
 const windowSubtitle = computed(() => {
   if (closeReason.value === "success") return t("knowledge.lexicalWindow.autoCloseSuccess");
   if (closeReason.value === "error") return t("knowledge.lexicalWindow.autoCloseError");
-  if (pollError.value) return pollError.value;
+  if (statusError.value) return statusError.value;
   return statusSnapshot.value?.detail?.trim() || t("knowledge.lexicalWindow.waiting");
 });
 const processedLabel = computed(() => {
@@ -213,10 +201,19 @@ async function initializeWindow() {
       event.preventDefault();
     });
   } catch {
-    // keep polling even if window hooks are unavailable
+    // keep status updates available even if close hooks are unavailable
   }
 
-  schedulePoll(120);
+  try {
+    statusUnlisten = await getLocusRuntime().subscribe<LexicalRebuildStatus>(
+      KNOWLEDGE_LEXICAL_REBUILD_STATUS_EVENT,
+      applyStatus,
+    );
+  } catch {
+    // initial status still renders if event subscription is unavailable
+  }
+
+  await loadInitialStatus();
 }
 
 onMounted(() => {
@@ -224,9 +221,9 @@ onMounted(() => {
 });
 
 onUnmounted(() => {
-  clearPollTimer();
   clearCloseTimer();
   closeRequestUnlisten?.();
+  statusUnlisten?.();
 });
 </script>
 

@@ -254,8 +254,9 @@ function mountKnowledgeState(props: KnowledgeStateProps) {
   const app = testRenderer.createApp(Root);
   app.mount({ children: [] });
   if (!state) throw new Error("useKnowledgeState did not mount");
+  const mountedState = state as ReturnType<typeof useKnowledgeState>;
   return {
-    state,
+    state: mountedState,
     unmount: () => app.unmount(),
   };
 }
@@ -985,6 +986,43 @@ describe("useKnowledgeState", () => {
       id: "Qwen/Qwen3-Embedding-4B",
       downloaded: false,
     });
+  });
+
+  it("updates lexical rebuild status from the backend event", async () => {
+    const mounted = mountKnowledgeState(
+      reactive({
+        workingDir: "F:/repo",
+        selectedModelId: "",
+        modelDefaults: {} as any,
+      }),
+    );
+    await flushPromises(8);
+    knowledgeMocks.knowledgeGetLexicalRebuildStatus.mockClear();
+
+    emitTauriEvent("knowledge-lexical-rebuild-status", {
+      running: true,
+      stage: "indexing",
+      detail: "Indexing docs",
+      currentFile: "design/a.md",
+      progress: 0.42,
+      processedDocs: 42,
+      totalDocs: 100,
+      error: null,
+      startedAt: "2026-04-16T00:00:00Z",
+      completedAt: null,
+    });
+    await nextTick();
+
+    expect(mounted.state.lexicalRebuildStatus.value).toMatchObject({
+      running: true,
+      stage: "indexing",
+      progress: 0.42,
+    });
+    expect(
+      knowledgeMocks.knowledgeGetLexicalRebuildStatus,
+    ).not.toHaveBeenCalled();
+
+    mounted.unmount();
   });
 
   it("updates the embedding device policy through the shared config save path", async () => {

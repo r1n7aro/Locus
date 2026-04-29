@@ -5,6 +5,7 @@ export const KNOWLEDGE_LEXICAL_PROGRESS_WINDOW_LABEL = "knowledge-lexical-progre
 export const KNOWLEDGE_LEXICAL_PROGRESS_WINDOW_PATH = "/knowledge-lexical-progress";
 export const KNOWLEDGE_LEXICAL_PROGRESS_WINDOW_FLAG = "knowledgeLexicalProgress";
 export const KNOWLEDGE_LEXICAL_PROGRESS_WINDOW_TITLE = "Locus Full-Text Index";
+export const KNOWLEDGE_LEXICAL_REBUILD_STATUS_EVENT = "knowledge-lexical-rebuild-status";
 export const LARGE_LEXICAL_REBUILD_DOC_THRESHOLD = 128;
 
 export function isKnowledgeLexicalProgressWindowLocation(

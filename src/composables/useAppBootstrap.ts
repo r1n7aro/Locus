@@ -31,7 +31,6 @@ import {
 } from "../services/git";
 import { assetDbOverview, getWatcherTuning } from "../services/asset";
 import {
-  knowledgeGetLexicalRebuildStatus,
   knowledgeListPage,
 } from "../services/knowledge";
 import { listAgents, listSubagentDefs } from "../services/agent";
@@ -40,12 +39,14 @@ import type {
   AssetDbScanEvent,
   PluginStatus,
   AppErrorPayload,
+  LexicalRebuildStatus,
 } from "../types";
 import { filterVisibleProviders } from "../config/providerVisibility";
 import { t } from "../i18n";
 import {
   getKnowledgeLexicalProgressRunKey,
   isKnowledgeLexicalProgressWindowLocation,
+  KNOWLEDGE_LEXICAL_REBUILD_STATUS_EVENT,
   openKnowledgeLexicalProgressWindow,
   shouldAutoOpenKnowledgeLexicalProgressWindow,
 } from "../services/knowledgeLexicalProgressWindow";
@@ -66,8 +67,7 @@ export function useAppBootstrap() {
   let unlistenScan: RuntimeUnsubscribe | null = null;
   let unlistenPlugin: RuntimeUnsubscribe | null = null;
   let unlistenAppError: RuntimeUnsubscribe | null = null;
-  let lexicalProgressPollTimer: ReturnType<typeof setTimeout> | null = null;
-  let lexicalProgressPollInFlight = false;
+  let unlistenLexicalRebuildStatus: RuntimeUnsubscribe | null = null;
   let lastAutoOpenedLexicalProgressRun = "";
 
   // -- Cross-domain watchers --
@@ -240,26 +240,10 @@ export function useAppBootstrap() {
     });
   }
 
-  function clearLexicalProgressPoll() {
-    if (!lexicalProgressPollTimer) return;
-    clearTimeout(lexicalProgressPollTimer);
-    lexicalProgressPollTimer = null;
-  }
-
-  function scheduleLexicalProgressPoll(delay = 700) {
-    if (isKnowledgeLexicalProgressWindowLocation()) return;
-    clearLexicalProgressPoll();
-    lexicalProgressPollTimer = setTimeout(() => {
-      lexicalProgressPollTimer = null;
-      void pollLexicalProgressWindowState();
-    }, delay);
-  }
-
-  async function maybeOpenLexicalProgressWindow() {
+  async function maybeOpenLexicalProgressWindow(status: LexicalRebuildStatus) {
     if (!projectStore.workingDir.trim()) return;
     if (isKnowledgeLexicalProgressWindowLocation()) return;
 
-    const status = await knowledgeGetLexicalRebuildStatus();
     const runKey = getKnowledgeLexicalProgressRunKey(status);
     if (!runKey) {
       lastAutoOpenedLexicalProgressRun = "";
@@ -271,23 +255,6 @@ export function useAppBootstrap() {
 
     lastAutoOpenedLexicalProgressRun = runKey;
     await openKnowledgeLexicalProgressWindow(status);
-  }
-
-  async function pollLexicalProgressWindowState() {
-    if (lexicalProgressPollInFlight) {
-      scheduleLexicalProgressPoll(500);
-      return;
-    }
-
-    lexicalProgressPollInFlight = true;
-    try {
-      await maybeOpenLexicalProgressWindow();
-    } catch {
-      // Ignore transient status read failures and retry on the next tick.
-    } finally {
-      lexicalProgressPollInFlight = false;
-      scheduleLexicalProgressPoll();
-    }
   }
 
   // -- Warmup functions (idempotent, reusable promise) --
@@ -410,12 +377,17 @@ export function useAppBootstrap() {
         operation: payload.operation,
       });
     });
+    unlistenLexicalRebuildStatus = await runtime.subscribe<LexicalRebuildStatus>(
+      KNOWLEDGE_LEXICAL_REBUILD_STATUS_EVENT,
+      (status) => {
+        void maybeOpenLexicalProgressWindow(status);
+      },
+    );
 
     // Initial Unity/AssetDb state
     await projectStore.checkUnityConnection();
     await projectStore.checkUnityPlugin();
     await projectStore.loadAssetDbStatus();
-    scheduleLexicalProgressPoll(180);
   }
 
   function cleanup() {
@@ -424,8 +396,7 @@ export function useAppBootstrap() {
     unlistenScan?.();
     unlistenPlugin?.();
     unlistenAppError?.();
-    clearLexicalProgressPoll();
-    lexicalProgressPollInFlight = false;
+    unlistenLexicalRebuildStatus?.();
     lastAutoOpenedLexicalProgressRun = "";
     resetSystemNotificationState();
     uiStore.cleanup();

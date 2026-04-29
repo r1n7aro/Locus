@@ -125,6 +125,7 @@ vi.mock("../services/knowledge", () => ({
 vi.mock("../services/knowledgeLexicalProgressWindow", () => ({
   getKnowledgeLexicalProgressRunKey: vi.fn().mockReturnValue(""),
   isKnowledgeLexicalProgressWindowLocation: () => false,
+  KNOWLEDGE_LEXICAL_REBUILD_STATUS_EVENT: "knowledge-lexical-rebuild-status",
   openKnowledgeLexicalProgressWindow: vi.fn().mockResolvedValue(undefined),
   shouldAutoOpenKnowledgeLexicalProgressWindow: vi.fn().mockReturnValue(false),
 }));
@@ -296,84 +297,87 @@ describe("useAppBootstrap onboarding completion", () => {
   });
 
   it("auto-opens the lexical progress window only once per rebuild run", async () => {
-    vi.useFakeTimers();
+    projectStoreMock.workingDir = "F:/Project";
 
-    try {
-      projectStoreMock.workingDir = "F:/Project";
+    const eventModule = await import("@tauri-apps/api/event");
+    const knowledgeModule = await import("../services/knowledge");
+    const progressWindowModule =
+      await import("../services/knowledgeLexicalProgressWindow");
+    const handlers = new Map<string, (event: { payload: any }) => void>();
 
-      const eventModule = await import("@tauri-apps/api/event");
-      const knowledgeModule = await import("../services/knowledge");
-      const progressWindowModule =
-        await import("../services/knowledgeLexicalProgressWindow");
-
+    (
+      eventModule.listen as unknown as ReturnType<typeof vi.fn>
+    ).mockImplementation(
+      async (name: string, handler: (event: { payload: any }) => void) => {
+        handlers.set(name, handler);
+        return vi.fn();
+      },
+    );
+    (
+      progressWindowModule.shouldAutoOpenKnowledgeLexicalProgressWindow as unknown as ReturnType<
+        typeof vi.fn
+      >
+    ).mockReturnValue(true);
+    (
+      progressWindowModule.getKnowledgeLexicalProgressRunKey as unknown as ReturnType<
+        typeof vi.fn
+      >
+    ).mockImplementation(
       (
-        eventModule.listen as unknown as ReturnType<typeof vi.fn>
-      ).mockResolvedValue(vi.fn());
-      (
-        knowledgeModule.knowledgeGetLexicalRebuildStatus as unknown as ReturnType<
-          typeof vi.fn
-        >
-      )
-        .mockResolvedValueOnce({
-          running: true,
-          stage: "preparing",
-          detail: "Preparing docs",
-          currentFile: null,
-          processedDocs: 24,
-          totalDocs: 4096,
-          error: null,
-          startedAt: "2026-04-16T00:00:00Z",
-          completedAt: null,
-        })
-        .mockResolvedValueOnce({
-          running: true,
-          stage: "committing",
-          detail: "Committing docs",
-          currentFile: null,
-          processedDocs: 4096,
-          totalDocs: 4096,
-          error: null,
-          startedAt: "2026-04-16T00:00:00Z",
-          completedAt: null,
-        });
-      (
-        progressWindowModule.shouldAutoOpenKnowledgeLexicalProgressWindow as unknown as ReturnType<
-          typeof vi.fn
-        >
-      ).mockReturnValue(true);
-      (
-        progressWindowModule.getKnowledgeLexicalProgressRunKey as unknown as ReturnType<
-          typeof vi.fn
-        >
-      ).mockImplementation(
-        (
-          status:
-            | { running?: boolean; startedAt?: string | null }
-            | null
-            | undefined,
-        ) => (status?.running ? (status.startedAt ?? "active") : ""),
-      );
+        status:
+          | { running?: boolean; startedAt?: string | null }
+          | null
+          | undefined,
+      ) => (status?.running ? (status.startedAt ?? "active") : ""),
+    );
 
-      const useAppBootstrap = await loadUseAppBootstrap();
-      const { registerListeners, cleanup } = useAppBootstrap();
-      await registerListeners();
+    const useAppBootstrap = await loadUseAppBootstrap();
+    const { registerListeners, cleanup } = useAppBootstrap();
+    await registerListeners();
 
-      vi.advanceTimersByTime(180);
-      await Promise.resolve();
-      expect(
-        progressWindowModule.openKnowledgeLexicalProgressWindow,
-      ).toHaveBeenCalledTimes(1);
+    const lexicalStatusHandler = handlers.get("knowledge-lexical-rebuild-status");
+    expect(lexicalStatusHandler).toBeTypeOf("function");
+    expect(
+      knowledgeModule.knowledgeGetLexicalRebuildStatus,
+    ).not.toHaveBeenCalled();
 
-      vi.advanceTimersByTime(700);
-      await Promise.resolve();
-      expect(
-        progressWindowModule.openKnowledgeLexicalProgressWindow,
-      ).toHaveBeenCalledTimes(1);
+    lexicalStatusHandler?.({
+      payload: {
+        running: true,
+        stage: "preparing",
+        detail: "Preparing docs",
+        currentFile: null,
+        processedDocs: 24,
+        totalDocs: 4096,
+        error: null,
+        startedAt: "2026-04-16T00:00:00Z",
+        completedAt: null,
+      },
+    });
+    await Promise.resolve();
+    expect(
+      progressWindowModule.openKnowledgeLexicalProgressWindow,
+    ).toHaveBeenCalledTimes(1);
 
-      cleanup();
-    } finally {
-      vi.useRealTimers();
-    }
+    lexicalStatusHandler?.({
+      payload: {
+        running: true,
+        stage: "committing",
+        detail: "Committing docs",
+        currentFile: null,
+        processedDocs: 4096,
+        totalDocs: 4096,
+        error: null,
+        startedAt: "2026-04-16T00:00:00Z",
+        completedAt: null,
+      },
+    });
+    await Promise.resolve();
+    expect(
+      progressWindowModule.openKnowledgeLexicalProgressWindow,
+    ).toHaveBeenCalledTimes(1);
+
+    cleanup();
   });
 
   it("dispatches system notifications only after the chat store accepts a stream event", async () => {

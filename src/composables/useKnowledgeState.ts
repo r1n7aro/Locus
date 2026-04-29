@@ -71,6 +71,7 @@ import { acquireSelectionLock } from "./useSelectionLock";
 import { openKnowledgeDownloadProgressWindow } from "../services/knowledgeDownloadWindow";
 import { openFeishuReferenceImportProgressWindow } from "../services/feishuReferenceImportWindow";
 import { openUnityReferenceImportProgressWindow } from "../services/unityReferenceImportWindow";
+import { KNOWLEDGE_LEXICAL_REBUILD_STATUS_EVENT } from "../services/knowledgeLexicalProgressWindow";
 import {
   buildKnowledgeCreateDefaults,
   defaultSummaryEnabledForType,
@@ -540,6 +541,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
   let pendingSaveCount = 0;
   let releaseSelectionLock: (() => void) | null = null;
   let knowledgeChangedUnlisten: UnlistenFn | null = null;
+  let lexicalRebuildStatusUnlisten: UnlistenFn | null = null;
   let destroyed = false;
   let loadedDirectoryDocumentPaths = emptyLoadedDirectoryDocumentPaths();
   let loadedDocumentTypes = new Set<KnowledgeDocumentType>();
@@ -787,23 +789,27 @@ export function useKnowledgeState(props: KnowledgeProps) {
     const request = captureWorkspaceRequest();
     if (!request.workspaceKey) return;
     try {
-      const [nextEmbeddingStatus, nextLexicalStatus] = await Promise.all([
-        knowledgeGetEmbeddingStatus(),
-        knowledgeGetLexicalRebuildStatus(),
-      ]);
+      const nextEmbeddingStatus = await knowledgeGetEmbeddingStatus();
       if (!isCurrentWorkspaceRequest(request)) return;
       embeddingStatus.value = nextEmbeddingStatus;
-      lexicalRebuildStatus.value = nextLexicalStatus;
-      if (
-        retrievalActionPending.value ||
-        nextEmbeddingStatus.activating ||
-        nextLexicalStatus.running
-      ) {
+      if (retrievalActionPending.value || nextEmbeddingStatus.activating) {
         scheduleRetrievalStatusPoll();
       }
     } catch {
       if (!isCurrentWorkspaceRequest(request)) return;
       stopRetrievalStatusPoll();
+    }
+  }
+
+  function handleLexicalRebuildStatus(nextStatus: LexicalRebuildStatus) {
+    if (!hasWorkspace.value) return;
+    lexicalRebuildStatus.value = nextStatus;
+    if (nextStatus.running) return;
+    if (nextStatus.stage === "completed" || nextStatus.stage === "error") {
+      if (!embeddingStatus.value?.activating) {
+        stopRetrievalStatusPoll();
+      }
+      void loadOverview();
     }
   }
 
@@ -1819,7 +1825,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
       unityReferenceImportStatus.value = nextUnityReferenceImportStatus;
       unityReferenceImportPending.value =
         nextUnityReferenceImportStatus.running;
-      if (nextEmbeddingStatus.activating || nextLexicalStatus.running) {
+      if (nextEmbeddingStatus.activating) {
         scheduleRetrievalStatusPoll();
       } else {
         stopRetrievalStatusPoll();
@@ -2313,10 +2319,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
       )(cause);
     } finally {
       retrievalActionPending.value = false;
-      if (
-        !embeddingStatus.value?.activating &&
-        !lexicalRebuildStatus.value?.running
-      ) {
+      if (!embeddingStatus.value?.activating) {
         stopRetrievalStatusPoll();
       }
     }
@@ -2409,10 +2412,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
       notifyError("knowledge_save_embedding_config", cause);
     } finally {
       retrievalActionPending.value = false;
-      if (
-        !embeddingStatus.value?.activating &&
-        !lexicalRebuildStatus.value?.running
-      ) {
+      if (!embeddingStatus.value?.activating) {
         stopRetrievalStatusPoll();
       }
     }
@@ -2429,10 +2429,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
       notifyEmbeddingRuntimeError(cause);
     } finally {
       retrievalActionPending.value = false;
-      if (
-        !embeddingStatus.value?.activating &&
-        !lexicalRebuildStatus.value?.running
-      ) {
+      if (!embeddingStatus.value?.activating) {
         stopRetrievalStatusPoll();
       }
     }
@@ -2454,7 +2451,6 @@ export function useKnowledgeState(props: KnowledgeProps) {
   async function rebuildLexicalIndex() {
     retrievalActionPending.value = true;
     error.value = "";
-    scheduleRetrievalStatusPoll(120);
     try {
       await knowledgeRebuildLexicalIndex();
       await loadOverview();
@@ -2462,10 +2458,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
       notifyError("knowledge_rebuild_lexical_index", cause);
     } finally {
       retrievalActionPending.value = false;
-      if (
-        !embeddingStatus.value?.activating &&
-        !lexicalRebuildStatus.value?.running
-      ) {
+      if (!embeddingStatus.value?.activating) {
         stopRetrievalStatusPoll();
       }
     }
@@ -2591,10 +2584,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
       );
     } finally {
       retrievalActionPending.value = false;
-      if (
-        !embeddingStatus.value?.activating &&
-        !lexicalRebuildStatus.value?.running
-      ) {
+      if (!embeddingStatus.value?.activating) {
         stopRetrievalStatusPoll();
       }
     }
@@ -3416,12 +3406,20 @@ export function useKnowledgeState(props: KnowledgeProps) {
         scheduleExternalRefresh(event.payload);
       },
     );
+    const releaseLexicalRebuildStatus = await listen<LexicalRebuildStatus>(
+      KNOWLEDGE_LEXICAL_REBUILD_STATUS_EVENT,
+      (event) => {
+        handleLexicalRebuildStatus(event.payload);
+      },
+    );
 
     if (destroyed) {
       release();
+      releaseLexicalRebuildStatus();
       return;
     }
     knowledgeChangedUnlisten = release;
+    lexicalRebuildStatusUnlisten = releaseLexicalRebuildStatus;
   });
 
   onUnmounted(() => {
@@ -3432,6 +3430,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
     stopFeishuReferenceStatusPoll();
     stopUnityReferenceStatusPoll();
     knowledgeChangedUnlisten?.();
+    lexicalRebuildStatusUnlisten?.();
     endExplorerDrag();
   });
 

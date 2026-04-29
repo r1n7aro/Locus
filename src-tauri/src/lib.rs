@@ -300,10 +300,11 @@ pub fn run() {
                 knowledge_index::KnowledgeRuntime::open(&knowledge_library_dir, &data_dir)
                     .map_err(|e| format!("Failed to initialize knowledge index runtime: {}", e))?;
             let knowledge_index_state: Arc<knowledge_index::KnowledgeIndexState> =
-                Arc::new(knowledge_index::KnowledgeIndexState::new(
+                Arc::new(knowledge_index::KnowledgeIndexState::new_with_app_handle(
                     knowledge_runtime.db,
                     knowledge_runtime.tantivy,
                     knowledge_runtime.embedding_mgr,
+                    app.handle().clone(),
                 ));
             let unity_reference_import_state = unity_docs::UnityReferenceImportState::default();
             let feishu_reference_import_state = feishu_docs::FeishuReferenceImportState::default();
