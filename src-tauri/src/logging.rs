@@ -154,10 +154,10 @@ impl AppLogStore {
 pub fn init_tracing(debug_flag: Arc<std::sync::atomic::AtomicBool>, log_store: Arc<AppLogStore>) {
     let stderr_filter = tracing_subscriber::filter::filter_fn({
         let debug_flag = debug_flag.clone();
-        move |metadata| allow_level(metadata.level(), &debug_flag)
+        move |metadata| allow_level(metadata.level(), metadata.target(), &debug_flag)
     });
     let capture_filter = tracing_subscriber::filter::filter_fn(move |metadata| {
-        allow_level(metadata.level(), &debug_flag)
+        allow_level(metadata.level(), metadata.target(), &debug_flag)
     });
 
     let stderr_layer = tracing_subscriber::fmt::layer()
@@ -195,12 +195,22 @@ pub fn prepare_print(
     )
 }
 
-fn allow_level(level: &Level, debug_flag: &std::sync::atomic::AtomicBool) -> bool {
+fn allow_level(level: &Level, target: &str, debug_flag: &std::sync::atomic::AtomicBool) -> bool {
     if debug_flag.load(Ordering::Relaxed) {
-        true
+        !is_third_party_trace(level, target)
     } else {
         !matches!(*level, Level::DEBUG | Level::TRACE)
     }
+}
+
+fn is_third_party_trace(level: &Level, target: &str) -> bool {
+    matches!(*level, Level::TRACE) && !is_app_target(target)
+}
+
+fn is_app_target(target: &str) -> bool {
+    matches!(target, "locus" | "locus_lib")
+        || target.starts_with("locus::")
+        || target.starts_with("locus_lib::")
 }
 
 fn normalize_level(level: Level) -> &'static str {
@@ -357,7 +367,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_print_level, extract_bracket_prefix, normalize_module_and_message};
+    use super::{
+        allow_level, classify_print_level, extract_bracket_prefix, normalize_module_and_message,
+    };
+    use std::sync::atomic::AtomicBool;
     use tracing::Level;
 
     #[test]
@@ -392,5 +405,26 @@ mod tests {
             classify_print_level("queued changed Unity assets", true),
             Level::INFO
         );
+    }
+
+    #[test]
+    fn debug_mode_filters_third_party_trace() {
+        let debug_flag = AtomicBool::new(true);
+
+        assert!(!allow_level(
+            &Level::TRACE,
+            "tokenizers::tokenizer",
+            &debug_flag
+        ));
+        assert!(allow_level(
+            &Level::TRACE,
+            "locus_lib::knowledge_index",
+            &debug_flag
+        ));
+        assert!(allow_level(
+            &Level::DEBUG,
+            "tokenizers::tokenizer",
+            &debug_flag
+        ));
     }
 }
