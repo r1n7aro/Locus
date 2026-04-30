@@ -745,6 +745,7 @@ pub fn run() {
             commands::knowledge_download_local_embedding_model,
             commands::knowledge_cancel_local_embedding_model_download,
             commands::knowledge_close_download_progress_window,
+            commands::knowledge_close_lexical_progress_window,
             commands::knowledge_close_unity_reference_import_progress_window,
             commands::knowledge_close_feishu_reference_import_progress_window,
             commands::knowledge_inspect_local_embedding_model_directory,

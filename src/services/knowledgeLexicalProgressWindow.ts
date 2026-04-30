@@ -56,7 +56,7 @@ export async function openKnowledgeLexicalProgressWindow(
       minHeight: 360,
       decorations: false,
       resizable: false,
-      closable: false,
+      closable: true,
       minimizable: false,
       maximizable: false,
       parent: getCurrentWebviewWindow(),

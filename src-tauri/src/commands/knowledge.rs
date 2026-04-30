@@ -36,6 +36,7 @@ pub struct AppKnowledgeDir(pub Arc<Option<std::path::PathBuf>>);
 
 pub const KNOWLEDGE_CHANGED_EVENT: &str = "knowledge-changed";
 pub const KNOWLEDGE_DOWNLOAD_WINDOW_LABEL: &str = "knowledge-download-progress";
+pub const KNOWLEDGE_LEXICAL_PROGRESS_WINDOW_LABEL: &str = "knowledge-lexical-progress";
 pub const UNITY_REFERENCE_IMPORT_WINDOW_LABEL: &str = "unity-reference-import-progress";
 pub const FEISHU_REFERENCE_IMPORT_WINDOW_LABEL: &str = "feishu-reference-import-progress";
 const DEFAULT_KNOWLEDGE_PAGE_SIZE: usize = 200;
@@ -1407,6 +1408,26 @@ pub async fn knowledge_close_download_progress_window(
             format!("Failed to close download progress window: {}", error),
         )
     })?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn knowledge_close_lexical_progress_window(
+    app_handle: AppHandle,
+) -> Result<(), AppError> {
+    let Some(window) = app_handle.get_webview_window(KNOWLEDGE_LEXICAL_PROGRESS_WINDOW_LABEL)
+    else {
+        return Ok(());
+    };
+    window
+        .destroy()
+        .or_else(|_| window.close())
+        .map_err(|error| {
+            AppError::new(
+                "knowledge.lexical_window_close_failed",
+                format!("Failed to close lexical progress window: {}", error),
+            )
+        })?;
     Ok(())
 }
 

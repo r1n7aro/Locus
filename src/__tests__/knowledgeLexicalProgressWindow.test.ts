@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const webviewWindowMocks = vi.hoisted(() => ({
@@ -14,9 +16,17 @@ vi.mock("@tauri-apps/api/webviewWindow", () => ({
       webviewWindowMocks.createdWindows.push(args);
     }
 
-    once(..._args: unknown[]) {}
+    once(event: string, handler: () => void) {
+      if (event === "tauri://created") handler();
+    }
   },
 }));
+
+const cwd = process.cwd();
+
+function read(relPath: string) {
+  return readFileSync(resolve(cwd, relPath), "utf8");
+}
 
 import {
   LARGE_LEXICAL_REBUILD_DOC_THRESHOLD,
@@ -136,5 +146,41 @@ describe("knowledgeLexicalProgressWindow", () => {
 
     expect(existingWindow.setFocus).not.toHaveBeenCalled();
     expect(webviewWindowMocks.createdWindows).toHaveLength(0);
+  });
+
+  it("creates a closable frameless progress window", async () => {
+    webviewWindowMocks.getByLabelMock.mockResolvedValue(null);
+
+    await openKnowledgeLexicalProgressWindow();
+
+    expect(webviewWindowMocks.createdWindows).toHaveLength(1);
+    const [, options] = webviewWindowMocks.createdWindows[0] as [
+      string,
+      Record<string, unknown>,
+    ];
+    expect(options.decorations).toBe(false);
+    expect(options.closable).toBe(true);
+  });
+
+  it("uses a titlebar close action instead of duplicate progress text", () => {
+    const component = read("src/components/KnowledgeLexicalProgressWindow.vue");
+    const knowledgeService = read("src/services/knowledge.ts");
+    const tauriCommands = read("src-tauri/src/commands/knowledge.rs");
+    const capability = read("src-tauri/capabilities/default.json");
+
+    expect(component).toContain('class="lexical-window-close"');
+    expect(component).toContain('@click.stop="void requestWindowClose()"');
+    expect(component).toContain("await appWindow.destroy()");
+    expect(component).toContain("knowledgeCloseLexicalProgressWindow");
+    expect(component).not.toContain('class="lexical-window-titlebar-progress"');
+    expect(knowledgeService).toContain(
+      'ipcInvoke<void>("knowledge_close_lexical_progress_window")',
+    );
+    expect(tauriCommands).toContain("knowledge_close_lexical_progress_window");
+    expect(tauriCommands).toMatch(
+      /window\s*\.\s*destroy\(\)\s*\.\s*or_else\(\|_\|\s*window\.close\(\)\)/,
+    );
+    expect(capability).toContain('"core:window:allow-destroy"');
+    expect(capability).toContain('"core:window:allow-set-closable"');
   });
 });

@@ -1,16 +1,20 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from "vue";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import type { UnlistenFn } from "@tauri-apps/api/event";
+import { X } from "lucide";
 import { t } from "../i18n";
 import { normalizeAppError } from "../services/errors";
 import { getLocusRuntime, type RuntimeUnsubscribe } from "../services/locusRuntime";
-import { knowledgeGetLexicalRebuildStatus } from "../services/knowledge";
+import {
+  knowledgeCloseLexicalProgressWindow,
+  knowledgeGetLexicalRebuildStatus,
+} from "../services/knowledge";
 import {
   KNOWLEDGE_LEXICAL_REBUILD_STATUS_EVENT,
   KNOWLEDGE_LEXICAL_PROGRESS_WINDOW_TITLE,
 } from "../services/knowledgeLexicalProgressWindow";
 import type { LexicalRebuildStatus } from "../types";
+import LucideIcon from "./icons/LucideIcon.vue";
 
 type CloseReason = "success" | "error" | null;
 
@@ -20,9 +24,7 @@ const closeReason = ref<CloseReason>(null);
 const statusError = ref("");
 
 let closeTimer: ReturnType<typeof setTimeout> | null = null;
-let closeRequestUnlisten: UnlistenFn | null = null;
 let statusUnlisten: RuntimeUnsubscribe | null = null;
-let allowWindowClose = false;
 
 function clearCloseTimer() {
   if (!closeTimer) return;
@@ -40,9 +42,6 @@ function formatPercent(value: number): string {
 
 async function destroyWindow() {
   clearCloseTimer();
-  allowWindowClose = true;
-  closeRequestUnlisten?.();
-  closeRequestUnlisten = null;
   statusUnlisten?.();
   statusUnlisten = null;
   try {
@@ -51,15 +50,21 @@ async function destroyWindow() {
     // ignore unsupported close state changes on teardown
   }
   try {
-    await appWindow.close();
-    return;
+    await knowledgeCloseLexicalProgressWindow();
   } catch {
-    // fallback to destroy if close is unavailable
+    // fall back to local window handles when the command is unavailable
   }
   try {
     await appWindow.destroy();
+    return;
   } catch {
-    // ignore destroy failures on teardown
+    // fallback to close if destroy is unavailable
+  }
+  try {
+    await appWindow.close();
+    return;
+  } catch {
+    // ignore close failures on teardown
   }
 }
 
@@ -70,6 +75,10 @@ function scheduleAutoClose(reason: Exclude<CloseReason, null>) {
     closeTimer = null;
     void destroyWindow();
   }, reason === "success" ? 1200 : 2600);
+}
+
+async function requestWindowClose() {
+  await destroyWindow();
 }
 
 function stageLabel(stage: string | null | undefined): string {
@@ -190,18 +199,9 @@ async function initializeWindow() {
     // ignore unsupported title updates
   }
   try {
-    await appWindow.setClosable(false);
+    await appWindow.setClosable(true);
   } catch {
     // ignore unsupported close state changes
-  }
-
-  try {
-    closeRequestUnlisten = await appWindow.onCloseRequested((event) => {
-      if (allowWindowClose) return;
-      event.preventDefault();
-    });
-  } catch {
-    // keep status updates available even if close hooks are unavailable
   }
 
   try {
@@ -222,7 +222,6 @@ onMounted(() => {
 
 onUnmounted(() => {
   clearCloseTimer();
-  closeRequestUnlisten?.();
   statusUnlisten?.();
 });
 </script>
@@ -231,7 +230,17 @@ onUnmounted(() => {
   <div class="lexical-window-root">
     <div class="lexical-window-titlebar">
       <div class="lexical-window-titlebar-label">{{ KNOWLEDGE_LEXICAL_PROGRESS_WINDOW_TITLE }}</div>
-      <div class="lexical-window-titlebar-progress">{{ progressLabel }}</div>
+      <button
+        class="lexical-window-close"
+        type="button"
+        :aria-label="t('common.close')"
+        :title="t('common.close')"
+        @pointerdown.stop
+        @mousedown.stop
+        @click.stop="void requestWindowClose()"
+      >
+        <LucideIcon :icon="X" :size="14" />
+      </button>
     </div>
 
     <div class="lexical-window-body-shell">
@@ -302,10 +311,35 @@ onUnmounted(() => {
   color: var(--text-color);
 }
 
-.lexical-window-titlebar-progress {
-  font-size: 11px;
-  font-weight: 600;
+.lexical-window-close {
+  -webkit-app-region: no-drag;
+  width: 28px;
+  height: 28px;
+  flex-shrink: 0;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
   color: var(--text-secondary);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.lexical-window-close:hover {
+  background: var(--hover-bg);
+  color: var(--text-color);
+}
+
+.lexical-window-close:focus-visible {
+  outline: 1px solid var(--accent-color);
+  outline-offset: 1px;
+}
+
+.lexical-window-close,
+.lexical-window-close * {
+  -webkit-app-region: no-drag;
 }
 
 .lexical-window-body-shell {

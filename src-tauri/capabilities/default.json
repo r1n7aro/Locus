@@ -22,10 +22,12 @@
     "core:window:allow-set-background-color",
     "core:webview:allow-set-webview-focus",
     "core:window:allow-set-always-on-top",
+    "core:window:allow-set-closable",
     "core:window:allow-minimize",
     "core:window:allow-toggle-maximize",
     "core:window:allow-is-maximized",
     "core:window:allow-close",
+    "core:window:allow-destroy",
     "opener:default",
     {
       "identifier": "opener:allow-open-path",

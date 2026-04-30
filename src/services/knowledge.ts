@@ -463,6 +463,10 @@ export function knowledgeCloseDownloadProgressWindow(): Promise<void> {
   return ipcInvoke<void>("knowledge_close_download_progress_window");
 }
 
+export function knowledgeCloseLexicalProgressWindow(): Promise<void> {
+  return ipcInvoke<void>("knowledge_close_lexical_progress_window");
+}
+
 export function knowledgeCloseUnityReferenceImportProgressWindow(): Promise<void> {
   return ipcInvoke<void>(
     "knowledge_close_unity_reference_import_progress_window",

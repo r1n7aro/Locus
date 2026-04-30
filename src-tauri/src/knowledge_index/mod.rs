@@ -2144,8 +2144,6 @@ where
     let mut doc_ids: HashSet<String> = documents.iter().map(|doc| doc.id.clone()).collect();
     doc_ids.extend(reuse_decision.retained_doc_ids.iter().cloned());
     let existing_states = db.list_all_index_states()?;
-    let lexical_progress_candidate = progress_tracks_all_work
-        || should_surface_lexical_rebuild(false, preparation_total + existing_states.len());
     let mut surface_progress = progress_tracks_all_work;
     if surface_progress {
         on_rebuild_progress("preparing", 0, preparation_total, None);
@@ -2193,15 +2191,7 @@ where
             force_lexical_sync,
             parallelize_prepare_analysis,
         )?;
-        let batch_has_lexical_sync = analyzed.iter().any(|analysis| analysis.lexical_sync);
-
         scanned += batch.len();
-        if !surface_progress
-            && lexical_progress_candidate
-            && (batch_has_lexical_sync || !removed_lexical_doc_ids.is_empty())
-        {
-            surface_progress = true;
-        }
         if surface_progress && should_emit_prepare_progress(scanned, preparation_total) {
             on_rebuild_progress("preparing", scanned, preparation_total, current_file);
         }
@@ -2261,9 +2251,9 @@ where
     } else {
         lexical_total
     };
-    if !surface_progress && lexical_progress_candidate && callback_total > 0 {
+    if !surface_progress && should_surface_lexical_rebuild(false, callback_total) {
         surface_progress = true;
-        on_rebuild_progress("preparing", preparation_total, preparation_total, None);
+        on_rebuild_progress("preparing", callback_total, callback_total, None);
     }
 
     if !removed_lexical_doc_ids.is_empty() {
@@ -4378,7 +4368,7 @@ mod tests {
         list_cached_documents, needs_embedding_backfill, plan_managed_directory_reuse,
         rebuild_plan_for_document, rebuild_reason_for_document, reconcile_unity_reference_import,
         reconcile_workspace_internal, DirectorySearchAccess, KnowledgeIndexState, KnowledgeRuntime,
-        RebuildReason, INDEX_VERSION,
+        RebuildReason, INDEX_VERSION, LARGE_LEXICAL_REBUILD_DOC_THRESHOLD,
     };
     use crate::knowledge_index::db::{ChunkRecord, DocIndexState, KnowledgeDb};
     use crate::knowledge_store::{
@@ -4554,6 +4544,61 @@ mod tests {
             },
         )
         .expect("save knowledge document");
+    }
+
+    fn memory_document(index: usize, body: String, updated_at: i64) -> KnowledgeDocument {
+        KnowledgeDocument {
+            id: format!("kd_test_memory_doc_{:03}", index),
+            doc_type: KnowledgeType::Memory,
+            path: format!("project/doc-{:03}.md", index),
+            title: format!("Project Memory {:03}", index),
+            inject_mode: KnowledgeInjectMode::Path,
+            inherit_inject_mode: false,
+            inject_mode_source: KnowledgeConfigSource {
+                kind: KnowledgeConfigSourceKind::SelfValue,
+                path: None,
+            },
+            summary_enabled: true,
+            command_enabled: false,
+            read_only: false,
+            ai_maintained: false,
+            storage_source: KnowledgeStorageSource::Project,
+            inherit_ai_config: false,
+            ai_config_source: KnowledgeConfigSource {
+                kind: KnowledgeConfigSourceKind::SelfValue,
+                path: None,
+            },
+            explicit_maintenance_rules: false,
+            external_source: None,
+            skill_enabled: None,
+            skill_surface: None,
+            command_trigger: None,
+            argument_hint: None,
+            summary: Some(format!("Project memory summary {:03}", index)),
+            body,
+            maintenance_rules: None,
+            created_at: 1,
+            updated_at,
+        }
+    }
+
+    fn save_memory_document(working_dir: &str, index: usize, body: &str, updated_at: i64) {
+        save_document(
+            working_dir,
+            memory_document(index, body.to_string(), updated_at),
+        )
+        .expect("save memory document");
+    }
+
+    fn seed_memory_documents(working_dir: &str, document_count: usize) {
+        for index in 0..document_count {
+            save_memory_document(
+                working_dir,
+                index,
+                &format!("Project memory body {:03}", index),
+                1,
+            );
+        }
     }
 
     fn seed_unity_reference_managed_document(working_dir: &str) {
@@ -5025,6 +5070,119 @@ mod tests {
             .expect("preparing progress");
 
         assert!(first_preparing_with_progress < first_indexing);
+    }
+
+    #[tokio::test]
+    async fn reconcile_workspace_suppresses_progress_for_single_lexical_update_in_large_catalog() {
+        let workspace = tempdir().expect("workspace");
+        let working_dir = workspace.path().to_string_lossy().to_string();
+        seed_memory_documents(&working_dir, LARGE_LEXICAL_REBUILD_DOC_THRESHOLD + 1);
+        let state = create_state(&working_dir);
+
+        reconcile_workspace_internal(
+            &working_dir,
+            None,
+            state.clone(),
+            false,
+            false,
+            false,
+            |_stage, _processed, _total, _path| {},
+        )
+        .await
+        .expect("initial reconcile");
+
+        save_memory_document(&working_dir, 42, "Updated single memory body", 2);
+
+        let mut events = Vec::new();
+        let report = reconcile_workspace_internal(
+            &working_dir,
+            None,
+            state,
+            false,
+            false,
+            false,
+            |stage, processed, total, path| {
+                events.push((
+                    stage.to_string(),
+                    processed,
+                    total,
+                    path.map(|value| value.to_string()),
+                ));
+            },
+        )
+        .await
+        .expect("single document reconcile");
+
+        assert_eq!(report.stale, 1);
+        assert_eq!(report.rebuilt, 1);
+        assert!(
+            events.is_empty(),
+            "single lexical update should stay below visible progress threshold: {:?}",
+            events
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_workspace_surfaces_progress_for_large_lexical_update_batch() {
+        let workspace = tempdir().expect("workspace");
+        let working_dir = workspace.path().to_string_lossy().to_string();
+        seed_memory_documents(&working_dir, LARGE_LEXICAL_REBUILD_DOC_THRESHOLD + 1);
+        let state = create_state(&working_dir);
+
+        reconcile_workspace_internal(
+            &working_dir,
+            None,
+            state.clone(),
+            false,
+            false,
+            false,
+            |_stage, _processed, _total, _path| {},
+        )
+        .await
+        .expect("initial reconcile");
+
+        for index in 0..LARGE_LEXICAL_REBUILD_DOC_THRESHOLD {
+            save_memory_document(
+                &working_dir,
+                index,
+                &format!("Updated memory body {:03}", index),
+                2,
+            );
+        }
+
+        let mut events = Vec::new();
+        let report = reconcile_workspace_internal(
+            &working_dir,
+            None,
+            state,
+            false,
+            false,
+            false,
+            |stage, processed, total, path| {
+                events.push((
+                    stage.to_string(),
+                    processed,
+                    total,
+                    path.map(|value| value.to_string()),
+                ));
+            },
+        )
+        .await
+        .expect("large lexical reconcile");
+
+        assert_eq!(report.stale, LARGE_LEXICAL_REBUILD_DOC_THRESHOLD);
+        assert_eq!(report.rebuilt, LARGE_LEXICAL_REBUILD_DOC_THRESHOLD);
+        assert!(events.iter().any(|(stage, processed, total, _)| {
+            stage == "preparing"
+                && *processed == LARGE_LEXICAL_REBUILD_DOC_THRESHOLD
+                && *total == LARGE_LEXICAL_REBUILD_DOC_THRESHOLD
+        }));
+        assert!(events.iter().any(|(stage, _, total, _)| {
+            stage == "indexing" && *total == LARGE_LEXICAL_REBUILD_DOC_THRESHOLD
+        }));
+        assert!(events
+            .iter()
+            .all(|(_, _, total, _)| *total == LARGE_LEXICAL_REBUILD_DOC_THRESHOLD));
     }
 
     #[tokio::test]
