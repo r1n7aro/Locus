@@ -5992,8 +5992,8 @@ updatedAt: 1
 ## Content
 # 战斗设计改进草案
 
-来源：飞书知识库 / SampleGame Old
-节点：`Cv6GwzY7JiYW8ikdhuVcqryfuh`
+来源：飞书知识库 / Example Knowledge Space
+节点：`node_example_docx`
 对象类型：`docx`
 
 ---
@@ -6483,7 +6483,7 @@ Body content
         let temp = TempDir::new().unwrap();
         let working_dir = temp.path().to_string_lossy().to_string();
 
-        for path in ["samplegame-old", "unity-official-docs", "notes"] {
+        for path in ["example-reference", "unity-official-docs", "notes"] {
             std::fs::create_dir_all(knowledge_root(&working_dir).join("reference").join(path))
                 .expect("create reference directory");
             update_directory_config(
@@ -6498,11 +6498,11 @@ Body content
         update_directory_external_sources(
             &working_dir,
             KnowledgeType::Reference,
-            "samplegame-old",
+            "example-reference",
             vec![KnowledgeExternalSource {
                 provider: KnowledgeSourceProvider::LocalFolder,
-                locator: Some("file:///F:/Docs/SampleGame%20Old".to_string()),
-                source_id: Some("samplegame-old".to_string()),
+                locator: Some("file:///F:/Docs/ExampleProjectReference".to_string()),
+                source_id: Some("example-reference".to_string()),
                 sync_enabled: false,
             }],
         )
@@ -6524,7 +6524,7 @@ Body content
             list_reference_external_directory_bindings(&working_dir).expect("list bindings");
 
         assert_eq!(bindings.len(), 2);
-        assert_eq!(bindings[0].path, "samplegame-old");
+        assert_eq!(bindings[0].path, "example-reference");
         assert_eq!(
             bindings[0].external_sources[0].provider,
             KnowledgeSourceProvider::LocalFolder
@@ -6544,25 +6544,25 @@ Body content
         std::fs::create_dir_all(
             knowledge_root(&working_dir)
                 .join("reference")
-                .join("samplegame-old")
+                .join("example-reference")
                 .join("gameplay"),
         )
         .expect("create external reference directory");
         update_directory_config(
             &working_dir,
             KnowledgeType::Reference,
-            "samplegame-old",
+            "example-reference",
             sample_directory_config(),
         )
         .expect("save reference config");
         update_directory_external_sources(
             &working_dir,
             KnowledgeType::Reference,
-            "samplegame-old",
+            "example-reference",
             vec![KnowledgeExternalSource {
                 provider: KnowledgeSourceProvider::LocalFolder,
-                locator: Some("file:///F:/Docs/SampleGame%20Old".to_string()),
-                source_id: Some("samplegame-old".to_string()),
+                locator: Some("file:///F:/Docs/ExampleProjectReference".to_string()),
+                source_id: Some("example-reference".to_string()),
                 sync_enabled: false,
             }],
         )
@@ -6570,32 +6570,32 @@ Body content
 
         let mut doc = sample_doc();
         doc.doc_type = KnowledgeType::Reference;
-        doc.path = "samplegame-old/gameplay/Gameplay.md".to_string();
+        doc.path = "example-reference/gameplay/Gameplay.md".to_string();
         doc.title = "Gameplay".to_string();
         doc.read_only = true;
         doc.external_source = Some(KnowledgeExternalSource {
             provider: KnowledgeSourceProvider::LocalFolder,
-            locator: Some("file:///F:/Docs/SampleGame%20Old".to_string()),
-            source_id: Some("samplegame-old".to_string()),
+            locator: Some("file:///F:/Docs/ExampleProjectReference".to_string()),
+            source_id: Some("example-reference".to_string()),
             sync_enabled: false,
         });
         save_document(&working_dir, doc).expect("save external doc");
 
         let regular_delete_error =
-            delete_directory(&working_dir, KnowledgeType::Reference, "samplegame-old")
+            delete_directory(&working_dir, KnowledgeType::Reference, "example-reference")
                 .expect_err("regular delete should reject read-only external docs");
         assert!(regular_delete_error.contains("read-only"));
 
-        delete_external_reference_directory(&working_dir, "samplegame-old")
+        delete_external_reference_directory(&working_dir, "example-reference")
             .expect("delete external directory");
 
         assert!(!knowledge_root(&working_dir)
             .join("reference")
-            .join("samplegame-old")
+            .join("example-reference")
             .exists());
         assert!(!knowledge_root(&working_dir)
             .join("reference")
-            .join("samplegame-old.locus-meta")
+            .join("example-reference.locus-meta")
             .exists());
     }
 
@@ -7724,7 +7724,7 @@ Body content
 
         let file_path = knowledge_root(&working_dir)
             .join("reference")
-            .join("samplegame-old")
+            .join("example-reference")
             .join("manual")
             .join("gameplay.md");
         let mut doc = sample_doc();
@@ -7735,19 +7735,19 @@ Body content
         doc.command_enabled = false;
         doc.external_source = Some(KnowledgeExternalSource {
             provider: KnowledgeSourceProvider::LocalFolder,
-            locator: Some("file:///F:/Docs/SampleGame%20Old".to_string()),
-            source_id: Some("samplegame-old".to_string()),
+            locator: Some("file:///F:/Docs/ExampleProjectReference".to_string()),
+            source_id: Some("example-reference".to_string()),
             sync_enabled: false,
         });
         save_document_to_path(&file_path, doc).expect("save mismatched read-only doc");
 
-        let error = delete_directory(&working_dir, KnowledgeType::Reference, "samplegame-old")
+        let error = delete_directory(&working_dir, KnowledgeType::Reference, "example-reference")
             .expect_err("delete should still reject read-only doc");
 
         assert!(error.contains("read-only"));
         assert!(knowledge_root(&working_dir)
             .join("reference")
-            .join("samplegame-old")
+            .join("example-reference")
             .exists());
     }
 

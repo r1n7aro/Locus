@@ -453,8 +453,7 @@ namespace Demo
 
 #[test]
 fn finds_class_with_preproc_if_inside_collection_initializer() {
-    // Repro for the SampleGame HotReloadSuggestionsHelper.cs case: a real
-    // top-level class whose Dictionary field initializer interleaves
+    // Repro for a real top-level class whose Dictionary field initializer interleaves
     // `#if UNITY_2022_1_OR_NEWER` blocks between entries. Tree-sitter's
     // recovery on this shape is not exercised by the existing top-level
     // `#if UNITY_EDITOR` test, and the watcher logged "no parseable C# type"
@@ -462,8 +461,8 @@ fn finds_class_with_preproc_if_inside_collection_initializer() {
     // ref_graph index gets the right script_class_name.
     let content = r#"
 using System.Collections.Generic;
-namespace SingularityGroup.HotReload.Editor {
-    internal static class HotReloadSuggestionsHelper {
+namespace ExampleProject.HotReload.Editor {
+    internal static class ExampleHotReloadSuggestions {
         public static Dictionary<int, string> suggestionMap = new Dictionary<int, string> {
             { 1, "first" },
 #if UNITY_2022_1_OR_NEWER
@@ -477,11 +476,11 @@ namespace SingularityGroup.HotReload.Editor {
     }
 }
 "#;
-    let meta = parse_cs_script(content, Some("HotReloadSuggestionsHelper"))
+    let meta = parse_cs_script(content, Some("ExampleHotReloadSuggestions"))
         .expect("class with preproc_if inside collection initializer must parse");
-    assert_eq!(meta.class_name, "HotReloadSuggestionsHelper");
+    assert_eq!(meta.class_name, "ExampleHotReloadSuggestions");
     assert_eq!(
         meta.namespace.as_deref(),
-        Some("SingularityGroup.HotReload.Editor")
+        Some("ExampleProject.HotReload.Editor")
     );
 }

@@ -20,7 +20,7 @@ function makeCommit(
   };
 }
 
-function makeSampleGameInput(): HistoryGraphInput {
+function makeExampleProjectInput(): HistoryGraphInput {
   return {
     commits: [
       makeCommit("63c0ffbe", ["9eea004e"], ["feat/test"]),
@@ -87,7 +87,7 @@ function makeSampleGameInput(): HistoryGraphInput {
 
 describe("history graph stash isolation", () => {
   it("keeps unanchored stash lineage out of the graph while preserving sidebar status", () => {
-    const input = makeSampleGameInput();
+    const input = makeExampleProjectInput();
 
     const scene = normalizeHistoryGraph(input);
     const unanchoredStashHashes = collectUnanchoredStashHashes(input);
@@ -106,8 +106,8 @@ describe("history graph stash isolation", () => {
     expect(layout.edges.some(edge => edge.id.startsWith("aux:stash"))).toBe(false);
   });
 
-  it("keeps SampleGame on two real commit lanes after stash isolation", () => {
-    const input = makeSampleGameInput();
+  it("keeps example project graph on two real commit lanes after stash isolation", () => {
+    const input = makeExampleProjectInput();
     const scene = normalizeHistoryGraph(input);
     const layout = layoutHistoryGraph(scene);
 
