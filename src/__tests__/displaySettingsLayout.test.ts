@@ -104,6 +104,29 @@ describe("display settings transcript alignment", () => {
     expect(en).toContain('"settings.display.mergeGitTreeStatusIcon": "Use colored icons for Git tree status"');
   });
 
+  it("adds a Git terminal suggestion visibility toggle that defaults to visible", () => {
+    const displaySettings = read("src/composables/useDisplaySettings.ts");
+    const displayPanel = read("src/components/settings/DisplaySettings.vue");
+    const gitTerminal = read("src/components/GitTerminal.vue");
+    const zh = read("src/language/zh.json");
+    const en = read("src/language/en.json");
+
+    expect(displaySettings).toContain("hideGitCommandSuggestions: boolean;");
+    expect(displaySettings).toContain("hideGitCommandSuggestions: false,");
+
+    expect(displayPanel).toContain(":model-value=\"display.hideGitCommandSuggestions\"");
+    expect(displayPanel).toContain(":aria-label=\"t('settings.display.hideGitCommandSuggestions')\"");
+    expect(displayPanel).toContain("@update:model-value=\"setDisplay('hideGitCommandSuggestions', $event)\"");
+    expect(displayPanel).toContain("{{ t(\"settings.display.hideGitCommandSuggestions\") }}");
+
+    expect(gitTerminal).toContain('import { useDisplaySettings } from "../composables/useDisplaySettings";');
+    expect(gitTerminal).toContain("const { state: displaySettings } = useDisplaySettings();");
+    expect(gitTerminal).toContain("!displaySettings.hideGitCommandSuggestions && lines.length === 0");
+
+    expect(zh).toContain('"settings.display.hideGitCommandSuggestions": "隐藏 Git 候选项"');
+    expect(en).toContain('"settings.display.hideGitCommandSuggestions": "Hide Git command suggestions"');
+  });
+
   it("adds a completed thinking block visibility toggle that defaults to hidden", () => {
     const displaySettings = read("src/composables/useDisplaySettings.ts");
     const displayPanel = read("src/components/settings/DisplaySettings.vue");

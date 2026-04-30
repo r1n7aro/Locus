@@ -17,6 +17,8 @@ export interface DisplaySettings {
   hideThinkingBlocks: boolean;
   /** Merge Git tree status letters into colored file icons */
   mergeGitTreeStatusIcon: boolean;
+  /** Hide Git command suggestions in Git terminal */
+  hideGitCommandSuggestions: boolean;
   /** Enable desktop notifications when the app is not focused */
   systemNotificationsEnabled: boolean;
   /** Notify when a chat run completes */
@@ -49,6 +51,7 @@ const defaults: DisplaySettings = {
   compactToolCalls: true,
   hideThinkingBlocks: true,
   mergeGitTreeStatusIcon: true,
+  hideGitCommandSuggestions: false,
   systemNotificationsEnabled: true,
   notifyOnChatDone: true,
   notifyOnAskUser: true,

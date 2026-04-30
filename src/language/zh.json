@@ -710,6 +710,7 @@
   "settings.display.hideThinkingBlocks": "隐藏已完成思考块",
   "settings.display.gitViewTitle": "Git 视图",
   "settings.display.mergeGitTreeStatusIcon": "层级视图用彩色图标显示修改状态",
+  "settings.display.hideGitCommandSuggestions": "隐藏 Git 候选项",
   "settings.display.notificationsTitle": "系统通知",
   "settings.display.notificationsDesc": "当窗口未聚焦时，为关键对话事件发送系统通知",
   "settings.display.systemNotificationsEnabled": "启用后台系统通知",

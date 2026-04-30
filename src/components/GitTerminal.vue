@@ -9,6 +9,7 @@ import type { StreamEvent, ModelOption } from "../types";
 import MarkdownRenderer from "./MarkdownRenderer.vue";
 import { t } from "../i18n";
 import { normalizeAppError } from "../services/errors";
+import { useDisplaySettings } from "../composables/useDisplaySettings";
 
 const props = defineProps<{
   workingDir: string;
@@ -26,6 +27,7 @@ const emit = defineEmits<{
 
 const modelDropdownOpen = ref(false);
 const modelDropdownRef = ref<HTMLElement | null>(null);
+const { state: displaySettings } = useDisplaySettings();
 
 const currentModelName = computed(() => {
   const m = props.models.find(m => m.id === props.selectedModelId);
@@ -637,7 +639,7 @@ defineExpose({ pushOutput });
         />
       </div>
 
-      <div v-if="lines.length === 0 && !streamingText && !streaming && !input" class="term-examples-inline">
+      <div v-if="!displaySettings.hideGitCommandSuggestions && lines.length === 0 && !streamingText && !streaming && !input" class="term-examples-inline">
         <span class="term-dim">{{ t("git.examples") }}</span>
         <span class="term-example ui-select-none" @click="input = 'git push'; handleBuiltinOrSubmit()">git push</span>
         <span class="term-example ui-select-none" @click="input = 'git pull'; handleBuiltinOrSubmit()">git pull</span>

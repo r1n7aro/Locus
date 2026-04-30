@@ -710,6 +710,7 @@
   "settings.display.hideThinkingBlocks": "Hide completed thinking blocks",
   "settings.display.gitViewTitle": "Git View",
   "settings.display.mergeGitTreeStatusIcon": "Use colored icons for Git tree status",
+  "settings.display.hideGitCommandSuggestions": "Hide Git command suggestions",
   "settings.display.notificationsTitle": "System Notifications",
   "settings.display.notificationsDesc": "Send desktop notifications for key chat events when the app is not focused",
   "settings.display.systemNotificationsEnabled": "Enable background system notifications",

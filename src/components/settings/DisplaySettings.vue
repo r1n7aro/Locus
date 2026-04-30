@@ -144,6 +144,15 @@ onMounted(async () => {
       />
       <span>{{ t("settings.display.mergeGitTreeStatusIcon") }}</span>
     </div>
+
+    <div class="toggle-row">
+      <BaseSwitch
+        :model-value="display.hideGitCommandSuggestions"
+        :aria-label="t('settings.display.hideGitCommandSuggestions')"
+        @update:model-value="setDisplay('hideGitCommandSuggestions', $event)"
+      />
+      <span>{{ t("settings.display.hideGitCommandSuggestions") }}</span>
+    </div>
   </div>
 
   <div class="settings-section">

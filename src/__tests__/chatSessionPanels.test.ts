@@ -35,7 +35,9 @@ const displaySettingsState = vi.hoisted(() => ({
   changesAutoClose: true,
   rightAlignUserMessages: false,
   compactToolCalls: true,
+  hideThinkingBlocks: true,
   mergeGitTreeStatusIcon: true,
+  hideGitCommandSuggestions: false,
 }));
 
 const agentStoreMocks = vi.hoisted(() => ({
@@ -147,7 +149,9 @@ describe("chat session panel state", () => {
     displaySettingsState.changesAutoClose = true;
     displaySettingsState.rightAlignUserMessages = false;
     displaySettingsState.compactToolCalls = true;
+    displaySettingsState.hideThinkingBlocks = true;
     displaySettingsState.mergeGitTreeStatusIcon = true;
+    displaySettingsState.hideGitCommandSuggestions = false;
 
     todoData = {
       s1: { items: [makeTodo("Todo from history")], latestRunId: "run-history" },

@@ -29,6 +29,7 @@ function createDisplayState(): DisplaySettings {
     compactToolCalls: true,
     hideThinkingBlocks: true,
     mergeGitTreeStatusIcon: true,
+    hideGitCommandSuggestions: false,
     systemNotificationsEnabled: true,
     notifyOnChatDone: true,
     notifyOnAskUser: true,
@@ -91,6 +92,7 @@ describe("systemNotifications", () => {
     displayState.compactToolCalls = true;
     displayState.hideThinkingBlocks = true;
     displayState.mergeGitTreeStatusIcon = true;
+    displayState.hideGitCommandSuggestions = false;
     displayState.systemNotificationsEnabled = true;
     displayState.notifyOnChatDone = true;
     displayState.notifyOnAskUser = true;
