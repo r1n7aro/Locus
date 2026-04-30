@@ -10,6 +10,7 @@ import hljs, { langFromPath } from "../hljs";
 import { diffStrings } from "../services/diff";
 import { t } from "../i18n";
 import { resolveToolBlockOverride } from "./tool-block-overrides/toolBlockOverrides";
+import { buildToolCallArgsSummary } from "./toolCallSummary";
 
 import type { ToolCallDisplay, FileDiffPayload } from "../types";
 
@@ -311,64 +312,9 @@ function prettifyKey(key: string): string {
     .toLowerCase();
 }
 
-const argsSummary = computed(() => {
-  try {
-    const args = JSON.parse(props.toolCall.arguments);
-    const name = props.toolCall.name;
-
-    if (name === "read" || name === "write" || name === "edit" || name === "list") {
-      const p = args.filePath || args.file_path || args.path || "";
-      if (!p) return "";
-      return shortenPath(p);
-    }
-
-    if (name === "grep") {
-      const pat = args.pattern || "";
-      const path = args.filePath || args.file_path || args.path || "";
-      if (pat && path) return `/${pat}/ in ${shortenPath(path)}`;
-      if (pat) return `/${pat}/`;
-      return "";
-    }
-
-    if (name === "bash") {
-      const cmd = args.command || "";
-      if (cmd.length <= 60) return cmd;
-      return cmd.slice(0, 57) + "...";
-    }
-
-    if (name === "task") {
-      const desc = args.description || "";
-      if (desc.length <= 60) return desc;
-      return desc.slice(0, 57) + "...";
-    }
-
-    if (name === "canvas" && args.spec) {
-      const s = args.spec;
-      const nc = s.nodes?.length || 0;
-      const ec = s.edges?.length || 0;
-      return `${s.title || "Canvas"} (${nc} nodes, ${ec} edges)`;
-    }
-
-    if (name === "webfetch") {
-      return args.url || "";
-    }
-
-    for (const v of Object.values(args)) {
-      if (typeof v === "string" && v.length > 0) {
-        return v.length <= 60 ? v : v.slice(0, 57) + "...";
-      }
-    }
-    return "";
-  } catch {
-    return "";
-  }
-});
-
-function shortenPath(p: string): string {
-  const parts = p.replace(/\\/g, "/").split("/").filter(Boolean);
-  if (parts.length <= 2) return parts.join("/");
-  return "…/" + parts.slice(-2).join("/");
-}
+const argsSummary = computed(() =>
+  buildToolCallArgsSummary(props.toolCall.name, props.toolCall.arguments),
+);
 
 function getFilePath(): string {
   try {
