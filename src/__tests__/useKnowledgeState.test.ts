@@ -1469,6 +1469,96 @@ describe("useKnowledgeState", () => {
     expect(state.selectedDocument.value?.body).toBe("正文");
   });
 
+  it("does not reread a selected document after deleting it from the explorer", async () => {
+    let deleted = false;
+    const designDoc: KnowledgeDocumentSummary = {
+      id: "design-1",
+      type: "design",
+      path: "combat/core-loop.md",
+      title: "核心循环",
+      injectMode: "excerpt",
+      summaryEnabled: true,
+      commandEnabled: false,
+      readOnly: false,
+      aiMaintained: false,
+      explicitMaintenanceRules: false,
+      summary: "摘要",
+      createdAt: 1,
+      updatedAt: 2,
+      hasSummary: true,
+    };
+    const memoryDoc: KnowledgeDocumentSummary = {
+      id: "memory-1",
+      type: "memory",
+      path: "project-understanding.md",
+      title: "项目理解",
+      injectMode: "full",
+      summaryEnabled: false,
+      commandEnabled: false,
+      readOnly: false,
+      aiMaintained: true,
+      explicitMaintenanceRules: true,
+      summary: null,
+      createdAt: 1,
+      updatedAt: 3,
+      hasSummary: false,
+    };
+
+    knowledgeMocks.knowledgeList.mockImplementation(async (input: any = {}) => {
+      const docs = deleted ? [memoryDoc] : [designDoc, memoryDoc];
+      return docs.filter((doc) => !input.type || doc.type === input.type);
+    });
+    knowledgeMocks.knowledgeDelete.mockImplementation(async (input: any) => {
+      deleted = true;
+      return {
+        kind: input.kind,
+        type: input.type ?? "design",
+        path: input.path,
+        resultPath: input.path,
+        document: null,
+        directory: null,
+      };
+    });
+
+    const state = useKnowledgeState(
+      reactive({
+        workingDir: "F:/repo",
+        selectedModelId: "",
+        modelDefaults: {} as any,
+      }),
+    );
+
+    await state.refreshKnowledgeData();
+    await state.selectDocument(designDoc);
+    knowledgeMocks.knowledgeRead.mockClear();
+
+    const folderNode = state.currentExplorerRoot.value?.children[0];
+    expect(folderNode?.kind).toBe("folder");
+    const documentNode =
+      folderNode?.kind === "folder" ? folderNode.children[0] : null;
+    expect(documentNode?.kind).toBe("document");
+
+    await state.deleteExplorerNode(documentNode!);
+
+    expect(knowledgeMocks.knowledgeDelete).toHaveBeenCalledWith({
+      kind: "document",
+      type: "design",
+      path: "combat/core-loop.md",
+    });
+    expect(
+      knowledgeMocks.knowledgeRead.mock.calls.some(([input]) => {
+        const request = input as { kind?: string; path?: string; type?: string };
+        return (
+          request.kind === "document" &&
+          request.type === "design" &&
+          request.path === "combat/core-loop.md"
+        );
+      }),
+    ).toBe(false);
+    expect(state.selectedDocument.value).toBeNull();
+    expect(state.selectedPath.value).toBeNull();
+  });
+
   it("keeps the search state after selecting a search result", async () => {
     vi.useFakeTimers();
     try {

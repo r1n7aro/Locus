@@ -1165,6 +1165,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
     selectedDocument.value = null;
     selectedDocumentId.value = null;
     selectedDocumentLoading.value = false;
+    pendingSelectionPath.value = null;
   }
 
   function clearSelectedDirectoryState() {
@@ -1887,6 +1888,9 @@ export function useKnowledgeState(props: KnowledgeProps) {
       }
       selectedDocument.value = doc;
       selectedDocumentId.value = doc.id;
+      if (pendingSelectionPath.value === doc.path) {
+        pendingSelectionPath.value = null;
+      }
       activeType.value = doc.type;
       mergeDocuments([doc]);
       if (doc.type === "reference") {
@@ -2225,6 +2229,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
     selectedDocumentId.value = null;
     selectedDocument.value = null;
     selectedDocumentLoading.value = false;
+    pendingSelectionPath.value = null;
     selectedDirectoryPath.value = null;
     selectedDirectoryConfig.value = null;
     selectedDirectoryLoading.value = false;
