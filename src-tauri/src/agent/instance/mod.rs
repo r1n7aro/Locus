@@ -429,6 +429,20 @@ struct KnowledgeToolConfirmAssessment {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BashGitKnowledgeAssessment {
+    touches_knowledge: bool,
+    requires_confirm: bool,
+    reconcile_after_success: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GitCommandEffect {
+    requires_confirm: bool,
+    reconcile_after_success: bool,
+    broad_scope: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ToolConfirmReason {
     UserPermission,
     KnowledgeGovernance,
@@ -2617,6 +2631,444 @@ impl AgentInstance {
         path_norm == root_norm || path_norm.starts_with(&(root_norm + "/"))
     }
 
+    fn shell_split_simple_segments(command: &str) -> Option<Vec<String>> {
+        let mut segments = Vec::new();
+        let mut current = String::new();
+        let mut quote: Option<char> = None;
+        let mut escaped = false;
+        let mut chars = command.chars().peekable();
+
+        while let Some(ch) = chars.next() {
+            if escaped {
+                current.push(ch);
+                escaped = false;
+                continue;
+            }
+
+            if ch == '\\' && quote != Some('\'') {
+                current.push(ch);
+                escaped = true;
+                continue;
+            }
+
+            if let Some(active_quote) = quote {
+                current.push(ch);
+                if ch == active_quote {
+                    quote = None;
+                }
+                continue;
+            }
+
+            if ch == '\'' || ch == '"' {
+                quote = Some(ch);
+                current.push(ch);
+                continue;
+            }
+
+            if ch == '&' && chars.peek() == Some(&'&') {
+                chars.next();
+                let segment = current.trim();
+                if !segment.is_empty() {
+                    segments.push(segment.to_string());
+                }
+                current.clear();
+                continue;
+            }
+
+            if ch == ';' {
+                let segment = current.trim();
+                if !segment.is_empty() {
+                    segments.push(segment.to_string());
+                }
+                current.clear();
+                continue;
+            }
+
+            if matches!(ch, '|' | '<' | '>') {
+                return None;
+            }
+
+            current.push(ch);
+        }
+
+        if quote.is_some() || escaped {
+            return None;
+        }
+
+        let segment = current.trim();
+        if !segment.is_empty() {
+            segments.push(segment.to_string());
+        }
+
+        if segments.is_empty() {
+            None
+        } else {
+            Some(segments)
+        }
+    }
+
+    fn shell_split_words(segment: &str) -> Option<Vec<String>> {
+        let mut words = Vec::new();
+        let mut current = String::new();
+        let mut quote: Option<char> = None;
+        let mut escaped = false;
+
+        for ch in segment.chars() {
+            if escaped {
+                current.push(ch);
+                escaped = false;
+                continue;
+            }
+
+            if ch == '\\' && quote != Some('\'') {
+                escaped = true;
+                continue;
+            }
+
+            if let Some(active_quote) = quote {
+                if ch == active_quote {
+                    quote = None;
+                } else {
+                    current.push(ch);
+                }
+                continue;
+            }
+
+            if ch == '\'' || ch == '"' {
+                quote = Some(ch);
+                continue;
+            }
+
+            if ch.is_whitespace() {
+                if !current.is_empty() {
+                    words.push(current.clone());
+                    current.clear();
+                }
+                continue;
+            }
+
+            current.push(ch);
+        }
+
+        if quote.is_some() || escaped {
+            return None;
+        }
+
+        if !current.is_empty() {
+            words.push(current);
+        }
+
+        Some(words)
+    }
+
+    fn is_git_executable(value: &str) -> bool {
+        matches!(
+            value.to_ascii_lowercase().as_str(),
+            "git" | "git.exe" | "git.cmd" | "git.bat"
+        )
+    }
+
+    fn git_subcommand_index(tokens: &[String]) -> Option<usize> {
+        if !tokens
+            .first()
+            .map(|value| Self::is_git_executable(value))
+            .unwrap_or(false)
+        {
+            return None;
+        }
+
+        let mut index = 1;
+        while index < tokens.len() {
+            let token = tokens[index].as_str();
+            match token {
+                "-c" | "-C" | "--git-dir" | "--work-tree" | "--namespace" => {
+                    index += 2;
+                }
+                "--no-pager" | "--paginate" => {
+                    index += 1;
+                }
+                value
+                    if value.starts_with("-c")
+                        || value.starts_with("--git-dir=")
+                        || value.starts_with("--work-tree=")
+                        || value.starts_with("--namespace=") =>
+                {
+                    index += 1;
+                }
+                value if value.starts_with('-') => {
+                    index += 1;
+                }
+                _ => return Some(index),
+            }
+        }
+        None
+    }
+
+    fn git_args_contain_flag(args: &[String], long_flag: &str, short_flag: &str) -> bool {
+        args.iter().any(|arg| arg == long_flag || arg == short_flag)
+    }
+
+    fn git_args_contain_any(args: &[String], flags: &[&str]) -> bool {
+        args.iter().any(|arg| {
+            flags
+                .iter()
+                .any(|flag| arg == flag || arg.starts_with(&format!("{flag}=")))
+        })
+    }
+
+    fn git_args_have_pathspec_separator(args: &[String]) -> bool {
+        args.iter()
+            .position(|arg| arg == "--")
+            .map(|index| {
+                args.iter()
+                    .skip(index + 1)
+                    .any(|arg| !arg.trim().is_empty())
+            })
+            .unwrap_or(false)
+    }
+
+    fn git_args_after_separator(args: &[String]) -> Vec<&str> {
+        args.iter()
+            .position(|arg| arg == "--")
+            .map(|index| {
+                args.iter()
+                    .skip(index + 1)
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    }
+
+    fn git_option_takes_value(arg: &str) -> bool {
+        matches!(
+            arg,
+            "-m" | "-F"
+                | "-C"
+                | "-c"
+                | "-S"
+                | "-s"
+                | "--message"
+                | "--file"
+                | "--author"
+                | "--date"
+                | "--reuse-message"
+                | "--reedit-message"
+                | "--source"
+                | "--pathspec-from-file"
+        )
+    }
+
+    fn git_collect_pathspec_like_args(args: &[String]) -> Vec<&str> {
+        if let Some(index) = args.iter().position(|arg| arg == "--") {
+            return args.iter().skip(index + 1).map(String::as_str).collect();
+        }
+
+        let mut pathspecs = Vec::new();
+        let mut skip_next = false;
+        for arg in args {
+            if skip_next {
+                skip_next = false;
+                continue;
+            }
+
+            if arg.starts_with("--") {
+                if !arg.contains('=') && Self::git_option_takes_value(arg) {
+                    skip_next = true;
+                }
+                continue;
+            }
+
+            if arg.starts_with('-') {
+                if Self::git_option_takes_value(arg) {
+                    skip_next = true;
+                }
+                continue;
+            }
+
+            pathspecs.push(arg.as_str());
+        }
+        pathspecs
+    }
+
+    fn git_pathspecs_are_broad(pathspecs: &[&str]) -> bool {
+        pathspecs.iter().any(|pathspec| {
+            let trimmed = pathspec.trim();
+            trimmed == "."
+                || trimmed == ":/"
+                || trimmed == ":(top)"
+                || trimmed == "*"
+                || trimmed == ":(glob)**"
+        })
+    }
+
+    fn classify_simple_git_tokens(tokens: &[String]) -> Option<GitCommandEffect> {
+        let subcommand_index = Self::git_subcommand_index(tokens)?;
+        let subcommand = tokens.get(subcommand_index)?.to_ascii_lowercase();
+        let args = &tokens[subcommand_index + 1..];
+
+        if matches!(
+            subcommand.as_str(),
+            "status" | "diff" | "log" | "show" | "ls-files" | "rev-parse"
+        ) {
+            return Some(GitCommandEffect {
+                requires_confirm: false,
+                reconcile_after_success: false,
+                broad_scope: false,
+            });
+        }
+
+        match subcommand.as_str() {
+            "add" => {
+                let pathspecs = Self::git_collect_pathspec_like_args(args);
+                let broad_scope = Self::git_args_contain_any(
+                    args,
+                    &["-A", "--all", "-u", "--update", "--renormalize"],
+                ) || Self::git_pathspecs_are_broad(&pathspecs);
+                Some(GitCommandEffect {
+                    requires_confirm: false,
+                    reconcile_after_success: false,
+                    broad_scope,
+                })
+            }
+            "restore" => {
+                let staged = Self::git_args_contain_flag(args, "--staged", "-S");
+                let worktree = Self::git_args_contain_flag(args, "--worktree", "-W");
+                let pathspecs = Self::git_collect_pathspec_like_args(args);
+                let broad_scope = Self::git_pathspecs_are_broad(&pathspecs);
+                if staged && !worktree {
+                    Some(GitCommandEffect {
+                        requires_confirm: false,
+                        reconcile_after_success: false,
+                        broad_scope,
+                    })
+                } else {
+                    Some(GitCommandEffect {
+                        requires_confirm: true,
+                        reconcile_after_success: true,
+                        broad_scope,
+                    })
+                }
+            }
+            "reset" => {
+                let hard = Self::git_args_contain_any(args, &["--hard"]);
+                if hard {
+                    return Some(GitCommandEffect {
+                        requires_confirm: true,
+                        reconcile_after_success: true,
+                        broad_scope: true,
+                    });
+                }
+
+                if Self::git_args_have_pathspec_separator(args) {
+                    let pathspecs = Self::git_args_after_separator(args);
+                    return Some(GitCommandEffect {
+                        requires_confirm: false,
+                        reconcile_after_success: false,
+                        broad_scope: Self::git_pathspecs_are_broad(&pathspecs),
+                    });
+                }
+
+                Some(GitCommandEffect {
+                    requires_confirm: true,
+                    reconcile_after_success: true,
+                    broad_scope: true,
+                })
+            }
+            "checkout" => {
+                let pathspecs = Self::git_args_after_separator(args);
+                Some(GitCommandEffect {
+                    requires_confirm: true,
+                    reconcile_after_success: true,
+                    broad_scope: pathspecs.is_empty() || Self::git_pathspecs_are_broad(&pathspecs),
+                })
+            }
+            "stash" => {
+                let action = args
+                    .iter()
+                    .find(|arg| !arg.starts_with('-'))
+                    .map(|arg| arg.to_ascii_lowercase())
+                    .unwrap_or_else(|| "push".to_string());
+                if matches!(action.as_str(), "list" | "show") {
+                    Some(GitCommandEffect {
+                        requires_confirm: false,
+                        reconcile_after_success: false,
+                        broad_scope: false,
+                    })
+                } else {
+                    Some(GitCommandEffect {
+                        requires_confirm: matches!(
+                            action.as_str(),
+                            "apply" | "pop" | "push" | "save"
+                        ),
+                        reconcile_after_success: matches!(
+                            action.as_str(),
+                            "apply" | "pop" | "push" | "save"
+                        ),
+                        broad_scope: true,
+                    })
+                }
+            }
+            "merge" | "rebase" | "cherry-pick" | "revert" => Some(GitCommandEffect {
+                requires_confirm: true,
+                reconcile_after_success: true,
+                broad_scope: true,
+            }),
+            "commit" => Some(GitCommandEffect {
+                requires_confirm: false,
+                reconcile_after_success: false,
+                broad_scope: false,
+            }),
+            _ => None,
+        }
+    }
+
+    fn classify_bash_git_command(command: &str) -> Option<GitCommandEffect> {
+        let segments = Self::shell_split_simple_segments(command)?;
+        let mut combined = GitCommandEffect {
+            requires_confirm: false,
+            reconcile_after_success: false,
+            broad_scope: false,
+        };
+
+        for segment in segments {
+            let tokens = Self::shell_split_words(&segment)?;
+            if tokens.is_empty() {
+                continue;
+            }
+            let effect = Self::classify_simple_git_tokens(&tokens)?;
+            combined.requires_confirm |= effect.requires_confirm;
+            combined.reconcile_after_success |= effect.reconcile_after_success;
+            combined.broad_scope |= effect.broad_scope;
+        }
+
+        Some(combined)
+    }
+
+    fn assess_bash_git_knowledge_command(
+        working_dir: &str,
+        app_knowledge_dir: Option<&std::path::PathBuf>,
+        args: &serde_json::Value,
+    ) -> Option<BashGitKnowledgeAssessment> {
+        let workdir = args
+            .get("workdir")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let command = args.get("command").and_then(|value| value.as_str())?;
+        let effect = Self::classify_bash_git_command(command)?;
+        let workdir_targets_knowledge =
+            Self::path_targets_knowledge_root(working_dir, app_knowledge_dir, workdir);
+        let command_targets_knowledge =
+            Self::shell_command_mentions_knowledge_root(working_dir, app_knowledge_dir, command);
+        let touches_knowledge =
+            workdir_targets_knowledge || command_targets_knowledge || effect.broad_scope;
+
+        Some(BashGitKnowledgeAssessment {
+            touches_knowledge,
+            requires_confirm: touches_knowledge && effect.requires_confirm,
+            reconcile_after_success: touches_knowledge && effect.reconcile_after_success,
+        })
+    }
+
     fn collect_knowledge_roots(
         working_dir: &str,
         app_knowledge_dir: Option<&std::path::PathBuf>,
@@ -2654,26 +3106,59 @@ impl AgentInstance {
             .any(|root| Self::path_is_within_root(&resolved_path, root))
     }
 
+    fn is_shell_path_boundary(ch: Option<char>, allow_path_child: bool) -> bool {
+        match ch {
+            None => true,
+            Some('/') if allow_path_child => true,
+            Some(ch) => ch.is_whitespace() || matches!(ch, '\'' | '"' | '`' | '(' | ')' | '='),
+        }
+    }
+
+    fn shell_command_mentions_path(command_norm: &str, path_norm: &str) -> bool {
+        let needle = path_norm.trim_matches('/');
+        if needle.is_empty() {
+            return false;
+        }
+
+        let mut search_from = 0;
+        while let Some(offset) = command_norm[search_from..].find(needle) {
+            let start = search_from + offset;
+            let end = start + needle.len();
+            let before = command_norm[..start].chars().next_back();
+            let after = command_norm[end..].chars().next();
+            if Self::is_shell_path_boundary(before, false)
+                && Self::is_shell_path_boundary(after, true)
+            {
+                return true;
+            }
+            search_from = end;
+            if search_from >= command_norm.len() {
+                break;
+            }
+        }
+        false
+    }
+
     fn shell_command_mentions_knowledge_root(
         working_dir: &str,
         app_knowledge_dir: Option<&std::path::PathBuf>,
         command: &str,
     ) -> bool {
         let command_norm = command.replace('\\', "/").to_ascii_lowercase();
-        if command_norm.contains("locus/knowledge/") {
+        if Self::shell_command_mentions_path(&command_norm, "locus/knowledge") {
             return true;
         }
 
         for root in Self::collect_knowledge_roots(working_dir, app_knowledge_dir) {
             let root_norm = Self::normalize_path_for_compare(&root);
-            if !root_norm.is_empty() && command_norm.contains(&root_norm) {
+            if Self::shell_command_mentions_path(&command_norm, &root_norm) {
                 return true;
             }
 
             if Self::has_selected_working_dir_value(working_dir) {
                 if let Ok(relative) = root.strip_prefix(working_dir) {
                     let relative_norm = Self::normalize_path_for_compare(relative);
-                    if !relative_norm.is_empty() && command_norm.contains(&(relative_norm + "/")) {
+                    if Self::shell_command_mentions_path(&command_norm, &relative_norm) {
                         return true;
                     }
                 }
@@ -2727,7 +3212,13 @@ impl AgentInstance {
                         command,
                     )
                 {
-                    Some(knowledge_tool_routing_error())
+                    if Self::assess_bash_git_knowledge_command(&self.working_dir, app_root, args)
+                        .is_some()
+                    {
+                        None
+                    } else {
+                        Some(knowledge_tool_routing_error())
+                    }
                 } else {
                     None
                 }
@@ -5240,6 +5731,7 @@ impl AgentInstance {
         tool_call_id: &str,
         tool_name: &str,
         arguments: &str,
+        args: &serde_json::Value,
         run_id: &str,
     ) -> ToolConfirmDecision {
         let mode_state: tauri::State<crate::ToolPermissionMode> = app_handle.state();
@@ -5252,11 +5744,7 @@ impl AgentInstance {
             tool_name,
             "knowledge_create" | "knowledge_edit" | "knowledge_move" | "knowledge_delete"
         ) {
-            match serde_json::from_str::<serde_json::Value>(arguments)
-                .map_err(|error| format!("Failed to parse tool arguments: {}", error))
-                .and_then(|parsed| {
-                    assess_knowledge_tool_confirmation(&self.working_dir, tool_name, &parsed)
-                }) {
+            match assess_knowledge_tool_confirmation(&self.working_dir, tool_name, args) {
                 Ok(Some(assessment)) => {
                     knowledge_governance_requires_confirm = assessment.governance_requires_confirm;
                     knowledge_preview = Some(assessment.preview);
@@ -5268,6 +5756,17 @@ impl AgentInstance {
                         "[Agent {}] knowledge tool confirm preview failed for '{}' (id={}): {}",
                         self.id, tool_name, tool_call_id, error
                     );
+                }
+            }
+        }
+        if tool_name == "bash" {
+            if let Some(assessment) = Self::assess_bash_git_knowledge_command(
+                &self.working_dir,
+                self.app_knowledge_dir.as_ref().as_ref(),
+                args,
+            ) {
+                if assessment.requires_confirm {
+                    knowledge_governance_requires_confirm = true;
                 }
             }
         }
@@ -5550,7 +6049,7 @@ impl AgentInstance {
         }
 
         match self
-            .request_tool_confirm(app_handle, &tc.id, &tc.name, &tc.arguments, run_id)
+            .request_tool_confirm(app_handle, &tc.id, &tc.name, &tc.arguments, args, run_id)
             .await
         {
             ToolConfirmDecision::Allow => {}
@@ -5626,13 +6125,50 @@ impl AgentInstance {
             self.await_tool_result(self.execute_unity_yaml_read(app_handle, args))
                 .await
         } else {
+            let bash_git_knowledge_assessment = if tc.name == "bash" {
+                Self::assess_bash_git_knowledge_command(
+                    &self.working_dir,
+                    self.app_knowledge_dir.as_ref().as_ref(),
+                    args,
+                )
+            } else {
+                None
+            };
             let tool_context = self.build_tool_execution_context(&tc.name).await;
-            self.await_tool_result(self.tool_registry.execute_with_context(
-                &tc.name,
-                args,
-                tool_context,
-            ))
-            .await
+            let mut result = self
+                .await_tool_result(self.tool_registry.execute_with_context(
+                    &tc.name,
+                    args,
+                    tool_context,
+                ))
+                .await;
+
+            if result.outcome == ToolRunOutcome::Done
+                && bash_git_knowledge_assessment
+                    .map(|assessment| assessment.reconcile_after_success)
+                    .unwrap_or(false)
+            {
+                match self
+                    .reconcile_knowledge_workspace_with_source(app_handle, "agent_git")
+                    .await
+                {
+                    Ok(()) => {
+                        eprintln!(
+                            "[Agent {}] reconciled knowledge index after bash git operation",
+                            self.id
+                        );
+                    }
+                    Err(error) => {
+                        let suffix = format!(
+                            "\n\nWarning: knowledge index reconcile failed after git operation: {}",
+                            error
+                        );
+                        result.output.push_str(&suffix);
+                    }
+                }
+            }
+
+            result
         }
     }
 
@@ -6010,7 +6546,11 @@ impl AgentInstance {
         }
     }
 
-    async fn reconcile_knowledge_workspace(&self, app_handle: &AppHandle) -> Result<(), String> {
+    async fn reconcile_knowledge_workspace_with_source(
+        &self,
+        app_handle: &AppHandle,
+        source: &str,
+    ) -> Result<(), String> {
         let knowledge_index_state = {
             let state: tauri::State<'_, Arc<crate::knowledge_index::KnowledgeIndexState>> =
                 app_handle.state();
@@ -6020,10 +6560,15 @@ impl AgentInstance {
             app_handle,
             &self.working_dir,
             knowledge_index_state,
-            "agent_knowledge_tool",
+            source,
         )
         .await
         .map_err(|error| error.to_string())
+    }
+
+    async fn reconcile_knowledge_workspace(&self, app_handle: &AppHandle) -> Result<(), String> {
+        self.reconcile_knowledge_workspace_with_source(app_handle, "agent_knowledge_tool")
+            .await
     }
 
     async fn execute_knowledge_create(
@@ -9016,11 +9561,89 @@ PrefabInstance:
             Some(&app_root),
             "mkdir Locus/knowledge/skill/unity"
         ));
+        assert!(AgentInstance::shell_command_mentions_knowledge_root(
+            "C:/Repo",
+            Some(&app_root),
+            "rm Locus/knowledge"
+        ));
         assert!(!AgentInstance::shell_command_mentions_knowledge_root(
             "C:/Repo",
             Some(&app_root),
             "cargo test"
         ));
+    }
+
+    #[test]
+    fn bash_git_knowledge_assessment_separates_index_and_worktree_operations() {
+        let app_root = std::path::PathBuf::from("C:/Repo/knowledge");
+        let cases = [
+            (
+                "git status --short Locus/knowledge/design/core.md",
+                false,
+                false,
+            ),
+            ("git add Locus/knowledge/design/core.md", false, false),
+            (
+                "git restore --staged Locus/knowledge/design/core.md",
+                false,
+                false,
+            ),
+            ("git reset -- Locus/knowledge/design/core.md", false, false),
+            ("git restore -- Locus/knowledge/design/core.md", true, true),
+            ("git checkout -- Locus/knowledge/design/core.md", true, true),
+            ("git reset --hard HEAD", true, true),
+            ("git stash apply", true, true),
+            ("git stash pop", true, true),
+            ("git merge feature/notes", true, true),
+            ("git rebase main", true, true),
+            ("git cherry-pick HEAD~1", true, true),
+            ("git revert HEAD", true, true),
+        ];
+
+        for (command, requires_confirm, reconcile_after_success) in cases {
+            let assessment = AgentInstance::assess_bash_git_knowledge_command(
+                "C:/Repo",
+                Some(&app_root),
+                &json!({"workdir":"C:/Repo","command":command}),
+            )
+            .expect("git command should be classified");
+            assert!(assessment.touches_knowledge, "command: {command}");
+            assert_eq!(
+                assessment.requires_confirm, requires_confirm,
+                "command: {command}"
+            );
+            assert_eq!(
+                assessment.reconcile_after_success, reconcile_after_success,
+                "command: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn bash_git_knowledge_assessment_handles_simple_git_sequences() {
+        let assessment = AgentInstance::assess_bash_git_knowledge_command(
+            "C:/Repo",
+            None,
+            &json!({
+                "workdir":"C:/Repo",
+                "command":"git add Locus/knowledge/design/core.md && git commit -m 'docs: update knowledge'"
+            }),
+        )
+        .expect("git sequence should be classified");
+
+        assert!(assessment.touches_knowledge);
+        assert!(!assessment.requires_confirm);
+        assert!(!assessment.reconcile_after_success);
+
+        assert!(AgentInstance::assess_bash_git_knowledge_command(
+            "C:/Repo",
+            None,
+            &json!({
+                "workdir":"C:/Repo",
+                "command":"git add Locus/knowledge/design/core.md && rm Locus/knowledge/design/core.md"
+            }),
+        )
+        .is_none());
     }
 
     fn test_agent_instance_with_prompts_and_app_knowledge_dir(
@@ -9215,6 +9838,18 @@ Use profiler helpers.
                 "bash",
                 json!({"workdir":".","command":"cat Locus/knowledge/design/core-loop.md"}),
             ),
+            (
+                "bash",
+                json!({"workdir":".","command":"mv Locus/knowledge/design/core-loop.md Locus/knowledge/design/core-loop-next.md"}),
+            ),
+            (
+                "bash",
+                json!({"workdir":".","command":"rm Locus/knowledge/design/core-loop.md"}),
+            ),
+            (
+                "bash",
+                json!({"workdir":".","command":"rm Locus/knowledge"}),
+            ),
         ] {
             assert_eq!(
                 agent.validate_knowledge_tool_routing(tool_name, &args),
@@ -9222,6 +9857,55 @@ Use profiler helpers.
                 "tool {tool_name} should be rejected for knowledge paths"
             );
         }
+    }
+
+    #[test]
+    fn knowledge_routing_allows_simple_git_commands_for_knowledge_paths() {
+        let root = tempdir().expect("temp dir");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(workspace.join("Locus/knowledge/design"))
+            .expect("create knowledge dir");
+        std::fs::write(
+            workspace.join("Locus/knowledge/design/core-loop.md"),
+            "# Core Loop\n",
+        )
+        .expect("write knowledge doc");
+
+        let agent = test_agent_instance(workspace.to_string_lossy().to_string());
+
+        for command in [
+            "git status --short Locus/knowledge/design/core-loop.md",
+            "git diff -- Locus/knowledge/design/core-loop.md",
+            "git add Locus/knowledge/design/core-loop.md",
+            "git restore --staged Locus/knowledge/design/core-loop.md",
+            "git reset -- Locus/knowledge/design/core-loop.md",
+            "git restore -- Locus/knowledge/design/core-loop.md",
+            "git checkout -- Locus/knowledge/design/core-loop.md",
+            "git reset --hard HEAD",
+            "git stash apply",
+            "git stash pop",
+            "git merge feature/knowledge",
+            "git rebase main",
+            "git cherry-pick HEAD~1",
+            "git revert HEAD",
+            "git add Locus/knowledge/design/core-loop.md && git commit -m 'docs: update knowledge'",
+        ] {
+            assert_eq!(
+                agent.validate_knowledge_tool_routing(
+                    "bash",
+                    &json!({"workdir":".","command":command})
+                ),
+                None,
+                "git command should be allowed through routing: {command}"
+            );
+        }
+
+        assert!(agent
+            .validate_knowledge_tool_routing(
+                "bash",
+                &json!({"workdir":".","command":"git clean -fd Locus/knowledge/design"})
+            )
+            .is_some());
     }
 
     #[test]
