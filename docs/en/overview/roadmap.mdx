@@ -1,26 +1,26 @@
 ---
 title: Roadmap
-description: Locus follow-up development plan
+description: What's coming next
 ---
 
 ## In Progress
 
-- **Vertical layout mode and Unity window embedding**: support switching the frontend to a vertical layout when the window becomes narrow, and embedding it in a native Unity Editor window
-- **Runtime analysis tools**: let the Agent write condition-triggered scripts during runtime to sample data frame by frame and improve debugging capability
+- **Vertical layout and native Unity-window embedding**: a vertical layout for narrow windows; an option to embed Locus inside a native Unity Editor window.
+- **Runtime analysis tools**: the Agent writes conditional, frame-by-frame sampling scripts during play mode to help with debugging.
 
 ## In Queue
 
-- **More Unity-domain knowledge SKILL**: maintaining project knowledge bases and memory (`/dream`), creating particle systems, reading profiler data to analyze project performance bottlenecks, writing custom render pipelines, and more
-- **Instant messaging software**: support sending and receiving conversation messages through messaging software
-- **More data editing tools**: support editing more kinds of configuration data such as Excel spreadsheets
-- **Unity Editor extensions**: expose Locus parsing, search, and other tools on the Unity side so high-speed search and similar capabilities can be used inside the native Unity Editor
-- **More version control software support**: P4 and SVN support
-- **Security improvements**: add more tool permission configuration items and use smaller models to review tool call safety
+- **More Unity Skills**: knowledge and memory maintenance (`/dream`), particle systems, profiler-driven performance triage, custom render pipelines, and more.
+- **Chat-app integration**: send and receive Locus conversations from messaging apps.
+- **More data editors**: support for additional config formats, such as Excel.
+- **Unity Editor extensions**: expose Locus's parser, fast search, and other tools inside the native Unity Editor.
+- **More VCS support**: Perforce (P4) and SVN.
+- **Tighter security controls**: more granular tool permissions, plus smaller models that audit tool-call safety.
 
 ## Under Discussion
 
-- **Local language model deployment**: provide an optional local model runtime inside Locus
-- **Hot updates while the editor is running**: support modifying script logic at runtime and compiling and applying it in real time
-- **End-to-end mode**: strengthen the model's ability to test and evaluate implemented features through editor screenshots, test input scripts, and separate evaluation contexts
-- **External tool import**: support importing external tools through MCP, CLI, and similar methods
-- **Game development SKILL HUB**: a community-driven SKILL sharing platform
+- **Local model runtime**: an optional local LLM runtime inside Locus.
+- **Hot reload during Play mode**: edit script logic at runtime and have it compile and apply live.
+- **End-to-end mode**: editor screenshots, scripted test inputs, and isolated evaluation contexts so the model can verify what it built.
+- **External tool import**: load external tools via MCP, CLI, and similar.
+- **Game-dev Skill Hub**: a community-driven sharing platform for Skills.

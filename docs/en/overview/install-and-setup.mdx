@@ -5,66 +5,66 @@ description: Install and configure Locus quickly
 
 <br/>
 <div style={{ textAlign: 'center', color: '#8f2f2f' }}>
-  **Before you begin using Locus to make any modifications, make sure you have backed up your project files.**<br />
-  **AI Agents may involve uncertainty while executing tasks. Use them with caution.**
+  **Back up your project files before letting Locus modify anything.**<br />
+  **AI agents can produce unexpected results—use them with care.**
 </div>
 
 <br/>
 
 ## Configure Model Services
 
-Locus requires a remote AI service as its inference engine. **The performance of the remote large model will directly affect the effectiveness of Locus.**
+Locus needs a remote AI service as its inference engine. **The chosen model's performance directly determines how well Locus works.**
 
-> **Subscription services and message formats currently supported by Locus**
+> **Currently supported subscriptions and message formats:**
 > - OpenAI subscription
-> - Anthropic subscription (Anthropic has explicitly prohibited third-party clients from accessing its subscription service. You assume the related risk when using this method.)
+> - Anthropic subscription (Anthropic explicitly bans third-party clients from accessing its subscription—use at your own risk.)
 > - OpenAI Response API
 > - Anthropic Messages API
 > - OpenAI Chat Completions API
 
-Other than the configured remote model service calls, Locus is a pure client-side application. No other information will be uploaded to the internet.
+Aside from calls to your configured model provider, Locus runs entirely on your machine—nothing else leaves it.
 
-We recommend installing the official package. After installation, the app will automatically enter the onboarding flow on first launch.
+We recommend the official installer. On first launch, the app drops you into the onboarding flow automatically.
 
 ## Select a Project and Install the Plugin
 
 ![img](/images/overview/install-and-setup/unity-plugin-2.png)
 
-Locus communicates with the Unity Editor through a Unity plugin to detect editor state, execute C# code, and more.
+A Unity plugin handles editor communication: state detection, C# execution, and asset import.
 
-The default plugin installation path is `Packages/com.farlocus.locus`. If an older `Assets/Locus` installation is detected, clicking update will automatically migrate it to the new package path.
+The plugin installs to `Packages/com.farlocus.locus` by default. If we find an older `Assets/Locus` install, clicking Update migrates it to the new package path.
 
 ## Version Control / Git Configuration
 
 ![img](/images/overview/install-and-setup/git-config.png)
 
-Locus relies on version control tools to provide functions such as undo and change analysis.
+Locus uses your version control system for features like undo and change analysis.
 
-In addition, Locus provides a graphical interface for Git.
+It also ships a graphical UI for Git.
 
-> We plan to support version control tools such as Perforce (P4) and SVN in the future. The current version supports Git only.
+> Perforce (P4) and SVN support is planned. Today, only Git is supported.
 
 ## Scan the Asset Database
 
 ![img](/images/overview/install-and-setup/asset-scan.png)
 
-Locus does not parse assets through the Unity Editor. Instead, it reads Unity serialized files directly from disk to analyze reference relationships between assets.
+Locus reads Unity's serialized files directly from disk—not through the Editor—to map references between assets.
 
 ## Try Your First Conversation
 
 <br/>
 <div style={{ textAlign: 'center', color: '#8f2f2f' }}>
-  **Before you begin using Locus to make any modifications, make sure you have backed up your project files.**<br />
-  **AI Agents may involve uncertainty while executing tasks. Use them with caution.**
+  **Back up your project files before letting Locus modify anything.**<br />
+  **AI agents can produce unexpected results—use them with care.**
 </div>
 
 
-The basic configuration of Locus is now complete. You can adjust the settings above later on the Settings page.
+Setup is done. You can revisit any of the above on the Settings page later.
 
-You can now try the following example conversations:
+Try one of these to start:
 
-- Analyze the project's code structure and point out areas that can be optimized.
-- Create a side-scrolling platformer: write a simple 2D side-scrolling jump controller and place several test platforms in the current scene.
-- Commit the current modifications to Git in batches.
-- Create a custom render pipeline in a cartoon style: draft an implementation plan and execute it after review.
-- Generate corresponding localized text for the description strings under all `Item` assets in the project and fill them into a table.
+- Analyze the project's code structure and call out anything worth refactoring.
+- Build a 2D platformer: write a simple jump controller and drop a few test platforms into the current scene.
+- Commit my pending changes to Git in batches.
+- Cartoon-style custom render pipeline: draft a plan, then execute once I've reviewed it.
+- Localize the description strings on every `Item` asset and write the results into a table.
