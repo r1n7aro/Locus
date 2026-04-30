@@ -387,6 +387,15 @@ export type StreamEvent = { runId: string } & (
       delta: string;
     }
   | {
+      type: "toolCallProgress";
+      sessionId: string;
+      toolCallId: string;
+      title: string;
+      info: string;
+      progress?: number | null;
+      state: string;
+    }
+  | {
       type: "subagentToolCallStart";
       sessionId: string;
       parentToolCallId: string;
@@ -1976,7 +1985,15 @@ export interface ToolCallDisplay {
   status: "running" | "done" | "error" | "interrupted";
   order?: number;
   output?: string;
+  progress?: ToolCallProgress | null;
   nestedToolCalls?: ToolCallDisplay[];
+}
+
+export interface ToolCallProgress {
+  title: string;
+  info: string;
+  progress?: number | null;
+  state: string;
 }
 
 export type NotificationLevel = "error" | "warning" | "success" | "info";

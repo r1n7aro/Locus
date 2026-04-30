@@ -108,12 +108,23 @@ namespace Locus
                     title = "",
                     info = "",
                     progress = 0,
-                    revision = _executeCodeProgressRevision
+                    revision = _executeCodeProgressRevision,
+                    source = ""
                 };
             }
         }
 
         private static void SetExecuteCodeProgress(string title, string info, float progress)
+        {
+            SetExecuteCodeProgressSnapshot(title, info, progress, "api");
+        }
+
+        private static void SetExecuteCodeStage(string info)
+        {
+            SetExecuteCodeProgressSnapshot(info, "", 0, "stage");
+        }
+
+        private static void SetExecuteCodeProgressSnapshot(string title, string info, float progress, string source)
         {
             lock (_executeCodeProgressLock)
             {
@@ -124,7 +135,8 @@ namespace Locus
                     title = string.IsNullOrEmpty(title) ? "Locus" : title,
                     info = info ?? "",
                     progress = Mathf.Clamp01(progress),
-                    revision = _executeCodeProgressRevision
+                    revision = _executeCodeProgressRevision,
+                    source = string.IsNullOrEmpty(source) ? "api" : source
                 };
             }
         }
@@ -146,26 +158,37 @@ namespace Locus
             try
             {
                 ResetExecuteCodeProgress();
+                SetExecuteCodeStage("Preparing compiler");
 
                 string prepareError = await EnsureExecuteCodeCompilationReadyAsync();
                 if (!string.IsNullOrEmpty(prepareError))
+                {
+                    SetExecuteCodeStage("Compiler preparation failed");
                     return ErrorResponse(requestId, prepareError);
+                }
 
                 CompiledAsyncSnippet snippet;
                 try
                 {
+                    SetExecuteCodeStage("Compiling snippet");
                     snippet = CompileAsyncSnippet(code);
                 }
                 catch (Exception ex)
                 {
+                    SetExecuteCodeStage("Compilation failed");
                     return ErrorResponse(requestId, "async snippet compilation exception: " + ex.Message);
                 }
 
+                SetExecuteCodeStage("Executing snippet");
                 string resultText = await ExecuteAsyncSnippetOnMainThreadAsync(snippet);
 
                 if (resultText.StartsWith("__ERROR__: ", StringComparison.Ordinal))
+                {
+                    SetExecuteCodeStage("Execution failed");
                     return ErrorResponse(requestId, resultText.Substring("__ERROR__: ".Length));
+                }
 
+                SetExecuteCodeStage("Execution complete");
                 return OkResponse(requestId, resultText);
             }
             finally

@@ -272,7 +272,7 @@ describe("reduceStreamEvent", () => {
       expect(mutations).toContainEqual({
         type: "updateToolCall",
         id: "tc1",
-        updates: { status: "done", output: "file contents" },
+        updates: { status: "done", output: "file contents", progress: null },
       });
     });
 
@@ -291,7 +291,7 @@ describe("reduceStreamEvent", () => {
       expect(mutations).toContainEqual({
         type: "updateToolCall",
         id: "tc1",
-        updates: { status: "error", output: "not found" },
+        updates: { status: "error", output: "not found", progress: null },
       });
     });
 
@@ -310,7 +310,7 @@ describe("reduceStreamEvent", () => {
       expect(mutations).toContainEqual({
         type: "updateToolCall",
         id: "tc1",
-        updates: { status: "interrupted", output: "工具执行被用户中止，未返回结果。" },
+        updates: { status: "interrupted", output: "工具执行被用户中止，未返回结果。", progress: null },
       });
     });
 
@@ -366,6 +366,35 @@ describe("reduceStreamEvent", () => {
       const mutations = reduceStreamEvent(state, event);
 
       expect(mutations).toContainEqual({ type: "appendToolDelta", id: "tc1", delta: "partial" });
+    });
+  });
+
+  describe("toolCallProgress", () => {
+    it("updates structured tool progress without appending output", () => {
+      const state = makeState({ isStreaming: true });
+      const event: StreamEvent = {
+        runId: "test-run",
+        type: "toolCallProgress",
+        sessionId: "s1",
+        toolCallId: "tc1",
+        title: "Compiling states",
+        info: "",
+        progress: null,
+        state: "running",
+      };
+      const mutations = reduceStreamEvent(state, event);
+
+      expect(mutations).toContainEqual({
+        type: "updateToolProgress",
+        id: "tc1",
+        progress: {
+          title: "Compiling states",
+          info: "",
+          progress: null,
+          state: "running",
+        },
+      });
+      expect(mutations.some((mutation) => mutation.type === "appendToolDelta")).toBe(false);
     });
   });
 

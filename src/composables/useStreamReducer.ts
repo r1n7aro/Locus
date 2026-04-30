@@ -1,5 +1,5 @@
 import { hydrateChatMessageIntent } from "./chatInputIntents";
-import type { StreamEvent, ChatMessage, TokenUsage, TodoItem, ToolCallDisplay, PendingQuestion, PendingToolConfirm, ImageAttachment } from "../types";
+import type { StreamEvent, ChatMessage, TokenUsage, TodoItem, ToolCallDisplay, PendingQuestion, PendingToolConfirm, ImageAttachment, ToolCallProgress } from "../types";
 
 export interface StreamState {
   messages: ChatMessage[];
@@ -35,6 +35,7 @@ export type StreamMutation =
   | { type: "addNestedToolCall"; parentId: string; toolCall: ToolCallDisplay }
   | { type: "updateNestedToolCall"; parentId: string; childId: string; updates: Partial<ToolCallDisplay> }
   | { type: "appendToolDelta"; id: string; delta: string }
+  | { type: "updateToolProgress"; id: string; progress: ToolCallProgress | null }
   | { type: "pushMessage"; message: ChatMessage }
   | { type: "upsertMessage"; message: ChatMessage }
   | { type: "upsertUserMessage"; message: ChatMessage }
@@ -198,7 +199,7 @@ export function reduceStreamEvent(state: StreamState, event: StreamEvent): Strea
       mutations.push({
         type: "updateToolCall",
         id: event.toolCallId,
-        updates: { status: event.outcome, output: event.output },
+        updates: { status: event.outcome, output: event.output, progress: null },
       });
       // Parse todowrite output
       if (event.toolName === "todowrite" && event.outcome === "done") {
@@ -227,6 +228,19 @@ export function reduceStreamEvent(state: StreamState, event: StreamEvent): Strea
 
     case "toolCallDelta":
       mutations.push({ type: "appendToolDelta", id: event.toolCallId, delta: event.delta });
+      break;
+
+    case "toolCallProgress":
+      mutations.push({
+        type: "updateToolProgress",
+        id: event.toolCallId,
+        progress: {
+          title: event.title,
+          info: event.info,
+          progress: event.progress,
+          state: event.state,
+        },
+      });
       break;
 
     case "subagentToolCallStart": {

@@ -753,6 +753,11 @@ export const useChatStore = defineStore("chat", () => {
         if (tcDelta) tcDelta.output = (tcDelta.output || "") + m.delta;
         break;
       }
+      case "updateToolProgress": {
+        const tcProgress = activeToolCalls.value.find((t) => t.id === m.id);
+        if (tcProgress) tcProgress.progress = m.progress;
+        break;
+      }
       case "pushMessage":
         messages.value = replaceMessageById(messages.value, m.message);
         if (m.message.role === "assistant") {

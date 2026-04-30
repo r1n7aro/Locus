@@ -62,6 +62,30 @@ fn emit_stream(handle: &AppHandle, run_id: &str, event: StreamEvent) {
     crate::session::gateway::emit_stream(handle, store.inner().as_ref(), run_id, event);
 }
 
+fn emit_tool_progress(
+    handle: &AppHandle,
+    run_id: &str,
+    session_id: &str,
+    tool_call_id: &str,
+    title: impl Into<String>,
+    info: impl Into<String>,
+    progress: Option<f32>,
+    state: impl Into<String>,
+) {
+    emit_stream(
+        handle,
+        run_id,
+        StreamEvent::ToolCallProgress {
+            session_id: session_id.to_string(),
+            tool_call_id: tool_call_id.to_string(),
+            title: title.into(),
+            info: info.into(),
+            progress,
+            state: state.into(),
+        },
+    );
+}
+
 fn log_stage_elapsed(
     agent_id: &str,
     session_id: &str,
@@ -6433,23 +6457,47 @@ impl AgentInstance {
             }
         }
 
-        let handle = app_handle.clone();
+        emit_tool_progress(
+            app_handle,
+            run_id,
+            &self.session_id,
+            tool_call_id,
+            "Preparing compiler",
+            "",
+            None,
+            "running",
+        );
+
+        let progress_handle = app_handle.clone();
+        let result_handle = app_handle.clone();
         let session_id = self.session_id.clone();
+        let result_session_id = self.session_id.clone();
         let tool_call_id = tool_call_id.to_string();
-        let run_id = run_id.to_string();
+        let result_tool_call_id = tool_call_id.clone();
+        let progress_run_id = run_id.to_string();
+        let result_run_id = progress_run_id.clone();
 
         match crate::unity_bridge::unity_execute_code_with_progress(
             &self.working_dir,
             code,
             move |snapshot| {
-                emit_stream(
-                    &handle,
-                    &run_id,
-                    StreamEvent::ToolCallDelta {
-                        session_id: session_id.clone(),
-                        tool_call_id: tool_call_id.clone(),
-                        delta: crate::unity_bridge::format_unity_execute_progress_delta(&snapshot),
-                    },
+                if !snapshot.active {
+                    return;
+                }
+                let progress = if snapshot.source == "api" {
+                    Some(snapshot.progress)
+                } else {
+                    None
+                };
+                emit_tool_progress(
+                    &progress_handle,
+                    &progress_run_id,
+                    &session_id,
+                    &tool_call_id,
+                    snapshot.title,
+                    snapshot.info,
+                    progress,
+                    "running",
                 );
             },
         )
@@ -6466,10 +6514,30 @@ impl AgentInstance {
                     is_error: false,
                 }
             }
-            Err(error) => ToolResult {
-                output: error,
-                is_error: true,
-            },
+            Err(error) => {
+                let title = if error.contains("compilation")
+                    || error.contains("Compilation")
+                    || error.contains("compile")
+                {
+                    "Compilation failed"
+                } else {
+                    "Execution failed"
+                };
+                emit_tool_progress(
+                    &result_handle,
+                    &result_run_id,
+                    &result_session_id,
+                    &result_tool_call_id,
+                    title,
+                    "",
+                    None,
+                    "error",
+                );
+                ToolResult {
+                    output: error,
+                    is_error: true,
+                }
+            }
         }
     }
 
@@ -6586,7 +6654,28 @@ impl AgentInstance {
             };
         }
 
+        emit_tool_progress(
+            app_handle,
+            run_id,
+            &self.session_id,
+            tool_call_id,
+            "Compiling states",
+            "",
+            None,
+            "running",
+        );
+
         if let Err(error) = crate::unity_bridge::compile_run_states(&self.working_dir, args).await {
+            emit_tool_progress(
+                app_handle,
+                run_id,
+                &self.session_id,
+                tool_call_id,
+                "Compilation failed",
+                "",
+                None,
+                "error",
+            );
             return ToolResult {
                 output: error,
                 is_error: true,
@@ -6603,6 +6692,16 @@ impl AgentInstance {
         }
 
         if current_status != requested_status {
+            emit_tool_progress(
+                app_handle,
+                run_id,
+                &self.session_id,
+                tool_call_id,
+                "Changing editor status",
+                format!("{} -> {}", current_status, requested_status),
+                None,
+                "running",
+            );
             match self
                 .request_unity_editor_status_change_confirm(
                     app_handle,
@@ -6633,12 +6732,33 @@ impl AgentInstance {
             if let Err(error) =
                 crate::unity_bridge::set_editor_status(&self.working_dir, requested_status).await
             {
+                emit_tool_progress(
+                    app_handle,
+                    run_id,
+                    &self.session_id,
+                    tool_call_id,
+                    "Editor status change failed",
+                    "",
+                    None,
+                    "error",
+                );
                 return ToolResult {
                     output: format!("Failed to change Unity Editor status: {}", error),
                     is_error: true,
                 };
             }
         }
+
+        emit_tool_progress(
+            app_handle,
+            run_id,
+            &self.session_id,
+            tool_call_id,
+            "Running state machine",
+            requested_status,
+            None,
+            "running",
+        );
 
         match crate::unity_bridge::unity_run_states(&self.working_dir, args).await {
             Ok(output) => ToolResult {
@@ -6649,10 +6769,22 @@ impl AgentInstance {
                 },
                 is_error: false,
             },
-            Err(error) => ToolResult {
-                output: error,
-                is_error: true,
-            },
+            Err(error) => {
+                emit_tool_progress(
+                    app_handle,
+                    run_id,
+                    &self.session_id,
+                    tool_call_id,
+                    "Runtime failed",
+                    "",
+                    None,
+                    "error",
+                );
+                ToolResult {
+                    output: error,
+                    is_error: true,
+                }
+            }
         }
     }
 

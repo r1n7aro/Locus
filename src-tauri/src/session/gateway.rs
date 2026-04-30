@@ -21,6 +21,7 @@ fn event_session_id(event: &StreamEvent) -> &str {
         | StreamEvent::ToolCallStart { session_id, .. }
         | StreamEvent::ToolCallDone { session_id, .. }
         | StreamEvent::ToolCallDelta { session_id, .. }
+        | StreamEvent::ToolCallProgress { session_id, .. }
         | StreamEvent::SubagentToolCallStart { session_id, .. }
         | StreamEvent::SubagentToolCallDone { session_id, .. }
         | StreamEvent::ToolCallRoundDone { session_id, .. }
@@ -47,6 +48,7 @@ fn event_type(event: &StreamEvent) -> &'static str {
         StreamEvent::ToolCallStart { .. } => "toolCallStart",
         StreamEvent::ToolCallDone { .. } => "toolCallDone",
         StreamEvent::ToolCallDelta { .. } => "toolCallDelta",
+        StreamEvent::ToolCallProgress { .. } => "toolCallProgress",
         StreamEvent::SubagentToolCallStart { .. } => "subagentToolCallStart",
         StreamEvent::SubagentToolCallDone { .. } => "subagentToolCallDone",
         StreamEvent::ToolCallRoundDone { .. } => "toolCallRoundDone",
@@ -73,6 +75,7 @@ fn run_status_for_event(event: &StreamEvent) -> Option<(&'static str, Option<Str
         | StreamEvent::ToolCallStart { .. }
         | StreamEvent::ToolCallDone { .. }
         | StreamEvent::ToolCallDelta { .. }
+        | StreamEvent::ToolCallProgress { .. }
         | StreamEvent::SubagentToolCallStart { .. }
         | StreamEvent::SubagentToolCallDone { .. }
         | StreamEvent::ToolCallRoundDone { .. }

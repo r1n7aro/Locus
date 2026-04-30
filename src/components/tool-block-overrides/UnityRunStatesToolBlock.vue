@@ -88,10 +88,16 @@ const statusIcon = computed(() => {
 
 const hasPrints = computed(() => (runtimePreview.value?.printText.trim().length ?? 0) > 0);
 const showRuntimePrintText = computed(() => props.toolCall.status === "running" && hasPrints.value);
+const toolProgress = computed(() => props.toolCall.status === "running" ? props.toolCall.progress : null);
+const toolProgressText = computed(() => {
+  const progress = toolProgress.value;
+  if (!progress) return "";
+  return [progress.title, progress.info].filter((part) => part.trim()).join(" · ");
+});
 
 const runtimeProgressSummary = computed(() => {
   const runtime = runtimePreview.value;
-  if (!runtime) return "";
+  if (!runtime) return toolProgressText.value;
   const parts: string[] = [];
   if (runtime.currentState) {
     parts.push(runtime.currentState);
@@ -116,7 +122,8 @@ const headerSummary = computed(() => runtimeProgressSummary.value);
 const showRuntimeProgressLine = computed(() => props.toolCall.status === "running" && Boolean(runtimePreview.value));
 const isFramed = computed(() => infoExpanded.value || showRuntimeProgressLine.value);
 const showRuntimePromptText = computed(() => props.toolCall.status === "running" && Boolean(runtimePromptText.value));
-const showRuntimePrintFallback = computed(() => showRuntimeProgressLine.value && !showRuntimePrintText.value);
+const showRuntimePrintFallback = computed(() => Boolean(runtimePreview.value) && !showRuntimePrintText.value);
+const showToolProgressDots = computed(() => props.toolCall.status === "running" && Boolean(toolProgressText.value) && !runtimePreview.value);
 </script>
 
 <template>
@@ -134,6 +141,7 @@ const showRuntimePrintFallback = computed(() => showRuntimeProgressLine.value &&
       </span>
       <span class="tool-call-name">{{ toolCall.name }}</span>
       <span v-if="headerSummary" class="tool-call-summary">{{ headerSummary }}</span>
+      <span v-if="showToolProgressDots" class="tool-call-inline-dots" aria-hidden="true"><span>.</span><span>.</span><span>.</span></span>
     </button>
 
     <div v-if="showRuntimeProgressLine" class="tool-call-progress-line" aria-live="polite">
@@ -288,6 +296,35 @@ const showRuntimePrintFallback = computed(() => showRuntimeProgressLine.value &&
   overflow: hidden;
   text-overflow: ellipsis;
   min-width: 0;
+}
+
+.tool-call-inline-dots {
+  display: inline-flex;
+  width: 1.4em;
+  margin-left: -4px;
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.4;
+  flex-shrink: 0;
+  opacity: 0.72;
+}
+
+.tool-call-inline-dots span {
+  animation: tool-inline-dot 1.2s infinite ease-in-out;
+}
+
+.tool-call-inline-dots span:nth-child(2) {
+  animation-delay: 0.2s;
+}
+
+.tool-call-inline-dots span:nth-child(3) {
+  animation-delay: 0.4s;
+}
+
+@keyframes tool-inline-dot {
+  0%, 20% { opacity: 0.22; }
+  50% { opacity: 1; }
+  100% { opacity: 0.22; }
 }
 
 .tool-call-detail {

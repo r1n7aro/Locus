@@ -58,6 +58,8 @@ pub struct UnityExecuteProgressSnapshot {
     pub progress: f32,
     #[serde(default)]
     pub revision: u64,
+    #[serde(default)]
+    pub source: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -918,7 +920,7 @@ pub fn import_assets_fire_and_forget(project_path: &str, asset_paths: Vec<String
 
 pub fn format_unity_execute_progress_delta(snapshot: &UnityExecuteProgressSnapshot) -> String {
     let payload = serde_json::to_string(snapshot).unwrap_or_else(|_| {
-        "{\"active\":false,\"title\":\"\",\"info\":\"\",\"progress\":0,\"revision\":0}".to_string()
+        "{\"active\":false,\"title\":\"\",\"info\":\"\",\"progress\":0,\"revision\":0,\"source\":\"\"}".to_string()
     });
     format!(
         "<{tag}>{payload}</{tag}>\n",

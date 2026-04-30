@@ -217,6 +217,13 @@ function applyMutation(state: EmbeddedChatState, mutation: StreamMutation) {
       }
       break;
     }
+    case "updateToolProgress": {
+      const toolCall = state.activeToolCalls.find((item) => item.id === mutation.id);
+      if (toolCall) {
+        toolCall.progress = mutation.progress;
+      }
+      break;
+    }
     case "pushMessage":
       state.messages = replaceMessageById(state.messages, mutation.message);
       break;

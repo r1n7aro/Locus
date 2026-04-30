@@ -65,6 +65,15 @@ pub enum StreamEvent {
         delta: String,
     },
     #[serde(rename_all = "camelCase")]
+    ToolCallProgress {
+        session_id: String,
+        tool_call_id: String,
+        title: String,
+        info: String,
+        progress: Option<f32>,
+        state: String,
+    },
+    #[serde(rename_all = "camelCase")]
     SubagentToolCallStart {
         session_id: String,
         parent_tool_call_id: String,

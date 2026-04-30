@@ -185,6 +185,11 @@ describe("unityRunStatesPreview", () => {
     expect(runStatesSource.indexOf("compile_run_states")).toBeLessThan(
       runStatesSource.indexOf("request_unity_editor_status_change_confirm"),
     );
+    expect(runStatesSource).toContain("Compiling states");
+    expect(runStatesSource).toContain("Compilation failed");
+    expect(runStatesSource).toContain("Running state machine");
+    expect(runStatesSource).toContain("Runtime failed");
+    expect(runStatesSource).toContain("emit_tool_progress(");
 
     const executeStart = agentSource.indexOf("async fn execute_unity_execute");
     const executeEnd = agentSource.indexOf("async fn execute_unity_recompile", executeStart);
@@ -216,14 +221,18 @@ describe("unityRunStatesPreview", () => {
     expect(progressIndex).toBeLessThan(detailIndex);
     expect(source).toContain("<span v-if=\"headerSummary\" class=\"tool-call-summary\">");
     expect(source).toContain("const headerSummary = computed(() => runtimeProgressSummary.value)");
+    expect(source).toContain("const toolProgress = computed(() => props.toolCall.status === \"running\" ? props.toolCall.progress : null)");
+    expect(source).toContain("const toolProgressText = computed(() => {");
     expect(source).toContain("const showRuntimeProgressLine = computed(() => props.toolCall.status === \"running\" && Boolean(runtimePreview.value))");
+    expect(source).toContain("const showToolProgressDots = computed(() => props.toolCall.status === \"running\" && Boolean(toolProgressText.value) && !runtimePreview.value)");
     expect(read("src/composables/unityRunStatesPreview.ts")).toContain("if (toolStatus === \"running\" && !hasOutput) return null;");
     expect(source).toContain("v-if=\"showRuntimeProgressLine\"");
+    expect(source).toContain("class=\"tool-call-inline-dots\"");
     expect(source).toContain("const runtimePromptText = computed(() => runtimePreview.value?.promptText.trim() ?? \"\")");
     expect(source).toContain("const showRuntimePromptText = computed(() => props.toolCall.status === \"running\" && Boolean(runtimePromptText.value))");
     expect(source).toContain("class=\"unity-run-prompt-text ui-select-text\"");
     expect(source).toContain("const showRuntimePrintText = computed(() => props.toolCall.status === \"running\" && hasPrints.value)");
-    expect(source).toContain("const showRuntimePrintFallback = computed(() => showRuntimeProgressLine.value && !showRuntimePrintText.value)");
+    expect(source).toContain("const showRuntimePrintFallback = computed(() => Boolean(runtimePreview.value) && !showRuntimePrintText.value)");
     expect(source).toContain("v-if=\"showRuntimePrintText\"");
     expect(source).toContain("v-else-if=\"showRuntimePrintFallback\"");
     expect(source).not.toContain("tool.unityRunStates.currentState");

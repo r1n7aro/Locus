@@ -72,6 +72,6 @@ export function parseUnityExecuteProgressOutput(rawOutput: string | undefined): 
   };
 }
 
-export function formatUnityExecuteProgressPercent(progress: UnityExecuteProgressEvent): string {
+export function formatUnityExecuteProgressPercent(progress: Pick<UnityExecuteProgressEvent, "progress">): string {
   return `${Math.round(clampProgress(progress.progress) * 100)}%`;
 }

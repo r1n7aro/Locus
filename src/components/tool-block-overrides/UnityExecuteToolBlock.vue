@@ -60,7 +60,19 @@ const rawOutput = computed(() => {
 });
 
 const progressPreview = computed(() => parseUnityExecuteProgressOutput(rawOutput.value));
-const progress = computed(() => progressPreview.value.progress);
+const liveProgress = computed(() => props.toolCall.status === "running" ? props.toolCall.progress : null);
+const liveProgressHasValue = computed(() => typeof liveProgress.value?.progress === "number");
+const progress = computed(() => {
+  const live = liveProgress.value;
+  if (live && typeof live.progress === "number") {
+    return {
+      title: live.title,
+      info: live.info,
+      progress: live.progress,
+    };
+  }
+  return props.toolCall.status === "running" ? progressPreview.value.progress : null;
+});
 const displayOutput = computed(() => progressPreview.value.displayOutput);
 
 const progressPercent = computed(() =>
@@ -99,7 +111,14 @@ const statusIcon = computed(() => {
 
 const showRuntimeOnly = computed(() => props.toolCall.status === "running");
 const showWaiting = computed(() => showRuntimeOnly.value && !progress.value && !displayOutput.value);
-const showProgressLine = computed(() => Boolean(progress.value));
+const showProgressLine = computed(() => showRuntimeOnly.value && Boolean(progress.value));
+const inlineStatus = computed(() => {
+  const live = liveProgress.value;
+  if (showRuntimeOnly.value && live && !liveProgressHasValue.value) {
+    return [live.title, live.info].filter((part) => part.trim()).join(" · ");
+  }
+  return showWaiting.value ? t("tool.waiting") : "";
+});
 const hasInfoDetail = computed(() => !showRuntimeOnly.value || Boolean(displayOutput.value));
 const isFramed = computed(() => infoExpanded.value || showProgressLine.value);
 </script>
@@ -119,7 +138,9 @@ const isFramed = computed(() => infoExpanded.value || showProgressLine.value);
       </span>
       <span class="tool-call-name">{{ toolCall.name }}</span>
       <span v-if="headerSummary" class="tool-call-summary">{{ headerSummary }}</span>
-      <span v-if="showWaiting" class="tool-call-inline-status">{{ t("tool.waiting") }}</span>
+      <span v-if="inlineStatus" class="tool-call-inline-status">
+        <span>{{ inlineStatus }}</span><span class="tool-call-inline-dots" aria-hidden="true"><span>.</span><span>.</span><span>.</span></span>
+      </span>
     </button>
 
     <div v-if="showProgressLine" class="tool-call-progress-line" aria-live="polite">
@@ -284,12 +305,38 @@ const isFramed = computed(() => infoExpanded.value || showProgressLine.value);
 }
 
 .tool-call-inline-status {
+  display: inline-flex;
+  align-items: baseline;
   color: var(--text-secondary);
   font-size: 11px;
   line-height: 1.4;
   white-space: nowrap;
   flex-shrink: 0;
   opacity: 0.72;
+}
+
+.tool-call-inline-dots {
+  display: inline-flex;
+  width: 1.4em;
+  margin-left: 1px;
+}
+
+.tool-call-inline-dots span {
+  animation: tool-inline-dot 1.2s infinite ease-in-out;
+}
+
+.tool-call-inline-dots span:nth-child(2) {
+  animation-delay: 0.2s;
+}
+
+.tool-call-inline-dots span:nth-child(3) {
+  animation-delay: 0.4s;
+}
+
+@keyframes tool-inline-dot {
+  0%, 20% { opacity: 0.22; }
+  50% { opacity: 1; }
+  100% { opacity: 0.22; }
 }
 
 .tool-call-detail {

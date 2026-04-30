@@ -43,6 +43,7 @@ namespace Locus
             public string info;
             public float progress;
             public int revision;
+            public string source;
         }
 
         public sealed class ScriptGlobals

@@ -59,12 +59,22 @@ describe("unityExecuteProgress", () => {
   });
 
   it("wires unity_execute progress through the bridge and tool block override", () => {
+    const asyncExecuteSource = read("locus_unity/Editor/ExecuteCodeAsync/LocusBridge.ExecuteCodeAsync.cs");
+    const agentSource = read("src-tauri/src/agent/instance/mod.rs");
     expect(read("src/components/tool-block-overrides/toolBlockOverrides.ts")).toContain("unity_execute");
     expect(read("src/components/tool-block-overrides/UnityExecuteToolBlock.vue")).toContain("parseUnityExecuteProgressOutput");
+    expect(read("src/components/tool-block-overrides/UnityExecuteToolBlock.vue")).toContain("props.toolCall.progress");
+    expect(read("src/components/tool-block-overrides/UnityExecuteToolBlock.vue")).toContain("const liveProgressHasValue = computed(() => typeof liveProgress.value?.progress === \"number\")");
     expect(read("src-tauri/src/unity_bridge/mod.rs")).toContain("unity_execute_code_with_progress");
-    expect(read("src-tauri/src/agent/instance/mod.rs")).toContain("execute_unity_execute");
+    expect(agentSource).toContain("execute_unity_execute");
+    expect(agentSource).toContain("StreamEvent::ToolCallProgress");
     expect(read("locus_unity/Editor/LocusBridge.cs")).toContain("execute_code_progress");
-    expect(read("locus_unity/Editor/ExecuteCodeAsync/LocusBridge.ExecuteCodeAsync.cs")).not.toContain("DisplayCancelableProgressBar(");
+    expect(asyncExecuteSource).toContain("Preparing compiler");
+    expect(asyncExecuteSource).toContain("Compiling snippet");
+    expect(asyncExecuteSource).toContain("Executing snippet");
+    expect(asyncExecuteSource).toContain("Compilation failed");
+    expect(asyncExecuteSource).toContain("Execution failed");
+    expect(asyncExecuteSource).not.toContain("DisplayCancelableProgressBar(");
     expect(read("tools/unity_execute.json")).toContain("reports progress to the Locus tool call panel");
   });
 
@@ -91,6 +101,8 @@ describe("unityExecuteProgress", () => {
     expect(headerIndex).toBeLessThan(progressIndex);
     expect(progressIndex).toBeLessThan(detailIndex);
     expect(source).toContain("v-if=\"showProgressLine\"");
+    expect(source).toContain("const inlineStatus = computed(() => {");
+    expect(source).toContain("class=\"tool-call-inline-dots\"");
     expect(source).toContain("v-if=\"infoExpanded && hasInfoDetail\"");
     expect(source).toContain("const isFramed = computed(() => infoExpanded.value || showProgressLine.value)");
     expect(source).toContain("'is-framed': isFramed");
