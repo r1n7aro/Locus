@@ -1228,7 +1228,7 @@ namespace Locus
                     value = prop.stringValue;
                     return true;
                 case SerializedPropertyType.Enum:
-                    value = prop.enumDisplayNames[prop.enumValueIndex];
+                    value = FormatSerializedEnumValue(prop);
                     return true;
                 case SerializedPropertyType.ObjectReference:
                     value = prop.objectReferenceValue != null
@@ -1259,6 +1259,53 @@ namespace Locus
                     return true;
                 default:
                     return false;
+            }
+        }
+
+        private static string FormatSerializedEnumValue(SerializedProperty prop)
+        {
+            int index = -1;
+            try
+            {
+                index = prop.enumValueIndex;
+            }
+            catch
+            {
+            }
+
+            try
+            {
+                var displayNames = prop.enumDisplayNames;
+                if (displayNames != null
+                    && index >= 0
+                    && index < displayNames.Length
+                    && !string.IsNullOrEmpty(displayNames[index]))
+                    return displayNames[index];
+            }
+            catch
+            {
+            }
+
+            try
+            {
+                var names = prop.enumNames;
+                if (names != null
+                    && index >= 0
+                    && index < names.Length
+                    && !string.IsNullOrEmpty(names[index]))
+                    return names[index];
+            }
+            catch
+            {
+            }
+
+            try
+            {
+                return "Unknown (" + prop.intValue.ToString(CultureInfo.InvariantCulture) + ")";
+            }
+            catch
+            {
+                return "Unknown";
             }
         }
 
@@ -1618,7 +1665,7 @@ namespace Locus
                     sb.AppendLine(indent + name + ": \"" + prop.stringValue + "\"");
                     break;
                 case SerializedPropertyType.Enum:
-                    sb.AppendLine(indent + name + ": " + prop.enumDisplayNames[prop.enumValueIndex]);
+                    sb.AppendLine(indent + name + ": " + FormatSerializedEnumValue(prop));
                     break;
                 case SerializedPropertyType.ObjectReference:
                 {
