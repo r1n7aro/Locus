@@ -14,9 +14,9 @@ English | [简体中文](README.zh-CN.md)
 `Locus for Unity` is an open-source AI Agent for Unity projects.
 
 - **In-editor operations**: write C# code, read and modify Unity objects and assets, and complete the full feature development workflow
+- **Runtime analysis and debugging**: autonomously operate and capture runtime state to help fix bugs and optimize performance
 - **Automated knowledge system**: automatically summarize conversation requirements into design documents and preserve project understanding in long-term memory
 - **Visual version control**: provide a visual version control interface with semantic diff analysis and conflict handling for Unity YAML assets
-- **Highly optimized prompts**: optimize prompts for Unity projects, improve Agent capability, and avoid common mistakes
 - **Multiple model support**: support subscription account sign-in and compatibility with multiple LLM API capabilities
 
 Locus is currently in early testing (`v0.2.2`). We welcome you to try it and share feedback through Issues. Your input is highly valuable to us.
