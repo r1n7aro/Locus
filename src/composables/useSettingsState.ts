@@ -501,6 +501,10 @@ export function useSettingsState(emit: SettingsEmit) {
 
   function requestOAuthLogin() {
     disclaimerTarget.value = "anthropic";
+    oauthStep.value = "idle";
+    oauthCode.value = "";
+    errorMsg.value = "";
+    successMsg.value = "";
     showDisclaimer.value = true;
   }
 
@@ -509,12 +513,8 @@ export function useSettingsState(emit: SettingsEmit) {
   }
 
   function confirmDisclaimer() {
-    const target = disclaimerTarget.value;
     showDisclaimer.value = false;
     disclaimerTarget.value = null;
-    if (target === "anthropic") {
-      startOAuthLogin();
-    }
   }
 
   function cancelDisclaimer() {

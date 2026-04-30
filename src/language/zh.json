@@ -523,12 +523,15 @@
   "settings.provider.deleteFailed": "删除失败: {0}",
   "settings.provider.loadFailed": "加载供应商列表失败: {0}",
   "settings.provider.openrouter.desc": "统一网关，聚合 Claude / GPT / Gemini 等主流模型",
-  "settings.provider.anthropic.desc": "通过 OAuth 授权使用 Claude Pro / Max / Team 订阅配额",
+  "settings.provider.anthropic.desc": "Claude 订阅登录入口已暂停",
   "settings.provider.anthropic_sdk.desc": "经由本机 Claude Code CLI，走 Anthropic 官方 Agent SDK 控制协议",
 
-  "settings.anthropic.title": "Claude 订阅账户（OAuth 授权）",
-  "settings.anthropic.loginBtn": "使用 Claude 账户登录",
-  "settings.anthropic.hint": "兼容 Claude Pro / Max / Team 订阅",
+  "settings.anthropic.title": "Claude 订阅账户（已暂停）",
+  "settings.anthropic.loginBtn": "查看说明",
+  "settings.anthropic.hint": "Anthropic 已明确禁止 OpenClaw 等第三方客户端使用 Claude 订阅计划",
+  "settings.anthropic.disabledStatus": "已暂停",
+  "settings.anthropic.disabledHint": "授权流程已暂停",
+  "settings.anthropic.detailsBtn": "查看说明",
   "settings.anthropic.instruction": "在浏览器中登录你的 Claude 账号，授权后复制页面上显示的授权码并粘贴到下方",
   "settings.anthropic.codePlaceholder": "粘贴授权码...",
   "settings.anthropic.confirm": "确认",
@@ -2380,11 +2383,11 @@
   "settings.archived.role.tool": "工具",
   "settings.archived.loadFailed": "加载归档会话失败: {0}",
 
-  "disclaimer.subscription.title": "第三方访问说明",
-  "disclaimer.subscription.body": "使用第三方客户端接入 Claude 或 ChatGPT 订阅前，请先确认以下事项：",
-  "disclaimer.subscription.risk1": "服务提供商可能据此暂停或终止您的订阅账户。",
-  "disclaimer.subscription.risk2": "Locus 与 Anthropic、OpenAI 无关联，无法保证此接入方式持续可用。",
-  "disclaimer.subscription.risk3": "继续使用即表示相关风险由您自行承担。",
-  "disclaimer.subscription.confirm": "知悉并继续",
-  "disclaimer.subscription.cancel": "取消"
+  "disclaimer.subscription.title": "Claude 订阅已暂停",
+  "disclaimer.subscription.body": "Anthropic 已明确禁止 OpenClaw 等第三方客户端使用 Claude 订阅计划。",
+  "disclaimer.subscription.risk1": "当前版本已暂停 Claude OAuth 授权流程。",
+  "disclaimer.subscription.risk2": "已登录账号仍可在设置中退出登录。",
+  "disclaimer.subscription.risk3": "使用 Claude 时请改用 Anthropic API、自定义端点或 Claude Agent SDK。",
+  "disclaimer.subscription.confirm": "知悉",
+  "disclaimer.subscription.cancel": "关闭"
 }

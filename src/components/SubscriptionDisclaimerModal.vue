@@ -7,7 +7,6 @@ defineProps<{
 }>();
 
 const emit = defineEmits<{
-  confirm: [];
   cancel: [];
 }>();
 </script>
@@ -60,13 +59,6 @@ const emit = defineEmits<{
           <footer class="subscription-disclaimer-footer">
             <BaseButton size="md" @click="emit('cancel')">
               {{ t("disclaimer.subscription.cancel") }}
-            </BaseButton>
-            <BaseButton
-              class="subscription-disclaimer-confirm"
-              size="md"
-              @click="emit('confirm')"
-            >
-              {{ t("disclaimer.subscription.confirm") }}
             </BaseButton>
           </footer>
         </section>
@@ -181,19 +173,6 @@ const emit = defineEmits<{
   gap: 8px;
   padding: 14px 20px 18px;
   border-top: 1px solid var(--border-color);
-}
-
-:deep(.subscription-disclaimer-confirm) {
-  border-color: color-mix(in srgb, var(--status-danger-fg) 84%, #000 16%);
-  background: color-mix(in srgb, var(--status-danger-fg) 84%, #000 16%);
-  color: #fff;
-}
-
-:deep(.subscription-disclaimer-confirm:hover:not(:disabled)) {
-  border-color: color-mix(in srgb, var(--status-danger-fg) 76%, #000 24%);
-  background: color-mix(in srgb, var(--status-danger-fg) 76%, #000 24%);
-  color: #fff;
-  filter: none;
 }
 
 .subscription-disclaimer-enter-active,

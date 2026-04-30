@@ -47,7 +47,7 @@ const {
   startEdit, cancelEdit, saveKey, deleteKey, handleKeydown,
   oauthStep, oauthCode, submitOAuthCode, cancelOAuth, oauthLogout, handleOAuthKeydown,
   codexStep, codexStatus, codexRetrying, codexModelConfig, codexUserCode, codexUrl, codexCodeCopied, cancelCodexLogin, codexLogout, retryCodexValidation, copyCode, setCodexTransportMode,
-  showDisclaimer, requestOAuthLogin, requestCodexLogin, confirmDisclaimer, cancelDisclaimer,
+  showDisclaimer, requestOAuthLogin, requestCodexLogin, cancelDisclaimer,
   modelDefaults, modelSaveMsg, saveModelDefaults,
   permSaveMsg, toolList, toolPermissions, setToolPermission,
   customEndpoints, editingEndpoint, isAddingEndpoint, testStatus, testResult,
@@ -528,7 +528,6 @@ function toggleReasoningEffort(ep: CustomEndpoint, effort: EffortLevel) {
     <SubscriptionDisclaimerModal
       :open="showDisclaimer"
       @cancel="cancelDisclaimer"
-      @confirm="confirmDisclaimer"
     />
   </div>
 </template>

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import BaseSegmented from "../ui/BaseSegmented.vue";
+import { computed } from "vue";
 import { t } from "../../i18n";
 import type {
   ModelOption,
@@ -59,6 +60,13 @@ const emit = defineEmits<{
   "update:editKey": [value: string];
   "update:oauthCode": [value: string];
 }>();
+
+const anthropicProvider = computed(() => props.providers.find((p) => p.id === "anthropic"));
+const thirdPartyProviders = computed(() =>
+  props.providers.filter(
+    (p) => p.id !== "anthropic" && p.id !== "anthropic_sdk" && p.id !== "openrouter",
+  ),
+);
 
 function providerMeta(id: string): { desc: string; url: string; placeholder: string } {
   switch (id) {
@@ -159,7 +167,7 @@ function updateCodexTransport(value: string) {
     <p class="section-desc" style="opacity:0.6;">{{ t("settings.models.noModels") }}</p>
   </div>
 
-  <div class="settings-section" v-if="providers.find(p => p.id === 'anthropic')">
+  <div class="settings-section" v-if="anthropicProvider">
     <div class="section-label">{{ t("settings.anthropic.title") }}</div>
     <div class="provider-card">
       <div class="provider-header">
@@ -167,60 +175,27 @@ function updateCodexTransport(value: string) {
           <span class="provider-name">Anthropic (OAuth)</span>
           <span class="provider-desc">{{ providerMeta('anthropic').desc }}</span>
         </div>
-        <span
-          class="provider-status"
-          :class="{ active: providers.find(p => p.id === 'anthropic')?.hasKey }"
-        >
-          {{ providers.find(p => p.id === 'anthropic')?.hasKey ? t("settings.provider.configured") : t("settings.provider.notConfigured") }}
+        <span class="provider-status">
+          {{ t("settings.anthropic.disabledStatus") }}
         </span>
       </div>
 
-      <div v-if="providers.find(p => p.id === 'anthropic')?.hasKey" class="provider-detail">
-        <span class="key-hint">{{ providers.find(p => p.id === 'anthropic')?.keyHint || t("settings.anthropic.loggedIn") }}</span>
+      <div class="provider-detail">
+        <span class="key-hint">
+          {{
+            anthropicProvider?.hasKey
+              ? (anthropicProvider.keyHint || t("settings.anthropic.loggedIn"))
+              : t("settings.anthropic.disabledHint")
+          }}
+        </span>
         <div class="provider-actions">
-          <button class="action-btn danger" @click="emit('oauthLogout')" :disabled="isLoading">
+          <button class="action-btn" @click="emit('startOAuthLogin')" :disabled="isLoading">
+            {{ t("settings.anthropic.detailsBtn") }}
+          </button>
+          <button v-if="anthropicProvider?.hasKey" class="action-btn danger" @click="emit('oauthLogout')" :disabled="isLoading">
             {{ t("settings.anthropic.logout") }}
           </button>
         </div>
-      </div>
-
-      <div v-else-if="oauthStep === 'idle'" class="provider-detail">
-        <button class="oauth-login-btn" @click="emit('startOAuthLogin')" :disabled="isLoading">
-          <svg viewBox="0 0 16 16" fill="currentColor" width="14" height="14">
-            <path d="M8 0a8 8 0 1 1 0 16A8 8 0 0 1 8 0zm0 1.5a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13zM8 3a.75.75 0 0 1 .75.75v3.5h3.5a.75.75 0 0 1 0 1.5h-3.5v3.5a.75.75 0 0 1-1.5 0v-3.5h-3.5a.75.75 0 0 1 0-1.5h3.5v-3.5A.75.75 0 0 1 8 3z"/>
-          </svg>
-          {{ t("settings.anthropic.loginBtn") }}
-        </button>
-        <span class="oauth-hint">{{ t("settings.anthropic.hint") }}</span>
-      </div>
-
-      <div v-else-if="oauthStep === 'waiting_code'" class="edit-form">
-        <div class="oauth-instruction">
-          {{ t("settings.anthropic.instruction") }}
-        </div>
-        <div class="edit-row">
-          <input
-            :value="oauthCode"
-            @input="emit('update:oauthCode', ($event.target as HTMLInputElement).value)"
-            class="key-input"
-            type="text"
-            :placeholder="t('settings.anthropic.codePlaceholder')"
-            autofocus
-            @keydown="emit('handleOAuthKeydown', $event)"
-          />
-          <button
-            class="save-btn"
-            :disabled="isLoading || !oauthCode.trim()"
-            @click="emit('submitOAuthCode')"
-          >
-            {{ isLoading ? '...' : t("settings.anthropic.confirm") }}
-          </button>
-          <button class="cancel-btn" @click="emit('cancelOAuth')">{{ t("settings.anthropic.cancel") }}</button>
-        </div>
-      </div>
-
-      <div v-else-if="oauthStep === 'exchanging'" class="provider-detail">
-        <span class="key-hint">{{ t("settings.anthropic.verifying") }}</span>
       </div>
     </div>
   </div>
@@ -359,11 +334,11 @@ function updateCodexTransport(value: string) {
     </div>
   </div>
 
-  <div class="settings-section">
+  <div v-if="thirdPartyProviders.length > 0" class="settings-section">
     <div class="section-label">{{ t("settings.provider.title") }}</div>
 
     <div
-      v-for="provider in providers.filter(p => p.id !== 'anthropic' && p.id !== 'anthropic_sdk')"
+      v-for="provider in thirdPartyProviders"
       :key="provider.id"
       class="provider-card"
     >

@@ -523,12 +523,15 @@
   "settings.provider.deleteFailed": "Delete failed: {0}",
   "settings.provider.loadFailed": "Load providers failed: {0}",
   "settings.provider.openrouter.desc": "Unified gateway for Claude, GPT, Gemini, and more",
-  "settings.provider.anthropic.desc": "OAuth access to Claude Pro / Max / Team subscription quota",
+  "settings.provider.anthropic.desc": "Claude subscription sign-in is paused",
   "settings.provider.anthropic_sdk.desc": "Runs via the local Claude Code CLI using the Anthropic Agent SDK control protocol",
 
-  "settings.anthropic.title": "Claude Subscription (OAuth)",
-  "settings.anthropic.loginBtn": "Sign in with Claude",
-  "settings.anthropic.hint": "Compatible with Claude Pro / Max / Team plans",
+  "settings.anthropic.title": "Claude Subscription (Paused)",
+  "settings.anthropic.loginBtn": "View Notice",
+  "settings.anthropic.hint": "Anthropic has explicitly prohibited third-party clients such as OpenClaw from using Claude subscription plans",
+  "settings.anthropic.disabledStatus": "Paused",
+  "settings.anthropic.disabledHint": "Authorization flow is paused",
+  "settings.anthropic.detailsBtn": "View Notice",
   "settings.anthropic.instruction": "Login your Claude account in browser, copy the authorization code after approval and paste below",
   "settings.anthropic.codePlaceholder": "Paste authorization code...",
   "settings.anthropic.confirm": "Confirm",
@@ -2380,11 +2383,11 @@
   "settings.archived.role.tool": "Tool",
   "settings.archived.loadFailed": "Failed to load archived sessions: {0}",
 
-  "disclaimer.subscription.title": "Third-Party Access Notice",
-  "disclaimer.subscription.body": "Before using a third-party client to access Claude or ChatGPT subscriptions, please confirm the following:",
-  "disclaimer.subscription.risk1": "Your subscription account may be suspended or terminated by the provider.",
-  "disclaimer.subscription.risk2": "Locus is not affiliated with Anthropic or OpenAI and cannot guarantee this access path will remain available.",
-  "disclaimer.subscription.risk3": "Continuing means you accept the related risks.",
-  "disclaimer.subscription.confirm": "Acknowledge and Continue",
-  "disclaimer.subscription.cancel": "Cancel"
+  "disclaimer.subscription.title": "Claude Subscription Paused",
+  "disclaimer.subscription.body": "Anthropic has explicitly prohibited third-party clients such as OpenClaw from using Claude subscription plans.",
+  "disclaimer.subscription.risk1": "This version has paused the Claude OAuth authorization flow.",
+  "disclaimer.subscription.risk2": "Already signed-in accounts can still be signed out from Settings.",
+  "disclaimer.subscription.risk3": "Use Anthropic API, custom endpoints, or Claude Agent SDK for Claude access.",
+  "disclaimer.subscription.confirm": "Acknowledged",
+  "disclaimer.subscription.cancel": "Close"
 }
