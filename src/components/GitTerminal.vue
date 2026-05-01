@@ -2,11 +2,12 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, watch, nextTick } from "vue";
 import { listen } from "@tauri-apps/api/event";
-import { cancelChat, chat } from "../services/session";
+import { answerQuestion as answerSessionQuestion, cancelChat, chat } from "../services/session";
 import { gitExecute } from "../services/git";
 import type { UnlistenFn } from "@tauri-apps/api/event";
-import type { StreamEvent, ModelOption } from "../types";
+import type { StreamEvent, ModelOption, PendingQuestion } from "../types";
 import MarkdownRenderer from "./MarkdownRenderer.vue";
+import AskUserCard from "./chat/AskUserCard.vue";
 import { t } from "../i18n";
 import { normalizeAppError } from "../services/errors";
 import { useDisplaySettings } from "../composables/useDisplaySettings";
@@ -75,6 +76,7 @@ const streaming = ref(false);
 const streamingText = ref("");
 const thinking = ref(false);
 const nativeRunning = ref(false);
+const pendingQuestion = ref<PendingQuestion | null>(null);
 const scrollEl = ref<HTMLElement | null>(null);
 const inputEl = ref<HTMLInputElement | null>(null);
 let pendingSessionId: string | null = null;
@@ -124,6 +126,7 @@ function shouldRefreshOnToolCompletion(toolName: string): boolean {
 async function runNative(text: string) {
   streamingText.value = "";
   thinking.value = false;
+  pendingQuestion.value = null;
   nativeRunning.value = true;
   activeToolExec = null;
   streaming.value = true;
@@ -177,6 +180,7 @@ async function submit() {
   streaming.value = true;
   thinking.value = true;
   nativeRunning.value = false;
+  pendingQuestion.value = null;
   pendingSessionId = null;
   activeToolExec = null;
 
@@ -195,6 +199,7 @@ async function submit() {
     streaming.value = false;
     thinking.value = false;
     nativeRunning.value = false;
+    pendingQuestion.value = null;
     lines.value.push({
       id: "err_" + Date.now(),
       type: "error",
@@ -210,6 +215,22 @@ async function cancel() {
     await cancelChat(sessionId.value);
   } catch (e) {
     console.error("cancel_chat failed:", e);
+  }
+}
+
+async function answerPendingQuestion(answer: string) {
+  const question = pendingQuestion.value;
+  if (!question) return;
+  pendingQuestion.value = null;
+  try {
+    await answerSessionQuestion(question.questionId, answer);
+  } catch (e) {
+    lines.value.push({
+      id: "err_" + Date.now(),
+      type: "error",
+      content: normalizeAppError(e).message,
+    });
+    scrollToBottom();
   }
 }
 
@@ -313,6 +334,24 @@ function handleStreamEvent(event: StreamEvent) {
       break;
     }
 
+    case "askUser":
+      thinking.value = false;
+      flushStreamingText();
+      pendingQuestion.value = {
+        questionId: event.questionId,
+        toolCallId: event.toolCallId,
+        question: event.question,
+        options: event.options,
+      };
+      scrollToBottom(true);
+      break;
+
+    case "inputAnswered":
+      if (pendingQuestion.value?.questionId === event.questionId) {
+        pendingQuestion.value = null;
+      }
+      break;
+
     case "toolCallRoundDone":
       if (event.fullText) {
         flushStreamingText();
@@ -340,6 +379,7 @@ function handleStreamEvent(event: StreamEvent) {
       streaming.value = false;
       thinking.value = false;
       nativeRunning.value = false;
+      pendingQuestion.value = null;
       activeToolExec = null;
       currentRunId.value = null;
       pendingSessionId = null;
@@ -351,6 +391,7 @@ function handleStreamEvent(event: StreamEvent) {
       streaming.value = false;
       thinking.value = false;
       nativeRunning.value = false;
+      pendingQuestion.value = null;
       activeToolExec = null;
       currentRunId.value = null;
       pendingSessionId = null;
@@ -362,6 +403,7 @@ function handleStreamEvent(event: StreamEvent) {
       streaming.value = false;
       thinking.value = false;
       nativeRunning.value = false;
+      pendingQuestion.value = null;
       activeToolExec = null;
       currentRunId.value = null;
       pendingSessionId = null;
@@ -532,6 +574,7 @@ watch(
     streaming.value = false;
     thinking.value = false;
     nativeRunning.value = false;
+    pendingQuestion.value = null;
     pendingSessionId = null;
     activeToolExec = null;
     history.value = [];
@@ -592,6 +635,18 @@ defineExpose({ pushOutput });
 
       <div v-if="streamingText" class="term-line term-line-ai term-streaming">
         <MarkdownRenderer :content="streamingText" />
+      </div>
+
+      <div
+        v-if="pendingQuestion"
+        class="term-question-panel"
+        @click.stop
+        @keydown.stop
+      >
+        <AskUserCard
+          :question="pendingQuestion"
+          @answer="answerPendingQuestion"
+        />
       </div>
 
       <div v-if="streaming && nativeRunning && !streamingText && !hasRunningTool" class="term-thinking-row">
@@ -820,6 +875,97 @@ defineExpose({ pushOutput });
   font-size: inherit;
   white-space: pre-wrap;
   word-break: break-word;
+}
+
+.term-question-panel {
+  width: min(680px, 100%);
+  margin: 8px 0 10px;
+  cursor: default;
+  font-family: var(--font-prose);
+}
+
+.term-question-panel :deep(.ask-user-card) {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--git-divider-strong);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--git-surface-detail) 86%, var(--git-surface-terminal));
+}
+
+.term-question-panel :deep(.ask-question) {
+  color: var(--git-text-primary);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+
+.term-question-panel :deep(.ask-options) {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.term-question-panel :deep(.ask-option-btn) {
+  align-items: flex-start;
+  justify-content: flex-start;
+  flex-direction: column;
+  gap: 4px;
+  padding-block: 8px;
+  text-align: left;
+}
+
+.term-question-panel :deep(.ask-option-label) {
+  color: inherit;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.term-question-panel :deep(.ask-option-desc) {
+  color: var(--git-text-secondary);
+  font-size: 11px;
+  line-height: 1.5;
+  text-align: left;
+}
+
+.term-question-panel :deep(.ask-custom) {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.term-question-panel :deep(.ask-custom-label) {
+  color: var(--git-text-secondary);
+  font-size: 11px;
+}
+
+.term-question-panel :deep(.ask-custom-input-row) {
+  display: flex;
+  gap: 8px;
+}
+
+.term-question-panel :deep(.ask-custom-input) {
+  flex: 1;
+  min-width: 0;
+  min-height: 30px;
+  padding: 0 9px;
+  border: 1px solid var(--git-divider);
+  border-radius: 6px;
+  background: var(--git-surface-terminal);
+  color: var(--git-text-primary);
+  font: inherit;
+}
+
+.term-question-panel :deep(.ask-custom-input:focus) {
+  outline: none;
+  border-color: color-mix(in srgb, var(--git-focus) 58%, var(--git-divider));
+}
+
+.term-question-panel :deep(.ask-custom-send) {
+  min-width: 38px;
+  padding-inline: 0;
 }
 
 /* ════════════════════════════════════════
