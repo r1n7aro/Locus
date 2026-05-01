@@ -1,6 +1,32 @@
 ---
-title: Knowledge
-description: TODO
+title: Knowledge System
+description: Learn how Locus organizes conversations, design decisions, long-term memory, and reusable skills into a project-aware knowledge system for Unity development.
 ---
 
-TODO
+The knowledge system is how Locus keeps the Agent grounded in your Unity project over time. Decisions and context that come up in conversations, edits, and debugging sessions are captured in a searchable, reviewable, reusable knowledge base instead of being re-explained from scratch each time.
+
+## Why a Unity Agent Needs Project Knowledge
+
+Unity context is more than code—it also covers scene structure, asset conventions, naming rules, build pipelines, and past team decisions. Keeping this information close to the Agent reduces repeated explanation, lowers the risk of unwanted edits, and helps later sessions stay consistent with earlier ones.
+
+## Knowledge Categories
+
+Locus currently organizes knowledge into a few categories:
+
+- **Design**: project requirements and ground truth. The Agent can propose updates during a conversation (subject to your approval), and you can edit it manually at any time.
+- **Memory**: dynamic context maintained by the Agent, such as user preferences, recurring issues, and project understanding.
+- **Skill**: codified workflows. Describe a process in natural language once, and the Agent follows it the next time the same situation comes up.
+- **Reference**: read-only external material such as Unity API docs or existing team documentation.
+
+## How Knowledge Accumulates
+
+You don't need to write knowledge up front—most of it comes from regular use:
+
+- Requirements clarified in a conversation feed back into Design
+- User preferences and recurring project traits land in Memory
+- Repeated procedures get captured as Skill
+- Existing external material can be plugged in as Reference
+
+## Current Stage
+
+Locus is still in the v0.2.3 early-testing stage, and the knowledge system continues to evolve. For now, treat it as a project-context layer that helps the Agent work, and keep a human review step before applying important changes.
