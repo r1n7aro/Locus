@@ -2684,7 +2684,7 @@ impl AgentInstance {
                 continue;
             }
 
-            if matches!(ch, '|' | '<' | '>') {
+            if matches!(ch, '<' | '>') {
                 return None;
             }
 
@@ -2705,6 +2705,72 @@ impl AgentInstance {
         } else {
             Some(segments)
         }
+    }
+
+    fn shell_split_pipeline(segment: &str) -> Option<Vec<String>> {
+        let mut parts = Vec::new();
+        let mut current = String::new();
+        let mut quote: Option<char> = None;
+        let mut escaped = false;
+        let mut chars = segment.chars().peekable();
+
+        while let Some(ch) = chars.next() {
+            if escaped {
+                current.push(ch);
+                escaped = false;
+                continue;
+            }
+
+            if ch == '\\' && quote != Some('\'') {
+                current.push(ch);
+                escaped = true;
+                continue;
+            }
+
+            if let Some(active_quote) = quote {
+                current.push(ch);
+                if ch == active_quote {
+                    quote = None;
+                }
+                continue;
+            }
+
+            if ch == '\'' || ch == '"' {
+                quote = Some(ch);
+                current.push(ch);
+                continue;
+            }
+
+            if ch == '|' {
+                if chars.peek() == Some(&'|') {
+                    return None;
+                }
+                let part = current.trim();
+                if part.is_empty() {
+                    return None;
+                }
+                parts.push(part.to_string());
+                current.clear();
+                continue;
+            }
+
+            if matches!(ch, '<' | '>') {
+                return None;
+            }
+
+            current.push(ch);
+        }
+
+        if quote.is_some() || escaped {
+            return None;
+        }
+
+        let part = current.trim();
+        if part.is_empty() {
+            return None;
+        }
+        parts.push(part.to_string());
+        Some(parts)
     }
 
     fn shell_split_words(segment: &str) -> Option<Vec<String>> {
@@ -2759,6 +2825,65 @@ impl AgentInstance {
         }
 
         Some(words)
+    }
+
+    fn shell_tokens_contain_knowledge_literal(tokens: &[String]) -> bool {
+        tokens.iter().any(|token| {
+            token
+                .replace('\\', "/")
+                .to_ascii_lowercase()
+                .contains("locus/knowledge")
+        })
+    }
+
+    fn shell_tokens_contain_command_substitution(tokens: &[String]) -> bool {
+        tokens
+            .iter()
+            .any(|token| token.contains("$(") || token.contains('`'))
+    }
+
+    fn classify_safe_shell_tokens(tokens: &[String]) -> Option<GitCommandEffect> {
+        if tokens
+            .first()
+            .map(|value| value.eq_ignore_ascii_case("echo"))
+            .unwrap_or(false)
+            && !Self::shell_tokens_contain_knowledge_literal(tokens)
+            && !Self::shell_tokens_contain_command_substitution(tokens)
+        {
+            Some(GitCommandEffect {
+                requires_confirm: false,
+                reconcile_after_success: false,
+                broad_scope: false,
+            })
+        } else {
+            None
+        }
+    }
+
+    fn shell_pipeline_filter_is_safe(tokens: &[String]) -> bool {
+        let Some(command) = tokens.first().map(|value| value.to_ascii_lowercase()) else {
+            return false;
+        };
+        if Self::shell_tokens_contain_knowledge_literal(tokens)
+            || Self::shell_tokens_contain_command_substitution(tokens)
+        {
+            return false;
+        }
+
+        match command.as_str() {
+            "cat" => tokens.iter().skip(1).all(|arg| arg.starts_with('-')),
+            "head" | "tail" | "wc" | "sort" | "uniq" => tokens
+                .iter()
+                .skip(1)
+                .all(|arg| arg.starts_with('-') || arg.chars().all(|ch| ch.is_ascii_digit())),
+            "sed" => tokens.iter().skip(1).all(|arg| {
+                arg.starts_with('-')
+                    || arg
+                        .chars()
+                        .all(|ch| ch.is_ascii_digit() || matches!(ch, ',' | 'p' | 'q'))
+            }),
+            _ => false,
+        }
     }
 
     fn is_git_executable(value: &str) -> bool {
@@ -3031,11 +3156,19 @@ impl AgentInstance {
         };
 
         for segment in segments {
-            let tokens = Self::shell_split_words(&segment)?;
+            let pipeline = Self::shell_split_pipeline(&segment)?;
+            let tokens = Self::shell_split_words(pipeline.first()?)?;
             if tokens.is_empty() {
                 continue;
             }
-            let effect = Self::classify_simple_git_tokens(&tokens)?;
+            let effect = Self::classify_safe_shell_tokens(&tokens)
+                .or_else(|| Self::classify_simple_git_tokens(&tokens))?;
+            for filter in pipeline.iter().skip(1) {
+                let filter_tokens = Self::shell_split_words(filter)?;
+                if !Self::shell_pipeline_filter_is_safe(&filter_tokens) {
+                    return None;
+                }
+            }
             combined.requires_confirm |= effect.requires_confirm;
             combined.reconcile_after_success |= effect.reconcile_after_success;
             combined.broad_scope |= effect.broad_scope;
@@ -9646,6 +9779,33 @@ PrefabInstance:
         .is_none());
     }
 
+    #[test]
+    fn bash_git_knowledge_assessment_allows_output_wrappers() {
+        let assessment = AgentInstance::assess_bash_git_knowledge_command(
+            "C:/Repo",
+            None,
+            &json!({
+                "workdir":"C:/Repo",
+                "command":"echo '--- diff ---' && git -c core.quotePath=false diff -- Locus/knowledge/design/core.md | sed -n '1,220p'"
+            }),
+        )
+        .expect("wrapped git diff should be classified");
+
+        assert!(assessment.touches_knowledge);
+        assert!(!assessment.requires_confirm);
+        assert!(!assessment.reconcile_after_success);
+
+        assert!(AgentInstance::assess_bash_git_knowledge_command(
+            "C:/Repo",
+            None,
+            &json!({
+                "workdir":"C:/Repo",
+                "command":"echo '--- docs ---' && find Locus/knowledge/design -maxdepth 3 -type f | sort"
+            }),
+        )
+        .is_none());
+    }
+
     fn test_agent_instance_with_prompts_and_app_knowledge_dir(
         working_dir: String,
         system_prompt: &str,
@@ -9889,6 +10049,7 @@ Use profiler helpers.
             "git cherry-pick HEAD~1",
             "git revert HEAD",
             "git add Locus/knowledge/design/core-loop.md && git commit -m 'docs: update knowledge'",
+            "echo '--- diff ---' && git -c core.quotePath=false diff -- Locus/knowledge/design/core-loop.md | sed -n '1,80p'",
         ] {
             assert_eq!(
                 agent.validate_knowledge_tool_routing(

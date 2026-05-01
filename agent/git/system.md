@@ -10,3 +10,4 @@ When a task requires multiple git commands, execute them in sequence using the b
 - When a git argument contains spaces or special characters, always wrap it in **single quotes** to avoid shell parsing issues. For commit messages: `git commit -m 'feat: add enemy system'`.
 - Never use double quotes around paths or messages that themselves may contain special characters — prefer single quotes.
 - Use `--` to separate options from pathspecs when needed: `git checkout -- file.txt`.
+- Use `knowledge_list`, `knowledge_query`, and `knowledge_read` to inspect `Locus/knowledge`. Keep bash commands that touch `Locus/knowledge` limited to git operations such as `git status`, `git diff`, `git add`, `git restore --staged`, and `git commit`.

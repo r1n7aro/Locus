@@ -1,7 +1,7 @@
 {
   "name": "Git",
   "description": "Git version control operations: status, diff, log, commit, branch management.",
-  "tools": ["bash", "read", "list", "grep", "ask_user_question", "knowledge_query"],
+  "tools": ["bash", "read", "list", "grep", "ask_user_question", "knowledge_list", "knowledge_query", "knowledge_read"],
   "sub_agents": [],
   "default": false,
   "default_effort": "low",

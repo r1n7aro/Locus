@@ -406,6 +406,20 @@ mod tests {
     }
 
     #[test]
+    fn git_agent_exposes_knowledge_inspection_tools() {
+        let registry = AgentDefRegistry::load(Some(repo_agent_dir().as_path()), None);
+        let agent = registry.get("git").expect("git agent should be loadable");
+
+        for tool in ["knowledge_list", "knowledge_query", "knowledge_read"] {
+            assert!(
+                agent.tools.iter().any(|name| name == tool),
+                "git agent should expose '{}'",
+                tool
+            );
+        }
+    }
+
+    #[test]
     fn task_agent_descriptions_hide_legacy_aliases() {
         let registry = AgentDefRegistry::load(Some(repo_agent_dir().as_path()), None);
         let descriptions = registry.list_task_agent_descriptions();
