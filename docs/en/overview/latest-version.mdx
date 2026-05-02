@@ -1,9 +1,9 @@
 ---
 title: "Latest Version"
-description: "Locus v0.2.3 (2026-04-29)"
+description: "Locus v0.2.4 (2026-05-02)"
 sidebarTitle: "Latest Version"
-version: "0.2.3"
-releasedAt: "2026-04-29"
+version: "0.2.4"
+releasedAt: "2026-05-02"
 channel: "stable"
 updateTitle: "Update available"
 changelogUrl: "/en/overview/latest-version"
@@ -17,17 +17,21 @@ changelogUrl: "/en/overview/latest-version"
 
 ### Added
 
-- Added `unity_yaml_list` and `unity_yaml_search` for inspecting Unity scene and prefab hierarchies before reading object detail.
-- Added richer `unity_yaml_read` detail modes for live Editor reads, prefab overrides, serialized fields, and duplicate-safe object paths.
-- Added chat transcript controls for hiding completed thinking blocks and preserving the actual order of thinking, tool calls, and streamed text.
-- Added broader Markdown and chat asset reference handling for Unity, workspace, and `ProjectSettings` paths.
+- Added a Git history search window in Collab for searching commits and stashes by file/path query, regex, author, and date range.
+- Added live progress events for `unity_execute` and `unity_run_states` in chat tool call panels.
+- Added a display setting to hide Git terminal command suggestions.
+- Added knowledge inspection tools to the Git Agent.
 
 ### Fixed
 
-- Fixed custom endpoint reasoning configuration so OpenAI Chat, OpenAI Responses, and Anthropic-compatible endpoints can send the correct reasoning parameter format and expose supported effort levels.
-- Reconciled loaded asset databases on startup and workspace switch so stale reference graph rows, same-path GUID conflicts, size/hash changes, and script cascades are detected.
-- Kept the Unity embedded WebView alive during Unity domain reloads, with delayed cleanup for transient reload closes.
-- Updated Knowledge lexical rebuild progress to use pushed status events instead of polling.
-- Cached debug mode state in Settings so remounted settings panels keep the correct toggle state.
-- Locked chat file-change undo while an undo operation is already running.
-- Improved subagent and Unity recompile tool-call waiting states.
+- Fixed Git terminal pending input by rendering ask-user and tool confirmation prompts inline.
+- Fixed saved reasoning effort handling so session and agent context changes keep the user's persisted default.
+- Fixed `unity_yaml_read` enum serialization when Unity does not provide enum display names.
+- Fixed Knowledge lexical rebuild progress for small single-document updates and large batch progress totals.
+- Fixed Knowledge selection cleanup after deleting documents or folders.
+- Filtered third-party TRACE logs while debug mode is enabled.
+- Improved `unity_yaml_read` tool header summaries with full file and object paths.
+
+### Removed
+
+- Removed the Claude subscription OAuth sign-in entry point while keeping logout available for existing accounts.

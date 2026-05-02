@@ -1,9 +1,9 @@
 ---
 title: "当前版本"
-description: "Locus v0.2.3 (2026-04-29)"
+description: "Locus v0.2.4 (2026-05-02)"
 sidebarTitle: "当前版本"
-version: "0.2.3"
-releasedAt: "2026-04-29"
+version: "0.2.4"
+releasedAt: "2026-05-02"
 channel: "stable"
 updateTitle: "发现新版本"
 changelogUrl: "/overview/latest-version"
@@ -17,17 +17,21 @@ changelogUrl: "/overview/latest-version"
 
 ### 新增
 
-- 新增 `unity_yaml_list` 和 `unity_yaml_search`，用于在读取对象详情前检查 Unity 场景与 Prefab 层级。
-- `unity_yaml_read` 新增更细的详情模式，支持实时 Editor 读取、Prefab override、序列化字段和重复名称安全路径。
-- Chat 会话渲染新增隐藏已完成 thinking 的显示设置，并按真实顺序展示 thinking、工具调用和流式文本。
-- Markdown 与 Chat 资产引用支持更多 Unity、工作区和 `ProjectSettings` 路径格式。
+- Collab 新增 Git 历史搜索窗口，支持按文件/路径、正则、作者和日期范围搜索 commit 与 stash。
+- `unity_execute` 和 `unity_run_states` 的工具调用面板新增实时进度事件。
+- 设置中新增隐藏 Git 终端命令候选项的显示开关。
+- Git Agent 新增通过知识工具检查 Locus 知识文档的能力。
 
 ### 修复
 
-- 修复自定义模型端点的推理参数配置，OpenAI Chat、OpenAI Responses、Anthropic 兼容端点现在可以发送正确的推理参数格式，并显示可用推理强度。
-- 启动和切换工作区时会校准已加载的资产数据库，处理过期引用图、同路径 GUID 冲突、大小/哈希变化和脚本级联更新。
-- Unity 域重载期间保留嵌入式 WebView，并对临时关闭执行延迟清理。
-- Knowledge lexical rebuild 进度改为接收状态事件推送。
-- Settings 会缓存调试模式状态，重新挂载设置面板时保持开关状态稳定。
-- Chat 文件变更撤销执行中会锁定撤销按钮，避免重复触发。
-- 改进 Subagent 和 Unity recompile 工具调用的等待状态展示。
+- Git 终端现在以内联形式展示用户提问和工具确认。
+- 修复推理强度保存逻辑，Session 与 Agent 的上下文强度不会覆盖用户默认选择。
+- 修复 Unity 缺少 enum display name 时 `unity_yaml_read` 的序列化。
+- 修复 Knowledge lexical rebuild 的小更新静默处理和大批量进度总量。
+- 修复删除知识文档或目录后的选中状态清理。
+- Debug 模式下过滤第三方 TRACE 日志。
+- 改进 `unity_yaml_read` 工具标题摘要，展示完整文件与对象路径。
+
+### 移除
+
+- 移除 Claude 订阅 OAuth 登录入口，已登录账号仍可在设置中退出。

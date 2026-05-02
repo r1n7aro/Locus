@@ -1,32 +1,38 @@
 {
-  "version": "0.2.3",
-  "releasedAt": "2026-04-29",
+  "version": "0.2.4",
+  "releasedAt": "2026-05-02",
   "channel": "stable",
   "locales": {
     "zh": {
       "title": "发现新版本",
-      "summary": "Locus v0.2.3 (2026-04-29)",
+      "summary": "Locus v0.2.4 (2026-05-02)",
       "changelogUrl": "/overview/latest-version",
       "changes": [
         {
           "title": "新增",
           "items": [
-            "新增 `unity_yaml_list` 和 `unity_yaml_search`，用于在读取对象详情前检查 Unity 场景与 Prefab 层级。",
-            "`unity_yaml_read` 新增更细的详情模式，支持实时 Editor 读取、Prefab override、序列化字段和重复名称安全路径。",
-            "Chat 会话渲染新增隐藏已完成 thinking 的显示设置，并按真实顺序展示 thinking、工具调用和流式文本。",
-            "Markdown 与 Chat 资产引用支持更多 Unity、工作区和 `ProjectSettings` 路径格式。"
+            "Collab 新增 Git 历史搜索窗口，支持按文件/路径、正则、作者和日期范围搜索 commit 与 stash。",
+            "`unity_execute` 和 `unity_run_states` 的工具调用面板新增实时进度事件。",
+            "设置中新增隐藏 Git 终端命令候选项的显示开关。",
+            "Git Agent 新增通过知识工具检查 Locus 知识文档的能力。"
           ]
         },
         {
           "title": "修复",
           "items": [
-            "修复自定义模型端点的推理参数配置，OpenAI Chat、OpenAI Responses、Anthropic 兼容端点现在可以发送正确的推理参数格式，并显示可用推理强度。",
-            "启动和切换工作区时会校准已加载的资产数据库，处理过期引用图、同路径 GUID 冲突、大小/哈希变化和脚本级联更新。",
-            "Unity 域重载期间保留嵌入式 WebView，并对临时关闭执行延迟清理。",
-            "Knowledge lexical rebuild 进度改为接收状态事件推送。",
-            "Settings 会缓存调试模式状态，重新挂载设置面板时保持开关状态稳定。",
-            "Chat 文件变更撤销执行中会锁定撤销按钮，避免重复触发。",
-            "改进 Subagent 和 Unity recompile 工具调用的等待状态展示。"
+            "Git 终端现在以内联形式展示用户提问和工具确认。",
+            "修复推理强度保存逻辑，Session 与 Agent 的上下文强度不会覆盖用户默认选择。",
+            "修复 Unity 缺少 enum display name 时 `unity_yaml_read` 的序列化。",
+            "修复 Knowledge lexical rebuild 的小更新静默处理和大批量进度总量。",
+            "修复删除知识文档或目录后的选中状态清理。",
+            "Debug 模式下过滤第三方 TRACE 日志。",
+            "改进 `unity_yaml_read` 工具标题摘要，展示完整文件与对象路径。"
+          ]
+        },
+        {
+          "title": "移除",
+          "items": [
+            "移除 Claude 订阅 OAuth 登录入口，已登录账号仍可在设置中退出。"
           ]
         }
       ],
@@ -39,28 +45,34 @@
     },
     "en": {
       "title": "Update available",
-      "summary": "Locus v0.2.3 (2026-04-29)",
+      "summary": "Locus v0.2.4 (2026-05-02)",
       "changelogUrl": "/en/overview/latest-version",
       "changes": [
         {
           "title": "Added",
           "items": [
-            "Added `unity_yaml_list` and `unity_yaml_search` for inspecting Unity scene and prefab hierarchies before reading object detail.",
-            "Added richer `unity_yaml_read` detail modes for live Editor reads, prefab overrides, serialized fields, and duplicate-safe object paths.",
-            "Added chat transcript controls for hiding completed thinking blocks and preserving the actual order of thinking, tool calls, and streamed text.",
-            "Added broader Markdown and chat asset reference handling for Unity, workspace, and `ProjectSettings` paths."
+            "Added a Git history search window in Collab for searching commits and stashes by file/path query, regex, author, and date range.",
+            "Added live progress events for `unity_execute` and `unity_run_states` in chat tool call panels.",
+            "Added a display setting to hide Git terminal command suggestions.",
+            "Added knowledge inspection tools to the Git Agent."
           ]
         },
         {
           "title": "Fixed",
           "items": [
-            "Fixed custom endpoint reasoning configuration so OpenAI Chat, OpenAI Responses, and Anthropic-compatible endpoints can send the correct reasoning parameter format and expose supported effort levels.",
-            "Reconciled loaded asset databases on startup and workspace switch so stale reference graph rows, same-path GUID conflicts, size/hash changes, and script cascades are detected.",
-            "Kept the Unity embedded WebView alive during Unity domain reloads, with delayed cleanup for transient reload closes.",
-            "Updated Knowledge lexical rebuild progress to use pushed status events instead of polling.",
-            "Cached debug mode state in Settings so remounted settings panels keep the correct toggle state.",
-            "Locked chat file-change undo while an undo operation is already running.",
-            "Improved subagent and Unity recompile tool-call waiting states."
+            "Fixed Git terminal pending input by rendering ask-user and tool confirmation prompts inline.",
+            "Fixed saved reasoning effort handling so session and agent context changes keep the user's persisted default.",
+            "Fixed `unity_yaml_read` enum serialization when Unity does not provide enum display names.",
+            "Fixed Knowledge lexical rebuild progress for small single-document updates and large batch progress totals.",
+            "Fixed Knowledge selection cleanup after deleting documents or folders.",
+            "Filtered third-party TRACE logs while debug mode is enabled.",
+            "Improved `unity_yaml_read` tool header summaries with full file and object paths."
+          ]
+        },
+        {
+          "title": "Removed",
+          "items": [
+            "Removed the Claude subscription OAuth sign-in entry point while keeping logout available for existing accounts."
           ]
         }
       ],
