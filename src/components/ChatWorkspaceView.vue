@@ -392,7 +392,7 @@ onUnmounted(() => {
       @cancel="chatStore.cancelChat"
       @select-agent="(id: string) => agentStore.selectAgent(id)"
       @select-model="(id: string) => modelStore.selectModel(id)"
-      @select-effort="(level: EffortLevel) => modelStore.effort = level"
+      @select-effort="(level: EffortLevel) => modelStore.selectEffort(level)"
       @save-raw-context="saveRawContext"
       @answer-question="chatStore.answerQuestion"
       @answer-tool-confirm="chatStore.answerToolConfirm"

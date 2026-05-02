@@ -207,7 +207,7 @@ function handleSelectAgent(agentId: string) {
         :effort-supported="modelStore.effortSupported"
         :disabled="isStreaming"
         @select-model="modelStore.selectModel"
-        @select-effort="modelStore.effort = $event"
+        @select-effort="modelStore.selectEffort"
       />
     </template>
   </EmbeddedChatPane>

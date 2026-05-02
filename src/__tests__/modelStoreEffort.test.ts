@@ -150,9 +150,20 @@ describe("useModelStore OpenAI effort mapping", () => {
     const modelStore = useModelStore();
 
     await modelStore.loadLastEffort();
-    modelStore.effort = "high";
+    modelStore.selectEffort("high");
     await nextTick();
 
     expect(modelServiceMocks.saveLastEffort).toHaveBeenCalledWith("high");
+  });
+
+  it("does not persist context effort changes from session or agent selection", async () => {
+    const modelStore = useModelStore();
+
+    await modelStore.loadLastEffort();
+    modelStore.applyContextEffort("medium");
+    await nextTick();
+
+    expect(modelStore.effort).toBe("medium");
+    expect(modelServiceMocks.saveLastEffort).not.toHaveBeenCalled();
   });
 });

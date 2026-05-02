@@ -72,18 +72,21 @@ export function useAppBootstrap() {
 
   // -- Cross-domain watchers --
 
-  // agent selection -> effort default
+  function syncEffortForChatContext() {
+    const agentId = agentStore.selectedAgentId;
+    if (!agentId) return;
+    if (!chatStore.activeSessionId) {
+      modelStore.restoreDefaultEffort();
+      return;
+    }
+    const agent = agentStore.agents.find((a) => a.id === agentId);
+    modelStore.applyContextEffort(agent?.defaultEffort ?? "none");
+  }
+
+  // active session/agent selection -> current effort
   watch(
-    () => agentStore.selectedAgentId,
-    (agentId) => {
-      if (!agentId) return;
-      const agent = agentStore.agents.find((a) => a.id === agentId);
-      if (agent?.defaultEffort) {
-        modelStore.effort = agent.defaultEffort;
-      } else {
-        modelStore.effort = "none";
-      }
-    },
+    () => [agentStore.selectedAgentId, chatStore.activeSessionId, agentStore.agents.length] as const,
+    syncEffortForChatContext,
     { immediate: true },
   );
 
@@ -164,6 +167,7 @@ export function useAppBootstrap() {
       loadSkills(),
     ]);
     await modelStore.loadLastEffort();
+    syncEffortForChatContext();
     skillsLoaded = true;
   }
 
@@ -455,6 +459,7 @@ export function useAppBootstrap() {
       loadSkills(),
     ]);
     await modelStore.loadLastEffort();
+    syncEffortForChatContext();
   }
 
   return {

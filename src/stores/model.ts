@@ -134,7 +134,8 @@ export const useModelStore = defineStore("model", () => {
   const codexTransport = ref<CodexTransportMode>("websocket");
   const selectedModelId = ref("");
   const lastModelId = ref("");
-  const effort = ref<EffortLevel>("none");
+  const effort = ref<EffortLevel>("medium");
+  const defaultEffort = ref<EffortLevel>("medium");
   const modelDefaults = ref<ModelDefaults>({ mainModel: "", planModel: "", subagentModels: {} });
   let effortPersistenceReady = false;
 
@@ -205,6 +206,14 @@ export const useModelStore = defineStore("model", () => {
 
   // -- Internal watchers (model-domain only) --
 
+  function clampEffortForSelectedModel(level: EffortLevel): EffortLevel {
+    const levels = availableEfforts.value;
+    if (levels.length > 0 && !levels.includes(level)) {
+      return levels[0];
+    }
+    return level;
+  }
+
   // Clamp effort when available levels change
   watch(availableEfforts, (levels) => {
     if (levels.length > 0 && !levels.includes(effort.value)) {
@@ -212,7 +221,7 @@ export const useModelStore = defineStore("model", () => {
     }
   }, { immediate: true });
 
-  watch(effort, (level) => {
+  watch(defaultEffort, (level) => {
     if (!effortPersistenceReady) return;
     Promise.resolve()
       .then(() => modelService.saveLastEffort(level))
@@ -255,7 +264,8 @@ export const useModelStore = defineStore("model", () => {
     try {
       const saved = await modelService.getLastEffort();
       if (isEffortLevel(saved)) {
-        effort.value = saved;
+        defaultEffort.value = saved;
+        effort.value = clampEffortForSelectedModel(saved);
       }
     } catch { /* ignore */ }
     effortPersistenceReady = true;
@@ -313,6 +323,21 @@ export const useModelStore = defineStore("model", () => {
     rememberLastModel(id);
   }
 
+  function selectEffort(level: EffortLevel) {
+    if (!isEffortLevel(level)) return;
+    defaultEffort.value = level;
+    effort.value = clampEffortForSelectedModel(level);
+  }
+
+  function applyContextEffort(level: EffortLevel | null | undefined) {
+    const normalized = typeof level === "string" && isEffortLevel(level) ? level : "none";
+    effort.value = clampEffortForSelectedModel(normalized);
+  }
+
+  function restoreDefaultEffort() {
+    applyContextEffort(defaultEffort.value);
+  }
+
   function applyModelDefaults(defaults: ModelDefaults) {
     modelDefaults.value = defaults;
   }
@@ -332,6 +357,7 @@ export const useModelStore = defineStore("model", () => {
     selectedModelId,
     lastModelId,
     effort,
+    defaultEffort,
     modelDefaults,
     allModels,
     availableModels,
@@ -348,6 +374,9 @@ export const useModelStore = defineStore("model", () => {
     loadCodexAvailableModels,
     resolveSelectedModel,
     selectModel,
+    selectEffort,
+    applyContextEffort,
+    restoreDefaultEffort,
     applyModelDefaults,
     applyCustomEndpoints,
     applyCodexModelConfig,

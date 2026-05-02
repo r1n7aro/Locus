@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { reactive } from "vue";
+import { nextTick, reactive } from "vue";
 
 let uiStoreMock: any;
 let authStoreMock: any;
@@ -175,6 +175,7 @@ describe("useAppBootstrap onboarding completion", () => {
 
     modelStoreMock = reactive({
       effort: "none",
+      defaultEffort: "none",
       loadModelDefaults: vi.fn().mockResolvedValue(undefined),
       loadLastModel: vi.fn().mockResolvedValue(undefined),
       loadLastEffort: vi.fn().mockResolvedValue(undefined),
@@ -182,6 +183,12 @@ describe("useAppBootstrap onboarding completion", () => {
       loadCodexModelConfig: vi.fn().mockResolvedValue(undefined),
       loadCodexAvailableModels: vi.fn().mockResolvedValue(undefined),
       resolveSelectedModel: vi.fn(),
+      applyContextEffort: vi.fn((level: string | null | undefined) => {
+        modelStoreMock.effort = level || "none";
+      }),
+      restoreDefaultEffort: vi.fn(() => {
+        modelStoreMock.effort = modelStoreMock.defaultEffort;
+      }),
     });
 
     projectStoreMock = reactive({
@@ -194,6 +201,7 @@ describe("useAppBootstrap onboarding completion", () => {
     });
 
     chatStoreMock = reactive({
+      activeSessionId: null,
       sessions: [],
       refreshSessions: vi.fn().mockResolvedValue(undefined),
       loadToolPermissionMode: vi.fn().mockResolvedValue(undefined),
@@ -205,6 +213,33 @@ describe("useAppBootstrap onboarding completion", () => {
     notificationStoreMock = {
       addNotice: vi.fn(),
     };
+  });
+
+  it("restores the saved default effort when returning to a new chat", async () => {
+    modelStoreMock.defaultEffort = "high";
+    chatStoreMock.activeSessionId = "session-1";
+    agentStoreMock.selectedAgentId = "git";
+    agentStoreMock.agents = [
+      { id: "dev", defaultEffort: "medium" },
+      { id: "git", defaultEffort: "low" },
+    ];
+
+    const useAppBootstrap = await loadUseAppBootstrap();
+    useAppBootstrap();
+    await nextTick();
+
+    expect(modelStoreMock.applyContextEffort).toHaveBeenLastCalledWith("low");
+
+    modelStoreMock.applyContextEffort.mockClear();
+    modelStoreMock.restoreDefaultEffort.mockClear();
+
+    chatStoreMock.activeSessionId = null;
+    agentStoreMock.selectedAgentId = "dev";
+    await nextTick();
+
+    expect(modelStoreMock.restoreDefaultEffort).toHaveBeenCalledTimes(1);
+    expect(modelStoreMock.applyContextEffort).not.toHaveBeenCalled();
+    expect(modelStoreMock.effort).toBe("high");
   });
 
   it("reloads sessions after onboarding completes", async () => {
