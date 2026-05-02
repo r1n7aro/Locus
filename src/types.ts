@@ -1645,6 +1645,36 @@ export interface GitHistorySnapshot {
   workspace: GitWorkspaceSummary;
 }
 
+export interface GitHistorySearchRequest {
+  query?: string | null;
+  useRegex?: boolean | null;
+  author?: string | null;
+  /** Unix timestamp (seconds), inclusive */
+  dateFrom?: number | null;
+  /** Unix timestamp (seconds), inclusive */
+  dateTo?: number | null;
+}
+
+export type GitHistorySearchResultKind = "commit" | "stash";
+
+export interface GitHistorySearchResult {
+  kind: GitHistorySearchResultKind;
+  hash: string;
+  shortHash: string;
+  author: string;
+  /** Unix timestamp (seconds) */
+  date: number;
+  message: string;
+  refName?: string | null;
+  files: GitFileChange[];
+}
+
+export interface GitHistorySearchResponse {
+  isRepo: boolean;
+  results: GitHistorySearchResult[];
+  truncated: boolean;
+}
+
 export interface GitProbeResult {
   available: boolean;
   inPath: boolean;

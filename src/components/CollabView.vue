@@ -1,6 +1,7 @@
 
 <script setup lang="ts">
-import { ref, computed, nextTick, watch } from "vue";
+import { ref, computed, nextTick, onMounted, onUnmounted, watch } from "vue";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { ModelOption, GitFileChange, DiffSource, FileDiffPayload, UnmergedFileEntry, GitHistoryTarget, GitBranchTarget, GitStashEntry, GitGraphRef } from "../types";
 import { gitCommitAction, gitBranchAction, gitStashAction, gitDiscardFile } from "../services/git";
 import GitTerminal from "./GitTerminal.vue";
@@ -35,6 +36,11 @@ import { extractLocalBranchNamesForHash } from "./collab/graph/refs";
 import { resolveBranchDblclickAction, resolveBranchTargetHash } from "./collab/branchInteraction";
 import type { GitGraphPublicApi, GitGraphSelectionTarget, GitGraphSelectOptions } from "./collab/gitGraphSelection";
 import { clampFloatingPosition } from "./ui/floatingPosition";
+import {
+  COLLAB_SEARCH_SELECT_EVENT,
+  openCollabSearchWindow,
+  type CollabSearchSelectionPayload,
+} from "../services/collabSearchWindow";
 
 const props = defineProps<{
   workingDir: string;
@@ -55,6 +61,7 @@ const hasWorkspace = computed(() => !!props.workingDir.trim());
 const terminalRef = ref<InstanceType<typeof GitTerminal> | null>(null);
 const gitGraphRef = ref<GitGraphPublicApi | null>(null);
 const gitConfigPopoverOpen = ref(false);
+let collabSearchSelectionUnlisten: UnlistenFn | null = null;
 
 const {
   isRepo, commits, graphRefs, headState, loading, selectedHistory, selectedCommitHash, hasMoreCommits, loadingMore,
@@ -417,6 +424,86 @@ function onSelectBranch(target: GitBranchTarget) {
   if (!hash) return;
   void selectHistoryInGraph({ kind: "commit", hash });
 }
+
+function isCollabSearchSelectionPayload(value: unknown): value is CollabSearchSelectionPayload {
+  if (!value || typeof value !== "object") return false;
+  const payload = value as Partial<CollabSearchSelectionPayload>;
+  return (payload.kind === "commit" || payload.kind === "stash")
+    && typeof payload.hash === "string"
+    && payload.hash.trim().length > 0;
+}
+
+async function ensureSearchCommitLoaded(hash: string): Promise<boolean> {
+  if (commits.value.some(commit => commit.hash === hash)) return true;
+
+  let attempts = 0;
+  while (hasMoreCommits.value && attempts < 200) {
+    attempts += 1;
+    const beforeCount = commits.value.length;
+    await loadMoreCommits();
+    await nextTick();
+    if (commits.value.some(commit => commit.hash === hash)) return true;
+    if (commits.value.length === beforeCount) break;
+  }
+  return false;
+}
+
+async function ensureSearchStashLoaded(hash: string): Promise<boolean> {
+  if (stashes.value.some(stash => stash.hash === hash)) return true;
+  await onRefresh();
+  return stashes.value.some(stash => stash.hash === hash);
+}
+
+async function selectCollabSearchResult(payload: CollabSearchSelectionPayload) {
+  const hash = payload.hash.trim();
+  const loaded = payload.kind === "stash"
+    ? await ensureSearchStashLoaded(hash)
+    : await ensureSearchCommitLoaded(hash);
+
+  if (!loaded) {
+    notificationStore.addNotice("warning", t("collab.search.targetMissing"), {
+      operation: "collabSearchSelect",
+      ttl: 3000,
+    });
+    return;
+  }
+
+  await selectHistoryInGraph(
+    { kind: payload.kind, hash },
+    { scroll: true, behavior: "smooth" },
+  );
+}
+
+async function openCollabSearch() {
+  try {
+    await openCollabSearchWindow();
+  } catch (cause) {
+    const err = normalizeAppError(cause);
+    notificationStore.addNotice("error", err.message, {
+      code: err.code,
+      operation: "openCollabSearch",
+    });
+  }
+}
+
+onMounted(async () => {
+  try {
+    collabSearchSelectionUnlisten = await listen<CollabSearchSelectionPayload>(
+      COLLAB_SEARCH_SELECT_EVENT,
+      (event) => {
+        if (!isCollabSearchSelectionPayload(event.payload)) return;
+        void selectCollabSearchResult(event.payload);
+      },
+    );
+  } catch {
+    collabSearchSelectionUnlisten = null;
+  }
+});
+
+onUnmounted(() => {
+  collabSearchSelectionUnlisten?.();
+  collabSearchSelectionUnlisten = null;
+});
 
 function onFileContextMenu(e: MouseEvent, file: GitFileChange, source: "gitUnstaged" | "gitStaged", selectedPaths: Set<string>) {
   const allFiles = source === "gitUnstaged" ? unstagedFiles.value : stagedFiles.value;
@@ -815,6 +902,7 @@ function copyBranchName() {
           @branch-dblclick="onBranchDblclick"
           @stash-contextmenu="onStashContextMenu"
           @open-git-config="openGitConfigPopover"
+          @open-search="openCollabSearch"
         />
       </div>
       <div
@@ -2010,7 +2098,14 @@ function copyBranchName() {
   color: var(--text-secondary);
 }
 
-:deep(.sidebar-collapse-btn) {
+:deep(.sidebar-header-actions) {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+:deep(.sidebar-collapse-btn),
+:deep(.sidebar-search-btn) {
   width: 22px;
   height: 22px;
   border: none;
@@ -2024,7 +2119,8 @@ function copyBranchName() {
   transition: all 0.15s;
 }
 
-:deep(.sidebar-collapse-btn:hover) {
+:deep(.sidebar-collapse-btn:hover),
+:deep(.sidebar-search-btn:hover) {
   background: var(--hover-bg);
   color: var(--text-color);
 }

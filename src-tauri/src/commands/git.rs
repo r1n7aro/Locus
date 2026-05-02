@@ -3,6 +3,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, State};
 
@@ -100,6 +101,45 @@ pub struct GitHistorySnapshot {
     pub refs: Vec<GitGraphRef>,
     pub stashes: Vec<GitStashEntry>,
     pub workspace: GitWorkspaceSummary,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitHistorySearchRequest {
+    pub query: Option<String>,
+    pub use_regex: Option<bool>,
+    pub author: Option<String>,
+    pub date_from: Option<i64>,
+    pub date_to: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum GitHistorySearchResultKind {
+    Commit,
+    Stash,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitHistorySearchResult {
+    pub kind: GitHistorySearchResultKind,
+    pub hash: String,
+    pub short_hash: String,
+    pub author: String,
+    pub date: i64,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ref_name: Option<String>,
+    pub files: Vec<GitFileChange>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitHistorySearchResponse {
+    pub is_repo: bool,
+    pub results: Vec<GitHistorySearchResult>,
+    pub truncated: bool,
 }
 
 struct VisibleHistoryPage {
@@ -698,6 +738,394 @@ pub async fn git_history_snapshot(
         refs,
         stashes,
         workspace,
+    })
+}
+
+const MAX_GIT_HISTORY_SEARCH_RESULTS: usize = 1000;
+
+#[derive(Debug, Clone)]
+struct GitHistorySearchFilter {
+    query_matcher: Option<GitHistorySearchQueryMatcher>,
+    author: String,
+    date_from: Option<i64>,
+    date_to: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+enum GitHistorySearchQueryMatcher {
+    Contains(String),
+    Regex(Regex),
+}
+
+impl GitHistorySearchFilter {
+    fn from_request(request: GitHistorySearchRequest) -> Result<Self, AppError> {
+        let query = request.query.unwrap_or_default().trim().to_string();
+        let query_matcher = if query.is_empty() {
+            None
+        } else if request.use_regex.unwrap_or(false) {
+            Some(GitHistorySearchQueryMatcher::Regex(
+                RegexBuilder::new(&query)
+                    .case_insensitive(true)
+                    .build()
+                    .map_err(|err| {
+                        AppError::new(
+                            "git.invalid_regex",
+                            format!("Invalid regular expression: {}", err),
+                        )
+                    })?,
+            ))
+        } else {
+            Some(GitHistorySearchQueryMatcher::Contains(query.to_lowercase()))
+        };
+
+        Ok(Self {
+            query_matcher,
+            author: request.author.unwrap_or_default().trim().to_lowercase(),
+            date_from: request.date_from,
+            date_to: request.date_to,
+        })
+    }
+
+    fn has_any_filter(&self) -> bool {
+        self.query_matcher.is_some()
+            || !self.author.is_empty()
+            || self.date_from.is_some()
+            || self.date_to.is_some()
+    }
+
+    fn matches_author_date(&self, author: &str, date: i64) -> bool {
+        if !self.author.is_empty() && !author.to_lowercase().contains(&self.author) {
+            return false;
+        }
+        if let Some(date_from) = self.date_from {
+            if date < date_from {
+                return false;
+            }
+        }
+        if let Some(date_to) = self.date_to {
+            if date > date_to {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn matches_file(&self, file: &GitFileChange) -> bool {
+        match &self.query_matcher {
+            None => true,
+            Some(matcher) => {
+                git_file_path_matches_query(&file.path, matcher)
+                    || file
+                        .old_path
+                        .as_deref()
+                        .is_some_and(|old_path| git_file_path_matches_query(old_path, matcher))
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct GitHistorySearchDraft {
+    hash: String,
+    short_hash: String,
+    author: String,
+    date: i64,
+    message: String,
+    files: Vec<GitFileChange>,
+}
+
+fn git_file_path_matches_query(path: &str, matcher: &GitHistorySearchQueryMatcher) -> bool {
+    let normalized = path.replace('\\', "/");
+    let file_name = normalized.rsplit('/').next().unwrap_or(&normalized);
+    match matcher {
+        GitHistorySearchQueryMatcher::Contains(query) => {
+            let normalized = normalized.to_lowercase();
+            if normalized.contains(query) {
+                return true;
+            }
+            normalized
+                .rsplit('/')
+                .next()
+                .is_some_and(|file_name| file_name.contains(query))
+        }
+        GitHistorySearchQueryMatcher::Regex(regex) => {
+            regex.is_match(&normalized) || regex.is_match(file_name)
+        }
+    }
+}
+
+#[cfg(test)]
+mod git_history_search_filter_tests {
+    use super::{
+        git_file_path_matches_query, GitHistorySearchFilter, GitHistorySearchQueryMatcher,
+        GitHistorySearchRequest,
+    };
+
+    #[test]
+    fn plain_history_search_matches_case_insensitive_file_name() {
+        let matcher = GitHistorySearchQueryMatcher::Contains("player.cs".to_string());
+
+        assert!(git_file_path_matches_query(
+            "Assets/Scripts/Player.cs",
+            &matcher
+        ));
+    }
+
+    #[test]
+    fn regex_history_search_matches_file_name_anchor() {
+        let filter = GitHistorySearchFilter::from_request(GitHistorySearchRequest {
+            query: Some(r"^Player\.(cs|prefab)$".to_string()),
+            use_regex: Some(true),
+            author: None,
+            date_from: None,
+            date_to: None,
+        })
+        .expect("regex should compile");
+        let matcher = filter.query_matcher.as_ref().expect("query matcher");
+
+        assert!(git_file_path_matches_query(
+            "Assets/Scripts/Player.cs",
+            matcher
+        ));
+        assert!(!git_file_path_matches_query(
+            "Assets/Scripts/Player.meta",
+            matcher
+        ));
+    }
+
+    #[test]
+    fn regex_history_search_reports_invalid_pattern() {
+        let error = GitHistorySearchFilter::from_request(GitHistorySearchRequest {
+            query: Some("[".to_string()),
+            use_regex: Some(true),
+            author: None,
+            date_from: None,
+            date_to: None,
+        })
+        .expect_err("invalid regex should fail");
+
+        assert_eq!(error.code, "git.invalid_regex");
+    }
+}
+
+fn push_git_history_search_draft(
+    results: &mut Vec<GitHistorySearchResult>,
+    truncated: &mut bool,
+    draft: Option<GitHistorySearchDraft>,
+) {
+    let Some(draft) = draft else {
+        return;
+    };
+    if draft.files.is_empty() {
+        return;
+    }
+    if results.len() >= MAX_GIT_HISTORY_SEARCH_RESULTS {
+        *truncated = true;
+        return;
+    }
+    results.push(GitHistorySearchResult {
+        kind: GitHistorySearchResultKind::Commit,
+        hash: draft.hash,
+        short_hash: draft.short_hash,
+        author: draft.author,
+        date: draft.date,
+        message: draft.message,
+        ref_name: None,
+        files: draft.files,
+    });
+}
+
+fn collect_commit_history_search_results(
+    cwd: &str,
+    filter: &GitHistorySearchFilter,
+    results: &mut Vec<GitHistorySearchResult>,
+    truncated: &mut bool,
+) -> Result<(), AppError> {
+    let stash_root_hashes = collect_stash_root_hashes(cwd);
+    let stash_hidden_hashes = collect_stash_hidden_hashes(cwd, &stash_root_hashes);
+    let output = command("git")
+        .args([
+            "-c",
+            "core.quotePath=false",
+            "log",
+            "--all",
+            "--topo-order",
+            "--find-renames",
+            "--name-status",
+            "--pretty=format:%x1e%H%x00%h%x00%P%x00%an%x00%at%x00%s",
+        ])
+        .current_dir(cwd)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .map_err(|e| format!("git history search failed: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("git history search failed: {}", stderr).into());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut draft: Option<GitHistorySearchDraft> = None;
+
+    for line in stdout.lines() {
+        if let Some(commit_line) = line.strip_prefix('\u{1e}') {
+            push_git_history_search_draft(results, truncated, draft.take());
+            if *truncated {
+                return Ok(());
+            }
+
+            let parts: Vec<&str> = commit_line.split('\0').collect();
+            if parts.len() < 6 {
+                continue;
+            }
+            let hash = parts[0].trim().to_string();
+            if hash.is_empty()
+                || stash_root_hashes.contains(&hash)
+                || stash_hidden_hashes.contains(&hash)
+            {
+                continue;
+            }
+
+            let author = parts[3].trim().to_string();
+            let date = parts[4].trim().parse().unwrap_or(0);
+            if !filter.matches_author_date(&author, date) {
+                continue;
+            }
+
+            draft = Some(GitHistorySearchDraft {
+                hash,
+                short_hash: parts[1].trim().to_string(),
+                author,
+                date,
+                message: parts[5].trim().to_string(),
+                files: Vec::new(),
+            });
+            continue;
+        }
+
+        let Some(current) = draft.as_mut() else {
+            continue;
+        };
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        for file in parse_name_status_lines(line) {
+            if filter.matches_file(&file) {
+                current.files.push(file);
+            }
+        }
+    }
+
+    push_git_history_search_draft(results, truncated, draft.take());
+    Ok(())
+}
+
+fn collect_stash_history_search_results(
+    cwd: &str,
+    filter: &GitHistorySearchFilter,
+    results: &mut Vec<GitHistorySearchResult>,
+    truncated: &mut bool,
+) -> Result<(), AppError> {
+    for stash in collect_stash_entries(cwd) {
+        if results.len() >= MAX_GIT_HISTORY_SEARCH_RESULTS {
+            *truncated = true;
+            return Ok(());
+        }
+        if !filter.matches_author_date(&stash.author, stash.date) {
+            continue;
+        }
+
+        let args = build_commit_files_args(&stash.hash, true);
+        let output = command("git")
+            .args(&args)
+            .current_dir(cwd)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .map_err(|e| format!("git stash search failed: {}", e))?;
+
+        if !output.status.success() {
+            continue;
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let files: Vec<GitFileChange> = parse_name_status_lines(&stdout)
+            .into_iter()
+            .filter(|file| filter.matches_file(file))
+            .collect();
+
+        if files.is_empty() {
+            continue;
+        }
+
+        results.push(GitHistorySearchResult {
+            kind: GitHistorySearchResultKind::Stash,
+            hash: stash.hash,
+            short_hash: stash.short_hash,
+            author: stash.author,
+            date: stash.date,
+            message: stash.message,
+            ref_name: Some(stash.ref_name),
+            files,
+        });
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn git_history_search(
+    workspace: State<'_, Arc<Workspace>>,
+    request: GitHistorySearchRequest,
+) -> Result<GitHistorySearchResponse, AppError> {
+    let cwd = workspace.path.read().await.clone();
+    if cwd.is_empty() {
+        return Ok(GitHistorySearchResponse {
+            is_repo: false,
+            results: vec![],
+            truncated: false,
+        });
+    }
+
+    let check = command("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .current_dir(&cwd)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .map_err(|e| format!("git not found: {}", e))?;
+
+    if !check.status.success() {
+        return Ok(GitHistorySearchResponse {
+            is_repo: false,
+            results: vec![],
+            truncated: false,
+        });
+    }
+
+    let filter = GitHistorySearchFilter::from_request(request)?;
+    if !filter.has_any_filter() {
+        return Ok(GitHistorySearchResponse {
+            is_repo: true,
+            results: vec![],
+            truncated: false,
+        });
+    }
+
+    let mut results = Vec::new();
+    let mut truncated = false;
+    collect_commit_history_search_results(&cwd, &filter, &mut results, &mut truncated)?;
+    if !truncated {
+        collect_stash_history_search_results(&cwd, &filter, &mut results, &mut truncated)?;
+    }
+    results.sort_by(|left, right| right.date.cmp(&left.date));
+
+    Ok(GitHistorySearchResponse {
+        is_repo: true,
+        results,
+        truncated,
     })
 }
 

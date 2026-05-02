@@ -692,6 +692,7 @@ pub fn run() {
             commands::answer_question,
             commands::git_log,
             commands::git_history_snapshot,
+            commands::git_history_search,
             commands::git_commit_body,
             commands::git_probe,
             commands::git_head_hash,

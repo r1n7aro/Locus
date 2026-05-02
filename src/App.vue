@@ -28,6 +28,7 @@ import { isKnowledgeLexicalProgressWindowLocation } from "./services/knowledgeLe
 import { isFeishuReferenceImportWindowLocation } from "./services/feishuReferenceImportWindow";
 import { isUnityReferenceImportWindowLocation } from "./services/unityReferenceImportWindow";
 import { isReferenceExternalImportWindowLocation } from "./services/referenceExternalImportWindow";
+import { isCollabSearchWindowLocation } from "./services/collabSearchWindow";
 import { isUnityHostLocation } from "./services/locusRuntime";
 const isCanvasWindow = window.location.pathname === '/canvas'
                     || window.location.search.includes('specId=');
@@ -39,6 +40,7 @@ const isKnowledgeLexicalProgressWindow = isKnowledgeLexicalProgressWindowLocatio
 const isFeishuReferenceImportWindow = isFeishuReferenceImportWindowLocation();
 const isUnityReferenceImportWindow = isUnityReferenceImportWindowLocation();
 const isReferenceExternalImportWindow = isReferenceExternalImportWindowLocation();
+const isCollabSearchWindow = isCollabSearchWindowLocation();
 const isStandaloneWindow = isCanvasWindow
   || isUnityEmbedWindow
   || isUnityEmbedTestWindow
@@ -46,7 +48,8 @@ const isStandaloneWindow = isCanvasWindow
   || isKnowledgeLexicalProgressWindow
   || isFeishuReferenceImportWindow
   || isUnityReferenceImportWindow
-  || isReferenceExternalImportWindow;
+  || isReferenceExternalImportWindow
+  || isCollabSearchWindow;
 
 const CanvasView = defineAsyncComponent(() => import("./components/CanvasView.vue"));
 const KnowledgeDownloadProgressWindow = defineAsyncComponent(() => import("./components/KnowledgeDownloadProgressWindow.vue"));
@@ -54,6 +57,7 @@ const KnowledgeLexicalProgressWindow = defineAsyncComponent(() => import("./comp
 const FeishuReferenceImportProgressWindow = defineAsyncComponent(() => import("./components/FeishuReferenceImportProgressWindow.vue"));
 const UnityReferenceImportProgressWindow = defineAsyncComponent(() => import("./components/UnityReferenceImportProgressWindow.vue"));
 const ReferenceExternalImportWindow = defineAsyncComponent(() => import("./components/ReferenceExternalImportWindow.vue"));
+const CollabSearchWindow = defineAsyncComponent(() => import("./components/CollabSearchWindow.vue"));
 const UnityEmbeddedSessionView = defineAsyncComponent(() => import("./components/UnityEmbeddedSessionView.vue"));
 const UnityEmbedTestView = defineAsyncComponent(() => import("./components/UnityEmbedTestView.vue"));
 const OnboardingView = defineAsyncComponent(() => import("./components/OnboardingView.vue"));
@@ -469,6 +473,7 @@ onUnmounted(() => {
   <FeishuReferenceImportProgressWindow v-else-if="isFeishuReferenceImportWindow" />
   <UnityReferenceImportProgressWindow v-else-if="isUnityReferenceImportWindow" />
   <ReferenceExternalImportWindow v-else-if="isReferenceExternalImportWindow" />
+  <CollabSearchWindow v-else-if="isCollabSearchWindow" />
   <div v-else-if="!authStore.authChecked" class="app-startup-state">
     <span>{{ t("common.loading") }}</span>
   </div>

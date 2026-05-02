@@ -8,6 +8,8 @@ import type {
   GitConfigScopeSnapshot,
   GitConfigSnapshot,
   GitFileChange,
+  GitHistorySearchRequest,
+  GitHistorySearchResponse,
   GitHistorySnapshot,
   GitInstallHelp,
   GitLogResult,
@@ -26,6 +28,10 @@ export function gitLog(skip: number, limit: number): Promise<GitLogResult> {
 
 export function gitHistorySnapshot(skip: number, limit: number): Promise<GitHistorySnapshot> {
   return ipcInvoke<GitHistorySnapshot>("git_history_snapshot", { skip, limit });
+}
+
+export function gitHistorySearch(request: GitHistorySearchRequest): Promise<GitHistorySearchResponse> {
+  return ipcInvoke<GitHistorySearchResponse>("git_history_search", { request });
 }
 
 export function gitCommitBody(hash: string): Promise<string> {

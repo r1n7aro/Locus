@@ -1,7 +1,24 @@
 <script setup lang="ts">
 import { ref, watch } from "vue";
+import {
+  Archive,
+  Check,
+  ChevronRight,
+  Circle,
+  CircleDot,
+  FolderGit2,
+  GitBranch,
+  Globe,
+  PanelLeftClose,
+  PanelLeftOpen,
+  Search,
+  Settings,
+  Tag,
+  Tags,
+} from "lucide";
 import type { GitBranchInfo, GitBranchTarget, GitGraphRef, GitHistoryTarget, GitRemoteBranch, GitStashEntry, GitSubmoduleInfo } from "../../types";
 import { t } from "../../i18n";
+import LucideIcon from "../icons/LucideIcon.vue";
 
 const props = defineProps<{
   localBranches: GitBranchInfo[];
@@ -35,6 +52,7 @@ const emit = defineEmits<{
   (e: "branchDblclick", target: GitBranchTarget): void;
   (e: "stashContextmenu", event: MouseEvent, target: GitHistoryTarget): void;
   (e: "openGitConfig", event: MouseEvent): void;
+  (e: "openSearch", event: MouseEvent): void;
 }>();
 
 const selectedStashHashes = ref<Set<string>>(new Set());
@@ -159,21 +177,28 @@ watch(
   <div v-if="!props.sidebarCollapsed" class="git-sidebar">
     <div class="sidebar-header">
       <span class="sidebar-title">Git</span>
-      <button class="sidebar-collapse-btn" @click="emit('toggleSidebar')" :title="t('collab.collapse')">
-        <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor">
-          <path d="M7.78 12.53a.75.75 0 0 1-1.06 0L2.47 8.28a.75.75 0 0 1 0-1.06l4.25-4.25a.75.75 0 0 1 1.06 1.06L4.81 7h7.44a.75.75 0 0 1 0 1.5H4.81l2.97 2.97a.75.75 0 0 1 0 1.06z"/>
-        </svg>
-      </button>
+      <div class="sidebar-header-actions">
+        <button class="sidebar-collapse-btn" type="button" @click="emit('toggleSidebar')" :title="t('collab.collapse')">
+          <LucideIcon :icon="PanelLeftClose" :size="14" />
+        </button>
+        <button
+          class="sidebar-search-btn"
+          type="button"
+          :title="t('collab.search.open')"
+          :aria-label="t('collab.search.open')"
+          @click="emit('openSearch', $event)"
+        >
+          <LucideIcon :icon="Search" :size="14" />
+        </button>
+      </div>
     </div>
     <div class="sidebar-scroll">
 
       <!-- LOCAL -->
       <div class="sidebar-section">
         <div class="sidebar-section-header" @click="emit('toggleLocal')">
-          <span class="chevron" :class="{ expanded: props.expandLocal }">&#9654;</span>
-          <svg class="section-icon" viewBox="0 0 16 16" width="14" height="14" fill="currentColor">
-            <path d="M4.75 7a.75.75 0 0 0 0 1.5h4.5a.75.75 0 0 0 0-1.5h-4.5zM5 4.75a.75.75 0 0 1 .75-.75h5.5a.75.75 0 0 1 0 1.5h-5.5A.75.75 0 0 1 5 4.75zM6.75 10a.75.75 0 0 0 0 1.5h2.5a.75.75 0 0 0 0-1.5h-2.5z"/>
-          </svg>
+          <LucideIcon class="chevron" :class="{ expanded: props.expandLocal }" :icon="ChevronRight" :size="11" />
+          <LucideIcon class="section-icon" :icon="GitBranch" :size="14" />
           <span class="section-label">LOCAL</span>
           <span class="section-count">{{ props.localBranches.length }}</span>
         </div>
@@ -186,9 +211,7 @@ watch(
             @dblclick="emit('branchDblclick', { kind: 'localBranch', branch: b })"
             @contextmenu.prevent="emit('branchContextmenu', $event, { kind: 'localBranch', branch: b })"
           >
-            <svg class="item-icon branch-icon" viewBox="0 0 16 16" width="12" height="12" fill="currentColor">
-              <path d="M11.75 2.5a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5zm-2.25.75a2.25 2.25 0 1 1 3 2.122V6A2.5 2.5 0 0 1 10 8.5H6A1.5 1.5 0 0 0 4.5 10v1.128a2.251 2.251 0 1 1-1.5 0V5.372a2.25 2.25 0 1 1 1.5 0v1.836A3 3 0 0 1 6 7h4a1 1 0 0 0 1-1v-.628A2.25 2.25 0 0 1 9.5 3.25zM4.25 12a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5zM3.5 3.25a.75.75 0 1 1 1.5 0 .75.75 0 0 1-1.5 0z"/>
-            </svg>
+            <LucideIcon class="item-icon branch-icon" :icon="GitBranch" :size="12" />
             <span class="item-label">{{ b.name }}</span>
             <span v-if="b.isCurrent" class="current-badge">HEAD</span>
           </div>
@@ -199,20 +222,15 @@ watch(
       <!-- REMOTE -->
       <div class="sidebar-section">
         <div class="sidebar-section-header" @click="emit('toggleRemotes')">
-          <span class="chevron" :class="{ expanded: props.expandRemotes }">&#9654;</span>
-          <svg class="section-icon" viewBox="0 0 16 16" width="14" height="14" fill="currentColor">
-            <path d="M8 0a8 8 0 1 0 0 16A8 8 0 0 0 8 0zM1.5 8a6.5 6.5 0 1 1 13 0 6.5 6.5 0 0 1-13 0z"/>
-            <path d="M8 1.5c-1.38 0-2.74 1.9-3.27 4.5h6.54C10.74 3.4 9.38 1.5 8 1.5zM4.55 7.5C4.52 7.66 4.5 7.83 4.5 8s.02.34.05.5h6.9c.03-.16.05-.33.05-.5s-.02-.34-.05-.5h-6.9zM4.73 10c.53 2.6 1.89 4.5 3.27 4.5s2.74-1.9 3.27-4.5H4.73z"/>
-          </svg>
+          <LucideIcon class="chevron" :class="{ expanded: props.expandRemotes }" :icon="ChevronRight" :size="11" />
+          <LucideIcon class="section-icon" :icon="Globe" :size="14" />
           <span class="section-label">REMOTE</span>
         </div>
         <div v-if="props.expandRemotes" class="sidebar-section-body">
           <template v-for="[remoteName, branches] in props.remoteBranches" :key="remoteName">
             <div class="sidebar-item remote-group" @click="emit('toggleRemoteName', remoteName)">
-              <span class="chevron small" :class="{ expanded: props.expandedRemoteNames.has(remoteName) }">&#9654;</span>
-              <svg class="item-icon" viewBox="0 0 16 16" width="12" height="12" fill="currentColor">
-                <path d="M8 0a8 8 0 1 0 0 16A8 8 0 0 0 8 0zM1.5 8a6.5 6.5 0 1 1 13 0 6.5 6.5 0 0 1-13 0z"/>
-              </svg>
+              <LucideIcon class="chevron small" :class="{ expanded: props.expandedRemoteNames.has(remoteName) }" :icon="ChevronRight" :size="10" />
+              <LucideIcon class="item-icon" :icon="Globe" :size="12" />
               <span class="item-label">{{ remoteName }}</span>
             </div>
             <template v-if="props.expandedRemoteNames.has(remoteName)">
@@ -225,9 +243,7 @@ watch(
                 @dblclick="emit('branchDblclick', { kind: 'remoteBranch', remoteName, branch: rb })"
                 @contextmenu.prevent="emit('branchContextmenu', $event, { kind: 'remoteBranch', remoteName, branch: rb })"
               >
-                <svg class="item-icon branch-icon" viewBox="0 0 16 16" width="12" height="12" fill="currentColor">
-                  <path d="M11.75 2.5a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5zm-2.25.75a2.25 2.25 0 1 1 3 2.122V6A2.5 2.5 0 0 1 10 8.5H6A1.5 1.5 0 0 0 4.5 10v1.128a2.251 2.251 0 1 1-1.5 0V5.372a2.25 2.25 0 1 1 1.5 0v1.836A3 3 0 0 1 6 7h4a1 1 0 0 0 1-1v-.628A2.25 2.25 0 0 1 9.5 3.25zM4.25 12a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5zM3.5 3.25a.75.75 0 1 1 1.5 0 .75.75 0 0 1-1.5 0z"/>
-                </svg>
+                <LucideIcon class="item-icon branch-icon" :icon="GitBranch" :size="12" />
                 <span class="item-label">{{ rb.name }}</span>
               </div>
             </template>
@@ -239,10 +255,8 @@ watch(
       <!-- STASHES -->
       <div class="sidebar-section">
         <div class="sidebar-section-header" @click="emit('toggleStashes')">
-          <span class="chevron" :class="{ expanded: props.expandStashes }">&#9654;</span>
-          <svg class="section-icon" viewBox="0 0 16 16" width="14" height="14" fill="currentColor">
-            <path d="M1.75 1h12.5c.966 0 1.75.784 1.75 1.75v10.5A1.75 1.75 0 0 1 14.25 15H1.75A1.75 1.75 0 0 1 0 13.25V2.75C0 1.784.784 1 1.75 1zm12.5 1.5H1.75a.25.25 0 0 0-.25.25v10.5c0 .138.112.25.25.25h12.5a.25.25 0 0 0 .25-.25V2.75a.25.25 0 0 0-.25-.25zM8 10a2 2 0 1 1 0-4 2 2 0 0 1 0 4z"/>
-          </svg>
+          <LucideIcon class="chevron" :class="{ expanded: props.expandStashes }" :icon="ChevronRight" :size="11" />
+          <LucideIcon class="section-icon" :icon="Archive" :size="14" />
           <span class="section-label">STASHES</span>
           <span v-if="props.stashes.length > 0" class="section-count">{{ props.stashes.length }}</span>
         </div>
@@ -255,9 +269,7 @@ watch(
             @click="onStashClick(s, $event)"
             @contextmenu="onStashContextMenu($event, s)"
           >
-            <svg class="item-icon stash-icon" viewBox="0 0 16 16" width="12" height="12" fill="currentColor">
-              <path d="M1.75 1h12.5c.966 0 1.75.784 1.75 1.75v10.5A1.75 1.75 0 0 1 14.25 15H1.75A1.75 1.75 0 0 1 0 13.25V2.75C0 1.784.784 1 1.75 1z"/>
-            </svg>
+            <LucideIcon class="item-icon stash-icon" :icon="Archive" :size="12" />
             <span class="item-label stash-label">{{ s.message }}</span>
             <span
               v-if="isUnanchoredStash(s)"
@@ -272,10 +284,8 @@ watch(
       <!-- TAGS -->
       <div v-if="props.tags.length > 0" class="sidebar-section">
         <div class="sidebar-section-header" @click="emit('toggleTags')">
-          <span class="chevron" :class="{ expanded: props.expandTags }">&#9654;</span>
-          <svg class="section-icon" viewBox="0 0 16 16" width="14" height="14" fill="currentColor">
-            <path d="M1 7.775V2.75C1 1.784 1.784 1 2.75 1h5.025c.464 0 .91.184 1.238.513l5.474 5.474a1.75 1.75 0 0 1 0 2.475l-5.025 5.025a1.75 1.75 0 0 1-2.475 0L1.513 9.013A1.75 1.75 0 0 1 1 7.775zM2.75 2.5a.25.25 0 0 0-.25.25v5.025c0 .066.026.13.073.177l5.475 5.475a.25.25 0 0 0 .353 0l5.026-5.026a.25.25 0 0 0 0-.353L7.952 2.573a.25.25 0 0 0-.177-.073H2.75zM6 5a1 1 0 1 1-2 0 1 1 0 0 1 2 0z"/>
-          </svg>
+          <LucideIcon class="chevron" :class="{ expanded: props.expandTags }" :icon="ChevronRight" :size="11" />
+          <LucideIcon class="section-icon" :icon="Tags" :size="14" />
           <span class="section-label">TAGS</span>
           <span class="section-count">{{ props.tags.length }}</span>
         </div>
@@ -287,9 +297,7 @@ watch(
             :title="tag.shortName + ' @ ' + tag.targetHash.slice(0, 7)"
             @click="emit('selectTag', tag)"
           >
-            <svg class="item-icon tag-icon" viewBox="0 0 16 16" width="12" height="12" fill="currentColor">
-              <path d="M1 7.775V2.75C1 1.784 1.784 1 2.75 1h5.025c.464 0 .91.184 1.238.513l5.474 5.474a1.75 1.75 0 0 1 0 2.475l-5.025 5.025a1.75 1.75 0 0 1-2.475 0L1.513 9.013A1.75 1.75 0 0 1 1 7.775zM2.75 2.5a.25.25 0 0 0-.25.25v5.025c0 .066.026.13.073.177l5.475 5.475a.25.25 0 0 0 .353 0l5.026-5.026a.25.25 0 0 0 0-.353L7.952 2.573a.25.25 0 0 0-.177-.073H2.75zM6 5a1 1 0 1 1-2 0 1 1 0 0 1 2 0z"/>
-            </svg>
+            <LucideIcon class="item-icon tag-icon" :icon="Tag" :size="12" />
             <span class="item-label">{{ tag.shortName }}</span>
           </div>
         </div>
@@ -298,10 +306,8 @@ watch(
       <!-- SUBMODULES -->
       <div v-if="props.submodules.length > 0" class="sidebar-section">
         <div class="sidebar-section-header" @click="emit('toggleSubmodules')">
-          <span class="chevron" :class="{ expanded: props.expandSubmodules }">&#9654;</span>
-          <svg class="section-icon" viewBox="0 0 16 16" width="14" height="14" fill="currentColor">
-            <path d="M0 2.75C0 1.784.784 1 1.75 1H5c.55 0 1.07.26 1.4.7l.9 1.2a.25.25 0 0 0 .2.1h6.75c.966 0 1.75.784 1.75 1.75v8.5A1.75 1.75 0 0 1 14.25 15H1.75A1.75 1.75 0 0 1 0 13.25V2.75zm1.75-.25a.25.25 0 0 0-.25.25v10.5c0 .138.112.25.25.25h12.5a.25.25 0 0 0 .25-.25v-8.5a.25.25 0 0 0-.25-.25H7.5c-.55 0-1.07-.26-1.4-.7l-.9-1.2a.25.25 0 0 0-.2-.1H1.75z"/>
-          </svg>
+          <LucideIcon class="chevron" :class="{ expanded: props.expandSubmodules }" :icon="ChevronRight" :size="11" />
+          <LucideIcon class="section-icon" :icon="FolderGit2" :size="14" />
           <span class="section-label">SUBMODULES</span>
           <span v-if="props.submodules.length > 0" class="section-count">{{ props.submodules.length }}</span>
         </div>
@@ -312,19 +318,11 @@ watch(
             :title="m.path + ' @ ' + m.hash.slice(0, 7)"
           >
             <span class="submodule-status" :class="'sub-' + m.status">
-              <svg v-if="m.status === 'ok'" viewBox="0 0 16 16" width="12" height="12" fill="currentColor">
-                <path d="M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L2.22 9.28a.75.75 0 0 1 1.06-1.06L6 10.94l6.72-6.72a.75.75 0 0 1 1.06 0z"/>
-              </svg>
-              <svg v-else-if="m.status === 'modified'" viewBox="0 0 16 16" width="12" height="12" fill="currentColor">
-                <path d="M8 4a4 4 0 1 0 0 8 4 4 0 0 0 0-8z"/>
-              </svg>
-              <svg v-else viewBox="0 0 16 16" width="12" height="12" fill="currentColor">
-                <path d="M8 0a8 8 0 1 0 0 16A8 8 0 0 0 8 0zm3.28 5.78l-4.25 4.25a.75.75 0 0 1-1.06 0l-2.25-2.25a.75.75 0 1 1 1.06-1.06L6.5 8.44l3.72-3.72a.75.75 0 1 1 1.06 1.06z"/>
-              </svg>
+              <LucideIcon v-if="m.status === 'ok'" :icon="Check" :size="12" />
+              <LucideIcon v-else-if="m.status === 'modified'" :icon="CircleDot" :size="12" />
+              <LucideIcon v-else :icon="Circle" :size="12" />
             </span>
-            <svg class="item-icon" viewBox="0 0 16 16" width="12" height="12" fill="currentColor">
-              <path d="M0 2.75C0 1.784.784 1 1.75 1H5c.55 0 1.07.26 1.4.7l.9 1.2a.25.25 0 0 0 .2.1h6.75c.966 0 1.75.784 1.75 1.75v8.5A1.75 1.75 0 0 1 14.25 15H1.75A1.75 1.75 0 0 1 0 13.25V2.75z"/>
-            </svg>
+            <LucideIcon class="item-icon" :icon="FolderGit2" :size="12" />
             <span class="item-label">{{ m.name }}</span>
           </div>
         </div>
@@ -338,9 +336,7 @@ watch(
         :title="t('git.config.open')"
         @click="emit('openGitConfig', $event)"
       >
-        <svg class="sidebar-config-icon" viewBox="0 0 16 16" width="13" height="13" fill="currentColor" aria-hidden="true">
-          <path d="M6.32 1.1a.75.75 0 0 1 .72-.55h1.92a.75.75 0 0 1 .72.55l.3 1.05c.38.15.74.36 1.07.62l1.06-.29a.75.75 0 0 1 .85.34l.96 1.66a.75.75 0 0 1-.13.91l-.78.77c.03.2.05.41.05.63s-.02.43-.05.64l.78.76a.75.75 0 0 1 .13.91l-.96 1.66a.75.75 0 0 1-.85.34l-1.06-.29c-.33.26-.69.47-1.07.62l-.3 1.05a.75.75 0 0 1-.72.55H7.04a.75.75 0 0 1-.72-.55l-.3-1.05a4.56 4.56 0 0 1-1.07-.62l-1.06.29a.75.75 0 0 1-.85-.34l-.96-1.66a.75.75 0 0 1 .13-.91l.78-.76a4.34 4.34 0 0 1 0-1.27l-.78-.77a.75.75 0 0 1-.13-.91l.96-1.66a.75.75 0 0 1 .85-.34l1.06.29c.33-.26.69-.47 1.07-.62l.3-1.05zM8 5.25a2.75 2.75 0 1 0 0 5.5 2.75 2.75 0 0 0 0-5.5z"/>
-        </svg>
+        <LucideIcon class="sidebar-config-icon" :icon="Settings" :size="13" />
         <span>{{ t("git.config.open") }}</span>
       </button>
     </div>
@@ -348,8 +344,6 @@ watch(
 
   <!-- Collapsed sidebar -->
   <div v-else class="sidebar-collapsed" @click="emit('toggleSidebar')" :title="t('collab.expand')">
-    <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor">
-      <path d="M8.22 2.97a.75.75 0 0 1 1.06 0l4.25 4.25a.75.75 0 0 1 0 1.06l-4.25 4.25a.75.75 0 0 1-1.06-1.06L11.19 8.5H3.75a.75.75 0 0 1 0-1.5h7.44L8.22 4.03a.75.75 0 0 1 0-1.06z"/>
-    </svg>
+    <LucideIcon :icon="PanelLeftOpen" :size="14" />
   </div>
 </template>
