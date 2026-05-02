@@ -5,9 +5,8 @@ import { listen } from "@tauri-apps/api/event";
 import { answerQuestion as answerSessionQuestion, cancelChat, chat } from "../services/session";
 import { gitExecute } from "../services/git";
 import type { UnlistenFn } from "@tauri-apps/api/event";
-import type { StreamEvent, ModelOption, PendingQuestion } from "../types";
+import type { StreamEvent, ModelOption, PendingQuestion, PendingToolConfirm } from "../types";
 import MarkdownRenderer from "./MarkdownRenderer.vue";
-import AskUserCard from "./chat/AskUserCard.vue";
 import { t } from "../i18n";
 import { normalizeAppError } from "../services/errors";
 import { useDisplaySettings } from "../composables/useDisplaySettings";
@@ -77,6 +76,9 @@ const streamingText = ref("");
 const thinking = ref(false);
 const nativeRunning = ref(false);
 const pendingQuestion = ref<PendingQuestion | null>(null);
+const pendingToolConfirm = ref<PendingToolConfirm | null>(null);
+const askCustomAnswer = ref("");
+const toolConfirmFeedback = ref("");
 const scrollEl = ref<HTMLElement | null>(null);
 const inputEl = ref<HTMLInputElement | null>(null);
 let pendingSessionId: string | null = null;
@@ -86,6 +88,18 @@ let activeToolExec: ToolExec | null = null;
 const hasRunningTool = computed(() =>
   lines.value.some(l => l.type === "tool" && l.toolExec?.status === "running")
 );
+
+const pendingQuestionOptions = computed(() => pendingQuestion.value?.options ?? []);
+const pendingQuestionQuickOptions = computed(() => pendingQuestionOptions.value.slice(0, -1));
+const pendingQuestionCustomOption = computed(() => {
+  const options = pendingQuestionOptions.value;
+  return options.length > 0 ? options[options.length - 1] : null;
+});
+
+interface TerminalMetaRow {
+  label: string;
+  value: string;
+}
 
 const history = ref<string[]>([]);
 const historyIdx = ref(-1);
@@ -119,6 +133,139 @@ function extractToolSummary(name: string, argsJson: string): string {
   return "";
 }
 
+function formatToolConfirmArguments(raw: string): string {
+  try {
+    const pretty = JSON.stringify(JSON.parse(raw), null, 2);
+    return pretty.length > 1_600 ? pretty.slice(0, 1_600) + "\n..." : pretty;
+  } catch {
+    return raw.length > 1_600 ? raw.slice(0, 1_600) + "..." : raw;
+  }
+}
+
+function truncatePreview(text: string, max = 1_600): string {
+  const normalized = text.trim();
+  if (normalized.length <= max) return normalized;
+  return normalized.slice(0, max) + "\n...";
+}
+
+const toolConfirmTitle = computed(() => {
+  const display = pendingToolConfirm.value?.display;
+  if (!display) return "";
+  if (display.kind === "basic") return t("chat.toolConfirm.title");
+  if (display.kind === "unityEditorStatusChange") {
+    const key = `chat.toolConfirm.unityStatus.title.${display.requestedStatus}`;
+    const label = t(key);
+    return label === key ? t("chat.toolConfirm.unityStatus.title") : label;
+  }
+
+  const docType = t(`chat.toolConfirm.knowledge.docType.${display.docType}`);
+  const suffix = display.targetKind === "directory" ? "Directory" : "Document";
+  return t(`chat.toolConfirm.knowledge.title.${display.operation}${suffix}`, docType);
+});
+
+const toolConfirmRows = computed<TerminalMetaRow[]>(() => {
+  const display = pendingToolConfirm.value?.display;
+  if (!display) return [];
+
+  if (display.kind === "basic") {
+    return [{ label: "tool", value: display.toolName }];
+  }
+
+  if (display.kind === "unityEditorStatusChange") {
+    const statusLabel = (status: string) => {
+      const key = `chat.toolConfirm.unityStatus.status.${status}`;
+      const label = t(key);
+      return label === key ? status : label;
+    };
+    return [
+      { label: "tool", value: display.toolName },
+      { label: t("chat.toolConfirm.unityStatus.current"), value: statusLabel(display.currentStatus) },
+      { label: t("chat.toolConfirm.unityStatus.requested"), value: statusLabel(display.requestedStatus) },
+    ];
+  }
+
+  const rows: TerminalMetaRow[] = [
+    {
+      label: "operation",
+      value: t(`chat.toolConfirm.knowledge.action.${display.operation}`),
+    },
+    {
+      label: "target",
+      value: t(`chat.toolConfirm.knowledge.kind.${display.targetKind}`),
+    },
+    {
+      label: t("chat.toolConfirm.knowledge.field.path"),
+      value: display.path,
+    },
+    {
+      label: t("chat.toolConfirm.knowledge.field.targetDirectory"),
+      value: display.directoryPath,
+    },
+    {
+      label: t("chat.toolConfirm.knowledge.field.directoryMode"),
+      value: t(`chat.toolConfirm.knowledge.mode.${display.directoryMode}`),
+    },
+  ];
+
+  if (display.newPath) {
+    rows.splice(3, 0, {
+      label: t("chat.toolConfirm.knowledge.field.newPath"),
+      value: display.newPath,
+    });
+  }
+
+  return rows;
+});
+
+const toolConfirmPreviewText = computed(() => {
+  const display = pendingToolConfirm.value?.display;
+  if (!display) return "";
+
+  if (display.kind === "basic") {
+    return formatToolConfirmArguments(display.arguments);
+  }
+
+  if (display.kind === "knowledge") {
+    const before = display.documentBeforeText?.trim();
+    const after = display.documentAfterText?.trim();
+    if (before || after) {
+      return [
+        before ? `--- ${t("chat.toolConfirm.knowledge.column.before")} ---\n${truncatePreview(before, 800)}` : "",
+        after ? `--- ${t("chat.toolConfirm.knowledge.column.after")} ---\n${truncatePreview(after, 800)}` : "",
+      ].filter(Boolean).join("\n\n");
+    }
+
+    const beforePaths = display.structureBeforePaths ?? [];
+    const afterPaths = display.structureAfterPaths ?? [];
+    if (beforePaths.length || afterPaths.length) {
+      return [
+        beforePaths.length
+          ? `--- ${t("chat.toolConfirm.knowledge.column.before")} ---\n${beforePaths.slice(0, 40).join("\n")}`
+          : "",
+        afterPaths.length
+          ? `--- ${t("chat.toolConfirm.knowledge.column.after")} ---\n${afterPaths.slice(0, 40).join("\n")}`
+          : "",
+      ].filter(Boolean).join("\n\n");
+    }
+  }
+
+  return "";
+});
+
+const toolConfirmAllowLabel = computed(() => {
+  const display = pendingToolConfirm.value?.display;
+  return display?.kind === "unityEditorStatusChange"
+    ? t("chat.toolConfirm.unityStatus.confirm")
+    : t("chat.toolConfirm.allow");
+});
+
+const toolConfirmDenyLabel = computed(() => {
+  const display = pendingToolConfirm.value?.display;
+  return display?.kind === "unityEditorStatusChange"
+    ? t("chat.toolConfirm.unityStatus.cancel")
+    : t("chat.toolConfirm.deny");
+});
+
 function shouldRefreshOnToolCompletion(toolName: string): boolean {
   return toolName === "bash" || toolName === "write" || toolName === "edit";
 }
@@ -127,6 +274,9 @@ async function runNative(text: string) {
   streamingText.value = "";
   thinking.value = false;
   pendingQuestion.value = null;
+  pendingToolConfirm.value = null;
+  askCustomAnswer.value = "";
+  toolConfirmFeedback.value = "";
   nativeRunning.value = true;
   activeToolExec = null;
   streaming.value = true;
@@ -181,6 +331,9 @@ async function submit() {
   thinking.value = true;
   nativeRunning.value = false;
   pendingQuestion.value = null;
+  pendingToolConfirm.value = null;
+  askCustomAnswer.value = "";
+  toolConfirmFeedback.value = "";
   pendingSessionId = null;
   activeToolExec = null;
 
@@ -200,6 +353,9 @@ async function submit() {
     thinking.value = false;
     nativeRunning.value = false;
     pendingQuestion.value = null;
+    pendingToolConfirm.value = null;
+    askCustomAnswer.value = "";
+    toolConfirmFeedback.value = "";
     lines.value.push({
       id: "err_" + Date.now(),
       type: "error",
@@ -222,6 +378,7 @@ async function answerPendingQuestion(answer: string) {
   const question = pendingQuestion.value;
   if (!question) return;
   pendingQuestion.value = null;
+  askCustomAnswer.value = "";
   try {
     await answerSessionQuestion(question.questionId, answer);
   } catch (e) {
@@ -232,6 +389,35 @@ async function answerPendingQuestion(answer: string) {
     });
     scrollToBottom();
   }
+}
+
+function answerPendingQuestionCustom() {
+  const answer = askCustomAnswer.value.trim();
+  if (!answer) return;
+  answerPendingQuestion(answer);
+}
+
+async function answerPendingToolConfirm(answer: string) {
+  const confirm = pendingToolConfirm.value;
+  if (!confirm) return;
+  pendingToolConfirm.value = null;
+  toolConfirmFeedback.value = "";
+  try {
+    await answerSessionQuestion(confirm.questionId, answer);
+  } catch (e) {
+    lines.value.push({
+      id: "err_" + Date.now(),
+      type: "error",
+      content: normalizeAppError(e).message,
+    });
+    scrollToBottom();
+  }
+}
+
+function answerPendingToolConfirmFeedback() {
+  const feedback = toolConfirmFeedback.value.trim();
+  if (!feedback) return;
+  answerPendingToolConfirm(`feedback:${feedback}`);
 }
 
 function flushStreamingText() {
@@ -337,6 +523,9 @@ function handleStreamEvent(event: StreamEvent) {
     case "askUser":
       thinking.value = false;
       flushStreamingText();
+      pendingToolConfirm.value = null;
+      toolConfirmFeedback.value = "";
+      askCustomAnswer.value = "";
       pendingQuestion.value = {
         questionId: event.questionId,
         toolCallId: event.toolCallId,
@@ -346,9 +535,28 @@ function handleStreamEvent(event: StreamEvent) {
       scrollToBottom(true);
       break;
 
+    case "toolConfirm":
+      thinking.value = false;
+      flushStreamingText();
+      pendingQuestion.value = null;
+      askCustomAnswer.value = "";
+      toolConfirmFeedback.value = "";
+      pendingToolConfirm.value = {
+        questionId: event.questionId,
+        toolCallId: event.toolCallId,
+        display: event.display,
+      };
+      scrollToBottom(true);
+      break;
+
     case "inputAnswered":
       if (pendingQuestion.value?.questionId === event.questionId) {
         pendingQuestion.value = null;
+        askCustomAnswer.value = "";
+      }
+      if (pendingToolConfirm.value?.questionId === event.questionId) {
+        pendingToolConfirm.value = null;
+        toolConfirmFeedback.value = "";
       }
       break;
 
@@ -380,6 +588,9 @@ function handleStreamEvent(event: StreamEvent) {
       thinking.value = false;
       nativeRunning.value = false;
       pendingQuestion.value = null;
+      pendingToolConfirm.value = null;
+      askCustomAnswer.value = "";
+      toolConfirmFeedback.value = "";
       activeToolExec = null;
       currentRunId.value = null;
       pendingSessionId = null;
@@ -392,6 +603,9 @@ function handleStreamEvent(event: StreamEvent) {
       thinking.value = false;
       nativeRunning.value = false;
       pendingQuestion.value = null;
+      pendingToolConfirm.value = null;
+      askCustomAnswer.value = "";
+      toolConfirmFeedback.value = "";
       activeToolExec = null;
       currentRunId.value = null;
       pendingSessionId = null;
@@ -404,6 +618,9 @@ function handleStreamEvent(event: StreamEvent) {
       thinking.value = false;
       nativeRunning.value = false;
       pendingQuestion.value = null;
+      pendingToolConfirm.value = null;
+      askCustomAnswer.value = "";
+      toolConfirmFeedback.value = "";
       activeToolExec = null;
       currentRunId.value = null;
       pendingSessionId = null;
@@ -575,6 +792,9 @@ watch(
     thinking.value = false;
     nativeRunning.value = false;
     pendingQuestion.value = null;
+    pendingToolConfirm.value = null;
+    askCustomAnswer.value = "";
+    toolConfirmFeedback.value = "";
     pendingSessionId = null;
     activeToolExec = null;
     history.value = [];
@@ -639,14 +859,93 @@ defineExpose({ pushOutput });
 
       <div
         v-if="pendingQuestion"
-        class="term-question-panel"
+        class="term-inline-panel term-question-panel"
         @click.stop
         @keydown.stop
       >
-        <AskUserCard
-          :question="pendingQuestion"
-          @answer="answerPendingQuestion"
-        />
+        <div class="term-inline-heading">
+          <span class="term-inline-prefix">?</span>
+          <span class="term-inline-title ui-select-text">{{ pendingQuestion.question }}</span>
+        </div>
+        <div v-if="pendingQuestionQuickOptions.length" class="term-inline-options">
+          <button
+            v-for="(option, index) in pendingQuestionQuickOptions"
+            :key="`${option.label}-${index}`"
+            type="button"
+            class="term-inline-option"
+            @click="answerPendingQuestion(option.label)"
+          >
+            <span class="term-inline-option-label">{{ option.label }}</span>
+            <span v-if="option.description" class="term-inline-option-desc">{{ option.description }}</span>
+          </button>
+        </div>
+        <div v-if="pendingQuestionCustomOption" class="term-inline-input-row">
+          <span class="term-inline-input-label">{{ pendingQuestionCustomOption.label }}</span>
+          <input
+            v-model="askCustomAnswer"
+            class="term-inline-input"
+            type="text"
+            :placeholder="pendingQuestionCustomOption.description"
+            @keydown.enter="answerPendingQuestionCustom"
+          />
+          <button
+            type="button"
+            class="term-inline-button is-primary"
+            :disabled="!askCustomAnswer.trim()"
+            @click="answerPendingQuestionCustom"
+          >
+            {{ t("common.send") }}
+          </button>
+        </div>
+      </div>
+
+      <div
+        v-if="pendingToolConfirm"
+        class="term-inline-panel term-confirm-panel"
+        @click.stop
+        @keydown.stop
+      >
+        <div class="term-inline-heading">
+          <span class="term-inline-prefix">confirm</span>
+          <span class="term-inline-title ui-select-text">{{ toolConfirmTitle }}</span>
+        </div>
+        <dl v-if="toolConfirmRows.length" class="term-inline-meta">
+          <div
+            v-for="row in toolConfirmRows"
+            :key="`${row.label}:${row.value}`"
+            class="term-inline-meta-row"
+          >
+            <dt>{{ row.label }}</dt>
+            <dd class="ui-select-text">{{ row.value }}</dd>
+          </div>
+        </dl>
+        <pre v-if="toolConfirmPreviewText" class="term-inline-pre ui-select-text">{{ toolConfirmPreviewText }}</pre>
+        <div class="term-inline-input-row">
+          <span class="term-inline-input-label">{{ t("chat.toolConfirm.feedbackLabel") }}</span>
+          <input
+            v-model="toolConfirmFeedback"
+            class="term-inline-input"
+            type="text"
+            :placeholder="t('chat.toolConfirm.feedbackPlaceholder')"
+            @keydown.enter="answerPendingToolConfirmFeedback"
+          />
+          <button
+            type="button"
+            class="term-inline-button"
+            :disabled="!toolConfirmFeedback.trim()"
+            @click="answerPendingToolConfirmFeedback"
+          >
+            {{ t("common.send") }}
+          </button>
+        </div>
+        <div class="term-inline-actions">
+          <button type="button" class="term-inline-button is-primary" @click="answerPendingToolConfirm('allow')">
+            {{ toolConfirmAllowLabel }}
+          </button>
+          <button type="button" class="term-inline-button" @click="answerPendingToolConfirm('deny')">
+            {{ toolConfirmDenyLabel }}
+          </button>
+        </div>
       </div>
 
       <div v-if="streaming && nativeRunning && !streamingText && !hasRunningTool" class="term-thinking-row">
@@ -877,24 +1176,45 @@ defineExpose({ pushOutput });
   word-break: break-word;
 }
 
-.term-question-panel {
-  width: min(680px, 100%);
+.term-inline-panel {
+  width: min(760px, 100%);
   margin: 8px 0 10px;
+  padding: 6px 0 6px 12px;
+  border-left: 2px solid var(--git-divider-strong);
   cursor: default;
-  font-family: var(--font-prose);
 }
 
-.term-question-panel :deep(.ask-user-card) {
+.term-question-panel {
+  border-left-color: var(--git-focus);
+}
+
+.term-confirm-panel {
+  border-left-color: var(--git-status-conflict);
+}
+
+.term-inline-heading {
   display: flex;
-  flex-direction: column;
-  gap: 10px;
-  padding: 10px 12px;
-  border: 1px solid var(--git-divider-strong);
-  border-radius: 8px;
-  background: color-mix(in srgb, var(--git-surface-detail) 86%, var(--git-surface-terminal));
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+  margin-bottom: 6px;
 }
 
-.term-question-panel :deep(.ask-question) {
+.term-inline-prefix {
+  flex-shrink: 0;
+  color: var(--git-status-added);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+
+.term-confirm-panel .term-inline-prefix {
+  color: var(--git-status-conflict);
+}
+
+.term-inline-title {
+  min-width: 0;
   color: var(--git-text-primary);
   font-size: 12px;
   font-weight: 600;
@@ -902,70 +1222,153 @@ defineExpose({ pushOutput });
   white-space: pre-wrap;
 }
 
-.term-question-panel :deep(.ask-options) {
+.term-inline-options {
   display: flex;
   flex-direction: column;
-  gap: 8px;
-}
-
-.term-question-panel :deep(.ask-option-btn) {
-  align-items: flex-start;
-  justify-content: flex-start;
-  flex-direction: column;
   gap: 4px;
-  padding-block: 8px;
-  text-align: left;
+  margin: 6px 0;
 }
 
-.term-question-panel :deep(.ask-option-label) {
-  color: inherit;
-  font-size: 12px;
+.term-inline-option {
+  display: grid;
+  grid-template-columns: minmax(88px, max-content) minmax(0, 1fr);
+  gap: 10px;
+  min-width: 0;
+  padding: 3px 8px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--git-text-primary);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.term-inline-option:hover,
+.term-inline-button:hover:not(:disabled) {
+  border-color: var(--git-divider);
+  background: var(--git-row-hover);
+}
+
+.term-inline-option-label {
+  color: var(--git-status-added);
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.term-inline-option-desc {
+  min-width: 0;
+  color: var(--git-text-secondary);
+  overflow-wrap: anywhere;
+}
+
+.term-inline-meta {
+  display: grid;
+  gap: 2px;
+  margin: 6px 0;
+}
+
+.term-inline-meta-row {
+  display: grid;
+  grid-template-columns: 112px minmax(0, 1fr);
+  gap: 10px;
+  min-width: 0;
+}
+
+.term-inline-meta dt,
+.term-inline-input-label {
+  color: var(--git-text-secondary);
+  font-size: 11px;
   font-weight: 600;
 }
 
-.term-question-panel :deep(.ask-option-desc) {
-  color: var(--git-text-secondary);
-  font-size: 11px;
-  line-height: 1.5;
-  text-align: left;
-}
-
-.term-question-panel :deep(.ask-custom) {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.term-question-panel :deep(.ask-custom-label) {
-  color: var(--git-text-secondary);
-  font-size: 11px;
-}
-
-.term-question-panel :deep(.ask-custom-input-row) {
-  display: flex;
-  gap: 8px;
-}
-
-.term-question-panel :deep(.ask-custom-input) {
-  flex: 1;
+.term-inline-meta dd {
   min-width: 0;
-  min-height: 30px;
-  padding: 0 9px;
+  margin: 0;
+  color: var(--git-text-primary);
+  overflow-wrap: anywhere;
+}
+
+.term-inline-pre {
+  max-height: 240px;
+  margin: 6px 0;
+  padding: 6px 8px;
+  overflow: auto;
   border: 1px solid var(--git-divider);
-  border-radius: 6px;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--git-surface-detail) 72%, var(--git-surface-terminal));
+  color: var(--git-text-secondary);
+  font-family: var(--font-mono-block);
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.term-inline-input-row {
+  display: grid;
+  grid-template-columns: max-content minmax(140px, 1fr) max-content;
+  gap: 8px;
+  align-items: center;
+  margin-top: 6px;
+}
+
+.term-inline-input {
+  min-width: 0;
+  min-height: 28px;
+  padding: 0 8px;
+  border: 1px solid var(--git-divider);
+  border-radius: 4px;
   background: var(--git-surface-terminal);
   color: var(--git-text-primary);
   font: inherit;
 }
 
-.term-question-panel :deep(.ask-custom-input:focus) {
+.term-inline-input:focus {
   outline: none;
   border-color: color-mix(in srgb, var(--git-focus) 58%, var(--git-divider));
 }
 
-.term-question-panel :deep(.ask-custom-send) {
-  min-width: 38px;
-  padding-inline: 0;
+.term-inline-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.term-inline-button {
+  min-height: 28px;
+  padding: 0 10px;
+  border: 1px solid var(--git-divider);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--git-text-primary);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.term-inline-button.is-primary {
+  border-color: color-mix(in srgb, var(--git-focus) 54%, var(--git-divider));
+  color: var(--git-focus);
+}
+
+.term-inline-button:disabled {
+  cursor: default;
+  opacity: 0.45;
+}
+
+@media (max-width: 720px) {
+  .term-inline-option,
+  .term-inline-meta-row,
+  .term-inline-input-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .term-inline-actions {
+    justify-content: flex-start;
+    flex-wrap: wrap;
+  }
 }
 
 /* ════════════════════════════════════════
