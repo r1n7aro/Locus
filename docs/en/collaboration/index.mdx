@@ -1,6 +1,26 @@
 ---
 title: Collaboration
-description: TODO
+description: Learn how Locus makes AI changes, Git history, asset diffs, and workspace state easier to track and review in Unity projects.
 ---
 
-TODO
+Collaboration in Locus is about what happens after the Agent edits your Unity project: how a human sees those edits, decides whether to accept them, and hands the work off to another developer when needed.
+
+It is not a real-time multi-user collaboration system and does not provide cloud team spaces or online permission management. The goal is to fit AI changes into the version-control and review flow developers already use.
+
+## What It Covers
+
+- **Visual Git**: view the history graph, branches, and the staged / unstaged / conflict areas in a single workspace, and work with commits, stashes, and submodules.
+- **Unity asset-aware diff**: Scene, Prefab, and ScriptableObject YAML assets are shown as structured changes rather than byte-by-byte text.
+- **Workspace state**: the current session, edits, and project state stay in the workspace so you can return to the same context later.
+- **Traceable Agent actions**: Agent edits land in the filesystem and Git history, so they can be reviewed the same way human commits are.
+
+## Typical Use Cases
+
+- Review what the Agent changed in this round, across both code and assets
+- Understand asset-level changes through semantic diffs instead of raw text
+- Resume a workspace later and recover the session and edit context
+- Hand a chunk of AI-produced changes to a human developer to take over
+
+## Current Stage
+
+Locus is still in the v0.2.3 early-testing stage and collaboration features continue to evolve. Before merging AI changes, it is worth combining the Git history with the semantic diffs for a manual check.
