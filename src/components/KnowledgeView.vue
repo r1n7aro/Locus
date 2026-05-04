@@ -115,6 +115,9 @@ const specialPage = ref<null | "retrieval" | "injection">(null);
 const overviewDismissed = ref(false);
 
 const hasWorkspace = computed(() => !!props.workingDir.trim());
+const embeddingRuntimeLoading = computed(
+  () => !!embeddingStatus.value?.activating,
+);
 
 const knowledgeTypes = computed<
   Array<{
@@ -452,7 +455,11 @@ onUnmounted(() => {
               {{ t("knowledge.retrieval.entry") }}
             </div>
             <div class="kx-type-tab-meta">
-              {{ t("knowledge.retrieval.entryHint") }}
+              {{
+                embeddingRuntimeLoading
+                  ? t("knowledge.retrieval.runtimeStarting")
+                  : t("knowledge.retrieval.entryHint")
+              }}
             </div>
           </button>
           <button
@@ -534,6 +541,14 @@ onUnmounted(() => {
 
       <div class="kx-right">
         <div class="kx-content">
+          <div
+            v-if="embeddingRuntimeLoading && specialPage !== 'retrieval'"
+            class="kx-runtime-loading"
+          >
+            <span class="kx-runtime-spinner" aria-hidden="true"></span>
+            <span>{{ t("knowledge.retrieval.runtimeStarting") }}</span>
+          </div>
+
           <KnowledgePreview
             v-if="selectedDocument"
             :document="selectedDocument"
@@ -828,6 +843,34 @@ onUnmounted(() => {
   flex-direction: column;
   min-height: 0;
   overflow: hidden;
+}
+
+.kx-runtime-loading {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border-color);
+  background: color-mix(in srgb, var(--panel-bg) 88%, var(--bg-color) 12%);
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.kx-runtime-spinner {
+  width: 12px;
+  height: 12px;
+  flex: 0 0 auto;
+  border-radius: 999px;
+  border: 2px solid color-mix(in srgb, currentColor 20%, transparent);
+  border-top-color: currentColor;
+  animation: kx-runtime-spin 0.8s linear infinite;
+}
+
+@keyframes kx-runtime-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .knowledge-empty-panel {

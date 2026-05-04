@@ -939,11 +939,16 @@ pub async fn activate_embedding_runtime(
             state.set_embedding_status(status);
         }
 
-        {
-            let mut mgr = mgr_handle.lock().await;
+        let activation_state = state.clone();
+        let activation_mgr_handle = mgr_handle.clone();
+        let activation_join = tokio::task::spawn_blocking(move || {
+            let started_at = Instant::now();
+            let mut mgr = activation_mgr_handle.blocking_lock();
             let mut status = mgr.status();
             status.activating = true;
-            state.set_embedding_status(status.clone());
+            status.stage = Some("preparing".to_string());
+            status.detail = Some("Preparing embedding runtime".to_string());
+            activation_state.set_embedding_status(status.clone());
 
             let result = mgr.activate_with_progress(&mut |progress| {
                 match progress {
@@ -965,7 +970,7 @@ pub async fn activate_embedding_runtime(
                     }
                 }
                 status.activating = true;
-                state.set_embedding_status(status.clone());
+                activation_state.set_embedding_status(status.clone());
             });
 
             if let Err(err) = result {
@@ -973,9 +978,40 @@ pub async fn activate_embedding_runtime(
                 failed.activating = false;
                 failed.error = Some(err.clone());
                 failed.stage = Some("error".to_string());
-                state.set_embedding_status(failed);
+                activation_state.set_embedding_status(failed);
+                tracing::warn!(
+                    log_module = "knowledge_index",
+                    elapsed_ms = started_at.elapsed().as_millis() as u64,
+                    error = %err,
+                    "embedding runtime activation failed"
+                );
                 return Err(err);
             }
+            tracing::info!(
+                log_module = "knowledge_index",
+                elapsed_ms = started_at.elapsed().as_millis() as u64,
+                "embedding runtime activation completed"
+            );
+            Ok(())
+        })
+        .await;
+
+        let activation_result = match activation_join {
+            Ok(result) => result,
+            Err(err) => {
+                let message = format!("Embedding runtime activation task failed: {err}");
+                let mut failed = state.embedding_status_snapshot();
+                failed.activating = false;
+                failed.error = Some(message.clone());
+                failed.stage = Some("error".to_string());
+                failed.detail = Some(message.clone());
+                state.set_embedding_status(failed);
+                return Err(message);
+            }
+        };
+
+        if let Err(err) = activation_result {
+            return Err(err);
         }
     }
 

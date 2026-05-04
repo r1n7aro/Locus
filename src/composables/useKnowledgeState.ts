@@ -3398,6 +3398,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
     );
     if (cachedDocs) documents.value = cachedDocs;
     void refreshKnowledgeData({ force: false, includeOverview: false });
+    void refreshRetrievalRuntimeStatus();
 
     const release = await listen<KnowledgeChangedEvent>(
       "knowledge-changed",
@@ -3456,6 +3457,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
         activeType.value = preservedActiveType;
       }
       void refreshKnowledgeData({ force: true, includeOverview: false });
+      void refreshRetrievalRuntimeStatus();
     },
   );
 
