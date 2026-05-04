@@ -51,6 +51,14 @@ bun tauri build
 
 发布安装包与版本说明见 [GitHub Releases](https://github.com/r1n7aro/Locus/releases)。
 
+本地构建两个 Windows 发布安装包：
+
+```powershell
+bun run release:installers
+```
+
+默认安装包保持标准命名，例如 `locus_0.2.5_x64-setup.exe`。无内嵌版本使用 `locus_0.2.5_x64-without_embed_python_git-setup.exe`。
+
 ## 许可证
 
 主仓库源代码采用 `GPL-3.0-or-later` 发布，完整文本见 [LICENSE](LICENSE)。

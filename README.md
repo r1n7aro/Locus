@@ -1,6 +1,6 @@
 # Locus for Unity - Open Source Unity Dev Agent
 
-> Scale game development efficiency and free creators from tedious, repetitive work.
+> Scale game development efficiency and free creators from dirty, repetitive work.
 
 [![Docs](https://img.shields.io/badge/DOCS-unity.farlocus.com-f2c230?style=for-the-badge&labelColor=4a4a4a)](https://unity.farlocus.com/en)
 [![Release](https://img.shields.io/badge/RELEASE-GitHub-5d7285?style=for-the-badge&labelColor=4a4a4a)](https://github.com/r1n7aro/Locus/releases)
@@ -45,11 +45,19 @@ This command starts the Vite development server and opens the Tauri desktop app.
 bun tauri build
 ```
 
-This command rebuilds the merged Roslyn DLL, builds the frontend, generates the third-party license bundle, and packages the desktop app. The default output is a Windows `NSIS` installer under `src-tauri/target/release/bundle/nsis/`.
+This command rebuilds the merged Roslyn DLL, prepares the managed Python and Git runtimes, builds the frontend, generates the third-party license bundle, and packages the desktop app. The default output is a Windows `NSIS` installer under `src-tauri/target/release/bundle/nsis/`.
 
 ## Releases
 
 See [GitHub Releases](https://github.com/r1n7aro/Locus/releases) for published installers and release notes.
+
+To build both Windows release installers locally:
+
+```powershell
+bun run release:installers
+```
+
+The default installer keeps the standard name, for example `locus_0.2.5_x64-setup.exe`. The no-embed installer uses `locus_0.2.5_x64-without_embed_python_git-setup.exe`.
 
 ## License
 
