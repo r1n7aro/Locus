@@ -1,9 +1,9 @@
 ---
 title: "Latest Version"
-description: "Locus v0.2.4 (2026-05-02)"
+description: "Locus v0.2.5 (2026-05-04)"
 sidebarTitle: "Latest Version"
-version: "0.2.4"
-releasedAt: "2026-05-02"
+version: "0.2.5"
+releasedAt: "2026-05-04"
 channel: "stable"
 updateTitle: "Update available"
 changelogUrl: "/en/overview/latest-version"
@@ -17,21 +17,17 @@ changelogUrl: "/en/overview/latest-version"
 
 ### Added
 
-- Added a Git history search window in Collab for searching commits and stashes by file/path query, regex, author, and date range.
-- Added live progress events for `unity_execute` and `unity_run_states` in chat tool call panels.
-- Added a display setting to hide Git terminal command suggestions.
-- Added knowledge inspection tools to the Git Agent.
+- Added managed Windows Python and Git runtimes, with runtime selection controls in Settings.
+- Added release installer variants for builds with bundled Python/Git and builds without bundled Python/Git.
+- Added folder selection in Collab staged/unstaged tree views for batch stage and unstage workflows.
 
 ### Fixed
 
-- Fixed Git terminal pending input by rendering ask-user and tool confirmation prompts inline.
-- Fixed saved reasoning effort handling so session and agent context changes keep the user's persisted default.
-- Fixed `unity_yaml_read` enum serialization when Unity does not provide enum display names.
-- Fixed Knowledge lexical rebuild progress for small single-document updates and large batch progress totals.
-- Fixed Knowledge selection cleanup after deleting documents or folders.
-- Filtered third-party TRACE logs while debug mode is enabled.
-- Improved `unity_yaml_read` tool header summaries with full file and object paths.
+- Improved Unity asset previews with syntax highlighting for text previews and default root target selection for prefabs.
+- Fixed app bootstrap and session restore paths so they keep the user's saved reasoning effort defaults.
+- Redacted sensitive Claude hook headers from logs.
+- Aligned Collab focus ring styling.
 
 ### Removed
 
-- Removed the Claude subscription OAuth sign-in entry point while keeping logout available for existing accounts.
+- Removed auth debug logging.

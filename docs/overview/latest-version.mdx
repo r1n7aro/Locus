@@ -1,9 +1,9 @@
 ---
 title: "当前版本"
-description: "Locus v0.2.4 (2026-05-02)"
+description: "Locus v0.2.5 (2026-05-04)"
 sidebarTitle: "当前版本"
-version: "0.2.4"
-releasedAt: "2026-05-02"
+version: "0.2.5"
+releasedAt: "2026-05-04"
 channel: "stable"
 updateTitle: "发现新版本"
 changelogUrl: "/overview/latest-version"
@@ -17,21 +17,17 @@ changelogUrl: "/overview/latest-version"
 
 ### 新增
 
-- Collab 新增 Git 历史搜索窗口，支持按文件/路径、正则、作者和日期范围搜索 commit 与 stash。
-- `unity_execute` 和 `unity_run_states` 的工具调用面板新增实时进度事件。
-- 设置中新增隐藏 Git 终端命令候选项的显示开关。
-- Git Agent 新增通过知识工具检查 Locus 知识文档的能力。
+- 新增 Windows 托管 Python 与 Git 运行时，并在设置中提供运行时选择。
+- 新增带内置 Python/Git 与不带内置 Python/Git 的安装包构建变体。
+- Collab staged/unstaged 树视图支持选择文件夹，用于批量 stage 和 unstage。
 
 ### 修复
 
-- Git 终端现在以内联形式展示用户提问和工具确认。
-- 修复推理强度保存逻辑，Session 与 Agent 的上下文强度不会覆盖用户默认选择。
-- 修复 Unity 缺少 enum display name 时 `unity_yaml_read` 的序列化。
-- 修复 Knowledge lexical rebuild 的小更新静默处理和大批量进度总量。
-- 修复删除知识文档或目录后的选中状态清理。
-- Debug 模式下过滤第三方 TRACE 日志。
-- 改进 `unity_yaml_read` 工具标题摘要，展示完整文件与对象路径。
+- 改进 Unity 资产预览：文本预览支持语法高亮，Prefab 默认选中根对象。
+- 修复应用启动与会话恢复路径中推理强度默认值被覆盖的问题。
+- Claude hook 日志会脱敏敏感请求头。
+- 对齐 Collab 焦点样式。
 
 ### 移除
 
-- 移除 Claude 订阅 OAuth 登录入口，已登录账号仍可在设置中退出。
+- 移除认证调试日志。

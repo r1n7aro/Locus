@@ -1,38 +1,34 @@
 {
-  "version": "0.2.4",
-  "releasedAt": "2026-05-02",
+  "version": "0.2.5",
+  "releasedAt": "2026-05-04",
   "channel": "stable",
   "locales": {
     "zh": {
       "title": "发现新版本",
-      "summary": "Locus v0.2.4 (2026-05-02)",
+      "summary": "Locus v0.2.5 (2026-05-04)",
       "changelogUrl": "/overview/latest-version",
       "changes": [
         {
           "title": "新增",
           "items": [
-            "Collab 新增 Git 历史搜索窗口，支持按文件/路径、正则、作者和日期范围搜索 commit 与 stash。",
-            "`unity_execute` 和 `unity_run_states` 的工具调用面板新增实时进度事件。",
-            "设置中新增隐藏 Git 终端命令候选项的显示开关。",
-            "Git Agent 新增通过知识工具检查 Locus 知识文档的能力。"
+            "新增 Windows 托管 Python 与 Git 运行时，并在设置中提供运行时选择。",
+            "新增带内置 Python/Git 与不带内置 Python/Git 的安装包构建变体。",
+            "Collab staged/unstaged 树视图支持选择文件夹，用于批量 stage 和 unstage。"
           ]
         },
         {
           "title": "修复",
           "items": [
-            "Git 终端现在以内联形式展示用户提问和工具确认。",
-            "修复推理强度保存逻辑，Session 与 Agent 的上下文强度不会覆盖用户默认选择。",
-            "修复 Unity 缺少 enum display name 时 `unity_yaml_read` 的序列化。",
-            "修复 Knowledge lexical rebuild 的小更新静默处理和大批量进度总量。",
-            "修复删除知识文档或目录后的选中状态清理。",
-            "Debug 模式下过滤第三方 TRACE 日志。",
-            "改进 `unity_yaml_read` 工具标题摘要，展示完整文件与对象路径。"
+            "改进 Unity 资产预览：文本预览支持语法高亮，Prefab 默认选中根对象。",
+            "修复应用启动与会话恢复路径中推理强度默认值被覆盖的问题。",
+            "Claude hook 日志会脱敏敏感请求头。",
+            "对齐 Collab 焦点样式。"
           ]
         },
         {
           "title": "移除",
           "items": [
-            "移除 Claude 订阅 OAuth 登录入口，已登录账号仍可在设置中退出。"
+            "移除认证调试日志。"
           ]
         }
       ],
@@ -45,34 +41,30 @@
     },
     "en": {
       "title": "Update available",
-      "summary": "Locus v0.2.4 (2026-05-02)",
+      "summary": "Locus v0.2.5 (2026-05-04)",
       "changelogUrl": "/en/overview/latest-version",
       "changes": [
         {
           "title": "Added",
           "items": [
-            "Added a Git history search window in Collab for searching commits and stashes by file/path query, regex, author, and date range.",
-            "Added live progress events for `unity_execute` and `unity_run_states` in chat tool call panels.",
-            "Added a display setting to hide Git terminal command suggestions.",
-            "Added knowledge inspection tools to the Git Agent."
+            "Added managed Windows Python and Git runtimes, with runtime selection controls in Settings.",
+            "Added release installer variants for builds with bundled Python/Git and builds without bundled Python/Git.",
+            "Added folder selection in Collab staged/unstaged tree views for batch stage and unstage workflows."
           ]
         },
         {
           "title": "Fixed",
           "items": [
-            "Fixed Git terminal pending input by rendering ask-user and tool confirmation prompts inline.",
-            "Fixed saved reasoning effort handling so session and agent context changes keep the user's persisted default.",
-            "Fixed `unity_yaml_read` enum serialization when Unity does not provide enum display names.",
-            "Fixed Knowledge lexical rebuild progress for small single-document updates and large batch progress totals.",
-            "Fixed Knowledge selection cleanup after deleting documents or folders.",
-            "Filtered third-party TRACE logs while debug mode is enabled.",
-            "Improved `unity_yaml_read` tool header summaries with full file and object paths."
+            "Improved Unity asset previews with syntax highlighting for text previews and default root target selection for prefabs.",
+            "Fixed app bootstrap and session restore paths so they keep the user's saved reasoning effort defaults.",
+            "Redacted sensitive Claude hook headers from logs.",
+            "Aligned Collab focus ring styling."
           ]
         },
         {
           "title": "Removed",
           "items": [
-            "Removed the Claude subscription OAuth sign-in entry point while keeping logout available for existing accounts."
+            "Removed auth debug logging."
           ]
         }
       ],
