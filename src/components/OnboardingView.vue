@@ -1,24 +1,23 @@
 
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref, watch } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
-import { openUrl } from "@tauri-apps/plugin-opener";
 import type { UnlistenFn } from "@tauri-apps/api/event";
-import type { ApiFormat, CustomEndpoint, GitProbeResult, PluginStatus, AssetDbScanEvent, ScanStats } from "../types";
+import { openPath } from "@tauri-apps/plugin-opener";
+import type { ApiFormat, CodexModelConfig, CustomEndpoint, GitProbeResult, ModelDefaults, PluginStatus, AssetDbScanEvent, ScanStats } from "../types";
 import { t, setLocale, locale, type Locale } from "../i18n";
 import { useTheme, type ThemePreference } from "../composables/useTheme";
-import { useCopyFeedback } from "../composables/useCopyFeedback";
+import { useSettingsState } from "../composables/useSettingsState";
 import { normalizeAppError } from "../services/errors";
+import { useAuthStore } from "../stores/auth";
+import { useModelStore } from "../stores/model";
 import { useUiStore } from "../stores/ui";
-import {
-  codexStatus, codexStartLogin, codexPollLogin,
-} from "../services/auth";
-import { getCustomEndpoints, saveCustomEndpoints } from "../services/model";
 import { setWorkingDir, getWorkingDir } from "../services/project";
 import { checkUnityPlugin, installUnityPlugin } from "../services/unity";
 import { gitCheckUserConfig, gitInitUnity, gitProbe, gitSetUserConfig } from "../services/git";
 import { assetDbScan } from "../services/asset";
+import BaseDropdown from "./ui/BaseDropdown.vue";
 import BaseSegmented from "./ui/BaseSegmented.vue";
 import GitMissingHelp from "./git/GitMissingHelp.vue";
 import {
@@ -29,6 +28,8 @@ import {
 
 const emit = defineEmits<{ completed: [] }>();
 const uiStore = useUiStore();
+const authStore = useAuthStore();
+const modelStore = useModelStore();
 
 const step = ref(0); // 0=welcome, 1=auth, 2=project, 3=plugin, 4=vcs, 5=scan
 const TOTAL_STEPS = 6;
@@ -76,17 +77,81 @@ function handleThemeChange(value: string) {
   setThemePreference(value as ThemePreference);
 }
 
-const authExpanded = ref<"custom" | "codex" | null>("custom");
-const authError = ref("");
-const authSuccess = ref("");
+function emitSettingsState(event: "authChanged"): void;
+function emitSettingsState(event: "modelDefaultsChanged", defaults: ModelDefaults): void;
+function emitSettingsState(event: "codexTransportChanged", config: CodexModelConfig): void;
+function emitSettingsState(event: "customEndpointsChanged", endpoints: CustomEndpoint[]): void;
+function emitSettingsState(event: "resetOnboarding"): void;
+function emitSettingsState(
+  event: "authChanged" | "modelDefaultsChanged" | "codexTransportChanged" | "customEndpointsChanged" | "resetOnboarding",
+  payload?: ModelDefaults | CodexModelConfig | CustomEndpoint[],
+) {
+  if (event === "authChanged") {
+    void handleSettingsAuthChanged();
+  } else if (event === "modelDefaultsChanged") {
+    modelStore.applyModelDefaults(payload as ModelDefaults);
+  } else if (event === "codexTransportChanged") {
+    modelStore.applyCodexModelConfig(payload as CodexModelConfig);
+  } else if (event === "customEndpointsChanged") {
+    modelStore.applyCustomEndpoints(payload as CustomEndpoint[]);
+  }
+}
 
-const customEndpoints = ref<CustomEndpoint[]>([]);
-const customEndpointSaving = ref(false);
+const {
+  errorMsg: settingsErrorMsg,
+  successMsg: settingsSuccessMsg,
+  codexStep: settingsCodexStep,
+  codexStatus: settingsCodexStatus,
+  codexUserCode: settingsCodexUserCode,
+  codexUrl: settingsCodexUrl,
+  codexCodeCopied: settingsCodexCodeCopied,
+  cancelCodexLogin: settingsCancelCodexLogin,
+  codexLogout: settingsCodexLogout,
+  copyCode: settingsCopyCode,
+  requestCodexLogin: settingsRequestCodexLogin,
+  customEndpoints: settingsCustomEndpoints,
+  editingEndpoint: settingsEditingEndpoint,
+  testStatus: settingsEndpointTestStatus,
+  testResult: settingsEndpointTestResult,
+  startAddEndpoint: settingsStartAddEndpoint,
+  startEditEndpoint: settingsStartEditEndpoint,
+  cancelEditEndpoint: settingsCancelEditEndpoint,
+  saveEndpoint: settingsSaveEndpoint,
+  deleteEndpoint: settingsDeleteEndpoint,
+  testEndpoint: settingsTestEndpoint,
+} = useSettingsState(emitSettingsState);
+
+const authExpanded = ref<"custom" | "codex" | null>("custom");
+const customEndpointConfigured = computed(() => settingsCustomEndpoints.value.length > 0);
+const codexConfigured = computed(() =>
+  settingsCodexStatus.value.authenticated || settingsCodexStep.value === "success",
+);
+const customEndpointReady = computed(() => {
+  const ep = settingsEditingEndpoint.value;
+  return !!ep?.name.trim() && !!ep.apiModel.trim() && !!ep.endpoint.trim();
+});
+const customEndpointTestReady = computed(() => {
+  const ep = settingsEditingEndpoint.value;
+  return !!ep && !!ep.apiModel.trim() && !!ep.endpoint.trim();
+});
+const customEndpointTestDetail = computed(() =>
+  settingsEndpointTestResult.value.replace(/\s*\[OPEN_HTML:.*\]/, "").trim(),
+);
+const customEndpointTestHtmlPath = computed(() => {
+  const match = settingsEndpointTestResult.value.match(/\[OPEN_HTML:(.+)\]/);
+  return match?.[1] ?? "";
+});
 const customApiFormatOptions = computed(() => [
   { value: "openai_chat" as ApiFormat, label: t("settings.custom.formatOpenaiChat") },
   { value: "openai_responses" as ApiFormat, label: t("settings.custom.formatOpenaiResponses") },
   { value: "anthropic_messages" as ApiFormat, label: t("settings.custom.formatAnthropicMessages") },
 ]);
+
+async function handleSettingsAuthChanged() {
+  await authStore.loadProviderStatus();
+  await modelStore.loadCodexAvailableModels();
+  modelStore.resolveSelectedModel(true);
+}
 
 function defaultReasoningParamFormat(apiFormat: ApiFormat): CustomEndpoint["reasoningParamFormat"] {
   switch (apiFormat) {
@@ -96,212 +161,72 @@ function defaultReasoningParamFormat(apiFormat: ApiFormat): CustomEndpoint["reas
   }
 }
 
-function newCustomEndpoint(): CustomEndpoint {
-  const apiFormat: ApiFormat = "openai_chat";
-  return {
-    id: crypto.randomUUID(),
-    name: "",
-    apiModel: "",
-    endpoint: "",
-    apiFormat,
-    apiKey: "",
-    contextLength: 128000,
-    betaFlags: [],
-    supportedReasoningEfforts: ["low", "medium", "high", "max"],
-    reasoningParamFormat: defaultReasoningParamFormat(apiFormat),
-  };
-}
-
-const customEndpointForm = ref<CustomEndpoint>(newCustomEndpoint());
-watch(
-  () => customEndpointForm.value.apiFormat,
-  (apiFormat) => {
-    customEndpointForm.value.reasoningParamFormat = defaultReasoningParamFormat(apiFormat);
-  },
-);
-const customEndpointConfigured = computed(() => customEndpoints.value.length > 0);
-const customEndpointReady = computed(() => {
-  const ep = customEndpointForm.value;
-  return !!ep.name.trim() && !!ep.apiModel.trim() && !!ep.endpoint.trim();
-});
-
-// OpenAI Codex
-type CodexStep = "idle" | "opening" | "waiting" | "success";
-const codexStep = ref<CodexStep>("idle");
-const codexAuthenticated = ref(false);
-const codexUserCode = ref("");
-const codexUrl = ref("");
-const codexDeviceAuthId = ref("");
-const codexInterval = ref(5);
-const { copied: codexCodeCopied, copyText: copyCodexText, reset: resetCodexCopyState } = useCopyFeedback();
-let codexTimer: ReturnType<typeof setTimeout> | null = null;
-let codexPollInFlight = false;
-
-async function loadModelConfigState() {
-  codexAuthenticated.value = false;
-  try {
-    customEndpoints.value = await getCustomEndpoints();
-  } catch { /* ignore */ }
-  try {
-    const cs = await codexStatus();
-    codexAuthenticated.value = cs.authenticated;
-  } catch { /* ignore */ }
-}
-
-async function startCodexLogin() {
-  if (codexStep.value === "opening" || codexStep.value === "waiting") return;
-  stopCodexPolling();
-  resetCodexCopyState();
-  authError.value = "";
-  codexStep.value = "opening";
-  try {
-    const info = await codexStartLogin();
-    codexUserCode.value = info.userCode;
-    codexUrl.value = info.url;
-    codexDeviceAuthId.value = info.deviceAuthId;
-    codexInterval.value = Math.max(info.interval, 5);
-    codexStep.value = "waiting";
-    void openUrl(info.url).catch(() => undefined);
-    scheduleCodexPoll();
-  } catch (e) {
-    codexStep.value = "idle";
-    authError.value = t("settings.codex.loginFailed", normalizeAppError(e).message);
+function toggleAuthProvider(provider: "custom" | "codex") {
+  authExpanded.value = authExpanded.value === provider ? null : provider;
+  if (provider === "custom" && authExpanded.value === "custom" && settingsCustomEndpoints.value.length === 0 && !settingsEditingEndpoint.value) {
+    settingsStartAddEndpoint();
   }
 }
 
-function stopCodexPolling() {
-  if (codexTimer) {
-    clearTimeout(codexTimer);
-    codexTimer = null;
-  }
-  codexPollInFlight = false;
+function updateInlineEndpointApiFormat(value: string) {
+  if (!settingsEditingEndpoint.value) return;
+  const apiFormat = value as ApiFormat;
+  settingsEditingEndpoint.value.apiFormat = apiFormat;
+  settingsEditingEndpoint.value.reasoningParamFormat = defaultReasoningParamFormat(apiFormat);
 }
 
-function scheduleCodexPoll(delayMs = codexInterval.value * 1000) {
-  if (codexTimer) clearTimeout(codexTimer);
-  codexTimer = setTimeout(() => {
-    codexTimer = null;
-    void pollCodex();
-  }, delayMs);
-}
-
-async function pollCodex() {
-  if (codexPollInFlight || codexStep.value !== "waiting") return;
-  codexPollInFlight = true;
-  try {
-    const result = await codexPollLogin(codexDeviceAuthId.value, codexUserCode.value);
-    if (result.status === "success") {
-      stopCodexPolling();
-      codexStep.value = "success";
-      codexAuthenticated.value = true;
-      authSuccess.value = t("settings.codex.loginSuccess");
-      setTimeout(() => { authSuccess.value = ""; codexStep.value = "idle"; }, 2000);
-    } else if (result.status === "failed") {
-      stopCodexPolling();
-      codexStep.value = "idle";
-      authError.value = result.message ?? t("settings.codex.authFailed");
-    } else if (codexStep.value === "waiting") {
-      scheduleCodexPoll();
-    }
-  } catch {
-    if (codexStep.value === "waiting") {
-      scheduleCodexPoll();
-    }
-  } finally {
-    codexPollInFlight = false;
-  }
-}
-
-function cancelCodexLogin() {
-  stopCodexPolling();
-  resetCodexCopyState();
-  codexStep.value = "idle";
-}
-
-async function copyCodexCode() {
-  await copyCodexText(codexUserCode.value);
-}
-
-function normalizedCustomEndpoint(): CustomEndpoint | null {
-  const ep = customEndpointForm.value;
-  const name = ep.name.trim();
-  const apiModel = ep.apiModel.trim();
-  const endpoint = ep.endpoint.trim();
-  if (!name) {
-    authError.value = t("settings.custom.nameRequired");
-    return null;
-  }
-  if (!apiModel) {
-    authError.value = t("settings.custom.apiModelRequired");
-    return null;
-  }
-  if (!endpoint) {
-    authError.value = t("settings.custom.endpointRequired");
-    return null;
-  }
-  const contextLength = Number(ep.contextLength);
-  return {
-    ...ep,
-    name,
-    apiModel,
-    endpoint,
-    apiKey: ep.apiKey.trim(),
-    contextLength: Number.isFinite(contextLength) && contextLength >= 1024 ? contextLength : 128000,
-    betaFlags: ep.betaFlags ?? [],
-    supportedReasoningEfforts: ep.supportedReasoningEfforts?.length
-      ? ep.supportedReasoningEfforts
-      : ["low", "medium", "high", "max"],
-    reasoningParamFormat: ep.reasoningParamFormat || defaultReasoningParamFormat(ep.apiFormat),
-  };
-}
-
-async function saveCustomEndpoint() {
-  const ep = normalizedCustomEndpoint();
-  if (!ep) return;
-  customEndpointSaving.value = true;
-  authError.value = "";
-  try {
-    const list = [...customEndpoints.value];
-    const idx = list.findIndex((item) => item.id === ep.id);
-    if (idx >= 0) list[idx] = ep;
-    else list.push(ep);
-    await saveCustomEndpoints(list);
-    customEndpoints.value = list;
-    customEndpointForm.value = newCustomEndpoint();
-    authSuccess.value = t("settings.custom.saved");
-    setTimeout(() => { authSuccess.value = ""; }, 2000);
-  } catch (e) {
-    authError.value = t("settings.custom.saveFailed", normalizeAppError(e).message);
-  } finally {
-    customEndpointSaving.value = false;
-  }
-}
-
-function handleCustomEndpointKeydown(e: KeyboardEvent) {
+function handleInlineEndpointKeydown(e: KeyboardEvent) {
   if (e.key === "Enter") {
     e.preventDefault();
-    void saveCustomEndpoint();
+    void settingsSaveEndpoint();
   } else if (e.key === "Escape") {
-    authError.value = "";
+    settingsCancelEditEndpoint();
+  }
+}
+
+async function openCustomEndpointTestHtml() {
+  if (!customEndpointTestHtmlPath.value) return;
+  try {
+    await openPath(customEndpointTestHtmlPath.value);
+  } catch (e) {
+    settingsEndpointTestResult.value = normalizeAppError(e).message;
   }
 }
 
 const projectPath = ref("");
 const projectError = ref("");
 const projectValid = ref(false);
+const projectOpening = ref(false);
+
+async function waitForProjectOpeningPaint() {
+  await nextTick();
+  await new Promise<void>((resolve) => {
+    if (typeof requestAnimationFrame !== "function") {
+      globalThis.setTimeout(resolve, 0);
+      return;
+    }
+    requestAnimationFrame(() => globalThis.setTimeout(resolve, 0));
+  });
+}
 
 async function browseProject() {
+  if (projectOpening.value) return;
   try {
     const selected = await open({ directory: true, multiple: false });
     if (selected && typeof selected === "string") {
       projectError.value = "";
+      projectPath.value = selected;
+      projectValid.value = false;
+      projectOpening.value = true;
+      await waitForProjectOpeningPaint();
       try {
-        await setWorkingDir(selected);
-        projectPath.value = selected;
+        projectPath.value = await setWorkingDir(selected);
         projectValid.value = true;
       } catch (e) {
         projectError.value = normalizeAppError(e).message;
         projectValid.value = false;
+      } finally {
+        projectOpening.value = false;
       }
     }
   } catch { /* cancelled */ }
@@ -502,7 +427,9 @@ async function startScan() {
 }
 
 watch(step, async (s) => {
-  if (s === 1) await loadModelConfigState();
+  if (s === 1 && authExpanded.value === "custom" && settingsCustomEndpoints.value.length === 0 && !settingsEditingEndpoint.value) {
+    settingsStartAddEndpoint();
+  }
   if (s === 3) {
     await checkPlugin();
     if (!unlistenPlugin) {
@@ -513,6 +440,16 @@ watch(step, async (s) => {
   }
   if (s === 4) await checkGit();
 });
+
+watch(
+  () => [step.value, authExpanded.value, settingsCustomEndpoints.value.length] as const,
+  ([s, expanded, endpointCount]) => {
+    if (s === 1 && expanded === "custom" && endpointCount === 0 && !settingsEditingEndpoint.value) {
+      settingsStartAddEndpoint();
+    }
+  },
+  { immediate: true },
+);
 
 function scanProgressText(): string {
   if (!scanPhase.value) return "";
@@ -540,7 +477,6 @@ onMounted(async () => {
 onUnmounted(() => {
   unlistenScan?.();
   unlistenPlugin?.();
-  stopCodexPolling();
 });
 </script>
 
@@ -630,133 +566,214 @@ onUnmounted(() => {
         <p>{{ t("onboarding.auth.desc3") }}</p>
       </div>
 
-      <div v-if="authSuccess" class="msg success">{{ authSuccess }}</div>
-      <div v-if="authError" class="msg error">{{ authError }}</div>
+      <div class="provider-list">
+        <div class="provider-card" :class="{ expanded: authExpanded === 'custom' }">
+          <div class="provider-header" @click="toggleAuthProvider('custom')">
+            <div class="provider-left">
+              <span class="provider-name">{{ t("onboarding.auth.customEndpoint") }}</span>
+              <span class="provider-desc-text">{{ t("onboarding.auth.customEndpointDesc") }}</span>
+            </div>
+            <span class="provider-badge" :class="{ configured: customEndpointConfigured }">
+              {{ customEndpointConfigured ? t("onboarding.auth.configured") : t("onboarding.auth.notConfigured") }}
+            </span>
+          </div>
+          <div v-if="authExpanded === 'custom'" class="provider-body custom-endpoint-body" @click.stop>
+            <div v-if="settingsSuccessMsg" class="msg success">{{ settingsSuccessMsg }}</div>
+            <div v-if="settingsErrorMsg" class="msg error">{{ settingsErrorMsg }}</div>
 
-      <!-- Custom endpoint -->
-      <div class="provider-card" :class="{ expanded: authExpanded === 'custom' }">
-        <div class="provider-header" @click="authExpanded = authExpanded === 'custom' ? null : 'custom'">
-          <div class="provider-left">
-            <span class="provider-name">{{ t("onboarding.auth.customEndpoint") }}</span>
-            <span class="provider-desc-text">{{ t("onboarding.auth.customEndpointDesc") }}</span>
-          </div>
-          <span class="provider-badge" :class="{ configured: customEndpointConfigured }">
-            {{ customEndpointConfigured ? t("onboarding.auth.configured") : t("onboarding.auth.notConfigured") }}
-          </span>
-        </div>
-        <div v-if="authExpanded === 'custom'" class="provider-body custom-endpoint-body" @click.stop>
-          <div class="custom-endpoint-fields">
-            <label class="custom-endpoint-field">
-              <span class="custom-endpoint-label">{{ t("settings.custom.name") }}</span>
-              <input
-                v-model="customEndpointForm.name"
-                class="ob-input"
-                type="text"
-                :placeholder="t('settings.custom.namePlaceholder')"
-                @keydown="handleCustomEndpointKeydown"
-              />
-            </label>
-            <label class="custom-endpoint-field">
-              <span class="custom-endpoint-label">{{ t("settings.custom.apiModel") }}</span>
-              <input
-                v-model="customEndpointForm.apiModel"
-                class="ob-input"
-                type="text"
-                :placeholder="t('settings.custom.apiModelPlaceholder')"
-                @keydown="handleCustomEndpointKeydown"
-              />
-            </label>
-            <label class="custom-endpoint-field">
-              <span class="custom-endpoint-label">{{ t("settings.custom.endpoint") }}</span>
-              <input
-                v-model="customEndpointForm.endpoint"
-                class="ob-input"
-                type="text"
-                :placeholder="t('settings.custom.endpointPlaceholder')"
-                @keydown="handleCustomEndpointKeydown"
-              />
-            </label>
-            <label class="custom-endpoint-field">
-              <span class="custom-endpoint-label">{{ t("settings.custom.apiFormat") }}</span>
-              <select v-model="customEndpointForm.apiFormat" class="ob-input ob-select">
-                <option
-                  v-for="option in customApiFormatOptions"
-                  :key="option.value"
-                  :value="option.value"
-                >
-                  {{ option.label }}
-                </option>
-              </select>
-            </label>
-            <label class="custom-endpoint-field">
-              <span class="custom-endpoint-label">
-                {{ t("settings.custom.apiKey") }}
-                <span class="custom-endpoint-hint">{{ t("settings.custom.apiKeyOptional") }}</span>
-              </span>
-              <input
-                v-model="customEndpointForm.apiKey"
-                class="ob-input"
-                type="password"
-                :placeholder="t('settings.custom.apiKeyPlaceholder')"
-                @keydown="handleCustomEndpointKeydown"
-              />
-            </label>
-          </div>
-          <div class="input-row custom-endpoint-actions">
-            <button
-              class="ob-btn primary"
-              :disabled="customEndpointSaving || !customEndpointReady"
-              @click="saveCustomEndpoint"
+            <div
+              v-if="settingsCustomEndpoints.length > 0 && !settingsEditingEndpoint"
+              class="custom-endpoints-inline-list"
             >
-              {{ customEndpointSaving ? "..." : t("settings.custom.save") }}
-            </button>
-          </div>
-        </div>
-      </div>
+              <div
+                v-for="ep in settingsCustomEndpoints"
+                :key="ep.id"
+                class="custom-endpoint-summary"
+              >
+                <div class="custom-endpoint-summary-main">
+                  <span class="custom-endpoint-summary-name">{{ ep.name }}</span>
+                  <span class="custom-endpoint-summary-meta">{{ ep.apiModel }}</span>
+                </div>
+                <div class="custom-endpoint-summary-actions">
+                  <button class="ob-btn secondary small" type="button" @click="settingsStartEditEndpoint(ep)">
+                    {{ t("settings.custom.edit") }}
+                  </button>
+                  <button class="ob-btn secondary small" type="button" @click="settingsDeleteEndpoint(ep.id)">
+                    {{ t("settings.custom.delete") }}
+                  </button>
+                </div>
+              </div>
+              <button class="ob-btn secondary" type="button" @click="settingsStartAddEndpoint">
+                {{ t("settings.custom.add") }}
+              </button>
+            </div>
 
-      <!-- OpenAI Codex -->
-      <div class="provider-card" :class="{ expanded: authExpanded === 'codex' }">
-        <div class="provider-header" @click="authExpanded = authExpanded === 'codex' ? null : 'codex'">
-          <div class="provider-left">
-            <span class="provider-name">{{ t("onboarding.auth.codex") }}</span>
-            <span class="provider-desc-text">{{ t("onboarding.auth.codexDesc") }}</span>
-          </div>
-          <span class="provider-badge" :class="{ configured: codexAuthenticated || codexStep === 'success' }">
-            {{ codexAuthenticated || codexStep === 'success' ? t("onboarding.auth.configured") : t("onboarding.auth.notConfigured") }}
-          </span>
-        </div>
-        <div v-if="authExpanded === 'codex'" class="provider-body" @click.stop>
-          <template v-if="codexAuthenticated && codexStep === 'idle'">
-            <div class="status-row ok">{{ t("settings.codex.loggedIn") }}</div>
-          </template>
-          <template v-else-if="codexStep === 'idle'">
-            <button class="ob-btn primary" @click="startCodexLogin">{{ t("settings.codex.loginBtn") }}</button>
-            <span class="hint-text">{{ t("settings.codex.hint") }}</span>
-          </template>
-          <template v-else-if="codexStep === 'opening'">
-            <button class="ob-btn primary" type="button" disabled>{{ t("settings.codex.opening") }}</button>
-            <span class="hint-text">{{ t("settings.codex.hint") }}</span>
-          </template>
-          <template v-else-if="codexStep === 'waiting'">
-            <p class="instruction-text">{{ t("settings.codex.instruction") }}</p>
-            <button
-              class="codex-code-row"
-              :class="{ copied: codexCodeCopied }"
-              type="button"
-              :title="codexCodeCopied ? t('common.copied') : t('common.clickToCopy')"
-              @click="copyCodexCode"
+            <div v-if="settingsEditingEndpoint" class="custom-endpoint-fields">
+              <label class="custom-endpoint-field">
+                <span class="custom-endpoint-label">{{ t("settings.custom.name") }}</span>
+                <input
+                  v-model="settingsEditingEndpoint.name"
+                  class="ob-input"
+                  type="text"
+                  :placeholder="t('settings.custom.namePlaceholder')"
+                  @keydown="handleInlineEndpointKeydown"
+                />
+              </label>
+              <label class="custom-endpoint-field">
+                <span class="custom-endpoint-label">{{ t("settings.custom.apiModel") }}</span>
+                <input
+                  v-model="settingsEditingEndpoint.apiModel"
+                  class="ob-input"
+                  type="text"
+                  :placeholder="t('settings.custom.apiModelPlaceholder')"
+                  @keydown="handleInlineEndpointKeydown"
+                />
+              </label>
+              <label class="custom-endpoint-field">
+                <span class="custom-endpoint-label">{{ t("settings.custom.endpoint") }}</span>
+                <input
+                  v-model="settingsEditingEndpoint.endpoint"
+                  class="ob-input"
+                  type="text"
+                  :placeholder="t('settings.custom.endpointPlaceholder')"
+                  @keydown="handleInlineEndpointKeydown"
+                />
+              </label>
+              <label class="custom-endpoint-field">
+                <span class="custom-endpoint-label">{{ t("settings.custom.apiFormat") }}</span>
+                <BaseDropdown
+                  class="custom-endpoint-format-dropdown"
+                  :model-value="settingsEditingEndpoint.apiFormat"
+                  :options="customApiFormatOptions"
+                  :aria-label="t('settings.custom.apiFormat')"
+                  menu-align="start"
+                  size="md"
+                  @update:model-value="updateInlineEndpointApiFormat"
+                />
+              </label>
+              <label class="custom-endpoint-field">
+                <span class="custom-endpoint-label custom-endpoint-label-with-hint">
+                  <span>{{ t("settings.custom.apiKey") }}</span>
+                  <span class="custom-endpoint-hint">{{ t("settings.custom.apiKeyOptional") }}</span>
+                </span>
+                <input
+                  v-model="settingsEditingEndpoint.apiKey"
+                  class="ob-input"
+                  type="password"
+                  :placeholder="t('settings.custom.apiKeyPlaceholder')"
+                  @keydown="handleInlineEndpointKeydown"
+                />
+              </label>
+            </div>
+
+            <div
+              v-if="settingsEndpointTestStatus !== 'idle'"
+              class="custom-endpoint-test-result"
+              :class="settingsEndpointTestStatus"
             >
-              <code class="codex-code">{{ codexUserCode }}</code>
-              <span class="codex-copy-indicator">
-                {{ codexCodeCopied ? t("common.copied") : t("common.clickToCopy") }}
+              <span v-if="settingsEndpointTestStatus === 'testing'" class="custom-endpoint-spinner"></span>
+              <span v-if="settingsEndpointTestStatus === 'testing'">{{ t("settings.custom.testing") }}</span>
+              <span v-else-if="settingsEndpointTestStatus === 'success'" class="custom-endpoint-test-heading">
+                {{ t("settings.custom.testOk") }}
               </span>
-            </button>
-            <div class="status-row loading">{{ t("settings.codex.waiting") }}</div>
-            <button class="ob-btn secondary" @click="cancelCodexLogin">{{ t("settings.codex.cancel") }}</button>
-          </template>
-          <template v-else-if="codexStep === 'success'">
-            <div class="status-row ok">{{ t("settings.codex.loginSuccess") }}</div>
-          </template>
+              <span v-else-if="settingsEndpointTestStatus === 'error'" class="custom-endpoint-test-heading">
+                {{ t("settings.custom.testFail") }}
+              </span>
+              <span v-if="customEndpointTestDetail" class="custom-endpoint-test-detail">
+                {{ customEndpointTestDetail }}
+              </span>
+              <button
+                v-if="customEndpointTestHtmlPath"
+                class="custom-endpoint-test-link"
+                type="button"
+                @click="openCustomEndpointTestHtml"
+              >
+                {{ t("settings.custom.openInBrowser") }}
+              </button>
+            </div>
+
+            <div v-if="settingsEditingEndpoint" class="custom-endpoint-actions">
+              <button
+                class="ob-btn secondary"
+                type="button"
+                :disabled="settingsEndpointTestStatus === 'testing' || !customEndpointTestReady"
+                @click="settingsTestEndpoint"
+              >
+                {{ settingsEndpointTestStatus === "testing" ? "..." : t("settings.custom.test") }}
+              </button>
+              <button
+                v-if="customEndpointConfigured"
+                class="ob-btn secondary"
+                type="button"
+                @click="settingsCancelEditEndpoint"
+              >
+                {{ t("settings.custom.cancel") }}
+              </button>
+              <button
+                class="ob-btn primary"
+                type="button"
+                :disabled="!customEndpointReady"
+                @click="settingsSaveEndpoint"
+              >
+                {{ t("settings.custom.save") }}
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div class="provider-card" :class="{ expanded: authExpanded === 'codex' }">
+          <div class="provider-header" @click="toggleAuthProvider('codex')">
+            <div class="provider-left">
+              <span class="provider-name">{{ t("onboarding.auth.codex") }}</span>
+              <span class="provider-desc-text">{{ t("onboarding.auth.codexDesc") }}</span>
+            </div>
+            <span class="provider-badge" :class="{ configured: codexConfigured }">
+              {{ codexConfigured ? t("onboarding.auth.configured") : t("onboarding.auth.notConfigured") }}
+            </span>
+          </div>
+          <div v-if="authExpanded === 'codex'" class="provider-body" @click.stop>
+            <template v-if="settingsCodexStatus.authenticated && settingsCodexStep === 'idle'">
+              <div class="status-row ok">{{ t("settings.codex.loggedIn") }}</div>
+              <button class="ob-btn secondary" type="button" @click="settingsCodexLogout">
+                {{ t("settings.codex.logout") }}
+              </button>
+            </template>
+            <template v-else-if="settingsCodexStep === 'idle'">
+              <button class="ob-btn primary" type="button" @click="settingsRequestCodexLogin">
+                {{ t("settings.codex.loginBtn") }}
+              </button>
+              <span class="hint-text">{{ t("settings.codex.hint") }}</span>
+            </template>
+            <template v-else-if="settingsCodexStep === 'opening'">
+              <button class="ob-btn primary" type="button" disabled>{{ t("settings.codex.opening") }}</button>
+              <span class="hint-text">{{ t("settings.codex.hint") }}</span>
+            </template>
+            <template v-else-if="settingsCodexStep === 'waiting'">
+              <p class="instruction-text">{{ t("settings.codex.instruction") }}</p>
+              <a v-if="settingsCodexUrl" :href="settingsCodexUrl" target="_blank" class="codex-url">
+                {{ settingsCodexUrl }}
+              </a>
+              <button
+                class="codex-code-row"
+                :class="{ copied: settingsCodexCodeCopied }"
+                type="button"
+                :title="settingsCodexCodeCopied ? t('common.copied') : t('common.clickToCopy')"
+                @click="settingsCopyCode"
+              >
+                <code class="codex-code">{{ settingsCodexUserCode }}</code>
+                <span class="codex-copy-indicator">
+                  {{ settingsCodexCodeCopied ? t("common.copied") : t("common.clickToCopy") }}
+                </span>
+              </button>
+              <div class="status-row loading">{{ t("settings.codex.waiting") }}</div>
+              <button class="ob-btn secondary" type="button" @click="settingsCancelCodexLogin">
+                {{ t("settings.codex.cancel") }}
+              </button>
+            </template>
+            <template v-else-if="settingsCodexStep === 'success'">
+              <div class="status-row ok">{{ t("settings.codex.loginSuccess") }}</div>
+            </template>
+          </div>
         </div>
       </div>
 
@@ -773,14 +790,25 @@ onUnmounted(() => {
       <p class="step-desc">{{ t("onboarding.project.desc") }}</p>
 
       <div class="project-area">
-        <button class="browse-btn" @click="browseProject">
-          <svg viewBox="0 0 16 16" fill="currentColor" width="20" height="20">
+        <button
+          class="browse-btn"
+          :disabled="projectOpening"
+          :aria-busy="projectOpening"
+          @click="browseProject"
+        >
+          <span v-if="projectOpening" class="project-opening-spinner" aria-hidden="true"></span>
+          <svg v-else viewBox="0 0 16 16" fill="currentColor" width="20" height="20">
             <path d="M1 3.5A1.5 1.5 0 0 1 2.5 2h3.879a1.5 1.5 0 0 1 1.06.44l1.122 1.12A1.5 1.5 0 0 0 9.62 4H13.5A1.5 1.5 0 0 1 15 5.5v7a1.5 1.5 0 0 1-1.5 1.5h-11A1.5 1.5 0 0 1 1 12.5v-9z"/>
           </svg>
-          {{ t("onboarding.project.browse") }}
+          {{ projectOpening ? t("onboarding.project.opening") : t("onboarding.project.browse") }}
         </button>
-        <div v-if="projectPath" class="project-selected" :class="{ valid: projectValid, invalid: !projectValid }">
-          <svg v-if="projectValid" class="status-icon ok" viewBox="0 0 16 16" fill="currentColor" width="16" height="16">
+        <div
+          v-if="projectPath"
+          class="project-selected"
+          :class="{ valid: projectValid && !projectOpening, invalid: !projectValid && !projectOpening, loading: projectOpening }"
+        >
+          <span v-if="projectOpening" class="project-opening-spinner" aria-hidden="true"></span>
+          <svg v-else-if="projectValid" class="status-icon ok" viewBox="0 0 16 16" fill="currentColor" width="16" height="16">
             <path d="M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L2.22 9.28a.75.75 0 0 1 1.06-1.06L6 10.94l6.72-6.72a.75.75 0 0 1 1.06 0z"/>
           </svg>
           <span class="project-path">{{ projectPath }}</span>
@@ -791,8 +819,8 @@ onUnmounted(() => {
       <p class="skip-hint">{{ t("onboarding.project.skipHint") }}</p>
 
       <div class="step-actions">
-        <button class="ob-btn secondary" @click="goBack">{{ t("onboarding.back") }}</button>
-        <button class="ob-btn primary" @click="goNext">{{ t("onboarding.next") }}</button>
+        <button class="ob-btn secondary" :disabled="projectOpening" @click="goBack">{{ t("onboarding.back") }}</button>
+        <button class="ob-btn primary" :disabled="projectOpening" @click="goNext">{{ t("onboarding.next") }}</button>
       </div>
     </div>
 
@@ -967,6 +995,7 @@ onUnmounted(() => {
       </div>
     </div>
     </div>
+
   </div>
 
 </template>
@@ -1133,7 +1162,7 @@ onUnmounted(() => {
 
 .step-card {
   width: 100%;
-  max-width: 520px;
+  max-width: 600px;
   background: var(--sidebar-bg);
   border: 1px solid var(--border-color);
   border-radius: 16px;
@@ -1235,6 +1264,14 @@ onUnmounted(() => {
   overflow: hidden;
   transition: border-color 0.15s;
 }
+.provider-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.provider-list .provider-card {
+  margin-bottom: 0;
+}
 .provider-card.expanded {
   border-color: var(--accent-color);
 }
@@ -1243,8 +1280,9 @@ onUnmounted(() => {
   align-items: center;
   justify-content: space-between;
   padding: 12px 16px;
-  cursor: pointer;
   transition: background 0.15s;
+  gap: 14px;
+  cursor: pointer;
 }
 .provider-header:hover {
   background: var(--hover-bg);
@@ -1253,6 +1291,7 @@ onUnmounted(() => {
   display: flex;
   flex-direction: column;
   gap: 2px;
+  min-width: 0;
 }
 .provider-name {
   font-size: 14px;
@@ -1266,35 +1305,90 @@ onUnmounted(() => {
 .provider-badge {
   font-size: 11px;
   padding: 2px 8px;
-  border-radius: 10px;
+  border-radius: 4px;
   background: var(--hover-bg);
   color: var(--text-secondary);
+  border: 1px solid transparent;
   white-space: nowrap;
 }
 .provider-badge.configured {
-  background: color-mix(in srgb, #22c55e 15%, transparent);
-  color: #22c55e;
+  background: var(--status-good-bg);
+  color: var(--status-good-fg);
+  border-color: var(--status-good-border);
 }
+
 .provider-body {
   padding: 0 16px 14px;
   display: flex;
   flex-direction: column;
   gap: 10px;
 }
+
+.custom-endpoints-inline-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.custom-endpoint-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 9px 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: var(--input-bg);
+}
+
+.custom-endpoint-summary-main {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.custom-endpoint-summary-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-color);
+}
+
+.custom-endpoint-summary-meta {
+  font-size: 12px;
+  color: var(--text-secondary);
+  font-family: var(--font-mono-identifier);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.custom-endpoint-summary-actions {
+  display: flex;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
 .custom-endpoint-fields {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   gap: 10px;
+  align-items: start;
 }
+
 .custom-endpoint-field {
   display: flex;
   flex-direction: column;
   gap: 4px;
+  min-height: 0;
   min-width: 0;
 }
-.custom-endpoint-field:nth-child(3) {
+
+.custom-endpoint-field:nth-child(3),
+.custom-endpoint-field:nth-child(5) {
   grid-column: 1 / -1;
 }
+
 .custom-endpoint-label {
   display: flex;
   align-items: center;
@@ -1304,36 +1398,118 @@ onUnmounted(() => {
   font-weight: 600;
   color: var(--text-secondary);
 }
+
+.custom-endpoint-label-with-hint {
+  align-items: flex-start;
+  justify-content: space-between;
+}
+
+.custom-endpoint-label-with-hint > span:first-child {
+  flex-shrink: 0;
+}
+
 .custom-endpoint-hint {
+  flex-shrink: 0;
   font-weight: 400;
   color: var(--text-secondary);
   opacity: 0.8;
-}
-.custom-endpoint-actions {
-  justify-content: flex-end;
+  line-height: 1.35;
+  text-align: right;
+  white-space: nowrap;
 }
 
-.input-row {
+.custom-endpoint-actions {
   display: flex;
-  gap: 8px;
   align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
 }
+
+.custom-endpoint-test-result {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  font-size: 12px;
+  line-height: 1.5;
+  flex-wrap: wrap;
+}
+
+.custom-endpoint-test-result.testing {
+  background: var(--hover-bg);
+  color: var(--text-secondary);
+}
+
+.custom-endpoint-test-result.success {
+  background: var(--status-good-bg);
+  color: var(--status-good-fg);
+}
+
+.custom-endpoint-test-result.error {
+  background: var(--status-danger-bg);
+  color: var(--status-danger-fg);
+}
+
+.custom-endpoint-test-heading {
+  font-weight: 600;
+}
+
+.custom-endpoint-test-detail {
+  min-width: 0;
+  word-break: break-word;
+}
+
+.custom-endpoint-test-link {
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--accent-color);
+  font: inherit;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.custom-endpoint-spinner {
+  width: 10px;
+  height: 10px;
+  margin-top: 3px;
+  border: 2px solid var(--border-color);
+  border-top-color: var(--accent-color);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+  flex-shrink: 0;
+}
+
 .ob-input {
   flex: 1;
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
   padding: 8px 12px;
   border: 1px solid var(--border-color);
   border-radius: 8px;
   background: var(--input-bg);
   color: var(--text-color);
   font-size: 13px;
+  font-family: inherit;
   outline: none;
   transition: border-color 0.15s;
 }
+
 .ob-input:focus {
   border-color: var(--accent-color);
 }
-.ob-select {
-  min-height: 35px;
+
+.custom-endpoint-format-dropdown {
+  width: 100%;
+}
+
+.custom-endpoint-format-dropdown :deep(.base-dropdown-menu) {
+  width: 100%;
+  min-width: 100%;
+  max-width: 100%;
 }
 
 .ob-btn {
@@ -1401,11 +1577,16 @@ onUnmounted(() => {
     width: 100%;
   }
 
+  .provider-header {
+    align-items: flex-start;
+  }
+
   .custom-endpoint-fields {
     grid-template-columns: 1fr;
   }
 
-  .custom-endpoint-field:nth-child(3) {
+  .custom-endpoint-field:nth-child(3),
+  .custom-endpoint-field:nth-child(5) {
     grid-column: auto;
   }
 
@@ -1414,7 +1595,7 @@ onUnmounted(() => {
   }
 
   .custom-endpoint-actions .ob-btn {
-    width: 100%;
+    flex: 1;
   }
 }
 
@@ -1507,6 +1688,13 @@ onUnmounted(() => {
   color: var(--accent-color);
   background: color-mix(in srgb, var(--accent-color) 5%, transparent);
 }
+.browse-btn:disabled,
+.browse-btn:disabled:hover {
+  border-color: var(--border-color);
+  color: var(--text-secondary);
+  background: var(--hover-bg);
+  cursor: wait;
+}
 .project-selected {
   display: flex;
   align-items: center;
@@ -1524,9 +1712,29 @@ onUnmounted(() => {
   background: color-mix(in srgb, #ef4444 10%, transparent);
   color: #ef4444;
 }
+.project-selected.loading {
+  background: var(--hover-bg);
+  color: var(--text-secondary);
+}
 .project-path {
   font-family: var(--font-mono-identifier);
   font-size: 12px;
+}
+.project-opening-spinner {
+  width: 12px;
+  height: 12px;
+  border: 2px solid var(--border-color);
+  border-top-color: var(--accent-color);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+  flex-shrink: 0;
+}
+
+.codex-url {
+  font-size: 11px;
+  color: var(--accent-color);
+  text-decoration: underline;
+  word-break: break-all;
 }
 
 .codex-code-row {
@@ -1545,18 +1753,22 @@ onUnmounted(() => {
   box-shadow: none;
   transition: border-color 0.15s, background 0.15s;
 }
+
 .codex-code-row:hover {
   background: var(--hover-bg);
   border-color: var(--accent-color);
 }
+
 .codex-code-row:focus-visible {
   outline: none;
   border-color: var(--accent-color);
 }
+
 .codex-code-row.copied {
-  border-color: var(--status-good-border, #22c55e);
-  background: var(--status-good-bg, color-mix(in srgb, #22c55e 10%, transparent));
+  border-color: var(--status-good-border);
+  background: var(--status-good-bg);
 }
+
 .codex-code {
   font-family: var(--font-mono-display);
   font-size: 20px;
@@ -1564,13 +1776,15 @@ onUnmounted(() => {
   color: var(--accent-color);
   letter-spacing: 2px;
 }
+
 .codex-copy-indicator {
   flex-shrink: 0;
   font-size: 12px;
   color: var(--text-secondary);
 }
+
 .codex-code-row.copied .codex-copy-indicator {
-  color: var(--status-good-fg, #22c55e);
+  color: var(--status-good-fg);
 }
 
 .scan-progress {
@@ -1598,6 +1812,9 @@ onUnmounted(() => {
 @keyframes scanSlide {
   0% { transform: translateX(-100%); }
   100% { transform: translateX(350%); }
+}
+@keyframes spin {
+  to { transform: rotate(360deg); }
 }
 
 /* ── Git Config Panel ── */
