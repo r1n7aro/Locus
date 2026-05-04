@@ -1,8 +1,8 @@
 ---
 title: "当前版本"
-description: "Locus v0.2.5 (2026-05-04)"
+description: "Locus v0.2.6 (2026-05-04)"
 sidebarTitle: "当前版本"
-version: "0.2.5"
+version: "0.2.6"
 releasedAt: "2026-05-04"
 channel: "stable"
 updateTitle: "发现新版本"
@@ -17,17 +17,19 @@ changelogUrl: "/overview/latest-version"
 
 ### 新增
 
-- 新增 Windows 托管 Python 与 Git 运行时，并在设置中提供运行时选择。
-- 新增带内置 Python/Git 与不带内置 Python/Git 的安装包构建变体。
-- Collab staged/unstaged 树视图支持选择文件夹，用于批量 stage 和 unstage。
+- 新增 Rust 后端与 Vue 前端启动阶段追踪，主窗口会在首帧挂载后显示。
+- 新增延后启动任务，用于标签预加载、最近工作区加载、Unity 监听、资产索引校准与知识索引。
+- Onboarding 支持内联配置自定义模型端点与 OpenAI Codex 设备授权。
+- Onboarding 支持测试自定义端点连接。
+- Knowledge 显示向量运行时启动状态，本地 embedding 启动时会展示轻量加载提示。
 
 ### 修复
 
-- 改进 Unity 资产预览：文本预览支持语法高亮，Prefab 默认选中根对象。
-- 修复应用启动与会话恢复路径中推理强度默认值被覆盖的问题。
-- Claude hook 日志会脱敏敏感请求头。
-- 对齐 Collab 焦点样式。
+- Git 与 Python 运行时发现结果会缓存，Settings 可复用发现结果，减少重复阻塞扫描。
+- Git 运行时发现移到后台阻塞任务中执行。
+- Onboarding 打开项目时会显示处理中状态，并在切换完成前禁用导航。
+- Knowledge 列表与概览读取在 embedding manager 繁忙时保持响应。
 
 ### 移除
 
-- 移除认证调试日志。
+- 暂无条目。

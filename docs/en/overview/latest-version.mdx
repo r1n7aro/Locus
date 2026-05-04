@@ -1,8 +1,8 @@
 ---
 title: "Latest Version"
-description: "Locus v0.2.5 (2026-05-04)"
+description: "Locus v0.2.6 (2026-05-04)"
 sidebarTitle: "Latest Version"
-version: "0.2.5"
+version: "0.2.6"
 releasedAt: "2026-05-04"
 channel: "stable"
 updateTitle: "Update available"
@@ -17,17 +17,19 @@ changelogUrl: "/en/overview/latest-version"
 
 ### Added
 
-- Added managed Windows Python and Git runtimes, with runtime selection controls in Settings.
-- Added release installer variants for builds with bundled Python/Git and builds without bundled Python/Git.
-- Added folder selection in Collab staged/unstaged tree views for batch stage and unstage workflows.
+- Added startup tracing across the Rust backend and Vue frontend, with the main window shown after the first mounted frame.
+- Added deferred startup work for tab preloading, recent workspace loading, Unity monitoring, asset reconciliation, and knowledge indexing.
+- Added inline model setup in onboarding for custom endpoints and OpenAI Codex device auth.
+- Added connection testing for custom endpoints during onboarding.
+- Added visible vector runtime startup state in Knowledge, including a compact loading indicator while local embeddings start.
 
 ### Fixed
 
-- Improved Unity asset previews with syntax highlighting for text previews and default root target selection for prefabs.
-- Fixed app bootstrap and session restore paths so they keep the user's saved reasoning effort defaults.
-- Redacted sensitive Claude hook headers from logs.
-- Aligned Collab focus ring styling.
+- Cached Git and Python runtime discovery so Settings can reuse discovered runtimes without repeating blocking scans.
+- Moved Git runtime discovery off the blocking command path.
+- Added onboarding project-opening feedback and disabled navigation while the selected project is being opened.
+- Kept Knowledge list and overview reads responsive while the embedding manager is busy.
 
 ### Removed
 
-- Removed auth debug logging.
+- No changes.
