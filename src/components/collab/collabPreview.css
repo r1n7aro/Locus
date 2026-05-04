@@ -572,8 +572,8 @@
 }
 
 .staging-tree-folder-btn:focus-visible {
-  outline: 2px solid var(--accent-color);
-  outline-offset: -2px;
+  outline: none;
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--git-focus) 38%, var(--border-strong));
 }
 
 .staging-tree-branch,
@@ -737,8 +737,8 @@
 }
 
 .file-item:focus-visible {
-  outline: 2px solid var(--accent-color);
-  outline-offset: -2px;
+  outline: none;
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--git-focus) 38%, var(--border-strong));
 }
 
 .staging-file-row {
