@@ -79,11 +79,15 @@ export function useAppBootstrap() {
       modelStore.restoreDefaultEffort();
       return;
     }
+    if (modelStore.hasUserDefaultEffort) {
+      modelStore.restoreDefaultEffort();
+      return;
+    }
     const agent = agentStore.agents.find((a) => a.id === agentId);
     modelStore.applyContextEffort(agent?.defaultEffort ?? "none");
   }
 
-  // active session/agent selection -> current effort
+  // active session/agent selection -> current effort, preserving the user's saved default.
   watch(
     () => [agentStore.selectedAgentId, chatStore.activeSessionId, agentStore.agents.length] as const,
     syncEffortForChatContext,

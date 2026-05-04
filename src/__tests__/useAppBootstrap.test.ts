@@ -176,6 +176,7 @@ describe("useAppBootstrap onboarding completion", () => {
     modelStoreMock = reactive({
       effort: "none",
       defaultEffort: "none",
+      hasUserDefaultEffort: false,
       loadModelDefaults: vi.fn().mockResolvedValue(undefined),
       loadLastModel: vi.fn().mockResolvedValue(undefined),
       loadLastEffort: vi.fn().mockResolvedValue(undefined),
@@ -215,8 +216,7 @@ describe("useAppBootstrap onboarding completion", () => {
     };
   });
 
-  it("restores the saved default effort when returning to a new chat", async () => {
-    modelStoreMock.defaultEffort = "high";
+  it("uses the agent default effort when no user default exists", async () => {
     chatStoreMock.activeSessionId = "session-1";
     agentStoreMock.selectedAgentId = "git";
     agentStoreMock.agents = [
@@ -235,6 +235,24 @@ describe("useAppBootstrap onboarding completion", () => {
 
     chatStoreMock.activeSessionId = null;
     agentStoreMock.selectedAgentId = "dev";
+    await nextTick();
+
+    expect(modelStoreMock.restoreDefaultEffort).toHaveBeenCalledTimes(1);
+    expect(modelStoreMock.applyContextEffort).not.toHaveBeenCalled();
+    expect(modelStoreMock.effort).toBe("none");
+  });
+
+  it("keeps the saved user default effort while a session is active", async () => {
+    modelStoreMock.defaultEffort = "high";
+    modelStoreMock.hasUserDefaultEffort = true;
+    chatStoreMock.activeSessionId = "session-1";
+    agentStoreMock.selectedAgentId = "dev";
+    agentStoreMock.agents = [
+      { id: "dev", defaultEffort: "medium" },
+    ];
+
+    const useAppBootstrap = await loadUseAppBootstrap();
+    useAppBootstrap();
     await nextTick();
 
     expect(modelStoreMock.restoreDefaultEffort).toHaveBeenCalledTimes(1);

@@ -144,6 +144,8 @@ describe("useModelStore OpenAI effort mapping", () => {
     await modelStore.loadLastEffort();
 
     expect(modelStore.effort).toBe("high");
+    expect(modelStore.defaultEffort).toBe("high");
+    expect(modelStore.hasUserDefaultEffort).toBe(true);
   });
 
   it("persists effort changes after hydration", async () => {
@@ -153,6 +155,8 @@ describe("useModelStore OpenAI effort mapping", () => {
     modelStore.selectEffort("high");
     await nextTick();
 
+    expect(modelStore.defaultEffort).toBe("high");
+    expect(modelStore.hasUserDefaultEffort).toBe(true);
     expect(modelServiceMocks.saveLastEffort).toHaveBeenCalledWith("high");
   });
 

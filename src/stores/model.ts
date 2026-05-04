@@ -136,6 +136,7 @@ export const useModelStore = defineStore("model", () => {
   const lastModelId = ref("");
   const effort = ref<EffortLevel>("medium");
   const defaultEffort = ref<EffortLevel>("medium");
+  const hasUserDefaultEffort = ref(false);
   const modelDefaults = ref<ModelDefaults>({ mainModel: "", planModel: "", subagentModels: {} });
   let effortPersistenceReady = false;
 
@@ -264,6 +265,7 @@ export const useModelStore = defineStore("model", () => {
     try {
       const saved = await modelService.getLastEffort();
       if (isEffortLevel(saved)) {
+        hasUserDefaultEffort.value = true;
         defaultEffort.value = saved;
         effort.value = clampEffortForSelectedModel(saved);
       }
@@ -325,6 +327,7 @@ export const useModelStore = defineStore("model", () => {
 
   function selectEffort(level: EffortLevel) {
     if (!isEffortLevel(level)) return;
+    hasUserDefaultEffort.value = true;
     defaultEffort.value = level;
     effort.value = clampEffortForSelectedModel(level);
   }
@@ -358,6 +361,7 @@ export const useModelStore = defineStore("model", () => {
     lastModelId,
     effort,
     defaultEffort,
+    hasUserDefaultEffort,
     modelDefaults,
     allModels,
     availableModels,
