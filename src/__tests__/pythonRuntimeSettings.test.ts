@@ -19,19 +19,27 @@ describe("Python runtime settings", () => {
     expect(source).toContain('t("settings.general.pythonRuntime")');
     expect(source).toContain("<BaseDropdown");
     expect(source).toContain('menu-align="start"');
-    expect(source).toContain("void refreshPythonRuntimeState()");
+    expect(source).toContain("void refreshPythonRuntimeState(false)");
+    expect(source).toContain('@click="refreshPythonRuntimeState(true)"');
     expect(source).toContain("@update:model-value=\"selectPythonRuntime\"");
-    expect(service).toContain('ipcInvoke<PythonRuntimeState>("get_python_runtime_state")');
+    expect(service).toContain("let pythonRuntimeStateCache");
+    expect(service).toContain('ipcInvoke<PythonRuntimeState>("get_python_runtime_state", { refresh })');
     expect(service).toContain('ipcInvoke<PythonRuntimeState>("save_python_runtime_selection"');
   });
 
-  it("loads Python runtime discovery off the blocking command path", () => {
+  it("loads Python runtime discovery off the blocking command path without repeating cached scans", () => {
     const command = read("src-tauri/src/commands/system.rs");
     const runtime = read("src-tauri/src/python_runtime.rs");
+    const processUtil = read("src-tauri/src/process_util.rs");
 
     expect(command).toContain("spawn_blocking");
+    expect(command).toContain("refresh.unwrap_or(false)");
     expect(runtime).toContain("command_output_with_timeout");
     expect(runtime).toContain("PY_RUNTIME_PROBE_TIMEOUT");
+    expect(runtime).toContain("discover_python_runtimes_cached");
+    expect(runtime).toContain("suppress_command_window(&mut command)");
+    expect(processUtil).toContain("pub fn suppress_command_window");
+    expect(processUtil).toContain("cmd.creation_flags(CREATE_NO_WINDOW)");
   });
 
   it("defines localized Python runtime labels", () => {
@@ -56,14 +64,19 @@ describe("Python runtime settings", () => {
     expect(source).toContain("gitSaveRuntimeSelection");
     expect(source).toContain('t("settings.general.gitRuntime")');
     expect(source).toContain("<BaseDropdown");
-    expect(source).toContain("void refreshGitRuntimeState()");
+    expect(source).toContain("void refreshGitRuntimeState(false)");
+    expect(source).toContain('@click="refreshGitRuntimeState(true)"');
     expect(source).toContain("@update:model-value=\"selectGitRuntime\"");
     expect(source).toContain("gitRuntimePath");
-    expect(gitService).toContain('ipcInvoke<GitRuntimeState>("git_runtime_state")');
+    expect(gitService).toContain("let gitRuntimeStateCache");
+    expect(gitService).toContain('ipcInvoke<GitRuntimeState>("git_runtime_state", { refresh })');
     expect(gitService).toContain('ipcInvoke<GitRuntimeState>("git_save_runtime_selection"');
     expect(gitCommands).toContain("pub struct GitRuntimeState");
+    expect(gitCommands).toContain("discover_git_runtimes_cached");
     expect(gitCommands).toContain("discover_git_runtimes(false)");
     expect(gitCommands).toContain("git_runtime_state");
+    expect(gitCommands).toContain("spawn_blocking");
+    expect(gitCommands).toContain("refresh.unwrap_or(false)");
     expect(gitCommands).toContain("git_save_runtime_selection");
     expect(lib).toContain("commands::git_runtime_state");
   });

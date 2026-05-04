@@ -1,7 +1,7 @@
 use std::ffi::OsString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
@@ -1425,6 +1425,7 @@ pub struct GitRuntimeState {
 }
 
 const GIT_OVERRIDE_FILE: &str = "git_path_override.txt";
+type GitRuntimeDiscoveryCache = Option<Vec<GitRuntimeCandidate>>;
 
 fn git_override_path(app_handle: &AppHandle) -> Result<std::path::PathBuf, AppError> {
     let data_dir = crate::commands::resolve_runtime_storage_dir(app_handle)
@@ -1452,6 +1453,7 @@ pub fn restore_saved_git_override(app_handle: &AppHandle) {
 
     std::env::set_var("LOCUS_GIT_PATH", saved);
     let _ = refresh_git_resolution();
+    clear_git_runtime_discovery_cache();
 }
 
 fn git_runtime_id_for_path(path: &Path) -> String {
@@ -1500,9 +1502,12 @@ fn selected_git_path(app_handle: &AppHandle) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-fn git_runtime_state_sync(app_handle: &AppHandle) -> Result<GitRuntimeState, AppError> {
+fn git_runtime_state_sync(
+    app_handle: &AppHandle,
+    refresh: bool,
+) -> Result<GitRuntimeState, AppError> {
     let selected_path = selected_git_path(app_handle);
-    let mut candidates = discover_git_runtimes(false);
+    let mut candidates = discover_git_runtimes_cached(refresh);
 
     if let Some(path) = selected_path.as_ref() {
         let already_listed = candidates
@@ -1553,16 +1558,55 @@ fn git_runtime_state_sync(app_handle: &AppHandle) -> Result<GitRuntimeState, App
     })
 }
 
+fn discover_git_runtimes_cached(refresh: bool) -> Vec<GitRuntimeCandidate> {
+    let cache = git_runtime_discovery_cache();
+    if !refresh {
+        if let Some(cached) = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .cloned()
+        {
+            return cached;
+        }
+    }
+
+    let runtimes = discover_git_runtimes(false);
+    let mut cached = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *cached = Some(runtimes.clone());
+    runtimes
+}
+
+fn clear_git_runtime_discovery_cache() {
+    let cache = git_runtime_discovery_cache();
+    let mut cached = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *cached = None;
+}
+
+fn git_runtime_discovery_cache() -> &'static Mutex<GitRuntimeDiscoveryCache> {
+    static CACHE: OnceLock<Mutex<GitRuntimeDiscoveryCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
 #[tauri::command]
-pub async fn git_runtime_state(app_handle: AppHandle) -> Result<GitRuntimeState, AppError> {
-    tauri::async_runtime::spawn_blocking(move || git_runtime_state_sync(&app_handle))
-        .await
-        .map_err(|e| {
-            AppError::new(
-                "git_runtime.join_failed",
-                format!("Failed to load Git runtime state: {}", e),
-            )
-        })?
+pub async fn git_runtime_state(
+    app_handle: AppHandle,
+    refresh: Option<bool>,
+) -> Result<GitRuntimeState, AppError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        git_runtime_state_sync(&app_handle, refresh.unwrap_or(false))
+    })
+    .await
+    .map_err(|e| {
+        AppError::new(
+            "git_runtime.join_failed",
+            format!("Failed to load Git runtime state: {}", e),
+        )
+    })?
 }
 
 #[tauri::command]
@@ -1571,7 +1615,7 @@ pub async fn git_save_runtime_selection(
     app_handle: AppHandle,
 ) -> Result<GitRuntimeState, AppError> {
     tauri::async_runtime::spawn_blocking(move || {
-        let state = git_runtime_state_sync(&app_handle)?;
+        let state = git_runtime_state_sync(&app_handle, false)?;
         let Some(selected) = state
             .runtimes
             .iter()
@@ -1589,7 +1633,7 @@ pub async fn git_save_runtime_selection(
         std::env::set_var("LOCUS_GIT_PATH", &selected.path);
         let _ = refresh_git_resolution();
 
-        git_runtime_state_sync(&app_handle)
+        git_runtime_state_sync(&app_handle, false)
     })
     .await
     .map_err(|e| {
@@ -1777,6 +1821,7 @@ pub async fn git_install_via(manager: String) -> Result<RunCommandResult, AppErr
         .map_err(|e| format!("Failed to install Git with {}: {}", manager, e))?;
 
     let _ = refresh_git_resolution();
+    clear_git_runtime_discovery_cache();
 
     Ok(RunCommandResult {
         stdout: String::from_utf8_lossy(&output.stdout).to_string(),
@@ -1808,6 +1853,7 @@ pub async fn git_set_override(path: String, app_handle: AppHandle) -> Result<Str
         .map_err(|e| format!("Failed to save Git override: {}", e))?;
     std::env::set_var("LOCUS_GIT_PATH", &normalized);
     let _ = refresh_git_resolution();
+    clear_git_runtime_discovery_cache();
     Ok(normalized)
 }
 
@@ -1820,6 +1866,7 @@ pub async fn git_clear_override(app_handle: AppHandle) -> Result<(), AppError> {
     }
     std::env::remove_var("LOCUS_GIT_PATH");
     let _ = refresh_git_resolution();
+    clear_git_runtime_discovery_cache();
     Ok(())
 }
 

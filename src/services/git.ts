@@ -23,6 +23,9 @@ import type {
   MergeActionKind,
 } from "../types";
 
+let gitRuntimeStateCache: GitRuntimeState | null = null;
+let gitRuntimeStateRequest: Promise<GitRuntimeState> | null = null;
+
 export function gitLog(skip: number, limit: number): Promise<GitLogResult> {
   return ipcInvoke<GitLogResult>("git_log", { skip, limit });
 }
@@ -43,12 +46,35 @@ export function gitProbe(): Promise<GitProbeResult> {
   return ipcInvoke<GitProbeResult>("git_probe");
 }
 
-export function gitRuntimeState(): Promise<GitRuntimeState> {
-  return ipcInvoke<GitRuntimeState>("git_runtime_state");
+export function gitRuntimeState(refresh = false): Promise<GitRuntimeState> {
+  if (!refresh && gitRuntimeStateCache) {
+    return Promise.resolve(gitRuntimeStateCache);
+  }
+  if (!refresh && gitRuntimeStateRequest) {
+    return gitRuntimeStateRequest;
+  }
+
+  const request = ipcInvoke<GitRuntimeState>("git_runtime_state", { refresh })
+    .then((state) => {
+      gitRuntimeStateCache = state;
+      return state;
+    })
+    .finally(() => {
+      if (gitRuntimeStateRequest === request) {
+        gitRuntimeStateRequest = null;
+      }
+    });
+
+  gitRuntimeStateRequest = request;
+  return request;
 }
 
 export function gitSaveRuntimeSelection(selectedId: string): Promise<GitRuntimeState> {
-  return ipcInvoke<GitRuntimeState>("git_save_runtime_selection", { selectedId });
+  return ipcInvoke<GitRuntimeState>("git_save_runtime_selection", { selectedId })
+    .then((state) => {
+      gitRuntimeStateCache = state;
+      return state;
+    });
 }
 
 export function gitHeadHash(): Promise<string | null> {

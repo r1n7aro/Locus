@@ -44,23 +44,29 @@ type GitResolutionCache = Option<Option<ResolvedGit>>;
 
 pub fn command(program: &str) -> std::process::Command {
     let mut cmd = Command::new(resolve_program(program));
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
+    suppress_command_window(&mut cmd);
     cmd
 }
 
 pub fn async_command(program: &str) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new(resolve_program(program));
+    suppress_async_command_window(&mut cmd);
+    cmd
+}
+
+pub fn suppress_command_window(cmd: &mut Command) {
     #[cfg(target_os = "windows")]
     {
-        #[allow(unused_imports)]
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
-    cmd
+}
+
+pub fn suppress_async_command_window(cmd: &mut tokio::process::Command) {
+    #[cfg(target_os = "windows")]
+    {
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
 }
 
 pub fn resolve_git() -> Option<ResolvedGit> {
@@ -262,8 +268,7 @@ fn git_version_for(path: &Path) -> Option<String> {
         .stderr(Stdio::piped());
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(CREATE_NO_WINDOW);
+        suppress_command_window(&mut cmd);
     }
     let output = command_output_with_timeout(cmd, GIT_VERSION_TIMEOUT)
         .ok()

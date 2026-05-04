@@ -1,6 +1,9 @@
 import { ipcInvoke } from "./ipc";
 import type { PythonRuntimeState } from "../types";
 
+let pythonRuntimeStateCache: PythonRuntimeState | null = null;
+let pythonRuntimeStateRequest: Promise<PythonRuntimeState> | null = null;
+
 export function getSystemLocale(): Promise<string | null> {
   return ipcInvoke<string | null>("get_system_locale");
 }
@@ -16,10 +19,33 @@ export function sendSystemNotification(title: string, body?: string | null): Pro
   );
 }
 
-export function getPythonRuntimeState(): Promise<PythonRuntimeState> {
-  return ipcInvoke<PythonRuntimeState>("get_python_runtime_state");
+export function getPythonRuntimeState(refresh = false): Promise<PythonRuntimeState> {
+  if (!refresh && pythonRuntimeStateCache) {
+    return Promise.resolve(pythonRuntimeStateCache);
+  }
+  if (!refresh && pythonRuntimeStateRequest) {
+    return pythonRuntimeStateRequest;
+  }
+
+  const request = ipcInvoke<PythonRuntimeState>("get_python_runtime_state", { refresh })
+    .then((state) => {
+      pythonRuntimeStateCache = state;
+      return state;
+    })
+    .finally(() => {
+      if (pythonRuntimeStateRequest === request) {
+        pythonRuntimeStateRequest = null;
+      }
+    });
+
+  pythonRuntimeStateRequest = request;
+  return request;
 }
 
 export function savePythonRuntimeSelection(selectedId: string): Promise<PythonRuntimeState> {
-  return ipcInvoke<PythonRuntimeState>("save_python_runtime_selection", { selectedId });
+  return ipcInvoke<PythonRuntimeState>("save_python_runtime_selection", { selectedId })
+    .then((state) => {
+      pythonRuntimeStateCache = state;
+      return state;
+    });
 }

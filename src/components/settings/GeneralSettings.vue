@@ -107,8 +107,8 @@ const hasAvailableGitOption = computed(() => gitOptions.value.some((option) => !
 onMounted(() => {
   void refreshDebugMode();
   void refreshStorageInfo();
-  void refreshGitRuntimeState();
-  void refreshPythonRuntimeState();
+  void refreshGitRuntimeState(false);
+  void refreshPythonRuntimeState(false);
 });
 
 async function refreshDebugMode() {
@@ -290,11 +290,11 @@ function gitSourceLabel(source: GitRuntimeInfo["source"]): string {
   }
 }
 
-async function refreshGitRuntimeState() {
+async function refreshGitRuntimeState(refresh = false) {
   const token = ++gitLoadToken;
   gitBusy.value = true;
   try {
-    const nextState = await gitRuntimeState();
+    const nextState = await gitRuntimeState(refresh);
     if (token === gitLoadToken) {
       gitState.value = nextState;
     }
@@ -337,7 +337,7 @@ async function selectGitRuntime(selectedId: string) {
       code: err.code,
       operation: "saveGitRuntime",
     });
-    await refreshGitRuntimeState();
+    await refreshGitRuntimeState(true);
   } finally {
     if (token === gitLoadToken) {
       gitBusy.value = false;
@@ -356,11 +356,11 @@ function pythonRuntimeHint(runtime: PythonRuntimeInfo): string {
   return runtime.path;
 }
 
-async function refreshPythonRuntimeState() {
+async function refreshPythonRuntimeState(refresh = false) {
   const token = ++pythonLoadToken;
   pythonBusy.value = true;
   try {
-    const nextState = await getPythonRuntimeState();
+    const nextState = await getPythonRuntimeState(refresh);
     if (token === pythonLoadToken) {
       pythonState.value = nextState;
     }
@@ -394,7 +394,7 @@ async function selectPythonRuntime(selectedId: string) {
       code: err.code,
       operation: "savePythonRuntime",
     });
-    await refreshPythonRuntimeState();
+    await refreshPythonRuntimeState(true);
   } finally {
     if (token === pythonLoadToken) {
       pythonBusy.value = false;
@@ -508,7 +508,7 @@ async function selectPythonRuntime(selectedId: string) {
           :disabled="gitBusy || !hasAvailableGitOption"
           @update:model-value="selectGitRuntime"
         />
-        <button class="action-btn runtime-btn" :disabled="gitBusy" @click="refreshGitRuntimeState">
+        <button class="action-btn runtime-btn" :disabled="gitBusy" @click="refreshGitRuntimeState(true)">
           {{ t("common.refresh") }}
         </button>
       </div>
@@ -544,7 +544,7 @@ async function selectPythonRuntime(selectedId: string) {
           :disabled="pythonBusy || !hasAvailablePythonOption"
           @update:model-value="selectPythonRuntime"
         />
-        <button class="action-btn python-btn" :disabled="pythonBusy" @click="refreshPythonRuntimeState">
+        <button class="action-btn python-btn" :disabled="pythonBusy" @click="refreshPythonRuntimeState(true)">
           {{ t("common.refresh") }}
         </button>
       </div>

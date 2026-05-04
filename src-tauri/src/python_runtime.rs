@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -57,13 +58,22 @@ pub struct ResolvedPythonRuntime {
     pub source: PythonRuntimeSource,
 }
 
+type PythonRuntimeDiscoveryCache = Option<Vec<PythonRuntimeInfo>>;
+
 pub fn config_file_name() -> &'static str {
     CONFIG_FILE
 }
 
 pub fn python_runtime_state(app_handle: Option<&AppHandle>) -> Result<PythonRuntimeState, String> {
+    python_runtime_state_with_refresh(app_handle, false)
+}
+
+pub fn python_runtime_state_with_refresh(
+    app_handle: Option<&AppHandle>,
+    refresh: bool,
+) -> Result<PythonRuntimeState, String> {
     let config = load_config().unwrap_or_default();
-    let mut runtimes = discover_python_runtimes(app_handle);
+    let mut runtimes = discover_python_runtimes_cached(app_handle, refresh);
 
     if let Some(path) = config
         .selected_path
@@ -162,7 +172,7 @@ pub fn save_python_runtime_selection(
     };
     save_config(&config)?;
 
-    python_runtime_state(app_handle)
+    python_runtime_state_with_refresh(app_handle, false)
 }
 
 pub fn resolve_effective_python(app_handle: Option<&AppHandle>) -> Option<ResolvedPythonRuntime> {
@@ -298,6 +308,35 @@ fn discover_python_runtimes(app_handle: Option<&AppHandle>) -> Vec<PythonRuntime
     }
 
     runtimes
+}
+
+fn discover_python_runtimes_cached(
+    app_handle: Option<&AppHandle>,
+    refresh: bool,
+) -> Vec<PythonRuntimeInfo> {
+    let cache = python_runtime_discovery_cache();
+    if !refresh {
+        if let Some(cached) = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .cloned()
+        {
+            return cached;
+        }
+    }
+
+    let runtimes = discover_python_runtimes(app_handle);
+    let mut cached = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *cached = Some(runtimes.clone());
+    runtimes
+}
+
+fn python_runtime_discovery_cache() -> &'static Mutex<PythonRuntimeDiscoveryCache> {
+    static CACHE: OnceLock<Mutex<PythonRuntimeDiscoveryCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
 }
 
 fn managed_python_runtime(app_handle: Option<&AppHandle>) -> Option<PythonRuntimeInfo> {
@@ -498,6 +537,7 @@ fn command_output_with_timeout(
     mut command: Command,
     timeout: Duration,
 ) -> std::io::Result<Option<Output>> {
+    crate::process_util::suppress_command_window(&mut command);
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

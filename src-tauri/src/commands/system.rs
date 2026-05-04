@@ -14,9 +14,13 @@ pub fn get_system_locale() -> Option<String> {
 #[tauri::command]
 pub async fn get_python_runtime_state(
     app_handle: AppHandle,
+    refresh: Option<bool>,
 ) -> Result<crate::python_runtime::PythonRuntimeState, crate::error::AppError> {
     tauri::async_runtime::spawn_blocking(move || {
-        crate::python_runtime::python_runtime_state(Some(&app_handle))
+        crate::python_runtime::python_runtime_state_with_refresh(
+            Some(&app_handle),
+            refresh.unwrap_or(false),
+        )
     })
     .await
     .map_err(|e| {
