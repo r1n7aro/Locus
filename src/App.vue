@@ -1,6 +1,6 @@
 
 <script setup lang="ts">
-import { computed, defineAsyncComponent, ref, shallowRef, onMounted, onUnmounted, watch } from "vue";
+import { computed, defineAsyncComponent, nextTick, ref, shallowRef, onMounted, onUnmounted, watch } from "vue";
 import type { Component, ShallowRef } from "vue";
 import { open } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -15,6 +15,7 @@ import { useChatStore } from "./stores/chat";
 import { useNotificationStore } from "./stores/notification";
 import { useAppUpdateStore } from "./stores/appUpdate";
 import { useAppBootstrap } from "./composables/useAppBootstrap";
+import { knowledgeGetEmbeddingStatus } from "./services/knowledge";
 
 import TopBannerHost from "./components/TopBannerHost.vue";
 import BaseButton from "./components/ui/BaseButton.vue";
@@ -30,6 +31,8 @@ import { isUnityReferenceImportWindowLocation } from "./services/unityReferenceI
 import { isReferenceExternalImportWindowLocation } from "./services/referenceExternalImportWindow";
 import { isCollabSearchWindowLocation } from "./services/collabSearchWindow";
 import { isUnityHostLocation } from "./services/locusRuntime";
+import { getCurrentTauriWindowLabel, showCurrentTauriWindow } from "./services/tauriRuntime";
+import { markStartupPhase } from "./services/startupPerf";
 const isCanvasWindow = window.location.pathname === '/canvas'
                     || window.location.search.includes('specId=');
 const isUnityEmbedTestWindow = window.location.pathname === "/unity-embed-test";
@@ -80,6 +83,10 @@ const notificationStore = useNotificationStore();
 const appUpdateStore = useAppUpdateStore();
 const unityEmbedBootstrapped = ref(false);
 const unityEmbedBootstrapError = ref<string | null>(null);
+const KNOWLEDGE_RUNTIME_LOADING_OPERATION = "knowledgeEmbeddingRuntimeLoading";
+const KNOWLEDGE_RUNTIME_STARTUP_POLL_COUNT = 16;
+let knowledgeRuntimeStatusTimer: ReturnType<typeof setTimeout> | null = null;
+let knowledgeRuntimeStartupPollsRemaining = 0;
 
 // -- Diff overlay provider (must be called in App setup so all children can inject) --
 const diffOverlay = provideDiffOverlay();
@@ -421,14 +428,98 @@ async function openAppUpdateChangelog() {
   }
 }
 
+function clearKnowledgeRuntimeStatusTimer() {
+  if (!knowledgeRuntimeStatusTimer) return;
+  clearTimeout(knowledgeRuntimeStatusTimer);
+  knowledgeRuntimeStatusTimer = null;
+}
+
+function scheduleKnowledgeRuntimeStatusPoll(delay = 700) {
+  clearKnowledgeRuntimeStatusTimer();
+  knowledgeRuntimeStatusTimer = setTimeout(() => {
+    knowledgeRuntimeStatusTimer = null;
+    void refreshKnowledgeRuntimeLoadingStatus();
+  }, delay);
+}
+
+async function refreshKnowledgeRuntimeLoadingStatus() {
+  if (isStandaloneWindow || !projectStore.workingDir.trim()) {
+    notificationStore.clearByOperation(KNOWLEDGE_RUNTIME_LOADING_OPERATION);
+    clearKnowledgeRuntimeStatusTimer();
+    return;
+  }
+
+  try {
+    const status = await knowledgeGetEmbeddingStatus();
+    if (status.activating) {
+      notificationStore.addNotice("info", t("knowledge.retrieval.runtimeStarting"), {
+        operation: KNOWLEDGE_RUNTIME_LOADING_OPERATION,
+        replaceOperation: true,
+        spinner: true,
+        sticky: true,
+        skipConsoleLog: true,
+      });
+      scheduleKnowledgeRuntimeStatusPoll();
+      return;
+    }
+
+    notificationStore.clearByOperation(KNOWLEDGE_RUNTIME_LOADING_OPERATION);
+    if (knowledgeRuntimeStartupPollsRemaining > 0) {
+      knowledgeRuntimeStartupPollsRemaining -= 1;
+      scheduleKnowledgeRuntimeStatusPoll();
+    }
+  } catch {
+    notificationStore.clearByOperation(KNOWLEDGE_RUNTIME_LOADING_OPERATION);
+    clearKnowledgeRuntimeStatusTimer();
+  }
+}
+
+function startKnowledgeRuntimeStartupPolling() {
+  if (isStandaloneWindow) return;
+  knowledgeRuntimeStartupPollsRemaining = KNOWLEDGE_RUNTIME_STARTUP_POLL_COUNT;
+  scheduleKnowledgeRuntimeStatusPoll(120);
+}
+
+function revealMainWindow() {
+  if (isStandaloneWindow) return;
+  const currentTauriWindowLabel = getCurrentTauriWindowLabel();
+  if (currentTauriWindowLabel && currentTauriWindowLabel !== "main") return;
+  markStartupPhase("main_window_show_start");
+  void showCurrentTauriWindow()
+    .then(() => {
+      markStartupPhase("main_window_show_done");
+    })
+    .catch((error) => {
+      markStartupPhase("main_window_show_error");
+      console.warn("[startup] failed to show main window", error);
+    });
+}
+
 // -- Lifecycle --
 onMounted(async () => {
+  markStartupPhase("app_mounted", {
+    window: isUnityEmbedWindow ? "unity_embed" : isStandaloneWindow ? "standalone" : "main",
+    path: window.location.pathname,
+  });
+  await nextTick();
+  setTimeout(revealMainWindow, 0);
+  if (typeof requestAnimationFrame === "function") {
+    requestAnimationFrame(() => markStartupPhase("app_next_frame"));
+  } else {
+    setTimeout(() => markStartupPhase("app_next_frame"), 0);
+  }
+
   if (isUnityEmbedWindow) {
     try {
+      markStartupPhase("unity_embed_bootstrap_critical_start");
       await bootstrapCritical();
+      markStartupPhase("unity_embed_bootstrap_critical_done");
+      markStartupPhase("unity_embed_register_listeners_start");
       await registerListeners();
+      markStartupPhase("unity_embed_register_listeners_done");
     } catch (error) {
       const err = normalizeAppError(error);
+      markStartupPhase("unity_embed_bootstrap_error", { code: err.code });
       unityEmbedBootstrapError.value = err.message;
       notificationStore.addNotice("error", err.message, {
         code: err.code,
@@ -439,14 +530,27 @@ onMounted(async () => {
     }
     return;
   }
-  if (isStandaloneWindow) return;
+  if (isStandaloneWindow) {
+    markStartupPhase("standalone_window_ready");
+    return;
+  }
   document.addEventListener("click", handleDirClickOutside, true);
+  markStartupPhase("main_dom_listeners_ready");
+  markStartupPhase("main_bootstrap_critical_start");
   await bootstrapCritical();
+  markStartupPhase("main_bootstrap_critical_done");
+  markStartupPhase("main_register_listeners_start");
   await registerListeners();
+  markStartupPhase("main_register_listeners_done");
   // Sessions page is now interactive — kick off background work
   preloadTabsInBackground();
+  markStartupPhase("main_preload_tabs_scheduled");
   void bootstrapDeferred();
+  markStartupPhase("main_bootstrap_deferred_scheduled");
   void appUpdateStore.checkForUpdates({ silent: true });
+  markStartupPhase("main_update_check_scheduled");
+  startKnowledgeRuntimeStartupPolling();
+  markStartupPhase("main_startup_done");
 });
 
 onUnmounted(() => {
@@ -456,7 +560,13 @@ onUnmounted(() => {
   }
   if (isStandaloneWindow) return;
   document.removeEventListener("click", handleDirClickOutside, true);
+  notificationStore.clearByOperation(KNOWLEDGE_RUNTIME_LOADING_OPERATION);
+  clearKnowledgeRuntimeStatusTimer();
   cleanup();
+});
+
+watch(() => projectStore.workingDir, () => {
+  startKnowledgeRuntimeStartupPolling();
 });
 </script>
 

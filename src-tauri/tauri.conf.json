@@ -12,6 +12,9 @@
   "app": {
     "windows": [
       {
+        "label": "main",
+        "create": false,
+        "visible": false,
         "title": "Locus",
         "width": 1400,
         "height": 900,

@@ -3,8 +3,9 @@ mod logging;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
+use tauri::webview::PageLoadEvent;
 use tauri::{Manager, WindowEvent};
 
 mod agent;
@@ -46,6 +47,41 @@ use agent::instance::{AssistantStreamState, RawContextStore};
 use commands::AppKnowledgeDir;
 
 const MAIN_WINDOW_LABEL: &str = "main";
+
+#[derive(Clone)]
+struct StartupTrace {
+    started_at: Instant,
+    last_mark: Arc<Mutex<Instant>>,
+}
+
+impl StartupTrace {
+    fn new() -> Self {
+        let now = Instant::now();
+        Self {
+            started_at: now,
+            last_mark: Arc::new(Mutex::new(now)),
+        }
+    }
+
+    fn elapsed_ms(&self) -> u128 {
+        self.started_at.elapsed().as_millis()
+    }
+
+    fn mark(&self, phase: &str) {
+        let now = Instant::now();
+        let mut delta_ms = 0;
+        if let Ok(mut last_mark) = self.last_mark.lock() {
+            delta_ms = now.duration_since(*last_mark).as_millis();
+            *last_mark = now;
+        }
+        eprintln!(
+            "[startup] phase={} total={}ms delta={}ms",
+            phase,
+            now.duration_since(self.started_at).as_millis(),
+            delta_ms
+        );
+    }
+}
 
 #[derive(Clone)]
 pub struct AppAgentDir(pub Arc<Option<std::path::PathBuf>>);
@@ -103,6 +139,9 @@ pub type ToolPermissions = Arc<tokio::sync::RwLock<std::collections::HashMap<Str
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let startup_trace = StartupTrace::new();
+    std::eprintln!("[startup] phase=run_enter total=0ms delta=0ms");
+
     let shared_debug_flag = Arc::new(AtomicBool::new(
         std::env::var("LOCUS_DEBUG")
             .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "True"))
@@ -110,15 +149,28 @@ pub fn run() {
     ));
     let log_store = Arc::new(logging::AppLogStore::new(logging::DEFAULT_LOG_CAPACITY));
     logging::init_tracing(shared_debug_flag.clone(), log_store.clone());
-    #[cfg(windows)]
-    knowledge_index::embedding::preload_ort_helpers();
-
+    startup_trace.mark("tracing_ready");
     let binary_cache: Arc<binary_cache::BinaryCache> = Arc::new(binary_cache::BinaryCache::new());
     let cache_for_protocol = binary_cache.clone();
     let debug_flag_for_setup = shared_debug_flag.clone();
     let log_store_for_setup = log_store.clone();
+    let startup_for_page_load = startup_trace.clone();
+    let startup_for_setup = startup_trace.clone();
 
     tauri::Builder::default()
+        .on_page_load(move |webview, payload| {
+            let event = match payload.event() {
+                PageLoadEvent::Started => "started",
+                PageLoadEvent::Finished => "finished",
+            };
+            eprintln!(
+                "[startup] phase=webview_page_load label={} event={} url={} total={}ms",
+                webview.label(),
+                event,
+                payload.url(),
+                startup_for_page_load.elapsed_ms()
+            );
+        })
         .register_uri_scheme_protocol("locus-binary", move |_ctx, request| {
             let request_start = Instant::now();
             let path = request.uri().path(); // "/blob/{uuid}"
@@ -170,6 +222,7 @@ pub fn run() {
             }
         })
         .setup(move |app| {
+            startup_for_setup.mark("setup_start");
             log_store_for_setup.attach_app_handle(app.handle().clone());
             if let Err(error) = commands::ensure_windows_notification_identity(&app.handle().clone())
             {
@@ -186,11 +239,13 @@ pub fn run() {
             commands::restore_saved_git_override(&app.handle().clone());
 
             println!("[Locus] data_dir: {:?}", data_dir);
+            startup_for_setup.mark("setup_storage_ready");
 
             let mut loaded_config = AppConfig::load(&data_dir);
             debug_flag_for_setup.store(loaded_config.debug_enabled(), Ordering::Relaxed);
             loaded_config.debug = debug_flag_for_setup.clone();
             let config = Arc::new(loaded_config);
+            startup_for_setup.mark("setup_config_ready");
 
             // Load OpenRouter API key from OS keychain only.
             let initial_key = keychain::get_secret(keychain::KEY_OPENROUTER)
@@ -208,11 +263,13 @@ pub fn run() {
             let codex_state: CodexAuthStateHandle =
                 Arc::new(tokio::sync::Mutex::new(CodexAuthState::new(&data_dir)));
             println!("[Locus] codex auth state initialized");
+            startup_for_setup.mark("setup_auth_state_ready");
 
             let store = Arc::new(
                 SessionStore::new(&data_dir)
                     .map_err(|e| format!("Failed to initialize SessionStore: {}", e))?,
             );
+            startup_for_setup.mark("setup_session_store_ready");
 
             let working_dir_file = data_dir.join("working_dir.txt");
             let initial_working_dir = std::fs::read_to_string(&working_dir_file)
@@ -238,6 +295,7 @@ pub fn run() {
                 None
             };
             println!("[Locus] workspace_id: {:?}", initial_workspace_id);
+            startup_for_setup.mark("setup_workspace_ready");
 
             let initial_working_dir_copy = initial_working_dir.clone();
             let workspace = Arc::new(Workspace {
@@ -283,6 +341,7 @@ pub fn run() {
                 app_agent_dir.0.as_deref(),
                 project_agent_opt,
             ));
+            startup_for_setup.mark("setup_agents_ready");
 
             let app_knowledge_dir = AppKnowledgeDir(Arc::new(
                 commands::resolve_app_knowledge_dir(&data_dir).map(|p| {
@@ -312,6 +371,7 @@ pub fn run() {
                 ));
             let unity_reference_import_state = unity_docs::UnityReferenceImportState::default();
             let feishu_reference_import_state = feishu_docs::FeishuReferenceImportState::default();
+            startup_for_setup.mark("setup_knowledge_runtime_ready");
 
             let mut tool_registry = ToolRegistry::with_builtins();
             let subagents = registry.list_task_agent_descriptions();
@@ -329,11 +389,13 @@ pub fn run() {
             }
             let tool_registry = Arc::new(tool_registry);
             println!("[Locus] tool registry initialized with built-in tools");
+            startup_for_setup.mark("setup_tool_registry_ready");
 
             let provider_keys: ProviderKeysState = Arc::new(tokio::sync::RwLock::new(
                 commands::load_provider_keys_from_keychain(&data_dir),
             ));
             println!("[Locus] provider keys loaded from keychain");
+            startup_for_setup.mark("setup_provider_keys_ready");
 
             let raw_context_store: RawContextStore =
                 Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
@@ -379,6 +441,7 @@ pub fn run() {
             println!("[Locus] tool_permissions: {:?}", initial_tool_perms);
             let tool_permissions: ToolPermissions =
                 Arc::new(tokio::sync::RwLock::new(initial_tool_perms));
+            startup_for_setup.mark("setup_permissions_ready");
 
             let canvas_spec_store: CanvasSpecStore =
                 Arc::new(tokio::sync::Mutex::new(HashMap::new()));
@@ -390,63 +453,33 @@ pub fn run() {
             let preview_cache = commands::asset::WorkspacePreviewCache::new();
             let dir_entries_cache = commands::DirEntriesPageCache::new();
 
+            let mut startup_ref_graph_reconcile: Option<(
+                std::path::PathBuf,
+                Arc<std::sync::Mutex<Option<asset_db::AssetDb>>>,
+            )> = None;
             let ref_graph_state = match asset_db::AssetDb::load_existing(std::path::Path::new(
                 &initial_working_dir_copy,
             )) {
                 asset_db::LoadExistingAssetDb::Ready(graph) => {
                     let project_root = std::path::Path::new(&initial_working_dir_copy);
-                    match asset_db::watcher::reconcile_loaded_db(project_root, graph) {
-                        Ok((graph, stats)) => {
-                            eprintln!(
-                                "[Locus] existing ref_graph DB reconciled: queued={}, processed={}, failed={}",
-                                stats.queued, stats.processed, stats.failed
-                            );
-                            match commands::asset::read_persisted_last_scan_info(
-                                std::path::Path::new(&initial_working_dir_copy),
-                            ) {
-                                Ok(Some(info)) => last_scan_info_state.set(info),
-                                Ok(None) => {}
-                                Err(err) => {
-                                    eprintln!(
-                                        "[Locus] warning: failed to load persisted asset scan info: {}",
-                                        err
-                                    );
-                                }
-                            }
-                            let db_path = std::path::Path::new(&initial_working_dir_copy)
-                                .join("Library")
-                                .join("Locus")
-                                .join("locus.db");
-                            eprintln!(
-                                "[Locus] existing ref_graph DB loaded: {}",
-                                db_path.display()
-                            );
-                            AssetDbState(Arc::new(std::sync::Mutex::new(Some(graph))))
-                        }
+                    match commands::asset::read_persisted_last_scan_info(
+                        std::path::Path::new(&initial_working_dir_copy),
+                    ) {
+                        Ok(Some(info)) => last_scan_info_state.set(info),
+                        Ok(None) => {}
                         Err(err) => {
-                            if let Err(clear_err) =
-                                commands::asset::delete_persisted_last_scan_info(project_root)
-                            {
-                                eprintln!(
-                                    "[Locus] warning: failed to clear stale asset scan info: {}",
-                                    clear_err
-                                );
-                            }
                             eprintln!(
-                                "[Locus] existing ref_graph DB reconcile failed, rescan required: {}",
+                                "[Locus] warning: failed to load persisted asset scan info: {}",
                                 err
                             );
-                            scan_phase_state.set(Some(asset_db::types::ScanPhase::Error {
-                                error: error::AppError::new(
-                                    "ref_graph.rescan_required.reconcile_failed",
-                                    "Persisted asset database could not be reconciled. Run a rescan to rebuild it.",
-                                )
-                                .detail(err)
-                                .retryable(true),
-                            }));
-                            AssetDbState(Arc::new(std::sync::Mutex::new(None)))
                         }
-                    }
+                    };
+                    let db_path = project_root.join("Library").join("Locus").join("locus.db");
+                    eprintln!("[Locus] existing ref_graph DB loaded: {}", db_path.display());
+                    let graph_state = Arc::new(std::sync::Mutex::new(Some(graph)));
+                    startup_ref_graph_reconcile =
+                        Some((project_root.to_path_buf(), graph_state.clone()));
+                    AssetDbState(graph_state)
                 }
                 asset_db::LoadExistingAssetDb::NeedsRescan(issue) => {
                     if let Err(err) = commands::asset::delete_persisted_last_scan_info(
@@ -479,6 +512,7 @@ pub fn run() {
                     AssetDbState(Arc::new(std::sync::Mutex::new(None)))
                 }
             };
+            startup_for_setup.mark("setup_asset_db_ready");
 
             let watcher_handle: AssetDbWatcherHandle = Arc::new(std::sync::Mutex::new(None));
             let knowledge_watcher_handle: KnowledgeFsWatcherHandle =
@@ -497,6 +531,36 @@ pub fn run() {
                         eprintln!("[Locus] warning: failed to start ref_graph watcher: {}", e);
                     }
                 }
+            }
+
+            if let Some((project_root, graph_state)) = startup_ref_graph_reconcile.take() {
+                let startup_for_reconcile = startup_for_setup.clone();
+                tauri::async_runtime::spawn_blocking(move || {
+                    startup_for_reconcile.mark("asset_reconcile_task_start");
+                    let started_at = Instant::now();
+                    match asset_db::watcher::reconcile_graph_state(
+                        &project_root,
+                        graph_state,
+                        true,
+                    ) {
+                        Ok(stats) => {
+                            eprintln!(
+                                "[Locus] existing ref_graph DB reconciled in background: queued={}, processed={}, failed={}, elapsed={}ms",
+                                stats.queued,
+                                stats.processed,
+                                stats.failed,
+                                started_at.elapsed().as_millis()
+                            );
+                        }
+                        Err(err) => {
+                            eprintln!(
+                                "[Locus] existing ref_graph DB background reconcile failed: {}",
+                                err
+                            );
+                        }
+                    }
+                    startup_for_reconcile.mark("asset_reconcile_task_done");
+                });
             }
 
             if !initial_working_dir_copy.trim().is_empty() {
@@ -526,6 +590,7 @@ pub fn run() {
                     }
                 }
             }
+            startup_for_setup.mark("setup_watchers_ready");
 
             app.manage(config);
             app.manage(auth_state);
@@ -560,6 +625,20 @@ pub fn run() {
             app.manage(unity_reference_import_state);
             app.manage(feishu_reference_import_state);
             app.manage(log_store_for_setup.clone());
+            startup_for_setup.mark("setup_state_managed");
+            startup_for_setup.mark("setup_backend_ready");
+
+            let main_window_config = app
+                .config()
+                .app
+                .windows
+                .iter()
+                .find(|window| window.label == MAIN_WINDOW_LABEL)
+                .ok_or_else(|| format!("Missing '{}' window config", MAIN_WINDOW_LABEL))?;
+            startup_for_setup.mark("main_window_build_start");
+            tauri::WebviewWindowBuilder::from_config(app.handle(), main_window_config)?.build()?;
+            startup_for_setup.mark("main_window_build_done");
+
             commands::start_unity_embed_control_server(app.handle().clone());
             #[cfg(target_os = "windows")]
             if let Err(error) = windows_window_frame::restore_main_window_frame(app) {
@@ -569,10 +648,13 @@ pub fn run() {
             if let Err(error) = windows_resize_sync::install_for_main_window(app) {
                 eprintln!("[Locus] warning: failed to install WebView2 resize sync: {error}");
             }
+            startup_for_setup.mark("setup_native_window_hooks_ready");
 
             let app_handle = app.handle().clone();
             let workspace_for_unity = workspace.clone();
+            let startup_for_unity = startup_for_setup.clone();
             tauri::async_runtime::spawn(async move {
+                startup_for_unity.mark("unity_monitor_task_start");
                 let wd = workspace_for_unity.path.read().await.clone();
                 let is_unity = unity_bridge::is_unity_project(&wd);
                 eprintln!(
@@ -588,14 +670,18 @@ pub fn run() {
                     .await;
                     unity_bridge::emit_plugin_status(&app_handle, &wd);
                 }
+                startup_for_unity.mark("unity_monitor_task_done");
             });
 
             let knowledge_startup_state = knowledge_index_state.clone();
             let workspace_for_knowledge = workspace.clone();
             let app_handle_for_knowledge = app.handle().clone();
+            let startup_for_knowledge = startup_for_setup.clone();
             tauri::async_runtime::spawn(async move {
+                startup_for_knowledge.mark("knowledge_startup_task_start");
                 let wd = workspace_for_knowledge.path.read().await.clone();
                 if wd.trim().is_empty() {
+                    startup_for_knowledge.mark("knowledge_startup_task_skipped");
                     return;
                 }
                 let app_knowledge_dir: tauri::State<'_, AppKnowledgeDir> =
@@ -618,7 +704,10 @@ pub fn run() {
                 {
                     eprintln!("[Locus] knowledge reconcile error: {}", e);
                 }
+                startup_for_knowledge.mark("knowledge_startup_task_done");
             });
+            startup_for_setup.mark("setup_background_tasks_scheduled");
+            startup_for_setup.mark("setup_done");
 
             Ok(())
         })

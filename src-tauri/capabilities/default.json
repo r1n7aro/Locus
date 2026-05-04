@@ -19,6 +19,7 @@
     "core:webview:allow-internal-toggle-devtools",
     "core:webview:allow-set-webview-background-color",
     "core:window:allow-create",
+    "core:window:allow-show",
     "core:window:allow-set-focus",
     "core:window:allow-set-background-color",
     "core:webview:allow-set-webview-focus",

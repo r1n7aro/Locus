@@ -1,3 +1,5 @@
+import { getCurrentWindow } from "@tauri-apps/api/window";
+
 type TauriInternals = {
   metadata?: {
     currentWindow?: {
@@ -15,7 +17,25 @@ function getTauriInternals(): TauriInternals | null {
 
 export function hasTauriWindowRuntime(): boolean {
   const internals = getTauriInternals();
-  return Boolean(internals?.metadata?.currentWindow?.label);
+  return typeof internals?.invoke === "function";
+}
+
+export function getCurrentTauriWindowLabel(): string | null {
+  if (!hasTauriWindowRuntime()) return null;
+  try {
+    return getCurrentWindow().label ?? null;
+  } catch {
+    return getTauriInternals()?.metadata?.currentWindow?.label ?? null;
+  }
+}
+
+export async function showCurrentTauriWindow(): Promise<void> {
+  if (!hasTauriWindowRuntime()) return;
+  const window = getCurrentWindow();
+  await window.show();
+  await window.setFocus().catch(() => {
+    /* Focusing can fail when the OS denies foreground activation. */
+  });
 }
 
 export function toggleTauriDevtools(): void {

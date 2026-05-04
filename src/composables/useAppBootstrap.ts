@@ -15,6 +15,7 @@ import {
   resetSystemNotificationState,
 } from "../services/systemNotifications";
 import { getLocusRuntime, type RuntimeUnsubscribe } from "../services/locusRuntime";
+import { markStartupPhase, measureStartupAsync } from "../services/startupPerf";
 import { setScope, setWarmup, clearWarmup } from "./warmupCache";
 import {
   getProviders,
@@ -134,15 +135,21 @@ export function useAppBootstrap() {
 
   // -- Bootstrap: Critical (first-screen minimum) --
   async function bootstrapCritical() {
-    await uiStore.init();
-    await Promise.all([
-      chatStore.loadToolPermissionMode(),
-      modelStore.loadModelDefaults(),
-      modelStore.loadLastModel(),
-      modelStore.loadCustomEndpoints(),
-      modelStore.loadCodexModelConfig(),
-    ]);
-    const authFailures = await authStore.checkAuth();
+    await measureStartupAsync("bootstrap_ui_init", async () => {
+      await uiStore.init();
+    });
+    await measureStartupAsync("bootstrap_model_config", async () => {
+      await Promise.all([
+        chatStore.loadToolPermissionMode(),
+        modelStore.loadModelDefaults(),
+        modelStore.loadLastModel(),
+        modelStore.loadCustomEndpoints(),
+        modelStore.loadCodexModelConfig(),
+      ]);
+    });
+    const authFailures = await measureStartupAsync("bootstrap_auth_check", async () => {
+      return authStore.checkAuth();
+    });
     const authFailureList = Array.isArray(authFailures) ? authFailures : [];
     for (const failure of authFailureList) {
       const isCodexFailure = failure.target === "codex";
@@ -161,23 +168,36 @@ export function useAppBootstrap() {
         },
       );
     }
-    await modelStore.loadCodexAvailableModels();
+    await measureStartupAsync("bootstrap_codex_available_models", async () => {
+      await modelStore.loadCodexAvailableModels();
+    });
+    markStartupPhase("bootstrap_resolve_selected_model_start");
     modelStore.resolveSelectedModel(true);
+    markStartupPhase("bootstrap_resolve_selected_model_done");
 
-    await Promise.all([
-      chatStore.refreshSessions(),
-      agentStore.loadAgents(),
-      projectStore.loadWorkingDir(),
-      loadSkills(),
-    ]);
-    await modelStore.loadLastEffort();
+    await measureStartupAsync("bootstrap_shell_data", async () => {
+      await Promise.all([
+        chatStore.refreshSessions(),
+        agentStore.loadAgents(),
+        projectStore.loadWorkingDir(),
+        loadSkills(),
+      ]);
+    });
+    await measureStartupAsync("bootstrap_last_effort", async () => {
+      await modelStore.loadLastEffort();
+    });
+    markStartupPhase("bootstrap_sync_effort_start");
     syncEffortForChatContext();
+    markStartupPhase("bootstrap_sync_effort_done");
     skillsLoaded = true;
+    markStartupPhase("bootstrap_critical_ready");
   }
 
   // -- Bootstrap: Deferred (fire-and-forget after first screen) --
   async function bootstrapDeferred() {
-    await Promise.all([projectStore.loadRecentDirs()]);
+    await measureStartupAsync("bootstrap_deferred_recent_dirs", async () => {
+      await Promise.all([projectStore.loadRecentDirs()]);
+    });
   }
 
   // -- Background preloading --
@@ -211,6 +231,7 @@ export function useAppBootstrap() {
   }
 
   function preloadTabsInBackground() {
+    markStartupPhase("preload_tabs_schedule_start");
     const schedule = (fn: () => void) => {
       if ("requestIdleCallback" in window) {
         (window as any).requestIdleCallback(fn, { timeout: 2000 });
@@ -220,9 +241,11 @@ export function useAppBootstrap() {
     };
 
     schedule(async () => {
+      markStartupPhase("preload_tabs_task_start");
       const warmupGeneration = setScope(projectStore.workingDir);
 
       // Stage 1: chunk prefetch — 2 concurrent (bottleneck is parse/eval, not download)
+      markStartupPhase("preload_tabs_chunks_start");
       await runQueue(
         [
           () => import("../components/SettingsView.vue"),
@@ -233,8 +256,10 @@ export function useAppBootstrap() {
         ],
         2,
       ).catch(() => {});
+      markStartupPhase("preload_tabs_chunks_done");
 
       // Stage 2: data warmup — 2 concurrent
+      markStartupPhase("preload_tabs_data_start");
       await runQueue(
         [
           () => warmupSettings(warmupGeneration),
@@ -245,7 +270,9 @@ export function useAppBootstrap() {
         ],
         2,
       ).catch(() => {});
+      markStartupPhase("preload_tabs_data_done");
     });
+    markStartupPhase("preload_tabs_schedule_done");
   }
 
   async function maybeOpenLexicalProgressWindow(status: LexicalRebuildStatus) {
@@ -354,8 +381,13 @@ export function useAppBootstrap() {
 
   // -- Event listener registration --
   async function registerListeners() {
+    markStartupPhase("register_listeners_enter");
     const runtime = getLocusRuntime();
-    if ((runtime.kind === "browser" || runtime.kind === "unity") && !runtime.unityBridgeUrl) return;
+    markStartupPhase("register_listeners_runtime_ready", { runtime: runtime.kind });
+    if ((runtime.kind === "browser" || runtime.kind === "unity") && !runtime.unityBridgeUrl) {
+      markStartupPhase("register_listeners_skipped");
+      return;
+    }
     unlisten = await runtime.subscribe<StreamEvent>("stream-event", (payload) => {
       const handled = chatStore.handleStreamEvent(payload);
       if (!handled) return;
@@ -391,11 +423,14 @@ export function useAppBootstrap() {
         void maybeOpenLexicalProgressWindow(status);
       },
     );
+    markStartupPhase("register_listeners_subscriptions_ready");
 
     // Initial Unity/AssetDb state
-    await projectStore.checkUnityConnection();
-    await projectStore.checkUnityPlugin();
-    await projectStore.loadAssetDbStatus();
+    await measureStartupAsync("register_listeners_initial_state", async () => {
+      await projectStore.checkUnityConnection();
+      await projectStore.checkUnityPlugin();
+      await projectStore.loadAssetDbStatus();
+    });
   }
 
   function cleanup() {

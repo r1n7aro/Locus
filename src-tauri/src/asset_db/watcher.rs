@@ -1244,23 +1244,53 @@ pub fn reconcile_loaded_db(
     project_root: &Path,
     graph: AssetDb,
 ) -> Result<(AssetDb, StartupReconcileStats), String> {
-    let stop = AtomicBool::new(false);
-    let queue = DirtyQueue::new();
-    let activity = RecentQueueActivityLog::new();
     let state = Arc::new(Mutex::new(Some(graph)));
-    let mut stats = StartupReconcileStats::default();
-
-    mtime_scan_once_with_options(
-        &queue,
-        &stop,
-        &state,
+    let stats = reconcile_graph_state_with_options(
         project_root,
-        &activity,
+        state.clone(),
         MtimeScanOptions {
             discover_new_meta: true,
             verify_hashes: true,
         },
+    )?;
+
+    let mut guard = state.lock().map_err(|e| format!("Lock error: {}", e))?;
+    let graph = guard
+        .take()
+        .ok_or_else(|| "AssetDb disappeared during startup reconcile".to_string())?;
+    eprintln!(
+        "[AssetDb Watcher] startup reconcile complete: queued={}, processed={}, failed={}",
+        stats.queued, stats.processed, stats.failed
     );
+    Ok((graph, stats))
+}
+
+pub fn reconcile_graph_state(
+    project_root: &Path,
+    state: Arc<Mutex<Option<AssetDb>>>,
+    verify_hashes: bool,
+) -> Result<StartupReconcileStats, String> {
+    reconcile_graph_state_with_options(
+        project_root,
+        state,
+        MtimeScanOptions {
+            discover_new_meta: true,
+            verify_hashes,
+        },
+    )
+}
+
+fn reconcile_graph_state_with_options(
+    project_root: &Path,
+    state: Arc<Mutex<Option<AssetDb>>>,
+    options: MtimeScanOptions,
+) -> Result<StartupReconcileStats, String> {
+    let stop = AtomicBool::new(false);
+    let queue = DirtyQueue::new();
+    let activity = RecentQueueActivityLog::new();
+    let mut stats = StartupReconcileStats::default();
+
+    mtime_scan_once_with_options(&queue, &stop, &state, project_root, &activity, options);
     stats.queued = queue.len() as u64;
 
     while let Some(rel_path) = queue.try_dequeue() {
@@ -1289,15 +1319,7 @@ pub fn reconcile_loaded_db(
         }
     }
 
-    let mut guard = state.lock().map_err(|e| format!("Lock error: {}", e))?;
-    let graph = guard
-        .take()
-        .ok_or_else(|| "AssetDb disappeared during startup reconcile".to_string())?;
-    eprintln!(
-        "[AssetDb Watcher] startup reconcile complete: queued={}, processed={}, failed={}",
-        stats.queued, stats.processed, stats.failed
-    );
-    Ok((graph, stats))
+    Ok(stats)
 }
 
 pub struct AssetDbWatcher {
