@@ -35,6 +35,8 @@ const props = defineProps<{
   codexCodeCopied: boolean;
   allModels: ModelOption[];
   customEndpoints: CustomEndpoint[];
+  mode?: "full" | "onboarding";
+  onboardingFocus?: "custom" | "codex" | null;
 }>();
 
 const emit = defineEmits<{
@@ -62,6 +64,7 @@ const emit = defineEmits<{
 }>();
 
 const anthropicProvider = computed(() => props.providers.find((p) => p.id === "anthropic"));
+const isOnboardingMode = computed(() => props.mode === "onboarding");
 const thirdPartyProviders = computed(() =>
   props.providers.filter(
     (p) => p.id !== "anthropic" && p.id !== "anthropic_sdk" && p.id !== "openrouter",
@@ -140,10 +143,17 @@ const codexTransportOptions = [
 function updateCodexTransport(value: string) {
   emit("update:codexTransport", value === "websocket" ? "websocket" : "http");
 }
+
+function focusSectionClass(section: "custom" | "codex") {
+  return {
+    "focus-section": isOnboardingMode.value && props.onboardingFocus === section,
+  };
+}
 </script>
 
 <template>
-  <div class="settings-section" v-if="allModels.length > 0">
+  <div class="settings-api-providers" :class="{ 'is-onboarding': isOnboardingMode }">
+  <div class="settings-section" v-if="!isOnboardingMode && allModels.length > 0">
     <div class="section-label">{{ t("settings.models.available") }}</div>
     <div class="available-models-grid">
       <div
@@ -162,12 +172,12 @@ function updateCodexTransport(value: string) {
       </div>
     </div>
   </div>
-  <div class="settings-section" v-else>
+  <div class="settings-section" v-else-if="!isOnboardingMode">
     <div class="section-label">{{ t("settings.models.available") }}</div>
     <p class="section-desc" style="opacity:0.6;">{{ t("settings.models.noModels") }}</p>
   </div>
 
-  <div class="settings-section" v-if="anthropicProvider">
+  <div class="settings-section" v-if="!isOnboardingMode && anthropicProvider">
     <div class="section-label">{{ t("settings.anthropic.title") }}</div>
     <div class="provider-card">
       <div class="provider-header">
@@ -200,7 +210,7 @@ function updateCodexTransport(value: string) {
     </div>
   </div>
 
-  <div class="settings-section" v-if="providers.find(p => p.id === 'anthropic_sdk')">
+  <div class="settings-section" v-if="!isOnboardingMode && providers.find(p => p.id === 'anthropic_sdk')">
     <div class="section-label">{{ t("settings.anthropicSdk.title") }}</div>
     <div class="provider-card">
       <div class="provider-header">
@@ -233,7 +243,7 @@ function updateCodexTransport(value: string) {
     </div>
   </div>
 
-  <div class="settings-section">
+  <div class="settings-section" :class="focusSectionClass('codex')">
     <div class="section-label">{{ t("settings.codex.title") }}</div>
     <div class="provider-card">
       <div class="provider-header">
@@ -334,7 +344,7 @@ function updateCodexTransport(value: string) {
     </div>
   </div>
 
-  <div v-if="thirdPartyProviders.length > 0" class="settings-section">
+  <div v-if="!isOnboardingMode && thirdPartyProviders.length > 0" class="settings-section">
     <div class="section-label">{{ t("settings.provider.title") }}</div>
 
     <div
@@ -407,7 +417,7 @@ function updateCodexTransport(value: string) {
     </div>
   </div>
 
-  <div class="settings-section">
+  <div class="settings-section" :class="focusSectionClass('custom')">
     <div class="section-label">{{ t("settings.custom.title") }}</div>
     <p class="section-desc">{{ t("settings.custom.desc") }}</p>
 
@@ -443,4 +453,457 @@ function updateCodexTransport(value: string) {
       + {{ t("settings.custom.add") }}
     </button>
   </div>
+  </div>
 </template>
+
+<style scoped>
+.settings-api-providers {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.settings-section {
+  padding: 18px 28px;
+}
+
+.settings-api-providers.is-onboarding .settings-section {
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.settings-api-providers.is-onboarding .settings-section:last-child {
+  border-bottom: none;
+}
+
+.settings-api-providers.is-onboarding .focus-section {
+  order: -1;
+}
+
+.section-label {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-secondary);
+  margin-bottom: 12px;
+}
+
+.section-desc {
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin: -4px 0 14px;
+  line-height: 1.5;
+}
+
+.provider-card {
+  border: 1px solid var(--border-color);
+  border-radius: 10px;
+  padding: 14px 16px;
+  margin-bottom: 10px;
+  transition: border-color 0.15s ease, background 0.15s ease;
+  background: color-mix(in srgb, var(--panel-bg) 84%, var(--sidebar-bg) 16%);
+}
+
+.provider-card:hover {
+  border-color: var(--border-strong);
+  background: color-mix(in srgb, var(--panel-bg) 88%, var(--hover-bg) 12%);
+}
+
+.provider-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.provider-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.provider-name {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.provider-desc {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.provider-status {
+  font-size: 11px;
+  font-weight: 500;
+  padding: 2px 8px;
+  border-radius: 4px;
+  background: var(--hover-bg);
+  color: var(--text-secondary);
+  border: 1px solid transparent;
+  flex-shrink: 0;
+  white-space: nowrap;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.provider-status.active {
+  background: var(--status-good-bg);
+  color: var(--status-good-fg);
+  border-color: var(--status-good-border);
+}
+
+.provider-status.error {
+  background: var(--status-danger-bg);
+  color: var(--status-danger-fg);
+  border-color: var(--status-danger-border);
+}
+
+.provider-detail {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border-color);
+}
+
+.key-hint {
+  font-size: 12px;
+  color: var(--text-secondary);
+  min-width: 0;
+  word-break: break-word;
+}
+
+.key-hint.mono {
+  font-family: var(--font-mono-identifier);
+}
+
+.provider-actions {
+  display: flex;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.codex-detail {
+  align-items: flex-start;
+}
+
+.codex-status-copy,
+.codex-transport-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.codex-transport-detail {
+  align-items: center;
+}
+
+.codex-transport-label {
+  color: var(--text-color);
+}
+
+.codex-validation-label {
+  font-size: 11px;
+  color: var(--status-danger-fg);
+  line-height: 1.4;
+}
+
+.codex-validation-error {
+  line-height: 1.5;
+  color: var(--text-secondary);
+}
+
+.action-btn,
+.cancel-btn,
+.test-btn {
+  padding: 6px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border-color);
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+  box-shadow: none;
+  white-space: nowrap;
+}
+
+.action-btn {
+  padding: 4px 10px;
+}
+
+.action-btn:hover,
+.cancel-btn:hover,
+.test-btn:hover:not(:disabled) {
+  background: var(--hover-bg);
+  color: var(--text-color);
+  border-color: var(--border-strong);
+}
+
+.action-btn.danger:hover {
+  color: var(--status-danger-fg);
+  border-color: var(--status-danger-border);
+  background: var(--status-danger-bg);
+}
+
+.add-key-btn {
+  padding: 6px 12px;
+  border-radius: 6px;
+  border: 1px dashed var(--border-color);
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+  box-shadow: none;
+}
+
+.add-key-btn:hover {
+  background: var(--hover-bg);
+  color: var(--text-color);
+  border-color: var(--border-strong);
+}
+
+.get-key-link,
+.codex-url {
+  font-size: 11px;
+  color: var(--text-secondary);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  transition: color 0.15s;
+}
+
+.codex-url {
+  color: var(--accent-color);
+  word-break: break-all;
+}
+
+.get-key-link:hover {
+  color: var(--text-color);
+}
+
+.edit-form {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border-color);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.edit-row {
+  display: flex;
+  gap: 6px;
+}
+
+.key-input {
+  flex: 1;
+  min-width: 0;
+  padding: 7px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border-color);
+  background: var(--input-bg);
+  color: var(--text-color);
+  font-size: 13px;
+  font-family: var(--font-mono-editor);
+  outline: none;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.key-input:focus {
+  border-color: var(--accent-border);
+  background: color-mix(in srgb, var(--input-bg) 88%, var(--accent-soft) 12%);
+}
+
+.save-btn,
+.oauth-login-btn {
+  padding: 6px 14px;
+  border-radius: 6px;
+  border: 1px solid var(--accent-color);
+  background: var(--accent-color);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: filter 0.15s ease, opacity 0.15s ease;
+  box-shadow: none;
+  white-space: nowrap;
+}
+
+.oauth-login-btn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 14px;
+}
+
+.save-btn:hover:not(:disabled),
+.oauth-login-btn:hover:not(:disabled) {
+  filter: brightness(1.06);
+}
+
+.save-btn:disabled,
+.oauth-login-btn:disabled,
+.test-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.oauth-hint {
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.oauth-instruction {
+  font-size: 12px;
+  color: var(--text-secondary);
+  line-height: 1.5;
+}
+
+.codex-code-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.codex-code-wrap {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: var(--input-bg);
+  border: 1px solid var(--border-color);
+  color: inherit;
+  cursor: pointer;
+  text-align: left;
+  box-shadow: none;
+  transition: border-color 0.15s, background 0.15s;
+}
+
+.codex-code-wrap:hover {
+  background: var(--hover-bg);
+  border-color: var(--border-strong);
+}
+
+.codex-code-wrap:focus-visible {
+  outline: none;
+  border-color: var(--accent-color);
+}
+
+.codex-code-wrap.copied {
+  border-color: var(--status-good-border);
+  background: var(--status-good-bg);
+}
+
+.codex-code {
+  flex: 1;
+  font-family: var(--font-mono-display);
+  font-size: 18px;
+  font-weight: 700;
+  letter-spacing: 3px;
+  color: var(--accent-color);
+}
+
+.codex-copy-indicator {
+  flex-shrink: 0;
+  font-size: 11px;
+  color: var(--text-secondary);
+  transition: color 0.15s;
+}
+
+.codex-code-wrap.copied .codex-copy-indicator {
+  color: var(--status-good-fg);
+}
+
+.codex-poll-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.codex-spinner {
+  width: 12px;
+  height: 12px;
+  border: 2px solid var(--border-color);
+  border-top-color: var(--accent-color);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+  flex-shrink: 0;
+}
+
+.available-models-grid,
+.custom-endpoints-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.available-models-grid {
+  gap: 12px;
+}
+
+.available-models-group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.available-models-provider {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-secondary);
+}
+
+.available-models-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.available-model-tag {
+  display: inline-block;
+  padding: 3px 10px;
+  font-size: 12px;
+  font-weight: 500;
+  border-radius: var(--radius-badge);
+  background: color-mix(in srgb, var(--panel-bg) 60%, var(--hover-bg) 40%);
+  color: var(--text-secondary);
+  border: 1px solid var(--border-color);
+  white-space: nowrap;
+}
+
+@media (max-width: 680px) {
+  .settings-section {
+    padding: 14px 18px;
+  }
+
+  .provider-header,
+  .provider-detail,
+  .edit-row {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .provider-status,
+  .provider-actions,
+  .save-btn,
+  .cancel-btn {
+    align-self: flex-start;
+  }
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+</style>

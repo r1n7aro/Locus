@@ -6,9 +6,6 @@ import type {
   ModelDefaults,
   AgentInfo,
   CustomEndpoint,
-  EffortLevel,
-  ApiFormat,
-  ReasoningParamFormat,
   CodexModelConfig,
 } from "../types";
 import { t, locale, setLocale } from "../i18n";
@@ -19,6 +16,7 @@ import ShortcutSettings from "./settings/ShortcutSettings.vue";
 import ConsoleSettings from "./settings/ConsoleSettings.vue";
 import AboutSettings from "./settings/AboutSettings.vue";
 import ApiProviders from "./settings/ApiProviders.vue";
+import CustomEndpointModal from "./settings/CustomEndpointModal.vue";
 import ModelDefaultsPanel from "./settings/ModelDefaults.vue";
 import ToolPermissions from "./settings/ToolPermissions.vue";
 import ArchivedSessionsSettings from "./settings/ArchivedSessionsSettings.vue";
@@ -51,7 +49,7 @@ const {
   modelDefaults, modelSaveMsg, saveModelDefaults,
   permSaveMsg, toolList, toolPermissions, setToolPermission,
   customEndpoints, editingEndpoint, isAddingEndpoint, testStatus, testResult,
-  startAddEndpoint, startEditEndpoint, cancelEditEndpoint, saveEndpoint, deleteEndpoint, testEndpoint, handleEndpointKeydown,
+  startAddEndpoint, startEditEndpoint, cancelEditEndpoint, saveEndpoint, deleteEndpoint, testEndpoint,
 } = useSettingsState(emit);
 
 const uiStore = useUiStore();
@@ -67,68 +65,6 @@ watch(
   { immediate: true },
 );
 
-import { openPath } from "@tauri-apps/plugin-opener";
-
-async function openTestHtml(result: string) {
-  const match = result.match(/\[OPEN_HTML:(.+)\]/);
-  if (!match?.[1]) {
-    alert("Failed to extract file path from test result.");
-    return;
-  }
-  try {
-    await openPath(match[1]);
-  } catch (e: any) {
-    alert(`Failed to open file: ${match[1]}\n${e?.message ?? e}`);
-  }
-}
-
-function toggleBetaFlag(ep: import("../types").CustomEndpoint, flag: string) {
-  if (!ep.betaFlags) ep.betaFlags = [];
-  const idx = ep.betaFlags.indexOf(flag);
-  if (idx >= 0) {
-    ep.betaFlags.splice(idx, 1);
-  } else {
-    ep.betaFlags.push(flag);
-  }
-}
-
-const customReasoningEffortOptions = [
-  { value: "low", label: "Low" },
-  { value: "medium", label: "Med" },
-  { value: "high", label: "High" },
-  { value: "max", label: "Max" },
-] satisfies Array<{ value: EffortLevel; label: string }>;
-
-const customReasoningFormatOptions = [
-  { value: "none", label: t("settings.custom.reasoningNone") },
-  { value: "openai_chat_reasoning_effort", label: t("settings.custom.reasoningOpenaiChat") },
-  { value: "openai_responses_reasoning_effort", label: t("settings.custom.reasoningOpenaiResponses") },
-  { value: "anthropic_thinking", label: t("settings.custom.reasoningAnthropic") },
-] satisfies Array<{ value: ReasoningParamFormat; label: string }>;
-
-function defaultReasoningParamFormat(apiFormat: ApiFormat): ReasoningParamFormat {
-  switch (apiFormat) {
-    case "openai_responses": return "openai_responses_reasoning_effort";
-    case "anthropic_messages": return "anthropic_thinking";
-    default: return "openai_chat_reasoning_effort";
-  }
-}
-
-function updateEndpointApiFormat(ep: CustomEndpoint, event: Event) {
-  const apiFormat = (event.target as HTMLSelectElement).value as ApiFormat;
-  ep.apiFormat = apiFormat;
-  ep.reasoningParamFormat = defaultReasoningParamFormat(apiFormat);
-}
-
-function toggleReasoningEffort(ep: CustomEndpoint, effort: EffortLevel) {
-  if (!ep.supportedReasoningEfforts) ep.supportedReasoningEfforts = [];
-  const idx = ep.supportedReasoningEfforts.indexOf(effort);
-  if (idx >= 0) {
-    ep.supportedReasoningEfforts.splice(idx, 1);
-  } else {
-    ep.supportedReasoningEfforts.push(effort);
-  }
-}
 </script>
 
 <template>
@@ -341,189 +277,15 @@ function toggleReasoningEffort(ep: CustomEndpoint, effort: EffortLevel) {
       <div v-if="errorMsg" class="error-msg">{{ errorMsg }}</div>
     </div><!-- end settings-content -->
 
-    <Transition name="modal">
-      <div v-if="editingEndpoint" class="modal-overlay" @mousedown.self="cancelEditEndpoint">
-        <div class="modal-dialog">
-          <div class="modal-header">
-            <span class="modal-title">{{ isAddingEndpoint ? t("settings.custom.add") : t("settings.custom.edit") }}</span>
-            <button class="close-btn" @click="cancelEditEndpoint">
-              <svg viewBox="0 0 16 16" fill="currentColor" width="14" height="14">
-                <path d="M3.72 3.72a.75.75 0 0 1 1.06 0L8 6.94l3.22-3.22a.75.75 0 1 1 1.06 1.06L9.06 8l3.22 3.22a.75.75 0 1 1-1.06 1.06L8 9.06l-3.22 3.22a.75.75 0 0 1-1.06-1.06L6.94 8 3.72 4.78a.75.75 0 0 1 0-1.06z"/>
-              </svg>
-            </button>
-          </div>
-          <div class="modal-body">
-            <div class="custom-form-row">
-              <label class="custom-form-label">{{ t("settings.custom.name") }}</label>
-              <input
-                v-model="editingEndpoint.name"
-                class="key-input"
-                type="text"
-                :placeholder="t('settings.custom.namePlaceholder')"
-                @keydown="handleEndpointKeydown"
-              />
-            </div>
-            <div class="custom-form-row">
-              <label class="custom-form-label">
-                {{ t("settings.custom.apiModel") }}
-                <span class="custom-form-hint">{{ t("settings.custom.apiModelHint") }}</span>
-              </label>
-              <input
-                v-model="editingEndpoint.apiModel"
-                class="key-input"
-                type="text"
-                :placeholder="t('settings.custom.apiModelPlaceholder')"
-                @keydown="handleEndpointKeydown"
-              />
-            </div>
-            <div class="custom-form-row">
-              <label class="custom-form-label">
-                {{ t("settings.custom.endpoint") }}
-                <span class="custom-form-hint">{{ t("settings.custom.endpointHint") }}</span>
-              </label>
-              <input
-                v-model="editingEndpoint.endpoint"
-                class="key-input"
-                type="text"
-                :placeholder="t('settings.custom.endpointPlaceholder')"
-                @keydown="handleEndpointKeydown"
-              />
-            </div>
-            <div class="custom-form-row">
-              <label class="custom-form-label">{{ t("settings.custom.apiFormat") }}</label>
-              <select
-                :value="editingEndpoint.apiFormat"
-                class="model-select"
-                @change="updateEndpointApiFormat(editingEndpoint, $event)"
-              >
-                <option value="openai_chat">{{ t("settings.custom.formatOpenaiChat") }}</option>
-                <option value="openai_responses">{{ t("settings.custom.formatOpenaiResponses") }}</option>
-                <option value="anthropic_messages">{{ t("settings.custom.formatAnthropicMessages") }}</option>
-              </select>
-            </div>
-            <div class="custom-form-row">
-              <label class="custom-form-label">
-                {{ t("settings.custom.apiKey") }}
-                <span class="custom-form-hint">{{ t("settings.custom.apiKeyOptional") }}</span>
-              </label>
-              <input
-                v-model="editingEndpoint.apiKey"
-                class="key-input"
-                type="password"
-                :placeholder="t('settings.custom.apiKeyPlaceholder')"
-                @keydown="handleEndpointKeydown"
-              />
-            </div>
-            <div class="custom-form-row">
-              <label class="custom-form-label">
-                {{ t("settings.custom.contextLength") }}
-                <span class="custom-form-hint">{{ t("settings.custom.contextLengthHint") }}</span>
-              </label>
-              <input
-                v-model.number="editingEndpoint.contextLength"
-                class="key-input"
-                type="number"
-                min="1024"
-                step="1024"
-                placeholder="128000"
-                @keydown="handleEndpointKeydown"
-              />
-            </div>
-            <div class="custom-form-row">
-              <label class="custom-form-label">
-                {{ t("settings.custom.reasoningFormat") }}
-              </label>
-              <select v-model="editingEndpoint.reasoningParamFormat" class="model-select">
-                <option
-                  v-for="option in customReasoningFormatOptions"
-                  :key="option.value"
-                  :value="option.value"
-                >
-                  {{ option.label }}
-                </option>
-              </select>
-            </div>
-            <div v-if="editingEndpoint.reasoningParamFormat !== 'none'" class="custom-form-row">
-              <label class="custom-form-label">
-                {{ t("settings.custom.reasoningEfforts") }}
-                <span class="custom-form-hint">{{ t("settings.custom.reasoningEffortsHint") }}</span>
-              </label>
-              <div class="beta-flags-list">
-                <label
-                  v-for="option in customReasoningEffortOptions"
-                  :key="option.value"
-                  class="beta-flag-item"
-                >
-                  <input
-                    type="checkbox"
-                    :checked="editingEndpoint.supportedReasoningEfforts?.includes(option.value)"
-                    @change="toggleReasoningEffort(editingEndpoint, option.value)"
-                  />
-                  <span class="beta-flag-name">{{ option.label }}</span>
-                </label>
-              </div>
-            </div>
-            <div v-if="editingEndpoint.apiFormat === 'anthropic_messages'" class="custom-form-row">
-              <label class="custom-form-label">
-                {{ t("settings.custom.betaFlags") }}
-                <span class="custom-form-hint">{{ t("settings.custom.betaFlagsHint") }}</span>
-              </label>
-              <div class="beta-flags-list">
-                <label class="beta-flag-item">
-                  <input
-                    type="checkbox"
-                    :checked="editingEndpoint.betaFlags?.includes('context-1m-2025-08-07')"
-                    @change="toggleBetaFlag(editingEndpoint, 'context-1m-2025-08-07')"
-                  />
-                  <span class="beta-flag-name">context-1m-2025-08-07</span>
-                  <span class="beta-flag-desc">{{ t("settings.custom.betaContext1m") }}</span>
-                </label>
-                <label class="beta-flag-item">
-                  <input
-                    type="checkbox"
-                    :checked="editingEndpoint.betaFlags?.includes('interleaved-thinking-2025-05-14')"
-                    @change="toggleBetaFlag(editingEndpoint, 'interleaved-thinking-2025-05-14')"
-                  />
-                  <span class="beta-flag-name">interleaved-thinking-2025-05-14</span>
-                  <span class="beta-flag-desc">{{ t("settings.custom.betaInterleavedThinking") }}</span>
-                </label>
-                <label class="beta-flag-item">
-                  <input
-                    type="checkbox"
-                    :checked="editingEndpoint.betaFlags?.includes('prompt-caching-scope-2026-01-05')"
-                    @change="toggleBetaFlag(editingEndpoint, 'prompt-caching-scope-2026-01-05')"
-                  />
-                  <span class="beta-flag-name">prompt-caching-scope-2026-01-05</span>
-                  <span class="beta-flag-desc">{{ t("settings.custom.betaPromptCaching") }}</span>
-                </label>
-              </div>
-            </div>
-            <div v-if="testStatus !== 'idle'" class="test-result" :class="testStatus">
-              <span v-if="testStatus === 'testing'" class="codex-spinner" style="width:10px;height:10px;"></span>
-              <span v-if="testStatus === 'testing'">{{ t("settings.custom.testing") }}</span>
-              <span v-else-if="testStatus === 'success'" class="test-ok">{{ t("settings.custom.testOk") }}</span>
-              <span v-else-if="testStatus === 'error'" class="test-err">{{ t("settings.custom.testFail") }}</span>
-              <span v-if="testResult && !testResult.includes('[OPEN_HTML:')" class="test-detail">{{ testResult }}</span>
-              <span v-else-if="testResult && testResult.includes('[OPEN_HTML:')" class="test-detail">
-                {{ testResult.replace(/\s*\[OPEN_HTML:.*\]/, '') }}
-                <a
-                  href="#"
-                  @click.prevent="openTestHtml(testResult)"
-                  style="margin-left:4px;color:var(--accent);text-decoration:underline;cursor:pointer;"
-                >{{ t("settings.custom.openInBrowser") }}</a>
-              </span>
-            </div>
-          </div>
-          <div class="modal-footer">
-            <button class="save-btn" @click="saveEndpoint">{{ t("settings.custom.save") }}</button>
-            <button class="test-btn" @click="testEndpoint" :disabled="testStatus === 'testing'">
-              {{ testStatus === 'testing' ? '...' : t("settings.custom.test") }}
-            </button>
-            <button class="cancel-btn" @click="cancelEditEndpoint">{{ t("settings.custom.cancel") }}</button>
-          </div>
-        </div>
-      </div>
-    </Transition>
+    <CustomEndpointModal
+      v-model:endpoint="editingEndpoint"
+      :is-adding="isAddingEndpoint"
+      :test-status="testStatus"
+      :test-result="testResult"
+      @close="cancelEditEndpoint"
+      @save="saveEndpoint"
+      @test="testEndpoint"
+    />
 
     <SubscriptionDisclaimerModal
       :open="showDisclaimer"
