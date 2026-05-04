@@ -115,15 +115,39 @@ function shouldCapture(meta) {
   );
 }
 
+const REDACTED_HEADER_VALUE = "<redacted>";
+
+function shouldRedactHeader(key) {
+  const normalized = String(key || "").toLowerCase();
+  return (
+    normalized === "authorization" ||
+    normalized === "proxy-authorization" ||
+    normalized === "x-api-key" ||
+    normalized === "api-key" ||
+    normalized === "apikey" ||
+    normalized === "cookie" ||
+    normalized === "set-cookie" ||
+    normalized.startsWith("anthropic-") ||
+    normalized.includes("token") ||
+    normalized.includes("secret") ||
+    normalized.includes("credential") ||
+    normalized.includes("password")
+  );
+}
+
+function formatHeaderValue(key, value) {
+  return shouldRedactHeader(key) ? REDACTED_HEADER_VALUE : value;
+}
+
 function formatHeaders(headers) {
   const lines = [];
   for (const [key, value] of Object.entries(headers || {})) {
     if (Array.isArray(value)) {
       for (const item of value) {
-        lines.push(`${key}: ${item}`);
+        lines.push(`${key}: ${formatHeaderValue(key, item)}`);
       }
     } else {
-      lines.push(`${key}: ${value}`);
+      lines.push(`${key}: ${formatHeaderValue(key, value)}`);
     }
   }
   return lines.join("\r\n");
