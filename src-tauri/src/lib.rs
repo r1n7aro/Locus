@@ -27,6 +27,7 @@ mod llm;
 pub(crate) mod merge;
 pub mod process_util;
 pub mod prompt;
+pub mod python_runtime;
 mod session;
 mod tool;
 pub mod unity_bridge;
@@ -179,6 +180,9 @@ pub fn run() {
             }
             let data_dir = commands::prepare_runtime_storage_dir(&app.handle().clone())
                 .map_err(|e| format!("Failed to prepare app storage dir: {}", e))?;
+            if let Ok(resource_dir) = app.path().resource_dir() {
+                process_util::set_managed_git_resource_dir(resource_dir);
+            }
             commands::restore_saved_git_override(&app.handle().clone());
 
             println!("[Locus] data_dir: {:?}", data_dir);
@@ -695,6 +699,8 @@ pub fn run() {
             commands::git_history_search,
             commands::git_commit_body,
             commands::git_probe,
+            commands::git_runtime_state,
+            commands::git_save_runtime_selection,
             commands::git_head_hash,
             commands::git_install_help,
             commands::git_install_via,
@@ -837,6 +843,8 @@ pub fn run() {
             commands::save_plan_artifact,
             commands::get_system_fonts,
             commands::get_system_locale,
+            commands::get_python_runtime_state,
+            commands::save_python_runtime_selection,
             commands::send_system_notification,
             commands::get_config_registry,
             commands::get_log_entries,

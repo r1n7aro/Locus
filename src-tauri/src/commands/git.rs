@@ -15,8 +15,9 @@ use crate::llm::anthropic_agent_sdk::{
     self, ClaudeCodeSdkOptions, ClaudeSdkAssistantMessage, ClaudeSdkHost, ClaudeSdkHostFuture,
 };
 use crate::process_util::{
-    async_command, augment_path_with_git, command, git_env_override, git_is_in_path, git_version,
-    normalize_git_path, program_in_path, resolve_git,
+    async_command, augment_path_with_git, command, discover_git_runtimes, git_env_override,
+    git_is_in_path, git_runtime_key, git_version, normalize_git_path, probe_git_runtime,
+    program_in_path, refresh_git_resolution, GitDiscoverySource, GitRuntimeCandidate,
 };
 use crate::session::models::{ChatMessage, MessageRole};
 use crate::tool::ToolResult;
@@ -1402,6 +1403,27 @@ pub struct GitProbeResult {
     pub is_repo: bool,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitRuntimeInfo {
+    pub id: String,
+    pub label: String,
+    pub path: String,
+    pub version: Option<String>,
+    pub source: String,
+    pub selected: bool,
+    pub available: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitRuntimeState {
+    pub runtimes: Vec<GitRuntimeInfo>,
+    pub selected_id: Option<String>,
+    pub effective: Option<GitRuntimeInfo>,
+    pub missing_selected: bool,
+}
+
 const GIT_OVERRIDE_FILE: &str = "git_path_override.txt";
 
 fn git_override_path(app_handle: &AppHandle) -> Result<std::path::PathBuf, AppError> {
@@ -1412,26 +1434,176 @@ fn git_override_path(app_handle: &AppHandle) -> Result<std::path::PathBuf, AppEr
     Ok(data_dir.join(GIT_OVERRIDE_FILE))
 }
 
-pub fn restore_saved_git_override(app_handle: &AppHandle) {
+fn read_saved_git_override(app_handle: &AppHandle) -> Option<String> {
     let Ok(path) = git_override_path(app_handle) else {
-        return;
+        return None;
     };
 
-    let Some(saved) = std::fs::read_to_string(path)
+    std::fs::read_to_string(path)
         .ok()
         .map(|s| s.trim().trim_matches('"').to_string())
         .filter(|s| !s.is_empty())
-    else {
+}
+
+pub fn restore_saved_git_override(app_handle: &AppHandle) {
+    let Some(saved) = read_saved_git_override(app_handle) else {
         return;
     };
 
     std::env::set_var("LOCUS_GIT_PATH", saved);
+    let _ = refresh_git_resolution();
+}
+
+fn git_runtime_id_for_path(path: &Path) -> String {
+    format!("git:{}", git_runtime_key(path))
+}
+
+fn git_runtime_label(source: GitDiscoverySource, version: &str) -> String {
+    let source_label = match source {
+        GitDiscoverySource::EnvOverride => "Manual Git",
+        GitDiscoverySource::Managed => "Managed Git",
+        GitDiscoverySource::Path => "PATH Git",
+        GitDiscoverySource::CommonLocation => "System Git",
+    };
+    if version.trim().is_empty() {
+        source_label.to_string()
+    } else {
+        format!("{} {}", source_label, version)
+    }
+}
+
+fn same_runtime_path(left: &Path, right: &Path) -> bool {
+    git_runtime_id_for_path(left) == git_runtime_id_for_path(right)
+}
+
+fn git_runtime_info(candidate: GitRuntimeCandidate) -> GitRuntimeInfo {
+    let id = git_runtime_id_for_path(&candidate.path);
+    let version = candidate.version.trim().to_string();
+    GitRuntimeInfo {
+        id,
+        label: git_runtime_label(candidate.source, &version),
+        path: candidate.path.display().to_string(),
+        version: if version.is_empty() {
+            None
+        } else {
+            Some(version)
+        },
+        source: candidate.source.as_str().to_string(),
+        selected: false,
+        available: true,
+    }
+}
+
+fn selected_git_path(app_handle: &AppHandle) -> Option<PathBuf> {
+    read_saved_git_override(app_handle)
+        .or_else(git_env_override)
+        .map(PathBuf::from)
+}
+
+fn git_runtime_state_sync(app_handle: &AppHandle) -> Result<GitRuntimeState, AppError> {
+    let selected_path = selected_git_path(app_handle);
+    let mut candidates = discover_git_runtimes(false);
+
+    if let Some(path) = selected_path.as_ref() {
+        let already_listed = candidates
+            .iter()
+            .any(|candidate| same_runtime_path(&candidate.path, path));
+        if !already_listed {
+            if let Some(candidate) =
+                probe_git_runtime(path.clone(), GitDiscoverySource::EnvOverride)
+            {
+                candidates.insert(0, candidate);
+            }
+        }
+    }
+
+    let mut runtimes: Vec<GitRuntimeInfo> = candidates.into_iter().map(git_runtime_info).collect();
+
+    let selected_id = selected_path.as_ref().and_then(|path| {
+        runtimes
+            .iter()
+            .find(|runtime| same_runtime_path(Path::new(&runtime.path), path))
+            .map(|runtime| runtime.id.clone())
+    });
+    let missing_selected = selected_path.is_some() && selected_id.is_none();
+    let effective_id = selected_id.clone().or_else(|| {
+        runtimes
+            .iter()
+            .find(|runtime| runtime.available)
+            .map(|runtime| runtime.id.clone())
+    });
+
+    for runtime in &mut runtimes {
+        runtime.selected = effective_id
+            .as_deref()
+            .map(|id| runtime.id == id)
+            .unwrap_or(false);
+    }
+
+    let effective = effective_id
+        .as_deref()
+        .and_then(|id| runtimes.iter().find(|runtime| runtime.id == id))
+        .cloned();
+
+    Ok(GitRuntimeState {
+        runtimes,
+        selected_id: effective_id,
+        effective,
+        missing_selected,
+    })
+}
+
+#[tauri::command]
+pub async fn git_runtime_state(app_handle: AppHandle) -> Result<GitRuntimeState, AppError> {
+    tauri::async_runtime::spawn_blocking(move || git_runtime_state_sync(&app_handle))
+        .await
+        .map_err(|e| {
+            AppError::new(
+                "git_runtime.join_failed",
+                format!("Failed to load Git runtime state: {}", e),
+            )
+        })?
+}
+
+#[tauri::command]
+pub async fn git_save_runtime_selection(
+    selected_id: String,
+    app_handle: AppHandle,
+) -> Result<GitRuntimeState, AppError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = git_runtime_state_sync(&app_handle)?;
+        let Some(selected) = state
+            .runtimes
+            .iter()
+            .find(|runtime| runtime.id == selected_id && runtime.available)
+        else {
+            return Err(AppError::new(
+                "git_runtime.unavailable",
+                "Selected Git runtime is unavailable.",
+            ));
+        };
+
+        let override_path = git_override_path(&app_handle)?;
+        std::fs::write(&override_path, &selected.path)
+            .map_err(|e| format!("Failed to save Git runtime selection: {}", e))?;
+        std::env::set_var("LOCUS_GIT_PATH", &selected.path);
+        let _ = refresh_git_resolution();
+
+        git_runtime_state_sync(&app_handle)
+    })
+    .await
+    .map_err(|e| {
+        AppError::new(
+            "git_runtime.join_failed",
+            format!("Failed to save Git runtime selection: {}", e),
+        )
+    })?
 }
 
 #[tauri::command]
 pub async fn git_probe(workspace: State<'_, Arc<Workspace>>) -> Result<GitProbeResult, AppError> {
     let cwd = workspace.path.read().await.clone();
-    let resolved = resolve_git();
+    let resolved = refresh_git_resolution();
     let available = resolved.is_some();
     let is_repo = if available && !cwd.is_empty() {
         command("git")
@@ -1604,6 +1776,8 @@ pub async fn git_install_via(manager: String) -> Result<RunCommandResult, AppErr
         .await
         .map_err(|e| format!("Failed to install Git with {}: {}", manager, e))?;
 
+    let _ = refresh_git_resolution();
+
     Ok(RunCommandResult {
         stdout: String::from_utf8_lossy(&output.stdout).to_string(),
         stderr: String::from_utf8_lossy(&output.stderr).to_string(),
@@ -1633,6 +1807,7 @@ pub async fn git_set_override(path: String, app_handle: AppHandle) -> Result<Str
     std::fs::write(&override_path, &normalized)
         .map_err(|e| format!("Failed to save Git override: {}", e))?;
     std::env::set_var("LOCUS_GIT_PATH", &normalized);
+    let _ = refresh_git_resolution();
     Ok(normalized)
 }
 
@@ -1644,6 +1819,7 @@ pub async fn git_clear_override(app_handle: AppHandle) -> Result<(), AppError> {
             .map_err(|e| format!("Failed to clear Git override: {}", e))?;
     }
     std::env::remove_var("LOCUS_GIT_PATH");
+    let _ = refresh_git_resolution();
     Ok(())
 }
 
@@ -2205,6 +2381,10 @@ fn current_branch_name(cwd: &str) -> Option<String> {
 }
 
 fn detect_merge_operation(cwd: &str, has_unmerged: bool) -> Option<MergeOperation> {
+    if !has_unmerged && crate::vcs::git_merge::has_stash_apply_abort_state(cwd) {
+        crate::vcs::git_merge::clear_stash_apply_abort_state(cwd);
+    }
+
     let git = match git_dir(cwd) {
         Some(d) => d,
         None => return None,
@@ -2282,6 +2462,8 @@ fn detect_merge_operation(cwd: &str, has_unmerged: bool) -> Option<MergeOperatio
         } else {
             (MergeOperationKind::Rebase, format!("Rebasing {}", onto))
         }
+    } else if has_unmerged && crate::vcs::git_merge::has_stash_apply_abort_state(cwd) {
+        (MergeOperationKind::GenericConflict, "Applying stash".into())
     } else if has_unmerged {
         (MergeOperationKind::GenericConflict, "Conflict".into())
     } else {
@@ -5037,7 +5219,7 @@ pub async fn git_merge_action(
             "No working directory set",
         ));
     }
-    crate::vcs::git_merge::execute_merge_action(&cwd, action, &operation_kind)
+    crate::vcs::git_merge::execute_merge_action(&cwd, action, &operation_kind).await
 }
 
 // ── Merge semantic commands ──
@@ -5933,8 +6115,30 @@ pub async fn git_stash_action(
     }
 
     match action.as_str() {
-        "apply" => run_git_action(&cwd, &["stash", "apply", &ref_name], "已应用 Stash"),
-        "pop" => run_git_action(&cwd, &["stash", "pop", &ref_name], "已应用并移除 Stash"),
+        "apply" | "pop" => {
+            let label = if action == "apply" {
+                "已应用 Stash"
+            } else {
+                "已应用并移除 Stash"
+            };
+            crate::vcs::git_merge::prepare_stash_apply_abort_state(
+                &cwd,
+                &format!("stash {} {}", action, ref_name),
+            )
+            .await?;
+
+            let args = if action == "apply" {
+                ["stash", "apply", ref_name.as_str()]
+            } else {
+                ["stash", "pop", ref_name.as_str()]
+            };
+            let result = run_git_action(&cwd, &args, label);
+            match &result {
+                Ok(action_result) if action_result.status == "conflict" => {}
+                _ => crate::vcs::git_merge::clear_stash_apply_abort_state(&cwd),
+            }
+            result
+        }
         "drop" => run_git_action(
             &cwd,
             &["stash", "drop", &ref_name],

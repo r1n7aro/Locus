@@ -23,6 +23,10 @@ site/
 .venv/
 .venv-docs/
 docs/.home.html
+src-tauri/gen/managed-python/windows-*/
+src-tauri/gen/managed-python/manifest.json
+src-tauri/gen/managed-git/windows-*/
+src-tauri/gen/managed-git/manifest.json
 
 # Editor directories and files
 .vscode/

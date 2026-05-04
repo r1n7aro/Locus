@@ -1,5 +1,5 @@
 {
-  "description": "Execute a shell command and return its output (stdout + stderr combined).\n- You MUST set workdir explicitly; never rely on the current process directory\n- Commands time out after 120s by default\n- Common uses: run EditMode tests, show git status, find asmdef references\n- Use the description field to briefly describe what the command does",
+  "description": "Execute a shell command and return its output (stdout + stderr combined).\n- You MUST set workdir explicitly; never rely on the current process directory\n- Commands time out after 120s by default\n- Common uses: run EditMode tests, show git status, find asmdef references\n- When commands call python or python3, they use the Python runtime selected in Settings > General\n- Use the description field to briefly describe what the command does",
   "parameters": {
     "type": "object",
     "properties": {

@@ -1,7 +1,14 @@
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 
 use crate::error::{AppError, AppResult};
 use crate::process_util::command;
+use crate::vcs::undo::ChangedFile;
+use crate::vcs::{Checkpoint, GitProvider, VcsProvider};
+
+const STASH_APPLY_ABORT_REF: &str = "refs/locus/stash-apply-abort";
+const STASH_APPLY_ABORT_STATE: &str = "locus/stash-apply-abort.json";
 
 // ── Types ──
 
@@ -65,6 +72,12 @@ pub enum MergeActionKind {
     Continue,
     Skip,
     Abort,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StashApplyAbortState {
+    checkpoint: Checkpoint,
 }
 
 // ── Conflict block parsing ──
@@ -577,6 +590,165 @@ pub fn apply_merge_resolution(cwd: &str, path: &str, mode: MergeApplyMode) -> Ap
 
 // ── Execute merge action (continue / skip / abort) ──
 
+fn stash_apply_abort_state_path(cwd: &str) -> Option<PathBuf> {
+    let git = crate::commands::git_dir(cwd)?;
+    Some(std::path::Path::new(&git).join(STASH_APPLY_ABORT_STATE))
+}
+
+fn load_stash_apply_abort_state(cwd: &str) -> Option<StashApplyAbortState> {
+    let path = stash_apply_abort_state_path(cwd)?;
+    let content = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str::<StashApplyAbortState>(&content).ok()
+}
+
+pub fn has_stash_apply_abort_state(cwd: &str) -> bool {
+    load_stash_apply_abort_state(cwd).is_some()
+}
+
+pub fn clear_stash_apply_abort_state(cwd: &str) {
+    if let Some(path) = stash_apply_abort_state_path(cwd) {
+        let _ = std::fs::remove_file(path);
+    }
+    let _ = run_git(
+        cwd,
+        &["update-ref", "-d", STASH_APPLY_ABORT_REF],
+        "clear stash abort ref",
+    );
+}
+
+pub async fn prepare_stash_apply_abort_state(
+    cwd: &str,
+    label: &str,
+) -> AppResult<Option<Checkpoint>> {
+    clear_stash_apply_abort_state(cwd);
+
+    let provider = GitProvider;
+    let checkpoint = provider
+        .checkpoint(cwd, label)
+        .await
+        .map_err(|e| AppError::new("merge.stash_abort_checkpoint_failed", e))?;
+
+    let Some(checkpoint) = checkpoint else {
+        return Ok(None);
+    };
+
+    run_git(
+        cwd,
+        &["update-ref", STASH_APPLY_ABORT_REF, &checkpoint.id],
+        "record stash abort ref",
+    )?;
+
+    let path = stash_apply_abort_state_path(cwd).ok_or_else(|| {
+        AppError::new(
+            "merge.no_git_dir",
+            "Unable to resolve repository metadata directory",
+        )
+    })?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            AppError::new(
+                "merge.stash_abort_checkpoint_failed",
+                format!("Failed to create stash abort state directory: {}", e),
+            )
+        })?;
+    }
+    let state = StashApplyAbortState {
+        checkpoint: checkpoint.clone(),
+    };
+    let json = serde_json::to_string_pretty(&state).map_err(|e| {
+        AppError::new(
+            "merge.stash_abort_checkpoint_failed",
+            format!("Failed to serialize stash abort state: {}", e),
+        )
+    })?;
+    std::fs::write(&path, json).map_err(|e| {
+        AppError::new(
+            "merge.stash_abort_checkpoint_failed",
+            format!("Failed to write stash abort state: {}", e),
+        )
+    })?;
+
+    Ok(Some(checkpoint))
+}
+
+fn parse_changed_file(line: &str) -> Option<ChangedFile> {
+    let parts: Vec<&str> = line.split('\t').collect();
+    if parts.len() < 2 {
+        return None;
+    }
+
+    let raw_status = parts[0].trim();
+    let status = raw_status
+        .chars()
+        .next()
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| "M".to_string());
+
+    if status == "R" && parts.len() >= 3 {
+        return Some(ChangedFile {
+            status,
+            path: parts[2].to_string(),
+            old_path: Some(parts[1].to_string()),
+        });
+    }
+
+    Some(ChangedFile {
+        status,
+        path: parts[1].to_string(),
+        old_path: None,
+    })
+}
+
+async fn abort_stash_apply_from_checkpoint(cwd: &str) -> AppResult<String> {
+    let state = load_stash_apply_abort_state(cwd).ok_or_else(|| {
+        AppError::new(
+            "merge.stash_abort_checkpoint_missing",
+            "Stash apply abort checkpoint was not found",
+        )
+    })?;
+
+    let changed = GitProvider::diff_files(cwd, &state.checkpoint.id)
+        .await
+        .map_err(|e| AppError::new("merge.stash_abort_failed", e))?;
+    let changed_files: Vec<ChangedFile> = changed
+        .iter()
+        .filter_map(|line| parse_changed_file(line))
+        .collect();
+
+    GitProvider::restore_files(
+        cwd,
+        &state.checkpoint.id,
+        state.checkpoint.index_tree_id.as_deref(),
+        &changed_files,
+    )
+    .await
+    .map_err(|e| AppError::new("merge.stash_abort_failed", e))?;
+
+    clear_stash_apply_abort_state(cwd);
+    Ok(format!(
+        "Aborted stash apply and restored {} changed path(s)",
+        changed_files.len()
+    ))
+}
+
+fn has_unmerged_entries(cwd: &str) -> bool {
+    let output = command("git")
+        .args(["ls-files", "-u"])
+        .current_dir(cwd)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output();
+    let output = match output {
+        Ok(output) if output.status.success() => output,
+        _ => return false,
+    };
+    !String::from_utf8_lossy(&output.stdout).trim().is_empty()
+}
+
+fn abort_generic_conflict(cwd: &str) -> AppResult<String> {
+    run_git(cwd, &["reset", "--merge"], "reset --merge")
+}
+
 /// Detect the current operation kind by checking sentinel files in .git dir.
 /// This is independent of what the frontend claims — backend is authoritative.
 fn detect_operation_kind(cwd: &str) -> Option<String> {
@@ -596,18 +768,29 @@ fn detect_operation_kind(cwd: &str) -> Option<String> {
     }
 }
 
-pub fn execute_merge_action(
+pub async fn execute_merge_action(
     cwd: &str,
     action: MergeActionKind,
     _frontend_operation_kind: &str, // kept for logging but not trusted
 ) -> AppResult<String> {
     // Backend detects the actual operation kind
-    let op_kind = detect_operation_kind(cwd).ok_or_else(|| {
-        AppError::new(
-            "merge.no_operation",
-            "No merge, rebase, cherry-pick, or revert operation is in progress",
-        )
-    })?;
+    let op_kind = match detect_operation_kind(cwd) {
+        Some(kind) => kind,
+        None => {
+            if matches!(action, MergeActionKind::Abort) {
+                if has_stash_apply_abort_state(cwd) {
+                    return abort_stash_apply_from_checkpoint(cwd).await;
+                }
+                if has_unmerged_entries(cwd) {
+                    return abort_generic_conflict(cwd);
+                }
+            }
+            return Err(AppError::new(
+                "merge.no_operation",
+                "No merge, rebase, cherry-pick, revert, or stash apply operation is in progress",
+            ));
+        }
+    };
 
     // Use --no-edit to accept default merge messages without opening an editor.
     // This is portable (works on Windows where `true` is not in PATH).
@@ -687,4 +870,163 @@ fn run_git(cwd: &str, args: &[&str], label: &str) -> AppResult<String> {
 fn run_git_add(cwd: &str, path: &str) -> AppResult<()> {
     run_git(cwd, &["add", "--", path], "add")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::*;
+    use tempfile::tempdir;
+
+    fn git_available() -> bool {
+        command("git")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    }
+
+    fn git(cwd: &Path, args: &[&str]) -> String {
+        let output = command("git")
+            .args(args)
+            .current_dir(cwd)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .expect("git command should run");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn git_may_fail(cwd: &Path, args: &[&str]) -> std::process::Output {
+        command("git")
+            .args(args)
+            .current_dir(cwd)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .expect("git command should run")
+    }
+
+    fn write_file(path: &Path, content: &str) {
+        std::fs::write(path, content).expect("write file");
+    }
+
+    fn setup_repo() -> tempfile::TempDir {
+        let repo = tempdir().expect("temp dir");
+        git(repo.path(), &["init"]);
+        git(repo.path(), &["config", "user.name", "Test User"]);
+        git(repo.path(), &["config", "user.email", "test@example.com"]);
+        git(repo.path(), &["config", "commit.gpgsign", "false"]);
+        git(repo.path(), &["config", "tag.gpgsign", "false"]);
+        git(repo.path(), &["config", "core.autocrlf", "false"]);
+
+        write_file(&repo.path().join("a.txt"), "base\n");
+        write_file(&repo.path().join("b.txt"), "base b\n");
+        write_file(&repo.path().join("c.txt"), "base c\n");
+        git(repo.path(), &["add", "a.txt", "b.txt", "c.txt"]);
+        git(repo.path(), &["commit", "-m", "init"]);
+        repo
+    }
+
+    fn create_conflicting_stash(repo: &Path) {
+        write_file(&repo.join("a.txt"), "stash\n");
+        write_file(&repo.join("c.txt"), "stash c\n");
+        git(repo, &["stash", "push", "-m", "stash changes"]);
+
+        write_file(&repo.join("a.txt"), "current\n");
+        git(repo, &["add", "a.txt"]);
+        git(repo, &["commit", "-m", "current"]);
+    }
+
+    #[tokio::test]
+    async fn stash_apply_abort_checkpoint_restores_staged_pre_apply_changes() {
+        if !git_available() {
+            return;
+        }
+
+        let repo = setup_repo();
+        create_conflicting_stash(repo.path());
+
+        write_file(&repo.path().join("b.txt"), "staged b\n");
+        git(repo.path(), &["add", "b.txt"]);
+        assert_eq!(git(repo.path(), &["status", "--short"]), "M  b.txt");
+
+        prepare_stash_apply_abort_state(&repo.path().to_string_lossy(), "stash apply stash@{0}")
+            .await
+            .expect("prepare checkpoint");
+
+        let apply = git_may_fail(repo.path(), &["stash", "apply", "stash@{0}"]);
+        assert!(!apply.status.success(), "stash apply should conflict");
+        assert_eq!(
+            git(repo.path(), &["status", "--short"]),
+            "UU a.txt\nM  b.txt\nM  c.txt"
+        );
+
+        execute_merge_action(
+            &repo.path().to_string_lossy(),
+            MergeActionKind::Abort,
+            "genericConflict",
+        )
+        .await
+        .expect("abort stash apply");
+
+        assert_eq!(git(repo.path(), &["status", "--short"]), "M  b.txt");
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("a.txt")).expect("read a"),
+            "current\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("b.txt")).expect("read b"),
+            "staged b\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("c.txt")).expect("read c"),
+            "base c\n"
+        );
+        assert!(!has_stash_apply_abort_state(&repo.path().to_string_lossy()));
+    }
+
+    #[tokio::test]
+    async fn generic_conflict_abort_falls_back_to_reset_merge_without_checkpoint() {
+        if !git_available() {
+            return;
+        }
+
+        let repo = setup_repo();
+        create_conflicting_stash(repo.path());
+
+        let apply = git_may_fail(repo.path(), &["stash", "apply", "stash@{0}"]);
+        assert!(!apply.status.success(), "stash apply should conflict");
+        assert_eq!(
+            git(repo.path(), &["status", "--short"]),
+            "UU a.txt\nM  c.txt"
+        );
+
+        execute_merge_action(
+            &repo.path().to_string_lossy(),
+            MergeActionKind::Abort,
+            "genericConflict",
+        )
+        .await
+        .expect("abort generic conflict");
+
+        assert_eq!(git(repo.path(), &["status", "--short"]), "");
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("a.txt")).expect("read a"),
+            "current\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("c.txt")).expect("read c"),
+            "base c\n"
+        );
+    }
 }

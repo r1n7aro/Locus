@@ -1552,6 +1552,7 @@ pub async fn reset_all_config(
             "model_defaults.json",
             "custom_endpoints.json",
             "codex_model_config.json",
+            crate::python_runtime::config_file_name(),
         ] {
             let path = pdir.join(file);
             if path.exists() {

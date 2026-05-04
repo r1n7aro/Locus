@@ -2,16 +2,25 @@
 import { computed, onMounted, ref } from "vue";
 import { t } from "../../i18n";
 import type { Locale } from "../../i18n";
+import BaseDropdown from "../ui/BaseDropdown.vue";
 import BaseSegmented from "../ui/BaseSegmented.vue";
 import BaseSwitch from "../ui/BaseSwitch.vue";
 import { getCachedDebugMode, getDebugMode, setDebugMode } from "../../services/permissions";
+import { gitRuntimeState, gitSaveRuntimeSelection } from "../../services/git";
+import { getPythonRuntimeState, savePythonRuntimeSelection } from "../../services/system";
 import {
   clearAppStorageMigration,
   getAppStorageInfo,
   openAppStorageDirectory,
   scheduleAppStorageMigration,
 } from "../../services/storage";
-import type { AppStorageInfo } from "../../types";
+import type {
+  AppStorageInfo,
+  GitRuntimeInfo,
+  GitRuntimeState,
+  PythonRuntimeInfo,
+  PythonRuntimeState,
+} from "../../types";
 import { confirm, open } from "@tauri-apps/plugin-dialog";
 import { normalizeAppError } from "../../services/errors";
 import { useNotificationStore } from "../../stores/notification";
@@ -37,6 +46,12 @@ const storageInfo = ref<AppStorageInfo | null>(null);
 const storageBusy = ref(false);
 const storageInfoLoadFailed = ref(false);
 const storageSuccess = ref("");
+const gitState = ref<GitRuntimeState | null>(null);
+const gitBusy = ref(false);
+const pythonState = ref<PythonRuntimeState | null>(null);
+const pythonBusy = ref(false);
+let gitLoadToken = 0;
+let pythonLoadToken = 0;
 
 const languageOptions = [
   { value: "zh", label: "中文" },
@@ -50,7 +65,53 @@ const debugStatusLabel = computed(() => {
     : t("settings.general.debugModeOff");
 });
 
-onMounted(async () => {
+const pythonOptions = computed(() =>
+  (pythonState.value?.runtimes ?? []).map((runtime) => ({
+    value: runtime.id,
+    label: pythonRuntimeLabel(runtime),
+    hint: runtime.available
+      ? pythonRuntimeHint(runtime)
+      : t("settings.general.pythonUnavailable"),
+    disabled: !runtime.available,
+  })),
+);
+
+const selectedPythonId = computed(() => pythonState.value?.selectedId ?? "");
+const selectedPythonLabel = computed(() => {
+  const runtime = pythonState.value?.effective;
+  if (!runtime) return pythonBusy.value ? t("common.loading") : t("settings.general.pythonNone");
+  return pythonRuntimeLabel(runtime);
+});
+
+const effectivePythonPath = computed(() => pythonState.value?.effective?.path ?? "");
+const hasAvailablePythonOption = computed(() => pythonOptions.value.some((option) => !option.disabled));
+const gitOptions = computed(() =>
+  (gitState.value?.runtimes ?? []).map((runtime) => ({
+    value: runtime.id,
+    label: gitRuntimeDisplayLabel(runtime),
+    hint: runtime.available
+      ? gitRuntimeHint(runtime)
+      : t("settings.general.gitUnavailable"),
+    disabled: !runtime.available,
+  })),
+);
+const selectedGitId = computed(() => gitState.value?.selectedId ?? "");
+const gitRuntimeLabel = computed(() => {
+  const runtime = gitState.value?.effective;
+  if (!runtime) return gitBusy.value ? t("common.loading") : t("settings.general.gitNone");
+  return gitRuntimeDisplayLabel(runtime);
+});
+const gitRuntimePath = computed(() => gitState.value?.effective?.path ?? "");
+const hasAvailableGitOption = computed(() => gitOptions.value.some((option) => !option.disabled));
+
+onMounted(() => {
+  void refreshDebugMode();
+  void refreshStorageInfo();
+  void refreshGitRuntimeState();
+  void refreshPythonRuntimeState();
+});
+
+async function refreshDebugMode() {
   try {
     debugEnabled.value = await getDebugMode();
     debugReady.value = true;
@@ -62,8 +123,7 @@ onMounted(async () => {
     });
     debugReady.value = true;
   }
-  await refreshStorageInfo();
-});
+}
 
 async function toggleDebug() {
   if (!debugReady.value || debugBusy.value) return;
@@ -214,6 +274,133 @@ async function cancelStorageMigration() {
     storageBusy.value = false;
   }
 }
+
+function gitSourceLabel(source: GitRuntimeInfo["source"]): string {
+  switch (source) {
+    case "envOverride":
+      return t("settings.general.gitManual");
+    case "managed":
+      return t("settings.general.gitManaged");
+    case "path":
+      return t("settings.general.gitPath");
+    case "commonLocation":
+      return t("settings.general.gitSystem");
+    default:
+      return t("settings.general.gitSystem");
+  }
+}
+
+async function refreshGitRuntimeState() {
+  const token = ++gitLoadToken;
+  gitBusy.value = true;
+  try {
+    const nextState = await gitRuntimeState();
+    if (token === gitLoadToken) {
+      gitState.value = nextState;
+    }
+  } catch (e) {
+    if (token !== gitLoadToken) return;
+    const err = normalizeAppError(e);
+    notificationStore.addNotice("error", err.message, {
+      code: err.code,
+      operation: "loadGitRuntime",
+    });
+  } finally {
+    if (token === gitLoadToken) {
+      gitBusy.value = false;
+    }
+  }
+}
+
+function gitRuntimeDisplayLabel(runtime: GitRuntimeInfo): string {
+  const source = gitSourceLabel(runtime.source);
+  return runtime.version ? `${source} ${runtime.version}` : source;
+}
+
+function gitRuntimeHint(runtime: GitRuntimeInfo): string {
+  return runtime.path;
+}
+
+async function selectGitRuntime(selectedId: string) {
+  if (gitBusy.value || !selectedId) return;
+  const token = ++gitLoadToken;
+  gitBusy.value = true;
+  try {
+    const nextState = await gitSaveRuntimeSelection(selectedId);
+    if (token === gitLoadToken) {
+      gitState.value = nextState;
+    }
+  } catch (e) {
+    if (token !== gitLoadToken) return;
+    const err = normalizeAppError(e);
+    notificationStore.addNotice("error", err.message, {
+      code: err.code,
+      operation: "saveGitRuntime",
+    });
+    await refreshGitRuntimeState();
+  } finally {
+    if (token === gitLoadToken) {
+      gitBusy.value = false;
+    }
+  }
+}
+
+function pythonRuntimeLabel(runtime: PythonRuntimeInfo): string {
+  const source = runtime.source === "managed"
+    ? t("settings.general.pythonManaged")
+    : t("settings.general.pythonSystem");
+  return runtime.version ? `${source} ${runtime.version}` : source;
+}
+
+function pythonRuntimeHint(runtime: PythonRuntimeInfo): string {
+  return runtime.path;
+}
+
+async function refreshPythonRuntimeState() {
+  const token = ++pythonLoadToken;
+  pythonBusy.value = true;
+  try {
+    const nextState = await getPythonRuntimeState();
+    if (token === pythonLoadToken) {
+      pythonState.value = nextState;
+    }
+  } catch (e) {
+    if (token !== pythonLoadToken) return;
+    const err = normalizeAppError(e);
+    notificationStore.addNotice("error", err.message, {
+      code: err.code,
+      operation: "loadPythonRuntime",
+    });
+  } finally {
+    if (token === pythonLoadToken) {
+      pythonBusy.value = false;
+    }
+  }
+}
+
+async function selectPythonRuntime(selectedId: string) {
+  if (pythonBusy.value || !selectedId) return;
+  const token = ++pythonLoadToken;
+  pythonBusy.value = true;
+  try {
+    const nextState = await savePythonRuntimeSelection(selectedId);
+    if (token === pythonLoadToken) {
+      pythonState.value = nextState;
+    }
+  } catch (e) {
+    if (token !== pythonLoadToken) return;
+    const err = normalizeAppError(e);
+    notificationStore.addNotice("error", err.message, {
+      code: err.code,
+      operation: "savePythonRuntime",
+    });
+    await refreshPythonRuntimeState();
+  } finally {
+    if (token === pythonLoadToken) {
+      pythonBusy.value = false;
+    }
+  }
+}
 </script>
 
 <template>
@@ -302,6 +489,78 @@ async function cancelStorageMigration() {
       </div>
     </div>
     <div v-if="storageSuccess" class="storage-success">{{ storageSuccess }}</div>
+  </div>
+
+  <div class="settings-section">
+    <div class="section-label">{{ t("settings.general.gitRuntime") }}</div>
+    <p class="section-desc">{{ t("settings.general.gitRuntimeDesc") }}</p>
+    <div class="runtime-block">
+      <div class="runtime-row">
+        <span class="runtime-label">{{ t("settings.general.gitSelected") }}</span>
+        <BaseDropdown
+          class="runtime-dropdown"
+          :model-value="selectedGitId"
+          :selected-label="gitRuntimeLabel"
+          :options="gitOptions"
+          menu-align="start"
+          :placeholder="t('settings.general.gitNone')"
+          :aria-label="t('settings.general.gitRuntime')"
+          :disabled="gitBusy || !hasAvailableGitOption"
+          @update:model-value="selectGitRuntime"
+        />
+        <button class="action-btn runtime-btn" :disabled="gitBusy" @click="refreshGitRuntimeState">
+          {{ t("common.refresh") }}
+        </button>
+      </div>
+      <div class="runtime-row">
+        <span class="runtime-label">{{ t("settings.general.gitPathLabel") }}</span>
+        <code class="runtime-path" :title="gitRuntimePath">
+          {{ gitRuntimePath || (gitBusy ? t("common.loading") : "—") }}
+        </code>
+      </div>
+      <div v-if="gitState?.missingSelected" class="runtime-hint">
+        {{ t("settings.general.gitMissingSelected") }}
+      </div>
+      <div v-else-if="!gitState?.effective && !gitBusy" class="runtime-hint">
+        {{ t("settings.general.gitNoRuntime") }}
+      </div>
+    </div>
+  </div>
+
+  <div class="settings-section">
+    <div class="section-label">{{ t("settings.general.pythonRuntime") }}</div>
+    <p class="section-desc">{{ t("settings.general.pythonRuntimeDesc") }}</p>
+    <div class="runtime-block">
+      <div class="runtime-row">
+        <span class="runtime-label">{{ t("settings.general.pythonSelected") }}</span>
+        <BaseDropdown
+          class="runtime-dropdown"
+          :model-value="selectedPythonId"
+          :selected-label="selectedPythonLabel"
+          :options="pythonOptions"
+          menu-align="start"
+          :placeholder="t('settings.general.pythonNone')"
+          :aria-label="t('settings.general.pythonRuntime')"
+          :disabled="pythonBusy || !hasAvailablePythonOption"
+          @update:model-value="selectPythonRuntime"
+        />
+        <button class="action-btn python-btn" :disabled="pythonBusy" @click="refreshPythonRuntimeState">
+          {{ t("common.refresh") }}
+        </button>
+      </div>
+      <div class="runtime-row">
+        <span class="runtime-label">{{ t("settings.general.pythonPath") }}</span>
+        <code class="runtime-path" :title="effectivePythonPath">
+          {{ effectivePythonPath || (pythonBusy ? t("common.loading") : "—") }}
+        </code>
+      </div>
+      <div v-if="pythonState?.missingSelected" class="runtime-hint">
+        {{ t("settings.general.pythonMissingSelected") }}
+      </div>
+      <div v-else-if="!pythonState?.effective && !pythonBusy" class="runtime-hint">
+        {{ t("settings.general.pythonNoRuntime") }}
+      </div>
+    </div>
   </div>
 
   <div class="settings-section">
@@ -433,5 +692,56 @@ async function cancelStorageMigration() {
   background: var(--status-good-bg);
   color: var(--status-good-fg);
   font-size: 12px;
+}
+.runtime-block {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-width: 760px;
+  padding: 14px 16px;
+  border: 1px solid var(--border-color);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--panel-bg) 84%, var(--sidebar-bg) 16%);
+}
+.runtime-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+.runtime-label {
+  font-size: 12px;
+  color: var(--text-secondary);
+  min-width: 72px;
+}
+.runtime-dropdown {
+  width: min(420px, 100%);
+}
+.runtime-path {
+  display: inline-block;
+  max-width: min(860px, 100%);
+  padding: 4px 8px;
+  border-radius: 6px;
+  background: var(--input-bg);
+  border: 1px solid var(--border-color);
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-family: var(--font-mono-identifier);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.runtime-btn,
+.python-btn {
+  font-size: 11px;
+}
+.runtime-btn:disabled,
+.python-btn:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+.runtime-hint {
+  font-size: 11px;
+  color: var(--text-secondary);
 }
 </style>

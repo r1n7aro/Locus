@@ -1,0 +1,16 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "build": {
+    "beforeBuildCommand": "bun run build:tauri:without_embed_python_git"
+  },
+  "bundle": {
+    "resources": {
+      "../LICENSE": "licenses/LICENSE",
+      "../THIRD_PARTY_NOTICES": "licenses/THIRD_PARTY_NOTICES",
+      "./gen/licenses-bundle": "licenses/third_party/",
+      "../agent": "agent/",
+      "../knowledge": "knowledge/",
+      "../locus_unity": "locus_unity/"
+    }
+  }
+}

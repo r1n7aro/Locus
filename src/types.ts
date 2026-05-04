@@ -231,6 +231,44 @@ export interface AppStorageInfo {
   restartRequired: boolean;
 }
 
+export type PythonRuntimeSource = "managed" | "system";
+
+export interface PythonRuntimeInfo {
+  id: string;
+  label: string;
+  path: string;
+  version?: string | null;
+  source: PythonRuntimeSource;
+  selected: boolean;
+  available: boolean;
+}
+
+export interface PythonRuntimeState {
+  runtimes: PythonRuntimeInfo[];
+  selectedId?: string | null;
+  effective?: PythonRuntimeInfo | null;
+  missingSelected: boolean;
+}
+
+export type GitRuntimeSource = "envOverride" | "managed" | "path" | "commonLocation";
+
+export interface GitRuntimeInfo {
+  id: string;
+  label: string;
+  path: string;
+  version?: string | null;
+  source: GitRuntimeSource;
+  selected: boolean;
+  available: boolean;
+}
+
+export interface GitRuntimeState {
+  runtimes: GitRuntimeInfo[];
+  selectedId?: string | null;
+  effective?: GitRuntimeInfo | null;
+  missingSelected: boolean;
+}
+
 export interface AuthUrlInfo {
   url: string;
 }
@@ -1679,7 +1717,7 @@ export interface GitProbeResult {
   available: boolean;
   inPath: boolean;
   path?: string;
-  source?: "envOverride" | "path" | "commonLocation";
+  source?: GitRuntimeSource;
   version?: string;
   envOverride?: string;
   isRepo: boolean;

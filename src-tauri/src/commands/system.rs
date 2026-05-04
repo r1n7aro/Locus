@@ -12,6 +12,41 @@ pub fn get_system_locale() -> Option<String> {
 }
 
 #[tauri::command]
+pub async fn get_python_runtime_state(
+    app_handle: AppHandle,
+) -> Result<crate::python_runtime::PythonRuntimeState, crate::error::AppError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::python_runtime::python_runtime_state(Some(&app_handle))
+    })
+    .await
+    .map_err(|e| {
+        crate::error::AppError::new(
+            "python_runtime.join_failed",
+            format!("Failed to load Python runtime state: {}", e),
+        )
+    })?
+    .map_err(crate::error::AppError::from)
+}
+
+#[tauri::command]
+pub async fn save_python_runtime_selection(
+    selected_id: String,
+    app_handle: AppHandle,
+) -> Result<crate::python_runtime::PythonRuntimeState, crate::error::AppError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::python_runtime::save_python_runtime_selection(&selected_id, Some(&app_handle))
+    })
+    .await
+    .map_err(|e| {
+        crate::error::AppError::new(
+            "python_runtime.join_failed",
+            format!("Failed to save Python runtime selection: {}", e),
+        )
+    })?
+    .map_err(crate::error::AppError::from)
+}
+
+#[tauri::command]
 pub fn send_system_notification(
     app_handle: AppHandle,
     title: String,

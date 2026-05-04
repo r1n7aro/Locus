@@ -159,6 +159,13 @@ onMounted(() => {
           {{ t("git.install.pickDirectory") }}
         </button>
         <button
+          class="git-help-btn secondary"
+          :disabled="overrideBusy || !!installBusy"
+          @click="emit('resolved')"
+        >
+          {{ t("git.install.refresh") }}
+        </button>
+        <button
           v-if="hasOverride"
           class="git-help-btn secondary"
           :disabled="overrideBusy"

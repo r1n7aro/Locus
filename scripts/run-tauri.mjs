@@ -24,6 +24,10 @@ const DEV_WITH_MCP_COMMAND = "dev-mcp";
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(scriptDir, "..");
 const srcTauriDir = path.join(repoRoot, "src-tauri");
+const DEFAULT_RELEASE_FLAVOR_CONFIG = path.relative(
+  repoRoot,
+  path.join(srcTauriDir, "tauri.with_embed_python_git.conf.json"),
+);
 const chromeDevtoolsMcpWrapper = path.join(scriptDir, "chrome-devtools-mcp-wrapper.mjs");
 const TAURI_TOP_LEVEL_COMMANDS = new Set([
   "android",
@@ -47,10 +51,11 @@ const NSIS_UPDATE_LEAVE_MARKER = "; Locus: keep upgrade path on update mode.";
 const NSIS_LOCATION_MARKER = "; Locus: read install locations from historical metadata keys.";
 const NSIS_UNITY_PACKAGE_MARKER = "; Locus: replace bundled Unity package resources.";
 const NSIS_LEGACY_BUILTIN_SKILL_MARKER = "; Locus: remove legacy root-level bundled skill resources.";
+const NSIS_MANAGED_RUNTIME_MARKER = "; Locus: replace optional bundled Python and Git resources.";
 
 const args = process.argv.slice(2);
 const shouldRunDevWithMcp = args[0] === DEV_WITH_MCP_COMMAND;
-const tauriArgs = shouldRunDevWithMcp ? ["dev", ...args.slice(1)] : args;
+let tauriArgs = shouldRunDevWithMcp ? ["dev", ...args.slice(1)] : args;
 const env = { ...process.env };
 
 const isHelpOrVersionCommand =
@@ -60,6 +65,35 @@ const isHelpOrVersionCommand =
   tauriArgs.includes("-V");
 const shouldExposeWebView2DebugPort =
   process.platform === "win32" && shouldRunDevWithMcp && !isHelpOrVersionCommand;
+
+function hasConfigArg(currentArgs) {
+  for (let index = 0; index < currentArgs.length; index += 1) {
+    const arg = currentArgs[index];
+
+    if (arg === "--config" || arg === "-c") {
+      return true;
+    }
+
+    if (arg.startsWith("--config=") || arg.startsWith("-c=")) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function shouldInjectDefaultReleaseFlavor(currentArgs) {
+  if (isHelpOrVersionCommand || hasConfigArg(currentArgs)) {
+    return false;
+  }
+
+  const command = getTauriCommand(currentArgs);
+  return command === "build" || command === "bundle";
+}
+
+if (shouldInjectDefaultReleaseFlavor(tauriArgs)) {
+  tauriArgs = [...tauriArgs, "--config", DEFAULT_RELEASE_FLAVOR_CONFIG];
+}
 
 function canListenOnPort(port) {
   return new Promise((resolve) => {
@@ -353,6 +387,25 @@ function patchNsisLegacyBuiltinSkillCleanup(content) {
   );
 }
 
+function patchNsisManagedRuntimeCleanup(content) {
+  if (content.includes(NSIS_MANAGED_RUNTIME_MARKER)) {
+    return content;
+  }
+
+  return replaceOnce(
+    content,
+    /Section Install\r?\n  SetOutPath \$INSTDIR/,
+    [
+      "Section Install",
+      "  SetOutPath $INSTDIR",
+      `  ${NSIS_MANAGED_RUNTIME_MARKER}`,
+      '  RMDir /r "$INSTDIR\\managed-python"',
+      '  RMDir /r "$INSTDIR\\managed-git"',
+    ],
+    "Unable to find the NSIS install section to patch.",
+  );
+}
+
 function patchNsisInstallerScript(scriptPath) {
   const original = readFileSync(scriptPath, "utf8");
   const productName = readNsisDefine(original, "PRODUCTNAME");
@@ -364,10 +417,12 @@ function patchNsisInstallerScript(scriptPath) {
     throw new Error(`Unable to read NSIS installer metadata from ${scriptPath}.`);
   }
 
-  const next = patchNsisUnityPackageCleanup(
-    patchNsisLegacyBuiltinSkillCleanup(
-      patchNsisInstallLocation(
-        patchNsisUpdateLeave(patchNsisUpdatePage(original)),
+  const next = patchNsisManagedRuntimeCleanup(
+    patchNsisUnityPackageCleanup(
+      patchNsisLegacyBuiltinSkillCleanup(
+        patchNsisInstallLocation(
+          patchNsisUpdateLeave(patchNsisUpdatePage(original)),
+        ),
       ),
     ),
   );

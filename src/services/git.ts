@@ -14,6 +14,7 @@ import type {
   GitInstallHelp,
   GitLogResult,
   GitProbeResult,
+  GitRuntimeState,
   GitStashEntry,
   GitStatusResult,
   GitSubmoduleInfo,
@@ -40,6 +41,14 @@ export function gitCommitBody(hash: string): Promise<string> {
 
 export function gitProbe(): Promise<GitProbeResult> {
   return ipcInvoke<GitProbeResult>("git_probe");
+}
+
+export function gitRuntimeState(): Promise<GitRuntimeState> {
+  return ipcInvoke<GitRuntimeState>("git_runtime_state");
+}
+
+export function gitSaveRuntimeSelection(selectedId: string): Promise<GitRuntimeState> {
+  return ipcInvoke<GitRuntimeState>("git_save_runtime_selection", { selectedId });
 }
 
 export function gitHeadHash(): Promise<string | null> {

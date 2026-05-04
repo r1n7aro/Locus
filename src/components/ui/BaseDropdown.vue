@@ -13,12 +13,14 @@ const props = withDefaults(defineProps<{
   options: DropdownOption[];
   selectedLabel?: string;
   size?: "sm" | "md";
+  menuAlign?: "start" | "end";
   placeholder?: string;
   ariaLabel?: string;
   disabled?: boolean;
 }>(), {
   selectedLabel: "",
   size: "sm",
+  menuAlign: "end",
   placeholder: "",
   ariaLabel: "",
   disabled: false,
@@ -183,6 +185,7 @@ onUnmounted(() => {
         :id="listboxId"
         ref="listboxRef"
         class="base-dropdown-menu"
+        :class="[`align-${menuAlign}`]"
         role="listbox"
         tabindex="-1"
       >
@@ -266,14 +269,23 @@ onUnmounted(() => {
 .base-dropdown-menu {
   position: absolute;
   top: calc(100% + 6px);
-  right: 0;
-  min-width: 220px;
+  min-width: max(220px, 100%);
+  width: max-content;
+  max-width: min(720px, calc(100vw - 32px));
   padding: 4px;
   border: 1px solid var(--border-color);
   border-radius: 10px;
   background: var(--elevated-bg, var(--panel-bg));
   box-shadow: 0 10px 28px rgba(0, 0, 0, 0.22);
   z-index: 40;
+}
+
+.base-dropdown-menu.align-start {
+  left: 0;
+}
+
+.base-dropdown-menu.align-end {
+  right: 0;
 }
 
 .base-dropdown-item {
@@ -313,14 +325,18 @@ onUnmounted(() => {
   font-size: 12px;
   font-weight: 500;
   min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
 }
 
 .base-dropdown-item-hint {
   min-width: 0;
+  max-width: 100%;
   font-size: 11px;
   color: var(--text-secondary);
   line-height: 1.4;
   white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 .base-dropdown-item.active .base-dropdown-item-hint {

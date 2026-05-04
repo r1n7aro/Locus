@@ -2240,6 +2240,7 @@ impl AgentInstance {
         let os = std::env::consts::OS.to_string();
         let arch = std::env::consts::ARCH.to_string();
         let shell = crate::tool::builtins::shell_display_name().to_string();
+        let python = crate::python_runtime::python_prompt_display(None);
         eprintln!(
             "[Agent {}] system prompt build start: session={} cwd={} has_working_dir={}",
             self.id, self.session_id, self.working_dir, has_working_dir
@@ -2322,6 +2323,7 @@ impl AgentInstance {
         env = env.replace("<os>", &os);
         env = env.replace("<arch>", &arch);
         env = env.replace("<shell>", &shell);
+        env = env.replace("<python>", &python);
         env = env.replace(
             "<working_dir>",
             &Self::display_working_dir_value(&self.working_dir),

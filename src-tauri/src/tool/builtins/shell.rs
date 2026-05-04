@@ -87,10 +87,24 @@ pub(super) fn bash() -> ToolDef {
                     };
                 }
 
+                let python = crate::python_runtime::resolve_effective_python(None);
+
+                let sh_command = || {
+                    if let Some(ref python) = python {
+                        format!(
+                            "{}{}",
+                            crate::python_runtime::sh_python_function_prefix(&python.path),
+                            command
+                        )
+                    } else {
+                        command.clone()
+                    }
+                };
+
                 let mut cmd = if cfg!(target_os = "windows") {
                     if detect_shell() == ShellKind::Sh {
                         let mut c = async_command("sh");
-                        c.arg("-c").arg(&command);
+                        c.arg("-c").arg(sh_command());
                         c
                     } else {
                         let wrapped = format!("chcp 65001 >nul && {}", command);
@@ -100,22 +114,33 @@ pub(super) fn bash() -> ToolDef {
                     }
                 } else {
                     let mut c = async_command("sh");
-                    c.arg("-c").arg(&command);
+                    c.arg("-c").arg(sh_command());
                     c
                 };
                 cmd.stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::piped());
 
+                cmd.env("PYTHONIOENCODING", "utf-8");
+                cmd.env("PYTHONUTF8", "1");
+                if let Some(ref python) = python {
+                    cmd.env("LOCUS_PYTHON", &python.path);
+                }
+
                 #[cfg(target_os = "windows")]
                 {
-                    cmd.env("PYTHONIOENCODING", "utf-8");
                     cmd.env("GIT_CONFIG_COUNT", "1");
                     cmd.env("GIT_CONFIG_KEY_0", "core.quotePath");
                     cmd.env("GIT_CONFIG_VALUE_0", "false");
-                    if let Some(path) = augment_path_with_git(std::env::var_os("PATH")) {
-                        cmd.env("PATH", path);
-                    }
+                }
+
+                let mut path = augment_path_with_git(std::env::var_os("PATH"))
+                    .or_else(|| std::env::var_os("PATH"));
+                if let Some(ref python) = python {
+                    path = crate::python_runtime::prepend_python_to_path(path, &python.path);
+                }
+                if let Some(path) = path {
+                    cmd.env("PATH", path);
                 }
 
                 if let Some(ref dir) = workdir {
