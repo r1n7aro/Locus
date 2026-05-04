@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { nextTick, reactive } from "vue";
 import { useAssetState } from "../composables/useAssetState";
-import type { AssetPreviewPayload, SemanticTargetInspector } from "../types";
+import type { AssetPreviewPayload, SemanticTargetInspector, SemanticTreeNode } from "../types";
 
 const assetServiceMocks = vi.hoisted(() => ({
   assetDbOverview: vi.fn(),
@@ -65,12 +65,35 @@ function textPreview(snippet: string): AssetPreviewPayload {
   };
 }
 
-function structuredPreview(previewKey: string): AssetPreviewPayload {
+function treeNode(
+  id: string,
+  label: string,
+  parentId: string | null = null,
+): SemanticTreeNode {
+  return {
+    id,
+    parentId,
+    label,
+    objectKind: "GameObject",
+    changeKind: "unchanged",
+    path: parentId ? `Root/${label}` : label,
+    childIds: [],
+    badgeCounts: {
+      added: 0,
+      removed: 0,
+      modified: 0,
+      componentsChanged: 0,
+    },
+    hasInspector: true,
+  };
+}
+
+function structuredPreview(previewKey: string, tree: SemanticTreeNode[] = []): AssetPreviewPayload {
   return {
     kind: "structured",
     previewKey,
     layout: "assetInspector",
-    tree: [],
+    tree,
     targets: [],
   };
 }
@@ -198,6 +221,79 @@ describe("useAssetState preview flow", () => {
     expect(state.previewNode.value?.path).toBe("Assets/New.prefab");
     expect(state.activeTargetId.value).toBeNull();
     expect(state.targetCache.value.size).toBe(0);
+    expect(state.targetLoading.value).toBe(false);
+  });
+
+  it("selects and loads the prefab root target after a structured prefab preview resolves", async () => {
+    const root = treeNode("go:root", "Player");
+    const child = treeNode("go:child", "Camera", root.id);
+
+    assetServiceMocks.previewWorkspaceAsset.mockResolvedValue(
+      structuredPreview("prefab-key", [root, child]),
+    );
+    assetServiceMocks.previewWorkspaceAssetTarget.mockResolvedValue(inspector(root.id));
+
+    const state = useAssetState(reactive({ workingDir: "F:/repo" }));
+
+    await state.loadPreview({
+      kind: "file",
+      name: "Player.prefab",
+      path: "Assets/Player.prefab",
+      depth: 1,
+    });
+    await flushPromises();
+
+    expect(state.activeTargetId.value).toBe(root.id);
+    expect(state.targetCache.value.get(root.id)).toEqual(inspector(root.id));
+    expect(assetServiceMocks.previewWorkspaceAssetTarget).toHaveBeenCalledWith(
+      "prefab-key",
+      root.id,
+    );
+  });
+
+  it("keeps the latest selected target active when the prefab root load resolves later", async () => {
+    const rootRequest = deferred<SemanticTargetInspector>();
+    const childRequest = deferred<SemanticTargetInspector>();
+    const root = treeNode("go:root", "Player");
+    const child = treeNode("go:child", "Camera", root.id);
+
+    assetServiceMocks.previewWorkspaceAsset.mockResolvedValue(
+      structuredPreview("prefab-key", [root, child]),
+    );
+    assetServiceMocks.previewWorkspaceAssetTarget
+      .mockImplementationOnce(() => rootRequest.promise)
+      .mockImplementationOnce(() => childRequest.promise);
+
+    const state = useAssetState(reactive({ workingDir: "F:/repo" }));
+
+    const previewLoad = state.loadPreview({
+      kind: "file",
+      name: "Player.prefab",
+      path: "Assets/Player.prefab",
+      depth: 1,
+    });
+    await flushPromises();
+
+    expect(state.activeTargetId.value).toBe(root.id);
+
+    const childLoad = state.loadTarget("prefab-key", child.id);
+    await flushPromises();
+
+    expect(state.activeTargetId.value).toBe(child.id);
+
+    rootRequest.resolve(inspector(root.id));
+    await previewLoad;
+    await flushPromises();
+
+    expect(state.activeTargetId.value).toBe(child.id);
+
+    childRequest.resolve(inspector(child.id));
+    await childLoad;
+    await flushPromises();
+
+    expect(state.activeTargetId.value).toBe(child.id);
+    expect(state.targetCache.value.has(root.id)).toBe(true);
+    expect(state.targetCache.value.has(child.id)).toBe(true);
     expect(state.targetLoading.value).toBe(false);
   });
 

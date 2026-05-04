@@ -94,9 +94,11 @@ export function useAssetState(props: AssetProps) {
   const targetCache = ref<Map<string, SemanticTargetInspector>>(new Map());
   const targetLoading = ref(false);
   let previewSession = 0;
+  let targetRequestGeneration = 0;
 
   function invalidatePreviewSession(): number {
     previewSession += 1;
+    targetRequestGeneration += 1;
     return previewSession;
   }
 
@@ -119,6 +121,19 @@ export function useAssetState(props: AssetProps) {
       path: file,
       depth: Math.max(0, segments.length - 1),
     };
+  }
+
+  function isPrefabPath(path: string): boolean {
+    return path.toLowerCase().endsWith(".prefab");
+  }
+
+  function defaultPrefabRootTargetId(payload: AssetPreviewPayload, assetPath: string): string | null {
+    if (!isPrefabPath(assetPath) || payload.kind !== "structured") return null;
+    const knownIds = new Set(payload.tree.map((node) => node.id));
+    const root = payload.tree.find((node) =>
+      node.hasInspector && (!node.parentId || !knownIds.has(node.parentId)),
+    );
+    return root?.id ?? null;
   }
 
   // db overview
@@ -629,6 +644,10 @@ export function useAssetState(props: AssetProps) {
       previewNode.value = nextNode;
       activeTargetId.value = null;
       targetCache.value = new Map();
+      const defaultTargetId = defaultPrefabRootTargetId(payload, nextNode.path);
+      if (payload.kind === "structured" && defaultTargetId) {
+        await loadTarget(payload.previewKey, defaultTargetId);
+      }
     } catch (e) {
       if (session !== previewSession) return;
       const err = normalizeAppError(e);
@@ -646,9 +665,11 @@ export function useAssetState(props: AssetProps) {
   async function loadTarget(previewKey: string, targetId: string) {
     if (!hasWorkspace.value) return null;
     const session = previewSession;
+    const generation = ++targetRequestGeneration;
+    activeTargetId.value = targetId;
     const cached = targetCache.value.get(targetId);
     if (cached) {
-      activeTargetId.value = targetId;
+      targetLoading.value = false;
       return cached;
     }
     targetLoading.value = true;
@@ -662,10 +683,13 @@ export function useAssetState(props: AssetProps) {
       const next = new Map(targetCache.value);
       next.set(targetId, inspector);
       targetCache.value = next;
-      activeTargetId.value = targetId;
+      if (generation === targetRequestGeneration) {
+        activeTargetId.value = targetId;
+      }
       return inspector;
     } catch (e) {
       if (session !== previewSession) return null;
+      if (generation !== targetRequestGeneration) return null;
       const err = normalizeAppError(e);
       // Cache eviction recovery: rebuild session and retry once.
       if (
@@ -684,7 +708,7 @@ export function useAssetState(props: AssetProps) {
       }
       return null;
     } finally {
-      if (session === previewSession) {
+      if (session === previewSession && generation === targetRequestGeneration) {
         targetLoading.value = false;
       }
     }
