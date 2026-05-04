@@ -21,7 +21,6 @@ export const useAuthStore = defineStore("auth", () => {
   async function checkAuthLight(markChecked = true) {
     try {
       const status = await authService.getAuthStatus();
-      console.log("[Auth] checkAuthLight result:", JSON.stringify(status));
       isAuthenticated.value = status.authenticated;
       hasApiKey.value = status.hasApiKey;
     } catch (e) {
@@ -63,7 +62,6 @@ export const useAuthStore = defineStore("auth", () => {
     }
     try {
       const cs = await authService.codexStatus();
-      console.log("[Auth] codexStatus:", JSON.stringify(cs));
       codexAuthenticated.value = cs.authenticated;
     } catch (e) {
       console.error("[Auth] codexStatus failed:", e);
