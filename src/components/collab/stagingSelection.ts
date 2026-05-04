@@ -14,6 +14,20 @@ export interface ResolveStagingFileSelectionResult {
   shouldActivateFile: boolean;
 }
 
+export interface ResolveStagingFolderSelectionInput {
+  selectedPaths: Set<string>;
+  lastClickedPath: string | null;
+  folderPaths: readonly string[];
+  shiftKey: boolean;
+  ctrlKey: boolean;
+  metaKey: boolean;
+}
+
+export interface ResolveStagingFolderSelectionResult {
+  nextSelectedPaths: Set<string>;
+  nextLastClickedPath: string | null;
+}
+
 export function resolveStagingFileSelection(
   input: ResolveStagingFileSelectionInput,
 ): ResolveStagingFileSelectionResult {
@@ -78,5 +92,45 @@ export function resolveStagingFileSelection(
     nextSelectedPaths: new Set(),
     nextLastClickedPath: clickedPath,
     shouldActivateFile: true,
+  };
+}
+
+export function resolveStagingFolderSelection(
+  input: ResolveStagingFolderSelectionInput,
+): ResolveStagingFolderSelectionResult {
+  const {
+    selectedPaths,
+    lastClickedPath,
+    folderPaths,
+    shiftKey,
+    ctrlKey,
+    metaKey,
+  } = input;
+  if (folderPaths.length === 0) {
+    return {
+      nextSelectedPaths: new Set(selectedPaths),
+      nextLastClickedPath: lastClickedPath,
+    };
+  }
+
+  const next = new Set(selectedPaths);
+  if (shiftKey) {
+    for (const path of folderPaths) {
+      next.add(path);
+    }
+  } else if (ctrlKey || metaKey) {
+    const allSelected = folderPaths.every((path) => next.has(path));
+    for (const path of folderPaths) {
+      if (allSelected) {
+        next.delete(path);
+      } else {
+        next.add(path);
+      }
+    }
+  }
+
+  return {
+    nextSelectedPaths: next,
+    nextLastClickedPath: folderPaths[folderPaths.length - 1],
   };
 }

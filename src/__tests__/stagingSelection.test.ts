@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { resolveStagingFileSelection } from "../components/collab/stagingSelection";
+import {
+  resolveStagingFileSelection,
+  resolveStagingFolderSelection,
+} from "../components/collab/stagingSelection";
 
 describe("stagingSelection", () => {
   it("keeps a plain click as the shift-range anchor without turning it into multi-select", () => {
@@ -78,5 +81,37 @@ describe("stagingSelection", () => {
     expect([...result.nextSelectedPaths]).toEqual(["Assets/C.cs"]);
     expect(result.nextLastClickedPath).toBe("Assets/C.cs");
     expect(result.shouldActivateFile).toBe(false);
+  });
+
+  it("adds every descendant file when shift-clicking a folder", () => {
+    const result = resolveStagingFolderSelection({
+      selectedPaths: new Set(["README.md"]),
+      lastClickedPath: "README.md",
+      folderPaths: ["Assets/A.cs", "Assets/Nested/B.cs"],
+      shiftKey: true,
+      ctrlKey: false,
+      metaKey: false,
+    });
+
+    expect([...result.nextSelectedPaths]).toEqual([
+      "README.md",
+      "Assets/A.cs",
+      "Assets/Nested/B.cs",
+    ]);
+    expect(result.nextLastClickedPath).toBe("Assets/Nested/B.cs");
+  });
+
+  it("toggles every descendant file when ctrl-clicking a selected folder", () => {
+    const result = resolveStagingFolderSelection({
+      selectedPaths: new Set(["README.md", "Assets/A.cs", "Assets/Nested/B.cs"]),
+      lastClickedPath: "Assets/Nested/B.cs",
+      folderPaths: ["Assets/A.cs", "Assets/Nested/B.cs"],
+      shiftKey: false,
+      ctrlKey: true,
+      metaKey: false,
+    });
+
+    expect([...result.nextSelectedPaths]).toEqual(["README.md"]);
+    expect(result.nextLastClickedPath).toBe("Assets/Nested/B.cs");
   });
 });

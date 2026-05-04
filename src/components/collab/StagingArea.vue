@@ -13,7 +13,7 @@ import {
   type LocusManagedFileLike,
 } from "../../composables/locusManagedFiles";
 import { acquireSelectionLock } from "../../composables/useSelectionLock";
-import { resolveStagingFileSelection } from "./stagingSelection";
+import { resolveStagingFileSelection, resolveStagingFolderSelection } from "./stagingSelection";
 import {
   persistStagingLayout,
   persistStagingViewMode,
@@ -221,6 +221,36 @@ function onFileClick(e: MouseEvent, f: GitFileChange, source: "gitUnstaged" | "g
   if (result.shouldActivateFile) {
     emit("selectFile", f, source);
   }
+}
+
+function onTreeFolderClick(
+  e: MouseEvent,
+  section: "unstaged" | "staged",
+  chainPaths: readonly string[],
+  expanded: boolean,
+) {
+  if (!(e.shiftKey || e.ctrlKey || e.metaKey)) {
+    toggleTreeFolder(section, chainPaths, expanded);
+    return;
+  }
+
+  e.preventDefault();
+  const path = chainPaths[chainPaths.length - 1];
+  if (!path) return;
+
+  const sel = section === "unstaged" ? selectedUnstaged : selectedStaged;
+  const lastClicked = section === "unstaged" ? lastClickedUnstaged : lastClickedStaged;
+  const result = resolveStagingFolderSelection({
+    selectedPaths: sel.value,
+    lastClickedPath: lastClicked.value,
+    folderPaths: folderPathsFor(section, path),
+    shiftKey: e.shiftKey,
+    ctrlKey: e.ctrlKey,
+    metaKey: e.metaKey,
+  });
+
+  sel.value = result.nextSelectedPaths;
+  lastClicked.value = result.nextLastClickedPath;
 }
 
 function onFileContextMenu(e: MouseEvent, f: GitFileChange, source: "gitUnstaged" | "gitStaged") {
@@ -488,6 +518,13 @@ function isFolderPending(section: "unstaged" | "staged", path: string) {
   return paths.some((filePath) => isUnstagePending(filePath));
 }
 
+function isFolderSelected(section: "unstaged" | "staged", path: string) {
+  const paths = folderPathsFor(section, path);
+  if (paths.length === 0) return false;
+  const selected = section === "unstaged" ? selectedUnstaged.value : selectedStaged.value;
+  return paths.every((filePath) => selected.has(filePath));
+}
+
 function stageFolder(path: string) {
   const paths = folderPathsFor("unstaged", path);
   if (paths.length === 1) {
@@ -652,15 +689,16 @@ function formatBlockedReason(file: GitBlockedPath): string {
                 <div
                   v-if="row.kind === 'folder'"
                   class="staging-tree-row staging-tree-folder-row"
-                  :class="{ pending: isFolderPending('unstaged', row.path) }"
+                  :class="{ pending: isFolderPending('unstaged', row.path), selected: isFolderSelected('unstaged', row.path) }"
                 >
                   <button
                     type="button"
                     class="staging-tree-folder-btn staging-tree-folder-main"
+                    :class="{ selected: isFolderSelected('unstaged', row.path) }"
                     :style="{ paddingLeft: `${treeIndentPx(row.depth)}px` }"
                     :title="row.path"
                     :aria-label="row.expanded ? t('merge.tree.toggleCollapse', row.name) : t('merge.tree.toggleExpand', row.name)"
-                    @click="toggleTreeFolder('unstaged', row.chainPaths, row.expanded)"
+                    @click="onTreeFolderClick($event, 'unstaged', row.chainPaths, row.expanded)"
                   >
                     <span class="staging-tree-branch" :class="{ open: row.expanded }" aria-hidden="true">
                       <LucideIcon class="staging-tree-chevron" :icon="ChevronRight" :size="10" />
@@ -792,15 +830,16 @@ function formatBlockedReason(file: GitBlockedPath): string {
                 <div
                   v-if="row.kind === 'folder'"
                   class="staging-tree-row staging-tree-folder-row"
-                  :class="{ pending: isFolderPending('staged', row.path) }"
+                  :class="{ pending: isFolderPending('staged', row.path), selected: isFolderSelected('staged', row.path) }"
                 >
                   <button
                     type="button"
                     class="staging-tree-folder-btn staging-tree-folder-main"
+                    :class="{ selected: isFolderSelected('staged', row.path) }"
                     :style="{ paddingLeft: `${treeIndentPx(row.depth)}px` }"
                     :title="row.path"
                     :aria-label="row.expanded ? t('merge.tree.toggleCollapse', row.name) : t('merge.tree.toggleExpand', row.name)"
-                    @click="toggleTreeFolder('staged', row.chainPaths, row.expanded)"
+                    @click="onTreeFolderClick($event, 'staged', row.chainPaths, row.expanded)"
                   >
                     <span class="staging-tree-branch" :class="{ open: row.expanded }" aria-hidden="true">
                       <LucideIcon class="staging-tree-chevron" :icon="ChevronRight" :size="10" />

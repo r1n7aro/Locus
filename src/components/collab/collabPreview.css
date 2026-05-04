@@ -563,6 +563,14 @@
   color: var(--text-color);
 }
 
+.staging-tree-folder-btn.selected {
+  background: var(--active-bg);
+}
+
+.staging-tree-folder-btn.selected:hover {
+  background: var(--active-bg);
+}
+
 .staging-tree-folder-btn:focus-visible {
   outline: 2px solid var(--accent-color);
   outline-offset: -2px;
