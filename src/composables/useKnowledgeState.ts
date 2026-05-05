@@ -1178,6 +1178,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
     type: KnowledgeDocumentType,
     path: string,
     request: WorkspaceRequestSnapshot,
+    options?: { silentSelectedDocument?: boolean },
   ) {
     if (!isCurrentWorkspaceRequest(request)) return;
     const exactDocuments = (await knowledgeList({
@@ -1193,7 +1194,9 @@ export function useKnowledgeState(props: KnowledgeProps) {
       if (exactDocuments.length === 0) {
         clearSelectedDocumentState();
       } else {
-        await loadSelectedDocument(exactDocuments[0]);
+        await loadSelectedDocument(exactDocuments[0], {
+          silent: options?.silentSelectedDocument ?? false,
+        });
       }
     }
   }
@@ -1257,7 +1260,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
 
     if (!type || !targetKind) {
       markKnowledgeDataDirty();
-      await refreshKnowledgeData();
+      await refreshKnowledgeData({ silentSelectedDocument: true });
       return;
     }
 
@@ -1278,13 +1281,15 @@ export function useKnowledgeState(props: KnowledgeProps) {
             (document) => document.type === type && document.path === path,
           );
           if (selectedMatch) {
-            await loadSelectedDocument(selectedMatch);
+            await loadSelectedDocument(selectedMatch, { silent: true });
           } else {
             clearSelectedDocumentState();
           }
         }
       } else {
-        await refreshExternalDocumentPath(type, path, request);
+        await refreshExternalDocumentPath(type, path, request, {
+          silentSelectedDocument: true,
+        });
       }
       if (!isCurrentWorkspaceRequest(request)) return;
 
@@ -1340,7 +1345,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
             document.type === type && document.path === selectedDocument.value?.path,
         );
         if (selectedMatch) {
-          await loadSelectedDocument(selectedMatch);
+          await loadSelectedDocument(selectedMatch, { silent: true });
           if (!isCurrentWorkspaceRequest(request)) return;
         } else {
           clearSelectedDocumentState();
@@ -1349,21 +1354,23 @@ export function useKnowledgeState(props: KnowledgeProps) {
         selectedDocumentSummary.value?.type === type &&
         pathMatchesSubtree(selectedDocumentSummary.value.path, path)
       ) {
-        await loadSelectedDocument(selectedDocumentSummary.value);
+        await loadSelectedDocument(selectedDocumentSummary.value, {
+          silent: true,
+        });
         if (!isCurrentWorkspaceRequest(request)) return;
       }
       return;
     }
 
     markKnowledgeDataDirty();
-    await refreshKnowledgeData();
+    await refreshKnowledgeData({ silentSelectedDocument: true });
   }
 
   async function flushExternalRefreshQueue() {
     const queued = pendingExternalChanges;
     pendingExternalChanges = [];
     if (queued.length === 0) {
-      await refreshKnowledgeData();
+      await refreshKnowledgeData({ silentSelectedDocument: true });
       return;
     }
     for (const item of queued) {
@@ -1861,6 +1868,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
 
   async function loadSelectedDocument(
     target?: KnowledgeDocumentSummary | KnowledgeDocument | null,
+    options?: { silent?: boolean },
   ) {
     if (!hasWorkspace.value) return;
     const request = captureWorkspaceRequest();
@@ -1872,7 +1880,10 @@ export function useKnowledgeState(props: KnowledgeProps) {
       return;
     }
 
-    selectedDocumentLoading.value = true;
+    const silent = options?.silent ?? false;
+    if (!silent) {
+      selectedDocumentLoading.value = true;
+    }
     error.value = "";
     try {
       const result = await knowledgeRead({
@@ -1906,7 +1917,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
       }
       notifyError("knowledge_read", cause);
     } finally {
-      if (isCurrentWorkspaceRequest(request)) {
+      if (isCurrentWorkspaceRequest(request) && !silent) {
         selectedDocumentLoading.value = false;
       }
     }
@@ -1973,6 +1984,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
   async function refreshKnowledgeData(options?: {
     force?: boolean;
     includeOverview?: boolean;
+    silentSelectedDocument?: boolean;
   }) {
     if (!hasWorkspace.value) {
       resetWorkspaceState();
@@ -1983,6 +1995,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
     if (!request.workspaceKey) return;
     const force = options?.force ?? true;
     const includeOverview = options?.includeOverview ?? true;
+    const silentSelectedDocument = options?.silentSelectedDocument ?? false;
     consumePendingUiSelection();
     await ensureTypeDataLoaded(activeType.value, {
       force,
@@ -2017,7 +2030,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
         pendingSelectionPath.value = null;
       }
     } else if (selectedDocumentId.value) {
-      await loadSelectedDocument();
+      await loadSelectedDocument(undefined, { silent: silentSelectedDocument });
     } else if (selectedDirectoryPath.value) {
       const stillExists = directoryGroups.value[activeType.value].includes(
         selectedDirectoryPath.value,

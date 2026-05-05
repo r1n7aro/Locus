@@ -883,6 +883,80 @@ describe("useKnowledgeState", () => {
     mounted.unmount();
   });
 
+  it("refreshes external document changes without showing selected document loading", async () => {
+    vi.useFakeTimers();
+    const props = reactive({
+      workingDir: "F:/repo",
+      selectedModelId: "",
+      modelDefaults: {} as any,
+    });
+    const mounted = mountKnowledgeState(props);
+    await flushPromises(8);
+
+    await mounted.state.selectDocument(mounted.state.documents.value[0]!);
+    knowledgeMocks.knowledgeRead.mockClear();
+
+    const readDeferred: { resolve?: (value: any) => void } = {};
+    knowledgeMocks.knowledgeRead.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          readDeferred.resolve = resolve;
+        }),
+    );
+
+    emitTauriEvent<KnowledgeChangedEvent>("knowledge-changed", {
+      workingDir: "F:/repo",
+      source: "knowledge_fs_watcher",
+      changedAt: 2,
+      docType: "design",
+      path: "combat/core-loop.md",
+      parentPath: "combat",
+      targetKind: "document",
+      changeKind: "content",
+      subtree: false,
+    });
+    vi.advanceTimersByTime(100);
+    await flushPromises(8);
+
+    expect(mounted.state.selectedDocumentLoading.value).toBe(false);
+    expect(knowledgeMocks.knowledgeRead).toHaveBeenCalledWith({
+      kind: "document",
+      path: "combat/core-loop.md",
+      type: "design",
+      part: "full",
+    });
+
+    readDeferred.resolve?.({
+      kind: "document",
+      document: {
+        id: "design-1",
+        type: "design",
+        path: "combat/core-loop.md",
+        title: "核心循环",
+        injectMode: "excerpt",
+        inheritInjectMode: false,
+        injectModeSource: { kind: "self", path: null },
+        summaryEnabled: true,
+        commandEnabled: false,
+        readOnly: false,
+        aiMaintained: false,
+        inheritAiConfig: false,
+        aiConfigSource: { kind: "self", path: null },
+        explicitMaintenanceRules: false,
+        summary: "摘要",
+        body: "正文 v3",
+        maintenanceRules: null,
+        createdAt: 1,
+        updatedAt: 4,
+        hasSummary: true,
+      },
+    });
+    await flushPromises(8);
+
+    expect(mounted.state.selectedDocument.value?.body).toBe("正文 v3");
+    mounted.unmount();
+  });
+
   it("drops in-flight search results after the workspace changes", async () => {
     vi.useFakeTimers();
     const searchDeferred: {
