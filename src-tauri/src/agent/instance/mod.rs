@@ -2773,7 +2773,9 @@ impl AgentInstance {
                 continue;
             }
 
-            if ch == '&' && chars.peek() == Some(&'&') {
+            if (ch == '&' && chars.peek() == Some(&'&'))
+                || (ch == '|' && chars.peek() == Some(&'|'))
+            {
                 chars.next();
                 let segment = current.trim();
                 if !segment.is_empty() {
@@ -2783,12 +2785,23 @@ impl AgentInstance {
                 continue;
             }
 
-            if ch == ';' {
+            if matches!(ch, '\n' | '\r') && current.trim_end().ends_with('|') {
+                current.push(' ');
+                if ch == '\r' && chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                continue;
+            }
+
+            if matches!(ch, ';' | '\n' | '\r') {
                 let segment = current.trim();
                 if !segment.is_empty() {
                     segments.push(segment.to_string());
                 }
                 current.clear();
+                if ch == '\r' && chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
                 continue;
             }
 
@@ -2951,10 +2964,8 @@ impl AgentInstance {
     }
 
     fn classify_safe_shell_tokens(tokens: &[String]) -> Option<GitCommandEffect> {
-        if tokens
-            .first()
-            .map(|value| value.eq_ignore_ascii_case("echo"))
-            .unwrap_or(false)
+        let command = tokens.first().map(|value| value.to_ascii_lowercase())?;
+        if matches!(command.as_str(), "echo" | "printf" | "true" | "false")
             && !Self::shell_tokens_contain_knowledge_literal(tokens)
             && !Self::shell_tokens_contain_command_substitution(tokens)
         {
@@ -9989,6 +10000,26 @@ PrefabInstance:
             None,
             &json!({
                 "workdir":"C:/Repo",
+                "command":"git -c core.quotePath=false diff -- Locus/knowledge/design/core.md | sed -n '1,220p' || true"
+            }),
+        )
+        .is_some());
+
+        assert!(AgentInstance::assess_bash_git_knowledge_command(
+            "C:/Repo",
+            None,
+            &json!({
+                "workdir":"C:/Repo",
+                "command":"git -c core.quotePath=false diff -- Locus/knowledge/design/core.md |\nsed -n '1,220p'"
+            }),
+        )
+        .is_some());
+
+        assert!(AgentInstance::assess_bash_git_knowledge_command(
+            "C:/Repo",
+            None,
+            &json!({
+                "workdir":"C:/Repo",
                 "command":"git add Locus/knowledge/design/core.md && rm Locus/knowledge/design/core.md"
             }),
         )
@@ -10017,6 +10048,36 @@ PrefabInstance:
             &json!({
                 "workdir":"C:/Repo",
                 "command":"echo '--- docs ---' && find Locus/knowledge/design -maxdepth 3 -type f | sort"
+            }),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn bash_git_knowledge_assessment_allows_multiline_git_status_after_diff() {
+        let assessment = AgentInstance::assess_bash_git_knowledge_command(
+            "C:/Repo",
+            None,
+            &json!({
+                "workdir":"C:/Repo",
+                "command":"git -c core.quotePath=false diff --unified=1 -- Assets/PlayerHealthBar.cs Assets/PlayerPlatformerController.cs ProjectSettings/ProjectSettings.asset | sed -n '220,520p'\nprintf '%s\\n' '--- knowledge status ---'\ngit -c core.quotePath=false status --short -- Locus/knowledge"
+            }),
+        )
+        .expect("multiline git status should be classified");
+
+        assert!(assessment.touches_knowledge);
+        assert!(!assessment.requires_confirm);
+        assert!(!assessment.reconcile_after_success);
+    }
+
+    #[test]
+    fn bash_git_knowledge_assessment_rejects_multiline_find_after_diff() {
+        assert!(AgentInstance::assess_bash_git_knowledge_command(
+            "C:/Repo",
+            None,
+            &json!({
+                "workdir":"C:/Repo",
+                "command":"git -c core.quotePath=false diff --unified=1 -- Assets/PlayerHealthBar.cs Assets/PlayerPlatformerController.cs ProjectSettings/ProjectSettings.asset | sed -n '220,520p'\nprintf '%s\\n' '--- knowledge files ---'\nfind Locus/knowledge/design/system -maxdepth 3 -type f | sort"
             }),
         )
         .is_none());
@@ -10266,6 +10327,7 @@ Use profiler helpers.
             "git revert HEAD",
             "git add Locus/knowledge/design/core-loop.md && git commit -m 'docs: update knowledge'",
             "echo '--- diff ---' && git -c core.quotePath=false diff -- Locus/knowledge/design/core-loop.md | sed -n '1,80p'",
+            "git -c core.quotePath=false diff --unified=1 -- Assets/PlayerHealthBar.cs Assets/PlayerPlatformerController.cs ProjectSettings/ProjectSettings.asset | sed -n '220,520p'\nprintf '%s\\n' '--- knowledge status ---'\ngit -c core.quotePath=false status --short -- Locus/knowledge",
         ] {
             assert_eq!(
                 agent.validate_knowledge_tool_routing(
@@ -10281,6 +10343,12 @@ Use profiler helpers.
             .validate_knowledge_tool_routing(
                 "bash",
                 &json!({"workdir":".","command":"git clean -fd Locus/knowledge/design"})
+            )
+            .is_some());
+        assert!(agent
+            .validate_knowledge_tool_routing(
+                "bash",
+                &json!({"workdir":".","command":"git -c core.quotePath=false diff --unified=1 -- Assets/PlayerHealthBar.cs Assets/PlayerPlatformerController.cs ProjectSettings/ProjectSettings.asset | sed -n '220,520p'\nprintf '%s\\n' '--- knowledge files ---'\nfind Locus/knowledge/design/system -maxdepth 3 -type f | sort"})
             )
             .is_some());
     }
