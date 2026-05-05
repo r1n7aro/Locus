@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { emitTo } from "@tauri-apps/api/event";
 import {
@@ -43,6 +43,8 @@ interface CalendarDay {
 const RESULT_COLUMN_STORAGE_KEY = "locus.collabSearch.resultColumns.v4";
 const RESULT_COLUMN_KEYS: ResultColumnKey[] = ["kind", "message", "ref", "author", "date", "files"];
 const RESULT_AUTO_FIT_COLUMNS: ResultColumnKey[] = ["message", "ref", "author", "date"];
+const RESULT_ROW_HEIGHT = 38;
+const RESULT_ROW_BUFFER = 12;
 const RESULT_COLUMN_DEFAULT_WIDTHS: Record<ResultColumnKey, number> = {
   kind: 58,
   message: 300,
@@ -82,17 +84,27 @@ const truncated = ref(false);
 const selectingHash = ref<string | null>(null);
 const queryInputRef = ref<HTMLInputElement | null>(null);
 const filterRef = ref<HTMLElement | null>(null);
+const resultScrollRef = ref<HTMLElement | null>(null);
+const resultTableRef = ref<HTMLElement | null>(null);
+const resultHeaderRef = ref<HTMLElement | null>(null);
 const filterOpen = ref(false);
 const activeDatePicker = ref<DatePickerTarget | null>(null);
 const calendarMonth = ref(startOfMonthDate(new Date()));
 const resultColumnWidths = ref<Record<ResultColumnKey, number>>(loadStoredResultColumnWidths());
 const activeResizeColumn = ref<ResizableResultColumn | null>(null);
+const resultScrollTop = ref(0);
+const resultViewportHeight = ref(0);
+const resultHeaderHeight = ref(30);
 
 let columnResizeMoveHandler: ((event: MouseEvent) => void) | null = null;
 let columnResizeUpHandler: ((event: MouseEvent) => void) | null = null;
 let releaseColumnResizeSelectionLock: (() => void) | null = null;
 let previousBodyCursor = "";
 let measureContext: CanvasRenderingContext2D | null = null;
+let pendingColumnResizeFrame = 0;
+let pendingColumnResizeWidths: Record<ResultColumnKey, number> | null = null;
+let resultScrollFrame = 0;
+let resultResizeObserver: ResizeObserver | null = null;
 
 const canSearch = computed(() =>
   !!query.value.trim()
@@ -116,19 +128,53 @@ const resultCountLabel = computed(() => {
 
 const showSearchStatus = computed(() => searched.value || loading.value || truncated.value);
 
-const resultGridStyle = computed(() => {
+const resultGridStyle = computed<Record<string, string>>(() => {
   const widths = resultColumnWidths.value;
   return {
-    "--collab-search-grid-columns": [
-      `${widths.kind}px`,
-      `${widths.message}px`,
-      `${widths.ref}px`,
-      `${widths.author}px`,
-      `${widths.date}px`,
-      `minmax(${RESULT_COLUMN_MIN_WIDTHS.files}px, 1fr)`,
-    ].join(" "),
+    "--collab-search-grid-columns": resultGridColumns(widths),
+    "--collab-search-grid-min-width": `${resultGridMinWidth(widths)}px`,
   };
 });
+
+const virtualResultRows = computed(() => {
+  const totalRows = results.value.length;
+  if (totalRows === 0) {
+    return {
+      rows: [] as Array<{ result: GitHistorySearchResult; top: number }>,
+      totalHeight: 0,
+    };
+  }
+
+  if (resultViewportHeight.value <= 0) {
+    return {
+      rows: results.value.map((result, index) => ({
+        result,
+        top: index * RESULT_ROW_HEIGHT,
+      })),
+      totalHeight: totalRows * RESULT_ROW_HEIGHT,
+    };
+  }
+
+  const bodyScrollTop = Math.max(0, resultScrollTop.value - resultHeaderHeight.value);
+  const visibleStart = Math.max(0, Math.floor(bodyScrollTop / RESULT_ROW_HEIGHT));
+  const visibleEnd = Math.min(
+    totalRows - 1,
+    Math.ceil((bodyScrollTop + resultViewportHeight.value) / RESULT_ROW_HEIGHT) - 1,
+  );
+  const start = Math.max(0, visibleStart - RESULT_ROW_BUFFER);
+  const end = Math.max(start, Math.min(totalRows - 1, visibleEnd + RESULT_ROW_BUFFER));
+  return {
+    rows: results.value.slice(start, end + 1).map((result, index) => ({
+      result,
+      top: (start + index) * RESULT_ROW_HEIGHT,
+    })),
+    totalHeight: totalRows * RESULT_ROW_HEIGHT,
+  };
+});
+
+const virtualResultSpacerStyle = computed(() => ({
+  height: `${virtualResultRows.value.totalHeight}px`,
+}));
 
 const weekdayLabels = computed(() =>
   locale.value === "zh"
@@ -210,6 +256,62 @@ function clampColumnWidth(column: ResultColumnKey, width: number): number {
     RESULT_COLUMN_MAX_WIDTHS[column],
     Math.max(RESULT_COLUMN_MIN_WIDTHS[column], Math.round(width)),
   );
+}
+
+function resultGridColumns(widths: Record<ResultColumnKey, number>): string {
+  return [
+    `${widths.kind}px`,
+    `${widths.message}px`,
+    `${widths.ref}px`,
+    `${widths.author}px`,
+    `${widths.date}px`,
+    `minmax(${widths.files}px, 1fr)`,
+  ].join(" ");
+}
+
+function resultGridMinWidth(widths: Record<ResultColumnKey, number>): number {
+  const columnWidth = RESULT_COLUMN_KEYS.reduce((total, column) => total + widths[column], 0);
+  const columnGapWidth = (RESULT_COLUMN_KEYS.length - 1) * 10;
+  const horizontalPaddingWidth = 28;
+  return columnWidth + columnGapWidth + horizontalPaddingWidth;
+}
+
+function applyResultGridSizing(widths: Record<ResultColumnKey, number>) {
+  const table = resultTableRef.value;
+  if (!table) return;
+  table.style.setProperty("--collab-search-grid-columns", resultGridColumns(widths));
+  table.style.setProperty("--collab-search-grid-min-width", `${resultGridMinWidth(widths)}px`);
+}
+
+function flushScheduledResultGridSizing() {
+  pendingColumnResizeFrame = 0;
+  if (!pendingColumnResizeWidths) return;
+  applyResultGridSizing(pendingColumnResizeWidths);
+}
+
+function scheduleResultGridSizing(widths: Record<ResultColumnKey, number>) {
+  pendingColumnResizeWidths = widths;
+  if (pendingColumnResizeFrame) return;
+  if (typeof requestAnimationFrame !== "function") {
+    flushScheduledResultGridSizing();
+    return;
+  }
+  pendingColumnResizeFrame = requestAnimationFrame(flushScheduledResultGridSizing);
+}
+
+function cancelScheduledResultGridSizing() {
+  if (pendingColumnResizeFrame && typeof cancelAnimationFrame === "function") {
+    cancelAnimationFrame(pendingColumnResizeFrame);
+  }
+  pendingColumnResizeFrame = 0;
+  pendingColumnResizeWidths = null;
+}
+
+function commitResultColumnWidths(widths: Record<ResultColumnKey, number>) {
+  cancelScheduledResultGridSizing();
+  applyResultGridSizing(widths);
+  resultColumnWidths.value = widths;
+  persistResultColumnWidths();
 }
 
 function loadStoredResultColumnWidths(): Record<ResultColumnKey, number> {
@@ -389,13 +491,13 @@ function pointerDeltaToPreferredDelta(delta: number): number {
   return delta;
 }
 
-function setAdjacentResultColumnWidths(
+function adjacentResultColumnWidths(
   column: ResizableResultColumn,
   nextColumn: ResultColumnKey,
   startColumnWidth: number,
   startNextColumnWidth: number,
   preferredDelta: number,
-) {
+): Record<ResultColumnKey, number> {
   const minDelta = Math.max(
     RESULT_COLUMN_MIN_WIDTHS[column] - startColumnWidth,
     startNextColumnWidth - RESULT_COLUMN_MAX_WIDTHS[nextColumn],
@@ -405,22 +507,23 @@ function setAdjacentResultColumnWidths(
     startNextColumnWidth - RESULT_COLUMN_MIN_WIDTHS[nextColumn],
   );
   const appliedDelta = Math.min(maxDelta, Math.max(minDelta, preferredDelta));
-  resultColumnWidths.value = {
+  return {
     ...resultColumnWidths.value,
     [column]: clampColumnWidth(column, startColumnWidth + appliedDelta),
     [nextColumn]: clampColumnWidth(nextColumn, startNextColumnWidth - appliedDelta),
   };
-  persistResultColumnWidths();
 }
 
 function nudgeResultColumnWidth(column: ResizableResultColumn, delta: number) {
   const nextColumn = nextResultColumn(column);
-  setAdjacentResultColumnWidths(
-    column,
-    nextColumn,
-    resultColumnWidths.value[column],
-    resultColumnWidths.value[nextColumn],
-    delta,
+  commitResultColumnWidths(
+    adjacentResultColumnWidths(
+      column,
+      nextColumn,
+      resultColumnWidths.value[column],
+      resultColumnWidths.value[nextColumn],
+      delta,
+    ),
   );
 }
 
@@ -439,6 +542,7 @@ function stopResultColumnResize() {
   releaseColumnResizeSelectionLock?.();
   releaseColumnResizeSelectionLock = null;
   activeResizeColumn.value = null;
+  cancelScheduledResultGridSizing();
 }
 
 function onResultColumnResizeStart(event: MouseEvent, column: ResizableResultColumn) {
@@ -451,6 +555,7 @@ function onResultColumnResizeStart(event: MouseEvent, column: ResizableResultCol
   const startX = event.clientX;
   const startColumnWidth = resultColumnWidths.value[column];
   const startNextColumnWidth = resultColumnWidths.value[nextColumn];
+  let latestWidths = resultColumnWidths.value;
   previousBodyCursor = document.body.style.cursor;
   document.body.style.cursor = "col-resize";
   releaseColumnResizeSelectionLock?.();
@@ -458,15 +563,17 @@ function onResultColumnResizeStart(event: MouseEvent, column: ResizableResultCol
 
   columnResizeMoveHandler = (nextEvent: MouseEvent) => {
     if (activeResizeColumn.value !== column) return;
-    setAdjacentResultColumnWidths(
+    latestWidths = adjacentResultColumnWidths(
       column,
       nextColumn,
       startColumnWidth,
       startNextColumnWidth,
       pointerDeltaToPreferredDelta(nextEvent.clientX - startX),
     );
+    scheduleResultGridSizing(latestWidths);
   };
   columnResizeUpHandler = () => {
+    commitResultColumnWidths(latestWidths);
     stopResultColumnResize();
   };
 
@@ -569,6 +676,35 @@ function onDocumentPointerDown(event: PointerEvent) {
   closeFilterDropdown();
 }
 
+function syncResultViewport() {
+  const scroll = resultScrollRef.value;
+  resultScrollTop.value = scroll?.scrollTop ?? 0;
+  resultViewportHeight.value = scroll?.clientHeight ?? 0;
+  resultHeaderHeight.value = resultHeaderRef.value?.offsetHeight ?? 30;
+}
+
+function onResultScroll() {
+  if (resultScrollFrame) return;
+  resultScrollFrame = requestAnimationFrame(() => {
+    resultScrollFrame = 0;
+    syncResultViewport();
+  });
+}
+
+function reconnectResultResizeObserver() {
+  resultResizeObserver?.disconnect();
+  if (!resultResizeObserver) return;
+  if (resultScrollRef.value) resultResizeObserver.observe(resultScrollRef.value);
+  if (resultHeaderRef.value) resultResizeObserver.observe(resultHeaderRef.value);
+}
+
+function resetResultScrollTop() {
+  if (resultScrollRef.value) {
+    resultScrollRef.value.scrollTop = 0;
+  }
+  resultScrollTop.value = 0;
+}
+
 async function runSearch() {
   if (loading.value || !canSearch.value) return;
   closeFilterDropdown();
@@ -584,7 +720,9 @@ async function runSearch() {
       dateTo: dateEndTimestamp(dateTo.value),
     });
     results.value = response.results;
+    resetResultScrollTop();
     autoFitResultColumnWidths(response.results);
+    void nextTick(syncResultViewport);
     truncated.value = response.truncated;
     if (!response.isRepo) {
       error.value = t("collab.notVcs");
@@ -627,12 +765,35 @@ async function selectResult(result: GitHistorySearchResult) {
 onMounted(() => {
   queryInputRef.value?.focus();
   document.addEventListener("pointerdown", onDocumentPointerDown, true);
+  if (typeof ResizeObserver !== "undefined") {
+    resultResizeObserver = new ResizeObserver(syncResultViewport);
+    reconnectResultResizeObserver();
+  } else {
+    window.addEventListener("resize", syncResultViewport);
+  }
+  syncResultViewport();
 });
 
 onUnmounted(() => {
   document.removeEventListener("pointerdown", onDocumentPointerDown, true);
   stopResultColumnResize();
+  if (resultScrollFrame) {
+    cancelAnimationFrame(resultScrollFrame);
+    resultScrollFrame = 0;
+  }
+  resultResizeObserver?.disconnect();
+  resultResizeObserver = null;
+  window.removeEventListener("resize", syncResultViewport);
 });
+
+watch([resultScrollRef, resultHeaderRef], () => {
+  reconnectResultResizeObserver();
+  void nextTick(syncResultViewport);
+}, { flush: "post" });
+
+watch(results, () => {
+  void nextTick(syncResultViewport);
+}, { flush: "post" });
 </script>
 
 <template>
@@ -806,7 +967,7 @@ onUnmounted(() => {
       </span>
     </div>
 
-    <div class="collab-search-body">
+    <div ref="resultScrollRef" class="collab-search-body" @scroll="onResultScroll">
       <div v-if="error" class="collab-search-error">{{ error }}</div>
       <div v-else-if="!searched" class="collab-search-empty">
         {{ t("collab.search.emptyIdle") }}
@@ -817,8 +978,8 @@ onUnmounted(() => {
       <div v-else-if="results.length === 0" class="collab-search-empty">
         {{ t("collab.search.noResults") }}
       </div>
-      <div v-else class="collab-search-results" :style="resultGridStyle">
-        <div class="collab-search-result-header">
+      <div v-else ref="resultTableRef" class="collab-search-results" :style="resultGridStyle">
+        <div ref="resultHeaderRef" class="collab-search-result-header">
           <div
             v-for="column in RESULT_COLUMN_KEYS"
             :key="column"
@@ -839,38 +1000,41 @@ onUnmounted(() => {
             ></button>
           </div>
         </div>
-        <button
-          v-for="result in results"
-          :key="`${result.kind}:${result.hash}`"
-          type="button"
-          class="collab-search-result"
-          :class="{ selecting: selectingHash === result.hash }"
-          :title="rowTitle(result)"
-          @click="void selectResult(result)"
-        >
-          <span class="collab-search-kind" :class="kindClass(result.kind)">{{ kindLabel(result.kind) }}</span>
-          <span class="collab-search-message">{{ result.message }}</span>
-          <span class="collab-search-ref">{{ resultRef(result) }}</span>
-          <span class="collab-search-author">{{ result.author }}</span>
-          <span class="collab-search-date-text">{{ formatDate(result.date) }}</span>
-          <span class="collab-search-files" :title="resultFilesTitle(result)">
-            <span
-              v-for="file in result.files.slice(0, 2)"
-              :key="`${result.hash}:${file.status}:${file.path}`"
-              class="collab-search-file"
-            >
-              <LucideIcon
-                :icon="unityAssetIconNodeForPath(file.path, { isFolder: false })"
-                :class="fileAssetIconClass(file)"
-                :size="13"
-              />
-              <span class="collab-search-file-path">{{ file.path }}</span>
+        <div class="collab-search-result-spacer" :style="virtualResultSpacerStyle">
+          <button
+            v-for="{ result, top } in virtualResultRows.rows"
+            :key="`${result.kind}:${result.hash}`"
+            type="button"
+            class="collab-search-result"
+            :class="{ selecting: selectingHash === result.hash }"
+            :style="{ transform: `translateY(${top}px)` }"
+            :title="rowTitle(result)"
+            @click="void selectResult(result)"
+          >
+            <span class="collab-search-kind" :class="kindClass(result.kind)">{{ kindLabel(result.kind) }}</span>
+            <span class="collab-search-message">{{ result.message }}</span>
+            <span class="collab-search-ref">{{ resultRef(result) }}</span>
+            <span class="collab-search-author">{{ result.author }}</span>
+            <span class="collab-search-date-text">{{ formatDate(result.date) }}</span>
+            <span class="collab-search-files" :title="resultFilesTitle(result)">
+              <span
+                v-for="file in result.files.slice(0, 2)"
+                :key="`${result.hash}:${file.status}:${file.path}`"
+                class="collab-search-file"
+              >
+                <LucideIcon
+                  :icon="unityAssetIconNodeForPath(file.path, { isFolder: false })"
+                  :class="fileAssetIconClass(file)"
+                  :size="13"
+                />
+                <span class="collab-search-file-path">{{ file.path }}</span>
+              </span>
+              <span v-if="result.files.length > 2" class="collab-search-file-more">
+                {{ t("collab.search.moreFiles", result.files.length - 2) }}
+              </span>
             </span>
-            <span v-if="result.files.length > 2" class="collab-search-file-more">
-              {{ t("collab.search.moreFiles", result.files.length - 2) }}
-            </span>
-          </span>
-        </button>
+          </button>
+        </div>
       </div>
     </div>
   </div>
@@ -1278,10 +1442,11 @@ onUnmounted(() => {
 }
 
 .collab-search-results {
+  --collab-search-result-row-height: 38px;
   position: relative;
   display: flex;
   flex-direction: column;
-  min-width: 0;
+  min-width: var(--collab-search-grid-min-width);
 }
 
 .collab-search-column-resize-handle {
@@ -1325,7 +1490,7 @@ onUnmounted(() => {
 .collab-search-result-header {
   box-sizing: border-box;
   width: 100%;
-  min-width: 0;
+  min-width: var(--collab-search-grid-min-width);
   min-height: 30px;
   display: grid;
   grid-template-columns: var(--collab-search-grid-columns);
@@ -1363,11 +1528,23 @@ onUnmounted(() => {
   padding-right: 8px;
 }
 
+.collab-search-result-spacer {
+  position: relative;
+  flex: 0 0 auto;
+  width: 100%;
+  min-width: var(--collab-search-grid-min-width);
+}
+
 .collab-search-result {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
   box-sizing: border-box;
   width: 100%;
-  min-width: 0;
-  min-height: 38px;
+  min-width: var(--collab-search-grid-min-width);
+  height: var(--collab-search-result-row-height);
+  min-height: var(--collab-search-result-row-height);
   display: grid;
   grid-template-columns: var(--collab-search-grid-columns);
   gap: 10px;
@@ -1379,6 +1556,7 @@ onUnmounted(() => {
   color: var(--text-color);
   text-align: left;
   cursor: pointer;
+  contain: layout paint style;
   transition: background 0.12s ease;
 }
 
