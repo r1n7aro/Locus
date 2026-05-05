@@ -43,6 +43,7 @@ where
         thinking_level,
         explicit_reasoning_effort,
         session_id,
+        supports_previous_response_id(base_url),
     );
 
     let raw_request = serde_json::to_string_pretty(&body).unwrap_or_default();
@@ -224,8 +225,9 @@ fn build_request_body(
     thinking_level: Option<&str>,
     explicit_reasoning_effort: Option<&str>,
     session_id: Option<&str>,
+    use_previous_response_id: bool,
 ) -> serde_json::Value {
-    let request_input = build_request_input(history);
+    let request_input = build_request_input(history, use_previous_response_id);
 
     let mut body = serde_json::json!({
         "model": model,
@@ -284,15 +286,17 @@ struct RequestInput {
     previous_response_id: Option<String>,
 }
 
-fn build_request_input(history: &[ChatMessage]) -> RequestInput {
-    if let Some((previous_response_id, start_index)) = find_previous_response_tail(history) {
-        if start_index < history.len() {
-            let input = build_input_messages(&history[start_index..]);
-            if !input.is_empty() {
-                return RequestInput {
-                    input,
-                    previous_response_id: Some(previous_response_id),
-                };
+fn build_request_input(history: &[ChatMessage], use_previous_response_id: bool) -> RequestInput {
+    if use_previous_response_id {
+        if let Some((previous_response_id, start_index)) = find_previous_response_tail(history) {
+            if start_index < history.len() {
+                let input = build_input_messages(&history[start_index..]);
+                if !input.is_empty() {
+                    return RequestInput {
+                        input,
+                        previous_response_id: Some(previous_response_id),
+                    };
+                }
             }
         }
     }
@@ -301,6 +305,14 @@ fn build_request_input(history: &[ChatMessage]) -> RequestInput {
         input: build_input_messages(history),
         previous_response_id: None,
     }
+}
+
+fn supports_previous_response_id(base_url: &str) -> bool {
+    url::Url::parse(base_url.trim())
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+        .as_deref()
+        == Some("api.openai.com")
 }
 
 fn find_previous_response_tail(history: &[ChatMessage]) -> Option<(String, usize)> {
@@ -1047,6 +1059,7 @@ mod tests {
             None,
             None,
             None,
+            true,
         );
 
         assert_eq!(body["text"]["verbosity"].as_str(), Some("low"));
@@ -1062,6 +1075,7 @@ mod tests {
             Some("high"),
             Some("max"),
             None,
+            true,
         );
 
         assert_eq!(body["reasoning"], serde_json::json!({ "effort": "max" }));
@@ -1189,11 +1203,12 @@ mod tests {
 
     #[test]
     fn uses_previous_response_id_when_tail_has_no_local_assistant_messages() {
-        let request_input = build_request_input(&[
+        let history = [
             assistant_message("assistant-1", "call tools", Some("resp_prev")),
             tool_message("tool-1", "call_1", "done"),
             user_message_with_images("继续", vec![]),
-        ]);
+        ];
+        let request_input = build_request_input(&history, true);
 
         assert_eq!(
             request_input.previous_response_id.as_deref(),
@@ -1203,12 +1218,26 @@ mod tests {
     }
 
     #[test]
+    fn full_replay_when_previous_response_id_disabled() {
+        let history = [
+            assistant_message("assistant-1", "call tools", Some("resp_prev")),
+            tool_message("tool-1", "call_1", "done"),
+            user_message_with_images("继续", vec![]),
+        ];
+        let request_input = build_request_input(&history, false);
+
+        assert!(request_input.previous_response_id.is_none());
+        assert_eq!(request_input.input.len(), 3);
+    }
+
+    #[test]
     fn falls_back_to_full_replay_after_local_assistant_message() {
-        let request_input = build_request_input(&[
+        let history = [
             assistant_message("assistant-1", "server response", Some("resp_prev")),
             assistant_message("assistant-2", "local compact summary", None),
             user_message_with_images("继续", vec![]),
-        ]);
+        ];
+        let request_input = build_request_input(&history, true);
 
         assert!(request_input.previous_response_id.is_none());
         assert_eq!(request_input.input.len(), 3);
