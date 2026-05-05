@@ -977,7 +977,10 @@ struct PartialToolCall {
 
 impl PartialToolCall {
     fn is_complete(&self) -> bool {
-        self.arguments_done || self.item_done
+        (self.arguments_done || self.item_done)
+            && !self.call_id.trim().is_empty()
+            && !self.name.trim().is_empty()
+            && valid_tool_arguments(&self.arguments)
     }
 
     fn notify_started<H>(&mut self, next_tool_start_order: &mut usize, on_tool_call_start: &H)
@@ -1038,6 +1041,11 @@ fn collect_complete_tool_calls(
     collected.sort_by_key(|entry| entry.start_order);
 
     (collected, incomplete)
+}
+
+fn valid_tool_arguments(arguments: &str) -> bool {
+    let trimmed = arguments.trim();
+    trimmed.is_empty() || serde_json::from_str::<serde_json::Value>(trimmed).is_ok()
 }
 
 struct CodexStreamState {
@@ -1287,11 +1295,13 @@ where
                                 .get("call_id")
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("")
+                                .trim()
                                 .to_string();
                             let name = item
                                 .get("name")
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("")
+                                .trim()
                                 .to_string();
                             let arguments = item
                                 .get("arguments")
@@ -2697,6 +2707,27 @@ mod tests {
         let (collected, incomplete) = collect_complete_tool_calls(&tool_calls);
         assert_eq!(collected.len(), 1);
         assert_eq!(collected[0].tool_call.id, "call_complete");
+        assert_eq!(incomplete, 1);
+    }
+
+    #[test]
+    fn treats_complete_tool_calls_with_empty_name_as_incomplete() {
+        let mut tool_calls = std::collections::HashMap::new();
+        tool_calls.insert(
+            "missing-name".to_string(),
+            PartialToolCall {
+                call_id: "call_1".to_string(),
+                name: String::new(),
+                arguments: "{}".to_string(),
+                arguments_done: true,
+                item_done: false,
+                notified: false,
+                start_order: None,
+            },
+        );
+
+        let (collected, incomplete) = collect_complete_tool_calls(&tool_calls);
+        assert!(collected.is_empty());
         assert_eq!(incomplete, 1);
     }
 

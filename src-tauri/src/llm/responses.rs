@@ -191,33 +191,7 @@ where
         ));
     }
 
-    let tool_calls: Vec<ToolCallInfo> = {
-        let mut entries: Vec<_> = state.tool_calls_map.into_iter().collect();
-        entries.sort_by_key(|(idx, _)| *idx);
-        let mut valid = Vec::with_capacity(entries.len());
-        for (_, tc) in entries {
-            // Validate that tool call arguments are parseable JSON
-            if !tc.arguments.is_empty() {
-                if serde_json::from_str::<serde_json::Value>(&tc.arguments).is_err() {
-                    return Err(format!(
-                        "Refusing to execute partial tool arguments for '{}': invalid JSON",
-                        tc.name
-                    ));
-                }
-            }
-            valid.push(ToolCallInfo {
-                id: tc.id,
-                name: tc.name,
-                arguments: tc.arguments,
-                server_tool: None,
-                server_tool_output: None,
-                outcome: None,
-                recorded_output: None,
-                nested_tool_calls: None,
-            });
-        }
-        valid
-    };
+    let tool_calls = collect_tool_calls(state.tool_calls_map)?;
 
     if !tool_calls.is_empty() {
         state.finish_reason = "tool_calls".to_string();
@@ -441,6 +415,67 @@ struct PendingToolCall {
     name: String,
     arguments: String,
     notified: bool,
+}
+
+impl PendingToolCall {
+    fn has_complete_metadata(&self) -> bool {
+        !self.id.trim().is_empty() && !self.name.trim().is_empty()
+    }
+}
+
+fn missing_tool_call_metadata(tc: &PendingToolCall) -> String {
+    let mut missing = Vec::new();
+    if tc.id.trim().is_empty() {
+        missing.push("id");
+    }
+    if tc.name.trim().is_empty() {
+        missing.push("name");
+    }
+    missing.join(", ")
+}
+
+fn validate_tool_call_arguments(tool_name: &str, arguments: &str) -> Result<(), String> {
+    let trimmed = arguments.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    serde_json::from_str::<serde_json::Value>(trimmed)
+        .map(|_| ())
+        .map_err(|error| {
+            format!(
+                "Refusing to execute malformed tool arguments for '{}': {}",
+                tool_name, error
+            )
+        })
+}
+
+fn collect_tool_calls(map: HashMap<u32, PendingToolCall>) -> Result<Vec<ToolCallInfo>, String> {
+    let mut entries: Vec<_> = map.into_iter().collect();
+    entries.sort_by_key(|(idx, _)| *idx);
+    let mut tool_calls = Vec::with_capacity(entries.len());
+
+    for (idx, tc) in entries {
+        if !tc.has_complete_metadata() {
+            return Err(format!(
+                "Refusing to execute incomplete tool call at index {}: missing {}",
+                idx,
+                missing_tool_call_metadata(&tc)
+            ));
+        }
+        validate_tool_call_arguments(&tc.name, &tc.arguments)?;
+        tool_calls.push(ToolCallInfo {
+            id: tc.id,
+            name: tc.name,
+            arguments: tc.arguments,
+            server_tool: None,
+            server_tool_output: None,
+            outcome: None,
+            recorded_output: None,
+            nested_tool_calls: None,
+        });
+    }
+
+    Ok(tool_calls)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -671,8 +706,8 @@ where
         "response.output_item.added" => {
             if let Ok(ev) = serde_json::from_str::<OutputItemAddedEvent>(&data_str) {
                 if ev.item.item_type == "function_call" {
-                    let call_id = ev.item.call_id.unwrap_or_default();
-                    let name = ev.item.name.unwrap_or_default();
+                    let call_id = ev.item.call_id.unwrap_or_default().trim().to_string();
+                    let name = ev.item.name.unwrap_or_default().trim().to_string();
                     state.tool_calls_map.insert(
                         ev.output_index,
                         PendingToolCall {
@@ -845,13 +880,14 @@ struct InputTokensDetails {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_input_messages, build_request_body, build_request_input, drain_sse_buffer,
-        is_retryable_response_status, ResponsesStreamState,
+        build_input_messages, build_request_body, build_request_input, collect_tool_calls,
+        drain_sse_buffer, is_retryable_response_status, PendingToolCall, ResponsesStreamState,
     };
     use crate::session::models::{
         ChatMessage, ImageData, MessageRole, ServerToolKind, ToolCallInfo,
     };
     use reqwest::StatusCode;
+    use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
     fn ignore_text(_: String) {}
@@ -1069,6 +1105,23 @@ mod tests {
             thinking.lock().expect("thinking mutex poisoned").as_str(),
             "Plan first."
         );
+    }
+
+    #[test]
+    fn collect_tool_calls_rejects_empty_name() {
+        let mut tool_calls = HashMap::new();
+        tool_calls.insert(
+            0,
+            PendingToolCall {
+                id: "call_1".to_string(),
+                name: String::new(),
+                arguments: "{}".to_string(),
+                notified: false,
+            },
+        );
+
+        let err = collect_tool_calls(tool_calls).expect_err("empty name should be rejected");
+        assert!(err.contains("missing name"), "unexpected error: {}", err);
     }
 
     #[test]

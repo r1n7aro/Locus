@@ -245,33 +245,11 @@ where
                                 }
                                 if let Some(ref tcs) = choice.delta.tool_calls {
                                     for tc in tcs {
-                                        let is_new = !tool_calls_map.contains_key(&tc.index);
-                                        let entry =
-                                            tool_calls_map.entry(tc.index).or_insert_with(|| {
-                                                PartialToolCall {
-                                                    id: String::new(),
-                                                    name: String::new(),
-                                                    arguments: String::new(),
-                                                }
-                                            });
-                                        if let Some(ref id) = tc.id {
-                                            entry.id = id.clone();
-                                        }
-                                        if let Some(ref func) = tc.function {
-                                            if let Some(ref name) = func.name {
-                                                entry.name = name.clone();
-                                            }
-                                            if let Some(ref args) = func.arguments {
-                                                entry.arguments.push_str(args);
-                                            }
-                                        }
-                                        if is_new && !entry.id.is_empty() && !entry.name.is_empty()
-                                        {
-                                            on_tool_call_start(
-                                                entry.id.clone(),
-                                                entry.name.clone(),
-                                            );
-                                        }
+                                        apply_tool_call_delta(
+                                            &mut tool_calls_map,
+                                            tc,
+                                            &on_tool_call_start,
+                                        );
                                     }
                                 }
                                 if let Some(ref reason) = choice.finish_reason {
@@ -334,24 +312,7 @@ where
                         }
                         if let Some(ref tcs) = choice.delta.tool_calls {
                             for tc in tcs {
-                                let entry = tool_calls_map.entry(tc.index).or_insert_with(|| {
-                                    PartialToolCall {
-                                        id: String::new(),
-                                        name: String::new(),
-                                        arguments: String::new(),
-                                    }
-                                });
-                                if let Some(ref id) = tc.id {
-                                    entry.id = id.clone();
-                                }
-                                if let Some(ref func) = tc.function {
-                                    if let Some(ref name) = func.name {
-                                        entry.name = name.clone();
-                                    }
-                                    if let Some(ref args) = func.arguments {
-                                        entry.arguments.push_str(args);
-                                    }
-                                }
+                                apply_tool_call_delta(&mut tool_calls_map, tc, &on_tool_call_start);
                             }
                         }
                         if let Some(ref reason) = choice.finish_reason {
@@ -414,7 +375,7 @@ fn finalize_stream_response(
         return Err("Stream ended with no data and no [DONE]".to_string());
     }
 
-    let tool_calls = collect_tool_calls(tool_calls_map);
+    let tool_calls = collect_tool_calls(tool_calls_map)?;
     if !tool_calls.is_empty() {
         finish_reason = "tool_calls".to_string();
     }
@@ -601,12 +562,23 @@ fn apply_cache_control_openrouter(messages: &mut Vec<serde_json::Value>) {
     }
 }
 
-fn collect_tool_calls(map: &std::collections::HashMap<i64, PartialToolCall>) -> Vec<ToolCallInfo> {
+fn collect_tool_calls(
+    map: &std::collections::HashMap<i64, PartialToolCall>,
+) -> Result<Vec<ToolCallInfo>, String> {
     let mut entries: Vec<_> = map.iter().collect();
     entries.sort_by_key(|(idx, _)| *idx);
-    entries
-        .into_iter()
-        .map(|(_, tc)| ToolCallInfo {
+    let mut tool_calls = Vec::with_capacity(entries.len());
+
+    for (idx, tc) in entries {
+        if !tc.has_complete_metadata() {
+            return Err(format!(
+                "Refusing to execute incomplete tool call at index {}: missing {}",
+                idx,
+                missing_tool_call_metadata(tc)
+            ));
+        }
+        validate_tool_call_arguments(&tc.name, &tc.arguments)?;
+        tool_calls.push(ToolCallInfo {
             id: tc.id.clone(),
             name: tc.name.clone(),
             arguments: tc.arguments.clone(),
@@ -615,8 +587,10 @@ fn collect_tool_calls(map: &std::collections::HashMap<i64, PartialToolCall>) -> 
             outcome: None,
             recorded_output: None,
             nested_tool_calls: None,
-        })
-        .collect()
+        });
+    }
+
+    Ok(tool_calls)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -653,6 +627,78 @@ struct PartialToolCall {
     id: String,
     name: String,
     arguments: String,
+    notified: bool,
+}
+
+impl PartialToolCall {
+    fn has_complete_metadata(&self) -> bool {
+        !self.id.trim().is_empty() && !self.name.trim().is_empty()
+    }
+}
+
+fn apply_tool_call_delta<H>(
+    tool_calls_map: &mut std::collections::HashMap<i64, PartialToolCall>,
+    tc: &StreamToolCallDelta,
+    on_tool_call_start: &H,
+) where
+    H: Fn(String, String) + Send + 'static,
+{
+    let entry = tool_calls_map
+        .entry(tc.index)
+        .or_insert_with(|| PartialToolCall {
+            id: String::new(),
+            name: String::new(),
+            arguments: String::new(),
+            notified: false,
+        });
+    if let Some(ref id) = tc.id {
+        assign_non_empty(&mut entry.id, id);
+    }
+    if let Some(ref func) = tc.function {
+        if let Some(ref name) = func.name {
+            assign_non_empty(&mut entry.name, name);
+        }
+        if let Some(ref args) = func.arguments {
+            entry.arguments.push_str(args);
+        }
+    }
+    if !entry.notified && !entry.id.is_empty() && !entry.name.is_empty() {
+        on_tool_call_start(entry.id.clone(), entry.name.clone());
+        entry.notified = true;
+    }
+}
+
+fn assign_non_empty(target: &mut String, value: &str) {
+    let trimmed = value.trim();
+    if !trimmed.is_empty() {
+        *target = trimmed.to_string();
+    }
+}
+
+fn missing_tool_call_metadata(tc: &PartialToolCall) -> String {
+    let mut missing = Vec::new();
+    if tc.id.trim().is_empty() {
+        missing.push("id");
+    }
+    if tc.name.trim().is_empty() {
+        missing.push("name");
+    }
+    missing.join(", ")
+}
+
+fn validate_tool_call_arguments(tool_name: &str, arguments: &str) -> Result<(), String> {
+    let trimmed = arguments.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    serde_json::from_str::<serde_json::Value>(trimmed)
+        .map(|_| ())
+        .map_err(|error| {
+            format!(
+                "Refusing to execute malformed tool arguments for '{}': {}",
+                tool_name, error
+            )
+        })
 }
 
 #[derive(Debug, Deserialize)]
@@ -722,11 +768,12 @@ struct ApiRequest {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_api_messages, build_request_body, finalize_stream_response, usage_totals,
-        PartialToolCall, StreamUsage,
+        apply_tool_call_delta, build_api_messages, build_request_body, collect_tool_calls,
+        finalize_stream_response, usage_totals, PartialToolCall, StreamToolCallDelta, StreamUsage,
     };
     use crate::session::models::{ChatMessage, MessageRole, ToolCallInfo};
     use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
 
     fn chat_message(
         role: MessageRole,
@@ -757,6 +804,7 @@ mod tests {
             id: id.to_string(),
             name: name.to_string(),
             arguments: arguments.to_string(),
+            notified: false,
         }
     }
 
@@ -931,5 +979,49 @@ mod tests {
         assert_eq!(tool_response.tool_calls[0].id, "call_1");
         assert_eq!(tool_response.tool_calls[0].name, "write_file");
         assert_eq!(tool_response.finish_reason, "tool_calls");
+    }
+
+    #[test]
+    fn tool_call_delta_preserves_existing_name_and_notifies_once() {
+        let mut tool_calls = HashMap::new();
+        let started = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+        let captured = started.clone();
+        let on_tool = move |id: String, name: String| {
+            captured
+                .lock()
+                .expect("tool mutex poisoned")
+                .push((id, name));
+        };
+
+        let start: StreamToolCallDelta = serde_json::from_value(serde_json::json!({
+            "index": 0,
+            "id": "call_1",
+            "function": { "name": "list", "arguments": "" }
+        }))
+        .expect("start delta should parse");
+        apply_tool_call_delta(&mut tool_calls, &start, &on_tool);
+
+        let args: StreamToolCallDelta = serde_json::from_value(serde_json::json!({
+            "index": 0,
+            "function": { "name": "", "arguments": "{\"path\":\"Assets\"}" }
+        }))
+        .expect("arguments delta should parse");
+        apply_tool_call_delta(&mut tool_calls, &args, &on_tool);
+
+        let collected = collect_tool_calls(&tool_calls).expect("tool call should be valid");
+        assert_eq!(collected[0].name, "list");
+        assert_eq!(
+            started.lock().expect("tool mutex poisoned").as_slice(),
+            &[("call_1".to_string(), "list".to_string())]
+        );
+    }
+
+    #[test]
+    fn collect_tool_calls_rejects_empty_name() {
+        let mut tool_calls = HashMap::new();
+        tool_calls.insert(0, complete_tool_call("call_1", "", "{}"));
+
+        let err = collect_tool_calls(&tool_calls).expect_err("empty name should be rejected");
+        assert!(err.contains("missing name"), "unexpected error: {}", err);
     }
 }

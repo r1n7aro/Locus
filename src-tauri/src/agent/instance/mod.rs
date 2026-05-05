@@ -278,6 +278,37 @@ pub(super) fn finalize_tool_call_record(
     finalized
 }
 
+fn validate_llm_tool_calls(tool_calls: &[ToolCallInfo]) -> Result<(), String> {
+    for (index, tool_call) in tool_calls.iter().enumerate() {
+        let mut missing = Vec::new();
+        if tool_call.id.trim().is_empty() {
+            missing.push("id");
+        }
+        if tool_call.name.trim().is_empty() {
+            missing.push("name");
+        }
+        if !missing.is_empty() {
+            return Err(format!(
+                "LLM returned incomplete tool call metadata at index {}: missing {}",
+                index,
+                missing.join(", ")
+            ));
+        }
+
+        let arguments = tool_call.arguments.trim();
+        if !arguments.is_empty() {
+            serde_json::from_str::<serde_json::Value>(arguments).map_err(|error| {
+                format!(
+                    "LLM returned malformed arguments for tool '{}' (id={}): {}",
+                    tool_call.name, tool_call.id, error
+                )
+            })?;
+        }
+    }
+
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InjectedPromptItem {
@@ -4973,6 +5004,34 @@ impl AgentInstance {
                         return Ok(String::new());
                     }
                     Some(Ok(resp)) => {
+                        if let Err(e) = validate_llm_tool_calls(&resp.tool_calls) {
+                            eprintln!(
+                                "[Agent {}] LLM attempt returned invalid tool calls: session={} run={} iteration={} attempt={}/{} elapsed_ms={} error={}",
+                                self.id,
+                                self.session_id,
+                                run_id,
+                                iteration,
+                                attempt_number,
+                                LLM_RETRIES + 1,
+                                llm_call_started_at.elapsed().as_millis(),
+                                e
+                            );
+                            last_llm_error = e.clone();
+                            if llm_attempt < LLM_RETRIES {
+                                let delay = 2000 * (llm_attempt as u64 + 1);
+                                eprintln!(
+                                    "[Agent {}] invalid tool calls (attempt {}/{}), retrying in {}ms: {}",
+                                    self.id,
+                                    llm_attempt + 1,
+                                    LLM_RETRIES + 1,
+                                    delay,
+                                    e
+                                );
+                                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                                continue;
+                            }
+                            continue;
+                        }
                         eprintln!(
                             "[Agent {}] LLM attempt success: session={} run={} iteration={} attempt={}/{} elapsed_ms={} text_len={} thinking_len={} tool_calls={} finish_reason={}",
                             self.id,

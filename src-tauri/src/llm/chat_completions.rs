@@ -555,6 +555,45 @@ struct PartialToolCall {
     notified: bool,
 }
 
+impl PartialToolCall {
+    fn has_complete_metadata(&self) -> bool {
+        !self.id.trim().is_empty() && !self.name.trim().is_empty()
+    }
+}
+
+fn assign_non_empty(target: &mut String, value: &str) {
+    let trimmed = value.trim();
+    if !trimmed.is_empty() {
+        *target = trimmed.to_string();
+    }
+}
+
+fn missing_tool_call_metadata(tc: &PartialToolCall) -> String {
+    let mut missing = Vec::new();
+    if tc.id.trim().is_empty() {
+        missing.push("id");
+    }
+    if tc.name.trim().is_empty() {
+        missing.push("name");
+    }
+    missing.join(", ")
+}
+
+fn validate_tool_call_arguments(tool_name: &str, arguments: &str) -> Result<(), String> {
+    let trimmed = arguments.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    serde_json::from_str::<serde_json::Value>(trimmed)
+        .map(|_| ())
+        .map_err(|error| {
+            format!(
+                "Refusing to execute malformed tool arguments for '{}': {}",
+                tool_name, error
+            )
+        })
+}
+
 fn next_sse_separator(buffer: &str) -> Option<(usize, usize)> {
     let lf = buffer.find("\n\n").map(|pos| (pos, 2usize));
     let crlf = buffer.find("\r\n\r\n").map(|pos| (pos, 4usize));
@@ -694,11 +733,11 @@ fn apply_stream_chunk<F, G, H>(
                             notified: false,
                         });
                 if let Some(ref id) = tc.id {
-                    entry.id = id.clone();
+                    assign_non_empty(&mut entry.id, id);
                 }
                 if let Some(ref func) = tc.function {
                     if let Some(ref name) = func.name {
-                        entry.name = name.clone();
+                        assign_non_empty(&mut entry.name, name);
                     }
                     if let Some(ref args) = func.arguments {
                         entry.arguments.push_str(args);
@@ -750,7 +789,7 @@ fn finalize_stream_response(
         return Err("Stream ended with no data and no [DONE]".to_string());
     }
 
-    let tool_calls = collect_tool_calls(&state.tool_calls_map);
+    let tool_calls = collect_tool_calls(&state.tool_calls_map)?;
     if !tool_calls.is_empty() {
         state.finish_reason = "tool_calls".to_string();
     }
@@ -787,12 +826,23 @@ fn finalize_stream_response(
     Ok(resp)
 }
 
-fn collect_tool_calls(map: &std::collections::HashMap<i64, PartialToolCall>) -> Vec<ToolCallInfo> {
+fn collect_tool_calls(
+    map: &std::collections::HashMap<i64, PartialToolCall>,
+) -> Result<Vec<ToolCallInfo>, String> {
     let mut entries: Vec<_> = map.iter().collect();
     entries.sort_by_key(|(idx, _)| *idx);
-    entries
-        .into_iter()
-        .map(|(_, tc)| ToolCallInfo {
+    let mut tool_calls = Vec::with_capacity(entries.len());
+
+    for (idx, tc) in entries {
+        if !tc.has_complete_metadata() {
+            return Err(format!(
+                "Refusing to execute incomplete tool call at index {}: missing {}",
+                idx,
+                missing_tool_call_metadata(tc)
+            ));
+        }
+        validate_tool_call_arguments(&tc.name, &tc.arguments)?;
+        tool_calls.push(ToolCallInfo {
             id: tc.id.clone(),
             name: tc.name.clone(),
             arguments: tc.arguments.clone(),
@@ -801,8 +851,10 @@ fn collect_tool_calls(map: &std::collections::HashMap<i64, PartialToolCall>) -> 
             outcome: None,
             recorded_output: None,
             nested_tool_calls: None,
-        })
-        .collect()
+        });
+    }
+
+    Ok(tool_calls)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -892,10 +944,11 @@ struct StreamFunctionDelta {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_stream_chunk, build_api_messages, build_request_body, ChatCompletionsFlavor,
-        ChatStreamState, StreamChunk,
+        apply_stream_chunk, build_api_messages, build_request_body, collect_tool_calls,
+        ChatCompletionsFlavor, ChatStreamState, PartialToolCall, StreamChunk,
     };
     use crate::session::models::{ChatMessage, ImageData, MessageRole, ToolCallInfo};
+    use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
     fn ignore_text(_: String) {}
@@ -1181,5 +1234,73 @@ mod tests {
 
         assert_eq!(state.full_text, "Answer.");
         assert_eq!(state.finish_reason, "stop");
+    }
+
+    #[test]
+    fn stream_empty_tool_name_delta_preserves_existing_name() {
+        let mut state = ChatStreamState::new();
+        let started = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+        let captured = started.clone();
+        let on_tool = move |id: String, name: String| {
+            captured
+                .lock()
+                .expect("tool mutex poisoned")
+                .push((id, name));
+        };
+
+        let start: StreamChunk = serde_json::from_value(serde_json::json!({
+            "choices": [{
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_1",
+                        "function": { "name": "list", "arguments": "" }
+                    }]
+                },
+                "finish_reason": null
+            }]
+        }))
+        .expect("start chunk should parse");
+        apply_stream_chunk(start, &mut state, &ignore_text, &ignore_thinking, &on_tool);
+
+        let args: StreamChunk = serde_json::from_value(serde_json::json!({
+            "choices": [{
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "function": { "name": "", "arguments": "{\"path\":\"Assets\"}" }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }))
+        .expect("arguments chunk should parse");
+        apply_stream_chunk(args, &mut state, &ignore_text, &ignore_thinking, &on_tool);
+
+        let tool_calls =
+            collect_tool_calls(&state.tool_calls_map).expect("tool call should be complete");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].name, "list");
+        assert_eq!(
+            started.lock().expect("tool mutex poisoned").as_slice(),
+            &[("call_1".to_string(), "list".to_string())]
+        );
+    }
+
+    #[test]
+    fn collect_tool_calls_rejects_empty_name() {
+        let mut tool_calls = HashMap::new();
+        tool_calls.insert(
+            0,
+            PartialToolCall {
+                id: "call_1".to_string(),
+                name: String::new(),
+                arguments: "{}".to_string(),
+                notified: false,
+            },
+        );
+
+        let err = collect_tool_calls(&tool_calls).expect_err("empty name should be rejected");
+        assert!(err.contains("missing name"), "unexpected error: {}", err);
     }
 }
