@@ -1,9 +1,9 @@
 ---
 title: "Latest Version"
-description: "Locus v0.2.6 (2026-05-04)"
+description: "Locus v0.2.7 (2026-05-05)"
 sidebarTitle: "Latest Version"
-version: "0.2.6"
-releasedAt: "2026-05-04"
+version: "0.2.7"
+releasedAt: "2026-05-05"
 channel: "stable"
 updateTitle: "Update available"
 changelogUrl: "/en/overview/latest-version"
@@ -17,18 +17,15 @@ changelogUrl: "/en/overview/latest-version"
 
 ### Added
 
-- Added startup tracing across the Rust backend and Vue frontend, with the main window shown after the first mounted frame.
-- Added deferred startup work for tab preloading, recent workspace loading, Unity monitoring, asset reconciliation, and knowledge indexing.
-- Added inline model setup in onboarding for custom endpoints and OpenAI Codex device auth.
-- Added connection testing for custom endpoints during onboarding.
-- Added visible vector runtime startup state in Knowledge, including a compact loading indicator while local embeddings start.
+- Added setup documentation for opening the embedded Unity editor window through `Window > Locus`.
 
 ### Fixed
 
-- Cached Git and Python runtime discovery so Settings can reuse discovered runtimes without repeating blocking scans.
-- Moved Git runtime discovery off the blocking command path.
-- Added onboarding project-opening feedback and disabled navigation while the selected project is being opened.
-- Kept Knowledge list and overview reads responsive while the embedding manager is busy.
+- Rejected incomplete or malformed streamed tool calls before execution across LLM providers.
+- Preserved existing tool call names when streaming providers send later empty name deltas.
+- Retried invalid LLM tool call responses instead of continuing with incomplete metadata.
+- Kept Collab search responsive with large result sets by virtualizing result rows.
+- Reduced column-resize work in Collab search by applying drag updates through animation frames and persisting widths after commit.
 
 ### Removed
 

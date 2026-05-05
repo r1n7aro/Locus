@@ -1,9 +1,9 @@
 ---
 title: "当前版本"
-description: "Locus v0.2.6 (2026-05-04)"
+description: "Locus v0.2.7 (2026-05-05)"
 sidebarTitle: "当前版本"
-version: "0.2.6"
-releasedAt: "2026-05-04"
+version: "0.2.7"
+releasedAt: "2026-05-05"
 channel: "stable"
 updateTitle: "发现新版本"
 changelogUrl: "/overview/latest-version"
@@ -17,18 +17,15 @@ changelogUrl: "/overview/latest-version"
 
 ### 新增
 
-- 新增 Rust 后端与 Vue 前端启动阶段追踪，主窗口会在首帧挂载后显示。
-- 新增延后启动任务，用于标签预加载、最近工作区加载、Unity 监听、资产索引校准与知识索引。
-- Onboarding 支持内联配置自定义模型端点与 OpenAI Codex 设备授权。
-- Onboarding 支持测试自定义端点连接。
-- Knowledge 显示向量运行时启动状态，本地 embedding 启动时会展示轻量加载提示。
+- 安装配置文档补充 Unity 编辑器中通过 `Window > Locus` 打开内置窗口的说明。
 
 ### 修复
 
-- Git 与 Python 运行时发现结果会缓存，Settings 可复用发现结果，减少重复阻塞扫描。
-- Git 运行时发现移到后台阻塞任务中执行。
-- Onboarding 打开项目时会显示处理中状态，并在切换完成前禁用导航。
-- Knowledge 列表与概览读取在 embedding manager 繁忙时保持响应。
+- LLM 流式工具调用会在执行前拒绝缺失元数据或参数格式错误的结果。
+- 当流式 provider 后续发送空工具名称增量时，保留已接收的工具名称。
+- LLM 返回无效工具调用时会进入重试流程，避免继续使用不完整元数据。
+- Collab 搜索结果改为虚拟列表，大量结果下保持响应。
+- Collab 搜索列宽拖拽通过动画帧更新，并在提交后持久化，减少拖拽过程中的更新压力。
 
 ### 移除
 
