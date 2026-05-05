@@ -21,6 +21,22 @@ English | [简体中文](README.zh-CN.md)
 
 Locus is currently in early testing (`v0.2.7`). We welcome you to try it and share feedback through Issues. Your input is highly valuable to us.
 
+## What Makes Locus Technically Different?
+
+Locus is a standalone Rust + Tauri + Vue.js application that runs as an independent process.
+
+- We designed a proprietary intermediate representation that lets agents progressively read large scenes and assets, along with retrieval tools that help agents quickly locate target objects
+- With Roslyn, Locus can JIT-compile and execute C# code inside the Unity Editor to make semantic asset edits. Locus also includes agent-side version management handling so users can review and revert asset and code changes the agent makes during a conversation
+- Built on Rust's parallel ecosystem, Locus performs highly parallel asset database scans, enabling fast semantic parsing for large scenes and reference queries for arbitrary assets. The Unity Editor API only provides dependency queries
+- Locus includes an automated knowledge system. The agent summarizes fragmented conversation requests into design documents and saves working understanding into memory, reducing repeated project exploration
+- Documents in the knowledge system support configurable AI maintenance modes and maintenance rules, plus L0/L1/L2 injection control inside context. Users can customize progressive expansion behavior, use native lexical and syntactic retrieval across large document sets, and choose and download embedding runtimes
+- We built C# state-machine tools so the agent can sample internal state through reflection at specific frames or events during runtime, output frame-by-frame tables, and dynamically debug multi-frame behavior
+- Locus provides a graphical version control interface and supports semantic diff review and conflict resolution for Unity YAML files
+- Locus uses Vue.js to deliver a modern frontend experience with better UX than the limited controls provided by the Unity Editor API, then embeds it into the Unity window through Windows APIs
+
+If Locus were implemented inside the Unity Editor, or designed as an MCP server, most of these capabilities would be difficult to deliver and some would be nearly impossible technically.
+So please stop asking us how `Locus` differs from `Coding Agent + MCP` or from agents implemented inside the Unity Editor.
+
 ## Installation
 
 Windows is currently the only supported platform. We plan to add macOS support soon.
