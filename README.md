@@ -36,8 +36,6 @@ Locus is a standalone Rust + Tauri + Vue.js application that runs as an independ
 
 If Locus were implemented inside the Unity Editor, or designed as an MCP server, most of these capabilities would be difficult to deliver and some would be nearly impossible technically.
 
-Therefore, please stop asking us how `Locus` differs from `Coding Agent + MCP` or from agents implemented inside the Unity Editor.
-
 ## Installation
 
 Windows is currently the only supported platform. We plan to add macOS support soon.

@@ -36,8 +36,6 @@ Locus是一个Rust + Tauri + Vue.js的独立进程应用程序。
 
 如果选择在 Unity 编辑器内部实现 Locus，或将 Locus 设计为一个 MCP 服务器，上述多数特性将难以落地，甚至在技术上几乎不可实现。
 
-因此，不要再问我们`Locus`与`Coding Agent + MCP`或`在 Unity 编辑器内部实现的 Agent`有什么不同了。
-
 ## 安装
 
 目前仅支持 Windows 系统，我们很快会完善针对 macOS 的支持。
