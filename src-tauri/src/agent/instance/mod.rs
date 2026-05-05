@@ -117,7 +117,7 @@ pub struct AgentInstance {
     working_dir: String,
     raw_store: RawContextStore,
     workspace_id: Option<String>,
-    parent_tool_call: Option<(String, String)>,
+    parent_tool_call: Option<ParentToolCall>,
     effort: Option<String>,
     app_knowledge_dir: Arc<Option<std::path::PathBuf>>,
     app_agent_dir: Arc<Option<std::path::PathBuf>>,
@@ -126,6 +126,81 @@ pub struct AgentInstance {
     tool_runtime_state: Arc<ToolRuntimeState>,
     partial_assistant: Arc<AssistantStreamState>,
     cancel_rx: tokio::sync::watch::Receiver<bool>,
+}
+
+#[derive(Debug, Clone)]
+struct ParentToolCall {
+    session_id: String,
+    run_id: String,
+    tool_call_id: String,
+}
+
+struct ParentStreamEvent {
+    run_id: String,
+    event: StreamEvent,
+}
+
+impl ParentToolCall {
+    fn new(session_id: String, run_id: String, tool_call_id: String) -> Self {
+        Self {
+            session_id,
+            run_id,
+            tool_call_id,
+        }
+    }
+
+    fn tool_call_delta(&self, delta: String) -> ParentStreamEvent {
+        ParentStreamEvent {
+            run_id: self.run_id.clone(),
+            event: StreamEvent::ToolCallDelta {
+                session_id: self.session_id.clone(),
+                tool_call_id: self.tool_call_id.clone(),
+                delta,
+            },
+        }
+    }
+
+    fn subagent_tool_call_start(
+        &self,
+        tool_call_id: String,
+        tool_name: String,
+        arguments: String,
+    ) -> ParentStreamEvent {
+        ParentStreamEvent {
+            run_id: self.run_id.clone(),
+            event: StreamEvent::SubagentToolCallStart {
+                session_id: self.session_id.clone(),
+                parent_tool_call_id: self.tool_call_id.clone(),
+                tool_call_id,
+                tool_name,
+                arguments,
+            },
+        }
+    }
+
+    fn subagent_tool_call_done(
+        &self,
+        tool_call_id: String,
+        tool_name: String,
+        output: String,
+        outcome: crate::commands::ToolCallOutcome,
+    ) -> ParentStreamEvent {
+        ParentStreamEvent {
+            run_id: self.run_id.clone(),
+            event: StreamEvent::SubagentToolCallDone {
+                session_id: self.session_id.clone(),
+                parent_tool_call_id: self.tool_call_id.clone(),
+                tool_call_id,
+                tool_name,
+                output,
+                outcome,
+            },
+        }
+    }
+}
+
+fn emit_parent_stream(handle: &AppHandle, event: ParentStreamEvent) {
+    emit_stream(handle, &event.run_id, event.event);
 }
 
 #[derive(Debug, Default, Clone)]
@@ -1600,11 +1675,11 @@ fn l3_rule_display_title(doc: &crate::knowledge_store::KnowledgeDocument) -> Str
     match (doc.doc_type, doc.path.trim()) {
         (crate::knowledge_store::KnowledgeType::Memory, "project-mistake-note.md")
         | (crate::knowledge_store::KnowledgeType::Memory, "project_mistake_note.md") => {
-            "错题本".to_string()
+            "Mistake Notebook".to_string()
         }
         (crate::knowledge_store::KnowledgeType::Memory, "user-preference.md")
         | (crate::knowledge_store::KnowledgeType::Memory, "user_preference.md") => {
-            "用户偏好".to_string()
+            "User Preferences".to_string()
         }
         _ => {
             let title = doc.title.trim();
@@ -1628,7 +1703,7 @@ fn format_l3_rule_heading(doc: &crate::knowledge_store::KnowledgeDocument) -> St
     if title.is_empty() {
         path
     } else {
-        format!("{}（{}）", title, path)
+        format!("{} ({})", title, path)
     }
 }
 
@@ -1682,7 +1757,7 @@ fn build_l3_rule_entries(
             let content = [
                 format!("### {}", title),
                 String::new(),
-                "Maintain Rules:".to_string(),
+                "Maintenance Rules:".to_string(),
                 rules.to_string(),
                 String::new(),
                 "Full Document:".to_string(),
@@ -4923,12 +4998,8 @@ impl AgentInstance {
                                 text: delta.clone(),
                             });
                             partial_for_text.append_text(&delta);
-                            if let Some((ref parent_sid, ref tc_id)) = ptc {
-                                emit_stream(&hdl, &rid, StreamEvent::ToolCallDelta {
-                                    session_id: parent_sid.clone(),
-                                    tool_call_id: tc_id.clone(),
-                                    delta,
-                                });
+                            if let Some(ref parent) = ptc {
+                                emit_parent_stream(&hdl, parent.tool_call_delta(delta));
                             }
                         },
                         move |thinking| {
@@ -4972,14 +5043,14 @@ impl AgentInstance {
                                 tool_name: tool_name.clone(),
                                 arguments: String::new(),
                             });
-                            if let Some((ref parent_sid, ref parent_tc_id)) = ptc3 {
-                                emit_stream(&hdl3, &rid3, StreamEvent::SubagentToolCallStart {
-                                    session_id: parent_sid.clone(),
-                                    parent_tool_call_id: parent_tc_id.clone(),
-                                    tool_call_id,
-                                    tool_name,
-                                    arguments: String::new(),
-                                    },
+                            if let Some(ref parent) = ptc3 {
+                                emit_parent_stream(
+                                    &hdl3,
+                                    parent.subagent_tool_call_start(
+                                        tool_call_id,
+                                        tool_name,
+                                        String::new(),
+                                    ),
                                 );
                             }
                         },
@@ -5216,22 +5287,24 @@ impl AgentInstance {
                         output: output.clone(),
                         outcome: crate::commands::ToolCallOutcome::Done,
                     });
-                    if let Some((ref parent_sid, ref parent_tc_id)) = self.parent_tool_call {
-                        emit_stream(app_handle, &run_id, StreamEvent::SubagentToolCallStart {
-                            session_id: parent_sid.clone(),
-                            parent_tool_call_id: parent_tc_id.clone(),
-                            tool_call_id: tc.id.clone(),
-                            tool_name: tc.name.clone(),
-                            arguments: tc.arguments.clone(),
-                        });
-                        emit_stream(app_handle, &run_id, StreamEvent::SubagentToolCallDone {
-                            session_id: parent_sid.clone(),
-                            parent_tool_call_id: parent_tc_id.clone(),
-                            tool_call_id: tc.id.clone(),
-                            tool_name: tc.name.clone(),
-                            output: output.clone(),
-                            outcome: crate::commands::ToolCallOutcome::Done,
-                        });
+                    if let Some(ref parent) = self.parent_tool_call {
+                        emit_parent_stream(
+                            app_handle,
+                            parent.subagent_tool_call_start(
+                                tc.id.clone(),
+                                tc.name.clone(),
+                                tc.arguments.clone(),
+                            ),
+                        );
+                        emit_parent_stream(
+                            app_handle,
+                            parent.subagent_tool_call_done(
+                                tc.id.clone(),
+                                tc.name.clone(),
+                                output.clone(),
+                                crate::commands::ToolCallOutcome::Done,
+                            ),
+                        );
                     }
                 }
             }
@@ -5286,14 +5359,15 @@ impl AgentInstance {
                         tool_name: tc.name.clone(),
                         arguments: tc.arguments.clone(),
                     });
-                    if let Some((ref parent_sid, ref parent_tc_id)) = self.parent_tool_call {
-                        emit_stream(app_handle, &run_id, StreamEvent::SubagentToolCallStart {
-                            session_id: parent_sid.clone(),
-                            parent_tool_call_id: parent_tc_id.clone(),
-                            tool_call_id: tc.id.clone(),
-                            tool_name: tc.name.clone(),
-                            arguments: tc.arguments.clone(),
-                        });
+                    if let Some(ref parent) = self.parent_tool_call {
+                        emit_parent_stream(
+                            app_handle,
+                            parent.subagent_tool_call_start(
+                                tc.id.clone(),
+                                tc.name.clone(),
+                                tc.arguments.clone(),
+                            ),
+                        );
                     }
 
                     let mut args: serde_json::Value = match serde_json::from_str(&tc.arguments) {
@@ -5477,21 +5551,22 @@ impl AgentInstance {
                         output: stored_output.clone(),
                         outcome: result.outcome.as_stream_outcome(),
                     });
-                    if let Some((ref parent_sid, ref parent_tc_id)) = self.parent_tool_call {
+                    if let Some(ref parent) = self.parent_tool_call {
                         let truncated_output = if stored_output.chars().count() > 500 {
                             let s: String = stored_output.chars().take(500).collect();
                             format!("{}…({} chars)", s, result.output.chars().count())
                         } else {
                             stored_output.clone()
                         };
-                        emit_stream(app_handle, &run_id, StreamEvent::SubagentToolCallDone {
-                            session_id: parent_sid.clone(),
-                            parent_tool_call_id: parent_tc_id.clone(),
-                            tool_call_id: tc.id.clone(),
-                            tool_name: tc.name.clone(),
-                            output: truncated_output,
-                            outcome: result.outcome.as_stream_outcome(),
-                        });
+                        emit_parent_stream(
+                            app_handle,
+                            parent.subagent_tool_call_done(
+                                tc.id.clone(),
+                                tc.name.clone(),
+                                truncated_output,
+                                result.outcome.as_stream_outcome(),
+                            ),
+                        );
                     }
 
                     if let Err(e) = store.add_tool_result(
@@ -9178,7 +9253,11 @@ impl AgentInstance {
             self.subagent_model_overrides.clone(),
             self.cancel_waiter(),
         );
-        child.parent_tool_call = Some((self.session_id.clone(), tool_call_id.to_string()));
+        child.parent_tool_call = Some(ParentToolCall::new(
+            self.session_id.clone(),
+            run_id.to_string(),
+            tool_call_id.to_string(),
+        ));
 
         match child
             .run(app_handle, store, prompt, None, "build", None)
@@ -9411,10 +9490,13 @@ mod tests {
         build_structure_section, finalize_tool_call_record, AgentInstance,
         AgentKnowledgeDocumentContent, AgentKnowledgeDocumentContentPatch, AgentKnowledgeListItem,
         AgentKnowledgeMutationResponse, AgentKnowledgeReadResponse, AgentKnowledgeSearchHit,
-        ExecutedToolResult, RawContextStore, ToolRunOutcome,
+        ExecutedToolResult, ParentToolCall, RawContextStore, ToolRunOutcome,
     };
     use crate::agent::definition::{AgentDef, AgentDefRegistry};
-    use crate::commands::{KnowledgeToolConfirmDirectoryMode, KnowledgeToolConfirmOperation};
+    use crate::commands::{
+        KnowledgeToolConfirmDirectoryMode, KnowledgeToolConfirmOperation, StreamEvent,
+        ToolCallOutcome,
+    };
     use crate::knowledge_store::{
         create_directory, default_directory_config_for_type, save_document,
         update_directory_config, KnowledgeDocument, KnowledgeInjectMode, KnowledgeReadResponse,
@@ -9435,6 +9517,79 @@ mod tests {
         });
 
         assert_eq!(result.outcome, ToolRunOutcome::Interrupted);
+    }
+
+    #[test]
+    fn parent_tool_call_events_use_parent_run_context() {
+        let parent = ParentToolCall::new(
+            "parent-session".to_string(),
+            "parent-run".to_string(),
+            "task-1".to_string(),
+        );
+
+        let start = parent.subagent_tool_call_start(
+            "read-1".to_string(),
+            "read".to_string(),
+            "{}".to_string(),
+        );
+        assert_eq!(start.run_id, "parent-run");
+        match start.event {
+            StreamEvent::SubagentToolCallStart {
+                session_id,
+                parent_tool_call_id,
+                tool_call_id,
+                tool_name,
+                arguments,
+            } => {
+                assert_eq!(session_id, "parent-session");
+                assert_eq!(parent_tool_call_id, "task-1");
+                assert_eq!(tool_call_id, "read-1");
+                assert_eq!(tool_name, "read");
+                assert_eq!(arguments, "{}");
+            }
+            other => panic!("unexpected event: {:?}", other),
+        }
+
+        let delta = parent.tool_call_delta("partial".to_string());
+        assert_eq!(delta.run_id, "parent-run");
+        match delta.event {
+            StreamEvent::ToolCallDelta {
+                session_id,
+                tool_call_id,
+                delta,
+            } => {
+                assert_eq!(session_id, "parent-session");
+                assert_eq!(tool_call_id, "task-1");
+                assert_eq!(delta, "partial");
+            }
+            other => panic!("unexpected event: {:?}", other),
+        }
+
+        let done = parent.subagent_tool_call_done(
+            "read-1".to_string(),
+            "read".to_string(),
+            "ok".to_string(),
+            ToolCallOutcome::Done,
+        );
+        assert_eq!(done.run_id, "parent-run");
+        match done.event {
+            StreamEvent::SubagentToolCallDone {
+                session_id,
+                parent_tool_call_id,
+                tool_call_id,
+                tool_name,
+                output,
+                outcome,
+            } => {
+                assert_eq!(session_id, "parent-session");
+                assert_eq!(parent_tool_call_id, "task-1");
+                assert_eq!(tool_call_id, "read-1");
+                assert_eq!(tool_name, "read");
+                assert_eq!(output, "ok");
+                assert_eq!(outcome, ToolCallOutcome::Done);
+            }
+            other => panic!("unexpected event: {:?}", other),
+        }
     }
 
     #[test]
@@ -10508,7 +10663,9 @@ Use profiler helpers.
         let working_dir = temp.path().to_string_lossy().to_string();
 
         let structure = build_structure_section(&working_dir, None).expect("build structure");
-        assert!(structure.contains("unity-project-understanding/ :: 维护 Unity 工程理解的结构缓存"));
+        assert!(structure.contains(
+            "unity-project-understanding/ :: Maintains a structural cache of Unity project understanding"
+        ));
         assert!(structure.contains(
             "Record only Unity project structure knowledge and lookup info that reduce repeated exploration"
         ));
@@ -10630,8 +10787,8 @@ Use profiler helpers.
 
         let rules = build_l3_rule_section(&working_dir, None).expect("build l3 rules");
         assert!(rules.contains("## L3 Rules"));
-        assert!(rules.contains("### 用户偏好（memory/user-preference.md）"));
-        assert!(rules.contains("Maintain Rules:"));
+        assert!(rules.contains("### User Preferences (memory/user-preference.md)"));
+        assert!(rules.contains("Maintenance Rules:"));
         assert!(rules
             .contains("- Record only long-term user preferences that stay stable across tasks"));
         assert!(rules.contains(
@@ -10679,8 +10836,8 @@ Use profiler helpers.
         .expect("save empty memory");
 
         let rules = build_l3_rule_section(&working_dir, None).expect("build l3 rules");
-        assert!(rules.contains("### Empty Memory（memory/empty-memory.md）"));
-        assert!(rules.contains("Maintain Rules:\n<empty>"));
+        assert!(rules.contains("### Empty Memory (memory/empty-memory.md)"));
+        assert!(rules.contains("Maintenance Rules:\n<empty>"));
         assert!(rules.contains("Full Document:\n<empty>"));
     }
 
@@ -10722,7 +10879,7 @@ Use profiler helpers.
         .expect("save mapped memory");
 
         let rules = build_l3_rule_section(&working_dir, None).expect("build mapped rules");
-        assert!(rules.contains("### Heading Map（memory/heading-map.md）"));
+        assert!(rules.contains("### Heading Map (memory/heading-map.md)"));
         assert!(rules.contains("Full Document:\n#### 一级\n##### 二级\n正文"));
     }
 
@@ -10751,7 +10908,7 @@ Use profiler helpers.
         assert!(prompt_parts.rules_prompt.contains("## L3 Rules"));
         assert!(prompt_parts
             .rules_prompt
-            .contains("### 用户偏好（memory/user-preference.md）"));
+            .contains("### User Preferences (memory/user-preference.md)"));
         assert!(prompt_parts.env_prompt.contains("Working directory:"));
         assert!(!prompt_parts.env_prompt.contains("## Knowledge"));
         assert!(!prompt_parts.env_prompt.contains("project-mistake-note.md"));

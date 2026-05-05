@@ -846,6 +846,17 @@ impl SessionStore {
         .map_err(|e| format!("Failed to query active session run: {}", e))
     }
 
+    pub fn session_id_for_run(&self, run_id: &str) -> Result<Option<String>, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        conn.query_row(
+            "SELECT session_id FROM session_runs WHERE run_id = ?1",
+            params![run_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|e| format!("Failed to query session run owner: {}", e))
+    }
+
     pub fn append_session_event(
         &self,
         session_id: &str,
@@ -3129,6 +3140,31 @@ mod tests {
         store
             .try_start_run(&session_id, "run-2")
             .expect("start second run");
+    }
+
+    #[test]
+    fn session_id_for_run_returns_run_owner() {
+        let dir = tempdir().expect("create temp dir");
+        let store = SessionStore::new(dir.path()).expect("initialize store");
+        let session_id = store
+            .create_session("Run Owner", None, None, "chat", None)
+            .expect("create session");
+
+        assert_eq!(
+            store
+                .session_id_for_run("missing-run")
+                .expect("query missing run"),
+            None
+        );
+
+        store
+            .try_start_run(&session_id, "run-1")
+            .expect("start run");
+
+        assert_eq!(
+            store.session_id_for_run("run-1").expect("query run owner"),
+            Some(session_id)
+        );
     }
 
     #[test]

@@ -134,9 +134,59 @@ fn event_merge(
     }
 }
 
+#[cfg(debug_assertions)]
+#[derive(Debug, PartialEq, Eq)]
+enum RunSessionValidation {
+    Match,
+    Mismatch { run_session_id: String },
+    UnknownRun,
+}
+
+#[cfg(debug_assertions)]
+fn validate_run_session(
+    store: &SessionStore,
+    run_id: &str,
+    event_session_id: &str,
+) -> Result<RunSessionValidation, String> {
+    match store.session_id_for_run(run_id)? {
+        Some(run_session_id) if run_session_id == event_session_id => {
+            Ok(RunSessionValidation::Match)
+        }
+        Some(run_session_id) => Ok(RunSessionValidation::Mismatch { run_session_id }),
+        None => Ok(RunSessionValidation::UnknownRun),
+    }
+}
+
+#[cfg(debug_assertions)]
+fn warn_if_run_session_mismatch(
+    store: &SessionStore,
+    run_id: &str,
+    event_session_id: &str,
+    event_kind: &str,
+) {
+    match validate_run_session(store, run_id, event_session_id) {
+        Ok(RunSessionValidation::Mismatch { run_session_id }) => {
+            eprintln!(
+                "[Locus] warning: stream event session/run mismatch: event={} event_session={} run={} run_session={}",
+                event_kind, event_session_id, run_id, run_session_id
+            );
+        }
+        Ok(RunSessionValidation::Match | RunSessionValidation::UnknownRun) => {}
+        Err(error) => {
+            eprintln!(
+                "[Locus] warning: failed to validate stream event session/run ownership: event={} event_session={} run={} error={}",
+                event_kind, event_session_id, run_id, error
+            );
+        }
+    }
+}
+
 pub fn emit_stream(app_handle: &AppHandle, store: &SessionStore, run_id: &str, event: StreamEvent) {
     let session_id = event_session_id(&event).to_string();
     let event_kind = event_type(&event);
+    #[cfg(debug_assertions)]
+    warn_if_run_session_mismatch(store, run_id, &session_id, event_kind);
+
     let mut run_status =
         run_status_for_event(&event).map(|(status, error_message)| SessionRunStatusUpdate {
             run_id: run_id.to_string(),
@@ -196,5 +246,46 @@ pub fn emit_stream(app_handle: &AppHandle, store: &SessionStore, run_id: &str, e
                 event_kind, session_id, run_id, error
             );
         }
+    }
+}
+
+#[cfg(all(test, debug_assertions))]
+mod tests {
+    use tempfile::tempdir;
+
+    use super::{validate_run_session, RunSessionValidation};
+    use crate::session::store::SessionStore;
+
+    #[test]
+    fn validate_run_session_detects_known_owner_mismatch() {
+        let dir = tempdir().expect("create temp dir");
+        let store = SessionStore::new(dir.path()).expect("initialize store");
+        let run_session_id = store
+            .create_session("Run Owner", None, None, "chat", None)
+            .expect("create run session");
+        let other_session_id = store
+            .create_session("Other", None, None, "chat", None)
+            .expect("create other session");
+
+        store
+            .try_start_run(&run_session_id, "run-1")
+            .expect("start run");
+
+        assert_eq!(
+            validate_run_session(&store, "run-1", &run_session_id).expect("validate matching run"),
+            RunSessionValidation::Match
+        );
+        assert_eq!(
+            validate_run_session(&store, "run-1", &other_session_id)
+                .expect("validate mismatched run"),
+            RunSessionValidation::Mismatch {
+                run_session_id: run_session_id.clone()
+            }
+        );
+        assert_eq!(
+            validate_run_session(&store, "knowledge_1", &other_session_id)
+                .expect("validate unknown run"),
+            RunSessionValidation::UnknownRun
+        );
     }
 }

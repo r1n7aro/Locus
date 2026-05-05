@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tauri::AppHandle;
 
 use super::{
-    emit_stream, finalize_tool_call_record, normalize_tool_args, AgentInstance,
+    emit_parent_stream, emit_stream, finalize_tool_call_record, normalize_tool_args, AgentInstance,
     AssistantStreamState, ExecutedToolResult,
 };
 use crate::commands::{StreamEvent, ToolCallOutcome};
@@ -49,17 +49,14 @@ impl<'a> ClaudeSdkRoundHost<'a> {
                 arguments: arguments.to_string(),
             },
         );
-        if let Some((ref parent_sid, ref parent_tc_id)) = self.agent.parent_tool_call {
-            emit_stream(
+        if let Some(ref parent) = self.agent.parent_tool_call {
+            emit_parent_stream(
                 self.app_handle,
-                self.run_id,
-                StreamEvent::SubagentToolCallStart {
-                    session_id: parent_sid.clone(),
-                    parent_tool_call_id: parent_tc_id.clone(),
-                    tool_call_id: tool_call_id.to_string(),
-                    tool_name: tool_name.to_string(),
-                    arguments: arguments.to_string(),
-                },
+                parent.subagent_tool_call_start(
+                    tool_call_id.to_string(),
+                    tool_name.to_string(),
+                    arguments.to_string(),
+                ),
             );
         }
     }
@@ -82,24 +79,21 @@ impl<'a> ClaudeSdkRoundHost<'a> {
                 outcome,
             },
         );
-        if let Some((ref parent_sid, ref parent_tc_id)) = self.agent.parent_tool_call {
+        if let Some(ref parent) = self.agent.parent_tool_call {
             let truncated_output = if output.chars().count() > 500 {
                 let prefix: String = output.chars().take(500).collect();
                 format!("{}... ({} chars)", prefix, output.chars().count())
             } else {
                 output.to_string()
             };
-            emit_stream(
+            emit_parent_stream(
                 self.app_handle,
-                self.run_id,
-                StreamEvent::SubagentToolCallDone {
-                    session_id: parent_sid.clone(),
-                    parent_tool_call_id: parent_tc_id.clone(),
-                    tool_call_id: tool_call_id.to_string(),
-                    tool_name: tool_name.to_string(),
-                    output: truncated_output,
+                parent.subagent_tool_call_done(
+                    tool_call_id.to_string(),
+                    tool_name.to_string(),
+                    truncated_output,
                     outcome,
-                },
+                ),
             );
         }
     }
@@ -229,16 +223,8 @@ impl<'a> ClaudeSdkHost for ClaudeSdkRoundHost<'a> {
                 text: delta.clone(),
             },
         );
-        if let Some((ref parent_sid, ref tc_id)) = self.agent.parent_tool_call {
-            emit_stream(
-                self.app_handle,
-                self.run_id,
-                StreamEvent::ToolCallDelta {
-                    session_id: parent_sid.clone(),
-                    tool_call_id: tc_id.clone(),
-                    delta,
-                },
-            );
+        if let Some(ref parent) = self.agent.parent_tool_call {
+            emit_parent_stream(self.app_handle, parent.tool_call_delta(delta));
         }
     }
 
