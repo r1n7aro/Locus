@@ -224,6 +224,27 @@ pub(crate) async fn sync_visible_document_for_path(
     Ok(())
 }
 
+pub(crate) async fn sync_visible_documents_for_paths_and_emit(
+    app_handle: &AppHandle,
+    working_dir: &str,
+    knowledge_index_state: Arc<KnowledgeIndexState>,
+    source: &str,
+    targets: &[(KnowledgeType, String)],
+) -> Result<(), AppError> {
+    for (doc_type, path) in targets {
+        sync_visible_document_for_path(
+            app_handle,
+            working_dir,
+            knowledge_index_state.clone(),
+            *doc_type,
+            path,
+        )
+        .await?;
+    }
+    emit_knowledge_changed(app_handle, working_dir, source);
+    Ok(())
+}
+
 pub(crate) async fn sync_visible_documents_for_prefix(
     app_handle: &AppHandle,
     working_dir: &str,

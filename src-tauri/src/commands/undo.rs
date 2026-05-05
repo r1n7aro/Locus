@@ -1,13 +1,17 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::sync::Arc;
 use tauri::{AppHandle, State};
 
 use crate::error::AppError;
 use crate::knowledge_index::KnowledgeIndexState;
+use crate::knowledge_store::KnowledgeType;
 use crate::session::store::SessionStore;
 use crate::vcs::undo::{ChangedFile, UndoConflict, UndoEntry, UndoPerformError};
 use crate::workspace::Workspace;
 use crate::UndoManagerHandle;
+
+const MAX_INCREMENTAL_KNOWLEDGE_UNDO_DOCS: usize = 8;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -55,20 +59,119 @@ fn format_conflict_detail(conflicts: &[UndoConflictInfo]) -> String {
         .join("\n")
 }
 
-fn path_touches_workspace_knowledge(path: &str) -> bool {
-    let normalized = path.trim().replace('\\', "/");
-    normalized.eq_ignore_ascii_case("Locus/knowledge")
-        || normalized
-            .to_ascii_lowercase()
-            .starts_with("locus/knowledge/")
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum KnowledgeUndoSyncPlan {
+    None,
+    Incremental(Vec<(KnowledgeType, String)>),
+    Reconcile,
 }
 
-fn changed_file_touches_workspace_knowledge(file: &ChangedFile) -> bool {
-    path_touches_workspace_knowledge(&file.path)
-        || file
-            .old_path
-            .as_deref()
-            .is_some_and(path_touches_workspace_knowledge)
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum KnowledgePathKind {
+    Document(KnowledgeType, String),
+    Reconcile,
+}
+
+fn strip_workspace_knowledge_prefix(path: &str) -> Option<String> {
+    let normalized = path.trim().replace('\\', "/");
+    let trimmed = normalized.trim_matches('/');
+    let lower = trimmed.to_ascii_lowercase();
+    if lower == "locus/knowledge" {
+        return Some(String::new());
+    }
+    if lower.starts_with("locus/knowledge/") {
+        return Some(
+            trimmed["locus/knowledge/".len()..]
+                .trim_matches('/')
+                .to_string(),
+        );
+    }
+    None
+}
+
+fn knowledge_type_from_segment(segment: &str) -> Option<KnowledgeType> {
+    match segment.to_ascii_lowercase().as_str() {
+        "design" => Some(KnowledgeType::Design),
+        "memory" => Some(KnowledgeType::Memory),
+        "skill" => Some(KnowledgeType::Skill),
+        "reference" => Some(KnowledgeType::Reference),
+        _ => None,
+    }
+}
+
+fn classify_workspace_knowledge_path(path: &str) -> Option<KnowledgePathKind> {
+    let stripped = strip_workspace_knowledge_prefix(path)?;
+    if stripped.is_empty() {
+        return Some(KnowledgePathKind::Reconcile);
+    }
+
+    let Some((doc_type_segment, relative_path)) = stripped.split_once('/') else {
+        return Some(KnowledgePathKind::Reconcile);
+    };
+    let Some(doc_type) = knowledge_type_from_segment(doc_type_segment) else {
+        return Some(KnowledgePathKind::Reconcile);
+    };
+    let relative_path = relative_path.trim_matches('/');
+    if !relative_path.to_ascii_lowercase().ends_with(".md") {
+        return Some(KnowledgePathKind::Reconcile);
+    }
+
+    match crate::knowledge_store::ensure_document_path(relative_path) {
+        Ok(path) => Some(KnowledgePathKind::Document(doc_type, path)),
+        Err(_) => Some(KnowledgePathKind::Reconcile),
+    }
+}
+
+fn knowledge_target_key(doc_type: KnowledgeType, path: &str) -> String {
+    let key = format!("{}/{}", doc_type.as_str(), path.replace('\\', "/"));
+    if cfg!(windows) {
+        key.to_ascii_lowercase()
+    } else {
+        key
+    }
+}
+
+fn add_incremental_knowledge_target(
+    targets: &mut Vec<(KnowledgeType, String)>,
+    seen: &mut HashSet<String>,
+    doc_type: KnowledgeType,
+    path: String,
+) {
+    if seen.insert(knowledge_target_key(doc_type, &path)) {
+        targets.push((doc_type, path));
+    }
+}
+
+fn knowledge_undo_sync_plan(files: &[ChangedFile]) -> KnowledgeUndoSyncPlan {
+    let mut targets = Vec::new();
+    let mut seen = HashSet::new();
+    let mut touched_knowledge = false;
+
+    for file in files {
+        for path in std::iter::once(file.path.as_str()).chain(file.old_path.as_deref()) {
+            let Some(kind) = classify_workspace_knowledge_path(path) else {
+                continue;
+            };
+            touched_knowledge = true;
+            match kind {
+                KnowledgePathKind::Document(doc_type, path) => {
+                    add_incremental_knowledge_target(&mut targets, &mut seen, doc_type, path);
+                    if targets.len() > MAX_INCREMENTAL_KNOWLEDGE_UNDO_DOCS {
+                        return KnowledgeUndoSyncPlan::Reconcile;
+                    }
+                }
+                KnowledgePathKind::Reconcile => return KnowledgeUndoSyncPlan::Reconcile,
+            }
+        }
+    }
+
+    if !touched_knowledge {
+        KnowledgeUndoSyncPlan::None
+    } else if targets.is_empty() {
+        KnowledgeUndoSyncPlan::Reconcile
+    } else {
+        KnowledgeUndoSyncPlan::Incremental(targets)
+    }
 }
 
 #[tauri::command]
@@ -104,10 +207,7 @@ pub async fn undo_perform(
         }
         Err(UndoPerformError::Other(msg)) => return Err(msg.into()),
     };
-    let knowledge_touched = result
-        .restored_files
-        .iter()
-        .any(changed_file_touches_workspace_knowledge);
+    let knowledge_sync_plan = knowledge_undo_sync_plan(&result.restored_files);
 
     if let Err(e) = store.truncate_from_message(&session_id, &result.entry.assistant_message_id) {
         eprintln!("[undo_perform] failed to truncate messages: {}", e);
@@ -121,19 +221,53 @@ pub async fn undo_perform(
         crate::llm::codex::reset_cached_session_window(&session_id).await;
     }
 
-    if knowledge_touched {
-        if let Err(error) = crate::commands::knowledge::reconcile_and_emit_knowledge_changed(
-            &app_handle,
-            &working_dir,
-            knowledge_index_state.inner().clone(),
-            "undo_perform",
-        )
-        .await
-        {
-            eprintln!(
-                "[undo_perform] failed to reconcile knowledge index after undo: {}",
-                error
-            );
+    match knowledge_sync_plan {
+        KnowledgeUndoSyncPlan::None => {}
+        KnowledgeUndoSyncPlan::Incremental(targets) => {
+            if let Err(error) =
+                crate::commands::knowledge::sync_visible_documents_for_paths_and_emit(
+                    &app_handle,
+                    &working_dir,
+                    knowledge_index_state.inner().clone(),
+                    "undo_perform",
+                    &targets,
+                )
+                .await
+            {
+                eprintln!(
+                    "[undo_perform] failed to sync knowledge documents after undo: {}",
+                    error
+                );
+                if let Err(error) =
+                    crate::commands::knowledge::reconcile_and_emit_knowledge_changed(
+                        &app_handle,
+                        &working_dir,
+                        knowledge_index_state.inner().clone(),
+                        "undo_perform",
+                    )
+                    .await
+                {
+                    eprintln!(
+                        "[undo_perform] failed to reconcile knowledge index after incremental sync failure: {}",
+                        error
+                    );
+                }
+            }
+        }
+        KnowledgeUndoSyncPlan::Reconcile => {
+            if let Err(error) = crate::commands::knowledge::reconcile_and_emit_knowledge_changed(
+                &app_handle,
+                &working_dir,
+                knowledge_index_state.inner().clone(),
+                "undo_perform",
+            )
+            .await
+            {
+                eprintln!(
+                    "[undo_perform] failed to reconcile knowledge index after undo: {}",
+                    error
+                );
+            }
         }
     }
 
@@ -173,4 +307,84 @@ pub async fn undo_check_conflicts(
             .check_conflicts(&session_id, &assistant_message_id)
             .await?,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{knowledge_undo_sync_plan, KnowledgeUndoSyncPlan};
+    use crate::knowledge_store::KnowledgeType;
+    use crate::vcs::undo::ChangedFile;
+
+    fn changed(path: &str) -> ChangedFile {
+        ChangedFile {
+            status: "M".to_string(),
+            path: path.to_string(),
+            old_path: None,
+        }
+    }
+
+    fn renamed(old_path: &str, path: &str) -> ChangedFile {
+        ChangedFile {
+            status: "R".to_string(),
+            path: path.to_string(),
+            old_path: Some(old_path.to_string()),
+        }
+    }
+
+    #[test]
+    fn knowledge_undo_sync_plan_uses_incremental_for_single_document() {
+        assert_eq!(
+            knowledge_undo_sync_plan(&[changed("Locus/knowledge/design/core-loop.md")]),
+            KnowledgeUndoSyncPlan::Incremental(vec![(
+                KnowledgeType::Design,
+                "core-loop.md".to_string()
+            )])
+        );
+    }
+
+    #[test]
+    fn knowledge_undo_sync_plan_syncs_both_paths_for_document_rename() {
+        assert_eq!(
+            knowledge_undo_sync_plan(&[renamed(
+                "Locus/knowledge/design/old-loop.md",
+                "Locus/knowledge/design/new-loop.md"
+            )]),
+            KnowledgeUndoSyncPlan::Incremental(vec![
+                (KnowledgeType::Design, "new-loop.md".to_string()),
+                (KnowledgeType::Design, "old-loop.md".to_string()),
+            ])
+        );
+    }
+
+    #[test]
+    fn knowledge_undo_sync_plan_reconciles_for_directory_or_metadata_changes() {
+        assert_eq!(
+            knowledge_undo_sync_plan(&[changed("Locus/knowledge/design")]),
+            KnowledgeUndoSyncPlan::Reconcile
+        );
+        assert_eq!(
+            knowledge_undo_sync_plan(&[changed("Locus/knowledge/design/core.locus-meta")]),
+            KnowledgeUndoSyncPlan::Reconcile
+        );
+    }
+
+    #[test]
+    fn knowledge_undo_sync_plan_reconciles_for_large_batches() {
+        let files = (0..=super::MAX_INCREMENTAL_KNOWLEDGE_UNDO_DOCS)
+            .map(|index| changed(&format!("Locus/knowledge/memory/doc-{index}.md")))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            knowledge_undo_sync_plan(&files),
+            KnowledgeUndoSyncPlan::Reconcile
+        );
+    }
+
+    #[test]
+    fn knowledge_undo_sync_plan_ignores_non_knowledge_paths() {
+        assert_eq!(
+            knowledge_undo_sync_plan(&[changed("src/main.rs")]),
+            KnowledgeUndoSyncPlan::None
+        );
+    }
 }
