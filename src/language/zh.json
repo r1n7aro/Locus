@@ -651,6 +651,8 @@
   "settings.custom.testOk": "连接成功",
   "settings.custom.testFail": "连接失败",
   "settings.custom.openInBrowser": "在浏览器中打开",
+  "settings.custom.testHtmlResponse": "服务器返回了 HTML 页面，未返回 JSON，可能是验证或挑战页面。",
+  "settings.custom.openTestHtmlFailed": "打开文件失败: {0}\n{1}",
   "settings.custom.testMissingFields": "请先填写 API 模型代号和请求端点",
   "model.provider.custom": "自定义",
 

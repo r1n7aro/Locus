@@ -651,6 +651,8 @@
   "settings.custom.testOk": "Connected",
   "settings.custom.testFail": "Failed",
   "settings.custom.openInBrowser": "Open in browser",
+  "settings.custom.testHtmlResponse": "Server returned an HTML page instead of JSON, possibly a verification or challenge page.",
+  "settings.custom.openTestHtmlFailed": "Failed to open file: {0}\n{1}",
   "settings.custom.testMissingFields": "Please fill in API model ID and endpoint URL first",
   "model.provider.custom": "Custom",
 

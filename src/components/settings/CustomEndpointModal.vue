@@ -3,6 +3,10 @@ import { computed } from "vue";
 import { openPath } from "@tauri-apps/plugin-opener";
 import { t } from "../../i18n";
 import { normalizeAppError } from "../../services/errors";
+import {
+  customEndpointTestDetail,
+  customEndpointTestHtmlPath,
+} from "../../services/customEndpointTestResult";
 import type {
   ApiFormat,
   CustomEndpoint,
@@ -39,11 +43,8 @@ const customReasoningFormatOptions = [
 ] satisfies Array<{ value: ReasoningParamFormat; label: string }>;
 
 const modalTitle = computed(() => props.isAdding ? t("settings.custom.add") : t("settings.custom.edit"));
-const testResultText = computed(() => props.testResult.replace(/\s*\[OPEN_HTML:.*\]/, "").trim());
-const testResultHtmlPath = computed(() => {
-  const match = props.testResult.match(/\[OPEN_HTML:(.+)\]/);
-  return match?.[1] ?? "";
-});
+const testResultText = computed(() => customEndpointTestDetail(props.testResult));
+const testResultHtmlPath = computed(() => customEndpointTestHtmlPath(props.testResult));
 
 function defaultReasoningParamFormat(apiFormat: ApiFormat): ReasoningParamFormat {
   switch (apiFormat) {
@@ -89,7 +90,7 @@ async function openTestHtml() {
     await openPath(path);
   } catch (e) {
     const err = normalizeAppError(e);
-    window.alert(`Failed to open file: ${path}\n${err.message}`);
+    window.alert(t("settings.custom.openTestHtmlFailed", path, err.message));
   }
 }
 

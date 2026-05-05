@@ -15,6 +15,8 @@ use crate::workspace::Workspace;
 use crate::AssetDbWatcherHandle;
 use crate::KnowledgeFsWatcherHandle;
 
+const ENDPOINT_TEST_HTML_RESPONSE_CODE: &str = "endpoint_test.html_response";
+
 /// Returns a stable app config directory inside the OS config root.
 /// On Windows this resolves under `%APPDATA%\\locus`, which keeps model config
 /// under the app-data tree while staying outside Tauri's bundle-specific
@@ -695,7 +697,7 @@ pub async fn test_custom_endpoint(endpoint: CustomEndpoint) -> Result<String, Ap
             let text = resp.text().await.unwrap_or_default();
             if !status.is_success() {
                 if let Some(msg) = maybe_html_fallback(&text) {
-                    return Err(format!("HTTP {} — {}", status.as_u16(), msg).into());
+                    return Err(endpoint_html_response_error(msg, Some(status)));
                 }
                 return Err(
                     format!("HTTP {} — {}", status.as_u16(), truncate_str(&text, 200)).into(),
@@ -707,7 +709,7 @@ pub async fn test_custom_endpoint(endpoint: CustomEndpoint) -> Result<String, Ap
                 }
             }
             if let Some(msg) = maybe_html_fallback(&text) {
-                return Ok(msg);
+                return Err(endpoint_html_response_error(msg, None));
             }
             Ok(truncate_str(&text, 120).to_string())
         }
@@ -732,7 +734,7 @@ pub async fn test_custom_endpoint(endpoint: CustomEndpoint) -> Result<String, Ap
             let text = resp.text().await.unwrap_or_default();
             if !status.is_success() {
                 if let Some(msg) = maybe_html_fallback(&text) {
-                    return Err(format!("HTTP {} — {}", status.as_u16(), msg).into());
+                    return Err(endpoint_html_response_error(msg, Some(status)));
                 }
                 return Err(
                     format!("HTTP {} — {}", status.as_u16(), truncate_str(&text, 200)).into(),
@@ -759,7 +761,7 @@ pub async fn test_custom_endpoint(endpoint: CustomEndpoint) -> Result<String, Ap
                 }
             }
             if let Some(msg) = maybe_html_fallback(&text) {
-                return Ok(msg);
+                return Err(endpoint_html_response_error(msg, None));
             }
             Ok(truncate_str(&text, 120).to_string())
         }
@@ -791,7 +793,7 @@ pub async fn test_custom_endpoint(endpoint: CustomEndpoint) -> Result<String, Ap
             let text = resp.text().await.unwrap_or_default();
             if !status.is_success() {
                 if let Some(msg) = maybe_html_fallback(&text) {
-                    return Err(format!("HTTP {} — {}", status.as_u16(), msg).into());
+                    return Err(endpoint_html_response_error(msg, Some(status)));
                 }
                 return Err(
                     format!("HTTP {} — {}", status.as_u16(), truncate_str(&text, 200)).into(),
@@ -803,7 +805,7 @@ pub async fn test_custom_endpoint(endpoint: CustomEndpoint) -> Result<String, Ap
                 }
             }
             if let Some(msg) = maybe_html_fallback(&text) {
-                return Ok(msg);
+                return Err(endpoint_html_response_error(msg, None));
             }
             Ok(truncate_str(&text, 120).to_string())
         }
@@ -822,7 +824,8 @@ fn truncate_str(s: &str, max: usize) -> &str {
 /// save it to a temp file and return a message with `[OPEN_HTML:filepath]` marker.
 fn maybe_html_fallback(text: &str) -> Option<String> {
     let trimmed = text.trim_start();
-    if trimmed.starts_with("<!") || trimmed.starts_with("<html") || trimmed.starts_with("<HTML") {
+    let head = trimmed.chars().take(32).collect::<String>().to_ascii_lowercase();
+    if head.starts_with("<!") || head.starts_with("<html") {
         let tmp =
             std::env::temp_dir().join(format!("locus_endpoint_test_{}.html", std::process::id()));
         if std::fs::write(&tmp, text).is_ok() {
@@ -836,6 +839,17 @@ fn maybe_html_fallback(text: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+fn endpoint_html_response_error(
+    message: String,
+    status: Option<reqwest::StatusCode>,
+) -> AppError {
+    let message = match status {
+        Some(status) => format!("HTTP {} — {}", status.as_u16(), message),
+        None => message,
+    };
+    AppError::new(ENDPOINT_TEST_HTML_RESPONSE_CODE, message)
 }
 
 #[tauri::command]

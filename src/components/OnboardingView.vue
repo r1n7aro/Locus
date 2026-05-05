@@ -10,6 +10,10 @@ import { t, setLocale, locale, type Locale } from "../i18n";
 import { useTheme, type ThemePreference } from "../composables/useTheme";
 import { useSettingsState } from "../composables/useSettingsState";
 import { normalizeAppError } from "../services/errors";
+import {
+  customEndpointTestDetail as formatCustomEndpointTestDetail,
+  customEndpointTestHtmlPath as extractCustomEndpointTestHtmlPath,
+} from "../services/customEndpointTestResult";
 import { useAuthStore } from "../stores/auth";
 import { useModelStore } from "../stores/model";
 import { useUiStore } from "../stores/ui";
@@ -135,12 +139,11 @@ const customEndpointTestReady = computed(() => {
   return !!ep && !!ep.apiModel.trim() && !!ep.endpoint.trim();
 });
 const customEndpointTestDetail = computed(() =>
-  settingsEndpointTestResult.value.replace(/\s*\[OPEN_HTML:.*\]/, "").trim(),
+  formatCustomEndpointTestDetail(settingsEndpointTestResult.value),
 );
-const customEndpointTestHtmlPath = computed(() => {
-  const match = settingsEndpointTestResult.value.match(/\[OPEN_HTML:(.+)\]/);
-  return match?.[1] ?? "";
-});
+const customEndpointTestHtmlPath = computed(() =>
+  extractCustomEndpointTestHtmlPath(settingsEndpointTestResult.value),
+);
 const customApiFormatOptions = computed(() => [
   { value: "openai_chat" as ApiFormat, label: t("settings.custom.formatOpenaiChat") },
   { value: "openai_responses" as ApiFormat, label: t("settings.custom.formatOpenaiResponses") },
@@ -189,7 +192,12 @@ async function openCustomEndpointTestHtml() {
   try {
     await openPath(customEndpointTestHtmlPath.value);
   } catch (e) {
-    settingsEndpointTestResult.value = normalizeAppError(e).message;
+    const err = normalizeAppError(e);
+    settingsEndpointTestResult.value = t(
+      "settings.custom.openTestHtmlFailed",
+      customEndpointTestHtmlPath.value,
+      err.message,
+    );
   }
 }
 

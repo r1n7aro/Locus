@@ -28,6 +28,10 @@ import {
   getToolPermissions,
   saveToolPermissions as serviceSaveToolPermissions,
 } from "../services/permissions";
+import {
+  customEndpointTestStatusForReply,
+  normalizeCustomEndpointTestErrorMessage,
+} from "../services/customEndpointTestResult";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { normalizeAppError } from "../services/errors";
 import { useNotificationStore } from "../stores/notification";
@@ -772,11 +776,11 @@ export function useSettingsState(emit: SettingsEmit) {
     testResult.value = "";
     try {
       const reply = await testCustomEndpoint(ep);
-      testStatus.value = "success";
+      testStatus.value = customEndpointTestStatusForReply(reply);
       testResult.value = reply;
     } catch (e) {
       testStatus.value = "error";
-      testResult.value = normalizeAppError(e).message;
+      testResult.value = normalizeCustomEndpointTestErrorMessage(e);
     }
   }
 
