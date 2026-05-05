@@ -1,14 +1,19 @@
 ---
-title: vs. Generic Agents
-description: Why Locus beats a generic coding agent inside Unity
+title: What Makes Locus Technically Different?
+description: Technical capabilities enabled by Locus's independent process architecture
 ---
 
-Locus is more than a thin wrapper around an LLM API. We've put serious work into pushing Agent capability further.
+Locus is a standalone Rust + Tauri + Vue.js application that runs as an independent process.
 
-- **JIT C# execution inside the Unity Editor.** With this, Locus modifies scenes and assets through scripts—no need to wrestle with giant YAML files on disk, and no need to pick from a sea of editor MCP tools.
-- **Progressive-expansion intermediate representation for Unity assets and components.** Locus walks the hierarchy and loads only what it needs, instead of slurping and parsing whole files up front.
-- **A full knowledge system built for game projects.** Auto-summarized design docs, long-term memory, Skill loading, and external imports (Unity API Reference, Feishu Docs, and more). Lexical and semantic retrieval ship side by side, with a local embedding runtime that runs out of the box on CPU or GPU.
-- **A highly parallel Unity YAML semantic parser, written in Rust.** Locus reads many large files straight from disk semantically, and the same parser powers semantic diff and merge in version control.
-- **A highly parallel Unity asset database, also in Rust.** Fast search across project assets and a complete bidirectional dependency graph, with direct queries for references and dependencies.
+- We designed a proprietary intermediate representation that lets agents progressively read large scenes and assets, along with retrieval tools that help agents quickly locate target objects
+- With Roslyn, Locus can JIT-compile and execute C# code inside the Unity Editor to make semantic asset edits. Locus also includes agent-side version management handling so users can review and revert asset and code changes the agent makes during a conversation
+- Built on Rust's parallel ecosystem, Locus performs highly parallel asset database scans, enabling fast semantic parsing for large scenes and reference queries for arbitrary assets. The Unity Editor API only provides dependency queries
+- Locus includes an automated knowledge system. The agent summarizes fragmented conversation requests into design documents and saves working understanding into memory, reducing repeated project exploration
+- Documents in the knowledge system support configurable AI maintenance modes and maintenance rules, plus L0/L1/L2 injection control inside context. Users can customize progressive expansion behavior, use native lexical and syntactic retrieval across large document sets, and choose and download embedding runtimes
+- We built C# state-machine tools so the agent can sample internal state through reflection at specific frames or events during runtime, output frame-by-frame tables, and dynamically debug multi-frame behavior
+- Locus provides a graphical version control interface and supports semantic diff review and conflict resolution for Unity YAML files
+- Locus uses Vue.js to deliver a modern frontend experience with better UX than the limited controls provided by the Unity Editor API, then embeds it into the Unity window through Windows APIs
 
-We're planning a technical blog post that walks through how Locus is built, along with the lessons we picked up along the way.
+If Locus were implemented inside the Unity Editor, or designed as an MCP server, most of these capabilities would be difficult to deliver and some would be nearly impossible technically.
+
+Therefore, please stop asking us how `Locus` differs from `Coding Agent + MCP` or from agents implemented inside the Unity Editor.
