@@ -296,14 +296,16 @@ const hasUnsavedChanges = computed(() => hasUnsavedSectionChanges.value || fileN
 
 const statusLabel = computed(() => {
   if (!props.document) return "";
-  if (props.saveLoading) return autoSaveInFlight.value ? t("knowledge.editor.autosaving") : t("knowledge.editor.saving");
-  if (autoSaveQueued.value) return t("knowledge.editor.autosavePending");
-  if (hasUnsavedChanges.value) return t("knowledge.editor.unsaved");
+  if (props.saveLoading && !autoSaveInFlight.value) return t("knowledge.editor.saving");
+  if (hasUnsavedChanges.value || autoSaveQueued.value || autoSaveInFlight.value) return t("knowledge.editor.unsaved");
   return t("knowledge.editor.saved");
 });
 
 const footerLabel = computed(() =>
   props.document ? `${statusLabel.value} · ${t("knowledge.editor.shortcut")}` : "",
+);
+const footerWarning = computed(() =>
+  hasUnsavedChanges.value && !autoSaveQueued.value && !autoSaveInFlight.value,
 );
 const visibleSections = computed(() => getKnowledgeDocumentEditorSections(props.document));
 const hasSupportPanels = computed(() => visibleSections.value.summary || visibleSections.value.maintenanceRules);
@@ -1616,7 +1618,7 @@ function labelForProvider(provider?: string | null): string {
               </div>
             </section>
 
-            <div v-if="footerLabel" class="editor-footnote" :class="{ 'is-warning': hasUnsavedChanges || autoSaveQueued }">
+            <div v-if="footerLabel" class="editor-footnote" :class="{ 'is-warning': footerWarning }">
               {{ footerLabel }}
             </div>
           </template>
