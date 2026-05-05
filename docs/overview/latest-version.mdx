@@ -1,9 +1,9 @@
 ---
 title: "当前版本"
-description: "Locus v0.2.7 (2026-05-05)"
+description: "Locus v0.2.8 (2026-05-06)"
 sidebarTitle: "当前版本"
-version: "0.2.7"
-releasedAt: "2026-05-05"
+version: "0.2.8"
+releasedAt: "2026-05-06"
 channel: "stable"
 updateTitle: "发现新版本"
 changelogUrl: "/overview/latest-version"
@@ -17,15 +17,18 @@ changelogUrl: "/overview/latest-version"
 
 ### 新增
 
-- 安装配置文档补充 Unity 编辑器中通过 `Window > Locus` 打开内置窗口的说明。
+- README 与文档新增技术概览，说明 Locus 的独立进程架构与面向 Unity 的能力。
 
 ### 修复
 
-- LLM 流式工具调用会在执行前拒绝缺失元数据或参数格式错误的结果。
-- 当流式 provider 后续发送空工具名称增量时，保留已接收的工具名称。
-- LLM 返回无效工具调用时会进入重试流程，避免继续使用不完整元数据。
-- Collab 搜索结果改为虚拟列表，大量结果下保持响应。
-- Collab 搜索列宽拖拽通过动画帧更新，并在提交后持久化，减少拖拽过程中的更新压力。
+- 子 Agent 流式事件改为通过父运行上下文发送，嵌套工具进度与增量会归属到正确的父会话。
+- 知识 Undo 改为增量同步已变化的知识文档；目录、元数据或大批量变化时执行完整 reconcile。
+- 外部刷新选中的知识文档时保持编辑区稳定，不显示选中文档加载状态。
+- 简化知识编辑器自动保存期间的底部状态，只保留稳定的已保存或未保存状态。
+- Agent 工具路由允许知识相关的 git diff/status 管道命令，包括多行命令。
+- 自定义端点测试将 HTML 或挑战页面响应视为连接失败，保留已保存 HTML 路径，并本地化展示详情。
+- 自定义端点使用 Responses API 时回放完整历史；官方 OpenAI 端点继续使用 `previous_response_id`。
+- 内置 Memory 标签与 L3 规则标题更新为英文标签和 ASCII 标题格式。
 
 ### 移除
 

@@ -1,9 +1,9 @@
 ---
 title: "Latest Version"
-description: "Locus v0.2.7 (2026-05-05)"
+description: "Locus v0.2.8 (2026-05-06)"
 sidebarTitle: "Latest Version"
-version: "0.2.7"
-releasedAt: "2026-05-05"
+version: "0.2.8"
+releasedAt: "2026-05-06"
 channel: "stable"
 updateTitle: "Update available"
 changelogUrl: "/en/overview/latest-version"
@@ -17,15 +17,18 @@ changelogUrl: "/en/overview/latest-version"
 
 ### Added
 
-- Added setup documentation for opening the embedded Unity editor window through `Window > Locus`.
+- Added a technical overview in the README and docs explaining Locus's independent process architecture and Unity-specific capabilities.
 
 ### Fixed
 
-- Rejected incomplete or malformed streamed tool calls before execution across LLM providers.
-- Preserved existing tool call names when streaming providers send later empty name deltas.
-- Retried invalid LLM tool call responses instead of continuing with incomplete metadata.
-- Kept Collab search responsive with large result sets by virtualizing result rows.
-- Reduced column-resize work in Collab search by applying drag updates through animation frames and persisting widths after commit.
+- Routed subagent stream events through the parent run context so nested tool progress and deltas attach to the correct parent session.
+- Updated knowledge undo to sync changed knowledge documents incrementally, with full reconciliation for directory, metadata, or large-batch changes.
+- Refreshed externally changed selected knowledge documents without showing the selected-document loading state.
+- Simplified the knowledge editor footer status during autosave so it stays on a stable saved or unsaved state.
+- Allowed knowledge-safe git diff and status pipelines, including multiline commands, in agent tool routing.
+- Treated custom endpoint HTML or challenge-page responses as test failures, preserved the saved HTML path, and localized the displayed detail.
+- Replayed full Responses API history for custom endpoints while keeping `previous_response_id` usage for the official OpenAI endpoint.
+- Updated built-in Memory labels and L3 rule headings to use English labels and ASCII heading formatting.
 
 ### Removed
 
