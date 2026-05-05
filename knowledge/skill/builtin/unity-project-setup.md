@@ -13,7 +13,7 @@ skillSurface: command
 commandTrigger: /unity-project-setup
 argumentHint: <focus area>
 createdAt: 1775735250000
-updatedAt: 1776267594940
+updatedAt: 1777966392569
 ---
 
 # Unity Project Setup
@@ -45,41 +45,41 @@ Before anything else, determine who you are talking to and adapt all subsequent 
 
 ```text
 ask_user_question:
-  question: "你在团队中的角色是？"
+  question: "What is your role on the team?"
   options:
-    - label: "程序"
-      description: "负责编写游戏逻辑、系统架构、工具开发"
-    - label: "策划"
-      description: "负责游戏设计、数值配置、关卡编辑"
-    - label: "美术"
-      description: "负责模型、动画、特效、UI 视觉"
+    - label: "Programmer"
+      description: "Writes gameplay logic, system architecture, and tools"
+    - label: "Designer"
+      description: "Owns game design, tuning data, and level editing"
+    - label: "Artist"
+      description: "Owns models, animation, VFX, and UI visuals"
 ```
 
 Adapt subsequent phases based on the role:
 
-- **程序** -> proceed to Step 2 (skill level), then run all phases.
-- **策划** -> skip architecture questions. Focus on designer-friendly infrastructure: ScriptableObject-based events, configuration workflows, scene management. Use non-technical language throughout. Skip asmdef and IL2CPP topics.
-- **美术** -> focus on art-pipeline infrastructure: Addressables for asset management, shader variant management, animation system setup (DOTween / PrimeTween). Skip code architecture topics.
+- **Programmer** -> proceed to Step 2 (skill level), then run all phases.
+- **Designer** -> skip architecture questions. Focus on designer-friendly infrastructure: ScriptableObject-based events, configuration workflows, scene management. Use non-technical language throughout. Skip asmdef and IL2CPP topics.
+- **Artist** -> focus on art-pipeline infrastructure: Addressables for asset management, shader variant management, animation system setup (DOTween / PrimeTween). Skip code architecture topics.
 
 **Step 2: Skill Level (programmer role only)**
 
 ```text
 ask_user_question:
-  question: "你对 Unity 和 C# 的熟悉程度？"
+  question: "How familiar are you with Unity and C#?"
   options:
-    - label: "入门"
-      description: "刚开始学 Unity"
-    - label: "有经验"
-      description: "做过完整项目，了解基本架构"
-    - label: "资深"
-      description: "熟悉 asmdef、IL2CPP、Package Manager 等"
+    - label: "Beginner"
+      description: "Just getting started with Unity"
+    - label: "Experienced"
+      description: "Has shipped or completed projects and understands basic architecture"
+    - label: "Senior"
+      description: "Knows asmdef, IL2CPP, Package Manager, and production constraints"
 ```
 
 Adapt based on level:
 
-- **入门** -> explain each concept in simple terms, recommend the minimum set of packages, skip asmdef layout.
-- **有经验** -> normal flow with recommendations and alternatives.
-- **资深** -> streamline Q&A and jump straight to package lists and install commands.
+- **Beginner** -> explain each concept in simple terms, recommend the minimum set of packages, skip asmdef layout.
+- **Experienced** -> normal flow with recommendations and alternatives.
+- **Senior** -> streamline Q&A and jump straight to package lists and install commands.
 
 ### Phase 1 - Project Profile
 

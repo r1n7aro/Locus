@@ -920,7 +920,7 @@ pub fn default_directory_config_for_type(doc_type: KnowledgeType) -> KnowledgeDi
     }
 }
 
-const MEMORY_BUILTIN_SEED_VERSION: u32 = 10;
+const MEMORY_BUILTIN_SEED_VERSION: u32 = 11;
 const KNOWLEDGE_DIRECTORY_CONFIG_SUFFIX: &str = ".locus-meta";
 const LEGACY_KNOWLEDGE_DIRECTORY_CONFIG_SUFFIX: &str = ".meta";
 const MEMORY_UNITY_PROJECT_UNDERSTANDING_PATH: &str = "unity-project-understanding";
@@ -928,8 +928,10 @@ const MEMORY_PROJECT_MISTAKE_NOTE_PATH: &str = "project-mistake-note.md";
 const MEMORY_PROJECT_MISTAKE_NOTE_LEGACY_PATH: &str = "project_mistake_note.md";
 const MEMORY_USER_PREFERENCE_PATH: &str = "user-preference.md";
 const MEMORY_USER_PREFERENCE_LEGACY_PATH: &str = "user_preference.md";
-const MEMORY_UNITY_PROJECT_UNDERSTANDING_SUMMARY: &str =
+const MEMORY_UNITY_PROJECT_UNDERSTANDING_SUMMARY_V10: &str =
     "维护 Unity 工程理解的结构缓存，沉淀长期有效的目录职责、系统入口、关键资源定位与约束。";
+const MEMORY_UNITY_PROJECT_UNDERSTANDING_SUMMARY: &str =
+    "Maintains a structural cache of Unity project understanding, preserving durable directory responsibilities, system entry points, key asset lookup paths, and constraints.";
 const MEMORY_PROJECT_MISTAKE_NOTE_RULES_V6: &str =
     "- 只记录已经验证的问题、返工原因与规避方式\n- 优先维护会重复踩坑的操作、约束、回归点与修复结论\n- 删除已失效问题、无法复现的问题与没有依据的猜测";
 const MEMORY_PROJECT_MISTAKE_NOTE_RULES_V9: &str =
@@ -969,14 +971,14 @@ fn memory_builtin_seeds() -> &'static [MemoryBuiltinSeed] {
         MemoryBuiltinSeed {
             id: "kd_builtin_memory_project_mistake_note",
             path: MEMORY_PROJECT_MISTAKE_NOTE_PATH,
-            title: "错题本",
+            title: "Mistake Notebook",
             inject_mode: KnowledgeInjectMode::Full,
             maintenance_rules: MEMORY_PROJECT_MISTAKE_NOTE_RULES,
         },
         MemoryBuiltinSeed {
             id: "kd_builtin_memory_user_preference",
             path: MEMORY_USER_PREFERENCE_PATH,
-            title: "用户偏好",
+            title: "User Preferences",
             inject_mode: KnowledgeInjectMode::Rule,
             maintenance_rules: MEMORY_USER_PREFERENCE_RULES,
         },
@@ -1312,6 +1314,25 @@ fn migrate_memory_builtin_seed_updates(
                 _ => continue,
             };
             migrate_builtin_memory_document_rules(working_dir, seed, previous_rules)?;
+        }
+    }
+    if previous_seed_version < 11 {
+        let record = read_directory_config(
+            working_dir,
+            KnowledgeType::Memory,
+            MEMORY_UNITY_PROJECT_UNDERSTANDING_PATH,
+        )?;
+        if record.exists
+            && record.config.summary.trim() == MEMORY_UNITY_PROJECT_UNDERSTANDING_SUMMARY_V10
+        {
+            let mut next = record.config;
+            next.summary = MEMORY_UNITY_PROJECT_UNDERSTANDING_SUMMARY.to_string();
+            update_directory_config(
+                working_dir,
+                KnowledgeType::Memory,
+                MEMORY_UNITY_PROJECT_UNDERSTANDING_PATH,
+                next,
+            )?;
         }
     }
     Ok(())
@@ -7324,6 +7345,60 @@ Body content
         assert_eq!(
             user_preference.maintenance_rules.as_deref(),
             Some(MEMORY_USER_PREFERENCE_RULES)
+        );
+    }
+
+    #[test]
+    fn ensure_memory_builtin_documents_updates_builtin_summary_for_seed_v10() {
+        let temp = TempDir::new().unwrap();
+        let working_dir = temp.path().to_string_lossy().to_string();
+
+        create_directory(
+            &working_dir,
+            KnowledgeType::Memory,
+            MEMORY_UNITY_PROJECT_UNDERSTANDING_PATH,
+        )
+        .expect("create builtin memory directory");
+        update_directory_config(
+            &working_dir,
+            KnowledgeType::Memory,
+            MEMORY_UNITY_PROJECT_UNDERSTANDING_PATH,
+            KnowledgeDirectoryConfig {
+                version: default_directory_config_version(),
+                summary: MEMORY_UNITY_PROJECT_UNDERSTANDING_SUMMARY_V10.to_string(),
+                inject_mode: KnowledgeInjectMode::Path,
+                inherit_inject_mode: false,
+                ai_maintained: true,
+                inherit_ai_config: false,
+                explicit_maintenance_rules: true,
+                lexical_search: FolderIndexRuleSetting::Inherit,
+                vector_search: FolderIndexRuleSetting::Inherit,
+                inherit_to_children: true,
+                allow_create_documents: true,
+                allow_create_directories: true,
+                allow_move_documents: true,
+                allow_move_directories: true,
+                maintenance_rules: MEMORY_UNITY_PROJECT_UNDERSTANDING_RULES.to_string(),
+            },
+        )
+        .expect("seed v10 builtin directory summary");
+        write_memory_builtin_seed_version(&working_dir, 10).expect("write old seed version");
+
+        ensure_memory_builtin_documents(&working_dir).expect("upgrade builtins");
+
+        let directory = read_directory_config(
+            &working_dir,
+            KnowledgeType::Memory,
+            MEMORY_UNITY_PROJECT_UNDERSTANDING_PATH,
+        )
+        .expect("read upgraded builtin directory");
+        assert_eq!(
+            directory.config.summary,
+            MEMORY_UNITY_PROJECT_UNDERSTANDING_SUMMARY
+        );
+        assert_eq!(
+            directory.config.maintenance_rules,
+            MEMORY_UNITY_PROJECT_UNDERSTANDING_RULES
         );
     }
 
