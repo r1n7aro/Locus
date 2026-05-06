@@ -9,6 +9,21 @@ type TauriInternals = {
   invoke?: (command: string, args?: Record<string, unknown>) => Promise<unknown>;
 };
 
+const WINDOW_DRAG_EXCLUDED_SELECTOR = [
+  "button",
+  "a",
+  "input",
+  "textarea",
+  "select",
+  "[contenteditable='true']",
+  ".workspace-selector",
+  ".window-controls",
+  ".dir-dropdown",
+  "[data-window-no-drag]",
+].join(", ");
+
+let windowDragFallbackInstalled = false;
+
 function getTauriInternals(): TauriInternals | null {
   const internals = (window as unknown as { __TAURI_INTERNALS__?: TauriInternals })
     .__TAURI_INTERNALS__;
@@ -35,6 +50,42 @@ export async function showCurrentTauriWindow(): Promise<void> {
   await window.show();
   await window.setFocus().catch(() => {
     /* Focusing can fail when the OS denies foreground activation. */
+  });
+}
+
+export function startCurrentWindowDragging(): void {
+  if (!hasTauriWindowRuntime()) return;
+  getCurrentWindow().startDragging().catch((error) => {
+    console.warn("Failed to start Tauri window drag:", error);
+  });
+}
+
+export function canStartWindowDragFromTarget(target: EventTarget | null): boolean {
+  if (typeof HTMLElement === "undefined" || !(target instanceof HTMLElement)) return false;
+  return !target.closest(WINDOW_DRAG_EXCLUDED_SELECTOR);
+}
+
+function isCssWindowDragRegionTarget(target: EventTarget | null): boolean {
+  if (typeof HTMLElement === "undefined" || !(target instanceof HTMLElement)) return false;
+  let element: HTMLElement | null = target;
+  while (element && element !== document.body) {
+    const appRegion = window.getComputedStyle(element).getPropertyValue("-webkit-app-region").trim();
+    if (appRegion === "no-drag") return false;
+    if (appRegion === "drag") return true;
+    element = element.parentElement;
+  }
+  return false;
+}
+
+export function installTauriWindowDragFallback(): void {
+  if (windowDragFallbackInstalled || !hasTauriWindowRuntime()) return;
+  windowDragFallbackInstalled = true;
+  window.addEventListener("pointerdown", (event) => {
+    if (event.defaultPrevented || event.button !== 0 || event.detail > 1) return;
+    if (!canStartWindowDragFromTarget(event.target)) return;
+    if (!isCssWindowDragRegionTarget(event.target)) return;
+    event.preventDefault();
+    startCurrentWindowDragging();
   });
 }
 

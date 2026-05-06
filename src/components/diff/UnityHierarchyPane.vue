@@ -2,6 +2,10 @@
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import type { MergeSide, SemanticTreeNode } from "../../types";
 import { t } from "../../i18n";
+import {
+  createAnimationFrameResizeObserver,
+  type ResizeObserverHandle,
+} from "../../composables/resizeObserver";
 import { compactMergeSideLabel } from "../collab/mergeUi";
 
 const props = defineProps<{
@@ -36,7 +40,7 @@ const collapsedIds = ref(new Set<string>());
 const paneHeight = ref(0);
 const AUTO_COLLAPSE_ROW_HEIGHT = 28;
 const HEADER_HEIGHT = 34;
-let resizeObserver: ResizeObserver | null = null;
+let resizeObserver: ResizeObserverHandle | null = null;
 
 const collapsibleIds = computed(() => (
   props.nodes
@@ -156,7 +160,8 @@ watch(
 onMounted(() => {
   updatePaneHeight();
   if (typeof ResizeObserver === "undefined") return;
-  resizeObserver = new ResizeObserver(() => updatePaneHeight());
+  resizeObserver = createAnimationFrameResizeObserver(updatePaneHeight);
+  if (!resizeObserver) return;
   if (paneRef.value) resizeObserver.observe(paneRef.value);
 });
 

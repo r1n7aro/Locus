@@ -1,5 +1,9 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
+import {
+  createAnimationFrameResizeObserver,
+  type ResizeObserverHandle,
+} from "../../composables/resizeObserver";
 
 interface FileTreeListItem {
   key: string;
@@ -22,7 +26,7 @@ const scrollRef = ref<HTMLElement | null>(null);
 const scrollTop = ref(0);
 const viewportHeight = ref(0);
 
-let resizeObserver: ResizeObserver | null = null;
+let resizeObserver: ResizeObserverHandle | null = null;
 let scrollFrame = 0;
 
 function updateViewportMetrics() {
@@ -86,10 +90,8 @@ watch(
 onMounted(() => {
   updateViewportMetrics();
   if (scrollRef.value && typeof ResizeObserver !== "undefined") {
-    resizeObserver = new ResizeObserver(() => {
-      updateViewportMetrics();
-    });
-    resizeObserver.observe(scrollRef.value);
+    resizeObserver = createAnimationFrameResizeObserver(updateViewportMetrics);
+    resizeObserver?.observe(scrollRef.value);
   }
 });
 

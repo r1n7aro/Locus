@@ -47,6 +47,10 @@ import {
   isKnowledgeEditModeLocked,
 } from "./knowledgeEditMode";
 import { acquireSelectionLock } from "../../composables/useSelectionLock";
+import {
+  createAnimationFrameResizeObserver,
+  type ResizeObserverHandle,
+} from "../../composables/resizeObserver";
 import BaseSegmented from "../ui/BaseSegmented.vue";
 import {
   useMarkdownEditorViewMode,
@@ -137,7 +141,7 @@ let supportWidthResizeStartX = 0;
 let supportWidthResizeStartValue = DEFAULT_SUPPORT_SECTION_WIDTH;
 let bodyCursorBeforeResize = "";
 let releaseSelectionLock: (() => void) | null = null;
-let layoutResizeObserver: ResizeObserver | null = null;
+let layoutResizeObserver: ResizeObserverHandle | null = null;
 let searchMatchScrollFrame = 0;
 
 function formatDocumentDisplayPath(document: KnowledgeDocument | null | undefined): string {
@@ -525,9 +529,10 @@ function observeSupportLayout() {
   layoutResizeObserver?.disconnect();
   layoutResizeObserver = null;
   if (typeof ResizeObserver === "undefined") return;
-  layoutResizeObserver = new ResizeObserver(() => {
+  layoutResizeObserver = createAnimationFrameResizeObserver(() => {
     syncSupportLayoutMetrics();
   });
+  if (!layoutResizeObserver) return;
   if (previewMainRef.value) layoutResizeObserver.observe(previewMainRef.value);
   if (supportLayoutRef.value) layoutResizeObserver.observe(supportLayoutRef.value);
 }

@@ -47,6 +47,10 @@ import {
   shouldAutoScrollToBottom,
   shouldShowWaitingPlaceholder,
 } from "../composables/chatViewStability";
+import {
+  createAnimationFrameResizeObserver,
+  type ResizeObserverHandle,
+} from "../composables/resizeObserver";
 import { forwardWheelToElement } from "../composables/chatWheelPassthrough";
 import { canOpenInEditor } from "../composables/useHideMeta";
 import { useDiffProgress } from "../composables/useDiffProgress";
@@ -833,7 +837,7 @@ function onMessagesScroll() {
   rememberScrollForSession();
 }
 
-let transcriptResizeObserver: ResizeObserver | null = null;
+let transcriptResizeObserver: ResizeObserverHandle | null = null;
 let transcriptResizeFrame = 0;
 let transcriptResizeReconcilePending = false;
 let transcriptObservedViewportWidth = 0;
@@ -933,7 +937,8 @@ function connectTranscriptResizeObserver() {
   if (!scrollEl && !contentEl) return;
   transcriptObservedViewportWidth = readTranscriptViewportWidth();
 
-  transcriptResizeObserver = new ResizeObserver(handleTranscriptResize);
+  transcriptResizeObserver = createAnimationFrameResizeObserver(handleTranscriptResize);
+  if (!transcriptResizeObserver) return;
 
   if (scrollEl) {
     transcriptResizeObserver.observe(scrollEl);

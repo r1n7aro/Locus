@@ -7,7 +7,10 @@ import "./styles/asset-icons.css";
 import { initDebugConsole } from "./services/debugConsole";
 import { bootstrapLocale } from "./i18n";
 import { getSystemLocale } from "./services/system";
-import { installTauriDevtoolsHotkeys } from "./services/tauriRuntime";
+import {
+  installTauriDevtoolsHotkeys,
+  installTauriWindowDragFallback,
+} from "./services/tauriRuntime";
 import { markStartupPhase, scheduleStartupPaintReport } from "./services/startupPerf";
 
 const debugConsoleReady = initDebugConsole();
@@ -17,6 +20,8 @@ void debugConsoleReady.finally(() => {
 });
 installTauriDevtoolsHotkeys();
 markStartupPhase("frontend_devtools_hotkeys_ready");
+installTauriWindowDragFallback();
+markStartupPhase("frontend_window_drag_fallback_ready");
 
 const app = createApp(App);
 markStartupPhase("frontend_vue_app_created");

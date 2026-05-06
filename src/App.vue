@@ -31,7 +31,12 @@ import { isUnityReferenceImportWindowLocation } from "./services/unityReferenceI
 import { isReferenceExternalImportWindowLocation } from "./services/referenceExternalImportWindow";
 import { isCollabSearchWindowLocation } from "./services/collabSearchWindow";
 import { isUnityHostLocation } from "./services/locusRuntime";
-import { getCurrentTauriWindowLabel, showCurrentTauriWindow } from "./services/tauriRuntime";
+import {
+  canStartWindowDragFromTarget,
+  getCurrentTauriWindowLabel,
+  showCurrentTauriWindow,
+  startCurrentWindowDragging,
+} from "./services/tauriRuntime";
 import { markStartupPhase } from "./services/startupPerf";
 const isCanvasWindow = window.location.pathname === '/canvas'
                     || window.location.search.includes('specId=');
@@ -276,6 +281,13 @@ const appLayoutStyle = computed(() => {
     height: `${uiStore.nativeWindowHeight}px`,
   };
 });
+
+function onTabBarPointerDown(event: PointerEvent) {
+  if (event.button !== 0 || event.detail > 1) return;
+  if (!canStartWindowDragFromTarget(event.target)) return;
+  event.preventDefault();
+  startCurrentWindowDragging();
+}
 
 function shortDir(dir: string): string {
   if (!dir) return t("app.dir.notSet");
@@ -596,7 +608,7 @@ watch(() => projectStore.workingDir, () => {
     @contextmenu.prevent
   >
     <div class="main-area">
-      <div class="tab-bar">
+      <div class="tab-bar" @pointerdown="onTabBarPointerDown">
         <div class="tab-drag-region" aria-hidden="true"></div>
         <span class="tab-brand">Locus</span>
         <button

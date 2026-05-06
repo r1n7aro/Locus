@@ -71,7 +71,7 @@ describe("chat responsive layout", () => {
     expect(workspace).toContain("assistantSidebarMaxSideWidth");
     expect(workspace).toContain(":max-side-width=\"assistantSidebarMaxSideWidth\"");
     expect(workspace).toContain("function handleWorkspaceResize(entries: ResizeObserverEntry[])");
-    expect(workspace).toContain("workspaceResizeObserver = new ResizeObserver(handleWorkspaceResize)");
+    expect(workspace).toContain("createAnimationFrameResizeObserver(handleWorkspaceResize)");
     expect(workspace).not.toContain("scheduleWorkspaceWidthUpdate");
     expect(workspace).toContain("saveRawContext");
     expect(sidebar).toContain("layout?: \"side\" | \"bottom\"");
@@ -105,6 +105,8 @@ describe("chat responsive layout", () => {
   it("keeps resize work out of the hot path while the window or session splitter is moving", () => {
     const app = read("src/App.vue");
     const chatView = read("src/components/ChatView.vue");
+    const main = read("src/main.ts");
+    const tauriRuntime = read("src/services/tauriRuntime.ts");
     const theme = read("src/composables/useTheme.ts");
     const uiStore = read("src/stores/ui.ts");
     const tauriConfig = read("src-tauri/tauri.conf.json");
@@ -114,6 +116,10 @@ describe("chat responsive layout", () => {
     expect(tauriConfig).toContain('"backgroundColor": "#1d1d21"');
     expect(capabilities).toContain("core:window:allow-set-background-color");
     expect(capabilities).toContain("core:webview:allow-set-webview-background-color");
+    expect(capabilities).toContain("core:window:allow-start-dragging");
+    expect(main).toContain("installTauriWindowDragFallback()");
+    expect(tauriRuntime).toContain('getPropertyValue("-webkit-app-region")');
+    expect(tauriRuntime).toContain("startCurrentWindowDragging()");
     expect(theme).toContain("getCurrentWebviewWindow().setBackgroundColor(color)");
     expect(app).toMatch(/html,\s*body,\s*#app\s*\{[\s\S]*background:\s*var\(--bg-color\);/);
     expect(app).not.toContain("--locus-resize-anchor-width");
@@ -123,6 +129,8 @@ describe("chat responsive layout", () => {
     expect(app).not.toContain("transform: translateZ(0);");
     expect(app).not.toContain(".app-layout.is-window-resizing .tab-content *");
     expect(app).toContain('class="tab-drag-region"');
+    expect(app).toContain('@pointerdown="onTabBarPointerDown"');
+    expect(app).toContain("startCurrentWindowDragging()");
     expect(app).toMatch(/\.tab-bar\s*\{[\s\S]*--window-resize-hit-area:\s*6px;[\s\S]*-webkit-app-region:\s*no-drag;/);
     expect(app).toMatch(/\.tab-drag-region\s*\{[\s\S]*inset:\s*var\(--window-resize-hit-area\) var\(--window-resize-hit-area\) 0 var\(--window-resize-hit-area\);[\s\S]*-webkit-app-region:\s*drag;/);
     expect(app).toMatch(/\.tab-spacer\s*\{[\s\S]*-webkit-app-region:\s*drag;[\s\S]*align-self:\s*stretch;/);
@@ -146,7 +154,7 @@ describe("chat responsive layout", () => {
     expect(chatView).toContain("function isLiveResizeInProgress()");
     expect(chatView).not.toContain('uiStore.noteViewportResize("chat-transcript", width)');
     expect(chatView).toContain('recordLayoutDiagnostic("chat.transcript.viewportResize"');
-    expect(chatView).toContain("transcriptResizeObserver = new ResizeObserver(handleTranscriptResize)");
+    expect(chatView).toContain("createAnimationFrameResizeObserver(handleTranscriptResize)");
     expect(chatView).toContain('flushPendingTranscriptResizeReconcile("window-resize-settled")');
     expect(chatView).toContain('flushPendingTranscriptResizeReconcile("session-drag-settled")');
     expect(chatView).toContain("let pendingSessionPanelWidth: number | null = null;");

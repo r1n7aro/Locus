@@ -3,6 +3,10 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue"
 import { t } from "../../i18n";
 import { refetchDiffByKey } from "../../services/diff";
 import { acquireSelectionLock } from "../../composables/useSelectionLock";
+import {
+  createAnimationFrameResizeObserver,
+  type ResizeObserverHandle,
+} from "../../composables/resizeObserver";
 import type {
   AssetBinaryMeta,
   BinaryAssetRef,
@@ -139,7 +143,7 @@ let lastX = 0;
 let lastY = 0;
 let loadToken = 0;
 let agPsdModule: typeof import("ag-psd") | null = null;
-let stageResizeObserver: ResizeObserver | null = null;
+let stageResizeObserver: ResizeObserverHandle | null = null;
 let releaseSelectionLock: (() => void) | null = null;
 
 async function ensureAgPsd(): Promise<typeof import("ag-psd")> {
@@ -387,10 +391,10 @@ watch(stageRef, (el) => {
     return;
   }
 
-  stageResizeObserver = new ResizeObserver(() => {
+  stageResizeObserver = createAnimationFrameResizeObserver(() => {
     updateStageSize();
   });
-  stageResizeObserver.observe(el);
+  stageResizeObserver?.observe(el);
   updateStageSize();
 });
 

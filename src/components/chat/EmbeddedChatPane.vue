@@ -29,6 +29,10 @@ import {
   createSettledScrollScheduler,
   shouldAutoScrollToBottom,
 } from "../../composables/chatViewStability";
+import {
+  createAnimationFrameResizeObserver,
+  type ResizeObserverHandle,
+} from "../../composables/resizeObserver";
 
 interface MetaRow {
   label: string;
@@ -119,7 +123,7 @@ const hasComposerStart = computed(() => !!slots["composer-start"]);
 const hasComposerActions = computed(() => !!slots["composer-actions"]);
 const viewportStates = new Map<string, SessionScrollState>();
 let suppressScrollCapture = false;
-let transcriptResizeObserver: ResizeObserver | null = null;
+let transcriptResizeObserver: ResizeObserverHandle | null = null;
 const toolHandoffViewportQuiet = ref(false);
 let activeToolViewportAnchor: LiveScrollAnchorSnapshot | null = null;
 let toolViewportAnchorFrame = 0;
@@ -367,11 +371,12 @@ function connectTranscriptResizeObserver() {
   const contentEl = getTranscriptContentElement();
   if (!scrollEl && !contentEl) return;
 
-  transcriptResizeObserver = new ResizeObserver(() => {
+  transcriptResizeObserver = createAnimationFrameResizeObserver(() => {
     if (suppressScrollCapture || toolHandoffViewportQuiet.value) return;
     if (restoreToolViewportAnchor()) return;
     reconcileViewport();
   });
+  if (!transcriptResizeObserver) return;
 
   if (scrollEl) {
     transcriptResizeObserver.observe(scrollEl);

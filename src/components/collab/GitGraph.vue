@@ -1,6 +1,10 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import { acquireSelectionLock } from "../../composables/useSelectionLock";
+import {
+  createAnimationFrameResizeObserver,
+  type ResizeObserverHandle,
+} from "../../composables/resizeObserver";
 import { t } from "../../i18n";
 import type {
   GitCommitInfo,
@@ -67,7 +71,7 @@ const headerHeight = ref(0);
 const columnWidthOverrides = ref<HistoryGraphColumnWidthOverrides>(readStoredColumnWidths());
 const activeResizeColumn = ref<HistoryGraphResizableColumn | null>(null);
 let scrollFrame = 0;
-let resizeObserver: ResizeObserver | null = null;
+let resizeObserver: ResizeObserverHandle | null = null;
 let columnResizeMoveHandler: ((event: MouseEvent) => void) | null = null;
 let columnResizeUpHandler: (() => void) | null = null;
 let releaseColumnResizeSelectionLock: (() => void) | null = null;
@@ -159,7 +163,7 @@ watch([scrollRef, headerRef], ([nextScrollRef], [previousScrollRef]) => {
 
 onMounted(() => {
   if (typeof ResizeObserver !== "undefined") {
-    resizeObserver = new ResizeObserver(() => {
+    resizeObserver = createAnimationFrameResizeObserver(() => {
       refreshViewport();
     });
     reconnectObservers();

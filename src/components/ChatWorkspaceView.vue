@@ -12,6 +12,10 @@ import { useModelStore } from "../stores/model";
 import { useNotificationStore } from "../stores/notification";
 import { useProjectStore } from "../stores/project";
 import { useSkills } from "../composables/useSkills";
+import {
+  createAnimationFrameResizeObserver,
+  type ResizeObserverHandle,
+} from "../composables/resizeObserver";
 import ChatView from "./ChatView.vue";
 import ThinkingPanel from "./ThinkingPanel.vue";
 import ChatSidebarPanel from "./ChatSidebarPanel.vue";
@@ -71,7 +75,7 @@ const assistantSidebarMaxSideWidth = computed(() => {
     Math.min(ASSISTANT_SIDEBAR_SIDE_MAX_WIDTH, remainingWidthBound, ratioBound),
   );
 });
-let workspaceResizeObserver: ResizeObserver | null = null;
+let workspaceResizeObserver: ResizeObserverHandle | null = null;
 
 function handleLayoutModeChange(_mode: ResolvedChatLayoutMode) {}
 
@@ -297,7 +301,8 @@ function connectWorkspaceResizeObserver() {
   disconnectWorkspaceResizeObserver();
   updateWorkspaceWidth();
   if (typeof ResizeObserver === "undefined" || !workspaceRef.value) return;
-  workspaceResizeObserver = new ResizeObserver(handleWorkspaceResize);
+  workspaceResizeObserver = createAnimationFrameResizeObserver(handleWorkspaceResize);
+  if (!workspaceResizeObserver) return;
   workspaceResizeObserver.observe(workspaceRef.value);
 }
 

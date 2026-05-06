@@ -17,6 +17,10 @@ import {
   type CollabSearchSelectionPayload,
 } from "../services/collabSearchWindow";
 import { acquireSelectionLock } from "../composables/useSelectionLock";
+import {
+  createAnimationFrameResizeObserver,
+  type ResizeObserverHandle,
+} from "../composables/resizeObserver";
 import { normalizeAppError } from "../services/errors";
 import { locale, t } from "../i18n";
 import {
@@ -104,7 +108,7 @@ let measureContext: CanvasRenderingContext2D | null = null;
 let pendingColumnResizeFrame = 0;
 let pendingColumnResizeWidths: Record<ResultColumnKey, number> | null = null;
 let resultScrollFrame = 0;
-let resultResizeObserver: ResizeObserver | null = null;
+let resultResizeObserver: ResizeObserverHandle | null = null;
 
 const canSearch = computed(() =>
   !!query.value.trim()
@@ -766,7 +770,7 @@ onMounted(() => {
   queryInputRef.value?.focus();
   document.addEventListener("pointerdown", onDocumentPointerDown, true);
   if (typeof ResizeObserver !== "undefined") {
-    resultResizeObserver = new ResizeObserver(syncResultViewport);
+    resultResizeObserver = createAnimationFrameResizeObserver(syncResultViewport);
     reconnectResultResizeObserver();
   } else {
     window.addEventListener("resize", syncResultViewport);

@@ -1,6 +1,10 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onBeforeUnmount, watch } from "vue";
 import { refetchDiffByKey } from "../../services/diff";
+import {
+  createAnimationFrameResizeObserver,
+  type ResizeObserverHandle,
+} from "../../composables/resizeObserver";
 import type { BinaryPreview } from "../../types";
 
 const props = defineProps<{
@@ -35,7 +39,7 @@ let controls: any = null;
 let gridHelper: any = null;
 let currentModel: any = null;
 let animationId: number | null = null;
-let containerResizeObserver: ResizeObserver | null = null;
+let containerResizeObserver: ResizeObserverHandle | null = null;
 
 // Module-level: cache Three.js imports so subsequent loads skip the import phase
 let threeCache: { THREE: any; FBXLoader: any; OrbitControls: any } | null = null;
@@ -196,10 +200,10 @@ function observeContainerSize() {
 
   if (!containerRef.value || typeof ResizeObserver === "undefined") return;
 
-  containerResizeObserver = new ResizeObserver(() => {
+  containerResizeObserver = createAnimationFrameResizeObserver(() => {
     resizeRendererToContainer();
   });
-  containerResizeObserver.observe(containerRef.value);
+  containerResizeObserver?.observe(containerRef.value);
 }
 
 function disposeObject(obj: any) {
