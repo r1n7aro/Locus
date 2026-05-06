@@ -42,6 +42,12 @@ Windows is currently the only supported platform. We plan to add macOS support s
 
 We recommend installing from the Releases build. For the post-installation setup flow, see [Quick Start](https://unity.farlocus.com/en/overview/install-and-setup).
 
+## Compatibility
+
+Locus currently supports Unity 2021 or later on Windows.
+
+If you encounter compatibility issues on older Unity versions, please report them through Issues. We will try to fix them where practical; compatibility fixes that require substantial changes may be handled as branch-specific solutions.
+
 ## Build from Source
 
 This repository uses `bun` + `Tauri 2`, with Windows as the primary development and build platform.

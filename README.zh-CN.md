@@ -42,6 +42,12 @@ Locus是一个Rust + Tauri + Vue.js的独立进程应用程序。
 
 我们推荐使用 Releases 中的安装包安装，安装后的配置流程见 [快速开始](https://unity.farlocus.com/overview/install-and-setup)。
 
+## 兼容性
+
+Locus 当前支持 Windows 系统上的 Unity 2021 或更高版本。
+
+如果您在更低 Unity 版本中发现兼容性问题，欢迎通过 Issue 反馈。我们会尽可能修复；涉及较大修改的兼容性修复，可能会作为分支方案处理。
+
 ## 从源代码构建
 
 当前仓库使用 `bun` + `Tauri 2`，目前以 Windows 作为主要开发与构建平台。
