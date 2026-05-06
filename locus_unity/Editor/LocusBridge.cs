@@ -53,6 +53,11 @@ namespace Locus
         private const int PipeBufferSize = 64 * 1024;
         private const int TextReaderWriterBufferSize = 16 * 1024;
         private const int MaxMainThreadActionsPerUpdate = 32;
+#if UNITY_2020
+        private const PipeOptions ServerPipeOptions = PipeOptions.None;
+#else
+        private const PipeOptions ServerPipeOptions = PipeOptions.Asynchronous;
+#endif
 
         // ───────────────── Main-thread dispatcher ─────────────────
 
@@ -554,12 +559,16 @@ namespace Locus
                         PipeDirection.InOut,
                         1,
                         PipeTransmissionMode.Byte,
-                        PipeOptions.Asynchronous,
+                        ServerPipeOptions,
                         PipeBufferSize,
                         PipeBufferSize
                     );
 
+#if UNITY_2020
+                    WaitForConnectionCompat(server, ct);
+#else
                     await server.WaitForConnectionAsync(ct);
+#endif
                     Debug.Log("[Locus] Pipe client connected: " + PipeName);
 
                     await HandleConnectionAsync(server, ct);
@@ -585,6 +594,41 @@ namespace Locus
                 }
             }
         }
+
+        // Unity 2020's Mono runtime exposes WaitForConnectionAsync(CancellationToken) but throws NotImplementedException.
+#if UNITY_2020
+        private static void WaitForConnectionCompat(NamedPipeServerStream server, CancellationToken ct)
+        {
+            if (ct.IsCancellationRequested)
+                throw new OperationCanceledException(ct);
+
+            using (ct.Register(delegate
+            {
+                try { server.Dispose(); } catch { }
+            }))
+            {
+                try
+                {
+                    server.WaitForConnection();
+                }
+                catch (ObjectDisposedException)
+                {
+                    if (ct.IsCancellationRequested)
+                        throw new OperationCanceledException(ct);
+                    throw;
+                }
+                catch (IOException)
+                {
+                    if (ct.IsCancellationRequested)
+                        throw new OperationCanceledException(ct);
+                    throw;
+                }
+            }
+
+            if (ct.IsCancellationRequested)
+                throw new OperationCanceledException(ct);
+        }
+#endif
 
         // ───────────────── Connection handling ─────────────────
 
