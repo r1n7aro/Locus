@@ -1,5 +1,5 @@
 import { hydrateChatMessageIntent } from "./chatInputIntents";
-import type { StreamEvent, ChatMessage, TokenUsage, TodoItem, ToolCallDisplay, PendingQuestion, PendingToolConfirm, ImageAttachment, ToolCallProgress } from "../types";
+import type { StreamEvent, ChatMessage, TokenUsage, TodoItem, ToolCallDisplay, ToolCallInfo, PendingQuestion, PendingToolConfirm, ImageAttachment, ToolCallProgress } from "../types";
 
 export interface StreamState {
   messages: ChatMessage[];
@@ -40,8 +40,9 @@ export type StreamMutation =
   | { type: "upsertMessage"; message: ChatMessage }
   | { type: "upsertUserMessage"; message: ChatMessage }
   | { type: "replaceMessages"; messages: ChatMessage[] }
-  | { type: "pushToolResults" }
+  | { type: "pushToolResults"; toolCallIds?: string[] }
   | { type: "resetRound" }
+  | { type: "resetRoundKeepToolCalls" }
   | { type: "clearPendingInputs" }
   | { type: "clearPendingInput"; questionId: string }
   | { type: "updateUsage"; usage: TokenUsage }
@@ -65,6 +66,18 @@ export function buildToolResultMessages(
       createdAt,
       toolCallId: toolCall.id,
     }));
+}
+
+function collectToolCallInfoIds(toolCalls: ToolCallInfo[] | undefined): string[] {
+  const ids: string[] = [];
+  const visit = (items: ToolCallInfo[] | undefined) => {
+    for (const item of items ?? []) {
+      ids.push(item.id);
+      visit(item.nestedToolCalls);
+    }
+  };
+  visit(toolCalls);
+  return ids;
 }
 
 function pendingUserMessageId(id: string): boolean {
@@ -288,8 +301,8 @@ export function reduceStreamEvent(state: StreamState, event: StreamEvent): Strea
           thinkingDuration: state.thinkingDuration > 0 ? state.thinkingDuration : undefined,
         },
       });
-      mutations.push({ type: "pushToolResults" });
-      mutations.push({ type: "resetRound" });
+      mutations.push({ type: "pushToolResults", toolCallIds: collectToolCallInfoIds(event.toolCalls) });
+      mutations.push({ type: "resetRoundKeepToolCalls" });
       break;
     }
 

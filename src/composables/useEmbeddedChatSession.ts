@@ -269,7 +269,25 @@ function applyMutation(state: EmbeddedChatState, mutation: StreamMutation) {
       state.isStreaming = mutation.value;
       break;
     case "pushToolResults":
-      state.messages.push(...buildToolResultMessages(state.activeToolCalls));
+      {
+        const targetIds = mutation.toolCallIds ? new Set(mutation.toolCallIds) : null;
+        const sourceToolCalls = targetIds
+          ? state.activeToolCalls.filter((toolCall) => targetIds.has(toolCall.id))
+          : state.activeToolCalls;
+        for (const message of buildToolResultMessages(sourceToolCalls)) {
+          state.messages = replaceMessageById(state.messages, message);
+        }
+      }
+      break;
+    case "resetRoundKeepToolCalls":
+      state.streamingText = "";
+      state.rawStreamText = "";
+      state.streamingThinking = "";
+      state.streamingTextOrder = 0;
+      state.thinkingOrder = 0;
+      state.isThinking = false;
+      state.thinkingStartTime = 0;
+      state.thinkingDuration = 0;
       break;
     case "setTodos":
     case "addUndoable":

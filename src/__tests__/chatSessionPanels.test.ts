@@ -234,6 +234,39 @@ describe("chat session panel state", () => {
     expect(sessionServiceMocks.saveActiveSessionSelection).not.toHaveBeenCalled();
   });
 
+  it("applies active session selection broadcasts without echoing persistence", async () => {
+    const chatStore = useChatStore();
+
+    chatStore.activeSessionId = "s2";
+    await chatStore.syncActiveSessionSelection("s1");
+
+    expect(chatStore.activeSessionId).toBe("s1");
+    expect(chatStore.todos).toHaveLength(1);
+    expect(sessionServiceMocks.saveActiveSessionSelection).not.toHaveBeenCalled();
+
+    await chatStore.syncActiveSessionSelection(null);
+
+    expect(chatStore.activeSessionId).toBeNull();
+    expect(sessionServiceMocks.saveActiveSessionSelection).not.toHaveBeenCalled();
+  });
+
+  it("marks active chat runs as streaming when runStart arrives from another window", async () => {
+    const chatStore = useChatStore();
+
+    await chatStore.selectSession("s1");
+
+    expect(chatStore.isStreaming).toBe(false);
+    chatStore.handleStreamEvent({
+      runId: "run-external",
+      type: "runStart",
+      sessionId: "s1",
+    });
+
+    expect(chatStore.isStreaming).toBe(true);
+    expect(chatStore.currentRunId).toBe("run-external");
+    expect(chatStore.streamingSessionIds.has("s1")).toBe(true);
+  });
+
   it("remembers todo panel visibility per session", async () => {
     const chatStore = useChatStore();
 
@@ -595,7 +628,7 @@ describe("chat session panel state", () => {
     expect(chatStore.activeToolCalls[0]?.id).toBe("tc-active");
   });
 
-  it("replays only the unfinished active round after loading persisted messages", async () => {
+  it("replays the active run tool chain after loading persisted messages", async () => {
     const chatStore = useChatStore();
 
     sessionServiceMocks.loadSession.mockResolvedValueOnce({
@@ -645,6 +678,21 @@ describe("chat session panel state", () => {
         sessionId: "s1",
         runId: "run-1",
         seq: 2,
+        eventType: "toolCallDone",
+        payload: {
+          type: "toolCallDone",
+          sessionId: "s1",
+          toolCallId: "tc-old",
+          toolName: "read",
+          output: "old output",
+          outcome: "done",
+        },
+        createdAt: 2,
+      },
+      {
+        sessionId: "s1",
+        runId: "run-1",
+        seq: 3,
         eventType: "toolCallRoundDone",
         payload: {
           type: "toolCallRoundDone",
@@ -653,12 +701,12 @@ describe("chat session panel state", () => {
           fullText: "persisted round",
           toolCalls: [{ id: "tc-old", name: "read", arguments: "{}" }],
         },
-        createdAt: 2,
+        createdAt: 3,
       },
       {
         sessionId: "s1",
         runId: "run-1",
-        seq: 3,
+        seq: 4,
         eventType: "toolCallStart",
         payload: {
           type: "toolCallStart",
@@ -667,16 +715,19 @@ describe("chat session panel state", () => {
           toolName: "grep",
           arguments: "{}",
         },
-        createdAt: 3,
+        createdAt: 4,
       },
     ]);
 
     await chatStore.selectSession("s1");
 
-    expect(chatStore.messages).toHaveLength(1);
-    expect(chatStore.messages[0]?.id).toBe("msg-round");
-    expect(chatStore.activeToolCalls).toHaveLength(1);
-    expect(chatStore.activeToolCalls[0]?.id).toBe("tc-current");
+    const assistantMessages = chatStore.messages.filter((message) => message.role === "assistant");
+    expect(assistantMessages).toHaveLength(1);
+    expect(assistantMessages[0]?.id).toBe("msg-round");
+    expect(chatStore.activeToolCalls).toHaveLength(2);
+    expect(chatStore.activeToolCalls.map((toolCall) => toolCall.id)).toEqual(["tc-old", "tc-current"]);
+    expect(chatStore.activeToolCalls[0]?.status).toBe("done");
+    expect(chatStore.activeToolCalls[1]?.status).toBe("running");
   });
 
   it("replaces a loaded assistant tool round when the live round-done event arrives", async () => {

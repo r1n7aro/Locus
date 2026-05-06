@@ -6,7 +6,7 @@ use std::sync::Arc;
 use futures::FutureExt;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Emitter, State};
 
 use super::auth::CodexAuthStateHandle;
 use super::{StreamEvent, TokenUsage};
@@ -53,6 +53,13 @@ const ACTIVE_SESSION_GLOBAL_WORKSPACE_KEY: &str = "__global__";
 struct ActiveSessionSelectionState {
     #[serde(default)]
     by_workspace: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActiveSessionSelectionChanged {
+    pub workspace_key: String,
+    pub session_id: Option<String>,
 }
 
 fn active_session_selection_path(app_handle: &AppHandle) -> Result<std::path::PathBuf, String> {
@@ -1081,11 +1088,12 @@ pub async fn save_active_session_selection(
     let normalized_session_id = session_id
         .as_deref()
         .map(str::trim)
-        .filter(|value| !value.is_empty());
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
 
-    match normalized_session_id {
+    match normalized_session_id.as_deref() {
         Some(value) => {
-            state.by_workspace.insert(key, value.to_string());
+            state.by_workspace.insert(key.clone(), value.to_string());
         }
         None => {
             state.by_workspace.remove(&key);
@@ -1093,6 +1101,13 @@ pub async fn save_active_session_selection(
     }
 
     write_active_session_selection_state(&app_handle, &state)?;
+    let _ = app_handle.emit(
+        "active-session-selection-changed",
+        ActiveSessionSelectionChanged {
+            workspace_key: key,
+            session_id: normalized_session_id,
+        },
+    );
     Ok(())
 }
 

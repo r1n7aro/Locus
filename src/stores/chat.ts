@@ -80,11 +80,7 @@ function activeReplayEvents(
   afterSeq: number,
 ): SessionEventRecord[] {
   if (afterSeq > 0) return records;
-  const lastCompletedRoundIndex = records
-    .map((record) => record.eventType)
-    .lastIndexOf("toolCallRoundDone");
-  if (lastCompletedRoundIndex < 0) return records;
-  return records.slice(lastCompletedRoundIndex + 1);
+  return records;
 }
 
 function normalizeToolPermissionMode(mode: string | null | undefined): ToolPermissionMode {
@@ -782,8 +778,17 @@ export const useChatStore = defineStore("chat", () => {
         logToolCollapseTrace("chat-store", "pushToolResults", {
           toolCallCount: activeToolCalls.value.length,
           toolCallIds: activeToolCalls.value.map((toolCall) => toolCall.id),
+          targetToolCallIds: m.toolCallIds ?? null,
         });
-        messages.value.push(...buildToolResultMessages(activeToolCalls.value));
+        {
+          const targetIds = m.toolCallIds ? new Set(m.toolCallIds) : null;
+          const sourceToolCalls = targetIds
+            ? activeToolCalls.value.filter((toolCall) => targetIds.has(toolCall.id))
+            : activeToolCalls.value;
+          for (const message of buildToolResultMessages(sourceToolCalls)) {
+            messages.value = replaceMessageById(messages.value, message);
+          }
+        }
         break;
       case "resetRound":
         logToolCollapseTrace("chat-store", "resetRound", {
@@ -801,6 +806,22 @@ export const useChatStore = defineStore("chat", () => {
         thinkingDuration.value = 0;
         isThinking.value = false;
         activeToolCalls.value = [];
+        break;
+      case "resetRoundKeepToolCalls":
+        logToolCollapseTrace("chat-store", "resetRoundKeepToolCalls", {
+          rawStreamLen: rawStreamText.value.length,
+          streamingLen: streamingText.value.length,
+          thinkingLen: streamingThinking.value.length,
+          activeToolCallCount: activeToolCalls.value.length,
+          activeToolCallIds: activeToolCalls.value.map((toolCall) => toolCall.id),
+        });
+        resetStreamAnim();
+        streamingThinking.value = "";
+        streamingTextOrder.value = 0;
+        thinkingOrder.value = 0;
+        thinkingStartTime.value = 0;
+        thinkingDuration.value = 0;
+        isThinking.value = false;
         break;
       case "clearPendingInputs":
         pendingQuestion.value = null;
@@ -912,10 +933,10 @@ export const useChatStore = defineStore("chat", () => {
 
       if (event.sessionId === activeSessionId.value) {
         currentRunId.value = event.runId;
-        if (!managedStreamingSessionIds.has(event.sessionId) && resolveSessionType(event.sessionId) !== "chat") {
+        if (!managedStreamingSessionIds.has(event.sessionId)) {
           resetStreamRuntimeState();
-          isStreaming.value = true;
         }
+        isStreaming.value = true;
       }
 
       if (
@@ -1147,10 +1168,10 @@ export const useChatStore = defineStore("chat", () => {
     }
   }
 
-  async function selectSession(id: string) {
+  async function selectSession(id: string, options: { persist?: boolean } = {}) {
     if (id === activeSessionId.value) return;
     persistTodoPanelState();
-    setActiveSessionSelection(id);
+    setActiveSessionSelection(id, { persist: options.persist });
     activeSessionType.value = sessions.value.find((session) => session.id === id)?.sessionType ?? null;
     currentRunId.value = sessionRunIds.value.get(id) ?? null;
     pendingPlanRun.value = null;
@@ -1161,6 +1182,26 @@ export const useChatStore = defineStore("chat", () => {
     showTodoPanel.value = false;
     todoMode.value = "current";
     await loadSessionState(id);
+  }
+
+  async function syncActiveSessionSelection(sessionId: string | null | undefined) {
+    const normalizedSessionId = sessionId?.trim() || null;
+    if (normalizedSessionId === activeSessionId.value) {
+      if (normalizedSessionId && !sessions.value.some((session) => session.id === normalizedSessionId)) {
+        await refreshSessions();
+      }
+      return;
+    }
+
+    if (!normalizedSessionId) {
+      newChat({ persistSelection: false });
+      return;
+    }
+
+    await selectSession(normalizedSessionId, { persist: false });
+    if (!sessions.value.some((session) => session.id === normalizedSessionId)) {
+      await refreshSessions();
+    }
   }
 
   function newChat(options: { persistSelection?: boolean } = {}) {
@@ -1627,6 +1668,7 @@ export const useChatStore = defineStore("chat", () => {
     setToolPermissionMode,
     toggleToolPermissionMode,
     selectSession,
+    syncActiveSessionSelection,
     newChat,
     resetWorkspaceScope,
     openThinkingPanel,

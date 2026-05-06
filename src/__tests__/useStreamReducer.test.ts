@@ -530,7 +530,7 @@ describe("reduceStreamEvent", () => {
   });
 
   describe("toolCallRoundDone", () => {
-    it("pushes assistant message, tool results, and resets round", () => {
+    it("pushes assistant message, tool results, and keeps tool calls live", () => {
       const state = makeState({ isStreaming: true, streamingThinking: "thought", thinkingDuration: 3 });
       const event: StreamEvent = { runId: "test-run",
         type: "toolCallRoundDone",
@@ -550,8 +550,9 @@ describe("reduceStreamEvent", () => {
         expect(pushMsg.message.thinkingContent).toBe("thought");
         expect(pushMsg.message.thinkingDuration).toBe(3);
       }
-      expect(mutations.find((m) => m.type === "pushToolResults")).toBeDefined();
-      expect(mutations.find((m) => m.type === "resetRound")).toBeDefined();
+      expect(mutations).toContainEqual({ type: "pushToolResults", toolCallIds: ["tc1"] });
+      expect(mutations.find((m) => m.type === "resetRoundKeepToolCalls")).toBeDefined();
+      expect(mutations.find((m) => m.type === "resetRound")).toBeUndefined();
     });
   });
 

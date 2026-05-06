@@ -146,6 +146,11 @@ export interface SessionEventRecord {
   createdAt: number;
 }
 
+export interface ActiveSessionSelectionChanged {
+  workspaceKey: string;
+  sessionId: string | null;
+}
+
 export interface SaveRawContextRequest {
   sessionId: string;
   includeSystemPrompt: boolean;

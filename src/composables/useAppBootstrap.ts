@@ -37,6 +37,7 @@ import {
 import { listAgents, listSubagentDefs } from "../services/agent";
 import type {
   StreamEvent,
+  ActiveSessionSelectionChanged,
   AssetDbScanEvent,
   PluginStatus,
   AppErrorPayload,
@@ -99,6 +100,7 @@ export function useAppBootstrap() {
   let unlistenUnity: RuntimeUnsubscribe | null = null;
   let unlistenScan: RuntimeUnsubscribe | null = null;
   let unlistenPlugin: RuntimeUnsubscribe | null = null;
+  let unlistenActiveSessionSelection: RuntimeUnsubscribe | null = null;
   let unlistenAppError: RuntimeUnsubscribe | null = null;
   let unlistenLexicalRebuildStatus: RuntimeUnsubscribe | null = null;
   let lastAutoOpenedLexicalProgressRun = "";
@@ -428,6 +430,12 @@ export function useAppBootstrap() {
         chatStore.sessions.find((session) => session.id === payload.sessionId)?.title ?? null;
       void maybeNotifyStreamEvent(payload, { sessionTitle });
     });
+    unlistenActiveSessionSelection = await runtime.subscribe<ActiveSessionSelectionChanged>(
+      "active-session-selection-changed",
+      (payload) => {
+        void chatStore.syncActiveSessionSelection(payload.sessionId);
+      },
+    );
     unlistenUnity = await runtime.subscribe<boolean>("unity-connection-status", (payload) => {
       projectStore.handleUnityConnectionStatus(payload);
       if (payload) {
@@ -472,6 +480,7 @@ export function useAppBootstrap() {
     unlistenUnity?.();
     unlistenScan?.();
     unlistenPlugin?.();
+    unlistenActiveSessionSelection?.();
     unlistenAppError?.();
     unlistenLexicalRebuildStatus?.();
     lastAutoOpenedLexicalProgressRun = "";
