@@ -4201,6 +4201,154 @@ impl AgentInstance {
         }
     }
 
+    async fn record_raw_attempt(
+        &self,
+        kind: &str,
+        iteration: usize,
+        attempt: u32,
+        system_parts: &[&str],
+        messages: &[crate::session::models::ChatMessage],
+        api_tools: &[serde_json::Value],
+        estimated_tokens: u32,
+        completed: bool,
+        response_or_error: &str,
+        used_previous_response_id: Option<bool>,
+    ) {
+        let request = serde_json::json!({
+            "_locusAttempt": {
+                "kind": kind,
+                "attempt": attempt,
+                "completed": completed,
+                "estimatedTokens": estimated_tokens,
+                "usedPreviousResponseId": used_previous_response_id,
+                "responseOrError": response_or_error,
+            },
+            "model": self.effective_model.clone(),
+            "system": system_parts,
+            "messages": messages,
+            "tools": api_tools,
+        });
+        let round = RawRound {
+            round: iteration,
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64,
+            request,
+            response: response_or_error.to_string(),
+        };
+        self.raw_store
+            .lock()
+            .await
+            .entry(self.session_id.clone())
+            .or_insert_with(Vec::new)
+            .push(round);
+    }
+
+    async fn call_compact_llm(
+        &self,
+        store: &SessionStore,
+        system_parts: &[&str],
+        messages: &[crate::session::models::ChatMessage],
+    ) -> Result<LlmCallResult, String> {
+        if let LlmBackend::OpenAiCodex {
+            auth,
+            transport,
+            base_url,
+        } = &self.backend
+        {
+            let system_prompt = system_parts.join("\n\n");
+            let model_name = &self.effective_model;
+            let actual_model = model_name.strip_prefix("openai/").unwrap_or(model_name);
+            let mut compact_turn_state = codex::TurnState::default();
+            let (access_token, account_id) = resolve_codex_request_auth(auth, false)
+                .await
+                .map_err(|e| format!("OpenAI Codex token failed (please re-login): {}", e))?;
+            let resp = match codex::stream_chat_with_options(
+                &access_token,
+                account_id.as_deref(),
+                *transport,
+                base_url.as_deref(),
+                actual_model,
+                &system_prompt,
+                messages,
+                &[],
+                self.effort.as_deref(),
+                self.debug,
+                None,
+                None,
+                &mut compact_turn_state,
+                codex::CodexStreamOptions::compact(),
+                &|_| {},
+                &|_| {},
+                &|_, _| {},
+            )
+            .await
+            {
+                Ok(resp) => resp,
+                Err(error) if is_codex_unauthorized_error(&error) => {
+                    eprintln!(
+                        "[OpenAI Codex] compact received unauthorized response, refreshing auth and retrying once"
+                    );
+                    let (access_token, account_id) =
+                        resolve_codex_request_auth(auth, true)
+                            .await
+                            .map_err(|e| format!("OpenAI Codex token refresh failed: {}", e))?;
+                    codex::stream_chat_with_options(
+                        &access_token,
+                        account_id.as_deref(),
+                        *transport,
+                        base_url.as_deref(),
+                        actual_model,
+                        &system_prompt,
+                        messages,
+                        &[],
+                        self.effort.as_deref(),
+                        self.debug,
+                        None,
+                        None,
+                        &mut compact_turn_state,
+                        codex::CodexStreamOptions::compact(),
+                        &|_| {},
+                        &|_| {},
+                        &|_, _| {},
+                    )
+                    .await?
+                }
+                Err(error) => return Err(error),
+            };
+            return Ok(LlmCallResult {
+                text: resp.text,
+                tool_calls: resp.tool_calls,
+                finish_reason: resp.finish_reason,
+                response_id: resp.response_id,
+                input_tokens: resp.input_tokens,
+                output_tokens: resp.output_tokens,
+                cache_read_tokens: resp.cache_read_tokens,
+                cache_write_tokens: resp.cache_write_tokens,
+                cost_usd: 0.0,
+                raw_request: resp.raw_request,
+                raw_response: resp.raw_response,
+                thinking_text: resp.thinking_text,
+                thinking_duration_secs: resp.thinking_duration_secs,
+                thinking_signature: String::new(),
+                continuation_request: resp.continuation_request,
+            });
+        }
+
+        self.call_llm(
+            store,
+            None,
+            system_parts,
+            messages,
+            &[],
+            |_| {},
+            |_| {},
+            |_, _| {},
+        )
+        .await
+    }
+
     async fn execute_auto_compact(
         &self,
         app_handle: &AppHandle,
@@ -4209,9 +4357,11 @@ impl AgentInstance {
         context_tokens: u32,
         context_limit: u32,
         run_id: &str,
+        attempt_kind: &str,
+        iteration: usize,
     ) -> Result<bool, String> {
         let messages = store.get_messages_for_prompt(&self.session_id)?;
-        if messages.len() < 4 {
+        if messages.len() < 2 {
             return Ok(false);
         }
 
@@ -4228,26 +4378,157 @@ impl AgentInstance {
         );
 
         eprintln!(
-            "[Agent {}] auto-compact triggered: context_tokens={}, limit={}, threshold=90%, messages={}",
-            self.id, context_tokens, context_limit, messages.len()
+            "[Agent {}] auto-compact triggered: context_tokens={}, limit={}, messages={}",
+            self.id,
+            context_tokens,
+            context_limit,
+            messages.len()
         );
 
-        let compact_messages = compact::build_compact_request(&messages);
+        let compact_plan = match compact::build_compact_request_with_budget(
+            &messages,
+            system_parts,
+            context_limit,
+        ) {
+            Ok(plan) => plan,
+            Err(e) => {
+                eprintln!(
+                    "[Agent {}] budgeted compact request unavailable, using emergency compact: {}",
+                    self.id, e
+                );
+                let boundary_idx = compact::find_compact_boundary_by_budget(
+                    &messages,
+                    compact::compact_recent_tail_token_budget(context_limit),
+                );
+                let summary = compact::build_emergency_compact_summary(&messages, boundary_idx, &e);
+                let keep_from_msg = &messages[boundary_idx];
+                let restored_files_section = compact::build_post_compact_restored_files_section(
+                    &messages[..boundary_idx],
+                    &self.working_dir,
+                );
+                let summary_msg = compact::build_post_compact_message(
+                    &summary,
+                    &restored_files_section,
+                    keep_from_msg.created_at,
+                    boundary_idx + 1 < messages.len(),
+                );
+                let (count_before, count_after) =
+                    store.compact_messages(&self.session_id, &summary_msg, &keep_from_msg.id)?;
+                if matches!(self.backend, LlmBackend::OpenAiCodex { .. }) {
+                    crate::llm::codex::reset_cached_session_window(&self.session_id).await;
+                }
+                let compacted_messages = store.get_messages(&self.session_id)?;
+                eprintln!(
+                    "[Agent {}] emergency auto-compact done: {} → {} messages, summary len={}",
+                    self.id,
+                    count_before,
+                    count_after,
+                    summary.len()
+                );
+                emit_stream(
+                    app_handle,
+                    run_id,
+                    StreamEvent::CompactDone {
+                        session_id: self.session_id.clone(),
+                        messages_before,
+                        messages_after: count_after,
+                        messages: compacted_messages,
+                    },
+                );
+                return Ok(true);
+            }
+        };
+
+        eprintln!(
+            "[Agent {}] compact request budget: estimated_tokens={}, budget={}, boundary_idx={}, truncated={}",
+            self.id,
+            compact_plan.estimated_tokens,
+            compact_plan.budget_tokens,
+            compact_plan.boundary_idx,
+            compact_plan.truncated
+        );
+
         let summary_result = self
-            .call_llm(
-                store,
-                None,
-                system_parts,
-                &compact_messages,
-                &[],
-                |_| {},
-                |_| {},
-                |_, _| {},
-            )
+            .call_compact_llm(store, system_parts, &compact_plan.messages)
             .await;
+        match &summary_result {
+            Ok(resp) => {
+                self.record_raw_attempt(
+                    attempt_kind,
+                    iteration,
+                    1,
+                    system_parts,
+                    &compact_plan.messages,
+                    &[],
+                    compact_plan.estimated_tokens,
+                    true,
+                    &resp.raw_response,
+                    Some(false),
+                )
+                .await;
+            }
+            Err(e) => {
+                self.record_raw_attempt(
+                    attempt_kind,
+                    iteration,
+                    1,
+                    system_parts,
+                    &compact_plan.messages,
+                    &[],
+                    compact_plan.estimated_tokens,
+                    false,
+                    e,
+                    Some(false),
+                )
+                .await;
+            }
+        }
 
         let summary_response = match summary_result {
             Ok(resp) => resp,
+            Err(e) if is_prompt_too_long_error(&e) => {
+                eprintln!(
+                    "[Agent {}] compact LLM call exceeded context, using emergency compact: {}",
+                    self.id, e
+                );
+                let boundary_idx = compact_plan.boundary_idx;
+                let summary = compact::build_emergency_compact_summary(&messages, boundary_idx, &e);
+                let keep_from_msg = &messages[boundary_idx];
+                let restored_files_section = compact::build_post_compact_restored_files_section(
+                    &messages[..boundary_idx],
+                    &self.working_dir,
+                );
+                let summary_msg = compact::build_post_compact_message(
+                    &summary,
+                    &restored_files_section,
+                    keep_from_msg.created_at,
+                    boundary_idx + 1 < messages.len(),
+                );
+                let (count_before, count_after) =
+                    store.compact_messages(&self.session_id, &summary_msg, &keep_from_msg.id)?;
+                if matches!(self.backend, LlmBackend::OpenAiCodex { .. }) {
+                    crate::llm::codex::reset_cached_session_window(&self.session_id).await;
+                }
+                let compacted_messages = store.get_messages(&self.session_id)?;
+                eprintln!(
+                    "[Agent {}] emergency auto-compact done after compact error: {} → {} messages, summary len={}",
+                    self.id,
+                    count_before,
+                    count_after,
+                    summary.len()
+                );
+                emit_stream(
+                    app_handle,
+                    run_id,
+                    StreamEvent::CompactDone {
+                        session_id: self.session_id.clone(),
+                        messages_before,
+                        messages_after: count_after,
+                        messages: compacted_messages,
+                    },
+                );
+                return Ok(true);
+            }
             Err(e) => {
                 eprintln!("[Agent {}] compact LLM call failed: {}", self.id, e);
                 return Err(e);
@@ -4325,7 +4606,7 @@ impl AgentInstance {
             return Err("Compact returned empty summary".to_string());
         }
 
-        let boundary_idx = compact::find_compact_boundary(&messages);
+        let boundary_idx = compact_plan.boundary_idx;
         let keep_from_msg = &messages[boundary_idx];
         let restored_files_section = compact::build_post_compact_restored_files_section(
             &messages[..boundary_idx],
@@ -4891,9 +5172,16 @@ impl AgentInstance {
             let prepared_messages = compact::prepare_messages_for_llm(&messages);
             let estimated_input_tokens =
                 compact::estimate_request_tokens(&system_parts, &prepared_messages, &api_tools);
+            let is_codex_backend = matches!(self.backend, LlmBackend::OpenAiCodex { .. });
+            let should_preflight_compact = if is_codex_backend {
+                compact::should_codex_auto_compact(estimated_input_tokens, ctx_limit)
+            } else {
+                compact::should_auto_compact(estimated_input_tokens, ctx_limit)
+            };
+            let mut preflight_compact_error: Option<String> = None;
 
             if !compact_tracker.is_circuit_broken()
-                && compact::should_auto_compact(estimated_input_tokens, ctx_limit)
+                && should_preflight_compact
             {
                 eprintln!(
                     "[Agent {}] preflight auto-compact candidate: estimated_tokens={}, limit={}, messages={} -> {}",
@@ -4911,6 +5199,8 @@ impl AgentInstance {
                         estimated_input_tokens,
                         ctx_limit,
                         &run_id,
+                        "compact",
+                        iteration,
                     )
                     .await
                 {
@@ -4923,8 +5213,20 @@ impl AgentInstance {
                     Err(e) => {
                         compact_tracker.record_failure();
                         eprintln!("[Agent {}] preflight auto-compact failed: {}", self.id, e);
+                        preflight_compact_error = Some(e);
                     }
                 }
+            }
+
+            if is_codex_backend
+                && compact::should_codex_block_normal_send(estimated_input_tokens, ctx_limit)
+            {
+                let reason = preflight_compact_error
+                    .unwrap_or_else(|| "Codex request is too close to the context limit".to_string());
+                return Err(format!(
+                    "Refusing to send oversized Codex request after compact failed or was unavailable: estimated_input_tokens={}, limit={}, reason={}",
+                    estimated_input_tokens, ctx_limit, reason
+                ));
             }
 
             eprintln!(
@@ -5143,6 +5445,19 @@ impl AgentInstance {
                             llm_call_started_at.elapsed().as_millis(),
                             e
                         );
+                        self.record_raw_attempt(
+                            "normal",
+                            iteration,
+                            attempt_number,
+                            &system_parts,
+                            &prepared_messages,
+                            &api_tools,
+                            estimated_input_tokens,
+                            false,
+                            &e,
+                            None,
+                        )
+                        .await;
                         if is_prompt_too_long_error(&e) && !compact_tracker.is_circuit_broken() {
                             eprintln!(
                                 "[Agent {}] prompt-too-long detected on iteration {}, scheduling reactive compact: {}",
@@ -5182,6 +5497,8 @@ impl AgentInstance {
                             estimated_input_tokens,
                             ctx_limit,
                             &run_id,
+                            "reactive_compact",
+                            iteration,
                         )
                         .await
                     {
@@ -5583,7 +5900,7 @@ impl AgentInstance {
                     if let Err(e) = store.add_tool_result(
                         &self.session_id,
                         &tc.id,
-                        &result.output,
+                        &stored_output,
                     ) {
                         eprintln!(
                             "[Agent {}] failed to save tool_result for '{}' (id={}): {}",

@@ -1954,6 +1954,10 @@ fn format_rounds_as_markdown(
     for round in rounds {
         let time_str = format_export_timestamp(round.timestamp);
         out.push_str(&format!("## Round {} ({})\n\n", round.round, time_str));
+        let attempt_metadata = round.request.get("_locusAttempt");
+        if let Some(metadata) = attempt_metadata {
+            format_raw_attempt_metadata(&mut out, metadata);
+        }
 
         if let Some(messages) = extract_request_history_items(&round.request) {
             let new_messages = if prev_msg_count < messages.len() {
@@ -1967,11 +1971,75 @@ fn format_rounds_as_markdown(
         }
 
         out.push_str("### 🤖 Assistant\n\n");
-        parse_sse_response(&mut out, &round.response);
+        if let Some(metadata) = attempt_metadata {
+            let completed = metadata
+                .get("completed")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            if completed {
+                parse_sse_response(&mut out, &round.response);
+            } else {
+                out.push_str("*(attempt failed before a completed assistant response)*\n\n");
+                if let Some(error) = metadata
+                    .get("responseOrError")
+                    .and_then(|value| value.as_str())
+                    .filter(|value| !value.trim().is_empty())
+                {
+                    write_text_code_block(&mut out, error);
+                }
+            }
+        } else {
+            parse_sse_response(&mut out, &round.response);
+        }
         out.push_str("\n---\n\n");
     }
 
     out
+}
+
+fn format_raw_attempt_metadata(out: &mut String, metadata: &serde_json::Value) {
+    out.push_str("### Attempt Metadata\n\n");
+    let kind = metadata
+        .get("kind")
+        .and_then(|value| value.as_str())
+        .unwrap_or(EMPTY_EXPORT_FIELD);
+    let attempt = metadata
+        .get("attempt")
+        .and_then(|value| value.as_u64())
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| EMPTY_EXPORT_FIELD.to_string());
+    let completed = metadata
+        .get("completed")
+        .and_then(|value| value.as_bool())
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| EMPTY_EXPORT_FIELD.to_string());
+    let estimated_tokens = metadata
+        .get("estimatedTokens")
+        .and_then(|value| value.as_u64())
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| EMPTY_EXPORT_FIELD.to_string());
+    let used_previous_response_id = metadata
+        .get("usedPreviousResponseId")
+        .and_then(|value| {
+            if value.is_null() {
+                None
+            } else {
+                value.as_bool().map(|inner| inner.to_string())
+            }
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+
+    out.push_str(&format!("- **Kind:** `{}`\n", kind));
+    out.push_str(&format!("- **Attempt:** `{}`\n", attempt));
+    out.push_str(&format!("- **Completed:** `{}`\n", completed));
+    out.push_str(&format!("- **Estimated Tokens:** `{}`\n", estimated_tokens));
+    out.push_str(&format!(
+        "- **Used previous_response_id:** `{}`\n",
+        used_previous_response_id
+    ));
+    out.push_str(
+        "- **Note:** failed attempts are captured from the local request view before a completed raw response exists.\n\n",
+    );
 }
 
 fn extract_request_history_items(request: &serde_json::Value) -> Option<&Vec<serde_json::Value>> {
@@ -2362,6 +2430,45 @@ mod tests {
         assert!(markdown.contains("*Call ID: `call_1`*"));
         assert!(markdown.contains(&long_output));
         assert!(!markdown.contains("... (truncated)"));
+    }
+
+    #[test]
+    fn raw_context_export_includes_failed_attempt_metadata() {
+        let markdown = format_rounds_as_markdown(
+            "session-failed-attempt",
+            &[crate::agent::instance::RawRound {
+                round: 12,
+                timestamp: 0,
+                request: serde_json::json!({
+                    "_locusAttempt": {
+                        "kind": "reactive_compact",
+                        "attempt": 1,
+                        "completed": false,
+                        "estimatedTokens": 269383,
+                        "usedPreviousResponseId": false,
+                        "responseOrError": "input exceeds context"
+                    },
+                    "model": "gpt-5.5",
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": "continue"
+                        }
+                    ],
+                    "tools": []
+                }),
+                response: "input exceeds context".to_string(),
+            }],
+            None,
+            None,
+            false,
+        );
+
+        assert!(markdown.contains("### Attempt Metadata"));
+        assert!(markdown.contains("- **Kind:** `reactive_compact`"));
+        assert!(markdown.contains("- **Estimated Tokens:** `269383`"));
+        assert!(markdown.contains("attempt failed before a completed assistant response"));
+        assert!(markdown.contains("input exceeds context"));
     }
 
     #[test]

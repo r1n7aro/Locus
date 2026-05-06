@@ -37,6 +37,15 @@ struct ClaudeSdkRoundHost<'a> {
     last_assistant: Option<ClaudeSdkAssistantMessage>,
 }
 
+fn save_claude_sdk_tool_result(
+    store: &SessionStore,
+    session_id: &str,
+    tool_call_id: &str,
+    stored_output: &str,
+) -> Result<String, String> {
+    store.add_tool_result(session_id, tool_call_id, stored_output)
+}
+
 impl<'a> ClaudeSdkRoundHost<'a> {
     fn emit_tool_call_start(&self, tool_call_id: &str, tool_name: &str, arguments: &str) {
         emit_stream(
@@ -364,10 +373,12 @@ impl<'a> ClaudeSdkHost for ClaudeSdkRoundHost<'a> {
                 result.outcome.as_stream_outcome(),
             );
 
-            if let Err(err) =
-                self.store
-                    .add_tool_result(&self.agent.session_id, &tool_call.id, &result.output)
-            {
+            if let Err(err) = save_claude_sdk_tool_result(
+                self.store,
+                &self.agent.session_id,
+                &tool_call.id,
+                &stored_output,
+            ) {
                 eprintln!(
                     "[Agent {}] failed to save Claude SDK tool result for '{}' (id={}): {}",
                     self.agent.id, tool_call.name, tool_call.id, err
@@ -700,4 +711,34 @@ fn sanitize_request_id(request_id: &str) -> String {
         .chars()
         .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn anthropic_sdk_tool_result_uses_stored_output() {
+        let dir = tempdir().expect("create temp dir");
+        let store = SessionStore::new(dir.path()).expect("initialize store");
+        let session_id = store
+            .create_session("Claude SDK Tool Result", None, None, "chat", None)
+            .expect("create session");
+        let full_output = "C".repeat(31_000);
+        let stored_output = store
+            .rewrite_tool_result_for_storage(&session_id, "tc-sdk", "bash", &full_output)
+            .expect("rewrite tool output");
+
+        save_claude_sdk_tool_result(&store, &session_id, "tc-sdk", &stored_output)
+            .expect("save SDK tool result");
+
+        let prompt_messages = store
+            .get_messages_for_prompt(&session_id)
+            .expect("load prompt messages");
+        assert_eq!(prompt_messages.len(), 1);
+        assert_eq!(prompt_messages[0].role, MessageRole::Tool);
+        assert!(prompt_messages[0].content.starts_with("<persisted-output>"));
+        assert!(!prompt_messages[0].content.contains(&full_output));
+    }
 }

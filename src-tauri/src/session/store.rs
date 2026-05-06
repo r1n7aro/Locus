@@ -328,7 +328,7 @@ impl SessionStore {
     ///
     /// Do not rely on ad-hoc `ALTER TABLE ... .ok()` fallbacks or silent
     /// schema drift. Session data must migrate deterministically.
-    const SCHEMA_VERSION: i32 = 14;
+    const SCHEMA_VERSION: i32 = 15;
 
     pub fn new(data_dir: &Path) -> Result<Self, String> {
         let db_path = data_dir.join("locus.db");
@@ -362,7 +362,7 @@ impl SessionStore {
         conn.execute_batch("PRAGMA foreign_keys = ON;")
             .map_err(|e| format!("Failed to enable foreign keys: {}", e))?;
 
-        Self::run_migrations(&conn)?;
+        Self::run_migrations(&conn, data_dir)?;
         Self::mark_nonterminal_runs_cancelled(&conn)?;
 
         let conn = Arc::new(Mutex::new(conn));
@@ -378,7 +378,7 @@ impl SessionStore {
     /// Fresh databases are created directly at the latest schema version.
     /// Supported upgrades start at v7, and every schema change after that must
     /// be expressed as an explicit migration keyed by `user_version`.
-    fn run_migrations(conn: &Connection) -> Result<(), String> {
+    fn run_migrations(conn: &Connection, data_dir: &Path) -> Result<(), String> {
         let current: i32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .map_err(|e| format!("Failed to read schema version: {}", e))?;
@@ -486,7 +486,13 @@ impl SessionStore {
             })?;
         }
 
-        debug_assert_eq!(Self::SCHEMA_VERSION, 14, "add a new migration block above");
+        if current < 15 {
+            Self::migrate(conn, 15, "persist oversized tool results", |conn| {
+                Self::migrate_oversized_tool_results(conn, data_dir)
+            })?;
+        }
+
+        debug_assert_eq!(Self::SCHEMA_VERSION, 15, "add a new migration block above");
         Ok(())
     }
 
@@ -683,6 +689,71 @@ impl SessionStore {
                     "UPDATE messages SET tool_calls = ?1 WHERE id = ?2",
                     params![serialized, message.id],
                 )?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn migrate_oversized_tool_results(conn: &Connection, data_dir: &Path) -> rusqlite::Result<()> {
+        fn to_sql_error(error: String) -> rusqlite::Error {
+            rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                error,
+            )))
+        }
+
+        let mut stmt = conn.prepare("SELECT id FROM sessions ORDER BY created_at ASC, id ASC")?;
+        let session_ids = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        for session_id in session_ids {
+            let raw_messages =
+                Self::get_messages_with_conn_filtered_static(conn, &session_id, false)
+                    .map_err(to_sql_error)?;
+            let normalized = crate::session::history::normalize_tool_round_history(&raw_messages);
+            let mut tool_names: HashMap<String, String> = HashMap::new();
+            for message in &normalized {
+                if message.role != MessageRole::Assistant {
+                    continue;
+                }
+                if let Some(tool_calls) = message.tool_calls.as_ref() {
+                    for tool_call in tool_calls {
+                        if !tool_call.id.trim().is_empty() {
+                            tool_names
+                                .entry(tool_call.id.clone())
+                                .or_insert_with(|| tool_call.name.clone());
+                        }
+                    }
+                }
+            }
+
+            for message in raw_messages {
+                if message.role != MessageRole::Tool {
+                    continue;
+                }
+                let Some(tool_call_id) = message.tool_call_id.as_deref() else {
+                    continue;
+                };
+                let tool_name = tool_names
+                    .get(tool_call_id)
+                    .map(String::as_str)
+                    .unwrap_or("unknown");
+                let rewritten = Self::rewrite_tool_result_for_storage_at(
+                    data_dir,
+                    &session_id,
+                    tool_call_id,
+                    tool_name,
+                    &message.content,
+                )
+                .map_err(to_sql_error)?;
+                if rewritten != message.content {
+                    conn.execute(
+                        "UPDATE messages SET content = ?1 WHERE id = ?2 AND session_id = ?3",
+                        params![rewritten, message.id, session_id],
+                    )?;
+                }
             }
         }
 
@@ -1446,11 +1517,31 @@ impl SessionStore {
     }
 
     fn session_tool_results_dir(&self, session_id: &str) -> PathBuf {
-        self.data_dir.join(TOOL_RESULTS_DIR).join(session_id)
+        Self::session_tool_results_dir_for(&self.data_dir, session_id)
+    }
+
+    fn session_tool_results_dir_for(data_dir: &Path, session_id: &str) -> PathBuf {
+        data_dir.join(TOOL_RESULTS_DIR).join(session_id)
     }
 
     pub fn rewrite_tool_result_for_storage(
         &self,
+        session_id: &str,
+        tool_call_id: &str,
+        tool_name: &str,
+        content: &str,
+    ) -> Result<String, String> {
+        Self::rewrite_tool_result_for_storage_at(
+            &self.data_dir,
+            session_id,
+            tool_call_id,
+            tool_name,
+            content,
+        )
+    }
+
+    fn rewrite_tool_result_for_storage_at(
+        data_dir: &Path,
         session_id: &str,
         tool_call_id: &str,
         tool_name: &str,
@@ -1473,7 +1564,7 @@ impl SessionStore {
             return Ok(content.to_string());
         }
 
-        let dir = self.session_tool_results_dir(session_id);
+        let dir = Self::session_tool_results_dir_for(data_dir, session_id);
         std::fs::create_dir_all(&dir).map_err(|e| {
             format!(
                 "Failed to create tool result dir '{}': {}",
@@ -3081,6 +3172,88 @@ mod tests {
         assert!(SessionStore::table_has_column(&conn, "session_runs", "status").unwrap());
         assert!(table_exists(&conn, "session_events"));
         assert!(SessionStore::table_has_column(&conn, "session_events", "payload_json").unwrap());
+    }
+
+    #[test]
+    fn v14_migration_persists_oversized_tool_results() {
+        let dir = tempdir().expect("create temp dir");
+        let db_path = dir.path().join("locus.db");
+        let conn = Connection::open(&db_path).expect("create db");
+        SessionStore::create_latest_schema(&conn).expect("create schema");
+        conn.pragma_update(None, "user_version", 14)
+            .expect("set v14");
+        conn.execute(
+            "INSERT INTO sessions (id, title, parent_session_id, workspace_id, session_type, agent_id, archived_at, latest_completed_run_id, latest_todo_run_id, created_at, updated_at)
+             VALUES (?1, ?2, NULL, NULL, 'chat', NULL, NULL, NULL, NULL, 100, 100)",
+            params!["session-1", "Migrated Session"],
+        )
+        .expect("insert session");
+
+        let tool_calls_json = serde_json::to_string(&vec![ToolCallInfo {
+            id: "tc-large".to_string(),
+            name: "bash".to_string(),
+            arguments: "{}".to_string(),
+            server_tool: None,
+            server_tool_output: None,
+            outcome: None,
+            recorded_output: None,
+            nested_tool_calls: None,
+        }])
+        .expect("serialize tool calls");
+        let large_output = "A".repeat(31_000);
+        conn.execute(
+            "INSERT INTO messages (id, session_id, role, content, created_at, prompt_prefix, prompt_suffix, tool_calls, tool_call_id, images, thinking_content, thinking_duration, thinking_signature, metadata_json, include_in_prompt)
+             VALUES (?1, ?2, 'assistant', '', 100, NULL, NULL, ?3, NULL, NULL, NULL, NULL, NULL, NULL, 1)",
+            params!["assistant-1", "session-1", tool_calls_json],
+        )
+        .expect("insert assistant");
+        conn.execute(
+            "INSERT INTO messages (id, session_id, role, content, created_at, prompt_prefix, prompt_suffix, tool_calls, tool_call_id, images, thinking_content, thinking_duration, thinking_signature, metadata_json, include_in_prompt)
+             VALUES (?1, ?2, 'tool', ?3, 101, NULL, NULL, NULL, ?4, NULL, NULL, NULL, NULL, NULL, 1)",
+            params!["tool-1", "session-1", large_output, "tc-large"],
+        )
+        .expect("insert tool");
+        drop(conn);
+
+        let store = SessionStore::new(dir.path()).expect("migrate store");
+        let prompt_messages = store
+            .get_messages_for_prompt("session-1")
+            .expect("load prompt messages");
+        let tool_message = prompt_messages
+            .iter()
+            .find(|message| message.role == MessageRole::Tool)
+            .expect("tool message");
+        assert!(tool_message.content.starts_with("<persisted-output>"));
+        assert!(tool_message.content.contains("Full output saved to:"));
+
+        let conn = Connection::open(&db_path).expect("reopen db");
+        let version: i32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read schema version");
+        assert_eq!(version, SessionStore::SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn large_tool_result_saved_as_persisted_reference_in_prompt_history() {
+        let dir = tempdir().expect("create temp dir");
+        let store = SessionStore::new(dir.path()).expect("initialize store");
+        let session_id = store
+            .create_session("Tool Result Storage", None, None, "chat", None)
+            .expect("create session");
+        let large_output = "B".repeat(31_000);
+        let stored_output = store
+            .rewrite_tool_result_for_storage(&session_id, "tc-large", "bash", &large_output)
+            .expect("rewrite large output");
+        store
+            .add_tool_result(&session_id, "tc-large", &stored_output)
+            .expect("add tool result");
+
+        let prompt_messages = store
+            .get_messages_for_prompt(&session_id)
+            .expect("load prompt messages");
+        assert_eq!(prompt_messages.len(), 1);
+        assert!(prompt_messages[0].content.starts_with("<persisted-output>"));
+        assert!(!prompt_messages[0].content.contains(&large_output));
     }
 
     #[test]

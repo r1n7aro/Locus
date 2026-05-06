@@ -25,6 +25,15 @@ const SUMMARY_CLOSE: &str = "</summary>";
 const POST_COMPACT_MAX_FILES_TO_RESTORE: usize = 4;
 const POST_COMPACT_MAX_TOKENS_PER_FILE: u32 = 1_200;
 const POST_COMPACT_TOTAL_FILE_TOKEN_BUDGET: u32 = 4_000;
+const COMPACT_REQUEST_BUDGET_MAX_TOKENS: u32 = 150_000;
+const COMPACT_REQUEST_BUDGET_MIN_TOKENS: u32 = 32_000;
+const COMPACT_RECENT_TAIL_MIN_TOKENS: u32 = 20_000;
+const COMPACT_RECENT_TAIL_MAX_TOKENS: u32 = 40_000;
+const COMPACT_MAX_USER_MESSAGE_TOKENS: u32 = 2_500;
+const COMPACT_MAX_ASSISTANT_MESSAGE_TOKENS: u32 = 1_600;
+const COMPACT_MAX_TOOL_OUTPUT_TOKENS: u32 = 900;
+const COMPACT_MAX_TOOL_ARGUMENT_TOKENS: u32 = 500;
+const EMERGENCY_SUMMARY_MAX_ITEMS: usize = 12;
 
 const COMPACT_PROMPT: &str = r#"CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.
 
@@ -97,6 +106,15 @@ pub struct CompactTracker {
     pub compacted: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct BudgetedCompactRequest {
+    pub messages: Vec<ChatMessage>,
+    pub boundary_idx: usize,
+    pub estimated_tokens: u32,
+    pub budget_tokens: u32,
+    pub truncated: bool,
+}
+
 impl CompactTracker {
     pub fn new() -> Self {
         Self {
@@ -133,6 +151,21 @@ pub fn should_auto_compact(total_input_tokens: u32, context_limit: u32) -> bool 
     total_input_tokens.saturating_add(auto_compact_buffer(context_limit)) >= threshold
 }
 
+pub fn should_codex_auto_compact(total_input_tokens: u32, context_limit: u32) -> bool {
+    if context_limit == 0 {
+        return false;
+    }
+    let soft_threshold = (context_limit.saturating_mul(7) / 10).min(180_000);
+    total_input_tokens >= soft_threshold
+}
+
+pub fn should_codex_block_normal_send(total_input_tokens: u32, context_limit: u32) -> bool {
+    if context_limit == 0 {
+        return false;
+    }
+    total_input_tokens >= context_limit.saturating_sub(24_000)
+}
+
 fn auto_compact_buffer(context_limit: u32) -> u32 {
     (context_limit / 20).clamp(
         AUTO_COMPACT_BUFFER_MIN_TOKENS,
@@ -144,7 +177,17 @@ fn estimate_text_tokens(text: &str) -> u32 {
     if text.is_empty() {
         0
     } else {
-        ((text.len() + 3) / 4) as u32
+        let byte_estimate = ((text.len() + 3) / 4) as u32;
+        let char_count = text.chars().count() as u32;
+        let dense_estimate = if text
+            .chars()
+            .any(|ch| !ch.is_ascii() || "{}[],:\"'\\/<>=_-".contains(ch))
+        {
+            ((char_count.saturating_mul(3)) + 1) / 2
+        } else {
+            char_count / 2
+        };
+        byte_estimate.max(dense_estimate).saturating_mul(5) / 4
     }
 }
 
@@ -203,6 +246,7 @@ pub fn prepare_messages_for_llm(messages: &[ChatMessage]) -> Vec<ChatMessage> {
     crate::session::history::materialize_prompt_edits(&normalized)
 }
 
+#[allow(dead_code)]
 pub fn build_compact_request(messages: &[ChatMessage]) -> Vec<ChatMessage> {
     let mut compact_messages = prepare_messages_for_llm(messages);
 
@@ -227,6 +271,304 @@ pub fn build_compact_request(messages: &[ChatMessage]) -> Vec<ChatMessage> {
     });
 
     compact_messages
+}
+
+pub fn compact_request_token_budget(context_limit: u32) -> u32 {
+    if context_limit == 0 {
+        return COMPACT_REQUEST_BUDGET_MIN_TOKENS;
+    }
+    (context_limit.saturating_mul(3) / 5).clamp(
+        COMPACT_REQUEST_BUDGET_MIN_TOKENS,
+        COMPACT_REQUEST_BUDGET_MAX_TOKENS,
+    )
+}
+
+pub fn compact_recent_tail_token_budget(context_limit: u32) -> u32 {
+    if context_limit == 0 {
+        return COMPACT_RECENT_TAIL_MIN_TOKENS;
+    }
+    (context_limit / 8).clamp(
+        COMPACT_RECENT_TAIL_MIN_TOKENS,
+        COMPACT_RECENT_TAIL_MAX_TOKENS,
+    )
+}
+
+fn truncate_to_token_budget(content: &str, max_tokens: u32) -> (String, bool) {
+    let max_chars = max_tokens.max(1) as usize * 4;
+    if content.chars().count() <= max_chars {
+        return (content.to_string(), false);
+    }
+    let truncated: String = content.chars().take(max_chars).collect();
+    (
+        format!(
+            "{}\n\n[truncated for compact request: {} chars total]",
+            truncated.trim_end(),
+            content.chars().count()
+        ),
+        true,
+    )
+}
+
+fn sanitize_tool_call_for_compact(tool_call: &ToolCallInfo) -> (ToolCallInfo, bool) {
+    let mut sanitized = tool_call.clone();
+    let mut truncated = false;
+    let (arguments, arguments_truncated) =
+        truncate_to_token_budget(&sanitized.arguments, COMPACT_MAX_TOOL_ARGUMENT_TOKENS);
+    sanitized.arguments = arguments;
+    truncated |= arguments_truncated;
+    sanitized.recorded_output = None;
+
+    if let Some(output) = sanitized.server_tool_output.take() {
+        let (output, output_truncated) =
+            truncate_to_token_budget(&output, COMPACT_MAX_TOOL_OUTPUT_TOKENS);
+        sanitized.server_tool_output = Some(output);
+        truncated |= output_truncated;
+    }
+
+    if let Some(nested) = sanitized.nested_tool_calls.take() {
+        let mut nested_truncated = false;
+        let nested = nested
+            .iter()
+            .map(|call| {
+                let (call, was_truncated) = sanitize_tool_call_for_compact(call);
+                nested_truncated |= was_truncated;
+                call
+            })
+            .collect();
+        sanitized.nested_tool_calls = Some(nested);
+        truncated |= nested_truncated;
+    }
+
+    (sanitized, truncated)
+}
+
+fn sanitize_message_for_compact(message: &ChatMessage) -> (ChatMessage, bool) {
+    let mut sanitized = message.clone();
+    let mut truncated = false;
+
+    let max_tokens = match sanitized.role {
+        MessageRole::User => COMPACT_MAX_USER_MESSAGE_TOKENS,
+        MessageRole::Assistant => COMPACT_MAX_ASSISTANT_MESSAGE_TOKENS,
+        MessageRole::Tool => COMPACT_MAX_TOOL_OUTPUT_TOKENS,
+    };
+    let (content, content_truncated) = truncate_to_token_budget(&sanitized.content, max_tokens);
+    sanitized.content = if sanitized.role == MessageRole::Tool
+        && !is_persisted_output_reference(&sanitized.content)
+    {
+        if content_truncated {
+            format!(
+                "{}\n\n[full tool output omitted from compact request; rely on persisted references or rerun/read if needed]",
+                content.trim_end()
+            )
+        } else {
+            content
+        }
+    } else {
+        content
+    };
+    truncated |= content_truncated;
+
+    if sanitized.images.take().is_some() {
+        sanitized.content = format!(
+            "{}\n\n[images omitted from compact request]",
+            sanitized.content.trim_end()
+        );
+        truncated = true;
+    }
+    if sanitized.thinking_content.take().is_some() {
+        truncated = true;
+    }
+    sanitized.thinking_duration = None;
+    sanitized.thinking_signature = None;
+
+    if let Some(tool_calls) = sanitized.tool_calls.take() {
+        let mut tool_truncated = false;
+        sanitized.tool_calls = Some(
+            tool_calls
+                .iter()
+                .map(|call| {
+                    let (call, was_truncated) = sanitize_tool_call_for_compact(call);
+                    tool_truncated |= was_truncated;
+                    call
+                })
+                .collect(),
+        );
+        truncated |= tool_truncated;
+    }
+
+    (sanitized, truncated)
+}
+
+fn build_omitted_messages_marker(count: usize, created_at: i64) -> ChatMessage {
+    ChatMessage {
+        id: uuid::Uuid::new_v4().to_string(),
+        role: MessageRole::Assistant,
+        content: format!(
+            "[{} older assistant/tool message(s) omitted from compact request to stay within budget. Preserve durable facts from the visible summary and recent raw tail.]",
+            count
+        ),
+        created_at,
+        prompt_prefix: None,
+        prompt_suffix: None,
+        response_id: None,
+        tool_calls: None,
+        tool_call_id: None,
+        images: None,
+        thinking_content: None,
+        thinking_duration: None,
+        thinking_signature: None,
+        knowledge_proposal: None,
+    }
+}
+
+pub fn find_compact_boundary_by_budget(
+    messages: &[ChatMessage],
+    target_recent_tokens: u32,
+) -> usize {
+    if messages.len() <= 1 {
+        return 0;
+    }
+
+    let mut total = 0u32;
+    let mut boundary = messages.len().saturating_sub(1);
+    for (idx, message) in messages.iter().enumerate().rev() {
+        total = total
+            .saturating_add(MESSAGE_OVERHEAD_TOKENS)
+            .saturating_add(estimate_text_tokens(&message.content));
+        if let Some(tool_calls) = message.tool_calls.as_ref() {
+            total = total.saturating_add(tool_calls.len() as u32 * TOOL_CALL_OVERHEAD_TOKENS);
+        }
+        boundary = idx;
+        if total >= target_recent_tokens {
+            break;
+        }
+    }
+
+    if boundary == 0 {
+        boundary = messages.len() / 2;
+    }
+
+    while boundary > 0 && messages[boundary].role == MessageRole::Tool {
+        boundary -= 1;
+    }
+
+    boundary.min(messages.len().saturating_sub(1))
+}
+
+pub fn build_compact_request_with_budget(
+    messages: &[ChatMessage],
+    system_parts: &[&str],
+    context_limit: u32,
+) -> Result<BudgetedCompactRequest, String> {
+    if messages.is_empty() {
+        return Err("Cannot compact an empty message history".to_string());
+    }
+
+    let boundary_idx =
+        find_compact_boundary_by_budget(messages, compact_recent_tail_token_budget(context_limit));
+    let budget_tokens = compact_request_token_budget(context_limit);
+    let prepared = prepare_messages_for_llm(messages);
+    let mut truncated = false;
+    let mut compact_messages: Vec<ChatMessage> = prepared
+        .iter()
+        .map(|message| {
+            let (message, was_truncated) = sanitize_message_for_compact(message);
+            truncated |= was_truncated;
+            message
+        })
+        .collect();
+
+    compact_messages.push(ChatMessage {
+        id: uuid::Uuid::new_v4().to_string(),
+        role: MessageRole::User,
+        content: COMPACT_PROMPT.to_string(),
+        created_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64,
+        prompt_prefix: None,
+        prompt_suffix: None,
+        response_id: None,
+        tool_calls: None,
+        tool_call_id: None,
+        images: None,
+        thinking_content: None,
+        thinking_duration: None,
+        thinking_signature: None,
+        knowledge_proposal: None,
+    });
+
+    let mut estimated_tokens = estimate_request_tokens(system_parts, &compact_messages, &[]);
+    if estimated_tokens <= budget_tokens {
+        return Ok(BudgetedCompactRequest {
+            messages: compact_messages,
+            boundary_idx,
+            estimated_tokens,
+            budget_tokens,
+            truncated,
+        });
+    }
+
+    let prompt = compact_messages
+        .pop()
+        .expect("compact prompt should have been appended");
+    let first_user = compact_messages
+        .iter()
+        .position(|message| message.role == MessageRole::User && message.tool_call_id.is_none());
+    let mut reduced = Vec::new();
+    if let Some(first_user_idx) = first_user {
+        reduced.push(compact_messages[first_user_idx].clone());
+    }
+
+    let mut tail = Vec::new();
+    let used_without_tail = estimate_request_tokens(system_parts, &reduced, &[])
+        .saturating_add(MESSAGE_OVERHEAD_TOKENS)
+        .saturating_add(estimate_text_tokens(&prompt.content));
+    let tail_budget = budget_tokens.saturating_sub(used_without_tail).max(4_000);
+    let mut tail_tokens = 0u32;
+    for (idx, message) in compact_messages.iter().enumerate().rev() {
+        if Some(idx) == first_user {
+            continue;
+        }
+        let candidate_tokens = estimate_request_tokens(&[], std::slice::from_ref(message), &[]);
+        if !tail.is_empty() && tail_tokens.saturating_add(candidate_tokens) > tail_budget {
+            break;
+        }
+        tail_tokens = tail_tokens.saturating_add(candidate_tokens);
+        tail.push(message.clone());
+    }
+    tail.reverse();
+
+    let omitted = compact_messages
+        .len()
+        .saturating_sub(reduced.len())
+        .saturating_sub(tail.len());
+    if omitted > 0 {
+        let marker_ts = tail
+            .first()
+            .or_else(|| reduced.first())
+            .map(|message| message.created_at.saturating_sub(1))
+            .unwrap_or_default();
+        reduced.push(build_omitted_messages_marker(omitted, marker_ts));
+    }
+    reduced.extend(tail);
+    reduced.push(prompt);
+
+    estimated_tokens = estimate_request_tokens(system_parts, &reduced, &[]);
+    if estimated_tokens > budget_tokens {
+        return Err(format!(
+            "Budgeted compact request still exceeds budget: estimated={} budget={}",
+            estimated_tokens, budget_tokens
+        ));
+    }
+
+    Ok(BudgetedCompactRequest {
+        messages: reduced,
+        boundary_idx,
+        estimated_tokens,
+        budget_tokens,
+        truncated: true,
+    })
 }
 
 fn strip_tag_block(input: &str, open: &str, close: &str) -> String {
@@ -271,6 +613,146 @@ pub fn extract_summary(raw_response: &str) -> String {
         .replace("\r\n", "\n")
         .trim()
         .to_string()
+}
+
+fn compact_line(value: &str, max_tokens: u32) -> String {
+    let (value, truncated) = truncate_to_token_budget(value.trim(), max_tokens);
+    let value = value.replace('\r', "").replace('\n', " ");
+    if truncated {
+        value
+    } else {
+        value.trim().to_string()
+    }
+}
+
+pub fn build_emergency_compact_summary(
+    messages: &[ChatMessage],
+    boundary_idx: usize,
+    reason: &str,
+) -> String {
+    let compacted_prefix = &messages[..boundary_idx.min(messages.len())];
+    let recent_tail = &messages[boundary_idx.min(messages.len())..];
+
+    let mut user_messages = Vec::new();
+    for message in messages
+        .iter()
+        .filter(|message| message.role == MessageRole::User && message.tool_call_id.is_none())
+    {
+        user_messages.push(compact_line(&message.content, 600));
+        if user_messages.len() >= EMERGENCY_SUMMARY_MAX_ITEMS {
+            break;
+        }
+    }
+
+    let mut assistant_notes = Vec::new();
+    for message in compacted_prefix.iter().rev().filter(|message| {
+        message.role == MessageRole::Assistant && !message.content.trim().is_empty()
+    }) {
+        assistant_notes.push(compact_line(&message.content, 500));
+        if assistant_notes.len() >= 4 {
+            break;
+        }
+    }
+    assistant_notes.reverse();
+
+    let mut tool_counts: HashMap<String, usize> = HashMap::new();
+    let mut large_outputs = Vec::new();
+    for message in compacted_prefix {
+        if let Some(tool_calls) = message.tool_calls.as_ref() {
+            for tool_call in tool_calls {
+                *tool_counts.entry(tool_call.name.clone()).or_default() += 1;
+            }
+        }
+        if message.role == MessageRole::Tool {
+            if is_persisted_output_reference(&message.content) {
+                large_outputs.push(compact_line(&message.content, 350));
+            } else if estimate_text_tokens(&message.content) > COMPACT_MAX_TOOL_OUTPUT_TOKENS {
+                large_outputs.push(format!(
+                    "tool_call_id={} large output omitted ({} chars)",
+                    message.tool_call_id.as_deref().unwrap_or("unknown"),
+                    message.content.chars().count()
+                ));
+            }
+        }
+        if large_outputs.len() >= 6 {
+            break;
+        }
+    }
+
+    let mut tool_summary: Vec<String> = tool_counts
+        .into_iter()
+        .map(|(name, count)| format!("{} x{}", name, count))
+        .collect();
+    tool_summary.sort();
+
+    let latest_user = messages
+        .iter()
+        .rev()
+        .find(|message| message.role == MessageRole::User && message.tool_call_id.is_none())
+        .map(|message| compact_line(&message.content, 700))
+        .unwrap_or_else(|| "No explicit user message found.".to_string());
+
+    let recent_tail_summary = recent_tail
+        .iter()
+        .take(8)
+        .map(|message| {
+            let role = match message.role {
+                MessageRole::User => "user",
+                MessageRole::Assistant => "assistant",
+                MessageRole::Tool => "tool",
+            };
+            format!("- {}: {}", role, compact_line(&message.content, 260))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!(
+        "1. Primary Request and Intent\n{}\n\n2. All User Messages\n{}\n\n3. Current State of the Work\nEmergency local compact was used because the compact LLM request could not be safely sent: {}.\n\n4. Important Technical Context\nRecent raw messages after this handoff remain in the prompt and take precedence over this summary.\n\n5. Files and Code Areas Touched\nNo deterministic file list is available from local emergency compact. Use recent raw tool calls and restored file context below.\n\n6. Recent Decisions and Why They Matter\n{}\n\n7. Open Issues, Risks, or Follow-ups\nThe LLM summary was skipped. Some middle conversation details may be omitted; large tool outputs are represented by persisted references or short previews.\n\n8. Latest User Feedback and Constraints\n{}\n\n9. Immediate Next Step\nContinue from the recent raw tail, using the latest user request and any surviving todo/tool context.\n\nTool Calls Made Before Compact\n{}\n\nLarge Outputs Omitted\n{}\n\nRecent Raw Tail Preview\n{}",
+        latest_user,
+        if user_messages.is_empty() {
+            "- empty".to_string()
+        } else {
+            user_messages
+                .iter()
+                .map(|message| format!("- {}", message))
+                .collect::<Vec<_>>()
+                .join("\n")
+        },
+        reason,
+        if assistant_notes.is_empty() {
+            "- empty".to_string()
+        } else {
+            assistant_notes
+                .iter()
+                .map(|note| format!("- {}", note))
+                .collect::<Vec<_>>()
+                .join("\n")
+        },
+        latest_user,
+        if tool_summary.is_empty() {
+            "- empty".to_string()
+        } else {
+            tool_summary
+                .iter()
+                .map(|entry| format!("- {}", entry))
+                .collect::<Vec<_>>()
+                .join("\n")
+        },
+        if large_outputs.is_empty() {
+            "- empty".to_string()
+        } else {
+            large_outputs
+                .iter()
+                .map(|entry| format!("- {}", entry))
+                .collect::<Vec<_>>()
+                .join("\n")
+        },
+        if recent_tail_summary.is_empty() {
+            "- empty".to_string()
+        } else {
+            recent_tail_summary
+        }
+    )
 }
 
 fn parse_restorable_tool_request(tc: &ToolCallInfo) -> Option<RestorableToolRequest> {
@@ -994,6 +1476,7 @@ pub fn build_post_compact_message(
     }
 }
 
+#[allow(dead_code)]
 pub fn find_compact_boundary(messages: &[ChatMessage]) -> usize {
     for (i, msg) in messages.iter().enumerate().rev() {
         if msg.role == MessageRole::User && msg.tool_call_id.is_none() {
@@ -1085,6 +1568,145 @@ mod tests {
     fn should_auto_compact_uses_buffer() {
         assert!(should_auto_compact(87_000, 100_000));
         assert!(!should_auto_compact(60_000, 100_000));
+    }
+
+    #[test]
+    fn codex_auto_compact_triggers_before_legacy_threshold() {
+        assert!(should_codex_auto_compact(180_000, 258_400));
+        assert!(!should_codex_auto_compact(120_000, 258_400));
+        assert!(should_codex_block_normal_send(235_000, 258_400));
+    }
+
+    #[test]
+    fn compact_request_is_budgeted_when_history_exceeds_limit() {
+        let mut messages = vec![make_message(
+            "user-1",
+            MessageRole::User,
+            "请分析这个 Unity 问题",
+            100,
+            None,
+            None,
+        )];
+        for i in 0..80 {
+            messages.push(make_message(
+                &format!("assistant-{}", i),
+                MessageRole::Assistant,
+                &"assistant output ".repeat(200),
+                101 + i,
+                Some(vec![ToolCallInfo {
+                    id: format!("tc-{}", i),
+                    name: "bash".to_string(),
+                    arguments: "large args".repeat(300),
+                    server_tool: None,
+                    server_tool_output: None,
+                    outcome: None,
+                    recorded_output: Some("recorded output should be stripped".repeat(200)),
+                    nested_tool_calls: None,
+                }]),
+                None,
+            ));
+            messages.push(make_message(
+                &format!("tool-{}", i),
+                MessageRole::Tool,
+                &"tool output ".repeat(2_000),
+                101 + i,
+                None,
+                Some(&format!("tc-{}", i)),
+            ));
+        }
+
+        let plan = build_compact_request_with_budget(&messages, &["system"], 258_400)
+            .expect("budgeted compact request");
+        assert!(plan.estimated_tokens <= plan.budget_tokens);
+        assert!(plan.truncated);
+        assert!(plan.boundary_idx > 0);
+    }
+
+    #[test]
+    fn single_user_many_tool_rounds_compact_boundary_prunes_history() {
+        let mut messages = vec![make_message(
+            "user-1",
+            MessageRole::User,
+            "排查阴影闪烁",
+            100,
+            None,
+            None,
+        )];
+        for i in 0..30 {
+            messages.push(make_message(
+                &format!("assistant-{}", i),
+                MessageRole::Assistant,
+                "running tool",
+                101 + i,
+                Some(vec![ToolCallInfo {
+                    id: format!("tc-{}", i),
+                    name: "read".to_string(),
+                    arguments: "{}".to_string(),
+                    server_tool: None,
+                    server_tool_output: None,
+                    outcome: None,
+                    recorded_output: None,
+                    nested_tool_calls: None,
+                }]),
+                None,
+            ));
+            messages.push(make_message(
+                &format!("tool-{}", i),
+                MessageRole::Tool,
+                &"tool output ".repeat(600),
+                101 + i,
+                None,
+                Some(&format!("tc-{}", i)),
+            ));
+        }
+
+        let boundary = find_compact_boundary_by_budget(&messages, 8_000);
+        assert!(boundary > 0);
+        assert!(boundary < messages.len() - 1);
+        assert_ne!(messages[boundary].role, MessageRole::Tool);
+    }
+
+    #[test]
+    fn emergency_compact_summary_preserves_user_and_recent_tail() {
+        let messages = vec![
+            make_message(
+                "user-1",
+                MessageRole::User,
+                "修复上下文压缩",
+                100,
+                None,
+                None,
+            ),
+            make_message(
+                "assistant-1",
+                MessageRole::Assistant,
+                "已检查 compact.rs",
+                101,
+                None,
+                None,
+            ),
+            make_message(
+                "tool-1",
+                MessageRole::Tool,
+                &"A".repeat(5_000),
+                102,
+                None,
+                Some("tc-1"),
+            ),
+            make_message(
+                "assistant-2",
+                MessageRole::Assistant,
+                "继续检查 store.rs",
+                103,
+                None,
+                None,
+            ),
+        ];
+
+        let summary = build_emergency_compact_summary(&messages, 2, "compact request too large");
+        assert!(summary.contains("修复上下文压缩"));
+        assert!(summary.contains("compact request too large"));
+        assert!(summary.contains("Recent Raw Tail Preview"));
     }
 
     #[test]

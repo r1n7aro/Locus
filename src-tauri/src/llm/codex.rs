@@ -42,6 +42,30 @@ pub struct TurnState {
     sticky_routing_token: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct CodexStreamOptions {
+    pub include_web_search: bool,
+    pub use_session_continuation: bool,
+}
+
+impl Default for CodexStreamOptions {
+    fn default() -> Self {
+        Self {
+            include_web_search: true,
+            use_session_continuation: true,
+        }
+    }
+}
+
+impl CodexStreamOptions {
+    pub fn compact() -> Self {
+        Self {
+            include_web_search: false,
+            use_session_continuation: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct LastWebsocketResponse {
     request_signature: serde_json::Value,
@@ -239,15 +263,18 @@ fn build_request_body(
     tools: &[serde_json::Value],
     thinking_level: Option<&str>,
     session_id: Option<&str>,
+    options: CodexStreamOptions,
 ) -> serde_json::Value {
     let input = build_input(history);
     let mut responses_tools = convert_tools(tools);
 
-    // Inject web_search server tool (executed by OpenAI API, not locally).
-    responses_tools.push(serde_json::json!({
-        "type": "web_search",
-        "external_web_access": true,
-    }));
+    if options.include_web_search {
+        // Inject web_search server tool (executed by OpenAI API, not locally).
+        responses_tools.push(serde_json::json!({
+            "type": "web_search",
+            "external_web_access": true,
+        }));
+    }
 
     let mut body = serde_json::json!({
         "model": model,
@@ -256,8 +283,10 @@ fn build_request_body(
         "store": false,
     });
 
-    if let Some(sid) = session_id {
-        body["prompt_cache_key"] = serde_json::json!(sid);
+    if options.use_session_continuation {
+        if let Some(sid) = session_id {
+            body["prompt_cache_key"] = serde_json::json!(sid);
+        }
     }
 
     if !system_prompt.is_empty() {
@@ -1606,6 +1635,52 @@ where
     G: Fn(String) + Send + Sync + 'static,
     H: Fn(String, String) + Send + Sync,
 {
+    stream_chat_with_options(
+        access_token,
+        account_id,
+        transport,
+        base_url,
+        model,
+        system_prompt,
+        history,
+        tools,
+        thinking_level,
+        debug,
+        session_id,
+        response_request_metadata,
+        turn_state,
+        CodexStreamOptions::default(),
+        on_text_delta,
+        on_thinking_delta,
+        on_tool_call_start,
+    )
+    .await
+}
+
+pub async fn stream_chat_with_options<F, G, H>(
+    access_token: &str,
+    account_id: Option<&str>,
+    transport: CodexTransportMode,
+    base_url: Option<&str>,
+    model: &str,
+    system_prompt: &str,
+    history: &[ChatMessage],
+    tools: &[serde_json::Value],
+    thinking_level: Option<&str>,
+    debug: bool,
+    session_id: Option<&str>,
+    response_request_metadata: Option<&HashMap<String, serde_json::Value>>,
+    turn_state: &mut TurnState,
+    options: CodexStreamOptions,
+    on_text_delta: &F,
+    on_thinking_delta: &G,
+    on_tool_call_start: &H,
+) -> Result<LlmResponse, String>
+where
+    F: Fn(String) + Send + Sync + 'static,
+    G: Fn(String) + Send + Sync + 'static,
+    H: Fn(String, String) + Send + Sync,
+{
     let mut last_error = String::new();
 
     for attempt in 0..=MAX_SAFE_STREAM_RECOVERY_RETRIES {
@@ -1623,6 +1698,7 @@ where
             session_id,
             response_request_metadata,
             turn_state,
+            options,
             on_text_delta,
             on_thinking_delta,
             on_tool_call_start,
@@ -1668,6 +1744,7 @@ async fn stream_chat_once<F, G, H>(
     session_id: Option<&str>,
     response_request_metadata: Option<&HashMap<String, serde_json::Value>>,
     turn_state: &mut TurnState,
+    options: CodexStreamOptions,
     on_text_delta: &F,
     on_thinking_delta: &G,
     on_tool_call_start: &H,
@@ -1684,7 +1761,17 @@ where
         tools,
         thinking_level,
         session_id,
+        options,
     );
+    let transport_session_id = options
+        .use_session_continuation
+        .then_some(session_id)
+        .flatten();
+    let transport_response_request_metadata = if options.use_session_continuation {
+        response_request_metadata
+    } else {
+        None
+    };
 
     match transport {
         CodexTransportMode::Http => {
@@ -1697,7 +1784,7 @@ where
                 tools,
                 debug,
                 body,
-                response_request_metadata,
+                transport_response_request_metadata,
                 on_text_delta,
                 on_thinking_delta,
                 on_tool_call_start,
@@ -1712,7 +1799,7 @@ where
                 model,
                 history,
                 tools,
-                session_id,
+                transport_session_id,
                 debug,
                 body.clone(),
                 turn_state,
@@ -1733,7 +1820,7 @@ where
                         tools,
                         debug,
                         body,
-                        response_request_metadata,
+                        transport_response_request_metadata,
                         on_text_delta,
                         on_thinking_delta,
                         on_tool_call_start,
@@ -2526,8 +2613,8 @@ mod tests {
         build_request_body, build_websocket_transport_request, codex_websocket_url,
         collect_complete_tool_calls, drain_sse_buffer, establish_http_connect_tunnel,
         process_sse_event_block, request_without_input, uri_host_port,
-        websocket_event_error_message, websocket_proxy_match_uri, CodexStreamState,
-        LastWebsocketResponse, PartialToolCall, CODEX_ORIGINATOR_HEADER_VALUE,
+        websocket_event_error_message, websocket_proxy_match_uri, CodexStreamOptions,
+        CodexStreamState, LastWebsocketResponse, PartialToolCall, CODEX_ORIGINATOR_HEADER_VALUE,
         RESPONSES_WEBSOCKETS_V2_BETA_HEADER_VALUE, X_CODEX_TURN_STATE_HEADER,
     };
     use crate::llm::CODEX_CLIENT_VERSION;
@@ -3059,9 +3146,30 @@ mod tests {
             &[],
             None,
             None,
+            CodexStreamOptions::default(),
         );
 
         assert_eq!(body["text"]["verbosity"].as_str(), Some("low"));
+    }
+
+    #[test]
+    fn compact_request_body_omits_web_search_and_prompt_cache_key() {
+        let options = CodexStreamOptions::compact();
+        let body = build_request_body(
+            "gpt-5.4",
+            "Summarize",
+            &[user_message_with_images("hello", vec![])],
+            &[],
+            None,
+            Some("session-1"),
+            options,
+        );
+
+        assert!(!options.include_web_search);
+        assert!(!options.use_session_continuation);
+        assert!(body.get("tools").is_none());
+        assert!(body.get("tool_choice").is_none());
+        assert!(body.get("prompt_cache_key").is_none());
     }
 
     #[test]
