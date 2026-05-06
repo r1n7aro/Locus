@@ -1,6 +1,6 @@
 # Locus for Unity - Open Source Unity Dev Agent
 
-> Scale game development efficiency and free creators from dirty, repetitive work.
+> Scale game development efficiency and free creators from tedious, repetitive work.
 
 [![Docs](https://img.shields.io/badge/DOCS-unity.farlocus.com-f2c230?style=for-the-badge&labelColor=4a4a4a)](https://unity.farlocus.com/en)
 [![Release](https://img.shields.io/badge/RELEASE-GitHub-5d7285?style=for-the-badge&labelColor=4a4a4a)](https://github.com/r1n7aro/Locus/releases)
