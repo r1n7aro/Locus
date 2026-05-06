@@ -12,6 +12,7 @@ const MESSAGE_OVERHEAD_TOKENS: u32 = 12;
 const TOOL_CALL_OVERHEAD_TOKENS: u32 = 24;
 const IMAGE_TOKEN_COST: u32 = 2_000;
 const TOOL_SCHEMA_OVERHEAD_TOKENS: u32 = 32;
+const APPROX_BYTES_PER_TOKEN: usize = 4;
 
 // Kept for backwards compatibility with previously persisted sessions.
 pub const CLEARED_TOOL_RESULT: &str = "[Old tool result content cleared]";
@@ -29,6 +30,7 @@ const COMPACT_REQUEST_BUDGET_MAX_TOKENS: u32 = 150_000;
 const COMPACT_REQUEST_BUDGET_MIN_TOKENS: u32 = 32_000;
 const COMPACT_RECENT_TAIL_MIN_TOKENS: u32 = 20_000;
 const COMPACT_RECENT_TAIL_MAX_TOKENS: u32 = 40_000;
+pub const COMPACT_USER_MESSAGE_MAX_TOKENS: u32 = 20_000;
 const COMPACT_MAX_USER_MESSAGE_TOKENS: u32 = 2_500;
 const COMPACT_MAX_ASSISTANT_MESSAGE_TOKENS: u32 = 1_600;
 const COMPACT_MAX_TOOL_OUTPUT_TOKENS: u32 = 900;
@@ -155,8 +157,8 @@ pub fn should_codex_auto_compact(total_input_tokens: u32, context_limit: u32) ->
     if context_limit == 0 {
         return false;
     }
-    let soft_threshold = (context_limit.saturating_mul(7) / 10).min(180_000);
-    total_input_tokens >= soft_threshold
+    let auto_compact_limit = context_limit.saturating_mul(9) / 10;
+    total_input_tokens >= auto_compact_limit
 }
 
 pub fn should_codex_block_normal_send(total_input_tokens: u32, context_limit: u32) -> bool {
@@ -175,20 +177,100 @@ fn auto_compact_buffer(context_limit: u32) -> u32 {
 
 fn estimate_text_tokens(text: &str) -> u32 {
     if text.is_empty() {
-        0
-    } else {
-        let byte_estimate = ((text.len() + 3) / 4) as u32;
-        let char_count = text.chars().count() as u32;
-        let dense_estimate = if text
-            .chars()
-            .any(|ch| !ch.is_ascii() || "{}[],:\"'\\/<>=_-".contains(ch))
-        {
-            ((char_count.saturating_mul(3)) + 1) / 2
-        } else {
-            char_count / 2
-        };
-        byte_estimate.max(dense_estimate).saturating_mul(5) / 4
+        return 0;
     }
+
+    text.len()
+        .saturating_add(APPROX_BYTES_PER_TOKEN.saturating_sub(1))
+        .checked_div(APPROX_BYTES_PER_TOKEN)
+        .unwrap_or(0)
+        .try_into()
+        .unwrap_or(u32::MAX)
+}
+
+fn is_real_user_message(message: &ChatMessage) -> bool {
+    message.role == MessageRole::User && message.tool_call_id.is_none()
+}
+
+fn estimate_message_prompt_tokens(message: &ChatMessage) -> u32 {
+    let mut total = MESSAGE_OVERHEAD_TOKENS
+        .saturating_add(estimate_text_tokens(&message.content))
+        .saturating_add(estimate_text_tokens(
+            message.prompt_prefix.as_deref().unwrap_or_default(),
+        ))
+        .saturating_add(estimate_text_tokens(
+            message.prompt_suffix.as_deref().unwrap_or_default(),
+        ));
+
+    if let Some(ref thinking) = message.thinking_content {
+        total = total.saturating_add(estimate_text_tokens(thinking));
+    }
+
+    if let Some(ref images) = message.images {
+        total = total.saturating_add(images.len() as u32 * IMAGE_TOKEN_COST);
+    }
+
+    if let Some(ref tool_calls) = message.tool_calls {
+        total = total.saturating_add(tool_calls.len() as u32 * TOOL_CALL_OVERHEAD_TOKENS);
+        for tc in tool_calls {
+            total = total
+                .saturating_add(estimate_text_tokens(&tc.name))
+                .saturating_add(estimate_text_tokens(&tc.arguments));
+        }
+    }
+
+    total
+}
+
+pub fn compact_user_message_token_budget() -> u32 {
+    COMPACT_USER_MESSAGE_MAX_TOKENS
+}
+
+pub fn select_recent_user_message_ids_for_compact_prompt(
+    messages: &[ChatMessage],
+    boundary_idx: usize,
+    max_tokens: u32,
+) -> HashSet<String> {
+    let mut selected = HashSet::new();
+    if max_tokens == 0 || messages.is_empty() {
+        return selected;
+    }
+
+    let mut used_tokens = 0u32;
+    for message in messages.iter().take(boundary_idx.min(messages.len())).rev() {
+        if !is_real_user_message(message) {
+            continue;
+        }
+
+        let message_tokens = estimate_message_prompt_tokens(message);
+        if used_tokens.saturating_add(message_tokens) > max_tokens {
+            break;
+        }
+
+        used_tokens = used_tokens.saturating_add(message_tokens);
+        selected.insert(message.id.clone());
+    }
+
+    selected
+}
+
+pub fn has_compactable_messages_before_boundary(
+    messages: &[ChatMessage],
+    boundary_idx: usize,
+) -> bool {
+    let mut user_tokens = 0u32;
+    for message in messages.iter().take(boundary_idx.min(messages.len())) {
+        if !is_real_user_message(message) {
+            return true;
+        }
+
+        user_tokens = user_tokens.saturating_add(estimate_message_prompt_tokens(message));
+        if user_tokens > COMPACT_USER_MESSAGE_MAX_TOKENS {
+            return true;
+        }
+    }
+
+    false
 }
 
 fn is_persisted_output_reference(content: &str) -> bool {
@@ -209,26 +291,7 @@ pub fn estimate_request_tokens(
     }
 
     for msg in messages {
-        total = total
-            .saturating_add(MESSAGE_OVERHEAD_TOKENS)
-            .saturating_add(estimate_text_tokens(&msg.content));
-
-        if let Some(ref thinking) = msg.thinking_content {
-            total = total.saturating_add(estimate_text_tokens(thinking));
-        }
-
-        if let Some(ref images) = msg.images {
-            total = total.saturating_add(images.len() as u32 * IMAGE_TOKEN_COST);
-        }
-
-        if let Some(ref tool_calls) = msg.tool_calls {
-            total = total.saturating_add(tool_calls.len() as u32 * TOOL_CALL_OVERHEAD_TOKENS);
-            for tc in tool_calls {
-                total = total
-                    .saturating_add(estimate_text_tokens(&tc.name))
-                    .saturating_add(estimate_text_tokens(&tc.arguments));
-            }
-        }
+        total = total.saturating_add(estimate_message_prompt_tokens(msg));
     }
 
     for tool in tools {
@@ -431,6 +494,7 @@ pub fn find_compact_boundary_by_budget(
 
     let mut total = 0u32;
     let mut boundary = messages.len().saturating_sub(1);
+    let mut reached_target = false;
     for (idx, message) in messages.iter().enumerate().rev() {
         total = total
             .saturating_add(MESSAGE_OVERHEAD_TOKENS)
@@ -440,12 +504,13 @@ pub fn find_compact_boundary_by_budget(
         }
         boundary = idx;
         if total >= target_recent_tokens {
+            reached_target = true;
             break;
         }
     }
 
-    if boundary == 0 {
-        boundary = messages.len() / 2;
+    if boundary == 0 && reached_target && messages.len() > 1 {
+        boundary = 1;
     }
 
     while boundary > 0 && messages[boundary].role == MessageRole::Tool {
@@ -613,6 +678,24 @@ pub fn extract_summary(raw_response: &str) -> String {
         .replace("\r\n", "\n")
         .trim()
         .to_string()
+}
+
+pub fn is_valid_compact_summary(summary: &str) -> bool {
+    let trimmed = summary.trim();
+    if trimmed.len() < 64 {
+        return false;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "..." | "…" | "(no response content)" | "no response content" | "empty" | "n/a"
+    ) {
+        return false;
+    }
+
+    let meaningful_chars = trimmed.chars().filter(|ch| ch.is_alphanumeric()).count();
+    meaningful_chars >= 24
 }
 
 fn compact_line(value: &str, max_tokens: u32) -> String {
@@ -1571,10 +1654,61 @@ mod tests {
     }
 
     #[test]
-    fn codex_auto_compact_triggers_before_legacy_threshold() {
-        assert!(should_codex_auto_compact(180_000, 258_400));
-        assert!(!should_codex_auto_compact(120_000, 258_400));
+    fn codex_auto_compact_uses_ninety_percent_context_limit() {
+        assert!(!should_codex_auto_compact(180_000, 258_400));
+        assert!(!should_codex_auto_compact(232_559, 258_400));
+        assert!(should_codex_auto_compact(232_560, 258_400));
         assert!(should_codex_block_normal_send(235_000, 258_400));
+    }
+
+    #[test]
+    fn token_estimator_uses_codex_byte_heuristic_for_json() {
+        let schema = r#"{"type":"function","function":{"name":"knowledge_query","parameters":{"type":"object","properties":{"query":{"type":"string"},"limit":{"type":"number"}}}}}"#
+            .repeat(200);
+
+        let estimated = estimate_text_tokens(&schema);
+        assert_eq!(estimated, ((schema.len() + 3) / 4) as u32);
+        assert!(estimated < (schema.len() as u32 / 2));
+    }
+
+    #[test]
+    fn codex_short_turn_with_large_tool_schemas_does_not_preflight_compact() {
+        let tools = (0..20)
+            .map(|idx| {
+                serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": format!("tool_{}", idx),
+                        "description": "tool schema description ".repeat(120),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "query": {
+                                    "type": "string",
+                                    "description": "query field ".repeat(80),
+                                },
+                                "limit": {
+                                    "type": "number",
+                                    "description": "limit field ".repeat(40),
+                                }
+                            }
+                        }
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let messages = vec![make_message(
+            "user-1",
+            MessageRole::User,
+            "analyze project structure",
+            100,
+            None,
+            None,
+        )];
+
+        let estimated = estimate_request_tokens(&["system"], &messages, &tools);
+        assert!(estimated < 60_000);
+        assert!(!should_codex_auto_compact(estimated, 258_400));
     }
 
     #[test]
@@ -1664,6 +1798,130 @@ mod tests {
         assert!(boundary > 0);
         assert!(boundary < messages.len() - 1);
         assert_ne!(messages[boundary].role, MessageRole::Tool);
+    }
+
+    #[test]
+    fn compact_boundary_does_not_prune_when_recent_tail_is_already_small() {
+        let messages = vec![
+            make_message("user-1", MessageRole::User, "分析项目结构", 100, None, None),
+            make_message(
+                "assistant-1",
+                MessageRole::Assistant,
+                "我会检查目录",
+                101,
+                None,
+                None,
+            ),
+        ];
+
+        let boundary = find_compact_boundary_by_budget(&messages, 8_000);
+        assert_eq!(boundary, 0);
+        assert!(!has_compactable_messages_before_boundary(
+            &messages, boundary
+        ));
+    }
+
+    #[test]
+    fn compact_boundary_moves_past_oversized_first_user_message() {
+        let messages = vec![
+            make_message(
+                "user-1",
+                MessageRole::User,
+                &"a".repeat(100_000),
+                100,
+                None,
+                None,
+            ),
+            make_message(
+                "assistant-1",
+                MessageRole::Assistant,
+                "旧回答",
+                101,
+                None,
+                None,
+            ),
+            make_message("user-2", MessageRole::User, "继续", 102, None, None),
+        ];
+
+        let boundary = find_compact_boundary_by_budget(&messages, 20_000);
+
+        assert_eq!(boundary, 1);
+        assert!(has_compactable_messages_before_boundary(
+            &messages, boundary
+        ));
+    }
+
+    #[test]
+    fn compactable_boundary_detects_user_history_over_codex_budget() {
+        let messages = vec![
+            make_message(
+                "user-1",
+                MessageRole::User,
+                &"a".repeat(60_000),
+                100,
+                None,
+                None,
+            ),
+            make_message(
+                "user-2",
+                MessageRole::User,
+                &"b".repeat(60_000),
+                101,
+                None,
+                None,
+            ),
+        ];
+
+        assert!(has_compactable_messages_before_boundary(
+            &messages,
+            messages.len()
+        ));
+    }
+
+    #[test]
+    fn recent_user_selector_caps_prompt_history_by_codex_budget() {
+        let messages = vec![
+            make_message(
+                "user-1",
+                MessageRole::User,
+                &"a".repeat(32),
+                100,
+                None,
+                None,
+            ),
+            make_message(
+                "user-2",
+                MessageRole::User,
+                &"b".repeat(32),
+                101,
+                None,
+                None,
+            ),
+            make_message(
+                "user-3",
+                MessageRole::User,
+                &"c".repeat(32),
+                102,
+                None,
+                None,
+            ),
+        ];
+
+        let selected =
+            select_recent_user_message_ids_for_compact_prompt(&messages, messages.len(), 40);
+
+        assert!(!selected.contains("user-1"));
+        assert!(selected.contains("user-2"));
+        assert!(selected.contains("user-3"));
+    }
+
+    #[test]
+    fn invalid_compact_summary_rejects_ellipsis() {
+        assert!(!is_valid_compact_summary("..."));
+        assert!(!is_valid_compact_summary("<summary>...</summary>"));
+        assert!(is_valid_compact_summary(
+            "1. Primary Request and Intent\nFix context compaction token estimation.\n\n2. All User Messages\n- Thoroughly repair token estimation and compaction behavior."
+        ));
     }
 
     #[test]

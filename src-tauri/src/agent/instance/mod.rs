@@ -4400,6 +4400,13 @@ impl AgentInstance {
                     &messages,
                     compact::compact_recent_tail_token_budget(context_limit),
                 );
+                if !compact::has_compactable_messages_before_boundary(&messages, boundary_idx) {
+                    eprintln!(
+                        "[Agent {}] emergency auto-compact skipped: no compactable messages before boundary {}",
+                        self.id, boundary_idx
+                    );
+                    return Ok(false);
+                }
                 let summary = compact::build_emergency_compact_summary(&messages, boundary_idx, &e);
                 let keep_from_msg = &messages[boundary_idx];
                 let restored_files_section = compact::build_post_compact_restored_files_section(
@@ -4448,6 +4455,15 @@ impl AgentInstance {
             compact_plan.truncated
         );
 
+        if !compact::has_compactable_messages_before_boundary(&messages, compact_plan.boundary_idx)
+        {
+            eprintln!(
+                "[Agent {}] auto-compact skipped: no compactable messages before boundary {}",
+                self.id, compact_plan.boundary_idx
+            );
+            return Ok(false);
+        }
+
         let summary_result = self
             .call_compact_llm(store, system_parts, &compact_plan.messages)
             .await;
@@ -4492,6 +4508,13 @@ impl AgentInstance {
                     self.id, e
                 );
                 let boundary_idx = compact_plan.boundary_idx;
+                if !compact::has_compactable_messages_before_boundary(&messages, boundary_idx) {
+                    eprintln!(
+                        "[Agent {}] emergency auto-compact skipped after compact error: no compactable messages before boundary {}",
+                        self.id, boundary_idx
+                    );
+                    return Ok(false);
+                }
                 let summary = compact::build_emergency_compact_summary(&messages, boundary_idx, &e);
                 let keep_from_msg = &messages[boundary_idx];
                 let restored_files_section = compact::build_post_compact_restored_files_section(
@@ -4600,13 +4623,21 @@ impl AgentInstance {
             }
         }
 
-        let summary = compact::extract_summary(&summary_response.text);
-        if summary.is_empty() {
-            eprintln!("[Agent {}] compact returned empty summary", self.id);
-            return Err("Compact returned empty summary".to_string());
+        let boundary_idx = compact_plan.boundary_idx;
+        let mut summary = compact::extract_summary(&summary_response.text);
+        if !compact::is_valid_compact_summary(&summary) {
+            eprintln!(
+                "[Agent {}] compact returned invalid summary, using emergency compact: summary_len={}",
+                self.id,
+                summary.len()
+            );
+            summary = compact::build_emergency_compact_summary(
+                &messages,
+                boundary_idx,
+                "compact LLM returned an invalid summary",
+            );
         }
 
-        let boundary_idx = compact_plan.boundary_idx;
         let keep_from_msg = &messages[boundary_idx];
         let restored_files_section = compact::build_post_compact_restored_files_section(
             &messages[..boundary_idx],

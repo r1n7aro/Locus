@@ -12,6 +12,7 @@ use super::models::{
     SessionEventRecord, SessionRunSummary, SessionSummary, TodoItem, TodoSnapshot, ToolCallInfo,
 };
 use crate::commands::TokenUsage;
+use crate::compact;
 
 #[derive(Clone)]
 pub struct SessionStore {
@@ -1961,49 +1962,83 @@ impl SessionStore {
         conn.execute("BEGIN", [])
             .map_err(|e| format!("Failed to begin transaction: {}", e))?;
 
-        let keep_from_rowid: i64 = conn
+        let (keep_from_rowid, keep_from_created_at): (i64, i64) = conn
             .query_row(
-                "SELECT rowid FROM messages WHERE session_id = ?1 AND id = ?2",
+                "SELECT rowid, created_at FROM messages WHERE session_id = ?1 AND id = ?2",
                 params![session_id, keep_from_message_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .map_err(|e| {
                 let _ = conn.execute("ROLLBACK", []);
                 format!("Failed to resolve compact boundary: {}", e)
             })?;
 
-        let carried_prompt_prefix = conn
-            .query_row(
-                "SELECT rowid, prompt_prefix FROM messages
-                 WHERE session_id = ?1
-                   AND include_in_prompt = 1
-                   AND role = 'user'
-                   AND tool_call_id IS NULL
-                   AND prompt_prefix IS NOT NULL
-                   AND trim(prompt_prefix) != ''
-                 ORDER BY created_at ASC, rowid ASC
-                 LIMIT 1",
-                params![session_id],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
-            )
-            .optional()
+        let prompt_messages = Self::get_messages_with_conn_filtered_static(&conn, session_id, true)
             .map_err(|e| {
                 let _ = conn.execute("ROLLBACK", []);
-                format!("Failed to load carried prompt prefix: {}", e)
-            })?
-            .filter(|(rowid, _)| *rowid < keep_from_rowid)
-            .map(|(_, prefix)| prefix);
+                e
+            })?;
+        let boundary_idx = prompt_messages
+            .iter()
+            .position(|message| message.id == keep_from_message_id)
+            .ok_or_else(|| {
+                let _ = conn.execute("ROLLBACK", []);
+                format!(
+                    "Compact boundary message is not included in prompt: {}",
+                    keep_from_message_id
+                )
+            })?;
+        let carried_prompt_prefix = prompt_messages
+            .iter()
+            .take(boundary_idx)
+            .find_map(|message| {
+                if message.role == MessageRole::User && message.tool_call_id.is_none() {
+                    message
+                        .prompt_prefix
+                        .as_deref()
+                        .filter(|prefix| !prefix.trim().is_empty())
+                        .map(|prefix| prefix.to_string())
+                } else {
+                    None
+                }
+            });
+        let retained_user_ids = compact::select_recent_user_message_ids_for_compact_prompt(
+            &prompt_messages,
+            boundary_idx,
+            compact::compact_user_message_token_budget(),
+        );
 
         conn.execute(
             "UPDATE messages
              SET include_in_prompt = 0
-             WHERE session_id = ?1 AND include_in_prompt = 1 AND rowid < ?2",
-            params![session_id, keep_from_rowid],
+             WHERE session_id = ?1
+               AND include_in_prompt = 1
+               AND (created_at < ?2 OR (created_at = ?2 AND rowid < ?3))",
+            params![session_id, keep_from_created_at, keep_from_rowid],
         )
         .map_err(|e| {
             let _ = conn.execute("ROLLBACK", []);
             format!("Failed to mark compacted messages: {}", e)
         })?;
+
+        for message_id in &retained_user_ids {
+            conn.execute(
+                "UPDATE messages
+                 SET include_in_prompt = 1
+                 WHERE session_id = ?1
+                   AND id = ?2
+                   AND role = 'user'
+                   AND tool_call_id IS NULL",
+                params![session_id, message_id],
+            )
+            .map_err(|e| {
+                let _ = conn.execute("ROLLBACK", []);
+                format!(
+                    "Failed to restore retained user message after compact: {}",
+                    e
+                )
+            })?;
+        }
 
         conn.execute(
             "INSERT INTO messages (id, session_id, role, content, created_at, prompt_prefix, prompt_suffix, tool_calls, tool_call_id, images, thinking_content, thinking_duration, thinking_signature, metadata_json)
@@ -3570,7 +3605,7 @@ mod tests {
             .compact_messages(&session_id, &summary_msg, latest_user_id)
             .expect("compact messages");
         assert_eq!(count_before, 4);
-        assert_eq!(count_after, 3);
+        assert_eq!(count_after, 4);
 
         let all_messages = store.get_messages(&session_id).expect("load all messages");
         let prompt_messages = store
@@ -3595,10 +3630,93 @@ mod tests {
                 latest_assistant_id,
             ]
         );
-        assert_eq!(prompt_messages.len(), 3);
-        assert_eq!(prompt_messages[0].id, "handoff-1");
-        assert_eq!(prompt_messages[1].content, "最新需求");
-        assert_eq!(prompt_messages[2].content, "最新回答");
+        assert_eq!(prompt_messages.len(), 4);
+        assert_eq!(prompt_messages[0].id, old_user_id);
+        assert_eq!(prompt_messages[1].id, "handoff-1");
+        assert_eq!(prompt_messages[2].content, "最新需求");
+        assert_eq!(prompt_messages[3].content, "最新回答");
+        assert_eq!(
+            prompt_messages[0].prompt_prefix.as_deref(),
+            Some("<system-reminder>\nEnv\n</system-reminder>")
+        );
+        assert_eq!(prompt_messages[2].prompt_prefix, None);
+        assert_eq!(
+            store
+                .first_user_message_id(&session_id)
+                .expect("first prompt user"),
+            Some(old_user_id.to_string())
+        );
+    }
+
+    #[test]
+    fn compact_messages_caps_old_user_prompt_history_and_carries_prefix() {
+        let dir = tempdir().expect("create temp dir");
+        let store = SessionStore::new(dir.path()).expect("initialize store");
+        let session_id = store
+            .create_session("Compact User Budget Test", None, None, "chat", None)
+            .expect("create session");
+
+        let old_user_id = "old-user";
+        let latest_user_id = "latest-user";
+        {
+            let conn = store.conn.lock().expect("lock store connection");
+            let oversized_user_content = "历史需求".repeat(30_000);
+            for (id, role, content, created_at, prompt_prefix) in [
+                (
+                    old_user_id,
+                    "user",
+                    oversized_user_content.as_str(),
+                    100i64,
+                    Some("<system-reminder>\nEnv\n</system-reminder>"),
+                ),
+                ("old-assistant", "assistant", "旧回答", 101i64, None),
+                (latest_user_id, "user", "最新需求", 102i64, None),
+                ("latest-assistant", "assistant", "最新回答", 103i64, None),
+            ] {
+                conn.execute(
+                    "INSERT INTO messages (id, session_id, role, content, created_at, prompt_prefix, prompt_suffix, tool_calls, tool_call_id, images, thinking_content, thinking_duration, thinking_signature, metadata_json)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)",
+                    params![id, session_id, role, content, created_at, prompt_prefix],
+                )
+                .expect("insert message");
+            }
+        }
+
+        let summary_msg = ChatMessage {
+            id: "handoff-1".to_string(),
+            role: MessageRole::Assistant,
+            content: "## Context Handoff\n\n交接摘要".to_string(),
+            created_at: 101,
+            prompt_prefix: None,
+            prompt_suffix: None,
+            response_id: None,
+            tool_calls: None,
+            tool_call_id: None,
+            images: None,
+            thinking_content: None,
+            thinking_duration: None,
+            thinking_signature: None,
+            knowledge_proposal: None,
+        };
+
+        let (count_before, count_after) = store
+            .compact_messages(&session_id, &summary_msg, latest_user_id)
+            .expect("compact messages");
+        assert_eq!(count_before, 4);
+        assert_eq!(count_after, 3);
+
+        let prompt_messages = store
+            .get_messages_for_prompt(&session_id)
+            .expect("load prompt messages");
+        let prompt_ids = prompt_messages
+            .iter()
+            .map(|message| message.id.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            prompt_ids,
+            vec!["handoff-1", latest_user_id, "latest-assistant"]
+        );
         assert_eq!(
             prompt_messages[1].prompt_prefix.as_deref(),
             Some("<system-reminder>\nEnv\n</system-reminder>")
@@ -3609,5 +3727,101 @@ mod tests {
                 .expect("first prompt user"),
             Some(latest_user_id.to_string())
         );
+    }
+
+    #[test]
+    fn compact_messages_excludes_previous_handoff_on_later_compact() {
+        let dir = tempdir().expect("create temp dir");
+        let store = SessionStore::new(dir.path()).expect("initialize store");
+        let session_id = store
+            .create_session("Compact Twice Test", None, None, "chat", None)
+            .expect("create session");
+
+        {
+            let conn = store.conn.lock().expect("lock store connection");
+            for (id, role, content, created_at) in [
+                ("user-1", "user", "第一轮需求", 100i64),
+                ("assistant-1", "assistant", "第一轮回答", 101i64),
+                ("user-2", "user", "第二轮需求", 102i64),
+                ("assistant-2", "assistant", "第二轮回答", 103i64),
+            ] {
+                conn.execute(
+                    "INSERT INTO messages (id, session_id, role, content, created_at, prompt_prefix, prompt_suffix, tool_calls, tool_call_id, images, thinking_content, thinking_duration, thinking_signature, metadata_json)
+                     VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)",
+                    params![id, session_id, role, content, created_at],
+                )
+                .expect("insert message");
+            }
+        }
+
+        let first_handoff = ChatMessage {
+            id: "handoff-1".to_string(),
+            role: MessageRole::Assistant,
+            content: "## Context Handoff\n\n第一次交接".to_string(),
+            created_at: 101,
+            prompt_prefix: None,
+            prompt_suffix: None,
+            response_id: None,
+            tool_calls: None,
+            tool_call_id: None,
+            images: None,
+            thinking_content: None,
+            thinking_duration: None,
+            thinking_signature: None,
+            knowledge_proposal: None,
+        };
+        store
+            .compact_messages(&session_id, &first_handoff, "user-2")
+            .expect("first compact");
+
+        {
+            let conn = store.conn.lock().expect("lock store connection");
+            for (id, role, content, created_at) in [
+                ("user-3", "user", "第三轮需求", 104i64),
+                ("assistant-3", "assistant", "第三轮回答", 105i64),
+            ] {
+                conn.execute(
+                    "INSERT INTO messages (id, session_id, role, content, created_at, prompt_prefix, prompt_suffix, tool_calls, tool_call_id, images, thinking_content, thinking_duration, thinking_signature, metadata_json)
+                     VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)",
+                    params![id, session_id, role, content, created_at],
+                )
+                .expect("insert later message");
+            }
+        }
+
+        let second_handoff = ChatMessage {
+            id: "handoff-2".to_string(),
+            role: MessageRole::Assistant,
+            content: "## Context Handoff\n\n第二次交接".to_string(),
+            created_at: 103,
+            prompt_prefix: None,
+            prompt_suffix: None,
+            response_id: None,
+            tool_calls: None,
+            tool_call_id: None,
+            images: None,
+            thinking_content: None,
+            thinking_duration: None,
+            thinking_signature: None,
+            knowledge_proposal: None,
+        };
+        store
+            .compact_messages(&session_id, &second_handoff, "user-3")
+            .expect("second compact");
+
+        let prompt_messages = store
+            .get_messages_for_prompt(&session_id)
+            .expect("load prompt messages");
+        let prompt_ids = prompt_messages
+            .iter()
+            .map(|message| message.id.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(!prompt_ids.contains(&"handoff-1"));
+        assert!(prompt_ids.contains(&"handoff-2"));
+        assert!(prompt_ids.contains(&"user-1"));
+        assert!(prompt_ids.contains(&"user-2"));
+        assert!(prompt_ids.contains(&"user-3"));
+        assert!(!prompt_ids.contains(&"assistant-2"));
     }
 }
