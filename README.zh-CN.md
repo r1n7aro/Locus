@@ -11,6 +11,8 @@
 
 [English](README.md) | 简体中文
 
+[![在 Bilibili 观看演示](https://img.youtube.com/vi/xoApXZMon9M/maxresdefault.jpg)](https://www.bilibili.com/video/BV1H4ReBNELD/)
+
 ## 概览
 
 `Locus for Unity`是一个面向Unity项目的**开源**AI Agent。

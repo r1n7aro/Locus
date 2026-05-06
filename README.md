@@ -11,6 +11,8 @@
 
 English | [简体中文](README.zh-CN.md)
 
+[![Watch the demo on YouTube](https://img.youtube.com/vi/xoApXZMon9M/maxresdefault.jpg)](https://www.youtube.com/watch?v=xoApXZMon9M)
+
 ## Overview
 
 `Locus for Unity` is an open-source AI Agent for Unity projects.
