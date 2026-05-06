@@ -1,8 +1,8 @@
 ---
 title: "Latest Version"
-description: "Locus v0.2.8 (2026-05-06)"
+description: "Locus v0.2.9 (2026-05-06)"
 sidebarTitle: "Latest Version"
-version: "0.2.8"
+version: "0.2.9"
 releasedAt: "2026-05-06"
 channel: "stable"
 updateTitle: "Update available"
@@ -17,19 +17,21 @@ changelogUrl: "/en/overview/latest-version"
 
 ### Added
 
-- Added a technical overview in the README and docs explaining Locus's independent process architecture and Unity-specific capabilities.
+- Added linked Unity asset directory support for asset indexing, watching, workspace listing, and search under `Assets/` and `Packages/`.
+- Added background asset database scan startup with live `reconcile` status for index verification.
+- Added README compatibility notes for supported Unity versions.
 
 ### Fixed
 
-- Routed subagent stream events through the parent run context so nested tool progress and deltas attach to the correct parent session.
-- Updated knowledge undo to sync changed knowledge documents incrementally, with full reconciliation for directory, metadata, or large-batch changes.
-- Refreshed externally changed selected knowledge documents without showing the selected-document loading state.
-- Simplified the knowledge editor footer status during autosave so it stays on a stable saved or unsaved state.
-- Allowed knowledge-safe git diff and status pipelines, including multiline commands, in agent tool routing.
-- Treated custom endpoint HTML or challenge-page responses as test failures, preserved the saved HTML path, and localized the displayed detail.
-- Replayed full Responses API history for custom endpoints while keeping `previous_response_id` usage for the official OpenAI endpoint.
-- Updated built-in Memory labels and L3 rule headings to use English labels and ASCII heading formatting.
+- Fixed Unity 2020 pipe accept compatibility in the Unity bridge.
+- Cancelled active asset scans and background index verification when switching workspaces or resetting configuration.
+- Reduced blocking when loading existing asset databases by using light startup reconciliation followed by background hash verification.
+- Bounded compact requests, added emergency compact summaries, and persisted oversized tool outputs with a schema v15 migration.
+- Included failed compact attempt metadata in raw context exports.
+- Required cached local embedding models before activation to avoid unexpected model downloads.
+- Stabilized ResizeObserver-driven layouts, Tauri window dragging, and the model effort selector dropdown.
+- Localized hardcoded frontend copy across Agent, Chat, Knowledge, Collab, settings, and preview surfaces.
 
 ### Removed
 
-- No changes.
+- Removed automatic local embedding model downloads during activation.

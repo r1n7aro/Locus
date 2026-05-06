@@ -1,36 +1,38 @@
 {
-  "version": "0.2.8",
+  "version": "0.2.9",
   "releasedAt": "2026-05-06",
   "channel": "stable",
   "locales": {
     "zh": {
       "title": "发现新版本",
-      "summary": "Locus v0.2.8 (2026-05-06)",
+      "summary": "Locus v0.2.9 (2026-05-06)",
       "changelogUrl": "/overview/latest-version",
       "changes": [
         {
           "title": "新增",
           "items": [
-            "README 与文档新增技术概览，说明 Locus 的独立进程架构与面向 Unity 的能力。"
+            "支持 `Assets/` 与 `Packages/` 下的链接 Unity 资产目录索引、监听、工作区列表与搜索。",
+            "资产数据库扫描支持后台启动，并新增索引校验状态展示。",
+            "README 新增 Unity 版本兼容性说明。"
           ]
         },
         {
           "title": "修复",
           "items": [
-            "子 Agent 流式事件改为通过父运行上下文发送，嵌套工具进度与增量会归属到正确的父会话。",
-            "知识 Undo 改为增量同步已变化的知识文档；目录、元数据或大批量变化时执行完整 reconcile。",
-            "外部刷新选中的知识文档时保持编辑区稳定，不显示选中文档加载状态。",
-            "简化知识编辑器自动保存期间的底部状态，只保留稳定的已保存或未保存状态。",
-            "Agent 工具路由允许知识相关的 git diff/status 管道命令，包括多行命令。",
-            "自定义端点测试将 HTML 或挑战页面响应视为连接失败，保留已保存 HTML 路径，并本地化展示详情。",
-            "自定义端点使用 Responses API 时回放完整历史；官方 OpenAI 端点继续使用 `previous_response_id`。",
-            "内置 Memory 标签与 L3 规则标题更新为英文标签和 ASCII 标题格式。"
+            "修复 Unity 2020 中 Unity Bridge 管道连接的兼容性问题。",
+            "切换工作区或重置配置时会取消正在运行的资产扫描与后台索引校验。",
+            "加载已有资产数据库时先执行轻量校验，再后台执行哈希校验，减少工作区切换阻塞。",
+            "上下文压缩请求加入预算限制、应急摘要，并通过 schema v15 迁移持久化超大工具输出。",
+            "原始上下文导出会记录失败的压缩尝试元数据。",
+            "本地嵌入模型激活前要求模型已缓存，避免激活时触发意外下载。",
+            "稳定 ResizeObserver 相关布局、Tauri 窗口拖拽与模型 effort 下拉面板。",
+            "本地化 Agent、Chat、Knowledge、Collab、设置与预览区域的硬编码前端文案。"
           ]
         },
         {
           "title": "移除",
           "items": [
-            "暂无条目。"
+            "移除本地嵌入模型激活阶段的自动下载行为。"
           ]
         }
       ],
@@ -43,32 +45,34 @@
     },
     "en": {
       "title": "Update available",
-      "summary": "Locus v0.2.8 (2026-05-06)",
+      "summary": "Locus v0.2.9 (2026-05-06)",
       "changelogUrl": "/en/overview/latest-version",
       "changes": [
         {
           "title": "Added",
           "items": [
-            "Added a technical overview in the README and docs explaining Locus's independent process architecture and Unity-specific capabilities."
+            "Added linked Unity asset directory support for asset indexing, watching, workspace listing, and search under `Assets/` and `Packages/`.",
+            "Added background asset database scan startup with live `reconcile` status for index verification.",
+            "Added README compatibility notes for supported Unity versions."
           ]
         },
         {
           "title": "Fixed",
           "items": [
-            "Routed subagent stream events through the parent run context so nested tool progress and deltas attach to the correct parent session.",
-            "Updated knowledge undo to sync changed knowledge documents incrementally, with full reconciliation for directory, metadata, or large-batch changes.",
-            "Refreshed externally changed selected knowledge documents without showing the selected-document loading state.",
-            "Simplified the knowledge editor footer status during autosave so it stays on a stable saved or unsaved state.",
-            "Allowed knowledge-safe git diff and status pipelines, including multiline commands, in agent tool routing.",
-            "Treated custom endpoint HTML or challenge-page responses as test failures, preserved the saved HTML path, and localized the displayed detail.",
-            "Replayed full Responses API history for custom endpoints while keeping `previous_response_id` usage for the official OpenAI endpoint.",
-            "Updated built-in Memory labels and L3 rule headings to use English labels and ASCII heading formatting."
+            "Fixed Unity 2020 pipe accept compatibility in the Unity bridge.",
+            "Cancelled active asset scans and background index verification when switching workspaces or resetting configuration.",
+            "Reduced blocking when loading existing asset databases by using light startup reconciliation followed by background hash verification.",
+            "Bounded compact requests, added emergency compact summaries, and persisted oversized tool outputs with a schema v15 migration.",
+            "Included failed compact attempt metadata in raw context exports.",
+            "Required cached local embedding models before activation to avoid unexpected model downloads.",
+            "Stabilized ResizeObserver-driven layouts, Tauri window dragging, and the model effort selector dropdown.",
+            "Localized hardcoded frontend copy across Agent, Chat, Knowledge, Collab, settings, and preview surfaces."
           ]
         },
         {
           "title": "Removed",
           "items": [
-            "No changes."
+            "Removed automatic local embedding model downloads during activation."
           ]
         }
       ],
