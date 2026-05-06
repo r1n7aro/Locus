@@ -928,7 +928,6 @@ struct LocalModelSelection {
     requested_model: String,
     route: LocalModelRoute,
     known_model: Option<FastembedModel>,
-    supported_preset: Option<&'static SupportedEmbeddingPreset>,
     manual_model_dir: PathBuf,
 }
 
@@ -1233,7 +1232,6 @@ fn select_local_model_source(
             requested_model,
             route: LocalModelRoute::Preset,
             known_model,
-            supported_preset,
             manual_model_dir,
         });
     }
@@ -1243,7 +1241,6 @@ fn select_local_model_source(
             requested_model,
             route: LocalModelRoute::Manual,
             known_model,
-            supported_preset,
             manual_model_dir,
         });
     }
@@ -1260,61 +1257,47 @@ fn select_local_model_source(
             requested_model,
             route: LocalModelRoute::Preset,
             known_model,
-            supported_preset,
             manual_model_dir,
         });
     }
 
-    Err(format!(
-        "Local model '{}' is not supported for automatic download. Choose a supported preset or place ONNX files in: {}",
-        requested_model,
-        manual_model_dir.display()
+    Err(local_model_not_downloaded_message(
+        &requested_model,
+        &manual_model_dir,
     ))
 }
 
+fn local_model_not_downloaded_message(model_id: &str, expected_dir: &Path) -> String {
+    format!(
+        "Local embedding model '{}' has not been downloaded. Download the model manually before activating semantic search. Expected local files in: {}",
+        model_id,
+        expected_dir.display()
+    )
+}
+
 impl LocalEmbeddingRuntime {
-    fn ensure_supported_preset_downloaded<F>(
+    fn ensure_selected_local_model_ready(
         selection: &LocalModelSelection,
-        config: &EmbeddingConfig,
         model_dir: &Path,
-        on_progress: &mut F,
-    ) -> Result<(), String>
-    where
-        F: FnMut(EmbeddingActivationProgress),
-    {
+    ) -> Result<(), String> {
         if let Some(model) = selection.known_model.clone() {
-            return prefetch_fastembed_model(
-                &model,
-                model_dir,
-                &config.local_model_download_source,
-                on_progress,
-            );
+            if fastembed_model_cached(&effective_fastembed_cache_dir(model_dir), &model) {
+                return Ok(());
+            }
+            return Err(local_model_not_downloaded_message(
+                &selection.requested_model,
+                &selection.manual_model_dir,
+            ));
         }
 
         if manual_model_files_ready(&selection.manual_model_dir) {
             return Ok(());
         }
 
-        let preset = selection.supported_preset.ok_or_else(|| {
-            format!(
-                "Local model '{}' is not supported for automatic download",
-                selection.requested_model
-            )
-        })?;
-
-        match preset.download_kind {
-            EmbeddingPresetDownloadKind::Fastembed => Err(format!(
-                "Local model '{}' is not supported for automatic download",
-                selection.requested_model
-            )),
-            EmbeddingPresetDownloadKind::HuggingFace => download_custom_huggingface_model(
-                preset.id,
-                supported_embedding_preset_download_model_id(preset),
-                model_dir,
-                &config.local_model_download_source,
-                on_progress,
-            ),
-        }
+        Err(local_model_not_downloaded_message(
+            &selection.requested_model,
+            &selection.manual_model_dir,
+        ))
     }
 
     fn new_with_requested_backend_only(
@@ -1326,12 +1309,7 @@ impl LocalEmbeddingRuntime {
         let selection = select_local_model_source(config, model_dir)?;
         match selection.route {
             LocalModelRoute::Preset => {
-                Self::ensure_supported_preset_downloaded(
-                    &selection,
-                    config,
-                    model_dir,
-                    &mut |_| {},
-                )?;
+                Self::ensure_selected_local_model_ready(&selection, model_dir)?;
                 if let Some(model) = selection.known_model.clone() {
                     return Self::build_fastembed_preset_runtime(
                         &selection.requested_model,
@@ -1377,12 +1355,7 @@ impl LocalEmbeddingRuntime {
         let selection = select_local_model_source(config, model_dir)?;
         match selection.route {
             LocalModelRoute::Preset => {
-                Self::ensure_supported_preset_downloaded(
-                    &selection,
-                    config,
-                    model_dir,
-                    on_progress,
-                )?;
+                Self::ensure_selected_local_model_ready(&selection, model_dir)?;
                 on_progress(EmbeddingActivationProgress::Stage {
                     stage: "initializing_runtime",
                     detail: Some(format!(
@@ -1967,29 +1940,33 @@ fn run_local_embedding_runtime_matrix_cases(
         let case = match route {
             LocalModelRoute::Preset => {
                 if let Some(model) = known_model.clone() {
-                    execute_local_self_test_case(
-                        case_id,
-                        route.as_str().to_string(),
-                        provider,
-                        requested_model.clone(),
-                        backend,
-                        || {
-                            let model = model.clone();
-                            prefetch_fastembed_model(
-                                &model,
-                                model_root,
-                                &config.local_model_download_source,
-                                &mut |_| {},
-                            )?;
-                            LocalEmbeddingRuntime::build_fastembed_preset_runtime(
-                                &requested_model,
-                                model_root,
-                                model,
-                                device_policy,
-                            )
-                        },
-                        test_text,
-                    )
+                    if fastembed_model_cached(&effective_fastembed_cache_dir(model_root), &model) {
+                        execute_local_self_test_case(
+                            case_id,
+                            route.as_str().to_string(),
+                            provider,
+                            requested_model.clone(),
+                            backend,
+                            || {
+                                LocalEmbeddingRuntime::build_fastembed_preset_runtime(
+                                    &requested_model,
+                                    model_root,
+                                    model.clone(),
+                                    device_policy,
+                                )
+                            },
+                            test_text,
+                        )
+                    } else {
+                        skipped_self_test_case(
+                            case_id,
+                            route.as_str().to_string(),
+                            provider,
+                            backend,
+                            requested_model.clone(),
+                            local_model_not_downloaded_message(&requested_model, &manual_model_dir),
+                        )
+                    }
                 } else {
                     skipped_self_test_case(
                         case_id,
@@ -3928,19 +3905,6 @@ fn remove_dir_if_exists(path: &Path) {
     }
 }
 
-fn prefetch_fastembed_model<F>(
-    model: &FastembedModel,
-    model_dir: &Path,
-    download_source: &str,
-    on_progress: &mut F,
-) -> Result<(), String>
-where
-    F: FnMut(EmbeddingActivationProgress),
-{
-    prefetch_fastembed_model_with_cancel(model, model_dir, download_source, None, on_progress)
-        .map_err(|error| error.to_string())
-}
-
 fn prefetch_fastembed_model_with_cancel<F>(
     model: &FastembedModel,
     model_dir: &Path,
@@ -4066,27 +4030,6 @@ where
             Err(error)
         }
     }
-}
-
-fn download_custom_huggingface_model<F>(
-    managed_model_id: &str,
-    download_model_id: &str,
-    managed_directory: &Path,
-    download_source: &str,
-    on_progress: &mut F,
-) -> Result<(), String>
-where
-    F: FnMut(EmbeddingActivationProgress),
-{
-    download_custom_huggingface_model_with_cancel(
-        managed_model_id,
-        download_model_id,
-        managed_directory,
-        download_source,
-        None,
-        on_progress,
-    )
-    .map_err(|error| error.to_string())
 }
 
 fn download_custom_huggingface_model_with_cancel<F>(
@@ -6103,6 +6046,51 @@ mod tests {
 
         let manager = EmbeddingManager::new(EmbeddingConfig::default(), dir.path());
         assert!(manager.is_model_downloaded());
+    }
+
+    #[test]
+    fn activation_requires_downloaded_huggingface_preset() {
+        let dir = tempdir().expect("temp dir");
+        let mut manager = EmbeddingManager::new(
+            EmbeddingConfig {
+                enabled: true,
+                local_model: "Qwen/Qwen3-Embedding-0.6B".to_string(),
+                ..EmbeddingConfig::default()
+            },
+            dir.path(),
+        );
+
+        let err = manager
+            .activate_with_progress(&mut |_| {})
+            .expect_err("activation should require a manual model download");
+
+        assert!(err.contains("has not been downloaded"));
+        assert!(!managed_model_root(dir.path())
+            .join(sanitize_model_id("Qwen/Qwen3-Embedding-0.6B"))
+            .exists());
+    }
+
+    #[test]
+    fn activation_requires_cached_fastembed_preset() {
+        let dir = tempdir().expect("temp dir");
+        let hf_home = dir.path().join("hf-home");
+        let hf_home_string = hf_home.to_string_lossy().to_string();
+        let _env = TempEnvGuard::set(&[("HF_HOME", Some(hf_home_string.as_str()))]);
+        let mut manager = EmbeddingManager::new(
+            EmbeddingConfig {
+                enabled: true,
+                local_model: "BAAI/bge-small-zh-v1.5".to_string(),
+                ..EmbeddingConfig::default()
+            },
+            dir.path(),
+        );
+
+        let err = manager
+            .activate_with_progress(&mut |_| {})
+            .expect_err("activation should require a cached fastembed model");
+
+        assert!(err.contains("has not been downloaded"));
+        assert!(!hf_home.exists());
     }
 
     #[test]
