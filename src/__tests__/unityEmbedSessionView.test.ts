@@ -136,6 +136,12 @@ describe("Unity embedded session view", () => {
     expect(command).toContain("GW_CHILD");
     expect(command).toContain("mouse_hook_sync_loop");
     expect(command).toContain("activate_for_input");
+    expect(command).toContain("focus_embed_window_for_input");
+    expect(command).toContain("AttachThreadInput");
+    expect(command).toContain("SetKeyboardFocus");
+    expect(command).toContain("COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC");
+    expect(command).toContain("controller.MoveFocus");
+    expect(command).not.toContain("if !is_activation_guard_enabled()");
     expect(command).toContain("mouse_activate_hook_installed");
     expect(command).toContain("mouse_activate_hooked_hwnd_count");
     expect(command).toContain("mouse_activate_block_count");

@@ -674,19 +674,25 @@ mod windows_impl {
         io::{AsyncBufReadExt, BufReader},
         net::windows::named_pipe::{NamedPipeServer, ServerOptions},
     };
+    use webview2_com::Microsoft::Web::WebView2::Win32::COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC;
     use windows::Win32::{
         Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
         Graphics::Gdi::ScreenToClient,
-        UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
-        UI::WindowsAndMessaging::{
-            GetForegroundWindow, GetParent, GetTopWindow, GetWindow, GetWindowLongPtrW,
-            GetWindowRect, GetWindowTextW, IsIconic, IsWindow, IsWindowVisible,
-            SetForegroundWindow, SetParent, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-            GWLP_HWNDPARENT, GWL_EXSTYLE, GWL_STYLE, GW_CHILD, GW_HWNDNEXT, HWND_TOP,
-            MA_NOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER,
-            SWP_NOSIZE, SW_HIDE, SW_SHOWNOACTIVATE, WM_MOUSEACTIVATE, WM_NCDESTROY, WS_CAPTION,
-            WS_CHILD, WS_EX_NOACTIVATE, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU,
-            WS_THICKFRAME,
+        System::Threading::{AttachThreadInput, GetCurrentThreadId},
+        UI::{
+            Input::KeyboardAndMouse::{SetActiveWindow, SetFocus as SetKeyboardFocus},
+            Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
+            WindowsAndMessaging::{
+                BringWindowToTop, GetForegroundWindow, GetParent, GetTopWindow, GetWindow,
+                GetWindowLongPtrW, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId,
+                IsIconic, IsWindow, IsWindowVisible, SetForegroundWindow, SetParent,
+                SetWindowLongPtrW, SetWindowPos, ShowWindow, GWLP_HWNDPARENT, GWL_EXSTYLE,
+                GWL_STYLE, GW_CHILD, GW_HWNDNEXT, HWND_TOP, MA_NOACTIVATE, SWP_FRAMECHANGED,
+                SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SW_HIDE,
+                SW_SHOWNOACTIVATE, WM_MOUSEACTIVATE, WM_NCDESTROY, WS_CAPTION, WS_CHILD,
+                WS_EX_NOACTIVATE, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU,
+                WS_THICKFRAME,
+            },
         },
     };
 
@@ -880,17 +886,16 @@ mod windows_impl {
             return Ok(());
         };
 
-        if !is_activation_guard_enabled() {
-            return Ok(());
-        }
-
-        set_mouse_activation_suppressed(Some(window), false)?;
-        ensure_mouse_activate_hook(window)?;
         let hwnd = window
             .hwnd()
             .map_err(|error| format!("Failed to read Tauri window handle: {error}"))?;
+        if is_activation_guard_enabled() {
+            set_mouse_activation_suppressed(Some(window), false)?;
+            ensure_mouse_activate_hook(window)?;
+        }
+
         unsafe {
-            let _ = SetForegroundWindow(hwnd);
+            focus_embed_window_for_input(window, hwnd);
         }
         Ok(())
     }
@@ -1038,6 +1043,118 @@ mod windows_impl {
         }
 
         unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
+    }
+
+    unsafe fn focus_embed_window_for_input(window: &tauri::WebviewWindow, hwnd: HWND) {
+        if !is_valid_window(hwnd) {
+            return;
+        }
+
+        let foreground_parent = focus_parent_for_embed_window(hwnd);
+        let foreground_target = if is_valid_window(foreground_parent) {
+            foreground_parent
+        } else {
+            hwnd
+        };
+        let mut focus_targets = vec![foreground_target, hwnd, GetForegroundWindow()];
+        unsafe {
+            collect_descendant_windows(hwnd, &mut focus_targets);
+        }
+
+        let current_thread = GetCurrentThreadId();
+        let attached_threads = attach_input_threads(current_thread, &focus_targets);
+
+        if is_valid_window(foreground_target) {
+            let _ = BringWindowToTop(foreground_target);
+            let _ = SetForegroundWindow(foreground_target);
+            let _ = SetActiveWindow(foreground_target);
+        }
+
+        focus_window_chain(hwnd);
+        let _ = window.set_focus();
+        focus_webview_controller(window);
+
+        detach_input_threads(current_thread, attached_threads);
+    }
+
+    unsafe fn focus_parent_for_embed_window(hwnd: HWND) -> HWND {
+        if has_child_style(hwnd) {
+            if let Ok(parent) = GetParent(hwnd) {
+                if is_valid_window(parent) {
+                    return parent;
+                }
+            }
+        }
+
+        let parent_hwnd = control_state()
+            .lock()
+            .map(|state| state.last_parent_hwnd)
+            .unwrap_or_default();
+        if parent_hwnd > 0 {
+            let parent = HWND(parent_hwnd as isize as *mut std::ffi::c_void);
+            if is_valid_window(parent) {
+                return parent;
+            }
+        }
+
+        HWND(std::ptr::null_mut())
+    }
+
+    unsafe fn is_valid_window(hwnd: HWND) -> bool {
+        !hwnd.0.is_null() && IsWindow(Some(hwnd)).as_bool()
+    }
+
+    unsafe fn attach_input_threads(current_thread: u32, hwnds: &[HWND]) -> Vec<u32> {
+        let mut attached_threads = Vec::new();
+        for hwnd in hwnds {
+            if !is_valid_window(*hwnd) {
+                continue;
+            }
+            let thread_id = GetWindowThreadProcessId(*hwnd, None);
+            if thread_id == 0
+                || thread_id == current_thread
+                || attached_threads.contains(&thread_id)
+            {
+                continue;
+            }
+
+            if AttachThreadInput(current_thread, thread_id, true).as_bool() {
+                attached_threads.push(thread_id);
+            }
+        }
+        attached_threads
+    }
+
+    unsafe fn detach_input_threads(current_thread: u32, mut attached_threads: Vec<u32>) {
+        attached_threads.reverse();
+        for thread_id in attached_threads {
+            let _ = AttachThreadInput(current_thread, thread_id, false);
+        }
+    }
+
+    unsafe fn focus_window_chain(hwnd: HWND) {
+        let mut focus_targets = vec![hwnd];
+        collect_descendant_windows(hwnd, &mut focus_targets);
+
+        for target in focus_targets {
+            if is_valid_window(target) && IsWindowVisible(target).as_bool() {
+                let _ = SetKeyboardFocus(Some(target));
+            }
+        }
+    }
+
+    fn focus_webview_controller(window: &tauri::WebviewWindow) {
+        let _ = window.with_webview(|webview| {
+            let controller = webview.controller();
+            unsafe {
+                let mut webview_hwnd = HWND::default();
+                let _ = controller.ParentWindow(&mut webview_hwnd);
+                if !webview_hwnd.0.is_null() {
+                    let _ = SetKeyboardFocus(Some(webview_hwnd));
+                }
+                let _ = controller.MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
+            }
+        });
     }
 
     pub(super) fn focus_debug_snapshot(
