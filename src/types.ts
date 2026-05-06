@@ -584,10 +584,10 @@ export type ToolConfirmDisplay =
   | UnityEditorStatusChangeToolConfirmDisplay;
 
 /**
- * Skill 触发方式（单一三态）：
- * - `command`：仅作为 / 命令出现，LLM 不会语义召回
- * - `auto`：仅由 LLM 语义召回，不在 / 命令面板中
- * - `both`：两种入口都开
+ * Skill trigger mode:
+ * - `command`: only appears as a slash command
+ * - `auto`: only participates in semantic recall
+ * - `both`: enables both entry points
  */
 export type SkillSurface = "command" | "auto" | "both";
 

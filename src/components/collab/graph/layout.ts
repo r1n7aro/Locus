@@ -77,8 +77,8 @@ interface PendingLane extends ActiveLane {
 
 interface RenderLane extends ActiveLane {
   /**
-   * 对真实 track，realTrack === track。
-   * 对 preview 占位，realTrack === null。
+   * For real tracks, realTrack === track.
+   * For preview placeholders, realTrack === null.
    */
   realTrack: number | null;
 }

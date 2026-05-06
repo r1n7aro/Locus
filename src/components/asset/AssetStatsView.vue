@@ -314,8 +314,8 @@ const liveScanProgress = computed(() => {
 });
 
 // Caption shown next to the status badge in the scan-status card.
-// - never scanned & not indexed → "尚未扫描"
-// - indexed but no in-process scan history → "持久化索引"
+// - never scanned & not indexed -> "Never scanned"
+// - indexed but no in-process scan history -> "Indexed from disk"
 // - has lastScanAt → formatted timestamp
 const lastCompletedScanCaption = computed(() => {
   const o = props.overview;
@@ -334,7 +334,7 @@ const scanCaption = computed(() =>
 );
 
 // Hero value for the scan-status card. Shows duration when we have one,
-// otherwise an em-dash so we don't render "尚未扫描" twice on the card.
+// otherwise a placeholder so the card does not repeat the status caption.
 const lastCompletedScanDuration = computed(() => {
   const o = props.overview;
   if (o?.lastScanDurationMs != null) return fmtDuration(o.lastScanDurationMs);
