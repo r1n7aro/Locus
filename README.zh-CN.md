@@ -6,8 +6,12 @@
 [![发布](https://img.shields.io/badge/RELEASE-GitHub-5d7285?style=for-the-badge&labelColor=4a4a4a)](https://github.com/r1n7aro/Locus/releases)
 [![许可证](https://img.shields.io/badge/LICENSE-GPL--3.0--or--later-88b000?style=for-the-badge&labelColor=4a4a4a)](LICENSE)
 [![路线图](https://img.shields.io/badge/ROADMAP-View-2d6cdf?style=for-the-badge&labelColor=4a4a4a)](https://unity.farlocus.com/overview/roadmap)
+[![Bilibili](https://img.shields.io/badge/BILIBILI-Watch-00a1d6?style=for-the-badge&labelColor=4a4a4a)](https://www.bilibili.com/video/BV1H4ReBNELD/)
+[![X](https://img.shields.io/badge/X-@farlocus-000000?style=for-the-badge&labelColor=4a4a4a)](https://x.com/farlocus)
 
 [English](README.md) | 简体中文
+
+[![在 Bilibili 观看演示](https://img.youtube.com/vi/xoApXZMon9M/maxresdefault.jpg)](https://www.bilibili.com/video/BV1H4ReBNELD/)
 
 ## 概览
 
