@@ -164,8 +164,9 @@ export const useUiStore = defineStore("ui", () => {
     try {
       setTab("chat");
       showOnboarding.value = !localStorage.getItem("locus-onboarding-completed");
-    } catch {
+    } catch (error) {
       setTab("chat");
+      console.error("Failed to read onboarding completion state:", error);
       showOnboarding.value = false;
     }
   }
@@ -256,7 +257,9 @@ export const useUiStore = defineStore("ui", () => {
   function completeOnboarding() {
     try {
       localStorage.setItem("locus-onboarding-completed", "1");
-    } catch { /* ignore */ }
+    } catch (error) {
+      console.error("Failed to persist onboarding completion state:", error);
+    }
     showOnboarding.value = false;
   }
 

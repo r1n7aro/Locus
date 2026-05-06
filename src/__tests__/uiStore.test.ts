@@ -236,4 +236,23 @@ describe("ui store window resize sync", () => {
     expect(store.activeTab).toBe("chat");
     expect(store.knowledgeMounted).toBe(false);
   });
+
+  it("logs localStorage write failures when completing onboarding", () => {
+    const store = useUiStore();
+    const error = new Error("localStorage unavailable");
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    localStorageMock.setItem.mockImplementationOnce(() => {
+      throw error;
+    });
+
+    store.completeOnboarding();
+
+    expect(consoleError).toHaveBeenCalledWith(
+      "Failed to persist onboarding completion state:",
+      error,
+    );
+    expect(store.showOnboarding).toBe(false);
+
+    consoleError.mockRestore();
+  });
 });
