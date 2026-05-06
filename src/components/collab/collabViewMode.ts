@@ -1,4 +1,5 @@
 import type { MergeOperation } from "../../types";
+import { t } from "../../i18n";
 import type { CollabHistorySelectionKind } from "./historySelection";
 
 export type CollabRightPanelMode = "merge" | "commit" | "workspace";
@@ -30,6 +31,6 @@ export function resolveMergeOperationBadge(
 
 export function resolveConflictActionHint(operation: MergeOperation | null): string {
   return operation
-    ? `${operation.label}中，操作已禁用`
-    : "存在未解决冲突，操作已禁用";
+    ? t("collab.conflict.actionDisabledDuring", operation.label)
+    : t("collab.conflict.actionDisabled");
 }

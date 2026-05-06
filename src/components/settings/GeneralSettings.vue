@@ -53,10 +53,10 @@ const pythonBusy = ref(false);
 let gitLoadToken = 0;
 let pythonLoadToken = 0;
 
-const languageOptions = [
-  { value: "zh", label: "中文" },
-  { value: "en", label: "English" },
-] as const;
+const languageOptions = computed(() => [
+  { value: "zh", label: t("language.zh") },
+  { value: "en", label: t("language.en") },
+]);
 
 const debugStatusLabel = computed(() => {
   if (!debugReady.value) return t("common.loading");
@@ -409,7 +409,7 @@ async function selectPythonRuntime(selectedId: string) {
     <p class="section-desc">{{ t("settings.general.languageDesc") }}</p>
     <BaseSegmented
       :model-value="locale"
-      :options="[...languageOptions]"
+      :options="languageOptions"
       @update:model-value="emit('setLocale', $event as Locale)"
     />
   </div>

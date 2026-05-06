@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
 import { getLocusRuntime } from "../services/locusRuntime";
+import { t } from "../i18n";
 import BaseButton from "./ui/BaseButton.vue";
 
 interface PingResponse {
@@ -43,10 +44,10 @@ const invokePing = ref<PingResponse | null>(null);
 const isUnityRuntime = computed(() => runtime.kind === "unity");
 
 const statusText = computed(() => {
-  if (error.value) return "连接失败";
-  if (loading.value) return "检测中";
-  if (ping.value?.ok) return "已连接";
-  return "待检测";
+  if (error.value) return t("unity.embed.status.failed");
+  if (loading.value) return t("unity.embed.status.checking");
+  if (ping.value?.ok) return t("unity.embed.status.connected");
+  return t("unity.embed.status.pending");
 });
 
 async function refresh() {

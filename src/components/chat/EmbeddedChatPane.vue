@@ -33,6 +33,7 @@ import {
   createAnimationFrameResizeObserver,
   type ResizeObserverHandle,
 } from "../../composables/resizeObserver";
+import { t } from "../../i18n";
 
 interface MetaRow {
   label: string;
@@ -88,15 +89,15 @@ const props = withDefaults(defineProps<{
   emptyHint: "",
   errorMessage: null,
   disabled: false,
-  sendLabel: "发送",
-  cancelLabel: "取消",
-  userLabel: "用户",
+  sendLabel: "",
+  cancelLabel: "",
+  userLabel: "",
   assistantLabel: "Locus",
-  thinkingLabel: "思考中",
+  thinkingLabel: "",
   waitingLabel: "",
-  thoughtDurationLabel: "思考了 {0} 秒",
-  thoughtMomentLabel: "思考了片刻",
-  runningLabel: "处理中",
+  thoughtDurationLabel: "",
+  thoughtMomentLabel: "",
+  runningLabel: "",
   selectedAgentId: "",
   skills: () => [],
   enableIntentBadges: false,
@@ -121,6 +122,17 @@ const transcriptRef = ref<InstanceType<typeof ChatTranscript> | null>(null);
 const hasHeader = computed(() => !!props.title || !!props.subtitle || !!slots["header-actions"]);
 const hasComposerStart = computed(() => !!slots["composer-start"]);
 const hasComposerActions = computed(() => !!slots["composer-actions"]);
+const effectiveSendLabel = computed(() => props.sendLabel || t("common.send"));
+const effectiveCancelLabel = computed(() => props.cancelLabel || t("common.cancel"));
+const effectiveUserLabel = computed(() => props.userLabel || t("chat.embedded.user"));
+const effectiveThinkingLabel = computed(() => props.thinkingLabel || t("chat.embedded.thinking"));
+const effectiveWaitingLabel = computed(() => props.waitingLabel || props.runningLabel || t("chat.embedded.running"));
+const effectiveThoughtDurationLabel = computed(() =>
+  props.thoughtDurationLabel || t("chat.transcript.thoughtDuration", "{0}"),
+);
+const effectiveThoughtMomentLabel = computed(() =>
+  props.thoughtMomentLabel || t("chat.transcript.thoughtMoment"),
+);
 const viewportStates = new Map<string, SessionScrollState>();
 let suppressScrollCapture = false;
 let transcriptResizeObserver: ResizeObserverHandle | null = null;
@@ -539,12 +551,12 @@ onUnmounted(() => {
       :active-tool-calls="activeToolCalls"
       :empty-title="emptyTitle"
       :empty-hint="emptyHint"
-      :user-label="userLabel"
+      :user-label="effectiveUserLabel"
       :assistant-label="assistantLabel"
-      :waiting-label="waitingLabel || runningLabel"
-      :thinking-active-label="thinkingLabel"
-      :thought-duration-label="thoughtDurationLabel"
-      :thought-moment-label="thoughtMomentLabel"
+      :waiting-label="effectiveWaitingLabel"
+      :thinking-active-label="effectiveThinkingLabel"
+      :thought-duration-label="effectiveThoughtDurationLabel"
+      :thought-moment-label="effectiveThoughtMomentLabel"
       :enable-intent-badges="enableIntentBadges"
       :show-user-images="showUserImages"
       :user-content-mode="userContentMode"
@@ -587,8 +599,8 @@ onUnmounted(() => {
         :placeholder="placeholder"
         :disabled="disabled"
         :is-streaming="isStreaming"
-        :send-label="sendLabel"
-        :cancel-label="cancelLabel"
+        :send-label="effectiveSendLabel"
+        :cancel-label="effectiveCancelLabel"
         @update:model-value="updateInput"
         @send="emit('send', $event)"
         @clear="emit('clear')"

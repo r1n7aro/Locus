@@ -1,11 +1,13 @@
 import { computed, type Ref } from "vue";
 import type { SkillManifest } from "../types";
+import { t } from "../i18n";
 import type { CommandDef } from "./chatInputIntents";
 import { rankSearchResults, scoreSearchFields, splitSearchTerms } from "./searchMatcher";
 import { resolveSkillCommandTrigger, skillHasCommandEnabled } from "./skillCommands";
 
-export const COMPACT_INSTRUCTION =
-  "请对上面的对话进行总结和压缩：保留关键的技术决策、代码变更、未完成任务和重要上下文，删除冗余的中间过程。用精简的格式输出总结，以便后续对话可以基于这个总结继续。";
+export function getCompactInstruction() {
+  return t("chat.command.compactInstruction");
+}
 
 export function useCommandRegistry(
   skills: Ref<SkillManifest[] | undefined>,
@@ -15,19 +17,19 @@ export function useCommandRegistry(
     const builtins: CommandDef[] = [
       {
         name: "/clear",
-        description: "清空当前会话并开始新对话",
+        description: t("chat.command.clearDesc"),
         commandKind: "action",
         commandType: "clear",
       },
       {
         name: "/compact",
-        description: "压缩当前上下文并总结历史消息",
+        description: t("chat.command.compactDesc"),
         commandKind: "action",
         commandType: "compact",
       },
       {
         name: "/plan",
-        description: "切换到规划模式",
+        description: t("chat.command.planDesc"),
         commandKind: "intent",
         commandType: "plan",
         agentOnly: "dev",

@@ -29,7 +29,7 @@ import {
   type ComposerIntentState,
 } from "../../composables/chatInputIntents";
 import { rankSearchResults } from "../../composables/searchMatcher";
-import { COMPACT_INSTRUCTION, useCommandRegistry } from "../../composables/useCommandRegistry";
+import { getCompactInstruction, useCommandRegistry } from "../../composables/useCommandRegistry";
 import {
   shouldSelectPopupOnEnter,
   shouldSubmitOnEnter,
@@ -762,7 +762,7 @@ function tryHandleExactActionCommand(): boolean {
   }
 
   if (command.commandType === "compact") {
-    const payload = buildSendPayload(COMPACT_INSTRUCTION, [], emptyComposerIntent(), command.name);
+    const payload = buildSendPayload(getCompactInstruction(), [], emptyComposerIntent(), command.name);
     resetDraft();
     emit("send", payload);
     return true;

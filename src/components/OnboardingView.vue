@@ -57,10 +57,10 @@ function selectLanguage(lang: Locale) {
 }
 
 const { preference: themePreference, setThemePreference } = useTheme();
-const languageOptions = [
-  { value: "zh", label: "中文" },
-  { value: "en", label: "English" },
-] as const;
+const languageOptions = computed(() => [
+  { value: "zh", label: t("language.zh") },
+  { value: "en", label: t("language.en") },
+]);
 const themeOptionDefs: { value: ThemePreference; labelKey: string }[] = [
   { value: "dark",   labelKey: "settings.display.themeDark" },
   { value: "light",  labelKey: "settings.display.themeLight" },
@@ -549,7 +549,7 @@ onUnmounted(() => {
           <BaseSegmented
             class="welcome-segmented"
             :model-value="locale"
-            :options="[...languageOptions]"
+            :options="languageOptions"
             @update:model-value="handleLanguageChange"
           />
         </section>

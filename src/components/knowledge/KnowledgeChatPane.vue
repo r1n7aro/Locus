@@ -84,32 +84,32 @@ const {
     const rules = props.document.explicitMaintenanceRules ? props.document.maintenanceRules?.trim() : "";
     const body = trimmedContext(props.document.body?.trim() ?? "", BODY_CONTEXT_LIMIT);
     const lines = [
-      "你正在知识页面的嵌入式对话中协助编辑一份知识文档。",
-      `目标文档标题：${props.document.title || props.document.path}`,
-      `目标文档路径：${props.document.path}`,
-      `文档类型：${typeLabel(props.document.type)}`,
-      `文档作用域：${scopeLabel(props.document)}`,
-      `编辑模式：${editModeLabel(editMode.value)}`,
+      t("knowledge.chat.request.intro"),
+      t("knowledge.chat.request.title", props.document.title || props.document.path),
+      t("knowledge.chat.request.path", props.document.path),
+      t("knowledge.chat.request.type", typeLabel(props.document.type)),
+      t("knowledge.chat.request.scope", scopeLabel(props.document)),
+      t("knowledge.chat.request.editMode", editModeLabel(editMode.value)),
     ];
 
     if (summary) {
-      lines.push("当前摘要：");
+      lines.push(t("knowledge.chat.request.summaryHeader"));
       lines.push(summary);
     }
     if (rules) {
-      lines.push("当前维护规则：");
+      lines.push(t("knowledge.chat.request.rulesHeader"));
       lines.push(rules);
     }
     if (body) {
-      lines.push("当前正文：");
+      lines.push(t("knowledge.chat.request.bodyHeader"));
       lines.push(body);
     }
 
-    lines.push("要求：");
-    lines.push("- 优先围绕当前目标文档工作");
-    lines.push("- 需要改动文档时，直接生成知识提案或更新该文档");
-    lines.push("- 保持现有文档结构、术语语义与约束一致");
-    lines.push("用户请求：");
+    lines.push(t("knowledge.chat.request.requirementsHeader"));
+    lines.push(t("knowledge.chat.request.requirementFocus"));
+    lines.push(t("knowledge.chat.request.requirementProposal"));
+    lines.push(t("knowledge.chat.request.requirementStructure"));
+    lines.push(t("knowledge.chat.request.userRequestHeader"));
     lines.push(input);
 
     return {
@@ -139,7 +139,7 @@ function editModeLabel(mode: KnowledgeEditMode) {
 function trimmedContext(value: string, limit: number) {
   if (!value) return "";
   if (value.length <= limit) return value;
-  return `${value.slice(0, limit)}\n\n[内容已截断，保留前 ${limit} 个字符]`;
+  return t("knowledge.chat.request.truncated", value.slice(0, limit), limit);
 }
 
 function handleSelectAgent(agentId: string) {

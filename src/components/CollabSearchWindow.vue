@@ -34,6 +34,7 @@ import BaseCheckbox from "./ui/BaseCheckbox.vue";
 type DatePickerTarget = "from" | "to";
 type ResultColumnKey = "kind" | "message" | "ref" | "author" | "date" | "files";
 type ResizableResultColumn = Exclude<ResultColumnKey, "files">;
+type CalendarWeekdayKey = "mon" | "tue" | "wed" | "thu" | "fri" | "sat" | "sun";
 
 interface CalendarDay {
   key: string;
@@ -73,6 +74,7 @@ const RESULT_COLUMN_MAX_WIDTHS: Record<ResultColumnKey, number> = {
   date: 180,
   files: 960,
 };
+const CALENDAR_WEEKDAY_KEYS: CalendarWeekdayKey[] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
 
 const appWindow = getCurrentWindow();
 const query = ref("");
@@ -181,9 +183,7 @@ const virtualResultSpacerStyle = computed(() => ({
 }));
 
 const weekdayLabels = computed(() =>
-  locale.value === "zh"
-    ? ["一", "二", "三", "四", "五", "六", "日"]
-    : ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"],
+  CALENDAR_WEEKDAY_KEYS.map((day) => t(`collab.search.weekday.${day}`)),
 );
 
 const selectedDateValue = computed(() => {
@@ -194,13 +194,10 @@ const selectedDateValue = computed(() => {
 
 const calendarMonthLabel = computed(() => {
   const date = calendarMonth.value;
-  if (locale.value === "zh") {
-    return `${date.getFullYear()}年${date.getMonth() + 1}月`;
-  }
-  return new Intl.DateTimeFormat("en-US", {
-    month: "long",
-    year: "numeric",
-  }).format(date);
+  const month = locale.value === "zh"
+    ? String(date.getMonth() + 1)
+    : new Intl.DateTimeFormat("en-US", { month: "long" }).format(date);
+  return t("collab.search.monthYear", date.getFullYear(), month);
 });
 
 const calendarDays = computed<CalendarDay[]>(() => {

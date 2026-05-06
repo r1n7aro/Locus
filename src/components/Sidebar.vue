@@ -23,7 +23,7 @@ const newChatTitle = computed(() =>
 );
 
 function shortDir(dir: string): string {
-  if (!dir) return "未设置";
+  if (!dir) return t("app.dir.notSet");
   const parts = dir.replace(/\\/g, "/").split("/").filter(Boolean);
   return parts.length > 0 ? parts[parts.length - 1] : dir;
 }
@@ -70,7 +70,7 @@ onUnmounted(() => document.removeEventListener("click", handleClickOutside, true
     <div class="workspace-selector" ref="dropdownRef">
       <button
         class="workspace-btn"
-        :title="props.workingDir || '未设置工作目录'"
+        :title="props.workingDir || t('app.dir.notSetTitle')"
         @click="toggleDropdown"
       >
         <svg class="ws-icon" viewBox="0 0 16 16" fill="currentColor" width="14" height="14">
@@ -83,7 +83,7 @@ onUnmounted(() => document.removeEventListener("click", handleClickOutside, true
       </button>
       <Transition name="dropdown">
         <div v-if="showDirDropdown" class="dir-dropdown">
-          <div class="dropdown-label">最近工作目录</div>
+          <div class="dropdown-label">{{ t("app.dir.recentDirs") }}</div>
           <div
             v-for="dir in recentDirs"
             :key="dir"
@@ -101,13 +101,13 @@ onUnmounted(() => document.removeEventListener("click", handleClickOutside, true
             </div>
             <span v-if="dir === props.workingDir" class="dir-check">&#10003;</span>
           </div>
-          <div v-if="recentDirs.length === 0" class="dropdown-empty">暂无记录</div>
+          <div v-if="recentDirs.length === 0" class="dropdown-empty">{{ t("app.dir.noRecords") }}</div>
           <div class="dropdown-divider"></div>
           <div class="dir-item browse" @click="browseNewDir">
             <svg class="dir-item-icon" viewBox="0 0 16 16" fill="currentColor" width="12" height="12">
               <path d="M8 2a.75.75 0 0 1 .75.75v4.5h4.5a.75.75 0 0 1 0 1.5h-4.5v4.5a.75.75 0 0 1-1.5 0v-4.5h-4.5a.75.75 0 0 1 0-1.5h4.5v-4.5A.75.75 0 0 1 8 2z"/>
             </svg>
-            <span class="dir-item-name">浏览其他目录...</span>
+            <span class="dir-item-name">{{ t("app.dir.browseOther") }}</span>
           </div>
         </div>
       </Transition>

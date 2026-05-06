@@ -689,8 +689,8 @@ watch(
         <div class="dir-toolbar">
           <span class="dir-title">Context</span>
           <div class="dir-actions">
-            <BaseButton class="dir-btn" aria-label="新增规则" @click="startCreateRule" :title="t('agent.newRule')">+</BaseButton>
-            <BaseButton class="dir-btn" aria-label="刷新" @click="refreshAll" :disabled="systemPromptLoading || ruleLoading" :title="t('common.refresh')">
+            <BaseButton class="dir-btn" :aria-label="t('agent.newRule')" @click="startCreateRule" :title="t('agent.newRule')">+</BaseButton>
+            <BaseButton class="dir-btn" :aria-label="t('common.refresh')" @click="refreshAll" :disabled="systemPromptLoading || ruleLoading" :title="t('common.refresh')">
               <span :class="{ spinning: systemPromptLoading || ruleLoading }">&#8635;</span>
             </BaseButton>
           </div>
@@ -853,8 +853,8 @@ watch(
           <span class="preview-path">{{ selectedRule()?.fileName }}</span>
           <span v-if="selectedRule()?.source === 'app'" class="source-badge source-app">{{ t("common.builtIn") }}</span>
           <span v-else-if="selectedRule()?.source === 'project'" class="source-badge source-project">{{ t("common.project") }}</span>
-          <BaseButton v-if="!ruleEditing" class="preview-open-btn" aria-label="编辑规则" @click="startEditRule" :title="t('common.edit')">&#9998;</BaseButton>
-          <button class="preview-close" aria-label="关闭规则预览" @click="selected = null; ruleContent = ''; ruleEditing = false" :title="t('common.close')">&times;</button>
+          <BaseButton v-if="!ruleEditing" class="preview-open-btn" :aria-label="t('agent.editRule')" @click="startEditRule" :title="t('common.edit')">&#9998;</BaseButton>
+          <button class="preview-close" :aria-label="t('agent.closeRulePreview')" @click="selected = null; ruleContent = ''; ruleEditing = false" :title="t('common.close')">&times;</button>
         </div>
         <div class="rule-action-bar">
           <label class="skill-toggle">
@@ -900,7 +900,7 @@ watch(
           <span class="preview-path">{{ injectedItemMeta(selectedInjectedItem()?.kind || "context") }}</span>
           <span class="source-badge source-runtime">{{ selectedInjectedItem()?.source === "builtIn" ? t("common.builtIn") : t("agent.runtime") }}</span>
           <span class="source-badge source-readonly">{{ t("agent.readOnly") }}</span>
-          <button class="preview-close" aria-label="关闭预览" @click="selected = null" :title="t('common.close')">&times;</button>
+          <button class="preview-close" :aria-label="t('agent.closePreview')" @click="selected = null" :title="t('common.close')">&times;</button>
         </div>
         <div class="preview-body" :class="{ 'is-loading': injectedLoading }">
           <div v-if="injectedLoading && !selectedInjectedItem()?.content" class="preview-loading">{{ t("common.loading") }}</div>

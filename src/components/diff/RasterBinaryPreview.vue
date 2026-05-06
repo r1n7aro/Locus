@@ -460,10 +460,10 @@ onBeforeUnmount(() => {
       <span v-if="unityTextureMeta?.importer" class="meta-chip">{{ unityTextureMeta.importer }}</span>
       <span class="toolbar-spacer" />
       <span v-if="rasterSource" class="size-label">{{ zoomLabel }}</span>
-      <button class="reset-btn" :title="t('asset.preview.raster.resetZoom')" @click="fitToViewport">
-        适应
+      <button class="reset-btn" :title="t('asset.preview.raster.fit')" @click="fitToViewport">
+        {{ t("asset.preview.raster.fit") }}
       </button>
-      <button class="reset-btn" title="原始大小" @click="showActualSize">
+      <button class="reset-btn" :title="t('asset.preview.raster.actualSize')" @click="showActualSize">
         1:1
       </button>
     </div>

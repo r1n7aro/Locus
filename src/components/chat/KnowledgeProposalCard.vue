@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed } from "vue";
 import BaseButton from "../ui/BaseButton.vue";
+import { t } from "../../i18n";
 import type { KnowledgeProposal } from "../../types";
 
 const props = defineProps<{
@@ -15,10 +16,10 @@ const emit = defineEmits<{
 const summaryText = computed(() => {
   const count = props.proposal.items.length;
   const confidence = Math.round(props.proposal.confidence * 100);
-  return `检测到 ${count} 项可维护知识，置信度 ${confidence}%`;
+  return t("knowledge.proposal.summary", count, confidence);
 });
 
-const reminderText = "点击“确认并应用”后，才会写入知识文档或启动知识更新流程。";
+const reminderText = computed(() => t("knowledge.proposal.reminder"));
 
 function labelForItemKind(kind: string): string {
   return kind === "memory" ? "Memory" : "Knowledge";
@@ -27,11 +28,11 @@ function labelForItemKind(kind: string): string {
 function labelForItemMode(mode: string): string {
   switch (mode) {
     case "replace":
-      return "替换正文";
+      return t("knowledge.proposal.mode.replace");
     case "create_source":
-      return "新增内容";
+      return t("knowledge.proposal.mode.createSource");
     case "update_source":
-      return "更新内容";
+      return t("knowledge.proposal.mode.updateSource");
     default:
       return mode;
   }
@@ -41,7 +42,7 @@ function labelForItemMode(mode: string): string {
 <template>
   <div class="knowledge-card">
     <div class="knowledge-card-header">
-      <div class="knowledge-card-title">知识维护建议</div>
+      <div class="knowledge-card-title">{{ t("knowledge.proposal.title") }}</div>
       <div class="knowledge-card-meta">
         <span>{{ summaryText }}</span>
       </div>
@@ -65,7 +66,7 @@ function labelForItemMode(mode: string): string {
     </div>
 
     <details class="knowledge-card-preview">
-      <summary>查看草稿</summary>
+      <summary>{{ t("knowledge.proposal.previewDraft") }}</summary>
       <div class="knowledge-card-preview-list">
         <section
           v-for="(item, index) in proposal.items"
@@ -82,14 +83,14 @@ function labelForItemMode(mode: string): string {
 
     <div class="knowledge-card-actions">
       <template v-if="proposal.status === 'pending'">
-        <BaseButton variant="neutral" @click="emit('ignore', proposal.proposalId)">忽略</BaseButton>
-        <BaseButton variant="primary" @click="emit('apply', proposal.proposalId)">确认并应用</BaseButton>
+        <BaseButton variant="neutral" @click="emit('ignore', proposal.proposalId)">{{ t("knowledge.proposal.ignore") }}</BaseButton>
+        <BaseButton variant="primary" @click="emit('apply', proposal.proposalId)">{{ t("knowledge.proposal.apply") }}</BaseButton>
       </template>
       <template v-else-if="proposal.status === 'applying'">
-        <span class="knowledge-card-status">正在应用知识更新</span>
+        <span class="knowledge-card-status">{{ t("knowledge.proposal.applying") }}</span>
       </template>
       <template v-else-if="proposal.status === 'applied'">
-        <span class="knowledge-card-status success">知识已更新</span>
+        <span class="knowledge-card-status success">{{ t("knowledge.proposal.applied") }}</span>
       </template>
     </div>
   </div>

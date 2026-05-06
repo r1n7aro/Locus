@@ -2,6 +2,7 @@
 <script setup lang="ts">
 import { computed } from "vue";
 import type { TokenUsage } from "../../types";
+import { t } from "../../i18n";
 
 const props = defineProps<{
   tokenUsage: TokenUsage;
@@ -37,10 +38,15 @@ const contextIndicatorColor = computed(() => {
 const contextTooltip = computed(() => {
   const u = props.tokenUsage;
   const parts = [
-    `上下文 ${formatTokens(contextTokens.value)} / ${formatTokens(contextLimit.value)} (${contextPercent.value.toFixed(1)}%)`,
+    t(
+      "chat.tokenUsage.context",
+      formatTokens(contextTokens.value),
+      formatTokens(contextLimit.value),
+      contextPercent.value.toFixed(1),
+    ),
   ];
   if (hasPrice.value) {
-    parts.push(`Cost ${formatUsd(u.totalCostUsd)}`);
+    parts.push(t("chat.tokenUsage.cost", formatUsd(u.totalCostUsd)));
   }
   return parts.join(" · ");
 });
