@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -20,6 +20,18 @@ use crate::unity_yaml;
 
 const MTIME_SCAN_INTERVAL_SECS: u64 = 60;
 const NEW_META_DISCOVERY_INTERVAL_SECS: u64 = 10 * 60;
+const MAX_LINKED_ASSET_WATCH_ROOTS: usize = 64;
+type SharedLinkedAssetRoots = Arc<RwLock<Vec<LinkedAssetRoot>>>;
+type SharedOsWatcher = Arc<Mutex<RecommendedWatcher>>;
+type SharedWatchedPaths = Arc<Mutex<HashSet<PathBuf>>>;
+
+#[derive(Clone)]
+struct LinkedAssetWatchState {
+    os_watcher: SharedOsWatcher,
+    watched_paths: SharedWatchedPaths,
+    linked_watched_paths: SharedWatchedPaths,
+    linked_roots: SharedLinkedAssetRoots,
+}
 
 /// Default per-item debounce in milliseconds. Tunable at runtime via
 /// [`WatcherTuning::debounce_ms`]. Stepless on the frontend slider, range
@@ -405,16 +417,7 @@ fn is_unity_asset_path(rel_path: &str) -> bool {
     )
 }
 
-fn to_asset_rel_path_and_reason(
-    project_root: &Path,
-    abs_path: &Path,
-) -> Option<(String, QueueEnqueueReason)> {
-    let rel = abs_path
-        .strip_prefix(project_root)
-        .ok()?
-        .to_string_lossy()
-        .replace('\\', "/");
-
+fn asset_rel_path_and_reason(rel: String) -> Option<(String, QueueEnqueueReason)> {
     if !rel.starts_with("Assets/") && !rel.starts_with("Packages/") {
         return None;
     }
@@ -441,12 +444,369 @@ fn to_asset_rel_path_and_reason(
     Some((asset_path, reason))
 }
 
+fn join_linked_asset_rel_path(link_rel_path: &str, target_relative: &Path) -> String {
+    let suffix = target_relative.to_string_lossy().replace('\\', "/");
+    let suffix = suffix.trim_matches('/');
+    if suffix.is_empty() {
+        link_rel_path.to_string()
+    } else {
+        format!("{}/{}", link_rel_path.trim_end_matches('/'), suffix)
+    }
+}
+
+fn linked_asset_rel_paths_for_abs(
+    abs_path: &Path,
+    linked_roots: &[LinkedAssetRoot],
+) -> Vec<String> {
+    let canonical_abs = dunce::canonicalize(abs_path).ok();
+    let mut rel_paths = Vec::new();
+    let mut seen = HashSet::new();
+
+    for root in linked_roots {
+        let mut mapped = None;
+        if let Some(canonical_abs) = canonical_abs.as_ref() {
+            if let Ok(relative) = canonical_abs.strip_prefix(&root.target_path) {
+                mapped = Some(join_linked_asset_rel_path(&root.link_rel_path, relative));
+            }
+        }
+        if mapped.is_none() {
+            if let Ok(relative) = abs_path.strip_prefix(&root.target_path) {
+                mapped = Some(join_linked_asset_rel_path(&root.link_rel_path, relative));
+            }
+        }
+        if let Some(rel_path) = mapped {
+            if seen.insert(rel_path.clone()) {
+                rel_paths.push(rel_path);
+            }
+        }
+    }
+
+    rel_paths
+}
+
+fn push_asset_rel_path_and_reason(
+    rel: String,
+    out: &mut Vec<(String, QueueEnqueueReason)>,
+    seen: &mut HashSet<String>,
+) {
+    if let Some((asset_path, reason)) = asset_rel_path_and_reason(rel) {
+        if seen.insert(asset_path.clone()) {
+            out.push((asset_path, reason));
+        }
+    }
+}
+
+fn to_asset_rel_paths_and_reasons(
+    project_root: &Path,
+    abs_path: &Path,
+    linked_roots: &[LinkedAssetRoot],
+) -> Vec<(String, QueueEnqueueReason)> {
+    let mut results = Vec::new();
+    let mut seen = HashSet::new();
+
+    if let Ok(rel) = abs_path.strip_prefix(project_root) {
+        let rel = rel.to_string_lossy().replace('\\', "/");
+        push_asset_rel_path_and_reason(rel, &mut results, &mut seen);
+    }
+
+    for rel in linked_asset_rel_paths_for_abs(abs_path, linked_roots) {
+        push_asset_rel_path_and_reason(rel, &mut results, &mut seen);
+    }
+
+    results
+}
+
 fn file_mtime_ns(path: &Path) -> u64 {
     std::fs::metadata(path)
         .ok()
         .as_ref()
         .map(scanner::get_mtime_ns)
         .unwrap_or(0)
+}
+
+fn sort_linked_asset_roots(mut roots: Vec<LinkedAssetRoot>) -> Vec<LinkedAssetRoot> {
+    roots.sort_by(|left, right| {
+        right
+            .target_path
+            .components()
+            .count()
+            .cmp(&left.target_path.components().count())
+            .then_with(|| left.link_rel_path.cmp(&right.link_rel_path))
+    });
+    roots
+}
+
+fn record_linked_asset_root(
+    project_root: &Path,
+    entry: &walkdir::DirEntry,
+    linked_asset_roots: &mut Vec<LinkedAssetRoot>,
+    linked_asset_rel_paths: &mut HashSet<String>,
+) {
+    if !entry.path_is_symlink() || !entry.file_type().is_dir() {
+        return;
+    }
+
+    let Ok(rel) = entry.path().strip_prefix(project_root) else {
+        return;
+    };
+    let link_rel_path = rel.to_string_lossy().replace('\\', "/");
+    if !linked_asset_rel_paths.insert(link_rel_path.clone()) {
+        return;
+    }
+    let target_path =
+        dunce::canonicalize(entry.path()).unwrap_or_else(|_| entry.path().to_path_buf());
+    linked_asset_roots.push(LinkedAssetRoot {
+        link_rel_path,
+        target_path,
+    });
+}
+
+fn cached_linked_asset_roots(graph_state: &Arc<Mutex<Option<AssetDb>>>) -> Vec<LinkedAssetRoot> {
+    let guard = match graph_state.lock() {
+        Ok(guard) => guard,
+        Err(error) => {
+            eprintln!(
+                "[AssetDb Watcher] warning: failed to lock ref_graph for linked roots: {}",
+                error
+            );
+            return Vec::new();
+        }
+    };
+
+    let Some(graph) = guard.as_ref() else {
+        return Vec::new();
+    };
+
+    match graph.linked_asset_roots() {
+        Ok(roots) => sort_linked_asset_roots(roots),
+        Err(error) => {
+            eprintln!(
+                "[AssetDb Watcher] warning: failed to load cached linked asset roots: {}",
+                error
+            );
+            Vec::new()
+        }
+    }
+}
+
+fn watch_key(path: &Path) -> PathBuf {
+    dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn linked_watch_keys_for_roots(roots: &[LinkedAssetRoot]) -> HashSet<PathBuf> {
+    roots
+        .iter()
+        .take(MAX_LINKED_ASSET_WATCH_ROOTS)
+        .map(|root| watch_key(&root.target_path))
+        .collect()
+}
+
+fn watch_path_once(
+    os_watcher: &SharedOsWatcher,
+    watched_paths: &SharedWatchedPaths,
+    watch_path: &Path,
+    label: &str,
+) -> Result<bool, String> {
+    let key = watch_key(watch_path);
+    {
+        let mut watched = watched_paths
+            .lock()
+            .map_err(|e| format!("Failed to lock watched paths: {}", e))?;
+        if !watched.insert(key.clone()) {
+            return Ok(false);
+        }
+    }
+
+    let watch_result = os_watcher
+        .lock()
+        .map_err(|e| format!("Failed to lock OS watcher: {}", e))?
+        .watch(watch_path, RecursiveMode::Recursive);
+
+    match watch_result {
+        Ok(()) => Ok(true),
+        Err(error) => {
+            if let Ok(mut watched) = watched_paths.lock() {
+                watched.remove(&key);
+            }
+            Err(format!(
+                "Failed to watch {} {}: {}",
+                label,
+                watch_path.display(),
+                error
+            ))
+        }
+    }
+}
+
+fn install_linked_asset_root_watches(
+    watch_state: &LinkedAssetWatchState,
+    roots: &[LinkedAssetRoot],
+) -> usize {
+    let mut linked_watch_count = 0usize;
+    for linked_root in roots.iter().take(MAX_LINKED_ASSET_WATCH_ROOTS) {
+        match watch_path_once(
+            &watch_state.os_watcher,
+            &watch_state.watched_paths,
+            &linked_root.target_path,
+            "linked asset root",
+        ) {
+            Ok(true) => {
+                if let Ok(mut linked_watched) = watch_state.linked_watched_paths.lock() {
+                    linked_watched.insert(watch_key(&linked_root.target_path));
+                }
+                linked_watch_count += 1;
+                eprintln!(
+                    "[AssetDb Watcher] watching linked asset root: {} -> {}",
+                    linked_root.link_rel_path,
+                    linked_root.target_path.display()
+                );
+            }
+            Ok(false) => {}
+            Err(error) => {
+                eprintln!(
+                    "[AssetDb Watcher] warning: failed to watch linked asset root {} -> {}: {}",
+                    linked_root.link_rel_path,
+                    linked_root.target_path.display(),
+                    error
+                );
+            }
+        }
+    }
+    if roots.len() > MAX_LINKED_ASSET_WATCH_ROOTS {
+        eprintln!(
+            "[AssetDb Watcher] warning: linked asset roots watch limit reached: watching {} of {}",
+            linked_watch_count,
+            roots.len()
+        );
+    }
+    linked_watch_count
+}
+
+fn prune_stale_linked_watch_keys(
+    linked_watched_paths: &SharedWatchedPaths,
+    desired_keys: &HashSet<PathBuf>,
+) -> Vec<PathBuf> {
+    let mut linked_watched = match linked_watched_paths.lock() {
+        Ok(guard) => guard,
+        Err(error) => {
+            eprintln!(
+                "[AssetDb Watcher] warning: failed to lock linked watched paths: {}",
+                error
+            );
+            return Vec::new();
+        }
+    };
+
+    let stale_keys: Vec<PathBuf> = linked_watched
+        .iter()
+        .filter(|key| !desired_keys.contains(*key))
+        .cloned()
+        .collect();
+    for key in &stale_keys {
+        linked_watched.remove(key);
+    }
+    stale_keys
+}
+
+fn uninstall_stale_linked_asset_root_watches(
+    watch_state: &LinkedAssetWatchState,
+    desired_keys: &HashSet<PathBuf>,
+) {
+    let stale_keys = prune_stale_linked_watch_keys(&watch_state.linked_watched_paths, desired_keys);
+
+    for key in stale_keys {
+        let unwatch_result = watch_state
+            .os_watcher
+            .lock()
+            .map_err(|e| format!("Failed to lock OS watcher: {}", e))
+            .and_then(|mut watcher| {
+                watcher.unwatch(&key).map_err(|e| {
+                    format!(
+                        "Failed to unwatch linked asset root {}: {}",
+                        key.display(),
+                        e
+                    )
+                })
+            });
+        if let Err(error) = unwatch_result {
+            eprintln!("[AssetDb Watcher] warning: {}", error);
+        } else {
+            eprintln!(
+                "[AssetDb Watcher] unwatched linked asset root: {}",
+                key.display()
+            );
+        }
+
+        if let Ok(mut watched) = watch_state.watched_paths.lock() {
+            watched.remove(&key);
+        }
+    }
+}
+
+fn sync_linked_asset_root_watches(watch_state: &LinkedAssetWatchState, roots: &[LinkedAssetRoot]) {
+    let desired_keys = linked_watch_keys_for_roots(roots);
+    uninstall_stale_linked_asset_root_watches(watch_state, &desired_keys);
+    install_linked_asset_root_watches(watch_state, roots);
+}
+
+fn persist_linked_asset_roots_if_changed(
+    state: &Arc<Mutex<Option<AssetDb>>>,
+    roots: &[LinkedAssetRoot],
+) -> Result<bool, String> {
+    let mut guard = state.lock().map_err(|e| format!("Lock error: {}", e))?;
+    let Some(graph) = guard.as_mut() else {
+        return Ok(false);
+    };
+
+    let current = sort_linked_asset_roots(graph.linked_asset_roots()?);
+    if current == roots {
+        return Ok(false);
+    }
+
+    let tx = graph
+        .conn
+        .transaction()
+        .map_err(|e| format!("Failed to begin linked asset root update: {}", e))?;
+    db::replace_linked_asset_roots(&tx, roots)?;
+    tx.commit()
+        .map_err(|e| format!("Failed to commit linked asset root update: {}", e))?;
+    Ok(true)
+}
+
+fn refresh_linked_asset_roots(
+    state: &Arc<Mutex<Option<AssetDb>>>,
+    watch_state: Option<&LinkedAssetWatchState>,
+    roots: Vec<LinkedAssetRoot>,
+) {
+    let roots = sort_linked_asset_roots(roots);
+    let changed = match persist_linked_asset_roots_if_changed(state, &roots) {
+        Ok(changed) => changed,
+        Err(error) => {
+            eprintln!(
+                "[AssetDb Watcher] warning: failed to persist linked asset roots: {}",
+                error
+            );
+            true
+        }
+    };
+
+    let Some(watch_state) = watch_state else {
+        return;
+    };
+
+    let roots_changed_for_runtime = watch_state
+        .linked_roots
+        .read()
+        .map(|current| *current != roots)
+        .unwrap_or(true);
+    if !changed && !roots_changed_for_runtime {
+        return;
+    }
+
+    sync_linked_asset_root_watches(watch_state, &roots);
+    if let Ok(mut current) = watch_state.linked_roots.write() {
+        *current = roots;
+    }
 }
 
 fn sleep_interruptible(duration: Duration, stop: &AtomicBool) -> bool {
@@ -870,14 +1230,23 @@ fn event_receiver_loop(
     queue: Arc<DirtyQueue>,
     stop: Arc<AtomicBool>,
     project_root: PathBuf,
+    linked_roots: SharedLinkedAssetRoots,
     activity: Arc<RecentQueueActivityLog>,
 ) {
     eprintln!("[AssetDb Watcher] event receiver thread started");
     while !stop.load(Ordering::Relaxed) {
         match rx.recv_timeout(Duration::from_secs(1)) {
             Ok(Ok(event)) => {
+                let linked_roots_snapshot = linked_roots
+                    .read()
+                    .map(|roots| roots.clone())
+                    .unwrap_or_default();
                 for path in &event.paths {
-                    if let Some((rel, reason)) = to_asset_rel_path_and_reason(&project_root, path) {
+                    for (rel, reason) in to_asset_rel_paths_and_reasons(
+                        &project_root,
+                        path,
+                        linked_roots_snapshot.as_slice(),
+                    ) {
                         if enqueue_with_activity(&queue, &activity, rel.clone(), reason, None) {
                             eprintln!("[AssetDb Watcher] dirty (OS/{:?}): {}", reason, rel);
                         }
@@ -900,8 +1269,17 @@ fn mtime_scanner_loop(
     state: Arc<Mutex<Option<AssetDb>>>,
     project_root: PathBuf,
     activity: Arc<RecentQueueActivityLog>,
+    linked_watch_state: LinkedAssetWatchState,
 ) {
-    mtime_scan_once(&queue, &stop, &state, &project_root, &activity, true);
+    mtime_scan_once_with_linked_watch(
+        &queue,
+        &stop,
+        &state,
+        &project_root,
+        &activity,
+        true,
+        Some(&linked_watch_state),
+    );
 
     let mut mtime_elapsed = Duration::ZERO;
     let mut discovery_elapsed = Duration::ZERO;
@@ -919,13 +1297,14 @@ fn mtime_scanner_loop(
             if discover_new_meta {
                 discovery_elapsed = Duration::ZERO;
             }
-            mtime_scan_once(
+            mtime_scan_once_with_linked_watch(
                 &queue,
                 &stop,
                 &state,
                 &project_root,
                 &activity,
                 discover_new_meta,
+                Some(&linked_watch_state),
             );
         }
     }
@@ -939,6 +1318,26 @@ fn mtime_scan_once(
     activity: &RecentQueueActivityLog,
     discover_new_meta: bool,
 ) {
+    mtime_scan_once_with_linked_watch(
+        queue,
+        stop,
+        state,
+        project_root,
+        activity,
+        discover_new_meta,
+        None,
+    );
+}
+
+fn mtime_scan_once_with_linked_watch(
+    queue: &DirtyQueue,
+    stop: &AtomicBool,
+    state: &Arc<Mutex<Option<AssetDb>>>,
+    project_root: &Path,
+    activity: &RecentQueueActivityLog,
+    discover_new_meta: bool,
+    linked_watch_state: Option<&LinkedAssetWatchState>,
+) {
     mtime_scan_once_with_options(
         queue,
         stop,
@@ -949,6 +1348,7 @@ fn mtime_scan_once(
             discover_new_meta,
             verify_hashes: false,
         },
+        linked_watch_state,
     );
 }
 
@@ -959,6 +1359,7 @@ fn mtime_scan_once_with_options(
     project_root: &Path,
     activity: &RecentQueueActivityLog,
     options: MtimeScanOptions,
+    linked_watch_state: Option<&LinkedAssetWatchState>,
 ) {
     if stop.load(Ordering::Relaxed) {
         return;
@@ -991,7 +1392,7 @@ fn mtime_scan_once_with_options(
         }
     };
 
-    if asset_records.is_empty() && file_records.is_empty() {
+    if asset_records.is_empty() && file_records.is_empty() && !options.discover_new_meta {
         return;
     }
 
@@ -1097,13 +1498,19 @@ fn mtime_scan_once_with_options(
     }
 
     let scan_roots = ["Assets", "Packages"];
+    let mut linked_asset_roots = Vec::new();
+    let mut linked_asset_rel_paths = HashSet::new();
     for root_name in &scan_roots {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
         let root_path = project_root.join(root_name);
         if !root_path.is_dir() {
             continue;
         }
 
         let walker = walkdir::WalkDir::new(&root_path)
+            .follow_links(true)
             .into_iter()
             .filter_entry(|entry| {
                 if entry.file_type().is_dir() {
@@ -1120,6 +1527,13 @@ fn mtime_scan_once_with_options(
             if stop.load(Ordering::Relaxed) {
                 break;
             }
+
+            record_linked_asset_root(
+                project_root,
+                &entry,
+                &mut linked_asset_roots,
+                &mut linked_asset_rel_paths,
+            );
 
             if !entry.file_type().is_file() {
                 continue;
@@ -1154,6 +1568,11 @@ fn mtime_scan_once_with_options(
             }
         }
     }
+
+    if stop.load(Ordering::Relaxed) {
+        return;
+    }
+    refresh_linked_asset_roots(state, linked_watch_state, linked_asset_roots);
 }
 
 fn queue_summary_logger_loop(
@@ -1244,23 +1663,69 @@ pub fn reconcile_loaded_db(
     project_root: &Path,
     graph: AssetDb,
 ) -> Result<(AssetDb, StartupReconcileStats), String> {
-    let state = Arc::new(Mutex::new(Some(graph)));
-    let stats = reconcile_graph_state_with_options(
+    let stop = AtomicBool::new(false);
+    reconcile_loaded_db_with_options(
         project_root,
-        state.clone(),
+        graph,
+        &stop,
         MtimeScanOptions {
             discover_new_meta: true,
             verify_hashes: true,
         },
-    )?;
+    )
+}
+
+pub fn reconcile_loaded_db_light(
+    project_root: &Path,
+    graph: AssetDb,
+) -> Result<(AssetDb, StartupReconcileStats), String> {
+    let stop = AtomicBool::new(false);
+    reconcile_loaded_db_with_options(
+        project_root,
+        graph,
+        &stop,
+        MtimeScanOptions {
+            discover_new_meta: false,
+            verify_hashes: false,
+        },
+    )
+}
+
+pub fn reconcile_loaded_db_with_cancel(
+    project_root: &Path,
+    graph: AssetDb,
+    stop: &AtomicBool,
+) -> Result<(AssetDb, StartupReconcileStats), String> {
+    reconcile_loaded_db_with_options(
+        project_root,
+        graph,
+        stop,
+        MtimeScanOptions {
+            discover_new_meta: true,
+            verify_hashes: true,
+        },
+    )
+}
+
+fn reconcile_loaded_db_with_options(
+    project_root: &Path,
+    graph: AssetDb,
+    stop: &AtomicBool,
+    options: MtimeScanOptions,
+) -> Result<(AssetDb, StartupReconcileStats), String> {
+    let state = Arc::new(Mutex::new(Some(graph)));
+    let stats = reconcile_graph_state_with_options(project_root, state.clone(), stop, options)?;
 
     let mut guard = state.lock().map_err(|e| format!("Lock error: {}", e))?;
     let graph = guard
         .take()
         .ok_or_else(|| "AssetDb disappeared during startup reconcile".to_string())?;
-    eprintln!(
-        "[AssetDb Watcher] startup reconcile complete: queued={}, processed={}, failed={}",
-        stats.queued, stats.processed, stats.failed
+    tracing::info!(
+        log_module = "AssetDb Watcher",
+        "startup reconcile complete: queued={}, processed={}, failed={}",
+        stats.queued,
+        stats.processed,
+        stats.failed
     );
     Ok((graph, stats))
 }
@@ -1270,9 +1735,20 @@ pub fn reconcile_graph_state(
     state: Arc<Mutex<Option<AssetDb>>>,
     verify_hashes: bool,
 ) -> Result<StartupReconcileStats, String> {
+    let stop = AtomicBool::new(false);
+    reconcile_graph_state_with_cancel(project_root, state, &stop, verify_hashes)
+}
+
+pub fn reconcile_graph_state_with_cancel(
+    project_root: &Path,
+    state: Arc<Mutex<Option<AssetDb>>>,
+    stop: &AtomicBool,
+    verify_hashes: bool,
+) -> Result<StartupReconcileStats, String> {
     reconcile_graph_state_with_options(
         project_root,
         state,
+        stop,
         MtimeScanOptions {
             discover_new_meta: true,
             verify_hashes,
@@ -1283,19 +1759,23 @@ pub fn reconcile_graph_state(
 fn reconcile_graph_state_with_options(
     project_root: &Path,
     state: Arc<Mutex<Option<AssetDb>>>,
+    stop: &AtomicBool,
     options: MtimeScanOptions,
 ) -> Result<StartupReconcileStats, String> {
-    let stop = AtomicBool::new(false);
     let queue = DirtyQueue::new();
     let activity = RecentQueueActivityLog::new();
     let mut stats = StartupReconcileStats::default();
 
-    mtime_scan_once_with_options(&queue, &stop, &state, project_root, &activity, options);
+    mtime_scan_once_with_options(&queue, stop, &state, project_root, &activity, options, None);
     stats.queued = queue.len() as u64;
 
     while let Some(rel_path) = queue.try_dequeue() {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+
         stats.processed += 1;
-        match process_dirty_asset(&rel_path, project_root, &state, &stop) {
+        match process_dirty_asset(&rel_path, project_root, &state, stop) {
             Ok(cascade_paths) => {
                 for request in cascade_paths {
                     if enqueue_with_activity(
@@ -1328,7 +1808,7 @@ pub struct AssetDbWatcher {
     current_file: CurrentFileSlot,
     recent_activity: Arc<RecentQueueActivityLog>,
     tuning: Arc<WatcherTuning>,
-    os_watcher: Option<RecommendedWatcher>,
+    os_watcher: Option<SharedOsWatcher>,
     threads: Vec<JoinHandle<()>>,
 }
 
@@ -1345,27 +1825,49 @@ impl AssetDbWatcher {
         let mut threads = Vec::new();
 
         let (tx, rx) = std::sync::mpsc::channel();
-        let mut os_watcher = RecommendedWatcher::new(tx, Config::default())
-            .map_err(|e| format!("Failed to create file watcher: {}", e))?;
+        let os_watcher = Arc::new(Mutex::new(
+            RecommendedWatcher::new(tx, Config::default())
+                .map_err(|e| format!("Failed to create file watcher: {}", e))?,
+        ));
+        let linked_roots = cached_linked_asset_roots(&graph_state);
+        let watched_paths: SharedWatchedPaths = Arc::new(Mutex::new(HashSet::new()));
+        let linked_watched_paths: SharedWatchedPaths = Arc::new(Mutex::new(HashSet::new()));
 
         for dir_name in &["Assets", "Packages"] {
             let watch_path = project_root.join(dir_name);
             if watch_path.is_dir() {
-                os_watcher
-                    .watch(&watch_path, RecursiveMode::Recursive)
-                    .map_err(|e| format!("Failed to watch {}: {}", dir_name, e))?;
-                eprintln!("[AssetDb Watcher] watching: {}", watch_path.display());
+                match watch_path_once(&os_watcher, &watched_paths, &watch_path, dir_name) {
+                    Ok(true) => {
+                        eprintln!("[AssetDb Watcher] watching: {}", watch_path.display());
+                    }
+                    Ok(false) => {}
+                    Err(error) => return Err(error),
+                }
             }
         }
+
+        let linked_roots = Arc::new(RwLock::new(linked_roots));
+        let linked_watch_state = LinkedAssetWatchState {
+            os_watcher: os_watcher.clone(),
+            watched_paths: watched_paths.clone(),
+            linked_watched_paths: linked_watched_paths.clone(),
+            linked_roots: linked_roots.clone(),
+        };
+        let initial_linked_roots = linked_roots
+            .read()
+            .map(|roots| roots.clone())
+            .unwrap_or_default();
+        install_linked_asset_root_watches(&linked_watch_state, &initial_linked_roots);
 
         let queue_ev = dirty_queue.clone();
         let stop_ev = stop.clone();
         let root_ev = project_root.clone();
+        let linked_roots_ev = linked_roots.clone();
         let activity_ev = recent_activity.clone();
         let event_thread = std::thread::Builder::new()
             .name("refgraph-events".into())
             .spawn(move || {
-                event_receiver_loop(rx, queue_ev, stop_ev, root_ev, activity_ev);
+                event_receiver_loop(rx, queue_ev, stop_ev, root_ev, linked_roots_ev, activity_ev);
             })
             .map_err(|e| format!("Failed to spawn event thread: {}", e))?;
         threads.push(event_thread);
@@ -1413,10 +1915,18 @@ impl AssetDbWatcher {
         let state_mt = graph_state.clone();
         let root_mt = project_root.clone();
         let activity_mt = recent_activity.clone();
+        let linked_watch_state_mt = linked_watch_state.clone();
         let mtime_thread = std::thread::Builder::new()
             .name("refgraph-mtime".into())
             .spawn(move || {
-                mtime_scanner_loop(queue_mt, stop_mt, state_mt, root_mt, activity_mt);
+                mtime_scanner_loop(
+                    queue_mt,
+                    stop_mt,
+                    state_mt,
+                    root_mt,
+                    activity_mt,
+                    linked_watch_state_mt,
+                );
             })
             .map_err(|e| format!("Failed to spawn mtime scanner thread: {}", e))?;
         threads.push(mtime_thread);
@@ -1496,6 +2006,26 @@ mod tests {
     use super::*;
     use uuid::Uuid;
 
+    #[cfg(unix)]
+    fn create_dir_symlink(source: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(source, link)
+    }
+
+    #[cfg(windows)]
+    fn create_dir_symlink(source: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::windows::fs::symlink_dir(source, link)
+    }
+
+    fn create_dir_symlink_or_skip(source: &Path, link: &Path) -> bool {
+        match create_dir_symlink(source, link) {
+            Ok(()) => true,
+            Err(error) => {
+                eprintln!("skipping symlink test; failed to create directory symlink: {error}");
+                false
+            }
+        }
+    }
+
     fn write_asset(root: &Path, rel_path: &str, content: &[u8], guid_hex: &str) {
         let abs_path = root.join(rel_path);
         if let Some(parent) = abs_path.parent() {
@@ -1513,6 +2043,240 @@ mod tests {
         let mut graph = AssetDb::open(root).expect("open asset db");
         graph.full_scan(|_| {}).expect("scan asset db");
         graph
+    }
+
+    #[test]
+    fn watcher_maps_external_events_from_symlinked_asset_root() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let root = temp.path().join("project");
+        let external = temp.path().join("shared-assets");
+        std::fs::create_dir_all(root.join("Assets")).expect("create assets dir");
+        std::fs::create_dir_all(root.join("Packages")).expect("create packages dir");
+        std::fs::create_dir_all(&external).expect("create external target");
+        std::fs::write(external.join("Hero.prefab.meta"), b"fileFormatVersion: 2\n")
+            .expect("write linked meta");
+
+        if !create_dir_symlink_or_skip(&external, &root.join("Assets/Linked")) {
+            return;
+        }
+
+        let linked_roots =
+            sort_linked_asset_roots(scanner::scan_directory(&root).linked_asset_roots);
+        assert!(linked_roots
+            .iter()
+            .any(|entry| entry.link_rel_path == "Assets/Linked"));
+
+        let mapped = to_asset_rel_paths_and_reasons(
+            &root,
+            &external.join("Hero.prefab.meta"),
+            linked_roots.as_slice(),
+        );
+        assert_eq!(
+            mapped,
+            vec![(
+                "Assets/Linked/Hero.prefab".to_string(),
+                QueueEnqueueReason::MetaChanged
+            )]
+        );
+    }
+
+    #[test]
+    fn watcher_maps_external_events_to_each_symlinked_asset_alias() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let root = temp.path().join("project");
+        let external = temp.path().join("shared-assets");
+        std::fs::create_dir_all(root.join("Assets")).expect("create assets dir");
+        std::fs::create_dir_all(root.join("Packages")).expect("create packages dir");
+        std::fs::create_dir_all(&external).expect("create external target");
+        std::fs::write(external.join("Hero.prefab.meta"), b"fileFormatVersion: 2\n")
+            .expect("write linked meta");
+
+        if !create_dir_symlink_or_skip(&external, &root.join("Assets/LinkedA")) {
+            return;
+        }
+        if !create_dir_symlink_or_skip(&external, &root.join("Packages/LinkedB")) {
+            return;
+        }
+
+        let linked_roots =
+            sort_linked_asset_roots(scanner::scan_directory(&root).linked_asset_roots);
+        let mapped = to_asset_rel_paths_and_reasons(
+            &root,
+            &external.join("Hero.prefab.meta"),
+            linked_roots.as_slice(),
+        );
+        assert_eq!(
+            mapped,
+            vec![
+                (
+                    "Assets/LinkedA/Hero.prefab".to_string(),
+                    QueueEnqueueReason::MetaChanged
+                ),
+                (
+                    "Packages/LinkedB/Hero.prefab".to_string(),
+                    QueueEnqueueReason::MetaChanged
+                )
+            ]
+        );
+    }
+
+    #[test]
+    fn watcher_loads_linked_roots_from_asset_db_cache() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let root = temp.path().join("project");
+        let external = temp.path().join("shared-assets");
+        std::fs::create_dir_all(root.join("Assets")).expect("create assets dir");
+        std::fs::create_dir_all(root.join("Packages")).expect("create packages dir");
+        std::fs::create_dir_all(&external).expect("create external target");
+        std::fs::write(
+            external.join("Hero.prefab"),
+            b"%YAML 1.1\n--- !u!1 &1000\nGameObject:\n  m_Name: Hero\n",
+        )
+        .expect("write linked prefab");
+        std::fs::write(
+            external.join("Hero.prefab.meta"),
+            b"fileFormatVersion: 2\nguid: 22222222222222222222222222222222\n",
+        )
+        .expect("write linked prefab meta");
+
+        if !create_dir_symlink_or_skip(&external, &root.join("Assets/Linked")) {
+            return;
+        }
+
+        let mut graph = AssetDb::open(&root).expect("open asset db");
+        graph.full_scan(|_| {}).expect("scan asset db");
+        let state = Arc::new(Mutex::new(Some(graph)));
+
+        let linked_roots = cached_linked_asset_roots(&state);
+        assert_eq!(linked_roots.len(), 1);
+        assert_eq!(linked_roots[0].link_rel_path, "Assets/Linked");
+        assert_eq!(
+            linked_roots[0].target_path,
+            dunce::canonicalize(&external).expect("canonical external target")
+        );
+    }
+
+    #[test]
+    fn linked_watch_prune_removes_stale_keys_and_keeps_active_keys() {
+        let current: SharedWatchedPaths = Arc::new(Mutex::new(HashSet::from([
+            PathBuf::from("C:/shared-a"),
+            PathBuf::from("C:/shared-b"),
+            PathBuf::from("C:/shared-c"),
+        ])));
+        let desired = HashSet::from([PathBuf::from("C:/shared-b"), PathBuf::from("C:/shared-c")]);
+
+        let stale = prune_stale_linked_watch_keys(&current, &desired);
+
+        assert_eq!(stale, vec![PathBuf::from("C:/shared-a")]);
+        let remaining = current.lock().expect("lock linked watched paths");
+        assert!(!remaining.contains(&PathBuf::from("C:/shared-a")));
+        assert!(remaining.contains(&PathBuf::from("C:/shared-b")));
+        assert!(remaining.contains(&PathBuf::from("C:/shared-c")));
+    }
+
+    #[test]
+    fn mtime_discovery_persists_new_symlinked_asset_root() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let root = temp.path().join("project");
+        let external = temp.path().join("shared-assets");
+        std::fs::create_dir_all(root.join("Assets/Base")).expect("create base assets dir");
+        std::fs::create_dir_all(root.join("Packages")).expect("create packages dir");
+        std::fs::create_dir_all(&external).expect("create external target");
+        write_asset(
+            &root,
+            "Assets/Base/Existing.prefab",
+            b"%YAML 1.1\n--- !u!1 &1000\nGameObject:\n  m_Name: Existing\n",
+            "33333333333333333333333333333333",
+        );
+
+        let graph = scan_test_graph(&root);
+        let state = Arc::new(Mutex::new(Some(graph)));
+        assert!(cached_linked_asset_roots(&state).is_empty());
+
+        std::fs::write(
+            external.join("Hero.prefab"),
+            b"%YAML 1.1\n--- !u!1 &1000\nGameObject:\n  m_Name: Hero\n",
+        )
+        .expect("write linked prefab");
+        std::fs::write(
+            external.join("Hero.prefab.meta"),
+            b"fileFormatVersion: 2\nguid: 44444444444444444444444444444444\n",
+        )
+        .expect("write linked prefab meta");
+
+        if !create_dir_symlink_or_skip(&external, &root.join("Assets/Linked")) {
+            return;
+        }
+
+        let queue = DirtyQueue::new();
+        let stop = AtomicBool::new(false);
+        let activity = RecentQueueActivityLog::new();
+        mtime_scan_once(&queue, &stop, &state, &root, &activity, true);
+
+        let linked_roots = cached_linked_asset_roots(&state);
+        assert_eq!(linked_roots.len(), 1);
+        assert_eq!(linked_roots[0].link_rel_path, "Assets/Linked");
+        assert_eq!(
+            linked_roots[0].target_path,
+            dunce::canonicalize(&external).expect("canonical external target")
+        );
+        let mut queued_paths = Vec::new();
+        while let Some(path) = queue.try_dequeue() {
+            queued_paths.push(path);
+        }
+        assert!(queued_paths
+            .iter()
+            .any(|path| path == "Assets/Linked/Hero.prefab"));
+    }
+
+    #[test]
+    fn mtime_discovery_finds_linked_asset_root_after_empty_scan() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let root = temp.path().join("project");
+        let external = temp.path().join("shared-assets");
+        std::fs::create_dir_all(root.join("Assets")).expect("create assets dir");
+        std::fs::create_dir_all(root.join("Packages")).expect("create packages dir");
+        std::fs::create_dir_all(&external).expect("create external target");
+
+        let graph = scan_test_graph(&root);
+        let state = Arc::new(Mutex::new(Some(graph)));
+        assert!(cached_linked_asset_roots(&state).is_empty());
+
+        std::fs::write(
+            external.join("Hero.prefab"),
+            b"%YAML 1.1\n--- !u!1 &1000\nGameObject:\n  m_Name: Hero\n",
+        )
+        .expect("write linked prefab");
+        std::fs::write(
+            external.join("Hero.prefab.meta"),
+            b"fileFormatVersion: 2\nguid: 55555555555555555555555555555555\n",
+        )
+        .expect("write linked prefab meta");
+
+        if !create_dir_symlink_or_skip(&external, &root.join("Assets/Linked")) {
+            return;
+        }
+
+        let queue = DirtyQueue::new();
+        let stop = AtomicBool::new(false);
+        let activity = RecentQueueActivityLog::new();
+        mtime_scan_once(&queue, &stop, &state, &root, &activity, true);
+
+        let linked_roots = cached_linked_asset_roots(&state);
+        assert_eq!(linked_roots.len(), 1);
+        assert_eq!(linked_roots[0].link_rel_path, "Assets/Linked");
+        assert_eq!(
+            linked_roots[0].target_path,
+            dunce::canonicalize(&external).expect("canonical external target")
+        );
+
+        let mut queued_paths = Vec::new();
+        while let Some(path) = queue.try_dequeue() {
+            queued_paths.push(path);
+        }
+        assert!(queued_paths
+            .iter()
+            .any(|path| path == "Assets/Linked/Hero.prefab"));
     }
 
     #[test]
@@ -1592,6 +2356,34 @@ mod tests {
         assert_eq!(
             queue.dequeue(&AtomicBool::new(false)),
             Some(asset_path.to_string())
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn light_reconcile_skips_new_meta_discovery() {
+        let root =
+            std::env::temp_dir().join(format!("locus-watcher-light-reconcile-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("Assets/Game")).expect("create temp assets");
+
+        let asset_path = "Assets/Game/New.prefab";
+        std::fs::write(root.join(asset_path), b"%YAML 1.1\n").expect("write asset");
+        std::fs::write(
+            root.join(format!("{}.meta", asset_path)),
+            b"fileFormatVersion: 2\nguid: 33333333333333333333333333333333\n",
+        )
+        .expect("write meta");
+
+        let graph = AssetDb::open(&root).expect("open asset db");
+        let (graph, stats) =
+            reconcile_loaded_db_light(&root, graph).expect("light reconcile asset db");
+
+        assert_eq!(stats.queued, 0);
+        assert_eq!(stats.processed, 0);
+        assert_eq!(
+            db::resolve_guid_by_path(&graph.conn, asset_path).unwrap(),
+            None
         );
 
         let _ = std::fs::remove_dir_all(&root);

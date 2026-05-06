@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceConfig {
@@ -10,6 +12,53 @@ pub struct WorkspaceConfig {
 pub struct Workspace {
     pub path: tokio::sync::RwLock<String>,
     pub workspace_id: tokio::sync::RwLock<Option<String>>,
+    generation: AtomicU64,
+    generation_lock: Mutex<()>,
+}
+
+impl Workspace {
+    pub fn new(path: String, workspace_id: Option<String>) -> Self {
+        Self {
+            path: tokio::sync::RwLock::new(path),
+            workspace_id: tokio::sync::RwLock::new(workspace_id),
+            generation: AtomicU64::new(0),
+            generation_lock: Mutex::new(()),
+        }
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
+    pub fn bump_generation(&self) -> u64 {
+        self.generation.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    pub fn lock_generation(&self) -> Result<WorkspaceGenerationGuard<'_>, String> {
+        let guard = self
+            .generation_lock
+            .lock()
+            .map_err(|e| format!("Workspace generation lock error: {}", e))?;
+        Ok(WorkspaceGenerationGuard {
+            workspace: self,
+            _guard: guard,
+        })
+    }
+}
+
+pub struct WorkspaceGenerationGuard<'a> {
+    workspace: &'a Workspace,
+    _guard: MutexGuard<'a, ()>,
+}
+
+impl WorkspaceGenerationGuard<'_> {
+    pub fn is_current(&self, generation: u64) -> bool {
+        self.workspace.generation() == generation
+    }
+
+    pub fn bump_generation(&self) -> u64 {
+        self.workspace.bump_generation()
+    }
 }
 
 pub fn workspace_config_path(dir: &str) -> std::path::PathBuf {
@@ -123,7 +172,7 @@ pub fn load_or_create_workspace(dir: &str) -> Result<String, String> {
 mod tests {
     use std::fs;
 
-    use super::{generated_workspace_id, WorkspaceConfig};
+    use super::{generated_workspace_id, Workspace, WorkspaceConfig};
 
     fn write_project_settings(root: &tempfile::TempDir, body: &str) {
         let settings_dir = root.path().join("ProjectSettings");
@@ -156,6 +205,14 @@ mod tests {
         );
         assert!(value.get("workspaceId").is_none());
         assert!(value.get("memory").is_none());
+    }
+
+    #[test]
+    fn workspace_generation_advances_on_bump() {
+        let workspace = Workspace::new("A".to_string(), Some("workspace-a".to_string()));
+        let initial = workspace.generation();
+        assert_eq!(workspace.bump_generation(), initial + 1);
+        assert_eq!(workspace.generation(), initial + 1);
     }
 
     #[test]

@@ -1,9 +1,11 @@
 import { ipcInvoke } from "./ipc";
 import type {
+  AssetDbLightStatus,
   AssetDbOverview,
   AssetRiskKind,
   AssetSearchResult,
   AssetPreviewPayload,
+  RefGraphScanStartResult,
   ScanStats,
   SemanticTargetInspector,
   WatcherTuning,
@@ -11,6 +13,10 @@ import type {
 
 export function assetDbOverview(): Promise<AssetDbOverview> {
   return ipcInvoke<AssetDbOverview>("asset_db_overview");
+}
+
+export function assetDbLightStatus(): Promise<AssetDbLightStatus> {
+  return ipcInvoke<AssetDbLightStatus>("asset_db_light_status");
 }
 
 export function assetRiskReport(kind: AssetRiskKind): Promise<string> {
@@ -23,6 +29,10 @@ export function assetDbStatus(): Promise<ScanStats | null> {
 
 export function assetDbScan(): Promise<ScanStats> {
   return ipcInvoke<ScanStats>("ref_graph_scan");
+}
+
+export function assetDbScanStart(): Promise<RefGraphScanStartResult> {
+  return ipcInvoke<RefGraphScanStartResult>("ref_graph_scan_start");
 }
 
 /**

@@ -1,5 +1,9 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use walkdir::WalkDir;
+
+use super::types::LinkedAssetRoot;
 
 pub(crate) const IGNORED_DIRS: &[&str] = &[
     "Library",
@@ -31,6 +35,7 @@ pub struct DirSnapshot {
     pub meta_files: Vec<FileEntry>,
     pub yaml_asset_files: Vec<FileEntry>,
     pub dirs_scanned: u64,
+    pub linked_asset_roots: Vec<LinkedAssetRoot>,
 }
 
 fn is_ignored_dir(name: &str) -> bool {
@@ -46,28 +51,61 @@ pub(crate) fn get_mtime_ns(metadata: &std::fs::Metadata) -> u64 {
         .unwrap_or(0)
 }
 
+#[allow(dead_code)]
 pub fn scan_directory(project_root: &Path) -> DirSnapshot {
+    let cancel = AtomicBool::new(false);
+    scan_directory_with_cancel(project_root, &cancel)
+}
+
+pub fn scan_directory_with_cancel(project_root: &Path, cancel: &AtomicBool) -> DirSnapshot {
     let scan_roots = ["Assets", "Packages"];
     let mut meta_files = Vec::new();
     let mut yaml_asset_files = Vec::new();
     let mut dirs_scanned = 0u64;
+    let mut linked_asset_roots = Vec::new();
+    let mut linked_asset_rel_paths = HashSet::new();
 
     for root_name in &scan_roots {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+
         let root_path = project_root.join(root_name);
         if !root_path.is_dir() {
             continue;
         }
 
-        let walker = WalkDir::new(&root_path).into_iter().filter_entry(|entry| {
-            if entry.file_type().is_dir() {
-                let name = entry.file_name().to_string_lossy();
-                !is_ignored_dir(&name)
-            } else {
-                true
-            }
-        });
+        let walker = WalkDir::new(&root_path)
+            .follow_links(true)
+            .into_iter()
+            .filter_entry(|entry| {
+                if entry.file_type().is_dir() {
+                    let name = entry.file_name().to_string_lossy();
+                    !is_ignored_dir(&name)
+                } else {
+                    true
+                }
+            });
 
         for entry in walker.filter_map(|e| e.ok()) {
+            if cancel.load(Ordering::Relaxed) {
+                break;
+            }
+
+            if entry.path_is_symlink() && entry.file_type().is_dir() {
+                if let Ok(rel) = entry.path().strip_prefix(project_root) {
+                    let link_rel_path = rel.to_string_lossy().replace('\\', "/");
+                    if linked_asset_rel_paths.insert(link_rel_path.clone()) {
+                        let target_path = dunce::canonicalize(entry.path())
+                            .unwrap_or_else(|_| entry.path().to_path_buf());
+                        linked_asset_roots.push(LinkedAssetRoot {
+                            link_rel_path,
+                            target_path,
+                        });
+                    }
+                }
+            }
+
             if entry.file_type().is_dir() {
                 dirs_scanned += 1;
                 continue;
@@ -110,5 +148,6 @@ pub fn scan_directory(project_root: &Path) -> DirSnapshot {
         meta_files,
         yaml_asset_files,
         dirs_scanned,
+        linked_asset_roots,
     }
 }

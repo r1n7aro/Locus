@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tauri::webview::PageLoadEvent;
-use tauri::{Manager, WindowEvent};
+use tauri::{Emitter, Manager, WindowEvent};
 
 mod agent;
 pub mod asset_db;
@@ -298,10 +298,7 @@ pub fn run() {
             startup_for_setup.mark("setup_workspace_ready");
 
             let initial_working_dir_copy = initial_working_dir.clone();
-            let workspace = Arc::new(Workspace {
-                path: tokio::sync::RwLock::new(initial_working_dir),
-                workspace_id: tokio::sync::RwLock::new(initial_workspace_id),
-            });
+            let workspace = Arc::new(Workspace::new(initial_working_dir, initial_workspace_id));
 
             let mut app_agent_dir_candidates = vec![
                 std::path::PathBuf::from("../agent"), // dev: src-tauri/../agent
@@ -518,6 +515,8 @@ pub fn run() {
             let knowledge_watcher_handle: KnowledgeFsWatcherHandle =
                 Arc::new(std::sync::Mutex::new(None));
             let watcher_tuning = Arc::new(crate::asset_db::watcher::WatcherTuning::new());
+            let ref_graph_scan_task_state = commands::RefGraphScanTaskState::new();
+            let asset_reconcile_task_state = commands::asset::AssetDbReconcileTaskState::new();
 
             if ref_graph_state.0.lock().unwrap().is_some() {
                 let graph_arc = ref_graph_state.0.clone();
@@ -535,28 +534,78 @@ pub fn run() {
 
             if let Some((project_root, graph_state)) = startup_ref_graph_reconcile.take() {
                 let startup_for_reconcile = startup_for_setup.clone();
+                let workspace_generation = workspace.generation();
+                let registration = asset_reconcile_task_state.register(
+                    project_root.display().to_string(),
+                    workspace_generation,
+                );
+                let cancel_token = registration.cancel_token();
+                scan_phase_state.set(Some(asset_db::types::ScanPhase::Reconcile {
+                    verify_hashes: true,
+                }));
+                let app_handle_for_reconcile = app.handle().clone();
+                let scan_phase_state_for_reconcile = scan_phase_state.clone();
+                let workspace_for_reconcile = workspace.clone();
                 tauri::async_runtime::spawn_blocking(move || {
+                    let _registration = registration;
                     startup_for_reconcile.mark("asset_reconcile_task_start");
                     let started_at = Instant::now();
-                    match asset_db::watcher::reconcile_graph_state(
+                    match asset_db::watcher::reconcile_graph_state_with_cancel(
                         &project_root,
                         graph_state,
+                        &cancel_token,
                         true,
                     ) {
                         Ok(stats) => {
-                            eprintln!(
-                                "[Locus] existing ref_graph DB reconciled in background: queued={}, processed={}, failed={}, elapsed={}ms",
-                                stats.queued,
-                                stats.processed,
-                                stats.failed,
-                                started_at.elapsed().as_millis()
-                            );
+                            if cancel_token.load(std::sync::atomic::Ordering::Relaxed)
+                                || workspace_for_reconcile.generation() != workspace_generation
+                            {
+                                eprintln!(
+                                    "[Locus] existing ref_graph DB background reconcile cancelled: elapsed={}ms",
+                                    started_at.elapsed().as_millis()
+                                );
+                            } else {
+                                tracing::info!(
+                                    log_module = "Locus",
+                                    "existing ref_graph DB reconciled in background: queued={}, processed={}, failed={}, elapsed={}ms",
+                                    stats.queued,
+                                    stats.processed,
+                                    stats.failed,
+                                    started_at.elapsed().as_millis()
+                                );
+                                let phase = asset_db::types::ScanPhase::ReconcileDone;
+                                let _ = app_handle_for_reconcile.emit("ref-graph-scan", &phase);
+                                if scan_phase_state_for_reconcile
+                                    .snapshot()
+                                    .as_ref()
+                                    .map(|phase| {
+                                        matches!(phase, asset_db::types::ScanPhase::Reconcile { .. })
+                                    })
+                                    .unwrap_or(false)
+                                {
+                                    scan_phase_state_for_reconcile.clear();
+                                }
+                            }
                         }
                         Err(err) => {
                             eprintln!(
                                 "[Locus] existing ref_graph DB background reconcile failed: {}",
                                 err
                             );
+                            if !cancel_token.load(std::sync::atomic::Ordering::Relaxed)
+                                && workspace_for_reconcile.generation() == workspace_generation
+                            {
+                                let phase = asset_db::types::ScanPhase::Error {
+                                    error: crate::error::AppError::new(
+                                        "ref_graph.rescan_required.reconcile_failed",
+                                        "Persisted asset database could not be verified. Run a rescan to rebuild it.",
+                                    )
+                                    .detail(err)
+                                    .retryable(true),
+                                };
+                                let _ = app_handle_for_reconcile.emit("ref-graph-scan", &phase);
+                                scan_phase_state_for_reconcile.set(Some(phase));
+                            }
                         }
                     }
                     startup_for_reconcile.mark("asset_reconcile_task_done");
@@ -610,6 +659,8 @@ pub fn run() {
             app.manage(watcher_handle);
             app.manage(knowledge_watcher_handle);
             app.manage(crate::asset_db::watcher::WatcherTuningState(watcher_tuning));
+            app.manage(ref_graph_scan_task_state);
+            app.manage(asset_reconcile_task_state);
             app.manage(last_scan_info_state);
             app.manage(scan_phase_state);
             app.manage(preview_cache);
@@ -768,7 +819,9 @@ pub fn run() {
             commands::open_unity_scene_object_inspector,
             commands::ref_graph_status,
             commands::ref_graph_scan,
+            commands::ref_graph_scan_start,
             commands::asset_db_overview,
+            commands::asset_db_light_status,
             commands::asset_risk_report,
             commands::get_watcher_tuning,
             commands::set_watcher_tuning,

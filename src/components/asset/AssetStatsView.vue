@@ -230,6 +230,17 @@ function buildLiveScanProgress(phase: AssetDbScanEvent): LiveScanProgress | null
         total: null,
         indeterminate: true,
       };
+    case "reconcile":
+      return {
+        stageLabel: t("asset.db.scanPhase.reconcile"),
+        summaryLabel: t("chat.assetDb.scanning.reconcile"),
+        heroValue: fmtStageStep(4),
+        heroLabel: t("asset.db.scanPhase.label"),
+        progressRatio: null,
+        completed: null,
+        total: null,
+        indeterminate: true,
+      };
     default:
       return null;
   }
@@ -298,7 +309,7 @@ const isScanning = computed(() => statusKey.value === "scanning");
 
 const liveScanProgress = computed(() => {
   const phase = props.overview?.currentScanPhase;
-  if (!phase || phase.phase === "done" || phase.phase === "error") return null;
+  if (!phase || phase.phase === "done" || phase.phase === "reconcileDone" || phase.phase === "error") return null;
   return buildLiveScanProgress(phase);
 });
 

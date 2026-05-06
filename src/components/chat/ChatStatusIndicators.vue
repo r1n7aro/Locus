@@ -56,9 +56,15 @@ const emit = defineEmits<{
 
 const activePopover = ref<StatusId | null>(null);
 
+function isAssetDbRunningPhase(phase: AssetDbScanEvent | null | undefined): boolean {
+  return phase != null
+    && phase.phase !== "done"
+    && phase.phase !== "reconcileDone"
+    && phase.phase !== "error";
+}
+
 const isScanning = computed(() => {
-  const p = props.scanPhase;
-  return p != null && p.phase !== "done" && p.phase !== "error";
+  return isAssetDbRunningPhase(props.scanPhase);
 });
 
 const scanError = computed(() => {
@@ -74,6 +80,8 @@ const scanLabel = computed(() => {
     case "metaParse": return t("chat.assetDb.scanning.metaParse", p.completed, p.total);
     case "yamlParse": return t("chat.assetDb.scanning.yamlParse", p.completed, p.total);
     case "dbWrite": return t("chat.assetDb.scanning.dbWrite");
+    case "reconcile": return t("chat.assetDb.scanning.reconcile");
+    case "reconcileDone": return "";
     case "done": return "";
     case "error": return t("chat.assetDb.scanning.error", p.error.message);
   }

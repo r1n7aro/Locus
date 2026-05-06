@@ -20,7 +20,7 @@ import { useUiStore } from "../stores/ui";
 import { setWorkingDir, getWorkingDir } from "../services/project";
 import { checkUnityPlugin, installUnityPlugin } from "../services/unity";
 import { gitCheckUserConfig, gitInitUnity, gitProbe, gitSetUserConfig } from "../services/git";
-import { assetDbScan } from "../services/asset";
+import { assetDbScanStart } from "../services/asset";
 import BaseDropdown from "./ui/BaseDropdown.vue";
 import BaseSegmented from "./ui/BaseSegmented.vue";
 import GitMissingHelp from "./git/GitMissingHelp.vue";
@@ -426,9 +426,11 @@ async function startScan() {
       if (e.payload.phase === "done") {
         scanStats.value = e.payload.stats;
         scanDone.value = true;
+      } else if (e.payload.phase === "reconcileDone") {
+        scanPhase.value = null;
       }
     });
-    await assetDbScan();
+    await assetDbScanStart();
   } catch (e) {
     scanPhase.value = { phase: "error", error: normalizeAppError(e) };
   }
@@ -466,6 +468,8 @@ function scanProgressText(): string {
     case "metaParse": return t("chat.assetDb.scanning.metaParse", scanPhase.value.completed, scanPhase.value.total);
     case "yamlParse": return t("chat.assetDb.scanning.yamlParse", scanPhase.value.completed, scanPhase.value.total);
     case "dbWrite": return t("chat.assetDb.scanning.dbWrite");
+    case "reconcile": return t("chat.assetDb.scanning.reconcile");
+    case "reconcileDone": return "";
     case "done": return t("onboarding.scan.complete", scanPhase.value.stats.nodesAdded, scanPhase.value.stats.edgesAdded);
     case "error": return t("chat.assetDb.scanning.error", scanPhase.value.error.message);
     default: return "";

@@ -11,7 +11,7 @@ const CURRENT_PARSER_VERSION: u32 = 1;
 /// Schema version. Bump on any incompatible asset-table schema change. Mismatch
 /// at `open_db` time triggers a full DB delete + rebuild — `locus.db` is a
 /// pure cache and we never migrate it.
-pub const ASSET_DB_VERSION: u32 = 7;
+pub const ASSET_DB_VERSION: u32 = 8;
 
 pub(crate) fn db_path(project_root: &Path) -> PathBuf {
     project_root.join("Library").join("Locus").join("locus.db")
@@ -38,6 +38,7 @@ pub(crate) fn configure_connection(conn: &Connection) -> Result<(), String> {
     // All five are per-connection and reversible.
     conn.execute_batch(
         "PRAGMA journal_mode=WAL;
+         PRAGMA busy_timeout=5000;
          PRAGMA synchronous=NORMAL;
          PRAGMA temp_store=MEMORY;
          PRAGMA cache_size=-65536;
@@ -91,6 +92,11 @@ pub(crate) fn ensure_aux_tables(conn: &Connection) -> Result<(), String> {
             duplicate_guid_packages_only INTEGER NOT NULL DEFAULT 0,
             duplicate_guid_cross_root INTEGER NOT NULL DEFAULT 0,
             parse_failure_count INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS linked_asset_roots (
+            link_rel_path TEXT PRIMARY KEY,
+            target_path TEXT NOT NULL
         );",
     )
     .map_err(|e| format!("Failed to create auxiliary asset tables: {}", e))
@@ -252,7 +258,8 @@ pub fn clear_all_in_tx(tx: &Transaction) -> Result<(), String> {
          DELETE FROM assets;
          DELETE FROM files;
          DELETE FROM script_inheritance_terms;
-         DELETE FROM asset_scan_metrics;",
+         DELETE FROM asset_scan_metrics;
+         DELETE FROM linked_asset_roots;",
     )
     .map_err(|e| format!("Failed to clear tables: {}", e))?;
     asset_fts::clear_all(tx)?;
@@ -383,6 +390,71 @@ pub fn set_scan_metrics(
     )
     .map_err(|e| format!("Failed to persist asset scan metrics: {}", e))?;
     Ok(())
+}
+
+pub fn replace_linked_asset_roots(
+    tx: &Transaction,
+    roots: &[LinkedAssetRoot],
+) -> Result<(), String> {
+    tx.execute("DELETE FROM linked_asset_roots", [])
+        .map_err(|e| format!("Failed to clear linked asset roots: {}", e))?;
+
+    if roots.is_empty() {
+        return Ok(());
+    }
+
+    let mut stmt = tx
+        .prepare(
+            "INSERT OR REPLACE INTO linked_asset_roots
+             (link_rel_path, target_path)
+             VALUES (?1, ?2)",
+        )
+        .map_err(|e| format!("Failed to prepare linked asset root insert: {}", e))?;
+
+    for root in roots {
+        stmt.execute(params![
+            root.link_rel_path.as_str(),
+            root.target_path.to_string_lossy().as_ref(),
+        ])
+        .map_err(|e| {
+            format!(
+                "Failed to persist linked asset root {} -> {}: {}",
+                root.link_rel_path,
+                root.target_path.display(),
+                e
+            )
+        })?;
+    }
+
+    Ok(())
+}
+
+pub fn get_linked_asset_roots(conn: &Connection) -> Result<Vec<LinkedAssetRoot>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT link_rel_path, target_path
+             FROM linked_asset_roots
+             ORDER BY link_rel_path ASC",
+        )
+        .map_err(|e| format!("Failed to prepare linked asset root query: {}", e))?;
+
+    let rows = stmt
+        .query_map([], |row| {
+            let link_rel_path: String = row.get(0)?;
+            let target_path: String = row.get(1)?;
+            Ok(LinkedAssetRoot {
+                link_rel_path,
+                target_path: PathBuf::from(target_path),
+            })
+        })
+        .map_err(|e| format!("Failed to query linked asset roots: {}", e))?;
+
+    let mut roots = Vec::new();
+    for row in rows {
+        roots.push(row.map_err(|e| format!("Failed to read linked asset roots: {}", e))?);
+    }
+
+    Ok(roots)
 }
 
 pub fn get_duplicate_guid_overview(conn: &Connection) -> Result<DuplicateGuidOverview, String> {

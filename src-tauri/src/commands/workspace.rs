@@ -1,12 +1,14 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::asset_db::{AssetDb, AssetDbState, LoadExistingAssetDb};
 use crate::commands::asset::{
-    delete_persisted_last_scan_info, read_persisted_last_scan_info, LastScanInfoState,
-    ScanPhaseState, WorkspacePreviewCache,
+    delete_persisted_last_scan_info, read_persisted_last_scan_info, AssetDbReconcileTaskState,
+    LastScanInfoState, ScanPhaseState, WorkspacePreviewCache,
 };
 use crate::error::AppError;
 use crate::keychain;
@@ -47,6 +49,225 @@ pub async fn get_working_dir(workspace: State<'_, Arc<Workspace>>) -> Result<Str
     Ok(dir)
 }
 
+struct WorkspaceSwitchTimer {
+    target: String,
+    started_at: Instant,
+    lap_started_at: Instant,
+}
+
+impl WorkspaceSwitchTimer {
+    fn new(target: &str, started_at: Instant) -> Self {
+        Self {
+            target: target.to_string(),
+            started_at,
+            lap_started_at: started_at,
+        }
+    }
+
+    fn mark(&mut self, phase: &str) {
+        self.mark_detail(phase, "");
+    }
+
+    fn mark_detail(&mut self, phase: &str, detail: impl AsRef<str>) {
+        let now = Instant::now();
+        let detail = detail.as_ref();
+        tracing::info!(
+            log_module = "WorkspaceSwitch",
+            "phase={} total_ms={} delta_ms={} target={}{}",
+            phase,
+            now.duration_since(self.started_at).as_millis(),
+            now.duration_since(self.lap_started_at).as_millis(),
+            self.target,
+            detail
+        );
+        self.lap_started_at = now;
+    }
+}
+
+fn emit_asset_phase_if_current(
+    workspace: &Arc<Workspace>,
+    workspace_generation: u64,
+    app_handle: &AppHandle,
+    scan_phase_state: &ScanPhaseState,
+    phase: crate::asset_db::types::ScanPhase,
+) -> bool {
+    let generation_guard = match workspace.lock_generation() {
+        Ok(guard) => guard,
+        Err(error) => {
+            eprintln!("[AssetDb] warning: failed to lock workspace generation: {error}");
+            return false;
+        }
+    };
+
+    if !generation_guard.is_current(workspace_generation) {
+        return false;
+    }
+
+    let _ = app_handle.emit("ref-graph-scan", &phase);
+    scan_phase_state.set(Some(phase));
+    true
+}
+
+fn emit_asset_reconcile_done_if_current(
+    workspace: &Arc<Workspace>,
+    workspace_generation: u64,
+    app_handle: &AppHandle,
+    scan_phase_state: &ScanPhaseState,
+) -> bool {
+    let generation_guard = match workspace.lock_generation() {
+        Ok(guard) => guard,
+        Err(error) => {
+            eprintln!("[AssetDb] warning: failed to lock workspace generation: {error}");
+            return false;
+        }
+    };
+
+    if !generation_guard.is_current(workspace_generation) {
+        return false;
+    }
+
+    let phase = crate::asset_db::types::ScanPhase::ReconcileDone;
+    let _ = app_handle.emit("ref-graph-scan", &phase);
+    if scan_phase_state
+        .snapshot()
+        .as_ref()
+        .map(|phase| matches!(phase, crate::asset_db::types::ScanPhase::Reconcile { .. }))
+        .unwrap_or(false)
+    {
+        scan_phase_state.clear();
+    }
+    true
+}
+
+fn emit_asset_reconcile_error_if_current(
+    workspace: &Arc<Workspace>,
+    workspace_generation: u64,
+    app_handle: &AppHandle,
+    scan_phase_state: &ScanPhaseState,
+    error: AppError,
+) -> bool {
+    emit_asset_phase_if_current(
+        workspace,
+        workspace_generation,
+        app_handle,
+        scan_phase_state,
+        crate::asset_db::types::ScanPhase::Error { error },
+    )
+}
+
+fn spawn_background_asset_hash_reconcile(
+    app_handle: AppHandle,
+    workspace: Arc<Workspace>,
+    workspace_generation: u64,
+    project_root: std::path::PathBuf,
+    graph_state: Arc<Mutex<Option<AssetDb>>>,
+    scan_phase_state: ScanPhaseState,
+    reconcile_task_state: AssetDbReconcileTaskState,
+) {
+    let cwd = project_root.display().to_string();
+    let registration = reconcile_task_state.register(cwd.clone(), workspace_generation);
+    let cancel_token = registration.cancel_token();
+    let phase = crate::asset_db::types::ScanPhase::Reconcile {
+        verify_hashes: true,
+    };
+
+    if !emit_asset_phase_if_current(
+        &workspace,
+        workspace_generation,
+        &app_handle,
+        &scan_phase_state,
+        phase,
+    ) {
+        return;
+    }
+
+    tauri::async_runtime::spawn(async move {
+        let _registration = registration;
+        let started_at = Instant::now();
+        let root_for_task = project_root.clone();
+        let graph_for_task = graph_state.clone();
+        let cancel_for_task = cancel_token.clone();
+        let result = tauri::async_runtime::spawn_blocking(move || {
+            crate::asset_db::watcher::reconcile_graph_state_with_cancel(
+                &root_for_task,
+                graph_for_task,
+                &cancel_for_task,
+                true,
+            )
+        })
+        .await;
+
+        if cancel_token.load(Ordering::Relaxed) || workspace.generation() != workspace_generation {
+            eprintln!(
+                "[AssetDb] background hash reconcile discarded for {} generation {}",
+                cwd, workspace_generation
+            );
+            return;
+        }
+
+        match result {
+            Ok(Ok(stats)) => {
+                tracing::info!(
+                    log_module = "AssetDb",
+                    "background hash reconcile complete: workspace={} queued={} processed={} failed={} elapsed_ms={}",
+                    cwd,
+                    stats.queued,
+                    stats.processed,
+                    stats.failed,
+                    started_at.elapsed().as_millis()
+                );
+                emit_asset_reconcile_done_if_current(
+                    &workspace,
+                    workspace_generation,
+                    &app_handle,
+                    &scan_phase_state,
+                );
+            }
+            Ok(Err(err)) => {
+                eprintln!(
+                    "[AssetDb] background hash reconcile failed: workspace={} elapsed_ms={} error={}",
+                    cwd,
+                    started_at.elapsed().as_millis(),
+                    err
+                );
+                let error = AppError::new(
+                    "ref_graph.rescan_required.reconcile_failed",
+                    "Persisted asset database could not be verified. Run a rescan to rebuild it.",
+                )
+                .detail(err)
+                .retryable(true);
+                emit_asset_reconcile_error_if_current(
+                    &workspace,
+                    workspace_generation,
+                    &app_handle,
+                    &scan_phase_state,
+                    error,
+                );
+            }
+            Err(err) => {
+                eprintln!(
+                    "[AssetDb] background hash reconcile task join failed: workspace={} elapsed_ms={} error={}",
+                    cwd,
+                    started_at.elapsed().as_millis(),
+                    err
+                );
+                let error = AppError::new(
+                    "ref_graph.reconcile_task_join_failed",
+                    format!("Task join error: {}", err),
+                )
+                .retryable(true);
+                emit_asset_reconcile_error_if_current(
+                    &workspace,
+                    workspace_generation,
+                    &app_handle,
+                    &scan_phase_state,
+                    error,
+                );
+            }
+        }
+    });
+}
+
 #[tauri::command]
 pub async fn set_working_dir(
     path: String,
@@ -57,6 +278,8 @@ pub async fn set_working_dir(
     knowledge_watcher_handle: State<'_, KnowledgeFsWatcherHandle>,
     last_scan_info: State<'_, LastScanInfoState>,
     scan_phase_state: State<'_, ScanPhaseState>,
+    scan_task_state: State<'_, super::RefGraphScanTaskState>,
+    reconcile_task_state: State<'_, AssetDbReconcileTaskState>,
     preview_cache: State<'_, WorkspacePreviewCache>,
     dir_entries_cache: State<'_, DirEntriesPageCache>,
     watcher_tuning: State<'_, crate::asset_db::watcher::WatcherTuningState>,
@@ -64,7 +287,10 @@ pub async fn set_working_dir(
     app_knowledge_dir: State<'_, crate::commands::AppKnowledgeDir>,
     app_handle: AppHandle,
 ) -> Result<String, AppError> {
+    let switch_started_at = Instant::now();
     let path = path.trim().to_string();
+    let mut switch_timer = WorkspaceSwitchTimer::new(&path, switch_started_at);
+    switch_timer.mark("request_received");
     if path.is_empty() {
         return Err("Path cannot be empty".to_string().into());
     }
@@ -81,12 +307,15 @@ pub async fn set_working_dir(
                 .into(),
         );
     }
+    switch_timer.mark("target_validated");
 
     let canonical = dunce::canonicalize(p)
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| path.clone());
+    switch_timer.mark_detail("canonicalized", format!(" canonical={}", canonical));
 
     let ws_id = crate::workspace::load_or_create_workspace(&canonical)?;
+    switch_timer.mark_detail("workspace_id_ready", format!(" workspace_id={}", ws_id));
 
     // Decide whether the workspace is actually changing. We compare the
     // canonical form against the currently-stored cwd. If unchanged, we keep
@@ -94,32 +323,69 @@ pub async fn set_working_dir(
     // a re-`set_working_dir` of the same project should not erase its history.
     let prev_cwd = workspace.path.read().await.clone();
     let is_real_switch = prev_cwd != canonical;
-
-    {
-        let mut dir = workspace.path.write().await;
-        *dir = canonical.clone();
-    }
     if is_real_switch {
-        // Only now is it safe to clear: the new workspace path is committed,
-        // all prior validation passed, and it differs from the previous one.
-        // Both the cached scan timestamp and any sticky scan-phase state from
-        // the previous project belong to a workspace we are no longer in.
-        last_scan_info.clear();
-        scan_phase_state.clear();
-        // Drop any preview sessions parsed against the previous workspace —
-        // they hold owned YAML docs that would otherwise be paired with the
-        // new project's AssetDb in `preview_workspace_asset_target`.
-        preview_cache.clear();
-        dir_entries_cache.clear();
+        reconcile_task_state.cancel_current("workspace switch");
+        let cancelled = scan_task_state.cancel_current_and_wait("workspace switch");
+        switch_timer.mark_detail(
+            "active_scan_cancel_checked",
+            format!(" cancelled={}", cancelled),
+        );
+        if !cancelled {
+            eprintln!(
+                "[Locus] warning: asset DB scan cancellation did not finish before workspace switch"
+            );
+        }
+    } else {
+        switch_timer.mark("same_workspace_checked");
+    }
+
+    let old_ref_graph_watcher = {
+        let mut dir = workspace.path.write().await;
+        let old_ref_graph_watcher = if is_real_switch {
+            let generation_guard = workspace
+                .lock_generation()
+                .map_err(|e| AppError::new("workspace.generation_lock_failed", e))?;
+            generation_guard.bump_generation();
+            last_scan_info.clear();
+            scan_phase_state.clear();
+            // Drop any preview sessions parsed against the previous workspace —
+            // they hold owned YAML docs that would otherwise be paired with the
+            // new project's AssetDb in `preview_workspace_asset_target`.
+            preview_cache.clear();
+            dir_entries_cache.clear();
+            *ref_graph_state
+                .0
+                .lock()
+                .map_err(|e| format!("Lock error: {}", e))? = None;
+            watcher_handle
+                .lock()
+                .map_err(|e| format!("Lock error: {}", e))?
+                .take()
+        } else {
+            None
+        };
+        *dir = canonical.clone();
+        old_ref_graph_watcher
+    };
+    switch_timer.mark_detail(
+        "workspace_state_committed",
+        format!(" is_real_switch={}", is_real_switch),
+    );
+    if let Some(old) = old_ref_graph_watcher {
+        old.stop_and_join();
+        switch_timer.mark("old_ref_graph_watcher_stopped");
+        eprintln!("[Locus] stopped ref_graph watcher (working dir changed)");
     }
     {
         let mut wid = workspace.workspace_id.write().await;
         *wid = Some(ws_id.clone());
     }
+    switch_timer.mark("workspace_id_state_committed");
 
     if is_real_switch {
         super::reset_unity_embed_control_window(&app_handle);
         super::refresh_unity_embed_control_server(app_handle.clone());
+        switch_timer.mark("unity_embed_control_refreshed");
     }
 
     if let Ok(data_dir) = super::resolve_runtime_storage_dir(&app_handle) {
@@ -127,13 +393,16 @@ pub async fn set_working_dir(
         let _ = std::fs::write(&file, &canonical);
         save_recent_dir(&data_dir, &canonical);
     }
+    switch_timer.mark("working_dir_persisted");
 
     if is_real_switch {
         let library_dir = crate::knowledge_index::library_dir_for_working_dir(&canonical);
         let model_storage_dir = super::resolve_runtime_storage_dir(&app_handle)?;
+        switch_timer.mark("knowledge_index_rebuild_start");
         knowledge_index_state
             .rebuild(&library_dir, &model_storage_dir)
             .await?;
+        switch_timer.mark("knowledge_index_rebuild_done");
         let knowledge_state = knowledge_index_state.inner().clone();
         let working_dir_for_index = canonical.clone();
         let app_handle_for_index = app_handle.clone();
@@ -159,6 +428,7 @@ pub async fn set_working_dir(
                 eprintln!("[Locus] knowledge reconcile error: {}", e);
             }
         });
+        switch_timer.mark("knowledge_reconcile_task_spawned");
     }
 
     if is_real_switch {
@@ -168,13 +438,16 @@ pub async fn set_working_dir(
                 error
             );
         }
+        switch_timer.mark("knowledge_roots_ready");
         let mut knowledge_watcher = knowledge_watcher_handle
             .lock()
             .map_err(|e| format!("Lock error: {}", e))?;
         if let Some(old) = knowledge_watcher.take() {
             old.stop();
+            switch_timer.mark("old_knowledge_watcher_stopped");
             eprintln!("[Locus] stopped knowledge watcher (working dir changed)");
         }
+        switch_timer.mark("knowledge_watcher_start_begin");
         match crate::knowledge_watcher::KnowledgeFsWatcher::start(
             app_handle.clone(),
             canonical.clone(),
@@ -183,9 +456,14 @@ pub async fn set_working_dir(
         ) {
             Ok(watcher) => {
                 *knowledge_watcher = Some(watcher);
+                switch_timer.mark("knowledge_watcher_start_done");
                 eprintln!("[Locus] knowledge watcher started for new working dir");
             }
             Err(error) => {
+                switch_timer.mark_detail(
+                    "knowledge_watcher_start_failed",
+                    format!(" error={}", error),
+                );
                 eprintln!(
                     "[Locus] warning: failed to start knowledge watcher: {}",
                     error
@@ -194,25 +472,26 @@ pub async fn set_working_dir(
         }
     }
 
-    {
-        let mut wh = watcher_handle
-            .lock()
-            .map_err(|e| format!("Lock error: {}", e))?;
-        if let Some(old) = wh.take() {
-            old.stop_and_join();
-            eprintln!("[Locus] stopped ref_graph watcher (working dir changed)");
-        }
-    }
-
+    switch_timer.mark("asset_db_load_existing_start");
     match AssetDb::load_existing(std::path::Path::new(&canonical)) {
         LoadExistingAssetDb::Ready(graph) => {
-            match crate::asset_db::watcher::reconcile_loaded_db(
+            switch_timer.mark("asset_db_load_existing_ready");
+            switch_timer.mark_detail("asset_db_reconcile_start", " verify_hashes=false");
+            match crate::asset_db::watcher::reconcile_loaded_db_light(
                 std::path::Path::new(&canonical),
                 graph,
             ) {
                 Ok((graph, stats)) => {
-                    eprintln!(
-                        "[Locus] ref_graph DB reconciled for new working dir: queued={}, processed={}, failed={}",
+                    switch_timer.mark_detail(
+                        "asset_db_reconcile_done",
+                        format!(
+                            " verify_hashes=false queued={} processed={} failed={}",
+                            stats.queued, stats.processed, stats.failed
+                        ),
+                    );
+                    tracing::info!(
+                        log_module = "Locus",
+                        "ref_graph DB light-reconciled for new working dir: queued={}, processed={}, failed={}",
                         stats.queued, stats.processed, stats.failed
                     );
                     let db_path = std::path::Path::new(&canonical)
@@ -244,9 +523,11 @@ pub async fn set_working_dir(
                             }
                         }
                     }
+                    switch_timer.mark("asset_db_state_ready");
 
                     let graph_arc = ref_graph_state.0.clone();
                     let watcher_root = std::path::PathBuf::from(&canonical);
+                    switch_timer.mark("asset_db_watcher_start_begin");
                     match crate::asset_db::watcher::AssetDbWatcher::start(
                         watcher_root,
                         graph_arc,
@@ -256,14 +537,34 @@ pub async fn set_working_dir(
                             *watcher_handle
                                 .lock()
                                 .map_err(|e| format!("Lock error: {}", e))? = Some(w);
+                            switch_timer.mark("asset_db_watcher_start_done");
                             eprintln!("[Locus] ref_graph watcher started for new working dir");
                         }
                         Err(e) => {
+                            switch_timer.mark_detail(
+                                "asset_db_watcher_start_failed",
+                                format!(" error={}", e),
+                            );
                             eprintln!("[Locus] warning: failed to start ref_graph watcher: {}", e);
                         }
                     }
+                    if is_real_switch {
+                        let workspace_generation = workspace.generation();
+                        spawn_background_asset_hash_reconcile(
+                            app_handle.clone(),
+                            workspace.inner().clone(),
+                            workspace_generation,
+                            std::path::PathBuf::from(&canonical),
+                            ref_graph_state.0.clone(),
+                            scan_phase_state.inner().clone(),
+                            reconcile_task_state.inner().clone(),
+                        );
+                        switch_timer.mark("asset_db_background_hash_reconcile_spawned");
+                    }
                 }
                 Err(err) => {
+                    switch_timer
+                        .mark_detail("asset_db_reconcile_failed", format!(" error={}", err));
                     eprintln!(
                         "[Locus] ref_graph DB reconcile failed for new working dir, rescan required: {}",
                         err
@@ -293,6 +594,10 @@ pub async fn set_working_dir(
             }
         }
         LoadExistingAssetDb::NeedsRescan(issue) => {
+            switch_timer.mark_detail(
+                "asset_db_load_existing_needs_rescan",
+                format!(" reason={}", issue.message),
+            );
             eprintln!(
                 "[Locus] ref_graph DB invalidated for new working dir, rescan required: {}",
                 issue.message
@@ -313,6 +618,7 @@ pub async fn set_working_dir(
             }));
         }
         LoadExistingAssetDb::Missing => {
+            switch_timer.mark("asset_db_load_existing_missing");
             eprintln!("[Locus] no ref_graph DB in new working dir, clearing state");
             last_scan_info.clear();
             if let Err(err) = delete_persisted_last_scan_info(std::path::Path::new(&canonical)) {
@@ -329,18 +635,30 @@ pub async fn set_working_dir(
     }
 
     if crate::unity_bridge::is_unity_project(&canonical) {
+        switch_timer.mark("unity_monitor_start_begin");
         crate::unity_bridge::start_unity_monitor(
             app_handle.clone(),
             canonical.clone(),
             &unity_monitor,
         )
         .await;
+        switch_timer.mark("unity_monitor_start_done");
+        switch_timer.mark("plugin_status_emit_begin");
         crate::unity_bridge::emit_plugin_status(&app_handle, &canonical);
+        switch_timer.mark("plugin_status_emit_done");
     } else {
         crate::unity_bridge::stop_unity_monitor(&unity_monitor).await;
         let _ = app_handle.emit("unity-connection-status", false);
+        switch_timer.mark("unity_monitor_stopped");
     }
 
+    switch_timer.mark_detail(
+        "finished",
+        format!(
+            " canonical={} workspace_id={} is_real_switch={}",
+            canonical, ws_id, is_real_switch
+        ),
+    );
     eprintln!(
         "[Locus] working_dir changed to: {}, workspace_id: {}",
         canonical, ws_id
@@ -824,7 +1142,11 @@ fn truncate_str(s: &str, max: usize) -> &str {
 /// save it to a temp file and return a message with `[OPEN_HTML:filepath]` marker.
 fn maybe_html_fallback(text: &str) -> Option<String> {
     let trimmed = text.trim_start();
-    let head = trimmed.chars().take(32).collect::<String>().to_ascii_lowercase();
+    let head = trimmed
+        .chars()
+        .take(32)
+        .collect::<String>()
+        .to_ascii_lowercase();
     if head.starts_with("<!") || head.starts_with("<html") {
         let tmp =
             std::env::temp_dir().join(format!("locus_endpoint_test_{}.html", std::process::id()));
@@ -841,10 +1163,7 @@ fn maybe_html_fallback(text: &str) -> Option<String> {
     }
 }
 
-fn endpoint_html_response_error(
-    message: String,
-    status: Option<reqwest::StatusCode>,
-) -> AppError {
+fn endpoint_html_response_error(message: String, status: Option<reqwest::StatusCode>) -> AppError {
     let message = match status {
         Some(status) => format!("HTTP {} — {}", status.as_u16(), message),
         None => message,
@@ -1029,31 +1348,79 @@ const WORKSPACE_HIDDEN_DIRS: &[&str] = &[
 ];
 
 const ASSET_ROOT_DIRS: &[&str] = &["Assets", "Packages", "ProjectSettings"];
+const LINKED_ASSET_ROOT_DIRS: &[&str] = &["Assets", "Packages"];
+const WORKSPACE_SEARCH_MAX_DEPTH: usize = 64;
 
-fn resolve_workspace_dir_target(
-    cwd: &str,
-    sub_path: &str,
-) -> Result<(std::path::PathBuf, std::path::PathBuf), AppError> {
-    let base = std::path::Path::new(cwd);
-    let target = if sub_path.is_empty() {
-        base.to_path_buf()
-    } else {
-        base.join(sub_path)
-    };
-
-    if !target.is_dir() {
-        return Ok((target, std::path::PathBuf::new()));
-    }
-
-    let canonical_base = dunce::canonicalize(base).unwrap_or_else(|_| base.to_path_buf());
-    let canonical_target = dunce::canonicalize(&target).unwrap_or_else(|_| target.clone());
-    if !canonical_target.starts_with(&canonical_base) {
+pub(crate) fn normalize_workspace_sub_path(sub_path: &str) -> Result<String, AppError> {
+    let unified = sub_path.replace('\\', "/");
+    if unified.contains('\0')
+        || unified.starts_with('/')
+        || unified
+            .split('/')
+            .next()
+            .map(|head| {
+                head.len() >= 2
+                    && head.as_bytes()[1] == b':'
+                    && head.as_bytes()[0].is_ascii_alphabetic()
+            })
+            .unwrap_or(false)
+    {
         return Err("Path is not within the working directory"
             .to_string()
             .into());
     }
 
-    Ok((target, canonical_target))
+    let mut parts = Vec::new();
+
+    for component in std::path::Path::new(&unified).components() {
+        match component {
+            std::path::Component::Normal(part) => {
+                let part = part.to_string_lossy();
+                if !part.is_empty() {
+                    parts.push(part.to_string());
+                }
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => {
+                return Err("Path is not within the working directory"
+                    .to_string()
+                    .into());
+            }
+        }
+    }
+
+    Ok(parts.join("/"))
+}
+
+fn resolve_workspace_dir_target(
+    cwd: &str,
+    sub_path: &str,
+) -> Result<(std::path::PathBuf, String), AppError> {
+    let base = std::path::Path::new(cwd);
+    let normalized_sub_path = normalize_workspace_sub_path(sub_path)?;
+    let target = if normalized_sub_path.is_empty() {
+        base.to_path_buf()
+    } else {
+        base.join(&normalized_sub_path)
+    };
+
+    if !target.is_dir() {
+        return Ok((target, normalized_sub_path));
+    }
+
+    let canonical_base = dunce::canonicalize(base).unwrap_or_else(|_| base.to_path_buf());
+    let canonical_target = dunce::canonicalize(&target).unwrap_or_else(|_| target.clone());
+    if canonical_target.starts_with(&canonical_base)
+        || path_reaches_allowed_linked_asset_dir(base, &normalized_sub_path)
+    {
+        return Ok((target, normalized_sub_path));
+    }
+
+    Err("Path is not within the working directory"
+        .to_string()
+        .into())
 }
 
 fn should_skip_workspace_entry(file_name: &str, is_dir: bool, exclude_meta: bool) -> bool {
@@ -1076,6 +1443,81 @@ fn join_workspace_rel_path(sub_path: &str, file_name: &str) -> String {
     }
 }
 
+fn is_allowed_linked_asset_rel_path(rel_path: &str) -> bool {
+    LINKED_ASSET_ROOT_DIRS.iter().any(|root| {
+        rel_path == *root
+            || rel_path
+                .strip_prefix(root)
+                .map(|rest| rest.starts_with('/'))
+                .unwrap_or(false)
+    })
+}
+
+fn path_reaches_allowed_linked_asset_dir(base: &std::path::Path, rel_path: &str) -> bool {
+    let mut current = base.to_path_buf();
+    let mut rel_parts = Vec::new();
+    let mut saw_allowed_linked_dir = false;
+
+    for part in rel_path.split('/').filter(|part| !part.is_empty()) {
+        current.push(part);
+        rel_parts.push(part);
+        if path_is_symlink_dir(&current) {
+            let current_rel_path = rel_parts.join("/");
+            if !is_allowed_linked_asset_rel_path(&current_rel_path) {
+                return false;
+            }
+            saw_allowed_linked_dir = true;
+        }
+    }
+
+    saw_allowed_linked_dir
+}
+
+fn entry_is_dir(entry: &std::fs::DirEntry, rel_path: &str) -> bool {
+    match entry.file_type() {
+        Ok(file_type) if file_type.is_dir() => true,
+        Ok(file_type) if file_type.is_symlink() => {
+            is_allowed_linked_asset_rel_path(rel_path) && entry.path().is_dir()
+        }
+        Ok(_) => false,
+        Err(_) => {
+            let path = entry.path();
+            if path_is_symlink_dir(&path) {
+                is_allowed_linked_asset_rel_path(rel_path)
+            } else {
+                path.is_dir()
+            }
+        }
+    }
+}
+
+fn entry_is_file(entry: &std::fs::DirEntry) -> bool {
+    match entry.file_type() {
+        Ok(file_type) if file_type.is_file() => true,
+        Ok(file_type) if file_type.is_symlink() => entry.path().is_file(),
+        Ok(_) => false,
+        Err(_) => entry.path().is_file(),
+    }
+}
+
+fn entry_is_symlink_dir(entry: &std::fs::DirEntry) -> bool {
+    match entry.file_type() {
+        Ok(file_type) if file_type.is_symlink() => entry.path().is_dir(),
+        _ => false,
+    }
+}
+
+fn entry_is_disallowed_symlink_dir(entry: &std::fs::DirEntry, rel_path: &str) -> bool {
+    entry_is_symlink_dir(entry) && !is_allowed_linked_asset_rel_path(rel_path)
+}
+
+fn path_is_symlink_dir(path: &std::path::Path) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => path.is_dir(),
+        _ => false,
+    }
+}
+
 fn collect_dir_entries(
     target: &std::path::Path,
     sub_path: &str,
@@ -1087,15 +1529,20 @@ fn collect_dir_entries(
 
     for entry in read_dir.flatten() {
         let file_name = entry.file_name().to_string_lossy().to_string();
+        let rel_path = join_workspace_rel_path(sub_path, &file_name);
 
-        let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+        if entry_is_disallowed_symlink_dir(&entry, &rel_path) {
+            continue;
+        }
+
+        let is_dir = entry_is_dir(&entry, &rel_path);
 
         if should_skip_workspace_entry(&file_name, is_dir, exclude_meta) {
             continue;
         }
 
         entries.push(DirEntry {
-            rel_path: join_workspace_rel_path(sub_path, &file_name),
+            rel_path,
             name: file_name,
             is_dir,
         });
@@ -1209,22 +1656,48 @@ fn collect_workspace_search_entries(
     query: &str,
     results: &mut Vec<WorkspaceSearchEntry>,
 ) -> Result<(), AppError> {
-    let mut stack = vec![(root_dir.to_path_buf(), root_rel_path.to_string())];
+    let initial_linked_visit_keys = path_is_symlink_dir(root_dir).then(|| Arc::new(HashSet::new()));
+    let mut stack = vec![(
+        root_dir.to_path_buf(),
+        root_rel_path.to_string(),
+        0usize,
+        initial_linked_visit_keys,
+    )];
 
-    while let Some((dir_path, dir_rel_path)) = stack.pop() {
+    while let Some((dir_path, dir_rel_path, depth, linked_visit_keys)) = stack.pop() {
+        let current_linked_visit_keys = if let Some(keys) = linked_visit_keys {
+            let visit_key = dunce::canonicalize(&dir_path).unwrap_or_else(|_| dir_path.clone());
+            if keys.contains(&visit_key) {
+                continue;
+            }
+            let mut updated = (*keys).clone();
+            updated.insert(visit_key);
+            Some(Arc::new(updated))
+        } else {
+            None
+        };
+
         let read_dir =
             std::fs::read_dir(&dir_path).map_err(|e| format!("Failed to read directory: {}", e))?;
-        let mut child_dirs: Vec<(std::path::PathBuf, String)> = Vec::new();
+        let mut child_dirs: Vec<(
+            std::path::PathBuf,
+            String,
+            Option<Arc<HashSet<std::path::PathBuf>>>,
+        )> = Vec::new();
 
         for entry in read_dir.flatten() {
             let file_name = entry.file_name().to_string_lossy().to_string();
-            let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+            let rel_path = join_workspace_rel_path(&dir_rel_path, &file_name);
+            if entry_is_disallowed_symlink_dir(&entry, &rel_path) {
+                continue;
+            }
+            let is_dir = entry_is_dir(&entry, &rel_path);
             if should_skip_workspace_entry(&file_name, is_dir, false) {
                 continue;
             }
 
-            let rel_path = join_workspace_rel_path(&dir_rel_path, &file_name);
-            if !is_dir && !include_files {
+            let is_file = entry_is_file(&entry);
+            if !is_dir && (!include_files || !is_file) {
                 continue;
             }
             if let Some(match_score) = workspace_search_score(query, &file_name, &rel_path, is_dir)
@@ -1237,13 +1710,22 @@ fn collect_workspace_search_entries(
                 ));
             }
 
-            if is_dir {
-                child_dirs.push((entry.path(), rel_path));
+            if is_dir && depth < WORKSPACE_SEARCH_MAX_DEPTH {
+                let child_linked_visit_keys = current_linked_visit_keys
+                    .clone()
+                    .or_else(|| entry_is_symlink_dir(&entry).then(|| Arc::new(HashSet::new())));
+                child_dirs.push((entry.path(), rel_path, child_linked_visit_keys));
             }
         }
 
         child_dirs.sort_by(|left, right| right.1.cmp(&left.1));
-        stack.extend(child_dirs);
+        stack.extend(
+            child_dirs
+                .into_iter()
+                .map(|(path, rel_path, linked_visit_keys)| {
+                    (path, rel_path, depth + 1, linked_visit_keys)
+                }),
+        );
     }
 
     Ok(())
@@ -1264,14 +1746,18 @@ fn search_workspace_entries_in_dir(
 
     for entry in read_dir.flatten() {
         let file_name = entry.file_name().to_string_lossy().to_string();
-        let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+        let rel_path = file_name.clone();
+        if entry_is_disallowed_symlink_dir(&entry, &rel_path) {
+            continue;
+        }
+        let is_dir = entry_is_dir(&entry, &rel_path);
         if should_skip_workspace_entry(&file_name, is_dir, false) {
             continue;
         }
 
-        if let Some(match_score) = workspace_search_score(query, &file_name, &file_name, is_dir) {
+        if let Some(match_score) = workspace_search_score(query, &file_name, &rel_path, is_dir) {
             results.push(build_workspace_search_entry(
-                file_name.clone(),
+                rel_path.clone(),
                 file_name.clone(),
                 is_dir,
                 match_score,
@@ -1282,10 +1768,10 @@ fn search_workspace_entries_in_dir(
             continue;
         }
 
-        let include_files = !ASSET_ROOT_DIRS.contains(&file_name.as_str());
+        let include_files = !ASSET_ROOT_DIRS.contains(&rel_path.as_str());
         collect_workspace_search_entries(
             &entry.path(),
-            &file_name,
+            &rel_path,
             include_files,
             query,
             &mut results,
@@ -1314,12 +1800,12 @@ pub async fn list_dir_entries(
     workspace: State<'_, Arc<Workspace>>,
 ) -> Result<Vec<DirEntry>, AppError> {
     let cwd = workspace.path.read().await.clone();
-    let (target, _canonical_target) = resolve_workspace_dir_target(&cwd, &sub_path)?;
+    let (target, normalized_sub_path) = resolve_workspace_dir_target(&cwd, &sub_path)?;
     if !target.is_dir() {
         return Ok(vec![]);
     }
 
-    collect_dir_entries(&target, &sub_path, false)
+    collect_dir_entries(&target, &normalized_sub_path, false)
 }
 
 #[tauri::command]
@@ -1332,7 +1818,7 @@ pub async fn list_dir_entries_page(
     dir_entries_cache: State<'_, DirEntriesPageCache>,
 ) -> Result<DirEntriesPage, AppError> {
     let cwd = workspace.path.read().await.clone();
-    let (target, canonical_target) = resolve_workspace_dir_target(&cwd, &sub_path)?;
+    let (target, normalized_sub_path) = resolve_workspace_dir_target(&cwd, &sub_path)?;
     if !target.is_dir() {
         return Ok(DirEntriesPage {
             entries: Vec::new(),
@@ -1345,15 +1831,20 @@ pub async fn list_dir_entries_page(
     let offset = offset.unwrap_or(0);
     let limit = limit.unwrap_or(200).clamp(1, 2_000);
     let exclude_meta = exclude_meta.unwrap_or(false);
-    let cache_key = format!("{}::{}", canonical_target.display(), u8::from(exclude_meta));
+    let cache_key = format!(
+        "{}::{}::{}",
+        cwd,
+        normalized_sub_path,
+        u8::from(exclude_meta)
+    );
 
     let listing = if offset == 0 {
-        let entries = collect_dir_entries(&target, &sub_path, exclude_meta)?;
+        let entries = collect_dir_entries(&target, &normalized_sub_path, exclude_meta)?;
         dir_entries_cache.insert(cache_key.clone(), entries)
     } else if let Some(cached) = dir_entries_cache.get(&cache_key) {
         cached
     } else {
-        let entries = collect_dir_entries(&target, &sub_path, exclude_meta)?;
+        let entries = collect_dir_entries(&target, &normalized_sub_path, exclude_meta)?;
         dir_entries_cache.insert(cache_key.clone(), entries)
     };
 
@@ -1501,6 +1992,8 @@ pub async fn reset_all_config(
     watcher_handle: State<'_, AssetDbWatcherHandle>,
     last_scan_info: State<'_, LastScanInfoState>,
     scan_phase_state: State<'_, ScanPhaseState>,
+    scan_task_state: State<'_, super::RefGraphScanTaskState>,
+    reconcile_task_state: State<'_, AssetDbReconcileTaskState>,
     preview_cache: State<'_, WorkspacePreviewCache>,
     dir_entries_cache: State<'_, DirEntriesPageCache>,
     knowledge_index_state: State<'_, Arc<crate::knowledge_index::KnowledgeIndexState>>,
@@ -1514,6 +2007,12 @@ pub async fn reset_all_config(
 ) -> Result<(), AppError> {
     let data_dir = super::resolve_runtime_storage_dir(&app_handle)
         .map_err(|e| format!("Failed to get data dir: {}", e))?;
+
+    let cancelled = scan_task_state.cancel_current_and_wait("config reset");
+    if !cancelled {
+        eprintln!("[Locus] warning: asset DB scan cancellation did not finish before reset");
+    }
+    reconcile_task_state.cancel_current("config reset");
 
     // Clear keychain secrets: OpenRouter key
     let _ = keychain::delete_secret(keychain::KEY_OPENROUTER);
@@ -1637,10 +2136,31 @@ pub async fn get_config_registry(
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_tool_permission_mode_request, search_workspace_entries_in_dir,
-        workspace_search_score,
+        collect_dir_entries, normalize_tool_permission_mode_request, normalize_workspace_sub_path,
+        resolve_workspace_dir_target, search_workspace_entries_in_dir, workspace_search_score,
     };
+    use std::path::Path;
     use tempfile::tempdir;
+
+    #[cfg(unix)]
+    fn create_dir_symlink(source: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(source, link)
+    }
+
+    #[cfg(windows)]
+    fn create_dir_symlink(source: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::windows::fs::symlink_dir(source, link)
+    }
+
+    fn create_dir_symlink_or_skip(source: &Path, link: &Path) -> bool {
+        match create_dir_symlink(source, link) {
+            Ok(()) => true,
+            Err(error) => {
+                eprintln!("skipping symlink test; failed to create directory symlink: {error}");
+                false
+            }
+        }
+    }
 
     #[test]
     fn normalize_tool_permission_mode_accepts_primary_value_arg() {
@@ -1692,6 +2212,20 @@ mod tests {
     }
 
     #[test]
+    fn normalize_workspace_sub_path_rejects_workspace_escapes() {
+        assert_eq!(
+            normalize_workspace_sub_path("Assets\\Linked\\Hero.cs").unwrap(),
+            "Assets/Linked/Hero.cs"
+        );
+        assert!(normalize_workspace_sub_path("../Assets").is_err());
+        assert!(normalize_workspace_sub_path("Assets/../ProjectSettings").is_err());
+        assert!(normalize_workspace_sub_path("C:/outside").is_err());
+        assert!(normalize_workspace_sub_path("C:outside").is_err());
+        assert!(normalize_workspace_sub_path("/tmp/outside").is_err());
+        assert!(normalize_workspace_sub_path("//server/share").is_err());
+    }
+
+    #[test]
     fn search_workspace_entries_in_dir_returns_generic_files_and_directories() {
         let temp = tempdir().expect("create temp dir");
         std::fs::create_dir_all(temp.path().join("UIElementsSchema"))
@@ -1722,5 +2256,104 @@ mod tests {
         assert!(!folder_results
             .iter()
             .any(|entry| { entry.rel_path == "Assets/Scripts/UI/Hud.prefab" }));
+    }
+
+    #[test]
+    fn directory_listing_treats_symlinked_folders_as_directories() {
+        let temp = tempdir().expect("create temp dir");
+        let workspace = temp.path().join("project");
+        let external = temp.path().join("shared-assets");
+        std::fs::create_dir_all(workspace.join("Assets")).expect("create assets dir");
+        std::fs::create_dir_all(external.join("Nested")).expect("create linked target");
+        std::fs::write(external.join("Nested/Hero.prefab"), b"prefab").expect("write asset");
+
+        let link = workspace.join("Assets/Linked");
+        if !create_dir_symlink_or_skip(&external, &link) {
+            return;
+        }
+
+        let assets_entries =
+            collect_dir_entries(&workspace.join("Assets"), "Assets", true).expect("list Assets");
+        assert!(assets_entries
+            .iter()
+            .any(|entry| entry.rel_path == "Assets/Linked" && entry.is_dir));
+
+        let workspace_str = workspace.to_string_lossy();
+        let (target, normalized) = resolve_workspace_dir_target(&workspace_str, "Assets/Linked")
+            .expect("resolve symlinked folder");
+        assert_eq!(normalized, "Assets/Linked");
+
+        let linked_entries =
+            collect_dir_entries(&target, &normalized, true).expect("list symlinked folder");
+        assert!(linked_entries
+            .iter()
+            .any(|entry| entry.rel_path == "Assets/Linked/Nested" && entry.is_dir));
+
+        let (nested_target, nested_normalized) =
+            resolve_workspace_dir_target(&workspace_str, "Assets/Linked/Nested")
+                .expect("resolve nested symlinked folder path");
+        assert_eq!(nested_normalized, "Assets/Linked/Nested");
+        assert!(nested_target.is_dir());
+    }
+
+    #[test]
+    fn directory_listing_rejects_non_asset_symlinked_folders() {
+        let temp = tempdir().expect("create temp dir");
+        let workspace = temp.path().join("project");
+        let external = temp.path().join("external-docs");
+        std::fs::create_dir_all(workspace.join("Assets")).expect("create assets dir");
+        std::fs::create_dir_all(&external).expect("create external target");
+        std::fs::write(external.join("Secret.txt"), b"secret").expect("write external file");
+
+        if !create_dir_symlink_or_skip(&external, &workspace.join("Docs")) {
+            return;
+        }
+
+        let workspace_str = workspace.to_string_lossy();
+        assert!(resolve_workspace_dir_target(&workspace_str, "Docs").is_err());
+
+        let root_entries = collect_dir_entries(&workspace, "", true).expect("list workspace root");
+        assert!(!root_entries.iter().any(|entry| entry.rel_path == "Docs"));
+    }
+
+    #[test]
+    fn workspace_search_skips_non_asset_symlinked_folders() {
+        let temp = tempdir().expect("create temp dir");
+        let workspace = temp.path().join("project");
+        let external = temp.path().join("external-docs");
+        std::fs::create_dir_all(workspace.join("Assets")).expect("create assets dir");
+        std::fs::create_dir_all(&external).expect("create external target");
+        std::fs::write(external.join("Secret.txt"), b"secret").expect("write external file");
+
+        if !create_dir_symlink_or_skip(&external, &workspace.join("Docs")) {
+            return;
+        }
+
+        let results =
+            search_workspace_entries_in_dir(&workspace, "Secret", 100).expect("search workspace");
+        assert!(!results
+            .iter()
+            .any(|entry| entry.rel_path == "Docs/Secret.txt"));
+    }
+
+    #[test]
+    fn workspace_search_does_not_recurse_forever_through_symlink_cycle() {
+        let temp = tempdir().expect("create temp dir");
+        let workspace = temp.path().join("project");
+        std::fs::create_dir_all(workspace.join("Assets/Real")).expect("create assets dir");
+        std::fs::write(workspace.join("Assets/Real/Hero.prefab"), "prefab")
+            .expect("write asset file");
+
+        let loop_link = workspace.join("Assets/Loop");
+        if !create_dir_symlink_or_skip(&workspace, &loop_link) {
+            return;
+        }
+
+        let results =
+            search_workspace_entries_in_dir(&workspace, "Loop", 100).expect("search workspace");
+        assert!(results
+            .iter()
+            .any(|entry| entry.rel_path == "Assets/Loop" && entry.is_dir));
+        assert!(results.len() < 20);
     }
 }

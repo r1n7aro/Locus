@@ -52,6 +52,38 @@ import {
   shouldAutoOpenKnowledgeLexicalProgressWindow,
 } from "../services/knowledgeLexicalProgressWindow";
 
+function workspaceSwitchNowMs(): number {
+  return typeof performance !== "undefined" && typeof performance.now === "function"
+    ? performance.now()
+    : Date.now();
+}
+
+function formatWorkspaceSwitchDetail(detail?: Record<string, unknown>): string {
+  if (!detail) return "";
+  const parts = Object.entries(detail)
+    .filter(([, value]) => value !== undefined && value !== null && value !== "")
+    .map(([key, value]) => `${key}=${String(value)}`);
+  return parts.length ? ` ${parts.join(" ")}` : "";
+}
+
+async function measureWorkspaceSwitchAsync<T>(
+  phase: string,
+  task: () => Promise<T>,
+  detail?: Record<string, unknown>,
+): Promise<T> {
+  const startedAt = workspaceSwitchNowMs();
+  console.info(`[workspace-switch] phase=${phase}_start${formatWorkspaceSwitchDetail(detail)}`);
+  try {
+    return await task();
+  } finally {
+    console.info(
+      `[workspace-switch] phase=${phase}_done elapsed_ms=${Math.round(
+        workspaceSwitchNowMs() - startedAt,
+      )}${formatWorkspaceSwitchDetail(detail)}`,
+    );
+  }
+}
+
 export function useAppBootstrap() {
   const uiStore = useUiStore();
   const authStore = useAuthStore();
@@ -427,9 +459,11 @@ export function useAppBootstrap() {
 
     // Initial Unity/AssetDb state
     await measureStartupAsync("register_listeners_initial_state", async () => {
-      await projectStore.checkUnityConnection();
-      await projectStore.checkUnityPlugin();
-      await projectStore.loadAssetDbStatus();
+      await Promise.all([
+        projectStore.checkUnityConnection(),
+        projectStore.checkUnityPlugin(),
+        projectStore.loadAssetDbStatus(),
+      ]);
     });
   }
 
@@ -448,6 +482,8 @@ export function useAppBootstrap() {
 
   // -- Workspace management --
   async function applyWorkingDir(path: string) {
+    const switchStartedAt = workspaceSwitchNowMs();
+    console.info(`[workspace-switch] phase=apply_start target=${path}`);
     clearWarmup(); // invalidate warmup cache for previous workingDir
     lastAutoOpenedLexicalProgressRun = "";
     resetSystemNotificationState();
@@ -456,16 +492,41 @@ export function useAppBootstrap() {
     _wpAsset = null;
     _wpAgent = null;
     _wpSettings = null;
-    await projectStore.setWorkingDir(path);
-    chatStore.newChat({ persistSelection: false });
-    await Promise.all([
-      chatStore.refreshSessions(),
-      projectStore.loadRecentDirs(),
-      projectStore.checkUnityConnection(),
-      projectStore.checkUnityPlugin(),
-      projectStore.loadAssetDbStatus(),
-      loadSkills(),
-    ]);
+    try {
+      await measureWorkspaceSwitchAsync(
+        "set_working_dir",
+        () => projectStore.setWorkingDir(path),
+        { target: path },
+      );
+      chatStore.newChat({ persistSelection: false });
+      console.info(`[workspace-switch] phase=new_chat_done target=${path}`);
+      await Promise.all([
+        measureWorkspaceSwitchAsync("refresh_sessions", () => chatStore.refreshSessions(), {
+          target: path,
+        }),
+        measureWorkspaceSwitchAsync("load_recent_dirs", () => projectStore.loadRecentDirs(), {
+          target: path,
+        }),
+        measureWorkspaceSwitchAsync(
+          "check_unity_connection",
+          () => projectStore.checkUnityConnection(),
+          { target: path },
+        ),
+        measureWorkspaceSwitchAsync("check_unity_plugin", () => projectStore.checkUnityPlugin(), {
+          target: path,
+        }),
+        measureWorkspaceSwitchAsync("load_asset_db_status", () => projectStore.loadAssetDbStatus(), {
+          target: path,
+        }),
+        measureWorkspaceSwitchAsync("load_skills", () => loadSkills(), { target: path }),
+      ]);
+    } finally {
+      console.info(
+        `[workspace-switch] phase=apply_done elapsed_ms=${Math.round(
+          workspaceSwitchNowMs() - switchStartedAt,
+        )} target=${path}`,
+      );
+    }
   }
 
   // -- Settings callbacks --

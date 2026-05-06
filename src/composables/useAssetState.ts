@@ -3,7 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import {
   assetDbOverview,
-  assetDbScan,
+  assetDbScanStart,
   searchWorkspaceAssets,
   previewWorkspaceAsset,
   previewWorkspaceAssetTarget,
@@ -761,12 +761,17 @@ export function useAssetState(props: AssetProps) {
   async function triggerRescan() {
     if (!hasWorkspace.value) return;
     try {
-      await assetDbScan();
+      const result = await assetDbScanStart();
+      if ((result.started || result.alreadyRunning) && dbOverview.value) {
+        dbOverview.value = {
+          ...dbOverview.value,
+          currentScanPhase: { phase: "dirScan" },
+          status: "scanning",
+        };
+      }
     } catch (e) {
       const err = normalizeAppError(e);
       error.value = err.message;
-    } finally {
-      await refreshDbOverview();
     }
   }
 
@@ -830,7 +835,7 @@ export function useAssetState(props: AssetProps) {
           return;
         }
         // Update the sticky phase + status from the live event.
-        if (phase.phase === "done") {
+        if (phase.phase === "done" || phase.phase === "reconcileDone") {
           dbOverview.value = {
             ...dbOverview.value,
             currentScanPhase: undefined,

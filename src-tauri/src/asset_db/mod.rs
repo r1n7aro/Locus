@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rayon::prelude::*;
@@ -22,6 +22,15 @@ use types::*;
 
 const SCAN_PROGRESS_TARGET_EVENTS: u64 = 96;
 const SCAN_PROGRESS_MIN_STEP: u64 = 32;
+const SCAN_CANCELLED_MESSAGE: &str = "Asset database scan cancelled.";
+
+fn ensure_scan_not_cancelled(cancel: &AtomicBool) -> Result<(), String> {
+    if cancel.load(Ordering::Relaxed) {
+        Err(SCAN_CANCELLED_MESSAGE.to_string())
+    } else {
+        Ok(())
+    }
+}
 
 fn scan_progress_emit_step(total: u64) -> u64 {
     if total == 0 {
@@ -262,6 +271,18 @@ impl AssetDb {
     where
         F: Fn(&ScanPhase) + Send + Sync,
     {
+        let cancel = AtomicBool::new(false);
+        self.full_scan_with_cancel(on_progress, &cancel)
+    }
+
+    pub fn full_scan_with_cancel<F>(
+        &mut self,
+        on_progress: F,
+        cancel: &AtomicBool,
+    ) -> Result<ScanStats, String>
+    where
+        F: Fn(&ScanPhase) + Send + Sync,
+    {
         let start = std::time::Instant::now();
         let mut stats = ScanStats::default();
 
@@ -271,16 +292,21 @@ impl AssetDb {
         // format machine-greppable: `[AssetDb][timing] <phase>=<ms>ms ...`.
         let mut phase_start = std::time::Instant::now();
 
+        ensure_scan_not_cancelled(cancel)?;
         on_progress(&ScanPhase::DirScan);
-        let snapshot = scanner::scan_directory(&self.project_root);
+        let snapshot = scanner::scan_directory_with_cancel(&self.project_root, cancel);
+        ensure_scan_not_cancelled(cancel)?;
         let t_dir_scan = phase_start.elapsed();
         stats.dirs_scanned = snapshot.dirs_scanned;
         stats.meta_files_found = snapshot.meta_files.len() as u64;
         stats.yaml_assets_found = snapshot.yaml_asset_files.len() as u64;
 
         eprintln!(
-            "[AssetDb] snapshot: {} dirs, {} .meta, {} yaml assets",
-            stats.dirs_scanned, stats.meta_files_found, stats.yaml_assets_found
+            "[AssetDb] snapshot: {} dirs, {} .meta, {} yaml assets, {} linked roots",
+            stats.dirs_scanned,
+            stats.meta_files_found,
+            stats.yaml_assets_found,
+            snapshot.linked_asset_roots.len()
         );
         eprintln!(
             "[AssetDb][timing] dir_scan={}ms ({} dirs, {} files)",
@@ -290,6 +316,7 @@ impl AssetDb {
         );
 
         phase_start = std::time::Instant::now();
+        ensure_scan_not_cancelled(cancel)?;
         on_progress(&ScanPhase::MetaParse {
             total: stats.meta_files_found,
             completed: 0,
@@ -301,6 +328,11 @@ impl AssetDb {
             .par_iter()
             .map(|entry| {
                 let outcome = (|| {
+                    ensure_scan_not_cancelled(cancel).map_err(|detail| ParseFailureEntry {
+                        kind: ParseFailureKind::ReadFailed,
+                        path: entry.rel_path.clone(),
+                        detail,
+                    })?;
                     let content = match std::fs::read(&entry.abs_path) {
                         Ok(content) => content,
                         Err(err) => {
@@ -335,6 +367,7 @@ impl AssetDb {
                 outcome
             })
             .collect();
+        ensure_scan_not_cancelled(cancel)?;
         let t_meta_par = phase_start.elapsed();
         let mut parse_failures = Vec::new();
         let mut meta_results = Vec::with_capacity(meta_outcomes.len());
@@ -432,6 +465,7 @@ impl AssetDb {
         }
 
         phase_start = std::time::Instant::now();
+        ensure_scan_not_cancelled(cancel)?;
         on_progress(&ScanPhase::YamlParse {
             total: stats.yaml_assets_found,
             completed: 0,
@@ -484,6 +518,11 @@ impl AssetDb {
             .par_iter()
             .map(|entry| {
                 let outcome = (|| {
+                    ensure_scan_not_cancelled(cancel).map_err(|detail| ParseFailureEntry {
+                        kind: ParseFailureKind::ReadFailed,
+                        path: entry.rel_path.clone(),
+                        detail,
+                    })?;
                     let src_guid = match path_to_guid.get(&entry.rel_path) {
                         Some(g) => *g,
                         None => {
@@ -538,6 +577,7 @@ impl AssetDb {
                 outcome
             })
             .collect();
+        ensure_scan_not_cancelled(cancel)?;
         let t_yaml_par = phase_start.elapsed();
         let mut yaml_results = Vec::with_capacity(yaml_outcomes.len());
         for outcome in yaml_outcomes {
@@ -670,6 +710,7 @@ impl AssetDb {
         );
 
         phase_start = std::time::Instant::now();
+        ensure_scan_not_cancelled(cancel)?;
         on_progress(&ScanPhase::DbWrite);
         let tx = self
             .conn
@@ -679,26 +720,37 @@ impl AssetDb {
 
         // Wipe + reinsert in the same transaction so a mid-write crash leaves
         // the previous state intact rather than an empty DB.
+        ensure_scan_not_cancelled(cancel)?;
         let t0 = std::time::Instant::now();
         db::clear_all_in_tx(&tx)?;
         let t_clear = t0.elapsed();
 
+        ensure_scan_not_cancelled(cancel)?;
         let t0 = std::time::Instant::now();
         stats.nodes_added = db::batch_insert_assets(&tx, &asset_nodes)?;
         let t_assets = t0.elapsed();
 
+        ensure_scan_not_cancelled(cancel)?;
         let t0 = std::time::Instant::now();
         db::batch_insert_files(&tx, &file_records)?;
         let t_files = t0.elapsed();
 
+        ensure_scan_not_cancelled(cancel)?;
         let t0 = std::time::Instant::now();
         db::set_scan_metrics(&tx, &stats.duplicate_guids, stats.parse_failures)?;
         let t_metrics = t0.elapsed();
 
+        ensure_scan_not_cancelled(cancel)?;
+        let t0 = std::time::Instant::now();
+        db::replace_linked_asset_roots(&tx, &snapshot.linked_asset_roots)?;
+        let t_linked_roots = t0.elapsed();
+
+        ensure_scan_not_cancelled(cancel)?;
         let t0 = std::time::Instant::now();
         stats.edges_added = db::batch_insert_edges(&tx, &edges)?;
         let t_edges = t0.elapsed();
 
+        ensure_scan_not_cancelled(cancel)?;
         let t0 = std::time::Instant::now();
         tx.commit()
             .map_err(|e| format!("Failed to commit: {}", e))?;
@@ -733,7 +785,7 @@ impl AssetDb {
         let t_risk_reports = t0.elapsed();
 
         eprintln!(
-            "[AssetDb][timing] db_write: tx_begin={}ms clear={}ms assets={}ms ({} rows) files={}ms ({} rows) metrics={}ms edges={}ms ({} rows) commit={}ms",
+            "[AssetDb][timing] db_write: tx_begin={}ms clear={}ms assets={}ms ({} rows) files={}ms ({} rows) metrics={}ms linked_roots={}ms ({} rows) edges={}ms ({} rows) commit={}ms",
             t_tx_begin.as_millis(),
             t_clear.as_millis(),
             t_assets.as_millis(),
@@ -741,6 +793,8 @@ impl AssetDb {
             t_files.as_millis(),
             file_records.len(),
             t_metrics.as_millis(),
+            t_linked_roots.as_millis(),
+            snapshot.linked_asset_roots.len(),
             t_edges.as_millis(),
             stats.edges_added,
             t_commit.as_millis()
@@ -910,6 +964,10 @@ impl AssetDb {
 
     pub fn project_root(&self) -> &Path {
         &self.project_root
+    }
+
+    pub(crate) fn linked_asset_roots(&self) -> Result<Vec<LinkedAssetRoot>, String> {
+        db::get_linked_asset_roots(&self.conn)
     }
 
     pub fn batch_resolve_paths(
@@ -1567,7 +1625,28 @@ fn sync_missing_reference_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path as StdPath;
     use uuid::Uuid;
+
+    #[cfg(unix)]
+    fn create_dir_symlink(source: &StdPath, link: &StdPath) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(source, link)
+    }
+
+    #[cfg(windows)]
+    fn create_dir_symlink(source: &StdPath, link: &StdPath) -> std::io::Result<()> {
+        std::os::windows::fs::symlink_dir(source, link)
+    }
+
+    fn create_dir_symlink_or_skip(source: &StdPath, link: &StdPath) -> bool {
+        match create_dir_symlink(source, link) {
+            Ok(()) => true,
+            Err(error) => {
+                eprintln!("skipping symlink test; failed to create directory symlink: {error}");
+                false
+            }
+        }
+    }
 
     fn temp_project_root() -> PathBuf {
         let root = std::env::temp_dir().join(format!("locus-assetdb-load-{}", Uuid::new_v4()));
@@ -1655,6 +1734,50 @@ mod tests {
         assert_eq!(overview.assets_only_groups, 1);
         assert_eq!(overview.packages_only_groups, 1);
         assert_eq!(overview.cross_root_groups, 1);
+    }
+
+    #[test]
+    fn full_scan_indexes_assets_inside_symlinked_asset_folders() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let root = temp.path().join("project");
+        let external = temp.path().join("shared-assets");
+        std::fs::create_dir_all(root.join("Assets")).expect("create assets dir");
+        std::fs::create_dir_all(&external).expect("create external target");
+        std::fs::write(
+            external.join("Hero.prefab"),
+            b"%YAML 1.1\n--- !u!1 &1000\nGameObject:\n  m_Name: Hero\n",
+        )
+        .expect("write linked prefab");
+        std::fs::write(
+            external.join("Hero.prefab.meta"),
+            b"fileFormatVersion: 2\nguid: 11111111111111111111111111111111\n",
+        )
+        .expect("write linked prefab meta");
+
+        if !create_dir_symlink_or_skip(&external, &root.join("Assets/Linked")) {
+            return;
+        }
+
+        let mut graph = AssetDb::open(&root).expect("open asset db");
+        let stats = graph.full_scan(|_| {}).expect("scan asset db");
+        assert_eq!(stats.meta_files_found, 1);
+        assert_eq!(stats.yaml_assets_found, 1);
+        assert_eq!(
+            graph
+                .resolve_guid_by_path("Assets/Linked/Hero.prefab")
+                .expect("resolve linked asset path"),
+            Some(parse_guid_hex("11111111111111111111111111111111").unwrap())
+        );
+
+        let linked_roots = graph
+            .linked_asset_roots()
+            .expect("load cached linked asset roots");
+        assert_eq!(linked_roots.len(), 1);
+        assert_eq!(linked_roots[0].link_rel_path, "Assets/Linked");
+        assert_eq!(
+            linked_roots[0].target_path,
+            dunce::canonicalize(&external).expect("canonical linked target")
+        );
     }
 
     #[test]

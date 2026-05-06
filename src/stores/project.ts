@@ -2,11 +2,11 @@ import { ref, computed } from "vue";
 import { defineStore } from "pinia";
 import * as projectService from "../services/project";
 import * as unityService from "../services/unity";
-import { assetDbOverview, assetDbScan } from "../services/asset";
+import { assetDbLightStatus, assetDbScanStart } from "../services/asset";
 import { normalizeAppError } from "../services/errors";
 import { useNotificationStore } from "./notification";
 import { t } from "../i18n";
-import type { AssetDbOverview, AssetDbScanEvent, ScanStats, PluginStatus } from "../types";
+import type { AssetDbLightStatus, AssetDbScanEvent, ScanStats, PluginStatus } from "../types";
 
 type PluginNoticeStatus = "missing" | "outdated";
 export type UnityLaunchState = "idle" | "starting" | "waitingConnection";
@@ -50,7 +50,10 @@ export const useProjectStore = defineStore("project", () => {
   }
 
   function isScanRunning(phase: AssetDbScanEvent | null): boolean {
-    return phase != null && phase.phase !== "done" && phase.phase !== "error";
+    return phase != null
+      && phase.phase !== "done"
+      && phase.phase !== "reconcileDone"
+      && phase.phase !== "error";
   }
 
   function clearUnityLaunchPoll() {
@@ -98,27 +101,32 @@ export const useProjectStore = defineStore("project", () => {
     scheduleUnityLaunchConnectionCheck();
   }
 
-  function minimalStatsFromOverview(overview: AssetDbOverview): ScanStats {
+  function minimalStatsFromLightStatus(status: AssetDbLightStatus): ScanStats {
     return {
       dirsScanned: 0,
       metaFilesFound: 0,
       yamlAssetsFound: 0,
-      nodesAdded: overview.nodes,
-      edgesAdded: overview.edges,
+      nodesAdded: status.nodes,
+      edgesAdded: status.edges,
       nodesUpdated: 0,
       nodesDeleted: 0,
-      parseFailures:
-        overview.assetRisks.find((entry) => entry.kind === "parseFailures")?.count ?? 0,
-      elapsedMs: overview.lastScanDurationMs ?? 0,
-      duplicateGuids: overview.duplicateGuids,
+      parseFailures: 0,
+      elapsedMs: status.lastScanDurationMs ?? 0,
+      duplicateGuids: {
+        groupCount: 0,
+        pathCount: 0,
+        assetsOnlyGroups: 0,
+        packagesOnlyGroups: 0,
+        crossRootGroups: 0,
+      },
     };
   }
 
-  function shouldAutoBuildFromOverview(overview: AssetDbOverview): boolean {
+  function shouldAutoBuildFromLightStatus(status: AssetDbLightStatus): boolean {
     if (!workingDir.value.trim()) return false;
     if (scanInFlight || isScanRunning(scanPhase.value)) return false;
-    if (overview.status === "none") return true;
-    const phase = overview.currentScanPhase;
+    if (status.status === "none") return true;
+    const phase = status.currentScanPhase;
     return phase?.phase === "error"
       && phase.error.code.startsWith("ref_graph.rescan_required.");
   }
@@ -137,6 +145,7 @@ export const useProjectStore = defineStore("project", () => {
     workingDir.value = result;
     scanPhase.value = null;
     lastScanStats.value = null;
+    scanInFlight = false;
     return result;
   }
 
@@ -153,19 +162,21 @@ export const useProjectStore = defineStore("project", () => {
     scanInFlight = true;
     scanPhase.value = { phase: "dirScan" };
     try {
-      const stats = await assetDbScan();
-      lastScanStats.value = stats;
+      const result = await assetDbScanStart();
+      if (!result.started && !result.alreadyRunning) {
+        scanInFlight = false;
+        scanPhase.value = null;
+      }
     } catch (e) {
       const err = normalizeAppError(e);
-      console.error("ref_graph_scan failed:", err);
+      scanInFlight = false;
+      console.error("ref_graph_scan_start failed:", err);
       scanPhase.value = { phase: "error", error: err };
       useNotificationStore().addNotice("error", err.message, {
         code: err.code,
-        operation: "ref_graph_scan",
+        operation: "ref_graph_scan_start",
         skipConsoleLog: true,
       });
-    } finally {
-      scanInFlight = false;
     }
   }
 
@@ -224,8 +235,8 @@ export const useProjectStore = defineStore("project", () => {
 
   async function loadAssetDbStatus() {
     try {
-      const overview = await assetDbOverview();
-      const currentPhase = overview.currentScanPhase ?? null;
+      const status = await assetDbLightStatus();
+      const currentPhase = status.currentScanPhase ?? null;
 
       if (currentPhase) {
         scanPhase.value = currentPhase;
@@ -233,25 +244,25 @@ export const useProjectStore = defineStore("project", () => {
         scanPhase.value = null;
       }
 
-      if (overview.lastScanStats) {
-        lastScanStats.value = overview.lastScanStats;
-      } else if (overview.status === "indexed") {
-        lastScanStats.value = minimalStatsFromOverview(overview);
-      } else if (overview.status === "none") {
+      if (status.lastScanStats) {
+        lastScanStats.value = status.lastScanStats;
+      } else if (status.status === "indexed") {
+        lastScanStats.value = minimalStatsFromLightStatus(status);
+      } else if (status.status === "none") {
         lastScanStats.value = null;
       }
 
-      if (overview.status === "indexed") {
+      if (status.status === "indexed") {
         console.log(
           "[AssetDb] loaded from existing DB:",
-          overview.nodes,
+          status.nodes,
           "assets,",
-          overview.edges,
+          status.edges,
           "edges",
         );
       }
 
-      if (shouldAutoBuildFromOverview(overview)) {
+      if (shouldAutoBuildFromLightStatus(status)) {
         void startScan();
       }
     } catch {
@@ -282,6 +293,8 @@ export const useProjectStore = defineStore("project", () => {
     if (event.phase === "done") {
       scanInFlight = false;
       lastScanStats.value = event.stats;
+    } else if (event.phase === "reconcileDone") {
+      scanPhase.value = null;
     } else if (event.phase === "error") {
       scanInFlight = false;
       console.error("[AssetDb] scan error:", event.error);

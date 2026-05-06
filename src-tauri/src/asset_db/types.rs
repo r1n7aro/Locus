@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 
 use crate::error::AppError;
@@ -311,6 +313,10 @@ pub enum ScanPhase {
     #[serde(rename_all = "camelCase")]
     DbWrite,
     #[serde(rename_all = "camelCase")]
+    Reconcile { verify_hashes: bool },
+    #[serde(rename_all = "camelCase")]
+    ReconcileDone,
+    #[serde(rename_all = "camelCase")]
     Done { stats: ScanStats },
     #[serde(rename_all = "camelCase")]
     Error { error: AppError },
@@ -329,6 +335,12 @@ pub struct DuplicateGuidOverview {
     pub packages_only_groups: u64,
     /// Collisions spanning multiple roots (for example `Assets/` + `Packages/`).
     pub cross_root_groups: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkedAssetRoot {
+    pub link_rel_path: String,
+    pub target_path: PathBuf,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

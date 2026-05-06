@@ -382,6 +382,8 @@ export type AssetDbScanEvent =
   | { phase: "metaParse"; total: number; completed: number }
   | { phase: "yamlParse"; total: number; completed: number }
   | { phase: "dbWrite" }
+  | { phase: "reconcile"; verifyHashes: boolean }
+  | { phase: "reconcileDone" }
   | { phase: "done"; stats: ScanStats }
   | { phase: "error"; error: AppErrorPayload };
 
@@ -2329,6 +2331,21 @@ export interface AssetDbOverview {
   duplicateGuidReportPath?: string;
   /** Sticky scan-phase snapshot. Same shape as AssetDbScanEvent. */
   currentScanPhase?: AssetDbScanEvent;
+}
+
+export interface AssetDbLightStatus {
+  status: AssetDbStatus;
+  nodes: number;
+  edges: number;
+  lastScanAt?: number;
+  lastScanDurationMs?: number;
+  lastScanStats?: ScanStats;
+  currentScanPhase?: AssetDbScanEvent;
+}
+
+export interface RefGraphScanStartResult {
+  started: boolean;
+  alreadyRunning: boolean;
 }
 
 export interface WatcherTuning {

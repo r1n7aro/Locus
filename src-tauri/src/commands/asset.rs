@@ -33,6 +33,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -180,14 +181,36 @@ impl LastScanInfoState {
 // mid-scan (or after the user missed the first `ref-graph-scan` event). The
 // snapshot is `None` when no scan is running and no error is sticky; on error
 // it holds `Some(ScanPhase::Error{..})` until the next scan starts; while
-// scanning it holds the latest `DirScan | MetaParse | YamlParse | DbWrite`
-// phase. `Done` is intentionally never stored — completion goes back to None.
+// scanning or verifying it holds the latest active phase. Completion events are
+// intentionally never stored — completion goes back to None.
 #[derive(Clone, Default)]
 pub struct ScanPhaseState(pub Arc<Mutex<Option<ScanPhase>>>);
 
 impl ScanPhaseState {
     pub fn new() -> Self {
         Self(Arc::new(Mutex::new(None)))
+    }
+
+    pub fn is_running_phase(phase: &ScanPhase) -> bool {
+        matches!(
+            phase,
+            ScanPhase::DirScan
+                | ScanPhase::MetaParse { .. }
+                | ScanPhase::YamlParse { .. }
+                | ScanPhase::DbWrite
+                | ScanPhase::Reconcile { .. }
+        )
+    }
+
+    pub fn try_begin_scan(&self) -> Result<bool, AppError> {
+        let mut guard = self.0.lock().map_err(|e| {
+            AppError::new("ref_graph.phase_lock_failed", format!("Lock error: {}", e))
+        })?;
+        if guard.as_ref().map(Self::is_running_phase).unwrap_or(false) {
+            return Ok(false);
+        }
+        *guard = Some(ScanPhase::DirScan);
+        Ok(true)
     }
 
     pub fn set(&self, phase: Option<ScanPhase>) {
@@ -202,6 +225,90 @@ impl ScanPhaseState {
 
     pub fn clear(&self) {
         self.set(None);
+    }
+}
+
+#[derive(Clone)]
+struct AssetDbReconcileTask {
+    cwd: String,
+    workspace_generation: u64,
+    cancel: Arc<AtomicBool>,
+}
+
+#[derive(Clone, Default)]
+pub struct AssetDbReconcileTaskState(Arc<Mutex<Option<AssetDbReconcileTask>>>);
+
+impl AssetDbReconcileTaskState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn register(&self, cwd: String, workspace_generation: u64) -> AssetDbReconcileRegistration {
+        let task = AssetDbReconcileTask {
+            cwd,
+            workspace_generation,
+            cancel: Arc::new(AtomicBool::new(false)),
+        };
+
+        if let Ok(mut guard) = self.0.lock() {
+            if let Some(previous) = guard.replace(task.clone()) {
+                previous.cancel.store(true, Ordering::Relaxed);
+                eprintln!(
+                    "[AssetDb] replaced active background reconcile for {} generation {}; cancellation requested",
+                    previous.cwd, previous.workspace_generation
+                );
+            }
+        }
+
+        AssetDbReconcileRegistration {
+            state: self.clone(),
+            task,
+        }
+    }
+
+    pub fn cancel_current(&self, reason: &str) {
+        let task = match self.0.lock() {
+            Ok(mut guard) => guard.take(),
+            Err(error) => {
+                eprintln!(
+                    "[AssetDb] failed to lock background reconcile state for cancellation: {error}"
+                );
+                None
+            }
+        };
+
+        if let Some(task) = task {
+            task.cancel.store(true, Ordering::Relaxed);
+            eprintln!(
+                "[AssetDb] cancelling background reconcile for {} generation {} ({})",
+                task.cwd, task.workspace_generation, reason
+            );
+        }
+    }
+}
+
+pub struct AssetDbReconcileRegistration {
+    state: AssetDbReconcileTaskState,
+    task: AssetDbReconcileTask,
+}
+
+impl AssetDbReconcileRegistration {
+    pub fn cancel_token(&self) -> Arc<AtomicBool> {
+        self.task.cancel.clone()
+    }
+}
+
+impl Drop for AssetDbReconcileRegistration {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.state.0.lock() {
+            if guard
+                .as_ref()
+                .map(|current| Arc::ptr_eq(&current.cancel, &self.task.cancel))
+                .unwrap_or(false)
+            {
+                *guard = None;
+            }
+        }
     }
 }
 
@@ -272,6 +379,22 @@ pub struct AssetDbOverview {
     pub current_scan_phase: Option<ScanPhase>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssetDbLightStatus {
+    pub status: AssetDbStatus,
+    pub nodes: u64,
+    pub edges: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_scan_at: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_scan_duration_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_scan_stats: Option<ScanStats>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_scan_phase: Option<ScanPhase>,
+}
+
 // ── Command: asset_db_overview ──
 
 /// Classify a `ScanPhase` snapshot for status-derivation purposes.
@@ -280,11 +403,12 @@ fn classify_scan_phase(phase: &ScanPhase) -> AssetDbStatus {
         ScanPhase::DirScan
         | ScanPhase::MetaParse { .. }
         | ScanPhase::YamlParse { .. }
-        | ScanPhase::DbWrite => AssetDbStatus::Scanning,
+        | ScanPhase::DbWrite
+        | ScanPhase::Reconcile { .. } => AssetDbStatus::Scanning,
         ScanPhase::Error { .. } => AssetDbStatus::Error,
-        // `Done` is never stored in `ScanPhaseState` (we set to None on
+        // Completion is never stored in `ScanPhaseState` (we set to None on
         // success), but the match needs to be exhaustive. Treat it as idle.
-        ScanPhase::Done { .. } => AssetDbStatus::Indexed,
+        ScanPhase::Done { .. } | ScanPhase::ReconcileDone => AssetDbStatus::Indexed,
     }
 }
 
@@ -485,6 +609,59 @@ pub async fn asset_db_overview(
             })
         }
     }
+}
+
+#[tauri::command]
+pub async fn asset_db_light_status(
+    ref_graph_state: State<'_, AssetDbState>,
+    last_scan_info: State<'_, LastScanInfoState>,
+    scan_phase: State<'_, ScanPhaseState>,
+    workspace: State<'_, Arc<Workspace>>,
+) -> Result<AssetDbLightStatus, AppError> {
+    let working_dir = workspace.path.read().await.clone();
+    let project_root = Path::new(&working_dir);
+    let last = last_scan_info.snapshot();
+    let last_scan_at = last
+        .as_ref()
+        .map(|i| i.finished_at_unix_ms)
+        .or_else(|| db_last_updated_unix_ms(project_root));
+    let last_scan_duration_ms = last.as_ref().map(|i| i.duration_ms);
+    let last_scan_stats = last.as_ref().map(|i| i.stats.clone());
+
+    let phase_snapshot = scan_phase.snapshot();
+    let phase_derived_status = phase_snapshot.as_ref().map(classify_scan_phase);
+
+    let guard = ref_graph_state
+        .0
+        .lock()
+        .map_err(|e| AppError::new("ref_graph.lock_failed", format!("Lock error: {}", e)))?;
+
+    let (db_loaded, nodes, edges) = match &*guard {
+        Some(graph) => {
+            let (nodes, edges) = graph
+                .get_stats()
+                .map_err(|e| AppError::new("ref_graph.stats_failed", e))?;
+            (true, nodes, edges)
+        }
+        None => (false, 0, 0),
+    };
+
+    let status = match phase_derived_status {
+        Some(AssetDbStatus::Scanning) => AssetDbStatus::Scanning,
+        Some(AssetDbStatus::Error) => AssetDbStatus::Error,
+        _ if db_loaded => AssetDbStatus::Indexed,
+        _ => AssetDbStatus::None,
+    };
+
+    Ok(AssetDbLightStatus {
+        status,
+        nodes,
+        edges,
+        last_scan_at,
+        last_scan_duration_ms,
+        last_scan_stats,
+        current_scan_phase: phase_snapshot,
+    })
 }
 
 #[tauri::command]
@@ -774,7 +951,7 @@ fn walk_root_for_search(
     }
     let walker = WalkDir::new(&root_dir)
         .max_depth(FALLBACK_WALK_MAX_DEPTH)
-        .follow_links(false)
+        .follow_links(true)
         .into_iter()
         .filter_entry(|entry| {
             // Skip well-known noise dirs at any depth.
@@ -1310,46 +1487,48 @@ fn text_language_for_ext(ext: &str) -> Option<&'static str> {
     }
 }
 
-/// Validates that `requested` (a workspace-relative path string) resolves to a
-/// real file inside `workspace_root`. Returns the canonical absolute path on
-/// success, or an `AppError` on any failure.
-///
-/// The check is intentionally strict: after canonicalization, the path must
-/// still start with the canonical workspace root. This rejects `../` escapes
-/// and absolute paths outside the workspace.
-fn resolve_workspace_path(workspace_root: &Path, requested: &str) -> Result<PathBuf, AppError> {
-    if requested.contains("..") {
+/// Validates that `requested` is a workspace-relative file path. Symlinked
+/// directories are accepted when the path is reached through the workspace
+/// tree, matching Unity's treatment of linked asset folders.
+fn resolve_workspace_path(
+    workspace_root: &Path,
+    requested: &str,
+) -> Result<(PathBuf, String), AppError> {
+    let rel_path = super::workspace::normalize_workspace_sub_path(requested).map_err(|_| {
+        AppError::new(
+            "asset.preview.invalid_path",
+            format!("Path is not within the workspace: {}", requested),
+        )
+    })?;
+    if rel_path.is_empty() {
         return Err(AppError::new(
             "asset.preview.invalid_path",
-            format!("Path may not contain '..' segments: {}", requested),
+            "Asset preview path cannot be empty.",
         ));
     }
-    let candidate = workspace_root.join(requested.replace('\\', "/"));
-    let canonical = dunce::canonicalize(&candidate).map_err(|e| {
-        AppError::new(
-            "asset.preview.not_found",
-            format!("File not found: {} ({})", requested, e),
-        )
-    })?;
-    let canonical_root = dunce::canonicalize(workspace_root).map_err(|e| {
-        AppError::new(
-            "asset.preview.invalid_workspace",
-            format!("Workspace root not accessible: {}", e),
-        )
-    })?;
-    if !canonical.starts_with(&canonical_root) {
+    if root_for_rel_path(&rel_path).is_none() {
         return Err(AppError::new(
-            "asset.preview.escape",
-            format!("Path escapes workspace: {}", requested),
+            "asset.preview.invalid_root",
+            format!(
+                "Asset preview only supports Assets, Packages, and ProjectSettings paths: {}",
+                requested
+            ),
         ));
     }
-    if !canonical.is_file() {
+    let candidate = workspace_root.join(&rel_path);
+    if !candidate.exists() {
+        return Err(AppError::new(
+            "asset.preview.not_found",
+            format!("File not found: {}", requested),
+        ));
+    }
+    if !candidate.is_file() {
         return Err(AppError::new(
             "asset.preview.not_file",
             format!("Path is not a regular file: {}", requested),
         ));
     }
-    Ok(canonical)
+    Ok((candidate, rel_path))
 }
 
 /// Read up to `TEXT_SNIPPET_MAX_LINES` lines / `TEXT_SNIPPET_MAX_BYTES` bytes
@@ -2108,7 +2287,7 @@ pub async fn preview_workspace_asset(
         ));
     }
     let workspace_root = PathBuf::from(&cwd);
-    let canonical = resolve_workspace_path(&workspace_root, &file_path)?;
+    let (canonical, asset_rel_path) = resolve_workspace_path(&workspace_root, &file_path)?;
 
     let ext = canonical
         .extension()
@@ -2129,9 +2308,9 @@ pub async fn preview_workspace_asset(
     // Slice 3d Scene/Prefab structured dispatch. Try this BEFORE the YAML
     // path so .unity/.prefab don't get caught by the catch-all YAML branch.
     if is_scene_or_prefab_ext(&ext) {
-        let asset_kind = crate::diff::content::unity_asset_kind(&file_path);
+        let asset_kind = crate::diff::content::unity_asset_kind(&asset_rel_path);
         if let Some(payload) = try_build_scene_structured_payload(
-            &file_path,
+            &asset_rel_path,
             &canonical,
             asset_kind,
             &preview_cache,
@@ -2145,9 +2324,9 @@ pub async fn preview_workspace_asset(
     // Slice 3c YAML structured dispatch (Material/ScriptableObject/AnimClip/
     // AnimatorController/GenericYaml).
     if is_slice3c_yaml_ext(&ext) {
-        let asset_kind = crate::diff::content::unity_asset_kind(&file_path);
+        let asset_kind = crate::diff::content::unity_asset_kind(&asset_rel_path);
         if let Some(payload) = try_build_yaml_structured_payload(
-            &file_path,
+            &asset_rel_path,
             &canonical,
             asset_kind,
             &preview_cache,
@@ -2165,7 +2344,7 @@ pub async fn preview_workspace_asset(
     //   + locus-binary URI protocol. On success → `binaryPreview` payload.
     //   On unknown kind / oversized / read error → `binaryInfo` fallback.
     let payload = build_binary_payload(
-        &file_path,
+        &asset_rel_path,
         &canonical,
         binary_cache.inner(),
         &ref_graph_state,
@@ -2184,6 +2363,27 @@ pub async fn preview_workspace_asset(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path as StdPath;
+
+    #[cfg(unix)]
+    fn create_dir_symlink(source: &StdPath, link: &StdPath) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(source, link)
+    }
+
+    #[cfg(windows)]
+    fn create_dir_symlink(source: &StdPath, link: &StdPath) -> std::io::Result<()> {
+        std::os::windows::fs::symlink_dir(source, link)
+    }
+
+    fn create_dir_symlink_or_skip(source: &StdPath, link: &StdPath) -> bool {
+        match create_dir_symlink(source, link) {
+            Ok(()) => true,
+            Err(error) => {
+                eprintln!("skipping symlink test; failed to create directory symlink: {error}");
+                false
+            }
+        }
+    }
 
     #[test]
     fn root_for_rel_path_classifies_known_roots() {
@@ -2253,6 +2453,72 @@ mod tests {
             extract_bare_terms("t:prefab hero enemy under:Assets/UI hero"),
             vec!["hero".to_string(), "enemy".to_string()]
         );
+    }
+
+    #[test]
+    fn asset_preview_resolution_allows_files_inside_symlinked_asset_folders() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let workspace = temp.path().join("project");
+        let external = temp.path().join("external-assets");
+        std::fs::create_dir_all(workspace.join("Assets")).expect("create assets dir");
+        std::fs::create_dir_all(&external).expect("create external target");
+        std::fs::write(external.join("Hero.cs"), b"class Hero {}").expect("write linked file");
+
+        if !create_dir_symlink_or_skip(&external, &workspace.join("Assets/Linked")) {
+            return;
+        }
+
+        let (resolved, rel_path) = resolve_workspace_path(&workspace, "Assets/Linked/Hero.cs")
+            .expect("resolve linked asset file");
+        assert_eq!(rel_path, "Assets/Linked/Hero.cs");
+        assert_eq!(
+            std::fs::read_to_string(resolved).expect("read resolved file"),
+            "class Hero {}"
+        );
+    }
+
+    #[test]
+    fn asset_preview_resolution_rejects_symlinks_outside_asset_roots() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let workspace = temp.path().join("project");
+        let external = temp.path().join("external-docs");
+        std::fs::create_dir_all(workspace.join("Assets")).expect("create assets dir");
+        std::fs::create_dir_all(&external).expect("create external target");
+        std::fs::write(external.join("Secret.txt"), b"secret").expect("write linked file");
+
+        if !create_dir_symlink_or_skip(&external, &workspace.join("Docs")) {
+            return;
+        }
+
+        let err = resolve_workspace_path(&workspace, "Docs/Secret.txt")
+            .expect_err("reject non-asset linked file");
+        assert_eq!(err.code, "asset.preview.invalid_root");
+    }
+
+    #[test]
+    fn asset_search_fallback_follows_symlinked_asset_folders() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let workspace = temp.path().join("project");
+        let external = temp.path().join("external-assets");
+        std::fs::create_dir_all(workspace.join("Assets")).expect("create assets dir");
+        std::fs::create_dir_all(&external).expect("create external target");
+        std::fs::write(external.join("Hero.prefab"), b"prefab").expect("write linked file");
+
+        if !create_dir_symlink_or_skip(&external, &workspace.join("Assets/Linked")) {
+            return;
+        }
+
+        let mut results = Vec::new();
+        walk_root_for_search(
+            &workspace,
+            AssetSearchRoot::Assets,
+            &[String::from("hero")],
+            &mut results,
+        );
+
+        assert!(results
+            .iter()
+            .any(|result| result.path == "Assets/Linked/Hero.prefab"));
     }
 
     #[test]

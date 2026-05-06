@@ -6,6 +6,7 @@ import type { AssetPreviewPayload, SemanticTargetInspector, SemanticTreeNode } f
 const assetServiceMocks = vi.hoisted(() => ({
   assetDbOverview: vi.fn(),
   assetDbScan: vi.fn(),
+  assetDbScanStart: vi.fn(),
   searchWorkspaceAssets: vi.fn(),
   previewWorkspaceAsset: vi.fn(),
   previewWorkspaceAssetTarget: vi.fn(),
