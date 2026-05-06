@@ -41,9 +41,10 @@ describe("selector dropdown alignment", () => {
     expect(source).toContain("right: 0;");
     expect(source).toContain("transform-origin: bottom right;");
     expect(source).toContain(".model-effort-dropdown.has-effort {");
-    expect(source).toContain("grid-template-columns: minmax(0, 1fr) 142px;");
+    expect(source).toContain("grid-template-columns: minmax(0, 1fr) 96px;");
     expect(source).toContain(".model-effort-effort-panel {");
     expect(source).toContain("border-left: 1px solid var(--border-color);");
+    expect(source).not.toContain("model-effort-option-desc");
     expect(source).toContain("selectModel: [id: string]");
     expect(source).toContain("selectEffort: [level: EffortLevel]");
   });

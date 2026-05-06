@@ -203,7 +203,6 @@ onUnmounted(() => document.removeEventListener("click", onClickOutside));
             @click="selectEffort(level.value)"
           >
             <span class="model-effort-option-name">{{ level.label }}</span>
-            <span class="model-effort-option-desc">{{ level.desc }}</span>
           </button>
         </div>
       </div>
@@ -303,7 +302,7 @@ onUnmounted(() => document.removeEventListener("click", onClickOutside));
 .model-effort-dropdown.has-effort {
   width: min(420px, calc(100vw - 24px));
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 142px;
+  grid-template-columns: minmax(0, 1fr) 96px;
 }
 
 :root[data-theme="dark"] .model-effort-dropdown {
@@ -379,12 +378,6 @@ onUnmounted(() => document.removeEventListener("click", onClickOutside));
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.model-effort-option-desc {
-  flex-shrink: 0;
-  color: var(--text-secondary);
-  font-size: 11px;
 }
 
 .dropdown-enter-active,
