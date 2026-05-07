@@ -945,8 +945,45 @@ namespace Locus
                     case "execute_code":
                         return await HandleExecuteCode(reqId, msg.message);
 
+                    case "cancel_execute_code":
+                        return HandleCancelExecuteCode(reqId);
+
                     case "execute_code_progress":
                         return OkResponse(reqId, GetExecuteCodeProgressJson());
+
+                    case "export_type_index":
+                    {
+                        var tcs = new TaskCompletionSource<PipeEnvelope>();
+                        PostToMainThread(delegate
+                        {
+                            try
+                            {
+                                tcs.SetResult(OkResponse(reqId, ExportTypeIndexJson()));
+                            }
+                            catch (Exception ex)
+                            {
+                                tcs.SetResult(ErrorResponse(reqId, ex.ToString()));
+                            }
+                        });
+                        return await tcs.Task;
+                    }
+
+                    case "export_type_index_fingerprint":
+                    {
+                        var tcs = new TaskCompletionSource<PipeEnvelope>();
+                        PostToMainThread(delegate
+                        {
+                            try
+                            {
+                                tcs.SetResult(OkResponse(reqId, ExportTypeIndexFingerprintJson()));
+                            }
+                            catch (Exception ex)
+                            {
+                                tcs.SetResult(ErrorResponse(reqId, ex.ToString()));
+                            }
+                        });
+                        return await tcs.Task;
+                    }
 
                     case "run_states":
                         return await HandleRunStates(reqId, msg.message);

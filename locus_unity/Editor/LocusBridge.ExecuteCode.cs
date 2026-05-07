@@ -23,23 +23,36 @@ namespace Locus
     {
         // ───────────────── execute_code shared helpers ─────────────────
 
-        private static async Task<string> EnsureExecuteCodeCompilationReadyAsync()
+        private static async Task<string> EnsureExecuteCodeCompilationReadyAsync(
+            Action<string> reportStage = null,
+            CancellationToken cancellationToken = default(CancellationToken))
         {
+            ThrowIfExecuteCodeCanceled(cancellationToken);
+            ReportExecuteCodeCompilerStage(reportStage, "Checking compiler cache");
             lock (_compileCacheLock)
             {
                 if (_metadataReferencesReady && _cachedMetadataReferences != null)
+                {
+                    ReportExecuteCodeCompilerStage(reportStage, "Compiler cache ready");
                     return null;
+                }
             }
 
             var tcs = new TaskCompletionSource<string>();
 
             // Build Unity-dependent metadata references on the main thread the first time execute_code runs.
+            ReportExecuteCodeCompilerStage(reportStage, "Waiting for Unity main thread");
             PostToMainThread(delegate
             {
                 try
                 {
-                    EnsureMetadataReferences();
+                    ThrowIfExecuteCodeCanceled(cancellationToken);
+                    EnsureMetadataReferences(reportStage, cancellationToken);
                     tcs.TrySetResult(null);
+                }
+                catch (OperationCanceledException)
+                {
+                    tcs.TrySetResult("execute_code canceled");
                 }
                 catch (Exception ex)
                 {
@@ -47,11 +60,28 @@ namespace Locus
                 }
             });
 
-            Task completed = await Task.WhenAny(tcs.Task, Task.Delay(ExecuteTimeoutMs));
+            Task delayTask = Task.Delay(ExecuteTimeoutMs, cancellationToken);
+            Task completed = await Task.WhenAny(tcs.Task, delayTask);
+            if (cancellationToken.IsCancellationRequested)
+                return "execute_code canceled";
             if (completed != tcs.Task)
                 return "prepare execute_code timed out";
 
             return tcs.Task.Result;
+        }
+
+        private static void ReportExecuteCodeCompilerStage(Action<string> reportStage, string stage)
+        {
+            if (reportStage == null || string.IsNullOrEmpty(stage))
+                return;
+
+            try
+            {
+                reportStage(stage);
+            }
+            catch
+            {
+            }
         }
 
         private static void SplitLeadingUsings(string code, out string leadingUsings, out string bodyCode)
@@ -158,60 +188,89 @@ namespace Locus
 
         // ───────────────── MetadataReference collection ─────────────────
 
-        private static List<MetadataReference> EnsureMetadataReferences()
+        private static void ThrowIfExecuteCodeCanceled(CancellationToken cancellationToken)
         {
+            if (cancellationToken.IsCancellationRequested)
+                throw new OperationCanceledException(cancellationToken);
+        }
+
+        private static List<MetadataReference> EnsureMetadataReferences(
+            Action<string> reportStage = null,
+            CancellationToken cancellationToken = default(CancellationToken))
+        {
+            ThrowIfExecuteCodeCanceled(cancellationToken);
+            ReportExecuteCodeCompilerStage(reportStage, "Locking compiler reference cache");
             lock (_compileCacheLock)
             {
+                ThrowIfExecuteCodeCanceled(cancellationToken);
                 if (_metadataReferencesReady && _cachedMetadataReferences != null)
+                {
+                    ReportExecuteCodeCompilerStage(reportStage, "Compiler reference cache ready");
                     return _cachedMetadataReferences;
+                }
 
-                _cachedMetadataReferences = BuildMetadataReferences();
+                _cachedMetadataReferences = BuildMetadataReferences(reportStage, cancellationToken);
                 _metadataReferencesReady = true;
+                ReportExecuteCodeCompilerStage(reportStage, "Compiler reference cache ready");
                 return _cachedMetadataReferences;
             }
         }
 
-        private static List<MetadataReference> BuildMetadataReferences()
+        private static List<MetadataReference> BuildMetadataReferences(
+            Action<string> reportStage = null,
+            CancellationToken cancellationToken = default(CancellationToken))
         {
             List<MetadataReference> references = new List<MetadataReference>(384);
             HashSet<string> referencedPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
+            ThrowIfExecuteCodeCanceled(cancellationToken);
+            ReportExecuteCodeCompilerStage(reportStage, "Adding core compiler references");
             TryAddMetadataReference(references, referencedPaths, SafeGetAssemblyLocation(typeof(object).Assembly));
             TryAddMetadataReference(references, referencedPaths, SafeGetAssemblyLocation(typeof(Enumerable).Assembly));
             TryAddMetadataReference(references, referencedPaths, SafeGetAssemblyLocation(typeof(UnityEngine.Debug).Assembly));
             TryAddMetadataReference(references, referencedPaths, SafeGetAssemblyLocation(typeof(UnityEditor.Editor).Assembly));
             TryAddMetadataReference(references, referencedPaths, SafeGetAssemblyLocation(typeof(LocusBridge).Assembly));
 
-            AddSystemAssemblyDirectories(references, referencedPaths);
+            AddSystemAssemblyDirectories(references, referencedPaths, reportStage, cancellationToken);
 
-            AddPrecompiledAssemblies(references, referencedPaths);
+            AddPrecompiledAssemblies(references, referencedPaths, reportStage, cancellationToken);
 
-            AddCompilationAssemblies(references, referencedPaths, AssembliesType.Editor);
-            AddCompilationAssemblies(references, referencedPaths, AssembliesType.PlayerWithoutTestAssemblies);
+            AddCompilationAssemblies(references, referencedPaths, AssembliesType.Editor, reportStage, cancellationToken);
+            AddCompilationAssemblies(references, referencedPaths, AssembliesType.PlayerWithoutTestAssemblies, reportStage, cancellationToken);
 
+            ReportExecuteCodeCompilerStage(reportStage, "Adding loaded AppDomain assemblies");
             foreach (Assembly asm in AppDomain.CurrentDomain.GetAssemblies())
             {
                 try
                 {
+                    ThrowIfExecuteCodeCanceled(cancellationToken);
                     if (asm == null || asm.IsDynamic)
                         continue;
 
                     TryAddMetadataReference(references, referencedPaths, SafeGetAssemblyLocation(asm));
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
                 }
                 catch
                 {
                 }
             }
 
-            AddScriptAssembliesDirectory(references, referencedPaths);
+            AddScriptAssembliesDirectory(references, referencedPaths, reportStage, cancellationToken);
 
             return references;
         }
 
         private static void AddSystemAssemblyDirectories(
             List<MetadataReference> references,
-            HashSet<string> referencedPaths)
+            HashSet<string> referencedPaths,
+            Action<string> reportStage = null,
+            CancellationToken cancellationToken = default(CancellationToken))
         {
+            ThrowIfExecuteCodeCanceled(cancellationToken);
+            ReportExecuteCodeCompilerStage(reportStage, "Adding Unity system assemblies");
             try
             {
                 ApiCompatibilityLevel apiCompatibilityLevel;
@@ -239,8 +298,15 @@ namespace Locus
                     }
 
                     for (int j = 0; j < dlls.Length; j++)
+                    {
+                        ThrowIfExecuteCodeCanceled(cancellationToken);
                         TryAddMetadataReference(references, referencedPaths, dlls[j]);
+                    }
                 }
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
             }
             catch
             {
@@ -265,8 +331,12 @@ namespace Locus
 
         private static void AddPrecompiledAssemblies(
             List<MetadataReference> references,
-            HashSet<string> referencedPaths)
+            HashSet<string> referencedPaths,
+            Action<string> reportStage = null,
+            CancellationToken cancellationToken = default(CancellationToken))
         {
+            ThrowIfExecuteCodeCanceled(cancellationToken);
+            ReportExecuteCodeCompilerStage(reportStage, "Adding precompiled assemblies");
             try
             {
                 string[] precompiledPaths =
@@ -277,7 +347,14 @@ namespace Locus
                     return;
 
                 for (int i = 0; i < precompiledPaths.Length; i++)
+                {
+                    ThrowIfExecuteCodeCanceled(cancellationToken);
                     TryAddMetadataReference(references, referencedPaths, precompiledPaths[i]);
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
             }
             catch
             {
@@ -287,13 +364,26 @@ namespace Locus
         private static void AddCompilationAssemblies(
             List<MetadataReference> references,
             HashSet<string> referencedPaths,
-            AssembliesType assembliesType)
+            AssembliesType assembliesType,
+            Action<string> reportStage = null,
+            CancellationToken cancellationToken = default(CancellationToken))
         {
+            ThrowIfExecuteCodeCanceled(cancellationToken);
+            ReportExecuteCodeCompilerStage(
+                reportStage,
+                assembliesType == AssembliesType.Editor
+                    ? "Adding editor compilation assemblies"
+                    : "Adding player compilation assemblies");
+
             UnityEditor.Compilation.Assembly[] assemblies = null;
 
             try
             {
                 assemblies = CompilationPipeline.GetAssemblies(assembliesType);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
             }
             catch
             {
@@ -305,6 +395,7 @@ namespace Locus
 
             for (int i = 0; i < assemblies.Length; i++)
             {
+                ThrowIfExecuteCodeCanceled(cancellationToken);
                 UnityEditor.Compilation.Assembly asm = assemblies[i];
                 if (asm == null)
                     continue;
@@ -316,14 +407,21 @@ namespace Locus
                     continue;
 
                 for (int j = 0; j < allRefs.Length; j++)
+                {
+                    ThrowIfExecuteCodeCanceled(cancellationToken);
                     TryAddMetadataReference(references, referencedPaths, allRefs[j]);
+                }
             }
         }
 
         private static void AddScriptAssembliesDirectory(
             List<MetadataReference> references,
-            HashSet<string> referencedPaths)
+            HashSet<string> referencedPaths,
+            Action<string> reportStage = null,
+            CancellationToken cancellationToken = default(CancellationToken))
         {
+            ThrowIfExecuteCodeCanceled(cancellationToken);
+            ReportExecuteCodeCompilerStage(reportStage, "Adding ScriptAssemblies");
             try
             {
                 string projectRoot = Path.GetDirectoryName(Application.dataPath);
@@ -343,7 +441,14 @@ namespace Locus
                 }
 
                 for (int i = 0; i < dlls.Length; i++)
+                {
+                    ThrowIfExecuteCodeCanceled(cancellationToken);
                     TryAddMetadataReference(references, referencedPaths, dlls[i]);
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
             }
             catch
             {

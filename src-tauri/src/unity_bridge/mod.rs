@@ -37,6 +37,7 @@ pub struct PipeResponse {
 }
 
 pub const UNITY_EXECUTE_PROGRESS_TAG: &str = "locus-unity-progress";
+pub const UNITY_EXECUTE_CANCELLED: &str = "__locus_unity_execute_cancelled__";
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -792,7 +793,8 @@ pub async fn unity_run_states(
 ) -> Result<String, String> {
     requested_run_states_editor_status(request)?;
 
-    let payload = serde_json::to_string(request)
+    let prepared = prepare_unity_run_states_request_for_send(project_path, request).await;
+    let payload = serde_json::to_string(&prepared.request)
         .map_err(|error| format!("Failed to serialize unity_run_states request: {}", error))?;
     let resp = send_message_without_timeout(project_path, "run_states", &payload).await?;
     let output = if resp.ok {
@@ -802,11 +804,23 @@ pub async fn unity_run_states(
             .unwrap_or_else(|| "unity_run_states failed".to_string())
     };
 
-    let rewritten = rewrite_run_states_output_for_size(project_path, output)?;
+    let rewritten = match rewrite_run_states_output_for_size(project_path, output) {
+        Ok(output) => output,
+        Err(error) if resp.ok => return Err(error),
+        Err(error) => {
+            return Err(crate::unity_type_index::append_auto_using_notes(
+                error,
+                &prepared.prepared_code,
+            ));
+        }
+    };
     if resp.ok {
         Ok(rewritten)
     } else {
-        Err(rewritten)
+        Err(crate::unity_type_index::append_auto_using_notes(
+            rewritten,
+            &prepared.prepared_code,
+        ))
     }
 }
 
@@ -816,7 +830,8 @@ pub async fn compile_run_states(
 ) -> Result<String, String> {
     requested_run_states_editor_status(request)?;
 
-    let payload = serde_json::to_string(request).map_err(|error| {
+    let prepared = prepare_unity_run_states_request_for_send(project_path, request).await;
+    let payload = serde_json::to_string(&prepared.request).map_err(|error| {
         format!(
             "Failed to serialize unity_run_states compilation request: {}",
             error
@@ -826,9 +841,11 @@ pub async fn compile_run_states(
     if resp.ok {
         Ok(resp.message.unwrap_or_default())
     } else {
-        Err(resp
-            .error
-            .unwrap_or_else(|| "unity_run_states compilation failed".to_string()))
+        Err(crate::unity_type_index::append_auto_using_notes(
+            resp.error
+                .unwrap_or_else(|| "unity_run_states compilation failed".to_string()),
+            &prepared.prepared_code,
+        ))
     }
 }
 
@@ -947,6 +964,119 @@ async fn query_unity_execute_progress(project_path: &str) -> Option<UnityExecute
     serde_json::from_str(&message).ok()
 }
 
+pub async fn cancel_unity_execute_code(project_path: &str) -> Result<String, String> {
+    let resp = send_message_with_timeout(
+        project_path,
+        "cancel_execute_code",
+        "",
+        Duration::from_secs(5),
+    )
+    .await?;
+
+    if resp.ok {
+        Ok(resp.message.unwrap_or_default())
+    } else {
+        Err(resp
+            .error
+            .unwrap_or_else(|| "cancel_execute_code failed".to_string()))
+    }
+}
+
+pub async fn refresh_unity_type_index(
+    project_path: &str,
+) -> Result<Arc<crate::unity_type_index::UnityTypeIndex>, String> {
+    let resp = send_message_with_timeout(
+        project_path,
+        "export_type_index",
+        "",
+        Duration::from_secs(30),
+    )
+    .await?;
+
+    if !resp.ok {
+        return Err(resp
+            .error
+            .unwrap_or_else(|| "export_type_index failed".to_string()));
+    }
+
+    let message = resp.message.unwrap_or_default();
+    crate::unity_type_index::persist_exported_type_index(project_path, &message).await
+}
+
+async fn current_unity_type_index_fingerprint(project_path: &str) -> Result<String, String> {
+    let resp = send_message_with_timeout(
+        project_path,
+        "export_type_index_fingerprint",
+        "",
+        Duration::from_secs(10),
+    )
+    .await?;
+
+    if !resp.ok {
+        return Err(resp
+            .error
+            .unwrap_or_else(|| "export_type_index_fingerprint failed".to_string()));
+    }
+
+    let message = resp.message.unwrap_or_default();
+    crate::unity_type_index::parse_exported_type_index_fingerprint(&message)
+}
+
+async fn cached_unity_type_index_is_current(
+    project_path: &str,
+    index: &crate::unity_type_index::UnityTypeIndex,
+) -> Result<bool, String> {
+    let current_fingerprint = current_unity_type_index_fingerprint(project_path).await?;
+    Ok(!index.fingerprint.is_empty() && index.fingerprint == current_fingerprint)
+}
+
+async fn unity_type_index_for_execute(
+    project_path: &str,
+) -> Option<Arc<crate::unity_type_index::UnityTypeIndex>> {
+    match crate::unity_type_index::load_cached_type_index(project_path).await {
+        Ok(Some(index)) => match cached_unity_type_index_is_current(project_path, &index).await {
+            Ok(true) => return Some(index),
+            Ok(false) => {
+                eprintln!("[Locus] Unity type index cache is stale; refreshing.");
+                crate::unity_type_index::invalidate_cached_type_index(project_path).await;
+            }
+            Err(error) => {
+                eprintln!(
+                    "[Locus] Unity type index cache validation failed; refreshing: {}",
+                    error
+                );
+                crate::unity_type_index::invalidate_cached_type_index(project_path).await;
+            }
+        },
+        Ok(None) => {}
+        Err(error) => eprintln!("[Locus] Unity type index cache ignored: {}", error),
+    }
+
+    match refresh_unity_type_index(project_path).await {
+        Ok(index) => Some(index),
+        Err(error) => {
+            eprintln!("[Locus] Unity type index export skipped: {}", error);
+            None
+        }
+    }
+}
+
+async fn prepare_unity_execute_code_for_send(
+    project_path: &str,
+    code: &str,
+) -> crate::unity_type_index::PreparedUnityCode {
+    let index = unity_type_index_for_execute(project_path).await;
+    crate::unity_type_index::prepare_unity_execute_code(code, index.as_deref())
+}
+
+async fn prepare_unity_run_states_request_for_send(
+    project_path: &str,
+    request: &serde_json::Value,
+) -> crate::unity_type_index::PreparedUnityRunStatesRequest {
+    let index = unity_type_index_for_execute(project_path).await;
+    crate::unity_type_index::prepare_unity_run_states_request(request, index.as_deref())
+}
+
 pub async fn unity_execute_code_with_progress<F>(
     project_path: &str,
     code: &str,
@@ -958,7 +1088,8 @@ where
     let op_lock = project_unity_op_lock(project_path).await;
     let _guard = op_lock.lock().await;
 
-    let execute = send_message_without_timeout(project_path, "execute_code", code);
+    let prepared = prepare_unity_execute_code_for_send(project_path, code).await;
+    let execute = send_message_without_timeout(project_path, "execute_code", &prepared.code);
     tokio::pin!(execute);
 
     let mut progress_tick = tokio::time::interval(Duration::from_millis(250));
@@ -982,18 +1113,117 @@ where
     if resp.ok {
         Ok(resp.message.unwrap_or_default())
     } else {
-        Err(resp.error.unwrap_or_else(|| "unknown error".to_string()))
+        Err(crate::unity_type_index::append_auto_using_notes(
+            resp.error.unwrap_or_else(|| "unknown error".to_string()),
+            &prepared,
+        ))
+    }
+}
+
+pub async fn unity_execute_code_with_progress_cancellable<F>(
+    project_path: &str,
+    code: &str,
+    mut cancel_rx: tokio::sync::watch::Receiver<bool>,
+    mut on_progress: F,
+) -> Result<String, String>
+where
+    F: FnMut(UnityExecuteProgressSnapshot) + Send,
+{
+    if *cancel_rx.borrow() {
+        return Err(UNITY_EXECUTE_CANCELLED.to_string());
+    }
+
+    let op_lock = project_unity_op_lock(project_path).await;
+    let _guard = tokio::select! {
+        guard = op_lock.lock() => guard,
+        _ = cancel_rx.changed() => return Err(UNITY_EXECUTE_CANCELLED.to_string()),
+    };
+
+    let prepared = tokio::select! {
+        prepared = prepare_unity_execute_code_for_send(project_path, code) => prepared,
+        _ = cancel_rx.changed() => return Err(UNITY_EXECUTE_CANCELLED.to_string()),
+    };
+
+    let execute = send_message_without_timeout(project_path, "execute_code", &prepared.code);
+    tokio::pin!(execute);
+
+    let mut progress_tick = tokio::time::interval(Duration::from_millis(250));
+    progress_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_progress_revision = 0u64;
+
+    let resp = loop {
+        tokio::select! {
+            result = &mut execute => break result?,
+            changed = cancel_rx.changed() => {
+                let cancelled = changed.is_err() || *cancel_rx.borrow();
+                if !cancelled {
+                    continue;
+                }
+
+                if let Err(error) = cancel_unity_execute_code(project_path).await {
+                    eprintln!("[Locus] cancel_execute_code skipped: {}", error);
+                }
+
+                let drain = tokio::time::sleep(Duration::from_secs(5));
+                tokio::pin!(drain);
+                loop {
+                    tokio::select! {
+                        result = &mut execute => {
+                            if let Err(error) = result {
+                                eprintln!("[Locus] execute_code after cancel ended with transport error: {}", error);
+                            }
+                            break;
+                        },
+                        _ = &mut drain => {
+                            eprintln!("[Locus] execute_code cancel drain timed out");
+                            break;
+                        },
+                        _ = progress_tick.tick() => {
+                            if let Some(snapshot) = query_unity_execute_progress(project_path).await {
+                                if snapshot.revision != last_progress_revision {
+                                    last_progress_revision = snapshot.revision;
+                                    on_progress(snapshot);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                return Err(UNITY_EXECUTE_CANCELLED.to_string());
+            },
+            _ = progress_tick.tick() => {
+                if let Some(snapshot) = query_unity_execute_progress(project_path).await {
+                    if snapshot.revision != last_progress_revision {
+                        last_progress_revision = snapshot.revision;
+                        on_progress(snapshot);
+                    }
+                }
+            }
+        }
+    };
+
+    if resp.ok {
+        Ok(resp.message.unwrap_or_default())
+    } else {
+        Err(crate::unity_type_index::append_auto_using_notes(
+            resp.error.unwrap_or_else(|| "unknown error".to_string()),
+            &prepared,
+        ))
     }
 }
 
 pub async fn unity_execute_code(project_path: &str, code: &str) -> Result<String, String> {
     let op_lock = project_unity_op_lock(project_path).await;
     let _guard = op_lock.lock().await;
-    let resp = send_message_without_timeout(project_path, "execute_code", code).await?;
+    let prepared = prepare_unity_execute_code_for_send(project_path, code).await;
+    let resp = send_message_without_timeout(project_path, "execute_code", &prepared.code).await?;
     if resp.ok {
         Ok(resp.message.unwrap_or_default())
     } else {
-        Err(resp.error.unwrap_or_else(|| "unknown error".to_string()))
+        Err(crate::unity_type_index::append_auto_using_notes(
+            resp.error.unwrap_or_else(|| "unknown error".to_string()),
+            &prepared,
+        ))
     }
 }
 
@@ -1049,6 +1279,13 @@ pub async fn recompile_and_wait(project_path: &str) -> Result<String, String> {
             match send_message(project_path, "ping", "").await {
                 Ok(resp) if resp.ok => {
                     eprintln!("[Locus] Unity reconnected after domain reload");
+                    crate::unity_type_index::invalidate_cached_type_index(project_path).await;
+                    if let Err(error) = refresh_unity_type_index(project_path).await {
+                        eprintln!(
+                            "[Locus] Unity type index refresh after recompile skipped: {}",
+                            error
+                        );
+                    }
                     return finish(Ok(
                         "Compilation succeeded, domain reload complete".to_string()
                     ));
@@ -1065,6 +1302,14 @@ pub async fn recompile_and_wait(project_path: &str) -> Result<String, String> {
                     match msg.as_str() {
                         "pending" => continue,
                         "ok" => {
+                            crate::unity_type_index::invalidate_cached_type_index(project_path)
+                                .await;
+                            if let Err(error) = refresh_unity_type_index(project_path).await {
+                                eprintln!(
+                                    "[Locus] Unity type index refresh after recompile skipped: {}",
+                                    error
+                                );
+                            }
                             return finish(Ok(
                                 "Compilation succeeded, domain reload complete".to_string()
                             ));

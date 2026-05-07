@@ -34,6 +34,7 @@ mod tool;
 pub mod unity_bridge;
 pub mod unity_csharp;
 mod unity_docs;
+pub mod unity_type_index;
 pub mod unity_yaml;
 pub mod vcs;
 #[cfg(target_os = "windows")]

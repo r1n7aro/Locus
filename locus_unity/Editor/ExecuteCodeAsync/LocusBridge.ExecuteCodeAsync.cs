@@ -97,6 +97,78 @@ namespace Locus
             }
         }
 
+        private sealed class ExecuteCodeRequestState : IDisposable
+        {
+            private readonly object _lock = new object();
+            private AsyncSnippetExecution _execution;
+
+            public readonly CancellationTokenSource Cancellation = new CancellationTokenSource();
+
+            public bool IsCancellationRequested
+            {
+                get { return Cancellation.IsCancellationRequested; }
+            }
+
+            public void SetExecution(AsyncSnippetExecution execution)
+            {
+                if (execution == null)
+                    return;
+
+                bool shouldCancel;
+                lock (_lock)
+                {
+                    _execution = execution;
+                    shouldCancel = Cancellation.IsCancellationRequested;
+                }
+
+                if (shouldCancel)
+                    execution.Cancel();
+            }
+
+            public void ClearExecution(AsyncSnippetExecution execution)
+            {
+                lock (_lock)
+                {
+                    if (ReferenceEquals(_execution, execution))
+                        _execution = null;
+                }
+            }
+
+            public void Cancel()
+            {
+                AsyncSnippetExecution execution;
+                try
+                {
+                    Cancellation.Cancel();
+                }
+                catch
+                {
+                }
+
+                lock (_lock)
+                {
+                    execution = _execution;
+                }
+
+                if (execution != null)
+                    execution.Cancel();
+            }
+
+            public void ThrowIfCancellationRequested()
+            {
+                Cancellation.Token.ThrowIfCancellationRequested();
+            }
+
+            public void Dispose()
+            {
+                Cancel();
+                Cancellation.Dispose();
+            }
+        }
+
+        private static readonly object _executeCodeRequestStateLock = new object();
+        private static ExecuteCodeRequestState _activeExecuteCodeRequest;
+
         private static void ResetExecuteCodeProgress()
         {
             lock (_executeCodeProgressLock)
@@ -149,29 +221,66 @@ namespace Locus
             }
         }
 
+        private static PipeEnvelope HandleCancelExecuteCode(string requestId)
+        {
+            ExecuteCodeRequestState requestState;
+            lock (_executeCodeRequestStateLock)
+            {
+                requestState = _activeExecuteCodeRequest;
+            }
+
+            if (requestState == null)
+            {
+                ResetExecuteCodeProgress();
+                return OkResponse(requestId, "no active execute_code");
+            }
+
+            requestState.Cancel();
+            ResetExecuteCodeProgress();
+            return OkResponse(requestId, "execute_code cancellation requested");
+        }
+
         private static async Task<PipeEnvelope> HandleExecuteCode(string requestId, string code)
         {
             if (string.IsNullOrWhiteSpace(code))
                 return ErrorResponse(requestId, "empty code");
 
             await _executeCodeLock.WaitAsync();
+            ExecuteCodeRequestState requestState = null;
             try
             {
-                ResetExecuteCodeProgress();
-                SetExecuteCodeStage("Preparing compiler");
+                requestState = new ExecuteCodeRequestState();
+                lock (_executeCodeRequestStateLock)
+                {
+                    _activeExecuteCodeRequest = requestState;
+                }
 
-                string prepareError = await EnsureExecuteCodeCompilationReadyAsync();
+                ResetExecuteCodeProgress();
+                SetExecuteCodeStage("Checking compiler cache");
+
+                string prepareError = await EnsureExecuteCodeCompilationReadyAsync(
+                    SetExecuteCodeStage,
+                    requestState.Cancellation.Token);
                 if (!string.IsNullOrEmpty(prepareError))
                 {
+                    requestState.ThrowIfCancellationRequested();
                     SetExecuteCodeStage("Compiler preparation failed");
                     return ErrorResponse(requestId, prepareError);
                 }
+
+                requestState.ThrowIfCancellationRequested();
 
                 CompiledAsyncSnippet snippet;
                 try
                 {
                     SetExecuteCodeStage("Compiling snippet");
+                    requestState.ThrowIfCancellationRequested();
                     snippet = CompileAsyncSnippet(code);
+                    requestState.ThrowIfCancellationRequested();
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
                 }
                 catch (Exception ex)
                 {
@@ -180,19 +289,32 @@ namespace Locus
                 }
 
                 SetExecuteCodeStage("Executing snippet");
-                string resultText = await ExecuteAsyncSnippetOnMainThreadAsync(snippet);
+                string resultText = await ExecuteAsyncSnippetOnMainThreadAsync(snippet, requestState);
 
                 if (resultText.StartsWith("__ERROR__: ", StringComparison.Ordinal))
                 {
+                    requestState.ThrowIfCancellationRequested();
                     SetExecuteCodeStage("Execution failed");
                     return ErrorResponse(requestId, resultText.Substring("__ERROR__: ".Length));
                 }
 
+                requestState.ThrowIfCancellationRequested();
                 SetExecuteCodeStage("Execution complete");
                 return OkResponse(requestId, resultText);
             }
+            catch (OperationCanceledException)
+            {
+                return ErrorResponse(requestId, "execute_code canceled");
+            }
             finally
             {
+                lock (_executeCodeRequestStateLock)
+                {
+                    if (ReferenceEquals(_activeExecuteCodeRequest, requestState))
+                        _activeExecuteCodeRequest = null;
+                }
+                if (requestState != null)
+                    requestState.Dispose();
                 ResetExecuteCodeProgress();
                 _executeCodeLock.Release();
             }
@@ -397,13 +519,31 @@ namespace Locus
             return sb.ToString();
         }
 
-        private static Task<string> ExecuteAsyncSnippetOnMainThreadAsync(CompiledAsyncSnippet snippet)
+        private static Task<string> ExecuteAsyncSnippetOnMainThreadAsync(
+            CompiledAsyncSnippet snippet,
+            ExecuteCodeRequestState requestState)
         {
             var execution = new AsyncSnippetExecution();
+            if (requestState != null)
+                requestState.SetExecution(execution);
+
+            if (requestState != null && requestState.IsCancellationRequested)
+            {
+                execution.Cancel();
+                execution.Completion.TrySetResult("__ERROR__: execution canceled");
+                return execution.Completion.Task;
+            }
 
             PostToMainThread(delegate
             {
-                RunAsyncSnippetOnMainThread(snippet, execution);
+                if (requestState != null && requestState.IsCancellationRequested)
+                {
+                    execution.Cancel();
+                    execution.Completion.TrySetResult("__ERROR__: execution canceled");
+                    return;
+                }
+
+                RunAsyncSnippetOnMainThread(snippet, execution, requestState);
             });
 
             _ = MonitorAsyncSnippetInactivityAsync(execution);
@@ -441,7 +581,8 @@ namespace Locus
 
         private static async void RunAsyncSnippetOnMainThread(
             CompiledAsyncSnippet snippet,
-            AsyncSnippetExecution execution)
+            AsyncSnippetExecution execution,
+            ExecuteCodeRequestState requestState)
         {
             BeginAsyncExecuteRuntime();
 
@@ -449,6 +590,9 @@ namespace Locus
 
             try
             {
+                if (requestState != null)
+                    requestState.ThrowIfCancellationRequested();
+
                 var globals = new ScriptGlobals(execution.TouchActivity);
                 ctx = new ExecuteCodeContext(execution.Cancellation, execution.TouchActivity);
 
@@ -471,6 +615,9 @@ namespace Locus
             {
                 if (ctx != null)
                     ctx.ClearProgress();
+
+                if (requestState != null)
+                    requestState.ClearExecution(execution);
 
                 execution.Dispose();
                 EndAsyncExecuteRuntime();

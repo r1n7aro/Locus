@@ -39,6 +39,7 @@ namespace Locus
             public string request_editor_status;
             public string initial_state;
             public RunStatesStateRequest[] states;
+            public string[] auto_usings;
         }
 
         [Serializable]
@@ -2618,6 +2619,7 @@ namespace Locus
             sb.AppendLine("using UnityEditorInternal;");
             sb.AppendLine("using UnityEditor.SceneManagement;");
             sb.AppendLine("using UnityEditor.Animations;");
+            AppendRunStatesAutoUsings(sb, request.auto_usings);
             sb.AppendLine("using static UnityEngine.Object;");
             sb.AppendLine("using Object = UnityEngine.Object;");
             sb.AppendLine();
@@ -2650,6 +2652,38 @@ namespace Locus
             sb.AppendLine("    }");
             sb.AppendLine("}");
             return sb.ToString();
+        }
+
+        private static void AppendRunStatesAutoUsings(StringBuilder sb, string[] namespaces)
+        {
+            if (namespaces == null || namespaces.Length == 0)
+                return;
+
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            for (int i = 0; i < namespaces.Length; i++)
+            {
+                string ns = (namespaces[i] ?? "").Trim();
+                if (string.IsNullOrEmpty(ns) || !seen.Add(ns) || !IsValidUsingNamespace(ns))
+                    continue;
+
+                sb.Append("using ").Append(ns).AppendLine(";");
+            }
+        }
+
+        private static bool IsValidUsingNamespace(string ns)
+        {
+            if (string.IsNullOrEmpty(ns))
+                return false;
+
+            for (int i = 0; i < ns.Length; i++)
+            {
+                char ch = ns[i];
+                bool ok = ch == '_' || ch == '.' || char.IsLetterOrDigit(ch);
+                if (!ok)
+                    return false;
+            }
+
+            return true;
         }
 
         private static void AppendRunStatesVariables(StringBuilder sb, string stateName, string code, string indent)
