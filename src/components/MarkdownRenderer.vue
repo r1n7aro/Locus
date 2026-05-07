@@ -1,12 +1,15 @@
 
 <script setup lang="ts">
 import { computed } from "vue";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { Marked } from "marked";
 import { markedHighlight } from "marked-highlight";
 import hljs from "../hljs";
+import { normalizeExternalMarkdownHref } from "../composables/markdownExternalLinks";
 import { injectAssetRefs, injectFileRefs, injectWorkspaceMentions } from "../composables/markdownInject";
 import { normalizeMarkdownForRender } from "../composables/markdownRender";
 import { wrapMarkdownTables } from "../composables/markdownTableHtml";
+import { hasTauriWindowRuntime } from "../services/tauriRuntime";
 
 const props = defineProps<{
   content: string;
@@ -170,10 +173,46 @@ const renderedHtml = computed(() => {
     return props.content;
   }
 });
+
+function isHandledMarkdownMouseButton(event: MouseEvent): boolean {
+  return event.button === 0 || event.button === 1;
+}
+
+async function openMarkdownHref(href: string): Promise<void> {
+  try {
+    await openUrl(href);
+  } catch (error) {
+    console.warn("Failed to open markdown link externally:", error);
+    if (!hasTauriWindowRuntime()) {
+      window.open(href, "_blank", "noopener,noreferrer");
+    }
+  }
+}
+
+function handleMarkdownLinkActivation(event: MouseEvent) {
+  if (event.defaultPrevented || !isHandledMarkdownMouseButton(event)) return;
+  if (!(event.target instanceof Element)) return;
+
+  const anchor = event.target.closest("a[href]") as HTMLAnchorElement | null;
+  if (!anchor) return;
+
+  event.preventDefault();
+  event.stopPropagation();
+
+  const href = normalizeExternalMarkdownHref(anchor.getAttribute("href"));
+  if (!href) return;
+
+  void openMarkdownHref(href);
+}
 </script>
 
 <template>
-  <div class="markdown-body ui-select-text" v-html="renderedHtml" />
+  <div
+    class="markdown-body ui-select-text"
+    @click="handleMarkdownLinkActivation"
+    @auxclick="handleMarkdownLinkActivation"
+    v-html="renderedHtml"
+  />
 </template>
 
 <style>
