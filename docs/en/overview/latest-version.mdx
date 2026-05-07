@@ -1,9 +1,9 @@
 ---
 title: "Latest Version"
-description: "Locus v0.2.9 (2026-05-06)"
+description: "Locus v0.2.10 (2026-05-08)"
 sidebarTitle: "Latest Version"
-version: "0.2.9"
-releasedAt: "2026-05-06"
+version: "0.2.10"
+releasedAt: "2026-05-08"
 channel: "stable"
 updateTitle: "Update available"
 changelogUrl: "/en/overview/latest-version"
@@ -17,21 +17,19 @@ changelogUrl: "/en/overview/latest-version"
 
 ### Added
 
-- Added linked Unity asset directory support for asset indexing, watching, workspace listing, and search under `Assets/` and `Packages/`.
-- Added background asset database scan startup with live `reconcile` status for index verification.
-- Added README compatibility notes for supported Unity versions.
+- Added Unity editor type indexing and automatic namespace injection for C# snippets used by `unity_execute` and `unity_run_states`.
+- Added persisted assistant render parts so thinking, text, tool calls, and knowledge proposals keep their render order across reloads, replay, and context export.
+- Added README demo thumbnail and social/video badges.
 
 ### Fixed
 
-- Fixed Unity 2020 pipe accept compatibility in the Unity bridge.
-- Cancelled active asset scans and background index verification when switching workspaces or resetting configuration.
-- Reduced blocking when loading existing asset databases by using light startup reconciliation followed by background hash verification.
-- Bounded compact requests, added emergency compact summaries, and persisted oversized tool outputs with a schema v15 migration.
-- Included failed compact attempt metadata in raw context exports.
-- Required cached local embedding models before activation to avoid unexpected model downloads.
-- Stabilized ResizeObserver-driven layouts, Tauri window dragging, and the model effort selector dropdown.
-- Localized hardcoded frontend copy across Agent, Chat, Knowledge, Collab, settings, and preview surfaces.
+- Fixed active chat session stream state synchronization across session switches, embedded chat, and background runs.
+- Fixed keyboard focus for the embedded Unity WebView after activation.
+- Clarified Unity hierarchy GameObject names by rendering them as `⟦Name⟧` while keeping `object_path` inputs clean.
+- Serialized custom endpoint save/delete flows against the latest saved list and refreshed the warmup cache after persistence.
+- Opened external Markdown links through the OS handler and blocked internal, relative, and unsafe WebView navigation.
+- Reported duplicate edit matches with source line numbers so `oldString` conflicts are easier to resolve.
 
 ### Removed
 
-- Removed automatic local embedding model downloads during activation.
+- None.

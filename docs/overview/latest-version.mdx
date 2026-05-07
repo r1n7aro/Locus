@@ -1,9 +1,9 @@
 ---
 title: "当前版本"
-description: "Locus v0.2.9 (2026-05-06)"
+description: "Locus v0.2.10 (2026-05-08)"
 sidebarTitle: "当前版本"
-version: "0.2.9"
-releasedAt: "2026-05-06"
+version: "0.2.10"
+releasedAt: "2026-05-08"
 channel: "stable"
 updateTitle: "发现新版本"
 changelogUrl: "/overview/latest-version"
@@ -17,21 +17,19 @@ changelogUrl: "/overview/latest-version"
 
 ### 新增
 
-- 支持 `Assets/` 与 `Packages/` 下的链接 Unity 资产目录索引、监听、工作区列表与搜索。
-- 资产数据库扫描支持后台启动，并新增索引校验状态展示。
-- README 新增 Unity 版本兼容性说明。
+- Unity C# 片段执行支持编辑器类型索引，并为 `unity_execute` 与 `unity_run_states` 自动补全缺失命名空间。
+- 持久化 assistant 渲染片段，重载、回放与上下文导出后仍保留 thinking、正文、工具调用和知识提案的渲染顺序。
+- README 新增演示缩略图与社交/视频入口。
 
 ### 修复
 
-- 修复 Unity 2020 中 Unity Bridge 管道连接的兼容性问题。
-- 切换工作区或重置配置时会取消正在运行的资产扫描与后台索引校验。
-- 加载已有资产数据库时先执行轻量校验，再后台执行哈希校验，减少工作区切换阻塞。
-- 上下文压缩请求加入预算限制、应急摘要，并通过 schema v15 迁移持久化超大工具输出。
-- 原始上下文导出会记录失败的压缩尝试元数据。
-- 本地嵌入模型激活前要求模型已缓存，避免激活时触发意外下载。
-- 稳定 ResizeObserver 相关布局、Tauri 窗口拖拽与模型 effort 下拉面板。
-- 本地化 Agent、Chat、Knowledge、Collab、设置与预览区域的硬编码前端文案。
+- 修复会话切换、嵌入式聊天与后台运行中的 active chat stream 状态同步。
+- 修复嵌入 Unity WebView 激活后的键盘输入焦点。
+- Unity 层级摘要中的 GameObject 名称显示为 `⟦Name⟧`，`object_path` 继续使用纯路径。
+- 自定义 endpoint 的保存和删除按最新已保存列表串行执行，并在持久化后刷新 warmup cache。
+- Markdown 外部链接通过系统处理器打开，并拦截内部、相对路径和不安全的 WebView 跳转。
+- edit 工具在 `oldString` 命中多处时输出匹配行号，便于补充上下文。
 
 ### 移除
 
-- 移除本地嵌入模型激活阶段的自动下载行为。
+- 无。

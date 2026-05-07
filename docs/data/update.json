@@ -1,38 +1,36 @@
 {
-  "version": "0.2.9",
-  "releasedAt": "2026-05-06",
+  "version": "0.2.10",
+  "releasedAt": "2026-05-08",
   "channel": "stable",
   "locales": {
     "zh": {
       "title": "发现新版本",
-      "summary": "Locus v0.2.9 (2026-05-06)",
+      "summary": "Locus v0.2.10 (2026-05-08)",
       "changelogUrl": "/overview/latest-version",
       "changes": [
         {
           "title": "新增",
           "items": [
-            "支持 `Assets/` 与 `Packages/` 下的链接 Unity 资产目录索引、监听、工作区列表与搜索。",
-            "资产数据库扫描支持后台启动，并新增索引校验状态展示。",
-            "README 新增 Unity 版本兼容性说明。"
+            "Unity C# 片段执行支持编辑器类型索引，并为 `unity_execute` 与 `unity_run_states` 自动补全缺失命名空间。",
+            "持久化 assistant 渲染片段，重载、回放与上下文导出后仍保留 thinking、正文、工具调用和知识提案的渲染顺序。",
+            "README 新增演示缩略图与社交/视频入口。"
           ]
         },
         {
           "title": "修复",
           "items": [
-            "修复 Unity 2020 中 Unity Bridge 管道连接的兼容性问题。",
-            "切换工作区或重置配置时会取消正在运行的资产扫描与后台索引校验。",
-            "加载已有资产数据库时先执行轻量校验，再后台执行哈希校验，减少工作区切换阻塞。",
-            "上下文压缩请求加入预算限制、应急摘要，并通过 schema v15 迁移持久化超大工具输出。",
-            "原始上下文导出会记录失败的压缩尝试元数据。",
-            "本地嵌入模型激活前要求模型已缓存，避免激活时触发意外下载。",
-            "稳定 ResizeObserver 相关布局、Tauri 窗口拖拽与模型 effort 下拉面板。",
-            "本地化 Agent、Chat、Knowledge、Collab、设置与预览区域的硬编码前端文案。"
+            "修复会话切换、嵌入式聊天与后台运行中的 active chat stream 状态同步。",
+            "修复嵌入 Unity WebView 激活后的键盘输入焦点。",
+            "Unity 层级摘要中的 GameObject 名称显示为 `⟦Name⟧`，`object_path` 继续使用纯路径。",
+            "自定义 endpoint 的保存和删除按最新已保存列表串行执行，并在持久化后刷新 warmup cache。",
+            "Markdown 外部链接通过系统处理器打开，并拦截内部、相对路径和不安全的 WebView 跳转。",
+            "edit 工具在 `oldString` 命中多处时输出匹配行号，便于补充上下文。"
           ]
         },
         {
           "title": "移除",
           "items": [
-            "移除本地嵌入模型激活阶段的自动下载行为。"
+            "无。"
           ]
         }
       ],
@@ -45,34 +43,32 @@
     },
     "en": {
       "title": "Update available",
-      "summary": "Locus v0.2.9 (2026-05-06)",
+      "summary": "Locus v0.2.10 (2026-05-08)",
       "changelogUrl": "/en/overview/latest-version",
       "changes": [
         {
           "title": "Added",
           "items": [
-            "Added linked Unity asset directory support for asset indexing, watching, workspace listing, and search under `Assets/` and `Packages/`.",
-            "Added background asset database scan startup with live `reconcile` status for index verification.",
-            "Added README compatibility notes for supported Unity versions."
+            "Added Unity editor type indexing and automatic namespace injection for C# snippets used by `unity_execute` and `unity_run_states`.",
+            "Added persisted assistant render parts so thinking, text, tool calls, and knowledge proposals keep their render order across reloads, replay, and context export.",
+            "Added README demo thumbnail and social/video badges."
           ]
         },
         {
           "title": "Fixed",
           "items": [
-            "Fixed Unity 2020 pipe accept compatibility in the Unity bridge.",
-            "Cancelled active asset scans and background index verification when switching workspaces or resetting configuration.",
-            "Reduced blocking when loading existing asset databases by using light startup reconciliation followed by background hash verification.",
-            "Bounded compact requests, added emergency compact summaries, and persisted oversized tool outputs with a schema v15 migration.",
-            "Included failed compact attempt metadata in raw context exports.",
-            "Required cached local embedding models before activation to avoid unexpected model downloads.",
-            "Stabilized ResizeObserver-driven layouts, Tauri window dragging, and the model effort selector dropdown.",
-            "Localized hardcoded frontend copy across Agent, Chat, Knowledge, Collab, settings, and preview surfaces."
+            "Fixed active chat session stream state synchronization across session switches, embedded chat, and background runs.",
+            "Fixed keyboard focus for the embedded Unity WebView after activation.",
+            "Clarified Unity hierarchy GameObject names by rendering them as `⟦Name⟧` while keeping `object_path` inputs clean.",
+            "Serialized custom endpoint save/delete flows against the latest saved list and refreshed the warmup cache after persistence.",
+            "Opened external Markdown links through the OS handler and blocked internal, relative, and unsafe WebView navigation.",
+            "Reported duplicate edit matches with source line numbers so `oldString` conflicts are easier to resolve."
           ]
         },
         {
           "title": "Removed",
           "items": [
-            "Removed automatic local embedding model downloads during activation."
+            "None."
           ]
         }
       ],
