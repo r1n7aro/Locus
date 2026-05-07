@@ -11,7 +11,9 @@ function makeState(overrides?: Partial<StreamState>): StreamState {
     streamSequence: 0,
     streamingTextOrder: 0,
     thinkingOrder: 0,
+    liveRenderParts: [],
     isStreaming: false,
+    isCompacting: false,
     isThinking: false,
     thinkingStartTime: 0,
     thinkingDuration: 0,
@@ -74,6 +76,24 @@ describe("reduceStreamEvent", () => {
       expect(mutations).toContainEqual({ type: "setStreamSequence", value: 3 });
     });
 
+    it("uses backend render order for the first visible text", () => {
+      const state = makeState({ isStreaming: true, streamSequence: 2 });
+      const event: StreamEvent = { runId: "test-run", type: "textDelta", sessionId: "s1", text: "hello", order: 7 };
+      const mutations = reduceStreamEvent(state, event);
+
+      expect(mutations).toContainEqual({ type: "setStreamingTextOrder", order: 7 });
+      expect(mutations).toContainEqual({ type: "setStreamSequence", value: 7 });
+    });
+
+    it("normalizes repeated backend render order after prior stream items", () => {
+      const state = makeState({ isStreaming: true, streamSequence: 7 });
+      const event: StreamEvent = { runId: "test-run", type: "textDelta", sessionId: "s1", text: "next", order: 1 };
+      const mutations = reduceStreamEvent(state, event);
+
+      expect(mutations).toContainEqual({ type: "setStreamingTextOrder", order: 8 });
+      expect(mutations).toContainEqual({ type: "setStreamSequence", value: 8 });
+    });
+
     it("appends text without auto-activating streaming (streaming controlled by chat store)", () => {
       const state = makeState();
       const event: StreamEvent = { runId: "test-run", type: "textDelta", sessionId: "s1", text: "hello" };
@@ -115,6 +135,15 @@ describe("reduceStreamEvent", () => {
 
       expect(mutations).toContainEqual({ type: "setThinkingOrder", order: 1 });
       expect(mutations).toContainEqual({ type: "setStreamSequence", value: 1 });
+    });
+
+    it("uses backend render order for the first thinking block", () => {
+      const state = makeState({ isStreaming: true });
+      const event: StreamEvent = { runId: "test-run", type: "thinkingDelta", sessionId: "s1", text: "thinking...", order: 4 };
+      const mutations = reduceStreamEvent(state, event);
+
+      expect(mutations).toContainEqual({ type: "setThinkingOrder", order: 4 });
+      expect(mutations).toContainEqual({ type: "setStreamSequence", value: 4 });
     });
 
     it("appends thinking and starts thinking mode", () => {
@@ -191,6 +220,40 @@ describe("reduceStreamEvent", () => {
 
       expect(mutations).toContainEqual({ type: "setStreamSequence", value: 2 });
       expect(addMut?.type === "addToolCall" ? addMut.toolCall.order : 0).toBe(2);
+    });
+
+    it("uses backend render order for top-level tool calls", () => {
+      const state = makeState({ isStreaming: true, streamSequence: 1 });
+      const event: StreamEvent = { runId: "test-run",
+        type: "toolCallStart",
+        sessionId: "s1",
+        toolCallId: "tc1",
+        toolName: "read",
+        arguments: '{"path":"foo.ts"}',
+        order: 6,
+      };
+      const mutations = reduceStreamEvent(state, event);
+      const addMut = mutations.find((m) => m.type === "addToolCall");
+
+      expect(mutations).toContainEqual({ type: "setStreamSequence", value: 6 });
+      expect(addMut?.type === "addToolCall" ? addMut.toolCall.order : 0).toBe(6);
+    });
+
+    it("normalizes repeated backend render order for later tool rounds", () => {
+      const state = makeState({ isStreaming: true, streamSequence: 8 });
+      const event: StreamEvent = { runId: "test-run",
+        type: "toolCallStart",
+        sessionId: "s1",
+        toolCallId: "tc-later",
+        toolName: "read",
+        arguments: "{}",
+        order: 2,
+      };
+      const mutations = reduceStreamEvent(state, event);
+      const addMut = mutations.find((m) => m.type === "addToolCall");
+
+      expect(mutations).toContainEqual({ type: "setStreamSequence", value: 9 });
+      expect(addMut?.type === "addToolCall" ? addMut.toolCall.order : 0).toBe(9);
     });
 
     it("adds a new tool call", () => {
@@ -530,14 +593,40 @@ describe("reduceStreamEvent", () => {
   });
 
   describe("toolCallRoundDone", () => {
-    it("pushes assistant message, tool results, and keeps tool calls live", () => {
-      const state = makeState({ isStreaming: true, streamingThinking: "thought", thinkingDuration: 3 });
+    it("pushes assistant message with render parts, tool results, and clears live round", () => {
+      const state = makeState({
+        isStreaming: true,
+        streamingTextOrder: 3,
+        streamingThinking: "thought",
+        thinkingOrder: 1,
+        thinkingDuration: 3,
+      });
       const event: StreamEvent = { runId: "test-run",
         type: "toolCallRoundDone",
         sessionId: "s1",
         messageId: "m1",
         fullText: "result text",
         toolCalls: [{ id: "tc1", name: "read", arguments: "{}" }],
+        renderParts: [
+          {
+            kind: "thinking",
+            id: "think-1",
+            order: { runId: "test-run", seq: 1 },
+            content: "thought",
+          },
+          {
+            kind: "toolCall",
+            id: "tc1",
+            order: { runId: "test-run", seq: 2 },
+            toolCall: { id: "tc1", name: "read", arguments: "{}" },
+          },
+          {
+            kind: "text",
+            id: "text-1",
+            order: { runId: "test-run", seq: 3 },
+            content: "result text",
+          },
+        ],
       };
       const mutations = reduceStreamEvent(state, event);
 
@@ -549,10 +638,53 @@ describe("reduceStreamEvent", () => {
         expect(pushMsg.message.content).toBe("result text");
         expect(pushMsg.message.thinkingContent).toBe("thought");
         expect(pushMsg.message.thinkingDuration).toBe(3);
+        expect(pushMsg.message.contentOrder).toBe(3);
+        expect(pushMsg.message.thinkingOrder).toBe(1);
+        expect(pushMsg.message.renderParts?.map((part) => part.kind)).toEqual(["thinking", "toolCall", "text"]);
       }
       expect(mutations).toContainEqual({ type: "pushToolResults", toolCallIds: ["tc1"] });
-      expect(mutations.find((m) => m.type === "resetRoundKeepToolCalls")).toBeDefined();
-      expect(mutations.find((m) => m.type === "resetRound")).toBeUndefined();
+      expect(mutations.find((m) => m.type === "clearLiveRenderParts")).toBeDefined();
+      expect(mutations.find((m) => m.type === "resetRound")).toBeDefined();
+      expect(mutations.find((m) => m.type === "resetRoundKeepToolCalls")).toBeUndefined();
+    });
+
+    it("keeps streamed render order when toolCallRoundDone carries round-local order", () => {
+      const state = makeState({ isStreaming: true, streamingTextOrder: 3, streamingThinking: "thought", thinkingOrder: 1 });
+      const event: StreamEvent = { runId: "test-run",
+        type: "toolCallRoundDone",
+        sessionId: "s1",
+        messageId: "m1",
+        fullText: "result text",
+        toolCalls: [{ id: "tc1", name: "read", arguments: "{}", order: 2 }],
+        contentOrder: 8,
+        thinkingOrder: 7,
+      };
+      const mutations = reduceStreamEvent(state, event);
+      const pushMsg = mutations.find((m) => m.type === "pushMessage");
+
+      expect(pushMsg?.type === "pushMessage" ? pushMsg.message.contentOrder : 0).toBe(3);
+      expect(pushMsg?.type === "pushMessage" ? pushMsg.message.thinkingOrder : 0).toBe(1);
+      expect(pushMsg?.type === "pushMessage" ? pushMsg.message.toolCalls?.[0]?.order : 0).toBe(2);
+    });
+
+    it("normalizes final-only message order while preserving thinking/content order", () => {
+      const state = makeState({ isStreaming: true, streamSequence: 10, streamingThinking: "thought" });
+      const event: StreamEvent = { runId: "test-run",
+        type: "toolCallRoundDone",
+        sessionId: "s1",
+        messageId: "m1",
+        fullText: "result text",
+        toolCalls: [{ id: "tc1", name: "read", arguments: "{}", order: 9 }],
+        contentOrder: 2,
+        thinkingOrder: 1,
+      };
+      const mutations = reduceStreamEvent(state, event);
+      const pushMsg = mutations.find((m) => m.type === "pushMessage");
+
+      expect(pushMsg?.type === "pushMessage" ? pushMsg.message.thinkingOrder : 0).toBe(11);
+      expect(pushMsg?.type === "pushMessage" ? pushMsg.message.contentOrder : 0).toBe(12);
+      expect(mutations).toContainEqual({ type: "setStreamSequence", value: 11 });
+      expect(mutations).toContainEqual({ type: "setStreamSequence", value: 12 });
     });
   });
 
@@ -616,6 +748,40 @@ describe("reduceStreamEvent", () => {
     });
   });
 
+  describe("compactStart", () => {
+    it("marks context compaction as visible and preserves token totals", () => {
+      const state = makeState({
+        tokenUsage: {
+          totalInputTokens: 100,
+          totalOutputTokens: 50,
+          totalCacheReadTokens: 10,
+          totalCacheWriteTokens: 5,
+          totalCostUsd: 0.01,
+          pricedRounds: 1,
+          contextTokens: 0,
+          contextLimit: 0,
+        },
+      });
+      const event: StreamEvent = {
+        runId: "test-run",
+        type: "compactStart",
+        sessionId: "s1",
+        contextTokens: 90000,
+        contextLimit: 100000,
+      };
+
+      const mutations = reduceStreamEvent(state, event);
+      expect(mutations).toContainEqual({ type: "setCompacting", value: true });
+      const usageMut = mutations.find((m) => m.type === "updateUsage");
+      expect(usageMut).toBeDefined();
+      if (usageMut?.type === "updateUsage") {
+        expect(usageMut.usage.contextTokens).toBe(90000);
+        expect(usageMut.usage.contextLimit).toBe(100000);
+        expect(usageMut.usage.totalInputTokens).toBe(100);
+      }
+    });
+  });
+
   describe("compactDone", () => {
     it("clears stale context usage after compaction completes", () => {
       const state = makeState({
@@ -660,6 +826,7 @@ describe("reduceStreamEvent", () => {
         expect(usageMut.usage.contextLimit).toBe(100000);
         expect(usageMut.usage.totalInputTokens).toBe(100);
       }
+      expect(mutations).toContainEqual({ type: "setCompacting", value: false });
     });
   });
 

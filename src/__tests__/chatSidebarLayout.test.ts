@@ -168,20 +168,55 @@ describe("chat sidebar layout", () => {
     expect(transcript).toContain("const transientToolCallsCanCollapse = computed(() =>");
     expect(transcript).toContain("@collapse-finished=\"onTransientToolCallsCollapseFinished\"");
     expect(transcript).toContain(":tool-calls=\"segment.toolCalls\"");
+    expect(transcript).toContain("function transientToolHandoffPart(toolCalls: ToolCallDisplay[])");
+    expect(transcript).toContain("const hasRenderedToolSegment = segments.some((segment) => segment.type === \"toolCalls\");");
+    expect(transcript).toContain("if (!hasRenderedToolSegment && transientToolCalls.value.length > 0) {");
+    expect(transcript).toContain("segments.unshift({");
+    expect(transcript).toContain("function transientToolSegmentKey(toolCalls: ToolCallDisplay[])");
+    expect(transcript).toContain("key: transientToolSegmentKey(pendingToolCalls),");
+    expect(transcript).toContain("key: transientToolSegmentKey(transientToolCalls.value),");
+    expect(transcript).toContain("animateCollapseOnMount: !!toolCallHandoff.value?.collapseArmed,");
+    expect(transcript).toContain(":animate-collapse-on-mount=\"segment.animateCollapseOnMount\"");
+    expect(transcript).toContain("if (!props.isStreaming && shouldReleaseToolCallHandoffToHistory(props.messages, previousMatchState))");
+    expect(transcript).toContain("if (!props.isStreaming && shouldReleaseToolCallHandoffToHistory(messages, toolCallHandoff.value.toolCallMatchState))");
     expect(transcript).toContain(":allow-collapse=\"transientToolCallsAllowCollapse\"");
     expect(transcript).toContain(":collapse-enabled=\"transientToolCallsCollapseEnabled\"");
     expect(chatView).toContain("const toolHandoffViewportQuiet = ref(false);");
     expect(chatView).toContain("function handleToolHandoffQuietChange(quiet: boolean) {");
     expect(chatView).toContain("@tool-handoff-quiet-change=\"handleToolHandoffQuietChange\"");
-    expect(transcript).toContain(":allow-collapse=\"!shouldKeepToolItemExpanded(segment.itemId)\"");
-    expect(transcript).toContain(":collapse-enabled=\"!shouldKeepToolItemExpanded(segment.itemId)\"");
+    expect(transcript).toContain(":allow-collapse=\"!shouldKeepToolSegmentExpanded(segment)\"");
+    expect(transcript).toContain(":collapse-enabled=\"!shouldKeepToolSegmentExpanded(segment)\"");
     expect(toolBlock).toContain("collapseEnabled?: boolean;");
     expect(toolBlock).toContain(":tool-calls=\"toolCall.nestedToolCalls\"");
     expect(toolBlock).toContain(":collapse-enabled=\"collapseEnabled\"");
     expect(toolBlock).toContain("@viewport-anchor-start=\"emitToolViewportAnchorStart\"");
     expect(toolBlock).toContain("@tool-viewport-anchor-start=\"emitToolViewportAnchorStart\"");
     expect(toolCollection).toContain("collapseEnabled?: boolean;");
+    expect(toolCollection).toContain("animateCollapseOnMount?: boolean;");
+    expect(toolCollection).toContain("const startsExpandedForCollapseAnimation =");
+    expect(toolCollection).toContain("onMounted(() => {");
     expect(toolCollection).toContain("props.allowCollapse && props.collapseEnabled");
+  });
+
+  it("keeps nested subagent tool rows compact", () => {
+    const toolBlock = read("src/components/ToolCallBlock.vue");
+
+    expect(toolBlock).toContain(".nested-tool-calls :deep(.tool-call-header) {");
+    expect(toolBlock).toMatch(/\.nested-tool-calls :deep\(\.tool-call-header\)\s*\{[\s\S]*min-height:\s*18px/);
+    expect(toolBlock).toMatch(/\.nested-tool-calls :deep\(\.tool-call-collection-list\)\s*\{[\s\S]*gap:\s*2px/);
+    expect(toolBlock).toMatch(/\.nested-tool-calls :deep\(\.spinner-anim\)\s*\{[\s\S]*width:\s*8px/);
+  });
+
+  it("auto-collapses completed subagent tool blocks", () => {
+    const toolBlock = read("src/components/ToolCallBlock.vue");
+
+    expect(toolBlock).toContain("function shouldAutoExpandSubagentTool(toolCall: ToolCallDisplay) {");
+    expect(toolBlock).toContain("return isSubagentToolName(toolCall.name) && toolCall.status === \"running\";");
+    expect(toolBlock).toContain("const expanded = ref(shouldAutoExpandSubagentTool(props.toolCall));");
+    expect(toolBlock).toContain("if (previousStatus === \"running\" && nextStatus !== \"running\") {");
+    expect(toolBlock).toContain("setExpanded(false, true);");
+    expect(toolBlock).toContain("} else if (previousStatus !== \"running\" && nextStatus === \"running\") {");
+    expect(toolBlock).toContain("setExpanded(true, true);");
   });
 
   it("filters history tool calls while the transient handoff batch owns the same ids", () => {
@@ -191,7 +226,8 @@ describe("chat sidebar layout", () => {
     expect(transcript).toContain("const hasLiveToolCalls = computed(() => props.activeToolCalls.length > 0);");
     expect(transcript).toContain("const hasTransientToolCalls = computed(() => transientToolCalls.value.length > 0);");
     expect(transcript).toContain("const hasToolCallHandoff = computed(() => hasTransientToolCalls.value && !hasLiveToolCalls.value);");
-    expect(transcript).toContain("const hasStreamingContent = computed(() => hasVisibleStreamingText.value || hasLiveToolCalls.value);");
+    expect(transcript).toContain("const canonicalLiveRenderParts = computed(() => {");
+    expect(transcript).toContain("canonicalLiveRenderParts.value.some((part) => part.kind === \"text\" || part.kind === \"toolCall\")");
     expect(transcript).toContain("const activeToolCallMatchState = computed<ToolCallMatchState>(() => {");
     expect(transcript).toContain("return toolCallHandoff.value?.toolCallMatchState ?? {");
     expect(transcript).toContain("const baseGroupedMessages = computed<MessageGroup[]>(() => buildGroupedMessages(activeToolCallMatchState.value));");
@@ -199,6 +235,8 @@ describe("chat sidebar layout", () => {
     expect(transcript).toContain("return mergeToolCallMatchStates(");
     expect(transcript).toContain("const groupedMessages = computed<MessageGroup[]>(() => buildGroupedMessages(historyHiddenToolCallMatchState.value));");
     expect(transcript).toContain("toolCallTreeHasAnyIds(message.toolCalls, toolCallHandoff.value!.toolCallMatchState)");
+    expect(transcript).toContain("function shouldReleaseToolCallHandoffToHistory(");
+    expect(transcript).toContain("clearToolCallHandoff(\"handoff-followed-by-history-message\")");
     expect(transcript).toContain("function buildTailHiddenToolCallMap(");
     expect(transcript).toContain("filterToolCallsByConsumableMatchState(");
     expect(transcript).toContain("cloneToolCallMatchState(hiddenToolCallMatchState)");
@@ -214,9 +252,9 @@ describe("chat sidebar layout", () => {
 
   it("keeps handoff waiting inside the transient tool group", () => {
     const transcript = read("src/components/chat/ChatTranscript.vue");
-    const toolWaitingIndex = transcript.indexOf("<div v-if=\"isToolWaitingForResponse\" class=\"chat-transcript-tool-waiting-row\">");
+    const toolWaitingIndex = transcript.indexOf("<div v-if=\"segment.showWaiting && isToolWaitingForResponse\" class=\"chat-transcript-tool-waiting-row\">");
     const standaloneWaitingIndex = transcript.indexOf("<div v-else-if=\"segment.type === 'waiting'\" class=\"chat-transcript-thinking-block\">");
-    const toolGroupIndex = transcript.indexOf("<div v-else-if=\"segment.type === 'toolCalls'\" class=\"chat-transcript-tool-calls-group\">");
+    const toolGroupIndex = transcript.indexOf("v-else-if=\"segment.type === 'toolCalls'\"");
 
     expect(toolGroupIndex).toBeGreaterThan(-1);
     expect(toolWaitingIndex).toBeGreaterThan(toolGroupIndex);
@@ -224,8 +262,26 @@ describe("chat sidebar layout", () => {
     expect(transcript).toContain("'waiting-placeholder': isStandaloneWaitingPlaceholder");
     expect(transcript).toContain("const isToolWaitingForResponse = computed(() => isWaitingForResponse.value && hasTransientToolCalls.value);");
     expect(transcript).toContain("const isStandaloneWaitingPlaceholder = computed(() => isWaitingForResponse.value && !hasTransientToolCalls.value);");
+    expect(transcript).toContain("showWaiting: false,");
+    expect(transcript).toContain("lastToolSegment.showWaiting = true;");
+    expect(transcript).toContain("segment.showWaiting && isToolWaitingForResponse");
     expect(transcript).toContain(".chat-transcript-tool-waiting-row {");
     expect(transcript).not.toContain("'waiting-placeholder': isWaitingForResponse");
+  });
+
+  it("sorts assistant segments by persisted render order", () => {
+    const transcript = read("src/components/chat/ChatTranscript.vue");
+
+    expect(transcript).toContain("function renderPartsForMessage(item: MessageRenderItem): AssistantRenderPart[]");
+    expect(transcript).toContain("assertCanonicalRenderParts(item.message.renderParts, `message:${item.message.id}`);");
+    expect(transcript).toContain("synthesizeLegacyRenderParts(item.message, {");
+    expect(transcript).toContain("const canonicalLiveRenderParts = computed(() => {");
+    expect(transcript).toContain("props.liveRenderParts.length > 0");
+    expect(transcript).toContain("const hasVisibleActiveThinkingBlock = computed(() =>");
+    expect(transcript).toContain(":class=\"{ active: segment.active, 'is-clickable': true }\"");
+    expect(transcript).toContain("data-render-part-kind=\"toolCall\"");
+    expect(transcript).toContain("data-render-part-kind=\"text\"");
+    expect(transcript).not.toContain("splitToolCallsByRenderOrder");
   });
 
   it("coalesces consecutive tool-only assistant rounds before rendering", () => {
@@ -235,7 +291,15 @@ describe("chat sidebar layout", () => {
     expect(batches).toContain("let pendingToolOnlyItem: T | null = null;");
     expect(batches).toContain("pendingToolOnlyItem ??= item;");
     expect(batches).toContain("const displayToolCalls = pendingToolCalls.length > 0 ? [...pendingToolCalls] : undefined;");
-    expect(transcript).toContain("'tool-only': isToolOnlyRenderItem(item),");
+    expect(transcript).toContain("function historyRenderSegmentsForGroup(group: MessageGroup): HistoryRenderSegment[]");
+    expect(transcript).toContain("function historyToolSegmentKey(toolCalls: ToolCallDisplay[], fallbackId: string)");
+    expect(transcript).toContain("key: historyToolSegmentKey(pendingToolCalls, pendingToolPart.id),");
+    expect(transcript).toContain("pendingToolCalls.push(...segment.toolCalls);");
+    expect(transcript).toContain("const hasToolFilter = hasExplicitDisplayToolCalls(item) || !!toolCallInfosForMessage(item.message);");
+    expect(transcript).toContain(".filter((part) => part.kind !== \"toolCall\" || !hasToolFilter || visibleToolIds.has(part.toolCall.id))");
+    expect(transcript).toContain("hiddenToolCallsByItemId.set(item.id, toolCalls ?? []);");
+    expect(batches).toContain("const hasToolCallsProperty = Object.prototype.hasOwnProperty.call(item, \"toolCalls\");");
+    expect(transcript).toContain("'tool-only': isToolOnlyMessageGroup(group),");
     expect(transcript).not.toContain("tool-only-followup");
     expect(transcript).not.toContain("shouldTightenToolOnlyGap");
   });

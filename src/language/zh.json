@@ -411,6 +411,7 @@
   "chat.transcript.thoughtDuration": "思考了 {0} 秒",
   "chat.transcript.thoughtMoment": "思考了片刻",
   "chat.transcript.handoff": "交接",
+  "chat.transcript.compacting": "正在压缩上下文…",
   "unityEmbed.chat.emptyTitle": "新会话",
   "unityEmbed.chat.emptyHint": "输入任务，Locus 会在当前 Unity 项目中执行。",
   "unityEmbed.chat.user": "你",

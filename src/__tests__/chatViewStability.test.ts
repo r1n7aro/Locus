@@ -4,6 +4,7 @@ import {
   createCoalescedScrollScheduler,
   createSettledScrollScheduler,
   findTrailingAssistantToolMessageId,
+  hasRunningToolCall,
   shouldAutoScrollToBottom,
   shouldShowAssistantContinuation,
   shouldShowWaitingPlaceholder,
@@ -105,6 +106,23 @@ describe("chatViewStability", () => {
       isThinking: false,
       hasThinkingContent: false,
     })).toBe(false);
+  });
+
+  it("treats completed tool calls as idle while nested running tools stay active", () => {
+    expect(hasRunningToolCall([
+      { status: "done" },
+      { status: "error" },
+      { status: "interrupted" },
+    ])).toBe(false);
+
+    expect(hasRunningToolCall([
+      {
+        status: "done",
+        nestedToolCalls: [
+          { id: "nested-1", name: "read", arguments: "{}", status: "running" },
+        ],
+      },
+    ])).toBe(true);
   });
 
   it("skips auto-scroll when the user is reviewing older content", () => {

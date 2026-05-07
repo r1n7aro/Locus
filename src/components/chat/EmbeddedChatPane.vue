@@ -7,6 +7,7 @@ import type {
   PendingToolConfirm,
   SkillManifest,
   ToolCallDisplay,
+  AssistantRenderPart,
 } from "../../types";
 import AskUserCard from "./AskUserCard.vue";
 import ToolConfirmCard from "./ToolConfirmCard.vue";
@@ -50,8 +51,10 @@ const props = withDefaults(defineProps<{
   thinkingText?: string;
   thinkingOrder?: number;
   isStreaming: boolean;
+  isCompacting?: boolean;
   isThinking: boolean;
   thinkingDuration?: number;
+  liveRenderParts?: AssistantRenderPart[];
   activeToolCalls: ToolCallDisplay[];
   pendingQuestion?: PendingQuestion | null;
   pendingToolConfirms?: PendingToolConfirm[];
@@ -68,6 +71,7 @@ const props = withDefaults(defineProps<{
   assistantLabel?: string;
   thinkingLabel?: string;
   waitingLabel?: string;
+  compactingLabel?: string;
   thoughtDurationLabel?: string;
   thoughtMomentLabel?: string;
   runningLabel?: string;
@@ -81,6 +85,7 @@ const props = withDefaults(defineProps<{
   metaRows: () => [],
   thinkingText: "",
   thinkingDuration: 0,
+  isCompacting: false,
   pendingQuestion: null,
   pendingToolConfirms: () => [],
   toolConfirmLayoutKey: null,
@@ -95,6 +100,7 @@ const props = withDefaults(defineProps<{
   assistantLabel: "Locus",
   thinkingLabel: "",
   waitingLabel: "",
+  compactingLabel: "",
   thoughtDurationLabel: "",
   thoughtMomentLabel: "",
   runningLabel: "",
@@ -127,6 +133,7 @@ const effectiveCancelLabel = computed(() => props.cancelLabel || t("common.cance
 const effectiveUserLabel = computed(() => props.userLabel || t("chat.embedded.user"));
 const effectiveThinkingLabel = computed(() => props.thinkingLabel || t("chat.embedded.thinking"));
 const effectiveWaitingLabel = computed(() => props.waitingLabel || props.runningLabel || t("chat.embedded.running"));
+const effectiveCompactingLabel = computed(() => props.compactingLabel || t("chat.transcript.compacting"));
 const effectiveThoughtDurationLabel = computed(() =>
   props.thoughtDurationLabel || t("chat.transcript.thoughtDuration", "{0}"),
 );
@@ -544,16 +551,19 @@ onUnmounted(() => {
       :streaming-text="streamingText"
       :streaming-text-order="streamingTextOrder"
       :is-streaming="isStreaming"
+      :is-compacting="isCompacting"
       :is-thinking="isThinking"
       :thinking-text="thinkingText"
       :thinking-order="thinkingOrder"
       :thinking-duration="thinkingDuration"
+      :live-render-parts="liveRenderParts"
       :active-tool-calls="activeToolCalls"
       :empty-title="emptyTitle"
       :empty-hint="emptyHint"
       :user-label="effectiveUserLabel"
       :assistant-label="assistantLabel"
       :waiting-label="effectiveWaitingLabel"
+      :compacting-label="effectiveCompactingLabel"
       :thinking-active-label="effectiveThinkingLabel"
       :thought-duration-label="effectiveThoughtDurationLabel"
       :thought-moment-label="effectiveThoughtMomentLabel"

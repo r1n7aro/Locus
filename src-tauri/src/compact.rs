@@ -324,6 +324,8 @@ pub fn build_compact_request(messages: &[ChatMessage]) -> Vec<ChatMessage> {
         prompt_prefix: None,
         prompt_suffix: None,
         response_id: None,
+        content_order: None,
+        thinking_order: None,
         tool_calls: None,
         tool_call_id: None,
         images: None,
@@ -331,6 +333,7 @@ pub fn build_compact_request(messages: &[ChatMessage]) -> Vec<ChatMessage> {
         thinking_duration: None,
         thinking_signature: None,
         knowledge_proposal: None,
+        render_parts: None,
     });
 
     compact_messages
@@ -474,6 +477,8 @@ fn build_omitted_messages_marker(count: usize, created_at: i64) -> ChatMessage {
         prompt_prefix: None,
         prompt_suffix: None,
         response_id: None,
+        content_order: None,
+        thinking_order: None,
         tool_calls: None,
         tool_call_id: None,
         images: None,
@@ -481,6 +486,7 @@ fn build_omitted_messages_marker(count: usize, created_at: i64) -> ChatMessage {
         thinking_duration: None,
         thinking_signature: None,
         knowledge_proposal: None,
+        render_parts: None,
     }
 }
 
@@ -554,6 +560,8 @@ pub fn build_compact_request_with_budget(
         prompt_prefix: None,
         prompt_suffix: None,
         response_id: None,
+        content_order: None,
+        thinking_order: None,
         tool_calls: None,
         tool_call_id: None,
         images: None,
@@ -561,6 +569,7 @@ pub fn build_compact_request_with_budget(
         thinking_duration: None,
         thinking_signature: None,
         knowledge_proposal: None,
+        render_parts: None,
     });
 
     let mut estimated_tokens = estimate_request_tokens(system_parts, &compact_messages, &[]);
@@ -1549,6 +1558,8 @@ pub fn build_post_compact_message(
         prompt_prefix: None,
         prompt_suffix: None,
         response_id: None,
+        content_order: None,
+        thinking_order: None,
         tool_calls: None,
         tool_call_id: None,
         images: None,
@@ -1556,6 +1567,7 @@ pub fn build_post_compact_message(
         thinking_duration: None,
         thinking_signature: None,
         knowledge_proposal: None,
+        render_parts: None,
     }
 }
 
@@ -1589,6 +1601,8 @@ mod tests {
             prompt_prefix: None,
             prompt_suffix: None,
             response_id: None,
+            content_order: None,
+            thinking_order: None,
             tool_calls,
             tool_call_id: tool_call_id.map(|s| s.to_string()),
             images: None,
@@ -1596,6 +1610,7 @@ mod tests {
             thinking_duration: None,
             thinking_signature: None,
             knowledge_proposal: None,
+            render_parts: None,
         }
     }
 
@@ -1731,6 +1746,7 @@ mod tests {
                     id: format!("tc-{}", i),
                     name: "bash".to_string(),
                     arguments: "large args".repeat(300),
+                    order: None,
                     server_tool: None,
                     server_tool_output: None,
                     outcome: None,
@@ -1776,6 +1792,7 @@ mod tests {
                     id: format!("tc-{}", i),
                     name: "read".to_string(),
                     arguments: "{}".to_string(),
+                    order: None,
                     server_tool: None,
                     server_tool_output: None,
                     outcome: None,
@@ -1994,6 +2011,7 @@ mod tests {
                         "limit": 20
                     })
                     .to_string(),
+                    order: None,
                     server_tool: None,
                     server_tool_output: None,
                     outcome: None,
@@ -2046,6 +2064,7 @@ mod tests {
                         "limit": 2
                     })
                     .to_string(),
+                    order: None,
                     server_tool: None,
                     server_tool_output: None,
                     outcome: None,
@@ -2093,6 +2112,7 @@ mod tests {
                         "file_path": "Assets/Data/Test.asset"
                     })
                     .to_string(),
+                    order: None,
                     server_tool: None,
                     server_tool_output: None,
                     outcome: None,
@@ -2152,6 +2172,7 @@ mod tests {
                         "file_path": "Assets/Data/Test.asset"
                     })
                     .to_string(),
+                    order: None,
                     server_tool: None,
                     server_tool_output: None,
                     outcome: None,

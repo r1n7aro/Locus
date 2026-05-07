@@ -40,15 +40,39 @@ pub enum StreamEvent {
         message: crate::session::models::ChatMessage,
     },
     #[serde(rename_all = "camelCase")]
-    TextDelta { session_id: String, text: String },
+    TextDelta {
+        session_id: String,
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        order: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        part_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        render_seq: Option<u32>,
+    },
     #[serde(rename_all = "camelCase")]
-    ThinkingDelta { session_id: String, text: String },
+    ThinkingDelta {
+        session_id: String,
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        order: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        part_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        render_seq: Option<u32>,
+    },
     #[serde(rename_all = "camelCase")]
     ToolCallStart {
         session_id: String,
         tool_call_id: String,
         tool_name: String,
         arguments: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        order: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        part_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        render_seq: Option<u32>,
     },
     #[serde(rename_all = "camelCase")]
     ToolCallDone {
@@ -80,6 +104,12 @@ pub enum StreamEvent {
         tool_call_id: String,
         tool_name: String,
         arguments: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        order: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        part_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        render_seq: Option<u32>,
     },
     #[serde(rename_all = "camelCase")]
     SubagentToolCallDone {
@@ -96,12 +126,24 @@ pub enum StreamEvent {
         message_id: String,
         full_text: String,
         tool_calls: Vec<crate::session::models::ToolCallInfo>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content_order: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thinking_order: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        render_parts: Option<Vec<crate::session::models::AssistantRenderPart>>,
     },
     #[serde(rename_all = "camelCase")]
     Done {
         session_id: String,
         message_id: String,
         full_text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content_order: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thinking_order: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        render_parts: Option<Vec<crate::session::models::AssistantRenderPart>>,
     },
     #[serde(rename_all = "camelCase")]
     KnowledgeProposal {
@@ -173,6 +215,8 @@ pub enum StreamEvent {
         thinking_content: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         thinking_duration: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        render_parts: Option<Vec<crate::session::models::AssistantRenderPart>>,
     },
     #[serde(rename_all = "camelCase")]
     Error { session_id: String, error: AppError },

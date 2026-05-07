@@ -104,6 +104,8 @@ pub struct ToolCallInfo {
     pub name: String,
     pub arguments: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_tool: Option<ServerToolKind>,
     /// Pre-computed output for server tools (e.g. web_search) that don't need local execution.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -120,6 +122,48 @@ impl ToolCallInfo {
     pub fn is_server_tool(&self) -> bool {
         self.server_tool.is_some() || self.server_tool_output.is_some()
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenderOrderKey {
+    pub run_id: String,
+    pub seq: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum AssistantRenderPart {
+    #[serde(rename_all = "camelCase")]
+    Thinking {
+        id: String,
+        order: RenderOrderKey,
+        content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        active: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+    },
+    #[serde(rename_all = "camelCase")]
+    Text {
+        id: String,
+        order: RenderOrderKey,
+        content: String,
+    },
+    #[serde(rename_all = "camelCase")]
+    ToolCall {
+        id: String,
+        order: RenderOrderKey,
+        tool_call: ToolCallInfo,
+    },
+    #[serde(rename_all = "camelCase")]
+    KnowledgeProposal {
+        id: String,
+        order: RenderOrderKey,
+        message: Box<ChatMessage>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -230,6 +274,10 @@ pub struct ChatMessage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_order: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_order: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCallInfo>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
@@ -243,4 +291,6 @@ pub struct ChatMessage {
     pub thinking_signature: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub knowledge_proposal: Option<KnowledgeProposal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub render_parts: Option<Vec<AssistantRenderPart>>,
 }

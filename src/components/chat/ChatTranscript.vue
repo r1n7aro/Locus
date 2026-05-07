@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onUnmounted, ref, useSlots, watch } from "vue";
-import type { ChatMessage, ToolCallDisplay, ToolCallInfo, UserIntentMeta } from "../../types";
+import type { AssistantRenderPart, ChatMessage, ToolCallDisplay, ToolCallInfo, UserIntentMeta } from "../../types";
 import {
   collectPendingContinuationToolItemIds,
   shouldShowAssistantContinuation,
@@ -12,6 +12,7 @@ import {
   collectToolCallDisplayIds,
   collectToolCallDisplayMatchState,
   filterToolCallsByConsumableMatchState,
+  firstToolCallRenderOrder,
   getToolCallInfoFingerprint,
   mergeSequentialAssistantToolCalls,
   mergeToolCallDisplaysWithoutDuplicates,
@@ -20,6 +21,11 @@ import {
   summarizeToolCallBatch,
 } from "../../composables/toolCallBatches";
 import type { ToolCallMatchState } from "../../composables/toolCallBatches";
+import {
+  assertCanonicalRenderParts,
+  compareAssistantRenderParts,
+  synthesizeLegacyRenderParts,
+} from "../../composables/assistantRenderParts";
 import { useDisplaySettings } from "../../composables/useDisplaySettings";
 import { parseChatAssetRefs } from "../../composables/chatAssetRefs";
 import { displayUserMessageContent } from "../../composables/chatUserMessageDisplay";
@@ -73,11 +79,13 @@ const props = withDefaults(defineProps<{
   streamingText: string;
   streamingTextOrder?: number;
   isStreaming: boolean;
+  isCompacting?: boolean;
   isThinking: boolean;
   hasThinking?: boolean;
   thinkingText?: string;
   thinkingOrder?: number;
   thinkingDuration?: number;
+  liveRenderParts?: AssistantRenderPart[];
   activeToolCalls: ToolCallDisplay[];
   variant?: TranscriptVariant;
   emptyTitle?: string;
@@ -86,6 +94,7 @@ const props = withDefaults(defineProps<{
   assistantLabel?: string;
   handoffLabel?: string;
   waitingLabel?: string;
+  compactingLabel?: string;
   thinkingActiveLabel?: string;
   thoughtDurationLabel?: string;
   thoughtMomentLabel?: string;
@@ -97,15 +106,18 @@ const props = withDefaults(defineProps<{
   variant: "embedded",
   hasThinking: undefined,
   streamingTextOrder: 0,
+  isCompacting: false,
   thinkingText: "",
   thinkingOrder: 0,
   thinkingDuration: 0,
+  liveRenderParts: () => [],
   emptyTitle: "",
   emptyHint: "",
   userLabel: "User",
   assistantLabel: "Locus",
   handoffLabel: "Handoff",
   waitingLabel: "Waiting for response…",
+  compactingLabel: "Compacting context…",
   thinkingActiveLabel: "Thinking…",
   thoughtDurationLabel: "Thought for {0}s",
   thoughtMomentLabel: "Thought for a moment",
@@ -423,16 +435,54 @@ function toolCallTreeHasAnyIds(
   );
 }
 
+function hasVisibleMessagePayload(message: ChatMessage) {
+  const status = message.knowledgeProposal?.status;
+  if (status === "stale" || status === "invalidated") return false;
+  if (message.role === "tool") return false;
+  return !!(
+    message.content.trim()
+    || message.thinkingContent?.trim()
+    || message.knowledgeProposal
+    || message.images?.length
+    || (message.role === "user" && userMessageDisplayContent(message).trim())
+  );
+}
+
+function shouldReleaseToolCallHandoffToHistory(
+  messages: ChatMessage[],
+  targetMatchState: ToolCallMatchState,
+) {
+  let matchedToolMessage = false;
+  for (const message of messages) {
+    const matchesTool = toolCallTreeHasAnyIds(message.toolCalls, targetMatchState);
+    if (matchesTool && hasVisibleMessagePayload(message)) {
+      return true;
+    }
+    if (matchedToolMessage && hasVisibleMessagePayload(message)) {
+      return true;
+    }
+    if (matchesTool) {
+      matchedToolMessage = true;
+    }
+  }
+  return false;
+}
+
 watch(
   () => props.activeToolCalls,
   (activeToolCalls, previousToolCalls) => {
     if (activeToolCalls.length === 0 && previousToolCalls && previousToolCalls.length > 0) {
+      const previousMatchState = collectToolCallDisplayMatchState(previousToolCalls);
       traceToolCollapse("activeToolCallsCleared", {
         previousCount: previousToolCalls.length,
         previousIds: previousToolCalls.map((toolCall) => toolCall.id),
         streamingTextLen: props.streamingText.length,
         isStreaming: props.isStreaming,
       });
+      if (!props.isStreaming && shouldReleaseToolCallHandoffToHistory(props.messages, previousMatchState)) {
+        clearToolCallHandoff("active-cleared-history-ready");
+        return;
+      }
       beginToolCallHandoff(previousToolCalls);
     }
   },
@@ -470,6 +520,10 @@ watch(
   () => props.messages,
   (messages, previous) => {
     if (messages === previous || !toolCallHandoff.value) return;
+    if (!props.isStreaming && shouldReleaseToolCallHandoffToHistory(messages, toolCallHandoff.value.toolCallMatchState)) {
+      clearToolCallHandoff("handoff-followed-by-history-message");
+      return;
+    }
     if (messages.some((message) => toolCallTreeHasAnyIds(message.toolCalls, toolCallHandoff.value!.toolCallMatchState))) {
       return;
     }
@@ -520,11 +574,23 @@ const activeToolCallMatchState = computed<ToolCallMatchState>(() => {
   };
 });
 
+function toolCallInfosForMessage(message: Pick<ChatMessage, "toolCalls" | "renderParts">) {
+  if (message.toolCalls) return message.toolCalls;
+  const toolParts = message.renderParts
+    ?.filter((part): part is Extract<AssistantRenderPart, { kind: "toolCall" }> => part.kind === "toolCall")
+    .map((part) => part.toolCall);
+  return toolParts && toolParts.length > 0 ? toolParts : undefined;
+}
+
+function hasExplicitDisplayToolCalls(item: Pick<MessageRenderItem, "displayToolCalls">) {
+  return Object.prototype.hasOwnProperty.call(item, "displayToolCalls");
+}
+
 function toolCallsForRenderItem(item: Pick<MessageRenderItem, "message" | "displayToolCalls">) {
   return buildMessageToolCalls(
     {
       toolCalls: resolveToolCallInfosForRender({
-        messageToolCalls: item.message.toolCalls,
+        messageToolCalls: toolCallInfosForMessage(item.message),
         displayToolCalls: item.displayToolCalls,
       }),
     },
@@ -534,20 +600,6 @@ function toolCallsForRenderItem(item: Pick<MessageRenderItem, "message" | "displ
 
 function toolCallsFromInfos(toolCalls: ToolCallInfo[] | undefined) {
   return buildMessageToolCalls({ toolCalls }, toolOutputMap.value);
-}
-
-function toolCallsBeforeContentForRenderItem(item: MessageRenderItem) {
-  if (Object.prototype.hasOwnProperty.call(item, "displayToolCallsBeforeContent")) {
-    return toolCallsFromInfos(item.displayToolCallsBeforeContent);
-  }
-  return item.message.content.trim().length > 0 ? [] : toolCallsForRenderItem(item);
-}
-
-function toolCallsAfterContentForRenderItem(item: MessageRenderItem) {
-  if (Object.prototype.hasOwnProperty.call(item, "displayToolCallsAfterContent")) {
-    return toolCallsFromInfos(item.displayToolCallsAfterContent);
-  }
-  return item.message.content.trim().length > 0 ? toolCallsForRenderItem(item) : [];
 }
 
 function shouldHideThinkingBlocks() {
@@ -570,9 +622,7 @@ function shouldRenderItem(item: MessageRenderItem) {
   }
 
   return !!(
-    item.message.content
-    || shouldRenderHistoryThinkingBlock(item)
-    || toolCallsForRenderItem(item).length > 0
+    renderPartsForMessage(item).length > 0
     || item.attachedKnowledgeProposals.length > 0
   );
 }
@@ -603,24 +653,25 @@ function buildTailHiddenToolCallMap(
   for (let index = tailGroup.items.length - 1; index >= 0; index -= 1) {
     if (!hasToolCallMatchState(consumableMatchState)) break;
     const item = tailGroup.items[index];
+    const itemToolCalls = item ? toolCallInfosForMessage(item.message) : undefined;
     if (
       !item
       || item.hidden
       || item.message.knowledgeProposal
       || item.message.role !== "assistant"
-      || !item.message.toolCalls
-      || item.message.toolCalls.length === 0
+      || !itemToolCalls
+      || itemToolCalls.length === 0
     ) {
       continue;
     }
 
     const previousMatchEntryCount = toolCallMatchEntryCount(consumableMatchState);
     const toolCalls = filterToolCallsByConsumableMatchState(
-      item.message.toolCalls,
+      itemToolCalls,
       consumableMatchState,
     );
     if (toolCallMatchEntryCount(consumableMatchState) !== previousMatchEntryCount) {
-      hiddenToolCallsByItemId.set(item.id, toolCalls);
+      hiddenToolCallsByItemId.set(item.id, toolCalls ?? []);
     }
   }
 
@@ -629,13 +680,15 @@ function buildTailHiddenToolCallMap(
 
 function isToolOnlyRenderItem(item: MessageRenderItem) {
   if (item.message.role !== "assistant" || item.message.knowledgeProposal) return false;
+  const parts = renderPartsForMessage(item);
+  if (parts.length > 0) {
+    return parts.every((part) => part.kind === "toolCall");
+  }
 
-  const hasContent = item.message.content.trim().length > 0;
-  const hasThinking = shouldRenderHistoryThinkingBlock(item);
   const hasAttachedKnowledgeProposals = item.attachedKnowledgeProposals.length > 0;
   const hasToolCalls = toolCallsForRenderItem(item).length > 0;
 
-  return !hasContent && !hasThinking && !hasAttachedKnowledgeProposals && hasToolCalls;
+  return !item.message.content.trim() && !shouldRenderHistoryThinkingBlock(item) && !hasAttachedKnowledgeProposals && hasToolCalls;
 }
 
 function buildGroupedMessages(hiddenToolCallMatchState: ToolCallMatchState): MessageGroup[] {
@@ -697,9 +750,10 @@ function buildGroupedMessages(hiddenToolCallMatchState: ToolCallMatchState): Mes
                   ...item,
                   content: item.message.content,
                   thinkingContent: item.message.thinkingContent,
+                  renderParts: item.message.renderParts,
                   toolCalls: hiddenToolCallsByItemId.has(item.id)
                     ? hiddenToolCallsByItemId.get(item.id)
-                    : item.message.toolCalls,
+                    : toolCallInfosForMessage(item.message),
                   attachedKnowledgeProposalCount: item.attachedKnowledgeProposals.length,
                   isKnowledgeProposal: !!item.message.knowledgeProposal,
                 })),
@@ -707,6 +761,7 @@ function buildGroupedMessages(hiddenToolCallMatchState: ToolCallMatchState): Mes
               ({
                 content: _content,
                 thinkingContent: _thinkingContent,
+                renderParts: _renderParts,
                 toolCalls: _toolCalls,
                 attachedKnowledgeProposalCount: _proposalCount,
                 isKnowledgeProposal: _isKnowledgeProposal,
@@ -854,13 +909,62 @@ function onTransientToolCallsCollapseFinished() {
   }
 }
 
-const hasThinkingContent = computed(() => props.hasThinking ?? !!props.thinkingText);
-const hasVisibleCompletedThinkingContent = computed(() => !shouldHideThinkingBlocks() && hasThinkingContent.value);
-const hasVisibleTransientThinkingBlock = computed(() => props.isThinking || hasVisibleCompletedThinkingContent.value);
+const canonicalLiveRenderParts = computed(() => {
+  if (props.liveRenderParts.length > 0) {
+    assertCanonicalRenderParts(props.liveRenderParts, "live");
+    return [...props.liveRenderParts].sort(compareAssistantRenderParts);
+  }
+
+  const legacyToolCalls: ToolCallInfo[] = props.activeToolCalls.map((toolCall) => ({
+    id: toolCall.id,
+    name: toolCall.name,
+    arguments: toolCall.arguments,
+    order: toolCall.order,
+    outcome: toolCall.status === "running" ? undefined : toolCall.status,
+    recordedOutput: toolCall.output,
+    nestedToolCalls: toolCall.nestedToolCalls?.map((nestedToolCall) => ({
+      id: nestedToolCall.id,
+      name: nestedToolCall.name,
+      arguments: nestedToolCall.arguments,
+      order: nestedToolCall.order,
+      outcome: nestedToolCall.status === "running" ? undefined : nestedToolCall.status,
+      recordedOutput: nestedToolCall.output,
+    })),
+  }));
+  return synthesizeLegacyRenderParts({
+    id: "__transient__",
+    role: "assistant",
+    content: props.streamingText,
+    createdAt: Date.now() / 1000,
+    contentOrder: props.streamingTextOrder,
+    thinkingOrder: props.thinkingOrder,
+    thinkingContent: props.thinkingText || undefined,
+    thinkingDuration: props.thinkingDuration,
+    toolCalls: legacyToolCalls,
+  });
+});
+
+const hasVisibleCompletedThinkingContent = computed(() =>
+  !shouldHideThinkingBlocks()
+  && canonicalLiveRenderParts.value.some((part) =>
+    part.kind === "thinking" && !part.active && part.content.trim(),
+  ),
+);
 const hasLiveToolCalls = computed(() => props.activeToolCalls.length > 0);
 const hasTransientToolCalls = computed(() => transientToolCalls.value.length > 0);
 const hasToolCallHandoff = computed(() => hasTransientToolCalls.value && !hasLiveToolCalls.value);
-const hasStreamingContent = computed(() => hasVisibleStreamingText.value || hasLiveToolCalls.value);
+const hasVisibleActiveThinkingBlock = computed(() =>
+  props.isThinking
+  && canonicalLiveRenderParts.value.some((part) => part.kind === "thinking" && part.active),
+);
+const hasVisibleTransientThinkingBlock = computed(
+  () => hasVisibleActiveThinkingBlock.value || hasVisibleCompletedThinkingContent.value,
+);
+const hasStreamingContent = computed(() =>
+  hasVisibleStreamingText.value
+  || canonicalLiveRenderParts.value.some((part) => part.kind === "text" || part.kind === "toolCall")
+  || hasLiveToolCalls.value,
+);
 const isWaitingForResponse = computed(
   () => shouldShowWaitingPlaceholder({
     isStreaming: props.isStreaming,
@@ -871,12 +975,14 @@ const isWaitingForResponse = computed(
 );
 const isToolWaitingForResponse = computed(() => isWaitingForResponse.value && hasTransientToolCalls.value);
 const isStandaloneWaitingPlaceholder = computed(() => isWaitingForResponse.value && !hasTransientToolCalls.value);
+const hasStandaloneCompactingPlaceholder = computed(() => props.isCompacting);
 const hasTransientAssistantMessage = computed(
   () =>
     hasStreamingContent.value
     || hasToolCallHandoff.value
     || hasVisibleTransientThinkingBlock.value
-    || isWaitingForResponse.value,
+    || isWaitingForResponse.value
+    || hasStandaloneCompactingPlaceholder.value,
 );
 
 watch(
@@ -935,147 +1041,294 @@ function shouldKeepToolItemExpanded(itemId: string) {
 }
 
 type HistoryRenderSegment =
-  | { type: "thinking"; key: string; content: string; duration?: number }
-  | { type: "toolCalls"; key: string; itemId: string; toolCalls: ToolCallDisplay[] }
-  | { type: "content"; key: string; content: string }
-  | { type: "knowledgeProposal"; key: string; message: ChatMessage };
+  | { type: "thinking"; key: string; part: AssistantRenderPart; content: string; duration?: number }
+  | { type: "toolCalls"; key: string; part: Extract<AssistantRenderPart, { kind: "toolCall" }>; itemId: string; itemIds: string[]; toolCalls: ToolCallDisplay[] }
+  | { type: "content"; key: string; part: AssistantRenderPart; content: string }
+  | { type: "knowledgeProposal"; key: string; part: AssistantRenderPart; message: ChatMessage };
 
 type TransientRenderSegment =
-  | { type: "thinking"; key: string; order: number }
-  | { type: "toolCalls"; key: string; order: number; toolCalls: ToolCallDisplay[] }
-  | { type: "waiting"; key: string; order: number; withinToolGroup: boolean }
-  | { type: "content"; key: string; order: number; content: string };
+  | { type: "thinking"; key: string; part: AssistantRenderPart; active: boolean; duration?: number }
+  | { type: "toolCalls"; key: string; part: Extract<AssistantRenderPart, { kind: "toolCall" }>; toolCalls: ToolCallDisplay[]; showWaiting: boolean; animateCollapseOnMount: boolean }
+  | { type: "waiting"; key: string; label: string }
+  | { type: "content"; key: string; part: AssistantRenderPart; content: string };
 
-const TRANSIENT_FALLBACK_ORDER: Record<TransientRenderSegment["type"], number> = {
-  thinking: 10,
-  toolCalls: 20,
-  waiting: 30,
-  content: 40,
-};
+function renderPartsForMessage(item: MessageRenderItem): AssistantRenderPart[] {
+  const hasToolFilter = hasExplicitDisplayToolCalls(item) || !!toolCallInfosForMessage(item.message);
+  const messageToolCalls = resolveToolCallInfosForRender({
+    messageToolCalls: toolCallInfosForMessage(item.message),
+    displayToolCalls: item.displayToolCalls,
+  });
 
-const TRANSIENT_ORDER_TIEBREAK: Record<TransientRenderSegment["type"], number> = {
-  thinking: 0,
-  toolCalls: 1,
-  waiting: 2,
-  content: 3,
-};
+  let parts: AssistantRenderPart[];
+  if (item.message.renderParts?.length) {
+    assertCanonicalRenderParts(item.message.renderParts, `message:${item.message.id}`);
+    const visibleToolIds = new Set((messageToolCalls ?? []).map((toolCall) => toolCall.id));
+    parts = [...item.message.renderParts]
+      .filter((part) => part.kind !== "thinking" || !shouldHideThinkingBlocks())
+      .filter((part) => part.kind !== "toolCall" || !hasToolFilter || visibleToolIds.has(part.toolCall.id))
+      .sort(compareAssistantRenderParts);
+  } else {
+    parts = synthesizeLegacyRenderParts(item.message, {
+      toolCalls: messageToolCalls,
+      beforeContentToolCalls: item.displayToolCallsBeforeContent,
+      afterContentToolCalls: item.displayToolCallsAfterContent,
+      knowledgeProposals: item.attachedKnowledgeProposals,
+    }).filter((part) => part.kind !== "thinking" || !shouldHideThinkingBlocks());
+  }
+
+  if (!item.message.renderParts?.length || item.attachedKnowledgeProposals.length === 0) {
+    return parts;
+  }
+
+  const lastOrder = parts[parts.length - 1]?.order ?? { runId: "legacy", seq: 1 };
+  return [
+    ...parts,
+    ...item.attachedKnowledgeProposals
+      .filter((message) => !!message.knowledgeProposal)
+      .map((message, index): AssistantRenderPart => ({
+        kind: "knowledgeProposal",
+        id: message.id,
+        order: { runId: lastOrder.runId, seq: lastOrder.seq + 100 + index },
+        message,
+      })),
+  ].sort(compareAssistantRenderParts);
+}
+
+function toolCallDisplayForPart(part: Extract<AssistantRenderPart, { kind: "toolCall" }>) {
+  return toolCallsFromInfos([part.toolCall])[0];
+}
+
+function toolCallInfoFromDisplay(toolCall: ToolCallDisplay): ToolCallInfo {
+  return {
+    id: toolCall.id,
+    name: toolCall.name,
+    arguments: toolCall.arguments,
+    order: toolCall.order,
+    outcome: toolCall.status === "running" ? undefined : toolCall.status,
+    recordedOutput: toolCall.output,
+    nestedToolCalls: toolCall.nestedToolCalls?.map((nestedToolCall) => toolCallInfoFromDisplay(nestedToolCall)),
+  };
+}
+
+function transientToolHandoffPart(toolCalls: ToolCallDisplay[]): Extract<AssistantRenderPart, { kind: "toolCall" }> | null {
+  const firstToolCall = toolCalls[0];
+  if (!firstToolCall) return null;
+
+  return {
+    kind: "toolCall",
+    id: "transient:tools-handoff",
+    order: { runId: "legacy", seq: firstToolCallRenderOrder(toolCalls) || 1 },
+    toolCall: toolCallInfoFromDisplay(firstToolCall),
+  };
+}
+
+function transientToolSegmentKey(toolCalls: ToolCallDisplay[]) {
+  return `transient:tools:${toolCalls[0]?.id ?? "handoff"}`;
+}
+
+function historyToolSegmentKey(toolCalls: ToolCallDisplay[], fallbackId: string) {
+  return `history:tools:${toolCalls[0]?.id ?? fallbackId}`;
+}
 
 function historyRenderSegments(item: MessageRenderItem): HistoryRenderSegment[] {
   const segments: HistoryRenderSegment[] = [];
-  const beforeToolCalls = toolCallsBeforeContentForRenderItem(item);
-  const afterToolCalls = toolCallsAfterContentForRenderItem(item);
+  let pendingToolPart: Extract<AssistantRenderPart, { kind: "toolCall" }> | null = null;
+  let pendingToolCalls: ToolCallDisplay[] = [];
+  let pendingToolPartIds: string[] = [];
 
-  if (shouldRenderHistoryThinkingBlock(item)) {
-    segments.push({
-      type: "thinking",
-      key: `${item.id}:thinking`,
-      content: item.message.thinkingContent ?? "",
-      duration: item.message.thinkingDuration,
-    });
-  }
-
-  if (beforeToolCalls.length > 0) {
+  const flushPendingTools = () => {
+    if (!pendingToolPart || pendingToolCalls.length === 0) return;
     segments.push({
       type: "toolCalls",
-      key: `${item.id}:tools:before`,
+      key: historyToolSegmentKey(pendingToolCalls, pendingToolPart.id),
+      part: pendingToolPart,
       itemId: item.id,
-      toolCalls: beforeToolCalls,
+      itemIds: [item.id],
+      toolCalls: pendingToolCalls,
     });
-  }
+    pendingToolPart = null;
+    pendingToolCalls = [];
+    pendingToolPartIds = [];
+  };
 
-  if (item.message.content) {
-    segments.push({
-      type: "content",
-      key: `${item.id}:content`,
-      content: item.message.content,
-    });
+  for (const part of renderPartsForMessage(item)) {
+    if (part.kind === "thinking") {
+      flushPendingTools();
+      segments.push({
+        type: "thinking",
+        key: `${item.id}:${part.id}`,
+        part,
+        content: part.content,
+        duration: part.duration,
+      });
+    } else if (part.kind === "text") {
+      flushPendingTools();
+      segments.push({
+        type: "content",
+        key: `${item.id}:${part.id}`,
+        part,
+        content: part.content,
+      });
+    } else if (part.kind === "toolCall") {
+      const toolCall = toolCallDisplayForPart(part);
+      if (toolCall) {
+        pendingToolPart ??= part;
+        pendingToolPartIds.push(part.id);
+        pendingToolCalls.push(toolCall);
+      }
+    } else if (part.kind === "knowledgeProposal") {
+      flushPendingTools();
+      segments.push({
+        type: "knowledgeProposal",
+        key: `${item.id}:${part.id}`,
+        part,
+        message: part.message,
+      });
+    }
   }
+  flushPendingTools();
+  return segments;
+}
 
-  if (afterToolCalls.length > 0) {
+function historyRenderSegmentsForGroup(group: MessageGroup): HistoryRenderSegment[] {
+  if (group.role !== "assistant") return [];
+
+  const segments: HistoryRenderSegment[] = [];
+  let pendingToolPart: Extract<AssistantRenderPart, { kind: "toolCall" }> | null = null;
+  let pendingToolCalls: ToolCallDisplay[] = [];
+  let pendingToolPartIds: string[] = [];
+  let pendingToolItemIds: string[] = [];
+
+  const flushPendingTools = () => {
+    if (!pendingToolPart || pendingToolCalls.length === 0) return;
+    const itemIds = Array.from(new Set(pendingToolItemIds));
     segments.push({
       type: "toolCalls",
-      key: `${item.id}:tools:after`,
-      itemId: item.id,
-      toolCalls: afterToolCalls,
+      key: historyToolSegmentKey(pendingToolCalls, pendingToolPart.id),
+      part: pendingToolPart,
+      itemId: itemIds[0] ?? group.id,
+      itemIds,
+      toolCalls: pendingToolCalls,
     });
+    pendingToolPart = null;
+    pendingToolCalls = [];
+    pendingToolPartIds = [];
+    pendingToolItemIds = [];
+  };
+
+  for (const item of group.items) {
+    for (const segment of historyRenderSegments(item)) {
+      if (segment.type === "toolCalls") {
+        pendingToolPart ??= segment.part;
+        pendingToolPartIds.push(segment.part.id);
+        pendingToolItemIds.push(...segment.itemIds);
+        pendingToolCalls.push(...segment.toolCalls);
+      } else {
+        flushPendingTools();
+        segments.push(segment);
+      }
+    }
+  }
+  flushPendingTools();
+  return segments;
+}
+
+function isToolOnlyMessageGroup(group: MessageGroup) {
+  if (group.role !== "assistant") return false;
+  const segments = historyRenderSegmentsForGroup(group);
+  return segments.length > 0 && segments.every((segment) => segment.type === "toolCalls");
+}
+
+function shouldKeepToolSegmentExpanded(segment: Extract<HistoryRenderSegment, { type: "toolCalls" }>) {
+  return segment.itemIds.some((itemId) => shouldKeepToolItemExpanded(itemId));
+}
+
+const transientRenderSegments = computed<TransientRenderSegment[]>(() => {
+  const segments: TransientRenderSegment[] = [];
+  const transientById = new Map(transientToolCalls.value.map((toolCall) => [toolCall.id, toolCall]));
+  let pendingToolPart: Extract<AssistantRenderPart, { kind: "toolCall" }> | null = null;
+  let pendingToolCalls: ToolCallDisplay[] = [];
+  let pendingToolPartIds: string[] = [];
+
+  const flushPendingTools = () => {
+    if (!pendingToolPart || pendingToolCalls.length === 0) return;
+    segments.push({
+      type: "toolCalls",
+      key: transientToolSegmentKey(pendingToolCalls),
+      part: pendingToolPart,
+      toolCalls: pendingToolCalls,
+      showWaiting: false,
+      animateCollapseOnMount: !!toolCallHandoff.value?.collapseArmed,
+    });
+    pendingToolPart = null;
+    pendingToolCalls = [];
+    pendingToolPartIds = [];
+  };
+
+  for (const part of canonicalLiveRenderParts.value) {
+    if (part.kind === "thinking") {
+      flushPendingTools();
+      if (part.active || (!shouldHideThinkingBlocks() && part.content.trim())) {
+        segments.push({
+          type: "thinking",
+          key: `transient:${part.id}`,
+          part,
+          active: !!part.active && props.isThinking,
+          duration: part.duration ?? props.thinkingDuration,
+        });
+      }
+    } else if (part.kind === "text") {
+      flushPendingTools();
+      const content = props.liveRenderParts.length <= 1 && props.streamingText ? props.streamingText : part.content;
+      if (content) {
+        segments.push({
+          type: "content",
+          key: `transient:${part.id}`,
+          part,
+          content,
+        });
+      }
+    } else if (part.kind === "toolCall") {
+      const toolCall = transientById.get(part.toolCall.id) ?? toolCallDisplayForPart(part);
+      if (toolCall) {
+        pendingToolPart ??= part;
+        pendingToolPartIds.push(part.id);
+        pendingToolCalls.push(toolCall);
+      }
+    }
+  }
+  flushPendingTools();
+
+  const hasRenderedToolSegment = segments.some((segment) => segment.type === "toolCalls");
+  if (!hasRenderedToolSegment && transientToolCalls.value.length > 0) {
+    const handoffPart = transientToolHandoffPart(transientToolCalls.value);
+    if (handoffPart) {
+      segments.unshift({
+        type: "toolCalls",
+        key: transientToolSegmentKey(transientToolCalls.value),
+        part: handoffPart,
+        toolCalls: transientToolCalls.value,
+        showWaiting: false,
+        animateCollapseOnMount: !!toolCallHandoff.value?.collapseArmed,
+      });
+    }
   }
 
-  for (const proposalMsg of item.attachedKnowledgeProposals) {
+  const toolSegments = segments.filter((segment) => segment.type === "toolCalls");
+  const lastToolSegment = toolSegments[toolSegments.length - 1];
+  if (lastToolSegment) {
+    lastToolSegment.showWaiting = true;
+  }
+
+  if (hasStandaloneCompactingPlaceholder.value || isStandaloneWaitingPlaceholder.value) {
     segments.push({
-      type: "knowledgeProposal",
-      key: proposalMsg.id,
-      message: proposalMsg,
+      type: "waiting",
+      key: hasStandaloneCompactingPlaceholder.value ? "transient:compacting" : "transient:waiting",
+      label: hasStandaloneCompactingPlaceholder.value ? props.compactingLabel : props.waitingLabel,
     });
   }
 
   return segments;
-}
-
-function firstToolCallOrder(toolCalls: ToolCallDisplay[]) {
-  let order = Number.POSITIVE_INFINITY;
-  const visit = (items: ToolCallDisplay[]) => {
-    for (const toolCall of items) {
-      if (typeof toolCall.order === "number" && toolCall.order > 0) {
-        order = Math.min(order, toolCall.order);
-      }
-      if (toolCall.nestedToolCalls && toolCall.nestedToolCalls.length > 0) {
-        visit(toolCall.nestedToolCalls);
-      }
-    }
-  };
-  visit(toolCalls);
-  return Number.isFinite(order) ? order : 0;
-}
-
-const transientToolCallsOrder = computed(() => firstToolCallOrder(transientToolCalls.value));
-
-const transientRenderSegments = computed<TransientRenderSegment[]>(() => {
-  const segments: TransientRenderSegment[] = [];
-  const toolOrder = transientToolCallsOrder.value || TRANSIENT_FALLBACK_ORDER.toolCalls;
-
-  if (hasVisibleTransientThinkingBlock.value) {
-    segments.push({
-      type: "thinking",
-      key: "transient:thinking",
-      order: props.thinkingOrder && props.thinkingOrder > 0
-        ? props.thinkingOrder
-        : TRANSIENT_FALLBACK_ORDER.thinking,
-    });
-  }
-
-  if (transientToolCalls.value.length > 0) {
-    segments.push({
-      type: "toolCalls",
-      key: "transient:tools",
-      order: toolOrder,
-      toolCalls: transientToolCalls.value,
-    });
-  }
-
-  if (isStandaloneWaitingPlaceholder.value) {
-    segments.push({
-      type: "waiting",
-      key: "transient:waiting",
-      order: TRANSIENT_FALLBACK_ORDER.waiting,
-      withinToolGroup: false,
-    });
-  }
-
-  if (props.streamingText) {
-    segments.push({
-      type: "content",
-      key: "transient:content",
-      order: props.streamingTextOrder && props.streamingTextOrder > 0
-        ? props.streamingTextOrder
-        : TRANSIENT_FALLBACK_ORDER.content,
-      content: props.streamingText,
-    });
-  }
-
-  return segments.sort((left, right) =>
-    left.order - right.order
-    || TRANSIENT_ORDER_TIEBREAK[left.type] - TRANSIENT_ORDER_TIEBREAK[right.type],
-  );
 });
 
 function formatThoughtSummary(duration?: number) {
@@ -1177,20 +1430,15 @@ function openImage(src: string) {
           </div>
 
           <div class="chat-transcript-message-content" :class="`is-${variant}`">
-            <div
-              v-for="item in group.items"
-              v-show="shouldRenderItem(item)"
-              :key="item.id"
-              class="chat-transcript-item-stack"
-              :class="[
-                `is-${variant}`,
-                {
-                  'tool-only': isToolOnlyRenderItem(item),
-                },
-              ]"
-              :data-scroll-anchor-id="item.id"
-            >
-              <template v-if="item.message.role === 'user'">
+            <template v-if="group.role === 'user'">
+              <div
+                v-for="item in group.items"
+                v-show="shouldRenderItem(item)"
+                :key="item.id"
+                class="chat-transcript-item-stack"
+                :class="`is-${variant}`"
+                :data-scroll-anchor-id="item.id"
+              >
                 <div
                   v-if="enableIntentBadges && messageIntentBadges(item.message).length > 0"
                   class="chat-transcript-intent-row"
@@ -1227,76 +1475,87 @@ function openImage(src: string) {
                     <template v-else>{{ segment.value }}</template>
                   </template>
                 </div>
-              </template>
+              </div>
+            </template>
 
-              <template v-else>
+            <div
+              v-else
+              class="chat-transcript-item-stack"
+              :class="[
+                `is-${variant}`,
+                {
+                  'tool-only': isToolOnlyMessageGroup(group),
+                },
+              ]"
+              :data-scroll-anchor-id="group.items[0]?.id"
+            >
+              <template
+                v-for="segment in historyRenderSegmentsForGroup(group)"
+                :key="segment.key"
+              >
+                <div
+                  v-if="segment.type === 'thinking'"
+                  class="chat-transcript-thinking-block"
+                  data-render-part-kind="thinking"
+                >
+                  <button
+                    v-if="variant === 'session'"
+                    type="button"
+                    class="chat-transcript-thinking-header is-clickable"
+                    @click="emit('openThinking', segment.content)"
+                  >
+                    <svg class="chat-transcript-thinking-chevron" viewBox="0 0 16 16" fill="currentColor" width="12" height="12">
+                      <path d="M6 3l5 5-5 5V3z" />
+                    </svg>
+                    <span class="chat-transcript-thinking-title">
+                      {{ formatThoughtSummary(segment.duration) }}
+                    </span>
+                  </button>
+
+                  <div v-else class="chat-transcript-thinking-chip">
+                    <span class="chat-transcript-thinking-title">
+                      {{ formatThoughtSummary(segment.duration) }}
+                    </span>
+                  </div>
+                </div>
+
+                <div
+                  v-else-if="segment.type === 'toolCalls'"
+                  class="chat-transcript-tool-calls-group"
+                  data-render-part-kind="toolCall"
+                >
+                  <ToolCallCollection
+                    :tool-calls="segment.toolCalls"
+                    :allow-collapse="!shouldKeepToolSegmentExpanded(segment)"
+                    :collapse-enabled="!shouldKeepToolSegmentExpanded(segment)"
+                    @viewport-anchor-start="emitToolViewportAnchorStart"
+                    @viewport-anchor-end="emitToolViewportAnchorEnd"
+                  >
+                    <template #default="{ toolCall }">
+                      <ToolCallBlock
+                        :tool-call="toolCall"
+                        :collapse-enabled="!shouldKeepToolSegmentExpanded(segment)"
+                        @tool-viewport-anchor-start="emitToolViewportAnchorStart"
+                        @tool-viewport-anchor-end="emitToolViewportAnchorEnd"
+                      />
+                    </template>
+                  </ToolCallCollection>
+                </div>
+
+                <MarkdownRenderer
+                  v-else-if="segment.type === 'content'"
+                  data-render-part-kind="text"
+                  :content="segment.content"
+                  enable-file-refs
+                />
+
                 <KnowledgeProposalCard
-                  v-if="item.message.knowledgeProposal"
-                  :proposal="item.message.knowledgeProposal"
+                  v-else-if="segment.type === 'knowledgeProposal'"
+                  data-render-part-kind="knowledgeProposal"
+                  :proposal="segment.message.knowledgeProposal!"
                   @apply="emit('applyKnowledgeProposal', $event)"
                   @ignore="emit('ignoreKnowledgeProposal', $event)"
                 />
-
-                <template v-else>
-                  <template
-                    v-for="segment in historyRenderSegments(item)"
-                    :key="segment.key"
-                  >
-                    <div v-if="segment.type === 'thinking'" class="chat-transcript-thinking-block">
-                      <button
-                        v-if="variant === 'session'"
-                        type="button"
-                        class="chat-transcript-thinking-header is-clickable"
-                        @click="emit('openThinking', segment.content)"
-                      >
-                        <svg class="chat-transcript-thinking-chevron" viewBox="0 0 16 16" fill="currentColor" width="12" height="12">
-                          <path d="M6 3l5 5-5 5V3z" />
-                        </svg>
-                        <span class="chat-transcript-thinking-title">
-                          {{ formatThoughtSummary(segment.duration) }}
-                        </span>
-                      </button>
-
-                      <div v-else class="chat-transcript-thinking-chip">
-                        <span class="chat-transcript-thinking-title">
-                          {{ formatThoughtSummary(segment.duration) }}
-                        </span>
-                      </div>
-                    </div>
-
-                    <div v-else-if="segment.type === 'toolCalls'" class="chat-transcript-tool-calls-group">
-                      <ToolCallCollection
-                        :tool-calls="segment.toolCalls"
-                        :allow-collapse="!shouldKeepToolItemExpanded(segment.itemId)"
-                        :collapse-enabled="!shouldKeepToolItemExpanded(segment.itemId)"
-                        @viewport-anchor-start="emitToolViewportAnchorStart"
-                        @viewport-anchor-end="emitToolViewportAnchorEnd"
-                      >
-                        <template #default="{ toolCall }">
-                          <ToolCallBlock
-                            :tool-call="toolCall"
-                            :collapse-enabled="!shouldKeepToolItemExpanded(segment.itemId)"
-                            @tool-viewport-anchor-start="emitToolViewportAnchorStart"
-                            @tool-viewport-anchor-end="emitToolViewportAnchorEnd"
-                          />
-                        </template>
-                      </ToolCallCollection>
-                    </div>
-
-                    <MarkdownRenderer
-                      v-else-if="segment.type === 'content'"
-                      :content="segment.content"
-                      enable-file-refs
-                    />
-
-                    <KnowledgeProposalCard
-                      v-else-if="segment.type === 'knowledgeProposal'"
-                      :proposal="segment.message.knowledgeProposal!"
-                      @apply="emit('applyKnowledgeProposal', $event)"
-                      @ignore="emit('ignoreKnowledgeProposal', $event)"
-                    />
-                  </template>
-                </template>
               </template>
             </div>
           </div>
@@ -1310,6 +1569,7 @@ function openImage(src: string) {
             {
               continuation: isStreamingContinuation,
               'waiting-placeholder': isStandaloneWaitingPlaceholder,
+              'compact-handoff': isCompacting,
             },
           ]"
           data-scroll-anchor-id="__transient__"
@@ -1319,7 +1579,7 @@ function openImage(src: string) {
             class="chat-transcript-message-role"
             :class="`is-${variant}`"
           >
-            {{ assistantLabel }}
+            {{ isCompacting ? handoffLabel : assistantLabel }}
           </div>
 
           <div class="chat-transcript-message-content" :class="`is-${variant}`">
@@ -1327,39 +1587,48 @@ function openImage(src: string) {
               v-for="segment in transientRenderSegments"
               :key="segment.key"
             >
-              <div v-if="segment.type === 'thinking'" class="chat-transcript-thinking-block">
+              <div
+                v-if="segment.type === 'thinking'"
+                class="chat-transcript-thinking-block"
+                data-render-part-kind="thinking"
+              >
                 <button
                   v-if="variant === 'session'"
                   type="button"
                   class="chat-transcript-thinking-header"
-                  :class="{ active: isThinking, 'is-clickable': true }"
+                  :class="{ active: segment.active, 'is-clickable': true }"
                   @click="emit('openThinking', '')"
                 >
                   <svg class="chat-transcript-thinking-chevron" viewBox="0 0 16 16" fill="currentColor" width="12" height="12">
                     <path d="M6 3l5 5-5 5V3z" />
                   </svg>
-                  <template v-if="isThinking">
+                  <template v-if="segment.active">
                     <span class="chat-transcript-thinking-spinner" />
                     <span class="chat-transcript-thinking-title">{{ thinkingActiveLabel }}</span>
                   </template>
                   <template v-else>
-                    <span class="chat-transcript-thinking-title">{{ formatThoughtSummary(thinkingDuration) }}</span>
+                    <span class="chat-transcript-thinking-title">{{ formatThoughtSummary(segment.duration) }}</span>
                   </template>
                 </button>
 
-                <div v-else class="chat-transcript-thinking-chip" :class="{ active: isThinking }">
-                  <span v-if="isThinking" class="chat-transcript-thinking-spinner compact" />
+                <div v-else class="chat-transcript-thinking-chip" :class="{ active: segment.active }">
+                  <span v-if="segment.active" class="chat-transcript-thinking-spinner compact" />
                   <span class="chat-transcript-thinking-title">
-                    {{ isThinking ? thinkingActiveLabel : formatThoughtSummary(thinkingDuration) }}
+                    {{ segment.active ? thinkingActiveLabel : formatThoughtSummary(segment.duration) }}
                   </span>
                 </div>
               </div>
 
-              <div v-else-if="segment.type === 'toolCalls'" class="chat-transcript-tool-calls-group">
+              <div
+                v-else-if="segment.type === 'toolCalls'"
+                class="chat-transcript-tool-calls-group"
+                data-render-part-kind="toolCall"
+              >
                 <ToolCallCollection
                   :tool-calls="segment.toolCalls"
                   :allow-collapse="transientToolCallsAllowCollapse"
                   :collapse-enabled="transientToolCallsCollapseEnabled"
+                  :animate-collapse-on-mount="segment.animateCollapseOnMount"
                   @collapse-finished="onTransientToolCallsCollapseFinished"
                   @viewport-anchor-start="emitToolViewportAnchorStart"
                   @viewport-anchor-end="emitToolViewportAnchorEnd"
@@ -1373,7 +1642,7 @@ function openImage(src: string) {
                     />
                   </template>
                 </ToolCallCollection>
-                <div v-if="isToolWaitingForResponse" class="chat-transcript-tool-waiting-row">
+                <div v-if="segment.showWaiting && isToolWaitingForResponse" class="chat-transcript-tool-waiting-row">
                   <span class="chat-transcript-thinking-spinner compact" />
                   <span class="chat-transcript-thinking-title">{{ waitingLabel }}</span>
                 </div>
@@ -1382,12 +1651,13 @@ function openImage(src: string) {
               <div v-else-if="segment.type === 'waiting'" class="chat-transcript-thinking-block">
                 <div class="chat-transcript-thinking-header active">
                   <span class="chat-transcript-thinking-spinner" />
-                  <span class="chat-transcript-thinking-title">{{ waitingLabel }}</span>
+                  <span class="chat-transcript-thinking-title">{{ segment.label }}</span>
                 </div>
               </div>
 
               <MarkdownRenderer
                 v-else-if="segment.type === 'content'"
+                data-render-part-kind="text"
                 :content="segment.content"
                 cursor
                 enable-file-refs

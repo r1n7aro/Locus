@@ -57,6 +57,7 @@ export interface AssistantToolMergeCandidate {
   id: string;
   content: string;
   thinkingContent?: string;
+  renderParts?: unknown[];
   toolCalls?: ToolCallInfo[];
   attachedKnowledgeProposalCount?: number;
   isKnowledgeProposal?: boolean;
@@ -71,6 +72,65 @@ export type AssistantToolMergeResult<T> = T & {
 export interface ToolCallInfoRenderSource {
   messageToolCalls?: ToolCallInfo[];
   displayToolCalls?: ToolCallInfo[];
+}
+
+interface OrderedToolCallLike {
+  order?: number;
+  nestedToolCalls?: readonly OrderedToolCallLike[];
+}
+
+export interface ToolCallRenderOrderSegment<T> {
+  order: number;
+  toolCalls: T[];
+}
+
+export function firstToolCallRenderOrder(toolCalls: readonly OrderedToolCallLike[]) {
+  let order = Number.POSITIVE_INFINITY;
+  const visit = (items: readonly OrderedToolCallLike[]) => {
+    for (const toolCall of items) {
+      if (typeof toolCall.order === "number" && toolCall.order > 0) {
+        order = Math.min(order, toolCall.order);
+      }
+      if (toolCall.nestedToolCalls && toolCall.nestedToolCalls.length > 0) {
+        visit(toolCall.nestedToolCalls);
+      }
+    }
+  };
+  visit(toolCalls);
+  return Number.isFinite(order) ? order : 0;
+}
+
+export function splitToolCallsByRenderOrder<T extends OrderedToolCallLike>(
+  toolCalls: readonly T[],
+  options: { fallbackOrder: number; boundaryOrders?: readonly number[] },
+): Array<ToolCallRenderOrderSegment<T>> {
+  const boundaryOrders = [...(options.boundaryOrders ?? [])]
+    .filter((order) => Number.isFinite(order) && order > 0)
+    .sort((left, right) => left - right);
+  const entries = toolCalls
+    .map((toolCall, index) => ({
+      toolCall,
+      index,
+      order: firstToolCallRenderOrder([toolCall]) || options.fallbackOrder,
+    }))
+    .sort((left, right) => left.order - right.order || left.index - right.index);
+  const segments: Array<ToolCallRenderOrderSegment<T>> = [];
+
+  const hasBoundaryBetween = (leftOrder: number, rightOrder: number) =>
+    boundaryOrders.some((boundaryOrder) =>
+      boundaryOrder > leftOrder && boundaryOrder <= rightOrder,
+    );
+
+  for (const entry of entries) {
+    const current = segments[segments.length - 1];
+    if (!current || hasBoundaryBetween(current.order, entry.order)) {
+      segments.push({ order: entry.order, toolCalls: [entry.toolCall] });
+      continue;
+    }
+    current.toolCalls.push(entry.toolCall);
+  }
+
+  return segments;
 }
 
 function stableSerialize(value: unknown): string {
@@ -429,6 +489,7 @@ export function buildMessageToolCall(
     id: toolCall.id,
     name: toolCall.name,
     arguments: toolCall.arguments,
+    order: toolCall.order,
     status: inferToolCallStatus(toolCall, output),
     output,
     nestedToolCalls: toolCall.nestedToolCalls?.map((nestedToolCall) =>
@@ -475,11 +536,24 @@ export function mergeSequentialAssistantToolCalls<T extends AssistantToolMergeCa
   };
 
   for (const item of items) {
+    if (item.renderParts && item.renderParts.length > 0) {
+      const hasToolCallsProperty = Object.prototype.hasOwnProperty.call(item, "toolCalls");
+      const displayToolCalls = hasToolCallsProperty ? [...(item.toolCalls ?? [])] : undefined;
+      flushPendingToolOnlyItem();
+      merged.push({
+        ...item,
+        ...(hasToolCallsProperty ? { displayToolCalls } : {}),
+      });
+      continue;
+    }
+
     const currentToolCalls = item.toolCalls ?? [];
     const hasResponseText = !item.isKnowledgeProposal && item.content.trim().length > 0;
+    const hasThinkingContent = !item.isKnowledgeProposal && !!item.thinkingContent?.trim();
     const isToolOnlyRound =
       !item.isKnowledgeProposal
       && !hasResponseText
+      && !hasThinkingContent
       && (item.attachedKnowledgeProposalCount ?? 0) === 0
       && currentToolCalls.length > 0;
     const canAbsorbPendingRounds = !item.isKnowledgeProposal && hasResponseText;

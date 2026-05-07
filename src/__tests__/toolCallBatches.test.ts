@@ -6,9 +6,11 @@ import {
   filterToolCallsByConsumableMatchState,
   filterToolCallsByActiveIds,
   filterToolCallsByMatchState,
+  firstToolCallRenderOrder,
   mergeSequentialAssistantToolCalls,
   mergeToolCallDisplaysWithoutDuplicates,
   resolveToolCallInfosForRender,
+  splitToolCallsByRenderOrder,
   summarizeToolCallBatch,
 } from "../composables/toolCallBatches";
 
@@ -69,6 +71,21 @@ describe("toolCallBatches", () => {
     expect(buildMessageToolCalls(message, { "tc-2": "cached output" })[0]?.output).toBe("server output");
   });
 
+  it("preserves persisted render order for historical message tool calls", () => {
+    const message: Pick<ChatMessage, "toolCalls"> = {
+      toolCalls: [
+        {
+          id: "tc-ordered",
+          name: "read",
+          arguments: "{}",
+          order: 4,
+        },
+      ],
+    };
+
+    expect(buildMessageToolCalls(message, {})[0]?.order).toBe(4);
+  });
+
   it("preserves persisted outcomes for historical tool calls", () => {
     const message: Pick<ChatMessage, "toolCalls"> = {
       toolCalls: [
@@ -108,6 +125,44 @@ describe("toolCallBatches", () => {
     const toolCalls = buildMessageToolCalls(message, {});
     expect(toolCalls[0]?.nestedToolCalls?.[0]?.output).toBe("class Player {}");
     expect(toolCalls[0]?.nestedToolCalls?.[0]?.status).toBe("done");
+  });
+
+  it("uses the earliest nested persisted order for a tool block", () => {
+    const toolCalls: ToolCallDisplay[] = [
+      {
+        id: "task-1",
+        name: "task",
+        arguments: "{}",
+        status: "done",
+        nestedToolCalls: [
+          {
+            id: "read-1",
+            name: "read",
+            arguments: "{}",
+            status: "done",
+            order: 2,
+          },
+        ],
+      },
+    ];
+
+    expect(firstToolCallRenderOrder(toolCalls)).toBe(2);
+  });
+
+  it("splits ordered tool groups around non-tool render boundaries", () => {
+    const segments = splitToolCallsByRenderOrder(
+      [
+        { ...makeToolCall("done", "tc-before"), order: 2 },
+        { ...makeToolCall("done", "tc-after-a"), order: 4 },
+        { ...makeToolCall("done", "tc-after-b"), order: 5 },
+      ],
+      { fallbackOrder: 20, boundaryOrders: [3] },
+    );
+
+    expect(segments.map((segment) => segment.toolCalls.map((toolCall) => toolCall.id))).toEqual([
+      ["tc-before"],
+      ["tc-after-a", "tc-after-b"],
+    ]);
   });
 
   it("collects nested active tool call ids for transcript de-duplication", () => {
@@ -544,7 +599,7 @@ describe("toolCallBatches", () => {
     expect(merged[1]?.displayToolCalls?.map((toolCall) => toolCall.id)).toEqual(["tc-read"]);
   });
 
-  it("waits for actual text instead of thinking-only state before merging", () => {
+  it("keeps thinking-only tool rounds separate so their thinking block can render", () => {
     const merged = mergeSequentialAssistantToolCalls([
       {
         id: "m1",
@@ -563,8 +618,12 @@ describe("toolCallBatches", () => {
       },
     ]);
 
-    expect(merged).toHaveLength(1);
-    expect(merged[0]?.id).toBe("m3");
-    expect(merged[0]?.displayToolCalls?.map((toolCall) => toolCall.id)).toEqual(["tc-1", "tc-2"]);
+    expect(merged).toHaveLength(3);
+    expect(merged[0]?.id).toBe("m1");
+    expect(merged[0]?.displayToolCalls?.map((toolCall) => toolCall.id)).toEqual(["tc-1"]);
+    expect(merged[1]?.id).toBe("m2");
+    expect(merged[1]?.thinkingContent).toBe("thinking");
+    expect(merged[1]?.displayToolCalls?.map((toolCall) => toolCall.id)).toEqual(["tc-2"]);
+    expect(merged[2]?.id).toBe("m3");
   });
 });

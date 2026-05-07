@@ -56,7 +56,9 @@ const {
   thinkingText,
   streamingTextOrder,
   thinkingOrder,
+  liveRenderParts,
   isStreaming,
+  isCompacting,
   isThinking,
   thinkingDuration,
   activeToolCalls,
@@ -154,7 +156,9 @@ function handleSelectAgent(agentId: string) {
     :streaming-text-order="streamingTextOrder"
     :thinking-text="thinkingText"
     :thinking-order="thinkingOrder"
+    :live-render-parts="liveRenderParts"
     :is-streaming="isStreaming"
+    :is-compacting="isCompacting"
     :is-thinking="isThinking"
     :thinking-duration="thinkingDuration"
     :active-tool-calls="activeToolCalls"

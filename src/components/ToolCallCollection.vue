@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch } from "vue";
+import { computed, onMounted, ref, watch } from "vue";
 import { useDisplaySettings } from "../composables/useDisplaySettings";
 import { summarizeToolCallBatch } from "../composables/toolCallBatches";
 import { t } from "../i18n";
@@ -11,9 +11,11 @@ const props = withDefaults(defineProps<{
   toolCalls: ToolCallDisplay[];
   allowCollapse?: boolean;
   collapseEnabled?: boolean;
+  animateCollapseOnMount?: boolean;
 }>(), {
   allowCollapse: true,
   collapseEnabled: true,
+  animateCollapseOnMount: false,
 });
 const emit = defineEmits<{
   (e: "collapseFinished"): void;
@@ -22,7 +24,13 @@ const emit = defineEmits<{
 }>();
 
 const { state: displaySettings } = useDisplaySettings();
-const expanded = ref(false);
+const startsExpandedForCollapseAnimation =
+  props.animateCollapseOnMount
+  && summarizeToolCallBatch(
+    props.toolCalls,
+    displaySettings.compactToolCalls && props.allowCollapse && props.collapseEnabled,
+  ).canCollapse;
+const expanded = ref(startsExpandedForCollapseAnimation);
 const panelVisible = ref(false);
 const panelLeaving = ref(false);
 const summaryRef = ref<HTMLElement | null>(null);
@@ -146,6 +154,14 @@ function toggleExpanded() {
   expanded.value = !expanded.value;
 }
 
+onMounted(() => {
+  if (!startsExpandedForCollapseAnimation) return;
+  traceCollection("animateCollapseOnMount");
+  runOnNextFrame(() => {
+    expanded.value = false;
+  });
+});
+
 function onPanelEnter(element: Element, done: () => void) {
   const panel = element as HTMLElement;
   traceCollection("panelEnter", {
@@ -254,7 +270,8 @@ watch(
       previous: prev ?? null,
       next,
     });
-    if (!prev || next.firstId !== prev.firstId) {
+    if (!prev) return;
+    if (next.firstId !== prev.firstId) {
       expanded.value = false;
     }
   },

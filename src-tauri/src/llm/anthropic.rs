@@ -935,6 +935,7 @@ where
                 id: tc.id,
                 name,
                 arguments,
+                order: None,
                 server_tool,
                 server_tool_output: tc.server_tool_output,
                 outcome: None,
@@ -1815,6 +1816,8 @@ mod tests {
             prompt_prefix: None,
             prompt_suffix: None,
             response_id: None,
+            content_order: None,
+            thinking_order: None,
             tool_calls: None,
             tool_call_id: None,
             images: None,
@@ -1822,6 +1825,7 @@ mod tests {
             thinking_duration: None,
             thinking_signature: None,
             knowledge_proposal: None,
+            render_parts: None,
         }];
 
         let mut messages = build_anthropic_messages(&history);
@@ -1915,6 +1919,8 @@ mod tests {
                 prompt_prefix: None,
                 prompt_suffix: None,
                 response_id: None,
+                content_order: None,
+                thinking_order: None,
                 tool_calls: None,
                 tool_call_id: None,
                 images: None,
@@ -1922,6 +1928,7 @@ mod tests {
                 thinking_duration: None,
                 thinking_signature: None,
                 knowledge_proposal: None,
+                render_parts: None,
             },
             ChatMessage {
                 id: "m2".to_string(),
@@ -1931,6 +1938,8 @@ mod tests {
                 prompt_prefix: None,
                 prompt_suffix: None,
                 response_id: None,
+                content_order: None,
+                thinking_order: None,
                 tool_calls: None,
                 tool_call_id: None,
                 images: None,
@@ -1938,6 +1947,7 @@ mod tests {
                 thinking_duration: None,
                 thinking_signature: None,
                 knowledge_proposal: None,
+                render_parts: None,
             },
             ChatMessage {
                 id: "m3".to_string(),
@@ -1947,6 +1957,8 @@ mod tests {
                 prompt_prefix: None,
                 prompt_suffix: None,
                 response_id: None,
+                content_order: None,
+                thinking_order: None,
                 tool_calls: None,
                 tool_call_id: None,
                 images: None,
@@ -1954,6 +1966,7 @@ mod tests {
                 thinking_duration: None,
                 thinking_signature: None,
                 knowledge_proposal: None,
+                render_parts: None,
             },
         ];
 
@@ -1992,10 +2005,13 @@ mod tests {
             prompt_prefix: None,
             prompt_suffix: None,
             response_id: None,
+            content_order: None,
+            thinking_order: None,
             tool_calls: Some(vec![ToolCallInfo {
                 id: "call_1".to_string(),
                 name: "read".to_string(),
                 arguments: r#"{"filePath":"Assets/Test.txt","limit":10}"#.to_string(),
+                order: None,
                 server_tool: None,
                 server_tool_output: None,
                 outcome: None,
@@ -2008,6 +2024,7 @@ mod tests {
             thinking_duration: None,
             thinking_signature: None,
             knowledge_proposal: None,
+            render_parts: None,
         }];
 
         let mut messages = build_anthropic_messages(&history);
@@ -2052,11 +2069,14 @@ mod tests {
                 prompt_prefix: None,
                 prompt_suffix: None,
                 response_id: None,
+                content_order: None,
+                thinking_order: None,
                 tool_calls: Some(vec![
                     ToolCallInfo {
                         id: "call_1".to_string(),
                         name: "read".to_string(),
                         arguments: r#"{"filePath":"Assets/Test.txt"}"#.to_string(),
+                        order: None,
                         server_tool: None,
                         server_tool_output: None,
                         outcome: None,
@@ -2067,6 +2087,7 @@ mod tests {
                         id: "call_2".to_string(),
                         name: "grep".to_string(),
                         arguments: r#"{"pattern":"Test","path":"Assets"}"#.to_string(),
+                        order: None,
                         server_tool: None,
                         server_tool_output: None,
                         outcome: None,
@@ -2080,6 +2101,7 @@ mod tests {
                 thinking_duration: None,
                 thinking_signature: None,
                 knowledge_proposal: None,
+                render_parts: None,
             },
             ChatMessage {
                 id: "user-1".to_string(),
@@ -2089,6 +2111,8 @@ mod tests {
                 prompt_prefix: None,
                 prompt_suffix: None,
                 response_id: None,
+                content_order: None,
+                thinking_order: None,
                 tool_calls: None,
                 tool_call_id: None,
                 images: None,
@@ -2096,6 +2120,7 @@ mod tests {
                 thinking_duration: None,
                 thinking_signature: None,
                 knowledge_proposal: None,
+                render_parts: None,
             },
         ];
 

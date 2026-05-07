@@ -1,5 +1,6 @@
 import { hydrateChatMessageIntent } from "./chatInputIntents";
-import type { StreamEvent, ChatMessage, TokenUsage, TodoItem, ToolCallDisplay, ToolCallInfo, PendingQuestion, PendingToolConfirm, ImageAttachment, ToolCallProgress } from "../types";
+import { sortedAssistantRenderParts } from "./assistantRenderParts";
+import type { StreamEvent, ChatMessage, TokenUsage, TodoItem, ToolCallDisplay, ToolCallInfo, PendingQuestion, PendingToolConfirm, ImageAttachment, ToolCallProgress, AssistantRenderPart } from "../types";
 
 export interface StreamState {
   messages: ChatMessage[];
@@ -9,7 +10,9 @@ export interface StreamState {
   streamSequence: number;
   streamingTextOrder: number;
   thinkingOrder: number;
+  liveRenderParts: AssistantRenderPart[];
   isStreaming: boolean;
+  isCompacting: boolean;
   isThinking: boolean;
   thinkingStartTime: number;
   thinkingDuration: number;
@@ -28,6 +31,11 @@ export type StreamMutation =
   | { type: "setStreamSequence"; value: number }
   | { type: "setStreamingTextOrder"; order: number }
   | { type: "setThinkingOrder"; order: number }
+  | { type: "upsertLiveRenderPart"; part: AssistantRenderPart }
+  | { type: "appendLiveRenderPartContent"; partId: string; text: string }
+  | { type: "deactivateLiveThinkingParts"; duration?: number }
+  | { type: "updateLiveToolPart"; toolCallId: string; updates: Partial<ToolCallInfo> }
+  | { type: "clearLiveRenderParts" }
   | { type: "setThinking"; value: boolean; startTime?: number }
   | { type: "updateThinkingDuration"; duration: number }
   | { type: "addToolCall"; toolCall: ToolCallDisplay }
@@ -51,6 +59,7 @@ export type StreamMutation =
   | { type: "addUndoable"; messageId: string }
   | { type: "setTodos"; runId: string; todos: TodoItem[] }
   | { type: "setStreaming"; value: boolean }
+  | { type: "setCompacting"; value: boolean }
   | { type: "canvasAutoOpen"; toolCallId: string; spec: unknown };
 
 export function buildToolResultMessages(
@@ -117,41 +126,238 @@ export function mergeUserMessage(messages: ChatMessage[], incoming: ChatMessage)
   return [...messages, message];
 }
 
+function cloneToolCallInfo(toolCall: ToolCallInfo): ToolCallInfo {
+  return {
+    ...toolCall,
+    nestedToolCalls: toolCall.nestedToolCalls?.map(cloneToolCallInfo),
+  };
+}
+
+function liveOrderFromEvent(
+  event: { runId: string; order?: number; renderSeq?: number; partId?: string },
+  fallbackSeq: number,
+  fallbackPartId: string,
+) {
+  const seq =
+    typeof event.renderSeq === "number" && event.renderSeq > 0
+      ? event.renderSeq
+      : fallbackSeq;
+
+  if (import.meta.env.DEV && (typeof event.renderSeq !== "number" || event.renderSeq <= 0)) {
+    console.error("[render-parts] stream event missing renderSeq", event);
+  }
+
+  return {
+    id: event.partId?.trim() || fallbackPartId,
+    order: { runId: event.runId, seq },
+  };
+}
+
+function existingLivePart<T extends AssistantRenderPart["kind"]>(
+  state: StreamState,
+  kind: T,
+  id: string,
+): Extract<AssistantRenderPart, { kind: T }> | undefined {
+  return state.liveRenderParts.find(
+    (part): part is Extract<AssistantRenderPart, { kind: T }> =>
+      part.kind === kind && part.id === id,
+  );
+}
+
+function currentThinkingDuration(state: StreamState) {
+  return state.isThinking && state.thinkingStartTime > 0
+    ? Math.round((Date.now() - state.thinkingStartTime) / 1000)
+    : undefined;
+}
+
+function finalizeLiveRenderParts(
+  state: StreamState,
+  options: {
+    runId: string;
+    messageId: string;
+    fullText: string;
+    toolCalls?: ToolCallInfo[];
+    renderParts?: AssistantRenderPart[] | null;
+    contentOrder?: number;
+    thinkingOrder?: number;
+    thinkingContent?: string | null;
+    thinkingDuration?: number | null;
+  },
+): AssistantRenderPart[] {
+  if (options.renderParts?.length) {
+    return sortedAssistantRenderParts(options.renderParts);
+  }
+
+  const toolCallsById = new Map((options.toolCalls ?? []).map((toolCall) => [toolCall.id, toolCall]));
+  const parts = state.liveRenderParts.map((part): AssistantRenderPart => {
+    if (part.kind === "thinking") {
+      return {
+        ...part,
+        active: false,
+        content: options.thinkingContent ?? part.content,
+        duration: options.thinkingDuration ?? state.thinkingDuration,
+      };
+    }
+    if (part.kind === "text") {
+      return { ...part, content: options.fullText || part.content };
+    }
+    if (part.kind === "toolCall") {
+      return {
+        ...part,
+        toolCall: cloneToolCallInfo(toolCallsById.get(part.id) ?? part.toolCall),
+      };
+    }
+    return part;
+  });
+
+  const hasTextPart = parts.some((part) => part.kind === "text");
+  if (options.fullText && !hasTextPart) {
+    const seq = options.contentOrder && options.contentOrder > 0 ? options.contentOrder : state.streamSequence + 1;
+    parts.push({
+      kind: "text",
+      id: `${options.messageId}:text`,
+      order: { runId: options.runId, seq },
+      content: options.fullText,
+    });
+  }
+
+  const thinkingContent = options.thinkingContent ?? state.streamingThinking;
+  const hasThinkingPart = parts.some((part) => part.kind === "thinking");
+  if (thinkingContent && !hasThinkingPart) {
+    const seq = options.thinkingOrder && options.thinkingOrder > 0 ? options.thinkingOrder : state.streamSequence + 1;
+    parts.push({
+      kind: "thinking",
+      id: `${options.messageId}:thinking`,
+      order: { runId: options.runId, seq },
+      content: thinkingContent,
+      active: false,
+      duration: options.thinkingDuration ?? state.thinkingDuration,
+    });
+  }
+
+  const existingToolPartIds = new Set(
+    parts.filter((part) => part.kind === "toolCall").map((part) => part.id),
+  );
+  for (const toolCall of options.toolCalls ?? []) {
+    if (existingToolPartIds.has(toolCall.id)) continue;
+    const seq = toolCall.order && toolCall.order > 0 ? toolCall.order : state.streamSequence + 1;
+    parts.push({
+      kind: "toolCall",
+      id: toolCall.id,
+      order: { runId: options.runId, seq },
+      toolCall: cloneToolCallInfo(toolCall),
+    });
+  }
+
+  return sortedAssistantRenderParts(parts);
+}
+
 export function reduceStreamEvent(state: StreamState, event: StreamEvent): StreamMutation[] {
   const mutations: StreamMutation[] = [];
 
-  const nextStreamOrder = () => state.streamSequence + 1;
+  let streamSequenceCursor = state.streamSequence;
+
+  const nextStreamOrder = () => streamSequenceCursor + 1;
 
   const markStreamSequence = (order: number) => {
-    if (order > state.streamSequence) {
+    if (order > streamSequenceCursor) {
+      streamSequenceCursor = order;
       mutations.push({ type: "setStreamSequence", value: order });
     }
   };
 
-  const markTextOrder = () => {
+  const resolveOrder = (explicitOrder?: number) => (
+    typeof explicitOrder === "number" && explicitOrder > streamSequenceCursor
+      ? explicitOrder
+      : nextStreamOrder()
+  );
+
+  const resolveMessageRenderOrders = (options: {
+    hasContent: boolean;
+    contentCurrentOrder?: number;
+    contentExplicitOrder?: number;
+    hasThinking: boolean;
+    thinkingCurrentOrder?: number;
+    thinkingExplicitOrder?: number;
+  }) => {
+    let contentOrder = options.hasContent && options.contentCurrentOrder && options.contentCurrentOrder > 0
+      ? options.contentCurrentOrder
+      : undefined;
+    let thinkingOrder = options.hasThinking && options.thinkingCurrentOrder && options.thinkingCurrentOrder > 0
+      ? options.thinkingCurrentOrder
+      : undefined;
+    const pendingOrders: Array<{
+      target: "thinking" | "content";
+      explicitOrder?: number;
+      fallbackRank: number;
+    }> = [];
+
+    if (options.hasThinking && !thinkingOrder) {
+      pendingOrders.push({
+        target: "thinking",
+        explicitOrder: options.thinkingExplicitOrder,
+        fallbackRank: 0,
+      });
+    }
+    if (options.hasContent && !contentOrder) {
+      pendingOrders.push({
+        target: "content",
+        explicitOrder: options.contentExplicitOrder,
+        fallbackRank: 1,
+      });
+    }
+
+    pendingOrders.sort((left, right) => {
+      const leftOrder = typeof left.explicitOrder === "number" && left.explicitOrder > 0
+        ? left.explicitOrder
+        : Number.POSITIVE_INFINITY;
+      const rightOrder = typeof right.explicitOrder === "number" && right.explicitOrder > 0
+        ? right.explicitOrder
+        : Number.POSITIVE_INFINITY;
+      return leftOrder - rightOrder || left.fallbackRank - right.fallbackRank;
+    });
+
+    for (const pending of pendingOrders) {
+      const order = resolveOrder(pending.explicitOrder);
+      markStreamSequence(order);
+      if (pending.target === "thinking") {
+        thinkingOrder = order;
+      } else {
+        contentOrder = order;
+      }
+    }
+
+    return { contentOrder, thinkingOrder };
+  };
+
+  const markTextOrder = (explicitOrder?: number) => {
     if (state.streamingTextOrder > 0 || state.rawStreamText.length > 0) return;
-    const order = nextStreamOrder();
+    const order = resolveOrder(explicitOrder);
     mutations.push({ type: "setStreamingTextOrder", order });
     markStreamSequence(order);
   };
 
-  const markThinkingOrder = () => {
+  const markThinkingOrder = (explicitOrder?: number) => {
     if (state.thinkingOrder > 0 || state.streamingThinking.length > 0) return;
-    const order = nextStreamOrder();
+    const order = resolveOrder(explicitOrder);
     mutations.push({ type: "setThinkingOrder", order });
     markStreamSequence(order);
   };
 
-  const markToolOrder = (existing?: ToolCallDisplay) => {
+  const markToolOrder = (existing?: ToolCallDisplay, explicitOrder?: number) => {
     if (existing?.order && existing.order > 0) return existing.order;
-    const order = nextStreamOrder();
+    const order = resolveOrder(explicitOrder);
     markStreamSequence(order);
     return order;
   };
 
   const finishThinkingBeforeTools = () => {
-    if (state.isThinking && state.thinkingStartTime > 0) {
-      mutations.push({ type: "updateThinkingDuration", duration: Math.round((Date.now() - state.thinkingStartTime) / 1000) });
+    const duration = currentThinkingDuration(state);
+    if (duration !== undefined) {
+      mutations.push({ type: "updateThinkingDuration", duration });
+      mutations.push({ type: "deactivateLiveThinkingParts", duration });
+    } else {
+      mutations.push({ type: "deactivateLiveThinkingParts" });
     }
     if (state.isThinking) {
       mutations.push({ type: "setThinking", value: false });
@@ -168,7 +374,25 @@ export function reduceStreamEvent(state: StreamState, event: StreamEvent): Strea
       break;
 
     case "textDelta":
-      markTextOrder();
+      markTextOrder(event.order);
+      {
+        const order = liveOrderFromEvent(
+          event,
+          state.streamingTextOrder || nextStreamOrder(),
+          `${event.runId}:text`,
+        );
+        mutations.push({ type: "deactivateLiveThinkingParts", duration: currentThinkingDuration(state) });
+        mutations.push({
+          type: "upsertLiveRenderPart",
+          part: {
+            kind: "text",
+            id: order.id,
+            order: order.order,
+            content: existingLivePart(state, "text", order.id)?.content ?? "",
+          },
+        });
+        mutations.push({ type: "appendLiveRenderPartContent", partId: order.id, text: event.text });
+      }
       mutations.push({ type: "appendRawText", text: event.text });
       if (state.isThinking && state.thinkingStartTime > 0) {
         mutations.push({ type: "updateThinkingDuration", duration: Math.round((Date.now() - state.thinkingStartTime) / 1000) });
@@ -177,7 +401,26 @@ export function reduceStreamEvent(state: StreamState, event: StreamEvent): Strea
       break;
 
     case "thinkingDelta":
-      markThinkingOrder();
+      markThinkingOrder(event.order);
+      {
+        const order = liveOrderFromEvent(
+          event,
+          state.thinkingOrder || nextStreamOrder(),
+          `${event.runId}:thinking`,
+        );
+        mutations.push({
+          type: "upsertLiveRenderPart",
+          part: {
+            kind: "thinking",
+            id: order.id,
+            order: order.order,
+            content: existingLivePart(state, "thinking", order.id)?.content ?? "",
+            active: true,
+            duration: state.thinkingDuration > 0 ? state.thinkingDuration : undefined,
+          },
+        });
+        mutations.push({ type: "appendLiveRenderPartContent", partId: order.id, text: event.text });
+      }
       mutations.push({ type: "appendThinking", text: event.text });
       if (!state.isThinking) {
         mutations.push({ type: "setThinking", value: true, startTime: Date.now() });
@@ -187,28 +430,54 @@ export function reduceStreamEvent(state: StreamState, event: StreamEvent): Strea
     case "toolCallStart": {
       finishThinkingBeforeTools();
       const existing = state.activeToolCalls.find((t) => t.id === event.toolCallId);
+      const legacyOrder = markToolOrder(existing, event.order);
+      const liveOrder = liveOrderFromEvent(event, legacyOrder, event.toolCallId);
+      const currentPart = existingLivePart(state, "toolCall", liveOrder.id);
+      mutations.push({
+        type: "upsertLiveRenderPart",
+        part: {
+          kind: "toolCall",
+          id: liveOrder.id,
+          order: liveOrder.order,
+          toolCall: {
+            ...(currentPart?.toolCall ?? {
+              id: event.toolCallId,
+              name: event.toolName,
+              arguments: "",
+            }),
+            id: event.toolCallId,
+            name: event.toolName,
+            arguments: event.arguments || currentPart?.toolCall.arguments || "",
+            order: liveOrder.order.seq,
+          },
+        },
+      });
       if (existing) {
         const updates: Partial<ToolCallDisplay> = {};
         if (event.arguments) {
           updates.arguments = event.arguments;
         }
-        if (!existing.order || existing.order <= 0) {
-          updates.order = markToolOrder(existing);
+        if (!existing.order || existing.order <= 0 || existing.order !== liveOrder.order.seq) {
+          updates.order = liveOrder.order.seq;
         }
         if (Object.keys(updates).length > 0) {
           mutations.push({ type: "updateToolCall", id: event.toolCallId, updates });
         }
       } else {
-        const order = markToolOrder();
         mutations.push({
           type: "addToolCall",
-          toolCall: { id: event.toolCallId, name: event.toolName, arguments: event.arguments, status: "running", order },
+          toolCall: { id: event.toolCallId, name: event.toolName, arguments: event.arguments, status: "running", order: liveOrder.order.seq },
         });
       }
       break;
     }
 
     case "toolCallDone": {
+      mutations.push({
+        type: "updateLiveToolPart",
+        toolCallId: event.toolCallId,
+        updates: { outcome: event.outcome, recordedOutput: event.output },
+      });
       mutations.push({
         type: "updateToolCall",
         id: event.toolCallId,
@@ -257,6 +526,7 @@ export function reduceStreamEvent(state: StreamState, event: StreamEvent): Strea
       break;
 
     case "subagentToolCallStart": {
+      finishThinkingBeforeTools();
       const parentTc = state.activeToolCalls.find((t) => t.id === event.parentToolCallId);
       if (parentTc) {
         const existingNested = parentTc.nestedToolCalls?.find((t) => t.id === event.toolCallId);
@@ -265,10 +535,11 @@ export function reduceStreamEvent(state: StreamState, event: StreamEvent): Strea
             mutations.push({ type: "updateNestedToolCall", parentId: event.parentToolCallId, childId: event.toolCallId, updates: { arguments: event.arguments } });
           }
         } else {
+          const order = markToolOrder(undefined, event.order);
           mutations.push({
             type: "addNestedToolCall",
             parentId: event.parentToolCallId,
-            toolCall: { id: event.toolCallId, name: event.toolName, arguments: event.arguments, status: "running" },
+            toolCall: { id: event.toolCallId, name: event.toolName, arguments: event.arguments, status: "running", order },
           });
         }
       }
@@ -289,6 +560,23 @@ export function reduceStreamEvent(state: StreamState, event: StreamEvent): Strea
       if (state.isThinking && state.thinkingStartTime > 0) {
         mutations.push({ type: "updateThinkingDuration", duration: Math.round((Date.now() - state.thinkingStartTime) / 1000) });
       }
+      const messageOrders = resolveMessageRenderOrders({
+        hasContent: !!event.fullText,
+        contentCurrentOrder: state.streamingTextOrder,
+        contentExplicitOrder: event.contentOrder,
+        hasThinking: !!state.streamingThinking,
+        thinkingCurrentOrder: state.thinkingOrder,
+        thinkingExplicitOrder: event.thinkingOrder,
+      });
+      const renderParts = finalizeLiveRenderParts(state, {
+        runId: event.runId,
+        messageId: event.messageId,
+        fullText: event.fullText,
+        toolCalls: event.toolCalls,
+        renderParts: event.renderParts,
+        contentOrder: messageOrders.contentOrder,
+        thinkingOrder: messageOrders.thinkingOrder,
+      });
       mutations.push({
         type: "pushMessage",
         message: {
@@ -299,10 +587,14 @@ export function reduceStreamEvent(state: StreamState, event: StreamEvent): Strea
           toolCalls: event.toolCalls.length > 0 ? event.toolCalls : undefined,
           thinkingContent: state.streamingThinking || undefined,
           thinkingDuration: state.thinkingDuration > 0 ? state.thinkingDuration : undefined,
+          contentOrder: messageOrders.contentOrder,
+          thinkingOrder: messageOrders.thinkingOrder,
+          renderParts,
         },
       });
       mutations.push({ type: "pushToolResults", toolCallIds: collectToolCallInfoIds(event.toolCalls) });
-      mutations.push({ type: "resetRoundKeepToolCalls" });
+      mutations.push({ type: "clearLiveRenderParts" });
+      mutations.push({ type: "resetRound" });
       break;
     }
 
@@ -326,6 +618,18 @@ export function reduceStreamEvent(state: StreamState, event: StreamEvent): Strea
       });
       break;
 
+    case "compactStart":
+      mutations.push({ type: "setCompacting", value: true });
+      mutations.push({
+        type: "updateUsage",
+        usage: {
+          ...state.tokenUsage,
+          contextTokens: event.contextTokens > 0 ? event.contextTokens : state.tokenUsage.contextTokens,
+          contextLimit: event.contextLimit > 0 ? event.contextLimit : state.tokenUsage.contextLimit,
+        },
+      });
+      break;
+
     case "compactDone":
       mutations.push({ type: "replaceMessages", messages: event.messages });
       if (state.tokenUsage.contextTokens > 0) {
@@ -337,6 +641,7 @@ export function reduceStreamEvent(state: StreamState, event: StreamEvent): Strea
           },
         });
       }
+      mutations.push({ type: "setCompacting", value: false });
       break;
 
     case "askUser":
@@ -374,8 +679,27 @@ export function reduceStreamEvent(state: StreamState, event: StreamEvent): Strea
       if (state.isThinking && state.thinkingStartTime > 0) {
         mutations.push({ type: "updateThinkingDuration", duration: Math.round((Date.now() - state.thinkingStartTime) / 1000) });
       }
-      if (event.fullText) {
+      if (event.fullText || event.renderParts?.length) {
         const existingMessage = state.messages.find((message) => message.id === event.messageId);
+        const messageOrders = resolveMessageRenderOrders({
+          hasContent: !!event.fullText,
+          contentCurrentOrder: existingMessage?.contentOrder ?? state.streamingTextOrder,
+          contentExplicitOrder: event.contentOrder,
+          hasThinking: !!(existingMessage?.thinkingContent ?? state.streamingThinking),
+          thinkingCurrentOrder: existingMessage?.thinkingOrder ?? state.thinkingOrder,
+          thinkingExplicitOrder: event.thinkingOrder,
+        });
+        const renderParts = finalizeLiveRenderParts(state, {
+          runId: event.runId,
+          messageId: event.messageId,
+          fullText: event.fullText,
+          toolCalls: existingMessage?.toolCalls,
+          renderParts: event.renderParts ?? existingMessage?.renderParts,
+          contentOrder: messageOrders.contentOrder,
+          thinkingOrder: messageOrders.thinkingOrder,
+          thinkingContent: existingMessage?.thinkingContent ?? state.streamingThinking,
+          thinkingDuration: existingMessage?.thinkingDuration ?? state.thinkingDuration,
+        });
         mutations.push({
           type: "upsertMessage",
           message: {
@@ -386,12 +710,17 @@ export function reduceStreamEvent(state: StreamState, event: StreamEvent): Strea
             createdAt: existingMessage?.createdAt ?? Date.now() / 1000,
             thinkingContent: (existingMessage?.thinkingContent ?? state.streamingThinking) || undefined,
             thinkingDuration: existingMessage?.thinkingDuration ?? (state.thinkingDuration > 0 ? state.thinkingDuration : undefined),
+            contentOrder: messageOrders.contentOrder,
+            thinkingOrder: messageOrders.thinkingOrder,
+            renderParts,
           },
         });
       }
+      mutations.push({ type: "clearLiveRenderParts" });
       mutations.push({ type: "resetRound" });
       mutations.push({ type: "clearPendingInputs" });
       mutations.push({ type: "setStreaming", value: false });
+      mutations.push({ type: "setCompacting", value: false });
       break;
     }
 
@@ -410,6 +739,23 @@ export function reduceStreamEvent(state: StreamState, event: StreamEvent): Strea
         const thinkingContent = (event.thinkingContent ?? state.streamingThinking) || undefined;
         const thinkingDuration =
           event.thinkingDuration ?? (state.thinkingDuration > 0 ? state.thinkingDuration : undefined);
+        const messageOrders = resolveMessageRenderOrders({
+          hasContent: !!content,
+          contentCurrentOrder: existingMessage?.contentOrder ?? state.streamingTextOrder,
+          hasThinking: !!thinkingContent,
+          thinkingCurrentOrder: existingMessage?.thinkingOrder ?? state.thinkingOrder,
+        });
+        const renderParts = finalizeLiveRenderParts(state, {
+          runId: event.runId,
+          messageId: event.messageId!,
+          fullText: content,
+          toolCalls: existingMessage?.toolCalls,
+          renderParts: event.renderParts ?? existingMessage?.renderParts,
+          contentOrder: messageOrders.contentOrder,
+          thinkingOrder: messageOrders.thinkingOrder,
+          thinkingContent,
+          thinkingDuration,
+        });
         mutations.push({
           type: "upsertMessage",
           message: {
@@ -420,19 +766,26 @@ export function reduceStreamEvent(state: StreamState, event: StreamEvent): Strea
             createdAt: existingMessage?.createdAt ?? Date.now() / 1000,
             thinkingContent,
             thinkingDuration,
+            contentOrder: messageOrders.contentOrder,
+            thinkingOrder: messageOrders.thinkingOrder,
+            renderParts,
           },
         });
       }
+      mutations.push({ type: "clearLiveRenderParts" });
       mutations.push({ type: "resetRound" });
       mutations.push({ type: "clearPendingInputs" });
       mutations.push({ type: "setStreaming", value: false });
+      mutations.push({ type: "setCompacting", value: false });
       break;
     }
 
     case "error":
+      mutations.push({ type: "clearLiveRenderParts" });
       mutations.push({ type: "resetRound" });
       mutations.push({ type: "clearPendingInputs" });
       mutations.push({ type: "setStreaming", value: false });
+      mutations.push({ type: "setCompacting", value: false });
       break;
   }
 

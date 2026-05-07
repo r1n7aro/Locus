@@ -4989,6 +4989,8 @@ pub async fn git_generate_commit_message(
         prompt_prefix: None,
         prompt_suffix: None,
         response_id: None,
+        content_order: None,
+        thinking_order: None,
         tool_calls: None,
         tool_call_id: None,
         images: None,
@@ -4996,6 +4998,7 @@ pub async fn git_generate_commit_message(
         thinking_duration: None,
         thinking_signature: None,
         knowledge_proposal: None,
+        render_parts: None,
     };
 
     let history = vec![user_msg];

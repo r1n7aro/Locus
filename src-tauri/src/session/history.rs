@@ -221,6 +221,8 @@ fn build_interrupted_tool_result_message(
         prompt_prefix: None,
         prompt_suffix: None,
         response_id: None,
+        content_order: None,
+        thinking_order: None,
         tool_calls: None,
         tool_call_id: Some(tool_call_id.to_string()),
         images: None,
@@ -228,6 +230,7 @@ fn build_interrupted_tool_result_message(
         thinking_duration: None,
         thinking_signature: None,
         knowledge_proposal: None,
+        render_parts: None,
     }
 }
 
@@ -255,6 +258,8 @@ mod tests {
             prompt_prefix: None,
             prompt_suffix: None,
             response_id: None,
+            content_order: None,
+            thinking_order: None,
             tool_calls: Some(tool_calls),
             tool_call_id: None,
             images: None,
@@ -262,6 +267,7 @@ mod tests {
             thinking_duration: None,
             thinking_signature: None,
             knowledge_proposal: None,
+            render_parts: None,
         }
     }
 
@@ -274,6 +280,8 @@ mod tests {
             prompt_prefix: None,
             prompt_suffix: None,
             response_id: None,
+            content_order: None,
+            thinking_order: None,
             tool_calls: None,
             tool_call_id: None,
             images: None,
@@ -281,6 +289,7 @@ mod tests {
             thinking_duration: None,
             thinking_signature: None,
             knowledge_proposal: None,
+            render_parts: None,
         }
     }
 
@@ -293,6 +302,8 @@ mod tests {
             prompt_prefix: None,
             prompt_suffix: None,
             response_id: None,
+            content_order: None,
+            thinking_order: None,
             tool_calls: None,
             tool_call_id: Some(tool_call_id.to_string()),
             images: None,
@@ -300,6 +311,7 @@ mod tests {
             thinking_duration: None,
             thinking_signature: None,
             knowledge_proposal: None,
+            render_parts: None,
         }
     }
 
@@ -313,6 +325,7 @@ mod tests {
                         id: "tc-1".to_string(),
                         name: "read".to_string(),
                         arguments: "{}".to_string(),
+                        order: None,
                         server_tool: None,
                         server_tool_output: None,
                         outcome: None,
@@ -323,6 +336,7 @@ mod tests {
                         id: "tc-2".to_string(),
                         name: "grep".to_string(),
                         arguments: "{}".to_string(),
+                        order: None,
                         server_tool: None,
                         server_tool_output: None,
                         outcome: None,
@@ -354,6 +368,7 @@ mod tests {
                         id: "tc-1".to_string(),
                         name: "read".to_string(),
                         arguments: "{}".to_string(),
+                        order: None,
                         server_tool: None,
                         server_tool_output: None,
                         outcome: None,
@@ -364,6 +379,7 @@ mod tests {
                         id: "tc-2".to_string(),
                         name: "grep".to_string(),
                         arguments: "{}".to_string(),
+                        order: None,
                         server_tool: None,
                         server_tool_output: None,
                         outcome: None,
@@ -393,6 +409,7 @@ mod tests {
                         id: "tc-server".to_string(),
                         name: "web_search".to_string(),
                         arguments: "{}".to_string(),
+                        order: None,
                         server_tool: Some(crate::session::models::ServerToolKind::WebSearch),
                         server_tool_output: Some("cached".to_string()),
                         outcome: None,
@@ -403,6 +420,7 @@ mod tests {
                         id: "tc-local".to_string(),
                         name: "read".to_string(),
                         arguments: "{}".to_string(),
+                        order: None,
                         server_tool: None,
                         server_tool_output: None,
                         outcome: None,
@@ -427,6 +445,7 @@ mod tests {
                 id: "tc-1".to_string(),
                 name: "task".to_string(),
                 arguments: "{}".to_string(),
+                order: None,
                 server_tool: None,
                 server_tool_output: None,
                 outcome: None,
@@ -450,6 +469,7 @@ mod tests {
                         id: "tc-done".to_string(),
                         name: "read".to_string(),
                         arguments: "{}".to_string(),
+                        order: None,
                         server_tool: None,
                         server_tool_output: None,
                         outcome: None,
@@ -460,6 +480,7 @@ mod tests {
                         id: "tc-missing".to_string(),
                         name: "grep".to_string(),
                         arguments: "{}".to_string(),
+                        order: None,
                         server_tool: None,
                         server_tool_output: None,
                         outcome: None,
@@ -494,6 +515,7 @@ mod tests {
                     id: "tc-1".to_string(),
                     name: "read".to_string(),
                     arguments: "{}".to_string(),
+                    order: None,
                     server_tool: None,
                     server_tool_output: None,
                     outcome: None,
@@ -508,6 +530,7 @@ mod tests {
                     id: "tc-2".to_string(),
                     name: "grep".to_string(),
                     arguments: "{}".to_string(),
+                    order: None,
                     server_tool: None,
                     server_tool_output: None,
                     outcome: None,

@@ -846,6 +846,7 @@ fn collect_tool_calls(
             id: tc.id.clone(),
             name: tc.name.clone(),
             arguments: tc.arguments.clone(),
+            order: None,
             server_tool: None,
             server_tool_output: None,
             outcome: None,
@@ -964,6 +965,8 @@ mod tests {
             prompt_prefix: None,
             prompt_suffix: None,
             response_id: None,
+            content_order: None,
+            thinking_order: None,
             tool_calls: None,
             tool_call_id: None,
             images,
@@ -971,6 +974,7 @@ mod tests {
             thinking_duration: None,
             thinking_signature: None,
             knowledge_proposal: None,
+            render_parts: None,
         }
     }
 
@@ -983,10 +987,13 @@ mod tests {
             prompt_prefix: None,
             prompt_suffix: None,
             response_id: None,
+            content_order: None,
+            thinking_order: None,
             tool_calls: Some(vec![ToolCallInfo {
                 id: "call_1".to_string(),
                 name: "read_file".to_string(),
                 arguments: r#"{"path":"a.txt"}"#.to_string(),
+                order: None,
                 server_tool: None,
                 server_tool_output: None,
                 outcome: None,
@@ -999,6 +1006,7 @@ mod tests {
             thinking_duration: Some(1),
             thinking_signature: None,
             knowledge_proposal: None,
+            render_parts: None,
         }
     }
 
@@ -1011,6 +1019,8 @@ mod tests {
             prompt_prefix: None,
             prompt_suffix: None,
             response_id: None,
+            content_order: None,
+            thinking_order: None,
             tool_calls: None,
             tool_call_id: Some(tool_call_id.to_string()),
             images: None,
@@ -1018,6 +1028,7 @@ mod tests {
             thinking_duration: None,
             thinking_signature: None,
             knowledge_proposal: None,
+            render_parts: None,
         }
     }
 

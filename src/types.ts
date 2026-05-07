@@ -22,6 +22,7 @@ export interface ToolCallInfo {
   id: string;
   name: string;
   arguments: string;
+  order?: number;
   serverTool?: ServerToolKind;
   serverToolOutput?: string;
   outcome?: ToolCallOutcome;
@@ -30,6 +31,40 @@ export interface ToolCallInfo {
 }
 
 export type ToolCallOutcome = "done" | "error" | "interrupted";
+
+export interface RenderOrderKey {
+  runId: string;
+  seq: number;
+}
+
+export type AssistantRenderPart =
+  | {
+      kind: "thinking";
+      id: string;
+      order: RenderOrderKey;
+      content: string;
+      active?: boolean;
+      duration?: number;
+      signature?: string;
+    }
+  | {
+      kind: "text";
+      id: string;
+      order: RenderOrderKey;
+      content: string;
+    }
+  | {
+      kind: "toolCall";
+      id: string;
+      order: RenderOrderKey;
+      toolCall: ToolCallInfo;
+    }
+  | {
+      kind: "knowledgeProposal";
+      id: string;
+      order: RenderOrderKey;
+      message: ChatMessage;
+    };
 
 export interface ImageAttachment {
   data: string;
@@ -95,6 +130,8 @@ export interface ChatMessage {
   promptPrefix?: string;
   promptSuffix?: string;
   responseId?: string;
+  contentOrder?: number;
+  thinkingOrder?: number;
   toolCalls?: ToolCallInfo[];
   toolCallId?: string;
   images?: ImageAttachment[];
@@ -103,6 +140,7 @@ export interface ChatMessage {
   thinkingSignature?: string;
   intentMeta?: UserIntentMeta;
   knowledgeProposal?: KnowledgeProposal;
+  renderParts?: AssistantRenderPart[];
 }
 
 export interface SessionDetail {
@@ -408,14 +446,17 @@ export interface KnowledgeChangedEvent {
 export type StreamEvent = { runId: string } & (
   | { type: "runStart"; sessionId: string }
   | { type: "userMessage"; sessionId: string; message: ChatMessage }
-  | { type: "textDelta"; sessionId: string; text: string }
-  | { type: "thinkingDelta"; sessionId: string; text: string }
+  | { type: "textDelta"; sessionId: string; text: string; order?: number; partId?: string; renderSeq?: number }
+  | { type: "thinkingDelta"; sessionId: string; text: string; order?: number; partId?: string; renderSeq?: number }
   | {
       type: "toolCallStart";
       sessionId: string;
       toolCallId: string;
       toolName: string;
       arguments: string;
+      order?: number;
+      partId?: string;
+      renderSeq?: number;
     }
   | {
       type: "toolCallDone";
@@ -447,6 +488,9 @@ export type StreamEvent = { runId: string } & (
       toolCallId: string;
       toolName: string;
       arguments: string;
+      order?: number;
+      partId?: string;
+      renderSeq?: number;
     }
   | {
       type: "subagentToolCallDone";
@@ -463,6 +507,9 @@ export type StreamEvent = { runId: string } & (
       messageId: string;
       fullText: string;
       toolCalls: ToolCallInfo[];
+      contentOrder?: number;
+      thinkingOrder?: number;
+      renderParts?: AssistantRenderPart[];
     }
   | { type: "knowledgeProposal"; sessionId: string; message: ChatMessage }
   | {
@@ -518,8 +565,17 @@ export type StreamEvent = { runId: string } & (
       fullText?: string | null;
       thinkingContent?: string | null;
       thinkingDuration?: number | null;
+      renderParts?: AssistantRenderPart[] | null;
     }
-  | { type: "done"; sessionId: string; messageId: string; fullText: string }
+  | {
+      type: "done";
+      sessionId: string;
+      messageId: string;
+      fullText: string;
+      contentOrder?: number;
+      thinkingOrder?: number;
+      renderParts?: AssistantRenderPart[];
+    }
   | { type: "error"; sessionId: string; error: AppErrorPayload }
 );
 

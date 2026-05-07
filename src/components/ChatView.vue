@@ -11,7 +11,7 @@ import {
   showInFolder,
 } from "../services/unity";
 // undoPreview removed — undo UI moved to ChatChangesPanel
-import type { ChatComposerSendPayload, ChatMessage, AgentInfo, TokenUsage, ModelOption, PendingQuestion, PendingToolConfirm, EffortLevel, SessionSummary, AssetDbScanEvent, ScanStats, ImageAttachment, SkillManifest, UserIntentMeta, SaveRawContextRequest, CodexTransportMode } from "../types";
+import type { ChatComposerSendPayload, ChatMessage, AgentInfo, TokenUsage, ModelOption, PendingQuestion, PendingToolConfirm, EffortLevel, SessionSummary, AssetDbScanEvent, ScanStats, ImageAttachment, SkillManifest, UserIntentMeta, SaveRawContextRequest, CodexTransportMode, AssistantRenderPart } from "../types";
 import type { ToolCallDisplay } from "../types";
 import ModelEffortSelector from "./ModelEffortSelector.vue";
 import SessionPanel from "./chat/SessionPanel.vue";
@@ -44,6 +44,7 @@ import {
 import {
   createCoalescedScrollScheduler,
   createSettledScrollScheduler,
+  hasRunningToolCall,
   shouldAutoScrollToBottom,
   shouldShowWaitingPlaceholder,
 } from "../composables/chatViewStability";
@@ -147,11 +148,13 @@ const props = defineProps<{
   streamingText: string;
   streamingTextOrder?: number;
   isStreaming: boolean;
+  isCompacting: boolean;
   isThinking: boolean;
   hasThinking: boolean;
   thinkingText: string;
   thinkingOrder?: number;
   thinkingDuration: number;
+  liveRenderParts?: AssistantRenderPart[];
   activeToolCalls: ToolCallDisplay[];
   agents: AgentInfo[];
   selectedAgentId: string;
@@ -437,7 +440,7 @@ watch(inputText, (value) => {
 });
 
 const hasStreamingContent = computed(
-  () => !!displayedStreamingText.value || props.activeToolCalls.length > 0
+  () => !!displayedStreamingText.value || hasRunningToolCall(props.activeToolCalls)
 );
 
 const isWaitingForResponse = computed(
@@ -1344,15 +1347,18 @@ onUnmounted(() => {
           :streaming-text="displayedStreamingText"
           :streaming-text-order="streamingTextOrder"
           :is-streaming="isStreaming"
+          :is-compacting="isCompacting"
           :is-thinking="isThinking"
           :has-thinking="hasThinking"
           :thinking-order="thinkingOrder"
           :thinking-duration="thinkingDuration"
+          :live-render-parts="liveRenderParts"
           :active-tool-calls="activeToolCalls"
           user-label="You"
           assistant-label="Locus"
           :handoff-label="t('chat.transcript.handoff')"
           :waiting-label="t('chat.transcript.waiting')"
+          :compacting-label="t('chat.transcript.compacting')"
           :thinking-active-label="t('chat.transcript.thinking')"
           :thought-duration-label="t('chat.transcript.thoughtDuration', '{0}')"
           :thought-moment-label="t('chat.transcript.thoughtMoment')"

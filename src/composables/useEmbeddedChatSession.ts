@@ -29,6 +29,7 @@ import type {
   TokenUsage,
   ToolCallDisplay,
   UserIntentMeta,
+  AssistantRenderPart,
 } from "../types";
 
 export interface EmbeddedChatRequest {
@@ -87,7 +88,9 @@ function createState(key: string): EmbeddedChatState {
     streamSequence: 0,
     streamingTextOrder: 0,
     thinkingOrder: 0,
+    liveRenderParts: [] as AssistantRenderPart[],
     isStreaming: false,
+    isCompacting: false,
     isThinking: false,
     thinkingStartTime: 0,
     thinkingDuration: 0,
@@ -123,6 +126,7 @@ function clearState(state: EmbeddedChatState) {
   state.showTodoPanel = false;
   state.undoableMessageIds = new Set<string>();
   state.streamSequence = 0;
+  state.isCompacting = false;
   resetRoundState(state);
 }
 
@@ -156,6 +160,7 @@ function resetRoundState(state: EmbeddedChatState) {
   state.streamingThinking = "";
   state.streamingTextOrder = 0;
   state.thinkingOrder = 0;
+  state.liveRenderParts = [];
   state.isThinking = false;
   state.thinkingStartTime = 0;
   state.thinkingDuration = 0;
@@ -179,6 +184,41 @@ function applyMutation(state: EmbeddedChatState, mutation: StreamMutation) {
       break;
     case "setThinkingOrder":
       state.thinkingOrder = mutation.order;
+      break;
+    case "upsertLiveRenderPart": {
+      const index = state.liveRenderParts.findIndex((part) => part.id === mutation.part.id);
+      if (index < 0) {
+        state.liveRenderParts = [...state.liveRenderParts, mutation.part];
+      } else {
+        const next = [...state.liveRenderParts];
+        next.splice(index, 1, { ...next[index]!, ...mutation.part } as AssistantRenderPart);
+        state.liveRenderParts = next;
+      }
+      break;
+    }
+    case "appendLiveRenderPartContent":
+      state.liveRenderParts = state.liveRenderParts.map((part) => {
+        if (part.id !== mutation.partId) return part;
+        if (part.kind !== "thinking" && part.kind !== "text") return part;
+        return { ...part, content: part.content + mutation.text };
+      });
+      break;
+    case "deactivateLiveThinkingParts":
+      state.liveRenderParts = state.liveRenderParts.map((part) =>
+        part.kind === "thinking"
+          ? { ...part, active: false, duration: mutation.duration ?? part.duration }
+          : part,
+      );
+      break;
+    case "updateLiveToolPart":
+      state.liveRenderParts = state.liveRenderParts.map((part) =>
+        part.kind === "toolCall" && part.toolCall.id === mutation.toolCallId
+          ? { ...part, toolCall: { ...part.toolCall, ...mutation.updates } }
+          : part,
+      );
+      break;
+    case "clearLiveRenderParts":
+      state.liveRenderParts = [];
       break;
     case "setThinking":
       state.isThinking = mutation.value;
@@ -268,6 +308,9 @@ function applyMutation(state: EmbeddedChatState, mutation: StreamMutation) {
     case "setStreaming":
       state.isStreaming = mutation.value;
       break;
+    case "setCompacting":
+      state.isCompacting = mutation.value;
+      break;
     case "pushToolResults":
       {
         const targetIds = mutation.toolCallIds ? new Set(mutation.toolCallIds) : null;
@@ -285,6 +328,7 @@ function applyMutation(state: EmbeddedChatState, mutation: StreamMutation) {
       state.streamingThinking = "";
       state.streamingTextOrder = 0;
       state.thinkingOrder = 0;
+      state.liveRenderParts = [];
       state.isThinking = false;
       state.thinkingStartTime = 0;
       state.thinkingDuration = 0;
@@ -397,6 +441,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     state.pendingQuestion = null;
     state.pendingToolConfirms = [];
     state.streamSequence = 0;
+    state.isCompacting = false;
     resetRoundState(state);
     state.isStreaming = true;
     state.pendingRun = true;
@@ -422,6 +467,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     } catch (error) {
       state.isStreaming = false;
       state.pendingRun = false;
+      state.isCompacting = false;
       resetRoundState(state);
       state.error = normalizeAppError(error).message;
     }
@@ -520,7 +566,9 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
   const thinkingText = computed(() => activeState.value.streamingThinking);
   const streamingTextOrder = computed(() => activeState.value.streamingTextOrder);
   const thinkingOrder = computed(() => activeState.value.thinkingOrder);
+  const liveRenderParts = computed(() => activeState.value.liveRenderParts);
   const isStreaming = computed(() => activeState.value.isStreaming);
+  const isCompacting = computed(() => activeState.value.isCompacting);
   const isThinking = computed(() => activeState.value.isThinking);
   const thinkingDuration = computed(() => activeState.value.thinkingDuration);
   const activeToolCalls = computed(() => activeState.value.activeToolCalls);
@@ -559,7 +607,9 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     thinkingText,
     streamingTextOrder,
     thinkingOrder,
+    liveRenderParts,
     isStreaming,
+    isCompacting,
     isThinking,
     thinkingDuration,
     activeToolCalls,

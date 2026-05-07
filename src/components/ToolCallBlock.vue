@@ -25,7 +25,15 @@ const emit = defineEmits<{
   (e: "toolViewportAnchorEnd", anchor: HTMLElement): void;
 }>();
 
-const expanded = ref(props.toolCall.name === "explore" || props.toolCall.name === "task");
+function isSubagentToolName(name: string) {
+  return name === "explore" || name === "task";
+}
+
+function shouldAutoExpandSubagentTool(toolCall: ToolCallDisplay) {
+  return isSubagentToolName(toolCall.name) && toolCall.status === "running";
+}
+
+const expanded = ref(shouldAutoExpandSubagentTool(props.toolCall));
 const rootRef = ref<HTMLElement | null>(null);
 const headerRef = ref<HTMLElement | null>(null);
 const outputPre = ref<HTMLPreElement | null>(null);
@@ -45,7 +53,7 @@ watch(
 
 const isSubagentTool = computed(() => {
   const name = props.toolCall.name;
-  return name === "explore" || name === "task";
+  return isSubagentToolName(name);
 });
 
 const waitingLabel = computed(() => (
@@ -72,17 +80,38 @@ function emitToolViewportAnchorEnd(anchor: HTMLElement) {
   emit("toolViewportAnchorEnd", anchor);
 }
 
-function toggleExpanded() {
+function setExpanded(nextExpanded: boolean, preserveViewport = false) {
+  if (expanded.value === nextExpanded) return;
   const anchor = headerRef.value ?? rootRef.value;
-  if (anchor) emitToolViewportAnchorStart(anchor);
-  expanded.value = !expanded.value;
+  if (preserveViewport && anchor) emitToolViewportAnchorStart(anchor);
+  expanded.value = nextExpanded;
 
-  if (anchor) {
+  if (preserveViewport && anchor) {
     nextTick(() => {
       runOnNextFrame(() => emitToolViewportAnchorEnd(anchor));
     });
   }
 }
+
+function toggleExpanded() {
+  setExpanded(!expanded.value, true);
+}
+
+watch(
+  () => [props.toolCall.id, props.toolCall.name, props.toolCall.status] as const,
+  ([nextId, _nextName, nextStatus], [previousId, _previousName, previousStatus]) => {
+    if (nextId !== previousId) {
+      setExpanded(shouldAutoExpandSubagentTool(props.toolCall), false);
+      return;
+    }
+    if (!isSubagentTool.value) return;
+    if (previousStatus === "running" && nextStatus !== "running") {
+      setExpanded(false, true);
+    } else if (previousStatus !== "running" && nextStatus === "running") {
+      setExpanded(true, true);
+    }
+  },
+);
 
 const canvasInfo = computed(() => {
   if (!isCanvasTool.value) return null;
@@ -731,35 +760,67 @@ const highlightedOutput = computed(() => {
 }
 
 .nested-tool-calls {
-  margin-bottom: 6px;
+  margin-bottom: 4px;
 }
 
-.nested-tool-calls .tool-call-block {
+.nested-tool-calls :deep(.tool-call-collection) {
+  gap: 2px;
+}
+
+.nested-tool-calls :deep(.tool-call-collection-list) {
+  gap: 2px;
+}
+
+.nested-tool-calls :deep(.tool-call-block) {
   border-color: rgba(128, 128, 128, 0.2);
   font-size: 12px;
 }
 
-.nested-tool-calls .tool-call-header {
-  min-height: 24px;
-  padding: 2px 8px;
+.nested-tool-calls :deep(.tool-call-header) {
+  gap: 5px;
+  min-height: 18px;
+  padding: 0 4px;
+  border-radius: 3px;
 }
 
-.nested-tool-calls .tool-call-name {
+.nested-tool-calls :deep(.tool-call-icon) {
+  width: 12px;
+  height: 12px;
+}
+
+.nested-tool-calls :deep(.tool-call-status-dot) {
+  width: 4px;
+  height: 4px;
+}
+
+.nested-tool-calls :deep(.spinner-anim) {
+  width: 8px;
+  height: 8px;
+  border-width: 1px;
+}
+
+.nested-tool-calls :deep(.tool-call-name) {
   font-size: 11px;
 }
 
-.nested-tool-calls .tool-call-summary {
+.nested-tool-calls :deep(.tool-call-summary) {
   font-size: 10px;
 }
 
-.nested-tool-calls .tool-call-status {
+.nested-tool-calls :deep(.tool-call-status) {
   font-size: 10px;
+}
+
+.nested-tool-calls :deep(.tool-call-detail) {
+  margin-top: 2px;
+  padding: 3px 0 0 18px;
 }
 
 .nested-tool-calls :deep(.tool-call-batch-summary) {
-  min-height: 24px;
-  padding: 2px 8px 2px 16px;
+  min-height: 20px;
+  padding: 1px 6px 1px 15px;
   border-color: transparent;
+  border-radius: 4px;
 }
 
 .nested-tool-calls :deep(.tool-call-batch-summary:hover),
@@ -797,7 +858,7 @@ const highlightedOutput = computed(() => {
 }
 
 .nested-tool-calls :deep(.tool-call-collection-list.with-summary.open) {
-  padding: 6px;
+  padding: 4px;
   border-color: rgba(128, 128, 128, 0.24);
   border-radius: 0 0 6px 6px;
 }

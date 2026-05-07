@@ -25,6 +25,7 @@ import type {
   TodoPanelMode,
   SessionEventRecord,
   SessionRunSummary,
+  AssistantRenderPart,
 } from "../types";
 
 type ToolPermissionMode = "auto" | "ask";
@@ -103,7 +104,9 @@ export const useChatStore = defineStore("chat", () => {
   const streamSequence = ref(0);
   const streamingTextOrder = ref(0);
   const thinkingOrder = ref(0);
+  const liveRenderParts = ref<AssistantRenderPart[]>([]);
   const isStreaming = ref(false);
+  const isCompacting = ref(false);
   const currentRunId = ref<string | null>(null);
   const isThinking = ref(false);
   const thinkingStartTime = ref(0);
@@ -246,6 +249,8 @@ export const useChatStore = defineStore("chat", () => {
     streamSequence.value = 0;
     streamingTextOrder.value = 0;
     thinkingOrder.value = 0;
+    liveRenderParts.value = [];
+    isCompacting.value = false;
     isThinking.value = false;
     thinkingStartTime.value = 0;
     thinkingDuration.value = 0;
@@ -286,6 +291,7 @@ export const useChatStore = defineStore("chat", () => {
     activeSessionType.value = null;
     pendingQuestion.value = null;
     pendingToolConfirms.value = [];
+    isCompacting.value = false;
   }
 
   function runEventReplayKey(sessionId: string, runId: string): string {
@@ -715,6 +721,41 @@ export const useChatStore = defineStore("chat", () => {
       case "setThinkingOrder":
         thinkingOrder.value = m.order;
         break;
+      case "upsertLiveRenderPart": {
+        const index = liveRenderParts.value.findIndex((part) => part.id === m.part.id);
+        if (index < 0) {
+          liveRenderParts.value = [...liveRenderParts.value, m.part];
+        } else {
+          const next = [...liveRenderParts.value];
+          next.splice(index, 1, { ...next[index]!, ...m.part } as AssistantRenderPart);
+          liveRenderParts.value = next;
+        }
+        break;
+      }
+      case "appendLiveRenderPartContent":
+        liveRenderParts.value = liveRenderParts.value.map((part) => {
+          if (part.id !== m.partId) return part;
+          if (part.kind !== "thinking" && part.kind !== "text") return part;
+          return { ...part, content: part.content + m.text };
+        });
+        break;
+      case "deactivateLiveThinkingParts":
+        liveRenderParts.value = liveRenderParts.value.map((part) =>
+          part.kind === "thinking"
+            ? { ...part, active: false, duration: m.duration ?? part.duration }
+            : part,
+        );
+        break;
+      case "updateLiveToolPart":
+        liveRenderParts.value = liveRenderParts.value.map((part) =>
+          part.kind === "toolCall" && part.toolCall.id === m.toolCallId
+            ? { ...part, toolCall: { ...part.toolCall, ...m.updates } }
+            : part,
+        );
+        break;
+      case "clearLiveRenderParts":
+        liveRenderParts.value = [];
+        break;
       case "setThinking":
         isThinking.value = m.value;
         if (m.startTime !== undefined) thinkingStartTime.value = m.startTime;
@@ -802,6 +843,7 @@ export const useChatStore = defineStore("chat", () => {
         streamingThinking.value = "";
         streamingTextOrder.value = 0;
         thinkingOrder.value = 0;
+        liveRenderParts.value = [];
         thinkingStartTime.value = 0;
         thinkingDuration.value = 0;
         isThinking.value = false;
@@ -819,6 +861,7 @@ export const useChatStore = defineStore("chat", () => {
         streamingThinking.value = "";
         streamingTextOrder.value = 0;
         thinkingOrder.value = 0;
+        liveRenderParts.value = [];
         thinkingStartTime.value = 0;
         thinkingDuration.value = 0;
         isThinking.value = false;
@@ -870,6 +913,9 @@ export const useChatStore = defineStore("chat", () => {
           });
         }
         isStreaming.value = m.value;
+        break;
+      case "setCompacting":
+        isCompacting.value = m.value;
         break;
       case "canvasAutoOpen":
         if (streamReplayDepth === 0) {
@@ -1045,7 +1091,10 @@ export const useChatStore = defineStore("chat", () => {
     if (event.sessionId !== activeSessionId.value) return true;
 
     const shouldUseIncrementalReducer =
-      managedStreamingSessionIds.has(event.sessionId) || resolveSessionType(event.sessionId) === "chat";
+      event.type === "compactStart"
+      || event.type === "compactDone"
+      || managedStreamingSessionIds.has(event.sessionId)
+      || resolveSessionType(event.sessionId) === "chat";
 
     if (!shouldUseIncrementalReducer) {
       if (event.type === "done" || event.type === "error" || event.type === "cancelled") {
@@ -1075,7 +1124,9 @@ export const useChatStore = defineStore("chat", () => {
       streamSequence: streamSequence.value,
       streamingTextOrder: streamingTextOrder.value,
       thinkingOrder: thinkingOrder.value,
+      liveRenderParts: liveRenderParts.value,
       isStreaming: isStreaming.value,
+      isCompacting: isCompacting.value,
       isThinking: isThinking.value,
       thinkingStartTime: thinkingStartTime.value,
       thinkingDuration: thinkingDuration.value,
@@ -1626,7 +1677,9 @@ export const useChatStore = defineStore("chat", () => {
     streamSequence,
     streamingTextOrder,
     thinkingOrder,
+    liveRenderParts,
     isStreaming,
+    isCompacting,
     currentRunId,
     isCancelling,
     isThinking,

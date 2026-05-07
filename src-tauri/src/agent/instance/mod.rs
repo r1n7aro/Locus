@@ -7,7 +7,7 @@ pub use backend::{LlmBackend, RawContextStore, RawRound};
 
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
@@ -25,7 +25,9 @@ use crate::commands::{
 };
 use crate::compact;
 use crate::llm::{anthropic, chat_completions, codex, openrouter, responses};
-use crate::session::models::{MessageRole, TodoItem, ToolCallInfo};
+use crate::session::models::{
+    AssistantRenderPart, MessageRole, RenderOrderKey, TodoItem, ToolCallInfo,
+};
 use crate::session::store::SessionStore;
 use crate::tool::{ToolExecutionContext, ToolRegistry, ToolResult, ToolRuntimeState};
 
@@ -140,6 +142,139 @@ struct ParentStreamEvent {
     event: StreamEvent,
 }
 
+#[derive(Debug, Default)]
+struct StreamRenderOrderTracker {
+    next_seq: u32,
+    part_orders: HashMap<String, u32>,
+}
+
+#[derive(Debug, Clone)]
+struct RenderPartMark {
+    id: String,
+    seq: u32,
+}
+
+impl StreamRenderOrderTracker {
+    fn next(&mut self) -> u32 {
+        self.next_seq = self.next_seq.saturating_add(1).max(1);
+        self.next_seq
+    }
+
+    fn mark_part(&mut self, run_id: &str, stable_key: &str) -> RenderPartMark {
+        if let Some(seq) = self.part_orders.get(stable_key).copied() {
+            return RenderPartMark {
+                id: format!("{}:{}", run_id, stable_key),
+                seq,
+            };
+        }
+        let seq = self.next();
+        self.part_orders.insert(stable_key.to_string(), seq);
+        RenderPartMark {
+            id: format!("{}:{}", run_id, stable_key),
+            seq,
+        }
+    }
+
+    fn mark_text(&mut self, run_id: &str, block_id: &str) -> RenderPartMark {
+        self.mark_part(run_id, &format!("text:{}", block_id))
+    }
+
+    fn mark_thinking(&mut self, run_id: &str, block_id: &str) -> RenderPartMark {
+        self.mark_part(run_id, &format!("thinking:{}", block_id))
+    }
+
+    fn mark_tool(&mut self, run_id: &str, tool_call_id: &str) -> RenderPartMark {
+        self.mark_part(run_id, &format!("tool:{}", tool_call_id))
+    }
+
+    fn assign_tool_orders_for_run(
+        &mut self,
+        run_id: &str,
+        tool_calls: &[ToolCallInfo],
+    ) -> Vec<ToolCallInfo> {
+        tool_calls
+            .iter()
+            .map(|tool_call| self.assign_tool_order(run_id, tool_call))
+            .collect()
+    }
+
+    fn assign_tool_order(&mut self, run_id: &str, tool_call: &ToolCallInfo) -> ToolCallInfo {
+        let mut tool_call = tool_call.clone();
+        if tool_call.order.is_none() {
+            let mark = self.mark_tool(run_id, &tool_call.id);
+            tool_call.order = Some(mark.seq);
+        }
+        if let Some(nested_tool_calls) = tool_call.nested_tool_calls.as_ref() {
+            tool_call.nested_tool_calls = Some(
+                nested_tool_calls
+                    .iter()
+                    .map(|nested| self.assign_tool_order(run_id, nested))
+                    .collect(),
+            );
+        }
+        tool_call
+    }
+}
+
+fn render_order_key(run_id: &str, seq: u32) -> RenderOrderKey {
+    RenderOrderKey {
+        run_id: run_id.to_string(),
+        seq,
+    }
+}
+
+fn assistant_render_parts_for_response(
+    run_id: &str,
+    text_part: Option<RenderPartMark>,
+    text: &str,
+    thinking_part: Option<RenderPartMark>,
+    thinking_text: &str,
+    thinking_duration: Option<u32>,
+    thinking_signature: Option<&str>,
+    tool_calls: &[ToolCallInfo],
+) -> Vec<AssistantRenderPart> {
+    let mut parts = Vec::new();
+    if let Some(mark) = thinking_part.filter(|_| !thinking_text.is_empty()) {
+        parts.push(AssistantRenderPart::Thinking {
+            id: mark.id,
+            order: render_order_key(run_id, mark.seq),
+            content: thinking_text.to_string(),
+            active: Some(false),
+            duration: thinking_duration,
+            signature: thinking_signature
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+        });
+    }
+    if let Some(mark) = text_part.filter(|_| !text.is_empty()) {
+        parts.push(AssistantRenderPart::Text {
+            id: mark.id,
+            order: render_order_key(run_id, mark.seq),
+            content: text.to_string(),
+        });
+    }
+    for tool_call in tool_calls {
+        if let Some(seq) = tool_call.order {
+            parts.push(AssistantRenderPart::ToolCall {
+                id: tool_call.id.clone(),
+                order: render_order_key(run_id, seq),
+                tool_call: tool_call.clone(),
+            });
+        }
+    }
+    parts.sort_by(|left, right| render_part_seq(left).cmp(&render_part_seq(right)));
+    parts
+}
+
+fn render_part_seq(part: &AssistantRenderPart) -> u32 {
+    match part {
+        AssistantRenderPart::Thinking { order, .. }
+        | AssistantRenderPart::Text { order, .. }
+        | AssistantRenderPart::ToolCall { order, .. }
+        | AssistantRenderPart::KnowledgeProposal { order, .. } => order.seq,
+    }
+}
+
 impl ParentToolCall {
     fn new(session_id: String, run_id: String, tool_call_id: String) -> Self {
         Self {
@@ -165,6 +300,9 @@ impl ParentToolCall {
         tool_call_id: String,
         tool_name: String,
         arguments: String,
+        order: Option<u32>,
+        part_id: Option<String>,
+        render_seq: Option<u32>,
     ) -> ParentStreamEvent {
         ParentStreamEvent {
             run_id: self.run_id.clone(),
@@ -174,6 +312,9 @@ impl ParentToolCall {
                 tool_call_id,
                 tool_name,
                 arguments,
+                order,
+                part_id,
+                render_seq,
             },
         }
     }
@@ -4896,6 +5037,7 @@ impl AgentInstance {
                     .as_ref()
                     .and_then(|message| message.thinking_content.clone()),
                 thinking_duration: interrupted.and_then(|message| message.thinking_duration),
+                render_parts: None,
             },
         );
     }
@@ -5160,10 +5302,13 @@ impl AgentInstance {
         let final_thinking_signature;
         let final_response_id;
         let final_continuation_request;
+        let final_content_order;
+        let final_thinking_order;
         let mut done_already_emitted = false;
         let mut terminal_done_message_id: Option<String> = None;
         let mut codex_turn_state = matches!(self.backend, LlmBackend::OpenAiCodex { .. })
             .then(codex::TurnState::default);
+        let render_order_tracker = Arc::new(Mutex::new(StreamRenderOrderTracker::default()));
 
         'agent_loop: loop {
             iteration += 1;
@@ -5271,6 +5416,8 @@ impl AgentInstance {
 
             const LLM_RETRIES: u32 = 2;
             let mut response = None;
+            let mut response_text_part: Option<RenderPartMark> = None;
+            let mut response_thinking_part: Option<RenderPartMark> = None;
             let mut last_llm_error = String::new();
             let mut needs_reactive_compact = false;
 
@@ -5294,6 +5441,8 @@ impl AgentInstance {
                 let hdl = handle.clone();
                 let ptc = parent_tc.clone();
                 let rid = run_id.clone();
+                let render_order_for_text = render_order_tracker.clone();
+                let text_block_id = format!("iteration:{}:attempt:{}:text", iteration, attempt_number);
                 let partial_for_text = self.partial_assistant.clone();
                 let agent_id_for_text = self.id.clone();
                 let first_text_delta_logged = Arc::new(AtomicBool::new(false));
@@ -5302,6 +5451,9 @@ impl AgentInstance {
                 let sid2 = session_id.clone();
                 let hdl2 = handle.clone();
                 let rid2 = run_id.clone();
+                let render_order_for_thinking = render_order_tracker.clone();
+                let thinking_block_id =
+                    format!("iteration:{}:attempt:{}:thinking", iteration, attempt_number);
                 let partial_for_thinking = self.partial_assistant.clone();
                 let agent_id_for_thinking = self.id.clone();
                 let first_thinking_delta_logged = Arc::new(AtomicBool::new(false));
@@ -5311,6 +5463,7 @@ impl AgentInstance {
                 let hdl3 = handle.clone();
                 let ptc3 = parent_tc.clone();
                 let rid3 = run_id.clone();
+                let render_order_for_tool = render_order_tracker.clone();
                 let agent_id_for_tool_start = self.id.clone();
                 let first_tool_call_logged = Arc::new(AtomicBool::new(false));
                 let first_tool_call_logged_for_cb = first_tool_call_logged.clone();
@@ -5324,6 +5477,13 @@ impl AgentInstance {
                         &prepared_messages,
                         &api_tools,
                         move |delta| {
+                            let mark = render_order_for_text
+                                .lock()
+                                .map(|mut tracker| tracker.mark_text(&rid, &text_block_id))
+                                .unwrap_or(RenderPartMark {
+                                    id: format!("{}:text:{}", rid, text_block_id),
+                                    seq: 1,
+                                });
                             if !first_text_delta_logged_for_cb.swap(true, Ordering::Relaxed) {
                                 eprintln!(
                                     "[Agent {}] first text delta: session={} run={} iteration={} attempt={}/{} elapsed_ms={} delta_len={}",
@@ -5340,6 +5500,9 @@ impl AgentInstance {
                             emit_stream(&hdl, &rid, StreamEvent::TextDelta {
                                 session_id: sid.clone(),
                                 text: delta.clone(),
+                                order: Some(mark.seq),
+                                part_id: Some(mark.id.clone()),
+                                render_seq: Some(mark.seq),
                             });
                             partial_for_text.append_text(&delta);
                             if let Some(ref parent) = ptc {
@@ -5347,6 +5510,15 @@ impl AgentInstance {
                             }
                         },
                         move |thinking| {
+                            let mark = render_order_for_thinking
+                                .lock()
+                                .map(|mut tracker| {
+                                    tracker.mark_thinking(&rid2, &thinking_block_id)
+                                })
+                                .unwrap_or(RenderPartMark {
+                                    id: format!("{}:thinking:{}", rid2, thinking_block_id),
+                                    seq: 1,
+                                });
                             if !first_thinking_delta_logged_for_cb.swap(true, Ordering::Relaxed) {
                                 eprintln!(
                                     "[Agent {}] first thinking delta: session={} run={} iteration={} attempt={}/{} elapsed_ms={} delta_len={}",
@@ -5363,10 +5535,20 @@ impl AgentInstance {
                             emit_stream(&hdl2, &rid2, StreamEvent::ThinkingDelta {
                                 session_id: sid2.clone(),
                                 text: thinking.clone(),
+                                order: Some(mark.seq),
+                                part_id: Some(mark.id.clone()),
+                                render_seq: Some(mark.seq),
                             });
                             partial_for_thinking.append_thinking(&thinking);
                         },
                         move |tool_call_id, tool_name| {
+                            let mark = render_order_for_tool
+                                .lock()
+                                .map(|mut tracker| tracker.mark_tool(&rid3, &tool_call_id))
+                                .unwrap_or(RenderPartMark {
+                                    id: tool_call_id.clone(),
+                                    seq: 1,
+                                });
                             if !first_tool_call_logged_for_cb.swap(true, Ordering::Relaxed) {
                                 eprintln!(
                                     "[Agent {}] first tool call start: session={} run={} iteration={} attempt={}/{} elapsed_ms={} tool_call_id={} tool_name={}",
@@ -5386,6 +5568,9 @@ impl AgentInstance {
                                 tool_call_id: tool_call_id.clone(),
                                 tool_name: tool_name.clone(),
                                 arguments: String::new(),
+                                order: Some(mark.seq),
+                                part_id: Some(tool_call_id.clone()),
+                                render_seq: Some(mark.seq),
                             });
                             if let Some(ref parent) = ptc3 {
                                 emit_parent_stream(
@@ -5394,6 +5579,9 @@ impl AgentInstance {
                                         tool_call_id,
                                         tool_name,
                                         String::new(),
+                                        Some(mark.seq),
+                                        Some(mark.id),
+                                        Some(mark.seq),
                                     ),
                                 );
                             }
@@ -5461,6 +5649,34 @@ impl AgentInstance {
                             resp.tool_calls.len(),
                             resp.finish_reason
                         );
+                        if !resp.text.is_empty() {
+                            response_text_part = render_order_tracker
+                                .lock()
+                                .ok()
+                                .map(|mut tracker| {
+                                    tracker.mark_text(
+                                        &run_id,
+                                        &format!(
+                                            "iteration:{}:attempt:{}:text",
+                                            iteration, attempt_number
+                                        ),
+                                    )
+                                });
+                        }
+                        if !resp.thinking_text.is_empty() {
+                            response_thinking_part = render_order_tracker
+                                .lock()
+                                .ok()
+                                .map(|mut tracker| {
+                                    tracker.mark_thinking(
+                                        &run_id,
+                                        &format!(
+                                            "iteration:{}:attempt:{}:thinking",
+                                            iteration, attempt_number
+                                        ),
+                                    )
+                                });
+                        }
                         response = Some(resp);
                         break;
                     }
@@ -5566,6 +5782,35 @@ impl AgentInstance {
                     .push(round);
             }
 
+            if !response.text.is_empty() && response_text_part.is_none() {
+                response_text_part = render_order_tracker.lock().ok().map(|mut tracker| {
+                    tracker.mark_text(&run_id, &format!("iteration:{}:text", iteration))
+                });
+            }
+            if !response.thinking_text.is_empty() && response_thinking_part.is_none() {
+                response_thinking_part = render_order_tracker.lock().ok().map(|mut tracker| {
+                    tracker.mark_thinking(&run_id, &format!("iteration:{}:thinking", iteration))
+                });
+            }
+            let ordered_tool_calls = render_order_tracker
+                .lock()
+                .map(|mut tracker| {
+                    tracker.assign_tool_orders_for_run(&run_id, &response.tool_calls)
+                })
+                .unwrap_or_else(|_| response.tool_calls.clone());
+            let response_content_order = response_text_part.as_ref().map(|part| part.seq);
+            let response_thinking_order = response_thinking_part.as_ref().map(|part| part.seq);
+            let response_render_parts = assistant_render_parts_for_response(
+                &run_id,
+                response_text_part.clone(),
+                &response.text,
+                response_thinking_part.clone(),
+                &response.thinking_text,
+                (response.thinking_duration_secs > 0).then_some(response.thinking_duration_secs),
+                (!response.thinking_signature.is_empty()).then_some(response.thinking_signature.as_str()),
+                &ordered_tool_calls,
+            );
+
             if response.input_tokens > 0 || response.output_tokens > 0
                 || response.cache_read_tokens > 0 || response.cache_write_tokens > 0
             {
@@ -5626,7 +5871,7 @@ impl AgentInstance {
             // Emit ToolCallStart (with arguments) + ToolCallDone for server tool calls (e.g. web_search)
             // that have pre-computed output. These don't need local execution. Output is embedded
             // as text in the assistant message for API history, so no separate Tool message is needed.
-            for tc in &response.tool_calls {
+            for tc in &ordered_tool_calls {
                 if let Some(ref output) = tc.server_tool_output {
                     eprintln!(
                         "[Agent {}] server tool '{}' (id={}) has pre-computed output ({} chars)",
@@ -5638,6 +5883,9 @@ impl AgentInstance {
                         tool_call_id: tc.id.clone(),
                         tool_name: tc.name.clone(),
                         arguments: tc.arguments.clone(),
+                        order: tc.order,
+                        part_id: Some(tc.id.clone()),
+                        render_seq: tc.order,
                     });
                     emit_stream(app_handle, &run_id, StreamEvent::ToolCallDone {
                         session_id: self.session_id.clone(),
@@ -5653,6 +5901,9 @@ impl AgentInstance {
                                 tc.id.clone(),
                                 tc.name.clone(),
                                 tc.arguments.clone(),
+                                tc.order,
+                                Some(tc.id.clone()),
+                                tc.order,
                             ),
                         );
                         emit_parent_stream(
@@ -5668,30 +5919,33 @@ impl AgentInstance {
                 }
             }
 
-            let has_executable_tool_calls = response.tool_calls.iter()
+            let has_executable_tool_calls = ordered_tool_calls.iter()
                 .any(|tc| !tc.is_server_tool());
 
-            if !response.tool_calls.is_empty() {
+            if !ordered_tool_calls.is_empty() {
                 eprintln!(
                     "[Agent {}] got {} tool calls ({} executable, {} server)",
                     self.id,
-                    response.tool_calls.len(),
-                    response.tool_calls.iter().filter(|tc| !tc.is_server_tool()).count(),
-                    response.tool_calls.iter().filter(|tc| tc.is_server_tool()).count(),
+                    ordered_tool_calls.len(),
+                    ordered_tool_calls.iter().filter(|tc| !tc.is_server_tool()).count(),
+                    ordered_tool_calls.iter().filter(|tc| tc.is_server_tool()).count(),
                 );
 
                 let thinking_opt = if response.thinking_text.is_empty() { None } else { Some(response.thinking_text.as_str()) };
                 let thinking_dur = if response.thinking_duration_secs > 0 { Some(response.thinking_duration_secs) } else { None };
                 let thinking_sig = if response.thinking_signature.is_empty() { None } else { Some(response.thinking_signature.as_str()) };
-                let assistant_msg_id = store.add_assistant_with_tool_calls_and_thinking(
+                let assistant_msg_id = store.add_assistant_with_tool_calls_and_render_parts(
                     &self.session_id,
                     &response.text,
-                    &response.tool_calls,
+                    &ordered_tool_calls,
                     thinking_opt,
                     thinking_dur,
                     thinking_sig,
                     response.response_id.as_deref(),
                     response.continuation_request.as_ref(),
+                    response_content_order,
+                    response_thinking_order,
+                    &response_render_parts,
                 )?;
                 self.partial_assistant.mark_persisted(
                     assistant_msg_id.clone(),
@@ -5701,7 +5955,7 @@ impl AgentInstance {
                 );
 
                 let mut prepared: Vec<(ToolCallInfo, serde_json::Value)> = Vec::new();
-                for tc in &response.tool_calls {
+                for tc in &ordered_tool_calls {
                     // Skip server tools that already have pre-computed output.
                     if tc.is_server_tool() {
                         continue;
@@ -5717,6 +5971,9 @@ impl AgentInstance {
                         tool_call_id: tc.id.clone(),
                         tool_name: tc.name.clone(),
                         arguments: tc.arguments.clone(),
+                        order: tc.order,
+                        part_id: Some(tc.id.clone()),
+                        render_seq: tc.order,
                     });
                     if let Some(ref parent) = self.parent_tool_call {
                         emit_parent_stream(
@@ -5725,6 +5982,9 @@ impl AgentInstance {
                                 tc.id.clone(),
                                 tc.name.clone(),
                                 tc.arguments.clone(),
+                                tc.order,
+                                Some(tc.id.clone()),
+                                tc.order,
                             ),
                         );
                     }
@@ -5945,8 +6205,7 @@ impl AgentInstance {
                     .zip(results.iter())
                     .map(|((tool_call, _), result)| (tool_call.id.as_str(), result))
                     .collect();
-                let finalized_tool_calls: Vec<ToolCallInfo> = response
-                    .tool_calls
+                let finalized_tool_calls: Vec<ToolCallInfo> = ordered_tool_calls
                     .iter()
                     .map(|tool_call| {
                         finalize_tool_call_record(
@@ -5956,11 +6215,26 @@ impl AgentInstance {
                     })
                     .collect();
 
-                if let Err(e) =
-                    store.update_message_tool_calls(&assistant_msg_id, &finalized_tool_calls)
-                {
+                let finalized_render_parts = assistant_render_parts_for_response(
+                    &run_id,
+                    response_text_part.clone(),
+                    &response.text,
+                    response_thinking_part.clone(),
+                    &response.thinking_text,
+                    (response.thinking_duration_secs > 0)
+                        .then_some(response.thinking_duration_secs),
+                    (!response.thinking_signature.is_empty())
+                        .then_some(response.thinking_signature.as_str()),
+                    &finalized_tool_calls,
+                );
+
+                if let Err(e) = store.update_message_tool_calls_and_render_parts(
+                    &assistant_msg_id,
+                    &finalized_tool_calls,
+                    &finalized_render_parts,
+                ) {
                     eprintln!(
-                        "[Agent {}] failed to update tool_calls for assistant message {}: {}",
+                        "[Agent {}] failed to update tool_calls/render_parts for assistant message {}: {}",
                         self.id, assistant_msg_id, e
                     );
                 }
@@ -6014,6 +6288,9 @@ impl AgentInstance {
                     message_id: assistant_msg_id.clone(),
                     full_text: response.text.clone(),
                     tool_calls: finalized_tool_calls,
+                    content_order: response_content_order,
+                    thinking_order: response_thinking_order,
+                    render_parts: Some(finalized_render_parts),
                 });
                 self.partial_assistant.reset();
 
@@ -6034,6 +6311,8 @@ impl AgentInstance {
                 final_thinking_signature = response.thinking_signature;
                 final_response_id = response.response_id;
                 final_continuation_request = response.continuation_request;
+                final_content_order = response_content_order;
+                final_thinking_order = response_thinking_order;
                 done_already_emitted = true;
                 terminal_done_message_id = Some(assistant_msg_id);
                 break;
@@ -6045,6 +6324,8 @@ impl AgentInstance {
             final_text = response.text;
             final_response_id = response.response_id;
             final_continuation_request = response.continuation_request;
+            final_content_order = response_content_order;
+            final_thinking_order = response_thinking_order;
             break;
         }
 
@@ -6064,7 +6345,23 @@ impl AgentInstance {
             } else {
                 Some(final_thinking_signature.as_str())
             };
-            let msg_id = store.add_message_with_thinking(
+            let final_render_parts = assistant_render_parts_for_response(
+                &run_id,
+                final_content_order.map(|seq| RenderPartMark {
+                    id: format!("{}:text:final", run_id),
+                    seq,
+                }),
+                &final_text,
+                final_thinking_order.map(|seq| RenderPartMark {
+                    id: format!("{}:thinking:final", run_id),
+                    seq,
+                }),
+                thinking_opt.unwrap_or_default(),
+                thinking_dur,
+                thinking_sig,
+                &[],
+            );
+            let msg_id = store.add_message_with_thinking_and_render_parts(
                 &self.session_id,
                 MessageRole::Assistant,
                 &final_text,
@@ -6073,6 +6370,9 @@ impl AgentInstance {
                 thinking_sig,
                 final_response_id.as_deref(),
                 final_continuation_request.as_ref(),
+                final_content_order,
+                final_thinking_order,
+                &final_render_parts,
             )?;
             self.partial_assistant.mark_persisted(
                 msg_id.clone(),
@@ -6113,6 +6413,9 @@ impl AgentInstance {
                     session_id: self.session_id.clone(),
                     message_id: msg_id,
                     full_text: final_text.clone(),
+                    content_order: final_content_order,
+                    thinking_order: final_thinking_order,
+                    render_parts: Some(final_render_parts),
                 },
             );
             self.partial_assistant.reset();
@@ -6155,6 +6458,9 @@ impl AgentInstance {
                     session_id: self.session_id.clone(),
                     message_id: terminal_message_id,
                     full_text: final_text.clone(),
+                    content_order: final_content_order,
+                    thinking_order: final_thinking_order,
+                    render_parts: None,
                 },
             );
             self.partial_assistant.reset();
@@ -6731,7 +7037,7 @@ impl AgentInstance {
             self.await_tool_result(self.execute_knowledge_delete(app_handle, args))
                 .await
         } else if tc.name == "unity_execute" {
-            self.await_tool_result(self.execute_unity_execute(app_handle, &tc.id, args, run_id))
+            self.execute_unity_execute(app_handle, &tc.id, args, run_id)
                 .await
         } else if tc.name == "unity_recompile" {
             self.await_tool_result(self.execute_unity_recompile(app_handle, &tc.id, args, run_id))
@@ -7537,14 +7843,18 @@ impl AgentInstance {
         tool_call_id: &str,
         args: &serde_json::Value,
         run_id: &str,
-    ) -> ToolResult {
+    ) -> ExecutedToolResult {
+        if self.is_cancel_requested() {
+            return Self::interrupted_tool_result();
+        }
+
         let code = match args.get("code").and_then(|value| value.as_str()) {
             Some(code) => code,
             None => {
-                return ToolResult {
+                return ExecutedToolResult::from_tool_result(ToolResult {
                     output: "Missing required parameter: code".to_string(),
                     is_error: true,
-                };
+                });
             }
         };
 
@@ -7556,40 +7866,40 @@ impl AgentInstance {
         {
             Some(status) => status,
             None => {
-                return ToolResult {
+                return ExecutedToolResult::from_tool_result(ToolResult {
                     output: "Missing required parameter: request_editor_status".to_string(),
                     is_error: true,
-                };
+                });
             }
         };
 
         if requested_status == crate::unity_bridge::UNITY_EDITOR_STATUS_DISCONNECTED
             || !crate::unity_bridge::is_known_editor_status(requested_status)
         {
-            return ToolResult {
+            return ExecutedToolResult::from_tool_result(ToolResult {
                 output: format!(
                     "Invalid request_editor_status: '{}'. Allowed values: editing, playing, playing_paused.",
                     requested_status
                 ),
                 is_error: true,
-            };
+            });
         }
 
         if !self.has_selected_working_dir() {
-            return ToolResult {
+            return ExecutedToolResult::from_tool_result(ToolResult {
                 output: "Tool 'unity_execute' requires a selected Unity project working directory."
                     .to_string(),
                 is_error: true,
-            };
+            });
         }
 
         let (connected, current_status, _scene) =
             crate::unity_bridge::query_unity_status(&self.working_dir).await;
         if !connected {
-            return ToolResult {
+            return ExecutedToolResult::from_tool_result(ToolResult {
                 output: "Unity Editor not connected".to_string(),
                 is_error: true,
-            };
+            });
         }
 
         if current_status != requested_status {
@@ -7606,6 +7916,9 @@ impl AgentInstance {
             {
                 ToolConfirmDecision::Allow => {}
                 ToolConfirmDecision::Deny { feedback } => {
+                    if self.is_cancel_requested() {
+                        return Self::interrupted_tool_result();
+                    }
                     let output = match feedback {
                         Some(feedback) => format!(
                             "Unity Editor status change was rejected by user feedback.\nUser feedback: {}",
@@ -7613,20 +7926,20 @@ impl AgentInstance {
                         ),
                         None => "user_denied_editor_state_change".to_string(),
                     };
-                    return ToolResult {
+                    return ExecutedToolResult::from_tool_result(ToolResult {
                         output,
                         is_error: true,
-                    };
+                    });
                 }
             }
 
             if let Err(error) =
                 crate::unity_bridge::set_editor_status(&self.working_dir, requested_status).await
             {
-                return ToolResult {
+                return ExecutedToolResult::from_tool_result(ToolResult {
                     output: format!("Failed to change Unity Editor status: {}", error),
                     is_error: true,
-                };
+                });
             }
         }
 
@@ -7635,7 +7948,7 @@ impl AgentInstance {
             run_id,
             &self.session_id,
             tool_call_id,
-            "Preparing compiler",
+            "Waiting for Unity execute slot",
             "",
             None,
             "running",
@@ -7650,9 +7963,11 @@ impl AgentInstance {
         let progress_run_id = run_id.to_string();
         let result_run_id = progress_run_id.clone();
 
-        match crate::unity_bridge::unity_execute_code_with_progress(
+        let cancel_rx = self.cancel_waiter();
+        match crate::unity_bridge::unity_execute_code_with_progress_cancellable(
             &self.working_dir,
             code,
+            cancel_rx,
             move |snapshot| {
                 if !snapshot.active {
                     return;
@@ -7678,14 +7993,17 @@ impl AgentInstance {
         {
             Ok(output) => {
                 let trimmed = output.trim();
-                ToolResult {
+                ExecutedToolResult::from_tool_result(ToolResult {
                     output: if trimmed.is_empty() {
                         "Code executed successfully (no output).".to_string()
                     } else {
                         trimmed.to_string()
                     },
                     is_error: false,
-                }
+                })
+            }
+            Err(error) if error == crate::unity_bridge::UNITY_EXECUTE_CANCELLED => {
+                Self::interrupted_tool_result()
             }
             Err(error) => {
                 let title = if error.contains("compilation")
@@ -7706,10 +8024,10 @@ impl AgentInstance {
                     None,
                     "error",
                 );
-                ToolResult {
+                ExecutedToolResult::from_tool_result(ToolResult {
                     output: error,
                     is_error: true,
-                }
+                })
             }
         }
     }
@@ -9890,6 +10208,9 @@ mod tests {
             "read-1".to_string(),
             "read".to_string(),
             "{}".to_string(),
+            Some(3),
+            Some("read-1".to_string()),
+            Some(3),
         );
         assert_eq!(start.run_id, "parent-run");
         match start.event {
@@ -9899,12 +10220,18 @@ mod tests {
                 tool_call_id,
                 tool_name,
                 arguments,
+                order,
+                part_id,
+                render_seq,
             } => {
                 assert_eq!(session_id, "parent-session");
                 assert_eq!(parent_tool_call_id, "task-1");
                 assert_eq!(tool_call_id, "read-1");
                 assert_eq!(tool_name, "read");
                 assert_eq!(arguments, "{}");
+                assert_eq!(order, Some(3));
+                assert_eq!(part_id, Some("read-1".to_string()));
+                assert_eq!(render_seq, Some(3));
             }
             other => panic!("unexpected event: {:?}", other),
         }
@@ -9957,6 +10284,7 @@ mod tests {
             id: "task-1".to_string(),
             name: "task".to_string(),
             arguments: "{}".to_string(),
+            order: None,
             server_tool: None,
             server_tool_output: None,
             outcome: None,
@@ -9967,6 +10295,7 @@ mod tests {
             id: "read-1".to_string(),
             name: "read".to_string(),
             arguments: "{}".to_string(),
+            order: None,
             server_tool: None,
             server_tool_output: None,
             outcome: Some(crate::commands::ToolCallOutcome::Done),

@@ -582,6 +582,7 @@ fn collect_tool_calls(
             id: tc.id.clone(),
             name: tc.name.clone(),
             arguments: tc.arguments.clone(),
+            order: None,
             server_tool: None,
             server_tool_output: None,
             outcome: None,
@@ -789,6 +790,8 @@ mod tests {
             prompt_prefix: None,
             prompt_suffix: None,
             response_id: None,
+            content_order: None,
+            thinking_order: None,
             tool_calls,
             tool_call_id: tool_call_id.map(str::to_string),
             images: None,
@@ -796,6 +799,7 @@ mod tests {
             thinking_duration: None,
             thinking_signature: None,
             knowledge_proposal: None,
+            render_parts: None,
         }
     }
 

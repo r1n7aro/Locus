@@ -479,6 +479,7 @@ fn collect_tool_calls(map: HashMap<u32, PendingToolCall>) -> Result<Vec<ToolCall
             id: tc.id,
             name: tc.name,
             arguments: tc.arguments,
+            order: None,
             server_tool: None,
             server_tool_output: None,
             outcome: None,
@@ -914,6 +915,8 @@ mod tests {
             prompt_prefix: None,
             prompt_suffix: None,
             response_id: None,
+            content_order: None,
+            thinking_order: None,
             tool_calls: None,
             tool_call_id: None,
             images: Some(images),
@@ -921,6 +924,7 @@ mod tests {
             thinking_duration: None,
             thinking_signature: None,
             knowledge_proposal: None,
+            render_parts: None,
         }
     }
 
@@ -933,6 +937,8 @@ mod tests {
             prompt_prefix: None,
             prompt_suffix: None,
             response_id: response_id.map(|value| value.to_string()),
+            content_order: None,
+            thinking_order: None,
             tool_calls: None,
             tool_call_id: None,
             images: None,
@@ -940,6 +946,7 @@ mod tests {
             thinking_duration: None,
             thinking_signature: None,
             knowledge_proposal: None,
+            render_parts: None,
         }
     }
 
@@ -957,6 +964,8 @@ mod tests {
             prompt_prefix: None,
             prompt_suffix: None,
             response_id: response_id.map(|value| value.to_string()),
+            content_order: None,
+            thinking_order: None,
             tool_calls: Some(tool_calls),
             tool_call_id: None,
             images: None,
@@ -964,6 +973,7 @@ mod tests {
             thinking_duration: None,
             thinking_signature: None,
             knowledge_proposal: None,
+            render_parts: None,
         }
     }
 
@@ -976,6 +986,8 @@ mod tests {
             prompt_prefix: None,
             prompt_suffix: None,
             response_id: None,
+            content_order: None,
+            thinking_order: None,
             tool_calls: None,
             tool_call_id: Some(tool_call_id.to_string()),
             images: None,
@@ -983,6 +995,7 @@ mod tests {
             thinking_duration: None,
             thinking_signature: None,
             knowledge_proposal: None,
+            render_parts: None,
         }
     }
 
@@ -1030,6 +1043,7 @@ mod tests {
                 id: "ws_1".to_string(),
                 name: "web_search".to_string(),
                 arguments: r#"{"query":"rust async await"}"#.to_string(),
+                order: None,
                 server_tool: Some(ServerToolKind::WebSearch),
                 server_tool_output: Some("Searched: rust async await".to_string()),
                 outcome: None,

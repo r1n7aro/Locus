@@ -8,8 +8,9 @@ use rusqlite::{params, Connection, OptionalExtension};
 use uuid::Uuid;
 
 use super::models::{
-    ChatMessage, KnowledgeProposal, KnowledgeProposalStatus, MessageRole, SessionDetail,
-    SessionEventRecord, SessionRunSummary, SessionSummary, TodoItem, TodoSnapshot, ToolCallInfo,
+    AssistantRenderPart, ChatMessage, KnowledgeProposal, KnowledgeProposalStatus, MessageRole,
+    SessionDetail, SessionEventRecord, SessionRunSummary, SessionSummary, TodoItem, TodoSnapshot,
+    ToolCallInfo,
 };
 use crate::commands::TokenUsage;
 use crate::compact;
@@ -67,6 +68,7 @@ const RUN_STATUS_CANCELLING: &str = "cancelling";
 const RUN_STATUS_DONE: &str = "done";
 const RUN_STATUS_CANCELLED: &str = "cancelled";
 const RUN_STATUS_ERROR: &str = "error";
+const CONTEXT_HANDOFF_MARKER: &str = "## Context Handoff";
 
 impl SessionEventWriter {
     const FLUSH_INTERVAL: Duration = Duration::from_millis(25);
@@ -261,21 +263,36 @@ struct MessageMetadata {
     response_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     response_request: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content_order: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking_order: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    render_parts: Option<Vec<AssistantRenderPart>>,
 }
 
 fn message_metadata_json(
     knowledge_proposal: Option<&KnowledgeProposal>,
     response_id: Option<&str>,
     response_request: Option<&serde_json::Value>,
+    content_order: Option<u32>,
+    thinking_order: Option<u32>,
+    render_parts: Option<&[AssistantRenderPart]>,
 ) -> Result<Option<String>, String> {
     let metadata = MessageMetadata {
         knowledge_proposal: knowledge_proposal.cloned(),
         response_id: response_id.map(|value| value.to_string()),
         response_request: response_request.cloned(),
+        content_order,
+        thinking_order,
+        render_parts: render_parts.map(|value| value.to_vec()),
     };
     if metadata.knowledge_proposal.is_none()
         && metadata.response_id.is_none()
         && metadata.response_request.is_none()
+        && metadata.content_order.is_none()
+        && metadata.thinking_order.is_none()
+        && metadata.render_parts.is_none()
     {
         return Ok(None);
     }
@@ -300,6 +317,10 @@ fn merge_prompt_prefixes(carried: &str, existing: Option<&str>) -> String {
     }
 
     format!("{}\n\n{}", carried_trimmed, existing_trimmed)
+}
+
+fn is_context_handoff_message(message: &ChatMessage) -> bool {
+    message.role == MessageRole::Assistant && message.content.starts_with(CONTEXT_HANDOFF_MARKER)
 }
 
 fn strip_top_level_recorded_output(tool_calls: &[ToolCallInfo]) -> Vec<ToolCallInfo> {
@@ -329,7 +350,7 @@ impl SessionStore {
     ///
     /// Do not rely on ad-hoc `ALTER TABLE ... .ok()` fallbacks or silent
     /// schema drift. Session data must migrate deterministically.
-    const SCHEMA_VERSION: i32 = 15;
+    const SCHEMA_VERSION: i32 = 16;
 
     pub fn new(data_dir: &Path) -> Result<Self, String> {
         let db_path = data_dir.join("locus.db");
@@ -493,7 +514,13 @@ impl SessionStore {
             })?;
         }
 
-        debug_assert_eq!(Self::SCHEMA_VERSION, 15, "add a new migration block above");
+        if current < 16 {
+            Self::migrate(conn, 16, "add message render order metadata", |conn| {
+                Self::migrate_message_render_orders(conn)
+            })?;
+        }
+
+        debug_assert_eq!(Self::SCHEMA_VERSION, 16, "add a new migration block above");
         Ok(())
     }
 
@@ -761,6 +788,137 @@ impl SessionStore {
         Ok(())
     }
 
+    fn migrate_message_render_orders(conn: &Connection) -> rusqlite::Result<()> {
+        fn to_sql_error(
+            error: impl Into<Box<dyn std::error::Error + Send + Sync>>,
+        ) -> rusqlite::Error {
+            rusqlite::Error::ToSqlConversionFailure(error.into())
+        }
+
+        fn bump_next_order(next_order: &mut u32, order: Option<u32>) {
+            if let Some(order) = order.filter(|value| *value > 0) {
+                *next_order = (*next_order).max(order.saturating_add(1));
+            }
+        }
+
+        fn assign_tool_call_orders(tool_calls: &mut [ToolCallInfo], next_order: &mut u32) -> bool {
+            let mut changed = false;
+            for tool_call in tool_calls {
+                if tool_call.order.is_none() {
+                    tool_call.order = Some(*next_order);
+                    *next_order = next_order.saturating_add(1);
+                    changed = true;
+                } else {
+                    bump_next_order(next_order, tool_call.order);
+                }
+
+                if let Some(nested_tool_calls) = tool_call.nested_tool_calls.as_mut() {
+                    changed |= assign_tool_call_orders(nested_tool_calls, next_order);
+                }
+            }
+            changed
+        }
+
+        let mut stmt = conn.prepare(
+            "SELECT id, role, content, tool_calls, thinking_content, metadata_json
+             FROM messages
+             ORDER BY created_at ASC, rowid ASC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(stmt);
+
+        for (message_id, role, content, tool_calls_json, thinking_content, metadata_json) in rows {
+            if role != "assistant" {
+                continue;
+            }
+
+            let mut metadata: MessageMetadata = metadata_json
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()
+                .map_err(to_sql_error)?
+                .unwrap_or_default();
+            let mut metadata_changed = false;
+            let mut next_order = 1u32;
+
+            bump_next_order(&mut next_order, metadata.thinking_order);
+            bump_next_order(&mut next_order, metadata.content_order);
+
+            let has_thinking = thinking_content
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|value| !value.is_empty());
+            if has_thinking && metadata.thinking_order.is_none() {
+                metadata.thinking_order = Some(next_order);
+                next_order = next_order.saturating_add(1);
+                metadata_changed = true;
+            }
+
+            if !content.trim().is_empty() && metadata.content_order.is_none() {
+                metadata.content_order = Some(next_order);
+                next_order = next_order.saturating_add(1);
+                metadata_changed = true;
+            }
+
+            let mut next_tool_calls_json = None;
+            if let Some(tool_calls_json) = tool_calls_json.as_deref() {
+                let mut tool_calls: Vec<ToolCallInfo> =
+                    serde_json::from_str(tool_calls_json).map_err(to_sql_error)?;
+                if assign_tool_call_orders(&mut tool_calls, &mut next_order) {
+                    next_tool_calls_json =
+                        Some(serde_json::to_string(&tool_calls).map_err(to_sql_error)?);
+                }
+            }
+
+            let next_metadata_json = if metadata_changed {
+                if metadata.knowledge_proposal.is_none()
+                    && metadata.response_id.is_none()
+                    && metadata.response_request.is_none()
+                    && metadata.content_order.is_none()
+                    && metadata.thinking_order.is_none()
+                    && metadata.render_parts.is_none()
+                {
+                    Some(None)
+                } else {
+                    Some(Some(
+                        serde_json::to_string(&metadata).map_err(to_sql_error)?,
+                    ))
+                }
+            } else {
+                None
+            };
+
+            if next_metadata_json.is_none() && next_tool_calls_json.is_none() {
+                continue;
+            }
+
+            conn.execute(
+                "UPDATE messages
+                 SET metadata_json = COALESCE(?1, metadata_json),
+                     tool_calls = COALESCE(?2, tool_calls)
+                 WHERE id = ?3",
+                params![
+                    next_metadata_json.flatten(),
+                    next_tool_calls_json,
+                    message_id,
+                ],
+            )?;
+        }
+
+        Ok(())
+    }
+
     fn now_ts() -> i64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -916,6 +1074,62 @@ impl SessionStore {
         )
         .optional()
         .map_err(|e| format!("Failed to query active session run: {}", e))
+    }
+
+    pub fn active_descendant_runs(
+        &self,
+        root_session_id: &str,
+    ) -> Result<Vec<SessionRunSummary>, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare(
+                "WITH RECURSIVE descendants(id) AS (
+                    SELECT id FROM sessions WHERE parent_session_id = ?1
+                    UNION ALL
+                    SELECT sessions.id
+                    FROM sessions
+                    JOIN descendants ON sessions.parent_session_id = descendants.id
+                 )
+                 SELECT session_runs.run_id,
+                        session_runs.session_id,
+                        session_runs.status,
+                        session_runs.started_at,
+                        session_runs.updated_at,
+                        session_runs.finished_at,
+                        session_runs.error_message
+                 FROM session_runs
+                 JOIN descendants ON descendants.id = session_runs.session_id
+                 WHERE session_runs.status IN (?2, ?3, ?4, ?5, ?6)
+                 ORDER BY session_runs.updated_at DESC",
+            )
+            .map_err(|e| format!("Failed to prepare active descendant run query: {}", e))?;
+
+        let rows = stmt
+            .query_map(
+                params![
+                    root_session_id,
+                    RUN_STATUS_QUEUED,
+                    RUN_STATUS_STARTING,
+                    RUN_STATUS_RUNNING,
+                    RUN_STATUS_WAITING_INPUT,
+                    RUN_STATUS_CANCELLING,
+                ],
+                |row| {
+                    Ok(SessionRunSummary {
+                        run_id: row.get(0)?,
+                        session_id: row.get(1)?,
+                        status: row.get(2)?,
+                        started_at: row.get(3)?,
+                        updated_at: row.get(4)?,
+                        finished_at: row.get(5)?,
+                        error_message: row.get(6)?,
+                    })
+                },
+            )
+            .map_err(|e| format!("Failed to query active descendant runs: {}", e))?;
+
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to read active descendant run: {}", e))
     }
 
     pub fn session_id_for_run(&self, run_id: &str) -> Result<Option<String>, String> {
@@ -1403,6 +1617,8 @@ impl SessionStore {
             prompt_suffix,
             None,
             None,
+            None,
+            None,
         )
     }
 
@@ -1416,6 +1632,33 @@ impl SessionStore {
         thinking_signature: Option<&str>,
         response_id: Option<&str>,
         response_request: Option<&serde_json::Value>,
+    ) -> Result<String, String> {
+        self.add_message_with_thinking_and_order(
+            session_id,
+            role,
+            content,
+            thinking_content,
+            thinking_duration,
+            thinking_signature,
+            response_id,
+            response_request,
+            None,
+            None,
+        )
+    }
+
+    pub fn add_message_with_thinking_and_order(
+        &self,
+        session_id: &str,
+        role: MessageRole,
+        content: &str,
+        thinking_content: Option<&str>,
+        thinking_duration: Option<u32>,
+        thinking_signature: Option<&str>,
+        response_id: Option<&str>,
+        response_request: Option<&serde_json::Value>,
+        content_order: Option<u32>,
+        thinking_order: Option<u32>,
     ) -> Result<String, String> {
         self.add_message_full_with_thinking(
             session_id,
@@ -1432,6 +1675,43 @@ impl SessionStore {
             None,
             response_id,
             response_request,
+            content_order,
+            thinking_order,
+        )
+    }
+
+    pub fn add_message_with_thinking_and_render_parts(
+        &self,
+        session_id: &str,
+        role: MessageRole,
+        content: &str,
+        thinking_content: Option<&str>,
+        thinking_duration: Option<u32>,
+        thinking_signature: Option<&str>,
+        response_id: Option<&str>,
+        response_request: Option<&serde_json::Value>,
+        content_order: Option<u32>,
+        thinking_order: Option<u32>,
+        render_parts: &[AssistantRenderPart],
+    ) -> Result<String, String> {
+        self.add_message_full_with_thinking_and_render_parts(
+            session_id,
+            role,
+            content,
+            None,
+            None,
+            None,
+            thinking_content,
+            thinking_duration,
+            thinking_signature,
+            None,
+            None,
+            None,
+            response_id,
+            response_request,
+            content_order,
+            thinking_order,
+            Some(render_parts),
         )
     }
 
@@ -1458,6 +1738,33 @@ impl SessionStore {
         response_id: Option<&str>,
         response_request: Option<&serde_json::Value>,
     ) -> Result<String, String> {
+        self.add_assistant_with_tool_calls_and_thinking_and_order(
+            session_id,
+            content,
+            tool_calls,
+            thinking_content,
+            thinking_duration,
+            thinking_signature,
+            response_id,
+            response_request,
+            None,
+            None,
+        )
+    }
+
+    pub fn add_assistant_with_tool_calls_and_thinking_and_order(
+        &self,
+        session_id: &str,
+        content: &str,
+        tool_calls: &[ToolCallInfo],
+        thinking_content: Option<&str>,
+        thinking_duration: Option<u32>,
+        thinking_signature: Option<&str>,
+        response_id: Option<&str>,
+        response_request: Option<&serde_json::Value>,
+        content_order: Option<u32>,
+        thinking_order: Option<u32>,
+    ) -> Result<String, String> {
         let tool_calls_json = serde_json::to_string(tool_calls)
             .map_err(|e| format!("Failed to serialize tool_calls: {}", e))?;
         self.add_message_full_with_thinking(
@@ -1475,6 +1782,45 @@ impl SessionStore {
             None,
             response_id,
             response_request,
+            content_order,
+            thinking_order,
+        )
+    }
+
+    pub fn add_assistant_with_tool_calls_and_render_parts(
+        &self,
+        session_id: &str,
+        content: &str,
+        tool_calls: &[ToolCallInfo],
+        thinking_content: Option<&str>,
+        thinking_duration: Option<u32>,
+        thinking_signature: Option<&str>,
+        response_id: Option<&str>,
+        response_request: Option<&serde_json::Value>,
+        content_order: Option<u32>,
+        thinking_order: Option<u32>,
+        render_parts: &[AssistantRenderPart],
+    ) -> Result<String, String> {
+        let tool_calls_json = serde_json::to_string(tool_calls)
+            .map_err(|e| format!("Failed to serialize tool_calls: {}", e))?;
+        self.add_message_full_with_thinking_and_render_parts(
+            session_id,
+            MessageRole::Assistant,
+            content,
+            Some(&tool_calls_json),
+            None,
+            None,
+            thinking_content,
+            thinking_duration,
+            thinking_signature,
+            None,
+            None,
+            None,
+            response_id,
+            response_request,
+            content_order,
+            thinking_order,
+            Some(render_parts),
         )
     }
 
@@ -1493,6 +1839,47 @@ impl SessionStore {
         .map_err(|e| {
             format!(
                 "Failed to update tool_calls for message '{}': {}",
+                message_id, e
+            )
+        })?;
+        Ok(())
+    }
+
+    pub fn update_message_tool_calls_and_render_parts(
+        &self,
+        message_id: &str,
+        tool_calls: &[ToolCallInfo],
+        render_parts: &[AssistantRenderPart],
+    ) -> Result<(), String> {
+        let tool_calls_json = serde_json::to_string(tool_calls)
+            .map_err(|e| format!("Failed to serialize tool_calls: {}", e))?;
+        let render_parts = render_parts.to_vec();
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let metadata_json: Option<String> = conn
+            .query_row(
+                "SELECT metadata_json FROM messages WHERE id = ?1",
+                params![message_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| format!("Failed to load message metadata: {}", e))?
+            .flatten();
+        let mut metadata: MessageMetadata = metadata_json
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(|e| format!("Failed to parse message metadata: {}", e))?
+            .unwrap_or_default();
+        metadata.render_parts = Some(render_parts);
+        let metadata_json = serde_json::to_string(&metadata)
+            .map_err(|e| format!("Failed to serialize message metadata: {}", e))?;
+        conn.execute(
+            "UPDATE messages SET tool_calls = ?1, metadata_json = ?2 WHERE id = ?3",
+            params![tool_calls_json, metadata_json, message_id],
+        )
+        .map_err(|e| {
+            format!(
+                "Failed to update tool_calls/render_parts for message '{}': {}",
                 message_id, e
             )
         })?;
@@ -1622,6 +2009,8 @@ impl SessionStore {
             None,
             None,
             None,
+            None,
+            None,
         )
     }
 
@@ -1641,11 +2030,60 @@ impl SessionStore {
         prompt_suffix: Option<&str>,
         response_id: Option<&str>,
         response_request: Option<&serde_json::Value>,
+        content_order: Option<u32>,
+        thinking_order: Option<u32>,
+    ) -> Result<String, String> {
+        self.add_message_full_with_thinking_and_render_parts(
+            session_id,
+            role,
+            content,
+            tool_calls_json,
+            tool_call_id,
+            images_json,
+            thinking_content,
+            thinking_duration,
+            thinking_signature,
+            knowledge_proposal,
+            prompt_prefix,
+            prompt_suffix,
+            response_id,
+            response_request,
+            content_order,
+            thinking_order,
+            None,
+        )
+    }
+
+    fn add_message_full_with_thinking_and_render_parts(
+        &self,
+        session_id: &str,
+        role: MessageRole,
+        content: &str,
+        tool_calls_json: Option<&str>,
+        tool_call_id: Option<&str>,
+        images_json: Option<&str>,
+        thinking_content: Option<&str>,
+        thinking_duration: Option<u32>,
+        thinking_signature: Option<&str>,
+        knowledge_proposal: Option<&KnowledgeProposal>,
+        prompt_prefix: Option<&str>,
+        prompt_suffix: Option<&str>,
+        response_id: Option<&str>,
+        response_request: Option<&serde_json::Value>,
+        content_order: Option<u32>,
+        thinking_order: Option<u32>,
+        render_parts: Option<&[AssistantRenderPart]>,
     ) -> Result<String, String> {
         let id = Uuid::new_v4().to_string();
         let now = Self::now_ts();
-        let metadata_json =
-            message_metadata_json(knowledge_proposal, response_id, response_request)?;
+        let metadata_json = message_metadata_json(
+            knowledge_proposal,
+            response_id,
+            response_request,
+            content_order,
+            thinking_order,
+            render_parts,
+        )?;
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
 
         conn.execute(
@@ -2002,6 +2440,17 @@ impl SessionStore {
                     None
                 }
             });
+        let carried_prompt_prefix = carried_prompt_prefix.or_else(|| {
+            let boundary_message = &prompt_messages[boundary_idx];
+            if !is_context_handoff_message(boundary_message) {
+                return None;
+            }
+            boundary_message
+                .prompt_prefix
+                .as_deref()
+                .filter(|prefix| !prefix.trim().is_empty())
+                .map(|prefix| prefix.to_string())
+        });
         let retained_user_ids = compact::select_recent_user_message_ids_for_compact_prompt(
             &prompt_messages,
             boundary_idx,
@@ -2019,6 +2468,23 @@ impl SessionStore {
         .map_err(|e| {
             let _ = conn.execute("ROLLBACK", []);
             format!("Failed to mark compacted messages: {}", e)
+        })?;
+
+        conn.execute(
+            "UPDATE messages
+             SET include_in_prompt = 0
+             WHERE session_id = ?1
+               AND include_in_prompt = 1
+               AND role = 'assistant'
+               AND content LIKE ?2",
+            params![session_id, format!("{}%", CONTEXT_HANDOFF_MARKER)],
+        )
+        .map_err(|e| {
+            let _ = conn.execute("ROLLBACK", []);
+            format!(
+                "Failed to remove previous handoff messages from prompt: {}",
+                e
+            )
         })?;
 
         for message_id in &retained_user_ids {
@@ -2207,9 +2673,18 @@ impl SessionStore {
                 .map(|json| serde_json::from_str(json))
                 .transpose()
                 .map_err(|e| format!("Failed to parse message metadata: {}", e))?;
-            let (knowledge_proposal, response_id) = metadata
-                .map(|value| (value.knowledge_proposal, value.response_id))
-                .unwrap_or((None, None));
+            let (knowledge_proposal, response_id, content_order, thinking_order, render_parts) =
+                metadata
+                    .map(|value| {
+                        (
+                            value.knowledge_proposal,
+                            value.response_id,
+                            value.content_order,
+                            value.thinking_order,
+                            value.render_parts,
+                        )
+                    })
+                    .unwrap_or((None, None, None, None, None));
 
             messages.push(ChatMessage {
                 id,
@@ -2219,6 +2694,8 @@ impl SessionStore {
                 prompt_prefix,
                 prompt_suffix,
                 response_id,
+                content_order,
+                thinking_order,
                 tool_calls,
                 tool_call_id,
                 images,
@@ -2226,6 +2703,7 @@ impl SessionStore {
                 thinking_duration: thinking_duration_raw.map(|d| d as u32),
                 thinking_signature,
                 knowledge_proposal,
+                render_parts,
             });
         }
         Ok(messages)
@@ -2507,6 +2985,74 @@ mod tests {
         assert!(SessionStore::table_has_column(&conn, "messages", "include_in_prompt").unwrap());
         assert!(table_exists(&conn, "session_runs"));
         assert!(table_exists(&conn, "session_events"));
+    }
+
+    #[test]
+    fn v15_database_migrates_message_render_orders() {
+        let dir = tempdir().expect("create temp dir");
+        let db_path = dir.path().join("locus.db");
+        let conn = Connection::open(&db_path).expect("create db");
+        SessionStore::create_latest_schema(&conn).expect("create schema");
+
+        conn.execute(
+            "INSERT INTO sessions (id, title, session_type, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params!["s1", "Render Order", "chat", 10, 10],
+        )
+        .expect("insert session");
+        let tool_calls_json = serde_json::to_string(&vec![ToolCallInfo {
+            id: "tc-1".to_string(),
+            name: "ask_user_question".to_string(),
+            arguments: "{}".to_string(),
+            order: None,
+            server_tool: None,
+            server_tool_output: None,
+            outcome: None,
+            recorded_output: None,
+            nested_tool_calls: None,
+        }])
+        .expect("serialize tool calls");
+        conn.execute(
+            "INSERT INTO messages (
+                id, session_id, role, content, created_at, tool_calls,
+                thinking_content, include_in_prompt
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1)",
+            params![
+                "m1",
+                "s1",
+                "assistant",
+                "https://x.com/",
+                11,
+                tool_calls_json,
+                "thinking"
+            ],
+        )
+        .expect("insert message");
+        conn.pragma_update(None, "user_version", 15)
+            .expect("set legacy version");
+        drop(conn);
+
+        let store = SessionStore::new(dir.path()).expect("migrate store");
+        let detail = store.load_session("s1").expect("load session");
+        let message = detail.messages.first().expect("migrated message");
+
+        assert_eq!(message.thinking_order, Some(1));
+        assert_eq!(message.content_order, Some(2));
+        assert_eq!(
+            message
+                .tool_calls
+                .as_ref()
+                .and_then(|tool_calls| tool_calls.first())
+                .and_then(|tool_call| tool_call.order),
+            Some(3)
+        );
+
+        let version: i32 = Connection::open(&db_path)
+            .expect("open migrated db")
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read schema version");
+        assert_eq!(version, SessionStore::SCHEMA_VERSION);
     }
 
     #[test]
@@ -2970,6 +3516,7 @@ mod tests {
             id: "tc-1".to_string(),
             name: "read".to_string(),
             arguments: "{}".to_string(),
+            order: None,
             server_tool: None,
             server_tool_output: None,
             outcome: None,
@@ -3228,6 +3775,7 @@ mod tests {
             id: "tc-large".to_string(),
             name: "bash".to_string(),
             arguments: "{}".to_string(),
+            order: None,
             server_tool: None,
             server_tool_output: None,
             outcome: None,
@@ -3373,6 +3921,56 @@ mod tests {
             store.session_id_for_run("run-1").expect("query run owner"),
             Some(session_id)
         );
+    }
+
+    #[test]
+    fn active_descendant_runs_returns_active_child_tree_runs() {
+        let dir = tempdir().expect("create temp dir");
+        let store = SessionStore::new(dir.path()).expect("initialize store");
+        let parent_id = store
+            .create_session("Parent", None, None, "chat", None)
+            .expect("create parent");
+        let child_id = store
+            .create_session("Child", Some(&parent_id), None, "chat", None)
+            .expect("create child");
+        let grandchild_id = store
+            .create_session("Grandchild", Some(&child_id), None, "chat", None)
+            .expect("create grandchild");
+        let sibling_id = store
+            .create_session("Sibling", Some(&parent_id), None, "chat", None)
+            .expect("create sibling");
+        let unrelated_id = store
+            .create_session("Unrelated", None, None, "chat", None)
+            .expect("create unrelated");
+
+        store
+            .try_start_run(&parent_id, "run-parent")
+            .expect("start parent run");
+        store
+            .try_start_run(&child_id, "run-child")
+            .expect("start child run");
+        store
+            .try_start_run(&grandchild_id, "run-grandchild")
+            .expect("start grandchild run");
+        store
+            .try_start_run(&sibling_id, "run-sibling")
+            .expect("start sibling run");
+        store
+            .update_run_status("run-sibling", "done", None)
+            .expect("finish sibling run");
+        store
+            .try_start_run(&unrelated_id, "run-unrelated")
+            .expect("start unrelated run");
+
+        let mut runs = store
+            .active_descendant_runs(&parent_id)
+            .expect("query active descendants")
+            .into_iter()
+            .map(|run| run.run_id)
+            .collect::<Vec<_>>();
+        runs.sort();
+
+        assert_eq!(runs, vec!["run-child", "run-grandchild"]);
     }
 
     #[test]
@@ -3592,6 +4190,8 @@ mod tests {
             prompt_prefix: None,
             prompt_suffix: None,
             response_id: None,
+            content_order: None,
+            thinking_order: None,
             tool_calls: None,
             tool_call_id: None,
             images: None,
@@ -3599,6 +4199,7 @@ mod tests {
             thinking_duration: None,
             thinking_signature: None,
             knowledge_proposal: None,
+            render_parts: None,
         };
 
         let (count_before, count_after) = store
@@ -3690,6 +4291,8 @@ mod tests {
             prompt_prefix: None,
             prompt_suffix: None,
             response_id: None,
+            content_order: None,
+            thinking_order: None,
             tool_calls: None,
             tool_call_id: None,
             images: None,
@@ -3697,6 +4300,7 @@ mod tests {
             thinking_duration: None,
             thinking_signature: None,
             knowledge_proposal: None,
+            render_parts: None,
         };
 
         let (count_before, count_after) = store
@@ -3762,6 +4366,8 @@ mod tests {
             prompt_prefix: None,
             prompt_suffix: None,
             response_id: None,
+            content_order: None,
+            thinking_order: None,
             tool_calls: None,
             tool_call_id: None,
             images: None,
@@ -3769,6 +4375,7 @@ mod tests {
             thinking_duration: None,
             thinking_signature: None,
             knowledge_proposal: None,
+            render_parts: None,
         };
         store
             .compact_messages(&session_id, &first_handoff, "user-2")
@@ -3797,6 +4404,8 @@ mod tests {
             prompt_prefix: None,
             prompt_suffix: None,
             response_id: None,
+            content_order: None,
+            thinking_order: None,
             tool_calls: None,
             tool_call_id: None,
             images: None,
@@ -3804,6 +4413,7 @@ mod tests {
             thinking_duration: None,
             thinking_signature: None,
             knowledge_proposal: None,
+            render_parts: None,
         };
         store
             .compact_messages(&session_id, &second_handoff, "user-3")
@@ -3823,5 +4433,102 @@ mod tests {
         assert!(prompt_ids.contains(&"user-2"));
         assert!(prompt_ids.contains(&"user-3"));
         assert!(!prompt_ids.contains(&"assistant-2"));
+    }
+
+    #[test]
+    fn compact_messages_replaces_previous_handoff_when_boundary_is_handoff() {
+        let dir = tempdir().expect("create temp dir");
+        let store = SessionStore::new(dir.path()).expect("initialize store");
+        let session_id = store
+            .create_session("Compact Handoff Boundary Test", None, None, "chat", None)
+            .expect("create session");
+
+        {
+            let conn = store.conn.lock().expect("lock store connection");
+            for (id, role, content, created_at) in [
+                ("user-1", "user", "第一轮需求", 100i64),
+                ("assistant-1", "assistant", "第一轮回答", 101i64),
+                ("user-2", "user", "第二轮需求", 102i64),
+                ("assistant-2", "assistant", "第二轮回答", 103i64),
+            ] {
+                conn.execute(
+                    "INSERT INTO messages (id, session_id, role, content, created_at, prompt_prefix, prompt_suffix, tool_calls, tool_call_id, images, thinking_content, thinking_duration, thinking_signature, metadata_json)
+                     VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)",
+                    params![id, session_id, role, content, created_at],
+                )
+                .expect("insert message");
+            }
+        }
+
+        let first_handoff = ChatMessage {
+            id: "handoff-1".to_string(),
+            role: MessageRole::Assistant,
+            content: "## Context Handoff\n\n第一次交接".to_string(),
+            created_at: 101,
+            prompt_prefix: None,
+            prompt_suffix: None,
+            response_id: None,
+            content_order: None,
+            thinking_order: None,
+            tool_calls: None,
+            tool_call_id: None,
+            images: None,
+            thinking_content: None,
+            thinking_duration: None,
+            thinking_signature: None,
+            knowledge_proposal: None,
+            render_parts: None,
+        };
+        store
+            .compact_messages(&session_id, &first_handoff, "user-2")
+            .expect("first compact");
+
+        let second_handoff = ChatMessage {
+            id: "handoff-2".to_string(),
+            role: MessageRole::Assistant,
+            content: "## Context Handoff\n\n第二次交接".to_string(),
+            created_at: 102,
+            prompt_prefix: None,
+            prompt_suffix: None,
+            response_id: None,
+            content_order: None,
+            thinking_order: None,
+            tool_calls: None,
+            tool_call_id: None,
+            images: None,
+            thinking_content: None,
+            thinking_duration: None,
+            thinking_signature: None,
+            knowledge_proposal: None,
+            render_parts: None,
+        };
+        store
+            .compact_messages(&session_id, &second_handoff, "handoff-1")
+            .expect("second compact");
+
+        let all_messages = store.get_messages(&session_id).expect("load all messages");
+        let prompt_messages = store
+            .get_messages_for_prompt(&session_id)
+            .expect("load prompt messages");
+        let all_ids = all_messages
+            .iter()
+            .map(|message| message.id.as_str())
+            .collect::<Vec<_>>();
+        let prompt_ids = prompt_messages
+            .iter()
+            .map(|message| message.id.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(all_ids.contains(&"handoff-1"));
+        assert!(all_ids.contains(&"handoff-2"));
+        assert!(!prompt_ids.contains(&"handoff-1"));
+        assert!(prompt_ids.contains(&"handoff-2"));
+        assert_eq!(
+            prompt_ids
+                .iter()
+                .filter(|id| id.starts_with("handoff-"))
+                .count(),
+            1
+        );
     }
 }

@@ -5,7 +5,7 @@ use tauri::AppHandle;
 
 use super::{
     emit_parent_stream, emit_stream, finalize_tool_call_record, normalize_tool_args, AgentInstance,
-    AssistantStreamState, ExecutedToolResult,
+    AssistantStreamState, ExecutedToolResult, StreamRenderOrderTracker,
 };
 use crate::commands::{StreamEvent, ToolCallOutcome};
 use crate::llm::anthropic_agent_sdk::{
@@ -20,6 +20,10 @@ struct PendingAssistantRound {
     text: String,
     tool_calls: Vec<ToolCallInfo>,
     remaining: HashSet<String>,
+    content_order: Option<u32>,
+    thinking_order: Option<u32>,
+    thinking_text: String,
+    thinking_signature: String,
 }
 
 struct ClaudeSdkRoundHost<'a> {
@@ -35,6 +39,7 @@ struct ClaudeSdkRoundHost<'a> {
     completed_tool_ids: HashSet<String>,
     pending_round: Option<PendingAssistantRound>,
     last_assistant: Option<ClaudeSdkAssistantMessage>,
+    render_order: StreamRenderOrderTracker,
 }
 
 fn save_claude_sdk_tool_result(
@@ -47,7 +52,8 @@ fn save_claude_sdk_tool_result(
 }
 
 impl<'a> ClaudeSdkRoundHost<'a> {
-    fn emit_tool_call_start(&self, tool_call_id: &str, tool_name: &str, arguments: &str) {
+    fn emit_tool_call_start(&mut self, tool_call_id: &str, tool_name: &str, arguments: &str) {
+        let mark = self.render_order.mark_tool(self.run_id, tool_call_id);
         emit_stream(
             self.app_handle,
             self.run_id,
@@ -56,6 +62,9 @@ impl<'a> ClaudeSdkRoundHost<'a> {
                 tool_call_id: tool_call_id.to_string(),
                 tool_name: tool_name.to_string(),
                 arguments: arguments.to_string(),
+                order: Some(mark.seq),
+                part_id: Some(tool_call_id.to_string()),
+                render_seq: Some(mark.seq),
             },
         );
         if let Some(ref parent) = self.agent.parent_tool_call {
@@ -65,6 +74,9 @@ impl<'a> ClaudeSdkRoundHost<'a> {
                     tool_call_id.to_string(),
                     tool_name.to_string(),
                     arguments.to_string(),
+                    Some(mark.seq),
+                    Some(mark.id),
+                    Some(mark.seq),
                 ),
             );
         }
@@ -118,12 +130,29 @@ impl<'a> ClaudeSdkRoundHost<'a> {
         }
 
         if let Some(round) = self.pending_round.take() {
-            if let Err(err) = self
-                .store
-                .update_message_tool_calls(&round.message_id, &round.tool_calls)
-            {
+            let render_parts = super::assistant_render_parts_for_response(
+                self.run_id,
+                round.content_order.map(|seq| super::RenderPartMark {
+                    id: format!("{}:text:claude-sdk-round", self.run_id),
+                    seq,
+                }),
+                &round.text,
+                round.thinking_order.map(|seq| super::RenderPartMark {
+                    id: format!("{}:thinking:claude-sdk-round", self.run_id),
+                    seq,
+                }),
+                &round.thinking_text,
+                None,
+                (!round.thinking_signature.is_empty()).then_some(round.thinking_signature.as_str()),
+                &round.tool_calls,
+            );
+            if let Err(err) = self.store.update_message_tool_calls_and_render_parts(
+                &round.message_id,
+                &round.tool_calls,
+                &render_parts,
+            ) {
                 eprintln!(
-                    "[Agent {}] failed to update Claude SDK tool_calls for message {}: {}",
+                    "[Agent {}] failed to update Claude SDK tool_calls/render_parts for message {}: {}",
                     self.agent.id, round.message_id, err
                 );
             }
@@ -135,6 +164,9 @@ impl<'a> ClaudeSdkRoundHost<'a> {
                     message_id: round.message_id,
                     full_text: round.text,
                     tool_calls: round.tool_calls,
+                    content_order: round.content_order,
+                    thinking_order: round.thinking_order,
+                    render_parts: Some(render_parts),
                 },
             );
             self.partial_assistant.reset();
@@ -165,6 +197,7 @@ impl<'a> ClaudeSdkRoundHost<'a> {
                     outcome: None,
                     recorded_output: None,
                     nested_tool_calls: None,
+                    order: None,
                 });
         }
 
@@ -185,6 +218,7 @@ impl<'a> ClaudeSdkRoundHost<'a> {
                     outcome: None,
                     recorded_output: None,
                     nested_tool_calls: None,
+                    order: None,
                 });
         }
 
@@ -203,6 +237,7 @@ impl<'a> ClaudeSdkRoundHost<'a> {
                     outcome: None,
                     recorded_output: None,
                     nested_tool_calls: None,
+                    order: None,
                 };
             }
         }
@@ -216,12 +251,16 @@ impl<'a> ClaudeSdkRoundHost<'a> {
             outcome: None,
             recorded_output: None,
             nested_tool_calls: None,
+            order: None,
         }
     }
 }
 
 impl<'a> ClaudeSdkHost for ClaudeSdkRoundHost<'a> {
     fn on_text_delta(&mut self, delta: String) {
+        let mark = self
+            .render_order
+            .mark_text(self.run_id, "claude-sdk-stream-text");
         self.streamed_text.push_str(&delta);
         self.partial_assistant.append_text(&delta);
         emit_stream(
@@ -230,6 +269,9 @@ impl<'a> ClaudeSdkHost for ClaudeSdkRoundHost<'a> {
             StreamEvent::TextDelta {
                 session_id: self.agent.session_id.clone(),
                 text: delta.clone(),
+                order: Some(mark.seq),
+                part_id: Some(mark.id),
+                render_seq: Some(mark.seq),
             },
         );
         if let Some(ref parent) = self.agent.parent_tool_call {
@@ -238,6 +280,9 @@ impl<'a> ClaudeSdkHost for ClaudeSdkRoundHost<'a> {
     }
 
     fn on_thinking_delta(&mut self, delta: String) {
+        let mark = self
+            .render_order
+            .mark_thinking(self.run_id, "claude-sdk-stream-thinking");
         self.partial_assistant.append_thinking(&delta);
         emit_stream(
             self.app_handle,
@@ -245,6 +290,9 @@ impl<'a> ClaudeSdkHost for ClaudeSdkRoundHost<'a> {
             StreamEvent::ThinkingDelta {
                 session_id: self.agent.session_id.clone(),
                 text: delta,
+                order: Some(mark.seq),
+                part_id: Some(mark.id),
+                render_seq: Some(mark.seq),
             },
         );
     }
@@ -269,7 +317,31 @@ impl<'a> ClaudeSdkHost for ClaudeSdkRoundHost<'a> {
             }
         }
 
-        for tool_call in &message.tool_calls {
+        let text_part = (!message.text.is_empty()).then(|| {
+            self.render_order
+                .mark_text(self.run_id, "claude-sdk-round-text")
+        });
+        let thinking_part = (!message.thinking_text.is_empty()).then(|| {
+            self.render_order
+                .mark_thinking(self.run_id, "claude-sdk-round-thinking")
+        });
+        let content_order = text_part.as_ref().map(|part| part.seq);
+        let thinking_order = thinking_part.as_ref().map(|part| part.seq);
+        let ordered_tool_calls = self
+            .render_order
+            .assign_tool_orders_for_run(self.run_id, &message.tool_calls);
+        let render_parts = super::assistant_render_parts_for_response(
+            self.run_id,
+            text_part,
+            &message.text,
+            thinking_part,
+            &message.thinking_text,
+            None,
+            (!message.thinking_signature.is_empty()).then_some(message.thinking_signature.as_str()),
+            &ordered_tool_calls,
+        );
+
+        for tool_call in &ordered_tool_calls {
             self.emit_tool_call_start(&tool_call.id, &tool_call.name, &tool_call.arguments);
             self.started_tool_calls
                 .retain(|(id, _)| id != &tool_call.id);
@@ -290,15 +362,18 @@ impl<'a> ClaudeSdkHost for ClaudeSdkRoundHost<'a> {
         } else {
             Some(message.thinking_signature.as_str())
         };
-        let message_id = self.store.add_assistant_with_tool_calls_and_thinking(
+        let message_id = self.store.add_assistant_with_tool_calls_and_render_parts(
             &self.agent.session_id,
             &message.text,
-            &message.tool_calls,
+            &ordered_tool_calls,
             thinking_text,
             None,
             thinking_signature,
             None,
             None,
+            content_order,
+            thinking_order,
+            &render_parts,
         )?;
         self.partial_assistant.mark_persisted(
             message_id.clone(),
@@ -307,8 +382,7 @@ impl<'a> ClaudeSdkHost for ClaudeSdkRoundHost<'a> {
             None,
         );
 
-        let remaining: HashSet<String> = message
-            .tool_calls
+        let remaining: HashSet<String> = ordered_tool_calls
             .iter()
             .filter(|tc| !self.completed_tool_ids.contains(&tc.id))
             .map(|tc| tc.id.clone())
@@ -317,8 +391,12 @@ impl<'a> ClaudeSdkHost for ClaudeSdkRoundHost<'a> {
         self.pending_round = Some(PendingAssistantRound {
             message_id,
             text: message.text,
-            tool_calls: message.tool_calls,
+            tool_calls: ordered_tool_calls,
             remaining,
+            content_order,
+            thinking_order,
+            thinking_text: message.thinking_text,
+            thinking_signature: message.thinking_signature,
         });
         self.streamed_text.clear();
         self.maybe_finish_pending_round();
@@ -441,6 +519,7 @@ impl AgentInstance {
             completed_tool_ids: HashSet::new(),
             pending_round: None,
             last_assistant: None,
+            render_order: StreamRenderOrderTracker::default(),
         };
 
         let turn = anthropic_agent_sdk::run_turn(
@@ -565,6 +644,9 @@ impl AgentInstance {
         };
 
         let mut done_message_id = String::new();
+        let mut done_content_order = None;
+        let mut done_thinking_order = None;
+        let mut done_render_parts = Vec::new();
         if !final_text.is_empty() {
             let thinking_text = final_snapshot.as_ref().and_then(|snapshot| {
                 (!snapshot.thinking_text.is_empty()).then_some(snapshot.thinking_text.as_str())
@@ -573,7 +655,24 @@ impl AgentInstance {
                 (!snapshot.thinking_signature.is_empty())
                     .then_some(snapshot.thinking_signature.as_str())
             });
-            done_message_id = store.add_message_with_thinking(
+            let text_part = host.render_order.mark_text(run_id, "claude-sdk-final-text");
+            let thinking_part = thinking_text.map(|_| {
+                host.render_order
+                    .mark_thinking(run_id, "claude-sdk-final-thinking")
+            });
+            done_content_order = Some(text_part.seq);
+            done_thinking_order = thinking_part.as_ref().map(|part| part.seq);
+            done_render_parts = super::assistant_render_parts_for_response(
+                run_id,
+                Some(text_part),
+                &final_text,
+                thinking_part,
+                thinking_text.unwrap_or_default(),
+                None,
+                thinking_signature,
+                &[],
+            );
+            done_message_id = store.add_message_with_thinking_and_render_parts(
                 &self.session_id,
                 MessageRole::Assistant,
                 &final_text,
@@ -582,6 +681,9 @@ impl AgentInstance {
                 thinking_signature,
                 None,
                 None,
+                done_content_order,
+                done_thinking_order,
+                &done_render_parts,
             )?;
             self.partial_assistant.mark_persisted(
                 done_message_id.clone(),
@@ -615,6 +717,9 @@ impl AgentInstance {
                 session_id: self.session_id.clone(),
                 message_id: done_message_id,
                 full_text: final_text.clone(),
+                content_order: done_content_order,
+                thinking_order: done_thinking_order,
+                render_parts: (!done_render_parts.is_empty()).then_some(done_render_parts),
             },
         );
         self.partial_assistant.reset();

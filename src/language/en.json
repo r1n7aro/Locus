@@ -411,6 +411,7 @@
   "chat.transcript.thoughtDuration": "Thought for {0}s",
   "chat.transcript.thoughtMoment": "Thought for a moment",
   "chat.transcript.handoff": "Handoff",
+  "chat.transcript.compacting": "Compacting context…",
   "unityEmbed.chat.emptyTitle": "New session",
   "unityEmbed.chat.emptyHint": "Enter a task and Locus will work in the current Unity project.",
   "unityEmbed.chat.user": "You",

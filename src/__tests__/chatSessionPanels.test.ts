@@ -724,10 +724,10 @@ describe("chat session panel state", () => {
     const assistantMessages = chatStore.messages.filter((message) => message.role === "assistant");
     expect(assistantMessages).toHaveLength(1);
     expect(assistantMessages[0]?.id).toBe("msg-round");
-    expect(chatStore.activeToolCalls).toHaveLength(2);
-    expect(chatStore.activeToolCalls.map((toolCall) => toolCall.id)).toEqual(["tc-old", "tc-current"]);
-    expect(chatStore.activeToolCalls[0]?.status).toBe("done");
-    expect(chatStore.activeToolCalls[1]?.status).toBe("running");
+    expect(assistantMessages[0]?.renderParts?.some((part) => part.kind === "toolCall" && part.id === "tc-old")).toBe(true);
+    expect(chatStore.activeToolCalls).toHaveLength(1);
+    expect(chatStore.activeToolCalls.map((toolCall) => toolCall.id)).toEqual(["tc-current"]);
+    expect(chatStore.activeToolCalls[0]?.status).toBe("running");
   });
 
   it("replaces a loaded assistant tool round when the live round-done event arrives", async () => {

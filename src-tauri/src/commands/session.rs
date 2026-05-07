@@ -1186,6 +1186,143 @@ pub async fn get_todos(
     store.get_todos(&session_id).map_err(Into::into)
 }
 
+fn emit_cancelled_session_run(
+    app_handle: &AppHandle,
+    store: &SessionStore,
+    session_id: String,
+    run_id: String,
+    interrupted: Option<crate::agent::instance::InterruptedAssistantMessage>,
+) {
+    emit_session_stream_with_run_id(
+        app_handle,
+        store,
+        run_id,
+        StreamEvent::Cancelled {
+            session_id,
+            message_id: interrupted
+                .as_ref()
+                .map(|message| message.message_id.clone()),
+            full_text: interrupted
+                .as_ref()
+                .map(|message| message.full_text.clone()),
+            thinking_content: interrupted
+                .as_ref()
+                .and_then(|message| message.thinking_content.clone()),
+            thinking_duration: interrupted.and_then(|message| message.thinking_duration),
+            render_parts: None,
+        },
+    );
+}
+
+async fn request_descendant_cancellations(
+    root_session_id: &str,
+    store: &SessionStore,
+    active_tasks: &ActiveTasks,
+) {
+    let descendant_runs = match store.active_descendant_runs(root_session_id) {
+        Ok(runs) => runs,
+        Err(error) => {
+            eprintln!(
+                "[Locus] failed to query active descendant runs for session {}: {}",
+                root_session_id, error
+            );
+            return;
+        }
+    };
+
+    if descendant_runs.is_empty() {
+        return;
+    }
+
+    let run_by_session: HashMap<String, String> = descendant_runs
+        .iter()
+        .map(|run| (run.session_id.clone(), run.run_id.clone()))
+        .collect();
+
+    for run in &descendant_runs {
+        if let Err(error) = store.update_run_status(
+            &run.run_id,
+            crate::session::gateway::RUN_STATUS_CANCELLING,
+            None,
+        ) {
+            eprintln!(
+                "[Locus] failed to mark descendant session {} run {} as cancelling: {}",
+                run.session_id, run.run_id, error
+            );
+        }
+    }
+
+    let tasks = active_tasks.lock().await;
+    for (session_id, run_id) in run_by_session {
+        if let Some(task) = tasks.get(&session_id) {
+            if task.run_id == run_id {
+                let _ = task.cancel_tx.send(true);
+            }
+        }
+    }
+}
+
+async fn finish_cancelled_descendant_runs(
+    root_session_id: &str,
+    app_handle: &AppHandle,
+    store: &SessionStore,
+    active_tasks: &ActiveTasks,
+) {
+    let descendant_runs = match store.active_descendant_runs(root_session_id) {
+        Ok(runs) => runs,
+        Err(error) => {
+            eprintln!(
+                "[Locus] failed to query active descendant runs for session {} during cancellation finish: {}",
+                root_session_id, error
+            );
+            return;
+        }
+    };
+
+    if descendant_runs.is_empty() {
+        return;
+    }
+
+    let mut removed_tasks = Vec::new();
+    {
+        let mut tasks = active_tasks.lock().await;
+        for run in &descendant_runs {
+            let remove = tasks
+                .get(&run.session_id)
+                .map(|task| task.run_id == run.run_id)
+                .unwrap_or(false);
+            if remove {
+                if let Some(task) = tasks.remove(&run.session_id) {
+                    removed_tasks.push((run.session_id.clone(), run.run_id.clone(), task));
+                }
+            }
+        }
+    }
+
+    let mut interrupted_by_run = HashMap::new();
+    for (session_id, run_id, task) in removed_tasks {
+        let interrupted = AgentInstance::persist_interrupted_assistant_snapshot(
+            store,
+            &session_id,
+            &task.partial_assistant.snapshot(),
+        );
+        task.partial_assistant.reset();
+        task.join_handle.abort();
+        crate::llm::codex::reset_cached_session_window(&session_id).await;
+        interrupted_by_run.insert(run_id, interrupted);
+    }
+
+    for run in descendant_runs {
+        let interrupted = interrupted_by_run.remove(&run.run_id).flatten();
+        eprintln!(
+            "[Locus] emitting descendant cancellation for session {} run {} under parent {}",
+            run.session_id, run.run_id, root_session_id
+        );
+        crate::llm::codex::reset_cached_session_window(&run.session_id).await;
+        emit_cancelled_session_run(app_handle, store, run.session_id, run.run_id, interrupted);
+    }
+}
+
 #[tauri::command]
 pub async fn cancel_chat(
     session_id: String,
@@ -1202,12 +1339,29 @@ pub async fn cancel_chat(
     };
 
     let Some((run_id, mut done_rx)) = graceful_wait else {
+        finish_cancelled_descendant_runs(
+            &session_id,
+            &app_handle,
+            store.inner().as_ref(),
+            active_tasks.inner(),
+        )
+        .await;
         return Ok(());
     };
 
     if *done_rx.borrow() {
+        finish_cancelled_descendant_runs(
+            &session_id,
+            &app_handle,
+            store.inner().as_ref(),
+            active_tasks.inner(),
+        )
+        .await;
         return Ok(());
     }
+
+    request_descendant_cancellations(&session_id, store.inner().as_ref(), active_tasks.inner())
+        .await;
 
     if let Err(error) = store.update_run_status(
         &run_id,
@@ -1233,6 +1387,13 @@ pub async fn cancel_chat(
             "[Locus] cancellation finished gracefully for session {}",
             session_id
         );
+        finish_cancelled_descendant_runs(
+            &session_id,
+            &app_handle,
+            store.inner().as_ref(),
+            active_tasks.inner(),
+        )
+        .await;
         return Ok(());
     }
 
@@ -1250,25 +1411,22 @@ pub async fn cancel_chat(
             session_id
         );
         crate::llm::codex::reset_cached_session_window(&session_id).await;
-        emit_session_stream_with_run_id(
+        emit_cancelled_session_run(
             &app_handle,
             store.inner().as_ref(),
+            session_id.clone(),
             run_id,
-            StreamEvent::Cancelled {
-                session_id,
-                message_id: interrupted
-                    .as_ref()
-                    .map(|message| message.message_id.clone()),
-                full_text: interrupted
-                    .as_ref()
-                    .map(|message| message.full_text.clone()),
-                thinking_content: interrupted
-                    .as_ref()
-                    .and_then(|message| message.thinking_content.clone()),
-                thinking_duration: interrupted.and_then(|message| message.thinking_duration),
-            },
+            interrupted,
         );
     }
+
+    finish_cancelled_descendant_runs(
+        &session_id,
+        &app_handle,
+        store.inner().as_ref(),
+        active_tasks.inner(),
+    )
+    .await;
 
     Ok(())
 }
@@ -1715,6 +1873,7 @@ fn export_tool_call(tool_call: &crate::session::models::ToolCallInfo) -> serde_j
         "id": tool_call.id,
         "name": tool_call.name,
         "arguments": tool_call.arguments,
+        "order": export_optional_u32(tool_call.order),
         "serverTool": export_optional_server_tool(tool_call.server_tool.as_ref()),
         "serverToolOutput": export_optional_text(tool_call.server_tool_output.as_deref()),
         "outcome": export_optional_tool_outcome(tool_call.outcome),
@@ -1895,6 +2054,13 @@ migration is written as `empty`.\n\n",
             "promptPrefix": export_optional_text(message.prompt_prefix.as_deref()),
             "promptSuffix": export_optional_text(message.prompt_suffix.as_deref()),
             "responseId": export_optional_text(message.response_id.as_deref()),
+            "contentOrder": export_optional_u32(message.content_order),
+            "thinkingOrder": export_optional_u32(message.thinking_order),
+            "renderParts": message
+                .render_parts
+                .as_ref()
+                .map(|parts| json!(parts))
+                .unwrap_or_else(|| json!(EMPTY_EXPORT_FIELD)),
             "toolCalls": export_tool_calls(message.tool_calls.as_deref()),
             "toolCallId": export_optional_text(message.tool_call_id.as_deref()),
             "images": export_images(message.images.as_deref()),
@@ -2599,6 +2765,8 @@ mod tests {
                 prompt_prefix: None,
                 prompt_suffix: None,
                 response_id: None,
+                content_order: None,
+                thinking_order: None,
                 tool_calls: None,
                 tool_call_id: None,
                 images: None,
@@ -2606,6 +2774,7 @@ mod tests {
                 thinking_duration: None,
                 thinking_signature: None,
                 knowledge_proposal: None,
+                render_parts: None,
             }],
         };
 
@@ -2618,6 +2787,8 @@ mod tests {
         assert!(markdown.contains("\"promptPrefix\": \"empty\""));
         assert!(markdown.contains("\"promptSuffix\": \"empty\""));
         assert!(markdown.contains("\"responseId\": \"empty\""));
+        assert!(markdown.contains("\"contentOrder\": \"empty\""));
+        assert!(markdown.contains("\"thinkingOrder\": \"empty\""));
         assert!(markdown.contains("\"toolCalls\": \"empty\""));
         assert!(markdown.contains("\"toolCallId\": \"empty\""));
         assert!(markdown.contains("\"images\": \"empty\""));
@@ -2646,10 +2817,13 @@ mod tests {
                 prompt_prefix: None,
                 prompt_suffix: None,
                 response_id: None,
+                content_order: None,
+                thinking_order: None,
                 tool_calls: Some(vec![ToolCallInfo {
                     id: "tc-1".to_string(),
                     name: "read".to_string(),
                     arguments: "{}".to_string(),
+                    order: None,
                     server_tool: None,
                     server_tool_output: None,
                     outcome: None,
@@ -2662,12 +2836,14 @@ mod tests {
                 thinking_duration: None,
                 thinking_signature: None,
                 knowledge_proposal: None,
+                render_parts: None,
             }],
         };
 
         let markdown = format_session_detail_as_markdown(&detail, &[], None, None, true, None);
 
         assert!(markdown.contains("\"serverTool\": \"empty\""));
+        assert!(markdown.contains("\"order\": \"empty\""));
         assert!(markdown.contains("\"serverToolOutput\": \"empty\""));
         assert!(markdown.contains("\"outcome\": \"empty\""));
         assert!(markdown.contains("\"recordedOutput\": \"empty\""));

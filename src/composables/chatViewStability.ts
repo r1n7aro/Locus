@@ -1,5 +1,7 @@
-import type { ChatMessage } from "../types";
+import type { ChatMessage, ToolCallDisplay } from "../types";
 import { isNearBottom, type ScrollMetrics, type SessionScrollState } from "./chatScrollState";
+
+type ToolCallRuntimeStatus = Pick<ToolCallDisplay, "status" | "nestedToolCalls">;
 
 export function shouldShowAssistantContinuation(
   lastGroupRole: "user" | "assistant" | null,
@@ -89,6 +91,13 @@ export function shouldShowWaitingPlaceholder(params: {
     && !hasStreamingContent
     && !isThinking
     && !hasThinkingContent
+  );
+}
+
+export function hasRunningToolCall(toolCalls: ToolCallRuntimeStatus[]): boolean {
+  return toolCalls.some((toolCall) =>
+    toolCall.status === "running"
+    || hasRunningToolCall(toolCall.nestedToolCalls ?? []),
   );
 }
 

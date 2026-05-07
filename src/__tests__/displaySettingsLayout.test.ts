@@ -145,8 +145,11 @@ describe("display settings transcript alignment", () => {
     expect(transcript).toContain("function shouldHideThinkingBlocks()");
     expect(transcript).toContain("return displaySettings.hideThinkingBlocks !== false;");
     expect(transcript).toContain("return !shouldHideThinkingBlocks() && !!item.message.thinkingContent?.trim();");
-    expect(transcript).toContain("const hasVisibleCompletedThinkingContent = computed(() => !shouldHideThinkingBlocks() && hasThinkingContent.value);");
-    expect(transcript).toContain("const hasVisibleTransientThinkingBlock = computed(() => props.isThinking || hasVisibleCompletedThinkingContent.value);");
+    expect(transcript).toContain("const hasVisibleCompletedThinkingContent = computed(() =>");
+    expect(transcript).toContain("&& canonicalLiveRenderParts.value.some((part) =>");
+    expect(transcript).toContain("const hasVisibleActiveThinkingBlock = computed(() =>");
+    expect(transcript).toContain("part.kind === \"thinking\" && part.active");
+    expect(transcript).toContain("hasVisibleActiveThinkingBlock.value || hasVisibleCompletedThinkingContent.value");
     expect(transcript).toContain("hasThinkingContent: hasVisibleCompletedThinkingContent.value,");
 
     expect(zh).toContain('"settings.display.hideThinkingBlocks": "隐藏已完成思考块"');

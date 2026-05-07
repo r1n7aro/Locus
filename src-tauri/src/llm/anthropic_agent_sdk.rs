@@ -643,6 +643,7 @@ fn parse_assistant_message(message: &serde_json::Value) -> Option<ClaudeSdkAssis
                                 id,
                                 name,
                                 arguments,
+                                order: None,
                                 server_tool: None,
                                 server_tool_output: None,
                                 outcome: None,
