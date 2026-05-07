@@ -519,22 +519,26 @@ fn do_replace(
     }
 
     fn check_unique(content: &str, matched: &str) -> Result<usize, String> {
-        let first = match content.find(matched) {
-            Some(pos) => pos,
-            None => {
-                return Err(
-                    "Internal error: fuzzy match could not be located in content.".to_string(),
-                )
+        let positions: Vec<usize> = content.match_indices(matched).map(|(pos, _)| pos).collect();
+        match positions.as_slice() {
+            [] => Err("Internal error: fuzzy match could not be located in content.".to_string()),
+            [first] => Ok(*first),
+            _ => {
+                let display_limit = 20;
+                let mut line_numbers: Vec<String> = positions
+                    .iter()
+                    .take(display_limit)
+                    .map(|pos| line_number_at_offset(content, *pos).to_string())
+                    .collect();
+                if positions.len() > display_limit {
+                    line_numbers.push("...".to_string());
+                }
+                Err(format!(
+                    "Found multiple matches for oldString at lines: {}. Provide more surrounding context to make it unique.",
+                    line_numbers.join(", ")
+                ))
             }
-        };
-        let last = content.rfind(matched).unwrap_or(first);
-        if first != last {
-            return Err(
-                "Found multiple matches for oldString. Provide more surrounding context to make it unique."
-                    .to_string(),
-            );
         }
-        Ok(first)
     }
 
     if content.contains(old_string) {
@@ -1057,6 +1061,39 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&target).expect("read edited file"),
             "class Player\r\n{\r\n    void Fire()\r\n    {\r\n        Shoot();\r\n        Reload();\r\n    }\r\n}\r\n"
+        );
+    }
+
+    #[test]
+    fn edit_reports_line_numbers_for_multiple_old_string_matches() {
+        let root = tempdir().expect("temp dir");
+        let target = root.path().join("player.cs");
+        let original = "class Player\n{\n    return;\n    Tick();\n    return;\n}\n";
+        std::fs::write(&target, original).expect("seed repeated file");
+
+        let result = tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(async {
+                (edit().execute)(
+                    json!({
+                        "filePath": target.to_string_lossy().to_string(),
+                        "oldString": "    return;",
+                        "newString": "    Stop();",
+                        "replaceAll": false
+                    }),
+                    ToolExecutionContext::default(),
+                )
+                .await
+            });
+
+        assert!(result.is_error);
+        assert!(result
+            .output
+            .contains("Found multiple matches for oldString"));
+        assert!(result.output.contains("at lines: 3, 5"));
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("read untouched file"),
+            original
         );
     }
 
