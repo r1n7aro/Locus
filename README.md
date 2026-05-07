@@ -6,8 +6,12 @@
 [![Release](https://img.shields.io/badge/RELEASE-GitHub-5d7285?style=for-the-badge&labelColor=4a4a4a)](https://github.com/r1n7aro/Locus/releases)
 [![License](https://img.shields.io/badge/LICENSE-GPL--3.0--or--later-88b000?style=for-the-badge&labelColor=4a4a4a)](LICENSE)
 [![Roadmap](https://img.shields.io/badge/ROADMAP-View-2d6cdf?style=for-the-badge&labelColor=4a4a4a)](https://unity.farlocus.com/en/overview/roadmap)
+[![YouTube](https://img.shields.io/badge/YOUTUBE-Watch-ff0000?style=for-the-badge&labelColor=4a4a4a)](https://www.youtube.com/watch?v=xoApXZMon9M)
+[![X](https://img.shields.io/badge/X-@farlocus-000000?style=for-the-badge&labelColor=4a4a4a)](https://x.com/farlocus)
 
 English | [简体中文](README.zh-CN.md)
+
+[![Watch the demo on YouTube](https://img.youtube.com/vi/xoApXZMon9M/maxresdefault.jpg)](https://www.youtube.com/watch?v=xoApXZMon9M)
 
 ## Overview
 
