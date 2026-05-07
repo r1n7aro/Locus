@@ -1218,6 +1218,13 @@ fn path_needs_hint(node: &HierarchyNode, path: &str) -> bool {
         .is_some_and(|segment| segment != node.name)
 }
 
+const GO_NAME_OPEN: &str = "⟦";
+const GO_NAME_CLOSE: &str = "⟧";
+
+fn format_go_name(name: &str) -> String {
+    format!("{}{}{}", GO_NAME_OPEN, name, GO_NAME_CLOSE)
+}
+
 fn format_node_label(node: &HierarchyNode, collapsed: bool, path: Option<&str>) -> String {
     let name = if collapsed {
         normalize_instance_name(&node.name)
@@ -1226,7 +1233,7 @@ fn format_node_label(node: &HierarchyNode, collapsed: bool, path: Option<&str>) 
     };
     let mut base = format!(
         "{}{}{}",
-        name,
+        format_go_name(name),
         format_component_suffix(node),
         format_go_annotations(node)
     );
@@ -1732,11 +1739,13 @@ pub fn format_scene_summary_with_options(
 
     if !irs.is_empty() {
         out.push_str("\nDrill down with object_path:\n");
+        out.push_str("- Names are displayed as ⟦Name⟧; omit ⟦⟧ in object_path\n");
         out.push_str("- Use paths from the hierarchy or Instances lines for object_path\n");
         out.push_str("- PrefabInstance targets return structured override detail\n");
     }
     if irs.is_empty() {
         out.push_str("\nDrill down with object_path:\n");
+        out.push_str("- Names are displayed as ⟦Name⟧; omit ⟦⟧ in object_path\n");
         out.push_str("- Use paths from the hierarchy for object_path\n");
     }
 

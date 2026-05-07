@@ -1179,7 +1179,7 @@ fn test_hierarchy_summary_groups_repeated_with_instances_and_shared_subtree() {
     ];
     let summary = format_hierarchy_summary(&roots);
     assert!(
-        summary.contains("LevelRoom (LevelRoom, Rigidbody2D, BoxCollider2D) ×2"),
+        summary.contains("⟦LevelRoom⟧ (LevelRoom, Rigidbody2D, BoxCollider2D) ×2"),
         "Should group structurally identical rooms: {}",
         summary
     );
@@ -1250,7 +1250,8 @@ fn test_hierarchy_summary_keeps_different_subtrees_unfolded() {
         summary
     );
     assert!(
-        summary.contains("LevelRoom (LevelRoom)") && summary.contains("LevelRoom (1) (LevelRoom)"),
+        summary.contains("⟦LevelRoom⟧ (LevelRoom)")
+            && summary.contains("⟦LevelRoom (1)⟧ (LevelRoom)"),
         "Each distinct room should stay visible: {}",
         summary
     );
@@ -1305,7 +1306,7 @@ fn test_hierarchy_summary_filters_by_query_with_ancestor_context() {
         summary
     );
     assert!(
-        summary.contains("StreetLight_A (Light)"),
+        summary.contains("⟦StreetLight_A⟧ (Light)"),
         "matching node should remain: {}",
         summary
     );
@@ -1323,7 +1324,7 @@ fn test_hierarchy_summary_filters_by_query_with_ancestor_context() {
         },
     );
     assert!(
-        regex_summary.contains("StreetLight_A (Light)"),
+        regex_summary.contains("⟦StreetLight_A⟧ (Light)"),
         "regex query should match hierarchy nodes: {}",
         regex_summary
     );
@@ -1466,17 +1467,17 @@ fn test_hierarchy_summary_uses_tree_guides_without_dropping_labels() {
         format_hierarchy_summary_with_options(&roots, &HierarchySummaryOptions::default());
 
     assert!(
-        summary.contains("E0002美术\n└─ 场景模型"),
+        summary.contains("⟦E0002美术⟧\n└─ ⟦场景模型⟧"),
         "root child should use a tree guide: {}",
         summary
     );
     assert!(
-        summary.contains("   ├─ 路灯 (Light)"),
+        summary.contains("   ├─ ⟦路灯⟧ (Light)"),
         "component labels should remain after tree prefix: {}",
         summary
     );
     assert!(
-        summary.contains("   └─ 破碎路灯  [Tag:Environment, Layer:Default]"),
+        summary.contains("   └─ ⟦破碎路灯⟧  [Tag:Environment, Layer:Default]"),
         "tag/layer annotations should remain after tree prefix: {}",
         summary
     );
@@ -1529,13 +1530,49 @@ fn test_hierarchy_summary_filters_by_component_and_path_prefix() {
         summary
     );
     assert!(
-        summary.contains("HpText (TextMeshProUGUI)"),
+        summary.contains("⟦HpText⟧ (TextMeshProUGUI)"),
         "component match should remain: {}",
         summary
     );
     assert!(
         !summary.contains("MenuUI"),
         "sibling outside path_prefix should be excluded: {}",
+        summary
+    );
+}
+
+#[test]
+fn test_hierarchy_summary_wraps_game_object_names_without_wrapping_paths() {
+    let roots = vec![
+        HierarchyNode {
+            name: "---------  MANAGERS --------------".to_string(),
+            file_id: 1,
+            is_active: true,
+            ..Default::default()
+        },
+        HierarchyNode {
+            name: "SpawnSystem".to_string(),
+            file_id: 2,
+            components: vec!["SpawnSystem".to_string()],
+            is_active: true,
+            ..Default::default()
+        },
+    ];
+
+    let summary = format_hierarchy_summary(&roots);
+    assert!(
+        summary.contains("⟦---------  MANAGERS --------------⟧"),
+        "divider-style GameObject names should be visibly bounded: {}",
+        summary
+    );
+    assert!(
+        summary.contains("⟦SpawnSystem⟧ (SpawnSystem)"),
+        "regular root GameObject names should use the same boundary: {}",
+        summary
+    );
+    assert!(
+        !summary.contains("---------  MANAGERS --------------/SpawnSystem"),
+        "sibling roots should not be rendered as a parent/child path: {}",
         summary
     );
 }

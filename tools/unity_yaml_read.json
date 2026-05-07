@@ -9,7 +9,7 @@
       },
       "object_path": {
         "type": "string",
-        "description": "Optional hierarchy path to a specific GameObject or PrefabInstance, such as 'Player', 'Environment/Buildings/House01', or a returned duplicate-safe path like 'Root/Enemy[2]'. Use paths returned by unity_yaml_list or unity_yaml_search."
+        "description": "Optional hierarchy path to a specific GameObject or PrefabInstance, such as 'Player', 'Environment/Buildings/House01', or a returned duplicate-safe path like 'Root/Enemy[2]'. Use unwrapped paths from unity_yaml_list or unity_yaml_search. If unity_yaml_list displays a name as `⟦Name⟧`, omit the `⟦` and `⟧` markers in object_path."
       },
       "detail": {
         "type": "string",

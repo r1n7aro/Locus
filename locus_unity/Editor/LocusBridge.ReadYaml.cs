@@ -584,6 +584,7 @@ namespace Locus
             sb.AppendLine("Drill down with object_path:");
             sb.AppendLine("- \"ObjectName\" → GameObject components detail");
             sb.AppendLine("- \"Parent/Child\" → nested GameObject components");
+            sb.AppendLine("- Names are displayed as ⟦Name⟧; omit ⟦⟧ in object_path");
             sb.AppendLine("- Use paths from the hierarchy or \"Instances\" lines for object_path");
 
             return sb.ToString();
@@ -1366,12 +1367,17 @@ namespace Locus
         {
             string prefix = (!collapsed && node.IsPrefabRoot) ? "[P] " : "";
             string name = collapsed ? node.NormalizedName : node.Name;
-            string suffix = prefix + name + node.ComponentSuffix + node.Annotations;
+            string suffix = prefix + FormatGameObjectName(name) + node.ComponentSuffix + node.Annotations;
             if (!collapsed && PathNeedsHint(node))
                 suffix += "  {object_path: " + node.Path + "}";
             if (node.BoneFolded)
                 suffix += " [" + node.BoneDescCount + " bones]";
             return suffix;
+        }
+
+        private static string FormatGameObjectName(string name)
+        {
+            return "⟦" + name + "⟧";
         }
 
         private static bool PathNeedsHint(HierarchySummaryNode node)
