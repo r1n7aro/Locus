@@ -918,6 +918,66 @@ fn normalize_reasoning_effort(value: &str) -> Option<String> {
     }
 }
 
+fn custom_endpoint_ids_from_file(path: &std::path::Path) -> HashSet<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<Vec<CustomEndpoint>>(&s).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|endpoint| endpoint.id)
+        .collect()
+}
+
+fn is_stale_custom_model_ref(model_id: &str, valid_endpoint_ids: &HashSet<String>) -> bool {
+    if let Some(endpoint_id) = model_id.trim().strip_prefix("custom/") {
+        return !endpoint_id.is_empty() && !valid_endpoint_ids.contains(endpoint_id);
+    }
+    false
+}
+
+fn prune_stale_custom_model_refs(valid_endpoint_ids: &HashSet<String>) -> Result<(), String> {
+    let dir = persistent_config_dir()?;
+    let last_model_path = dir.join("last_model.txt");
+    if let Some(last_model) = read_nonempty_string(&last_model_path) {
+        if is_stale_custom_model_ref(&last_model, valid_endpoint_ids) {
+            let _ = std::fs::remove_file(&last_model_path);
+        }
+    }
+
+    let defaults_path = dir.join("model_defaults.json");
+    let Some(mut defaults) = std::fs::read_to_string(&defaults_path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<ModelDefaults>(&s).ok())
+    else {
+        return Ok(());
+    };
+
+    let mut changed = false;
+    if is_stale_custom_model_ref(&defaults.main_model, valid_endpoint_ids) {
+        defaults.main_model.clear();
+        changed = true;
+    }
+    if is_stale_custom_model_ref(&defaults.plan_model, valid_endpoint_ids) {
+        defaults.plan_model.clear();
+        changed = true;
+    }
+    defaults.subagent_models.retain(|_, model_id| {
+        let keep = !is_stale_custom_model_ref(model_id, valid_endpoint_ids);
+        if !keep {
+            changed = true;
+        }
+        keep
+    });
+
+    if changed {
+        let json = serde_json::to_string_pretty(&defaults)
+            .map_err(|e| format!("Failed to serialize model defaults: {}", e))?;
+        std::fs::write(&defaults_path, json)
+            .map_err(|e| format!("Failed to save model defaults: {}", e))?;
+    }
+    Ok(())
+}
+
 pub(crate) fn normalize_custom_endpoint_config(endpoint: &mut CustomEndpoint) {
     endpoint.supported_reasoning_efforts = endpoint
         .supported_reasoning_efforts
@@ -956,6 +1016,13 @@ pub async fn save_custom_endpoints(
     endpoints: Vec<CustomEndpoint>,
     app_handle: AppHandle,
 ) -> Result<(), AppError> {
+    let path = custom_endpoints_path(&app_handle)?;
+    let previous_endpoint_ids = custom_endpoint_ids_from_file(&path);
+    let next_endpoint_ids: HashSet<String> = endpoints
+        .iter()
+        .map(|endpoint| endpoint.id.clone())
+        .collect();
+
     // Save api_key to keychain, strip from JSON file
     for ep in &endpoints {
         if !ep.api_key.is_empty() {
@@ -971,10 +1038,13 @@ pub async fn save_custom_endpoints(
         ep.api_key = String::new();
     }
 
-    let path = custom_endpoints_path(&app_handle)?;
     let json = serde_json::to_string_pretty(&stripped)
         .map_err(|e| format!("Failed to serialize: {}", e))?;
     std::fs::write(&path, json).map_err(|e| format!("Failed to save custom endpoints: {}", e))?;
+    for endpoint_id in previous_endpoint_ids.difference(&next_endpoint_ids) {
+        let _ = keychain::delete_secret(&keychain::endpoint_key_name(endpoint_id));
+    }
+    prune_stale_custom_model_refs(&next_endpoint_ids)?;
     Ok(())
 }
 

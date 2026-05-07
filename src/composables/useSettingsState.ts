@@ -1,5 +1,5 @@
 import { ref, computed, onMounted, onUnmounted } from "vue";
-import { clearWarmup, getWarmup } from "./warmupCache";
+import { clearWarmup, getWarmup, setWarmup } from "./warmupCache";
 import { resetAllConfig } from "../services/project";
 import {
   getProviders,
@@ -146,6 +146,7 @@ export function useSettingsState(emit: SettingsEmit) {
     customEndpoints.value = [];
     editingEndpoint.value = null;
     isAddingEndpoint.value = false;
+    customEndpointSaving.value = false;
     testStatus.value = "idle";
     testResult.value = "";
     emit("authChanged");
@@ -638,10 +639,13 @@ export function useSettingsState(emit: SettingsEmit) {
   const customEndpoints = ref<CustomEndpoint[]>([]);
   const editingEndpoint = ref<CustomEndpoint | null>(null);
   const isAddingEndpoint = ref(false);
+  const customEndpointSaving = ref(false);
   const testStatus = ref<"idle" | "testing" | "success" | "error">("idle");
   const testResult = ref("");
   const defaultReasoningEfforts: EffortLevel[] = ["low", "medium", "high", "max"];
   const reasoningEffortSet = new Set<EffortLevel>(["none", "low", "medium", "high", "xhigh", "max"]);
+  let customEndpointMutationQueue: Promise<void> = Promise.resolve();
+  let pendingCustomEndpointMutations = 0;
 
   function defaultReasoningParamFormat(apiFormat: ApiFormat): ReasoningParamFormat {
     switch (apiFormat) {
@@ -661,10 +665,39 @@ export function useSettingsState(emit: SettingsEmit) {
   function normalizeCustomEndpoint(ep: CustomEndpoint): CustomEndpoint {
     return {
       ...ep,
-      betaFlags: ep.betaFlags ?? [],
+      betaFlags: [...(ep.betaFlags ?? [])],
       supportedReasoningEfforts: normalizeReasoningEfforts(ep.supportedReasoningEfforts),
       reasoningParamFormat: ep.reasoningParamFormat ?? defaultReasoningParamFormat(ep.apiFormat),
     };
+  }
+
+  function applyLoadedCustomEndpoints(endpoints: CustomEndpoint[]): CustomEndpoint[] {
+    const normalized = endpoints.map(normalizeCustomEndpoint);
+    customEndpoints.value = normalized;
+    setWarmup("settings:customEndpoints", normalized);
+    return normalized;
+  }
+
+  async function reloadCustomEndpointsAfterMutation() {
+    const latest = applyLoadedCustomEndpoints(await getCustomEndpoints());
+    emit("customEndpointsChanged", latest);
+    return latest;
+  }
+
+  function enqueueCustomEndpointMutation(task: () => Promise<void>): Promise<void> {
+    pendingCustomEndpointMutations += 1;
+    customEndpointSaving.value = true;
+    const run = customEndpointMutationQueue
+      .catch(() => undefined)
+      .then(task)
+      .finally(() => {
+        pendingCustomEndpointMutations = Math.max(0, pendingCustomEndpointMutations - 1);
+        if (pendingCustomEndpointMutations === 0) {
+          customEndpointSaving.value = false;
+        }
+      });
+    customEndpointMutationQueue = run;
+    return run;
   }
 
   function newEmptyEndpoint(): CustomEndpoint {
@@ -685,7 +718,7 @@ export function useSettingsState(emit: SettingsEmit) {
 
   async function loadCustomEndpoints() {
     try {
-      customEndpoints.value = (await getCustomEndpoints()).map(normalizeCustomEndpoint);
+      applyLoadedCustomEndpoints(await getCustomEndpoints());
     } catch (e) {
       const err = normalizeAppError(e);
       useNotificationStore().addNotice("error", t("settings.custom.loadFailed", err.message), {
@@ -722,46 +755,52 @@ export function useSettingsState(emit: SettingsEmit) {
     if (!ep.endpoint.trim()) { errorMsg.value = t("settings.custom.endpointRequired"); return; }
     errorMsg.value = "";
 
-    const list = [...customEndpoints.value];
-    const idx = list.findIndex(e => e.id === ep.id);
-    if (idx >= 0) {
-      list[idx] = ep;
-    } else {
-      list.push(ep);
-    }
+    await enqueueCustomEndpointMutation(async () => {
+      const list = [...customEndpoints.value];
+      const idx = list.findIndex(e => e.id === ep.id);
+      if (idx >= 0) {
+        list[idx] = ep;
+      } else {
+        list.push(ep);
+      }
 
-    try {
-      await saveCustomEndpoints(list);
-      customEndpoints.value = list;
-      editingEndpoint.value = null;
-      isAddingEndpoint.value = false;
-      emit("customEndpointsChanged", list);
-      successMsg.value = t("settings.custom.saved");
-      setTimeout(() => { successMsg.value = ""; }, 2000);
-    } catch (e) {
-      const err = normalizeAppError(e);
-      useNotificationStore().addNotice("error", t("settings.custom.saveFailed", err.message), {
-        code: err.code,
-        operation: "saveEndpoint",
-      });
-    }
+      try {
+        await saveCustomEndpoints(list);
+        await reloadCustomEndpointsAfterMutation();
+        editingEndpoint.value = null;
+        isAddingEndpoint.value = false;
+        successMsg.value = t("settings.custom.saved");
+        setTimeout(() => { successMsg.value = ""; }, 2000);
+      } catch (e) {
+        const err = normalizeAppError(e);
+        useNotificationStore().addNotice("error", t("settings.custom.saveFailed", err.message), {
+          code: err.code,
+          operation: "saveEndpoint",
+        });
+      }
+    });
   }
 
   async function deleteEndpoint(id: string) {
-    const list = customEndpoints.value.filter(e => e.id !== id);
-    try {
-      await saveCustomEndpoints(list);
-      customEndpoints.value = list;
-      emit("customEndpointsChanged", list);
-      successMsg.value = t("settings.custom.deleted");
-      setTimeout(() => { successMsg.value = ""; }, 2000);
-    } catch (e) {
-      const err = normalizeAppError(e);
-      useNotificationStore().addNotice("error", t("settings.custom.saveFailed", err.message), {
-        code: err.code,
-        operation: "deleteEndpoint",
-      });
-    }
+    await enqueueCustomEndpointMutation(async () => {
+      const list = customEndpoints.value.filter(e => e.id !== id);
+      try {
+        await saveCustomEndpoints(list);
+        await reloadCustomEndpointsAfterMutation();
+        if (editingEndpoint.value?.id === id) {
+          editingEndpoint.value = null;
+          isAddingEndpoint.value = false;
+        }
+        successMsg.value = t("settings.custom.deleted");
+        setTimeout(() => { successMsg.value = ""; }, 2000);
+      } catch (e) {
+        const err = normalizeAppError(e);
+        useNotificationStore().addNotice("error", t("settings.custom.saveFailed", err.message), {
+          code: err.code,
+          operation: "deleteEndpoint",
+        });
+      }
+    });
   }
 
   async function testEndpoint() {
@@ -903,6 +942,7 @@ export function useSettingsState(emit: SettingsEmit) {
     customEndpoints,
     editingEndpoint,
     isAddingEndpoint,
+    customEndpointSaving,
     testStatus,
     testResult,
     newEmptyEndpoint,

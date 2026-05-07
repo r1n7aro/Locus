@@ -48,7 +48,7 @@ const {
   showDisclaimer, requestOAuthLogin, requestCodexLogin, cancelDisclaimer,
   modelDefaults, modelSaveMsg, saveModelDefaults,
   permSaveMsg, toolList, toolPermissions, setToolPermission,
-  customEndpoints, editingEndpoint, isAddingEndpoint, testStatus, testResult,
+  customEndpoints, editingEndpoint, isAddingEndpoint, customEndpointSaving, testStatus, testResult,
   startAddEndpoint, startEditEndpoint, cancelEditEndpoint, saveEndpoint, deleteEndpoint, testEndpoint,
 } = useSettingsState(emit);
 
@@ -196,6 +196,7 @@ watch(
           :codex-code-copied="codexCodeCopied"
           :all-models="allModels"
           :custom-endpoints="customEndpoints"
+          :custom-endpoint-saving="customEndpointSaving"
           @start-edit="startEdit"
           @cancel-edit="cancelEdit"
           @save-key="saveKey"
@@ -280,6 +281,7 @@ watch(
     <CustomEndpointModal
       v-model:endpoint="editingEndpoint"
       :is-adding="isAddingEndpoint"
+      :saving="customEndpointSaving"
       :test-status="testStatus"
       :test-result="testResult"
       @close="cancelEditEndpoint"

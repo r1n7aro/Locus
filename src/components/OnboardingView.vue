@@ -115,6 +115,7 @@ const {
   requestCodexLogin: settingsRequestCodexLogin,
   customEndpoints: settingsCustomEndpoints,
   editingEndpoint: settingsEditingEndpoint,
+  customEndpointSaving: settingsCustomEndpointSaving,
   testStatus: settingsEndpointTestStatus,
   testResult: settingsEndpointTestResult,
   startAddEndpoint: settingsStartAddEndpoint,
@@ -179,6 +180,7 @@ function updateInlineEndpointApiFormat(value: string) {
 }
 
 function handleInlineEndpointKeydown(e: KeyboardEvent) {
+  if (settingsCustomEndpointSaving.value) return;
   if (e.key === "Enter") {
     e.preventDefault();
     void settingsSaveEndpoint();
@@ -607,15 +609,30 @@ onUnmounted(() => {
                   <span class="custom-endpoint-summary-meta">{{ ep.apiModel }}</span>
                 </div>
                 <div class="custom-endpoint-summary-actions">
-                  <button class="ob-btn secondary small" type="button" @click="settingsStartEditEndpoint(ep)">
+                  <button
+                    class="ob-btn secondary small"
+                    type="button"
+                    :disabled="settingsCustomEndpointSaving"
+                    @click="settingsStartEditEndpoint(ep)"
+                  >
                     {{ t("settings.custom.edit") }}
                   </button>
-                  <button class="ob-btn secondary small" type="button" @click="settingsDeleteEndpoint(ep.id)">
+                  <button
+                    class="ob-btn secondary small"
+                    type="button"
+                    :disabled="settingsCustomEndpointSaving"
+                    @click="settingsDeleteEndpoint(ep.id)"
+                  >
                     {{ t("settings.custom.delete") }}
                   </button>
                 </div>
               </div>
-              <button class="ob-btn secondary" type="button" @click="settingsStartAddEndpoint">
+              <button
+                class="ob-btn secondary"
+                type="button"
+                :disabled="settingsCustomEndpointSaving"
+                @click="settingsStartAddEndpoint"
+              >
                 {{ t("settings.custom.add") }}
               </button>
             </div>
@@ -627,6 +644,7 @@ onUnmounted(() => {
                   v-model="settingsEditingEndpoint.name"
                   class="ob-input"
                   type="text"
+                  :disabled="settingsCustomEndpointSaving"
                   :placeholder="t('settings.custom.namePlaceholder')"
                   @keydown="handleInlineEndpointKeydown"
                 />
@@ -637,6 +655,7 @@ onUnmounted(() => {
                   v-model="settingsEditingEndpoint.apiModel"
                   class="ob-input"
                   type="text"
+                  :disabled="settingsCustomEndpointSaving"
                   :placeholder="t('settings.custom.apiModelPlaceholder')"
                   @keydown="handleInlineEndpointKeydown"
                 />
@@ -647,6 +666,7 @@ onUnmounted(() => {
                   v-model="settingsEditingEndpoint.endpoint"
                   class="ob-input"
                   type="text"
+                  :disabled="settingsCustomEndpointSaving"
                   :placeholder="t('settings.custom.endpointPlaceholder')"
                   @keydown="handleInlineEndpointKeydown"
                 />
@@ -658,6 +678,7 @@ onUnmounted(() => {
                   :model-value="settingsEditingEndpoint.apiFormat"
                   :options="customApiFormatOptions"
                   :aria-label="t('settings.custom.apiFormat')"
+                  :disabled="settingsCustomEndpointSaving"
                   menu-align="start"
                   size="md"
                   @update:model-value="updateInlineEndpointApiFormat"
@@ -672,6 +693,7 @@ onUnmounted(() => {
                   v-model="settingsEditingEndpoint.apiKey"
                   class="ob-input"
                   type="password"
+                  :disabled="settingsCustomEndpointSaving"
                   :placeholder="t('settings.custom.apiKeyPlaceholder')"
                   @keydown="handleInlineEndpointKeydown"
                 />
@@ -708,7 +730,7 @@ onUnmounted(() => {
               <button
                 class="ob-btn secondary"
                 type="button"
-                :disabled="settingsEndpointTestStatus === 'testing' || !customEndpointTestReady"
+                :disabled="settingsCustomEndpointSaving || settingsEndpointTestStatus === 'testing' || !customEndpointTestReady"
                 @click="settingsTestEndpoint"
               >
                 {{ settingsEndpointTestStatus === "testing" ? "..." : t("settings.custom.test") }}
@@ -717,6 +739,7 @@ onUnmounted(() => {
                 v-if="customEndpointConfigured"
                 class="ob-btn secondary"
                 type="button"
+                :disabled="settingsCustomEndpointSaving"
                 @click="settingsCancelEditEndpoint"
               >
                 {{ t("settings.custom.cancel") }}
@@ -724,10 +747,10 @@ onUnmounted(() => {
               <button
                 class="ob-btn primary"
                 type="button"
-                :disabled="!customEndpointReady"
+                :disabled="settingsCustomEndpointSaving || !customEndpointReady"
                 @click="settingsSaveEndpoint"
               >
-                {{ t("settings.custom.save") }}
+                {{ settingsCustomEndpointSaving ? "..." : t("settings.custom.save") }}
               </button>
             </div>
           </div>

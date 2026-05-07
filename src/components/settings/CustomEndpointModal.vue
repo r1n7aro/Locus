@@ -18,6 +18,7 @@ const endpoint = defineModel<CustomEndpoint | null>("endpoint", { required: true
 
 const props = defineProps<{
   isAdding: boolean;
+  saving?: boolean;
   testStatus: "idle" | "testing" | "success" | "error";
   testResult: string;
 }>();
@@ -95,17 +96,17 @@ async function openTestHtml() {
 }
 
 function handleEndpointKeydown(e: KeyboardEvent) {
-  if (e.key === "Escape") emit("close");
+  if (e.key === "Escape" && !props.saving) emit("close");
 }
 </script>
 
 <template>
   <Transition name="modal">
-    <div v-if="endpoint" class="modal-overlay" @mousedown.self="emit('close')">
+    <div v-if="endpoint" class="modal-overlay" @mousedown.self="!saving && emit('close')">
       <div class="modal-dialog" role="dialog" aria-modal="true">
         <div class="modal-header">
           <span class="modal-title">{{ modalTitle }}</span>
-          <button class="close-btn" type="button" @click="emit('close')">
+          <button class="close-btn" type="button" :disabled="saving" @click="emit('close')">
             <svg viewBox="0 0 16 16" fill="currentColor" width="14" height="14">
               <path d="M3.72 3.72a.75.75 0 0 1 1.06 0L8 6.94l3.22-3.22a.75.75 0 1 1 1.06 1.06L9.06 8l3.22 3.22a.75.75 0 1 1-1.06 1.06L8 9.06l-3.22 3.22a.75.75 0 0 1-1.06-1.06L6.94 8 3.72 4.78a.75.75 0 0 1 0-1.06z"/>
             </svg>
@@ -119,6 +120,7 @@ function handleEndpointKeydown(e: KeyboardEvent) {
               v-model="endpoint.name"
               class="key-input"
               type="text"
+              :disabled="saving"
               :placeholder="t('settings.custom.namePlaceholder')"
               @keydown="handleEndpointKeydown"
             />
@@ -132,6 +134,7 @@ function handleEndpointKeydown(e: KeyboardEvent) {
               v-model="endpoint.apiModel"
               class="key-input"
               type="text"
+              :disabled="saving"
               :placeholder="t('settings.custom.apiModelPlaceholder')"
               @keydown="handleEndpointKeydown"
             />
@@ -145,6 +148,7 @@ function handleEndpointKeydown(e: KeyboardEvent) {
               v-model="endpoint.endpoint"
               class="key-input"
               type="text"
+              :disabled="saving"
               :placeholder="t('settings.custom.endpointPlaceholder')"
               @keydown="handleEndpointKeydown"
             />
@@ -154,6 +158,7 @@ function handleEndpointKeydown(e: KeyboardEvent) {
             <select
               :value="endpoint.apiFormat"
               class="model-select"
+              :disabled="saving"
               @change="updateEndpointApiFormat"
             >
               <option value="openai_chat">{{ t("settings.custom.formatOpenaiChat") }}</option>
@@ -170,6 +175,7 @@ function handleEndpointKeydown(e: KeyboardEvent) {
               v-model="endpoint.apiKey"
               class="key-input"
               type="password"
+              :disabled="saving"
               :placeholder="t('settings.custom.apiKeyPlaceholder')"
               @keydown="handleEndpointKeydown"
             />
@@ -183,6 +189,7 @@ function handleEndpointKeydown(e: KeyboardEvent) {
               v-model.number="endpoint.contextLength"
               class="key-input"
               type="number"
+              :disabled="saving"
               min="1024"
               step="1024"
               placeholder="128000"
@@ -191,7 +198,7 @@ function handleEndpointKeydown(e: KeyboardEvent) {
           </div>
           <div class="custom-form-row">
             <label class="custom-form-label">{{ t("settings.custom.reasoningFormat") }}</label>
-            <select v-model="endpoint.reasoningParamFormat" class="model-select">
+            <select v-model="endpoint.reasoningParamFormat" class="model-select" :disabled="saving">
               <option
                 v-for="option in customReasoningFormatOptions"
                 :key="option.value"
@@ -214,6 +221,7 @@ function handleEndpointKeydown(e: KeyboardEvent) {
               >
                 <input
                   type="checkbox"
+                  :disabled="saving"
                   :checked="endpoint.supportedReasoningEfforts?.includes(option.value)"
                   @change="toggleReasoningEffort(option.value)"
                 />
@@ -230,6 +238,7 @@ function handleEndpointKeydown(e: KeyboardEvent) {
               <label class="beta-flag-item">
                 <input
                   type="checkbox"
+                  :disabled="saving"
                   :checked="endpoint.betaFlags?.includes('context-1m-2025-08-07')"
                   @change="toggleBetaFlag('context-1m-2025-08-07')"
                 />
@@ -239,6 +248,7 @@ function handleEndpointKeydown(e: KeyboardEvent) {
               <label class="beta-flag-item">
                 <input
                   type="checkbox"
+                  :disabled="saving"
                   :checked="endpoint.betaFlags?.includes('interleaved-thinking-2025-05-14')"
                   @change="toggleBetaFlag('interleaved-thinking-2025-05-14')"
                 />
@@ -248,6 +258,7 @@ function handleEndpointKeydown(e: KeyboardEvent) {
               <label class="beta-flag-item">
                 <input
                   type="checkbox"
+                  :disabled="saving"
                   :checked="endpoint.betaFlags?.includes('prompt-caching-scope-2026-01-05')"
                   @change="toggleBetaFlag('prompt-caching-scope-2026-01-05')"
                 />
@@ -274,11 +285,13 @@ function handleEndpointKeydown(e: KeyboardEvent) {
         </div>
 
         <div class="modal-footer">
-          <button class="save-btn" type="button" @click="emit('save')">{{ t("settings.custom.save") }}</button>
-          <button class="test-btn" type="button" @click="emit('test')" :disabled="testStatus === 'testing'">
+          <button class="save-btn" type="button" :disabled="saving" @click="emit('save')">
+            {{ saving ? '...' : t("settings.custom.save") }}
+          </button>
+          <button class="test-btn" type="button" @click="emit('test')" :disabled="saving || testStatus === 'testing'">
             {{ testStatus === 'testing' ? '...' : t("settings.custom.test") }}
           </button>
-          <button class="cancel-btn" type="button" @click="emit('close')">{{ t("settings.custom.cancel") }}</button>
+          <button class="cancel-btn" type="button" :disabled="saving" @click="emit('close')">{{ t("settings.custom.cancel") }}</button>
         </div>
       </div>
     </div>
@@ -355,9 +368,14 @@ function handleEndpointKeydown(e: KeyboardEvent) {
   padding: 0;
 }
 
-.close-btn:hover {
+.close-btn:hover:not(:disabled) {
   background: var(--hover-bg);
   color: var(--text-color);
+}
+
+.close-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 .custom-form-row {
@@ -424,6 +442,13 @@ function handleEndpointKeydown(e: KeyboardEvent) {
   background-color: color-mix(in srgb, var(--input-bg) 88%, var(--accent-soft) 12%);
 }
 
+.key-input:disabled,
+.model-select:disabled,
+.beta-flag-item input[type="checkbox"]:disabled {
+  opacity: 0.65;
+  cursor: not-allowed;
+}
+
 .beta-flags-list {
   display: flex;
   flex-direction: column;
@@ -473,6 +498,11 @@ function handleEndpointKeydown(e: KeyboardEvent) {
   filter: brightness(1.06);
 }
 
+.save-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 .cancel-btn,
 .test-btn {
   padding: 6px 14px;
@@ -493,13 +523,14 @@ function handleEndpointKeydown(e: KeyboardEvent) {
   color: var(--text-secondary);
 }
 
-.cancel-btn:hover,
+.cancel-btn:hover:not(:disabled),
 .test-btn:hover:not(:disabled) {
   background: var(--hover-bg);
   border-color: var(--accent-border);
   color: var(--accent-color);
 }
 
+.cancel-btn:disabled,
 .test-btn:disabled {
   opacity: 0.5;
   cursor: not-allowed;

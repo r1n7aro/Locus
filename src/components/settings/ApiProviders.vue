@@ -35,6 +35,7 @@ const props = defineProps<{
   codexCodeCopied: boolean;
   allModels: ModelOption[];
   customEndpoints: CustomEndpoint[];
+  customEndpointSaving?: boolean;
   mode?: "full" | "onboarding";
   onboardingFocus?: "custom" | "codex" | null;
 }>();
@@ -437,8 +438,22 @@ function focusSectionClass(section: "custom" | "codex") {
         <div class="provider-detail">
           <span class="key-hint mono">{{ ep.apiKey ? ep.apiKey.slice(0, 8) + '...' : '(no key)' }}</span>
           <div class="provider-actions">
-            <button class="action-btn" @click="emit('startEditEndpoint', ep)">{{ t("settings.custom.edit") }}</button>
-            <button class="action-btn danger" @click="emit('deleteEndpoint', ep.id)">{{ t("settings.custom.delete") }}</button>
+            <button
+              class="action-btn"
+              type="button"
+              :disabled="customEndpointSaving"
+              @click="emit('startEditEndpoint', ep)"
+            >
+              {{ t("settings.custom.edit") }}
+            </button>
+            <button
+              class="action-btn danger"
+              type="button"
+              :disabled="customEndpointSaving"
+              @click="emit('deleteEndpoint', ep.id)"
+            >
+              {{ t("settings.custom.delete") }}
+            </button>
           </div>
         </div>
       </div>
@@ -448,6 +463,8 @@ function focusSectionClass(section: "custom" | "codex") {
     <button
       class="add-key-btn"
       style="margin-top: 8px;"
+      type="button"
+      :disabled="customEndpointSaving"
       @click="emit('startAddEndpoint')"
     >
       + {{ t("settings.custom.add") }}
@@ -750,7 +767,9 @@ function focusSectionClass(section: "custom" | "codex") {
 
 .save-btn:disabled,
 .oauth-login-btn:disabled,
-.test-btn:disabled {
+.test-btn:disabled,
+.action-btn:disabled,
+.add-key-btn:disabled {
   opacity: 0.5;
   cursor: not-allowed;
 }
