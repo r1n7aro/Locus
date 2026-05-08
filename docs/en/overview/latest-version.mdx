@@ -1,8 +1,8 @@
 ---
 title: "Latest Version"
-description: "Locus v0.2.10 (2026-05-08)"
+description: "Locus v0.2.11 (2026-05-08)"
 sidebarTitle: "Latest Version"
-version: "0.2.10"
+version: "0.2.11"
 releasedAt: "2026-05-08"
 channel: "stable"
 updateTitle: "Update available"
@@ -17,18 +17,18 @@ changelogUrl: "/en/overview/latest-version"
 
 ### Added
 
-- Added Unity editor type indexing and automatic namespace injection for C# snippets used by `unity_execute` and `unity_run_states`.
-- Added persisted assistant render parts so thinking, text, tool calls, and knowledge proposals keep their render order across reloads, replay, and context export.
-- Added README demo thumbnail and social/video badges.
+- Added QQ group 1104932978 for community discussion.
+- Added chat references for Unity assets, scene objects, and project knowledge. References can be selected from `@` search, shown as attachment chips, sent with messages, and preserved in transcripts and context export.
+- Added Unity embedded drag-and-drop references so Unity assets and scene objects can be dropped into the composer and reopened or selected from chat.
+- Added a dedicated `/compact` action that runs as its own session task, records the latest context window usage, and shows a compacted-context divider in the transcript.
+- Added OpenAI Chat custom endpoint reasoning replay for multi-turn tool calls, plus MiniMax reasoning split and reasoning details support.
 
 ### Fixed
 
-- Fixed active chat session stream state synchronization across session switches, embedded chat, and background runs.
-- Fixed keyboard focus for the embedded Unity WebView after activation.
-- Clarified Unity hierarchy GameObject names by rendering them as `⟦Name⟧` while keeping `object_path` inputs clean.
-- Serialized custom endpoint save/delete flows against the latest saved list and refreshed the warmup cache after persistence.
-- Opened external Markdown links through the OS handler and blocked internal, relative, and unsafe WebView navigation.
-- Reported duplicate edit matches with source line numbers so `oldString` conflicts are easier to resolve.
+- Fixed compact token budgeting to count tool arguments, nested tool calls, and server tool output when choosing the retained message boundary.
+- Fixed compacted handoff display order and kept compact markers out of normal assistant message grouping.
+- Fixed OpenAI-compatible streaming providers that finish with `finish_reason` before the `[DONE]` marker.
+- Fixed custom endpoint defaults by using a 256K context window and preserving legacy OpenAI Chat reasoning replay behavior.
 
 ### Removed
 

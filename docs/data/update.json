@@ -1,30 +1,30 @@
 {
-  "version": "0.2.10",
+  "version": "0.2.11",
   "releasedAt": "2026-05-08",
   "channel": "stable",
   "locales": {
     "zh": {
       "title": "发现新版本",
-      "summary": "Locus v0.2.10 (2026-05-08)",
+      "summary": "Locus v0.2.11 (2026-05-08)",
       "changelogUrl": "/overview/latest-version",
       "changes": [
         {
           "title": "新增",
           "items": [
-            "Unity C# 片段执行支持编辑器类型索引，并为 `unity_execute` 与 `unity_run_states` 自动补全缺失命名空间。",
-            "持久化 assistant 渲染片段，重载、回放与上下文导出后仍保留 thinking、正文、工具调用和知识提案的渲染顺序。",
-            "README 新增演示缩略图与社交/视频入口。"
+            "QQ群号：1104932978，欢迎加入交流。",
+            "聊天支持引用 Unity 资产、场景对象与项目知识。引用可通过 `@` 搜索选择，以附件形式展示，随消息发送，并保留在转录与上下文导出中。",
+            "Unity 嵌入窗口支持拖拽资产与场景对象到输入区，并可从聊天中重新选择或打开。",
+            "`/compact` 使用独立会话任务执行上下文压缩，记录最新上下文窗口用量，并在转录中显示“上下文已压缩”分隔标记。",
+            "OpenAI Chat 自定义 endpoint 支持多轮工具调用回放 reasoning 内容，并新增 MiniMax reasoning split 与 reasoning details 支持。"
           ]
         },
         {
           "title": "修复",
           "items": [
-            "修复会话切换、嵌入式聊天与后台运行中的 active chat stream 状态同步。",
-            "修复嵌入 Unity WebView 激活后的键盘输入焦点。",
-            "Unity 层级摘要中的 GameObject 名称显示为 `⟦Name⟧`，`object_path` 继续使用纯路径。",
-            "自定义 endpoint 的保存和删除按最新已保存列表串行执行，并在持久化后刷新 warmup cache。",
-            "Markdown 外部链接通过系统处理器打开，并拦截内部、相对路径和不安全的 WebView 跳转。",
-            "edit 工具在 `oldString` 命中多处时输出匹配行号，便于补充上下文。"
+            "上下文压缩预算会计入工具参数、嵌套工具调用与服务端工具输出，保留边界更准确。",
+            "修复压缩交接标记的显示顺序，并避免压缩标记混入普通 assistant 消息分组。",
+            "修复部分 OpenAI 兼容流式接口在 `[DONE]` 前返回 `finish_reason` 时的收尾处理。",
+            "自定义 endpoint 默认上下文窗口调整为 256K，并保留旧 OpenAI Chat endpoint 的 reasoning 回放行为。"
           ]
         },
         {
@@ -43,26 +43,26 @@
     },
     "en": {
       "title": "Update available",
-      "summary": "Locus v0.2.10 (2026-05-08)",
+      "summary": "Locus v0.2.11 (2026-05-08)",
       "changelogUrl": "/en/overview/latest-version",
       "changes": [
         {
           "title": "Added",
           "items": [
-            "Added Unity editor type indexing and automatic namespace injection for C# snippets used by `unity_execute` and `unity_run_states`.",
-            "Added persisted assistant render parts so thinking, text, tool calls, and knowledge proposals keep their render order across reloads, replay, and context export.",
-            "Added README demo thumbnail and social/video badges."
+            "Added QQ group 1104932978 for community discussion.",
+            "Added chat references for Unity assets, scene objects, and project knowledge. References can be selected from `@` search, shown as attachment chips, sent with messages, and preserved in transcripts and context export.",
+            "Added Unity embedded drag-and-drop references so Unity assets and scene objects can be dropped into the composer and reopened or selected from chat.",
+            "Added a dedicated `/compact` action that runs as its own session task, records the latest context window usage, and shows a compacted-context divider in the transcript.",
+            "Added OpenAI Chat custom endpoint reasoning replay for multi-turn tool calls, plus MiniMax reasoning split and reasoning details support."
           ]
         },
         {
           "title": "Fixed",
           "items": [
-            "Fixed active chat session stream state synchronization across session switches, embedded chat, and background runs.",
-            "Fixed keyboard focus for the embedded Unity WebView after activation.",
-            "Clarified Unity hierarchy GameObject names by rendering them as `⟦Name⟧` while keeping `object_path` inputs clean.",
-            "Serialized custom endpoint save/delete flows against the latest saved list and refreshed the warmup cache after persistence.",
-            "Opened external Markdown links through the OS handler and blocked internal, relative, and unsafe WebView navigation.",
-            "Reported duplicate edit matches with source line numbers so `oldString` conflicts are easier to resolve."
+            "Fixed compact token budgeting to count tool arguments, nested tool calls, and server tool output when choosing the retained message boundary.",
+            "Fixed compacted handoff display order and kept compact markers out of normal assistant message grouping.",
+            "Fixed OpenAI-compatible streaming providers that finish with `finish_reason` before the `[DONE]` marker.",
+            "Fixed custom endpoint defaults by using a 256K context window and preserving legacy OpenAI Chat reasoning replay behavior."
           ]
         },
         {
