@@ -230,6 +230,7 @@ pub enum LlmBackend {
         beta_flags: Vec<String>,
         supported_reasoning_efforts: Vec<String>,
         reasoning_param_format: crate::commands::CustomReasoningParamFormat,
+        replay_reasoning_content: bool,
     },
 }
 

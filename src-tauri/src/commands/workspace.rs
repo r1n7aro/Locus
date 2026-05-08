@@ -889,10 +889,14 @@ pub struct CustomEndpoint {
     pub supported_reasoning_efforts: Vec<String>,
     #[serde(default)]
     pub reasoning_param_format: Option<CustomReasoningParamFormat>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_reasoning_content: Option<bool>,
 }
 
+const DEFAULT_CUSTOM_ENDPOINT_CONTEXT_LENGTH: u32 = 256_000;
+
 fn default_context_length() -> u32 {
-    128_000
+    DEFAULT_CUSTOM_ENDPOINT_CONTEXT_LENGTH
 }
 
 fn default_supported_reasoning_efforts() -> Vec<String> {
@@ -908,6 +912,10 @@ fn default_reasoning_param_format(api_format: &ApiFormat) -> CustomReasoningPara
         ApiFormat::AnthropicMessages => CustomReasoningParamFormat::AnthropicThinking,
         ApiFormat::OpenaiChat => CustomReasoningParamFormat::OpenaiChatReasoningEffort,
     }
+}
+
+fn default_replay_reasoning_content(endpoint: &CustomEndpoint) -> bool {
+    endpoint.api_format == ApiFormat::OpenaiChat
 }
 
 fn normalize_reasoning_effort(value: &str) -> Option<String> {
@@ -987,9 +995,15 @@ pub(crate) fn normalize_custom_endpoint_config(endpoint: &mut CustomEndpoint) {
     if endpoint.supported_reasoning_efforts.is_empty() {
         endpoint.supported_reasoning_efforts = default_supported_reasoning_efforts();
     }
+    if endpoint.context_length == 0 {
+        endpoint.context_length = default_context_length();
+    }
     if endpoint.reasoning_param_format.is_none() {
         endpoint.reasoning_param_format =
             Some(default_reasoning_param_format(&endpoint.api_format));
+    }
+    if endpoint.replay_reasoning_content.is_none() {
+        endpoint.replay_reasoning_content = Some(default_replay_reasoning_content(endpoint));
     }
 }
 
@@ -2206,8 +2220,10 @@ pub async fn get_config_registry(
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_dir_entries, normalize_tool_permission_mode_request, normalize_workspace_sub_path,
+        collect_dir_entries, normalize_custom_endpoint_config,
+        normalize_tool_permission_mode_request, normalize_workspace_sub_path,
         resolve_workspace_dir_target, search_workspace_entries_in_dir, workspace_search_score,
+        CustomEndpoint,
     };
     use std::path::Path;
     use tempfile::tempdir;
@@ -2267,6 +2283,41 @@ mod tests {
             normalize_tool_permission_mode_request(Some(" AUTO "), None),
             "auto"
         );
+    }
+
+    #[test]
+    fn custom_endpoint_defaults_to_256k_context_length() {
+        let raw = r#"[{
+            "id": "custom-1",
+            "name": "Custom",
+            "apiModel": "model",
+            "endpoint": "https://example.com/v1",
+            "apiFormat": "openai_chat"
+        }]"#;
+
+        let mut endpoints: Vec<CustomEndpoint> =
+            serde_json::from_str(raw).expect("deserialize custom endpoint");
+        normalize_custom_endpoint_config(&mut endpoints[0]);
+
+        assert_eq!(endpoints[0].context_length, 256_000);
+        assert_eq!(endpoints[0].replay_reasoning_content, Some(true));
+    }
+
+    #[test]
+    fn custom_endpoint_disables_reasoning_content_replay_for_non_chat_formats() {
+        let raw = r#"[{
+            "id": "custom-1",
+            "name": "Responses",
+            "apiModel": "gpt-5.1",
+            "endpoint": "https://api.openai.com/v1",
+            "apiFormat": "openai_responses"
+        }]"#;
+
+        let mut endpoints: Vec<CustomEndpoint> =
+            serde_json::from_str(raw).expect("deserialize custom endpoint");
+        normalize_custom_endpoint_config(&mut endpoints[0]);
+
+        assert_eq!(endpoints[0].replay_reasoning_content, Some(false));
     }
 
     #[test]

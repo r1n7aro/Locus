@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { computed } from "vue";
 import { openPath } from "@tauri-apps/plugin-opener";
+import BaseButton from "../ui/BaseButton.vue";
+import BaseCheckbox from "../ui/BaseCheckbox.vue";
 import { t } from "../../i18n";
 import { normalizeAppError } from "../../services/errors";
 import {
@@ -62,25 +64,25 @@ function updateEndpointApiFormat(event: Event) {
   endpoint.value.reasoningParamFormat = defaultReasoningParamFormat(apiFormat);
 }
 
-function toggleReasoningEffort(effort: EffortLevel) {
+function setReasoningEffortEnabled(effort: EffortLevel, enabled: boolean) {
   if (!endpoint.value) return;
   if (!endpoint.value.supportedReasoningEfforts) endpoint.value.supportedReasoningEfforts = [];
   const idx = endpoint.value.supportedReasoningEfforts.indexOf(effort);
-  if (idx >= 0) {
-    endpoint.value.supportedReasoningEfforts.splice(idx, 1);
-  } else {
+  if (enabled && idx < 0) {
     endpoint.value.supportedReasoningEfforts.push(effort);
+  } else if (!enabled && idx >= 0) {
+    endpoint.value.supportedReasoningEfforts.splice(idx, 1);
   }
 }
 
-function toggleBetaFlag(flag: string) {
+function setBetaFlagEnabled(flag: string, enabled: boolean) {
   if (!endpoint.value) return;
   if (!endpoint.value.betaFlags) endpoint.value.betaFlags = [];
   const idx = endpoint.value.betaFlags.indexOf(flag);
-  if (idx >= 0) {
-    endpoint.value.betaFlags.splice(idx, 1);
-  } else {
+  if (enabled && idx < 0) {
     endpoint.value.betaFlags.push(flag);
+  } else if (!enabled && idx >= 0) {
+    endpoint.value.betaFlags.splice(idx, 1);
   }
 }
 
@@ -192,7 +194,7 @@ function handleEndpointKeydown(e: KeyboardEvent) {
               :disabled="saving"
               min="1024"
               step="1024"
-              placeholder="128000"
+              placeholder="256000"
               @keydown="handleEndpointKeydown"
             />
           </div>
@@ -208,25 +210,38 @@ function handleEndpointKeydown(e: KeyboardEvent) {
               </option>
             </select>
           </div>
+          <div v-if="endpoint.apiFormat === 'openai_chat'" class="custom-form-row">
+            <div class="custom-option-row">
+              <BaseCheckbox
+                v-model="endpoint.replayReasoningContent"
+                :disabled="saving"
+                :aria-label="t('settings.custom.replayReasoningContent')"
+              />
+              <div class="custom-option-copy">
+                <span class="custom-option-name">{{ t("settings.custom.replayReasoningContent") }}</span>
+                <span class="custom-option-desc">{{ t("settings.custom.replayReasoningContentHint") }}</span>
+              </div>
+            </div>
+          </div>
           <div v-if="endpoint.reasoningParamFormat !== 'none'" class="custom-form-row">
             <label class="custom-form-label">
               {{ t("settings.custom.reasoningEfforts") }}
               <span class="custom-form-hint">{{ t("settings.custom.reasoningEffortsHint") }}</span>
             </label>
-            <div class="beta-flags-list">
-              <label
+            <div class="custom-options-list compact">
+              <div
                 v-for="option in customReasoningEffortOptions"
                 :key="option.value"
-                class="beta-flag-item"
+                class="custom-option-row compact"
               >
-                <input
-                  type="checkbox"
+                <BaseCheckbox
                   :disabled="saving"
-                  :checked="endpoint.supportedReasoningEfforts?.includes(option.value)"
-                  @change="toggleReasoningEffort(option.value)"
+                  :model-value="endpoint.supportedReasoningEfforts?.includes(option.value) ?? false"
+                  :aria-label="option.label"
+                  @update:model-value="setReasoningEffortEnabled(option.value, $event)"
                 />
-                <span class="beta-flag-name">{{ option.label }}</span>
-              </label>
+                <span class="custom-option-name mono">{{ option.label }}</span>
+              </div>
             </div>
           </div>
           <div v-if="endpoint.apiFormat === 'anthropic_messages'" class="custom-form-row">
@@ -234,37 +249,43 @@ function handleEndpointKeydown(e: KeyboardEvent) {
               {{ t("settings.custom.betaFlags") }}
               <span class="custom-form-hint">{{ t("settings.custom.betaFlagsHint") }}</span>
             </label>
-            <div class="beta-flags-list">
-              <label class="beta-flag-item">
-                <input
-                  type="checkbox"
+            <div class="custom-options-list">
+              <div class="custom-option-row">
+                <BaseCheckbox
                   :disabled="saving"
-                  :checked="endpoint.betaFlags?.includes('context-1m-2025-08-07')"
-                  @change="toggleBetaFlag('context-1m-2025-08-07')"
+                  :model-value="endpoint.betaFlags?.includes('context-1m-2025-08-07') ?? false"
+                  aria-label="context-1m-2025-08-07"
+                  @update:model-value="setBetaFlagEnabled('context-1m-2025-08-07', $event)"
                 />
-                <span class="beta-flag-name">context-1m-2025-08-07</span>
-                <span class="beta-flag-desc">{{ t("settings.custom.betaContext1m") }}</span>
-              </label>
-              <label class="beta-flag-item">
-                <input
-                  type="checkbox"
+                <div class="custom-option-copy inline">
+                  <span class="custom-option-name mono">context-1m-2025-08-07</span>
+                  <span class="custom-option-desc">{{ t("settings.custom.betaContext1m") }}</span>
+                </div>
+              </div>
+              <div class="custom-option-row">
+                <BaseCheckbox
                   :disabled="saving"
-                  :checked="endpoint.betaFlags?.includes('interleaved-thinking-2025-05-14')"
-                  @change="toggleBetaFlag('interleaved-thinking-2025-05-14')"
+                  :model-value="endpoint.betaFlags?.includes('interleaved-thinking-2025-05-14') ?? false"
+                  aria-label="interleaved-thinking-2025-05-14"
+                  @update:model-value="setBetaFlagEnabled('interleaved-thinking-2025-05-14', $event)"
                 />
-                <span class="beta-flag-name">interleaved-thinking-2025-05-14</span>
-                <span class="beta-flag-desc">{{ t("settings.custom.betaInterleavedThinking") }}</span>
-              </label>
-              <label class="beta-flag-item">
-                <input
-                  type="checkbox"
+                <div class="custom-option-copy inline">
+                  <span class="custom-option-name mono">interleaved-thinking-2025-05-14</span>
+                  <span class="custom-option-desc">{{ t("settings.custom.betaInterleavedThinking") }}</span>
+                </div>
+              </div>
+              <div class="custom-option-row">
+                <BaseCheckbox
                   :disabled="saving"
-                  :checked="endpoint.betaFlags?.includes('prompt-caching-scope-2026-01-05')"
-                  @change="toggleBetaFlag('prompt-caching-scope-2026-01-05')"
+                  :model-value="endpoint.betaFlags?.includes('prompt-caching-scope-2026-01-05') ?? false"
+                  aria-label="prompt-caching-scope-2026-01-05"
+                  @update:model-value="setBetaFlagEnabled('prompt-caching-scope-2026-01-05', $event)"
                 />
-                <span class="beta-flag-name">prompt-caching-scope-2026-01-05</span>
-                <span class="beta-flag-desc">{{ t("settings.custom.betaPromptCaching") }}</span>
-              </label>
+                <div class="custom-option-copy inline">
+                  <span class="custom-option-name mono">prompt-caching-scope-2026-01-05</span>
+                  <span class="custom-option-desc">{{ t("settings.custom.betaPromptCaching") }}</span>
+                </div>
+              </div>
             </div>
           </div>
           <div v-if="testStatus !== 'idle'" class="test-result" :class="testStatus">
@@ -285,13 +306,13 @@ function handleEndpointKeydown(e: KeyboardEvent) {
         </div>
 
         <div class="modal-footer">
-          <button class="save-btn" type="button" :disabled="saving" @click="emit('save')">
+          <BaseButton variant="primary" type="button" :disabled="saving" @click="emit('save')">
             {{ saving ? '...' : t("settings.custom.save") }}
-          </button>
-          <button class="test-btn" type="button" @click="emit('test')" :disabled="saving || testStatus === 'testing'">
+          </BaseButton>
+          <BaseButton type="button" @click="emit('test')" :disabled="saving || testStatus === 'testing'">
             {{ testStatus === 'testing' ? '...' : t("settings.custom.test") }}
-          </button>
-          <button class="cancel-btn" type="button" :disabled="saving" @click="emit('close')">{{ t("settings.custom.cancel") }}</button>
+          </BaseButton>
+          <BaseButton type="button" :disabled="saving" @click="emit('close')">{{ t("settings.custom.cancel") }}</BaseButton>
         </div>
       </div>
     </div>
@@ -313,9 +334,9 @@ function handleEndpointKeydown(e: KeyboardEvent) {
   background: var(--surface-elevated);
   border: 1px solid var(--border-color);
   border-radius: 12px;
-  width: 420px;
-  max-width: 90%;
-  max-height: 80%;
+  width: 500px;
+  max-width: calc(100% - 48px);
+  max-height: 84%;
   display: flex;
   flex-direction: column;
   box-shadow: 0 18px 40px rgba(15, 17, 21, 0.16);
@@ -443,97 +464,63 @@ function handleEndpointKeydown(e: KeyboardEvent) {
 }
 
 .key-input:disabled,
-.model-select:disabled,
-.beta-flag-item input[type="checkbox"]:disabled {
+.model-select:disabled {
   opacity: 0.65;
   cursor: not-allowed;
 }
 
-.beta-flags-list {
+.custom-options-list {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 8px;
 }
 
-.beta-flag-item {
+.custom-options-list.compact {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(64px, max-content));
+  gap: 8px 14px;
+}
+
+.custom-option-row {
   display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  min-height: 18px;
+}
+
+.custom-option-row.compact {
   align-items: center;
-  gap: 6px;
+}
+
+.custom-option-copy {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.custom-option-copy.inline {
+  flex-direction: row;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 2px 8px;
+}
+
+.custom-option-name {
   font-size: 12px;
-  cursor: pointer;
+  line-height: 18px;
+  color: var(--text-color);
 }
 
-.beta-flag-item input[type="checkbox"] {
-  margin: 0;
-  cursor: pointer;
-}
-
-.beta-flag-name {
+.custom-option-name.mono {
   font-family: var(--font-mono-identifier);
   font-size: 11px;
-  color: var(--text-color);
 }
 
-.beta-flag-desc {
+.custom-option-desc {
+  color: var(--text-secondary);
   font-size: 11px;
-  color: var(--text-secondary);
-  margin-left: 2px;
-}
-
-.save-btn {
-  padding: 6px 14px;
-  border-radius: 6px;
-  border: 1px solid var(--accent-color);
-  background: var(--accent-color);
-  color: #fff;
-  font-size: 12px;
-  font-weight: 500;
-  cursor: pointer;
-  transition: filter 0.15s ease, opacity 0.15s ease;
-  box-shadow: none;
-  white-space: nowrap;
-}
-
-.save-btn:hover:not(:disabled) {
-  filter: brightness(1.06);
-}
-
-.save-btn:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-
-.cancel-btn,
-.test-btn {
-  padding: 6px 14px;
-  border-radius: 6px;
-  border: 1px solid var(--border-color);
-  background: transparent;
-  color: var(--text-color);
-  font-size: 12px;
-  font-weight: 500;
-  cursor: pointer;
-  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
-  box-shadow: none;
-  white-space: nowrap;
-}
-
-.cancel-btn {
-  padding-inline: 10px;
-  color: var(--text-secondary);
-}
-
-.cancel-btn:hover:not(:disabled),
-.test-btn:hover:not(:disabled) {
-  background: var(--hover-bg);
-  border-color: var(--accent-border);
-  color: var(--accent-color);
-}
-
-.cancel-btn:disabled,
-.test-btn:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
+  line-height: 1.4;
 }
 
 .test-result {

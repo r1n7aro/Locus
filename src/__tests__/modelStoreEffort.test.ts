@@ -106,10 +106,11 @@ describe("useModelStore OpenAI effort mapping", () => {
       endpoint: "https://example.com/v1/responses",
       apiFormat: "openai_responses",
       apiKey: "",
-      contextLength: 128000,
+      contextLength: 256000,
       betaFlags: [],
       supportedReasoningEfforts: ["medium", "high"],
       reasoningParamFormat: "openai_responses_reasoning_effort",
+      replayReasoningContent: false,
     }]);
     modelStore.selectedModelId = "custom/endpoint-1";
 
@@ -126,9 +127,10 @@ describe("useModelStore OpenAI effort mapping", () => {
       endpoint: "https://example.com/v1",
       apiFormat: "openai_chat",
       apiKey: "",
-      contextLength: 128000,
+      contextLength: 256000,
       betaFlags: [],
       reasoningParamFormat: "openai_chat_reasoning_effort",
+      replayReasoningContent: true,
     } as any]);
     modelStore.selectedModelId = "custom/endpoint-1";
 

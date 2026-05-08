@@ -1164,9 +1164,9 @@ watch(
   background: var(--surface-elevated);
   border: 1px solid var(--border-color);
   border-radius: 12px;
-  width: 420px;
-  max-width: 90%;
-  max-height: 80%;
+  width: 500px;
+  max-width: calc(100% - 48px);
+  max-height: 84%;
   display: flex;
   flex-direction: column;
   box-shadow: 0 18px 40px rgba(15, 17, 21, 0.16);

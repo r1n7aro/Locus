@@ -11,6 +11,7 @@ const CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
 enum ChatCompletionsFlavor {
     Generic,
     DeepSeek,
+    MiniMax,
 }
 
 pub async fn stream_chat<F, G, H>(
@@ -22,6 +23,7 @@ pub async fn stream_chat<F, G, H>(
     base_url: &str,
     reasoning_effort: Option<&str>,
     thinking_level: Option<&str>,
+    replay_reasoning_content: bool,
     debug: bool,
     on_text_delta: F,
     on_thinking_delta: G,
@@ -45,6 +47,7 @@ where
         history,
         flavor,
         deepseek_thinking_mode_enabled(thinking_level),
+        replay_reasoning_content,
     );
     let body = build_request_body(
         model,
@@ -57,12 +60,13 @@ where
     let raw_request = serde_json::to_string_pretty(&body).unwrap_or_else(|_| format!("{:?}", body));
 
     eprintln!(
-        "[{}] POST model={} messages={} tools={} flavor={:?}",
+        "[{}] POST model={} messages={} tools={} flavor={:?} replay_reasoning_content={}",
         tag,
         model,
         history.len(),
         tools.len(),
-        flavor
+        flavor,
+        replay_reasoning_content
     );
 
     let api_url = format!(
@@ -184,7 +188,15 @@ where
         return finalize_stream_response(tag, debug, true, state, raw_request, raw_response);
     }
 
-    finalize_stream_response(tag, debug, false, state, raw_request, raw_response)
+    let saw_finish_reason = state.saw_finish_reason;
+    finalize_stream_response(
+        tag,
+        debug,
+        saw_finish_reason,
+        state,
+        raw_request,
+        raw_response,
+    )
 }
 
 fn detect_flavor(model: &str, base_url: &str) -> ChatCompletionsFlavor {
@@ -192,6 +204,11 @@ fn detect_flavor(model: &str, base_url: &str) -> ChatCompletionsFlavor {
     let base_url = base_url.trim().to_ascii_lowercase();
     if model.starts_with("deepseek-") || base_url.contains("deepseek") {
         ChatCompletionsFlavor::DeepSeek
+    } else if model.contains("minimax")
+        || base_url.contains("minimax")
+        || base_url.contains("minimaxi")
+    {
+        ChatCompletionsFlavor::MiniMax
     } else {
         ChatCompletionsFlavor::Generic
     }
@@ -220,17 +237,25 @@ fn build_request_body(
         ChatCompletionsFlavor::DeepSeek => {
             apply_deepseek_thinking_params(&mut body, reasoning_effort, thinking_level);
         }
+        ChatCompletionsFlavor::MiniMax => {
+            body["reasoning_split"] = serde_json::json!(true);
+            apply_generic_reasoning_effort(&mut body, reasoning_effort);
+        }
         ChatCompletionsFlavor::Generic => {
-            if let Some(effort) = reasoning_effort
-                .map(str::trim)
-                .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("none"))
-            {
-                body["reasoning_effort"] = serde_json::json!(effort);
-            }
+            apply_generic_reasoning_effort(&mut body, reasoning_effort);
         }
     }
 
     body
+}
+
+fn apply_generic_reasoning_effort(body: &mut serde_json::Value, reasoning_effort: Option<&str>) {
+    if let Some(effort) = reasoning_effort
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("none"))
+    {
+        body["reasoning_effort"] = serde_json::json!(effort);
+    }
 }
 
 fn apply_deepseek_thinking_params(
@@ -272,6 +297,7 @@ fn build_api_messages(
     history: &[ChatMessage],
     flavor: ChatCompletionsFlavor,
     deepseek_thinking_enabled: bool,
+    replay_reasoning_content: bool,
 ) -> Vec<serde_json::Value> {
     let mut messages = Vec::new();
     if !system_prompt.is_empty() {
@@ -306,13 +332,23 @@ fn build_api_messages(
                     "role": "assistant",
                     "content": msg.content,
                 });
-                if flavor == ChatCompletionsFlavor::DeepSeek {
+                if replay_reasoning_content {
                     if let Some(thinking) = msg
                         .thinking_content
                         .as_deref()
                         .filter(|value| !value.trim().is_empty())
                     {
-                        m["reasoning_content"] = serde_json::json!(thinking);
+                        if flavor == ChatCompletionsFlavor::MiniMax {
+                            m["reasoning_details"] = serde_json::json!([{
+                                "type": "reasoning.text",
+                                "id": "reasoning-text-1",
+                                "format": "MiniMax-response-v1",
+                                "index": 0,
+                                "text": thinking,
+                            }]);
+                        } else {
+                            m["reasoning_content"] = serde_json::json!(thinking);
+                        }
                     }
                 }
                 if let Some(ref tool_calls) = msg.tool_calls {
@@ -433,7 +469,7 @@ fn build_user_content(msg: &ChatMessage, flavor: ChatCompletionsFlavor) -> serde
         ChatCompletionsFlavor::DeepSeek => {
             serde_json::Value::String(deepseek_text_content(&msg.content, msg.images.as_deref()))
         }
-        ChatCompletionsFlavor::Generic => {
+        ChatCompletionsFlavor::Generic | ChatCompletionsFlavor::MiniMax => {
             if let Some(images) = msg.images.as_deref().filter(|images| !images.is_empty()) {
                 let mut blocks: Vec<serde_json::Value> = images
                     .iter()
@@ -497,8 +533,10 @@ struct ChatStreamState {
     thinking_text: String,
     thinking_started_at: Option<Instant>,
     thinking_duration_secs: u32,
+    reasoning_detail_text_by_key: std::collections::HashMap<String, String>,
     tool_calls_map: std::collections::HashMap<i64, PartialToolCall>,
     finish_reason: String,
+    saw_finish_reason: bool,
     input_tokens: u32,
     output_tokens: u32,
     cache_read_tokens: u32,
@@ -513,8 +551,10 @@ impl ChatStreamState {
             thinking_text: String::new(),
             thinking_started_at: None,
             thinking_duration_secs: 0,
+            reasoning_detail_text_by_key: std::collections::HashMap::new(),
             tool_calls_map: std::collections::HashMap::new(),
             finish_reason: String::from("stop"),
+            saw_finish_reason: false,
             input_tokens: 0,
             output_tokens: 0,
             cache_read_tokens: 0,
@@ -535,6 +575,49 @@ impl ChatStreamState {
         }
         self.thinking_text.push_str(delta);
         on_thinking_delta(delta.to_string());
+    }
+
+    fn push_reasoning_details<G>(
+        &mut self,
+        details: &[StreamReasoningDetail],
+        on_thinking_delta: &G,
+    ) where
+        G: Fn(String) + Send + 'static,
+    {
+        for detail in details {
+            let Some(text) = detail.text.as_deref().filter(|value| !value.is_empty()) else {
+                continue;
+            };
+            let key = detail
+                .id
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("index:{}", detail.index.unwrap_or(0)));
+            let previous = self
+                .reasoning_detail_text_by_key
+                .get(&key)
+                .cloned()
+                .unwrap_or_default();
+            let delta = if text.starts_with(&previous) {
+                text[previous.len()..].to_string()
+            } else {
+                text.to_string()
+            };
+            if delta.is_empty() {
+                self.reasoning_detail_text_by_key
+                    .insert(key, text.to_string());
+                continue;
+            }
+            let next_accumulated = if text.starts_with(&previous) {
+                text.to_string()
+            } else {
+                format!("{}{}", previous, text)
+            };
+            self.push_thinking(&delta, on_thinking_delta);
+            self.reasoning_detail_text_by_key
+                .insert(key, next_accumulated);
+        }
     }
 
     fn finish_thinking_timing(&mut self) {
@@ -715,6 +798,9 @@ fn apply_stream_chunk<F, G, H>(
         if let Some(ref reasoning) = choice.delta.reasoning_content {
             state.push_thinking(reasoning, on_thinking_delta);
         }
+        if let Some(ref reasoning_details) = choice.delta.reasoning_details {
+            state.push_reasoning_details(reasoning_details, on_thinking_delta);
+        }
         if let Some(ref content) = choice.delta.content {
             state.finish_thinking_timing();
             state.full_text.push_str(content);
@@ -750,7 +836,11 @@ fn apply_stream_chunk<F, G, H>(
             }
         }
         if let Some(ref reason) = choice.finish_reason {
-            state.finish_reason = reason.clone();
+            let reason = reason.trim();
+            if !reason.is_empty() {
+                state.finish_reason = reason.to_string();
+                state.saw_finish_reason = true;
+            }
         }
     }
     if let Some(ref usage) = chunk.usage {
@@ -926,7 +1016,16 @@ struct StreamChoice {
 struct StreamDelta {
     content: Option<String>,
     reasoning_content: Option<String>,
+    reasoning_details: Option<Vec<StreamReasoningDetail>>,
     tool_calls: Option<Vec<StreamToolCallDelta>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamReasoningDetail {
+    id: Option<String>,
+    #[serde(default)]
+    index: Option<i64>,
+    text: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -946,7 +1045,8 @@ struct StreamFunctionDelta {
 mod tests {
     use super::{
         apply_stream_chunk, build_api_messages, build_request_body, collect_tool_calls,
-        ChatCompletionsFlavor, ChatStreamState, PartialToolCall, StreamChunk,
+        detect_flavor, drain_sse_buffer, finalize_stream_response, ChatCompletionsFlavor,
+        ChatStreamState, PartialToolCall, StreamChunk,
     };
     use crate::session::models::{ChatMessage, ImageData, MessageRole, ToolCallInfo};
     use std::collections::HashMap;
@@ -970,6 +1070,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
             images,
+            asset_refs: None,
             thinking_content: None,
             thinking_duration: None,
             thinking_signature: None,
@@ -1002,6 +1103,7 @@ mod tests {
             }]),
             tool_call_id: None,
             images: None,
+            asset_refs: None,
             thinking_content: Some("I should inspect the file.".to_string()),
             thinking_duration: Some(1),
             thinking_signature: None,
@@ -1024,6 +1126,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: Some(tool_call_id.to_string()),
             images: None,
+            asset_refs: None,
             thinking_content: None,
             thinking_duration: None,
             thinking_signature: None,
@@ -1047,6 +1150,7 @@ mod tests {
                 assistant_message_with_tool_and_thinking(),
             ],
             ChatCompletionsFlavor::DeepSeek,
+            true,
             true,
         );
 
@@ -1075,11 +1179,66 @@ mod tests {
         let mut assistant = assistant_message_with_tool_and_thinking();
         assistant.thinking_content = Some("\n  Keep exact reasoning.  \n".to_string());
 
-        let messages = build_api_messages("", &[assistant], ChatCompletionsFlavor::DeepSeek, true);
+        let messages = build_api_messages(
+            "",
+            &[assistant],
+            ChatCompletionsFlavor::DeepSeek,
+            true,
+            true,
+        );
 
         assert_eq!(
             messages[0]["reasoning_content"],
             serde_json::json!("\n  Keep exact reasoning.  \n")
+        );
+    }
+
+    #[test]
+    fn generic_messages_replay_reasoning_content_when_enabled() {
+        let assistant = assistant_message_with_tool_and_thinking();
+
+        let enabled = build_api_messages(
+            "",
+            &[assistant.clone()],
+            ChatCompletionsFlavor::Generic,
+            false,
+            true,
+        );
+        assert_eq!(
+            enabled[0]["reasoning_content"],
+            serde_json::json!("I should inspect the file.")
+        );
+
+        let disabled = build_api_messages(
+            "",
+            &[assistant],
+            ChatCompletionsFlavor::Generic,
+            false,
+            false,
+        );
+        assert!(disabled[0].get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn minimax_messages_replay_reasoning_details_when_enabled() {
+        let assistant = assistant_message_with_tool_and_thinking();
+
+        let messages = build_api_messages(
+            "",
+            &[assistant],
+            ChatCompletionsFlavor::MiniMax,
+            false,
+            true,
+        );
+
+        assert!(messages[0].get("reasoning_content").is_none());
+        assert_eq!(
+            messages[0]["reasoning_details"][0]["text"],
+            serde_json::json!("I should inspect the file.")
+        );
+        assert_eq!(
+            messages[0]["reasoning_details"][0]["format"],
+            serde_json::json!("MiniMax-response-v1")
         );
     }
 
@@ -1095,6 +1254,7 @@ mod tests {
                 user_message("Continue", None),
             ],
             ChatCompletionsFlavor::DeepSeek,
+            true,
             true,
         );
 
@@ -1122,6 +1282,7 @@ mod tests {
             &[assistant, tool_message("call_1", "file contents")],
             ChatCompletionsFlavor::DeepSeek,
             false,
+            true,
         );
 
         assert_eq!(
@@ -1143,6 +1304,7 @@ mod tests {
                 }]),
             )],
             ChatCompletionsFlavor::Generic,
+            false,
             false,
         );
 
@@ -1183,6 +1345,37 @@ mod tests {
     }
 
     #[test]
+    fn detects_minimax_flavor_by_model_or_endpoint() {
+        assert_eq!(
+            detect_flavor("MiniMax-M2.7", "https://example.com/v1"),
+            ChatCompletionsFlavor::MiniMax
+        );
+        assert_eq!(
+            detect_flavor("custom-model", "https://api.minimax.io/v1"),
+            ChatCompletionsFlavor::MiniMax
+        );
+        assert_eq!(
+            detect_flavor("custom-model", "https://api.minimaxi.com/v1"),
+            ChatCompletionsFlavor::MiniMax
+        );
+    }
+
+    #[test]
+    fn minimax_request_body_enables_reasoning_split() {
+        let body = build_request_body(
+            "MiniMax-M2.7",
+            Vec::new(),
+            &[],
+            Some("high"),
+            Some("high"),
+            ChatCompletionsFlavor::MiniMax,
+        );
+
+        assert_eq!(body["reasoning_split"], serde_json::json!(true));
+        assert_eq!(body["reasoning_effort"], serde_json::json!("high"));
+    }
+
+    #[test]
     fn stream_reasoning_content_updates_thinking_channel() {
         let mut state = ChatStreamState::new();
         let thinking = Arc::new(Mutex::new(String::new()));
@@ -1207,6 +1400,59 @@ mod tests {
         assert_eq!(
             thinking.lock().expect("thinking mutex poisoned").as_str(),
             "Think first."
+        );
+    }
+
+    #[test]
+    fn stream_reasoning_details_updates_thinking_channel_without_duplicates() {
+        let mut state = ChatStreamState::new();
+        let thinking = Arc::new(Mutex::new(String::new()));
+        let captured = thinking.clone();
+        let on_thinking = move |delta: String| {
+            captured
+                .lock()
+                .expect("thinking mutex poisoned")
+                .push_str(&delta);
+        };
+
+        let first: StreamChunk = serde_json::from_value(serde_json::json!({
+            "choices": [{
+                "delta": {
+                    "reasoning_details": [{
+                        "type": "reasoning.text",
+                        "id": "reasoning-text-1",
+                        "format": "MiniMax-response-v1",
+                        "index": 0,
+                        "text": "Think"
+                    }]
+                },
+                "finish_reason": null
+            }]
+        }))
+        .expect("first chunk should parse");
+        apply_stream_chunk(first, &mut state, &ignore_text, &on_thinking, &ignore_tool);
+
+        let second: StreamChunk = serde_json::from_value(serde_json::json!({
+            "choices": [{
+                "delta": {
+                    "reasoning_details": [{
+                        "type": "reasoning.text",
+                        "id": "reasoning-text-1",
+                        "format": "MiniMax-response-v1",
+                        "index": 0,
+                        "text": "Think more."
+                    }]
+                },
+                "finish_reason": null
+            }]
+        }))
+        .expect("second chunk should parse");
+        apply_stream_chunk(second, &mut state, &ignore_text, &on_thinking, &ignore_tool);
+
+        assert_eq!(state.thinking_text, "Think more.");
+        assert_eq!(
+            thinking.lock().expect("thinking mutex poisoned").as_str(),
+            "Think more."
         );
     }
 
@@ -1296,6 +1542,57 @@ mod tests {
             started.lock().expect("tool mutex poisoned").as_slice(),
             &[("call_1".to_string(), "list".to_string())]
         );
+    }
+
+    #[test]
+    fn stream_eof_after_finish_reason_finalizes_without_done_marker() {
+        let mut state = ChatStreamState::new();
+        let chunk = serde_json::json!({
+            "choices": [{
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_1",
+                        "function": {
+                            "name": "list",
+                            "arguments": "{\"path\":\"Assets\"}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+        let raw_response = format!("data: {}\n\n", chunk);
+        let mut buffer = raw_response.clone();
+
+        let got_done = drain_sse_buffer(
+            &mut buffer,
+            true,
+            false,
+            &mut state,
+            &ignore_text,
+            &ignore_thinking,
+            &ignore_tool,
+        )
+        .expect("stream chunk should parse");
+
+        assert!(!got_done);
+        assert!(state.saw_finish_reason);
+        let saw_finish_reason = state.saw_finish_reason;
+        let response = finalize_stream_response(
+            "Custom Chat",
+            false,
+            saw_finish_reason,
+            state,
+            String::new(),
+            raw_response,
+        )
+        .expect("finish_reason should be accepted as terminal at EOF");
+
+        assert_eq!(response.finish_reason, "tool_calls");
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.tool_calls[0].name, "list");
+        assert_eq!(response.tool_calls[0].arguments, "{\"path\":\"Assets\"}");
     }
 
     #[test]

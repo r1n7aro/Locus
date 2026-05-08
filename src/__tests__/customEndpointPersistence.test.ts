@@ -93,10 +93,11 @@ function endpoint(partial: Partial<CustomEndpoint> & Pick<CustomEndpoint, "id" |
     endpoint: "https://example.com/v1",
     apiFormat: "openai_chat",
     apiKey: "",
-    contextLength: 128000,
+    contextLength: 256000,
     betaFlags: [],
     supportedReasoningEfforts: ["low", "medium", "high", "max"],
     reasoningParamFormat: "openai_chat_reasoning_effort",
+    replayReasoningContent: true,
     ...partial,
   };
 }
@@ -135,6 +136,39 @@ describe("custom endpoint persistence", () => {
     expect(emitted).toContainEqual(["customEndpointsChanged", [saved]]);
     expect(state.customEndpointSaving.value).toBe(false);
     expect(state.editingEndpoint.value).toBeNull();
+  });
+
+  it("starts new endpoints with the 256k context window default", () => {
+    const state = useSettingsState((() => undefined) as never);
+
+    state.startAddEndpoint();
+
+    expect(state.editingEndpoint.value?.contextLength).toBe(256000);
+  });
+
+  it("starts new OpenAI Chat endpoints with reasoning content replay enabled", () => {
+    const state = useSettingsState((() => undefined) as never);
+
+    state.startAddEndpoint();
+
+    expect(state.editingEndpoint.value?.replayReasoningContent).toBe(true);
+  });
+
+  it("normalizes legacy OpenAI Chat endpoints to replay reasoning content", async () => {
+    const state = useSettingsState((() => undefined) as never);
+    modelServiceMocks.getCustomEndpoints.mockResolvedValueOnce([
+      endpoint({
+        id: "openai-chat",
+        name: "OpenAI Chat",
+        apiModel: "chat-model",
+        endpoint: "https://example.com/v1",
+        replayReasoningContent: undefined,
+      } as any),
+    ]);
+
+    await state.loadCustomEndpoints();
+
+    expect(state.customEndpoints.value[0].replayReasoningContent).toBe(true);
   });
 
   it("serializes delete mutations against the latest reloaded list", async () => {

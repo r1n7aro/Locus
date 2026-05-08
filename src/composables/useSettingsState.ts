@@ -49,6 +49,8 @@ import { filterVisibleProviders } from "../config/providerVisibility";
 import { useCopyFeedback } from "./useCopyFeedback";
 import { setThemePreference } from "./useTheme";
 
+const DEFAULT_CUSTOM_ENDPOINT_CONTEXT_LENGTH = 256_000;
+
 export interface ProviderStatus {
   id: string;
   name: string;
@@ -662,12 +664,22 @@ export function useSettingsState(emit: SettingsEmit) {
     return normalized.length > 0 ? normalized : [...defaultReasoningEfforts];
   }
 
+  function defaultReplayReasoningContent(ep: CustomEndpoint): boolean {
+    return ep.apiFormat === "openai_chat";
+  }
+
   function normalizeCustomEndpoint(ep: CustomEndpoint): CustomEndpoint {
     return {
       ...ep,
+      contextLength: Number.isFinite(ep.contextLength) && ep.contextLength > 0
+        ? ep.contextLength
+        : DEFAULT_CUSTOM_ENDPOINT_CONTEXT_LENGTH,
       betaFlags: [...(ep.betaFlags ?? [])],
       supportedReasoningEfforts: normalizeReasoningEfforts(ep.supportedReasoningEfforts),
       reasoningParamFormat: ep.reasoningParamFormat ?? defaultReasoningParamFormat(ep.apiFormat),
+      replayReasoningContent: typeof ep.replayReasoningContent === "boolean"
+        ? ep.replayReasoningContent
+        : defaultReplayReasoningContent(ep),
     };
   }
 
@@ -709,10 +721,11 @@ export function useSettingsState(emit: SettingsEmit) {
       endpoint: "",
       apiFormat,
       apiKey: "",
-      contextLength: 128000,
+      contextLength: DEFAULT_CUSTOM_ENDPOINT_CONTEXT_LENGTH,
       betaFlags: [],
       supportedReasoningEfforts: [...defaultReasoningEfforts],
       reasoningParamFormat: defaultReasoningParamFormat(apiFormat),
+      replayReasoningContent: true,
     };
   }
 
