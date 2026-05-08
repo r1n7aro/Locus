@@ -1,9 +1,9 @@
 ---
 title: "Latest Version"
-description: "Locus v0.2.11 (2026-05-08)"
+description: "Locus v0.2.12 (2026-05-09)"
 sidebarTitle: "Latest Version"
-version: "0.2.11"
-releasedAt: "2026-05-08"
+version: "0.2.12"
+releasedAt: "2026-05-09"
 channel: "stable"
 updateTitle: "Update available"
 changelogUrl: "/en/overview/latest-version"
@@ -17,18 +17,15 @@ changelogUrl: "/en/overview/latest-version"
 
 ### Added
 
-- Added QQ group 1104932978 for community discussion.
-- Added chat references for Unity assets, scene objects, and project knowledge. References can be selected from `@` search, shown as attachment chips, sent with messages, and preserved in transcripts and context export.
-- Added Unity embedded drag-and-drop references so Unity assets and scene objects can be dropped into the composer and reopened or selected from chat.
-- Added a dedicated `/compact` action that runs as its own session task, records the latest context window usage, and shows a compacted-context divider in the transcript.
-- Added OpenAI Chat custom endpoint reasoning replay for multi-turn tool calls, plus MiniMax reasoning split and reasoning details support.
+- Made QQ group 1104932978 searchable for community discussion.
+- Added Unity editor context references in chat. Unity assets and scene objects can be sent from the editor into the composer, included with messages as references, and reopened or selected from the transcript.
+- Added `xhigh` reasoning effort support for custom endpoints that expose GPT-5 / Codex-style effort levels.
 
 ### Fixed
 
-- Fixed compact token budgeting to count tool arguments, nested tool calls, and server tool output when choosing the retained message boundary.
-- Fixed compacted handoff display order and kept compact markers out of normal assistant message grouping.
-- Fixed OpenAI-compatible streaming providers that finish with `finish_reason` before the `[DONE]` marker.
-- Fixed custom endpoint defaults by using a 256K context window and preserving legacy OpenAI Chat reasoning replay behavior.
+- Hardened Unity execute progress transport around temporarily unavailable progress snapshots, pipe reconnects, and cancellation draining.
+- File changes from a cancelled run now remain visible after interruption.
+- System notifications now stay silent while the embedded Unity window has input focus.
 
 ### Removed
 

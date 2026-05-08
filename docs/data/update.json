@@ -1,30 +1,27 @@
 {
-  "version": "0.2.11",
-  "releasedAt": "2026-05-08",
+  "version": "0.2.12",
+  "releasedAt": "2026-05-09",
   "channel": "stable",
   "locales": {
     "zh": {
       "title": "发现新版本",
-      "summary": "Locus v0.2.11 (2026-05-08)",
+      "summary": "Locus v0.2.12 (2026-05-09)",
       "changelogUrl": "/overview/latest-version",
       "changes": [
         {
           "title": "新增",
           "items": [
-            "QQ群号：1104932978，欢迎加入交流。",
-            "聊天支持引用 Unity 资产、场景对象与项目知识。引用可通过 `@` 搜索选择，以附件形式展示，随消息发送，并保留在转录与上下文导出中。",
-            "Unity 嵌入窗口支持拖拽资产与场景对象到输入区，并可从聊天中重新选择或打开。",
-            "`/compact` 使用独立会话任务执行上下文压缩，记录最新上下文窗口用量，并在转录中显示“上下文已压缩”分隔标记。",
-            "OpenAI Chat 自定义 endpoint 支持多轮工具调用回放 reasoning 内容，并新增 MiniMax reasoning split 与 reasoning details 支持。"
+            "QQ群号：1104932978，欢迎加入交流，现在可以搜索到了，之前没有开搜索。",
+            "聊天支持接收 Unity 编辑器上下文引用。Unity 资产与场景对象可从编辑器发送到输入区，以引用形式随消息发送，并可在转录中重新选择或打开。",
+            "自定义 endpoint 支持 `xhigh` 推理强度，可用于 GPT-5 / Codex 风格的最高推理档位。"
           ]
         },
         {
           "title": "修复",
           "items": [
-            "上下文压缩预算会计入工具参数、嵌套工具调用与服务端工具输出，保留边界更准确。",
-            "修复压缩交接标记的显示顺序，并避免压缩标记混入普通 assistant 消息分组。",
-            "修复部分 OpenAI 兼容流式接口在 `[DONE]` 前返回 `finish_reason` 时的收尾处理。",
-            "自定义 endpoint 默认上下文窗口调整为 256K，并保留旧 OpenAI Chat endpoint 的 reasoning 回放行为。"
+            "Unity 执行进度传输在进度临时不可用、管道重连与取消收尾时更稳定。",
+            "中断已取消的运行后，文件变更面板会继续显示该轮产生的变更。",
+            "Unity 嵌入窗口获得输入焦点时，系统通知会保持静默。"
           ]
         },
         {
@@ -43,26 +40,23 @@
     },
     "en": {
       "title": "Update available",
-      "summary": "Locus v0.2.11 (2026-05-08)",
+      "summary": "Locus v0.2.12 (2026-05-09)",
       "changelogUrl": "/en/overview/latest-version",
       "changes": [
         {
           "title": "Added",
           "items": [
-            "Added QQ group 1104932978 for community discussion.",
-            "Added chat references for Unity assets, scene objects, and project knowledge. References can be selected from `@` search, shown as attachment chips, sent with messages, and preserved in transcripts and context export.",
-            "Added Unity embedded drag-and-drop references so Unity assets and scene objects can be dropped into the composer and reopened or selected from chat.",
-            "Added a dedicated `/compact` action that runs as its own session task, records the latest context window usage, and shows a compacted-context divider in the transcript.",
-            "Added OpenAI Chat custom endpoint reasoning replay for multi-turn tool calls, plus MiniMax reasoning split and reasoning details support."
+            "Made QQ group 1104932978 searchable for community discussion.",
+            "Added Unity editor context references in chat. Unity assets and scene objects can be sent from the editor into the composer, included with messages as references, and reopened or selected from the transcript.",
+            "Added `xhigh` reasoning effort support for custom endpoints that expose GPT-5 / Codex-style effort levels."
           ]
         },
         {
           "title": "Fixed",
           "items": [
-            "Fixed compact token budgeting to count tool arguments, nested tool calls, and server tool output when choosing the retained message boundary.",
-            "Fixed compacted handoff display order and kept compact markers out of normal assistant message grouping.",
-            "Fixed OpenAI-compatible streaming providers that finish with `finish_reason` before the `[DONE]` marker.",
-            "Fixed custom endpoint defaults by using a 256K context window and preserving legacy OpenAI Chat reasoning replay behavior."
+            "Hardened Unity execute progress transport around temporarily unavailable progress snapshots, pipe reconnects, and cancellation draining.",
+            "File changes from a cancelled run now remain visible after interruption.",
+            "System notifications now stay silent while the embedded Unity window has input focus."
           ]
         },
         {
