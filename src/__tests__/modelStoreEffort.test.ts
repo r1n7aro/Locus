@@ -117,7 +117,7 @@ describe("useModelStore OpenAI effort mapping", () => {
     expect(modelStore.availableEfforts).toEqual(["medium", "high"]);
   });
 
-  it("defaults custom endpoints to low medium high max reasoning controls", () => {
+  it("defaults custom endpoints to low medium high xhigh max reasoning controls", () => {
     const modelStore = useModelStore();
 
     modelStore.applyCustomEndpoints([{
@@ -134,8 +134,29 @@ describe("useModelStore OpenAI effort mapping", () => {
     } as any]);
     modelStore.selectedModelId = "custom/endpoint-1";
 
-    expect(modelStore.availableEfforts).toEqual(["low", "medium", "high", "max"]);
+    expect(modelStore.availableEfforts).toEqual(["low", "medium", "high", "xhigh", "max"]);
     expect(modelStore.effortSupported).toBe(true);
+  });
+
+  it("upgrades legacy custom endpoint defaults to include xhigh", () => {
+    const modelStore = useModelStore();
+
+    modelStore.applyCustomEndpoints([{
+      id: "endpoint-1",
+      name: "Custom Chat",
+      apiModel: "deepseek-v4-pro",
+      endpoint: "https://example.com/v1",
+      apiFormat: "openai_chat",
+      apiKey: "",
+      contextLength: 256000,
+      betaFlags: [],
+      supportedReasoningEfforts: ["low", "medium", "high", "max"],
+      reasoningParamFormat: "openai_chat_reasoning_effort",
+      replayReasoningContent: true,
+    }]);
+    modelStore.selectedModelId = "custom/endpoint-1";
+
+    expect(modelStore.availableEfforts).toEqual(["low", "medium", "high", "xhigh", "max"]);
   });
 
   it("loads the saved effort selection from persistence", async () => {

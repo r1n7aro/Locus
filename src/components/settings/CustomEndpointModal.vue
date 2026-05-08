@@ -35,6 +35,7 @@ const customReasoningEffortOptions = [
   { value: "low", label: "Low" },
   { value: "medium", label: "Med" },
   { value: "high", label: "High" },
+  { value: "xhigh", label: "XHigh" },
   { value: "max", label: "Max" },
 ] satisfies Array<{ value: EffortLevel; label: string }>;
 
@@ -105,7 +106,7 @@ function handleEndpointKeydown(e: KeyboardEvent) {
 <template>
   <Transition name="modal">
     <div v-if="endpoint" class="modal-overlay" @mousedown.self="!saving && emit('close')">
-      <div class="modal-dialog" role="dialog" aria-modal="true">
+      <div class="modal-dialog custom-endpoint-dialog" role="dialog" aria-modal="true">
         <div class="modal-header">
           <span class="modal-title">{{ modalTitle }}</span>
           <button class="close-btn" type="button" :disabled="saving" @click="emit('close')">
@@ -115,175 +116,177 @@ function handleEndpointKeydown(e: KeyboardEvent) {
           </button>
         </div>
 
-        <div class="modal-body">
-          <div class="custom-form-row">
-            <label class="custom-form-label">{{ t("settings.custom.name") }}</label>
-            <input
-              v-model="endpoint.name"
-              class="key-input"
-              type="text"
-              :disabled="saving"
-              :placeholder="t('settings.custom.namePlaceholder')"
-              @keydown="handleEndpointKeydown"
-            />
-          </div>
-          <div class="custom-form-row">
-            <label class="custom-form-label">
-              {{ t("settings.custom.apiModel") }}
-              <span class="custom-form-hint">{{ t("settings.custom.apiModelHint") }}</span>
-            </label>
-            <input
-              v-model="endpoint.apiModel"
-              class="key-input"
-              type="text"
-              :disabled="saving"
-              :placeholder="t('settings.custom.apiModelPlaceholder')"
-              @keydown="handleEndpointKeydown"
-            />
-          </div>
-          <div class="custom-form-row">
-            <label class="custom-form-label">
-              {{ t("settings.custom.endpoint") }}
-              <span class="custom-form-hint">{{ t("settings.custom.endpointHint") }}</span>
-            </label>
-            <input
-              v-model="endpoint.endpoint"
-              class="key-input"
-              type="text"
-              :disabled="saving"
-              :placeholder="t('settings.custom.endpointPlaceholder')"
-              @keydown="handleEndpointKeydown"
-            />
-          </div>
-          <div class="custom-form-row">
-            <label class="custom-form-label">{{ t("settings.custom.apiFormat") }}</label>
-            <select
-              :value="endpoint.apiFormat"
-              class="model-select"
-              :disabled="saving"
-              @change="updateEndpointApiFormat"
-            >
-              <option value="openai_chat">{{ t("settings.custom.formatOpenaiChat") }}</option>
-              <option value="openai_responses">{{ t("settings.custom.formatOpenaiResponses") }}</option>
-              <option value="anthropic_messages">{{ t("settings.custom.formatAnthropicMessages") }}</option>
-            </select>
-          </div>
-          <div class="custom-form-row">
-            <label class="custom-form-label">
-              {{ t("settings.custom.apiKey") }}
-              <span class="custom-form-hint">{{ t("settings.custom.apiKeyOptional") }}</span>
-            </label>
-            <input
-              v-model="endpoint.apiKey"
-              class="key-input"
-              type="password"
-              :disabled="saving"
-              :placeholder="t('settings.custom.apiKeyPlaceholder')"
-              @keydown="handleEndpointKeydown"
-            />
-          </div>
-          <div class="custom-form-row">
-            <label class="custom-form-label">
-              {{ t("settings.custom.contextLength") }}
-              <span class="custom-form-hint">{{ t("settings.custom.contextLengthHint") }}</span>
-            </label>
-            <input
-              v-model.number="endpoint.contextLength"
-              class="key-input"
-              type="number"
-              :disabled="saving"
-              min="1024"
-              step="1024"
-              placeholder="256000"
-              @keydown="handleEndpointKeydown"
-            />
-          </div>
-          <div class="custom-form-row">
-            <label class="custom-form-label">{{ t("settings.custom.reasoningFormat") }}</label>
-            <select v-model="endpoint.reasoningParamFormat" class="model-select" :disabled="saving">
-              <option
-                v-for="option in customReasoningFormatOptions"
-                :key="option.value"
-                :value="option.value"
-              >
-                {{ option.label }}
-              </option>
-            </select>
-          </div>
-          <div v-if="endpoint.apiFormat === 'openai_chat'" class="custom-form-row">
-            <div class="custom-option-row">
-              <BaseCheckbox
-                v-model="endpoint.replayReasoningContent"
+        <div class="modal-body custom-endpoint-body">
+          <div class="custom-form-stack">
+            <div class="custom-form-row">
+              <label class="custom-form-label">{{ t("settings.custom.name") }}</label>
+              <input
+                v-model="endpoint.name"
+                class="key-input"
+                type="text"
                 :disabled="saving"
-                :aria-label="t('settings.custom.replayReasoningContent')"
+                :placeholder="t('settings.custom.namePlaceholder')"
+                @keydown="handleEndpointKeydown"
               />
-              <div class="custom-option-copy">
-                <span class="custom-option-name">{{ t("settings.custom.replayReasoningContent") }}</span>
-                <span class="custom-option-desc">{{ t("settings.custom.replayReasoningContentHint") }}</span>
-              </div>
             </div>
-          </div>
-          <div v-if="endpoint.reasoningParamFormat !== 'none'" class="custom-form-row">
-            <label class="custom-form-label">
-              {{ t("settings.custom.reasoningEfforts") }}
-              <span class="custom-form-hint">{{ t("settings.custom.reasoningEffortsHint") }}</span>
-            </label>
-            <div class="custom-options-list compact">
-              <div
-                v-for="option in customReasoningEffortOptions"
-                :key="option.value"
-                class="custom-option-row compact"
+            <div class="custom-form-row">
+              <label class="custom-form-label">
+                {{ t("settings.custom.apiModel") }}
+                <span class="custom-form-hint">{{ t("settings.custom.apiModelHint") }}</span>
+              </label>
+              <input
+                v-model="endpoint.apiModel"
+                class="key-input"
+                type="text"
+                :disabled="saving"
+                :placeholder="t('settings.custom.apiModelPlaceholder')"
+                @keydown="handleEndpointKeydown"
+              />
+            </div>
+            <div class="custom-form-row">
+              <label class="custom-form-label">
+                {{ t("settings.custom.endpoint") }}
+                <span class="custom-form-hint">{{ t("settings.custom.endpointHint") }}</span>
+              </label>
+              <input
+                v-model="endpoint.endpoint"
+                class="key-input"
+                type="text"
+                :disabled="saving"
+                :placeholder="t('settings.custom.endpointPlaceholder')"
+                @keydown="handleEndpointKeydown"
+              />
+            </div>
+            <div class="custom-form-row">
+              <label class="custom-form-label">{{ t("settings.custom.apiFormat") }}</label>
+              <select
+                :value="endpoint.apiFormat"
+                class="model-select"
+                :disabled="saving"
+                @change="updateEndpointApiFormat"
               >
+                <option value="openai_chat">{{ t("settings.custom.formatOpenaiChat") }}</option>
+                <option value="openai_responses">{{ t("settings.custom.formatOpenaiResponses") }}</option>
+                <option value="anthropic_messages">{{ t("settings.custom.formatAnthropicMessages") }}</option>
+              </select>
+            </div>
+            <div class="custom-form-row">
+              <label class="custom-form-label">
+                {{ t("settings.custom.apiKey") }}
+                <span class="custom-form-hint">{{ t("settings.custom.apiKeyOptional") }}</span>
+              </label>
+              <input
+                v-model="endpoint.apiKey"
+                class="key-input"
+                type="password"
+                :disabled="saving"
+                :placeholder="t('settings.custom.apiKeyPlaceholder')"
+                @keydown="handleEndpointKeydown"
+              />
+            </div>
+            <div class="custom-form-row">
+              <label class="custom-form-label">
+                {{ t("settings.custom.contextLength") }}
+                <span class="custom-form-hint">{{ t("settings.custom.contextLengthHint") }}</span>
+              </label>
+              <input
+                v-model.number="endpoint.contextLength"
+                class="key-input number-input"
+                type="number"
+                :disabled="saving"
+                min="1024"
+                step="1024"
+                placeholder="256000"
+                @keydown="handleEndpointKeydown"
+              />
+            </div>
+            <div class="custom-form-row">
+              <label class="custom-form-label">{{ t("settings.custom.reasoningFormat") }}</label>
+              <select v-model="endpoint.reasoningParamFormat" class="model-select" :disabled="saving">
+                <option
+                  v-for="option in customReasoningFormatOptions"
+                  :key="option.value"
+                  :value="option.value"
+                >
+                  {{ option.label }}
+                </option>
+              </select>
+            </div>
+            <div v-if="endpoint.apiFormat === 'openai_chat'" class="custom-form-row">
+              <label class="custom-form-label">
+                {{ t("settings.custom.replayReasoningContent") }}
+                <span class="custom-form-hint">{{ t("settings.custom.replayReasoningContentHint") }}</span>
+              </label>
+              <div class="custom-checkbox-control">
                 <BaseCheckbox
+                  v-model="endpoint.replayReasoningContent"
                   :disabled="saving"
-                  :model-value="endpoint.supportedReasoningEfforts?.includes(option.value) ?? false"
-                  :aria-label="option.label"
-                  @update:model-value="setReasoningEffortEnabled(option.value, $event)"
+                  :aria-label="t('settings.custom.replayReasoningContent')"
                 />
-                <span class="custom-option-name mono">{{ option.label }}</span>
               </div>
             </div>
-          </div>
-          <div v-if="endpoint.apiFormat === 'anthropic_messages'" class="custom-form-row">
-            <label class="custom-form-label">
-              {{ t("settings.custom.betaFlags") }}
-              <span class="custom-form-hint">{{ t("settings.custom.betaFlagsHint") }}</span>
-            </label>
-            <div class="custom-options-list">
-              <div class="custom-option-row">
-                <BaseCheckbox
-                  :disabled="saving"
-                  :model-value="endpoint.betaFlags?.includes('context-1m-2025-08-07') ?? false"
-                  aria-label="context-1m-2025-08-07"
-                  @update:model-value="setBetaFlagEnabled('context-1m-2025-08-07', $event)"
-                />
-                <div class="custom-option-copy inline">
-                  <span class="custom-option-name mono">context-1m-2025-08-07</span>
-                  <span class="custom-option-desc">{{ t("settings.custom.betaContext1m") }}</span>
+            <div v-if="endpoint.reasoningParamFormat !== 'none'" class="custom-form-row">
+              <label class="custom-form-label">
+                {{ t("settings.custom.reasoningEfforts") }}
+                <span class="custom-form-hint">{{ t("settings.custom.reasoningEffortsHint") }}</span>
+              </label>
+              <div class="custom-effort-options">
+                <div
+                  v-for="option in customReasoningEffortOptions"
+                  :key="option.value"
+                  class="custom-option-row compact"
+                >
+                  <BaseCheckbox
+                    :disabled="saving"
+                    :model-value="endpoint.supportedReasoningEfforts?.includes(option.value) ?? false"
+                    :aria-label="option.label"
+                    @update:model-value="setReasoningEffortEnabled(option.value, $event)"
+                  />
+                  <span class="custom-option-name mono">{{ option.label }}</span>
                 </div>
               </div>
-              <div class="custom-option-row">
-                <BaseCheckbox
-                  :disabled="saving"
-                  :model-value="endpoint.betaFlags?.includes('interleaved-thinking-2025-05-14') ?? false"
-                  aria-label="interleaved-thinking-2025-05-14"
-                  @update:model-value="setBetaFlagEnabled('interleaved-thinking-2025-05-14', $event)"
-                />
-                <div class="custom-option-copy inline">
-                  <span class="custom-option-name mono">interleaved-thinking-2025-05-14</span>
-                  <span class="custom-option-desc">{{ t("settings.custom.betaInterleavedThinking") }}</span>
+            </div>
+            <div v-if="endpoint.apiFormat === 'anthropic_messages'" class="custom-form-row">
+              <label class="custom-form-label">
+                {{ t("settings.custom.betaFlags") }}
+                <span class="custom-form-hint">{{ t("settings.custom.betaFlagsHint") }}</span>
+              </label>
+              <div class="custom-options-list">
+                <div class="custom-option-row">
+                  <BaseCheckbox
+                    :disabled="saving"
+                    :model-value="endpoint.betaFlags?.includes('context-1m-2025-08-07') ?? false"
+                    aria-label="context-1m-2025-08-07"
+                    @update:model-value="setBetaFlagEnabled('context-1m-2025-08-07', $event)"
+                  />
+                  <div class="custom-option-copy inline">
+                    <span class="custom-option-name mono">context-1m-2025-08-07</span>
+                    <span class="custom-option-desc">{{ t("settings.custom.betaContext1m") }}</span>
+                  </div>
                 </div>
-              </div>
-              <div class="custom-option-row">
-                <BaseCheckbox
-                  :disabled="saving"
-                  :model-value="endpoint.betaFlags?.includes('prompt-caching-scope-2026-01-05') ?? false"
-                  aria-label="prompt-caching-scope-2026-01-05"
-                  @update:model-value="setBetaFlagEnabled('prompt-caching-scope-2026-01-05', $event)"
-                />
-                <div class="custom-option-copy inline">
-                  <span class="custom-option-name mono">prompt-caching-scope-2026-01-05</span>
-                  <span class="custom-option-desc">{{ t("settings.custom.betaPromptCaching") }}</span>
+                <div class="custom-option-row">
+                  <BaseCheckbox
+                    :disabled="saving"
+                    :model-value="endpoint.betaFlags?.includes('interleaved-thinking-2025-05-14') ?? false"
+                    aria-label="interleaved-thinking-2025-05-14"
+                    @update:model-value="setBetaFlagEnabled('interleaved-thinking-2025-05-14', $event)"
+                  />
+                  <div class="custom-option-copy inline">
+                    <span class="custom-option-name mono">interleaved-thinking-2025-05-14</span>
+                    <span class="custom-option-desc">{{ t("settings.custom.betaInterleavedThinking") }}</span>
+                  </div>
+                </div>
+                <div class="custom-option-row">
+                  <BaseCheckbox
+                    :disabled="saving"
+                    :model-value="endpoint.betaFlags?.includes('prompt-caching-scope-2026-01-05') ?? false"
+                    aria-label="prompt-caching-scope-2026-01-05"
+                    @update:model-value="setBetaFlagEnabled('prompt-caching-scope-2026-01-05', $event)"
+                  />
+                  <div class="custom-option-copy inline">
+                    <span class="custom-option-name mono">prompt-caching-scope-2026-01-05</span>
+                    <span class="custom-option-desc">{{ t("settings.custom.betaPromptCaching") }}</span>
+                  </div>
                 </div>
               </div>
             </div>
@@ -343,6 +346,11 @@ function handleEndpointKeydown(e: KeyboardEvent) {
   overflow: hidden;
 }
 
+.modal-dialog.custom-endpoint-dialog {
+  width: 560px;
+  max-width: calc(100% - 48px);
+}
+
 .modal-header {
   display: flex;
   align-items: center;
@@ -363,6 +371,17 @@ function handleEndpointKeydown(e: KeyboardEvent) {
   flex-direction: column;
   gap: 12px;
   overflow-y: auto;
+}
+
+.modal-body.custom-endpoint-body {
+  padding: 14px 20px 16px;
+  gap: 14px;
+}
+
+.custom-form-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
 }
 
 .modal-footer {
@@ -399,29 +418,38 @@ function handleEndpointKeydown(e: KeyboardEvent) {
   cursor: not-allowed;
 }
 
-.custom-form-row {
+.custom-endpoint-body .custom-form-row {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 6px;
+  min-width: 0;
 }
 
-.custom-form-label {
+.custom-endpoint-body .custom-form-label {
   font-size: 12px;
   font-weight: 600;
   color: var(--text-color);
   display: flex;
-  align-items: baseline;
-  gap: 6px;
+  flex-direction: column;
+  align-items: flex-start;
+  flex-wrap: wrap;
+  gap: 2px;
+  min-width: 0;
+  line-height: 1.35;
+  padding-top: 0;
 }
 
-.custom-form-hint {
+.custom-endpoint-body .custom-form-hint {
   font-size: 11px;
   font-weight: 400;
   color: var(--text-secondary);
+  min-width: 0;
 }
 
 .key-input {
   flex: 1;
+  width: 100%;
+  min-width: 0;
   padding: 7px 10px;
   border-radius: 6px;
   border: 1px solid var(--border-color);
@@ -430,7 +458,12 @@ function handleEndpointKeydown(e: KeyboardEvent) {
   font-size: 13px;
   font-family: var(--font-mono-editor);
   outline: none;
+  box-sizing: border-box;
   transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.number-input {
+  max-width: 180px;
 }
 
 .key-input:focus {
@@ -440,6 +473,7 @@ function handleEndpointKeydown(e: KeyboardEvent) {
 
 .model-select {
   width: 100%;
+  min-width: 0;
   padding: 7px 10px;
   border-radius: 6px;
   border: 1px solid var(--border-color);
@@ -456,6 +490,7 @@ function handleEndpointKeydown(e: KeyboardEvent) {
   background-repeat: no-repeat;
   background-position: right 10px center;
   padding-right: 28px;
+  box-sizing: border-box;
 }
 
 .model-select:focus {
@@ -475,10 +510,12 @@ function handleEndpointKeydown(e: KeyboardEvent) {
   gap: 8px;
 }
 
-.custom-options-list.compact {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(64px, max-content));
-  gap: 8px 14px;
+.custom-effort-options {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 18px;
+  min-height: 32px;
 }
 
 .custom-option-row {
@@ -490,6 +527,17 @@ function handleEndpointKeydown(e: KeyboardEvent) {
 
 .custom-option-row.compact {
   align-items: center;
+  min-width: 0;
+  min-height: 24px;
+  gap: 6px;
+}
+
+.custom-checkbox-control {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 24px;
+  min-width: 0;
 }
 
 .custom-option-copy {
@@ -515,6 +563,7 @@ function handleEndpointKeydown(e: KeyboardEvent) {
 .custom-option-name.mono {
   font-family: var(--font-mono-identifier);
   font-size: 11px;
+  white-space: nowrap;
 }
 
 .custom-option-desc {
@@ -612,5 +661,16 @@ function handleEndpointKeydown(e: KeyboardEvent) {
 
 @keyframes spin {
   to { transform: rotate(360deg); }
+}
+
+@media (max-width: 700px) {
+  .modal-dialog.custom-endpoint-dialog {
+    width: min(560px, calc(100% - 24px));
+    max-width: calc(100% - 24px);
+  }
+
+  .number-input {
+    max-width: none;
+  }
 }
 </style>

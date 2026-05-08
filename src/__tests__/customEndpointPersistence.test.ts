@@ -95,7 +95,7 @@ function endpoint(partial: Partial<CustomEndpoint> & Pick<CustomEndpoint, "id" |
     apiKey: "",
     contextLength: 256000,
     betaFlags: [],
-    supportedReasoningEfforts: ["low", "medium", "high", "max"],
+    supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max"],
     reasoningParamFormat: "openai_chat_reasoning_effort",
     replayReasoningContent: true,
     ...partial,
@@ -154,6 +154,20 @@ describe("custom endpoint persistence", () => {
     expect(state.editingEndpoint.value?.replayReasoningContent).toBe(true);
   });
 
+  it("starts new endpoints with xhigh and max reasoning efforts", () => {
+    const state = useSettingsState((() => undefined) as never);
+
+    state.startAddEndpoint();
+
+    expect(state.editingEndpoint.value?.supportedReasoningEfforts).toEqual([
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ]);
+  });
+
   it("normalizes legacy OpenAI Chat endpoints to replay reasoning content", async () => {
     const state = useSettingsState((() => undefined) as never);
     modelServiceMocks.getCustomEndpoints.mockResolvedValueOnce([
@@ -169,6 +183,27 @@ describe("custom endpoint persistence", () => {
     await state.loadCustomEndpoints();
 
     expect(state.customEndpoints.value[0].replayReasoningContent).toBe(true);
+  });
+
+  it("normalizes legacy default reasoning efforts to include xhigh", async () => {
+    const state = useSettingsState((() => undefined) as never);
+    modelServiceMocks.getCustomEndpoints.mockResolvedValueOnce([
+      endpoint({
+        id: "legacy-efforts",
+        name: "Legacy Efforts",
+        supportedReasoningEfforts: ["low", "medium", "high", "max"],
+      }),
+    ]);
+
+    await state.loadCustomEndpoints();
+
+    expect(state.customEndpoints.value[0].supportedReasoningEfforts).toEqual([
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ]);
   });
 
   it("serializes delete mutations against the latest reloaded list", async () => {

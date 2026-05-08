@@ -644,7 +644,8 @@ export function useSettingsState(emit: SettingsEmit) {
   const customEndpointSaving = ref(false);
   const testStatus = ref<"idle" | "testing" | "success" | "error">("idle");
   const testResult = ref("");
-  const defaultReasoningEfforts: EffortLevel[] = ["low", "medium", "high", "max"];
+  const defaultReasoningEfforts: EffortLevel[] = ["low", "medium", "high", "xhigh", "max"];
+  const legacyDefaultReasoningEfforts: EffortLevel[] = ["low", "medium", "high", "max"];
   const reasoningEffortSet = new Set<EffortLevel>(["none", "low", "medium", "high", "xhigh", "max"]);
   let customEndpointMutationQueue: Promise<void> = Promise.resolve();
   let pendingCustomEndpointMutations = 0;
@@ -661,7 +662,14 @@ export function useSettingsState(emit: SettingsEmit) {
     const normalized = Array.isArray(values)
       ? values.filter((value): value is EffortLevel => reasoningEffortSet.has(value))
       : [];
+    if (isSameEffortList(normalized, legacyDefaultReasoningEfforts)) {
+      return [...defaultReasoningEfforts];
+    }
     return normalized.length > 0 ? normalized : [...defaultReasoningEfforts];
+  }
+
+  function isSameEffortList(a: EffortLevel[], b: EffortLevel[]): boolean {
+    return a.length === b.length && a.every((value, index) => value === b[index]);
   }
 
   function defaultReplayReasoningContent(ep: CustomEndpoint): boolean {

@@ -37,7 +37,8 @@ const codexFallbackModels: ModelOption[] = [
 ];
 
 const effortLevels: EffortLevel[] = ["none", "low", "medium", "high", "xhigh", "max"];
-const customDefaultReasoningEfforts: EffortLevel[] = ["low", "medium", "high", "max"];
+const customDefaultReasoningEfforts: EffortLevel[] = ["low", "medium", "high", "xhigh", "max"];
+const legacyCustomDefaultReasoningEfforts: EffortLevel[] = ["low", "medium", "high", "max"];
 
 function normalizeOpenAiReasoningModel(model: string): string {
   return model.trim().toLowerCase();
@@ -54,7 +55,14 @@ function normalizeEfforts(values?: EffortLevel[] | null): EffortLevel[] {
 
 function normalizeCustomReasoningEfforts(values?: EffortLevel[] | null): EffortLevel[] {
   const normalized = normalizeEfforts(values).filter((value) => value !== "none");
+  if (isSameEffortList(normalized, legacyCustomDefaultReasoningEfforts)) {
+    return [...customDefaultReasoningEfforts];
+  }
   return normalized.length > 0 ? normalized : [...customDefaultReasoningEfforts];
+}
+
+function isSameEffortList(a: EffortLevel[], b: EffortLevel[]): boolean {
+  return a.length === b.length && a.every((value, index) => value === b[index]);
 }
 
 function supportsOpenAiReasoningModel(model: string): boolean {
