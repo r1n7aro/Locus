@@ -8,6 +8,7 @@
 [![Roadmap](https://img.shields.io/badge/ROADMAP-View-2d6cdf?style=for-the-badge&labelColor=4a4a4a)](https://unity.farlocus.com/en/overview/roadmap)
 [![YouTube](https://img.shields.io/badge/YOUTUBE-Watch-ff0000?style=for-the-badge&labelColor=4a4a4a)](https://www.youtube.com/watch?v=xoApXZMon9M)
 [![X](https://img.shields.io/badge/X-@farlocus-000000?style=for-the-badge&labelColor=4a4a4a)](https://x.com/farlocus)
+![QQ Group](https://img.shields.io/badge/QQ_Group-1104932978-12b7f5?style=for-the-badge&labelColor=4a4a4a)
 
 English | [简体中文](README.zh-CN.md)
 

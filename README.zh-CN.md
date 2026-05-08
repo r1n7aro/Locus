@@ -8,6 +8,7 @@
 [![路线图](https://img.shields.io/badge/ROADMAP-View-2d6cdf?style=for-the-badge&labelColor=4a4a4a)](https://unity.farlocus.com/overview/roadmap)
 [![Bilibili](https://img.shields.io/badge/BILIBILI-Watch-00a1d6?style=for-the-badge&labelColor=4a4a4a)](https://www.bilibili.com/video/BV1H4ReBNELD/)
 [![X](https://img.shields.io/badge/X-@farlocus-000000?style=for-the-badge&labelColor=4a4a4a)](https://x.com/farlocus)
+![QQ群](https://img.shields.io/badge/QQ_Group-1104932978-12b7f5?style=for-the-badge&labelColor=4a4a4a)
 
 [English](README.md) | 简体中文
 
