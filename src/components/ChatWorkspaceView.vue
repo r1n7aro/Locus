@@ -396,6 +396,7 @@ onUnmounted(() => {
       :streaming-session-ids="chatStore.streamingSessionIds"
       :undoable-message-ids="chatStore.undoableMessageIds"
       @send="chatStore.sendMessage"
+      @compact="chatStore.compactSession"
       @cancel="chatStore.cancelChat"
       @select-agent="(id: string) => agentStore.selectAgent(id)"
       @select-model="(id: string) => modelStore.selectModel(id)"

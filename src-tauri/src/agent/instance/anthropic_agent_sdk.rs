@@ -553,6 +553,11 @@ impl AgentInstance {
             || turn.cache_read_tokens > 0
             || turn.cache_write_tokens > 0
         {
+            let context_tokens = turn.input_tokens
+                + turn.output_tokens
+                + turn.cache_read_tokens
+                + turn.cache_write_tokens;
+            let context_limit = super::model_context_limit(&self.effective_model);
             match store.record_token_usage(
                 &self.session_id,
                 turn.input_tokens as u64,
@@ -561,6 +566,8 @@ impl AgentInstance {
                 turn.cache_write_tokens as u64,
                 turn.cost_usd,
                 0,
+                Some(context_tokens),
+                Some(context_limit),
             ) {
                 Ok(totals) => {
                     emit_stream(
@@ -578,11 +585,8 @@ impl AgentInstance {
                             total_cache_write_tokens: totals.total_cache_write_tokens,
                             total_cost_usd: totals.total_cost_usd,
                             priced_rounds: totals.priced_rounds,
-                            context_tokens: turn.input_tokens
-                                + turn.output_tokens
-                                + turn.cache_read_tokens
-                                + turn.cache_write_tokens,
-                            context_limit: super::model_context_limit(&self.effective_model),
+                            context_tokens,
+                            context_limit,
                         },
                     );
                 }

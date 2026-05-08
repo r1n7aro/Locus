@@ -20,4 +20,30 @@ describe("chat composer draft persistence", () => {
     expect(chatView).toContain("void restoreComposerDraft(nextSessionId ?? null);");
     expect(chatView).toContain("if (props.activeSessionId === null) {");
   });
+
+  it("syncs asset reference drafts between chat windows by session", () => {
+    const chatView = read("src/components/ChatView.vue");
+    const richInput = read("src/components/chat/RichChatInput.vue");
+
+    expect(chatView).toContain("const composerAssetRefSyncKey = computed(() => `chat:${draftSessionKey(props.activeSessionId)}`);");
+    expect(chatView).toContain(':asset-ref-sync-key="composerAssetRefSyncKey"');
+    expect(richInput).toContain('const ASSET_REF_SYNC_CHANNEL = "locus-chat-asset-ref-drafts";');
+    expect(richInput).toContain("function setAssetRefAttachments(");
+    expect(richInput).toContain("broadcastAssetRefDraft(next);");
+    expect(richInput).toContain("function removeAssetRef(index: number)");
+    expect(richInput).toContain("setAssetRefAttachments(next);");
+    expect(richInput).toContain("applyAssetRefSyncMessage(event.data);");
+  });
+
+  it("converts Unity mention refs into composer asset references", () => {
+    const richInput = read("src/components/chat/RichChatInput.vue");
+
+    expect(richInput).toContain('import { extractChatAssetRefs } from "../../composables/chatAssetRefs";');
+    expect(richInput).toContain("const UNITY_ASSET_REF_ROOT_RE = /^(?:Assets|Packages|ProjectSettings)(?:\\/|$)/i;");
+    expect(richInput).toContain("const assetRef = buildManualAssetRef(mentionPath);");
+    expect(richInput).toContain("addAssetRefs([assetRef]);");
+    expect(richInput).toContain("const inlineAssetRefs = extractInlineUnityAssetRefs(parsed.cleanedText);");
+    expect(richInput).toContain("const cleanedInput = normalizeComposerText(inlineAssetRefs.text);");
+    expect(richInput).toContain("dedupeAssetRefs([...assetRefAttachments.value, ...inlineAssetRefs.assetRefs]);");
+  });
 });

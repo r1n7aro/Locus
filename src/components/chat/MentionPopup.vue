@@ -3,6 +3,11 @@
 import { nextTick, ref, watch } from "vue";
 import type { ComponentPublicInstance } from "vue";
 import { t } from "../../i18n";
+import LucideIcon from "../icons/LucideIcon.vue";
+import {
+  unityAssetIconClassForPath,
+  unityAssetIconNodeForPath,
+} from "../icons/unityAssetIcons";
 
 export interface MentionDisplayEntry {
   relPath: string;
@@ -12,6 +17,7 @@ export interface MentionDisplayEntry {
   meta?: string;
   canNavigate?: boolean;
   isCurrentPath?: boolean;
+  entryKind?: "asset" | "knowledge";
 }
 
 const props = defineProps<{
@@ -116,6 +122,20 @@ function buildFragments(text: string, query: string): HighlightFragment[] {
   return fragments;
 }
 
+function iconNodeForEntry(entry: MentionDisplayEntry) {
+  return unityAssetIconNodeForPath(entry.relPath, {
+    isFolder: entry.isDir,
+    fallbackKind: entry.entryKind === "knowledge" ? "asset" : "file",
+  });
+}
+
+function iconClassForEntry(entry: MentionDisplayEntry) {
+  return unityAssetIconClassForPath(entry.relPath, {
+    isFolder: entry.isDir,
+    fallbackKind: entry.entryKind === "knowledge" ? "asset" : "file",
+  });
+}
+
 watch(
   () => [props.visible, props.selectedIndex, props.entries.length],
   async ([visible]) => {
@@ -187,7 +207,12 @@ watch(
           class="mention-select"
           @mousedown.prevent="emit('select', entry)"
         >
-          <span class="mention-icon" :class="{ 'is-dir': entry.isDir, 'is-file': !entry.isDir }" />
+          <LucideIcon
+            class="mention-icon"
+            :class="iconClassForEntry(entry)"
+            :icon="iconNodeForEntry(entry)"
+            :size="14"
+          />
           <span class="mention-copy">
             <span class="mention-name">
               <span

@@ -7,8 +7,11 @@ import {
   openUnitySceneObjectInspector,
   classifyUnitySceneObjectError,
 } from "../services/unity";
+import { knowledgeRevealTarget } from "../services/knowledge";
+import { normalizeAppError } from "../services/errors";
 import { t } from "../i18n";
 import { useNotificationStore } from "../stores/notification";
+import type { AssetRefKind, KnowledgeDocumentType } from "../types";
 import LucideIcon from "./icons/LucideIcon.vue";
 import {
   unityAssetIconClassForKind,
@@ -18,6 +21,7 @@ import {
 
 const props = defineProps<{
   path: string;
+  kind?: AssetRefKind;
   removable?: boolean;
 }>();
 
@@ -26,9 +30,23 @@ const emit = defineEmits<{
 }>();
 
 const notificationStore = useNotificationStore();
+const KNOWLEDGE_REF_ROOT_RE = /^(design|memory|skill|reference)\/.+\.md$/i;
+
+const normalizedPath = computed(() =>
+  props.path.trim().replace(/\\/g, "/").replace(/\/+$/, ""),
+);
+
+const knowledgeRef = computed(() => {
+  const match = normalizedPath.value.match(KNOWLEDGE_REF_ROOT_RE);
+  if (!match) return null;
+  return {
+    docType: match[1].toLowerCase() as KnowledgeDocumentType,
+    path: normalizedPath.value,
+  };
+});
 
 const sceneObjectRef = computed(() => {
-  const normalized = props.path.trim().replace(/\\/g, "/").replace(/\/+$/, "");
+  const normalized = normalizedPath.value;
   const match = normalized.match(/^((?:Assets|Packages)\/.+?\.unity)\/(.+)$/i);
   if (!match) return null;
   const objectPath = match[2].replace(/^\/+|\/+$/g, "");
@@ -39,24 +57,38 @@ const sceneObjectRef = computed(() => {
   };
 });
 
+const effectiveKind = computed<AssetRefKind>(() =>
+  props.kind ?? (knowledgeRef.value ? "knowledge" : sceneObjectRef.value ? "sceneObject" : "asset"),
+);
+
 const displayName = computed(() => {
-  const parts = (sceneObjectRef.value?.objectPath ?? props.path).split("/");
-  const fileName = parts[parts.length - 1] || props.path;
+  const parts = (sceneObjectRef.value?.objectPath ?? (normalizedPath.value || props.path)).split("/");
+  const fileName = parts[parts.length - 1] || normalizedPath.value || props.path;
   const dotIdx = fileName.lastIndexOf(".");
   return dotIdx > 0 ? fileName.substring(0, dotIdx) : fileName;
 });
 
 const iconKind = computed(() =>
-  unityAssetIconKindForPath(props.path, {
-    isSceneObject: !!sceneObjectRef.value,
-    fallbackKind: "asset",
-  }),
+  effectiveKind.value === "knowledge"
+    ? "text"
+    : unityAssetIconKindForPath(normalizedPath.value || props.path, {
+        isSceneObject: !!sceneObjectRef.value,
+        fallbackKind: "asset",
+      }),
 );
 
 const iconNode = computed(() => unityAssetIconNodeForKind(iconKind.value));
 
 async function handleClick(e: MouseEvent) {
   try {
+    if (knowledgeRef.value) {
+      await knowledgeRevealTarget({
+        kind: "document",
+        docType: knowledgeRef.value.docType,
+        path: knowledgeRef.value.path,
+      });
+      return;
+    }
     if (sceneObjectRef.value) {
       const { scenePath, objectPath } = sceneObjectRef.value;
       if (e.ctrlKey || e.metaKey) {
@@ -68,10 +100,23 @@ async function handleClick(e: MouseEvent) {
     }
     await selectUnityAsset(props.path);
   } catch (error) {
+    if (knowledgeRef.value) {
+      notifyKnowledgeRefError(error);
+      return;
+    }
     if (sceneObjectRef.value) {
       notifyUnitySceneObjectError(error, sceneObjectRef.value.scenePath, sceneObjectRef.value.objectPath);
     }
   }
+}
+
+function notifyKnowledgeRefError(error: unknown) {
+  const err = normalizeAppError(error);
+  notificationStore.addNotice("warning", t("chat.knowledgeRef.openFailed", err.message), {
+    code: err.code,
+    operation: "knowledgeRef",
+    replaceOperation: true,
+  });
 }
 
 function notifyUnitySceneObjectError(error: unknown, scenePath: string, objectPath: string) {
@@ -158,7 +203,7 @@ function notifyUnitySceneObjectError(error: unknown, scenePath: string, objectPa
 }
 
 .asset-chip-remove:hover {
-  background: rgba(255, 80, 80, 0.2);
-  color: #e55;
+  background: color-mix(in srgb, var(--status-error-bg, var(--hover-bg)) 76%, transparent);
+  color: var(--status-error-fg, var(--text-color));
 }
 </style>

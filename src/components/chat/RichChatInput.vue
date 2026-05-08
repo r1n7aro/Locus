@@ -3,14 +3,18 @@ import { computed, nextTick, onMounted, onUnmounted, ref, useSlots, watch } from
 import type { ComponentPublicInstance } from "vue";
 import { t } from "../../i18n";
 import { searchWorkspaceAssets } from "../../services/asset";
+import { knowledgeQuery } from "../../services/knowledge";
 import {
   listDirEntriesPage,
   type DirEntry,
 } from "../../services/project";
 import { useNotificationStore } from "../../stores/notification";
 import type {
+  AssetRefAttachment,
   ChatComposerSendPayload,
   ImageAttachment,
+  KnowledgeDocumentType,
+  KnowledgeSearchResult,
   SkillIntentItem,
   SkillManifest,
 } from "../../types";
@@ -28,13 +32,16 @@ import {
   type CommandDef,
   type ComposerIntentState,
 } from "../../composables/chatInputIntents";
+import { extractChatAssetRefs } from "../../composables/chatAssetRefs";
 import { rankSearchResults } from "../../composables/searchMatcher";
-import { getCompactInstruction, useCommandRegistry } from "../../composables/useCommandRegistry";
+import { useCommandRegistry } from "../../composables/useCommandRegistry";
 import {
   shouldSelectPopupOnEnter,
   shouldSubmitOnEnter,
   useChatInputSettings,
 } from "../../composables/useChatInputSettings";
+import { subscribeUnityEmbedAssetDrop } from "../../services/unity";
+import AssetChip from "../AssetChip.vue";
 import MentionPopup from "./MentionPopup.vue";
 import ChatComposer from "./ChatComposer.vue";
 import ChatInputShell from "./ChatInputShell.vue";
@@ -45,6 +52,8 @@ interface MentionSearchResult {
   parentPath: string;
   isDir: boolean;
   matchScore: number;
+  meta?: string;
+  entryKind: "asset" | "knowledge";
 }
 
 interface MentionDisplayEntry {
@@ -55,9 +64,23 @@ interface MentionDisplayEntry {
   meta?: string;
   canNavigate?: boolean;
   isCurrentPath?: boolean;
+  entryKind?: "asset" | "knowledge";
 }
 
 const PASTE_THRESHOLD = 500;
+const ASSET_REF_SYNC_CHANNEL = "locus-chat-asset-ref-drafts";
+const ASSET_REF_SYNC_STORAGE_KEY = "locus:chatAssetRefDraftSync";
+const UNITY_ASSET_REF_ROOT_RE = /^(?:Assets|Packages|ProjectSettings)(?:\/|$)/i;
+const PROJECT_KNOWLEDGE_REF_ROOT_RE = /^(?:design|memory|skill|reference)\/.+\.md$/i;
+const KNOWLEDGE_MENTION_TYPES: KnowledgeDocumentType[] = ["design", "memory", "skill", "reference"];
+
+interface AssetRefSyncMessage {
+  kind: "assetRefs";
+  sourceId: string;
+  syncKey: string;
+  refs: AssetRefAttachment[];
+  seq: number;
+}
 
 const props = withDefaults(defineProps<{
   modelValue: string;
@@ -74,6 +97,7 @@ const props = withDefaults(defineProps<{
   showSkillBadges?: boolean;
   compact?: boolean;
   showAction?: boolean;
+  assetRefSyncKey?: string;
 }>(), {
   skills: () => [],
   placeholder: "",
@@ -87,6 +111,7 @@ const props = withDefaults(defineProps<{
   showSkillBadges: true,
   compact: false,
   showAction: true,
+  assetRefSyncKey: "",
 });
 
 const emit = defineEmits<{
@@ -94,6 +119,7 @@ const emit = defineEmits<{
   (e: "send", payload: ChatComposerSendPayload): void;
   (e: "cancel"): void;
   (e: "clear"): void;
+  (e: "compact"): void;
 }>();
 
 const composerRef = ref<InstanceType<typeof ChatComposer> | null>(null);
@@ -112,6 +138,7 @@ const {
 const pastedContent = ref("");
 const showPasteEditor = ref(false);
 const imageAttachments = ref<ImageAttachment[]>([]);
+const assetRefAttachments = ref<AssetRefAttachment[]>([]);
 const previewImageIndex = ref<number | null>(null);
 const composerIntent = ref<ComposerIntentState>(emptyComposerIntent());
 const activeOperator = ref<ActiveOperator | null>(null);
@@ -130,17 +157,29 @@ const mentionAnchor = ref(-1);
 const mentionTokenEnd = ref(-1);
 const mentionSubPath = ref("");
 const mentionLoading = ref(false);
+const assetRefDrafts = new Map<string, AssetRefAttachment[]>();
 
 let mentionDebounceTimer: ReturnType<typeof setTimeout> | null = null;
 let mentionRequestSeq = 0;
 let lastSearchQuery = "";
 let pendingMentionCursor: number | null = null;
+let releaseUnityAssetDrop: (() => void) | null = null;
+let unityAssetDropSubscriptionDisposed = false;
+let assetRefSyncChannel: BroadcastChannel | null = null;
+let assetRefSyncSeq = 0;
+let lastAssetRefSyncKey = "";
+const assetRefSyncSourceId = `rich-chat-input-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+
+const hasTopAttachments = computed(() =>
+  imageAttachments.value.length > 0 || assetRefAttachments.value.length > 0,
+);
 
 const canSend = computed(() =>
   props.isStreaming
   || !!props.modelValue.trim()
   || !!pastedContent.value
-  || imageAttachments.value.length > 0,
+  || imageAttachments.value.length > 0
+  || assetRefAttachments.value.length > 0,
 );
 const hasHeaderStart = computed(() =>
   !!slots["header-start"]
@@ -218,14 +257,44 @@ function mapAssetSearchResult(result: {
     parentPath: parentPathFor(result.path),
     isDir: false,
     matchScore: result.matchScore,
+    entryKind: "asset",
+  };
+}
+
+function fallbackKnowledgeName(path: string): string {
+  const fileName = path.split("/").pop() || path;
+  const dotIndex = fileName.lastIndexOf(".");
+  return dotIndex > 0 ? fileName.slice(0, dotIndex) : fileName;
+}
+
+function mapKnowledgeSearchResult(result: KnowledgeSearchResult): MentionSearchResult {
+  return {
+    relPath: result.path,
+    name: result.title?.trim() || fallbackKnowledgeName(result.path),
+    parentPath: parentPathFor(result.path),
+    isDir: false,
+    matchScore: Math.max(1, Math.round(result.score || 1)),
+    meta: result.path,
+    entryKind: "knowledge",
   };
 }
 
 const rankedMentionSearchResults = computed(() =>
   rankSearchResults(mentionSearchResults.value, mentionQuery.value, (result) => [
-    { text: result.name, weight: 180 + Math.min(Math.floor(result.matchScore / 12), 90) },
-    { text: result.relPath, weight: 90 + Math.min(Math.floor(result.matchScore / 24), 45) },
+    {
+      text: result.name,
+      weight: result.entryKind === "knowledge"
+        ? 165 + Math.min(Math.floor(result.matchScore / 12), 60)
+        : 180 + Math.min(Math.floor(result.matchScore / 12), 90),
+    },
+    {
+      text: result.relPath,
+      weight: result.entryKind === "knowledge"
+        ? 120 + Math.min(Math.floor(result.matchScore / 24), 35)
+        : 90 + Math.min(Math.floor(result.matchScore / 24), 45),
+    },
     { text: result.parentPath, weight: 30 },
+    { text: result.meta || "", weight: 50 },
   ]),
 );
 
@@ -241,6 +310,7 @@ const mentionCurrentFolderEntry = computed<MentionDisplayEntry | null>(() => {
     meta: t("chat.mention.currentFolder"),
     canNavigate: false,
     isCurrentPath: true,
+    entryKind: "asset",
   };
 });
 
@@ -262,7 +332,9 @@ const mentionDisplayList = computed<MentionDisplayEntry[]>(() => {
       name: result.name,
       parentPath: result.parentPath,
       isDir: result.isDir,
+      meta: result.meta,
       canNavigate: result.isDir,
+      entryKind: result.entryKind,
     }));
   }
   const entries = filteredMentionEntries.value.map((entry) => ({
@@ -271,6 +343,7 @@ const mentionDisplayList = computed<MentionDisplayEntry[]>(() => {
     parentPath: "",
     isDir: entry.isDir,
     canNavigate: entry.isDir,
+    entryKind: "asset" as const,
   }));
   return mentionCurrentFolderEntry.value
     ? [mentionCurrentFolderEntry.value, ...entries]
@@ -435,10 +508,17 @@ async function searchAssets(query: string) {
   const requestSeq = ++mentionRequestSeq;
   mentionLoading.value = true;
   try {
-    const assetResults = await searchWorkspaceAssets(query, [
-      "Assets",
-      "Packages",
-      "ProjectSettings",
+    const [assetSearch, knowledgeSearch] = await Promise.allSettled([
+      searchWorkspaceAssets(query, [
+        "Assets",
+        "Packages",
+        "ProjectSettings",
+      ]),
+      knowledgeQuery({
+        query,
+        limit: 16,
+        types: KNOWLEDGE_MENTION_TYPES,
+      }),
     ]);
     if (
       requestSeq !== mentionRequestSeq
@@ -449,7 +529,22 @@ async function searchAssets(query: string) {
       return;
     }
 
-    mentionSearchResults.value = assetResults.map(mapAssetSearchResult);
+    const assetResults = assetSearch.status === "fulfilled"
+      ? assetSearch.value.map(mapAssetSearchResult)
+      : [];
+    const knowledgeResults = knowledgeSearch.status === "fulfilled"
+      ? knowledgeSearch.value
+        .filter((result) => (result.storageSource ?? "project") === "project")
+        .map(mapKnowledgeSearchResult)
+      : [];
+
+    mentionSearchResults.value = [...assetResults, ...knowledgeResults];
+
+    if (assetSearch.status === "rejected" && mentionSearchResults.value.length === 0) {
+      mentionMode.value = "browse";
+      mentionSubPath.value = "";
+      await loadDirEntries("");
+    }
   } catch {
     if (
       requestSeq !== mentionRequestSeq
@@ -662,6 +757,21 @@ function selectMentionEntry(entry: MentionDisplayEntry) {
     ? `${entry.relPath}/`
     : entry.relPath;
 
+  const assetRef = buildManualAssetRef(mentionPath);
+  if (assetRef) {
+    const nextText = removeTextRange(props.modelValue, mentionAnchor.value, mentionTokenEnd.value);
+    const cursor = Math.max(0, Math.min(mentionAnchor.value, nextText.length));
+    dismissOperatorPopupForCursor(nextText, cursor);
+    setInputValue(nextText);
+    addAssetRefs([assetRef]);
+    closeMentionPopup();
+    nextTick(() => {
+      focusComposerSelection(cursor);
+      syncOperatorState();
+    });
+    return;
+  }
+
   const nextMention = insertInlineMention(
     props.modelValue,
     mentionAnchor.value,
@@ -702,10 +812,210 @@ function mentionNavigateParent() {
   mentionNavigateTo(mentionBreadcrumbs.value.length - 2);
 }
 
+function inferAssetRefKind(path: string, kind?: AssetRefAttachment["kind"]): AssetRefAttachment["kind"] {
+  if (kind === "knowledge") return "knowledge";
+  if (kind === "sceneObject") return "sceneObject";
+  return /^((?:Assets|Packages)\/.+?\.unity)\/.+/i.test(path) ? "sceneObject" : "asset";
+}
+
+function normalizeUnityAssetRefPath(path: string) {
+  return path.trim().replace(/\\/g, "/").replace(/\/+$/, "");
+}
+
+function isSupportedUnityAssetRefPath(path: string) {
+  return UNITY_ASSET_REF_ROOT_RE.test(normalizeUnityAssetRefPath(path));
+}
+
+function isSupportedProjectKnowledgeRefPath(path: string) {
+  return PROJECT_KNOWLEDGE_REF_ROOT_RE.test(normalizeUnityAssetRefPath(path));
+}
+
+function buildManualAssetRef(path: string): AssetRefAttachment | null {
+  const normalizedPath = normalizeUnityAssetRefPath(path);
+  if (!normalizedPath) return null;
+  if (isSupportedProjectKnowledgeRefPath(normalizedPath)) {
+    return {
+      path: normalizedPath,
+      kind: "knowledge",
+      source: "manual",
+    };
+  }
+  if (!isSupportedUnityAssetRefPath(normalizedPath)) return null;
+  return {
+    path: normalizedPath,
+    kind: inferAssetRefKind(normalizedPath),
+    source: "manual",
+  };
+}
+
+function buildManualAssetRefs(paths: string[]) {
+  return paths
+    .map((path) => buildManualAssetRef(path))
+    .filter((assetRef): assetRef is AssetRefAttachment => !!assetRef);
+}
+
+function extractInlineUnityAssetRefs(text: string) {
+  const extracted = extractChatAssetRefs(text);
+  return {
+    text: extracted.text,
+    assetRefs: buildManualAssetRefs(extracted.refs),
+  };
+}
+
+function normalizeAssetRef(assetRef: AssetRefAttachment): AssetRefAttachment | null {
+  const path = assetRef.path.trim().replace(/\\/g, "/").replace(/\/+$/, "");
+  if (!path) return null;
+  return {
+    path,
+    kind: inferAssetRefKind(path, assetRef.kind),
+    name: assetRef.name?.trim() || undefined,
+    typeLabel: assetRef.typeLabel?.trim() || undefined,
+    source: assetRef.source ?? "unity",
+  };
+}
+
+function assetRefKey(assetRef: Pick<AssetRefAttachment, "kind" | "path">) {
+  return `${assetRef.kind}\u{0}${assetRef.path.toLowerCase()}`;
+}
+
+function dedupeAssetRefs(assetRefs: AssetRefAttachment[]) {
+  const seen = new Set<string>();
+  const next: AssetRefAttachment[] = [];
+  for (const assetRef of assetRefs) {
+    const normalized = normalizeAssetRef(assetRef);
+    if (!normalized) continue;
+    const key = assetRefKey(normalized);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    next.push(normalized);
+  }
+  return next;
+}
+
+function cloneAssetRefs(assetRefs: AssetRefAttachment[]) {
+  return assetRefs.map((assetRef) => ({ ...assetRef }));
+}
+
+function currentAssetRefSyncKey() {
+  return props.assetRefSyncKey.trim();
+}
+
+function rememberAssetRefDraft(assetRefs: AssetRefAttachment[], key = currentAssetRefSyncKey()) {
+  if (!key) return;
+  if (assetRefs.length > 0) {
+    assetRefDrafts.set(key, cloneAssetRefs(assetRefs));
+    return;
+  }
+  assetRefDrafts.delete(key);
+}
+
+function broadcastAssetRefDraft(assetRefs: AssetRefAttachment[], key = currentAssetRefSyncKey()) {
+  if (!key) return;
+  const message: AssetRefSyncMessage = {
+    kind: "assetRefs",
+    sourceId: assetRefSyncSourceId,
+    syncKey: key,
+    refs: cloneAssetRefs(assetRefs),
+    seq: ++assetRefSyncSeq,
+  };
+
+  assetRefSyncChannel?.postMessage(message);
+
+  try {
+    window.localStorage.setItem(ASSET_REF_SYNC_STORAGE_KEY, JSON.stringify(message));
+    window.localStorage.removeItem(ASSET_REF_SYNC_STORAGE_KEY);
+  } catch {
+    // Local storage can be disabled; BroadcastChannel is the primary path.
+  }
+}
+
+function setAssetRefAttachments(
+  assetRefs: AssetRefAttachment[],
+  options: { broadcast?: boolean } = {},
+) {
+  const next = dedupeAssetRefs(assetRefs);
+  assetRefAttachments.value = next;
+  rememberAssetRefDraft(next);
+  if (options.broadcast !== false) {
+    broadcastAssetRefDraft(next);
+  }
+  return next;
+}
+
+function applyAssetRefSyncMessage(message: unknown) {
+  if (!message || typeof message !== "object") return;
+  const payload = message as Partial<AssetRefSyncMessage>;
+  if (payload.kind !== "assetRefs") return;
+  if (!payload.syncKey || payload.sourceId === assetRefSyncSourceId) return;
+
+  const refs = dedupeAssetRefs(Array.isArray(payload.refs) ? payload.refs : []);
+  rememberAssetRefDraft(refs, payload.syncKey);
+  if (payload.syncKey === currentAssetRefSyncKey()) {
+    assetRefAttachments.value = cloneAssetRefs(refs);
+  }
+}
+
+function handleAssetRefSyncStorage(event: StorageEvent) {
+  if (event.key !== ASSET_REF_SYNC_STORAGE_KEY || !event.newValue) return;
+  try {
+    applyAssetRefSyncMessage(JSON.parse(event.newValue));
+  } catch {
+    // Ignore malformed cross-window draft sync payloads.
+  }
+}
+
+function setupAssetRefSync() {
+  if (typeof BroadcastChannel !== "undefined") {
+    assetRefSyncChannel = new BroadcastChannel(ASSET_REF_SYNC_CHANNEL);
+    assetRefSyncChannel.onmessage = (event) => {
+      applyAssetRefSyncMessage(event.data);
+    };
+  }
+  window.addEventListener("storage", handleAssetRefSyncStorage);
+}
+
+function teardownAssetRefSync() {
+  window.removeEventListener("storage", handleAssetRefSyncStorage);
+  assetRefSyncChannel?.close();
+  assetRefSyncChannel = null;
+}
+
+function addAssetRefs(assetRefs: AssetRefAttachment[]) {
+  const next = setAssetRefAttachments([...assetRefAttachments.value, ...assetRefs]);
+  if (next.length > 0) {
+    nextTick(() => composerRef.value?.focus());
+  }
+}
+
+function removeAssetRef(index: number) {
+  const next = [...assetRefAttachments.value];
+  next.splice(index, 1);
+  setAssetRefAttachments(next);
+}
+
+function buildAssetRefsPromptBlock(assetRefs: AssetRefAttachment[]) {
+  if (assetRefs.length === 0) return "";
+  const lines = assetRefs.map((assetRef) => {
+    if (assetRef.kind === "knowledge") {
+      return `- project knowledge: \`${assetRef.path}\` (use \`knowledge_read\`)`;
+    }
+    const label = assetRef.kind === "sceneObject" ? "scene object" : "asset";
+    return `- ${label}: {@${assetRef.path}}`;
+  });
+  return `<locus-references>\nUse Unity refs as exact asset anchors. Use project knowledge refs as exact knowledge_read paths.\n${lines.join("\n")}\n</locus-references>`;
+}
+
+function appendAssetRefsPromptBlock(text: string, assetRefs: AssetRefAttachment[]) {
+  const block = buildAssetRefsPromptBlock(assetRefs);
+  if (!block) return text;
+  return text.trim() ? `${text}\n\n${block}` : block;
+}
+
 function resetDraft() {
   setInputValue("");
   pastedContent.value = "";
   imageAttachments.value = [];
+  setAssetRefAttachments([]);
   closeImagePreview();
   composerIntent.value = emptyComposerIntent();
   activeOperator.value = null;
@@ -734,6 +1044,7 @@ function showUserIntentMissingInputNotice() {
 function buildSendPayload(
   text: string,
   images: ImageAttachment[],
+  assetRefs: AssetRefAttachment[],
   intent: ComposerIntentState,
   displayText?: string,
 ): ChatComposerSendPayload {
@@ -741,19 +1052,21 @@ function buildSendPayload(
     text,
     displayText: displayText ?? text,
     images,
+    assetRefs,
     mode: intent.mode === "plan" ? "plan" : null,
     userIntent: buildUserIntentMeta(intent),
   };
 }
 
-function tryHandleExactActionCommand(): boolean {
-  const typed = props.modelValue.trim();
-  if (!typed || pastedContent.value || imageAttachments.value.length > 0 || hasComposerIntent(composerIntent.value)) {
-    return false;
-  }
+function canExecuteActionCommand(): boolean {
+  return !pastedContent.value
+    && imageAttachments.value.length === 0
+    && assetRefAttachments.value.length === 0
+    && !hasComposerIntent(composerIntent.value);
+}
 
-  const command = findExactAvailableCommand(typed);
-  if (!command || command.commandKind !== "action") return false;
+function executeActionCommand(command: CommandDef): boolean {
+  if (command.commandKind !== "action" || !canExecuteActionCommand()) return false;
 
   if (command.commandType === "clear") {
     resetDraft();
@@ -762,13 +1075,22 @@ function tryHandleExactActionCommand(): boolean {
   }
 
   if (command.commandType === "compact") {
-    const payload = buildSendPayload(getCompactInstruction(), [], emptyComposerIntent(), command.name);
     resetDraft();
-    emit("send", payload);
+    emit("compact");
     return true;
   }
 
   return false;
+}
+
+function tryHandleExactActionCommand(): boolean {
+  const typed = props.modelValue.trim();
+  if (!typed || !canExecuteActionCommand()) {
+    return false;
+  }
+
+  const command = findExactAvailableCommand(typed);
+  return command ? executeActionCommand(command) : false;
 }
 
 function handleSend() {
@@ -785,12 +1107,14 @@ function handleSend() {
   }
 
   const mergedIntent = mergeComposerIntent(composerIntent.value, parsed.intent);
-  const cleanedInput = normalizeComposerText(parsed.cleanedText);
+  const inlineAssetRefs = extractInlineUnityAssetRefs(parsed.cleanedText);
+  const cleanedInput = normalizeComposerText(inlineAssetRefs.text);
   const images: ImageAttachment[] = props.allowImages
     ? imageAttachments.value.map(({ data, mimeType }) => ({ data, mimeType }))
     : [];
+  const assetRefs = dedupeAssetRefs([...assetRefAttachments.value, ...inlineAssetRefs.assetRefs]);
 
-  if (!cleanedInput && !pastedContent.value && images.length === 0) {
+  if (!cleanedInput && !pastedContent.value && images.length === 0 && assetRefs.length === 0) {
     if (hasComposerIntent(mergedIntent)) {
       showUserIntentMissingInputNotice();
     }
@@ -801,7 +1125,8 @@ function handleSend() {
     ? (cleanedInput ? `${cleanedInput}\n\n${pastedContent.value}` : pastedContent.value)
     : cleanedInput;
 
-  const payload = buildSendPayload(text, images, mergedIntent);
+  const sendText = appendAssetRefsPromptBlock(text, assetRefs);
+  const payload = buildSendPayload(sendText, images, assetRefs, mergedIntent, text);
   resetDraft();
   emit("send", payload);
 }
@@ -879,7 +1204,12 @@ function handleKeydown(event: KeyboardEvent) {
       commandHighlightIndex.value = (commandHighlightIndex.value - 1 + commands.length) % commands.length;
       return;
     }
-    if (shouldSelectPopupOnEnter(event, chatInputSettings.submitMode)) {
+    if (shouldSubmitOnEnter(event, chatInputSettings.submitMode)) {
+      const command = commands[commandHighlightIndex.value];
+      if (command && executeActionCommand(command)) {
+        event.preventDefault();
+        return;
+      }
       if (commands.length === 0) return;
       event.preventDefault();
       executeCommandFromPopup(commands[commandHighlightIndex.value]);
@@ -1036,12 +1366,47 @@ watch(
   },
 );
 
+watch(
+  () => props.assetRefSyncKey,
+  (nextKey, previousKey) => {
+    const previous = (previousKey ?? lastAssetRefSyncKey).trim();
+    if (previous) {
+      rememberAssetRefDraft(assetRefAttachments.value, previous);
+    }
+
+    const next = nextKey.trim();
+    lastAssetRefSyncKey = next;
+    if (!next) return;
+    assetRefAttachments.value = cloneAssetRefs(assetRefDrafts.get(next) ?? []);
+  },
+  { immediate: true },
+);
+
 onMounted(() => {
+  unityAssetDropSubscriptionDisposed = false;
+  setupAssetRefSync();
   document.addEventListener("keydown", handleDocumentKeydown);
+  subscribeUnityEmbedAssetDrop((payload) => {
+    addAssetRefs(payload.refs ?? []);
+  })
+    .then((release) => {
+      if (unityAssetDropSubscriptionDisposed) {
+        release();
+        return;
+      }
+      releaseUnityAssetDrop = release;
+    })
+    .catch((error) => {
+      console.warn("[Locus] Unity asset drop subscription failed:", error);
+    });
 });
 
 onUnmounted(() => {
+  unityAssetDropSubscriptionDisposed = true;
   document.removeEventListener("keydown", handleDocumentKeydown);
+  teardownAssetRefSync();
+  releaseUnityAssetDrop?.();
+  releaseUnityAssetDrop = null;
   clearMentionDebounce();
   invalidateMentionRequests();
 });
@@ -1144,7 +1509,7 @@ defineExpose({
       :compact="compact"
       :show-action="showAction"
       :show-header="hasHeaderContent"
-      :extend-top="imageAttachments.length > 0"
+      :extend-top="hasTopAttachments"
       @update:model-value="setInputValue"
       @keydown="handleKeydown"
       @paste="handlePaste"
@@ -1156,10 +1521,18 @@ defineExpose({
       @cancel="emit('cancel')"
     >
       <template #overlay>
-        <div v-if="imageAttachments.length > 0" class="image-attachment-list">
+        <div v-if="hasTopAttachments" class="composer-attachment-list">
+          <AssetChip
+            v-for="(assetRef, index) in assetRefAttachments"
+            :key="`${assetRef.kind}:${assetRef.path}`"
+            :path="assetRef.path"
+            :kind="assetRef.kind"
+            removable
+            @remove="removeAssetRef(index)"
+          />
           <div
             v-for="(image, index) in imageAttachments"
-            :key="index"
+            :key="`image:${index}`"
             class="image-attachment-item"
           >
             <button
@@ -1495,41 +1868,8 @@ defineExpose({
 :deep(.mention-icon) {
   flex-shrink: 0;
   width: 14px;
-  height: 12px;
-  position: relative;
-}
-
-:deep(.mention-icon.is-file::before) {
-  content: "";
-  position: absolute;
-  inset: 1px 1px 1px 2px;
-  border: 1px solid color-mix(in srgb, var(--text-secondary) 72%, transparent);
-  border-radius: 2px;
-}
-
-:deep(.mention-icon.is-dir::before) {
-  content: "";
-  position: absolute;
-  left: 0;
-  right: 0;
-  bottom: 0;
-  height: 9px;
-  border: 1px solid color-mix(in srgb, var(--text-secondary) 72%, transparent);
-  border-radius: 2px;
-  background: color-mix(in srgb, var(--sidebar-bg, var(--hover-bg)) 70%, transparent);
-}
-
-:deep(.mention-icon.is-dir::after) {
-  content: "";
-  position: absolute;
-  top: 0;
-  left: 1px;
-  width: 7px;
-  height: 4px;
-  border: 1px solid color-mix(in srgb, var(--text-secondary) 72%, transparent);
-  border-bottom: none;
-  border-radius: 2px 2px 0 0;
-  background: color-mix(in srgb, var(--sidebar-bg, var(--hover-bg)) 82%, transparent);
+  height: 14px;
+  opacity: 0.95;
 }
 
 :deep(.mention-name) {
@@ -1616,16 +1956,50 @@ defineExpose({
   font-size: 11px;
 }
 
-.image-attachment-list {
+.composer-attachment-list {
   display: flex;
-  align-items: flex-start;
-  flex-wrap: wrap;
+  align-items: center;
+  flex-wrap: nowrap;
   gap: 6px;
   min-width: 0;
   max-width: 100%;
-  overflow: visible;
-  padding: 1px 8px 0 0;
+  overflow-x: auto;
+  overflow-y: visible;
+  padding: 1px 8px 7px 0;
   pointer-events: auto;
+  scrollbar-width: thin;
+}
+
+.composer-attachment-list::-webkit-scrollbar {
+  height: 4px;
+}
+
+.composer-attachment-list::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--border-color) 72%, transparent);
+  border-radius: 999px;
+}
+
+.composer-attachment-list :deep(.asset-chip) {
+  flex: 0 0 auto;
+  height: 28px;
+  min-height: 28px;
+  max-width: min(280px, calc(100vw - 96px));
+  padding-top: 0;
+  padding-bottom: 0;
+  background: color-mix(in srgb, var(--panel-bg) 70%, var(--input-bg) 30%);
+  border-color: color-mix(in srgb, var(--border-color) 88%, transparent);
+  font-size: 12px;
+  line-height: 1;
+}
+
+.composer-attachment-list :deep(.asset-chip:hover) {
+  background: color-mix(in srgb, var(--hover-bg) 82%, var(--panel-bg) 18%);
+  border-color: color-mix(in srgb, var(--accent-color) 35%, var(--border-color));
+}
+
+.composer-attachment-list :deep(.asset-chip-remove:hover) {
+  background: color-mix(in srgb, var(--status-error-bg, var(--hover-bg)) 76%, transparent);
+  color: var(--status-error-fg, var(--text-color));
 }
 
 .image-attachment-item {
@@ -1664,10 +2038,10 @@ defineExpose({
 
 .image-attachment-remove {
   position: absolute;
-  top: -6px;
-  right: -6px;
-  width: 16px;
-  height: 16px;
+  top: -1px;
+  right: -1px;
+  width: 14px;
+  height: 14px;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1676,7 +2050,7 @@ defineExpose({
   border-radius: 50%;
   background: var(--panel-bg);
   color: var(--text-secondary);
-  font-size: 12px;
+  font-size: 11px;
   line-height: 1;
   cursor: pointer;
   opacity: 0;

@@ -175,6 +175,19 @@ pub struct ImageData {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct AssetRefData {
+    pub path: String,
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub type_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UserIntentSkill {
     pub dir_name: String,
     pub source: String,
@@ -283,6 +296,8 @@ pub struct ChatMessage {
     pub tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub images: Option<Vec<ImageData>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub asset_refs: Option<Vec<AssetRefData>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking_content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

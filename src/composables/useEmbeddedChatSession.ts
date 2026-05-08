@@ -23,6 +23,7 @@ import type {
   ChatMessage,
   EffortLevel,
   ImageAttachment,
+  AssetRefAttachment,
   PendingQuestion,
   PendingToolConfirm,
   StreamEvent,
@@ -38,6 +39,7 @@ export interface EmbeddedChatRequest {
   mode?: string | null;
   userIntent?: UserIntentMeta | null;
   images?: ImageAttachment[] | null;
+  assetRefs?: AssetRefAttachment[] | null;
 }
 
 interface EmbeddedChatState extends StreamState {
@@ -432,6 +434,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
       content: displayText,
       createdAt: Date.now() / 1000,
       images: request.images && request.images.length > 0 ? request.images : undefined,
+      assetRefs: request.assetRefs && request.assetRefs.length > 0 ? request.assetRefs : undefined,
       thinkingSignature: request.userIntent ? JSON.stringify(request.userIntent) : undefined,
       intentMeta: request.userIntent ?? undefined,
     });
@@ -455,6 +458,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
         model: selectedModelId,
         effort: toValue(options.effortSupported) ? (toValue(options.effort) ?? null) : null,
         images: request.images && request.images.length > 0 ? request.images : null,
+        assetRefs: request.assetRefs && request.assetRefs.length > 0 ? request.assetRefs : null,
         sessionType: options.sessionType ?? "chat",
         mode: request.mode ?? null,
         userIntent: request.userIntent ?? null,

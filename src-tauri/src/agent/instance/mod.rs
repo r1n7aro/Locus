@@ -4198,6 +4198,7 @@ impl AgentInstance {
                 beta_flags,
                 supported_reasoning_efforts,
                 reasoning_param_format,
+                replay_reasoning_content,
                 ..
             } => {
                 use crate::commands::{ApiFormat, CustomReasoningParamFormat};
@@ -4229,6 +4230,7 @@ impl AgentInstance {
                             endpoint.as_str(),
                             reasoning_effort,
                             thinking_level,
+                            *replay_reasoning_content,
                             self.debug,
                             on_text_delta,
                             on_thinking_delta,
@@ -4490,6 +4492,72 @@ impl AgentInstance {
         .await
     }
 
+    async fn estimate_current_context_tokens(
+        &self,
+        store: &SessionStore,
+        system_parts: &[&str],
+    ) -> Result<u32, String> {
+        let messages = store.get_messages_for_prompt(&self.session_id)?;
+        let prepared_messages = compact::prepare_messages_for_llm(&messages);
+        let effective_tools = self.resolve_effective_tool_names().await;
+        let api_tools = self.build_api_tools(&effective_tools).await;
+        Ok(compact::estimate_request_tokens(
+            system_parts,
+            &prepared_messages,
+            &api_tools,
+        ))
+    }
+
+    async fn persist_compacted_context_usage(
+        &self,
+        store: &SessionStore,
+        system_parts: &[&str],
+        context_limit: u32,
+    ) -> u32 {
+        let context_tokens = match self
+            .estimate_current_context_tokens(store, system_parts)
+            .await
+        {
+            Ok(tokens) => tokens,
+            Err(error) => {
+                eprintln!(
+                    "[Agent {}] failed to estimate compacted context usage: {}",
+                    self.id, error
+                );
+                return 0;
+            }
+        };
+
+        if context_tokens > 0 && context_limit > 0 {
+            match store.record_token_usage(
+                &self.session_id,
+                0,
+                0,
+                0,
+                0,
+                0.0,
+                0,
+                Some(context_tokens),
+                Some(context_limit),
+            ) {
+                Ok(_) => {
+                    eprintln!(
+                        "[Agent {}] compacted context usage persisted: {}/{}",
+                        self.id, context_tokens, context_limit
+                    );
+                }
+                Err(error) => {
+                    eprintln!(
+                        "[Agent {}] failed to persist compacted context usage: {}",
+                        self.id, error
+                    );
+                }
+            }
+        }
+
+        context_tokens
+    }
+
     async fn execute_auto_compact(
         &self,
         app_handle: &AppHandle,
@@ -4497,6 +4565,7 @@ impl AgentInstance {
         system_parts: &[&str],
         context_tokens: u32,
         context_limit: u32,
+        force_compact: bool,
         run_id: &str,
         attempt_kind: &str,
         iteration: usize,
@@ -4507,26 +4576,22 @@ impl AgentInstance {
         }
 
         let messages_before = messages.len() as u32;
-
-        emit_stream(
-            app_handle,
-            run_id,
-            StreamEvent::CompactStart {
-                session_id: self.session_id.clone(),
-                context_tokens,
-                context_limit,
-            },
-        );
+        let compact_label = if force_compact {
+            "manual-compact"
+        } else {
+            "auto-compact"
+        };
 
         eprintln!(
-            "[Agent {}] auto-compact triggered: context_tokens={}, limit={}, messages={}",
+            "[Agent {}] {} requested: context_tokens={}, limit={}, messages={}",
             self.id,
+            compact_label,
             context_tokens,
             context_limit,
             messages.len()
         );
 
-        let compact_plan = match compact::build_compact_request_with_budget(
+        let mut compact_plan = match compact::build_compact_request_with_budget(
             &messages,
             system_parts,
             context_limit,
@@ -4537,21 +4602,38 @@ impl AgentInstance {
                     "[Agent {}] budgeted compact request unavailable, using emergency compact: {}",
                     self.id, e
                 );
-                let boundary_idx = compact::find_compact_boundary_by_budget(
+                let mut boundary_idx = compact::find_compact_boundary_by_budget(
                     &messages,
                     compact::compact_recent_tail_token_budget(context_limit),
                 );
+                if force_compact
+                    && !compact::has_compactable_messages_before_boundary(&messages, boundary_idx)
+                {
+                    boundary_idx = messages.len().saturating_sub(1);
+                    while boundary_idx > 0 && messages[boundary_idx].role == MessageRole::Tool {
+                        boundary_idx -= 1;
+                    }
+                }
                 if !compact::has_compactable_messages_before_boundary(&messages, boundary_idx) {
                     eprintln!(
-                        "[Agent {}] emergency auto-compact skipped: no compactable messages before boundary {}",
-                        self.id, boundary_idx
+                        "[Agent {}] emergency {} skipped: no compactable messages before boundary {}",
+                        self.id, compact_label, boundary_idx
                     );
                     return Ok(false);
                 }
+                emit_stream(
+                    app_handle,
+                    run_id,
+                    StreamEvent::CompactStart {
+                        session_id: self.session_id.clone(),
+                        context_tokens,
+                        context_limit,
+                    },
+                );
                 let summary = compact::build_emergency_compact_summary(&messages, boundary_idx, &e);
                 let keep_from_msg = &messages[boundary_idx];
                 let restored_files_section = compact::build_post_compact_restored_files_section(
-                    &messages[..boundary_idx],
+                    &messages,
                     &self.working_dir,
                 );
                 let summary_msg = compact::build_post_compact_message(
@@ -4565,10 +4647,14 @@ impl AgentInstance {
                 if matches!(self.backend, LlmBackend::OpenAiCodex { .. }) {
                     crate::llm::codex::reset_cached_session_window(&self.session_id).await;
                 }
+                let compacted_context_tokens = self
+                    .persist_compacted_context_usage(store, system_parts, context_limit)
+                    .await;
                 let compacted_messages = store.get_messages(&self.session_id)?;
                 eprintln!(
-                    "[Agent {}] emergency auto-compact done: {} → {} messages, summary len={}",
+                    "[Agent {}] emergency {} done: {} → {} messages, summary len={}",
                     self.id,
+                    compact_label,
                     count_before,
                     count_after,
                     summary.len()
@@ -4580,12 +4666,28 @@ impl AgentInstance {
                         session_id: self.session_id.clone(),
                         messages_before,
                         messages_after: count_after,
+                        context_tokens: compacted_context_tokens,
+                        context_limit,
                         messages: compacted_messages,
                     },
                 );
                 return Ok(true);
             }
         };
+
+        if force_compact
+            && !compact::has_compactable_messages_before_boundary(
+                &messages,
+                compact_plan.boundary_idx,
+            )
+        {
+            compact_plan.boundary_idx = messages.len().saturating_sub(1);
+            while compact_plan.boundary_idx > 0
+                && messages[compact_plan.boundary_idx].role == MessageRole::Tool
+            {
+                compact_plan.boundary_idx -= 1;
+            }
+        }
 
         eprintln!(
             "[Agent {}] compact request budget: estimated_tokens={}, budget={}, boundary_idx={}, truncated={}",
@@ -4599,11 +4701,21 @@ impl AgentInstance {
         if !compact::has_compactable_messages_before_boundary(&messages, compact_plan.boundary_idx)
         {
             eprintln!(
-                "[Agent {}] auto-compact skipped: no compactable messages before boundary {}",
-                self.id, compact_plan.boundary_idx
+                "[Agent {}] {} skipped: no compactable messages before boundary {}",
+                self.id, compact_label, compact_plan.boundary_idx
             );
             return Ok(false);
         }
+
+        emit_stream(
+            app_handle,
+            run_id,
+            StreamEvent::CompactStart {
+                session_id: self.session_id.clone(),
+                context_tokens,
+                context_limit,
+            },
+        );
 
         let summary_result = self
             .call_compact_llm(store, system_parts, &compact_plan.messages)
@@ -4659,7 +4771,7 @@ impl AgentInstance {
                 let summary = compact::build_emergency_compact_summary(&messages, boundary_idx, &e);
                 let keep_from_msg = &messages[boundary_idx];
                 let restored_files_section = compact::build_post_compact_restored_files_section(
-                    &messages[..boundary_idx],
+                    &messages,
                     &self.working_dir,
                 );
                 let summary_msg = compact::build_post_compact_message(
@@ -4673,6 +4785,9 @@ impl AgentInstance {
                 if matches!(self.backend, LlmBackend::OpenAiCodex { .. }) {
                     crate::llm::codex::reset_cached_session_window(&self.session_id).await;
                 }
+                let compacted_context_tokens = self
+                    .persist_compacted_context_usage(store, system_parts, context_limit)
+                    .await;
                 let compacted_messages = store.get_messages(&self.session_id)?;
                 eprintln!(
                     "[Agent {}] emergency auto-compact done after compact error: {} → {} messages, summary len={}",
@@ -4688,6 +4803,8 @@ impl AgentInstance {
                         session_id: self.session_id.clone(),
                         messages_before,
                         messages_after: count_after,
+                        context_tokens: compacted_context_tokens,
+                        context_limit,
                         messages: compacted_messages,
                     },
                 );
@@ -4717,6 +4834,8 @@ impl AgentInstance {
                 summary_response.cache_write_tokens as u64,
                 summary_response.cost_usd,
                 priced_rounds,
+                None,
+                None,
             ) {
                 Ok(totals) => {
                     eprintln!(
@@ -4780,10 +4899,8 @@ impl AgentInstance {
         }
 
         let keep_from_msg = &messages[boundary_idx];
-        let restored_files_section = compact::build_post_compact_restored_files_section(
-            &messages[..boundary_idx],
-            &self.working_dir,
-        );
+        let restored_files_section =
+            compact::build_post_compact_restored_files_section(&messages, &self.working_dir);
         let summary_msg = compact::build_post_compact_message(
             &summary,
             &restored_files_section,
@@ -4796,6 +4913,9 @@ impl AgentInstance {
         if matches!(self.backend, LlmBackend::OpenAiCodex { .. }) {
             crate::llm::codex::reset_cached_session_window(&self.session_id).await;
         }
+        let compacted_context_tokens = self
+            .persist_compacted_context_usage(store, system_parts, context_limit)
+            .await;
         let compacted_messages = store.get_messages(&self.session_id)?;
 
         eprintln!(
@@ -4813,6 +4933,8 @@ impl AgentInstance {
                 session_id: self.session_id.clone(),
                 messages_before,
                 messages_after: count_after,
+                context_tokens: compacted_context_tokens,
+                context_limit,
                 messages: compacted_messages,
             },
         );
@@ -5048,6 +5170,7 @@ impl AgentInstance {
         store: &'a SessionStore,
         user_text: &'a str,
         images: Option<&'a [crate::session::models::ImageData]>,
+        asset_refs: Option<&'a [crate::session::models::AssetRefData]>,
         initial_mode: &'a str,
         user_intent: Option<crate::session::models::UserIntentPayload>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send + 'a>>
@@ -5060,6 +5183,7 @@ impl AgentInstance {
                 store,
                 user_text,
                 images,
+                asset_refs,
                 initial_mode,
                 user_intent,
                 run_id,
@@ -5074,6 +5198,7 @@ impl AgentInstance {
         store: &'a SessionStore,
         user_text: &'a str,
         images: Option<&'a [crate::session::models::ImageData]>,
+        asset_refs: Option<&'a [crate::session::models::AssetRefData]>,
         initial_mode: &'a str,
         user_intent: Option<crate::session::models::UserIntentPayload>,
         run_id: String,
@@ -5083,12 +5208,13 @@ impl AgentInstance {
             let run_started_at = Instant::now();
             self.partial_assistant.reset();
             eprintln!(
-                "[Agent {}] run pipeline start: session={} run={} mode={} images={} has_user_intent={}",
+                "[Agent {}] run pipeline start: session={} run={} mode={} images={} asset_refs={} has_user_intent={}",
                 self.id,
                 self.session_id,
                 run_id,
                 initial_mode,
                 images.map(|items| items.len()).unwrap_or(0),
+                asset_refs.map(|items| items.len()).unwrap_or(0),
                 user_intent.is_some()
             );
             let clear_started_at = Instant::now();
@@ -5109,6 +5235,72 @@ impl AgentInstance {
         emit_stream(app_handle, &run_id, StreamEvent::RunStart {
             session_id: self.session_id.clone(),
         });
+
+        if initial_mode == "compact" {
+            let prompt_parts = self.build_system_prompt_parts().await;
+            let system_parts: Vec<&str> = {
+                let mut parts = vec![prompt_parts.base_prompt.as_str()];
+                if !prompt_parts.rules_prompt.is_empty() {
+                    parts.push(prompt_parts.rules_prompt.as_str());
+                }
+                if !prompt_parts.knowledge_prompt.is_empty() {
+                    parts.push(prompt_parts.knowledge_prompt.as_str());
+                }
+                parts
+            };
+            let ctx_limit = if let LlmBackend::Custom { context_length, .. } = &self.backend {
+                *context_length
+            } else {
+                model_context_limit(&self.effective_model)
+            };
+            let messages = store.get_messages_for_prompt(&self.session_id)?;
+            let prepared_messages = compact::prepare_messages_for_llm(&messages);
+            let effective_tools = self.resolve_effective_tool_names().await;
+            let api_tools = self.build_api_tools(&effective_tools).await;
+            let estimated_input_tokens =
+                compact::estimate_request_tokens(&system_parts, &prepared_messages, &api_tools);
+            let compacted = self
+                .execute_auto_compact(
+                    app_handle,
+                    store,
+                    &system_parts,
+                    estimated_input_tokens,
+                    ctx_limit,
+                    true,
+                    &run_id,
+                    "compact",
+                    1,
+                )
+                .await?;
+            if !compacted {
+                eprintln!(
+                    "[Agent {}] manual compact finished without changes: session={} run={} messages={}",
+                    self.id,
+                    self.session_id,
+                    run_id,
+                    messages.len()
+                );
+            }
+            if let Err(error) = store.set_latest_completed_run_id(&self.session_id, Some(&run_id)) {
+                eprintln!(
+                    "[Agent {}] failed to persist latest completed run id for manual compact {} run {}: {}",
+                    self.id, self.session_id, run_id, error
+                );
+            }
+            emit_stream(
+                app_handle,
+                &run_id,
+                StreamEvent::Done {
+                    session_id: self.session_id.clone(),
+                    message_id: String::new(),
+                    full_text: String::new(),
+                    content_order: None,
+                    thinking_order: None,
+                    render_parts: None,
+                },
+            );
+            return Ok(String::new());
+        }
 
         let user_text_started_at = Instant::now();
         let actual_user_text: String;
@@ -5183,11 +5375,12 @@ impl AgentInstance {
         } else {
             None
         };
-        let current_message_id = store.add_message_with_images_and_signature(
+        let current_message_id = store.add_message_with_images_asset_refs_and_signature(
             &self.session_id,
             MessageRole::User,
             &actual_user_text,
             images,
+            asset_refs,
             user_intent_signature.as_deref(),
             current_prompt_prefix,
             user_prompt_suffix.as_deref(),
@@ -5374,6 +5567,7 @@ impl AgentInstance {
                         &system_parts,
                         estimated_input_tokens,
                         ctx_limit,
+                        false,
                         &run_id,
                         "compact",
                         iteration,
@@ -5743,6 +5937,7 @@ impl AgentInstance {
                             &system_parts,
                             estimated_input_tokens,
                             ctx_limit,
+                            false,
                             &run_id,
                             "reactive_compact",
                             iteration,
@@ -5819,6 +6014,15 @@ impl AgentInstance {
                 } else {
                     0
                 };
+                let context_tokens = response.input_tokens
+                    + response.cache_read_tokens
+                    + response.cache_write_tokens
+                    + response.output_tokens;
+                let context_limit = if let LlmBackend::Custom { context_length, .. } = &self.backend {
+                    *context_length
+                } else {
+                    model_context_limit(&self.effective_model)
+                };
                 match store.record_token_usage(
                     &self.session_id,
                     response.input_tokens as u64,
@@ -5827,6 +6031,8 @@ impl AgentInstance {
                     response.cache_write_tokens as u64,
                     response.cost_usd,
                     priced_rounds,
+                    Some(context_tokens),
+                    Some(context_limit),
                 ) {
                     Ok(totals) => {
                         eprintln!(
@@ -5851,15 +6057,8 @@ impl AgentInstance {
                             total_cache_write_tokens: totals.total_cache_write_tokens,
                             total_cost_usd: totals.total_cost_usd,
                             priced_rounds: totals.priced_rounds,
-                            context_tokens: response.input_tokens
-                                + response.cache_read_tokens
-                                + response.cache_write_tokens
-                                + response.output_tokens,
-                            context_limit: if let LlmBackend::Custom { context_length, .. } = &self.backend {
-                                *context_length
-                            } else {
-                                model_context_limit(&self.effective_model)
-                            },
+                            context_tokens,
+                            context_limit,
                         });
                     }
                     Err(e) => {
@@ -9937,7 +10136,7 @@ impl AgentInstance {
         ));
 
         match child
-            .run(app_handle, store, prompt, None, "build", None)
+            .run(app_handle, store, prompt, None, None, "build", None)
             .await
         {
             Ok(result_text) => {
@@ -9962,6 +10161,8 @@ impl AgentInstance {
                             child_usage.total_cache_write_tokens,
                             child_usage.total_cost_usd,
                             child_usage.priced_rounds,
+                            None,
+                            None,
                         ) {
                             Ok(parent_totals) => {
                                 eprintln!(
@@ -10049,6 +10250,8 @@ impl AgentInstance {
                             child_usage.total_cache_write_tokens,
                             child_usage.total_cost_usd,
                             child_usage.priced_rounds,
+                            None,
+                            None,
                         ) {
                             emit_stream(
                                 app_handle,

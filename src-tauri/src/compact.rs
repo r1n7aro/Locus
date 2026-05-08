@@ -39,41 +39,31 @@ const EMERGENCY_SUMMARY_MAX_ITEMS: usize = 12;
 
 const COMPACT_PROMPT: &str = r#"CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.
 
-You are writing a handoff summary so the same assistant can continue the work after context compaction.
-Preserve the user's intent, constraints, unfinished work, recent decisions, file references, and technical details needed to continue without losing momentum.
+You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary for another LLM that will resume the task.
 
 Important rules:
 - Do NOT call Read, Bash, Grep, List, Edit, Write, or any other tool.
 - Prefer the user's working language when it is obvious from the conversation.
-- Treat this as a handoff note, not as a status update to the user.
+- Treat this as handoff context, not as a user-facing status update.
+- Be concise, structured, and focused on helping the next LLM continue the work.
 - Your final answer must contain exactly two plain-text blocks:
   1. <analysis>...</analysis>
   2. <summary>...</summary>
 
-In <analysis>, work through the conversation chronologically and verify:
-- The user's explicit requests and changing intent
-- Every non-tool user message, preserving the user's original wording when it matters
-- What work was completed vs. still pending
-- Important technical decisions, code patterns, and architectural constraints
-- Specific files, functions, classes, commands, and edits that matter
-- Errors, regressions, retries, and user corrections
-- What was being worked on immediately before compaction
+In <analysis>, identify the durable context worth carrying forward:
+- Current progress and key decisions made
+- Important constraints, user preferences, and project conventions
+- Files, commands, errors, and technical details needed to continue
+- What remains to be done and the immediate next step
 
-In <summary>, write a precise handoff with these sections:
-1. Primary Request and Intent
-2. All User Messages
-   - Include every non-tool user message in chronological order.
-   - Keep the user's original wording verbatim when practical.
-   - If you must shorten, preserve intent, constraints, and exact asks with high fidelity.
-3. Current State of the Work
-4. Important Technical Context
-5. Files and Code Areas Touched
-6. Recent Decisions and Why They Matter
-7. Open Issues, Risks, or Follow-ups
-8. Latest User Feedback and Constraints
-9. Immediate Next Step
+In <summary>, write only the compact handoff. Include:
+- Primary request and current intent
+- Current progress and decisions
+- Important constraints and references
+- Files and code areas that matter
+- Open issues, risks, and next steps
 
-If some recent raw messages remain after this summary, assume they will appear below the handoff and should take precedence if there is any conflict.
+Recent user messages may remain after this handoff. If any retained raw user message conflicts with the summary, prefer the raw user message.
 "#;
 
 #[derive(Debug, Clone, Copy)]
@@ -192,6 +182,26 @@ fn is_real_user_message(message: &ChatMessage) -> bool {
     message.role == MessageRole::User && message.tool_call_id.is_none()
 }
 
+fn estimate_tool_call_prompt_tokens(tool_call: &ToolCallInfo) -> u32 {
+    let mut total = TOOL_CALL_OVERHEAD_TOKENS
+        .saturating_add(estimate_text_tokens(&tool_call.name))
+        .saturating_add(estimate_text_tokens(&tool_call.arguments))
+        .saturating_add(estimate_text_tokens(
+            tool_call.server_tool_output.as_deref().unwrap_or_default(),
+        ))
+        .saturating_add(estimate_text_tokens(
+            tool_call.recorded_output.as_deref().unwrap_or_default(),
+        ));
+
+    if let Some(nested_tool_calls) = tool_call.nested_tool_calls.as_ref() {
+        for nested in nested_tool_calls {
+            total = total.saturating_add(estimate_tool_call_prompt_tokens(nested));
+        }
+    }
+
+    total
+}
+
 fn estimate_message_prompt_tokens(message: &ChatMessage) -> u32 {
     let mut total = MESSAGE_OVERHEAD_TOKENS
         .saturating_add(estimate_text_tokens(&message.content))
@@ -211,11 +221,8 @@ fn estimate_message_prompt_tokens(message: &ChatMessage) -> u32 {
     }
 
     if let Some(ref tool_calls) = message.tool_calls {
-        total = total.saturating_add(tool_calls.len() as u32 * TOOL_CALL_OVERHEAD_TOKENS);
         for tc in tool_calls {
-            total = total
-                .saturating_add(estimate_text_tokens(&tc.name))
-                .saturating_add(estimate_text_tokens(&tc.arguments));
+            total = total.saturating_add(estimate_tool_call_prompt_tokens(tc));
         }
     }
 
@@ -329,6 +336,7 @@ pub fn build_compact_request(messages: &[ChatMessage]) -> Vec<ChatMessage> {
         tool_calls: None,
         tool_call_id: None,
         images: None,
+        asset_refs: None,
         thinking_content: None,
         thinking_duration: None,
         thinking_signature: None,
@@ -482,6 +490,7 @@ fn build_omitted_messages_marker(count: usize, created_at: i64) -> ChatMessage {
         tool_calls: None,
         tool_call_id: None,
         images: None,
+        asset_refs: None,
         thinking_content: None,
         thinking_duration: None,
         thinking_signature: None,
@@ -502,12 +511,7 @@ pub fn find_compact_boundary_by_budget(
     let mut boundary = messages.len().saturating_sub(1);
     let mut reached_target = false;
     for (idx, message) in messages.iter().enumerate().rev() {
-        total = total
-            .saturating_add(MESSAGE_OVERHEAD_TOKENS)
-            .saturating_add(estimate_text_tokens(&message.content));
-        if let Some(tool_calls) = message.tool_calls.as_ref() {
-            total = total.saturating_add(tool_calls.len() as u32 * TOOL_CALL_OVERHEAD_TOKENS);
-        }
+        total = total.saturating_add(estimate_message_prompt_tokens(message));
         boundary = idx;
         if total >= target_recent_tokens {
             reached_target = true;
@@ -565,6 +569,7 @@ pub fn build_compact_request_with_budget(
         tool_calls: None,
         tool_call_id: None,
         images: None,
+        asset_refs: None,
         thinking_content: None,
         thinking_duration: None,
         thinking_signature: None,
@@ -1563,6 +1568,7 @@ pub fn build_post_compact_message(
         tool_calls: None,
         tool_call_id: None,
         images: None,
+        asset_refs: None,
         thinking_content: None,
         thinking_duration: None,
         thinking_signature: None,
@@ -1606,6 +1612,7 @@ mod tests {
             tool_calls,
             tool_call_id: tool_call_id.map(|s| s.to_string()),
             images: None,
+            asset_refs: None,
             thinking_content: None,
             thinking_duration: None,
             thinking_signature: None,
@@ -1818,6 +1825,66 @@ mod tests {
     }
 
     #[test]
+    fn compact_boundary_counts_tool_arguments() {
+        let messages = vec![
+            make_message("user-1", MessageRole::User, "分析工具结果", 100, None, None),
+            make_message(
+                "assistant-1",
+                MessageRole::Assistant,
+                "running tool",
+                101,
+                Some(vec![ToolCallInfo {
+                    id: "tc-large".to_string(),
+                    name: "read".to_string(),
+                    arguments: "large args".repeat(4_000),
+                    order: None,
+                    server_tool: None,
+                    server_tool_output: None,
+                    outcome: None,
+                    recorded_output: None,
+                    nested_tool_calls: None,
+                }]),
+                None,
+            ),
+            make_message("user-2", MessageRole::User, "继续", 102, None, None),
+        ];
+
+        let boundary = find_compact_boundary_by_budget(&messages, 8_000);
+
+        assert_eq!(boundary, 1);
+    }
+
+    #[test]
+    fn compact_boundary_counts_server_tool_output() {
+        let messages = vec![
+            make_message("user-1", MessageRole::User, "搜索资料", 100, None, None),
+            make_message(
+                "assistant-1",
+                MessageRole::Assistant,
+                "searched",
+                101,
+                Some(vec![ToolCallInfo {
+                    id: "tc-web".to_string(),
+                    name: "web_search".to_string(),
+                    arguments: "{}".to_string(),
+                    order: None,
+                    server_tool: Some(crate::session::models::ServerToolKind::WebSearch),
+                    server_tool_output: Some("search result ".repeat(4_000)),
+                    outcome: None,
+                    recorded_output: None,
+                    nested_tool_calls: None,
+                }]),
+                None,
+            ),
+            make_message("user-2", MessageRole::User, "继续", 102, None, None),
+        ];
+
+        let boundary = find_compact_boundary_by_budget(&messages, 8_000);
+
+        assert_eq!(boundary, 1);
+    }
+
+    #[test]
     fn compact_boundary_does_not_prune_when_recent_tail_is_already_small() {
         let messages = vec![
             make_message("user-1", MessageRole::User, "分析项目结构", 100, None, None),
@@ -1985,9 +2052,10 @@ mod tests {
     }
 
     #[test]
-    fn compact_prompt_requires_all_user_messages() {
-        assert!(COMPACT_PROMPT.contains("All User Messages"));
-        assert!(COMPACT_PROMPT.contains("every non-tool user message"));
+    fn compact_prompt_requires_concise_checkpoint_handoff() {
+        assert!(COMPACT_PROMPT.contains("CONTEXT CHECKPOINT COMPACTION"));
+        assert!(COMPACT_PROMPT.contains("Be concise"));
+        assert!(!COMPACT_PROMPT.contains("All User Messages"));
     }
 
     #[test]

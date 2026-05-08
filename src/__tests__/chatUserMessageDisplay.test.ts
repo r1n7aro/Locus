@@ -20,6 +20,12 @@ describe("displayUserMessageContent", () => {
     )).toBe("继续");
   });
 
+  it("hides structured Unity asset reference blocks", () => {
+    expect(displayUserMessageContent(
+      "检查这个预制体\n\n<unity-asset-refs>\n- asset: {@Assets/Prefabs/Player.prefab}\n- scene object: {@Assets/Scenes/Main.unity/Root/Player}\n</unity-asset-refs>",
+    )).toBe("检查这个预制体");
+  });
+
   it("keeps user-authored bracket prefixes", () => {
     expect(displayUserMessageContent("[BUG] 修复按钮状态")).toBe("[BUG] 修复按钮状态");
   });

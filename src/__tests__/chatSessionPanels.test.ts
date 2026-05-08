@@ -213,6 +213,20 @@ describe("chat session panel state", () => {
     expect(chatStore.showTodoPanel).toBe(true);
   });
 
+  it("restores persisted context usage when opening a historical session", async () => {
+    const chatStore = useChatStore();
+    sessionServiceMocks.getSessionUsage.mockResolvedValueOnce({
+      ...emptyUsage(),
+      contextTokens: 42000,
+      contextLimit: 258400,
+    });
+
+    await chatStore.selectSession("s1");
+
+    expect(chatStore.tokenUsage.contextTokens).toBe(42000);
+    expect(chatStore.tokenUsage.contextLimit).toBe(258400);
+  });
+
   it("restores the persisted active session after refreshing sessions", async () => {
     const chatStore = useChatStore();
 

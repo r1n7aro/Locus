@@ -16,7 +16,7 @@ import { useDisplaySettings } from "../composables/useDisplaySettings";
 import { logToolCollapseTrace, previewTraceText } from "../services/toolCollapseTrace";
 import type {
   SessionSummary, SessionDetail, ChatMessage, TokenUsage,
-  TodoItem, StreamEvent, ImageAttachment, ToolCallDisplay,
+  TodoItem, StreamEvent, ImageAttachment, AssetRefAttachment, ToolCallDisplay,
   PendingQuestion, PendingToolConfirm,
   UserIntentMeta,
   KnowledgeProposalStatus,
@@ -266,7 +266,7 @@ export const useChatStore = defineStore("chat", () => {
     undoEntries: Array<{ assistantMessageId: string }>,
   ) {
     messages.value = hydrateMessages(detail.messages);
-    tokenUsage.value = { ...usage, contextTokens: 0, contextLimit: 0 };
+    tokenUsage.value = usage;
     todos.value = sessionTodos.items;
     sessionLatestTodoRunIds.value.set(detail.id, sessionTodos.latestRunId);
     sessionLatestCompletedRunIds.value.set(detail.id, detail.latestCompletedRunId ?? null);
@@ -1393,6 +1393,7 @@ export const useChatStore = defineStore("chat", () => {
   async function sendMessage(
     text: string,
     images: ImageAttachment[] = [],
+    assetRefs: AssetRefAttachment[] = [],
     overrides?: { displayText?: string; mode?: string; userIntent?: UserIntentMeta | null },
   ) {
     const modelStore = useModelStore();
@@ -1420,6 +1421,7 @@ export const useChatStore = defineStore("chat", () => {
       content: displayText,
       createdAt: Date.now() / 1000,
       images: images.length > 0 ? images : undefined,
+      assetRefs: assetRefs.length > 0 ? assetRefs : undefined,
       thinkingSignature: overrides?.userIntent ? JSON.stringify(overrides.userIntent) : undefined,
       intentMeta: overrides?.userIntent ?? undefined,
     });
@@ -1446,6 +1448,7 @@ export const useChatStore = defineStore("chat", () => {
       mode: overrides?.mode || "build",
       textLength: text.length,
       imageCount: images.length,
+      assetRefCount: assetRefs.length,
       model,
       agentId: agentStore.selectedAgentId || null,
     });
@@ -1458,6 +1461,7 @@ export const useChatStore = defineStore("chat", () => {
         model,
         effort: modelStore.effortSupported ? modelStore.effort : null,
         images: images.length > 0 ? images : null,
+        assetRefs: assetRefs.length > 0 ? assetRefs : null,
         mode: overrides?.mode || null,
         userIntent: overrides?.userIntent || null,
         subagentModels: Object.keys(modelStore.modelDefaults.subagentModels).length > 0 ? modelStore.modelDefaults.subagentModels : null,
@@ -1514,6 +1518,90 @@ export const useChatStore = defineStore("chat", () => {
       if (activeSessionId.value) {
         managedStreamingSessionIds.delete(activeSessionId.value);
       }
+      pendingManagedSessionId = null;
+      pendingManagedUnboundSession = false;
+    }
+  }
+
+  async function compactSession() {
+    if (!activeSessionId.value || isStreaming.value) return;
+
+    const modelStore = useModelStore();
+    const agentStore = useAgentStore();
+    const sessionId = activeSessionId.value;
+
+    const { state: displaySettings } = useDisplaySettings();
+    if (displaySettings.changesAutoClose) {
+      useChatChangesStore().closePanel();
+    }
+
+    resetStreamRuntimeState();
+    isStreaming.value = true;
+    pendingManagedSessionId = sessionId;
+    pendingManagedUnboundSession = false;
+    managedStreamingSessionIds.add(sessionId);
+
+    const model = modelStore.selectedModelId || null;
+
+    logChatStreamDebug("compact request start", {
+      sessionId,
+      model,
+      agentId: agentStore.selectedAgentId || null,
+    });
+
+    try {
+      const { sessionId: sid, runId } = await sessionService.chat({
+        sessionId,
+        text: "",
+        agentId: agentStore.selectedAgentId || null,
+        model,
+        effort: modelStore.effortSupported ? modelStore.effort : null,
+        images: null,
+        assetRefs: null,
+        mode: "compact",
+        userIntent: null,
+        subagentModels: Object.keys(modelStore.modelDefaults.subagentModels).length > 0 ? modelStore.modelDefaults.subagentModels : null,
+      });
+
+      logChatStreamDebug("compact request resolved", {
+        sessionId: sid,
+        runId,
+        activeSessionId: activeSessionId.value,
+        pendingManagedSessionId,
+      });
+
+      const previousRunId = sessionRunIds.value.get(sid) ?? null;
+      streamingSessionIds.value.add(sid);
+      sessionRunIds.value.set(sid, runId);
+      if (previousRunId && previousRunId !== runId) {
+        forgetRunReplaySeq(sid, previousRunId);
+      }
+      closedRunIds.delete(sid);
+      cancelRequestedRunIds.delete(sid);
+      pendingSessionId = null;
+      pendingManagedSessionId = sid;
+      pendingManagedUnboundSession = false;
+      managedStreamingSessionIds.add(sid);
+      currentRunId.value = runId;
+      sessionAgentId.value = agentStore.selectedAgentId || null;
+      await refreshSessions();
+    } catch (e) {
+      console.error("compact failed:", e);
+      logChatStreamDebug("compact request failed", {
+        sessionId,
+        error: e instanceof Error ? e.message : String(e),
+      });
+      const err = normalizeAppError(e);
+      useNotificationStore().addNotice("error", t("app.sendFailed", err.message), {
+        code: err.code,
+        operation: "compact",
+        skipConsoleLog: true,
+      });
+      isStreaming.value = false;
+      isCompacting.value = false;
+      resetStreamAnim();
+      pendingSessionId = null;
+      managedStreamingSessionIds.delete(sessionId);
       pendingManagedSessionId = null;
       pendingManagedUnboundSession = false;
     }
@@ -1729,6 +1817,7 @@ export const useChatStore = defineStore("chat", () => {
     archiveSession,
     deleteSession,
     sendMessage,
+    compactSession,
     cancelSession,
     cancelSessions,
     cancelChat,

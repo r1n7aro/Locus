@@ -39,9 +39,9 @@ describe("chat input mode layout", () => {
 
     expect(zh).toContain('"settings.shortcuts.sendModeTitle": "发送方式"');
     expect(zh).toContain('"settings.shortcuts.sendModeModifierSendHint": "Enter 换行"');
-    expect(zh).toContain('"chat.input.placeholderModifierSend": "输入消息... (@ 引用文件或文件夹, / 查看命令, {0}+Enter 发送)"');
+    expect(zh).toContain('"chat.input.placeholderModifierSend": "输入消息... (@ 引用资产、文件夹或知识, / 查看命令, {0}+Enter 发送)"');
     expect(en).toContain('"settings.shortcuts.sendModeTitle": "Send behavior"');
     expect(en).toContain('"settings.shortcuts.sendModeModifierSendHint": "Enter inserts newline"');
-    expect(en).toContain('"chat.input.placeholderModifierSend": "Type message... (@ ref file or folder, / commands, {0}+Enter to send)"');
+    expect(en).toContain('"chat.input.placeholderModifierSend": "Type message... (@ ref asset, folder, or knowledge, / commands, {0}+Enter to send)"');
   });
 });

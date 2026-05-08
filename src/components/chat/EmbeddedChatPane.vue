@@ -72,6 +72,7 @@ const props = withDefaults(defineProps<{
   thinkingLabel?: string;
   waitingLabel?: string;
   compactingLabel?: string;
+  compactedLabel?: string;
   thoughtDurationLabel?: string;
   thoughtMomentLabel?: string;
   runningLabel?: string;
@@ -101,6 +102,7 @@ const props = withDefaults(defineProps<{
   thinkingLabel: "",
   waitingLabel: "",
   compactingLabel: "",
+  compactedLabel: "",
   thoughtDurationLabel: "",
   thoughtMomentLabel: "",
   runningLabel: "",
@@ -134,6 +136,7 @@ const effectiveUserLabel = computed(() => props.userLabel || t("chat.embedded.us
 const effectiveThinkingLabel = computed(() => props.thinkingLabel || t("chat.embedded.thinking"));
 const effectiveWaitingLabel = computed(() => props.waitingLabel || props.runningLabel || t("chat.embedded.running"));
 const effectiveCompactingLabel = computed(() => props.compactingLabel || t("chat.transcript.compacting"));
+const effectiveCompactedLabel = computed(() => props.compactedLabel || t("chat.transcript.compacted"));
 const effectiveThoughtDurationLabel = computed(() =>
   props.thoughtDurationLabel || t("chat.transcript.thoughtDuration", "{0}"),
 );
@@ -564,6 +567,7 @@ onUnmounted(() => {
       :assistant-label="assistantLabel"
       :waiting-label="effectiveWaitingLabel"
       :compacting-label="effectiveCompactingLabel"
+      :compacted-label="effectiveCompactedLabel"
       :thinking-active-label="effectiveThinkingLabel"
       :thought-duration-label="effectiveThoughtDurationLabel"
       :thought-moment-label="effectiveThoughtMomentLabel"

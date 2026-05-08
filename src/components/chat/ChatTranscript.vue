@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onUnmounted, ref, useSlots, watch } from "vue";
-import type { AssistantRenderPart, ChatMessage, ToolCallDisplay, ToolCallInfo, UserIntentMeta } from "../../types";
+import type { AssetRefAttachment, AssistantRenderPart, ChatMessage, ToolCallDisplay, ToolCallInfo, UserIntentMeta } from "../../types";
 import {
   collectPendingContinuationToolItemIds,
   shouldShowAssistantContinuation,
@@ -95,6 +95,7 @@ const props = withDefaults(defineProps<{
   handoffLabel?: string;
   waitingLabel?: string;
   compactingLabel?: string;
+  compactedLabel?: string;
   thinkingActiveLabel?: string;
   thoughtDurationLabel?: string;
   thoughtMomentLabel?: string;
@@ -118,6 +119,7 @@ const props = withDefaults(defineProps<{
   handoffLabel: "Handoff",
   waitingLabel: "Waiting for response…",
   compactingLabel: "Compacting context…",
+  compactedLabel: "Context compacted",
   thinkingActiveLabel: "Thinking…",
   thoughtDurationLabel: "Thought for {0}s",
   thoughtMomentLabel: "Thought for a moment",
@@ -190,6 +192,10 @@ function userMessageDisplaySegments(message: ChatMessage) {
   return props.userContentMode === "asset"
     ? parseChatAssetRefs(content)
     : [{ type: "text" as const, value: content }];
+}
+
+function messageAssetRefs(message: ChatMessage): AssetRefAttachment[] {
+  return message.assetRefs ?? [];
 }
 
 function isCompactHandoffMessage(msg: ChatMessage) {
@@ -444,6 +450,7 @@ function hasVisibleMessagePayload(message: ChatMessage) {
     || message.thinkingContent?.trim()
     || message.knowledgeProposal
     || message.images?.length
+    || message.assetRefs?.length
     || (message.role === "user" && userMessageDisplayContent(message).trim())
   );
 }
@@ -610,6 +617,10 @@ function shouldRenderHistoryThinkingBlock(item: Pick<MessageRenderItem, "message
   return !shouldHideThinkingBlocks() && !!item.message.thinkingContent?.trim();
 }
 
+function shouldRenderTransientThinkingSegment(part: Extract<AssistantRenderPart, { kind: "thinking" }>) {
+  return !!part.active || (!shouldHideThinkingBlocks() && part.content.trim().length > 0);
+}
+
 function shouldRenderItem(item: MessageRenderItem) {
   if (item.message.knowledgeProposal) return true;
 
@@ -707,7 +718,9 @@ function buildGroupedMessages(hiddenToolCallMatchState: ToolCallMatchState): Mes
     order += 1;
     flatItems.push(renderItem);
     const last = groups[groups.length - 1];
-    if (last && last.role === msg.role) {
+    const isHandoff = isCompactHandoffMessage(msg);
+    const lastIsHandoff = !!last?.items.some((item) => isCompactHandoffMessage(item.message));
+    if (last && last.role === msg.role && !isHandoff && !lastIsHandoff) {
       last.items.push(renderItem);
     } else {
       groups.push({ id: msg.id, role: msg.role as "user" | "assistant", items: [renderItem] });
@@ -1267,16 +1280,15 @@ const transientRenderSegments = computed<TransientRenderSegment[]>(() => {
 
   for (const part of canonicalLiveRenderParts.value) {
     if (part.kind === "thinking") {
+      if (!shouldRenderTransientThinkingSegment(part)) continue;
       flushPendingTools();
-      if (part.active || (!shouldHideThinkingBlocks() && part.content.trim())) {
-        segments.push({
-          type: "thinking",
-          key: `transient:${part.id}`,
-          part,
-          active: !!part.active && props.isThinking,
-          duration: part.duration ?? props.thinkingDuration,
-        });
-      }
+      segments.push({
+        type: "thinking",
+        key: `transient:${part.id}`,
+        part,
+        active: !!part.active && props.isThinking,
+        duration: part.duration ?? props.thinkingDuration,
+      });
     } else if (part.kind === "text") {
       flushPendingTools();
       const content = props.liveRenderParts.length <= 1 && props.streamingText ? props.streamingText : part.content;
@@ -1346,12 +1358,18 @@ function messageGroupLabel(group: MessageGroup) {
       : props.assistantLabel;
 }
 
+function isCompactMarkerGroup(group: MessageGroup) {
+  return group.items.length > 0 && group.items.every((item) => isCompactHandoffMessage(item.message));
+}
+
 function shouldRightAlignUserMessageGroup(group: Pick<MessageGroup, "role">) {
   return props.variant === "session" && displaySettings.rightAlignUserMessages && group.role === "user";
 }
 
 function shouldShowSessionRoundDivider(group: Pick<MessageGroup, "role">, index: number) {
-  return props.variant === "session" && group.role === "user" && index > 0;
+  if (props.variant !== "session" || group.role !== "user" || index <= 0) return false;
+  const previousGroup = groupedMessages.value[index - 1];
+  return !previousGroup || !isCompactMarkerGroup(previousGroup);
 }
 
 const hasFooterSlot = computed(() => !!slots.footer);
@@ -1410,9 +1428,23 @@ function openImage(src: string) {
         </slot>
       </div>
       <template v-else>
-        <div
+        <template
           v-for="(group, idx) in groupedMessages"
           :key="group.id"
+        >
+          <div
+            v-if="isCompactMarkerGroup(group)"
+            class="chat-transcript-compact-marker"
+            :class="`is-${variant}`"
+            :data-scroll-anchor-id="group.items[0]?.id"
+          >
+            <span class="chat-transcript-compact-marker-line"></span>
+            <span class="chat-transcript-compact-marker-label">{{ compactedLabel }}</span>
+            <span class="chat-transcript-compact-marker-line"></span>
+          </div>
+
+          <div
+            v-else
           class="chat-transcript-message"
           :class="[
             `is-${variant}`,
@@ -1424,7 +1456,7 @@ function openImage(src: string) {
               'user-align-right': shouldRightAlignUserMessageGroup(group),
             },
           ]"
-        >
+          >
           <div class="chat-transcript-message-role" :class="`is-${variant}`">
             {{ messageGroupLabel(group) }}
           </div>
@@ -1454,6 +1486,18 @@ function openImage(src: string) {
                 </div>
 
                 <div
+                  v-if="messageAssetRefs(item.message).length > 0"
+                  class="chat-transcript-user-asset-refs"
+                >
+                  <AssetChip
+                    v-for="assetRef in messageAssetRefs(item.message)"
+                    :key="`${assetRef.kind}:${assetRef.path}`"
+                    :path="assetRef.path"
+                    :kind="assetRef.kind"
+                  />
+                </div>
+
+                <div
                   v-if="showUserImages && item.message.images && item.message.images.length > 0"
                   class="chat-transcript-user-images"
                 >
@@ -1471,7 +1515,11 @@ function openImage(src: string) {
                     v-for="(segment, segmentIdx) in userMessageDisplaySegments(item.message)"
                     :key="segmentIdx"
                   >
-                    <AssetChip v-if="segment.type === 'asset'" :path="segment.value" />
+                    <AssetChip
+                      v-if="segment.type === 'asset' || segment.type === 'knowledge'"
+                      :path="segment.value"
+                      :kind="segment.type === 'knowledge' ? 'knowledge' : undefined"
+                    />
                     <template v-else>{{ segment.value }}</template>
                   </template>
                 </div>
@@ -1559,7 +1607,8 @@ function openImage(src: string) {
               </template>
             </div>
           </div>
-        </div>
+          </div>
+        </template>
 
         <div
           v-if="hasTransientAssistantMessage"
@@ -1790,6 +1839,37 @@ function openImage(src: string) {
   border-top-color: color-mix(in srgb, var(--accent-color) 18%, transparent);
 }
 
+.chat-transcript-compact-marker {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1;
+  user-select: none;
+}
+
+.chat-transcript-compact-marker.is-session {
+  padding: 10px 48px;
+  background: var(--msg-assistant-bg);
+}
+
+.chat-transcript-compact-marker.is-embedded {
+  padding: 8px 14px;
+}
+
+.chat-transcript-compact-marker-line {
+  height: 1px;
+  flex: 1;
+  min-width: 24px;
+  background: var(--border-color);
+}
+
+.chat-transcript-compact-marker-label {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
 .chat-transcript-message.is-session.before-continuation {
   padding-bottom: 0;
 }
@@ -1943,6 +2023,28 @@ function openImage(src: string) {
 .chat-transcript-message.is-session.user.user-align-right .chat-transcript-plain-text {
   align-self: flex-end;
   text-align: left;
+}
+
+.chat-transcript-user-asset-refs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  max-width: min(100%, 78ch);
+}
+
+.chat-transcript-message.is-session.user.user-align-right .chat-transcript-user-asset-refs {
+  justify-content: flex-end;
+}
+
+.chat-transcript-user-asset-refs :deep(.asset-chip) {
+  max-width: min(320px, 100%);
+  background: color-mix(in srgb, var(--panel-bg) 68%, var(--msg-user-bg) 32%);
+  border-color: color-mix(in srgb, var(--border-color) 88%, transparent);
+}
+
+.chat-transcript-user-asset-refs :deep(.asset-chip:hover) {
+  background: color-mix(in srgb, var(--hover-bg) 82%, var(--panel-bg) 18%);
+  border-color: color-mix(in srgb, var(--accent-color) 35%, var(--border-color));
 }
 
 .chat-transcript-user-images {

@@ -17,7 +17,7 @@ describe("RichChatInput image attachment layout", () => {
     const zh = read("src/language/zh.json");
     const en = read("src/language/en.json");
 
-    expect(source).toContain('class="image-attachment-list"');
+    expect(source).toContain('class="composer-attachment-list"');
     expect(source).toContain('class="image-attachment-thumb-button ui-select-none"');
     expect(source).toContain('@click="openImagePreview(index)"');
     expect(source).toContain("const previewImageIndex = ref<number | null>(null);");
@@ -25,13 +25,17 @@ describe("RichChatInput image attachment layout", () => {
     expect(source).toContain('class="image-preview-dialog"');
     expect(source).toContain(':src="previewImageSrc"');
     expect(source).toContain(':show-header="hasHeaderContent"');
-    expect(source).toContain(':extend-top="imageAttachments.length > 0"');
-    expect(source).toMatch(/<template #overlay>[\s\S]*class="image-attachment-list"/);
+    expect(source).toContain(':extend-top="hasTopAttachments"');
+    expect(source).toContain("const hasTopAttachments = computed(() =>");
+    expect(source).toMatch(/<template #overlay>[\s\S]*class="composer-attachment-list"/);
     expect(source).toContain('const file = item.kind === "file" ? item.getAsFile() : null;');
     expect(source).toContain("imageAttachments.value.map(({ data, mimeType }) => ({ data, mimeType }))");
     expect(source).not.toContain('class="image-preview-bar"');
-    expect(source).toContain("flex-wrap: wrap;");
-    expect(source).toContain("overflow: visible;");
+    expect(source).toContain("flex-wrap: nowrap;");
+    expect(source).toContain("overflow-x: auto;");
+    expect(source).toContain("height: 28px;");
+    expect(source).not.toContain('class="asset-ref-attachment-list"');
+    expect(source).not.toContain('class="image-attachment-list"');
     expect(source).toMatch(/\.image-preview-overlay \{[\s\S]*position: fixed;[\s\S]*z-index: 9999;/);
     expect(source).toMatch(/\.image-preview-dialog \{[\s\S]*max-width: min\(76vw, 920px\);[\s\S]*max-height: min\(78vh, 720px\);/);
     expect(source).not.toContain(".image-attachment-item:hover .image-attachment-preview");

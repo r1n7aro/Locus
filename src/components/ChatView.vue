@@ -11,7 +11,7 @@ import {
   showInFolder,
 } from "../services/unity";
 // undoPreview removed — undo UI moved to ChatChangesPanel
-import type { ChatComposerSendPayload, ChatMessage, AgentInfo, TokenUsage, ModelOption, PendingQuestion, PendingToolConfirm, EffortLevel, SessionSummary, AssetDbScanEvent, ScanStats, ImageAttachment, SkillManifest, UserIntentMeta, SaveRawContextRequest, CodexTransportMode, AssistantRenderPart } from "../types";
+import type { ChatComposerSendPayload, ChatMessage, AgentInfo, TokenUsage, ModelOption, PendingQuestion, PendingToolConfirm, EffortLevel, SessionSummary, AssetDbScanEvent, ScanStats, ImageAttachment, AssetRefAttachment, SkillManifest, UserIntentMeta, SaveRawContextRequest, CodexTransportMode, AssistantRenderPart } from "../types";
 import type { ToolCallDisplay } from "../types";
 import ModelEffortSelector from "./ModelEffortSelector.vue";
 import SessionPanel from "./chat/SessionPanel.vue";
@@ -189,7 +189,8 @@ const props = defineProps<{
 
 
 const emit = defineEmits<{
-  send: [text: string, images: ImageAttachment[], overrides?: { displayText?: string; mode?: string; userIntent?: UserIntentMeta | null }];
+  send: [text: string, images: ImageAttachment[], assetRefs: AssetRefAttachment[], overrides?: { displayText?: string; mode?: string; userIntent?: UserIntentMeta | null }];
+  compact: [];
   cancel: [];
   selectAgent: [id: string];
   selectModel: [id: string];
@@ -382,6 +383,8 @@ const transcriptRef = ref<InstanceType<typeof ChatTranscript> | null>(null);
 function draftSessionKey(sessionId: string | null) {
   return sessionId ?? NEW_CHAT_DRAFT_KEY;
 }
+
+const composerAssetRefSyncKey = computed(() => `chat:${draftSessionKey(props.activeSessionId)}`);
 
 function storeComposerDraft(sessionId: string | null, value: string) {
   const key = draftSessionKey(sessionId);
@@ -1059,7 +1062,7 @@ const showSingleToolConfirmCard = computed(() =>
 
 function handlePlanContinue() {
   chatStore.clearPendingPlan();
-  emit("send", t("chat.plan.continueMessage"), []);
+  emit("send", t("chat.plan.continueMessage"), [], []);
 }
 
 function handleComposerSend(payload: ChatComposerSendPayload) {
@@ -1067,7 +1070,7 @@ function handleComposerSend(payload: ChatComposerSendPayload) {
     chatStore.clearPendingPlan();
   }
 
-  emit("send", payload.text, payload.images, {
+  emit("send", payload.text, payload.images, payload.assetRefs, {
     displayText: payload.displayText,
     mode: payload.mode ?? undefined,
     userIntent: payload.userIntent ?? null,
@@ -1359,6 +1362,7 @@ onUnmounted(() => {
           :handoff-label="t('chat.transcript.handoff')"
           :waiting-label="t('chat.transcript.waiting')"
           :compacting-label="t('chat.transcript.compacting')"
+          :compacted-label="t('chat.transcript.compacted')"
           :thinking-active-label="t('chat.transcript.thinking')"
           :thought-duration-label="t('chat.transcript.thoughtDuration', '{0}')"
           :thought-moment-label="t('chat.transcript.thoughtMoment')"
@@ -1513,7 +1517,9 @@ onUnmounted(() => {
         :send-label="t('common.send')"
         :cancel-label="t('common.cancel')"
         :compact="inputControlsCollapsed"
+        :asset-ref-sync-key="composerAssetRefSyncKey"
         @send="handleComposerSend"
+        @compact="emit('compact')"
         @clear="handleNewChatRequest"
         @cancel="emit('cancel')"
       >

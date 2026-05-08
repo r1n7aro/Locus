@@ -1,12 +1,16 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted } from "vue";
+import { onMounted, onUnmounted, ref } from "vue";
 import { t } from "../i18n";
 import {
   activateUnityEmbedForInput,
+  commitUnityEmbedAssetDrop,
   getUnityEmbedFocusDebugSnapshot,
   setUnityEmbedMouseActivationSuppressed,
+  subscribeUnityEmbedAssetDragState,
+  type UnityEmbedAssetDragStatePayload,
   type UnityEmbedFocusDebugSnapshot,
 } from "../services/unity";
+import type { AssetRefAttachment } from "../types";
 import ChatWorkspaceView from "./ChatWorkspaceView.vue";
 import TopBannerHost from "./TopBannerHost.vue";
 
@@ -27,11 +31,21 @@ const ACTIVATION_ALLOWED_SELECTOR = [
   ".chat-composer-input",
 ].join(",");
 
+const UNITY_ASSET_DRAG_STATE_TTL_MS = 1200;
+
+const unityAssetDragRefs = ref<AssetRefAttachment[]>([]);
+
 let lastActivationSuppressed: boolean | null = null;
 let activationErrorLogged = false;
 let inputActivationErrorLogged = false;
+let assetDropCommitErrorLogged = false;
+let assetDragStateSubscriptionErrorLogged = false;
+let assetDropCommitInFlight = false;
 let focusOutFrame = 0;
 let focusDebugSequence = 0;
+let releaseUnityAssetDragState: (() => void) | null = null;
+let unityAssetDragStateSubscriptionDisposed = false;
+let unityAssetDragStateClearTimer = 0;
 
 function focusDebugEnabled(): boolean {
   try {
@@ -162,6 +176,75 @@ function handleClick(event: MouseEvent) {
   }, 240);
 }
 
+function clearUnityAssetDragStateTimer() {
+  if (!unityAssetDragStateClearTimer) return;
+  window.clearTimeout(unityAssetDragStateClearTimer);
+  unityAssetDragStateClearTimer = 0;
+}
+
+function clearUnityAssetDragState() {
+  clearUnityAssetDragStateTimer();
+  unityAssetDragRefs.value = [];
+}
+
+function hasUnityAssetDragState(): boolean {
+  return unityAssetDragRefs.value.length > 0;
+}
+
+function scheduleUnityAssetDragStateExpiry() {
+  clearUnityAssetDragStateTimer();
+  unityAssetDragStateClearTimer = window.setTimeout(() => {
+    unityAssetDragStateClearTimer = 0;
+    unityAssetDragRefs.value = [];
+  }, UNITY_ASSET_DRAG_STATE_TTL_MS);
+}
+
+function handleUnityAssetDragState(payload: UnityEmbedAssetDragStatePayload) {
+  const refs = Array.isArray(payload.refs) ? payload.refs : [];
+  if (!payload.hasRefs || refs.length === 0) {
+    clearUnityAssetDragState();
+    return;
+  }
+
+  unityAssetDragRefs.value = refs;
+  scheduleUnityAssetDragStateExpiry();
+}
+
+function isUnityExternalFileDrag(event: DragEvent): boolean {
+  const types = event.dataTransfer ? Array.from(event.dataTransfer.types) : [];
+  return types.includes("Files");
+}
+
+function acceptUnityAssetDrag(event: DragEvent): boolean {
+  if (!isUnityExternalFileDrag(event) && !hasUnityAssetDragState()) return false;
+  event.preventDefault();
+  if (event.dataTransfer) {
+    event.dataTransfer.dropEffect = "copy";
+  }
+  return true;
+}
+
+function handleUnityAssetDrag(event: DragEvent) {
+  acceptUnityAssetDrag(event);
+}
+
+function handleUnityAssetDrop(event: DragEvent) {
+  if (!acceptUnityAssetDrag(event) || assetDropCommitInFlight) return;
+  assetDropCommitInFlight = true;
+  commitUnityEmbedAssetDrop()
+    .then(() => {
+      clearUnityAssetDragState();
+    })
+    .catch((error: unknown) => {
+      if (assetDropCommitErrorLogged) return;
+      assetDropCommitErrorLogged = true;
+      console.warn("[Locus] failed to commit Unity asset drop:", error);
+    })
+    .finally(() => {
+      assetDropCommitInFlight = false;
+    });
+}
+
 function handleFocusIn(event: FocusEvent) {
   if (targetAllowsActivation(event.target)) {
     lastActivationSuppressed = false;
@@ -201,14 +284,32 @@ onMounted(() => {
   applyMouseActivationSuppressed(true);
   window.addEventListener("focus", handleWindowFocus);
   window.addEventListener("blur", handleWindowBlur);
+  unityAssetDragStateSubscriptionDisposed = false;
+  subscribeUnityEmbedAssetDragState(handleUnityAssetDragState)
+    .then((release) => {
+      if (unityAssetDragStateSubscriptionDisposed) {
+        release();
+        return;
+      }
+      releaseUnityAssetDragState = release;
+    })
+    .catch((error: unknown) => {
+      if (assetDragStateSubscriptionErrorLogged) return;
+      assetDragStateSubscriptionErrorLogged = true;
+      console.warn("[Locus] Unity asset drag state subscription failed:", error);
+    });
   printFocusDebug("mounted", document.activeElement);
 });
 
 onUnmounted(() => {
+  unityAssetDragStateSubscriptionDisposed = true;
   window.removeEventListener("focus", handleWindowFocus);
   window.removeEventListener("blur", handleWindowBlur);
   if (focusOutFrame) cancelAnimationFrame(focusOutFrame);
   focusOutFrame = 0;
+  releaseUnityAssetDragState?.();
+  releaseUnityAssetDragState = null;
+  clearUnityAssetDragState();
   applyMouseActivationSuppressed(true);
 });
 </script>
@@ -218,6 +319,9 @@ onUnmounted(() => {
     class="unity-session-view"
     @pointerdown.capture="handlePointerDown"
     @click.capture="handleClick"
+    @dragenter.capture="handleUnityAssetDrag"
+    @dragover.capture="handleUnityAssetDrag"
+    @drop.capture="handleUnityAssetDrop"
     @focusin.capture="handleFocusIn"
     @focusout.capture="handleFocusOut"
   >

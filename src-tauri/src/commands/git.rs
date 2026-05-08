@@ -4994,6 +4994,7 @@ pub async fn git_generate_commit_message(
         tool_calls: None,
         tool_call_id: None,
         images: None,
+        asset_refs: None,
         thinking_content: None,
         thinking_duration: None,
         thinking_signature: None,

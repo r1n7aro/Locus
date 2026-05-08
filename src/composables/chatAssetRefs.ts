@@ -4,12 +4,18 @@ import {
 } from "./markdownInject";
 
 export interface ChatAssetRefSegment {
-  type: "text" | "asset";
+  type: "text" | "asset" | "knowledge";
   value: string;
 }
 
-const UNITY_ASSET_REF_START_RE = /`@?(?:Assets|Packages|ProjectSettings)\/|\{@(?:Assets|Packages|ProjectSettings)\/|@(?:Assets|Packages|ProjectSettings)\//g;
-const UNITY_ASSET_ROOT_RE = /^(?:Assets|Packages|ProjectSettings)\//;
+export interface ExtractedChatAssetRefs {
+  text: string;
+  refs: string[];
+}
+
+const UNITY_ASSET_REF_START_RE = /`@?(?:Assets|Packages|ProjectSettings|design|memory|skill|reference)\/|\{@(?:Assets|Packages|ProjectSettings|design|memory|skill|reference)\/|@(?:Assets|Packages|ProjectSettings|design|memory|skill|reference)\//gi;
+const UNITY_ASSET_ROOT_RE = /^(?:Assets|Packages|ProjectSettings)\//i;
+const PROJECT_KNOWLEDGE_ROOT_RE = /^(?:design|memory|skill|reference)\/.+\.md$/i;
 
 function findSimpleAssetMentionEnd(text: string, start: number): number {
   let end = start;
@@ -48,13 +54,18 @@ export function parseChatAssetRefs(text: string): ChatAssetRefSegment[] {
     const end = backticked ? text.indexOf("`", pathStart) : findAssetMentionEnd(text, pathStart);
     if (end < 0) continue;
     const pathValue = normalizeAssetSegmentValue(text.slice(pathStart, end).replace(/\\/g, "/"));
-    if (!UNITY_ASSET_ROOT_RE.test(pathValue)) continue;
+    const refType = UNITY_ASSET_ROOT_RE.test(pathValue)
+      ? "asset"
+      : PROJECT_KNOWLEDGE_ROOT_RE.test(pathValue)
+        ? "knowledge"
+        : null;
+    if (!refType) continue;
     const tokenEnd = backticked ? end + 1 : braced && text[end] === "}" ? end + 1 : end;
 
     if (markerStart > cursor) {
       segments.push({ type: "text", value: text.slice(cursor, markerStart) });
     }
-    segments.push({ type: "asset", value: pathValue });
+    segments.push({ type: refType, value: pathValue });
     cursor = tokenEnd;
     UNITY_ASSET_REF_START_RE.lastIndex = tokenEnd;
   }
@@ -64,4 +75,23 @@ export function parseChatAssetRefs(text: string): ChatAssetRefSegment[] {
   }
 
   return segments;
+}
+
+export function extractChatAssetRefs(text: string): ExtractedChatAssetRefs {
+  const segments = parseChatAssetRefs(text);
+  const refs: string[] = [];
+  const textSegments: string[] = [];
+
+  for (const segment of segments) {
+    if (segment.type === "asset" || segment.type === "knowledge") {
+      refs.push(segment.value);
+    } else {
+      textSegments.push(segment.value);
+    }
+  }
+
+  return {
+    text: textSegments.join(""),
+    refs,
+  };
 }

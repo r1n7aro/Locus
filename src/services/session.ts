@@ -7,6 +7,7 @@ import type {
   TokenUsage,
   TodoSnapshot,
   ImageAttachment,
+  AssetRefAttachment,
   UserIntentMeta,
 } from "../types";
 
@@ -18,6 +19,7 @@ export interface ChatParams {
   model?: string | null;
   effort?: string | null;
   images?: ImageAttachment[] | null;
+  assetRefs?: AssetRefAttachment[] | null;
   sessionType?: string | null;
   mode?: string | null;
   userIntent?: UserIntentMeta | null;

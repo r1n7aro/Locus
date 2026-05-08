@@ -1,9 +1,10 @@
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Manager, PhysicalPosition, PhysicalSize, WebviewUrl};
+use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, WebviewUrl};
 
 use crate::error::AppError;
 use crate::workspace::Workspace;
@@ -13,15 +14,20 @@ const CONTROL_PIPE_NAME_PREFIX: &str = r"\\.\pipe\locus_tauri_unity_embed_";
 const EMBED_URL: &str = "/unity-embed?host=tauri-overlay";
 const CLOSE_REASON_DOMAIN_RELOAD: &str = "domainReload";
 const TRANSIENT_CLOSE_DESTROY_DELAY: Duration = Duration::from_secs(30);
+const ASSET_DRAG_CACHE_TTL: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct UnityEmbedControlMessage {
     #[serde(rename = "type")]
     kind: String,
+    #[serde(default)]
     x: i32,
+    #[serde(default)]
     y: i32,
+    #[serde(default)]
     width: i32,
+    #[serde(default)]
     height: i32,
     #[serde(default = "default_visible")]
     visible: bool,
@@ -29,6 +35,40 @@ struct UnityEmbedControlMessage {
     parent_hwnd: i64,
     #[serde(default)]
     reason: String,
+    #[serde(default)]
+    asset_refs: Option<Vec<UnityEmbedAssetRef>>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UnityEmbedAssetRef {
+    path: String,
+    kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    type_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UnityEmbedAssetDropPayload {
+    refs: Vec<UnityEmbedAssetRef>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UnityEmbedAssetDragStatePayload {
+    has_refs: bool,
+    refs: Vec<UnityEmbedAssetRef>,
+}
+
+#[derive(Default)]
+struct UnityEmbedAssetDragCache {
+    refs: Vec<UnityEmbedAssetRef>,
+    updated_at: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -321,6 +361,218 @@ async fn current_workspace_path(app_handle: &AppHandle) -> String {
     }
 }
 
+pub(crate) fn handle_unity_embed_webview_event(
+    webview: &tauri::Webview,
+    event: &tauri::WebviewEvent,
+) {
+    if webview.label() != WINDOW_LABEL {
+        return;
+    }
+
+    let paths = match event {
+        tauri::WebviewEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) => paths.clone(),
+        _ => return,
+    };
+    if paths.is_empty() {
+        return;
+    }
+
+    let app_handle = webview.app_handle().clone();
+    tauri::async_runtime::spawn(async move {
+        let workspace_path = current_workspace_path(&app_handle).await;
+        let refs = unity_file_drop_asset_refs(&workspace_path, &paths);
+        if refs.is_empty() {
+            return;
+        }
+        if let Err(error) = emit_unity_embed_asset_drop(&app_handle, refs) {
+            eprintln!("[Locus] failed to emit Unity embed file drop: {error}");
+        }
+    });
+}
+
+fn emit_unity_embed_asset_drop(
+    app_handle: &AppHandle,
+    refs: Vec<UnityEmbedAssetRef>,
+) -> Result<(), String> {
+    app_handle
+        .emit_to(
+            WINDOW_LABEL,
+            "unity-embed-asset-drop",
+            UnityEmbedAssetDropPayload { refs },
+        )
+        .map_err(|error| format!("Failed to emit Unity embed asset drop: {error}"))
+}
+
+fn emit_unity_embed_asset_drag_state(
+    app_handle: &AppHandle,
+    refs: Vec<UnityEmbedAssetRef>,
+) -> Result<(), String> {
+    app_handle
+        .emit_to(
+            WINDOW_LABEL,
+            "unity-embed-asset-drag-state",
+            UnityEmbedAssetDragStatePayload {
+                has_refs: !refs.is_empty(),
+                refs,
+            },
+        )
+        .map_err(|error| format!("Failed to emit Unity embed asset drag state: {error}"))
+}
+
+fn asset_drag_cache() -> &'static Mutex<UnityEmbedAssetDragCache> {
+    static CACHE: OnceLock<Mutex<UnityEmbedAssetDragCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(UnityEmbedAssetDragCache::default()))
+}
+
+fn cache_unity_embed_asset_drag_refs(refs: Vec<UnityEmbedAssetRef>) {
+    let Ok(mut cache) = asset_drag_cache().lock() else {
+        return;
+    };
+
+    if refs.is_empty() {
+        cache.refs.clear();
+        cache.updated_at = None;
+        return;
+    }
+
+    cache.refs = refs;
+    cache.updated_at = Some(Instant::now());
+}
+
+fn current_unity_embed_asset_drag_refs() -> Vec<UnityEmbedAssetRef> {
+    let Ok(cache) = asset_drag_cache().lock() else {
+        return Vec::new();
+    };
+
+    let Some(updated_at) = cache.updated_at else {
+        return Vec::new();
+    };
+    if updated_at.elapsed() > ASSET_DRAG_CACHE_TTL {
+        return Vec::new();
+    }
+
+    cache.refs.clone()
+}
+
+#[tauri::command]
+pub async fn unity_embed_commit_asset_drop(app_handle: AppHandle) -> Result<(), AppError> {
+    let refs = current_unity_embed_asset_drag_refs();
+    if refs.is_empty() {
+        return Ok(());
+    }
+
+    emit_unity_embed_asset_drop(&app_handle, refs).map_err(AppError::from)?;
+    cache_unity_embed_asset_drag_refs(Vec::new());
+    emit_unity_embed_asset_drag_state(&app_handle, Vec::new()).map_err(AppError::from)
+}
+
+fn unity_file_drop_asset_refs(workspace_path: &str, paths: &[PathBuf]) -> Vec<UnityEmbedAssetRef> {
+    let mut seen = HashSet::new();
+    let mut refs = Vec::new();
+
+    for path in paths {
+        let Some(asset_ref) = unity_file_drop_asset_ref(workspace_path, path) else {
+            continue;
+        };
+        let key = format!("{}\n{}", asset_ref.kind, asset_ref.path);
+        if seen.insert(key) {
+            refs.push(asset_ref);
+        }
+    }
+
+    refs
+}
+
+fn unity_file_drop_asset_ref(workspace_path: &str, path: &Path) -> Option<UnityEmbedAssetRef> {
+    let relative_path = unity_relative_drop_path(workspace_path, path)?;
+    let name = unity_drop_name(path, &relative_path);
+    let type_label = unity_drop_type_label(path);
+    Some(UnityEmbedAssetRef {
+        path: relative_path,
+        kind: "asset".to_string(),
+        name,
+        type_label,
+        source: Some("unity".to_string()),
+    })
+}
+
+fn unity_relative_drop_path(workspace_path: &str, path: &Path) -> Option<String> {
+    let raw_path = normalize_unity_path_text(&path.to_string_lossy());
+    if is_supported_unity_ref_path(&raw_path) {
+        return Some(raw_path);
+    }
+    if workspace_path.trim().is_empty() {
+        return None;
+    }
+
+    let workspace_path = normalize_existing_path_text(Path::new(workspace_path));
+    if workspace_path.is_empty() {
+        return None;
+    }
+
+    let dropped_path = normalize_existing_path_text(path);
+    let workspace_len = workspace_path.len();
+    let is_direct_child = dropped_path.len() > workspace_len
+        && dropped_path[..workspace_len].eq_ignore_ascii_case(&workspace_path)
+        && dropped_path.as_bytes().get(workspace_len) == Some(&b'/');
+    if !is_direct_child {
+        return None;
+    }
+
+    let relative_path = normalize_unity_path_text(&dropped_path[workspace_len + 1..]);
+    if is_supported_unity_ref_path(&relative_path) {
+        Some(relative_path)
+    } else {
+        None
+    }
+}
+
+fn normalize_existing_path_text(path: &Path) -> String {
+    let normalized = dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    normalize_unity_path_text(&normalized.to_string_lossy())
+}
+
+fn normalize_unity_path_text(path: &str) -> String {
+    strip_extended_path_prefix(path)
+        .trim()
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn is_supported_unity_ref_path(path: &str) -> bool {
+    let normalized = normalize_unity_path_text(path);
+    let lower = normalized.to_ascii_lowercase();
+    matches!(lower.as_str(), "assets" | "packages" | "projectsettings")
+        || lower.starts_with("assets/")
+        || lower.starts_with("packages/")
+        || lower.starts_with("projectsettings/")
+}
+
+fn unity_drop_name(path: &Path, relative_path: &str) -> Option<String> {
+    path.file_stem()
+        .or_else(|| path.file_name())
+        .map(|name| name.to_string_lossy().to_string())
+        .filter(|name| !name.is_empty())
+        .or_else(|| {
+            relative_path
+                .rsplit('/')
+                .next()
+                .map(|name| name.to_string())
+                .filter(|name| !name.is_empty())
+        })
+}
+
+fn unity_drop_type_label(path: &Path) -> Option<String> {
+    if path.is_dir() {
+        return Some("Folder".to_string());
+    }
+
+    path.extension()
+        .map(|extension| extension.to_string_lossy().to_string())
+        .filter(|extension| !extension.is_empty())
+}
+
 async fn current_control_pipe_name(app_handle: &AppHandle) -> Option<String> {
     let current_project_path = current_workspace_path(app_handle).await;
     if current_project_path.trim().is_empty() {
@@ -545,7 +797,9 @@ fn apply_control_message_on_main(
     app_handle: &AppHandle,
     msg: UnityEmbedControlMessage,
 ) -> Result<(), String> {
-    record_control_message(&msg);
+    if msg.kind != "assetDrop" && msg.kind != "assetDrag" {
+        record_control_message(&msg);
+    }
     match msg.kind.as_str() {
         "open" | "update" => {
             cancel_transient_close_destroy();
@@ -580,6 +834,20 @@ fn apply_control_message_on_main(
             }
             record_window_destroyed();
             Ok(())
+        }
+        "assetDrop" => {
+            let refs = msg.asset_refs.unwrap_or_default();
+            if refs.is_empty() {
+                return Ok(());
+            }
+            emit_unity_embed_asset_drop(app_handle, refs)?;
+            cache_unity_embed_asset_drag_refs(Vec::new());
+            emit_unity_embed_asset_drag_state(app_handle, Vec::new())
+        }
+        "assetDrag" => {
+            let refs = msg.asset_refs.unwrap_or_default();
+            cache_unity_embed_asset_drag_refs(refs.clone());
+            emit_unity_embed_asset_drag_state(app_handle, refs)
         }
         other => Err(format!("Unknown Unity embed control message: {other}")),
     }
@@ -1797,7 +2065,12 @@ mod windows_impl {
 
 #[cfg(test)]
 mod tests {
-    use super::{control_pipe_name_for_project_path, normalize_pipe_project_path};
+    use std::path::{Path, PathBuf};
+
+    use super::{
+        control_pipe_name_for_project_path, normalize_pipe_project_path,
+        unity_file_drop_asset_refs, unity_relative_drop_path,
+    };
 
     #[test]
     fn pipe_project_path_normalizes_windows_slashes_and_extended_prefix() {
@@ -1812,6 +2085,29 @@ mod tests {
         assert_eq!(
             control_pipe_name_for_project_path(r"F:\Game\Project"),
             r"\\.\pipe\locus_tauri_unity_embed_F__Game_Project"
+        );
+    }
+
+    #[test]
+    fn unity_drop_path_maps_project_file_to_asset_ref() {
+        let refs = unity_file_drop_asset_refs(
+            "F:/Game/Project",
+            &[PathBuf::from("f:/Game/Project/Assets/Prefabs/Enemy.prefab")],
+        );
+
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].path, "Assets/Prefabs/Enemy.prefab");
+        assert_eq!(refs[0].kind, "asset");
+        assert_eq!(refs[0].name.as_deref(), Some("Enemy"));
+        assert_eq!(refs[0].type_label.as_deref(), Some("prefab"));
+        assert_eq!(refs[0].source.as_deref(), Some("unity"));
+    }
+
+    #[test]
+    fn unity_drop_path_rejects_files_outside_unity_ref_roots() {
+        assert_eq!(
+            unity_relative_drop_path("F:/Game/Project", Path::new("F:/Game/Project/README.md")),
+            None
         );
     }
 }

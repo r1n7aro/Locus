@@ -1,6 +1,6 @@
 import { hydrateChatMessageIntent } from "./chatInputIntents";
 import { sortedAssistantRenderParts } from "./assistantRenderParts";
-import type { StreamEvent, ChatMessage, TokenUsage, TodoItem, ToolCallDisplay, ToolCallInfo, PendingQuestion, PendingToolConfirm, ImageAttachment, ToolCallProgress, AssistantRenderPart } from "../types";
+import type { StreamEvent, ChatMessage, TokenUsage, TodoItem, ToolCallDisplay, ToolCallInfo, PendingQuestion, PendingToolConfirm, ImageAttachment, AssetRefAttachment, ToolCallProgress, AssistantRenderPart } from "../types";
 
 export interface StreamState {
   messages: ChatMessage[];
@@ -99,9 +99,16 @@ function imageFingerprint(images: ImageAttachment[] | undefined): string {
     .join("\u{1}");
 }
 
+function assetRefFingerprint(assetRefs: AssetRefAttachment[] | undefined): string {
+  return (assetRefs ?? [])
+    .map((assetRef) => `${assetRef.kind}\u{0}${assetRef.path}`)
+    .join("\u{1}");
+}
+
 function isMatchingPendingUserMessage(candidate: ChatMessage, message: ChatMessage): boolean {
   if (candidate.role !== "user" || !pendingUserMessageId(candidate.id)) return false;
   if (imageFingerprint(candidate.images) !== imageFingerprint(message.images)) return false;
+  if (assetRefFingerprint(candidate.assetRefs) !== assetRefFingerprint(message.assetRefs)) return false;
   if (candidate.content === message.content) return true;
   if (candidate.thinkingSignature && candidate.thinkingSignature === message.thinkingSignature) return true;
   return Math.abs(candidate.createdAt - message.createdAt) <= 60;
@@ -632,12 +639,13 @@ export function reduceStreamEvent(state: StreamState, event: StreamEvent): Strea
 
     case "compactDone":
       mutations.push({ type: "replaceMessages", messages: event.messages });
-      if (state.tokenUsage.contextTokens > 0) {
+      if ((event.contextTokens ?? 0) > 0 && (event.contextLimit ?? 0) > 0) {
         mutations.push({
           type: "updateUsage",
           usage: {
             ...state.tokenUsage,
-            contextTokens: 0,
+            contextTokens: event.contextTokens ?? state.tokenUsage.contextTokens,
+            contextLimit: event.contextLimit ?? state.tokenUsage.contextLimit,
           },
         });
       }

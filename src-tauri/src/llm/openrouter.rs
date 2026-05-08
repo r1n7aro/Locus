@@ -795,6 +795,7 @@ mod tests {
             tool_calls,
             tool_call_id: tool_call_id.map(str::to_string),
             images: None,
+            asset_refs: None,
             thinking_content: None,
             thinking_duration: None,
             thinking_signature: None,

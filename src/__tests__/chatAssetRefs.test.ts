@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseChatAssetRefs } from "../composables/chatAssetRefs";
+import { extractChatAssetRefs, parseChatAssetRefs } from "../composables/chatAssetRefs";
 
 describe("parseChatAssetRefs", () => {
   it("keeps Unity asset paths with spaces intact", () => {
@@ -112,5 +112,47 @@ describe("parseChatAssetRefs", () => {
       { type: "text", value: "Folder: " },
       { type: "asset", value: "Assets/AmplifyShaderEditor" },
     ]);
+  });
+
+  it("parses project knowledge refs", () => {
+    const segments = parseChatAssetRefs(
+      "Knowledge: @design/combat/core-loop.md and `reference/unity/api.md`",
+    );
+
+    expect(segments).toEqual([
+      { type: "text", value: "Knowledge: " },
+      { type: "knowledge", value: "design/combat/core-loop.md" },
+      { type: "text", value: " and " },
+      { type: "knowledge", value: "reference/unity/api.md" },
+    ]);
+  });
+});
+
+describe("extractChatAssetRefs", () => {
+  it("removes inline Unity refs from text and returns extracted refs", () => {
+    expect(extractChatAssetRefs("检查 `Assets/Prefabs/Player.prefab` 和 @Packages/com.game/tool.asmdef")).toEqual({
+      text: "检查  和 ",
+      refs: [
+        "Assets/Prefabs/Player.prefab",
+        "Packages/com.game/tool.asmdef",
+      ],
+    });
+  });
+
+  it("extracts folder refs selected from mention browse", () => {
+    expect(extractChatAssetRefs("参考 `Assets/AmplifyShaderEditor/` 处理")).toEqual({
+      text: "参考  处理",
+      refs: ["Assets/AmplifyShaderEditor"],
+    });
+  });
+
+  it("extracts project knowledge refs", () => {
+    expect(extractChatAssetRefs("参考 {@memory/project/background.md} 和 @design/core-loop.md")).toEqual({
+      text: "参考  和 ",
+      refs: [
+        "memory/project/background.md",
+        "design/core-loop.md",
+      ],
+    });
   });
 });

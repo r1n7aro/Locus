@@ -783,7 +783,7 @@ describe("reduceStreamEvent", () => {
   });
 
   describe("compactDone", () => {
-    it("clears stale context usage after compaction completes", () => {
+    it("updates context usage with the compacted prompt estimate", () => {
       const state = makeState({
         tokenUsage: {
           totalInputTokens: 100,
@@ -802,11 +802,19 @@ describe("reduceStreamEvent", () => {
         sessionId: "s1",
         messagesBefore: 40,
         messagesAfter: 8,
+        contextTokens: 2400,
+        contextLimit: 100000,
         messages: [
           {
-            id: "handoff-1",
+            id: "user-1",
+            role: "user",
+            content: "older visible request",
+            createdAt: 90,
+          },
+          {
+            id: "assistant-1",
             role: "assistant",
-            content: "## Context Handoff",
+            content: "older visible answer",
             createdAt: 100,
           },
         ],
@@ -816,16 +824,43 @@ describe("reduceStreamEvent", () => {
       const replaceMut = mutations.find((m) => m.type === "replaceMessages");
       expect(replaceMut).toBeDefined();
       if (replaceMut?.type === "replaceMessages") {
-        expect(replaceMut.messages).toHaveLength(1);
-        expect(replaceMut.messages[0]?.content).toContain("Context Handoff");
+        expect(replaceMut.messages).toHaveLength(2);
+        expect(replaceMut.messages.map((message) => message.id)).toEqual(["user-1", "assistant-1"]);
       }
       const usageMut = mutations.find((m) => m.type === "updateUsage");
       expect(usageMut).toBeDefined();
       if (usageMut?.type === "updateUsage") {
-        expect(usageMut.usage.contextTokens).toBe(0);
+        expect(usageMut.usage.contextTokens).toBe(2400);
         expect(usageMut.usage.contextLimit).toBe(100000);
         expect(usageMut.usage.totalInputTokens).toBe(100);
       }
+      expect(mutations).toContainEqual({ type: "setCompacting", value: false });
+    });
+
+    it("keeps previous context usage for compactDone events recorded before context fields existed", () => {
+      const state = makeState({
+        tokenUsage: {
+          totalInputTokens: 100,
+          totalOutputTokens: 50,
+          totalCacheReadTokens: 10,
+          totalCacheWriteTokens: 5,
+          totalCostUsd: 0.01,
+          pricedRounds: 1,
+          contextTokens: 8000,
+          contextLimit: 100000,
+        },
+      });
+      const event: StreamEvent = {
+        runId: "test-run",
+        type: "compactDone",
+        sessionId: "s1",
+        messagesBefore: 40,
+        messagesAfter: 8,
+        messages: [],
+      };
+
+      const mutations = reduceStreamEvent(state, event);
+      expect(mutations.some((m) => m.type === "updateUsage")).toBe(false);
       expect(mutations).toContainEqual({ type: "setCompacting", value: false });
     });
   });

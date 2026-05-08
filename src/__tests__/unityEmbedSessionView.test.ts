@@ -166,6 +166,67 @@ describe("Unity embedded session view", () => {
     expect(unityWindow).toContain("IntersectionArea");
   });
 
+  it("bridges Unity asset drops into the embedded composer attachment bar", () => {
+    const unityWindow = read("locus_unity/Editor/LocusEditorWindow.cs");
+    const app = read("src-tauri/src/lib.rs");
+    const command = read("src-tauri/src/commands/unity_embed.rs");
+    const service = read("src/services/unity.ts");
+    const view = read("src/components/UnityEmbeddedSessionView.vue");
+    const input = read("src/components/chat/RichChatInput.vue");
+    const transcript = read("src/components/chat/ChatTranscript.vue");
+
+    expect(app).toContain(".on_webview_event(|webview, event|");
+    expect(app).toContain("commands::handle_unity_embed_webview_event(webview, event);");
+    expect(app).toContain("commands::unity_embed_commit_asset_drop");
+    expect(command).toContain("pub(crate) fn handle_unity_embed_webview_event");
+    expect(command).toContain("tauri::DragDropEvent::Drop { paths, .. }");
+    expect(command).toContain("unity_file_drop_asset_refs(&workspace_path, &paths)");
+    expect(command).toContain("fn unity_relative_drop_path");
+    expect(command).toContain("fn cache_unity_embed_asset_drag_refs");
+    expect(command).toContain("pub async fn unity_embed_commit_asset_drop");
+    expect(command).toContain('kind: "asset".to_string()');
+    expect(command).toContain('source: Some("unity".to_string())');
+    expect(command).toContain('"unity-embed-asset-drop"');
+    expect(command).toContain("UnityEmbedAssetDragStatePayload");
+    expect(command).toContain('"unity-embed-asset-drag-state"');
+    expect(command).toContain(".disable_drag_drop_handler()");
+    expect(unityWindow).toContain("public DroppedAssetRef[] assetRefs;");
+    expect(unityWindow).toContain("HandleUnityObjectDrag();");
+    expect(unityWindow).toContain("SendAssetDragState(false);");
+    expect(unityWindow).toContain("SendAssetDragStateMessage(assetRefs);");
+    expect(unityWindow).toContain('type = "assetDrag"');
+    expect(unityWindow).toContain("BuildAssetRefsSignature");
+    expect(unityWindow).toContain("DragAndDrop.objectReferences");
+    expect(unityWindow).toContain("DragAndDrop.paths");
+    expect(unityWindow).toContain('type = "assetDrop"');
+    expect(unityWindow).toContain('kind = "sceneObject"');
+    expect(unityWindow).toContain('source = "unity"');
+    expect(unityWindow).toContain('message.type == "open" || message.type == "update"');
+    expect(command).toContain("asset_refs: Option<Vec<UnityEmbedAssetRef>>");
+    expect(command).toContain('"assetDrop" =>');
+    expect(command).toContain('"assetDrag" =>');
+    expect(service).toContain("commitUnityEmbedAssetDrop");
+    expect(service).toContain("unity_embed_commit_asset_drop");
+    expect(service).toContain("subscribeUnityEmbedAssetDrop");
+    expect(service).toContain("subscribeUnityEmbedAssetDragState");
+    expect(service).not.toContain("[Locus][UnityEmbedDrag]");
+    expect(view).toContain("@dragover.capture=\"handleUnityAssetDrag\"");
+    expect(view).toContain("@drop.capture=\"handleUnityAssetDrop\"");
+    expect(view).toContain("commitUnityEmbedAssetDrop()");
+    expect(view).toContain("subscribeUnityEmbedAssetDragState(handleUnityAssetDragState)");
+    expect(view).toContain("hasUnityAssetDragState()");
+    expect(view).toContain("if (!isUnityExternalFileDrag(event) && !hasUnityAssetDragState()) return false;");
+    expect(view).toContain("UNITY_ASSET_DRAG_STATE_TTL_MS");
+    expect(view).not.toContain("handleDragDebug");
+    expect(input).toContain("assetRefAttachments = ref<AssetRefAttachment[]>([])");
+    expect(input).toContain("subscribeUnityEmbedAssetDrop((payload)");
+    expect(input).toContain('class="composer-attachment-list"');
+    expect(input).toContain("flex-wrap: nowrap;");
+    expect(input).toContain("<locus-references>");
+    expect(transcript).toContain("messageAssetRefs(item.message)");
+    expect(transcript).toContain('class="chat-transcript-user-asset-refs"');
+  });
+
   it("routes embedded Ctrl-click asset refs to a locked Unity Inspector", () => {
     const chat = read("src/components/ChatView.vue");
     const service = read("src/services/unity.ts");

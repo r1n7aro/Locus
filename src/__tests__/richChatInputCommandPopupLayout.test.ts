@@ -48,4 +48,35 @@ describe("RichChatInput command popup layout", () => {
     expect(richInput).toContain('ref="commandPopupRef"');
     expect(richInput).toContain(':ref="(el) => setCommandItemRef(index, el)"');
   });
+
+  it("executes highlighted action commands on Enter and keeps Tab as autocomplete", () => {
+    const richInput = read("src/components/chat/RichChatInput.vue");
+
+    expect(richInput).toContain("function executeActionCommand(command: CommandDef): boolean {");
+    expect(richInput).toContain("return command ? executeActionCommand(command) : false;");
+
+    const popupStart = richInput.indexOf("if (showCommandPopup.value) {");
+    const enterStart = richInput.indexOf(
+      "if (shouldSubmitOnEnter(event, chatInputSettings.submitMode)) {",
+      popupStart,
+    );
+    const actionStart = richInput.indexOf("if (command && executeActionCommand(command)) {", enterStart);
+    const autocompleteStart = richInput.indexOf(
+      "executeCommandFromPopup(commands[commandHighlightIndex.value]);",
+      enterStart,
+    );
+    const tabStart = richInput.indexOf('if (event.key === "Tab" && commands.length > 0) {', enterStart);
+    const tabAutocompleteStart = richInput.indexOf(
+      "executeCommandFromPopup(commands[commandHighlightIndex.value]);",
+      tabStart,
+    );
+
+    expect(popupStart).toBeGreaterThanOrEqual(0);
+    expect(enterStart).toBeGreaterThan(popupStart);
+    expect(actionStart).toBeGreaterThan(enterStart);
+    expect(actionStart).toBeLessThan(autocompleteStart);
+    expect(richInput.slice(actionStart, autocompleteStart)).toContain("event.preventDefault();");
+    expect(tabStart).toBeGreaterThan(enterStart);
+    expect(tabAutocompleteStart).toBeGreaterThan(tabStart);
+  });
 });

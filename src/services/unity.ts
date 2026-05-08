@@ -1,6 +1,6 @@
 import { ipcInvoke } from "./ipc";
 import { getLocusRuntime } from "./locusRuntime";
-import type { PluginStatus } from "../types";
+import type { AssetRefAttachment, PluginStatus } from "../types";
 
 export interface AssetSearchResult {
   name: string;
@@ -71,6 +71,37 @@ export function activateUnityEmbedForInput(): Promise<void> {
   const runtime = getLocusRuntime();
   if (runtime.kind !== "tauri") return Promise.resolve();
   return runtime.invoke("unity_embed_activate_for_input");
+}
+
+export function commitUnityEmbedAssetDrop(): Promise<void> {
+  const runtime = getLocusRuntime();
+  if (runtime.kind !== "tauri") return Promise.resolve();
+  return runtime.invoke("unity_embed_commit_asset_drop");
+}
+
+export interface UnityEmbedAssetDropPayload {
+  refs: AssetRefAttachment[];
+}
+
+export interface UnityEmbedAssetDragStatePayload {
+  hasRefs: boolean;
+  refs: AssetRefAttachment[];
+}
+
+export function subscribeUnityEmbedAssetDrop(
+  handler: (payload: UnityEmbedAssetDropPayload) => void,
+): Promise<() => void> {
+  const runtime = getLocusRuntime();
+  if (runtime.kind !== "tauri") return Promise.resolve(() => {});
+  return runtime.subscribe<UnityEmbedAssetDropPayload>("unity-embed-asset-drop", handler);
+}
+
+export function subscribeUnityEmbedAssetDragState(
+  handler: (payload: UnityEmbedAssetDragStatePayload) => void,
+): Promise<() => void> {
+  const runtime = getLocusRuntime();
+  if (runtime.kind !== "tauri") return Promise.resolve(() => {});
+  return runtime.subscribe<UnityEmbedAssetDragStatePayload>("unity-embed-asset-drag-state", handler);
 }
 
 export interface UnityEmbedFocusDebugSnapshot {

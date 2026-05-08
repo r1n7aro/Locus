@@ -24,6 +24,7 @@ namespace Locus
         private const double SyncIntervalSeconds = 0.12d;
         private const double ResizeSyncIntervalSeconds = 1d / 60d;
         private const double ResizeBoostDurationSeconds = 0.35d;
+        private const double AssetDragStateRefreshSeconds = 0.35d;
         private const double HeartbeatIntervalSeconds = 2d;
         private const double DesktopProbeIntervalSeconds = 2d;
         private const int PipeConnectTimeoutMs = 500;
@@ -52,6 +53,8 @@ namespace Locus
         private int _screenWidth;
         private int _screenHeight;
         private double _nextHeartbeatAt;
+        private double _nextAssetDragStateAt;
+        private string _lastAssetDragSignature = "";
         private bool _hasLastSent;
         private int _lastSentX;
         private int _lastSentY;
@@ -63,6 +66,7 @@ namespace Locus
         private LocusDesktopInstall _desktopInstall = LocusDesktopInstall.NotFound;
         private bool _desktopProcessRunning;
         private volatile bool _desktopLaunchInFlight;
+        private volatile bool _assetDragStateSendInFlight;
         private string _connectedPipeName = "";
 
         [Serializable]
@@ -76,6 +80,17 @@ namespace Locus
             public bool visible;
             public long parentHwnd;
             public string reason;
+            public DroppedAssetRef[] assetRefs;
+        }
+
+        [Serializable]
+        private sealed class DroppedAssetRef
+        {
+            public string path;
+            public string kind;
+            public string name;
+            public string typeLabel;
+            public string source;
         }
 
         private sealed class LocusDesktopInstall
@@ -159,6 +174,7 @@ namespace Locus
         private void OnGUI()
         {
             UpdateScreenRectFromGUI();
+            HandleUnityObjectDrag();
             RefreshDesktopState(false);
             DrawPlaceholder();
 
@@ -176,6 +192,7 @@ namespace Locus
             _nextSyncAt = now + (resizeBoostActive ? ResizeSyncIntervalSeconds : SyncIntervalSeconds);
             RefreshDesktopState(false);
             SendOpenOrUpdate(false);
+            SendAssetDragState(false);
 
             if (_failedSends > 0 || ShouldShowStartButton() || _desktopLaunchInFlight)
                 Repaint();
@@ -198,6 +215,73 @@ namespace Locus
         {
             SendControlMessage(BuildMessage("close", false, reason), true);
             _sentOpen = false;
+        }
+
+        private void SendAssetDrop(DroppedAssetRef[] assetRefs)
+        {
+            if (assetRefs == null || assetRefs.Length == 0)
+                return;
+
+            SendControlMessage(new EmbedControlMessage
+            {
+                type = "assetDrop",
+                assetRefs = assetRefs
+            }, true);
+        }
+
+        private void SendAssetDragState(bool force)
+        {
+            DroppedAssetRef[] assetRefs = BuildDroppedAssetRefs();
+            if (assetRefs.Length == 0)
+            {
+                if (_lastAssetDragSignature.Length > 0)
+                {
+                    _lastAssetDragSignature = "";
+                    _nextAssetDragStateAt = 0d;
+                    SendAssetDragStateMessage(assetRefs);
+                }
+                _lastAssetDragSignature = "";
+                return;
+            }
+
+            double now = EditorApplication.timeSinceStartup;
+            string signature = BuildAssetRefsSignature(assetRefs);
+            if (!force && string.Equals(signature, _lastAssetDragSignature, StringComparison.Ordinal) && now < _nextAssetDragStateAt)
+                return;
+
+            _lastAssetDragSignature = signature;
+            _nextAssetDragStateAt = now + AssetDragStateRefreshSeconds;
+            SendAssetDragStateMessage(assetRefs);
+        }
+
+        private void SendAssetDragStateMessage(DroppedAssetRef[] assetRefs)
+        {
+            if (assetRefs == null || _assetDragStateSendInFlight)
+                return;
+
+            string json = JsonUtility.ToJson(new EmbedControlMessage
+            {
+                type = "assetDrag",
+                assetRefs = assetRefs
+            });
+            string pipeName = GetControlPipeName();
+            _assetDragStateSendInFlight = true;
+
+            Task.Run(() =>
+            {
+                try
+                {
+                    WritePipeLine(pipeName, json);
+                }
+                catch
+                {
+                    DisconnectPipe();
+                }
+                finally
+                {
+                    _assetDragStateSendInFlight = false;
+                }
+            });
         }
 
         private string GetCloseReason()
@@ -225,6 +309,189 @@ namespace Locus
                 parentHwnd = GetUnityHostHwnd(_screenX, _screenY, _screenWidth, _screenHeight),
                 reason = reason ?? ""
             };
+        }
+
+        private void HandleUnityObjectDrag()
+        {
+            Event evt = Event.current;
+            if (evt == null)
+                return;
+            if (evt.type != EventType.DragUpdated && evt.type != EventType.DragPerform)
+                return;
+
+            DroppedAssetRef[] assetRefs = BuildDroppedAssetRefs();
+            if (assetRefs.Length == 0)
+                return;
+
+            DragAndDrop.visualMode = DragAndDropVisualMode.Link;
+            if (evt.type == EventType.DragPerform)
+            {
+                DragAndDrop.AcceptDrag();
+                SendAssetDrop(assetRefs);
+            }
+            evt.Use();
+        }
+
+        private DroppedAssetRef[] BuildDroppedAssetRefs()
+        {
+            List<DroppedAssetRef> refs = new List<DroppedAssetRef>();
+            HashSet<string> seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            UnityEngine.Object[] objects = DragAndDrop.objectReferences;
+            if (objects != null)
+            {
+                foreach (UnityEngine.Object obj in objects)
+                {
+                    DroppedAssetRef assetRef = BuildDroppedObjectRef(obj);
+                    AddDroppedAssetRef(refs, seen, assetRef);
+                }
+            }
+
+            string[] paths = DragAndDrop.paths;
+            if (paths != null)
+            {
+                foreach (string path in paths)
+                {
+                    string normalizedPath = NormalizeProjectRelativePath(path);
+                    if (!IsSupportedUnityRefPath(normalizedPath))
+                        continue;
+                    AddDroppedAssetRef(refs, seen, new DroppedAssetRef
+                    {
+                        path = normalizedPath,
+                        kind = "asset",
+                        name = Path.GetFileNameWithoutExtension(normalizedPath),
+                        typeLabel = "",
+                        source = "unity"
+                    });
+                }
+            }
+
+            return refs.ToArray();
+        }
+
+        private static string BuildAssetRefsSignature(DroppedAssetRef[] assetRefs)
+        {
+            if (assetRefs == null || assetRefs.Length == 0)
+                return "";
+
+            StringBuilder sb = new StringBuilder(assetRefs.Length * 64);
+            foreach (DroppedAssetRef assetRef in assetRefs)
+            {
+                if (assetRef == null)
+                    continue;
+                sb.Append(assetRef.kind).Append('\n').Append(assetRef.path).Append('\n');
+            }
+            return sb.ToString();
+        }
+
+        private DroppedAssetRef BuildDroppedObjectRef(UnityEngine.Object obj)
+        {
+            if (obj == null)
+                return null;
+
+            string assetPath = NormalizeUnityPath(AssetDatabase.GetAssetPath(obj));
+            if (IsSupportedUnityRefPath(assetPath))
+            {
+                return new DroppedAssetRef
+                {
+                    path = assetPath,
+                    kind = "asset",
+                    name = obj.name ?? Path.GetFileNameWithoutExtension(assetPath),
+                    typeLabel = obj.GetType().Name,
+                    source = "unity"
+                };
+            }
+
+            GameObject gameObject = obj as GameObject;
+            if (gameObject == null)
+            {
+                Component component = obj as Component;
+                if (component != null)
+                    gameObject = component.gameObject;
+            }
+
+            if (gameObject == null || !gameObject.scene.IsValid())
+                return null;
+
+            string scenePath = NormalizeUnityPath(gameObject.scene.path);
+            if (string.IsNullOrEmpty(scenePath))
+                return null;
+
+            string hierarchyPath = BuildHierarchyPath(gameObject.transform);
+            if (string.IsNullOrEmpty(hierarchyPath))
+                return null;
+
+            return new DroppedAssetRef
+            {
+                path = scenePath + "/" + hierarchyPath,
+                kind = "sceneObject",
+                name = gameObject.name,
+                typeLabel = "GameObject",
+                source = "unity"
+            };
+        }
+
+        private static void AddDroppedAssetRef(
+            List<DroppedAssetRef> refs,
+            HashSet<string> seen,
+            DroppedAssetRef assetRef)
+        {
+            if (assetRef == null || string.IsNullOrEmpty(assetRef.path))
+                return;
+
+            string key = assetRef.kind + "\n" + assetRef.path;
+            if (seen.Contains(key))
+                return;
+
+            seen.Add(key);
+            refs.Add(assetRef);
+        }
+
+        private static string BuildHierarchyPath(Transform transform)
+        {
+            if (transform == null)
+                return "";
+
+            List<string> parts = new List<string>();
+            Transform current = transform;
+            while (current != null)
+            {
+                parts.Add(current.name);
+                current = current.parent;
+            }
+            parts.Reverse();
+            return string.Join("/", parts.ToArray());
+        }
+
+        private static string NormalizeProjectRelativePath(string path)
+        {
+            string normalized = NormalizeUnityPath(path);
+            if (string.IsNullOrEmpty(normalized))
+                return "";
+
+            DirectoryInfo projectRootInfo = Directory.GetParent(Application.dataPath);
+            if (projectRootInfo == null)
+                return normalized;
+
+            string projectRoot = projectRootInfo.FullName.Replace('\\', '/');
+            if (normalized.StartsWith(projectRoot + "/", StringComparison.OrdinalIgnoreCase))
+                normalized = normalized.Substring(projectRoot.Length + 1);
+
+            return NormalizeUnityPath(normalized);
+        }
+
+        private static string NormalizeUnityPath(string path)
+        {
+            return string.IsNullOrEmpty(path)
+                ? ""
+                : path.Trim().Replace('\\', '/').TrimEnd('/');
+        }
+
+        private static bool IsSupportedUnityRefPath(string path)
+        {
+            return path.StartsWith("Assets/", StringComparison.OrdinalIgnoreCase)
+                || path.StartsWith("Packages/", StringComparison.OrdinalIgnoreCase)
+                || path.StartsWith("ProjectSettings/", StringComparison.OrdinalIgnoreCase);
         }
 
         private bool ShouldSendMessage(EmbedControlMessage message)
@@ -314,6 +581,8 @@ namespace Locus
             string json = JsonUtility.ToJson(message);
             string pipeName = GetControlPipeName();
             _sendInFlight = true;
+            bool isGeometryMessage = message.type == "open" || message.type == "update";
+            bool isAssetDropMessage = message.type == "assetDrop";
 
             Task.Run(() =>
             {
@@ -321,18 +590,23 @@ namespace Locus
                 {
                     WritePipeLine(pipeName, json);
 
-                    if (message.type != "close")
+                    if (isGeometryMessage)
                     {
                         _sentOpen = true;
                         RecordLastSent(message);
                         _failedSends = 0;
                         _statusMessage = "Overlay signal sent.";
                     }
+                    else if (isAssetDropMessage)
+                    {
+                        _failedSends = 0;
+                        _statusMessage = "Asset reference sent.";
+                    }
                 }
                 catch (Exception ex)
                 {
                     DisconnectPipe();
-                    if (message.type != "close")
+                    if (isGeometryMessage)
                     {
                         int failures = _failedSends + 1;
                         _failedSends = failures;

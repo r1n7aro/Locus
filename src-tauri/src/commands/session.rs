@@ -17,7 +17,7 @@ use crate::config::AppConfig;
 use crate::error::AppError;
 use crate::knowledge_store::{self, KnowledgeDocument, KnowledgeInjectMode, KnowledgeType};
 use crate::session::models::{
-    ChatMessage, ImageData, KnowledgeProposalItem, KnowledgeProposalItemKind,
+    AssetRefData, ChatMessage, ImageData, KnowledgeProposalItem, KnowledgeProposalItemKind,
     KnowledgeProposalStatus, SessionDetail, SessionEventRecord, SessionRunSummary,
     SessionRuntimeStatus, SessionSummary, TodoItem, TodoSnapshot, UserIntentPayload,
 };
@@ -519,6 +519,7 @@ async fn resolve_model_backend(
                 .reasoning_param_format
                 .clone()
                 .unwrap_or(crate::commands::CustomReasoningParamFormat::OpenaiChatReasoningEffort),
+            replay_reasoning_content: endpoint.replay_reasoning_content.unwrap_or(false),
         });
     }
 
@@ -669,6 +670,7 @@ pub async fn chat(
     model: Option<String>,
     effort: Option<String>,
     images: Option<Vec<ImageData>>,
+    asset_refs: Option<Vec<AssetRefData>>,
     session_type: Option<String>,
     mode: Option<String>,
     user_intent: Option<UserIntentPayload>,
@@ -788,6 +790,7 @@ pub async fn chat(
                 .reasoning_param_format
                 .clone()
                 .unwrap_or(crate::commands::CustomReasoningParamFormat::OpenaiChatReasoningEffort),
+            replay_reasoning_content: ep.replay_reasoning_content.unwrap_or(false),
         }
     } else if is_openrouter {
         let api_key = api_key_state.read().await.clone();
@@ -901,6 +904,7 @@ pub async fn chat(
     let tasks = active_tasks.inner().clone();
     let sid_for_cleanup = sid.clone();
     let images_for_task = images.unwrap_or_default();
+    let asset_refs_for_task = asset_refs.unwrap_or_default();
     let user_intent_for_task = user_intent;
     let run_id_for_task = run_id.clone();
     let store_for_task = store.clone();
@@ -923,6 +927,11 @@ pub async fn chat(
                 None
             } else {
                 Some(&images_for_task)
+            },
+            if asset_refs_for_task.is_empty() {
+                None
+            } else {
+                Some(&asset_refs_for_task)
             },
             &effective_mode,
             user_intent_for_task,
@@ -1850,6 +1859,14 @@ fn export_optional_u32(value: Option<u32>) -> serde_json::Value {
     }
 }
 
+fn export_context_usage_value(value: u32, limit: u32) -> serde_json::Value {
+    if limit > 0 {
+        json!(value)
+    } else {
+        json!(EMPTY_EXPORT_FIELD)
+    }
+}
+
 fn export_optional_tool_outcome(
     value: Option<crate::commands::ToolCallOutcome>,
 ) -> serde_json::Value {
@@ -1902,6 +1919,13 @@ fn export_images(images: Option<&[ImageData]>) -> serde_json::Value {
                 "dataLength": image.data.len(),
             }))
             .collect::<Vec<_>>()),
+        _ => json!(EMPTY_EXPORT_FIELD),
+    }
+}
+
+fn export_asset_refs(asset_refs: Option<&[AssetRefData]>) -> serde_json::Value {
+    match asset_refs {
+        Some(asset_refs) if !asset_refs.is_empty() => json!(asset_refs),
         _ => json!(EMPTY_EXPORT_FIELD),
     }
 }
@@ -2019,6 +2043,8 @@ migration is written as `empty`.\n\n",
             "totalCacheWriteTokens": usage.total_cache_write_tokens,
             "totalCostUsd": usage.total_cost_usd,
             "pricedRounds": usage.priced_rounds,
+            "contextTokens": export_context_usage_value(usage.context_tokens, usage.context_limit),
+            "contextLimit": export_context_usage_value(usage.context_limit, usage.context_limit),
         }),
         None => json!({
             "totalInputTokens": EMPTY_EXPORT_FIELD,
@@ -2027,6 +2053,8 @@ migration is written as `empty`.\n\n",
             "totalCacheWriteTokens": EMPTY_EXPORT_FIELD,
             "totalCostUsd": EMPTY_EXPORT_FIELD,
             "pricedRounds": EMPTY_EXPORT_FIELD,
+            "contextTokens": EMPTY_EXPORT_FIELD,
+            "contextLimit": EMPTY_EXPORT_FIELD,
         }),
     };
     append_json_block(&mut out, "Token Usage", &usage_json, 2);
@@ -2064,6 +2092,7 @@ migration is written as `empty`.\n\n",
             "toolCalls": export_tool_calls(message.tool_calls.as_deref()),
             "toolCallId": export_optional_text(message.tool_call_id.as_deref()),
             "images": export_images(message.images.as_deref()),
+            "assetRefs": export_asset_refs(message.asset_refs.as_deref()),
             "thinkingContent": export_optional_text(message.thinking_content.as_deref()),
             "thinkingDuration": export_optional_u32(message.thinking_duration),
             "thinkingSignature": export_optional_text(message.thinking_signature.as_deref()),
@@ -2110,9 +2139,18 @@ fn format_rounds_as_markdown(
             u.total_cache_read_tokens,
             u.total_cache_write_tokens
         ));
+        if u.context_limit > 0 {
+            out.push_str(&format!(
+                "- **Context Window:** {} / {}\n",
+                u.context_tokens, u.context_limit
+            ));
+        } else {
+            out.push_str(&format!("- **Context Window:** `{}`\n", EMPTY_EXPORT_FIELD));
+        }
         out.push_str(&format!("- **Total Cost:** ${:.4}\n", u.total_cost_usd));
     } else {
         out.push_str(&format!("- **Total Tokens:** `{}`\n", EMPTY_EXPORT_FIELD));
+        out.push_str(&format!("- **Context Window:** `{}`\n", EMPTY_EXPORT_FIELD));
         out.push_str(&format!("- **Total Cost:** `{}`\n", EMPTY_EXPORT_FIELD));
     }
     out.push_str("\n\n");
@@ -2770,6 +2808,7 @@ mod tests {
                 tool_calls: None,
                 tool_call_id: None,
                 images: None,
+                asset_refs: None,
                 thinking_content: None,
                 thinking_duration: None,
                 thinking_signature: None,
@@ -2792,6 +2831,7 @@ mod tests {
         assert!(markdown.contains("\"toolCalls\": \"empty\""));
         assert!(markdown.contains("\"toolCallId\": \"empty\""));
         assert!(markdown.contains("\"images\": \"empty\""));
+        assert!(markdown.contains("\"assetRefs\": \"empty\""));
         assert!(markdown.contains("\"thinkingContent\": \"empty\""));
         assert!(markdown.contains("\"thinkingDuration\": \"empty\""));
         assert!(markdown.contains("\"knowledgeProposal\": \"empty\""));
@@ -2832,6 +2872,7 @@ mod tests {
                 }]),
                 tool_call_id: None,
                 images: None,
+                asset_refs: None,
                 thinking_content: None,
                 thinking_duration: None,
                 thinking_signature: None,
@@ -2964,6 +3005,8 @@ mod tests {
         assert!(markdown.contains("\"latestCompletedRunId\": \"empty\""));
         assert!(markdown.contains("\"promptPrefix\": \"empty\""));
         assert!(markdown.contains("\"promptSuffix\": \"empty\""));
+        assert!(markdown.contains("\"contextTokens\": \"empty\""));
+        assert!(markdown.contains("\"contextLimit\": \"empty\""));
     }
 }
 

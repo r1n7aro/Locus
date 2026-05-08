@@ -202,6 +202,10 @@ pub enum StreamEvent {
         session_id: String,
         messages_before: u32,
         messages_after: u32,
+        #[serde(default)]
+        context_tokens: u32,
+        #[serde(default)]
+        context_limit: u32,
         messages: Vec<crate::session::models::ChatMessage>,
     },
     #[serde(rename_all = "camelCase")]
@@ -306,6 +310,8 @@ pub struct TokenUsage {
     pub total_cache_write_tokens: u64,
     pub total_cost_usd: f64,
     pub priced_rounds: u64,
+    pub context_tokens: u32,
+    pub context_limit: u32,
 }
 
 pub use asset::*;

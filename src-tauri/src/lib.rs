@@ -210,6 +210,9 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
+        .on_webview_event(|webview, event| {
+            commands::handle_unity_embed_webview_event(webview, event);
+        })
         .on_window_event(|window, event| {
             if window.label() != MAIN_WINDOW_LABEL {
                 return;
@@ -996,6 +999,7 @@ pub fn run() {
             commands::unity_embed_set_mouse_activation_suppressed,
             commands::unity_embed_activate_for_input,
             commands::unity_embed_focus_debug_snapshot,
+            commands::unity_embed_commit_asset_drop,
             commands::fetch_app_update_manifest,
         ])
         .run(tauri::generate_context!())

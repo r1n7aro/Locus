@@ -71,6 +71,16 @@ export interface ImageAttachment {
   mimeType: string;
 }
 
+export type AssetRefKind = "asset" | "sceneObject" | "knowledge";
+
+export interface AssetRefAttachment {
+  path: string;
+  kind: AssetRefKind;
+  name?: string;
+  typeLabel?: string;
+  source?: "unity" | "manual";
+}
+
 export interface SkillIntentItem {
   dirName: string;
   source: "app" | "project";
@@ -87,6 +97,7 @@ export interface ChatComposerSendPayload {
   text: string;
   displayText: string;
   images: ImageAttachment[];
+  assetRefs: AssetRefAttachment[];
   mode?: string | null;
   userIntent?: UserIntentMeta | null;
 }
@@ -135,6 +146,7 @@ export interface ChatMessage {
   toolCalls?: ToolCallInfo[];
   toolCallId?: string;
   images?: ImageAttachment[];
+  assetRefs?: AssetRefAttachment[];
   thinkingContent?: string;
   thinkingDuration?: number;
   thinkingSignature?: string;
@@ -245,6 +257,7 @@ export interface CustomEndpoint {
   betaFlags: string[];
   supportedReasoningEfforts: EffortLevel[];
   reasoningParamFormat: ReasoningParamFormat;
+  replayReasoningContent: boolean;
 }
 
 export interface ModelDefaults {
@@ -556,6 +569,8 @@ export type StreamEvent = { runId: string } & (
       sessionId: string;
       messagesBefore: number;
       messagesAfter: number;
+      contextTokens?: number;
+      contextLimit?: number;
       messages: ChatMessage[];
     }
   | {

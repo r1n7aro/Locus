@@ -69,6 +69,7 @@ const RUN_STATUS_DONE: &str = "done";
 const RUN_STATUS_CANCELLED: &str = "cancelled";
 const RUN_STATUS_ERROR: &str = "error";
 const CONTEXT_HANDOFF_MARKER: &str = "## Context Handoff";
+const CONTEXT_COMPACTED_DISPLAY_MARKER: &str = "## Context Handoff\n\nContext compacted.";
 
 impl SessionEventWriter {
     const FLUSH_INTERVAL: Duration = Duration::from_millis(25);
@@ -323,6 +324,28 @@ fn is_context_handoff_message(message: &ChatMessage) -> bool {
     message.role == MessageRole::Assistant && message.content.starts_with(CONTEXT_HANDOFF_MARKER)
 }
 
+fn redact_context_handoff_for_display(message: &mut ChatMessage) {
+    if !is_context_handoff_message(message) {
+        return;
+    }
+
+    message.content = CONTEXT_COMPACTED_DISPLAY_MARKER.to_string();
+    message.prompt_prefix = None;
+    message.prompt_suffix = None;
+    message.response_id = None;
+    message.content_order = None;
+    message.thinking_order = None;
+    message.tool_calls = None;
+    message.tool_call_id = None;
+    message.images = None;
+    message.asset_refs = None;
+    message.thinking_content = None;
+    message.thinking_duration = None;
+    message.thinking_signature = None;
+    message.knowledge_proposal = None;
+    message.render_parts = None;
+}
+
 fn strip_top_level_recorded_output(tool_calls: &[ToolCallInfo]) -> Vec<ToolCallInfo> {
     tool_calls
         .iter()
@@ -350,7 +373,7 @@ impl SessionStore {
     ///
     /// Do not rely on ad-hoc `ALTER TABLE ... .ok()` fallbacks or silent
     /// schema drift. Session data must migrate deterministically.
-    const SCHEMA_VERSION: i32 = 16;
+    const SCHEMA_VERSION: i32 = 18;
 
     pub fn new(data_dir: &Path) -> Result<Self, String> {
         let db_path = data_dir.join("locus.db");
@@ -520,7 +543,32 @@ impl SessionStore {
             })?;
         }
 
-        debug_assert_eq!(Self::SCHEMA_VERSION, 16, "add a new migration block above");
+        if current < 17 {
+            Self::migrate(conn, 17, "add message asset references", |conn| {
+                if !Self::table_has_column(conn, "messages", "asset_refs")? {
+                    conn.execute_batch("ALTER TABLE messages ADD COLUMN asset_refs TEXT;")?;
+                }
+                Ok(())
+            })?;
+        }
+
+        if current < 18 {
+            Self::migrate(conn, 18, "persist latest context usage", |conn| {
+                if !Self::table_has_column(conn, "token_usage", "last_context_tokens")? {
+                    conn.execute_batch(
+                        "ALTER TABLE token_usage ADD COLUMN last_context_tokens INTEGER NOT NULL DEFAULT 0;",
+                    )?;
+                }
+                if !Self::table_has_column(conn, "token_usage", "last_context_limit")? {
+                    conn.execute_batch(
+                        "ALTER TABLE token_usage ADD COLUMN last_context_limit INTEGER NOT NULL DEFAULT 0;",
+                    )?;
+                }
+                Ok(())
+            })?;
+        }
+
+        debug_assert_eq!(Self::SCHEMA_VERSION, 18, "add a new migration block above");
         Ok(())
     }
 
@@ -553,6 +601,7 @@ impl SessionStore {
                 tool_calls TEXT,
                 tool_call_id TEXT,
                 images TEXT,
+                asset_refs TEXT,
                 thinking_content TEXT,
                 thinking_duration INTEGER,
                 thinking_signature TEXT,
@@ -568,7 +617,9 @@ impl SessionStore {
                 total_cache_read_tokens INTEGER NOT NULL DEFAULT 0,
                 total_cache_write_tokens INTEGER NOT NULL DEFAULT 0,
                 total_cost_usd REAL NOT NULL DEFAULT 0,
-                priced_rounds INTEGER NOT NULL DEFAULT 0
+                priced_rounds INTEGER NOT NULL DEFAULT 0,
+                last_context_tokens INTEGER NOT NULL DEFAULT 0,
+                last_context_limit INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS todos (
@@ -1560,7 +1611,9 @@ impl SessionStore {
         role: MessageRole,
         content: &str,
     ) -> Result<String, String> {
-        self.add_message_full(session_id, role, content, None, None, None, None, None)
+        self.add_message_full(
+            session_id, role, content, None, None, None, None, None, None,
+        )
     }
 
     pub fn add_message_with_images(
@@ -1584,15 +1637,17 @@ impl SessionStore {
             images_json.as_deref(),
             None,
             None,
+            None,
         )
     }
 
-    pub fn add_message_with_images_and_signature(
+    pub fn add_message_with_images_asset_refs_and_signature(
         &self,
         session_id: &str,
         role: MessageRole,
         content: &str,
         images: Option<&[super::models::ImageData]>,
+        asset_refs: Option<&[super::models::AssetRefData]>,
         thinking_signature: Option<&str>,
         prompt_prefix: Option<&str>,
         prompt_suffix: Option<&str>,
@@ -1602,6 +1657,11 @@ impl SessionStore {
             .map(|imgs| serde_json::to_string(imgs))
             .transpose()
             .map_err(|e| format!("Failed to serialize images: {}", e))?;
+        let asset_refs_json = asset_refs
+            .filter(|refs| !refs.is_empty())
+            .map(|refs| serde_json::to_string(refs))
+            .transpose()
+            .map_err(|e| format!("Failed to serialize asset refs: {}", e))?;
         self.add_message_full_with_thinking(
             session_id,
             role,
@@ -1609,6 +1669,7 @@ impl SessionStore {
             None,
             None,
             images_json.as_deref(),
+            asset_refs_json.as_deref(),
             None,
             None,
             thinking_signature,
@@ -1667,6 +1728,7 @@ impl SessionStore {
             None,
             None,
             None,
+            None,
             thinking_content,
             thinking_duration,
             thinking_signature,
@@ -1698,6 +1760,7 @@ impl SessionStore {
             session_id,
             role,
             content,
+            None,
             None,
             None,
             None,
@@ -1774,6 +1837,7 @@ impl SessionStore {
             Some(&tool_calls_json),
             None,
             None,
+            None,
             thinking_content,
             thinking_duration,
             thinking_signature,
@@ -1808,6 +1872,7 @@ impl SessionStore {
             MessageRole::Assistant,
             content,
             Some(&tool_calls_json),
+            None,
             None,
             None,
             thinking_content,
@@ -1901,6 +1966,7 @@ impl SessionStore {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -1991,6 +2057,7 @@ impl SessionStore {
         tool_calls_json: Option<&str>,
         tool_call_id: Option<&str>,
         images_json: Option<&str>,
+        asset_refs_json: Option<&str>,
         prompt_prefix: Option<&str>,
         knowledge_proposal: Option<&KnowledgeProposal>,
     ) -> Result<String, String> {
@@ -2001,6 +2068,7 @@ impl SessionStore {
             tool_calls_json,
             tool_call_id,
             images_json,
+            asset_refs_json,
             None,
             None,
             None,
@@ -2022,6 +2090,7 @@ impl SessionStore {
         tool_calls_json: Option<&str>,
         tool_call_id: Option<&str>,
         images_json: Option<&str>,
+        asset_refs_json: Option<&str>,
         thinking_content: Option<&str>,
         thinking_duration: Option<u32>,
         thinking_signature: Option<&str>,
@@ -2040,6 +2109,7 @@ impl SessionStore {
             tool_calls_json,
             tool_call_id,
             images_json,
+            asset_refs_json,
             thinking_content,
             thinking_duration,
             thinking_signature,
@@ -2062,6 +2132,7 @@ impl SessionStore {
         tool_calls_json: Option<&str>,
         tool_call_id: Option<&str>,
         images_json: Option<&str>,
+        asset_refs_json: Option<&str>,
         thinking_content: Option<&str>,
         thinking_duration: Option<u32>,
         thinking_signature: Option<&str>,
@@ -2087,9 +2158,9 @@ impl SessionStore {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
 
         conn.execute(
-            "INSERT INTO messages (id, session_id, role, content, created_at, prompt_prefix, prompt_suffix, tool_calls, tool_call_id, images, thinking_content, thinking_duration, thinking_signature, metadata_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-            params![id, session_id, role.as_str(), content, now, prompt_prefix, prompt_suffix, tool_calls_json, tool_call_id, images_json, thinking_content, thinking_duration.map(|d| d as i64), thinking_signature, metadata_json],
+            "INSERT INTO messages (id, session_id, role, content, created_at, prompt_prefix, prompt_suffix, tool_calls, tool_call_id, images, asset_refs, thinking_content, thinking_duration, thinking_signature, metadata_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            params![id, session_id, role.as_str(), content, now, prompt_prefix, prompt_suffix, tool_calls_json, tool_call_id, images_json, asset_refs_json, thinking_content, thinking_duration.map(|d| d as i64), thinking_signature, metadata_json],
         )
         .map_err(|e| format!("Failed to add message: {}", e))?;
 
@@ -2111,6 +2182,7 @@ impl SessionStore {
             session_id,
             MessageRole::Assistant,
             "",
+            None,
             None,
             None,
             None,
@@ -2209,18 +2281,32 @@ impl SessionStore {
         cache_write_tokens: u64,
         cost_usd: f64,
         priced_rounds: u64,
+        context_tokens: Option<u32>,
+        context_limit: Option<u32>,
     ) -> Result<TokenUsage, String> {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
         conn.execute(
-            "INSERT INTO token_usage (session_id, total_input_tokens, total_output_tokens, total_cache_read_tokens, total_cache_write_tokens, total_cost_usd, priced_rounds)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "INSERT INTO token_usage (
+                session_id,
+                total_input_tokens,
+                total_output_tokens,
+                total_cache_read_tokens,
+                total_cache_write_tokens,
+                total_cost_usd,
+                priced_rounds,
+                last_context_tokens,
+                last_context_limit
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, COALESCE(?8, 0), COALESCE(?9, 0))
              ON CONFLICT(session_id) DO UPDATE SET
                 total_input_tokens = total_input_tokens + ?2,
                 total_output_tokens = total_output_tokens + ?3,
                 total_cache_read_tokens = total_cache_read_tokens + ?4,
                 total_cache_write_tokens = total_cache_write_tokens + ?5,
                 total_cost_usd = total_cost_usd + ?6,
-                priced_rounds = priced_rounds + ?7",
+                priced_rounds = priced_rounds + ?7,
+                last_context_tokens = CASE WHEN ?8 IS NULL THEN last_context_tokens ELSE ?8 END,
+                last_context_limit = CASE WHEN ?9 IS NULL THEN last_context_limit ELSE ?9 END",
             params![
                 session_id,
                 input_tokens as i64,
@@ -2228,14 +2314,34 @@ impl SessionStore {
                 cache_read_tokens as i64,
                 cache_write_tokens as i64,
                 cost_usd,
-                priced_rounds as i64
+                priced_rounds as i64,
+                context_tokens.map(|value| value as i64),
+                context_limit.map(|value| value as i64),
             ],
         )
         .map_err(|e| format!("Failed to record token usage: {}", e))?;
 
-        let (total_in, total_out, total_cr, total_cw, total_cost_usd, priced_rounds) = conn
+        let (
+            total_in,
+            total_out,
+            total_cr,
+            total_cw,
+            total_cost_usd,
+            priced_rounds,
+            last_context_tokens,
+            last_context_limit,
+        ) = conn
             .query_row(
-                "SELECT total_input_tokens, total_output_tokens, total_cache_read_tokens, total_cache_write_tokens, total_cost_usd, priced_rounds FROM token_usage WHERE session_id = ?1",
+                "SELECT
+                    total_input_tokens,
+                    total_output_tokens,
+                    total_cache_read_tokens,
+                    total_cache_write_tokens,
+                    total_cost_usd,
+                    priced_rounds,
+                    last_context_tokens,
+                    last_context_limit
+                 FROM token_usage WHERE session_id = ?1",
                 params![session_id],
                 |row| {
                     Ok((
@@ -2245,6 +2351,8 @@ impl SessionStore {
                         row.get::<_, i64>(3)?,
                         row.get::<_, f64>(4)?,
                         row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, i64>(7)?,
                     ))
                 },
             )
@@ -2257,13 +2365,24 @@ impl SessionStore {
             total_cache_write_tokens: total_cw as u64,
             total_cost_usd,
             priced_rounds: priced_rounds as u64,
+            context_tokens: last_context_tokens as u32,
+            context_limit: last_context_limit as u32,
         })
     }
 
     pub fn get_token_usage(&self, session_id: &str) -> Result<TokenUsage, String> {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
         let result = conn.query_row(
-            "SELECT total_input_tokens, total_output_tokens, total_cache_read_tokens, total_cache_write_tokens, total_cost_usd, priced_rounds FROM token_usage WHERE session_id = ?1",
+            "SELECT
+                total_input_tokens,
+                total_output_tokens,
+                total_cache_read_tokens,
+                total_cache_write_tokens,
+                total_cost_usd,
+                priced_rounds,
+                last_context_tokens,
+                last_context_limit
+             FROM token_usage WHERE session_id = ?1",
             params![session_id],
             |row| {
                 Ok((
@@ -2273,21 +2392,32 @@ impl SessionStore {
                     row.get::<_, i64>(3)?,
                     row.get::<_, f64>(4)?,
                     row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(7)?,
                 ))
             },
         );
 
         match result {
-            Ok((total_in, total_out, total_cr, total_cw, total_cost_usd, priced_rounds)) => {
-                Ok(TokenUsage {
-                    total_input_tokens: total_in as u64,
-                    total_output_tokens: total_out as u64,
-                    total_cache_read_tokens: total_cr as u64,
-                    total_cache_write_tokens: total_cw as u64,
-                    total_cost_usd,
-                    priced_rounds: priced_rounds as u64,
-                })
-            }
+            Ok((
+                total_in,
+                total_out,
+                total_cr,
+                total_cw,
+                total_cost_usd,
+                priced_rounds,
+                last_context_tokens,
+                last_context_limit,
+            )) => Ok(TokenUsage {
+                total_input_tokens: total_in as u64,
+                total_output_tokens: total_out as u64,
+                total_cache_read_tokens: total_cr as u64,
+                total_cache_write_tokens: total_cw as u64,
+                total_cost_usd,
+                priced_rounds: priced_rounds as u64,
+                context_tokens: last_context_tokens as u32,
+                context_limit: last_context_limit as u32,
+            }),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(TokenUsage {
                 total_input_tokens: 0,
                 total_output_tokens: 0,
@@ -2295,6 +2425,8 @@ impl SessionStore {
                 total_cache_write_tokens: 0,
                 total_cost_usd: 0.0,
                 priced_rounds: 0,
+                context_tokens: 0,
+                context_limit: 0,
             }),
             Err(e) => Err(format!("Failed to get token usage: {}", e)),
         }
@@ -2400,23 +2532,12 @@ impl SessionStore {
         conn.execute("BEGIN", [])
             .map_err(|e| format!("Failed to begin transaction: {}", e))?;
 
-        let (keep_from_rowid, keep_from_created_at): (i64, i64) = conn
-            .query_row(
-                "SELECT rowid, created_at FROM messages WHERE session_id = ?1 AND id = ?2",
-                params![session_id, keep_from_message_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .map_err(|e| {
-                let _ = conn.execute("ROLLBACK", []);
-                format!("Failed to resolve compact boundary: {}", e)
-            })?;
-
         let prompt_messages = Self::get_messages_with_conn_filtered_static(&conn, session_id, true)
             .map_err(|e| {
                 let _ = conn.execute("ROLLBACK", []);
                 e
             })?;
-        let boundary_idx = prompt_messages
+        let _boundary_idx = prompt_messages
             .iter()
             .position(|message| message.id == keep_from_message_id)
             .ok_or_else(|| {
@@ -2426,34 +2547,22 @@ impl SessionStore {
                     keep_from_message_id
                 )
             })?;
-        let carried_prompt_prefix = prompt_messages
-            .iter()
-            .take(boundary_idx)
-            .find_map(|message| {
-                if message.role == MessageRole::User && message.tool_call_id.is_none() {
-                    message
-                        .prompt_prefix
-                        .as_deref()
-                        .filter(|prefix| !prefix.trim().is_empty())
-                        .map(|prefix| prefix.to_string())
-                } else {
-                    None
-                }
-            });
-        let carried_prompt_prefix = carried_prompt_prefix.or_else(|| {
-            let boundary_message = &prompt_messages[boundary_idx];
-            if !is_context_handoff_message(boundary_message) {
-                return None;
+        let carried_prompt_prefix = prompt_messages.iter().find_map(|message| {
+            if (message.role == MessageRole::User && message.tool_call_id.is_none())
+                || is_context_handoff_message(message)
+            {
+                message
+                    .prompt_prefix
+                    .as_deref()
+                    .filter(|prefix| !prefix.trim().is_empty())
+                    .map(|prefix| prefix.to_string())
+            } else {
+                None
             }
-            boundary_message
-                .prompt_prefix
-                .as_deref()
-                .filter(|prefix| !prefix.trim().is_empty())
-                .map(|prefix| prefix.to_string())
         });
         let retained_user_ids = compact::select_recent_user_message_ids_for_compact_prompt(
             &prompt_messages,
-            boundary_idx,
+            prompt_messages.len(),
             compact::compact_user_message_token_budget(),
         );
 
@@ -2461,30 +2570,12 @@ impl SessionStore {
             "UPDATE messages
              SET include_in_prompt = 0
              WHERE session_id = ?1
-               AND include_in_prompt = 1
-               AND (created_at < ?2 OR (created_at = ?2 AND rowid < ?3))",
-            params![session_id, keep_from_created_at, keep_from_rowid],
+               AND include_in_prompt = 1",
+            params![session_id],
         )
         .map_err(|e| {
             let _ = conn.execute("ROLLBACK", []);
             format!("Failed to mark compacted messages: {}", e)
-        })?;
-
-        conn.execute(
-            "UPDATE messages
-             SET include_in_prompt = 0
-             WHERE session_id = ?1
-               AND include_in_prompt = 1
-               AND role = 'assistant'
-               AND content LIKE ?2",
-            params![session_id, format!("{}%", CONTEXT_HANDOFF_MARKER)],
-        )
-        .map_err(|e| {
-            let _ = conn.execute("ROLLBACK", []);
-            format!(
-                "Failed to remove previous handoff messages from prompt: {}",
-                e
-            )
         })?;
 
         for message_id in &retained_user_ids {
@@ -2507,8 +2598,8 @@ impl SessionStore {
         }
 
         conn.execute(
-            "INSERT INTO messages (id, session_id, role, content, created_at, prompt_prefix, prompt_suffix, tool_calls, tool_call_id, images, thinking_content, thinking_duration, thinking_signature, metadata_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)",
+            "INSERT INTO messages (id, session_id, role, content, created_at, prompt_prefix, prompt_suffix, tool_calls, tool_call_id, images, asset_refs, thinking_content, thinking_duration, thinking_signature, metadata_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)",
             params![
                 summary_msg.id,
                 session_id,
@@ -2601,20 +2692,31 @@ impl SessionStore {
         session_id: &str,
         prompt_only: bool,
     ) -> Result<Vec<ChatMessage>, String> {
+        let asset_refs_select = if Self::table_has_column(conn, "messages", "asset_refs")
+            .map_err(|e| format!("Failed to inspect messages.asset_refs: {}", e))?
+        {
+            "asset_refs"
+        } else {
+            "NULL AS asset_refs"
+        };
         let query = if prompt_only {
-            "SELECT id, role, content, created_at, prompt_prefix, prompt_suffix, tool_calls, tool_call_id, images, thinking_content, thinking_duration, thinking_signature, metadata_json
+            format!(
+                "SELECT id, role, content, created_at, prompt_prefix, prompt_suffix, tool_calls, tool_call_id, images, {asset_refs_select}, thinking_content, thinking_duration, thinking_signature, metadata_json
              FROM messages
              WHERE session_id = ?1 AND include_in_prompt = 1
              ORDER BY created_at ASC, rowid ASC"
+            )
         } else {
-            "SELECT id, role, content, created_at, prompt_prefix, prompt_suffix, tool_calls, tool_call_id, images, thinking_content, thinking_duration, thinking_signature, metadata_json
+            format!(
+                "SELECT id, role, content, created_at, prompt_prefix, prompt_suffix, tool_calls, tool_call_id, images, {asset_refs_select}, thinking_content, thinking_duration, thinking_signature, metadata_json
              FROM messages
              WHERE session_id = ?1
-             ORDER BY created_at ASC, rowid ASC"
+             ORDER BY rowid ASC"
+            )
         };
 
         let mut stmt = conn
-            .prepare(query)
+            .prepare(&query)
             .map_err(|e| format!("Failed to prepare query: {}", e))?;
 
         let rows = stmt
@@ -2630,9 +2732,10 @@ impl SessionStore {
                     row.get::<_, Option<String>>(7)?,
                     row.get::<_, Option<String>>(8)?,
                     row.get::<_, Option<String>>(9)?,
-                    row.get::<_, Option<i64>>(10)?,
-                    row.get::<_, Option<String>>(11)?,
+                    row.get::<_, Option<String>>(10)?,
+                    row.get::<_, Option<i64>>(11)?,
                     row.get::<_, Option<String>>(12)?,
+                    row.get::<_, Option<String>>(13)?,
                 ))
             })
             .map_err(|e| format!("Failed to query messages: {}", e))?;
@@ -2649,6 +2752,7 @@ impl SessionStore {
                 tool_calls_json,
                 tool_call_id,
                 images_json,
+                asset_refs_json,
                 thinking_content,
                 thinking_duration_raw,
                 thinking_signature,
@@ -2667,6 +2771,12 @@ impl SessionStore {
                 .map(|json| serde_json::from_str(json))
                 .transpose()
                 .map_err(|e| format!("Failed to parse images: {}", e))?;
+
+            let asset_refs: Option<Vec<super::models::AssetRefData>> = asset_refs_json
+                .as_deref()
+                .map(|json| serde_json::from_str(json))
+                .transpose()
+                .map_err(|e| format!("Failed to parse asset refs: {}", e))?;
 
             let metadata: Option<MessageMetadata> = metadata_json
                 .as_deref()
@@ -2699,12 +2809,18 @@ impl SessionStore {
                 tool_calls,
                 tool_call_id,
                 images,
+                asset_refs,
                 thinking_content,
                 thinking_duration: thinking_duration_raw.map(|d| d as u32),
                 thinking_signature,
                 knowledge_proposal,
                 render_parts,
             });
+        }
+        if !prompt_only {
+            for message in &mut messages {
+                redact_context_handoff_for_display(message);
+            }
         }
         Ok(messages)
     }
@@ -2921,7 +3037,7 @@ impl SessionStore {
 
 #[cfg(test)]
 mod tests {
-    use super::SessionStore;
+    use super::{SessionStore, CONTEXT_COMPACTED_DISPLAY_MARKER};
     use crate::session::models::{
         ChatMessage, KnowledgeProposalStatus, MessageRole, TodoItem, ToolCallInfo,
     };
@@ -2982,9 +3098,43 @@ mod tests {
         assert!(SessionStore::table_has_column(&conn, "messages", "metadata_json").unwrap());
         assert!(SessionStore::table_has_column(&conn, "messages", "prompt_prefix").unwrap());
         assert!(SessionStore::table_has_column(&conn, "messages", "prompt_suffix").unwrap());
+        assert!(SessionStore::table_has_column(&conn, "messages", "asset_refs").unwrap());
         assert!(SessionStore::table_has_column(&conn, "messages", "include_in_prompt").unwrap());
+        assert!(
+            SessionStore::table_has_column(&conn, "token_usage", "last_context_tokens").unwrap()
+        );
+        assert!(
+            SessionStore::table_has_column(&conn, "token_usage", "last_context_limit").unwrap()
+        );
         assert!(table_exists(&conn, "session_runs"));
         assert!(table_exists(&conn, "session_events"));
+    }
+
+    #[test]
+    fn token_usage_persists_latest_context_window() {
+        let dir = tempdir().expect("create temp dir");
+        let store = SessionStore::new(dir.path()).expect("initialize store");
+        let session_id = store
+            .create_session("Usage", None, None, "chat", None)
+            .expect("create session");
+
+        let usage = store
+            .record_token_usage(&session_id, 100, 20, 10, 5, 0.0, 0, Some(135), Some(1000))
+            .expect("record usage");
+        assert_eq!(usage.context_tokens, 135);
+        assert_eq!(usage.context_limit, 1000);
+
+        let usage = store
+            .record_token_usage(&session_id, 7, 3, 0, 0, 0.0, 0, None, None)
+            .expect("record usage without context");
+        assert_eq!(usage.total_input_tokens, 107);
+        assert_eq!(usage.total_output_tokens, 23);
+        assert_eq!(usage.context_tokens, 135);
+        assert_eq!(usage.context_limit, 1000);
+
+        let reloaded = store.get_token_usage(&session_id).expect("read usage");
+        assert_eq!(reloaded.context_tokens, 135);
+        assert_eq!(reloaded.context_limit, 1000);
     }
 
     #[test]
@@ -3152,7 +3302,14 @@ mod tests {
         );
         assert!(SessionStore::table_has_column(&conn, "messages", "prompt_prefix").unwrap());
         assert!(SessionStore::table_has_column(&conn, "messages", "prompt_suffix").unwrap());
+        assert!(SessionStore::table_has_column(&conn, "messages", "asset_refs").unwrap());
         assert!(SessionStore::table_has_column(&conn, "messages", "include_in_prompt").unwrap());
+        assert!(
+            SessionStore::table_has_column(&conn, "token_usage", "last_context_tokens").unwrap()
+        );
+        assert!(
+            SessionStore::table_has_column(&conn, "token_usage", "last_context_limit").unwrap()
+        );
     }
 
     #[test]
@@ -4195,6 +4352,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
             images: None,
+            asset_refs: None,
             thinking_content: None,
             thinking_duration: None,
             thinking_signature: None,
@@ -4206,7 +4364,7 @@ mod tests {
             .compact_messages(&session_id, &summary_msg, latest_user_id)
             .expect("compact messages");
         assert_eq!(count_before, 4);
-        assert_eq!(count_after, 4);
+        assert_eq!(count_after, 3);
 
         let all_messages = store.get_messages(&session_id).expect("load all messages");
         let prompt_messages = store
@@ -4226,16 +4384,16 @@ mod tests {
             vec![
                 old_user_id,
                 old_assistant_id,
-                "handoff-1",
                 latest_user_id,
                 latest_assistant_id,
+                "handoff-1"
             ]
         );
-        assert_eq!(prompt_messages.len(), 4);
+        assert_eq!(all_messages[4].content, CONTEXT_COMPACTED_DISPLAY_MARKER);
+        assert_eq!(prompt_messages.len(), 3);
         assert_eq!(prompt_messages[0].id, old_user_id);
         assert_eq!(prompt_messages[1].id, "handoff-1");
         assert_eq!(prompt_messages[2].content, "最新需求");
-        assert_eq!(prompt_messages[3].content, "最新回答");
         assert_eq!(
             prompt_messages[0].prompt_prefix.as_deref(),
             Some("<system-reminder>\nEnv\n</system-reminder>")
@@ -4296,6 +4454,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
             images: None,
+            asset_refs: None,
             thinking_content: None,
             thinking_duration: None,
             thinking_signature: None,
@@ -4307,7 +4466,7 @@ mod tests {
             .compact_messages(&session_id, &summary_msg, latest_user_id)
             .expect("compact messages");
         assert_eq!(count_before, 4);
-        assert_eq!(count_after, 3);
+        assert_eq!(count_after, 2);
 
         let prompt_messages = store
             .get_messages_for_prompt(&session_id)
@@ -4317,10 +4476,7 @@ mod tests {
             .map(|message| message.id.as_str())
             .collect::<Vec<_>>();
 
-        assert_eq!(
-            prompt_ids,
-            vec!["handoff-1", latest_user_id, "latest-assistant"]
-        );
+        assert_eq!(prompt_ids, vec!["handoff-1", latest_user_id]);
         assert_eq!(
             prompt_messages[1].prompt_prefix.as_deref(),
             Some("<system-reminder>\nEnv\n</system-reminder>")
@@ -4331,6 +4487,178 @@ mod tests {
                 .expect("first prompt user"),
             Some(latest_user_id.to_string())
         );
+    }
+
+    #[test]
+    fn compact_marker_displays_after_assistant_tail_when_compacting_after_turn() {
+        let dir = tempdir().expect("create temp dir");
+        let store = SessionStore::new(dir.path()).expect("initialize store");
+        let session_id = store
+            .create_session("Compact Marker Order Test", None, None, "chat", None)
+            .expect("create session");
+
+        {
+            let conn = store.conn.lock().expect("lock store connection");
+            for (id, role, content, created_at) in [
+                ("user-1", "user", "测试 unity_execute", 100i64),
+                ("assistant-tools", "assistant", "已调用工具", 101i64),
+                ("assistant-final", "assistant", "测试完成", 102i64),
+            ] {
+                conn.execute(
+                    "INSERT INTO messages (id, session_id, role, content, created_at, prompt_prefix, prompt_suffix, tool_calls, tool_call_id, images, thinking_content, thinking_duration, thinking_signature, metadata_json)
+                     VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)",
+                    params![id, session_id, role, content, created_at],
+                )
+                .expect("insert message");
+            }
+        }
+
+        let summary_msg = ChatMessage {
+            id: "handoff-1".to_string(),
+            role: MessageRole::Assistant,
+            content: "## Context Handoff\n\n交接摘要".to_string(),
+            created_at: 101,
+            prompt_prefix: None,
+            prompt_suffix: None,
+            response_id: None,
+            content_order: None,
+            thinking_order: None,
+            tool_calls: None,
+            tool_call_id: None,
+            images: None,
+            asset_refs: None,
+            thinking_content: None,
+            thinking_duration: None,
+            thinking_signature: None,
+            knowledge_proposal: None,
+            render_parts: None,
+        };
+
+        store
+            .compact_messages(&session_id, &summary_msg, "assistant-final")
+            .expect("compact messages");
+
+        let all_messages = store.get_messages(&session_id).expect("load all messages");
+        let all_ids = all_messages
+            .iter()
+            .map(|message| message.id.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            all_ids,
+            vec!["user-1", "assistant-tools", "assistant-final", "handoff-1"]
+        );
+        assert_eq!(
+            all_messages.last().map(|message| message.content.as_str()),
+            Some(CONTEXT_COMPACTED_DISPLAY_MARKER)
+        );
+    }
+
+    #[test]
+    fn compact_markers_follow_message_insert_order_across_multiple_compacts() {
+        let dir = tempdir().expect("create temp dir");
+        let store = SessionStore::new(dir.path()).expect("initialize store");
+        let session_id = store
+            .create_session("Compact Marker Insert Order Test", None, None, "chat", None)
+            .expect("create session");
+
+        {
+            let conn = store.conn.lock().expect("lock store connection");
+            for (id, role, content, created_at) in [
+                ("user-1", "user", "第一轮需求", 100i64),
+                ("assistant-1", "assistant", "第一轮回答", 101i64),
+            ] {
+                conn.execute(
+                    "INSERT INTO messages (id, session_id, role, content, created_at, prompt_prefix, prompt_suffix, tool_calls, tool_call_id, images, thinking_content, thinking_duration, thinking_signature, metadata_json)
+                     VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)",
+                    params![id, session_id, role, content, created_at],
+                )
+                .expect("insert first turn message");
+            }
+        }
+
+        let first_handoff = ChatMessage {
+            id: "handoff-1".to_string(),
+            role: MessageRole::Assistant,
+            content: "## Context Handoff\n\n第一次交接".to_string(),
+            created_at: 101,
+            prompt_prefix: None,
+            prompt_suffix: None,
+            response_id: None,
+            content_order: None,
+            thinking_order: None,
+            tool_calls: None,
+            tool_call_id: None,
+            images: None,
+            asset_refs: None,
+            thinking_content: None,
+            thinking_duration: None,
+            thinking_signature: None,
+            knowledge_proposal: None,
+            render_parts: None,
+        };
+        store
+            .compact_messages(&session_id, &first_handoff, "assistant-1")
+            .expect("first compact");
+
+        {
+            let conn = store.conn.lock().expect("lock store connection");
+            for (id, role, content, created_at) in [
+                ("user-2", "user", "你好", 102i64),
+                ("assistant-2", "assistant", "你好，我在。", 103i64),
+            ] {
+                conn.execute(
+                    "INSERT INTO messages (id, session_id, role, content, created_at, prompt_prefix, prompt_suffix, tool_calls, tool_call_id, images, thinking_content, thinking_duration, thinking_signature, metadata_json)
+                     VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)",
+                    params![id, session_id, role, content, created_at],
+                )
+                .expect("insert second turn message");
+            }
+        }
+
+        let second_handoff = ChatMessage {
+            id: "handoff-2".to_string(),
+            role: MessageRole::Assistant,
+            content: "## Context Handoff\n\n第二次交接".to_string(),
+            created_at: 103,
+            prompt_prefix: None,
+            prompt_suffix: None,
+            response_id: None,
+            content_order: None,
+            thinking_order: None,
+            tool_calls: None,
+            tool_call_id: None,
+            images: None,
+            asset_refs: None,
+            thinking_content: None,
+            thinking_duration: None,
+            thinking_signature: None,
+            knowledge_proposal: None,
+            render_parts: None,
+        };
+        store
+            .compact_messages(&session_id, &second_handoff, "assistant-2")
+            .expect("second compact");
+
+        let all_messages = store.get_messages(&session_id).expect("load all messages");
+        let all_ids = all_messages
+            .iter()
+            .map(|message| message.id.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            all_ids,
+            vec![
+                "user-1",
+                "assistant-1",
+                "handoff-1",
+                "user-2",
+                "assistant-2",
+                "handoff-2"
+            ]
+        );
+        assert_eq!(all_messages[2].content, CONTEXT_COMPACTED_DISPLAY_MARKER);
+        assert_eq!(all_messages[5].content, CONTEXT_COMPACTED_DISPLAY_MARKER);
     }
 
     #[test]
@@ -4371,6 +4699,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
             images: None,
+            asset_refs: None,
             thinking_content: None,
             thinking_duration: None,
             thinking_signature: None,
@@ -4409,6 +4738,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
             images: None,
+            asset_refs: None,
             thinking_content: None,
             thinking_duration: None,
             thinking_signature: None,
@@ -4473,6 +4803,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
             images: None,
+            asset_refs: None,
             thinking_content: None,
             thinking_duration: None,
             thinking_signature: None,
@@ -4496,6 +4827,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
             images: None,
+            asset_refs: None,
             thinking_content: None,
             thinking_duration: None,
             thinking_signature: None,

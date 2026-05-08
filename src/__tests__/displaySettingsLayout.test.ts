@@ -151,6 +151,9 @@ describe("display settings transcript alignment", () => {
     expect(transcript).toContain("part.kind === \"thinking\" && part.active");
     expect(transcript).toContain("hasVisibleActiveThinkingBlock.value || hasVisibleCompletedThinkingContent.value");
     expect(transcript).toContain("hasThinkingContent: hasVisibleCompletedThinkingContent.value,");
+    expect(transcript).toContain("function shouldRenderTransientThinkingSegment(");
+    expect(transcript).toContain("return !!part.active || (!shouldHideThinkingBlocks() && part.content.trim().length > 0);");
+    expect(transcript).toMatch(/if \(part\.kind === "thinking"\) \{\s+if \(!shouldRenderTransientThinkingSegment\(part\)\) continue;\s+flushPendingTools\(\);/);
 
     expect(zh).toContain('"settings.display.hideThinkingBlocks": "隐藏已完成思考块"');
     expect(en).toContain('"settings.display.hideThinkingBlocks": "Hide completed thinking blocks"');
