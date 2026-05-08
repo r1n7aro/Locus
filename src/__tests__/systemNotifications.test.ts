@@ -54,6 +54,10 @@ const systemMocks = vi.hoisted(() => ({
   sendSystemNotification: vi.fn(),
 }));
 
+const unityMocks = vi.hoisted(() => ({
+  getUnityEmbedFocusDebugSnapshot: vi.fn(),
+}));
+
 const windowMocks = vi.hoisted(() => ({
   getFocusedWindow: vi.fn(),
 }));
@@ -62,6 +66,7 @@ const displayState = createDisplayState();
 
 vi.mock("@tauri-apps/plugin-notification", () => notificationMocks);
 vi.mock("../services/system", () => systemMocks);
+vi.mock("../services/unity", () => unityMocks);
 vi.mock("@tauri-apps/api/window", () => ({
   Window: windowMocks,
 }));
@@ -102,6 +107,7 @@ describe("systemNotifications", () => {
     notificationMocks.isPermissionGranted.mockResolvedValue(true);
     notificationMocks.requestPermission.mockResolvedValue("granted");
     windowMocks.getFocusedWindow.mockResolvedValue(null);
+    unityMocks.getUnityEmbedFocusDebugSnapshot.mockResolvedValue(null);
   });
 
   it("sends a completion notification when no app window is focused", async () => {
@@ -135,6 +141,46 @@ describe("systemNotifications", () => {
         retryable: false,
         severity: "error",
       },
+    });
+
+    expect(systemMocks.sendSystemNotification).not.toHaveBeenCalled();
+  });
+
+  it("skips notifications while the Unity embedded window has input focus", async () => {
+    unityMocks.getUnityEmbedFocusDebugSnapshot.mockResolvedValue({
+      ok: true,
+      reason: "",
+      foregroundHwnd: 100,
+      foregroundTitle: "Unity",
+      inputFocusHwnd: 200,
+      inputFocusTitle: "Locus",
+      overlayHwnd: 200,
+      overlayTitle: "Locus",
+      overlayVisible: true,
+      overlayForeground: false,
+      overlayInputFocused: true,
+      overlayChildWindow: true,
+      overlayParentHwnd: 100,
+      overlayNoActivate: false,
+      activationGuardEnabled: false,
+      mouseActivateHookInstalled: false,
+      mouseActivateHookedHwndCount: 0,
+      mouseActivateBlockCount: 0,
+      mouseActivationSuppressed: false,
+      parentHwnd: 100,
+      parentTitle: "Unity",
+      parentVisible: true,
+      parentForeground: true,
+    });
+
+    await maybeNotifyStreamEvent({
+      type: "askUser",
+      runId: "run-unity-focus",
+      sessionId: "session-1",
+      questionId: "question-unity-focus",
+      toolCallId: "tool-1",
+      question: "请确认目录",
+      options: [],
     });
 
     expect(systemMocks.sendSystemNotification).not.toHaveBeenCalled();

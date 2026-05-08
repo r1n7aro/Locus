@@ -6,6 +6,7 @@ import {
 import { useDisplaySettings } from "../composables/useDisplaySettings";
 import { t } from "../i18n";
 import { sendSystemNotification } from "./system";
+import { getUnityEmbedFocusDebugSnapshot } from "./unity";
 import type { StreamEvent, ToolConfirmDisplay } from "../types";
 
 interface StreamNotificationContext {
@@ -111,10 +112,23 @@ async function buildNotificationMessage(
 
 async function hasFocusedLocusWindow(): Promise<boolean> {
   try {
-    return (await Window.getFocusedWindow()) !== null;
+    if ((await Window.getFocusedWindow()) !== null) return true;
   } catch {
-    return document.hasFocus();
+    if (document.hasFocus()) return true;
   }
+
+  return hasFocusedUnityEmbedWindow();
+}
+
+async function hasFocusedUnityEmbedWindow(): Promise<boolean> {
+  const snapshot = await getUnityEmbedFocusDebugSnapshot().catch(() => null);
+  if (!snapshot?.ok || !snapshot.overlayVisible) return false;
+
+  return snapshot.overlayInputFocused
+    || (
+      snapshot.overlayInputFocused == null
+      && (snapshot.overlayForeground || snapshot.parentForeground)
+    );
 }
 
 async function ensureNotificationPermission(): Promise<boolean> {
