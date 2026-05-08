@@ -37,6 +37,14 @@ struct UnityEmbedControlMessage {
     reason: String,
     #[serde(default)]
     asset_refs: Option<Vec<UnityEmbedAssetRef>>,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    text_entries: Option<Vec<UnityEmbedTextDropEntry>>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    source: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -56,6 +64,29 @@ struct UnityEmbedAssetRef {
 #[serde(rename_all = "camelCase")]
 struct UnityEmbedAssetDropPayload {
     refs: Vec<UnityEmbedAssetRef>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UnityEmbedTextDropEntry {
+    text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    level: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UnityEmbedTextDropPayload {
+    text: String,
+    entries: Vec<UnityEmbedTextDropEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -103,10 +134,13 @@ pub struct UnityEmbedFocusDebugSnapshot {
     pub reason: String,
     pub foreground_hwnd: i64,
     pub foreground_title: String,
+    pub input_focus_hwnd: i64,
+    pub input_focus_title: String,
     pub overlay_hwnd: i64,
     pub overlay_title: String,
     pub overlay_visible: bool,
     pub overlay_foreground: bool,
+    pub overlay_input_focused: bool,
     pub overlay_child_window: bool,
     pub overlay_parent_hwnd: i64,
     pub overlay_no_activate: bool,
@@ -401,6 +435,27 @@ fn emit_unity_embed_asset_drop(
             UnityEmbedAssetDropPayload { refs },
         )
         .map_err(|error| format!("Failed to emit Unity embed asset drop: {error}"))
+}
+
+fn emit_unity_embed_text_drop(
+    app_handle: &AppHandle,
+    text: String,
+    entries: Vec<UnityEmbedTextDropEntry>,
+    title: Option<String>,
+    source: Option<String>,
+) -> Result<(), String> {
+    app_handle
+        .emit_to(
+            WINDOW_LABEL,
+            "unity-embed-text-drop",
+            UnityEmbedTextDropPayload {
+                text,
+                entries,
+                title,
+                source,
+            },
+        )
+        .map_err(|error| format!("Failed to emit Unity embed text drop: {error}"))
 }
 
 fn emit_unity_embed_asset_drag_state(
@@ -797,7 +852,7 @@ fn apply_control_message_on_main(
     app_handle: &AppHandle,
     msg: UnityEmbedControlMessage,
 ) -> Result<(), String> {
-    if msg.kind != "assetDrop" && msg.kind != "assetDrag" {
+    if msg.kind != "assetDrop" && msg.kind != "assetDrag" && msg.kind != "consoleText" {
         record_control_message(&msg);
     }
     match msg.kind.as_str() {
@@ -848,6 +903,25 @@ fn apply_control_message_on_main(
             let refs = msg.asset_refs.unwrap_or_default();
             cache_unity_embed_asset_drag_refs(refs.clone());
             emit_unity_embed_asset_drag_state(app_handle, refs)
+        }
+        "consoleText" => {
+            let text = msg.text.unwrap_or_default();
+            let title = msg.title;
+            let source = msg.source;
+            let mut entries = msg.text_entries.unwrap_or_default();
+            entries.retain(|entry| !entry.text.trim().is_empty());
+            if entries.is_empty() && !text.trim().is_empty() {
+                entries.push(UnityEmbedTextDropEntry {
+                    text: text.clone(),
+                    title: title.clone(),
+                    source: source.clone(),
+                    level: None,
+                });
+            }
+            if text.trim().is_empty() && entries.is_empty() {
+                return Ok(());
+            }
+            emit_unity_embed_text_drop(app_handle, text, entries, title, source)
         }
         other => Err(format!("Unknown Unity embed control message: {other}")),
     }
@@ -948,18 +1022,18 @@ mod windows_impl {
         Graphics::Gdi::ScreenToClient,
         System::Threading::{AttachThreadInput, GetCurrentThreadId},
         UI::{
-            Input::KeyboardAndMouse::{SetActiveWindow, SetFocus as SetKeyboardFocus},
+            Input::KeyboardAndMouse::{GetFocus, SetActiveWindow, SetFocus as SetKeyboardFocus},
             Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
             WindowsAndMessaging::{
-                BringWindowToTop, GetForegroundWindow, GetParent, GetTopWindow, GetWindow,
-                GetWindowLongPtrW, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId,
-                IsIconic, IsWindow, IsWindowVisible, SetForegroundWindow, SetParent,
-                SetWindowLongPtrW, SetWindowPos, ShowWindow, GWLP_HWNDPARENT, GWL_EXSTYLE,
-                GWL_STYLE, GW_CHILD, GW_HWNDNEXT, HWND_TOP, MA_NOACTIVATE, SWP_FRAMECHANGED,
-                SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SW_HIDE,
-                SW_SHOWNOACTIVATE, WM_MOUSEACTIVATE, WM_NCDESTROY, WS_CAPTION, WS_CHILD,
-                WS_EX_NOACTIVATE, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU,
-                WS_THICKFRAME,
+                BringWindowToTop, GetAncestor, GetForegroundWindow, GetGUIThreadInfo, GetParent,
+                GetTopWindow, GetWindow, GetWindowLongPtrW, GetWindowRect, GetWindowTextW,
+                GetWindowThreadProcessId, IsChild, IsIconic, IsWindow, IsWindowVisible,
+                SetForegroundWindow, SetParent, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+                GUITHREADINFO, GA_ROOT, GWLP_HWNDPARENT, GWL_EXSTYLE, GWL_STYLE, GW_CHILD,
+                GW_HWNDNEXT, HWND_TOP, MA_NOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE,
+                SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SW_HIDE, SW_SHOWNOACTIVATE,
+                WM_MOUSEACTIVATE, WM_NCDESTROY, WS_CAPTION, WS_CHILD, WS_EX_NOACTIVATE,
+                WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_THICKFRAME,
             },
         },
     };
@@ -1425,6 +1499,124 @@ mod windows_impl {
         });
     }
 
+    unsafe fn overlay_input_focus_state(
+        overlay: Option<HWND>,
+        foreground: HWND,
+        parent: HWND,
+    ) -> (bool, HWND) {
+        let Some(overlay) = overlay else {
+            return (false, HWND(std::ptr::null_mut()));
+        };
+        if !is_valid_window(overlay) || !IsWindowVisible(overlay).as_bool() {
+            return (false, HWND(std::ptr::null_mut()));
+        }
+        if !foreground_allows_embed_focus(overlay, foreground, parent) {
+            return (false, HWND(std::ptr::null_mut()));
+        }
+
+        let mut focus_scope = Vec::new();
+        push_unique_window(&mut focus_scope, foreground);
+        push_unique_window(&mut focus_scope, overlay);
+        push_unique_window(&mut focus_scope, parent);
+        collect_descendant_windows(overlay, &mut focus_scope);
+
+        let current_thread = GetCurrentThreadId();
+        let attached_threads = attach_input_threads(current_thread, &focus_scope);
+        let input_focus = GetFocus();
+        detach_input_threads(current_thread, attached_threads);
+        if is_valid_window(input_focus) {
+            return (is_embed_window_or_descendant(overlay, input_focus), input_focus);
+        }
+
+        for thread_id in window_thread_ids(&focus_scope) {
+            if let Some((inside_overlay, candidate)) =
+                gui_thread_focus_candidate(thread_id, overlay)
+            {
+                return (inside_overlay, candidate);
+            }
+        }
+
+        if is_embed_window_or_descendant(overlay, foreground) {
+            return (true, foreground);
+        }
+
+        (false, HWND(std::ptr::null_mut()))
+    }
+
+    unsafe fn foreground_allows_embed_focus(overlay: HWND, foreground: HWND, parent: HWND) -> bool {
+        if !is_valid_window(foreground) {
+            return false;
+        }
+        if is_embed_window_or_descendant(overlay, foreground) {
+            return true;
+        }
+        if is_valid_window(parent) && foreground == parent {
+            return true;
+        }
+
+        let root = GetAncestor(overlay, GA_ROOT);
+        is_valid_window(root) && root == foreground
+    }
+
+    unsafe fn gui_thread_focus_candidate(thread_id: u32, overlay: HWND) -> Option<(bool, HWND)> {
+        let mut info = GUITHREADINFO {
+            cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+            ..GUITHREADINFO::default()
+        };
+        if GetGUIThreadInfo(thread_id, &mut info).is_err() {
+            return None;
+        }
+
+        let candidates = [
+            info.hwndFocus,
+            info.hwndActive,
+            info.hwndCapture,
+            info.hwndCaret,
+        ];
+        let mut first_valid = HWND(std::ptr::null_mut());
+        for candidate in candidates {
+            if !is_valid_window(candidate) {
+                continue;
+            }
+            if first_valid.0.is_null() {
+                first_valid = candidate;
+            }
+            if is_embed_window_or_descendant(overlay, candidate) {
+                return Some((true, candidate));
+            }
+        }
+
+        if first_valid.0.is_null() {
+            None
+        } else {
+            Some((false, first_valid))
+        }
+    }
+
+    unsafe fn window_thread_ids(hwnds: &[HWND]) -> Vec<u32> {
+        let mut thread_ids = Vec::new();
+        for hwnd in hwnds {
+            if !is_valid_window(*hwnd) {
+                continue;
+            }
+            let thread_id = GetWindowThreadProcessId(*hwnd, None);
+            if thread_id != 0 && !thread_ids.contains(&thread_id) {
+                thread_ids.push(thread_id);
+            }
+        }
+        thread_ids
+    }
+
+    unsafe fn is_embed_window_or_descendant(overlay: HWND, hwnd: HWND) -> bool {
+        is_valid_window(hwnd) && (hwnd == overlay || IsChild(overlay, hwnd).as_bool())
+    }
+
+    unsafe fn push_unique_window(hwnds: &mut Vec<HWND>, hwnd: HWND) {
+        if is_valid_window(hwnd) && !hwnds.contains(&hwnd) {
+            hwnds.push(hwnd);
+        }
+    }
+
     pub(super) fn focus_debug_snapshot(
         window: Option<&tauri::WebviewWindow>,
     ) -> UnityEmbedFocusDebugSnapshot {
@@ -1461,6 +1653,9 @@ mod windows_impl {
         } else {
             false
         };
+        let (overlay_input_focused, input_focus) = unsafe {
+            overlay_input_focus_state(overlay, foreground, parent)
+        };
         let (mouse_activation_suppressed, activation_guard_enabled) = mouse_activation_state()
             .lock()
             .map(|state| (state.suppressed, state.guard_enabled))
@@ -1484,12 +1679,15 @@ mod windows_impl {
             },
             foreground_hwnd,
             foreground_title: unsafe { hwnd_title(foreground) },
+            input_focus_hwnd: input_focus.0 as isize as i64,
+            input_focus_title: unsafe { hwnd_title(input_focus) },
             overlay_hwnd,
             overlay_title: overlay
                 .map(|hwnd| unsafe { hwnd_title(hwnd) })
                 .unwrap_or_default(),
             overlay_visible,
             overlay_foreground: overlay_hwnd != 0 && overlay_hwnd == foreground_hwnd,
+            overlay_input_focused,
             overlay_child_window,
             overlay_parent_hwnd,
             overlay_no_activate,

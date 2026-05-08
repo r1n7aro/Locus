@@ -83,6 +83,20 @@ export interface UnityEmbedAssetDropPayload {
   refs: AssetRefAttachment[];
 }
 
+export interface UnityEmbedTextDropEntry {
+  text: string;
+  title?: string;
+  source?: string;
+  level?: string;
+}
+
+export interface UnityEmbedTextDropPayload {
+  text: string;
+  entries?: UnityEmbedTextDropEntry[];
+  title?: string;
+  source?: string;
+}
+
 export interface UnityEmbedAssetDragStatePayload {
   hasRefs: boolean;
   refs: AssetRefAttachment[];
@@ -94,6 +108,14 @@ export function subscribeUnityEmbedAssetDrop(
   const runtime = getLocusRuntime();
   if (runtime.kind !== "tauri") return Promise.resolve(() => {});
   return runtime.subscribe<UnityEmbedAssetDropPayload>("unity-embed-asset-drop", handler);
+}
+
+export function subscribeUnityEmbedTextDrop(
+  handler: (payload: UnityEmbedTextDropPayload) => void,
+): Promise<() => void> {
+  const runtime = getLocusRuntime();
+  if (runtime.kind !== "tauri") return Promise.resolve(() => {});
+  return runtime.subscribe<UnityEmbedTextDropPayload>("unity-embed-text-drop", handler);
 }
 
 export function subscribeUnityEmbedAssetDragState(
@@ -109,10 +131,13 @@ export interface UnityEmbedFocusDebugSnapshot {
   reason: string;
   foregroundHwnd: number;
   foregroundTitle: string;
+  inputFocusHwnd?: number;
+  inputFocusTitle?: string;
   overlayHwnd: number;
   overlayTitle: string;
   overlayVisible: boolean;
   overlayForeground: boolean;
+  overlayInputFocused?: boolean;
   overlayChildWindow: boolean;
   overlayParentHwnd: number;
   overlayNoActivate: boolean;

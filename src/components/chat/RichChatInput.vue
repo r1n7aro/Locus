@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, useSlots, watch } from "vue";
 import type { ComponentPublicInstance } from "vue";
+import { FileText, Layers, X } from "lucide";
 import { t } from "../../i18n";
 import { searchWorkspaceAssets } from "../../services/asset";
 import { knowledgeQuery } from "../../services/knowledge";
@@ -40,8 +41,13 @@ import {
   shouldSubmitOnEnter,
   useChatInputSettings,
 } from "../../composables/useChatInputSettings";
-import { subscribeUnityEmbedAssetDrop } from "../../services/unity";
+import {
+  subscribeUnityEmbedAssetDrop,
+  subscribeUnityEmbedTextDrop,
+  type UnityEmbedTextDropEntry,
+} from "../../services/unity";
 import AssetChip from "../AssetChip.vue";
+import LucideIcon from "../icons/LucideIcon.vue";
 import MentionPopup from "./MentionPopup.vue";
 import ChatComposer from "./ChatComposer.vue";
 import ChatInputShell from "./ChatInputShell.vue";
@@ -68,6 +74,7 @@ interface MentionDisplayEntry {
 }
 
 const PASTE_THRESHOLD = 500;
+const ASSET_REF_COLLAPSE_THRESHOLD = 5;
 const ASSET_REF_SYNC_CHANNEL = "locus-chat-asset-ref-drafts";
 const ASSET_REF_SYNC_STORAGE_KEY = "locus:chatAssetRefDraftSync";
 const UNITY_ASSET_REF_ROOT_RE = /^(?:Assets|Packages|ProjectSettings)(?:\/|$)/i;
@@ -80,6 +87,22 @@ interface AssetRefSyncMessage {
   syncKey: string;
   refs: AssetRefAttachment[];
   seq: number;
+}
+
+interface ConsoleTextAttachment {
+  id: string;
+  title: string;
+  source: string;
+  level: string;
+  text: string;
+  createdAt: number;
+}
+
+interface ConsoleTextInput {
+  text?: string | null;
+  title?: string | null;
+  source?: string | null;
+  level?: string | null;
 }
 
 const props = withDefaults(defineProps<{
@@ -139,6 +162,9 @@ const pastedContent = ref("");
 const showPasteEditor = ref(false);
 const imageAttachments = ref<ImageAttachment[]>([]);
 const assetRefAttachments = ref<AssetRefAttachment[]>([]);
+const showAssetRefDetails = ref(false);
+const consoleTextAttachments = ref<ConsoleTextAttachment[]>([]);
+const showConsoleTextDetails = ref(false);
 const previewImageIndex = ref<number | null>(null);
 const composerIntent = ref<ComposerIntentState>(emptyComposerIntent());
 const activeOperator = ref<ActiveOperator | null>(null);
@@ -147,6 +173,10 @@ const showCommandPopup = ref(false);
 const commandHighlightIndex = ref(0);
 const commandPopupRef = ref<HTMLElement | null>(null);
 const commandItemRefs = ref<HTMLElement[]>([]);
+const assetRefGroupRootRef = ref<HTMLElement | null>(null);
+const assetRefDetailsRootRef = ref<HTMLElement | null>(null);
+const consoleTextGroupRootRef = ref<HTMLElement | null>(null);
+const consoleTextDetailsRootRef = ref<HTMLElement | null>(null);
 const showMentionPopup = ref(false);
 const mentionHighlightIndex = ref(0);
 const mentionMode = ref<"search" | "browse">("search");
@@ -164,14 +194,18 @@ let mentionRequestSeq = 0;
 let lastSearchQuery = "";
 let pendingMentionCursor: number | null = null;
 let releaseUnityAssetDrop: (() => void) | null = null;
+let releaseUnityTextDrop: (() => void) | null = null;
 let unityAssetDropSubscriptionDisposed = false;
+let unityTextDropSubscriptionDisposed = false;
 let assetRefSyncChannel: BroadcastChannel | null = null;
 let assetRefSyncSeq = 0;
 let lastAssetRefSyncKey = "";
 const assetRefSyncSourceId = `rich-chat-input-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 
 const hasTopAttachments = computed(() =>
-  imageAttachments.value.length > 0 || assetRefAttachments.value.length > 0,
+  imageAttachments.value.length > 0
+  || assetRefAttachments.value.length > 0
+  || consoleTextAttachments.value.length > 0,
 );
 
 const canSend = computed(() =>
@@ -179,7 +213,8 @@ const canSend = computed(() =>
   || !!props.modelValue.trim()
   || !!pastedContent.value
   || imageAttachments.value.length > 0
-  || assetRefAttachments.value.length > 0,
+  || assetRefAttachments.value.length > 0
+  || consoleTextAttachments.value.length > 0,
 );
 const hasHeaderStart = computed(() =>
   !!slots["header-start"]
@@ -222,6 +257,15 @@ const previewImage = computed(() => {
 });
 const previewImageSrc = computed(() =>
   previewImage.value ? imagePreviewUrl(previewImage.value) : "",
+);
+const shouldCollapseAssetRefs = computed(() =>
+  assetRefAttachments.value.length > ASSET_REF_COLLAPSE_THRESHOLD,
+);
+const collapsedAssetRefPreview = computed(() =>
+  assetRefAttachments.value.slice(0, 3).map(assetRefDisplayName).join(", "),
+);
+const consoleTextTotalChars = computed(() =>
+  consoleTextAttachments.value.reduce((total, item) => total + item.text.length, 0),
 );
 
 const mentionBreadcrumbs = computed(() => {
@@ -896,6 +940,18 @@ function cloneAssetRefs(assetRefs: AssetRefAttachment[]) {
   return assetRefs.map((assetRef) => ({ ...assetRef }));
 }
 
+function assetRefDisplayName(assetRef: AssetRefAttachment) {
+  const path = normalizeUnityAssetRefPath(assetRef.path);
+  if (assetRef.name?.trim()) return assetRef.name.trim();
+
+  const sceneObjectMatch = path.match(/^((?:Assets|Packages)\/.+?\.unity)\/(.+)$/i);
+  const displayPath = sceneObjectMatch ? sceneObjectMatch[2] : path;
+  const parts = displayPath.split("/").filter(Boolean);
+  const fileName = parts[parts.length - 1] || displayPath || path;
+  const dotIdx = fileName.lastIndexOf(".");
+  return dotIdx > 0 ? fileName.substring(0, dotIdx) : fileName;
+}
+
 function currentAssetRefSyncKey() {
   return props.assetRefSyncKey.trim();
 }
@@ -991,6 +1047,144 @@ function removeAssetRef(index: number) {
   const next = [...assetRefAttachments.value];
   next.splice(index, 1);
   setAssetRefAttachments(next);
+  if (next.length <= ASSET_REF_COLLAPSE_THRESHOLD) {
+    closeAssetRefDetails();
+  }
+}
+
+function clearAssetRefs() {
+  setAssetRefAttachments([]);
+  closeAssetRefDetails();
+}
+
+function toggleAssetRefDetails() {
+  if (!shouldCollapseAssetRefs.value) return;
+  showCommandPopup.value = false;
+  closeMentionPopup();
+  closeConsoleTextDetails();
+  showAssetRefDetails.value = !showAssetRefDetails.value;
+}
+
+function closeAssetRefDetails() {
+  showAssetRefDetails.value = false;
+}
+
+function consoleTextTitle(item: Pick<ConsoleTextAttachment, "title">) {
+  const title = item.title.trim();
+  return title || t("chat.consoleRefs.defaultTitle");
+}
+
+function consoleTextSource(item: Pick<ConsoleTextAttachment, "source">) {
+  return item.source.trim();
+}
+
+function consoleTextLevelClass(level: string) {
+  const normalized = level.trim().toLowerCase();
+  if (normalized.includes("warning")) return "level-warning";
+  if (
+    normalized.includes("error")
+    || normalized.includes("assert")
+    || normalized.includes("exception")
+    || normalized.includes("fatal")
+  ) {
+    return "level-error";
+  }
+  return "level-log";
+}
+
+function normalizeConsoleTextAttachment(
+  item: ConsoleTextInput,
+  fallback: { title?: string | null; source?: string | null } = {},
+): ConsoleTextAttachment | null {
+  const text = (item.text ?? "").trim();
+  if (!text) return null;
+  return {
+    id: `console-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`,
+    title: item.title?.trim() || fallback.title?.trim() || t("chat.consoleRefs.defaultTitle"),
+    source: item.source?.trim() || fallback.source?.trim() || "unity-console",
+    level: item.level?.trim() || "Log",
+    text,
+    createdAt: Date.now(),
+  };
+}
+
+function addConsoleTextAttachment(payload: {
+  text?: string | null;
+  entries?: UnityEmbedTextDropEntry[] | null;
+  title?: string | null;
+  source?: string | null;
+}) {
+  const entries = Array.isArray(payload.entries) ? payload.entries : [];
+  const next = entries.length > 0
+    ? entries
+      .map((entry) => normalizeConsoleTextAttachment(entry, payload))
+      .filter((entry): entry is ConsoleTextAttachment => !!entry)
+    : [normalizeConsoleTextAttachment(payload, payload)].filter((entry): entry is ConsoleTextAttachment => !!entry);
+
+  if (next.length === 0) return;
+  consoleTextAttachments.value.push(...next);
+  nextTick(() => composerRef.value?.focus());
+}
+
+function removeConsoleTextAttachment(index: number) {
+  const next = [...consoleTextAttachments.value];
+  next.splice(index, 1);
+  consoleTextAttachments.value = next;
+  if (next.length === 0) {
+    closeConsoleTextDetails();
+  }
+}
+
+function clearConsoleTextAttachments() {
+  consoleTextAttachments.value = [];
+  closeConsoleTextDetails();
+}
+
+function toggleConsoleTextDetails() {
+  if (consoleTextAttachments.value.length === 0) return;
+  showCommandPopup.value = false;
+  closeMentionPopup();
+  closeAssetRefDetails();
+  showConsoleTextDetails.value = !showConsoleTextDetails.value;
+}
+
+function closeConsoleTextDetails() {
+  showConsoleTextDetails.value = false;
+}
+
+function buildConsoleTextPromptBlock(items: ConsoleTextAttachment[]) {
+  if (items.length === 0) return "";
+  const entries = items.map((item, index) => {
+    const source = consoleTextSource(item);
+    const lines = [
+      `## Entry ${index + 1}: ${consoleTextTitle(item)}`,
+      source ? `Source: ${source}` : "",
+      `Chars: ${item.text.length}`,
+      "",
+      item.text,
+    ].filter((line) => line !== "");
+    return lines.join("\n");
+  });
+  return `<locus-console>\nUse these Unity Console entries as diagnostic context.\n\n${entries.join("\n\n---\n\n")}\n</locus-console>`;
+}
+
+function appendConsoleTextPromptBlock(text: string, items: ConsoleTextAttachment[]) {
+  const block = buildConsoleTextPromptBlock(items);
+  if (!block) return text;
+  return text.trim() ? `${text}\n\n${block}` : block;
+}
+
+function buildConsoleTextDisplayBlock(items: ConsoleTextAttachment[]) {
+  if (items.length === 0) return "";
+  return items
+    .map((item) => t("chat.consoleRefs.displayLine", consoleTextTitle(item), item.text.length))
+    .join("\n");
+}
+
+function appendConsoleTextDisplayBlock(text: string, items: ConsoleTextAttachment[]) {
+  const block = buildConsoleTextDisplayBlock(items);
+  if (!block) return text;
+  return text.trim() ? `${text}\n\n${block}` : block;
 }
 
 function buildAssetRefsPromptBlock(assetRefs: AssetRefAttachment[]) {
@@ -1015,6 +1209,7 @@ function resetDraft() {
   setInputValue("");
   pastedContent.value = "";
   imageAttachments.value = [];
+  clearConsoleTextAttachments();
   setAssetRefAttachments([]);
   closeImagePreview();
   composerIntent.value = emptyComposerIntent();
@@ -1062,6 +1257,7 @@ function canExecuteActionCommand(): boolean {
   return !pastedContent.value
     && imageAttachments.value.length === 0
     && assetRefAttachments.value.length === 0
+    && consoleTextAttachments.value.length === 0
     && !hasComposerIntent(composerIntent.value);
 }
 
@@ -1113,8 +1309,15 @@ function handleSend() {
     ? imageAttachments.value.map(({ data, mimeType }) => ({ data, mimeType }))
     : [];
   const assetRefs = dedupeAssetRefs([...assetRefAttachments.value, ...inlineAssetRefs.assetRefs]);
+  const consoleTexts = [...consoleTextAttachments.value];
 
-  if (!cleanedInput && !pastedContent.value && images.length === 0 && assetRefs.length === 0) {
+  if (
+    !cleanedInput
+    && !pastedContent.value
+    && images.length === 0
+    && assetRefs.length === 0
+    && consoleTexts.length === 0
+  ) {
     if (hasComposerIntent(mergedIntent)) {
       showUserIntentMissingInputNotice();
     }
@@ -1125,8 +1328,10 @@ function handleSend() {
     ? (cleanedInput ? `${cleanedInput}\n\n${pastedContent.value}` : pastedContent.value)
     : cleanedInput;
 
-  const sendText = appendAssetRefsPromptBlock(text, assetRefs);
-  const payload = buildSendPayload(sendText, images, assetRefs, mergedIntent, text);
+  const textWithConsole = appendConsoleTextPromptBlock(text, consoleTexts);
+  const sendText = appendAssetRefsPromptBlock(textWithConsole, assetRefs);
+  const displayText = appendConsoleTextDisplayBlock(text, consoleTexts);
+  const payload = buildSendPayload(sendText, images, assetRefs, mergedIntent, displayText);
   resetDraft();
   emit("send", payload);
 }
@@ -1300,6 +1505,24 @@ function handleDocumentKeydown(event: KeyboardEvent) {
   if (event.key === "Escape" && previewImageIndex.value != null) {
     closeImagePreview();
   }
+  if (event.key === "Escape" && showAssetRefDetails.value) {
+    closeAssetRefDetails();
+  }
+  if (event.key === "Escape" && showConsoleTextDetails.value) {
+    closeConsoleTextDetails();
+  }
+}
+
+function handleDocumentMouseDown(event: MouseEvent) {
+  if (!showAssetRefDetails.value && !showConsoleTextDetails.value) return;
+  const target = event.target instanceof Node ? event.target : null;
+  if (!target) return;
+  if (assetRefGroupRootRef.value?.contains(target)) return;
+  if (assetRefDetailsRootRef.value?.contains(target)) return;
+  if (consoleTextGroupRootRef.value?.contains(target)) return;
+  if (consoleTextDetailsRootRef.value?.contains(target)) return;
+  closeAssetRefDetails();
+  closeConsoleTextDetails();
 }
 
 function openPasteEditor() {
@@ -1382,10 +1605,16 @@ watch(
   { immediate: true },
 );
 
+watch(shouldCollapseAssetRefs, (collapsed) => {
+  if (!collapsed) closeAssetRefDetails();
+});
+
 onMounted(() => {
   unityAssetDropSubscriptionDisposed = false;
+  unityTextDropSubscriptionDisposed = false;
   setupAssetRefSync();
   document.addEventListener("keydown", handleDocumentKeydown);
+  document.addEventListener("mousedown", handleDocumentMouseDown);
   subscribeUnityEmbedAssetDrop((payload) => {
     addAssetRefs(payload.refs ?? []);
   })
@@ -1399,14 +1628,31 @@ onMounted(() => {
     .catch((error) => {
       console.warn("[Locus] Unity asset drop subscription failed:", error);
     });
+  subscribeUnityEmbedTextDrop((payload) => {
+    addConsoleTextAttachment(payload);
+  })
+    .then((release) => {
+      if (unityTextDropSubscriptionDisposed) {
+        release();
+        return;
+      }
+      releaseUnityTextDrop = release;
+    })
+    .catch((error) => {
+      console.warn("[Locus] Unity text drop subscription failed:", error);
+    });
 });
 
 onUnmounted(() => {
   unityAssetDropSubscriptionDisposed = true;
+  unityTextDropSubscriptionDisposed = true;
   document.removeEventListener("keydown", handleDocumentKeydown);
+  document.removeEventListener("mousedown", handleDocumentMouseDown);
   teardownAssetRefSync();
   releaseUnityAssetDrop?.();
   releaseUnityAssetDrop = null;
+  releaseUnityTextDrop?.();
+  releaseUnityTextDrop = null;
   clearMentionDebounce();
   invalidateMentionRequests();
 });
@@ -1454,6 +1700,87 @@ defineExpose({
                 <span class="command-kind-badge">{{ commandTypeLabel(command) }}</span>
               </div>
               <span class="command-desc">{{ command.description }}</span>
+            </div>
+          </div>
+        </div>
+      </Transition>
+
+      <Transition name="asset-ref-details-popover">
+        <div
+          v-if="showAssetRefDetails && shouldCollapseAssetRefs"
+          ref="assetRefDetailsRootRef"
+          class="asset-ref-details-popover"
+          role="dialog"
+          :aria-label="t('chat.assetRefs.detailsTitle', assetRefAttachments.length)"
+        >
+          <div class="asset-ref-details-header">
+            <span class="asset-ref-details-title">{{ t("chat.assetRefs.detailsTitle", assetRefAttachments.length) }}</span>
+            <button
+              type="button"
+              class="asset-ref-details-close ui-select-none"
+              :aria-label="t('common.close')"
+              @click="closeAssetRefDetails"
+            >
+              <LucideIcon :icon="X" :size="14" />
+            </button>
+          </div>
+          <div class="asset-ref-details-list">
+            <div
+              v-for="(assetRef, index) in assetRefAttachments"
+              :key="`${assetRef.kind}:${assetRef.path}`"
+              class="asset-ref-detail-row"
+            >
+              <AssetChip
+                :path="assetRef.path"
+                :kind="assetRef.kind"
+                removable
+                @remove="removeAssetRef(index)"
+              />
+              <span class="asset-ref-detail-path">{{ assetRef.path }}</span>
+            </div>
+          </div>
+        </div>
+      </Transition>
+
+      <Transition name="asset-ref-details-popover">
+        <div
+          v-if="showConsoleTextDetails && consoleTextAttachments.length > 0"
+          ref="consoleTextDetailsRootRef"
+          class="console-text-details-popover"
+          role="dialog"
+          :aria-label="t('chat.consoleRefs.detailsTitle', consoleTextAttachments.length)"
+        >
+          <div class="asset-ref-details-header">
+            <span class="asset-ref-details-title">{{ t("chat.consoleRefs.detailsTitle", consoleTextAttachments.length) }}</span>
+            <button
+              type="button"
+              class="asset-ref-details-close ui-select-none"
+              :aria-label="t('common.close')"
+              @click="closeConsoleTextDetails"
+            >
+              <LucideIcon :icon="X" :size="14" />
+            </button>
+          </div>
+          <div class="console-text-details-list">
+            <div
+              v-for="(item, index) in consoleTextAttachments"
+              :key="item.id"
+              class="console-text-detail-item"
+              :class="consoleTextLevelClass(item.level)"
+            >
+              <div class="console-text-detail-header">
+                <span class="console-text-detail-title">{{ consoleTextTitle(item) }}</span>
+                <span class="console-text-detail-meta">{{ t("chat.consoleRefs.charCount", item.text.length) }}</span>
+                <button
+                  type="button"
+                  class="asset-ref-details-close console-text-detail-remove ui-select-none"
+                  :aria-label="t('chat.consoleRefs.remove')"
+                  @click="removeConsoleTextAttachment(index)"
+                >
+                  <LucideIcon :icon="X" :size="13" />
+                </button>
+              </div>
+              <pre class="console-text-detail-body">{{ item.text }}</pre>
             </div>
           </div>
         </div>
@@ -1522,14 +1849,70 @@ defineExpose({
     >
       <template #overlay>
         <div v-if="hasTopAttachments" class="composer-attachment-list">
-          <AssetChip
-            v-for="(assetRef, index) in assetRefAttachments"
-            :key="`${assetRef.kind}:${assetRef.path}`"
-            :path="assetRef.path"
-            :kind="assetRef.kind"
-            removable
-            @remove="removeAssetRef(index)"
-          />
+          <div
+            v-if="consoleTextAttachments.length > 0"
+            ref="consoleTextGroupRootRef"
+            class="console-text-group"
+          >
+            <button
+              type="button"
+              class="console-text-group-button ui-select-none"
+              :class="{ 'is-open': showConsoleTextDetails }"
+              :aria-expanded="showConsoleTextDetails"
+              :title="t('chat.consoleRefs.groupOpen')"
+              @click.stop="toggleConsoleTextDetails"
+            >
+              <LucideIcon class="asset-ref-group-icon" :icon="FileText" :size="14" />
+              <span class="asset-ref-group-title">{{ t("chat.consoleRefs.groupLabel", consoleTextAttachments.length) }}</span>
+              <span class="console-text-group-meta">{{ t("chat.consoleRefs.charCount", consoleTextTotalChars) }}</span>
+            </button>
+            <button
+              type="button"
+              class="asset-ref-group-remove ui-select-none"
+              :aria-label="t('chat.consoleRefs.clear')"
+              :title="t('chat.consoleRefs.clear')"
+              @click.stop="clearConsoleTextAttachments"
+            >
+              <LucideIcon :icon="X" :size="13" />
+            </button>
+          </div>
+          <div
+            v-if="shouldCollapseAssetRefs"
+            ref="assetRefGroupRootRef"
+            class="asset-ref-group"
+          >
+            <button
+              type="button"
+              class="asset-ref-group-button ui-select-none"
+              :class="{ 'is-open': showAssetRefDetails }"
+              :aria-expanded="showAssetRefDetails"
+              :title="t('chat.assetRefs.groupOpen')"
+              @click.stop="toggleAssetRefDetails"
+            >
+              <LucideIcon class="asset-ref-group-icon" :icon="Layers" :size="14" />
+              <span class="asset-ref-group-title">{{ t("chat.assetRefs.groupLabel", assetRefAttachments.length) }}</span>
+              <span v-if="collapsedAssetRefPreview" class="asset-ref-group-preview">{{ collapsedAssetRefPreview }}</span>
+            </button>
+            <button
+              type="button"
+              class="asset-ref-group-remove ui-select-none"
+              :aria-label="t('chat.assetRefs.clear')"
+              :title="t('chat.assetRefs.clear')"
+              @click.stop="clearAssetRefs"
+            >
+              <LucideIcon :icon="X" :size="13" />
+            </button>
+          </div>
+          <template v-else>
+            <AssetChip
+              v-for="(assetRef, index) in assetRefAttachments"
+              :key="`${assetRef.kind}:${assetRef.path}`"
+              :path="assetRef.path"
+              :kind="assetRef.kind"
+              removable
+              @remove="removeAssetRef(index)"
+            />
+          </template>
           <div
             v-for="(image, index) in imageAttachments"
             :key="`image:${index}`"
@@ -2000,6 +2383,322 @@ defineExpose({
 .composer-attachment-list :deep(.asset-chip-remove:hover) {
   background: color-mix(in srgb, var(--status-error-bg, var(--hover-bg)) 76%, transparent);
   color: var(--status-error-fg, var(--text-color));
+}
+
+.asset-ref-group {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: stretch;
+  height: 28px;
+  max-width: min(420px, calc(100vw - 96px));
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--border-color) 88%, transparent);
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--panel-bg) 70%, var(--input-bg) 30%);
+}
+
+.console-text-group {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: stretch;
+  height: 28px;
+  max-width: min(240px, calc(100vw - 96px));
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--border-color) 88%, transparent);
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--panel-bg) 70%, var(--input-bg) 30%);
+}
+
+.asset-ref-group-button {
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 100%;
+  padding: 0 8px;
+  border: none;
+  background: transparent;
+  color: var(--text-color);
+  cursor: pointer;
+}
+
+.console-text-group-button {
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 100%;
+  padding: 0 8px;
+  border: none;
+  background: transparent;
+  color: var(--text-color);
+  cursor: pointer;
+}
+
+.asset-ref-group-button:hover,
+.asset-ref-group-button.is-open,
+.console-text-group-button:hover,
+.console-text-group-button.is-open {
+  background: color-mix(in srgb, var(--hover-bg) 82%, var(--panel-bg) 18%);
+}
+
+.asset-ref-group-button:focus-visible,
+.console-text-group-button:focus-visible,
+.asset-ref-group-remove:focus-visible,
+.asset-ref-details-close:focus-visible {
+  outline: 1px solid var(--accent-color);
+  outline-offset: -1px;
+}
+
+.asset-ref-group-icon {
+  flex: 0 0 auto;
+  color: var(--text-secondary);
+}
+
+.asset-ref-group-title {
+  flex: 0 0 auto;
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.asset-ref-group-preview {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-family: var(--font-mono-identifier);
+  white-space: nowrap;
+}
+
+.console-text-group-meta {
+  flex: 0 0 auto;
+  color: var(--text-secondary);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.asset-ref-group-remove {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 100%;
+  padding: 0;
+  border: none;
+  border-left: 1px solid color-mix(in srgb, var(--border-color) 82%, transparent);
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.asset-ref-group-remove:hover {
+  color: var(--status-error-fg, var(--text-color));
+  background: color-mix(in srgb, var(--status-error-bg, var(--hover-bg)) 76%, transparent);
+}
+
+.asset-ref-details-popover {
+  position: absolute;
+  left: 0;
+  bottom: 100%;
+  z-index: 12;
+  display: flex;
+  flex-direction: column;
+  width: min(520px, calc(100vw - 32px));
+  max-height: min(360px, 60vh);
+  margin-bottom: 4px;
+  overflow: hidden;
+  border: 1px solid var(--border-color);
+  border-radius: 10px;
+  background: var(--surface-elevated, var(--panel-bg));
+  box-shadow: 0 -4px 16px rgba(0, 0, 0, 0.14);
+}
+
+.console-text-details-popover {
+  position: absolute;
+  left: 0;
+  bottom: 100%;
+  z-index: 12;
+  display: flex;
+  flex-direction: column;
+  width: min(640px, calc(100vw - 32px));
+  max-height: min(420px, 64vh);
+  margin-bottom: 4px;
+  overflow: hidden;
+  border: 1px solid var(--border-color);
+  border-radius: 10px;
+  background: var(--surface-elevated, var(--panel-bg));
+  box-shadow: 0 -4px 16px rgba(0, 0, 0, 0.14);
+}
+
+.asset-ref-details-header {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 34px;
+  padding: 6px 8px 6px 10px;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.asset-ref-details-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text-color);
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.asset-ref-details-close {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.asset-ref-details-close:hover {
+  border-color: color-mix(in srgb, var(--border-color) 82%, transparent);
+  background: var(--hover-bg);
+  color: var(--text-color);
+}
+
+.asset-ref-details-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  padding: 4px;
+}
+
+.console-text-details-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  padding: 4px;
+}
+
+.console-text-detail-item {
+  border-radius: 7px;
+  overflow: hidden;
+}
+
+.console-text-detail-item + .console-text-detail-item {
+  margin-top: 6px;
+  border-top: 1px solid var(--border-color);
+  padding-top: 6px;
+}
+
+.console-text-detail-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 28px;
+  padding: 2px 4px 4px 6px;
+}
+
+.console-text-detail-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text-color);
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.console-text-detail-item.level-error .console-text-detail-title {
+  color: var(--status-error-fg, var(--text-color));
+}
+
+.console-text-detail-item.level-warning .console-text-detail-title {
+  color: var(--status-warn-fg, var(--text-color));
+}
+
+.console-text-detail-item.level-log .console-text-detail-title {
+  color: var(--text-color);
+}
+
+.console-text-detail-meta {
+  flex: 0 0 auto;
+  margin-left: auto;
+  color: var(--text-secondary);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.console-text-detail-remove {
+  width: 22px;
+  height: 22px;
+}
+
+.console-text-detail-body {
+  max-height: 240px;
+  margin: 0;
+  overflow: auto;
+  padding: 8px 10px;
+  border: 1px solid color-mix(in srgb, var(--border-color) 78%, transparent);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--input-bg) 82%, var(--panel-bg) 18%);
+  color: var(--text-color);
+  font-family: var(--font-mono-editor);
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.asset-ref-detail-row {
+  display: grid;
+  grid-template-columns: minmax(120px, max-content) minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 4px 6px;
+  border-radius: 7px;
+}
+
+.asset-ref-detail-row:hover {
+  background: color-mix(in srgb, var(--hover-bg) 82%, transparent);
+}
+
+.asset-ref-detail-row :deep(.asset-chip) {
+  max-width: 220px;
+}
+
+.asset-ref-detail-path {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-family: var(--font-mono-identifier);
+  white-space: nowrap;
+}
+
+.asset-ref-details-popover-enter-active {
+  transition: opacity 0.15s ease-out, transform 0.15s ease-out;
+}
+
+.asset-ref-details-popover-leave-active {
+  transition: opacity 0.1s ease-in, transform 0.1s ease-in;
+}
+
+.asset-ref-details-popover-enter-from,
+.asset-ref-details-popover-leave-to {
+  opacity: 0;
+  transform: translateY(6px);
 }
 
 .image-attachment-item {

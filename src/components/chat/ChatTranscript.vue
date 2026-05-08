@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { computed, nextTick, onUnmounted, ref, useSlots, watch } from "vue";
+import { FileText } from "lucide";
 import type { AssetRefAttachment, AssistantRenderPart, ChatMessage, ToolCallDisplay, ToolCallInfo, UserIntentMeta } from "../../types";
+import { t } from "../../i18n";
 import {
   collectPendingContinuationToolItemIds,
   shouldShowAssistantContinuation,
@@ -28,13 +30,18 @@ import {
 } from "../../composables/assistantRenderParts";
 import { useDisplaySettings } from "../../composables/useDisplaySettings";
 import { parseChatAssetRefs } from "../../composables/chatAssetRefs";
-import { displayUserMessageContent } from "../../composables/chatUserMessageDisplay";
+import {
+  displayUserMessageContent,
+  userMessageConsoleEntries,
+  type UserConsoleEntryDisplay,
+} from "../../composables/chatUserMessageDisplay";
 import { logToolCollapseTrace, previewTraceText } from "../../services/toolCollapseTrace";
 import MarkdownRenderer from "../MarkdownRenderer.vue";
 import ToolCallCollection from "../ToolCallCollection.vue";
 import ToolCallBlock from "../ToolCallBlock.vue";
 import KnowledgeProposalCard from "./KnowledgeProposalCard.vue";
 import AssetChip from "../AssetChip.vue";
+import LucideIcon from "../icons/LucideIcon.vue";
 
 type TranscriptVariant = "session" | "embedded";
 type UserContentMode = "plain" | "asset";
@@ -196,6 +203,14 @@ function userMessageDisplaySegments(message: ChatMessage) {
 
 function messageAssetRefs(message: ChatMessage): AssetRefAttachment[] {
   return message.assetRefs ?? [];
+}
+
+function messageConsoleEntries(message: ChatMessage): UserConsoleEntryDisplay[] {
+  return userMessageConsoleEntries(message.content);
+}
+
+function consoleEntryClass(entry: UserConsoleEntryDisplay) {
+  return `level-${entry.level.toLowerCase()}`;
 }
 
 function isCompactHandoffMessage(msg: ChatMessage) {
@@ -451,6 +466,7 @@ function hasVisibleMessagePayload(message: ChatMessage) {
     || message.knowledgeProposal
     || message.images?.length
     || message.assetRefs?.length
+    || (message.role === "user" && messageConsoleEntries(message).length > 0)
     || (message.role === "user" && userMessageDisplayContent(message).trim())
   );
 }
@@ -1510,6 +1526,29 @@ function openImage(src: string) {
                   />
                 </div>
 
+                <div
+                  v-if="messageConsoleEntries(item.message).length > 0"
+                  class="chat-transcript-user-console"
+                >
+                  <div class="chat-transcript-user-console-header">
+                    <LucideIcon :icon="FileText" :size="14" />
+                    <span>{{ t("chat.consoleRefs.defaultTitle") }}</span>
+                    <span class="chat-transcript-user-console-count">{{ messageConsoleEntries(item.message).length }}</span>
+                  </div>
+                  <div class="chat-transcript-user-console-list">
+                    <div
+                      v-for="(entry, consoleIdx) in messageConsoleEntries(item.message)"
+                      :key="`${item.id}:console:${consoleIdx}`"
+                      class="chat-transcript-user-console-row"
+                      :class="consoleEntryClass(entry)"
+                    >
+                      <span class="chat-transcript-user-console-level">{{ entry.level }}</span>
+                      <span class="chat-transcript-user-console-title">{{ entry.title.replace(/^\[[^\]]+\]\s*/, "") }}</span>
+                      <span class="chat-transcript-user-console-chars">{{ t("chat.consoleRefs.charCount", entry.chars) }}</span>
+                    </div>
+                  </div>
+                </div>
+
                 <div v-if="userMessageDisplayContent(item.message)" class="chat-transcript-plain-text ui-select-text">
                   <template
                     v-for="(segment, segmentIdx) in userMessageDisplaySegments(item.message)"
@@ -2060,6 +2099,92 @@ function openImage(src: string) {
   border: 1px solid var(--border-color);
   object-fit: contain;
   cursor: pointer;
+}
+
+.chat-transcript-user-console {
+  width: min(520px, 100%);
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--border-color) 88%, transparent);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--panel-bg) 68%, var(--msg-user-bg) 32%);
+}
+
+.chat-transcript-message.is-session.user.user-align-right .chat-transcript-user-console {
+  align-self: flex-end;
+}
+
+.chat-transcript-user-console-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 28px;
+  padding: 5px 8px;
+  border-bottom: 1px solid color-mix(in srgb, var(--border-color) 78%, transparent);
+  color: var(--text-color);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.chat-transcript-user-console-header :deep(svg) {
+  color: var(--text-secondary);
+}
+
+.chat-transcript-user-console-count {
+  margin-left: auto;
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.chat-transcript-user-console-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 4px;
+}
+
+.chat-transcript-user-console-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  min-height: 26px;
+  padding: 4px 6px;
+  border-radius: 6px;
+  color: var(--text-color);
+  font-size: 12px;
+}
+
+.chat-transcript-user-console-row:hover {
+  background: color-mix(in srgb, var(--hover-bg) 76%, transparent);
+}
+
+.chat-transcript-user-console-level {
+  min-width: 46px;
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.chat-transcript-user-console-row.level-error .chat-transcript-user-console-level {
+  color: var(--status-error-fg, var(--text-color));
+}
+
+.chat-transcript-user-console-row.level-warning .chat-transcript-user-console-level {
+  color: var(--status-warn-fg, var(--text-color));
+}
+
+.chat-transcript-user-console-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-transcript-user-console-chars {
+  color: var(--text-secondary);
+  font-size: 11px;
+  white-space: nowrap;
 }
 
 .chat-transcript-thinking-header {

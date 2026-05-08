@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { displayUserMessageContent } from "../composables/chatUserMessageDisplay";
+import {
+  displayUserMessageContent,
+  userMessageConsoleEntries,
+} from "../composables/chatUserMessageDisplay";
 
 describe("displayUserMessageContent", () => {
   it("hides system reminder blocks around user text", () => {
@@ -24,6 +27,35 @@ describe("displayUserMessageContent", () => {
     expect(displayUserMessageContent(
       "检查这个预制体\n\n<unity-asset-refs>\n- asset: {@Assets/Prefabs/Player.prefab}\n- scene object: {@Assets/Scenes/Main.unity/Root/Player}\n</unity-asset-refs>",
     )).toBe("检查这个预制体");
+  });
+
+  it("hides structured Console blocks from user text", () => {
+    expect(displayUserMessageContent(
+      "分析原因\n\n<locus-console>\nUse these Unity Console entries as diagnostic context.\n\n## Entry 1: [Error] InvalidCastException\nSource: unity-console\nChars: 18\n\n[Error] InvalidCastException\n</locus-console>",
+    )).toBe("分析原因");
+  });
+
+  it("extracts structured Console entries for attachment display", () => {
+    const entries = userMessageConsoleEntries(
+      "<locus-console>\nUse these Unity Console entries as diagnostic context.\n\n## Entry 1: [Error] InvalidCastException\nSource: unity-console\nChars: 18\n\n[Error] InvalidCastException\n\n---\n\n## Entry 2: [Warning] Slow call\nSource: unity-console\nChars: 14\n\n[Warning] Slow call\n</locus-console>",
+    );
+
+    expect(entries).toEqual([
+      {
+        title: "[Error] InvalidCastException",
+        level: "Error",
+        source: "unity-console",
+        chars: 18,
+        text: "[Error] InvalidCastException",
+      },
+      {
+        title: "[Warning] Slow call",
+        level: "Warning",
+        source: "unity-console",
+        chars: 14,
+        text: "[Warning] Slow call",
+      },
+    ]);
   });
 
   it("keeps user-authored bracket prefixes", () => {
