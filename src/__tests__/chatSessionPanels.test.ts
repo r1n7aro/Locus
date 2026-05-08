@@ -441,6 +441,48 @@ describe("chat session panel state", () => {
     ]);
   });
 
+  it("shows file changes from the cancelled run after interruption", async () => {
+    const chatStore = useChatStore();
+    const changesStore = useChatChangesStore();
+
+    undoData.s1 = [
+      makeUndoEntry("s1", "src/old.ts", {
+        assistantMessageId: "msg-old",
+        runId: "run-old",
+        createdAt: 1,
+      }),
+    ];
+    latestCompletedRunIdData.s1 = "run-old";
+
+    await chatStore.selectSession("s1");
+    changesStore.closePanel();
+
+    undoData.s1 = [
+      ...undoData.s1,
+      makeUndoEntry("s1", "src/cancelled.ts", {
+        assistantMessageId: "msg-cancelled",
+        runId: "run-cancelled",
+        createdAt: 2,
+      }),
+    ];
+
+    chatStore.handleStreamEvent({
+      runId: "run-cancelled",
+      type: "cancelled",
+      sessionId: "s1",
+      messageId: "msg-cancelled",
+      fullText: "已中断",
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(changesStore.latestTurnRounds).toHaveLength(1);
+    expect(changesStore.latestTurnFiles.map((file) => file.path)).toEqual([
+      "src/cancelled.ts",
+    ]);
+    expect(changesStore.currentFileCount).toBe(1);
+    expect(changesStore.currentPanelVisible).toBe(true);
+  });
+
   it("keeps current mode pinned to the completed run even when the final sub-round has no undo entry", async () => {
     const chatStore = useChatStore();
     const changesStore = useChatChangesStore();

@@ -1088,6 +1088,11 @@ export const useChatStore = defineStore("chat", () => {
       void useChatChangesStore().refresh(event.sessionId, { allowAutoOpen: false });
     }
 
+    if (event.type === "cancelled") {
+      useChatChangesStore().setLatestCompletedRunId(event.sessionId, event.runId);
+      void useChatChangesStore().refresh(event.sessionId);
+    }
+
     if (event.sessionId !== activeSessionId.value) return true;
 
     const shouldUseIncrementalReducer =
