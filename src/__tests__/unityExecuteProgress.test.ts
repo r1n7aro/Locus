@@ -61,13 +61,23 @@ describe("unityExecuteProgress", () => {
   it("wires unity_execute progress through the bridge and tool block override", () => {
     const asyncExecuteSource = read("locus_unity/Editor/ExecuteCodeAsync/LocusBridge.ExecuteCodeAsync.cs");
     const agentSource = read("src-tauri/src/agent/instance/mod.rs");
+    const unityBridgeSource = read("src-tauri/src/unity_bridge/mod.rs");
+    const transportSource = read("src-tauri/src/unity_bridge/transport.rs");
     expect(read("src/components/tool-block-overrides/toolBlockOverrides.ts")).toContain("unity_execute");
     expect(read("src/components/tool-block-overrides/UnityExecuteToolBlock.vue")).toContain("parseUnityExecuteProgressOutput");
     expect(read("src/components/tool-block-overrides/UnityExecuteToolBlock.vue")).toContain("props.toolCall.progress");
     expect(read("src/components/tool-block-overrides/UnityExecuteToolBlock.vue")).toContain("const liveProgressHasValue = computed(() => typeof liveProgress.value?.progress === \"number\")");
-    expect(read("src-tauri/src/unity_bridge/mod.rs")).toContain("unity_execute_code_with_progress");
-    expect(read("src-tauri/src/unity_bridge/mod.rs")).toContain("cancel_execute_code");
-    expect(read("src-tauri/src/unity_bridge/mod.rs")).toContain("UNITY_EXECUTE_CANCELLED");
+    expect(unityBridgeSource).toContain("unity_execute_code_with_progress");
+    expect(unityBridgeSource).toContain("cancel_execute_code");
+    expect(unityBridgeSource).toContain("UNITY_EXECUTE_CANCELLED");
+    expect(unityBridgeSource).toContain("Waiting for Locus Unity operation lock");
+    expect(unityBridgeSource).toContain("Preparing Unity type index");
+    expect(unityBridgeSource).toContain("Sending execute_code to Unity");
+    expect(unityBridgeSource).toContain("Unity execute did not start within");
+    expect(unityBridgeSource).toContain("Unity execute progress was unavailable");
+    expect(unityBridgeSource).toContain("disconnect_with_reason(project_path");
+    expect(transportSource).toContain("disconnect_with_reason");
+    expect(transportSource).toContain("fail_all_pending(conn, reason)");
     expect(agentSource).toContain("execute_unity_execute");
     expect(agentSource).toContain("unity_execute_code_with_progress_cancellable");
     expect(agentSource).toContain("StreamEvent::ToolCallProgress");

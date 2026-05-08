@@ -54,6 +54,7 @@ mod windows_impl {
     static CONNECTIONS: OnceLock<Mutex<HashMap<String, Arc<UnityPipeConnection>>>> =
         OnceLock::new();
     static REQUEST_SEQ: AtomicU64 = AtomicU64::new(1);
+    const PIPE_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
     fn connections() -> &'static Mutex<HashMap<String, Arc<UnityPipeConnection>>> {
         CONNECTIONS.get_or_init(|| Mutex::new(HashMap::new()))
@@ -105,6 +106,23 @@ mod windows_impl {
         let mut pending = conn.pending.lock().await;
         for (_, tx) in pending.drain() {
             let _ = tx.send(Err(reason.clone()));
+        }
+    }
+
+    async fn close_connection(conn: &Arc<UnityPipeConnection>, reason: String) {
+        fail_all_pending(conn, reason).await;
+
+        match conn.writer.try_lock() {
+            Ok(mut writer) => {
+                let _ = writer.shutdown().await;
+            }
+            Err(_) => {
+                let conn = conn.clone();
+                tokio::spawn(async move {
+                    let mut writer = conn.writer.lock().await;
+                    let _ = writer.shutdown().await;
+                });
+            }
         }
     }
 
@@ -233,7 +251,7 @@ mod windows_impl {
             pending.insert(request_id.clone(), tx);
         }
 
-        let write_result = async {
+        let write_result = tokio::time::timeout(PIPE_WRITE_TIMEOUT, async {
             let mut writer = conn.writer.lock().await;
             writer
                 .write_all(json.as_bytes())
@@ -247,8 +265,9 @@ mod windows_impl {
                 .flush()
                 .await
                 .map_err(|e| format!("Pipe flush failed: {}", e))
-        }
-        .await;
+        })
+        .await
+        .unwrap_or_else(|_| Err("Unity pipe write timed out".to_string()));
 
         if let Err(err) = write_result {
             {
@@ -256,6 +275,7 @@ mod windows_impl {
                 pending.remove(&request_id);
             }
             remove_connection_if_same(&conn.pipe_name, &conn).await;
+            close_connection(&conn, err.clone()).await;
             return Err(err);
         }
 
@@ -312,12 +332,20 @@ mod windows_impl {
         send_message_with_timeout(project_path, msg_type, message, Duration::from_secs(35)).await
     }
 
-    pub async fn disconnect(project_path: &str) {
+    pub async fn disconnect_with_reason(project_path: &str, reason: &str) {
         let pipe_name = get_pipe_name(project_path);
-        let mut map = connections().lock().await;
-        if let Some(conn) = map.remove(&pipe_name) {
-            fail_all_pending(&conn, "disconnected for recompile".to_string()).await;
+        let conn = {
+            let mut map = connections().lock().await;
+            map.remove(&pipe_name)
+        };
+
+        if let Some(conn) = conn {
+            close_connection(&conn, reason.to_string()).await;
         }
+    }
+
+    pub async fn disconnect(project_path: &str) {
+        disconnect_with_reason(project_path, "disconnected for recompile").await;
     }
 }
 
@@ -384,5 +412,13 @@ pub async fn disconnect(project_path: &str) {
     windows_impl::disconnect(project_path).await;
 }
 
+#[cfg(target_os = "windows")]
+pub async fn disconnect_with_reason(project_path: &str, reason: &str) {
+    windows_impl::disconnect_with_reason(project_path, reason).await;
+}
+
 #[cfg(not(target_os = "windows"))]
 pub async fn disconnect(_project_path: &str) {}
+
+#[cfg(not(target_os = "windows"))]
+pub async fn disconnect_with_reason(_project_path: &str, _reason: &str) {}

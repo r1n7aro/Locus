@@ -38,6 +38,9 @@ pub struct PipeResponse {
 
 pub const UNITY_EXECUTE_PROGRESS_TAG: &str = "locus-unity-progress";
 pub const UNITY_EXECUTE_CANCELLED: &str = "__locus_unity_execute_cancelled__";
+const UNITY_EXECUTE_PROGRESS_POLL_MS: u64 = 250;
+const UNITY_EXECUTE_START_TIMEOUT_SECS: u64 = 30;
+const UNITY_EXECUTE_PROGRESS_LOST_TIMEOUT_SECS: u64 = 120;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -946,6 +949,21 @@ pub fn format_unity_execute_progress_delta(snapshot: &UnityExecuteProgressSnapsh
     )
 }
 
+fn rust_unity_execute_progress(
+    title: impl Into<String>,
+    info: impl Into<String>,
+    revision: u64,
+) -> UnityExecuteProgressSnapshot {
+    UnityExecuteProgressSnapshot {
+        active: true,
+        title: title.into(),
+        info: info.into(),
+        progress: 0.0,
+        revision,
+        source: "rust".to_string(),
+    }
+}
+
 async fn query_unity_execute_progress(project_path: &str) -> Option<UnityExecuteProgressSnapshot> {
     let resp = send_message_with_timeout(
         project_path,
@@ -1085,26 +1103,82 @@ pub async fn unity_execute_code_with_progress<F>(
 where
     F: FnMut(UnityExecuteProgressSnapshot) + Send,
 {
+    let mut rust_progress_revision = 1u64;
+    on_progress(rust_unity_execute_progress(
+        "Waiting for Locus Unity operation lock",
+        "",
+        rust_progress_revision,
+    ));
+    rust_progress_revision += 1;
+
     let op_lock = project_unity_op_lock(project_path).await;
     let _guard = op_lock.lock().await;
 
+    on_progress(rust_unity_execute_progress(
+        "Preparing Unity type index",
+        "",
+        rust_progress_revision,
+    ));
+    rust_progress_revision += 1;
+
     let prepared = prepare_unity_execute_code_for_send(project_path, code).await;
+
+    on_progress(rust_unity_execute_progress(
+        "Sending execute_code to Unity",
+        "",
+        rust_progress_revision,
+    ));
+
     let execute = send_message_without_timeout(project_path, "execute_code", &prepared.code);
     tokio::pin!(execute);
 
-    let mut progress_tick = tokio::time::interval(Duration::from_millis(250));
+    let mut progress_tick = tokio::time::interval(Duration::from_millis(
+        UNITY_EXECUTE_PROGRESS_POLL_MS,
+    ));
     progress_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_progress_revision = 0u64;
+    let mut saw_unity_progress = false;
+    let execute_started_at = std::time::Instant::now();
+    let mut progress_unavailable_since: Option<std::time::Instant> = None;
 
     let resp = loop {
         tokio::select! {
             result = &mut execute => break result?,
             _ = progress_tick.tick() => {
                 if let Some(snapshot) = query_unity_execute_progress(project_path).await {
+                    progress_unavailable_since = None;
+                    if snapshot.active {
+                        saw_unity_progress = true;
+                    }
                     if snapshot.revision != last_progress_revision {
                         last_progress_revision = snapshot.revision;
                         on_progress(snapshot);
                     }
+                } else if saw_unity_progress {
+                    let unavailable_since = progress_unavailable_since
+                        .get_or_insert_with(std::time::Instant::now);
+                    if unavailable_since.elapsed()
+                        > Duration::from_secs(UNITY_EXECUTE_PROGRESS_LOST_TIMEOUT_SECS)
+                    {
+                        let reason = format!(
+                            "Unity execute progress was unavailable for {}s; reconnecting Unity pipe",
+                            UNITY_EXECUTE_PROGRESS_LOST_TIMEOUT_SECS
+                        );
+                        transport::disconnect_with_reason(project_path, &reason).await;
+                        return Err(reason);
+                    }
+                }
+
+                if !saw_unity_progress
+                    && execute_started_at.elapsed()
+                        > Duration::from_secs(UNITY_EXECUTE_START_TIMEOUT_SECS)
+                {
+                    let reason = format!(
+                        "Unity execute did not start within {}s; reconnecting Unity pipe",
+                        UNITY_EXECUTE_START_TIMEOUT_SECS
+                    );
+                    transport::disconnect_with_reason(project_path, &reason).await;
+                    return Err(reason);
                 }
             }
         }
@@ -1133,23 +1207,49 @@ where
         return Err(UNITY_EXECUTE_CANCELLED.to_string());
     }
 
+    let mut rust_progress_revision = 1u64;
+    on_progress(rust_unity_execute_progress(
+        "Waiting for Locus Unity operation lock",
+        "",
+        rust_progress_revision,
+    ));
+    rust_progress_revision += 1;
+
     let op_lock = project_unity_op_lock(project_path).await;
     let _guard = tokio::select! {
         guard = op_lock.lock() => guard,
         _ = cancel_rx.changed() => return Err(UNITY_EXECUTE_CANCELLED.to_string()),
     };
 
+    on_progress(rust_unity_execute_progress(
+        "Preparing Unity type index",
+        "",
+        rust_progress_revision,
+    ));
+    rust_progress_revision += 1;
+
     let prepared = tokio::select! {
         prepared = prepare_unity_execute_code_for_send(project_path, code) => prepared,
         _ = cancel_rx.changed() => return Err(UNITY_EXECUTE_CANCELLED.to_string()),
     };
 
+    on_progress(rust_unity_execute_progress(
+        "Sending execute_code to Unity",
+        "",
+        rust_progress_revision,
+    ));
+
     let execute = send_message_without_timeout(project_path, "execute_code", &prepared.code);
     tokio::pin!(execute);
 
-    let mut progress_tick = tokio::time::interval(Duration::from_millis(250));
+    let mut progress_tick = tokio::time::interval(Duration::from_millis(
+        UNITY_EXECUTE_PROGRESS_POLL_MS,
+    ));
     progress_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_progress_revision = 0u64;
+    let mut saw_unity_progress = false;
+    let execute_started_at = std::time::Instant::now();
+    let mut progress_unavailable_since: Option<std::time::Instant> = None;
 
     let resp = loop {
         tokio::select! {
@@ -1176,6 +1276,10 @@ where
                         },
                         _ = &mut drain => {
                             eprintln!("[Locus] execute_code cancel drain timed out");
+                            transport::disconnect_with_reason(
+                                project_path,
+                                "execute_code cancel drain timed out",
+                            ).await;
                             break;
                         },
                         _ = progress_tick.tick() => {
@@ -1193,10 +1297,39 @@ where
             },
             _ = progress_tick.tick() => {
                 if let Some(snapshot) = query_unity_execute_progress(project_path).await {
+                    progress_unavailable_since = None;
+                    if snapshot.active {
+                        saw_unity_progress = true;
+                    }
                     if snapshot.revision != last_progress_revision {
                         last_progress_revision = snapshot.revision;
                         on_progress(snapshot);
                     }
+                } else if saw_unity_progress {
+                    let unavailable_since = progress_unavailable_since
+                        .get_or_insert_with(std::time::Instant::now);
+                    if unavailable_since.elapsed()
+                        > Duration::from_secs(UNITY_EXECUTE_PROGRESS_LOST_TIMEOUT_SECS)
+                    {
+                        let reason = format!(
+                            "Unity execute progress was unavailable for {}s; reconnecting Unity pipe",
+                            UNITY_EXECUTE_PROGRESS_LOST_TIMEOUT_SECS
+                        );
+                        transport::disconnect_with_reason(project_path, &reason).await;
+                        return Err(reason);
+                    }
+                }
+
+                if !saw_unity_progress
+                    && execute_started_at.elapsed()
+                        > Duration::from_secs(UNITY_EXECUTE_START_TIMEOUT_SECS)
+                {
+                    let reason = format!(
+                        "Unity execute did not start within {}s; reconnecting Unity pipe",
+                        UNITY_EXECUTE_START_TIMEOUT_SECS
+                    );
+                    transport::disconnect_with_reason(project_path, &reason).await;
+                    return Err(reason);
                 }
             }
         }
@@ -1213,18 +1346,7 @@ where
 }
 
 pub async fn unity_execute_code(project_path: &str, code: &str) -> Result<String, String> {
-    let op_lock = project_unity_op_lock(project_path).await;
-    let _guard = op_lock.lock().await;
-    let prepared = prepare_unity_execute_code_for_send(project_path, code).await;
-    let resp = send_message_without_timeout(project_path, "execute_code", &prepared.code).await?;
-    if resp.ok {
-        Ok(resp.message.unwrap_or_default())
-    } else {
-        Err(crate::unity_type_index::append_auto_using_notes(
-            resp.error.unwrap_or_else(|| "unknown error".to_string()),
-            &prepared,
-        ))
-    }
+    unity_execute_code_with_progress(project_path, code, |_| {}).await
 }
 
 /// Trigger a Unity recompile and wait until the new domain is ready.
@@ -1280,6 +1402,11 @@ pub async fn recompile_and_wait(project_path: &str) -> Result<String, String> {
                 Ok(resp) if resp.ok => {
                     eprintln!("[Locus] Unity reconnected after domain reload");
                     crate::unity_type_index::invalidate_cached_type_index(project_path).await;
+                    transport::disconnect_with_reason(
+                        project_path,
+                        "Unity reconnected after domain reload",
+                    )
+                    .await;
                     if let Err(error) = refresh_unity_type_index(project_path).await {
                         eprintln!(
                             "[Locus] Unity type index refresh after recompile skipped: {}",
@@ -1304,6 +1431,11 @@ pub async fn recompile_and_wait(project_path: &str) -> Result<String, String> {
                         "ok" => {
                             crate::unity_type_index::invalidate_cached_type_index(project_path)
                                 .await;
+                            transport::disconnect_with_reason(
+                                project_path,
+                                "Unity recompile completed",
+                            )
+                            .await;
                             if let Err(error) = refresh_unity_type_index(project_path).await {
                                 eprintln!(
                                     "[Locus] Unity type index refresh after recompile skipped: {}",

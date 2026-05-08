@@ -222,6 +222,8 @@ namespace Locus
 
         public static void Stop()
         {
+            CancelActiveExecuteCode("bridge stopped");
+
             var cts = _cts;
             var task = _serverTask;
 
@@ -697,6 +699,7 @@ namespace Locus
                     }
                 }
 
+                CancelActiveExecuteCode("pipe disconnected");
                 Debug.Log("[Locus] Pipe client disconnected: " + PipeName);
             }
         }
@@ -949,6 +952,7 @@ namespace Locus
                         return HandleCancelExecuteCode(reqId);
 
                     case "execute_code_progress":
+                        TouchActiveExecuteCodeClientHeartbeat();
                         return OkResponse(reqId, GetExecuteCodeProgressJson());
 
                     case "export_type_index":

@@ -21,6 +21,8 @@ namespace Locus
     {
         private const double AsyncExecutePumpRequestIntervalSeconds = 0.05;
         private const int AsyncExecuteInactivityPollMs = 250;
+        private const int ExecuteCodeLockWaitTimeoutMs = 30000;
+        private const int ExecuteClientHeartbeatTimeoutMs = 120000;
 
         private static readonly object _executeAsyncContinuationQueueLock = new object();
         private static readonly List<ExecuteCodeWaitState> _executeAsyncContinuationQueue =
@@ -101,12 +103,28 @@ namespace Locus
         {
             private readonly object _lock = new object();
             private AsyncSnippetExecution _execution;
+            private long _lastClientHeartbeatTimestamp;
+            private int _clientHeartbeatCount;
+            private volatile bool _disposed;
 
             public readonly CancellationTokenSource Cancellation = new CancellationTokenSource();
 
             public bool IsCancellationRequested
             {
-                get { return Cancellation.IsCancellationRequested; }
+                get
+                {
+                    if (_disposed)
+                        return true;
+
+                    try
+                    {
+                        return Cancellation.IsCancellationRequested;
+                    }
+                    catch (ObjectDisposedException)
+                    {
+                        return true;
+                    }
+                }
             }
 
             public void SetExecution(AsyncSnippetExecution execution)
@@ -125,6 +143,39 @@ namespace Locus
                     execution.Cancel();
             }
 
+            public void TouchClientHeartbeat()
+            {
+                if (_disposed)
+                    return;
+
+                Interlocked.Exchange(
+                    ref _lastClientHeartbeatTimestamp,
+                    System.Diagnostics.Stopwatch.GetTimestamp());
+                Interlocked.Increment(ref _clientHeartbeatCount);
+            }
+
+            public int ClientHeartbeatCount
+            {
+                get { return Interlocked.CompareExchange(ref _clientHeartbeatCount, 0, 0); }
+            }
+
+            public double ClientHeartbeatIdleSeconds
+            {
+                get
+                {
+                    long last = Interlocked.Read(ref _lastClientHeartbeatTimestamp);
+                    if (last <= 0)
+                        return 0;
+
+                    long now = System.Diagnostics.Stopwatch.GetTimestamp();
+                    long elapsed = now - last;
+                    if (elapsed <= 0)
+                        return 0;
+
+                    return elapsed / (double)System.Diagnostics.Stopwatch.Frequency;
+                }
+            }
+
             public void ClearExecution(AsyncSnippetExecution execution)
             {
                 lock (_lock)
@@ -139,7 +190,8 @@ namespace Locus
                 AsyncSnippetExecution execution;
                 try
                 {
-                    Cancellation.Cancel();
+                    if (!_disposed)
+                        Cancellation.Cancel();
                 }
                 catch
                 {
@@ -156,18 +208,53 @@ namespace Locus
 
             public void ThrowIfCancellationRequested()
             {
+                if (_disposed)
+                    throw new OperationCanceledException();
+
                 Cancellation.Token.ThrowIfCancellationRequested();
             }
 
             public void Dispose()
             {
                 Cancel();
+                _disposed = true;
                 Cancellation.Dispose();
             }
         }
 
         private static readonly object _executeCodeRequestStateLock = new object();
         private static ExecuteCodeRequestState _activeExecuteCodeRequest;
+
+        private static ExecuteCodeRequestState ActiveExecuteCodeRequest
+        {
+            get
+            {
+                lock (_executeCodeRequestStateLock)
+                {
+                    return _activeExecuteCodeRequest;
+                }
+            }
+        }
+
+        private static void TouchActiveExecuteCodeClientHeartbeat()
+        {
+            ExecuteCodeRequestState requestState = ActiveExecuteCodeRequest;
+            if (requestState != null)
+                requestState.TouchClientHeartbeat();
+        }
+
+        private static void CancelActiveExecuteCode(string reason)
+        {
+            ExecuteCodeRequestState requestState = ActiveExecuteCodeRequest;
+            if (requestState == null)
+                return;
+
+            requestState.Cancel();
+            ResetExecuteCodeProgress();
+
+            if (!string.IsNullOrEmpty(reason))
+                Debug.LogWarning("[Locus] execute_code canceled: " + reason);
+        }
 
         private static void ResetExecuteCodeProgress()
         {
@@ -240,12 +327,72 @@ namespace Locus
             return OkResponse(requestId, "execute_code cancellation requested");
         }
 
+        private static async Task MonitorExecuteCodeClientHeartbeatAsync(ExecuteCodeRequestState requestState)
+        {
+            if (requestState == null)
+                return;
+
+            try
+            {
+                while (!requestState.IsCancellationRequested)
+                {
+                    await Task.Delay(AsyncExecuteInactivityPollMs).ConfigureAwait(false);
+
+                    if (requestState.IsCancellationRequested)
+                        return;
+
+                    if (requestState.ClientHeartbeatCount <= 0)
+                        continue;
+
+                    if (requestState.ClientHeartbeatIdleSeconds < ExecuteClientHeartbeatTimeoutMs / 1000.0)
+                        continue;
+
+                    requestState.Cancel();
+                    ResetExecuteCodeProgress();
+                    Debug.LogWarning(
+                        "[Locus] execute_code canceled: client heartbeat timed out after " +
+                        (ExecuteClientHeartbeatTimeoutMs / 1000) +
+                        " seconds");
+                    return;
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError("[Locus] execute_code heartbeat monitor failed: " + ex);
+            }
+        }
+
         private static async Task<PipeEnvelope> HandleExecuteCode(string requestId, string code)
         {
             if (string.IsNullOrWhiteSpace(code))
                 return ErrorResponse(requestId, "empty code");
 
-            await _executeCodeLock.WaitAsync();
+            if (ActiveExecuteCodeRequest == null)
+                SetExecuteCodeStage("Waiting for Unity execute lock");
+
+            bool lockTaken = false;
+            try
+            {
+                if (!await _executeCodeLock.WaitAsync(ExecuteCodeLockWaitTimeoutMs))
+                {
+                    if (ActiveExecuteCodeRequest == null)
+                        ResetExecuteCodeProgress();
+                    return ErrorResponse(
+                        requestId,
+                        "execute_code lock wait timed out after " +
+                        (ExecuteCodeLockWaitTimeoutMs / 1000) +
+                        " seconds");
+                }
+
+                lockTaken = true;
+            }
+            catch (ObjectDisposedException ex)
+            {
+                if (ActiveExecuteCodeRequest == null)
+                    ResetExecuteCodeProgress();
+                return ErrorResponse(requestId, "execute_code lock unavailable: " + ex.Message);
+            }
+
             ExecuteCodeRequestState requestState = null;
             try
             {
@@ -254,6 +401,7 @@ namespace Locus
                 {
                     _activeExecuteCodeRequest = requestState;
                 }
+                _ = MonitorExecuteCodeClientHeartbeatAsync(requestState);
 
                 ResetExecuteCodeProgress();
                 SetExecuteCodeStage("Checking compiler cache");
@@ -316,7 +464,8 @@ namespace Locus
                 if (requestState != null)
                     requestState.Dispose();
                 ResetExecuteCodeProgress();
-                _executeCodeLock.Release();
+                if (lockTaken)
+                    _executeCodeLock.Release();
             }
         }
 
