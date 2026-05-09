@@ -14,10 +14,6 @@ English | [简体中文](README.zh-CN.md)
 
 [![Watch the demo on YouTube](https://img.youtube.com/vi/xoApXZMon9M/maxresdefault.jpg)](https://www.youtube.com/watch?v=xoApXZMon9M)
 
-## Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=r1n7aro/Locus&type=Date)](https://www.star-history.com/#r1n7aro/Locus&Date)
-
 ## Overview
 
 `Locus for Unity` is an open-source AI Agent for Unity projects.
@@ -110,3 +106,7 @@ Published installers include the root license file, the root third-party notices
 ## Disclaimer
 
 This project is a free and open-source tool for the Unity Editor, and is not affiliated with Unity Technologies.
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=r1n7aro/Locus&type=Date)](https://www.star-history.com/#r1n7aro/Locus&Date)
