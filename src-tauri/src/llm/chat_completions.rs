@@ -6,6 +6,7 @@ use super::openrouter::LlmResponse;
 use crate::session::models::{ChatMessage, ImageData, MessageRole, ToolCallInfo};
 
 const CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
+const RAW_CHUNK_DEBUG_PREVIEW_CHARS: usize = 1600;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChatCompletionsFlavor {
@@ -172,7 +173,17 @@ where
             &on_thinking_delta,
             &on_tool_call_start,
         )? {
-            return finalize_stream_response(tag, debug, true, state, raw_request, raw_response);
+            return finalize_stream_response(
+                tag,
+                model,
+                &api_url,
+                flavor,
+                debug,
+                true,
+                state,
+                raw_request,
+                raw_response,
+            );
         }
     }
 
@@ -185,12 +196,25 @@ where
         &on_thinking_delta,
         &on_tool_call_start,
     )? {
-        return finalize_stream_response(tag, debug, true, state, raw_request, raw_response);
+        return finalize_stream_response(
+            tag,
+            model,
+            &api_url,
+            flavor,
+            debug,
+            true,
+            state,
+            raw_request,
+            raw_response,
+        );
     }
 
     let saw_finish_reason = state.saw_finish_reason;
     finalize_stream_response(
         tag,
+        model,
+        &api_url,
+        flavor,
         debug,
         saw_finish_reason,
         state,
@@ -855,6 +879,9 @@ fn apply_stream_chunk<F, G, H>(
 
 fn finalize_stream_response(
     tag: &str,
+    model: &str,
+    api_url: &str,
+    flavor: ChatCompletionsFlavor,
     debug: bool,
     got_terminal_event: bool,
     mut state: ChatStreamState,
@@ -879,7 +906,23 @@ fn finalize_stream_response(
         return Err("Stream ended with no data and no [DONE]".to_string());
     }
 
-    let tool_calls = collect_tool_calls(&state.tool_calls_map)?;
+    let tool_calls = match collect_tool_calls(&state.tool_calls_map) {
+        Ok(tool_calls) => tool_calls,
+        Err(error) => {
+            if debug {
+                log_tool_call_collection_failure(
+                    tag,
+                    model,
+                    api_url,
+                    flavor,
+                    &state.tool_calls_map,
+                    &raw_response,
+                    &error,
+                );
+            }
+            return Err(error);
+        }
+    };
     if !tool_calls.is_empty() {
         state.finish_reason = "tool_calls".to_string();
     }
@@ -914,6 +957,91 @@ fn finalize_stream_response(
     }
 
     Ok(resp)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IncompleteToolCallDiagnostic {
+    index: i64,
+    missing: String,
+    arguments_len: usize,
+}
+
+fn first_incomplete_tool_call(
+    map: &std::collections::HashMap<i64, PartialToolCall>,
+) -> Option<IncompleteToolCallDiagnostic> {
+    let mut entries: Vec<_> = map.iter().collect();
+    entries.sort_by_key(|(idx, _)| *idx);
+
+    for (idx, tc) in entries {
+        if !tc.has_complete_metadata() {
+            return Some(IncompleteToolCallDiagnostic {
+                index: *idx,
+                missing: missing_tool_call_metadata(tc),
+                arguments_len: tc.arguments.chars().count(),
+            });
+        }
+    }
+
+    None
+}
+
+fn summarize_recent_raw_chunk(raw_response: &str, max_chars: usize) -> String {
+    if raw_response.is_empty() {
+        return "(empty)".to_string();
+    }
+
+    let char_count = raw_response.chars().count();
+    let mut tail_chars: Vec<char> = raw_response.chars().rev().take(max_chars).collect();
+    tail_chars.reverse();
+    let tail: String = tail_chars.into_iter().collect();
+    let escaped = tail.escape_debug().to_string();
+
+    if char_count > max_chars {
+        format!("...{}", escaped)
+    } else {
+        escaped
+    }
+}
+
+fn log_tool_call_collection_failure(
+    tag: &str,
+    model: &str,
+    api_url: &str,
+    flavor: ChatCompletionsFlavor,
+    map: &std::collections::HashMap<i64, PartialToolCall>,
+    raw_response: &str,
+    error: &str,
+) {
+    let recent_raw_chunk = summarize_recent_raw_chunk(raw_response, RAW_CHUNK_DEBUG_PREVIEW_CHARS);
+    let raw_response_len = raw_response.chars().count();
+
+    if let Some(issue) = first_incomplete_tool_call(map) {
+        eprintln!(
+            "[DEBUG][{}] incomplete streamed tool call: provider={} model={} api_url={} flavor={:?} tool_index={} missing={} received_arguments_len={} raw_response_len={} recent_raw_chunk={}",
+            tag,
+            tag,
+            model,
+            api_url,
+            flavor,
+            issue.index,
+            issue.missing,
+            issue.arguments_len,
+            raw_response_len,
+            recent_raw_chunk
+        );
+    } else {
+        eprintln!(
+            "[DEBUG][{}] tool call collection failed: provider={} model={} api_url={} flavor={:?} error={} raw_response_len={} recent_raw_chunk={}",
+            tag,
+            tag,
+            model,
+            api_url,
+            flavor,
+            error,
+            raw_response_len,
+            recent_raw_chunk
+        );
+    }
 }
 
 fn collect_tool_calls(
@@ -1045,8 +1173,9 @@ struct StreamFunctionDelta {
 mod tests {
     use super::{
         apply_stream_chunk, build_api_messages, build_request_body, collect_tool_calls,
-        detect_flavor, drain_sse_buffer, finalize_stream_response, ChatCompletionsFlavor,
-        ChatStreamState, PartialToolCall, StreamChunk,
+        detect_flavor, drain_sse_buffer, finalize_stream_response, first_incomplete_tool_call,
+        summarize_recent_raw_chunk, ChatCompletionsFlavor, ChatStreamState, PartialToolCall,
+        StreamChunk,
     };
     use crate::session::models::{ChatMessage, ImageData, MessageRole, ToolCallInfo};
     use std::collections::HashMap;
@@ -1581,6 +1710,9 @@ mod tests {
         let saw_finish_reason = state.saw_finish_reason;
         let response = finalize_stream_response(
             "Custom Chat",
+            "gpt-5.4",
+            "https://example.test/chat/completions",
+            ChatCompletionsFlavor::Generic,
             false,
             saw_finish_reason,
             state,
@@ -1593,6 +1725,34 @@ mod tests {
         assert_eq!(response.tool_calls.len(), 1);
         assert_eq!(response.tool_calls[0].name, "list");
         assert_eq!(response.tool_calls[0].arguments, "{\"path\":\"Assets\"}");
+    }
+
+    #[test]
+    fn reports_incomplete_tool_call_diagnostic() {
+        let mut tool_calls = HashMap::new();
+        tool_calls.insert(
+            1,
+            PartialToolCall {
+                id: String::new(),
+                name: String::new(),
+                arguments: "{\"todos\":[]}".to_string(),
+                notified: false,
+            },
+        );
+
+        let diagnostic =
+            first_incomplete_tool_call(&tool_calls).expect("incomplete call should be reported");
+
+        assert_eq!(diagnostic.index, 1);
+        assert_eq!(diagnostic.missing, "id, name");
+        assert_eq!(diagnostic.arguments_len, "{\"todos\":[]}".chars().count());
+    }
+
+    #[test]
+    fn raw_chunk_summary_truncates_and_escapes_newlines() {
+        let summary = summarize_recent_raw_chunk("data: first\n\ndata: second\r\n", 12);
+
+        assert_eq!(summary, "...ta: second\\r\\n");
     }
 
     #[test]
