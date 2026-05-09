@@ -106,3 +106,7 @@ bun run release:installers
 ## 免责声明
 
 本项目是一个面向 Unity Editor 的免费开源工具，与 Unity Technologies 无关联。
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=r1n7aro/Locus&type=Date)](https://www.star-history.com/#r1n7aro/Locus&Date)

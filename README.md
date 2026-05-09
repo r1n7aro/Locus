@@ -106,3 +106,7 @@ Published installers include the root license file, the root third-party notices
 ## Disclaimer
 
 This project is a free and open-source tool for the Unity Editor, and is not affiliated with Unity Technologies.
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=r1n7aro/Locus&type=Date)](https://www.star-history.com/#r1n7aro/Locus&Date)
