@@ -871,6 +871,13 @@ pub enum CustomReasoningParamFormat {
     AnthropicThinking,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomEndpointServerTools {
+    #[serde(default)]
+    pub web_search: bool,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CustomEndpoint {
@@ -891,6 +898,8 @@ pub struct CustomEndpoint {
     pub reasoning_param_format: Option<CustomReasoningParamFormat>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replay_reasoning_content: Option<bool>,
+    #[serde(default)]
+    pub server_tools: CustomEndpointServerTools,
 }
 
 const DEFAULT_CUSTOM_ENDPOINT_CONTEXT_LENGTH: u32 = 256_000;
@@ -2301,6 +2310,27 @@ mod tests {
 
         assert_eq!(endpoints[0].context_length, 256_000);
         assert_eq!(endpoints[0].replay_reasoning_content, Some(true));
+        assert!(!endpoints[0].server_tools.web_search);
+    }
+
+    #[test]
+    fn custom_endpoint_preserves_server_tool_settings() {
+        let raw = r#"[{
+            "id": "custom-1",
+            "name": "Custom",
+            "apiModel": "claude-sonnet-4-20250514",
+            "endpoint": "https://api.anthropic.com/v1",
+            "apiFormat": "anthropic_messages",
+            "serverTools": {
+                "webSearch": true
+            }
+        }]"#;
+
+        let mut endpoints: Vec<CustomEndpoint> =
+            serde_json::from_str(raw).expect("deserialize custom endpoint");
+        normalize_custom_endpoint_config(&mut endpoints[0]);
+
+        assert!(endpoints[0].server_tools.web_search);
     }
 
     #[test]

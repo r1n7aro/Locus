@@ -676,6 +676,12 @@ export function useSettingsState(emit: SettingsEmit) {
     return ep.apiFormat === "openai_chat";
   }
 
+  function normalizeServerTools(value?: Partial<CustomEndpoint["serverTools"]> | null): CustomEndpoint["serverTools"] {
+    return {
+      webSearch: value?.webSearch === true,
+    };
+  }
+
   function normalizeCustomEndpoint(ep: CustomEndpoint): CustomEndpoint {
     return {
       ...ep,
@@ -688,6 +694,7 @@ export function useSettingsState(emit: SettingsEmit) {
       replayReasoningContent: typeof ep.replayReasoningContent === "boolean"
         ? ep.replayReasoningContent
         : defaultReplayReasoningContent(ep),
+      serverTools: normalizeServerTools(ep.serverTools),
     };
   }
 
@@ -734,6 +741,7 @@ export function useSettingsState(emit: SettingsEmit) {
       supportedReasoningEfforts: [...defaultReasoningEfforts],
       reasoningParamFormat: defaultReasoningParamFormat(apiFormat),
       replayReasoningContent: true,
+      serverTools: normalizeServerTools(),
     };
   }
 

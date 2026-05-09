@@ -98,6 +98,7 @@ function endpoint(partial: Partial<CustomEndpoint> & Pick<CustomEndpoint, "id" |
     supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max"],
     reasoningParamFormat: "openai_chat_reasoning_effort",
     replayReasoningContent: true,
+    serverTools: { webSearch: false },
     ...partial,
   };
 }
@@ -154,6 +155,14 @@ describe("custom endpoint persistence", () => {
     expect(state.editingEndpoint.value?.replayReasoningContent).toBe(true);
   });
 
+  it("starts new endpoints with server web search disabled", () => {
+    const state = useSettingsState((() => undefined) as never);
+
+    state.startAddEndpoint();
+
+    expect(state.editingEndpoint.value?.serverTools.webSearch).toBe(false);
+  });
+
   it("starts new endpoints with xhigh and max reasoning efforts", () => {
     const state = useSettingsState((() => undefined) as never);
 
@@ -183,6 +192,21 @@ describe("custom endpoint persistence", () => {
     await state.loadCustomEndpoints();
 
     expect(state.customEndpoints.value[0].replayReasoningContent).toBe(true);
+  });
+
+  it("normalizes legacy endpoints to disabled server tools", async () => {
+    const state = useSettingsState((() => undefined) as never);
+    modelServiceMocks.getCustomEndpoints.mockResolvedValueOnce([
+      endpoint({
+        id: "legacy-server-tools",
+        name: "Legacy Server Tools",
+        serverTools: undefined,
+      } as any),
+    ]);
+
+    await state.loadCustomEndpoints();
+
+    expect(state.customEndpoints.value[0].serverTools).toEqual({ webSearch: false });
   });
 
   it("normalizes legacy default reasoning efforts to include xhigh", async () => {

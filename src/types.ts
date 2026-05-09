@@ -246,6 +246,10 @@ export type ReasoningParamFormat =
   | "openai_responses_reasoning_effort"
   | "anthropic_thinking";
 
+export interface CustomEndpointServerTools {
+  webSearch: boolean;
+}
+
 export interface CustomEndpoint {
   id: string;
   name: string;
@@ -258,6 +262,7 @@ export interface CustomEndpoint {
   supportedReasoningEfforts: EffortLevel[];
   reasoningParamFormat: ReasoningParamFormat;
   replayReasoningContent: boolean;
+  serverTools: CustomEndpointServerTools;
 }
 
 export interface ModelDefaults {

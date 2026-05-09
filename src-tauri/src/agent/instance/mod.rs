@@ -4199,6 +4199,7 @@ impl AgentInstance {
                 supported_reasoning_efforts,
                 reasoning_param_format,
                 replay_reasoning_content,
+                server_tools,
                 ..
             } => {
                 use crate::commands::{ApiFormat, CustomReasoningParamFormat};
@@ -4314,6 +4315,7 @@ impl AgentInstance {
                             endpoint.as_str(),
                             beta_flags,
                             thinking_level,
+                            server_tools.web_search,
                             Some(&self.session_id),
                             "Custom(Anthropic)",
                             on_text_delta,

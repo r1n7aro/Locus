@@ -111,6 +111,7 @@ describe("useModelStore OpenAI effort mapping", () => {
       supportedReasoningEfforts: ["medium", "high"],
       reasoningParamFormat: "openai_responses_reasoning_effort",
       replayReasoningContent: false,
+      serverTools: { webSearch: false },
     }]);
     modelStore.selectedModelId = "custom/endpoint-1";
 
@@ -131,6 +132,7 @@ describe("useModelStore OpenAI effort mapping", () => {
       betaFlags: [],
       reasoningParamFormat: "openai_chat_reasoning_effort",
       replayReasoningContent: true,
+      serverTools: { webSearch: false },
     } as any]);
     modelStore.selectedModelId = "custom/endpoint-1";
 
@@ -153,6 +155,7 @@ describe("useModelStore OpenAI effort mapping", () => {
       supportedReasoningEfforts: ["low", "medium", "high", "max"],
       reasoningParamFormat: "openai_chat_reasoning_effort",
       replayReasoningContent: true,
+      serverTools: { webSearch: false },
     }]);
     modelStore.selectedModelId = "custom/endpoint-1";
 

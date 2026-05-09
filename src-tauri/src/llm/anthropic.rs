@@ -439,6 +439,7 @@ pub async fn stream_chat_native<F, G, H>(
     base_url: &str,
     extra_beta_flags: &[String],
     thinking_level: Option<&str>,
+    include_web_search: bool,
     request_session_id: Option<&str>,
     tag: &str,
     on_text_delta: F,
@@ -464,18 +465,7 @@ where
 
     let messages = build_anthropic_messages(history);
 
-    let mut anthropic_tools = convert_tools_to_anthropic(tools);
-
-    // Inject web search server tool schema (Anthropic API native)
-    anthropic_tools.push(serde_json::json!({
-        "type": "web_search_20250305",
-        "name": "web_search",
-        "max_uses": 5
-    }));
-
-    if let Some(last_tool) = anthropic_tools.last_mut() {
-        last_tool["cache_control"] = serde_json::json!({ "type": "ephemeral", "ttl": CACHE_TTL });
-    }
+    let anthropic_tools = build_native_anthropic_tools(tools, include_web_search);
 
     let system_blocks = serde_json::json!([{
         "type": "text",
@@ -1331,6 +1321,28 @@ fn convert_tools_to_anthropic(openai_tools: &[serde_json::Value]) -> Vec<serde_j
     tools
 }
 
+fn build_native_anthropic_tools(
+    openai_tools: &[serde_json::Value],
+    include_web_search: bool,
+) -> Vec<serde_json::Value> {
+    let mut tools = convert_tools_to_anthropic(openai_tools);
+
+    if include_web_search {
+        // Server-side Anthropic tool. Some custom-compatible endpoints reject this type.
+        tools.push(serde_json::json!({
+            "type": "web_search_20250305",
+            "name": "web_search",
+            "max_uses": 5
+        }));
+    }
+
+    if let Some(last_tool) = tools.last_mut() {
+        last_tool["cache_control"] = serde_json::json!({ "type": "ephemeral", "ttl": CACHE_TTL });
+    }
+
+    tools
+}
+
 fn convert_tools_to_oauth_sdk_like_anthropic(
     openai_tools: &[serde_json::Value],
 ) -> (Vec<serde_json::Value>, OauthToolAliases) {
@@ -1783,8 +1795,8 @@ struct MessageDelta {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_cache_control, build_anthropic_messages, build_oauth_system_blocks,
-        build_text_blocks, convert_tools_to_oauth_sdk_like_anthropic,
+        apply_cache_control, build_anthropic_messages, build_native_anthropic_tools,
+        build_oauth_system_blocks, build_text_blocks, convert_tools_to_oauth_sdk_like_anthropic,
         rewrite_oauth_tool_use_blocks, CACHE_TTL,
     };
     use crate::session::models::{ChatMessage, MessageRole, ToolCallInfo};
@@ -1907,6 +1919,23 @@ mod tests {
                 "replaceAll": true
             })
         );
+    }
+
+    #[test]
+    fn native_anthropic_tools_omit_web_search_when_disabled() {
+        let tools = build_native_anthropic_tools(&[], false);
+
+        assert!(tools.is_empty());
+    }
+
+    #[test]
+    fn native_anthropic_tools_include_web_search_when_enabled() {
+        let tools = build_native_anthropic_tools(&[], true);
+
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["type"], json!("web_search_20250305"));
+        assert_eq!(tools[0]["name"], json!("web_search"));
+        assert_eq!(tools[0]["cache_control"]["type"], json!("ephemeral"));
     }
 
     #[test]

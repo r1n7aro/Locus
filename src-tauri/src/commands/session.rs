@@ -520,6 +520,7 @@ async fn resolve_model_backend(
                 .clone()
                 .unwrap_or(crate::commands::CustomReasoningParamFormat::OpenaiChatReasoningEffort),
             replay_reasoning_content: endpoint.replay_reasoning_content.unwrap_or(false),
+            server_tools: endpoint.server_tools.clone(),
         });
     }
 
@@ -791,6 +792,7 @@ pub async fn chat(
                 .clone()
                 .unwrap_or(crate::commands::CustomReasoningParamFormat::OpenaiChatReasoningEffort),
             replay_reasoning_content: ep.replay_reasoning_content.unwrap_or(false),
+            server_tools: ep.server_tools.clone(),
         }
     } else if is_openrouter {
         let api_key = api_key_state.read().await.clone();

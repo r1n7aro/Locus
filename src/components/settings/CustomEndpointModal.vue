@@ -87,6 +87,14 @@ function setBetaFlagEnabled(flag: string, enabled: boolean) {
   }
 }
 
+function setWebSearchEnabled(enabled: boolean) {
+  if (!endpoint.value) return;
+  endpoint.value.serverTools = {
+    ...(endpoint.value.serverTools ?? { webSearch: false }),
+    webSearch: enabled,
+  };
+}
+
 async function openTestHtml() {
   const path = testResultHtmlPath.value;
   if (!path) return;
@@ -286,6 +294,26 @@ function handleEndpointKeydown(e: KeyboardEvent) {
                   <div class="custom-option-copy inline">
                     <span class="custom-option-name mono">prompt-caching-scope-2026-01-05</span>
                     <span class="custom-option-desc">{{ t("settings.custom.betaPromptCaching") }}</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div v-if="endpoint.apiFormat === 'anthropic_messages'" class="custom-form-row">
+              <label class="custom-form-label">
+                {{ t("settings.custom.serverTools") }}
+                <span class="custom-form-hint">{{ t("settings.custom.serverToolsHint") }}</span>
+              </label>
+              <div class="custom-options-list">
+                <div class="custom-option-row">
+                  <BaseCheckbox
+                    :disabled="saving"
+                    :model-value="endpoint.serverTools?.webSearch ?? false"
+                    aria-label="web_search"
+                    @update:model-value="setWebSearchEnabled"
+                  />
+                  <div class="custom-option-copy inline">
+                    <span class="custom-option-name mono">web_search</span>
+                    <span class="custom-option-desc">{{ t("settings.custom.serverToolWebSearch") }}</span>
                   </div>
                 </div>
               </div>
