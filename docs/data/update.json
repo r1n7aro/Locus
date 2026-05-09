@@ -13,7 +13,9 @@
           "items": [
             "QQ群号：1104932978，欢迎加入交流，现在可以搜索到了，之前没有开搜索。",
             "聊天支持接收 Unity 编辑器上下文引用。Unity 资产与场景对象可从编辑器发送到输入区，以引用形式随消息发送，并可在转录中重新选择或打开。",
-            "自定义 endpoint 支持 `xhigh` 推理强度，可用于 GPT-5 / Codex 风格的最高推理档位。"
+            "自定义 endpoint 支持 `xhigh` 推理强度，可用于 GPT-5 / Codex 风格的最高推理档位。",
+            "自定义 Anthropic Messages 端点新增服务器端工具选项，可按端点启用 Anthropic 原生 `web_search`。",
+            "自定义端点设置会保存服务器端工具偏好，旧端点配置默认关闭服务器端联网搜索。"
           ]
         },
         {
@@ -21,7 +23,9 @@
           "items": [
             "Unity 执行进度传输在进度临时不可用、管道重连与取消收尾时更稳定。",
             "中断已取消的运行后，文件变更面板会继续显示该轮产生的变更。",
-            "Unity 嵌入窗口获得输入焦点时，系统通知会保持静默。"
+            "Unity 嵌入窗口获得输入焦点时，系统通知会保持静默。",
+            "自定义 Anthropic Messages 请求只在端点启用时发送 Anthropic 原生 `web_search`，避免兼容端点收到不支持的服务器端工具载荷。",
+            "Chat Completions 调试日志在流式工具调用元数据不完整时，会记录模型、端点格式与最近的原始响应片段，便于定位兼容端点问题。"
           ]
         },
         {
@@ -48,7 +52,9 @@
           "items": [
             "Made QQ group 1104932978 searchable for community discussion.",
             "Added Unity editor context references in chat. Unity assets and scene objects can be sent from the editor into the composer, included with messages as references, and reopened or selected from the transcript.",
-            "Added `xhigh` reasoning effort support for custom endpoints that expose GPT-5 / Codex-style effort levels."
+            "Added `xhigh` reasoning effort support for custom endpoints that expose GPT-5 / Codex-style effort levels.",
+            "Added a Server Tools option for custom Anthropic Messages endpoints. Users can enable Anthropic native `web_search` per endpoint.",
+            "Custom endpoint settings now persist server tool preferences and default legacy endpoint configs to server-side web search disabled."
           ]
         },
         {
@@ -56,7 +62,9 @@
           "items": [
             "Hardened Unity execute progress transport around temporarily unavailable progress snapshots, pipe reconnects, and cancellation draining.",
             "File changes from a cancelled run now remain visible after interruption.",
-            "System notifications now stay silent while the embedded Unity window has input focus."
+            "System notifications now stay silent while the embedded Unity window has input focus.",
+            "Custom Anthropic Messages requests now include Anthropic native `web_search` only when the endpoint enables it, avoiding unsupported server tool payloads for compatible custom endpoints.",
+            "Chat Completions debug logs now include the model, endpoint flavor, and recent raw response chunk when streamed tool-call metadata is incomplete, making compatible endpoint issues easier to diagnose."
           ]
         },
         {
