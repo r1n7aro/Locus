@@ -14,6 +14,10 @@
 
 [![在 Bilibili 观看演示](https://img.youtube.com/vi/xoApXZMon9M/maxresdefault.jpg)](https://www.bilibili.com/video/BV1H4ReBNELD/)
 
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=r1n7aro/Locus&type=Date)](https://www.star-history.com/#r1n7aro/Locus&Date)
+
 ## 概览
 
 `Locus for Unity`是一个面向Unity项目的**开源**AI Agent。
