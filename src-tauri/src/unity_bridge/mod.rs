@@ -1132,9 +1132,8 @@ where
     let execute = send_message_without_timeout(project_path, "execute_code", &prepared.code);
     tokio::pin!(execute);
 
-    let mut progress_tick = tokio::time::interval(Duration::from_millis(
-        UNITY_EXECUTE_PROGRESS_POLL_MS,
-    ));
+    let mut progress_tick =
+        tokio::time::interval(Duration::from_millis(UNITY_EXECUTE_PROGRESS_POLL_MS));
     progress_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_progress_revision = 0u64;
     let mut saw_unity_progress = false;
@@ -1242,9 +1241,8 @@ where
     let execute = send_message_without_timeout(project_path, "execute_code", &prepared.code);
     tokio::pin!(execute);
 
-    let mut progress_tick = tokio::time::interval(Duration::from_millis(
-        UNITY_EXECUTE_PROGRESS_POLL_MS,
-    ));
+    let mut progress_tick =
+        tokio::time::interval(Duration::from_millis(UNITY_EXECUTE_PROGRESS_POLL_MS));
     progress_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_progress_revision = 0u64;
     let mut saw_unity_progress = false;

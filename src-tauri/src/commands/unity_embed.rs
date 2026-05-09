@@ -1029,11 +1029,11 @@ mod windows_impl {
                 GetTopWindow, GetWindow, GetWindowLongPtrW, GetWindowRect, GetWindowTextW,
                 GetWindowThreadProcessId, IsChild, IsIconic, IsWindow, IsWindowVisible,
                 SetForegroundWindow, SetParent, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-                GUITHREADINFO, GA_ROOT, GWLP_HWNDPARENT, GWL_EXSTYLE, GWL_STYLE, GW_CHILD,
-                GW_HWNDNEXT, HWND_TOP, MA_NOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE,
-                SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SW_HIDE, SW_SHOWNOACTIVATE,
-                WM_MOUSEACTIVATE, WM_NCDESTROY, WS_CAPTION, WS_CHILD, WS_EX_NOACTIVATE,
-                WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_THICKFRAME,
+                GA_ROOT, GUITHREADINFO, GWLP_HWNDPARENT, GWL_EXSTYLE, GWL_STYLE, GW_CHILD,
+                GW_HWNDNEXT, HWND_TOP, MA_NOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
+                SWP_NOOWNERZORDER, SWP_NOSIZE, SW_HIDE, SW_SHOWNOACTIVATE, WM_MOUSEACTIVATE,
+                WM_NCDESTROY, WS_CAPTION, WS_CHILD, WS_EX_NOACTIVATE, WS_MAXIMIZEBOX,
+                WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_THICKFRAME,
             },
         },
     };
@@ -1525,7 +1525,10 @@ mod windows_impl {
         let input_focus = GetFocus();
         detach_input_threads(current_thread, attached_threads);
         if is_valid_window(input_focus) {
-            return (is_embed_window_or_descendant(overlay, input_focus), input_focus);
+            return (
+                is_embed_window_or_descendant(overlay, input_focus),
+                input_focus,
+            );
         }
 
         for thread_id in window_thread_ids(&focus_scope) {
@@ -1653,9 +1656,8 @@ mod windows_impl {
         } else {
             false
         };
-        let (overlay_input_focused, input_focus) = unsafe {
-            overlay_input_focus_state(overlay, foreground, parent)
-        };
+        let (overlay_input_focused, input_focus) =
+            unsafe { overlay_input_focus_state(overlay, foreground, parent) };
         let (mouse_activation_suppressed, activation_guard_enabled) = mouse_activation_state()
             .lock()
             .map(|state| (state.suppressed, state.guard_enabled))
