@@ -2351,6 +2351,23 @@ mod tests {
     }
 
     #[test]
+    fn custom_endpoint_defaults_anthropic_messages_reasoning_replay_to_disabled() {
+        let raw = r#"[{
+            "id": "custom-1",
+            "name": "Anthropic",
+            "apiModel": "claude-sonnet-4-20250514",
+            "endpoint": "https://api.anthropic.com/v1",
+            "apiFormat": "anthropic_messages"
+        }]"#;
+
+        let mut endpoints: Vec<CustomEndpoint> =
+            serde_json::from_str(raw).expect("deserialize custom endpoint");
+        normalize_custom_endpoint_config(&mut endpoints[0]);
+
+        assert_eq!(endpoints[0].replay_reasoning_content, Some(false));
+    }
+
+    #[test]
     fn workspace_search_score_matches_compact_path_queries() {
         let score = workspace_search_score(
             "UIElementsSchema/UnityEditor.Overlays",

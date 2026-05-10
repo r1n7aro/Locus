@@ -49,6 +49,9 @@ const customReasoningFormatOptions = [
 const modalTitle = computed(() => props.isAdding ? t("settings.custom.add") : t("settings.custom.edit"));
 const testResultText = computed(() => customEndpointTestDetail(props.testResult));
 const testResultHtmlPath = computed(() => customEndpointTestHtmlPath(props.testResult));
+const showReplayReasoningContent = computed(() =>
+  endpoint.value?.apiFormat === "openai_chat" || endpoint.value?.apiFormat === "anthropic_messages"
+);
 
 function defaultReasoningParamFormat(apiFormat: ApiFormat): ReasoningParamFormat {
   switch (apiFormat) {
@@ -58,11 +61,16 @@ function defaultReasoningParamFormat(apiFormat: ApiFormat): ReasoningParamFormat
   }
 }
 
+function defaultReplayReasoningContent(apiFormat: ApiFormat): boolean {
+  return apiFormat === "openai_chat";
+}
+
 function updateEndpointApiFormat(event: Event) {
   if (!endpoint.value) return;
   const apiFormat = (event.target as HTMLSelectElement).value as ApiFormat;
   endpoint.value.apiFormat = apiFormat;
   endpoint.value.reasoningParamFormat = defaultReasoningParamFormat(apiFormat);
+  endpoint.value.replayReasoningContent = defaultReplayReasoningContent(apiFormat);
 }
 
 function setReasoningEffortEnabled(effort: EffortLevel, enabled: boolean) {
@@ -220,7 +228,7 @@ function handleEndpointKeydown(e: KeyboardEvent) {
                 </option>
               </select>
             </div>
-            <div v-if="endpoint.apiFormat === 'openai_chat'" class="custom-form-row">
+            <div v-if="showReplayReasoningContent" class="custom-form-row">
               <label class="custom-form-label">
                 {{ t("settings.custom.replayReasoningContent") }}
                 <span class="custom-form-hint">{{ t("settings.custom.replayReasoningContentHint") }}</span>

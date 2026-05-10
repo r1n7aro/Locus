@@ -227,7 +227,7 @@ where
     let model = model.strip_prefix("anthropic/").unwrap_or(model);
     let mut effective_model = normalize_anthropic_model(model).to_string();
 
-    let mut messages = build_anthropic_messages(history);
+    let mut messages = build_anthropic_messages(history, AnthropicHistoryOptions::standard());
     let (converted_tools, tool_aliases) = convert_tools_to_oauth_sdk_like_anthropic(tools);
     rewrite_oauth_tool_use_blocks(&mut messages, &tool_aliases);
     let anthropic_tools = converted_tools;
@@ -439,6 +439,7 @@ pub async fn stream_chat_native<F, G, H>(
     base_url: &str,
     extra_beta_flags: &[String],
     thinking_level: Option<&str>,
+    replay_thinking_blocks: bool,
     include_web_search: bool,
     request_session_id: Option<&str>,
     tag: &str,
@@ -463,7 +464,10 @@ where
         .build()
         .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
 
-    let messages = build_anthropic_messages(history);
+    let messages = build_anthropic_messages(
+        history,
+        AnthropicHistoryOptions::custom_endpoint(replay_thinking_blocks),
+    );
 
     let anthropic_tools = build_native_anthropic_tools(tools, include_web_search);
 
@@ -1017,7 +1021,32 @@ fn build_thinking_params(
     }
 }
 
-fn build_anthropic_messages(history: &[ChatMessage]) -> Vec<serde_json::Value> {
+#[derive(Debug, Clone, Copy)]
+struct AnthropicHistoryOptions {
+    replay_thinking_blocks: bool,
+    require_thinking_signature: bool,
+}
+
+impl AnthropicHistoryOptions {
+    fn standard() -> Self {
+        Self {
+            replay_thinking_blocks: true,
+            require_thinking_signature: false,
+        }
+    }
+
+    fn custom_endpoint(replay_thinking_blocks: bool) -> Self {
+        Self {
+            replay_thinking_blocks,
+            require_thinking_signature: true,
+        }
+    }
+}
+
+fn build_anthropic_messages(
+    history: &[ChatMessage],
+    options: AnthropicHistoryOptions,
+) -> Vec<serde_json::Value> {
     let history = crate::session::history::normalize_tool_round_history(history);
     let mut messages: Vec<serde_json::Value> = Vec::new();
 
@@ -1061,7 +1090,17 @@ fn build_anthropic_messages(history: &[ChatMessage]) -> Vec<serde_json::Value> {
             }
             MessageRole::Assistant => {
                 let has_text = !msg.content.is_empty();
-                let has_thinking = msg.thinking_content.as_ref().is_some_and(|t| !t.is_empty());
+                let thinking_text = msg
+                    .thinking_content
+                    .as_deref()
+                    .filter(|value| !value.is_empty());
+                let thinking_signature = msg
+                    .thinking_signature
+                    .as_deref()
+                    .filter(|value| !value.is_empty());
+                let has_thinking = options.replay_thinking_blocks
+                    && thinking_text.is_some()
+                    && (!options.require_thinking_signature || thinking_signature.is_some());
                 let tool_calls = msg.tool_calls.as_ref();
                 let has_tool_calls = tool_calls.is_some_and(|calls| !calls.is_empty());
 
@@ -1080,15 +1119,12 @@ fn build_anthropic_messages(history: &[ChatMessage]) -> Vec<serde_json::Value> {
                 let mut content_blocks: Vec<serde_json::Value> = Vec::new();
 
                 if has_thinking {
-                    let thinking_text = msg.thinking_content.as_deref().unwrap_or_default();
                     let mut thinking_block = serde_json::json!({
                         "type": "thinking",
                         "thinking": thinking_text,
                     });
-                    if let Some(ref sig) = msg.thinking_signature {
-                        if !sig.is_empty() {
-                            thinking_block["signature"] = serde_json::json!(sig);
-                        }
+                    if let Some(sig) = thinking_signature {
+                        thinking_block["signature"] = serde_json::json!(sig);
                     }
                     content_blocks.push(thinking_block);
                 }
@@ -1797,10 +1833,37 @@ mod tests {
     use super::{
         apply_cache_control, build_anthropic_messages, build_native_anthropic_tools,
         build_oauth_system_blocks, build_text_blocks, convert_tools_to_oauth_sdk_like_anthropic,
-        rewrite_oauth_tool_use_blocks, CACHE_TTL,
+        rewrite_oauth_tool_use_blocks, AnthropicHistoryOptions, CACHE_TTL,
     };
     use crate::session::models::{ChatMessage, MessageRole, ToolCallInfo};
     use serde_json::json;
+
+    fn assistant_message(
+        content: &str,
+        thinking_content: Option<&str>,
+        thinking_signature: Option<&str>,
+    ) -> ChatMessage {
+        ChatMessage {
+            id: "assistant".to_string(),
+            role: MessageRole::Assistant,
+            content: content.to_string(),
+            created_at: 0,
+            prompt_prefix: None,
+            prompt_suffix: None,
+            response_id: None,
+            content_order: None,
+            thinking_order: None,
+            tool_calls: None,
+            tool_call_id: None,
+            images: None,
+            asset_refs: None,
+            thinking_content: thinking_content.map(str::to_string),
+            thinking_duration: None,
+            thinking_signature: thinking_signature.map(str::to_string),
+            knowledge_proposal: None,
+            render_parts: None,
+        }
+    }
 
     #[test]
     fn splits_system_reminder_text_into_separate_blocks() {
@@ -1841,7 +1904,7 @@ mod tests {
             render_parts: None,
         }];
 
-        let mut messages = build_anthropic_messages(&history);
+        let mut messages = build_anthropic_messages(&history, AnthropicHistoryOptions::standard());
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0]["content"].as_array().map(|v| v.len()), Some(2));
 
@@ -1939,6 +2002,61 @@ mod tests {
     }
 
     #[test]
+    fn custom_endpoint_history_omits_thinking_when_replay_disabled() {
+        let history = vec![assistant_message("answer", Some("thinking"), Some("sig"))];
+
+        let messages =
+            build_anthropic_messages(&history, AnthropicHistoryOptions::custom_endpoint(false));
+
+        let blocks = messages[0]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], json!("text"));
+        assert_eq!(blocks[0]["text"], json!("answer"));
+    }
+
+    #[test]
+    fn custom_endpoint_history_skips_unsigned_thinking_when_replay_enabled() {
+        let history = vec![assistant_message("answer", Some("thinking"), None)];
+
+        let messages =
+            build_anthropic_messages(&history, AnthropicHistoryOptions::custom_endpoint(true));
+
+        let blocks = messages[0]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], json!("text"));
+        assert_eq!(blocks[0]["text"], json!("answer"));
+    }
+
+    #[test]
+    fn custom_endpoint_history_replays_signed_thinking_when_enabled() {
+        let history = vec![assistant_message("answer", Some("thinking"), Some("sig"))];
+
+        let messages =
+            build_anthropic_messages(&history, AnthropicHistoryOptions::custom_endpoint(true));
+
+        let blocks = messages[0]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["type"], json!("thinking"));
+        assert_eq!(blocks[0]["thinking"], json!("thinking"));
+        assert_eq!(blocks[0]["signature"], json!("sig"));
+        assert_eq!(blocks[1]["type"], json!("text"));
+        assert_eq!(blocks[1]["text"], json!("answer"));
+    }
+
+    #[test]
+    fn standard_history_preserves_unsigned_thinking() {
+        let history = vec![assistant_message("answer", Some("thinking"), None)];
+
+        let messages = build_anthropic_messages(&history, AnthropicHistoryOptions::standard());
+
+        let blocks = messages[0]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["type"], json!("thinking"));
+        assert_eq!(blocks[0]["thinking"], json!("thinking"));
+        assert!(blocks[0].get("signature").is_none());
+    }
+
+    #[test]
     fn oauth_request_cache_control_stays_within_anthropic_limit() {
         let history = vec![
             ChatMessage {
@@ -2003,7 +2121,7 @@ mod tests {
             },
         ];
 
-        let mut messages = build_anthropic_messages(&history);
+        let mut messages = build_anthropic_messages(&history, AnthropicHistoryOptions::standard());
         apply_cache_control(&mut messages);
 
         let message_cache_blocks = messages
@@ -2061,7 +2179,7 @@ mod tests {
             render_parts: None,
         }];
 
-        let mut messages = build_anthropic_messages(&history);
+        let mut messages = build_anthropic_messages(&history, AnthropicHistoryOptions::standard());
         let api_tools = vec![json!({
             "type": "function",
             "function": {
@@ -2160,7 +2278,7 @@ mod tests {
             },
         ];
 
-        let messages = build_anthropic_messages(&history);
+        let messages = build_anthropic_messages(&history, AnthropicHistoryOptions::standard());
 
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[0]["role"], json!("assistant"));

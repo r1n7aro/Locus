@@ -194,6 +194,23 @@ describe("custom endpoint persistence", () => {
     expect(state.customEndpoints.value[0].replayReasoningContent).toBe(true);
   });
 
+  it("normalizes legacy Anthropic Messages endpoints to disabled reasoning replay", async () => {
+    const state = useSettingsState((() => undefined) as never);
+    modelServiceMocks.getCustomEndpoints.mockResolvedValueOnce([
+      endpoint({
+        id: "anthropic-messages",
+        name: "Anthropic Messages",
+        apiFormat: "anthropic_messages",
+        reasoningParamFormat: "anthropic_thinking",
+        replayReasoningContent: undefined,
+      } as any),
+    ]);
+
+    await state.loadCustomEndpoints();
+
+    expect(state.customEndpoints.value[0].replayReasoningContent).toBe(false);
+  });
+
   it("normalizes legacy endpoints to disabled server tools", async () => {
     const state = useSettingsState((() => undefined) as never);
     modelServiceMocks.getCustomEndpoints.mockResolvedValueOnce([

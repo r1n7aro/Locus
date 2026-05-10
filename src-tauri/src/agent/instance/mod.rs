@@ -4315,6 +4315,7 @@ impl AgentInstance {
                             endpoint.as_str(),
                             beta_flags,
                             thinking_level,
+                            *replay_reasoning_content,
                             server_tools.web_search,
                             Some(&self.session_id),
                             "Custom(Anthropic)",
