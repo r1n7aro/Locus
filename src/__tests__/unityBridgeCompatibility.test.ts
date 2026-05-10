@@ -20,4 +20,15 @@ describe("unityBridgeCompatibility", () => {
     expect(bridge).toContain("server.WaitForConnection();");
     expect(bridge).toContain("ct.Register(delegate");
   });
+
+  it("keeps the Unity bridge connection stable after recompilation", () => {
+    const bridge = read("src-tauri/src/unity_bridge/mod.rs");
+    const transport = read("src-tauri/src/unity_bridge/transport.rs");
+
+    expect(bridge).toContain("wait_for_unity_bridge_ready_after_recompile");
+    expect(bridge).toContain("refresh_unity_type_index_after_recompile");
+    expect(bridge).toContain("Unity reconnected after domain reload");
+    expect(bridge).not.toContain("Unity recompile completed");
+    expect(transport).toContain(".filter(|value| !value.is_empty())");
+  });
 });

@@ -25,6 +25,7 @@ describe("chat status indicators", () => {
     expect(chatView).toContain('@launch-unity-project="emit(\'launchUnityProject\')"');
     expect(chatView).toContain(':unity-launching="unityLaunching"');
     expect(chatView).toContain(':unity-launch-state="unityLaunchState"');
+    expect(chatView).toContain(':unity-recompiling="unityRecompileActive"');
     expect(chatView).toContain("workingDir?: string;");
     expect(chatView).toContain(':working-dir="workingDir"');
     expect(workspace).toContain(':working-dir="projectStore.workingDir"');
@@ -99,8 +100,11 @@ describe("chat status indicators", () => {
     expect(indicators).toContain("unityLaunching?: boolean;");
     expect(indicators).toContain('type UnityLaunchState = "idle" | "starting" | "waitingConnection";');
     expect(indicators).toContain("unityLaunchState?: UnityLaunchState;");
+    expect(indicators).toContain("unityRecompiling?: boolean;");
     expect(indicators).toContain('const unityCanLaunch = computed(() =>');
-    expect(indicators).toContain('!props.unityConnected && !props.unityPluginStatus');
+    expect(indicators).toContain('&& !props.unityConnected');
+    expect(indicators).toContain('&& !props.unityPluginStatus');
+    expect(indicators).toContain('&& !unityRecompileWaitingConnection.value');
     expect(indicators).toContain('const effectiveUnityLaunchState = computed<UnityLaunchState>(() =>');
     expect(indicators).toContain('if (effectiveUnityLaunchState.value === "starting") return t("chat.unity.launching");');
     expect(indicators).toContain('return t("chat.status.unity.waitingConnection");');
@@ -118,5 +122,21 @@ describe("chat status indicators", () => {
     expect(zh).toContain('"chat.status.unity.launch": "启动"');
     expect(zh).toContain('"chat.status.unity.waitingConnection": "等待连接"');
     expect(zh).toContain('"chat.status.unity.launchTitle": "启动 Unity 项目"');
+  });
+
+  it("shows Unity recompile reconnect waits as the accent connection state", () => {
+    const chatView = read("src/components/ChatView.vue");
+    const indicators = read("src/components/chat/ChatStatusIndicators.vue");
+    const zh = read("src/language/zh.json");
+    const en = read("src/language/en.json");
+
+    expect(chatView).toContain("function hasRunningUnityRecompile(calls: ToolCallDisplay[] | undefined): boolean");
+    expect(chatView).toContain('call.name === "unity_recompile" && call.status === "running"');
+    expect(chatView).toContain("const unityRecompileActive = computed(() => hasRunningUnityRecompile(props.activeToolCalls));");
+    expect(indicators).toContain("const unityRecompileWaitingConnection = computed(() =>");
+    expect(indicators).toContain('if (unityRecompileWaitingConnection.value) return t("chat.unity.waitingRecompileConnection");');
+    expect(indicators).toContain('unityRecompileWaitingConnection.value || effectiveUnityLaunchState.value !== "idle"');
+    expect(zh).toContain('"chat.unity.waitingRecompileConnection": "Unity 重编译中，等待重连"');
+    expect(en).toContain('"chat.unity.waitingRecompileConnection": "Unity recompiling, waiting for reconnect"');
   });
 });

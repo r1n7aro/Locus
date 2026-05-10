@@ -187,6 +187,14 @@ const props = defineProps<{
   sessionPanelStorageScope?: string;
 }>();
 
+function hasRunningUnityRecompile(calls: ToolCallDisplay[] | undefined): boolean {
+  return !!calls?.some((call) =>
+    (call.name === "unity_recompile" && call.status === "running")
+    || hasRunningUnityRecompile(call.nestedToolCalls),
+  );
+}
+
+const unityRecompileActive = computed(() => hasRunningUnityRecompile(props.activeToolCalls));
 
 const emit = defineEmits<{
   send: [text: string, images: ImageAttachment[], assetRefs: AssetRefAttachment[], overrides?: { displayText?: string; mode?: string; userIntent?: UserIntentMeta | null }];
@@ -1484,6 +1492,7 @@ onUnmounted(() => {
             :unity-plugin-installing="unityPluginInstalling"
             :unity-launching="unityLaunching"
             :unity-launch-state="unityLaunchState"
+            :unity-recompiling="unityRecompileActive"
             :working-dir="workingDir"
             :is-unity-project="isUnityProject"
             :scan-phase="scanPhase"

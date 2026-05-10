@@ -170,7 +170,13 @@ mod windows_impl {
                 }
             };
 
-            if let Some(reply_to) = env.reply_to.clone() {
+            let reply_to = env
+                .reply_to
+                .clone()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty());
+
+            if let Some(reply_to) = reply_to {
                 let tx = {
                     let mut pending = conn.pending.lock().await;
                     pending.remove(&reply_to)

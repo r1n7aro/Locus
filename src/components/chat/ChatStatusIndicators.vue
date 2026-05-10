@@ -42,6 +42,7 @@ const props = defineProps<{
   unityPluginInstalling?: boolean;
   unityLaunching?: boolean;
   unityLaunchState?: UnityLaunchState;
+  unityRecompiling?: boolean;
   workingDir?: string;
   isUnityProject?: boolean;
   scanPhase?: AssetDbScanEvent | null;
@@ -124,8 +125,15 @@ const effectiveUnityLaunchState = computed<UnityLaunchState>(() => {
   return props.unityLaunching ? "starting" : "idle";
 });
 
+const unityRecompileWaitingConnection = computed(() =>
+  !!props.unityRecompiling
+  && !props.unityConnected
+  && !props.unityPluginStatus,
+);
+
 const unitySummary = computed(() => {
   if (unityPluginLabel.value) return unityPluginLabel.value;
+  if (unityRecompileWaitingConnection.value) return t("chat.unity.waitingRecompileConnection");
   if (effectiveUnityLaunchState.value === "starting") return t("chat.unity.launching");
   if (effectiveUnityLaunchState.value === "waitingConnection") return t("chat.unity.waitingConnection");
   return props.unityConnected ? t("chat.unity.connected") : t("chat.unity.disconnected");
@@ -136,13 +144,16 @@ const unityTone = computed<StatusTone>(() =>
     ? "danger"
     : props.unityConnected
       ? "success"
-      : effectiveUnityLaunchState.value !== "idle"
+      : unityRecompileWaitingConnection.value || effectiveUnityLaunchState.value !== "idle"
         ? "accent"
         : "danger",
 );
 
 const unityCanLaunch = computed(() =>
-  !!props.isUnityProject && !props.unityConnected && !props.unityPluginStatus,
+  !!props.isUnityProject
+  && !props.unityConnected
+  && !props.unityPluginStatus
+  && !unityRecompileWaitingConnection.value,
 );
 
 const unityActionLabel = computed(() => {
@@ -282,7 +293,9 @@ const statusItems = computed<StatusItem[]>(() => [
     actionTitle: unityActionTitle.value,
     actionDisabled: props.unityPluginStatus
       ? props.unityPluginInstalling
-      : effectiveUnityLaunchState.value !== "idle" || !props.isUnityProject,
+      : unityRecompileWaitingConnection.value
+        || effectiveUnityLaunchState.value !== "idle"
+        || !props.isUnityProject,
     actionVariant: props.unityPluginStatus ? "neutral" : "primary",
   },
 ]);

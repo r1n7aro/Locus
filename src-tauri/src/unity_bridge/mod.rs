@@ -1347,6 +1347,56 @@ pub async fn unity_execute_code(project_path: &str, code: &str) -> Result<String
     unity_execute_code_with_progress(project_path, code, |_| {}).await
 }
 
+async fn wait_for_unity_bridge_ready_after_recompile(project_path: &str) -> Result<(), String> {
+    let max_wait = Duration::from_secs(30);
+    let start = std::time::Instant::now();
+
+    loop {
+        let detail =
+            match send_message_with_timeout(project_path, "status", "", Duration::from_secs(5))
+                .await
+            {
+                Ok(resp) if resp.ok => return Ok(()),
+                Ok(resp) => resp
+                    .error
+                    .unwrap_or_else(|| "Unity status returned ok=false".to_string()),
+                Err(error) => error,
+            };
+
+        if start.elapsed() > max_wait {
+            return Err(format!(
+                "Timed out waiting for Unity bridge to become ready after recompile (30s): {}",
+                detail
+            ));
+        }
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+async fn refresh_unity_type_index_after_recompile(project_path: &str) -> Result<(), String> {
+    const MAX_ATTEMPTS: u32 = 3;
+    let mut last_error = String::new();
+
+    for attempt in 1..=MAX_ATTEMPTS {
+        match refresh_unity_type_index(project_path).await {
+            Ok(_) => return Ok(()),
+            Err(error) => {
+                last_error = error;
+                eprintln!(
+                    "[Locus] Unity type index refresh after recompile attempt {}/{} failed: {}",
+                    attempt, MAX_ATTEMPTS, last_error
+                );
+                if attempt < MAX_ATTEMPTS {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+        }
+    }
+
+    Err(last_error)
+}
+
 /// Trigger a Unity recompile and wait until the new domain is ready.
 ///
 /// Flow:
@@ -1376,7 +1426,10 @@ pub async fn recompile_and_wait(project_path: &str) -> Result<String, String> {
         );
     }
 
-    let resp = send_message(project_path, "request_recompile", "").await?;
+    let resp = match send_message(project_path, "request_recompile", "").await {
+        Ok(resp) => resp,
+        Err(error) => return finish(Err(error)),
+    };
     if !resp.ok {
         return finish(Err(resp
             .error
@@ -1400,12 +1453,13 @@ pub async fn recompile_and_wait(project_path: &str) -> Result<String, String> {
                 Ok(resp) if resp.ok => {
                     eprintln!("[Locus] Unity reconnected after domain reload");
                     crate::unity_type_index::invalidate_cached_type_index(project_path).await;
-                    transport::disconnect_with_reason(
-                        project_path,
-                        "Unity reconnected after domain reload",
-                    )
-                    .await;
-                    if let Err(error) = refresh_unity_type_index(project_path).await {
+                    if let Err(error) =
+                        wait_for_unity_bridge_ready_after_recompile(project_path).await
+                    {
+                        return finish(Err(error));
+                    }
+                    if let Err(error) = refresh_unity_type_index_after_recompile(project_path).await
+                    {
                         eprintln!(
                             "[Locus] Unity type index refresh after recompile skipped: {}",
                             error
@@ -1429,12 +1483,14 @@ pub async fn recompile_and_wait(project_path: &str) -> Result<String, String> {
                         "ok" => {
                             crate::unity_type_index::invalidate_cached_type_index(project_path)
                                 .await;
-                            transport::disconnect_with_reason(
-                                project_path,
-                                "Unity recompile completed",
-                            )
-                            .await;
-                            if let Err(error) = refresh_unity_type_index(project_path).await {
+                            if let Err(error) =
+                                wait_for_unity_bridge_ready_after_recompile(project_path).await
+                            {
+                                return finish(Err(error));
+                            }
+                            if let Err(error) =
+                                refresh_unity_type_index_after_recompile(project_path).await
+                            {
                                 eprintln!(
                                     "[Locus] Unity type index refresh after recompile skipped: {}",
                                     error
