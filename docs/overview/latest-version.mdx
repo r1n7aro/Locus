@@ -1,9 +1,9 @@
 ---
 title: "当前版本"
-description: "Locus v0.2.12 (2026-05-09)"
+description: "Locus v0.2.13 (2026-05-10)"
 sidebarTitle: "当前版本"
-version: "0.2.12"
-releasedAt: "2026-05-09"
+version: "0.2.13"
+releasedAt: "2026-05-10"
 channel: "stable"
 updateTitle: "发现新版本"
 changelogUrl: "/overview/latest-version"
@@ -17,19 +17,16 @@ changelogUrl: "/overview/latest-version"
 
 ### 新增
 
-- QQ群号：1104932978，欢迎加入交流，现在可以搜索到了，之前没有开搜索。
-- 聊天支持接收 Unity 编辑器上下文引用。Unity 资产与场景对象可从编辑器发送到输入区，以引用形式随消息发送，并可在转录中重新选择或打开。
-- 自定义 endpoint 支持 `xhigh` 推理强度，可用于 GPT-5 / Codex 风格的最高推理档位。
-- 自定义 Anthropic Messages 端点新增服务器端工具选项，可按端点启用 Anthropic 原生 `web_search`。
-- 自定义端点设置会保存服务器端工具偏好，旧端点配置默认关闭服务器端联网搜索。
+- GPT-5.5 现在作为 Codex 默认 fallback 模型，GPT-5.4 保留为后备 fallback。
+- 自定义 Anthropic Messages 端点支持配置推理内容回放。
+- 英文与中文 README 新增 Star History 图表。
 
 ### 修复
 
-- Unity 执行进度传输在进度临时不可用、管道重连与取消收尾时更稳定。
-- 中断已取消的运行后，文件变更面板会继续显示该轮产生的变更。
-- Unity 嵌入窗口获得输入焦点时，系统通知会保持静默。
-- 自定义 Anthropic Messages 请求只在端点启用时发送 Anthropic 原生 `web_search`，避免兼容端点收到不支持的服务器端工具载荷。
-- Chat Completions 调试日志在流式工具调用元数据不完整时，会记录模型、端点格式与最近的原始响应片段，便于定位兼容端点问题。
+- 自定义 Anthropic Messages 端点默认关闭推理内容回放，并且只在启用回放时发送带签名的 thinking block。
+- Unity 重编译后会等待 bridge 就绪，再刷新类型索引。
+- 聊天状态会在 Unity 重编译重连期间显示等待重连状态，并在等待期间禁用启动操作。
+- Unity bridge transport 会忽略 trim 后为空的 `reply_to` 值。
 
 ### 移除
 

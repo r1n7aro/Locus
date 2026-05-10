@@ -1,9 +1,9 @@
 ---
 title: "Latest Version"
-description: "Locus v0.2.12 (2026-05-09)"
+description: "Locus v0.2.13 (2026-05-10)"
 sidebarTitle: "Latest Version"
-version: "0.2.12"
-releasedAt: "2026-05-09"
+version: "0.2.13"
+releasedAt: "2026-05-10"
 channel: "stable"
 updateTitle: "Update available"
 changelogUrl: "/en/overview/latest-version"
@@ -17,19 +17,16 @@ changelogUrl: "/en/overview/latest-version"
 
 ### Added
 
-- Made QQ group 1104932978 searchable for community discussion.
-- Added Unity editor context references in chat. Unity assets and scene objects can be sent from the editor into the composer, included with messages as references, and reopened or selected from the transcript.
-- Added `xhigh` reasoning effort support for custom endpoints that expose GPT-5 / Codex-style effort levels.
-- Added a Server Tools option for custom Anthropic Messages endpoints. Users can enable Anthropic native `web_search` per endpoint.
-- Custom endpoint settings now persist server tool preferences and default legacy endpoint configs to server-side web search disabled.
+- Added GPT-5.5 as the default Codex fallback model, with GPT-5.4 kept as the secondary fallback.
+- Added a reasoning replay setting for custom Anthropic Messages endpoints.
+- Added a Star History chart to the English and Chinese READMEs.
 
 ### Fixed
 
-- Hardened Unity execute progress transport around temporarily unavailable progress snapshots, pipe reconnects, and cancellation draining.
-- File changes from a cancelled run now remain visible after interruption.
-- System notifications now stay silent while the embedded Unity window has input focus.
-- Custom Anthropic Messages requests now include Anthropic native `web_search` only when the endpoint enables it, avoiding unsupported server tool payloads for compatible custom endpoints.
-- Chat Completions debug logs now include the model, endpoint flavor, and recent raw response chunk when streamed tool-call metadata is incomplete, making compatible endpoint issues easier to diagnose.
+- Custom Anthropic Messages endpoints now default reasoning replay to disabled and only replay signed thinking blocks when replay is enabled.
+- Unity recompilation now waits for the bridge to become ready before refreshing the type index.
+- Unity recompile status now shows a reconnect waiting state in chat and disables the launch action while reconnect is pending.
+- Unity bridge transport now ignores empty `reply_to` values after trimming.
 
 ### Removed
 
