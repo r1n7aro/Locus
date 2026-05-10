@@ -35,16 +35,20 @@ describe("useModelStore OpenAI effort mapping", () => {
     modelServiceMocks.saveLastEffort.mockResolvedValue(undefined);
   });
 
-  it("uses GPT-5.4 as the Codex fallback catalog", () => {
+  it("includes GPT-5.5 and GPT-5.4 in the Codex fallback catalog", () => {
     const authStore = useAuthStore();
     authStore.codexAuthenticated = true;
     const modelStore = useModelStore();
 
+    expect(modelStore.codexModels.map((model) => model.id)).toEqual([
+      "openai/gpt-5.5",
+      "openai/gpt-5.4",
+    ]);
+    expect(modelStore.availableModels.some((model) => model.id === "openai/gpt-5.5")).toBe(true);
     expect(modelStore.availableModels.some((model) => model.id === "openai/gpt-5.4")).toBe(true);
-    expect(modelStore.availableModels.some((model) => model.id === "openai/gpt-5.5")).toBe(false);
   });
 
-  it("exposes GPT-5.5 only after the remote Codex catalog returns it", async () => {
+  it("uses the remote Codex catalog when it is available", async () => {
     const authStore = useAuthStore();
     authStore.codexAuthenticated = true;
     modelServiceMocks.getCodexAvailableModels.mockResolvedValue([

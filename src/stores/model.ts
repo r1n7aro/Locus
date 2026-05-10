@@ -26,13 +26,22 @@ const builtinModels: ModelOption[] = [
 
 const codexFallbackModels: ModelOption[] = [
   {
+    id: "openai/gpt-5.5",
+    name: "GPT-5.5",
+    provider: "openai_codex",
+    defaultEffort: "medium",
+    supportedEfforts: ["low", "medium", "high", "xhigh"],
+    additionalSpeedTiers: ["fast"],
+    isDefault: true,
+  },
+  {
     id: "openai/gpt-5.4",
     name: "GPT-5.4",
     provider: "openai_codex",
     defaultEffort: "medium",
     supportedEfforts: ["low", "medium", "high", "xhigh"],
     additionalSpeedTiers: ["fast"],
-    isDefault: true,
+    isDefault: false,
   },
 ];
 
