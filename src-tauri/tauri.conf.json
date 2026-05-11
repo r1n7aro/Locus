@@ -49,6 +49,11 @@
       "../agent": "agent/",
       "../knowledge": "knowledge/",
       "../locus_unity": "locus_unity/"
+    },
+    "windows": {
+      "nsis": {
+        "template": "nsis/installer.nsi"
+      }
     }
   }
 }
