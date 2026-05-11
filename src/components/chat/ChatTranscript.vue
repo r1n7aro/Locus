@@ -12,6 +12,7 @@ import {
   buildMessageToolCalls,
   cloneToolCallMatchState,
   collectToolCallDisplayIds,
+  collectToolCallDisplayIdMatchState,
   collectToolCallDisplayMatchState,
   filterToolCallsByConsumableMatchState,
   firstToolCallRenderOrder,
@@ -588,7 +589,7 @@ onUnmounted(() => {
 
 const activeToolCallMatchState = computed<ToolCallMatchState>(() => {
   if (props.activeToolCalls.length > 0) {
-    return collectToolCallDisplayMatchState(props.activeToolCalls);
+    return collectToolCallDisplayIdMatchState(props.activeToolCalls);
   }
   return toolCallHandoff.value?.toolCallMatchState ?? {
     ids: new Set<string>(),

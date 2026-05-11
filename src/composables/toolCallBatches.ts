@@ -285,6 +285,14 @@ export function collectToolCallDisplayMatchState(toolCalls: ToolCallDisplay[]): 
   return { ids, fingerprintCounts, idFingerprints };
 }
 
+export function collectToolCallDisplayIdMatchState(toolCalls: ToolCallDisplay[]): ToolCallMatchState {
+  return {
+    ids: collectToolCallDisplayIds(toolCalls),
+    fingerprintCounts: new Map<string, number>(),
+    idFingerprints: new Map<string, string>(),
+  };
+}
+
 export function mergeToolCallMatchStates(...states: ToolCallMatchState[]): ToolCallMatchState {
   const ids = new Set<string>();
   const fingerprintCounts = new Map<string, number>();

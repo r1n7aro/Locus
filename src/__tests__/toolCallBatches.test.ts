@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   buildMessageToolCalls,
   collectToolCallDisplayIds,
+  collectToolCallDisplayIdMatchState,
   collectToolCallDisplayMatchState,
   filterToolCallsByConsumableMatchState,
   filterToolCallsByActiveIds,
@@ -281,6 +282,33 @@ describe("toolCallBatches", () => {
         arguments: "{\"path\":\"Assets/Scripts/TestMonoB.cs\"}",
       },
     ]);
+  });
+
+  it("keeps prior identical tools visible while a new active tool is running", () => {
+    const hiddenState = collectToolCallDisplayIdMatchState([
+      {
+        id: "active-recompile",
+        name: "unity_recompile",
+        arguments: "{\"project_path\":\"F:/Unity/Game\",\"editor_status\":\"editing\"}",
+        status: "running",
+      },
+    ]);
+
+    const priorRecompile = {
+      id: "history-recompile",
+      name: "unity_recompile",
+      arguments: "{\"project_path\":\"F:/Unity/Game\",\"editor_status\":\"editing\"}",
+    };
+
+    expect(filterToolCallsByConsumableMatchState([priorRecompile], hiddenState)).toEqual([
+      priorRecompile,
+    ]);
+    expect(filterToolCallsByConsumableMatchState([
+      {
+        ...priorRecompile,
+        id: "active-recompile",
+      },
+    ], hiddenState)).toBeUndefined();
   });
 
   it("consumes transient semantic matches once across a transcript tail", () => {
