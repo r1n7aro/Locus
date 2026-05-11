@@ -2532,6 +2532,12 @@ function labelForProvider(provider?: string | null): string {
   transition: width 0.16s ease;
 }
 
+.preview-side-rail:has(.meta-dropdown.open) {
+  position: relative;
+  z-index: 20;
+  overflow: visible;
+}
+
 .preview-side-rail.is-resizing {
   transition: none;
 }
@@ -2628,6 +2634,11 @@ function labelForProvider(provider?: string | null): string {
   width: 100%;
   min-height: 0;
   overflow: auto;
+}
+
+.preview-side-rail:has(.meta-dropdown.open) .preview-side-rail-body,
+.preview-side-rail:has(.meta-dropdown.open) .preview-side-rail-panel {
+  overflow: visible;
 }
 
 .preview-side-rail-panel-meta {

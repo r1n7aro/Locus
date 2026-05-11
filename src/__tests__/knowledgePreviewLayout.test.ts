@@ -156,6 +156,17 @@ describe("KnowledgePreview layout", () => {
     expect(preview).not.toContain("BaseCheckbox");
   });
 
+  it("keeps metadata dropdowns in place while raising the open side rail", () => {
+    const preview = read("src/components/knowledge/KnowledgePreview.vue");
+    const dropdown = read("src/components/ui/BaseDropdown.vue");
+
+    expect(dropdown).toContain(':class="[`size-${size}`, { open }]"');
+    expect(dropdown).not.toContain("<Teleport");
+    expect(preview).not.toContain("teleport");
+    expect(preview).toMatch(/\.preview-side-rail:has\(\.meta-dropdown\.open\)\s*\{[\s\S]*z-index:\s*20;[\s\S]*overflow:\s*visible;/);
+    expect(preview).toMatch(/\.preview-side-rail:has\(\.meta-dropdown\.open\) \.preview-side-rail-body,[\s\S]*\.preview-side-rail:has\(\.meta-dropdown\.open\) \.preview-side-rail-panel\s*\{[\s\S]*overflow:\s*visible;/);
+  });
+
   it("shows skill command fields only for command-capable skill surfaces", () => {
     const preview = read("src/components/knowledge/KnowledgePreview.vue");
 

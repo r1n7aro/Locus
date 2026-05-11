@@ -161,7 +161,7 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div ref="rootRef" class="base-dropdown" :class="[`size-${size}`]" @keydown.capture="onKeydown">
+  <div ref="rootRef" class="base-dropdown" :class="[`size-${size}`, { open }]" @keydown.capture="onKeydown">
     <button
       ref="triggerRef"
       class="base-dropdown-trigger"
