@@ -437,8 +437,20 @@ fn build_history_transport_request(
     history: &[ChatMessage],
     response_request_metadata: Option<&HashMap<String, serde_json::Value>>,
     include_type_field: bool,
+    use_previous_response_id: bool,
 ) -> serde_json::Value {
-    let request_input = build_history_request_input(body, history, response_request_metadata);
+    let request_input = if use_previous_response_id {
+        build_history_request_input(body, history, response_request_metadata)
+    } else {
+        ContinuationRequestInput {
+            input: body
+                .get("input")
+                .and_then(|value| value.as_array())
+                .cloned()
+                .unwrap_or_else(|| build_input(history)),
+            previous_response_id: None,
+        }
+    };
     apply_transport_request_input(body, request_input, include_type_field)
 }
 
@@ -1865,6 +1877,7 @@ where
         history,
         response_request_metadata,
         /*include_type_field*/ false,
+        /*use_previous_response_id*/ false,
     );
     let raw_request = serde_json::to_string_pretty(&request_body).unwrap_or_default();
     let api_url = codex_responses_endpoint(base_url);
@@ -3396,6 +3409,7 @@ mod tests {
             ],
             Some(&response_request_metadata("assistant-1", &body)),
             /*include_type_field*/ true,
+            /*use_previous_response_id*/ true,
         );
 
         assert_eq!(
@@ -3410,6 +3424,44 @@ mod tests {
                 .and_then(|value| value.as_array())
                 .map(|items| items.len()),
             Some(2)
+        );
+    }
+
+    #[test]
+    fn history_transport_request_replays_full_input_when_previous_response_id_disabled() {
+        let body = serde_json::json!({
+            "model": "gpt-5.4",
+            "input": build_input(&[
+                assistant_message("assistant-1", "call tools", Some("resp_prev")),
+                tool_message("tool-1", "call_1", "done"),
+                user_message_with_images("continue", vec![]),
+            ]),
+            "stream": true,
+            "store": false,
+            "instructions": "You are Codex",
+            "tools": [{"type":"function","name":"read","description":"Read a file","parameters":{"type":"object"}}],
+            "tool_choice": "auto",
+        });
+        let request = build_history_transport_request(
+            &body,
+            &[
+                assistant_message("assistant-1", "call tools", Some("resp_prev")),
+                tool_message("tool-1", "call_1", "done"),
+                user_message_with_images("continue", vec![]),
+            ],
+            Some(&response_request_metadata("assistant-1", &body)),
+            /*include_type_field*/ false,
+            /*use_previous_response_id*/ false,
+        );
+
+        assert!(request.get("previous_response_id").is_none());
+        assert!(request.get("type").is_none());
+        assert_eq!(
+            request
+                .get("input")
+                .and_then(|value| value.as_array())
+                .map(|items| items.len()),
+            Some(3)
         );
     }
 
@@ -3456,6 +3508,7 @@ mod tests {
             &history,
             Some(&response_request_metadata("assistant-1", &previous_body)),
             /*include_type_field*/ true,
+            /*use_previous_response_id*/ true,
         );
 
         assert_eq!(
@@ -3503,6 +3556,7 @@ mod tests {
             ],
             Some(&response_request_metadata("assistant-1", &previous_body)),
             /*include_type_field*/ true,
+            /*use_previous_response_id*/ true,
         );
 
         assert!(request.get("previous_response_id").is_none());
