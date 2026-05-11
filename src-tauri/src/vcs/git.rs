@@ -519,6 +519,7 @@ impl GitProvider {
                 "diff-tree",
                 "-r",
                 "--name-status",
+                "--find-renames",
                 "--no-commit-id",
                 checkpoint_id,
                 &after_ref,
@@ -768,6 +769,55 @@ mod tests {
             .expect("diff_files should succeed");
         assert_eq!(changed, vec!["D\ttest1.cs".to_string()]);
         assert_eq!(git(&repo, &["status", "--short"]), "");
+
+        std::fs::remove_dir_all(&repo).expect("cleanup temp repo");
+    }
+
+    #[tokio::test]
+    async fn diff_files_detects_renamed_file_with_small_edit() {
+        if !git_available() {
+            return;
+        }
+
+        let repo = setup_repo("git-diff-rename");
+        let old_dir = repo.join("GameLogic").join("MVVM");
+        let new_dir = repo.join("UIModule").join("MVVM");
+        std::fs::create_dir_all(&old_dir).expect("create old dir");
+        let old_path = old_dir.join("AsyncCommand.cs");
+        write_file(
+            &old_path,
+            "namespace GameLogic.MVVM\n{\n    public sealed class AsyncCommand : ICommand\n    {\n        public void Execute() {}\n    }\n}\n",
+        );
+        git(&repo, &["add", "GameLogic/MVVM/AsyncCommand.cs"]);
+        git(&repo, &["commit", "-m", "add async command"]);
+
+        let provider = GitProvider;
+        let checkpoint = provider
+            .checkpoint(&repo.to_string_lossy(), "agent round")
+            .await
+            .expect("checkpoint should succeed")
+            .expect("checkpoint should exist");
+
+        std::fs::create_dir_all(&new_dir).expect("create new dir");
+        let new_path = new_dir.join("AsyncCommand.cs");
+        std::fs::rename(&old_path, &new_path).expect("rename file");
+        write_file(
+            &new_path,
+            "namespace UIModule.MVVM\n{\n    public sealed class AsyncCommand : ICommand\n    {\n        public void Execute() {}\n    }\n}\n",
+        );
+
+        let changed = GitProvider::diff_files(&repo.to_string_lossy(), &checkpoint.id)
+            .await
+            .expect("diff_files should succeed");
+        assert_eq!(changed.len(), 1);
+        let parts: Vec<&str> = changed[0].split('\t').collect();
+        assert_eq!(parts.len(), 3);
+        assert!(
+            parts[0].starts_with('R'),
+            "expected rename, got {changed:?}"
+        );
+        assert_eq!(parts[1], "GameLogic/MVVM/AsyncCommand.cs");
+        assert_eq!(parts[2], "UIModule/MVVM/AsyncCommand.cs");
 
         std::fs::remove_dir_all(&repo).expect("cleanup temp repo");
     }
