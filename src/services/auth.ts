@@ -15,6 +15,35 @@ export interface CodexStatus {
   validationError?: string | null;
 }
 
+export interface CodexRateLimitWindow {
+  usedPercent: number;
+  remainingPercent: number;
+  windowMinutes?: number | null;
+  resetsAt?: number | null;
+}
+
+export interface CodexCreditsSnapshot {
+  hasCredits: boolean;
+  unlimited: boolean;
+  balance?: string | null;
+}
+
+export interface CodexRateLimitSnapshot {
+  limitId?: string | null;
+  limitName?: string | null;
+  primary?: CodexRateLimitWindow | null;
+  secondary?: CodexRateLimitWindow | null;
+  credits?: CodexCreditsSnapshot | null;
+  planType?: string | null;
+  rateLimitReachedType?: string | null;
+}
+
+export interface CodexRateLimitsResponse {
+  fetchedAtMs: number;
+  rateLimits: CodexRateLimitSnapshot;
+  rateLimitsByLimitId: Record<string, CodexRateLimitSnapshot>;
+}
+
 export interface CodexLoginInfo {
   userCode: string;
   url: string;
@@ -77,4 +106,8 @@ export function codexLogout(): Promise<void> {
 
 export function codexRetryAuth(): Promise<CodexStatus> {
   return ipcInvoke<CodexStatus>("codex_retry_auth");
+}
+
+export function codexRateLimits(): Promise<CodexRateLimitsResponse> {
+  return ipcInvoke<CodexRateLimitsResponse>("codex_rate_limits");
 }

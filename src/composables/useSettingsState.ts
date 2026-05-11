@@ -9,12 +9,18 @@ import {
   exchangeAuthCode,
   authLogout,
   codexStatus as fetchCodexStatus,
+  codexRateLimits as fetchCodexRateLimits,
   codexStartLogin,
   codexPollLogin,
   codexLogout as serviceCodexLogout,
   codexRetryAuth as serviceCodexRetryAuth,
 } from "../services/auth";
-import type { CodexStatus as RemoteCodexStatus } from "../services/auth";
+import type {
+  CodexRateLimitSnapshot,
+  CodexRateLimitWindow as RemoteCodexRateLimitWindow,
+  CodexRateLimitsResponse,
+  CodexStatus as RemoteCodexStatus,
+} from "../services/auth";
 import {
   getModelDefaults,
   saveModelDefaults as serviceSaveModelDefaults,
@@ -65,6 +71,32 @@ export interface CodexStatusState {
   validationError: string | null;
 }
 
+export interface CodexQuotaWindowState {
+  id: string;
+  limitId: string;
+  limitName: string | null;
+  windowType: "primary" | "secondary";
+  usedPercent: number;
+  remainingPercent: number;
+  windowMinutes: number | null;
+  resetsAt: number | null;
+}
+
+export interface CodexQuotaCreditsState {
+  unlimited: boolean;
+  balance: string | null;
+}
+
+export interface CodexQuotaState {
+  loading: boolean;
+  loaded: boolean;
+  error: string | null;
+  fetchedAtMs: number | null;
+  windows: CodexQuotaWindowState[];
+  credits: CodexQuotaCreditsState | null;
+  planType: string | null;
+}
+
 type SettingsEmit = {
   (e: "authChanged"): void;
   (e: "modelDefaultsChanged", defaults: ModelDefaults): void;
@@ -74,6 +106,18 @@ type SettingsEmit = {
 };
 
 export function useSettingsState(emit: SettingsEmit) {
+  function emptyCodexQuota(): CodexQuotaState {
+    return {
+      loading: false,
+      loaded: false,
+      error: null,
+      fetchedAtMs: null,
+      windows: [],
+      credits: null,
+      planType: null,
+    };
+  }
+
   function normalizeCodexStatus(status?: RemoteCodexStatus | null): CodexStatusState {
     return {
       authenticated: !!status?.authenticated,
@@ -88,6 +132,83 @@ export function useSettingsState(emit: SettingsEmit) {
   ): CodexModelConfig {
     return {
       transport: config?.transport === "http" ? "http" : "websocket",
+    };
+  }
+
+  function clampPercent(value: unknown, fallback: number): number {
+    const numeric = typeof value === "number" ? value : Number(value);
+    if (!Number.isFinite(numeric)) return fallback;
+    return Math.max(0, Math.min(100, numeric));
+  }
+
+  function normalizeRateLimitWindow(
+    window: RemoteCodexRateLimitWindow | null | undefined,
+    fallbackRemaining: number,
+  ): Pick<CodexQuotaWindowState, "usedPercent" | "remainingPercent" | "windowMinutes" | "resetsAt"> | null {
+    if (!window) return null;
+    const usedPercent = clampPercent(window.usedPercent, 100 - fallbackRemaining);
+    const remainingPercent = clampPercent(window.remainingPercent, 100 - usedPercent);
+    const windowMinutes = typeof window.windowMinutes === "number" && Number.isFinite(window.windowMinutes)
+      ? window.windowMinutes
+      : null;
+    const resetsAt = typeof window.resetsAt === "number" && Number.isFinite(window.resetsAt)
+      ? window.resetsAt
+      : null;
+
+    return { usedPercent, remainingPercent, windowMinutes, resetsAt };
+  }
+
+  function appendQuotaWindows(
+    result: CodexQuotaWindowState[],
+    limitId: string,
+    snapshot: CodexRateLimitSnapshot,
+  ) {
+    const limitName = snapshot.limitName ?? null;
+    const primary = normalizeRateLimitWindow(snapshot.primary, 100);
+    if (primary) {
+      result.push({
+        id: `${limitId}:primary`,
+        limitId,
+        limitName,
+        windowType: "primary",
+        ...primary,
+      });
+    }
+
+    const secondary = normalizeRateLimitWindow(snapshot.secondary, 100);
+    if (secondary) {
+      result.push({
+        id: `${limitId}:secondary`,
+        limitId,
+        limitName,
+        windowType: "secondary",
+        ...secondary,
+      });
+    }
+  }
+
+  function normalizeCodexQuota(response?: CodexRateLimitsResponse | null): CodexQuotaState {
+    if (!response?.rateLimits) return emptyCodexQuota();
+
+    const windows: CodexQuotaWindowState[] = [];
+    const primaryLimitId = response.rateLimits.limitId ?? "codex";
+    appendQuotaWindows(windows, primaryLimitId, response.rateLimits);
+
+    const credits = response.rateLimits.credits?.hasCredits
+      ? {
+          unlimited: !!response.rateLimits.credits.unlimited,
+          balance: response.rateLimits.credits.balance ?? null,
+        }
+      : null;
+
+    return {
+      loading: false,
+      loaded: true,
+      error: null,
+      fetchedAtMs: response.fetchedAtMs,
+      windows,
+      credits,
+      planType: response.rateLimits.planType ?? null,
     };
   }
 
@@ -134,6 +255,7 @@ export function useSettingsState(emit: SettingsEmit) {
     codexStep.value = "idle";
     codexRetrying.value = false;
     codexStatus.value = normalizeCodexStatus();
+    codexQuota.value = emptyCodexQuota();
     codexModelConfig.value = normalizeCodexModelConfig();
     codexUserCode.value = "";
     codexUrl.value = "";
@@ -343,6 +465,7 @@ export function useSettingsState(emit: SettingsEmit) {
   type CodexStep = "idle" | "opening" | "waiting" | "success";
   const codexStep = ref<CodexStep>("idle");
   const codexStatus = ref<CodexStatusState>(normalizeCodexStatus());
+  const codexQuota = ref<CodexQuotaState>(emptyCodexQuota());
   const codexRetrying = ref(false);
   const codexModelConfig = ref<CodexModelConfig>(normalizeCodexModelConfig());
   const codexUserCode = ref("");
@@ -372,7 +495,34 @@ export function useSettingsState(emit: SettingsEmit) {
   async function loadCodexStatus() {
     try {
       codexStatus.value = normalizeCodexStatus(await fetchCodexStatus());
+      if (!codexStatus.value.authenticated || codexStatus.value.validationFailed) {
+        codexQuota.value = emptyCodexQuota();
+      }
     } catch { /* ignore */ }
+  }
+
+  async function loadCodexRateLimits() {
+    if (!codexStatus.value.authenticated || codexStatus.value.validationFailed) {
+      codexQuota.value = emptyCodexQuota();
+      return;
+    }
+
+    codexQuota.value = {
+      ...codexQuota.value,
+      loading: true,
+      error: null,
+    };
+
+    try {
+      codexQuota.value = normalizeCodexQuota(await fetchCodexRateLimits());
+    } catch (e) {
+      const err = normalizeAppError(e);
+      codexQuota.value = {
+        ...codexQuota.value,
+        loading: false,
+        error: err.message,
+      };
+    }
   }
 
   async function loadCodexModelConfig() {
@@ -409,6 +559,7 @@ export function useSettingsState(emit: SettingsEmit) {
         stopCodexPolling();
         codexStep.value = "success";
         await loadCodexStatus();
+        await loadCodexRateLimits();
         emit("authChanged");
         successMsg.value = t("settings.codex.loginSuccess");
         setTimeout(() => { successMsg.value = ""; codexStep.value = "idle"; }, 3000);
@@ -465,6 +616,7 @@ export function useSettingsState(emit: SettingsEmit) {
     try {
       await serviceCodexLogout();
       codexStatus.value = normalizeCodexStatus();
+      codexQuota.value = emptyCodexQuota();
       emit("authChanged");
       successMsg.value = t("settings.codex.logoutSuccess");
       setTimeout(() => { successMsg.value = ""; }, 2000);
@@ -487,6 +639,7 @@ export function useSettingsState(emit: SettingsEmit) {
     errorMsg.value = "";
     try {
       codexStatus.value = normalizeCodexStatus(await serviceCodexRetryAuth());
+      await loadCodexRateLimits();
       emit("authChanged");
       successMsg.value = t("settings.codex.validationRetrySuccess");
       setTimeout(() => { successMsg.value = ""; }, 2000);
@@ -870,6 +1023,9 @@ export function useSettingsState(emit: SettingsEmit) {
 
     if (cachedCodex) codexStatus.value = normalizeCodexStatus(cachedCodex);
     else await loadCodexStatus();
+    if (codexStatus.value.authenticated && !codexStatus.value.validationFailed) {
+      void loadCodexRateLimits();
+    }
     await loadCodexModelConfig();
 
     if (cachedDefaults) modelDefaults.value = cachedDefaults;
@@ -926,6 +1082,7 @@ export function useSettingsState(emit: SettingsEmit) {
     // codex
     codexStep,
     codexStatus,
+    codexQuota,
     codexRetrying,
     codexModelConfig,
     codexUserCode,
@@ -934,6 +1091,7 @@ export function useSettingsState(emit: SettingsEmit) {
     codexDeviceAuthId,
     codexInterval,
     loadCodexStatus,
+    loadCodexRateLimits,
     loadCodexModelConfig,
     startCodexLogin,
     pollCodex,

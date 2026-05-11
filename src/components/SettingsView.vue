@@ -44,7 +44,7 @@ const {
   providers, editingProvider, editKey, errorMsg, successMsg, isLoading,
   startEdit, cancelEdit, saveKey, deleteKey, handleKeydown,
   oauthStep, oauthCode, submitOAuthCode, cancelOAuth, oauthLogout, handleOAuthKeydown,
-  codexStep, codexStatus, codexRetrying, codexModelConfig, codexUserCode, codexUrl, codexCodeCopied, cancelCodexLogin, codexLogout, retryCodexValidation, copyCode, setCodexTransportMode,
+  codexStep, codexStatus, codexQuota, codexRetrying, codexModelConfig, codexUserCode, codexUrl, codexCodeCopied, cancelCodexLogin, codexLogout, retryCodexValidation, copyCode, setCodexTransportMode, loadCodexRateLimits,
   showDisclaimer, requestOAuthLogin, requestCodexLogin, cancelDisclaimer,
   modelDefaults, modelSaveMsg, saveModelDefaults,
   permSaveMsg, toolList, toolPermissions, setToolPermission,
@@ -189,6 +189,7 @@ watch(
           :oauth-code="oauthCode"
           :codex-step="codexStep"
           :codex-status="codexStatus"
+          :codex-quota="codexQuota"
           :codex-retrying="codexRetrying"
           :codex-transport="codexModelConfig.transport"
           :codex-user-code="codexUserCode"
@@ -211,6 +212,7 @@ watch(
           @cancel-codex-login="cancelCodexLogin"
           @codex-logout="codexLogout"
           @retry-codex-validation="retryCodexValidation"
+          @refresh-codex-quota="loadCodexRateLimits"
           @copy-code="copyCode"
           @update:codex-transport="setCodexTransportMode"
           @start-add-endpoint="startAddEndpoint"

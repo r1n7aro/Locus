@@ -7,6 +7,7 @@ use tauri::{AppHandle, State};
 use crate::auth::codex::{CodexAuthState, CodexLoginInfo, CodexPollResult, CodexStatus};
 use crate::auth::{AuthState, AuthStatus, AuthUrlInfo};
 use crate::keychain;
+use crate::llm::codex_usage::CodexRateLimitsResponse;
 
 use crate::error::AppError;
 use crate::{ApiKeyState, ProviderKeysState};
@@ -330,4 +331,45 @@ pub async fn codex_retry_auth(
         .retry_validation()
         .await
         .map_err(AppError::from)
+}
+
+#[tauri::command]
+pub async fn codex_rate_limits(
+    codex: State<'_, CodexAuthStateHandle>,
+    config: State<'_, Arc<crate::config::AppConfig>>,
+) -> Result<CodexRateLimitsResponse, AppError> {
+    let (access_token, account_id) = {
+        let mut guard = codex.lock().await;
+        let access_token = guard.access_token().await.map_err(AppError::from)?;
+        let account_id = guard.account_id();
+        (access_token, account_id)
+    };
+
+    match crate::llm::codex_usage::fetch_codex_rate_limits(
+        &access_token,
+        account_id.as_deref(),
+        config.base_url.as_deref(),
+    )
+    .await
+    {
+        Ok(response) => Ok(response),
+        Err(error) if error.is_unauthorized() => {
+            let (access_token, account_id) = {
+                let mut guard = codex.lock().await;
+                guard.retry_validation().await.map_err(AppError::from)?;
+                let access_token = guard.access_token().await.map_err(AppError::from)?;
+                let account_id = guard.account_id();
+                (access_token, account_id)
+            };
+
+            crate::llm::codex_usage::fetch_codex_rate_limits(
+                &access_token,
+                account_id.as_deref(),
+                config.base_url.as_deref(),
+            )
+            .await
+            .map_err(|err| AppError::from(err.to_string()))
+        }
+        Err(error) => Err(AppError::from(error.to_string())),
+    }
 }

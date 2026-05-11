@@ -1,14 +1,14 @@
 <script setup lang="ts">
 import BaseSegmented from "../ui/BaseSegmented.vue";
 import { computed } from "vue";
-import { t } from "../../i18n";
+import { locale, t } from "../../i18n";
 import type {
   ModelOption,
   CustomEndpoint,
   ApiFormat,
   CodexTransportMode,
 } from "../../types";
-import type { CodexStatusState, ProviderStatus } from "../../composables/useSettingsState";
+import type { CodexQuotaState, CodexQuotaWindowState, CodexStatusState, ProviderStatus } from "../../composables/useSettingsState";
 import { visibleProviderOrder } from "../../config/providerVisibility";
 
 interface ModelGroup {
@@ -28,6 +28,7 @@ const props = defineProps<{
   oauthCode: string;
   codexStep: "idle" | "opening" | "waiting" | "success";
   codexStatus: CodexStatusState;
+  codexQuota: CodexQuotaState;
   codexRetrying: boolean;
   codexTransport: CodexTransportMode;
   codexUserCode: string;
@@ -55,6 +56,7 @@ const emit = defineEmits<{
   cancelCodexLogin: [];
   codexLogout: [];
   retryCodexValidation: [];
+  refreshCodexQuota: [];
   copyCode: [];
   "update:codexTransport": [value: CodexTransportMode];
   startAddEndpoint: [];
@@ -149,6 +151,58 @@ function focusSectionClass(section: "custom" | "codex") {
   return {
     "focus-section": isOnboardingMode.value && props.onboardingFocus === section,
   };
+}
+
+function formatQuotaPercent(value: number): string {
+  return Math.round(Math.max(0, Math.min(100, value))).toString();
+}
+
+function formatQuotaWindowLabel(window: CodexQuotaWindowState): string {
+  const minutes = window.windowMinutes;
+  let label: string;
+  if (!minutes || minutes <= 0) {
+    label = window.windowType === "primary"
+      ? t("settings.codex.quotaWindowPrimary")
+      : t("settings.codex.quotaWindowSecondary");
+  } else if (minutes % 10080 === 0) {
+    label = t("settings.codex.quotaWindowWeeks", minutes / 10080);
+  } else if (minutes % 1440 === 0) {
+    label = t("settings.codex.quotaWindowDays", minutes / 1440);
+  } else if (minutes % 60 === 0) {
+    label = t("settings.codex.quotaWindowHours", minutes / 60);
+  } else {
+    label = t("settings.codex.quotaWindowMinutes", minutes);
+  }
+
+  if (window.limitId !== "codex") {
+    return `${window.limitName || window.limitId} ${label}`;
+  }
+  return label;
+}
+
+function formatQuotaReset(resetsAt: number | null): string {
+  if (!resetsAt) return "";
+  const date = new Date(resetsAt * 1000);
+  if (Number.isNaN(date.getTime())) return "";
+  return date.toLocaleTimeString(locale.value === "zh" ? "zh-CN" : "en-US", {
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
+}
+
+function quotaBarStyle(window: CodexQuotaWindowState) {
+  return {
+    width: `${formatQuotaPercent(window.remainingPercent)}%`,
+  };
+}
+
+function quotaCreditsLabel() {
+  const credits = props.codexQuota.credits;
+  if (!credits) return "";
+  if (credits.unlimited) return t("settings.codex.quotaCreditsUnlimited");
+  if (credits.balance) return t("settings.codex.quotaCredits", credits.balance);
+  return "";
 }
 </script>
 
@@ -292,21 +346,67 @@ function focusSectionClass(section: "custom" | "codex") {
         </div>
       </div>
 
-      <div v-else-if="codexStep === 'idle'" class="provider-detail">
+      <div
+        v-if="codexStatus.authenticated && !codexStatus.validationFailed"
+        class="provider-detail codex-quota-detail"
+      >
+        <div class="codex-quota-copy">
+          <span class="key-hint codex-quota-label">{{ t("settings.codex.quotaLabel") }}</span>
+          <div v-if="codexQuota.windows.length > 0" class="codex-quota-list">
+            <div
+              v-for="window in codexQuota.windows"
+              :key="window.id"
+              class="codex-quota-row"
+            >
+              <span class="codex-quota-name">{{ formatQuotaWindowLabel(window) }}</span>
+              <span class="codex-quota-track" aria-hidden="true">
+                <span class="codex-quota-fill" :style="quotaBarStyle(window)"></span>
+              </span>
+              <span class="codex-quota-percent">
+                {{ t("settings.codex.quotaPercent", formatQuotaPercent(window.remainingPercent)) }}
+              </span>
+              <span v-if="formatQuotaReset(window.resetsAt)" class="codex-quota-reset">
+                {{ formatQuotaReset(window.resetsAt) }}
+              </span>
+            </div>
+            <span v-if="quotaCreditsLabel()" class="oauth-hint">{{ quotaCreditsLabel() }}</span>
+            <span v-if="codexQuota.error" class="oauth-hint codex-validation-error">
+              {{ codexQuota.error }}
+            </span>
+          </div>
+          <span v-else-if="codexQuota.loading" class="oauth-hint">{{ t("settings.codex.quotaLoading") }}</span>
+          <span v-else-if="codexQuota.error" class="oauth-hint codex-validation-error">
+            {{ codexQuota.error }}
+          </span>
+          <span v-else class="oauth-hint">{{ t("settings.codex.quotaUnavailable") }}</span>
+        </div>
+        <div class="provider-actions">
+          <button
+            class="action-btn"
+            type="button"
+            :disabled="codexQuota.loading"
+            @click="emit('refreshCodexQuota')"
+          >
+            {{ codexQuota.loading ? t("settings.codex.quotaRefreshing") : t("settings.codex.refreshQuota") }}
+          </button>
+        </div>
+      </div>
+
+      <div v-if="!codexStatus.authenticated && codexStep === 'idle'" class="provider-detail">
         <button class="oauth-login-btn" @click="emit('startCodexLogin')" :disabled="isLoading">
           {{ t("settings.codex.loginBtn") }}
         </button>
         <span class="oauth-hint">{{ t("settings.codex.hint") }}</span>
       </div>
 
-      <div v-else-if="codexStep === 'opening'" class="provider-detail">
+      <div v-else-if="!codexStatus.authenticated && codexStep === 'opening'" class="provider-detail">
         <button class="oauth-login-btn" type="button" disabled>
           {{ t("settings.codex.opening") }}
         </button>
         <span class="oauth-hint">{{ t("settings.codex.hint") }}</span>
       </div>
 
-      <div v-else-if="codexStep === 'waiting'" class="edit-form">
+      <div v-else-if="!codexStatus.authenticated && codexStep === 'waiting'" class="edit-form">
         <div class="oauth-instruction">{{ t("settings.codex.instruction") }}</div>
         <div class="codex-code-row">
           <a :href="codexUrl" target="_blank" class="codex-url">{{ codexUrl }}</a>
@@ -610,7 +710,8 @@ function focusSectionClass(section: "custom" | "codex") {
 }
 
 .codex-status-copy,
-.codex-transport-copy {
+.codex-transport-copy,
+.codex-quota-copy {
   display: flex;
   flex-direction: column;
   gap: 4px;
@@ -623,6 +724,57 @@ function focusSectionClass(section: "custom" | "codex") {
 
 .codex-transport-label {
   color: var(--text-color);
+}
+
+.codex-quota-detail {
+  align-items: flex-start;
+}
+
+.codex-quota-label {
+  color: var(--text-color);
+}
+
+.codex-quota-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: min(360px, 100%);
+}
+
+.codex-quota-row {
+  display: grid;
+  grid-template-columns: minmax(72px, 128px) minmax(120px, 1fr) 40px 44px;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.codex-quota-name,
+.codex-quota-percent,
+.codex-quota-reset {
+  white-space: nowrap;
+}
+
+.codex-quota-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.codex-quota-track {
+  position: relative;
+  height: 4px;
+  min-width: 72px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--hover-bg);
+}
+
+.codex-quota-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  border-radius: inherit;
+  background: var(--accent-color);
 }
 
 .codex-validation-label {

@@ -971,6 +971,7 @@ pub fn run() {
             commands::codex_poll_login,
             commands::codex_logout,
             commands::codex_retry_auth,
+            commands::codex_rate_limits,
             commands::diff_single_file,
             commands::diff_semantic_target,
             commands::diff_text_for_large,
