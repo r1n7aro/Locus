@@ -41,6 +41,7 @@ describe("Knowledge injection preview", () => {
   it("builds the runtime knowledge prompt with the final section layout", () => {
     const runtime = read("src-tauri/src/agent/instance/mod.rs");
     const markdownRenderer = read("src/components/MarkdownRenderer.vue");
+    const markdownCodeLines = read("src/composables/markdownCodeLines.ts");
 
     expect(runtime).toContain('"## Knowledge\\n\\n{}"');
     expect(runtime).toContain('"### Structure"');
@@ -52,7 +53,8 @@ describe("Knowledge injection preview", () => {
     expect(runtime).toContain('"## L3 Rules');
     expect(runtime).toContain('knowledge_rule::');
     expect(markdownRenderer).toContain('normalizedLang === "tree"');
-    expect(markdownRenderer).toContain('code-line code-line-tree');
+    expect(markdownRenderer).toContain('renderHighlightedCodeLines(escapeHtml(code), false)');
+    expect(markdownCodeLines).toContain('code-line code-line-tree');
     expect(runtime).not.toContain("Knowledge-related guidance and runtime context are concentrated here.");
     expect(runtime).not.toContain('"### Index"');
   });

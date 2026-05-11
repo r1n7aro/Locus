@@ -5,6 +5,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import { Marked } from "marked";
 import { markedHighlight } from "marked-highlight";
 import hljs from "../hljs";
+import { renderHighlightedCodeLines } from "../composables/markdownCodeLines";
 import { normalizeExternalMarkdownHref } from "../composables/markdownExternalLinks";
 import { injectAssetRefs, injectFileRefs, injectWorkspaceMentions } from "../composables/markdownInject";
 import { normalizeMarkdownForRender } from "../composables/markdownRender";
@@ -23,18 +24,6 @@ function escapeHtml(source: string): string {
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;");
-}
-
-function renderCodeLines(source: string, showLineNumbers = true): string {
-  const lines = source.split("\n");
-  if (lines.length > 1 && lines[lines.length - 1] === "") lines.pop();
-  return lines
-    .map((line, i) => (
-      showLineNumbers
-        ? `<span class="code-line"><span class="line-number">${i + 1}</span><span class="line-content">${line || " "}</span></span>`
-        : `<span class="code-line code-line-tree"><span class="line-content">${line || " "}</span></span>`
-    ))
-    .join("\n");
 }
 
 function escapeRegExp(source: string): string {
@@ -128,14 +117,14 @@ const md = new Marked(
     highlight(code: string, lang: string) {
       const normalizedLang = lang.trim().toLowerCase();
       if (normalizedLang === "tree") {
-        return renderCodeLines(escapeHtml(code), false);
+        return renderHighlightedCodeLines(escapeHtml(code), false);
       }
 
       let highlighted = escapeHtml(code);
       if (normalizedLang && hljs.getLanguage(normalizedLang)) {
         highlighted = hljs.highlight(code, { language: normalizedLang }).value;
       }
-      return renderCodeLines(highlighted);
+      return renderHighlightedCodeLines(highlighted);
     },
   }),
   {
