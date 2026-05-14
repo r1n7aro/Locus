@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   collectPendingContinuationToolItemIds,
+  collectPendingContinuationToolSegmentItemIds,
   createCoalescedScrollScheduler,
   createSettledScrollScheduler,
   findTrailingAssistantToolMessageId,
@@ -33,6 +34,52 @@ describe("chatViewStability", () => {
     });
 
     expect(Array.from(pendingIds)).toEqual(["m3", "m2"]);
+  });
+
+  it("keeps the tool segment after the latest body expanded until another body arrives", () => {
+    const pendingIds = collectPendingContinuationToolSegmentItemIds({
+      isStreaming: true,
+      lastGroupRole: "assistant",
+      hasTransientAssistantMessage: true,
+      segments: [
+        { type: "content" },
+        { type: "toolCalls", itemIds: ["m1"] },
+        { type: "content" },
+        { type: "toolCalls", itemIds: ["m2"] },
+      ],
+    });
+
+    expect(Array.from(pendingIds)).toEqual(["m2"]);
+  });
+
+  it("keeps trailing tool segments expanded across non-body assistant parts", () => {
+    const pendingIds = collectPendingContinuationToolSegmentItemIds({
+      isStreaming: true,
+      lastGroupRole: "assistant",
+      hasTransientAssistantMessage: true,
+      segments: [
+        { type: "content" },
+        { type: "toolCalls", itemIds: ["m2"] },
+        { type: "other" },
+      ],
+    });
+
+    expect(Array.from(pendingIds)).toEqual(["m2"]);
+  });
+
+  it("stops pinning tool segments once a later body exists", () => {
+    const pendingIds = collectPendingContinuationToolSegmentItemIds({
+      isStreaming: true,
+      lastGroupRole: "assistant",
+      hasTransientAssistantMessage: true,
+      segments: [
+        { type: "content" },
+        { type: "toolCalls", itemIds: ["m2"] },
+        { type: "content" },
+      ],
+    });
+
+    expect(Array.from(pendingIds)).toEqual([]);
   });
 
   it("stops pinning historical tool rounds once the final response arrives", () => {

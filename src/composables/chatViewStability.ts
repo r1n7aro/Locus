@@ -16,6 +16,11 @@ export interface PendingContinuationToolItem {
   toolCallCount: number;
 }
 
+export interface PendingContinuationRenderSegment {
+  type: "toolCalls" | "content" | "other";
+  itemIds?: readonly string[];
+}
+
 type TrailingToolMessage = Pick<ChatMessage, "id" | "role" | "toolCalls">;
 
 export function findTrailingAssistantToolMessageId(
@@ -55,6 +60,37 @@ export function collectPendingContinuationToolItemIds(params: {
     if (item.content.trim().length > 0) break;
     if (item.toolCallCount > 0) {
       pendingIds.add(item.id);
+    }
+  }
+
+  return pendingIds;
+}
+
+export function collectPendingContinuationToolSegmentItemIds(params: {
+  isStreaming: boolean;
+  lastGroupRole: "user" | "assistant" | null;
+  hasTransientAssistantMessage: boolean;
+  segments: PendingContinuationRenderSegment[];
+}): Set<string> {
+  const {
+    isStreaming,
+    lastGroupRole,
+    hasTransientAssistantMessage,
+    segments,
+  } = params;
+
+  if (!isStreaming || !shouldShowAssistantContinuation(lastGroupRole, hasTransientAssistantMessage)) {
+    return new Set();
+  }
+
+  const pendingIds = new Set<string>();
+  for (let index = segments.length - 1; index >= 0; index -= 1) {
+    const segment = segments[index];
+    if (!segment) continue;
+    if (segment.type === "content") break;
+    if (segment.type !== "toolCalls") continue;
+    for (const itemId of segment.itemIds ?? []) {
+      pendingIds.add(itemId);
     }
   }
 

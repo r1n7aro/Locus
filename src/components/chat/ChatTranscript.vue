@@ -4,9 +4,10 @@ import { FileText } from "lucide";
 import type { AssetRefAttachment, AssistantRenderPart, ChatMessage, ToolCallDisplay, ToolCallInfo, UserIntentMeta } from "../../types";
 import { t } from "../../i18n";
 import {
-  collectPendingContinuationToolItemIds,
+  collectPendingContinuationToolSegmentItemIds,
   shouldShowAssistantContinuation,
   shouldShowWaitingPlaceholder,
+  type PendingContinuationRenderSegment,
 } from "../../composables/chatViewStability";
 import {
   buildMessageToolCalls,
@@ -17,6 +18,8 @@ import {
   filterToolCallsByConsumableMatchState,
   firstToolCallRenderOrder,
   getToolCallInfoFingerprint,
+  hasVisibleTextPartAfterToolCalls,
+  lastToolCallRenderOrder,
   mergeSequentialAssistantToolCalls,
   mergeToolCallDisplaysWithoutDuplicates,
   mergeToolCallMatchStates,
@@ -333,8 +336,19 @@ watch(
 );
 
 const hasVisibleStreamingText = computed(() => props.streamingText.trim().length > 0);
+const hasVisibleStreamingTextAfterToolHandoff = computed(() => {
+  const handoff = toolCallHandoff.value;
+  if (!handoff) return hasVisibleStreamingText.value;
+  if (hasVisibleTextPartAfterToolCalls(props.liveRenderParts, handoff.toolCalls)) {
+    return true;
+  }
+  const handoffLastToolOrder = lastToolCallRenderOrder(handoff.toolCalls);
+  return handoffLastToolOrder > 0
+    && hasVisibleStreamingText.value
+    && props.streamingTextOrder > handoffLastToolOrder;
+});
 const shouldArmToolCallHandoffCollapse = computed(
-  () => hasVisibleStreamingText.value || !props.isStreaming,
+  () => hasVisibleStreamingTextAfterToolHandoff.value || !props.isStreaming,
 );
 
 function scheduleToolCallHandoffCollapse() {
@@ -346,6 +360,7 @@ function scheduleToolCallHandoffCollapse() {
     createdAt: handoff.createdAt,
     toolCallCount: handoff.toolCalls.length,
     visibleStreamingText: hasVisibleStreamingText.value,
+    visibleStreamingTextAfterHandoff: hasVisibleStreamingTextAfterToolHandoff.value,
     streamingTextLen: props.streamingText.length,
     isStreaming: props.isStreaming,
   });
@@ -530,6 +545,7 @@ watch(shouldArmToolCallHandoffCollapse, (shouldArm) => {
     previous: lastShouldArmToolCallHandoffCollapse,
     next: shouldArm,
     hasVisibleStreamingText: hasVisibleStreamingText.value,
+    hasVisibleStreamingTextAfterToolHandoff: hasVisibleStreamingTextAfterToolHandoff.value,
     streamingTextLen: props.streamingText.length,
     isStreaming: props.isStreaming,
     hasHandoff: !!toolCallHandoff.value,
@@ -1047,18 +1063,19 @@ const pendingContinuationToolItemIds = computed(() => {
   const groups = baseGroupedMessages.value;
   const lastGroup = groups[groups.length - 1];
 
-  return collectPendingContinuationToolItemIds({
+  const segments =
+    lastGroup?.role === "assistant"
+      ? historyRenderSegmentsForGroup(lastGroup).map((segment): PendingContinuationRenderSegment => ({
+          type: segment.type === "toolCalls" || segment.type === "content" ? segment.type : "other",
+          itemIds: segment.type === "toolCalls" ? segment.itemIds : undefined,
+        }))
+      : [];
+
+  return collectPendingContinuationToolSegmentItemIds({
     isStreaming: props.isStreaming,
     lastGroupRole: lastGroup?.role ?? null,
     hasTransientAssistantMessage: hasTransientAssistantMessage.value,
-    items:
-      lastGroup?.role === "assistant"
-        ? lastGroup.items.map((item) => ({
-            id: item.id,
-            content: item.message.content,
-            toolCallCount: toolCallsForRenderItem(item).length,
-          }))
-        : [],
+    segments,
   });
 });
 

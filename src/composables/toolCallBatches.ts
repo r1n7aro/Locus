@@ -1,4 +1,4 @@
-import type { ChatMessage, ToolCallDisplay, ToolCallInfo } from "../types";
+import type { AssistantRenderPart, ChatMessage, ToolCallDisplay, ToolCallInfo } from "../types";
 
 const INTERRUPTED_TOOL_RESULT = "工具执行被用户中止，未返回结果。";
 const GENERIC_ARGUMENT_ALIAS_GROUPS: Array<readonly [string, readonly string[]]> = [
@@ -98,6 +98,35 @@ export function firstToolCallRenderOrder(toolCalls: readonly OrderedToolCallLike
   };
   visit(toolCalls);
   return Number.isFinite(order) ? order : 0;
+}
+
+export function lastToolCallRenderOrder(toolCalls: readonly OrderedToolCallLike[]) {
+  let order = 0;
+  const visit = (items: readonly OrderedToolCallLike[]) => {
+    for (const toolCall of items) {
+      if (typeof toolCall.order === "number" && toolCall.order > 0) {
+        order = Math.max(order, toolCall.order);
+      }
+      if (toolCall.nestedToolCalls && toolCall.nestedToolCalls.length > 0) {
+        visit(toolCall.nestedToolCalls);
+      }
+    }
+  };
+  visit(toolCalls);
+  return order;
+}
+
+export function hasVisibleTextPartAfterToolCalls(
+  parts: readonly AssistantRenderPart[],
+  toolCalls: readonly OrderedToolCallLike[],
+) {
+  const lastToolOrder = lastToolCallRenderOrder(toolCalls);
+  if (lastToolOrder <= 0) return false;
+  return parts.some((part) =>
+    part.kind === "text"
+    && part.content.trim().length > 0
+    && part.order.seq > lastToolOrder,
+  );
 }
 
 export function splitToolCallsByRenderOrder<T extends OrderedToolCallLike>(

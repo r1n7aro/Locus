@@ -8,6 +8,8 @@ import {
   filterToolCallsByActiveIds,
   filterToolCallsByMatchState,
   firstToolCallRenderOrder,
+  hasVisibleTextPartAfterToolCalls,
+  lastToolCallRenderOrder,
   mergeSequentialAssistantToolCalls,
   mergeToolCallDisplaysWithoutDuplicates,
   resolveToolCallInfosForRender,
@@ -148,6 +150,61 @@ describe("toolCallBatches", () => {
     ];
 
     expect(firstToolCallRenderOrder(toolCalls)).toBe(2);
+  });
+
+  it("uses the latest nested persisted order for handoff collapse boundaries", () => {
+    const toolCalls: ToolCallDisplay[] = [
+      {
+        id: "task-1",
+        name: "task",
+        arguments: "{}",
+        status: "done",
+        order: 3,
+        nestedToolCalls: [
+          {
+            id: "read-1",
+            name: "read",
+            arguments: "{}",
+            status: "done",
+            order: 5,
+          },
+        ],
+      },
+      {
+        id: "grep-1",
+        name: "grep",
+        arguments: "{}",
+        status: "done",
+        order: 4,
+      },
+    ];
+
+    expect(lastToolCallRenderOrder(toolCalls)).toBe(5);
+  });
+
+  it("detects only body text rendered after the handoff tools", () => {
+    const toolCalls: ToolCallDisplay[] = [
+      { ...makeToolCall("done", "tc-1"), order: 3 },
+      { ...makeToolCall("done", "tc-2"), order: 4 },
+    ];
+
+    expect(hasVisibleTextPartAfterToolCalls([
+      {
+        kind: "text",
+        id: "before",
+        order: { runId: "run-1", seq: 2 },
+        content: "工具前的正文",
+      },
+    ], toolCalls)).toBe(false);
+
+    expect(hasVisibleTextPartAfterToolCalls([
+      {
+        kind: "text",
+        id: "after",
+        order: { runId: "run-1", seq: 5 },
+        content: "工具后的正文",
+      },
+    ], toolCalls)).toBe(true);
   });
 
   it("splits ordered tool groups around non-tool render boundaries", () => {
