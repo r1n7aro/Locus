@@ -1778,20 +1778,26 @@ pub async fn start_unity_monitor(
 
                 match status.last_error.as_deref() {
                     Some(error) if last_status != Some(false) => {
-                        eprintln!(
-                            "[Locus] Unity Editor not connected (pipe: {}): {}",
-                            pipe_name, error
+                        tracing::debug!(
+                            log_module = "Locus",
+                            "Unity Editor not connected (pipe: {}): {}",
+                            pipe_name,
+                            error
                         );
                     }
                     Some(error) if disconnected_attempts % 10 == 0 => {
-                        eprintln!(
-                            "[Locus] Unity reconnect still failing after {} attempt(s) (pipe: {}): {}",
-                            disconnected_attempts, pipe_name, error
+                        tracing::debug!(
+                            log_module = "Locus",
+                            "Unity reconnect still failing after {} attempt(s) (pipe: {}): {}",
+                            disconnected_attempts,
+                            pipe_name,
+                            error
                         );
                     }
                     None if last_status != Some(false) => {
-                        eprintln!(
-                            "[Locus] Unity Editor not connected (pipe: {}): status returned disconnected",
+                        tracing::debug!(
+                            log_module = "Locus",
+                            "Unity Editor not connected (pipe: {}): status returned disconnected",
                             pipe_name
                         );
                     }
