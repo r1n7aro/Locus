@@ -1,9 +1,9 @@
 ---
 title: "Latest Version"
-description: "Locus v0.2.13 (2026-05-10)"
+description: "Locus v0.2.14 (2026-05-14)"
 sidebarTitle: "Latest Version"
-version: "0.2.13"
-releasedAt: "2026-05-10"
+version: "0.2.14"
+releasedAt: "2026-05-14"
 channel: "stable"
 updateTitle: "Update available"
 changelogUrl: "/en/overview/latest-version"
@@ -17,16 +17,25 @@ changelogUrl: "/en/overview/latest-version"
 
 ### Added
 
-- Added GPT-5.5 as the default Codex fallback model, with GPT-5.4 kept as the secondary fallback.
-- Added a reasoning replay setting for custom Anthropic Messages endpoints.
-- Added a Star History chart to the English and Chinese READMEs.
+- Added Codex quota usage in Settings, including quota windows, remaining percentage, reset time, and manual refresh.
+- Added configurable approval behavior settings for Unity editor status changes and knowledge governance.
+- Added a dedicated file review window for chat diffs.
+- Added right-click reference actions in chat for files, Unity assets, scene objects, and knowledge documents.
+- Added Git diff review target support in Settings.
 
 ### Fixed
 
-- Custom Anthropic Messages endpoints now default reasoning replay to disabled and only replay signed thinking blocks when replay is enabled.
-- Unity recompilation now waits for the bridge to become ready before refreshing the type index.
-- Unity recompile status now shows a reconnect waiting state in chat and disables the launch action while reconnect is pending.
-- Unity bridge transport now ignores empty `reply_to` values after trimming.
+- Windows NSIS installs now keep the update path compatible and clean up replaced bundled resources during install.
+- Custom Codex HTTP history requests now replay the full input when previous response IDs are disabled.
+- Highlighted markdown code lines now keep their line state.
+- Active tool calls now match by ID, keeping streamed tool handoff state more stable.
+- Edit diff previews in chat now stack more reliably.
+- Knowledge side rail dropdowns now stay visible.
+- Git checkpoint diffs now detect renamed files.
+- Unity bridge execution now recovers from stalled or timed-out pipe states.
+- Unity asset search now supports quoted queries.
+- Unity reconnect polling logs are quieter.
+- Settings now show Codex quota reset dates.
 
 ### Removed
 

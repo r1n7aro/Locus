@@ -1,9 +1,9 @@
 ---
 title: "当前版本"
-description: "Locus v0.2.13 (2026-05-10)"
+description: "Locus v0.2.14 (2026-05-14)"
 sidebarTitle: "当前版本"
-version: "0.2.13"
-releasedAt: "2026-05-10"
+version: "0.2.14"
+releasedAt: "2026-05-14"
 channel: "stable"
 updateTitle: "发现新版本"
 changelogUrl: "/overview/latest-version"
@@ -17,16 +17,25 @@ changelogUrl: "/overview/latest-version"
 
 ### 新增
 
-- GPT-5.5 现在作为 Codex 默认 fallback 模型，GPT-5.4 保留为后备 fallback。
-- 自定义 Anthropic Messages 端点支持配置推理内容回放。
-- 英文与中文 README 新增 Star History 图表。
+- 设置页新增 Codex 用量显示，包含配额窗口、剩余额度、重置时间和手动刷新。
+- 新增 Unity Editor 状态变更与知识治理的审批行为配置。
+- 聊天差异新增独立文件审阅窗口。
+- 聊天引用新增右键操作，支持文件、Unity 资源、场景对象和知识文档。
+- 设置页新增 Git diff 审阅目标配置。
 
 ### 修复
 
-- 自定义 Anthropic Messages 端点默认关闭推理内容回放，并且只在启用回放时发送带签名的 thinking block。
-- Unity 重编译后会等待 bridge 就绪，再刷新类型索引。
-- 聊天状态会在 Unity 重编译重连期间显示等待重连状态，并在等待期间禁用启动操作。
-- Unity bridge transport 会忽略 trim 后为空的 `reply_to` 值。
+- Windows NSIS 安装器会保持更新兼容路径，并在安装时清理已替换的内置资源。
+- 自定义 Codex HTTP 历史请求在关闭 previous response id 时会回放完整输入。
+- Markdown 高亮代码行会保留行状态。
+- 工具调用现在按 ID 匹配，流式工具交接状态更稳定。
+- 聊天中的编辑差异预览堆叠更稳定。
+- 知识侧栏下拉菜单会保持可见。
+- Git checkpoint diff 会识别重命名文件。
+- Unity bridge 执行遇到卡住或管道超时时会尝试恢复连接。
+- Unity 资源搜索支持带引号的查询。
+- Unity 重连轮询日志更安静。
+- 设置页会显示 Codex 配额重置时间。
 
 ### 移除
 
