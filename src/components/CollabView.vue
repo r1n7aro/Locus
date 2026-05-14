@@ -2,7 +2,7 @@
 <script setup lang="ts">
 import { ref, computed, nextTick, onMounted, onUnmounted, watch } from "vue";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import type { ModelOption, GitFileChange, DiffSource, FileDiffPayload, UnmergedFileEntry, GitHistoryTarget, GitBranchTarget, GitStashEntry, GitGraphRef } from "../types";
+import type { ModelOption, GitFileChange, DiffSource, FileDiffPayload, FileDiffRequest, UnmergedFileEntry, GitHistoryTarget, GitBranchTarget, GitStashEntry, GitGraphRef } from "../types";
 import { gitCommitAction, gitBranchAction, gitStashAction, gitDiscardFile } from "../services/git";
 import GitTerminal from "./GitTerminal.vue";
 import GitInitOverlay from "./collab/GitInitOverlay.vue";
@@ -23,7 +23,9 @@ import { diffSingleFile, refetchDiffByKey } from "../services/diff";
 import { canOpenInEditor, useHideMeta, withMetaCompanionPaths } from "../composables/useHideMeta";
 import { countLocusManagedFiles } from "../composables/locusManagedFiles";
 import { useDiffProgress } from "../composables/useDiffProgress";
+import { useDisplaySettings } from "../composables/useDisplaySettings";
 import { normalizeAppError } from "../services/errors";
+import { openFileDiffReviewWindow } from "../services/chatDiffReviewWindow";
 import { t } from "../i18n";
 import {
   resolveCollabRightPanelMode,
@@ -56,6 +58,7 @@ const emit = defineEmits<{
 
 const projectStore = useProjectStore();
 const notificationStore = useNotificationStore();
+const { state: displaySettings } = useDisplaySettings();
 const { hideMeta } = useHideMeta();
 const hasWorkspace = computed(() => !!props.workingDir.trim());
 const terminalRef = ref<InstanceType<typeof GitTerminal> | null>(null);
@@ -189,6 +192,40 @@ async function onSelectFile(file: GitFileChange, source: DiffSource, commitHash?
   // Toggle: clicking the same file again closes the diff
   const nextCommitHash = source === "gitCommit" ? (commitHash ?? null) : null;
   if (
+    displaySettings.gitDiffReviewTarget !== "window"
+    && activeFilePath.value === file.path
+    && inlineDiff.value
+    && activeDiffSource.value === source
+    && activeDiffCommitHash.value === nextCommitHash
+  ) {
+    closeDiff();
+    return;
+  }
+
+  const request: FileDiffRequest = {
+    source,
+    filePath: file.path,
+    oldPath: file.oldPath,
+    commitHash,
+    detail: "full",
+  };
+
+  if (displaySettings.gitDiffReviewTarget === "window") {
+    activeFilePath.value = file.path;
+    activeDiffSource.value = source;
+    activeDiffCommitHash.value = nextCommitHash;
+    inlineDiff.value = null;
+    diffLoading.value = false;
+    diffProgress.reset();
+    try {
+      const opened = await openFileDiffReviewWindow({ request });
+      if (opened) return;
+    } catch (e) {
+      console.error("[CollabView] failed to open diff review window:", e);
+    }
+  }
+
+  if (
     activeFilePath.value === file.path
     && inlineDiff.value
     && activeDiffSource.value === source
@@ -204,13 +241,7 @@ async function onSelectFile(file: GitFileChange, source: DiffSource, commitHash?
   diffLoading.value = true;
   diffProgress.reset();
   try {
-    const payload = await diffSingleFile({
-      source,
-      filePath: file.path,
-      oldPath: file.oldPath,
-      commitHash,
-      detail: "full",
-    });
+    const payload = await diffSingleFile(request);
     inlineDiff.value = payload;
   } catch (e) {
     console.error("[CollabView] failed to fetch diff:", e);

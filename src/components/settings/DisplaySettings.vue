@@ -2,7 +2,7 @@
 import { computed, ref, onMounted } from "vue";
 import { t } from "../../i18n";
 import { useTheme, type ThemePreference } from "../../composables/useTheme";
-import { useDisplaySettings, type ChatDiffReviewTarget, type FontSlot } from "../../composables/useDisplaySettings";
+import { useDisplaySettings, type DiffReviewTarget, type FontSlot } from "../../composables/useDisplaySettings";
 import { ipcInvoke } from "../../services/ipc";
 import BaseSegmented from "../ui/BaseSegmented.vue";
 import BaseSwitch from "../ui/BaseSwitch.vue";
@@ -23,7 +23,7 @@ const themeOptions = computed(() =>
   })),
 );
 
-const chatDiffReviewOptions = computed(() => [
+const diffReviewTargetOptions = computed(() => [
   { value: "inline", label: t("settings.display.diffReviewInline") },
   { value: "window", label: t("settings.display.diffReviewWindow") },
 ]);
@@ -143,14 +143,26 @@ onMounted(async () => {
     <p class="section-desc">{{ t("settings.display.diffReviewDesc") }}</p>
 
     <div class="choice-row">
-      <span class="choice-label">{{ t("settings.display.diffReviewTarget") }}</span>
+      <span class="choice-label">{{ t("settings.display.diffReviewChatTarget") }}</span>
       <BaseSegmented
         class="choice-segmented"
         :model-value="display.chatDiffReviewTarget"
-        :options="chatDiffReviewOptions"
-        :aria-label="t('settings.display.diffReviewTarget')"
+        :options="diffReviewTargetOptions"
+        :aria-label="t('settings.display.diffReviewChatTarget')"
         size="sm"
-        @update:model-value="setDisplay('chatDiffReviewTarget', $event as ChatDiffReviewTarget)"
+        @update:model-value="setDisplay('chatDiffReviewTarget', $event as DiffReviewTarget)"
+      />
+    </div>
+
+    <div class="choice-row">
+      <span class="choice-label">{{ t("settings.display.diffReviewGitTarget") }}</span>
+      <BaseSegmented
+        class="choice-segmented"
+        :model-value="display.gitDiffReviewTarget"
+        :options="diffReviewTargetOptions"
+        :aria-label="t('settings.display.diffReviewGitTarget')"
+        size="sm"
+        @update:model-value="setDisplay('gitDiffReviewTarget', $event as DiffReviewTarget)"
       />
     </div>
   </div>

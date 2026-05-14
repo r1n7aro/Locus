@@ -127,27 +127,33 @@ describe("display settings transcript alignment", () => {
     expect(en).toContain('"settings.display.hideGitCommandSuggestions": "Hide Git command suggestions"');
   });
 
-  it("adds a chat diff review target setting that defaults to the current window", () => {
+  it("adds file diff review target settings that default to the current window", () => {
     const displaySettings = read("src/composables/useDisplaySettings.ts");
     const displayPanel = read("src/components/settings/DisplaySettings.vue");
     const chatChangesPanel = read("src/components/ChatChangesPanel.vue");
     const chatView = read("src/components/ChatView.vue");
     const chatReviewWindow = read("src/components/ChatDiffReviewWindow.vue");
     const fileDiffViewer = read("src/components/diff/FileDiffViewer.vue");
+    const collabView = read("src/components/CollabView.vue");
     const app = read("src/App.vue");
     const capability = read("src-tauri/capabilities/default.json");
     const zh = read("src/language/zh.json");
     const en = read("src/language/en.json");
 
-    expect(displaySettings).toContain('export type ChatDiffReviewTarget = "inline" | "window";');
-    expect(displaySettings).toContain("chatDiffReviewTarget: ChatDiffReviewTarget;");
+    expect(displaySettings).toContain('export type DiffReviewTarget = "inline" | "window";');
+    expect(displaySettings).toContain("chatDiffReviewTarget: DiffReviewTarget;");
+    expect(displaySettings).toContain("gitDiffReviewTarget: DiffReviewTarget;");
     expect(displaySettings).toContain('chatDiffReviewTarget: "inline",');
+    expect(displaySettings).toContain('gitDiffReviewTarget: "inline",');
 
     expect(displayPanel).toContain('<div class="section-label">{{ t("settings.display.diffReviewTitle") }}</div>');
     expect(displayPanel).toContain('<p class="section-desc">{{ t("settings.display.diffReviewDesc") }}</p>');
-    expect(displayPanel).toContain("settings.display.diffReviewTarget");
+    expect(displayPanel).toContain("settings.display.diffReviewChatTarget");
+    expect(displayPanel).toContain("settings.display.diffReviewGitTarget");
     expect(displayPanel).toContain(":model-value=\"display.chatDiffReviewTarget\"");
-    expect(displayPanel).toContain("@update:model-value=\"setDisplay('chatDiffReviewTarget', $event as ChatDiffReviewTarget)\"");
+    expect(displayPanel).toContain(":model-value=\"display.gitDiffReviewTarget\"");
+    expect(displayPanel).toContain("@update:model-value=\"setDisplay('chatDiffReviewTarget', $event as DiffReviewTarget)\"");
+    expect(displayPanel).toContain("@update:model-value=\"setDisplay('gitDiffReviewTarget', $event as DiffReviewTarget)\"");
     expect(displayPanel.indexOf("settings.display.diffReviewTitle")).toBeGreaterThan(
       displayPanel.indexOf("settings.display.panelBehaviorTitle"),
     );
@@ -157,6 +163,8 @@ describe("display settings transcript alignment", () => {
 
     expect(chatChangesPanel).toContain("displaySettings.chatDiffReviewTarget === \"window\"");
     expect(chatChangesPanel).toContain("openChatDiffReviewWindow({ request })");
+    expect(collabView).toContain("displaySettings.gitDiffReviewTarget === \"window\"");
+    expect(collabView).toContain("openFileDiffReviewWindow({ request })");
     expect(chatView).toContain("openInlineDiffInWindow");
     expect(chatView).toContain("chat.changes.openReviewWindow");
     expect(chatReviewWindow).toContain(":hide-text-display-controls=\"true\"");
@@ -175,13 +183,15 @@ describe("display settings transcript alignment", () => {
 
     expect(zh).toContain('"settings.display.panelBehaviorDesc": "控制会话面板的打开与关闭"');
     expect(zh).toContain('"settings.display.diffReviewTitle": "文件修改审查"');
-    expect(zh).toContain('"settings.display.diffReviewDesc": "选择从会话中打开文件修改时的默认位置"');
-    expect(zh).toContain('"settings.display.diffReviewTarget": "审查文件修改"');
+    expect(zh).toContain('"settings.display.diffReviewDesc": "选择文件修改审查的默认打开位置"');
+    expect(zh).toContain('"settings.display.diffReviewChatTarget": "会话修改"');
+    expect(zh).toContain('"settings.display.diffReviewGitTarget": "Git 修改"');
     expect(zh).toContain('"settings.display.diffReviewWindow": "独立窗口"');
     expect(en).toContain('"settings.display.panelBehaviorDesc": "Control how session panels open and close"');
     expect(en).toContain('"settings.display.diffReviewTitle": "File Change Review"');
-    expect(en).toContain('"settings.display.diffReviewDesc": "Choose where file changes open from the session view"');
-    expect(en).toContain('"settings.display.diffReviewTarget": "Review file changes"');
+    expect(en).toContain('"settings.display.diffReviewDesc": "Choose where file change reviews open by default"');
+    expect(en).toContain('"settings.display.diffReviewChatTarget": "Session changes"');
+    expect(en).toContain('"settings.display.diffReviewGitTarget": "Git changes"');
     expect(en).toContain('"settings.display.diffReviewWindow": "Separate window"');
   });
 

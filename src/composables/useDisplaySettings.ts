@@ -1,7 +1,9 @@
 import { reactive } from "vue";
 
 export type FontSlot = "ui" | "prose" | "monoInline" | "monoBlock" | "monoEditor";
-export type ChatDiffReviewTarget = "inline" | "window";
+export type DiffReviewTarget = "inline" | "window";
+export type ChatDiffReviewTarget = DiffReviewTarget;
+export type GitDiffReviewTarget = DiffReviewTarget;
 
 export interface DisplaySettings {
   /** Auto-open TODO panel when todos arrive */
@@ -11,7 +13,9 @@ export interface DisplaySettings {
   /** Auto-close file changes panel when a new round starts */
   changesAutoClose: boolean;
   /** Default target for reviewing chat file diffs */
-  chatDiffReviewTarget: ChatDiffReviewTarget;
+  chatDiffReviewTarget: DiffReviewTarget;
+  /** Default target for reviewing Git file diffs */
+  gitDiffReviewTarget: DiffReviewTarget;
   /** Right-align user messages in the session transcript */
   rightAlignUserMessages: boolean;
   /** Collapse completed tool call batches in chat transcript */
@@ -51,6 +55,7 @@ const defaults: DisplaySettings = {
   changesAutoOpen: true,
   changesAutoClose: true,
   chatDiffReviewTarget: "inline",
+  gitDiffReviewTarget: "inline",
   rightAlignUserMessages: true,
   compactToolCalls: true,
   hideThinkingBlocks: true,

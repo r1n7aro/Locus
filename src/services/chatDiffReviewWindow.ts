@@ -116,3 +116,5 @@ export async function openChatDiffReviewWindow(
 
   return true;
 }
+
+export const openFileDiffReviewWindow = openChatDiffReviewWindow;

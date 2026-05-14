@@ -33,6 +33,8 @@ const displaySettingsState = vi.hoisted(() => ({
   todoAutoOpen: true,
   changesAutoOpen: true,
   changesAutoClose: true,
+  chatDiffReviewTarget: "inline",
+  gitDiffReviewTarget: "inline",
   rightAlignUserMessages: false,
   compactToolCalls: true,
   hideThinkingBlocks: true,
