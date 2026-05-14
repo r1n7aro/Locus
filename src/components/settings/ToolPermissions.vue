@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { t } from "../../i18n";
+import BaseCheckbox from "../ui/BaseCheckbox.vue";
 import BaseSegmented from "../ui/BaseSegmented.vue";
 
 type ToolMode = "auto" | "ask";
@@ -14,6 +15,7 @@ interface ToolPermissionItem {
 const props = defineProps<{
   toolPermissionMode: ToolMode;
   toolList: ToolPermissionItem[];
+  behaviorList: ToolPermissionItem[];
   toolPermissions: Record<string, ToolMode>;
   permSaveMsg: string;
 }>();
@@ -29,7 +31,12 @@ const permissionOptions = [
 ] as const;
 
 function getToolMode(name: string): ToolMode {
-  return props.toolPermissions[name] ?? (props.toolList.find((tool) => tool.name === name)?.defaultMode ?? "ask");
+  const item = [...props.toolList, ...props.behaviorList].find((entry) => entry.name === name);
+  return props.toolPermissions[name] ?? (item?.defaultMode ?? "ask");
+}
+
+function setRequiresApproval(name: string, value: boolean) {
+  emit("setPermission", name, value ? "ask" : "auto");
 }
 </script>
 
@@ -52,6 +59,39 @@ function getToolMode(name: string): ToolMode {
             {{ permSaveMsg }}
           </div>
         </Transition>
+      </div>
+
+      <div class="perm-card perm-behavior-card">
+        <div class="perm-card-heading">
+          <div class="perm-card-title">{{ t("settings.perms.behaviorTitle") }}</div>
+          <div class="perm-card-desc">{{ t("settings.perms.behaviorDesc") }}</div>
+        </div>
+
+        <div class="perm-table-head perm-behavior-head" aria-hidden="true">
+          <span>{{ t("settings.perms.columnBehavior") }}</span>
+          <span>{{ t("settings.perms.columnApproval") }}</span>
+        </div>
+
+        <div class="perm-list">
+          <div
+            v-for="behavior in behaviorList"
+            :key="behavior.name"
+            class="perm-row perm-behavior-row"
+          >
+            <div class="perm-info">
+              <span class="perm-name perm-behavior-name">{{ behavior.label }}</span>
+              <span class="perm-desc">{{ behavior.desc }}</span>
+            </div>
+
+            <div class="perm-checkbox-control">
+              <BaseCheckbox
+                :model-value="getToolMode(behavior.name) === 'ask'"
+                :aria-label="behavior.label"
+                @update:model-value="setRequiresApproval(behavior.name, $event)"
+              />
+            </div>
+          </div>
+        </div>
       </div>
 
       <div class="perm-mode-row">
@@ -183,6 +223,28 @@ function getToolMode(name: string): ToolMode {
   overflow: hidden;
 }
 
+.perm-behavior-card {
+  margin-bottom: 12px;
+}
+
+.perm-card-heading {
+  padding: 12px 16px 10px;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.perm-card-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-color);
+}
+
+.perm-card-desc {
+  margin-top: 3px;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text-secondary);
+}
+
 .perm-table-head {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
@@ -235,6 +297,10 @@ function getToolMode(name: string): ToolMode {
   color: var(--text-color);
 }
 
+.perm-behavior-name {
+  font-family: inherit;
+}
+
 .perm-desc {
   font-size: 12px;
   color: var(--text-secondary);
@@ -254,6 +320,12 @@ function getToolMode(name: string): ToolMode {
 .perm-control :deep(.base-segmented-item) {
   flex: 1;
   justify-content: center;
+}
+
+.perm-checkbox-control {
+  display: flex;
+  justify-content: flex-end;
+  min-width: 96px;
 }
 
 @media (max-width: 860px) {
@@ -286,6 +358,11 @@ function getToolMode(name: string): ToolMode {
 
   .perm-control {
     width: 100%;
+  }
+
+  .perm-checkbox-control {
+    justify-content: flex-start;
+    min-width: 0;
   }
 }
 </style>

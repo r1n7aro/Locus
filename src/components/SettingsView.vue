@@ -47,7 +47,7 @@ const {
   codexStep, codexStatus, codexQuota, codexRetrying, codexModelConfig, codexUserCode, codexUrl, codexCodeCopied, cancelCodexLogin, codexLogout, retryCodexValidation, copyCode, setCodexTransportMode, loadCodexRateLimits,
   showDisclaimer, requestOAuthLogin, requestCodexLogin, cancelDisclaimer,
   modelDefaults, modelSaveMsg, saveModelDefaults,
-  permSaveMsg, toolList, toolPermissions, setToolPermission,
+  permSaveMsg, toolList, approvalBehaviorList, toolPermissions, setToolPermission,
   customEndpoints, editingEndpoint, isAddingEndpoint, customEndpointSaving, testStatus, testResult,
   startAddEndpoint, startEditEndpoint, cancelEditEndpoint, saveEndpoint, deleteEndpoint, testEndpoint,
 } = useSettingsState(emit);
@@ -239,6 +239,7 @@ watch(
         <ToolPermissions
           :tool-permission-mode="chatStore.toolPermissionMode"
           :tool-list="toolList"
+          :behavior-list="approvalBehaviorList"
           :tool-permissions="toolPermissions"
           :perm-save-msg="permSaveMsg"
           @set-global-permission-mode="chatStore.setToolPermissionMode"

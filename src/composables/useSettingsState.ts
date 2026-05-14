@@ -740,10 +740,30 @@ export function useSettingsState(emit: SettingsEmit) {
     { name: "knowledge_edit",     label: "knowledge_edit",     desc: t("tool.desc.knowledge_edit"),     defaultMode: "auto" as const },
   ]);
 
+  const approvalBehaviorList = computed(() => [
+    {
+      name: "behavior.unity_editor_status_change",
+      label: t("settings.perms.behavior.unityEditorStatusChange"),
+      desc: t("settings.perms.behavior.unityEditorStatusChangeDesc"),
+      defaultMode: "ask" as const,
+    },
+    {
+      name: "behavior.knowledge_governance",
+      label: t("settings.perms.behavior.knowledgeGovernance"),
+      desc: t("settings.perms.behavior.knowledgeGovernanceDesc"),
+      defaultMode: "ask" as const,
+    },
+  ]);
+
+  const permissionList = computed(() => [
+    ...toolList.value,
+    ...approvalBehaviorList.value,
+  ]);
+
   const toolPermissions = ref<Record<string, "auto" | "ask">>({});
 
   function getToolMode(name: string): "auto" | "ask" {
-    return toolPermissions.value[name] ?? (toolList.value.find(tl => tl.name === name)?.defaultMode ?? "ask");
+    return toolPermissions.value[name] ?? (permissionList.value.find(item => item.name === name)?.defaultMode ?? "ask");
   }
 
   async function loadToolPermissions() {
@@ -771,8 +791,8 @@ export function useSettingsState(emit: SettingsEmit) {
   async function saveToolPermissions() {
     try {
       const fullMap: Record<string, string> = {};
-      for (const tool of toolList.value) {
-        fullMap[tool.name] = getToolMode(tool.name);
+      for (const item of permissionList.value) {
+        fullMap[item.name] = getToolMode(item.name);
       }
       await serviceSaveToolPermissions(fullMap);
       permSaveMsg.value = t("settings.perms.saved");
@@ -1118,6 +1138,7 @@ export function useSettingsState(emit: SettingsEmit) {
     // tool permissions
     permSaveMsg,
     toolList,
+    approvalBehaviorList,
     toolPermissions,
     loadToolPermissions,
     setToolPermission,

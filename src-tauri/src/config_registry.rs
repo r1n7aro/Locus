@@ -446,6 +446,35 @@ fn collect_permissions(app_handle: &tauri::AppHandle, out: &mut Vec<ConfigEntry>
             current_value: current.into(),
         });
     }
+
+    let behavior_list = [
+        (
+            "behavior.unity_editor_status_change",
+            "Switch Unity Editor status",
+            "Approval mode for changing Unity Editor status during tool execution.",
+        ),
+        (
+            "behavior.knowledge_governance",
+            "Edit protected knowledge",
+            "Approval mode for protected knowledge changes, including Design, Skill, Reference, and approval-gated folders.",
+        ),
+    ];
+
+    for (name, label, desc) in behavior_list {
+        let current = perms.get(name).map(|s| s.as_str()).unwrap_or("ask");
+
+        out.push(ConfigEntry {
+            key: format!("permissions.{}", name),
+            category: "permissions".into(),
+            label: label.into(),
+            description: format!(
+                "{} 'auto' = execute without confirmation, 'ask' = require user approval.",
+                desc
+            ),
+            storage: "app_storage_dir/tool_permissions.json".into(),
+            current_value: current.into(),
+        });
+    }
 }
 
 // ── knowledge ────────────────────────────────────────────────────────────────

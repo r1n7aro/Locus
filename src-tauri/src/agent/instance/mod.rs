@@ -701,6 +701,15 @@ enum PermissionModeSetting {
     Ask,
 }
 
+const PERMISSION_BEHAVIOR_UNITY_EDITOR_STATUS_CHANGE: &str = "behavior.unity_editor_status_change";
+const PERMISSION_BEHAVIOR_KNOWLEDGE_GOVERNANCE: &str = "behavior.knowledge_governance";
+
+#[derive(Debug, Clone)]
+struct UserWaitTarget {
+    session_id: String,
+    run_id: String,
+}
+
 #[derive(Debug, Clone)]
 struct ToolConfirmAssessment {
     reasons: Vec<ToolConfirmReason>,
@@ -3967,14 +3976,49 @@ impl AgentInstance {
             return;
         }
 
-        if let Err(e) =
-            crate::unity_bridge::end_edit_session(&self.working_dir, &self.session_id).await
-        {
-            eprintln!(
-                "[Agent {}] failed to clean up Unity edit session for {}: {}",
-                self.id, self.session_id, e
-            );
+        match crate::unity_bridge::end_edit_session(&self.working_dir, &self.session_id).await {
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!(
+                    "[Agent {}] failed to clean up Unity edit session for {}: {}",
+                    self.id, self.session_id, e
+                );
+                Self::retry_unity_edit_session_cleanup(
+                    self.id.clone(),
+                    self.working_dir.clone(),
+                    self.session_id.clone(),
+                );
+            }
         }
+    }
+
+    fn retry_unity_edit_session_cleanup(agent_id: String, working_dir: String, session_id: String) {
+        tokio::spawn(async move {
+            const MAX_ATTEMPTS: u32 = 24;
+
+            for attempt in 1..=MAX_ATTEMPTS {
+                let delay_secs = if attempt <= 5 { 1 } else { 5 };
+                tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+
+                match crate::unity_bridge::end_edit_session(&working_dir, &session_id).await {
+                    Ok(msg) => {
+                        eprintln!(
+                            "[Agent {}] Unity edit session cleanup retry succeeded for {} after attempt {}: {}",
+                            agent_id, session_id, attempt, msg
+                        );
+                        return;
+                    }
+                    Err(error) => {
+                        if attempt == MAX_ATTEMPTS || attempt % 5 == 0 {
+                            eprintln!(
+                                "[Agent {}] Unity edit session cleanup retry failed for {} attempt {}/{}: {}",
+                                agent_id, session_id, attempt, MAX_ATTEMPTS, error
+                            );
+                        }
+                    }
+                }
+            }
+        });
     }
 
     #[allow(dead_code)]
@@ -6797,6 +6841,30 @@ impl AgentInstance {
         }
     }
 
+    fn permission_setting_requires_confirm(
+        mode: Option<&str>,
+        default_requires_confirm: bool,
+    ) -> bool {
+        match Self::normalize_tool_permission_mode(mode) {
+            Some(PermissionModeSetting::Auto) => false,
+            Some(PermissionModeSetting::Ask) => true,
+            None => default_requires_confirm,
+        }
+    }
+
+    fn user_wait_target(&self, run_id: &str) -> UserWaitTarget {
+        match self.parent_tool_call.as_ref() {
+            Some(parent) => UserWaitTarget {
+                session_id: parent.session_id.clone(),
+                run_id: parent.run_id.clone(),
+            },
+            None => UserWaitTarget {
+                session_id: self.session_id.clone(),
+                run_id: run_id.to_string(),
+            },
+        }
+    }
+
     fn permission_confirm_reason(
         global_mode: &str,
         tool_mode: Option<&str>,
@@ -6875,19 +6943,19 @@ impl AgentInstance {
         let normalized_global_mode = Self::normalize_global_permission_mode(&global_mode);
 
         let mut knowledge_preview: Option<KnowledgeToolConfirmPreview> = None;
-        let mut knowledge_governance_requires_confirm = false;
+        let mut knowledge_governance_triggered = false;
         if matches!(
             tool_name,
             "knowledge_create" | "knowledge_edit" | "knowledge_move" | "knowledge_delete"
         ) {
             match assess_knowledge_tool_confirmation(&self.working_dir, tool_name, args) {
                 Ok(Some(assessment)) => {
-                    knowledge_governance_requires_confirm = assessment.governance_requires_confirm;
+                    knowledge_governance_triggered = assessment.governance_requires_confirm;
                     knowledge_preview = Some(assessment.preview);
                 }
                 Ok(None) => {}
                 Err(error) => {
-                    knowledge_governance_requires_confirm = true;
+                    knowledge_governance_triggered = true;
                     eprintln!(
                         "[Agent {}] knowledge tool confirm preview failed for '{}' (id={}): {}",
                         self.id, tool_name, tool_call_id, error
@@ -6902,10 +6970,22 @@ impl AgentInstance {
                 args,
             ) {
                 if assessment.requires_confirm {
-                    knowledge_governance_requires_confirm = true;
+                    knowledge_governance_triggered = true;
                 }
             }
         }
+
+        let perms_state: tauri::State<crate::ToolPermissions> = app_handle.state();
+        let perms = perms_state.read().await;
+        let tool_mode = perms.get(tool_name).cloned();
+        let knowledge_governance_requires_confirm = knowledge_governance_triggered
+            && Self::permission_setting_requires_confirm(
+                perms
+                    .get(PERMISSION_BEHAVIOR_KNOWLEDGE_GOVERNANCE)
+                    .map(String::as_str),
+                true,
+            );
+        drop(perms);
 
         if normalized_global_mode == PermissionModeSetting::Auto
             && !knowledge_governance_requires_confirm
@@ -6916,11 +6996,6 @@ impl AgentInstance {
             );
             return ToolConfirmDecision::Allow;
         }
-
-        let perms_state: tauri::State<crate::ToolPermissions> = app_handle.state();
-        let perms = perms_state.read().await;
-        let tool_mode = perms.get(tool_name).cloned();
-        drop(perms);
 
         let assessment = Self::assess_tool_confirmation(
             &global_mode,
@@ -6946,6 +7021,7 @@ impl AgentInstance {
 
         let question_id = uuid::Uuid::new_v4().to_string();
         let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+        let wait_target = self.user_wait_target(run_id);
 
         {
             let question_store: tauri::State<crate::QuestionStore> = app_handle.state();
@@ -6953,8 +7029,8 @@ impl AgentInstance {
             store.insert(
                 question_id.clone(),
                 crate::PendingQuestionResponse {
-                    session_id: self.session_id.clone(),
-                    run_id: run_id.to_string(),
+                    session_id: wait_target.session_id.clone(),
+                    run_id: wait_target.run_id.clone(),
                     tx,
                 },
             );
@@ -6962,9 +7038,9 @@ impl AgentInstance {
 
         emit_stream(
             app_handle,
-            run_id,
+            &wait_target.run_id,
             crate::commands::StreamEvent::ToolConfirm {
-                session_id: self.session_id.clone(),
+                session_id: wait_target.session_id.clone(),
                 question_id: question_id.clone(),
                 tool_call_id: tool_call_id.to_string(),
                 display: assessment.display,
@@ -7027,8 +7103,27 @@ impl AgentInstance {
         requested_status: &str,
         run_id: &str,
     ) -> ToolConfirmDecision {
+        let perms_state: tauri::State<crate::ToolPermissions> = app_handle.state();
+        let perms = perms_state.read().await;
+        let requires_confirm = Self::permission_setting_requires_confirm(
+            perms
+                .get(PERMISSION_BEHAVIOR_UNITY_EDITOR_STATUS_CHANGE)
+                .map(String::as_str),
+            true,
+        );
+        drop(perms);
+
+        if !requires_confirm {
+            eprintln!(
+                "[Agent {}] {} status change confirm skipped (permission behavior=auto)",
+                self.id, tool_name
+            );
+            return ToolConfirmDecision::Allow;
+        }
+
         let question_id = uuid::Uuid::new_v4().to_string();
         let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+        let wait_target = self.user_wait_target(run_id);
 
         {
             let question_store: tauri::State<crate::QuestionStore> = app_handle.state();
@@ -7036,8 +7131,8 @@ impl AgentInstance {
             store.insert(
                 question_id.clone(),
                 crate::PendingQuestionResponse {
-                    session_id: self.session_id.clone(),
-                    run_id: run_id.to_string(),
+                    session_id: wait_target.session_id.clone(),
+                    run_id: wait_target.run_id.clone(),
                     tx,
                 },
             );
@@ -7045,9 +7140,9 @@ impl AgentInstance {
 
         emit_stream(
             app_handle,
-            run_id,
+            &wait_target.run_id,
             crate::commands::StreamEvent::ToolConfirm {
-                session_id: self.session_id.clone(),
+                session_id: wait_target.session_id.clone(),
                 question_id: question_id.clone(),
                 tool_call_id: tool_call_id.to_string(),
                 display: ToolConfirmDisplay::UnityEditorStatusChange(
@@ -7981,6 +8076,7 @@ impl AgentInstance {
         let question_id = uuid::Uuid::new_v4().to_string();
 
         let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+        let wait_target = self.user_wait_target(run_id);
 
         {
             let question_store: tauri::State<crate::QuestionStore> = app_handle.state();
@@ -7988,8 +8084,8 @@ impl AgentInstance {
             store.insert(
                 question_id.clone(),
                 crate::PendingQuestionResponse {
-                    session_id: self.session_id.clone(),
-                    run_id: run_id.to_string(),
+                    session_id: wait_target.session_id.clone(),
+                    run_id: wait_target.run_id.clone(),
                     tx,
                 },
             );
@@ -7997,9 +8093,9 @@ impl AgentInstance {
 
         emit_stream(
             app_handle,
-            run_id,
+            &wait_target.run_id,
             crate::commands::StreamEvent::AskUser {
-                session_id: self.session_id.clone(),
+                session_id: wait_target.session_id.clone(),
                 question_id: question_id.clone(),
                 tool_call_id: tool_call_id.to_string(),
                 question: question.clone(),
@@ -8252,26 +8348,29 @@ impl AgentInstance {
         }
 
         if crate::unity_bridge::is_play_mode_status(status) {
-            let ask_args = serde_json::json!({
-                "question": "Unity Editor is in play mode. Exit play mode to recompile scripts?",
-                "options": [
-                    { "label": "Confirm", "description": "Exit play mode and recompile" },
-                    { "label": "Cancel", "description": "Cancel this compilation" }
-                ]
-            });
-
-            let ask_result = self
-                .execute_ask(app_handle, tool_call_id, &ask_args, run_id)
-                .await;
-            if ask_result.is_error {
-                return ask_result;
-            }
-
-            if ask_result.output.contains("Cancel") {
-                return ToolResult {
-                    output: "User cancelled compilation".to_string(),
-                    is_error: false,
-                };
+            match self
+                .request_unity_editor_status_change_confirm(
+                    app_handle,
+                    "unity_recompile",
+                    tool_call_id,
+                    status,
+                    crate::unity_bridge::UNITY_EDITOR_STATUS_EDITING,
+                    run_id,
+                )
+                .await
+            {
+                ToolConfirmDecision::Allow => {}
+                ToolConfirmDecision::Deny { feedback } => {
+                    let is_error = feedback.is_some();
+                    let output = match feedback {
+                        Some(feedback) => format!(
+                            "Unity Editor status change was rejected by user feedback.\nUser feedback: {}",
+                            feedback
+                        ),
+                        None => "User cancelled compilation".to_string(),
+                    };
+                    return ToolResult { output, is_error };
+                }
             }
 
             if let Err(e) = crate::unity_bridge::exit_play_mode(&self.working_dir).await {
@@ -10485,6 +10584,24 @@ mod tests {
     }
 
     #[test]
+    fn user_wait_target_uses_parent_context_for_subagents() {
+        let mut agent = test_agent_instance(String::new());
+        let target = agent.user_wait_target("child-run");
+        assert_eq!(target.session_id, "session-test");
+        assert_eq!(target.run_id, "child-run");
+
+        agent.parent_tool_call = Some(ParentToolCall::new(
+            "parent-session".to_string(),
+            "parent-run".to_string(),
+            "task-1".to_string(),
+        ));
+
+        let target = agent.user_wait_target("child-run");
+        assert_eq!(target.session_id, "parent-session");
+        assert_eq!(target.run_id, "parent-run");
+    }
+
+    #[test]
     fn finalize_tool_call_record_preserves_nested_subagent_history() {
         let tool_call = ToolCallInfo {
             id: "task-1".to_string(),
@@ -11504,6 +11621,21 @@ Use profiler helpers.
         ));
         assert!(!AgentInstance::permission_requires_confirm(
             "ask", None, "list"
+        ));
+    }
+
+    #[test]
+    fn behavior_permission_defaults_to_approval_and_allows_auto_override() {
+        assert!(AgentInstance::permission_setting_requires_confirm(
+            None, true
+        ));
+        assert!(AgentInstance::permission_setting_requires_confirm(
+            Some("ask"),
+            true
+        ));
+        assert!(!AgentInstance::permission_setting_requires_confirm(
+            Some("auto"),
+            true
         ));
     }
 

@@ -138,10 +138,16 @@ describe("chat panel toggle layout", () => {
     const toolPermissions = read("src/components/settings/ToolPermissions.vue");
 
     expect(settingsView).toContain(':tool-permission-mode="chatStore.toolPermissionMode"');
+    expect(settingsView).toContain(':behavior-list="approvalBehaviorList"');
     expect(settingsView).toContain('@set-global-permission-mode="chatStore.setToolPermissionMode"');
     expect(toolPermissions).toContain("settings.perms.globalMode");
     expect(toolPermissions).toContain("settings.perms.globalModeDesc");
+    expect(toolPermissions).toContain("settings.perms.behaviorTitle");
+    expect(toolPermissions).toContain("BaseCheckbox");
     expect(toolPermissions).toContain("emit('setGlobalPermissionMode', $event as ToolMode)");
+    expect(toolPermissions.indexOf("settings.perms.behaviorTitle")).toBeLessThan(
+      toolPermissions.indexOf("settings.perms.globalMode"),
+    );
   });
 
   it("keeps the toggle mounted during streaming and keeps token usage next to the model selector", () => {
