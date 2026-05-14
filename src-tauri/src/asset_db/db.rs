@@ -1027,41 +1027,182 @@ fn extract_filename(path: &str) -> &str {
     }
 }
 
+fn is_query_escape_char(ch: char) -> bool {
+    ch == '"' || ch == '\\' || ch == '|' || ch.is_whitespace()
+}
+
+fn split_query_tokens(q: &str) -> Result<Vec<String>, String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_quote = false;
+    let mut chars = q.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            if let Some(&next) = chars.peek() {
+                if is_query_escape_char(next) {
+                    current.push(ch);
+                    current.push(next);
+                    chars.next();
+                    continue;
+                }
+            }
+            current.push(ch);
+            continue;
+        }
+
+        if ch == '"' {
+            in_quote = !in_quote;
+            current.push(ch);
+            continue;
+        }
+
+        if ch.is_whitespace() && !in_quote {
+            if !current.is_empty() {
+                tokens.push(std::mem::take(&mut current));
+            }
+            continue;
+        }
+
+        current.push(ch);
+    }
+
+    if in_quote {
+        return Err(
+            "Unclosed quote in query. Use double quotes around values with spaces, e.g. n:\"Point Light\"."
+                .to_string(),
+        );
+    }
+
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+
+    Ok(tokens)
+}
+
+fn split_query_tokens_lossy(q: &str) -> Vec<String> {
+    split_query_tokens(q).unwrap_or_else(|_| q.split_whitespace().map(|s| s.to_string()).collect())
+}
+
+fn unquote_query_value(raw: &str) -> Result<String, String> {
+    let mut out = String::new();
+    let mut in_quote = false;
+    let mut chars = raw.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            if let Some(&next) = chars.peek() {
+                if is_query_escape_char(next) {
+                    out.push(next);
+                    chars.next();
+                    continue;
+                }
+            }
+            out.push(ch);
+            continue;
+        }
+
+        if ch == '"' {
+            in_quote = !in_quote;
+            continue;
+        }
+
+        out.push(ch);
+    }
+
+    if in_quote {
+        return Err(
+            "Unclosed quote in query. Use double quotes around values with spaces, e.g. n:\"Point Light\"."
+                .to_string(),
+        );
+    }
+
+    Ok(out)
+}
+
+fn split_or_values(raw: &str) -> Result<Vec<String>, String> {
+    let mut values = Vec::new();
+    let mut current = String::new();
+    let mut in_quote = false;
+    let mut chars = raw.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            if let Some(&next) = chars.peek() {
+                if is_query_escape_char(next) {
+                    current.push(ch);
+                    current.push(next);
+                    chars.next();
+                    continue;
+                }
+            }
+            current.push(ch);
+            continue;
+        }
+
+        if ch == '"' {
+            in_quote = !in_quote;
+            current.push(ch);
+            continue;
+        }
+
+        if ch == '|' && !in_quote {
+            values.push(unquote_query_value(&current)?);
+            current.clear();
+            continue;
+        }
+
+        current.push(ch);
+    }
+
+    if in_quote {
+        return Err(
+            "Unclosed quote in query. Use double quotes around values with spaces, e.g. n:\"Point Light\"."
+                .to_string(),
+        );
+    }
+
+    values.push(unquote_query_value(&current)?);
+    Ok(values)
+}
+
+fn split_or_values_lossy(raw: &str) -> Vec<String> {
+    split_or_values(raw).unwrap_or_else(|_| raw.split('|').map(|s| s.to_string()).collect())
+}
+
+fn unquote_query_value_lossy(raw: &str) -> String {
+    unquote_query_value(raw).unwrap_or_else(|_| raw.to_string())
+}
+
 pub fn parse_query(q: &str) -> Result<Vec<SearchPredicate>, String> {
     let mut predicates = Vec::new();
 
-    for token in q.split_whitespace() {
+    for token in split_query_tokens(q)? {
         if let Some(rest) = token.strip_prefix("t:") {
             let mut kinds = Vec::new();
-            for part in rest.split('|') {
-                match parse_asset_type(part) {
+            for part in split_or_values(rest)? {
+                match parse_asset_type(&part) {
                     Some(kind) => kinds.push(kind),
                     None => return Err(format!("Unknown asset type: '{}'. Valid types: scene, prefab, material, animation, animatorController, genericAsset, script, texture, audio, shader, model, otherYaml, metaOnly", part)),
                 }
             }
             predicates.push(SearchPredicate::Type(kinds));
         } else if let Some(rest) = token.strip_prefix("n=") {
-            predicates.push(SearchPredicate::NameExact(
-                rest.split('|').map(|s| s.to_string()).collect(),
-            ));
+            predicates.push(SearchPredicate::NameExact(split_or_values(rest)?));
         } else if let Some(rest) = token.strip_prefix("n^") {
-            predicates.push(SearchPredicate::NamePrefix(
-                rest.split('|').map(|s| s.to_string()).collect(),
-            ));
+            predicates.push(SearchPredicate::NamePrefix(split_or_values(rest)?));
         } else if let Some(rest) = token.strip_prefix("n$") {
-            predicates.push(SearchPredicate::NameSuffix(
-                rest.split('|').map(|s| s.to_string()).collect(),
-            ));
+            predicates.push(SearchPredicate::NameSuffix(split_or_values(rest)?));
         } else if let Some(rest) = token.strip_prefix("n:") {
-            predicates.push(SearchPredicate::NameContains(
-                rest.split('|').map(|s| s.to_string()).collect(),
-            ));
+            predicates.push(SearchPredicate::NameContains(split_or_values(rest)?));
         } else if let Some(rest) = token.strip_prefix("under:") {
-            predicates.push(SearchPredicate::Under(rest.to_string()));
+            predicates.push(SearchPredicate::Under(unquote_query_value(rest)?));
         } else if let Some(rest) = token.strip_prefix("guid:") {
-            match parse_guid_hex(rest) {
+            let guid = unquote_query_value(rest)?;
+            match parse_guid_hex(&guid) {
                 Some(g) => predicates.push(SearchPredicate::GuidExact(g)),
-                None => return Err(format!("Invalid GUID: '{}' (expected 32 hex chars)", rest)),
+                None => return Err(format!("Invalid GUID: '{}' (expected 32 hex chars)", guid)),
             }
         } else {
             return Err(format!(
@@ -1102,11 +1243,11 @@ pub struct LenientQuery {
 pub fn parse_query_lenient(q: &str) -> LenientQuery {
     let mut predicates: Vec<SearchPredicate> = Vec::new();
     let mut bare_terms: Vec<String> = Vec::new();
-    for token in q.split_whitespace() {
+    for token in split_query_tokens_lossy(q) {
         if let Some(rest) = token.strip_prefix("t:") {
             let mut kinds = Vec::new();
-            for part in rest.split('|') {
-                if let Some(k) = parse_asset_type(part) {
+            for part in split_or_values_lossy(rest) {
+                if let Some(k) = parse_asset_type(&part) {
                     kinds.push(k);
                 }
             }
@@ -1114,33 +1255,26 @@ pub fn parse_query_lenient(q: &str) -> LenientQuery {
                 predicates.push(SearchPredicate::Type(kinds));
             }
         } else if let Some(rest) = token.strip_prefix("n=") {
-            predicates.push(SearchPredicate::NameExact(
-                rest.split('|').map(|s| s.to_string()).collect(),
-            ));
+            predicates.push(SearchPredicate::NameExact(split_or_values_lossy(rest)));
         } else if let Some(rest) = token.strip_prefix("n^") {
-            predicates.push(SearchPredicate::NamePrefix(
-                rest.split('|').map(|s| s.to_string()).collect(),
-            ));
+            predicates.push(SearchPredicate::NamePrefix(split_or_values_lossy(rest)));
         } else if let Some(rest) = token.strip_prefix("n$") {
-            predicates.push(SearchPredicate::NameSuffix(
-                rest.split('|').map(|s| s.to_string()).collect(),
-            ));
+            predicates.push(SearchPredicate::NameSuffix(split_or_values_lossy(rest)));
         } else if let Some(rest) = token.strip_prefix("n:") {
             // Explicit n: stays a structured filename-only predicate.
-            predicates.push(SearchPredicate::NameContains(
-                rest.split('|').map(|s| s.to_string()).collect(),
-            ));
+            predicates.push(SearchPredicate::NameContains(split_or_values_lossy(rest)));
         } else if let Some(rest) = token.strip_prefix("under:") {
-            predicates.push(SearchPredicate::Under(rest.to_string()));
+            predicates.push(SearchPredicate::Under(unquote_query_value_lossy(rest)));
         } else if let Some(rest) = token.strip_prefix("guid:") {
-            if let Some(g) = parse_guid_hex(rest) {
+            let guid = unquote_query_value_lossy(rest);
+            if let Some(g) = parse_guid_hex(&guid) {
                 predicates.push(SearchPredicate::GuidExact(g));
             }
         } else {
             // Bare token — kept out of `predicates` so the router can route
             // it through FTS / path-fragment search separately, with AND
             // semantics across terms.
-            bare_terms.push(token.to_string());
+            bare_terms.push(unquote_query_value_lossy(&token));
         }
     }
     LenientQuery {
@@ -2426,6 +2560,94 @@ mod tests {
     }
 
     #[test]
+    fn parse_query_supports_quoted_or_name_values() {
+        let parsed =
+            parse_query(r#"t:prefab|material n:PointLight|"Point Light"|DefaultPointLight"#)
+                .unwrap();
+
+        assert_eq!(parsed.len(), 2);
+        match &parsed[0] {
+            SearchPredicate::Type(kinds) => {
+                assert_eq!(kinds, &vec![AssetKind::Prefab, AssetKind::Material]);
+            }
+            other => panic!("expected type predicate, got {other:?}"),
+        }
+        match &parsed[1] {
+            SearchPredicate::NameContains(names) => {
+                assert_eq!(
+                    names,
+                    &vec![
+                        "PointLight".to_string(),
+                        "Point Light".to_string(),
+                        "DefaultPointLight".to_string()
+                    ]
+                );
+            }
+            other => panic!("expected name predicate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_query_supports_quoted_under_values() {
+        let parsed = parse_query(r#"under:"Assets/My Folder" n="Point Light""#).unwrap();
+
+        assert_eq!(parsed.len(), 2);
+        match &parsed[0] {
+            SearchPredicate::Under(path) => assert_eq!(path, "Assets/My Folder"),
+            other => panic!("expected under predicate, got {other:?}"),
+        }
+        match &parsed[1] {
+            SearchPredicate::NameExact(names) => {
+                assert_eq!(names, &vec!["Point Light".to_string()]);
+            }
+            other => panic!("expected exact name predicate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_query_supports_escaped_pipe_as_literal_value() {
+        let parsed = parse_query(r#"n:Point\|Light|DefaultPointLight"#).unwrap();
+
+        match &parsed[0] {
+            SearchPredicate::NameContains(names) => {
+                assert_eq!(
+                    names,
+                    &vec!["Point|Light".to_string(), "DefaultPointLight".to_string()]
+                );
+            }
+            other => panic!("expected name predicate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_query_rejects_unclosed_quotes() {
+        let err = parse_query(r#"n:"Point Light"#).unwrap_err();
+
+        assert!(err.contains("Unclosed quote in query"));
+    }
+
+    #[test]
+    fn search_assets_matches_quoted_name_with_space() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        seed_assets(
+            &mut conn,
+            &[
+                test_asset("Assets/Lighting/Point Light.prefab", AssetKind::Prefab, ""),
+                test_asset("Assets/Lighting/PointLight.prefab", AssetKind::Prefab, ""),
+            ],
+        );
+        let predicates = parse_query(r#"t:prefab n:"Point Light""#).unwrap();
+
+        let result = search_assets(&conn, &predicates, &["p".to_string()], 20, 0).unwrap();
+
+        assert_eq!(result.total, 1);
+        assert_eq!(
+            result.rows[0].p.as_deref(),
+            Some("Assets/Lighting/Point Light.prefab")
+        );
+    }
+
+    #[test]
     fn get_all_meta_asset_mtimes_returns_duplicate_guid_aliases() {
         let mut conn = Connection::open_in_memory().unwrap();
         create_tables(&conn).unwrap();
@@ -2675,6 +2897,18 @@ mod tests {
             parsed.bare_terms,
             vec!["hero".to_string(), "enemy".to_string()]
         );
+    }
+
+    #[test]
+    fn parse_query_lenient_supports_quoted_bare_terms() {
+        let parsed = parse_query_lenient(r#"t:prefab "hero enemy" under:"Assets/My Folder""#);
+        assert_eq!(parsed.predicates.len(), 2);
+        assert_eq!(parsed.bare_terms, vec!["hero enemy".to_string()]);
+
+        match &parsed.predicates[1] {
+            SearchPredicate::Under(path) => assert_eq!(path, "Assets/My Folder"),
+            other => panic!("expected under predicate, got {other:?}"),
+        }
     }
 
     #[test]
