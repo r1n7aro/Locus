@@ -47,8 +47,9 @@ mod windows_impl {
 
     struct UnityPipeConnection {
         pipe_name: String,
-        writer: Mutex<WriteHalf<NamedPipeClient>>,
+        writer: Mutex<Option<WriteHalf<NamedPipeClient>>>,
         pending: Mutex<HashMap<String, oneshot::Sender<Result<PipeEnvelope, String>>>>,
+        reader_abort: Mutex<Option<tokio::task::AbortHandle>>,
     }
 
     static CONNECTIONS: OnceLock<Mutex<HashMap<String, Arc<UnityPipeConnection>>>> =
@@ -65,7 +66,7 @@ mod windows_impl {
     }
 
     async fn open_client_with_retry(pipe_name: &str) -> Result<NamedPipeClient, String> {
-        const MAX_RETRIES: u32 = 5;
+        const MAX_RETRIES: u32 = 30;
         const ERROR_PIPE_BUSY: i32 = 231;
 
         let mut last_err = String::new();
@@ -77,7 +78,8 @@ mod windows_impl {
                     if e.raw_os_error() == Some(ERROR_PIPE_BUSY) && attempt + 1 < MAX_RETRIES =>
                 {
                     last_err = format!("Failed to connect to Unity Editor ({}): {}", pipe_name, e);
-                    tokio::time::sleep(Duration::from_millis(100 * (attempt as u64 + 1))).await;
+                    let delay_ms = (100 * (attempt as u64 + 1)).min(1_000);
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                 }
                 Err(e) => {
                     return Err(format!(
@@ -112,15 +114,23 @@ mod windows_impl {
     async fn close_connection(conn: &Arc<UnityPipeConnection>, reason: String) {
         fail_all_pending(conn, reason).await;
 
+        if let Some(abort) = conn.reader_abort.lock().await.take() {
+            abort.abort();
+        }
+
         match conn.writer.try_lock() {
             Ok(mut writer) => {
-                let _ = writer.shutdown().await;
+                if let Some(mut writer) = writer.take() {
+                    let _ = writer.shutdown().await;
+                }
             }
             Err(_) => {
                 let conn = conn.clone();
                 tokio::spawn(async move {
                     let mut writer = conn.writer.lock().await;
-                    let _ = writer.shutdown().await;
+                    if let Some(mut writer) = writer.take() {
+                        let _ = writer.shutdown().await;
+                    }
                 });
             }
         }
@@ -214,8 +224,9 @@ mod windows_impl {
 
         let new_conn = Arc::new(UnityPipeConnection {
             pipe_name: pipe_name.clone(),
-            writer: Mutex::new(writer),
+            writer: Mutex::new(Some(writer)),
             pending: Mutex::new(HashMap::new()),
+            reader_abort: Mutex::new(None),
         });
 
         {
@@ -226,7 +237,8 @@ mod windows_impl {
             map.insert(pipe_name.clone(), new_conn.clone());
         }
 
-        tokio::spawn(reader_loop(new_conn.clone(), reader));
+        let reader_task = tokio::spawn(reader_loop(new_conn.clone(), reader));
+        *new_conn.reader_abort.lock().await = Some(reader_task.abort_handle());
         Ok(new_conn)
     }
 
@@ -258,7 +270,10 @@ mod windows_impl {
         }
 
         let write_result = tokio::time::timeout(PIPE_WRITE_TIMEOUT, async {
-            let mut writer = conn.writer.lock().await;
+            let mut writer_guard = conn.writer.lock().await;
+            let writer = writer_guard
+                .as_mut()
+                .ok_or_else(|| "Unity pipe connection is closing".to_string())?;
             writer
                 .write_all(json.as_bytes())
                 .await
@@ -293,9 +308,13 @@ mod windows_impl {
                     return Err("Unity response failed: response channel closed".to_string())
                 }
                 Err(_) => {
+                    let err = "Unity response timed out".to_string();
                     let mut pending = conn.pending.lock().await;
                     pending.remove(&request_id);
-                    return Err("Unity response timed out".to_string());
+                    drop(pending);
+                    remove_connection_if_same(&conn.pipe_name, &conn).await;
+                    close_connection(&conn, err.clone()).await;
+                    return Err(err);
                 }
             }
         } else {

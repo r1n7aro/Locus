@@ -31,4 +31,13 @@ describe("unityBridgeCompatibility", () => {
     expect(bridge).not.toContain("Unity recompile completed");
     expect(transport).toContain(".filter(|value| !value.is_empty())");
   });
+
+  it("drops the cached Unity pipe connection after a response timeout", () => {
+    const transport = read("src-tauri/src/unity_bridge/transport.rs");
+
+    expect(transport).toContain('let err = "Unity response timed out".to_string();');
+    expect(transport).toContain("drop(pending);");
+    expect(transport).toContain("remove_connection_if_same(&conn.pipe_name, &conn).await;");
+    expect(transport).toContain("close_connection(&conn, err.clone()).await;");
+  });
 });

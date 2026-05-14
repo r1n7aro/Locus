@@ -40,6 +40,7 @@ import type {
   ActiveSessionSelectionChanged,
   AssetDbScanEvent,
   PluginStatus,
+  UnityConnectionStatus,
   AppErrorPayload,
   LexicalRebuildStatus,
 } from "../types";
@@ -98,6 +99,7 @@ export function useAppBootstrap() {
 
   let unlisten: RuntimeUnsubscribe | null = null;
   let unlistenUnity: RuntimeUnsubscribe | null = null;
+  let unlistenUnityDetail: RuntimeUnsubscribe | null = null;
   let unlistenScan: RuntimeUnsubscribe | null = null;
   let unlistenPlugin: RuntimeUnsubscribe | null = null;
   let unlistenActiveSessionSelection: RuntimeUnsubscribe | null = null;
@@ -444,6 +446,12 @@ export function useAppBootstrap() {
         console.log("[Locus] Unity Editor disconnected.");
       }
     });
+    unlistenUnityDetail = await runtime.subscribe<UnityConnectionStatus>(
+      "unity-connection-status-detail",
+      (payload) => {
+        projectStore.handleUnityConnectionStatusDetail(payload);
+      },
+    );
     unlistenScan = await runtime.subscribe<AssetDbScanEvent>("ref-graph-scan", (payload) => {
       projectStore.handleScanEvent(payload);
     });
@@ -478,6 +486,7 @@ export function useAppBootstrap() {
   function cleanup() {
     unlisten?.();
     unlistenUnity?.();
+    unlistenUnityDetail?.();
     unlistenScan?.();
     unlistenPlugin?.();
     unlistenActiveSessionSelection?.();

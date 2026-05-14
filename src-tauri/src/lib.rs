@@ -813,6 +813,7 @@ pub fn run() {
             commands::ignore_knowledge_proposal,
             commands::apply_knowledge_proposal,
             commands::check_unity_connection,
+            commands::check_unity_connection_status,
             commands::check_unity_plugin,
             commands::install_unity_plugin,
             commands::launch_unity_project,

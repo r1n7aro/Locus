@@ -25,9 +25,11 @@ describe("chat status indicators", () => {
     expect(chatView).toContain('@launch-unity-project="emit(\'launchUnityProject\')"');
     expect(chatView).toContain(':unity-launching="unityLaunching"');
     expect(chatView).toContain(':unity-launch-state="unityLaunchState"');
+    expect(chatView).toContain(':unity-connection-status="unityConnectionStatus"');
     expect(chatView).toContain(':unity-recompiling="unityRecompileActive"');
     expect(chatView).toContain("workingDir?: string;");
     expect(chatView).toContain(':working-dir="workingDir"');
+    expect(workspace).toContain(':unity-connection-status="projectStore.unityConnectionStatus"');
     expect(workspace).toContain(':working-dir="projectStore.workingDir"');
     expect(workspace).toContain(':unity-plugin-status="projectStore.pluginToast"');
     expect(workspace).toContain(':unity-plugin-installing="projectStore.pluginInstalling"');
@@ -46,13 +48,17 @@ describe("chat status indicators", () => {
     const zh = read("src/language/zh.json");
 
     expect(indicators).toContain('workingDir?: string;');
+    expect(indicators).toContain('unityConnectionStatus?: UnityConnectionStatus | null;');
     expect(indicators).toContain('function unityPipeNameForWorkingDir(workingDir: string)');
     expect(indicators).toContain('return `\\\\\\\\.\\\\pipe\\\\locus_unity_${sanitized}`;');
     expect(indicators).toContain('label: t("chat.status.unity.pipe")');
     expect(indicators).toContain('label: t("chat.status.unity.workingDir")');
+    expect(indicators).toContain('label: t("chat.status.unity.lastError")');
+    expect(indicators).toContain('label: t("chat.status.unity.reconnectAttempts")');
     expect(indicators).toContain(':class="{ \'is-mono\': row.mono }"');
     expect(zh).toContain('"chat.status.unity.pipe": "管道"');
     expect(zh).toContain('"chat.status.unity.workingDir": "工作目录"');
+    expect(zh).toContain('"chat.status.unity.lastError": "最后错误"');
   });
 
   it("uses fixed icon triggers with top hover labels and click popovers", () => {
@@ -114,10 +120,13 @@ describe("chat status indicators", () => {
     expect(projectStore).toContain('const unityLaunching = computed(() => unityLaunchState.value === "starting");');
     expect(projectStore).toContain("async function launchUnityProject()");
     expect(projectStore).toContain("await unityService.launchUnityProject();");
+    expect(projectStore).toContain("await unityService.checkUnityConnectionStatus()");
     expect(projectStore).toContain('unityLaunchState.value = "starting";');
     expect(projectStore).toContain('unityLaunchState.value = "waitingConnection";');
     expect(projectStore).toContain("function handleUnityConnectionStatus(connected: boolean)");
+    expect(projectStore).toContain("function handleUnityConnectionStatusDetail(status: UnityConnectionStatus)");
     expect(bootstrap).toContain("projectStore.handleUnityConnectionStatus(payload);");
+    expect(bootstrap).toContain('"unity-connection-status-detail"');
     expect(unityService).toContain('return ipcInvoke<UnityLaunchResult>("launch_unity_project");');
     expect(zh).toContain('"chat.status.unity.launch": "启动"');
     expect(zh).toContain('"chat.status.unity.waitingConnection": "等待连接"');

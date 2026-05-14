@@ -10,6 +10,7 @@ const projectServiceMocks = vi.hoisted(() => ({
 
 const unityServiceMocks = vi.hoisted(() => ({
   checkUnityConnection: vi.fn(),
+  checkUnityConnectionStatus: vi.fn(),
   checkUnityPlugin: vi.fn(),
   installUnityPlugin: vi.fn(),
   launchUnityProject: vi.fn(),

@@ -6,7 +6,7 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     sync::{Arc, OnceLock},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
@@ -39,7 +39,7 @@ pub struct PipeResponse {
 pub const UNITY_EXECUTE_PROGRESS_TAG: &str = "locus-unity-progress";
 pub const UNITY_EXECUTE_CANCELLED: &str = "__locus_unity_execute_cancelled__";
 const UNITY_EXECUTE_PROGRESS_POLL_MS: u64 = 250;
-const UNITY_EXECUTE_START_TIMEOUT_SECS: u64 = 30;
+const UNITY_EXECUTE_START_TIMEOUT_SECS: u64 = 15;
 const UNITY_EXECUTE_PROGRESS_LOST_TIMEOUT_SECS: u64 = 120;
 
 #[derive(Debug, Clone, Serialize)]
@@ -48,6 +48,22 @@ pub struct UnityLaunchResult {
     pub editor_path: String,
     pub project_path: String,
     pub project_version: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnityConnectionStatus {
+    pub connected: bool,
+    pub editor_status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scene_path: Option<String>,
+    pub pipe_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<u64>,
+    pub reconnect_attempts: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    pub checked_at_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -431,11 +447,76 @@ pub fn format_editor_status_for_event(status: &str) -> &'static str {
     }
 }
 
-pub async fn is_unity_connected(project_path: &str) -> bool {
-    match send_message(project_path, "ping", "").await {
-        Ok(resp) => resp.ok,
-        Err(_) => false,
+fn unix_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
+
+fn parse_unity_status_message(message: &str) -> (&'static str, Option<String>) {
+    let (status_part, scene_part) = match message.split_once('|') {
+        Some((status, scene)) => (status, Some(scene.trim().to_string())),
+        None => (message, None),
+    };
+    (
+        normalize_editor_status(status_part),
+        scene_part.filter(|scene| !scene.is_empty()),
+    )
+}
+
+pub async fn query_unity_connection_status(project_path: &str) -> UnityConnectionStatus {
+    let pipe_name = get_pipe_name(project_path);
+    let checked_at_ms = unix_now_ms();
+    let started_at = std::time::Instant::now();
+
+    match send_message(project_path, "status", "").await {
+        Ok(resp) if resp.ok => {
+            let latency_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+            let message = resp.message.unwrap_or_default();
+            let (editor_status, scene_path) = parse_unity_status_message(&message);
+            UnityConnectionStatus {
+                connected: true,
+                editor_status: editor_status.to_string(),
+                scene_path,
+                pipe_name,
+                latency_ms: Some(latency_ms),
+                reconnect_attempts: 0,
+                last_error: None,
+                checked_at_ms,
+            }
+        }
+        Ok(resp) => {
+            let latency_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+            UnityConnectionStatus {
+                connected: false,
+                editor_status: UNITY_EDITOR_STATUS_DISCONNECTED.to_string(),
+                scene_path: None,
+                pipe_name,
+                latency_ms: Some(latency_ms),
+                reconnect_attempts: 0,
+                last_error: Some(
+                    resp.error
+                        .unwrap_or_else(|| "Unity status returned ok=false".to_string()),
+                ),
+                checked_at_ms,
+            }
+        }
+        Err(error) => UnityConnectionStatus {
+            connected: false,
+            editor_status: UNITY_EDITOR_STATUS_DISCONNECTED.to_string(),
+            scene_path: None,
+            pipe_name,
+            latency_ms: None,
+            reconnect_attempts: 0,
+            last_error: Some(error),
+            checked_at_ms,
+        },
     }
+}
+
+pub async fn is_unity_connected(project_path: &str) -> bool {
+    query_unity_connection_status(project_path).await.connected
 }
 
 pub async fn select_asset(
@@ -533,11 +614,7 @@ pub async fn query_unity_status(project_path: &str) -> (bool, &'static str, Opti
     match send_message(project_path, "status", "").await {
         Ok(resp) if resp.ok => {
             let msg = resp.message.unwrap_or_default();
-            let (status_part, scene_part) = match msg.split_once('|') {
-                Some((s, scene)) => (s, Some(scene.to_string())),
-                None => (msg.as_str(), None),
-            };
-            let status = normalize_editor_status(status_part);
+            let (status, scene_part) = parse_unity_status_message(&msg);
             (true, status, scene_part)
         }
         _ => (false, UNITY_EDITOR_STATUS_DISCONNECTED, None),
@@ -982,6 +1059,74 @@ async fn query_unity_execute_progress(project_path: &str) -> Option<UnityExecute
     serde_json::from_str(&message).ok()
 }
 
+async fn wait_for_unity_bridge_ready(
+    project_path: &str,
+    max_wait: Duration,
+    context: &str,
+) -> Result<(), String> {
+    let start = std::time::Instant::now();
+
+    loop {
+        let detail =
+            match send_message_with_timeout(project_path, "status", "", Duration::from_secs(5))
+                .await
+            {
+                Ok(resp) if resp.ok => return Ok(()),
+                Ok(resp) => resp
+                    .error
+                    .unwrap_or_else(|| "Unity status returned ok=false".to_string()),
+                Err(error) => error,
+            };
+
+        if start.elapsed() > max_wait {
+            return Err(format!(
+                "Timed out waiting for Unity bridge to become ready {} ({}s): {}",
+                context,
+                max_wait.as_secs(),
+                detail
+            ));
+        }
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+async fn reconnect_unity_pipe_for_execute(project_path: &str, reason: &str) -> Result<(), String> {
+    transport::disconnect_with_reason(project_path, reason).await;
+    wait_for_unity_bridge_ready(
+        project_path,
+        Duration::from_secs(20),
+        "after execute pipe reset",
+    )
+    .await
+}
+
+async fn reconnect_unity_pipe_for_execute_cancellable(
+    project_path: &str,
+    reason: &str,
+    cancel_rx: &mut tokio::sync::watch::Receiver<bool>,
+) -> Result<(), String> {
+    let reconnect = reconnect_unity_pipe_for_execute(project_path, reason);
+    tokio::pin!(reconnect);
+    loop {
+        tokio::select! {
+            result = &mut reconnect => return result,
+            changed = cancel_rx.changed() => {
+                if changed.is_err() || *cancel_rx.borrow() {
+                    return Err(UNITY_EXECUTE_CANCELLED.to_string());
+                }
+            }
+        }
+    }
+}
+
+fn append_execute_reconnect_result(reason: &str, reconnect: Result<(), String>) -> String {
+    match reconnect {
+        Ok(()) => format!("{}; Unity pipe reconnected.", reason),
+        Err(error) => format!("{}; Unity pipe reconnect failed: {}", reason, error),
+    }
+}
+
 pub async fn cancel_unity_execute_code(project_path: &str) -> Result<String, String> {
     let resp = send_message_with_timeout(
         project_path,
@@ -1123,62 +1268,97 @@ where
 
     let prepared = prepare_unity_execute_code_for_send(project_path, code).await;
 
-    on_progress(rust_unity_execute_progress(
-        "Sending execute_code to Unity",
-        "",
-        rust_progress_revision,
-    ));
-
-    let execute = send_message_without_timeout(project_path, "execute_code", &prepared.code);
-    tokio::pin!(execute);
-
-    let mut progress_tick =
-        tokio::time::interval(Duration::from_millis(UNITY_EXECUTE_PROGRESS_POLL_MS));
-    progress_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut last_progress_revision = 0u64;
-    let mut saw_unity_progress = false;
-    let execute_started_at = std::time::Instant::now();
-    let mut progress_unavailable_since: Option<std::time::Instant> = None;
-
+    let mut send_attempt = 1u32;
     let resp = loop {
-        tokio::select! {
-            result = &mut execute => break result?,
-            _ = progress_tick.tick() => {
-                if let Some(snapshot) = query_unity_execute_progress(project_path).await {
-                    progress_unavailable_since = None;
-                    if snapshot.active {
-                        saw_unity_progress = true;
-                    }
-                    if snapshot.revision != last_progress_revision {
-                        last_progress_revision = snapshot.revision;
-                        on_progress(snapshot);
-                    }
-                } else if saw_unity_progress {
-                    let unavailable_since = progress_unavailable_since
-                        .get_or_insert_with(std::time::Instant::now);
-                    if unavailable_since.elapsed()
-                        > Duration::from_secs(UNITY_EXECUTE_PROGRESS_LOST_TIMEOUT_SECS)
-                    {
-                        let reason = format!(
-                            "Unity execute progress was unavailable for {}s; reconnecting Unity pipe",
-                            UNITY_EXECUTE_PROGRESS_LOST_TIMEOUT_SECS
-                        );
-                        transport::disconnect_with_reason(project_path, &reason).await;
-                        return Err(reason);
-                    }
-                }
+        on_progress(rust_unity_execute_progress(
+            if send_attempt == 1 {
+                "Sending execute_code to Unity"
+            } else {
+                "Retrying execute_code after Unity pipe reconnect"
+            },
+            "",
+            rust_progress_revision,
+        ));
+        rust_progress_revision += 1;
 
-                if !saw_unity_progress
-                    && execute_started_at.elapsed()
-                        > Duration::from_secs(UNITY_EXECUTE_START_TIMEOUT_SECS)
-                {
-                    let reason = format!(
-                        "Unity execute did not start within {}s; reconnecting Unity pipe",
-                        UNITY_EXECUTE_START_TIMEOUT_SECS
-                    );
-                    transport::disconnect_with_reason(project_path, &reason).await;
-                    return Err(reason);
+        let execute = send_message_without_timeout(project_path, "execute_code", &prepared.code);
+        tokio::pin!(execute);
+
+        let mut progress_tick =
+            tokio::time::interval(Duration::from_millis(UNITY_EXECUTE_PROGRESS_POLL_MS));
+        progress_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut last_progress_revision = 0u64;
+        let mut saw_unity_progress = false;
+        let execute_started_at = std::time::Instant::now();
+        let mut progress_unavailable_since: Option<std::time::Instant> = None;
+
+        let attempt_result: Result<PipeResponse, String> = loop {
+            tokio::select! {
+                result = &mut execute => break result,
+                _ = progress_tick.tick() => {
+                    if let Some(snapshot) = query_unity_execute_progress(project_path).await {
+                        progress_unavailable_since = None;
+                        if snapshot.active {
+                            saw_unity_progress = true;
+                        }
+                        if snapshot.revision != last_progress_revision {
+                            last_progress_revision = snapshot.revision;
+                            on_progress(snapshot);
+                        }
+                    } else if saw_unity_progress {
+                        let unavailable_since = progress_unavailable_since
+                            .get_or_insert_with(std::time::Instant::now);
+                        if unavailable_since.elapsed()
+                            > Duration::from_secs(UNITY_EXECUTE_PROGRESS_LOST_TIMEOUT_SECS)
+                        {
+                            let reason = format!(
+                                "Unity execute progress was unavailable for {}s; reconnecting Unity pipe",
+                                UNITY_EXECUTE_PROGRESS_LOST_TIMEOUT_SECS
+                            );
+                            return Err(append_execute_reconnect_result(
+                                &reason,
+                                reconnect_unity_pipe_for_execute(project_path, &reason).await,
+                            ));
+                        }
+                    }
+
+                    if !saw_unity_progress
+                        && execute_started_at.elapsed()
+                            > Duration::from_secs(UNITY_EXECUTE_START_TIMEOUT_SECS)
+                    {
+                        break Err(format!(
+                            "Unity execute did not leave the sending stage within {}s",
+                            UNITY_EXECUTE_START_TIMEOUT_SECS
+                        ));
+                    }
                 }
+            }
+        };
+
+        match attempt_result {
+            Ok(resp) => break resp,
+            Err(error) if !saw_unity_progress && send_attempt == 1 => {
+                on_progress(rust_unity_execute_progress(
+                    "Reconnecting Unity pipe",
+                    &error,
+                    rust_progress_revision,
+                ));
+                rust_progress_revision += 1;
+                if let Err(reconnect_error) =
+                    reconnect_unity_pipe_for_execute(project_path, &error).await
+                {
+                    return Err(format!(
+                        "{}; Unity pipe reconnect failed: {}",
+                        error, reconnect_error
+                    ));
+                }
+                send_attempt += 1;
+            }
+            Err(error) => {
+                return Err(append_execute_reconnect_result(
+                    &error,
+                    reconnect_unity_pipe_for_execute(project_path, &error).await,
+                ));
             }
         }
     };
@@ -1232,103 +1412,172 @@ where
         _ = cancel_rx.changed() => return Err(UNITY_EXECUTE_CANCELLED.to_string()),
     };
 
-    on_progress(rust_unity_execute_progress(
-        "Sending execute_code to Unity",
-        "",
-        rust_progress_revision,
-    ));
-
-    let execute = send_message_without_timeout(project_path, "execute_code", &prepared.code);
-    tokio::pin!(execute);
-
-    let mut progress_tick =
-        tokio::time::interval(Duration::from_millis(UNITY_EXECUTE_PROGRESS_POLL_MS));
-    progress_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut last_progress_revision = 0u64;
-    let mut saw_unity_progress = false;
-    let execute_started_at = std::time::Instant::now();
-    let mut progress_unavailable_since: Option<std::time::Instant> = None;
-
+    let mut send_attempt = 1u32;
     let resp = loop {
-        tokio::select! {
-            result = &mut execute => break result?,
-            changed = cancel_rx.changed() => {
-                let cancelled = changed.is_err() || *cancel_rx.borrow();
-                if !cancelled {
-                    continue;
-                }
+        on_progress(rust_unity_execute_progress(
+            if send_attempt == 1 {
+                "Sending execute_code to Unity"
+            } else {
+                "Retrying execute_code after Unity pipe reconnect"
+            },
+            "",
+            rust_progress_revision,
+        ));
+        rust_progress_revision += 1;
 
-                if let Err(error) = cancel_unity_execute_code(project_path).await {
-                    eprintln!("[Locus] cancel_execute_code skipped: {}", error);
-                }
+        let execute = send_message_without_timeout(project_path, "execute_code", &prepared.code);
+        tokio::pin!(execute);
 
-                let drain = tokio::time::sleep(Duration::from_secs(5));
-                tokio::pin!(drain);
-                loop {
-                    tokio::select! {
-                        result = &mut execute => {
-                            if let Err(error) = result {
-                                eprintln!("[Locus] execute_code after cancel ended with transport error: {}", error);
-                            }
-                            break;
-                        },
-                        _ = &mut drain => {
-                            eprintln!("[Locus] execute_code cancel drain timed out");
-                            transport::disconnect_with_reason(
-                                project_path,
-                                "execute_code cancel drain timed out",
-                            ).await;
-                            break;
-                        },
-                        _ = progress_tick.tick() => {
-                            if let Some(snapshot) = query_unity_execute_progress(project_path).await {
-                                if snapshot.revision != last_progress_revision {
-                                    last_progress_revision = snapshot.revision;
-                                    on_progress(snapshot);
+        let mut progress_tick =
+            tokio::time::interval(Duration::from_millis(UNITY_EXECUTE_PROGRESS_POLL_MS));
+        progress_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut last_progress_revision = 0u64;
+        let mut saw_unity_progress = false;
+        let execute_started_at = std::time::Instant::now();
+        let mut progress_unavailable_since: Option<std::time::Instant> = None;
+
+        let attempt_result: Result<PipeResponse, String> = loop {
+            tokio::select! {
+                result = &mut execute => break result,
+                changed = cancel_rx.changed() => {
+                    let cancelled = changed.is_err() || *cancel_rx.borrow();
+                    if !cancelled {
+                        continue;
+                    }
+
+                    if let Err(error) = cancel_unity_execute_code(project_path).await {
+                        eprintln!("[Locus] cancel_execute_code skipped: {}", error);
+                    }
+
+                    let drain = tokio::time::sleep(Duration::from_secs(5));
+                    tokio::pin!(drain);
+                    loop {
+                        tokio::select! {
+                            result = &mut execute => {
+                                if let Err(error) = result {
+                                    eprintln!("[Locus] execute_code after cancel ended with transport error: {}", error);
+                                }
+                                break;
+                            },
+                            _ = &mut drain => {
+                                eprintln!("[Locus] execute_code cancel drain timed out");
+                                transport::disconnect_with_reason(
+                                    project_path,
+                                    "execute_code cancel drain timed out",
+                                ).await;
+                                break;
+                            },
+                            _ = progress_tick.tick() => {
+                                if let Some(snapshot) = query_unity_execute_progress(project_path).await {
+                                    if snapshot.revision != last_progress_revision {
+                                        last_progress_revision = snapshot.revision;
+                                        on_progress(snapshot);
+                                    }
                                 }
                             }
                         }
                     }
-                }
 
-                return Err(UNITY_EXECUTE_CANCELLED.to_string());
-            },
-            _ = progress_tick.tick() => {
-                if let Some(snapshot) = query_unity_execute_progress(project_path).await {
-                    progress_unavailable_since = None;
-                    if snapshot.active {
-                        saw_unity_progress = true;
+                    return Err(UNITY_EXECUTE_CANCELLED.to_string());
+                },
+                _ = progress_tick.tick() => {
+                    if let Some(snapshot) = query_unity_execute_progress(project_path).await {
+                        progress_unavailable_since = None;
+                        if snapshot.active {
+                            saw_unity_progress = true;
+                        }
+                        if snapshot.revision != last_progress_revision {
+                            last_progress_revision = snapshot.revision;
+                            on_progress(snapshot);
+                        }
+                    } else if saw_unity_progress {
+                        let unavailable_since = progress_unavailable_since
+                            .get_or_insert_with(std::time::Instant::now);
+                        if unavailable_since.elapsed()
+                            > Duration::from_secs(UNITY_EXECUTE_PROGRESS_LOST_TIMEOUT_SECS)
+                        {
+                            let reason = format!(
+                                "Unity execute progress was unavailable for {}s; reconnecting Unity pipe",
+                                UNITY_EXECUTE_PROGRESS_LOST_TIMEOUT_SECS
+                            );
+                            let reconnect = reconnect_unity_pipe_for_execute_cancellable(
+                                project_path,
+                                &reason,
+                                &mut cancel_rx,
+                            )
+                            .await;
+                            if reconnect
+                                .as_ref()
+                                .err()
+                                .map(|error| error == UNITY_EXECUTE_CANCELLED)
+                                .unwrap_or(false)
+                            {
+                                return Err(UNITY_EXECUTE_CANCELLED.to_string());
+                            }
+                            return Err(append_execute_reconnect_result(&reason, reconnect));
+                        }
                     }
-                    if snapshot.revision != last_progress_revision {
-                        last_progress_revision = snapshot.revision;
-                        on_progress(snapshot);
-                    }
-                } else if saw_unity_progress {
-                    let unavailable_since = progress_unavailable_since
-                        .get_or_insert_with(std::time::Instant::now);
-                    if unavailable_since.elapsed()
-                        > Duration::from_secs(UNITY_EXECUTE_PROGRESS_LOST_TIMEOUT_SECS)
+
+                    if !saw_unity_progress
+                        && execute_started_at.elapsed()
+                            > Duration::from_secs(UNITY_EXECUTE_START_TIMEOUT_SECS)
                     {
-                        let reason = format!(
-                            "Unity execute progress was unavailable for {}s; reconnecting Unity pipe",
-                            UNITY_EXECUTE_PROGRESS_LOST_TIMEOUT_SECS
-                        );
-                        transport::disconnect_with_reason(project_path, &reason).await;
-                        return Err(reason);
+                        break Err(format!(
+                            "Unity execute did not leave the sending stage within {}s",
+                            UNITY_EXECUTE_START_TIMEOUT_SECS
+                        ));
                     }
                 }
+            }
+        };
 
-                if !saw_unity_progress
-                    && execute_started_at.elapsed()
-                        > Duration::from_secs(UNITY_EXECUTE_START_TIMEOUT_SECS)
+        match attempt_result {
+            Ok(resp) => break resp,
+            Err(error) if !saw_unity_progress && send_attempt == 1 => {
+                on_progress(rust_unity_execute_progress(
+                    "Reconnecting Unity pipe",
+                    &error,
+                    rust_progress_revision,
+                ));
+                rust_progress_revision += 1;
+                let reconnect = reconnect_unity_pipe_for_execute_cancellable(
+                    project_path,
+                    &error,
+                    &mut cancel_rx,
+                )
+                .await;
+                if reconnect
+                    .as_ref()
+                    .err()
+                    .map(|error| error == UNITY_EXECUTE_CANCELLED)
+                    .unwrap_or(false)
                 {
-                    let reason = format!(
-                        "Unity execute did not start within {}s; reconnecting Unity pipe",
-                        UNITY_EXECUTE_START_TIMEOUT_SECS
-                    );
-                    transport::disconnect_with_reason(project_path, &reason).await;
-                    return Err(reason);
+                    return Err(UNITY_EXECUTE_CANCELLED.to_string());
                 }
+                if let Err(reconnect_error) = reconnect {
+                    return Err(format!(
+                        "{}; Unity pipe reconnect failed: {}",
+                        error, reconnect_error
+                    ));
+                }
+                send_attempt += 1;
+            }
+            Err(error) => {
+                let reconnect = reconnect_unity_pipe_for_execute_cancellable(
+                    project_path,
+                    &error,
+                    &mut cancel_rx,
+                )
+                .await;
+                if reconnect
+                    .as_ref()
+                    .err()
+                    .map(|error| error == UNITY_EXECUTE_CANCELLED)
+                    .unwrap_or(false)
+                {
+                    return Err(UNITY_EXECUTE_CANCELLED.to_string());
+                }
+                return Err(append_execute_reconnect_result(&error, reconnect));
             }
         }
     };
@@ -1348,30 +1597,7 @@ pub async fn unity_execute_code(project_path: &str, code: &str) -> Result<String
 }
 
 async fn wait_for_unity_bridge_ready_after_recompile(project_path: &str) -> Result<(), String> {
-    let max_wait = Duration::from_secs(30);
-    let start = std::time::Instant::now();
-
-    loop {
-        let detail =
-            match send_message_with_timeout(project_path, "status", "", Duration::from_secs(5))
-                .await
-            {
-                Ok(resp) if resp.ok => return Ok(()),
-                Ok(resp) => resp
-                    .error
-                    .unwrap_or_else(|| "Unity status returned ok=false".to_string()),
-                Err(error) => error,
-            };
-
-        if start.elapsed() > max_wait {
-            return Err(format!(
-                "Timed out waiting for Unity bridge to become ready after recompile (30s): {}",
-                detail
-            ));
-        }
-
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
+    wait_for_unity_bridge_ready(project_path, Duration::from_secs(30), "after recompile").await
 }
 
 async fn refresh_unity_type_index_after_recompile(project_path: &str) -> Result<(), String> {
@@ -1535,32 +1761,50 @@ pub async fn start_unity_monitor(
 
     let handle = tauri::async_runtime::spawn(async move {
         let mut last_status: Option<bool> = None;
+        let mut disconnected_attempts: u32 = 0;
 
         loop {
-            let result = send_message(&project_path, "ping", "").await;
-            let connected = matches!(&result, Ok(resp) if resp.ok);
+            let mut status = query_unity_connection_status(&project_path).await;
+            let connected = status.connected;
 
-            match &result {
-                Ok(_) if connected => {
-                    if last_status != Some(true) {
-                        eprintln!("[Locus] Unity Editor connected! (pipe: {})", pipe_name);
-                    }
+            if connected {
+                if last_status != Some(true) {
+                    eprintln!("[Locus] Unity Editor connected! (pipe: {})", pipe_name);
                 }
-                Ok(resp) => {
-                    eprintln!(
-                        "[Locus] Unity ping ok=false, error: {:?} (pipe: {})",
-                        resp.error, pipe_name
-                    );
-                }
-                Err(e) => {
-                    if last_status != Some(false) {
+                disconnected_attempts = 0;
+            } else {
+                disconnected_attempts = disconnected_attempts.saturating_add(1);
+                status.reconnect_attempts = disconnected_attempts;
+
+                match status.last_error.as_deref() {
+                    Some(error) if last_status != Some(false) => {
                         eprintln!(
                             "[Locus] Unity Editor not connected (pipe: {}): {}",
-                            pipe_name, e
+                            pipe_name, error
                         );
                     }
+                    Some(error) if disconnected_attempts % 10 == 0 => {
+                        eprintln!(
+                            "[Locus] Unity reconnect still failing after {} attempt(s) (pipe: {}): {}",
+                            disconnected_attempts, pipe_name, error
+                        );
+                    }
+                    None if last_status != Some(false) => {
+                        eprintln!(
+                            "[Locus] Unity Editor not connected (pipe: {}): status returned disconnected",
+                            pipe_name
+                        );
+                    }
+                    None => {}
+                    _ => {}
                 }
             }
+
+            if connected {
+                status.reconnect_attempts = 0;
+            }
+
+            let _ = app_handle.emit("unity-connection-status-detail", status.clone());
 
             if last_status != Some(connected) {
                 last_status = Some(connected);

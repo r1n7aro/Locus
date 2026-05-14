@@ -199,6 +199,8 @@ describe("useAppBootstrap onboarding completion", () => {
       checkUnityConnection: vi.fn().mockResolvedValue(undefined),
       checkUnityPlugin: vi.fn().mockResolvedValue(undefined),
       loadAssetDbStatus: vi.fn().mockResolvedValue(undefined),
+      handleUnityConnectionStatus: vi.fn(),
+      handleUnityConnectionStatusDetail: vi.fn(),
     });
 
     chatStoreMock = reactive({

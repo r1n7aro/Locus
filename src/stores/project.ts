@@ -6,7 +6,13 @@ import { assetDbLightStatus, assetDbScanStart } from "../services/asset";
 import { normalizeAppError } from "../services/errors";
 import { useNotificationStore } from "./notification";
 import { t } from "../i18n";
-import type { AssetDbLightStatus, AssetDbScanEvent, ScanStats, PluginStatus } from "../types";
+import type {
+  AssetDbLightStatus,
+  AssetDbScanEvent,
+  PluginStatus,
+  ScanStats,
+  UnityConnectionStatus,
+} from "../types";
 
 type PluginNoticeStatus = "missing" | "outdated";
 export type UnityLaunchState = "idle" | "starting" | "waitingConnection";
@@ -19,6 +25,7 @@ export const useProjectStore = defineStore("project", () => {
   const workingDir = ref("");
   const recentDirs = ref<string[]>([]);
   const unityConnected = ref(false);
+  const unityConnectionStatus = ref<UnityConnectionStatus | null>(null);
   const scanPhase = ref<AssetDbScanEvent | null>(null);
   const lastScanStats = ref<ScanStats | null>(null);
   const pluginToast = ref<"missing" | "outdated" | null>(null);
@@ -74,6 +81,11 @@ export const useProjectStore = defineStore("project", () => {
     if (connected) {
       resetUnityLaunchState();
     }
+  }
+
+  function setUnityConnectionStatus(status: UnityConnectionStatus) {
+    unityConnectionStatus.value = status;
+    setUnityConnected(status.connected);
   }
 
   function scheduleUnityLaunchConnectionCheck(delayMs = UNITY_LAUNCH_CONNECTION_POLL_MS) {
@@ -143,6 +155,7 @@ export const useProjectStore = defineStore("project", () => {
     const result = await projectService.setWorkingDir(path);
     resetUnityLaunchState();
     workingDir.value = result;
+    unityConnectionStatus.value = null;
     scanPhase.value = null;
     lastScanStats.value = null;
     scanInFlight = false;
@@ -182,7 +195,7 @@ export const useProjectStore = defineStore("project", () => {
 
   async function checkUnityConnection() {
     try {
-      setUnityConnected(await unityService.checkUnityConnection());
+      setUnityConnectionStatus(await unityService.checkUnityConnectionStatus());
     } catch {
       setUnityConnected(false);
     }
@@ -276,6 +289,7 @@ export const useProjectStore = defineStore("project", () => {
     workingDir.value = "";
     recentDirs.value = [];
     unityConnected.value = false;
+    unityConnectionStatus.value = null;
     scanPhase.value = null;
     lastScanStats.value = null;
     scanInFlight = false;
@@ -286,6 +300,10 @@ export const useProjectStore = defineStore("project", () => {
 
   function handleUnityConnectionStatus(connected: boolean) {
     setUnityConnected(connected);
+  }
+
+  function handleUnityConnectionStatusDetail(status: UnityConnectionStatus) {
+    setUnityConnectionStatus(status);
   }
 
   function handleScanEvent(event: AssetDbScanEvent) {
@@ -319,6 +337,7 @@ export const useProjectStore = defineStore("project", () => {
     workingDir,
     recentDirs,
     unityConnected,
+    unityConnectionStatus,
     scanPhase,
     lastScanStats,
     pluginToast,
@@ -337,6 +356,7 @@ export const useProjectStore = defineStore("project", () => {
     loadAssetDbStatus,
     resetWorkspaceState,
     handleUnityConnectionStatus,
+    handleUnityConnectionStatusDetail,
     handleScanEvent,
     handlePluginStatus,
   };

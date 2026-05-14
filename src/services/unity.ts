@@ -1,6 +1,6 @@
 import { ipcInvoke } from "./ipc";
 import { getLocusRuntime } from "./locusRuntime";
-import type { AssetRefAttachment, PluginStatus } from "../types";
+import type { AssetRefAttachment, PluginStatus, UnityConnectionStatus } from "../types";
 
 export interface AssetSearchResult {
   name: string;
@@ -11,6 +11,10 @@ export interface AssetSearchResult {
 
 export function checkUnityConnection(): Promise<boolean> {
   return ipcInvoke<boolean>("check_unity_connection");
+}
+
+export function checkUnityConnectionStatus(): Promise<UnityConnectionStatus> {
+  return ipcInvoke<UnityConnectionStatus>("check_unity_connection_status");
 }
 
 export function checkUnityPlugin(): Promise<PluginStatus> {

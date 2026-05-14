@@ -11,7 +11,7 @@ import {
   showInFolder,
 } from "../services/unity";
 // undoPreview removed — undo UI moved to ChatChangesPanel
-import type { ChatComposerSendPayload, ChatMessage, AgentInfo, TokenUsage, ModelOption, PendingQuestion, PendingToolConfirm, EffortLevel, SessionSummary, AssetDbScanEvent, ScanStats, ImageAttachment, AssetRefAttachment, SkillManifest, UserIntentMeta, SaveRawContextRequest, CodexTransportMode, AssistantRenderPart } from "../types";
+import type { ChatComposerSendPayload, ChatMessage, AgentInfo, TokenUsage, ModelOption, PendingQuestion, PendingToolConfirm, EffortLevel, SessionSummary, AssetDbScanEvent, ScanStats, ImageAttachment, AssetRefAttachment, SkillManifest, UserIntentMeta, SaveRawContextRequest, CodexTransportMode, AssistantRenderPart, UnityConnectionStatus } from "../types";
 import type { ToolCallDisplay } from "../types";
 import ModelEffortSelector from "./ModelEffortSelector.vue";
 import SessionPanel from "./chat/SessionPanel.vue";
@@ -175,6 +175,7 @@ const props = defineProps<{
   unityPluginInstalling?: boolean;
   unityLaunching?: boolean;
   unityLaunchState?: "idle" | "starting" | "waitingConnection";
+  unityConnectionStatus?: UnityConnectionStatus | null;
   workingDir?: string;
   scanPhase?: AssetDbScanEvent | null;
   lastScanStats?: ScanStats | null;
@@ -1492,6 +1493,7 @@ onUnmounted(() => {
             :unity-plugin-installing="unityPluginInstalling"
             :unity-launching="unityLaunching"
             :unity-launch-state="unityLaunchState"
+            :unity-connection-status="unityConnectionStatus"
             :unity-recompiling="unityRecompileActive"
             :working-dir="workingDir"
             :is-unity-project="isUnityProject"

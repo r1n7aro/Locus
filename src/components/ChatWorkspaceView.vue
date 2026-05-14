@@ -388,6 +388,7 @@ onUnmounted(() => {
       :unity-plugin-installing="projectStore.pluginInstalling"
       :unity-launching="projectStore.unityLaunching"
       :unity-launch-state="projectStore.unityLaunchState"
+      :unity-connection-status="projectStore.unityConnectionStatus"
       :working-dir="projectStore.workingDir"
       :scan-phase="projectStore.scanPhase"
       :last-scan-stats="projectStore.lastScanStats"

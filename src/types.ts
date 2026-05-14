@@ -81,6 +81,17 @@ export interface AssetRefAttachment {
   source?: "unity" | "manual";
 }
 
+export interface UnityConnectionStatus {
+  connected: boolean;
+  editorStatus: string;
+  scenePath?: string | null;
+  pipeName: string;
+  latencyMs?: number | null;
+  reconnectAttempts: number;
+  lastError?: string | null;
+  checkedAtMs: number;
+}
+
 export interface SkillIntentItem {
   dirName: string;
   source: "app" | "project";

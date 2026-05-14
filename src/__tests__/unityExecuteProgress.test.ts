@@ -73,7 +73,9 @@ describe("unityExecuteProgress", () => {
     expect(unityBridgeSource).toContain("Waiting for Locus Unity operation lock");
     expect(unityBridgeSource).toContain("Preparing Unity type index");
     expect(unityBridgeSource).toContain("Sending execute_code to Unity");
-    expect(unityBridgeSource).toContain("Unity execute did not start within");
+    expect(unityBridgeSource).toContain("Unity execute did not leave the sending stage within");
+    expect(unityBridgeSource).toContain("Retrying execute_code after Unity pipe reconnect");
+    expect(unityBridgeSource).toContain("reconnect_unity_pipe_for_execute");
     expect(unityBridgeSource).toContain("Unity execute progress was unavailable");
     expect(unityBridgeSource).toContain("disconnect_with_reason(project_path");
     expect(transportSource).toContain("disconnect_with_reason");

@@ -2,7 +2,7 @@
 import { computed, onMounted, onUnmounted, ref } from "vue";
 import { Box, Database, type IconNode } from "lucide";
 import { t } from "../../i18n";
-import type { AssetDbScanEvent, ScanStats } from "../../types";
+import type { AssetDbScanEvent, ScanStats, UnityConnectionStatus } from "../../types";
 import BaseButton from "../ui/BaseButton.vue";
 
 type StatusId = "assetDb" | "unity";
@@ -42,6 +42,7 @@ const props = defineProps<{
   unityPluginInstalling?: boolean;
   unityLaunching?: boolean;
   unityLaunchState?: UnityLaunchState;
+  unityConnectionStatus?: UnityConnectionStatus | null;
   unityRecompiling?: boolean;
   workingDir?: string;
   isUnityProject?: boolean;
@@ -108,8 +109,24 @@ function unityPipeNameForWorkingDir(workingDir: string) {
 }
 
 const unityPipeName = computed(() =>
-  props.unityConnected ? unityPipeNameForWorkingDir(unityWorkingDir.value) : "",
+  props.unityConnectionStatus?.pipeName || unityPipeNameForWorkingDir(unityWorkingDir.value),
 );
+
+const unityEditorStatus = computed(() =>
+  props.unityConnectionStatus?.editorStatus || (props.unityConnected ? "editing" : "disconnected"),
+);
+
+function unityEditorStatusLabel(status: string) {
+  const normalized = status || "disconnected";
+  const key = `chat.toolConfirm.unityStatus.status.${normalized}`;
+  const label = t(key);
+  return label === key ? normalized : label;
+}
+
+function formatTimestamp(ms: number | null | undefined) {
+  if (!Number.isFinite(ms ?? Number.NaN) || !ms) return "";
+  return new Date(ms).toLocaleTimeString();
+}
 
 const unityPluginLabel = computed(() => {
   if (props.unityPluginStatus === "missing") return t("app.plugin.notInstalled");
@@ -250,6 +267,53 @@ const assetRows = computed<StatusDetailRow[]>(() => {
 
 const unityRows = computed<StatusDetailRow[]>(() => {
   const rows: StatusDetailRow[] = [];
+  const status = props.unityConnectionStatus ?? null;
+
+  rows.push({
+    label: t("chat.status.detail.status"),
+    value: unityEditorStatusLabel(unityEditorStatus.value),
+  });
+
+  if (status?.scenePath) {
+    rows.push({
+      label: t("chat.status.unity.scene"),
+      value: status.scenePath,
+      mono: true,
+    });
+  }
+
+  if (typeof status?.latencyMs === "number") {
+    rows.push({
+      label: t("chat.status.unity.latency"),
+      value: formatElapsed(status.latencyMs),
+    });
+  }
+
+  if (status?.checkedAtMs) {
+    const checkedAt = formatTimestamp(status.checkedAtMs);
+    if (checkedAt) {
+      rows.push({
+        label: t("chat.status.unity.checkedAt"),
+        value: checkedAt,
+      });
+    }
+  }
+
+  if (!props.unityConnected && (status?.reconnectAttempts ?? 0) > 0) {
+    rows.push({
+      label: t("chat.status.unity.reconnectAttempts"),
+      value: String(status?.reconnectAttempts ?? 0),
+    });
+  }
+
+  if (status?.lastError) {
+    rows.push({
+      label: t("chat.status.unity.lastError"),
+      value: status.lastError,
+      mono: true,
+    });
+  }
+
   if (unityPipeName.value) {
     rows.push({
       label: t("chat.status.unity.pipe"),

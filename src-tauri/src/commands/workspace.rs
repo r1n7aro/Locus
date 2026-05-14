@@ -1982,6 +1982,14 @@ pub async fn check_unity_connection(
 }
 
 #[tauri::command]
+pub async fn check_unity_connection_status(
+    workspace: State<'_, Arc<Workspace>>,
+) -> Result<crate::unity_bridge::UnityConnectionStatus, AppError> {
+    let cwd = workspace.path.read().await.clone();
+    Ok(crate::unity_bridge::query_unity_connection_status(&cwd).await)
+}
+
+#[tauri::command]
 pub async fn check_unity_plugin(
     workspace: State<'_, Arc<Workspace>>,
 ) -> Result<crate::unity_bridge::PluginStatus, AppError> {
