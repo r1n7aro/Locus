@@ -1,6 +1,7 @@
 
 <script setup lang="ts">
 import { ref, nextTick, watch, computed, onMounted, onUnmounted } from "vue";
+import { PanelTopOpen } from "lucide";
 import {
   selectUnityAsset,
   openUnityAssetInspector,
@@ -11,7 +12,7 @@ import {
   showInFolder,
 } from "../services/unity";
 // undoPreview removed — undo UI moved to ChatChangesPanel
-import type { ChatComposerSendPayload, ChatMessage, AgentInfo, TokenUsage, ModelOption, PendingQuestion, PendingToolConfirm, EffortLevel, SessionSummary, AssetDbScanEvent, ScanStats, ImageAttachment, AssetRefAttachment, SkillManifest, UserIntentMeta, SaveRawContextRequest, CodexTransportMode, AssistantRenderPart, UnityConnectionStatus } from "../types";
+import type { ChatComposerSendPayload, ChatMessage, AgentInfo, TokenUsage, ModelOption, PendingQuestion, PendingToolConfirm, EffortLevel, SessionSummary, AssetDbScanEvent, ScanStats, ImageAttachment, AssetRefAttachment, SkillManifest, UserIntentMeta, SaveRawContextRequest, CodexTransportMode, AssistantRenderPart, UnityConnectionStatus, KnowledgeDocumentType } from "../types";
 import type { ToolCallDisplay } from "../types";
 import ModelEffortSelector from "./ModelEffortSelector.vue";
 import SessionPanel from "./chat/SessionPanel.vue";
@@ -26,7 +27,12 @@ import ToolConfirmBatchCard from "./chat/ToolConfirmBatchCard.vue";
 import FileDiffViewer from "./diff/FileDiffViewer.vue";
 import BaseButton from "./ui/BaseButton.vue";
 import BaseSegmented from "./ui/BaseSegmented.vue";
+import LucideIcon from "./icons/LucideIcon.vue";
+import { clampFloatingPosition } from "./ui/floatingPosition";
 import { refetchDiffByKey } from "../services/diff";
+import { openChatDiffReviewWindow } from "../services/chatDiffReviewWindow";
+import { normalizeAppError } from "../services/errors";
+import { knowledgeRevealTarget } from "../services/knowledge";
 import { t } from "../i18n";
 import { useChatChangesStore } from "../stores/chatChanges";
 import { useChatStore } from "../stores/chat";
@@ -228,6 +234,46 @@ function closeLightbox() {
   lightboxSrc.value = "";
 }
 
+type AssetRefContextMenuTarget =
+  | {
+      kind: "asset";
+      filePath: string;
+      assetPath: string;
+    }
+  | {
+      kind: "file";
+      filePath: string;
+      entryKind: "file" | "folder";
+    }
+  | {
+      kind: "knowledge";
+      docType: KnowledgeDocumentType;
+      path: string;
+      filePath: string;
+    }
+  | {
+      kind: "sceneObject";
+      filePath: string;
+      scenePath: string;
+      objectPath: string;
+    };
+
+type AssetRefContextMenuState = {
+  x: number;
+  y: number;
+  target: AssetRefContextMenuTarget;
+};
+
+const ASSET_REF_CONTEXT_MENU_VIEWPORT_MARGIN = 8;
+const KNOWLEDGE_DOCUMENT_ROOT_RE = /^(design|memory|skill|reference)\/(.+\.md)$/i;
+const KNOWLEDGE_DOCUMENT_FILE_RE = /^Locus\/knowledge\/(design|memory|skill|reference)\/(.+\.md)$/i;
+const assetRefCtxMenu = ref<AssetRefContextMenuState | null>(null);
+const assetRefCtxMenuRef = ref<HTMLElement | null>(null);
+const assetRefCtxMenuStyle = computed(() => ({
+  left: `${assetRefCtxMenu.value?.x ?? 0}px`,
+  top: `${assetRefCtxMenu.value?.y ?? 0}px`,
+}));
+
 function isUnityRuntime() {
   return getLocusRuntime().kind === "unity";
 }
@@ -261,6 +307,204 @@ function shouldUseUnitySceneObjectRef(scenePath: string, objectPath: string) {
 
 function shouldOpenUnitySceneObjectInspector(e: MouseEvent, scenePath: string, objectPath: string) {
   return (e.ctrlKey || e.metaKey) && shouldUseUnitySceneObjectRef(scenePath, objectPath);
+}
+
+const assetRefContextCanSelectInUnity = computed(() => {
+  const target = assetRefCtxMenu.value?.target;
+  if (!target) return false;
+  if (target.kind === "sceneObject") {
+    return shouldUseUnitySceneObjectRef(target.scenePath, target.objectPath);
+  }
+  if (target.kind !== "asset") return false;
+  return shouldSelectUnityAsset(target.assetPath);
+});
+
+const assetRefContextIsKnowledge = computed(() =>
+  assetRefCtxMenu.value?.target.kind === "knowledge",
+);
+
+const assetRefContextCanOpenInEditor = computed(() => {
+  const target = assetRefCtxMenu.value?.target;
+  return !!target && !(target.kind === "knowledge" || (target.kind === "file" && target.entryKind === "folder"));
+});
+
+const assetRefContextSupportsUnity = computed(() => {
+  const target = assetRefCtxMenu.value?.target;
+  return target?.kind === "asset" || target?.kind === "sceneObject";
+});
+
+function viewportSize() {
+  return {
+    width: window.innerWidth || document.documentElement.clientWidth,
+    height: window.innerHeight || document.documentElement.clientHeight,
+  };
+}
+
+function updateAssetRefContextMenuPosition() {
+  const menu = assetRefCtxMenu.value;
+  const el = assetRefCtxMenuRef.value;
+  if (!menu || !el) return;
+
+  const rect = el.getBoundingClientRect();
+  const next = clampFloatingPosition(
+    { x: menu.x, y: menu.y },
+    { width: rect.width, height: rect.height },
+    viewportSize(),
+    ASSET_REF_CONTEXT_MENU_VIEWPORT_MARGIN,
+  );
+  if (next.x === menu.x && next.y === menu.y) return;
+  assetRefCtxMenu.value = { ...menu, x: next.x, y: next.y };
+}
+
+function closeAssetRefContextMenu() {
+  assetRefCtxMenu.value = null;
+}
+
+function normalizeAssetRefDatasetPath(path: string | undefined): string {
+  return (path ?? "").trim().replace(/\\/g, "/").replace(/\/+$/, "");
+}
+
+function toKnowledgeDocumentType(value: string): KnowledgeDocumentType | null {
+  const normalized = value.trim().toLowerCase();
+  if (
+    normalized === "design" ||
+    normalized === "memory" ||
+    normalized === "skill" ||
+    normalized === "reference"
+  ) {
+    return normalized;
+  }
+  return null;
+}
+
+function parseKnowledgeDocumentRefPath(filePath: string): AssetRefContextMenuTarget | null {
+  const normalized = normalizeAssetRefDatasetPath(filePath).replace(/^\/+/, "");
+  if (!normalized) return null;
+
+  const fileMatch = normalized.match(KNOWLEDGE_DOCUMENT_FILE_RE);
+  if (fileMatch) {
+    const docType = toKnowledgeDocumentType(fileMatch[1] ?? "");
+    const path = normalizeAssetRefDatasetPath(fileMatch[2]);
+    if (docType && path) {
+      return {
+        kind: "knowledge",
+        docType,
+        path: `${docType}/${path}`,
+        filePath: normalized,
+      };
+    }
+  }
+
+  const rootMatch = normalized.match(KNOWLEDGE_DOCUMENT_ROOT_RE);
+  if (rootMatch) {
+    const docType = toKnowledgeDocumentType(rootMatch[1] ?? "");
+    const path = normalizeAssetRefDatasetPath(rootMatch[2]);
+    if (docType && path) {
+      return {
+        kind: "knowledge",
+        docType,
+        path: `${docType}/${path}`,
+        filePath: `Locus/knowledge/${docType}/${path}`,
+      };
+    }
+  }
+
+  return null;
+}
+
+function assetContextTargetFromElement(target: Element): AssetRefContextMenuTarget | null {
+  const knowledgeRef = target.closest(".asset-chip[data-ref-kind='knowledge']") as HTMLElement | null;
+  if (knowledgeRef) {
+    const docType = toKnowledgeDocumentType(knowledgeRef.dataset.knowledgeType ?? "");
+    const path = normalizeAssetRefDatasetPath(knowledgeRef.dataset.knowledgePath);
+    if (docType && path) {
+      return {
+        kind: "knowledge",
+        docType,
+        path,
+        filePath: `Locus/knowledge/${path}`,
+      };
+    }
+  }
+
+  const sceneObjectRef = target.closest(
+    ".md-unity-scene-object-ref, .asset-chip[data-ref-kind='sceneObject']",
+  ) as HTMLElement | null;
+  if (sceneObjectRef) {
+    const scenePath = normalizeAssetRefDatasetPath(sceneObjectRef.dataset.scenePath);
+    const objectPath = normalizeAssetRefDatasetPath(sceneObjectRef.dataset.sceneObjectPath);
+    if (scenePath && objectPath) {
+      return {
+        kind: "sceneObject",
+        filePath: scenePath,
+        scenePath,
+        objectPath,
+      };
+    }
+  }
+
+  const unityAssetRef = target.closest(
+    ".md-unity-asset-ref, .md-file-ref[data-asset-path], .md-asset-chip, .asset-chip[data-ref-kind='asset']",
+  ) as HTMLElement | null;
+  if (unityAssetRef) {
+    const assetPath = normalizeAssetRefDatasetPath(
+      unityAssetRef.dataset.assetPath || unityAssetRef.dataset.filePath,
+    );
+    if (assetPath && isUnityAssetPath(assetPath)) {
+      return {
+        kind: "asset",
+        filePath: assetPath,
+        assetPath,
+      };
+    }
+  }
+
+  const workspaceAssetRef = target.closest(".md-workspace-ref[data-workspace-path]") as HTMLElement | null;
+  const workspacePath = normalizeAssetRefDatasetPath(workspaceAssetRef?.dataset.workspacePath);
+  const workspaceKnowledgeTarget = parseKnowledgeDocumentRefPath(workspacePath);
+  if (workspaceKnowledgeTarget) return workspaceKnowledgeTarget;
+  if (!workspacePath || !isUnityAssetPath(workspacePath)) {
+    const fileRef = target.closest(".md-file-ref[data-file-path]") as HTMLElement | null;
+    const filePath = normalizeAssetRefDatasetPath(fileRef?.dataset.filePath);
+    const fileKnowledgeTarget = parseKnowledgeDocumentRefPath(filePath);
+    if (fileKnowledgeTarget) return fileKnowledgeTarget;
+    if (filePath) {
+      return {
+        kind: "file",
+        filePath,
+        entryKind: workspaceAssetRef?.dataset.entryKind === "folder" ? "folder" : "file",
+      };
+    }
+    if (workspacePath && workspaceAssetRef?.dataset.entryKind === "folder") {
+      return {
+        kind: "file",
+        filePath: workspacePath,
+        entryKind: "folder",
+      };
+    }
+    return null;
+  }
+
+  return {
+    kind: "asset",
+    filePath: workspacePath,
+    assetPath: workspacePath,
+  };
+}
+
+function handleContentContextMenu(e: MouseEvent) {
+  if (!(e.target instanceof Element)) return;
+  const target = assetContextTargetFromElement(e.target);
+  if (!target) return;
+
+  e.preventDefault();
+  e.stopPropagation();
+  assetRefCtxMenu.value = {
+    x: e.clientX,
+    y: e.clientY,
+    target,
+  };
+  void nextTick(updateAssetRefContextMenuPosition);
 }
 
 function handleContentClick(e: MouseEvent) {
@@ -377,6 +621,94 @@ function handleFolderRefClick(folderPath: string) {
     return;
   }
   showInFolder(folderPath).catch((e: unknown) => console.warn("showInFolder failed:", e));
+}
+
+function notifyAssetRefContextMenuError(error: unknown, operation: string, fallbackMessage: string) {
+  const err = normalizeAppError(error);
+  notificationStore.addNotice("warning", err.message || fallbackMessage, {
+    code: err.code,
+    operation,
+    replaceOperation: true,
+  });
+}
+
+async function doAssetRefOpenInEditor() {
+  const target = assetRefCtxMenu.value?.target;
+  if (!target || !assetRefContextCanOpenInEditor.value) return;
+  closeAssetRefContextMenu();
+  try {
+    await openFileExternal(target.filePath);
+  } catch (error) {
+    console.warn("openFileExternal failed:", error);
+    notifyAssetRefContextMenuError(error, "assetRefOpenInEditor", "Failed to open file");
+  }
+}
+
+async function openInlineDiffInWindow() {
+  const payload = chatChangesStore.inlineDiffPayload;
+  if (!payload) return;
+  try {
+    await openChatDiffReviewWindow({ payload });
+  } catch (cause) {
+    const err = normalizeAppError(cause);
+    notificationStore.addNotice("error", err.message, {
+      code: err.code,
+      operation: "openChatDiffReviewWindow",
+    });
+  }
+}
+
+async function doAssetRefShowInFolder() {
+  const target = assetRefCtxMenu.value?.target;
+  if (!target) return;
+  closeAssetRefContextMenu();
+  try {
+    if (target.kind === "knowledge") {
+      await knowledgeRevealTarget({
+        kind: "document",
+        docType: target.docType,
+        path: target.path,
+      });
+      return;
+    }
+    await showInFolder(target.filePath);
+  } catch (error) {
+    console.warn("showInFolder failed:", error);
+    notifyAssetRefContextMenuError(error, "assetRefShowInFolder", "Failed to show file in folder");
+  }
+}
+
+function doAssetRefOpenInKnowledge() {
+  const target = assetRefCtxMenu.value?.target;
+  if (!target || target.kind !== "knowledge") return;
+  closeAssetRefContextMenu();
+  uiStore.stageKnowledgeSelection({
+    dashboard: target.docType,
+    path: target.path,
+  });
+  uiStore.setTab("knowledge");
+}
+
+async function doAssetRefSelectInUnity() {
+  const target = assetRefCtxMenu.value?.target;
+  if (!target || !assetRefContextCanSelectInUnity.value) return;
+  closeAssetRefContextMenu();
+
+  try {
+    if (target.kind === "sceneObject") {
+      await selectUnitySceneObject(target.scenePath, target.objectPath);
+      return;
+    }
+    if (target.kind !== "asset") return;
+    await selectUnityAsset(target.assetPath);
+  } catch (error) {
+    console.warn("selectUnityAsset failed:", error);
+    if (target.kind === "sceneObject") {
+      notifyUnitySceneObjectError(error, target.scenePath, target.objectPath);
+      return;
+    }
+    notifyAssetRefContextMenuError(error, "assetRefSelectInUnity", "Failed to select asset in Unity");
+  }
 }
 
 function handleQuestionAnswer(answer: string) {
@@ -1287,6 +1619,14 @@ onUnmounted(() => {
           </span>
           <span class="diff-inline-actions">
             <BaseButton
+              class="diff-inline-action-btn ui-select-none"
+              :title="t('chat.changes.openReviewWindow')"
+              @click="openInlineDiffInWindow"
+            >
+              <LucideIcon :icon="PanelTopOpen" :size="13" />
+              {{ t('chat.changes.openReviewWindow') }}
+            </BaseButton>
+            <BaseButton
               v-if="!chatChangesStore.inlineDiffPayload!.isBinary && canOpenInEditor(chatChangesStore.inlineDiffPayload!.filePath)"
               class="diff-inline-action-btn ui-select-none"
               :title="t('common.openInEditor')"
@@ -1380,6 +1720,7 @@ onUnmounted(() => {
           user-content-mode="asset"
           @scroll="onMessagesScroll"
           @content-click="handleContentClick"
+          @content-contextmenu="handleContentContextMenu"
           @open-thinking="emit('openThinking', $event)"
           @open-image="openLightbox"
           @apply-knowledge-proposal="chatStore.applyKnowledgeProposal"
@@ -1553,6 +1894,54 @@ onUnmounted(() => {
       </RichChatInput>
     </div>
     </div><!-- /chat-view -->
+
+    <Teleport to="body">
+      <div
+        v-if="assetRefCtxMenu"
+        class="asset-ref-ctx-backdrop"
+        @click="closeAssetRefContextMenu"
+        @contextmenu.prevent="closeAssetRefContextMenu"
+      >
+        <div
+          ref="assetRefCtxMenuRef"
+          class="asset-ref-ctx-menu"
+          :style="assetRefCtxMenuStyle"
+          @click.stop
+        >
+          <button
+            v-if="assetRefContextIsKnowledge"
+            type="button"
+            class="asset-ref-ctx-item"
+            @click="doAssetRefOpenInKnowledge"
+          >
+            {{ t("common.openInKnowledge") }}
+          </button>
+          <button
+            v-else-if="assetRefContextCanOpenInEditor"
+            type="button"
+            class="asset-ref-ctx-item"
+            @click="doAssetRefOpenInEditor"
+          >
+            {{ t("common.openInEditor") }}
+          </button>
+          <button type="button" class="asset-ref-ctx-item" @click="doAssetRefShowInFolder">
+            {{ t("common.openInFileExplorer") }}
+          </button>
+          <template v-if="assetRefContextSupportsUnity">
+            <div class="asset-ref-ctx-sep"></div>
+            <button
+              type="button"
+              class="asset-ref-ctx-item"
+              :class="{ disabled: !assetRefContextCanSelectInUnity }"
+              :disabled="!assetRefContextCanSelectInUnity"
+              @click="doAssetRefSelectInUnity"
+            >
+              {{ t("common.selectInUnity") }}
+            </button>
+          </template>
+        </div>
+      </div>
+    </Teleport>
 
     <Transition name="lightbox">
       <div v-if="lightboxSrc" class="lightbox-overlay" @click="closeLightbox">
@@ -2316,6 +2705,70 @@ onUnmounted(() => {
   font-size: 13px;
   font-weight: 600;
   min-height: 32px;
+}
+
+.asset-ref-ctx-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+}
+
+.asset-ref-ctx-menu {
+  position: fixed;
+  z-index: 10000;
+  box-sizing: border-box;
+  min-width: min(184px, calc(100vw - 16px));
+  max-width: calc(100vw - 16px);
+  max-height: calc(100vh - 16px);
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 5px;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: var(--elevated-bg, var(--panel-bg));
+  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.24);
+}
+
+.asset-ref-ctx-item {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  min-height: 28px;
+  padding: 0 10px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-color);
+  font: inherit;
+  font-size: 12px;
+  line-height: 1;
+  text-align: left;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.asset-ref-ctx-item:hover:not(:disabled),
+.asset-ref-ctx-item:focus-visible:not(:disabled) {
+  background: var(--hover-bg);
+}
+
+.asset-ref-ctx-item:focus-visible {
+  outline: none;
+}
+
+.asset-ref-ctx-item.disabled,
+.asset-ref-ctx-item:disabled {
+  color: var(--text-secondary);
+  cursor: default;
+  opacity: 0.48;
+}
+
+.asset-ref-ctx-sep {
+  height: 1px;
+  margin: 4px 0;
+  background: var(--border-color);
 }
 
 .lightbox-overlay {

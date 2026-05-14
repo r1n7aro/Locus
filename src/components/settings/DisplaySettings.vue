@@ -2,7 +2,7 @@
 import { computed, ref, onMounted } from "vue";
 import { t } from "../../i18n";
 import { useTheme, type ThemePreference } from "../../composables/useTheme";
-import { useDisplaySettings, type FontSlot } from "../../composables/useDisplaySettings";
+import { useDisplaySettings, type ChatDiffReviewTarget, type FontSlot } from "../../composables/useDisplaySettings";
 import { ipcInvoke } from "../../services/ipc";
 import BaseSegmented from "../ui/BaseSegmented.vue";
 import BaseSwitch from "../ui/BaseSwitch.vue";
@@ -22,6 +22,11 @@ const themeOptions = computed(() =>
     label: t(opt.labelKey),
   })),
 );
+
+const chatDiffReviewOptions = computed(() => [
+  { value: "inline", label: t("settings.display.diffReviewInline") },
+  { value: "window", label: t("settings.display.diffReviewWindow") },
+]);
 
 const systemNotificationOptionsDisabled = computed(
   () => !display.systemNotificationsEnabled,
@@ -130,6 +135,23 @@ onMounted(async () => {
         @update:model-value="setDisplay('hideThinkingBlocks', $event)"
       />
       <span>{{ t("settings.display.hideThinkingBlocks") }}</span>
+    </div>
+  </div>
+
+  <div class="settings-section">
+    <div class="section-label">{{ t("settings.display.diffReviewTitle") }}</div>
+    <p class="section-desc">{{ t("settings.display.diffReviewDesc") }}</p>
+
+    <div class="choice-row">
+      <span class="choice-label">{{ t("settings.display.diffReviewTarget") }}</span>
+      <BaseSegmented
+        class="choice-segmented"
+        :model-value="display.chatDiffReviewTarget"
+        :options="chatDiffReviewOptions"
+        :aria-label="t('settings.display.diffReviewTarget')"
+        size="sm"
+        @update:model-value="setDisplay('chatDiffReviewTarget', $event as ChatDiffReviewTarget)"
+      />
     </div>
   </div>
 
@@ -266,6 +288,26 @@ onMounted(async () => {
 }
 
 .theme-segmented {
+  justify-self: start;
+  width: fit-content;
+  max-width: 100%;
+}
+
+.choice-row {
+  display: grid;
+  grid-template-columns: 110px minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  width: min(560px, 100%);
+  padding: 7px 0;
+}
+
+.choice-label {
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+
+.choice-segmented {
   justify-self: start;
   width: fit-content;
   max-width: 100%;

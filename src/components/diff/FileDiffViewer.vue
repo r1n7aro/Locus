@@ -28,8 +28,10 @@ const props = withDefaults(
     filter?: "all" | "before" | "after";
     /** When true, the parent controls the tab switcher — hide the built-in tab bar */
     hideBuiltinTabs?: boolean;
+    /** When true, the parent controls text display mode actions — hide the built-in toolbar */
+    hideTextDisplayControls?: boolean;
   }>(),
-  { mode: "unified", compact: false, filter: "all", hideBuiltinTabs: false },
+  { mode: "unified", compact: false, filter: "all", hideBuiltinTabs: false, hideTextDisplayControls: false },
 );
 
 const emit = defineEmits<{
@@ -167,6 +169,10 @@ function scheduleTextReady() {
 
 const hasSemanticAndText = computed(
   () => !!props.payload.semantic && (!!effectiveText.value || props.payload.isLarge),
+);
+
+const hasTextDisplayModeControl = computed(
+  () => !!effectiveText.value && (activeTab.value === "text" || !props.payload.semantic) && !props.compact,
 );
 
 const hasSemanticDetails = computed(() => {
@@ -448,7 +454,13 @@ function formatLfsSize(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-defineExpose({ activeTab, hasSemanticAndText });
+defineExpose({
+  activeTab,
+  hasSemanticAndText,
+  hasTextDisplayModeControl,
+  textDisplayMode,
+  toggleTextDisplayMode,
+});
 </script>
 
 <template>
@@ -602,7 +614,7 @@ defineExpose({ activeTab, hasSemanticAndText });
         </button>
         <p v-if="!compact && lazyTextError" class="lfs-error">{{ lazyTextError }}</p>
       </div>
-      <div v-if="effectiveText && (activeTab === 'text' || !payload.semantic) && !compact" class="diff-view-controls">
+      <div v-if="hasTextDisplayModeControl && !hideTextDisplayControls" class="diff-view-controls">
         <span class="summary-spacer"></span>
         <button class="summary-toggle-btn" :class="{ active: textDisplayMode === 'side-by-side' }" @click="toggleTextDisplayMode">
           {{ t('diff.mode.sideBySide') }}

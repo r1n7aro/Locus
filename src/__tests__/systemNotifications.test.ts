@@ -25,6 +25,7 @@ function createDisplayState(): DisplaySettings {
     todoAutoOpen: true,
     changesAutoOpen: true,
     changesAutoClose: true,
+    chatDiffReviewTarget: "inline",
     rightAlignUserMessages: false,
     compactToolCalls: true,
     hideThinkingBlocks: true,
@@ -94,6 +95,7 @@ describe("systemNotifications", () => {
     displayState.todoAutoOpen = true;
     displayState.changesAutoOpen = true;
     displayState.changesAutoClose = true;
+    displayState.chatDiffReviewTarget = "inline";
     displayState.compactToolCalls = true;
     displayState.hideThinkingBlocks = true;
     displayState.mergeGitTreeStatusIcon = true;

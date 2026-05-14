@@ -11,6 +11,7 @@
     "feishu-reference-import-progress",
     "reference-external-import",
     "collab-history-search",
+    "chat-diff-review",
     "unity-embed"
   ],
   "permissions": [

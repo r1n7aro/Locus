@@ -8,6 +8,7 @@ import { diffSingleFile, createRequestToken, isTokenStale } from "../services/di
 import { normalizeAppError } from "../services/errors";
 import { findUndoRestoreUserText } from "../services/chatUndo";
 import { selectUnityAsset, openFileExternal } from "../services/unity";
+import { openChatDiffReviewWindow } from "../services/chatDiffReviewWindow";
 import { t } from "../i18n";
 import { useNotificationStore } from "../stores/notification";
 import FileDiffPopover from "./diff/FileDiffPopover.vue";
@@ -17,6 +18,7 @@ import { useHideMeta, isMetaFile, canOpenInEditor } from "../composables/useHide
 import { buildStagingTreeRows, collectStagingFolderPaths } from "./collab/stagingTree";
 import type { StagingTreeRow } from "./collab/stagingTree";
 import type { StagingViewMode } from "./collab/stagingLayout";
+import { useDisplaySettings } from "../composables/useDisplaySettings";
 
 const { hideMeta } = useHideMeta();
 const projectStore = useProjectStore();
@@ -32,6 +34,7 @@ const props = defineProps<{
 const chatStore = useChatStore();
 const changesStore = useChatChangesStore();
 const uiStore = useUiStore();
+const { state: displaySettings } = useDisplaySettings();
 
 const mode = computed(() => changesStore.currentMode);
 const fileViewMode = ref<StagingViewMode>(readStoredChatChangesViewMode());
@@ -245,10 +248,27 @@ function onItemMouseLeave() {
 
 async function onItemClick(item: DisplayItem) {
   clearHover();
+  const request = buildRequest(item, "full");
+  if (displaySettings.chatDiffReviewTarget === "window") {
+    try {
+      const opened = await openChatDiffReviewWindow({ request });
+      if (opened) {
+        changesStore.closeInlineDiff();
+        return;
+      }
+    } catch (e) {
+      const err = normalizeAppError(e);
+      notificationStore.addNotice("error", err.message, {
+        code: err.code,
+        operation: "openChatDiffReviewWindow",
+      });
+      console.error("[ChatChangesPanel] failed to open diff review window:", e);
+    }
+  }
   const seq = ++clickSeq;
   changesStore.setInlineDiffLoading(true);
   try {
-    const payload = await diffSingleFile(buildRequest(item, "full"));
+    const payload = await diffSingleFile(request);
     if (seq !== clickSeq) return; // stale — newer click or session switch
     changesStore.openInlineDiff(payload, item.assistantMessageId);
   } catch (e) {

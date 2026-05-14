@@ -135,7 +135,18 @@ function notifyUnitySceneObjectError(error: unknown, scenePath: string, objectPa
 </script>
 
 <template>
-  <span class="asset-chip" :title="path" @click.stop="handleClick">
+  <span
+    class="asset-chip"
+    :title="path"
+    :data-ref-kind="effectiveKind"
+    :data-knowledge-type="knowledgeRef?.docType"
+    :data-knowledge-path="knowledgeRef?.path"
+    :data-file-path="effectiveKind === 'knowledge' ? undefined : normalizedPath"
+    :data-asset-path="effectiveKind === 'asset' ? normalizedPath : undefined"
+    :data-scene-path="sceneObjectRef?.scenePath"
+    :data-scene-object-path="sceneObjectRef?.objectPath"
+    @click.stop="handleClick"
+  >
     <LucideIcon
       class="asset-chip-icon"
       :class="unityAssetIconClassForKind(iconKind)"

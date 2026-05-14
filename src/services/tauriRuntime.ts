@@ -25,6 +25,7 @@ const WINDOW_DRAG_EXCLUDED_SELECTOR = [
 let windowDragFallbackInstalled = false;
 
 function getTauriInternals(): TauriInternals | null {
+  if (typeof window === "undefined") return null;
   const internals = (window as unknown as { __TAURI_INTERNALS__?: TauriInternals })
     .__TAURI_INTERNALS__;
   return internals ?? null;

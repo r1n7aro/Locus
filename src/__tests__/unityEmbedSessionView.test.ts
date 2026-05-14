@@ -299,6 +299,47 @@ describe("Unity embedded session view", () => {
     expect(embedServer).toContain('request.command == "open_unity_asset_inspector"');
   });
 
+  it("offers reference context-menu actions for assets and knowledge documents", () => {
+    const chat = read("src/components/ChatView.vue");
+    const transcript = read("src/components/chat/ChatTranscript.vue");
+    const assetChip = read("src/components/AssetChip.vue");
+    const zh = read("src/language/zh.json");
+    const en = read("src/language/en.json");
+
+    expect(transcript).toContain('(e: "contentContextmenu", event: MouseEvent): void;');
+    expect(transcript).toContain("@contextmenu=\"emitContentContextmenu\"");
+    expect(chat).toContain("@content-contextmenu=\"handleContentContextMenu\"");
+    expect(chat).toContain("function handleContentContextMenu(e: MouseEvent)");
+    expect(chat).toContain("function assetContextTargetFromElement(target: Element)");
+    expect(chat).toContain("function parseKnowledgeDocumentRefPath(filePath: string)");
+    expect(chat).toContain("KNOWLEDGE_DOCUMENT_FILE_RE");
+    expect(chat).toContain('kind: "file"');
+    expect(chat).toContain("assetRefContextCanOpenInEditor");
+    expect(chat).toContain("assetRefContextSupportsUnity");
+    expect(chat).toContain(".md-workspace-ref[data-workspace-path]");
+    expect(chat).toContain('class="asset-ref-ctx-menu"');
+    expect(chat).toContain("doAssetRefOpenInEditor");
+    expect(chat).toContain("doAssetRefShowInFolder");
+    expect(chat).toContain("doAssetRefSelectInUnity");
+    expect(chat).toContain("doAssetRefOpenInKnowledge");
+    expect(chat).toContain("knowledgeRevealTarget({");
+    expect(chat).toContain("uiStore.stageKnowledgeSelection({");
+    expect(chat).toContain("openFileExternal(target.filePath)");
+    expect(chat).toContain("showInFolder(target.filePath)");
+    expect(chat).toContain("selectUnityAsset(target.assetPath)");
+    expect(chat).toContain('t("common.openInFileExplorer")');
+    expect(chat).toContain('t("common.openInKnowledge")');
+    expect(assetChip).toContain(':data-ref-kind="effectiveKind"');
+    expect(assetChip).toContain(":data-knowledge-type=\"knowledgeRef?.docType\"");
+    expect(assetChip).toContain(":data-knowledge-path=\"knowledgeRef?.path\"");
+    expect(assetChip).toContain(':data-asset-path="effectiveKind === \'asset\' ? normalizedPath : undefined"');
+    expect(assetChip).toContain(":data-scene-path=\"sceneObjectRef?.scenePath\"");
+    expect(zh).toContain('"common.openInFileExplorer": "在文件资源管理器中打开"');
+    expect(zh).toContain('"common.openInKnowledge": "在知识页中打开"');
+    expect(en).toContain('"common.openInFileExplorer": "Open in File Explorer"');
+    expect(en).toContain('"common.openInKnowledge": "Open in Knowledge"');
+  });
+
   it("routes scene object refs to Unity selection and locked inspectors", () => {
     const markdownInject = read("src/composables/markdownInject.ts");
     const chat = read("src/components/ChatView.vue");

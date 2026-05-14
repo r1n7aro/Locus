@@ -127,6 +127,64 @@ describe("display settings transcript alignment", () => {
     expect(en).toContain('"settings.display.hideGitCommandSuggestions": "Hide Git command suggestions"');
   });
 
+  it("adds a chat diff review target setting that defaults to the current window", () => {
+    const displaySettings = read("src/composables/useDisplaySettings.ts");
+    const displayPanel = read("src/components/settings/DisplaySettings.vue");
+    const chatChangesPanel = read("src/components/ChatChangesPanel.vue");
+    const chatView = read("src/components/ChatView.vue");
+    const chatReviewWindow = read("src/components/ChatDiffReviewWindow.vue");
+    const fileDiffViewer = read("src/components/diff/FileDiffViewer.vue");
+    const app = read("src/App.vue");
+    const capability = read("src-tauri/capabilities/default.json");
+    const zh = read("src/language/zh.json");
+    const en = read("src/language/en.json");
+
+    expect(displaySettings).toContain('export type ChatDiffReviewTarget = "inline" | "window";');
+    expect(displaySettings).toContain("chatDiffReviewTarget: ChatDiffReviewTarget;");
+    expect(displaySettings).toContain('chatDiffReviewTarget: "inline",');
+
+    expect(displayPanel).toContain('<div class="section-label">{{ t("settings.display.diffReviewTitle") }}</div>');
+    expect(displayPanel).toContain('<p class="section-desc">{{ t("settings.display.diffReviewDesc") }}</p>');
+    expect(displayPanel).toContain("settings.display.diffReviewTarget");
+    expect(displayPanel).toContain(":model-value=\"display.chatDiffReviewTarget\"");
+    expect(displayPanel).toContain("@update:model-value=\"setDisplay('chatDiffReviewTarget', $event as ChatDiffReviewTarget)\"");
+    expect(displayPanel.indexOf("settings.display.diffReviewTitle")).toBeGreaterThan(
+      displayPanel.indexOf("settings.display.panelBehaviorTitle"),
+    );
+    expect(displayPanel.indexOf("settings.display.diffReviewTitle")).toBeLessThan(
+      displayPanel.indexOf("settings.display.gitViewTitle"),
+    );
+
+    expect(chatChangesPanel).toContain("displaySettings.chatDiffReviewTarget === \"window\"");
+    expect(chatChangesPanel).toContain("openChatDiffReviewWindow({ request })");
+    expect(chatView).toContain("openInlineDiffInWindow");
+    expect(chatView).toContain("chat.changes.openReviewWindow");
+    expect(chatReviewWindow).toContain(":hide-text-display-controls=\"true\"");
+    expect(chatReviewWindow).toContain("fileDiffViewerRef?.hasTextDisplayModeControl");
+    expect(chatReviewWindow).toContain("fileDiffViewerRef.toggleTextDisplayMode()");
+    expect(chatReviewWindow.indexOf("common.openInEditor")).toBeLessThan(
+      chatReviewWindow.indexOf("diff.mode.sideBySide"),
+    );
+    expect(fileDiffViewer).toContain("hideTextDisplayControls?: boolean;");
+    expect(fileDiffViewer).toContain("hasTextDisplayModeControl");
+    expect(fileDiffViewer).toContain("toggleTextDisplayMode,");
+
+    expect(app).toContain("isChatDiffReviewWindowLocation");
+    expect(app).toContain("<ChatDiffReviewWindow v-else-if=\"isChatDiffReviewWindow\" />");
+    expect(capability).toContain('"chat-diff-review"');
+
+    expect(zh).toContain('"settings.display.panelBehaviorDesc": "控制会话面板的打开与关闭"');
+    expect(zh).toContain('"settings.display.diffReviewTitle": "文件修改审查"');
+    expect(zh).toContain('"settings.display.diffReviewDesc": "选择从会话中打开文件修改时的默认位置"');
+    expect(zh).toContain('"settings.display.diffReviewTarget": "审查文件修改"');
+    expect(zh).toContain('"settings.display.diffReviewWindow": "独立窗口"');
+    expect(en).toContain('"settings.display.panelBehaviorDesc": "Control how session panels open and close"');
+    expect(en).toContain('"settings.display.diffReviewTitle": "File Change Review"');
+    expect(en).toContain('"settings.display.diffReviewDesc": "Choose where file changes open from the session view"');
+    expect(en).toContain('"settings.display.diffReviewTarget": "Review file changes"');
+    expect(en).toContain('"settings.display.diffReviewWindow": "Separate window"');
+  });
+
   it("adds a completed thinking block visibility toggle that defaults to hidden", () => {
     const displaySettings = read("src/composables/useDisplaySettings.ts");
     const displayPanel = read("src/components/settings/DisplaySettings.vue");

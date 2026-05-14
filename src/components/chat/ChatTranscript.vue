@@ -147,6 +147,7 @@ const emit = defineEmits<{
   (e: "openImage", src: string): void;
   (e: "scroll", event: Event): void;
   (e: "contentClick", event: MouseEvent): void;
+  (e: "contentContextmenu", event: MouseEvent): void;
   (e: "toolHandoffQuietChange", quiet: boolean): void;
   (e: "toolViewportAnchorStart", anchor: HTMLElement): void;
   (e: "toolViewportAnchorEnd", anchor: HTMLElement): void;
@@ -1428,6 +1429,10 @@ function emitContentClick(event: MouseEvent) {
   emit("contentClick", event);
 }
 
+function emitContentContextmenu(event: MouseEvent) {
+  emit("contentContextmenu", event);
+}
+
 function emitToolViewportAnchorStart(anchor: HTMLElement) {
   emit("toolViewportAnchorStart", anchor);
 }
@@ -1449,6 +1454,7 @@ function openImage(src: string) {
     :class="`is-${variant}`"
     @scroll="emitScroll"
     @click="emitContentClick"
+    @contextmenu="emitContentContextmenu"
   >
     <div ref="contentRef" class="chat-transcript-content">
       <div

@@ -30,6 +30,7 @@ import { isFeishuReferenceImportWindowLocation } from "./services/feishuReferenc
 import { isUnityReferenceImportWindowLocation } from "./services/unityReferenceImportWindow";
 import { isReferenceExternalImportWindowLocation } from "./services/referenceExternalImportWindow";
 import { isCollabSearchWindowLocation } from "./services/collabSearchWindow";
+import { isChatDiffReviewWindowLocation } from "./services/chatDiffReviewWindow";
 import { isUnityHostLocation } from "./services/locusRuntime";
 import {
   canStartWindowDragFromTarget,
@@ -49,6 +50,7 @@ const isFeishuReferenceImportWindow = isFeishuReferenceImportWindowLocation();
 const isUnityReferenceImportWindow = isUnityReferenceImportWindowLocation();
 const isReferenceExternalImportWindow = isReferenceExternalImportWindowLocation();
 const isCollabSearchWindow = isCollabSearchWindowLocation();
+const isChatDiffReviewWindow = isChatDiffReviewWindowLocation();
 const isStandaloneWindow = isCanvasWindow
   || isUnityEmbedWindow
   || isUnityEmbedTestWindow
@@ -57,7 +59,8 @@ const isStandaloneWindow = isCanvasWindow
   || isFeishuReferenceImportWindow
   || isUnityReferenceImportWindow
   || isReferenceExternalImportWindow
-  || isCollabSearchWindow;
+  || isCollabSearchWindow
+  || isChatDiffReviewWindow;
 
 const CanvasView = defineAsyncComponent(() => import("./components/CanvasView.vue"));
 const KnowledgeDownloadProgressWindow = defineAsyncComponent(() => import("./components/KnowledgeDownloadProgressWindow.vue"));
@@ -66,6 +69,7 @@ const FeishuReferenceImportProgressWindow = defineAsyncComponent(() => import(".
 const UnityReferenceImportProgressWindow = defineAsyncComponent(() => import("./components/UnityReferenceImportProgressWindow.vue"));
 const ReferenceExternalImportWindow = defineAsyncComponent(() => import("./components/ReferenceExternalImportWindow.vue"));
 const CollabSearchWindow = defineAsyncComponent(() => import("./components/CollabSearchWindow.vue"));
+const ChatDiffReviewWindow = defineAsyncComponent(() => import("./components/ChatDiffReviewWindow.vue"));
 const UnityEmbeddedSessionView = defineAsyncComponent(() => import("./components/UnityEmbeddedSessionView.vue"));
 const UnityEmbedTestView = defineAsyncComponent(() => import("./components/UnityEmbedTestView.vue"));
 const OnboardingView = defineAsyncComponent(() => import("./components/OnboardingView.vue"));
@@ -596,6 +600,7 @@ watch(() => projectStore.workingDir, () => {
   <UnityReferenceImportProgressWindow v-else-if="isUnityReferenceImportWindow" />
   <ReferenceExternalImportWindow v-else-if="isReferenceExternalImportWindow" />
   <CollabSearchWindow v-else-if="isCollabSearchWindow" />
+  <ChatDiffReviewWindow v-else-if="isChatDiffReviewWindow" />
   <div v-else-if="!authStore.authChecked" class="app-startup-state">
     <span>{{ t("common.loading") }}</span>
   </div>
