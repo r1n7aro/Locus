@@ -184,11 +184,17 @@ function formatQuotaReset(resetsAt: number | null): string {
   if (!resetsAt) return "";
   const date = new Date(resetsAt * 1000);
   if (Number.isNaN(date.getTime())) return "";
-  return date.toLocaleTimeString(locale.value === "zh" ? "zh-CN" : "en-US", {
+  const dateLocale = locale.value === "zh" ? "zh-CN" : "en-US";
+  const dateLabel = date.toLocaleDateString(dateLocale, {
+    month: "2-digit",
+    day: "2-digit",
+  });
+  const timeLabel = date.toLocaleTimeString(dateLocale, {
     hour: "2-digit",
     minute: "2-digit",
     hour12: false,
   });
+  return `${dateLabel} ${timeLabel}`;
 }
 
 function quotaBarStyle(window: CodexQuotaWindowState) {
@@ -738,12 +744,12 @@ function quotaCreditsLabel() {
   display: flex;
   flex-direction: column;
   gap: 6px;
-  width: min(360px, 100%);
+  width: min(420px, 100%);
 }
 
 .codex-quota-row {
   display: grid;
-  grid-template-columns: minmax(72px, 128px) minmax(120px, 1fr) 40px 44px;
+  grid-template-columns: minmax(72px, 128px) minmax(96px, 1fr) 40px minmax(86px, max-content);
   align-items: center;
   gap: 8px;
   font-size: 12px;
@@ -759,6 +765,10 @@ function quotaCreditsLabel() {
 .codex-quota-name {
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.codex-quota-reset {
+  text-align: right;
 }
 
 .codex-quota-track {
