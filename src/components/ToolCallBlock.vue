@@ -435,7 +435,6 @@ const highlightedOutput = computed(() => {
             <FileDiffViewer
               v-if="editDiffPayloads.get(idx)"
               :payload="editDiffPayloads.get(idx)!"
-              mode="side-by-side"
               :style="idx > 0 ? 'margin-top: 6px' : ''"
             />
             <div v-else class="edit-diff-container" :style="idx > 0 ? 'margin-top: 6px' : ''">
@@ -976,8 +975,8 @@ const highlightedOutput = computed(() => {
 }
 
 .edit-diff-container {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
+  display: flex;
+  flex-direction: column;
   gap: 0;
   border-radius: 6px;
   overflow: hidden;
@@ -1063,6 +1062,6 @@ const highlightedOutput = computed(() => {
 }
 
 .edit-diff-old {
-  border-right: 1px solid rgba(255, 255, 255, 0.08);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
 }
 </style>
