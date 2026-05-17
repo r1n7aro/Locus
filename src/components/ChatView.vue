@@ -206,6 +206,7 @@ const unityRecompileActive = computed(() => hasRunningUnityRecompile(props.activ
 const emit = defineEmits<{
   send: [text: string, images: ImageAttachment[], assetRefs: AssetRefAttachment[], overrides?: { displayText?: string; mode?: string; userIntent?: UserIntentMeta | null }];
   compact: [];
+  fork: [];
   cancel: [];
   selectAgent: [id: string];
   selectModel: [id: string];
@@ -726,6 +727,53 @@ function draftSessionKey(sessionId: string | null) {
 }
 
 const composerAssetRefSyncKey = computed(() => `chat:${draftSessionKey(props.activeSessionId)}`);
+type UndoChoice = "conversation" | "files";
+const undoChooserVisible = ref(false);
+const undoChooserRef = ref<HTMLElement | null>(null);
+const selectedUndoChoice = ref<UndoChoice>("conversation");
+const undoAction = ref<"conversation" | "files" | null>(null);
+const undoChooserBusy = computed(() => undoAction.value !== null);
+
+const latestConversationTurn = computed(() => {
+  let userIndex = -1;
+  for (let index = props.messages.length - 1; index >= 0; index -= 1) {
+    if (props.messages[index]?.role === "user") {
+      userIndex = index;
+      break;
+    }
+  }
+  if (userIndex < 0) return null;
+
+  const turnMessages = props.messages.slice(userIndex);
+  const fileUndoTarget = turnMessages.find(
+    (message) => message.role === "assistant" && !!props.undoableMessageIds?.has(message.id),
+  )?.id ?? null;
+
+  return {
+    userText: props.messages[userIndex]?.content ?? "",
+    fileUndoTarget,
+  };
+});
+
+const canUndoConversation = computed(() =>
+  !!props.activeSessionId && !!latestConversationTurn.value && !props.isStreaming,
+);
+const canUndoFilesAndConversation = computed(() =>
+  canUndoConversation.value && !!latestConversationTurn.value?.fileUndoTarget,
+);
+const undoChoices = computed<UndoChoice[]>(() => {
+  if (!canUndoConversation.value) return [];
+  return canUndoFilesAndConversation.value
+    ? ["conversation", "files"]
+    : ["conversation"];
+});
+
+watch(undoChoices, (choices) => {
+  if (!undoChooserVisible.value || choices.length === 0) return;
+  if (!choices.includes(selectedUndoChoice.value)) {
+    selectedUndoChoice.value = defaultUndoChoice();
+  }
+});
 
 function storeComposerDraft(sessionId: string | null, value: string) {
   const key = draftSessionKey(sessionId);
@@ -748,6 +796,105 @@ async function focusComposerInput() {
   const end = inputText.value.length;
   composerPanelRef.value?.focus();
   composerPanelRef.value?.setSelectionRange(end, end);
+}
+
+function defaultUndoChoice(): UndoChoice {
+  return canUndoFilesAndConversation.value ? "files" : "conversation";
+}
+
+async function openUndoChooser() {
+  selectedUndoChoice.value = defaultUndoChoice();
+  undoChooserVisible.value = true;
+  await nextTick();
+  undoChooserRef.value?.focus();
+}
+
+function closeUndoChooser() {
+  if (undoChooserBusy.value) return;
+  undoChooserVisible.value = false;
+}
+
+function restoreUndoText(text: string) {
+  if (text.trim()) {
+    uiStore.stageChatPrefill(text);
+  }
+}
+
+function moveUndoChoice(delta: number) {
+  const choices = undoChoices.value;
+  if (choices.length === 0) return;
+  const currentIndex = choices.indexOf(selectedUndoChoice.value);
+  const nextIndex = currentIndex < 0
+    ? 0
+    : (currentIndex + delta + choices.length) % choices.length;
+  selectedUndoChoice.value = choices[nextIndex] ?? defaultUndoChoice();
+}
+
+function runSelectedUndoChoice() {
+  if (selectedUndoChoice.value === "files" && canUndoFilesAndConversation.value) {
+    void undoFilesAndConversation();
+    return;
+  }
+  if (canUndoConversation.value) {
+    void undoConversationOnly();
+  }
+}
+
+function handleUndoChooserKeydown(event: KeyboardEvent) {
+  if (!undoChooserVisible.value) return;
+  if (event.key === "Escape") {
+    event.preventDefault();
+    closeUndoChooser();
+    return;
+  }
+  if (undoChooserBusy.value) return;
+  if (event.key === "ArrowDown") {
+    event.preventDefault();
+    moveUndoChoice(1);
+    return;
+  }
+  if (event.key === "ArrowUp") {
+    event.preventDefault();
+    moveUndoChoice(-1);
+    return;
+  }
+  if (event.key === "Enter") {
+    event.preventDefault();
+    runSelectedUndoChoice();
+  }
+}
+
+async function undoConversationOnly() {
+  const turn = latestConversationTurn.value;
+  if (!turn || !canUndoConversation.value || undoChooserBusy.value) return;
+  undoAction.value = "conversation";
+  chatChangesStore.closeInlineDiff();
+  try {
+    const undone = await chatStore.undoLatestConversationTurn();
+    if (undone) {
+      undoChooserVisible.value = false;
+      restoreUndoText(turn.userText);
+    }
+  } finally {
+    undoAction.value = null;
+  }
+}
+
+async function undoFilesAndConversation() {
+  const turn = latestConversationTurn.value;
+  const targetId = turn?.fileUndoTarget;
+  if (!targetId || !canUndoFilesAndConversation.value || undoChooserBusy.value) return;
+  undoAction.value = "files";
+  chatChangesStore.closeInlineDiff();
+  try {
+    const undone = await chatStore.performUndo(targetId);
+    if (undone) {
+      undoChooserVisible.value = false;
+      restoreUndoText(turn.userText);
+    }
+  } finally {
+    undoAction.value = null;
+  }
 }
 
 async function handleNewChatRequest() {
@@ -1872,6 +2019,8 @@ onUnmounted(() => {
         :asset-ref-sync-key="composerAssetRefSyncKey"
         @send="handleComposerSend"
         @compact="emit('compact')"
+        @fork="emit('fork')"
+        @undo="openUndoChooser"
         @clear="handleNewChatRequest"
         @cancel="emit('cancel')"
       >
@@ -1894,6 +2043,70 @@ onUnmounted(() => {
       </RichChatInput>
     </div>
     </div><!-- /chat-view -->
+
+    <Teleport to="body">
+      <Transition name="undo-chooser-fade">
+        <div
+          v-if="undoChooserVisible"
+          ref="undoChooserRef"
+          class="undo-chooser-backdrop"
+          tabindex="-1"
+          @click.self="closeUndoChooser"
+          @keydown="handleUndoChooserKeydown"
+        >
+          <div class="undo-chooser" role="dialog" aria-modal="true" :aria-label="t('chat.undo.dialogTitle')">
+            <div class="undo-chooser-header">
+              <div class="undo-chooser-title">{{ t("chat.undo.dialogTitle") }}</div>
+              <button
+                type="button"
+                class="undo-chooser-close ui-select-none"
+                :disabled="undoChooserBusy"
+                :aria-label="t('common.cancel')"
+                @click="closeUndoChooser"
+              >
+                &times;
+              </button>
+            </div>
+            <div v-if="!canUndoConversation" class="undo-chooser-empty">
+              {{ t("chat.undo.noConversationRound") }}
+            </div>
+            <div v-else class="undo-chooser-actions">
+              <button
+                type="button"
+                class="undo-chooser-action"
+                :class="{ 'is-selected': selectedUndoChoice === 'conversation' }"
+                :disabled="undoChooserBusy"
+                :aria-pressed="selectedUndoChoice === 'conversation'"
+                @focus="selectedUndoChoice = 'conversation'"
+                @click="undoConversationOnly"
+              >
+                <span>{{ t("chat.undo.conversationOnly") }}</span>
+                <span v-if="undoAction === 'conversation'" class="undo-chooser-action-state">
+                  {{ t("chat.changes.undoing") }}
+                </span>
+              </button>
+              <button
+                type="button"
+                class="undo-chooser-action"
+                :class="{ 'is-selected': selectedUndoChoice === 'files' }"
+                :disabled="undoChooserBusy || !canUndoFilesAndConversation"
+                :aria-pressed="selectedUndoChoice === 'files'"
+                @focus="selectedUndoChoice = 'files'"
+                @click="undoFilesAndConversation"
+              >
+                <span>{{ t("chat.undo.filesAndConversation") }}</span>
+                <span v-if="undoAction === 'files'" class="undo-chooser-action-state">
+                  {{ t("chat.changes.undoing") }}
+                </span>
+              </button>
+              <div v-if="!canUndoFilesAndConversation" class="undo-chooser-note">
+                {{ t("chat.undo.noFileUndo") }}
+              </div>
+            </div>
+          </div>
+        </div>
+      </Transition>
+    </Teleport>
 
     <Teleport to="body">
       <div
@@ -2705,6 +2918,130 @@ onUnmounted(() => {
   font-size: 13px;
   font-weight: 600;
   min-height: 32px;
+}
+
+.undo-chooser-fade-enter-active,
+.undo-chooser-fade-leave-active {
+  transition: opacity 120ms ease;
+}
+
+.undo-chooser-fade-enter-from,
+.undo-chooser-fade-leave-to {
+  opacity: 0;
+}
+
+.undo-chooser-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1300;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  padding: 0 16px 112px;
+  background: color-mix(in srgb, var(--bg-color) 26%, transparent);
+}
+
+.undo-chooser {
+  width: min(420px, calc(100vw - 32px));
+  overflow: hidden;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: var(--panel-bg);
+  box-shadow: var(--shadow-popover, 0 12px 28px rgba(0, 0, 0, 0.24));
+}
+
+.undo-chooser-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 40px;
+  padding: 0 10px 0 14px;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.undo-chooser-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-color);
+}
+
+.undo-chooser-close {
+  width: 28px;
+  height: 28px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.undo-chooser-close:hover:not(:disabled),
+.undo-chooser-close:focus-visible:not(:disabled) {
+  border-color: var(--border-color);
+  background: var(--hover-bg);
+  color: var(--text-color);
+}
+
+.undo-chooser-close:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+.undo-chooser-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+}
+
+.undo-chooser-action {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 36px;
+  padding: 0 12px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: var(--bg-color);
+  color: var(--text-color);
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.undo-chooser-action:hover:not(:disabled),
+.undo-chooser-action:focus-visible:not(:disabled) {
+  border-color: color-mix(in srgb, var(--accent-color) 32%, var(--border-color));
+  background: var(--hover-bg);
+}
+
+.undo-chooser-action.is-selected:not(:disabled) {
+  border-color: color-mix(in srgb, var(--accent-color) 42%, var(--border-color));
+  background: color-mix(in srgb, var(--accent-soft) 84%, var(--panel-bg) 16%);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent-color) 12%, transparent);
+}
+
+.undo-chooser-action:disabled {
+  cursor: default;
+  opacity: 0.58;
+}
+
+.undo-chooser-action-state,
+.undo-chooser-note,
+.undo-chooser-empty {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.undo-chooser-note {
+  padding: 0 2px 2px;
+}
+
+.undo-chooser-empty {
+  padding: 14px;
 }
 
 .asset-ref-ctx-backdrop {

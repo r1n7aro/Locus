@@ -21,7 +21,7 @@ use crate::session::models::{
     KnowledgeProposalStatus, SessionDetail, SessionEventRecord, SessionRunSummary,
     SessionRuntimeStatus, SessionSummary, TodoItem, TodoSnapshot, UserIntentPayload,
 };
-use crate::session::store::SessionStore;
+use crate::session::store::{SessionStore, CHILD_SESSION_FORK_ERROR};
 use crate::tool::ToolRegistry;
 use crate::workspace::Workspace;
 use crate::{ActiveTaskHandle, ActiveTasks, ApiKeyState, ProviderKeysState, QuestionStore};
@@ -663,6 +663,27 @@ pub async fn create_session(
 }
 
 #[tauri::command]
+pub async fn fork_session(
+    session_id: String,
+    title: Option<String>,
+    store: State<'_, Arc<SessionStore>>,
+) -> Result<String, AppError> {
+    store
+        .fork_session(&session_id, title.as_deref())
+        .map_err(|error| {
+            if error == CHILD_SESSION_FORK_ERROR {
+                AppError::new("session.fork_child", "Child sessions cannot be forked.")
+                    .detail(error)
+                    .operation("forkSession")
+            } else {
+                AppError::new("session.fork_failed", "Failed to fork session.")
+                    .detail(error)
+                    .operation("forkSession")
+            }
+        })
+}
+
+#[tauri::command]
 pub async fn chat(
     session_id: Option<String>,
     text: String,
@@ -1024,6 +1045,25 @@ pub async fn load_session(
     session_id: String,
     store: State<'_, Arc<SessionStore>>,
 ) -> Result<SessionDetail, AppError> {
+    store.load_session(&session_id).map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn undo_latest_conversation_turn(
+    session_id: String,
+    store: State<'_, Arc<SessionStore>>,
+) -> Result<SessionDetail, AppError> {
+    let deleted = store
+        .truncate_latest_conversation_turn(&session_id)
+        .map_err(AppError::from)?;
+    if deleted == 0 {
+        return Err(AppError::new(
+            "session.undo.empty",
+            "No conversation round is available to undo.",
+        )
+        .operation("undo"));
+    }
+    crate::llm::codex::reset_cached_session_window(&session_id).await;
     store.load_session(&session_id).map_err(Into::into)
 }
 

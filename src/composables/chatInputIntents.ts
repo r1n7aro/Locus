@@ -2,7 +2,7 @@
 
 export type IntentMode = "build" | "plan";
 export type IntentCommandKind = "action" | "intent";
-export type IntentCommandType = "plan" | "skill" | "compact" | "clear";
+export type IntentCommandType = "plan" | "skill" | "compact" | "clear" | "fork" | "undo";
 
 export interface ComposerIntentState {
   mode: IntentMode;
@@ -118,6 +118,7 @@ function isIntentMeta(value: unknown): value is UserIntentMeta {
   if (meta.kind !== "user_intent_v1") return false;
   if (meta.mode !== "build" && meta.mode !== "plan") return false;
   if (!Array.isArray(meta.skills)) return false;
+  if (meta.clientMessageId !== undefined && typeof meta.clientMessageId !== "string") return false;
   return meta.skills.every((skill) =>
     !!skill
     && typeof skill === "object"
@@ -164,6 +165,18 @@ export function buildUserIntentMeta(intent: ComposerIntentState): UserIntentMeta
     kind: "user_intent_v1",
     mode: intent.mode,
     skills,
+  };
+}
+
+export function withClientMessageId(
+  intent: UserIntentMeta | null | undefined,
+  clientMessageId: string,
+): UserIntentMeta {
+  return {
+    kind: "user_intent_v1",
+    mode: intent?.mode ?? "build",
+    skills: intent?.skills ?? [],
+    clientMessageId,
   };
 }
 

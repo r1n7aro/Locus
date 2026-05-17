@@ -38,12 +38,21 @@ describe("chat composer draft persistence", () => {
   it("converts Unity mention refs into composer asset references", () => {
     const richInput = read("src/components/chat/RichChatInput.vue");
 
-    expect(richInput).toContain('import { extractChatAssetRefs } from "../../composables/chatAssetRefs";');
+    expect(richInput).toContain('import { buildProjectKnowledgeRefPath, extractChatAssetRefs } from "../../composables/chatAssetRefs";');
     expect(richInput).toContain("const UNITY_ASSET_REF_ROOT_RE = /^(?:Assets|Packages|ProjectSettings)(?:\\/|$)/i;");
     expect(richInput).toContain("const assetRef = buildManualAssetRef(mentionPath);");
     expect(richInput).toContain("addAssetRefs([assetRef]);");
     expect(richInput).toContain("const inlineAssetRefs = extractInlineUnityAssetRefs(parsed.cleanedText);");
     expect(richInput).toContain("const cleanedInput = normalizeComposerText(inlineAssetRefs.text);");
     expect(richInput).toContain("dedupeAssetRefs([...assetRefAttachments.value, ...inlineAssetRefs.assetRefs]);");
+  });
+
+  it("converts knowledge search results into composer asset references", () => {
+    const richInput = read("src/components/chat/RichChatInput.vue");
+
+    expect(richInput).toContain("const refPath = buildProjectKnowledgeRefPath(result.type, result.path);");
+    expect(richInput).toContain("relPath: refPath,");
+    expect(richInput).toContain("parentPath: parentPathFor(refPath),");
+    expect(richInput).toContain("meta: refPath,");
   });
 });

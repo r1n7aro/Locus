@@ -398,6 +398,7 @@ onUnmounted(() => {
       :undoable-message-ids="chatStore.undoableMessageIds"
       @send="chatStore.sendMessage"
       @compact="chatStore.compactSession"
+      @fork="chatStore.forkSession"
       @cancel="chatStore.cancelChat"
       @select-agent="(id: string) => agentStore.selectAgent(id)"
       @select-model="(id: string) => modelStore.selectModel(id)"

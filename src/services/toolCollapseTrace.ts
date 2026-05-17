@@ -3,9 +3,42 @@ const traceStartMs =
     ? performance.now()
     : Date.now();
 
-const TOOL_COLLAPSE_VERIFICATION_EVENTS = new Set([
+const TOOL_COLLAPSE_HANDOFF_EVENTS = new Set([
+  "activeToolCallsCleared",
+  "activeToolCallsResumedWithHandoff",
+  "animateCollapseOnMount",
+  "beginToolCallHandoff",
+  "clearToolCallHandoff",
+  "collapseArmed",
+  "expandedChanged",
+  "historyToolSegmentPinnedStateChanged",
+  "historyToolSegmentExpansionDecision",
+  "onTransientToolCallsCollapseFinished",
+  "panelAfterLeave",
+  "pendingContinuationToolItemIdsChanged",
+  "promotableHistoryToolCallsChanged",
+  "promotedHistoryToolCallsRenderGap",
+  "promotedHistoryToolCallsVisibilityChanged",
+  "clearRetainedCollapsedToolCalls",
+  "retainCollapsedToolCallHandoff",
+  "retainCollapsedToolCallHandoffSkipped",
+  "transientPromotedToolCallsCoverage",
+  "transientToolCallsCollapseEnabledChanged",
   "waitingLayoutStateChanged",
 ]);
+
+function shouldTraceEvent(event: string) {
+  if (typeof localStorage === "undefined") return false;
+
+  const enabled = localStorage.getItem("locus.toolCollapseTraceEnabled") === "true";
+  if (!enabled) return false;
+
+  const mode = localStorage.getItem("locus.toolCollapseTrace");
+  if (mode === "all") return true;
+  if (mode === "handoff") return TOOL_COLLAPSE_HANDOFF_EVENTS.has(event);
+  if (mode === "waiting") return event === "waitingLayoutStateChanged";
+  return false;
+}
 
 function nowMs() {
   return typeof performance !== "undefined" && typeof performance.now === "function"
@@ -28,7 +61,7 @@ export function logToolCollapseTrace(
   event: string,
   detail?: Record<string, unknown>,
 ) {
-  if (!TOOL_COLLAPSE_VERIFICATION_EVENTS.has(event)) return;
+  if (!shouldTraceEvent(event)) return;
 
   const prefix = `[tool-collapse][+${elapsedMs()}ms][${scope}] ${event}`;
   if (!detail || Object.keys(detail).length === 0) {

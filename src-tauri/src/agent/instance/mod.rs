@@ -2381,6 +2381,22 @@ impl AgentInstance {
             .collect()
     }
 
+    fn normalize_tool_call_names(&self, tool_calls: &mut [ToolCallInfo]) {
+        for tool_call in tool_calls {
+            if let Some(canonical) = self
+                .tool_registry
+                .canonical_name(&tool_call.name)
+                .map(str::to_string)
+            {
+                tool_call.name = canonical;
+            }
+
+            if let Some(nested_tool_calls) = tool_call.nested_tool_calls.as_mut() {
+                self.normalize_tool_call_names(nested_tool_calls);
+            }
+        }
+    }
+
     async fn available_tool_prompt_items(&self) -> Vec<InjectedPromptItem> {
         let tool_names = self.resolve_effective_tool_names().await;
         let api_tools = self.build_api_tools(&tool_names).await;
@@ -5688,6 +5704,8 @@ impl AgentInstance {
                 let agent_id_for_text = self.id.clone();
                 let first_text_delta_logged = Arc::new(AtomicBool::new(false));
                 let first_text_delta_logged_for_cb = first_text_delta_logged.clone();
+                let attempt_emitted_output = Arc::new(AtomicBool::new(false));
+                let emitted_output_for_text = attempt_emitted_output.clone();
 
                 let sid2 = session_id.clone();
                 let hdl2 = handle.clone();
@@ -5699,6 +5717,7 @@ impl AgentInstance {
                 let agent_id_for_thinking = self.id.clone();
                 let first_thinking_delta_logged = Arc::new(AtomicBool::new(false));
                 let first_thinking_delta_logged_for_cb = first_thinking_delta_logged.clone();
+                let emitted_output_for_thinking = attempt_emitted_output.clone();
 
                 let sid3 = session_id.clone();
                 let hdl3 = handle.clone();
@@ -5708,6 +5727,8 @@ impl AgentInstance {
                 let agent_id_for_tool_start = self.id.clone();
                 let first_tool_call_logged = Arc::new(AtomicBool::new(false));
                 let first_tool_call_logged_for_cb = first_tool_call_logged.clone();
+                let emitted_output_for_tool = attempt_emitted_output.clone();
+                let tool_registry_for_tool_start = self.tool_registry.clone();
 
                 let mut cancel_rx = self.cancel_waiter();
                 let result = tokio::select! {
@@ -5718,6 +5739,7 @@ impl AgentInstance {
                         &prepared_messages,
                         &api_tools,
                         move |delta| {
+                            emitted_output_for_text.store(true, Ordering::Relaxed);
                             let mark = render_order_for_text
                                 .lock()
                                 .map(|mut tracker| tracker.mark_text(&rid, &text_block_id))
@@ -5751,6 +5773,7 @@ impl AgentInstance {
                             }
                         },
                         move |thinking| {
+                            emitted_output_for_thinking.store(true, Ordering::Relaxed);
                             let mark = render_order_for_thinking
                                 .lock()
                                 .map(|mut tracker| {
@@ -5783,6 +5806,11 @@ impl AgentInstance {
                             partial_for_thinking.append_thinking(&thinking);
                         },
                         move |tool_call_id, tool_name| {
+                            let tool_name = tool_registry_for_tool_start
+                                .canonical_name(&tool_name)
+                                .map(str::to_string)
+                                .unwrap_or(tool_name);
+                            emitted_output_for_tool.store(true, Ordering::Relaxed);
                             let mark = render_order_for_tool
                                 .lock()
                                 .map(|mut tracker| tracker.mark_tool(&rid3, &tool_call_id))
@@ -5849,6 +5877,7 @@ impl AgentInstance {
                     }
                     Some(Ok(resp)) => {
                         if let Err(e) = validate_llm_tool_calls(&resp.tool_calls) {
+                            let attempt_had_output = attempt_emitted_output.load(Ordering::Relaxed);
                             eprintln!(
                                 "[Agent {}] LLM attempt returned invalid tool calls: session={} run={} iteration={} attempt={}/{} elapsed_ms={} error={}",
                                 self.id,
@@ -5861,7 +5890,7 @@ impl AgentInstance {
                                 e
                             );
                             last_llm_error = e.clone();
-                            if llm_attempt < LLM_RETRIES {
+                            if !attempt_had_output && llm_attempt < LLM_RETRIES {
                                 let delay = 2000 * (llm_attempt as u64 + 1);
                                 eprintln!(
                                     "[Agent {}] invalid tool calls (attempt {}/{}), retrying in {}ms: {}",
@@ -5873,6 +5902,13 @@ impl AgentInstance {
                                 );
                                 tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                                 continue;
+                            }
+                            if attempt_had_output {
+                                eprintln!(
+                                    "[Agent {}] invalid tool calls after streamed output; stopping retry to avoid duplicate visible output",
+                                    self.id
+                                );
+                                break;
                             }
                             continue;
                         }
@@ -5957,8 +5993,9 @@ impl AgentInstance {
                         }
 
                         let is_retryable = is_retryable_llm_error(&e);
+                        let attempt_had_output = attempt_emitted_output.load(Ordering::Relaxed);
 
-                        if is_retryable && llm_attempt < LLM_RETRIES {
+                        if is_retryable && !attempt_had_output && llm_attempt < LLM_RETRIES {
                             let delay = 2000 * (llm_attempt as u64 + 1);
                             eprintln!(
                                 "[Agent {}] LLM stream error (attempt {}/{}), retrying in {}ms: {}",
@@ -5966,6 +6003,12 @@ impl AgentInstance {
                             );
                             tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                             continue;
+                        }
+                        if is_retryable && attempt_had_output {
+                            eprintln!(
+                                "[Agent {}] retryable LLM error after streamed output; stopping retry to avoid duplicate visible output",
+                                self.id
+                            );
                         }
 
                         eprintln!("[Agent {}] LLM error (iteration {}):\n{}", self.id, iteration, e);
@@ -6034,12 +6077,13 @@ impl AgentInstance {
                     tracker.mark_thinking(&run_id, &format!("iteration:{}:thinking", iteration))
                 });
             }
-            let ordered_tool_calls = render_order_tracker
+            let mut ordered_tool_calls = render_order_tracker
                 .lock()
                 .map(|mut tracker| {
                     tracker.assign_tool_orders_for_run(&run_id, &response.tool_calls)
                 })
                 .unwrap_or_else(|_| response.tool_calls.clone());
+            self.normalize_tool_call_names(&mut ordered_tool_calls);
             let response_content_order = response_text_part.as_ref().map(|part| part.seq);
             let response_thinking_order = response_thinking_part.as_ref().map(|part| part.seq);
             let response_render_parts = assistant_render_parts_for_response(
@@ -6747,6 +6791,14 @@ impl AgentInstance {
 
             if let Err(ref err) = run_result {
                 self.clear_pending_knowledge_proposal(app_handle).await;
+                let interrupted = Self::persist_interrupted_assistant_snapshot(
+                    store,
+                    &self.session_id,
+                    &self.partial_assistant.snapshot(),
+                );
+                if interrupted.is_some() {
+                    self.partial_assistant.reset();
+                }
                 eprintln!(
                     "[Agent {}] emitting Error for session {} run {}: {}",
                     self.id, self.session_id, run_id, err
@@ -6939,7 +6991,7 @@ impl AgentInstance {
         run_id: &str,
     ) -> ToolConfirmDecision {
         let mode_state: tauri::State<crate::ToolPermissionMode> = app_handle.state();
-        let global_mode = mode_state.read().await.clone();
+        let global_mode = mode_state.0.read().await.clone();
         let normalized_global_mode = Self::normalize_global_permission_mode(&global_mode);
 
         let mut knowledge_preview: Option<KnowledgeToolConfirmPreview> = None;
@@ -6976,7 +7028,7 @@ impl AgentInstance {
         }
 
         let perms_state: tauri::State<crate::ToolPermissions> = app_handle.state();
-        let perms = perms_state.read().await;
+        let perms = perms_state.0.read().await;
         let tool_mode = perms.get(tool_name).cloned();
         let knowledge_governance_requires_confirm = knowledge_governance_triggered
             && Self::permission_setting_requires_confirm(
@@ -7104,7 +7156,7 @@ impl AgentInstance {
         run_id: &str,
     ) -> ToolConfirmDecision {
         let perms_state: tauri::State<crate::ToolPermissions> = app_handle.state();
-        let perms = perms_state.read().await;
+        let perms = perms_state.0.read().await;
         let requires_confirm = Self::permission_setting_requires_confirm(
             perms
                 .get(PERMISSION_BEHAVIOR_UNITY_EDITOR_STATUS_CHANGE)
@@ -11192,6 +11244,7 @@ Use profiler helpers.
                 source: "app".to_string(),
                 name: "Unity Profiler Runtime Sampling".to_string(),
             }],
+            client_message_id: None,
         };
 
         let reminder = agent.build_selected_skill_reminder(&intent);

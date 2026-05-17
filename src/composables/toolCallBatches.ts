@@ -350,6 +350,17 @@ export function cloneToolCallMatchState(state: ToolCallMatchState): ToolCallMatc
   };
 }
 
+export function areToolCallDisplaysCoveredByMatchState(
+  toolCalls: ToolCallDisplay[],
+  state: ToolCallMatchState,
+): boolean {
+  if (toolCalls.length === 0) return false;
+  if (state.ids.size === 0 && state.fingerprintCounts.size === 0) return false;
+
+  const remainingState = cloneToolCallMatchState(state);
+  return toolCalls.every((toolCall) => consumeDisplayMatch(toolCall, remainingState));
+}
+
 function consumeFingerprintMatch(state: ToolCallMatchState, fingerprint: string): boolean {
   const remaining = state.fingerprintCounts.get(fingerprint) ?? 0;
   if (remaining <= 0) return false;

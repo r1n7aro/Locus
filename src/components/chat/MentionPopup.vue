@@ -28,6 +28,7 @@ const props = defineProps<{
   breadcrumbs: string[];
   query: string;
   loading: boolean;
+  showEmpty: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -185,12 +186,14 @@ watch(
           @mousedown.prevent="emit('navigateTo', idx)"
         >{{ part }}</span>
       </template>
+      <span v-if="loading && entries.length > 0" class="mention-loading-status">{{ t('chat.mention.loading') }}</span>
     </div>
     <div v-else class="mention-search-header">
       <span class="mention-search-label">{{ t('chat.mention.assetSearch') }}</span>
+      <span v-if="loading && entries.length > 0" class="mention-loading-status">{{ t('chat.mention.loading') }}</span>
     </div>
     <div v-if="loading && entries.length === 0" class="mention-loading">{{ t('chat.mention.loading') }}</div>
-    <div v-else-if="entries.length === 0" class="mention-empty">{{ t('chat.mention.noMatch') }}</div>
+    <div v-else-if="showEmpty" class="mention-empty">{{ t('chat.mention.noMatch') }}</div>
     <template v-else>
       <div
         v-for="(entry, idx) in entries"
@@ -241,7 +244,6 @@ watch(
           @mousedown.prevent.stop="emit('openDir', entry)"
         >&rsaquo;</button>
       </div>
-      <div v-if="loading" class="mention-loading mention-loading-inline">{{ t('chat.mention.loading') }}</div>
     </template>
   </div>
 </template>

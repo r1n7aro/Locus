@@ -60,6 +60,7 @@ const TOOL_RESULT_PREVIEW_CHARS: usize = 2_000;
 const DEFAULT_MAX_RESULT_SIZE_CHARS: usize = 50_000;
 const LARGE_RESULT_TAG_OPEN: &str = "<persisted-output>";
 const LARGE_RESULT_TAG_CLOSE: &str = "</persisted-output>";
+pub const CHILD_SESSION_FORK_ERROR: &str = "Child sessions cannot be forked";
 const RUN_STATUS_QUEUED: &str = "queued";
 const RUN_STATUS_STARTING: &str = "starting";
 const RUN_STATUS_RUNNING: &str = "running";
@@ -355,6 +356,100 @@ fn strip_top_level_recorded_output(tool_calls: &[ToolCallInfo]) -> Vec<ToolCallI
             tool_call
         })
         .collect()
+}
+
+fn copy_dir_recursively(source: &Path, target: &Path) -> Result<(), String> {
+    if !source.is_dir() {
+        return Ok(());
+    }
+
+    std::fs::create_dir_all(target).map_err(|e| {
+        format!(
+            "Failed to create copied tool result dir '{}': {}",
+            target.display(),
+            e
+        )
+    })?;
+
+    for entry in std::fs::read_dir(source).map_err(|e| {
+        format!(
+            "Failed to read tool result dir '{}': {}",
+            source.display(),
+            e
+        )
+    })? {
+        let entry = entry.map_err(|e| format!("Failed to read tool result entry: {}", e))?;
+        let source_path = entry.path();
+        let target_path = target.join(entry.file_name());
+        let file_type = entry
+            .file_type()
+            .map_err(|e| format!("Failed to inspect tool result entry: {}", e))?;
+        if file_type.is_dir() {
+            copy_dir_recursively(&source_path, &target_path)?;
+        } else if file_type.is_file() {
+            if let Some(parent) = target_path.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    format!(
+                        "Failed to create copied tool result parent '{}': {}",
+                        parent.display(),
+                        e
+                    )
+                })?;
+            }
+            std::fs::copy(&source_path, &target_path).map_err(|e| {
+                format!(
+                    "Failed to copy tool result '{}' to '{}': {}",
+                    source_path.display(),
+                    target_path.display(),
+                    e
+                )
+            })?;
+        }
+    }
+
+    Ok(())
+}
+
+fn path_reference_pairs(source: &Path, target: &Path) -> Vec<(String, String)> {
+    let raw_pairs = [
+        (source.display().to_string(), target.display().to_string()),
+        (
+            source.to_string_lossy().into_owned(),
+            target.to_string_lossy().into_owned(),
+        ),
+    ];
+    let mut pairs = Vec::new();
+    for (source_value, target_value) in raw_pairs {
+        for (source_variant, target_variant) in [
+            (source_value.clone(), target_value.clone()),
+            (
+                source_value.replace('\\', "/"),
+                target_value.replace('\\', "/"),
+            ),
+            (
+                source_value.replace('/', "\\"),
+                target_value.replace('/', "\\"),
+            ),
+        ] {
+            if source_variant.is_empty()
+                || pairs
+                    .iter()
+                    .any(|(existing, _): &(String, String)| existing == &source_variant)
+            {
+                continue;
+            }
+            pairs.push((source_variant, target_variant));
+        }
+    }
+    pairs
+}
+
+fn rewrite_tool_result_references(content: &str, source_dir: &Path, target_dir: &Path) -> String {
+    let mut rewritten = content.to_string();
+    for (source, target) in path_reference_pairs(source_dir, target_dir) {
+        rewritten = rewritten.replace(&source, &target);
+    }
+    rewritten
 }
 
 impl SessionStore {
@@ -996,6 +1091,252 @@ impl SessionStore {
         Ok(id)
     }
 
+    pub fn fork_session(&self, source_id: &str, title: Option<&str>) -> Result<String, String> {
+        #[derive(Debug)]
+        struct PersistedMessageRow {
+            role: String,
+            content: String,
+            created_at: i64,
+            prompt_prefix: Option<String>,
+            prompt_suffix: Option<String>,
+            tool_calls: Option<String>,
+            tool_call_id: Option<String>,
+            images: Option<String>,
+            asset_refs: Option<String>,
+            thinking_content: Option<String>,
+            thinking_duration: Option<i64>,
+            thinking_signature: Option<String>,
+            metadata_json: Option<String>,
+            include_in_prompt: i64,
+        }
+
+        let new_id = Uuid::new_v4().to_string();
+        let now = Self::now_ts();
+        let source_tool_dir = self.session_tool_results_dir(source_id);
+        let target_tool_dir = self.session_tool_results_dir(&new_id);
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+
+        conn.execute("BEGIN IMMEDIATE", [])
+            .map_err(|e| format!("Failed to begin session fork transaction: {}", e))?;
+
+        let result = (|| -> Result<String, String> {
+            let (
+                source_title,
+                parent_session_id,
+                workspace_id,
+                session_type,
+                agent_id,
+                latest_completed_run_id,
+                latest_todo_run_id,
+            ) = conn
+                .query_row(
+                    "SELECT title, parent_session_id, workspace_id, session_type, agent_id, latest_completed_run_id, latest_todo_run_id
+                     FROM sessions WHERE id = ?1",
+                    params![source_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, Option<String>>(4)?,
+                            row.get::<_, Option<String>>(5)?,
+                            row.get::<_, Option<String>>(6)?,
+                        ))
+                    },
+                )
+                .map_err(|e| format!("Session not found: {}", e))?;
+
+            if parent_session_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .is_some()
+            {
+                return Err(CHILD_SESSION_FORK_ERROR.to_string());
+            }
+
+            if source_tool_dir.is_dir() {
+                copy_dir_recursively(&source_tool_dir, &target_tool_dir)?;
+            }
+
+            let resolved_title = title
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("{} (fork)", source_title));
+
+            conn.execute(
+                "INSERT INTO sessions (
+                    id,
+                    title,
+                    parent_session_id,
+                    workspace_id,
+                    session_type,
+                    agent_id,
+                    archived_at,
+                    latest_completed_run_id,
+                    latest_todo_run_id,
+                    created_at,
+                    updated_at
+                 )
+                 VALUES (?1, ?2, NULL, ?3, ?4, ?5, NULL, ?6, ?7, ?8, ?8)",
+                params![
+                    new_id,
+                    resolved_title,
+                    workspace_id,
+                    session_type,
+                    agent_id,
+                    latest_completed_run_id,
+                    latest_todo_run_id,
+                    now,
+                ],
+            )
+            .map_err(|e| format!("Failed to create forked session: {}", e))?;
+
+            let message_rows = {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT role, content, created_at, prompt_prefix, prompt_suffix, tool_calls, tool_call_id, images, asset_refs, thinking_content, thinking_duration, thinking_signature, metadata_json, include_in_prompt
+                         FROM messages
+                         WHERE session_id = ?1
+                         ORDER BY rowid ASC",
+                    )
+                    .map_err(|e| format!("Failed to prepare fork message query: {}", e))?;
+                let rows = stmt
+                    .query_map(params![source_id], |row| {
+                        Ok(PersistedMessageRow {
+                            role: row.get(0)?,
+                            content: row.get(1)?,
+                            created_at: row.get(2)?,
+                            prompt_prefix: row.get(3)?,
+                            prompt_suffix: row.get(4)?,
+                            tool_calls: row.get(5)?,
+                            tool_call_id: row.get(6)?,
+                            images: row.get(7)?,
+                            asset_refs: row.get(8)?,
+                            thinking_content: row.get(9)?,
+                            thinking_duration: row.get(10)?,
+                            thinking_signature: row.get(11)?,
+                            metadata_json: row.get(12)?,
+                            include_in_prompt: row.get(13)?,
+                        })
+                    })
+                    .map_err(|e| format!("Failed to query messages for fork: {}", e))?;
+                rows.collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| format!("Failed to read fork message row: {}", e))?
+            };
+
+            let rewrite_tool_paths = source_tool_dir.is_dir();
+            for row in message_rows {
+                let message_id = Uuid::new_v4().to_string();
+                let content = if rewrite_tool_paths {
+                    rewrite_tool_result_references(&row.content, &source_tool_dir, &target_tool_dir)
+                } else {
+                    row.content
+                };
+                conn.execute(
+                    "INSERT INTO messages (
+                        id,
+                        session_id,
+                        role,
+                        content,
+                        created_at,
+                        prompt_prefix,
+                        prompt_suffix,
+                        tool_calls,
+                        tool_call_id,
+                        images,
+                        asset_refs,
+                        thinking_content,
+                        thinking_duration,
+                        thinking_signature,
+                        metadata_json,
+                        include_in_prompt
+                     )
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                    params![
+                        message_id,
+                        new_id,
+                        row.role,
+                        content,
+                        row.created_at,
+                        row.prompt_prefix,
+                        row.prompt_suffix,
+                        row.tool_calls,
+                        row.tool_call_id,
+                        row.images,
+                        row.asset_refs,
+                        row.thinking_content,
+                        row.thinking_duration,
+                        row.thinking_signature,
+                        row.metadata_json,
+                        row.include_in_prompt,
+                    ],
+                )
+                .map_err(|e| format!("Failed to copy message into fork: {}", e))?;
+            }
+
+            conn.execute(
+                "INSERT INTO token_usage (
+                    session_id,
+                    total_input_tokens,
+                    total_output_tokens,
+                    total_cache_read_tokens,
+                    total_cache_write_tokens,
+                    total_cost_usd,
+                    priced_rounds,
+                    last_context_tokens,
+                    last_context_limit
+                 )
+                 SELECT ?1,
+                    total_input_tokens,
+                    total_output_tokens,
+                    total_cache_read_tokens,
+                    total_cache_write_tokens,
+                    total_cost_usd,
+                    priced_rounds,
+                    last_context_tokens,
+                    last_context_limit
+                 FROM token_usage
+                 WHERE session_id = ?2",
+                params![new_id, source_id],
+            )
+            .map_err(|e| format!("Failed to copy token usage into fork: {}", e))?;
+
+            conn.execute(
+                "INSERT INTO todos (session_id, position, content, status, priority)
+                 SELECT ?1, position, content, status, priority
+                 FROM todos
+                 WHERE session_id = ?2
+                 ORDER BY position ASC",
+                params![new_id, source_id],
+            )
+            .map_err(|e| format!("Failed to copy todos into fork: {}", e))?;
+
+            Ok(new_id.clone())
+        })();
+
+        match result {
+            Ok(id) => {
+                if let Err(e) = conn.execute("COMMIT", []) {
+                    if target_tool_dir.is_dir() {
+                        let _ = std::fs::remove_dir_all(&target_tool_dir);
+                    }
+                    return Err(format!("Failed to commit session fork: {}", e));
+                }
+                Ok(id)
+            }
+            Err(error) => {
+                let _ = conn.execute("ROLLBACK", []);
+                if target_tool_dir.is_dir() {
+                    let _ = std::fs::remove_dir_all(&target_tool_dir);
+                }
+                Err(error)
+            }
+        }
+    }
+
     pub fn try_start_run(&self, session_id: &str, run_id: &str) -> Result<(), String> {
         let now = Self::now_ts();
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
@@ -1603,6 +1944,60 @@ impl SessionStore {
             .map_err(|e| format!("Failed to truncate messages: {}", e))?;
 
         Ok(deleted as u64)
+    }
+
+    pub fn truncate_latest_conversation_turn(&self, session_id: &str) -> Result<u64, String> {
+        let now = Self::now_ts();
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        conn.execute_batch("BEGIN IMMEDIATE")
+            .map_err(|e| format!("Failed to begin latest turn truncation: {}", e))?;
+
+        let result = (|| -> Result<u64, String> {
+            let truncate_from_rowid: Option<i64> = conn
+                .query_row(
+                    "SELECT rowid FROM messages
+                     WHERE session_id = ?1 AND role = 'user' AND tool_call_id IS NULL
+                     ORDER BY rowid DESC
+                     LIMIT 1",
+                    params![session_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|e| format!("Failed to find latest conversation turn: {}", e))?;
+
+            let Some(truncate_from_rowid) = truncate_from_rowid else {
+                return Ok(0);
+            };
+
+            let deleted = conn
+                .execute(
+                    "DELETE FROM messages WHERE session_id = ?1 AND rowid >= ?2",
+                    params![session_id, truncate_from_rowid],
+                )
+                .map_err(|e| format!("Failed to truncate latest conversation turn: {}", e))?;
+
+            if deleted > 0 {
+                conn.execute(
+                    "UPDATE sessions SET latest_completed_run_id = NULL, updated_at = ?1 WHERE id = ?2",
+                    params![now, session_id],
+                )
+                .map_err(|e| format!("Failed to update session after latest turn truncation: {}", e))?;
+            }
+
+            Ok(deleted as u64)
+        })();
+
+        match result {
+            Ok(deleted) => {
+                conn.execute_batch("COMMIT")
+                    .map_err(|e| format!("Failed to commit latest turn truncation: {}", e))?;
+                Ok(deleted)
+            }
+            Err(error) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
     }
 
     pub fn add_message(
@@ -3037,11 +3432,15 @@ impl SessionStore {
 
 #[cfg(test)]
 mod tests {
-    use super::{SessionStore, CONTEXT_COMPACTED_DISPLAY_MARKER};
+    use super::{
+        build_large_tool_result_message, PersistedToolResult, SessionStore,
+        CHILD_SESSION_FORK_ERROR, CONTEXT_COMPACTED_DISPLAY_MARKER,
+    };
     use crate::session::models::{
         ChatMessage, KnowledgeProposalStatus, MessageRole, TodoItem, ToolCallInfo,
     };
     use rusqlite::{params, Connection, OptionalExtension};
+    use std::fs;
     use tempfile::tempdir;
 
     fn table_exists(conn: &Connection, table: &str) -> bool {
@@ -3135,6 +3534,133 @@ mod tests {
         let reloaded = store.get_token_usage(&session_id).expect("read usage");
         assert_eq!(reloaded.context_tokens, 135);
         assert_eq!(reloaded.context_limit, 1000);
+    }
+
+    #[test]
+    fn fork_session_copies_root_session_data_and_tool_results() {
+        let dir = tempdir().expect("create temp dir");
+        let store = SessionStore::new(dir.path()).expect("initialize store");
+        let session_id = store
+            .create_session("Source", None, Some("workspace-1"), "chat", Some("dev"))
+            .expect("create session");
+
+        store
+            .set_latest_completed_run_id(&session_id, Some("run-1"))
+            .expect("set latest completed run");
+        store
+            .record_token_usage(&session_id, 100, 20, 10, 5, 1.25, 2, Some(512), Some(4096))
+            .expect("record usage");
+        store
+            .update_todos(
+                &session_id,
+                Some("run-1"),
+                &[TodoItem {
+                    content: "Review copied session".to_string(),
+                    status: "pending".to_string(),
+                    priority: "medium".to_string(),
+                }],
+            )
+            .expect("update todos");
+
+        let source_tool_dir = store.session_tool_results_dir(&session_id);
+        fs::create_dir_all(&source_tool_dir).expect("create tool dir");
+        let source_tool_file = source_tool_dir.join("tool-a.txt");
+        fs::write(&source_tool_file, "full tool output").expect("write tool output");
+        let persisted_message = build_large_tool_result_message(&PersistedToolResult {
+            filepath: source_tool_file.clone(),
+            original_size: 16,
+            preview: "full tool output".to_string(),
+            has_more: false,
+        });
+
+        {
+            let conn = store.conn.lock().expect("lock db");
+            conn.execute(
+                "INSERT INTO messages (
+                    id, session_id, role, content, created_at, prompt_prefix, prompt_suffix,
+                    tool_calls, tool_call_id, images, asset_refs, thinking_content,
+                    thinking_duration, thinking_signature, metadata_json, include_in_prompt
+                 )
+                 VALUES (?1, ?2, 'user', 'hello', 10, 'prefix', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 1)",
+                params!["user-old", session_id],
+            )
+            .expect("insert user message");
+            conn.execute(
+                "INSERT INTO messages (
+                    id, session_id, role, content, created_at, prompt_prefix, prompt_suffix,
+                    tool_calls, tool_call_id, images, asset_refs, thinking_content,
+                    thinking_duration, thinking_signature, metadata_json, include_in_prompt
+                 )
+                 VALUES (?1, ?2, 'tool', ?3, 11, NULL, NULL, NULL, 'tool-a', NULL, NULL, NULL, NULL, NULL, NULL, 0)",
+                params!["tool-old", session_id, persisted_message],
+            )
+            .expect("insert tool message");
+        }
+
+        let fork_id = store
+            .fork_session(&session_id, Some("Forked"))
+            .expect("fork session");
+
+        assert_ne!(fork_id, session_id);
+        let detail = store.load_session(&fork_id).expect("load forked session");
+        assert_eq!(detail.title, "Forked");
+        assert_eq!(detail.agent_id.as_deref(), Some("dev"));
+        assert_eq!(detail.session_type, "chat");
+        assert_eq!(detail.parent_session_id, None);
+        assert_eq!(detail.latest_completed_run_id.as_deref(), Some("run-1"));
+        assert_eq!(detail.messages.len(), 2);
+        assert_ne!(detail.messages[0].id, "user-old");
+        assert_ne!(detail.messages[1].id, "tool-old");
+        assert_eq!(detail.messages[0].content, "hello");
+
+        let target_tool_file = store.session_tool_results_dir(&fork_id).join("tool-a.txt");
+        assert_eq!(
+            fs::read_to_string(&target_tool_file).expect("read copied tool output"),
+            "full tool output"
+        );
+        assert!(detail.messages[1]
+            .content
+            .contains(&target_tool_file.display().to_string()));
+        assert!(!detail.messages[1]
+            .content
+            .contains(&source_tool_file.display().to_string()));
+
+        let prompt_messages = store
+            .get_messages_for_prompt(&fork_id)
+            .expect("load fork prompt messages");
+        assert_eq!(prompt_messages.len(), 1);
+        assert_eq!(prompt_messages[0].content, "hello");
+        assert_eq!(prompt_messages[0].prompt_prefix.as_deref(), Some("prefix"));
+
+        let usage = store.get_token_usage(&fork_id).expect("load copied usage");
+        assert_eq!(usage.total_input_tokens, 100);
+        assert_eq!(usage.total_output_tokens, 20);
+        assert_eq!(usage.total_cost_usd, 1.25);
+        assert_eq!(usage.priced_rounds, 2);
+        assert_eq!(usage.context_tokens, 512);
+        assert_eq!(usage.context_limit, 4096);
+
+        let todos = store.get_todos(&fork_id).expect("load copied todos");
+        assert_eq!(todos.latest_run_id.as_deref(), Some("run-1"));
+        assert_eq!(todos.items.len(), 1);
+        assert_eq!(todos.items[0].content, "Review copied session");
+    }
+
+    #[test]
+    fn fork_session_rejects_child_sessions() {
+        let dir = tempdir().expect("create temp dir");
+        let store = SessionStore::new(dir.path()).expect("initialize store");
+        let parent_id = store
+            .create_session("Parent", None, None, "chat", None)
+            .expect("create parent");
+        let child_id = store
+            .create_session("Child", Some(&parent_id), None, "chat", Some("explorer"))
+            .expect("create child");
+
+        let error = store
+            .fork_session(&child_id, Some("Child copy"))
+            .expect_err("child fork should fail");
+        assert_eq!(error, CHILD_SESSION_FORK_ERROR);
     }
 
     #[test]
@@ -4302,6 +4828,59 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].id, "user-old");
         assert_eq!(messages[1].id, "assistant-old");
+    }
+
+    #[test]
+    fn truncate_latest_conversation_turn_removes_latest_user_round_only() {
+        let dir = tempdir().expect("create temp dir");
+        let store = SessionStore::new(dir.path()).expect("initialize store");
+        let session_id = store
+            .create_session("Latest Turn", None, None, "chat", None)
+            .expect("create session");
+
+        store
+            .add_message(&session_id, MessageRole::User, "old user")
+            .expect("insert old user");
+        store
+            .add_message(&session_id, MessageRole::Assistant, "old assistant")
+            .expect("insert old assistant");
+        store
+            .add_message(&session_id, MessageRole::User, "latest user")
+            .expect("insert latest user");
+        store
+            .add_message(&session_id, MessageRole::Assistant, "latest assistant")
+            .expect("insert latest assistant");
+        store
+            .set_latest_completed_run_id(&session_id, Some("run-latest"))
+            .expect("set latest run");
+
+        let deleted = store
+            .truncate_latest_conversation_turn(&session_id)
+            .expect("truncate latest turn");
+        assert_eq!(deleted, 2);
+
+        let detail = store.load_session(&session_id).expect("load session");
+        assert_eq!(detail.latest_completed_run_id, None);
+        let contents = detail
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(contents, vec!["old user", "old assistant"]);
+    }
+
+    #[test]
+    fn truncate_latest_conversation_turn_returns_zero_without_user_message() {
+        let dir = tempdir().expect("create temp dir");
+        let store = SessionStore::new(dir.path()).expect("initialize store");
+        let session_id = store
+            .create_session("Empty", None, None, "chat", None)
+            .expect("create session");
+
+        let deleted = store
+            .truncate_latest_conversation_turn(&session_id)
+            .expect("truncate latest turn");
+        assert_eq!(deleted, 0);
     }
 
     #[test]

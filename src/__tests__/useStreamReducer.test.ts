@@ -544,6 +544,97 @@ describe("reduceStreamEvent", () => {
         },
       ]);
     });
+
+    it("matches pending user messages by client message id when persisted content differs", () => {
+      const signature = JSON.stringify({
+        kind: "user_intent_v1",
+        mode: "build",
+        skills: [],
+        clientMessageId: "user_pending_1",
+      });
+      const messages = mergeUserMessage([
+        {
+          id: "user_pending_1",
+          role: "user",
+          content: "inspect this asset",
+          createdAt: 10,
+          thinkingSignature: signature,
+        },
+      ], {
+        id: "user-1",
+        role: "user",
+        content: "inspect this asset\n\n<locus-references>\n- asset: {@Assets/Foo.prefab}\n</locus-references>",
+        createdAt: 11,
+        thinkingSignature: signature,
+      });
+
+      expect(messages).toHaveLength(1);
+      expect(messages[0]?.id).toBe("user-1");
+      expect(messages[0]?.content).toContain("<locus-references>");
+    });
+
+    it("does not replace a pending user message with different content only because timestamps are close", () => {
+      const messages = mergeUserMessage([
+        {
+          id: "user_pending_1",
+          role: "user",
+          content: "new message",
+          createdAt: 10,
+        },
+      ], {
+        id: "user-1",
+        role: "user",
+        content: "old message",
+        createdAt: 11,
+      });
+
+      expect(messages).toEqual([
+        {
+          id: "user_pending_1",
+          role: "user",
+          content: "new message",
+          createdAt: 10,
+        },
+        {
+          id: "user-1",
+          role: "user",
+          content: "old message",
+          createdAt: 11,
+        },
+      ]);
+    });
+
+    it("keeps pending messages separate when client message ids differ", () => {
+      const pendingSignature = JSON.stringify({
+        kind: "user_intent_v1",
+        mode: "build",
+        skills: [],
+        clientMessageId: "user_pending_new",
+      });
+      const persistedSignature = JSON.stringify({
+        kind: "user_intent_v1",
+        mode: "build",
+        skills: [],
+        clientMessageId: "user_pending_old",
+      });
+      const messages = mergeUserMessage([
+        {
+          id: "user_pending_new",
+          role: "user",
+          content: "same text",
+          createdAt: 10,
+          thinkingSignature: pendingSignature,
+        },
+      ], {
+        id: "user-old",
+        role: "user",
+        content: "same text",
+        createdAt: 11,
+        thinkingSignature: persistedSignature,
+      });
+
+      expect(messages.map((message) => message.id)).toEqual(["user_pending_new", "user-old"]);
+    });
   });
 
   describe("subagent tool calls", () => {

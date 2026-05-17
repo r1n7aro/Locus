@@ -8,7 +8,7 @@ import { getToolPermissionMode, saveToolPermissionMode } from "../services/permi
 import * as sessionService from "../services/session";
 import * as undoService from "../services/undo";
 import { buildToolResultMessages, mergeUserMessage, reduceStreamEvent, type StreamMutation } from "../composables/useStreamReducer";
-import { hydrateChatMessagesIntent } from "../composables/chatInputIntents";
+import { hydrateChatMessagesIntent, withClientMessageId } from "../composables/chatInputIntents";
 import type { SessionScrollState } from "../composables/chatScrollState";
 import { t } from "../i18n";
 import { useChatChangesStore } from "./chatChanges";
@@ -313,6 +313,7 @@ export const useChatStore = defineStore("chat", () => {
   function trackActiveRun(sessionId: string, runId: string) {
     streamingSessionIds.value.add(sessionId);
     sessionRunIds.value.set(sessionId, runId);
+    useChatChangesStore().setActiveRunId(sessionId, runId);
     closedRunIds.delete(sessionId);
     if (activeSessionId.value === sessionId) {
       currentRunId.value = runId;
@@ -952,6 +953,7 @@ export const useChatStore = defineStore("chat", () => {
       cancelRequestedRunIds.delete(event.sessionId);
       streamingSessionIds.value.add(event.sessionId);
       sessionRunIds.value.set(event.sessionId, event.runId);
+      useChatChangesStore().setActiveRunId(event.sessionId, event.runId);
 
       if (managedStreamingSessionIds.has(event.sessionId)) {
         pendingManagedSessionId = event.sessionId;
@@ -1079,6 +1081,7 @@ export const useChatStore = defineStore("chat", () => {
         activeSessionId: activeSessionId.value,
         isStreaming: isStreaming.value,
       });
+      useChatChangesStore().setActiveRunId(event.sessionId, event.runId);
       void useChatChangesStore().refresh(event.sessionId);
     }
 
@@ -1189,6 +1192,7 @@ export const useChatStore = defineStore("chat", () => {
         code: event.error.code,
         operation: "chat",
       });
+      void loadSessionState(event.sessionId);
     }
 
     if (event.type === "done") {
@@ -1420,15 +1424,19 @@ export const useChatStore = defineStore("chat", () => {
       });
     }
 
+    const pendingMessageId = nextPendingMessageId();
+    const userIntent = withClientMessageId(overrides?.userIntent, pendingMessageId);
+    const userIntentSignature = JSON.stringify(userIntent);
+
     messages.value.push({
-      id: nextPendingMessageId(),
+      id: pendingMessageId,
       role: "user",
       content: displayText,
       createdAt: Date.now() / 1000,
       images: images.length > 0 ? images : undefined,
       assetRefs: assetRefs.length > 0 ? assetRefs : undefined,
-      thinkingSignature: overrides?.userIntent ? JSON.stringify(overrides.userIntent) : undefined,
-      intentMeta: overrides?.userIntent ?? undefined,
+      thinkingSignature: userIntentSignature,
+      intentMeta: userIntent,
     });
     resetStreamRuntimeState();
     isStreaming.value = true;
@@ -1468,7 +1476,7 @@ export const useChatStore = defineStore("chat", () => {
         images: images.length > 0 ? images : null,
         assetRefs: assetRefs.length > 0 ? assetRefs : null,
         mode: overrides?.mode || null,
-        userIntent: overrides?.userIntent || null,
+        userIntent,
         subagentModels: Object.keys(modelStore.modelDefaults.subagentModels).length > 0 ? modelStore.modelDefaults.subagentModels : null,
       });
       logChatStreamDebug("chat request resolved", {
@@ -1481,6 +1489,7 @@ export const useChatStore = defineStore("chat", () => {
       const previousRunId = sessionRunIds.value.get(sid) ?? null;
       streamingSessionIds.value.add(sid);
       sessionRunIds.value.set(sid, runId);
+      useChatChangesStore().setActiveRunId(sid, runId);
       if (previousRunId && previousRunId !== runId) {
         forgetRunReplaySeq(sid, previousRunId);
       }
@@ -1519,9 +1528,11 @@ export const useChatStore = defineStore("chat", () => {
       });
       isStreaming.value = false;
       resetStreamAnim();
+      messages.value = messages.value.filter((message) => message.id !== pendingMessageId);
       pendingSessionId = null;
       if (activeSessionId.value) {
         managedStreamingSessionIds.delete(activeSessionId.value);
+        await loadSessionState(activeSessionId.value);
       }
       pendingManagedSessionId = null;
       pendingManagedUnboundSession = false;
@@ -1578,6 +1589,7 @@ export const useChatStore = defineStore("chat", () => {
       const previousRunId = sessionRunIds.value.get(sid) ?? null;
       streamingSessionIds.value.add(sid);
       sessionRunIds.value.set(sid, runId);
+      useChatChangesStore().setActiveRunId(sid, runId);
       if (previousRunId && previousRunId !== runId) {
         forgetRunReplaySeq(sid, previousRunId);
       }
@@ -1609,6 +1621,49 @@ export const useChatStore = defineStore("chat", () => {
       managedStreamingSessionIds.delete(sessionId);
       pendingManagedSessionId = null;
       pendingManagedUnboundSession = false;
+    }
+  }
+
+  function forkedSessionTitle(session: SessionSummary | undefined): string {
+    const title = session?.title?.trim() || t("chat.session.newSession");
+    return t("chat.session.forkTitle", title);
+  }
+
+  async function forkSession() {
+    const sourceSessionId = activeSessionId.value;
+    if (!sourceSessionId || isStreaming.value) return;
+
+    const sourceSession = sessions.value.find((session) => session.id === sourceSessionId);
+    if (sourceSession?.parentSessionId) {
+      useNotificationStore().addNotice("warning", t("chat.session.forkChildBlocked"), {
+        code: "session.fork_child",
+        operation: "forkSession",
+      });
+      return;
+    }
+
+    try {
+      const forkedId = await sessionService.forkSession(
+        sourceSessionId,
+        forkedSessionTitle(sourceSession),
+      );
+      await refreshSessions();
+      await selectSession(forkedId);
+      useNotificationStore().addNotice("success", t("chat.session.forked"), {
+        operation: "forkSession",
+      });
+    } catch (e) {
+      const err = normalizeAppError(e);
+      const isChildFork = err.code === "session.fork_child";
+      useNotificationStore().addNotice(
+        isChildFork ? "warning" : "error",
+        isChildFork ? t("chat.session.forkChildBlocked") : t("chat.session.forkFailed", err.message),
+        {
+          code: err.code,
+          operation: "forkSession",
+          skipConsoleLog: true,
+        },
+      );
     }
   }
 
@@ -1760,6 +1815,36 @@ export const useChatStore = defineStore("chat", () => {
     }
   }
 
+  async function undoLatestConversationTurn(): Promise<boolean> {
+    if (!activeSessionId.value) return false;
+    try {
+      const sessionId = activeSessionId.value;
+      const detail = await sessionService.undoLatestConversationTurn(sessionId);
+      const undoEntries = await useChatChangesStore().loadChanges(sessionId, { allowAutoOpen: false });
+      useChatChangesStore().setLatestCompletedRunId(
+        sessionId,
+        detail.latestCompletedRunId ?? null,
+      );
+      sessionLatestCompletedRunIds.value.set(
+        sessionId,
+        detail.latestCompletedRunId ?? null,
+      );
+      messages.value = hydrateMessages(detail.messages);
+      undoableMessageIds.value = new Set(undoEntries.map((e) => e.assistantMessageId));
+      activeSessionType.value = detail.sessionType;
+      return true;
+    } catch (e) {
+      console.error("undo_latest_conversation_turn failed:", e);
+      const err = normalizeAppError(e);
+      useNotificationStore().addNotice("error", t("app.undoFailed", err.message), {
+        code: err.code,
+        operation: "undo",
+        skipConsoleLog: true,
+      });
+      return false;
+    }
+  }
+
   return {
     sessions,
     activeSessionId,
@@ -1823,6 +1908,7 @@ export const useChatStore = defineStore("chat", () => {
     deleteSession,
     sendMessage,
     compactSession,
+    forkSession,
     cancelSession,
     cancelSessions,
     cancelChat,
@@ -1833,6 +1919,7 @@ export const useChatStore = defineStore("chat", () => {
     applyKnowledgeProposal,
     checkUndoConflicts,
     performUndo,
+    undoLatestConversationTurn,
     cleanupAnim,
   };
 });

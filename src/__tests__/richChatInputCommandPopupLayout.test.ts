@@ -79,4 +79,24 @@ describe("RichChatInput command popup layout", () => {
     expect(tabStart).toBeGreaterThan(enterStart);
     expect(tabAutocompleteStart).toBeGreaterThan(tabStart);
   });
+
+  it("registers fork as an executable action command", () => {
+    const richInput = read("src/components/chat/RichChatInput.vue");
+    const commandRegistry = read("src/composables/useCommandRegistry.ts");
+
+    expect(commandRegistry).toContain('name: "/fork"');
+    expect(commandRegistry).toContain('commandType: "fork"');
+    expect(richInput).toContain('if (command.commandType === "fork") {');
+    expect(richInput).toContain('emit("fork");');
+  });
+
+  it("registers undo as an executable action command", () => {
+    const richInput = read("src/components/chat/RichChatInput.vue");
+    const commandRegistry = read("src/composables/useCommandRegistry.ts");
+
+    expect(commandRegistry).toContain('name: "/undo"');
+    expect(commandRegistry).toContain('commandType: "undo"');
+    expect(richInput).toContain('if (command.commandType === "undo") {');
+    expect(richInput).toContain('emit("undo");');
+  });
 });

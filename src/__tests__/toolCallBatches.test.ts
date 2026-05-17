@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  areToolCallDisplaysCoveredByMatchState,
   buildMessageToolCalls,
   collectToolCallDisplayIds,
   collectToolCallDisplayIdMatchState,
@@ -501,6 +502,53 @@ describe("toolCallBatches", () => {
     );
 
     expect(merged.map((toolCall) => toolCall.id)).toEqual(["history-1"]);
+  });
+
+  it("checks whether a historical tool segment is fully covered by a retained match state", () => {
+    const retainedState = collectToolCallDisplayMatchState([
+      {
+        id: "handoff-read",
+        name: "read",
+        arguments: "{\"path\":\"Assets/Scripts/TestMonoA.cs\"}",
+        status: "done",
+      },
+      {
+        id: "handoff-grep",
+        name: "grep",
+        arguments: "{\"path\":\"Assets/Scripts\"}",
+        status: "done",
+      },
+    ]);
+
+    expect(areToolCallDisplaysCoveredByMatchState([
+      {
+        id: "history-read",
+        name: "read",
+        arguments: "{\"filePath\":\"Assets\\\\Scripts\\\\TestMonoA.cs\"}",
+        status: "done",
+      },
+      {
+        id: "history-grep",
+        name: "grep",
+        arguments: "{\"path\":\"Assets/Scripts\"}",
+        status: "done",
+      },
+    ], retainedState)).toBe(true);
+
+    expect(areToolCallDisplaysCoveredByMatchState([
+      {
+        id: "history-read",
+        name: "read",
+        arguments: "{\"path\":\"Assets/Scripts/TestMonoA.cs\"}",
+        status: "done",
+      },
+      {
+        id: "history-extra",
+        name: "list",
+        arguments: "{\"path\":\"Assets\"}",
+        status: "done",
+      },
+    ], retainedState)).toBe(false);
   });
 
   it("collapses completed tool batches when compact mode is enabled", () => {

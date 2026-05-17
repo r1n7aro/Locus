@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { extractChatAssetRefs, parseChatAssetRefs } from "../composables/chatAssetRefs";
+import {
+  buildProjectKnowledgeRefPath,
+  extractChatAssetRefs,
+  parseChatAssetRefs,
+} from "../composables/chatAssetRefs";
 
 describe("parseChatAssetRefs", () => {
   it("keeps Unity asset paths with spaces intact", () => {
@@ -154,5 +158,22 @@ describe("extractChatAssetRefs", () => {
         "design/core-loop.md",
       ],
     });
+  });
+});
+
+describe("buildProjectKnowledgeRefPath", () => {
+  it("prefixes search result paths with the knowledge document type", () => {
+    expect(
+      buildProjectKnowledgeRefPath(
+        "reference",
+        "unity-project-understanding/project-structure.md",
+      ),
+    ).toBe("reference/unity-project-understanding/project-structure.md");
+  });
+
+  it("keeps already type-prefixed knowledge paths intact", () => {
+    expect(
+      buildProjectKnowledgeRefPath("memory", "memory/project/background.md"),
+    ).toBe("memory/project/background.md");
   });
 });

@@ -97,6 +97,10 @@ pub struct ToolRegistry {
     tools: HashMap<String, ToolDef>,
 }
 
+fn normalize_tool_name_key(name: &str) -> String {
+    name.trim().to_ascii_lowercase()
+}
+
 impl ToolRegistry {
     pub fn new() -> Self {
         ToolRegistry {
@@ -105,19 +109,23 @@ impl ToolRegistry {
     }
 
     pub fn register(&mut self, tool: ToolDef) {
-        self.tools.insert(tool.name.clone(), tool);
+        self.tools.insert(normalize_tool_name_key(&tool.name), tool);
     }
 
     #[allow(dead_code)]
     pub fn get(&self, name: &str) -> Option<&ToolDef> {
-        self.tools.get(name)
+        self.tools.get(&normalize_tool_name_key(name))
+    }
+
+    pub fn canonical_name(&self, name: &str) -> Option<&str> {
+        self.get(name).map(|def| def.name.as_str())
     }
 
     pub fn resolve_api_tools(&self, tool_names: &[String]) -> Vec<serde_json::Value> {
         tool_names
             .iter()
             .filter_map(|name| {
-                self.tools.get(name).map(|def| {
+                self.get(name).map(|def| {
                     serde_json::json!({
                         "type": "function",
                         "function": {
@@ -142,7 +150,7 @@ impl ToolRegistry {
         arguments: &serde_json::Value,
         context: ToolExecutionContext,
     ) -> ToolResult {
-        match self.tools.get(name) {
+        match self.get(name) {
             Some(def) => (def.execute)(arguments.clone(), context).await,
             None => ToolResult {
                 output: format!("Tool '{}' not found", name),
@@ -203,8 +211,55 @@ impl ToolRegistry {
 
 #[cfg(test)]
 mod tests {
-    use super::{ToolExecutionContext, ToolRuntimeState};
+    use super::{ToolDef, ToolExecutionContext, ToolRegistry, ToolResult, ToolRuntimeState};
     use std::sync::Arc;
+
+    #[test]
+    fn registry_resolves_api_tools_with_canonical_name_case_insensitively() {
+        let mut registry = ToolRegistry::new();
+        registry.register(ToolDef {
+            name: "edit".to_string(),
+            description: "Edit a file".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+            execute: Arc::new(|_, _| {
+                Box::pin(async {
+                    ToolResult {
+                        output: String::new(),
+                        is_error: false,
+                    }
+                })
+            }),
+        });
+
+        let tools = registry.resolve_api_tools(&["Edit".to_string()]);
+
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["function"]["name"].as_str(), Some("edit"));
+        assert_eq!(registry.canonical_name(" EDIT "), Some("edit"));
+    }
+
+    #[tokio::test]
+    async fn registry_executes_tool_names_case_insensitively() {
+        let mut registry = ToolRegistry::new();
+        registry.register(ToolDef {
+            name: "edit".to_string(),
+            description: "Edit a file".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+            execute: Arc::new(|_, _| {
+                Box::pin(async {
+                    ToolResult {
+                        output: "ok".to_string(),
+                        is_error: false,
+                    }
+                })
+            }),
+        });
+
+        let result = registry.execute("Edit", &serde_json::json!({})).await;
+
+        assert!(!result.is_error);
+        assert_eq!(result.output, "ok");
+    }
 
     #[test]
     fn unity_asset_read_redirects_only_once_for_same_file() {

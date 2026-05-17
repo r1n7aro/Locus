@@ -1,4 +1,4 @@
-import { hydrateChatMessageIntent } from "./chatInputIntents";
+import { hydrateChatMessageIntent, parseUserIntentMeta } from "./chatInputIntents";
 import { sortedAssistantRenderParts } from "./assistantRenderParts";
 import type { StreamEvent, ChatMessage, TokenUsage, TodoItem, ToolCallDisplay, ToolCallInfo, PendingQuestion, PendingToolConfirm, ImageAttachment, AssetRefAttachment, ToolCallProgress, AssistantRenderPart } from "../types";
 
@@ -109,9 +109,19 @@ function isMatchingPendingUserMessage(candidate: ChatMessage, message: ChatMessa
   if (candidate.role !== "user" || !pendingUserMessageId(candidate.id)) return false;
   if (imageFingerprint(candidate.images) !== imageFingerprint(message.images)) return false;
   if (assetRefFingerprint(candidate.assetRefs) !== assetRefFingerprint(message.assetRefs)) return false;
+
+  const candidateClientMessageId = candidate.intentMeta?.clientMessageId
+    ?? parseUserIntentMeta(candidate.thinkingSignature)?.clientMessageId;
+  const incomingClientMessageId = message.intentMeta?.clientMessageId
+    ?? parseUserIntentMeta(message.thinkingSignature)?.clientMessageId;
+  if (candidateClientMessageId || incomingClientMessageId) {
+    return !!candidateClientMessageId && candidateClientMessageId === incomingClientMessageId;
+  }
+
   if (candidate.content === message.content) return true;
-  if (candidate.thinkingSignature && candidate.thinkingSignature === message.thinkingSignature) return true;
-  return Math.abs(candidate.createdAt - message.createdAt) <= 60;
+  const candidateContent = candidate.content.trim();
+  const incomingContent = message.content.trim();
+  return !!candidateContent && !!incomingContent && incomingContent.includes(candidateContent);
 }
 
 export function mergeUserMessage(messages: ChatMessage[], incoming: ChatMessage): ChatMessage[] {

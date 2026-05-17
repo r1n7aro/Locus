@@ -10,6 +10,7 @@ const sessionServiceMocks = vi.hoisted(() => ({
   chat: vi.fn(),
   cancelChat: vi.fn(),
   deleteSession: vi.fn(),
+  forkSession: vi.fn(),
   getActiveSessionSelection: vi.fn(),
   getSessionUsage: vi.fn(),
   getSessionActiveRun: vi.fn(),
@@ -22,6 +23,7 @@ const sessionServiceMocks = vi.hoisted(() => ({
   renameSession: vi.fn(),
   saveActiveSessionSelection: vi.fn(),
   staleKnowledgeProposals: vi.fn(),
+  undoLatestConversationTurn: vi.fn(),
 }));
 
 const undoServiceMocks = vi.hoisted(() => ({
@@ -184,6 +186,7 @@ describe("chat session panel state", () => {
     sessionServiceMocks.chat.mockResolvedValue({ sessionId: "s1", runId: "run-default" });
     sessionServiceMocks.cancelChat.mockResolvedValue(undefined);
     sessionServiceMocks.deleteSession.mockResolvedValue(undefined);
+    sessionServiceMocks.forkSession.mockResolvedValue("s-copy");
     sessionServiceMocks.getActiveSessionSelection.mockResolvedValue(null);
     sessionServiceMocks.getSessionUsage.mockImplementation(async () => emptyUsage());
     sessionServiceMocks.getSessionActiveRun.mockResolvedValue(null);
@@ -197,6 +200,9 @@ describe("chat session panel state", () => {
     sessionServiceMocks.renameSession.mockResolvedValue(undefined);
     sessionServiceMocks.saveActiveSessionSelection.mockResolvedValue(undefined);
     sessionServiceMocks.staleKnowledgeProposals.mockResolvedValue(undefined);
+    sessionServiceMocks.undoLatestConversationTurn.mockImplementation(async (sessionId: string) =>
+      sessionServiceMocks.loadSession(sessionId),
+    );
     undoServiceMocks.undoList.mockImplementation(async (sessionId: string) => undoData[sessionId] ?? []);
     undoServiceMocks.undoPerform.mockResolvedValue(undefined);
   });
@@ -516,6 +522,80 @@ describe("chat session panel state", () => {
       "src/beta.ts",
     ]);
     expect(changesStore.currentFileCount).toBe(2);
+  });
+
+  it("shows file changes from the active run as soon as undo arrives", async () => {
+    const chatStore = useChatStore();
+    const changesStore = useChatChangesStore();
+
+    undoData.s1 = [
+      makeUndoEntry("s1", "src/old.ts", {
+        assistantMessageId: "msg-old",
+        runId: "run-old",
+        createdAt: 1,
+      }),
+    ];
+    latestCompletedRunIdData.s1 = "run-old";
+
+    await chatStore.selectSession("s1");
+    changesStore.closePanel();
+
+    chatStore.handleStreamEvent({
+      runId: "run-new",
+      type: "runStart",
+      sessionId: "s1",
+    });
+
+    expect(changesStore.latestTurnRounds).toEqual([]);
+    expect(changesStore.currentFileCount).toBe(0);
+
+    undoData.s1 = [
+      ...undoData.s1,
+      makeUndoEntry("s1", "src/live.ts", {
+        assistantMessageId: "msg-live",
+        runId: "run-new",
+        createdAt: 2,
+      }),
+    ];
+
+    chatStore.handleStreamEvent({
+      runId: "run-new",
+      type: "undoAvailable",
+      sessionId: "s1",
+      assistantMessageId: "msg-live",
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(changesStore.currentPanelVisible).toBe(true);
+    expect(changesStore.latestTurnRounds).toHaveLength(1);
+    expect(changesStore.latestTurnFiles.map((file) => file.path)).toEqual([
+      "src/live.ts",
+    ]);
+    expect(changesStore.currentFileCount).toBe(1);
+  });
+
+  it("clears previous current-round file changes after chat returns a new run id", async () => {
+    const chatStore = useChatStore();
+    const changesStore = useChatChangesStore();
+
+    undoData.s1 = [
+      makeUndoEntry("s1", "src/old.ts", {
+        assistantMessageId: "msg-old",
+        runId: "run-old",
+        createdAt: 1,
+      }),
+    ];
+    latestCompletedRunIdData.s1 = "run-old";
+    sessionServiceMocks.chat.mockResolvedValueOnce({ sessionId: "s1", runId: "run-new" });
+
+    await chatStore.selectSession("s1");
+    expect(changesStore.currentFileCount).toBe(1);
+
+    await chatStore.sendMessage("next");
+
+    expect(changesStore.latestTurnRounds).toEqual([]);
+    expect(changesStore.currentFileCount).toBe(0);
+    expect(changesStore.hasAnyChanges).toBe(true);
   });
 
   it("tracks background-session undo arrivals and opens the panel when that session is revisited", async () => {
@@ -1477,6 +1557,28 @@ describe("chat session panel state", () => {
     expect(chatStore.messages[0].id).not.toBe(chatStore.messages[1].id);
   });
 
+  it("removes the local pending user message when chat launch fails", async () => {
+    const chatStore = useChatStore();
+    sessionServiceMocks.chat.mockRejectedValueOnce(new Error("session locked"));
+
+    await chatStore.sendMessage("will fail");
+
+    expect(chatStore.isStreaming).toBe(false);
+    expect(chatStore.messages).toEqual([]);
+  });
+
+  it("sends a client message id that matches the local pending user message", async () => {
+    const chatStore = useChatStore();
+
+    await chatStore.sendMessage("hello");
+
+    const userMessage = chatStore.messages.find((message) => message.role === "user");
+    const chatParams = sessionServiceMocks.chat.mock.calls[sessionServiceMocks.chat.mock.calls.length - 1]?.[0];
+    expect(userMessage?.id).toMatch(/^user_pending_/);
+    expect(chatParams?.userIntent?.clientMessageId).toBe(userMessage?.id);
+    expect(userMessage?.thinkingSignature).toContain(userMessage?.id ?? "");
+  });
+
   it("marks pending knowledge proposals stale when the user continues chatting", async () => {
     const chatStore = useChatStore();
 
@@ -1646,6 +1748,77 @@ describe("chat session panel state", () => {
     expect(chatStore.activeToolCalls[0].id).toBe("tc-resume");
   });
 
+  it("forks the active root session and switches to the copy", async () => {
+    const chatStore = useChatStore();
+
+    chatStore.sessions = [
+      {
+        id: "s1",
+        title: "Root session",
+        agentId: null,
+        sessionType: "chat",
+        parentSessionId: null,
+        updatedAt: 1,
+      },
+    ] as any;
+    chatStore.activeSessionId = "s1";
+    sessionServiceMocks.forkSession.mockResolvedValueOnce("s-copy");
+    sessionServiceMocks.listSessions.mockResolvedValueOnce([
+      {
+        id: "s-copy",
+        title: "Root session copy",
+        agentId: null,
+        sessionType: "chat",
+        parentSessionId: null,
+        updatedAt: 2,
+      },
+      {
+        id: "s1",
+        title: "Root session",
+        agentId: null,
+        sessionType: "chat",
+        parentSessionId: null,
+        updatedAt: 1,
+      },
+    ]);
+
+    await chatStore.forkSession();
+
+    expect(sessionServiceMocks.forkSession).toHaveBeenCalledWith("s1", "Root session");
+    expect(chatStore.activeSessionId).toBe("s-copy");
+    expect(sessionServiceMocks.loadSession).toHaveBeenCalledWith("s-copy");
+    expect(notificationStoreMocks.addNotice).toHaveBeenCalledWith(
+      "success",
+      "",
+      { operation: "forkSession" },
+    );
+  });
+
+  it("blocks child session forks before calling the backend", async () => {
+    const chatStore = useChatStore();
+
+    chatStore.sessions = [
+      {
+        id: "child-1",
+        title: "Child session",
+        agentId: "explorer",
+        sessionType: "chat",
+        parentSessionId: "root-1",
+        updatedAt: 2,
+      },
+    ] as any;
+    chatStore.activeSessionId = "child-1";
+
+    await chatStore.forkSession();
+
+    expect(sessionServiceMocks.forkSession).not.toHaveBeenCalled();
+    expect(notificationStoreMocks.addNotice).toHaveBeenCalledWith(
+      "warning",
+      "",
+      { code: "session.fork_child", operation: "forkSession" },
+    );
+  });
+
   it("archives the active session, clears local state, and notifies the user", async () => {
     const chatStore = useChatStore();
 
@@ -1745,6 +1918,41 @@ describe("chat session panel state", () => {
     expect(chatStore.messages[0]).toMatchObject({
       id: "user-restored",
       content: "恢复到输入框的内容",
+    });
+  });
+
+  it("returns true after conversation-only undo reloads the session state", async () => {
+    const chatStore = useChatStore();
+
+    sessionServiceMocks.undoLatestConversationTurn.mockImplementation(async (sessionId: string) => ({
+      id: sessionId,
+      title: `Session ${sessionId}`,
+      messages: [
+        {
+          id: "user-kept",
+          role: "user",
+          content: "保留的上一轮",
+          createdAt: 1,
+        },
+      ],
+      agentId: null,
+      sessionType: "chat",
+      parentSessionId: null,
+      latestCompletedRunId: null,
+      createdAt: 0,
+      updatedAt: 0,
+    }));
+    undoData.s1 = [];
+
+    await chatStore.selectSession("s1");
+    const result = await chatStore.undoLatestConversationTurn();
+
+    expect(result).toBe(true);
+    expect(sessionServiceMocks.undoLatestConversationTurn).toHaveBeenCalledWith("s1");
+    expect(chatStore.messages).toHaveLength(1);
+    expect(chatStore.messages[0]).toMatchObject({
+      id: "user-kept",
+      content: "保留的上一轮",
     });
   });
 

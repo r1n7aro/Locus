@@ -28,6 +28,18 @@ export function useCommandRegistry(
         commandType: "compact",
       },
       {
+        name: "/fork",
+        description: t("chat.command.forkDesc"),
+        commandKind: "action",
+        commandType: "fork",
+      },
+      {
+        name: "/undo",
+        description: t("chat.command.undoDesc"),
+        commandKind: "action",
+        commandType: "undo",
+      },
+      {
         name: "/plan",
         description: t("chat.command.planDesc"),
         commandKind: "intent",

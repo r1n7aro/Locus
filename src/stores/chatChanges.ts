@@ -18,6 +18,7 @@ export interface ChatChangesSessionState {
   rounds: ChatChangeRound[];
   mergedFiles: ChatMergedFileItem[];
   latestCompletedRunId: string | null;
+  activeRunId: string | null;
   selectedFileKey: string | null;
   loading: boolean;
   error: string | null;
@@ -31,6 +32,7 @@ function emptySessionState(): ChatChangesSessionState {
     rounds: [],
     mergedFiles: [],
     latestCompletedRunId: null,
+    activeRunId: null,
     selectedFileKey: null,
     loading: false,
     error: null,
@@ -89,8 +91,9 @@ export const useChatChangesStore = defineStore("chatChanges", () => {
   const latestTurnRounds = computed(() => {
     const s = currentState();
     if (!s || s.rounds.length === 0) return [];
-    if (s.latestCompletedRunId) {
-      return s.rounds.filter((r) => r.runId === s.latestCompletedRunId);
+    const currentRunId = s.activeRunId ?? s.latestCompletedRunId;
+    if (currentRunId) {
+      return s.rounds.filter((r) => r.runId === currentRunId);
     }
     const latestKey = roundTurnKey(s.rounds[s.rounds.length - 1]);
     return s.rounds.filter((r) => roundTurnKey(r) === latestKey);
@@ -218,6 +221,8 @@ export const useChatChangesStore = defineStore("chatChanges", () => {
         latestEntryKey,
         previousArrivalKey,
         currentArrivalKey: s.lastArrivalEntryKey,
+        activeRunId: s.activeRunId,
+        latestCompletedRunId: s.latestCompletedRunId,
         changesAutoOpenEnabled,
         autoOpened,
         panelVisible: s.panelVisible,
@@ -273,6 +278,16 @@ export const useChatChangesStore = defineStore("chatChanges", () => {
     if (!sessionId) return;
     const s = getState(sessionId);
     s.latestCompletedRunId = runId ?? null;
+    if (!runId || s.activeRunId === runId) {
+      s.activeRunId = null;
+    }
+    triggerRef(sessions);
+  }
+
+  function setActiveRunId(sessionId: string | null, runId: string | null | undefined) {
+    if (!sessionId) return;
+    const s = getState(sessionId);
+    s.activeRunId = runId ?? null;
     triggerRef(sessions);
   }
 
@@ -324,6 +339,7 @@ export const useChatChangesStore = defineStore("chatChanges", () => {
     togglePanel,
     closePanel,
     setMode,
+    setActiveRunId,
     setLatestCompletedRunId,
     clear,
   };

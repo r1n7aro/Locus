@@ -33,7 +33,7 @@ import {
   type CommandDef,
   type ComposerIntentState,
 } from "../../composables/chatInputIntents";
-import { extractChatAssetRefs } from "../../composables/chatAssetRefs";
+import { buildProjectKnowledgeRefPath, extractChatAssetRefs } from "../../composables/chatAssetRefs";
 import { rankSearchResults } from "../../composables/searchMatcher";
 import { useCommandRegistry } from "../../composables/useCommandRegistry";
 import {
@@ -143,6 +143,8 @@ const emit = defineEmits<{
   (e: "cancel"): void;
   (e: "clear"): void;
   (e: "compact"): void;
+  (e: "fork"): void;
+  (e: "undo"): void;
 }>();
 
 const composerRef = ref<InstanceType<typeof ChatComposer> | null>(null);
@@ -187,6 +189,7 @@ const mentionAnchor = ref(-1);
 const mentionTokenEnd = ref(-1);
 const mentionSubPath = ref("");
 const mentionLoading = ref(false);
+const mentionSearchSettledQuery = ref("");
 const assetRefDrafts = new Map<string, AssetRefAttachment[]>();
 
 let mentionDebounceTimer: ReturnType<typeof setTimeout> | null = null;
@@ -312,13 +315,14 @@ function fallbackKnowledgeName(path: string): string {
 }
 
 function mapKnowledgeSearchResult(result: KnowledgeSearchResult): MentionSearchResult {
+  const refPath = buildProjectKnowledgeRefPath(result.type, result.path);
   return {
-    relPath: result.path,
+    relPath: refPath,
     name: result.title?.trim() || fallbackKnowledgeName(result.path),
-    parentPath: parentPathFor(result.path),
+    parentPath: parentPathFor(refPath),
     isDir: false,
     matchScore: Math.max(1, Math.round(result.score || 1)),
-    meta: result.path,
+    meta: refPath,
     entryKind: "knowledge",
   };
 }
@@ -393,6 +397,18 @@ const mentionDisplayList = computed<MentionDisplayEntry[]>(() => {
     ? [mentionCurrentFolderEntry.value, ...entries]
     : entries;
 });
+
+const mentionPopupLoading = computed(() => {
+  if (mentionLoading.value) return true;
+  if (mentionMode.value === "search") {
+    return mentionSearchSettledQuery.value !== mentionQuery.value;
+  }
+  return mentionEntriesPath.value !== mentionSubPath.value;
+});
+
+const showMentionEmpty = computed(() =>
+  !mentionPopupLoading.value && mentionDisplayList.value.length === 0,
+);
 
 function buildIntentBadges(
   intent: Pick<ComposerIntentState, "mode" | "skills"> | null | undefined,
@@ -547,7 +563,7 @@ async function loadDirEntries(subPath: string) {
 }
 
 async function searchAssets(query: string) {
-  if (query === lastSearchQuery) return;
+  if (query === lastSearchQuery && mentionSearchSettledQuery.value === query) return;
   lastSearchQuery = query;
   const requestSeq = ++mentionRequestSeq;
   mentionLoading.value = true;
@@ -583,6 +599,7 @@ async function searchAssets(query: string) {
       : [];
 
     mentionSearchResults.value = [...assetResults, ...knowledgeResults];
+    mentionSearchSettledQuery.value = query;
 
     if (assetSearch.status === "rejected" && mentionSearchResults.value.length === 0) {
       mentionMode.value = "browse";
@@ -619,6 +636,7 @@ function closeMentionPopup() {
   mentionEntries.value = [];
   mentionEntriesPath.value = null;
   mentionSearchResults.value = [];
+  mentionSearchSettledQuery.value = "";
   mentionHighlightIndex.value = 0;
   mentionMode.value = "search";
   lastSearchQuery = "";
@@ -1276,6 +1294,18 @@ function executeActionCommand(command: CommandDef): boolean {
     return true;
   }
 
+  if (command.commandType === "fork") {
+    resetDraft();
+    emit("fork");
+    return true;
+  }
+
+  if (command.commandType === "undo") {
+    resetDraft();
+    emit("undo");
+    return true;
+  }
+
   return false;
 }
 
@@ -1794,7 +1824,8 @@ defineExpose({
           :selected-index="mentionHighlightIndex"
           :breadcrumbs="mentionBreadcrumbs"
           :query="mentionMode === 'search' ? mentionQuery : mentionBrowseFilter"
-          :loading="mentionLoading"
+          :loading="mentionPopupLoading"
+          :show-empty="showMentionEmpty"
           @select="selectMentionEntry"
           @open-dir="browseMentionDirectory"
           @navigate-to="mentionNavigateTo"
@@ -2293,6 +2324,10 @@ defineExpose({
 }
 
 :deep(.mention-search-header) {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
   padding: 6px 10px 4px;
   border-bottom: 1px solid var(--border-color);
   margin-bottom: 2px;
@@ -2304,6 +2339,15 @@ defineExpose({
   text-transform: uppercase;
   letter-spacing: 0.5px;
   font-weight: 600;
+}
+
+:deep(.mention-loading-status) {
+  flex: 0 0 auto;
+  margin-left: auto;
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.4;
+  white-space: nowrap;
 }
 
 :deep(.mention-open) {
@@ -2330,13 +2374,6 @@ defineExpose({
   font-size: 12px;
   color: var(--text-secondary);
   text-align: center;
-}
-
-:deep(.mention-loading-inline) {
-  padding-top: 6px;
-  border-top: 1px solid var(--border-color);
-  margin-top: 2px;
-  font-size: 11px;
 }
 
 .composer-attachment-list {

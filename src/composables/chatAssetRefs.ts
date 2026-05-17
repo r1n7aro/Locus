@@ -2,6 +2,7 @@ import {
   findUnityAssetPathEnd,
   findUnitySceneObjectPathEnd,
 } from "./markdownInject";
+import type { KnowledgeDocumentType } from "../types";
 
 export interface ChatAssetRefSegment {
   type: "text" | "asset" | "knowledge";
@@ -16,6 +17,16 @@ export interface ExtractedChatAssetRefs {
 const UNITY_ASSET_REF_START_RE = /`@?(?:Assets|Packages|ProjectSettings|design|memory|skill|reference)\/|\{@(?:Assets|Packages|ProjectSettings|design|memory|skill|reference)\/|@(?:Assets|Packages|ProjectSettings|design|memory|skill|reference)\//gi;
 const UNITY_ASSET_ROOT_RE = /^(?:Assets|Packages|ProjectSettings)\//i;
 const PROJECT_KNOWLEDGE_ROOT_RE = /^(?:design|memory|skill|reference)\/.+\.md$/i;
+const PROJECT_KNOWLEDGE_TYPE_PREFIX_RE = /^(?:design|memory|skill|reference)\//i;
+
+export function buildProjectKnowledgeRefPath(
+  type: KnowledgeDocumentType,
+  path: string,
+): string {
+  const normalized = path.trim().replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+  if (PROJECT_KNOWLEDGE_TYPE_PREFIX_RE.test(normalized)) return normalized;
+  return `${type}/${normalized}`;
+}
 
 function findSimpleAssetMentionEnd(text: string, start: number): number {
   let end = start;

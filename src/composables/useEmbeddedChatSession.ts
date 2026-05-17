@@ -12,6 +12,7 @@ import { t } from "../i18n";
 import { normalizeAppError } from "../services/errors";
 import { getLocusRuntime, type RuntimeUnsubscribe } from "../services/locusRuntime";
 import * as sessionService from "../services/session";
+import { hydrateChatMessagesIntent, withClientMessageId } from "./chatInputIntents";
 import {
   buildToolResultMessages,
   mergeUserMessage,
@@ -374,6 +375,16 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     return pendingState;
   }
 
+  async function reloadSessionMessagesAfterError(state: EmbeddedChatState, sessionId: string) {
+    try {
+      const detail = await sessionService.loadSession(sessionId);
+      if (state.sessionId !== sessionId) return;
+      state.messages = hydrateChatMessagesIntent(detail.messages);
+    } catch (error) {
+      console.warn("[embedded-chat] loadSession after stream error failed:", error);
+    }
+  }
+
   function handleStreamEvent(event: StreamEvent) {
     const state = resolveStateForEvent(event);
     if (!state) return;
@@ -396,6 +407,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
       state.error = normalizeAppError(event.error).message;
       state.currentRunId = null;
       state.pendingRun = false;
+      void reloadSessionMessagesAfterError(state, event.sessionId);
       return;
     }
 
@@ -428,15 +440,19 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
       });
     }
 
+    const pendingMessageId = `embedded_user_${Date.now()}`;
+    const userIntent = withClientMessageId(request.userIntent, pendingMessageId);
+    const userIntentSignature = JSON.stringify(userIntent);
+
     state.messages.push({
-      id: `embedded_user_${Date.now()}`,
+      id: pendingMessageId,
       role: "user",
       content: displayText,
       createdAt: Date.now() / 1000,
       images: request.images && request.images.length > 0 ? request.images : undefined,
       assetRefs: request.assetRefs && request.assetRefs.length > 0 ? request.assetRefs : undefined,
-      thinkingSignature: request.userIntent ? JSON.stringify(request.userIntent) : undefined,
-      intentMeta: request.userIntent ?? undefined,
+      thinkingSignature: userIntentSignature,
+      intentMeta: userIntent,
     });
 
     state.inputText = "";
@@ -461,7 +477,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
         assetRefs: request.assetRefs && request.assetRefs.length > 0 ? request.assetRefs : null,
         sessionType: options.sessionType ?? "chat",
         mode: request.mode ?? null,
-        userIntent: request.userIntent ?? null,
+        userIntent,
       });
 
       state.sessionId = launch.sessionId;
@@ -472,6 +488,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
       state.isStreaming = false;
       state.pendingRun = false;
       state.isCompacting = false;
+      state.messages = state.messages.filter((message) => message.id !== pendingMessageId);
       resetRoundState(state);
       state.error = normalizeAppError(error).message;
     }

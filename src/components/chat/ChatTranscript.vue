@@ -15,6 +15,7 @@ import {
   collectToolCallDisplayIds,
   collectToolCallDisplayIdMatchState,
   collectToolCallDisplayMatchState,
+  areToolCallDisplaysCoveredByMatchState,
   filterToolCallsByConsumableMatchState,
   firstToolCallRenderOrder,
   getToolCallInfoFingerprint,
@@ -73,6 +74,7 @@ interface ToolCallHandoffState {
   toolCalls: ToolCallDisplay[];
   toolCallIds: Set<string>;
   toolCallMatchState: ToolCallMatchState;
+  collapseCandidateToolCalls: ToolCallDisplay[];
   willAutoCollapse: boolean;
   collapseArmed: boolean;
   collapseFinished: boolean;
@@ -247,6 +249,7 @@ const visibleMessages = computed(() =>
 
 const toolCallHandoff = ref<ToolCallHandoffState | null>(null);
 const toolCallHandoffQuiet = ref(false);
+const retainedCollapsedToolCallMatchState = ref<ToolCallMatchState>(emptyToolCallMatchState());
 let toolCallHandoffSequence = 0;
 let toolCallHandoffArmTimer: ReturnType<typeof setTimeout> | null = null;
 let toolCallHandoffFrameA = 0;
@@ -311,6 +314,52 @@ function traceToolCollapse(event: string, detail?: Record<string, unknown>) {
   logToolCollapseTrace(`transcript:${props.variant}`, event, detail);
 }
 
+function shouldRetainCollapsedToolCallHandoff(handoff: ToolCallHandoffState) {
+  return handoff.collapseFinished || (handoff.collapseArmed && handoff.willAutoCollapse);
+}
+
+function retainCollapsedToolCallHandoff(handoff: ToolCallHandoffState, reason: string) {
+  const retainedToolCalls = handoff.collapseCandidateToolCalls.length > 0
+    ? handoff.collapseCandidateToolCalls
+    : handoff.toolCalls;
+  if (!shouldRetainCollapsedToolCallHandoff(handoff)) {
+    traceToolCollapse("retainCollapsedToolCallHandoffSkipped", {
+      reason,
+      renderKey: handoff.renderKey,
+      toolCallCount: retainedToolCalls.length,
+      toolCallIds: Array.from(handoff.toolCallIds),
+      collapseArmed: handoff.collapseArmed,
+      collapseFinished: handoff.collapseFinished,
+      willAutoCollapse: handoff.willAutoCollapse,
+      retainedEntryCount: toolCallMatchEntryCount(retainedCollapsedToolCallMatchState.value),
+    });
+    return;
+  }
+  retainedCollapsedToolCallMatchState.value = mergeToolCallMatchStates(
+    retainedCollapsedToolCallMatchState.value,
+    collectToolCallDisplayMatchState(retainedToolCalls),
+  );
+  traceToolCollapse("retainCollapsedToolCallHandoff", {
+    reason,
+    renderKey: handoff.renderKey,
+    toolCallCount: retainedToolCalls.length,
+    retainedToolCallIds: retainedToolCalls.map((toolCall) => toolCall.id),
+    collapseArmed: handoff.collapseArmed,
+    collapseFinished: handoff.collapseFinished,
+    willAutoCollapse: handoff.willAutoCollapse,
+    retainedEntryCount: toolCallMatchEntryCount(retainedCollapsedToolCallMatchState.value),
+  });
+}
+
+function clearRetainedCollapsedToolCalls(reason: string) {
+  if (!hasToolCallMatchState(retainedCollapsedToolCallMatchState.value)) return;
+  traceToolCollapse("clearRetainedCollapsedToolCalls", {
+    reason,
+    retainedEntryCount: toolCallMatchEntryCount(retainedCollapsedToolCallMatchState.value),
+  });
+  retainedCollapsedToolCallMatchState.value = emptyToolCallMatchState();
+}
+
 function clearToolCallHandoff(reason = "clear") {
   const handoff = toolCallHandoff.value;
   if (handoff) {
@@ -332,6 +381,7 @@ watch(
   (sessionKey, previousSessionKey) => {
     if (sessionKey === previousSessionKey) return;
     clearToolCallHandoff("session-key-changed");
+    clearRetainedCollapsedToolCalls("session-key-changed");
   },
   { flush: "sync" },
 );
@@ -412,6 +462,7 @@ function scheduleToolCallHandoffCollapse() {
           });
           toolCallHandoff.value = {
             ...nextHandoff,
+            collapseCandidateToolCalls: cloneToolCallDisplays(transientCollapseCandidateToolCalls.value),
             collapseArmed: true,
             collapseFinished: false,
           };
@@ -436,6 +487,7 @@ function beginToolCallHandoff(previousToolCalls: ToolCallDisplay[]) {
     toolCalls,
     toolCallIds: collectToolCallDisplayIds(toolCalls),
     toolCallMatchState: collectToolCallDisplayMatchState(toolCalls),
+    collapseCandidateToolCalls: cloneToolCallDisplays(toolCalls),
     willAutoCollapse: summarizeToolCallBatch(toolCalls, displaySettings.compactToolCalls).canCollapse,
     collapseArmed: false,
     collapseFinished: false,
@@ -531,8 +583,19 @@ watch(
 
 watch(
   () => props.activeToolCalls.length,
-  (activeToolCallCount) => {
+  (activeToolCallCount, previousActiveToolCallCount) => {
     if (activeToolCallCount > 0 && toolCallHandoff.value) {
+      traceToolCollapse("activeToolCallsResumedWithHandoff", {
+        previousActiveToolCallCount,
+        activeToolCallCount,
+        activeToolCallIds: props.activeToolCalls.map((toolCall) => toolCall.id),
+        handoffRenderKey: toolCallHandoff.value.renderKey,
+        handoffToolCallIds: Array.from(toolCallHandoff.value.toolCallIds),
+        handoffCollapseArmed: toolCallHandoff.value.collapseArmed,
+        handoffCollapseFinished: toolCallHandoff.value.collapseFinished,
+        isStreaming: props.isStreaming,
+      });
+      retainCollapsedToolCallHandoff(toolCallHandoff.value, "active-tool-calls-resumed");
       clearToolCallHandoff("active-tool-calls-resumed");
     }
   },
@@ -594,6 +657,9 @@ watch(
       collapseArmed: handoff?.collapseArmed ?? false,
       collapseFinished: handoff?.collapseFinished ?? false,
     });
+    if (!isStreaming) {
+      clearRetainedCollapsedToolCalls("stream-ended");
+    }
     if (isStreaming || !handoff?.collapseFinished) return;
     clearToolCallHandoff("stream-ended-after-collapse");
   },
@@ -625,18 +691,6 @@ function toolCallInfosForMessage(message: Pick<ChatMessage, "toolCalls" | "rende
 
 function hasExplicitDisplayToolCalls(item: Pick<MessageRenderItem, "displayToolCalls">) {
   return Object.prototype.hasOwnProperty.call(item, "displayToolCalls");
-}
-
-function toolCallsForRenderItem(item: Pick<MessageRenderItem, "message" | "displayToolCalls">) {
-  return buildMessageToolCalls(
-    {
-      toolCalls: resolveToolCallInfosForRender({
-        messageToolCalls: toolCallInfosForMessage(item.message),
-        displayToolCalls: item.displayToolCalls,
-      }),
-    },
-    toolOutputMap.value,
-  );
 }
 
 function toolCallsFromInfos(toolCalls: ToolCallInfo[] | undefined) {
@@ -674,6 +728,14 @@ function shouldRenderItem(item: MessageRenderItem) {
 
 function hasToolCallMatchState(state: ToolCallMatchState) {
   return state.ids.size > 0 || state.fingerprintCounts.size > 0;
+}
+
+function emptyToolCallMatchState(): ToolCallMatchState {
+  return {
+    ids: new Set<string>(),
+    fingerprintCounts: new Map<string, number>(),
+    idFingerprints: new Map<string, string>(),
+  };
 }
 
 function toolCallMatchEntryCount(state: ToolCallMatchState) {
@@ -721,19 +783,6 @@ function buildTailHiddenToolCallMap(
   }
 
   return hiddenToolCallsByItemId;
-}
-
-function isToolOnlyRenderItem(item: MessageRenderItem) {
-  if (item.message.role !== "assistant" || item.message.knowledgeProposal) return false;
-  const parts = renderPartsForMessage(item);
-  if (parts.length > 0) {
-    return parts.every((part) => part.kind === "toolCall");
-  }
-
-  const hasAttachedKnowledgeProposals = item.attachedKnowledgeProposals.length > 0;
-  const hasToolCalls = toolCallsForRenderItem(item).length > 0;
-
-  return !item.message.content.trim() && !shouldRenderHistoryThinkingBlock(item) && !hasAttachedKnowledgeProposals && hasToolCalls;
 }
 
 function buildGroupedMessages(hiddenToolCallMatchState: ToolCallMatchState): MessageGroup[] {
@@ -826,6 +875,10 @@ function buildGroupedMessages(hiddenToolCallMatchState: ToolCallMatchState): Mes
 
 const baseGroupedMessages = computed<MessageGroup[]>(() => buildGroupedMessages(activeToolCallMatchState.value));
 
+const shouldPromoteHistoryToolCalls = computed(
+  () => !!toolCallHandoff.value || props.activeToolCalls.length > 0,
+);
+
 function emptyPromotedHistoryToolCalls(): PromotedHistoryToolCallsState {
   return {
     itemIds: new Set<string>(),
@@ -840,7 +893,7 @@ function emptyPromotedHistoryToolCalls(): PromotedHistoryToolCallsState {
 }
 
 const promotableHistoryToolCalls = computed<PromotedHistoryToolCallsState>(() => {
-  if (!toolCallHandoff.value) return emptyPromotedHistoryToolCalls();
+  if (!shouldPromoteHistoryToolCalls.value) return emptyPromotedHistoryToolCalls();
 
   const lastGroup = baseGroupedMessages.value[baseGroupedMessages.value.length - 1];
   if (!lastGroup || lastGroup.role !== "assistant") {
@@ -849,14 +902,16 @@ const promotableHistoryToolCalls = computed<PromotedHistoryToolCallsState>(() =>
 
   const collectedItemIds = new Set<string>();
   const collectedBatches: ToolCallDisplay[][] = [];
+  const segments = historyRenderSegmentsForGroup(lastGroup);
 
-  for (let index = lastGroup.items.length - 1; index >= 0; index -= 1) {
-    const item = lastGroup.items[index];
-    if (!item || !isToolOnlyRenderItem(item)) break;
-    const itemToolCalls = toolCallsForRenderItem(item);
-    if (itemToolCalls.length === 0) break;
-    collectedItemIds.add(item.id);
-    collectedBatches.unshift(cloneToolCallDisplays(itemToolCalls));
+  for (let index = segments.length - 1; index >= 0; index -= 1) {
+    const segment = segments[index];
+    if (!segment || segment.type !== "toolCalls") break;
+    if (segment.toolCalls.length === 0) break;
+    for (const itemId of segment.itemIds) {
+      collectedItemIds.add(itemId);
+    }
+    collectedBatches.unshift(cloneToolCallDisplays(segment.toolCalls));
   }
 
   if (collectedBatches.length === 0) return emptyPromotedHistoryToolCalls();
@@ -877,7 +932,7 @@ const transientOwnedToolCalls = computed(() =>
 );
 
 const transientCollapseCandidateToolCalls = computed(() => {
-  if (!toolCallHandoff.value || promotableHistoryToolCalls.value.toolCalls.length === 0) {
+  if (promotableHistoryToolCalls.value.toolCalls.length === 0) {
     return transientOwnedToolCalls.value;
   }
   return mergeToolCallDisplaysWithoutDuplicates(
@@ -890,8 +945,27 @@ const transientToolCallsCanCollapse = computed(() =>
   summarizeToolCallBatch(transientCollapseCandidateToolCalls.value, displaySettings.compactToolCalls).canCollapse,
 );
 
+const shouldHidePromotedHistoryToolCalls = computed(() =>
+  promotableHistoryToolCalls.value.toolCalls.length > 0
+  && (props.activeToolCalls.length > 0 || !!toolCallHandoff.value?.collapseArmed),
+);
+
+watch(shouldHidePromotedHistoryToolCalls, (next, previous) => {
+  traceToolCollapse("promotedHistoryToolCallsVisibilityChanged", {
+    previous,
+    next,
+    promotedToolCallCount: promotableHistoryToolCalls.value.toolCalls.length,
+    promotedToolCallIds: promotableHistoryToolCalls.value.toolCalls.map((toolCall) => toolCall.id),
+    activeToolCallCount: props.activeToolCalls.length,
+    activeToolCallIds: props.activeToolCalls.map((toolCall) => toolCall.id),
+    hasHandoff: !!toolCallHandoff.value,
+    handoffCollapseArmed: toolCallHandoff.value?.collapseArmed ?? false,
+    isStreaming: props.isStreaming,
+  });
+});
+
 const historyHiddenToolCallMatchState = computed<ToolCallMatchState>(() => {
-  if (!toolCallHandoff.value?.collapseArmed) {
+  if (!shouldHidePromotedHistoryToolCalls.value) {
     return activeToolCallMatchState.value;
   }
   return mergeToolCallMatchStates(
@@ -902,8 +976,13 @@ const historyHiddenToolCallMatchState = computed<ToolCallMatchState>(() => {
 
 const groupedMessages = computed<MessageGroup[]>(() => buildGroupedMessages(historyHiddenToolCallMatchState.value));
 
+const shouldRenderPromotedHistoryToolCallsInTransient = computed(() =>
+  promotableHistoryToolCalls.value.toolCalls.length > 0
+  && (props.activeToolCalls.length > 0 || !!toolCallHandoff.value?.collapseArmed),
+);
+
 const transientToolCalls = computed(() => {
-  if (!toolCallHandoff.value?.collapseArmed || promotableHistoryToolCalls.value.toolCalls.length === 0) {
+  if (!shouldRenderPromotedHistoryToolCallsInTransient.value) {
     return transientOwnedToolCalls.value;
   }
   return transientCollapseCandidateToolCalls.value;
@@ -1080,6 +1159,44 @@ const pendingContinuationToolItemIds = computed(() => {
   });
 });
 
+function pendingContinuationSegmentSnapshot() {
+  const groups = baseGroupedMessages.value;
+  const lastGroup = groups[groups.length - 1];
+  const segments =
+    lastGroup?.role === "assistant"
+      ? historyRenderSegmentsForGroup(lastGroup).map((segment, index) => ({
+          index,
+          type: segment.type === "toolCalls" || segment.type === "content" ? segment.type : "other",
+          itemIds: segment.type === "toolCalls" ? segment.itemIds : [],
+        }))
+      : [];
+
+  return {
+    lastGroupRole: lastGroup?.role ?? null,
+    segments,
+  };
+}
+
+watch(
+  () => Array.from(pendingContinuationToolItemIds.value).join("\u241f"),
+  (next, previous) => {
+    const snapshot = pendingContinuationSegmentSnapshot();
+    traceToolCollapse("pendingContinuationToolItemIdsChanged", {
+      previous: previous ? previous.split("\u241f") : [],
+      next: next ? next.split("\u241f") : [],
+      isStreaming: props.isStreaming,
+      hasTransientAssistantMessage: hasTransientAssistantMessage.value,
+      activeToolCallCount: props.activeToolCalls.length,
+      activeToolCallIds: props.activeToolCalls.map((toolCall) => toolCall.id),
+      hasHandoff: !!toolCallHandoff.value,
+      handoffCollapseArmed: toolCallHandoff.value?.collapseArmed ?? false,
+      handoffCollapseFinished: toolCallHandoff.value?.collapseFinished ?? false,
+      lastGroupRole: snapshot.lastGroupRole,
+      historySegments: snapshot.segments,
+    });
+  },
+);
+
 const nonCollapsibleToolItemIds = computed(() => {
   return new Set(pendingContinuationToolItemIds.value);
 });
@@ -1096,7 +1213,16 @@ type HistoryRenderSegment =
 
 type TransientRenderSegment =
   | { type: "thinking"; key: string; part: AssistantRenderPart; active: boolean; duration?: number }
-  | { type: "toolCalls"; key: string; part: Extract<AssistantRenderPart, { kind: "toolCall" }>; toolCalls: ToolCallDisplay[]; showWaiting: boolean; animateCollapseOnMount: boolean }
+  | {
+      type: "toolCalls";
+      key: string;
+      part: Extract<AssistantRenderPart, { kind: "toolCall" }>;
+      toolCalls: ToolCallDisplay[];
+      showWaiting: boolean;
+      allowCollapse: boolean;
+      collapseEnabled: boolean;
+      animateCollapseOnMount: boolean;
+    }
   | { type: "waiting"; key: string; label: string }
   | { type: "content"; key: string; part: AssistantRenderPart; content: string };
 
@@ -1106,13 +1232,19 @@ function renderPartsForMessage(item: MessageRenderItem): AssistantRenderPart[] {
     messageToolCalls: toolCallInfosForMessage(item.message),
     displayToolCalls: item.displayToolCalls,
   });
+  const hasRenderPartThinking = !!item.message.renderParts?.some((part) =>
+    part.kind === "thinking" && part.content.trim().length > 0,
+  );
+  const shouldRenderThinkingPart =
+    shouldRenderHistoryThinkingBlock(item)
+    || (!shouldHideThinkingBlocks() && hasRenderPartThinking);
 
   let parts: AssistantRenderPart[];
   if (item.message.renderParts?.length) {
     assertCanonicalRenderParts(item.message.renderParts, `message:${item.message.id}`);
     const visibleToolIds = new Set((messageToolCalls ?? []).map((toolCall) => toolCall.id));
     parts = [...item.message.renderParts]
-      .filter((part) => part.kind !== "thinking" || !shouldHideThinkingBlocks())
+      .filter((part) => part.kind !== "thinking" || shouldRenderThinkingPart)
       .filter((part) => part.kind !== "toolCall" || !hasToolFilter || visibleToolIds.has(part.toolCall.id))
       .sort(compareAssistantRenderParts);
   } else {
@@ -1121,7 +1253,7 @@ function renderPartsForMessage(item: MessageRenderItem): AssistantRenderPart[] {
       beforeContentToolCalls: item.displayToolCallsBeforeContent,
       afterContentToolCalls: item.displayToolCallsAfterContent,
       knowledgeProposals: item.attachedKnowledgeProposals,
-    }).filter((part) => part.kind !== "thinking" || !shouldHideThinkingBlocks());
+    }).filter((part) => part.kind !== "thinking" || shouldRenderThinkingPart);
   }
 
   if (!item.message.renderParts?.length || item.attachedKnowledgeProposals.length === 0) {
@@ -1288,8 +1420,91 @@ function isToolOnlyMessageGroup(group: MessageGroup) {
 }
 
 function shouldKeepToolSegmentExpanded(segment: Extract<HistoryRenderSegment, { type: "toolCalls" }>) {
-  return segment.itemIds.some((itemId) => shouldKeepToolItemExpanded(itemId));
+  if (!segment.itemIds.some((itemId) => shouldKeepToolItemExpanded(itemId))) return false;
+  return !areToolCallDisplaysCoveredByMatchState(
+    segment.toolCalls,
+    retainedCollapsedToolCallMatchState.value,
+  );
 }
+
+function historyToolSegmentPinnedSnapshot() {
+  return groupedMessages.value.flatMap((group, groupIndex) => {
+    if (group.role !== "assistant") return [];
+    return historyRenderSegmentsForGroup(group)
+      .filter((segment): segment is Extract<HistoryRenderSegment, { type: "toolCalls" }> => segment.type === "toolCalls")
+      .map((segment, segmentIndex) => ({
+        groupIndex,
+        segmentIndex,
+        key: segment.key,
+        itemIds: segment.itemIds,
+        toolCallIds: segment.toolCalls.map((toolCall) => toolCall.id),
+        keepExpanded: shouldKeepToolSegmentExpanded(segment),
+      }))
+      .filter((segment) => segment.keepExpanded);
+  });
+}
+
+watch(
+  () => JSON.stringify(historyToolSegmentPinnedSnapshot()),
+  (next, previous) => {
+    traceToolCollapse("historyToolSegmentPinnedStateChanged", {
+      previous: previous ? JSON.parse(previous) : [],
+      next: next ? JSON.parse(next) : [],
+      pendingItemIds: Array.from(pendingContinuationToolItemIds.value),
+      isStreaming: props.isStreaming,
+      hasTransientAssistantMessage: hasTransientAssistantMessage.value,
+      activeToolCallCount: props.activeToolCalls.length,
+      activeToolCallIds: props.activeToolCalls.map((toolCall) => toolCall.id),
+      hasHandoff: !!toolCallHandoff.value,
+      handoffCollapseArmed: toolCallHandoff.value?.collapseArmed ?? false,
+      handoffCollapseFinished: toolCallHandoff.value?.collapseFinished ?? false,
+    });
+  },
+);
+
+function historyToolSegmentExpansionSnapshot() {
+  return groupedMessages.value.flatMap((group, groupIndex) => {
+    if (group.role !== "assistant") return [];
+    return historyRenderSegmentsForGroup(group)
+      .filter((segment): segment is Extract<HistoryRenderSegment, { type: "toolCalls" }> => segment.type === "toolCalls")
+      .map((segment, segmentIndex) => {
+        const pendingContinuation = segment.itemIds.some((itemId) => shouldKeepToolItemExpanded(itemId));
+        const retainedCovered = areToolCallDisplaysCoveredByMatchState(
+          segment.toolCalls,
+          retainedCollapsedToolCallMatchState.value,
+        );
+        return {
+          groupIndex,
+          segmentIndex,
+          key: segment.key,
+          itemIds: segment.itemIds,
+          toolCallIds: segment.toolCalls.map((toolCall) => toolCall.id),
+          pendingContinuation,
+          retainedCovered,
+          keepExpanded: pendingContinuation && !retainedCovered,
+        };
+      });
+  });
+}
+
+watch(
+  () => JSON.stringify(historyToolSegmentExpansionSnapshot()),
+  (next, previous) => {
+    traceToolCollapse("historyToolSegmentExpansionDecision", {
+      previous: previous ? JSON.parse(previous) : [],
+      next: next ? JSON.parse(next) : [],
+      pendingItemIds: Array.from(pendingContinuationToolItemIds.value),
+      retainedEntryCount: toolCallMatchEntryCount(retainedCollapsedToolCallMatchState.value),
+      isStreaming: props.isStreaming,
+      hasTransientAssistantMessage: hasTransientAssistantMessage.value,
+      activeToolCallCount: props.activeToolCalls.length,
+      activeToolCallIds: props.activeToolCalls.map((toolCall) => toolCall.id),
+      hasHandoff: !!toolCallHandoff.value,
+      handoffCollapseArmed: toolCallHandoff.value?.collapseArmed ?? false,
+      handoffCollapseFinished: toolCallHandoff.value?.collapseFinished ?? false,
+    });
+  },
+);
 
 const transientRenderSegments = computed<TransientRenderSegment[]>(() => {
   const segments: TransientRenderSegment[] = [];
@@ -1306,6 +1521,8 @@ const transientRenderSegments = computed<TransientRenderSegment[]>(() => {
       part: pendingToolPart,
       toolCalls: pendingToolCalls,
       showWaiting: false,
+      allowCollapse: transientToolCallsAllowCollapse.value,
+      collapseEnabled: transientToolCallsCollapseEnabled.value,
       animateCollapseOnMount: !!toolCallHandoff.value?.collapseArmed,
     });
     pendingToolPart = null;
@@ -1346,7 +1563,52 @@ const transientRenderSegments = computed<TransientRenderSegment[]>(() => {
   }
   flushPendingTools();
 
-  const hasRenderedToolSegment = segments.some((segment) => segment.type === "toolCalls");
+  let hasRenderedToolSegment = segments.some((segment) => segment.type === "toolCalls");
+  const promotedToolCalls = promotableHistoryToolCalls.value.toolCalls;
+  if (shouldRenderPromotedHistoryToolCallsInTransient.value && promotedToolCalls.length > 0) {
+    const promotedPart = transientToolHandoffPart(transientToolCalls.value);
+    if (promotedPart) {
+      const firstToolSegmentIndex = segments.findIndex((segment) => segment.type === "toolCalls");
+      const firstContentSegmentIndex = segments.findIndex((segment) => segment.type === "content");
+      const candidateToolSegment = firstToolSegmentIndex >= 0 ? segments[firstToolSegmentIndex] : null;
+      const firstToolSegment = candidateToolSegment?.type === "toolCalls" ? candidateToolSegment : null;
+      const firstToolPrecedesContent =
+        !!firstToolSegment
+        && (firstContentSegmentIndex < 0 || firstToolSegmentIndex < firstContentSegmentIndex);
+      const shouldCollapsePromotedPrefix =
+        !!toolCallHandoff.value?.collapseArmed
+        || firstContentSegmentIndex >= 0;
+
+      if (firstToolPrecedesContent) {
+        const mergedToolCalls = mergeToolCallDisplaysWithoutDuplicates(
+          promotedToolCalls,
+          firstToolSegment.toolCalls,
+        );
+        firstToolSegment.key = transientToolSegmentKey(mergedToolCalls);
+        firstToolSegment.part = promotedPart;
+        firstToolSegment.toolCalls = mergedToolCalls;
+        firstToolSegment.allowCollapse = true;
+        firstToolSegment.collapseEnabled = shouldCollapsePromotedPrefix;
+      } else {
+        const prefixToolCalls =
+          firstToolSegmentIndex < 0 && transientOwnedToolCalls.value.length > 0
+            ? transientToolCalls.value
+            : promotedToolCalls;
+        segments.unshift({
+          type: "toolCalls",
+          key: transientToolSegmentKey(prefixToolCalls),
+          part: promotedPart,
+          toolCalls: prefixToolCalls,
+          showWaiting: false,
+          allowCollapse: true,
+          collapseEnabled: shouldCollapsePromotedPrefix,
+          animateCollapseOnMount: !!toolCallHandoff.value?.collapseArmed,
+        });
+      }
+    }
+  }
+  hasRenderedToolSegment = segments.some((segment) => segment.type === "toolCalls");
+
   if (!hasRenderedToolSegment && transientToolCalls.value.length > 0) {
     const handoffPart = transientToolHandoffPart(transientToolCalls.value);
     if (handoffPart) {
@@ -1356,6 +1618,8 @@ const transientRenderSegments = computed<TransientRenderSegment[]>(() => {
         part: handoffPart,
         toolCalls: transientToolCalls.value,
         showWaiting: false,
+        allowCollapse: transientToolCallsAllowCollapse.value,
+        collapseEnabled: transientToolCallsCollapseEnabled.value,
         animateCollapseOnMount: !!toolCallHandoff.value?.collapseArmed,
       });
     }
@@ -1365,6 +1629,34 @@ const transientRenderSegments = computed<TransientRenderSegment[]>(() => {
   const lastToolSegment = toolSegments[toolSegments.length - 1];
   if (lastToolSegment) {
     lastToolSegment.showWaiting = true;
+  }
+
+  if (shouldRenderPromotedHistoryToolCallsInTransient.value) {
+    const promotedIds = promotableHistoryToolCalls.value.toolCalls.map((toolCall) => toolCall.id);
+    const renderedIds = toolSegments.flatMap((segment) => segment.toolCalls.map((toolCall) => toolCall.id));
+    const renderedIdSet = new Set(renderedIds);
+    const missingPromotedIds = promotedIds.filter((id) => !renderedIdSet.has(id));
+    const detail = {
+      promotedToolCallCount: promotedIds.length,
+      promotedToolCallIds: promotedIds,
+      transientToolCallCount: transientToolCalls.value.length,
+      transientToolCallIds: transientToolCalls.value.map((toolCall) => toolCall.id),
+      renderedToolSegmentCount: toolSegments.length,
+      renderedToolCallIds: renderedIds,
+      missingPromotedToolCallIds: missingPromotedIds,
+      hasRenderedToolSegment,
+      activeToolCallCount: props.activeToolCalls.length,
+      activeToolCallIds: props.activeToolCalls.map((toolCall) => toolCall.id),
+      livePartKinds: canonicalLiveRenderParts.value.map((part) => part.kind),
+      livePartIds: canonicalLiveRenderParts.value.map((part) => part.id),
+      hasHandoff: !!toolCallHandoff.value,
+      handoffCollapseArmed: toolCallHandoff.value?.collapseArmed ?? false,
+      isStreaming: props.isStreaming,
+    };
+    traceToolCollapse("transientPromotedToolCallsCoverage", detail);
+    if (missingPromotedIds.length > 0) {
+      traceToolCollapse("promotedHistoryToolCallsRenderGap", detail);
+    }
   }
 
   if (hasStandaloneCompactingPlaceholder.value || isStandaloneWaitingPlaceholder.value) {
@@ -1738,8 +2030,8 @@ function openImage(src: string) {
               >
                 <ToolCallCollection
                   :tool-calls="segment.toolCalls"
-                  :allow-collapse="transientToolCallsAllowCollapse"
-                  :collapse-enabled="transientToolCallsCollapseEnabled"
+                  :allow-collapse="segment.allowCollapse"
+                  :collapse-enabled="segment.collapseEnabled"
                   :animate-collapse-on-mount="segment.animateCollapseOnMount"
                   @collapse-finished="onTransientToolCallsCollapseFinished"
                   @viewport-anchor-start="emitToolViewportAnchorStart"
@@ -1748,7 +2040,7 @@ function openImage(src: string) {
                   <template #default="{ toolCall }">
                     <ToolCallBlock
                       :tool-call="toolCall"
-                      :collapse-enabled="transientToolCallsCollapseEnabled"
+                      :collapse-enabled="segment.collapseEnabled"
                       @tool-viewport-anchor-start="emitToolViewportAnchorStart"
                       @tool-viewport-anchor-end="emitToolViewportAnchorEnd"
                     />

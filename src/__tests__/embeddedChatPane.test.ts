@@ -44,6 +44,9 @@ describe("EmbeddedChatPane contract", () => {
     expect(embeddedSession).toContain("buildToolResultMessages(sourceToolCalls)");
     expect(embeddedSession).toContain("function replaceMessageById");
     expect(embeddedSession).toContain("state.messages = replaceMessageById(state.messages, mutation.message)");
+    expect(embeddedSession).toContain("async function reloadSessionMessagesAfterError");
+    expect(embeddedSession).toContain("sessionService.loadSession(sessionId)");
+    expect(embeddedSession).toContain("hydrateChatMessagesIntent(detail.messages)");
     expect(pane).toContain("<AskUserCard");
     expect(pane).toContain("<ToolConfirmCard");
     expect(pane).toContain('class="embedded-chat-pane"');

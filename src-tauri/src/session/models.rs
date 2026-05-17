@@ -201,6 +201,8 @@ pub struct UserIntentPayload {
     pub mode: String,
     #[serde(default)]
     pub skills: Vec<UserIntentSkill>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_message_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
