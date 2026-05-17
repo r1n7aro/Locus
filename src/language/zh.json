@@ -546,7 +546,7 @@
   "settings.proxy.modeSystem": "系统代理",
   "settings.proxy.modeManual": "手动配置代理",
   "settings.proxy.modeDisabled": "禁用代理",
-  "settings.proxy.modeAutoHint": "从环境变量读取代理配置",
+  "settings.proxy.modeAutoHint": "读取环境变量和系统代理配置",
   "settings.proxy.modeSystemHint": "后端请求读取系统代理配置",
   "settings.proxy.modeManualHint": "使用下方手动配置",
   "settings.proxy.modeDisabledHint": "后端请求直连",

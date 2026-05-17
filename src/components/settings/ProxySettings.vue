@@ -156,6 +156,31 @@ const modeHint = computed(() => {
 });
 
 const environmentEntries = computed(() => status.value?.environment ?? status.value?.manual ?? []);
+const systemEntries = computed(() => {
+  const system = status.value?.system;
+  if (!system?.available) return [];
+
+  const entries: Array<{ key: string; value: string }> = [];
+  const pushText = (key: string, value?: string | null) => {
+    const text = value?.trim();
+    if (text) entries.push({ key, value: text });
+  };
+  const pushBool = (key: string, value?: boolean | null) => {
+    if (value === null || value === undefined) return;
+    entries.push({ key, value: value ? t("settings.proxy.yes") : t("settings.proxy.no") });
+  };
+
+  pushBool(t("settings.proxy.enabled"), system.enabled);
+  pushBool(t("settings.proxy.autoDetect"), system.autoDetect);
+  pushText(t("settings.proxy.autoConfigUrl"), system.autoConfigUrl);
+  pushText(t("settings.proxy.proxyServer"), system.proxyServer);
+  pushText(t("settings.proxy.proxyOverride"), system.proxyOverride);
+  pushText(t("settings.proxy.httpProxy"), system.httpProxy);
+  pushText(t("settings.proxy.httpsProxy"), system.httpsProxy);
+  pushText(t("settings.proxy.socksProxy"), system.socksProxy);
+
+  return entries;
+});
 
 const manualChanged = computed(() => {
   const saved = status.value?.config?.manual ?? emptyManualConfig();
@@ -230,6 +255,16 @@ function routeDetailText(route: ProxyRoute): string {
           </template>
         </dl>
         <div v-else class="proxy-empty">{{ t("settings.proxy.manualEmpty") }}</div>
+      </section>
+
+      <section v-if="draftConfig.mode === 'auto' && systemEntries.length" class="proxy-block">
+        <div class="proxy-block-title">{{ t("settings.proxy.systemConfig") }}</div>
+        <dl class="proxy-grid">
+          <template v-for="entry in systemEntries" :key="entry.key">
+            <dt>{{ entry.key }}</dt>
+            <dd>{{ entry.value }}</dd>
+          </template>
+        </dl>
       </section>
 
       <section v-if="draftConfig.mode === 'manual'" class="proxy-block">

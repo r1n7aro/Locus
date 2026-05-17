@@ -546,7 +546,7 @@
   "settings.proxy.modeSystem": "System Proxy",
   "settings.proxy.modeManual": "Manual Proxy",
   "settings.proxy.modeDisabled": "Disable Proxy",
-  "settings.proxy.modeAutoHint": "Read proxy settings from environment variables",
+  "settings.proxy.modeAutoHint": "Read proxy settings from environment variables and system configuration",
   "settings.proxy.modeSystemHint": "Backend requests read the system proxy configuration",
   "settings.proxy.modeManualHint": "Use the manual settings below",
   "settings.proxy.modeDisabledHint": "Backend requests connect directly",

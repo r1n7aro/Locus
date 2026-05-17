@@ -255,6 +255,29 @@ fn set_proxy_config_override(config: Option<ProxyConfig>) {
     *guard = config;
 }
 
+#[cfg(test)]
+fn system_proxy_config_override() -> &'static Mutex<Option<SystemProxyConfig>> {
+    static OVERRIDE: OnceLock<Mutex<Option<SystemProxyConfig>>> = OnceLock::new();
+    OVERRIDE.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+fn set_system_proxy_config_override(config: Option<SystemProxyConfig>) {
+    let mut guard = system_proxy_config_override()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *guard = config;
+}
+
+#[cfg(test)]
+fn system_proxy_config_override_value() -> Option<SystemProxyConfig> {
+    system_proxy_config_override()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .cloned()
+}
+
 fn proxy_config_path() -> Result<std::path::PathBuf, String> {
     Ok(crate::commands::persistent_config_dir()?.join(PROXY_CONFIG_FILE))
 }
@@ -466,6 +489,45 @@ fn direct_proxy_matcher() -> Matcher {
     Matcher::builder().build()
 }
 
+fn first_user_env_value(keys: &[&str]) -> Option<String> {
+    for key in keys {
+        let Some(raw_value) = std::env::var_os(key) else {
+            continue;
+        };
+        if is_locus_injected_proxy_env(key, &raw_value) {
+            continue;
+        }
+        let value = raw_value.to_string_lossy().trim().to_string();
+        if value.is_empty() {
+            continue;
+        }
+        return Some(value);
+    }
+
+    None
+}
+
+fn first_proxy_value_from_map(
+    map: &std::collections::HashMap<OsString, OsString>,
+    keys: &[&str],
+) -> Option<String> {
+    for key in keys {
+        let Some((_, raw_value)) = map
+            .iter()
+            .find(|(entry_key, _)| env_key_matches_os(entry_key.as_os_str(), key))
+        else {
+            continue;
+        };
+        let value = raw_value.to_string_lossy().trim().to_string();
+        if value.is_empty() {
+            continue;
+        }
+        return Some(value);
+    }
+
+    None
+}
+
 fn manual_proxy_matcher(config: &ManualProxyConfig) -> Matcher {
     let mut builder = Matcher::builder();
     if !config.all_proxy.trim().is_empty() {
@@ -484,9 +546,78 @@ fn manual_proxy_matcher(config: &ManualProxyConfig) -> Matcher {
     builder.build()
 }
 
+fn system_proxy_enabled(config: &SystemProxyConfig) -> bool {
+    config.available && config.enabled.unwrap_or(false)
+}
+
+fn system_proxy_for_http(config: &SystemProxyConfig) -> Option<String> {
+    if !system_proxy_enabled(config) {
+        return None;
+    }
+    config
+        .http_proxy
+        .clone()
+        .or_else(|| config.socks_proxy.clone())
+}
+
+fn system_proxy_for_https(config: &SystemProxyConfig) -> Option<String> {
+    if !system_proxy_enabled(config) {
+        return None;
+    }
+    config
+        .https_proxy
+        .clone()
+        .or_else(|| config.socks_proxy.clone())
+}
+
+fn auto_proxy_matcher_for_system_config_unlocked(system: &SystemProxyConfig) -> Matcher {
+    with_locus_proxy_env_hidden_unlocked(|| {
+        let env_all = first_user_env_value(&["ALL_PROXY", "all_proxy"]);
+        let env_http = first_user_env_value(&["HTTP_PROXY", "http_proxy"]);
+        let env_https = first_user_env_value(&["HTTPS_PROXY", "https_proxy"]);
+
+        let mut builder = Matcher::builder();
+        if let Some(value) = env_all.as_deref() {
+            builder = builder.all(value);
+        }
+        let http_proxy = env_http.clone().or_else(|| {
+            if env_all.is_none() {
+                system_proxy_for_http(system)
+            } else {
+                None
+            }
+        });
+        if let Some(value) = http_proxy.as_deref() {
+            builder = builder.http(value);
+        }
+        let https_proxy = env_https.clone().or_else(|| {
+            if env_all.is_none() {
+                system_proxy_for_https(system)
+            } else {
+                None
+            }
+        });
+        if let Some(value) = https_proxy.as_deref() {
+            builder = builder.https(value);
+        }
+
+        let no_proxy = auto_no_proxy_process_value(system);
+        if !no_proxy.is_empty() {
+            builder = builder.no(no_proxy);
+        }
+
+        builder.build()
+    })
+}
+
+fn auto_proxy_matcher_unlocked() -> Matcher {
+    let system = read_system_proxy_config();
+    auto_proxy_matcher_for_system_config_unlocked(&system)
+}
+
 fn proxy_matcher_for_config_unlocked(config: &ProxyConfig) -> Matcher {
     match config.mode {
-        ProxyMode::Auto => with_locus_proxy_env_hidden_unlocked(Matcher::from_env),
+        ProxyMode::Auto => auto_proxy_matcher_unlocked(),
         ProxyMode::Manual => manual_proxy_matcher(&config.manual),
         ProxyMode::Disabled => direct_proxy_matcher(),
     }
@@ -652,23 +783,61 @@ fn proxy_env_scope_for_url_unlocked(
                     },
                 ));
             };
-            let (configured_env_key, configured_proxy) =
-                configured_proxy_env_for_target(&target_uri).unwrap_or_else(|| {
-                    (
-                        proxy_env_key_for_target(&target_uri).to_string(),
-                        proxy_display_uri(proxy.uri()),
-                    )
-                });
+            if let Some((configured_env_key, configured_proxy)) =
+                configured_proxy_env_for_target(&target_uri)
+            {
+                clear_locus_injected_proxy_env_unlocked();
+                return Ok((
+                    ResolvedProxyRoute {
+                        proxy_state: "environment".to_string(),
+                        proxy_env_key: Some(configured_env_key),
+                        proxy_url: Some(sanitize_proxy_display_url(&configured_proxy)),
+                    },
+                    ProxyEnvScope {
+                        clear_user_proxy_env: false,
+                        entries: Vec::new(),
+                    },
+                ));
+            }
+
+            let env_key = proxy_env_key_for_target(&target_uri).to_string();
+            let proxy_display = proxy_display_uri(proxy.uri());
+            let Some(proxy_url) = build_supported_ureq_proxy_url(proxy.uri(), proxy.raw_auth())?
+            else {
+                clear_locus_injected_proxy_env_unlocked();
+                return Ok((
+                    ResolvedProxyRoute {
+                        proxy_state: "system_unsupported".to_string(),
+                        proxy_env_key: None,
+                        proxy_url: Some(proxy_display),
+                    },
+                    ProxyEnvScope {
+                        clear_user_proxy_env: false,
+                        entries: Vec::new(),
+                    },
+                ));
+            };
+
+            let mut entries = vec![
+                (env_key.clone(), OsString::from(proxy_url.clone())),
+                (env_key.to_ascii_lowercase(), OsString::from(proxy_url)),
+            ];
+            let system = read_system_proxy_config();
+            let no_proxy = auto_no_proxy_process_value(&system);
+            if !no_proxy.is_empty() {
+                entries.push(("NO_PROXY".to_string(), OsString::from(no_proxy.clone())));
+                entries.push(("no_proxy".to_string(), OsString::from(no_proxy)));
+            }
             clear_locus_injected_proxy_env_unlocked();
             Ok((
                 ResolvedProxyRoute {
-                    proxy_state: "environment".to_string(),
-                    proxy_env_key: Some(configured_env_key),
-                    proxy_url: Some(sanitize_proxy_display_url(&configured_proxy)),
+                    proxy_state: "system".to_string(),
+                    proxy_env_key: Some(env_key),
+                    proxy_url: Some(proxy_display),
                 },
                 ProxyEnvScope {
                     clear_user_proxy_env: false,
-                    entries: Vec::new(),
+                    entries,
                 },
             ))
         }
@@ -786,7 +955,11 @@ pub fn apply_proxy_env_to_command(cmd: &mut std::process::Command) {
     }
     let config = load_proxy_config();
     match config.mode {
-        ProxyMode::Auto => {}
+        ProxyMode::Auto => {
+            for (key, value) in auto_proxy_process_env_entries_unlocked() {
+                cmd.env(key, value);
+            }
+        }
         ProxyMode::Disabled => {
             for key in PROXY_ENV_KEYS {
                 cmd.env_remove(key);
@@ -810,7 +983,11 @@ pub fn apply_proxy_env_to_async_command(cmd: &mut tokio::process::Command) {
     }
     let config = load_proxy_config();
     match config.mode {
-        ProxyMode::Auto => {}
+        ProxyMode::Auto => {
+            for (key, value) in auto_proxy_process_env_entries_unlocked() {
+                cmd.env(key, value);
+            }
+        }
         ProxyMode::Disabled => {
             for key in PROXY_ENV_KEYS {
                 cmd.env_remove(key);
@@ -832,7 +1009,11 @@ pub fn extend_proxy_env_map(map: &mut std::collections::HashMap<OsString, OsStri
     remove_locus_injected_proxy_entries_from_map(map);
     let config = load_proxy_config();
     match config.mode {
-        ProxyMode::Auto => {}
+        ProxyMode::Auto => {
+            for (key, value) in auto_proxy_process_env_entries_for_map_unlocked(map) {
+                map.insert(OsString::from(key), value);
+            }
+        }
         ProxyMode::Disabled => remove_proxy_env_entries_from_map(map),
         ProxyMode::Manual => {
             remove_proxy_env_entries_from_map(map);
@@ -931,6 +1112,61 @@ fn proxy_process_env_entries_unlocked(config: &ProxyConfig) -> Vec<(String, OsSt
     }
 
     entries
+}
+
+fn system_proxy_process_env_entries(
+    system: &SystemProxyConfig,
+    has_all_proxy: bool,
+    has_http_proxy: bool,
+    has_https_proxy: bool,
+) -> Vec<(String, OsString)> {
+    if !system_proxy_enabled(system) {
+        return Vec::new();
+    }
+
+    let mut entries: Vec<(String, OsString)> = Vec::new();
+    if !has_all_proxy && !has_http_proxy {
+        if let Some(value) = system_proxy_for_http(system) {
+            push_manual_proxy_env_entry(&mut entries, "HTTP_PROXY", "http_proxy", &value);
+        }
+    }
+    if !has_all_proxy && !has_https_proxy {
+        if let Some(value) = system_proxy_for_https(system) {
+            push_manual_proxy_env_entry(&mut entries, "HTTPS_PROXY", "https_proxy", &value);
+        }
+    }
+
+    if !entries.is_empty() {
+        let no_proxy = auto_no_proxy_process_value(system);
+        if !no_proxy.is_empty() {
+            entries.push(("NO_PROXY".to_string(), OsString::from(no_proxy.clone())));
+            entries.push(("no_proxy".to_string(), OsString::from(no_proxy)));
+        }
+    }
+
+    entries
+}
+
+fn auto_proxy_process_env_entries_unlocked() -> Vec<(String, OsString)> {
+    let system = read_system_proxy_config();
+    system_proxy_process_env_entries(
+        &system,
+        first_user_env_value(&["ALL_PROXY", "all_proxy"]).is_some(),
+        first_user_env_value(&["HTTP_PROXY", "http_proxy"]).is_some(),
+        first_user_env_value(&["HTTPS_PROXY", "https_proxy"]).is_some(),
+    )
+}
+
+fn auto_proxy_process_env_entries_for_map_unlocked(
+    map: &std::collections::HashMap<OsString, OsString>,
+) -> Vec<(String, OsString)> {
+    let system = read_system_proxy_config();
+    system_proxy_process_env_entries(
+        &system,
+        first_proxy_value_from_map(map, &["ALL_PROXY", "all_proxy"]).is_some(),
+        first_proxy_value_from_map(map, &["HTTP_PROXY", "http_proxy"]).is_some(),
+        first_proxy_value_from_map(map, &["HTTPS_PROXY", "https_proxy"]).is_some(),
+    )
 }
 
 fn push_manual_proxy_env_entry(
@@ -1050,7 +1286,13 @@ fn resolve_proxy_route(
     let target: Uri = url.parse().ok()?;
     let intercept = matcher.intercept(&target);
     let source = match (&intercept, mode) {
-        (Some(_), ProxyMode::Auto) => ProxyRouteSource::Environment,
+        (Some(_), ProxyMode::Auto) => {
+            if configured_proxy_env_for_target(&target).is_some() {
+                ProxyRouteSource::Environment
+            } else {
+                ProxyRouteSource::System
+            }
+        }
         (Some(_), ProxyMode::Manual) => ProxyRouteSource::Manual,
         (None, _) => ProxyRouteSource::Direct,
         (Some(_), ProxyMode::Disabled) => ProxyRouteSource::Direct,
@@ -1127,7 +1369,6 @@ fn configured_proxy_env_for_target(target_uri: &Uri) -> Option<(String, String)>
     None
 }
 
-#[cfg(test)]
 fn user_bypass_env_values() -> Vec<String> {
     ["NO_PROXY", "no_proxy"]
         .into_iter()
@@ -1152,6 +1393,19 @@ fn push_bypass_entries(entries: &mut Vec<String>, raw: &str, separators: &[char]
     }
 }
 
+fn push_windows_proxy_override_entries(entries: &mut Vec<String>, raw: &str) {
+    for entry in raw
+        .split(';')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+    {
+        if entry.eq_ignore_ascii_case("<local>") {
+            continue;
+        }
+        entries.push(entry.replace("*.", ""));
+    }
+}
+
 fn manual_no_proxy_process_value(config: &ManualProxyConfig) -> String {
     let mut entries = Vec::new();
     push_bypass_entries(&mut entries, &config.no_proxy, &[',']);
@@ -1161,8 +1415,7 @@ fn manual_no_proxy_process_value(config: &ManualProxyConfig) -> String {
     entries.join(",")
 }
 
-#[cfg(test)]
-fn no_proxy_process_value() -> String {
+fn auto_no_proxy_process_value(system: &SystemProxyConfig) -> String {
     let mut entries = Vec::new();
 
     for raw in user_bypass_env_values() {
@@ -1171,16 +1424,9 @@ fn no_proxy_process_value() -> String {
 
     push_bypass_entries(&mut entries, LOCAL_PROXY_BYPASS, &[',']);
 
-    if let Some(raw) = read_system_proxy_config().proxy_override {
-        for entry in raw
-            .split(';')
-            .map(str::trim)
-            .filter(|entry| !entry.is_empty())
-        {
-            if entry.eq_ignore_ascii_case("<local>") {
-                continue;
-            }
-            entries.push(entry.to_string());
+    if system_proxy_enabled(system) {
+        if let Some(raw) = system.proxy_override.as_deref() {
+            push_windows_proxy_override_entries(&mut entries, raw);
         }
     }
 
@@ -1189,23 +1435,50 @@ fn no_proxy_process_value() -> String {
     entries.join(",")
 }
 
+#[cfg(test)]
+fn no_proxy_process_value() -> String {
+    let system = read_system_proxy_config();
+    auto_no_proxy_process_value(&system)
+}
+
 fn sanitize_windows_proxy_server(raw: &str) -> String {
     raw.split(';')
         .map(str::trim)
         .filter(|segment| !segment.is_empty())
         .map(|segment| {
             if let Some((scheme, value)) = segment.split_once('=') {
+                let default_scheme = default_windows_proxy_value_scheme(scheme.trim());
                 format!(
                     "{}={}",
                     scheme.trim(),
-                    sanitize_proxy_display_url(value.trim())
+                    sanitize_proxy_value_with_default_scheme(value.trim(), default_scheme)
                 )
             } else {
-                sanitize_proxy_display_url(segment)
+                sanitize_proxy_value_with_default_scheme(segment, "http")
             }
         })
         .collect::<Vec<_>>()
         .join(";")
+}
+
+fn default_windows_proxy_value_scheme(entry_scheme: &str) -> &'static str {
+    match entry_scheme.to_ascii_lowercase().as_str() {
+        "socks" | "socks4" | "socks5" => "socks5",
+        _ => "http",
+    }
+}
+
+fn sanitize_proxy_value_with_default_scheme(raw: &str, default_scheme: &str) -> String {
+    let value = raw.trim();
+    if value.is_empty() {
+        return String::new();
+    }
+
+    if value.contains("://") {
+        sanitize_proxy_display_url(value)
+    } else {
+        sanitize_proxy_display_url(&format!("{}://{}", default_scheme, value))
+    }
 }
 
 fn parse_windows_proxy_server(raw: &str) -> (Option<String>, Option<String>, Option<String>) {
@@ -1223,17 +1496,31 @@ fn parse_windows_proxy_server(raw: &str) -> (Option<String>, Option<String>, Opt
             continue;
         };
         has_protocol_entries = true;
-        let sanitized = sanitize_proxy_display_url(value.trim());
         match scheme.trim().to_ascii_lowercase().as_str() {
-            "http" => http_proxy = Some(sanitized),
-            "https" => https_proxy = Some(sanitized),
-            "socks" | "socks4" | "socks5" => socks_proxy = Some(sanitized),
+            "http" => {
+                http_proxy = Some(sanitize_proxy_value_with_default_scheme(
+                    value.trim(),
+                    "http",
+                ));
+            }
+            "https" => {
+                https_proxy = Some(sanitize_proxy_value_with_default_scheme(
+                    value.trim(),
+                    "http",
+                ));
+            }
+            "socks" | "socks4" | "socks5" => {
+                socks_proxy = Some(sanitize_proxy_value_with_default_scheme(
+                    value.trim(),
+                    default_windows_proxy_value_scheme(scheme.trim()),
+                ));
+            }
             _ => {}
         }
     }
 
     if !has_protocol_entries {
-        let sanitized = sanitize_proxy_display_url(raw.trim());
+        let sanitized = sanitize_proxy_value_with_default_scheme(raw.trim(), "http");
         if !sanitized.is_empty() {
             http_proxy = Some(sanitized.clone());
             https_proxy = Some(sanitized);
@@ -1259,6 +1546,70 @@ fn authority_host(host: &str) -> String {
 
 #[cfg(windows)]
 fn read_system_proxy_config() -> SystemProxyConfig {
+    #[cfg(test)]
+    if let Some(config) = system_proxy_config_override_value() {
+        return config;
+    }
+
+    read_winhttp_current_user_ie_proxy_config()
+        .unwrap_or_else(|| read_windows_registry_proxy_config("windowsRegistryFallback"))
+}
+
+#[cfg(windows)]
+fn read_winhttp_current_user_ie_proxy_config() -> Option<SystemProxyConfig> {
+    use windows::Win32::Networking::WinHttp::{
+        WinHttpGetIEProxyConfigForCurrentUser, WINHTTP_CURRENT_USER_IE_PROXY_CONFIG,
+    };
+
+    let mut config = WINHTTP_CURRENT_USER_IE_PROXY_CONFIG::default();
+    unsafe {
+        WinHttpGetIEProxyConfigForCurrentUser(&mut config).ok()?;
+    }
+
+    let proxy_server_raw = windows_owned_pwstr_to_string(config.lpszProxy);
+    let proxy_override = windows_owned_pwstr_to_string(config.lpszProxyBypass);
+    let auto_config_url = windows_owned_pwstr_to_string(config.lpszAutoConfigUrl);
+    let (http_proxy, https_proxy, socks_proxy) = proxy_server_raw
+        .as_deref()
+        .map(parse_windows_proxy_server)
+        .unwrap_or((None, None, None));
+
+    Some(SystemProxyConfig {
+        platform: std::env::consts::OS.to_string(),
+        available: true,
+        source: "winHttpCurrentUserIE".to_string(),
+        enabled: Some(proxy_server_raw.is_some()),
+        auto_detect: Some(config.fAutoDetect.as_bool()),
+        auto_config_url,
+        proxy_server: proxy_server_raw
+            .as_deref()
+            .map(sanitize_windows_proxy_server),
+        proxy_override,
+        http_proxy,
+        https_proxy,
+        socks_proxy,
+    })
+}
+
+#[cfg(windows)]
+fn windows_owned_pwstr_to_string(value: windows::core::PWSTR) -> Option<String> {
+    use windows::Win32::Foundation::{GlobalFree, HGLOBAL};
+
+    if value.is_null() {
+        return None;
+    }
+
+    let text = unsafe { value.to_string().ok() }
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty());
+    unsafe {
+        let _ = GlobalFree(Some(HGLOBAL(value.as_ptr().cast())));
+    }
+    text
+}
+
+#[cfg(windows)]
+fn read_windows_registry_proxy_config(source: &str) -> SystemProxyConfig {
     use winreg::enums::HKEY_CURRENT_USER;
     use winreg::RegKey;
 
@@ -1271,7 +1622,7 @@ fn read_system_proxy_config() -> SystemProxyConfig {
                 return SystemProxyConfig {
                     platform,
                     available: false,
-                    source: "windowsRegistry".to_string(),
+                    source: source.to_string(),
                     enabled: None,
                     auto_detect: None,
                     auto_config_url: None,
@@ -1312,7 +1663,7 @@ fn read_system_proxy_config() -> SystemProxyConfig {
     SystemProxyConfig {
         platform,
         available: true,
-        source: "windowsRegistry".to_string(),
+        source: source.to_string(),
         enabled,
         auto_detect,
         auto_config_url,
@@ -1328,6 +1679,11 @@ fn read_system_proxy_config() -> SystemProxyConfig {
 
 #[cfg(not(windows))]
 fn read_system_proxy_config() -> SystemProxyConfig {
+    #[cfg(test)]
+    if let Some(config) = system_proxy_config_override_value() {
+        return config;
+    }
+
     SystemProxyConfig {
         platform: std::env::consts::OS.to_string(),
         available: false,
@@ -1359,6 +1715,7 @@ mod tests {
     struct TempEnvGuard {
         saved: Vec<(String, Option<OsString>)>,
         saved_config: Option<ProxyConfig>,
+        saved_system_config: Option<SystemProxyConfig>,
     }
 
     impl TempEnvGuard {
@@ -1369,6 +1726,13 @@ mod tests {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone();
             set_proxy_config_override(Some(ProxyConfig::default()));
+            let saved_system_config = system_proxy_config_override()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            set_system_proxy_config_override(Some(test_system_proxy_config(
+                false, None, None, None, None, None,
+            )));
             let saved = vars
                 .iter()
                 .map(|(key, _)| ((*key).to_string(), std::env::var_os(key)))
@@ -1382,6 +1746,7 @@ mod tests {
             Self {
                 saved,
                 saved_config,
+                saved_system_config,
             }
         }
     }
@@ -1390,12 +1755,36 @@ mod tests {
         fn drop(&mut self) {
             clear_locus_injected_proxy_env();
             set_proxy_config_override(self.saved_config.clone());
+            set_system_proxy_config_override(self.saved_system_config.clone());
             for (key, value) in self.saved.iter().rev() {
                 match value {
                     Some(value) => std::env::set_var(key, value),
                     None => std::env::remove_var(key),
                 }
             }
+        }
+    }
+
+    fn test_system_proxy_config(
+        enabled: bool,
+        proxy_server: Option<&str>,
+        http_proxy: Option<&str>,
+        https_proxy: Option<&str>,
+        socks_proxy: Option<&str>,
+        proxy_override: Option<&str>,
+    ) -> SystemProxyConfig {
+        SystemProxyConfig {
+            platform: std::env::consts::OS.to_string(),
+            available: true,
+            source: "test".to_string(),
+            enabled: Some(enabled),
+            auto_detect: Some(false),
+            auto_config_url: None,
+            proxy_server: proxy_server.map(str::to_string),
+            proxy_override: proxy_override.map(str::to_string),
+            http_proxy: http_proxy.map(str::to_string),
+            https_proxy: https_proxy.map(str::to_string),
+            socks_proxy: socks_proxy.map(str::to_string),
         }
     }
 
@@ -1431,6 +1820,26 @@ mod tests {
     }
 
     #[test]
+    fn parse_windows_proxy_server_defaults_single_value_to_http_proxy() {
+        let (http_proxy, https_proxy, socks_proxy) = parse_windows_proxy_server("127.0.0.1:7890");
+
+        assert_eq!(http_proxy.as_deref(), Some("http://127.0.0.1:7890"));
+        assert_eq!(https_proxy.as_deref(), Some("http://127.0.0.1:7890"));
+        assert_eq!(socks_proxy, None);
+    }
+
+    #[test]
+    fn parse_windows_proxy_server_preserves_protocol_specific_entries() {
+        let (http_proxy, https_proxy, socks_proxy) = parse_windows_proxy_server(
+            "http=127.0.0.1:7890;https=127.0.0.1:7891;socks=127.0.0.1:1080",
+        );
+
+        assert_eq!(http_proxy.as_deref(), Some("http://127.0.0.1:7890"));
+        assert_eq!(https_proxy.as_deref(), Some("http://127.0.0.1:7891"));
+        assert_eq!(socks_proxy.as_deref(), Some("socks5://127.0.0.1:1080"));
+    }
+
+    #[test]
     fn configured_proxy_env_ignores_locus_injected_values() {
         let _lock = env_test_lock();
         let _guard = TempEnvGuard::set(&[
@@ -1449,6 +1858,132 @@ mod tests {
 
         assert_eq!(configured_proxy_env_for_target(&target), None);
         assert!(!has_configured_proxy_env());
+    }
+
+    #[test]
+    fn auto_proxy_mode_uses_system_proxy_when_environment_is_empty() {
+        let _lock = env_test_lock();
+        let _guard = TempEnvGuard::set(&[
+            ("HTTP_PROXY", None),
+            ("http_proxy", None),
+            ("HTTPS_PROXY", None),
+            ("https_proxy", None),
+            ("ALL_PROXY", None),
+            ("all_proxy", None),
+            ("NO_PROXY", None),
+            ("no_proxy", None),
+        ]);
+        set_system_proxy_config_override(Some(test_system_proxy_config(
+            true,
+            Some("http://127.0.0.1:7890"),
+            Some("http://127.0.0.1:7890"),
+            Some("http://127.0.0.1:7890"),
+            None,
+            Some("localhost;127.*;<local>"),
+        )));
+
+        let status = get_proxy_status();
+        let https_route = status
+            .routes
+            .iter()
+            .find(|route| route.target_label == "HTTPS")
+            .expect("https route");
+        assert_eq!(https_route.source, ProxyRouteSource::System);
+        assert_eq!(
+            https_route.proxy_url.as_deref(),
+            Some("http://127.0.0.1:7890")
+        );
+
+        let (route, scoped_proxy) = with_proxy_env_for_url("https://api.openai.com/", |_| {
+            (
+                std::env::var("HTTPS_PROXY").ok(),
+                std::env::var("NO_PROXY").ok(),
+            )
+        })
+        .expect("proxy scope");
+
+        assert_eq!(route.proxy_state, "system");
+        assert_eq!(route.proxy_env_key.as_deref(), Some("HTTPS_PROXY"));
+        assert_eq!(route.proxy_url.as_deref(), Some("http://127.0.0.1:7890"));
+        assert_eq!(scoped_proxy.0.as_deref(), Some("http://127.0.0.1:7890"));
+        assert!(scoped_proxy
+            .1
+            .as_deref()
+            .unwrap_or_default()
+            .split(',')
+            .any(|entry| entry == "localhost"));
+        assert_eq!(std::env::var("HTTPS_PROXY").ok(), None);
+    }
+
+    #[test]
+    fn auto_proxy_mode_prefers_environment_proxy_over_system_proxy() {
+        let _lock = env_test_lock();
+        let _guard = TempEnvGuard::set(&[
+            ("HTTP_PROXY", None),
+            ("http_proxy", None),
+            ("https_proxy", None),
+            ("HTTPS_PROXY", Some("http://127.0.0.1:65501")),
+            ("ALL_PROXY", None),
+            ("all_proxy", None),
+            ("NO_PROXY", None),
+            ("no_proxy", None),
+        ]);
+        set_system_proxy_config_override(Some(test_system_proxy_config(
+            true,
+            Some("http://127.0.0.1:7890"),
+            Some("http://127.0.0.1:7890"),
+            Some("http://127.0.0.1:7890"),
+            None,
+            None,
+        )));
+
+        let (route, scoped_proxy) = with_proxy_env_for_url("https://api.openai.com/", |_| {
+            std::env::var("HTTPS_PROXY").ok()
+        })
+        .expect("proxy scope");
+
+        assert_eq!(route.proxy_state, "environment");
+        assert_eq!(route.proxy_env_key.as_deref(), Some("HTTPS_PROXY"));
+        assert_eq!(route.proxy_url.as_deref(), Some("http://127.0.0.1:65501"));
+        assert_eq!(scoped_proxy.as_deref(), Some("http://127.0.0.1:65501"));
+    }
+
+    #[test]
+    fn extend_proxy_env_map_adds_system_proxy_for_auto_mode() {
+        let _lock = env_test_lock();
+        let _guard = TempEnvGuard::set(&[
+            ("HTTP_PROXY", None),
+            ("http_proxy", None),
+            ("HTTPS_PROXY", None),
+            ("https_proxy", None),
+            ("ALL_PROXY", None),
+            ("all_proxy", None),
+            ("NO_PROXY", None),
+            ("no_proxy", None),
+        ]);
+        set_system_proxy_config_override(Some(test_system_proxy_config(
+            true,
+            Some("http://127.0.0.1:7890"),
+            Some("http://127.0.0.1:7890"),
+            Some("http://127.0.0.1:7890"),
+            None,
+            Some("corp.local;<local>"),
+        )));
+        let mut envs: HashMap<OsString, OsString> = HashMap::new();
+
+        extend_proxy_env_map(&mut envs);
+
+        assert_eq!(
+            envs.get(&OsString::from("HTTPS_PROXY"))
+                .and_then(|value| value.to_str()),
+            Some("http://127.0.0.1:7890")
+        );
+        assert!(envs
+            .get(&OsString::from("NO_PROXY"))
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .split(',')
+            .any(|entry| entry == "corp.local"));
     }
 
     #[test]
