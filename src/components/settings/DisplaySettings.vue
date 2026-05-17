@@ -220,6 +220,19 @@ onMounted(async () => {
       :class="{ disabled: systemNotificationOptionsDisabled }"
     >
       <BaseSwitch
+        :model-value="display.notifyOnSubagentDone"
+        :disabled="systemNotificationOptionsDisabled"
+        :aria-label="t('settings.display.notifyOnSubagentDone')"
+        @update:model-value="setDisplay('notifyOnSubagentDone', $event)"
+      />
+      <span>{{ t("settings.display.notifyOnSubagentDone") }}</span>
+    </div>
+
+    <div
+      class="toggle-row"
+      :class="{ disabled: systemNotificationOptionsDisabled }"
+    >
+      <BaseSwitch
         :model-value="display.notifyOnAskUser"
         :disabled="systemNotificationOptionsDisabled"
         :aria-label="t('settings.display.notifyOnAskUser')"

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
+import { save } from "@tauri-apps/plugin-dialog";
 import { t } from "../../i18n";
 import BaseButton from "../ui/BaseButton.vue";
 import BaseSegmented from "../ui/BaseSegmented.vue";
@@ -13,6 +14,7 @@ import {
   getDebugConsoleSnapshot,
   initDebugConsole,
   refreshDebugConsole,
+  saveDebugConsoleLogExport,
   subscribeDebugConsole,
 } from "../../services/debugConsole";
 import type { DebugConsoleEntry } from "../../types";
@@ -50,6 +52,7 @@ const notificationStore = useNotificationStore();
 const entries = ref<DebugConsoleEntry[]>(getDebugConsoleSnapshot());
 const debugEnabled = ref(false);
 const autoScroll = ref(true);
+const isExporting = ref(false);
 const levelFilter = ref<LevelFilter>("all");
 const sourceFilter = ref<SourceFilter>("all");
 const searchQuery = ref("");
@@ -181,6 +184,17 @@ function formatTime(timestampMs: number): string {
   const minutes = String(date.getMinutes()).padStart(2, "0");
   const seconds = String(date.getSeconds()).padStart(2, "0");
   return `${hours}:${minutes}:${seconds}`;
+}
+
+function defaultExportFileName(): string {
+  const date = new Date();
+  const year = String(date.getFullYear());
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  const hours = String(date.getHours()).padStart(2, "0");
+  const minutes = String(date.getMinutes()).padStart(2, "0");
+  const seconds = String(date.getSeconds()).padStart(2, "0");
+  return `locus-console-${year}${month}${day}-${hours}${minutes}${seconds}.log`;
 }
 
 function escapeRegExp(value: string): string {
@@ -333,6 +347,34 @@ async function clearAll() {
   }
 }
 
+async function exportLogs() {
+  const snapshot = entries.value.slice();
+  if (snapshot.length === 0 || isExporting.value) return;
+
+  try {
+    isExporting.value = true;
+    const filePath = await save({
+      defaultPath: defaultExportFileName(),
+      filters: [{ name: "Log", extensions: ["log"] }],
+    });
+    if (!filePath) return;
+
+    const savedPath = await saveDebugConsoleLogExport(filePath, snapshot);
+    notificationStore.addNotice("success", t("settings.console.exported", savedPath), {
+      operation: "exportDebugConsole",
+      skipConsoleLog: true,
+    });
+  } catch (error) {
+    const normalized = normalizeAppError(error);
+    notificationStore.addNotice("error", t("settings.console.exportFailed", normalized.message), {
+      code: normalized.code,
+      operation: "exportDebugConsole",
+    });
+  } finally {
+    isExporting.value = false;
+  }
+}
+
 let unsubscribe: (() => void) | null = null;
 
 onMounted(async () => {
@@ -393,6 +435,14 @@ watch(
         />
         <BaseButton class="console-action" size="sm" @click="refreshAll">
           {{ t("common.refresh") }}
+        </BaseButton>
+        <BaseButton
+          class="console-action"
+          size="sm"
+          :disabled="entries.length === 0 || isExporting"
+          @click="exportLogs"
+        >
+          {{ isExporting ? t("settings.console.exporting") : t("settings.console.export") }}
         </BaseButton>
         <BaseButton class="console-action" size="sm" @click="clearAll">
           {{ t("settings.console.clear") }}

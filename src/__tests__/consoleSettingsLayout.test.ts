@@ -78,6 +78,36 @@ describe("ConsoleSettings layout", () => {
     expect(source).toMatch(/\.console-search-hit\s*\{[\s\S]*color:\s*inherit;/);
   });
 
+  it("adds a log export action with a .log save dialog", () => {
+    const source = read("src/components/settings/ConsoleSettings.vue");
+    const service = read("src/services/debugConsole.ts");
+    const rustCommand = read("src-tauri/src/commands/log.rs");
+    const rustLib = read("src-tauri/src/lib.rs");
+    const zh = read("src/language/zh.json");
+    const en = read("src/language/en.json");
+
+    expect(source).toContain('import { save } from "@tauri-apps/plugin-dialog"');
+    expect(source).toContain("const isExporting = ref(false)");
+    expect(source).toContain("function defaultExportFileName(): string");
+    expect(source).toContain("return `locus-console-${year}${month}${day}-${hours}${minutes}${seconds}.log`");
+    expect(source).toContain("async function exportLogs()");
+    expect(source).toContain("filters: [{ name: \"Log\", extensions: [\"log\"] }]");
+    expect(source).toContain("saveDebugConsoleLogExport(filePath, snapshot)");
+    expect(source).toContain(':disabled="entries.length === 0 || isExporting"');
+    expect(source).toContain('t("settings.console.export")');
+    expect(service).toContain("export function formatDebugConsoleEntriesForLogExport");
+    expect(service).toContain("export async function saveDebugConsoleLogExport");
+    expect(service).toContain('invoke<string>("save_log_export"');
+    expect(rustCommand).toContain("pub async fn save_log_export");
+    expect(rustCommand).toContain("path.set_extension(\"log\")");
+    expect(rustCommand).toContain("std::fs::write(&path, content.as_bytes())");
+    expect(rustLib).toContain("commands::save_log_export");
+    expect(zh).toContain('"settings.console.export": "导出日志"');
+    expect(zh).toContain('"settings.console.exported": "已导出日志: {0}"');
+    expect(en).toContain('"settings.console.export": "Export Logs"');
+    expect(en).toContain('"settings.console.exported": "Exported logs: {0}"');
+  });
+
   it("formats timestamps to seconds instead of milliseconds", () => {
     const source = read("src/components/settings/ConsoleSettings.vue");
 

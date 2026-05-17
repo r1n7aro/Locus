@@ -30,6 +30,8 @@ export interface DisplaySettings {
   systemNotificationsEnabled: boolean;
   /** Notify when a chat run completes */
   notifyOnChatDone: boolean;
+  /** Notify when a subagent run completes */
+  notifyOnSubagentDone: boolean;
   /** Notify when the agent asks the user a question */
   notifyOnAskUser: boolean;
   /** Notify when a chat run fails */
@@ -63,6 +65,7 @@ const defaults: DisplaySettings = {
   hideGitCommandSuggestions: false,
   systemNotificationsEnabled: true,
   notifyOnChatDone: true,
+  notifyOnSubagentDone: false,
   notifyOnAskUser: true,
   notifyOnChatError: true,
   notifyOnToolConfirm: true,

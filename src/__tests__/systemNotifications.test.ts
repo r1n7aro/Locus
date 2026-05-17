@@ -7,6 +7,7 @@ import {
 
 const translations = {
   "notifications.chatDoneTitle": "对话已完成",
+  "notifications.subagentDoneTitle": "Subagent 已完成",
   "notifications.askUserTitle": "需要你的输入",
   "notifications.chatErrorTitle": "对话出错",
   "notifications.toolConfirmTitle": "需要确认",
@@ -34,6 +35,7 @@ function createDisplayState(): DisplaySettings {
     hideGitCommandSuggestions: false,
     systemNotificationsEnabled: true,
     notifyOnChatDone: true,
+    notifyOnSubagentDone: false,
     notifyOnAskUser: true,
     notifyOnChatError: true,
     notifyOnToolConfirm: true,
@@ -104,6 +106,7 @@ describe("systemNotifications", () => {
     displayState.hideGitCommandSuggestions = false;
     displayState.systemNotificationsEnabled = true;
     displayState.notifyOnChatDone = true;
+    displayState.notifyOnSubagentDone = false;
     displayState.notifyOnAskUser = true;
     displayState.notifyOnChatError = true;
     displayState.notifyOnToolConfirm = true;
@@ -129,6 +132,41 @@ describe("systemNotifications", () => {
     expect(systemMocks.sendSystemNotification).toHaveBeenCalledWith(
       "对话已完成",
       "登录修复\n已完成输出",
+    );
+  });
+
+  it("skips subagent completion notifications by default", async () => {
+    await maybeNotifyStreamEvent(
+      {
+        type: "done",
+        runId: "run-subagent-1",
+        sessionId: "session-child-1",
+        messageId: "message-subagent-1",
+        fullText: "子任务已完成",
+      },
+      { sessionTitle: "代码检索", isSubagent: true },
+    );
+
+    expect(systemMocks.sendSystemNotification).not.toHaveBeenCalled();
+  });
+
+  it("sends subagent completion notifications when enabled", async () => {
+    displayState.notifyOnSubagentDone = true;
+
+    await maybeNotifyStreamEvent(
+      {
+        type: "done",
+        runId: "run-subagent-2",
+        sessionId: "session-child-2",
+        messageId: "message-subagent-2",
+        fullText: "子任务已完成",
+      },
+      { sessionTitle: "代码检索", isSubagent: true },
+    );
+
+    expect(systemMocks.sendSystemNotification).toHaveBeenCalledWith(
+      "Subagent 已完成",
+      "代码检索\n子任务已完成",
     );
   });
 

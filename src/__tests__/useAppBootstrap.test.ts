@@ -477,6 +477,35 @@ describe("useAppBootstrap onboarding completion", () => {
     );
 
     maybeNotifyStreamEventMock.mockClear();
+    chatStoreMock.sessions = [
+      { id: "session-1", title: "Session A" },
+      {
+        id: "session-child-1",
+        title: "Explorer",
+        parentSessionId: "session-1",
+      },
+    ];
+
+    streamHandler?.({
+      payload: {
+        type: "done",
+        runId: "run-child-1",
+        sessionId: "session-child-1",
+        messageId: "message-child-1",
+        fullText: "Child response",
+      },
+    });
+
+    expect(maybeNotifyStreamEventMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "done",
+        runId: "run-child-1",
+        sessionId: "session-child-1",
+      }),
+      { sessionTitle: "Explorer", isSubagent: true },
+    );
+
+    maybeNotifyStreamEventMock.mockClear();
     chatStoreMock.handleStreamEvent.mockReturnValue(false);
 
     streamHandler?.({

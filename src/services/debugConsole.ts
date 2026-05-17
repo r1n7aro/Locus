@@ -40,6 +40,46 @@ function trimEntries() {
   }
 }
 
+function normalizeExportMessage(message: string): string {
+  return message.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+}
+
+function formatExportEntry(entry: DebugConsoleEntry): string {
+  const timestamp = new Date(entry.timestampMs).toISOString();
+  const prefix = `[${timestamp}] [${entry.level.toUpperCase()}] [${entry.source}] [${entry.module}]`;
+  const messageLines = normalizeExportMessage(entry.message).split("\n");
+  const [firstLine = "", ...restLines] = messageLines;
+  const continuation = restLines.map((line) => `    ${line}`);
+  return [`${prefix} ${firstLine}`, ...continuation].join("\n");
+}
+
+export function formatDebugConsoleEntriesForLogExport(
+  logEntries: readonly DebugConsoleEntry[],
+  exportedAt = new Date(),
+): string {
+  const sortedEntries = logEntries
+    .map((entry, index) => ({ entry, index }))
+    .sort((left, right) =>
+      left.entry.timestampMs - right.entry.timestampMs || left.index - right.index,
+    )
+    .map(({ entry }) => entry);
+  const header = [
+    "# Locus Console Log Export",
+    `# Exported At: ${exportedAt.toISOString()}`,
+    `# Entries: ${sortedEntries.length}`,
+  ].join("\n");
+  const body = sortedEntries.map(formatExportEntry).join("\n");
+  return body ? `${header}\n\n${body}\n` : `${header}\n`;
+}
+
+export async function saveDebugConsoleLogExport(
+  filePath: string,
+  logEntries: readonly DebugConsoleEntry[],
+): Promise<string> {
+  const content = formatDebugConsoleEntriesForLogExport(logEntries);
+  return invoke<string>("save_log_export", { filePath, content });
+}
+
 function pushEntries(batch: DebugConsoleEntry[]) {
   let changed = false;
   for (const entry of batch) {

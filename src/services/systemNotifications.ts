@@ -11,6 +11,7 @@ import type { StreamEvent, ToolConfirmDisplay } from "../types";
 
 interface StreamNotificationContext {
   sessionTitle?: string | null;
+  isSubagent?: boolean;
 }
 
 type NotifiableStreamEvent = Extract<
@@ -151,13 +152,13 @@ async function ensureNotificationPermission(): Promise<boolean> {
   }
 }
 
-function isEventEnabled(event: NotifiableStreamEvent): boolean {
+function isEventEnabled(event: NotifiableStreamEvent, context: StreamNotificationContext): boolean {
   const { state } = useDisplaySettings();
   if (!state.systemNotificationsEnabled) return false;
 
   switch (event.type) {
     case "done":
-      return state.notifyOnChatDone;
+      return context.isSubagent ? state.notifyOnSubagentDone : state.notifyOnChatDone;
     case "askUser":
       return state.notifyOnAskUser;
     case "error":
@@ -178,7 +179,7 @@ export async function maybeNotifyStreamEvent(
   context: StreamNotificationContext = {},
 ) {
   if (!isNotifiableStreamEvent(event)) return;
-  if (!isEventEnabled(event)) return;
+  if (!isEventEnabled(event, context)) return;
 
   const notificationKey = getNotificationKey(event);
   if (recentNotificationKeys.has(notificationKey)) return;
@@ -189,7 +190,7 @@ export async function maybeNotifyStreamEvent(
   switch (event.type) {
     case "done":
       await buildNotificationMessage(
-        t("notifications.chatDoneTitle"),
+        t(context.isSubagent ? "notifications.subagentDoneTitle" : "notifications.chatDoneTitle"),
         summarizeText(event.fullText) || t("notifications.chatDoneFallback"),
         context,
       );

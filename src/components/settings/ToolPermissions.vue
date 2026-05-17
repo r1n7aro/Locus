@@ -1,6 +1,5 @@
 <script setup lang="ts">
 import { t } from "../../i18n";
-import BaseCheckbox from "../ui/BaseCheckbox.vue";
 import BaseSegmented from "../ui/BaseSegmented.vue";
 
 type ToolMode = "auto" | "ask";
@@ -34,10 +33,6 @@ function getToolMode(name: string): ToolMode {
   const item = [...props.toolList, ...props.behaviorList].find((entry) => entry.name === name);
   return props.toolPermissions[name] ?? (item?.defaultMode ?? "ask");
 }
-
-function setRequiresApproval(name: string, value: boolean) {
-  emit("setPermission", name, value ? "ask" : "auto");
-}
 </script>
 
 <template>
@@ -69,7 +64,7 @@ function setRequiresApproval(name: string, value: boolean) {
 
         <div class="perm-table-head perm-behavior-head" aria-hidden="true">
           <span>{{ t("settings.perms.columnBehavior") }}</span>
-          <span>{{ t("settings.perms.columnApproval") }}</span>
+          <span>{{ t("settings.perms.columnMode") }}</span>
         </div>
 
         <div class="perm-list">
@@ -83,11 +78,12 @@ function setRequiresApproval(name: string, value: boolean) {
               <span class="perm-desc">{{ behavior.desc }}</span>
             </div>
 
-            <div class="perm-checkbox-control">
-              <BaseCheckbox
-                :model-value="getToolMode(behavior.name) === 'ask'"
-                :aria-label="behavior.label"
-                @update:model-value="setRequiresApproval(behavior.name, $event)"
+            <div class="perm-control">
+              <BaseSegmented
+                size="sm"
+                :model-value="getToolMode(behavior.name)"
+                :options="[...permissionOptions]"
+                @update:model-value="emit('setPermission', behavior.name, $event as ToolMode)"
               />
             </div>
           </div>
@@ -322,12 +318,6 @@ function setRequiresApproval(name: string, value: boolean) {
   justify-content: center;
 }
 
-.perm-checkbox-control {
-  display: flex;
-  justify-content: flex-end;
-  min-width: 96px;
-}
-
 @media (max-width: 860px) {
   .perm-header {
     padding-right: 0;
@@ -358,11 +348,6 @@ function setRequiresApproval(name: string, value: boolean) {
 
   .perm-control {
     width: 100%;
-  }
-
-  .perm-checkbox-control {
-    justify-content: flex-start;
-    min-width: 0;
   }
 }
 </style>

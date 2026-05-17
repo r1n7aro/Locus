@@ -127,6 +127,32 @@ describe("display settings transcript alignment", () => {
     expect(en).toContain('"settings.display.hideGitCommandSuggestions": "Hide Git command suggestions"');
   });
 
+  it("adds a subagent completion notification toggle that defaults to off", () => {
+    const displaySettings = read("src/composables/useDisplaySettings.ts");
+    const displayPanel = read("src/components/settings/DisplaySettings.vue");
+    const notifications = read("src/services/systemNotifications.ts");
+    const bootstrap = read("src/composables/useAppBootstrap.ts");
+    const zh = read("src/language/zh.json");
+    const en = read("src/language/en.json");
+
+    expect(displaySettings).toContain("notifyOnSubagentDone: boolean;");
+    expect(displaySettings).toContain("notifyOnSubagentDone: false,");
+
+    expect(displayPanel).toContain(":model-value=\"display.notifyOnSubagentDone\"");
+    expect(displayPanel).toContain(":aria-label=\"t('settings.display.notifyOnSubagentDone')\"");
+    expect(displayPanel).toContain("@update:model-value=\"setDisplay('notifyOnSubagentDone', $event)\"");
+    expect(displayPanel).toContain("{{ t(\"settings.display.notifyOnSubagentDone\") }}");
+
+    expect(notifications).toContain("context.isSubagent ? state.notifyOnSubagentDone : state.notifyOnChatDone");
+    expect(notifications).toContain('context.isSubagent ? "notifications.subagentDoneTitle" : "notifications.chatDoneTitle"');
+    expect(bootstrap).toContain("...(session?.parentSessionId ? { isSubagent: true } : {})");
+
+    expect(zh).toContain('"settings.display.notifyOnSubagentDone": "Subagent 完成时通知"');
+    expect(zh).toContain('"notifications.subagentDoneTitle": "Subagent 已完成"');
+    expect(en).toContain('"settings.display.notifyOnSubagentDone": "Notify when a Sub-agent completes"');
+    expect(en).toContain('"notifications.subagentDoneTitle": "Sub-agent complete"');
+  });
+
   it("adds file diff review target settings that default to the current window", () => {
     const displaySettings = read("src/composables/useDisplaySettings.ts");
     const displayPanel = read("src/components/settings/DisplaySettings.vue");

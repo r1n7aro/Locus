@@ -428,9 +428,12 @@ export function useAppBootstrap() {
       const handled = chatStore.handleStreamEvent(payload);
       if (!handled) return;
 
-      const sessionTitle =
-        chatStore.sessions.find((session) => session.id === payload.sessionId)?.title ?? null;
-      void maybeNotifyStreamEvent(payload, { sessionTitle });
+      const session = chatStore.sessions.find((item) => item.id === payload.sessionId);
+      const notificationContext = {
+        sessionTitle: session?.title ?? null,
+        ...(session?.parentSessionId ? { isSubagent: true } : {}),
+      };
+      void maybeNotifyStreamEvent(payload, notificationContext);
     });
     unlistenActiveSessionSelection = await runtime.subscribe<ActiveSessionSelectionChanged>(
       "active-session-selection-changed",
