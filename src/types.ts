@@ -102,6 +102,7 @@ export interface UserIntentMeta {
   kind: "user_intent_v1";
   mode: "build" | "plan";
   skills: SkillIntentItem[];
+  clientMessageId?: string;
 }
 
 export interface ChatComposerSendPayload {
@@ -341,6 +342,59 @@ export interface GitRuntimeState {
   missingSelected: boolean;
 }
 
+export type ProxyMode = "auto" | "manual" | "disabled";
+export type ProxyEnvironmentEntryKind = "proxy" | "bypass";
+export type ProxyRouteSource = "system" | "environment" | "manual" | "direct";
+
+export interface ProxyEnvironmentEntry {
+  key: string;
+  value: string;
+  kind: ProxyEnvironmentEntryKind;
+}
+
+export interface SystemProxyConfig {
+  platform: string;
+  available: boolean;
+  source: string;
+  enabled?: boolean | null;
+  autoDetect?: boolean | null;
+  autoConfigUrl?: string | null;
+  proxyServer?: string | null;
+  proxyOverride?: string | null;
+  httpProxy?: string | null;
+  httpsProxy?: string | null;
+  socksProxy?: string | null;
+}
+
+export interface ManualProxyConfig {
+  httpProxy: string;
+  httpsProxy: string;
+  allProxy: string;
+  noProxy: string;
+}
+
+export interface ProxyConfig {
+  mode: ProxyMode;
+  manual: ManualProxyConfig;
+}
+
+export interface ProxyRoute {
+  targetLabel: string;
+  targetUrl: string;
+  proxyUrl?: string | null;
+  source: ProxyRouteSource;
+}
+
+export interface ProxyStatus {
+  mode: ProxyMode;
+  config: ProxyConfig;
+  environment: ProxyEnvironmentEntry[];
+  /** Backward-compatible alias for older backend status payloads. Prefer environment. */
+  manual: ProxyEnvironmentEntry[];
+  system: SystemProxyConfig;
+  routes: ProxyRoute[];
+}
+
 export interface AuthUrlInfo {
   url: string;
 }
@@ -355,6 +409,18 @@ export interface AppUpdateDownloadChannel {
   url: string;
 }
 
+export interface AppUpdateInstallerDownload {
+  id: string;
+  label: string;
+  url: string;
+  platform: string;
+  arch: string;
+  includesManagedPython: boolean;
+  includesManagedGit: boolean;
+  requiresSystemPython: boolean;
+  requiresSystemGit: boolean;
+}
+
 export interface AppUpdateLocaleEntry {
   title: string;
   summary: string;
@@ -367,6 +433,7 @@ export interface AppUpdateManifest {
   version: string;
   releasedAt: string;
   channel: string;
+  installers?: AppUpdateInstallerDownload[];
   locales: Record<string, AppUpdateLocaleEntry>;
 }
 
@@ -386,7 +453,10 @@ export interface AppUpdateInfo {
   title: string;
   summary: string;
   changelogUrl: string;
+  downloadUrl: string;
+  downloadLabel: string;
   changes: AppUpdateChangeGroup[];
+  installer?: AppUpdateInstallerDownload | null;
   sourceKind: AppUpdateSourceKind;
   sourceBaseUrl: string;
 }
@@ -836,7 +906,12 @@ export interface KnowledgeExternalDirectoryBinding {
   externalSources: KnowledgeExternalSource[];
 }
 
-export type KnowledgeSearchMatchKind = "lexical" | "semantic" | "hybrid";
+export type KnowledgeSearchMatchKind =
+  | "lexical"
+  | "semantic"
+  | "hybrid"
+  | "grep"
+  | "grepHybrid";
 export type KnowledgeSearchMatchSection =
   | "summary"
   | "body"

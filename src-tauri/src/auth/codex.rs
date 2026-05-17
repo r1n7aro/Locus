@@ -297,7 +297,7 @@ impl CodexAuthState {
     }
 
     pub async fn start_login(&self) -> Result<CodexLoginInfo, String> {
-        let client = reqwest::Client::new();
+        let client = crate::network::default_reqwest_client()?;
         let url = format!("{}/api/accounts/deviceauth/usercode", ISSUER);
 
         let resp = client
@@ -342,7 +342,7 @@ impl CodexAuthState {
             return Ok(CodexPollResult::Success);
         }
 
-        let client = reqwest::Client::new();
+        let client = crate::network::default_reqwest_client()?;
         let url = format!("{}/api/accounts/deviceauth/token", ISSUER);
 
         let resp = client
@@ -385,7 +385,7 @@ impl CodexAuthState {
             return Ok(CodexPollResult::Success);
         }
 
-        let client = reqwest::Client::new();
+        let client = crate::network::default_reqwest_client()?;
 
         let params = [
             ("grant_type", "authorization_code"),
@@ -440,7 +440,7 @@ impl CodexAuthState {
             .map(|t| t.refresh_token.clone())
             .ok_or("No refresh token")?;
 
-        let client = reqwest::Client::new();
+        let client = crate::network::default_reqwest_client()?;
         let params = [
             ("grant_type", "refresh_token"),
             ("refresh_token", &refresh_token),

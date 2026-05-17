@@ -1073,13 +1073,14 @@ pub async fn save_custom_endpoints(
 
 #[tauri::command]
 pub async fn test_custom_endpoint(endpoint: CustomEndpoint) -> Result<String, AppError> {
-    let client = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(15))
-        .timeout(std::time::Duration::from_secs(30))
-        .gzip(true)
-        .deflate(true)
-        .build()
-        .map_err(|e| format!("HTTP client error: {}", e))?;
+    let client = crate::network::reqwest_client(
+        crate::network::ReqwestClientOptions::new()
+            .connect_timeout(std::time::Duration::from_secs(15))
+            .timeout(std::time::Duration::from_secs(30))
+            .gzip(true)
+            .deflate(true),
+    )
+    .map_err(|e| format!("HTTP client error: {}", e))?;
 
     match endpoint.api_format {
         ApiFormat::OpenaiChat => {
@@ -1284,7 +1285,7 @@ pub async fn set_debug_mode(
 pub async fn get_tool_permission_mode(
     mode: State<'_, crate::ToolPermissionMode>,
 ) -> Result<String, AppError> {
-    Ok(mode.read().await.clone())
+    Ok(mode.0.read().await.clone())
 }
 
 fn normalize_tool_permission_mode_request(value: Option<&str>, mode: Option<&str>) -> &'static str {
@@ -1306,7 +1307,7 @@ pub async fn save_tool_permission_mode(
     // Accept both `value` and the legacy `mode` argument to keep older frontends working.
     let normalized =
         normalize_tool_permission_mode_request(value.as_deref(), mode.as_deref()).to_string();
-    *mode_state.write().await = normalized.clone();
+    *mode_state.0.write().await = normalized.clone();
     let data_dir = super::resolve_runtime_storage_dir(&app_handle)
         .map_err(|e| format!("Failed to get data dir: {}", e))?;
     let path = data_dir.join("tool_permission_mode.txt");
@@ -1319,7 +1320,7 @@ pub async fn save_tool_permission_mode(
 pub async fn get_tool_permissions(
     perms: State<'_, crate::ToolPermissions>,
 ) -> Result<std::collections::HashMap<String, String>, AppError> {
-    Ok(perms.read().await.clone())
+    Ok(perms.0.read().await.clone())
 }
 
 #[tauri::command]
@@ -1335,7 +1336,7 @@ pub async fn save_tool_permissions(
             (k, mode)
         })
         .collect();
-    *perms.write().await = normalized.clone();
+    *perms.0.write().await = normalized.clone();
     let data_dir = super::resolve_runtime_storage_dir(&app_handle)
         .map_err(|e| format!("Failed to get data dir: {}", e))?;
     let path = data_dir.join("tool_permissions.json");
@@ -2210,8 +2211,8 @@ pub async fn reset_all_config(
     knowledge_index_state
         .rebuild(&no_workspace_library_dir, &data_dir)
         .await?;
-    *mode.write().await = "auto".to_string();
-    *perms.write().await = std::collections::HashMap::new();
+    *mode.0.write().await = "auto".to_string();
+    *perms.0.write().await = std::collections::HashMap::new();
     *api_key_state.write().await = String::new();
     *provider_keys.write().await = std::collections::HashMap::new();
     auth.lock().await.logout();

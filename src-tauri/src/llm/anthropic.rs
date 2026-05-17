@@ -212,17 +212,17 @@ where
     G: Fn(String) + Send + 'static,
     H: Fn(String, String) + Send + 'static,
 {
-    let client = reqwest::Client::builder()
-        .tcp_keepalive(std::time::Duration::from_secs(15))
-        .tcp_nodelay(true)
-        .connect_timeout(std::time::Duration::from_secs(30))
-        .pool_idle_timeout(std::time::Duration::from_secs(60))
-        .pool_max_idle_per_host(1)
-        .http2_adaptive_window(true)
-        .http2_keep_alive_interval(std::time::Duration::from_secs(20))
-        .http2_keep_alive_timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+    let client = crate::network::reqwest_client(
+        crate::network::ReqwestClientOptions::new()
+            .tcp_keepalive(std::time::Duration::from_secs(15))
+            .tcp_nodelay(true)
+            .connect_timeout(std::time::Duration::from_secs(30))
+            .pool_idle_timeout(std::time::Duration::from_secs(60))
+            .pool_max_idle_per_host(1)
+            .http2_adaptive_window(true)
+            .http2_keep_alive_interval(std::time::Duration::from_secs(20))
+            .http2_keep_alive_timeout(std::time::Duration::from_secs(15)),
+    )?;
 
     let model = model.strip_prefix("anthropic/").unwrap_or(model);
     let mut effective_model = normalize_anthropic_model(model).to_string();
@@ -452,17 +452,17 @@ where
     G: Fn(String) + Send + 'static,
     H: Fn(String, String) + Send + 'static,
 {
-    let client = reqwest::Client::builder()
-        .tcp_keepalive(std::time::Duration::from_secs(15))
-        .tcp_nodelay(true)
-        .connect_timeout(std::time::Duration::from_secs(30))
-        .pool_idle_timeout(std::time::Duration::from_secs(60))
-        .pool_max_idle_per_host(1)
-        .http2_adaptive_window(true)
-        .http2_keep_alive_interval(std::time::Duration::from_secs(20))
-        .http2_keep_alive_timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+    let client = crate::network::reqwest_client(
+        crate::network::ReqwestClientOptions::new()
+            .tcp_keepalive(std::time::Duration::from_secs(15))
+            .tcp_nodelay(true)
+            .connect_timeout(std::time::Duration::from_secs(30))
+            .pool_idle_timeout(std::time::Duration::from_secs(60))
+            .pool_max_idle_per_host(1)
+            .http2_adaptive_window(true)
+            .http2_keep_alive_interval(std::time::Duration::from_secs(20))
+            .http2_keep_alive_timeout(std::time::Duration::from_secs(15)),
+    )?;
 
     let messages = build_anthropic_messages(
         history,

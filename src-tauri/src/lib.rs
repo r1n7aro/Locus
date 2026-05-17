@@ -26,6 +26,7 @@ pub mod knowledge_store;
 mod knowledge_watcher;
 mod llm;
 pub(crate) mod merge;
+pub mod network;
 pub mod process_util;
 pub mod prompt;
 pub mod python_runtime;
@@ -134,9 +135,23 @@ pub type KnowledgeProposalDraftStore =
 
 pub type UndoManagerHandle = Arc<vcs::UndoManager>;
 
-pub type ToolPermissionMode = Arc<tokio::sync::RwLock<String>>;
+#[derive(Clone)]
+pub struct ToolPermissionMode(pub Arc<tokio::sync::RwLock<String>>);
 
-pub type ToolPermissions = Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>>;
+#[derive(Clone)]
+pub struct ToolPermissions(pub Arc<tokio::sync::RwLock<HashMap<String, String>>>);
+
+#[cfg(test)]
+mod state_type_tests {
+    use super::{ApiKeyState, ProviderKeysState, ToolPermissionMode, ToolPermissions};
+    use std::any::TypeId;
+
+    #[test]
+    fn permission_state_types_do_not_alias_key_state_types() {
+        assert_ne!(TypeId::of::<ToolPermissionMode>(), TypeId::of::<ApiKeyState>());
+        assert_ne!(TypeId::of::<ToolPermissions>(), TypeId::of::<ProviderKeysState>());
+    }
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -417,15 +432,13 @@ pub fn run() {
                 .unwrap_or_else(|| "auto".to_string());
             println!("[Locus] tool_permission_mode: {}", initial_tool_mode);
             let tool_permission_mode: ToolPermissionMode =
-                Arc::new(tokio::sync::RwLock::new(initial_tool_mode));
+                ToolPermissionMode(Arc::new(tokio::sync::RwLock::new(initial_tool_mode)));
 
             let tool_perm_path = data_dir.join("tool_permissions.json");
-            let initial_tool_perms: std::collections::HashMap<String, String> =
+            let initial_tool_perms: HashMap<String, String> =
                 std::fs::read_to_string(&tool_perm_path)
                     .ok()
-                    .and_then(|s| {
-                        serde_json::from_str::<std::collections::HashMap<String, String>>(&s).ok()
-                    })
+                    .and_then(|s| serde_json::from_str::<HashMap<String, String>>(&s).ok())
                     .map(|raw| {
                         raw.into_iter()
                             .map(|(key, value)| {
@@ -441,7 +454,7 @@ pub fn run() {
                     .unwrap_or_default();
             println!("[Locus] tool_permissions: {:?}", initial_tool_perms);
             let tool_permissions: ToolPermissions =
-                Arc::new(tokio::sync::RwLock::new(initial_tool_perms));
+                ToolPermissions(Arc::new(tokio::sync::RwLock::new(initial_tool_perms)));
             startup_for_setup.mark("setup_permissions_ready");
 
             let canvas_spec_store: CanvasSpecStore =
@@ -768,6 +781,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::create_session,
+            commands::fork_session,
             commands::chat,
             commands::list_agents,
             commands::list_subagent_defs,
@@ -977,6 +991,7 @@ pub fn run() {
             commands::diff_semantic_target,
             commands::diff_text_for_large,
             commands::diff_strings,
+            commands::undo_latest_conversation_turn,
             commands::undo_perform,
             commands::undo_preview,
             commands::undo_list,
@@ -991,12 +1006,15 @@ pub fn run() {
             commands::save_plan_artifact,
             commands::get_system_fonts,
             commands::get_system_locale,
+            commands::get_proxy_status,
+            commands::save_proxy_config,
             commands::get_python_runtime_state,
             commands::save_python_runtime_selection,
             commands::send_system_notification,
             commands::get_config_registry,
             commands::get_log_entries,
             commands::clear_log_entries,
+            commands::save_log_export,
             commands::unity_embed_status,
             commands::unity_embed_set_mouse_activation_suppressed,
             commands::unity_embed_activate_for_input,

@@ -7,7 +7,7 @@ use futures::{SinkExt, StreamExt};
 use http::Uri;
 use hyper_util::client::legacy::connect::proxy::{SocksV4, SocksV5, Tunnel};
 use hyper_util::client::legacy::connect::HttpConnector;
-use hyper_util::client::proxy::matcher::{Intercept, Matcher};
+use hyper_util::client::proxy::matcher::Intercept;
 use std::collections::HashMap;
 use std::io;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
@@ -877,7 +877,7 @@ async fn connect_via_socks5_proxy(
 
 async fn connect_websocket_transport(request: &http::Request<()>) -> Result<BoxedCodexIo, String> {
     let target_uri = websocket_proxy_match_uri(request.uri())?;
-    let matcher = Matcher::from_system();
+    let matcher = crate::network::proxy_matcher();
 
     if let Some(proxy) = matcher.intercept(&target_uri) {
         match proxy.uri().scheme_str().unwrap_or("http") {
@@ -1865,11 +1865,11 @@ where
     G: Fn(String) + Send + 'static,
     H: Fn(String, String) + Send,
 {
-    let client = reqwest::Client::builder()
-        .tcp_keepalive(Duration::from_secs(20))
-        .connect_timeout(Duration::from_secs(30))
-        .build()
-        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+    let client = crate::network::reqwest_client(
+        crate::network::ReqwestClientOptions::new()
+            .tcp_keepalive(Duration::from_secs(20))
+            .connect_timeout(Duration::from_secs(30)),
+    )?;
 
     let continuation_request = request_without_input(&body);
     let request_body = build_history_transport_request(

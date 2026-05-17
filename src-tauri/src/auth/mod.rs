@@ -181,7 +181,7 @@ impl AuthState {
             .take()
             .ok_or_else(|| "No pending OAuth state. Call get_authorize_url first.".to_string())?;
 
-        let client = reqwest::Client::new();
+        let client = crate::network::default_reqwest_client()?;
 
         if state != expected_state {
             return Err("OAuth state mismatch. Please retry login.".to_string());
@@ -241,7 +241,7 @@ impl AuthState {
             .map(|t| t.refresh_token.clone())
             .ok_or_else(|| "No refresh token available".to_string())?;
 
-        let client = reqwest::Client::new();
+        let client = crate::network::default_reqwest_client()?;
 
         let body = serde_json::json!({
             "grant_type": "refresh_token",

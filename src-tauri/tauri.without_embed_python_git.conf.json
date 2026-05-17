@@ -8,6 +8,7 @@
       "../LICENSE": "licenses/LICENSE",
       "../THIRD_PARTY_NOTICES": "licenses/THIRD_PARTY_NOTICES",
       "./gen/licenses-bundle": "licenses/third_party/",
+      "./gen/ort-runtime": "ort-runtime/",
       "../agent": "agent/",
       "../knowledge": "knowledge/",
       "../locus_unity": "locus_unity/"

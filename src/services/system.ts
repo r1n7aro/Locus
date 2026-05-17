@@ -1,5 +1,5 @@
 import { ipcInvoke } from "./ipc";
-import type { PythonRuntimeState } from "../types";
+import type { ProxyConfig, ProxyStatus, PythonRuntimeState } from "../types";
 
 let pythonRuntimeStateCache: PythonRuntimeState | null = null;
 let pythonRuntimeStateRequest: Promise<PythonRuntimeState> | null = null;
@@ -17,6 +17,14 @@ export function sendSystemNotification(title: string, body?: string | null): Pro
     },
     { throwOnError: false },
   );
+}
+
+export function getProxyStatus(): Promise<ProxyStatus> {
+  return ipcInvoke<ProxyStatus>("get_proxy_status");
+}
+
+export function saveProxyConfig(config: ProxyConfig): Promise<ProxyStatus> {
+  return ipcInvoke<ProxyStatus>("save_proxy_config", { config });
 }
 
 export function getPythonRuntimeState(refresh = false): Promise<PythonRuntimeState> {

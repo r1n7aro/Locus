@@ -113,11 +113,12 @@ async fn fetch_remote_models(
     base_url: Option<&str>,
     etag: Option<&str>,
 ) -> Result<CodexModelsFetchOutcome, String> {
-    let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(MODELS_REFRESH_TIMEOUT_SECS))
-        .timeout(Duration::from_secs(MODELS_REFRESH_TIMEOUT_SECS))
-        .build()
-        .map_err(|e| format!("Failed to create Codex models client: {e}"))?;
+    let client = crate::network::reqwest_client(
+        crate::network::ReqwestClientOptions::new()
+            .connect_timeout(Duration::from_secs(MODELS_REFRESH_TIMEOUT_SECS))
+            .timeout(Duration::from_secs(MODELS_REFRESH_TIMEOUT_SECS)),
+    )
+    .map_err(|e| format!("Failed to create Codex models client: {e}"))?;
 
     let url = codex_models_endpoint(base_url);
     let mut request = client

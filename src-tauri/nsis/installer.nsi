@@ -67,6 +67,9 @@ Var UpdateMode
 Var NoShortcutMode
 Var WixMode
 Var OldMainBinaryName
+Var LocusSkipManagedGit
+Var LocusGitProbePath
+Var LocusGitInstallRoot
 
 Name "${PRODUCTNAME}"
 BrandingText "${COPYRIGHT}"
@@ -614,8 +617,108 @@ Section WebView2
   ${EndIf}
 SectionEnd
 
+Function LocusProbeGitExecutable
+  ${If} $LocusSkipManagedGit == 1
+    Return
+  ${EndIf}
+  ${If} $LocusGitProbePath == ""
+    Return
+  ${EndIf}
+
+  IfFileExists "$LocusGitProbePath" 0 done
+
+  ${StrCase} $R2 "$LocusGitProbePath" "L"
+  ${StrCase} $R3 "$INSTDIR\managed-git" "L"
+  ${StrLoc} $R4 $R2 $R3 ">"
+  ${If} $R4 != ""
+    Return
+  ${EndIf}
+
+  nsExec::ExecToStack '"$LocusGitProbePath" --version'
+  Pop $R0
+  Pop $R1
+  ${If} $R0 == 0
+    StrCpy $LocusSkipManagedGit 1
+    DetailPrint "System Git detected: $LocusGitProbePath"
+  ${EndIf}
+
+  done:
+FunctionEnd
+
+Function LocusProbeGitInstallRoot
+  ${If} $LocusSkipManagedGit == 1
+    Return
+  ${EndIf}
+  ${If} $LocusGitInstallRoot == ""
+    Return
+  ${EndIf}
+
+  StrCpy $LocusGitProbePath "$LocusGitInstallRoot\cmd\git.exe"
+  Call LocusProbeGitExecutable
+  StrCpy $LocusGitProbePath "$LocusGitInstallRoot\bin\git.exe"
+  Call LocusProbeGitExecutable
+  StrCpy $LocusGitProbePath "$LocusGitInstallRoot\mingw64\bin\git.exe"
+  Call LocusProbeGitExecutable
+FunctionEnd
+
+Function LocusProbeGitRegistry
+  ReadRegStr $LocusGitInstallRoot HKCU "SOFTWARE\GitForWindows" "InstallPath"
+  Call LocusProbeGitInstallRoot
+  ReadRegStr $LocusGitInstallRoot HKCU "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Git_is1" "InstallLocation"
+  Call LocusProbeGitInstallRoot
+  ReadRegStr $LocusGitInstallRoot HKLM "SOFTWARE\GitForWindows" "InstallPath"
+  Call LocusProbeGitInstallRoot
+  ReadRegStr $LocusGitInstallRoot HKLM "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Git_is1" "InstallLocation"
+  Call LocusProbeGitInstallRoot
+FunctionEnd
+
+Function LocusDetectSystemGit
+  StrCpy $LocusSkipManagedGit 0
+
+  ClearErrors
+  SearchPath $LocusGitProbePath "git.exe"
+  ${IfNot} ${Errors}
+    Call LocusProbeGitExecutable
+  ${EndIf}
+
+  ${If} ${RunningX64}
+    SetRegView 64
+    Call LocusProbeGitRegistry
+    SetRegView 32
+    Call LocusProbeGitRegistry
+    SetRegView lastused
+  ${Else}
+    Call LocusProbeGitRegistry
+  ${EndIf}
+
+  ${If} ${RunningX64}
+    StrCpy $LocusGitInstallRoot "$PROGRAMFILES64\Git"
+    Call LocusProbeGitInstallRoot
+  ${EndIf}
+  StrCpy $LocusGitInstallRoot "$PROGRAMFILES\Git"
+  Call LocusProbeGitInstallRoot
+  StrCpy $LocusGitInstallRoot "$LOCALAPPDATA\Programs\Git"
+  Call LocusProbeGitInstallRoot
+  StrCpy $LocusGitInstallRoot "$PROFILE\scoop\apps\git\current"
+  Call LocusProbeGitInstallRoot
+
+  ClearErrors
+  ReadEnvStr $LocusGitInstallRoot "ChocolateyInstall"
+  ${IfNot} ${Errors}
+    StrCpy $LocusGitProbePath "$LocusGitInstallRoot\bin\git.exe"
+    Call LocusProbeGitExecutable
+  ${EndIf}
+
+  ${If} $LocusSkipManagedGit == 1
+    DetailPrint "System Git is available; skipping bundled Git resources."
+  ${Else}
+    DetailPrint "System Git not detected; installing bundled Git resources."
+  ${EndIf}
+FunctionEnd
+
 Section Install
   SetOutPath $INSTDIR
+  Call LocusDetectSystemGit
   ; Locus: replace optional bundled Python and Git resources.
   RMDir /r "$INSTDIR\managed-python"
   RMDir /r "$INSTDIR\managed-git"
@@ -637,10 +740,18 @@ Section Install
 
   ; Copy resources
   {{#each resources_dirs}}
-    CreateDirectory "$INSTDIR\\{{this}}"
+    StrCpy $R0 "{{this}}" 11
+    ${If} $LocusSkipManagedGit != 1
+    ${OrIf} $R0 != "managed-git"
+      CreateDirectory "$INSTDIR\\{{this}}"
+    ${EndIf}
   {{/each}}
   {{#each resources}}
-    File /a "/oname={{this.[1]}}" "{{no-escape @key}}"
+    StrCpy $R0 "{{this.[1]}}" 11
+    ${If} $LocusSkipManagedGit != 1
+    ${OrIf} $R0 != "managed-git"
+      File /a "/oname={{this.[1]}}" "{{no-escape @key}}"
+    ${EndIf}
   {{/each}}
 
   ; Copy external binaries

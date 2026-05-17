@@ -12,6 +12,18 @@ pub fn get_system_locale() -> Option<String> {
 }
 
 #[tauri::command]
+pub fn get_proxy_status() -> crate::network::ProxyStatus {
+    crate::network::get_proxy_status()
+}
+
+#[tauri::command]
+pub fn save_proxy_config(
+    config: crate::network::ProxyConfig,
+) -> Result<crate::network::ProxyStatus, crate::error::AppError> {
+    crate::network::save_proxy_config(config).map_err(crate::error::AppError::from)
+}
+
+#[tauri::command]
 pub async fn get_python_runtime_state(
     app_handle: AppHandle,
     refresh: Option<bool>,

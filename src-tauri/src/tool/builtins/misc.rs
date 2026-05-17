@@ -30,7 +30,15 @@ pub(super) fn webfetch() -> ToolDef {
                     };
                 }
 
-                let client = reqwest::Client::new();
+                let client = match crate::network::default_reqwest_client() {
+                    Ok(client) => client,
+                    Err(e) => {
+                        return ToolResult {
+                            output: format!("Error creating HTTP client: {}", e),
+                            is_error: true,
+                        }
+                    }
+                };
                 let response = match client
                     .get(url)
                     .header("User-Agent", "Mozilla/5.0 (compatible; bot/1.0)")

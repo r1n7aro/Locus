@@ -44,11 +44,11 @@ where
     H: Fn(String, String) + Send + 'static,
 {
     let tag = provider_tag.unwrap_or("OpenRouter");
-    let client = reqwest::Client::builder()
-        .tcp_keepalive(std::time::Duration::from_secs(20))
-        .connect_timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+    let client = crate::network::reqwest_client(
+        crate::network::ReqwestClientOptions::new()
+            .tcp_keepalive(std::time::Duration::from_secs(20))
+            .connect_timeout(std::time::Duration::from_secs(30)),
+    )?;
 
     let messages = build_api_messages(system_prompt, history);
 

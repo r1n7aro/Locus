@@ -84,6 +84,7 @@ describe("Python runtime settings", () => {
   it("bundles managed Git with the desktop package", () => {
     const pkg = read("package.json");
     const tauriConfig = read("src-tauri/tauri.with_embed_python_git.conf.json");
+    const installer = read("src-tauri/nsis/installer.nsi");
     const processUtil = read("src-tauri/src/process_util.rs");
     const lib = read("src-tauri/src/lib.rs");
     const script = read("scripts/prepare-managed-git.mjs");
@@ -91,6 +92,11 @@ describe("Python runtime settings", () => {
     expect(pkg).toContain('"git:bundle": "bun run scripts/prepare-managed-git.mjs"');
     expect(pkg).toContain("bun run git:bundle");
     expect(tauriConfig).toContain('"./gen/managed-git": "managed-git/"');
+    expect(installer).toContain("Function LocusDetectSystemGit");
+    expect(installer).toContain("SearchPath $LocusGitProbePath \"git.exe\"");
+    expect(installer).toContain("System Git is available; skipping bundled Git resources.");
+    expect(installer).toContain("StrCpy $R0 \"{{this.[1]}}\" 11");
+    expect(installer).toContain("$R0 != \"managed-git\"");
     expect(processUtil).toContain("GitDiscoverySource::Managed");
     expect(processUtil).toContain("resolve_git_from_managed_resource");
     expect(processUtil).toContain("git_runtime_key");

@@ -280,7 +280,7 @@ export function useSettingsState(emit: SettingsEmit) {
   }
 
   // ── Navigation ───────────────────────────────────────────────────────
-  const activeCategory = ref<"api" | "models" | "permissions" | "general" | "display" | "shortcuts" | "knowledge" | "archived" | "console" | "about">("general");
+  const activeCategory = ref<"api" | "models" | "permissions" | "proxy" | "general" | "display" | "shortcuts" | "knowledge" | "archived" | "console" | "about">("general");
 
   // ── Provider / API key state ─────────────────────────────────────────
   const providers = ref<ProviderStatus[]>([]);
@@ -778,9 +778,15 @@ export function useSettingsState(emit: SettingsEmit) {
   }
 
   async function setToolPermission(name: string, mode: "auto" | "ask") {
-    if (getToolMode(name) === mode) return;
+    const previousPermissions = toolPermissions.value;
+    const previousMode = getToolMode(name);
+    if (previousMode === mode) return;
     toolPermissions.value = { ...toolPermissions.value, [name]: mode };
-    await saveToolPermissions();
+    try {
+      await saveToolPermissions();
+    } catch {
+      toolPermissions.value = previousPermissions;
+    }
   }
 
   async function toggleToolPermission(name: string) {
@@ -795,6 +801,7 @@ export function useSettingsState(emit: SettingsEmit) {
         fullMap[item.name] = getToolMode(item.name);
       }
       await serviceSaveToolPermissions(fullMap);
+      setWarmup("settings:toolPermissions", fullMap);
       permSaveMsg.value = t("settings.perms.saved");
       if (permSaveTimer) clearTimeout(permSaveTimer);
       permSaveTimer = setTimeout(() => {
@@ -807,6 +814,7 @@ export function useSettingsState(emit: SettingsEmit) {
         code: err.code,
         operation: "saveToolPermissions",
       });
+      throw e;
     }
   }
 

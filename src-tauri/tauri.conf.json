@@ -4,7 +4,7 @@
   "version": "0.2.14",
   "identifier": "com.locus.app",
   "build": {
-    "beforeDevCommand": "bun run dev",
+    "beforeDevCommand": "bun run ort:bundle && bun run dev",
     "devUrl": "http://localhost:14901",
     "beforeBuildCommand": "bun run build:tauri:without_embed_python_git",
     "frontendDist": "../dist"
@@ -46,6 +46,7 @@
       "../LICENSE": "licenses/LICENSE",
       "../THIRD_PARTY_NOTICES": "licenses/THIRD_PARTY_NOTICES",
       "./gen/licenses-bundle": "licenses/third_party/",
+      "./gen/ort-runtime": "ort-runtime/",
       "../agent": "agent/",
       "../knowledge": "knowledge/",
       "../locus_unity": "locus_unity/"

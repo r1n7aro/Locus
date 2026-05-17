@@ -31,7 +31,7 @@ futures = "0.3.32"
 walkdir = "2.5.0"
 ignore = "0.4"
 tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.12", features = ["json", "stream", "blocking", "native-tls", "http2", "gzip", "deflate"], default-features = false }
+reqwest = { version = "0.12", features = ["json", "stream", "blocking", "native-tls", "http2", "gzip", "deflate", "system-proxy", "socks"], default-features = false }
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 hyper-util = { version = "0.1", features = ["client-proxy", "client-proxy-system", "client-legacy", "tokio"] }
 native-tls = "0.2"
@@ -58,9 +58,9 @@ similar = "2"
 indexmap = { version = "2", features = ["serde"] }
 tantivy = "0.26"
 font-kit = "0.14"
-fastembed = { version = "5.13.2", default-features = false, features = ["hf-hub-native-tls", "ort-download-binaries-native-tls", "directml"] }
+fastembed = { version = "5.13.2", default-features = false, features = ["hf-hub-native-tls", "ort-load-dynamic"] }
 hf-hub = { version = "0.4.3", default-features = false, features = ["ureq", "native-tls"] }
-ureq = { version = "2.12.1", default-features = false, features = ["native-tls"] }
+ureq = { version = "2.12.1", default-features = false, features = ["native-tls", "socks-proxy"] }
 tree-sitter = "0.25"
 # Pinned: the parser in src/unity_csharp/parser.rs depends on the named-node
 # layout (`modifier`, `attribute_list`, `variable_declaration`, etc.) of this
@@ -81,7 +81,7 @@ tauri-plugin-notification = "2.3.3"
 # Keep this pinned to rc.11 because fastembed 5.13.2 still depends on the same
 # ort/ort-sys pair upstream; rc.12 would create an unresolved onnxruntime links conflict.
 [target.'cfg(windows)'.dependencies]
-ort = { version = "=2.0.0-rc.11", default-features = false, features = ["directml", "copy-dylibs", "preload-dylibs"] }
+ort = { version = "=2.0.0-rc.11", default-features = false, features = ["load-dynamic"] }
 tauri-winrt-notification = "0.7.2"
 windows = { version = "0.61.3", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Graphics_Dxgi", "Win32_Graphics_Gdi", "Win32_Storage_FileSystem", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 webview2-com = "0.38.2"

@@ -134,13 +134,14 @@ pub async fn fetch_codex_rate_limits(
     account_id: Option<&str>,
     base_url: Option<&str>,
 ) -> Result<CodexRateLimitsResponse, CodexRateLimitsFetchError> {
-    let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(USAGE_REFRESH_TIMEOUT_SECS))
-        .timeout(Duration::from_secs(USAGE_REFRESH_TIMEOUT_SECS))
-        .build()
-        .map_err(|e| {
-            CodexRateLimitsFetchError::Other(format!("Failed to create Codex usage client: {e}"))
-        })?;
+    let client = crate::network::reqwest_client(
+        crate::network::ReqwestClientOptions::new()
+            .connect_timeout(Duration::from_secs(USAGE_REFRESH_TIMEOUT_SECS))
+            .timeout(Duration::from_secs(USAGE_REFRESH_TIMEOUT_SECS)),
+    )
+    .map_err(|e| {
+        CodexRateLimitsFetchError::Other(format!("Failed to create Codex usage client: {e}"))
+    })?;
 
     let url = codex_usage_endpoint(base_url);
     let mut request = client

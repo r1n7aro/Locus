@@ -14,7 +14,7 @@ The Locus source tree is distributed under `GPL-3.0-or-later`. See [LICENSE](LIC
   - Native desktop runtime crate license texts and notices copied from the Cargo registry cache
   - Fallback SPDX license texts for registry crates that publish only license expressions and omit standalone license files
   - The bundled dependency manifests and lockfiles used to identify the shipped dependency set
-  - Legal texts for the ONNX Runtime `1.23.2` runtime and the DirectML `1.15.4` redistributable used by the embedding stack
+  - Legal texts for the ONNX Runtime `1.23.0` runtime and the DirectML `1.15.4` redistributable used by the embedding stack
 - The default Windows desktop application bundle includes the CPython Windows embeddable package prepared under `managed-python/`. Its license file is kept inside the bundled Python runtime directory.
 - The default Windows desktop application bundle includes Git for Windows PortableGit prepared under `managed-git/`. Its license files are kept inside the bundled Git runtime directory.
 - The `without_embed_python_git` Windows bundle omits `managed-python/` and `managed-git/` and relies on user-provided Python and Git installations when those workflows need them.

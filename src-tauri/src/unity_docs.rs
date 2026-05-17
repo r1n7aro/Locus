@@ -696,12 +696,13 @@ async fn run_unity_reference_import(
     let target_path = target_path.unwrap_or_else(|| UNITY_REFERENCE_MANAGED_DIR.to_string());
     let managed_path = reference_target_managed_path(&target_path);
     let had_existing_managed_store = use_legacy_managed_store && has_managed_store(&working_dir);
-    let client = reqwest::Client::builder()
-        .user_agent("Locus/1.0 (Unity Reference Import)")
-        .build()
-        .map_err(|e| {
-            UnityReferenceImportRunError::Failed(format!("Failed to build download client: {}", e))
-        })?;
+    let client = crate::network::reqwest_client(
+        crate::network::ReqwestClientOptions::new()
+            .user_agent("Locus/1.0 (Unity Reference Import)"),
+    )
+    .map_err(|e| {
+        UnityReferenceImportRunError::Failed(format!("Failed to build download client: {}", e))
+    })?;
 
     ensure_import_not_cancelled(&cancel_requested)?;
     let source = resolve_offline_source(&client, &docs_version, selected_locale)

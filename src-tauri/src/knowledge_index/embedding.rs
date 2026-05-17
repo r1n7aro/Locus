@@ -4,15 +4,13 @@ use fastembed::{
 };
 use hf_hub::api::sync::{ApiBuilder, ApiRepo};
 use hf_hub::{Cache, Repo, RepoType};
-use http::Uri;
-use hyper_util::client::proxy::matcher::Matcher;
 #[cfg(windows)]
-use ndarray::{s, Array, Array2, ArrayView, Axis, Dim, Dimension, IxDynImpl};
+use ndarray::{Array, Array2, ArrayView, Axis, Dim, Dimension, IxDynImpl, s};
 #[cfg(windows)]
-use ort::ep::{DirectML, ExecutionProvider, CUDA};
+use ort::ep::{CUDA, DirectML, ExecutionProvider};
 #[cfg(windows)]
 use ort::{
-    session::{builder::GraphOptimizationLevel, Session},
+    session::{Session, builder::GraphOptimizationLevel},
     tensor::TensorElementType,
     value::Value,
 };
@@ -22,10 +20,10 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 #[cfg(windows)]
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 #[cfg(windows)]
 use tokenizers::{AddedToken, PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
@@ -467,36 +465,76 @@ fn prioritize_directml_adapter_indices(candidates: &[DirectMlAdapterCandidate]) 
 }
 
 #[cfg(windows)]
-pub fn preload_ort_helpers() {
-    static ORT_HELPERS_PRELOADED: OnceLock<()> = OnceLock::new();
+fn ensure_ort_runtime_loaded() -> Result<(), String> {
+    static ORT_RUNTIME_INIT: OnceLock<Result<(), String>> = OnceLock::new();
 
-    ORT_HELPERS_PRELOADED.get_or_init(|| {
-        for dll in collect_runtime_helper_dlls() {
-            tracing::info!(
-                log_module = "knowledge_index",
-                dll = %dll.name,
-                path = %dll.path.clone().unwrap_or_default(),
-                exists = dll.exists,
-                version = %dll.version.clone().unwrap_or_default(),
-                "embedding helper dll check"
-            );
-        }
-
-        if let Some(path) = find_runtime_helper_dll("DirectML.dll") {
-            if let Err(error) = ort::util::preload_dylib(&path) {
-                tracing::warn!(
-                    log_module = "knowledge_index",
-                    path = %path.display(),
-                    error = %error,
-                    "failed to preload DirectML.dll"
-                );
-            }
-        }
-    });
+    ORT_RUNTIME_INIT
+        .get_or_init(init_ort_runtime_from_helpers)
+        .clone()
 }
 
 #[cfg(not(windows))]
-pub fn preload_ort_helpers() {}
+fn ensure_ort_runtime_loaded() -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(windows)]
+fn init_ort_runtime_from_helpers() -> Result<(), String> {
+    for dll in collect_runtime_helper_dlls() {
+        tracing::info!(
+            log_module = "knowledge_index",
+            dll = %dll.name,
+            path = %dll.path.clone().unwrap_or_default(),
+            exists = dll.exists,
+            version = %dll.version.clone().unwrap_or_default(),
+            "embedding helper dll check"
+        );
+    }
+
+    let onnxruntime_path = find_runtime_helper_dll("onnxruntime.dll");
+    let runtime_dir = onnxruntime_path
+        .as_deref()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf);
+    let directml_path = runtime_dir
+        .as_ref()
+        .map(|dir| dir.join("DirectML.dll"))
+        .filter(|path| path.is_file())
+        .or_else(|| find_runtime_helper_dll("DirectML.dll"));
+    if let Some(path) = directml_path {
+        if let Err(error) = ort::util::preload_dylib(&path) {
+            tracing::warn!(
+                log_module = "knowledge_index",
+                path = %path.display(),
+                error = %error,
+                "failed to preload DirectML.dll"
+            );
+        }
+    }
+
+    let onnxruntime_path = onnxruntime_path.unwrap_or_else(|| PathBuf::from("onnxruntime.dll"));
+    tracing::info!(
+        log_module = "knowledge_index",
+        path = %onnxruntime_path.display(),
+        "loading onnxruntime.dll for local embeddings"
+    );
+
+    ort::init_from(&onnxruntime_path)
+        .map_err(|error| {
+            format!(
+                "Failed to load ONNX Runtime from '{}': {}",
+                onnxruntime_path.display(),
+                normalize_runtime_error_message_with_debug(
+                    &error.to_string(),
+                    Some(&format!("{error:#?}")),
+                    "ONNX Runtime dynamic load failed"
+                )
+            )
+        })?
+        .commit();
+
+    Ok(())
+}
 
 #[cfg(windows)]
 fn collect_runtime_helper_dlls() -> Vec<EmbeddingRuntimeTestDllInfo> {
@@ -532,7 +570,7 @@ fn runtime_helper_search_dirs() -> Vec<PathBuf> {
 
     if let Ok(exe_path) = std::env::current_exe() {
         if let Some(exe_dir) = exe_path.parent() {
-            push_unique_path(&mut dirs, exe_dir);
+            push_runtime_helper_root_candidates(&mut dirs, exe_dir);
             if exe_dir
                 .file_name()
                 .and_then(|value| value.to_str())
@@ -540,17 +578,50 @@ fn runtime_helper_search_dirs() -> Vec<PathBuf> {
                 .unwrap_or(false)
             {
                 if let Some(parent) = exe_dir.parent() {
-                    push_unique_path(&mut dirs, parent);
+                    push_runtime_helper_root_candidates(&mut dirs, parent);
                 }
             }
         }
     }
 
     if let Ok(current_dir) = std::env::current_dir() {
-        push_unique_path(&mut dirs, &current_dir);
+        push_runtime_helper_root_candidates(&mut dirs, &current_dir);
+        push_unique_path(
+            &mut dirs,
+            &current_dir
+                .join("src-tauri")
+                .join("gen")
+                .join("ort-runtime")
+                .join("windows-x64"),
+        );
+        push_unique_path(
+            &mut dirs,
+            &current_dir
+                .join("gen")
+                .join("ort-runtime")
+                .join("windows-x64"),
+        );
     }
 
+    push_unique_path(
+        &mut dirs,
+        &PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("gen")
+            .join("ort-runtime")
+            .join("windows-x64"),
+    );
+
     dirs
+}
+
+#[cfg(windows)]
+fn push_runtime_helper_root_candidates(paths: &mut Vec<PathBuf>, root: &Path) {
+    push_unique_path(paths, root);
+    push_unique_path(paths, &root.join("ort-runtime").join("windows-x64"));
+    push_unique_path(
+        paths,
+        &root.join("resources").join("ort-runtime").join("windows-x64"),
+    );
 }
 
 #[cfg(windows)]
@@ -1304,8 +1375,6 @@ impl LocalEmbeddingRuntime {
         config: &EmbeddingConfig,
         model_dir: &Path,
     ) -> Result<Self, String> {
-        preload_ort_helpers();
-
         let selection = select_local_model_source(config, model_dir)?;
         match selection.route {
             LocalModelRoute::Preset => {
@@ -1349,8 +1418,6 @@ impl LocalEmbeddingRuntime {
                 config.local_runtime, LOCAL_RUNTIME_FASTEMBED
             ));
         }
-
-        preload_ort_helpers();
 
         let selection = select_local_model_source(config, model_dir)?;
         match selection.route {
@@ -1438,7 +1505,7 @@ impl LocalEmbeddingRuntime {
         model: FastembedModel,
         device_policy: &str,
     ) -> Result<Self, String> {
-        preload_ort_helpers();
+        ensure_ort_runtime_loaded()?;
 
         let cache_dir = effective_fastembed_cache_dir(model_dir);
         let (mut embedding, device) = initialize_local_embedding_with_device_policy(
@@ -1533,7 +1600,7 @@ impl LocalEmbeddingRuntime {
         known_model: Option<&FastembedModel>,
         device_policy: &str,
     ) -> Result<Self, String> {
-        preload_ort_helpers();
+        ensure_ort_runtime_loaded()?;
 
         let model_file = find_manual_model_file(manual_model_dir).ok_or_else(|| {
             format!(
@@ -2782,7 +2849,7 @@ fn build_directml_ort_session(
     optimization_level: GraphOptimizationLevel,
     enable_quant_qdq: bool,
 ) -> Result<Session, String> {
-    preload_ort_helpers();
+    ensure_ort_runtime_loaded()?;
 
     let mut builder = Session::builder().map_err(|error| {
         format!(
@@ -2858,7 +2925,7 @@ fn build_cpu_ort_session(
     optimization_level: GraphOptimizationLevel,
     enable_quant_qdq: bool,
 ) -> Result<Session, String> {
-    preload_ort_helpers();
+    ensure_ort_runtime_loaded()?;
 
     let mut builder = Session::builder().map_err(|error| {
         format!(
@@ -2915,8 +2982,8 @@ fn build_cpu_ort_session(
 #[cfg(windows)]
 fn directml_device_ids_to_try() -> Vec<i32> {
     use windows::Win32::Graphics::Dxgi::{
-        CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory6, DXGI_ADAPTER_FLAG_SOFTWARE,
-        DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+        CreateDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+        IDXGIAdapter1, IDXGIFactory6,
     };
 
     let factory: IDXGIFactory6 = match unsafe { CreateDXGIFactory1() } {
@@ -2973,8 +3040,8 @@ fn collect_directml_adapter_diagnostics() -> Vec<EmbeddingRuntimeTestAdapterInfo
 #[cfg(windows)]
 fn enumerate_dxgi_adapters() -> Vec<EmbeddingRuntimeTestAdapterInfo> {
     use windows::Win32::Graphics::Dxgi::{
-        CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory6, DXGI_ADAPTER_FLAG_SOFTWARE,
-        DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+        CreateDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+        IDXGIAdapter1, IDXGIFactory6,
     };
 
     fn adapter_name(desc: &windows::Win32::Graphics::Dxgi::DXGI_ADAPTER_DESC1) -> String {
@@ -3118,10 +3185,10 @@ fn current_cpu_device_name() -> Option<String> {
 
 #[cfg(windows)]
 fn read_runtime_dll_version(path: &Path) -> Option<String> {
-    use windows::core::{w, HSTRING};
     use windows::Win32::Storage::FileSystem::{
-        GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW, VS_FIXEDFILEINFO,
+        GetFileVersionInfoSizeW, GetFileVersionInfoW, VS_FIXEDFILEINFO, VerQueryValueW,
     };
+    use windows::core::{HSTRING, w};
 
     let path = HSTRING::from(path.as_os_str().to_string_lossy().as_ref());
     let size = unsafe { GetFileVersionInfoSizeW(&path, None) };
@@ -3164,11 +3231,11 @@ fn read_runtime_dll_version(path: &Path) -> Option<String> {
 
 #[cfg(windows)]
 fn query_gpu_memory_bytes_for_adapter_index(adapter_index: i32) -> Option<u64> {
-    use windows::core::Interface;
     use windows::Win32::Graphics::Dxgi::{
-        CreateDXGIFactory1, IDXGIAdapter1, IDXGIAdapter3, IDXGIFactory6,
-        DXGI_MEMORY_SEGMENT_GROUP_LOCAL, DXGI_QUERY_VIDEO_MEMORY_INFO,
+        CreateDXGIFactory1, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, DXGI_QUERY_VIDEO_MEMORY_INFO,
+        IDXGIAdapter1, IDXGIAdapter3, IDXGIFactory6,
     };
+    use windows::core::Interface;
 
     let factory: IDXGIFactory6 = unsafe { CreateDXGIFactory1().ok()? };
     let adapter: IDXGIAdapter1 = unsafe { factory.EnumAdapters1(adapter_index as u32).ok()? };
@@ -3185,8 +3252,8 @@ fn query_gpu_memory_bytes_for_adapter_index(adapter_index: i32) -> Option<u64> {
 #[cfg(windows)]
 fn query_preferred_gpu_memory_bytes() -> Option<u64> {
     use windows::Win32::Graphics::Dxgi::{
-        CreateDXGIFactory1, IDXGIAdapter3, IDXGIFactory6, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
-        DXGI_MEMORY_SEGMENT_GROUP_LOCAL, DXGI_QUERY_VIDEO_MEMORY_INFO,
+        CreateDXGIFactory1, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, DXGI_MEMORY_SEGMENT_GROUP_LOCAL,
+        DXGI_QUERY_VIDEO_MEMORY_INFO, IDXGIAdapter3, IDXGIFactory6,
     };
 
     let factory: IDXGIFactory6 = unsafe { CreateDXGIFactory1().ok()? };
@@ -3360,211 +3427,12 @@ fn normalize_embedding_values(values: &[f32]) -> Vec<f32> {
         .collect()
 }
 
-fn authority_host(host: &str) -> String {
-    if host.contains(':') && !host.starts_with('[') {
-        format!("[{}]", host)
-    } else {
-        host.to_string()
-    }
-}
-
-fn proxy_display_uri(uri: &Uri) -> String {
-    let scheme = uri.scheme_str().unwrap_or("http");
-    let host = uri.host().unwrap_or("<missing-host>");
-    match uri.port_u16() {
-        Some(port) => format!("{}://{}:{}", scheme, authority_host(host), port),
-        None => format!("{}://{}", scheme, authority_host(host)),
-    }
-}
-
-fn sanitize_proxy_display_url(raw: &str) -> String {
-    if let Ok(url) = Url::parse(raw) {
-        let scheme = url.scheme();
-        let host = url.host_str().unwrap_or("<missing-host>");
-        return match url.port_or_known_default() {
-            Some(port) => format!("{}://{}:{}", scheme, authority_host(host), port),
-            None => format!("{}://{}", scheme, authority_host(host)),
-        };
-    }
-
-    if let Ok(uri) = raw.parse::<Uri>() {
-        return proxy_display_uri(&uri);
-    }
-
-    if let Some((scheme, remainder)) = raw.split_once("://") {
-        if let Some((_, host_part)) = remainder.rsplit_once('@') {
-            return format!("{}://{}", scheme, host_part);
-        }
-    }
-
-    raw.to_string()
-}
-
-fn system_proxy_match_uri(url: &str) -> Result<Uri, String> {
-    let parsed: Uri = url
-        .parse()
-        .map_err(|e| format!("Failed to parse proxy target URL '{}': {}", url, e))?;
-    let scheme = match parsed.scheme_str() {
-        Some("http") | Some("https") => parsed
-            .scheme_str()
-            .ok_or_else(|| "Proxy target URL is missing a scheme".to_string())?,
-        Some(other) => {
-            return Err(format!(
-                "Unsupported proxy target URL scheme '{}': {}",
-                other, url
-            ));
-        }
-        None => return Err(format!("Proxy target URL is missing a scheme: {}", url)),
-    };
-    let authority = parsed
-        .authority()
-        .cloned()
-        .ok_or_else(|| format!("Proxy target URL is missing an authority: {}", url))?;
-    let path_and_query = parsed
-        .path_and_query()
-        .cloned()
-        .unwrap_or_else(|| http::uri::PathAndQuery::from_static("/"));
-
-    Uri::builder()
-        .scheme(scheme)
-        .authority(authority)
-        .path_and_query(path_and_query)
-        .build()
-        .map_err(|e| format!("Failed to normalize proxy target URL '{}': {}", url, e))
-}
-
-fn system_proxy_env_key_for_target(target_uri: &Uri) -> &'static str {
-    match target_uri.scheme_str() {
-        Some("http") => "HTTP_PROXY",
-        _ => "HTTPS_PROXY",
-    }
-}
-
-fn configured_proxy_env_for_target(target_uri: &Uri) -> Option<(String, String)> {
-    let env_keys = match target_uri.scheme_str() {
-        Some("http") => ["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"],
-        _ => ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"],
-    };
-
-    for key in env_keys {
-        if let Some(value) = std::env::var_os(key) {
-            return Some((key.to_string(), value.to_string_lossy().to_string()));
-        }
-    }
-
-    None
-}
-
-fn build_supported_ureq_proxy_url(
-    proxy_uri: &Uri,
-    auth: Option<(&str, &str)>,
-) -> Result<Option<String>, String> {
-    let scheme = match proxy_uri.scheme_str() {
-        Some("http") => "http",
-        Some("socks4") => "socks4",
-        Some("socks4a") => "socks4a",
-        Some("socks5") | Some("socks5h") => "socks5",
-        Some("https") => return Ok(None),
-        Some(other) => {
-            return Err(format!(
-                "Unsupported system proxy scheme for knowledge download: {}",
-                other
-            ));
-        }
-        None => return Err("System proxy URI is missing a scheme".to_string()),
-    };
-
-    let host = proxy_uri
-        .host()
-        .ok_or_else(|| "System proxy URI is missing host".to_string())?;
-    let port = proxy_uri.port_u16().unwrap_or(match scheme {
-        "http" => 80,
-        "socks4" | "socks4a" | "socks5" => 1080,
-        _ => 80,
-    });
-    let auth_prefix = auth
-        .map(|(user, pass)| format!("{user}:{pass}@"))
-        .unwrap_or_default();
-    Ok(Some(format!(
-        "{}://{}{}:{}",
-        scheme,
-        auth_prefix,
-        authority_host(host),
-        port
-    )))
-}
-
-#[derive(Debug, Clone)]
-struct ResolvedDownloadProxyRoute {
-    proxy_state: String,
-    proxy_env_key: Option<String>,
-    proxy_url: Option<String>,
-}
-
-fn ensure_system_proxy_env_for_url(url: &str) -> Result<ResolvedDownloadProxyRoute, String> {
-    let target_uri = system_proxy_match_uri(url)?;
-    let env_key = system_proxy_env_key_for_target(&target_uri).to_string();
-
-    if let Some((configured_env_key, configured_proxy)) =
-        configured_proxy_env_for_target(&target_uri)
-    {
-        return Ok(ResolvedDownloadProxyRoute {
-            proxy_state: "environment".to_string(),
-            proxy_env_key: Some(configured_env_key),
-            proxy_url: Some(sanitize_proxy_display_url(&configured_proxy)),
-        });
-    }
-
-    let matcher = Matcher::from_system();
-    let Some(proxy) = matcher.intercept(&target_uri) else {
-        tracing::info!(
-            log_module = "knowledge_index",
-            target_url = %url,
-            "Knowledge download did not find a matching system proxy"
-        );
-        return Ok(ResolvedDownloadProxyRoute {
-            proxy_state: "direct".to_string(),
-            proxy_env_key: None,
-            proxy_url: None,
-        });
-    };
-    let proxy_display = proxy_display_uri(proxy.uri());
-
-    let Some(proxy_url) = build_supported_ureq_proxy_url(proxy.uri(), proxy.raw_auth())? else {
-        tracing::warn!(
-            log_module = "knowledge_index",
-            target_url = %url,
-            proxy_scheme = %proxy.uri().scheme_str().unwrap_or("unknown"),
-            "Knowledge download found a system proxy, but the current hf-hub/ureq stack does not support that proxy scheme"
-        );
-        return Ok(ResolvedDownloadProxyRoute {
-            proxy_state: "system_unsupported".to_string(),
-            proxy_env_key: None,
-            proxy_url: Some(proxy_display),
-        });
-    };
-
-    tracing::info!(
-        log_module = "knowledge_index",
-        target_url = %url,
-        proxy = %proxy_display,
-        "Knowledge download is using the detected system proxy"
-    );
-    std::env::set_var(&env_key, &proxy_url);
-    std::env::set_var(env_key.to_ascii_lowercase(), &proxy_url);
-    Ok(ResolvedDownloadProxyRoute {
-        proxy_state: "system".to_string(),
-        proxy_env_key: Some(env_key),
-        proxy_url: Some(proxy_display),
-    })
-}
-
 pub fn prepare_local_model_download_network(
     download_source: &str,
 ) -> Result<EmbeddingDownloadNetworkStatus, String> {
     let source = normalize_local_model_download_source(download_source).to_string();
     let endpoint = download_source_endpoint(download_source).to_string();
-    let proxy = ensure_system_proxy_env_for_url(&endpoint)?;
+    let proxy = crate::network::ensure_proxy_env_for_url(&endpoint)?;
     Ok(EmbeddingDownloadNetworkStatus {
         source,
         endpoint,
@@ -3590,14 +3458,14 @@ impl RemoteEmbeddingRuntime {
         if config.remote_model.trim().is_empty() {
             return Err("Remote embedding model is required".into());
         }
-        ensure_system_proxy_env_for_url(&endpoint)?;
-
-        let client = ureq::AgentBuilder::new()
-            .try_proxy_from_env(true)
-            .timeout_connect(std::time::Duration::from_secs(15))
-            .timeout_read(std::time::Duration::from_secs(60))
-            .timeout_write(std::time::Duration::from_secs(60))
-            .build();
+        let (_, client) = crate::network::with_proxy_env_for_url(&endpoint, |_| {
+            ureq::AgentBuilder::new()
+                .try_proxy_from_env(true)
+                .timeout_connect(std::time::Duration::from_secs(15))
+                .timeout_read(std::time::Duration::from_secs(60))
+                .timeout_write(std::time::Duration::from_secs(60))
+                .build()
+        })?;
 
         let max_batch = config.remote_max_batch.max(1) as usize;
         let mut runtime = Self {
@@ -3932,19 +3800,20 @@ where
         ))
     })?;
     let hf_endpoint = download_source_endpoint(download_source).to_string();
-    ensure_system_proxy_env_for_url(&hf_endpoint).map_err(EmbeddingDownloadError::failed)?;
-
-    let api = ApiBuilder::new()
-        .with_cache_dir(cache_dir.clone())
-        .with_endpoint(hf_endpoint.clone())
-        .with_progress(false)
-        .build()
-        .map_err(|error| {
-            EmbeddingDownloadError::failed(format!(
-                "Failed to initialize HuggingFace downloader: {}",
-                error
-            ))
-        })?;
+    let (_, api_result) = crate::network::with_proxy_env_for_url(&hf_endpoint, |_| {
+        ApiBuilder::new()
+            .with_cache_dir(cache_dir.clone())
+            .with_endpoint(hf_endpoint.clone())
+            .with_progress(false)
+            .build()
+    })
+    .map_err(EmbeddingDownloadError::failed)?;
+    let api = api_result.map_err(|error| {
+        EmbeddingDownloadError::failed(format!(
+            "Failed to initialize HuggingFace downloader: {}",
+            error
+        ))
+    })?;
     let repo = api.model(info.model_code.clone());
     let cache_repo =
         Cache::new(cache_dir.clone()).repo(Repo::new(info.model_code.clone(), RepoType::Model));
@@ -4058,18 +3927,20 @@ where
     }
 
     let hf_endpoint = download_source_endpoint(download_source).to_string();
-    ensure_system_proxy_env_for_url(&hf_endpoint).map_err(EmbeddingDownloadError::failed)?;
-    let api = ApiBuilder::new()
-        .with_cache_dir(effective_fastembed_cache_dir(managed_directory))
-        .with_endpoint(hf_endpoint.clone())
-        .with_progress(false)
-        .build()
-        .map_err(|error| {
-            EmbeddingDownloadError::failed(format!(
-                "Failed to initialize HuggingFace downloader: {}",
-                error
-            ))
-        })?;
+    let (_, api_result) = crate::network::with_proxy_env_for_url(&hf_endpoint, |_| {
+        ApiBuilder::new()
+            .with_cache_dir(effective_fastembed_cache_dir(managed_directory))
+            .with_endpoint(hf_endpoint.clone())
+            .with_progress(false)
+            .build()
+    })
+    .map_err(EmbeddingDownloadError::failed)?;
+    let api = api_result.map_err(|error| {
+        EmbeddingDownloadError::failed(format!(
+            "Failed to initialize HuggingFace downloader: {}",
+            error
+        ))
+    })?;
     let repo = api.model(download_model_id.to_string());
     let repo_info = repo.info().map_err(|error| {
         EmbeddingDownloadError::failed(format!(
@@ -4218,11 +4089,13 @@ fn effective_fastembed_cache_dir(default_dir: &Path) -> PathBuf {
 }
 
 fn download_metadata_client(endpoint: &str) -> Result<ureq::Agent, String> {
-    ensure_system_proxy_env_for_url(endpoint)?;
-    Ok(ureq::AgentBuilder::new()
-        .try_proxy_from_env(true)
-        .redirects(10)
-        .build())
+    crate::network::with_proxy_env_for_url(endpoint, |_| {
+        ureq::AgentBuilder::new()
+            .try_proxy_from_env(true)
+            .redirects(10)
+            .build()
+    })
+    .map(|(_, agent)| agent)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -5080,10 +4953,12 @@ fn preferred_local_execution_provider_plans(device_policy: &str) -> Vec<Executio
                 backend_label: "GPU-DirectML",
                 device_name: query_gpu_adapter_name_for_index(device_id)
                     .unwrap_or_else(|| "GPU".to_string()),
-                providers: vec![DirectML::default()
-                    .with_device_id(device_id)
-                    .build()
-                    .error_on_failure()],
+                providers: vec![
+                    DirectML::default()
+                        .with_device_id(device_id)
+                        .build()
+                        .error_on_failure(),
+                ],
             })
             .collect(),
         DEVICE_POLICY_GPU_CUDA => vec![ExecutionProviderPlan {
@@ -5264,8 +5139,8 @@ fn execution_provider_availability(result: Result<bool, ort::Error>) -> String {
 #[cfg(windows)]
 fn summarize_dxgi_adapters() -> String {
     use windows::Win32::Graphics::Dxgi::{
-        CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory6, DXGI_ADAPTER_DESC1,
-        DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+        CreateDXGIFactory1, DXGI_ADAPTER_DESC1, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+        IDXGIAdapter1, IDXGIFactory6,
     };
 
     fn adapter_name(desc: &DXGI_ADAPTER_DESC1) -> String {
@@ -5752,18 +5627,16 @@ fn path_ends_with_components(path: &Path, relative_path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_remote_repo_tree_url, build_supported_ureq_proxy_url, config_path, extract_next_link,
-        load_config, local_model_catalog, managed_model_root, migrate_legacy_managed_model_root,
-        normalize_device_policy, prepare_local_model_download_network,
-        prioritize_directml_adapter_indices, resolve_next_link_url, sanitize_model_id,
-        sanitize_proxy_display_url, save_config, select_local_model_source,
-        supported_embedding_preset, supported_embedding_preset_download_model_id,
+        DEVICE_POLICY_CPU_FASTEMBED, DEVICE_POLICY_GPU_CUDA, DEVICE_POLICY_GPU_DIRECTML,
         DirectMlAdapterCandidate, EmbeddingConfig, EmbeddingManager, FastembedModel,
-        LocalModelRoute, ManualPoolingMode, TextEmbedding, DEVICE_POLICY_CPU_FASTEMBED,
-        DEVICE_POLICY_GPU_CUDA, DEVICE_POLICY_GPU_DIRECTML, LOCAL_MODEL_DOWNLOAD_SOURCE_HF_MIRROR,
-        LOCAL_MODEL_DOWNLOAD_SOURCE_OFFICIAL,
+        LOCAL_MODEL_DOWNLOAD_SOURCE_HF_MIRROR, LOCAL_MODEL_DOWNLOAD_SOURCE_OFFICIAL,
+        LocalModelRoute, ManualPoolingMode, TextEmbedding, build_remote_repo_tree_url, config_path,
+        extract_next_link, load_config, local_model_catalog, managed_model_root,
+        migrate_legacy_managed_model_root, normalize_device_policy,
+        prepare_local_model_download_network, prioritize_directml_adapter_indices,
+        resolve_next_link_url, sanitize_model_id, save_config, select_local_model_source,
+        supported_embedding_preset, supported_embedding_preset_download_model_id,
     };
-    use http::Uri;
     use tempfile::tempdir;
 
     struct TempEnvGuard {
@@ -6065,9 +5938,11 @@ mod tests {
             .expect_err("activation should require a manual model download");
 
         assert!(err.contains("has not been downloaded"));
-        assert!(!managed_model_root(dir.path())
-            .join(sanitize_model_id("Qwen/Qwen3-Embedding-0.6B"))
-            .exists());
+        assert!(
+            !managed_model_root(dir.path())
+                .join(sanitize_model_id("Qwen/Qwen3-Embedding-0.6B"))
+                .exists()
+        );
     }
 
     #[test]
@@ -6285,30 +6160,6 @@ mod tests {
             .expect("last hidden state output");
 
         assert!(sentence_embedding_index < last_hidden_state_index);
-    }
-
-    #[test]
-    fn build_supported_ureq_proxy_url_maps_http_proxy() {
-        let proxy_uri: Uri = "http://127.0.0.1:7890".parse().expect("proxy uri");
-        let proxy_url =
-            build_supported_ureq_proxy_url(&proxy_uri, Some(("user", "pass"))).expect("proxy");
-        assert_eq!(
-            proxy_url.as_deref(),
-            Some("http://user:pass@127.0.0.1:7890")
-        );
-    }
-
-    #[test]
-    fn build_supported_ureq_proxy_url_skips_https_proxy_scheme() {
-        let proxy_uri: Uri = "https://127.0.0.1:8443".parse().expect("proxy uri");
-        let proxy_url = build_supported_ureq_proxy_url(&proxy_uri, None).expect("proxy");
-        assert_eq!(proxy_url, None);
-    }
-
-    #[test]
-    fn sanitize_proxy_display_url_hides_credentials() {
-        let display = sanitize_proxy_display_url("http://user:pass@127.0.0.1:7890");
-        assert_eq!(display, "http://127.0.0.1:7890");
     }
 
     #[test]

@@ -1452,13 +1452,14 @@ fn bind_feishu_oauth_listener() -> Result<(TcpListener, String), String> {
 }
 
 fn feishu_client() -> Result<Client, String> {
-    Client::builder()
-        .connect_timeout(Duration::from_secs(20))
-        .timeout(Duration::from_secs(45))
-        .gzip(true)
-        .deflate(true)
-        .build()
-        .map_err(|error| format!("Failed to build Feishu HTTP client: {}", error))
+    crate::network::reqwest_client(
+        crate::network::ReqwestClientOptions::new()
+            .connect_timeout(Duration::from_secs(20))
+            .timeout(Duration::from_secs(45))
+            .gzip(true)
+            .deflate(true),
+    )
+    .map_err(|error| format!("Failed to build Feishu HTTP client: {}", error))
 }
 
 fn validate_core_config(

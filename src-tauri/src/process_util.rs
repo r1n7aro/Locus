@@ -45,12 +45,14 @@ type GitResolutionCache = Option<Option<ResolvedGit>>;
 pub fn command(program: &str) -> std::process::Command {
     let mut cmd = Command::new(resolve_program(program));
     suppress_command_window(&mut cmd);
+    crate::network::apply_proxy_env_to_command(&mut cmd);
     cmd
 }
 
 pub fn async_command(program: &str) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new(resolve_program(program));
     suppress_async_command_window(&mut cmd);
+    crate::network::apply_proxy_env_to_async_command(&mut cmd);
     cmd
 }
 

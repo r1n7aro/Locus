@@ -29,11 +29,11 @@ where
     G: Fn(String) + Send + 'static,
     H: Fn(String, String) + Send + 'static,
 {
-    let client = reqwest::Client::builder()
-        .tcp_keepalive(std::time::Duration::from_secs(20))
-        .connect_timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+    let client = crate::network::reqwest_client(
+        crate::network::ReqwestClientOptions::new()
+            .tcp_keepalive(std::time::Duration::from_secs(20))
+            .connect_timeout(std::time::Duration::from_secs(30)),
+    )?;
 
     let body = build_request_body(
         model,

@@ -183,6 +183,7 @@ pub async fn run_turn<H: ClaudeSdkHost>(
         .or_insert_with(|| OsString::from("sdk-rs"));
     envs.entry(OsString::from("LOCUS_SESSION_ID"))
         .or_insert_with(|| OsString::from(options.locus_session_id.clone()));
+    crate::network::extend_proxy_env_map(&mut envs);
 
     if options.debug {
         let abs_dir = sdk_debug_dir();

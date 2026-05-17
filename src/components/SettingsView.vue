@@ -15,6 +15,7 @@ import DisplaySettings from "./settings/DisplaySettings.vue";
 import ShortcutSettings from "./settings/ShortcutSettings.vue";
 import ConsoleSettings from "./settings/ConsoleSettings.vue";
 import AboutSettings from "./settings/AboutSettings.vue";
+import ProxySettings from "./settings/ProxySettings.vue";
 import ApiProviders from "./settings/ApiProviders.vue";
 import CustomEndpointModal from "./settings/CustomEndpointModal.vue";
 import ModelDefaultsPanel from "./settings/ModelDefaults.vue";
@@ -141,6 +142,16 @@ watch(
         </button>
         <button
           class="sidebar-item"
+          :class="{ active: activeCategory === 'proxy' }"
+          @click="activeCategory = 'proxy'"
+        >
+          <svg viewBox="0 0 16 16" fill="currentColor" width="14" height="14">
+            <path d="M8 1.25a6.75 6.75 0 1 0 0 13.5A6.75 6.75 0 0 0 8 1.25zM2.8 7.25a5.25 5.25 0 0 1 2.044-3.376A8.66 8.66 0 0 0 4.13 7.25H2.8zm0 1.5h1.33c.111 1.294.36 2.454.714 3.376A5.25 5.25 0 0 1 2.8 8.75zm2.84 0h4.72C10.09 11.684 9.09 13.25 8 13.25S5.91 11.684 5.64 8.75zm0-1.5C5.91 4.316 6.91 2.75 8 2.75s2.09 1.566 2.36 4.5H5.64zm5.516 4.876c.354-.922.603-2.082.714-3.376h1.33a5.25 5.25 0 0 1-2.044 3.376zM11.87 7.25a8.66 8.66 0 0 0-.714-3.376A5.25 5.25 0 0 1 13.2 7.25h-1.33z"/>
+          </svg>
+          <span>{{ t("settings.tab.proxy") }}</span>
+        </button>
+        <button
+          class="sidebar-item"
           :class="{ active: activeCategory === 'archived' }"
           @click="activeCategory = 'archived'"
         >
@@ -245,6 +256,10 @@ watch(
           @set-global-permission-mode="chatStore.setToolPermissionMode"
           @set-permission="setToolPermission"
         />
+      </template>
+
+      <template v-if="activeCategory === 'proxy'">
+        <ProxySettings />
       </template>
 
       <template v-if="activeCategory === 'display'">

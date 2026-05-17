@@ -20,11 +20,14 @@ const STANDARD_LICENSE_FILES = {
 
 const BUNDLED_BINARIES = [
   {
-    kind: "static-runtime",
+    kind: "redistributable-binary",
     name: "ONNX Runtime",
-    version: "1.23.2",
-    sourceDir: path.join(THIRD_PARTY_SOURCE_DIR, "onnxruntime-1.23.2"),
-    distributedFiles: ["locus.exe (static link via ort-sys prebuilt binaries)"],
+    version: "1.23.0",
+    sourceDir: path.join(THIRD_PARTY_SOURCE_DIR, "onnxruntime-1.23.0"),
+    distributedFiles: [
+      "onnxruntime.dll",
+      "onnxruntime_providers_shared.dll",
+    ],
   },
   {
     kind: "redistributable-binary",
