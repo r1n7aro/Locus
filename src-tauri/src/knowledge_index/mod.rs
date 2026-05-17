@@ -2225,6 +2225,8 @@ where
     let mut catalog_rows = Vec::with_capacity(documents.len());
     let mut access_cache = HashMap::new();
     let general_config = load_general_config(&library_dir_for_working_dir(working_dir));
+    let automatic_lexical_progress_enabled =
+        general_config.enabled && general_config.lexical_search_enabled;
 
     for state in existing_states {
         if !doc_ids.contains(&state.doc_id) {
@@ -2322,7 +2324,10 @@ where
     } else {
         lexical_total
     };
-    if !surface_progress && should_surface_lexical_rebuild(false, callback_total) {
+    if !surface_progress
+        && automatic_lexical_progress_enabled
+        && should_surface_lexical_rebuild(false, callback_total)
+    {
         surface_progress = true;
         on_rebuild_progress("preparing", callback_total, callback_total, None);
     }
@@ -4587,7 +4592,11 @@ fn cosine_similarity(left: &[f32], right: &[f32]) -> f32 {
         norm_right += right[index] * right[index];
     }
     let denom = norm_left.sqrt() * norm_right.sqrt();
-    if denom < 1e-10 { 0.0 } else { dot / denom }
+    if denom < 1e-10 {
+        0.0
+    } else {
+        dot / denom
+    }
 }
 
 fn truncate_snippet(text: &str, max_chars: usize) -> String {
@@ -4646,20 +4655,21 @@ fn embedding_model_label(config: &EmbeddingConfig) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        DirectorySearchAccess, INDEX_VERSION, KnowledgeGeneralConfig, KnowledgeIndexState,
-        KnowledgeRuntime, LARGE_LEXICAL_REBUILD_DOC_THRESHOLD, RebuildReason,
         build_embedding_backend_state_marker, build_overview, embedding_rebuild_detail,
         embedding_stage_progress, lexical_stage_progress, library_dir_for_working_dir,
         list_cached_documents, needs_embedding_backfill, plan_managed_directory_reuse,
         query_documents, rebuild_plan_for_document, rebuild_reason_for_document,
         reconcile_unity_reference_import, reconcile_workspace_internal, save_general_config,
+        DirectorySearchAccess, KnowledgeGeneralConfig, KnowledgeIndexState, KnowledgeRuntime,
+        RebuildReason, INDEX_VERSION, LARGE_LEXICAL_REBUILD_DOC_THRESHOLD,
     };
     use crate::knowledge_index::db::{ChunkRecord, DocIndexState, KnowledgeDb};
     use crate::knowledge_store::{
+        default_directory_config_for_type, save_document, update_directory_config,
         FolderIndexRuleSetting, KnowledgeConfigSource, KnowledgeConfigSourceKind,
         KnowledgeDocument, KnowledgeExternalSource, KnowledgeInjectMode,
         KnowledgeSearchMatchSection, KnowledgeSourceProvider, KnowledgeStorageSource,
-        KnowledgeType, default_directory_config_for_type, save_document, update_directory_config,
+        KnowledgeType,
     };
     use crate::unity_docs;
     use std::{path::Path, sync::Arc, time::Duration};
@@ -5282,13 +5292,11 @@ mod tests {
             .await
             .expect("rebuild clears bootstrap cache");
 
-        assert!(
-            state
-                .catalog_bootstrapped_workspaces
-                .lock()
-                .await
-                .is_empty()
-        );
+        assert!(state
+            .catalog_bootstrapped_workspaces
+            .lock()
+            .await
+            .is_empty());
     }
 
     #[test]
@@ -5421,11 +5429,9 @@ mod tests {
             decision.excluded_prefixes,
             vec![(KnowledgeType::Reference, "unity-official-docs".to_string())]
         );
-        assert!(
-            decision
-                .retained_doc_ids
-                .contains("kd_unity_execution_order")
-        );
+        assert!(decision
+            .retained_doc_ids
+            .contains("kd_unity_execution_order"));
         assert_eq!(
             db.get_managed_directory_snapshot(unity_docs::UNITY_REFERENCE_MANAGED_PATH)
                 .expect("load managed snapshot")
@@ -5589,6 +5595,7 @@ mod tests {
         let workspace = tempdir().expect("workspace");
         let working_dir = workspace.path().to_string_lossy().to_string();
         seed_memory_documents(&working_dir, LARGE_LEXICAL_REBUILD_DOC_THRESHOLD + 1);
+        save_test_general_config(&working_dir, true, false);
         let state = create_state(&working_dir);
 
         reconcile_workspace_internal(
@@ -5639,6 +5646,7 @@ mod tests {
         let workspace = tempdir().expect("workspace");
         let working_dir = workspace.path().to_string_lossy().to_string();
         seed_memory_documents(&working_dir, LARGE_LEXICAL_REBUILD_DOC_THRESHOLD + 1);
+        save_test_general_config(&working_dir, true, false);
         let state = create_state(&working_dir);
 
         reconcile_workspace_internal(
@@ -5692,11 +5700,77 @@ mod tests {
         assert!(events.iter().any(|(stage, _, total, _)| {
             stage == "indexing" && *total == LARGE_LEXICAL_REBUILD_DOC_THRESHOLD
         }));
+        assert!(events
+            .iter()
+            .all(|(_, _, total, _)| *total == LARGE_LEXICAL_REBUILD_DOC_THRESHOLD));
+    }
+
+    #[tokio::test]
+    async fn reconcile_workspace_suppresses_progress_for_large_lexical_disable_cleanup() {
+        let workspace = tempdir().expect("workspace");
+        let working_dir = workspace.path().to_string_lossy().to_string();
+        seed_memory_documents(&working_dir, LARGE_LEXICAL_REBUILD_DOC_THRESHOLD + 1);
+        save_test_general_config(&working_dir, true, false);
+        let state = create_state(&working_dir);
+
+        reconcile_workspace_internal(
+            &working_dir,
+            None,
+            state.clone(),
+            false,
+            false,
+            false,
+            |_stage, _processed, _total, _path| {},
+        )
+        .await
+        .expect("initial lexical reconcile");
+        let indexed_doc_count = state
+            .db()
+            .list_all_index_states()
+            .expect("list initial index states")
+            .len();
+
+        save_test_general_config(&working_dir, false, false);
+
+        let mut events = Vec::new();
+        let report = reconcile_workspace_internal(
+            &working_dir,
+            None,
+            state.clone(),
+            false,
+            false,
+            false,
+            |stage, processed, total, path| {
+                events.push((
+                    stage.to_string(),
+                    processed,
+                    total,
+                    path.map(|value| value.to_string()),
+                ));
+            },
+        )
+        .await
+        .expect("lexical disable reconcile");
+        let sample_state = state
+            .db()
+            .get_index_state("kd_test_memory_doc_000")
+            .expect("load index state")
+            .expect("stored index state");
+        let hits = state
+            .tantivy()
+            .search("Project memory body 000", 5, 2.0)
+            .expect("search tantivy after cleanup");
+
+        assert!(indexed_doc_count >= LARGE_LEXICAL_REBUILD_DOC_THRESHOLD);
+        assert_eq!(report.stale, indexed_doc_count);
+        assert_eq!(report.rebuilt, indexed_doc_count);
         assert!(
+            events.is_empty(),
+            "lexical disable cleanup should not surface progress: {:?}",
             events
-                .iter()
-                .all(|(_, _, total, _)| *total == LARGE_LEXICAL_REBUILD_DOC_THRESHOLD)
         );
+        assert!(sample_state.embedding_backend.ends_with("|l=0|v=0"));
+        assert!(hits.is_empty());
     }
 
     #[tokio::test]
