@@ -67,9 +67,12 @@ function formatPercent(value: number | null | undefined): string {
 function retrievalModeLabel(mode: KnowledgeSearchMatchKind): string {
   switch (mode) {
     case "hybrid":
+    case "grepHybrid":
       return t("knowledge.dashboard.knowledge.searchModeHybrid");
     case "semantic":
       return t("knowledge.dashboard.knowledge.searchModeSemantic");
+    case "grep":
+      return t("knowledge.dashboard.knowledge.searchModeGrep");
     default:
       return t("knowledge.dashboard.knowledge.searchModeLexical");
   }
@@ -330,6 +333,9 @@ const availableSearchMode = computed(() => {
   }
   if (lexicalEnabled.value) {
     return retrievalModeLabel("lexical");
+  }
+  if (props.generalConfig?.enabled) {
+    return retrievalModeLabel("grep");
   }
   return t("knowledge.dashboard.knowledge.disabled");
 });
@@ -861,7 +867,7 @@ const managedDirectoryPath = computed(() =>
         </div>
 
         <div class="settings-footer">
-          <BaseButton :disabled="pending" @click="emit('rebuildLexical')">
+          <BaseButton :disabled="pending || !lexicalEnabled" @click="emit('rebuildLexical')">
             {{ t("knowledge.dashboard.knowledge.rebuildIndex") }}
           </BaseButton>
         </div>

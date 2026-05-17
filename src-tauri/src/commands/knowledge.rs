@@ -1899,6 +1899,13 @@ fn enrich_knowledge_list_items(
     app_root: Option<&std::path::PathBuf>,
     items: &mut [KnowledgeListItem],
 ) {
+    let library_dir = if working_dir.trim().is_empty() {
+        knowledge_index::no_workspace_library_dir()
+    } else {
+        knowledge_index::library_dir_for_working_dir(working_dir)
+    };
+    let general_config = knowledge_index::load_general_config(&library_dir);
+
     for item in items {
         if item.byte_size.is_none() {
             if let Ok(document) = knowledge_store::load_document_by_path_with_app_root(
@@ -1916,8 +1923,16 @@ fn enrich_knowledge_list_items(
             item.doc_type,
             &item.path,
         ) {
-            item.lexical_search_enabled = Some(access.lexical_enabled);
-            item.semantic_search_enabled = Some(access.vector_enabled);
+            item.lexical_search_enabled = Some(
+                general_config.enabled
+                    && general_config.lexical_search_enabled
+                    && access.lexical_enabled,
+            );
+            item.semantic_search_enabled = Some(
+                general_config.enabled
+                    && general_config.semantic_search_enabled
+                    && access.vector_enabled,
+            );
         }
     }
 }

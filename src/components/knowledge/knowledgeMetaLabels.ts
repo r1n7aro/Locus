@@ -269,6 +269,13 @@ export function buildKnowledgeSearchMatchTags(
   matchKind: KnowledgeSearchMatchKind,
 ): KnowledgeListTag[] {
   const tags: KnowledgeListTag[] = [];
+  if (matchKind === "grep" || matchKind === "grepHybrid") {
+    tags.push({
+      text: t("knowledge.meta.tag.grep"),
+      tone: "search-on",
+      title: `${t("knowledge.meta.tag.grep")} - ${t("knowledge.search.grep")}`,
+    });
+  }
   if (matchKind === "lexical" || matchKind === "hybrid") {
     tags.push({
       text: tagForSearchKind("lexical"),
@@ -276,7 +283,11 @@ export function buildKnowledgeSearchMatchTags(
       title: `${tagForSearchKind("lexical")} - ${t("knowledge.search.lexical")}`,
     });
   }
-  if (matchKind === "semantic" || matchKind === "hybrid") {
+  if (
+    matchKind === "semantic" ||
+    matchKind === "hybrid" ||
+    matchKind === "grepHybrid"
+  ) {
     tags.push({
       text: tagForSearchKind("semantic"),
       tone: "search-on",

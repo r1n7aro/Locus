@@ -6,7 +6,7 @@ use tantivy::indexer::{IndexWriterOptions, UserOperation};
 use tantivy::query::QueryParser;
 use tantivy::schema::*;
 use tantivy::tokenizer::{LowerCaser, NgramTokenizer, TextAnalyzer};
-use tantivy::{doc, Index, IndexReader, IndexWriter, ReloadPolicy, Term};
+use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, Term, doc};
 
 const TANTIVY_INDEX_FORMAT: &str = "tantivy-0.26-ngram-v2";
 const TANTIVY_STAMP_FILE: &str = "locus_knowledge_tantivy_format";
@@ -400,6 +400,11 @@ impl KnowledgeTantivyIndex {
         }
 
         Ok(hits)
+    }
+
+    pub fn indexed_entry_count(&self) -> Result<usize, String> {
+        self.reader.reload().map_err(|e| e.to_string())?;
+        Ok(self.reader.searcher().num_docs() as usize)
     }
 
     pub fn index_dir(&self) -> &Path {

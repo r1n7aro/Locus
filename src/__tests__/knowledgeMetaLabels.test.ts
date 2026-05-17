@@ -13,8 +13,10 @@ vi.mock("../i18n", () => ({
     "knowledge.meta.tag.lexicalOff": "LX-",
     "knowledge.meta.tag.semanticOn": "SM",
     "knowledge.meta.tag.semanticOff": "SM-",
+    "knowledge.meta.tag.grep": "TXT",
     "knowledge.search.lexical": "全文匹配",
     "knowledge.search.semantic": "语义匹配",
+    "knowledge.search.grep": "文本匹配",
     "knowledge.directoryConfig.lexicalSearch": "全文检索",
     "knowledge.directoryConfig.semanticSearch": "语义检索",
     "knowledge.directoryConfig.lexicalRuleInheritHint": "沿用 LX 规则",
@@ -159,6 +161,25 @@ describe("knowledgeMetaLabels", () => {
         text: "LX",
         tone: "search-on",
         title: "LX - 全文匹配",
+      },
+      {
+        text: "SM",
+        tone: "search-on",
+        title: "SM - 语义匹配",
+      },
+    ]);
+    expect(buildKnowledgeSearchMatchTags("grep")).toEqual([
+      {
+        text: "TXT",
+        tone: "search-on",
+        title: "TXT - 文本匹配",
+      },
+    ]);
+    expect(buildKnowledgeSearchMatchTags("grepHybrid")).toEqual([
+      {
+        text: "TXT",
+        tone: "search-on",
+        title: "TXT - 文本匹配",
       },
       {
         text: "SM",

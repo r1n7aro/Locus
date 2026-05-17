@@ -38,7 +38,9 @@ use self::embedding::{EmbeddingActivationProgress, EmbeddingManager};
 use self::semantic_rank::{
     passes_semantic_score_threshold, semantic_confidence, should_use_semantic_recall,
 };
-use self::tantivy_index::{KnowledgeTantivyIndex, LexicalBulkWriterGuard, LexicalDocumentRecord};
+use self::tantivy_index::{
+    KnowledgeTantivyIndex, LexicalBulkWriterGuard, LexicalDocumentRecord, LexicalHit,
+};
 
 pub const INDEX_VERSION: i32 = 3;
 const TANTIVY_BATCH_DOCS: usize = 128;
@@ -64,7 +66,7 @@ impl Default for KnowledgeGeneralConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            lexical_search_enabled: true,
+            lexical_search_enabled: false,
             semantic_search_enabled: false,
         }
     }
@@ -744,10 +746,17 @@ struct SemanticHit {
     snippet: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeywordSearchKind {
+    LexicalIndex,
+    TextScan,
+}
+
 #[derive(Debug, Clone)]
 struct FusionEntry {
     doc_id: String,
     lexical_rank: Option<usize>,
+    lexical_kind: Option<KeywordSearchKind>,
     semantic_rank: Option<usize>,
     semantic_score: Option<f32>,
     section: String,
@@ -887,6 +896,22 @@ pub fn save_general_config(
     let data = serde_json::to_string_pretty(config)
         .map_err(|e| format!("Failed to serialize knowledge config: {}", e))?;
     std::fs::write(&path, data).map_err(|e| format!("Failed to write knowledge config: {}", e))
+}
+
+fn apply_general_search_config(
+    access: DirectorySearchAccess,
+    config: &KnowledgeGeneralConfig,
+) -> DirectorySearchAccess {
+    if !config.enabled {
+        return DirectorySearchAccess {
+            lexical_enabled: false,
+            vector_enabled: false,
+        };
+    }
+    DirectorySearchAccess {
+        lexical_enabled: access.lexical_enabled && config.lexical_search_enabled,
+        vector_enabled: access.vector_enabled && config.semantic_search_enabled,
+    }
 }
 
 pub async fn maybe_auto_activate_embedding_runtime(
@@ -1651,16 +1676,20 @@ fn collect_vector_backfill_candidates(
 ) -> Result<EmbeddingBackfillSelection, String> {
     let mut selection = EmbeddingBackfillSelection::default();
     let mut access_cache = HashMap::new();
+    let general_config = load_general_config(&library_dir_for_working_dir(working_dir));
 
     for existing_state in db.list_all_index_states()? {
         let doc_type = knowledge_type_from_str(&existing_state.doc_type)?;
-        let access = cached_document_search_access(
-            working_dir,
-            app_knowledge_dir,
-            doc_type,
-            &existing_state.doc_path,
-            &mut access_cache,
-        )?;
+        let access = apply_general_search_config(
+            cached_document_search_access(
+                working_dir,
+                app_knowledge_dir,
+                doc_type,
+                &existing_state.doc_path,
+                &mut access_cache,
+            )?,
+            &general_config,
+        );
         if !access.vector_enabled {
             continue;
         }
@@ -1959,6 +1988,7 @@ where
     let mut report = ReconcileReport::default();
     report.removed = removed_doc_ids.len();
     let mut access_cache = HashMap::new();
+    let general_config = load_general_config(&library_dir_for_working_dir(working_dir));
     let mut scanned = 0usize;
     let mut indexed_docs = 0usize;
     let mut pending_catalog_rows = Vec::with_capacity(UNITY_IMPORT_BULK_MAX_DOCS_PER_COMMIT);
@@ -1985,13 +2015,16 @@ where
         let analyzed_batch = documents_batch
             .iter()
             .map(|document| {
-                let access = cached_document_search_access(
-                    working_dir,
-                    app_knowledge_dir,
-                    document.doc_type,
-                    &document.path,
-                    &mut access_cache,
-                )?;
+                let access = apply_general_search_config(
+                    cached_document_search_access(
+                        working_dir,
+                        app_knowledge_dir,
+                        document.doc_type,
+                        &document.path,
+                        &mut access_cache,
+                    )?,
+                    &general_config,
+                );
                 let state = build_index_state(document, backend_signature, access);
                 let catalog_row = build_document_catalog_row(document, access)?;
                 Ok((document.clone(), state, access, catalog_row))
@@ -2191,6 +2224,7 @@ where
     let mut removed_lexical_doc_ids = Vec::new();
     let mut catalog_rows = Vec::with_capacity(documents.len());
     let mut access_cache = HashMap::new();
+    let general_config = load_general_config(&library_dir_for_working_dir(working_dir));
 
     for state in existing_states {
         if !doc_ids.contains(&state.doc_id) {
@@ -2213,7 +2247,8 @@ where
             &mut access_cache,
         )?;
 
-        let batch = batch_document_search_inputs(documents_batch.to_vec(), &access_cache);
+        let batch =
+            batch_document_search_inputs(documents_batch.to_vec(), &access_cache, &general_config);
         let parallelize_prepare_analysis =
             should_parallelize_prepare_analysis(embedding_backfill_ready, &batch);
         let current_file = batch.last().map(|(document, _)| document.path.as_str());
@@ -2443,9 +2478,7 @@ fn plan_unity_reference_reuse(
     if current_snapshot.document_count != current_snapshot.expected_document_count {
         eprintln!(
             "[KnowledgeIndex] unity reuse skipped workspace={} reason=snapshot_count_mismatch current={} expected={}",
-            working_dir,
-            current_snapshot.document_count,
-            current_snapshot.expected_document_count
+            working_dir, current_snapshot.document_count, current_snapshot.expected_document_count
         );
         return Ok(None);
     }
@@ -2455,8 +2488,7 @@ fn plan_unity_reference_reuse(
     else {
         eprintln!(
             "[KnowledgeIndex] unity reuse skipped workspace={} reason=no_stored_snapshot managed_path={}",
-            working_dir,
-            current_snapshot.managed_path
+            working_dir, current_snapshot.managed_path
         );
         return Ok(None);
     };
@@ -2515,18 +2547,22 @@ fn plan_unity_reference_reuse(
     };
 
     let mut access_cache = HashMap::new();
+    let general_config = load_general_config(&library_dir_for_working_dir(working_dir));
     let mut retained_doc_ids = HashSet::with_capacity(current_snapshot.document_count);
     for row in catalog_rows {
         let Some(state) = state_map.get(&row.doc_id) else {
             return Ok(None);
         };
-        let access = cached_document_search_access(
-            working_dir,
-            app_knowledge_dir,
-            KnowledgeType::Reference,
-            &row.doc_path,
-            &mut access_cache,
-        )?;
+        let access = apply_general_search_config(
+            cached_document_search_access(
+                working_dir,
+                app_knowledge_dir,
+                KnowledgeType::Reference,
+                &row.doc_path,
+                &mut access_cache,
+            )?,
+            &general_config,
+        );
         let expected_backend = build_embedding_backend_state_marker(backend_signature, access);
         if state.stale != 0
             || state.index_version != INDEX_VERSION
@@ -2942,12 +2978,16 @@ pub async fn upsert_document(
     let tantivy = state.tantivy();
     let mgr_handle = state.embedding_mgr();
     let mgr = mgr_handle.lock().await;
-    let access = knowledge_store::effective_document_search_access_with_app_root(
-        working_dir,
-        app_knowledge_dir,
-        document.doc_type,
-        &document.path,
-    )?;
+    let general_config = load_general_config(&library_dir_for_working_dir(working_dir));
+    let access = apply_general_search_config(
+        knowledge_store::effective_document_search_access_with_app_root(
+            working_dir,
+            app_knowledge_dir,
+            document.doc_type,
+            &document.path,
+        )?,
+        &general_config,
+    );
     let desired_state = build_index_state(&document, &mgr.backend_signature_json(), access);
     let catalog_row = build_document_catalog_row(&document, access)?;
     let prepared =
@@ -3002,6 +3042,8 @@ pub async fn build_overview(
     ensure_document_catalog_available(working_dir, app_knowledge_dir, state.clone()).await?;
 
     let db = state.db();
+    let library_dir = library_dir_for_working_dir(working_dir);
+    let general_config = load_general_config(&library_dir);
     let catalog_rows = db.list_document_catalog_entries(None)?;
     let all_states = db.list_all_index_states()?;
     let state_map: HashMap<String, DocIndexState> = all_states
@@ -3015,26 +3057,50 @@ pub async fn build_overview(
         .as_ref()
         .map(|value| value.total_docs)
         .unwrap_or(0);
-    let mut lexical_indexable_count = unity_managed_cache
-        .as_ref()
-        .map(|value| value.lexical_enabled_docs)
-        .unwrap_or(0);
-    let mut lexical_fresh_count = unity_managed_cache
-        .as_ref()
-        .map(|value| value.lexical_fresh_docs)
-        .unwrap_or(0);
-    let mut lexical_stale_count = unity_managed_cache
-        .as_ref()
-        .map(|value| value.lexical_stale_docs)
-        .unwrap_or(0);
-    let mut vector_indexable_count = unity_managed_cache
-        .as_ref()
-        .map(|value| value.vector_enabled_docs)
-        .unwrap_or(0);
-    let mut fresh_enabled_count = unity_managed_cache
-        .as_ref()
-        .map(|value| value.fresh_enabled_docs)
-        .unwrap_or(0);
+    let mut lexical_indexable_count =
+        if general_config.enabled && general_config.lexical_search_enabled {
+            unity_managed_cache
+                .as_ref()
+                .map(|value| value.lexical_enabled_docs)
+                .unwrap_or(0)
+        } else {
+            0
+        };
+    let mut lexical_fresh_count = if general_config.enabled && general_config.lexical_search_enabled
+    {
+        unity_managed_cache
+            .as_ref()
+            .map(|value| value.lexical_fresh_docs)
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    let mut lexical_stale_count = if general_config.enabled && general_config.lexical_search_enabled
+    {
+        unity_managed_cache
+            .as_ref()
+            .map(|value| value.lexical_stale_docs)
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    let mut vector_indexable_count =
+        if general_config.enabled && general_config.semantic_search_enabled {
+            unity_managed_cache
+                .as_ref()
+                .map(|value| value.vector_enabled_docs)
+                .unwrap_or(0)
+        } else {
+            0
+        };
+    let mut fresh_enabled_count = if general_config.enabled {
+        unity_managed_cache
+            .as_ref()
+            .map(|value| value.fresh_enabled_docs)
+            .unwrap_or(0)
+    } else {
+        0
+    };
     for row in catalog_rows {
         if unity_managed_cache.is_some()
             && row.doc_type == KnowledgeType::Reference.as_str()
@@ -3050,13 +3116,16 @@ pub async fn build_overview(
             "reference" => KnowledgeType::Reference,
             _ => continue,
         };
-        let access = cached_document_search_access(
-            working_dir,
-            app_knowledge_dir,
-            doc_type,
-            &row.doc_path,
-            &mut access_cache,
-        )?;
+        let access = apply_general_search_config(
+            cached_document_search_access(
+                working_dir,
+                app_knowledge_dir,
+                doc_type,
+                &row.doc_path,
+                &mut access_cache,
+            )?,
+            &general_config,
+        );
         if access.lexical_enabled {
             lexical_indexable_count += 1;
         }
@@ -3080,8 +3149,6 @@ pub async fn build_overview(
     let embedded_chunk_count = db.count_embeddings_for_fresh_docs()?;
     let embedded_doc_count = db.count_distinct_docs_with_embeddings_for_fresh_docs()?;
 
-    let library_dir = library_dir_for_working_dir(working_dir);
-    let general_config = load_general_config(&library_dir);
     let (
         embedding_config,
         backend_signature,
@@ -3186,14 +3253,33 @@ pub async fn query_documents(
     let tantivy = state.tantivy();
 
     let query_limit = limit.max(1).min(50);
-    let lexical_hits = if general_config.lexical_search_enabled {
-        lexical_query
-            .filter(|value| !value.trim().is_empty())
-            .map(|value| tantivy.search(value, query_limit * 6, 2.0))
-            .transpose()?
-            .unwrap_or_default()
-    } else {
-        Vec::new()
+    let lexical_query = lexical_query.filter(|value| !value.trim().is_empty());
+    let (lexical_hits, lexical_kind) = match lexical_query {
+        Some(value) if general_config.lexical_search_enabled => (
+            lexical_index_search_documents(
+                working_dir,
+                app_knowledge_dir,
+                &db,
+                &tantivy,
+                value,
+                types,
+                path_prefix,
+                query_limit * 6,
+            )?,
+            Some(KeywordSearchKind::LexicalIndex),
+        ),
+        Some(value) => (
+            text_scan_search_documents(
+                working_dir,
+                app_knowledge_dir,
+                value,
+                types,
+                path_prefix,
+                query_limit * 6,
+            )?,
+            Some(KeywordSearchKind::TextScan),
+        ),
+        None => (Vec::new(), None),
     };
     let semantic_hits = if general_config.semantic_search_enabled
         && semantic_query
@@ -3272,6 +3358,7 @@ pub async fn query_documents(
             .or_insert_with(|| FusionEntry {
                 doc_id: hit.doc_id.clone(),
                 lexical_rank: None,
+                lexical_kind: None,
                 semantic_rank: None,
                 semantic_score: None,
                 section: hit.section.clone(),
@@ -3279,6 +3366,7 @@ pub async fn query_documents(
             });
         if entry.lexical_rank.is_none() {
             entry.lexical_rank = Some(rank);
+            entry.lexical_kind = lexical_kind;
             entry.section = hit.section.clone();
             entry.snippet = hit.snippet.clone();
         }
@@ -3289,6 +3377,7 @@ pub async fn query_documents(
             .or_insert_with(|| FusionEntry {
                 doc_id: hit.doc_id.clone(),
                 lexical_rank: None,
+                lexical_kind: None,
                 semantic_rank: None,
                 semantic_score: None,
                 section: hit.section.clone(),
@@ -3331,8 +3420,14 @@ pub async fn query_documents(
                 score += 0.3;
             }
             let match_kind = match (entry.lexical_rank.is_some(), entry.semantic_rank.is_some()) {
-                (true, true) => "hybrid",
-                (true, false) => "lexical",
+                (true, true) => match entry.lexical_kind {
+                    Some(KeywordSearchKind::TextScan) => "grepHybrid",
+                    _ => "hybrid",
+                },
+                (true, false) => match entry.lexical_kind {
+                    Some(KeywordSearchKind::TextScan) => "grep",
+                    _ => "lexical",
+                },
                 (false, true) => "semantic",
                 _ => "lexical",
             };
@@ -4049,6 +4144,7 @@ fn populate_document_access_cache_for_batch(
 fn batch_document_search_inputs(
     documents: Vec<KnowledgeDocument>,
     cache: &HashMap<DirectoryAccessCacheKey, DirectorySearchAccess>,
+    general_config: &KnowledgeGeneralConfig,
 ) -> Vec<PendingDocumentAnalysisInput> {
     documents
         .into_iter()
@@ -4066,7 +4162,10 @@ fn batch_document_search_inputs(
                     lexical_enabled: true,
                     vector_enabled: true,
                 });
-            (document, access)
+            (
+                document,
+                apply_general_search_config(access, general_config),
+            )
         })
         .collect()
 }
@@ -4208,6 +4307,149 @@ fn needs_embedding_backfill(db: &KnowledgeDb, doc_id: &str) -> Result<bool, Stri
     Ok(embedding_count < chunk_count)
 }
 
+fn lexical_index_search_documents(
+    working_dir: &str,
+    app_knowledge_dir: Option<&std::path::PathBuf>,
+    db: &KnowledgeDb,
+    tantivy: &KnowledgeTantivyIndex,
+    query: &str,
+    types: Option<&[KnowledgeType]>,
+    path_prefix: Option<&str>,
+    limit: usize,
+) -> Result<Vec<LexicalHit>, String> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let target_limit = limit.max(1);
+    let indexed_entry_count = tantivy.indexed_entry_count()?;
+    if indexed_entry_count == 0 {
+        return Ok(Vec::new());
+    }
+
+    let max_search_limit = indexed_entry_count.max(target_limit).min(50_000);
+    let mut search_limit = target_limit.min(max_search_limit);
+
+    loop {
+        let hits = tantivy.search(query, search_limit, 2.0)?;
+        let hit_doc_ids = hits
+            .iter()
+            .map(|hit| hit.doc_id.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let doc_map = load_cached_documents_by_ids(db, &hit_doc_ids)?;
+        let mut access_cache = HashMap::new();
+        let mut seen_doc_ids = HashSet::new();
+        let mut filtered_hits = Vec::new();
+
+        for hit in hits.iter() {
+            if !cached_doc_allowed(&doc_map, &hit.doc_id, types, path_prefix) {
+                continue;
+            }
+            let Some(document) = doc_map.get(&hit.doc_id) else {
+                continue;
+            };
+            let access = cached_document_entry_search_access(
+                working_dir,
+                app_knowledge_dir,
+                document,
+                &mut access_cache,
+            )?;
+            if !access.lexical_enabled {
+                continue;
+            }
+            if seen_doc_ids.insert(hit.doc_id.clone()) {
+                filtered_hits.push(hit.clone());
+                if filtered_hits.len() >= target_limit {
+                    return Ok(filtered_hits);
+                }
+            }
+        }
+
+        if hits.len() < search_limit || search_limit >= max_search_limit {
+            return Ok(filtered_hits);
+        }
+
+        let next_limit = search_limit.saturating_mul(2).min(max_search_limit);
+        if next_limit == search_limit {
+            return Ok(filtered_hits);
+        }
+        search_limit = next_limit;
+    }
+}
+
+fn text_scan_search_documents(
+    working_dir: &str,
+    app_knowledge_dir: Option<&std::path::PathBuf>,
+    query: &str,
+    types: Option<&[KnowledgeType]>,
+    path_prefix: Option<&str>,
+    limit: usize,
+) -> Result<Vec<LexicalHit>, String> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut documents = Vec::new();
+    if let Some(types) = types {
+        for doc_type in types {
+            documents.extend(knowledge_store::load_documents_with_app_root(
+                working_dir,
+                app_knowledge_dir,
+                Some(*doc_type),
+                path_prefix,
+            )?);
+        }
+    } else {
+        documents = knowledge_store::load_documents_with_app_root(
+            working_dir,
+            app_knowledge_dir,
+            None,
+            path_prefix,
+        )?;
+    }
+
+    let mut hits = documents
+        .into_iter()
+        .filter_map(|document| {
+            let access = knowledge_store::effective_document_search_access_with_app_root(
+                working_dir,
+                app_knowledge_dir,
+                document.doc_type,
+                &document.path,
+            )
+            .ok()?;
+            if !access.lexical_enabled {
+                return None;
+            }
+            let (score, snippet, matched_section) =
+                knowledge_store::score_document_text_match(query, &document)?;
+            Some(LexicalHit {
+                doc_id: document.id,
+                section: match_section_name(matched_section).to_string(),
+                title: document.title,
+                path: document.path,
+                score,
+                snippet: truncate_snippet(&snippet, 220),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    hits.sort_by(|left, right| {
+        right
+            .score
+            .partial_cmp(&left.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.path.cmp(&right.path))
+            .then_with(|| left.title.cmp(&right.title))
+    });
+    hits.truncate(limit.max(1));
+    Ok(hits)
+}
+
 fn semantic_recall(
     db: &KnowledgeDb,
     embedding_mgr: &EmbeddingManager,
@@ -4298,6 +4540,15 @@ fn section_to_match_section(section: &str) -> Option<KnowledgeSearchMatchSection
     }
 }
 
+fn match_section_name(section: Option<KnowledgeSearchMatchSection>) -> &'static str {
+    match section {
+        Some(KnowledgeSearchMatchSection::Summary) => "summary",
+        Some(KnowledgeSearchMatchSection::MaintenanceRules) => "maintenanceRules",
+        Some(KnowledgeSearchMatchSection::Body) => "body",
+        None => "",
+    }
+}
+
 fn estimate_document_tokens(document: &KnowledgeDocument) -> u64 {
     let mut text = String::new();
     if let Some(summary) = knowledge_store::active_summary(document) {
@@ -4336,11 +4587,7 @@ fn cosine_similarity(left: &[f32], right: &[f32]) -> f32 {
         norm_right += right[index] * right[index];
     }
     let denom = norm_left.sqrt() * norm_right.sqrt();
-    if denom < 1e-10 {
-        0.0
-    } else {
-        dot / denom
-    }
+    if denom < 1e-10 { 0.0 } else { dot / denom }
 }
 
 fn truncate_snippet(text: &str, max_chars: usize) -> String {
@@ -4399,19 +4646,20 @@ fn embedding_model_label(config: &EmbeddingConfig) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
+        DirectorySearchAccess, INDEX_VERSION, KnowledgeGeneralConfig, KnowledgeIndexState,
+        KnowledgeRuntime, LARGE_LEXICAL_REBUILD_DOC_THRESHOLD, RebuildReason,
         build_embedding_backend_state_marker, build_overview, embedding_rebuild_detail,
         embedding_stage_progress, lexical_stage_progress, library_dir_for_working_dir,
         list_cached_documents, needs_embedding_backfill, plan_managed_directory_reuse,
-        rebuild_plan_for_document, rebuild_reason_for_document, reconcile_unity_reference_import,
-        reconcile_workspace_internal, DirectorySearchAccess, KnowledgeIndexState, KnowledgeRuntime,
-        RebuildReason, INDEX_VERSION, LARGE_LEXICAL_REBUILD_DOC_THRESHOLD,
+        query_documents, rebuild_plan_for_document, rebuild_reason_for_document,
+        reconcile_unity_reference_import, reconcile_workspace_internal, save_general_config,
     };
     use crate::knowledge_index::db::{ChunkRecord, DocIndexState, KnowledgeDb};
     use crate::knowledge_store::{
-        default_directory_config_for_type, save_document, update_directory_config,
         FolderIndexRuleSetting, KnowledgeConfigSource, KnowledgeConfigSourceKind,
-        KnowledgeDocument, KnowledgeExternalSource, KnowledgeInjectMode, KnowledgeSourceProvider,
-        KnowledgeStorageSource, KnowledgeType,
+        KnowledgeDocument, KnowledgeExternalSource, KnowledgeInjectMode,
+        KnowledgeSearchMatchSection, KnowledgeSourceProvider, KnowledgeStorageSource,
+        KnowledgeType, default_directory_config_for_type, save_document, update_directory_config,
     };
     use crate::unity_docs;
     use std::{path::Path, sync::Arc, time::Duration};
@@ -4430,6 +4678,15 @@ mod tests {
             embedding_backend: "backend-a".to_string(),
             stale: 0,
         }
+    }
+
+    #[test]
+    fn general_config_defaults_keep_lexical_search_disabled() {
+        let config = KnowledgeGeneralConfig::default();
+
+        assert!(config.enabled);
+        assert!(!config.lexical_search_enabled);
+        assert!(!config.semantic_search_enabled);
     }
 
     #[test]
@@ -4542,14 +4799,22 @@ mod tests {
         assert!(!needs_embedding_backfill(&db, "doc-1").expect("complete embeddings"));
     }
 
-    fn seed_design_document(working_dir: &str) {
+    fn save_design_document(
+        working_dir: &str,
+        id: &str,
+        path: &str,
+        title: &str,
+        summary: Option<&str>,
+        body: &str,
+        updated_at: i64,
+    ) {
         save_document(
             working_dir,
             KnowledgeDocument {
-                id: "kd_test_design_doc".to_string(),
+                id: id.to_string(),
                 doc_type: KnowledgeType::Design,
-                path: "combat/core-loop.md".to_string(),
-                title: "核心循环".to_string(),
+                path: path.to_string(),
+                title: title.to_string(),
                 inject_mode: KnowledgeInjectMode::Path,
                 inherit_inject_mode: false,
                 inject_mode_source: KnowledgeConfigSource {
@@ -4572,14 +4837,26 @@ mod tests {
                 skill_surface: None,
                 command_trigger: None,
                 argument_hint: None,
-                summary: Some("战斗核心循环".to_string()),
-                body: "正文".to_string(),
+                summary: summary.map(str::to_string),
+                body: body.to_string(),
                 maintenance_rules: None,
                 created_at: 1,
-                updated_at: 1,
+                updated_at,
             },
         )
         .expect("save knowledge document");
+    }
+
+    fn seed_design_document(working_dir: &str) {
+        save_design_document(
+            working_dir,
+            "kd_test_design_doc",
+            "combat/core-loop.md",
+            "核心循环",
+            Some("战斗核心循环"),
+            "正文",
+            1,
+        );
     }
 
     fn memory_document(index: usize, body: String, updated_at: i64) -> KnowledgeDocument {
@@ -4793,6 +5070,173 @@ mod tests {
         ))
     }
 
+    fn save_test_general_config(
+        working_dir: &str,
+        lexical_search_enabled: bool,
+        semantic_search_enabled: bool,
+    ) {
+        save_general_config(
+            &library_dir_for_working_dir(working_dir),
+            &KnowledgeGeneralConfig {
+                enabled: true,
+                lexical_search_enabled,
+                semantic_search_enabled,
+            },
+        )
+        .expect("save knowledge general config");
+    }
+
+    #[tokio::test]
+    async fn query_documents_uses_text_scan_when_lexical_index_disabled() {
+        let workspace = tempdir().expect("workspace");
+        let working_dir = workspace.path().to_string_lossy().to_string();
+        seed_design_document(&working_dir);
+        save_test_general_config(&working_dir, false, false);
+        let state = create_state(&working_dir);
+
+        let hits = query_documents(
+            &working_dir,
+            None,
+            Some("战斗核心"),
+            None,
+            None,
+            None,
+            5,
+            state.clone(),
+        )
+        .await
+        .expect("query documents");
+        let indexed_hits = state
+            .tantivy()
+            .search("战斗核心", 5, 2.0)
+            .expect("query tantivy directly");
+
+        assert!(hits.iter().any(|hit| {
+            hit.id == "kd_test_design_doc"
+                && hit.match_kind == "grep"
+                && hit.matched_section == Some(KnowledgeSearchMatchSection::Summary)
+        }));
+        assert!(indexed_hits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn query_documents_text_scan_matches_split_keyword_terms() {
+        let workspace = tempdir().expect("workspace");
+        let working_dir = workspace.path().to_string_lossy().to_string();
+        seed_design_document(&working_dir);
+        save_test_general_config(&working_dir, false, false);
+        let state = create_state(&working_dir);
+
+        let hits = query_documents(
+            &working_dir,
+            None,
+            Some("战斗 核心"),
+            None,
+            Some(&[KnowledgeType::Design]),
+            Some("combat"),
+            5,
+            state,
+        )
+        .await
+        .expect("query documents");
+
+        assert!(hits.iter().any(|hit| {
+            hit.id == "kd_test_design_doc"
+                && hit.match_kind == "grep"
+                && hit.matched_section == Some(KnowledgeSearchMatchSection::Summary)
+        }));
+    }
+
+    #[tokio::test]
+    async fn query_documents_text_scan_respects_directory_lexical_access() {
+        let workspace = tempdir().expect("workspace");
+        let working_dir = workspace.path().to_string_lossy().to_string();
+        seed_design_document(&working_dir);
+        save_test_general_config(&working_dir, false, false);
+
+        let mut directory_config = default_directory_config_for_type(KnowledgeType::Design);
+        directory_config.lexical_search = FolderIndexRuleSetting::Disabled;
+        update_directory_config(
+            &working_dir,
+            KnowledgeType::Design,
+            "combat",
+            directory_config,
+        )
+        .expect("disable directory lexical search");
+
+        let state = create_state(&working_dir);
+        let hits = query_documents(
+            &working_dir,
+            None,
+            Some("战斗核心"),
+            None,
+            None,
+            None,
+            5,
+            state,
+        )
+        .await
+        .expect("query documents");
+
+        assert!(hits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn query_documents_lexical_index_refills_after_path_filter() {
+        let workspace = tempdir().expect("workspace");
+        let working_dir = workspace.path().to_string_lossy().to_string();
+        for index in 0..24 {
+            save_design_document(
+                &working_dir,
+                &format!("kd_noise_doc_{:03}", index),
+                &format!("noise/doc-{:03}.md", index),
+                &format!("共享检索词 Noise {:03}", index),
+                Some("共享检索词 noise summary"),
+                "共享检索词 noise body",
+                1,
+            );
+        }
+        save_design_document(
+            &working_dir,
+            "kd_target_doc",
+            "target/match.md",
+            "Target",
+            None,
+            "共享检索词 target body",
+            1,
+        );
+        save_test_general_config(&working_dir, true, false);
+        let state = create_state(&working_dir);
+        reconcile_workspace_internal(
+            &working_dir,
+            None,
+            state.clone(),
+            true,
+            true,
+            false,
+            |_stage, _processed, _total, _path| {},
+        )
+        .await
+        .expect("reconcile workspace");
+
+        let hits = query_documents(
+            &working_dir,
+            None,
+            Some("共享检索词"),
+            None,
+            Some(&[KnowledgeType::Design]),
+            Some("target"),
+            1,
+            state,
+        )
+        .await
+        .expect("query documents");
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "kd_target_doc");
+        assert_eq!(hits[0].match_kind, "lexical");
+    }
+
     #[tokio::test]
     async fn rebuild_reopens_same_workspace_after_releasing_existing_tantivy_writer() {
         let workspace = tempdir().expect("workspace");
@@ -4838,11 +5282,13 @@ mod tests {
             .await
             .expect("rebuild clears bootstrap cache");
 
-        assert!(state
-            .catalog_bootstrapped_workspaces
-            .lock()
-            .await
-            .is_empty());
+        assert!(
+            state
+                .catalog_bootstrapped_workspaces
+                .lock()
+                .await
+                .is_empty()
+        );
     }
 
     #[test]
@@ -4880,6 +5326,7 @@ mod tests {
         let workspace = tempdir().expect("workspace");
         let working_dir = workspace.path().to_string_lossy().to_string();
         seed_design_document(&working_dir);
+        save_test_general_config(&working_dir, true, false);
         let state = create_state(&working_dir);
         let guard = state.embedding_mgr().lock_owned().await;
 
@@ -4974,9 +5421,11 @@ mod tests {
             decision.excluded_prefixes,
             vec![(KnowledgeType::Reference, "unity-official-docs".to_string())]
         );
-        assert!(decision
-            .retained_doc_ids
-            .contains("kd_unity_execution_order"));
+        assert!(
+            decision
+                .retained_doc_ids
+                .contains("kd_unity_execution_order")
+        );
         assert_eq!(
             db.get_managed_directory_snapshot(unity_docs::UNITY_REFERENCE_MANAGED_PATH)
                 .expect("load managed snapshot")
@@ -4991,6 +5440,7 @@ mod tests {
         let workspace = tempdir().expect("workspace");
         let working_dir = workspace.path().to_string_lossy().to_string();
         seed_unity_reference_documents(&working_dir, 129);
+        save_test_general_config(&working_dir, true, false);
         let state = create_state(&working_dir);
 
         let mut events = Vec::new();
@@ -5028,6 +5478,32 @@ mod tests {
         assert!(events.iter().any(|(stage, _, _, _)| stage == "preparing"));
         assert!(events.iter().any(|(stage, _, _, _)| stage == "indexing"));
         assert!(events.iter().any(|(stage, _, _, _)| stage == "committing"));
+    }
+
+    #[tokio::test]
+    async fn reconcile_unity_reference_import_skips_tantivy_when_lexical_index_disabled() {
+        let workspace = tempdir().expect("workspace");
+        let working_dir = workspace.path().to_string_lossy().to_string();
+        seed_unity_reference_documents(&working_dir, 2);
+        save_test_general_config(&working_dir, false, false);
+        let state = create_state(&working_dir);
+
+        reconcile_unity_reference_import(&working_dir, None, state.clone(), |_stage, _, _, _| {})
+            .await
+            .expect("reconcile unity reference import");
+
+        let hits = state
+            .tantivy()
+            .search("Manual 000", 5, 2.0)
+            .expect("search indexed unity docs");
+        let sample_state = state
+            .db()
+            .get_index_state("kd_unity_ref_000")
+            .expect("load index state")
+            .expect("stored index state");
+
+        assert!(hits.is_empty());
+        assert!(sample_state.embedding_backend.ends_with("|l=0|v=0"));
     }
 
     #[tokio::test]
@@ -5216,9 +5692,11 @@ mod tests {
         assert!(events.iter().any(|(stage, _, total, _)| {
             stage == "indexing" && *total == LARGE_LEXICAL_REBUILD_DOC_THRESHOLD
         }));
-        assert!(events
-            .iter()
-            .all(|(_, _, total, _)| *total == LARGE_LEXICAL_REBUILD_DOC_THRESHOLD));
+        assert!(
+            events
+                .iter()
+                .all(|(_, _, total, _)| *total == LARGE_LEXICAL_REBUILD_DOC_THRESHOLD)
+        );
     }
 
     #[tokio::test]
@@ -5227,6 +5705,7 @@ mod tests {
         let workspace = tempdir().expect("workspace");
         let working_dir = workspace.path().to_string_lossy().to_string();
         seed_unity_reference_documents(&working_dir, 129);
+        save_test_general_config(&working_dir, true, true);
 
         let mut enabled_config = default_directory_config_for_type(KnowledgeType::Reference);
         enabled_config.vector_search = FolderIndexRuleSetting::Enabled;

@@ -206,9 +206,14 @@ function deriveSearchMode(
 ): KnowledgeSearchMatchKind | null {
   if (!results.length) return null;
   const kinds = new Set(results.map((result) => result.matchKind));
-  if (kinds.has("hybrid") || (kinds.has("lexical") && kinds.has("semantic")))
+  if (
+    kinds.has("hybrid")
+    || kinds.has("grepHybrid")
+    || (kinds.has("semantic") && (kinds.has("lexical") || kinds.has("grep")))
+  )
     return "hybrid";
   if (kinds.has("semantic")) return "semantic";
+  if (kinds.has("grep")) return "grep";
   return "lexical";
 }
 

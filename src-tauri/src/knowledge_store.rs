@@ -930,26 +930,16 @@ const MEMORY_USER_PREFERENCE_PATH: &str = "user-preference.md";
 const MEMORY_USER_PREFERENCE_LEGACY_PATH: &str = "user_preference.md";
 const MEMORY_UNITY_PROJECT_UNDERSTANDING_SUMMARY_V10: &str =
     "维护 Unity 工程理解的结构缓存，沉淀长期有效的目录职责、系统入口、关键资源定位与约束。";
-const MEMORY_UNITY_PROJECT_UNDERSTANDING_SUMMARY: &str =
-    "Maintains a structural cache of Unity project understanding, preserving durable directory responsibilities, system entry points, key asset lookup paths, and constraints.";
-const MEMORY_PROJECT_MISTAKE_NOTE_RULES_V6: &str =
-    "- 只记录已经验证的问题、返工原因与规避方式\n- 优先维护会重复踩坑的操作、约束、回归点与修复结论\n- 删除已失效问题、无法复现的问题与没有依据的猜测";
-const MEMORY_PROJECT_MISTAKE_NOTE_RULES_V9: &str =
-    "- 只记录已经验证的问题、返工原因与规避方式\n- 优先维护会重复踩坑的操作、约束、回归点与修复结论\n- 每条保持简短，聚焦单个教训或约束\n- 总量控制在 20 条以内，定期合并重复项\n- 删除已失效问题、无法复现的问题与没有依据的猜测";
-const MEMORY_PROJECT_MISTAKE_NOTE_RULES: &str =
-    "- Record only verified problems, rework causes, and avoidance steps\n- Prioritize recurring pitfalls, constraints, regression points, and confirmed fixes\n- Keep each entry short and focused on one lesson or constraint\n- Keep the list within 20 items and merge duplicates regularly\n- Remove outdated issues, non-reproducible issues, and unsupported guesses";
-const MEMORY_USER_PREFERENCE_RULES_V6: &str =
-    "- 只记录跨任务长期稳定的用户偏好\n- 优先维护语言、汇报方式、代码风格、禁忌与明确要求\n- 删除一次性安排、临时口径与没有确认的推断";
-const MEMORY_USER_PREFERENCE_RULES_V9: &str =
-    "- 只记录跨任务长期稳定的用户偏好\n- 优先维护语言、汇报方式、代码风格、禁忌与明确要求\n- 每条保持简短，只写稳定偏好或硬约束\n- 总量控制在 20 条以内，合并相近偏好\n- 删除一次性安排、临时口径与没有确认的推断";
-const MEMORY_USER_PREFERENCE_RULES: &str =
-    "- Record only long-term user preferences that stay stable across tasks\n- Prioritize language, reporting style, code style, taboos, and explicit requirements\n- Keep each entry short and limited to stable preferences or hard constraints\n- Keep the list within 20 items and merge similar preferences\n- Remove one-off arrangements, temporary phrasing, and unconfirmed inferences";
-const MEMORY_UNITY_PROJECT_UNDERSTANDING_RULES_V4: &str =
-    "- 只记录能减少重复探索的 Unity 项目结构认知与定位信息\n- 优先维护目录职责、核心系统入口、关键场景、Prefab、ScriptableObject、程序集与配置映射\n- 记录已经验证的资源关系、运行入口、关键依赖与常用定位路径\n- 删除临时调查过程、一次性任务痕迹、未经验证的猜测与已过期缓存";
-const MEMORY_UNITY_PROJECT_UNDERSTANDING_RULES_V9: &str =
-    "- 只记录能减少重复探索的 Unity 项目结构认知与定位信息\n- 只维护来自工程项目本身的工程理解，包括目录职责、系统入口、资源关系、运行入口与配置映射\n- 用户补充的设计目标、玩法意图、产品方向与方案决策写入 Design，不写入这里\n- 优先维护目录职责、核心系统入口、关键场景、Prefab、ScriptableObject、程序集与配置映射\n- 记录已经验证的资源关系、运行入口、关键依赖与常用定位路径\n- 删除临时调查过程、一次性任务痕迹、未经验证的猜测与已过期缓存";
-const MEMORY_UNITY_PROJECT_UNDERSTANDING_RULES: &str =
-    "- Record only Unity project structure knowledge and lookup info that reduce repeated exploration\n- Maintain only project-derived engineering understanding, including directory responsibilities, system entry points, asset relationships, runtime entry points, and config mappings\n- Write user-supplied design goals, gameplay intent, product direction, and solution decisions into Design\n- Prioritize directory responsibilities, core system entry points, key scenes, prefabs, ScriptableObjects, assemblies, and config mappings\n- Record verified asset relationships, runtime entry points, key dependencies, and common lookup paths\n- Remove temporary investigation traces, one-off task residue, unverified guesses, and expired cache";
+const MEMORY_UNITY_PROJECT_UNDERSTANDING_SUMMARY: &str = "Maintains a structural cache of Unity project understanding, preserving durable directory responsibilities, system entry points, key asset lookup paths, and constraints.";
+const MEMORY_PROJECT_MISTAKE_NOTE_RULES_V6: &str = "- 只记录已经验证的问题、返工原因与规避方式\n- 优先维护会重复踩坑的操作、约束、回归点与修复结论\n- 删除已失效问题、无法复现的问题与没有依据的猜测";
+const MEMORY_PROJECT_MISTAKE_NOTE_RULES_V9: &str = "- 只记录已经验证的问题、返工原因与规避方式\n- 优先维护会重复踩坑的操作、约束、回归点与修复结论\n- 每条保持简短，聚焦单个教训或约束\n- 总量控制在 20 条以内，定期合并重复项\n- 删除已失效问题、无法复现的问题与没有依据的猜测";
+const MEMORY_PROJECT_MISTAKE_NOTE_RULES: &str = "- Record only verified problems, rework causes, and avoidance steps\n- Prioritize recurring pitfalls, constraints, regression points, and confirmed fixes\n- Keep each entry short and focused on one lesson or constraint\n- Keep the list within 20 items and merge duplicates regularly\n- Remove outdated issues, non-reproducible issues, and unsupported guesses";
+const MEMORY_USER_PREFERENCE_RULES_V6: &str = "- 只记录跨任务长期稳定的用户偏好\n- 优先维护语言、汇报方式、代码风格、禁忌与明确要求\n- 删除一次性安排、临时口径与没有确认的推断";
+const MEMORY_USER_PREFERENCE_RULES_V9: &str = "- 只记录跨任务长期稳定的用户偏好\n- 优先维护语言、汇报方式、代码风格、禁忌与明确要求\n- 每条保持简短，只写稳定偏好或硬约束\n- 总量控制在 20 条以内，合并相近偏好\n- 删除一次性安排、临时口径与没有确认的推断";
+const MEMORY_USER_PREFERENCE_RULES: &str = "- Record only long-term user preferences that stay stable across tasks\n- Prioritize language, reporting style, code style, taboos, and explicit requirements\n- Keep each entry short and limited to stable preferences or hard constraints\n- Keep the list within 20 items and merge similar preferences\n- Remove one-off arrangements, temporary phrasing, and unconfirmed inferences";
+const MEMORY_UNITY_PROJECT_UNDERSTANDING_RULES_V4: &str = "- 只记录能减少重复探索的 Unity 项目结构认知与定位信息\n- 优先维护目录职责、核心系统入口、关键场景、Prefab、ScriptableObject、程序集与配置映射\n- 记录已经验证的资源关系、运行入口、关键依赖与常用定位路径\n- 删除临时调查过程、一次性任务痕迹、未经验证的猜测与已过期缓存";
+const MEMORY_UNITY_PROJECT_UNDERSTANDING_RULES_V9: &str = "- 只记录能减少重复探索的 Unity 项目结构认知与定位信息\n- 只维护来自工程项目本身的工程理解，包括目录职责、系统入口、资源关系、运行入口与配置映射\n- 用户补充的设计目标、玩法意图、产品方向与方案决策写入 Design，不写入这里\n- 优先维护目录职责、核心系统入口、关键场景、Prefab、ScriptableObject、程序集与配置映射\n- 记录已经验证的资源关系、运行入口、关键依赖与常用定位路径\n- 删除临时调查过程、一次性任务痕迹、未经验证的猜测与已过期缓存";
+const MEMORY_UNITY_PROJECT_UNDERSTANDING_RULES: &str = "- Record only Unity project structure knowledge and lookup info that reduce repeated exploration\n- Maintain only project-derived engineering understanding, including directory responsibilities, system entry points, asset relationships, runtime entry points, and config mappings\n- Write user-supplied design goals, gameplay intent, product direction, and solution decisions into Design\n- Prioritize directory responsibilities, core system entry points, key scenes, prefabs, ScriptableObjects, assemblies, and config mappings\n- Record verified asset relationships, runtime entry points, key dependencies, and common lookup paths\n- Remove temporary investigation traces, one-off task residue, unverified guesses, and expired cache";
 
 struct MemoryBuiltinSeed {
     id: &'static str,
@@ -4648,7 +4638,7 @@ pub fn list_directory_configs_with_app_root_excluding_prefixes(
     Ok(records)
 }
 
-fn score_document(
+pub(crate) fn score_document_text_match(
     query: &str,
     doc: &KnowledgeDocument,
 ) -> Option<(f32, String, Option<KnowledgeSearchMatchSection>)> {
@@ -4656,6 +4646,7 @@ fn score_document(
     if needle.is_empty() {
         return None;
     }
+    let terms = text_match_terms(&needle);
 
     let mut score = 0.0_f32;
     let mut snippet = String::new();
@@ -4672,15 +4663,29 @@ fn score_document(
     if title.contains(&needle) {
         score += 8.0;
         snippet = doc.title.clone();
+    } else if contains_all_text_match_terms(&title, &terms) {
+        score += 5.5;
+        snippet = doc.title.clone();
     }
     if path.contains(&needle) {
         score += 4.0;
         if snippet.is_empty() {
             snippet = doc.path.clone();
         }
+    } else if contains_all_text_match_terms(&path, &terms) {
+        score += 3.0;
+        if snippet.is_empty() {
+            snippet = doc.path.clone();
+        }
     }
     if summary.contains(&needle) {
         score += 6.0;
+        if snippet.is_empty() {
+            snippet = summary_text.to_string();
+        }
+        matched_section = Some(KnowledgeSearchMatchSection::Summary);
+    } else if contains_all_text_match_terms(&summary, &terms) {
+        score += 4.5;
         if snippet.is_empty() {
             snippet = summary_text.to_string();
         }
@@ -4694,11 +4699,27 @@ fn score_document(
         if matched_section.is_none() {
             matched_section = Some(KnowledgeSearchMatchSection::MaintenanceRules);
         }
+    } else if contains_all_text_match_terms(&rules, &terms) {
+        score += 3.0;
+        if snippet.is_empty() {
+            snippet = rules_text.to_string();
+        }
+        if matched_section.is_none() {
+            matched_section = Some(KnowledgeSearchMatchSection::MaintenanceRules);
+        }
     }
     if body.contains(&needle) {
         score += 3.0;
         if snippet.is_empty() {
-            snippet = extract_snippet(&doc.body, &needle);
+            snippet = extract_snippet(&doc.body, &needle, &terms);
+        }
+        if matched_section.is_none() {
+            matched_section = Some(KnowledgeSearchMatchSection::Body);
+        }
+    } else if contains_all_text_match_terms(&body, &terms) {
+        score += 2.0;
+        if snippet.is_empty() {
+            snippet = extract_snippet(&doc.body, &needle, &terms);
         }
         if matched_section.is_none() {
             matched_section = Some(KnowledgeSearchMatchSection::Body);
@@ -4711,17 +4732,61 @@ fn score_document(
         if snippet.is_empty() {
             snippet = active_summary(doc)
                 .map(str::to_string)
-                .unwrap_or_else(|| extract_snippet(&doc.body, &needle));
+                .unwrap_or_else(|| extract_snippet(&doc.body, &needle, &terms));
         }
         Some((score, snippet, matched_section))
     }
 }
 
-fn extract_snippet(text: &str, query: &str) -> String {
+fn text_match_terms(query: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    let mut current = String::new();
+    for ch in query.chars() {
+        if ch.is_alphanumeric() || ch == '_' {
+            current.push(ch);
+        } else if !current.is_empty() {
+            terms.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        terms.push(current);
+    }
+    if terms.is_empty() && !query.is_empty() {
+        terms.push(query.to_string());
+    }
+    terms.sort();
+    terms.dedup();
+    terms
+}
+
+fn contains_all_text_match_terms(text: &str, terms: &[String]) -> bool {
+    !terms.is_empty() && terms.iter().all(|term| text.contains(term))
+}
+
+fn extract_snippet(text: &str, query: &str, terms: &[String]) -> String {
     let lowered = text.to_lowercase();
-    if let Some(index) = lowered.find(query) {
-        let start = index.saturating_sub(80);
-        let end = (index + query.len() + 120).min(text.len());
+    let matched = std::iter::once(query)
+        .chain(terms.iter().map(String::as_str))
+        .find_map(|candidate| {
+            if candidate.is_empty() {
+                None
+            } else {
+                lowered
+                    .find(candidate)
+                    .map(|index| (index, candidate.len()))
+            }
+        });
+
+    if let Some((index, matched_len)) = matched {
+        let mut start = index.saturating_sub(80).min(text.len());
+        while start > 0 && !text.is_char_boundary(start) {
+            start -= 1;
+        }
+
+        let mut end = (index + matched_len + 120).min(text.len());
+        while end < text.len() && !text.is_char_boundary(end) {
+            end += 1;
+        }
         return text[start..end].trim().to_string();
     }
 
@@ -4745,7 +4810,8 @@ pub fn query_documents(
             let Ok(doc) = load_document_by_path(working_dir, ty, &item.path) else {
                 continue;
             };
-            let Some((score, snippet, matched_section)) = score_document(query, &doc) else {
+            let Some((score, snippet, matched_section)) = score_document_text_match(query, &doc)
+            else {
                 continue;
             };
             items.push(KnowledgeSearchHit {
@@ -6299,11 +6365,13 @@ Body content
         assert!(created.ai_maintained);
         assert_eq!(created.read_only, false);
         assert!(!created.summary_enabled);
-        assert!(created
-            .maintenance_rules
-            .as_ref()
-            .map(|value| !value.trim().is_empty())
-            .unwrap_or(false));
+        assert!(
+            created
+                .maintenance_rules
+                .as_ref()
+                .map(|value| !value.trim().is_empty())
+                .unwrap_or(false)
+        );
     }
 
     #[test]
@@ -6326,10 +6394,12 @@ Body content
         .expect("save config");
 
         assert_eq!(saved.config_path, "project-structure.locus-meta");
-        assert!(knowledge_root(&working_dir)
-            .join("memory")
-            .join("project-structure.locus-meta")
-            .is_file());
+        assert!(
+            knowledge_root(&working_dir)
+                .join("memory")
+                .join("project-structure.locus-meta")
+                .is_file()
+        );
         let raw = std::fs::read_to_string(
             knowledge_root(&working_dir)
                 .join("memory")
@@ -6610,14 +6680,18 @@ Body content
         delete_external_reference_directory(&working_dir, "example-reference")
             .expect("delete external directory");
 
-        assert!(!knowledge_root(&working_dir)
-            .join("reference")
-            .join("example-reference")
-            .exists());
-        assert!(!knowledge_root(&working_dir)
-            .join("reference")
-            .join("example-reference.locus-meta")
-            .exists());
+        assert!(
+            !knowledge_root(&working_dir)
+                .join("reference")
+                .join("example-reference")
+                .exists()
+        );
+        assert!(
+            !knowledge_root(&working_dir)
+                .join("reference")
+                .join("example-reference.locus-meta")
+                .exists()
+        );
     }
 
     #[test]
@@ -6832,14 +6906,18 @@ Body content
         assert!(directory.config.ai_maintained);
         assert!(directory.config.explicit_maintenance_rules);
         assert!(directory.config.summary.contains("Unity"));
-        assert!(directory
-            .config
-            .maintenance_rules
-            .contains("Write user-supplied design goals"));
-        assert!(directory
-            .config
-            .maintenance_rules
-            .contains("Maintain only project-derived engineering understanding"));
+        assert!(
+            directory
+                .config
+                .maintenance_rules
+                .contains("Write user-supplied design goals")
+        );
+        assert!(
+            directory
+                .config
+                .maintenance_rules
+                .contains("Maintain only project-derived engineering understanding")
+        );
     }
 
     #[test]
@@ -7159,13 +7237,15 @@ Body content
 
         ensure_memory_builtin_documents(&working_dir).expect("upgrade builtins");
 
-        assert!(!document_path(
-            &working_dir,
-            KnowledgeType::Memory,
-            MEMORY_USER_PREFERENCE_LEGACY_PATH
-        )
-        .expect("legacy path")
-        .is_file());
+        assert!(
+            !document_path(
+                &working_dir,
+                KnowledgeType::Memory,
+                MEMORY_USER_PREFERENCE_LEGACY_PATH
+            )
+            .expect("legacy path")
+            .is_file()
+        );
 
         let migrated = load_document_by_path(
             &working_dir,
@@ -7441,12 +7521,14 @@ Body content
 
         ensure_memory_builtin_documents(&working_dir).expect("seed builtins");
 
-        assert!(load_document_by_path(
-            &working_dir,
-            KnowledgeType::Memory,
-            "project-understanding.md"
-        )
-        .is_err());
+        assert!(
+            load_document_by_path(
+                &working_dir,
+                KnowledgeType::Memory,
+                "project-understanding.md"
+            )
+            .is_err()
+        );
 
         let migrated = load_document_by_path(
             &working_dir,
@@ -7576,16 +7658,20 @@ Body content
         .expect("move directory");
 
         assert_eq!(moved, "systems/gameplay");
-        assert!(!knowledge_root(&working_dir)
-            .join("design")
-            .join("gameplay")
-            .exists());
-        assert!(knowledge_root(&working_dir)
-            .join("design")
-            .join("systems")
-            .join("gameplay")
-            .join("notes")
-            .is_dir());
+        assert!(
+            !knowledge_root(&working_dir)
+                .join("design")
+                .join("gameplay")
+                .exists()
+        );
+        assert!(
+            knowledge_root(&working_dir)
+                .join("design")
+                .join("systems")
+                .join("gameplay")
+                .join("notes")
+                .is_dir()
+        );
 
         let reread = load_document_by_path(
             &working_dir,
@@ -7631,21 +7717,27 @@ Body content
         )
         .expect("move directory");
 
-        assert!(!knowledge_root(&working_dir)
-            .join("design")
-            .join("gameplay.locus-meta")
-            .exists());
-        assert!(knowledge_root(&working_dir)
-            .join("design")
-            .join("systems")
-            .join("gameplay.locus-meta")
-            .is_file());
-        assert!(knowledge_root(&working_dir)
-            .join("design")
-            .join("systems")
-            .join("gameplay")
-            .join("notes.locus-meta")
-            .is_file());
+        assert!(
+            !knowledge_root(&working_dir)
+                .join("design")
+                .join("gameplay.locus-meta")
+                .exists()
+        );
+        assert!(
+            knowledge_root(&working_dir)
+                .join("design")
+                .join("systems")
+                .join("gameplay.locus-meta")
+                .is_file()
+        );
+        assert!(
+            knowledge_root(&working_dir)
+                .join("design")
+                .join("systems")
+                .join("gameplay")
+                .join("notes.locus-meta")
+                .is_file()
+        );
     }
 
     #[test]
@@ -7683,10 +7775,12 @@ Body content
             delete_directory(&working_dir, KnowledgeType::Design, "gameplay").expect("delete");
 
         assert_eq!(deleted, "gameplay");
-        assert!(!knowledge_root(&working_dir)
-            .join("design")
-            .join("gameplay")
-            .exists());
+        assert!(
+            !knowledge_root(&working_dir)
+                .join("design")
+                .join("gameplay")
+                .exists()
+        );
         let remaining = list_documents(&working_dir, Some(KnowledgeType::Design), None).unwrap();
         assert!(remaining.is_empty());
     }
@@ -7723,14 +7817,18 @@ Body content
 
         delete_directory(&working_dir, KnowledgeType::Design, "gameplay").expect("delete");
 
-        assert!(!knowledge_root(&working_dir)
-            .join("design")
-            .join("gameplay.locus-meta")
-            .exists());
-        assert!(!knowledge_root(&working_dir)
-            .join("design")
-            .join("gameplay")
-            .exists());
+        assert!(
+            !knowledge_root(&working_dir)
+                .join("design")
+                .join("gameplay.locus-meta")
+                .exists()
+        );
+        assert!(
+            !knowledge_root(&working_dir)
+                .join("design")
+                .join("gameplay")
+                .exists()
+        );
     }
 
     #[test]
@@ -7744,14 +7842,18 @@ Body content
 
         let result = delete_directory(&working_dir, KnowledgeType::Design, "gameplay");
 
-        assert!(result
-            .expect_err("delete should fail")
-            .contains("read-only"));
-        assert!(knowledge_root(&working_dir)
-            .join("design")
-            .join("gameplay")
-            .join("core-loop.md")
-            .is_file());
+        assert!(
+            result
+                .expect_err("delete should fail")
+                .contains("read-only")
+        );
+        assert!(
+            knowledge_root(&working_dir)
+                .join("design")
+                .join("gameplay")
+                .join("core-loop.md")
+                .is_file()
+        );
     }
 
     #[test]
@@ -7786,10 +7888,12 @@ Body content
         .expect("delete mismatched directory");
 
         assert_eq!(deleted, "unity-official-docs");
-        assert!(!knowledge_root(&working_dir)
-            .join("reference")
-            .join("unity-official-docs")
-            .exists());
+        assert!(
+            !knowledge_root(&working_dir)
+                .join("reference")
+                .join("unity-official-docs")
+                .exists()
+        );
     }
 
     #[test]
@@ -7820,10 +7924,12 @@ Body content
             .expect_err("delete should still reject read-only doc");
 
         assert!(error.contains("read-only"));
-        assert!(knowledge_root(&working_dir)
-            .join("reference")
-            .join("example-reference")
-            .exists());
+        assert!(
+            knowledge_root(&working_dir)
+                .join("reference")
+                .join("example-reference")
+                .exists()
+        );
     }
 
     #[test]

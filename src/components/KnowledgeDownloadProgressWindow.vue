@@ -128,6 +128,18 @@ function summarizeProxyStatus(): MetaSummary {
         primary: t("knowledge.retrieval.downloadWindowProxyEnvironment"),
         secondary: [route.proxyEnvKey, route.proxyUrl].filter(Boolean).join(" · "),
       };
+    case "manual":
+      return {
+        primary: t("knowledge.retrieval.downloadWindowProxyManual"),
+        secondary: route.proxyUrl || "",
+      };
+    case "manual_unsupported":
+      return {
+        primary: t("knowledge.retrieval.downloadWindowProxyUnsupported"),
+        secondary: route.proxyUrl
+          ? `${route.proxyUrl} · ${t("knowledge.retrieval.downloadWindowProxyUnsupportedDetail")}`
+          : t("knowledge.retrieval.downloadWindowProxyUnsupportedDetail"),
+      };
     case "system":
       return {
         primary: t("knowledge.retrieval.downloadWindowProxySystem"),

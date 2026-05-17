@@ -1,12 +1,12 @@
 <script setup lang="ts">
-import type { KnowledgeSearchResult } from "../../types";
+import type { KnowledgeSearchMatchKind, KnowledgeSearchResult } from "../../types";
 import { t } from "../../i18n";
 
 defineProps<{
   query: string;
   results: KnowledgeSearchResult[];
   searching: boolean;
-  searchMode: "lexical" | "semantic" | "hybrid" | null;
+  searchMode: KnowledgeSearchMatchKind | null;
   searchLatencyMs: number | null;
 }>();
 
@@ -38,9 +38,12 @@ function labelForStoredScope(result: KnowledgeSearchResult): string {
 function labelForMatchMode(kind: KnowledgeSearchResult["matchKind"]): string {
   switch (kind) {
     case "hybrid":
+    case "grepHybrid":
       return t("knowledge.search.hybrid");
     case "semantic":
       return t("knowledge.search.semantic");
+    case "grep":
+      return t("knowledge.search.grep");
     default:
       return t("knowledge.search.lexical");
   }

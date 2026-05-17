@@ -596,6 +596,7 @@ function searchSnippetTitle() {
   const kind = activeSearchContext.value?.result.matchKind ?? "semantic";
   if (kind === "lexical") return t("knowledge.preview.searchHitLexical");
   if (kind === "semantic") return t("knowledge.preview.searchHitSemantic");
+  if (kind === "grep") return t("knowledge.preview.searchHitGrep");
   return t("knowledge.preview.searchHitHybrid");
 }
 
