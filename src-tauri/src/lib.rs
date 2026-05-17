@@ -148,8 +148,14 @@ mod state_type_tests {
 
     #[test]
     fn permission_state_types_do_not_alias_key_state_types() {
-        assert_ne!(TypeId::of::<ToolPermissionMode>(), TypeId::of::<ApiKeyState>());
-        assert_ne!(TypeId::of::<ToolPermissions>(), TypeId::of::<ProviderKeysState>());
+        assert_ne!(
+            TypeId::of::<ToolPermissionMode>(),
+            TypeId::of::<ApiKeyState>()
+        );
+        assert_ne!(
+            TypeId::of::<ToolPermissions>(),
+            TypeId::of::<ProviderKeysState>()
+        );
     }
 }
 

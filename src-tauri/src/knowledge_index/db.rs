@@ -1,4 +1,4 @@
-use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -1651,7 +1651,7 @@ fn parent_path_for_doc_path(doc_path: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DocumentCatalogRow, KNOWLEDGE_DB_VERSION, KnowledgeDb, ManagedDirectorySnapshotRow,
+        DocumentCatalogRow, KnowledgeDb, ManagedDirectorySnapshotRow, KNOWLEDGE_DB_VERSION,
     };
     use rusqlite::Connection;
     use tempfile::tempdir;

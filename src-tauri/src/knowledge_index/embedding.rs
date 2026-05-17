@@ -5,12 +5,12 @@ use fastembed::{
 use hf_hub::api::sync::{ApiBuilder, ApiRepo};
 use hf_hub::{Cache, Repo, RepoType};
 #[cfg(windows)]
-use ndarray::{Array, Array2, ArrayView, Axis, Dim, Dimension, IxDynImpl, s};
+use ndarray::{s, Array, Array2, ArrayView, Axis, Dim, Dimension, IxDynImpl};
 #[cfg(windows)]
-use ort::ep::{CUDA, DirectML, ExecutionProvider};
+use ort::ep::{DirectML, ExecutionProvider, CUDA};
 #[cfg(windows)]
 use ort::{
-    session::{Session, builder::GraphOptimizationLevel},
+    session::{builder::GraphOptimizationLevel, Session},
     tensor::TensorElementType,
     value::Value,
 };
@@ -20,10 +20,10 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 #[cfg(windows)]
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 #[cfg(windows)]
 use tokenizers::{AddedToken, PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
@@ -620,7 +620,10 @@ fn push_runtime_helper_root_candidates(paths: &mut Vec<PathBuf>, root: &Path) {
     push_unique_path(paths, &root.join("ort-runtime").join("windows-x64"));
     push_unique_path(
         paths,
-        &root.join("resources").join("ort-runtime").join("windows-x64"),
+        &root
+            .join("resources")
+            .join("ort-runtime")
+            .join("windows-x64"),
     );
 }
 
@@ -2982,8 +2985,8 @@ fn build_cpu_ort_session(
 #[cfg(windows)]
 fn directml_device_ids_to_try() -> Vec<i32> {
     use windows::Win32::Graphics::Dxgi::{
-        CreateDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
-        IDXGIAdapter1, IDXGIFactory6,
+        CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory6, DXGI_ADAPTER_FLAG_SOFTWARE,
+        DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
     };
 
     let factory: IDXGIFactory6 = match unsafe { CreateDXGIFactory1() } {
@@ -3040,8 +3043,8 @@ fn collect_directml_adapter_diagnostics() -> Vec<EmbeddingRuntimeTestAdapterInfo
 #[cfg(windows)]
 fn enumerate_dxgi_adapters() -> Vec<EmbeddingRuntimeTestAdapterInfo> {
     use windows::Win32::Graphics::Dxgi::{
-        CreateDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
-        IDXGIAdapter1, IDXGIFactory6,
+        CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory6, DXGI_ADAPTER_FLAG_SOFTWARE,
+        DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
     };
 
     fn adapter_name(desc: &windows::Win32::Graphics::Dxgi::DXGI_ADAPTER_DESC1) -> String {
@@ -3185,10 +3188,10 @@ fn current_cpu_device_name() -> Option<String> {
 
 #[cfg(windows)]
 fn read_runtime_dll_version(path: &Path) -> Option<String> {
+    use windows::core::{w, HSTRING};
     use windows::Win32::Storage::FileSystem::{
-        GetFileVersionInfoSizeW, GetFileVersionInfoW, VS_FIXEDFILEINFO, VerQueryValueW,
+        GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW, VS_FIXEDFILEINFO,
     };
-    use windows::core::{HSTRING, w};
 
     let path = HSTRING::from(path.as_os_str().to_string_lossy().as_ref());
     let size = unsafe { GetFileVersionInfoSizeW(&path, None) };
@@ -3231,11 +3234,11 @@ fn read_runtime_dll_version(path: &Path) -> Option<String> {
 
 #[cfg(windows)]
 fn query_gpu_memory_bytes_for_adapter_index(adapter_index: i32) -> Option<u64> {
-    use windows::Win32::Graphics::Dxgi::{
-        CreateDXGIFactory1, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, DXGI_QUERY_VIDEO_MEMORY_INFO,
-        IDXGIAdapter1, IDXGIAdapter3, IDXGIFactory6,
-    };
     use windows::core::Interface;
+    use windows::Win32::Graphics::Dxgi::{
+        CreateDXGIFactory1, IDXGIAdapter1, IDXGIAdapter3, IDXGIFactory6,
+        DXGI_MEMORY_SEGMENT_GROUP_LOCAL, DXGI_QUERY_VIDEO_MEMORY_INFO,
+    };
 
     let factory: IDXGIFactory6 = unsafe { CreateDXGIFactory1().ok()? };
     let adapter: IDXGIAdapter1 = unsafe { factory.EnumAdapters1(adapter_index as u32).ok()? };
@@ -3252,8 +3255,8 @@ fn query_gpu_memory_bytes_for_adapter_index(adapter_index: i32) -> Option<u64> {
 #[cfg(windows)]
 fn query_preferred_gpu_memory_bytes() -> Option<u64> {
     use windows::Win32::Graphics::Dxgi::{
-        CreateDXGIFactory1, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, DXGI_MEMORY_SEGMENT_GROUP_LOCAL,
-        DXGI_QUERY_VIDEO_MEMORY_INFO, IDXGIAdapter3, IDXGIFactory6,
+        CreateDXGIFactory1, IDXGIAdapter3, IDXGIFactory6, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+        DXGI_MEMORY_SEGMENT_GROUP_LOCAL, DXGI_QUERY_VIDEO_MEMORY_INFO,
     };
 
     let factory: IDXGIFactory6 = unsafe { CreateDXGIFactory1().ok()? };
@@ -4953,12 +4956,10 @@ fn preferred_local_execution_provider_plans(device_policy: &str) -> Vec<Executio
                 backend_label: "GPU-DirectML",
                 device_name: query_gpu_adapter_name_for_index(device_id)
                     .unwrap_or_else(|| "GPU".to_string()),
-                providers: vec![
-                    DirectML::default()
-                        .with_device_id(device_id)
-                        .build()
-                        .error_on_failure(),
-                ],
+                providers: vec![DirectML::default()
+                    .with_device_id(device_id)
+                    .build()
+                    .error_on_failure()],
             })
             .collect(),
         DEVICE_POLICY_GPU_CUDA => vec![ExecutionProviderPlan {
@@ -5139,8 +5140,8 @@ fn execution_provider_availability(result: Result<bool, ort::Error>) -> String {
 #[cfg(windows)]
 fn summarize_dxgi_adapters() -> String {
     use windows::Win32::Graphics::Dxgi::{
-        CreateDXGIFactory1, DXGI_ADAPTER_DESC1, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
-        IDXGIAdapter1, IDXGIFactory6,
+        CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory6, DXGI_ADAPTER_DESC1,
+        DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
     };
 
     fn adapter_name(desc: &DXGI_ADAPTER_DESC1) -> String {
@@ -5627,15 +5628,15 @@ fn path_ends_with_components(path: &Path, relative_path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
+        build_remote_repo_tree_url, config_path, extract_next_link, load_config,
+        local_model_catalog, managed_model_root, migrate_legacy_managed_model_root,
+        normalize_device_policy, prepare_local_model_download_network,
+        prioritize_directml_adapter_indices, resolve_next_link_url, sanitize_model_id, save_config,
+        select_local_model_source, supported_embedding_preset,
+        supported_embedding_preset_download_model_id, DirectMlAdapterCandidate, EmbeddingConfig,
+        EmbeddingManager, FastembedModel, LocalModelRoute, ManualPoolingMode, TextEmbedding,
         DEVICE_POLICY_CPU_FASTEMBED, DEVICE_POLICY_GPU_CUDA, DEVICE_POLICY_GPU_DIRECTML,
-        DirectMlAdapterCandidate, EmbeddingConfig, EmbeddingManager, FastembedModel,
         LOCAL_MODEL_DOWNLOAD_SOURCE_HF_MIRROR, LOCAL_MODEL_DOWNLOAD_SOURCE_OFFICIAL,
-        LocalModelRoute, ManualPoolingMode, TextEmbedding, build_remote_repo_tree_url, config_path,
-        extract_next_link, load_config, local_model_catalog, managed_model_root,
-        migrate_legacy_managed_model_root, normalize_device_policy,
-        prepare_local_model_download_network, prioritize_directml_adapter_indices,
-        resolve_next_link_url, sanitize_model_id, save_config, select_local_model_source,
-        supported_embedding_preset, supported_embedding_preset_download_model_id,
     };
     use tempfile::tempdir;
 
@@ -5938,11 +5939,9 @@ mod tests {
             .expect_err("activation should require a manual model download");
 
         assert!(err.contains("has not been downloaded"));
-        assert!(
-            !managed_model_root(dir.path())
-                .join(sanitize_model_id("Qwen/Qwen3-Embedding-0.6B"))
-                .exists()
-        );
+        assert!(!managed_model_root(dir.path())
+            .join(sanitize_model_id("Qwen/Qwen3-Embedding-0.6B"))
+            .exists());
     }
 
     #[test]

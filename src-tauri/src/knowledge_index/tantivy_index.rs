@@ -6,7 +6,7 @@ use tantivy::indexer::{IndexWriterOptions, UserOperation};
 use tantivy::query::QueryParser;
 use tantivy::schema::*;
 use tantivy::tokenizer::{LowerCaser, NgramTokenizer, TextAnalyzer};
-use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, Term, doc};
+use tantivy::{doc, Index, IndexReader, IndexWriter, ReloadPolicy, Term};
 
 const TANTIVY_INDEX_FORMAT: &str = "tantivy-0.26-ngram-v2";
 const TANTIVY_STAMP_FILE: &str = "locus_knowledge_tantivy_format";

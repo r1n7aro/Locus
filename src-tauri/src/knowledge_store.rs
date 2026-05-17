@@ -6365,13 +6365,11 @@ Body content
         assert!(created.ai_maintained);
         assert_eq!(created.read_only, false);
         assert!(!created.summary_enabled);
-        assert!(
-            created
-                .maintenance_rules
-                .as_ref()
-                .map(|value| !value.trim().is_empty())
-                .unwrap_or(false)
-        );
+        assert!(created
+            .maintenance_rules
+            .as_ref()
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false));
     }
 
     #[test]
@@ -6394,12 +6392,10 @@ Body content
         .expect("save config");
 
         assert_eq!(saved.config_path, "project-structure.locus-meta");
-        assert!(
-            knowledge_root(&working_dir)
-                .join("memory")
-                .join("project-structure.locus-meta")
-                .is_file()
-        );
+        assert!(knowledge_root(&working_dir)
+            .join("memory")
+            .join("project-structure.locus-meta")
+            .is_file());
         let raw = std::fs::read_to_string(
             knowledge_root(&working_dir)
                 .join("memory")
@@ -6680,18 +6676,14 @@ Body content
         delete_external_reference_directory(&working_dir, "example-reference")
             .expect("delete external directory");
 
-        assert!(
-            !knowledge_root(&working_dir)
-                .join("reference")
-                .join("example-reference")
-                .exists()
-        );
-        assert!(
-            !knowledge_root(&working_dir)
-                .join("reference")
-                .join("example-reference.locus-meta")
-                .exists()
-        );
+        assert!(!knowledge_root(&working_dir)
+            .join("reference")
+            .join("example-reference")
+            .exists());
+        assert!(!knowledge_root(&working_dir)
+            .join("reference")
+            .join("example-reference.locus-meta")
+            .exists());
     }
 
     #[test]
@@ -6906,18 +6898,14 @@ Body content
         assert!(directory.config.ai_maintained);
         assert!(directory.config.explicit_maintenance_rules);
         assert!(directory.config.summary.contains("Unity"));
-        assert!(
-            directory
-                .config
-                .maintenance_rules
-                .contains("Write user-supplied design goals")
-        );
-        assert!(
-            directory
-                .config
-                .maintenance_rules
-                .contains("Maintain only project-derived engineering understanding")
-        );
+        assert!(directory
+            .config
+            .maintenance_rules
+            .contains("Write user-supplied design goals"));
+        assert!(directory
+            .config
+            .maintenance_rules
+            .contains("Maintain only project-derived engineering understanding"));
     }
 
     #[test]
@@ -7237,15 +7225,13 @@ Body content
 
         ensure_memory_builtin_documents(&working_dir).expect("upgrade builtins");
 
-        assert!(
-            !document_path(
-                &working_dir,
-                KnowledgeType::Memory,
-                MEMORY_USER_PREFERENCE_LEGACY_PATH
-            )
-            .expect("legacy path")
-            .is_file()
-        );
+        assert!(!document_path(
+            &working_dir,
+            KnowledgeType::Memory,
+            MEMORY_USER_PREFERENCE_LEGACY_PATH
+        )
+        .expect("legacy path")
+        .is_file());
 
         let migrated = load_document_by_path(
             &working_dir,
@@ -7521,14 +7507,12 @@ Body content
 
         ensure_memory_builtin_documents(&working_dir).expect("seed builtins");
 
-        assert!(
-            load_document_by_path(
-                &working_dir,
-                KnowledgeType::Memory,
-                "project-understanding.md"
-            )
-            .is_err()
-        );
+        assert!(load_document_by_path(
+            &working_dir,
+            KnowledgeType::Memory,
+            "project-understanding.md"
+        )
+        .is_err());
 
         let migrated = load_document_by_path(
             &working_dir,
@@ -7658,20 +7642,16 @@ Body content
         .expect("move directory");
 
         assert_eq!(moved, "systems/gameplay");
-        assert!(
-            !knowledge_root(&working_dir)
-                .join("design")
-                .join("gameplay")
-                .exists()
-        );
-        assert!(
-            knowledge_root(&working_dir)
-                .join("design")
-                .join("systems")
-                .join("gameplay")
-                .join("notes")
-                .is_dir()
-        );
+        assert!(!knowledge_root(&working_dir)
+            .join("design")
+            .join("gameplay")
+            .exists());
+        assert!(knowledge_root(&working_dir)
+            .join("design")
+            .join("systems")
+            .join("gameplay")
+            .join("notes")
+            .is_dir());
 
         let reread = load_document_by_path(
             &working_dir,
@@ -7717,27 +7697,21 @@ Body content
         )
         .expect("move directory");
 
-        assert!(
-            !knowledge_root(&working_dir)
-                .join("design")
-                .join("gameplay.locus-meta")
-                .exists()
-        );
-        assert!(
-            knowledge_root(&working_dir)
-                .join("design")
-                .join("systems")
-                .join("gameplay.locus-meta")
-                .is_file()
-        );
-        assert!(
-            knowledge_root(&working_dir)
-                .join("design")
-                .join("systems")
-                .join("gameplay")
-                .join("notes.locus-meta")
-                .is_file()
-        );
+        assert!(!knowledge_root(&working_dir)
+            .join("design")
+            .join("gameplay.locus-meta")
+            .exists());
+        assert!(knowledge_root(&working_dir)
+            .join("design")
+            .join("systems")
+            .join("gameplay.locus-meta")
+            .is_file());
+        assert!(knowledge_root(&working_dir)
+            .join("design")
+            .join("systems")
+            .join("gameplay")
+            .join("notes.locus-meta")
+            .is_file());
     }
 
     #[test]
@@ -7775,12 +7749,10 @@ Body content
             delete_directory(&working_dir, KnowledgeType::Design, "gameplay").expect("delete");
 
         assert_eq!(deleted, "gameplay");
-        assert!(
-            !knowledge_root(&working_dir)
-                .join("design")
-                .join("gameplay")
-                .exists()
-        );
+        assert!(!knowledge_root(&working_dir)
+            .join("design")
+            .join("gameplay")
+            .exists());
         let remaining = list_documents(&working_dir, Some(KnowledgeType::Design), None).unwrap();
         assert!(remaining.is_empty());
     }
@@ -7817,18 +7789,14 @@ Body content
 
         delete_directory(&working_dir, KnowledgeType::Design, "gameplay").expect("delete");
 
-        assert!(
-            !knowledge_root(&working_dir)
-                .join("design")
-                .join("gameplay.locus-meta")
-                .exists()
-        );
-        assert!(
-            !knowledge_root(&working_dir)
-                .join("design")
-                .join("gameplay")
-                .exists()
-        );
+        assert!(!knowledge_root(&working_dir)
+            .join("design")
+            .join("gameplay.locus-meta")
+            .exists());
+        assert!(!knowledge_root(&working_dir)
+            .join("design")
+            .join("gameplay")
+            .exists());
     }
 
     #[test]
@@ -7842,18 +7810,14 @@ Body content
 
         let result = delete_directory(&working_dir, KnowledgeType::Design, "gameplay");
 
-        assert!(
-            result
-                .expect_err("delete should fail")
-                .contains("read-only")
-        );
-        assert!(
-            knowledge_root(&working_dir)
-                .join("design")
-                .join("gameplay")
-                .join("core-loop.md")
-                .is_file()
-        );
+        assert!(result
+            .expect_err("delete should fail")
+            .contains("read-only"));
+        assert!(knowledge_root(&working_dir)
+            .join("design")
+            .join("gameplay")
+            .join("core-loop.md")
+            .is_file());
     }
 
     #[test]
@@ -7888,12 +7852,10 @@ Body content
         .expect("delete mismatched directory");
 
         assert_eq!(deleted, "unity-official-docs");
-        assert!(
-            !knowledge_root(&working_dir)
-                .join("reference")
-                .join("unity-official-docs")
-                .exists()
-        );
+        assert!(!knowledge_root(&working_dir)
+            .join("reference")
+            .join("unity-official-docs")
+            .exists());
     }
 
     #[test]
@@ -7924,12 +7886,10 @@ Body content
             .expect_err("delete should still reject read-only doc");
 
         assert!(error.contains("read-only"));
-        assert!(
-            knowledge_root(&working_dir)
-                .join("reference")
-                .join("example-reference")
-                .exists()
-        );
+        assert!(knowledge_root(&working_dir)
+            .join("reference")
+            .join("example-reference")
+            .exists());
     }
 
     #[test]
