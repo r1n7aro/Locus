@@ -1,9 +1,9 @@
 ---
 title: "当前版本"
-description: "Locus v0.2.14 (2026-05-14)"
+description: "Locus v0.2.15 (2026-05-17)"
 sidebarTitle: "当前版本"
-version: "0.2.14"
-releasedAt: "2026-05-14"
+version: "0.2.15"
+releasedAt: "2026-05-17"
 channel: "stable"
 updateTitle: "发现新版本"
 changelogUrl: "/overview/latest-version"
@@ -11,33 +11,29 @@ changelogUrl: "/overview/latest-version"
 
 ## 下载
 
-- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.2.14/locus_0.2.14_x64-setup.exe)
-- [Windows x64（系统 Python/Git）](https://github.com/r1n7aro/Locus/releases/download/v0.2.14/locus_0.2.14_x64-without_embed_python_git-setup.exe)
+- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.2.15/locus_0.2.15_x64-setup.exe)
+- [Windows x64（系统 Python/Git）](https://github.com/r1n7aro/Locus/releases/download/v0.2.15/locus_0.2.15_x64-without_embed_python_git-setup.exe)
 - [GitHub Releases](https://github.com/r1n7aro/Locus/releases)
 
 ## 变更列表
 
 ### 新增
 
-- 设置页新增 Codex 用量显示，包含配额窗口、剩余额度、重置时间和手动刷新。
-- 新增 Unity Editor 状态变更与知识治理的审批行为配置。
-- 聊天差异新增独立文件审阅窗口。
-- 聊天引用新增右键操作，支持文件、Unity 资源、场景对象和知识文档。
-- 设置页新增 Git diff 审阅目标配置。
+- 设置页新增代理配置，后端请求、更新检查、知识下载、模型下载和 agent 子进程会使用代理路由。
+- 新增 ONNX Runtime 打包准备流程，用于向量检索运行时发布。
+- 知识库在全文索引关闭时支持文本扫描匹配。
+- 聊天新增会话复制和撤回上一轮对话流程。
+- 更新流程新增安装包元数据和安装包选择。
+- 控制台新增日志导出，系统通知新增 subagent 完成提醒。
 
 ### 修复
 
-- Windows NSIS 安装器会保持更新兼容路径，并在安装时清理已替换的内置资源。
-- 自定义 Codex HTTP 历史请求在关闭 previous response id 时会回放完整输入。
-- Markdown 高亮代码行会保留行状态。
-- 工具调用现在按 ID 匹配，流式工具交接状态更稳定。
-- 聊天中的编辑差异预览堆叠更稳定。
-- 知识侧栏下拉菜单会保持可见。
-- Git checkpoint diff 会识别重命名文件。
-- Unity bridge 执行遇到卡住或管道超时时会尝试恢复连接。
-- Unity 资源搜索支持带引号的查询。
-- Unity 重连轮询日志更安静。
-- 设置页会显示 Codex 配额重置时间。
+- 聊天流式渲染中的工具调用折叠和交接状态更稳定。
+- 聊天发送失败后会移除待发送消息并重新加载会话状态。
+- 知识索引状态会遵循全局全文检索与语义检索开关。
+- 全文检索关闭时会隐藏全文索引重建进度。
+- Windows 安装器会检测系统 Git，并可跳过内置 Git 资源。
+- 工具权限保存失败时会恢复界面状态。
 
 ### 移除
 

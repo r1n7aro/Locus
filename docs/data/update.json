@@ -1,12 +1,12 @@
 {
-  "version": "0.2.14",
-  "releasedAt": "2026-05-14",
+  "version": "0.2.15",
+  "releasedAt": "2026-05-17",
   "channel": "stable",
   "installers": [
     {
       "id": "windows-x64",
       "label": "Windows x64",
-      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.2.14/locus_0.2.14_x64-setup.exe",
+      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.2.15/locus_0.2.15_x64-setup.exe",
       "platform": "windows",
       "arch": "x64",
       "includesManagedPython": true,
@@ -17,7 +17,7 @@
     {
       "id": "windows-x64-without-embed-python-git",
       "label": "Windows x64 - system Python/Git",
-      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.2.14/locus_0.2.14_x64-without_embed_python_git-setup.exe",
+      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.2.15/locus_0.2.15_x64-without_embed_python_git-setup.exe",
       "platform": "windows",
       "arch": "x64",
       "includesManagedPython": false,
@@ -29,33 +29,29 @@
   "locales": {
     "zh": {
       "title": "发现新版本",
-      "summary": "Locus v0.2.14 (2026-05-14)",
+      "summary": "Locus v0.2.15 (2026-05-17)",
       "changelogUrl": "/overview/latest-version",
       "changes": [
         {
           "title": "新增",
           "items": [
-            "设置页新增 Codex 用量显示，包含配额窗口、剩余额度、重置时间和手动刷新。",
-            "新增 Unity Editor 状态变更与知识治理的审批行为配置。",
-            "聊天差异新增独立文件审阅窗口。",
-            "聊天引用新增右键操作，支持文件、Unity 资源、场景对象和知识文档。",
-            "设置页新增 Git diff 审阅目标配置。"
+            "设置页新增代理配置，后端请求、更新检查、知识下载、模型下载和 agent 子进程会使用代理路由。",
+            "新增 ONNX Runtime 打包准备流程，用于向量检索运行时发布。",
+            "知识库在全文索引关闭时支持文本扫描匹配。",
+            "聊天新增会话复制和撤回上一轮对话流程。",
+            "更新流程新增安装包元数据和安装包选择。",
+            "控制台新增日志导出，系统通知新增 subagent 完成提醒。"
           ]
         },
         {
           "title": "修复",
           "items": [
-            "Windows NSIS 安装器会保持更新兼容路径，并在安装时清理已替换的内置资源。",
-            "自定义 Codex HTTP 历史请求在关闭 previous response id 时会回放完整输入。",
-            "Markdown 高亮代码行会保留行状态。",
-            "工具调用现在按 ID 匹配，流式工具交接状态更稳定。",
-            "聊天中的编辑差异预览堆叠更稳定。",
-            "知识侧栏下拉菜单会保持可见。",
-            "Git checkpoint diff 会识别重命名文件。",
-            "Unity bridge 执行遇到卡住或管道超时时会尝试恢复连接。",
-            "Unity 资源搜索支持带引号的查询。",
-            "Unity 重连轮询日志更安静。",
-            "设置页会显示 Codex 配额重置时间。"
+            "聊天流式渲染中的工具调用折叠和交接状态更稳定。",
+            "聊天发送失败后会移除待发送消息并重新加载会话状态。",
+            "知识索引状态会遵循全局全文检索与语义检索开关。",
+            "全文检索关闭时会隐藏全文索引重建进度。",
+            "Windows 安装器会检测系统 Git，并可跳过内置 Git 资源。",
+            "工具权限保存失败时会恢复界面状态。"
           ]
         },
         {
@@ -68,11 +64,11 @@
       "downloadChannels": [
         {
           "label": "Windows x64",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.2.14/locus_0.2.14_x64-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.2.15/locus_0.2.15_x64-setup.exe"
         },
         {
           "label": "Windows x64（系统 Python/Git）",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.2.14/locus_0.2.14_x64-without_embed_python_git-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.2.15/locus_0.2.15_x64-without_embed_python_git-setup.exe"
         },
         {
           "label": "GitHub Releases",
@@ -82,33 +78,29 @@
     },
     "en": {
       "title": "Update available",
-      "summary": "Locus v0.2.14 (2026-05-14)",
+      "summary": "Locus v0.2.15 (2026-05-17)",
       "changelogUrl": "/en/overview/latest-version",
       "changes": [
         {
           "title": "Added",
           "items": [
-            "Added Codex quota usage in Settings, including quota windows, remaining percentage, reset time, and manual refresh.",
-            "Added configurable approval behavior settings for Unity editor status changes and knowledge governance.",
-            "Added a dedicated file review window for chat diffs.",
-            "Added right-click reference actions in chat for files, Unity assets, scene objects, and knowledge documents.",
-            "Added Git diff review target support in Settings."
+            "Added proxy settings and backend proxy routing for update checks, LLM clients, knowledge downloads, and agent subprocesses.",
+            "Added bundled ONNX Runtime preparation for vector search runtime packaging.",
+            "Added text-scan fallback search for knowledge when lexical indexing is disabled.",
+            "Added chat session fork and latest-turn undo workflows.",
+            "Added installer metadata and package selection in the update flow.",
+            "Added console log export and subagent completion notifications."
           ]
         },
         {
           "title": "Fixed",
           "items": [
-            "Windows NSIS installs now keep the update path compatible and clean up replaced bundled resources during install.",
-            "Custom Codex HTTP history requests now replay the full input when previous response IDs are disabled.",
-            "Highlighted markdown code lines now keep their line state.",
-            "Active tool calls now match by ID, keeping streamed tool handoff state more stable.",
-            "Edit diff previews in chat now stack more reliably.",
-            "Knowledge side rail dropdowns now stay visible.",
-            "Git checkpoint diffs now detect renamed files.",
-            "Unity bridge execution now recovers from stalled or timed-out pipe states.",
-            "Unity asset search now supports quoted queries.",
-            "Unity reconnect polling logs are quieter.",
-            "Settings now show Codex quota reset dates."
+            "Chat streaming keeps tool-call collapse and handoff rendering more stable.",
+            "Failed chat sends now remove pending messages and reload session state.",
+            "Knowledge index status now follows global lexical and semantic search settings.",
+            "Lexical rebuild progress is suppressed when lexical search is disabled.",
+            "Windows installer detects system Git and can skip bundled Git resources.",
+            "Tool permission saves restore UI state on failure."
           ]
         },
         {
@@ -121,11 +113,11 @@
       "downloadChannels": [
         {
           "label": "Windows x64",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.2.14/locus_0.2.14_x64-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.2.15/locus_0.2.15_x64-setup.exe"
         },
         {
           "label": "Windows x64 (system Python/Git)",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.2.14/locus_0.2.14_x64-without_embed_python_git-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.2.15/locus_0.2.15_x64-without_embed_python_git-setup.exe"
         },
         {
           "label": "GitHub Releases",

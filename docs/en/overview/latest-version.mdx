@@ -1,9 +1,9 @@
 ---
 title: "Latest Version"
-description: "Locus v0.2.14 (2026-05-14)"
+description: "Locus v0.2.15 (2026-05-17)"
 sidebarTitle: "Latest Version"
-version: "0.2.14"
-releasedAt: "2026-05-14"
+version: "0.2.15"
+releasedAt: "2026-05-17"
 channel: "stable"
 updateTitle: "Update available"
 changelogUrl: "/en/overview/latest-version"
@@ -11,33 +11,29 @@ changelogUrl: "/en/overview/latest-version"
 
 ## Download
 
-- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.2.14/locus_0.2.14_x64-setup.exe)
-- [Windows x64 (system Python/Git)](https://github.com/r1n7aro/Locus/releases/download/v0.2.14/locus_0.2.14_x64-without_embed_python_git-setup.exe)
+- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.2.15/locus_0.2.15_x64-setup.exe)
+- [Windows x64 (system Python/Git)](https://github.com/r1n7aro/Locus/releases/download/v0.2.15/locus_0.2.15_x64-without_embed_python_git-setup.exe)
 - [GitHub Releases](https://github.com/r1n7aro/Locus/releases)
 
 ## Changes
 
 ### Added
 
-- Added Codex quota usage in Settings, including quota windows, remaining percentage, reset time, and manual refresh.
-- Added configurable approval behavior settings for Unity editor status changes and knowledge governance.
-- Added a dedicated file review window for chat diffs.
-- Added right-click reference actions in chat for files, Unity assets, scene objects, and knowledge documents.
-- Added Git diff review target support in Settings.
+- Added proxy settings and backend proxy routing for update checks, LLM clients, knowledge downloads, and agent subprocesses.
+- Added bundled ONNX Runtime preparation for vector search runtime packaging.
+- Added text-scan fallback search for knowledge when lexical indexing is disabled.
+- Added chat session fork and latest-turn undo workflows.
+- Added installer metadata and package selection in the update flow.
+- Added console log export and subagent completion notifications.
 
 ### Fixed
 
-- Windows NSIS installs now keep the update path compatible and clean up replaced bundled resources during install.
-- Custom Codex HTTP history requests now replay the full input when previous response IDs are disabled.
-- Highlighted markdown code lines now keep their line state.
-- Active tool calls now match by ID, keeping streamed tool handoff state more stable.
-- Edit diff previews in chat now stack more reliably.
-- Knowledge side rail dropdowns now stay visible.
-- Git checkpoint diffs now detect renamed files.
-- Unity bridge execution now recovers from stalled or timed-out pipe states.
-- Unity asset search now supports quoted queries.
-- Unity reconnect polling logs are quieter.
-- Settings now show Codex quota reset dates.
+- Chat streaming keeps tool-call collapse and handoff rendering more stable.
+- Failed chat sends now remove pending messages and reload session state.
+- Knowledge index status now follows global lexical and semantic search settings.
+- Lexical rebuild progress is suppressed when lexical search is disabled.
+- Windows installer detects system Git and can skip bundled Git resources.
+- Tool permission saves restore UI state on failure.
 
 ### Removed
 
