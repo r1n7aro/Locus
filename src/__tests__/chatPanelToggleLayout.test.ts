@@ -143,7 +143,8 @@ describe("chat panel toggle layout", () => {
     expect(toolPermissions).toContain("settings.perms.globalMode");
     expect(toolPermissions).toContain("settings.perms.globalModeDesc");
     expect(toolPermissions).toContain("settings.perms.behaviorTitle");
-    expect(toolPermissions).toContain("BaseCheckbox");
+    expect(toolPermissions).toContain("BaseSegmented");
+    expect(toolPermissions).toContain("settings.perms.columnMode");
     expect(toolPermissions).toContain("emit('setGlobalPermissionMode', $event as ToolMode)");
     expect(toolPermissions.indexOf("settings.perms.behaviorTitle")).toBeLessThan(
       toolPermissions.indexOf("settings.perms.globalMode"),
