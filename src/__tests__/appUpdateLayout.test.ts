@@ -21,9 +21,10 @@ describe("app update prompt", () => {
     expect(app).toContain('import { useAppUpdateStore } from "./stores/appUpdate"');
     expect(app).toContain("void appUpdateStore.checkForUpdates({ silent: true });");
     expect(app).toContain("<AppUpdateModal");
-    expect(app).toContain('@view="openAppUpdateChangelog"');
-    expect(app).toContain("await openUrl(updateInfo.changelogUrl);");
+    expect(app).toContain('@view="openAppUpdateDownload"');
+    expect(app).toContain("await openUrl(updateInfo.downloadUrl);");
     expect(app).toContain('t("app.update.openFailed", err.message)');
+    expect(modal).toContain('t("app.update.downloadPackage")');
     expect(modal).toContain('t("app.update.currentVersion")');
     expect(modal).toContain('Locus v${props.info.latestVersion} (${props.info.releasedAt})');
     expect(modal).toContain('Locus v${props.info.currentVersion}');
@@ -41,6 +42,7 @@ describe("app update prompt", () => {
     expect(store).toContain("notificationStore.addNotice(\"success\", t(\"app.update.upToDateNotice\")");
     expect(service).toContain('const DOCS_BASE_URL = "https://unity.farlocus.com";');
     expect(service).toContain("sourceBaseUrl = DOCS_BASE_URL");
+    expect(service).toContain("selectInstaller");
     expect(service).toContain('"fetch_app_update_manifest"');
     expect(zh).toContain('"settings.about.versionSourceLocal": "本地服务器 ({0})"');
     expect(en).toContain('"settings.about.versionSourceLocal": "Local server ({0})"');

@@ -27,6 +27,20 @@ pub struct AppUpdateDownloadChannel {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct AppUpdateInstallerDownload {
+    pub id: String,
+    pub label: String,
+    pub url: String,
+    pub platform: String,
+    pub arch: String,
+    pub includes_managed_python: bool,
+    pub includes_managed_git: bool,
+    pub requires_system_python: bool,
+    pub requires_system_git: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AppUpdateLocaleEntry {
     pub title: String,
     pub summary: String,
@@ -43,6 +57,8 @@ pub struct AppUpdateManifest {
     pub version: String,
     pub released_at: String,
     pub channel: String,
+    #[serde(default)]
+    pub installers: Vec<AppUpdateInstallerDownload>,
     pub locales: HashMap<String, AppUpdateLocaleEntry>,
 }
 
@@ -112,14 +128,15 @@ fn validate_manifest(manifest: &AppUpdateManifest) -> Result<(), AppError> {
 async fn fetch_manifest_from_source(
     source: &AppUpdateSource,
 ) -> Result<AppUpdateManifest, AppError> {
-    let client = reqwest::Client::builder()
-        .connect_timeout(source.connect_timeout)
-        .timeout(source.request_timeout)
-        .gzip(true)
-        .deflate(true)
-        .user_agent(concat!("Locus/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .map_err(|e| format!("Failed to create update manifest client: {}", e))?;
+    let client = crate::network::reqwest_client(
+        crate::network::ReqwestClientOptions::new()
+            .connect_timeout(source.connect_timeout)
+            .timeout(source.request_timeout)
+            .gzip(true)
+            .deflate(true)
+            .user_agent(concat!("Locus/", env!("CARGO_PKG_VERSION"))),
+    )
+    .map_err(|e| format!("Failed to create update manifest client: {}", e))?;
 
     let response = client
         .get(&source.manifest_url)

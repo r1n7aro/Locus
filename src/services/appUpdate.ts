@@ -3,6 +3,7 @@ import type {
   AppUpdateChangeGroup,
   AppUpdateDownloadChannel,
   AppUpdateInfo,
+  AppUpdateInstallerDownload,
   AppUpdateLocaleEntry,
   AppUpdateManifest,
   AppUpdateManifestFetchResult,
@@ -39,6 +40,22 @@ function isAppUpdateDownloadChannel(value: unknown): value is AppUpdateDownloadC
   return isNonEmptyString(record.label) && isNonEmptyString(record.url);
 }
 
+function isAppUpdateInstallerDownload(value: unknown): value is AppUpdateInstallerDownload {
+  if (typeof value !== "object" || value === null) return false;
+  const record = value as Record<string, unknown>;
+  return (
+    isNonEmptyString(record.id)
+    && isNonEmptyString(record.label)
+    && isNonEmptyString(record.url)
+    && isNonEmptyString(record.platform)
+    && isNonEmptyString(record.arch)
+    && typeof record.includesManagedPython === "boolean"
+    && typeof record.includesManagedGit === "boolean"
+    && typeof record.requiresSystemPython === "boolean"
+    && typeof record.requiresSystemGit === "boolean"
+  );
+}
+
 function isAppUpdateLocaleEntry(value: unknown): value is AppUpdateLocaleEntry {
   if (typeof value !== "object" || value === null) return false;
   const record = value as Record<string, unknown>;
@@ -67,6 +84,13 @@ export function isAppUpdateManifest(value: unknown): value is AppUpdateManifest 
     || !isNonEmptyString(record.channel)
     || typeof record.locales !== "object"
     || record.locales === null
+    || (
+      record.installers !== undefined
+      && (
+        !Array.isArray(record.installers)
+        || !record.installers.every(isAppUpdateInstallerDownload)
+      )
+    )
   ) {
     return false;
   }
@@ -200,12 +224,48 @@ function sanitizeChangeGroups(groups: AppUpdateChangeGroup[]): AppUpdateChangeGr
     .filter((group) => group.title.length > 0 && group.items.length > 0);
 }
 
+function sanitizeInstallers(
+  installers: AppUpdateInstallerDownload[] | undefined,
+  sourceBaseUrl: string,
+): AppUpdateInstallerDownload[] {
+  return (installers ?? [])
+    .map((installer) => ({
+      ...installer,
+      id: installer.id.trim(),
+      label: installer.label.trim(),
+      url: resolveUpdateUrl(installer.url.trim(), sourceBaseUrl),
+      platform: installer.platform.trim().toLowerCase(),
+      arch: installer.arch.trim().toLowerCase(),
+    }))
+    .filter((installer) =>
+      installer.id.length > 0
+      && installer.label.length > 0
+      && installer.url.length > 0
+      && installer.platform.length > 0
+      && installer.arch.length > 0,
+    );
+}
+
 export function resolveUpdateUrl(url: string, baseUrl = DOCS_BASE_URL): string {
   try {
     return new URL(url, `${baseUrl.replace(/\/$/, "")}/`).toString();
   } catch {
     return `${baseUrl.replace(/\/$/, "")}/overview/latest-version`;
   }
+}
+
+function selectInstaller(
+  installers: AppUpdateInstallerDownload[],
+): AppUpdateInstallerDownload | null {
+  if (installers.length === 0) {
+    return null;
+  }
+
+  const platformInstallers = installers.filter((installer) => installer.platform === "windows");
+  const candidates = platformInstallers.length > 0 ? platformInstallers : installers;
+  return candidates.find((installer) =>
+    !installer.requiresSystemPython && !installer.requiresSystemGit,
+  ) ?? candidates[0] ?? null;
 }
 
 export function resolveAppUpdateInfo(
@@ -224,6 +284,10 @@ export function resolveAppUpdateInfo(
     return null;
   }
 
+  const installers = sanitizeInstallers(manifest.installers, sourceBaseUrl);
+  const installer = selectInstaller(installers);
+  const changelogUrl = resolveUpdateUrl(localeEntry.changelogUrl, sourceBaseUrl);
+
   return {
     currentVersion: currentVersion.trim().replace(/^v/i, ""),
     latestVersion: manifest.version.trim().replace(/^v/i, ""),
@@ -231,8 +295,11 @@ export function resolveAppUpdateInfo(
     channel: manifest.channel.trim(),
     title: localeEntry.title.trim(),
     summary: localeEntry.summary.trim(),
-    changelogUrl: resolveUpdateUrl(localeEntry.changelogUrl, sourceBaseUrl),
+    changelogUrl,
+    downloadUrl: installer?.url ?? changelogUrl,
+    downloadLabel: installer?.label ?? localeEntry.title.trim(),
     changes: sanitizeChangeGroups(localeEntry.changes),
+    installer,
     sourceKind,
     sourceBaseUrl,
   };

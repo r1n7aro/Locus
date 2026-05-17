@@ -427,18 +427,18 @@ function closeAppUpdateModal() {
   appUpdateStore.dismissDialog();
 }
 
-async function openAppUpdateChangelog() {
+async function openAppUpdateDownload() {
   const updateInfo = appUpdateStore.updateInfo;
   if (!updateInfo) return;
 
   try {
-    await openUrl(updateInfo.changelogUrl);
+    await openUrl(updateInfo.downloadUrl);
     appUpdateStore.dismissDialog();
   } catch (error) {
     const err = normalizeAppError(error);
     notificationStore.addNotice("error", t("app.update.openFailed", err.message), {
       code: err.code,
-      operation: "openAppUpdateChangelog",
+      operation: "openAppUpdateDownload",
       skipConsoleLog: true,
     });
   }
@@ -852,7 +852,7 @@ watch(() => projectStore.workingDir, () => {
     :open="showAppUpdateModal"
     :info="appUpdateStore.updateInfo"
     @close="closeAppUpdateModal"
-    @view="openAppUpdateChangelog"
+    @view="openAppUpdateDownload"
   />
   <Transition name="workspace-switch-modal">
     <div

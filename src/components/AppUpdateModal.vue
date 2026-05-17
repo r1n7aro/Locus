@@ -24,6 +24,8 @@ const currentVersionLabel = computed(() => {
   if (!props.info) return "";
   return `Locus v${props.info.currentVersion}`;
 });
+
+const downloadPackageLabel = computed(() => props.info?.downloadLabel.trim() ?? "");
 </script>
 
 <template>
@@ -75,6 +77,11 @@ const currentVersionLabel = computed(() => {
                   {{ currentVersionLabel }}
                 </div>
               </div>
+            </div>
+
+            <div v-if="downloadPackageLabel" class="app-update-download-row">
+              <span class="app-update-download-label">{{ t("app.update.downloadPackage") }}</span>
+              <span class="app-update-download-value">{{ downloadPackageLabel }}</span>
             </div>
 
             <section v-if="visibleChanges.length > 0" class="app-update-changes">
@@ -232,6 +239,29 @@ const currentVersionLabel = computed(() => {
   font-size: 13px;
   line-height: 1.5;
   font-weight: 700;
+}
+
+.app-update-download-row {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  min-width: 0;
+  padding: 12px 0 0;
+}
+
+.app-update-download-label {
+  flex: 0 0 auto;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.app-update-download-value {
+  min-width: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-color);
+  word-break: break-word;
 }
 
 .app-update-changes {

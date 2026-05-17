@@ -25,6 +25,8 @@ export const releaseNoteLocalizedFrontmatterKeys = [
   "changelogUrl",
 ];
 
+const releaseAssetRepo = "r1n7aro/Locus";
+
 const releaseNoteRequiredFrontmatterKeys = [
   ...releaseNoteSharedFrontmatterKeys,
   ...releaseNoteLocalizedFrontmatterKeys,
@@ -164,6 +166,39 @@ function parseDownloadChannels(body, filePath, downloadsHeadings) {
   return channels;
 }
 
+function releaseAssetUrl(version, fileName) {
+  const normalizedVersion = version.trim().replace(/^v/i, "");
+  return `https://github.com/${releaseAssetRepo}/releases/download/v${normalizedVersion}/${fileName}`;
+}
+
+function buildInstallerDownloads(version) {
+  const normalizedVersion = version.trim().replace(/^v/i, "");
+  return [
+    {
+      id: "windows-x64",
+      label: "Windows x64",
+      url: releaseAssetUrl(normalizedVersion, `locus_${normalizedVersion}_x64-setup.exe`),
+      platform: "windows",
+      arch: "x64",
+      includesManagedPython: true,
+      includesManagedGit: true,
+      requiresSystemPython: false,
+      requiresSystemGit: false,
+    },
+    {
+      id: "windows-x64-without-embed-python-git",
+      label: "Windows x64 - system Python/Git",
+      url: releaseAssetUrl(normalizedVersion, `locus_${normalizedVersion}_x64-without_embed_python_git-setup.exe`),
+      platform: "windows",
+      arch: "x64",
+      includesManagedPython: false,
+      includesManagedGit: false,
+      requiresSystemPython: true,
+      requiresSystemGit: true,
+    },
+  ];
+}
+
 async function parseLocaleReleaseNotes(docsDir, locale, config) {
   const filePath = path.join(docsDir, config.sourcePath);
   const raw = await readFile(filePath, "utf8");
@@ -270,6 +305,7 @@ export async function buildUpdateJson(docsDir) {
     version: reference.version,
     releasedAt: reference.releasedAt,
     channel: reference.channel,
+    installers: buildInstallerDownloads(reference.version),
     locales,
   };
 }
