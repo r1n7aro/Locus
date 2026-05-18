@@ -54,7 +54,7 @@ pub(super) fn bash() -> ToolDef {
         name: "bash".to_string(),
         description: prompt.description,
         parameters: prompt.parameters,
-        execute: make_exec(|args, _ctx| {
+        execute: make_exec(|args, ctx| {
             Box::pin(async move {
                 let command = match args.get("command").and_then(|v| v.as_str()) {
                     Some(c) => c.to_string(),
@@ -87,7 +87,18 @@ pub(super) fn bash() -> ToolDef {
                     };
                 }
 
-                let python = crate::python_runtime::resolve_effective_python(None);
+                let python =
+                    crate::python_runtime::resolve_effective_python(ctx.app_handle.as_ref());
+                if let Some(ref python) = python {
+                    if let Err(error) =
+                        crate::python_runtime::ensure_runtime_package_environment(python)
+                    {
+                        return ToolResult {
+                            output: error,
+                            is_error: true,
+                        };
+                    }
+                }
 
                 let sh_command = || {
                     if let Some(ref python) = python {
@@ -125,6 +136,28 @@ pub(super) fn bash() -> ToolDef {
                 cmd.env("PYTHONUTF8", "1");
                 if let Some(ref python) = python {
                     cmd.env("LOCUS_PYTHON", &python.path);
+                    if let Some(ref home) = python.home {
+                        cmd.env("PYTHONHOME", home);
+                    }
+                    if matches!(
+                        &python.source,
+                        crate::python_runtime::PythonRuntimeSource::Managed
+                    ) {
+                        cmd.env("PYTHONNOUSERSITE", "1");
+                        cmd.env("PIP_DISABLE_PIP_VERSION_CHECK", "1");
+                        cmd.env("PIP_NO_WARN_SCRIPT_LOCATION", "1");
+                        if let Some(ref package_dir) = python.package_dir {
+                            cmd.env("PIP_TARGET", package_dir);
+                            if let Some(python_path) =
+                                crate::python_runtime::managed_python_path_env(
+                                    std::env::var_os("PYTHONPATH"),
+                                    python,
+                                )
+                            {
+                                cmd.env("PYTHONPATH", python_path);
+                            }
+                        }
+                    }
                 }
 
                 #[cfg(target_os = "windows")]

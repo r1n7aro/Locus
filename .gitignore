@@ -25,6 +25,7 @@ site/
 docs/.home.html
 src-tauri/gen/managed-python/windows-*/
 src-tauri/gen/managed-python/manifest.json
+src-tauri/gen/managed-python/pip.pyz
 src-tauri/gen/managed-git/windows-*/
 src-tauri/gen/managed-git/manifest.json
 src-tauri/gen/ort-runtime/windows-*/

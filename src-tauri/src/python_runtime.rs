@@ -11,6 +11,7 @@ use tauri::{AppHandle, Manager};
 const CONFIG_FILE: &str = "python_runtime_config.json";
 const MANAGED_RESOURCE_DIR: &str = "managed-python";
 const MANAGED_WINDOWS_X64_ID: &str = "managed:windows-x64";
+const MANAGED_PIP_ZIPAPP: &str = "pip.pyz";
 const PY_LAUNCHER_TIMEOUT: Duration = Duration::from_millis(1500);
 const PY_RUNTIME_PROBE_TIMEOUT: Duration = Duration::from_millis(2200);
 
@@ -56,6 +57,9 @@ pub struct ResolvedPythonRuntime {
     pub path: PathBuf,
     pub version: Option<String>,
     pub source: PythonRuntimeSource,
+    pub home: Option<PathBuf>,
+    pub package_dir: Option<PathBuf>,
+    pub pip_zipapp: Option<PathBuf>,
 }
 
 type PythonRuntimeDiscoveryCache = Option<Vec<PythonRuntimeInfo>>;
@@ -181,10 +185,31 @@ pub fn resolve_effective_python(app_handle: Option<&AppHandle>) -> Option<Resolv
     if !effective.available {
         return None;
     }
+    let source = effective.source;
+    let path = PathBuf::from(effective.path);
+    let version = effective.version;
+    let home = if source == PythonRuntimeSource::Managed {
+        path.parent().map(Path::to_path_buf)
+    } else {
+        None
+    };
+    let package_dir = if source == PythonRuntimeSource::Managed {
+        managed_python_package_dir(app_handle, version.as_deref())
+    } else {
+        None
+    };
+    let pip_zipapp = if source == PythonRuntimeSource::Managed {
+        managed_python_pip_zipapp_path(app_handle)
+    } else {
+        None
+    };
     Some(ResolvedPythonRuntime {
-        path: PathBuf::from(effective.path),
-        version: effective.version,
-        source: effective.source,
+        path,
+        version,
+        source,
+        home,
+        package_dir,
+        pip_zipapp,
     })
 }
 
@@ -213,24 +238,34 @@ pub fn ensure_python_shim_dir(python_path: &Path) -> Option<PathBuf> {
     {
         let target = python_path.display().to_string();
         let shim = format!("@echo off\r\n\"{}\" %*\r\n", target);
+        let pip_shim = format!("@echo off\r\n\"{}\" -m pip %*\r\n", target);
         std::fs::write(dir.join("python.cmd"), &shim).ok()?;
         std::fs::write(dir.join("python3.cmd"), shim).ok()?;
+        std::fs::write(dir.join("pip.cmd"), &pip_shim).ok()?;
+        std::fs::write(dir.join("pip3.cmd"), pip_shim).ok()?;
     }
 
     #[cfg(not(target_os = "windows"))]
     {
         let target = shell_quote_posix(&python_path.display().to_string());
         let shim = format!("#!/bin/sh\nexec {} \"$@\"\n", target);
+        let pip_shim = format!("#!/bin/sh\nexec {} -m pip \"$@\"\n", target);
         let python = dir.join("python");
         let python3 = dir.join("python3");
+        let pip = dir.join("pip");
+        let pip3 = dir.join("pip3");
         std::fs::write(&python, &shim).ok()?;
         std::fs::write(&python3, &shim).ok()?;
+        std::fs::write(&pip, &pip_shim).ok()?;
+        std::fs::write(&pip3, &pip_shim).ok()?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let mode = std::fs::Permissions::from_mode(0o755);
             let _ = std::fs::set_permissions(&python, mode.clone());
             let _ = std::fs::set_permissions(&python3, mode);
+            let _ = std::fs::set_permissions(&pip, mode.clone());
+            let _ = std::fs::set_permissions(&pip3, mode);
         }
     }
 
@@ -255,9 +290,44 @@ pub fn prepend_python_to_path(
 pub fn sh_python_function_prefix(python_path: &Path) -> String {
     let executable = shell_quote_posix(&python_path.display().to_string().replace('\\', "/"));
     format!(
-        "python() {{ {} \"$@\"; }}\npython3() {{ {} \"$@\"; }}\n",
-        executable, executable
+        "python() {{ {} \"$@\"; }}\npython3() {{ {} \"$@\"; }}\npip() {{ {} -m pip \"$@\"; }}\npip3() {{ {} -m pip \"$@\"; }}\n",
+        executable, executable, executable, executable
     )
+}
+
+pub fn ensure_runtime_package_environment(runtime: &ResolvedPythonRuntime) -> Result<(), String> {
+    if !matches!(&runtime.source, PythonRuntimeSource::Managed) {
+        return Ok(());
+    }
+
+    let Some(package_dir) = runtime.package_dir.as_ref() else {
+        return Ok(());
+    };
+
+    std::fs::create_dir_all(package_dir).map_err(|e| {
+        format!(
+            "Failed to create managed Python package dir '{}': {}",
+            package_dir.display(),
+            e
+        )
+    })?;
+
+    if let Some(pip_zipapp) = runtime.pip_zipapp.as_ref().filter(|path| path.is_file()) {
+        write_pip_module_shim(package_dir, pip_zipapp)?;
+    }
+
+    Ok(())
+}
+
+pub fn managed_python_path_env(
+    current_path: Option<OsString>,
+    runtime: &ResolvedPythonRuntime,
+) -> Option<OsString> {
+    if !matches!(&runtime.source, PythonRuntimeSource::Managed) {
+        return current_path;
+    }
+    let package_dir = runtime.package_dir.as_ref()?.to_path_buf();
+    crate::process_util::prepend_paths(current_path, vec![package_dir])
 }
 
 fn config_path() -> Result<PathBuf, String> {
@@ -362,7 +432,7 @@ fn managed_python_runtime(app_handle: Option<&AppHandle>) -> Option<PythonRuntim
     })
 }
 
-fn managed_python_executable_path(app_handle: Option<&AppHandle>) -> Option<PathBuf> {
+fn managed_python_roots(app_handle: Option<&AppHandle>) -> Vec<PathBuf> {
     let mut roots = Vec::new();
     if let Some(app) = app_handle {
         if let Ok(resource_dir) = app.path().resource_dir() {
@@ -378,8 +448,18 @@ fn managed_python_executable_path(app_handle: Option<&AppHandle>) -> Option<Path
     }
 
     roots.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("gen"));
+    roots
+}
 
-    find_managed_python_executable(&roots)
+fn managed_python_executable_path(app_handle: Option<&AppHandle>) -> Option<PathBuf> {
+    find_managed_python_executable(&managed_python_roots(app_handle))
+}
+
+fn managed_python_pip_zipapp_path(app_handle: Option<&AppHandle>) -> Option<PathBuf> {
+    managed_python_roots(app_handle)
+        .into_iter()
+        .map(|root| root.join(MANAGED_RESOURCE_DIR).join(MANAGED_PIP_ZIPAPP))
+        .find(|candidate| candidate.is_file())
 }
 
 fn find_managed_python_executable(roots: &[PathBuf]) -> Option<PathBuf> {
@@ -396,6 +476,74 @@ fn managed_python_executable_under(root: &Path) -> PathBuf {
     } else {
         base.join("bin").join("python3")
     }
+}
+
+fn managed_python_package_dir(
+    app_handle: Option<&AppHandle>,
+    version: Option<&str>,
+) -> Option<PathBuf> {
+    let data_dir = if let Some(app) = app_handle {
+        crate::commands::resolve_runtime_storage_dir(app).ok()
+    } else {
+        crate::commands::packaged_runtime_storage_dir()
+            .ok()
+            .flatten()
+    }?;
+    Some(
+        data_dir
+            .join(MANAGED_RESOURCE_DIR)
+            .join(managed_python_platform_id())
+            .join(managed_python_version_tag(version))
+            .join("site-packages"),
+    )
+}
+
+fn managed_python_platform_id() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "windows-x64"
+    } else {
+        "default"
+    }
+}
+
+fn managed_python_version_tag(version: Option<&str>) -> String {
+    let Some(version) = version.map(str::trim).filter(|value| !value.is_empty()) else {
+        return "python".to_string();
+    };
+    let mut parts = version.split('.');
+    let Some(major) = parts.next().filter(|value| !value.is_empty()) else {
+        return "python".to_string();
+    };
+    let Some(minor) = parts.next().filter(|value| !value.is_empty()) else {
+        return format!("python-{}", major);
+    };
+    format!("python-{}.{}", major, minor)
+}
+
+fn write_pip_module_shim(package_dir: &Path, pip_zipapp: &Path) -> Result<(), String> {
+    let pip_dir = package_dir.join("pip");
+    std::fs::create_dir_all(&pip_dir).map_err(|e| {
+        format!(
+            "Failed to create pip shim dir '{}': {}",
+            pip_dir.display(),
+            e
+        )
+    })?;
+
+    let zipapp_literal = serde_json::to_string(&pip_zipapp.display().to_string())
+        .map_err(|e| format!("Failed to serialize pip zipapp path: {}", e))?;
+    let init_path = pip_dir.join("__init__.py");
+    if !init_path.is_file() {
+        std::fs::write(&init_path, "# Locus managed Python pip shim.\n")
+            .map_err(|e| format!("Failed to write pip shim '{}': {}", init_path.display(), e))?;
+    }
+
+    let main = format!(
+        "import os\nimport runpy\nimport sys\n\nPIP_ZIPAPP = {zipapp_literal}\nSTUB_ROOT = os.path.dirname(os.path.dirname(__file__))\nSTUB_ROOT_KEY = os.path.normcase(os.path.normpath(STUB_ROOT))\nsys.path = [entry for entry in sys.path if os.path.normcase(os.path.normpath(entry or os.curdir)) != STUB_ROOT_KEY]\nfor name in list(sys.modules):\n    if name == 'pip' or name.startswith('pip.'):\n        del sys.modules[name]\nif PIP_ZIPAPP not in sys.path:\n    sys.path.insert(0, PIP_ZIPAPP)\nsys.argv[0] = PIP_ZIPAPP\nrunpy.run_path(PIP_ZIPAPP, run_name='__main__')\n"
+    );
+    let main_path = pip_dir.join("__main__.py");
+    std::fs::write(&main_path, main)
+        .map_err(|e| format!("Failed to write pip shim '{}': {}", main_path.display(), e))
 }
 
 fn system_python_candidates() -> Vec<PathBuf> {
@@ -496,6 +644,13 @@ fn probe_python_runtime(
     }
 
     let mut command = Command::new(&candidate);
+    if source == PythonRuntimeSource::Managed {
+        if let Some(home) = candidate.parent() {
+            command.env("PYTHONHOME", home);
+            command.env("PYTHONNOUSERSITE", "1");
+        }
+        command.env_remove("PYTHONPATH");
+    }
     command
         .arg("-c")
         .arg("import sys; print('{}.{}.{}'.format(*sys.version_info[:3])); print(sys.executable)");
@@ -598,7 +753,8 @@ fn shell_quote_posix(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        find_managed_python_executable, managed_python_executable_under, sh_python_function_prefix,
+        find_managed_python_executable, managed_python_executable_under,
+        managed_python_version_tag, sh_python_function_prefix,
     };
     use std::path::Path;
 
@@ -625,7 +781,16 @@ mod tests {
         let prefix = sh_python_function_prefix(Path::new("C:/Tools/Python/python.exe"));
         assert!(prefix.contains("python()"));
         assert!(prefix.contains("python3()"));
+        assert!(prefix.contains("pip()"));
+        assert!(prefix.contains("pip3()"));
         assert!(prefix.contains("'C:/Tools/Python/python.exe'"));
+    }
+
+    #[test]
+    fn managed_python_version_tag_uses_major_minor() {
+        assert_eq!(managed_python_version_tag(Some("3.13.12")), "python-3.13");
+        assert_eq!(managed_python_version_tag(Some("3")), "python-3");
+        assert_eq!(managed_python_version_tag(None), "python");
     }
 
     #[test]

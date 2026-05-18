@@ -38,6 +38,9 @@ describe("Python runtime settings", () => {
     expect(runtime).toContain("PY_RUNTIME_PROBE_TIMEOUT");
     expect(runtime).toContain("discover_python_runtimes_cached");
     expect(runtime).toContain("suppress_command_window(&mut command)");
+    expect(runtime).toContain("managed_python_package_dir");
+    expect(runtime).toContain("write_pip_module_shim");
+    expect(runtime).toContain("PIP_ZIPAPP");
     expect(processUtil).toContain("pub fn suppress_command_window");
     expect(processUtil).toContain("cmd.creation_flags(CREATE_NO_WINDOW)");
   });
@@ -47,9 +50,11 @@ describe("Python runtime settings", () => {
     const en = read("src/language/en.json");
 
     expect(zh).toContain('"settings.general.pythonRuntime": "Python 运行时"');
+    expect(zh).toContain("托管 Python 的依赖安装到数据目录");
     expect(zh).toContain('"settings.general.pythonManaged": "托管 Python"');
     expect(zh).toContain('"settings.general.pythonSystem": "系统 Python"');
     expect(en).toContain('"settings.general.pythonRuntime": "Python Runtime"');
+    expect(en).toContain("Managed Python installs packages into the data directory");
     expect(en).toContain('"settings.general.pythonManaged": "Managed Python"');
     expect(en).toContain('"settings.general.pythonSystem": "System Python"');
   });
@@ -107,6 +112,24 @@ describe("Python runtime settings", () => {
         .or_else(resolve_git_from_managed_resource)`);
     expect(lib).toContain("set_managed_git_resource_dir");
     expect(script).toContain("PortableGit");
+  });
+
+  it("routes managed Python pip installs into the app data directory", () => {
+    const script = read("scripts/prepare-managed-python.mjs");
+    const runtime = read("src-tauri/src/python_runtime.rs");
+    const shell = read("src-tauri/src/tool/builtins/shell.rs");
+    const bashTool = read("tools/bash.json");
+
+    expect(script).toContain("PIP_ZIPAPP_URL");
+    expect(script).toContain("pip.pyz");
+    expect(script).toContain("rmSync(path.join(targetDir, \"python313._pth\")");
+    expect(runtime).toContain("managed_python_package_dir");
+    expect(runtime).toContain(".join(\"site-packages\")");
+    expect(runtime).toContain("write_pip_module_shim");
+    expect(shell).toContain("PIP_TARGET");
+    expect(shell).toContain("PYTHONHOME");
+    expect(shell).toContain("managed_python_path_env");
+    expect(bashTool).toContain("Managed Python installs pip packages into the Locus data directory by default");
   });
 
   it("defines release installer flavors for embedded and no-embed packages", () => {
