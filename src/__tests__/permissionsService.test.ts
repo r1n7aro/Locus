@@ -7,8 +7,11 @@ vi.mock("../services/ipc", () => ({
 }));
 
 import {
+  getCachedFileToolWorkspaceBoundary,
   getCachedDebugMode,
   getDebugMode,
+  getFileToolWorkspaceBoundary,
+  setFileToolWorkspaceBoundary,
   saveToolPermissionMode,
   setDebugMode,
 } from "../services/permissions";
@@ -46,6 +49,28 @@ describe("permissions service", () => {
     expect(ipcInvokeMock).toHaveBeenCalledTimes(1);
     expect(ipcInvokeMock).toHaveBeenCalledWith("set_debug_mode", {
       value: false,
+    });
+  });
+
+  it("caches loaded file tool workspace boundary mode", async () => {
+    ipcInvokeMock.mockResolvedValueOnce(false);
+
+    await expect(getFileToolWorkspaceBoundary()).resolves.toBe(false);
+    await expect(getFileToolWorkspaceBoundary()).resolves.toBe(false);
+
+    expect(getCachedFileToolWorkspaceBoundary()).toBe(false);
+    expect(ipcInvokeMock).toHaveBeenCalledTimes(1);
+    expect(ipcInvokeMock).toHaveBeenCalledWith("get_file_tool_workspace_boundary");
+  });
+
+  it("updates the cached file tool workspace boundary after saving", async () => {
+    await setFileToolWorkspaceBoundary(true);
+
+    expect(getCachedFileToolWorkspaceBoundary()).toBe(true);
+    await expect(getFileToolWorkspaceBoundary()).resolves.toBe(true);
+    expect(ipcInvokeMock).toHaveBeenCalledTimes(1);
+    expect(ipcInvokeMock).toHaveBeenCalledWith("set_file_tool_workspace_boundary", {
+      value: true,
     });
   });
 });

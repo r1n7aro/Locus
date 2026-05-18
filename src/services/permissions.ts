@@ -3,6 +3,9 @@ import { ipcInvoke } from "./ipc";
 let cachedDebugMode: boolean | null = null;
 let pendingDebugModeLoad: Promise<boolean> | null = null;
 let debugModeCacheVersion = 0;
+let cachedFileToolWorkspaceBoundary: boolean | null = null;
+let pendingFileToolWorkspaceBoundaryLoad: Promise<boolean> | null = null;
+let fileToolWorkspaceBoundaryCacheVersion = 0;
 
 export function getToolPermissionMode(): Promise<string> {
   return ipcInvoke<string>("get_tool_permission_mode");
@@ -56,6 +59,46 @@ export async function setDebugMode(value: boolean): Promise<void> {
   } catch (error) {
     debugModeCacheVersion += 1;
     cachedDebugMode = previous;
+    throw error;
+  }
+}
+
+export function getCachedFileToolWorkspaceBoundary(): boolean | null {
+  return cachedFileToolWorkspaceBoundary;
+}
+
+export function getFileToolWorkspaceBoundary(): Promise<boolean> {
+  if (cachedFileToolWorkspaceBoundary !== null) {
+    return Promise.resolve(cachedFileToolWorkspaceBoundary);
+  }
+
+  if (!pendingFileToolWorkspaceBoundaryLoad) {
+    const cacheVersion = fileToolWorkspaceBoundaryCacheVersion;
+    pendingFileToolWorkspaceBoundaryLoad = ipcInvoke<boolean>("get_file_tool_workspace_boundary")
+      .then((value) => {
+        if (cacheVersion === fileToolWorkspaceBoundaryCacheVersion) {
+          cachedFileToolWorkspaceBoundary = value;
+        }
+        return cachedFileToolWorkspaceBoundary ?? value;
+      })
+      .finally(() => {
+        pendingFileToolWorkspaceBoundaryLoad = null;
+      });
+  }
+
+  return pendingFileToolWorkspaceBoundaryLoad;
+}
+
+export async function setFileToolWorkspaceBoundary(value: boolean): Promise<void> {
+  const previous = cachedFileToolWorkspaceBoundary;
+  fileToolWorkspaceBoundaryCacheVersion += 1;
+  cachedFileToolWorkspaceBoundary = value;
+
+  try {
+    await ipcInvoke("set_file_tool_workspace_boundary", { value });
+  } catch (error) {
+    fileToolWorkspaceBoundaryCacheVersion += 1;
+    cachedFileToolWorkspaceBoundary = previous;
     throw error;
   }
 }

@@ -31,7 +31,9 @@ import {
   testCustomEndpoint,
 } from "../services/model";
 import {
+  getFileToolWorkspaceBoundary,
   getToolPermissions,
+  setFileToolWorkspaceBoundary,
   saveToolPermissions as serviceSaveToolPermissions,
 } from "../services/permissions";
 import {
@@ -222,6 +224,7 @@ export function useSettingsState(emit: SettingsEmit) {
       localStorage.removeItem("locus-locale");
       localStorage.removeItem("locus-theme-preference");
       localStorage.removeItem("locus-unity-embed-theme-preference");
+      localStorage.removeItem("locus-knowledge-access-mode");
       localStorage.removeItem("locus:sessionPanelWidth");
       localStorage.removeItem("locus:unity:sessionPanelWidth");
       localStorage.removeItem("locus:unity:sessionPanelCollapsed");
@@ -709,6 +712,9 @@ export function useSettingsState(emit: SettingsEmit) {
 
   // ── Tool permissions ─────────────────────────────────────────────────
   const permSaveMsg = ref("");
+  const fileToolWorkspaceBoundary = ref(false);
+  const fileToolWorkspaceBoundaryReady = ref(false);
+  const fileToolWorkspaceBoundaryBusy = ref(false);
   let permSaveTimer: ReturnType<typeof setTimeout> | null = null;
 
   const toolList = computed(() => [
@@ -721,7 +727,7 @@ export function useSettingsState(emit: SettingsEmit) {
     { name: "write",              label: "write",              desc: t("tool.desc.write"),              defaultMode: "ask"  as const },
     { name: "edit",               label: "edit",               desc: t("tool.desc.edit"),               defaultMode: "ask"  as const },
     { name: "bash",               label: "bash",               desc: t("tool.desc.bash"),               defaultMode: "ask"  as const },
-    { name: "webfetch",           label: "webfetch",           desc: t("tool.desc.webfetch"),           defaultMode: "ask"  as const },
+    { name: "web_fetch",          label: "web_fetch",          desc: t("tool.desc.web_fetch"),          defaultMode: "ask"  as const },
     { name: "canvas",             label: "canvas",             desc: t("tool.desc.canvas"),             defaultMode: "auto" as const },
     { name: "unity_execute",      label: "unity_execute",      desc: t("tool.desc.unity_execute"),      defaultMode: "ask"  as const },
     { name: "unity_run_states",   label: "unity_run_states",   desc: t("tool.desc.unity_run_states"),   defaultMode: "ask"  as const },
@@ -738,6 +744,9 @@ export function useSettingsState(emit: SettingsEmit) {
     { name: "knowledge_delete",   label: "knowledge_delete",   desc: t("tool.desc.knowledge_delete"),   defaultMode: "auto" as const },
     { name: "knowledge_move",     label: "knowledge_move",     desc: t("tool.desc.knowledge_move"),     defaultMode: "auto" as const },
     { name: "knowledge_edit",     label: "knowledge_edit",     desc: t("tool.desc.knowledge_edit"),     defaultMode: "auto" as const },
+    { name: "skill_create",       label: "skill_create",       desc: t("tool.desc.skill_create"),       defaultMode: "auto" as const },
+    { name: "skill_reload",       label: "skill_reload",       desc: t("tool.desc.skill_reload"),       defaultMode: "auto" as const },
+    { name: "skill_list",         label: "skill_list",         desc: t("tool.desc.skill_list"),         defaultMode: "auto" as const },
   ]);
 
   const approvalBehaviorList = computed(() => [
@@ -775,6 +784,42 @@ export function useSettingsState(emit: SettingsEmit) {
       }
       toolPermissions.value = normalized;
     } catch { /* use defaults */ }
+  }
+
+  async function loadFileToolWorkspaceBoundary() {
+    try {
+      fileToolWorkspaceBoundary.value = await getFileToolWorkspaceBoundary();
+    } catch {
+      fileToolWorkspaceBoundary.value = false;
+    } finally {
+      fileToolWorkspaceBoundaryReady.value = true;
+    }
+  }
+
+  async function setFileToolWorkspaceBoundaryEnabled(value: boolean) {
+    if (!fileToolWorkspaceBoundaryReady.value || fileToolWorkspaceBoundaryBusy.value) return;
+    const previous = fileToolWorkspaceBoundary.value;
+    if (previous === value) return;
+    fileToolWorkspaceBoundary.value = value;
+    fileToolWorkspaceBoundaryBusy.value = true;
+    try {
+      await setFileToolWorkspaceBoundary(value);
+      permSaveMsg.value = t("settings.perms.saved");
+      if (permSaveTimer) clearTimeout(permSaveTimer);
+      permSaveTimer = setTimeout(() => {
+        permSaveMsg.value = "";
+        permSaveTimer = null;
+      }, 2000);
+    } catch (e) {
+      fileToolWorkspaceBoundary.value = previous;
+      const err = normalizeAppError(e);
+      useNotificationStore().addNotice("error", t("settings.perms.fileBoundarySaveFailed", err.message), {
+        code: err.code,
+        operation: "setFileToolWorkspaceBoundary",
+      });
+    } finally {
+      fileToolWorkspaceBoundaryBusy.value = false;
+    }
   }
 
   async function setToolPermission(name: string, mode: "auto" | "ask") {
@@ -876,6 +921,7 @@ export function useSettingsState(emit: SettingsEmit) {
         ? ep.replayReasoningContent
         : defaultReplayReasoningContent(ep),
       serverTools: normalizeServerTools(ep.serverTools),
+      supportsToolLazyLoading: ep.supportsToolLazyLoading === true,
     };
   }
 
@@ -923,6 +969,7 @@ export function useSettingsState(emit: SettingsEmit) {
       reasoningParamFormat: defaultReasoningParamFormat(apiFormat),
       replayReasoningContent: true,
       serverTools: normalizeServerTools(),
+      supportsToolLazyLoading: false,
     };
   }
 
@@ -1068,6 +1115,7 @@ export function useSettingsState(emit: SettingsEmit) {
     } else {
       await loadToolPermissions();
     }
+    await loadFileToolWorkspaceBoundary();
 
     if (cachedEndpoints) customEndpoints.value = cachedEndpoints.map(normalizeCustomEndpoint);
     else await loadCustomEndpoints();
@@ -1148,8 +1196,13 @@ export function useSettingsState(emit: SettingsEmit) {
     toolList,
     approvalBehaviorList,
     toolPermissions,
+    fileToolWorkspaceBoundary,
+    fileToolWorkspaceBoundaryReady,
+    fileToolWorkspaceBoundaryBusy,
     loadToolPermissions,
+    loadFileToolWorkspaceBoundary,
     setToolPermission,
+    setFileToolWorkspaceBoundaryEnabled,
     toggleToolPermission,
     saveToolPermissions,
     getToolMode,

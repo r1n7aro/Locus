@@ -1,8 +1,10 @@
 <script setup lang="ts">
+import { computed } from "vue";
 import { t } from "../../i18n";
 import BaseSegmented from "../ui/BaseSegmented.vue";
 
 type ToolMode = "auto" | "ask";
+type FileBoundaryMode = "all" | "workspace";
 
 interface ToolPermissionItem {
   name: string;
@@ -16,12 +18,16 @@ const props = defineProps<{
   toolList: ToolPermissionItem[];
   behaviorList: ToolPermissionItem[];
   toolPermissions: Record<string, ToolMode>;
+  fileWorkspaceBoundaryEnabled: boolean;
+  fileWorkspaceBoundaryReady: boolean;
+  fileWorkspaceBoundaryBusy: boolean;
   permSaveMsg: string;
 }>();
 
 const emit = defineEmits<{
   setGlobalPermissionMode: [mode: ToolMode];
   setPermission: [name: string, mode: ToolMode];
+  setFileWorkspaceBoundary: [value: boolean];
 }>();
 
 const permissionOptions = [
@@ -29,9 +35,31 @@ const permissionOptions = [
   { value: "ask", label: "Ask" },
 ] as const;
 
+const fileBoundaryOptions = computed(() => [
+  {
+    value: "all",
+    label: t("settings.perms.fileBoundaryAll"),
+    disabled: !props.fileWorkspaceBoundaryReady || props.fileWorkspaceBoundaryBusy,
+  },
+  {
+    value: "workspace",
+    label: t("settings.perms.fileBoundaryWorkspace"),
+    disabled: !props.fileWorkspaceBoundaryReady || props.fileWorkspaceBoundaryBusy,
+  },
+]);
+
+const fileBoundaryMode = computed<FileBoundaryMode>(() =>
+  props.fileWorkspaceBoundaryEnabled ? "workspace" : "all",
+);
+
 function getToolMode(name: string): ToolMode {
   const item = [...props.toolList, ...props.behaviorList].find((entry) => entry.name === name);
   return props.toolPermissions[name] ?? (item?.defaultMode ?? "ask");
+}
+
+function setFileBoundaryMode(mode: string) {
+  if (!props.fileWorkspaceBoundaryReady || props.fileWorkspaceBoundaryBusy) return;
+  emit("setFileWorkspaceBoundary", mode === "workspace");
 }
 </script>
 
@@ -56,10 +84,35 @@ function getToolMode(name: string): ToolMode {
         </Transition>
       </div>
 
-      <div class="perm-card perm-behavior-card">
-        <div class="perm-card-heading">
-          <div class="perm-card-title">{{ t("settings.perms.behaviorTitle") }}</div>
-          <div class="perm-card-desc">{{ t("settings.perms.behaviorDesc") }}</div>
+      <div class="perm-panel">
+        <div class="perm-panel-heading">
+          <div class="perm-panel-title">{{ t("settings.perms.fileBoundaryTitle") }}</div>
+          <div class="perm-panel-desc">{{ t("settings.perms.fileBoundaryDesc") }}</div>
+        </div>
+
+        <div class="perm-row perm-simple-row">
+          <div class="perm-info">
+            <span class="perm-name perm-text-name">{{ t("settings.perms.fileBoundaryScope") }}</span>
+          </div>
+
+          <div class="perm-control perm-boundary-control">
+            <BaseSegmented
+              v-if="fileWorkspaceBoundaryReady"
+              size="sm"
+              :model-value="fileBoundaryMode"
+              :options="fileBoundaryOptions"
+              :aria-label="t('settings.perms.fileBoundaryTitle')"
+              @update:model-value="setFileBoundaryMode"
+            />
+            <span v-else class="perm-segmented-placeholder" aria-hidden="true" />
+          </div>
+        </div>
+      </div>
+
+      <div class="perm-panel">
+        <div class="perm-panel-heading">
+          <div class="perm-panel-title">{{ t("settings.perms.behaviorTitle") }}</div>
+          <div class="perm-panel-desc">{{ t("settings.perms.behaviorDesc") }}</div>
         </div>
 
         <div class="perm-table-head perm-behavior-head" aria-hidden="true">
@@ -90,23 +143,34 @@ function getToolMode(name: string): ToolMode {
         </div>
       </div>
 
-      <div class="perm-mode-row">
-        <div class="perm-mode-copy">
-          <span class="perm-mode-label">{{ t("settings.perms.globalMode") }}</span>
-          <span class="perm-mode-desc">{{ t("settings.perms.globalModeDesc") }}</span>
+      <div class="perm-panel">
+        <div class="perm-panel-heading">
+          <div class="perm-panel-title">{{ t("settings.perms.globalMode") }}</div>
+          <div class="perm-panel-desc">{{ t("settings.perms.globalModeDesc") }}</div>
         </div>
 
-        <div class="perm-mode-control">
-          <BaseSegmented
-            size="sm"
-            :model-value="toolPermissionMode"
-            :options="[...permissionOptions]"
-            @update:model-value="emit('setGlobalPermissionMode', $event as ToolMode)"
-          />
+        <div class="perm-row perm-simple-row">
+          <div class="perm-info">
+            <span class="perm-name perm-text-name">{{ t("settings.perms.globalModeDefault") }}</span>
+          </div>
+
+          <div class="perm-control">
+            <BaseSegmented
+              size="sm"
+              :model-value="toolPermissionMode"
+              :options="[...permissionOptions]"
+              @update:model-value="emit('setGlobalPermissionMode', $event as ToolMode)"
+            />
+          </div>
         </div>
       </div>
 
-      <div class="perm-card">
+      <div class="perm-panel">
+        <div class="perm-panel-heading">
+          <div class="perm-panel-title">{{ t("settings.perms.toolTitle") }}</div>
+          <div class="perm-panel-desc">{{ t("settings.perms.toolDesc") }}</div>
+        </div>
+
         <div class="perm-table-head" aria-hidden="true">
           <span>{{ t("settings.perms.columnTool") }}</span>
           <span>{{ t("settings.perms.columnMode") }}</span>
@@ -141,11 +205,15 @@ function getToolMode(name: string): ToolMode {
 <style scoped>
 .perm-shell {
   position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
 }
 
 .perm-header {
   position: relative;
   padding-right: 88px;
+  margin-bottom: 2px;
 }
 
 .perm-toast {
@@ -166,79 +234,39 @@ function getToolMode(name: string): ToolMode {
   pointer-events: none;
 }
 
-.perm-mode-row {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 16px;
-  align-items: center;
-  margin-bottom: 12px;
-  padding: 12px 16px;
-  border: 1px solid var(--border-color);
-  border-radius: 10px;
-  background: color-mix(in srgb, var(--panel-bg) 84%, var(--sidebar-bg) 16%);
-}
-
-.perm-mode-copy {
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-  min-width: 0;
-}
-
-.perm-mode-label {
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--text-color);
-}
-
-.perm-mode-desc {
-  font-size: 12px;
-  color: var(--text-secondary);
-  line-height: 1.45;
-}
-
-.perm-mode-control {
-  width: 116px;
-  flex-shrink: 0;
-}
-
-.perm-mode-control :deep(.base-segmented) {
-  display: flex;
-  width: 100%;
-}
-
-.perm-mode-control :deep(.base-segmented-item) {
-  flex: 1;
-  justify-content: center;
-}
-
-.perm-card {
+.perm-panel {
   border: 1px solid var(--border-color);
   border-radius: 10px;
   background: color-mix(in srgb, var(--panel-bg) 84%, var(--sidebar-bg) 16%);
   overflow: hidden;
 }
 
-.perm-behavior-card {
-  margin-bottom: 12px;
-}
-
-.perm-card-heading {
+.perm-panel-heading {
   padding: 12px 16px 10px;
   border-bottom: 1px solid var(--border-color);
 }
 
-.perm-card-title {
+.perm-panel-title {
   font-size: 13px;
   font-weight: 600;
   color: var(--text-color);
 }
 
-.perm-card-desc {
+.perm-panel-desc {
   margin-top: 3px;
   font-size: 12px;
   line-height: 1.45;
   color: var(--text-secondary);
+}
+
+.perm-segmented-placeholder {
+  display: block;
+  width: 116px;
+  height: 28px;
+  border: 1px solid color-mix(in srgb, var(--border-strong) 82%, var(--text-secondary) 18%);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--input-bg) 76%, var(--hover-bg) 24%);
+  opacity: 0.55;
 }
 
 .perm-table-head {
@@ -271,6 +299,10 @@ function getToolMode(name: string): ToolMode {
   transition: background 0.15s ease;
 }
 
+.perm-simple-row {
+  min-height: 52px;
+}
+
 .perm-row:last-child {
   border-bottom: none;
 }
@@ -293,7 +325,8 @@ function getToolMode(name: string): ToolMode {
   color: var(--text-color);
 }
 
-.perm-behavior-name {
+.perm-behavior-name,
+.perm-text-name {
   font-family: inherit;
 }
 
@@ -316,6 +349,11 @@ function getToolMode(name: string): ToolMode {
 .perm-control :deep(.base-segmented-item) {
   flex: 1;
   justify-content: center;
+  white-space: nowrap;
+}
+
+.perm-boundary-control {
+  width: 132px;
 }
 
 @media (max-width: 860px) {
@@ -332,21 +370,16 @@ function getToolMode(name: string): ToolMode {
     display: none;
   }
 
-  .perm-mode-row {
-    grid-template-columns: 1fr;
-    gap: 10px;
-  }
-
-  .perm-mode-control {
-    width: 100%;
-  }
-
   .perm-row {
     grid-template-columns: 1fr;
     gap: 10px;
   }
 
   .perm-control {
+    width: 100%;
+  }
+
+  .perm-segmented-placeholder {
     width: 100%;
   }
 }

@@ -48,7 +48,9 @@ const {
   codexStep, codexStatus, codexQuota, codexRetrying, codexModelConfig, codexUserCode, codexUrl, codexCodeCopied, cancelCodexLogin, codexLogout, retryCodexValidation, copyCode, setCodexTransportMode, loadCodexRateLimits,
   showDisclaimer, requestOAuthLogin, requestCodexLogin, cancelDisclaimer,
   modelDefaults, modelSaveMsg, saveModelDefaults,
-  permSaveMsg, toolList, approvalBehaviorList, toolPermissions, setToolPermission,
+  permSaveMsg, toolList, approvalBehaviorList, toolPermissions,
+  fileToolWorkspaceBoundary, fileToolWorkspaceBoundaryReady, fileToolWorkspaceBoundaryBusy,
+  setToolPermission, setFileToolWorkspaceBoundaryEnabled,
   customEndpoints, editingEndpoint, isAddingEndpoint, customEndpointSaving, testStatus, testResult,
   startAddEndpoint, startEditEndpoint, cancelEditEndpoint, saveEndpoint, deleteEndpoint, testEndpoint,
 } = useSettingsState(emit);
@@ -252,9 +254,13 @@ watch(
           :tool-list="toolList"
           :behavior-list="approvalBehaviorList"
           :tool-permissions="toolPermissions"
+          :file-workspace-boundary-enabled="fileToolWorkspaceBoundary"
+          :file-workspace-boundary-ready="fileToolWorkspaceBoundaryReady"
+          :file-workspace-boundary-busy="fileToolWorkspaceBoundaryBusy"
           :perm-save-msg="permSaveMsg"
           @set-global-permission-mode="chatStore.setToolPermissionMode"
           @set-permission="setToolPermission"
+          @set-file-workspace-boundary="setFileToolWorkspaceBoundaryEnabled"
         />
       </template>
 

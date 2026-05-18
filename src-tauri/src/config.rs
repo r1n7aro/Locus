@@ -32,6 +32,8 @@ pub struct AppConfig {
     pub base_url: Option<String>,
     #[serde(default = "default_debug_flag", with = "serde_atomic_bool")]
     pub debug: Arc<AtomicBool>,
+    #[serde(default = "default_debug_flag", with = "serde_atomic_bool")]
+    pub file_tool_workspace_boundary: Arc<AtomicBool>,
     #[serde(skip)]
     config_path: Arc<Mutex<Option<PathBuf>>>,
 }
@@ -67,6 +69,7 @@ impl AppConfig {
             model,
             base_url,
             debug: Arc::new(AtomicBool::new(debug)),
+            file_tool_workspace_boundary: default_debug_flag(),
             config_path: Arc::new(Mutex::new(Some(primary_path.to_path_buf()))),
         };
 
@@ -136,6 +139,16 @@ impl AppConfig {
 
     pub fn set_debug_enabled(&self, value: bool) -> Result<(), String> {
         self.debug.store(value, Ordering::Relaxed);
+        self.persist()
+    }
+
+    pub fn file_tool_workspace_boundary_enabled(&self) -> bool {
+        self.file_tool_workspace_boundary.load(Ordering::Relaxed)
+    }
+
+    pub fn set_file_tool_workspace_boundary_enabled(&self, value: bool) -> Result<(), String> {
+        self.file_tool_workspace_boundary
+            .store(value, Ordering::Relaxed);
         self.persist()
     }
 
@@ -257,7 +270,26 @@ mod tests {
         assert_eq!(config.model, "legacy-model");
         assert_eq!(config.base_url.as_deref(), Some("https://example.com"));
         assert!(config.debug_enabled());
+        assert!(!config.file_tool_workspace_boundary_enabled());
         assert!(!written.contains("api_key"));
         assert!(!written.contains("or-legacy-secret"));
+    }
+
+    #[test]
+    fn file_tool_workspace_boundary_defaults_to_disabled() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("config.json");
+        fs::write(
+            &config_path,
+            r#"{
+  "model": "legacy-model",
+  "debug": false
+}"#,
+        )
+        .expect("legacy config");
+
+        let config = AppConfig::load_from_path(&config_path);
+
+        assert!(!config.file_tool_workspace_boundary_enabled());
     }
 }

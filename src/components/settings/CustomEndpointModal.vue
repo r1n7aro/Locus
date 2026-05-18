@@ -326,6 +326,19 @@ function handleEndpointKeydown(e: KeyboardEvent) {
                 </div>
               </div>
             </div>
+            <div class="custom-form-row">
+              <label class="custom-form-label">
+                {{ t("settings.custom.toolLazyLoading") }}
+                <span class="custom-form-hint">{{ t("settings.custom.toolLazyLoadingHint") }}</span>
+              </label>
+              <div class="custom-checkbox-control">
+                <BaseCheckbox
+                  v-model="endpoint.supportsToolLazyLoading"
+                  :disabled="saving"
+                  :aria-label="t('settings.custom.toolLazyLoading')"
+                />
+              </div>
+            </div>
           </div>
           <div v-if="testStatus !== 'idle'" class="test-result" :class="testStatus">
             <span v-if="testStatus === 'testing'" class="codex-spinner"></span>

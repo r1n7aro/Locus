@@ -22,6 +22,8 @@ const modelServiceMocks = vi.hoisted(() => ({
   saveCodexModelConfig: vi.fn(),
   getToolPermissions: vi.fn(),
   saveToolPermissions: vi.fn(),
+  getFileToolWorkspaceBoundary: vi.fn(),
+  setFileToolWorkspaceBoundary: vi.fn(),
   resetAllConfig: vi.fn(),
   setWarmup: vi.fn(),
   getWarmup: vi.fn(),
@@ -60,6 +62,8 @@ vi.mock("../services/model", () => ({
 vi.mock("../services/permissions", () => ({
   getToolPermissions: modelServiceMocks.getToolPermissions,
   saveToolPermissions: modelServiceMocks.saveToolPermissions,
+  getFileToolWorkspaceBoundary: modelServiceMocks.getFileToolWorkspaceBoundary,
+  setFileToolWorkspaceBoundary: modelServiceMocks.setFileToolWorkspaceBoundary,
 }));
 
 vi.mock("../services/project", () => ({
@@ -101,6 +105,7 @@ function endpoint(partial: Partial<CustomEndpoint> & Pick<CustomEndpoint, "id" |
     reasoningParamFormat: "openai_chat_reasoning_effort",
     replayReasoningContent: true,
     serverTools: { webSearch: false },
+    supportsToolLazyLoading: false,
     ...partial,
   };
 }
@@ -111,6 +116,8 @@ describe("custom endpoint persistence", () => {
     modelServiceMocks.getWarmup.mockReturnValue(undefined);
     modelServiceMocks.getCustomEndpoints.mockResolvedValue([]);
     modelServiceMocks.saveCustomEndpoints.mockResolvedValue(undefined);
+    modelServiceMocks.getFileToolWorkspaceBoundary.mockResolvedValue(false);
+    modelServiceMocks.setFileToolWorkspaceBoundary.mockResolvedValue(undefined);
   });
 
   it("reloads saved endpoints and refreshes the warmup cache", async () => {
@@ -163,6 +170,14 @@ describe("custom endpoint persistence", () => {
     state.startAddEndpoint();
 
     expect(state.editingEndpoint.value?.serverTools.webSearch).toBe(false);
+  });
+
+  it("starts new endpoints with tool lazy loading disabled", () => {
+    const state = useSettingsState((() => undefined) as never);
+
+    state.startAddEndpoint();
+
+    expect(state.editingEndpoint.value?.supportsToolLazyLoading).toBe(false);
   });
 
   it("starts new endpoints with xhigh and max reasoning efforts", () => {
@@ -226,6 +241,21 @@ describe("custom endpoint persistence", () => {
     await state.loadCustomEndpoints();
 
     expect(state.customEndpoints.value[0].serverTools).toEqual({ webSearch: false });
+  });
+
+  it("normalizes legacy endpoints to disabled tool lazy loading", async () => {
+    const state = useSettingsState((() => undefined) as never);
+    modelServiceMocks.getCustomEndpoints.mockResolvedValueOnce([
+      endpoint({
+        id: "legacy-tool-loading",
+        name: "Legacy Tool Loading",
+        supportsToolLazyLoading: undefined,
+      } as any),
+    ]);
+
+    await state.loadCustomEndpoints();
+
+    expect(state.customEndpoints.value[0].supportsToolLazyLoading).toBe(false);
   });
 
   it("normalizes legacy default reasoning efforts to include xhigh", async () => {
