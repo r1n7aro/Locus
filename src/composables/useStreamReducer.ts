@@ -471,6 +471,9 @@ export function reduceStreamEvent(state: StreamState, event: StreamEvent): Strea
       });
       if (existing) {
         const updates: Partial<ToolCallDisplay> = {};
+        if (event.toolName && event.toolName !== existing.name) {
+          updates.name = event.toolName;
+        }
         if (event.arguments) {
           updates.arguments = event.arguments;
         }

@@ -116,7 +116,10 @@ describe("chat sidebar layout", () => {
     expect(transcript).toContain(".chat-transcript-message.is-session.assistant.transient.continuation {");
     expect(transcript).toContain(".chat-transcript-message.is-embedded.transient.continuation {");
     expect(transcript).toContain(".chat-transcript-message.is-session.continuation {");
-    expect(transcript).toContain("padding-top: 6px;");
+    expect(transcript).toContain("--chat-transcript-session-segment-gap: 10px;");
+    expect(transcript).toContain("padding-top: var(--chat-transcript-session-segment-gap);");
+    expect(transcript).toContain("gap: var(--chat-transcript-session-segment-gap);");
+    expect(transcript).not.toContain("padding-top: 6px;");
     expect(transcript).toContain(".chat-transcript-message.is-session.assistant.transient.waiting-placeholder {");
     expect(chatView).toContain("background: var(--msg-assistant-bg);");
     expect(sidebar).toContain("background: var(--msg-assistant-bg);");
@@ -130,18 +133,32 @@ describe("chat sidebar layout", () => {
 
     expect(toolCollection).toContain("const panelVisible = ref(false);");
     expect(toolCollection).toContain("const panelLeaving = ref(false);");
+    expect(toolCollection).toContain("const autoCollapseFloatingSummary = ref(startsExpandedForCollapseAnimation);");
+    expect(toolCollection).toContain("const floatingSummaryHeight = ref(30);");
     expect(toolCollection).toContain("const summaryOpen = computed(() =>");
+    expect(toolCollection).toContain("const floatingSummary = computed(() =>");
+    expect(toolCollection).toContain("const floatingSummaryStyle = computed(() =>");
     expect(toolCollection).toContain("height 320ms cubic-bezier(0.2, 0, 0, 1)");
     expect(toolCollection).toContain("transformOrigin = \"top center\"");
+    expect(toolCollection).toContain("function collapsedSummaryHeight()");
+    expect(toolCollection).toContain("function updateFloatingSummaryHeight()");
+    expect(toolCollection).toContain("function emitViewportAnchorStart()");
     expect(toolCollection).toContain("<Transition");
     expect(toolCollection).toContain(":css=\"false\"");
     expect(toolCollection).toContain("@leave=\"onPanelLeave\"");
+    expect(toolCollection).toContain("const targetHeight = autoCollapseFloatingSummary.value ? updateFloatingSummaryHeight() : 0;");
     expect(toolCollection).toContain("emit(\"collapseFinished\");");
+    expect(toolCollection).toContain("emitViewportAnchorStart();");
     expect(toolCollection).toContain("translateY(-4px) scaleY(0.97)");
     expect(toolCollection).toContain("class=\"tool-call-collection-panel\"");
+    expect(toolCollection).toContain(":style=\"floatingSummaryStyle\"");
     expect(toolCollection).toContain("'is-collapsing': batchState.canCollapse && panelLeaving");
+    expect(toolCollection).toContain("'has-floating-summary': floatingSummary");
     expect(toolCollection).toContain(":class=\"{ open: expanded }\"");
     expect(toolCollection).toContain(".tool-call-batch-summary.open.closing");
+    expect(toolCollection).toContain(".tool-call-collection.has-floating-summary {");
+    expect(toolCollection).toContain("min-height: var(--tool-call-summary-height, 30px);");
+    expect(toolCollection).toContain(".tool-call-collection.has-floating-summary .tool-call-batch-summary");
   });
 
   it("keeps tool batches on a shared transient handoff path until the collapse leave finishes", () => {
@@ -176,8 +193,12 @@ describe("chat sidebar layout", () => {
     expect(transcript).toContain("const transientCollapseCandidateToolCalls = computed(() => {");
     expect(transcript).toContain("if (promotableHistoryToolCalls.value.toolCalls.length === 0) {");
     expect(transcript).toContain("const transientToolCallsCanCollapse = computed(() =>");
+    expect(transcript).toContain("const shouldKeepPromotedHistoryToolCallsInTransient = computed(() =>");
+    expect(transcript).toContain("|| (!!toolCallHandoff.value && transientToolCallsCanCollapse.value)");
     expect(transcript).toContain("const shouldHidePromotedHistoryToolCalls = computed(() =>");
+    expect(transcript).toContain("&& shouldKeepPromotedHistoryToolCallsInTransient.value");
     expect(transcript).toContain("promotedHistoryToolCallsVisibilityChanged");
+    expect(transcript).toContain("keepPromotedInTransient: shouldKeepPromotedHistoryToolCallsInTransient.value");
     expect(transcript).toContain("const shouldRenderPromotedHistoryToolCallsInTransient = computed(() =>");
     expect(transcript).toContain("transientPromotedToolCallsCoverage");
     expect(transcript).toContain("promotedHistoryToolCallsRenderGap");
@@ -280,10 +301,12 @@ describe("chat sidebar layout", () => {
     expect(chatView).toContain("if (suppressScrollCapture || toolHandoffViewportQuiet.value) return;");
   });
 
-  it("keeps handoff waiting inside the transient tool group", () => {
+  it("keeps handoff waiting out of the transient tool group layout", () => {
     const transcript = read("src/components/chat/ChatTranscript.vue");
-    const toolWaitingIndex = transcript.indexOf("<div v-if=\"segment.showWaiting && isToolWaitingForResponse\" class=\"chat-transcript-tool-waiting-row\">");
-    const standaloneWaitingIndex = transcript.indexOf("<div v-else-if=\"segment.type === 'waiting'\" class=\"chat-transcript-thinking-block\">");
+    const toolCollection = read("src/components/ToolCallCollection.vue");
+    const waitingIndicator = read("src/components/chat/ChatWaitingIndicator.vue");
+    const toolWaitingIndex = transcript.indexOf("<div v-if=\"segment.showWaiting && isToolWaitingRowVisible\" class=\"chat-transcript-tool-waiting-row\">");
+    const standaloneWaitingIndex = transcript.indexOf("v-else-if=\"segment.type === 'waiting'\"");
     const toolGroupIndex = transcript.indexOf("v-else-if=\"segment.type === 'toolCalls'\"");
 
     expect(toolGroupIndex).toBeGreaterThan(-1);
@@ -291,11 +314,36 @@ describe("chat sidebar layout", () => {
     expect(toolWaitingIndex).toBeLessThan(standaloneWaitingIndex);
     expect(transcript).toContain("'waiting-placeholder': isStandaloneWaitingPlaceholder");
     expect(transcript).toContain("const isToolWaitingForResponse = computed(() => isWaitingForResponse.value && hasTransientToolCalls.value);");
+    expect(transcript).toContain("const isToolWaitingRowVisible = computed(() => isToolWaitingForResponse.value && !hasToolCallHandoff.value);");
+    expect(transcript).toContain("const isToolWaitingStatusVisible = computed(() => isToolWaitingForResponse.value && hasToolCallHandoff.value);");
     expect(transcript).toContain("const isStandaloneWaitingPlaceholder = computed(() => isWaitingForResponse.value && !hasTransientToolCalls.value);");
     expect(transcript).toContain("showWaiting: false,");
     expect(transcript).toContain("lastToolSegment.showWaiting = true;");
-    expect(transcript).toContain("segment.showWaiting && isToolWaitingForResponse");
+    expect(transcript).toContain("segment.showWaiting && isToolWaitingRowVisible");
+    expect(transcript).toContain(":show-waiting-status=\"segment.showWaiting && isToolWaitingStatusVisible\"");
+    expect(transcript).toContain(":waiting-label=\"waitingLabel\"");
+    expect(transcript).toContain(":data-tool-layout-waiting-status=\"String(segment.showWaiting && isToolWaitingStatusVisible)\"");
+    expect(transcript).not.toContain("segment.showWaiting && isToolWaitingForResponse");
+    expect(toolCollection).toContain("showWaitingStatus?: boolean;");
+    expect(toolCollection).toContain("waitingLabel?: string;");
+    expect(toolCollection).toContain("class=\"tool-call-collection-waiting-status\"");
+    expect(toolCollection).toContain("position: absolute;");
+    expect(toolCollection).toContain("left: 4px;");
+    expect(toolCollection).toContain("top: calc(100% + 6px);");
+    expect(toolCollection).toContain("pointer-events: none;");
+    expect(transcript).toContain("import ChatWaitingIndicator from \"./ChatWaitingIndicator.vue\";");
+    expect(transcript).toContain("<ChatWaitingIndicator :label=\"waitingLabel\" compact />");
+    expect(transcript).toContain("<ChatWaitingIndicator :label=\"segment.label\" />");
+    expect(toolCollection).toContain("import ChatWaitingIndicator from \"./chat/ChatWaitingIndicator.vue\";");
+    expect(toolCollection).toContain("<ChatWaitingIndicator :label=\"waitingLabel\" compact />");
+    expect(toolCollection).not.toContain("tool-call-collection-waiting-dot");
+    expect(toolCollection).not.toContain("tool-call-collection-waiting-label");
+    expect(waitingIndicator).toContain("class=\"chat-waiting-indicator\"");
+    expect(waitingIndicator).toContain("chat-waiting-indicator-spinner");
+    expect(waitingIndicator).toContain("chat-waiting-indicator-label");
     expect(transcript).toContain(".chat-transcript-tool-waiting-row {");
+    expect(transcript).not.toContain("contain-intrinsic-size: auto 0;");
+    expect(transcript).not.toContain("padding-top: 8px;");
     expect(transcript).not.toContain("'waiting-placeholder': isWaitingForResponse");
   });
 
@@ -311,7 +359,51 @@ describe("chat sidebar layout", () => {
     expect(transcript).toContain(":class=\"{ active: segment.active, 'is-clickable': true }\"");
     expect(transcript).toContain("data-render-part-kind=\"toolCall\"");
     expect(transcript).toContain("data-render-part-kind=\"text\"");
+    expect(transcript).toContain("data-render-part-kind=\"waiting\"");
+    expect(transcript).toContain("data-render-part-scope=\"history\"");
+    expect(transcript).toContain("data-render-part-scope=\"transient\"");
+    expect(transcript).toContain(":data-render-part-key=\"segment.key\"");
+    expect(transcript).toMatch(
+      /<div class="chat-transcript-message-content" :class="`is-\$\{variant\}`">\s*<div class="chat-transcript-item-stack" :class="`is-\$\{variant\}`">\s*<template\s+v-for="segment in transientRenderSegments"/,
+    );
     expect(transcript).not.toContain("splitToolCallsByRenderOrder");
+  });
+
+  it("keeps live thinking above transient status overlays", () => {
+    const transcript = read("src/components/chat/ChatTranscript.vue");
+    const diagnostics = read("src/services/layoutDiagnostics.ts");
+
+    expect(transcript).toContain("'has-live-thinking': hasVisibleActiveThinkingBlock");
+    expect(transcript).toContain("'has-tool-waiting-status': isToolWaitingStatusVisible");
+    expect(transcript).toContain(".chat-transcript-message.is-session.assistant.transient.has-live-thinking");
+    expect(transcript).toContain(".chat-transcript-message.is-session.assistant.transient.has-tool-waiting-status");
+    expect(transcript).toContain("content-visibility: visible;");
+    expect(transcript).toContain("contain: layout;");
+    expect(transcript).toContain(".chat-transcript-item-stack > [data-render-part-kind]");
+    expect(transcript).toContain(".chat-transcript-tool-calls-group {");
+    expect(transcript).toContain("z-index: 0;");
+    expect(transcript).toContain(".chat-transcript-thinking-block[data-render-part-scope=\"transient\"]");
+    expect(transcript).toContain("z-index: 3;");
+    expect(transcript).toContain("<ChatWaitingIndicator :label=\"thinkingActiveLabel\" />");
+    expect(transcript).toContain("<ChatWaitingIndicator v-if=\"segment.active\" :label=\"thinkingActiveLabel\" compact />");
+    expect(transcript).not.toContain("chat-transcript-thinking-spinner");
+    expect(transcript).not.toContain("chat-transcript-thinking-shimmer");
+    expect(transcript).toContain("traceTranscriptPaintOcclusion");
+    expect(transcript).toContain("hasTransientStatusPaintTarget");
+    expect(transcript).toContain("traceTransientStatusPaint");
+    expect(transcript).toContain("transientStatusPaintStateChanged");
+    expect(transcript).toContain("standaloneWaiting: isStandaloneWaitingPlaceholder.value");
+    expect(transcript).toContain("toolWaitingStatusVisible: isToolWaitingStatusVisible.value");
+    expect(transcript).toContain("transientSegmentPaintState()");
+    expect(diagnostics).toContain("[Locus layout][paint-occlusion]");
+    expect(diagnostics).toContain("document.elementsFromPoint");
+    expect(diagnostics).toContain("TRANSCRIPT_STANDALONE_WAITING_SELECTOR");
+    expect(diagnostics).toContain("TRANSCRIPT_TOOL_WAITING_STATUS_SELECTOR");
+    expect(diagnostics).toContain("tool-waiting-status");
+    expect(diagnostics).toContain("insideTargetWhenTargetHitTestable");
+    expect(diagnostics).toContain("occludedTargets");
+    expect(diagnostics).toContain("intersectingCandidates");
+    expect(diagnostics).toContain("TRANSCRIPT_ACTIVE_THINKING_SELECTOR");
   });
 
   it("coalesces consecutive tool-only assistant rounds before rendering", () => {

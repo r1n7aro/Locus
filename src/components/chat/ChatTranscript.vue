@@ -41,10 +41,15 @@ import {
   type UserConsoleEntryDisplay,
 } from "../../composables/chatUserMessageDisplay";
 import { logToolCollapseTrace, previewTraceText } from "../../services/toolCollapseTrace";
+import {
+  traceToolBlockLayoutChange,
+  traceTranscriptPaintOcclusion,
+} from "../../services/layoutDiagnostics";
 import MarkdownRenderer from "../MarkdownRenderer.vue";
 import ToolCallCollection from "../ToolCallCollection.vue";
 import ToolCallBlock from "../ToolCallBlock.vue";
 import KnowledgeProposalCard from "./KnowledgeProposalCard.vue";
+import ChatWaitingIndicator from "./ChatWaitingIndicator.vue";
 import AssetChip from "../AssetChip.vue";
 import LucideIcon from "../icons/LucideIcon.vue";
 
@@ -185,7 +190,7 @@ function buildIntentBadges(
   for (const skill of intent.skills || []) {
     badges.push({
       key: `${skill.source}:${skill.dirName}`,
-      label: `SKILL: ${skill.name}`,
+      label: skill.name,
       kind: "skill",
     });
   }
@@ -314,6 +319,54 @@ function traceToolCollapse(event: string, detail?: Record<string, unknown>) {
   logToolCollapseTrace(`transcript:${props.variant}`, event, detail);
 }
 
+function toolLayoutToolCallIds(toolCalls: ToolCallDisplay[]) {
+  return toolCalls.map((toolCall) => toolCall.id).join(",");
+}
+
+function toolLayoutStatuses(toolCalls: ToolCallDisplay[]) {
+  return toolCalls.map((toolCall) => `${toolCall.id}:${toolCall.status}`).join(",");
+}
+
+function messageListLayoutSnapshot(messages: ChatMessage[] | undefined) {
+  const list = messages ?? [];
+  const lastMessage = list[list.length - 1] ?? null;
+  const lastAssistantMessage = [...list].reverse().find((message) => message.role === "assistant") ?? null;
+  const textPartLengths = lastAssistantMessage?.renderParts
+    ?.filter((part): part is Extract<AssistantRenderPart, { kind: "text" }> => part.kind === "text")
+    .map((part) => part.content.length) ?? [];
+
+  return {
+    count: list.length,
+    lastRole: lastMessage?.role ?? "",
+    lastId: lastMessage?.id ?? "",
+    lastContentLen: lastMessage?.content.length ?? 0,
+    lastRenderPartKinds: lastMessage?.renderParts?.map((part) => part.kind) ?? [],
+    lastAssistantId: lastAssistantMessage?.id ?? "",
+    lastAssistantContentLen: lastAssistantMessage?.content.length ?? 0,
+    lastAssistantRenderPartKinds: lastAssistantMessage?.renderParts?.map((part) => part.kind) ?? [],
+    lastAssistantTextPartLengths: textPartLengths,
+  };
+}
+
+function traceToolLayoutChange(reason: string, detail: Record<string, unknown> = {}) {
+  traceToolBlockLayoutChange({
+    scope: `chat-transcript:${props.variant}`,
+    reason,
+    scrollElement: scrollRef.value,
+    contentElement: contentRef.value,
+    detail: {
+      sessionKey: props.sessionKey ?? "",
+      isStreaming: props.isStreaming,
+      activeToolCallCount: props.activeToolCalls.length,
+      activeToolCallIds: props.activeToolCalls.map((toolCall) => toolCall.id),
+      hasHandoff: !!toolCallHandoff.value,
+      handoffCollapseArmed: toolCallHandoff.value?.collapseArmed ?? false,
+      handoffCollapseFinished: toolCallHandoff.value?.collapseFinished ?? false,
+      ...detail,
+    },
+  });
+}
+
 function shouldRetainCollapsedToolCallHandoff(handoff: ToolCallHandoffState) {
   return handoff.collapseFinished || (handoff.collapseArmed && handoff.willAutoCollapse);
 }
@@ -363,6 +416,14 @@ function clearRetainedCollapsedToolCalls(reason: string) {
 function clearToolCallHandoff(reason = "clear") {
   const handoff = toolCallHandoff.value;
   if (handoff) {
+    traceToolLayoutChange("clearToolCallHandoff", {
+      reason,
+      renderKey: handoff.renderKey,
+      toolCallCount: handoff.toolCalls.length,
+      toolCallIds: Array.from(handoff.toolCallIds),
+      collapseArmed: handoff.collapseArmed,
+      collapseFinished: handoff.collapseFinished,
+    });
     traceToolCollapse("clearToolCallHandoff", {
       reason,
       renderKey: handoff.renderKey,
@@ -451,6 +512,12 @@ function scheduleToolCallHandoffCollapse() {
             return;
           }
 
+          traceToolLayoutChange("toolCallHandoffCollapseArmed", {
+            renderKey: nextHandoff.renderKey,
+            toolCallIds: Array.from(nextHandoff.toolCallIds),
+            collapseCandidateToolCallCount: transientCollapseCandidateToolCalls.value.length,
+            promotableHistoryToolCallCount: promotableHistoryToolCalls.value.toolCalls.length,
+          });
           setToolCallHandoffQuiet(true);
           traceToolCollapse("collapseArmed", {
             renderKey: nextHandoff.renderKey,
@@ -479,6 +546,11 @@ function beginToolCallHandoff(previousToolCalls: ToolCallDisplay[]) {
     return;
   }
 
+  traceToolLayoutChange("beginToolCallHandoff", {
+    toolCallCount: toolCalls.length,
+    toolCallIds: toolCalls.map((toolCall) => toolCall.id),
+    statuses: toolLayoutStatuses(toolCalls),
+  });
   clearToolCallHandoffTimers();
   setToolCallHandoffQuiet(false);
   toolCallHandoff.value = {
@@ -563,6 +635,15 @@ function shouldReleaseToolCallHandoffToHistory(
 watch(
   () => props.activeToolCalls,
   (activeToolCalls, previousToolCalls) => {
+    if (activeToolCalls !== previousToolCalls) {
+      traceToolLayoutChange("activeToolCallsChanged", {
+        previousCount: previousToolCalls?.length ?? 0,
+        previousIds: previousToolCalls?.map((toolCall) => toolCall.id) ?? [],
+        nextCount: activeToolCalls.length,
+        nextIds: activeToolCalls.map((toolCall) => toolCall.id),
+        nextStatuses: toolLayoutStatuses(activeToolCalls),
+      });
+    }
     if (activeToolCalls.length === 0 && previousToolCalls && previousToolCalls.length > 0) {
       const previousMatchState = collectToolCallDisplayMatchState(previousToolCalls);
       traceToolCollapse("activeToolCallsCleared", {
@@ -585,6 +666,12 @@ watch(
   () => props.activeToolCalls.length,
   (activeToolCallCount, previousActiveToolCallCount) => {
     if (activeToolCallCount > 0 && toolCallHandoff.value) {
+      traceToolLayoutChange("activeToolCallsResumedWithHandoff", {
+        previousActiveToolCallCount,
+        activeToolCallCount,
+        handoffRenderKey: toolCallHandoff.value.renderKey,
+        handoffToolCallIds: Array.from(toolCallHandoff.value.toolCallIds),
+      });
       traceToolCollapse("activeToolCallsResumedWithHandoff", {
         previousActiveToolCallCount,
         activeToolCallCount,
@@ -623,7 +710,20 @@ watch(shouldArmToolCallHandoffCollapse, (shouldArm) => {
 watch(
   () => props.messages,
   (messages, previous) => {
-    if (messages === previous || !toolCallHandoff.value) return;
+    if (messages === previous) return;
+    const hasHandoff = !!toolCallHandoff.value;
+    traceToolLayoutChange(hasHandoff ? "messagesChangedDuringToolHandoff" : "messagesChanged", {
+      previousCount: previous?.length ?? 0,
+      nextCount: messages.length,
+      previousMessages: messageListLayoutSnapshot(previous),
+      nextMessages: messageListLayoutSnapshot(messages),
+      streamingTextLen: props.streamingText.length,
+      isStreaming: props.isStreaming,
+      hasHandoff,
+      handoffRenderKey: toolCallHandoff.value?.renderKey ?? "",
+      handoffToolCallIds: toolCallHandoff.value ? Array.from(toolCallHandoff.value.toolCallIds) : [],
+    });
+    if (!toolCallHandoff.value) return;
     if (!props.isStreaming && shouldReleaseToolCallHandoffToHistory(messages, toolCallHandoff.value.toolCallMatchState)) {
       clearToolCallHandoff("handoff-followed-by-history-message");
       return;
@@ -637,6 +737,11 @@ watch(
 );
 
 watch(hasVisibleStreamingText, (visible, previousVisible) => {
+  traceToolLayoutChange("visibleStreamingTextChanged", {
+    previous: previousVisible,
+    next: visible,
+    streamingTextLen: props.streamingText.length,
+  });
   traceToolCollapse("hasVisibleStreamingTextChanged", {
     previous: previousVisible,
     next: visible,
@@ -650,6 +755,13 @@ watch(
   () => props.isStreaming,
   (isStreaming, previousStreaming) => {
     const handoff = toolCallHandoff.value;
+    traceToolLayoutChange("isStreamingChanged", {
+      previous: previousStreaming,
+      next: isStreaming,
+      hasHandoff: !!handoff,
+      collapseArmed: handoff?.collapseArmed ?? false,
+      collapseFinished: handoff?.collapseFinished ?? false,
+    });
     traceToolCollapse("isStreamingChanged", {
       previous: previousStreaming,
       next: isStreaming,
@@ -945,12 +1057,24 @@ const transientToolCallsCanCollapse = computed(() =>
   summarizeToolCallBatch(transientCollapseCandidateToolCalls.value, displaySettings.compactToolCalls).canCollapse,
 );
 
+const shouldKeepPromotedHistoryToolCallsInTransient = computed(() =>
+  props.activeToolCalls.length > 0
+  || (!!toolCallHandoff.value && transientToolCallsCanCollapse.value),
+);
+
 const shouldHidePromotedHistoryToolCalls = computed(() =>
   promotableHistoryToolCalls.value.toolCalls.length > 0
-  && (props.activeToolCalls.length > 0 || !!toolCallHandoff.value?.collapseArmed),
+  && shouldKeepPromotedHistoryToolCallsInTransient.value,
 );
 
 watch(shouldHidePromotedHistoryToolCalls, (next, previous) => {
+  traceToolLayoutChange("promotedHistoryToolCallsVisibilityChanged", {
+    previous,
+    next,
+    promotedToolCallCount: promotableHistoryToolCalls.value.toolCalls.length,
+    promotedToolCallIds: promotableHistoryToolCalls.value.toolCalls.map((toolCall) => toolCall.id),
+    keepPromotedInTransient: shouldKeepPromotedHistoryToolCallsInTransient.value,
+  });
   traceToolCollapse("promotedHistoryToolCallsVisibilityChanged", {
     previous,
     next,
@@ -960,6 +1084,7 @@ watch(shouldHidePromotedHistoryToolCalls, (next, previous) => {
     activeToolCallIds: props.activeToolCalls.map((toolCall) => toolCall.id),
     hasHandoff: !!toolCallHandoff.value,
     handoffCollapseArmed: toolCallHandoff.value?.collapseArmed ?? false,
+    keepPromotedInTransient: shouldKeepPromotedHistoryToolCallsInTransient.value,
     isStreaming: props.isStreaming,
   });
 });
@@ -978,7 +1103,7 @@ const groupedMessages = computed<MessageGroup[]>(() => buildGroupedMessages(hist
 
 const shouldRenderPromotedHistoryToolCallsInTransient = computed(() =>
   promotableHistoryToolCalls.value.toolCalls.length > 0
-  && (props.activeToolCalls.length > 0 || !!toolCallHandoff.value?.collapseArmed),
+  && shouldKeepPromotedHistoryToolCallsInTransient.value,
 );
 
 const transientToolCalls = computed(() => {
@@ -996,6 +1121,12 @@ const transientToolCallsCollapseEnabled = computed(
 );
 
 watch(promotableHistoryToolCalls, (nextState, previousState) => {
+  traceToolLayoutChange("promotableHistoryToolCallsChanged", {
+    previousItemCount: previousState?.itemIds.size ?? 0,
+    nextItemCount: nextState.itemIds.size,
+    nextToolCallCount: nextState.toolCalls.length,
+    nextToolCallIds: Array.from(nextState.toolCallIds),
+  });
   traceToolCollapse("promotableHistoryToolCallsChanged", {
     previousItemCount: previousState?.itemIds.size ?? 0,
     nextItemCount: nextState.itemIds.size,
@@ -1006,6 +1137,12 @@ watch(promotableHistoryToolCalls, (nextState, previousState) => {
 });
 
 watch(transientToolCallsCollapseEnabled, (enabled, previousEnabled) => {
+  traceToolLayoutChange("transientToolCallsCollapseEnabledChanged", {
+    previous: previousEnabled,
+    next: enabled,
+    transientToolCallCount: transientToolCalls.value.length,
+    transientToolCallIds: transientToolCalls.value.map((toolCall) => toolCall.id),
+  });
   traceToolCollapse("transientToolCallsCollapseEnabledChanged", {
     previous: previousEnabled,
     next: enabled,
@@ -1016,6 +1153,11 @@ watch(transientToolCallsCollapseEnabled, (enabled, previousEnabled) => {
 
 function onTransientToolCallsCollapseFinished() {
   if (!toolCallHandoff.value?.collapseArmed) return;
+  traceToolLayoutChange("transientToolCallsCollapseFinished", {
+    renderKey: toolCallHandoff.value.renderKey,
+    toolCallCount: transientToolCalls.value.length,
+    toolCallIds: transientToolCalls.value.map((toolCall) => toolCall.id),
+  });
   traceToolCollapse("onTransientToolCallsCollapseFinished", {
     renderKey: toolCallHandoff.value.renderKey,
     toolCallCount: transientToolCalls.value.length,
@@ -1100,6 +1242,8 @@ const isWaitingForResponse = computed(
   }),
 );
 const isToolWaitingForResponse = computed(() => isWaitingForResponse.value && hasTransientToolCalls.value);
+const isToolWaitingRowVisible = computed(() => isToolWaitingForResponse.value && !hasToolCallHandoff.value);
+const isToolWaitingStatusVisible = computed(() => isToolWaitingForResponse.value && hasToolCallHandoff.value);
 const isStandaloneWaitingPlaceholder = computed(() => isWaitingForResponse.value && !hasTransientToolCalls.value);
 const hasStandaloneCompactingPlaceholder = computed(() => props.isCompacting);
 const hasTransientAssistantMessage = computed(
@@ -1112,13 +1256,24 @@ const hasTransientAssistantMessage = computed(
 );
 
 watch(
-  () => `${Number(isStandaloneWaitingPlaceholder.value)}:${Number(isToolWaitingForResponse.value)}:${transientToolCalls.value.length}`,
+  () => `${Number(isStandaloneWaitingPlaceholder.value)}:${Number(isToolWaitingForResponse.value)}:${Number(isToolWaitingRowVisible.value)}:${Number(isToolWaitingStatusVisible.value)}:${transientToolCalls.value.length}`,
   (next, previous) => {
+    traceToolLayoutChange("waitingLayoutStateChanged", {
+      previous,
+      next,
+      standaloneWaiting: isStandaloneWaitingPlaceholder.value,
+      toolWaiting: isToolWaitingForResponse.value,
+      toolWaitingRowVisible: isToolWaitingRowVisible.value,
+      toolWaitingStatusVisible: isToolWaitingStatusVisible.value,
+      transientToolCallCount: transientToolCalls.value.length,
+    });
     traceToolCollapse("waitingLayoutStateChanged", {
       previous,
       next,
       standaloneWaiting: isStandaloneWaitingPlaceholder.value,
       toolWaiting: isToolWaitingForResponse.value,
+      toolWaitingRowVisible: isToolWaitingRowVisible.value,
+      toolWaitingStatusVisible: isToolWaitingStatusVisible.value,
       transientToolCallCount: transientToolCalls.value.length,
       hasHandoff: !!toolCallHandoff.value,
       streamingTextLen: props.streamingText.length,
@@ -1181,6 +1336,12 @@ watch(
   () => Array.from(pendingContinuationToolItemIds.value).join("\u241f"),
   (next, previous) => {
     const snapshot = pendingContinuationSegmentSnapshot();
+    traceToolLayoutChange("pendingContinuationToolItemIdsChanged", {
+      previous: previous ? previous.split("\u241f") : [],
+      next: next ? next.split("\u241f") : [],
+      lastGroupRole: snapshot.lastGroupRole,
+      historySegments: snapshot.segments,
+    });
     traceToolCollapse("pendingContinuationToolItemIdsChanged", {
       previous: previous ? previous.split("\u241f") : [],
       next: next ? next.split("\u241f") : [],
@@ -1447,6 +1608,11 @@ function historyToolSegmentPinnedSnapshot() {
 watch(
   () => JSON.stringify(historyToolSegmentPinnedSnapshot()),
   (next, previous) => {
+    traceToolLayoutChange("historyToolSegmentPinnedStateChanged", {
+      previous: previous ? JSON.parse(previous) : [],
+      next: next ? JSON.parse(next) : [],
+      pendingItemIds: Array.from(pendingContinuationToolItemIds.value),
+    });
     traceToolCollapse("historyToolSegmentPinnedStateChanged", {
       previous: previous ? JSON.parse(previous) : [],
       next: next ? JSON.parse(next) : [],
@@ -1490,6 +1656,11 @@ function historyToolSegmentExpansionSnapshot() {
 watch(
   () => JSON.stringify(historyToolSegmentExpansionSnapshot()),
   (next, previous) => {
+    traceToolLayoutChange("historyToolSegmentExpansionDecision", {
+      previous: previous ? JSON.parse(previous) : [],
+      next: next ? JSON.parse(next) : [],
+      retainedEntryCount: toolCallMatchEntryCount(retainedCollapsedToolCallMatchState.value),
+    });
     traceToolCollapse("historyToolSegmentExpansionDecision", {
       previous: previous ? JSON.parse(previous) : [],
       next: next ? JSON.parse(next) : [],
@@ -1670,6 +1841,112 @@ const transientRenderSegments = computed<TransientRenderSegment[]>(() => {
   return segments;
 });
 
+function transientSegmentPaintState() {
+  return transientRenderSegments.value.map((segment, index) => {
+    if (segment.type === "thinking") {
+      return {
+        index,
+        type: segment.type,
+        key: segment.key,
+        active: segment.active,
+        duration: segment.duration ?? 0,
+      };
+    }
+    if (segment.type === "toolCalls") {
+      return {
+        index,
+        type: segment.type,
+        key: segment.key,
+        toolCallCount: segment.toolCalls.length,
+        toolCallIds: segment.toolCalls.map((toolCall) => toolCall.id),
+        statuses: toolLayoutStatuses(segment.toolCalls),
+        showWaiting: segment.showWaiting,
+        allowCollapse: segment.allowCollapse,
+        collapseEnabled: segment.collapseEnabled,
+        animateCollapseOnMount: segment.animateCollapseOnMount,
+      };
+    }
+    if (segment.type === "content") {
+      return {
+        index,
+        type: segment.type,
+        key: segment.key,
+        textLength: segment.content.length,
+        textPreview: previewTraceText(segment.content, 48),
+      };
+    }
+    return {
+      index,
+      type: segment.type,
+      key: segment.key,
+      label: segment.label,
+    };
+  });
+}
+
+function hasTransientStatusPaintTarget() {
+  return hasVisibleActiveThinkingBlock.value
+    || isStandaloneWaitingPlaceholder.value
+    || hasStandaloneCompactingPlaceholder.value
+    || isToolWaitingStatusVisible.value;
+}
+
+function traceTransientStatusPaint(reason: string, detail: Record<string, unknown> = {}) {
+  if (!hasTransientStatusPaintTarget()) return;
+  traceTranscriptPaintOcclusion({
+    scope: `chat-transcript:${props.variant}`,
+    reason,
+    scrollElement: scrollRef.value,
+    contentElement: contentRef.value,
+    detail: {
+      sessionKey: props.sessionKey ?? "",
+      isStreaming: props.isStreaming,
+      isThinking: props.isThinking,
+      hasVisibleActiveThinkingBlock: hasVisibleActiveThinkingBlock.value,
+      activeToolCallCount: props.activeToolCalls.length,
+      activeToolCallIds: props.activeToolCalls.map((toolCall) => toolCall.id),
+      activeToolCallStatuses: toolLayoutStatuses(props.activeToolCalls),
+      hasHandoff: !!toolCallHandoff.value,
+      handoffCollapseArmed: toolCallHandoff.value?.collapseArmed ?? false,
+      handoffCollapseFinished: toolCallHandoff.value?.collapseFinished ?? false,
+      standaloneWaiting: isStandaloneWaitingPlaceholder.value,
+      compactingWaiting: hasStandaloneCompactingPlaceholder.value,
+      toolWaiting: isToolWaitingForResponse.value,
+      toolWaitingRowVisible: isToolWaitingRowVisible.value,
+      toolWaitingStatusVisible: isToolWaitingStatusVisible.value,
+      transientSegments: transientSegmentPaintState(),
+      liveRenderParts: canonicalLiveRenderParts.value.map((part) => ({
+        kind: part.kind,
+        id: part.id,
+        active: part.kind === "thinking" ? part.active : undefined,
+        order: part.order ?? 0,
+      })),
+      ...detail,
+    },
+  });
+}
+
+watch(
+  () => [
+    Number(hasVisibleActiveThinkingBlock.value),
+    Number(props.isThinking),
+    Number(isStandaloneWaitingPlaceholder.value),
+    Number(hasStandaloneCompactingPlaceholder.value),
+    Number(isToolWaitingForResponse.value),
+    Number(isToolWaitingRowVisible.value),
+    Number(isToolWaitingStatusVisible.value),
+    props.activeToolCalls.map((toolCall) => `${toolCall.id}:${toolCall.status}`).join(","),
+    transientSegmentPaintState().map((segment) => JSON.stringify(segment)).join("|"),
+  ].join("::"),
+  (next, previous) => {
+    traceTransientStatusPaint("transientStatusPaintStateChanged", {
+      previous,
+      next,
+    });
+  },
+  { flush: "post", immediate: true },
+);
+
 function formatThoughtSummary(duration?: number) {
   if (duration && duration > 0) {
     return props.thoughtDurationLabel.replace("{0}", String(duration));
@@ -1813,7 +2090,12 @@ function openImage(src: string) {
                     class="chat-transcript-intent-badge"
                     :class="badge.kind"
                   >
-                    {{ badge.label }}
+                    <template v-if="badge.kind === 'skill'">
+                      <span class="chat-transcript-intent-badge-mark">SKILL</span>
+                      <span class="chat-transcript-intent-badge-divider"></span>
+                      <span class="chat-transcript-intent-badge-text">{{ badge.label }}</span>
+                    </template>
+                    <template v-else>{{ badge.label }}</template>
                   </span>
                 </div>
 
@@ -1900,6 +2182,8 @@ function openImage(src: string) {
                   v-if="segment.type === 'thinking'"
                   class="chat-transcript-thinking-block"
                   data-render-part-kind="thinking"
+                  data-render-part-scope="history"
+                  :data-render-part-key="segment.key"
                 >
                   <button
                     v-if="variant === 'session'"
@@ -1926,6 +2210,14 @@ function openImage(src: string) {
                   v-else-if="segment.type === 'toolCalls'"
                   class="chat-transcript-tool-calls-group"
                   data-render-part-kind="toolCall"
+                  data-render-part-scope="history"
+                  :data-render-part-key="segment.key"
+                  data-tool-layout-kind="group"
+                  data-tool-layout-scope="history"
+                  :data-tool-layout-key="segment.key"
+                  :data-tool-layout-tool-call-ids="toolLayoutToolCallIds(segment.toolCalls)"
+                  :data-tool-layout-statuses="toolLayoutStatuses(segment.toolCalls)"
+                  :data-tool-layout-keep-expanded="String(shouldKeepToolSegmentExpanded(segment))"
                 >
                   <ToolCallCollection
                     :tool-calls="segment.toolCalls"
@@ -1948,6 +2240,8 @@ function openImage(src: string) {
                 <MarkdownRenderer
                   v-else-if="segment.type === 'content'"
                   data-render-part-kind="text"
+                  data-render-part-scope="history"
+                  :data-render-part-key="segment.key"
                   :content="segment.content"
                   enable-file-refs
                 />
@@ -1955,6 +2249,8 @@ function openImage(src: string) {
                 <KnowledgeProposalCard
                   v-else-if="segment.type === 'knowledgeProposal'"
                   data-render-part-kind="knowledgeProposal"
+                  data-render-part-scope="history"
+                  :data-render-part-key="segment.key"
                   :proposal="segment.message.knowledgeProposal!"
                   @apply="emit('applyKnowledgeProposal', $event)"
                   @ignore="emit('ignoreKnowledgeProposal', $event)"
@@ -1974,6 +2270,8 @@ function openImage(src: string) {
               continuation: isStreamingContinuation,
               'waiting-placeholder': isStandaloneWaitingPlaceholder,
               'compact-handoff': isCompacting,
+              'has-live-thinking': hasVisibleActiveThinkingBlock,
+              'has-tool-waiting-status': isToolWaitingStatusVisible,
             },
           ]"
           data-scroll-anchor-id="__transient__"
@@ -1987,86 +2285,109 @@ function openImage(src: string) {
           </div>
 
           <div class="chat-transcript-message-content" :class="`is-${variant}`">
-            <template
-              v-for="segment in transientRenderSegments"
-              :key="segment.key"
-            >
-              <div
-                v-if="segment.type === 'thinking'"
-                class="chat-transcript-thinking-block"
-                data-render-part-kind="thinking"
+            <div class="chat-transcript-item-stack" :class="`is-${variant}`">
+              <template
+                v-for="segment in transientRenderSegments"
+                :key="segment.key"
               >
-                <button
-                  v-if="variant === 'session'"
-                  type="button"
-                  class="chat-transcript-thinking-header"
-                  :class="{ active: segment.active, 'is-clickable': true }"
-                  @click="emit('openThinking', '')"
+                <div
+                  v-if="segment.type === 'thinking'"
+                  class="chat-transcript-thinking-block"
+                  data-render-part-kind="thinking"
+                  data-render-part-scope="transient"
+                  :data-render-part-key="segment.key"
                 >
-                  <svg class="chat-transcript-thinking-chevron" viewBox="0 0 16 16" fill="currentColor" width="12" height="12">
-                    <path d="M6 3l5 5-5 5V3z" />
-                  </svg>
-                  <template v-if="segment.active">
-                    <span class="chat-transcript-thinking-spinner" />
-                    <span class="chat-transcript-thinking-title">{{ thinkingActiveLabel }}</span>
-                  </template>
-                  <template v-else>
-                    <span class="chat-transcript-thinking-title">{{ formatThoughtSummary(segment.duration) }}</span>
-                  </template>
-                </button>
+                  <button
+                    v-if="variant === 'session'"
+                    type="button"
+                    class="chat-transcript-thinking-header"
+                    :class="{ active: segment.active, 'is-clickable': true }"
+                    @click="emit('openThinking', '')"
+                  >
+                    <svg class="chat-transcript-thinking-chevron" viewBox="0 0 16 16" fill="currentColor" width="12" height="12">
+                      <path d="M6 3l5 5-5 5V3z" />
+                    </svg>
+                    <template v-if="segment.active">
+                      <ChatWaitingIndicator :label="thinkingActiveLabel" />
+                    </template>
+                    <template v-else>
+                      <span class="chat-transcript-thinking-title">{{ formatThoughtSummary(segment.duration) }}</span>
+                    </template>
+                  </button>
 
-                <div v-else class="chat-transcript-thinking-chip" :class="{ active: segment.active }">
-                  <span v-if="segment.active" class="chat-transcript-thinking-spinner compact" />
-                  <span class="chat-transcript-thinking-title">
-                    {{ segment.active ? thinkingActiveLabel : formatThoughtSummary(segment.duration) }}
-                  </span>
+                  <div v-else class="chat-transcript-thinking-chip" :class="{ active: segment.active }">
+                    <ChatWaitingIndicator v-if="segment.active" :label="thinkingActiveLabel" compact />
+                    <span v-else class="chat-transcript-thinking-title">
+                      {{ formatThoughtSummary(segment.duration) }}
+                    </span>
+                  </div>
                 </div>
-              </div>
 
-              <div
-                v-else-if="segment.type === 'toolCalls'"
-                class="chat-transcript-tool-calls-group"
-                data-render-part-kind="toolCall"
-              >
-                <ToolCallCollection
-                  :tool-calls="segment.toolCalls"
-                  :allow-collapse="segment.allowCollapse"
-                  :collapse-enabled="segment.collapseEnabled"
-                  :animate-collapse-on-mount="segment.animateCollapseOnMount"
-                  @collapse-finished="onTransientToolCallsCollapseFinished"
-                  @viewport-anchor-start="emitToolViewportAnchorStart"
-                  @viewport-anchor-end="emitToolViewportAnchorEnd"
+                <div
+                  v-else-if="segment.type === 'toolCalls'"
+                  class="chat-transcript-tool-calls-group"
+                  data-render-part-kind="toolCall"
+                  data-render-part-scope="transient"
+                  :data-render-part-key="segment.key"
+                  data-tool-layout-kind="group"
+                  data-tool-layout-scope="transient"
+                  :data-tool-layout-key="segment.key"
+                  :data-tool-layout-tool-call-ids="toolLayoutToolCallIds(segment.toolCalls)"
+                  :data-tool-layout-statuses="toolLayoutStatuses(segment.toolCalls)"
+                  :data-tool-layout-allow-collapse="String(segment.allowCollapse)"
+                  :data-tool-layout-collapse-enabled="String(segment.collapseEnabled)"
+                  :data-tool-layout-animate-collapse-on-mount="String(segment.animateCollapseOnMount)"
+                  :data-tool-layout-show-waiting="String(segment.showWaiting && isToolWaitingRowVisible)"
+                  :data-tool-layout-waiting-status="String(segment.showWaiting && isToolWaitingStatusVisible)"
                 >
-                  <template #default="{ toolCall }">
-                    <ToolCallBlock
-                      :tool-call="toolCall"
-                      :collapse-enabled="segment.collapseEnabled"
-                      @tool-viewport-anchor-start="emitToolViewportAnchorStart"
-                      @tool-viewport-anchor-end="emitToolViewportAnchorEnd"
-                    />
-                  </template>
-                </ToolCallCollection>
-                <div v-if="segment.showWaiting && isToolWaitingForResponse" class="chat-transcript-tool-waiting-row">
-                  <span class="chat-transcript-thinking-spinner compact" />
-                  <span class="chat-transcript-thinking-title">{{ waitingLabel }}</span>
+                  <ToolCallCollection
+                    :tool-calls="segment.toolCalls"
+                    :allow-collapse="segment.allowCollapse"
+                    :collapse-enabled="segment.collapseEnabled"
+                    :animate-collapse-on-mount="segment.animateCollapseOnMount"
+                    :show-waiting-status="segment.showWaiting && isToolWaitingStatusVisible"
+                    :waiting-label="waitingLabel"
+                    @collapse-finished="onTransientToolCallsCollapseFinished"
+                    @viewport-anchor-start="emitToolViewportAnchorStart"
+                    @viewport-anchor-end="emitToolViewportAnchorEnd"
+                  >
+                    <template #default="{ toolCall }">
+                      <ToolCallBlock
+                        :tool-call="toolCall"
+                        :collapse-enabled="segment.collapseEnabled"
+                        @tool-viewport-anchor-start="emitToolViewportAnchorStart"
+                        @tool-viewport-anchor-end="emitToolViewportAnchorEnd"
+                      />
+                    </template>
+                  </ToolCallCollection>
+                  <div v-if="segment.showWaiting && isToolWaitingRowVisible" class="chat-transcript-tool-waiting-row">
+                    <ChatWaitingIndicator :label="waitingLabel" compact />
+                  </div>
                 </div>
-              </div>
 
-              <div v-else-if="segment.type === 'waiting'" class="chat-transcript-thinking-block">
-                <div class="chat-transcript-thinking-header active">
-                  <span class="chat-transcript-thinking-spinner" />
-                  <span class="chat-transcript-thinking-title">{{ segment.label }}</span>
+                <div
+                  v-else-if="segment.type === 'waiting'"
+                  class="chat-transcript-thinking-block"
+                  data-render-part-kind="waiting"
+                  data-render-part-scope="transient"
+                  :data-render-part-key="segment.key"
+                >
+                  <div class="chat-transcript-thinking-header active">
+                    <ChatWaitingIndicator :label="segment.label" />
+                  </div>
                 </div>
-              </div>
 
-              <MarkdownRenderer
-                v-else-if="segment.type === 'content'"
-                data-render-part-kind="text"
-                :content="segment.content"
-                cursor
-                enable-file-refs
-              />
-            </template>
+                <MarkdownRenderer
+                  v-else-if="segment.type === 'content'"
+                  data-render-part-kind="text"
+                  data-render-part-scope="transient"
+                  :data-render-part-key="segment.key"
+                  :content="segment.content"
+                  cursor
+                  enable-file-refs
+                />
+              </template>
+            </div>
           </div>
         </div>
 
@@ -2099,6 +2420,7 @@ function openImage(src: string) {
 }
 
 .chat-transcript-scroll.is-session {
+  --chat-transcript-session-segment-gap: 10px;
   padding: 24px 0;
   background: var(--msg-assistant-bg);
   overflow-anchor: none;
@@ -2146,9 +2468,9 @@ function openImage(src: string) {
     contain-intrinsic-size: auto 180px;
   }
 
-  .chat-transcript-message.is-session.assistant.transient.waiting-placeholder {
+  .chat-transcript-message.is-session.assistant.transient.has-live-thinking,
+  .chat-transcript-message.is-session.assistant.transient.has-tool-waiting-status {
     content-visibility: visible;
-    contain-intrinsic-size: auto 0;
   }
 }
 
@@ -2172,8 +2494,11 @@ function openImage(src: string) {
   background: var(--msg-assistant-bg);
   border-top: none;
   border-bottom: none;
-  padding-top: 8px;
-  padding-bottom: 0;
+}
+
+.chat-transcript-message.is-session.assistant.transient.has-live-thinking,
+.chat-transcript-message.is-session.assistant.transient.has-tool-waiting-status {
+  contain: layout;
 }
 
 .chat-transcript-message.is-session.compact-handoff {
@@ -2230,7 +2555,7 @@ function openImage(src: string) {
 }
 
 .chat-transcript-message.is-session.continuation {
-  padding-top: 6px;
+  padding-top: var(--chat-transcript-session-segment-gap);
 }
 
 .chat-transcript-message.is-embedded {
@@ -2318,7 +2643,7 @@ function openImage(src: string) {
 }
 
 .chat-transcript-item-stack.is-session {
-  gap: 10px;
+  gap: var(--chat-transcript-session-segment-gap);
 }
 
 .chat-transcript-message.is-session.user.user-align-right .chat-transcript-item-stack.is-session {
@@ -2329,6 +2654,11 @@ function openImage(src: string) {
 
 .chat-transcript-item-stack.is-embedded {
   gap: 9px;
+}
+
+.chat-transcript-item-stack > [data-render-part-kind] {
+  position: relative;
+  z-index: 1;
 }
 
 .chat-transcript-intent-row {
@@ -2342,7 +2672,8 @@ function openImage(src: string) {
   align-items: center;
   gap: 4px;
   padding: 2px 8px;
-  border-radius: var(--radius-badge);
+  border: 1px solid transparent;
+  border-radius: 6px;
   font-size: 11px;
   font-weight: 600;
   letter-spacing: 0.02em;
@@ -2356,8 +2687,51 @@ function openImage(src: string) {
 }
 
 .chat-transcript-intent-badge.skill {
+  display: inline-grid;
+  grid-template-columns: auto 1px minmax(0, auto);
+  align-items: stretch;
+  gap: 0;
+  min-height: 28px;
+  padding: 0;
+  overflow: hidden;
+  color: var(--text-color);
+  border-color: color-mix(in srgb, var(--accent-color) 26%, var(--border-color));
+  background: color-mix(in srgb, var(--panel-bg) 74%, var(--msg-user-bg) 26%);
+  line-height: 1;
+}
+
+.chat-transcript-intent-badge-mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 42px;
+  padding: 0 8px;
   color: var(--accent-color);
-  background: color-mix(in srgb, var(--accent-color) 14%, transparent);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  line-height: 1;
+}
+
+.chat-transcript-intent-badge-divider {
+  align-self: stretch;
+  width: 1px;
+  background: color-mix(in srgb, var(--accent-color) 22%, var(--border-color));
+}
+
+.chat-transcript-intent-badge-text {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 0;
+  max-width: 180px;
+  padding: 0 8px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1;
 }
 
 .chat-transcript-plain-text {
@@ -2503,10 +2877,25 @@ function openImage(src: string) {
   white-space: nowrap;
 }
 
+.chat-transcript-thinking-block {
+  position: relative;
+  z-index: 0;
+  display: flex;
+  align-items: flex-start;
+  min-width: 0;
+  min-height: 28px;
+}
+
+.chat-transcript-thinking-block[data-render-part-scope="transient"] {
+  z-index: 3;
+}
+
 .chat-transcript-thinking-header {
   display: inline-flex;
   align-items: center;
   gap: 6px;
+  max-width: 100%;
+  min-height: 28px;
   padding: 4px 10px 4px 6px;
   border: none;
   border-radius: 8px;
@@ -2514,7 +2903,9 @@ function openImage(src: string) {
   color: var(--text-secondary);
   font: inherit;
   font-size: 13px;
+  line-height: 1.35;
   text-align: left;
+  overflow: visible;
 }
 
 .chat-transcript-thinking-header.is-clickable {
@@ -2535,6 +2926,7 @@ function openImage(src: string) {
   border-radius: 6px;
   background: color-mix(in srgb, var(--hover-bg) 78%, transparent);
   color: var(--text-secondary);
+  line-height: 1.35;
 }
 
 .chat-transcript-thinking-chip.active {
@@ -2547,52 +2939,14 @@ function openImage(src: string) {
   opacity: 0.5;
 }
 
-.chat-transcript-thinking-spinner {
-  width: 14px;
-  height: 14px;
-  border: 2px solid var(--border-color);
-  border-top-color: var(--text-secondary);
-  border-radius: 50%;
-  animation: chat-transcript-thinking-spin 0.8s linear infinite;
-  flex-shrink: 0;
-}
-
-.chat-transcript-thinking-spinner.compact {
-  width: 12px;
-  height: 12px;
-}
-
-@keyframes chat-transcript-thinking-spin {
-  to {
-    transform: rotate(360deg);
-  }
-}
-
 .chat-transcript-thinking-title {
   font-weight: 500;
   white-space: nowrap;
 }
 
-.chat-transcript-thinking-header.active .chat-transcript-thinking-title {
-  background: linear-gradient(90deg, var(--text-secondary) 0%, var(--text-color) 50%, var(--text-secondary) 100%);
-  background-size: 200% 100%;
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
-  background-clip: text;
-  animation: chat-transcript-thinking-shimmer 2s ease-in-out infinite;
-}
-
-@keyframes chat-transcript-thinking-shimmer {
-  0% {
-    background-position: 100% 0;
-  }
-
-  100% {
-    background-position: -100% 0;
-  }
-}
-
 .chat-transcript-tool-calls-group {
+  position: relative;
+  z-index: 0;
   display: flex;
   flex-direction: column;
   gap: 6px;

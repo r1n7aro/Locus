@@ -35,6 +35,10 @@ import {
   type ResizeObserverHandle,
 } from "../../composables/resizeObserver";
 import { t } from "../../i18n";
+import {
+  captureTranscriptLayoutSnapshot,
+  traceViewportAnchorSample,
+} from "../../services/layoutDiagnostics";
 
 interface MetaRow {
   label: string;
@@ -167,6 +171,20 @@ function getTranscriptContentElement() {
   return transcriptRef.value?.getContentElement?.() ?? null;
 }
 
+function traceToolViewportAnchor(phase: string, anchor: HTMLElement | null | undefined, detail: Record<string, unknown> = {}) {
+  traceViewportAnchorSample({
+    scope: "embedded-chat",
+    phase,
+    scrollElement: getTranscriptElement(),
+    contentElement: getTranscriptContentElement(),
+    anchor,
+    detail: {
+      viewportKey: getViewportStateKey(),
+      ...detail,
+    },
+  });
+}
+
 function readTranscriptMetrics(el: HTMLElement) {
   return {
     scrollTop: el.scrollTop,
@@ -229,12 +247,34 @@ function restoreToolViewportAnchor() {
   const el = getTranscriptElement();
   if (!anchorState || !el) return false;
   if (!el.contains(anchorState.anchor)) {
+    traceToolViewportAnchor("restore:anchor-disconnected", anchorState.anchor);
     clearToolViewportAnchor();
     return false;
   }
 
+  const before = captureTranscriptLayoutSnapshot("embedded-chat", "toolViewportAnchorRestore", el, getTranscriptContentElement());
   suppressScrollCapture = true;
+  const scrollTopBefore = el.scrollTop;
   const restored = restoreLiveScrollAnchor(el, anchorState);
+  traceViewportAnchorSample({
+    scope: "embedded-chat",
+    phase: "restore",
+    scrollElement: el,
+    contentElement: getTranscriptContentElement(),
+    anchor: anchorState.anchor,
+    anchorState: {
+      offsetTop: anchorState.offsetTop,
+      fallbackScrollTop: anchorState.fallbackScrollTop,
+    },
+    restored,
+    before,
+    detail: {
+      viewportKey: getViewportStateKey(),
+      scrollTopBefore,
+      scrollTopAfter: el.scrollTop,
+      scrollDelta: el.scrollTop - scrollTopBefore,
+    },
+  });
   if (restored) {
     viewportStates.set(getViewportStateKey(), captureViewportState(el));
   }
@@ -258,17 +298,36 @@ function handleToolViewportAnchorStart(anchor: HTMLElement) {
   streamEndScrollScheduler.cancel();
   clearToolViewportAnchorFrame();
   activeToolViewportAnchor = captureLiveScrollAnchor(el, anchor);
+  traceViewportAnchorSample({
+    scope: "embedded-chat",
+    phase: "start",
+    scrollElement: el,
+    contentElement: getTranscriptContentElement(),
+    anchor,
+    anchorState: activeToolViewportAnchor
+      ? {
+          offsetTop: activeToolViewportAnchor.offsetTop,
+          fallbackScrollTop: activeToolViewportAnchor.fallbackScrollTop,
+        }
+      : null,
+    detail: {
+      viewportKey: getViewportStateKey(),
+    },
+  });
   restoreToolViewportAnchor();
 }
 
 function handleToolViewportAnchorEnd(anchor: HTMLElement) {
   if (!activeToolViewportAnchor || activeToolViewportAnchor.anchor !== anchor) return;
 
+  traceToolViewportAnchor("end:before-restore", anchor);
   restoreToolViewportAnchor();
   clearToolViewportAnchorFrame();
   toolViewportAnchorFrame = requestViewportFrame(() => {
     toolViewportAnchorFrame = 0;
+    traceToolViewportAnchor("end:frame-before-restore", anchor);
     restoreToolViewportAnchor();
+    traceToolViewportAnchor("end:frame-after-restore", anchor);
     activeToolViewportAnchor = null;
   });
 }

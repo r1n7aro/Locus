@@ -4,6 +4,8 @@ import { useDisplaySettings } from "../composables/useDisplaySettings";
 import { summarizeToolCallBatch } from "../composables/toolCallBatches";
 import { t } from "../i18n";
 import { logToolCollapseTrace } from "../services/toolCollapseTrace";
+import { traceToolBlockLayoutChange } from "../services/layoutDiagnostics";
+import ChatWaitingIndicator from "./chat/ChatWaitingIndicator.vue";
 
 import type { ToolCallDisplay } from "../types";
 
@@ -12,10 +14,14 @@ const props = withDefaults(defineProps<{
   allowCollapse?: boolean;
   collapseEnabled?: boolean;
   animateCollapseOnMount?: boolean;
+  showWaitingStatus?: boolean;
+  waitingLabel?: string;
 }>(), {
   allowCollapse: true,
   collapseEnabled: true,
   animateCollapseOnMount: false,
+  showWaitingStatus: false,
+  waitingLabel: "Waiting for response...",
 });
 const emit = defineEmits<{
   (e: "collapseFinished"): void;
@@ -33,6 +39,9 @@ const startsExpandedForCollapseAnimation =
 const expanded = ref(startsExpandedForCollapseAnimation);
 const panelVisible = ref(false);
 const panelLeaving = ref(false);
+const autoCollapseFloatingSummary = ref(startsExpandedForCollapseAnimation);
+const floatingSummaryHeight = ref(30);
+const collectionRef = ref<HTMLElement | null>(null);
 const summaryRef = ref<HTMLElement | null>(null);
 const panelTransitionCleanup = new WeakMap<HTMLElement, () => void>();
 
@@ -71,6 +80,18 @@ const toggleLabel = computed(() =>
 const summaryOpen = computed(() =>
   batchState.value.canCollapse && (expanded.value || panelVisible.value),
 );
+const floatingSummary = computed(() =>
+  batchState.value.canCollapse && autoCollapseFloatingSummary.value,
+);
+const floatingSummaryStyle = computed(() =>
+  floatingSummary.value
+    ? { "--tool-call-summary-height": `${floatingSummaryHeight.value}px` }
+    : undefined,
+);
+
+const toolLayoutToolCallIds = computed(() => props.toolCalls.map((toolCall) => toolCall.id).join(","));
+const toolLayoutStatuses = computed(() => props.toolCalls.map((toolCall) => `${toolCall.id}:${toolCall.status}`).join(","));
+const toolLayoutKey = computed(() => props.toolCalls.map((toolCall) => toolCall.id).join("|") || "empty");
 
 function traceCollection(event: string, detail?: Record<string, unknown>) {
   logToolCollapseTrace("tool-collection", event, {
@@ -82,7 +103,33 @@ function traceCollection(event: string, detail?: Record<string, unknown>) {
     expanded: expanded.value,
     panelVisible: panelVisible.value,
     panelLeaving: panelLeaving.value,
+    showWaitingStatus: props.showWaitingStatus,
     ...detail,
+  });
+}
+
+function traceCollectionLayout(reason: string, detail: Record<string, unknown> = {}) {
+  const root = collectionRef.value;
+  const scrollElement = root?.closest<HTMLElement>(".chat-transcript-scroll") ?? null;
+  const contentElement = scrollElement?.querySelector<HTMLElement>(".chat-transcript-content") ?? null;
+  traceToolBlockLayoutChange({
+    scope: "tool-collection",
+    reason,
+    scrollElement,
+    contentElement,
+    detail: {
+      firstToolCallId: props.toolCalls[0]?.id ?? "",
+      toolCallIds: props.toolCalls.map((toolCall) => toolCall.id),
+      statuses: toolLayoutStatuses.value,
+      allowCollapse: props.allowCollapse,
+      collapseEnabled: props.collapseEnabled,
+      canCollapse: batchState.value.canCollapse,
+      expanded: expanded.value,
+      panelVisible: panelVisible.value,
+      panelLeaving: panelLeaving.value,
+      showWaitingStatus: props.showWaitingStatus,
+      ...detail,
+    },
   });
 }
 
@@ -109,6 +156,18 @@ function resetPanelTransition(element: HTMLElement) {
   element.style.transformOrigin = "";
   element.style.willChange = "";
   element.style.transition = "";
+}
+
+function collapsedSummaryHeight() {
+  const summary = summaryRef.value;
+  if (!summary) return 30;
+  const rectHeight = summary.getBoundingClientRect().height;
+  return Math.ceil(rectHeight || summary.offsetHeight || 30);
+}
+
+function updateFloatingSummaryHeight() {
+  floatingSummaryHeight.value = collapsedSummaryHeight();
+  return floatingSummaryHeight.value;
 }
 
 function queuePanelTransition(element: HTMLElement, done: () => void) {
@@ -148,9 +207,16 @@ function emitViewportAnchorEnd() {
   if (anchor) emit("viewportAnchorEnd", anchor);
 }
 
-function toggleExpanded() {
+function emitViewportAnchorStart() {
   const anchor = summaryRef.value;
   if (anchor) emit("viewportAnchorStart", anchor);
+}
+
+function toggleExpanded() {
+  emitViewportAnchorStart();
+  traceCollectionLayout("collectionToggleExpanded", {
+    nextExpanded: !expanded.value,
+  });
   expanded.value = !expanded.value;
 }
 
@@ -158,6 +224,12 @@ onMounted(() => {
   if (!startsExpandedForCollapseAnimation) return;
   traceCollection("animateCollapseOnMount");
   runOnNextFrame(() => {
+    updateFloatingSummaryHeight();
+    emitViewportAnchorStart();
+    traceCollectionLayout("collectionAnimateCollapseOnMount", {
+      nextExpanded: false,
+      floatingSummaryHeight: floatingSummaryHeight.value,
+    });
     expanded.value = false;
   });
 });
@@ -200,8 +272,11 @@ function onPanelEnterCancelled(element: Element) {
 
 function onPanelLeave(element: Element, done: () => void) {
   const panel = element as HTMLElement;
+  const targetHeight = autoCollapseFloatingSummary.value ? updateFloatingSummaryHeight() : 0;
   traceCollection("panelLeave", {
     heightBefore: panel.scrollHeight,
+    targetHeight,
+    floatingSummary: autoCollapseFloatingSummary.value,
   });
   panelLeaving.value = true;
   panelVisible.value = true;
@@ -212,7 +287,7 @@ function onPanelLeave(element: Element, done: () => void) {
   void panel.offsetHeight;
   queuePanelTransition(panel, done);
   runOnNextFrame(() => {
-    panel.style.height = "0px";
+    panel.style.height = `${targetHeight}px`;
     panel.style.opacity = "0";
     panel.style.transform = "translateY(-4px) scaleY(0.97)";
   });
@@ -223,6 +298,7 @@ function onPanelAfterLeave(element: Element) {
   panelVisible.value = false;
   panelLeaving.value = false;
   resetPanelTransition(element as HTMLElement);
+  autoCollapseFloatingSummary.value = false;
   emitViewportAnchorEnd();
   emit("collapseFinished");
 }
@@ -232,6 +308,7 @@ function onPanelLeaveCancelled(element: Element) {
   panelLeaving.value = false;
   panelVisible.value = true;
   resetPanelTransition(element as HTMLElement);
+  autoCollapseFloatingSummary.value = false;
   emitViewportAnchorEnd();
 }
 
@@ -281,12 +358,27 @@ watch(
 
 <template>
   <div
+    ref="collectionRef"
     class="tool-call-collection"
+    :style="floatingSummaryStyle"
     :class="{
       'is-collapsible': batchState.canCollapse,
       'is-expanded': batchState.canCollapse && summaryOpen,
       'is-collapsing': batchState.canCollapse && panelLeaving,
+      'has-floating-summary': floatingSummary,
     }"
+    data-tool-layout-kind="collection"
+    :data-tool-layout-key="toolLayoutKey"
+    :data-tool-layout-tool-call-ids="toolLayoutToolCallIds"
+    :data-tool-layout-statuses="toolLayoutStatuses"
+    :data-tool-layout-can-collapse="String(batchState.canCollapse)"
+    :data-tool-layout-allow-collapse="String(allowCollapse)"
+    :data-tool-layout-collapse-enabled="String(collapseEnabled)"
+    :data-tool-layout-expanded="String(summaryOpen)"
+    :data-tool-layout-panel-visible="String(panelVisible)"
+    :data-tool-layout-panel-leaving="String(panelLeaving)"
+    :data-tool-layout-floating-summary="String(floatingSummary)"
+    :data-tool-layout-waiting-status="String(showWaitingStatus)"
   >
     <button
       v-if="batchState.canCollapse"
@@ -341,6 +433,14 @@ watch(
         </div>
       </div>
     </Transition>
+
+    <div
+      v-if="showWaitingStatus"
+      class="tool-call-collection-waiting-status"
+      aria-live="polite"
+    >
+      <ChatWaitingIndicator :label="waitingLabel" compact />
+    </div>
   </div>
 </template>
 
@@ -349,10 +449,15 @@ watch(
   display: flex;
   flex-direction: column;
   gap: 6px;
+  position: relative;
 }
 
 .tool-call-collection.is-expanded {
   gap: 0;
+}
+
+.tool-call-collection.has-floating-summary {
+  min-height: var(--tool-call-summary-height, 30px);
 }
 
 .tool-call-collection-panel {
@@ -375,7 +480,19 @@ watch(
   font: inherit;
   text-align: left;
   cursor: pointer;
-  transition: background 0.18s, border-color 0.18s, border-radius 0.24s, color 0.15s;
+  transition: background 0.18s, border-color 0.18s, border-radius 0.24s, color 0.15s, opacity 0.18s;
+}
+
+.tool-call-collection.has-floating-summary .tool-call-batch-summary {
+  position: absolute;
+  inset: 0 0 auto;
+  z-index: 1;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.tool-call-collection.has-floating-summary.is-collapsing .tool-call-batch-summary {
+  opacity: 1;
 }
 
 .tool-call-batch-summary:hover,
@@ -414,6 +531,23 @@ watch(
   margin-left: auto;
   font-size: 11px;
   color: var(--text-secondary);
+}
+
+.tool-call-collection-waiting-status {
+  position: absolute;
+  left: 4px;
+  top: calc(100% + 6px);
+  z-index: 2;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: min(100%, 260px);
+  min-height: 22px;
+  padding: 1px 4px;
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1.35;
+  pointer-events: none;
 }
 
 .tool-call-batch-chevron {

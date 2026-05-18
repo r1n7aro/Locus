@@ -11,6 +11,7 @@ import { diffStrings } from "../services/diff";
 import { t } from "../i18n";
 import { resolveToolBlockOverride } from "./tool-block-overrides/toolBlockOverrides";
 import { buildToolCallArgsSummary } from "./toolCallSummary";
+import { traceToolBlockLayoutChange } from "../services/layoutDiagnostics";
 
 import type { ToolCallDisplay, FileDiffPayload } from "../types";
 
@@ -63,6 +64,9 @@ const waitingLabel = computed(() => (
 const isCanvasTool = computed(() => props.toolCall.name === "canvas");
 const showRecompileHint = computed(() => props.toolCall.name === "unity_recompile" && props.toolCall.status === "running");
 const toolBlockOverride = computed(() => resolveToolBlockOverride(props.toolCall.name));
+const toolLayoutKey = computed(() => props.toolCall.id || props.toolCall.name);
+const toolLayoutToolCallIds = computed(() => props.toolCall.id);
+const toolLayoutStatuses = computed(() => `${props.toolCall.id}:${props.toolCall.status}`);
 
 function runOnNextFrame(callback: () => void) {
   if (typeof requestAnimationFrame === "function") {
@@ -80,10 +84,35 @@ function emitToolViewportAnchorEnd(anchor: HTMLElement) {
   emit("toolViewportAnchorEnd", anchor);
 }
 
+function traceBlockLayout(reason: string, detail: Record<string, unknown> = {}) {
+  const root = rootRef.value;
+  const scrollElement = root?.closest<HTMLElement>(".chat-transcript-scroll") ?? null;
+  const contentElement = scrollElement?.querySelector<HTMLElement>(".chat-transcript-content") ?? null;
+  traceToolBlockLayoutChange({
+    scope: "tool-block",
+    reason,
+    scrollElement,
+    contentElement,
+    detail: {
+      toolCallId: props.toolCall.id,
+      toolName: props.toolCall.name,
+      status: props.toolCall.status,
+      expanded: expanded.value,
+      collapseEnabled: props.collapseEnabled,
+      ...detail,
+    },
+  });
+}
+
 function setExpanded(nextExpanded: boolean, preserveViewport = false) {
   if (expanded.value === nextExpanded) return;
   const anchor = headerRef.value ?? rootRef.value;
   if (preserveViewport && anchor) emitToolViewportAnchorStart(anchor);
+  traceBlockLayout("toolBlockExpandedChanged", {
+    previousExpanded: expanded.value,
+    nextExpanded,
+    preserveViewport,
+  });
   expanded.value = nextExpanded;
 
   if (preserveViewport && anchor) {
@@ -394,6 +423,12 @@ const highlightedOutput = computed(() => {
     v-if="toolBlockOverride"
     :tool-call="toolCall"
     :collapse-enabled="collapseEnabled"
+    data-tool-layout-kind="block"
+    :data-tool-layout-key="toolLayoutKey"
+    :data-tool-layout-tool-call-ids="toolLayoutToolCallIds"
+    :data-tool-layout-statuses="toolLayoutStatuses"
+    :data-tool-layout-collapse-enabled="String(collapseEnabled)"
+    :data-tool-layout-expanded="String(expanded)"
     @tool-viewport-anchor-start="emitToolViewportAnchorStart"
     @tool-viewport-anchor-end="emitToolViewportAnchorEnd"
   />
@@ -402,6 +437,12 @@ const highlightedOutput = computed(() => {
     ref="rootRef"
     class="tool-call-block"
     :class="[toolCall.status, { 'is-expanded': expanded, 'is-recompile-attention': showRecompileHint }]"
+    data-tool-layout-kind="block"
+    :data-tool-layout-key="toolLayoutKey"
+    :data-tool-layout-tool-call-ids="toolLayoutToolCallIds"
+    :data-tool-layout-statuses="toolLayoutStatuses"
+    :data-tool-layout-collapse-enabled="String(collapseEnabled)"
+    :data-tool-layout-expanded="String(expanded)"
   >
     <button ref="headerRef" type="button" class="tool-call-header ui-select-none" @click="toggleExpanded">
       <span class="tool-call-icon" :class="statusIcon">
