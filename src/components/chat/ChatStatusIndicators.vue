@@ -21,6 +21,7 @@ import type {
 } from "../../types";
 import BaseButton from "../ui/BaseButton.vue";
 import BaseSegmented, { type SegmentedOption } from "../ui/BaseSegmented.vue";
+import { estimateKnowledgeContextCostTokens } from "./knowledgeContextCost";
 
 type StatusId = "assetDb" | "unity" | "knowledge";
 type StatusTone = "success" | "danger" | "accent" | "muted";
@@ -167,15 +168,6 @@ function formatCount(value: number): string {
 function formatPercent(value: number | null | undefined): string {
   if (typeof value !== "number" || !Number.isFinite(value)) return "0%";
   return `${Math.round(Math.min(1, Math.max(0, value)) * 100)}%`;
-}
-
-function estimateTextTokens(text: string): number {
-  if (!text) return 0;
-  return Math.ceil(text.length / 4);
-}
-
-function isKnowledgeInjectionItem(item: InjectedPromptItem): boolean {
-  return item.id === "knowledge_context" || item.id.startsWith("knowledge_rule::");
 }
 
 function lexicalStageLabel(stage: string | null | undefined): string {
@@ -441,9 +433,7 @@ const knowledgeAgentId = computed(() => props.selectedAgentId?.trim() ?? "");
 
 const knowledgeContextEstimatedTokens = computed(() => {
   if (knowledgeMode.value === "disabled") return 0;
-  return injectedItems.value
-    .filter(isKnowledgeInjectionItem)
-    .reduce((total, item) => total + estimateTextTokens(item.content), 0);
+  return estimateKnowledgeContextCostTokens(injectedItems.value);
 });
 
 const knowledgeContextCostLabel = computed(() => {
