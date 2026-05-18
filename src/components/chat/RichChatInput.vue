@@ -42,10 +42,17 @@ import {
   useChatInputSettings,
 } from "../../composables/useChatInputSettings";
 import {
+  subscribeLocusFileDrop,
   subscribeUnityEmbedAssetDrop,
   subscribeUnityEmbedTextDrop,
+  type LocusFileDropRef,
   type UnityEmbedTextDropEntry,
 } from "../../services/unity";
+import {
+  getCachedFileToolWorkspaceBoundary,
+  getFileToolWorkspaceBoundary,
+} from "../../services/permissions";
+import { useProjectStore } from "../../stores/project";
 import AssetChip from "../AssetChip.vue";
 import LucideIcon from "../icons/LucideIcon.vue";
 import MentionPopup from "./MentionPopup.vue";
@@ -77,6 +84,7 @@ const PASTE_THRESHOLD = 500;
 const ASSET_REF_COLLAPSE_THRESHOLD = 5;
 const ASSET_REF_SYNC_CHANNEL = "locus-chat-asset-ref-drafts";
 const ASSET_REF_SYNC_STORAGE_KEY = "locus:chatAssetRefDraftSync";
+const LOCAL_FILE_BOUNDARY_WARNING_OPERATION = "local-file-boundary-warning";
 const UNITY_ASSET_REF_ROOT_RE = /^(?:Assets|Packages|ProjectSettings)(?:\/|$)/i;
 const PROJECT_KNOWLEDGE_REF_ROOT_RE = /^(?:design|memory|skill|reference)\/.+\.md$/i;
 const KNOWLEDGE_MENTION_TYPES: KnowledgeDocumentType[] = ["design", "memory", "skill", "reference"];
@@ -103,6 +111,10 @@ interface ConsoleTextInput {
   title?: string | null;
   source?: string | null;
   level?: string | null;
+}
+
+interface LocalFileAttachment extends LocusFileDropRef {
+  id: string;
 }
 
 const props = withDefaults(defineProps<{
@@ -149,6 +161,7 @@ const emit = defineEmits<{
 
 const composerRef = ref<InstanceType<typeof ChatComposer> | null>(null);
 const notificationStore = useNotificationStore();
+const projectStore = useProjectStore();
 const slots = useSlots();
 const { state: chatInputSettings } = useChatInputSettings();
 
@@ -167,6 +180,8 @@ const assetRefAttachments = ref<AssetRefAttachment[]>([]);
 const showAssetRefDetails = ref(false);
 const consoleTextAttachments = ref<ConsoleTextAttachment[]>([]);
 const showConsoleTextDetails = ref(false);
+const localFileAttachments = ref<LocalFileAttachment[]>([]);
+const showLocalFileDetails = ref(false);
 const previewImageIndex = ref<number | null>(null);
 const composerIntent = ref<ComposerIntentState>(emptyComposerIntent());
 const activeOperator = ref<ActiveOperator | null>(null);
@@ -179,6 +194,8 @@ const assetRefGroupRootRef = ref<HTMLElement | null>(null);
 const assetRefDetailsRootRef = ref<HTMLElement | null>(null);
 const consoleTextGroupRootRef = ref<HTMLElement | null>(null);
 const consoleTextDetailsRootRef = ref<HTMLElement | null>(null);
+const localFileGroupRootRef = ref<HTMLElement | null>(null);
+const localFileDetailsRootRef = ref<HTMLElement | null>(null);
 const showMentionPopup = ref(false);
 const mentionHighlightIndex = ref(0);
 const mentionMode = ref<"search" | "browse">("search");
@@ -198,8 +215,10 @@ let lastSearchQuery = "";
 let pendingMentionCursor: number | null = null;
 let releaseUnityAssetDrop: (() => void) | null = null;
 let releaseUnityTextDrop: (() => void) | null = null;
+let releaseLocusFileDrop: (() => void) | null = null;
 let unityAssetDropSubscriptionDisposed = false;
 let unityTextDropSubscriptionDisposed = false;
+let locusFileDropSubscriptionDisposed = false;
 let assetRefSyncChannel: BroadcastChannel | null = null;
 let assetRefSyncSeq = 0;
 let lastAssetRefSyncKey = "";
@@ -208,7 +227,8 @@ const assetRefSyncSourceId = `rich-chat-input-${Date.now().toString(36)}-${Math.
 const hasTopAttachments = computed(() =>
   imageAttachments.value.length > 0
   || assetRefAttachments.value.length > 0
-  || consoleTextAttachments.value.length > 0,
+  || consoleTextAttachments.value.length > 0
+  || localFileAttachments.value.length > 0,
 );
 
 const canSend = computed(() =>
@@ -217,7 +237,8 @@ const canSend = computed(() =>
   || !!pastedContent.value
   || imageAttachments.value.length > 0
   || assetRefAttachments.value.length > 0
-  || consoleTextAttachments.value.length > 0,
+  || consoleTextAttachments.value.length > 0
+  || localFileAttachments.value.length > 0,
 );
 const hasHeaderStart = computed(() =>
   !!slots["header-start"]
@@ -269,6 +290,15 @@ const collapsedAssetRefPreview = computed(() =>
 );
 const consoleTextTotalChars = computed(() =>
   consoleTextAttachments.value.reduce((total, item) => total + item.text.length, 0),
+);
+const shouldGroupLocalFiles = computed(() =>
+  localFileAttachments.value.length > 1,
+);
+const singleLocalFileAttachment = computed(() =>
+  localFileAttachments.value.length === 1 ? localFileAttachments.value[0] : null,
+);
+const localFilePreview = computed(() =>
+  localFileAttachments.value.slice(0, 2).map(localFileDisplayName).join(", "),
 );
 
 const mentionBreadcrumbs = computed(() => {
@@ -423,7 +453,7 @@ function buildIntentBadges(
   for (const skill of intent.skills || []) {
     badges.push({
       key: `${skill.source}:${skill.dirName}`,
-      label: `SKILL: ${skill.name}`,
+      label: skill.name,
       kind: "skill",
       skill,
     });
@@ -1080,6 +1110,7 @@ function toggleAssetRefDetails() {
   showCommandPopup.value = false;
   closeMentionPopup();
   closeConsoleTextDetails();
+  closeLocalFileDetails();
   showAssetRefDetails.value = !showAssetRefDetails.value;
 }
 
@@ -1158,11 +1189,135 @@ function clearConsoleTextAttachments() {
   closeConsoleTextDetails();
 }
 
+function normalizeLocalFileAttachment(file: LocusFileDropRef): LocalFileAttachment | null {
+  const path = file.path?.trim().replace(/\\/g, "/").replace(/\/+$/, "");
+  if (!path) return null;
+  return {
+    id: `file-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`,
+    path,
+    name: file.name?.trim() || undefined,
+    typeLabel: file.typeLabel?.trim() || undefined,
+    isDir: !!file.isDir,
+    source: file.source?.trim() || "local",
+  };
+}
+
+function localFileKey(file: Pick<LocalFileAttachment, "path">) {
+  return file.path.toLowerCase();
+}
+
+function dedupeLocalFileAttachments(files: LocalFileAttachment[]) {
+  const seen = new Set<string>();
+  const next: LocalFileAttachment[] = [];
+  for (const file of files) {
+    const key = localFileKey(file);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    next.push(file);
+  }
+  return next;
+}
+
+function normalizeBoundaryPath(path: string) {
+  return path.trim().replace(/\\/g, "/").replace(/\/+$/, "");
+}
+
+function isPathInsideWorkspace(path: string, workspacePath: string) {
+  const normalizedPath = normalizeBoundaryPath(path);
+  const normalizedWorkspace = normalizeBoundaryPath(workspacePath);
+  if (!normalizedPath || !normalizedWorkspace) return false;
+  const lowerPath = normalizedPath.toLowerCase();
+  const lowerWorkspace = normalizedWorkspace.toLowerCase();
+  return lowerPath === lowerWorkspace || lowerPath.startsWith(`${lowerWorkspace}/`);
+}
+
+function isExternalLocalFile(file: Pick<LocalFileAttachment, "path">) {
+  return !isPathInsideWorkspace(file.path, projectStore.workingDir);
+}
+
+function showLocalFileBoundaryWarning() {
+  notificationStore.addNotice("warning", t("chat.fileRefs.boundaryOffWarning"), {
+    operation: LOCAL_FILE_BOUNDARY_WARNING_OPERATION,
+    replaceOperation: true,
+    ttl: 8000,
+  });
+}
+
+async function warnIfFileBoundaryAllowsExternalFiles(files: LocalFileAttachment[]) {
+  if (!files.some(isExternalLocalFile)) return;
+
+  const cachedBoundary = getCachedFileToolWorkspaceBoundary();
+  if (cachedBoundary === false) {
+    showLocalFileBoundaryWarning();
+    return;
+  }
+  if (cachedBoundary === true) return;
+
+  try {
+    const boundaryEnabled = await getFileToolWorkspaceBoundary();
+    if (!boundaryEnabled) {
+      showLocalFileBoundaryWarning();
+    }
+  } catch {
+    // Settings load failures are surfaced from the settings panel; this warning only reflects known state.
+  }
+}
+
+function addLocalFileAttachments(files: LocusFileDropRef[]) {
+  const normalized = files
+    .map((file) => normalizeLocalFileAttachment(file))
+    .filter((file): file is LocalFileAttachment => !!file);
+  if (normalized.length === 0) return;
+  localFileAttachments.value = dedupeLocalFileAttachments([
+    ...localFileAttachments.value,
+    ...normalized,
+  ]);
+  if (!shouldGroupLocalFiles.value) {
+    closeLocalFileDetails();
+  }
+  void warnIfFileBoundaryAllowsExternalFiles(normalized);
+  nextTick(() => composerRef.value?.focus());
+}
+
+function removeLocalFileAttachment(index: number) {
+  const next = [...localFileAttachments.value];
+  next.splice(index, 1);
+  localFileAttachments.value = next;
+  if (next.length <= 1) {
+    closeLocalFileDetails();
+  }
+}
+
+function clearLocalFileAttachments() {
+  localFileAttachments.value = [];
+  closeLocalFileDetails();
+}
+
+function localFileDisplayName(file: Pick<LocalFileAttachment, "path" | "name">) {
+  if (file.name?.trim()) return file.name.trim();
+  const normalized = file.path.replace(/\\/g, "/").replace(/\/+$/, "");
+  return normalized.split("/").filter(Boolean).pop() || normalized;
+}
+
+function toggleLocalFileDetails() {
+  if (!shouldGroupLocalFiles.value) return;
+  showCommandPopup.value = false;
+  closeMentionPopup();
+  closeAssetRefDetails();
+  closeConsoleTextDetails();
+  showLocalFileDetails.value = !showLocalFileDetails.value;
+}
+
+function closeLocalFileDetails() {
+  showLocalFileDetails.value = false;
+}
+
 function toggleConsoleTextDetails() {
   if (consoleTextAttachments.value.length === 0) return;
   showCommandPopup.value = false;
   closeMentionPopup();
   closeAssetRefDetails();
+  closeLocalFileDetails();
   showConsoleTextDetails.value = !showConsoleTextDetails.value;
 }
 
@@ -1205,6 +1360,35 @@ function appendConsoleTextDisplayBlock(text: string, items: ConsoleTextAttachmen
   return text.trim() ? `${text}\n\n${block}` : block;
 }
 
+function buildLocalFilesPromptBlock(files: LocalFileAttachment[]) {
+  if (files.length === 0) return "";
+  const lines = files.map((file) => {
+    const kind = file.isDir ? "folder" : "file";
+    const type = file.typeLabel ? `; type: ${file.typeLabel}` : "";
+    return `- ${kind}: \`${file.path}\`${type}`;
+  });
+  return `<locus-local-files>\nThese are local paths supplied by drag and drop. Read contents only when needed, using \`read\` for files and \`list\` for folders.\n${lines.join("\n")}\n</locus-local-files>`;
+}
+
+function appendLocalFilesPromptBlock(text: string, files: LocalFileAttachment[]) {
+  const block = buildLocalFilesPromptBlock(files);
+  if (!block) return text;
+  return text.trim() ? `${text}\n\n${block}` : block;
+}
+
+function buildLocalFilesDisplayBlock(files: LocalFileAttachment[]) {
+  if (files.length === 0) return "";
+  return files
+    .map((file) => t("chat.fileRefs.displayLine", localFileDisplayName(file)))
+    .join("\n");
+}
+
+function appendLocalFilesDisplayBlock(text: string, files: LocalFileAttachment[]) {
+  const block = buildLocalFilesDisplayBlock(files);
+  if (!block) return text;
+  return text.trim() ? `${text}\n\n${block}` : block;
+}
+
 function buildAssetRefsPromptBlock(assetRefs: AssetRefAttachment[]) {
   if (assetRefs.length === 0) return "";
   const lines = assetRefs.map((assetRef) => {
@@ -1228,6 +1412,7 @@ function resetDraft() {
   pastedContent.value = "";
   imageAttachments.value = [];
   clearConsoleTextAttachments();
+  clearLocalFileAttachments();
   setAssetRefAttachments([]);
   closeImagePreview();
   composerIntent.value = emptyComposerIntent();
@@ -1276,6 +1461,7 @@ function canExecuteActionCommand(): boolean {
     && imageAttachments.value.length === 0
     && assetRefAttachments.value.length === 0
     && consoleTextAttachments.value.length === 0
+    && localFileAttachments.value.length === 0
     && !hasComposerIntent(composerIntent.value);
 }
 
@@ -1340,6 +1526,7 @@ function handleSend() {
     : [];
   const assetRefs = dedupeAssetRefs([...assetRefAttachments.value, ...inlineAssetRefs.assetRefs]);
   const consoleTexts = [...consoleTextAttachments.value];
+  const localFiles = [...localFileAttachments.value];
 
   if (
     !cleanedInput
@@ -1347,6 +1534,7 @@ function handleSend() {
     && images.length === 0
     && assetRefs.length === 0
     && consoleTexts.length === 0
+    && localFiles.length === 0
   ) {
     if (hasComposerIntent(mergedIntent)) {
       showUserIntentMissingInputNotice();
@@ -1359,8 +1547,12 @@ function handleSend() {
     : cleanedInput;
 
   const textWithConsole = appendConsoleTextPromptBlock(text, consoleTexts);
-  const sendText = appendAssetRefsPromptBlock(textWithConsole, assetRefs);
-  const displayText = appendConsoleTextDisplayBlock(text, consoleTexts);
+  const textWithLocalFiles = appendLocalFilesPromptBlock(textWithConsole, localFiles);
+  const sendText = appendAssetRefsPromptBlock(textWithLocalFiles, assetRefs);
+  const displayText = appendLocalFilesDisplayBlock(
+    appendConsoleTextDisplayBlock(text, consoleTexts),
+    localFiles,
+  );
   const payload = buildSendPayload(sendText, images, assetRefs, mergedIntent, displayText);
   resetDraft();
   emit("send", payload);
@@ -1541,18 +1733,24 @@ function handleDocumentKeydown(event: KeyboardEvent) {
   if (event.key === "Escape" && showConsoleTextDetails.value) {
     closeConsoleTextDetails();
   }
+  if (event.key === "Escape" && showLocalFileDetails.value) {
+    closeLocalFileDetails();
+  }
 }
 
 function handleDocumentMouseDown(event: MouseEvent) {
-  if (!showAssetRefDetails.value && !showConsoleTextDetails.value) return;
+  if (!showAssetRefDetails.value && !showConsoleTextDetails.value && !showLocalFileDetails.value) return;
   const target = event.target instanceof Node ? event.target : null;
   if (!target) return;
   if (assetRefGroupRootRef.value?.contains(target)) return;
   if (assetRefDetailsRootRef.value?.contains(target)) return;
   if (consoleTextGroupRootRef.value?.contains(target)) return;
   if (consoleTextDetailsRootRef.value?.contains(target)) return;
+  if (localFileGroupRootRef.value?.contains(target)) return;
+  if (localFileDetailsRootRef.value?.contains(target)) return;
   closeAssetRefDetails();
   closeConsoleTextDetails();
+  closeLocalFileDetails();
 }
 
 function openPasteEditor() {
@@ -1642,6 +1840,7 @@ watch(shouldCollapseAssetRefs, (collapsed) => {
 onMounted(() => {
   unityAssetDropSubscriptionDisposed = false;
   unityTextDropSubscriptionDisposed = false;
+  locusFileDropSubscriptionDisposed = false;
   setupAssetRefSync();
   document.addEventListener("keydown", handleDocumentKeydown);
   document.addEventListener("mousedown", handleDocumentMouseDown);
@@ -1671,11 +1870,25 @@ onMounted(() => {
     .catch((error) => {
       console.warn("[Locus] Unity text drop subscription failed:", error);
     });
+  subscribeLocusFileDrop((payload) => {
+    addLocalFileAttachments(payload.files ?? []);
+  })
+    .then((release) => {
+      if (locusFileDropSubscriptionDisposed) {
+        release();
+        return;
+      }
+      releaseLocusFileDrop = release;
+    })
+    .catch((error) => {
+      console.warn("[Locus] local file drop subscription failed:", error);
+    });
 });
 
 onUnmounted(() => {
   unityAssetDropSubscriptionDisposed = true;
   unityTextDropSubscriptionDisposed = true;
+  locusFileDropSubscriptionDisposed = true;
   document.removeEventListener("keydown", handleDocumentKeydown);
   document.removeEventListener("mousedown", handleDocumentMouseDown);
   teardownAssetRefSync();
@@ -1683,6 +1896,8 @@ onUnmounted(() => {
   releaseUnityAssetDrop = null;
   releaseUnityTextDrop?.();
   releaseUnityTextDrop = null;
+  releaseLocusFileDrop?.();
+  releaseLocusFileDrop = null;
   clearMentionDebounce();
   invalidateMentionRequests();
 });
@@ -1852,6 +2067,51 @@ defineExpose({
           </div>
         </div>
       </Transition>
+
+      <Transition name="asset-ref-details-popover">
+        <div
+          v-if="showLocalFileDetails && shouldGroupLocalFiles"
+          ref="localFileDetailsRootRef"
+          class="local-file-details-popover"
+          role="dialog"
+          :aria-label="t('chat.fileRefs.detailsTitle', localFileAttachments.length)"
+        >
+          <div class="asset-ref-details-header">
+            <span class="asset-ref-details-title">{{ t("chat.fileRefs.detailsTitle", localFileAttachments.length) }}</span>
+            <button
+              type="button"
+              class="asset-ref-details-close ui-select-none"
+              :aria-label="t('common.close')"
+              @click="closeLocalFileDetails"
+            >
+              <LucideIcon :icon="X" :size="14" />
+            </button>
+          </div>
+          <div class="local-file-details-list">
+            <div
+              v-for="(file, index) in localFileAttachments"
+              :key="file.path"
+              class="local-file-detail-row"
+            >
+              <div class="local-file-detail-copy">
+                <span class="local-file-detail-name">{{ localFileDisplayName(file) }}</span>
+                <span class="local-file-detail-path">{{ file.path }}</span>
+              </div>
+              <span class="local-file-detail-type">
+                {{ file.isDir ? t("chat.fileRefs.folder") : (file.typeLabel || t("chat.fileRefs.file")) }}
+              </span>
+              <button
+                type="button"
+                class="asset-ref-details-close local-file-detail-remove ui-select-none"
+                :aria-label="t('chat.fileRefs.remove')"
+                @click="removeLocalFileAttachment(index)"
+              >
+                <LucideIcon :icon="X" :size="13" />
+              </button>
+            </div>
+          </div>
+        </div>
+      </Transition>
     </template>
 
     <ChatComposer
@@ -1903,6 +2163,53 @@ defineExpose({
               :aria-label="t('chat.consoleRefs.clear')"
               :title="t('chat.consoleRefs.clear')"
               @click.stop="clearConsoleTextAttachments"
+            >
+              <LucideIcon :icon="X" :size="13" />
+            </button>
+          </div>
+          <div
+            v-if="shouldGroupLocalFiles"
+            ref="localFileGroupRootRef"
+            class="local-file-group"
+          >
+            <button
+              type="button"
+              class="local-file-group-button ui-select-none"
+              :class="{ 'is-open': showLocalFileDetails }"
+              :aria-expanded="showLocalFileDetails"
+              :title="t('chat.fileRefs.groupOpen')"
+              @click.stop="toggleLocalFileDetails"
+            >
+              <LucideIcon class="asset-ref-group-icon" :icon="FileText" :size="14" />
+              <span class="asset-ref-group-title">{{ t("chat.fileRefs.groupLabel", localFileAttachments.length) }}</span>
+              <span v-if="localFilePreview" class="asset-ref-group-preview">{{ localFilePreview }}</span>
+            </button>
+            <button
+              type="button"
+              class="asset-ref-group-remove ui-select-none"
+              :aria-label="t('chat.fileRefs.clear')"
+              :title="t('chat.fileRefs.clear')"
+              @click.stop="clearLocalFileAttachments"
+            >
+              <LucideIcon :icon="X" :size="13" />
+            </button>
+          </div>
+          <div
+            v-else-if="singleLocalFileAttachment"
+            class="local-file-chip"
+            :title="singleLocalFileAttachment.path"
+          >
+            <LucideIcon class="local-file-chip-icon" :icon="FileText" :size="14" />
+            <span class="local-file-chip-name">{{ localFileDisplayName(singleLocalFileAttachment) }}</span>
+            <span class="local-file-chip-meta">
+              {{ singleLocalFileAttachment.isDir ? t("chat.fileRefs.folder") : (singleLocalFileAttachment.typeLabel || t("chat.fileRefs.file")) }}
+            </span>
+            <button
+              type="button"
+              class="local-file-chip-remove ui-select-none"
+              :aria-label="t('chat.fileRefs.remove')"
+              :title="t('chat.fileRefs.remove')"
+              @click.stop="removeLocalFileAttachment(0)"
             >
               <LucideIcon :icon="X" :size="13" />
             </button>
@@ -1982,16 +2289,23 @@ defineExpose({
               <span class="composer-badge-remove">&times;</span>
             </button>
             <div v-if="showSkillBadges && composerSkillBadges.length > 0" class="composer-badge-row">
-              <button
+              <span
                 v-for="badge in composerSkillBadges"
                 :key="badge.key"
-                type="button"
                 class="composer-badge skill ui-select-none"
-                @click="badge.skill ? removeSkillBadge(badge.skill) : undefined"
               >
-                <span>{{ badge.label }}</span>
-                <span class="composer-badge-remove">&times;</span>
-              </button>
+                <span class="composer-badge-mark">SKILL</span>
+                <span class="composer-badge-divider"></span>
+                <span class="composer-badge-text">{{ badge.label }}</span>
+                <button
+                  type="button"
+                  class="composer-badge-remove"
+                  :aria-label="`移除 Skill ${badge.label}`"
+                  @click="badge.skill ? removeSkillBadge(badge.skill) : undefined"
+                >
+                  &times;
+                </button>
+              </span>
             </div>
           </div>
           <div v-if="hasHeaderEnd" class="composer-header-end">
@@ -2422,7 +2736,8 @@ defineExpose({
   color: var(--status-error-fg, var(--text-color));
 }
 
-.asset-ref-group {
+.asset-ref-group,
+.local-file-group {
   flex: 0 0 auto;
   display: inline-flex;
   align-items: stretch;
@@ -2432,6 +2747,20 @@ defineExpose({
   border: 1px solid color-mix(in srgb, var(--border-color) 88%, transparent);
   border-radius: 7px;
   background: color-mix(in srgb, var(--panel-bg) 70%, var(--input-bg) 30%);
+}
+
+.local-file-chip {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  max-width: min(300px, calc(100vw - 96px));
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--border-color) 88%, transparent);
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--panel-bg) 70%, var(--input-bg) 30%);
+  color: var(--text-color);
 }
 
 .console-text-group {
@@ -2446,7 +2775,8 @@ defineExpose({
   background: color-mix(in srgb, var(--panel-bg) 70%, var(--input-bg) 30%);
 }
 
-.asset-ref-group-button {
+.asset-ref-group-button,
+.local-file-group-button {
   min-width: 0;
   display: inline-flex;
   align-items: center;
@@ -2474,14 +2804,18 @@ defineExpose({
 
 .asset-ref-group-button:hover,
 .asset-ref-group-button.is-open,
+.local-file-group-button:hover,
+.local-file-group-button.is-open,
 .console-text-group-button:hover,
 .console-text-group-button.is-open {
   background: color-mix(in srgb, var(--hover-bg) 82%, var(--panel-bg) 18%);
 }
 
 .asset-ref-group-button:focus-visible,
+.local-file-group-button:focus-visible,
 .console-text-group-button:focus-visible,
 .asset-ref-group-remove:focus-visible,
+.local-file-chip-remove:focus-visible,
 .asset-ref-details-close:focus-visible {
   outline: 1px solid var(--accent-color);
   outline-offset: -1px;
@@ -2492,10 +2826,32 @@ defineExpose({
   color: var(--text-secondary);
 }
 
+.local-file-chip-icon {
+  flex: 0 0 auto;
+  margin-left: 8px;
+  color: var(--text-secondary);
+}
+
 .asset-ref-group-title {
   flex: 0 0 auto;
   font-size: 12px;
   font-weight: 600;
+  white-space: nowrap;
+}
+
+.local-file-chip-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.local-file-chip-meta {
+  flex: 0 0 auto;
+  color: var(--text-secondary);
+  font-size: 11px;
   white-space: nowrap;
 }
 
@@ -2531,7 +2887,27 @@ defineExpose({
   cursor: pointer;
 }
 
+.local-file-chip-remove {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 100%;
+  padding: 0;
+  border: none;
+  border-left: 1px solid color-mix(in srgb, var(--border-color) 82%, transparent);
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
 .asset-ref-group-remove:hover {
+  color: var(--status-error-fg, var(--text-color));
+  background: color-mix(in srgb, var(--status-error-bg, var(--hover-bg)) 76%, transparent);
+}
+
+.local-file-chip-remove:hover {
   color: var(--status-error-fg, var(--text-color));
   background: color-mix(in srgb, var(--status-error-bg, var(--hover-bg)) 76%, transparent);
 }
@@ -2553,7 +2929,8 @@ defineExpose({
   box-shadow: 0 -4px 16px rgba(0, 0, 0, 0.14);
 }
 
-.console-text-details-popover {
+.console-text-details-popover,
+.local-file-details-popover {
   position: absolute;
   left: 0;
   bottom: 100%;
@@ -2568,6 +2945,10 @@ defineExpose({
   border-radius: 10px;
   background: var(--surface-elevated, var(--panel-bg));
   box-shadow: 0 -4px 16px rgba(0, 0, 0, 0.14);
+}
+
+.local-file-details-popover {
+  width: min(680px, calc(100vw - 32px));
 }
 
 .asset-ref-details-header {
@@ -2619,11 +3000,68 @@ defineExpose({
   padding: 4px;
 }
 
-.console-text-details-list {
+.console-text-details-list,
+.local-file-details-list {
   flex: 1 1 auto;
   min-height: 0;
   overflow: auto;
   padding: 4px;
+}
+
+.local-file-detail-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 34px;
+  padding: 4px 4px 4px 8px;
+  border-radius: 7px;
+}
+
+.local-file-detail-row:hover {
+  background: var(--hover-bg);
+}
+
+.local-file-detail-copy {
+  min-width: 0;
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.local-file-detail-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text-color);
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.local-file-detail-path {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text-secondary);
+  font-family: var(--font-mono-identifier);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.local-file-detail-type {
+  flex: 0 0 auto;
+  max-width: 90px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text-secondary);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.local-file-detail-remove {
+  width: 22px;
+  height: 22px;
 }
 
 .console-text-detail-item {
@@ -3159,15 +3597,74 @@ defineExpose({
 }
 
 .composer-badge.skill {
+  display: inline-grid;
+  grid-template-columns: auto 1px minmax(0, auto) auto;
+  align-items: stretch;
+  gap: 0;
+  height: 28px;
+  min-height: 28px;
+  padding: 0;
+  overflow: hidden;
+  color: var(--text-color);
+  border-color: color-mix(in srgb, var(--accent-color) 26%, var(--border-color));
+  background: color-mix(in srgb, var(--panel-bg) 72%, var(--input-bg) 28%);
+  cursor: default;
+  line-height: 1;
+}
+
+.composer-badge-mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 42px;
+  padding: 0 8px;
   color: var(--accent-color);
-  border-color: color-mix(in srgb, var(--accent-color) 24%, transparent);
-  background: color-mix(in srgb, var(--accent-color) 14%, transparent);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  line-height: 1;
+}
+
+.composer-badge-divider {
+  align-self: stretch;
+  width: 1px;
+  background: color-mix(in srgb, var(--accent-color) 22%, var(--border-color));
+}
+
+.composer-badge-text {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 0;
+  max-width: 180px;
+  padding: 0 8px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1;
 }
 
 .composer-badge-remove {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  padding: 0 6px 0 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  box-shadow: none;
   font-size: 14px;
   line-height: 1;
   opacity: 0.7;
+}
+
+.composer-badge-remove:hover {
+  color: var(--text-color);
+  opacity: 1;
 }
 
 .composer-top-badge {

@@ -9,7 +9,7 @@ function read(relPath: string) {
 }
 
 describe("app update prompt", () => {
-  it("checks the update manifest during startup and renders a root modal linked to the docs current-version page", () => {
+  it("checks the update manifest during startup and renders a root modal linked to the GitHub release page", () => {
     const app = read("src/App.vue");
     const modal = read("src/components/AppUpdateModal.vue");
     const store = read("src/stores/appUpdate.ts");
@@ -21,8 +21,8 @@ describe("app update prompt", () => {
     expect(app).toContain('import { useAppUpdateStore } from "./stores/appUpdate"');
     expect(app).toContain("void appUpdateStore.checkForUpdates({ silent: true });");
     expect(app).toContain("<AppUpdateModal");
-    expect(app).toContain('@view="openAppUpdateDownload"');
-    expect(app).toContain("await openUrl(updateInfo.downloadUrl);");
+    expect(app).toContain('@view="openAppUpdateRelease"');
+    expect(app).toContain("await openUrl(updateInfo.releaseUrl);");
     expect(app).toContain('t("app.update.openFailed", err.message)');
     expect(modal).toContain('t("app.update.downloadPackage")');
     expect(modal).toContain('t("app.update.currentVersion")');
@@ -43,6 +43,7 @@ describe("app update prompt", () => {
     expect(service).toContain('const DOCS_BASE_URL = "https://unity.farlocus.com";');
     expect(service).toContain("sourceBaseUrl = DOCS_BASE_URL");
     expect(service).toContain("selectInstaller");
+    expect(service).toContain("resolveGitHubReleaseUrl");
     expect(service).toContain('"fetch_app_update_manifest"');
     expect(zh).toContain('"settings.about.versionSourceLocal": "本地服务器 ({0})"');
     expect(en).toContain('"settings.about.versionSourceLocal": "Local server ({0})"');

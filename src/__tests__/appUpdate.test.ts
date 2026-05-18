@@ -107,6 +107,7 @@ describe("resolveAppUpdateInfo", () => {
         latestVersion: "0.2.0",
         title: "发现新版本",
         changelogUrl: "https://unity.farlocus.com/overview/latest-version",
+        releaseUrl: "https://github.com/r1n7aro/Locus/releases/tag/v0.2.0",
         downloadUrl: "https://github.com/r1n7aro/Locus/releases/download/v0.2.0/locus_0.2.0_x64-setup.exe",
         downloadLabel: "Windows x64",
         sourceKind: "remote",
@@ -120,6 +121,27 @@ describe("resolveAppUpdateInfo", () => {
 
     expect(info?.title).toBe("Update available");
     expect(info?.changes[0]?.title).toBe("Added");
+  });
+
+  it("resolves the browser update target to the GitHub release page", () => {
+    const info = resolveAppUpdateInfo({
+      ...manifest,
+      installers: [],
+      locales: {
+        zh: {
+          ...manifest.locales.zh,
+          downloadChannels: [
+            {
+              label: "Windows x64",
+              url: "https://github.com/r1n7aro/Locus/releases/download/v0.2.0/locus_0.2.0_x64-setup.exe",
+            },
+          ],
+        },
+      },
+    }, "0.1.0", "zh");
+
+    expect(info?.releaseUrl).toBe("https://github.com/r1n7aro/Locus/releases/tag/v0.2.0");
+    expect(info?.downloadUrl).toBe("https://unity.farlocus.com/overview/latest-version");
   });
 
   it("skips the dialog when the local build is already current", () => {

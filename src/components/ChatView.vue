@@ -68,8 +68,13 @@ import {
   getChatSubmitModifierLabel,
   useChatInputSettings,
 } from "../composables/useChatInputSettings";
+import { useKnowledgeAccessMode } from "../composables/useKnowledgeAccessMode";
 import { logToolCollapseTrace, previewTraceText } from "../services/toolCollapseTrace";
-import { recordLayoutDiagnostic } from "../services/layoutDiagnostics";
+import {
+  captureTranscriptLayoutSnapshot,
+  recordLayoutDiagnostic,
+  traceViewportAnchorSample,
+} from "../services/layoutDiagnostics";
 
 type ChatLayoutMode = "auto" | "horizontal" | "vertical";
 type ResolvedChatLayoutMode = "horizontal" | "vertical";
@@ -80,6 +85,7 @@ const uiStore = useUiStore();
 const notificationStore = useNotificationStore();
 const { state: shortcutState } = useKeyboardShortcuts();
 const { state: chatInputSettings } = useChatInputSettings();
+const { state: knowledgeAccessState, setMode: setKnowledgeAccessMode } = useKnowledgeAccessMode();
 
 const isPlanStreaming = computed(() => !!chatStore.pendingPlanRun && props.isStreaming);
 const isPlanDone = computed(() => !!chatStore.pendingPlanRun && !props.isStreaming);
@@ -319,6 +325,7 @@ const assetRefContextCanSelectInUnity = computed(() => {
   if (target.kind !== "asset") return false;
   return shouldSelectUnityAsset(target.assetPath);
 });
+const knowledgeAccessMode = computed(() => knowledgeAccessState.mode);
 
 const assetRefContextIsKnowledge = computed(() =>
   assetRefCtxMenu.value?.target.kind === "knowledge",
@@ -1058,6 +1065,20 @@ function getMessagesContentElement() {
   return transcriptRef.value?.getContentElement?.() ?? null;
 }
 
+function traceToolViewportAnchor(phase: string, anchor: HTMLElement | null | undefined, detail: Record<string, unknown> = {}) {
+  traceViewportAnchorSample({
+    scope: "chat-view",
+    phase,
+    scrollElement: getMessagesElement(),
+    contentElement: getMessagesContentElement(),
+    anchor,
+    detail: {
+      sessionId: props.activeSessionId ?? "",
+      ...detail,
+    },
+  });
+}
+
 function handleBottomPanelWheel(event: WheelEvent) {
   forwardWheelToElement(event, getMessagesElement());
 }
@@ -1122,12 +1143,34 @@ function restoreToolViewportAnchor() {
   const el = getMessagesElement();
   if (!anchorState || !el) return false;
   if (!el.contains(anchorState.anchor)) {
+    traceToolViewportAnchor("restore:anchor-disconnected", anchorState.anchor);
     clearToolViewportAnchor();
     return false;
   }
 
+  const before = captureTranscriptLayoutSnapshot("chat-view", "toolViewportAnchorRestore", el, getMessagesContentElement());
   suppressScrollCapture = true;
+  const scrollTopBefore = el.scrollTop;
   const restored = restoreLiveScrollAnchor(el, anchorState);
+  traceViewportAnchorSample({
+    scope: "chat-view",
+    phase: "restore",
+    scrollElement: el,
+    contentElement: getMessagesContentElement(),
+    anchor: anchorState.anchor,
+    anchorState: {
+      offsetTop: anchorState.offsetTop,
+      fallbackScrollTop: anchorState.fallbackScrollTop,
+    },
+    restored,
+    before,
+    detail: {
+      sessionId: props.activeSessionId ?? "",
+      scrollTopBefore,
+      scrollTopAfter: el.scrollTop,
+      scrollDelta: el.scrollTop - scrollTopBefore,
+    },
+  });
   if (restored && props.activeSessionId) {
     chatStore.rememberSessionScrollState(props.activeSessionId, captureCurrentSessionScrollState(el));
   }
@@ -1151,17 +1194,36 @@ function handleToolViewportAnchorStart(anchor: HTMLElement) {
   streamEndScrollScheduler.cancel();
   clearToolViewportAnchorFrame();
   activeToolViewportAnchor = captureLiveScrollAnchor(el, anchor);
+  traceViewportAnchorSample({
+    scope: "chat-view",
+    phase: "start",
+    scrollElement: el,
+    contentElement: getMessagesContentElement(),
+    anchor,
+    anchorState: activeToolViewportAnchor
+      ? {
+          offsetTop: activeToolViewportAnchor.offsetTop,
+          fallbackScrollTop: activeToolViewportAnchor.fallbackScrollTop,
+        }
+      : null,
+    detail: {
+      sessionId: props.activeSessionId ?? "",
+    },
+  });
   restoreToolViewportAnchor();
 }
 
 function handleToolViewportAnchorEnd(anchor: HTMLElement) {
   if (!activeToolViewportAnchor || activeToolViewportAnchor.anchor !== anchor) return;
 
+  traceToolViewportAnchor("end:before-restore", anchor);
   restoreToolViewportAnchor();
   clearToolViewportAnchorFrame();
   toolViewportAnchorFrame = requestViewportFrame(() => {
     toolViewportAnchorFrame = 0;
+    traceToolViewportAnchor("end:frame-before-restore", anchor);
     restoreToolViewportAnchor();
+    traceToolViewportAnchor("end:frame-after-restore", anchor);
     activeToolViewportAnchor = null;
   });
 }
@@ -1987,9 +2049,12 @@ onUnmounted(() => {
             :is-unity-project="isUnityProject"
             :scan-phase="scanPhase"
             :last-scan-stats="lastScanStats"
+            :knowledge-access-mode="knowledgeAccessMode"
+            :selected-agent-id="selectedAgentId"
             @start-scan="emit('startScan')"
             @install-plugin="emit('installPlugin')"
             @launch-unity-project="emit('launchUnityProject')"
+            @update-knowledge-access-mode="setKnowledgeAccessMode"
           />
         </div>
         <div class="input-backdrop-action">

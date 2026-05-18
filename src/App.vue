@@ -15,6 +15,7 @@ import { useChatStore } from "./stores/chat";
 import { useNotificationStore } from "./stores/notification";
 import { useAppUpdateStore } from "./stores/appUpdate";
 import { useAppBootstrap } from "./composables/useAppBootstrap";
+import { useUnityAssetDropTarget } from "./composables/useUnityAssetDropTarget";
 import { knowledgeGetEmbeddingStatus } from "./services/knowledge";
 
 import TopBannerHost from "./components/TopBannerHost.vue";
@@ -100,6 +101,12 @@ let knowledgeRuntimeStartupPollsRemaining = 0;
 // -- Diff overlay provider (must be called in App setup so all children can inject) --
 const diffOverlay = provideDiffOverlay();
 const { bootstrapCritical, bootstrapDeferred, preloadTabsInBackground, registerListeners, cleanup, applyWorkingDir, closeSettings, onOnboardingCompleted } = useAppBootstrap();
+const {
+  handleUnityAssetDrag: handleMainUnityAssetDrag,
+  handleUnityAssetDrop: handleMainUnityAssetDrop,
+} = useUnityAssetDropTarget({
+  enabled: () => !isStandaloneWindow,
+});
 
 function createLazyViewState(
   loader: () => Promise<{ default: Component }>,
@@ -427,18 +434,18 @@ function closeAppUpdateModal() {
   appUpdateStore.dismissDialog();
 }
 
-async function openAppUpdateDownload() {
+async function openAppUpdateRelease() {
   const updateInfo = appUpdateStore.updateInfo;
   if (!updateInfo) return;
 
   try {
-    await openUrl(updateInfo.downloadUrl);
+    await openUrl(updateInfo.releaseUrl);
     appUpdateStore.dismissDialog();
   } catch (error) {
     const err = normalizeAppError(error);
     notificationStore.addNotice("error", t("app.update.openFailed", err.message), {
       code: err.code,
-      operation: "openAppUpdateDownload",
+      operation: "openAppUpdateRelease",
       skipConsoleLog: true,
     });
   }
@@ -611,6 +618,9 @@ watch(() => projectStore.workingDir, () => {
     :style="appLayoutStyle"
     v-else-if="authStore.authChecked"
     @contextmenu.prevent
+    @dragenter.capture="handleMainUnityAssetDrag"
+    @dragover.capture="handleMainUnityAssetDrag"
+    @drop.capture="handleMainUnityAssetDrop"
   >
     <div class="main-area">
       <div class="tab-bar" @pointerdown="onTabBarPointerDown">
@@ -852,7 +862,7 @@ watch(() => projectStore.workingDir, () => {
     :open="showAppUpdateModal"
     :info="appUpdateStore.updateInfo"
     @close="closeAppUpdateModal"
-    @view="openAppUpdateDownload"
+    @view="openAppUpdateRelease"
   />
   <Transition name="workspace-switch-modal">
     <div

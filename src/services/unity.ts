@@ -101,6 +101,18 @@ export interface UnityEmbedTextDropPayload {
   source?: string;
 }
 
+export interface LocusFileDropRef {
+  path: string;
+  name?: string;
+  typeLabel?: string;
+  isDir: boolean;
+  source?: string;
+}
+
+export interface LocusFileDropPayload {
+  files: LocusFileDropRef[];
+}
+
 export interface UnityEmbedAssetDragStatePayload {
   hasRefs: boolean;
   refs: AssetRefAttachment[];
@@ -120,6 +132,14 @@ export function subscribeUnityEmbedTextDrop(
   const runtime = getLocusRuntime();
   if (runtime.kind !== "tauri") return Promise.resolve(() => {});
   return runtime.subscribe<UnityEmbedTextDropPayload>("unity-embed-text-drop", handler);
+}
+
+export function subscribeLocusFileDrop(
+  handler: (payload: LocusFileDropPayload) => void,
+): Promise<() => void> {
+  const runtime = getLocusRuntime();
+  if (runtime.kind !== "tauri") return Promise.resolve(() => {});
+  return runtime.subscribe<LocusFileDropPayload>("locus-file-drop", handler);
 }
 
 export function subscribeUnityEmbedAssetDragState(

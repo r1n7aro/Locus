@@ -112,20 +112,41 @@ function detectMentionOperator(text: string, safeCursor: number): ActiveOperator
   };
 }
 
-function isIntentMeta(value: unknown): value is UserIntentMeta {
-  if (!value || typeof value !== "object") return false;
+function normalizeSkillSource(source: unknown): SkillIntentItem["source"] | null {
+  if (source === "app" || source === "builtin" || source === "builtIn") return "app";
+  if (source === "project") return "project";
+  return null;
+}
+
+function normalizeIntentMeta(value: unknown): UserIntentMeta | null {
+  if (!value || typeof value !== "object") return null;
   const meta = value as Partial<UserIntentMeta>;
-  if (meta.kind !== "user_intent_v1") return false;
-  if (meta.mode !== "build" && meta.mode !== "plan") return false;
-  if (!Array.isArray(meta.skills)) return false;
-  if (meta.clientMessageId !== undefined && typeof meta.clientMessageId !== "string") return false;
-  return meta.skills.every((skill) =>
-    !!skill
-    && typeof skill === "object"
-    && typeof (skill as SkillIntentItem).dirName === "string"
-    && typeof (skill as SkillIntentItem).name === "string"
-    && ((skill as SkillIntentItem).source === "app" || (skill as SkillIntentItem).source === "project"),
-  );
+  if (meta.kind !== "user_intent_v1") return null;
+  if (meta.mode !== "build" && meta.mode !== "plan") return null;
+  if (!Array.isArray(meta.skills)) return null;
+  if (meta.clientMessageId !== undefined && typeof meta.clientMessageId !== "string") return null;
+
+  const skills: SkillIntentItem[] = [];
+  for (const skill of meta.skills) {
+    if (!skill || typeof skill !== "object") return null;
+    const candidate = skill as SkillIntentItem;
+    const source = normalizeSkillSource(candidate.source);
+    if (!source || typeof candidate.dirName !== "string" || typeof candidate.name !== "string") {
+      return null;
+    }
+    skills.push({
+      dirName: candidate.dirName,
+      source,
+      name: candidate.name,
+    });
+  }
+
+  return {
+    kind: "user_intent_v1",
+    mode: meta.mode,
+    skills,
+    clientMessageId: meta.clientMessageId,
+  };
 }
 
 export function emptyComposerIntent(): ComposerIntentState {
@@ -184,14 +205,14 @@ export function parseUserIntentMeta(raw: string | undefined | null): UserIntentM
   if (!raw) return null;
   try {
     const parsed = JSON.parse(raw);
-    return isIntentMeta(parsed) ? parsed : null;
+    return normalizeIntentMeta(parsed);
   } catch {
     return null;
   }
 }
 
 export function hydrateChatMessageIntent(message: ChatMessage): ChatMessage {
-  const intentMeta = parseUserIntentMeta(message.thinkingSignature);
+  const intentMeta = normalizeIntentMeta(message.intentMeta) ?? parseUserIntentMeta(message.thinkingSignature);
   if (!intentMeta) return message;
   return {
     ...message,

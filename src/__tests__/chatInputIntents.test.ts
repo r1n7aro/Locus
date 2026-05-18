@@ -3,6 +3,7 @@ import {
   detectActiveOperator,
   insertInlineMention,
   parseInlineIntentCommands,
+  parseUserIntentMeta,
   type CommandDef,
 } from "../composables/chatInputIntents";
 
@@ -145,6 +146,26 @@ describe("parseInlineIntentCommands", () => {
 
     expect(result.blockedCommand?.name).toBe("/plan");
     expect(result.cleanedText).toBe("请先 /plan 看一下");
+  });
+});
+
+describe("parseUserIntentMeta", () => {
+  it("normalizes legacy builtin skill sources to app", () => {
+    const parsed = parseUserIntentMeta(JSON.stringify({
+      kind: "user_intent_v1",
+      mode: "build",
+      skills: [{
+        dirName: "create-skill",
+        source: "builtin",
+        name: "Create Skill",
+      }],
+    }));
+
+    expect(parsed?.skills).toEqual([{
+      dirName: "create-skill",
+      source: "app",
+      name: "Create Skill",
+    }]);
   });
 });
 

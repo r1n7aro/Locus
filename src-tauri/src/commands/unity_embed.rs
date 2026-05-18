@@ -10,6 +10,11 @@ use crate::error::AppError;
 use crate::workspace::Workspace;
 
 const WINDOW_LABEL: &str = "unity-embed";
+const MAIN_WINDOW_LABEL: &str = "main";
+const ASSET_DROP_EVENT: &str = "unity-embed-asset-drop";
+const TEXT_DROP_EVENT: &str = "unity-embed-text-drop";
+const ASSET_DRAG_STATE_EVENT: &str = "unity-embed-asset-drag-state";
+const FILE_DROP_EVENT: &str = "locus-file-drop";
 const CONTROL_PIPE_NAME_PREFIX: &str = r"\\.\pipe\locus_tauri_unity_embed_";
 const EMBED_URL: &str = "/unity-embed?host=tauri-overlay";
 const CLOSE_REASON_DOMAIN_RELOAD: &str = "domainReload";
@@ -87,6 +92,24 @@ struct UnityEmbedTextDropPayload {
     title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     source: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocusFileDropRef {
+    path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    type_label: Option<String>,
+    is_dir: bool,
+    source: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocusFileDropPayload {
+    files: Vec<LocusFileDropRef>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -399,7 +422,7 @@ pub(crate) fn handle_unity_embed_webview_event(
     webview: &tauri::Webview,
     event: &tauri::WebviewEvent,
 ) {
-    if webview.label() != WINDOW_LABEL {
+    if !is_locus_drop_target_label(webview.label()) {
         return;
     }
 
@@ -411,30 +434,112 @@ pub(crate) fn handle_unity_embed_webview_event(
         return;
     }
 
-    let app_handle = webview.app_handle().clone();
+    handle_locus_drop_paths(
+        webview.app_handle().clone(),
+        webview.label().to_string(),
+        paths,
+    );
+}
+
+pub(crate) fn handle_locus_window_event(window: &tauri::Window, event: &tauri::WindowEvent) {
+    if !is_locus_drop_target_label(window.label()) {
+        return;
+    }
+
+    let paths = match event {
+        tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) => paths.clone(),
+        _ => return,
+    };
+    if paths.is_empty() {
+        return;
+    }
+
+    handle_locus_drop_paths(
+        window.app_handle().clone(),
+        window.label().to_string(),
+        paths,
+    );
+}
+
+fn handle_locus_drop_paths(app_handle: AppHandle, target_label: String, paths: Vec<PathBuf>) {
     tauri::async_runtime::spawn(async move {
         let workspace_path = current_workspace_path(&app_handle).await;
         let refs = unity_file_drop_asset_refs(&workspace_path, &paths);
-        if refs.is_empty() {
-            return;
+        if !refs.is_empty() {
+            if let Err(error) = emit_locus_asset_drop_to(&app_handle, &target_label, refs) {
+                eprintln!("[Locus] failed to emit Unity asset drop: {error}");
+            }
         }
-        if let Err(error) = emit_unity_embed_asset_drop(&app_handle, refs) {
-            eprintln!("[Locus] failed to emit Unity embed file drop: {error}");
+
+        let file_refs = locus_file_drop_refs(&workspace_path, &paths);
+        if !file_refs.is_empty() {
+            if let Err(error) = emit_locus_file_drop_to(&app_handle, &target_label, file_refs) {
+                eprintln!("[Locus] failed to emit local file drop: {error}");
+            }
         }
     });
+}
+
+fn is_locus_drop_target_label(label: &str) -> bool {
+    label == WINDOW_LABEL || label == MAIN_WINDOW_LABEL
+}
+
+fn emit_to_existing_window<T>(
+    app_handle: &AppHandle,
+    label: &str,
+    event: &str,
+    payload: T,
+) -> Result<(), String>
+where
+    T: Clone + Serialize,
+{
+    if app_handle.get_webview_window(label).is_none() {
+        return Ok(());
+    }
+    app_handle
+        .emit_to(label, event, payload)
+        .map_err(|error| format!("Failed to emit {event} to {label}: {error}"))
+}
+
+fn emit_locus_asset_drop_to(
+    app_handle: &AppHandle,
+    label: &str,
+    refs: Vec<UnityEmbedAssetRef>,
+) -> Result<(), String> {
+    if refs.is_empty() {
+        return Ok(());
+    }
+    emit_to_existing_window(
+        app_handle,
+        label,
+        ASSET_DROP_EVENT,
+        UnityEmbedAssetDropPayload { refs },
+    )
+}
+
+fn emit_locus_asset_drop_to_chat_windows(
+    app_handle: &AppHandle,
+    refs: Vec<UnityEmbedAssetRef>,
+) -> Result<(), String> {
+    if refs.is_empty() {
+        return Ok(());
+    }
+
+    let payload = UnityEmbedAssetDropPayload { refs };
+    emit_to_existing_window(
+        app_handle,
+        MAIN_WINDOW_LABEL,
+        ASSET_DROP_EVENT,
+        payload.clone(),
+    )?;
+    emit_to_existing_window(app_handle, WINDOW_LABEL, ASSET_DROP_EVENT, payload)
 }
 
 fn emit_unity_embed_asset_drop(
     app_handle: &AppHandle,
     refs: Vec<UnityEmbedAssetRef>,
 ) -> Result<(), String> {
-    app_handle
-        .emit_to(
-            WINDOW_LABEL,
-            "unity-embed-asset-drop",
-            UnityEmbedAssetDropPayload { refs },
-        )
-        .map_err(|error| format!("Failed to emit Unity embed asset drop: {error}"))
+    emit_locus_asset_drop_to_chat_windows(app_handle, refs)
 }
 
 fn emit_unity_embed_text_drop(
@@ -444,34 +549,36 @@ fn emit_unity_embed_text_drop(
     title: Option<String>,
     source: Option<String>,
 ) -> Result<(), String> {
-    app_handle
-        .emit_to(
-            WINDOW_LABEL,
-            "unity-embed-text-drop",
-            UnityEmbedTextDropPayload {
-                text,
-                entries,
-                title,
-                source,
-            },
-        )
-        .map_err(|error| format!("Failed to emit Unity embed text drop: {error}"))
+    let payload = UnityEmbedTextDropPayload {
+        text,
+        entries,
+        title,
+        source,
+    };
+    emit_to_existing_window(
+        app_handle,
+        MAIN_WINDOW_LABEL,
+        TEXT_DROP_EVENT,
+        payload.clone(),
+    )?;
+    emit_to_existing_window(app_handle, WINDOW_LABEL, TEXT_DROP_EVENT, payload)
 }
 
 fn emit_unity_embed_asset_drag_state(
     app_handle: &AppHandle,
     refs: Vec<UnityEmbedAssetRef>,
 ) -> Result<(), String> {
-    app_handle
-        .emit_to(
-            WINDOW_LABEL,
-            "unity-embed-asset-drag-state",
-            UnityEmbedAssetDragStatePayload {
-                has_refs: !refs.is_empty(),
-                refs,
-            },
-        )
-        .map_err(|error| format!("Failed to emit Unity embed asset drag state: {error}"))
+    let payload = UnityEmbedAssetDragStatePayload {
+        has_refs: !refs.is_empty(),
+        refs,
+    };
+    emit_to_existing_window(
+        app_handle,
+        MAIN_WINDOW_LABEL,
+        ASSET_DRAG_STATE_EVENT,
+        payload.clone(),
+    )?;
+    emit_to_existing_window(app_handle, WINDOW_LABEL, ASSET_DRAG_STATE_EVENT, payload)
 }
 
 fn asset_drag_cache() -> &'static Mutex<UnityEmbedAssetDragCache> {
@@ -536,6 +643,56 @@ fn unity_file_drop_asset_refs(workspace_path: &str, paths: &[PathBuf]) -> Vec<Un
     }
 
     refs
+}
+
+fn locus_file_drop_refs(workspace_path: &str, paths: &[PathBuf]) -> Vec<LocusFileDropRef> {
+    let mut seen = HashSet::new();
+    let mut refs = Vec::new();
+
+    for path in paths {
+        if unity_file_drop_asset_ref(workspace_path, path).is_some() {
+            continue;
+        }
+        let Some(file_ref) = locus_file_drop_ref(path) else {
+            continue;
+        };
+        if seen.insert(file_ref.path.to_ascii_lowercase()) {
+            refs.push(file_ref);
+        }
+    }
+
+    refs
+}
+
+fn locus_file_drop_ref(path: &Path) -> Option<LocusFileDropRef> {
+    let normalized = normalize_existing_path_text(path);
+    if normalized.is_empty() {
+        return None;
+    }
+
+    Some(LocusFileDropRef {
+        path: normalized,
+        name: unity_drop_name(path, ""),
+        type_label: unity_drop_type_label(path),
+        is_dir: path.is_dir(),
+        source: "local".to_string(),
+    })
+}
+
+fn emit_locus_file_drop_to(
+    app_handle: &AppHandle,
+    label: &str,
+    files: Vec<LocusFileDropRef>,
+) -> Result<(), String> {
+    if files.is_empty() {
+        return Ok(());
+    }
+    emit_to_existing_window(
+        app_handle,
+        label,
+        FILE_DROP_EVENT,
+        LocusFileDropPayload { files },
+    )
 }
 
 fn unity_file_drop_asset_ref(workspace_path: &str, path: &Path) -> Option<UnityEmbedAssetRef> {
@@ -2268,7 +2425,7 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::{
-        control_pipe_name_for_project_path, normalize_pipe_project_path,
+        control_pipe_name_for_project_path, locus_file_drop_refs, normalize_pipe_project_path,
         unity_file_drop_asset_refs, unity_relative_drop_path,
     };
 
@@ -2309,5 +2466,36 @@ mod tests {
             unity_relative_drop_path("F:/Game/Project", Path::new("F:/Game/Project/README.md")),
             None
         );
+    }
+
+    #[test]
+    fn file_drop_maps_non_asset_paths_to_local_refs() {
+        let refs = locus_file_drop_refs(
+            "F:/Game/Project",
+            &[
+                PathBuf::from("F:/Game/Project/README.md"),
+                PathBuf::from("D:/Notes/design.txt"),
+            ],
+        );
+
+        assert_eq!(refs.len(), 2);
+        assert_eq!(refs[0].path, "F:/Game/Project/README.md");
+        assert_eq!(refs[0].name.as_deref(), Some("README"));
+        assert_eq!(refs[0].type_label.as_deref(), Some("md"));
+        assert!(!refs[0].is_dir);
+        assert_eq!(refs[0].source, "local");
+        assert_eq!(refs[1].path, "D:/Notes/design.txt");
+        assert_eq!(refs[1].name.as_deref(), Some("design"));
+        assert_eq!(refs[1].type_label.as_deref(), Some("txt"));
+    }
+
+    #[test]
+    fn file_drop_keeps_asset_paths_as_unity_refs() {
+        let refs = locus_file_drop_refs(
+            "F:/Game/Project",
+            &[PathBuf::from("F:/Game/Project/Assets/Prefabs/Enemy.prefab")],
+        );
+
+        assert!(refs.is_empty());
     }
 }

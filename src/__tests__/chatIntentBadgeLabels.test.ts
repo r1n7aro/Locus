@@ -9,12 +9,22 @@ function read(relPath: string) {
 }
 
 describe("chat intent badge labels", () => {
-  it("uses uppercase SKILL labels in the composer and transcript badges", () => {
+  it("uses compact uppercase SKILL markers in the composer and transcript badges", () => {
     const richInput = read("src/components/chat/RichChatInput.vue");
     const transcript = read("src/components/chat/ChatTranscript.vue");
 
-    expect(richInput).toContain("label: `SKILL: ${skill.name}`,");
-    expect(transcript).toContain("label: `SKILL: ${skill.name}`,");
+    expect(richInput).toContain("label: skill.name,");
+    expect(transcript).toContain("label: skill.name,");
+    expect(richInput).toContain("composer-badge-mark");
+    expect(transcript).toContain("chat-transcript-intent-badge-mark");
+    expect(richInput).toContain("height: 28px;");
+    expect(transcript).toContain("min-height: 28px;");
+    expect(richInput).toContain('class="composer-badge-remove"');
+    expect(richInput).toContain('@click="badge.skill ? removeSkillBadge(badge.skill) : undefined"');
+    expect(richInput).toContain(">SKILL<");
+    expect(transcript).toContain(">SKILL<");
+    expect(richInput).not.toContain("label: `SKILL: ${skill.name}`,");
+    expect(transcript).not.toContain("label: `SKILL: ${skill.name}`,");
     expect(richInput).not.toContain("label: `Skill: ${skill.name}`,");
     expect(transcript).not.toContain("label: `Skill: ${skill.name}`,");
   });

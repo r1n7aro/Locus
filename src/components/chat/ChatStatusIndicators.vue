@@ -1,13 +1,30 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from "vue";
-import { Box, Database, type IconNode } from "lucide";
+import { computed, onMounted, onUnmounted, ref, watch } from "vue";
+import { BookOpen, Box, Database, type IconNode } from "lucide";
 import { t } from "../../i18n";
-import type { AssetDbScanEvent, ScanStats, UnityConnectionStatus } from "../../types";
+import { listAgentInjectedItems } from "../../services/agent";
+import { normalizeAppError } from "../../services/errors";
+import {
+  knowledgeGetEmbeddingStatus,
+  knowledgeGetLexicalRebuildStatus,
+  knowledgeGetOverview,
+} from "../../services/knowledge";
+import type {
+  AssetDbScanEvent,
+  EmbeddingStatus,
+  InjectedPromptItem,
+  KnowledgeAccessMode,
+  KnowledgeRetrievalOverview,
+  LexicalRebuildStatus,
+  ScanStats,
+  UnityConnectionStatus,
+} from "../../types";
 import BaseButton from "../ui/BaseButton.vue";
+import BaseSegmented, { type SegmentedOption } from "../ui/BaseSegmented.vue";
 
-type StatusId = "assetDb" | "unity";
+type StatusId = "assetDb" | "unity" | "knowledge";
 type StatusTone = "success" | "danger" | "accent" | "muted";
-type StatusIcon = "database" | "unity";
+type StatusIcon = "database" | "unity" | "knowledge";
 type UnityPluginNotice = "missing" | "outdated";
 type UnityLaunchState = "idle" | "starting" | "waitingConnection";
 
@@ -25,6 +42,7 @@ interface StatusItem {
   inlineLabel: string;
   tone: StatusTone;
   rows: StatusDetailRow[];
+  modeOptions?: SegmentedOption[];
   actionLabel?: string;
   actionTitle?: string;
   actionDisabled?: boolean;
@@ -34,6 +52,7 @@ interface StatusItem {
 const STATUS_ICONS: Record<StatusIcon, IconNode> = {
   database: Database,
   unity: Box,
+  knowledge: BookOpen,
 };
 
 const props = defineProps<{
@@ -48,15 +67,26 @@ const props = defineProps<{
   isUnityProject?: boolean;
   scanPhase?: AssetDbScanEvent | null;
   lastScanStats?: ScanStats | null;
+  knowledgeAccessMode?: KnowledgeAccessMode;
+  selectedAgentId?: string;
 }>();
 
 const emit = defineEmits<{
   startScan: [];
   installPlugin: [];
   launchUnityProject: [];
+  updateKnowledgeAccessMode: [mode: KnowledgeAccessMode];
 }>();
 
 const activePopover = ref<StatusId | null>(null);
+const knowledgeOverview = ref<KnowledgeRetrievalOverview | null>(null);
+const lexicalRebuildStatus = ref<LexicalRebuildStatus | null>(null);
+const embeddingStatus = ref<EmbeddingStatus | null>(null);
+const injectedItems = ref<InjectedPromptItem[]>([]);
+const knowledgeStatusLoading = ref(false);
+const knowledgeRetrievalError = ref("");
+const knowledgeContextError = ref("");
+let knowledgeStatusSeq = 0;
 
 function isAssetDbRunningPhase(phase: AssetDbScanEvent | null | undefined): boolean {
   return phase != null
@@ -126,6 +156,48 @@ function unityEditorStatusLabel(status: string) {
 function formatTimestamp(ms: number | null | undefined) {
   if (!Number.isFinite(ms ?? Number.NaN) || !ms) return "";
   return new Date(ms).toLocaleTimeString();
+}
+
+const countFormatter = new Intl.NumberFormat("zh-CN");
+
+function formatCount(value: number): string {
+  return countFormatter.format(Math.max(0, Math.round(value)));
+}
+
+function formatPercent(value: number | null | undefined): string {
+  if (typeof value !== "number" || !Number.isFinite(value)) return "0%";
+  return `${Math.round(Math.min(1, Math.max(0, value)) * 100)}%`;
+}
+
+function estimateTextTokens(text: string): number {
+  if (!text) return 0;
+  return Math.ceil(text.length / 4);
+}
+
+function isKnowledgeInjectionItem(item: InjectedPromptItem): boolean {
+  return item.id === "knowledge_context" || item.id.startsWith("knowledge_rule::");
+}
+
+function lexicalStageLabel(stage: string | null | undefined): string {
+  switch (stage) {
+    case "preparing": return t("knowledge.dashboard.knowledge.stagePreparing");
+    case "cleaning": return t("knowledge.dashboard.knowledge.stageCleaning");
+    case "indexing": return t("knowledge.dashboard.knowledge.stageIndexing");
+    case "committing": return t("knowledge.dashboard.knowledge.stageCommitting");
+    case "completed": return t("knowledge.dashboard.knowledge.stageCompleted");
+    case "downloading_model": return t("settings.knowledge.stage.downloadingModel");
+    case "cancelling": return t("settings.knowledge.stage.cancelling");
+    case "cancelled": return t("settings.knowledge.stage.cancelled");
+    case "initializing_runtime": return t("settings.knowledge.stage.initializingRuntime");
+    case "ready": return t("settings.knowledge.stage.ready");
+    case "error": return t("settings.knowledge.stage.error");
+    default: return stage || t("knowledge.dashboard.knowledge.stageIdle");
+  }
+}
+
+function semanticStageLabel(stage: string | null | undefined): string {
+  if (stage === "committing") return t("knowledge.dashboard.knowledge.stagePersistingEmbeddings");
+  return lexicalStageLabel(stage);
 }
 
 const unityPluginLabel = computed(() => {
@@ -331,6 +403,133 @@ const unityRows = computed<StatusDetailRow[]>(() => {
   return rows;
 });
 
+const knowledgeMode = computed<KnowledgeAccessMode>(() => props.knowledgeAccessMode ?? "full");
+
+const knowledgeHasWorkspace = computed(() => !!props.workingDir?.trim());
+
+const knowledgeModeOptions = computed<SegmentedOption[]>(() => [
+  {
+    value: "disabled",
+    label: t("chat.status.knowledge.mode.disabled"),
+    hint: t("chat.status.knowledge.mode.disabledHint"),
+  },
+  {
+    value: "read_only",
+    label: t("chat.status.knowledge.mode.readOnly"),
+    hint: t("chat.status.knowledge.mode.readOnlyHint"),
+  },
+  {
+    value: "full",
+    label: t("chat.status.knowledge.mode.full"),
+    hint: t("chat.status.knowledge.mode.fullHint"),
+  },
+]);
+
+const knowledgeModeSummary = computed(() => {
+  if (!knowledgeHasWorkspace.value) return t("chat.status.knowledge.noWorkspace");
+  if (knowledgeMode.value === "disabled") return t("chat.status.knowledge.disabled");
+  if (knowledgeMode.value === "read_only") return t("chat.status.knowledge.readOnly");
+  return t("chat.status.knowledge.full");
+});
+
+const knowledgeTone = computed<StatusTone>(() => {
+  if (!knowledgeHasWorkspace.value || knowledgeMode.value === "disabled") return "muted";
+  return knowledgeMode.value === "read_only" ? "accent" : "success";
+});
+
+const knowledgeAgentId = computed(() => props.selectedAgentId?.trim() ?? "");
+
+const knowledgeContextEstimatedTokens = computed(() => {
+  if (knowledgeMode.value === "disabled") return 0;
+  return injectedItems.value
+    .filter(isKnowledgeInjectionItem)
+    .reduce((total, item) => total + estimateTextTokens(item.content), 0);
+});
+
+const knowledgeContextCostLabel = computed(() => {
+  if (!knowledgeHasWorkspace.value) return t("chat.status.knowledge.noWorkspace");
+  if (knowledgeMode.value === "disabled") return t("chat.status.knowledge.contextCostZero");
+  if (knowledgeStatusLoading.value && injectedItems.value.length === 0) {
+    return t("chat.status.knowledge.loading");
+  }
+  return t(
+    "chat.status.knowledge.contextCostTokens",
+    formatCount(knowledgeContextEstimatedTokens.value),
+  );
+});
+
+const lexicalRetrievalLabel = computed(() => {
+  if (!knowledgeHasWorkspace.value) return t("chat.status.knowledge.noWorkspace");
+  if (knowledgeMode.value === "disabled") return t("chat.status.knowledge.requestOff");
+  if (knowledgeStatusLoading.value && !knowledgeOverview.value && !lexicalRebuildStatus.value) {
+    return t("chat.status.knowledge.loading");
+  }
+  if (lexicalRebuildStatus.value?.error) return lexicalRebuildStatus.value.error;
+  if (lexicalRebuildStatus.value?.running) {
+    const progress = typeof lexicalRebuildStatus.value.progress === "number"
+      ? `${formatPercent(lexicalRebuildStatus.value.progress)} · `
+      : "";
+    return `${progress}${lexicalStageLabel(lexicalRebuildStatus.value.stage)}`;
+  }
+
+  const fullText = knowledgeOverview.value?.fullText;
+  if (!fullText?.enabled) return t("chat.status.knowledge.off");
+  if (fullText.pendingItemCount > 0 || fullText.staleItemCount > 0) {
+    return t(
+      "chat.status.knowledge.indexPending",
+      formatCount(fullText.pendingItemCount + fullText.staleItemCount),
+    );
+  }
+  return t(
+    "chat.status.knowledge.indexReady",
+    formatCount(fullText.indexedItemCount),
+    formatCount(fullText.indexableItemCount),
+  );
+});
+
+const semanticRetrievalLabel = computed(() => {
+  if (!knowledgeHasWorkspace.value) return t("chat.status.knowledge.noWorkspace");
+  if (knowledgeMode.value === "disabled") return t("chat.status.knowledge.requestOff");
+  if (knowledgeStatusLoading.value && !knowledgeOverview.value && !embeddingStatus.value) {
+    return t("chat.status.knowledge.loading");
+  }
+  if (embeddingStatus.value?.error) return embeddingStatus.value.error;
+  if (knowledgeOverview.value?.semantic.error) return knowledgeOverview.value.semantic.error;
+  if (embeddingStatus.value?.activating || embeddingStatus.value?.stage === "indexing") {
+    if (embeddingStatus.value.indexProgress != null) {
+      return `${formatPercent(embeddingStatus.value.indexProgress)} · ${semanticStageLabel(embeddingStatus.value.stage)}`;
+    }
+    return semanticStageLabel(embeddingStatus.value.stage);
+  }
+
+  const semantic = knowledgeOverview.value?.semantic;
+  if (!semantic?.enabled) return t("chat.status.knowledge.off");
+  if (!semantic.ready || !embeddingStatus.value?.ready) {
+    return semanticStageLabel(embeddingStatus.value?.stage || semantic.stage);
+  }
+  if (semantic.pendingItemCount > 0) {
+    return t("chat.status.knowledge.indexPending", formatCount(semantic.pendingItemCount));
+  }
+  return t("chat.status.knowledge.semanticReady", formatPercent(semantic.coverageRatio));
+});
+
+const knowledgeRows = computed<StatusDetailRow[]>(() => {
+  return [
+    {
+      label: t("chat.status.knowledge.lexicalRetrieval"),
+      value: knowledgeRetrievalError.value || lexicalRetrievalLabel.value,
+    },
+    {
+      label: t("chat.status.knowledge.semanticRetrieval"),
+      value: knowledgeRetrievalError.value || semanticRetrievalLabel.value,
+    },
+    {
+      label: t("chat.status.knowledge.contextCost"),
+      value: knowledgeContextError.value || knowledgeContextCostLabel.value,
+    },
+  ];
+});
+
 const statusItems = computed<StatusItem[]>(() => [
   {
     id: "assetDb",
@@ -362,6 +561,16 @@ const statusItems = computed<StatusItem[]>(() => [
         || !props.isUnityProject,
     actionVariant: props.unityPluginStatus ? "neutral" : "primary",
   },
+  {
+    id: "knowledge",
+    icon: "knowledge",
+    title: t("chat.status.knowledge.title"),
+    summary: knowledgeModeSummary.value,
+    inlineLabel: knowledgeModeSummary.value,
+    tone: knowledgeTone.value,
+    rows: knowledgeRows.value,
+    modeOptions: knowledgeModeOptions.value,
+  },
 ]);
 
 const activeItem = computed(() =>
@@ -374,10 +583,83 @@ function statusIconNode(icon: StatusIcon) {
 
 function togglePopover(id: StatusId) {
   activePopover.value = activePopover.value === id ? null : id;
+  if (activePopover.value === "knowledge") {
+    void loadKnowledgeStatus();
+  }
 }
 
 function closePopover() {
   activePopover.value = null;
+}
+
+function setKnowledgeMode(mode: string) {
+  if (mode === "disabled" || mode === "read_only" || mode === "full") {
+    emit("updateKnowledgeAccessMode", mode);
+  }
+}
+
+function clearKnowledgeStatus() {
+  knowledgeOverview.value = null;
+  lexicalRebuildStatus.value = null;
+  embeddingStatus.value = null;
+  injectedItems.value = [];
+  knowledgeRetrievalError.value = "";
+  knowledgeContextError.value = "";
+}
+
+async function loadKnowledgeStatus() {
+  const seq = ++knowledgeStatusSeq;
+  if (!knowledgeHasWorkspace.value) {
+    clearKnowledgeStatus();
+    knowledgeStatusLoading.value = false;
+    return;
+  }
+  if (knowledgeMode.value === "disabled") {
+    clearKnowledgeStatus();
+    knowledgeStatusLoading.value = false;
+    return;
+  }
+
+  knowledgeStatusLoading.value = true;
+  const agentId = knowledgeAgentId.value;
+  const [overviewResult, lexicalResult, embeddingResult, injectedResult] =
+    await Promise.allSettled([
+      knowledgeGetOverview(),
+      knowledgeGetLexicalRebuildStatus(),
+      knowledgeGetEmbeddingStatus(),
+      agentId
+        ? listAgentInjectedItems(agentId, knowledgeMode.value)
+        : Promise.resolve([] as InjectedPromptItem[]),
+    ]);
+
+  if (seq !== knowledgeStatusSeq) return;
+
+  knowledgeRetrievalError.value = "";
+  knowledgeContextError.value = "";
+
+  if (overviewResult.status === "fulfilled") {
+    knowledgeOverview.value = overviewResult.value;
+  } else {
+    knowledgeOverview.value = null;
+    knowledgeRetrievalError.value = normalizeAppError(overviewResult.reason).message;
+  }
+
+  if (lexicalResult.status === "fulfilled") {
+    lexicalRebuildStatus.value = lexicalResult.value;
+  }
+
+  if (embeddingResult.status === "fulfilled") {
+    embeddingStatus.value = embeddingResult.value;
+  }
+
+  if (injectedResult.status === "fulfilled") {
+    injectedItems.value = injectedResult.value;
+  } else {
+    injectedItems.value = [];
+    knowledgeContextError.value = normalizeAppError(injectedResult.reason).message;
+  }
+
+  knowledgeStatusLoading.value = false;
 }
 
 function runStatusAction(item: StatusItem) {
@@ -403,6 +685,15 @@ onMounted(() => {
   document.addEventListener("click", closePopover);
   document.addEventListener("keydown", onDocumentKeydown);
 });
+
+watch(
+  () => `${props.workingDir ?? ""}::${knowledgeAgentId.value}::${knowledgeMode.value}`,
+  () => {
+    if (activePopover.value === "knowledge") {
+      void loadKnowledgeStatus();
+    }
+  },
+);
 
 onUnmounted(() => {
   document.removeEventListener("click", closePopover);
@@ -478,6 +769,14 @@ onUnmounted(() => {
             {{ activeItem.actionLabel }}
           </BaseButton>
         </div>
+        <BaseSegmented
+          v-if="activeItem.modeOptions"
+          class="chat-status-mode"
+          size="sm"
+          :model-value="knowledgeMode"
+          :options="activeItem.modeOptions"
+          @update:model-value="setKnowledgeMode"
+        />
         <dl v-if="activeItem.rows.length > 0" class="chat-status-detail-list">
           <template v-for="row in activeItem.rows" :key="`${row.label}:${row.value}`">
             <dt>{{ row.label }}</dt>
@@ -636,6 +935,20 @@ onUnmounted(() => {
 
 .chat-status-popover-summary.tone-accent {
   color: var(--accent-color);
+}
+
+.chat-status-popover-summary.tone-muted {
+  color: var(--text-secondary);
+}
+
+.chat-status-mode {
+  width: 100%;
+  margin-top: 10px;
+}
+
+.chat-status-mode :deep(.base-segmented-item) {
+  flex: 1 1 0;
+  padding: 0 8px;
 }
 
 .chat-status-detail-list {

@@ -12,6 +12,7 @@ import type {
 import { ipcInvoke } from "./ipc";
 
 const DOCS_BASE_URL = "https://unity.farlocus.com";
+const GITHUB_RELEASES_URL = "https://github.com/r1n7aro/Locus/releases";
 const SEMVER_PATTERN =
   /^v?(?<core>\d+(?:\.\d+)*)(?:-(?<prerelease>[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+(?<build>[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$/i;
 
@@ -268,6 +269,54 @@ function selectInstaller(
   ) ?? candidates[0] ?? null;
 }
 
+function githubReleaseUrlFromUrl(url: string): string | null {
+  try {
+    const parsed = new URL(url);
+    if (parsed.hostname.toLowerCase() !== "github.com") {
+      return null;
+    }
+
+    const parts = parsed.pathname.split("/").filter(Boolean);
+    if (parts.length < 3 || parts[2] !== "releases") {
+      return null;
+    }
+
+    if (parts[3] === "download" && parts[4]) {
+      return `${parsed.origin}/${parts[0]}/${parts[1]}/releases/tag/${parts[4]}`;
+    }
+
+    if (parts[3] === "tag" && parts[4]) {
+      return `${parsed.origin}/${parts[0]}/${parts[1]}/releases/tag/${parts[4]}`;
+    }
+
+    return `${parsed.origin}/${parts[0]}/${parts[1]}/releases`;
+  } catch {
+    return null;
+  }
+}
+
+function resolveGitHubReleaseUrl(
+  localeEntry: AppUpdateLocaleEntry,
+  installers: AppUpdateInstallerDownload[],
+  sourceBaseUrl: string,
+): string {
+  for (const installer of installers) {
+    const releaseUrl = githubReleaseUrlFromUrl(installer.url);
+    if (releaseUrl) {
+      return releaseUrl;
+    }
+  }
+
+  for (const channel of localeEntry.downloadChannels ?? []) {
+    const releaseUrl = githubReleaseUrlFromUrl(resolveUpdateUrl(channel.url.trim(), sourceBaseUrl));
+    if (releaseUrl) {
+      return releaseUrl;
+    }
+  }
+
+  return GITHUB_RELEASES_URL;
+}
+
 export function resolveAppUpdateInfo(
   manifest: AppUpdateManifest,
   currentVersion: string,
@@ -287,6 +336,7 @@ export function resolveAppUpdateInfo(
   const installers = sanitizeInstallers(manifest.installers, sourceBaseUrl);
   const installer = selectInstaller(installers);
   const changelogUrl = resolveUpdateUrl(localeEntry.changelogUrl, sourceBaseUrl);
+  const releaseUrl = resolveGitHubReleaseUrl(localeEntry, installers, sourceBaseUrl);
 
   return {
     currentVersion: currentVersion.trim().replace(/^v/i, ""),
@@ -296,6 +346,7 @@ export function resolveAppUpdateInfo(
     title: localeEntry.title.trim(),
     summary: localeEntry.summary.trim(),
     changelogUrl,
+    releaseUrl,
     downloadUrl: installer?.url ?? changelogUrl,
     downloadLabel: installer?.label ?? localeEntry.title.trim(),
     changes: sanitizeChangeGroups(localeEntry.changes),
