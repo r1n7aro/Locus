@@ -179,6 +179,13 @@ describe("KnowledgePreview layout", () => {
                   <span class="meta-label">{{ t("knowledge.skill.commandTrigger") }}</span>`);
   });
 
+  it("keeps skill command text inputs readable in the metadata rail", () => {
+    const preview = read("src/components/knowledge/KnowledgePreview.vue");
+
+    expect(preview).toMatch(/\.meta-dropdown :deep\(\.base-dropdown-trigger\)\s*\{[\s\S]*min-height:\s*30px;/);
+    expect(preview).toMatch(/\.meta-text-input\s*\{[\s\S]*width:\s*100%;[\s\S]*height:\s*30px;[\s\S]*min-height:\s*30px;[\s\S]*box-sizing:\s*border-box;[\s\S]*line-height:\s*18px;/);
+  });
+
   it("renders file metadata below the document config block", () => {
     const preview = read("src/components/knowledge/KnowledgePreview.vue");
 

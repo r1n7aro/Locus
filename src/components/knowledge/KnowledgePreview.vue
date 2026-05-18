@@ -9,6 +9,8 @@ import type {
   KnowledgeSearchSelectionContext,
   KnowledgeDocumentType,
   KnowledgeInjectMode,
+  SkillManifest,
+  SkillUnityInstallStatus,
   SkillSurface,
 } from "../../types";
 import { skillSurfaceAllowsCommand } from "../../types";
@@ -26,6 +28,11 @@ import BaseMarkdownEditor from "../ui/BaseMarkdownEditor.vue";
 import BaseSwitch from "../ui/BaseSwitch.vue";
 import MarkdownRenderer from "../MarkdownRenderer.vue";
 import KnowledgeChatPane from "./KnowledgeChatPane.vue";
+import {
+  getSkillUnityInstallStatus,
+  installSkillUnityFiles,
+  removeSkillUnityFiles,
+} from "../../services/knowledge";
 import {
   hintForInjectMode,
   hintForKnowledgeEditMode,
@@ -113,6 +120,9 @@ const sidePanelTab = ref<"meta" | "chat">("chat");
 const sidePanelWidth = ref(DEFAULT_SIDE_PANEL_WIDTH);
 const skillCommandDraft = ref("");
 const skillArgumentHintDraft = ref("");
+const skillUnityStatus = ref<SkillUnityInstallStatus | null>(null);
+const skillUnityStatusLoading = ref(false);
+const skillUnityActionPending = ref(false);
 const supportPanelsCollapsedPreference = ref<boolean | null>(loadStoredSupportPanelsCollapsed());
 const supportPanelsCollapsed = ref(supportPanelsCollapsedPreference.value ?? true);
 const previewMainRef = ref<HTMLElement | null>(null);
@@ -157,6 +167,28 @@ function formatDocumentDisplayPath(document: KnowledgeDocument | null | undefine
   return path;
 }
 
+function packageIdForSkillDocument(document: KnowledgeDocument | null | undefined): string {
+  if (!document || document.type !== "skill") return "";
+  if (document.storageSource !== "app") return "";
+  if (document.externalSource?.provider !== "package") return "";
+  return document.externalSource.sourceId || document.path.split("/")[0] || "";
+}
+
+function skillPackageManifestForDocument(document: KnowledgeDocument | null | undefined): SkillManifest | null {
+  const packageId = packageIdForSkillDocument(document);
+  if (!packageId) return null;
+  return skillItems.value.find((item) =>
+    item.source === "app"
+    && item.kind === "package"
+    && (item.packageId === packageId || item.dirName === packageId)
+  ) ?? null;
+}
+
+function skillPackageL1Unavailable(): boolean {
+  const manifest = skillPackageManifestForDocument(props.document);
+  return manifest?.hasL1 === false;
+}
+
 const isReadOnly = computed(() => !!props.document?.readOnly);
 const isEditModeLocked = computed(() => isKnowledgeEditModeLocked(props.document));
 const documentPath = computed(() => props.document?.path?.trim() || "");
@@ -192,7 +224,10 @@ const injectModeOptions = computed(() => [
   {
     value: "excerpt",
     label: labelForInjectMode("excerpt"),
-    hint: hintForInjectMode("excerpt"),
+    hint: skillPackageL1Unavailable()
+      ? t("knowledge.skill.l1Unavailable")
+      : hintForInjectMode("excerpt"),
+    disabled: skillPackageL1Unavailable(),
   },
   {
     value: "full",
@@ -373,6 +408,43 @@ const skillCommandInputDisabled = computed(() =>
 const showSkillCommandFields = computed(() =>
   isSkillDocument.value && skillEnabled.value && skillSurfaceAllowsCommand(currentSkillSurface.value),
 );
+const skillPackageId = computed(() => {
+  return packageIdForSkillDocument(props.document);
+});
+const showSkillUnityStatus = computed(() => Boolean(skillPackageId.value && skillUnityStatus.value?.hasUnity));
+const skillUnityStatusLabel = computed(() => {
+  const state = skillUnityStatus.value?.state ?? "";
+  switch (state) {
+    case "pluginMissing":
+      return t("knowledge.skill.unityStatus.pluginMissing");
+    case "notInstalled":
+      return t("knowledge.skill.unityStatus.notInstalled");
+    case "installed":
+      return t("knowledge.skill.unityStatus.installed");
+    case "partial":
+      return t("knowledge.skill.unityStatus.partial");
+    case "modified":
+      return t("knowledge.skill.unityStatus.modified");
+    case "sourceMissing":
+      return t("knowledge.skill.unityStatus.sourceMissing");
+    default:
+      return t("knowledge.skill.unityStatus.notApplicable");
+  }
+});
+const canInstallSkillUnityFiles = computed(() => {
+  const state = skillUnityStatus.value?.state;
+  return !!skillPackageId.value
+    && !!skillUnityStatus.value?.hasUnity
+    && state !== "pluginMissing"
+    && state !== "sourceMissing"
+    && state !== "installed";
+});
+const canRemoveSkillUnityFiles = computed(() => {
+  const state = skillUnityStatus.value?.state;
+  return !!skillPackageId.value
+    && !!skillUnityStatus.value?.hasUnity
+    && (state === "installed" || state === "modified" || state === "partial");
+});
 const sideRailStyle = computed(() => {
   if (metaCollapsed.value) {
     return {
@@ -853,6 +925,10 @@ watch(
   },
   { immediate: true },
 );
+
+watch(skillPackageId, () => {
+  void refreshSkillUnityStatus();
+}, { immediate: true });
 
 onMounted(() => {
   observeSupportLayout();
@@ -1348,6 +1424,62 @@ function onSkillArgumentHintKeydown(event: KeyboardEvent) {
   }
 }
 
+async function refreshSkillUnityStatus() {
+  const packageId = skillPackageId.value;
+  if (!packageId) {
+    skillUnityStatus.value = null;
+    return;
+  }
+  skillUnityStatusLoading.value = true;
+  try {
+    skillUnityStatus.value = await getSkillUnityInstallStatus(packageId);
+  } catch {
+    skillUnityStatus.value = null;
+  } finally {
+    skillUnityStatusLoading.value = false;
+  }
+}
+
+async function installSkillUnity() {
+  const packageId = skillPackageId.value;
+  if (!packageId || skillUnityActionPending.value) return;
+  skillUnityActionPending.value = true;
+  try {
+    skillUnityStatus.value = await installSkillUnityFiles(packageId);
+    notificationStore.addNotice("success", t("knowledge.skill.unityInstallDone"), {
+      operation: "skill_unity_install",
+      replaceOperation: true,
+    });
+  } catch (cause) {
+    notificationStore.addNotice("error", String(cause), {
+      operation: "skill_unity_install",
+      replaceOperation: true,
+    });
+  } finally {
+    skillUnityActionPending.value = false;
+  }
+}
+
+async function removeSkillUnity() {
+  const packageId = skillPackageId.value;
+  if (!packageId || skillUnityActionPending.value) return;
+  skillUnityActionPending.value = true;
+  try {
+    skillUnityStatus.value = await removeSkillUnityFiles(packageId);
+    notificationStore.addNotice("success", t("knowledge.skill.unityRemoveDone"), {
+      operation: "skill_unity_remove",
+      replaceOperation: true,
+    });
+  } catch (cause) {
+    notificationStore.addNotice("error", String(cause), {
+      operation: "skill_unity_remove",
+      replaceOperation: true,
+    });
+  } finally {
+    skillUnityActionPending.value = false;
+  }
+}
+
 function labelForType(type?: KnowledgeDocumentType | null): string {
   switch (type) {
     case "design":
@@ -1774,6 +1906,43 @@ function labelForProvider(provider?: string | null): string {
                       @blur="persistSkillArgumentHint"
                       @keydown="onSkillArgumentHintKeydown"
                     />
+                  </div>
+                </div>
+                <div
+                  v-if="skillPackageId && (skillUnityStatusLoading || showSkillUnityStatus)"
+                  class="meta-group skill-unity-group"
+                >
+                  <div class="meta-row">
+                    <span class="meta-label">{{ t("knowledge.skill.unityStatus.label") }}</span>
+                    <span class="meta-value meta-value-wrap">
+                      {{
+                        skillUnityStatusLoading
+                          ? t("knowledge.skill.unityStatus.loading")
+                          : skillUnityStatusLabel
+                      }}
+                    </span>
+                  </div>
+                  <div v-if="skillUnityStatus?.installRoot" class="meta-row">
+                    <span class="meta-label">{{ t("knowledge.skill.unityStatus.path") }}</span>
+                    <span class="meta-value meta-value-wrap">{{ skillUnityStatus.installRoot }}</span>
+                  </div>
+                  <div class="skill-unity-actions">
+                    <button
+                      type="button"
+                      class="skill-unity-action"
+                      :disabled="skillUnityStatusLoading || skillUnityActionPending || !canInstallSkillUnityFiles"
+                      @click="installSkillUnity"
+                    >
+                      {{ t("knowledge.skill.unityStatus.install") }}
+                    </button>
+                    <button
+                      type="button"
+                      class="skill-unity-action danger"
+                      :disabled="skillUnityStatusLoading || skillUnityActionPending || !canRemoveSkillUnityFiles"
+                      @click="removeSkillUnity"
+                    >
+                      {{ t("knowledge.skill.unityStatus.remove") }}
+                    </button>
                   </div>
                 </div>
                 <div class="meta-row meta-row-control">
@@ -2706,6 +2875,47 @@ function labelForProvider(provider?: string | null): string {
   overflow-wrap: anywhere;
 }
 
+.skill-unity-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding-top: 2px;
+}
+
+.skill-unity-action {
+  min-height: 28px;
+  padding: 0 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border-color);
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease, opacity 0.15s ease;
+}
+
+.skill-unity-action:hover:not(:disabled) {
+  background: var(--hover-bg);
+  border-color: var(--border-strong);
+  color: var(--text-color);
+}
+
+.skill-unity-action.danger {
+  color: var(--status-danger-fg);
+  border-color: var(--status-danger-border);
+}
+
+.skill-unity-action.danger:hover:not(:disabled) {
+  background: var(--status-danger-bg);
+  border-color: var(--status-danger-fg);
+}
+
+.skill-unity-action:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 .meta-row-control {
   align-items: center;
 }
@@ -2731,18 +2941,23 @@ function labelForProvider(provider?: string | null): string {
 
 .meta-dropdown :deep(.base-dropdown-trigger) {
   min-width: 0;
+  min-height: 30px;
 }
 
 .meta-text-input {
   flex: 1;
+  width: 100%;
   min-width: 0;
-  height: 28px;
+  height: 30px;
+  min-height: 30px;
   padding: 0 10px;
+  box-sizing: border-box;
   border-radius: 6px;
   border: 1px solid var(--border-color);
   background: color-mix(in srgb, var(--panel-bg) 72%, var(--hover-bg) 28%);
   color: var(--text-color);
   font-size: 12px;
+  line-height: 18px;
   font-family: var(--font-mono-identifier);
   outline: none;
   transition: border-color 0.15s ease, box-shadow 0.15s ease, color 0.15s ease;

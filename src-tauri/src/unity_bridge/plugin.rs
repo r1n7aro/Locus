@@ -16,6 +16,7 @@ pub enum PluginStatus {
 }
 
 const PLUGIN_DEFAULT_INSTALL_DIR: &str = "Packages/com.farlocus.locus";
+const PLUGIN_SKILLS_DIR: &str = "Editor/Skills";
 const PLUGIN_ASMDEF_NAME: &str = "Locus.Editor.asmdef";
 const PLUGIN_HASH_FILE: &str = ".locus_plugin_hash";
 const PLUGIN_LEGACY_ASSETS_INSTALL_DIRS: &[&str] = &["Assets/Locus", "Assets/Plugins/Locus"];
@@ -83,6 +84,14 @@ fn normalize_path_key(path: &Path) -> String {
 
 fn expected_install_dir(project_path: &Path) -> PathBuf {
     project_path.join(PLUGIN_DEFAULT_INSTALL_DIR)
+}
+
+pub fn plugin_install_root(project_path: &Path) -> PathBuf {
+    expected_install_dir(project_path)
+}
+
+pub fn plugin_skills_root(project_path: &Path) -> PathBuf {
+    expected_install_dir(project_path).join(PLUGIN_SKILLS_DIR)
 }
 
 fn plugin_meta_path(path: &Path) -> PathBuf {
@@ -210,6 +219,12 @@ fn should_skip_plugin_source_entry(source_dir: &Path, path: &Path) -> bool {
         return true;
     }
 
+    if rel == format!("{}.meta", PLUGIN_SKILLS_DIR)
+        || rel.starts_with(&format!("{}/", PLUGIN_SKILLS_DIR))
+    {
+        return true;
+    }
+
     if rel.starts_with("Editor/Roslyn/ILRepack-") {
         return true;
     }
@@ -259,6 +274,68 @@ fn copy_plugin_dir(source_dir: &Path, install_dir: &Path) -> Result<(), String> 
             std::fs::write(&dest, &data)
                 .map_err(|e| format!("Failed to write {}: {}", dest.display(), e))?;
         }
+    }
+
+    Ok(())
+}
+
+fn copy_dir_contents(source_dir: &Path, target_dir: &Path) -> Result<(), String> {
+    if !source_dir.is_dir() {
+        return Ok(());
+    }
+
+    for entry in walkdir::WalkDir::new(source_dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        let rel = entry
+            .path()
+            .strip_prefix(source_dir)
+            .map_err(|e| format!("strip_prefix: {}", e))?;
+        let dest = target_dir.join(rel);
+        if entry.file_type().is_dir() {
+            std::fs::create_dir_all(&dest)
+                .map_err(|e| format!("Failed to create directory {}: {}", dest.display(), e))?;
+        } else {
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    format!("Failed to create directory {}: {}", parent.display(), e)
+                })?;
+            }
+            std::fs::copy(entry.path(), &dest).map_err(|e| {
+                format!(
+                    "Failed to preserve plugin file {} -> {}: {}",
+                    entry.path().display(),
+                    dest.display(),
+                    e
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn preserve_installed_skill_files(install_dir: &Path, staging_dir: &Path) -> Result<(), String> {
+    let source_skills = install_dir.join(PLUGIN_SKILLS_DIR);
+    if source_skills.is_dir() {
+        copy_dir_contents(&source_skills, &staging_dir.join(PLUGIN_SKILLS_DIR))?;
+    }
+
+    let source_skills_meta = plugin_meta_path(&source_skills);
+    if source_skills_meta.is_file() {
+        let target_skills_meta = plugin_meta_path(&staging_dir.join(PLUGIN_SKILLS_DIR));
+        if let Some(parent) = target_skills_meta.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create directory {}: {}", parent.display(), e))?;
+        }
+        std::fs::copy(&source_skills_meta, &target_skills_meta).map_err(|e| {
+            format!(
+                "Failed to preserve plugin skills meta {} -> {}: {}",
+                source_skills_meta.display(),
+                target_skills_meta.display(),
+                e
+            )
+        })?;
     }
 
     Ok(())
@@ -376,7 +453,14 @@ fn install_or_update_plugin_with_source_dir(
     std::fs::write(staging_dir.join(PLUGIN_HASH_FILE), &hash)
         .map_err(|e| format!("Failed to write staged hash file: {}", e))?;
 
+    if install_dir.is_dir() {
+        preserve_installed_skill_files(&install_dir, &staging_dir)?;
+    }
+
     for dir in installed_dirs {
+        if normalize_path_key(&dir.root) != normalize_path_key(&install_dir) {
+            preserve_installed_skill_files(&dir.root, &staging_dir)?;
+        }
         remove_plugin_dir(&dir.root)?;
     }
 
@@ -656,6 +740,54 @@ mod tests {
 
         let status = check_plugin_status_with_source_dir(&source_dir, temp.path()).unwrap();
         assert!(matches!(status, PluginStatus::UpToDate));
+    }
+
+    #[test]
+    fn plugin_hash_ignores_installed_skill_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = tempfile::tempdir().unwrap();
+        create_unity_project(temp.path());
+        create_minimal_plugin_source(source.path());
+
+        install_or_update_plugin_with_source_dir(source.path(), temp.path()).unwrap();
+        let skill_file = temp
+            .path()
+            .join(PLUGIN_DEFAULT_INSTALL_DIR)
+            .join(PLUGIN_SKILLS_DIR)
+            .join("com.example.skill/Bridge.cs");
+        write_file(&skill_file, b"public static class Bridge {}");
+
+        let status = check_plugin_status_with_source_dir(source.path(), temp.path()).unwrap();
+        assert!(matches!(status, PluginStatus::UpToDate));
+    }
+
+    #[test]
+    fn install_preserves_installed_skill_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = tempfile::tempdir().unwrap();
+        create_unity_project(temp.path());
+        create_minimal_plugin_source(source.path());
+
+        install_or_update_plugin_with_source_dir(source.path(), temp.path()).unwrap();
+        let install_dir = temp.path().join(PLUGIN_DEFAULT_INSTALL_DIR);
+        let skill_file = install_dir
+            .join(PLUGIN_SKILLS_DIR)
+            .join("com.example.skill/Bridge.cs");
+        let skills_meta = plugin_meta_path(&install_dir.join(PLUGIN_SKILLS_DIR));
+        write_file(&skill_file, b"public static class Bridge {}");
+        write_file(&skills_meta, b"fileFormatVersion: 2");
+        write_file(&source.path().join("Editor/BridgeHost.cs"), b"host update");
+
+        install_or_update_plugin_with_source_dir(source.path(), temp.path()).unwrap();
+
+        assert_eq!(
+            std::fs::read(&skill_file).unwrap(),
+            b"public static class Bridge {}"
+        );
+        assert_eq!(
+            std::fs::read(&skills_meta).unwrap(),
+            b"fileFormatVersion: 2"
+        );
     }
 
     #[test]

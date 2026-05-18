@@ -1,0 +1,26 @@
+{
+  "description": "Fetch a URL for agent-readable content.\n- The URL must start with http:// or https://\n- Format options: \"markdown\" (default), \"html\", or \"text\"\n- For markdown output, the tool asks the original URL for markdown/text first, returns markdown or plain text directly, and converts HTML responses to markdown\n- Results are truncated at maxChars characters, default 50,000",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "url": {
+        "type": "string",
+        "description": "The URL to fetch (must start with http:// or https://)"
+      },
+      "format": {
+        "type": "string",
+        "enum": ["markdown", "html", "text"],
+        "description": "Return format: markdown (default), html, or text"
+      },
+      "timeout": {
+        "type": "integer",
+        "description": "Timeout in seconds (max 120, default 30)"
+      },
+      "maxChars": {
+        "type": "integer",
+        "description": "Maximum number of characters to return (max 200000, default 50000)"
+      }
+    },
+    "required": ["url"]
+  }
+}

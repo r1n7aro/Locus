@@ -217,7 +217,7 @@ fn tool_result_threshold(tool_name: &str) -> Option<usize> {
         "read" | "knowledge_read" => None,
         "bash" | "list" | "knowledge_list" | "knowledge_query" => Some(30_000),
         "grep" => Some(20_000),
-        "webfetch" => Some(100_000),
+        "web_fetch" => Some(100_000),
         _ => Some(DEFAULT_MAX_RESULT_SIZE_CHARS),
     }
 }

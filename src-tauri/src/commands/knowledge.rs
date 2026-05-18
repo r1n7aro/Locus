@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::BufRead;
 use std::sync::Arc;
 use std::time::Instant;
@@ -6,7 +6,7 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
 
-use crate::agent::definition::canonical_agent_id;
+use crate::agent::definition::{canonical_agent_id, AgentDefRegistry};
 use crate::error::{AppError, ErrorSeverity};
 use crate::feishu_docs::{
     self, FeishuReferenceConfigInput, FeishuReferenceConnectionTestResult,
@@ -26,6 +26,7 @@ use crate::knowledge_store::{
     KnowledgeSearchHit, KnowledgeSourceProvider, KnowledgeTargetKind, KnowledgeType,
     KnowledgeUpdateOp, KnowledgeUpdateRequest, SkillSurface,
 };
+use crate::tool::ToolRegistry;
 use crate::unity_docs::{
     self, UnityManagedDirectoryStat, UnityReferenceImportState, UnityReferenceImportStatus,
 };
@@ -807,6 +808,18 @@ pub(crate) fn execute_knowledge_read_request(
         KnowledgeTargetKind::Document => {
             let (doc_type, normalized_path) =
                 resolve_knowledge_document_target(request.doc_type, &request.path)?;
+            if doc_type == KnowledgeType::Skill {
+                if let Some(result) = super::skill::read_skill_package_document_sync(
+                    &normalized_path,
+                    request.part.as_deref().unwrap_or("full"),
+                )? {
+                    return Ok(KnowledgeReadResponse {
+                        kind: KnowledgeTargetKind::Document,
+                        document: Some(result),
+                        directory: None,
+                    });
+                }
+            }
             ensure_memory_builtins_for_type(working_dir, Some(doc_type))?;
             let result = knowledge_store::read_document_with_app_root(
                 working_dir,
@@ -854,6 +867,12 @@ pub(crate) fn execute_knowledge_create_request(
                 request.doc_type.or(document_patch.doc_type),
                 &request.path,
             )?;
+            if doc_type == KnowledgeType::Skill {
+                return Err(
+                    "knowledge_create cannot create Skill documents; use skill_create instead."
+                        .to_string(),
+                );
+            }
             ensure_memory_builtins_for_type(working_dir, Some(doc_type))?;
             let parent_path = parent_directory_from_document_path(&normalized_path);
             ensure_parent_directory_allows_create(
@@ -909,6 +928,12 @@ pub(crate) fn execute_knowledge_create_request(
         KnowledgeTargetKind::Directory => {
             let (doc_type, normalized_path) =
                 resolve_knowledge_directory_target(request.doc_type, &request.path)?;
+            if doc_type == KnowledgeType::Skill {
+                return Err(
+                    "knowledge_create cannot create Skill directories; use skill_create instead."
+                        .to_string(),
+                );
+            }
             let parent_path = parent_directory_from_directory_path(&normalized_path);
             ensure_parent_directory_allows_create(
                 working_dir,
@@ -1827,6 +1852,25 @@ pub async fn knowledge_list(
     .await
     .map_err(AppError::from)?;
     let mut items = items;
+    if resolved_type.is_none() || resolved_type == Some(KnowledgeType::Skill) {
+        let existing_paths = items
+            .iter()
+            .filter(|item| item.doc_type == KnowledgeType::Skill)
+            .map(|item| item.path.clone())
+            .collect::<HashSet<_>>();
+        items.extend(
+            super::skill::list_skill_package_knowledge_items_sync(resolved_prefix.as_deref())
+                .into_iter()
+                .filter(|item| !existing_paths.contains(&item.path)),
+        );
+        items.sort_by(|a, b| {
+            a.doc_type
+                .as_str()
+                .cmp(b.doc_type.as_str())
+                .then(a.path.cmp(&b.path))
+                .then(a.title.cmp(&b.title))
+        });
+    }
     enrich_knowledge_list_items(
         &working_dir,
         app_knowledge_dir.0.as_ref().as_ref(),
@@ -2893,6 +2937,156 @@ pub async fn preview_workspace_file(
 
 // ══════════════════════════════════════════════════════════════════
 // ══════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentToolLoadConfig {
+    #[serde(default)]
+    pub direct_load: HashMap<String, bool>,
+}
+
+fn tool_load_config_path(working_dir: &str, agent_id: &str) -> std::path::PathBuf {
+    let agent_id = canonical_agent_id(agent_id);
+    std::path::Path::new(working_dir)
+        .join("Locus")
+        .join("agent")
+        .join(agent_id)
+        .join("tool_load_config.json")
+}
+
+pub fn load_tool_load_config(working_dir: &str, agent_id: &str) -> AgentToolLoadConfig {
+    let path = tool_load_config_path(working_dir, agent_id);
+    match std::fs::read_to_string(&path) {
+        Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
+        Err(_) => AgentToolLoadConfig::default(),
+    }
+}
+
+fn save_tool_load_config(
+    working_dir: &str,
+    agent_id: &str,
+    config: &AgentToolLoadConfig,
+) -> Result<(), String> {
+    let path = tool_load_config_path(working_dir, agent_id);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create directory: {}", e))?;
+    }
+    let json =
+        serde_json::to_string_pretty(config).map_err(|e| format!("Serialization failed: {}", e))?;
+    std::fs::write(&path, json).map_err(|e| format!("Failed to save config: {}", e))?;
+    Ok(())
+}
+
+fn load_app_tool_load_config(
+    app_agent_dir: &Option<std::path::PathBuf>,
+    agent_id: &str,
+) -> AgentToolLoadConfig {
+    let agent_id = canonical_agent_id(agent_id);
+    if let Some(app_dir) = app_agent_dir {
+        let path = app_dir.join(agent_id).join("tool_load_config.json");
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            return serde_json::from_str(&content).unwrap_or_default();
+        }
+    }
+    AgentToolLoadConfig::default()
+}
+
+pub fn merged_tool_load_config_for_agent(
+    app_agent_dir: &Option<std::path::PathBuf>,
+    working_dir: &str,
+    agent_id: &str,
+) -> AgentToolLoadConfig {
+    let agent_id = canonical_agent_id(agent_id);
+    let mut config = load_app_tool_load_config(app_agent_dir, agent_id);
+    if !working_dir.trim().is_empty() {
+        let ws_config = load_tool_load_config(working_dir, agent_id);
+        for (name, direct_load) in ws_config.direct_load {
+            config.direct_load.insert(name, direct_load);
+        }
+    }
+    config
+}
+
+pub fn save_tool_direct_load_override(
+    working_dir: &str,
+    agent_id: &str,
+    tool_name: &str,
+    direct_load: bool,
+    default_direct_load: bool,
+) -> Result<(), String> {
+    let mut config = load_tool_load_config(working_dir, agent_id);
+    let key = tool_name.trim().to_string();
+    if direct_load == default_direct_load {
+        config.direct_load.remove(&key);
+    } else {
+        config.direct_load.insert(key, direct_load);
+    }
+    save_tool_load_config(working_dir, agent_id, &config)
+}
+
+#[tauri::command]
+pub async fn set_agent_tool_direct_load(
+    agent_id: String,
+    tool_name: String,
+    direct_load: bool,
+    registry: State<'_, Arc<AgentDefRegistry>>,
+    tool_registry: State<'_, Arc<ToolRegistry>>,
+    workspace: State<'_, Arc<Workspace>>,
+) -> Result<(), AppError> {
+    let agent_id = canonical_agent_id(&agent_id).to_string();
+    let def = registry
+        .get(&agent_id)
+        .ok_or_else(|| format!("Agent '{}' not found", agent_id))?;
+    let working_dir = workspace.path.read().await.clone();
+    if working_dir.trim().is_empty() {
+        return Err("No working directory selected".to_string().into());
+    }
+
+    let canonical = tool_registry
+        .canonical_name(&tool_name)
+        .map(str::to_string)
+        .ok_or_else(|| format!("Tool '{}' not found", tool_name))?;
+    if matches!(canonical.as_str(), "tool_load" | "tool_call") {
+        return Err(format!("Tool '{}' load mode is fixed", canonical).into());
+    }
+    if !tool_registry.is_built_in(&canonical) {
+        return Err(format!(
+            "Tool '{}' is provided by a skill and is loaded only through skills",
+            canonical
+        )
+        .into());
+    }
+    if tool_registry.default_load_mode(&canonical) == crate::tool::ToolLoadMode::Skill {
+        return Err(format!(
+            "Tool '{}' load mode is controlled by the tool registry",
+            canonical
+        )
+        .into());
+    }
+
+    let enabled_for_agent = def.tools.iter().any(|name| {
+        tool_registry
+            .canonical_name(name)
+            .is_some_and(|tool| tool == canonical)
+    });
+    if !enabled_for_agent {
+        return Err(format!(
+            "Tool '{}' is not enabled for agent '{}'",
+            canonical, agent_id
+        )
+        .into());
+    }
+
+    save_tool_direct_load_override(
+        &working_dir,
+        &agent_id,
+        &canonical,
+        direct_load,
+        tool_registry.default_load_mode(&canonical) == crate::tool::ToolLoadMode::Direct,
+    )
+    .map_err(Into::into)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

@@ -31,6 +31,7 @@ const tauriEventMocks = vi.hoisted(() => ({
 }));
 
 const knowledgeMocks = vi.hoisted(() => ({
+  createSkillScaffold: vi.fn(),
   knowledgeActivateEmbedding: vi.fn(),
   knowledgeCreate: vi.fn(),
   knowledgeDelete: vi.fn(),
@@ -622,6 +623,30 @@ describe("useKnowledgeState", () => {
           hasSummary:
             !!input.document?.summaryEnabled && !!input.document?.summary,
         },
+      };
+    });
+    knowledgeMocks.createSkillScaffold.mockImplementation(async (input: any) => {
+      const dirName = (input.path ?? `${input.name}.md`)
+        .replace(/\\/g, "/")
+        .replace(/^skill\//, "")
+        .replace(/\.md$/i, "");
+      return {
+        name: input.name,
+        description: input.summary ?? "",
+        argumentHint: input.argumentHint ?? "",
+        dirName,
+        source: "project",
+        relPath: `skill/${dirName}.md`,
+        updatedAt: 2,
+        skillEnabled: true,
+        skillSurface: "command",
+        skillDescription: input.summary ?? null,
+        commandTrigger: input.commandTrigger ?? `/${input.name}`,
+        kind: "document",
+        hasUnity: false,
+        hasL0: true,
+        hasL1: true,
+        hasL2: true,
       };
     });
     knowledgeMocks.knowledgeEdit.mockImplementation(async (input: any) => {
@@ -2204,20 +2229,11 @@ describe("useKnowledgeState", () => {
     state.selectType("skill");
     await state.createDocument("Create Skill");
 
-    expect(knowledgeMocks.knowledgeCreate).toHaveBeenCalledWith(
+    expect(knowledgeMocks.createSkillScaffold).toHaveBeenCalledWith(
       expect.objectContaining({
-        kind: "document",
-        type: "skill",
+        name: "create-skill",
         path: "create-skill.md",
-        document: expect.objectContaining({
-          title: "Create Skill",
-          inheritInjectMode: true,
-          inheritAiConfig: true,
-          summaryEnabled: true,
-          skillEnabled: true,
-          skillSurface: "command",
-          commandTrigger: "/create-skill",
-        }),
+        commandTrigger: "/create-skill",
       }),
     );
   });
@@ -2234,16 +2250,11 @@ describe("useKnowledgeState", () => {
     state.selectType("skill");
     await state.createDocumentAt("unity", "asset-audit");
 
-    expect(knowledgeMocks.knowledgeCreate).toHaveBeenCalledWith(
+    expect(knowledgeMocks.createSkillScaffold).toHaveBeenCalledWith(
       expect.objectContaining({
-        kind: "document",
-        type: "skill",
+        name: "asset-audit",
         path: "unity/asset-audit.md",
-        document: expect.objectContaining({
-          skillEnabled: true,
-          skillSurface: "command",
-          commandTrigger: "/asset-audit",
-        }),
+        commandTrigger: "/asset-audit",
       }),
     );
   });

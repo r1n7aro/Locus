@@ -232,6 +232,7 @@ pub enum LlmBackend {
         reasoning_param_format: crate::commands::CustomReasoningParamFormat,
         replay_reasoning_content: bool,
         server_tools: crate::commands::CustomEndpointServerTools,
+        supports_tool_lazy_loading: bool,
     },
 }
 

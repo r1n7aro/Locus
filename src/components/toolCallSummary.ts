@@ -71,7 +71,7 @@ export function buildToolCallArgsSummary(toolName: string, argumentsText: string
       return `${getStringArg(specRecord, ["title"]) || "Canvas"} (${nodes} nodes, ${edges} edges)`;
     }
 
-    if (toolName === "webfetch") {
+    if (toolName === "web_fetch") {
       return getStringArg(args, ["url"]);
     }
 

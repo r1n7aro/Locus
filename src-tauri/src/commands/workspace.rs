@@ -32,6 +32,13 @@ pub(crate) fn persistent_config_dir() -> Result<std::path::PathBuf, String> {
     Ok(dir)
 }
 
+pub(crate) fn app_temp_dir() -> Result<std::path::PathBuf, String> {
+    let dir = persistent_config_dir()?.join("temp");
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("Failed to create app temp directory: {}", e))?;
+    Ok(dir)
+}
+
 fn read_nonempty_string(path: &std::path::Path) -> Option<String> {
     std::fs::read_to_string(path)
         .ok()
@@ -878,6 +885,10 @@ pub struct CustomEndpointServerTools {
     pub web_search: bool,
 }
 
+fn default_supports_tool_lazy_loading() -> bool {
+    false
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CustomEndpoint {
@@ -900,6 +911,8 @@ pub struct CustomEndpoint {
     pub replay_reasoning_content: Option<bool>,
     #[serde(default)]
     pub server_tools: CustomEndpointServerTools,
+    #[serde(default = "default_supports_tool_lazy_loading")]
+    pub supports_tool_lazy_loading: bool,
 }
 
 const DEFAULT_CUSTOM_ENDPOINT_CONTEXT_LENGTH: u32 = 256_000;
@@ -1278,6 +1291,24 @@ pub async fn set_debug_mode(
     config: State<'_, Arc<crate::config::AppConfig>>,
 ) -> Result<(), AppError> {
     config.set_debug_enabled(value).map_err(AppError::from)?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn get_file_tool_workspace_boundary(
+    config: State<'_, Arc<crate::config::AppConfig>>,
+) -> Result<bool, AppError> {
+    Ok(config.file_tool_workspace_boundary_enabled())
+}
+
+#[tauri::command]
+pub async fn set_file_tool_workspace_boundary(
+    value: bool,
+    config: State<'_, Arc<crate::config::AppConfig>>,
+) -> Result<(), AppError> {
+    config
+        .set_file_tool_workspace_boundary_enabled(value)
+        .map_err(AppError::from)?;
     Ok(())
 }
 
@@ -2320,6 +2351,7 @@ mod tests {
         assert_eq!(endpoints[0].context_length, 256_000);
         assert_eq!(endpoints[0].replay_reasoning_content, Some(true));
         assert!(!endpoints[0].server_tools.web_search);
+        assert!(!endpoints[0].supports_tool_lazy_loading);
     }
 
     #[test]

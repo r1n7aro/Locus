@@ -116,6 +116,7 @@ describe("useModelStore OpenAI effort mapping", () => {
       reasoningParamFormat: "openai_responses_reasoning_effort",
       replayReasoningContent: false,
       serverTools: { webSearch: false },
+      supportsToolLazyLoading: false,
     }]);
     modelStore.selectedModelId = "custom/endpoint-1";
 
@@ -137,6 +138,7 @@ describe("useModelStore OpenAI effort mapping", () => {
       reasoningParamFormat: "openai_chat_reasoning_effort",
       replayReasoningContent: true,
       serverTools: { webSearch: false },
+      supportsToolLazyLoading: false,
     } as any]);
     modelStore.selectedModelId = "custom/endpoint-1";
 
@@ -160,6 +162,7 @@ describe("useModelStore OpenAI effort mapping", () => {
       reasoningParamFormat: "openai_chat_reasoning_effort",
       replayReasoningContent: true,
       serverTools: { webSearch: false },
+      supportsToolLazyLoading: false,
     }]);
     modelStore.selectedModelId = "custom/endpoint-1";
 

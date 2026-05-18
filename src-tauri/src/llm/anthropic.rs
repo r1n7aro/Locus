@@ -1540,7 +1540,7 @@ fn oauth_public_tool_name(internal_name: &str) -> String {
         "unity_yaml_list" => "UnityYamlList".to_string(),
         "unity_yaml_search" => "UnityYamlSearch".to_string(),
         "unity_yaml_read" => "UnityYamlRead".to_string(),
-        "webfetch" => "WebFetch".to_string(),
+        "web_fetch" => "WebFetch".to_string(),
         other => oauth_pascal_case(other),
     }
 }

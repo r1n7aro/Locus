@@ -310,6 +310,8 @@ fn request_without_input(body: &serde_json::Value) -> serde_json::Value {
         map.remove("input");
         map.remove("previous_response_id");
         map.remove("type");
+        map.remove("tools");
+        map.remove("tool_choice");
     }
     request
 }

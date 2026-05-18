@@ -1,0 +1,14 @@
+{
+  "description": "List Skill manifests currently discoverable by Locus, including project Skills, built-in app Skills, and app-installed Skill packages. Returns one plain-text line per Skill.",
+  "parameters": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "source": {
+        "type": "string",
+        "enum": ["project", "app"],
+        "description": "Optional source filter."
+      }
+    }
+  }
+}

@@ -73,6 +73,8 @@ export interface ImageAttachment {
 
 export type AssetRefKind = "asset" | "sceneObject" | "knowledge";
 
+export type KnowledgeAccessMode = "disabled" | "read_only" | "full";
+
 export interface AssetRefAttachment {
   path: string;
   kind: AssetRefKind;
@@ -275,6 +277,7 @@ export interface CustomEndpoint {
   reasoningParamFormat: ReasoningParamFormat;
   replayReasoningContent: boolean;
   serverTools: CustomEndpointServerTools;
+  supportsToolLazyLoading: boolean;
 }
 
 export interface ModelDefaults {
@@ -453,6 +456,7 @@ export interface AppUpdateInfo {
   title: string;
   summary: string;
   changelogUrl: string;
+  releaseUrl: string;
   downloadUrl: string;
   downloadLabel: string;
   changes: AppUpdateChangeGroup[];
@@ -775,6 +779,13 @@ export interface SkillManifest {
   skillSurface: SkillSurface;
   skillDescription: string | null;
   commandTrigger: string;
+  kind?: "document" | "package";
+  packageId?: string | null;
+  packageVersion?: string | null;
+  hasUnity?: boolean;
+  hasL0?: boolean;
+  hasL1?: boolean;
+  hasL2?: boolean;
 }
 
 export interface SkillConfig {
@@ -782,6 +793,47 @@ export interface SkillConfig {
   surface: SkillSurface;
   description: string;
   commandTrigger: string;
+}
+
+export type SkillUnityInstallState =
+  | "pluginMissing"
+  | "notApplicable"
+  | "notInstalled"
+  | "installed"
+  | "partial"
+  | "modified"
+  | "sourceMissing";
+
+export interface SkillUnityFileStatus {
+  sourcePath: string;
+  targetPath: string;
+  state: string;
+  sourceHash?: string | null;
+  installedHash?: string | null;
+}
+
+export interface SkillUnityInstallStatus {
+  packageId: string;
+  hasUnity: boolean;
+  state: SkillUnityInstallState;
+  pluginRoot: string;
+  installRoot: string;
+  files: SkillUnityFileStatus[];
+  message?: string | null;
+}
+
+export interface SkillCreateInput {
+  kind?: "md" | "package";
+  name: string;
+  path?: string;
+  packageId?: string | null;
+  version?: string | null;
+  summary?: string | null;
+  body?: string;
+  argumentHint?: string | null;
+  commandTrigger?: string | null;
+  commandEnabled?: boolean;
+  modelInvocationEnabled?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -1670,13 +1722,27 @@ export interface AgentSystemPromptStats {
   totalChars: number;
 }
 
+export type InjectedToolLoadMode = "direct" | "lazy" | "skill";
+
+export interface InjectedToolMeta {
+  function?: unknown;
+  loadMode?: InjectedToolLoadMode;
+  loadReason?: string;
+  directLoaded?: boolean;
+  directLoadDefault?: boolean;
+  directLoadOverride?: boolean | null;
+  canConfigureDirectLoad?: boolean;
+  nativeLazy?: boolean;
+  toolSource?: "builtIn" | "skill" | string;
+}
+
 export interface InjectedPromptItem {
   id: string;
   title: string;
   kind: "rule" | "context" | "tools";
   content: string;
-  source: "builtIn" | "runtime";
-  meta?: unknown | null;
+  source: "builtIn" | "runtime" | "system";
+  meta?: InjectedToolMeta | Record<string, unknown> | null;
 }
 
 export interface CanvasFieldUpdate {

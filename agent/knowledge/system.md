@@ -11,10 +11,11 @@ Use knowledge tools as the primary write path:
 - `knowledge_read` to read a specific document by type-prefixed `.md` path.
 - `knowledge_list` to browse document entries under a type or directory path prefix.
 - `knowledge_edit` to update document content sections.
-- `knowledge_create`, `knowledge_move`, and `knowledge_delete` for document or directory lifecycle changes.
+- `knowledge_create`, `knowledge_move`, and `knowledge_delete` for Design, Memory, and Reference document or directory lifecycle changes.
+- `skill_create`, `skill_reload`, and `skill_list` for Skill lifecycle work, including Markdown Skill documents and APP Skill packages.
 - The current public tool surface exposes document reads and document-content edits. Directory config is not a public read or edit target.
 
-Do not use generic file editing tools inside knowledge roots.
+Use dedicated knowledge tools inside knowledge roots. Filesystem tools may edit files inside an APP Skill package root returned by `skill_create`.
 
 When maintaining knowledge:
 - Keep the knowledge base current and structurally sound when the user gives new project information or implementation changes affect document correctness.

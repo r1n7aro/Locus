@@ -235,6 +235,7 @@ pub fn run() {
             commands::handle_unity_embed_webview_event(webview, event);
         })
         .on_window_event(|window, event| {
+            commands::handle_locus_window_event(window, event);
             if window.label() != MAIN_WINDOW_LABEL {
                 return;
             }
@@ -795,6 +796,7 @@ pub fn run() {
             commands::get_agent_env_template,
             commands::get_agent_system_prompt_stats,
             commands::list_agent_injected_items,
+            commands::set_agent_tool_direct_load,
             commands::load_session,
             commands::list_sessions,
             commands::list_archived_sessions,
@@ -957,6 +959,9 @@ pub fn run() {
             commands::list_skills,
             commands::read_skill_manifest,
             commands::create_skill_scaffold,
+            commands::get_skill_unity_install_status,
+            commands::install_skill_unity_files,
+            commands::remove_skill_unity_files,
             commands::open_file_external,
             commands::reveal_workspace_file,
             commands::knowledge_reveal_target,
@@ -1004,6 +1009,8 @@ pub fn run() {
             commands::undo_check_conflicts,
             commands::get_debug_mode,
             commands::set_debug_mode,
+            commands::get_file_tool_workspace_boundary,
+            commands::set_file_tool_workspace_boundary,
             commands::get_tool_permission_mode,
             commands::save_tool_permission_mode,
             commands::get_tool_permissions,

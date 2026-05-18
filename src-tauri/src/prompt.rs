@@ -15,7 +15,7 @@ pub mod tools {
     pub const EDIT: &str = include_str!("../../tools/edit.json");
     pub const BASH: &str = include_str!("../../tools/bash.json");
     pub const GREP: &str = include_str!("../../tools/grep.json");
-    pub const WEBFETCH: &str = include_str!("../../tools/webfetch.json");
+    pub const WEB_FETCH: &str = include_str!("../../tools/web_fetch.json");
     pub const TODOWRITE: &str = include_str!("../../tools/todowrite.json");
     pub const UNITY_EXECUTE: &str = include_str!("../../tools/unity_execute.json");
     pub const UNITY_RUN_STATES: &str = include_str!("../../tools/unity_run_states.json");
@@ -35,7 +35,12 @@ pub mod tools {
     pub const KNOWLEDGE_DELETE: &str = include_str!("../../tools/knowledge_delete.json");
     pub const KNOWLEDGE_MOVE: &str = include_str!("../../tools/knowledge_move.json");
     pub const KNOWLEDGE_EDIT: &str = include_str!("../../tools/knowledge_edit.json");
+    pub const SKILL_CREATE: &str = include_str!("../../tools/skill_create.json");
+    pub const SKILL_RELOAD: &str = include_str!("../../tools/skill_reload.json");
+    pub const SKILL_LIST: &str = include_str!("../../tools/skill_list.json");
     pub const CONFIG_QUERY: &str = include_str!("../../tools/config_query.json");
+    pub const TOOL_LOAD: &str = include_str!("../../tools/tool_load.json");
+    pub const TOOL_CALL: &str = include_str!("../../tools/tool_call.json");
 }
 
 #[derive(serde::Deserialize)]
@@ -79,7 +84,7 @@ mod tests {
             ("edit", tools::EDIT),
             ("bash", tools::BASH),
             ("grep", tools::GREP),
-            ("webfetch", tools::WEBFETCH),
+            ("web_fetch", tools::WEB_FETCH),
             ("todowrite", tools::TODOWRITE),
             ("unity_execute", tools::UNITY_EXECUTE),
             ("unity_run_states", tools::UNITY_RUN_STATES),
@@ -99,7 +104,12 @@ mod tests {
             ("knowledge_delete", tools::KNOWLEDGE_DELETE),
             ("knowledge_move", tools::KNOWLEDGE_MOVE),
             ("knowledge_edit", tools::KNOWLEDGE_EDIT),
+            ("skill_create", tools::SKILL_CREATE),
+            ("skill_reload", tools::SKILL_RELOAD),
+            ("skill_list", tools::SKILL_LIST),
             ("config_query", tools::CONFIG_QUERY),
+            ("tool_load", tools::TOOL_LOAD),
+            ("tool_call", tools::TOOL_CALL),
         ];
 
         for (name, json_str) in tool_prompts {

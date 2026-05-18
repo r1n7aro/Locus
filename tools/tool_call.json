@@ -1,0 +1,18 @@
+{
+  "description": "Call a Locus tool by name on endpoints that use meta-tool dispatch. Use `tool_load` first when you need the target tool description or parameter schema. The target tool must be allowed for the current agent.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "toolName": {
+        "type": "string",
+        "description": "Name of the target tool to execute."
+      },
+      "arguments": {
+        "type": "object",
+        "description": "Arguments for the target tool, using that tool's parameter names."
+      }
+    },
+    "required": ["toolName", "arguments"],
+    "additionalProperties": false
+  }
+}

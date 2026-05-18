@@ -41,6 +41,9 @@ describe("agentPromptDashboard", () => {
     expect(summary.totalRuleCount).toBe(3);
     expect(summary.injectedContextCount).toBe(1);
     expect(summary.toolCount).toBe(2);
+    expect(summary.directToolCount).toBe(2);
+    expect(summary.lazyToolCount).toBe(0);
+    expect(summary.skillToolCount).toBe(0);
     expect(summary.parts.map((part) => part.key)).toEqual([
       "base",
       "env",
@@ -92,5 +95,37 @@ describe("agentPromptDashboard", () => {
     expect(summary.health.level).toBe("heavy");
     expect(summary.health.score).toBeLessThan(60);
     expect(summary.health.dominantPartKey).toBe("knowledge");
+  });
+
+  it("counts only direct tool schemas in the baseline context", () => {
+    const readMeta = makeToolMeta("read", { filePath: { type: "string" } });
+    const editMeta = makeToolMeta("edit", {
+      filePath: { type: "string" },
+      oldText: { type: "string" },
+    });
+    const summary = buildAgentPromptDashboard(
+      {
+        baseChars: 1200,
+        envChars: 400,
+        rulesChars: 800,
+        knowledgeChars: 600,
+        totalChars: 3000,
+      },
+      [{ enabled: true }],
+      [
+        { kind: "tools", meta: { function: readMeta, loadMode: "direct" } },
+        { kind: "tools", meta: { function: editMeta, loadMode: "lazy" } },
+        { kind: "tools", meta: { function: makeToolMeta("skill_runner"), loadMode: "skill" } },
+      ],
+    );
+
+    const toolPart = summary.parts.find((part) => part.key === "tools");
+
+    expect(summary.toolCount).toBe(3);
+    expect(summary.directToolCount).toBe(1);
+    expect(summary.lazyToolCount).toBe(1);
+    expect(summary.skillToolCount).toBe(1);
+    expect(toolPart?.tokens).toBeGreaterThan(0);
+    expect(toolPart?.tokens).toBeLessThan(200);
   });
 });

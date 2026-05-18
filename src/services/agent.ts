@@ -1,5 +1,11 @@
 import { ipcInvoke } from "./ipc";
-import type { AgentInfo, AgentSystemPromptStats, InjectedPromptItem, RuleItem } from "../types";
+import type {
+  AgentInfo,
+  AgentSystemPromptStats,
+  InjectedPromptItem,
+  KnowledgeAccessMode,
+  RuleItem,
+} from "../types";
 
 export function listAgents(): Promise<AgentInfo[]> {
   return ipcInvoke<AgentInfo[]>("list_agents");
@@ -21,8 +27,18 @@ export function getAgentSystemPromptStats(agentId: string): Promise<AgentSystemP
   return ipcInvoke<AgentSystemPromptStats>("get_agent_system_prompt_stats", { agentId });
 }
 
-export function listAgentInjectedItems(agentId: string): Promise<InjectedPromptItem[]> {
-  return ipcInvoke<InjectedPromptItem[]>("list_agent_injected_items", { agentId });
+export function listAgentInjectedItems(
+  agentId: string,
+  knowledgeMode?: KnowledgeAccessMode | null,
+): Promise<InjectedPromptItem[]> {
+  return ipcInvoke<InjectedPromptItem[]>("list_agent_injected_items", {
+    agentId,
+    knowledgeMode: knowledgeMode ?? null,
+  });
+}
+
+export function setAgentToolDirectLoad(agentId: string, toolName: string, directLoad: boolean): Promise<void> {
+  return ipcInvoke("set_agent_tool_direct_load", { agentId, toolName, directLoad });
 }
 
 export function listRules(agentId: string): Promise<RuleItem[]> {

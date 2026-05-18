@@ -410,9 +410,50 @@ impl<'a> ClaudeSdkHost for ClaudeSdkRoundHost<'a> {
         arguments: serde_json::Value,
     ) -> ClaudeSdkHostFuture<'b> {
         Box::pin(async move {
-            let tool_call = self.take_matching_tool_call(request_id, tool_name, &arguments);
+            let mut tool_call = self.take_matching_tool_call(request_id, tool_name, &arguments);
             let mut args_for_exec = arguments.clone();
-            normalize_tool_args(&mut args_for_exec);
+            if tool_call.name == "tool_call" {
+                match super::parse_meta_tool_call_arguments(&tool_call.arguments) {
+                    Ok((target_name, mut target_args)) => {
+                        let allowed = self.agent.allowed_tool_set().await;
+                        if let Some(canonical) = self
+                            .agent
+                            .tool_registry
+                            .canonical_name(&target_name)
+                            .map(str::to_string)
+                            .filter(|name| {
+                                !AgentInstance::is_meta_tool(name) && allowed.contains(name)
+                            })
+                        {
+                            normalize_tool_args(&mut target_args);
+                            let target_arguments = serde_json::to_string(&target_args)
+                                .unwrap_or_else(|_| "{}".to_string());
+                            eprintln!(
+                                "[Agent {}] meta-call dispatch: tool_call -> '{}' args_len={}",
+                                self.agent.id,
+                                canonical,
+                                target_arguments.len()
+                            );
+                            tool_call.name = canonical;
+                            tool_call.arguments = target_arguments.clone();
+                            args_for_exec = target_args;
+                            self.emit_tool_call_start(
+                                &tool_call.id,
+                                &tool_call.name,
+                                &tool_call.arguments,
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "[Agent {}] invalid Claude SDK meta-call arguments for tool_call id={}: {}",
+                            self.agent.id, tool_call.id, error
+                        );
+                    }
+                }
+            } else {
+                normalize_tool_args(&mut args_for_exec);
+            }
             self.agent
                 .inject_working_dir(&tool_call.name, &mut args_for_exec);
 
@@ -470,6 +511,8 @@ impl<'a> ClaudeSdkHost for ClaudeSdkRoundHost<'a> {
                     .iter_mut()
                     .find(|pending_tool_call| pending_tool_call.id == tool_call.id)
                 {
+                    existing.name = tool_call.name.clone();
+                    existing.arguments = tool_call.arguments.clone();
                     *existing = finalize_tool_call_record(existing, Some(&result));
                 }
                 round.remaining.remove(&tool_call.id);
@@ -492,8 +535,8 @@ impl AgentInstance {
         initial_mode: &str,
         run_id: &str,
     ) -> Result<String, String> {
-        let effective_tools = self.resolve_effective_tool_names().await;
-        let api_tools = self.build_api_tools(&effective_tools).await;
+        let request_tools = self.build_request_tool_names().await;
+        let api_tools = self.build_api_tools(&request_tools).await;
 
         let resume_session_id = anthropic_agent_sdk::cached_session_id(&self.session_id).await;
         if resume_session_id.is_none() && store.get_messages_for_prompt(&self.session_id)?.len() > 1

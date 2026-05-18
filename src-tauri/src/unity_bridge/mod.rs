@@ -15,7 +15,7 @@ use tokio::sync::Mutex;
 
 pub use plugin::{
     check_plugin_status, emit_plugin_status, find_plugin_source_dir, install_or_update_plugin,
-    PluginStatus,
+    plugin_install_root, plugin_skills_root, PluginStatus,
 };
 pub use transport::{send_message, send_message_with_timeout, send_message_without_timeout};
 

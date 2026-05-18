@@ -1,5 +1,5 @@
 {
-  "description": "Create a unified knowledge document or knowledge directory. Document paths must end with `.md`; directory paths do not. New documents and folders inherit inject mode and AI edit config from the parent directory by default, and top-level folders inherit the type defaults. Document creation may include initial content. Directory creation only creates the folder structure; metadata and config use dedicated knowledge tools. Returns a plain-text status line.",
+  "description": "Create a unified non-Skill knowledge document or knowledge directory. Use `skill_create` for Skill documents and Skill packages. Document paths must end with `.md`; directory paths do not. New documents and folders inherit inject mode and AI edit config from the parent directory by default, and top-level folders inherit the type defaults. Document creation may include initial content. Directory creation only creates the folder structure; metadata and config use dedicated knowledge tools. Returns a plain-text status line.",
   "parameters": {
     "type": "object",
     "additionalProperties": false,
@@ -11,7 +11,7 @@
       },
       "path": {
         "type": "string",
-        "description": "Target type-prefixed path. Use a `.md` suffix for `kind=document`, for example `design/combat/hit-reaction.md` or `skill/build/release.md`; omit `.md` for `kind=directory`."
+        "description": "Target type-prefixed path. Use a `.md` suffix for `kind=document`, for example `design/combat/hit-reaction.md` or `memory/preferences/editor.md`; omit `.md` for `kind=directory`. Skill paths are rejected; use `skill_create`."
       },
       "document": {
         "type": "object",

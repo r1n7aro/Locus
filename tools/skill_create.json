@@ -1,0 +1,55 @@
+{
+  "description": "Create a project Skill document or an app Skill package with explicit metadata. Use this instead of `knowledge_create` whenever the target is a Skill. Returns a plain-text status line with the created Skill path and command trigger.",
+  "parameters": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "kind": {
+        "type": "string",
+        "enum": ["md", "package"],
+        "description": "Create a single Markdown Skill document (`md`) or an app-installed Skill package (`package`)."
+      },
+      "name": {
+        "type": "string",
+        "description": "Lowercase kebab-case Skill name for documents, or display-oriented package name when `kind` is `package`."
+      },
+      "path": {
+        "type": "string",
+        "description": "Document-only Skill path. Accepts `asset-audit.md`, `unity/asset-audit.md`, or `skill/unity/asset-audit.md`. When omitted, uses `<name>.md`."
+      },
+      "packageId": {
+        "type": "string",
+        "description": "Package-only required app Skill package id, for example `com.example.asset-audit`."
+      },
+      "version": {
+        "type": "string",
+        "description": "Package-only required semantic version, for example `0.1.0`."
+      },
+      "summary": {
+        "type": ["string", "null"],
+        "description": "Required one-line Skill description or package description."
+      },
+      "body": {
+        "type": "string",
+        "description": "Optional body for the Skill `## Content` section. Omit to create the standard scaffold."
+      },
+      "argumentHint": {
+        "type": ["string", "null"],
+        "description": "Optional slash-command argument hint."
+      },
+      "commandTrigger": {
+        "type": ["string", "null"],
+        "description": "Optional slash command trigger. Defaults to `/<name>`."
+      },
+      "commandEnabled": {
+        "type": "boolean",
+        "description": "Whether the Skill should expose a slash command. Defaults to true."
+      },
+      "modelInvocationEnabled": {
+        "type": "boolean",
+        "description": "Package-only metadata for automatic model invocation. Defaults to true."
+      }
+    },
+    "required": ["kind", "name", "summary"]
+  }
+}

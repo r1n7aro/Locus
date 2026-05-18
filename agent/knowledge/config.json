@@ -8,6 +8,7 @@
     "task",
     "todowrite",
     "ask_user_question",
+    "web_fetch",
     "unity_asset_search",
     "unity_ref_search",
     "unity_yaml_list",
@@ -19,7 +20,10 @@
     "knowledge_create",
     "knowledge_edit",
     "knowledge_move",
-    "knowledge_delete"
+    "knowledge_delete",
+    "skill_create",
+    "skill_reload",
+    "skill_list"
   ],
   "sub_agents": ["explorer"],
   "default": false,

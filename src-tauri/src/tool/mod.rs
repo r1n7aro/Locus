@@ -7,6 +7,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
+use tauri::AppHandle;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolResult {
@@ -21,6 +22,7 @@ pub struct ToolRuntimeState {
 
 #[derive(Clone, Default)]
 pub struct ToolExecutionContext {
+    pub app_handle: Option<AppHandle>,
     pub working_dir: Option<String>,
     pub unity_connected: Option<bool>,
     pub runtime_state: Option<Arc<ToolRuntimeState>>,
@@ -93,23 +95,65 @@ pub struct ToolDef {
     pub execute: ToolExecuteFn,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolLoadMode {
+    Direct,
+    Lazy,
+    Skill,
+}
+
 pub struct ToolRegistry {
     tools: HashMap<String, ToolDef>,
+    built_in_tools: HashSet<String>,
+    load_modes: HashMap<String, ToolLoadMode>,
 }
 
 fn normalize_tool_name_key(name: &str) -> String {
     name.trim().to_ascii_lowercase()
 }
 
+pub fn default_load_mode_for_builtin_tool(name: &str) -> ToolLoadMode {
+    if matches!(
+        normalize_tool_name_key(name).as_str(),
+        "knowledge_create"
+            | "knowledge_delete"
+            | "knowledge_move"
+            | "skill_create"
+            | "unity_run_states"
+            | "web_fetch"
+    ) {
+        ToolLoadMode::Lazy
+    } else {
+        ToolLoadMode::Direct
+    }
+}
+
 impl ToolRegistry {
     pub fn new() -> Self {
         ToolRegistry {
             tools: HashMap::new(),
+            built_in_tools: HashSet::new(),
+            load_modes: HashMap::new(),
         }
     }
 
+    #[allow(dead_code)]
     pub fn register(&mut self, tool: ToolDef) {
-        self.tools.insert(normalize_tool_name_key(&tool.name), tool);
+        let key = normalize_tool_name_key(&tool.name);
+        self.load_modes.insert(key.clone(), ToolLoadMode::Skill);
+        self.tools.insert(key, tool);
+    }
+
+    pub fn register_builtin(&mut self, tool: ToolDef) {
+        let mode = default_load_mode_for_builtin_tool(&tool.name);
+        self.register_builtin_with_load_mode(tool, mode);
+    }
+
+    pub fn register_builtin_with_load_mode(&mut self, tool: ToolDef, load_mode: ToolLoadMode) {
+        let key = normalize_tool_name_key(&tool.name);
+        self.built_in_tools.insert(key.clone());
+        self.load_modes.insert(key.clone(), load_mode);
+        self.tools.insert(key, tool);
     }
 
     #[allow(dead_code)]
@@ -121,24 +165,43 @@ impl ToolRegistry {
         self.get(name).map(|def| def.name.as_str())
     }
 
+    pub fn tool_description(&self, name: &str) -> Option<(&str, &serde_json::Value)> {
+        self.get(name)
+            .map(|def| (def.description.as_str(), &def.parameters))
+    }
+
+    pub fn is_built_in(&self, name: &str) -> bool {
+        self.built_in_tools.contains(&normalize_tool_name_key(name))
+    }
+
+    pub fn default_load_mode(&self, name: &str) -> ToolLoadMode {
+        self.load_modes
+            .get(&normalize_tool_name_key(name))
+            .copied()
+            .unwrap_or(ToolLoadMode::Skill)
+    }
+
+    pub fn resolve_api_tool(&self, name: &str) -> Option<serde_json::Value> {
+        self.get(name).map(|def| {
+            serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": def.name,
+                    "description": def.description,
+                    "parameters": def.parameters,
+                }
+            })
+        })
+    }
+
     pub fn resolve_api_tools(&self, tool_names: &[String]) -> Vec<serde_json::Value> {
         tool_names
             .iter()
-            .filter_map(|name| {
-                self.get(name).map(|def| {
-                    serde_json::json!({
-                        "type": "function",
-                        "function": {
-                            "name": def.name,
-                            "description": def.description,
-                            "parameters": def.parameters,
-                        }
-                    })
-                })
-            })
+            .filter_map(|name| self.resolve_api_tool(name))
             .collect()
     }
 
+    #[allow(dead_code)]
     pub async fn execute(&self, name: &str, arguments: &serde_json::Value) -> ToolResult {
         self.execute_with_context(name, arguments, ToolExecutionContext::default())
             .await
@@ -183,7 +246,7 @@ impl ToolRegistry {
             })
         });
 
-        self.register(ToolDef {
+        self.register_builtin(ToolDef {
             name: "task".to_string(),
             description,
             parameters: serde_json::json!({
@@ -211,7 +274,9 @@ impl ToolRegistry {
 
 #[cfg(test)]
 mod tests {
-    use super::{ToolDef, ToolExecutionContext, ToolRegistry, ToolResult, ToolRuntimeState};
+    use super::{
+        ToolDef, ToolExecutionContext, ToolLoadMode, ToolRegistry, ToolResult, ToolRuntimeState,
+    };
     use std::sync::Arc;
 
     #[test]
@@ -262,8 +327,61 @@ mod tests {
     }
 
     #[test]
+    fn registry_tracks_default_load_modes() {
+        let mut registry = ToolRegistry::new();
+        registry.register(ToolDef {
+            name: "skill_tool".to_string(),
+            description: "Skill tool".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+            execute: Arc::new(|_, _| {
+                Box::pin(async {
+                    ToolResult {
+                        output: String::new(),
+                        is_error: false,
+                    }
+                })
+            }),
+        });
+        registry.register_builtin_with_load_mode(
+            ToolDef {
+                name: "builtin_lazy".to_string(),
+                description: "Builtin lazy".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+                execute: Arc::new(|_, _| {
+                    Box::pin(async {
+                        ToolResult {
+                            output: String::new(),
+                            is_error: false,
+                        }
+                    })
+                }),
+            },
+            ToolLoadMode::Lazy,
+        );
+
+        assert_eq!(
+            registry.default_load_mode("skill_tool"),
+            ToolLoadMode::Skill
+        );
+        assert_eq!(
+            registry.default_load_mode("builtin_lazy"),
+            ToolLoadMode::Lazy
+        );
+    }
+
+    #[test]
+    fn builtins_register_web_fetch_as_lazy_without_legacy_name() {
+        let registry = ToolRegistry::with_builtins();
+
+        assert_eq!(registry.canonical_name("web_fetch"), Some("web_fetch"));
+        assert_eq!(registry.default_load_mode("web_fetch"), ToolLoadMode::Lazy);
+        assert_eq!(registry.canonical_name("webfetch"), None);
+    }
+
+    #[test]
     fn unity_asset_read_redirects_only_once_for_same_file() {
         let context = ToolExecutionContext {
+            app_handle: None,
             working_dir: Some("C:/Project".to_string()),
             unity_connected: Some(true),
             runtime_state: Some(Arc::new(ToolRuntimeState::default())),
@@ -277,6 +395,7 @@ mod tests {
     #[test]
     fn unity_asset_read_redirect_requires_connection_and_supported_extension() {
         let disconnected = ToolExecutionContext {
+            app_handle: None,
             working_dir: Some("C:/Project".to_string()),
             unity_connected: Some(false),
             runtime_state: Some(Arc::new(ToolRuntimeState::default())),
@@ -284,6 +403,7 @@ mod tests {
         assert!(!disconnected.should_redirect_unity_asset_read("Assets/Test/MyAsset.asset"));
 
         let connected = ToolExecutionContext {
+            app_handle: None,
             working_dir: Some("C:/Project".to_string()),
             unity_connected: Some(true),
             runtime_state: Some(Arc::new(ToolRuntimeState::default())),

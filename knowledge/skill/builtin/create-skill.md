@@ -11,63 +11,58 @@ aiMaintained: false
 skillEnabled: true
 skillSurface: command
 commandTrigger: /create-skill
-argumentHint: <skill-name>
+argumentHint: <skill-name> [--package]
 createdAt: 1775552858000
-updatedAt: 1776267594940
+updatedAt: 1779026645000
 ---
 
 # Create Skill
 
 ## Summary
-Create a new unified Skill document in the project's knowledge store, using the current single-file format and the correct command-facing metadata.
+Create a reusable Skill through the dedicated Skill tools, as either a project-level single document or an APP-installed package with docs, metadata, scripts, CLI assets, and optional Unity C# capabilities.
 
 ## Content
-## When to use
-
-- Turn a repeated workflow into a reusable project skill.
-- Recover or migrate a legacy `knowledge/Skill/<name>/SKILL.md` workflow into the current `Locus/knowledge/skill/*.md` format.
-- Add a slash-command entry that the team can trigger repeatedly for the same kind of task.
-
-## When NOT to use
-
-- A one-off project conclusion belongs in `design`.
-- A user preference or hidden long-term context belongs in `memory`.
-- External package docs, version notes, or copied references belong in `reference`.
-- Temporary task notes or scratchpad content should stay in the current conversation.
-
 ## Instructions
 
 1. Clarify the workflow boundary before creating the skill.
    - Ask what repeated task this skill should standardize, what output it should produce, and which checks must always happen.
    - Create a skill only when the workflow has stable steps, reusable judgment rules, or a consistent deliverable.
 
-2. Choose the path, slug, and title.
+2. Choose the storage model.
+   - Use a single document for a project-local SOP that only needs Markdown instructions.
+   - Use a package when the user asks for distribution, APP installation, bundled scripts, CLI binaries, multiple docs, or Unity C# files.
+   - Prefer package IDs like `com.example.asset-audit` for distributed packages and kebab-case slugs like `asset-audit` for single documents.
+
+3. Choose the path, slug, and title for a single document.
    - Convert the requested name to kebab-case.
-   - Default to `skill/<slug>.md` in knowledge tools, which maps to `Locus/knowledge/skill/<slug>.md` in the repo.
-   - Use a nested path such as `skill/unity/<slug>.md` only when topic grouping materially improves retrieval.
+   - Default `skill_create.path` to `<slug>.md`, which maps to `Locus/knowledge/skill/<slug>.md` in the repo.
+   - Use a nested path such as `unity/<slug>.md` only when topic grouping materially improves retrieval.
    - Use a human-readable Title Case title.
 
-3. Use the current knowledge semantics.
+4. Use the current knowledge semantics.
    - Project skills live under the project knowledge root.
    - APP-installed built-in skills live under `skill/builtin/` in the APP knowledge root and are treated as user-level workflows.
+   - APP-installed Skill packages live under the APP skill package directory, usually `%APPDATA%/locus/skills/<package-id>/` on Windows, `<repo>/skills/<package-id>/` during local development, or `<app>/skills/<package-id>/` next to the packaged executable.
    - Keep skills focused on SOPs, execution order, checks, and output requirements.
 
-4. Prefer the unified knowledge tools.
-   - Create the document with `knowledge_create` using a type-prefixed path such as `skill/<slug>.md`.
-   - Seed both `summary` and `body` in the create call so the skill is usable immediately.
-   - If the skill already exists, update its body with `knowledge_edit` instead of creating a duplicate.
+5. Use Skill lifecycle tools for Markdown documents and packages.
+   - Create a Markdown document with `skill_create` using `kind: "md"`, `name: <slug>`, `summary: <one-line description>`, and, when needed, `path: <folder>/<slug>.md`.
+   - Create a package with `skill_create` using `kind: "package"`, `name: <display name>`, `packageId: <reverse-dns-id>`, `version: <semver>`, `summary: <one-line description>`, plus optional command metadata.
+   - Seed `summary` and `body` in `skill_create` so the skill is usable immediately.
+   - Use `skill_list` before creating when command or name conflicts are likely.
+   - For an existing Markdown Skill, update content with `knowledge_edit`; for an existing package, edit files under its package root.
+   - Run `skill_reload` after creation or content edits to validate that Locus can read the Skill manifest.
 
-5. Use this body template for the `document.body` content:
+6. Use the body template that matches the trigger surface.
+   - For command-only Skills, use only execution instructions:
 
 ```markdown
-## When to use
-
-## When NOT to use
-
 ## Instructions
 ```
 
-6. If you need to create or repair the Markdown file directly, use this exact document shape:
+   - For auto-recalled Skills, add concise selection guidance before the instructions.
+
+7. If you need to repair a command-only Markdown Skill file directly, use this exact document shape, then run `skill_reload`:
 
 ```markdown
 ---
@@ -94,24 +89,97 @@ updatedAt: <unix-ms>
 <one-line description>
 
 ## Content
-## When to use
-
-## When NOT to use
-
 ## Instructions
 ```
 
-7. Keep the current skill storage model simple.
-   - Prefer a single Markdown document.
-   - Do not recreate legacy `SKILL.md` directories, sidecar `references/`, `scripts/`, or `assets/` unless the user explicitly asks for a richer skill package.
+8. Create a package when the Skill needs bundled capabilities.
+   - Create the initial package with `skill_create`; the result includes `packageRoot` for later file edits.
+   - Use the APP temp directory, usually `%APPDATA%/locus/temp/` on Windows, for clone checkouts, archives, generated source, build caches, and intermediate compiler output.
+   - Copy only the final package assets from the APP temp directory into `packageRoot`, such as `SKILL.md`, docs, scripts, compiled CLI binaries, and Unity C# files.
+   - Edit files inside the returned `packageRoot` with filesystem tools when adding docs, scripts, CLI binaries, or Unity C# files.
+   - Add `SKILL.md` at the package root and put both common Skill metadata and Locus metadata in its YAML frontmatter.
+   - Add optional docs under `references/`, Python scripts under `scripts/`, executable CLI files under `bin/`, and Unity C# scripts under `unity/Editor/`.
+   - When a server-side search tool is available and the package needs to integrate external software, first check GitHub for an official or well-maintained CLI. Build the CLI into a platform binary, place it under `bin/`, and declare it in `x-locus.capabilities.cli`.
+   - Keep all manifest paths package-relative and use forward slashes.
 
-8. When migrating from a legacy skill:
+9. Use this package structure:
+
+```text
+<package-id>/
+├── SKILL.md
+├── references/
+│   └── details.md
+├── scripts/
+│   └── tool.py
+├── bin/
+│   └── tool.exe
+└── unity/
+    └── Editor/
+        └── SkillBridge.cs
+```
+
+10. Use this root `SKILL.md` shape for packages:
+
+```markdown
+---
+name: Asset Audit
+description: Use when auditing Unity project assets, unused files, import settings, or cleanup risks.
+argument-hint: <scope>
+x-locus:
+  schema: locus.skill.v1
+  id: com.example.asset-audit
+  version: 0.1.0
+  source:
+    type: github
+    url: https://github.com/example/locus-skills
+    reference: asset-audit
+  command:
+    enabled: true
+    trigger: /asset-audit
+  capabilities:
+    unity:
+      - name: AssetAuditBridge
+        path: unity/Editor/SkillBridge.cs
+        api: unity_execute
+    python:
+      - name: asset-audit
+        path: scripts/tool.py
+        mode: cli
+    cli:
+      - name: asset-audit
+        path: bin/tool.exe
+---
+
+# Asset Audit
+
+## Instructions
+
+Full execution workflow, required checks, expected outputs, and references to package-local docs such as [details](references/details.md).
+```
+
+11. Respect package document levels when the Skill benefits from progressive disclosure.
+   - `L0`, `L1`, and `L2` are optional package sections.
+   - Use `L0` for selection guidance, `L1` for a compact workflow, and `L2` for full instructions.
+   - Use links to other package docs for progressive disclosure instead of putting every detail in the root document.
+
+12. Handle Unity C# package files correctly.
+   - Put source files in the package under `unity/Editor/`.
+   - Declare each C# file in `x-locus.capabilities.unity`.
+   - Installed Unity C# files are copied into `Packages/com.farlocus.locus/Editor/Skills/<package-id>/` in the target Unity project.
+   - Installation status is based on the real target file and hash, so report `installed`, `modified`, `partial`, or `notInstalled` from the Skill UI when relevant.
+
+13. Keep the current skill storage model simple.
+   - Prefer `skill_create` for a single Markdown document.
+   - Use a package when bundled resources, multiple docs, or distribution are part of the requirement.
+   - Do not recreate legacy `knowledge/Skill/<name>/SKILL.md` directories.
+
+14. When migrating from a legacy skill:
    - Map legacy frontmatter `name` to the new `path`, `title`, and default command trigger.
    - Move the legacy description into `## Summary`.
-   - Move the legacy body into `## Content`, then normalize it into `When to use`, `When NOT to use`, and `Instructions` sections when needed.
+   - Move the legacy body into `## Content`, then normalize it into `Instructions` for command-only Skills or selection guidance plus `Instructions` for auto-recalled Skills.
    - Preserve useful examples and decision rules, and drop obsolete path conventions such as `knowledge/Skill/<name>/SKILL.md`.
+   - If the legacy skill has bundled files or references, migrate it into a package and link detailed docs from the root `SKILL.md`.
 
-9. After creation or migration, report:
-   - The knowledge path, for example `skill/<slug>.md`.
-   - The repo file path, for example `Locus/knowledge/skill/<slug>.md`.
-   - The slash command trigger, usually `/<slug>`.
+15. After creation or migration, run `skill_reload` and report:
+   - For a single document: the knowledge path, repo file path, and slash command trigger.
+   - For a package: the package ID, package root path, root document path, command trigger, and any Unity C# install target.

@@ -27,4 +27,11 @@ describe("toolCallSummary", () => {
       file_path: "Assets/Scripts/Gameplay/PlayerController.cs",
     }))).toBe("…/Gameplay/PlayerController.cs");
   });
+
+  it("shows url summaries for web_fetch", () => {
+    expect(buildToolCallArgsSummary("web_fetch", JSON.stringify({
+      url: "https://example.com/docs",
+      format: "markdown",
+    }))).toBe("https://example.com/docs");
+  });
 });

@@ -1,4 +1,9 @@
-import type { AgentSystemPromptStats, InjectedPromptItem, RuleItem } from "../../types";
+import type {
+  AgentSystemPromptStats,
+  InjectedPromptItem,
+  InjectedToolLoadMode,
+  RuleItem,
+} from "../../types";
 
 const TOOL_SCHEMA_OVERHEAD_TOKENS = 32;
 
@@ -32,6 +37,9 @@ export interface AgentPromptDashboardSummary {
   totalRuleCount: number;
   injectedContextCount: number;
   toolCount: number;
+  directToolCount: number;
+  lazyToolCount: number;
+  skillToolCount: number;
   health: AgentPromptDashboardHealth;
 }
 
@@ -43,11 +51,30 @@ export function estimatePromptTokens(chars: number): number {
   return chars > 0 ? Math.ceil(chars / 4) : 0;
 }
 
+function asRecord(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  return value as Record<string, unknown>;
+}
+
+function unwrapToolDefinition(meta: unknown): unknown {
+  const record = asRecord(meta);
+  const functionDef = asRecord(record?.function);
+  return functionDef ?? meta ?? {};
+}
+
+export function toolMetaLoadMode(meta: unknown): InjectedToolLoadMode {
+  const record = asRecord(meta);
+  if (record?.loadMode === "lazy") return "lazy";
+  if (record?.loadMode === "skill") return "skill";
+  return "direct";
+}
+
 function serializeToolMeta(meta: unknown): string {
   try {
+    const definition = unwrapToolDefinition(meta);
     const wrapped = {
       type: "function",
-      function: meta ?? {},
+      function: definition,
     };
     return JSON.stringify(wrapped) ?? "";
   } catch {
@@ -64,7 +91,9 @@ export function estimateToolPrompt(meta: unknown): ToolPromptEstimate {
 }
 
 function estimateToolPart(items: Array<Pick<InjectedPromptItem, "kind" | "meta">>): AgentPromptDashboardPart {
-  const toolItems = items.filter((item) => item.kind === "tools");
+  const toolItems = items.filter((item) =>
+    item.kind === "tools" && toolMetaLoadMode(item.meta) === "direct",
+  );
   const summary = toolItems.reduce((sum, item) => {
     const estimate = estimateToolPrompt(item.meta);
     sum.chars += estimate.chars;
@@ -123,7 +152,11 @@ export function buildAgentPromptDashboard(
   const totalRuleCount = ruleItems.length;
   const enabledRuleCount = ruleItems.filter((rule) => rule.enabled).length;
   const injectedContextCount = injectedItems.filter((item) => item.kind !== "tools").length;
-  const toolCount = injectedItems.filter((item) => item.kind === "tools").length;
+  const toolItems = injectedItems.filter((item) => item.kind === "tools");
+  const directToolCount = toolItems.filter((item) => toolMetaLoadMode(item.meta) === "direct").length;
+  const lazyToolCount = toolItems.filter((item) => toolMetaLoadMode(item.meta) === "lazy").length;
+  const skillToolCount = toolItems.filter((item) => toolMetaLoadMode(item.meta) === "skill").length;
+  const toolCount = toolItems.length;
   const dominantPart = parts.reduce((best, part) => (
     part.share > best.share ? part : best
   ), parts[0]!);
@@ -184,6 +217,9 @@ export function buildAgentPromptDashboard(
     totalRuleCount,
     injectedContextCount,
     toolCount,
+    directToolCount,
+    lazyToolCount,
+    skillToolCount,
     health: {
       score,
       level,

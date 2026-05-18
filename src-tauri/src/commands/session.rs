@@ -11,7 +11,9 @@ use tauri::{AppHandle, Emitter, State};
 use super::auth::CodexAuthStateHandle;
 use super::{StreamEvent, TokenUsage};
 use crate::agent::definition::{canonical_agent_id, is_hidden_legacy_agent_id, AgentDefRegistry};
-use crate::agent::instance::{AgentInstance, AgentSystemPromptStats, LlmBackend, RawContextStore};
+use crate::agent::instance::{
+    AgentInstance, AgentSystemPromptStats, KnowledgeAccessMode, LlmBackend, RawContextStore,
+};
 use crate::auth::AuthState;
 use crate::config::AppConfig;
 use crate::error::AppError;
@@ -456,6 +458,7 @@ pub async fn get_agent_system_prompt_stats(
         None,
         app_knowledge_dir.0.clone(),
         app_agent_dir.0.clone(),
+        KnowledgeAccessMode::Full,
         None,
         HashMap::new(),
         tokio::sync::watch::channel(false).1,
@@ -521,6 +524,7 @@ async fn resolve_model_backend(
                 .unwrap_or(crate::commands::CustomReasoningParamFormat::OpenaiChatReasoningEffort),
             replay_reasoning_content: endpoint.replay_reasoning_content.unwrap_or(false),
             server_tools: endpoint.server_tools.clone(),
+            supports_tool_lazy_loading: endpoint.supports_tool_lazy_loading,
         });
     }
 
@@ -590,6 +594,7 @@ async fn resolve_model_backend(
 #[tauri::command]
 pub async fn list_agent_injected_items(
     agent_id: String,
+    knowledge_mode: Option<String>,
     registry: State<'_, Arc<AgentDefRegistry>>,
     tool_registry: State<'_, Arc<ToolRegistry>>,
     workspace: State<'_, Arc<Workspace>>,
@@ -606,6 +611,8 @@ pub async fn list_agent_injected_items(
     } else {
         workspace.workspace_id.read().await.clone()
     };
+    let knowledge_access_mode = KnowledgeAccessMode::from_request(knowledge_mode.as_deref())
+        .map_err(|error| AppError::new("agent.invalid_knowledge_mode", error))?;
 
     let instance = AgentInstance::new(
         Arc::new(def.clone()),
@@ -621,6 +628,7 @@ pub async fn list_agent_injected_items(
         None,
         app_knowledge_dir.0.clone(),
         app_agent_dir.0.clone(),
+        knowledge_access_mode,
         None,
         HashMap::new(),
         tokio::sync::watch::channel(false).1,
@@ -697,6 +705,7 @@ pub async fn chat(
     mode: Option<String>,
     user_intent: Option<UserIntentPayload>,
     subagent_models: Option<HashMap<String, String>>,
+    knowledge_mode: Option<String>,
     app_handle: AppHandle,
     store: State<'_, Arc<SessionStore>>,
     registry: State<'_, Arc<AgentDefRegistry>>,
@@ -814,6 +823,7 @@ pub async fn chat(
                 .unwrap_or(crate::commands::CustomReasoningParamFormat::OpenaiChatReasoningEffort),
             replay_reasoning_content: ep.replay_reasoning_content.unwrap_or(false),
             server_tools: ep.server_tools.clone(),
+            supports_tool_lazy_loading: ep.supports_tool_lazy_loading,
         }
     } else if is_openrouter {
         let api_key = api_key_state.read().await.clone();
@@ -879,6 +889,8 @@ pub async fn chat(
 
     let akd = app_knowledge_dir.0.clone();
     let aad = app_agent_dir.0.clone();
+    let knowledge_access_mode = KnowledgeAccessMode::from_request(knowledge_mode.as_deref())
+        .map_err(|error| AppError::new("chat.invalid_knowledge_mode", error).operation("chat"))?;
     let um = Some(undo_manager.inner().clone());
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
     let (done_tx, done_rx) = tokio::sync::watch::channel(false);
@@ -896,6 +908,7 @@ pub async fn chat(
         effort,
         akd,
         aad,
+        knowledge_access_mode,
         um,
         subagent_models.unwrap_or_default(),
         cancel_rx,

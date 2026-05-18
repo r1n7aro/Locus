@@ -1,0 +1,19 @@
+{
+  "description": "Load or reload a Skill manifest after edits and validate that Locus can read it. Use after modifying a Skill file so parse or metadata errors are surfaced before reporting completion.",
+  "parameters": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "name": {
+        "type": "string",
+        "description": "Skill dir name or package id, for example `asset-audit`, `unity/asset-audit`, or `com.example.asset-audit`."
+      },
+      "source": {
+        "type": "string",
+        "enum": ["project", "app"],
+        "description": "Skill source. Defaults to `project`; use `app` for built-in Skills or app-installed packages."
+      }
+    },
+    "required": ["name"]
+  }
+}

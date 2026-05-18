@@ -34,10 +34,12 @@ import type {
   FeishuReferenceOauthStartResult,
   FeishuSourceTestResult,
   LexicalRebuildStatus,
+  SkillCreateInput,
   UnityReferenceImportLocale,
   UnityReferenceImportStatus,
   SkillConfig,
   SkillManifest,
+  SkillUnityInstallStatus,
 } from "../types";
 
 interface KnowledgeReadPayload {
@@ -809,6 +811,42 @@ export function readSkillManifest(
   return ipcInvoke<string>("read_skill_manifest", { dirName, source });
 }
 
-export function createSkillScaffold(name: string): Promise<SkillManifest> {
-  return ipcInvoke<SkillManifest>("create_skill_scaffold", { name });
+export function createSkillScaffold(input: SkillCreateInput): Promise<SkillManifest> {
+  return ipcInvoke<SkillManifest>("create_skill_scaffold", {
+    kind: input.kind ?? "md",
+    name: input.name,
+    path: input.path,
+    packageId: input.packageId,
+    version: input.version,
+    summary: input.summary,
+    body: input.body,
+    argumentHint: input.argumentHint,
+    commandTrigger: input.commandTrigger,
+    commandEnabled: input.commandEnabled,
+    modelInvocationEnabled: input.modelInvocationEnabled,
+  });
+}
+
+export function getSkillUnityInstallStatus(
+  packageId: string,
+): Promise<SkillUnityInstallStatus> {
+  return ipcInvoke<SkillUnityInstallStatus>("get_skill_unity_install_status", {
+    packageId,
+  });
+}
+
+export function installSkillUnityFiles(
+  packageId: string,
+): Promise<SkillUnityInstallStatus> {
+  return ipcInvoke<SkillUnityInstallStatus>("install_skill_unity_files", {
+    packageId,
+  });
+}
+
+export function removeSkillUnityFiles(
+  packageId: string,
+): Promise<SkillUnityInstallStatus> {
+  return ipcInvoke<SkillUnityInstallStatus>("remove_skill_unity_files", {
+    packageId,
+  });
 }

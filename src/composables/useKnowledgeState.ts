@@ -5,6 +5,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { getWarmup } from "./warmupCache";
 import {
   knowledgeActivateEmbedding,
+  createSkillScaffold,
   knowledgeCreate,
   knowledgeDeactivateEmbedding,
   knowledgeDelete,
@@ -2756,6 +2757,29 @@ export function useKnowledgeState(props: KnowledgeProps) {
         .replace(/\\/g, "/")
         .replace(/^\/+|\/+$/g, "");
       const slug = slugifyKnowledgePath(trimmed);
+      if (activeType.value === "skill") {
+        const path = buildCreatePath(activeType.value, slug, relativeDir);
+        const manifest = await enqueueMutation(() =>
+          createSkillScaffold({
+            kind: "md",
+            name: slug,
+            path,
+            summary: trimmed.replace(/\.md$/i, ""),
+            commandTrigger: `/${slug}`,
+          }),
+        );
+        const docPath = `${manifest.dirName}.md`;
+        pendingSelectionPath.value = docPath;
+        await refreshKnowledgeData();
+        const matched = documents.value.find(
+          (doc) => doc.type === "skill" && doc.path === docPath,
+        );
+        if (matched) {
+          await selectDocument(matched);
+        }
+        expandAncestors(fullDocumentPath("skill", docPath));
+        return;
+      }
       const filePath = buildCreatePath(activeType.value, slug, relativeDir);
       const defaults = buildKnowledgeCreateDefaults(activeType.value);
       const result = await enqueueMutation(() =>
@@ -2783,7 +2807,10 @@ export function useKnowledgeState(props: KnowledgeProps) {
       await selectDocument(doc);
       expandAncestors(fullDocumentPath(doc.type, doc.path));
     } catch (cause) {
-      notifyError("knowledge_create.document", cause);
+      notifyError(
+        activeType.value === "skill" ? "skill_create" : "knowledge_create.document",
+        cause,
+      );
     } finally {
       creatingDocument.value = false;
     }
@@ -2807,6 +2834,28 @@ export function useKnowledgeState(props: KnowledgeProps) {
     creatingDocument.value = true;
     error.value = "";
     try {
+      if (activeType.value === "skill") {
+        const manifest = await enqueueMutation(() =>
+          createSkillScaffold({
+            kind: "md",
+            name: slug,
+            path: pathName,
+            summary: trimmed.replace(/\.md$/i, ""),
+            commandTrigger: `/${slug}`,
+          }),
+        );
+        const docPath = `${manifest.dirName}.md`;
+        pendingSelectionPath.value = docPath;
+        await refreshKnowledgeData();
+        const matched = documents.value.find(
+          (doc) => doc.type === "skill" && doc.path === docPath,
+        );
+        if (matched) {
+          await selectDocument(matched);
+        }
+        expandAncestors(fullDocumentPath("skill", docPath));
+        return;
+      }
       const defaults = buildKnowledgeCreateDefaults(activeType.value);
       const result = await enqueueMutation(() =>
         knowledgeCreate({
@@ -2833,7 +2882,10 @@ export function useKnowledgeState(props: KnowledgeProps) {
       await selectDocument(doc);
       expandAncestors(fullDocumentPath(doc.type, doc.path));
     } catch (cause) {
-      notifyError("knowledge_create.document", cause);
+      notifyError(
+        activeType.value === "skill" ? "skill_create" : "knowledge_create.document",
+        cause,
+      );
     } finally {
       creatingDocument.value = false;
     }

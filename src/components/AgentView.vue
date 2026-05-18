@@ -1,8 +1,8 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, watch } from "vue";
-import { listAgents, listSubagentDefs, getAgentEnvTemplate, getAgentSystemPrompt, getAgentSystemPromptStats, listAgentInjectedItems, listRules, readRule, saveRule, deleteRule, setRuleEnabled, setRuleOrder } from "../services/agent";
-import type { AgentInfo, AgentSystemPromptStats, InjectedPromptItem, RuleItem } from "../types";
+import { listAgents, listSubagentDefs, getAgentEnvTemplate, getAgentSystemPrompt, getAgentSystemPromptStats, listAgentInjectedItems, setAgentToolDirectLoad, listRules, readRule, saveRule, deleteRule, setRuleEnabled, setRuleOrder } from "../services/agent";
+import type { AgentInfo, AgentSystemPromptStats, InjectedPromptItem, InjectedToolLoadMode, RuleItem } from "../types";
 import { getWarmup } from "../composables/warmupCache";
 import MarkdownRenderer from "./MarkdownRenderer.vue";
 import BaseButton from "./ui/BaseButton.vue";
@@ -73,8 +73,19 @@ const ruleContextMenu = ref<{ x: number; y: number; rule: RuleItem | null } | nu
 // ── Injected ──
 const injectedItems = ref<InjectedPromptItem[]>([]);
 const injectedLoading = ref(false);
+const toolLoadSaving = ref(false);
+const toolLoadConfigError = ref("");
 const availableToolItems = computed(() =>
   injectedItems.value.filter((item) => item.kind === "tools"),
+);
+const directToolItems = computed(() =>
+  availableToolItems.value.filter((item) => toolMetaLoadMode(item.meta) === "direct"),
+);
+const lazyToolItems = computed(() =>
+  availableToolItems.value.filter((item) => toolMetaLoadMode(item.meta) === "lazy"),
+);
+const skillToolItems = computed(() =>
+  availableToolItems.value.filter((item) => toolMetaLoadMode(item.meta) === "skill"),
 );
 const injectedContextItems = computed(() =>
   injectedItems.value.filter((item) => item.kind !== "tools"),
@@ -85,6 +96,23 @@ const injectedContextEntryCount = computed(() =>
 const promptDashboard = computed(() =>
   buildAgentPromptDashboard(promptStats.value, ruleItems.value, injectedItems.value),
 );
+
+function toolMetaLoadMode(meta: InjectedPromptItem["meta"]): InjectedToolLoadMode {
+  const record = toolMetaRecord(meta);
+  if (record?.loadMode === "lazy") return "lazy";
+  if (record?.loadMode === "skill") return "skill";
+  return "direct";
+}
+
+function toolMetaRecord(meta: InjectedPromptItem["meta"]): Record<string, unknown> | null {
+  if (!meta || typeof meta !== "object" || Array.isArray(meta)) return null;
+  return meta as Record<string, unknown>;
+}
+
+function toolMetaBoolean(meta: InjectedPromptItem["meta"], key: string): boolean | null {
+  const value = toolMetaRecord(meta)?.[key];
+  return typeof value === "boolean" ? value : null;
+}
 
 const sidebarWidth = ref(160);
 const dirPanelWidth = ref(280);
@@ -115,6 +143,60 @@ const selectedToolDescription = computed(() => {
   return selectedToolDefinition.value?.description || selectedInjectedItem()?.content || "";
 });
 
+const selectedToolLoadMode = computed(() => {
+  const item = selectedInjectedItem();
+  if (!item || item.kind !== "tools") return null;
+  return toolMetaLoadMode(item.meta);
+});
+
+const selectedToolLoadLabel = computed(() => {
+  const mode = selectedToolLoadMode.value;
+  if (mode === "lazy") return t("agent.tool.loadMode.lazy");
+  if (mode === "skill") return t("agent.tool.loadMode.skill");
+  return t("agent.tool.loadMode.direct");
+});
+
+const selectedToolLoadSummary = computed(() => {
+  const mode = selectedToolLoadMode.value;
+  if (mode === "lazy") return t("agent.tool.loadSummary.lazy");
+  if (mode === "skill") return t("agent.tool.loadSummary.skill");
+  return t("agent.tool.loadSummary.direct");
+});
+
+const selectedToolCanConfigureDirectLoad = computed(() => {
+  const item = selectedInjectedItem();
+  if (!item || item.kind !== "tools") return false;
+  return toolMetaBoolean(item.meta, "canConfigureDirectLoad") === true;
+});
+
+const selectedToolDirectLoadChecked = computed(() => selectedToolLoadMode.value === "direct");
+
+const selectedToolLoadConfigSummary = computed(() => {
+  const item = selectedInjectedItem();
+  if (!item || item.kind !== "tools") return "";
+
+  const directLoadOverride = toolMetaBoolean(item.meta, "directLoadOverride");
+  const directLoadDefault =
+    toolMetaBoolean(item.meta, "directLoadDefault") ?? selectedToolDirectLoadChecked.value;
+  const directText = directLoadDefault
+    ? t("agent.tool.loadConfig.defaultDirect")
+    : t("agent.tool.loadConfig.defaultLazy");
+
+  if (selectedToolCanConfigureDirectLoad.value) {
+    if (directLoadOverride !== null) {
+      return directLoadOverride
+        ? t("agent.tool.loadConfig.overrideDirect")
+        : t("agent.tool.loadConfig.overrideLazy");
+    }
+    return directText;
+  }
+
+  if (selectedToolLoadMode.value === "skill") {
+    return t("agent.tool.loadConfig.skillOnly");
+  }
+  return directText;
+});
+
 const selectedToolFooterMeta = computed(() => {
   const tool = selectedToolDefinition.value;
   if (!tool) {
@@ -129,6 +211,13 @@ const selectedToolFooterMeta = computed(() => {
     formatCount(tool.promptCharCount),
     formatTokenCount(tool.estimatedPromptTokens),
   );
+});
+
+const selectedToolPreviewMeta = computed(() => {
+  if (selectedInjectedItem()?.kind !== "tools") {
+    return injectedItemMeta(selectedInjectedItem()?.kind || "context");
+  }
+  return `${selectedToolLoadLabel.value} · ${selectedToolFooterMeta.value}`;
 });
 
 type DashboardNoteTone = "good" | "warn" | "danger";
@@ -182,7 +271,9 @@ function dashboardPartMeta(key: AgentPromptPartKey): string {
     case "tools":
       return t(
         "agent.dashboard.partMeta.tools",
-        formatCount(promptDashboard.value.toolCount),
+        formatCount(promptDashboard.value.directToolCount),
+        formatCount(promptDashboard.value.lazyToolCount),
+        formatCount(promptDashboard.value.skillToolCount),
       );
   }
 }
@@ -406,10 +497,30 @@ async function loadInjectedItems() {
 
 function selectInjectedItem(item: InjectedPromptItem) {
   selected.value = { type: "injected", item };
+  toolLoadConfigError.value = "";
   closeRuleContextMenu();
   ruleEditing.value = false;
   ruleCreating.value = false;
   confirmingDeleteRule.value = null;
+}
+
+async function setSelectedToolDirectLoadState(directLoad: boolean) {
+  const item = selectedInjectedItem();
+  const tool = selectedToolDefinition.value;
+  if (!selectedAgentId.value || !item || item.kind !== "tools" || !tool) return;
+  if (!selectedToolCanConfigureDirectLoad.value || toolLoadSaving.value) return;
+
+  toolLoadSaving.value = true;
+  toolLoadConfigError.value = "";
+  try {
+    await setAgentToolDirectLoad(selectedAgentId.value, tool.name, directLoad);
+    await loadInjectedItems();
+  } catch (e) {
+    console.error("set_agent_tool_direct_load failed:", e);
+    toolLoadConfigError.value = t("agent.tool.loadConfigSaveFailed", normalizeAppError(e).message);
+  } finally {
+    toolLoadSaving.value = false;
+  }
 }
 
 async function selectRuleItem(rule: RuleItem) {
@@ -790,14 +901,50 @@ watch(
             </button>
           </div>
 
-          <template v-if="injectedLoading || availableToolItems.length > 0">
+          <template v-if="injectedLoading || directToolItems.length > 0">
             <div class="section-label">
-              <span>{{ t("agent.availableTools") }}</span>
-              <span v-if="availableToolItems.length" class="section-count">{{ availableToolItems.length }}</span>
+              <span>{{ t("agent.directTools") }}</span>
+              <span v-if="directToolItems.length" class="section-count">{{ directToolItems.length }}</span>
             </div>
-            <div v-if="injectedLoading && availableToolItems.length === 0" class="dir-empty-inline">{{ t("common.loading") }}</div>
+            <div v-if="injectedLoading && directToolItems.length === 0" class="dir-empty-inline">{{ t("common.loading") }}</div>
             <button
-              v-for="item in availableToolItems"
+              v-for="item in directToolItems"
+              :key="item.id"
+              type="button"
+              class="kb-item injected-item"
+              :class="{ selected: selected?.type === 'injected' && selectedInjectedItem()?.id === item.id }"
+              @click="selectInjectedItem(item)"
+            >
+              <span class="prompt-icon injected-icon">{{ injectedItemIcon(item.kind) }}</span>
+              <span class="item-title">{{ item.title }}</span>
+            </button>
+          </template>
+
+          <template v-if="lazyToolItems.length > 0">
+            <div class="section-label">
+              <span>{{ t("agent.lazyTools") }}</span>
+              <span class="section-count">{{ lazyToolItems.length }}</span>
+            </div>
+            <button
+              v-for="item in lazyToolItems"
+              :key="item.id"
+              type="button"
+              class="kb-item injected-item"
+              :class="{ selected: selected?.type === 'injected' && selectedInjectedItem()?.id === item.id }"
+              @click="selectInjectedItem(item)"
+            >
+              <span class="prompt-icon injected-icon">{{ injectedItemIcon(item.kind) }}</span>
+              <span class="item-title">{{ item.title }}</span>
+            </button>
+          </template>
+
+          <template v-if="skillToolItems.length > 0">
+            <div class="section-label">
+              <span>{{ t("agent.skillTools") }}</span>
+              <span class="section-count">{{ skillToolItems.length }}</span>
+            </div>
+            <button
+              v-for="item in skillToolItems"
               :key="item.id"
               type="button"
               class="kb-item injected-item"
@@ -897,7 +1044,7 @@ watch(
       <div v-else-if="selected?.type === 'injected'" class="preview-panel">
         <div class="preview-header">
           <span class="preview-title">{{ selectedInjectedItem()?.title }}</span>
-          <span class="preview-path">{{ injectedItemMeta(selectedInjectedItem()?.kind || "context") }}</span>
+          <span class="preview-path">{{ selectedInjectedItem()?.kind === "tools" ? selectedToolLoadLabel : injectedItemMeta(selectedInjectedItem()?.kind || "context") }}</span>
           <span class="source-badge source-runtime">{{ selectedInjectedItem()?.source === "builtIn" ? t("common.builtIn") : t("agent.runtime") }}</span>
           <span class="source-badge source-readonly">{{ t("agent.readOnly") }}</span>
           <button class="preview-close" :aria-label="t('agent.closePreview')" @click="selected = null" :title="t('common.close')">&times;</button>
@@ -906,7 +1053,23 @@ watch(
           <div v-if="injectedLoading && !selectedInjectedItem()?.content" class="preview-loading">{{ t("common.loading") }}</div>
           <template v-else-if="selectedInjectedItem()?.kind === 'tools' && selectedToolDefinition">
             <div class="tool-detail">
+              <div class="tool-summary-line">{{ selectedToolLoadSummary }}</div>
               <div class="tool-summary-line">{{ selectedToolFooterMeta }}</div>
+
+              <section class="tool-section tool-load-config-section">
+                <div class="tool-section-title">{{ t("agent.tool.loadConfig.title") }}</div>
+                <div v-if="selectedToolCanConfigureDirectLoad" class="tool-load-config-row">
+                  <BaseCheckbox
+                    :model-value="selectedToolDirectLoadChecked"
+                    :disabled="toolLoadSaving"
+                    :aria-label="t('agent.tool.loadConfig.directLoad')"
+                    @update:model-value="setSelectedToolDirectLoadState"
+                  />
+                  <span class="tool-load-config-label">{{ t("agent.tool.loadConfig.directLoad") }}</span>
+                </div>
+                <div class="tool-load-config-summary">{{ selectedToolLoadConfigSummary }}</div>
+                <div v-if="toolLoadConfigError" class="tool-config-error">{{ toolLoadConfigError }}</div>
+              </section>
 
               <section class="tool-section">
                 <div class="tool-section-title">{{ t("agent.tool.overview") }}</div>
@@ -961,7 +1124,7 @@ watch(
           <MarkdownRenderer v-else v-show="!injectedLoading || selectedInjectedItem()?.content" :content="selectedInjectedItem()?.content || ''" />
         </div>
         <div class="preview-footer">
-          <span class="preview-meta">{{ selectedInjectedItem()?.kind === "tools" ? selectedToolFooterMeta : injectedItemMeta(selectedInjectedItem()?.kind || "context") }}</span>
+          <span class="preview-meta">{{ selectedInjectedItem()?.kind === "tools" ? selectedToolPreviewMeta : injectedItemMeta(selectedInjectedItem()?.kind || "context") }}</span>
         </div>
       </div>
 
@@ -1081,12 +1244,16 @@ watch(
                     <span class="dashboard-stat-value">{{ formatCount(promptDashboard.injectedContextCount) }}</span>
                   </div>
                   <div class="dashboard-stat-cell">
-                    <span class="dashboard-stat-label">{{ t("agent.dashboard.runtime.availableTools") }}</span>
-                    <span class="dashboard-stat-value">{{ formatCount(promptDashboard.toolCount) }}</span>
+                    <span class="dashboard-stat-label">{{ t("agent.dashboard.runtime.directTools") }}</span>
+                    <span class="dashboard-stat-value">{{ formatCount(promptDashboard.directToolCount) }}</span>
                   </div>
                   <div class="dashboard-stat-cell">
-                    <span class="dashboard-stat-label">{{ t("agent.dashboard.runtime.dominantShare") }}</span>
-                    <span class="dashboard-stat-value">{{ formatPercent(promptDashboard.health.dominantShare) }}</span>
+                    <span class="dashboard-stat-label">{{ t("agent.dashboard.runtime.lazyTools") }}</span>
+                    <span class="dashboard-stat-value">{{ formatCount(promptDashboard.lazyToolCount) }}</span>
+                  </div>
+                  <div class="dashboard-stat-cell">
+                    <span class="dashboard-stat-label">{{ t("agent.dashboard.runtime.skillTools") }}</span>
+                    <span class="dashboard-stat-value">{{ formatCount(promptDashboard.skillToolCount) }}</span>
                   </div>
                 </div>
                 <div v-if="promptStatsError" class="dashboard-inline-note">{{ promptStatsError }}</div>
@@ -2214,6 +2381,30 @@ watch(
   letter-spacing: 0.5px;
   text-transform: uppercase;
   opacity: 0.82;
+}
+
+.tool-load-config-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 24px;
+}
+
+.tool-load-config-label {
+  font-size: 13px;
+  color: var(--text-color);
+}
+
+.tool-load-config-summary {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-secondary);
+}
+
+.tool-config-error {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--status-danger-fg);
 }
 
 .tool-required-list {

@@ -1,0 +1,17 @@
+{
+  "description": "Load one or more specialized tools by name. On endpoints that support native lazy tool loading, the result only reports load status and the loaded tools become available as normal tools in the next model turn. On other endpoints, the result includes tool descriptions and parameter schemas; call the target tool through `tool_call`.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "tools": {
+        "type": "array",
+        "description": "Tool names to load. Multiple tools can be loaded in one call.",
+        "items": {
+          "type": "string"
+        }
+      }
+    },
+    "required": ["tools"],
+    "additionalProperties": false
+  }
+}

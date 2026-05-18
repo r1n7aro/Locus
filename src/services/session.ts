@@ -9,6 +9,7 @@ import type {
   ImageAttachment,
   AssetRefAttachment,
   UserIntentMeta,
+  KnowledgeAccessMode,
 } from "../types";
 
 export interface ChatParams {
@@ -24,6 +25,7 @@ export interface ChatParams {
   mode?: string | null;
   userIntent?: UserIntentMeta | null;
   subagentModels?: Record<string, string> | null;
+  knowledgeMode?: KnowledgeAccessMode | null;
 }
 
 export interface CreateSessionParams {

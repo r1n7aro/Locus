@@ -795,7 +795,9 @@ fn now_millis() -> i64 {
 fn provider_is_read_only(provider: KnowledgeSourceProvider) -> bool {
     matches!(
         provider,
-        KnowledgeSourceProvider::LocalFolder | KnowledgeSourceProvider::Feishu
+        KnowledgeSourceProvider::LocalFolder
+            | KnowledgeSourceProvider::Feishu
+            | KnowledgeSourceProvider::Package
     )
 }
 

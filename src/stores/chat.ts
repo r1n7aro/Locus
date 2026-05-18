@@ -13,6 +13,7 @@ import type { SessionScrollState } from "../composables/chatScrollState";
 import { t } from "../i18n";
 import { useChatChangesStore } from "./chatChanges";
 import { useDisplaySettings } from "../composables/useDisplaySettings";
+import { useKnowledgeAccessMode } from "../composables/useKnowledgeAccessMode";
 import { logToolCollapseTrace, previewTraceText } from "../services/toolCollapseTrace";
 import type {
   SessionSummary, SessionDetail, ChatMessage, TokenUsage,
@@ -1407,6 +1408,7 @@ export const useChatStore = defineStore("chat", () => {
   ) {
     const modelStore = useModelStore();
     const agentStore = useAgentStore();
+    const { state: knowledgeAccessState } = useKnowledgeAccessMode();
 
     const displayText = overrides?.displayText ?? text;
 
@@ -1478,6 +1480,7 @@ export const useChatStore = defineStore("chat", () => {
         mode: overrides?.mode || null,
         userIntent,
         subagentModels: Object.keys(modelStore.modelDefaults.subagentModels).length > 0 ? modelStore.modelDefaults.subagentModels : null,
+        knowledgeMode: knowledgeAccessState.mode,
       });
       logChatStreamDebug("chat request resolved", {
         sessionId: sid,
@@ -1544,6 +1547,7 @@ export const useChatStore = defineStore("chat", () => {
 
     const modelStore = useModelStore();
     const agentStore = useAgentStore();
+    const { state: knowledgeAccessState } = useKnowledgeAccessMode();
     const sessionId = activeSessionId.value;
 
     const { state: displaySettings } = useDisplaySettings();
@@ -1577,6 +1581,7 @@ export const useChatStore = defineStore("chat", () => {
         mode: "compact",
         userIntent: null,
         subagentModels: Object.keys(modelStore.modelDefaults.subagentModels).length > 0 ? modelStore.modelDefaults.subagentModels : null,
+        knowledgeMode: knowledgeAccessState.mode,
       });
 
       logChatStreamDebug("compact request resolved", {
