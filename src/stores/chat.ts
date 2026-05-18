@@ -14,6 +14,7 @@ import { t } from "../i18n";
 import { useChatChangesStore } from "./chatChanges";
 import { useDisplaySettings } from "../composables/useDisplaySettings";
 import { useKnowledgeAccessMode } from "../composables/useKnowledgeAccessMode";
+import { useChatInputSettings } from "../composables/useChatInputSettings";
 import { logToolCollapseTrace, previewTraceText } from "../services/toolCollapseTrace";
 import type {
   SessionSummary, SessionDetail, ChatMessage, TokenUsage,
@@ -27,6 +28,7 @@ import type {
   SessionEventRecord,
   SessionRunSummary,
   AssistantRenderPart,
+  PendingSessionInput,
 } from "../types";
 
 type ToolPermissionMode = "auto" | "ask";
@@ -51,9 +53,57 @@ function replaceMessageById(list: ChatMessage[], message: ChatMessage): ChatMess
   return next;
 }
 
+function pendingInputMergeKey(sessionId: string, runId: string, mergeGroupId: string) {
+  return `${sessionId}\u{0}${runId}\u{0}${mergeGroupId}`;
+}
+
+function mergePendingInputList(
+  list: PendingSessionInput[],
+  input: PendingSessionInput,
+): PendingSessionInput[] {
+  const index = list.findIndex((item) =>
+    item.id === input.id
+    || (
+      item.runId === input.runId
+      && item.mergeGroupId === input.mergeGroupId
+      && item.status !== "accepted"
+      && item.status !== "restored"
+    ));
+  if (index < 0) return [...list, input];
+  const next = [...list];
+  next.splice(index, 1, input);
+  return next;
+}
+
+function visiblePendingInputs(inputs: PendingSessionInput[] | undefined): PendingSessionInput[] {
+  return (inputs ?? []).filter((input) =>
+    input.status === "queued" || input.status === "delivering");
+}
+
+function pendingInputDelivery(input: PendingSessionInput): "after_run" | "immediate" {
+  return input.delivery === "immediate" ? "immediate" : "after_run";
+}
+
+function joinPendingText(existing: string, next: string): string {
+  const existingTrimmed = existing.trim();
+  const nextTrimmed = next.trim();
+  if (!existingTrimmed && !nextTrimmed) return "";
+  if (!existingTrimmed) return next;
+  if (!nextTrimmed) return existing;
+  return `${existing}\n${next}`;
+}
+
+function isPendingInputFallbackError(code: string): boolean {
+  return code === "session.pending_input.run_closed"
+    || code === "session.pending_input.no_active_run"
+    || code === "session.pending_input.run_mismatch"
+    || code === "session.run_locked";
+}
+
 function isActiveRuntimeStatus(status: SessionSummary["runtimeStatus"]): boolean {
   return status === "running"
     || status === "waiting_input"
+    || status === "finishing"
     || status === "cancelling"
     || status === "starting"
     || status === "queued";
@@ -62,6 +112,7 @@ function isActiveRuntimeStatus(status: SessionSummary["runtimeStatus"]): boolean
 function isActiveRunStatus(status: SessionRunSummary["status"] | null | undefined): boolean {
   return status === "running"
     || status === "waiting_input"
+    || status === "finishing"
     || status === "cancelling"
     || status === "starting"
     || status === "queued";
@@ -128,6 +179,10 @@ export const useChatStore = defineStore("chat", () => {
   const streamingSessionIds = ref(new Set<string>());
   const undoableMessageIds = ref(new Set<string>());
   const sessionRunIds = ref(new Map<string, string>());
+  const pendingInputsBySession = ref(new Map<string, PendingSessionInput[]>());
+  const acceptedPendingInputIds = new Set<string>();
+  const localPendingInputGroups = new Set<string>();
+  const localFallbackPendingInputGroups = new Set<string>();
   const replayedSessionEventSeqs = new Map<string, number>();
   const sessionScrollStates = ref(new Map<string, SessionScrollState>());
   const sessionAgentId = ref<string | null>(null);
@@ -158,6 +213,29 @@ export const useChatStore = defineStore("chat", () => {
   const todoCelebrationVersion = computed(() => (
     todoCelebrationEnabled.value ? todoWriteVersion.value : 0
   ));
+  const activeQueuedFollowUps = computed(() => {
+    const sessionId = activeSessionId.value;
+    if (!sessionId) return [];
+    const inputs = visiblePendingInputs(pendingInputsBySession.value.get(sessionId));
+    const runId = currentRunId.value;
+    return runId ? inputs.filter((input) => input.runId === runId) : inputs;
+  });
+  const activeQueuedFollowUp = computed(() => {
+    const inputs = activeQueuedFollowUps.value;
+    if (inputs.length === 0) return null;
+    const displayText = inputs
+      .map((input) => input.displayText || input.text)
+      .filter((text) => text.trim().length > 0)
+      .join("\n");
+    return {
+      inputs,
+      displayText,
+      canInsert: inputs.some((input) => pendingInputDelivery(input) !== "immediate"),
+      isInserting: inputs.every((input) => pendingInputDelivery(input) === "immediate"),
+      imageCount: inputs.reduce((total, input) => total + (input.images?.length ?? 0), 0),
+      assetRefCount: inputs.reduce((total, input) => total + (input.assetRefs?.length ?? 0), 0),
+    };
+  });
 
   // Plan run tracking (bound to runId + sessionId to avoid stale state)
   const pendingPlanRun = ref<{
@@ -267,6 +345,7 @@ export const useChatStore = defineStore("chat", () => {
     undoEntries: Array<{ assistantMessageId: string }>,
   ) {
     messages.value = hydrateMessages(detail.messages);
+    setSessionPendingInputs(detail.id, detail.pendingInputs ?? []);
     tokenUsage.value = usage;
     todos.value = sessionTodos.items;
     sessionLatestTodoRunIds.value.set(detail.id, sessionTodos.latestRunId);
@@ -281,6 +360,9 @@ export const useChatStore = defineStore("chat", () => {
   }
 
   function clearLoadedSessionState() {
+    if (activeSessionId.value) {
+      setSessionPendingInputs(activeSessionId.value, []);
+    }
     messages.value = [];
     tokenUsage.value = emptyTokenUsage();
     todos.value = [];
@@ -328,6 +410,136 @@ export const useChatStore = defineStore("chat", () => {
     cancelRequestedRunIds.delete(sessionId);
     managedStreamingSessionIds.delete(sessionId);
     forgetRunReplaySeq(sessionId, runId);
+  }
+
+  function setSessionPendingInputs(sessionId: string, inputs: PendingSessionInput[]) {
+    const next = new Map(pendingInputsBySession.value);
+    const visible = visiblePendingInputs(inputs);
+    if (visible.length === 0) {
+      next.delete(sessionId);
+    } else {
+      next.set(sessionId, visible);
+    }
+    pendingInputsBySession.value = next;
+  }
+
+  function upsertPendingInput(input: PendingSessionInput) {
+    if (acceptedPendingInputIds.has(input.id)) return;
+    const next = new Map(pendingInputsBySession.value);
+    const list = visiblePendingInputs(next.get(input.sessionId));
+    const merged = visiblePendingInputs(mergePendingInputList(list, input));
+    if (merged.length === 0) {
+      next.delete(input.sessionId);
+    } else {
+      next.set(input.sessionId, merged);
+    }
+    pendingInputsBySession.value = next;
+  }
+
+  function removePendingInput(sessionId: string, predicate: (input: PendingSessionInput) => boolean) {
+    const next = new Map(pendingInputsBySession.value);
+    const list = visiblePendingInputs(next.get(sessionId)).filter((input) => !predicate(input));
+    if (list.length === 0) {
+      next.delete(sessionId);
+    } else {
+      next.set(sessionId, list);
+    }
+    pendingInputsBySession.value = next;
+  }
+
+  function clearRunPendingInputs(sessionId: string, runId: string) {
+    removePendingInput(sessionId, (input) => input.runId === runId);
+    for (const key of Array.from(localPendingInputGroups)) {
+      if (key.startsWith(`${sessionId}\u{0}${runId}\u{0}`)) {
+        localPendingInputGroups.delete(key);
+      }
+    }
+    for (const key of Array.from(localFallbackPendingInputGroups)) {
+      if (key.startsWith(`${sessionId}\u{0}${runId}\u{0}`)) {
+        localFallbackPendingInputGroups.delete(key);
+      }
+    }
+  }
+
+  function markPendingInputAccepted(sessionId: string, pendingInputId: string) {
+    acceptedPendingInputIds.add(pendingInputId);
+    const accepted = visiblePendingInputs(pendingInputsBySession.value.get(sessionId))
+      .find((input) => input.id === pendingInputId);
+    if (accepted) {
+      const key = pendingInputMergeKey(sessionId, accepted.runId, accepted.mergeGroupId);
+      localPendingInputGroups.delete(key);
+      localFallbackPendingInputGroups.delete(key);
+    }
+    removePendingInput(sessionId, (input) => input.id === pendingInputId);
+  }
+
+  function localQueuedInputsForRun(
+    sessionId: string,
+    runId: string,
+    includeServerQueued = false,
+  ): PendingSessionInput[] {
+    const groups = includeServerQueued ? localPendingInputGroups : localFallbackPendingInputGroups;
+    const inputs = visiblePendingInputs(pendingInputsBySession.value.get(sessionId))
+      .filter((input) => input.runId === runId);
+    return inputs.filter((input) =>
+      groups.has(
+        pendingInputMergeKey(sessionId, runId, input.mergeGroupId),
+      ));
+  }
+
+  function upsertLocalPendingInput(params: {
+    sessionId: string;
+    runId: string;
+    mergeGroupId: string;
+    text: string;
+    displayText: string;
+    images: ImageAttachment[];
+    assetRefs: AssetRefAttachment[];
+    mode?: string | null;
+    userIntent?: UserIntentMeta | null;
+    clientMessageId?: string | null;
+  }): PendingSessionInput {
+    const existing = visiblePendingInputs(pendingInputsBySession.value.get(params.sessionId))
+      .find((input) =>
+        input.runId === params.runId && input.mergeGroupId === params.mergeGroupId);
+    const now = Date.now() / 1000;
+    const pending: PendingSessionInput = existing
+      ? {
+        ...existing,
+        text: joinPendingText(existing.text, params.text),
+        displayText: joinPendingText(existing.displayText, params.displayText),
+        images: [...(existing.images ?? []), ...params.images],
+        assetRefs: [...(existing.assetRefs ?? []), ...params.assetRefs],
+        mode: existing.mode === "plan" || params.mode === "plan"
+          ? "plan"
+          : params.mode ?? existing.mode ?? null,
+        userIntent: params.userIntent ?? existing.userIntent ?? null,
+        clientMessageId: existing.clientMessageId ?? params.clientMessageId ?? null,
+        updatedAt: now,
+      }
+      : {
+        id: params.mergeGroupId,
+        sessionId: params.sessionId,
+        runId: params.runId,
+        mergeGroupId: params.mergeGroupId,
+        status: "queued",
+        delivery: "after_run",
+        text: params.text,
+        displayText: params.displayText,
+        images: params.images.length > 0 ? [...params.images] : undefined,
+        assetRefs: params.assetRefs.length > 0 ? [...params.assetRefs] : undefined,
+        mode: params.mode ?? null,
+        userIntent: params.userIntent ?? null,
+        clientMessageId: params.clientMessageId ?? null,
+        messageId: null,
+        createdAt: now,
+        updatedAt: now,
+      };
+    upsertPendingInput(pending);
+    localPendingInputGroups.add(
+      pendingInputMergeKey(params.sessionId, params.runId, params.mergeGroupId),
+    );
+    return pending;
   }
 
   async function listRunEvents(sessionId: string, runId: string, afterSeq: number) {
@@ -1047,6 +1259,26 @@ export const useChatStore = defineStore("chat", () => {
       return false;
     }
 
+    if (event.type === "pendingInputQueued") {
+      upsertPendingInput(event.input);
+      return true;
+    }
+
+    if (event.type === "pendingInputAccepted") {
+      markPendingInputAccepted(event.sessionId, event.pendingInputId);
+      for (const key of Array.from(localPendingInputGroups)) {
+        if (key.includes(`\u{0}${event.runId}\u{0}`)) {
+          localPendingInputGroups.delete(key);
+        }
+      }
+      for (const key of Array.from(localFallbackPendingInputGroups)) {
+        if (key.includes(`\u{0}${event.runId}\u{0}`)) {
+          localFallbackPendingInputGroups.delete(key);
+        }
+      }
+      return true;
+    }
+
     if (event.type === "done" || event.type === "error" || event.type === "cancelled") {
       const trackedRunId = sessionRunIds.value.get(event.sessionId) ?? null;
       const wasStreaming = streamingSessionIds.value.has(event.sessionId);
@@ -1212,6 +1444,34 @@ export const useChatStore = defineStore("chat", () => {
       }
     }
 
+    if (event.type === "done" || event.type === "cancelled") {
+      const queued = localQueuedInputsForRun(
+        event.sessionId,
+        event.runId,
+        event.type === "cancelled",
+      );
+      if (queued.length > 0) {
+        clearRunPendingInputs(event.sessionId, event.runId);
+        const next = queued[0]!;
+        globalThis.setTimeout(() => {
+          void sendMessage(
+            next.text,
+            next.images ?? [],
+            next.assetRefs ?? [],
+            {
+              displayText: next.displayText,
+              mode: next.mode ?? undefined,
+              userIntent: next.userIntent ?? null,
+            },
+          );
+        }, 0);
+      }
+    }
+
+    if (event.type === "error" || event.type === "cancelled") {
+      clearRunPendingInputs(event.sessionId, event.runId);
+    }
+
     return true;
   }
 
@@ -1280,6 +1540,10 @@ export const useChatStore = defineStore("chat", () => {
     closedRunIds.clear();
     cancelRequestedRunIds.clear();
     replayedSessionEventSeqs.clear();
+    pendingInputsBySession.value = new Map();
+    acceptedPendingInputIds.clear();
+    localPendingInputGroups.clear();
+    localFallbackPendingInputGroups.clear();
     messages.value = [];
     resetStreamRuntimeState();
     isStreaming.value = false;
@@ -1313,6 +1577,10 @@ export const useChatStore = defineStore("chat", () => {
     cancelRequestedRunIds.clear();
     replayedSessionEventSeqs.clear();
     sessions.value = [];
+    pendingInputsBySession.value = new Map();
+    acceptedPendingInputIds.clear();
+    localPendingInputGroups.clear();
+    localFallbackPendingInputGroups.clear();
     messages.value = [];
     resetStreamRuntimeState();
     isStreaming.value = false;
@@ -1367,6 +1635,7 @@ export const useChatStore = defineStore("chat", () => {
       clearTrackedRun(id, sessionRunIds.value.get(id) ?? null);
       closedRunIds.delete(id);
       clearSessionScrollState(id);
+      setSessionPendingInputs(id, []);
       if (activeSessionId.value === id) {
         newChat();
       }
@@ -1387,6 +1656,7 @@ export const useChatStore = defineStore("chat", () => {
       clearTrackedRun(id, sessionRunIds.value.get(id) ?? null);
       closedRunIds.delete(id);
       clearSessionScrollState(id);
+      setSessionPendingInputs(id, []);
       if (activeSessionId.value === id) {
         newChat();
       }
@@ -1397,6 +1667,149 @@ export const useChatStore = defineStore("chat", () => {
       });
     } catch (e) {
       console.error("delete_session failed:", e);
+    }
+  }
+
+  function localPendingGroupForRun(sessionId: string, runId: string): string | null {
+    const prefix = `${sessionId}\u{0}${runId}\u{0}`;
+    const existing = Array.from(localPendingInputGroups).find((key) => key.startsWith(prefix));
+    return existing ? existing.slice(prefix.length) : null;
+  }
+
+  async function queueRunningMessage(
+    text: string,
+    displayText: string,
+    images: ImageAttachment[],
+    assetRefs: AssetRefAttachment[],
+    overrides?: { displayText?: string; mode?: string; userIntent?: UserIntentMeta | null },
+  ): Promise<boolean> {
+    const sessionId = activeSessionId.value;
+    const runId = currentRunId.value;
+    if (!sessionId || !runId) return false;
+    const { state: chatInputSettings } = useChatInputSettings();
+    const delivery = chatInputSettings.runningSendMode === "insert" ? "immediate" : "after_run";
+
+    let mergeGroupId = localPendingGroupForRun(sessionId, runId);
+    if (!mergeGroupId) {
+      mergeGroupId = nextPendingMessageId();
+      localPendingInputGroups.add(pendingInputMergeKey(sessionId, runId, mergeGroupId));
+    }
+    const clientMessageId = mergeGroupId;
+    const userIntent = withClientMessageId(overrides?.userIntent, clientMessageId);
+
+    logChatStreamDebug("queue running chat input", {
+      sessionId,
+      runId,
+      mergeGroupId,
+      textLength: text.length,
+      imageCount: images.length,
+      assetRefCount: assetRefs.length,
+    });
+
+    try {
+      const pending = await sessionService.queueChatInput({
+        sessionId,
+        runId,
+        mergeGroupId,
+        text,
+        displayText,
+        images: images.length > 0 ? images : null,
+        assetRefs: assetRefs.length > 0 ? assetRefs : null,
+        mode: overrides?.mode || null,
+        userIntent,
+        clientMessageId,
+        delivery,
+      });
+      if (
+        activeSessionId.value !== sessionId
+        || currentRunId.value !== runId
+        || !isStreaming.value
+      ) {
+        if (!acceptedPendingInputIds.has(pending.id)) {
+          upsertPendingInput(pending);
+        }
+        return true;
+      }
+      if (!acceptedPendingInputIds.has(pending.id)) {
+        upsertPendingInput(pending);
+        localPendingInputGroups.add(
+          pendingInputMergeKey(pending.sessionId, pending.runId, pending.mergeGroupId),
+        );
+      }
+      return true;
+    } catch (e) {
+      console.warn("queue_chat_input failed:", e);
+      const err = normalizeAppError(e);
+      if (isPendingInputFallbackError(err.code)) {
+        const pending = upsertLocalPendingInput({
+          sessionId,
+          runId,
+          mergeGroupId,
+          text,
+          displayText,
+          images,
+          assetRefs,
+          mode: overrides?.mode ?? null,
+          userIntent,
+          clientMessageId,
+        });
+        localFallbackPendingInputGroups.add(
+          pendingInputMergeKey(sessionId, runId, pending.mergeGroupId),
+        );
+        if (!isStreaming.value || currentRunId.value !== runId) {
+          clearRunPendingInputs(sessionId, runId);
+          globalThis.setTimeout(() => {
+            void sendMessage(
+              pending.text,
+              pending.images ?? [],
+              pending.assetRefs ?? [],
+              {
+                displayText: pending.displayText,
+                mode: pending.mode ?? undefined,
+                userIntent: pending.userIntent ?? null,
+              },
+            );
+          }, 0);
+        }
+        return true;
+      }
+      useNotificationStore().addNotice("error", t("app.sendFailed", err.message), {
+        code: err.code,
+        operation: "chat",
+        skipConsoleLog: true,
+      });
+      return false;
+    }
+  }
+
+  async function insertActiveQueuedFollowUp(): Promise<boolean> {
+    const sessionId = activeSessionId.value;
+    const runId = currentRunId.value;
+    const pending = activeQueuedFollowUps.value.find((input) =>
+      pendingInputDelivery(input) !== "immediate");
+    if (!sessionId || !runId || !pending) return false;
+
+    try {
+      const inserted = await sessionService.insertPendingChatInput(
+        sessionId,
+        runId,
+        pending.id,
+      );
+      if (!acceptedPendingInputIds.has(inserted.id)) {
+        upsertPendingInput(inserted);
+      }
+      localPendingInputGroups.add(
+        pendingInputMergeKey(inserted.sessionId, inserted.runId, inserted.mergeGroupId),
+      );
+      return true;
+    } catch (e) {
+      const err = normalizeAppError(e);
+      useNotificationStore().addNotice("error", t("app.sendFailed", err.message), {
+        code: err.code,
+        operation: "chat",
+        skipConsoleLog: true,
+      });
+      return false;
     }
   }
 
@@ -1424,6 +1837,11 @@ export const useChatStore = defineStore("chat", () => {
       sessionService.staleKnowledgeProposals(staleSessionId).catch((e) => {
         console.warn("stale_knowledge_proposals failed:", e);
       });
+    }
+
+    if (isStreaming.value && activeSessionId.value && currentRunId.value) {
+      await queueRunningMessage(text, displayText, images, assetRefs, overrides);
+      return;
     }
 
     const pendingMessageId = nextPendingMessageId();
@@ -1804,6 +2222,7 @@ export const useChatStore = defineStore("chat", () => {
         activeSessionId.value,
         detail.latestCompletedRunId ?? null,
       );
+      setSessionPendingInputs(activeSessionId.value, detail.pendingInputs ?? []);
       messages.value = hydrateMessages(detail.messages);
       undoableMessageIds.value = new Set(undoEntries.map((e) => e.assistantMessageId));
       activeSessionType.value = detail.sessionType;
@@ -1834,6 +2253,7 @@ export const useChatStore = defineStore("chat", () => {
         sessionId,
         detail.latestCompletedRunId ?? null,
       );
+      setSessionPendingInputs(sessionId, detail.pendingInputs ?? []);
       messages.value = hydrateMessages(detail.messages);
       undoableMessageIds.value = new Set(undoEntries.map((e) => e.assistantMessageId));
       activeSessionType.value = detail.sessionType;
@@ -1887,6 +2307,9 @@ export const useChatStore = defineStore("chat", () => {
     setTodoMode,
     pendingQuestion,
     pendingToolConfirms,
+    activeQueuedFollowUps,
+    activeQueuedFollowUp,
+    insertActiveQueuedFollowUp,
     streamingSessionIds,
     undoableMessageIds,
     rememberSessionScrollState,

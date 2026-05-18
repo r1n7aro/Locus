@@ -15,10 +15,11 @@ import {
   getChatSubmitModifierLabel,
   useChatInputSettings,
   type ChatSubmitMode,
+  type RunningSendMode,
 } from "../../composables/useChatInputSettings";
 
 const { state, setShortcut, resetShortcut } = useKeyboardShortcuts();
-const { state: chatInputSettings, setSubmitMode } = useChatInputSettings();
+const { state: chatInputSettings, setSubmitMode, setRunningSendMode } = useChatInputSettings();
 
 const recordingAction = ref<ShortcutAction | null>(null);
 const captureError = ref("");
@@ -35,6 +36,19 @@ const submitModeOptions = computed(() => [
     value: "mod-enter-send",
     label: t("settings.shortcuts.sendModeModifierSend", submitModifierLabel),
     hint: t("settings.shortcuts.sendModeModifierSendHint"),
+  },
+]);
+
+const runningSendModeOptions = computed(() => [
+  {
+    value: "after-run",
+    label: t("settings.shortcuts.runningSendAfterRun"),
+    hint: t("settings.shortcuts.runningSendAfterRunHint"),
+  },
+  {
+    value: "insert",
+    label: t("settings.shortcuts.runningSendInsert"),
+    hint: t("settings.shortcuts.runningSendInsertHint"),
   },
 ]);
 
@@ -111,6 +125,23 @@ function handleReset(action: ShortcutAction) {
           :aria-label="t('settings.shortcuts.sendModeTitle')"
           size="md"
           @update:model-value="setSubmitMode($event as ChatSubmitMode)"
+        />
+      </div>
+    </div>
+
+    <div class="shortcut-mode-row">
+      <div class="shortcut-main">
+        <div class="shortcut-title">{{ t("settings.shortcuts.runningSendTitle") }}</div>
+        <div class="shortcut-desc">{{ t("settings.shortcuts.runningSendDesc") }}</div>
+      </div>
+
+      <div class="shortcut-mode-control">
+        <BaseDropdown
+          :model-value="chatInputSettings.runningSendMode"
+          :options="runningSendModeOptions"
+          :aria-label="t('settings.shortcuts.runningSendTitle')"
+          size="md"
+          @update:model-value="setRunningSendMode($event as RunningSendMode)"
         />
       </div>
     </div>

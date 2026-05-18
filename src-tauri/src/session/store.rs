@@ -65,6 +65,7 @@ const RUN_STATUS_QUEUED: &str = "queued";
 const RUN_STATUS_STARTING: &str = "starting";
 const RUN_STATUS_RUNNING: &str = "running";
 const RUN_STATUS_WAITING_INPUT: &str = "waiting_input";
+const RUN_STATUS_FINISHING: &str = "finishing";
 const RUN_STATUS_CANCELLING: &str = "cancelling";
 const RUN_STATUS_DONE: &str = "done";
 const RUN_STATUS_CANCELLED: &str = "cancelled";
@@ -468,7 +469,7 @@ impl SessionStore {
     ///
     /// Do not rely on ad-hoc `ALTER TABLE ... .ok()` fallbacks or silent
     /// schema drift. Session data must migrate deterministically.
-    const SCHEMA_VERSION: i32 = 18;
+    const SCHEMA_VERSION: i32 = 19;
 
     pub fn new(data_dir: &Path) -> Result<Self, String> {
         let db_path = data_dir.join("locus.db");
@@ -663,7 +664,13 @@ impl SessionStore {
             })?;
         }
 
-        debug_assert_eq!(Self::SCHEMA_VERSION, 18, "add a new migration block above");
+        if current < 19 {
+            Self::migrate(conn, 19, "reserve in-memory pending input queue", |_conn| {
+                Ok(())
+            })?;
+        }
+
+        debug_assert_eq!(Self::SCHEMA_VERSION, 19, "add a new migration block above");
         Ok(())
     }
 
@@ -775,7 +782,7 @@ impl SessionStore {
                  updated_at = ?2,
                  finished_at = COALESCE(finished_at, ?2),
                  error_message = COALESCE(error_message, 'Interrupted by application restart')
-             WHERE status IN (?3, ?4, ?5, ?6, ?7)",
+             WHERE status IN (?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 RUN_STATUS_CANCELLED,
                 now,
@@ -783,6 +790,7 @@ impl SessionStore {
                 RUN_STATUS_STARTING,
                 RUN_STATUS_RUNNING,
                 RUN_STATUS_WAITING_INPUT,
+                RUN_STATUS_FINISHING,
                 RUN_STATUS_CANCELLING,
             ],
         )
@@ -1347,7 +1355,7 @@ impl SessionStore {
         let active_run = conn
             .query_row(
                 "SELECT run_id FROM session_runs
-                 WHERE session_id = ?1 AND status IN (?2, ?3, ?4, ?5, ?6)
+                 WHERE session_id = ?1 AND status IN (?2, ?3, ?4, ?5, ?6, ?7)
                  ORDER BY updated_at DESC
                  LIMIT 1",
                 params![
@@ -1356,6 +1364,7 @@ impl SessionStore {
                     RUN_STATUS_STARTING,
                     RUN_STATUS_RUNNING,
                     RUN_STATUS_WAITING_INPUT,
+                    RUN_STATUS_FINISHING,
                     RUN_STATUS_CANCELLING,
                 ],
                 |row| row.get::<_, String>(0),
@@ -1433,6 +1442,10 @@ impl SessionStore {
         Ok(())
     }
 
+    pub fn close_run_pending_input_queue(&self, run_id: &str) -> Result<(), String> {
+        self.update_run_status(run_id, RUN_STATUS_FINISHING, None)
+    }
+
     pub fn active_run_for_session(
         &self,
         session_id: &str,
@@ -1441,7 +1454,7 @@ impl SessionStore {
         conn.query_row(
             "SELECT run_id, session_id, status, started_at, updated_at, finished_at, error_message
              FROM session_runs
-             WHERE session_id = ?1 AND status IN (?2, ?3, ?4, ?5, ?6)
+             WHERE session_id = ?1 AND status IN (?2, ?3, ?4, ?5, ?6, ?7)
              ORDER BY updated_at DESC
              LIMIT 1",
             params![
@@ -1450,6 +1463,7 @@ impl SessionStore {
                 RUN_STATUS_STARTING,
                 RUN_STATUS_RUNNING,
                 RUN_STATUS_WAITING_INPUT,
+                RUN_STATUS_FINISHING,
                 RUN_STATUS_CANCELLING,
             ],
             |row| {
@@ -1491,7 +1505,7 @@ impl SessionStore {
                         session_runs.error_message
                  FROM session_runs
                  JOIN descendants ON descendants.id = session_runs.session_id
-                 WHERE session_runs.status IN (?2, ?3, ?4, ?5, ?6)
+                  WHERE session_runs.status IN (?2, ?3, ?4, ?5, ?6, ?7)
                  ORDER BY session_runs.updated_at DESC",
             )
             .map_err(|e| format!("Failed to prepare active descendant run query: {}", e))?;
@@ -1504,6 +1518,7 @@ impl SessionStore {
                     RUN_STATUS_STARTING,
                     RUN_STATUS_RUNNING,
                     RUN_STATUS_WAITING_INPUT,
+                    RUN_STATUS_FINISHING,
                     RUN_STATUS_CANCELLING,
                 ],
                 |row| {
@@ -1819,6 +1834,7 @@ impl SessionStore {
             created_at,
             updated_at,
             messages,
+            pending_inputs: Vec::new(),
         })
     }
 
@@ -3505,6 +3521,29 @@ mod tests {
         assert!(
             SessionStore::table_has_column(&conn, "token_usage", "last_context_limit").unwrap()
         );
+        assert!(table_exists(&conn, "session_runs"));
+        assert!(table_exists(&conn, "session_events"));
+    }
+
+    #[test]
+    fn v18_database_migrates_forward_to_v19_without_pending_input_table() {
+        let dir = tempdir().expect("create temp dir");
+        let db_path = dir.path().join("locus.db");
+        {
+            let _store = SessionStore::new(dir.path()).expect("initialize latest store");
+        }
+
+        let conn = Connection::open(&db_path).expect("open db");
+        conn.execute_batch("PRAGMA user_version = 18;")
+            .expect("simulate v18 schema");
+        drop(conn);
+
+        let _store = SessionStore::new(dir.path()).expect("migrate store");
+        let conn = Connection::open(&db_path).expect("open migrated db");
+        let version: i32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read schema version");
+        assert_eq!(version, SessionStore::SCHEMA_VERSION);
         assert!(table_exists(&conn, "session_runs"));
         assert!(table_exists(&conn, "session_events"));
     }

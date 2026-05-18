@@ -409,7 +409,7 @@ function ctxArchive() {
           rowRoleClass(row.node),
           {
             active: row.node.kind === 'session' && !!row.node.sessionId && (row.node.sessionId === activeSessionId || selectedIds.has(row.node.sessionId) || (ctxMenu && ctxMenu.ids.includes(row.node.sessionId))),
-            streaming: row.node.status === 'running',
+            streaming: row.node.status === 'running' || row.node.status === 'finishing',
             folder: row.node.kind === 'folder',
             child: row.depth > 0,
             virtual: row.node.kind === 'session' && row.node.isVirtual,
@@ -426,7 +426,7 @@ function ctxArchive() {
           class="sp-expand-btn"
           :class="{
             open: row.expanded,
-            'is-running': row.node.status === 'running',
+            'is-running': row.node.status === 'running' || row.node.status === 'finishing',
           }"
           @click.stop="toggleNode(row)"
           :title="row.expanded ? t('chat.session.collapse') : t('chat.session.expand')"
@@ -708,7 +708,8 @@ function ctxArchive() {
   white-space: nowrap;
 }
 
-.sp-session-status.is-running {
+.sp-session-status.is-running,
+.sp-session-status.is-finishing {
   border-color: color-mix(in srgb, var(--accent-color) 26%, var(--border-color));
   background: color-mix(in srgb, var(--accent-color) 8%, transparent);
   color: var(--accent-color);
@@ -741,7 +742,8 @@ function ctxArchive() {
   transition: opacity 0.12s ease;
 }
 
-.sp-session-dot.is-running {
+.sp-session-dot.is-running,
+.sp-session-dot.is-finishing {
   width: 6px;
   height: 6px;
   background: var(--accent-color);

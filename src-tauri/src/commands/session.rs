@@ -6,7 +6,7 @@ use std::sync::Arc;
 use futures::FutureExt;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use super::auth::CodexAuthStateHandle;
 use super::{StreamEvent, TokenUsage};
@@ -20,13 +20,18 @@ use crate::error::AppError;
 use crate::knowledge_store::{self, KnowledgeDocument, KnowledgeInjectMode, KnowledgeType};
 use crate::session::models::{
     AssetRefData, ChatMessage, ImageData, KnowledgeProposalItem, KnowledgeProposalItemKind,
-    KnowledgeProposalStatus, SessionDetail, SessionEventRecord, SessionRunSummary,
-    SessionRuntimeStatus, SessionSummary, TodoItem, TodoSnapshot, UserIntentPayload,
+    KnowledgeProposalStatus, PendingSessionInput, SessionDetail, SessionEventRecord,
+    SessionRunSummary, SessionRuntimeStatus, SessionSummary, TodoItem, TodoSnapshot,
+    UserIntentPayload,
 };
+use crate::session::pending_inputs::QueuePendingInputRequest;
 use crate::session::store::{SessionStore, CHILD_SESSION_FORK_ERROR};
 use crate::tool::ToolRegistry;
 use crate::workspace::Workspace;
-use crate::{ActiveTaskHandle, ActiveTasks, ApiKeyState, ProviderKeysState, QuestionStore};
+use crate::{
+    ActiveTaskHandle, ActiveTasks, ApiKeyState, PendingInputQueueHandle, ProviderKeysState,
+    QuestionStore,
+};
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -171,6 +176,7 @@ fn runtime_status_from_run_status(status: &str) -> SessionRuntimeStatus {
         "queued" => SessionRuntimeStatus::Queued,
         "starting" => SessionRuntimeStatus::Starting,
         "waiting_input" => SessionRuntimeStatus::WaitingInput,
+        "finishing" => SessionRuntimeStatus::Finishing,
         "cancelling" => SessionRuntimeStatus::Cancelling,
         "error" => SessionRuntimeStatus::Error,
         _ => SessionRuntimeStatus::Running,
@@ -955,53 +961,141 @@ pub async fn chat(
             return;
         }
 
-        let task_result = AssertUnwindSafe(instance.run_with_run_id(
-            &handle,
-            &store_for_task,
-            &text,
-            if images_for_task.is_empty() {
-                None
-            } else {
-                Some(&images_for_task)
-            },
-            if asset_refs_for_task.is_empty() {
-                None
-            } else {
-                Some(&asset_refs_for_task)
-            },
-            &effective_mode,
-            user_intent_for_task,
-            run_id_for_task.clone(),
-        ))
-        .catch_unwind()
-        .await;
+        let mut current_run_id = run_id_for_task.clone();
+        let mut next_text = text;
+        let mut next_images = images_for_task;
+        let mut next_asset_refs = asset_refs_for_task;
+        let mut next_mode = effective_mode;
+        let mut next_user_intent = user_intent_for_task;
+        let mut accepted_pending_input_id: Option<String> = None;
 
-        match task_result {
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => {
-                eprintln!("[Locus] session {} failed: {}", sid_clone, e);
+        loop {
+            let task_result = AssertUnwindSafe(instance.run_with_run_id(
+                &handle,
+                &store_for_task,
+                &next_text,
+                if next_images.is_empty() {
+                    None
+                } else {
+                    Some(&next_images)
+                },
+                if next_asset_refs.is_empty() {
+                    None
+                } else {
+                    Some(&next_asset_refs)
+                },
+                &next_mode,
+                next_user_intent.take(),
+                current_run_id.clone(),
+                accepted_pending_input_id.take(),
+            ))
+            .catch_unwind()
+            .await;
+
+            match task_result {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    eprintln!("[Locus] session {} failed: {}", sid_clone, e);
+                    break;
+                }
+                Err(panic_payload) => {
+                    let panic_message = panic_payload_to_string(panic_payload);
+                    eprintln!("[Locus] session {} panicked: {}", sid_clone, panic_message);
+                    emit_session_stream_with_run_id(
+                        &handle,
+                        store_for_task.as_ref(),
+                        current_run_id.clone(),
+                        StreamEvent::Error {
+                            session_id: sid_clone.clone(),
+                            error: AppError::new(
+                                "chat.stream_failed",
+                                format!("Session terminated unexpectedly: {}", panic_message),
+                            ),
+                        },
+                    );
+                    break;
+                }
             }
-            Err(panic_payload) => {
-                let panic_message = panic_payload_to_string(panic_payload);
-                eprintln!("[Locus] session {} panicked: {}", sid_clone, panic_message);
-                emit_session_stream_with_run_id(
-                    &handle,
-                    store_for_task.as_ref(),
-                    run_id_for_task.clone(),
-                    StreamEvent::Error {
-                        session_id: sid_clone.clone(),
-                        error: AppError::new(
-                            "chat.stream_failed",
-                            format!("Session terminated unexpectedly: {}", panic_message),
-                        ),
-                    },
+
+            let follow_up = {
+                let queue_state: tauri::State<'_, crate::PendingInputQueueHandle> = handle.state();
+                let claimed = match queue_state.lock() {
+                    Ok(mut queue) => queue.claim_after_run(&sid_clone, &current_run_id),
+                    Err(error) => {
+                        eprintln!(
+                            "[Locus] failed to lock pending input queue for session {} run {}: {}",
+                            sid_clone, current_run_id, error
+                        );
+                        None
+                    }
+                };
+                claimed
+            };
+            let Some(follow_up) = follow_up else {
+                break;
+            };
+
+            let next_run_id = generate_chat_run_id(&sid_clone);
+            if let Err(error) = store_for_task.try_start_run(&sid_clone, &next_run_id) {
+                let queue_state: tauri::State<'_, crate::PendingInputQueueHandle> = handle.state();
+                if let Ok(mut queue) = queue_state.lock() {
+                    queue.restore_claimed(vec![follow_up]);
+                }
+                eprintln!(
+                    "[Locus] failed to start queued follow-up for session {} after run {}: {}",
+                    sid_clone, current_run_id, error
                 );
+                break;
             }
+
+            {
+                let mut guard = tasks.lock().await;
+                match guard.get_mut(&sid_for_cleanup) {
+                    Some(task) if task.run_id == current_run_id => {
+                        task.run_id = next_run_id.clone();
+                    }
+                    _ => {
+                        let queue_state: tauri::State<'_, crate::PendingInputQueueHandle> =
+                            handle.state();
+                        if let Ok(mut queue) = queue_state.lock() {
+                            queue.restore_claimed(vec![follow_up]);
+                        }
+                        if let Err(error) = store_for_task.update_run_status(
+                            &next_run_id,
+                            "error",
+                            Some("Active task changed before queued follow-up could start"),
+                        ) {
+                            eprintln!(
+                                "[Locus] failed to mark queued follow-up run {} as error: {}",
+                                next_run_id, error
+                            );
+                        }
+                        break;
+                    }
+                }
+            }
+
+            accepted_pending_input_id = Some(follow_up.id);
+            next_text = follow_up.text;
+            next_images = follow_up.images.unwrap_or_default();
+            next_asset_refs = follow_up.asset_refs.unwrap_or_default();
+            next_mode = follow_up
+                .mode
+                .clone()
+                .or_else(|| {
+                    follow_up
+                        .user_intent
+                        .as_ref()
+                        .map(|intent| intent.mode.clone())
+                })
+                .unwrap_or_else(|| "build".to_string());
+            next_user_intent = follow_up.user_intent;
+            current_run_id = next_run_id;
         }
         let removed = {
             let mut guard = tasks.lock().await;
             match guard.get(&sid_for_cleanup) {
-                Some(task) if task.run_id == run_id_for_task => {
+                Some(task) if task.run_id == current_run_id => {
                     guard.remove(&sid_for_cleanup).is_some()
                 }
                 _ => false,
@@ -1009,7 +1103,7 @@ pub async fn chat(
         };
         eprintln!(
             "[Locus] active task cleared for session {} run {} removed={}",
-            sid_for_cleanup, run_id_for_task, removed
+            sid_for_cleanup, current_run_id, removed
         );
         let _ = done_tx.send(true);
     });
@@ -1054,11 +1148,258 @@ pub async fn chat(
 }
 
 #[tauri::command]
+pub async fn queue_chat_input(
+    session_id: String,
+    run_id: String,
+    merge_group_id: String,
+    text: String,
+    display_text: Option<String>,
+    images: Option<Vec<ImageData>>,
+    asset_refs: Option<Vec<AssetRefData>>,
+    mode: Option<String>,
+    user_intent: Option<UserIntentPayload>,
+    client_message_id: Option<String>,
+    delivery: Option<String>,
+    app_handle: AppHandle,
+    store: State<'_, Arc<SessionStore>>,
+    pending_input_queue: State<'_, PendingInputQueueHandle>,
+    active_tasks: State<'_, ActiveTasks>,
+) -> Result<PendingSessionInput, AppError> {
+    let trimmed_merge_group_id = merge_group_id.trim();
+    if trimmed_merge_group_id.is_empty() {
+        return Err(AppError::new(
+            "session.pending_input.invalid_group",
+            "Pending input merge group is required.",
+        )
+        .operation("chat"));
+    }
+
+    let images = images.unwrap_or_default();
+    let asset_refs = asset_refs.unwrap_or_default();
+    let requested_delivery = if delivery.as_deref() == Some("immediate") {
+        "immediate"
+    } else {
+        "after_run"
+    };
+    if text.trim().is_empty() && images.is_empty() && asset_refs.is_empty() {
+        return Err(AppError::new(
+            "session.pending_input.empty",
+            "Pending input cannot be empty.",
+        )
+        .operation("chat"));
+    }
+
+    {
+        let tasks = active_tasks.lock().await;
+        let Some(task) = tasks.get(&session_id) else {
+            return Err(AppError::new(
+                "session.pending_input.no_active_run",
+                "Session has no active run for queued input.",
+            )
+            .operation("chat")
+            .retryable(true));
+        };
+        if task.run_id != run_id {
+            return Err(AppError::new(
+                "session.pending_input.run_mismatch",
+                "Queued input targets a stale run.",
+            )
+            .detail(format!(
+                "expected active run {}, got {}",
+                task.run_id, run_id
+            ))
+            .operation("chat")
+            .retryable(true));
+        }
+    }
+
+    let run = store
+        .active_run_for_session(&session_id)
+        .map_err(AppError::from)?
+        .filter(|run| run.run_id == run_id);
+    let Some(run) = run else {
+        return Err(AppError::new(
+            "session.pending_input.no_active_run",
+            "Session has no active run for queued input.",
+        )
+        .operation("chat")
+        .retryable(true));
+    };
+    if !matches!(
+        run.status.as_str(),
+        "queued" | "starting" | "running" | "waiting_input"
+    ) && !(run.status == "finishing" && requested_delivery == "after_run")
+    {
+        return Err(AppError::new(
+            "session.pending_input.run_closed",
+            "The active run is no longer accepting queued input.",
+        )
+        .detail(format!("run {} status {}", run_id, run.status))
+        .operation("chat")
+        .retryable(true));
+    }
+
+    if run.status == "finishing" && requested_delivery == "immediate" {
+        return Err(AppError::new(
+            "session.pending_input.run_closed",
+            "The active run is no longer accepting queued input.",
+        )
+        .detail(format!("run {} status {}", run_id, run.status))
+        .operation("chat")
+        .retryable(true));
+    }
+
+    let display_text = display_text.unwrap_or_else(|| text.clone());
+    let pending = {
+        let mut queue = pending_input_queue.lock().map_err(|e| {
+            AppError::new(
+                "session.pending_input.lock_failed",
+                "Pending input queue is unavailable.",
+            )
+            .detail(e.to_string())
+            .operation("chat")
+            .retryable(true)
+        })?;
+        queue.queue_input(QueuePendingInputRequest {
+            session_id: session_id.clone(),
+            run_id: run_id.clone(),
+            merge_group_id: trimmed_merge_group_id.to_string(),
+            text,
+            display_text,
+            images,
+            asset_refs,
+            mode,
+            user_intent,
+            client_message_id,
+            delivery,
+        })
+    };
+
+    emit_session_stream_with_run_id(
+        &app_handle,
+        store.inner().as_ref(),
+        run_id,
+        StreamEvent::PendingInputQueued {
+            session_id,
+            input: pending.clone(),
+        },
+    );
+
+    Ok(pending)
+}
+
+#[tauri::command]
+pub async fn insert_pending_chat_input(
+    session_id: String,
+    run_id: String,
+    pending_input_id: Option<String>,
+    app_handle: AppHandle,
+    store: State<'_, Arc<SessionStore>>,
+    pending_input_queue: State<'_, PendingInputQueueHandle>,
+    active_tasks: State<'_, ActiveTasks>,
+) -> Result<PendingSessionInput, AppError> {
+    {
+        let tasks = active_tasks.lock().await;
+        let Some(task) = tasks.get(&session_id) else {
+            return Err(AppError::new(
+                "session.pending_input.no_active_run",
+                "Session has no active run for queued input.",
+            )
+            .operation("chat")
+            .retryable(true));
+        };
+        if task.run_id != run_id {
+            return Err(AppError::new(
+                "session.pending_input.run_mismatch",
+                "Queued input targets a stale run.",
+            )
+            .detail(format!(
+                "expected active run {}, got {}",
+                task.run_id, run_id
+            ))
+            .operation("chat")
+            .retryable(true));
+        }
+    }
+
+    let run = store
+        .active_run_for_session(&session_id)
+        .map_err(AppError::from)?
+        .filter(|run| run.run_id == run_id);
+    let Some(run) = run else {
+        return Err(AppError::new(
+            "session.pending_input.no_active_run",
+            "Session has no active run for queued input.",
+        )
+        .operation("chat")
+        .retryable(true));
+    };
+    if !matches!(
+        run.status.as_str(),
+        "queued" | "starting" | "running" | "waiting_input"
+    ) {
+        return Err(AppError::new(
+            "session.pending_input.run_closed",
+            "The active run is no longer accepting queued input.",
+        )
+        .detail(format!("run {} status {}", run_id, run.status))
+        .operation("chat")
+        .retryable(true));
+    }
+
+    let pending = {
+        let mut queue = pending_input_queue.lock().map_err(|e| {
+            AppError::new(
+                "session.pending_input.lock_failed",
+                "Pending input queue is unavailable.",
+            )
+            .detail(e.to_string())
+            .operation("chat")
+            .retryable(true)
+        })?;
+        queue.promote_to_immediate(&session_id, &run_id, pending_input_id.as_deref())
+    };
+    let Some(pending) = pending else {
+        return Err(AppError::new(
+            "session.pending_input.not_found",
+            "Queued input was not found for the active run.",
+        )
+        .operation("chat")
+        .retryable(true));
+    };
+
+    emit_session_stream_with_run_id(
+        &app_handle,
+        store.inner().as_ref(),
+        run_id,
+        StreamEvent::PendingInputQueued {
+            session_id,
+            input: pending.clone(),
+        },
+    );
+
+    Ok(pending)
+}
+
+#[tauri::command]
 pub async fn load_session(
     session_id: String,
     store: State<'_, Arc<SessionStore>>,
+    pending_input_queue: State<'_, PendingInputQueueHandle>,
 ) -> Result<SessionDetail, AppError> {
-    store.load_session(&session_id).map_err(Into::into)
+    let mut detail = store.load_session(&session_id).map_err(AppError::from)?;
+    detail.pending_inputs = pending_input_queue
+        .lock()
+        .map_err(|e| {
+            AppError::new(
+                "session.pending_input.lock_failed",
+                "Pending input queue is unavailable.",
+            )
+            .detail(e.to_string())
+            .operation("loadSession")
+        })?
+        .list_session(&session_id);
+    Ok(detail)
 }
 
 #[tauri::command]
@@ -2121,6 +2462,13 @@ migration is written as `empty`.\n\n",
     };
     append_json_block(&mut out, "Todos", &todos_json, 2);
 
+    let pending_inputs_json = if detail.pending_inputs.is_empty() {
+        json!(EMPTY_EXPORT_FIELD)
+    } else {
+        json!(detail.pending_inputs)
+    };
+    append_json_block(&mut out, "Pending Inputs", &pending_inputs_json, 2);
+
     out.push_str("## Messages\n\n");
     if detail.messages.is_empty() {
         out.push_str("`empty`\n\n");
@@ -2870,6 +3218,7 @@ mod tests {
                 knowledge_proposal: None,
                 render_parts: None,
             }],
+            pending_inputs: vec![],
         };
 
         let markdown = format_session_detail_as_markdown(&detail, &[], None, None, true, None);
@@ -2878,6 +3227,7 @@ mod tests {
         assert!(markdown.contains("\"agentId\": \"empty\""));
         assert!(markdown.contains("\"parentSessionId\": \"empty\""));
         assert!(markdown.contains("\"latestCompletedRunId\": \"empty\""));
+        assert!(markdown.contains("## Pending Inputs"));
         assert!(markdown.contains("\"promptPrefix\": \"empty\""));
         assert!(markdown.contains("\"promptSuffix\": \"empty\""));
         assert!(markdown.contains("\"responseId\": \"empty\""));
@@ -2934,6 +3284,7 @@ mod tests {
                 knowledge_proposal: None,
                 render_parts: None,
             }],
+            pending_inputs: vec![],
         };
 
         let markdown = format_session_detail_as_markdown(&detail, &[], None, None, true, None);
@@ -2958,6 +3309,7 @@ mod tests {
             created_at: 10,
             updated_at: 20,
             messages: vec![],
+            pending_inputs: vec![],
         };
 
         let markdown = format_session_detail_as_markdown(

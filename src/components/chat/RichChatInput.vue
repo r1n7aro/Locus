@@ -232,8 +232,7 @@ const hasTopAttachments = computed(() =>
 );
 
 const canSend = computed(() =>
-  props.isStreaming
-  || !!props.modelValue.trim()
+  !!props.modelValue.trim()
   || !!pastedContent.value
   || imageAttachments.value.length > 0
   || assetRefAttachments.value.length > 0
@@ -1506,9 +1505,7 @@ function tryHandleExactActionCommand(): boolean {
 }
 
 function handleSend() {
-  if (props.isStreaming) return;
-
-  if (tryHandleExactActionCommand()) {
+  if (!props.isStreaming && tryHandleExactActionCommand()) {
     return;
   }
 

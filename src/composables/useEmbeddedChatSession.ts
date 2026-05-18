@@ -13,6 +13,7 @@ import { normalizeAppError } from "../services/errors";
 import { getLocusRuntime, type RuntimeUnsubscribe } from "../services/locusRuntime";
 import * as sessionService from "../services/session";
 import { hydrateChatMessagesIntent, withClientMessageId } from "./chatInputIntents";
+import { useChatInputSettings } from "./useChatInputSettings";
 import {
   buildToolResultMessages,
   mergeUserMessage,
@@ -32,6 +33,7 @@ import type {
   ToolCallDisplay,
   UserIntentMeta,
   AssistantRenderPart,
+  PendingSessionInput,
 } from "../types";
 
 export interface EmbeddedChatRequest {
@@ -50,6 +52,10 @@ interface EmbeddedChatState extends StreamState {
   inputText: string;
   error: string | null;
   pendingRun: boolean;
+  pendingInputs: PendingSessionInput[];
+  acceptedPendingInputIds: Set<string>;
+  localMergeGroupId: string | null;
+  localFallbackMergeGroupId: string | null;
 }
 
 export interface UseEmbeddedChatSessionOptions {
@@ -84,6 +90,10 @@ function createState(key: string): EmbeddedChatState {
     inputText: "",
     error: null,
     pendingRun: false,
+    pendingInputs: [],
+    acceptedPendingInputIds: new Set<string>(),
+    localMergeGroupId: null,
+    localFallbackMergeGroupId: null,
     messages: [] as ChatMessage[],
     streamingText: "",
     rawStreamText: "",
@@ -115,12 +125,53 @@ function replaceMessageById(list: ChatMessage[], message: ChatMessage): ChatMess
   return next;
 }
 
+function mergePendingInputList(
+  list: PendingSessionInput[],
+  input: PendingSessionInput,
+): PendingSessionInput[] {
+  const index = list.findIndex((item) =>
+    item.id === input.id
+    || (item.runId === input.runId && item.mergeGroupId === input.mergeGroupId));
+  if (index < 0) return [...list, input];
+  const next = [...list];
+  next.splice(index, 1, input);
+  return next;
+}
+
+function visiblePendingInputs(inputs: PendingSessionInput[]) {
+  return inputs.filter((input) => input.status === "queued" || input.status === "delivering");
+}
+
+function pendingInputDelivery(input: PendingSessionInput): "after_run" | "immediate" {
+  return input.delivery === "immediate" ? "immediate" : "after_run";
+}
+
+function joinPendingText(existing: string, next: string): string {
+  const existingTrimmed = existing.trim();
+  const nextTrimmed = next.trim();
+  if (!existingTrimmed && !nextTrimmed) return "";
+  if (!existingTrimmed) return next;
+  if (!nextTrimmed) return existing;
+  return `${existing}\n${next}`;
+}
+
+function isPendingInputFallbackError(code: string): boolean {
+  return code === "session.pending_input.run_closed"
+    || code === "session.pending_input.no_active_run"
+    || code === "session.pending_input.run_mismatch"
+    || code === "session.run_locked";
+}
+
 function clearState(state: EmbeddedChatState) {
   state.sessionId = null;
   state.currentRunId = null;
   state.inputText = "";
   state.error = null;
   state.pendingRun = false;
+  state.pendingInputs = [];
+  state.acceptedPendingInputIds.clear();
+  state.localMergeGroupId = null;
+  state.localFallbackMergeGroupId = null;
   state.messages = [];
   state.pendingQuestion = null;
   state.pendingToolConfirms = [];
@@ -380,6 +431,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
       const detail = await sessionService.loadSession(sessionId);
       if (state.sessionId !== sessionId) return;
       state.messages = hydrateChatMessagesIntent(detail.messages);
+      state.pendingInputs = visiblePendingInputs(detail.pendingInputs ?? []);
     } catch (error) {
       console.warn("[embedded-chat] loadSession after stream error failed:", error);
     }
@@ -398,6 +450,22 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
       return;
     }
 
+    if (event.type === "pendingInputQueued") {
+      if (state.acceptedPendingInputIds.has(event.input.id)) return;
+      state.pendingInputs = visiblePendingInputs(
+        mergePendingInputList(state.pendingInputs, event.input),
+      );
+      return;
+    }
+
+    if (event.type === "pendingInputAccepted") {
+      state.acceptedPendingInputIds.add(event.pendingInputId);
+      state.pendingInputs = state.pendingInputs.filter((input) => input.id !== event.pendingInputId);
+      state.localMergeGroupId = null;
+      state.localFallbackMergeGroupId = null;
+      return;
+    }
+
     const mutations = reduceStreamEvent(state, event);
     for (const mutation of mutations) {
       applyMutation(state, mutation);
@@ -412,14 +480,46 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     }
 
     if (event.type === "done" || event.type === "cancelled") {
+      let queuedRequest: EmbeddedChatRequest | null = null;
+      const followUpMergeGroupId = event.type === "cancelled"
+        ? state.localMergeGroupId
+        : state.localFallbackMergeGroupId;
+      if ((event.type === "done" || event.type === "cancelled") && followUpMergeGroupId) {
+        const queued = state.pendingInputs.find((input) =>
+          input.runId === event.runId && input.mergeGroupId === followUpMergeGroupId);
+        if (queued) {
+          state.pendingInputs = state.pendingInputs.filter((input) => input.id !== queued.id);
+          state.localMergeGroupId = null;
+          state.localFallbackMergeGroupId = null;
+          queuedRequest = {
+            text: queued.text,
+            displayText: queued.displayText,
+            mode: queued.mode ?? null,
+            userIntent: queued.userIntent ?? null,
+            images: queued.images ?? null,
+            assetRefs: queued.assetRefs ?? null,
+          };
+        }
+      }
+      if (event.type === "cancelled") {
+        state.pendingInputs = state.pendingInputs.filter((input) => input.runId !== event.runId);
+        if (!queuedRequest) {
+          state.localMergeGroupId = null;
+          state.localFallbackMergeGroupId = null;
+        }
+      }
       state.currentRunId = null;
       state.pendingRun = false;
+      if (queuedRequest) {
+        globalThis.setTimeout(() => {
+          void send(queuedRequest);
+        }, 0);
+      }
     }
   }
 
   async function send(requestOverride?: EmbeddedChatRequest | null) {
     const state = activeState.value;
-    if (state.isStreaming) return;
 
     const input = state.inputText.trim();
     const request = requestOverride ?? (input ? options.buildRequest(input) : null);
@@ -438,6 +538,109 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
       sessionService.staleKnowledgeProposals(state.sessionId).catch((error: unknown) => {
         console.warn("[embedded-chat] staleKnowledgeProposals failed:", error);
       });
+    }
+
+    if (state.isStreaming && state.sessionId && state.currentRunId) {
+      const { state: chatInputSettings } = useChatInputSettings();
+      const delivery = chatInputSettings.runningSendMode === "insert" ? "immediate" : "after_run";
+      let mergeGroupId = state.localMergeGroupId;
+      if (!mergeGroupId) {
+        mergeGroupId = `embedded_user_${Date.now()}`;
+        state.localMergeGroupId = mergeGroupId;
+      }
+      const userIntent = withClientMessageId(request.userIntent, mergeGroupId);
+      try {
+        const pending = await sessionService.queueChatInput({
+          sessionId: state.sessionId,
+          runId: state.currentRunId,
+          mergeGroupId,
+          text: request.text,
+          displayText,
+          images: request.images && request.images.length > 0 ? request.images : null,
+          assetRefs: request.assetRefs && request.assetRefs.length > 0 ? request.assetRefs : null,
+          mode: request.mode ?? null,
+          userIntent,
+          clientMessageId: mergeGroupId,
+          delivery,
+        });
+        if (!state.isStreaming || state.currentRunId !== pending.runId) {
+          if (!state.acceptedPendingInputIds.has(pending.id)) {
+            state.pendingInputs = visiblePendingInputs(
+              mergePendingInputList(state.pendingInputs, pending),
+            );
+          }
+          return;
+        }
+        if (!state.acceptedPendingInputIds.has(pending.id)) {
+          state.pendingInputs = visiblePendingInputs(
+            mergePendingInputList(state.pendingInputs, pending),
+          );
+        }
+        state.inputText = "";
+        state.error = null;
+      } catch (error) {
+        const err = normalizeAppError(error);
+        if (isPendingInputFallbackError(err.code)) {
+          const existing = state.pendingInputs.find((input) =>
+            input.runId === state.currentRunId && input.mergeGroupId === mergeGroupId);
+          const now = Date.now() / 1000;
+          const pending: PendingSessionInput = existing
+            ? {
+              ...existing,
+              text: joinPendingText(existing.text, request.text),
+              displayText: joinPendingText(existing.displayText, displayText),
+              images: [...(existing.images ?? []), ...(request.images ?? [])],
+              assetRefs: [...(existing.assetRefs ?? []), ...(request.assetRefs ?? [])],
+              mode: existing.mode === "plan" || request.mode === "plan"
+                ? "plan"
+                : request.mode ?? existing.mode ?? null,
+              userIntent: userIntent ?? existing.userIntent ?? null,
+              clientMessageId: existing.clientMessageId ?? mergeGroupId,
+              updatedAt: now,
+            }
+            : {
+              id: mergeGroupId,
+              sessionId: state.sessionId,
+              runId: state.currentRunId,
+              mergeGroupId,
+              status: "queued",
+              delivery: "after_run",
+              text: request.text,
+              displayText,
+              images: request.images && request.images.length > 0 ? [...request.images] : undefined,
+              assetRefs: request.assetRefs && request.assetRefs.length > 0 ? [...request.assetRefs] : undefined,
+              mode: request.mode ?? null,
+              userIntent,
+              clientMessageId: mergeGroupId,
+              messageId: null,
+              createdAt: now,
+              updatedAt: now,
+            };
+          state.pendingInputs = visiblePendingInputs(
+            mergePendingInputList(state.pendingInputs, pending),
+          );
+          state.localFallbackMergeGroupId = mergeGroupId;
+          state.inputText = "";
+          state.error = null;
+          if (!state.isStreaming || state.currentRunId !== pending.runId) {
+            state.pendingInputs = state.pendingInputs.filter((input) => input.id !== pending.id);
+            state.localMergeGroupId = null;
+            globalThis.setTimeout(() => {
+              void send({
+                text: pending.text,
+                displayText: pending.displayText,
+                mode: pending.mode ?? null,
+                userIntent: pending.userIntent ?? null,
+                images: pending.images ?? null,
+                assetRefs: pending.assetRefs ?? null,
+              });
+            }, 0);
+          }
+          return;
+        }
+        state.error = err.message;
+      }
+      return;
     }
 
     const pendingMessageId = `embedded_user_${Date.now()}`;
@@ -491,6 +694,31 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
       state.messages = state.messages.filter((message) => message.id !== pendingMessageId);
       resetRoundState(state);
       state.error = normalizeAppError(error).message;
+    }
+  }
+
+  async function insertQueuedFollowUp() {
+    const state = activeState.value;
+    if (!state.sessionId || !state.currentRunId) return false;
+    const pending = visiblePendingInputs(state.pendingInputs).find((input) =>
+      input.runId === state.currentRunId && pendingInputDelivery(input) !== "immediate");
+    if (!pending) return false;
+
+    try {
+      const inserted = await sessionService.insertPendingChatInput(
+        state.sessionId,
+        state.currentRunId,
+        pending.id,
+      );
+      if (!state.acceptedPendingInputIds.has(inserted.id)) {
+        state.pendingInputs = visiblePendingInputs(
+          mergePendingInputList(state.pendingInputs, inserted),
+        );
+      }
+      return true;
+    } catch (error) {
+      state.error = normalizeAppError(error).message;
+      return false;
     }
   }
 
@@ -595,6 +823,19 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
   const activeToolCalls = computed(() => activeState.value.activeToolCalls);
   const pendingQuestion = computed(() => activeState.value.pendingQuestion);
   const pendingToolConfirms = computed(() => activeState.value.pendingToolConfirms);
+  const queuedFollowUp = computed(() => {
+    const inputs = visiblePendingInputs(activeState.value.pendingInputs);
+    if (inputs.length === 0) return null;
+    return {
+      inputs,
+      canInsert: inputs.some((input) => pendingInputDelivery(input) !== "immediate"),
+      isInserting: inputs.every((input) => pendingInputDelivery(input) === "immediate"),
+      displayText: inputs
+        .map((input) => input.displayText || input.text)
+        .filter((text) => text.trim().length > 0)
+        .join("\n"),
+    };
+  });
   const errorMessage = computed(() => activeState.value.error);
   const sessionId = computed(() => activeState.value.sessionId);
 
@@ -636,9 +877,11 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     activeToolCalls,
     pendingQuestion,
     pendingToolConfirms,
+    queuedFollowUp,
     errorMessage,
     sessionId,
     send,
+    insertQueuedFollowUp,
     cancel,
     resetSession,
     answerQuestion,

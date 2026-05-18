@@ -1,4 +1,4 @@
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 
 use crate::commands::{StreamEvent, StreamEventEnvelope};
 use crate::session::store::{
@@ -16,6 +16,8 @@ fn event_session_id(event: &StreamEvent) -> &str {
     match event {
         StreamEvent::RunStart { session_id }
         | StreamEvent::UserMessage { session_id, .. }
+        | StreamEvent::PendingInputQueued { session_id, .. }
+        | StreamEvent::PendingInputAccepted { session_id, .. }
         | StreamEvent::TextDelta { session_id, .. }
         | StreamEvent::ThinkingDelta { session_id, .. }
         | StreamEvent::ToolCallStart { session_id, .. }
@@ -43,6 +45,8 @@ fn event_type(event: &StreamEvent) -> &'static str {
     match event {
         StreamEvent::RunStart { .. } => "runStart",
         StreamEvent::UserMessage { .. } => "userMessage",
+        StreamEvent::PendingInputQueued { .. } => "pendingInputQueued",
+        StreamEvent::PendingInputAccepted { .. } => "pendingInputAccepted",
         StreamEvent::TextDelta { .. } => "textDelta",
         StreamEvent::ThinkingDelta { .. } => "thinkingDelta",
         StreamEvent::ToolCallStart { .. } => "toolCallStart",
@@ -90,7 +94,9 @@ fn run_status_for_event(event: &StreamEvent) -> Option<(&'static str, Option<Str
         StreamEvent::Done { .. } => Some((RUN_STATUS_DONE, None)),
         StreamEvent::Cancelled { .. } => Some((RUN_STATUS_CANCELLED, None)),
         StreamEvent::Error { error, .. } => Some((RUN_STATUS_ERROR, Some(error.message.clone()))),
-        StreamEvent::KnowledgeProposal { .. } => None,
+        StreamEvent::KnowledgeProposal { .. }
+        | StreamEvent::PendingInputQueued { .. }
+        | StreamEvent::PendingInputAccepted { .. } => None,
     }
 }
 
@@ -184,6 +190,20 @@ fn warn_if_run_session_mismatch(
 pub fn emit_stream(app_handle: &AppHandle, store: &SessionStore, run_id: &str, event: StreamEvent) {
     let session_id = event_session_id(&event).to_string();
     let event_kind = event_type(&event);
+    if matches!(
+        &event,
+        StreamEvent::Cancelled { .. } | StreamEvent::Error { .. }
+    ) {
+        if let Some(queue_state) = app_handle.try_state::<crate::PendingInputQueueHandle>() {
+            match queue_state.lock() {
+                Ok(mut queue) => queue.clear_run(&session_id, run_id),
+                Err(error) => eprintln!(
+                    "[Locus] failed to clear pending input queue for session {} run {}: {}",
+                    session_id, run_id, error
+                ),
+            }
+        }
+    }
     #[cfg(debug_assertions)]
     warn_if_run_session_mismatch(store, run_id, &session_id, event_kind);
 

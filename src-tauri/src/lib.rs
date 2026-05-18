@@ -112,6 +112,9 @@ pub struct ActiveTaskHandle {
 
 pub type ActiveTasks = Arc<tokio::sync::Mutex<HashMap<String, ActiveTaskHandle>>>;
 
+pub type PendingInputQueueHandle =
+    Arc<std::sync::Mutex<session::pending_inputs::PendingInputQueue>>;
+
 pub type ApiKeyState = Arc<tokio::sync::RwLock<String>>;
 
 pub type ProviderKeysState = Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>>;
@@ -424,6 +427,8 @@ pub fn run() {
                 Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
 
             let active_tasks: ActiveTasks = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+            let pending_input_queue: PendingInputQueueHandle =
+                Arc::new(std::sync::Mutex::new(session::pending_inputs::PendingInputQueue::default()));
 
             let question_store: QuestionStore = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
             let knowledge_proposal_drafts: KnowledgeProposalDraftStore =
@@ -678,6 +683,7 @@ pub fn run() {
             app.manage(workspace.clone());
             app.manage(raw_context_store);
             app.manage(active_tasks);
+            app.manage(pending_input_queue);
             app.manage(unity_monitor.clone());
             app.manage(ref_graph_state);
             app.manage(watcher_handle);
@@ -790,6 +796,8 @@ pub fn run() {
             commands::create_session,
             commands::fork_session,
             commands::chat,
+            commands::queue_chat_input,
+            commands::insert_pending_chat_input,
             commands::list_agents,
             commands::list_subagent_defs,
             commands::get_agent_system_prompt,

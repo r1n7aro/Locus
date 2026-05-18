@@ -2,9 +2,11 @@ import { reactive } from "vue";
 import { detectShortcutPlatform, type ShortcutPlatform } from "./useKeyboardShortcuts";
 
 export type ChatSubmitMode = "enter-send" | "mod-enter-send";
+export type RunningSendMode = "after-run" | "insert";
 
 export interface ChatInputSettings {
   submitMode: ChatSubmitMode;
+  runningSendMode: RunningSendMode;
 }
 
 type EnterEventLike = Pick<KeyboardEvent, "key" | "shiftKey" | "ctrlKey" | "metaKey"> & {
@@ -15,10 +17,15 @@ const STORAGE_KEY = "locus-chat-input-settings";
 
 const defaults: ChatInputSettings = {
   submitMode: "enter-send",
+  runningSendMode: "after-run",
 };
 
 function normalizeSubmitMode(value: unknown): ChatSubmitMode {
   return value === "mod-enter-send" ? "mod-enter-send" : "enter-send";
+}
+
+function normalizeRunningSendMode(value: unknown): RunningSendMode {
+  return value === "insert" ? "insert" : "after-run";
 }
 
 function load(): ChatInputSettings {
@@ -28,6 +35,7 @@ function load(): ChatInputSettings {
       const parsed = JSON.parse(raw) as Partial<ChatInputSettings>;
       return {
         submitMode: normalizeSubmitMode(parsed.submitMode),
+        runningSendMode: normalizeRunningSendMode(parsed.runningSendMode),
       };
     }
   } catch {
@@ -80,8 +88,14 @@ export function useChatInputSettings() {
     save({ ...state });
   }
 
+  function setRunningSendMode(mode: RunningSendMode) {
+    state.runningSendMode = normalizeRunningSendMode(mode);
+    save({ ...state });
+  }
+
   return {
     state,
     setSubmitMode,
+    setRunningSendMode,
   };
 }

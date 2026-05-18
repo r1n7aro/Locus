@@ -26,7 +26,8 @@ use crate::commands::{
 use crate::compact;
 use crate::llm::{anthropic, chat_completions, codex, openrouter, responses};
 use crate::session::models::{
-    AssistantRenderPart, MessageRole, RenderOrderKey, TodoItem, ToolCallInfo,
+    AssistantRenderPart, ChatMessage, MessageRole, PendingSessionInput, RenderOrderKey, TodoItem,
+    ToolCallInfo,
 };
 use crate::session::store::SessionStore;
 use crate::tool::{ToolExecutionContext, ToolLoadMode, ToolRegistry, ToolResult, ToolRuntimeState};
@@ -5661,6 +5662,147 @@ impl AgentInstance {
         }
     }
 
+    fn pending_input_mode(input: &PendingSessionInput) -> String {
+        input
+            .mode
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                input
+                    .user_intent
+                    .as_ref()
+                    .map(|intent| intent.mode.as_str())
+            })
+            .unwrap_or("build")
+            .to_string()
+    }
+
+    fn persisted_message_by_id(
+        &self,
+        store: &SessionStore,
+        message_id: &str,
+    ) -> Result<ChatMessage, String> {
+        store
+            .get_messages(&self.session_id)?
+            .into_iter()
+            .find(|message| message.id == message_id)
+            .ok_or_else(|| {
+                format!(
+                    "Persisted message not found: session={} message={}",
+                    self.session_id, message_id
+                )
+            })
+    }
+
+    fn persist_claimed_pending_inputs(
+        &self,
+        app_handle: &AppHandle,
+        store: &SessionStore,
+        run_id: &str,
+        env_prompt_prefix: Option<&str>,
+        pending_inputs: Vec<PendingSessionInput>,
+    ) -> Result<bool, String> {
+        if pending_inputs.is_empty() {
+            return Ok(false);
+        }
+
+        let claimed_inputs = pending_inputs.clone();
+        let result = (|| -> Result<(), String> {
+            for input in pending_inputs {
+                let user_intent_signature = input
+                    .user_intent
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()
+                    .map_err(|e| format!("Failed to serialize pending user intent: {}", e))?;
+                let effective_mode = Self::pending_input_mode(&input);
+                let user_prompt_suffix =
+                    self.build_user_prompt_suffix(&effective_mode, input.user_intent.as_ref());
+                let first_user_message_id = store.first_user_message_id(&self.session_id)?;
+                let current_prompt_prefix = if first_user_message_id.is_none() {
+                    env_prompt_prefix
+                } else {
+                    None
+                };
+                let message_id = store.add_message_with_images_asset_refs_and_signature(
+                    &self.session_id,
+                    MessageRole::User,
+                    &input.text,
+                    input.images.as_deref(),
+                    input.asset_refs.as_deref(),
+                    user_intent_signature.as_deref(),
+                    current_prompt_prefix,
+                    user_prompt_suffix.as_deref(),
+                )?;
+                if let Some(first_user_message_id) = first_user_message_id.as_deref() {
+                    store.update_message_prompt_prefix(
+                        &self.session_id,
+                        first_user_message_id,
+                        env_prompt_prefix,
+                    )?;
+                }
+                let current_user_message = self.persisted_message_by_id(store, &message_id)?;
+                emit_stream(
+                    app_handle,
+                    run_id,
+                    StreamEvent::UserMessage {
+                        session_id: self.session_id.clone(),
+                        message: current_user_message,
+                    },
+                );
+                emit_stream(
+                    app_handle,
+                    run_id,
+                    StreamEvent::PendingInputAccepted {
+                        session_id: self.session_id.clone(),
+                        pending_input_id: input.id,
+                        message_id,
+                    },
+                );
+            }
+            Ok(())
+        })();
+
+        if let Err(error) = result {
+            let queue_state: tauri::State<'_, crate::PendingInputQueueHandle> = app_handle.state();
+            match queue_state.lock() {
+                Ok(mut queue) => queue.restore_claimed(claimed_inputs),
+                Err(restore_error) => {
+                    eprintln!(
+                        "[Agent {}] failed to restore claimed pending inputs after error: {}",
+                        self.id, restore_error
+                    );
+                }
+            }
+            return Err(error);
+        }
+
+        Ok(true)
+    }
+
+    fn drain_queued_pending_inputs(
+        &self,
+        app_handle: &AppHandle,
+        store: &SessionStore,
+        run_id: &str,
+        env_prompt_prefix: Option<&str>,
+    ) -> Result<bool, String> {
+        let queue_state: tauri::State<'_, crate::PendingInputQueueHandle> = app_handle.state();
+        let pending_inputs = {
+            let mut queue = queue_state
+                .lock()
+                .map_err(|e| format!("Failed to lock pending input queue: {}", e))?;
+            queue.claim_immediate(&self.session_id, run_id)
+        };
+        self.persist_claimed_pending_inputs(
+            app_handle,
+            store,
+            run_id,
+            env_prompt_prefix,
+            pending_inputs,
+        )
+    }
+
     fn new_run_id(&self) -> String {
         format!(
             "{}_{}",
@@ -5789,6 +5931,7 @@ impl AgentInstance {
                 initial_mode,
                 user_intent,
                 run_id,
+                None,
             )
             .await
         })
@@ -5804,6 +5947,7 @@ impl AgentInstance {
         initial_mode: &'a str,
         user_intent: Option<crate::session::models::UserIntentPayload>,
         run_id: String,
+        accepted_pending_input_id: Option<String>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send + 'a>>
     {
         Box::pin(async move {
@@ -6009,6 +6153,13 @@ impl AgentInstance {
             session_id: self.session_id.clone(),
             message: current_user_message,
         });
+        if let Some(pending_input_id) = accepted_pending_input_id.as_deref() {
+            emit_stream(app_handle, &run_id, StreamEvent::PendingInputAccepted {
+                session_id: self.session_id.clone(),
+                pending_input_id: pending_input_id.to_string(),
+                message_id: current_message_id.clone(),
+            });
+        }
         eprintln!(
             "[Agent {}] user message persisted: session={} run={} elapsed_ms={} prefix_chars={} suffix_chars={} updated_first_message_prefix={}",
             self.id,
@@ -7149,6 +7300,20 @@ impl AgentInstance {
                     return Ok(String::new());
                 }
 
+                if !has_executable_tool_calls {
+                    store.close_run_pending_input_queue(&run_id)?;
+                }
+
+                if self.drain_queued_pending_inputs(
+                    app_handle,
+                    store,
+                    &run_id,
+                    env_prompt_prefix.as_deref(),
+                )? {
+                    store.update_run_status(&run_id, "running", None)?;
+                    continue 'agent_loop;
+                }
+
                 if has_executable_tool_calls {
                     continue;
                 }
@@ -7165,6 +7330,71 @@ impl AgentInstance {
                 done_already_emitted = true;
                 terminal_done_message_id = Some(assistant_msg_id);
                 break;
+            }
+
+            store.close_run_pending_input_queue(&run_id)?;
+            let pending_inputs = {
+                let queue_state: tauri::State<'_, crate::PendingInputQueueHandle> =
+                    app_handle.state();
+                let mut queue = queue_state
+                    .lock()
+                    .map_err(|e| format!("Failed to lock pending input queue: {}", e))?;
+                queue.claim_immediate(&self.session_id, &run_id)
+            };
+            if !pending_inputs.is_empty() {
+                let thinking_opt = if response.thinking_text.is_empty() {
+                    None
+                } else {
+                    Some(response.thinking_text.as_str())
+                };
+                let thinking_dur = if response.thinking_duration_secs > 0 {
+                    Some(response.thinking_duration_secs)
+                } else {
+                    None
+                };
+                let thinking_sig = if response.thinking_signature.is_empty() {
+                    None
+                } else {
+                    Some(response.thinking_signature.as_str())
+                };
+                let assistant_msg_id = store.add_message_with_thinking_and_render_parts(
+                    &self.session_id,
+                    MessageRole::Assistant,
+                    &response.text,
+                    thinking_opt,
+                    thinking_dur,
+                    thinking_sig,
+                    response.response_id.as_deref(),
+                    response.continuation_request.as_ref(),
+                    response_content_order,
+                    response_thinking_order,
+                    &response_render_parts,
+                )?;
+                self.partial_assistant.mark_persisted(
+                    assistant_msg_id.clone(),
+                    response.text.clone(),
+                    thinking_opt.map(str::to_string),
+                    thinking_dur,
+                );
+                emit_stream(app_handle, &run_id, StreamEvent::ToolCallRoundDone {
+                    session_id: self.session_id.clone(),
+                    message_id: assistant_msg_id,
+                    full_text: response.text.clone(),
+                    tool_calls: Vec::new(),
+                    content_order: response_content_order,
+                    thinking_order: response_thinking_order,
+                    render_parts: Some(response_render_parts),
+                });
+                self.partial_assistant.reset();
+                self.persist_claimed_pending_inputs(
+                    app_handle,
+                    store,
+                    &run_id,
+                    env_prompt_prefix.as_deref(),
+                    pending_inputs,
+                )?;
+                store.update_run_status(&run_id, "running", None)?;
+                continue 'agent_loop;
             }
 
             final_thinking_text = response.thinking_text;

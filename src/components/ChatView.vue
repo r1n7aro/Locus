@@ -89,12 +89,15 @@ const { state: knowledgeAccessState, setMode: setKnowledgeAccessMode } = useKnow
 
 const isPlanStreaming = computed(() => !!chatStore.pendingPlanRun && props.isStreaming);
 const isPlanDone = computed(() => !!chatStore.pendingPlanRun && !props.isStreaming);
-
 const isViewingSubagent = computed(() => {
   if (!props.activeSessionId) return false;
   const session = props.sessions.find(s => s.id === props.activeSessionId);
   return !!session?.parentSessionId;
 });
+const activeQueuedFollowUp = computed(() => chatStore.activeQueuedFollowUp);
+const showQueuedFollowUp = computed(() =>
+  !!activeQueuedFollowUp.value && props.isStreaming && !isViewingSubagent.value,
+);
 const diffProgress = useDiffProgress();
 const diffProgressWidth = computed(() => `${diffProgress.progress.value * 100}%`);
 const chatInputPlaceholder = computed(() => {
@@ -103,6 +106,11 @@ const chatInputPlaceholder = computed(() => {
   }
   return t("chat.input.placeholder");
 });
+const runningSendLabel = computed(() =>
+  chatInputSettings.runningSendMode === "insert"
+    ? t("chat.input.queuedFollowUpInsert")
+    : t("chat.input.queue"),
+);
 const inputControlsCollapsed = ref(false);
 const inputControlsSwitching = ref(false);
 const INPUT_CONTROLS_SWITCH_VISIBLE_MS = 120;
@@ -236,6 +244,10 @@ const emit = defineEmits<{
 const lightboxSrc = ref("");
 function openLightbox(src: string) {
   lightboxSrc.value = src;
+}
+
+function handleInsertQueuedFollowUp() {
+  void chatStore.insertActiveQueuedFollowUp();
 }
 function closeLightbox() {
   lightboxSrc.value = "";
@@ -1949,10 +1961,27 @@ onUnmounted(() => {
       </div>
 
     <div
-      v-if="(pendingQuestion && !isViewingSubagent) || showBatchToolConfirmCard || showSingleToolConfirmCard || (isPlanDone && !isViewingSubagent) || (isPlanStreaming && !isViewingSubagent)"
+      v-if="(pendingQuestion && !isViewingSubagent) || showBatchToolConfirmCard || showSingleToolConfirmCard || showQueuedFollowUp || (isPlanDone && !isViewingSubagent) || (isPlanStreaming && !isViewingSubagent)"
       class="chat-pending-stack"
       @wheel="handleBottomPanelWheel"
     >
+      <div v-if="showQueuedFollowUp" class="queued-follow-up-bar">
+        <span class="queued-follow-up-label">
+          {{ activeQueuedFollowUp?.isInserting ? t('chat.input.queuedFollowUpInserting') : t('chat.input.queuedFollowUp') }}
+        </span>
+        <span class="queued-follow-up-text">{{ activeQueuedFollowUp?.displayText }}</span>
+        <BaseButton
+          v-if="activeQueuedFollowUp?.canInsert"
+          class="queued-follow-up-insert"
+          size="sm"
+          variant="neutral"
+          type="button"
+          @click="handleInsertQueuedFollowUp"
+        >
+          {{ t('chat.input.queuedFollowUpInsert') }}
+        </BaseButton>
+      </div>
+
       <AskUserCard
         v-if="pendingQuestion && !isViewingSubagent"
         :question="pendingQuestion"
@@ -2078,7 +2107,7 @@ onUnmounted(() => {
         :skills="skills"
         :placeholder="chatInputPlaceholder"
         :is-streaming="isStreaming"
-        :send-label="t('common.send')"
+        :send-label="isStreaming ? runningSendLabel : t('common.send')"
         :cancel-label="t('common.cancel')"
         :compact="inputControlsCollapsed"
         :asset-ref-sync-key="composerAssetRefSyncKey"
@@ -2732,6 +2761,38 @@ onUnmounted(() => {
 .chat-view.is-vertical-layout :deep(.tool-confirm-batch-card) {
   margin-left: 12px;
   margin-right: 12px;
+}
+
+.queued-follow-up-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 6px 10px;
+  margin: 0 12px 6px;
+  background: color-mix(in srgb, var(--panel-bg) 76%, var(--input-bg) 24%);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.queued-follow-up-label {
+  flex: 0 0 auto;
+  color: var(--text-secondary);
+}
+
+.queued-follow-up-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-color);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.queued-follow-up-insert {
+  flex: 0 0 auto;
 }
 
 /* ── Mode selector ── */

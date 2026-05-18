@@ -40,6 +40,17 @@ pub enum StreamEvent {
         message: crate::session::models::ChatMessage,
     },
     #[serde(rename_all = "camelCase")]
+    PendingInputQueued {
+        session_id: String,
+        input: crate::session::models::PendingSessionInput,
+    },
+    #[serde(rename_all = "camelCase")]
+    PendingInputAccepted {
+        session_id: String,
+        pending_input_id: String,
+        message_id: String,
+    },
+    #[serde(rename_all = "camelCase")]
     TextDelta {
         session_id: String,
         text: String,

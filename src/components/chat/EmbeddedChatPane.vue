@@ -14,6 +14,7 @@ import ToolConfirmCard from "./ToolConfirmCard.vue";
 import ToolConfirmBatchCard from "./ToolConfirmBatchCard.vue";
 import ChatTranscript from "./ChatTranscript.vue";
 import RichChatInput from "./RichChatInput.vue";
+import BaseButton from "../ui/BaseButton.vue";
 import { forwardWheelToElement } from "../../composables/chatWheelPassthrough";
 import {
   captureScrollAnchor,
@@ -62,6 +63,7 @@ const props = withDefaults(defineProps<{
   activeToolCalls: ToolCallDisplay[];
   pendingQuestion?: PendingQuestion | null;
   pendingToolConfirms?: PendingToolConfirm[];
+  queuedFollowUp?: { displayText: string; canInsert?: boolean; isInserting?: boolean } | null;
   toolConfirmLayoutKey?: string | null;
   inputValue: string;
   placeholder?: string;
@@ -93,6 +95,7 @@ const props = withDefaults(defineProps<{
   isCompacting: false,
   pendingQuestion: null,
   pendingToolConfirms: () => [],
+  queuedFollowUp: null,
   toolConfirmLayoutKey: null,
   placeholder: "",
   emptyTitle: "",
@@ -125,6 +128,7 @@ const emit = defineEmits<{
   (e: "answerQuestion", value: string): void;
   (e: "answerToolConfirm", questionId: string, answer: string): void;
   (e: "answerAllToolConfirms", questionIds: string[], answer: string): void;
+  (e: "insertQueuedFollowUp"): void;
   (e: "applyKnowledgeProposal", proposalId: string): void;
   (e: "ignoreKnowledgeProposal", proposalId: string): void;
 }>();
@@ -643,10 +647,26 @@ onUnmounted(() => {
 
     <div class="embedded-chat-bottom">
       <div
-        v-if="pendingQuestion || showBatchToolConfirmCard || showSingleToolConfirmCard"
+        v-if="pendingQuestion || showBatchToolConfirmCard || showSingleToolConfirmCard || queuedFollowUp"
         class="embedded-chat-panels"
         @wheel="handleBottomPanelWheel"
       >
+        <div v-if="queuedFollowUp" class="embedded-queued-follow-up">
+          <span class="embedded-queued-label">
+            {{ queuedFollowUp.isInserting ? t('chat.input.queuedFollowUpInserting') : t('chat.input.queuedFollowUp') }}
+          </span>
+          <span class="embedded-queued-text">{{ queuedFollowUp.displayText }}</span>
+          <BaseButton
+            v-if="queuedFollowUp.canInsert"
+            class="embedded-queued-insert"
+            size="sm"
+            variant="neutral"
+            type="button"
+            @click="emit('insertQueuedFollowUp')"
+          >
+            {{ t('chat.input.queuedFollowUpInsert') }}
+          </BaseButton>
+        </div>
         <AskUserCard
           v-if="pendingQuestion"
           :question="pendingQuestion"
@@ -791,6 +811,36 @@ onUnmounted(() => {
   flex-direction: column;
   gap: 10px;
   min-width: 0;
+}
+
+.embedded-queued-follow-up {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 6px 10px;
+  background: color-mix(in srgb, var(--panel-bg) 76%, var(--input-bg) 24%);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  font-size: 12px;
+}
+
+.embedded-queued-label {
+  flex: 0 0 auto;
+  color: var(--text-secondary);
+}
+
+.embedded-queued-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-color);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.embedded-queued-insert {
+  flex: 0 0 auto;
 }
 
 :deep(.ask-user-card) {

@@ -20,6 +20,7 @@ pub enum SessionRuntimeStatus {
     Queued,
     Starting,
     WaitingInput,
+    Finishing,
     Cancelling,
     Error,
 }
@@ -37,6 +38,8 @@ pub struct SessionDetail {
     pub created_at: i64,
     pub updated_at: i64,
     pub messages: Vec<ChatMessage>,
+    #[serde(default)]
+    pub pending_inputs: Vec<PendingSessionInput>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -203,6 +206,38 @@ pub struct UserIntentPayload {
     pub skills: Vec<UserIntentSkill>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_message_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingSessionInput {
+    pub id: String,
+    pub session_id: String,
+    pub run_id: String,
+    pub merge_group_id: String,
+    pub status: String,
+    #[serde(default = "default_pending_input_delivery")]
+    pub delivery: String,
+    pub text: String,
+    pub display_text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub images: Option<Vec<ImageData>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asset_refs: Option<Vec<AssetRefData>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_intent: Option<UserIntentPayload>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+fn default_pending_input_delivery() -> String {
+    "after_run".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

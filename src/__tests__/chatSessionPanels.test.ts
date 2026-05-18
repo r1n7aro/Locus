@@ -20,6 +20,8 @@ const sessionServiceMocks = vi.hoisted(() => ({
   listArchivedSessions: vi.fn(),
   listSessions: vi.fn(),
   loadSession: vi.fn(),
+  insertPendingChatInput: vi.fn(),
+  queueChatInput: vi.fn(),
   renameSession: vi.fn(),
   saveActiveSessionSelection: vi.fn(),
   staleKnowledgeProposals: vi.fn(),
@@ -197,6 +199,41 @@ describe("chat session panel state", () => {
     sessionServiceMocks.listSessionEvents.mockResolvedValue([]);
     sessionServiceMocks.listArchivedSessions.mockImplementation(async () => []);
     sessionServiceMocks.listSessions.mockImplementation(async () => []);
+    sessionServiceMocks.queueChatInput.mockImplementation(async (params: any) => ({
+      id: "pending-1",
+      sessionId: params.sessionId,
+      runId: params.runId,
+      mergeGroupId: params.mergeGroupId,
+      status: "queued",
+      delivery: params.delivery ?? "after_run",
+      text: params.text,
+      displayText: params.displayText ?? params.text,
+      images: params.images ?? undefined,
+      assetRefs: params.assetRefs ?? undefined,
+      mode: params.mode ?? null,
+      userIntent: params.userIntent ?? null,
+      clientMessageId: params.clientMessageId ?? null,
+      messageId: null,
+      createdAt: 1,
+      updatedAt: 1,
+    }));
+    sessionServiceMocks.insertPendingChatInput.mockImplementation(async (
+      sessionId: string,
+      runId: string,
+      pendingInputId: string | null,
+    ) => ({
+      id: pendingInputId ?? "pending-1",
+      sessionId,
+      runId,
+      mergeGroupId: "group-1",
+      status: "queued",
+      delivery: "immediate",
+      text: "queued",
+      displayText: "queued",
+      messageId: null,
+      createdAt: 1,
+      updatedAt: 2,
+    }));
     sessionServiceMocks.renameSession.mockResolvedValue(undefined);
     sessionServiceMocks.saveActiveSessionSelection.mockResolvedValue(undefined);
     sessionServiceMocks.staleKnowledgeProposals.mockResolvedValue(undefined);
@@ -1510,11 +1547,29 @@ describe("chat session panel state", () => {
           updatedAt: 2,
           runtimeStatus: "running",
         },
+      ])
+      .mockResolvedValue([
+        {
+          id: "s1",
+          title: "Retry session",
+          agentId: null,
+          sessionType: "chat",
+          updatedAt: 2,
+          runtimeStatus: "running",
+        },
       ]);
 
     await chatStore.sendMessage("first");
     await chatStore.cancelChat();
     await chatStore.sendMessage("second");
+
+    expect(sessionServiceMocks.queueChatInput).toHaveBeenCalledTimes(1);
+    chatStore.handleStreamEvent({
+      runId: "run-1",
+      type: "cancelled",
+      sessionId: "s1",
+    });
+    await new Promise((resolve) => globalThis.setTimeout(resolve, 0));
 
     chatStore.handleStreamEvent({
       runId: "run-2",
@@ -1523,11 +1578,6 @@ describe("chat session panel state", () => {
       toolCallId: "tc-new",
       toolName: "read",
       arguments: "{}",
-    });
-    chatStore.handleStreamEvent({
-      runId: "run-1",
-      type: "cancelled",
-      sessionId: "s1",
     });
 
     expect(chatStore.isStreaming).toBe(true);
@@ -1577,6 +1627,176 @@ describe("chat session panel state", () => {
     expect(userMessage?.id).toMatch(/^user_pending_/);
     expect(chatParams?.userIntent?.clientMessageId).toBe(userMessage?.id);
     expect(userMessage?.thinkingSignature).toContain(userMessage?.id ?? "");
+  });
+
+  it("queues and merges follow-up messages while a run is active", async () => {
+    const chatStore = useChatStore();
+    const pendingByGroup = new Map<string, any>();
+    sessionServiceMocks.queueChatInput.mockImplementation(async (params: any) => {
+      const existing = pendingByGroup.get(params.mergeGroupId);
+      const pending = existing
+        ? {
+          ...existing,
+          text: `${existing.text}\n${params.text}`,
+          displayText: `${existing.displayText}\n${params.displayText ?? params.text}`,
+          updatedAt: existing.updatedAt + 1,
+        }
+        : {
+          id: "pending-running",
+          sessionId: params.sessionId,
+          runId: params.runId,
+          mergeGroupId: params.mergeGroupId,
+          status: "queued",
+          delivery: params.delivery ?? "after_run",
+          text: params.text,
+          displayText: params.displayText ?? params.text,
+          images: params.images ?? undefined,
+          assetRefs: params.assetRefs ?? undefined,
+          mode: params.mode ?? null,
+          userIntent: params.userIntent ?? null,
+          clientMessageId: params.clientMessageId ?? null,
+          messageId: null,
+          createdAt: 1,
+          updatedAt: 1,
+        };
+      pendingByGroup.set(params.mergeGroupId, pending);
+      return pending;
+    });
+
+    chatStore.activeSessionId = "s1";
+    chatStore.currentRunId = "run-1";
+    chatStore.isStreaming = true;
+
+    await chatStore.sendMessage("first");
+    await chatStore.sendMessage("second");
+
+    expect(sessionServiceMocks.chat).not.toHaveBeenCalled();
+    expect(sessionServiceMocks.queueChatInput).toHaveBeenCalledTimes(2);
+    const firstCall = sessionServiceMocks.queueChatInput.mock.calls[0]![0];
+    const secondCall = sessionServiceMocks.queueChatInput.mock.calls[1]![0];
+    expect(firstCall.delivery).toBe("after_run");
+    expect(secondCall.mergeGroupId).toBe(firstCall.mergeGroupId);
+    expect(chatStore.activeQueuedFollowUp?.displayText).toBe("first\nsecond");
+
+    chatStore.handleStreamEvent({
+      runId: "run-1",
+      type: "pendingInputAccepted",
+      sessionId: "s1",
+      pendingInputId: "pending-running",
+      messageId: "msg-accepted",
+    });
+
+    expect(chatStore.activeQueuedFollowUp).toBeNull();
+  });
+
+  it("does not reinsert a queued follow-up after it was accepted", async () => {
+    const chatStore = useChatStore();
+    let resolveQueue: ((value: any) => void) | null = null;
+    sessionServiceMocks.queueChatInput.mockImplementationOnce((params: any) => new Promise((resolve) => {
+      resolveQueue = resolve;
+      void params;
+    }));
+
+    chatStore.activeSessionId = "s1";
+    chatStore.currentRunId = "run-1";
+    chatStore.isStreaming = true;
+
+    const sendPromise = chatStore.sendMessage("race");
+    await vi.waitFor(() => {
+      expect(sessionServiceMocks.queueChatInput).toHaveBeenCalledTimes(1);
+    });
+    const params = sessionServiceMocks.queueChatInput.mock.calls[0]![0];
+
+    chatStore.handleStreamEvent({
+      runId: "run-1",
+      type: "pendingInputAccepted",
+      sessionId: "s1",
+      pendingInputId: "pending-race",
+      messageId: "msg-accepted",
+    });
+    chatStore.handleStreamEvent({
+      runId: "run-1",
+      type: "pendingInputQueued",
+      sessionId: "s1",
+      input: {
+        id: "pending-race",
+        sessionId: "s1",
+        runId: "run-1",
+        mergeGroupId: params.mergeGroupId,
+        status: "queued",
+        delivery: "after_run",
+        text: "race",
+        displayText: "race",
+        messageId: null,
+        createdAt: 1,
+        updatedAt: 1,
+      },
+    });
+
+    expect(resolveQueue).toBeTruthy();
+    const resolveQueuedInput = resolveQueue as unknown as (value: any) => void;
+    resolveQueuedInput({
+      id: "pending-race",
+      sessionId: "s1",
+      runId: "run-1",
+      mergeGroupId: params.mergeGroupId,
+      status: "queued",
+      delivery: "after_run",
+      text: "race",
+      displayText: "race",
+      messageId: null,
+      createdAt: 1,
+      updatedAt: 1,
+    });
+    await sendPromise;
+
+    expect(chatStore.activeQueuedFollowUp).toBeNull();
+  });
+
+  it("keeps a closing-run follow-up and sends it after the terminal event", async () => {
+    const chatStore = useChatStore();
+    sessionServiceMocks.queueChatInput.mockRejectedValueOnce({
+      code: "session.pending_input.run_closed",
+      message: "run is closing",
+    });
+
+    chatStore.sessions = [
+      {
+        id: "s1",
+        title: "Closing run",
+        agentId: null,
+        sessionType: "chat",
+        updatedAt: 1,
+      },
+    ] as any;
+    chatStore.activeSessionId = "s1";
+    chatStore.currentRunId = "run-1";
+    chatStore.isStreaming = true;
+    chatStore.streamingSessionIds.add("s1");
+
+    await chatStore.sendMessage("next turn");
+
+    expect(sessionServiceMocks.queueChatInput).toHaveBeenCalledTimes(1);
+    expect(sessionServiceMocks.chat).not.toHaveBeenCalled();
+    expect(chatStore.activeQueuedFollowUp?.displayText).toBe("next turn");
+
+    chatStore.handleStreamEvent({
+      runId: "run-1",
+      type: "done",
+      sessionId: "s1",
+      messageId: "msg-1",
+      fullText: "done",
+    });
+    await new Promise((resolve) => globalThis.setTimeout(resolve, 25));
+    await Promise.resolve();
+
+    expect(chatStore.activeQueuedFollowUp).toBeNull();
+    expect(sessionServiceMocks.chat).toHaveBeenCalledTimes(1);
+    expect(sessionServiceMocks.chat.mock.calls[0]?.[0]).toMatchObject({
+      sessionId: "s1",
+      text: "next turn",
+    });
+    expect(notificationStoreMocks.addNotice).not.toHaveBeenCalled();
   });
 
   it("marks pending knowledge proposals stale when the user continues chatting", async () => {

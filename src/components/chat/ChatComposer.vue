@@ -61,13 +61,14 @@ const hasFooter = computed(() =>
   !props.compact && (hasFooterStart.value || hasFooterEnd.value || props.showAction),
 );
 const showInlineAction = computed(() => props.compact && props.showAction);
-const textareaDisabled = computed(() => props.disabled || props.isStreaming);
-const actionDisabled = computed(() => !props.isStreaming && (props.disabled || !props.canSend));
+const textareaDisabled = computed(() => props.disabled);
+const isCancelAction = computed(() => props.isStreaming && !props.canSend);
+const actionDisabled = computed(() => props.disabled || (!isCancelAction.value && !props.canSend));
 const textareaStyle = computed(() => ({
   maxHeight: `${props.maxHeight}px`,
 }));
 const actionLabel = computed(() => (
-  props.isStreaming
+  isCancelAction.value
     ? (props.cancelLabel || t("common.cancel"))
     : (props.sendLabel || t("common.send"))
 ));
@@ -98,7 +99,7 @@ function handleKeydown(event: KeyboardEvent) {
 }
 
 function handleActionClick() {
-  if (props.isStreaming) {
+  if (isCancelAction.value) {
     emit("cancel");
     return;
   }
@@ -176,14 +177,14 @@ watch(() => props.compact, () => {
       <button
         v-if="showInlineAction"
         class="chat-composer-action chat-composer-inline-action ui-select-none"
-        :class="{ 'is-cancel': isStreaming }"
+        :class="{ 'is-cancel': isCancelAction }"
         :disabled="actionDisabled"
         :title="actionLabel"
         :aria-label="actionLabel"
         type="button"
         @click="handleActionClick"
       >
-        <span v-if="isStreaming" class="chat-composer-stop-icon" aria-hidden="true">&#9632;</span>
+        <span v-if="isCancelAction" class="chat-composer-stop-icon" aria-hidden="true">&#9632;</span>
         <span v-else class="chat-composer-send-icon" aria-hidden="true">&#8593;</span>
       </button>
     </div>
@@ -197,14 +198,14 @@ watch(() => props.compact, () => {
         <button
           v-if="showAction"
           class="chat-composer-action ui-select-none"
-          :class="{ 'is-cancel': isStreaming }"
+          :class="{ 'is-cancel': isCancelAction }"
           :disabled="actionDisabled"
           :title="actionLabel"
           :aria-label="actionLabel"
           type="button"
           @click="handleActionClick"
         >
-          <span v-if="isStreaming" class="chat-composer-stop-icon" aria-hidden="true">&#9632;</span>
+          <span v-if="isCancelAction" class="chat-composer-stop-icon" aria-hidden="true">&#9632;</span>
           <span v-else class="chat-composer-send-icon" aria-hidden="true">&#8593;</span>
         </button>
       </div>

@@ -64,8 +64,10 @@ const {
   activeToolCalls,
   pendingQuestion,
   pendingToolConfirms,
+  queuedFollowUp,
   errorMessage,
   send,
+  insertQueuedFollowUp,
   cancel,
   answerQuestion,
   answerToolConfirm,
@@ -164,6 +166,7 @@ function handleSelectAgent(agentId: string) {
     :active-tool-calls="activeToolCalls"
     :pending-question="pendingQuestion"
     :pending-tool-confirms="pendingToolConfirms"
+    :queued-follow-up="queuedFollowUp"
     :tool-confirm-layout-key="sessionKey"
     :input-value="inputText"
     :placeholder="placeholder"
@@ -186,6 +189,7 @@ function handleSelectAgent(agentId: string) {
     user-content-mode="asset"
     @update:input-value="inputText = $event"
     @send="send"
+    @insert-queued-follow-up="insertQueuedFollowUp"
     @cancel="cancel"
     @clear="resetSession"
     @answer-question="answerQuestion"

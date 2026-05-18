@@ -5,6 +5,7 @@ export type SessionTreeStatus =
   | "queued"
   | "starting"
   | "waiting_input"
+  | "finishing"
   | "cancelling"
   | "error";
 
@@ -63,6 +64,7 @@ function statusPriority(status: SessionTreeStatus | null): number {
   switch (status) {
     case "running":
     case "waiting_input":
+    case "finishing":
       return 5;
     case "cancelling":
       return 4;
@@ -204,6 +206,7 @@ export function nodeContainsSession(node: SessionTreeNode, sessionId: string | n
 export function nodeHasActiveDescendant(node: SessionTreeNode): boolean {
   if (node.kind === "session" && (
     node.status === "running" ||
+    node.status === "finishing" ||
     node.status === "starting" ||
     node.status === "queued"
   )) {
@@ -211,6 +214,7 @@ export function nodeHasActiveDescendant(node: SessionTreeNode): boolean {
   }
   if (node.kind === "folder" && (
     node.status === "running" ||
+    node.status === "finishing" ||
     node.status === "starting" ||
     node.status === "queued"
   )) {

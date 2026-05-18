@@ -3,6 +3,7 @@ export type SessionRuntimeStatus =
   | "queued"
   | "starting"
   | "waiting_input"
+  | "finishing"
   | "cancelling"
   | "error";
 
@@ -169,6 +170,25 @@ export interface ChatMessage {
   renderParts?: AssistantRenderPart[];
 }
 
+export interface PendingSessionInput {
+  id: string;
+  sessionId: string;
+  runId: string;
+  mergeGroupId: string;
+  status: "queued" | "delivering" | "accepted" | "restored" | string;
+  delivery?: "after_run" | "immediate" | string;
+  text: string;
+  displayText: string;
+  images?: ImageAttachment[];
+  assetRefs?: AssetRefAttachment[];
+  mode?: string | null;
+  userIntent?: UserIntentMeta | null;
+  clientMessageId?: string | null;
+  messageId?: string | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
 export interface SessionDetail {
   id: string;
   title: string;
@@ -179,6 +199,7 @@ export interface SessionDetail {
   createdAt: number;
   updatedAt: number;
   messages: ChatMessage[];
+  pendingInputs?: PendingSessionInput[];
 }
 
 export type SessionRunStatus =
@@ -186,6 +207,7 @@ export type SessionRunStatus =
   | "starting"
   | "running"
   | "waiting_input"
+  | "finishing"
   | "cancelling"
   | "done"
   | "cancelled"
@@ -549,6 +571,8 @@ export interface KnowledgeChangedEvent {
 export type StreamEvent = { runId: string } & (
   | { type: "runStart"; sessionId: string }
   | { type: "userMessage"; sessionId: string; message: ChatMessage }
+  | { type: "pendingInputQueued"; sessionId: string; input: PendingSessionInput }
+  | { type: "pendingInputAccepted"; sessionId: string; pendingInputId: string; messageId: string }
   | { type: "textDelta"; sessionId: string; text: string; order?: number; partId?: string; renderSeq?: number }
   | { type: "thinkingDelta"; sessionId: string; text: string; order?: number; partId?: string; renderSeq?: number }
   | {

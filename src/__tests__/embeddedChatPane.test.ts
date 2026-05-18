@@ -47,8 +47,12 @@ describe("EmbeddedChatPane contract", () => {
     expect(embeddedSession).toContain("async function reloadSessionMessagesAfterError");
     expect(embeddedSession).toContain("sessionService.loadSession(sessionId)");
     expect(embeddedSession).toContain("hydrateChatMessagesIntent(detail.messages)");
+    expect(embeddedSession).toContain("sessionService.queueChatInput");
     expect(pane).toContain("<AskUserCard");
     expect(pane).toContain("<ToolConfirmCard");
+    expect(pane).toContain('queuedFollowUp?: { displayText: string; canInsert?: boolean; isInserting?: boolean } | null;');
+    expect(pane).toContain('@click="emit(\'insertQueuedFollowUp\')"');
+    expect(pane).toContain('class="embedded-queued-follow-up"');
     expect(pane).toContain('class="embedded-chat-pane"');
     expect(knowledgePane).toContain("<AgentSelector");
     expect(knowledgePane).toContain("<ModelEffortSelector");
@@ -57,6 +61,7 @@ describe("EmbeddedChatPane contract", () => {
     expect(knowledgePane).toContain("show-user-images");
     expect(knowledgePane).toContain('user-content-mode="asset"');
     expect(knowledgePane).toContain(':tool-confirm-layout-key="sessionKey"');
+    expect(knowledgePane).toContain(':queued-follow-up="queuedFollowUp"');
     expect(knowledgePane).toContain(":waiting-label=\"t('chat.transcript.waiting')\"");
     expect(chatView).toContain("<RichChatInput");
     expect(chatView).toContain("<ChatTranscript");

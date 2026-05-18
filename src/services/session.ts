@@ -10,6 +10,7 @@ import type {
   AssetRefAttachment,
   UserIntentMeta,
   KnowledgeAccessMode,
+  PendingSessionInput,
 } from "../types";
 
 export interface ChatParams {
@@ -40,8 +41,38 @@ export interface ChatLaunchResult {
   runId: string;
 }
 
+export interface QueueChatInputParams {
+  sessionId: string;
+  runId: string;
+  mergeGroupId: string;
+  text: string;
+  displayText?: string | null;
+  images?: ImageAttachment[] | null;
+  assetRefs?: AssetRefAttachment[] | null;
+  mode?: string | null;
+  userIntent?: UserIntentMeta | null;
+  clientMessageId?: string | null;
+  delivery?: "after_run" | "immediate" | string | null;
+}
+
 export function chat(params: ChatParams): Promise<ChatLaunchResult> {
   return ipcInvoke<ChatLaunchResult>("chat", { ...params });
+}
+
+export function queueChatInput(params: QueueChatInputParams): Promise<PendingSessionInput> {
+  return ipcInvoke<PendingSessionInput>("queue_chat_input", { ...params });
+}
+
+export function insertPendingChatInput(
+  sessionId: string,
+  runId: string,
+  pendingInputId?: string | null,
+): Promise<PendingSessionInput> {
+  return ipcInvoke<PendingSessionInput>("insert_pending_chat_input", {
+    sessionId,
+    runId,
+    pendingInputId: pendingInputId ?? null,
+  });
 }
 
 export function cancelChat(sessionId: string): Promise<void> {

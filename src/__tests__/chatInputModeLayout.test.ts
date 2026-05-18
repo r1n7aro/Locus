@@ -13,10 +13,12 @@ describe("chat input mode layout", () => {
     const source = read("src/components/settings/ShortcutSettings.vue");
 
     expect(source).toContain('import BaseDropdown from "../ui/BaseDropdown.vue"');
-    expect(source).toContain('const { state: chatInputSettings, setSubmitMode } = useChatInputSettings();');
+    expect(source).toContain('const { state: chatInputSettings, setSubmitMode, setRunningSendMode } = useChatInputSettings();');
     expect(source).toContain('<BaseDropdown');
     expect(source).toContain(':model-value="chatInputSettings.submitMode"');
     expect(source).toContain('@update:model-value="setSubmitMode($event as ChatSubmitMode)"');
+    expect(source).toContain(':model-value="chatInputSettings.runningSendMode"');
+    expect(source).toContain('@update:model-value="setRunningSendMode($event as RunningSendMode)"');
   });
 
   it("threads submit mode through the chat input stack", () => {
@@ -38,9 +40,11 @@ describe("chat input mode layout", () => {
     const en = read("src/language/en.json");
 
     expect(zh).toContain('"settings.shortcuts.sendModeTitle": "发送方式"');
+    expect(zh).toContain('"settings.shortcuts.runningSendAfterRun": "排为下一条"');
     expect(zh).toContain('"settings.shortcuts.sendModeModifierSendHint": "Enter 换行"');
     expect(zh).toContain('"chat.input.placeholderModifierSend": "输入消息... (@ 引用资产、文件夹或知识, / 查看命令, {0}+Enter 发送)"');
     expect(en).toContain('"settings.shortcuts.sendModeTitle": "Send behavior"');
+    expect(en).toContain('"settings.shortcuts.runningSendAfterRun": "Queue next"');
     expect(en).toContain('"settings.shortcuts.sendModeModifierSendHint": "Enter inserts newline"');
     expect(en).toContain('"chat.input.placeholderModifierSend": "Type message... (@ ref asset, folder, or knowledge, / commands, {0}+Enter to send)"');
   });
