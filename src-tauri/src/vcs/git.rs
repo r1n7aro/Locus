@@ -78,6 +78,27 @@ impl GitProvider {
         }
     }
 
+    fn format_workspace_snapshot_failure(working_dir: &str, label: &str, error: &str) -> String {
+        let mut detail = format!(
+            "[UndoManager] workspace snapshot failed; workspace='{}'; label='{}'; reason={}",
+            working_dir, label, error
+        );
+
+        if Self::should_auto_remove_root_nul(error) {
+            detail.push_str(
+                "; hint=Git cannot index a root file named NUL on Windows. Remove or rename ./NUL and retry.",
+            );
+        }
+
+        detail
+    }
+
+    fn log_workspace_snapshot_failure(working_dir: &str, label: &str, error: String) -> String {
+        let detail = Self::format_workspace_snapshot_failure(working_dir, label, &error);
+        eprintln!("{}", detail);
+        detail
+    }
+
     async fn git_with_index(
         working_dir: &str,
         args: &[&str],
@@ -125,14 +146,21 @@ impl GitProvider {
     // Capture the current working tree into a stash-style commit using a temporary
     // index so the real staged/untracked state stays untouched.
     async fn snapshot_worktree_once(working_dir: &str, label: &str) -> Result<String, String> {
-        let temp_index = TempGitIndex::create(working_dir).await?;
-        Self::git_with_index(working_dir, &["add", "-A"], Some(&temp_index)).await?;
+        let temp_index = TempGitIndex::create(working_dir)
+            .await
+            .map_err(|error| format!("create temporary git index failed: {}", error))?;
+        Self::git_with_index(working_dir, &["add", "-A"], Some(&temp_index))
+            .await
+            .map_err(|error| {
+                format!("stage workspace into temporary git index failed: {}", error)
+            })?;
         Self::git_with_index(
             working_dir,
             &["stash", "create", "-m", label],
             Some(&temp_index),
         )
         .await
+        .map_err(|error| format!("create stash-style workspace snapshot failed: {}", error))
     }
 
     fn should_auto_remove_root_nul(error: &str) -> bool {
@@ -187,11 +215,14 @@ impl GitProvider {
                     "[UndoManager] detected root NUL while snapshotting '{}'; attempting auto-remove via rm -f",
                     working_dir
                 );
-                Self::remove_root_nul_with_rm(working_dir)
-                    .await
-                    .map_err(|cleanup_error| {
-                        format!("{} (auto-remove root NUL failed: {})", error, cleanup_error)
-                    })?;
+                if let Err(cleanup_error) = Self::remove_root_nul_with_rm(working_dir).await {
+                    return Err(Self::log_workspace_snapshot_failure(
+                        working_dir,
+                        label,
+                        format!("{} (auto-remove root NUL failed: {})", error, cleanup_error),
+                    ));
+                }
+
                 eprintln!(
                     "[UndoManager] auto-remove root NUL completed for '{}'; retrying snapshot",
                     working_dir
@@ -199,13 +230,21 @@ impl GitProvider {
                 Self::snapshot_worktree_once(working_dir, label)
                     .await
                     .map_err(|retry_error| {
-                        format!(
-                            "{} (after auto-removing root NUL, retry failed: {})",
-                            error, retry_error
+                        Self::log_workspace_snapshot_failure(
+                            working_dir,
+                            label,
+                            format!(
+                                "{} (after auto-removing root NUL, retry failed: {})",
+                                error, retry_error
+                            ),
                         )
                     })
             }
-            Err(error) => Err(error),
+            Err(error) => Err(Self::log_workspace_snapshot_failure(
+                working_dir,
+                label,
+                error,
+            )),
         }
     }
 
@@ -962,5 +1001,18 @@ mod tests {
         assert!(!GitProvider::should_auto_remove_root_nul(
             "git add -A failed: fatal: adding files failed"
         ));
+    }
+
+    #[test]
+    fn workspace_snapshot_failure_log_includes_context() {
+        let message = GitProvider::format_workspace_snapshot_failure(
+            "C:\\repo",
+            "agent round",
+            "git add -A failed: fatal: adding files failed",
+        );
+
+        assert!(message.contains("workspace='C:\\repo'"));
+        assert!(message.contains("label='agent round'"));
+        assert!(message.contains("reason=git add -A failed: fatal: adding files failed"));
     }
 }
