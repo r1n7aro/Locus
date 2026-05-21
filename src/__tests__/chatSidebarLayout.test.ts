@@ -287,6 +287,9 @@ describe("chat sidebar layout", () => {
     expect(transcript).toContain("const groupedMessages = computed<MessageGroup[]>(() => buildGroupedMessages(historyHiddenToolCallMatchState.value));");
     expect(transcript).toContain("toolCallTreeHasAnyIds(message.toolCalls, toolCallHandoff.value!.toolCallMatchState)");
     expect(transcript).toContain("function shouldReleaseToolCallHandoffToHistory(");
+    expect(transcript).toContain("function hasVisibleUserMessageAfterToolCallMatch(");
+    expect(transcript).toContain("clearToolCallHandoff(\"active-cleared-history-before-inserted-user\")");
+    expect(transcript).toContain("clearToolCallHandoff(\"handoff-history-before-inserted-user\")");
     expect(transcript).toContain("clearToolCallHandoff(\"handoff-followed-by-history-message\")");
     expect(transcript).toContain("function buildTailHiddenToolCallMap(");
     expect(transcript).toContain("filterToolCallsByConsumableMatchState(");

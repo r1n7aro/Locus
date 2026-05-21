@@ -25,6 +25,19 @@ const TOOL_COLLAPSE_HANDOFF_EVENTS = new Set([
   "transientPromotedToolCallsCoverage",
   "transientToolCallsCollapseEnabledChanged",
   "waitingLayoutStateChanged",
+  "applyStreamMutation",
+  "deferUserMessageDuringToolRound",
+  "embeddedApplyStreamMutation",
+  "embeddedDeferUserMessageDuringToolRound",
+  "embeddedFlushDeferredUserMessages",
+  "embeddedStreamEventReceived",
+  "flushDeferredUserMessages",
+  "historyToolBlockOrderChanged",
+  "messagesOrderChanged",
+  "streamEventMutationBatch",
+  "streamEventReceived",
+  "transcriptBlockOrderChanged",
+  "transientRenderSegmentsChanged",
 ]);
 
 function shouldTraceEvent(event: string) {

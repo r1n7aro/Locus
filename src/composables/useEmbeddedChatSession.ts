@@ -12,6 +12,7 @@ import { t } from "../i18n";
 import { normalizeAppError } from "../services/errors";
 import { getLocusRuntime, type RuntimeUnsubscribe } from "../services/locusRuntime";
 import * as sessionService from "../services/session";
+import { logToolCollapseTrace, previewTraceText } from "../services/toolCollapseTrace";
 import { hydrateChatMessagesIntent, withClientMessageId } from "./chatInputIntents";
 import { useChatInputSettings } from "./useChatInputSettings";
 import {
@@ -54,6 +55,7 @@ interface EmbeddedChatState extends StreamState {
   pendingRun: boolean;
   pendingInputs: PendingSessionInput[];
   acceptedPendingInputIds: Set<string>;
+  deferredUserMessagesByRun: Map<string, ChatMessage[]>;
   localMergeGroupId: string | null;
   localFallbackMergeGroupId: string | null;
 }
@@ -92,6 +94,7 @@ function createState(key: string): EmbeddedChatState {
     pendingRun: false,
     pendingInputs: [],
     acceptedPendingInputIds: new Set<string>(),
+    deferredUserMessagesByRun: new Map<string, ChatMessage[]>(),
     localMergeGroupId: null,
     localFallbackMergeGroupId: null,
     messages: [] as ChatMessage[],
@@ -123,6 +126,157 @@ function replaceMessageById(list: ChatMessage[], message: ChatMessage): ChatMess
   const next = [...list];
   next.splice(index, 1, message);
   return next;
+}
+
+function traceEmbeddedMessageOrder(messages: ChatMessage[]) {
+  return messages.map((message, index) => ({
+    index,
+    id: message.id,
+    role: message.role,
+    contentLen: message.content.length,
+    contentPreview: previewTraceText(message.content, 48),
+    toolCallId: message.toolCallId ?? null,
+    toolCallIds: message.toolCalls?.map((toolCall) => toolCall.id) ?? [],
+    renderPartKinds: message.renderParts?.map((part) => part.kind) ?? [],
+  }));
+}
+
+function traceEmbeddedToolCallOrder(toolCalls: ToolCallDisplay[]) {
+  return toolCalls.map((toolCall, index) => ({
+    index,
+    id: toolCall.id,
+    name: toolCall.name,
+    status: toolCall.status,
+    order: toolCall.order ?? null,
+    nestedIds: toolCall.nestedToolCalls?.map((nested) => nested.id) ?? [],
+  }));
+}
+
+function traceEmbeddedStreamEvent(event: StreamEvent) {
+  const base = {
+    type: event.type,
+    sessionId: event.sessionId,
+    runId: event.runId,
+  };
+
+  switch (event.type) {
+    case "userMessage":
+      return {
+        ...base,
+        messageId: event.message.id,
+        contentLen: event.message.content.length,
+        contentPreview: previewTraceText(event.message.content, 48),
+      };
+    case "pendingInputAccepted":
+      return {
+        ...base,
+        pendingInputId: event.pendingInputId,
+        messageId: event.messageId,
+      };
+    case "toolCallRoundDone":
+      return {
+        ...base,
+        messageId: event.messageId,
+        fullTextLen: event.fullText.length,
+        toolCallIds: event.toolCalls.map((toolCall) => toolCall.id),
+        renderPartKinds: event.renderParts?.map((part) => part.kind) ?? [],
+      };
+    default:
+      return base;
+  }
+}
+
+function traceEmbeddedStreamMutation(mutation: StreamMutation) {
+  switch (mutation.type) {
+    case "pushMessage":
+    case "upsertMessage":
+    case "upsertUserMessage":
+      return {
+        type: mutation.type,
+        messageId: mutation.message.id,
+        role: mutation.message.role,
+        contentLen: mutation.message.content.length,
+        toolCallIds: mutation.message.toolCalls?.map((toolCall) => toolCall.id) ?? [],
+        renderPartKinds: mutation.message.renderParts?.map((part) => part.kind) ?? [],
+      };
+    case "pushToolResults":
+      return {
+        type: mutation.type,
+        toolCallIds: mutation.toolCallIds ?? null,
+      };
+    case "addToolCall":
+      return {
+        type: mutation.type,
+        toolCall: traceEmbeddedToolCallOrder([mutation.toolCall])[0],
+      };
+    case "updateToolCall":
+      return {
+        type: mutation.type,
+        id: mutation.id,
+        updates: mutation.updates,
+      };
+    default:
+      return { type: mutation.type };
+  }
+}
+
+function traceEmbeddedOrder(
+  state: EmbeddedChatState,
+  event: string,
+  detail: Record<string, unknown> = {},
+) {
+  logToolCollapseTrace("embedded-chat:order", event, {
+    key: state.key,
+    sessionId: state.sessionId,
+    currentRunId: state.currentRunId,
+    isStreaming: state.isStreaming,
+    messageCount: state.messages.length,
+    messages: traceEmbeddedMessageOrder(state.messages),
+    activeToolCalls: traceEmbeddedToolCallOrder(state.activeToolCalls),
+    deferredUserMessages: Array.from(state.deferredUserMessagesByRun.entries()).map(([runId, deferredMessages]) => ({
+      runId,
+      count: deferredMessages.length,
+      messages: traceEmbeddedMessageOrder(deferredMessages),
+    })),
+    ...detail,
+  });
+}
+
+function deferUserMessage(
+  state: EmbeddedChatState,
+  event: Extract<StreamEvent, { type: "userMessage" }>,
+) {
+  const messagesForRun = state.deferredUserMessagesByRun.get(event.runId) ?? [];
+  state.deferredUserMessagesByRun.set(event.runId, mergeUserMessage(messagesForRun, event.message));
+  traceEmbeddedOrder(state, "embeddedDeferUserMessageDuringToolRound", {
+    event: traceEmbeddedStreamEvent(event),
+    deferredForRun: traceEmbeddedMessageOrder(state.deferredUserMessagesByRun.get(event.runId) ?? []),
+  });
+}
+
+function flushDeferredUserMessages(state: EmbeddedChatState, runId: string) {
+  const deferredMessages = state.deferredUserMessagesByRun.get(runId);
+  if (!deferredMessages || deferredMessages.length === 0) return;
+
+  const messagesBeforeFlush = traceEmbeddedMessageOrder(state.messages);
+  for (const message of deferredMessages) {
+    state.messages = mergeUserMessage(state.messages, message);
+  }
+  state.deferredUserMessagesByRun.delete(runId);
+  traceEmbeddedOrder(state, "embeddedFlushDeferredUserMessages", {
+    runId,
+    flushedMessages: traceEmbeddedMessageOrder(deferredMessages),
+    messagesBeforeFlush,
+    messagesAfterFlush: traceEmbeddedMessageOrder(state.messages),
+  });
+}
+
+function shouldDeferUserMessage(
+  state: EmbeddedChatState,
+  event: Extract<StreamEvent, { type: "userMessage" }>,
+) {
+  if (event.runId !== state.currentRunId) return false;
+  return state.activeToolCalls.length > 0;
 }
 
 function mergePendingInputList(
@@ -170,6 +324,7 @@ function clearState(state: EmbeddedChatState) {
   state.pendingRun = false;
   state.pendingInputs = [];
   state.acceptedPendingInputIds.clear();
+  state.deferredUserMessagesByRun.clear();
   state.localMergeGroupId = null;
   state.localFallbackMergeGroupId = null;
   state.messages = [];
@@ -222,6 +377,8 @@ function resetRoundState(state: EmbeddedChatState) {
 }
 
 function applyMutation(state: EmbeddedChatState, mutation: StreamMutation) {
+  const messagesBeforeMutation = traceEmbeddedMessageOrder(state.messages);
+  const activeToolCallsBeforeMutation = traceEmbeddedToolCallOrder(state.activeToolCalls);
   switch (mutation.type) {
     case "appendRawText":
       state.rawStreamText += mutation.text;
@@ -389,9 +546,15 @@ function applyMutation(state: EmbeddedChatState, mutation: StreamMutation) {
       break;
     case "setTodos":
     case "addUndoable":
-    case "canvasAutoOpen":
       break;
   }
+  traceEmbeddedOrder(state, "embeddedApplyStreamMutation", {
+    mutation: traceEmbeddedStreamMutation(mutation),
+    messagesBeforeMutation,
+    messagesAfterMutation: traceEmbeddedMessageOrder(state.messages),
+    activeToolCallsBeforeMutation,
+    activeToolCallsAfterMutation: traceEmbeddedToolCallOrder(state.activeToolCalls),
+  });
 }
 
 export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
@@ -441,6 +604,20 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     const state = resolveStateForEvent(event);
     if (!state) return;
 
+    traceEmbeddedOrder(state, "embeddedStreamEventReceived", {
+      event: traceEmbeddedStreamEvent(event),
+      pendingInputs: visiblePendingInputs(state.pendingInputs).map((input, index) => ({
+        index,
+        id: input.id,
+        runId: input.runId,
+        mergeGroupId: input.mergeGroupId,
+        delivery: input.delivery ?? "after_run",
+        status: input.status,
+        displayTextLen: (input.displayText || input.text).length,
+        displayTextPreview: previewTraceText(input.displayText || input.text, 48),
+      })),
+    });
+
     if (state.currentRunId && event.runId !== state.currentRunId) return;
     if (!state.currentRunId) state.currentRunId = event.runId;
 
@@ -466,12 +643,26 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
       return;
     }
 
+    if (event.type === "userMessage" && shouldDeferUserMessage(state, event)) {
+      deferUserMessage(state, event);
+      return;
+    }
+
     const mutations = reduceStreamEvent(state, event);
+    traceEmbeddedOrder(state, "streamEventMutationBatch", {
+      event: traceEmbeddedStreamEvent(event),
+      mutationCount: mutations.length,
+      mutations: mutations.map(traceEmbeddedStreamMutation),
+    });
     for (const mutation of mutations) {
       applyMutation(state, mutation);
     }
+    if (event.type === "toolCallRoundDone") {
+      flushDeferredUserMessages(state, event.runId);
+    }
 
     if (event.type === "error") {
+      flushDeferredUserMessages(state, event.runId);
       state.error = normalizeAppError(event.error).message;
       state.currentRunId = null;
       state.pendingRun = false;
@@ -480,6 +671,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     }
 
     if (event.type === "done" || event.type === "cancelled") {
+      flushDeferredUserMessages(state, event.runId);
       let queuedRequest: EmbeddedChatRequest | null = null;
       const followUpMergeGroupId = event.type === "cancelled"
         ? state.localMergeGroupId

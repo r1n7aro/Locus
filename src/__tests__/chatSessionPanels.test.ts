@@ -1689,6 +1689,84 @@ describe("chat session panel state", () => {
     expect(chatStore.activeQueuedFollowUp).toBeNull();
   });
 
+  it("shows an inserted user message after the active tool round is persisted", () => {
+    const chatStore = useChatStore();
+
+    chatStore.sessions = [
+      {
+        id: "s1",
+        title: "Running session",
+        agentId: null,
+        sessionType: "chat",
+        updatedAt: 1,
+      },
+    ] as any;
+    chatStore.activeSessionId = "s1";
+    chatStore.currentRunId = "run-1";
+    chatStore.isStreaming = true;
+    chatStore.messages = [
+      {
+        id: "user-1",
+        role: "user",
+        content: "first",
+        createdAt: 1,
+      },
+    ] as any;
+
+    chatStore.handleStreamEvent({
+      runId: "run-1",
+      type: "toolCallStart",
+      sessionId: "s1",
+      toolCallId: "tc-1",
+      toolName: "read",
+      arguments: "{}",
+    });
+    chatStore.handleStreamEvent({
+      runId: "run-1",
+      type: "userMessage",
+      sessionId: "s1",
+      message: {
+        id: "user-follow-up",
+        role: "user",
+        content: "next",
+        createdAt: 2,
+      },
+    });
+
+    expect(chatStore.messages.map((message) => message.id)).toEqual(["user-1"]);
+
+    chatStore.handleStreamEvent({
+      runId: "run-1",
+      type: "pendingInputAccepted",
+      sessionId: "s1",
+      pendingInputId: "pending-follow-up",
+      messageId: "user-follow-up",
+    });
+    chatStore.handleStreamEvent({
+      runId: "run-1",
+      type: "toolCallDone",
+      sessionId: "s1",
+      toolCallId: "tc-1",
+      toolName: "read",
+      output: "ok",
+      outcome: "done",
+    });
+    chatStore.handleStreamEvent({
+      runId: "run-1",
+      type: "toolCallRoundDone",
+      sessionId: "s1",
+      messageId: "assistant-round",
+      fullText: "finished previous round",
+      toolCalls: [{ id: "tc-1", name: "read", arguments: "{}", outcome: "done" }],
+    });
+
+    expect(chatStore.messages.filter((message) => message.role !== "tool").map((message) => message.id)).toEqual([
+      "user-1",
+      "assistant-round",
+      "user-follow-up",
+    ]);
+  });
+
   it("does not reinsert a queued follow-up after it was accepted", async () => {
     const chatStore = useChatStore();
     let resolveQueue: ((value: any) => void) | null = null;

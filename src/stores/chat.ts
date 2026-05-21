@@ -57,6 +57,129 @@ function pendingInputMergeKey(sessionId: string, runId: string, mergeGroupId: st
   return `${sessionId}\u{0}${runId}\u{0}${mergeGroupId}`;
 }
 
+function runScopedKey(sessionId: string, runId: string) {
+  return `${sessionId}\u{0}${runId}`;
+}
+
+function traceMessageOrder(messages: ChatMessage[]) {
+  return messages.map((message, index) => ({
+    index,
+    id: message.id,
+    role: message.role,
+    contentLen: message.content.length,
+    contentPreview: previewTraceText(message.content, 48),
+    toolCallId: message.toolCallId ?? null,
+    toolCallIds: message.toolCalls?.map((toolCall) => toolCall.id) ?? [],
+    renderPartKinds: message.renderParts?.map((part) => part.kind) ?? [],
+  }));
+}
+
+function traceToolCallOrder(toolCalls: ToolCallDisplay[]) {
+  return toolCalls.map((toolCall, index) => ({
+    index,
+    id: toolCall.id,
+    name: toolCall.name,
+    status: toolCall.status,
+    order: toolCall.order ?? null,
+    nestedIds: toolCall.nestedToolCalls?.map((nested) => nested.id) ?? [],
+  }));
+}
+
+function traceStreamEvent(event: StreamEvent) {
+  const base = {
+    type: event.type,
+    sessionId: event.sessionId,
+    runId: event.runId,
+  };
+
+  switch (event.type) {
+    case "userMessage":
+      return {
+        ...base,
+        messageId: event.message.id,
+        contentLen: event.message.content.length,
+        contentPreview: previewTraceText(event.message.content, 48),
+      };
+    case "pendingInputAccepted":
+      return {
+        ...base,
+        pendingInputId: event.pendingInputId,
+        messageId: event.messageId,
+      };
+    case "pendingInputQueued":
+      return {
+        ...base,
+        pendingInputId: event.input.id,
+        delivery: event.input.delivery ?? "after_run",
+        mergeGroupId: event.input.mergeGroupId,
+      };
+    case "toolCallStart":
+    case "toolCallDone":
+    case "toolCallDelta":
+    case "toolCallProgress":
+      return {
+        ...base,
+        toolCallId: event.toolCallId,
+        toolName: "toolName" in event ? event.toolName : undefined,
+      };
+    case "toolCallRoundDone":
+      return {
+        ...base,
+        messageId: event.messageId,
+        fullTextLen: event.fullText.length,
+        toolCallIds: event.toolCalls.map((toolCall) => toolCall.id),
+        renderPartKinds: event.renderParts?.map((part) => part.kind) ?? [],
+      };
+    case "done":
+      return {
+        ...base,
+        messageId: event.messageId,
+        fullTextLen: event.fullText.length,
+      };
+    default:
+      return base;
+  }
+}
+
+function traceStreamMutation(mutation: StreamMutation) {
+  switch (mutation.type) {
+    case "pushMessage":
+    case "upsertMessage":
+    case "upsertUserMessage":
+      return {
+        type: mutation.type,
+        messageId: mutation.message.id,
+        role: mutation.message.role,
+        contentLen: mutation.message.content.length,
+        toolCallIds: mutation.message.toolCalls?.map((toolCall) => toolCall.id) ?? [],
+        renderPartKinds: mutation.message.renderParts?.map((part) => part.kind) ?? [],
+      };
+    case "pushToolResults":
+      return {
+        type: mutation.type,
+        toolCallIds: mutation.toolCallIds ?? null,
+      };
+    case "addToolCall":
+      return {
+        type: mutation.type,
+        toolCall: traceToolCallOrder([mutation.toolCall])[0],
+      };
+    case "updateToolCall":
+      return {
+        type: mutation.type,
+        id: mutation.id,
+        updates: mutation.updates,
+      };
+    case "resetRound":
+    case "resetRoundKeepToolCalls":
+    case "clearLiveRenderParts":
+    case "setStreaming":
+      return mutation;
+    default:
+      return { type: mutation.type };
+  }
+}
+
 function mergePendingInputList(
   list: PendingSessionInput[],
   input: PendingSessionInput,
@@ -181,6 +304,7 @@ export const useChatStore = defineStore("chat", () => {
   const sessionRunIds = ref(new Map<string, string>());
   const pendingInputsBySession = ref(new Map<string, PendingSessionInput[]>());
   const acceptedPendingInputIds = new Set<string>();
+  const deferredUserMessagesByRun = new Map<string, ChatMessage[]>();
   const localPendingInputGroups = new Set<string>();
   const localFallbackPendingInputGroups = new Set<string>();
   const replayedSessionEventSeqs = new Map<string, number>();
@@ -268,6 +392,27 @@ export const useChatStore = defineStore("chat", () => {
     return `user_pending_${Date.now()}_${pendingMessageSeq}`;
   }
 
+  function deferredUserMessagesTraceState() {
+    return Array.from(deferredUserMessagesByRun.entries()).map(([key, deferredMessages]) => ({
+      key,
+      count: deferredMessages.length,
+      messages: traceMessageOrder(deferredMessages),
+    }));
+  }
+
+  function traceStoreOrder(event: string, detail: Record<string, unknown> = {}) {
+    logToolCollapseTrace("chat-store:order", event, {
+      activeSessionId: activeSessionId.value,
+      currentRunId: currentRunId.value,
+      isStreaming: isStreaming.value,
+      messageCount: messages.value.length,
+      messages: traceMessageOrder(messages.value),
+      activeToolCalls: traceToolCallOrder(activeToolCalls.value),
+      deferredUserMessages: deferredUserMessagesTraceState(),
+      ...detail,
+    });
+  }
+
   function resolveSessionType(sessionId: string | null): string | null {
     if (!sessionId) return null;
     if (sessionId === activeSessionId.value && activeSessionType.value) {
@@ -344,6 +489,7 @@ export const useChatStore = defineStore("chat", () => {
     sessionTodos: TodoSnapshot,
     undoEntries: Array<{ assistantMessageId: string }>,
   ) {
+    clearDeferredUserMessagesForSession(detail.id);
     messages.value = hydrateMessages(detail.messages);
     setSessionPendingInputs(detail.id, detail.pendingInputs ?? []);
     tokenUsage.value = usage;
@@ -361,6 +507,7 @@ export const useChatStore = defineStore("chat", () => {
 
   function clearLoadedSessionState() {
     if (activeSessionId.value) {
+      clearDeferredUserMessagesForSession(activeSessionId.value);
       setSessionPendingInputs(activeSessionId.value, []);
     }
     messages.value = [];
@@ -410,6 +557,17 @@ export const useChatStore = defineStore("chat", () => {
     cancelRequestedRunIds.delete(sessionId);
     managedStreamingSessionIds.delete(sessionId);
     forgetRunReplaySeq(sessionId, runId);
+    if (runId) {
+      deferredUserMessagesByRun.delete(runScopedKey(sessionId, runId));
+    }
+  }
+
+  function clearDeferredUserMessagesForSession(sessionId: string) {
+    for (const key of Array.from(deferredUserMessagesByRun.keys())) {
+      if (key.startsWith(`${sessionId}\u{0}`)) {
+        deferredUserMessagesByRun.delete(key);
+      }
+    }
   }
 
   function setSessionPendingInputs(sessionId: string, inputs: PendingSessionInput[]) {
@@ -471,6 +629,45 @@ export const useChatStore = defineStore("chat", () => {
       localFallbackPendingInputGroups.delete(key);
     }
     removePendingInput(sessionId, (input) => input.id === pendingInputId);
+  }
+
+  function shouldDeferUserMessage(event: Extract<StreamEvent, { type: "userMessage" }>) {
+    if (event.sessionId !== activeSessionId.value) return false;
+    if (event.runId !== currentRunId.value) return false;
+    return activeToolCalls.value.length > 0;
+  }
+
+  function deferUserMessage(event: Extract<StreamEvent, { type: "userMessage" }>) {
+    const key = runScopedKey(event.sessionId, event.runId);
+    const messagesForRun = deferredUserMessagesByRun.get(key) ?? [];
+    deferredUserMessagesByRun.set(key, mergeUserMessage(messagesForRun, event.message));
+    traceStoreOrder("deferUserMessageDuringToolRound", {
+      key,
+      event: traceStreamEvent(event),
+      deferredForRun: traceMessageOrder(deferredUserMessagesByRun.get(key) ?? []),
+    });
+  }
+
+  function flushDeferredUserMessages(sessionId: string, runId: string) {
+    const key = runScopedKey(sessionId, runId);
+    const deferredMessages = deferredUserMessagesByRun.get(key);
+    if (!deferredMessages || deferredMessages.length === 0) return;
+
+    const beforeMessages = traceMessageOrder(messages.value);
+    if (activeSessionId.value === sessionId) {
+      for (const message of deferredMessages) {
+        messages.value = mergeUserMessage(messages.value, message);
+      }
+    }
+    deferredUserMessagesByRun.delete(key);
+    traceStoreOrder("flushDeferredUserMessages", {
+      key,
+      sessionId,
+      runId,
+      flushedMessages: traceMessageOrder(deferredMessages),
+      messagesBeforeFlush: beforeMessages,
+      messagesAfterFlush: traceMessageOrder(messages.value),
+    });
   }
 
   function localQueuedInputsForRun(
@@ -707,13 +904,6 @@ export const useChatStore = defineStore("chat", () => {
   }
 
   // -- Mutation applier --
-  // canvasAutoOpenCallback is set by App.vue (UI shell behavior stays outside store)
-  let canvasAutoOpenCallback: ((toolCallId: string, spec: unknown) => void) | null = null;
-
-  function setCanvasAutoOpenCallback(cb: (toolCallId: string, spec: unknown) => void) {
-    canvasAutoOpenCallback = cb;
-  }
-
   function persistTodoPanelState(sessionId: string | null = activeSessionId.value) {
     if (!sessionId) return;
     todoPanelVisibility.value.set(sessionId, showTodoPanel.value);
@@ -904,7 +1094,9 @@ export const useChatStore = defineStore("chat", () => {
   }
 
   function applyMutation(m: StreamMutation) {
-      switch (m.type) {
+    const messagesBeforeMutation = traceMessageOrder(messages.value);
+    const activeToolCallsBeforeMutation = traceToolCallOrder(activeToolCalls.value);
+    switch (m.type) {
       case "appendRawText":
         {
           const rawLenBefore = rawStreamText.value.length;
@@ -1131,16 +1323,36 @@ export const useChatStore = defineStore("chat", () => {
       case "setCompacting":
         isCompacting.value = m.value;
         break;
-      case "canvasAutoOpen":
-        if (streamReplayDepth === 0) {
-          canvasAutoOpenCallback?.(m.toolCallId, m.spec);
-        }
-        break;
     }
+    traceStoreOrder("applyStreamMutation", {
+      mutation: traceStreamMutation(m),
+      messagesBeforeMutation,
+      messagesAfterMutation: traceMessageOrder(messages.value),
+      activeToolCallsBeforeMutation,
+      activeToolCallsAfterMutation: traceToolCallOrder(activeToolCalls.value),
+      streamReplayDepth,
+    });
   }
 
   // -- Stream event handler --
   function handleStreamEvent(event: StreamEvent): boolean {
+    traceStoreOrder("streamEventReceived", {
+      event: traceStreamEvent(event),
+      expectedRunId: sessionRunIds.value.get(event.sessionId)
+        ?? (event.sessionId === activeSessionId.value ? currentRunId.value : null),
+      streamReplayDepth,
+      pendingInputs: visiblePendingInputs(pendingInputsBySession.value.get(event.sessionId)).map((input, index) => ({
+        index,
+        id: input.id,
+        runId: input.runId,
+        mergeGroupId: input.mergeGroupId,
+        delivery: input.delivery ?? "after_run",
+        status: input.status,
+        displayTextLen: (input.displayText || input.text).length,
+        displayTextPreview: previewTraceText(input.displayText || input.text, 48),
+      })),
+    });
+
     if (event.type === "runStart") {
       const closedRunId = closedRunIds.get(event.sessionId);
       if (closedRunId && closedRunId === event.runId) {
@@ -1279,9 +1491,15 @@ export const useChatStore = defineStore("chat", () => {
       return true;
     }
 
+    if (event.type === "userMessage" && shouldDeferUserMessage(event)) {
+      deferUserMessage(event);
+      return true;
+    }
+
     if (event.type === "done" || event.type === "error" || event.type === "cancelled") {
       const trackedRunId = sessionRunIds.value.get(event.sessionId) ?? null;
       const wasStreaming = streamingSessionIds.value.has(event.sessionId);
+      flushDeferredUserMessages(event.sessionId, event.runId);
       clearTrackedRun(event.sessionId, trackedRunId ?? event.runId);
       closedRunIds.set(event.sessionId, event.runId);
       if (pendingManagedSessionId === event.sessionId) {
@@ -1415,8 +1633,17 @@ export const useChatStore = defineStore("chat", () => {
     }
 
     const mutations = reduceStreamEvent(state, event);
+    traceStoreOrder("streamEventMutationBatch", {
+      event: traceStreamEvent(event),
+      mutationCount: mutations.length,
+      mutations: mutations.map(traceStreamMutation),
+      streamReplayDepth,
+    });
     for (const m of mutations) {
       applyMutation(m);
+    }
+    if (event.type === "toolCallRoundDone") {
+      flushDeferredUserMessages(event.sessionId, event.runId);
     }
 
     // Push stream errors to global notification
@@ -1542,6 +1769,7 @@ export const useChatStore = defineStore("chat", () => {
     replayedSessionEventSeqs.clear();
     pendingInputsBySession.value = new Map();
     acceptedPendingInputIds.clear();
+    deferredUserMessagesByRun.clear();
     localPendingInputGroups.clear();
     localFallbackPendingInputGroups.clear();
     messages.value = [];
@@ -1579,6 +1807,7 @@ export const useChatStore = defineStore("chat", () => {
     sessions.value = [];
     pendingInputsBySession.value = new Map();
     acceptedPendingInputIds.clear();
+    deferredUserMessagesByRun.clear();
     localPendingInputGroups.clear();
     localFallbackPendingInputGroups.clear();
     messages.value = [];
@@ -1633,6 +1862,7 @@ export const useChatStore = defineStore("chat", () => {
       await sessionService.archiveSession(id);
       useChatChangesStore().clear(id);
       clearTrackedRun(id, sessionRunIds.value.get(id) ?? null);
+      clearDeferredUserMessagesForSession(id);
       closedRunIds.delete(id);
       clearSessionScrollState(id);
       setSessionPendingInputs(id, []);
@@ -1654,6 +1884,7 @@ export const useChatStore = defineStore("chat", () => {
       await sessionService.deleteSession(id);
       useChatChangesStore().clear(id);
       clearTrackedRun(id, sessionRunIds.value.get(id) ?? null);
+      clearDeferredUserMessagesForSession(id);
       closedRunIds.delete(id);
       clearSessionScrollState(id);
       setSessionPendingInputs(id, []);
@@ -2321,7 +2552,6 @@ export const useChatStore = defineStore("chat", () => {
     pendingPlanRun,
     clearPendingPlan: () => { pendingPlanRun.value = null; },
     handleStreamEvent,
-    setCanvasAutoOpenCallback,
     refreshSessions,
     loadToolPermissionMode,
     setToolPermissionMode,

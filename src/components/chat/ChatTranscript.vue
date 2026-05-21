@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onUnmounted, ref, useSlots, watch } from "vue";
 import { FileText } from "lucide";
-import type { AssetRefAttachment, AssistantRenderPart, ChatMessage, ToolCallDisplay, ToolCallInfo, UserIntentMeta } from "../../types";
+import type { AssetRefAttachment, AssistantRenderPart, ChatMessage, ImageAttachment, ToolCallDisplay, ToolCallInfo, UserIntentMeta } from "../../types";
 import { t } from "../../i18n";
 import {
   collectPendingContinuationToolSegmentItemIds,
@@ -245,6 +245,16 @@ const toolOutputMap = computed<Record<string, string>>(() => {
   return map;
 });
 
+const toolOutputImageMap = computed<Record<string, ImageAttachment[]>>(() => {
+  const map: Record<string, ImageAttachment[]> = {};
+  for (const msg of props.messages) {
+    if (msg.role === "tool" && msg.toolCallId && msg.images && msg.images.length > 0) {
+      map[msg.toolCallId] = msg.images;
+    }
+  }
+  return map;
+});
+
 const visibleMessages = computed(() =>
   props.messages.filter((msg) => {
     const status = msg.knowledgeProposal?.status;
@@ -300,7 +310,7 @@ function clearToolCallHandoffTimers() {
 }
 
 function cloneToolCallDisplay(toolCall: ToolCallDisplay): ToolCallDisplay {
-  return {
+  const clone: ToolCallDisplay = {
     id: toolCall.id,
     name: toolCall.name,
     arguments: toolCall.arguments,
@@ -309,6 +319,10 @@ function cloneToolCallDisplay(toolCall: ToolCallDisplay): ToolCallDisplay {
     output: toolCall.output,
     nestedToolCalls: toolCall.nestedToolCalls?.map((nestedToolCall) => cloneToolCallDisplay(nestedToolCall)),
   };
+  if (toolCall.images && toolCall.images.length > 0) {
+    clone.images = [...toolCall.images];
+  }
+  return clone;
 }
 
 function cloneToolCallDisplays(toolCalls: ToolCallDisplay[]) {
@@ -346,6 +360,28 @@ function messageListLayoutSnapshot(messages: ChatMessage[] | undefined) {
     lastAssistantRenderPartKinds: lastAssistantMessage?.renderParts?.map((part) => part.kind) ?? [],
     lastAssistantTextPartLengths: textPartLengths,
   };
+}
+
+function messageOrderTraceSnapshot(messages: ChatMessage[] | undefined) {
+  return (messages ?? []).map((message, index) => ({
+    index,
+    id: message.id,
+    role: message.role,
+    contentLen: message.content.length,
+    contentPreview: previewTraceText(message.content, 48),
+    toolCallId: message.toolCallId ?? null,
+    toolCallIds: message.toolCalls?.map((toolCall) => toolCall.id) ?? [],
+    renderPartKinds: message.renderParts?.map((part) => part.kind) ?? [],
+  }));
+}
+
+function parseTraceJson(value: string | undefined) {
+  if (!value) return null;
+  try {
+    return JSON.parse(value) as unknown;
+  } catch {
+    return value;
+  }
 }
 
 function traceToolLayoutChange(reason: string, detail: Record<string, unknown> = {}) {
@@ -632,6 +668,22 @@ function shouldReleaseToolCallHandoffToHistory(
   return false;
 }
 
+function hasVisibleUserMessageAfterToolCallMatch(
+  messages: ChatMessage[],
+  targetMatchState: ToolCallMatchState,
+) {
+  let matchedToolMessage = false;
+  for (const message of messages) {
+    if (matchedToolMessage && message.role === "user" && hasVisibleMessagePayload(message)) {
+      return true;
+    }
+    if (toolCallTreeHasAnyIds(message.toolCalls, targetMatchState)) {
+      matchedToolMessage = true;
+    }
+  }
+  return false;
+}
+
 watch(
   () => props.activeToolCalls,
   (activeToolCalls, previousToolCalls) => {
@@ -652,6 +704,10 @@ watch(
         streamingTextLen: props.streamingText.length,
         isStreaming: props.isStreaming,
       });
+      if (hasVisibleUserMessageAfterToolCallMatch(props.messages, previousMatchState)) {
+        clearToolCallHandoff("active-cleared-history-before-inserted-user");
+        return;
+      }
       if (!props.isStreaming && shouldReleaseToolCallHandoffToHistory(props.messages, previousMatchState)) {
         clearToolCallHandoff("active-cleared-history-ready");
         return;
@@ -723,7 +779,21 @@ watch(
       handoffRenderKey: toolCallHandoff.value?.renderKey ?? "",
       handoffToolCallIds: toolCallHandoff.value ? Array.from(toolCallHandoff.value.toolCallIds) : [],
     });
+    traceToolCollapse("messagesOrderChanged", {
+      previous: messageOrderTraceSnapshot(previous),
+      next: messageOrderTraceSnapshot(messages),
+      isStreaming: props.isStreaming,
+      activeToolCallCount: props.activeToolCalls.length,
+      activeToolCallIds: props.activeToolCalls.map((toolCall) => toolCall.id),
+      hasHandoff,
+      handoffRenderKey: toolCallHandoff.value?.renderKey ?? "",
+      handoffToolCallIds: toolCallHandoff.value ? Array.from(toolCallHandoff.value.toolCallIds) : [],
+    });
     if (!toolCallHandoff.value) return;
+    if (hasVisibleUserMessageAfterToolCallMatch(messages, toolCallHandoff.value.toolCallMatchState)) {
+      clearToolCallHandoff("handoff-history-before-inserted-user");
+      return;
+    }
     if (!props.isStreaming && shouldReleaseToolCallHandoffToHistory(messages, toolCallHandoff.value.toolCallMatchState)) {
       clearToolCallHandoff("handoff-followed-by-history-message");
       return;
@@ -806,7 +876,7 @@ function hasExplicitDisplayToolCalls(item: Pick<MessageRenderItem, "displayToolC
 }
 
 function toolCallsFromInfos(toolCalls: ToolCallInfo[] | undefined) {
-  return buildMessageToolCalls({ toolCalls }, toolOutputMap.value);
+  return buildMessageToolCalls({ toolCalls }, toolOutputMap.value, toolOutputImageMap.value);
 }
 
 function shouldHideThinkingBlocks() {
@@ -1883,6 +1953,150 @@ function transientSegmentPaintState() {
     };
   });
 }
+
+function historyToolBlockOrderState() {
+  return groupedMessages.value.flatMap((group, groupIndex) =>
+    historyRenderSegmentsForGroup(group)
+      .map((segment, segmentIndex) => {
+        if (segment.type !== "toolCalls") return null;
+        return {
+          groupIndex,
+          groupId: group.id,
+          role: group.role,
+          segmentIndex,
+          key: segment.key,
+          itemIds: segment.itemIds,
+          toolCallCount: segment.toolCalls.length,
+          toolCallIds: segment.toolCalls.map((toolCall) => toolCall.id),
+          statuses: toolLayoutStatuses(segment.toolCalls),
+          keepExpanded: shouldKeepToolSegmentExpanded(segment),
+        };
+      })
+      .filter((segment): segment is NonNullable<typeof segment> => !!segment));
+}
+
+function transcriptGroupOrderState() {
+  return groupedMessages.value.map((group, groupIndex) => ({
+    groupIndex,
+    id: group.id,
+    role: group.role,
+    itemIds: group.items.map((item) => item.id),
+    itemRoles: group.items.map((item) => item.message.role),
+    itemContentLens: group.items.map((item) => item.message.content.length),
+    itemToolCallIds: group.items.map((item) => item.message.toolCalls?.map((toolCall) => toolCall.id) ?? []),
+    segmentOrder: historyRenderSegmentsForGroup(group).map((segment, segmentIndex) => {
+      if (segment.type === "toolCalls") {
+        return {
+          segmentIndex,
+          type: segment.type,
+          key: segment.key,
+          itemIds: segment.itemIds,
+          toolCallIds: segment.toolCalls.map((toolCall) => toolCall.id),
+        };
+      }
+      if (segment.type === "content") {
+        return {
+          segmentIndex,
+          type: segment.type,
+          key: segment.key,
+          contentLen: segment.content.length,
+          contentPreview: previewTraceText(segment.content, 48),
+        };
+      }
+      if (segment.type === "knowledgeProposal") {
+        return {
+          segmentIndex,
+          type: segment.type,
+          key: segment.key,
+          messageId: segment.message.id,
+        };
+      }
+      return {
+        segmentIndex,
+        type: segment.type,
+        key: segment.key,
+      };
+    }),
+  }));
+}
+
+function transcriptBlockOrderState() {
+  const historyToolBlocks = historyToolBlockOrderState();
+  const transientSegments = transientSegmentPaintState();
+  const historyToolIds = new Set(historyToolBlocks.flatMap((block) => block.toolCallIds));
+  const transientToolIds = transientSegments.flatMap((segment) =>
+    segment.type === "toolCalls" ? segment.toolCallIds : []);
+
+  return {
+    sessionKey: props.sessionKey ?? "",
+    isStreaming: props.isStreaming,
+    hasTransientAssistantMessage: hasTransientAssistantMessage.value,
+    activeToolCalls: props.activeToolCalls.map((toolCall) => ({
+      id: toolCall.id,
+      name: toolCall.name,
+      status: toolCall.status,
+      order: toolCall.order ?? null,
+    })),
+    hasHandoff: !!toolCallHandoff.value,
+    handoff: toolCallHandoff.value
+      ? {
+        renderKey: toolCallHandoff.value.renderKey,
+        toolCallIds: Array.from(toolCallHandoff.value.toolCallIds),
+        collapseArmed: toolCallHandoff.value.collapseArmed,
+        collapseFinished: toolCallHandoff.value.collapseFinished,
+      }
+      : null,
+    shouldHidePromotedHistoryToolCalls: shouldHidePromotedHistoryToolCalls.value,
+    shouldRenderPromotedHistoryToolCallsInTransient: shouldRenderPromotedHistoryToolCallsInTransient.value,
+    promotedHistoryToolCallIds: Array.from(promotableHistoryToolCalls.value.toolCallIds),
+    duplicateHistoryTransientToolIds: transientToolIds.filter((id, index) =>
+      transientToolIds.indexOf(id) === index && historyToolIds.has(id)),
+    groups: transcriptGroupOrderState(),
+    historyToolBlocks,
+    transientSegments,
+  };
+}
+
+watch(
+  () => JSON.stringify(historyToolBlockOrderState()),
+  (next, previous) => {
+    traceToolCollapse("historyToolBlockOrderChanged", {
+      previous: parseTraceJson(previous),
+      next: parseTraceJson(next),
+      blockOrder: parseTraceJson(next),
+      transcriptOrder: transcriptBlockOrderState(),
+    });
+  },
+  { flush: "post", immediate: true },
+);
+
+watch(
+  () => JSON.stringify(transientSegmentPaintState()),
+  (next, previous) => {
+    traceToolCollapse("transientRenderSegmentsChanged", {
+      previous: parseTraceJson(previous),
+      next: parseTraceJson(next),
+      transcriptOrder: transcriptBlockOrderState(),
+    });
+  },
+  { flush: "post", immediate: true },
+);
+
+watch(
+  () => JSON.stringify(transcriptBlockOrderState()),
+  (next, previous) => {
+    const nextState = parseTraceJson(next);
+    traceToolLayoutChange("transcriptBlockOrderChanged", {
+      previous: parseTraceJson(previous),
+      next: nextState,
+    });
+    traceToolCollapse("transcriptBlockOrderChanged", {
+      previous: parseTraceJson(previous),
+      next: nextState,
+    });
+  },
+  { flush: "post", immediate: true },
+);
 
 function hasTransientStatusPaintTarget() {
   return hasVisibleActiveThinkingBlock.value
