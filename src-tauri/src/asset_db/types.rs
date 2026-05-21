@@ -313,13 +313,38 @@ pub enum ScanPhase {
     #[serde(rename_all = "camelCase")]
     DbWrite,
     #[serde(rename_all = "camelCase")]
-    Reconcile { verify_hashes: bool },
+    Reconcile {
+        verify_hashes: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stage: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        total: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        completed: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        queued: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        failed: Option<u64>,
+    },
     #[serde(rename_all = "camelCase")]
     ReconcileDone,
     #[serde(rename_all = "camelCase")]
     Done { stats: ScanStats },
     #[serde(rename_all = "camelCase")]
     Error { error: AppError },
+}
+
+impl ScanPhase {
+    pub fn reconcile_started(verify_hashes: bool) -> Self {
+        Self::Reconcile {
+            verify_hashes,
+            stage: Some("scanning".to_string()),
+            total: None,
+            completed: None,
+            queued: None,
+            failed: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

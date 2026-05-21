@@ -113,7 +113,7 @@ const scanLabel = computed(() => {
     case "metaParse": return t("chat.assetDb.scanning.metaParse", p.completed, p.total);
     case "yamlParse": return t("chat.assetDb.scanning.yamlParse", p.completed, p.total);
     case "dbWrite": return t("chat.assetDb.scanning.dbWrite");
-    case "reconcile": return t("chat.assetDb.scanning.reconcile");
+    case "reconcile": return reconcileScanLabel(p);
     case "reconcileDone": return "";
     case "done": return "";
     case "error": return t("chat.assetDb.scanning.error", p.error.message);
@@ -168,6 +168,57 @@ function formatCount(value: number): string {
 function formatPercent(value: number | null | undefined): string {
   if (typeof value !== "number" || !Number.isFinite(value)) return "0%";
   return `${Math.round(Math.min(1, Math.max(0, value)) * 100)}%`;
+}
+
+function isFiniteCount(value: number | null | undefined): value is number {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+function formatProgressCount(completed: number, total: number): string {
+  return `${formatCount(completed)} / ${formatCount(total)}`;
+}
+
+function reconcileStageLabel(stage: string | null | undefined): string {
+  switch (stage) {
+    case "scanning": return t("chat.status.assetDb.reconcileStage.scanning");
+    case "discovering": return t("chat.status.assetDb.reconcileStage.discovering");
+    case "processing": return t("chat.status.assetDb.reconcileStage.processing");
+    default: return stage || t("asset.db.scanPhase.reconcile");
+  }
+}
+
+function reconcileProgressRatio(phase: Extract<AssetDbScanEvent, { phase: "reconcile" }>): number | null {
+  if (!isFiniteCount(phase.completed) || !isFiniteCount(phase.total) || phase.total <= 0) {
+    return null;
+  }
+  return Math.min(1, Math.max(0, phase.completed / phase.total));
+}
+
+function reconcileProgressText(phase: Extract<AssetDbScanEvent, { phase: "reconcile" }>): string {
+  if (!isFiniteCount(phase.completed) || !isFiniteCount(phase.total) || phase.total <= 0) return "";
+  const ratio = reconcileProgressRatio(phase);
+  const percent = ratio == null ? "" : `${formatPercent(ratio)} · `;
+  return `${percent}${formatProgressCount(phase.completed, phase.total)}`;
+}
+
+function reconcileScanLabel(phase: Extract<AssetDbScanEvent, { phase: "reconcile" }>): string {
+  const count = reconcileProgressText(phase);
+  switch (phase.stage) {
+    case "scanning":
+      return count
+        ? t("chat.assetDb.scanning.reconcile.scanning", count)
+        : t("chat.assetDb.scanning.reconcile.scanningUnknown");
+    case "discovering":
+      return isFiniteCount(phase.queued)
+        ? t("chat.assetDb.scanning.reconcile.discovering", formatCount(phase.queued))
+        : t("chat.assetDb.scanning.reconcile.discoveringUnknown");
+    case "processing":
+      return count
+        ? t("chat.assetDb.scanning.reconcile.processing", count)
+        : t("chat.assetDb.scanning.reconcile.processingUnknown");
+    default:
+      return t("chat.assetDb.scanning.reconcile");
+  }
 }
 
 function lexicalStageLabel(stage: string | null | undefined): string {
@@ -294,10 +345,15 @@ function formatElapsed(ms: number) {
 }
 
 function scanProgressRow(phase: AssetDbScanEvent | null | undefined): StatusDetailRow | null {
-  if (!phase || (phase.phase !== "metaParse" && phase.phase !== "yamlParse")) return null;
+  if (!phase) return null;
+  if (phase.phase === "reconcile") {
+    const value = reconcileProgressText(phase);
+    return value ? { label: t("chat.status.assetDb.progress"), value } : null;
+  }
+  if (phase.phase !== "metaParse" && phase.phase !== "yamlParse") return null;
   return {
     label: t("chat.status.assetDb.progress"),
-    value: `${phase.completed} / ${phase.total}`,
+    value: formatProgressCount(phase.completed, phase.total),
   };
 }
 
@@ -306,6 +362,32 @@ const assetRows = computed<StatusDetailRow[]>(() => {
 
   const progress = scanProgressRow(props.scanPhase);
   if (progress) rows.push(progress);
+
+  if (props.scanPhase?.phase === "reconcile") {
+    const phase = props.scanPhase;
+    rows.push({
+      label: t("chat.status.assetDb.stage"),
+      value: reconcileStageLabel(phase.stage),
+    });
+    rows.push({
+      label: t("chat.status.assetDb.reconcileMode"),
+      value: phase.verifyHashes
+        ? t("chat.status.assetDb.reconcileModeHash")
+        : t("chat.status.assetDb.reconcileModeMtime"),
+    });
+    if (isFiniteCount(phase.queued)) {
+      rows.push({
+        label: t("chat.status.assetDb.queued"),
+        value: formatCount(phase.queued),
+      });
+    }
+    if (isFiniteCount(phase.failed) && phase.failed > 0) {
+      rows.push({
+        label: t("chat.status.assetDb.failed"),
+        value: formatCount(phase.failed),
+      });
+    }
+  }
 
   if (scanError.value) {
     rows.push({ label: t("chat.status.detail.code"), value: scanError.value.code });

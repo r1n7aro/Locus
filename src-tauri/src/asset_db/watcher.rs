@@ -49,6 +49,8 @@ const RECENT_ENQUEUE_RETENTION_MS: u64 = 5 * 60_000;
 const RECENT_ENQUEUE_SAMPLE_LIMIT: usize = 8;
 const RECENT_ENQUEUE_BUFFER_LIMIT: usize = 512;
 const QUEUE_SUMMARY_LOG_INTERVAL_SECS: u64 = 3;
+const RECONCILE_PROGRESS_TARGET_EVENTS: u64 = 96;
+const RECONCILE_PROGRESS_MIN_STEP: u64 = 32;
 
 #[derive(Debug, Clone, Copy)]
 struct MtimeScanOptions {
@@ -62,6 +64,56 @@ pub struct StartupReconcileStats {
     pub queued: u64,
     pub processed: u64,
     pub failed: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct StartupReconcileProgress {
+    pub verify_hashes: bool,
+    pub stage: &'static str,
+    pub total: Option<u64>,
+    pub completed: Option<u64>,
+    pub queued: Option<u64>,
+    pub failed: Option<u64>,
+}
+
+impl StartupReconcileProgress {
+    pub fn to_scan_phase(&self) -> ScanPhase {
+        ScanPhase::Reconcile {
+            verify_hashes: self.verify_hashes,
+            stage: Some(self.stage.to_string()),
+            total: self.total,
+            completed: self.completed,
+            queued: self.queued,
+            failed: self.failed,
+        }
+    }
+}
+
+type ReconcileProgressCallback<'a> = Option<&'a dyn Fn(&StartupReconcileProgress)>;
+
+fn reconcile_progress_emit_step(total: u64) -> u64 {
+    if total == 0 {
+        1
+    } else {
+        (total / RECONCILE_PROGRESS_TARGET_EVENTS).max(RECONCILE_PROGRESS_MIN_STEP)
+    }
+}
+
+fn should_emit_reconcile_progress(completed: u64, total: u64) -> bool {
+    if total == 0 {
+        return completed == 0;
+    }
+    let step = reconcile_progress_emit_step(total);
+    completed == 0 || completed == 1 || completed == total || completed % step == 0
+}
+
+fn emit_reconcile_progress(
+    on_progress: ReconcileProgressCallback<'_>,
+    progress: StartupReconcileProgress,
+) {
+    if let Some(on_progress) = on_progress {
+        on_progress(&progress);
+    }
 }
 
 /// Compute the default number of active worker threads as ¼ of the host's
@@ -1349,6 +1401,7 @@ fn mtime_scan_once_with_linked_watch(
             verify_hashes: false,
         },
         linked_watch_state,
+        None,
     );
 }
 
@@ -1360,6 +1413,7 @@ fn mtime_scan_once_with_options(
     activity: &RecentQueueActivityLog,
     options: MtimeScanOptions,
     linked_watch_state: Option<&LinkedAssetWatchState>,
+    on_progress: ReconcileProgressCallback<'_>,
 ) {
     if stop.load(Ordering::Relaxed) {
         return;
@@ -1395,6 +1449,20 @@ fn mtime_scan_once_with_options(
     if asset_records.is_empty() && file_records.is_empty() && !options.discover_new_meta {
         return;
     }
+
+    let scan_total = (asset_records.len() + file_records.len()) as u64;
+    let mut scan_completed = 0u64;
+    emit_reconcile_progress(
+        on_progress,
+        StartupReconcileProgress {
+            verify_hashes: options.verify_hashes,
+            stage: "scanning",
+            total: Some(scan_total),
+            completed: Some(0),
+            queued: Some(queue.len() as u64),
+            failed: Some(0),
+        },
+    );
 
     for record in &asset_records {
         if stop.load(Ordering::Relaxed) {
@@ -1447,6 +1515,21 @@ fn mtime_scan_once_with_options(
                 None,
             );
         }
+
+        scan_completed += 1;
+        if should_emit_reconcile_progress(scan_completed, scan_total) {
+            emit_reconcile_progress(
+                on_progress,
+                StartupReconcileProgress {
+                    verify_hashes: options.verify_hashes,
+                    stage: "scanning",
+                    total: Some(scan_total),
+                    completed: Some(scan_completed),
+                    queued: Some(queue.len() as u64),
+                    failed: Some(0),
+                },
+            );
+        }
     }
 
     let mut indexed_meta_paths = HashSet::new();
@@ -1491,11 +1574,38 @@ fn mtime_scan_once_with_options(
                 None,
             );
         }
+
+        scan_completed += 1;
+        if should_emit_reconcile_progress(scan_completed, scan_total) {
+            emit_reconcile_progress(
+                on_progress,
+                StartupReconcileProgress {
+                    verify_hashes: options.verify_hashes,
+                    stage: "scanning",
+                    total: Some(scan_total),
+                    completed: Some(scan_completed),
+                    queued: Some(queue.len() as u64),
+                    failed: Some(0),
+                },
+            );
+        }
     }
 
     if !options.discover_new_meta {
         return;
     }
+
+    emit_reconcile_progress(
+        on_progress,
+        StartupReconcileProgress {
+            verify_hashes: options.verify_hashes,
+            stage: "discovering",
+            total: None,
+            completed: None,
+            queued: Some(queue.len() as u64),
+            failed: Some(0),
+        },
+    );
 
     let scan_roots = ["Assets", "Packages"];
     let mut linked_asset_roots = Vec::new();
@@ -1672,6 +1782,7 @@ pub fn reconcile_loaded_db(
             discover_new_meta: true,
             verify_hashes: true,
         },
+        None,
     )
 }
 
@@ -1688,6 +1799,7 @@ pub fn reconcile_loaded_db_light(
             discover_new_meta: false,
             verify_hashes: false,
         },
+        None,
     )
 }
 
@@ -1704,6 +1816,28 @@ pub fn reconcile_loaded_db_with_cancel(
             discover_new_meta: true,
             verify_hashes: true,
         },
+        None,
+    )
+}
+
+pub fn reconcile_loaded_db_with_cancel_and_progress<F>(
+    project_root: &Path,
+    graph: AssetDb,
+    stop: &AtomicBool,
+    on_progress: F,
+) -> Result<(AssetDb, StartupReconcileStats), String>
+where
+    F: Fn(&StartupReconcileProgress),
+{
+    reconcile_loaded_db_with_options(
+        project_root,
+        graph,
+        stop,
+        MtimeScanOptions {
+            discover_new_meta: true,
+            verify_hashes: true,
+        },
+        Some(&on_progress),
     )
 }
 
@@ -1712,9 +1846,16 @@ fn reconcile_loaded_db_with_options(
     graph: AssetDb,
     stop: &AtomicBool,
     options: MtimeScanOptions,
+    on_progress: ReconcileProgressCallback<'_>,
 ) -> Result<(AssetDb, StartupReconcileStats), String> {
     let state = Arc::new(Mutex::new(Some(graph)));
-    let stats = reconcile_graph_state_with_options(project_root, state.clone(), stop, options)?;
+    let stats = reconcile_graph_state_with_options(
+        project_root,
+        state.clone(),
+        stop,
+        options,
+        on_progress,
+    )?;
 
     let mut guard = state.lock().map_err(|e| format!("Lock error: {}", e))?;
     let graph = guard
@@ -1753,6 +1894,29 @@ pub fn reconcile_graph_state_with_cancel(
             discover_new_meta: true,
             verify_hashes,
         },
+        None,
+    )
+}
+
+pub fn reconcile_graph_state_with_cancel_and_progress<F>(
+    project_root: &Path,
+    state: Arc<Mutex<Option<AssetDb>>>,
+    stop: &AtomicBool,
+    verify_hashes: bool,
+    on_progress: F,
+) -> Result<StartupReconcileStats, String>
+where
+    F: Fn(&StartupReconcileProgress),
+{
+    reconcile_graph_state_with_options(
+        project_root,
+        state,
+        stop,
+        MtimeScanOptions {
+            discover_new_meta: true,
+            verify_hashes,
+        },
+        Some(&on_progress),
     )
 }
 
@@ -1761,13 +1925,35 @@ fn reconcile_graph_state_with_options(
     state: Arc<Mutex<Option<AssetDb>>>,
     stop: &AtomicBool,
     options: MtimeScanOptions,
+    on_progress: ReconcileProgressCallback<'_>,
 ) -> Result<StartupReconcileStats, String> {
     let queue = DirtyQueue::new();
     let activity = RecentQueueActivityLog::new();
     let mut stats = StartupReconcileStats::default();
 
-    mtime_scan_once_with_options(&queue, stop, &state, project_root, &activity, options, None);
+    mtime_scan_once_with_options(
+        &queue,
+        stop,
+        &state,
+        project_root,
+        &activity,
+        options,
+        None,
+        on_progress,
+    );
     stats.queued = queue.len() as u64;
+
+    emit_reconcile_progress(
+        on_progress,
+        StartupReconcileProgress {
+            verify_hashes: options.verify_hashes,
+            stage: "processing",
+            total: Some(stats.queued),
+            completed: Some(0),
+            queued: Some(queue.len() as u64),
+            failed: Some(0),
+        },
+    );
 
     while let Some(rel_path) = queue.try_dequeue() {
         if stop.load(Ordering::Relaxed) {
@@ -1796,6 +1982,21 @@ fn reconcile_graph_state_with_options(
                     rel_path, error
                 );
             }
+        }
+
+        let total = stats.queued.max(stats.processed);
+        if should_emit_reconcile_progress(stats.processed, total) || queue.len() == 0 {
+            emit_reconcile_progress(
+                on_progress,
+                StartupReconcileProgress {
+                    verify_hashes: options.verify_hashes,
+                    stage: "processing",
+                    total: Some(total),
+                    completed: Some(stats.processed),
+                    queued: Some(queue.len() as u64),
+                    failed: Some(stats.failed),
+                },
+            );
         }
     }
 

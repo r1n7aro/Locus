@@ -35,6 +35,8 @@ interface LiveScanProgress {
   completed: number | null;
   total: number | null;
   indeterminate: boolean;
+  queued?: number | null;
+  failed?: number | null;
 }
 
 const notificationStore = useNotificationStore();
@@ -180,6 +182,19 @@ function fmtStageStep(step: number): string {
   return `${step} / 4`;
 }
 
+function isFiniteCount(value: number | null | undefined): value is number {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+function reconcileStageLabel(stage: string | null | undefined): string {
+  switch (stage) {
+    case "scanning": return t("chat.status.assetDb.reconcileStage.scanning");
+    case "discovering": return t("chat.status.assetDb.reconcileStage.discovering");
+    case "processing": return t("chat.status.assetDb.reconcileStage.processing");
+    default: return stage || t("asset.db.scanPhase.reconcile");
+  }
+}
+
 function buildLiveScanProgress(phase: AssetDbScanEvent): LiveScanProgress | null {
   switch (phase.phase) {
     case "dirScan":
@@ -231,16 +246,31 @@ function buildLiveScanProgress(phase: AssetDbScanEvent): LiveScanProgress | null
         indeterminate: true,
       };
     case "reconcile":
+    {
+      const hasProgress = isFiniteCount(phase.completed)
+        && isFiniteCount(phase.total)
+        && phase.total > 0;
+      const progressRatio = hasProgress
+        ? clampProgress((phase.completed ?? 0) / (phase.total ?? 1))
+        : null;
+      const summaryLabel = hasProgress
+        ? t("asset.db.scanProgressCount", fmtNum(phase.completed ?? 0), fmtNum(phase.total ?? 0))
+        : phase.stage === "discovering" && isFiniteCount(phase.queued)
+          ? t("chat.assetDb.scanning.reconcile.discovering", fmtNum(phase.queued))
+          : t("chat.assetDb.scanning.reconcile");
       return {
-        stageLabel: t("asset.db.scanPhase.reconcile"),
-        summaryLabel: t("chat.assetDb.scanning.reconcile"),
-        heroValue: fmtStageStep(4),
-        heroLabel: t("asset.db.scanPhase.label"),
-        progressRatio: null,
-        completed: null,
-        total: null,
-        indeterminate: true,
+        stageLabel: reconcileStageLabel(phase.stage),
+        summaryLabel,
+        heroValue: progressRatio != null ? fmtPercent(progressRatio) : fmtStageStep(4),
+        heroLabel: progressRatio != null ? t("asset.db.scanProgress") : t("asset.db.scanPhase.label"),
+        progressRatio,
+        completed: isFiniteCount(phase.completed) ? phase.completed : null,
+        total: isFiniteCount(phase.total) ? phase.total : null,
+        indeterminate: progressRatio == null,
+        queued: isFiniteCount(phase.queued) ? phase.queued : null,
+        failed: isFiniteCount(phase.failed) ? phase.failed : null,
       };
+    }
     default:
       return null;
   }
@@ -490,6 +520,14 @@ async function openRiskDetail(kind: AssetRiskKind) {
               <div v-if="liveScanProgress.total != null" class="detail-row">
                 <span class="detail-key">{{ t("asset.db.scanPhase.total") }}</span>
                 <span class="detail-value">{{ fmtNum(liveScanProgress.total) }}</span>
+              </div>
+              <div v-if="liveScanProgress.queued != null" class="detail-row">
+                <span class="detail-key">{{ t("chat.status.assetDb.queued") }}</span>
+                <span class="detail-value">{{ fmtNum(liveScanProgress.queued) }}</span>
+              </div>
+              <div v-if="liveScanProgress.failed != null && liveScanProgress.failed > 0" class="detail-row">
+                <span class="detail-key">{{ t("chat.status.assetDb.failed") }}</span>
+                <span class="detail-value warn">{{ fmtNum(liveScanProgress.failed) }}</span>
               </div>
               <div class="detail-row">
                 <span class="detail-key">{{ t("asset.db.lastScan") }}</span>
@@ -1048,7 +1086,6 @@ async function openRiskDetail(kind: AssetRiskKind) {
   font-weight: 500;
   font-style: italic;
 }
-
 /* ── Watcher tuning controls ── */
 .watcher-tuning {
   display: flex;

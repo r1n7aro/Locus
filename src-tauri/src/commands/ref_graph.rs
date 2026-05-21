@@ -404,8 +404,28 @@ async fn run_ref_graph_scan_job(
         if cancel_token.load(Ordering::Relaxed) {
             return Err(REF_GRAPH_SCAN_CANCELLED_DETAIL.to_string());
         }
+        let handle_for_reconcile = handle.clone();
+        let scan_phase_state_for_reconcile = scan_phase_state.clone();
+        let workspace_for_reconcile = workspace.clone();
+        let cancel_for_reconcile_progress = cancel_token.clone();
         let (graph, reconcile_stats) =
-            crate::asset_db::watcher::reconcile_loaded_db_with_cancel(&root, graph, &cancel_token)?;
+            crate::asset_db::watcher::reconcile_loaded_db_with_cancel_and_progress(
+                &root,
+                graph,
+                &cancel_token,
+                |progress| {
+                    if cancel_for_reconcile_progress.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let _ = emit_scan_phase_if_current(
+                        &workspace_for_reconcile,
+                        workspace_generation,
+                        &handle_for_reconcile,
+                        &scan_phase_state_for_reconcile,
+                        progress.to_scan_phase(),
+                    );
+                },
+            )?;
         eprintln!(
             "[AssetDb] post-scan reconcile complete: queued={}, processed={}, failed={}",
             reconcile_stats.queued, reconcile_stats.processed, reconcile_stats.failed

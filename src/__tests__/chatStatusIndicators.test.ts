@@ -148,4 +148,49 @@ describe("chat status indicators", () => {
     expect(zh).toContain('"chat.unity.waitingRecompileConnection": "Unity 重编译中，等待重连"');
     expect(en).toContain('"chat.unity.waitingRecompileConnection": "Unity recompiling, waiting for reconnect"');
   });
+
+  it("shows staged asset reconcile progress without current file detail", () => {
+    const indicators = read("src/components/chat/ChatStatusIndicators.vue");
+    const assetStats = read("src/components/asset/AssetStatsView.vue");
+    const types = read("src/types.ts");
+    const rustTypes = read("src-tauri/src/asset_db/types.rs");
+    const watcher = read("src-tauri/src/asset_db/watcher.rs");
+    const zh = read("src/language/zh.json");
+    const en = read("src/language/en.json");
+    const scanEventBlock = types.match(/export type AssetDbScanEvent =[\s\S]*?\| \{ phase: "error"; error: AppErrorPayload \};/)?.[0] ?? "";
+
+    expect(scanEventBlock).toContain('phase: "reconcile";');
+    expect(scanEventBlock).toContain('stage?: "scanning" | "discovering" | "processing" | string | null;');
+    expect(scanEventBlock).toContain("queued?: number | null;");
+    expect(scanEventBlock).toContain("failed?: number | null;");
+    expect(scanEventBlock).not.toContain("currentFile");
+
+    expect(rustTypes).toContain("pub fn reconcile_started(verify_hashes: bool) -> Self");
+    expect(rustTypes).toContain("stage: Option<String>");
+    expect(rustTypes).toContain("queued: Option<u64>");
+    expect(rustTypes).toContain("failed: Option<u64>");
+    expect(rustTypes).not.toContain("current_file: Option<String>");
+    expect(watcher).toContain('stage: "scanning"');
+    expect(watcher).toContain('stage: "discovering"');
+    expect(watcher).toContain('stage: "processing"');
+
+    expect(indicators).toContain('case "reconcile": return reconcileScanLabel(p);');
+    expect(indicators).toContain('label: t("chat.status.assetDb.stage")');
+    expect(indicators).toContain('label: t("chat.status.assetDb.reconcileMode")');
+    expect(indicators).toContain('label: t("chat.status.assetDb.queued")');
+    expect(indicators).toContain('return value ? { label: t("chat.status.assetDb.progress"), value } : null;');
+    expect(indicators).not.toContain("chat.status.assetDb.currentFile");
+
+    expect(assetStats).toContain('stageLabel: reconcileStageLabel(phase.stage)');
+    expect(assetStats).toContain("queued: isFiniteCount(phase.queued) ? phase.queued : null");
+    expect(assetStats).toContain("failed: isFiniteCount(phase.failed) ? phase.failed : null");
+    expect(assetStats).not.toContain("liveScanProgress.currentFile");
+
+    expect(zh).toContain('"chat.assetDb.scanning.reconcile.scanning": "校验文件 {0}..."');
+    expect(zh).toContain('"chat.status.assetDb.reconcileStage.processing": "同步变更"');
+    expect(zh).not.toContain('"chat.status.assetDb.currentFile"');
+    expect(en).toContain('"chat.assetDb.scanning.reconcile.processing": "Syncing changes {0}..."');
+    expect(en).toContain('"chat.status.assetDb.reconcileStage.scanning": "Verifying files"');
+    expect(en).not.toContain('"chat.status.assetDb.currentFile"');
+  });
 });
