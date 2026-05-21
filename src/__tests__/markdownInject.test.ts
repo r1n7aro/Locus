@@ -238,6 +238,35 @@ describe("injectAssetRefs", () => {
     expect(result).not.toContain("<code>");
   });
 
+  it("converts absolute local file paths inside inline code", () => {
+    const html = "<code>C:\\Users\\ExampleUser\\AppData\\Roaming\\Locus\\temp\\locus-temp-test.txt</code>";
+    const result = injectAssetRefs(html);
+    expect(result).toContain("md-file-ref");
+    expect(result).toContain('data-file-path="C:/Users/ExampleUser/AppData/Roaming/Locus/temp/locus-temp-test.txt"');
+    expect(result).toContain('data-entry-kind="file"');
+    expect(result).toContain("locus-temp-test.txt");
+    expect(result).not.toContain("<code>");
+  });
+
+  it("converts absolute local folder paths inside inline code", () => {
+    const html = "<code>C:\\Users\\ExampleUser\\AppData\\Roaming\\Locus\\temp\\</code>";
+    const result = injectAssetRefs(html);
+    expect(result).toContain("md-file-ref");
+    expect(result).toContain("md-folder-ref");
+    expect(result).toContain('data-file-path="C:/Users/ExampleUser/AppData/Roaming/Locus/temp"');
+    expect(result).toContain('data-entry-kind="folder"');
+    expect(result).toContain("temp");
+  });
+
+  it("converts POSIX absolute paths inside inline code", () => {
+    const html = "<code>/tmp/locus-temp-test.txt</code>";
+    const result = injectAssetRefs(html);
+    expect(result).toContain("md-file-ref");
+    expect(result).toContain('data-file-path="/tmp/locus-temp-test.txt"');
+    expect(result).toContain('data-entry-kind="file"');
+    expect(result).toContain("locus-temp-test.txt");
+  });
+
   it("does not convert generic workspace mentions", () => {
     const html = "See @UIElementsSchema/UnityEditor.Overlays.xsd";
     const result = injectAssetRefs(html);
@@ -339,6 +368,48 @@ describe("injectFileRefs", () => {
     const html = "Update utils/helpers.ts";
     const result = injectFileRefs(html);
     expect(result).toContain('data-file-path="utils/helpers.ts"');
+  });
+
+  it("converts bare absolute local file paths", () => {
+    const html = "Wrote C:/Users/ExampleUser/AppData/Roaming/Locus/temp/locus-temp-test.txt.";
+    const result = injectFileRefs(html);
+    expect(result).toContain("md-file-ref");
+    expect(result).toContain('data-file-path="C:/Users/ExampleUser/AppData/Roaming/Locus/temp/locus-temp-test.txt"');
+    expect(result).toContain('data-entry-kind="file"');
+    expect(result).toContain("locus-temp-test.txt");
+    expect(result).toContain("</span>.");
+  });
+
+  it("converts quoted absolute local paths with spaces", () => {
+    const html = "Saved 'C:/Users/ExampleUser/AppData/Roaming/Locus/temp/My File.txt'";
+    const result = injectFileRefs(html);
+    expect(result).toContain("md-file-ref");
+    expect(result).toContain('data-file-path="C:/Users/ExampleUser/AppData/Roaming/Locus/temp/My File.txt"');
+    expect(result).toContain("My File.txt");
+    expect(result).not.toContain("'C:/Users");
+  });
+
+  it("converts bare absolute local folder paths", () => {
+    const html = "Open C:/Users/ExampleUser/AppData/Roaming/Locus/temp/ when needed";
+    const result = injectFileRefs(html);
+    expect(result).toContain("md-folder-ref");
+    expect(result).toContain('data-file-path="C:/Users/ExampleUser/AppData/Roaming/Locus/temp"');
+    expect(result).toContain('data-entry-kind="folder"');
+    expect(result).toContain("temp");
+  });
+
+  it("does not convert bare POSIX absolute paths", () => {
+    const html = "Open /tmp/locus-temp-test.txt when needed";
+    const result = injectFileRefs(html);
+    expect(result).not.toContain("md-file-ref");
+    expect(result).toBe(html);
+  });
+
+  it("does not convert Chinese slash phrases as POSIX refs", () => {
+    const html = "左侧有一个小猪角色和一个绿色怪物/植物，摄像机当前构图比较靠近岩石主体。";
+    const result = injectFileRefs(html);
+    expect(result).not.toContain("md-file-ref");
+    expect(result).toBe(html);
   });
 
   it("converts bare Unity asset file refs with spaces", () => {

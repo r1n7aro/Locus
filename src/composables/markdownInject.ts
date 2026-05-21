@@ -52,6 +52,14 @@ const BARE_UNITY_ASSET_START_RE = /(?<![@`\/])(?:Assets|Packages)\//g;
 const BRACED_WORKSPACE_MENTION_RE = /\{@([^{}\r\n]*\/[^{}\r\n]*)\}/g;
 const WORKSPACE_MENTION_RE = /@((?:[^\s@<]+\/)+[^\s@<]*)/g;
 const UNITY_ASSET_ICON_BASE = "/unity-asset-icons";
+const WINDOWS_DRIVE_ABSOLUTE_RE = /^[A-Za-z]:[\\/]/;
+const UNC_ABSOLUTE_RE = /^(?:\\\\|\/\/)[^\\/]+[\\/][^\\/]+/;
+const POSIX_ABSOLUTE_RE = /^\/(?!\/)/;
+const QUOTED_LOCAL_FILE_REF_RE = /(["'])((?:[A-Za-z]:[\\/]|\\\\|\/\/)(?:(?!\1).)+?)\s*\1/g;
+// Bare `/...` is too ambiguous in prose such as `GameObject/Component`.
+// POSIX absolute paths are still rendered when they appear inside inline code.
+const ABSOLUTE_LOCAL_FILE_REF_RE = /(?<![@`\w])((?:[A-Za-z]:[\\/]\S*|\\\\[^\s\\/]+[\\/][^\s\\/]+(?:[\\/]\S*)?|\/\/[^\s/]+\/[^\s/]+(?:\/\S*)?))/g;
+const TRAILING_FILE_REF_PUNCT_RE = /[.,;，。；、？！\])}）】》」』]+$/;
 
 function escapeAttr(source: string): string {
   return source
@@ -66,6 +74,42 @@ function displayFileRef(filePath: string, line = ""): string {
   const segments = displayPath.split("/");
   const fileName = segments[segments.length - 1] || displayPath;
   return line ? `${fileName}:${line}` : fileName;
+}
+
+function normalizeFileRefPath(filePath: string): string {
+  return filePath.trim().replace(/\\/g, "/");
+}
+
+export function isAbsoluteLocalRefPath(filePath: string): boolean {
+  const normalized = filePath.trim();
+  return WINDOWS_DRIVE_ABSOLUTE_RE.test(normalized)
+    || UNC_ABSOLUTE_RE.test(normalized)
+    || POSIX_ABSOLUTE_RE.test(normalized);
+}
+
+function isUsableAbsoluteLocalRefPath(filePath: string): boolean {
+  const normalized = normalizeFileRefPath(filePath);
+  if (!isAbsoluteLocalRefPath(normalized)) return false;
+  if (WINDOWS_DRIVE_ABSOLUTE_RE.test(normalized)) return normalized.length > 3;
+  if (UNC_ABSOLUTE_RE.test(normalized)) return normalized.split("/").filter(Boolean).length >= 2;
+  return normalized.length > 1;
+}
+
+function fileRefBaseName(filePath: string): string {
+  const normalized = normalizeFileRefPath(filePath).replace(/\/+$/, "");
+  const parts = normalized.split("/").filter(Boolean);
+  return parts[parts.length - 1] || normalized;
+}
+
+function hasFileExtension(filePath: string): boolean {
+  return /\.[^./\\]+$/.test(fileRefBaseName(filePath));
+}
+
+function isFolderFileRef(filePath: string, line = ""): boolean {
+  if (line) return false;
+  const raw = filePath.trim();
+  if (/[\\/]$/.test(raw)) return true;
+  return isAbsoluteLocalRefPath(raw) && !hasFileExtension(raw);
 }
 
 function normalizeUnityAssetRefPath(filePath: string): string {
@@ -131,6 +175,18 @@ function renderFileRef(
   return `<span class="${className}" data-file-path="${escaped}"${lineAttr}${attrs} title="${label}" aria-label="${label}">${icon}<span class="md-ref-label">${displayFileRef(filePath, line)}</span></span>`;
 }
 
+function renderLocalFileRef(filePath: string, line = ""): string {
+  const normalizedPath = normalizeFileRefPath(filePath);
+  const isDir = isFolderFileRef(filePath, line);
+  const cleanPath = isDir ? (normalizedPath.replace(/\/+$/, "") || normalizedPath) : normalizedPath;
+  const classes = isDir ? "md-folder-ref" : "";
+  const entryKind = isDir ? "folder" : "file";
+  const icon = isDir
+    ? renderRefIcon("folder", "md-workspace-ref-icon")
+    : renderRefIcon();
+  return renderFileRef(cleanPath, line, classes, ` data-entry-kind="${entryKind}"`, icon);
+}
+
 function renderUnityAssetRef(filePath: string, line = ""): string {
   const normalizedPath = normalizeUnityAssetRefPath(filePath);
   const escaped = escapeAttr(normalizedPath);
@@ -146,6 +202,10 @@ function renderUnityAssetRef(filePath: string, line = ""): string {
 
 function renderWorkspaceMention(path: string, match: string): string {
   const isDir = path.endsWith("/");
+  if (isUsableAbsoluteLocalRefPath(path)) {
+    return renderLocalFileRef(path);
+  }
+
   if (/^(Assets|Packages)\//.test(path) && !isDir) {
     return match;
   }
@@ -351,7 +411,7 @@ function splitInlineCodePathSuffix(source: string): { path: string; line: string
 }
 
 function isWorkspaceInlineRefPath(filePath: string): boolean {
-  const normalized = filePath.trim().replace(/\\/g, "/");
+  const normalized = normalizeFileRefPath(filePath);
   if (!normalized.includes("/")) return false;
   if (ASSET_ROOT_RE.test(normalized)) return true;
   if (INLINE_WORKSPACE_ROOT_RE.test(normalized)) return true;
@@ -360,9 +420,9 @@ function isWorkspaceInlineRefPath(filePath: string): boolean {
 }
 
 function renderWorkspaceInlineRef(filePath: string, line = ""): string {
-  const normalizedPath = filePath.trim().replace(/\\/g, "/");
+  const normalizedPath = normalizeFileRefPath(filePath);
   if (line) {
-    return renderFileRef(normalizedPath.replace(/\/+$/, ""), line);
+    return renderLocalFileRef(normalizedPath.replace(/\/+$/, ""), line);
   }
   return renderWorkspaceMention(normalizedPath, normalizedPath);
 }
@@ -370,7 +430,13 @@ function renderWorkspaceInlineRef(filePath: string, line = ""): string {
 function assetRefFromInlineCode(source: string): string | null {
   const refText = normalizeInlineCodeRefText(source);
   const parsed = splitInlineCodePathSuffix(refText);
-  if (!parsed || !isWorkspaceInlineRefPath(parsed.path)) return null;
+  if (!parsed) return null;
+
+  if (isUsableAbsoluteLocalRefPath(parsed.path)) {
+    return renderLocalFileRef(parsed.path, parsed.line);
+  }
+
+  if (!isWorkspaceInlineRefPath(parsed.path)) return null;
 
   const sceneObjectRef = splitSceneObjectRef(parsed.path);
   if (sceneObjectRef) {
@@ -483,10 +549,27 @@ export function injectWorkspaceMentions(html: string): string {
 // Match project-relative file paths, optionally with :line or #Lline suffix.
 // Requires at least one slash and a file extension to reduce false positives.
 // Does not match if preceded by @ (already handled as an asset/workspace mention) or backticks.
-const FILE_REF_RE = /(?<![@`\/])(?:(?:src|src-tauri|Assets|Packages|Library|ProjectSettings|Editor)\/[\w.\/\-]+[\w.\-]|[\w.\-]+\/[\w.\/\-]*\.[\w]+)(?::(\d+)|#L(\d+))?/g;
+const FILE_REF_RE = /(?<![@`\/\w])(?:(?:src|src-tauri|Assets|Packages|Library|ProjectSettings|Editor)\/[\w.\/\-]+[\w.\-]|[\w.\-]+\/[\w.\/\-]*\.[\w]+)(?::(\d+)|#L(\d+))?/g;
 
 // Detects if a match is inside a URL by checking preceding text for ://
 const URL_CONTEXT_RE = /\w+:\/\/\S*$/;
+const URL_PROTOCOL_PREFIX_RE = /\w+:$/;
+
+function splitTrailingFileRefPunctuation(source: string): { value: string; trailing: string } {
+  const match = source.match(TRAILING_FILE_REF_PUNCT_RE);
+  if (!match) return { value: source, trailing: "" };
+  return {
+    value: source.slice(0, -match[0].length),
+    trailing: match[0],
+  };
+}
+
+function renderAbsoluteLocalFileRefCandidate(source: string): string | null {
+  const { value, trailing } = splitTrailingFileRefPunctuation(source);
+  const parsed = splitInlineCodePathSuffix(value);
+  if (!parsed || !isUsableAbsoluteLocalRefPath(parsed.path)) return null;
+  return `${renderLocalFileRef(parsed.path, parsed.line)}${trailing}`;
+}
 
 export function injectFileRefs(html: string): string {
   return walkHtmlText(html, (text) => {
@@ -506,7 +589,19 @@ export function injectFileRefs(html: string): string {
       0,
     );
 
-    const injected = looseUnityRefs.replace(FILE_REF_RE, (match, lineColon, lineHash, offset, fullText) => {
+    const quotedLocalRefs = looseUnityRefs.replace(QUOTED_LOCAL_FILE_REF_RE, (match, _quote, path) => {
+      const rendered = renderAbsoluteLocalFileRefCandidate(path);
+      return rendered ? stashRef(rendered) : match;
+    });
+
+    const localRefs = quotedLocalRefs.replace(ABSOLUTE_LOCAL_FILE_REF_RE, (match, path, offset, fullText) => {
+      const preceding = fullText.slice(0, offset);
+      if (URL_CONTEXT_RE.test(preceding) || URL_PROTOCOL_PREFIX_RE.test(preceding)) return match;
+      const rendered = renderAbsoluteLocalFileRefCandidate(path);
+      return rendered ? stashRef(rendered) : match;
+    });
+
+    const injected = localRefs.replace(FILE_REF_RE, (match, lineColon, lineHash, offset, fullText) => {
       // Skip matches that are part of a URL
       const preceding = fullText.slice(0, offset);
       if (URL_CONTEXT_RE.test(preceding)) return match;
@@ -521,7 +616,7 @@ export function injectFileRefs(html: string): string {
       if (ASSET_ROOT_RE.test(filePath)) {
         return renderUnityAssetRef(filePath, line);
       }
-      return renderFileRef(filePath, line);
+      return renderLocalFileRef(filePath, line);
     });
     return injected.replace(/\u0000mdref:(\d+)\u0000/g, (_match, index) => refs[Number(index)] ?? "");
   });

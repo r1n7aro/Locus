@@ -6,6 +6,7 @@ import {
   selectUnitySceneObject,
   openUnitySceneObjectInspector,
   classifyUnitySceneObjectError,
+  openFileExternal,
 } from "../services/unity";
 import { knowledgeRevealTarget } from "../services/knowledge";
 import { normalizeAppError } from "../services/errors";
@@ -78,6 +79,7 @@ const iconKind = computed(() =>
 );
 
 const iconNode = computed(() => unityAssetIconNodeForKind(iconKind.value));
+const unitySelectableAsset = computed(() => /^(Assets|Packages)\//i.test(normalizedPath.value));
 
 async function handleClick(e: MouseEvent) {
   try {
@@ -98,7 +100,11 @@ async function handleClick(e: MouseEvent) {
       await selectUnitySceneObject(scenePath, objectPath);
       return;
     }
-    await selectUnityAsset(props.path);
+    if (unitySelectableAsset.value) {
+      await selectUnityAsset(props.path);
+      return;
+    }
+    await openFileExternal(props.path);
   } catch (error) {
     if (knowledgeRef.value) {
       notifyKnowledgeRefError(error);

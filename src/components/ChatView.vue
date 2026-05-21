@@ -477,6 +477,13 @@ function assetContextTargetFromElement(target: Element): AssetRefContextMenuTarg
         assetPath,
       };
     }
+    if (assetPath) {
+      return {
+        kind: "file",
+        filePath: assetPath,
+        entryKind: unityAssetRef.dataset.entryKind === "folder" ? "folder" : "file",
+      };
+    }
   }
 
   const workspaceAssetRef = target.closest(".md-workspace-ref[data-workspace-path]") as HTMLElement | null;
@@ -492,7 +499,9 @@ function assetContextTargetFromElement(target: Element): AssetRefContextMenuTarg
       return {
         kind: "file",
         filePath,
-        entryKind: workspaceAssetRef?.dataset.entryKind === "folder" ? "folder" : "file",
+        entryKind: (fileRef?.dataset.entryKind || workspaceAssetRef?.dataset.entryKind) === "folder"
+          ? "folder"
+          : "file",
       };
     }
     if (workspacePath && workspaceAssetRef?.dataset.entryKind === "folder") {
@@ -578,6 +587,10 @@ function handleContentClick(e: MouseEvent) {
     e.preventDefault();
     const filePath = fileRef.dataset.filePath;
     if (!filePath) return;
+    if (fileRef.dataset.entryKind === "folder") {
+      handleFolderRefClick(filePath);
+      return;
+    }
     const assetPath = fileRef.dataset.assetPath || filePath;
     if (shouldOpenUnityAssetInspector(e, assetPath)) {
       handleUnityAssetInspectorClick(assetPath);
