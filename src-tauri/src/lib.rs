@@ -91,7 +91,7 @@ use asset_db::watcher::AssetDbWatcher;
 pub use asset_db::AssetDbState;
 use auth::codex::CodexAuthState;
 use auth::AuthState;
-use commands::{CanvasSpecStore, CodexAuthStateHandle};
+use commands::CodexAuthStateHandle;
 use config::AppConfig;
 
 pub type AssetDbWatcherHandle = Arc<std::sync::Mutex<Option<AssetDbWatcher>>>;
@@ -294,8 +294,11 @@ pub fn run() {
             println!("[Locus] codex auth state initialized");
             startup_for_setup.mark("setup_auth_state_ready");
 
+            let app_temp_dir = commands::set_app_temp_dir_override(data_dir.join("temp"))
+                .map_err(|e| format!("Failed to prepare app temp dir: {}", e))?;
+            let tool_results_root = app_temp_dir.join("tool-results");
             let store = Arc::new(
-                SessionStore::new(&data_dir)
+                SessionStore::new_with_tool_results_root(&data_dir, tool_results_root)
                     .map_err(|e| format!("Failed to initialize SessionStore: {}", e))?,
             );
             startup_for_setup.mark("setup_session_store_ready");
@@ -469,9 +472,6 @@ pub fn run() {
                 ToolPermissions(Arc::new(tokio::sync::RwLock::new(initial_tool_perms)));
             startup_for_setup.mark("setup_permissions_ready");
 
-            let canvas_spec_store: CanvasSpecStore =
-                Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-
             let unity_monitor: UnityMonitorHandle = Arc::new(tokio::sync::Mutex::new(None));
 
             let last_scan_info_state = commands::asset::LastScanInfoState::new();
@@ -569,9 +569,7 @@ pub fn run() {
                     workspace_generation,
                 );
                 let cancel_token = registration.cancel_token();
-                scan_phase_state.set(Some(asset_db::types::ScanPhase::Reconcile {
-                    verify_hashes: true,
-                }));
+                scan_phase_state.set(Some(asset_db::types::ScanPhase::reconcile_started(true)));
                 let app_handle_for_reconcile = app.handle().clone();
                 let scan_phase_state_for_reconcile = scan_phase_state.clone();
                 let workspace_for_reconcile = workspace.clone();
@@ -579,11 +577,22 @@ pub fn run() {
                     let _registration = registration;
                     startup_for_reconcile.mark("asset_reconcile_task_start");
                     let started_at = Instant::now();
-                    match asset_db::watcher::reconcile_graph_state_with_cancel(
+                    let app_handle_for_progress = app_handle_for_reconcile.clone();
+                    let scan_phase_state_for_progress = scan_phase_state_for_reconcile.clone();
+                    let workspace_for_progress = workspace_for_reconcile.clone();
+                    match asset_db::watcher::reconcile_graph_state_with_cancel_and_progress(
                         &project_root,
                         graph_state,
                         &cancel_token,
                         true,
+                        |progress| {
+                            if workspace_for_progress.generation() != workspace_generation {
+                                return;
+                            }
+                            let phase = progress.to_scan_phase();
+                            let _ = app_handle_for_progress.emit("ref-graph-scan", &phase);
+                            scan_phase_state_for_progress.set(Some(phase));
+                        },
                     ) {
                         Ok(stats) => {
                             if cancel_token.load(std::sync::atomic::Ordering::Relaxed)
@@ -697,7 +706,6 @@ pub fn run() {
             app.manage(dir_entries_cache);
             app.manage(question_store);
             app.manage(knowledge_proposal_drafts);
-            app.manage(canvas_spec_store);
             app.manage(undo_manager);
             app.manage(tool_permission_mode);
             app.manage(tool_permissions);
@@ -827,7 +835,10 @@ pub fn run() {
             commands::save_provider_key,
             commands::delete_provider_key,
             commands::get_app_storage_info,
+            commands::get_app_temp_info,
+            commands::clear_app_temp_dir,
             commands::open_app_storage_dir,
+            commands::open_app_temp_dir,
             commands::schedule_app_storage_migration,
             commands::clear_app_storage_migration,
             commands::get_working_dir,
@@ -967,6 +978,7 @@ pub fn run() {
             commands::list_skills,
             commands::read_skill_manifest,
             commands::create_skill_scaffold,
+            commands::delete_skill_package,
             commands::get_skill_unity_install_status,
             commands::install_skill_unity_files,
             commands::remove_skill_unity_files,
@@ -980,14 +992,6 @@ pub fn run() {
             commands::delete_rule,
             commands::set_rule_enabled,
             commands::set_rule_order,
-            commands::canvas_set_spec,
-            commands::canvas_get_spec,
-            commands::canvas_update_field,
-            commands::canvas_refresh,
-            commands::canvas_save,
-            commands::canvas_load,
-            commands::canvas_list,
-            commands::canvas_delete,
             commands::get_last_model,
             commands::save_last_model,
             commands::get_last_effort,

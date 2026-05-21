@@ -9,13 +9,17 @@ import { getCachedDebugMode, getDebugMode, setDebugMode } from "../../services/p
 import { gitRuntimeState, gitSaveRuntimeSelection } from "../../services/git";
 import { getPythonRuntimeState, savePythonRuntimeSelection } from "../../services/system";
 import {
+  clearAppTempDir,
   clearAppStorageMigration,
+  getAppTempInfo,
   getAppStorageInfo,
   openAppStorageDirectory,
+  openAppTempDirectory,
   scheduleAppStorageMigration,
 } from "../../services/storage";
 import type {
   AppStorageInfo,
+  AppTempInfo,
   GitRuntimeInfo,
   GitRuntimeState,
   PythonRuntimeInfo,
@@ -46,6 +50,10 @@ const storageInfo = ref<AppStorageInfo | null>(null);
 const storageBusy = ref(false);
 const storageInfoLoadFailed = ref(false);
 const storageSuccess = ref("");
+const tempInfo = ref<AppTempInfo | null>(null);
+const tempBusy = ref(false);
+const tempInfoLoadFailed = ref(false);
+const tempSuccess = ref("");
 const gitState = ref<GitRuntimeState | null>(null);
 const gitBusy = ref(false);
 const pythonState = ref<PythonRuntimeState | null>(null);
@@ -107,6 +115,7 @@ const hasAvailableGitOption = computed(() => gitOptions.value.some((option) => !
 onMounted(() => {
   void refreshDebugMode();
   void refreshStorageInfo();
+  void refreshTempInfo();
   void refreshGitRuntimeState(false);
   void refreshPythonRuntimeState(false);
 });
@@ -173,6 +182,51 @@ async function refreshStorageInfo() {
   }
 }
 
+async function refreshTempInfo() {
+  tempBusy.value = true;
+  try {
+    tempInfo.value = await getAppTempInfo();
+    tempInfoLoadFailed.value = false;
+  } catch (e) {
+    tempInfoLoadFailed.value = true;
+    const err = normalizeAppError(e);
+    notificationStore.addNotice("error", err.message, {
+      code: err.code,
+      operation: "loadTempInfo",
+    });
+  } finally {
+    tempBusy.value = false;
+  }
+}
+
+async function clearTempDirectory() {
+  if (tempBusy.value) return;
+  const confirmed = await confirm(
+    t("settings.general.tempClearConfirm"),
+    {
+      title: t("settings.general.tempFiles"),
+      kind: "warning",
+    },
+  );
+  if (!confirmed) return;
+
+  tempBusy.value = true;
+  tempSuccess.value = "";
+  try {
+    tempInfo.value = await clearAppTempDir();
+    tempInfoLoadFailed.value = false;
+    tempSuccess.value = t("settings.general.tempClearDone");
+  } catch (e) {
+    const err = normalizeAppError(e);
+    notificationStore.addNotice("error", err.message, {
+      code: err.code,
+      operation: "clearTempDir",
+    });
+  } finally {
+    tempBusy.value = false;
+  }
+}
+
 async function openStorageDirectory(path: string | null | undefined) {
   if (!path) return;
   try {
@@ -182,6 +236,19 @@ async function openStorageDirectory(path: string | null | undefined) {
     notificationStore.addNotice("error", err.message, {
       code: err.code,
       operation: "openStorageDirectory",
+    });
+  }
+}
+
+async function openTempDirectory(path: string | null | undefined) {
+  if (!path) return;
+  try {
+    await openAppTempDirectory();
+  } catch (e) {
+    const err = normalizeAppError(e);
+    notificationStore.addNotice("error", err.message, {
+      code: err.code,
+      operation: "openTempDirectory",
     });
   }
 }
@@ -489,6 +556,49 @@ async function selectPythonRuntime(selectedId: string) {
       </div>
     </div>
     <div v-if="storageSuccess" class="storage-success">{{ storageSuccess }}</div>
+  </div>
+
+  <div class="settings-section">
+    <div class="section-label">{{ t("settings.general.tempFiles") }}</div>
+    <p class="section-desc">{{ t("settings.general.tempFilesDesc") }}</p>
+    <div class="storage-block">
+      <div class="storage-row">
+        <span class="storage-label">{{ t("settings.general.storageCurrentPath") }}</span>
+        <code class="storage-path" :title="tempInfo?.path || ''">
+          {{ tempInfo?.path || (tempBusy ? t("common.loading") : "—") }}
+        </code>
+        <button
+          class="action-btn storage-btn"
+          :disabled="tempBusy || !tempInfo"
+          @click="openTempDirectory(tempInfo?.path)"
+        >
+          {{ t("settings.general.storageOpen") }}
+        </button>
+      </div>
+      <div class="storage-row">
+        <span class="storage-label">{{ t("settings.general.storageSize") }}</span>
+        <span class="storage-text">{{ tempInfo ? formatBytes(tempInfo.sizeBytes) : "—" }}</span>
+      </div>
+      <div v-if="tempInfoLoadFailed && !tempInfo && !tempBusy" class="storage-status">
+        <span class="storage-status-text">{{ t("settings.general.tempUnavailable") }}</span>
+        <button class="action-btn storage-btn" @click="refreshTempInfo">
+          {{ t("common.refresh") }}
+        </button>
+      </div>
+      <div class="storage-actions">
+        <button class="action-btn storage-btn" :disabled="tempBusy" @click="refreshTempInfo">
+          {{ t("common.refresh") }}
+        </button>
+        <button
+          class="action-btn storage-btn danger"
+          :disabled="tempBusy || !tempInfo || tempInfo.sizeBytes <= 0"
+          @click="clearTempDirectory"
+        >
+          {{ t("settings.general.tempClear") }}
+        </button>
+      </div>
+    </div>
+    <div v-if="tempSuccess" class="storage-success">{{ tempSuccess }}</div>
   </div>
 
   <div class="settings-section">

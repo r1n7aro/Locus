@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -32,7 +32,35 @@ pub(crate) fn persistent_config_dir() -> Result<std::path::PathBuf, String> {
     Ok(dir)
 }
 
+fn app_temp_dir_override() -> &'static Mutex<Option<std::path::PathBuf>> {
+    static OVERRIDE: OnceLock<Mutex<Option<std::path::PathBuf>>> = OnceLock::new();
+    OVERRIDE.get_or_init(|| Mutex::new(None))
+}
+
+pub(crate) fn set_app_temp_dir_override(
+    dir: std::path::PathBuf,
+) -> Result<std::path::PathBuf, String> {
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("Failed to create app temp directory: {}", e))?;
+    let dir = dunce::canonicalize(&dir).unwrap_or(dir);
+    let mut guard = app_temp_dir_override()
+        .lock()
+        .map_err(|e| format!("Failed to lock app temp directory override: {}", e))?;
+    *guard = Some(dir.clone());
+    Ok(dir)
+}
+
 pub(crate) fn app_temp_dir() -> Result<std::path::PathBuf, String> {
+    if let Some(dir) = app_temp_dir_override()
+        .lock()
+        .map_err(|e| format!("Failed to lock app temp directory override: {}", e))?
+        .clone()
+    {
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| format!("Failed to create app temp directory: {}", e))?;
+        return Ok(dir);
+    }
+
     let dir = persistent_config_dir()?.join("temp");
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("Failed to create app temp directory: {}", e))?;
@@ -174,9 +202,7 @@ fn spawn_background_asset_hash_reconcile(
     let cwd = project_root.display().to_string();
     let registration = reconcile_task_state.register(cwd.clone(), workspace_generation);
     let cancel_token = registration.cancel_token();
-    let phase = crate::asset_db::types::ScanPhase::Reconcile {
-        verify_hashes: true,
-    };
+    let phase = crate::asset_db::types::ScanPhase::reconcile_started(true);
 
     if !emit_asset_phase_if_current(
         &workspace,
@@ -194,12 +220,24 @@ fn spawn_background_asset_hash_reconcile(
         let root_for_task = project_root.clone();
         let graph_for_task = graph_state.clone();
         let cancel_for_task = cancel_token.clone();
+        let app_handle_for_progress = app_handle.clone();
+        let workspace_for_progress = workspace.clone();
+        let scan_phase_state_for_progress = scan_phase_state.clone();
         let result = tauri::async_runtime::spawn_blocking(move || {
-            crate::asset_db::watcher::reconcile_graph_state_with_cancel(
+            crate::asset_db::watcher::reconcile_graph_state_with_cancel_and_progress(
                 &root_for_task,
                 graph_for_task,
                 &cancel_for_task,
                 true,
+                |progress| {
+                    let _ = emit_asset_phase_if_current(
+                        &workspace_for_progress,
+                        workspace_generation,
+                        &app_handle_for_progress,
+                        &scan_phase_state_for_progress,
+                        progress.to_scan_phase(),
+                    );
+                },
             )
         })
         .await;
@@ -889,6 +927,10 @@ fn default_supports_tool_lazy_loading() -> bool {
     false
 }
 
+fn default_supports_vision() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CustomEndpoint {
@@ -913,6 +955,8 @@ pub struct CustomEndpoint {
     pub server_tools: CustomEndpointServerTools,
     #[serde(default = "default_supports_tool_lazy_loading")]
     pub supports_tool_lazy_loading: bool,
+    #[serde(default = "default_supports_vision")]
+    pub supports_vision: bool,
 }
 
 const DEFAULT_CUSTOM_ENDPOINT_CONTEXT_LENGTH: u32 = 256_000;
@@ -2352,6 +2396,7 @@ mod tests {
         assert_eq!(endpoints[0].replay_reasoning_content, Some(true));
         assert!(!endpoints[0].server_tools.web_search);
         assert!(!endpoints[0].supports_tool_lazy_loading);
+        assert!(endpoints[0].supports_vision);
     }
 
     #[test]
@@ -2372,6 +2417,24 @@ mod tests {
         normalize_custom_endpoint_config(&mut endpoints[0]);
 
         assert!(endpoints[0].server_tools.web_search);
+    }
+
+    #[test]
+    fn custom_endpoint_preserves_disabled_vision_setting() {
+        let raw = r#"[{
+            "id": "custom-1",
+            "name": "Text Only",
+            "apiModel": "local-text",
+            "endpoint": "http://localhost:8080/v1",
+            "apiFormat": "openai_chat",
+            "supportsVision": false
+        }]"#;
+
+        let mut endpoints: Vec<CustomEndpoint> =
+            serde_json::from_str(raw).expect("deserialize custom endpoint");
+        normalize_custom_endpoint_config(&mut endpoints[0]);
+
+        assert!(!endpoints[0].supports_vision);
     }
 
     #[test]

@@ -39,6 +39,13 @@ pub struct AppStorageInfo {
     pub restart_required: bool,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppTempInfo {
+    pub path: String,
+    pub size_bytes: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum DefaultStorageSelection {
     Default(PathBuf),
@@ -212,6 +219,51 @@ fn compute_dir_size(path: &Path) -> u64 {
         .filter_map(|entry| entry.metadata().ok())
         .map(|meta| meta.len())
         .sum()
+}
+
+fn clear_dir_contents(path: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(path).map_err(|e| {
+        format!(
+            "Failed to create temporary directory '{}': {}",
+            path.display(),
+            e
+        )
+    })?;
+    for entry in std::fs::read_dir(path).map_err(|e| {
+        format!(
+            "Failed to read temporary directory '{}': {}",
+            path.display(),
+            e
+        )
+    })? {
+        let entry = entry.map_err(|e| format!("Failed to read temporary entry: {}", e))?;
+        let entry_path = entry.path();
+        let file_type = entry.file_type().map_err(|e| {
+            format!(
+                "Failed to inspect temporary entry '{}': {}",
+                entry_path.display(),
+                e
+            )
+        })?;
+        if file_type.is_dir() {
+            std::fs::remove_dir_all(&entry_path).map_err(|e| {
+                format!(
+                    "Failed to remove temporary directory '{}': {}",
+                    entry_path.display(),
+                    e
+                )
+            })?;
+        } else {
+            std::fs::remove_file(&entry_path).map_err(|e| {
+                format!(
+                    "Failed to remove temporary file '{}': {}",
+                    entry_path.display(),
+                    e
+                )
+            })?;
+        }
+    }
+    Ok(())
 }
 
 fn move_file_or_dir(src: &Path, dst: &Path) -> Result<(), String> {
@@ -437,6 +489,19 @@ fn build_storage_info(app_handle: &AppHandle) -> Result<AppStorageInfo, String> 
     })
 }
 
+fn app_temp_dir_for_storage(app_handle: &AppHandle) -> Result<PathBuf, String> {
+    let temp = resolve_runtime_storage_dir(app_handle)?.join("temp");
+    super::set_app_temp_dir_override(temp)
+}
+
+fn build_temp_info(app_handle: &AppHandle) -> Result<AppTempInfo, String> {
+    let temp = app_temp_dir_for_storage(app_handle)?;
+    Ok(AppTempInfo {
+        path: temp.display().to_string(),
+        size_bytes: compute_dir_size(&temp),
+    })
+}
+
 pub(crate) fn resolve_runtime_storage_dir(app_handle: &AppHandle) -> Result<PathBuf, String> {
     let default = default_app_storage_dir(app_handle)?;
     if let Some(custom) = read_storage_override()? {
@@ -510,9 +575,45 @@ pub async fn get_app_storage_info(app_handle: AppHandle) -> Result<AppStorageInf
 }
 
 #[tauri::command]
+pub async fn get_app_temp_info(app_handle: AppHandle) -> Result<AppTempInfo, AppError> {
+    tauri::async_runtime::spawn_blocking(move || build_temp_info(&app_handle))
+        .await
+        .map_err(|e| {
+            AppError::new(
+                "temp.info_join_failed",
+                format!("Failed to load temporary file info: {}", e),
+            )
+        })?
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn clear_app_temp_dir(app_handle: AppHandle) -> Result<AppTempInfo, AppError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let temp = app_temp_dir_for_storage(&app_handle)?;
+        clear_dir_contents(&temp)?;
+        build_temp_info(&app_handle)
+    })
+    .await
+    .map_err(|e| {
+        AppError::new(
+            "temp.clear_join_failed",
+            format!("Failed to clear temporary files: {}", e),
+        )
+    })?
+    .map_err(Into::into)
+}
+
+#[tauri::command]
 pub async fn open_app_storage_dir(app_handle: AppHandle) -> Result<(), AppError> {
     let active = resolve_runtime_storage_dir(&app_handle)?;
     crate::commands::knowledge::open_file_native(&active).map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn open_app_temp_dir(app_handle: AppHandle) -> Result<(), AppError> {
+    let temp = app_temp_dir_for_storage(&app_handle)?;
+    crate::commands::knowledge::open_file_native(&temp).map_err(Into::into)
 }
 
 #[tauri::command]
