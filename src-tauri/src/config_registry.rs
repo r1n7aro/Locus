@@ -409,7 +409,6 @@ fn collect_permissions(app_handle: &tauri::AppHandle, out: &mut Vec<ConfigEntry>
         ("edit", "File editing (partial)"),
         ("bash", "Shell command execution"),
         ("web_fetch", "HTTP fetch from the web"),
-        ("canvas", "Canvas graph operations"),
         ("unity_execute", "Execute C# code in Unity"),
         ("unity_run_states", "Run Unity state-machine debugging flow"),
         ("unity_recompile", "Trigger Unity recompilation"),

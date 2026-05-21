@@ -303,53 +303,6 @@ pub(super) fn ask() -> ToolDef {
     }
 }
 
-// ─── canvas ──────────────────────────────────────────────────────────────────
-
-pub(super) fn canvas() -> ToolDef {
-    let prompt = crate::prompt::parse_tool_prompt(crate::prompt::tools::CANVAS);
-    ToolDef {
-        name: "canvas".to_string(),
-        description: prompt.description,
-        parameters: prompt.parameters,
-        execute: make_exec(|args, _ctx| {
-            Box::pin(async move {
-                let spec = match args.get("spec") {
-                    Some(s) => s.clone(),
-                    None => {
-                        return ToolResult {
-                            output: "Missing required parameter: spec".to_string(),
-                            is_error: true,
-                        }
-                    }
-                };
-
-                let node_count = spec
-                    .get("nodes")
-                    .and_then(|n| n.as_array())
-                    .map(|a| a.len())
-                    .unwrap_or(0);
-                let edge_count = spec
-                    .get("edges")
-                    .and_then(|e| e.as_array())
-                    .map(|a| a.len())
-                    .unwrap_or(0);
-                let title = spec
-                    .get("title")
-                    .and_then(|t| t.as_str())
-                    .unwrap_or("Canvas");
-
-                ToolResult {
-                    output: format!(
-                        "Canvas \"{}\" created ({} nodes, {} edges). The canvas spec is available in the tool arguments.",
-                        title, node_count, edge_count
-                    ),
-                    is_error: false,
-                }
-            })
-        }),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{html_to_markdown, render_web_fetch_content, truncate_utf8_prefix, WebFetchFormat};

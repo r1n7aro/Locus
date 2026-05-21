@@ -40,8 +40,6 @@ import {
   startCurrentWindowDragging,
 } from "./services/tauriRuntime";
 import { markStartupPhase } from "./services/startupPerf";
-const isCanvasWindow = window.location.pathname === '/canvas'
-                    || window.location.search.includes('specId=');
 const isUnityEmbedTestWindow = window.location.pathname === "/unity-embed-test";
 const isUnityEmbedWindow = !isUnityEmbedTestWindow
   && (window.location.pathname === "/unity-embed" || isUnityHostLocation());
@@ -52,8 +50,7 @@ const isUnityReferenceImportWindow = isUnityReferenceImportWindowLocation();
 const isReferenceExternalImportWindow = isReferenceExternalImportWindowLocation();
 const isCollabSearchWindow = isCollabSearchWindowLocation();
 const isChatDiffReviewWindow = isChatDiffReviewWindowLocation();
-const isStandaloneWindow = isCanvasWindow
-  || isUnityEmbedWindow
+const isStandaloneWindow = isUnityEmbedWindow
   || isUnityEmbedTestWindow
   || isKnowledgeDownloadWindow
   || isKnowledgeLexicalProgressWindow
@@ -63,7 +60,6 @@ const isStandaloneWindow = isCanvasWindow
   || isCollabSearchWindow
   || isChatDiffReviewWindow;
 
-const CanvasView = defineAsyncComponent(() => import("./components/CanvasView.vue"));
 const KnowledgeDownloadProgressWindow = defineAsyncComponent(() => import("./components/KnowledgeDownloadProgressWindow.vue"));
 const KnowledgeLexicalProgressWindow = defineAsyncComponent(() => import("./components/KnowledgeLexicalProgressWindow.vue"));
 const FeishuReferenceImportProgressWindow = defineAsyncComponent(() => import("./components/FeishuReferenceImportProgressWindow.vue"));
@@ -76,11 +72,8 @@ const UnityEmbedTestView = defineAsyncComponent(() => import("./components/Unity
 const OnboardingView = defineAsyncComponent(() => import("./components/OnboardingView.vue"));
 const FileDiffOverlay = defineAsyncComponent(() => import("./components/diff/FileDiffOverlay.vue"));
 
-// Initialize theme & fonts for app-token windows; Canvas keeps its own styles.
-if (!isCanvasWindow) {
-  initTheme(isUnityEmbedWindow ? "unityEmbed" : "main");
-  initFonts();
-}
+initTheme(isUnityEmbedWindow ? "unityEmbed" : "main");
+initFonts();
 
 // -- Stores --
 const uiStore = useUiStore();
@@ -594,9 +587,8 @@ watch(() => projectStore.workingDir, () => {
 </script>
 
 <template>
-  <CanvasView v-if="isCanvasWindow" />
   <UnityEmbeddedSessionView
-    v-else-if="isUnityEmbedWindow"
+    v-if="isUnityEmbedWindow"
     :bootstrapped="unityEmbedBootstrapped"
     :bootstrap-error="unityEmbedBootstrapError"
   />

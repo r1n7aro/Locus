@@ -23,10 +23,6 @@ vi.mock("@tauri-apps/api/webviewWindow", () => ({
   },
 }));
 
-vi.mock("../services/canvas", () => ({
-  canvasSetSpec: vi.fn(),
-}));
-
 vi.mock("../stores/ui", () => ({
   useUiStore: () => uiStoreMock,
 }));
@@ -208,7 +204,6 @@ describe("useAppBootstrap onboarding completion", () => {
       sessions: [],
       refreshSessions: vi.fn().mockResolvedValue(undefined),
       loadToolPermissionMode: vi.fn().mockResolvedValue(undefined),
-      setCanvasAutoOpenCallback: vi.fn(),
       handleStreamEvent: vi.fn().mockReturnValue(true),
       cleanupAnim: vi.fn(),
     });

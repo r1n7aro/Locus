@@ -73,7 +73,6 @@ describe("selection source policy", () => {
   it("routes drag selection lock through the shared helper", () => {
     const helperUsers = [
       "src/components/AgentView.vue",
-      "src/components/CanvasView.vue",
       "src/components/ChatView.vue",
       "src/components/collab/MergeSemanticView.vue",
       "src/components/collab/StagingArea.vue",

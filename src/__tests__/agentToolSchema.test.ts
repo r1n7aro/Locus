@@ -42,8 +42,8 @@ describe("parseAgentToolDefinition", () => {
   it("flattens nested object and array schema paths", () => {
     const tool = parseAgentToolDefinition({
       function: {
-        name: "canvas",
-        description: "Canvas tool",
+        name: "nested_tool",
+        description: "Nested tool",
         parameters: {
           type: "object",
           properties: {

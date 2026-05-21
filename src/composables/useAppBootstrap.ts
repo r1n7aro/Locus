@@ -1,6 +1,4 @@
 import { watch } from "vue";
-import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
-import { canvasSetSpec } from "../services/canvas";
 import { useUiStore } from "../stores/ui";
 import { useAuthStore } from "../stores/auth";
 import { useAgentStore } from "../stores/agent";
@@ -139,32 +137,6 @@ export function useAppBootstrap() {
       if (tab === "chat" && !skillsLoaded) {
         loadSkills();
         skillsLoaded = true;
-      }
-    },
-  );
-
-  // Canvas auto-open (UI shell behavior, not in chat store)
-  chatStore.setCanvasAutoOpenCallback(
-    async (toolCallId: string, spec: unknown) => {
-      try {
-        const specId = toolCallId;
-        await canvasSetSpec(specId, JSON.stringify(spec));
-        const win = new WebviewWindow(`canvas-${specId}`, {
-          url: `/canvas?specId=${specId}`,
-          title: `Canvas: ${(spec as any).title || "Canvas"}`,
-          width: 1200,
-          height: 800,
-          minWidth: 600,
-          minHeight: 400,
-          decorations: true,
-          resizable: true,
-          center: true,
-        });
-        win.once("tauri://error", (e) =>
-          console.error("Canvas auto-open error:", e),
-        );
-      } catch {
-        /* ignore */
       }
     },
   );

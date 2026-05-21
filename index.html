@@ -48,9 +48,7 @@
   <body>
     <script>
       // Apply theme before Vue mounts to prevent flash of wrong theme.
-      // Canvas windows (/canvas or ?specId=) keep their own styles.
       (function(){
-        if(/\/canvas|specId=/.test(location.pathname+location.search))return;
         var params=new URLSearchParams(location.search);
         var isUnityEmbed=location.pathname!=='/unity-embed-test'&&
           (location.pathname==='/unity-embed'||params.get('host')==='unity');

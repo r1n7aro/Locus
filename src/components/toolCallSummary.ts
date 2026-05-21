@@ -63,14 +63,6 @@ export function buildToolCallArgsSummary(toolName: string, argumentsText: string
       return desc.slice(0, 57) + "...";
     }
 
-    const spec = args.spec;
-    if (toolName === "canvas" && spec && typeof spec === "object" && !Array.isArray(spec)) {
-      const specRecord = spec as ToolCallArguments;
-      const nodes = Array.isArray(specRecord.nodes) ? specRecord.nodes.length : 0;
-      const edges = Array.isArray(specRecord.edges) ? specRecord.edges.length : 0;
-      return `${getStringArg(specRecord, ["title"]) || "Canvas"} (${nodes} nodes, ${edges} edges)`;
-    }
-
     if (toolName === "web_fetch") {
       return getStringArg(args, ["url"]);
     }
