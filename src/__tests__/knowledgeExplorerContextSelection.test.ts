@@ -48,6 +48,7 @@ describe("KnowledgeExplorer contextual selection", () => {
     expect(explorer).toContain('emit("renameDocument", draft.relativePath, name, props.activeType);');
     expect(explorer).toContain('emit("copyRelativePath", menu.node);');
     expect(explorer).toContain('emit("openInFileSystem", menu.node);');
+    expect(explorer).toContain('t("knowledge.explorer.deletePackage")');
     expect(explorer).toContain('t("knowledge.explorer.copyRelativePath")');
     expect(explorer).toContain('t("knowledge.explorer.openInFileSystem")');
   });

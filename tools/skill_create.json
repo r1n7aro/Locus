@@ -1,5 +1,5 @@
 {
-  "description": "Create a project Skill document or an app Skill package with explicit metadata. Use this instead of `knowledge_create` whenever the target is a Skill. Returns a plain-text status line with the created Skill path and command trigger.",
+  "description": "Create a project Skill document or an app Skill package with explicit metadata. Use this instead of `knowledge_create` whenever the target is a Skill. Dependency-bearing Skills that require CLI tools, binaries, scripts, Unity C# files, or package-local runtime assets must use `kind: \"package\"`. Returns a plain-text status line with the created Skill path and command trigger.",
   "parameters": {
     "type": "object",
     "additionalProperties": false,
@@ -7,7 +7,7 @@
       "kind": {
         "type": "string",
         "enum": ["md", "package"],
-        "description": "Create a single Markdown Skill document (`md`) or an app-installed Skill package (`package`)."
+        "description": "Create a single Markdown Skill document (`md`) only for text-only SOPs, or an app-installed Skill package (`package`) for Skills with dependencies such as CLI tools, binaries, scripts, Unity C# files, or bundled docs/assets."
       },
       "name": {
         "type": "string",

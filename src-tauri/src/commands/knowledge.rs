@@ -21,10 +21,10 @@ use crate::knowledge_index::{
 use crate::knowledge_store::{
     self, KnowledgeCreateRequest, KnowledgeDeleteRequest, KnowledgeDirectoryConfig,
     KnowledgeDirectoryConfigPatch, KnowledgeDirectoryConfigRecord, KnowledgeDocumentPatch,
-    KnowledgeEditRequest, KnowledgeExternalDirectoryBinding, KnowledgeListItem,
-    KnowledgeMoveRequest, KnowledgeMutationResponse, KnowledgeReadRequest, KnowledgeReadResponse,
-    KnowledgeSearchHit, KnowledgeSourceProvider, KnowledgeTargetKind, KnowledgeType,
-    KnowledgeUpdateOp, KnowledgeUpdateRequest, SkillSurface,
+    KnowledgeEditRequest, KnowledgeExternalDirectoryBinding, KnowledgeInjectMode,
+    KnowledgeListItem, KnowledgeMoveRequest, KnowledgeMutationResponse, KnowledgeReadRequest,
+    KnowledgeReadResponse, KnowledgeSearchHit, KnowledgeSourceProvider, KnowledgeTargetKind,
+    KnowledgeType, KnowledgeUpdateOp, KnowledgeUpdateRequest, SkillSurface,
 };
 use crate::tool::ToolRegistry;
 use crate::unity_docs::{
@@ -325,6 +325,8 @@ pub struct SkillConfig {
     pub description: String,
     #[serde(default)]
     pub command_trigger: String,
+    #[serde(default)]
+    pub inject_mode: KnowledgeInjectMode,
 }
 
 fn default_true() -> bool {
@@ -338,6 +340,7 @@ impl Default for SkillConfig {
             surface: SkillSurface::Command,
             description: String::new(),
             command_trigger: String::new(),
+            inject_mode: KnowledgeInjectMode::None,
         }
     }
 }
@@ -350,13 +353,38 @@ fn skill_config_path(working_dir: &str) -> std::path::PathBuf {
 }
 
 fn normalize_skill_config_key(rel_path: &str, source: Option<&str>) -> String {
-    if let Some(skill_path) = rel_path
-        .strip_prefix("skill/")
-        .and_then(|rest| rest.strip_suffix(".md"))
-    {
-        return format!("{}:skill/{}", source.unwrap_or("project"), skill_path);
+    let normalized = rel_path
+        .trim()
+        .replace('\\', "/")
+        .trim_matches('/')
+        .to_string();
+    if normalized.contains(":skill/") {
+        return normalized;
     }
-    rel_path.to_string()
+
+    if let Some(rest) = normalized.strip_prefix("skill/") {
+        let skill_path = rest
+            .strip_suffix("/SKILL.md")
+            .or_else(|| rest.strip_suffix("/SKILL"))
+            .or_else(|| rest.strip_suffix(".md"))
+            .unwrap_or(rest);
+        if !skill_path.trim().is_empty() {
+            return format!("{}:skill/{}", source.unwrap_or("project"), skill_path);
+        }
+    }
+
+    if let Some(source) = source {
+        let skill_path = normalized
+            .strip_suffix("/SKILL.md")
+            .or_else(|| normalized.strip_suffix("/SKILL"))
+            .or_else(|| normalized.strip_suffix(".md"))
+            .unwrap_or(&normalized);
+        if !skill_path.trim().is_empty() {
+            return format!("{}:skill/{}", source, skill_path);
+        }
+    }
+
+    normalized
 }
 
 pub fn load_skill_config(working_dir: &str) -> std::collections::HashMap<String, SkillConfig> {
@@ -402,20 +430,23 @@ pub async fn set_skill_config(
     surface: SkillSurface,
     description: String,
     command_trigger: String,
+    inject_mode: Option<KnowledgeInjectMode>,
     workspace: State<'_, Arc<Workspace>>,
 ) -> Result<(), AppError> {
     let working_dir = workspace.path.read().await.clone();
     let mut map = load_skill_config(&working_dir);
     let key = normalize_skill_config_key(&rel_path, source.as_deref());
-    map.insert(
-        key,
-        SkillConfig {
-            enabled,
-            surface,
-            description,
-            command_trigger: command_trigger.trim().to_string(),
-        },
-    );
+    let existing = map.get(&key).cloned().unwrap_or_default();
+    let config = SkillConfig {
+        enabled,
+        surface,
+        description,
+        command_trigger: command_trigger.trim().to_string(),
+        inject_mode: inject_mode.unwrap_or(existing.inject_mode),
+    };
+    let fallback = super::skill::fallback_command_name_for_skill_ref(&key);
+    let config = super::skill::normalize_and_validate_skill_config(&config, &fallback)?;
+    map.insert(key, config);
     save_skill_config(&working_dir, &map).map_err(Into::into)
 }
 
@@ -806,12 +837,40 @@ pub(crate) fn execute_knowledge_read_request(
 
     match request.kind {
         KnowledgeTargetKind::Document => {
+            let requested_part = request.part.as_deref().unwrap_or("full");
+            let inferred_type = parse_knowledge_type_from_path(&request.path);
+            let requested_type = match (request.doc_type, inferred_type) {
+                (Some(explicit), Some(inferred)) if explicit != inferred => {
+                    return Err(
+                        "knowledge document path type prefix does not match the explicit type."
+                            .to_string(),
+                    );
+                }
+                (Some(explicit), _) => Some(explicit),
+                (None, inferred) => inferred,
+            };
+            if requested_type == Some(KnowledgeType::Skill) {
+                let virtual_path = normalize_knowledge_directory_path(&request.path)?;
+                if let Some(result) = super::skill::read_skill_package_document_sync(
+                    working_dir,
+                    &virtual_path,
+                    requested_part,
+                )? {
+                    return Ok(KnowledgeReadResponse {
+                        kind: KnowledgeTargetKind::Document,
+                        document: Some(result),
+                        directory: None,
+                    });
+                }
+            }
+
             let (doc_type, normalized_path) =
                 resolve_knowledge_document_target(request.doc_type, &request.path)?;
             if doc_type == KnowledgeType::Skill {
                 if let Some(result) = super::skill::read_skill_package_document_sync(
+                    working_dir,
                     &normalized_path,
-                    request.part.as_deref().unwrap_or("full"),
+                    requested_part,
                 )? {
                     return Ok(KnowledgeReadResponse {
                         kind: KnowledgeTargetKind::Document,
@@ -826,7 +885,7 @@ pub(crate) fn execute_knowledge_read_request(
                 app_knowledge_dir,
                 doc_type,
                 &normalized_path,
-                request.part.as_deref().unwrap_or("full"),
+                requested_part,
             )?;
             Ok(KnowledgeReadResponse {
                 kind: KnowledgeTargetKind::Document,
@@ -1859,9 +1918,12 @@ pub async fn knowledge_list(
             .map(|item| item.path.clone())
             .collect::<HashSet<_>>();
         items.extend(
-            super::skill::list_skill_package_knowledge_items_sync(resolved_prefix.as_deref())
-                .into_iter()
-                .filter(|item| !existing_paths.contains(&item.path)),
+            super::skill::list_skill_package_knowledge_items_sync(
+                &working_dir,
+                resolved_prefix.as_deref(),
+            )
+            .into_iter()
+            .filter(|item| !existing_paths.contains(&item.path)),
         );
         items.sort_by(|a, b| {
             a.doc_type
@@ -2528,6 +2590,22 @@ fn validate_workspace_path(
     Ok(canonical)
 }
 
+fn is_absolute_local_path(file_path: &str) -> bool {
+    let path = std::path::Path::new(file_path);
+    path.is_absolute() || file_path.starts_with("\\\\")
+}
+
+fn resolve_openable_file_ref_path(
+    file_path: &str,
+    working_dir: &str,
+) -> Result<std::path::PathBuf, AppError> {
+    if is_absolute_local_path(file_path) {
+        return canonicalize_existing_path(std::path::Path::new(file_path));
+    }
+
+    validate_workspace_path(file_path, working_dir)
+}
+
 /// Resolve a workspace-relative path for "show in folder" behavior.
 /// Existing files are revealed directly; missing files fall back to the nearest
 /// existing parent directory within the workspace.
@@ -2564,6 +2642,34 @@ fn resolve_workspace_reveal_path(
     }
 
     Ok(workspace_canonical)
+}
+
+fn resolve_absolute_reveal_path(file_path: &str) -> Result<std::path::PathBuf, AppError> {
+    let full = std::path::Path::new(file_path);
+    if full.exists() {
+        return canonicalize_existing_path(full);
+    }
+
+    let mut candidate = full.parent();
+    while let Some(path) = candidate {
+        if path.exists() {
+            return canonicalize_existing_path(path);
+        }
+        candidate = path.parent();
+    }
+
+    Err(format!("Path not found: {}", file_path).into())
+}
+
+fn resolve_file_ref_reveal_path(
+    file_path: &str,
+    working_dir: &str,
+) -> Result<std::path::PathBuf, AppError> {
+    if is_absolute_local_path(file_path) {
+        return resolve_absolute_reveal_path(file_path);
+    }
+
+    resolve_workspace_reveal_path(file_path, working_dir)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2627,6 +2733,28 @@ fn resolve_knowledge_reveal_path(
         return canonicalize_existing_path(&workspace_path);
     }
 
+    if doc_type == KnowledgeType::Skill {
+        match kind {
+            KnowledgeTargetKind::Document => {
+                if let Some(package_path) =
+                    super::skill::resolve_skill_package_document_path_sync(&normalized_path)
+                        .map_err(AppError::from)?
+                {
+                    return canonicalize_existing_path(&package_path);
+                }
+            }
+            KnowledgeTargetKind::Directory => {
+                if !normalized_path.contains('/') {
+                    if let Ok(package_root) =
+                        super::skill::resolve_skill_package_root_sync(&normalized_path)
+                    {
+                        return canonicalize_existing_path(&package_root);
+                    }
+                }
+            }
+        }
+    }
+
     if kind == KnowledgeTargetKind::Document
         && doc_type == KnowledgeType::Reference
         && unity_docs::is_unity_reference_managed_relative_path(&normalized_path)
@@ -2673,7 +2801,7 @@ pub async fn open_file_external(
     workspace: State<'_, Arc<Workspace>>,
 ) -> Result<(), AppError> {
     let working_dir = workspace.path.read().await.clone();
-    let canonical = validate_workspace_path(&file_path, &working_dir)?;
+    let canonical = resolve_openable_file_ref_path(&file_path, &working_dir)?;
 
     if !canonical.exists() {
         return Err(format!("File not found: {}", file_path).into());
@@ -2688,7 +2816,7 @@ pub async fn reveal_workspace_file(
     workspace: State<'_, Arc<Workspace>>,
 ) -> Result<(), AppError> {
     let working_dir = workspace.path.read().await.clone();
-    let reveal_path = resolve_workspace_reveal_path(&file_path, &working_dir)?;
+    let reveal_path = resolve_file_ref_reveal_path(&file_path, &working_dir)?;
     reveal_path_native(&reveal_path).map_err(Into::into)
 }
 
@@ -2795,7 +2923,7 @@ pub async fn preview_workspace_file(
     workspace: State<'_, Arc<Workspace>>,
 ) -> Result<WorkspaceFilePreview, AppError> {
     let working_dir = workspace.path.read().await.clone();
-    let canonical = match validate_workspace_path(&file_path, &working_dir) {
+    let canonical = match resolve_openable_file_ref_path(&file_path, &working_dir) {
         Ok(p) => p,
         Err(_) => {
             return Ok(WorkspaceFilePreview {
@@ -3475,6 +3603,45 @@ mod tests {
                 .unwrap();
 
         assert_eq!(resolved, dunce::canonicalize(assets_dir).unwrap());
+    }
+
+    #[test]
+    fn resolve_openable_file_ref_path_allows_absolute_file() {
+        let workspace = TempDir::new().unwrap();
+        let external = TempDir::new().unwrap();
+        let working_dir = workspace.path().to_string_lossy().to_string();
+        let file_path = external.path().join("locus-temp-test.txt");
+        std::fs::write(&file_path, "external").unwrap();
+
+        let resolved =
+            resolve_openable_file_ref_path(&file_path.to_string_lossy(), &working_dir).unwrap();
+
+        assert_eq!(resolved, dunce::canonicalize(file_path).unwrap());
+    }
+
+    #[test]
+    fn resolve_file_ref_reveal_path_allows_absolute_directory() {
+        let workspace = TempDir::new().unwrap();
+        let external = TempDir::new().unwrap();
+        let working_dir = workspace.path().to_string_lossy().to_string();
+
+        let resolved =
+            resolve_file_ref_reveal_path(&external.path().to_string_lossy(), &working_dir).unwrap();
+
+        assert_eq!(resolved, dunce::canonicalize(external.path()).unwrap());
+    }
+
+    #[test]
+    fn resolve_file_ref_reveal_path_falls_back_for_missing_absolute_child() {
+        let workspace = TempDir::new().unwrap();
+        let external = TempDir::new().unwrap();
+        let working_dir = workspace.path().to_string_lossy().to_string();
+        let missing = external.path().join("missing").join("file.txt");
+
+        let resolved =
+            resolve_file_ref_reveal_path(&missing.to_string_lossy(), &working_dir).unwrap();
+
+        assert_eq!(resolved, dunce::canonicalize(external.path()).unwrap());
     }
 
     #[test]

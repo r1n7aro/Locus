@@ -1,6 +1,15 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import type { ComponentPublicInstance } from "vue";
+import {
+  Check,
+  ChevronRight,
+  FileText,
+  Folder,
+  FolderOpen,
+  Package,
+  X,
+} from "lucide";
 import { t } from "../../i18n";
 import type { ExplorerNode } from "../../composables/useKnowledgeState";
 import type {
@@ -23,9 +32,12 @@ import {
   resolveKnowledgeContextSelection,
   resolveKnowledgeExplorerSelection,
 } from "./knowledgeExplorerSelection";
+import LucideIcon from "../icons/LucideIcon.vue";
 
 type FolderNode = Extract<ExplorerNode, { kind: "folder" }>;
+type PackageNode = Extract<ExplorerNode, { kind: "package" }>;
 type DocumentNode = Extract<ExplorerNode, { kind: "document" }>;
+type BranchNode = FolderNode | PackageNode;
 
 const props = defineProps<{
   tree: ExplorerNode[];
@@ -48,6 +60,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   (e: "selectDocument", document: DocumentNode["document"]): void;
+  (e: "selectPackage", document: PackageNode["document"]): void;
   (e: "selectSearchResult", result: KnowledgeSearchResult): void;
   (e: "selectFolderConfig", path: string): void;
   (e: "toggle", path: string): void;
@@ -88,6 +101,13 @@ type ContextMenuState =
       depth: number;
       expanded: boolean;
       childCount: number;
+      targetNodes: ExplorerNode[];
+    }
+  | {
+      x: number;
+      y: number;
+      kind: "package";
+      node: PackageNode;
       targetNodes: ExplorerNode[];
     }
   | {
@@ -159,6 +179,10 @@ const folderDisplayStats = computed(() =>
   buildFolderDisplayStats(props.tree, props.folderStats),
 );
 
+function isBranchNode(node: ExplorerNode): node is BranchNode {
+  return node.kind === "folder" || node.kind === "package";
+}
+
 const visibleRows = computed<VisibleEntry[]>(() => {
   const out: VisibleEntry[] = [];
   if (inlineCreate.value?.anchorPath === props.activeType) {
@@ -171,17 +195,17 @@ const visibleRows = computed<VisibleEntry[]>(() => {
 
   const walk = (nodes: ExplorerNode[]) => {
     for (const node of nodes) {
-      const expanded =
-        node.kind === "folder" ? props.isPathExpanded(node.path) : false;
+      const branch = isBranchNode(node);
+      const expanded = branch ? props.isPathExpanded(node.path) : false;
       const folderStats =
-        node.kind === "folder" ? folderDisplayStats.value.get(node.path) : null;
+        branch ? folderDisplayStats.value.get(node.path) : null;
       const folderLoaded =
         node.kind === "folder"
           ? props.folderDocumentsLoaded(node.relativePath)
           : false;
       const directChildCount =
         folderStats?.directChildCount ??
-        (node.kind === "folder" ? node.children.length : 0);
+        (branch ? node.children.length : 0);
       const descendantDocumentCount = folderStats?.descendantDocumentCount ?? 0;
       out.push({
         type: "row",
@@ -195,9 +219,10 @@ const visibleRows = computed<VisibleEntry[]>(() => {
           draft: inlineCreate.value,
         });
       }
-      if (node.kind === "folder" && expanded) {
+      if (branch && expanded) {
         walk(node.children);
         if (
+          node.kind === "folder" &&
           folderLoaded &&
           (props.hasMoreFolderDocuments(node.relativePath) ||
             props.folderDocumentsLoading(node.relativePath))
@@ -321,11 +346,15 @@ function rowClick(row: FlatRow, event: MouseEvent) {
     emit("toggle", row.node.path);
     return;
   }
+  if (row.node.kind === "package") {
+    emit("selectPackage", row.node.document);
+    return;
+  }
   emit("selectDocument", row.node.document);
 }
 
 function toggleExpansion(row: FlatRow) {
-  if (row.node.kind !== "folder") return;
+  if (!isBranchNode(row.node)) return;
   emit("toggle", row.node.path);
 }
 
@@ -381,6 +410,16 @@ function openContextMenu(event: MouseEvent, row: FlatRow) {
       depth: row.node.depth,
       expanded: row.expanded,
       childCount: row.directChildCount,
+      targetNodes,
+    };
+    return;
+  }
+  if (row.node.kind === "package") {
+    ctxMenu.value = {
+      x: event.clientX,
+      y: event.clientY,
+      kind: "package",
+      node: row.node,
       targetNodes,
     };
     return;
@@ -451,6 +490,8 @@ function parentDirectory(node: ExplorerNode): string {
   const path =
     node.kind === "folder"
       ? normalizeRelativePath(node.relativePath)
+      : node.kind === "package"
+        ? normalizeRelativePath(node.relativePath)
       : normalizeRelativePath(node.document.path);
   const segments = path.split("/").filter(Boolean);
   return segments.slice(0, -1).join("/");
@@ -458,11 +499,13 @@ function parentDirectory(node: ExplorerNode): string {
 
 function canDragNode(node: ExplorerNode): boolean {
   if (node.kind === "document") return true;
+  if (node.kind === "package") return false;
   return !!node.relativePath.trim();
 }
 
 function canDropOnDir(node: ExplorerNode, targetDir: string): boolean {
   const normalizedTargetDir = normalizeRelativePath(targetDir);
+  if (node.kind === "package") return false;
   if (node.kind === "document") {
     return parentDirectory(node) !== normalizedTargetDir;
   }
@@ -596,7 +639,7 @@ function createActionLabel(kind: InlineCreateState["kind"]): string {
 
 function openExternalImportFolderDialog() {
   if (!ctxMenu.value || props.activeType !== "reference") return;
-  if (ctxMenu.value.kind === "leaf") return;
+  if (ctxMenu.value.kind === "leaf" || ctxMenu.value.kind === "package") return;
   const parentDir =
     ctxMenu.value.kind === "folder" ? ctxMenu.value.parentDir : "";
   closeContextMenu();
@@ -605,7 +648,7 @@ function openExternalImportFolderDialog() {
 
 async function openCreateInline(kind: InlineCreateState["kind"]) {
   if (!ctxMenu.value) return;
-  if (ctxMenu.value.kind === "leaf") return;
+  if (ctxMenu.value.kind === "leaf" || ctxMenu.value.kind === "package") return;
   closeInlineRename();
 
   if (ctxMenu.value.kind === "folder" && !ctxMenu.value.expanded) {
@@ -627,7 +670,13 @@ async function openCreateInline(kind: InlineCreateState["kind"]) {
 
 async function startRenameSelection() {
   const menu = ctxMenu.value;
-  if (!menu || menu.kind === "root" || menu.targetNodes.length !== 1) return;
+  if (
+    !menu ||
+    menu.kind === "root" ||
+    menu.kind === "package" ||
+    menu.targetNodes.length !== 1
+  )
+    return;
   closeInlineCreate();
   inlineRename.value =
     menu.kind === "folder"
@@ -798,12 +847,44 @@ function isBuiltinSkillGroupFolder(node: FolderNode): boolean {
   return props.activeType === "skill" && node.depth === 1 && node.relativePath === "builtin";
 }
 
+function documentKindIconClass(node: DocumentNode): string {
+  return node.document.type === "skill" ? "skill-document" : "document";
+}
+
+function packageTags(node: PackageNode): Array<{
+  text: string;
+  tone: "external" | "auto";
+  title: string;
+}> {
+  const tags: Array<{
+    text: string;
+    tone: "external" | "auto";
+    title: string;
+  }> = [
+    {
+      text: "PKG",
+      tone: "external",
+      title: t("knowledge.skillPackage.badge"),
+    },
+  ];
+  const trigger = node.document.commandTrigger?.trim();
+  if (trigger) {
+    tags.push({
+      text: trigger.length > 10 ? `${trigger.slice(0, 9)}...` : trigger,
+      tone: "auto",
+      title: t("knowledge.skill.commandTrigger"),
+    });
+  }
+  return tags;
+}
+
 function deleteMenuLabel(
-  menu: Extract<ContextMenuState, { kind: "folder" | "leaf" }>,
+  menu: Extract<ContextMenuState, { kind: "folder" | "leaf" | "package" }>,
 ): string {
   if (menu.targetNodes.length > 1) {
     return t("knowledge.explorer.deleteMany", menu.targetNodes.length);
   }
+  if (menu.kind === "package") return t("knowledge.explorer.deletePackage");
   return menu.kind === "folder"
     ? t("knowledge.ctx.deleteFolder")
     : t("knowledge.explorer.delete");
@@ -905,7 +986,8 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
               class="kx-row-shell"
               :class="{
                 'kx-folder': entry.row.node.kind === 'folder',
-                'kx-leaf': entry.row.node.kind !== 'folder',
+                'kx-package': entry.row.node.kind === 'package',
+                'kx-leaf': entry.row.node.kind === 'document',
                 selected:
                   selectedPath === entry.row.node.path ||
                   selectedPaths.has(entry.row.node.path),
@@ -932,27 +1014,22 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
               >
                 <span
                   v-if="
-                    entry.row.node.kind === 'folder' &&
+                    entry.row.node.kind !== 'document' &&
                     entry.row.directChildCount > 0
                   "
                   class="kx-branch-slot"
                   @click.stop="toggleExpansion(entry.row)"
                 >
-                  <svg
+                  <LucideIcon
                     class="kx-chevron"
                     :class="{ open: entry.row.expanded }"
-                    viewBox="0 0 16 16"
-                    width="10"
-                    height="10"
-                    fill="currentColor"
-                  >
-                    <path
-                      d="M6.22 3.22a.75.75 0 0 1 1.06 0l4.25 4.25a.75.75 0 0 1 0 1.06l-4.25 4.25a.75.75 0 0 1-1.06-1.06L9.94 8 6.22 4.28a.75.75 0 0 1 0-1.06z"
-                    />
-                  </svg>
+                    :icon="ChevronRight"
+                    :size="10"
+                    :stroke-width="2.4"
+                  />
                 </span>
                 <span
-                  v-else-if="entry.row.node.kind === 'folder'"
+                  v-else-if="entry.row.node.kind !== 'document'"
                   class="kx-branch-spacer"
                   aria-hidden="true"
                 ></span>
@@ -962,30 +1039,27 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
                   :class="{ open: entry.row.expanded }"
                   aria-hidden="true"
                 >
-                  <svg
-                    viewBox="0 0 16 16"
-                    width="13"
-                    height="13"
-                    fill="none"
-                  >
-                    <path
-                      v-if="!entry.row.expanded"
-                      d="M2.25 4.5A1.25 1.25 0 0 1 3.5 3.25h2.1c.32 0 .62.13.84.36l.8.82c.14.15.34.23.55.23h4.71A1.25 1.25 0 0 1 13.75 5.9v5.6a1.25 1.25 0 0 1-1.25 1.25H3.5a1.25 1.25 0 0 1-1.25-1.25V4.5Z"
-                      fill="currentColor"
-                    />
-                    <template v-else>
-                      <path
-                        d="M2.5 4.5a1.25 1.25 0 0 1 1.25-1.25h1.9c.28 0 .55.11.74.31l.98.98c.2.2.46.31.74.31h4.14a1.25 1.25 0 0 1 1.25 1.25v5.1a1.25 1.25 0 0 1-1.25 1.25h-8.5A1.25 1.25 0 0 1 2.5 11.2V4.5Z"
-                        stroke="currentColor"
-                        stroke-width="1.2"
-                        stroke-linecap="round"
-                        stroke-linejoin="round"
-                      />
-                    </template>
-                  </svg>
+                  <LucideIcon
+                    :icon="entry.row.expanded ? FolderOpen : Folder"
+                    :size="13"
+                    :stroke-width="2"
+                  />
                 </span>
-                <span v-else class="kx-bullet-slot">
-                  <span class="kx-bullet"></span>
+                <span
+                  v-else-if="entry.row.node.kind === 'package'"
+                  class="kx-kind-icon package"
+                  :class="{ open: entry.row.expanded }"
+                  aria-hidden="true"
+                >
+                  <LucideIcon :icon="Package" :size="13" :stroke-width="2" />
+                </span>
+                <span
+                  v-else
+                  class="kx-kind-icon document"
+                  :class="documentKindIconClass(entry.row.node)"
+                  aria-hidden="true"
+                >
+                  <LucideIcon :icon="FileText" :size="13" :stroke-width="2" />
                 </span>
 
                 <template v-if="isRenamingRow(entry.row)">
@@ -1017,6 +1091,26 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
                     'flag-inject': tag.tone === 'inject',
                     'flag-inject-strong': tag.tone === 'inject-strong',
                     'flag-search-on': tag.tone === 'search-on',
+                  }"
+                  :title="tag.title"
+                >
+                  {{ tag.text }}
+                </span>
+                <span class="kx-count">{{
+                  entry.row.descendantDocumentCount
+                }}</span>
+              </div>
+              <div
+                v-else-if="entry.row.node.kind === 'package'"
+                class="kx-row-side"
+              >
+                <span
+                  v-for="tag in packageTags(entry.row.node)"
+                  :key="`${entry.row.node.path}-${tag.text}`"
+                  class="kx-flag"
+                  :class="{
+                    'flag-external': tag.tone === 'external',
+                    'flag-auto': tag.tone === 'auto',
                   }"
                   :title="tag.title"
                 >
@@ -1071,16 +1165,7 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
                     :disabled="!entry.draft.name.trim()"
                     @click="submitInlineCreate"
                   >
-                    <svg
-                      viewBox="0 0 16 16"
-                      width="12"
-                      height="12"
-                      fill="currentColor"
-                    >
-                      <path
-                        d="M13.78 4.22a.75.75 0 0 1 0 1.06l-6 6a.75.75 0 0 1-1.06 0l-3-3a.75.75 0 0 1 1.06-1.06l2.47 2.47 5.47-5.47a.75.75 0 0 1 1.06 0z"
-                      />
-                    </svg>
+                    <LucideIcon :icon="Check" :size="12" :stroke-width="2.4" />
                   </BaseButton>
                   <BaseButton
                     class="kx-create-action"
@@ -1088,16 +1173,7 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
                     :title="t('common.cancel')"
                     @click="closeInlineCreate"
                   >
-                    <svg
-                      viewBox="0 0 16 16"
-                      width="12"
-                      height="12"
-                      fill="currentColor"
-                    >
-                      <path
-                        d="M4.22 4.22a.75.75 0 0 1 1.06 0L8 6.94l2.72-2.72a.75.75 0 1 1 1.06 1.06L9.06 8l2.72 2.72a.75.75 0 0 1-1.06 1.06L8 9.06l-2.72 2.72a.75.75 0 1 1-1.06-1.06L6.94 8 4.22 5.28a.75.75 0 0 1 0-1.06z"
-                      />
-                    </svg>
+                    <LucideIcon :icon="X" :size="12" :stroke-width="2.4" />
                   </BaseButton>
                 </div>
               </div>
@@ -1223,6 +1299,31 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
                 ctxMenu.kind === 'folder' &&
                 (ctxMenu.targetNodes.length > 1 || canDeleteFolder(ctxMenu))
               "
+              type="button"
+              class="kx-ctx-item kx-ctx-item-danger"
+              @click="requestDeleteSelectedNodes"
+            >
+              {{ deleteMenuLabel(ctxMenu) }}
+            </button>
+          </template>
+          <template v-else-if="ctxMenu.kind === 'package'">
+            <button
+              v-if="ctxMenu.targetNodes.length === 1"
+              type="button"
+              class="kx-ctx-item"
+              @click="copySelectedRelativePath"
+            >
+              {{ t("knowledge.explorer.copyRelativePath") }}
+            </button>
+            <button
+              v-if="ctxMenu.targetNodes.length === 1"
+              type="button"
+              class="kx-ctx-item"
+              @click="openSelectedInFileSystem"
+            >
+              {{ t("knowledge.explorer.openInFileSystem") }}
+            </button>
+            <button
               type="button"
               class="kx-ctx-item kx-ctx-item-danger"
               @click="requestDeleteSelectedNodes"
@@ -1518,6 +1619,22 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
 
 .kx-kind-icon.folder.open {
   color: color-mix(in srgb, var(--accent-color) 54%, var(--text-secondary) 46%);
+}
+
+.kx-kind-icon.package {
+  color: color-mix(in srgb, var(--accent-color) 74%, var(--text-color) 26%);
+}
+
+.kx-kind-icon.package.open {
+  color: var(--accent-color);
+}
+
+.kx-kind-icon.document {
+  color: color-mix(in srgb, var(--text-secondary) 82%, var(--text-color) 18%);
+}
+
+.kx-kind-icon.document.skill-document {
+  color: color-mix(in srgb, var(--accent-color) 46%, var(--text-secondary) 54%);
 }
 
 .kx-bullet {

@@ -8,12 +8,14 @@ use walkdir::WalkDir;
 
 use crate::error::AppError;
 use crate::knowledge_index::KnowledgeIndexState;
-use crate::knowledge_store::{self, KnowledgeDocument, KnowledgeType, SkillSurface};
+use crate::knowledge_store::{
+    self, KnowledgeDocument, KnowledgeInjectMode, KnowledgeType, SkillSurface,
+};
 use crate::workspace::Workspace;
 
 use super::knowledge::{
-    get_updated_at, load_skill_config, reconcile_and_emit_knowledge_changed, AppKnowledgeDir,
-    SkillConfig,
+    get_updated_at, load_skill_config, reconcile_and_emit_knowledge_changed, save_skill_config,
+    AppKnowledgeDir, SkillConfig,
 };
 
 // ── Manifest ─────────────────────────────────────────────────
@@ -282,21 +284,17 @@ pub fn parse_skill_item_id(item_id: &str) -> Option<(&str, &str)> {
     Some((source, dir_name))
 }
 
-pub fn lookup_skill_config(
-    configs: &std::collections::HashMap<String, SkillConfig>,
+pub fn lookup_skill_config_override<'a>(
+    configs: &'a std::collections::HashMap<String, SkillConfig>,
     source: &str,
     dir_name: &str,
-) -> SkillConfig {
+) -> Option<&'a SkillConfig> {
     let new_key = config_key(source, dir_name);
-    configs
-        .get(&new_key)
-        .cloned()
-        .or_else(|| {
-            dir_name
-                .strip_prefix("builtin/")
-                .and_then(|legacy_name| configs.get(&config_key(source, legacy_name)).cloned())
-        })
-        .unwrap_or_default()
+    configs.get(&new_key).or_else(|| {
+        dir_name
+            .strip_prefix("builtin/")
+            .and_then(|legacy_name| configs.get(&config_key(source, legacy_name)))
+    })
 }
 
 // ── Scanning ─────────────────────────────────────────────────
@@ -348,21 +346,75 @@ fn scan_skill_dir(
         ) else {
             continue;
         };
-        let cfg = (source == "app").then(|| lookup_skill_config(configs, source, &dir_name));
+        let cfg = if source == "app" {
+            lookup_skill_config_override(configs, source, &dir_name)
+        } else {
+            None
+        };
         manifests.push(build_skill_manifest(
             &document,
             &dir_name,
             source,
             &rel_path,
             get_updated_at(&path),
-            cfg.as_ref(),
+            cfg,
         ));
     }
 
     manifests
 }
 
-fn normalize_command_trigger(value: &str, fallback: &str) -> String {
+fn command_trigger_has_boundary(value: &str) -> bool {
+    value.chars().any(|ch| {
+        ch.is_whitespace()
+            || matches!(
+                ch,
+                ',' | '，'
+                    | '。'
+                    | '！'
+                    | '？'
+                    | '!'
+                    | '?'
+                    | ':'
+                    | '：'
+                    | ';'
+                    | '；'
+                    | '('
+                    | ')'
+                    | '['
+                    | ']'
+                    | '{'
+                    | '}'
+                    | '<'
+                    | '>'
+                    | '《'
+                    | '》'
+                    | '「'
+                    | '」'
+                    | '『'
+                    | '』'
+                    | '"'
+                    | '“'
+                    | '”'
+                    | '\''
+                    | '‘'
+                    | '’'
+            )
+    })
+}
+
+fn validate_normalized_command_trigger(value: &str) -> Result<(), String> {
+    let normalized = value.trim();
+    if !normalized.starts_with('/') || normalized.len() <= 1 {
+        return Err("Command trigger must be a single / command token.".to_string());
+    }
+    if command_trigger_has_boundary(&normalized[1..]) {
+        return Err("Command trigger must be a single / command token.".to_string());
+    }
+    Ok(())
+}
+
+pub(crate) fn normalize_command_trigger(value: &str, fallback: &str) -> String {
     let seed = if value.trim().is_empty() {
         fallback.trim()
     } else {
@@ -376,8 +428,86 @@ fn normalize_command_trigger(value: &str, fallback: &str) -> String {
     }
 }
 
-fn resolve_command_trigger(config: &SkillConfig, fallback: &str) -> String {
-    normalize_command_trigger(&config.command_trigger, fallback)
+pub(crate) fn normalize_and_validate_command_trigger(
+    value: &str,
+    fallback: &str,
+) -> Result<String, String> {
+    let normalized = normalize_command_trigger(value, fallback);
+    validate_normalized_command_trigger(&normalized)?;
+    Ok(normalized)
+}
+
+fn resolve_config_command_trigger(config: &SkillConfig) -> Option<String> {
+    let value = config.command_trigger.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(normalize_command_trigger(value, ""))
+    }
+}
+
+pub(crate) fn normalize_and_validate_skill_config(
+    config: &SkillConfig,
+    fallback: &str,
+) -> Result<SkillConfig, String> {
+    let mut normalized = config.clone();
+    normalized.command_trigger = normalized.command_trigger.trim().to_string();
+    if !normalized.command_trigger.is_empty()
+        || (normalized.enabled && normalized.surface.allows_command())
+    {
+        normalized.command_trigger =
+            normalize_and_validate_command_trigger(&normalized.command_trigger, fallback)?;
+    }
+    Ok(normalized)
+}
+
+pub(crate) fn fallback_command_name_for_skill_ref(value: &str) -> String {
+    let normalized = value.trim().replace('\\', "/");
+    let without_source = normalized
+        .split_once(":skill/")
+        .map(|(_, rest)| rest)
+        .unwrap_or(&normalized);
+    let without_type = without_source
+        .strip_prefix("skill/")
+        .unwrap_or(without_source);
+    let without_suffix = without_type
+        .strip_suffix("/SKILL.md")
+        .or_else(|| without_type.strip_suffix("/SKILL"))
+        .or_else(|| without_type.strip_suffix(".md"))
+        .unwrap_or(without_type);
+    let leaf_or_package = without_suffix
+        .rsplit('/')
+        .next()
+        .unwrap_or(without_suffix)
+        .trim();
+    default_package_command_name(leaf_or_package)
+}
+
+fn validated_skill_config_override(
+    configs: &std::collections::HashMap<String, SkillConfig>,
+    source: &str,
+    dir_name: &str,
+    fallback: &str,
+) -> Result<Option<SkillConfig>, String> {
+    lookup_skill_config_override(configs, source, dir_name)
+        .map(|config| normalize_and_validate_skill_config(config, fallback))
+        .transpose()
+}
+
+fn validate_skill_document_config(
+    document: &KnowledgeDocument,
+    fallback: &str,
+) -> Result<(), String> {
+    let skill_enabled = document.skill_enabled.unwrap_or(true);
+    let skill_surface = document.skill_surface.unwrap_or_default();
+    let trigger = document.command_trigger.as_deref().unwrap_or("");
+    if !trigger.trim().is_empty()
+        || document.command_enabled
+        || (skill_enabled && skill_surface.allows_command())
+    {
+        normalize_and_validate_command_trigger(trigger, fallback)?;
+    }
+    Ok(())
 }
 
 fn resolve_document_command_trigger(document: &KnowledgeDocument, fallback: &str) -> String {
@@ -409,8 +539,7 @@ fn build_skill_manifest(
             (!manifest_description.trim().is_empty()).then(|| manifest_description.clone())
         });
     let command_trigger = override_config
-        .map(|config| resolve_command_trigger(config, &document.title))
-        .filter(|value| !value.trim().is_empty())
+        .and_then(resolve_config_command_trigger)
         .unwrap_or_else(|| resolve_document_command_trigger(document, &document.title));
 
     SkillManifest {
@@ -476,6 +605,10 @@ fn package_doc_rel_path_for_virtual_path(
 ) -> Result<Option<String>, String> {
     let normalized = normalize_package_rel_path(virtual_path)?;
     let package_id = normalize_package_id(&manifest.id)?;
+    if normalized == package_id || normalized == format!("skill/{}", package_id) {
+        return Ok(Some(package_root_doc_rel_path(manifest)));
+    }
+
     let Some(rest) = normalized
         .strip_prefix(&format!("{}/", package_id))
         .or_else(|| normalized.strip_prefix(&format!("skill/{}/", package_id)))
@@ -580,10 +713,12 @@ fn normalize_package_manifest(
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
     if let Some(command) = manifest.command.as_mut() {
+        let fallback_trigger = default_package_command_name(&manifest.id);
         command.trigger = command
             .trigger
             .take()
-            .map(|value| normalize_command_trigger(&value, &manifest.id))
+            .map(|value| normalize_and_validate_command_trigger(&value, &fallback_trigger))
+            .transpose()?
             .filter(|value| !value.is_empty());
         command.argument_hint = command
             .argument_hint
@@ -747,8 +882,63 @@ fn find_skill_package(package_id: &str) -> Result<SkillPackageRecord, String> {
     Err(format!("Skill package not found: {}", normalized_id))
 }
 
+fn find_skill_package_in_parent(
+    package_parent: &Path,
+    package_id: &str,
+) -> Result<SkillPackageRecord, String> {
+    let normalized_id = normalize_package_id(package_id)?;
+    let direct_root = package_parent.join(&normalized_id);
+    if direct_root.join("SKILL.md").is_file() {
+        return load_skill_package_record(&direct_root)
+            .map_err(|error| format!("Invalid Skill package '{}': {}", normalized_id, error));
+    }
+
+    let entries = std::fs::read_dir(package_parent).map_err(|e| {
+        format!(
+            "Failed to read Skill package directory '{}': {}",
+            package_parent.display(),
+            e
+        )
+    })?;
+    for entry in entries.flatten() {
+        let root = entry.path();
+        if !root.is_dir() || !root.join("SKILL.md").is_file() {
+            continue;
+        }
+        let Ok(record) = load_skill_package_record(&root) else {
+            continue;
+        };
+        if record.manifest.id == normalized_id {
+            return Ok(record);
+        }
+    }
+
+    Err(format!("Skill package not found: {}", normalized_id))
+}
+
 pub fn resolve_skill_package_root_sync(package_id: &str) -> Result<PathBuf, String> {
     find_skill_package(package_id).map(|record| record.root)
+}
+
+pub(crate) fn resolve_skill_package_document_path_sync(
+    virtual_path: &str,
+) -> Result<Option<PathBuf>, String> {
+    for record in list_skill_packages_sync() {
+        let Some(doc_rel_path) =
+            package_doc_rel_path_for_virtual_path(&record.manifest, virtual_path)?
+        else {
+            continue;
+        };
+        let file_path = package_file_path(&record.root, &doc_rel_path)?;
+        if file_path.is_file() {
+            return Ok(Some(file_path));
+        }
+        return Err(format!(
+            "Skill package document not found: {}",
+            virtual_path
+        ));
+    }
+    Ok(None)
 }
 
 fn package_source_summary(
@@ -801,6 +991,62 @@ fn package_skill_surface(manifest: &SkillPackageManifestFile) -> SkillSurface {
     }
 }
 
+fn skill_surface_allows_command(surface: SkillSurface) -> bool {
+    matches!(surface, SkillSurface::Command | SkillSurface::Both)
+}
+
+fn configured_package_skill_enabled(
+    manifest: &SkillPackageManifestFile,
+    override_config: Option<&SkillConfig>,
+) -> bool {
+    override_config
+        .map(|config| config.enabled)
+        .unwrap_or_else(|| package_skill_enabled(manifest))
+}
+
+fn configured_package_skill_surface(
+    manifest: &SkillPackageManifestFile,
+    override_config: Option<&SkillConfig>,
+) -> SkillSurface {
+    override_config
+        .map(|config| config.surface)
+        .unwrap_or_else(|| package_skill_surface(manifest))
+}
+
+fn configured_package_command_enabled(
+    manifest: &SkillPackageManifestFile,
+    override_config: Option<&SkillConfig>,
+) -> bool {
+    configured_package_skill_enabled(manifest, override_config)
+        && skill_surface_allows_command(configured_package_skill_surface(manifest, override_config))
+}
+
+fn configured_package_description(
+    manifest: &SkillPackageManifestFile,
+    override_config: Option<&SkillConfig>,
+) -> String {
+    override_config
+        .and_then(|config| {
+            (!config.description.trim().is_empty()).then(|| config.description.clone())
+        })
+        .unwrap_or_else(|| manifest.description.clone())
+}
+
+fn configured_package_command_trigger(
+    manifest: &SkillPackageManifestFile,
+    override_config: Option<&SkillConfig>,
+) -> String {
+    override_config
+        .and_then(resolve_config_command_trigger)
+        .unwrap_or_else(|| package_command_trigger(manifest))
+}
+
+fn configured_package_inject_mode(override_config: Option<&SkillConfig>) -> KnowledgeInjectMode {
+    override_config
+        .map(|config| config.inject_mode)
+        .unwrap_or(KnowledgeInjectMode::None)
+}
+
 fn package_argument_hint(manifest: &SkillPackageManifestFile) -> Option<String> {
     manifest
         .command
@@ -816,7 +1062,7 @@ fn package_command_trigger(manifest: &SkillPackageManifestFile) -> String {
             .as_ref()
             .and_then(|item| item.trigger.as_deref())
             .unwrap_or(""),
-        &manifest.id,
+        &default_package_command_name(&manifest.id),
     )
 }
 
@@ -824,6 +1070,7 @@ fn package_to_document(
     record: &SkillPackageRecord,
     doc_rel_path: &str,
     body: String,
+    override_config: Option<&SkillConfig>,
 ) -> KnowledgeDocument {
     let manifest = &record.manifest;
     let path = if doc_rel_path == package_root_doc_rel_path(manifest) {
@@ -831,14 +1078,16 @@ fn package_to_document(
     } else {
         format!("{}/{}", manifest.id, doc_rel_path)
     };
-    let command_enabled = package_command_enabled(manifest);
-    let skill_surface = package_skill_surface(manifest);
+    let command_enabled = configured_package_command_enabled(manifest, override_config);
+    let skill_enabled = configured_package_skill_enabled(manifest, override_config);
+    let skill_surface = configured_package_skill_surface(manifest, override_config);
+    let description = configured_package_description(manifest, override_config);
     KnowledgeDocument {
         id: package_document_id(&manifest.id),
         doc_type: KnowledgeType::Skill,
         path,
         title: manifest.name.clone(),
-        inject_mode: knowledge_store::KnowledgeInjectMode::None,
+        inject_mode: configured_package_inject_mode(override_config),
         inherit_inject_mode: false,
         inject_mode_source: Default::default(),
         summary_enabled: true,
@@ -850,11 +1099,14 @@ fn package_to_document(
         ai_config_source: Default::default(),
         explicit_maintenance_rules: false,
         external_source: package_source_summary(manifest),
-        skill_enabled: Some(package_skill_enabled(manifest)),
+        skill_enabled: Some(skill_enabled),
         skill_surface: Some(skill_surface),
-        command_trigger: Some(package_command_trigger(manifest)),
+        command_trigger: Some(configured_package_command_trigger(
+            manifest,
+            override_config,
+        )),
         argument_hint: package_argument_hint(manifest),
-        summary: (!manifest.description.trim().is_empty()).then(|| manifest.description.clone()),
+        summary: (!description.trim().is_empty()).then_some(description),
         body,
         maintenance_rules: None,
         created_at: record.updated_at,
@@ -863,6 +1115,7 @@ fn package_to_document(
 }
 
 pub(crate) fn read_skill_package_document_sync(
+    working_dir: &str,
     virtual_path: &str,
     part: &str,
 ) -> Result<Option<knowledge_store::KnowledgeReadResult>, String> {
@@ -878,12 +1131,14 @@ pub(crate) fn read_skill_package_document_sync(
         }
     };
 
+    let configs = load_skill_config(working_dir);
     for record in list_skill_packages_sync() {
         let Some(doc_rel_path) =
             package_doc_rel_path_for_virtual_path(&record.manifest, virtual_path)?
         else {
             continue;
         };
+        let config = lookup_skill_config_override(&configs, "app", &record.manifest.id);
         let file_path = package_file_path(&record.root, &doc_rel_path)?;
         if !file_path.is_file() {
             return Err(format!(
@@ -894,7 +1149,7 @@ pub(crate) fn read_skill_package_document_sync(
         let raw = std::fs::read_to_string(&file_path)
             .map_err(|e| format!("Failed to read skill package document: {}", e))?;
         let body = strip_optional_skill_frontmatter(&raw).to_string();
-        let mut document = package_to_document(&record, &doc_rel_path, body);
+        let mut document = package_to_document(&record, &doc_rel_path, body, config);
         match normalized_part {
             "full" => {}
             "summary" => {
@@ -920,15 +1175,21 @@ pub(crate) fn read_skill_package_document_sync(
     Ok(None)
 }
 
-fn package_to_list_item(record: &SkillPackageRecord) -> knowledge_store::KnowledgeListItem {
+fn package_to_list_item(
+    record: &SkillPackageRecord,
+    override_config: Option<&SkillConfig>,
+) -> knowledge_store::KnowledgeListItem {
     let manifest = &record.manifest;
-    let command_enabled = package_command_enabled(manifest);
+    let command_enabled = configured_package_command_enabled(manifest, override_config);
+    let skill_enabled = configured_package_skill_enabled(manifest, override_config);
+    let skill_surface = configured_package_skill_surface(manifest, override_config);
+    let description = configured_package_description(manifest, override_config);
     knowledge_store::KnowledgeListItem {
         id: package_document_id(&manifest.id),
         doc_type: KnowledgeType::Skill,
         path: format!("{}/SKILL.md", manifest.id),
         title: manifest.name.clone(),
-        inject_mode: knowledge_store::KnowledgeInjectMode::None,
+        inject_mode: configured_package_inject_mode(override_config),
         summary_enabled: true,
         command_enabled,
         read_only: true,
@@ -936,13 +1197,16 @@ fn package_to_list_item(record: &SkillPackageRecord) -> knowledge_store::Knowled
         explicit_maintenance_rules: false,
         storage_source: knowledge_store::KnowledgeStorageSource::App,
         external_source: package_source_summary(manifest),
-        skill_enabled: Some(package_skill_enabled(manifest)),
-        skill_surface: Some(package_skill_surface(manifest)),
-        command_trigger: Some(package_command_trigger(manifest)),
+        skill_enabled: Some(skill_enabled),
+        skill_surface: Some(skill_surface),
+        command_trigger: Some(configured_package_command_trigger(
+            manifest,
+            override_config,
+        )),
         argument_hint: package_argument_hint(manifest),
         created_at: record.updated_at,
         updated_at: record.updated_at,
-        has_summary: !manifest.description.trim().is_empty(),
+        has_summary: !description.trim().is_empty(),
         has_body_content: true,
         byte_size: package_file_path(&record.root, &package_root_doc_rel_path(manifest))
             .ok()
@@ -950,11 +1214,12 @@ fn package_to_list_item(record: &SkillPackageRecord) -> knowledge_store::Knowled
             .map(|meta| meta.len()),
         lexical_search_enabled: Some(false),
         semantic_search_enabled: Some(false),
-        summary: (!manifest.description.trim().is_empty()).then(|| manifest.description.clone()),
+        summary: (!description.trim().is_empty()).then_some(description),
     }
 }
 
 pub(crate) fn list_skill_package_knowledge_items_sync(
+    working_dir: &str,
     path_prefix: Option<&str>,
 ) -> Vec<knowledge_store::KnowledgeListItem> {
     let normalized_prefix = path_prefix
@@ -966,9 +1231,13 @@ pub(crate) fn list_skill_package_knowledge_items_sync(
                 .to_string()
         })
         .unwrap_or_default();
+    let configs = load_skill_config(working_dir);
     list_skill_packages_sync()
         .into_iter()
-        .map(|record| package_to_list_item(&record))
+        .map(|record| {
+            let config = lookup_skill_config_override(&configs, "app", &record.manifest.id);
+            package_to_list_item(&record, config)
+        })
         .filter(|item| normalized_prefix.is_empty() || item.path.starts_with(&normalized_prefix))
         .collect()
 }
@@ -993,8 +1262,7 @@ fn build_package_skill_manifest(
         })
         .or_else(|| (!manifest_description.is_empty()).then(|| manifest_description.clone()));
     let command_trigger = override_config
-        .map(|config| resolve_command_trigger(config, &manifest.name))
-        .filter(|value| !value.trim().is_empty())
+        .and_then(resolve_config_command_trigger)
         .unwrap_or_else(|| package_command_trigger(manifest));
 
     SkillManifest {
@@ -1041,8 +1309,8 @@ pub fn list_skills_sync(
     let mut manifests = Vec::new();
 
     for package in list_skill_packages_sync() {
-        let cfg = lookup_skill_config(&configs, "app", &package.manifest.id);
-        manifests.push(build_package_skill_manifest(&package, "app", Some(&cfg)));
+        let cfg = lookup_skill_config_override(&configs, "app", &package.manifest.id);
+        manifests.push(build_package_skill_manifest(&package, "app", cfg));
     }
 
     if let Some(app_dir) = app_knowledge_dir {
@@ -1312,8 +1580,8 @@ pub fn create_skill_document_sync(
     let command_enabled = request.command_enabled.unwrap_or(true);
     let command_trigger = if command_enabled {
         let trigger = optional_trimmed(request.command_trigger)
-            .map(|value| normalize_command_trigger(&value, &name))
-            .unwrap_or_else(|| normalize_command_trigger("", &name));
+            .map(|value| normalize_and_validate_command_trigger(&value, &name))
+            .unwrap_or_else(|| normalize_and_validate_command_trigger("", &name))?;
         (!trigger.is_empty()).then_some(trigger)
     } else {
         None
@@ -1388,8 +1656,8 @@ fn create_skill_package_in_parent_sync(
     let default_trigger = default_package_command_name(&package_id);
     let command_trigger = if command_enabled {
         let trigger = optional_trimmed(request.command_trigger)
-            .map(|value| normalize_command_trigger(&value, &default_trigger))
-            .unwrap_or_else(|| normalize_command_trigger("", &default_trigger));
+            .map(|value| normalize_and_validate_command_trigger(&value, &default_trigger))
+            .unwrap_or_else(|| normalize_and_validate_command_trigger("", &default_trigger))?;
         (!trigger.is_empty()).then_some(trigger)
     } else {
         None
@@ -1457,6 +1725,56 @@ pub fn create_skill_sync(
     }
 }
 
+fn delete_skill_package_from_parent_sync(
+    working_dir: &str,
+    package_parent: &Path,
+    package_id: &str,
+) -> Result<String, String> {
+    let record = find_skill_package_in_parent(package_parent, package_id)?;
+    let canonical_parent = dunce::canonicalize(package_parent).map_err(|e| {
+        format!(
+            "Failed to resolve Skill package directory '{}': {}",
+            package_parent.display(),
+            e
+        )
+    })?;
+    let canonical_root = dunce::canonicalize(&record.root).map_err(|e| {
+        format!(
+            "Failed to resolve Skill package root '{}': {}",
+            record.root.display(),
+            e
+        )
+    })?;
+    if canonical_root == canonical_parent || !canonical_root.starts_with(&canonical_parent) {
+        return Err(
+            "Skill package root resolves outside of the writable package directory".to_string(),
+        );
+    }
+
+    std::fs::remove_dir_all(&canonical_root).map_err(|e| {
+        format!(
+            "Failed to delete Skill package '{}': {}",
+            canonical_root.display(),
+            e
+        )
+    })?;
+
+    let mut configs = load_skill_config(working_dir);
+    if configs
+        .remove(&config_key("app", &record.manifest.id))
+        .is_some()
+    {
+        save_skill_config(working_dir, &configs)?;
+    }
+
+    Ok(record.manifest.id)
+}
+
+pub fn delete_skill_package_sync(working_dir: &str, package_id: &str) -> Result<String, String> {
+    let package_parent = writable_app_skill_package_dir()?;
+    delete_skill_package_from_parent_sync(working_dir, &package_parent, package_id)
+}
+
 fn normalize_skill_source(source: Option<&str>) -> Result<&str, String> {
     match source.map(str::trim).filter(|value| !value.is_empty()) {
         None => Ok("project"),
@@ -1475,8 +1793,10 @@ pub fn reload_skill_manifest_sync(
     if source == "app" {
         if let Ok(record) = find_skill_package(&request.name) {
             let configs = load_skill_config(working_dir);
-            let cfg = lookup_skill_config(&configs, "app", &record.manifest.id);
-            return Ok(build_package_skill_manifest(&record, "app", Some(&cfg)));
+            let fallback = default_package_command_name(&record.manifest.id);
+            let cfg =
+                validated_skill_config_override(&configs, "app", &record.manifest.id, &fallback)?;
+            return Ok(build_package_skill_manifest(&record, "app", cfg.as_ref()));
         }
     }
 
@@ -1513,10 +1833,19 @@ pub fn reload_skill_manifest_sync(
             document.path, document_path
         ));
     }
+    validate_skill_document_config(&document, document_path.trim_end_matches(".md"))?;
 
     let configs = load_skill_config(working_dir);
-    let cfg =
-        (source == "app").then(|| lookup_skill_config(&configs, source, &normalized_dir_name));
+    let cfg = if source == "app" {
+        validated_skill_config_override(
+            &configs,
+            source,
+            &normalized_dir_name,
+            document_path.trim_end_matches(".md"),
+        )?
+    } else {
+        None
+    };
     Ok(build_skill_manifest(
         &document,
         document_path.trim_end_matches(".md"),
@@ -1592,6 +1921,25 @@ pub async fn create_skill_scaffold(
     )
     .await?;
     Ok(manifest)
+}
+
+#[tauri::command]
+pub async fn delete_skill_package(
+    package_id: String,
+    app_handle: AppHandle,
+    workspace: State<'_, Arc<Workspace>>,
+    knowledge_index_state: State<'_, Arc<KnowledgeIndexState>>,
+) -> Result<(), AppError> {
+    let working_dir = workspace.path.read().await.clone();
+    delete_skill_package_sync(&working_dir, &package_id).map_err(AppError::from)?;
+    reconcile_and_emit_knowledge_changed(
+        &app_handle,
+        &working_dir,
+        knowledge_index_state.inner().clone(),
+        "delete_skill_package",
+    )
+    .await?;
+    Ok(())
 }
 
 fn hash_file(path: &Path) -> Result<String, String> {
@@ -1818,8 +2166,12 @@ pub async fn remove_skill_unity_files(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_valid_skill_scaffold_name, list_skills_sync, read_skill_manifest_sync};
-    use crate::knowledge_store::SkillSurface;
+    use super::{
+        is_valid_skill_scaffold_name, list_skills_sync, read_skill_manifest_sync,
+        SkillPackageManifestFile,
+    };
+    use crate::commands::knowledge::SkillConfig;
+    use crate::knowledge_store::{KnowledgeInjectMode, SkillSurface};
     use tempfile::TempDir;
 
     #[test]
@@ -1959,6 +2311,84 @@ Do the work.
     }
 
     #[test]
+    fn package_knowledge_item_applies_workspace_config() {
+        let temp = TempDir::new().unwrap();
+        std::fs::write(
+            temp.path().join("SKILL.md"),
+            r#"---
+name: Feishu CLI
+description: Use Feishu safely.
+x-locus:
+  schema: locus.skill.v1
+  id: com.feishu.cli
+  version: 0.1.0
+  command:
+    enabled: true
+    trigger: /feishu
+---
+
+# Feishu CLI
+
+## L0
+Use Feishu safely.
+"#,
+        )
+        .unwrap();
+
+        let record = super::load_skill_package_record(temp.path()).unwrap();
+        let item = super::package_to_list_item(
+            &record,
+            Some(&SkillConfig {
+                enabled: true,
+                surface: SkillSurface::Auto,
+                description: "Workspace override.".to_string(),
+                command_trigger: "/lark".to_string(),
+                inject_mode: KnowledgeInjectMode::Path,
+            }),
+        );
+
+        assert_eq!(item.inject_mode, KnowledgeInjectMode::Path);
+        assert_eq!(item.skill_surface, Some(SkillSurface::Auto));
+        assert_eq!(item.command_enabled, false);
+        assert_eq!(item.command_trigger.as_deref(), Some("/lark"));
+        assert_eq!(item.summary.as_deref(), Some("Workspace override."));
+    }
+
+    #[test]
+    fn package_doc_rel_path_resolves_root_and_nested_documents() {
+        let manifest = SkillPackageManifestFile {
+            id: "com.example.asset-audit".to_string(),
+            name: "Asset Audit".to_string(),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            super::package_doc_rel_path_for_virtual_path(&manifest, "com.example.asset-audit")
+                .unwrap()
+                .as_deref(),
+            Some("SKILL.md")
+        );
+        assert_eq!(
+            super::package_doc_rel_path_for_virtual_path(
+                &manifest,
+                "skill/com.example.asset-audit"
+            )
+            .unwrap()
+            .as_deref(),
+            Some("SKILL.md")
+        );
+        assert_eq!(
+            super::package_doc_rel_path_for_virtual_path(
+                &manifest,
+                "com.example.asset-audit/docs/usage.md"
+            )
+            .unwrap()
+            .as_deref(),
+            Some("docs/usage.md")
+        );
+    }
+
+    #[test]
     fn create_skill_document_sync_requires_summary_metadata() {
         let temp = TempDir::new().unwrap();
         let working_dir = temp.path().to_string_lossy().to_string();
@@ -1996,6 +2426,26 @@ Do the work.
         )
         .expect("read created skill document");
         assert_eq!(saved.document.body, "## Instructions");
+    }
+
+    #[test]
+    fn create_skill_rejects_invalid_command_trigger() {
+        let temp = TempDir::new().unwrap();
+        let working_dir = temp.path().to_string_lossy().to_string();
+
+        let err = super::create_skill_document_sync(
+            &working_dir,
+            super::SkillCreateRequest {
+                kind: super::SkillCreateKind::Md,
+                name: "asset-audit".to_string(),
+                summary: Some("Audit Unity assets.".to_string()),
+                command_trigger: Some("/asset audit".to_string()),
+                ..Default::default()
+            },
+        )
+        .expect_err("invalid command trigger should be rejected");
+
+        assert!(err.contains("Command trigger must be a single / command token"));
     }
 
     #[test]
@@ -2041,6 +2491,150 @@ Do the work.
                 .and_then(|command| command.enabled),
             Some(true)
         );
+    }
+
+    #[test]
+    fn delete_skill_package_removes_package_root_and_config() {
+        let workspace = TempDir::new().unwrap();
+        let package_parent = TempDir::new().unwrap();
+        let working_dir = workspace.path().to_string_lossy().to_string();
+        super::create_skill_package_in_parent_sync(
+            package_parent.path(),
+            super::SkillCreateRequest {
+                kind: super::SkillCreateKind::Package,
+                name: "Asset Audit".to_string(),
+                package_id: Some("com.example.asset-audit".to_string()),
+                version: Some("0.1.0".to_string()),
+                summary: Some("Audit Unity assets.".to_string()),
+                ..Default::default()
+            },
+        )
+        .expect("create package");
+
+        let mut configs = std::collections::HashMap::new();
+        configs.insert(
+            "app:skill/com.example.asset-audit".to_string(),
+            SkillConfig {
+                enabled: false,
+                surface: SkillSurface::Auto,
+                description: "override".to_string(),
+                command_trigger: "/audit".to_string(),
+                inject_mode: KnowledgeInjectMode::Path,
+            },
+        );
+        crate::commands::knowledge::save_skill_config(&working_dir, &configs).expect("save config");
+
+        let deleted = super::delete_skill_package_from_parent_sync(
+            &working_dir,
+            package_parent.path(),
+            "com.example.asset-audit",
+        )
+        .expect("delete package");
+
+        assert_eq!(deleted, "com.example.asset-audit");
+        assert!(!package_parent
+            .path()
+            .join("com.example.asset-audit")
+            .exists());
+        assert!(!crate::commands::knowledge::load_skill_config(&working_dir)
+            .contains_key("app:skill/com.example.asset-audit"));
+    }
+
+    #[test]
+    fn create_skill_package_rejects_invalid_command_trigger() {
+        let temp = TempDir::new().unwrap();
+
+        let err = super::create_skill_package_in_parent_sync(
+            temp.path(),
+            super::SkillCreateRequest {
+                kind: super::SkillCreateKind::Package,
+                name: "Feishu CLI".to_string(),
+                package_id: Some("com.feishu.cli".to_string()),
+                version: Some("0.1.0".to_string()),
+                summary: Some("Use Feishu safely.".to_string()),
+                command_trigger: Some("/Feishu CLI".to_string()),
+                ..Default::default()
+            },
+        )
+        .expect_err("invalid package command trigger should be rejected");
+
+        assert!(err.contains("Command trigger must be a single / command token"));
+    }
+
+    #[test]
+    fn package_default_command_uses_package_tail_not_display_name() {
+        let temp = TempDir::new().unwrap();
+        std::fs::write(
+            temp.path().join("SKILL.md"),
+            r#"---
+name: Feishu CLI
+description: Use Feishu safely.
+x-locus:
+  schema: locus.skill.v1
+  id: com.feishu.cli
+  version: 0.1.0
+  command:
+    enabled: true
+---
+
+# Feishu CLI
+
+## Instructions
+Use Feishu safely.
+"#,
+        )
+        .unwrap();
+
+        let record = super::load_skill_package_record(temp.path()).unwrap();
+        let item = super::package_to_list_item(&record, None);
+
+        assert_eq!(item.command_trigger.as_deref(), Some("/cli"));
+    }
+
+    #[test]
+    fn reload_skill_manifest_rejects_invalid_command_trigger() {
+        let temp = TempDir::new().unwrap();
+        let working_dir = temp.path().to_string_lossy().to_string();
+        let skill_dir = temp.path().join("Locus").join("knowledge").join("skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("bad-skill.md"),
+            r#"---
+id: kd_skill_bad_skill
+type: skill
+path: bad-skill.md
+title: Bad Skill
+injectMode: none
+summaryEnabled: true
+commandEnabled: true
+readOnly: false
+aiMaintained: false
+skillEnabled: true
+skillSurface: command
+commandTrigger: /bad skill
+createdAt: 1
+updatedAt: 1
+---
+
+# Bad Skill
+
+## Instructions
+Do the work.
+"#,
+        )
+        .unwrap();
+
+        let err = super::reload_skill_manifest_sync(
+            &working_dir,
+            None,
+            super::SkillReloadRequest {
+                name: "bad-skill".to_string(),
+                source: None,
+            },
+        )
+        .expect_err("invalid command trigger should fail reload");
+
+        assert!(err.contains("Command trigger must be a single / command token"));
     }
 
     #[test]

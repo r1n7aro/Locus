@@ -9,17 +9,25 @@ function read(relPath: string) {
 }
 
 describe("KnowledgeExplorer row icons", () => {
-  it("renders asset-style folder icons while keeping document bullets", () => {
+  it("uses the local LucideIcon wrapper for folders, packages, and documents", () => {
     const explorer = read("src/components/knowledge/KnowledgeExplorer.vue");
 
+    expect(explorer).toContain(
+      'import LucideIcon from "../icons/LucideIcon.vue"',
+    );
     expect(explorer).toContain('class="kx-kind-icon folder"');
+    expect(explorer).toContain('class="kx-kind-icon package"');
+    expect(explorer).toContain('class="kx-kind-icon document"');
     expect(explorer).toContain(':class="{ open: entry.row.expanded }"');
-    expect(explorer).toContain('<span v-else class="kx-bullet-slot">');
-    expect(explorer).toContain('<span class="kx-bullet"></span>');
+    expect(explorer).toContain(':icon="entry.row.expanded ? FolderOpen : Folder"');
+    expect(explorer).toContain(':icon="Package"');
+    expect(explorer).toContain(':icon="FileText"');
     expect(explorer).toContain(".kx-kind-icon.folder {");
+    expect(explorer).toContain(".kx-kind-icon.package {");
+    expect(explorer).toContain(".kx-kind-icon.document.skill-document {");
   });
 
-  it("uses a spacer instead of a chevron for folders without child rows", () => {
+  it("uses a spacer instead of a chevron for collapsed branches without child rows", () => {
     const explorer = read("src/components/knowledge/KnowledgeExplorer.vue");
 
     expect(explorer).toContain("entry.row.directChildCount > 0");

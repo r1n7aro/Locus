@@ -793,6 +793,7 @@ export function setSkillConfig(
     surface: config.surface,
     description: config.description,
     commandTrigger: config.commandTrigger,
+    injectMode: config.injectMode,
   });
 }
 
@@ -824,6 +825,12 @@ export function createSkillScaffold(input: SkillCreateInput): Promise<SkillManif
     commandTrigger: input.commandTrigger,
     commandEnabled: input.commandEnabled,
     modelInvocationEnabled: input.modelInvocationEnabled,
+  });
+}
+
+export function deleteSkillPackage(packageId: string): Promise<void> {
+  return ipcInvoke<void>("delete_skill_package", {
+    packageId,
   });
 }
 

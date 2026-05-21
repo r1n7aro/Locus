@@ -29,8 +29,9 @@ Create a reusable Skill through the dedicated Skill tools, as either a project-l
    - Create a skill only when the workflow has stable steps, reusable judgment rules, or a consistent deliverable.
 
 2. Choose the storage model.
-   - Use a single document for a project-local SOP that only needs Markdown instructions.
+   - Use a single document only for a project-local SOP that needs Markdown instructions and no local runtime assets.
    - Use a package when the user asks for distribution, APP installation, bundled scripts, CLI binaries, multiple docs, or Unity C# files.
+   - You MUST use a package for any Skill that depends on a CLI, compiled binary, Python/script helper, Unity C# file, package-local docs, or other local dependency environment. Do not create an `md` Skill that merely tells the user to install the dependency unless the user explicitly asks for docs-only guidance.
    - Prefer package IDs like `com.example.asset-audit` for distributed packages and kebab-case slugs like `asset-audit` for single documents.
 
 3. Choose the path, slug, and title for a single document.
@@ -48,6 +49,7 @@ Create a reusable Skill through the dedicated Skill tools, as either a project-l
 5. Use Skill lifecycle tools for Markdown documents and packages.
    - Create a Markdown document with `skill_create` using `kind: "md"`, `name: <slug>`, `summary: <one-line description>`, and, when needed, `path: <folder>/<slug>.md`.
    - Create a package with `skill_create` using `kind: "package"`, `name: <display name>`, `packageId: <reverse-dns-id>`, `version: <semver>`, `summary: <one-line description>`, plus optional command metadata.
+   - If the Skill needs a dependency environment such as an external CLI, downloaded binary, generated helper script, or Unity C# bridge, choose `kind: "package"` even when the initial instructions look short.
    - Seed `summary` and `body` in `skill_create` so the skill is usable immediately.
    - Use `skill_list` before creating when command or name conflicts are likely.
    - For an existing Markdown Skill, update content with `knowledge_edit`; for an existing package, edit files under its package root.
@@ -93,6 +95,7 @@ updatedAt: <unix-ms>
 ```
 
 8. Create a package when the Skill needs bundled capabilities.
+   - This is mandatory for dependency-bearing Skills: CLI integrations, local executables, scripts, Unity C# capabilities, and workflows that require package-local reference docs must be packaged.
    - Create the initial package with `skill_create`; the result includes `packageRoot` for later file edits.
    - Use the APP temp directory, usually `%APPDATA%/locus/temp/` on Windows, for clone checkouts, archives, generated source, build caches, and intermediate compiler output.
    - Copy only the final package assets from the APP temp directory into `packageRoot`, such as `SKILL.md`, docs, scripts, compiled CLI binaries, and Unity C# files.
@@ -169,8 +172,8 @@ Full execution workflow, required checks, expected outputs, and references to pa
    - Installation status is based on the real target file and hash, so report `installed`, `modified`, `partial`, or `notInstalled` from the Skill UI when relevant.
 
 13. Keep the current skill storage model simple.
-   - Prefer `skill_create` for a single Markdown document.
-   - Use a package when bundled resources, multiple docs, or distribution are part of the requirement.
+   - Prefer `skill_create` for a single Markdown document only when the Skill is text-only.
+   - Use a package when bundled resources, multiple docs, dependency setup, CLI tooling, scripts, Unity C# files, or distribution are part of the requirement.
    - Do not recreate legacy `knowledge/Skill/<name>/SKILL.md` directories.
 
 14. When migrating from a legacy skill:

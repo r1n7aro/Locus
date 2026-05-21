@@ -13,6 +13,7 @@ import KnowledgeRetrievalPanel from "./knowledge/KnowledgeRetrievalPanel.vue";
 import KnowledgeInjectionPreviewPanel from "./knowledge/KnowledgeInjectionPreviewPanel.vue";
 import KnowledgeSearchBar from "./knowledge/KnowledgeSearchBar.vue";
 import KnowledgePreview from "./knowledge/KnowledgePreview.vue";
+import KnowledgeSkillPackagePreview from "./knowledge/KnowledgeSkillPackagePreview.vue";
 import WorkspaceRequiredState from "./WorkspaceRequiredState.vue";
 import {
   useKnowledgeState,
@@ -47,6 +48,7 @@ const {
   selectedPath,
   selectedDocument,
   selectedDocumentLoading,
+  selectedPackageDocument,
   selectedDirectoryConfig,
   selectedDirectoryLoading,
   savingDocument,
@@ -88,6 +90,7 @@ const {
   refreshRetrievalState,
   selectType,
   selectDocument,
+  selectPackage,
   selectDirectory,
   selectSearchResult,
   selectLocalEmbeddingModelOption,
@@ -98,6 +101,7 @@ const {
   createFolder,
   updateSection,
   updateMeta,
+  updatePackageConfig,
   saveDirectoryConfig,
   deleteDocument,
   deleteExplorerNode,
@@ -199,6 +203,12 @@ function handleSelectDocument(summary: Parameters<typeof selectDocument>[0]) {
   specialPage.value = null;
   overviewDismissed.value = false;
   void selectDocument(summary);
+}
+
+function handleSelectPackage(summary: Parameters<typeof selectPackage>[0]) {
+  specialPage.value = null;
+  overviewDismissed.value = false;
+  void selectPackage(summary);
 }
 
 function handleSelectDirectory(path: string) {
@@ -367,6 +377,11 @@ function handleUpdateMeta(patch: KnowledgeDocumentPatch) {
   );
 }
 
+function handleUpdatePackageConfig(patch: KnowledgeDocumentPatch) {
+  if (!selectedPackageDocument.value) return;
+  void updatePackageConfig(patch);
+}
+
 function handleSaveDirectoryConfig(
   path: string,
   config: Parameters<typeof saveDirectoryConfig>[1],
@@ -387,6 +402,9 @@ function deleteDialogMessage(nodes: ExplorerNode[]): string {
   if (!node) return "";
   if (node.kind === "folder") {
     return t("knowledge.explorer.deleteFolderConfirm", node.name);
+  }
+  if (node.kind === "package") {
+    return t("knowledge.explorer.deletePackageConfirm", node.name);
   }
   return t("knowledge.explorer.deleteDocumentConfirm", node.name);
 }
@@ -511,6 +529,7 @@ onUnmounted(() => {
           :search-results="searchResults"
           :searching="searching"
           @select-document="handleSelectDocument"
+          @select-package="handleSelectPackage"
           @select-search-result="handleSelectSearchResult"
           @select-folder-config="handleSelectDirectory"
           @request-external-import-folder="
@@ -549,8 +568,17 @@ onUnmounted(() => {
             <span>{{ t("knowledge.retrieval.runtimeStarting") }}</span>
           </div>
 
+          <KnowledgeSkillPackagePreview
+            v-if="selectedPackageDocument"
+            :package-document="selectedPackageDocument"
+            :documents="documents"
+            :save-loading="savingDocument"
+            @select-document="handleSelectDocument"
+            @update-config="handleUpdatePackageConfig"
+          />
+
           <KnowledgePreview
-            v-if="selectedDocument"
+            v-else-if="selectedDocument"
             :document="selectedDocument"
             :search-context="selectedSearchContext"
             :loading="selectedDocumentLoading"

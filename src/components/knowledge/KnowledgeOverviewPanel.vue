@@ -148,6 +148,10 @@ function renderFallbackTreeLines(
     (node): node is Extract<ExplorerNode, { kind: "folder" }> =>
       node.kind === "folder",
   );
+  const packageNodes = nodes.filter(
+    (node): node is Extract<ExplorerNode, { kind: "package" }> =>
+      node.kind === "package",
+  );
   const documentNodes = nodes.filter(
     (node): node is Extract<ExplorerNode, { kind: "document" }> =>
       node.kind === "document",
@@ -159,6 +163,17 @@ function renderFallbackTreeLines(
       label: `${folder.name}/`,
       nested: renderFallbackTreeLines(
         folder.children,
+        showFiles,
+        maxVisibleFiles,
+      ),
+    });
+  }
+
+  for (const packageNode of packageNodes) {
+    entries.push({
+      label: `${packageNode.name}/`,
+      nested: renderFallbackTreeLines(
+        packageNode.children,
         showFiles,
         maxVisibleFiles,
       ),

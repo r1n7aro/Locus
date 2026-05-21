@@ -32,6 +32,7 @@ const tauriEventMocks = vi.hoisted(() => ({
 
 const knowledgeMocks = vi.hoisted(() => ({
   createSkillScaffold: vi.fn(),
+  deleteSkillPackage: vi.fn(),
   knowledgeActivateEmbedding: vi.fn(),
   knowledgeCreate: vi.fn(),
   knowledgeDelete: vi.fn(),
@@ -65,6 +66,7 @@ const knowledgeMocks = vi.hoisted(() => ({
   knowledgeDeactivateEmbedding: vi.fn(),
   knowledgeSaveEmbeddingConfig: vi.fn(),
   knowledgeSaveGeneralConfig: vi.fn(),
+  setSkillConfig: vi.fn(),
 }));
 
 vi.mock("../services/knowledge", () => knowledgeMocks);
@@ -543,6 +545,7 @@ describe("useKnowledgeState", () => {
     knowledgeMocks.knowledgeSaveEmbeddingConfig.mockImplementation(
       async (config: any) => config,
     );
+    knowledgeMocks.setSkillConfig.mockResolvedValue(undefined);
     knowledgeMocks.knowledgeActivateEmbedding.mockResolvedValue(undefined);
     knowledgeMocks.knowledgeDeactivateEmbedding.mockResolvedValue(undefined);
     knowledgeMocks.knowledgeDownloadLocalEmbeddingModel.mockResolvedValue(
@@ -2355,6 +2358,131 @@ describe("useKnowledgeState", () => {
       path: "combat",
       newPath: "systems/combat",
     });
+  });
+
+  it("represents package skills as package branches with selectable package info", async () => {
+    const rootSkill: KnowledgeDocumentSummary = {
+      id: "skill-package-root",
+      type: "skill",
+      path: "com.feishu.cli/SKILL.md",
+      title: "Feishu CLI",
+      injectMode: "excerpt",
+      summaryEnabled: true,
+      commandEnabled: true,
+      readOnly: true,
+      aiMaintained: false,
+      storageSource: "app",
+      explicitMaintenanceRules: false,
+      externalSource: {
+        provider: "package",
+        sourceId: "com.feishu.cli",
+        locator: "skills/com.feishu.cli",
+      },
+      skillEnabled: true,
+      skillSurface: "both",
+      commandTrigger: "/feishu",
+      argumentHint: "[resource]",
+      summary: "Use Feishu safely.",
+      createdAt: 1,
+      updatedAt: 2,
+      hasSummary: true,
+    };
+    const childSkill: KnowledgeDocumentSummary = {
+      ...rootSkill,
+      id: "skill-package-child",
+      path: "com.feishu.cli/reference/auth.md",
+      title: "Auth",
+      commandTrigger: null,
+      argumentHint: null,
+      summary: "Authentication notes.",
+    };
+    knowledgeMocks.knowledgeList.mockImplementation(async (input: any = {}) =>
+      input.type === "skill" ? [childSkill, rootSkill] : [],
+    );
+    knowledgeMocks.knowledgeListDirectories.mockResolvedValue([]);
+
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    vi.stubGlobal("navigator", {
+      clipboard: {
+        writeText,
+      },
+    });
+
+    const state = useKnowledgeState(
+      reactive({
+        workingDir: "F:/repo",
+        selectedModelId: "",
+        modelDefaults: {} as any,
+      }),
+    );
+
+    await state.selectType("skill");
+    const packageNode = state.visibleExplorerTree.value[0];
+    expect(packageNode).toMatchObject({
+      kind: "package",
+      name: "com.feishu.cli",
+      path: "skill/com.feishu.cli",
+    });
+    expect(
+      packageNode?.kind === "package"
+        ? packageNode.children.some(
+            (child) =>
+              child.kind === "document" &&
+              child.document.path === "com.feishu.cli/SKILL.md",
+          )
+        : false,
+    ).toBe(true);
+    expect(
+      packageNode?.kind === "package"
+        ? packageNode.children.some(
+            (child) =>
+              child.kind === "folder" &&
+              child.relativePath === "com.feishu.cli/reference",
+          )
+        : false,
+    ).toBe(true);
+
+    if (packageNode?.kind !== "package") throw new Error("missing package node");
+    await state.selectPackage(packageNode.document);
+
+    expect(state.selectedPackageDocument.value?.path).toBe(
+      "com.feishu.cli/SKILL.md",
+    );
+    expect(state.selectedPath.value).toBe("skill/com.feishu.cli");
+
+    await state.updatePackageConfig({
+      injectMode: "path",
+      skillEnabled: true,
+      skillSurface: "auto",
+      commandTrigger: "/lark",
+    });
+
+    expect(knowledgeMocks.setSkillConfig).toHaveBeenCalledWith(
+      "skill/com.feishu.cli",
+      "app",
+      {
+        enabled: true,
+        surface: "auto",
+        description: "Use Feishu safely.",
+        commandTrigger: "/lark",
+        injectMode: "path",
+      },
+    );
+
+    await state.copyExplorerRelativePath(packageNode);
+    expect(writeText).toHaveBeenCalledWith("skill/com.feishu.cli");
+
+    await state.openExplorerInFileSystem(packageNode);
+    expect(knowledgeMocks.knowledgeRevealTarget).toHaveBeenCalledWith({
+      kind: "directory",
+      docType: "skill",
+      path: "com.feishu.cli",
+    });
+
+    await state.deleteExplorerNode(packageNode);
+    expect(knowledgeMocks.deleteSkillPackage).toHaveBeenCalledWith(
+      "com.feishu.cli",
+    );
   });
 
   it("renames a folder from the explorer and keeps the directory selection", async () => {
