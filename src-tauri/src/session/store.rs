@@ -18,7 +18,7 @@ use crate::compact;
 #[derive(Clone)]
 pub struct SessionStore {
     conn: Arc<Mutex<Connection>>,
-    data_dir: PathBuf,
+    tool_results_root: PathBuf,
     event_writer: Arc<SessionEventWriter>,
 }
 
@@ -55,11 +55,13 @@ struct SessionEventWriter {
     sender: mpsc::Sender<QueuedSessionEvent>,
 }
 
-const TOOL_RESULTS_DIR: &str = "tool-results";
 const TOOL_RESULT_PREVIEW_CHARS: usize = 2_000;
 const DEFAULT_MAX_RESULT_SIZE_CHARS: usize = 50_000;
 const LARGE_RESULT_TAG_OPEN: &str = "<persisted-output>";
 const LARGE_RESULT_TAG_CLOSE: &str = "</persisted-output>";
+const DELETED_RESULT_TAG_OPEN: &str = "<persisted-output-deleted>";
+const DELETED_RESULT_TAG_CLOSE: &str = "</persisted-output-deleted>";
+const LARGE_RESULT_PATH_PREFIX: &str = "Full output saved to: ";
 pub const CHILD_SESSION_FORK_ERROR: &str = "Child sessions cannot be forked";
 const RUN_STATUS_QUEUED: &str = "queued";
 const RUN_STATUS_STARTING: &str = "starting";
@@ -192,6 +194,32 @@ pub struct PersistedToolResult {
 
 fn is_large_result_reference(content: &str) -> bool {
     content.trim_start().starts_with(LARGE_RESULT_TAG_OPEN)
+}
+
+fn is_deleted_result_reference(content: &str) -> bool {
+    content.trim_start().starts_with(DELETED_RESULT_TAG_OPEN)
+}
+
+fn persisted_output_path(content: &str) -> Option<PathBuf> {
+    if !is_large_result_reference(content) {
+        return None;
+    }
+    content
+        .lines()
+        .find_map(|line| {
+            line.split_once(LARGE_RESULT_PATH_PREFIX)
+                .map(|(_, path)| path)
+        })
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn build_deleted_tool_result_message(path: &Path) -> String {
+    format!(
+        "{DELETED_RESULT_TAG_OPEN}\nFull output file deleted: {}\n{DELETED_RESULT_TAG_CLOSE}",
+        path.display()
+    )
 }
 
 fn estimate_preview(content: &str, max_chars: usize) -> (String, bool) {
@@ -472,6 +500,13 @@ impl SessionStore {
     const SCHEMA_VERSION: i32 = 19;
 
     pub fn new(data_dir: &Path) -> Result<Self, String> {
+        Self::new_with_tool_results_root(data_dir, data_dir.join("temp").join("tool-results"))
+    }
+
+    pub fn new_with_tool_results_root(
+        data_dir: &Path,
+        tool_results_root: PathBuf,
+    ) -> Result<Self, String> {
         let db_path = data_dir.join("locus.db");
 
         // Schemas below the supported migration baseline are not upgraded
@@ -503,7 +538,7 @@ impl SessionStore {
         conn.execute_batch("PRAGMA foreign_keys = ON;")
             .map_err(|e| format!("Failed to enable foreign keys: {}", e))?;
 
-        Self::run_migrations(&conn, data_dir)?;
+        Self::run_migrations(&conn, &tool_results_root)?;
         Self::mark_nonterminal_runs_cancelled(&conn)?;
 
         let conn = Arc::new(Mutex::new(conn));
@@ -511,7 +546,7 @@ impl SessionStore {
 
         Ok(SessionStore {
             conn,
-            data_dir: data_dir.to_path_buf(),
+            tool_results_root,
             event_writer,
         })
     }
@@ -519,7 +554,7 @@ impl SessionStore {
     /// Fresh databases are created directly at the latest schema version.
     /// Supported upgrades start at v7, and every schema change after that must
     /// be expressed as an explicit migration keyed by `user_version`.
-    fn run_migrations(conn: &Connection, data_dir: &Path) -> Result<(), String> {
+    fn run_migrations(conn: &Connection, tool_results_root: &Path) -> Result<(), String> {
         let current: i32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .map_err(|e| format!("Failed to read schema version: {}", e))?;
@@ -629,7 +664,7 @@ impl SessionStore {
 
         if current < 15 {
             Self::migrate(conn, 15, "persist oversized tool results", |conn| {
-                Self::migrate_oversized_tool_results(conn, data_dir)
+                Self::migrate_oversized_tool_results(conn, tool_results_root)
             })?;
         }
 
@@ -877,7 +912,10 @@ impl SessionStore {
         Ok(())
     }
 
-    fn migrate_oversized_tool_results(conn: &Connection, data_dir: &Path) -> rusqlite::Result<()> {
+    fn migrate_oversized_tool_results(
+        conn: &Connection,
+        tool_results_root: &Path,
+    ) -> rusqlite::Result<()> {
         fn to_sql_error(error: String) -> rusqlite::Error {
             rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
                 std::io::ErrorKind::Other,
@@ -923,7 +961,7 @@ impl SessionStore {
                     .map(String::as_str)
                     .unwrap_or("unknown");
                 let rewritten = Self::rewrite_tool_result_for_storage_at(
-                    data_dir,
+                    tool_results_root,
                     &session_id,
                     tool_call_id,
                     tool_name,
@@ -1822,7 +1860,8 @@ impl SessionStore {
             .map_err(|e| format!("Session not found: {}", e))?;
 
         let raw_messages = self.get_messages_with_conn(&conn, id)?;
-        let messages = crate::session::history::normalize_tool_round_history(&raw_messages);
+        let mut messages = crate::session::history::normalize_tool_round_history(&raw_messages);
+        Self::mark_missing_persisted_outputs_for_display(&mut messages);
 
         Ok(SessionDetail {
             id: id.to_string(),
@@ -2368,25 +2407,102 @@ impl SessionStore {
         tool_call_id: &str,
         content: &str,
     ) -> Result<String, String> {
+        self.add_tool_result_with_images(session_id, tool_call_id, content, None)
+    }
+
+    pub fn add_tool_result_with_images(
+        &self,
+        session_id: &str,
+        tool_call_id: &str,
+        content: &str,
+        images: Option<&[super::models::ImageData]>,
+    ) -> Result<String, String> {
+        let images_json = images
+            .filter(|imgs| !imgs.is_empty())
+            .map(|imgs| serde_json::to_string(imgs))
+            .transpose()
+            .map_err(|e| format!("Failed to serialize tool result images: {}", e))?;
         self.add_message_full(
             session_id,
             MessageRole::Tool,
             content,
             None,
             Some(tool_call_id),
-            None,
+            images_json.as_deref(),
             None,
             None,
             None,
         )
     }
 
-    fn session_tool_results_dir(&self, session_id: &str) -> PathBuf {
-        Self::session_tool_results_dir_for(&self.data_dir, session_id)
+    fn mark_missing_persisted_outputs_for_display(messages: &mut [ChatMessage]) {
+        for message in messages {
+            Self::mark_missing_persisted_outputs_in_message(message);
+        }
     }
 
-    fn session_tool_results_dir_for(data_dir: &Path, session_id: &str) -> PathBuf {
-        data_dir.join(TOOL_RESULTS_DIR).join(session_id)
+    fn mark_missing_persisted_outputs_in_message(message: &mut ChatMessage) {
+        if message.role == MessageRole::Tool {
+            Self::mark_missing_persisted_output_content(&mut message.content);
+        }
+
+        if let Some(tool_calls) = message.tool_calls.as_mut() {
+            Self::mark_missing_persisted_outputs_in_tool_calls(tool_calls);
+        }
+
+        if let Some(render_parts) = message.render_parts.as_mut() {
+            Self::mark_missing_persisted_outputs_in_render_parts(render_parts);
+        }
+    }
+
+    fn mark_missing_persisted_outputs_in_render_parts(render_parts: &mut [AssistantRenderPart]) {
+        for part in render_parts {
+            match part {
+                AssistantRenderPart::ToolCall { tool_call, .. } => {
+                    Self::mark_missing_persisted_outputs_in_tool_call(tool_call);
+                }
+                AssistantRenderPart::KnowledgeProposal { message, .. } => {
+                    Self::mark_missing_persisted_outputs_in_message(message);
+                }
+                AssistantRenderPart::Thinking { .. } | AssistantRenderPart::Text { .. } => {}
+            }
+        }
+    }
+
+    fn mark_missing_persisted_outputs_in_tool_calls(tool_calls: &mut [ToolCallInfo]) {
+        for tool_call in tool_calls {
+            Self::mark_missing_persisted_outputs_in_tool_call(tool_call);
+        }
+    }
+
+    fn mark_missing_persisted_outputs_in_tool_call(tool_call: &mut ToolCallInfo) {
+        if let Some(output) = tool_call.recorded_output.as_mut() {
+            Self::mark_missing_persisted_output_content(output);
+        }
+        if let Some(output) = tool_call.server_tool_output.as_mut() {
+            Self::mark_missing_persisted_output_content(output);
+        }
+        if let Some(nested) = tool_call.nested_tool_calls.as_mut() {
+            Self::mark_missing_persisted_outputs_in_tool_calls(nested);
+        }
+    }
+
+    fn mark_missing_persisted_output_content(content: &mut String) {
+        let Some(path) = persisted_output_path(content) else {
+            return;
+        };
+        if path.exists() {
+            return;
+        }
+        *content = build_deleted_tool_result_message(&path);
+    }
+
+    fn session_tool_results_dir(&self, session_id: &str) -> PathBuf {
+        Self::session_tool_results_dir_for(&self.tool_results_root, session_id)
+    }
+
+    fn session_tool_results_dir_for(tool_results_root: &Path, session_id: &str) -> PathBuf {
+        tool_results_root.join(session_id)
     }
 
     pub fn rewrite_tool_result_for_storage(
@@ -2397,7 +2513,7 @@ impl SessionStore {
         content: &str,
     ) -> Result<String, String> {
         Self::rewrite_tool_result_for_storage_at(
-            &self.data_dir,
+            &self.tool_results_root,
             session_id,
             tool_call_id,
             tool_name,
@@ -2406,7 +2522,7 @@ impl SessionStore {
     }
 
     fn rewrite_tool_result_for_storage_at(
-        data_dir: &Path,
+        tool_results_root: &Path,
         session_id: &str,
         tool_call_id: &str,
         tool_name: &str,
@@ -2415,6 +2531,7 @@ impl SessionStore {
         if content.is_empty()
             || tool_call_id.is_empty()
             || is_large_result_reference(content)
+            || is_deleted_result_reference(content)
             || content == crate::compact::CLEARED_TOOL_RESULT
         {
             return Ok(content.to_string());
@@ -2429,7 +2546,7 @@ impl SessionStore {
             return Ok(content.to_string());
         }
 
-        let dir = Self::session_tool_results_dir_for(data_dir, session_id);
+        let dir = Self::session_tool_results_dir_for(tool_results_root, session_id);
         std::fs::create_dir_all(&dir).map_err(|e| {
             format!(
                 "Failed to create tool result dir '{}': {}",
@@ -4559,6 +4676,54 @@ mod tests {
         assert_eq!(prompt_messages.len(), 1);
         assert!(prompt_messages[0].content.starts_with("<persisted-output>"));
         assert!(!prompt_messages[0].content.contains(&large_output));
+    }
+
+    #[test]
+    fn missing_persisted_tool_result_is_marked_deleted_for_display() {
+        let dir = tempdir().expect("create temp dir");
+        let store = SessionStore::new(dir.path()).expect("initialize store");
+        let session_id = store
+            .create_session("Deleted Tool Result", None, None, "chat", None)
+            .expect("create session");
+
+        let large_output = "C".repeat(31_000);
+        let stored_output = store
+            .rewrite_tool_result_for_storage(&session_id, "tc-large", "bash", &large_output)
+            .expect("rewrite large output");
+        store
+            .add_assistant_with_tool_calls(
+                &session_id,
+                "",
+                &[ToolCallInfo {
+                    id: "tc-large".to_string(),
+                    name: "bash".to_string(),
+                    arguments: "{}".to_string(),
+                    order: None,
+                    server_tool: None,
+                    server_tool_output: None,
+                    outcome: None,
+                    recorded_output: None,
+                    nested_tool_calls: None,
+                }],
+            )
+            .expect("add assistant");
+        store
+            .add_tool_result(&session_id, "tc-large", &stored_output)
+            .expect("add tool result");
+
+        let tool_dir = store.session_tool_results_dir(&session_id);
+        fs::remove_dir_all(&tool_dir).expect("remove persisted output");
+
+        let detail = store.load_session(&session_id).expect("load session");
+        let tool_message = detail
+            .messages
+            .iter()
+            .find(|message| message.role == MessageRole::Tool)
+            .expect("tool message");
+        assert!(tool_message
+            .content
+            .starts_with("<persisted-output-deleted>"));
+        assert!(tool_message.content.contains("Full output file deleted:"));
     }
 
     #[test]

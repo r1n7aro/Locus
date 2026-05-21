@@ -339,6 +339,43 @@ describe("reduceStreamEvent", () => {
       });
     });
 
+    it("attaches image results to completed tool calls", () => {
+      const image = { data: "iVBORw0KGgo=", mimeType: "image/png" };
+      const state = makeState({ isStreaming: true, activeToolCalls: [{ id: "tc1", name: "unity_capture_viewport", arguments: "{}", status: "running" }] });
+      const event: StreamEvent = { runId: "test-run",
+        type: "toolCallDone",
+        sessionId: "s1",
+        toolCallId: "tc1",
+        toolName: "unity_capture_viewport",
+        output: "{\"image\":\"attached\"}",
+        outcome: "done",
+        images: [image],
+      };
+      const mutations = reduceStreamEvent(state, event);
+
+      expect(mutations).toContainEqual({
+        type: "updateToolCall",
+        id: "tc1",
+        updates: {
+          status: "done",
+          output: "{\"image\":\"attached\"}",
+          progress: null,
+          images: [image],
+        },
+      });
+
+      expect(buildToolResultMessages([
+        {
+          id: "tc1",
+          name: "unity_capture_viewport",
+          arguments: "{}",
+          status: "done",
+          output: "{\"image\":\"attached\"}",
+          images: [image],
+        },
+      ])[0]?.images).toEqual([image]);
+    });
+
     it("marks tool call as error when outcome is error", () => {
       const state = makeState({ isStreaming: true, activeToolCalls: [{ id: "tc1", name: "read", arguments: "{}", status: "running" }] });
       const event: StreamEvent = { runId: "test-run",
@@ -399,27 +436,6 @@ describe("reduceStreamEvent", () => {
       }
     });
 
-    it("emits canvasAutoOpen for canvas tool", () => {
-      const spec = { title: "Test", fields: [] };
-      const tc: ToolCallDisplay = { id: "tc1", name: "canvas", arguments: JSON.stringify({ spec }), status: "running" };
-      const state = makeState({ isStreaming: true, activeToolCalls: [tc] });
-      const event: StreamEvent = { runId: "test-run",
-        type: "toolCallDone",
-        sessionId: "s1",
-        toolCallId: "tc1",
-        toolName: "canvas",
-        output: "ok",
-        outcome: "done",
-      };
-      const mutations = reduceStreamEvent(state, event);
-
-      const canvasMut = mutations.find((m) => m.type === "canvasAutoOpen");
-      expect(canvasMut).toBeDefined();
-      if (canvasMut?.type === "canvasAutoOpen") {
-        expect(canvasMut.toolCallId).toBe("tc1");
-        expect(canvasMut.spec).toEqual(spec);
-      }
-    });
   });
 
   describe("toolCallDelta", () => {

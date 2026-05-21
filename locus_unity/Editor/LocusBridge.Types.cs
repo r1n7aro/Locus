@@ -36,6 +36,26 @@ namespace Locus
         }
 
         [Serializable]
+        private class CaptureViewportRequest
+        {
+            public string target;
+            public string windowTitle;
+        }
+
+        [Serializable]
+        private class CaptureViewportResponse
+        {
+            public string target;
+            public string title;
+            public string path;
+            public int width;
+            public int height;
+            public int originalWidth;
+            public int originalHeight;
+            public string mimeType;
+        }
+
+        [Serializable]
         private class ExecuteCodeProgressSnapshot
         {
             public bool active;

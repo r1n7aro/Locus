@@ -339,6 +339,19 @@ function handleEndpointKeydown(e: KeyboardEvent) {
                 />
               </div>
             </div>
+            <div class="custom-form-row">
+              <label class="custom-form-label">
+                {{ t("settings.custom.imageUnderstanding") }}
+                <span class="custom-form-hint">{{ t("settings.custom.imageUnderstandingHint") }}</span>
+              </label>
+              <div class="custom-checkbox-control">
+                <BaseCheckbox
+                  v-model="endpoint.supportsVision"
+                  :disabled="saving"
+                  :aria-label="t('settings.custom.imageUnderstanding')"
+                />
+              </div>
+            </div>
           </div>
           <div v-if="testStatus !== 'idle'" class="test-result" :class="testStatus">
             <span v-if="testStatus === 'testing'" class="codex-spinner"></span>

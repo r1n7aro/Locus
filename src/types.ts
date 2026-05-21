@@ -300,6 +300,7 @@ export interface CustomEndpoint {
   replayReasoningContent: boolean;
   serverTools: CustomEndpointServerTools;
   supportsToolLazyLoading: boolean;
+  supportsVision: boolean;
 }
 
 export interface ModelDefaults {
@@ -327,6 +328,11 @@ export interface AppStorageInfo {
   usesCustomPath: boolean;
   pendingTargetPath?: string | null;
   restartRequired: boolean;
+}
+
+export interface AppTempInfo {
+  path: string;
+  sizeBytes: number;
 }
 
 export type PythonRuntimeSource = "managed" | "system";
@@ -550,7 +556,15 @@ export type AssetDbScanEvent =
   | { phase: "metaParse"; total: number; completed: number }
   | { phase: "yamlParse"; total: number; completed: number }
   | { phase: "dbWrite" }
-  | { phase: "reconcile"; verifyHashes: boolean }
+  | {
+      phase: "reconcile";
+      verifyHashes: boolean;
+      stage?: "scanning" | "discovering" | "processing" | string | null;
+      total?: number | null;
+      completed?: number | null;
+      queued?: number | null;
+      failed?: number | null;
+    }
   | { phase: "reconcileDone" }
   | { phase: "done"; stats: ScanStats }
   | { phase: "error"; error: AppErrorPayload };
@@ -592,6 +606,7 @@ export type StreamEvent = { runId: string } & (
       toolName: string;
       output: string;
       outcome: ToolCallOutcome;
+      images?: ImageAttachment[];
     }
   | {
       type: "toolCallDelta";
@@ -627,6 +642,7 @@ export type StreamEvent = { runId: string } & (
       toolName: string;
       output: string;
       outcome: ToolCallOutcome;
+      images?: ImageAttachment[];
     }
   | {
       type: "toolCallRoundDone";
@@ -817,6 +833,7 @@ export interface SkillConfig {
   surface: SkillSurface;
   description: string;
   commandTrigger: string;
+  injectMode?: KnowledgeInjectMode;
 }
 
 export type SkillUnityInstallState =
@@ -1769,93 +1786,6 @@ export interface InjectedPromptItem {
   meta?: InjectedToolMeta | Record<string, unknown> | null;
 }
 
-export interface CanvasFieldUpdate {
-  mode: "serialized" | "code";
-  gameObjectPath?: string;
-  componentType?: string;
-  propertyPath?: string;
-  code?: string;
-}
-
-export interface CanvasField {
-  id: string;
-  name: string;
-  label?: string;
-  type:
-    | "int"
-    | "float"
-    | "string"
-    | "bool"
-    | "vector2"
-    | "vector3"
-    | "vector4"
-    | "color"
-    | "enum"
-    | "object_ref"
-    | "asset_ref";
-  value: any;
-  readonly?: boolean;
-  range?: [number, number];
-  enumNames?: string[];
-  update?: CanvasFieldUpdate;
-}
-
-export interface CanvasNode {
-  id: string;
-  label: string;
-  subtitle?: string;
-  position?: { x: number; y: number };
-  fields: CanvasField[];
-}
-
-export interface CanvasEdge {
-  id: string;
-  source: string;
-  sourceField?: string;
-  target: string;
-  label?: string;
-}
-
-export interface CanvasGraphSpec {
-  title: string;
-  context?: {
-    scenePath?: string;
-  };
-  nodes: CanvasNode[];
-  edges?: CanvasEdge[];
-}
-
-export interface CanvasSaveData {
-  version: number;
-  savedAt: string;
-  spec: CanvasGraphSpec;
-  viewState: {
-    panX: number;
-    panY: number;
-    zoom: number;
-    nodePositions: Record<string, { x: number; y: number }>;
-    nodeExpanded: Record<string, boolean>;
-  };
-}
-
-export type UndoEntry =
-  | {
-      type: "field_edit";
-      fieldId: string;
-      oldValue: any;
-      newValue: any;
-      update: CanvasFieldUpdate;
-      valueType: string;
-      timestamp: number;
-    }
-  | {
-      type: "node_move";
-      nodeId: string;
-      oldPosition: { x: number; y: number };
-      newPosition: { x: number; y: number };
-      timestamp: number;
-    };
-
 export interface VcsCheckpoint {
   id: string;
   label: string;
@@ -2312,6 +2242,7 @@ export interface ToolCallDisplay {
   status: "running" | "done" | "error" | "interrupted";
   order?: number;
   output?: string;
+  images?: ImageAttachment[];
   progress?: ToolCallProgress | null;
   nestedToolCalls?: ToolCallDisplay[];
 }

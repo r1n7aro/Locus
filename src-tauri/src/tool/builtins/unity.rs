@@ -225,6 +225,25 @@ pub(super) fn unity_asset_search() -> ToolDef {
     }
 }
 
+// ─── unity_capture_viewport ─────────────────────────────────────────────────
+
+pub(super) fn unity_capture_viewport() -> ToolDef {
+    let prompt = crate::prompt::parse_tool_prompt(crate::prompt::tools::UNITY_CAPTURE_VIEWPORT);
+    ToolDef {
+        name: "unity_capture_viewport".to_string(),
+        description: prompt.description,
+        parameters: prompt.parameters,
+        execute: Arc::new(|_args, _ctx| {
+            Box::pin(async {
+                ToolResult {
+                    output: "Error: unity_capture_viewport should be intercepted by agent loop, not executed directly".to_string(),
+                    is_error: true,
+                }
+            })
+        }),
+    }
+}
+
 // ─── Unity YAML tools ────────────────────────────────────────────────────────
 
 fn intercepted_unity_yaml_tool(name: &str, prompt_json: &str) -> ToolDef {

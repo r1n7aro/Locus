@@ -8,6 +8,7 @@ import {
   parseUnityRunStatesArguments,
   parseUnityRunStatesOutput,
 } from "../../composables/unityRunStatesPreview";
+import { persistedOutputDisplay } from "../toolPersistedOutput";
 
 import type { ToolCallDisplay } from "../../types";
 
@@ -52,20 +53,20 @@ function toggleExpanded() {
   setExpanded(!infoExpanded.value);
 }
 
-function unwrapPersistedOutput(output: string): string {
-  const match = output.match(/^<persisted-output>\n?([\s\S]*?)\n?<\/persisted-output>\s*$/);
-  return match ? match[1].trim() : output;
-}
-
-const displayOutput = computed(() => {
+const outputDisplay = computed(() => {
   const output = props.toolCall.output;
-  return output ? unwrapPersistedOutput(output) : "";
+  return output ? persistedOutputDisplay(output) : { kind: "normal" as const, text: "" };
 });
+
+const displayOutput = computed(() => outputDisplay.value.text);
+const isDeletedOutput = computed(() => outputDisplay.value.kind === "deleted");
+const deletedOutputPath = computed(() => outputDisplay.value.path || "");
 
 const argsPreview = computed(() => parseUnityRunStatesArguments(props.toolCall.arguments));
 
 const outputPreview = computed(() => {
   if (!displayOutput.value) return null;
+  if (isDeletedOutput.value) return null;
   return parseUnityRunStatesOutput(displayOutput.value);
 });
 
@@ -162,8 +163,14 @@ const showToolProgressDots = computed(() => props.toolCall.status === "running" 
 
         <div v-if="toolCall.output !== undefined" class="tool-call-section">
           <div class="tool-call-section-label">{{ t("tool.section.output") }}</div>
+          <div v-if="isDeletedOutput" class="tool-output-deleted">
+            <div class="tool-output-deleted-title">{{ t("tool.persistedOutputDeleted") }}</div>
+            <code v-if="deletedOutputPath" class="tool-output-deleted-path">
+              {{ t("tool.persistedOutputDeletedPath", deletedOutputPath) }}
+            </code>
+          </div>
           <UnityRunStatesOutputPreview
-            v-if="outputPreview"
+            v-else-if="outputPreview"
             :preview="outputPreview"
           />
           <pre v-else class="tool-call-pre ui-select-text" :class="{ 'error-output': toolCall.status === 'error' }">{{ displayOutput }}</pre>
@@ -372,6 +379,31 @@ const showToolProgressDots = computed(() => props.toolCall.status === "running" 
   margin: 0;
   overflow-y: auto;
   scrollbar-gutter: stable;
+}
+
+.tool-output-deleted {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: var(--hover-bg);
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.tool-output-deleted-title {
+  color: var(--text-color);
+  font-weight: 600;
+}
+
+.tool-output-deleted-path {
+  font-family: var(--font-mono-identifier);
+  font-size: 11px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .unity-run-progress {

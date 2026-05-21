@@ -106,6 +106,7 @@ function endpoint(partial: Partial<CustomEndpoint> & Pick<CustomEndpoint, "id" |
     replayReasoningContent: true,
     serverTools: { webSearch: false },
     supportsToolLazyLoading: false,
+    supportsVision: true,
     ...partial,
   };
 }
@@ -178,6 +179,14 @@ describe("custom endpoint persistence", () => {
     state.startAddEndpoint();
 
     expect(state.editingEndpoint.value?.supportsToolLazyLoading).toBe(false);
+  });
+
+  it("starts new endpoints with image understanding enabled", () => {
+    const state = useSettingsState((() => undefined) as never);
+
+    state.startAddEndpoint();
+
+    expect(state.editingEndpoint.value?.supportsVision).toBe(true);
   });
 
   it("starts new endpoints with xhigh and max reasoning efforts", () => {
@@ -256,6 +265,21 @@ describe("custom endpoint persistence", () => {
     await state.loadCustomEndpoints();
 
     expect(state.customEndpoints.value[0].supportsToolLazyLoading).toBe(false);
+  });
+
+  it("normalizes legacy endpoints to enabled image understanding", async () => {
+    const state = useSettingsState((() => undefined) as never);
+    modelServiceMocks.getCustomEndpoints.mockResolvedValueOnce([
+      endpoint({
+        id: "legacy-vision",
+        name: "Legacy Vision",
+        supportsVision: undefined,
+      } as any),
+    ]);
+
+    await state.loadCustomEndpoints();
+
+    expect(state.customEndpoints.value[0].supportsVision).toBe(true);
   });
 
   it("normalizes legacy default reasoning efforts to include xhigh", async () => {

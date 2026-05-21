@@ -3,7 +3,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use crate::session::models::{ChatMessage, MessageRole, ServerToolKind, ToolCallInfo};
+use crate::session::models::{ChatMessage, ImageData, MessageRole, ServerToolKind, ToolCallInfo};
 
 #[derive(Debug, Clone)]
 pub struct LlmResponse {
@@ -1178,7 +1178,10 @@ fn build_anthropic_messages(
                             tool_result_blocks.push(serde_json::json!({
                                 "type": "tool_result",
                                 "tool_use_id": tool_use_id,
-                                "content": tool_msg.content,
+                                "content": build_tool_result_content(
+                                    &tool_msg.content,
+                                    tool_msg.images.as_deref(),
+                                ),
                             }));
                         } else {
                             eprintln!("[Anthropic] skipped tool_result with empty tool_use_id");
@@ -1533,6 +1536,7 @@ fn oauth_public_tool_name(internal_name: &str) -> String {
         "knowledge_edit" => "KnowledgeEdit".to_string(),
         "todowrite" => "TodoWrite".to_string(),
         "unity_asset_search" => "UnityAssetSearch".to_string(),
+        "unity_capture_viewport" => "UnityCaptureViewport".to_string(),
         "unity_execute" => "UnityExecute".to_string(),
         "unity_run_states" => "UnityRunStates".to_string(),
         "unity_recompile" => "UnityRecompile".to_string(),
@@ -1630,6 +1634,25 @@ fn build_text_blocks(text: &str) -> Vec<serde_json::Value> {
 
     push_text_block(&mut blocks, remaining);
     blocks
+}
+
+fn build_tool_result_content(text: &str, images: Option<&[ImageData]>) -> serde_json::Value {
+    let Some(images) = images.filter(|images| !images.is_empty()) else {
+        return serde_json::Value::String(text.to_string());
+    };
+
+    let mut blocks = build_text_blocks(text);
+    for img in images {
+        blocks.push(serde_json::json!({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": img.mime_type,
+                "data": img.data,
+            }
+        }));
+    }
+    serde_json::Value::Array(blocks)
 }
 
 fn push_text_block(blocks: &mut Vec<serde_json::Value>, text: &str) {
@@ -1835,7 +1858,7 @@ mod tests {
         build_oauth_system_blocks, build_text_blocks, convert_tools_to_oauth_sdk_like_anthropic,
         rewrite_oauth_tool_use_blocks, AnthropicHistoryOptions, CACHE_TTL,
     };
-    use crate::session::models::{ChatMessage, MessageRole, ToolCallInfo};
+    use crate::session::models::{ChatMessage, ImageData, MessageRole, ToolCallInfo};
     use serde_json::json;
 
     fn assistant_message(
@@ -2300,5 +2323,43 @@ mod tests {
         assert_eq!(user_blocks.len(), 1);
         assert_eq!(user_blocks[0]["type"], json!("text"));
         assert_eq!(user_blocks[0]["text"], json!("继续"));
+    }
+
+    #[test]
+    fn tool_result_images_are_nested_in_anthropic_tool_result_content() {
+        let history = vec![ChatMessage {
+            id: "tool-1".to_string(),
+            role: MessageRole::Tool,
+            content: "Unity screenshot captured.".to_string(),
+            created_at: 0,
+            prompt_prefix: None,
+            prompt_suffix: None,
+            response_id: None,
+            content_order: None,
+            thinking_order: None,
+            tool_calls: None,
+            tool_call_id: Some("call_1".to_string()),
+            images: Some(vec![ImageData {
+                data: "YWJj".to_string(),
+                mime_type: "image/png".to_string(),
+            }]),
+            asset_refs: None,
+            thinking_content: None,
+            thinking_duration: None,
+            thinking_signature: None,
+            knowledge_proposal: None,
+            render_parts: None,
+        }];
+
+        let messages = build_anthropic_messages(&history, AnthropicHistoryOptions::standard());
+        let tool_result = &messages[0]["content"][0];
+        assert_eq!(tool_result["type"], json!("tool_result"));
+        let content = tool_result["content"]
+            .as_array()
+            .expect("tool_result content should be a block array");
+        assert_eq!(content[0]["type"], json!("text"));
+        assert_eq!(content[1]["type"], json!("image"));
+        assert_eq!(content[1]["source"]["media_type"], json!("image/png"));
+        assert_eq!(content[1]["source"]["data"], json!("YWJj"));
     }
 }

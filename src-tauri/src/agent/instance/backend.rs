@@ -233,6 +233,7 @@ pub enum LlmBackend {
         replay_reasoning_content: bool,
         server_tools: crate::commands::CustomEndpointServerTools,
         supports_tool_lazy_loading: bool,
+        supports_vision: bool,
     },
 }
 
@@ -271,6 +272,7 @@ pub(super) fn normalize_tool_args(args: &mut serde_json::Value) {
         ("replace_all", "replaceAll"),
         ("editor_status", "editorStatus"),
         ("request_editor_status", "requestEditorStatus"),
+        ("window_title", "windowTitle"),
         ("asset_path", "assetPath"),
         ("max_depth", "maxDepth"),
         ("type_filter", "typeFilter"),

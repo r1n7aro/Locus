@@ -1,6 +1,7 @@
 mod anthropic_agent_sdk;
 mod backend;
 mod prompt_context;
+mod unity_capture;
 
 pub use backend::resolve_openrouter_model;
 pub use backend::{LlmBackend, RawContextStore, RawRound};
@@ -26,8 +27,8 @@ use crate::commands::{
 use crate::compact;
 use crate::llm::{anthropic, chat_completions, codex, openrouter, responses};
 use crate::session::models::{
-    AssistantRenderPart, ChatMessage, MessageRole, PendingSessionInput, RenderOrderKey, TodoItem,
-    ToolCallInfo,
+    AssistantRenderPart, ChatMessage, ImageData, MessageRole, PendingSessionInput, RenderOrderKey,
+    TodoItem, ToolCallInfo,
 };
 use crate::session::store::SessionStore;
 use crate::tool::{ToolExecutionContext, ToolLoadMode, ToolRegistry, ToolResult, ToolRuntimeState};
@@ -45,6 +46,40 @@ fn is_codex_unauthorized_error(error: &str) -> bool {
     lower.contains("401 unauthorized")
         || lower.contains("http error: 401")
         || lower.contains("api error (401")
+}
+
+fn messages_have_images(messages: &[ChatMessage]) -> bool {
+    messages
+        .iter()
+        .any(|msg| msg.images.as_ref().is_some_and(|images| !images.is_empty()))
+}
+
+fn no_vision_endpoint_error() -> String {
+    "This model endpoint is configured without image understanding. Enable Image understanding in the custom endpoint settings or select a vision-capable model before using screenshots or image attachments.".to_string()
+}
+
+fn is_vision_unsupported_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    let image_term = lower.contains("image")
+        || lower.contains("vision")
+        || lower.contains("multimodal")
+        || lower.contains("modality")
+        || lower.contains("image_url");
+    image_term
+        && (lower.contains("unsupported")
+            || lower.contains("not support")
+            || lower.contains("does not support")
+            || lower.contains("not allowed")
+            || lower.contains("invalid")
+            || lower.contains("unknown content type")
+            || lower.contains("content type"))
+}
+
+fn user_friendly_llm_error(error: &str) -> String {
+    if is_vision_unsupported_error(error) {
+        return no_vision_endpoint_error();
+    }
+    error.to_string()
 }
 
 async fn resolve_codex_request_auth(
@@ -413,6 +448,7 @@ impl ParentToolCall {
         tool_name: String,
         output: String,
         outcome: crate::commands::ToolCallOutcome,
+        images: Option<Vec<ImageData>>,
     ) -> ParentStreamEvent {
         ParentStreamEvent {
             run_id: self.run_id.clone(),
@@ -423,6 +459,7 @@ impl ParentToolCall {
                 tool_name,
                 output,
                 outcome,
+                images,
             },
         }
     }
@@ -516,6 +553,7 @@ pub(super) struct ExecutedToolResult {
     is_error: bool,
     outcome: ToolRunOutcome,
     nested_tool_calls: Option<Vec<ToolCallInfo>>,
+    images: Option<Vec<ImageData>>,
 }
 
 impl ToolRunOutcome {
@@ -543,6 +581,7 @@ impl ExecutedToolResult {
             output: result.output,
             is_error: result.is_error,
             nested_tool_calls: None,
+            images: None,
         }
     }
 
@@ -551,6 +590,13 @@ impl ExecutedToolResult {
             output: self.output,
             is_error: self.is_error,
         }
+    }
+
+    pub(super) fn with_images(mut self, images: Vec<ImageData>) -> Self {
+        if !images.is_empty() {
+            self.images = Some(images);
+        }
+        self
     }
 
     pub(super) fn with_nested_tool_calls(mut self, nested_tool_calls: Vec<ToolCallInfo>) -> Self {
@@ -1369,7 +1415,7 @@ fn pluralize_files(count: usize) -> &'static str {
     }
 }
 
-fn prompt_skill_file_name(path: &str) -> String {
+fn prompt_flattened_skill_file_name(path: &str) -> String {
     let normalized = path.replace('\\', "/");
     if let Some(prefix) = normalized.strip_suffix("/SKILL.md") {
         let slug = prefix.rsplit('/').next().unwrap_or(prefix);
@@ -1383,22 +1429,19 @@ fn prompt_skill_file_name(path: &str) -> String {
     }
 }
 
-fn prompt_file_name(doc_type: crate::knowledge_store::KnowledgeType, path: &str) -> String {
-    match doc_type {
-        crate::knowledge_store::KnowledgeType::Skill => prompt_skill_file_name(path),
-        _ => path
-            .replace('\\', "/")
-            .rsplit('/')
-            .next()
-            .unwrap_or(path)
-            .to_string(),
-    }
+fn prompt_file_name(path: &str) -> String {
+    let normalized = path.replace('\\', "/");
+    normalized
+        .rsplit('/')
+        .next()
+        .unwrap_or(&normalized)
+        .to_string()
 }
 
 fn prompt_file_desc(item: &crate::knowledge_store::KnowledgeListItem) -> String {
     let title = item.title.trim();
     if title.is_empty() {
-        prompt_file_name(item.doc_type, &item.path)
+        prompt_file_name(&item.path)
     } else {
         clip_single_line(title, 80)
     }
@@ -1501,8 +1544,14 @@ fn build_prompt_tree(
         }
     }
     for item in items {
+        let file_name =
+            if flatten_skill && item.doc_type == crate::knowledge_store::KnowledgeType::Skill {
+                prompt_flattened_skill_file_name(&item.path)
+            } else {
+                prompt_file_name(&item.path)
+            };
         let file = PromptTreeFile {
-            name: prompt_file_name(item.doc_type, &item.path),
+            name: file_name,
             desc: prompt_file_desc(item),
         };
         let parts: Vec<String> = if flatten_skill {
@@ -1614,6 +1663,7 @@ fn build_structure_section(
         None,
     )?;
     skill_items.extend(crate::commands::list_skill_package_knowledge_items_sync(
+        working_dir,
         None,
     ));
     let memory_items = crate::knowledge_store::list_documents_with_app_root(
@@ -1666,7 +1716,7 @@ fn build_structure_section(
             &unity_note,
         );
     }
-    let skill_tree = build_prompt_tree(&skill_items, empty_skill_directories, true);
+    let skill_tree = build_prompt_tree(&skill_items, empty_skill_directories, false);
     let memory_tree = build_prompt_tree(&memory_items, &memory_directories, false);
 
     let top_entries = if access_mode == KnowledgeAccessMode::ReadOnly {
@@ -1734,7 +1784,7 @@ fn build_search_section() -> String {
     [
         "### Search",
         "1. Start with `knowledge_query` and split exact terms into `lexicalQuery` and intent-style retrieval into `semanticQuery` when useful.",
-        "2. Use `knowledge_read` when you know the target `.md` document path or need a specific document.",
+        "2. Use `knowledge_read` when you know the target document path or need a specific document. For Skill packages, `skill/<package-id>` reads the package root `SKILL.md`.",
         "3. Use `knowledge_list` to browse entries under a type-prefixed directory path prefix such as `design/` or `skill/unity/`.",
     ]
     .join("\n")
@@ -1763,7 +1813,7 @@ fn build_tools_section(access_mode: KnowledgeAccessMode) -> String {
     let mut lines = vec![
         "### Tools",
         "- `knowledge_query`: Search knowledge with separate `lexicalQuery` and `semanticQuery` inputs, plus an optional type-prefixed `pathPrefix`.",
-        "- `knowledge_read`: Read a specific document by type-prefixed `.md` path.",
+        "- `knowledge_read`: Read a specific document by type-prefixed path. For Skill packages, `skill/<package-id>` reads the package root `SKILL.md` and `skill/<package-id>/docs/file.md` reads package child docs.",
         "- `knowledge_list`: Browse entries under a type-prefixed directory path prefix.",
     ];
     if access_mode == KnowledgeAccessMode::Full {
@@ -1772,7 +1822,7 @@ fn build_tools_section(access_mode: KnowledgeAccessMode) -> String {
             "- `knowledge_create`: Create a new non-Skill document or folder at a type-prefixed path. Document paths end with `.md`; directory paths do not. Document creation only accepts initial content.",
             "- `knowledge_move`: Move a document or folder using type-prefixed paths. Document paths end with `.md`; directory paths do not.",
             "- `knowledge_delete`: Delete an obsolete document or folder by type-prefixed path. Document paths end with `.md`; directory paths do not.",
-            "- `skill_create`: Create a Skill as `kind: \"md\"` with metadata or `kind: \"package\"` with package metadata.",
+            "- `skill_create`: Create a Skill as `kind: \"md\"` with metadata or `kind: \"package\"` with package metadata. Use `kind: \"package\"` for Skills that require CLI tools, binaries, scripts, Unity C# files, bundled docs, or any package-local dependency environment.",
             "- `skill_reload`: Load or reload a Skill manifest after edits and return validation errors.",
             "- `skill_list`: List discoverable project Skills, built-in app Skills, and app Skill packages.",
         ]);
@@ -2367,10 +2417,21 @@ impl AgentInstance {
                 .or_else(|| require_workspace_bound("filePath")),
             "unity_recompile" => require_non_empty("project_path", "to be set explicitly")
                 .or_else(|| require_absolute_without_workspace("project_path")),
-            "unity_execute" | "unity_run_states" | "unity_ref_search" | "unity_asset_search"
-            | "unity_yaml_list" | "unity_yaml_search" | "unity_yaml_read" | "knowledge_list"
-            | "knowledge_query" | "knowledge_read" | "knowledge_create" | "knowledge_delete"
-            | "knowledge_move" | "knowledge_edit" => {
+            "unity_execute"
+            | "unity_run_states"
+            | "unity_capture_viewport"
+            | "unity_ref_search"
+            | "unity_asset_search"
+            | "unity_yaml_list"
+            | "unity_yaml_search"
+            | "unity_yaml_read"
+            | "knowledge_list"
+            | "knowledge_query"
+            | "knowledge_read"
+            | "knowledge_create"
+            | "knowledge_delete"
+            | "knowledge_move"
+            | "knowledge_edit" => {
                 if has_working_dir {
                     None
                 } else {
@@ -4764,9 +4825,13 @@ impl AgentInstance {
                 replay_reasoning_content,
                 server_tools,
                 supports_tool_lazy_loading: _,
+                supports_vision,
                 ..
             } => {
                 use crate::commands::{ApiFormat, CustomReasoningParamFormat};
+                if !supports_vision && messages_have_images(messages) {
+                    return Err(no_vision_endpoint_error());
+                }
                 let custom_reasoning_effort = crate::llm::openai_reasoning::custom_reasoning_effort(
                     self.effort.as_deref(),
                     supported_reasoning_efforts,
@@ -5828,6 +5893,7 @@ impl AgentInstance {
             is_error: false,
             outcome: ToolRunOutcome::Interrupted,
             nested_tool_calls: None,
+            images: None,
         }
     }
 
@@ -6655,6 +6721,7 @@ impl AgentInstance {
                         break;
                     }
                     Some(Err(e)) => {
+                        let e = user_friendly_llm_error(&e);
                         eprintln!(
                             "[Agent {}] LLM attempt error: session={} run={} iteration={} attempt={}/{} elapsed_ms={} error={}",
                             self.id,
@@ -6882,6 +6949,7 @@ impl AgentInstance {
                         tool_name: tc.name.clone(),
                         output: output.clone(),
                         outcome: crate::commands::ToolCallOutcome::Done,
+                        images: None,
                     });
                     if let Some(ref parent) = self.parent_tool_call {
                         emit_parent_stream(
@@ -6902,6 +6970,7 @@ impl AgentInstance {
                                 tc.name.clone(),
                                 output.clone(),
                                 crate::commands::ToolCallOutcome::Done,
+                                None,
                             ),
                         );
                     }
@@ -7169,6 +7238,7 @@ impl AgentInstance {
                         tool_name: tc.name.clone(),
                         output: stored_output.clone(),
                         outcome: result.outcome.as_stream_outcome(),
+                        images: result.images.clone(),
                     });
                     if let Some(ref parent) = self.parent_tool_call {
                         let truncated_output = if stored_output.chars().count() > 500 {
@@ -7184,14 +7254,16 @@ impl AgentInstance {
                                 tc.name.clone(),
                                 truncated_output,
                                 result.outcome.as_stream_outcome(),
+                                result.images.clone(),
                             ),
                         );
                     }
 
-                    if let Err(e) = store.add_tool_result(
+                    if let Err(e) = store.add_tool_result_with_images(
                         &self.session_id,
                         &tc.id,
                         &stored_output,
+                        result.images.as_deref(),
                     ) {
                         eprintln!(
                             "[Agent {}] failed to save tool_result for '{}' (id={}): {}",
@@ -7616,11 +7688,11 @@ impl AgentInstance {
                 | "todowrite"
                 | "unity_ref_search"
                 | "unity_asset_search"
+                | "unity_capture_viewport"
                 | "unity_yaml_list"
                 | "unity_yaml_search"
                 | "unity_yaml_read"
                 | "unity_recompile"
-                | "canvas"
                 | "knowledge_list"
                 | "knowledge_query"
                 | "knowledge_read"
@@ -8226,6 +8298,9 @@ impl AgentInstance {
                 .await
         } else if tc.name == "unity_run_states" {
             self.await_tool_result(self.execute_unity_run_states(app_handle, &tc.id, args, run_id))
+                .await
+        } else if tc.name == "unity_capture_viewport" {
+            self.await_executed_tool_result(self.execute_unity_capture_viewport(args))
                 .await
         } else if tc.name == "unity_ref_search" {
             ExecutedToolResult::from_tool_result(self.execute_unity_ref_search(app_handle, args))
@@ -11752,6 +11827,7 @@ mod tests {
             "read".to_string(),
             "ok".to_string(),
             ToolCallOutcome::Done,
+            None,
         );
         assert_eq!(done.run_id, "parent-run");
         match done.event {
@@ -11762,6 +11838,7 @@ mod tests {
                 tool_name,
                 output,
                 outcome,
+                images,
             } => {
                 assert_eq!(session_id, "parent-session");
                 assert_eq!(parent_tool_call_id, "task-1");
@@ -11769,6 +11846,7 @@ mod tests {
                 assert_eq!(tool_name, "read");
                 assert_eq!(output, "ok");
                 assert_eq!(outcome, ToolCallOutcome::Done);
+                assert!(images.is_none());
             }
             other => panic!("unexpected event: {:?}", other),
         }
@@ -12495,6 +12573,7 @@ PrefabInstance:
                     "edit".to_string(),
                     "unity_execute".to_string(),
                     "unity_run_states".to_string(),
+                    "unity_capture_viewport".to_string(),
                     "web_fetch".to_string(),
                     "knowledge_create".to_string(),
                     "knowledge_edit".to_string(),
@@ -12525,6 +12604,9 @@ PrefabInstance:
             cancel_rx,
         );
 
+        let request_tool_names = instance.build_request_tool_names().await;
+        assert!(!request_tool_names.contains(&"unity_capture_viewport".to_string()));
+
         let items = instance.available_tool_prompt_items().await;
 
         assert_eq!(tool_load_mode(&items, "tool_load"), "direct");
@@ -12537,7 +12619,12 @@ PrefabInstance:
         assert_eq!(tool_load_mode(&items, "knowledge_move"), "lazy");
         assert_eq!(tool_load_mode(&items, "knowledge_delete"), "lazy");
         assert_eq!(tool_load_mode(&items, "unity_run_states"), "lazy");
+        assert_eq!(tool_load_mode(&items, "unity_capture_viewport"), "lazy");
         assert_eq!(tool_load_mode(&items, "web_fetch"), "lazy");
+        assert_eq!(
+            tool_meta_bool(&items, "unity_capture_viewport", "directLoaded"),
+            Some(false)
+        );
         assert_eq!(
             tool_meta_bool(&items, "edit", "canConfigureDirectLoad"),
             Some(true)
@@ -12565,6 +12652,7 @@ PrefabInstance:
                     "knowledge_create".to_string(),
                     "knowledge_delete".to_string(),
                     "unity_run_states".to_string(),
+                    "unity_capture_viewport".to_string(),
                 ],
                 sub_agents: Vec::new(),
                 default: false,
@@ -12595,6 +12683,7 @@ PrefabInstance:
         assert!(parts.env_prompt.contains("- `knowledge_create`"));
         assert!(parts.env_prompt.contains("- `knowledge_delete`"));
         assert!(parts.env_prompt.contains("- `unity_run_states`"));
+        assert!(parts.env_prompt.contains("- `unity_capture_viewport`"));
         assert!(parts.env_prompt.contains("- `web_fetch`"));
         assert!(!parts.env_prompt.contains("- `read`"));
 
@@ -12607,6 +12696,7 @@ PrefabInstance:
         assert!(manifest.content.contains("- `knowledge_create`"));
         assert!(manifest.content.contains("- `knowledge_delete`"));
         assert!(manifest.content.contains("- `unity_run_states`"));
+        assert!(manifest.content.contains("- `unity_capture_viewport`"));
         assert!(manifest.content.contains("- `web_fetch`"));
         assert!(!manifest.content.contains("- `read`"));
     }
@@ -13403,6 +13493,64 @@ Use profiler helpers.
         assert!(structure.contains("combat/"));
         assert!(!structure.contains("combat/ :: Combat systems summary"));
         assert!(!structure.contains("Keep verified combat structure only"));
+    }
+
+    #[test]
+    fn structure_section_keeps_skill_subdirectories_in_readable_paths() {
+        let temp = tempdir().expect("temp dir");
+        let working_dir = temp.path().to_string_lossy().to_string();
+
+        save_document(
+            &working_dir,
+            KnowledgeDocument {
+                id: "kd_skill_builtin_create_skill".to_string(),
+                doc_type: KnowledgeType::Skill,
+                path: "builtin/create-skill.md".to_string(),
+                title: "Create Skill".to_string(),
+                inject_mode: KnowledgeInjectMode::None,
+                inherit_inject_mode: false,
+                inject_mode_source: Default::default(),
+                summary_enabled: true,
+                command_enabled: true,
+                read_only: false,
+                ai_maintained: false,
+                storage_source: crate::knowledge_store::KnowledgeStorageSource::Project,
+                inherit_ai_config: false,
+                ai_config_source: Default::default(),
+                explicit_maintenance_rules: false,
+                external_source: None,
+                skill_enabled: Some(true),
+                skill_surface: None,
+                command_trigger: Some("/create-skill".to_string()),
+                argument_hint: None,
+                summary: Some("Create reusable Skills.".to_string()),
+                body: "Body".to_string(),
+                maintenance_rules: None,
+                created_at: 0,
+                updated_at: 0,
+            },
+        )
+        .expect("save skill doc");
+
+        let structure = build_structure_section(&working_dir, None, KnowledgeAccessMode::Full)
+            .expect("build structure");
+        let skill_index = structure.find("skill/ ::").unwrap_or_else(|| {
+            panic!("expected skill section in structure:\n{}", structure);
+        });
+        let builtin_index = structure.find("builtin/").unwrap_or_else(|| {
+            panic!("expected builtin directory in structure:\n{}", structure);
+        });
+        let doc_index = structure
+            .find("create-skill.md :: create-skill")
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected create-skill document in structure:\n{}",
+                    structure
+                );
+            });
+
+        assert!(skill_index < builtin_index);
+        assert!(builtin_index < doc_index);
     }
 
     #[test]

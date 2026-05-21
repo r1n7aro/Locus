@@ -531,6 +531,7 @@ async fn resolve_model_backend(
             replay_reasoning_content: endpoint.replay_reasoning_content.unwrap_or(false),
             server_tools: endpoint.server_tools.clone(),
             supports_tool_lazy_loading: endpoint.supports_tool_lazy_loading,
+            supports_vision: endpoint.supports_vision,
         });
     }
 
@@ -830,6 +831,7 @@ pub async fn chat(
             replay_reasoning_content: ep.replay_reasoning_content.unwrap_or(false),
             server_tools: ep.server_tools.clone(),
             supports_tool_lazy_loading: ep.supports_tool_lazy_loading,
+            supports_vision: ep.supports_vision,
         }
     } else if is_openrouter {
         let api_key = api_key_state.read().await.clone();

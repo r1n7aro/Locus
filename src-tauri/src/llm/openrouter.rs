@@ -1,7 +1,7 @@
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 
-use crate::session::models::{ChatMessage, MessageRole, ToolCallInfo};
+use crate::session::models::{ChatMessage, ImageData, MessageRole, ToolCallInfo};
 
 #[derive(Debug, Clone)]
 pub struct LlmResponse {
@@ -450,7 +450,9 @@ fn build_api_messages(system_prompt: &str, history: &[ChatMessage]) -> Vec<serde
         }],
     })];
 
-    for msg in history {
+    let mut i = 0usize;
+    while i < history.len() {
+        let msg = &history[i];
         match msg.role {
             MessageRole::User => {
                 if let Some(ref images) = msg.images {
@@ -510,17 +512,71 @@ fn build_api_messages(system_prompt: &str, history: &[ChatMessage]) -> Vec<serde
                 messages.push(m);
             }
             MessageRole::Tool => {
-                messages.push(serde_json::json!({
-                    "role": "tool",
-                    "tool_call_id": msg.tool_call_id.as_deref().unwrap_or(""),
-                    "content": msg.content,
-                }));
+                let mut tool_image_text_parts = Vec::new();
+                let mut tool_images = Vec::new();
+                while i < history.len() && history[i].role == MessageRole::Tool {
+                    let tool_msg = &history[i];
+                    messages.push(serde_json::json!({
+                        "role": "tool",
+                        "tool_call_id": tool_msg.tool_call_id.as_deref().unwrap_or(""),
+                        "content": tool_msg.content,
+                    }));
+                    if let Some(images) = tool_msg.images.as_ref().filter(|imgs| !imgs.is_empty()) {
+                        tool_image_text_parts.push(format_tool_image_text(tool_msg));
+                        tool_images.extend(images.iter().cloned());
+                    }
+                    i += 1;
+                }
+                if !tool_images.is_empty() {
+                    messages.push(serde_json::json!({
+                        "role": "user",
+                        "content": build_tool_image_user_content(
+                            &tool_image_text_parts.join("\n\n"),
+                            &tool_images,
+                        ),
+                    }));
+                }
+                continue;
             }
         }
+        i += 1;
     }
 
     apply_cache_control_openrouter(&mut messages);
     messages
+}
+
+fn format_tool_image_text(msg: &ChatMessage) -> String {
+    let call_id = msg.tool_call_id.as_deref().unwrap_or("").trim();
+    let header = if call_id.is_empty() {
+        "Tool result image attachment:".to_string()
+    } else {
+        format!("Tool result image attachment for `{}`:", call_id)
+    };
+    if msg.content.trim().is_empty() {
+        header
+    } else {
+        format!("{}\n{}", header, msg.content)
+    }
+}
+
+fn build_tool_image_user_content(text: &str, images: &[ImageData]) -> serde_json::Value {
+    let mut blocks = Vec::new();
+    if !text.is_empty() {
+        blocks.push(serde_json::json!({
+            "type": "text",
+            "text": text,
+        }));
+    }
+    for img in images {
+        blocks.push(serde_json::json!({
+            "type": "image_url",
+            "image_url": {
+                "url": format!("data:{};base64,{}", img.mime_type, img.data),
+            }
+        }));
+    }
+    serde_json::Value::Array(blocks)
 }
 
 fn apply_cache_control_openrouter(messages: &mut Vec<serde_json::Value>) {
@@ -772,7 +828,7 @@ mod tests {
         apply_tool_call_delta, build_api_messages, build_request_body, collect_tool_calls,
         finalize_stream_response, usage_totals, PartialToolCall, StreamToolCallDelta, StreamUsage,
     };
-    use crate::session::models::{ChatMessage, MessageRole, ToolCallInfo};
+    use crate::session::models::{ChatMessage, ImageData, MessageRole, ToolCallInfo};
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
@@ -802,6 +858,18 @@ mod tests {
             knowledge_proposal: None,
             render_parts: None,
         }
+    }
+
+    fn chat_message_with_images(
+        role: MessageRole,
+        content: &str,
+        tool_calls: Option<Vec<ToolCallInfo>>,
+        tool_call_id: Option<&str>,
+        images: Vec<ImageData>,
+    ) -> ChatMessage {
+        let mut message = chat_message(role, content, tool_calls, tool_call_id);
+        message.images = Some(images);
+        message
     }
 
     fn complete_tool_call(id: &str, name: &str, arguments: &str) -> PartialToolCall {
@@ -899,6 +967,37 @@ mod tests {
         assert_eq!(
             messages[4]["content"][0]["cache_control"],
             serde_json::json!({ "type": "ephemeral" })
+        );
+    }
+
+    #[test]
+    fn tool_result_images_become_followup_user_image_blocks() {
+        let messages = build_api_messages(
+            "system prompt",
+            &[
+                chat_message(MessageRole::Tool, "plain", None, Some("tool_1")),
+                chat_message_with_images(
+                    MessageRole::Tool,
+                    "screenshot",
+                    None,
+                    Some("tool_2"),
+                    vec![ImageData {
+                        data: "YWJj".to_string(),
+                        mime_type: "image/png".to_string(),
+                    }],
+                ),
+            ],
+        );
+
+        assert_eq!(messages[1]["role"], serde_json::json!("tool"));
+        assert_eq!(messages[2]["role"], serde_json::json!("tool"));
+        assert_eq!(messages[3]["role"], serde_json::json!("user"));
+        let blocks = messages[3]["content"].as_array().unwrap();
+        assert_eq!(blocks[0]["type"], serde_json::json!("text"));
+        assert_eq!(blocks[1]["type"], serde_json::json!("image_url"));
+        assert_eq!(
+            blocks[1]["image_url"]["url"],
+            serde_json::json!("data:image/png;base64,YWJj")
         );
     }
 

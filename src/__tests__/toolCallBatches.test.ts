@@ -60,6 +60,30 @@ describe("toolCallBatches", () => {
     ]);
   });
 
+  it("attaches persisted tool result images to historical tool calls", () => {
+    const image = { data: "iVBORw0KGgo=", mimeType: "image/png" };
+    const message: Pick<ChatMessage, "toolCalls"> = {
+      toolCalls: [
+        {
+          id: "tc-image",
+          name: "unity_capture_viewport",
+          arguments: "{\"target\":\"scene\"}",
+        },
+      ],
+    };
+
+    expect(buildMessageToolCalls(message, { "tc-image": "{\"image\":\"attached\"}" }, { "tc-image": [image] })).toEqual([
+      {
+        id: "tc-image",
+        name: "unity_capture_viewport",
+        arguments: "{\"target\":\"scene\"}",
+        status: "done",
+        output: "{\"image\":\"attached\"}",
+        images: [image],
+      },
+    ]);
+  });
+
   it("prefers server tool output for historical message tool calls", () => {
     const message: Pick<ChatMessage, "toolCalls"> = {
       toolCalls: [

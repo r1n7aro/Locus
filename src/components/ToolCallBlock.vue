@@ -1,16 +1,16 @@
 
 <script setup lang="ts">
 import { ref, computed, nextTick, watch } from "vue";
-import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
-import { canvasSetSpec } from "../services/canvas";
 import MarkdownRenderer from "./MarkdownRenderer.vue";
 import ToolCallCollection from "./ToolCallCollection.vue";
+import ToolResultImages from "./ToolResultImages.vue";
 import FileDiffViewer from "./diff/FileDiffViewer.vue";
 import hljs, { langFromPath } from "../hljs";
 import { diffStrings } from "../services/diff";
 import { t } from "../i18n";
 import { resolveToolBlockOverride } from "./tool-block-overrides/toolBlockOverrides";
 import { buildToolCallArgsSummary } from "./toolCallSummary";
+import { persistedOutputDisplay } from "./toolPersistedOutput";
 import { traceToolBlockLayoutChange } from "../services/layoutDiagnostics";
 
 import type { ToolCallDisplay, FileDiffPayload } from "../types";
@@ -61,7 +61,6 @@ const waitingLabel = computed(() => (
   isSubagentTool.value ? t("tool.subagentWaiting") : t("tool.waiting")
 ));
 
-const isCanvasTool = computed(() => props.toolCall.name === "canvas");
 const showRecompileHint = computed(() => props.toolCall.name === "unity_recompile" && props.toolCall.status === "running");
 const toolBlockOverride = computed(() => resolveToolBlockOverride(props.toolCall.name));
 const toolLayoutKey = computed(() => props.toolCall.id || props.toolCall.name);
@@ -141,58 +140,6 @@ watch(
     }
   },
 );
-
-const canvasInfo = computed(() => {
-  if (!isCanvasTool.value) return null;
-  try {
-    const args = JSON.parse(props.toolCall.arguments);
-    const spec = args.spec;
-    if (!spec) return null;
-    return {
-      title: spec.title || "Canvas",
-      nodeCount: spec.nodes?.length || 0,
-      edgeCount: spec.edges?.length || 0,
-    };
-  } catch {
-    return null;
-  }
-});
-
-async function openCanvasWindow() {
-  try {
-    const args = JSON.parse(props.toolCall.arguments);
-    const spec = args.spec;
-    if (!spec) return;
-
-    const specId = props.toolCall.id;
-
-    const existingWin = await WebviewWindow.getByLabel(`canvas-${specId}`);
-    if (existingWin) {
-      await existingWin.setFocus();
-      return;
-    }
-
-    await canvasSetSpec(specId, JSON.stringify(spec));
-
-    const canvasWin = new WebviewWindow(`canvas-${specId}`, {
-      url: `/canvas?specId=${specId}`,
-      title: `Canvas: ${spec.title || "Canvas"}`,
-      width: 1200,
-      height: 800,
-      minWidth: 600,
-      minHeight: 400,
-      decorations: true,
-      resizable: true,
-      center: true,
-    });
-
-    canvasWin.once("tauri://error", (e) => {
-      console.error("Canvas window error:", e);
-    });
-  } catch (e) {
-    console.error("Failed to open canvas window:", e);
-  }
-}
 
 const statusIcon = computed(() => {
   switch (props.toolCall.status) {
@@ -383,19 +330,21 @@ function getFilePath(): string {
   }
 }
 
-function unwrapPersistedOutput(output: string): string {
-  const match = output.match(/^<persisted-output>\n?([\s\S]*?)\n?<\/persisted-output>\s*$/);
-  return match ? match[1].trim() : output;
-}
-
-const displayOutput = computed(() => {
+const outputDisplay = computed(() => {
   const output = props.toolCall.output;
-  return output ? unwrapPersistedOutput(output) : "";
+  return output ? persistedOutputDisplay(output) : { kind: "normal" as const, text: "" };
 });
+
+const displayOutput = computed(() => outputDisplay.value.text);
+const isDeletedOutput = computed(() => outputDisplay.value.kind === "deleted");
+const deletedOutputPath = computed(() => outputDisplay.value.path || "");
+const toolResultImages = computed(() => props.toolCall.images ?? []);
+const hasToolResultImages = computed(() => toolResultImages.value.length > 0);
 
 const highlightedOutput = computed(() => {
   const output = props.toolCall.output;
   if (!output) return null;
+  if (outputDisplay.value.kind !== "normal") return null;
   const name = props.toolCall.name;
   if (name !== "read" && name !== "write" && name !== "edit") return null;
   const filePath = getFilePath();
@@ -403,7 +352,7 @@ const highlightedOutput = computed(() => {
   const lang = langFromPath(filePath);
   if (!lang) return null;
   try {
-    let code = output;
+    let code = displayOutput.value;
     const contentMatch = code.match(/^<content>\n?([\s\S]*?)\n?<\/content>\s*$/);
     if (contentMatch) {
       code = contentMatch[1];
@@ -455,11 +404,6 @@ const highlightedOutput = computed(() => {
     <div v-if="showRecompileHint" class="recompile-hint">
       <div class="recompile-hint-main">{{ t("tool.recompile.hint") }}</div>
       <div class="recompile-hint-sub">{{ t("tool.recompile.sub") }}</div>
-    </div>
-    <div v-if="isCanvasTool && canvasInfo && toolCall.status === 'done'" class="canvas-tool-summary">
-      <button class="canvas-open-btn" @click.stop="openCanvasWindow">
-        {{ t("tool.canvas.open") }}
-      </button>
     </div>
     <div v-if="expanded" class="tool-call-detail">
       <div class="tool-call-section">
@@ -513,7 +457,7 @@ const highlightedOutput = computed(() => {
           {{ t("tool.section.output") }}
           <span v-if="toolCall.status === 'running' && toolCall.output" class="output-streaming-indicator"></span>
         </div>
-        <template v-if="toolCall.output || (isSubagentTool && toolCall.nestedToolCalls && toolCall.nestedToolCalls.length > 0)">
+        <template v-if="toolCall.output || hasToolResultImages || (isSubagentTool && toolCall.nestedToolCalls && toolCall.nestedToolCalls.length > 0)">
           <div v-if="isSubagentTool && toolCall.status !== 'error'" class="subagent-output ui-select-text" :class="{ 'streaming-output': toolCall.status === 'running' }" ref="outputPre">
             <div v-if="toolCall.nestedToolCalls && toolCall.nestedToolCalls.length > 0" class="nested-tool-calls">
               <ToolCallCollection
@@ -532,10 +476,23 @@ const highlightedOutput = computed(() => {
                 </template>
               </ToolCallCollection>
             </div>
-            <MarkdownRenderer v-if="toolCall.output" :content="toolCall.output" />
+            <div v-if="toolCall.output && isDeletedOutput" class="tool-output-deleted">
+              <div class="tool-output-deleted-title">{{ t("tool.persistedOutputDeleted") }}</div>
+              <code v-if="deletedOutputPath" class="tool-output-deleted-path">
+                {{ t("tool.persistedOutputDeletedPath", deletedOutputPath) }}
+              </code>
+            </div>
+            <MarkdownRenderer v-else-if="toolCall.output" :content="displayOutput" />
+          </div>
+          <div v-else-if="toolCall.output && isDeletedOutput" class="tool-output-deleted">
+            <div class="tool-output-deleted-title">{{ t("tool.persistedOutputDeleted") }}</div>
+            <code v-if="deletedOutputPath" class="tool-output-deleted-path">
+              {{ t("tool.persistedOutputDeletedPath", deletedOutputPath) }}
+            </code>
           </div>
           <pre v-else-if="toolCall.output && highlightedOutput" class="tool-call-pre ui-select-text hljs" :class="{ 'error-output': toolCall.status === 'error', 'streaming-output': toolCall.status === 'running' }" ref="outputPre" v-html="highlightedOutput"></pre>
           <pre v-else-if="toolCall.output" class="tool-call-pre ui-select-text" :class="{ 'error-output': toolCall.status === 'error', 'streaming-output': toolCall.status === 'running' }" ref="outputPre">{{ displayOutput }}</pre>
+          <ToolResultImages v-if="hasToolResultImages" :images="toolResultImages" />
         </template>
         <template v-else>
           <div v-if="toolCall.status === 'running'" class="tool-call-waiting">
@@ -790,6 +747,31 @@ const highlightedOutput = computed(() => {
   scrollbar-gutter: stable;
 }
 
+.tool-output-deleted {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: var(--hover-bg);
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.tool-output-deleted-title {
+  color: var(--text-color);
+  font-weight: 600;
+}
+
+.tool-output-deleted-path {
+  font-family: var(--font-mono-identifier);
+  font-size: 11px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .subagent-output {
   padding: 6px 8px;
   border-radius: 6px;
@@ -991,28 +973,6 @@ const highlightedOutput = computed(() => {
   font-size: 11px;
   color: color-mix(in srgb, var(--status-warn-fg) 48%, var(--text-secondary));
   margin-top: 2px;
-}
-
-.canvas-tool-summary {
-  padding: 6px 10px;
-  border-top: 1px solid var(--border-color);
-}
-
-.canvas-open-btn {
-  background: #2d5a3e;
-  border: 1px solid #3fb950;
-  color: #3fb950;
-  padding: 5px 16px;
-  border-radius: 5px;
-  cursor: pointer;
-  font-size: 12px;
-  font-weight: 500;
-  transition: background 0.15s;
-}
-
-.canvas-open-btn:hover {
-  background: #3a6b4e;
-  color: #fff;
 }
 
 .edit-diff-container {

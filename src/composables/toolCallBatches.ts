@@ -1,4 +1,4 @@
-import type { AssistantRenderPart, ChatMessage, ToolCallDisplay, ToolCallInfo } from "../types";
+import type { AssistantRenderPart, ChatMessage, ImageAttachment, ToolCallDisplay, ToolCallInfo } from "../types";
 
 const INTERRUPTED_TOOL_RESULT = "工具执行被用户中止，未返回结果。";
 const GENERIC_ARGUMENT_ALIAS_GROUPS: Array<readonly [string, readonly string[]]> = [
@@ -520,20 +520,25 @@ export function resolveToolCallInfosForRender(
 export function buildMessageToolCalls(
   message: Pick<ChatMessage, "toolCalls">,
   toolOutputMap: Record<string, string>,
+  toolOutputImageMap: Record<string, ImageAttachment[]> = {},
 ): ToolCallDisplay[] {
-  return (message.toolCalls ?? []).map((toolCall) => buildMessageToolCall(toolCall, toolOutputMap));
+  return (message.toolCalls ?? []).map((toolCall) =>
+    buildMessageToolCall(toolCall, toolOutputMap, toolOutputImageMap),
+  );
 }
 
 export function buildMessageToolCall(
   toolCall: ToolCallInfo,
   toolOutputMap: Record<string, string>,
+  toolOutputImageMap: Record<string, ImageAttachment[]> = {},
 ): ToolCallDisplay {
   const output =
     toolCall.recordedOutput
     ?? toolCall.serverToolOutput
     ?? toolOutputMap[toolCall.id];
+  const images = toolOutputImageMap[toolCall.id];
 
-  return {
+  const display: ToolCallDisplay = {
     id: toolCall.id,
     name: toolCall.name,
     arguments: toolCall.arguments,
@@ -541,9 +546,13 @@ export function buildMessageToolCall(
     status: inferToolCallStatus(toolCall, output),
     output,
     nestedToolCalls: toolCall.nestedToolCalls?.map((nestedToolCall) =>
-      buildMessageToolCall(nestedToolCall, toolOutputMap),
+      buildMessageToolCall(nestedToolCall, toolOutputMap, toolOutputImageMap),
     ),
   };
+  if (images && images.length > 0) {
+    display.images = images;
+  }
+  return display;
 }
 
 function inferToolCallStatus(

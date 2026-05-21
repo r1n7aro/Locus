@@ -115,10 +115,18 @@ fn normalize_tool_name_key(name: &str) -> String {
 pub fn default_load_mode_for_builtin_tool(name: &str) -> ToolLoadMode {
     if matches!(
         normalize_tool_name_key(name).as_str(),
+        "skill_list" | "skill_reload"
+    ) {
+        return ToolLoadMode::Skill;
+    }
+
+    if matches!(
+        normalize_tool_name_key(name).as_str(),
         "knowledge_create"
             | "knowledge_delete"
             | "knowledge_move"
             | "skill_create"
+            | "unity_capture_viewport"
             | "unity_run_states"
             | "web_fetch"
     ) {
@@ -376,6 +384,34 @@ mod tests {
         assert_eq!(registry.canonical_name("web_fetch"), Some("web_fetch"));
         assert_eq!(registry.default_load_mode("web_fetch"), ToolLoadMode::Lazy);
         assert_eq!(registry.canonical_name("webfetch"), None);
+    }
+
+    #[test]
+    fn builtins_register_unity_capture_viewport_as_lazy() {
+        let registry = ToolRegistry::with_builtins();
+
+        assert_eq!(
+            registry.canonical_name("unity_capture_viewport"),
+            Some("unity_capture_viewport")
+        );
+        assert_eq!(
+            registry.default_load_mode("unity_capture_viewport"),
+            ToolLoadMode::Lazy
+        );
+    }
+
+    #[test]
+    fn builtins_register_skill_lifecycle_tools_as_skill_loaded() {
+        let registry = ToolRegistry::with_builtins();
+
+        assert_eq!(
+            registry.default_load_mode("skill_list"),
+            ToolLoadMode::Skill
+        );
+        assert_eq!(
+            registry.default_load_mode("skill_reload"),
+            ToolLoadMode::Skill
+        );
     }
 
     #[test]

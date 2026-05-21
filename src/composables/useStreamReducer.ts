@@ -59,8 +59,7 @@ export type StreamMutation =
   | { type: "addUndoable"; messageId: string }
   | { type: "setTodos"; runId: string; todos: TodoItem[] }
   | { type: "setStreaming"; value: boolean }
-  | { type: "setCompacting"; value: boolean }
-  | { type: "canvasAutoOpen"; toolCallId: string; spec: unknown };
+  | { type: "setCompacting"; value: boolean };
 
 export function buildToolResultMessages(
   activeToolCalls: ToolCallDisplay[],
@@ -68,13 +67,19 @@ export function buildToolResultMessages(
 ): ChatMessage[] {
   return activeToolCalls
     .filter((toolCall) => toolCall.output !== undefined)
-    .map((toolCall): ChatMessage => ({
-      id: `tool_result_${toolCall.id}`,
-      role: "tool",
-      content: toolCall.output ?? "",
-      createdAt,
-      toolCallId: toolCall.id,
-    }));
+    .map((toolCall): ChatMessage => {
+      const message: ChatMessage = {
+        id: `tool_result_${toolCall.id}`,
+        role: "tool",
+        content: toolCall.output ?? "",
+        createdAt,
+        toolCallId: toolCall.id,
+      };
+      if (toolCall.images && toolCall.images.length > 0) {
+        message.images = toolCall.images;
+      }
+      return message;
+    });
 }
 
 function collectToolCallInfoIds(toolCalls: ToolCallInfo[] | undefined): string[] {
@@ -493,6 +498,14 @@ export function reduceStreamEvent(state: StreamState, event: StreamEvent): Strea
     }
 
     case "toolCallDone": {
+      const updates: Partial<ToolCallDisplay> = {
+        status: event.outcome,
+        output: event.output,
+        progress: null,
+      };
+      if (event.images && event.images.length > 0) {
+        updates.images = event.images;
+      }
       mutations.push({
         type: "updateLiveToolPart",
         toolCallId: event.toolCallId,
@@ -501,7 +514,7 @@ export function reduceStreamEvent(state: StreamState, event: StreamEvent): Strea
       mutations.push({
         type: "updateToolCall",
         id: event.toolCallId,
-        updates: { status: event.outcome, output: event.output, progress: null },
+        updates,
       });
       // Parse todowrite output
       if (event.toolName === "todowrite" && event.outcome === "done") {
@@ -510,18 +523,6 @@ export function reduceStreamEvent(state: StreamState, event: StreamEvent): Strea
           try {
             const parsed = JSON.parse(event.output.slice(jsonStart)) as TodoItem[];
             mutations.push({ type: "setTodos", runId: event.runId, todos: parsed });
-          } catch { /* ignore */ }
-        }
-      }
-      // Canvas auto-open
-      if (event.toolName === "canvas" && event.outcome === "done") {
-        const canvasTc = state.activeToolCalls.find((t) => t.id === event.toolCallId);
-        if (canvasTc) {
-          try {
-            const parsed = JSON.parse(canvasTc.arguments);
-            if (parsed.spec) {
-              mutations.push({ type: "canvasAutoOpen", toolCallId: event.toolCallId, spec: parsed.spec });
-            }
           } catch { /* ignore */ }
         }
       }
@@ -567,11 +568,18 @@ export function reduceStreamEvent(state: StreamState, event: StreamEvent): Strea
     }
 
     case "subagentToolCallDone": {
+      const updates: Partial<ToolCallDisplay> = {
+        status: event.outcome,
+        output: event.output,
+      };
+      if (event.images && event.images.length > 0) {
+        updates.images = event.images;
+      }
       mutations.push({
         type: "updateNestedToolCall",
         parentId: event.parentToolCallId,
         childId: event.toolCallId,
-        updates: { status: event.outcome, output: event.output },
+        updates,
       });
       break;
     }

@@ -1,0 +1,23 @@
+{
+  "description": "Capture a PNG screenshot from the connected Unity Editor and return it as an image attachment in the tool result.\n\nUse this tool when the Agent needs to inspect the actual visual state of the Game view, Scene view, or a specific Editor window. The current workspace provides the Unity project. The tool always returns PNG image data and a short JSON metadata summary; do not request another format.\n\n`request_editor_status` declares the Unity Editor status required before capture. Locus verifies the Editor is connected and still in that status before requesting the screenshot.\n\nTargets:\n- `game`: captures the visible Game view.\n- `scene`: captures the last active Scene view, or the first available Scene view.\n- `editor_window`: captures an Editor window. Use `window_title` when a specific window should be captured; it matches window title, C# type name, or full type name. If omitted, Locus captures the currently focused Editor window.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "request_editor_status": {
+        "type": "string",
+        "enum": ["editing", "playing", "playing_paused"],
+        "description": "Required Unity Editor status before capture."
+      },
+      "target": {
+        "type": "string",
+        "enum": ["game", "scene", "editor_window"],
+        "description": "Unity viewport or Editor window to capture."
+      },
+      "window_title": {
+        "type": "string",
+        "description": "Optional title or type-name match for target `editor_window`."
+      }
+    },
+    "required": ["request_editor_status", "target"]
+  }
+}

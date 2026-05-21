@@ -383,17 +383,82 @@ fn build_api_messages(
                 messages.push(m);
             }
             MessageRole::Tool => {
-                messages.push(serde_json::json!({
-                    "role": "tool",
-                    "tool_call_id": msg.tool_call_id.as_deref().unwrap_or(""),
-                    "content": msg.content,
-                }));
+                let mut tool_image_text_parts = Vec::new();
+                let mut tool_images = Vec::new();
+                while i < history.len() && history[i].role == MessageRole::Tool {
+                    let tool_msg = &history[i];
+                    messages.push(serde_json::json!({
+                        "role": "tool",
+                        "tool_call_id": tool_msg.tool_call_id.as_deref().unwrap_or(""),
+                        "content": tool_msg.content,
+                    }));
+                    if let Some(images) = tool_msg.images.as_ref().filter(|imgs| !imgs.is_empty()) {
+                        tool_image_text_parts.push(format_tool_image_text(tool_msg));
+                        tool_images.extend(images.iter().cloned());
+                    }
+                    i += 1;
+                }
+                if !tool_images.is_empty() {
+                    messages.push(serde_json::json!({
+                        "role": "user",
+                        "content": build_tool_image_user_content(
+                            &tool_image_text_parts.join("\n\n"),
+                            &tool_images,
+                            flavor,
+                        ),
+                    }));
+                }
+                continue;
             }
         }
         i += 1;
     }
 
     messages
+}
+
+fn format_tool_image_text(msg: &ChatMessage) -> String {
+    let call_id = msg.tool_call_id.as_deref().unwrap_or("").trim();
+    let header = if call_id.is_empty() {
+        "Tool result image attachment:".to_string()
+    } else {
+        format!("Tool result image attachment for `{}`:", call_id)
+    };
+    if msg.content.trim().is_empty() {
+        header
+    } else {
+        format!("{}\n{}", header, msg.content)
+    }
+}
+
+fn build_tool_image_user_content(
+    text: &str,
+    images: &[ImageData],
+    flavor: ChatCompletionsFlavor,
+) -> serde_json::Value {
+    match flavor {
+        ChatCompletionsFlavor::DeepSeek => {
+            serde_json::Value::String(deepseek_text_content(text, Some(images)))
+        }
+        ChatCompletionsFlavor::Generic | ChatCompletionsFlavor::MiniMax => {
+            let mut blocks = Vec::new();
+            if !text.is_empty() {
+                blocks.push(serde_json::json!({
+                    "type": "text",
+                    "text": text,
+                }));
+            }
+            for img in images {
+                blocks.push(serde_json::json!({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": format!("data:{};base64,{}", img.mime_type, img.data),
+                    }
+                }));
+            }
+            serde_json::Value::Array(blocks)
+        }
+    }
 }
 
 fn should_flatten_deepseek_tool_round(
@@ -478,9 +543,9 @@ fn collect_following_tool_outputs(
             .as_deref()
             .filter(|value| !value.is_empty())
         {
-            outputs
-                .entry(tool_call_id.to_string())
-                .or_insert_with(|| history[index].content.clone());
+            outputs.entry(tool_call_id.to_string()).or_insert_with(|| {
+                deepseek_text_content(&history[index].content, history[index].images.as_deref())
+            });
         }
         *consumed += 1;
         index += 1;
@@ -1264,6 +1329,16 @@ mod tests {
         }
     }
 
+    fn tool_message_with_images(
+        tool_call_id: &str,
+        content: &str,
+        images: Vec<ImageData>,
+    ) -> ChatMessage {
+        let mut message = tool_message(tool_call_id, content);
+        message.images = Some(images);
+        message
+    }
+
     #[test]
     fn deepseek_messages_use_text_content_and_replay_reasoning() {
         let messages = build_api_messages(
@@ -1440,6 +1515,38 @@ mod tests {
         let blocks = messages[1]["content"].as_array().unwrap();
         assert_eq!(blocks[0]["type"], serde_json::json!("image_url"));
         assert_eq!(blocks[1]["type"], serde_json::json!("text"));
+    }
+
+    #[test]
+    fn generic_messages_replay_tool_result_images_as_followup_user_content() {
+        let messages = build_api_messages(
+            "",
+            &[
+                tool_message("call_1", "text result"),
+                tool_message_with_images(
+                    "call_2",
+                    "screenshot",
+                    vec![ImageData {
+                        data: "YWJj".to_string(),
+                        mime_type: "image/png".to_string(),
+                    }],
+                ),
+            ],
+            ChatCompletionsFlavor::Generic,
+            false,
+            false,
+        );
+
+        assert_eq!(messages[0]["role"], serde_json::json!("tool"));
+        assert_eq!(messages[1]["role"], serde_json::json!("tool"));
+        assert_eq!(messages[2]["role"], serde_json::json!("user"));
+        let blocks = messages[2]["content"].as_array().unwrap();
+        assert_eq!(blocks[0]["type"], serde_json::json!("text"));
+        assert_eq!(blocks[1]["type"], serde_json::json!("image_url"));
+        assert_eq!(
+            blocks[1]["image_url"]["url"],
+            serde_json::json!("data:image/png;base64,YWJj")
+        );
     }
 
     #[test]

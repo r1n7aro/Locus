@@ -117,6 +117,7 @@ describe("useModelStore OpenAI effort mapping", () => {
       replayReasoningContent: false,
       serverTools: { webSearch: false },
       supportsToolLazyLoading: false,
+      supportsVision: true,
     }]);
     modelStore.selectedModelId = "custom/endpoint-1";
 
@@ -139,6 +140,7 @@ describe("useModelStore OpenAI effort mapping", () => {
       replayReasoningContent: true,
       serverTools: { webSearch: false },
       supportsToolLazyLoading: false,
+      supportsVision: true,
     } as any]);
     modelStore.selectedModelId = "custom/endpoint-1";
 
@@ -163,6 +165,7 @@ describe("useModelStore OpenAI effort mapping", () => {
       replayReasoningContent: true,
       serverTools: { webSearch: false },
       supportsToolLazyLoading: false,
+      supportsVision: true,
     }]);
     modelStore.selectedModelId = "custom/endpoint-1";
 

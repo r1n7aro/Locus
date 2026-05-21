@@ -1,6 +1,5 @@
 pub mod asset;
 mod auth;
-mod canvas;
 mod diff;
 mod fonts;
 mod git;
@@ -92,6 +91,8 @@ pub enum StreamEvent {
         tool_name: String,
         output: String,
         outcome: ToolCallOutcome,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        images: Option<Vec<crate::session::models::ImageData>>,
     },
     #[serde(rename_all = "camelCase")]
     ToolCallDelta {
@@ -130,6 +131,8 @@ pub enum StreamEvent {
         tool_name: String,
         output: String,
         outcome: ToolCallOutcome,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        images: Option<Vec<crate::session::models::ImageData>>,
     },
     #[serde(rename_all = "camelCase")]
     ToolCallRoundDone {
@@ -327,7 +330,6 @@ pub struct TokenUsage {
 
 pub use asset::*;
 pub use auth::*;
-pub use canvas::*;
 pub use diff::*;
 pub use fonts::*;
 pub use git::*;

@@ -995,6 +995,9 @@ namespace Locus
                     case "compile_run_states":
                         return await HandleCompileRunStates(reqId, msg.message);
 
+                    case "capture_viewport":
+                        return await HandleCaptureViewport(reqId, msg.message);
+
                     case "request_recompile":
                     {
                         PostToMainThread(delegate
@@ -1191,12 +1194,6 @@ namespace Locus
 
                     case "read_yaml":
                         return await HandleReadYaml(reqId, msg.message);
-
-                    case "set_serialized_data":
-                        return await HandleSetSerializedData(reqId, msg.message);
-
-                    case "get_serialized_data":
-                        return await HandleGetSerializedData(reqId, msg.message);
 
                     case "reload_open_scenes":
                     {

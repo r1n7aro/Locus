@@ -728,7 +728,6 @@ export function useSettingsState(emit: SettingsEmit) {
     { name: "edit",               label: "edit",               desc: t("tool.desc.edit"),               defaultMode: "ask"  as const },
     { name: "bash",               label: "bash",               desc: t("tool.desc.bash"),               defaultMode: "ask"  as const },
     { name: "web_fetch",          label: "web_fetch",          desc: t("tool.desc.web_fetch"),          defaultMode: "ask"  as const },
-    { name: "canvas",             label: "canvas",             desc: t("tool.desc.canvas"),             defaultMode: "auto" as const },
     { name: "unity_execute",      label: "unity_execute",      desc: t("tool.desc.unity_execute"),      defaultMode: "ask"  as const },
     { name: "unity_run_states",   label: "unity_run_states",   desc: t("tool.desc.unity_run_states"),   defaultMode: "ask"  as const },
     { name: "unity_recompile",    label: "unity_recompile",    desc: t("tool.desc.unity_recompile"),    defaultMode: "auto" as const },
@@ -922,6 +921,7 @@ export function useSettingsState(emit: SettingsEmit) {
         : defaultReplayReasoningContent(ep),
       serverTools: normalizeServerTools(ep.serverTools),
       supportsToolLazyLoading: ep.supportsToolLazyLoading === true,
+      supportsVision: ep.supportsVision !== false,
     };
   }
 
@@ -970,6 +970,7 @@ export function useSettingsState(emit: SettingsEmit) {
       replayReasoningContent: true,
       serverTools: normalizeServerTools(),
       supportsToolLazyLoading: false,
+      supportsVision: true,
     };
   }
 

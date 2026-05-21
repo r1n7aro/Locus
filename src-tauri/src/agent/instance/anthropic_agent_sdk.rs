@@ -47,8 +47,9 @@ fn save_claude_sdk_tool_result(
     session_id: &str,
     tool_call_id: &str,
     stored_output: &str,
+    images: Option<&[ImageData]>,
 ) -> Result<String, String> {
-    store.add_tool_result(session_id, tool_call_id, stored_output)
+    store.add_tool_result_with_images(session_id, tool_call_id, stored_output, images)
 }
 
 impl<'a> ClaudeSdkRoundHost<'a> {
@@ -88,6 +89,7 @@ impl<'a> ClaudeSdkRoundHost<'a> {
         tool_name: &str,
         output: &str,
         outcome: ToolCallOutcome,
+        images: Option<&[ImageData]>,
     ) {
         emit_stream(
             self.app_handle,
@@ -98,6 +100,7 @@ impl<'a> ClaudeSdkRoundHost<'a> {
                 tool_name: tool_name.to_string(),
                 output: output.to_string(),
                 outcome,
+                images: images.map(|items| items.to_vec()),
             },
         );
         if let Some(ref parent) = self.agent.parent_tool_call {
@@ -114,6 +117,7 @@ impl<'a> ClaudeSdkRoundHost<'a> {
                     tool_name.to_string(),
                     truncated_output,
                     outcome,
+                    images.map(|items| items.to_vec()),
                 ),
             );
         }
@@ -490,6 +494,7 @@ impl<'a> ClaudeSdkHost for ClaudeSdkRoundHost<'a> {
                 &tool_call.name,
                 &stored_output,
                 result.outcome.as_stream_outcome(),
+                result.images.as_deref(),
             );
 
             if let Err(err) = save_claude_sdk_tool_result(
@@ -497,6 +502,7 @@ impl<'a> ClaudeSdkHost for ClaudeSdkRoundHost<'a> {
                 &self.agent.session_id,
                 &tool_call.id,
                 &stored_output,
+                result.images.as_deref(),
             ) {
                 eprintln!(
                     "[Agent {}] failed to save Claude SDK tool result for '{}' (id={}): {}",
@@ -882,7 +888,7 @@ mod tests {
             .rewrite_tool_result_for_storage(&session_id, "tc-sdk", "bash", &full_output)
             .expect("rewrite tool output");
 
-        save_claude_sdk_tool_result(&store, &session_id, "tc-sdk", &stored_output)
+        save_claude_sdk_tool_result(&store, &session_id, "tc-sdk", &stored_output, None)
             .expect("save SDK tool result");
 
         let prompt_messages = store

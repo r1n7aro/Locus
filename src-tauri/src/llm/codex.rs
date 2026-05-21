@@ -198,13 +198,40 @@ fn build_input(history: &[ChatMessage]) -> Vec<serde_json::Value> {
                     input.push(serde_json::json!({
                         "type": "function_call_output",
                         "call_id": call_id,
-                        "output": msg.content,
+                        "output": build_tool_output_content(&msg.content, msg.images.as_deref()),
                     }));
                 }
             }
         }
     }
     input
+}
+
+fn build_tool_output_content(text: &str, images: Option<&[ImageData]>) -> serde_json::Value {
+    let Some(images) = images.filter(|images| !images.is_empty()) else {
+        return serde_json::Value::String(text.to_string());
+    };
+
+    let mut content = Vec::new();
+    if !text.is_empty() {
+        content.push(serde_json::json!({
+            "type": "input_text",
+            "text": text,
+        }));
+    }
+    for img in images {
+        content.push(serde_json::json!({
+            "type": "input_image",
+            "image_url": format!("data:{};base64,{}", img.mime_type, img.data),
+        }));
+    }
+    if content.is_empty() {
+        content.push(serde_json::json!({
+            "type": "input_text",
+            "text": "",
+        }));
+    }
+    serde_json::Value::Array(content)
 }
 
 /// Chat Completions: { type:"function", function:{ name, description, parameters } }
@@ -2742,6 +2769,17 @@ mod tests {
         }
     }
 
+    fn tool_message_with_images(
+        id: &str,
+        tool_call_id: &str,
+        content: &str,
+        images: Vec<ImageData>,
+    ) -> ChatMessage {
+        let mut message = tool_message(id, tool_call_id, content);
+        message.images = Some(images);
+        message
+    }
+
     fn response_request_metadata(
         message_id: &str,
         body: &serde_json::Value,
@@ -3130,6 +3168,30 @@ mod tests {
         assert_eq!(
             content[1].get("text").and_then(|v| v.as_str()),
             Some("Describe this image")
+        );
+    }
+
+    #[test]
+    fn builds_function_call_output_with_image_content() {
+        let input = build_input(&[tool_message_with_images(
+            "tool-1",
+            "call_1",
+            "Unity screenshot captured.",
+            vec![ImageData {
+                data: "YWJj".to_string(),
+                mime_type: "image/png".to_string(),
+            }],
+        )]);
+
+        assert_eq!(input[0]["type"], serde_json::json!("function_call_output"));
+        let output = input[0]["output"]
+            .as_array()
+            .expect("tool output should be a content array");
+        assert_eq!(output[0]["type"], serde_json::json!("input_text"));
+        assert_eq!(output[1]["type"], serde_json::json!("input_image"));
+        assert_eq!(
+            output[1]["image_url"],
+            serde_json::json!("data:image/png;base64,YWJj")
         );
     }
 

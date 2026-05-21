@@ -1,3 +1,4 @@
+mod capture;
 mod focus;
 mod plugin;
 mod transport;
@@ -13,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 use tokio::sync::Mutex;
 
+pub use capture::{capture_viewport, UnityViewportCapture};
 pub use plugin::{
     check_plugin_status, emit_plugin_status, find_plugin_source_dir, install_or_update_plugin,
     plugin_install_root, plugin_skills_root, PluginStatus,

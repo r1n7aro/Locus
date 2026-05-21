@@ -19,6 +19,8 @@ pub mod tools {
     pub const TODOWRITE: &str = include_str!("../../tools/todowrite.json");
     pub const UNITY_EXECUTE: &str = include_str!("../../tools/unity_execute.json");
     pub const UNITY_RUN_STATES: &str = include_str!("../../tools/unity_run_states.json");
+    pub const UNITY_CAPTURE_VIEWPORT: &str =
+        include_str!("../../tools/unity_capture_viewport.json");
     pub const UNITY_REF_SEARCH: &str = include_str!("../../tools/unity_ref_search.json");
     pub const UNITY_ASSET_SEARCH: &str = include_str!("../../tools/unity_asset_search.json");
     pub const UNITY_YAML_LIST: &str = include_str!("../../tools/unity_yaml_list.json");
@@ -27,7 +29,6 @@ pub mod tools {
     pub const UNITY_RECOMPILE: &str = include_str!("../../tools/unity_recompile.json");
     pub const LIST: &str = include_str!("../../tools/list.json");
     pub const ASK: &str = include_str!("../../tools/ask.json");
-    pub const CANVAS: &str = include_str!("../../tools/canvas.json");
     pub const KNOWLEDGE_LIST: &str = include_str!("../../tools/knowledge_list.json");
     pub const KNOWLEDGE_QUERY: &str = include_str!("../../tools/knowledge_query.json");
     pub const KNOWLEDGE_READ: &str = include_str!("../../tools/knowledge_read.json");
@@ -88,6 +89,7 @@ mod tests {
             ("todowrite", tools::TODOWRITE),
             ("unity_execute", tools::UNITY_EXECUTE),
             ("unity_run_states", tools::UNITY_RUN_STATES),
+            ("unity_capture_viewport", tools::UNITY_CAPTURE_VIEWPORT),
             ("unity_ref_search", tools::UNITY_REF_SEARCH),
             ("unity_asset_search", tools::UNITY_ASSET_SEARCH),
             ("unity_yaml_list", tools::UNITY_YAML_LIST),
@@ -96,7 +98,6 @@ mod tests {
             ("unity_recompile", tools::UNITY_RECOMPILE),
             ("list", tools::LIST),
             ("ask", tools::ASK),
-            ("canvas", tools::CANVAS),
             ("knowledge_list", tools::KNOWLEDGE_LIST),
             ("knowledge_query", tools::KNOWLEDGE_QUERY),
             ("knowledge_read", tools::KNOWLEDGE_READ),
