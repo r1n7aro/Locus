@@ -1,10 +1,10 @@
 <script setup lang="ts">
 import { computed, ref, watch, nextTick } from "vue";
-import hljs, { langFromPath } from "../../hljs";
 import { diffSemanticTarget, diffTextForLarge, invalidateDiffCache } from "../../services/diff";
 import { gitExecute } from "../../services/git";
 import { t } from "../../i18n";
 import { useResizablePanel } from "../../composables/useResizablePanel";
+import { highlightDiffHunk } from "./fileDiffText";
 import type {
   FileDiffPayload,
   FileDiffRequest,
@@ -338,51 +338,11 @@ function toggleTextDisplayMode() {
   textDisplayMode.value = textDisplayMode.value === "unified" ? "side-by-side" : "unified";
 }
 
-function escapeHtml(source: string): string {
-  return source.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-}
-
-function highlightHunk(hunk: DiffHunk, filePath: string, skipHighlight = false): DiffLine[] {
-  if (skipHighlight) return hunk.lines.map((l) => ({ ...l, content: escapeHtml(l.content) }));
-  const lang = langFromPath(filePath);
-  if (!lang) return hunk.lines;
-
-  const oldLines = hunk.lines
-    .filter((line) => line.kind === "context" || line.kind === "delete")
-    .map((line) => line.content);
-  const newLines = hunk.lines
-    .filter((line) => line.kind === "context" || line.kind === "add")
-    .map((line) => line.content);
-
-  let oldHighlighted: string[] = [];
-  let newHighlighted: string[] = [];
-  try {
-    oldHighlighted = hljs
-      .highlight(oldLines.join(""), { language: lang })
-      .value.split("\n");
-    newHighlighted = hljs
-      .highlight(newLines.join(""), { language: lang })
-      .value.split("\n");
-  } catch {
-    return hunk.lines;
-  }
-
-  let oldIndex = 0;
-  let newIndex = 0;
-  return hunk.lines.map((line) => {
-    let content = escapeHtml(line.content);
-    if (line.kind === "delete" && oldIndex < oldHighlighted.length) {
-      content = oldHighlighted[oldIndex++];
-    } else if (line.kind === "add" && newIndex < newHighlighted.length) {
-      content = newHighlighted[newIndex++];
-    } else if (line.kind === "context") {
-      if (oldIndex < oldHighlighted.length) {
-        content = oldHighlighted[oldIndex++];
-      }
-      newIndex++;
-    }
-    return { ...line, content };
-  });
+function highlightedHunkForRender(hunk: DiffHunk): DiffHunk {
+  return {
+    ...hunk,
+    lines: highlightDiffHunk(hunk, props.payload.filePath, totalLineCount.value > HIGHLIGHT_LINE_LIMIT),
+  };
 }
 
 interface SideBySideRow {
@@ -631,7 +591,7 @@ defineExpose({
 
             <template v-if="textDisplayMode === 'unified'">
               <div
-                v-for="(line, lineIndex) in filterLines(highlightHunk(hunk, payload.filePath, totalLineCount > HIGHLIGHT_LINE_LIMIT))"
+                v-for="(line, lineIndex) in filterLines(highlightedHunkForRender(hunk).lines)"
                 :key="`${originalIndex}-${lineIndex}`"
                 class="diff-line"
                 :class="line.kind"
@@ -645,7 +605,7 @@ defineExpose({
             </template>
 
             <template v-else>
-              <div v-for="(row, rowIndex) in filterRows(alignHunk(hunk))" :key="`${originalIndex}-${rowIndex}`" class="diff-sbs-row">
+              <div v-for="(row, rowIndex) in filterRows(alignHunk(highlightedHunkForRender(hunk)))" :key="`${originalIndex}-${rowIndex}`" class="diff-sbs-row">
                 <div class="diff-sbs-cell left" :class="row.left?.kind ?? 'empty'">
                   <span class="diff-ln">{{ row.left?.oldLineNo ?? "" }}</span>
                   <span class="diff-content" v-html="row.left?.content ?? '&nbsp;'"></span>

@@ -47,6 +47,7 @@ export function langFromPath(filePath: string): string | null {
     xml: "xml",
     html: "xml",
     htm: "xml",
+    vue: "xml",
     css: "css",
     sh: "bash",
     bash: "bash",
