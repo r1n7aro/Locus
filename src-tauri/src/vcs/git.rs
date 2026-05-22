@@ -493,6 +493,9 @@ impl GitProvider {
             if let Some(old_path) = &file.old_path {
                 Self::insert_restore_target(&mut restore_targets, old_path);
             }
+            if matches!(file.status.as_str(), "A" | "R") {
+                Self::insert_restore_meta_sidecar(&mut restore_targets, &file.path);
+            }
         }
         restore_targets
     }
@@ -503,7 +506,14 @@ impl GitProvider {
             return;
         }
 
-        targets.insert(normalized.clone());
+        targets.insert(normalized);
+    }
+
+    fn insert_restore_meta_sidecar(targets: &mut std::collections::BTreeSet<String>, path: &str) {
+        let normalized = path.replace('\\', "/");
+        if normalized.trim().is_empty() {
+            return;
+        }
         if !normalized.ends_with(".meta") {
             targets.insert(format!("{}.meta", normalized));
         }
@@ -846,6 +856,86 @@ mod tests {
             git(&repo, &["status", "--short"]),
             "M  tracked.txt\n?? untracked.txt"
         );
+
+        std::fs::remove_dir_all(&repo).expect("cleanup temp repo");
+    }
+
+    #[tokio::test]
+    async fn restore_modified_file_keeps_untracked_meta_sidecar() {
+        if !git_available() {
+            return;
+        }
+
+        let repo = setup_repo("git-restore-modified-meta-boundary");
+        let provider = GitProvider;
+        let checkpoint = provider
+            .checkpoint(&repo.to_string_lossy(), "agent round")
+            .await
+            .expect("checkpoint should succeed")
+            .expect("checkpoint should exist");
+
+        write_file(&repo.join("tracked.txt"), "base\nagent-change\n");
+        write_file(&repo.join("tracked.txt.meta"), "manual sidecar\n");
+
+        GitProvider::restore_files(
+            &repo.to_string_lossy(),
+            &checkpoint.id,
+            checkpoint.index_tree_id.as_deref(),
+            &[ChangedFile {
+                status: "M".to_string(),
+                path: "tracked.txt".to_string(),
+                old_path: None,
+            }],
+        )
+        .await
+        .expect("restore should succeed");
+
+        assert_eq!(
+            normalize_lf(
+                &std::fs::read_to_string(repo.join("tracked.txt")).expect("tracked after restore")
+            ),
+            "base\n",
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join("tracked.txt.meta")).expect("meta after restore"),
+            "manual sidecar\n",
+        );
+
+        std::fs::remove_dir_all(&repo).expect("cleanup temp repo");
+    }
+
+    #[tokio::test]
+    async fn restore_added_file_removes_meta_sidecar() {
+        if !git_available() {
+            return;
+        }
+
+        let repo = setup_repo("git-restore-added-meta-sidecar");
+        let provider = GitProvider;
+        let checkpoint = provider
+            .checkpoint(&repo.to_string_lossy(), "agent round")
+            .await
+            .expect("checkpoint should succeed")
+            .expect("checkpoint should exist");
+
+        write_file(&repo.join("new.asset"), "new asset\n");
+        write_file(&repo.join("new.asset.meta"), "new meta\n");
+
+        GitProvider::restore_files(
+            &repo.to_string_lossy(),
+            &checkpoint.id,
+            checkpoint.index_tree_id.as_deref(),
+            &[ChangedFile {
+                status: "A".to_string(),
+                path: "new.asset".to_string(),
+                old_path: None,
+            }],
+        )
+        .await
+        .expect("restore should succeed");
+
+        assert!(!repo.join("new.asset").exists());
+        assert!(!repo.join("new.asset.meta").exists());
 
         std::fs::remove_dir_all(&repo).expect("cleanup temp repo");
     }
