@@ -31,6 +31,7 @@ function createDisplayState(): DisplaySettings {
     rightAlignUserMessages: false,
     compactToolCalls: true,
     hideThinkingBlocks: true,
+    showViewsInSessionPanel: true,
     mergeGitTreeStatusIcon: true,
     hideGitCommandSuggestions: false,
     systemNotificationsEnabled: true,
@@ -102,6 +103,7 @@ describe("systemNotifications", () => {
     displayState.gitDiffReviewTarget = "inline";
     displayState.compactToolCalls = true;
     displayState.hideThinkingBlocks = true;
+    displayState.showViewsInSessionPanel = true;
     displayState.mergeGitTreeStatusIcon = true;
     displayState.hideGitCommandSuggestions = false;
     displayState.systemNotificationsEnabled = true;

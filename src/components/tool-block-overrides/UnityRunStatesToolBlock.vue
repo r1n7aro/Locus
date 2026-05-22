@@ -53,6 +53,15 @@ function toggleExpanded() {
   setExpanded(!infoExpanded.value);
 }
 
+function expandFromBlockClick(event: MouseEvent) {
+  if (infoExpanded.value || !hasInfoDetail.value) return;
+  const target = event.target instanceof HTMLElement ? event.target : null;
+  if (target?.closest("button, a, input, textarea, select, [role='button'], .tool-call-detail, .ui-select-text")) {
+    return;
+  }
+  setExpanded(true);
+}
+
 const outputDisplay = computed(() => {
   const output = props.toolCall.output;
   return output ? persistedOutputDisplay(output) : { kind: "normal" as const, text: "" };
@@ -128,13 +137,18 @@ const showToolProgressDots = computed(() => props.toolCall.status === "running" 
 </script>
 
 <template>
-  <div ref="rootRef" class="unity-tool-call-block unity-run-tool-block" :class="[toolCall.status, { 'is-expanded': infoExpanded, 'is-framed': isFramed }]">
+  <div
+    ref="rootRef"
+    class="unity-tool-call-block unity-run-tool-block"
+    :class="[toolCall.status, { 'is-expanded': infoExpanded, 'is-framed': isFramed }]"
+    @click="expandFromBlockClick"
+  >
     <button
       ref="headerRef"
       type="button"
       class="tool-call-header ui-select-none"
       :aria-expanded="infoExpanded && hasInfoDetail"
-      @click="toggleExpanded"
+      @click.stop="toggleExpanded"
     >
       <span class="tool-call-icon" :class="statusIcon">
         <span v-if="toolCall.status === 'running'" class="spinner-anim"></span>
@@ -203,6 +217,10 @@ const showToolProgressDots = computed(() => props.toolCall.status === "running" 
   border: 1px solid color-mix(in srgb, #8b7cf6 46%, var(--border-color));
   border-radius: 8px;
   background: color-mix(in srgb, var(--panel-bg) 82%, var(--msg-assistant-bg) 18%);
+}
+
+.unity-tool-call-block:not(.is-expanded) {
+  cursor: pointer;
 }
 
 .tool-call-header {

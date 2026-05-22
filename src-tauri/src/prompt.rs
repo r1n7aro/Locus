@@ -17,6 +17,7 @@ pub mod tools {
     pub const GREP: &str = include_str!("../../tools/grep.json");
     pub const WEB_FETCH: &str = include_str!("../../tools/web_fetch.json");
     pub const TODOWRITE: &str = include_str!("../../tools/todowrite.json");
+    pub const GRAPH_VIEW: &str = include_str!("../../tools/graph_view.json");
     pub const UNITY_EXECUTE: &str = include_str!("../../tools/unity_execute.json");
     pub const UNITY_RUN_STATES: &str = include_str!("../../tools/unity_run_states.json");
     pub const UNITY_CAPTURE_VIEWPORT: &str =
@@ -39,6 +40,15 @@ pub mod tools {
     pub const SKILL_CREATE: &str = include_str!("../../tools/skill_create.json");
     pub const SKILL_RELOAD: &str = include_str!("../../tools/skill_reload.json");
     pub const SKILL_LIST: &str = include_str!("../../tools/skill_list.json");
+    pub const VIEW_CREATE: &str = include_str!("../../tools/view_create.json");
+    pub const VIEW_LIST: &str = include_str!("../../tools/view_list.json");
+    pub const VIEW_RELOAD: &str = include_str!("../../tools/view_reload.json");
+    pub const VIEW_RUN: &str = include_str!("../../tools/view_run.json");
+    pub const VIEW_COMPILE_SCRIPT: &str = include_str!("../../tools/view_compile_script.json");
+    pub const VIEW_CALL_SCRIPT: &str = include_str!("../../tools/view_call_script.json");
+    pub const VIEW_BINDING_READ: &str = include_str!("../../tools/view_binding_read.json");
+    pub const VIEW_BINDING_WRITE: &str = include_str!("../../tools/view_binding_write.json");
+    pub const VIEW_BINDING_APPLY: &str = include_str!("../../tools/view_binding_apply.json");
     pub const CONFIG_QUERY: &str = include_str!("../../tools/config_query.json");
     pub const TOOL_LOAD: &str = include_str!("../../tools/tool_load.json");
     pub const TOOL_CALL: &str = include_str!("../../tools/tool_call.json");
@@ -87,6 +97,7 @@ mod tests {
             ("grep", tools::GREP),
             ("web_fetch", tools::WEB_FETCH),
             ("todowrite", tools::TODOWRITE),
+            ("graph_view", tools::GRAPH_VIEW),
             ("unity_execute", tools::UNITY_EXECUTE),
             ("unity_run_states", tools::UNITY_RUN_STATES),
             ("unity_capture_viewport", tools::UNITY_CAPTURE_VIEWPORT),
@@ -108,6 +119,15 @@ mod tests {
             ("skill_create", tools::SKILL_CREATE),
             ("skill_reload", tools::SKILL_RELOAD),
             ("skill_list", tools::SKILL_LIST),
+            ("view_create", tools::VIEW_CREATE),
+            ("view_list", tools::VIEW_LIST),
+            ("view_reload", tools::VIEW_RELOAD),
+            ("view_run", tools::VIEW_RUN),
+            ("view_compile_script", tools::VIEW_COMPILE_SCRIPT),
+            ("view_call_script", tools::VIEW_CALL_SCRIPT),
+            ("view_binding_read", tools::VIEW_BINDING_READ),
+            ("view_binding_write", tools::VIEW_BINDING_WRITE),
+            ("view_binding_apply", tools::VIEW_BINDING_APPLY),
             ("config_query", tools::CONFIG_QUERY),
             ("tool_load", tools::TOOL_LOAD),
             ("tool_call", tools::TOOL_CALL),

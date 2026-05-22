@@ -69,6 +69,10 @@ namespace Locus
         private static volatile bool _isPlaying;
         private static volatile bool _isPaused;
         private static volatile string _activeScenePath = "";
+        private static int _editorUpdateEventSequence;
+        private static double _lastEditorUpdateEventAt = -1.0;
+        private static string _lastEditorUpdateSelectionKey = "";
+        private const double EditorUpdateEventIntervalSeconds = 0.25;
 
         // ───────────────── Runtime compilation cache ─────────────────
 
@@ -124,6 +128,27 @@ namespace Locus
                 allowUnsafe: false,
                 assemblyIdentityComparer: DesktopAssemblyIdentityComparer.Default
             );
+
+        [Serializable]
+        private sealed class EditorUpdatePayload
+        {
+            public int sequence;
+            public double timeSinceStartup;
+            public bool isPlaying;
+            public bool isPaused;
+            public string activeScenePath;
+            public EditorSelectionSnapshot selection;
+        }
+
+        [Serializable]
+        private sealed class EditorSelectionSnapshot
+        {
+            public string kind;
+            public string name;
+            public string type;
+            public string path;
+            public int instanceId;
+        }
 
         // ───────────────── Lifecycle ─────────────────
 
@@ -343,6 +368,7 @@ namespace Locus
                 _metadataReferencesReady = false;
                 _cachedMetadataReferences = null;
             }
+            InvalidateViewScriptCache();
         }
 
         // ───────────────── Main-thread dispatcher ─────────────────
@@ -487,6 +513,7 @@ namespace Locus
 
             PumpRunStates();
             PumpExecuteCodeAsyncRuntime();
+            MaybeSendEditorUpdateEvent();
 
             // Detect "no compilation started" after request_recompile
             if (_recompileCheckFrames >= 0)
@@ -542,6 +569,69 @@ namespace Locus
                     Debug.LogError("[Locus] Main-thread action failed: " + ex);
                 }
             }
+        }
+
+        private static void MaybeSendEditorUpdateEvent()
+        {
+            double now = EditorApplication.timeSinceStartup;
+            UnityEngine.Object selection = Selection.activeObject;
+            string selectionKey = selection != null ? selection.GetInstanceID().ToString() : "none";
+            bool selectionChanged = !string.Equals(selectionKey, _lastEditorUpdateSelectionKey, StringComparison.Ordinal);
+            if (!selectionChanged && _lastEditorUpdateEventAt >= 0 && now - _lastEditorUpdateEventAt < EditorUpdateEventIntervalSeconds)
+                return;
+
+            _lastEditorUpdateSelectionKey = selectionKey;
+            _lastEditorUpdateEventAt = now;
+            _editorUpdateEventSequence++;
+
+            var payload = new EditorUpdatePayload
+            {
+                sequence = _editorUpdateEventSequence,
+                timeSinceStartup = now,
+                isPlaying = _isPlaying,
+                isPaused = _isPaused,
+                activeScenePath = _activeScenePath,
+                selection = BuildEditorSelectionSnapshot(selection)
+            };
+            SendEventToRust("unity-editor-update", JsonUtility.ToJson(payload));
+        }
+
+        private static EditorSelectionSnapshot BuildEditorSelectionSnapshot(UnityEngine.Object selection)
+        {
+            if (selection == null)
+            {
+                return new EditorSelectionSnapshot
+                {
+                    kind = "none",
+                    name = "",
+                    type = "",
+                    path = "",
+                    instanceId = 0
+                };
+            }
+
+            string path = AssetDatabase.GetAssetPath(selection) ?? "";
+            return new EditorSelectionSnapshot
+            {
+                kind = EditorSelectionKind(selection, path),
+                name = selection.name ?? "",
+                type = selection.GetType().FullName ?? selection.GetType().Name,
+                path = path,
+                instanceId = selection.GetInstanceID()
+            };
+        }
+
+        private static string EditorSelectionKind(UnityEngine.Object selection, string path)
+        {
+            if (selection is Material)
+                return "material";
+            if (selection is GameObject)
+                return "gameObject";
+            if (selection is Component)
+                return "component";
+            if (!string.IsNullOrEmpty(path))
+                return "asset";
+            return "object";
         }
 
         // ───────────────── Pipe server loop ─────────────────
@@ -994,6 +1084,24 @@ namespace Locus
 
                     case "compile_run_states":
                         return await HandleCompileRunStates(reqId, msg.message);
+
+                    case "compile_named":
+                        return await HandleCompileNamed(reqId, msg.message);
+
+                    case "invoke_named":
+                        return await HandleInvokeNamed(reqId, msg.message);
+
+                    case "invoke_named_cached":
+                        return await HandleInvokeNamedCached(reqId, msg.message);
+
+                    case "view_binding_read":
+                        return await HandleViewBindingRead(reqId, msg.message);
+
+                    case "view_binding_write":
+                        return await HandleViewBindingWrite(reqId, msg.message);
+
+                    case "view_binding_apply":
+                        return await HandleViewBindingApply(reqId, msg.message);
 
                     case "capture_viewport":
                         return await HandleCaptureViewport(reqId, msg.message);

@@ -278,12 +278,24 @@ impl AgentDefRegistry {
 
         tools.retain(|tool| !matches!(tool.as_str(), "knowledge_directory" | "knowledge_update"));
 
-        for tool in [
-            "knowledge_create",
-            "knowledge_edit",
-            "knowledge_move",
-            "knowledge_delete",
-        ] {
+        let required_tools: &[&str] = if canonical_agent_id(agent_id) == "dev" {
+            &[
+                "knowledge_create",
+                "knowledge_edit",
+                "knowledge_move",
+                "knowledge_delete",
+                "graph_view",
+            ]
+        } else {
+            &[
+                "knowledge_create",
+                "knowledge_edit",
+                "knowledge_move",
+                "knowledge_delete",
+            ]
+        };
+
+        for &tool in required_tools {
             if !tools.iter().any(|name| name == tool) {
                 tools.push(tool.to_string());
             }
@@ -398,6 +410,17 @@ mod tests {
     #[test]
     fn dev_agent_exposes_knowledge_mutation_tools() {
         assert_knowledge_mutation_tools("dev");
+    }
+
+    #[test]
+    fn dev_agent_exposes_graph_view_tool() {
+        let registry = AgentDefRegistry::load(Some(repo_agent_dir().as_path()), None);
+        let agent = registry.get("dev").expect("dev agent should be loadable");
+
+        assert!(
+            agent.tools.iter().any(|name| name == "graph_view"),
+            "dev agent should expose graph_view"
+        );
     }
 
     #[test]

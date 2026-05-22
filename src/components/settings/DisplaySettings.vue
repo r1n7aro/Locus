@@ -136,6 +136,15 @@ onMounted(async () => {
       />
       <span>{{ t("settings.display.hideThinkingBlocks") }}</span>
     </div>
+
+    <div class="toggle-row">
+      <BaseSwitch
+        :model-value="display.showViewsInSessionPanel"
+        :aria-label="t('settings.display.showViewsInSessionPanel')"
+        @update:model-value="setDisplay('showViewsInSessionPanel', $event)"
+      />
+      <span>{{ t("settings.display.showViewsInSessionPanel") }}</span>
+    </div>
   </div>
 
   <div class="settings-section">

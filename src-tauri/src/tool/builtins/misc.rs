@@ -282,6 +282,27 @@ pub(super) fn todowrite() -> ToolDef {
     }
 }
 
+// ─── graph_view ─────────────────────────────────────────────────────────────
+
+pub(super) fn graph_view() -> ToolDef {
+    let execute: ToolExecuteFn = Arc::new(|_args, _ctx| {
+        Box::pin(async {
+            ToolResult {
+                output: "Error: graph_view tool should be intercepted by agent loop".to_string(),
+                is_error: true,
+            }
+        })
+    });
+
+    let prompt = crate::prompt::parse_tool_prompt(crate::prompt::tools::GRAPH_VIEW);
+    ToolDef {
+        name: "graph_view".to_string(),
+        description: prompt.description,
+        parameters: prompt.parameters,
+        execute,
+    }
+}
+
 // ─── ask ─────────────────────────────────────────────────────────────────────
 
 pub(super) fn ask() -> ToolDef {

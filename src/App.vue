@@ -2,6 +2,8 @@
 <script setup lang="ts">
 import { computed, defineAsyncComponent, nextTick, ref, shallowRef, onMounted, onUnmounted, watch } from "vue";
 import type { Component, ShallowRef } from "vue";
+import { listen } from "@tauri-apps/api/event";
+import type { UnlistenFn } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { t } from "./i18n";
@@ -17,6 +19,7 @@ import { useAppUpdateStore } from "./stores/appUpdate";
 import { useAppBootstrap } from "./composables/useAppBootstrap";
 import { useUnityAssetDropTarget } from "./composables/useUnityAssetDropTarget";
 import { knowledgeGetEmbeddingStatus } from "./services/knowledge";
+import { APP_CLOSE_REQUESTED_EVENT, requestAppExit } from "./services/system";
 
 import TopBannerHost from "./components/TopBannerHost.vue";
 import BaseButton from "./components/ui/BaseButton.vue";
@@ -33,6 +36,8 @@ import { isReferenceExternalImportWindowLocation } from "./services/referenceExt
 import { isCollabSearchWindowLocation } from "./services/collabSearchWindow";
 import { isChatDiffReviewWindowLocation } from "./services/chatDiffReviewWindow";
 import { isUnityHostLocation } from "./services/locusRuntime";
+import { isViewHostWindowLocation } from "./services/view";
+import { isAgentGraphToolWindowLocation } from "./services/agentGraphTool";
 import {
   canStartWindowDragFromTarget,
   getCurrentTauriWindowLabel,
@@ -50,6 +55,8 @@ const isUnityReferenceImportWindow = isUnityReferenceImportWindowLocation();
 const isReferenceExternalImportWindow = isReferenceExternalImportWindowLocation();
 const isCollabSearchWindow = isCollabSearchWindowLocation();
 const isChatDiffReviewWindow = isChatDiffReviewWindowLocation();
+const isViewHostWindow = isViewHostWindowLocation();
+const isAgentGraphToolWindow = isAgentGraphToolWindowLocation();
 const isStandaloneWindow = isUnityEmbedWindow
   || isUnityEmbedTestWindow
   || isKnowledgeDownloadWindow
@@ -58,7 +65,9 @@ const isStandaloneWindow = isUnityEmbedWindow
   || isUnityReferenceImportWindow
   || isReferenceExternalImportWindow
   || isCollabSearchWindow
-  || isChatDiffReviewWindow;
+  || isChatDiffReviewWindow
+  || isViewHostWindow
+  || isAgentGraphToolWindow;
 
 const KnowledgeDownloadProgressWindow = defineAsyncComponent(() => import("./components/KnowledgeDownloadProgressWindow.vue"));
 const KnowledgeLexicalProgressWindow = defineAsyncComponent(() => import("./components/KnowledgeLexicalProgressWindow.vue"));
@@ -67,6 +76,8 @@ const UnityReferenceImportProgressWindow = defineAsyncComponent(() => import("./
 const ReferenceExternalImportWindow = defineAsyncComponent(() => import("./components/ReferenceExternalImportWindow.vue"));
 const CollabSearchWindow = defineAsyncComponent(() => import("./components/CollabSearchWindow.vue"));
 const ChatDiffReviewWindow = defineAsyncComponent(() => import("./components/ChatDiffReviewWindow.vue"));
+const ViewHostWindow = defineAsyncComponent(() => import("./components/ViewHostWindow.vue"));
+const AgentGraphToolWindow = defineAsyncComponent(() => import("./components/AgentGraphToolWindow.vue"));
 const UnityEmbeddedSessionView = defineAsyncComponent(() => import("./components/UnityEmbeddedSessionView.vue"));
 const UnityEmbedTestView = defineAsyncComponent(() => import("./components/UnityEmbedTestView.vue"));
 const OnboardingView = defineAsyncComponent(() => import("./components/OnboardingView.vue"));
@@ -90,6 +101,7 @@ const KNOWLEDGE_RUNTIME_LOADING_OPERATION = "knowledgeEmbeddingRuntimeLoading";
 const KNOWLEDGE_RUNTIME_STARTUP_POLL_COUNT = 16;
 let knowledgeRuntimeStatusTimer: ReturnType<typeof setTimeout> | null = null;
 let knowledgeRuntimeStartupPollsRemaining = 0;
+let appCloseRequestUnlisten: UnlistenFn | null = null;
 
 // -- Diff overlay provider (must be called in App setup so all children can inject) --
 const diffOverlay = provideDiffOverlay();
@@ -165,6 +177,10 @@ const assetView = createLazyViewState(
   () => import("./components/AssetView.vue"),
   "loadAssetView",
 );
+const viewPackageView = createLazyViewState(
+  () => import("./components/ViewPackageView.vue"),
+  "loadViewPackageView",
+);
 const agentView = createLazyViewState(
   () => import("./components/AgentView.vue"),
   "loadAgentView",
@@ -189,6 +205,10 @@ const knowledgeViewError = knowledgeView.error;
 const assetViewComponent = assetView.component;
 const assetViewLoading = assetView.loading;
 const assetViewError = assetView.error;
+
+const viewPackageViewComponent = viewPackageView.component;
+const viewPackageViewLoading = viewPackageView.loading;
+const viewPackageViewError = viewPackageView.error;
 
 const agentViewComponent = agentView.component;
 const agentViewLoading = agentView.loading;
@@ -218,6 +238,11 @@ watch(() => uiStore.assetMounted, (mounted) => {
   void assetView.ensureLoaded();
 }, { immediate: true });
 
+watch(() => uiStore.viewMounted, (mounted) => {
+  if (!mounted) return;
+  void viewPackageView.ensureLoaded();
+}, { immediate: true });
+
 watch(() => uiStore.agentMounted, (mounted) => {
   if (!mounted) return;
   void agentView.ensureLoaded();
@@ -234,6 +259,9 @@ const dirDropdownRef = ref<HTMLElement | null>(null);
 const pendingWorkspaceSwitchPath = ref<string | null>(null);
 const switchingWorkspacePath = ref<string | null>(null);
 const workspaceSwitchBusy = ref(false);
+const appCloseConfirmOpen = ref(false);
+const appCloseBusy = ref(false);
+const appCloseRunningTaskCount = ref(0);
 const runningSessionCount = computed(() => chatStore.streamingSessionIds.size);
 const workspaceSwitchTargetName = computed(() =>
   pendingWorkspaceSwitchPath.value ? shortDir(pendingWorkspaceSwitchPath.value) : "",
@@ -315,11 +343,27 @@ function closeWorkspaceSwitchDialog() {
   pendingWorkspaceSwitchPath.value = null;
 }
 
+function closeAppCloseDialog() {
+  if (appCloseBusy.value) return;
+  appCloseConfirmOpen.value = false;
+  appCloseRunningTaskCount.value = 0;
+}
+
 function reportWorkingDirSwitchError(error: unknown) {
   const err = normalizeAppError(error);
   notificationStore.addNotice("error", err.message, {
     code: err.code,
     operation: "switchWorkingDir",
+    replaceOperation: true,
+    skipConsoleLog: true,
+  });
+}
+
+function reportAppCloseError(error: unknown) {
+  const err = normalizeAppError(error);
+  notificationStore.addNotice("error", t("app.closeFailed", err.message), {
+    code: err.code,
+    operation: "requestAppExit",
     replaceOperation: true,
     skipConsoleLog: true,
   });
@@ -378,6 +422,28 @@ async function confirmWorkspaceSwitch() {
     switchingWorkspacePath.value = null;
     workspaceSwitchBusy.value = false;
   }
+}
+
+async function confirmAppClose() {
+  if (appCloseBusy.value) return;
+  appCloseBusy.value = true;
+  try {
+    await requestAppExit();
+  } catch (error) {
+    appCloseBusy.value = false;
+    reportAppCloseError(error);
+  }
+}
+
+async function handleAppCloseRequest() {
+  if (isStandaloneWindow || appCloseBusy.value || appCloseConfirmOpen.value) return;
+  const runningTaskCount = runningSessionCount.value;
+  if (runningTaskCount > 0) {
+    appCloseRunningTaskCount.value = runningTaskCount;
+    appCloseConfirmOpen.value = true;
+    return;
+  }
+  await confirmAppClose();
 }
 
 async function selectRecentDir(dir: string) {
@@ -496,6 +562,17 @@ function startKnowledgeRuntimeStartupPolling() {
   scheduleKnowledgeRuntimeStatusPoll(120);
 }
 
+async function registerAppCloseRequestListener() {
+  if (isStandaloneWindow || appCloseRequestUnlisten) return;
+  try {
+    appCloseRequestUnlisten = await listen<void>(APP_CLOSE_REQUESTED_EVENT, () => {
+      void handleAppCloseRequest();
+    });
+  } catch (error) {
+    console.warn("Failed to listen for app close requests:", error);
+  }
+}
+
 function revealMainWindow() {
   if (isStandaloneWindow) return;
   const currentTauriWindowLabel = getCurrentTauriWindowLabel();
@@ -551,6 +628,7 @@ onMounted(async () => {
     return;
   }
   document.addEventListener("click", handleDirClickOutside, true);
+  await registerAppCloseRequestListener();
   markStartupPhase("main_dom_listeners_ready");
   markStartupPhase("main_bootstrap_critical_start");
   await bootstrapCritical();
@@ -576,6 +654,8 @@ onUnmounted(() => {
   }
   if (isStandaloneWindow) return;
   document.removeEventListener("click", handleDirClickOutside, true);
+  appCloseRequestUnlisten?.();
+  appCloseRequestUnlisten = null;
   notificationStore.clearByOperation(KNOWLEDGE_RUNTIME_LOADING_OPERATION);
   clearKnowledgeRuntimeStatusTimer();
   cleanup();
@@ -600,6 +680,8 @@ watch(() => projectStore.workingDir, () => {
   <ReferenceExternalImportWindow v-else-if="isReferenceExternalImportWindow" />
   <CollabSearchWindow v-else-if="isCollabSearchWindow" />
   <ChatDiffReviewWindow v-else-if="isChatDiffReviewWindow" />
+  <ViewHostWindow v-else-if="isViewHostWindow" />
+  <AgentGraphToolWindow v-else-if="isAgentGraphToolWindow" />
   <div v-else-if="!authStore.authChecked" class="app-startup-state">
     <span>{{ t("common.loading") }}</span>
   </div>
@@ -638,6 +720,11 @@ watch(() => projectStore.workingDir, () => {
           :class="{ active: uiStore.activeTab === 'asset' }"
           @click="uiStore.setTab('asset')"
         >{{ t("app.tab.asset") }}</button>
+        <button
+          class="tab-item"
+          :class="{ active: uiStore.activeTab === 'views' }"
+          @click="uiStore.setTab('views')"
+        >{{ t("app.tab.views") }}</button>
         <button
           class="tab-item"
           :class="{ active: uiStore.activeTab === 'agent' }"
@@ -812,6 +899,20 @@ watch(() => projectStore.workingDir, () => {
         </div>
 
         <component
+          :is="viewPackageViewComponent"
+          v-if="uiStore.viewMounted && viewPackageViewComponent"
+          v-show="uiStore.activeTab === 'views'"
+          :working-dir="projectStore.workingDir"
+        />
+        <div
+          v-else-if="uiStore.viewMounted && uiStore.activeTab === 'views'"
+          class="tab-loading-state"
+          :class="{ 'is-loading': viewPackageViewLoading, 'is-error': !!viewPackageViewError }"
+        >
+          {{ viewPackageViewError || t("common.loading") }}
+        </div>
+
+        <component
           :is="agentViewComponent"
           v-if="uiStore.agentMounted && agentViewComponent"
           v-show="uiStore.activeTab === 'agent'"
@@ -901,6 +1002,55 @@ watch(() => projectStore.workingDir, () => {
             @click="confirmWorkspaceSwitch"
           >
             {{ t("app.dir.runningConfirmAction") }}
+          </BaseButton>
+        </div>
+      </div>
+    </div>
+  </Transition>
+  <Transition name="workspace-switch-modal">
+    <div
+      v-if="appCloseConfirmOpen"
+      class="workspace-switch-overlay app-close-overlay"
+      @click.self="closeAppCloseDialog"
+    >
+      <div
+        class="workspace-switch-dialog app-close-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="app-close-title"
+      >
+        <div class="workspace-switch-header app-close-header">
+          <span id="app-close-title" class="workspace-switch-title app-close-title">
+            {{ t("app.close.runningConfirmTitle") }}
+          </span>
+          <button
+            class="workspace-switch-close app-close-close"
+            :disabled="appCloseBusy"
+            @click="closeAppCloseDialog"
+          >
+            <svg viewBox="0 0 16 16" fill="currentColor" width="14" height="14">
+              <path d="M3.72 3.72a.75.75 0 0 1 1.06 0L8 6.94l3.22-3.22a.75.75 0 1 1 1.06 1.06L9.06 8l3.22 3.22a.75.75 0 1 1-1.06 1.06L8 9.06l-3.22 3.22a.75.75 0 0 1-1.06-1.06L6.94 8 3.72 4.78a.75.75 0 0 1 0-1.06z"/>
+            </svg>
+          </button>
+        </div>
+        <div class="workspace-switch-body app-close-body">
+          <p class="workspace-switch-message app-close-message">
+            {{ t("app.close.runningConfirmMessage", String(appCloseRunningTaskCount)) }}
+          </p>
+          <p class="workspace-switch-warning app-close-warning">
+            {{ t("app.close.runningConfirmWarning") }}
+          </p>
+        </div>
+        <div class="workspace-switch-footer app-close-footer">
+          <BaseButton :disabled="appCloseBusy" @click="closeAppCloseDialog">
+            {{ t("common.cancel") }}
+          </BaseButton>
+          <BaseButton
+            variant="danger"
+            :disabled="appCloseBusy"
+            @click="confirmAppClose"
+          >
+            {{ t("app.close.runningConfirmAction") }}
           </BaseButton>
         </div>
       </div>
@@ -1658,7 +1808,7 @@ body.is-dragging-select-lock * {
   overflow: hidden;
 }
 
-.tab-content > :is(.chat-workspace-view, .chat-view-layout, .collab-view, .knowledge-view, .asset-view, .agent-view, .settings-panel) {
+.tab-content > :is(.chat-workspace-view, .chat-view-layout, .collab-view, .knowledge-view, .asset-view, .view-package-view, .agent-view, .settings-panel) {
   min-width: 0;
   min-height: 0;
   contain: layout paint;

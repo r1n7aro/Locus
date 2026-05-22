@@ -1,0 +1,18 @@
+{
+  "description": "Compile a named C# View Script from a View Package through Unity Bridge. The script is read from the package manifest scripts[] entry, hashed, compiled in Unity, and cached by name, entryType, source hash, and Unity domain fingerprint.",
+  "parameters": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "viewId": {
+        "type": "string",
+        "description": "View id containing the script, for example material-inspector."
+      },
+      "scriptName": {
+        "type": "string",
+        "description": "scripts[].name from view.json, for example InspectorViewApi."
+      }
+    },
+    "required": ["viewId", "scriptName"]
+  }
+}

@@ -19,7 +19,9 @@ pub use plugin::{
     check_plugin_status, emit_plugin_status, find_plugin_source_dir, install_or_update_plugin,
     plugin_install_root, plugin_skills_root, PluginStatus,
 };
-pub use transport::{send_message, send_message_with_timeout, send_message_without_timeout};
+pub use transport::{
+    send_message, send_message_with_timeout, send_message_without_timeout, set_event_app_handle,
+};
 
 pub type UnityMonitorHandle = Arc<tokio::sync::Mutex<Option<tauri::async_runtime::JoinHandle<()>>>>;
 
@@ -931,6 +933,100 @@ pub async fn compile_run_states(
     }
 }
 
+pub async fn compile_named(
+    project_path: &str,
+    request: &serde_json::Value,
+) -> Result<String, String> {
+    let op_lock = project_unity_op_lock(project_path).await;
+    let _guard = op_lock.lock().await;
+    let payload = serde_json::to_string(request)
+        .map_err(|error| format!("Failed to serialize compile_named request: {}", error))?;
+    let resp = send_message_without_timeout(project_path, "compile_named", &payload).await?;
+    if resp.ok {
+        Ok(resp.message.unwrap_or_default())
+    } else {
+        Err(resp
+            .error
+            .unwrap_or_else(|| "compile_named failed".to_string()))
+    }
+}
+
+pub async fn invoke_named(
+    project_path: &str,
+    request: &serde_json::Value,
+) -> Result<String, String> {
+    let op_lock = project_unity_op_lock(project_path).await;
+    let _guard = op_lock.lock().await;
+    let payload = serde_json::to_string(request)
+        .map_err(|error| format!("Failed to serialize invoke_named request: {}", error))?;
+    let resp = send_message_without_timeout(project_path, "invoke_named", &payload).await?;
+    if resp.ok {
+        Ok(resp.message.unwrap_or_default())
+    } else {
+        Err(resp
+            .error
+            .unwrap_or_else(|| "invoke_named failed".to_string()))
+    }
+}
+
+pub async fn invoke_named_cached(
+    project_path: &str,
+    request: &serde_json::Value,
+) -> Result<String, String> {
+    let op_lock = project_unity_op_lock(project_path).await;
+    let _guard = op_lock.lock().await;
+    let payload = serde_json::to_string(request)
+        .map_err(|error| format!("Failed to serialize invoke_named_cached request: {}", error))?;
+    let resp = send_message_without_timeout(project_path, "invoke_named_cached", &payload).await?;
+    if resp.ok {
+        Ok(resp.message.unwrap_or_default())
+    } else {
+        Err(resp
+            .error
+            .unwrap_or_else(|| "invoke_named_cached failed".to_string()))
+    }
+}
+
+pub async fn view_binding_read(
+    project_path: &str,
+    request: &serde_json::Value,
+) -> Result<String, String> {
+    send_view_binding_message(project_path, "view_binding_read", request).await
+}
+
+pub async fn view_binding_write(
+    project_path: &str,
+    request: &serde_json::Value,
+) -> Result<String, String> {
+    send_view_binding_message(project_path, "view_binding_write", request).await
+}
+
+pub async fn view_binding_apply(
+    project_path: &str,
+    request: &serde_json::Value,
+) -> Result<String, String> {
+    send_view_binding_message(project_path, "view_binding_apply", request).await
+}
+
+async fn send_view_binding_message(
+    project_path: &str,
+    message_type: &str,
+    request: &serde_json::Value,
+) -> Result<String, String> {
+    let op_lock = project_unity_op_lock(project_path).await;
+    let _guard = op_lock.lock().await;
+    let payload = serde_json::to_string(request)
+        .map_err(|error| format!("Failed to serialize {} request: {}", message_type, error))?;
+    let resp = send_message_without_timeout(project_path, message_type, &payload).await?;
+    if resp.ok {
+        Ok(resp.message.unwrap_or_default())
+    } else {
+        Err(resp
+            .error
+            .unwrap_or_else(|| format!("{} failed", message_type)))
+    }
+}
+
 pub async fn unity_log(project_path: &str, message: &str) -> Result<(), String> {
     let resp = send_message(project_path, "log", message).await?;
     if resp.ok {
@@ -1754,6 +1850,7 @@ pub async fn start_unity_monitor(
     monitor: &UnityMonitorHandle,
 ) {
     stop_unity_monitor(monitor).await;
+    set_event_app_handle(app_handle.clone());
 
     let pipe_name = get_pipe_name(&project_path);
     eprintln!(

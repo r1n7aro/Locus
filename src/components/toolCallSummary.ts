@@ -63,6 +63,12 @@ export function buildToolCallArgsSummary(toolName: string, argumentsText: string
       return desc.slice(0, 57) + "...";
     }
 
+    if (toolName === "graph_view") {
+      const title = getStringArg(args, ["title"]);
+      if (title.length <= 60) return title;
+      return title.slice(0, 57) + "...";
+    }
+
     if (toolName === "web_fetch") {
       return getStringArg(args, ["url"]);
     }

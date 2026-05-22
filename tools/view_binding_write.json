@@ -1,0 +1,25 @@
+{
+  "description": "Write a Unity SerializedProperty for a View Binding. Provide either bindingId from bindings.json or a concrete target, plus the JSON value to write.",
+  "parameters": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "viewId": {
+        "type": "string",
+        "description": "View id containing bindings.json, for example material-inspector."
+      },
+      "bindingId": {
+        "type": ["string", "null"],
+        "description": "Optional binding id from bindings.json."
+      },
+      "target": {
+        "type": ["object", "null"],
+        "description": "Concrete binding target. Fields: kind, path, scenePath, objectPath, componentType, propertyPath."
+      },
+      "value": {
+        "description": "JSON value to write to the SerializedProperty."
+      }
+    },
+    "required": ["viewId", "value"]
+  }
+}

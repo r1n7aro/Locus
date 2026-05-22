@@ -1,0 +1,179 @@
+{
+  "description": "Display a graph to the user in a dedicated Locus graph window. Use this when a graph is the clearest representation of nodes, ports, parameters, and links, such as shader networks, animation controllers, state machines, behavior trees, dependency graphs, or Blueprint-style flows.\n\nThe agent submits only node definitions and links. Locus renders the graph with built-in styling, port connection UI, parameter controls, and automatic layout.\n\nUse editable=false when the graph is for inspection only. The window opens and the tool returns immediately so work can continue.\n\nUse editable=true when the user must review or edit the graph before the agent proceeds. The tool waits until the user confirms an option in the graph window, then returns the selected option and the modified graph data. Closing the window cancels the wait.\n\nOptions work like ask_user_question choices: provide up to 3 concise labels with descriptions. They are shown as confirmation actions in editable mode.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "title": {
+        "type": "string",
+        "description": "Short graph window title."
+      },
+      "editable": {
+        "type": "boolean",
+        "description": "Whether the user can edit the graph and the tool must wait for confirmation. Defaults to false."
+      },
+      "nodes": {
+        "type": "array",
+        "description": "Graph nodes. Coordinates are optional; Locus can auto-layout nodes.",
+        "items": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string",
+              "description": "Stable unique node id."
+            },
+            "type": {
+              "type": "string",
+              "description": "Optional node type used for display and downstream processing."
+            },
+            "title": {
+              "type": "string",
+              "description": "Display title. Defaults to id."
+            },
+            "subtitle": {
+              "type": "string",
+              "description": "Optional secondary display text."
+            },
+            "x": {
+              "type": "number",
+              "description": "Optional x coordinate."
+            },
+            "y": {
+              "type": "number",
+              "description": "Optional y coordinate."
+            },
+            "inputs": {
+              "type": "array",
+              "description": "Input ports.",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "id": { "type": "string", "description": "Stable port id." },
+                  "label": { "type": "string", "description": "Display label." },
+                  "type": { "type": "string", "description": "Optional value type." }
+                },
+                "required": ["id"]
+              }
+            },
+            "outputs": {
+              "type": "array",
+              "description": "Output ports.",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "id": { "type": "string", "description": "Stable port id." },
+                  "label": { "type": "string", "description": "Display label." },
+                  "type": { "type": "string", "description": "Optional value type." }
+                },
+                "required": ["id"]
+              }
+            },
+            "parameters": {
+              "type": "array",
+              "description": "Editable node parameters shown inside the node.",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "id": { "type": "string", "description": "Stable parameter id." },
+                  "label": { "type": "string", "description": "Display label." },
+                  "type": { "type": "string", "description": "string, text, number, boolean, select, or color." },
+                  "value": { "description": "Current parameter value." },
+                  "options": {
+                    "type": "array",
+                    "description": "Select options when type is select.",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "label": { "type": "string", "description": "Option label." },
+                        "value": { "description": "Option value." }
+                      },
+                      "required": ["label", "value"]
+                    }
+                  },
+                  "min": { "type": "number", "description": "Minimum number value." },
+                  "max": { "type": "number", "description": "Maximum number value." },
+                  "step": { "type": "number", "description": "Number step." },
+                  "placeholder": { "type": "string", "description": "Input placeholder." },
+                  "readOnly": { "type": "boolean", "description": "Whether this parameter is read-only." }
+                },
+                "required": ["id"]
+              }
+            },
+            "data": {
+              "description": "Optional agent-defined payload kept with the node."
+            }
+          },
+          "required": ["id"]
+        }
+      },
+      "links": {
+        "type": "array",
+        "description": "Links between nodes or ports. Use from.portId and to.portId for port-level links.",
+        "items": {
+          "type": "object",
+          "properties": {
+            "id": { "type": "string", "description": "Optional stable link id." },
+            "from": {
+              "type": "object",
+              "properties": {
+                "nodeId": { "type": "string", "description": "Source node id." },
+                "portId": { "type": "string", "description": "Optional source output port id." }
+              },
+              "required": ["nodeId"]
+            },
+            "to": {
+              "type": "object",
+              "properties": {
+                "nodeId": { "type": "string", "description": "Target node id." },
+                "portId": { "type": "string", "description": "Optional target input port id." }
+              },
+              "required": ["nodeId"]
+            },
+            "label": { "type": "string", "description": "Optional link label." },
+            "type": { "type": "string", "description": "Optional link type." },
+            "data": { "description": "Optional agent-defined payload kept with the link." }
+          },
+          "required": ["from", "to"]
+        }
+      },
+      "layout": {
+        "type": "object",
+        "description": "Optional layout settings. Defaults to automatic layout for missing coordinates.",
+        "properties": {
+          "auto": { "description": "true, false, missing, always, or off." },
+          "direction": { "type": "string", "description": "right, left, down, or up." },
+          "nodeSpacing": { "type": "number", "description": "Spacing between nodes." },
+          "layerSpacing": { "type": "number", "description": "Spacing between graph layers." },
+          "padding": { "type": "number", "description": "Layout padding." }
+        }
+      },
+      "options": {
+        "type": "array",
+        "description": "Editable-mode confirmation choices. Maximum 3.",
+        "maxItems": 3,
+        "items": {
+          "type": "object",
+          "properties": {
+            "label": {
+              "type": "string",
+              "description": "Short display text for this option."
+            },
+            "description": {
+              "type": "string",
+              "description": "Brief explanation of what this option means."
+            },
+            "value": {
+              "type": "string",
+              "description": "Optional stable value returned to the agent."
+            }
+          },
+          "required": ["label", "description"]
+        }
+      },
+      "graph": {
+        "type": "object",
+        "description": "Optional full GraphData object. If present, it is used instead of top-level nodes and links."
+      }
+    },
+    "required": ["nodes"]
+  }
+}

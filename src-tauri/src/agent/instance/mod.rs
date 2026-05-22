@@ -7686,6 +7686,7 @@ impl AgentInstance {
                 | "list"
                 | "ask_user_question"
                 | "todowrite"
+                | "graph_view"
                 | "unity_ref_search"
                 | "unity_asset_search"
                 | "unity_capture_viewport"
@@ -8259,6 +8260,8 @@ impl AgentInstance {
         } else if tc.name == "ask_user_question" {
             self.await_tool_result(self.execute_ask(app_handle, &tc.id, args, run_id))
                 .await
+        } else if tc.name == "graph_view" {
+            self.execute_graph_view(app_handle, &tc.id, args).await
         } else if tc.name == "todowrite" {
             ExecutedToolResult::from_tool_result(self.execute_todowrite(store, args, run_id))
         } else if tc.name == "config_query" {
@@ -9278,6 +9281,127 @@ impl AgentInstance {
                 output: format!("Error listing Skills: {}", error),
                 is_error: true,
             },
+        }
+    }
+
+    async fn execute_graph_view(
+        &self,
+        app_handle: &AppHandle,
+        tool_call_id: &str,
+        args: &serde_json::Value,
+    ) -> ExecutedToolResult {
+        if self.is_cancel_requested() {
+            return Self::interrupted_tool_result();
+        }
+
+        let request = match crate::commands::agent_graph_tool_request_from_args(args, tool_call_id)
+        {
+            Ok(request) => request,
+            Err(error) => {
+                return ExecutedToolResult::from_tool_result(ToolResult {
+                    output: format!("Error parsing graph_view arguments: {}", error),
+                    is_error: true,
+                });
+            }
+        };
+        let request_id = request.request_id.clone();
+        let editable = request.editable;
+        let (tx, rx) = if editable {
+            let (tx, rx) = tokio::sync::oneshot::channel::<crate::commands::AgentGraphToolAnswer>();
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+
+        let graph_store: tauri::State<'_, crate::commands::AgentGraphToolStore> =
+            app_handle.state();
+        let graph_store = graph_store.inner().clone();
+        crate::commands::insert_agent_graph_tool_request(&graph_store, request.clone(), tx).await;
+
+        let open_result = match crate::commands::open_agent_graph_tool_window(app_handle, &request)
+        {
+            Ok(result) => result,
+            Err(error) => {
+                let _ = crate::commands::remove_agent_graph_tool_request(&graph_store, &request_id)
+                    .await;
+                return ExecutedToolResult::from_tool_result(ToolResult {
+                    output: error,
+                    is_error: true,
+                });
+            }
+        };
+
+        if !editable {
+            return ExecutedToolResult::from_tool_result(ToolResult {
+                output: serde_json::to_string_pretty(&serde_json::json!({
+                    "status": "opened",
+                    "requestId": open_result.request_id,
+                    "windowLabel": open_result.window_label,
+                    "hostUrl": open_result.host_url,
+                    "editable": false,
+                }))
+                .unwrap_or_else(|_| "Graph window opened.".to_string()),
+                is_error: false,
+            });
+        }
+
+        eprintln!(
+            "[Agent {}] graph_view: waiting for editable graph response (request_id={})",
+            self.id, request_id
+        );
+
+        let mut cancel_rx = self.cancel_waiter();
+        let Some(rx) = rx else {
+            return ExecutedToolResult::from_tool_result(ToolResult {
+                output: "Internal error: editable graph_view missing receiver.".to_string(),
+                is_error: true,
+            });
+        };
+        let answer_result = tokio::select! {
+            result = rx => Some(result),
+            _ = cancel_rx.changed() => None,
+        };
+
+        match answer_result {
+            Some(Ok(crate::commands::AgentGraphToolAnswer::Submitted(answer))) => {
+                eprintln!(
+                    "[Agent {}] graph_view: user submitted graph (request_id={})",
+                    self.id, request_id
+                );
+                ExecutedToolResult::from_tool_result(ToolResult {
+                    output: serde_json::to_string_pretty(&serde_json::json!({
+                        "status": "submitted",
+                        "requestId": answer.request_id,
+                        "option": answer.option,
+                        "graph": answer.graph,
+                    }))
+                    .unwrap_or_else(|_| "Graph submitted.".to_string()),
+                    is_error: false,
+                })
+            }
+            Some(Ok(crate::commands::AgentGraphToolAnswer::Cancelled)) => {
+                eprintln!(
+                    "[Agent {}] graph_view: graph window cancelled (request_id={})",
+                    self.id, request_id
+                );
+                ExecutedToolResult::from_tool_result(ToolResult {
+                    output: "Graph editing was cancelled before confirmation.".to_string(),
+                    is_error: true,
+                })
+            }
+            Some(Err(_)) => ExecutedToolResult::from_tool_result(ToolResult {
+                output: "Graph response channel was closed.".to_string(),
+                is_error: true,
+            }),
+            None => {
+                let _ = crate::commands::cancel_agent_graph_tool_request_by_id(
+                    &graph_store,
+                    &request_id,
+                )
+                .await;
+                crate::commands::close_agent_graph_tool_window(app_handle, &request_id);
+                Self::interrupted_tool_result()
+            }
         }
     }
 
@@ -12574,6 +12698,7 @@ PrefabInstance:
                     "unity_execute".to_string(),
                     "unity_run_states".to_string(),
                     "unity_capture_viewport".to_string(),
+                    "graph_view".to_string(),
                     "web_fetch".to_string(),
                     "knowledge_create".to_string(),
                     "knowledge_edit".to_string(),
@@ -12606,6 +12731,7 @@ PrefabInstance:
 
         let request_tool_names = instance.build_request_tool_names().await;
         assert!(!request_tool_names.contains(&"unity_capture_viewport".to_string()));
+        assert!(!request_tool_names.contains(&"graph_view".to_string()));
 
         let items = instance.available_tool_prompt_items().await;
 
@@ -12620,6 +12746,7 @@ PrefabInstance:
         assert_eq!(tool_load_mode(&items, "knowledge_delete"), "lazy");
         assert_eq!(tool_load_mode(&items, "unity_run_states"), "lazy");
         assert_eq!(tool_load_mode(&items, "unity_capture_viewport"), "lazy");
+        assert_eq!(tool_load_mode(&items, "graph_view"), "lazy");
         assert_eq!(tool_load_mode(&items, "web_fetch"), "lazy");
         assert_eq!(
             tool_meta_bool(&items, "unity_capture_viewport", "directLoaded"),
@@ -12653,6 +12780,7 @@ PrefabInstance:
                     "knowledge_delete".to_string(),
                     "unity_run_states".to_string(),
                     "unity_capture_viewport".to_string(),
+                    "graph_view".to_string(),
                 ],
                 sub_agents: Vec::new(),
                 default: false,
@@ -12684,6 +12812,7 @@ PrefabInstance:
         assert!(parts.env_prompt.contains("- `knowledge_delete`"));
         assert!(parts.env_prompt.contains("- `unity_run_states`"));
         assert!(parts.env_prompt.contains("- `unity_capture_viewport`"));
+        assert!(parts.env_prompt.contains("- `graph_view`"));
         assert!(parts.env_prompt.contains("- `web_fetch`"));
         assert!(!parts.env_prompt.contains("- `read`"));
 
@@ -12697,6 +12826,7 @@ PrefabInstance:
         assert!(manifest.content.contains("- `knowledge_delete`"));
         assert!(manifest.content.contains("- `unity_run_states`"));
         assert!(manifest.content.contains("- `unity_capture_viewport`"));
+        assert!(manifest.content.contains("- `graph_view`"));
         assert!(manifest.content.contains("- `web_fetch`"));
         assert!(!manifest.content.contains("- `read`"));
     }

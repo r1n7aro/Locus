@@ -22,6 +22,8 @@ export interface DisplaySettings {
   compactToolCalls: boolean;
   /** Hide completed thinking blocks in chat transcript */
   hideThinkingBlocks: boolean;
+  /** Show View packages in the lower section of the session list */
+  showViewsInSessionPanel: boolean;
   /** Merge Git tree status letters into colored file icons */
   mergeGitTreeStatusIcon: boolean;
   /** Hide Git command suggestions in Git terminal */
@@ -61,6 +63,7 @@ const defaults: DisplaySettings = {
   rightAlignUserMessages: true,
   compactToolCalls: true,
   hideThinkingBlocks: true,
+  showViewsInSessionPanel: true,
   mergeGitTreeStatusIcon: true,
   hideGitCommandSuggestions: false,
   systemNotificationsEnabled: true,

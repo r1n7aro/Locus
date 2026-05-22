@@ -1,3 +1,4 @@
+mod agent_graph;
 pub mod asset;
 mod auth;
 mod diff;
@@ -14,6 +15,7 @@ mod system;
 mod undo;
 mod unity_embed;
 mod update;
+mod view;
 mod workspace;
 
 use serde::{Deserialize, Serialize};
@@ -328,6 +330,7 @@ pub struct TokenUsage {
     pub context_limit: u32,
 }
 
+pub use agent_graph::*;
 pub use asset::*;
 pub use auth::*;
 pub use diff::*;
@@ -344,4 +347,5 @@ pub use system::*;
 pub use undo::*;
 pub use unity_embed::*;
 pub use update::*;
+pub use view::*;
 pub use workspace::*;

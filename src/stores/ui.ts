@@ -17,7 +17,7 @@ interface NativeWindowClientSizeEvent {
 }
 
 export const useUiStore = defineStore("ui", () => {
-  const activeTab = ref<"chat" | "collab" | "knowledge" | "asset" | "agent" | "settings">("chat");
+  const activeTab = ref<"chat" | "collab" | "knowledge" | "asset" | "views" | "agent" | "settings">("chat");
   const settingsCategoryHint = ref<"api" | "models" | "permissions" | "proxy" | "general" | "display" | "shortcuts" | "knowledge" | "archived" | "console" | "about" | null>(null);
   const alwaysOnTop = ref(false);
   const isMaximized = ref(false);
@@ -35,6 +35,7 @@ export const useUiStore = defineStore("ui", () => {
   const collabMounted = ref(false);
   const knowledgeMounted = ref(false);
   const assetMounted = ref(false);
+  const viewMounted = ref(false);
   const agentMounted = ref(false);
   const settingsMounted = ref(false);
 
@@ -188,6 +189,7 @@ export const useUiStore = defineStore("ui", () => {
     if (tab === "collab") collabMounted.value = true;
     if (tab === "knowledge") knowledgeMounted.value = true;
     if (tab === "asset") assetMounted.value = true;
+    if (tab === "views") viewMounted.value = true;
     if (tab === "agent") agentMounted.value = true;
     if (tab === "settings") settingsMounted.value = true;
   }
@@ -281,6 +283,7 @@ export const useUiStore = defineStore("ui", () => {
     collabMounted,
     knowledgeMounted,
     assetMounted,
+    viewMounted,
     agentMounted,
     settingsMounted,
     init,

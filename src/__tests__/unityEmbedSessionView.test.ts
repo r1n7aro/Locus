@@ -48,13 +48,18 @@ describe("Unity embedded session view", () => {
   it("exits the desktop app when the main window closes", () => {
     const app = read("src-tauri/src/lib.rs");
     const command = read("src-tauri/src/commands/unity_embed.rs");
+    const system = read("src-tauri/src/commands/system.rs");
 
     expect(app).toContain("const MAIN_WINDOW_LABEL: &str = \"main\";");
+    expect(app).toContain("const MAIN_WINDOW_CLOSE_REQUESTED_EVENT: &str = \"locus-main-window-close-requested\";");
     expect(app).toContain(".on_window_event(|window, event|");
     expect(app).toContain("WindowEvent::CloseRequested");
     expect(app).toContain("api.prevent_close();");
-    expect(app).toContain("commands::destroy_unity_embed_control_window_on_main(&app_handle);");
-    expect(app).toContain("app_handle.exit(0);");
+    expect(app).toContain("window.emit(MAIN_WINDOW_CLOSE_REQUESTED_EVENT, ())");
+    expect(app).toContain("commands::request_app_exit");
+    expect(system).toContain("pub fn request_app_exit(app_handle: AppHandle)");
+    expect(system).toContain("crate::commands::destroy_unity_embed_control_window_on_main(&app_handle);");
+    expect(system).toContain("app_handle.exit(0);");
     expect(command).toContain("pub(crate) fn destroy_unity_embed_control_window_on_main");
     expect(command).toContain("window.destroy().or_else(|_| window.close())");
     expect(command).toContain("record_window_destroyed();");
@@ -349,15 +354,18 @@ describe("Unity embedded session view", () => {
     expect(chat).toContain('class="asset-ref-ctx-menu"');
     expect(chat).toContain("doAssetRefOpenInEditor");
     expect(chat).toContain("doAssetRefShowInFolder");
+    expect(chat).toContain("doAssetRefCopyPath");
     expect(chat).toContain("doAssetRefSelectInUnity");
     expect(chat).toContain("doAssetRefOpenInKnowledge");
     expect(chat).toContain("knowledgeRevealTarget({");
     expect(chat).toContain("uiStore.stageKnowledgeSelection({");
     expect(chat).toContain("openFileExternal(target.filePath)");
     expect(chat).toContain("showInFolder(target.filePath)");
+    expect(chat).toContain("navigator.clipboard.writeText(path)");
     expect(chat).toContain("selectUnityAsset(target.assetPath)");
     expect(chat).toContain('t("common.openInFileExplorer")');
     expect(chat).toContain('t("common.openInKnowledge")');
+    expect(chat).toContain('t("common.copyPath")');
     expect(assetChip).toContain(':data-ref-kind="effectiveKind"');
     expect(assetChip).toContain(":data-knowledge-type=\"knowledgeRef?.docType\"");
     expect(assetChip).toContain(":data-knowledge-path=\"knowledgeRef?.path\"");
@@ -365,8 +373,10 @@ describe("Unity embedded session view", () => {
     expect(assetChip).toContain(":data-scene-path=\"sceneObjectRef?.scenePath\"");
     expect(zh).toContain('"common.openInFileExplorer": "在文件资源管理器中打开"');
     expect(zh).toContain('"common.openInKnowledge": "在知识页中打开"');
+    expect(zh).toContain('"common.copyPath": "复制路径"');
     expect(en).toContain('"common.openInFileExplorer": "Open in File Explorer"');
     expect(en).toContain('"common.openInKnowledge": "Open in Knowledge"');
+    expect(en).toContain('"common.copyPath": "Copy Path"');
   });
 
   it("routes scene object refs to Unity selection and locked inspectors", () => {

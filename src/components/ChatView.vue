@@ -68,6 +68,7 @@ import {
   getChatSubmitModifierLabel,
   useChatInputSettings,
 } from "../composables/useChatInputSettings";
+import { useDisplaySettings } from "../composables/useDisplaySettings";
 import { useKnowledgeAccessMode } from "../composables/useKnowledgeAccessMode";
 import { logToolCollapseTrace, previewTraceText } from "../services/toolCollapseTrace";
 import {
@@ -85,6 +86,7 @@ const uiStore = useUiStore();
 const notificationStore = useNotificationStore();
 const { state: shortcutState } = useKeyboardShortcuts();
 const { state: chatInputSettings } = useChatInputSettings();
+const { state: displaySettings } = useDisplaySettings();
 const { state: knowledgeAccessState, setMode: setKnowledgeAccessMode } = useKnowledgeAccessMode();
 
 const isPlanStreaming = computed(() => !!chatStore.pendingPlanRun && props.isStreaming);
@@ -663,6 +665,31 @@ function notifyAssetRefContextMenuError(error: unknown, operation: string, fallb
     operation,
     replaceOperation: true,
   });
+}
+
+function assetRefContextCopyPath(target: AssetRefContextMenuTarget): string {
+  if (target.kind === "sceneObject") {
+    return `${target.scenePath}/${target.objectPath}`;
+  }
+  return target.filePath;
+}
+
+async function doAssetRefCopyPath() {
+  const target = assetRefCtxMenu.value?.target;
+  if (!target) return;
+  const path = assetRefContextCopyPath(target);
+  closeAssetRefContextMenu();
+  try {
+    await navigator.clipboard.writeText(path);
+    notificationStore.addNotice("success", t("common.copied"), {
+      operation: "assetRefCopyPath",
+      replaceOperation: true,
+      skipConsoleLog: true,
+    });
+  } catch (error) {
+    console.warn("copy asset ref path failed:", error);
+    notifyAssetRefContextMenuError(error, "assetRefCopyPath", t("common.copyPathFailed"));
+  }
 }
 
 async function doAssetRefOpenInEditor() {
@@ -1898,6 +1925,8 @@ onUnmounted(() => {
       :active-session-id="activeSessionId"
       :streaming-session-ids="streamingSessionIds"
       :session-panel-width="sessionPanelWidth"
+      :working-dir="workingDir"
+      :show-views="displaySettings.showViewsInSessionPanel"
       @select-session="emit('selectSession', $event)"
       @new-chat="handleNewChatRequest"
       @rename-session="(id: string, title: string) => emit('renameSession', id, title)"
@@ -2247,6 +2276,9 @@ onUnmounted(() => {
           <button type="button" class="asset-ref-ctx-item" @click="doAssetRefShowInFolder">
             {{ t("common.openInFileExplorer") }}
           </button>
+          <button type="button" class="asset-ref-ctx-item" @click="doAssetRefCopyPath">
+            {{ t("common.copyPath") }}
+          </button>
           <template v-if="assetRefContextSupportsUnity">
             <div class="asset-ref-ctx-sep"></div>
             <button
@@ -2391,7 +2423,7 @@ onUnmounted(() => {
 }
 
 :deep(.sp-session-list) {
-  flex: 1 1 0;
+  flex: 1 1 40%;
   min-height: 0;
   height: 0;
   overflow-y: auto;

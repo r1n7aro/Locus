@@ -38,6 +38,7 @@ mod unity_docs;
 pub mod unity_type_index;
 pub mod unity_yaml;
 pub mod vcs;
+pub mod view;
 #[cfg(target_os = "windows")]
 mod windows_resize_sync;
 #[cfg(target_os = "windows")]
@@ -49,6 +50,7 @@ use agent::instance::{AssistantStreamState, RawContextStore};
 use commands::AppKnowledgeDir;
 
 const MAIN_WINDOW_LABEL: &str = "main";
+const MAIN_WINDOW_CLOSE_REQUESTED_EVENT: &str = "locus-main-window-close-requested";
 
 #[derive(Clone)]
 struct StartupTrace {
@@ -239,15 +241,19 @@ pub fn run() {
         })
         .on_window_event(|window, event| {
             commands::handle_locus_window_event(window, event);
+            commands::handle_agent_graph_tool_window_event(window, event);
             if window.label() != MAIN_WINDOW_LABEL {
                 return;
             }
 
             if let WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
-                let app_handle = window.app_handle().clone();
-                commands::destroy_unity_embed_control_window_on_main(&app_handle);
-                app_handle.exit(0);
+                if let Err(error) = window.emit(MAIN_WINDOW_CLOSE_REQUESTED_EVENT, ()) {
+                    eprintln!(
+                        "[Locus] failed to emit main window close request event: {}",
+                        error
+                    );
+                }
             }
         })
         .setup(move |app| {
@@ -434,6 +440,8 @@ pub fn run() {
                 Arc::new(std::sync::Mutex::new(session::pending_inputs::PendingInputQueue::default()));
 
             let question_store: QuestionStore = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+            let agent_graph_tool_store: commands::AgentGraphToolStore =
+                Arc::new(tokio::sync::Mutex::new(HashMap::new()));
             let knowledge_proposal_drafts: KnowledgeProposalDraftStore =
                 Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
@@ -705,6 +713,7 @@ pub fn run() {
             app.manage(preview_cache);
             app.manage(dir_entries_cache);
             app.manage(question_store);
+            app.manage(agent_graph_tool_store);
             app.manage(knowledge_proposal_drafts);
             app.manage(undo_manager);
             app.manage(tool_permission_mode);
@@ -1036,6 +1045,7 @@ pub fn run() {
             commands::get_python_runtime_state,
             commands::save_python_runtime_selection,
             commands::send_system_notification,
+            commands::request_app_exit,
             commands::get_config_registry,
             commands::get_log_entries,
             commands::clear_log_entries,
@@ -1045,6 +1055,25 @@ pub fn run() {
             commands::unity_embed_activate_for_input,
             commands::unity_embed_focus_debug_snapshot,
             commands::unity_embed_commit_asset_drop,
+            commands::view_templates,
+            commands::view_list,
+            commands::view_tree,
+            commands::view_create,
+            commands::view_create_folder,
+            commands::view_delete_entry,
+            commands::view_move_entry,
+            commands::view_read,
+            commands::view_reload,
+            commands::view_run,
+            commands::view_compile_script,
+            commands::view_call_script,
+            commands::view_append_frontend_log,
+            commands::view_binding_read,
+            commands::view_binding_write,
+            commands::view_binding_apply,
+            commands::agent_graph_tool_request,
+            commands::agent_graph_tool_submit,
+            commands::agent_graph_tool_cancel,
             commands::fetch_app_update_manifest,
         ])
         .run(tauri::generate_context!())

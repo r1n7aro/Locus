@@ -23,6 +23,15 @@ export default defineConfig(async () => ({
     }),
   ],
 
+  resolve: {
+    alias: [
+      {
+        find: /^vue$/,
+        replacement: "vue/dist/vue.esm-bundler.js",
+      },
+    ],
+  },
+
   test: {
     setupFiles: ["src/__tests__/setupVitest.ts"],
     include: ["src/__tests__/**/*.test.ts"],

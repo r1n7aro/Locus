@@ -125,6 +125,15 @@ function toggleExpanded() {
   setExpanded(!expanded.value, true);
 }
 
+function expandFromBlockClick(event: MouseEvent) {
+  if (expanded.value) return;
+  const target = event.target instanceof HTMLElement ? event.target : null;
+  if (target?.closest("button, a, input, textarea, select, [role='button'], .tool-call-detail, .ui-select-text")) {
+    return;
+  }
+  setExpanded(true, true);
+}
+
 watch(
   () => [props.toolCall.id, props.toolCall.name, props.toolCall.status] as const,
   ([nextId, _nextName, nextStatus], [previousId, _previousName, previousStatus]) => {
@@ -163,6 +172,7 @@ const displayName = computed(() => {
 });
 
 const isEditTool = computed(() => props.toolCall.name === "edit");
+const GRAPH_VIEW_HIDDEN_ARG_KEYS = new Set(["description"]);
 
 interface EditDiffItem {
   oldStr: string;
@@ -286,6 +296,7 @@ const parsedArgs = computed(() => {
     return Object.entries(args)
       .filter(([key]) => !isTask || key === "prompt")
       .filter(([key]) => !isEdit || !editDiffKeys.includes(key))
+      .filter(([key]) => props.toolCall.name !== "graph_view" || !GRAPH_VIEW_HIDDEN_ARG_KEYS.has(key))
       .map(([key, value]) => ({
         key,
         value,
@@ -392,8 +403,9 @@ const highlightedOutput = computed(() => {
     :data-tool-layout-statuses="toolLayoutStatuses"
     :data-tool-layout-collapse-enabled="String(collapseEnabled)"
     :data-tool-layout-expanded="String(expanded)"
+    @click="expandFromBlockClick"
   >
-    <button ref="headerRef" type="button" class="tool-call-header ui-select-none" @click="toggleExpanded">
+    <button ref="headerRef" type="button" class="tool-call-header ui-select-none" @click.stop="toggleExpanded">
       <span class="tool-call-icon" :class="statusIcon">
         <span v-if="toolCall.status === 'running'" class="spinner-anim"></span>
         <span v-else class="tool-call-status-dot"></span>
@@ -523,6 +535,10 @@ const highlightedOutput = computed(() => {
 
 .tool-call-block.is-expanded {
   width: 100%;
+}
+
+.tool-call-block:not(.is-expanded) {
+  cursor: pointer;
 }
 
 .tool-call-block.is-recompile-attention {

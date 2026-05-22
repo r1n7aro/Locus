@@ -1,0 +1,49 @@
+{
+  "description": "Create a View Package under the selected Unity project at Locus/views/<view-id>. Use this only inside the /view workflow. It validates the View id, writes the template package, and returns package summary plus manifest metadata. Use normal file tools to read or edit files inside packageRoot.",
+  "parameters": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "id": {
+        "type": "string",
+        "description": "Lowercase kebab-case View id, for example material-inspector."
+      },
+      "name": {
+        "type": ["string", "null"],
+        "description": "Display name for the View. Defaults to a title generated from id."
+      },
+      "template": {
+        "type": "string",
+        "enum": ["blank", "inspector-form", "node-graph", "link-board"],
+        "description": "Built-in View template to copy. Supported values: blank, inspector-form, node-graph, link-board."
+      },
+      "icon": {
+        "type": ["string", "null"],
+        "enum": [
+          "View",
+          "PanelTopOpen",
+          "PanelsTopLeft",
+          "InspectionPanel",
+          "TableProperties",
+          "Network",
+          "Link2",
+          "Workflow",
+          "Kanban",
+          "Grid2X2",
+          "Layers",
+          "Package",
+          "Box",
+          "Braces",
+          "FileCode2",
+          "Puzzle",
+          "ScanSearch",
+          "ChartNoAxesCombined",
+          "FormInput",
+          null
+        ],
+        "description": "Optional Locus icon library name for the View list. Defaults by template."
+      }
+    },
+    "required": ["id", "template"]
+  }
+}

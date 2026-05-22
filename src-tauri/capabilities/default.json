@@ -11,7 +11,9 @@
     "reference-external-import",
     "collab-history-search",
     "chat-diff-review",
-    "unity-embed"
+    "unity-embed",
+    "view-*",
+    "agent-graph-*"
   ],
   "permissions": [
     "core:default",

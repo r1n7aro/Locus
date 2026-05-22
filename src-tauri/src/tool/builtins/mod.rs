@@ -5,11 +5,12 @@ mod search;
 mod shell;
 mod skill;
 mod unity;
+mod view;
 
 use std::path::Path;
 use std::sync::Arc;
 
-use super::{ToolDef, ToolExecuteFn, ToolExecutionContext, ToolRegistry, ToolResult};
+use super::{ToolDef, ToolExecuteFn, ToolExecutionContext, ToolLoadMode, ToolRegistry, ToolResult};
 
 pub use shell::shell_display_name;
 
@@ -22,6 +23,7 @@ pub fn register_all(registry: &mut ToolRegistry) {
     registry.register_builtin(unity::unity_asset_search());
     registry.register_builtin(misc::web_fetch());
     registry.register_builtin(misc::todowrite());
+    registry.register_builtin(misc::graph_view());
 
     registry.register_builtin(filesystem::list());
     registry.register_builtin(unity::unity_execute());
@@ -43,6 +45,15 @@ pub fn register_all(registry: &mut ToolRegistry) {
     registry.register_builtin(skill::skill_create_tool());
     registry.register_builtin(skill::skill_reload_tool());
     registry.register_builtin(skill::skill_list_tool());
+    registry.register_builtin_with_load_mode(view::view_create(), ToolLoadMode::Skill);
+    registry.register_builtin_with_load_mode(view::view_list(), ToolLoadMode::Skill);
+    registry.register_builtin_with_load_mode(view::view_reload(), ToolLoadMode::Skill);
+    registry.register_builtin_with_load_mode(view::view_run(), ToolLoadMode::Skill);
+    registry.register_builtin_with_load_mode(view::view_compile_script(), ToolLoadMode::Skill);
+    registry.register_builtin_with_load_mode(view::view_call_script(), ToolLoadMode::Skill);
+    registry.register_builtin_with_load_mode(view::view_binding_read(), ToolLoadMode::Skill);
+    registry.register_builtin_with_load_mode(view::view_binding_write(), ToolLoadMode::Skill);
+    registry.register_builtin_with_load_mode(view::view_binding_apply(), ToolLoadMode::Skill);
     registry.register_builtin(config_query_tool());
     registry.register_builtin(tool_load_tool());
     registry.register_builtin(tool_call_tool());

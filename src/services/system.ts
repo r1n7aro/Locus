@@ -1,6 +1,8 @@
 import { ipcInvoke } from "./ipc";
 import type { ProxyConfig, ProxyStatus, PythonRuntimeState } from "../types";
 
+export const APP_CLOSE_REQUESTED_EVENT = "locus-main-window-close-requested";
+
 let pythonRuntimeStateCache: PythonRuntimeState | null = null;
 let pythonRuntimeStateRequest: Promise<PythonRuntimeState> | null = null;
 
@@ -17,6 +19,10 @@ export function sendSystemNotification(title: string, body?: string | null): Pro
     },
     { throwOnError: false },
   );
+}
+
+export function requestAppExit(): Promise<void> {
+  return ipcInvoke<void>("request_app_exit");
 }
 
 export function getProxyStatus(): Promise<ProxyStatus> {

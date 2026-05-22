@@ -34,4 +34,12 @@ describe("toolCallSummary", () => {
       format: "markdown",
     }))).toBe("https://example.com/docs");
   });
+
+  it("uses graph_view title for compact summaries", () => {
+    expect(buildToolCallArgsSummary("graph_view", JSON.stringify({
+      title: "WaterNew.shader readable Shader Graph",
+      description: "This field is hidden from the tool call block.",
+      nodes: [{ id: "surface" }],
+    }))).toBe("WaterNew.shader readable Shader Graph");
+  });
 });

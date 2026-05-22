@@ -71,6 +71,12 @@ pub fn send_system_notification(
     send_system_notification_impl(&app_handle, &title, body.as_deref())
 }
 
+#[tauri::command]
+pub fn request_app_exit(app_handle: AppHandle) {
+    crate::commands::destroy_unity_embed_control_window_on_main(&app_handle);
+    app_handle.exit(0);
+}
+
 #[cfg(windows)]
 pub(crate) fn ensure_windows_notification_identity(app_handle: &AppHandle) -> Result<(), String> {
     use winreg::enums::HKEY_CURRENT_USER;

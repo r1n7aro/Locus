@@ -1,0 +1,14 @@
+{
+  "description": "Open a View Package in the Locus View host window. The host renders the package App.vue template and style.css in a sandboxed page, injects Locus runtime styles, and reports manifest or load errors in the window.",
+  "parameters": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "viewId": {
+        "type": "string",
+        "description": "View id to open, for example material-inspector."
+      }
+    },
+    "required": ["viewId"]
+  }
+}

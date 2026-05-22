@@ -1,0 +1,26 @@
+{
+  "description": "Invoke a method on a named C# View Script from a View Package through Unity Bridge. The tool compiles or reuses the cached script, runs the requested public static method in Unity, and returns the method result.",
+  "parameters": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "viewId": {
+        "type": "string",
+        "description": "View id containing the script, for example material-inspector."
+      },
+      "scriptName": {
+        "type": "string",
+        "description": "scripts[].name from view.json, for example InspectorViewApi."
+      },
+      "method": {
+        "type": "string",
+        "description": "Public static method to invoke, for example Read or Apply."
+      },
+      "args": {
+        "type": "object",
+        "description": "JSON object passed to the script method. Methods can accept zero parameters, a string JSON payload, object, or a serializable request type."
+      }
+    },
+    "required": ["viewId", "scriptName", "method", "args"]
+  }
+}

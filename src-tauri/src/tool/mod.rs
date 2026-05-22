@@ -125,6 +125,7 @@ pub fn default_load_mode_for_builtin_tool(name: &str) -> ToolLoadMode {
         "knowledge_create"
             | "knowledge_delete"
             | "knowledge_move"
+            | "graph_view"
             | "skill_create"
             | "unity_capture_viewport"
             | "unity_run_states"
@@ -398,6 +399,14 @@ mod tests {
             registry.default_load_mode("unity_capture_viewport"),
             ToolLoadMode::Lazy
         );
+    }
+
+    #[test]
+    fn builtins_register_graph_view_as_lazy() {
+        let registry = ToolRegistry::with_builtins();
+
+        assert_eq!(registry.canonical_name("graph_view"), Some("graph_view"));
+        assert_eq!(registry.default_load_mode("graph_view"), ToolLoadMode::Lazy);
     }
 
     #[test]

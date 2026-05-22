@@ -18,6 +18,7 @@ mod windows_impl {
             OnceLock,
         },
     };
+    use tauri::{AppHandle, Emitter};
     use tokio::{
         io::{AsyncBufReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf},
         net::windows::named_pipe::{ClientOptions, NamedPipeClient},
@@ -54,8 +55,13 @@ mod windows_impl {
 
     static CONNECTIONS: OnceLock<Mutex<HashMap<String, Arc<UnityPipeConnection>>>> =
         OnceLock::new();
+    static EVENT_APP_HANDLE: OnceLock<AppHandle> = OnceLock::new();
     static REQUEST_SEQ: AtomicU64 = AtomicU64::new(1);
     const PIPE_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
+    pub(super) fn set_event_app_handle(app_handle: AppHandle) {
+        let _ = EVENT_APP_HANDLE.set(app_handle);
+    }
 
     fn connections() -> &'static Mutex<HashMap<String, Arc<UnityPipeConnection>>> {
         CONNECTIONS.get_or_init(|| Mutex::new(HashMap::new()))
@@ -136,9 +142,36 @@ mod windows_impl {
         }
     }
 
+    fn unsolicited_payload(env: &PipeEnvelope) -> serde_json::Value {
+        if let Some(message) = env.message.as_deref() {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(message) {
+                return value;
+            }
+        }
+
+        serde_json::json!({
+            "message": env.message,
+            "error": env.error
+        })
+    }
+
     fn handle_unsolicited_message(env: &PipeEnvelope) {
+        let event_name = env.kind.trim();
+        if event_name.is_empty() {
+            eprintln!(
+                "[Locus] unsolicited Unity message missing type: message={:?}, error={:?}",
+                env.message, env.error
+            );
+            return;
+        }
+
+        if let Some(app_handle) = EVENT_APP_HANDLE.get() {
+            let _ = app_handle.emit(event_name, unsolicited_payload(env));
+            return;
+        }
+
         eprintln!(
-            "[Locus] unsolicited Unity message: type={}, message={:?}, error={:?}",
+            "[Locus] unsolicited Unity message without app handle: type={}, message={:?}, error={:?}",
             env.kind, env.message, env.error
         );
     }
@@ -375,6 +408,14 @@ mod windows_impl {
 }
 
 // ── Public dispatch ──────────────────────────────────────────────────
+
+#[cfg(target_os = "windows")]
+pub fn set_event_app_handle(app_handle: tauri::AppHandle) {
+    windows_impl::set_event_app_handle(app_handle);
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn set_event_app_handle(_app_handle: tauri::AppHandle) {}
 
 #[cfg(target_os = "windows")]
 pub async fn send_message(

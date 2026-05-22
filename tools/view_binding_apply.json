@@ -1,0 +1,21 @@
+{
+  "description": "Apply multiple Unity SerializedProperty writes for a View Binding workflow. Each write can reference a bindingId from bindings.json or provide a concrete target.",
+  "parameters": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "viewId": {
+        "type": "string",
+        "description": "View id containing bindings.json, for example material-inspector."
+      },
+      "writes": {
+        "type": "array",
+        "description": "Binding writes. Each item accepts bindingId, target, and value.",
+        "items": {
+          "type": "object"
+        }
+      }
+    },
+    "required": ["viewId", "writes"]
+  }
+}
