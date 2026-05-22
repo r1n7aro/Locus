@@ -44,6 +44,7 @@ pub struct UndoRoundGuard {
     _workspace_guard: OwnedMutexGuard<()>,
 }
 
+#[derive(Debug)]
 pub enum UndoPerformError {
     Conflict(Vec<UndoConflict>),
     Other(String),
@@ -88,6 +89,20 @@ fn changed_file_overlaps(
             .as_ref()
             .map(|p| target_keys.contains(&normalize_path_key(p)))
             .unwrap_or(false)
+}
+
+fn push_changed_file_if_new_target(
+    seen: &mut std::collections::HashSet<String>,
+    files: &mut Vec<ChangedFile>,
+    file: &ChangedFile,
+) {
+    let mut has_new_target = seen.insert(normalize_path_key(&file.path));
+    if let Some(old_path) = &file.old_path {
+        has_new_target |= seen.insert(normalize_path_key(old_path));
+    }
+    if has_new_target {
+        files.push(file.clone());
+    }
 }
 
 impl UndoManager {
@@ -352,9 +367,7 @@ impl UndoManager {
                         need_reload = true;
                     }
                     for f in &entry.changed_files {
-                        if seen.insert(f.path.clone()) {
-                            all_changed.push(f.clone());
-                        }
+                        push_changed_file_if_new_target(&mut seen, &mut all_changed, f);
                     }
                 }
             }
@@ -479,9 +492,7 @@ impl UndoManager {
                 continue;
             }
             for f in &entry.changed_files {
-                if seen.insert(f.path.clone()) {
-                    files.push(f.clone());
-                }
+                push_changed_file_if_new_target(&mut seen, &mut files, f);
             }
         }
 
@@ -645,6 +656,73 @@ mod tests {
             .await
             .expect_err("after_round should report diff capture failure");
         assert!(err.contains("failed to capture undo diff"));
+    }
+
+    #[tokio::test]
+    async fn undo_removes_later_deleted_file_absent_from_target_checkpoint() {
+        if !git_available() {
+            return;
+        }
+
+        let repo = setup_repo("undo-later-delete-absent-from-target");
+        let repo_str = repo.to_string_lossy().to_string();
+        let manager = UndoManager::new(GitProvider);
+
+        let round_a = manager
+            .before_round(&repo_str, "round-a")
+            .await
+            .expect("round a before_round")
+            .expect("round a checkpoint");
+        write_file(&repo.join("tracked.txt"), "base\nagent-a\n");
+        assert!(manager
+            .after_round(
+                "session-a",
+                "msg-a",
+                Some("run-a"),
+                round_a,
+                false,
+                &repo_str,
+            )
+            .await
+            .expect("round a after_round"));
+
+        write_file(&repo.join("later.txt"), "external file\n");
+        let round_b = manager
+            .before_round(&repo_str, "round-b")
+            .await
+            .expect("round b before_round")
+            .expect("round b checkpoint");
+        std::fs::remove_file(repo.join("later.txt")).expect("delete later file");
+        assert!(manager
+            .after_round(
+                "session-a",
+                "msg-b",
+                Some("run-b"),
+                round_b,
+                false,
+                &repo_str,
+            )
+            .await
+            .expect("round b after_round"));
+
+        manager
+            .perform_undo_checked("session-a", "msg-a", &repo_str, true)
+            .await
+            .expect("undo should not fail on a later D path absent from target checkpoint");
+
+        assert_eq!(
+            std::fs::read_to_string(repo.join("tracked.txt"))
+                .expect("tracked after undo")
+                .replace("\r\n", "\n"),
+            "base\n",
+        );
+        assert!(
+            !repo.join("later.txt").exists(),
+            "later file should stay absent because the target checkpoint did not contain it",
+        );
+        assert_eq!(git(&repo, &["status", "--short", "--", "later.txt"]), "");
+
+        std::fs::remove_dir_all(&repo).expect("cleanup temp repo");
     }
 
     #[tokio::test]

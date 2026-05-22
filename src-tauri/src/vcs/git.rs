@@ -451,57 +451,13 @@ impl GitProvider {
         index_tree_id: Option<&str>,
         files: &[super::undo::ChangedFile],
     ) -> Result<(), String> {
-        for f in files {
-            let full_path = std::path::Path::new(working_dir).join(&f.path);
-            match f.status.as_str() {
-                "A" => {
-                    let _ = tokio::fs::remove_file(&full_path).await;
-                    let meta_path = format!("{}.meta", full_path.display());
-                    let _ = tokio::fs::remove_file(&meta_path).await;
-                }
-                "R" => {
-                    let _ = tokio::fs::remove_file(&full_path).await;
-                    let meta_path = format!("{}.meta", full_path.display());
-                    let _ = tokio::fs::remove_file(&meta_path).await;
+        let restore_targets = Self::collect_restore_targets(files);
 
-                    let restore_path = f.old_path.as_deref().unwrap_or(&f.path);
-                    Self::git(
-                        working_dir,
-                        &[
-                            "restore",
-                            &format!("--source={}", checkpoint_id),
-                            "--worktree",
-                            "--",
-                            restore_path,
-                        ],
-                    )
-                    .await?;
-                }
-                _ => {
-                    Self::git(
-                        working_dir,
-                        &[
-                            "restore",
-                            &format!("--source={}", checkpoint_id),
-                            "--worktree",
-                            "--",
-                            &f.path,
-                        ],
-                    )
-                    .await?;
-                }
-            }
+        for path in &restore_targets {
+            Self::restore_worktree_path_to_tree(working_dir, checkpoint_id, path).await?;
         }
 
         if let Some(index_tree_id) = index_tree_id {
-            let mut restore_targets = std::collections::BTreeSet::new();
-            for file in files {
-                restore_targets.insert(file.path.clone());
-                if let Some(old_path) = &file.old_path {
-                    restore_targets.insert(old_path.clone());
-                }
-            }
-
             for path in restore_targets {
                 if Self::tree_contains_path(working_dir, index_tree_id, &path).await? {
                     Self::git(
@@ -525,6 +481,115 @@ impl GitProvider {
             }
         }
 
+        Ok(())
+    }
+
+    fn collect_restore_targets(
+        files: &[super::undo::ChangedFile],
+    ) -> std::collections::BTreeSet<String> {
+        let mut restore_targets = std::collections::BTreeSet::new();
+        for file in files {
+            Self::insert_restore_target(&mut restore_targets, &file.path);
+            if let Some(old_path) = &file.old_path {
+                Self::insert_restore_target(&mut restore_targets, old_path);
+            }
+        }
+        restore_targets
+    }
+
+    fn insert_restore_target(targets: &mut std::collections::BTreeSet<String>, path: &str) {
+        let normalized = path.replace('\\', "/");
+        if normalized.trim().is_empty() {
+            return;
+        }
+
+        targets.insert(normalized.clone());
+        if !normalized.ends_with(".meta") {
+            targets.insert(format!("{}.meta", normalized));
+        }
+    }
+
+    async fn restore_worktree_path_to_tree(
+        working_dir: &str,
+        tree_id: &str,
+        path: &str,
+    ) -> Result<(), String> {
+        if Self::tree_contains_path(working_dir, tree_id, path).await? {
+            Self::remove_directory_conflict(working_dir, path).await?;
+            Self::git(
+                working_dir,
+                &[
+                    "restore",
+                    &format!("--source={}", tree_id),
+                    "--worktree",
+                    "--",
+                    path,
+                ],
+            )
+            .await?;
+        } else {
+            Self::remove_worktree_path(working_dir, path).await?;
+        }
+        Ok(())
+    }
+
+    async fn remove_directory_conflict(working_dir: &str, path: &str) -> Result<(), String> {
+        let full_path = std::path::Path::new(working_dir).join(path);
+        let metadata = match tokio::fs::symlink_metadata(&full_path).await {
+            Ok(metadata) => metadata,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                return Err(format!(
+                    "failed to inspect worktree path '{}' before restore: {}",
+                    full_path.display(),
+                    e
+                ));
+            }
+        };
+
+        if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            tokio::fs::remove_dir_all(&full_path).await.map_err(|e| {
+                format!(
+                    "failed to remove directory conflict '{}' before restore: {}",
+                    full_path.display(),
+                    e
+                )
+            })?;
+        }
+        Ok(())
+    }
+
+    async fn remove_worktree_path(working_dir: &str, path: &str) -> Result<(), String> {
+        let full_path = std::path::Path::new(working_dir).join(path);
+        let metadata = match tokio::fs::symlink_metadata(&full_path).await {
+            Ok(metadata) => metadata,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                return Err(format!(
+                    "failed to inspect worktree path '{}' before removal: {}",
+                    full_path.display(),
+                    e
+                ));
+            }
+        };
+
+        if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            tokio::fs::remove_dir_all(&full_path).await.map_err(|e| {
+                format!(
+                    "failed to remove worktree directory '{}': {}",
+                    full_path.display(),
+                    e
+                )
+            })?;
+        } else {
+            tokio::fs::remove_file(&full_path).await.map_err(|e| {
+                format!(
+                    "failed to remove worktree file '{}': {}",
+                    full_path.display(),
+                    e
+                )
+            })?;
+        }
         Ok(())
     }
 
