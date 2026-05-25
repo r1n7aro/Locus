@@ -98,17 +98,18 @@ updatedAt: <unix-ms>
    - This is mandatory for dependency-bearing Skills: CLI integrations, local executables, scripts, Unity C# capabilities, and workflows that require package-local reference docs must be packaged.
    - Create the initial package with `skill_create`; the result includes `packageRoot` for later file edits.
    - Use the APP temp directory, usually `%APPDATA%/locus/temp/` on Windows, for clone checkouts, archives, generated source, build caches, and intermediate compiler output.
-   - Copy only the final package assets from the APP temp directory into `packageRoot`, such as `SKILL.md`, docs, scripts, compiled CLI binaries, and Unity C# files.
+   - Copy only the final package assets from the APP temp directory into `packageRoot`, such as `skill.json`, `SKILL.md`, docs, scripts, compiled CLI binaries, and Unity C# files.
    - Edit files inside the returned `packageRoot` with filesystem tools when adding docs, scripts, CLI binaries, or Unity C# files.
-   - Add `SKILL.md` at the package root and put both common Skill metadata and Locus metadata in its YAML frontmatter.
+   - Keep Locus package metadata in `skill.json`; keep `SKILL.md` as the model-facing workflow document.
    - Add optional docs under `references/`, Python scripts under `scripts/`, executable CLI files under `bin/`, and Unity C# scripts under `unity/Editor/`.
-   - When a server-side search tool is available and the package needs to integrate external software, first check GitHub for an official or well-maintained CLI. Build the CLI into a platform binary, place it under `bin/`, and declare it in `x-locus.capabilities.cli`.
+   - When a server-side search tool is available and the package needs to integrate external software, first check GitHub for an official or well-maintained CLI. Build the CLI into a platform binary, place it under `bin/`, and declare it in `capabilities.cli` or expose it through `tools[]`.
    - Keep all manifest paths package-relative and use forward slashes.
 
 9. Use this package structure:
 
 ```text
 <package-id>/
+├── skill.json
 ├── SKILL.md
 ├── references/
 │   └── details.md
@@ -121,38 +122,86 @@ updatedAt: <unix-ms>
         └── SkillBridge.cs
 ```
 
-10. Use this root `SKILL.md` shape for packages:
+10. Use this root `skill.json` shape for packages:
+
+```json
+{
+  "schema": "locus.skill.v1",
+  "id": "com.example.asset-audit",
+  "version": "0.1.0",
+  "name": "Asset Audit",
+  "description": "Use when auditing Unity project assets, unused files, import settings, or cleanup risks.",
+  "argumentHint": "<scope>",
+  "disableModelInvocation": false,
+  "source": {
+    "type": "github",
+    "url": "https://github.com/example/locus-skills",
+    "reference": "asset-audit"
+  },
+  "command": {
+    "enabled": true,
+    "trigger": "/asset-audit"
+  },
+  "capabilities": {
+    "unity": [
+      {
+        "name": "AssetAuditBridge",
+        "path": "unity/Editor/SkillBridge.cs",
+        "api": "unity_execute"
+      }
+    ],
+    "python": [
+      {
+        "name": "asset-audit",
+        "path": "scripts/tool.py",
+        "mode": "cli"
+      }
+    ],
+    "cli": [
+      {
+        "name": "asset-audit",
+        "path": "bin/tool.exe"
+      }
+    ]
+  },
+  "tools": [
+    {
+      "name": "run-audit",
+      "description": "Run the package audit script and return structured findings.",
+      "runtime": "python",
+      "path": "scripts/tool.py",
+      "input": "json-stdin",
+      "output": "json-stdout",
+      "timeoutMs": 120000,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "scope": { "type": "string" }
+        }
+      }
+    },
+    {
+      "name": "capture-game-view",
+      "description": "Dynamically compile the package C# script, capture the Game view, and return findings.",
+      "runtime": "unity",
+      "path": "unity/Editor/SkillBridge.cs",
+      "entryType": "Locus.Skills.AssetAuditBridge",
+      "method": "CaptureGameView",
+      "requestEditorStatus": "playing",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "frameCount": { "type": "integer", "minimum": 1 }
+        }
+      }
+    }
+  ]
+}
+```
+
+11. Use this root `SKILL.md` shape for packages:
 
 ```markdown
----
-name: Asset Audit
-description: Use when auditing Unity project assets, unused files, import settings, or cleanup risks.
-argument-hint: <scope>
-x-locus:
-  schema: locus.skill.v1
-  id: com.example.asset-audit
-  version: 0.1.0
-  source:
-    type: github
-    url: https://github.com/example/locus-skills
-    reference: asset-audit
-  command:
-    enabled: true
-    trigger: /asset-audit
-  capabilities:
-    unity:
-      - name: AssetAuditBridge
-        path: unity/Editor/SkillBridge.cs
-        api: unity_execute
-    python:
-      - name: asset-audit
-        path: scripts/tool.py
-        mode: cli
-    cli:
-      - name: asset-audit
-        path: bin/tool.exe
----
-
 # Asset Audit
 
 ## Instructions
@@ -160,29 +209,38 @@ x-locus:
 Full execution workflow, required checks, expected outputs, and references to package-local docs such as [details](references/details.md).
 ```
 
-11. Respect package document levels when the Skill benefits from progressive disclosure.
+12. Register package tools only for stable, reusable operations.
+   - `runtime: "python"` executes a package-relative Python script with managed/system Python and sends tool arguments as JSON stdin by default.
+   - `runtime: "bash"` executes a package-local shell script or trusted command through `sh`.
+   - `runtime: "cli"` executes a package-local binary or PATH command directly.
+   - `runtime: "unity"` with `path` dynamically compiles the package C# source in Unity, then invokes `method` on `entryType`; the method accepts zero parameters or one JSON parameter and returns JSON-compatible data.
+   - `runtime: "unity"` with only `typeName` invokes an already loaded static Unity type and is reserved for bridge code that is intentionally installed or otherwise present in the project.
+   - Tool names are registered as namespaced Locus tools derived from package id and tool name, so use short, action-oriented names inside `tools[]`.
+
+13. Respect package document levels when the Skill benefits from progressive disclosure.
    - `L0`, `L1`, and `L2` are optional package sections.
    - Use `L0` for selection guidance, `L1` for a compact workflow, and `L2` for full instructions.
    - Use links to other package docs for progressive disclosure instead of putting every detail in the root document.
 
-12. Handle Unity C# package files correctly.
+14. Handle Unity C# package files correctly.
    - Put source files in the package under `unity/Editor/`.
-   - Declare each C# file in `x-locus.capabilities.unity`.
+   - Prefer exposing callable Unity operations through `tools[]` with `runtime: "unity"` and `path`; this compiles dynamically and leaves the Unity project unchanged.
+   - Declare C# files in `capabilities.unity` only when they must be installed as persistent Editor bridge files.
    - Installed Unity C# files are copied into `Packages/com.farlocus.locus/Editor/Skills/<package-id>/` in the target Unity project.
    - Installation status is based on the real target file and hash, so report `installed`, `modified`, `partial`, or `notInstalled` from the Skill UI when relevant.
 
-13. Keep the current skill storage model simple.
+15. Keep the current skill storage model simple.
    - Prefer `skill_create` for a single Markdown document only when the Skill is text-only.
    - Use a package when bundled resources, multiple docs, dependency setup, CLI tooling, scripts, Unity C# files, or distribution are part of the requirement.
    - Do not recreate legacy `knowledge/Skill/<name>/SKILL.md` directories.
 
-14. When migrating from a legacy skill:
+16. When migrating from a legacy skill:
    - Map legacy frontmatter `name` to the new `path`, `title`, and default command trigger.
    - Move the legacy description into `## Summary`.
    - Move the legacy body into `## Content`, then normalize it into `Instructions` for command-only Skills or selection guidance plus `Instructions` for auto-recalled Skills.
    - Preserve useful examples and decision rules, and drop obsolete path conventions such as `knowledge/Skill/<name>/SKILL.md`.
    - If the legacy skill has bundled files or references, migrate it into a package and link detailed docs from the root `SKILL.md`.
 
-15. After creation or migration, run `skill_reload` and report:
+17. After creation or migration, run `skill_reload` and report:
    - For a single document: the knowledge path, repo file path, and slash command trigger.
    - For a package: the package ID, package root path, root document path, command trigger, and any Unity C# install target.

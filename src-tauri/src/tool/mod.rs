@@ -170,17 +170,32 @@ impl ToolRegistry {
         self.tools.get(&normalize_tool_name_key(name))
     }
 
-    pub fn canonical_name(&self, name: &str) -> Option<&str> {
-        self.get(name).map(|def| def.name.as_str())
+    pub fn canonical_name(&self, name: &str) -> Option<String> {
+        self.get(name)
+            .map(|def| def.name.clone())
+            .or_else(|| crate::commands::canonical_skill_package_tool_name(name))
     }
 
-    pub fn tool_description(&self, name: &str) -> Option<(&str, &serde_json::Value)> {
+    pub fn tool_description(&self, name: &str) -> Option<(String, serde_json::Value)> {
         self.get(name)
-            .map(|def| (def.description.as_str(), &def.parameters))
+            .map(|def| (def.description.clone(), def.parameters.clone()))
+            .or_else(|| crate::commands::skill_package_tool_description_sync(name))
     }
 
     pub fn is_built_in(&self, name: &str) -> bool {
         self.built_in_tools.contains(&normalize_tool_name_key(name))
+    }
+
+    pub fn skill_tool_names(&self) -> Vec<String> {
+        let mut names = self
+            .tools
+            .iter()
+            .filter_map(|(key, def)| (!self.built_in_tools.contains(key)).then(|| def.name.clone()))
+            .collect::<Vec<_>>();
+        names.extend(crate::commands::skill_package_tool_names_sync());
+        names.sort();
+        names.dedup();
+        names
     }
 
     pub fn default_load_mode(&self, name: &str) -> ToolLoadMode {
@@ -191,16 +206,18 @@ impl ToolRegistry {
     }
 
     pub fn resolve_api_tool(&self, name: &str) -> Option<serde_json::Value> {
-        self.get(name).map(|def| {
-            serde_json::json!({
-                "type": "function",
-                "function": {
-                    "name": def.name,
-                    "description": def.description,
-                    "parameters": def.parameters,
-                }
+        self.get(name)
+            .map(|def| {
+                serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": def.name,
+                        "description": def.description,
+                        "parameters": def.parameters,
+                    }
+                })
             })
-        })
+            .or_else(|| crate::commands::resolve_skill_package_api_tool_sync(name))
     }
 
     pub fn resolve_api_tools(&self, tool_names: &[String]) -> Vec<serde_json::Value> {
@@ -224,9 +241,18 @@ impl ToolRegistry {
     ) -> ToolResult {
         match self.get(name) {
             Some(def) => (def.execute)(arguments.clone(), context).await,
-            None => ToolResult {
-                output: format!("Tool '{}' not found", name),
-                is_error: true,
+            None => match crate::commands::execute_skill_package_tool_by_api_name(
+                name,
+                arguments.clone(),
+                context,
+            )
+            .await
+            {
+                Some(result) => result,
+                None => ToolResult {
+                    output: format!("Tool '{}' not found", name),
+                    is_error: true,
+                },
             },
         }
     }
@@ -309,7 +335,7 @@ mod tests {
 
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["function"]["name"].as_str(), Some("edit"));
-        assert_eq!(registry.canonical_name(" EDIT "), Some("edit"));
+        assert_eq!(registry.canonical_name(" EDIT ").as_deref(), Some("edit"));
     }
 
     #[tokio::test]
@@ -382,7 +408,10 @@ mod tests {
     fn builtins_register_web_fetch_as_lazy_without_legacy_name() {
         let registry = ToolRegistry::with_builtins();
 
-        assert_eq!(registry.canonical_name("web_fetch"), Some("web_fetch"));
+        assert_eq!(
+            registry.canonical_name("web_fetch").as_deref(),
+            Some("web_fetch")
+        );
         assert_eq!(registry.default_load_mode("web_fetch"), ToolLoadMode::Lazy);
         assert_eq!(registry.canonical_name("webfetch"), None);
     }
@@ -392,7 +421,7 @@ mod tests {
         let registry = ToolRegistry::with_builtins();
 
         assert_eq!(
-            registry.canonical_name("unity_capture_viewport"),
+            registry.canonical_name("unity_capture_viewport").as_deref(),
             Some("unity_capture_viewport")
         );
         assert_eq!(
@@ -405,7 +434,10 @@ mod tests {
     fn builtins_register_graph_view_as_lazy() {
         let registry = ToolRegistry::with_builtins();
 
-        assert_eq!(registry.canonical_name("graph_view"), Some("graph_view"));
+        assert_eq!(
+            registry.canonical_name("graph_view").as_deref(),
+            Some("graph_view")
+        );
         assert_eq!(registry.default_load_mode("graph_view"), ToolLoadMode::Lazy);
     }
 

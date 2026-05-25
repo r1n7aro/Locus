@@ -1,5 +1,5 @@
 {
-  "description": "Create a project Skill document or an app Skill package with explicit metadata. Use this instead of `knowledge_create` whenever the target is a Skill. Dependency-bearing Skills that require CLI tools, binaries, scripts, Unity C# files, or package-local runtime assets must use `kind: \"package\"`. Returns a plain-text status line with the created Skill path and command trigger.",
+  "description": "Create a project Skill document or an app Skill package with explicit metadata. Use this instead of `knowledge_create` whenever the target is a Skill. Dependency-bearing Skills that require CLI tools, binaries, scripts, Unity C# files, package-local runtime assets, or package-registered tools must use `kind: \"package\"`. Package creation writes `skill.json` for Locus metadata and a plain `SKILL.md` for model-facing instructions. Returns a plain-text status line with the created Skill path and command trigger.",
   "parameters": {
     "type": "object",
     "additionalProperties": false,

@@ -409,6 +409,13 @@ pub fn run() {
             startup_for_setup.mark("setup_knowledge_runtime_ready");
 
             let mut tool_registry = ToolRegistry::with_builtins();
+            let skill_tool_count = commands::register_skill_package_tools(&mut tool_registry);
+            if skill_tool_count > 0 {
+                println!(
+                    "[Locus] registered {} Skill package tool(s)",
+                    skill_tool_count
+                );
+            }
             let subagents = registry.list_task_agent_descriptions();
             if !subagents.is_empty() {
                 tool_registry.register_task_tool(&subagents);
@@ -1074,6 +1081,7 @@ pub fn run() {
             commands::agent_graph_tool_request,
             commands::agent_graph_tool_submit,
             commands::agent_graph_tool_cancel,
+            commands::agent_graph_tool_reopen,
             commands::fetch_app_update_manifest,
         ])
         .run(tauri::generate_context!())

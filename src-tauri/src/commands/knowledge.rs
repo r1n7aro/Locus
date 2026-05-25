@@ -3173,7 +3173,6 @@ pub async fn set_agent_tool_direct_load(
 
     let canonical = tool_registry
         .canonical_name(&tool_name)
-        .map(str::to_string)
         .ok_or_else(|| format!("Tool '{}' not found", tool_name))?;
     if matches!(canonical.as_str(), "tool_load" | "tool_call") {
         return Err(format!("Tool '{}' load mode is fixed", canonical).into());
