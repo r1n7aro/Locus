@@ -35,4 +35,11 @@ describe("agentGraphTool service", () => {
     expect(read("src/components/AgentGraphToolWindow.vue")).not.toContain("agent-graph-description");
     expect(read("src/components/ToolCallBlock.vue")).toContain("GRAPH_VIEW_HIDDEN_ARG_KEYS");
   });
+
+  it("keeps the graph window title out of the embedded graph toolbar", () => {
+    const source = read("src/components/AgentGraphToolWindow.vue");
+
+    expect(source).toContain('title=""');
+    expect(source).not.toContain(':title="payload.title"');
+  });
 });

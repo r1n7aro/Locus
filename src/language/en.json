@@ -625,6 +625,7 @@
   "tool.noOutput": "(No output)",
   "tool.persistedOutputDeleted": "Full output deleted",
   "tool.persistedOutputDeletedPath": "Original path: {0}",
+  "tool.graphView.open": "Open View",
 
   "settings.title": "Settings",
   "settings.close": "Close",

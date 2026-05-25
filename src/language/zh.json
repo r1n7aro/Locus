@@ -625,6 +625,7 @@
   "tool.noOutput": "(无输出)",
   "tool.persistedOutputDeleted": "完整输出已删除",
   "tool.persistedOutputDeletedPath": "原路径：{0}",
+  "tool.graphView.open": "打开 View",
 
   "settings.title": "设置",
   "settings.close": "关闭",

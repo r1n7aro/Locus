@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -93,6 +94,15 @@ pub struct AgentGraphToolOpenResult {
     pub editable: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentGraphToolReopenRequest {
+    pub tool_call_id: String,
+    pub arguments: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
+}
+
 #[derive(Debug)]
 pub enum AgentGraphToolAnswer {
     Submitted(AgentGraphToolSubmitRequest),
@@ -145,6 +155,57 @@ pub fn agent_graph_tool_request_from_args(
         graph,
         options,
     })
+}
+
+fn agent_graph_tool_snapshot_request_id(request: &AgentGraphToolReopenRequest) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    request.tool_call_id.hash(&mut hasher);
+    request.arguments.hash(&mut hasher);
+    request.output.hash(&mut hasher);
+    format!("snapshot-{:016x}", hasher.finish())
+}
+
+fn submitted_graph_from_output(output: Option<&str>) -> Option<serde_json::Value> {
+    let parsed: serde_json::Value = serde_json::from_str(output?).ok()?;
+    parsed
+        .get("graph")
+        .filter(|value| value.is_object())
+        .cloned()
+}
+
+fn request_id_from_output(output: Option<&str>) -> Option<String> {
+    let parsed: serde_json::Value = serde_json::from_str(output?).ok()?;
+    parsed
+        .get("requestId")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn agent_graph_tool_reopen_request_from_record(
+    request: &AgentGraphToolReopenRequest,
+) -> Result<AgentGraphToolRequest, String> {
+    let mut args = serde_json::from_str::<serde_json::Value>(&request.arguments)
+        .map_err(|error| format!("Error parsing graph_view arguments: {}", error))?;
+    let Some(args_object) = args.as_object_mut() else {
+        return Err("graph_view arguments must be an object.".to_string());
+    };
+
+    if let Some(graph) = submitted_graph_from_output(request.output.as_deref()) {
+        args_object.insert("graph".to_string(), graph);
+        args_object.remove("nodes");
+        args_object.remove("links");
+        args_object.remove("connections");
+    }
+    args_object.insert("editable".to_string(), serde_json::Value::Bool(false));
+    args_object.remove("options");
+
+    let mut graph_request = agent_graph_tool_request_from_args(&args, &request.tool_call_id)?;
+    graph_request.request_id = agent_graph_tool_snapshot_request_id(request);
+    graph_request.editable = false;
+    graph_request.options = Vec::new();
+    Ok(graph_request)
 }
 
 fn normalize_graph_arg(args: &serde_json::Value) -> Result<serde_json::Value, String> {
@@ -426,6 +487,37 @@ pub async fn agent_graph_tool_cancel(
     })
 }
 
+#[tauri::command]
+pub async fn agent_graph_tool_reopen(
+    request: AgentGraphToolReopenRequest,
+    store: State<'_, AgentGraphToolStore>,
+    app_handle: AppHandle,
+) -> Result<AgentGraphToolOpenResult, AppError> {
+    if let Some(existing_request_id) = request_id_from_output(request.output.as_deref()) {
+        let existing_request = {
+            let guard = store.lock().await;
+            guard
+                .get(&existing_request_id)
+                .map(|entry| entry.request.clone())
+        };
+        if let Some(existing_request) = existing_request {
+            return open_agent_graph_tool_window(&app_handle, &existing_request)
+                .map_err(AppError::from);
+        }
+    }
+
+    let graph_request =
+        agent_graph_tool_reopen_request_from_record(&request).map_err(AppError::from)?;
+    insert_agent_graph_tool_request(store.inner(), graph_request.clone(), None).await;
+    match open_agent_graph_tool_window(&app_handle, &graph_request) {
+        Ok(result) => Ok(result),
+        Err(error) => {
+            let _ = remove_agent_graph_tool_request(store.inner(), &graph_request.request_id).await;
+            Err(AppError::from(error))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -486,5 +578,61 @@ mod tests {
         let error = agent_graph_tool_request_from_args(&args, "tool-1").unwrap_err();
 
         assert!(error.contains("at most 3"));
+    }
+
+    #[test]
+    fn graph_tool_reopen_forces_readonly_and_uses_submitted_graph() {
+        let request = AgentGraphToolReopenRequest {
+            tool_call_id: "tool-1".to_string(),
+            arguments: serde_json::json!({
+                "title": "Editable Graph",
+                "editable": true,
+                "nodes": [{ "id": "original" }],
+                "links": [],
+                "options": [
+                    { "label": "Apply", "description": "Apply graph", "value": "apply" }
+                ]
+            })
+            .to_string(),
+            output: Some(
+                serde_json::json!({
+                    "status": "submitted",
+                    "requestId": "request-1",
+                    "graph": {
+                        "schema": "locus.graph.v1",
+                        "nodes": [{ "id": "submitted" }],
+                        "links": []
+                    }
+                })
+                .to_string(),
+            ),
+        };
+
+        let reopened = agent_graph_tool_reopen_request_from_record(&request).unwrap();
+
+        assert!(!reopened.editable);
+        assert!(reopened.request_id.starts_with("snapshot-"));
+        assert!(reopened.options.is_empty());
+        assert_eq!(reopened.graph["nodes"][0]["id"], "submitted");
+    }
+
+    #[test]
+    fn graph_tool_reopen_falls_back_to_original_graph_args() {
+        let request = AgentGraphToolReopenRequest {
+            tool_call_id: "tool-2".to_string(),
+            arguments: serde_json::json!({
+                "title": "Readonly Graph",
+                "editable": false,
+                "nodes": [{ "id": "node-a" }],
+                "links": []
+            })
+            .to_string(),
+            output: Some("Graph editing was cancelled before confirmation.".to_string()),
+        };
+
+        let reopened = agent_graph_tool_reopen_request_from_record(&request).unwrap();
+
+        assert!(!reopened.editable);
+        assert_eq!(reopened.graph["nodes"][0]["id"], "node-a");
     }
 }

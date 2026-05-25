@@ -36,6 +36,19 @@ export interface AgentGraphToolSubmitResult {
   status: string;
 }
 
+export interface AgentGraphToolOpenResult {
+  requestId: string;
+  windowLabel: string;
+  hostUrl: string;
+  editable: boolean;
+}
+
+export interface AgentGraphToolReopenRequest {
+  toolCallId: string;
+  arguments: string;
+  output?: string;
+}
+
 export function isAgentGraphToolWindowLocation(
   locationLike: Pick<Location, "pathname" | "search"> = window.location,
 ): boolean {
@@ -67,4 +80,14 @@ export function agentGraphToolSubmit(
 
 export function agentGraphToolCancel(requestId: string): Promise<AgentGraphToolSubmitResult> {
   return ipcInvoke<AgentGraphToolSubmitResult>("agent_graph_tool_cancel", { requestId });
+}
+
+export function agentGraphToolReopen(
+  request: AgentGraphToolReopenRequest,
+): Promise<AgentGraphToolOpenResult> {
+  return ipcInvoke<AgentGraphToolOpenResult>(
+    "agent_graph_tool_reopen",
+    { request },
+    { notify: true, operation: "agent_graph_tool_reopen" },
+  );
 }

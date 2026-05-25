@@ -170,7 +170,7 @@ onBeforeUnmount(() => {
       <GraphView
         v-else-if="payload"
         :controller="graphController"
-        :title="payload.title"
+        title=""
         :readonly="!payload.editable"
         :auto-layout="payload.graph.layout?.auto ?? 'missing'"
         :layout-options="payload.graph.layout ?? {}"

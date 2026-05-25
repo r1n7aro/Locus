@@ -1,16 +1,19 @@
 
 <script setup lang="ts">
 import { ref, computed, nextTick, watch } from "vue";
+import { PanelTopOpen } from "lucide";
 import MarkdownRenderer from "./MarkdownRenderer.vue";
 import ToolCallCollection from "./ToolCallCollection.vue";
 import ToolResultImages from "./ToolResultImages.vue";
 import FileDiffViewer from "./diff/FileDiffViewer.vue";
+import LucideIcon from "./icons/LucideIcon.vue";
 import hljs, { langFromPath } from "../hljs";
 import { diffStrings } from "../services/diff";
 import { t } from "../i18n";
 import { resolveToolBlockOverride } from "./tool-block-overrides/toolBlockOverrides";
 import { buildToolCallArgsSummary } from "./toolCallSummary";
 import { persistedOutputDisplay } from "./toolPersistedOutput";
+import { agentGraphToolReopen } from "../services/agentGraphTool";
 import { traceToolBlockLayoutChange } from "../services/layoutDiagnostics";
 
 import type { ToolCallDisplay, FileDiffPayload } from "../types";
@@ -35,6 +38,7 @@ function shouldAutoExpandSubagentTool(toolCall: ToolCallDisplay) {
 }
 
 const expanded = ref(shouldAutoExpandSubagentTool(props.toolCall));
+const openingGraphView = ref(false);
 const rootRef = ref<HTMLElement | null>(null);
 const headerRef = ref<HTMLElement | null>(null);
 const outputPre = ref<HTMLPreElement | null>(null);
@@ -172,6 +176,9 @@ const displayName = computed(() => {
 });
 
 const isEditTool = computed(() => props.toolCall.name === "edit");
+const showGraphViewOpenButton = computed(() =>
+  props.toolCall.name === "graph_view" && props.toolCall.status !== "running",
+);
 const GRAPH_VIEW_HIDDEN_ARG_KEYS = new Set(["description"]);
 
 interface EditDiffItem {
@@ -332,6 +339,22 @@ const argsSummary = computed(() =>
   buildToolCallArgsSummary(props.toolCall.name, props.toolCall.arguments),
 );
 
+async function reopenGraphView() {
+  if (openingGraphView.value) return;
+  openingGraphView.value = true;
+  try {
+    await agentGraphToolReopen({
+      toolCallId: props.toolCall.id,
+      arguments: props.toolCall.arguments,
+      output: props.toolCall.output,
+    });
+  } catch {
+    // ipcInvoke reports the error through the notification store.
+  } finally {
+    openingGraphView.value = false;
+  }
+}
+
 function getFilePath(): string {
   try {
     const args = JSON.parse(props.toolCall.arguments);
@@ -405,14 +428,28 @@ const highlightedOutput = computed(() => {
     :data-tool-layout-expanded="String(expanded)"
     @click="expandFromBlockClick"
   >
-    <button ref="headerRef" type="button" class="tool-call-header ui-select-none" @click.stop="toggleExpanded">
-      <span class="tool-call-icon" :class="statusIcon">
-        <span v-if="toolCall.status === 'running'" class="spinner-anim"></span>
-        <span v-else class="tool-call-status-dot"></span>
-      </span>
-      <span class="tool-call-name">{{ displayName }}</span>
-      <span v-if="argsSummary" class="tool-call-summary">{{ argsSummary }}</span>
-    </button>
+    <div class="tool-call-header-row">
+      <button ref="headerRef" type="button" class="tool-call-header ui-select-none" @click.stop="toggleExpanded">
+        <span class="tool-call-icon" :class="statusIcon">
+          <span v-if="toolCall.status === 'running'" class="spinner-anim"></span>
+          <span v-else class="tool-call-status-dot"></span>
+        </span>
+        <span class="tool-call-name">{{ displayName }}</span>
+        <span v-if="argsSummary" class="tool-call-summary">{{ argsSummary }}</span>
+      </button>
+      <button
+        v-if="showGraphViewOpenButton"
+        type="button"
+        class="tool-call-action-button"
+        :title="t('tool.graphView.open')"
+        :aria-label="t('tool.graphView.open')"
+        :disabled="openingGraphView"
+        @click.stop="reopenGraphView"
+      >
+        <LucideIcon :icon="PanelTopOpen" :size="13" />
+        <span>{{ t("tool.graphView.open") }}</span>
+      </button>
+    </div>
     <div v-if="showRecompileHint" class="recompile-hint">
       <div class="recompile-hint-main">{{ t("tool.recompile.hint") }}</div>
       <div class="recompile-hint-sub">{{ t("tool.recompile.sub") }}</div>
@@ -585,6 +622,16 @@ const highlightedOutput = computed(() => {
   color: var(--status-warn-fg);
 }
 
+.tool-call-header-row {
+  width: 100%;
+  max-width: 100%;
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
 .tool-call-icon {
   width: 14px;
   height: 14px;
@@ -654,6 +701,39 @@ const highlightedOutput = computed(() => {
   overflow: hidden;
   text-overflow: ellipsis;
   min-width: 0;
+}
+
+.tool-call-action-button {
+  appearance: none;
+  min-height: 24px;
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  padding: 0 8px;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+  transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease, opacity 0.12s ease;
+}
+
+.tool-call-action-button:hover:not(:disabled),
+.tool-call-action-button:focus-visible {
+  background: color-mix(in srgb, var(--hover-bg) 76%, transparent);
+  border-color: var(--border-color);
+  color: var(--text-color);
+  outline: none;
+}
+
+.tool-call-action-button:disabled {
+  cursor: wait;
+  opacity: 0.58;
 }
 
 .tool-call-detail {
