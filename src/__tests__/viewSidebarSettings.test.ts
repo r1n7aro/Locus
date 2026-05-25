@@ -58,6 +58,23 @@ describe("View sidebar settings", () => {
     expect(createTool).toContain("\"InspectionPanel\"");
   });
 
+  it("lets view_create create temporary packages outside the visible View tree", () => {
+    const service = read("src/services/view.ts");
+    const createTool = read("tools/view_create.json");
+    const runtime = read("src-tauri/src/view.rs");
+    const tool = read("src-tauri/src/tool/builtins/view.rs");
+
+    expect(service).toContain("temporary?: boolean;");
+    expect(createTool).toContain("\"temporary\"");
+    expect(createTool).toContain("do not appear in view_list");
+    expect(runtime).toContain("temporary_views_root_for_workspace");
+    expect(runtime).toContain("parse_view_create_request");
+    expect(runtime).toContain("create_view_sync_with_scope");
+    expect(runtime).toContain("resolve_view_package_root");
+    expect(tool).toContain("parse_view_create_request(args)");
+    expect(tool).toContain("create_view_sync_with_scope(&working_dir, request, temporary)");
+  });
+
   it("keeps View tree operations package-level and disk-backed", () => {
     const service = read("src/services/view.ts");
     const commands = read("src-tauri/src/commands/view.rs");

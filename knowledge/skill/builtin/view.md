@@ -46,6 +46,7 @@ Use this workflow when the user asks for a Locus View, View Package, or frontend
 3. Create or locate the package.
    - Use `view_list` first when a matching View may already exist.
    - Use `view_create` for a new package.
+   - Set `temporary: true` for one-off display Views that should stay out of `Locus/views` and the user-visible View tree. Use the returned `summary.id` and `packageRoot` for edits, reloads, and `view_run`.
    - Keep `id` lowercase kebab-case.
    - Use concise display names.
    - Choose `icon` from the Locus icon library when creating a package. Common choices: `View`, `InspectionPanel`, `TableProperties`, `Network`, `Link2`, `Workflow`, `Kanban`, `Grid2X2`, `Layers`, `Package`, `Box`, `Braces`, `FileCode2`, `Puzzle`, `ScanSearch`.

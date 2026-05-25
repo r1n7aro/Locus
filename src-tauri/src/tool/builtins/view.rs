@@ -50,8 +50,8 @@ pub(super) fn view_create() -> ToolDef {
                     Ok(path) => path,
                     Err(result) => return result,
                 };
-                let request = match serde_json::from_value::<crate::view::ViewCreateRequest>(args) {
-                    Ok(request) => request,
+                let (request, temporary) = match crate::view::parse_view_create_request(args) {
+                    Ok(parsed) => parsed,
                     Err(error) => {
                         return ToolResult {
                             output: format!("Error parsing view_create arguments: {}", error),
@@ -60,7 +60,7 @@ pub(super) fn view_create() -> ToolDef {
                     }
                 };
 
-                match crate::view::create_view_sync(&working_dir, request) {
+                match crate::view::create_view_sync_with_scope(&working_dir, request, temporary) {
                     Ok(detail) => {
                         if let Some(app_handle) = ctx.app_handle.as_ref() {
                             crate::view::emit_view_reload(app_handle, &detail.summary);

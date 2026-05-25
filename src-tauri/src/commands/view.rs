@@ -5,15 +5,16 @@ use tauri::{AppHandle, State};
 use crate::error::AppError;
 use crate::view::{
     append_view_frontend_log_sync, call_view_script, compile_view_script, create_view_folder_sync,
-    create_view_sync, delete_view_entry_sync, emit_view_reload, emit_view_tree_changed,
-    list_view_tree_sync, list_views_sync, move_view_entry_sync, open_view_window, read_view_sync,
-    reload_view_sync, supported_view_templates, view_binding_apply as view_binding_apply_impl,
-    view_binding_read as view_binding_read_impl, view_binding_write as view_binding_write_impl,
-    ViewBindingApplyRequest, ViewBindingApplyResult, ViewBindingReadRequest, ViewBindingReadResult,
-    ViewBindingWriteRequest, ViewBindingWriteResult, ViewCallScriptRequest, ViewCallScriptResult,
-    ViewCompileScriptRequest, ViewCompileScriptResult, ViewCreateFolderRequest, ViewCreateRequest,
-    ViewDeleteEntryRequest, ViewFolderSummary, ViewFrontendLogRequest, ViewMoveEntryRequest,
-    ViewPackageDetail, ViewPackageSummary, ViewRunResult, ViewTemplateSummary, ViewTreeSnapshot,
+    create_view_sync_with_scope, delete_view_entry_sync, emit_view_reload, emit_view_tree_changed,
+    list_view_tree_sync, list_views_sync, move_view_entry_sync, open_view_window,
+    parse_view_create_request, read_view_sync, reload_view_sync, supported_view_templates,
+    view_binding_apply as view_binding_apply_impl, view_binding_read as view_binding_read_impl,
+    view_binding_write as view_binding_write_impl, ViewBindingApplyRequest, ViewBindingApplyResult,
+    ViewBindingReadRequest, ViewBindingReadResult, ViewBindingWriteRequest, ViewBindingWriteResult,
+    ViewCallScriptRequest, ViewCallScriptResult, ViewCompileScriptRequest, ViewCompileScriptResult,
+    ViewCreateFolderRequest, ViewDeleteEntryRequest, ViewFolderSummary, ViewFrontendLogRequest,
+    ViewMoveEntryRequest, ViewPackageDetail, ViewPackageSummary, ViewRunResult,
+    ViewTemplateSummary, ViewTreeSnapshot,
 };
 use crate::workspace::Workspace;
 
@@ -38,12 +39,14 @@ pub async fn view_tree(workspace: State<'_, Arc<Workspace>>) -> Result<ViewTreeS
 
 #[tauri::command]
 pub async fn view_create(
-    request: ViewCreateRequest,
+    request: serde_json::Value,
     workspace: State<'_, Arc<Workspace>>,
     app_handle: AppHandle,
 ) -> Result<ViewPackageDetail, AppError> {
     let working_dir = workspace.path.read().await.clone();
-    let detail = create_view_sync(&working_dir, request).map_err(AppError::from)?;
+    let (request, temporary) = parse_view_create_request(request).map_err(AppError::from)?;
+    let detail =
+        create_view_sync_with_scope(&working_dir, request, temporary).map_err(AppError::from)?;
     emit_view_reload(&app_handle, &detail.summary);
     Ok(detail)
 }

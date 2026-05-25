@@ -1,5 +1,5 @@
 {
-  "description": "Create a View Package under the selected Unity project at Locus/views/<view-id>. Use this only inside the /view workflow. It validates the View id, writes the template package, and returns package summary plus manifest metadata. Use normal file tools to read or edit files inside packageRoot.",
+  "description": "Create a View Package. By default it writes a persistent package under the selected Unity project at Locus/views/<view-id>. Set temporary=true for one-off display Views; Locus writes them under the app temp directory, appends a unique suffix to the requested id, keeps them out of the user-visible View registry, and returns the actual id plus packageRoot. Use this only inside the /view workflow. Use normal file tools to read or edit files inside packageRoot.",
   "parameters": {
     "type": "object",
     "additionalProperties": false,
@@ -42,6 +42,10 @@
           null
         ],
         "description": "Optional Locus icon library name for the View list. Defaults by template."
+      },
+      "temporary": {
+        "type": "boolean",
+        "description": "Create a one-off View package outside Locus/views. Temporary Views can be opened with the returned id but do not appear in view_list or the user-visible View tree."
       }
     },
     "required": ["id", "template"]

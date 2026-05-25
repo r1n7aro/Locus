@@ -12,6 +12,7 @@ use tauri::{AppHandle, Emitter, Manager, WebviewUrl};
 pub const VIEW_SCHEMA: &str = "locus.view.v1";
 pub const VIEW_BINDINGS_SCHEMA: &str = "locus.view.bindings.v1";
 pub const VIEW_ROOT_RELATIVE: &str = "Locus/views";
+pub const TEMP_VIEW_ROOT_RELATIVE: &str = "view-packages";
 pub const VIEW_RELOAD_EVENT: &str = "view-package-reloaded";
 pub const VIEW_TREE_CHANGED_EVENT: &str = "view-tree-changed";
 
@@ -91,6 +92,8 @@ pub struct ViewPackageSummary {
     pub manifest_path: String,
     pub updated_at: i64,
     pub capabilities: ViewCapabilities,
+    #[serde(default)]
+    pub temporary: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -525,6 +528,54 @@ pub fn views_root_for_workspace(working_dir: &str) -> Result<PathBuf, String> {
     Ok(workspace_root(working_dir)?.join(VIEW_ROOT_RELATIVE))
 }
 
+fn temp_workspace_dir_name(working_dir: &str) -> Result<String, String> {
+    let root = workspace_root(working_dir)?;
+    let normalized = root.display().to_string().replace('\\', "/");
+    let hash = blake3::hash(normalized.to_ascii_lowercase().as_bytes())
+        .to_hex()
+        .to_string();
+    let raw_name = root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("workspace");
+    let mut slug = String::new();
+    let mut previous_dash = false;
+    for ch in raw_name.chars() {
+        let next = if ch.is_ascii_alphanumeric() {
+            Some(ch.to_ascii_lowercase())
+        } else if ch == '-' || ch == '_' || ch == ' ' {
+            Some('-')
+        } else {
+            None
+        };
+        let Some(next) = next else {
+            continue;
+        };
+        if next == '-' {
+            if slug.is_empty() || previous_dash {
+                continue;
+            }
+            previous_dash = true;
+        } else {
+            previous_dash = false;
+        }
+        slug.push(next);
+    }
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+    if slug.is_empty() {
+        slug.push_str("workspace");
+    }
+    Ok(format!("{}-{}", slug, &hash[..12]))
+}
+
+pub fn temporary_views_root_for_workspace(working_dir: &str) -> Result<PathBuf, String> {
+    Ok(crate::commands::app_temp_dir()?
+        .join(TEMP_VIEW_ROOT_RELATIVE)
+        .join(temp_workspace_dir_name(working_dir)?))
+}
+
 pub fn view_package_root(working_dir: &str, id: &str) -> Result<PathBuf, String> {
     let id = normalize_view_id(id)?;
     let views_root = views_root_for_workspace(working_dir)?;
@@ -547,6 +598,49 @@ pub fn view_package_root(working_dir: &str, id: &str) -> Result<PathBuf, String>
                 .join(", ")
         )),
     }
+}
+
+pub fn resolve_view_package_root(working_dir: &str, id: &str) -> Result<PathBuf, String> {
+    let id = normalize_view_id(id)?;
+    let persistent_root = view_package_root(working_dir, &id)?;
+    if manifest_matches_id(&persistent_root, &id) {
+        return Ok(persistent_root);
+    }
+
+    let temp_root = temporary_views_root_for_workspace(working_dir)?;
+    let matches = find_view_package_roots_by_id(&temp_root, &id)?;
+    match matches.len() {
+        0 => Ok(persistent_root),
+        1 => Ok(matches[0].clone()),
+        _ => Err(format!(
+            "Multiple temporary View packages use id '{}': {}",
+            id,
+            matches
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
+pub fn parse_view_create_request(
+    value: serde_json::Value,
+) -> Result<(ViewCreateRequest, bool), String> {
+    let temporary = match value.get("temporary") {
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| "temporary must be a boolean.".to_string())?,
+        None => false,
+    };
+
+    let mut request_value = value;
+    if let Some(object) = request_value.as_object_mut() {
+        object.remove("temporary");
+    }
+    let request = serde_json::from_value::<ViewCreateRequest>(request_value)
+        .map_err(|error| error.to_string())?;
+    Ok((request, temporary))
 }
 
 fn package_path(root: &Path, rel_path: &str) -> Result<PathBuf, String> {
@@ -591,6 +685,7 @@ fn summary_from_manifest(
     views_root: &Path,
     root: &Path,
     manifest: &ViewManifest,
+    temporary: bool,
 ) -> ViewPackageSummary {
     ViewPackageSummary {
         id: manifest.id.clone(),
@@ -608,7 +703,14 @@ fn summary_from_manifest(
         manifest_path: manifest_path(root).display().to_string().replace('\\', "/"),
         updated_at: updated_at(&manifest_path(root)),
         capabilities: manifest.capabilities.clone(),
+        temporary,
     }
+}
+
+fn path_is_under_root(path: &Path, root: &Path) -> bool {
+    let path = dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let root = dunce::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    path.starts_with(root)
 }
 
 fn is_skippable_view_scan_dir(name: &str) -> bool {
@@ -690,7 +792,7 @@ pub fn list_views_sync(working_dir: &str) -> Result<Vec<ViewPackageSummary>, Str
             continue;
         };
         match load_manifest_from_root(root) {
-            Ok(manifest) => views.push(summary_from_manifest(&views_root, root, &manifest)),
+            Ok(manifest) => views.push(summary_from_manifest(&views_root, root, &manifest, false)),
             Err(error) => {
                 eprintln!(
                     "[Locus] skipped invalid View package {}: {}",
@@ -888,7 +990,20 @@ pub fn create_view_sync(
     working_dir: &str,
     request: ViewCreateRequest,
 ) -> Result<ViewPackageDetail, String> {
-    let id = normalize_view_id(&request.id)?;
+    create_view_sync_with_scope(working_dir, request, false)
+}
+
+pub fn create_view_sync_with_scope(
+    working_dir: &str,
+    request: ViewCreateRequest,
+    temporary: bool,
+) -> Result<ViewPackageDetail, String> {
+    let requested_id = normalize_view_id(&request.id)?;
+    let id = if temporary {
+        unique_temporary_view_id(&requested_id)
+    } else {
+        requested_id.clone()
+    };
     let template = request
         .template
         .as_deref()
@@ -905,7 +1020,7 @@ pub fn create_view_sync(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
-        .unwrap_or_else(|| title_from_id(&id));
+        .unwrap_or_else(|| title_from_id(&requested_id));
     let icon = request
         .icon
         .as_deref()
@@ -916,7 +1031,11 @@ pub fn create_view_sync(
         validate_view_icon_name(icon)?;
     }
 
-    let root = view_package_root(working_dir, &id)?;
+    let root = if temporary {
+        temporary_view_package_root(working_dir, &id)?
+    } else {
+        view_package_root(working_dir, &id)?
+    };
     if root.exists() {
         return Err(format!("View package already exists: {}", root.display()));
     }
@@ -935,8 +1054,21 @@ pub fn create_view_sync(
     read_view_sync(working_dir, &id)
 }
 
+fn unique_temporary_view_id(base_id: &str) -> String {
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    format!("{}-tmp-{}", base_id, &suffix[..8])
+}
+
+fn temporary_view_package_root(working_dir: &str, id: &str) -> Result<PathBuf, String> {
+    let id = normalize_view_id(id)?;
+    let root = temporary_views_root_for_workspace(working_dir)?;
+    std::fs::create_dir_all(&root)
+        .map_err(|e| format!("Failed to create {}: {}", root.display(), e))?;
+    Ok(root.join(id))
+}
+
 pub fn read_view_sync(working_dir: &str, view_id: &str) -> Result<ViewPackageDetail, String> {
-    let root = view_package_root(working_dir, view_id)?;
+    let root = resolve_view_package_root(working_dir, view_id)?;
     if !root.is_dir() {
         return Err(format!("View package not found: {}", view_id));
     }
@@ -949,7 +1081,10 @@ pub fn read_view_sync(working_dir: &str, view_id: &str) -> Result<ViewPackageDet
     }
 
     let views_root = views_root_for_workspace(working_dir)?;
-    let summary = summary_from_manifest(&views_root, &root, &manifest);
+    let temp_root = temporary_views_root_for_workspace(working_dir)?;
+    let temporary = path_is_under_root(&root, &temp_root);
+    let summary_root = if temporary { &temp_root } else { &views_root };
+    let summary = summary_from_manifest(summary_root, &root, &manifest, temporary);
     let mut rel_paths = BTreeSet::new();
     rel_paths.insert("view.json".to_string());
     rel_paths.insert("README.md".to_string());
@@ -1108,7 +1243,7 @@ fn start_view_file_watcher(
     working_dir: &str,
     view_id: &str,
 ) -> Result<(), String> {
-    let root = view_package_root(working_dir, view_id)?;
+    let root = resolve_view_package_root(working_dir, view_id)?;
     let root = dunce::canonicalize(&root).unwrap_or(root);
     let key = root.display().to_string().replace('\\', "/");
     {
@@ -1235,7 +1370,7 @@ pub fn append_view_frontend_log_sync(
     working_dir: &str,
     request: ViewFrontendLogRequest,
 ) -> Result<(), String> {
-    let root = view_package_root(working_dir, &request.view_id)?;
+    let root = resolve_view_package_root(working_dir, &request.view_id)?;
     if !root.is_dir() || !manifest_path(&root).is_file() {
         return Err(format!("View package not found: {}", request.view_id));
     }
@@ -1370,7 +1505,7 @@ fn resolve_view_binding(
 }
 
 fn load_view_bindings(working_dir: &str, view_id: &str) -> Result<LoadedViewBindings, String> {
-    let root = view_package_root(working_dir, view_id)?;
+    let root = resolve_view_package_root(working_dir, view_id)?;
     let manifest = load_manifest_from_root(&root)?;
     let bindings_path = package_path(&root, &manifest.bindings)?;
     let raw = std::fs::read_to_string(&bindings_path)
@@ -1474,7 +1609,7 @@ fn resolve_view_script_sync(
         return Err("View script name cannot be empty.".to_string());
     }
 
-    let root = view_package_root(working_dir, view_id)?;
+    let root = resolve_view_package_root(working_dir, view_id)?;
     let manifest = load_manifest_from_root(&root)?;
     let script = manifest
         .scripts
@@ -2289,11 +2424,12 @@ mod tests {
         append_view_frontend_log_sync, create_view_folder_sync, create_view_sync,
         delete_view_entry_sync, ensure_view_binding_write_allowed, is_valid_view_id,
         list_view_tree_sync, list_views_sync, move_view_entry_sync, normalize_package_rel_path,
-        read_view_sync, resolve_view_binding_target, resolve_view_script_sync,
-        supported_view_templates, validate_view_manifest, view_package_root,
-        view_script_bridge_payload, view_script_cached_invoke_payload, ViewBindingTarget,
-        ViewFrontendLogRequest, ViewManifest, VIEW_BINDINGS_SCHEMA, VIEW_SCHEMA,
+        parse_view_create_request, read_view_sync, resolve_view_binding_target,
+        resolve_view_script_sync, supported_view_templates, validate_view_manifest,
+        view_package_root, view_script_bridge_payload, view_script_cached_invoke_payload,
+        ViewBindingTarget, ViewFrontendLogRequest, ViewManifest, VIEW_BINDINGS_SCHEMA, VIEW_SCHEMA,
     };
+    use serde_json::json;
     use tempfile::tempdir;
 
     #[test]
@@ -2318,6 +2454,22 @@ mod tests {
         assert!(normalize_package_rel_path("F:/App.vue").is_err());
         assert!(normalize_package_rel_path("/tmp/App.vue").is_err());
         assert!(normalize_package_rel_path("src//App.vue").is_err());
+    }
+
+    #[test]
+    fn view_create_request_parses_temporary_flag() {
+        let (request, temporary) = parse_view_create_request(json!({
+            "id": "scratch-panel",
+            "name": "Scratch Panel",
+            "template": "blank",
+            "temporary": true
+        }))
+        .expect("parse view_create request");
+
+        assert!(temporary);
+        assert_eq!(request.id, "scratch-panel");
+        assert_eq!(request.name.as_deref(), Some("Scratch Panel"));
+        assert_eq!(request.template.as_deref(), Some("blank"));
     }
 
     #[test]

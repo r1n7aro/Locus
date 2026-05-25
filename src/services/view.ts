@@ -43,6 +43,7 @@ export interface ViewPackageSummary {
   manifestPath: string;
   updatedAt: number;
   capabilities: ViewCapabilities;
+  temporary?: boolean;
 }
 
 export interface ViewFolderSummary {
@@ -76,6 +77,7 @@ export interface ViewCreateRequest {
   name?: string | null;
   template?: string | null;
   icon?: string | null;
+  temporary?: boolean;
 }
 
 export interface ViewCreateFolderRequest {
