@@ -1,6 +1,7 @@
 mod anthropic_agent_sdk;
 mod backend;
 mod prompt_context;
+mod read_file;
 mod unity_capture;
 
 pub use backend::resolve_openrouter_model;
@@ -46,6 +47,16 @@ fn is_codex_unauthorized_error(error: &str) -> bool {
     lower.contains("401 unauthorized")
         || lower.contains("http error: 401")
         || lower.contains("api error (401")
+}
+
+fn is_recoverable_compact_llm_error(error: &str) -> bool {
+    is_prompt_too_long_error(error) || is_tool_call_output_reference_error(error)
+}
+
+fn is_tool_call_output_reference_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("no tool call found for function call output")
+        || (lower.contains("no tool call found") && lower.contains("function_call_output"))
 }
 
 fn messages_have_images(messages: &[ChatMessage]) -> bool {
@@ -2591,7 +2602,8 @@ impl AgentInstance {
     }
 
     async fn resolve_effective_tool_names(&self) -> Vec<String> {
-        self.def
+        let mut tools: Vec<String> = self
+            .def
             .tools
             .iter()
             .filter(|tool_name| match tool_name.as_str() {
@@ -2604,7 +2616,11 @@ impl AgentInstance {
                 _ => true,
             })
             .cloned()
-            .collect()
+            .collect();
+        for tool_name in self.tool_registry.skill_tool_names() {
+            push_unique_tool_name(&mut tools, &tool_name);
+        }
+        tools
     }
 
     fn supports_native_tool_lazy_loading(&self) -> bool {
@@ -2661,7 +2677,7 @@ impl AgentInstance {
             .filter_map(|(name, direct_load)| {
                 self.tool_registry
                     .canonical_name(&name)
-                    .map(|canonical| (canonical.to_string(), direct_load))
+                    .map(|canonical| (canonical, direct_load))
             })
             .collect()
     }
@@ -2713,7 +2729,7 @@ impl AgentInstance {
         self.resolve_effective_tool_names()
             .await
             .into_iter()
-            .filter_map(|name| self.tool_registry.canonical_name(&name).map(str::to_string))
+            .filter_map(|name| self.tool_registry.canonical_name(&name))
             .collect()
     }
 
@@ -2742,9 +2758,7 @@ impl AgentInstance {
                     continue;
                 }
                 for name in requested_tool_load_names(&tool_call.arguments) {
-                    let Some(canonical) =
-                        self.tool_registry.canonical_name(&name).map(str::to_string)
-                    else {
+                    let Some(canonical) = self.tool_registry.canonical_name(&name) else {
                         continue;
                     };
                     if allowed.contains(&canonical) {
@@ -2815,11 +2829,7 @@ impl AgentInstance {
 
     fn normalize_tool_call_names(&self, tool_calls: &mut [ToolCallInfo]) {
         for tool_call in tool_calls {
-            if let Some(canonical) = self
-                .tool_registry
-                .canonical_name(&tool_call.name)
-                .map(str::to_string)
-            {
+            if let Some(canonical) = self.tool_registry.canonical_name(&tool_call.name) {
                 tool_call.name = canonical;
             }
 
@@ -2835,10 +2845,7 @@ impl AgentInstance {
             if tool_call.name == "tool_call" {
                 match parse_meta_tool_call_arguments(&tool_call.arguments) {
                     Ok((target_name, mut target_args)) => {
-                        let Some(canonical) = self
-                            .tool_registry
-                            .canonical_name(&target_name)
-                            .map(str::to_string)
+                        let Some(canonical) = self.tool_registry.canonical_name(&target_name)
                         else {
                             eprintln!(
                                 "[Agent {}] meta-call target '{}' is not registered",
@@ -2888,8 +2895,7 @@ impl AgentInstance {
         let mut tool_names = Vec::new();
 
         for name in request_tool_names {
-            let Some(canonical) = self.tool_registry.canonical_name(&name).map(str::to_string)
-            else {
+            let Some(canonical) = self.tool_registry.canonical_name(&name) else {
                 continue;
             };
             direct_tool_names.insert(canonical.clone());
@@ -4948,6 +4954,7 @@ impl AgentInstance {
                             server_tools.web_search,
                             Some(&self.session_id),
                             "Custom(Anthropic)",
+                            self.debug,
                             on_text_delta,
                             on_thinking_delta,
                             on_tool_call_start,
@@ -5388,9 +5395,9 @@ impl AgentInstance {
 
         let summary_response = match summary_result {
             Ok(resp) => resp,
-            Err(e) if is_prompt_too_long_error(&e) => {
+            Err(e) if is_recoverable_compact_llm_error(&e) => {
                 eprintln!(
-                    "[Agent {}] compact LLM call exceeded context, using emergency compact: {}",
+                    "[Agent {}] compact LLM call could not be safely sent, using emergency compact: {}",
                     self.id, e
                 );
                 let boundary_idx = compact_plan.boundary_idx;
@@ -5881,6 +5888,51 @@ impl AgentInstance {
 
     pub(super) fn is_cancel_requested(&self) -> bool {
         *self.cancel_rx.borrow()
+    }
+
+    pub(super) fn run_is_current_for_session(
+        &self,
+        store: &SessionStore,
+        run_id: &str,
+        stage: &str,
+        tool_call_id: Option<&str>,
+    ) -> bool {
+        match store.active_run_for_session(&self.session_id) {
+            Ok(Some(active_run)) if active_run.run_id == run_id => true,
+            Ok(active_run) => {
+                let active_run_id = active_run
+                    .as_ref()
+                    .map(|run| run.run_id.as_str())
+                    .unwrap_or("none");
+                let active_status = active_run
+                    .as_ref()
+                    .map(|run| run.status.as_str())
+                    .unwrap_or("none");
+                eprintln!(
+                    "[Agent {}] discarding stale tool result: session={} run={} active_run={} active_status={} stage={} tool_call_id={}",
+                    self.id,
+                    self.session_id,
+                    run_id,
+                    active_run_id,
+                    active_status,
+                    stage,
+                    tool_call_id.unwrap_or("")
+                );
+                false
+            }
+            Err(error) => {
+                eprintln!(
+                    "[Agent {}] failed to validate active run before accepting tool result; discarding result: session={} run={} stage={} tool_call_id={} error={}",
+                    self.id,
+                    self.session_id,
+                    run_id,
+                    stage,
+                    tool_call_id.unwrap_or(""),
+                    error
+                );
+                false
+            }
+        }
     }
 
     fn cancel_waiter(&self) -> tokio::sync::watch::Receiver<bool> {
@@ -6571,7 +6623,6 @@ impl AgentInstance {
                         move |tool_call_id, tool_name| {
                             let tool_name = tool_registry_for_tool_start
                                 .canonical_name(&tool_name)
-                                .map(str::to_string)
                                 .unwrap_or(tool_name);
                             emitted_output_for_tool.store(true, Ordering::Relaxed);
                             let mark = render_order_for_tool
@@ -7189,6 +7240,15 @@ impl AgentInstance {
                     futures::future::join_all(futures).await
                 };
 
+                if !self.run_is_current_for_session(store, &run_id, "tool_round_results", None) {
+                    return Ok(String::new());
+                }
+                if self.is_cancel_requested() {
+                    self.clear_pending_knowledge_proposal(app_handle).await;
+                    self.emit_cancelled(app_handle, store, &run_id);
+                    return Ok(String::new());
+                }
+
                 if !has_unity_recompile {
                     let queued_asset_paths: Vec<String> = prepared
                         .iter()
@@ -7232,6 +7292,29 @@ impl AgentInstance {
                         stored_output.len()
                     );
 
+                    match store.add_tool_result_with_images_for_run(
+                        &self.session_id,
+                        &run_id,
+                        &tc.id,
+                        &stored_output,
+                        result.images.as_deref(),
+                    ) {
+                        Ok(Some(_)) => {}
+                        Ok(None) => {
+                            eprintln!(
+                                "[Agent {}] discarding stale tool result before save: session={} run={} tool_call_id={}",
+                                self.id, self.session_id, run_id, tc.id
+                            );
+                            return Ok(String::new());
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[Agent {}] failed to save tool_result for '{}' (id={}): {}",
+                                self.id, tc.name, tc.id, e
+                            );
+                        }
+                    }
+
                     emit_stream(app_handle, &run_id, StreamEvent::ToolCallDone {
                         session_id: self.session_id.clone(),
                         tool_call_id: tc.id.clone(),
@@ -7256,18 +7339,6 @@ impl AgentInstance {
                                 result.outcome.as_stream_outcome(),
                                 result.images.clone(),
                             ),
-                        );
-                    }
-
-                    if let Err(e) = store.add_tool_result_with_images(
-                        &self.session_id,
-                        &tc.id,
-                        &stored_output,
-                        result.images.as_deref(),
-                    ) {
-                        eprintln!(
-                            "[Agent {}] failed to save tool_result for '{}' (id={}): {}",
-                            self.id, tc.name, tc.id, e
                         );
                     }
                 }
@@ -8252,7 +8323,10 @@ impl AgentInstance {
             }
         }
 
-        if tc.name == "task" {
+        if tc.name == "read" {
+            self.await_executed_tool_result(self.execute_read(app_handle, args))
+                .await
+        } else if tc.name == "task" {
             self.await_executed_tool_result(
                 self.execute_task(app_handle, store, args, &tc.id, run_id),
             )
@@ -8396,11 +8470,7 @@ impl AgentInstance {
         let mut loaded_guard = self.loaded_tool_names.lock().await;
         let mut items = Vec::new();
         for requested_name in requested {
-            let Some(canonical) = self
-                .tool_registry
-                .canonical_name(&requested_name)
-                .map(str::to_string)
-            else {
+            let Some(canonical) = self.tool_registry.canonical_name(&requested_name) else {
                 items.push(serde_json::json!({
                     "requested": requested_name,
                     "status": "unknown_tool",

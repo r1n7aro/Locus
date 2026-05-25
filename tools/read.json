@@ -1,5 +1,5 @@
 {
-  "description": "Read the contents of a workspace text file.\n- Returns file content (up to 2000 lines by default)\n- Use offset and limit to page through large files\n- This tool only reads files; use list for directories\n- Do not use this tool for documents under Locus/knowledge, including Memory. Use knowledge_list, knowledge_query, or knowledge_read instead",
+  "description": "Read a workspace file.\n- Text files return file content (up to 2000 lines by default)\n- Use offset and limit to page through large text files\n- PNG, JPEG, GIF, and WebP images return an image attachment; offset and limit are ignored for images\n- This tool only reads files; use list for directories\n- Do not use this tool for documents under Locus/knowledge, including Memory. Use knowledge_list, knowledge_query, or knowledge_read instead",
   "parameters": {
     "type": "object",
     "properties": {
@@ -9,11 +9,11 @@
       },
       "offset": {
         "type": "integer",
-        "description": "Line number to start reading from (1-indexed)"
+        "description": "Line number to start reading from for text files (1-indexed); ignored for images"
       },
       "limit": {
         "type": "integer",
-        "description": "Max number of lines to read (default 2000)"
+        "description": "Max number of lines to read for text files (default 2000); ignored for images"
       }
     },
     "required": ["filePath"]

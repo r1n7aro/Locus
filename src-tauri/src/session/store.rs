@@ -2435,6 +2435,73 @@ impl SessionStore {
         )
     }
 
+    pub fn add_tool_result_with_images_for_run(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        tool_call_id: &str,
+        content: &str,
+        images: Option<&[super::models::ImageData]>,
+    ) -> Result<Option<String>, String> {
+        let images_json = images
+            .filter(|imgs| !imgs.is_empty())
+            .map(|imgs| serde_json::to_string(imgs))
+            .transpose()
+            .map_err(|e| format!("Failed to serialize tool result images: {}", e))?;
+        let id = Uuid::new_v4().to_string();
+        let now = Self::now_ts();
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let active_run = conn
+            .query_row(
+                "SELECT run_id, status
+                 FROM session_runs
+                 WHERE session_id = ?1 AND status IN (?2, ?3, ?4, ?5, ?6, ?7)
+                 ORDER BY updated_at DESC
+                 LIMIT 1",
+                params![
+                    session_id,
+                    RUN_STATUS_QUEUED,
+                    RUN_STATUS_STARTING,
+                    RUN_STATUS_RUNNING,
+                    RUN_STATUS_WAITING_INPUT,
+                    RUN_STATUS_FINISHING,
+                    RUN_STATUS_CANCELLING,
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|e| format!("Failed to query active session run: {}", e))?;
+
+        match active_run {
+            Some((active_run_id, active_status))
+                if active_run_id == run_id && active_status != RUN_STATUS_CANCELLING => {}
+            _ => return Ok(None),
+        }
+
+        conn.execute(
+            "INSERT INTO messages (id, session_id, role, content, created_at, tool_call_id, images)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                id,
+                session_id,
+                MessageRole::Tool.as_str(),
+                content,
+                now,
+                tool_call_id,
+                images_json.as_deref(),
+            ],
+        )
+        .map_err(|e| format!("Failed to add message: {}", e))?;
+
+        conn.execute(
+            "UPDATE sessions SET updated_at = ?1 WHERE id = ?2",
+            params![now, session_id],
+        )
+        .map_err(|e| format!("Failed to update session: {}", e))?;
+
+        Ok(Some(id))
+    }
+
     fn mark_missing_persisted_outputs_for_display(messages: &mut [ChatMessage]) {
         for message in messages {
             Self::mark_missing_persisted_outputs_in_message(message);
@@ -3567,7 +3634,8 @@ impl SessionStore {
 mod tests {
     use super::{
         build_large_tool_result_message, PersistedToolResult, SessionStore,
-        CHILD_SESSION_FORK_ERROR, CONTEXT_COMPACTED_DISPLAY_MARKER,
+        CHILD_SESSION_FORK_ERROR, CONTEXT_COMPACTED_DISPLAY_MARKER, RUN_STATUS_CANCELLING,
+        RUN_STATUS_DONE,
     };
     use crate::session::models::{
         ChatMessage, KnowledgeProposalStatus, MessageRole, TodoItem, ToolCallInfo,
@@ -3693,6 +3761,48 @@ mod tests {
     }
 
     #[test]
+    fn add_tool_result_for_run_discards_stale_and_cancelling_runs() {
+        let dir = tempdir().expect("create temp dir");
+        let store = SessionStore::new(dir.path()).expect("initialize store");
+        let session_id = store
+            .create_session("Run gated tool result", None, None, "chat", None)
+            .expect("create session");
+
+        store
+            .try_start_run(&session_id, "run-1")
+            .expect("start first run");
+        let saved = store
+            .add_tool_result_with_images_for_run(&session_id, "run-1", "tc-1", "first", None)
+            .expect("save current run tool result");
+        assert!(saved.is_some());
+
+        store
+            .update_run_status("run-1", RUN_STATUS_DONE, None)
+            .expect("finish first run");
+        store
+            .try_start_run(&session_id, "run-2")
+            .expect("start second run");
+        let stale = store
+            .add_tool_result_with_images_for_run(&session_id, "run-1", "tc-stale", "stale", None)
+            .expect("discard stale tool result");
+        assert!(stale.is_none());
+
+        store
+            .update_run_status("run-2", RUN_STATUS_CANCELLING, None)
+            .expect("cancel second run");
+        let cancelling = store
+            .add_tool_result_with_images_for_run(
+                &session_id,
+                "run-2",
+                "tc-cancelling",
+                "cancelling",
+                None,
+            )
+            .expect("discard cancelling tool result");
+        assert!(cancelling.is_none());
+    }
+
+    #[test]
     fn fork_session_copies_root_session_data_and_tool_results() {
         let dir = tempdir().expect("create temp dir");
         let store = SessionStore::new(dir.path()).expect("initialize store");
@@ -3728,6 +3838,18 @@ mod tests {
             preview: "full tool output".to_string(),
             has_more: false,
         });
+        let assistant_tool_calls = serde_json::to_string(&vec![ToolCallInfo {
+            id: "tool-a".to_string(),
+            name: "shell_command".to_string(),
+            arguments: "{}".to_string(),
+            order: None,
+            server_tool: None,
+            server_tool_output: None,
+            outcome: None,
+            recorded_output: None,
+            nested_tool_calls: None,
+        }])
+        .expect("serialize tool calls");
 
         {
             let conn = store.conn.lock().expect("lock db");
@@ -3747,7 +3869,17 @@ mod tests {
                     tool_calls, tool_call_id, images, asset_refs, thinking_content,
                     thinking_duration, thinking_signature, metadata_json, include_in_prompt
                  )
-                 VALUES (?1, ?2, 'tool', ?3, 11, NULL, NULL, NULL, 'tool-a', NULL, NULL, NULL, NULL, NULL, NULL, 0)",
+                 VALUES (?1, ?2, 'assistant', '', 11, NULL, NULL, ?3, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0)",
+                params!["assistant-old", session_id, assistant_tool_calls],
+            )
+            .expect("insert assistant message");
+            conn.execute(
+                "INSERT INTO messages (
+                    id, session_id, role, content, created_at, prompt_prefix, prompt_suffix,
+                    tool_calls, tool_call_id, images, asset_refs, thinking_content,
+                    thinking_duration, thinking_signature, metadata_json, include_in_prompt
+                 )
+                 VALUES (?1, ?2, 'tool', ?3, 12, NULL, NULL, NULL, 'tool-a', NULL, NULL, NULL, NULL, NULL, NULL, 0)",
                 params!["tool-old", session_id, persisted_message],
             )
             .expect("insert tool message");
@@ -3764,9 +3896,10 @@ mod tests {
         assert_eq!(detail.session_type, "chat");
         assert_eq!(detail.parent_session_id, None);
         assert_eq!(detail.latest_completed_run_id.as_deref(), Some("run-1"));
-        assert_eq!(detail.messages.len(), 2);
+        assert_eq!(detail.messages.len(), 3);
         assert_ne!(detail.messages[0].id, "user-old");
-        assert_ne!(detail.messages[1].id, "tool-old");
+        assert_ne!(detail.messages[1].id, "assistant-old");
+        assert_ne!(detail.messages[2].id, "tool-old");
         assert_eq!(detail.messages[0].content, "hello");
 
         let target_tool_file = store.session_tool_results_dir(&fork_id).join("tool-a.txt");
@@ -3774,10 +3907,10 @@ mod tests {
             fs::read_to_string(&target_tool_file).expect("read copied tool output"),
             "full tool output"
         );
-        assert!(detail.messages[1]
+        assert!(detail.messages[2]
             .content
             .contains(&target_tool_file.display().to_string()));
-        assert!(!detail.messages[1]
+        assert!(!detail.messages[2]
             .content
             .contains(&source_tool_file.display().to_string()));
 

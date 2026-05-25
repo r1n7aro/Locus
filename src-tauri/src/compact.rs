@@ -499,6 +499,33 @@ fn build_omitted_messages_marker(count: usize, created_at: i64) -> ChatMessage {
     }
 }
 
+fn prune_tool_results_without_visible_calls(messages: &mut Vec<ChatMessage>) -> usize {
+    let before = messages.len();
+    let mut visible_tool_call_ids: HashSet<String> = HashSet::new();
+
+    messages.retain(|message| match message.role {
+        MessageRole::Assistant => {
+            if let Some(tool_calls) = message.tool_calls.as_ref() {
+                for tool_call in tool_calls {
+                    if !tool_call.id.is_empty() {
+                        visible_tool_call_ids.insert(tool_call.id.clone());
+                    }
+                }
+            }
+            true
+        }
+        MessageRole::Tool => message
+            .tool_call_id
+            .as_deref()
+            .filter(|tool_call_id| !tool_call_id.is_empty())
+            .map(|tool_call_id| visible_tool_call_ids.contains(tool_call_id))
+            .unwrap_or(false),
+        MessageRole::User => true,
+    });
+
+    before.saturating_sub(messages.len())
+}
+
 pub fn find_compact_boundary_by_budget(
     messages: &[ChatMessage],
     target_recent_tokens: u32,
@@ -552,6 +579,9 @@ pub fn build_compact_request_with_budget(
             message
         })
         .collect();
+    if prune_tool_results_without_visible_calls(&mut compact_messages) > 0 {
+        truncated = true;
+    }
 
     compact_messages.push(ChatMessage {
         id: uuid::Uuid::new_v4().to_string(),
@@ -618,19 +648,22 @@ pub fn build_compact_request_with_budget(
     }
     tail.reverse();
 
-    let omitted = compact_messages
-        .len()
-        .saturating_sub(reduced.len())
-        .saturating_sub(tail.len());
+    let marker_insert_idx = reduced.len();
+    reduced.extend(tail);
+    prune_tool_results_without_visible_calls(&mut reduced);
+
+    let omitted = compact_messages.len().saturating_sub(reduced.len());
     if omitted > 0 {
-        let marker_ts = tail
-            .first()
+        let marker_ts = reduced
+            .get(marker_insert_idx)
             .or_else(|| reduced.first())
             .map(|message| message.created_at.saturating_sub(1))
             .unwrap_or_default();
-        reduced.push(build_omitted_messages_marker(omitted, marker_ts));
+        reduced.insert(
+            marker_insert_idx.min(reduced.len()),
+            build_omitted_messages_marker(omitted, marker_ts),
+        );
     }
-    reduced.extend(tail);
     reduced.push(prompt);
 
     estimated_tokens = estimate_request_tokens(system_parts, &reduced, &[]);
@@ -1777,6 +1810,66 @@ mod tests {
         assert!(plan.estimated_tokens <= plan.budget_tokens);
         assert!(plan.truncated);
         assert!(plan.boundary_idx > 0);
+    }
+
+    #[test]
+    fn compact_request_prunes_tool_outputs_when_their_calls_are_omitted() {
+        let mut messages = vec![make_message(
+            "user-1",
+            MessageRole::User,
+            "排查长会话 compact 失败",
+            100,
+            None,
+            None,
+        )];
+        for i in 0..80 {
+            messages.push(make_message(
+                &format!("assistant-{}", i),
+                MessageRole::Assistant,
+                "running tool",
+                101 + i,
+                Some(vec![ToolCallInfo {
+                    id: format!("tc-{}", i),
+                    name: "read".to_string(),
+                    arguments: "large args".repeat(300),
+                    order: None,
+                    server_tool: None,
+                    server_tool_output: None,
+                    outcome: None,
+                    recorded_output: None,
+                    nested_tool_calls: None,
+                }]),
+                None,
+            ));
+            messages.push(make_message(
+                &format!("tool-{}", i),
+                MessageRole::Tool,
+                &"tool output ".repeat(2_000),
+                101 + i,
+                None,
+                Some(&format!("tc-{}", i)),
+            ));
+        }
+
+        let plan = build_compact_request_with_budget(&messages, &["system"], 258_400)
+            .expect("budgeted compact request");
+        let mut visible_tool_call_ids = HashSet::new();
+        for message in &plan.messages {
+            if let Some(tool_calls) = message.tool_calls.as_ref() {
+                visible_tool_call_ids.extend(tool_calls.iter().map(|call| call.id.clone()));
+            }
+            if message.role == MessageRole::Tool {
+                let tool_call_id = message
+                    .tool_call_id
+                    .as_deref()
+                    .expect("tool result should have an id");
+                assert!(
+                    visible_tool_call_ids.contains(tool_call_id),
+                    "tool result without visible function call: {}",
+                    tool_call_id
+                );
+            }
+        }
     }
 
     #[test]

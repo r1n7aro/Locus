@@ -50,6 +50,10 @@ pub fn normalize_tool_round_history(messages: &[ChatMessage]) -> Vec<ChatMessage
 
     while i < messages.len() {
         let msg = &messages[i];
+        if msg.role == MessageRole::Tool {
+            i += 1;
+            continue;
+        }
         if msg.role != MessageRole::Assistant {
             normalized.push(msg.clone());
             i += 1;
@@ -64,6 +68,8 @@ pub fn normalize_tool_round_history(messages: &[ChatMessage]) -> Vec<ChatMessage
             .filter(|call| !call.is_server_tool() && !call.id.is_empty())
             .map(|call| call.id.clone())
             .collect();
+        let expected_tool_call_set: HashSet<String> =
+            expected_tool_call_ids.iter().cloned().collect();
 
         i += 1;
 
@@ -72,14 +78,17 @@ pub fn normalize_tool_round_history(messages: &[ChatMessage]) -> Vec<ChatMessage
         let mut following_tool_messages: Vec<ChatMessage> = Vec::new();
         while i < messages.len() && messages[i].role == MessageRole::Tool {
             if let Some(tool_call_id) = messages[i].tool_call_id.as_deref() {
-                if !tool_call_id.is_empty() {
+                if !tool_call_id.is_empty()
+                    && expected_tool_call_set.contains(tool_call_id)
+                    && !present_tool_ids.contains(tool_call_id)
+                {
                     present_tool_ids.insert(tool_call_id.to_string());
                     observed_tool_outputs
                         .entry(tool_call_id.to_string())
                         .or_insert_with(|| messages[i].content.clone());
+                    following_tool_messages.push(messages[i].clone());
                 }
             }
-            following_tool_messages.push(messages[i].clone());
             i += 1;
         }
 
@@ -401,6 +410,68 @@ mod tests {
         assert_eq!(normalized[1].id, "tool-1");
         assert_eq!(normalized[2].tool_call_id.as_deref(), Some("tc-2"));
         assert_eq!(normalized[2].content, INTERRUPTED_TOOL_RESULT);
+    }
+
+    #[test]
+    fn drops_tool_results_without_matching_visible_tool_call() {
+        let messages = vec![
+            tool_message("orphan-start", "tc-orphan-start", "stale start"),
+            assistant_with_tools(
+                "assistant-1",
+                vec![ToolCallInfo {
+                    id: "tc-1".to_string(),
+                    name: "read".to_string(),
+                    arguments: "{}".to_string(),
+                    order: None,
+                    server_tool: None,
+                    server_tool_output: None,
+                    outcome: None,
+                    recorded_output: None,
+                    nested_tool_calls: None,
+                }],
+            ),
+            tool_message("tool-valid", "tc-1", "valid"),
+            tool_message("tool-stale", "tc-stale", "stale"),
+            user_message("user-1", "继续"),
+        ];
+
+        let normalized = normalize_tool_round_history(&messages);
+        assert_eq!(normalized.len(), 3);
+        assert_eq!(normalized[0].id, "assistant-1");
+        assert_eq!(normalized[1].id, "tool-valid");
+        assert_eq!(normalized[1].tool_call_id.as_deref(), Some("tc-1"));
+        assert_eq!(normalized[2].id, "user-1");
+    }
+
+    #[test]
+    fn drops_duplicate_tool_results_for_the_same_tool_call() {
+        let messages = vec![
+            assistant_with_tools(
+                "assistant-1",
+                vec![ToolCallInfo {
+                    id: "tc-1".to_string(),
+                    name: "read".to_string(),
+                    arguments: "{}".to_string(),
+                    order: None,
+                    server_tool: None,
+                    server_tool_output: None,
+                    outcome: None,
+                    recorded_output: None,
+                    nested_tool_calls: None,
+                }],
+            ),
+            tool_message("tool-first", "tc-1", "first"),
+            tool_message("tool-duplicate", "tc-1", "duplicate"),
+        ];
+
+        let normalized = normalize_tool_round_history(&messages);
+        assert_eq!(normalized.len(), 2);
+        assert_eq!(normalized[1].id, "tool-first");
+        let tool_calls = normalized[0]
+            .tool_calls
+            .as_ref()
+            .expect("assistant tool calls");
+        assert_eq!(tool_calls[0].recorded_output.as_deref(), Some("first"));
     }
 
     #[test]

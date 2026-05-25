@@ -45,11 +45,18 @@ struct ClaudeSdkRoundHost<'a> {
 fn save_claude_sdk_tool_result(
     store: &SessionStore,
     session_id: &str,
+    run_id: &str,
     tool_call_id: &str,
     stored_output: &str,
     images: Option<&[ImageData]>,
-) -> Result<String, String> {
-    store.add_tool_result_with_images(session_id, tool_call_id, stored_output, images)
+) -> Result<Option<String>, String> {
+    store.add_tool_result_with_images_for_run(
+        session_id,
+        run_id,
+        tool_call_id,
+        stored_output,
+        images,
+    )
 }
 
 impl<'a> ClaudeSdkRoundHost<'a> {
@@ -424,7 +431,6 @@ impl<'a> ClaudeSdkHost for ClaudeSdkRoundHost<'a> {
                             .agent
                             .tool_registry
                             .canonical_name(&target_name)
-                            .map(str::to_string)
                             .filter(|name| {
                                 !AgentInstance::is_meta_tool(name) && allowed.contains(name)
                             })
@@ -473,6 +479,19 @@ impl<'a> ClaudeSdkHost for ClaudeSdkRoundHost<'a> {
                 )
                 .await;
 
+            if !self.agent.run_is_current_for_session(
+                self.store,
+                self.run_id,
+                "claude_sdk_tool_result",
+                Some(&tool_call.id),
+            ) || self.agent.is_cancel_requested()
+            {
+                return crate::tool::ToolResult {
+                    output: crate::session::history::INTERRUPTED_TOOL_RESULT.to_string(),
+                    is_error: false,
+                };
+            }
+
             let stored_output = match self.store.rewrite_tool_result_for_storage(
                 &self.agent.session_id,
                 &tool_call.id,
@@ -489,6 +508,33 @@ impl<'a> ClaudeSdkHost for ClaudeSdkRoundHost<'a> {
                 }
             };
 
+            match save_claude_sdk_tool_result(
+                self.store,
+                &self.agent.session_id,
+                self.run_id,
+                &tool_call.id,
+                &stored_output,
+                result.images.as_deref(),
+            ) {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    eprintln!(
+                        "[Agent {}] discarding stale Claude SDK tool result before save: session={} run={} tool_call_id={}",
+                        self.agent.id, self.agent.session_id, self.run_id, tool_call.id
+                    );
+                    return crate::tool::ToolResult {
+                        output: crate::session::history::INTERRUPTED_TOOL_RESULT.to_string(),
+                        is_error: false,
+                    };
+                }
+                Err(err) => {
+                    eprintln!(
+                        "[Agent {}] failed to save Claude SDK tool result for '{}' (id={}): {}",
+                        self.agent.id, tool_call.name, tool_call.id, err
+                    );
+                }
+            }
+
             self.emit_tool_call_done(
                 &tool_call.id,
                 &tool_call.name,
@@ -496,19 +542,6 @@ impl<'a> ClaudeSdkHost for ClaudeSdkRoundHost<'a> {
                 result.outcome.as_stream_outcome(),
                 result.images.as_deref(),
             );
-
-            if let Err(err) = save_claude_sdk_tool_result(
-                self.store,
-                &self.agent.session_id,
-                &tool_call.id,
-                &stored_output,
-                result.images.as_deref(),
-            ) {
-                eprintln!(
-                    "[Agent {}] failed to save Claude SDK tool result for '{}' (id={}): {}",
-                    self.agent.id, tool_call.name, tool_call.id, err
-                );
-            }
 
             self.completed_tool_ids.insert(tool_call.id.clone());
             if let Some(round) = self.pending_round.as_mut() {
@@ -669,6 +702,10 @@ impl AgentInstance {
                 .entry(self.session_id.clone())
                 .or_insert_with(Vec::new)
                 .push(round);
+        }
+
+        if !self.run_is_current_for_session(store, run_id, "claude_sdk_turn_done", None) {
+            return Ok(String::new());
         }
 
         if self.is_cancel_requested() {
@@ -883,13 +920,24 @@ mod tests {
         let session_id = store
             .create_session("Claude SDK Tool Result", None, None, "chat", None)
             .expect("create session");
+        store
+            .try_start_run(&session_id, "run-sdk")
+            .expect("start run");
         let full_output = "C".repeat(31_000);
         let stored_output = store
             .rewrite_tool_result_for_storage(&session_id, "tc-sdk", "bash", &full_output)
             .expect("rewrite tool output");
 
-        save_claude_sdk_tool_result(&store, &session_id, "tc-sdk", &stored_output, None)
-            .expect("save SDK tool result");
+        save_claude_sdk_tool_result(
+            &store,
+            &session_id,
+            "run-sdk",
+            "tc-sdk",
+            &stored_output,
+            None,
+        )
+        .expect("save SDK tool result")
+        .expect("current run");
 
         let prompt_messages = store
             .get_messages_for_prompt(&session_id)

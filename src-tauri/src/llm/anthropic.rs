@@ -1,6 +1,6 @@
 use futures::StreamExt;
 use regex::Regex;
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::session::models::{ChatMessage, ImageData, MessageRole, ServerToolKind, ToolCallInfo};
@@ -46,11 +46,100 @@ const X_STAINLESS_RUNTIME: &str = "node";
 const X_STAINLESS_RUNTIME_VERSION: &str = "v24.3.0";
 const X_STAINLESS_TIMEOUT: &str = "600";
 const CACHE_TTL: &str = "1h";
+const RAW_CHUNK_DEBUG_PREVIEW_CHARS: usize = 1600;
 
 const BILLING_HEADER_BLOCK: &str =
     "x-anthropic-billing-header: cc_version=2.1.92.19c; cc_entrypoint=sdk-rs; cch=00000;";
 const AGENT_SDK_IDENTITY: &str = "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
 const OAUTH_COMPAT_FALLBACK_MODEL: &str = "claude-opus-4-1-20250805";
+
+fn next_sse_separator(buffer: &str) -> Option<(usize, usize)> {
+    let lf = buffer.find("\n\n").map(|pos| (pos, 2usize));
+    let crlf = buffer.find("\r\n\r\n").map(|pos| (pos, 4usize));
+    match (lf, crlf) {
+        (Some(left), Some(right)) => Some(if left.0 <= right.0 { left } else { right }),
+        (Some(found), None) | (None, Some(found)) => Some(found),
+        (None, None) => None,
+    }
+}
+
+fn sse_line_value<'a>(line: &'a str, field: &str) -> Option<&'a str> {
+    let rest = line.strip_prefix(field)?.strip_prefix(':')?;
+    Some(rest.trim_start())
+}
+
+fn summarize_recent_raw_chunk(raw_response: &str, max_chars: usize) -> String {
+    if raw_response.is_empty() {
+        return "(empty)".to_string();
+    }
+
+    let char_count = raw_response.chars().count();
+    let mut tail_chars: Vec<char> = raw_response.chars().rev().take(max_chars).collect();
+    tail_chars.reverse();
+    let tail: String = tail_chars.into_iter().collect();
+    let escaped = tail.escape_debug().to_string();
+
+    if char_count > max_chars {
+        format!("...{}", escaped)
+    } else {
+        escaped
+    }
+}
+
+fn stream_response_header_summary(response: &reqwest::Response) -> String {
+    const HEADER_NAMES: &[&str] = &[
+        "content-type",
+        "content-length",
+        "transfer-encoding",
+        "connection",
+        "date",
+        "server",
+        "x-request-id",
+        "request-id",
+        "cf-ray",
+    ];
+
+    let headers = response.headers();
+    let summary = HEADER_NAMES
+        .iter()
+        .filter_map(|name| {
+            headers
+                .get(*name)
+                .and_then(|value| value.to_str().ok())
+                .map(|value| format!("{}={}", name, value))
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    if summary.is_empty() {
+        "(none)".to_string()
+    } else {
+        summary
+    }
+}
+
+fn parse_anthropic_event<T: DeserializeOwned>(
+    tag: &str,
+    event_type: &str,
+    data: &str,
+    debug: bool,
+) -> Option<T> {
+    match serde_json::from_str::<T>(data) {
+        Ok(event) => Some(event),
+        Err(error) => {
+            if debug {
+                eprintln!(
+                    "[DEBUG][{}] failed to parse Anthropic stream event: type={} error={} data={}",
+                    tag,
+                    event_type,
+                    error,
+                    summarize_recent_raw_chunk(data, RAW_CHUNK_DEBUG_PREVIEW_CHARS)
+                );
+            }
+            None
+        }
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 struct OauthToolAliases {
@@ -305,7 +394,7 @@ where
             None,
             &session_id,
             &client_request_id,
-            BETA_FLAGS,
+            Some(BETA_FLAGS),
             attempt,
         );
         let mut req = client.post(&url);
@@ -345,6 +434,9 @@ where
         let status = resp.status();
         if status.is_success() {
             return parse_anthropic_sse(
+                "Anthropic",
+                &url,
+                false,
                 resp,
                 raw_request,
                 oauth_tool_aliases.as_ref(),
@@ -443,6 +535,7 @@ pub async fn stream_chat_native<F, G, H>(
     include_web_search: bool,
     request_session_id: Option<&str>,
     tag: &str,
+    debug: bool,
     on_text_delta: F,
     on_thinking_delta: G,
     on_tool_call_start: H,
@@ -516,6 +609,24 @@ where
     let session_id = request_header_session_id(request_session_id);
     let client_request_id = uuid::Uuid::new_v4().to_string();
 
+    if debug {
+        let mut debug_headers: Vec<(&str, &str)> = vec![
+            ("Content-Type", "application/json"),
+            ("Authorization", "Bearer <token>"),
+            ("x-api-key", "<token>"),
+            ("anthropic-version", API_VERSION),
+        ];
+        if !beta_flags.trim().is_empty() {
+            debug_headers.push(("anthropic-beta", beta_flags.as_str()));
+        }
+        super::debug::save_request(
+            "custom_anthropic_messages",
+            &api_url,
+            &debug_headers,
+            &raw_request,
+        );
+    }
+
     const MAX_RETRIES: u32 = 3;
     const BASE_DELAY_MS: u64 = 1000;
 
@@ -527,7 +638,7 @@ where
             Some(api_key),
             &session_id,
             &client_request_id,
-            &beta_flags,
+            (!beta_flags.trim().is_empty()).then_some(beta_flags.as_str()),
             attempt,
         );
         let mut req = client.post(&api_url);
@@ -539,6 +650,9 @@ where
                 let status = resp.status();
                 if status.is_success() {
                     return parse_anthropic_sse(
+                        tag,
+                        &api_url,
+                        debug,
                         resp,
                         raw_request,
                         None,
@@ -602,6 +716,9 @@ where
 }
 
 async fn parse_anthropic_sse<F, G, H>(
+    tag: &str,
+    api_url: &str,
+    debug: bool,
     response: reqwest::Response,
     raw_request: String,
     oauth_tool_aliases: Option<&OauthToolAliases>,
@@ -614,6 +731,15 @@ where
     G: Fn(String) + Send + 'static,
     H: Fn(String, String) + Send + 'static,
 {
+    let status = response.status();
+    let response_headers = stream_response_header_summary(&response);
+    if debug {
+        eprintln!(
+            "[DEBUG][{}] stream response accepted: status={} url={} headers={}",
+            tag, status, api_url, response_headers
+        );
+    }
+
     let mut stream = response.bytes_stream();
     let mut buffer = String::new();
     let mut full_text = String::new();
@@ -648,18 +774,20 @@ where
                     source = std::error::Error::source(cause);
                 }
                 if raw_response.is_empty() {
-                    eprintln!("[Anthropic] {} (no response data received)", error_chain);
-                } else {
-                    let tail = if raw_response.len() > 2000 {
-                        &raw_response[raw_response.len() - 2000..]
-                    } else {
-                        &raw_response
-                    };
                     eprintln!(
-                        "[Anthropic] {}\n  raw_response_len={}, last_chunk:\n{}",
+                        "[{}] {} (no response data received, status={}, url={}, headers={})",
+                        tag, error_chain, status, api_url, response_headers
+                    );
+                } else {
+                    eprintln!(
+                        "[{}] {}\n  status={} url={} headers={}\n  raw_response_len={} recent_raw_chunk={}",
+                        tag,
                         error_chain,
+                        status,
+                        api_url,
+                        response_headers,
                         raw_response.len(),
-                        tail
+                        summarize_recent_raw_chunk(&raw_response, RAW_CHUNK_DEBUG_PREVIEW_CHARS)
                     );
                 }
 
@@ -675,8 +803,14 @@ where
             }
             Err(_) => {
                 eprintln!(
-                    "[Anthropic] Stream chunk read timed out after {}s",
-                    CHUNK_TIMEOUT.as_secs()
+                    "[{}] Stream chunk read timed out after {}s (status={}, url={}, headers={}, raw_response_len={}, pending_buffer_len={})",
+                    tag,
+                    CHUNK_TIMEOUT.as_secs(),
+                    status,
+                    api_url,
+                    response_headers,
+                    raw_response.len(),
+                    buffer.len()
                 );
                 return Err(format!(
                     "Stream read timed out after {}s, partial_data: text_len={}, tools={}",
@@ -691,19 +825,22 @@ where
         raw_response.push_str(&chunk_text);
         buffer.push_str(&chunk_text);
 
-        while let Some(pos) = buffer.find("\n\n") {
+        while let Some((pos, sep_len)) = next_sse_separator(&buffer) {
             let event_text = buffer[..pos].to_string();
-            buffer = buffer[pos + 2..].to_string();
+            buffer = buffer[pos + sep_len..].to_string();
 
             let mut event_type = String::new();
             let mut data_str = String::new();
 
             for line in event_text.lines() {
                 let line = line.trim();
-                if let Some(et) = line.strip_prefix("event: ") {
+                if let Some(et) = sse_line_value(line, "event") {
                     event_type = et.trim().to_string();
-                } else if let Some(d) = line.strip_prefix("data: ") {
-                    data_str = d.trim().to_string();
+                } else if let Some(d) = sse_line_value(line, "data") {
+                    if !data_str.is_empty() {
+                        data_str.push('\n');
+                    }
+                    data_str.push_str(d.trim());
                 }
             }
 
@@ -713,7 +850,12 @@ where
 
             match event_type.as_str() {
                 "content_block_start" => {
-                    if let Ok(ev) = serde_json::from_str::<ContentBlockStartEvent>(&data_str) {
+                    if let Some(ev) = parse_anthropic_event::<ContentBlockStartEvent>(
+                        tag,
+                        event_type.as_str(),
+                        &data_str,
+                        debug,
+                    ) {
                         _current_block_index = Some(ev.index);
                         match ev.content_block.block_type.as_str() {
                             "tool_use" => {
@@ -816,7 +958,12 @@ where
                     }
                 }
                 "content_block_delta" => {
-                    if let Ok(ev) = serde_json::from_str::<ContentBlockDeltaEvent>(&data_str) {
+                    if let Some(ev) = parse_anthropic_event::<ContentBlockDeltaEvent>(
+                        tag,
+                        event_type.as_str(),
+                        &data_str,
+                        debug,
+                    ) {
                         match ev.delta.delta_type.as_str() {
                             "text_delta" => {
                                 if let Some(ref text) = ev.delta.text {
@@ -867,7 +1014,12 @@ where
                     _current_block_index = None;
                 }
                 "message_delta" => {
-                    if let Ok(ev) = serde_json::from_str::<MessageDeltaEvent>(&data_str) {
+                    if let Some(ev) = parse_anthropic_event::<MessageDeltaEvent>(
+                        tag,
+                        event_type.as_str(),
+                        &data_str,
+                        debug,
+                    ) {
                         if let Some(ref reason) = ev.delta.stop_reason {
                             stop_reason = reason.clone();
                         }
@@ -880,7 +1032,12 @@ where
                     got_message_stop = true;
                 }
                 "message_start" => {
-                    if let Ok(ev) = serde_json::from_str::<MessageStartEvent>(&data_str) {
+                    if let Some(ev) = parse_anthropic_event::<MessageStartEvent>(
+                        tag,
+                        event_type.as_str(),
+                        &data_str,
+                        debug,
+                    ) {
                         if let Some(ref usage) = ev.message.usage {
                             input_tokens = usage.input_tokens;
                             output_tokens = usage.output_tokens;
@@ -893,12 +1050,35 @@ where
                 "error" => {
                     return Err(format!("Anthropic stream error: {}", data_str));
                 }
-                _ => {}
+                _ => {
+                    if debug {
+                        eprintln!(
+                            "[DEBUG][{}] ignored Anthropic stream event: type={} data_len={}",
+                            tag,
+                            event_type,
+                            data_str.len()
+                        );
+                    }
+                }
             }
         }
     }
 
     if !got_message_stop {
+        eprintln!(
+            "[{}] stream ended before message_stop: status={} url={} headers={} parsed_text_len={} parsed_thinking_len={} parsed_tool_calls={} raw_response_len={} pending_buffer_len={} recent_raw_chunk={} pending_buffer={}",
+            tag,
+            status,
+            api_url,
+            response_headers,
+            full_text.len(),
+            full_thinking.len(),
+            tool_calls.len(),
+            raw_response.len(),
+            buffer.len(),
+            summarize_recent_raw_chunk(&raw_response, RAW_CHUNK_DEBUG_PREVIEW_CHARS),
+            summarize_recent_raw_chunk(&buffer, RAW_CHUNK_DEBUG_PREVIEW_CHARS)
+        );
         if !full_text.is_empty() || !tool_calls.is_empty() {
             return Err(format!(
                 "Stream ended without message_stop (incomplete response, text_len={}, tools={})",
@@ -906,7 +1086,17 @@ where
                 tool_calls.len()
             ));
         }
-        return Err("Stream ended with no data and no message_stop".to_string());
+        if !raw_response.is_empty() {
+            return Err(format!(
+                "Stream ended with no parsed Anthropic events and no message_stop (raw_response_len={}, pending_buffer_len={})",
+                raw_response.len(),
+                buffer.len()
+            ));
+        }
+        return Err(format!(
+            "Stream ended with no data and no message_stop (status={}, headers={})",
+            status, response_headers
+        ));
     }
 
     let final_tool_calls: Vec<ToolCallInfo> = tool_calls
@@ -1687,11 +1877,7 @@ fn build_oauth_user_id_metadata(
 }
 
 fn resolve_native_beta_flags(extra_beta_flags: &[String]) -> String {
-    if extra_beta_flags.is_empty() {
-        BETA_FLAGS.to_string()
-    } else {
-        extra_beta_flags.join(",")
-    }
+    extra_beta_flags.join(",")
 }
 
 fn build_claude_code_headers(
@@ -1699,7 +1885,7 @@ fn build_claude_code_headers(
     x_api_key: Option<&str>,
     session_id: &str,
     client_request_id: &str,
-    beta_flags: &str,
+    beta_flags: Option<&str>,
     retry_count: u32,
 ) -> Vec<(String, String)> {
     let mut headers = vec![
@@ -1709,7 +1895,6 @@ fn build_claude_code_headers(
             format!("Bearer {}", bearer_token),
         ),
         ("Content-Type".to_string(), "application/json".to_string()),
-        ("anthropic-beta".to_string(), beta_flags.to_string()),
         (
             "anthropic-dangerous-direct-browser-access".to_string(),
             "true".to_string(),
@@ -1752,6 +1937,10 @@ fn build_claude_code_headers(
             X_STAINLESS_TIMEOUT.to_string(),
         ),
     ];
+
+    if let Some(beta_flags) = beta_flags.filter(|value| !value.trim().is_empty()) {
+        headers.push(("anthropic-beta".to_string(), beta_flags.to_string()));
+    }
 
     if let Some(api_key) = x_api_key {
         headers.push(("x-api-key".to_string(), api_key.to_string()));
@@ -1856,7 +2045,8 @@ mod tests {
     use super::{
         apply_cache_control, build_anthropic_messages, build_native_anthropic_tools,
         build_oauth_system_blocks, build_text_blocks, convert_tools_to_oauth_sdk_like_anthropic,
-        rewrite_oauth_tool_use_blocks, AnthropicHistoryOptions, CACHE_TTL,
+        next_sse_separator, resolve_native_beta_flags, rewrite_oauth_tool_use_blocks,
+        sse_line_value, AnthropicHistoryOptions, CACHE_TTL,
     };
     use crate::session::models::{ChatMessage, ImageData, MessageRole, ToolCallInfo};
     use serde_json::json;
@@ -1901,6 +2091,50 @@ mod tests {
             json!("<system-reminder>\nalpha\n</system-reminder>\n\n")
         );
         assert_eq!(blocks[1]["text"], json!("reply with exactly: ok"));
+    }
+
+    #[test]
+    fn anthropic_sse_separator_accepts_lf_and_crlf_blocks() {
+        let lf = "event: ping\ndata: {}\n\nrest";
+        let (pos, sep_len) = next_sse_separator(lf).expect("lf separator");
+        assert_eq!(&lf[..pos], "event: ping\ndata: {}");
+        assert_eq!(sep_len, 2);
+        assert_eq!(&lf[pos + sep_len..], "rest");
+
+        let crlf = "event: ping\r\ndata: {}\r\n\r\nrest";
+        let (pos, sep_len) = next_sse_separator(crlf).expect("crlf separator");
+        assert_eq!(&crlf[..pos], "event: ping\r\ndata: {}");
+        assert_eq!(sep_len, 4);
+        assert_eq!(&crlf[pos + sep_len..], "rest");
+    }
+
+    #[test]
+    fn anthropic_sse_line_values_accept_optional_space_after_colon() {
+        assert_eq!(
+            sse_line_value("event:message_stop", "event"),
+            Some("message_stop")
+        );
+        assert_eq!(
+            sse_line_value("event: message_stop", "event"),
+            Some("message_stop")
+        );
+        assert_eq!(
+            sse_line_value("data:{\"type\":\"message_stop\"}", "data"),
+            Some("{\"type\":\"message_stop\"}")
+        );
+        assert_eq!(
+            sse_line_value("data: {\"type\":\"message_stop\"}", "data"),
+            Some("{\"type\":\"message_stop\"}")
+        );
+    }
+
+    #[test]
+    fn custom_anthropic_beta_flags_are_explicit() {
+        assert_eq!(resolve_native_beta_flags(&[]), "");
+        assert_eq!(
+            resolve_native_beta_flags(&["interleaved-thinking-2025-05-14".to_string()]),
+            "interleaved-thinking-2025-05-14"
+        );
     }
 
     #[test]
@@ -2327,32 +2561,64 @@ mod tests {
 
     #[test]
     fn tool_result_images_are_nested_in_anthropic_tool_result_content() {
-        let history = vec![ChatMessage {
-            id: "tool-1".to_string(),
-            role: MessageRole::Tool,
-            content: "Unity screenshot captured.".to_string(),
-            created_at: 0,
-            prompt_prefix: None,
-            prompt_suffix: None,
-            response_id: None,
-            content_order: None,
-            thinking_order: None,
-            tool_calls: None,
-            tool_call_id: Some("call_1".to_string()),
-            images: Some(vec![ImageData {
-                data: "YWJj".to_string(),
-                mime_type: "image/png".to_string(),
-            }]),
-            asset_refs: None,
-            thinking_content: None,
-            thinking_duration: None,
-            thinking_signature: None,
-            knowledge_proposal: None,
-            render_parts: None,
-        }];
+        let history = vec![
+            ChatMessage {
+                id: "assistant-1".to_string(),
+                role: MessageRole::Assistant,
+                content: String::new(),
+                created_at: 0,
+                prompt_prefix: None,
+                prompt_suffix: None,
+                response_id: None,
+                content_order: None,
+                thinking_order: None,
+                tool_calls: Some(vec![ToolCallInfo {
+                    id: "call_1".to_string(),
+                    name: "capture_unity_screenshot".to_string(),
+                    arguments: "{}".to_string(),
+                    order: None,
+                    server_tool: None,
+                    server_tool_output: None,
+                    outcome: None,
+                    recorded_output: None,
+                    nested_tool_calls: None,
+                }]),
+                tool_call_id: None,
+                images: None,
+                asset_refs: None,
+                thinking_content: None,
+                thinking_duration: None,
+                thinking_signature: None,
+                knowledge_proposal: None,
+                render_parts: None,
+            },
+            ChatMessage {
+                id: "tool-1".to_string(),
+                role: MessageRole::Tool,
+                content: "Unity screenshot captured.".to_string(),
+                created_at: 1,
+                prompt_prefix: None,
+                prompt_suffix: None,
+                response_id: None,
+                content_order: None,
+                thinking_order: None,
+                tool_calls: None,
+                tool_call_id: Some("call_1".to_string()),
+                images: Some(vec![ImageData {
+                    data: "YWJj".to_string(),
+                    mime_type: "image/png".to_string(),
+                }]),
+                asset_refs: None,
+                thinking_content: None,
+                thinking_duration: None,
+                thinking_signature: None,
+                knowledge_proposal: None,
+                render_parts: None,
+            },
+        ];
 
         let messages = build_anthropic_messages(&history, AnthropicHistoryOptions::standard());
-        let tool_result = &messages[0]["content"][0];
+        let tool_result = &messages[1]["content"][0];
         assert_eq!(tool_result["type"], json!("tool_result"));
         let content = tool_result["content"]
             .as_array()
