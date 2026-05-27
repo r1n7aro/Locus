@@ -43,8 +43,10 @@ export function assetDbScanStart(): Promise<RefGraphScanStartResult> {
 export function searchWorkspaceAssets(
   query: string,
   roots: string[],
+  limit?: number,
 ): Promise<AssetSearchResult[]> {
-  return ipcInvoke<AssetSearchResult[]>("search_workspace_assets", { query, roots });
+  const payload = limit === undefined ? { query, roots } : { query, roots, limit };
+  return ipcInvoke<AssetSearchResult[]>("search_workspace_assets", payload);
 }
 
 export function previewWorkspaceAsset(filePath: string): Promise<AssetPreviewPayload> {

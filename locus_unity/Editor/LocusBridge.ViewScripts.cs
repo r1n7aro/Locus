@@ -23,6 +23,15 @@ namespace Locus
         private static readonly object _viewScriptCacheLock = new object();
         private static readonly Dictionary<string, CompiledViewScript> _viewScriptCache =
             new Dictionary<string, CompiledViewScript>(StringComparer.Ordinal);
+        private static readonly object _skillPackageAssemblyCacheLock = new object();
+        private static readonly Dictionary<string, CompiledSkillPackageAssembly> _skillPackageAssemblyCache =
+            new Dictionary<string, CompiledSkillPackageAssembly>(StringComparer.Ordinal);
+        private static readonly object _skillPackageAssemblyRegistryLock = new object();
+        private static readonly Dictionary<string, string> _activeSkillPackageAssemblyByPackage =
+            new Dictionary<string, string>(StringComparer.Ordinal);
+        private static readonly HashSet<string> _activeSkillPackageAssemblyIds =
+            new HashSet<string>(StringComparer.Ordinal);
+        private const string SkillPackageAssemblyPrefix = "__LocusSkillPackage_";
         private static readonly string _viewScriptDomainFingerprint = Guid.NewGuid().ToString("N");
         private static int _viewScriptAssemblyCounter;
 
@@ -55,11 +64,65 @@ namespace Locus
             public Type EntryType;
         }
 
+        [Serializable]
+        private sealed class SkillPackageCompileRequest
+        {
+            public string packageId;
+            public string sourceHash;
+            public SkillPackageScriptSource[] scripts;
+        }
+
+        [Serializable]
+        private sealed class SkillPackageInvokeRequest
+        {
+            public string packageId;
+            public string assemblyId;
+            public string typeName;
+            public string entryType;
+            public string method;
+            public string argsJson;
+        }
+
+        [Serializable]
+        private sealed class SkillPackageScriptSource
+        {
+            public string path;
+            public string source;
+        }
+
+        private sealed class CompiledSkillPackageAssembly
+        {
+            public string PackageId;
+            public string Hash;
+            public string AssemblyId;
+            public string PreviousAssemblyId;
+            public string AssemblyPath;
+            public int ScriptCount;
+            public int PublicTypeCount;
+            public string PreviousTypeIndexFingerprint;
+            public string TypeIndexFingerprint;
+            public TypeIndexEntry[] PublicTypes;
+            public Assembly Assembly;
+        }
+
         private static void InvalidateViewScriptCache()
         {
             lock (_viewScriptCacheLock)
             {
                 _viewScriptCache.Clear();
+            }
+        }
+
+        private static void InvalidateSkillPackageAssemblyCache()
+        {
+            lock (_skillPackageAssemblyCacheLock)
+            {
+                _skillPackageAssemblyCache.Clear();
+            }
+            lock (_skillPackageAssemblyRegistryLock)
+            {
+                _activeSkillPackageAssemblyByPackage.Clear();
+                _activeSkillPackageAssemblyIds.Clear();
             }
         }
 
@@ -91,6 +154,85 @@ namespace Locus
             }
 
             return OkResponse(requestId, BuildCompileNamedResponse(compiled, cacheHit));
+        }
+
+        private static async Task<PipeEnvelope> HandleCompileSkillPackage(string requestId, string message)
+        {
+            SkillPackageCompileRequest request;
+            try
+            {
+                request = ParseSkillPackageCompileRequest(message);
+            }
+            catch (Exception ex)
+            {
+                return ErrorResponse(requestId, ex.Message);
+            }
+
+            string prepareError = await EnsureExecuteCodeCompilationReadyAsync();
+            if (!string.IsNullOrEmpty(prepareError))
+                return ErrorResponse(requestId, prepareError);
+
+            bool cacheHit;
+            CompiledSkillPackageAssembly compiled;
+            try
+            {
+                compiled = CompileOrGetSkillPackageAssembly(request, out cacheHit);
+            }
+            catch (Exception ex)
+            {
+                return ErrorResponse(requestId, ex.Message);
+            }
+
+            return OkResponse(requestId, BuildCompileSkillPackageResponse(compiled, cacheHit));
+        }
+
+        private static async Task<PipeEnvelope> HandleInvokeSkillPackage(string requestId, string message)
+        {
+            SkillPackageInvokeRequest request;
+            try
+            {
+                request = ParseSkillPackageInvokeRequest(message);
+            }
+            catch (Exception ex)
+            {
+                return ErrorResponse(requestId, ex.Message);
+            }
+
+            var tcs = new TaskCompletionSource<string>();
+            PostToMainThread(delegate
+            {
+                try
+                {
+                    object result = InvokeCompiledSkillPackageMethod(request);
+                    tcs.TrySetResult(BuildInvokeSkillPackageResponse(request, result));
+                }
+                catch (TargetInvocationException ex)
+                {
+                    tcs.TrySetException(ex.InnerException ?? ex);
+                }
+                catch (Exception ex)
+                {
+                    tcs.TrySetException(ex);
+                }
+            });
+
+            Task completed = await Task.WhenAny(tcs.Task, Task.Delay(ExecuteTimeoutMs));
+            if (completed != tcs.Task)
+                return ErrorResponse(requestId, "invoke_skill_package timed out");
+
+            try
+            {
+                return OkResponse(requestId, tcs.Task.Result);
+            }
+            catch (AggregateException ex)
+            {
+                Exception inner = ex.InnerException ?? ex;
+                return ErrorResponse(requestId, inner.Message);
+            }
+            catch (Exception ex)
+            {
+                return ErrorResponse(requestId, ex.Message);
+            }
         }
 
         private static async Task<PipeEnvelope> HandleInvokeNamed(string requestId, string message)
@@ -243,6 +385,55 @@ namespace Locus
                 request.path = "ViewScript.cs";
         }
 
+        private static SkillPackageCompileRequest ParseSkillPackageCompileRequest(string message)
+        {
+            SkillPackageCompileRequest request = JsonUtility.FromJson<SkillPackageCompileRequest>(message ?? "{}");
+            ValidateSkillPackageCompileRequest(request);
+            return request;
+        }
+
+        private static SkillPackageInvokeRequest ParseSkillPackageInvokeRequest(string message)
+        {
+            SkillPackageInvokeRequest request = JsonUtility.FromJson<SkillPackageInvokeRequest>(message ?? "{}");
+            ValidateSkillPackageInvokeRequest(request);
+            return request;
+        }
+
+        private static void ValidateSkillPackageCompileRequest(SkillPackageCompileRequest request)
+        {
+            if (request == null)
+                throw new Exception("compile_skill_package request is empty");
+            if (string.IsNullOrWhiteSpace(request.packageId))
+                throw new Exception("compile_skill_package request missing packageId");
+            if (string.IsNullOrWhiteSpace(request.sourceHash))
+                throw new Exception("compile_skill_package request missing sourceHash");
+            if (request.scripts == null || request.scripts.Length == 0)
+                throw new Exception("compile_skill_package request has no scripts");
+
+            for (int i = 0; i < request.scripts.Length; i++)
+            {
+                SkillPackageScriptSource script = request.scripts[i];
+                if (script == null)
+                    throw new Exception("compile_skill_package script entry is empty");
+                if (string.IsNullOrWhiteSpace(script.path))
+                    throw new Exception("compile_skill_package script missing path");
+                if (script.source == null)
+                    throw new Exception("compile_skill_package script missing source: " + script.path);
+            }
+        }
+
+        private static void ValidateSkillPackageInvokeRequest(SkillPackageInvokeRequest request)
+        {
+            if (request == null)
+                throw new Exception("invoke_skill_package request is empty");
+            if (string.IsNullOrWhiteSpace(request.packageId))
+                throw new Exception("invoke_skill_package request missing packageId");
+            if (string.IsNullOrWhiteSpace(EffectiveSkillPackageInvokeTypeName(request)))
+                throw new Exception("invoke_skill_package request missing typeName");
+            if (string.IsNullOrWhiteSpace(request.method))
+                throw new Exception("invoke_skill_package request missing method");
+        }
+
         private static CompiledViewScript CompileOrGetViewScript(
             ViewCompileNamedRequest request,
             out bool cacheHit)
@@ -265,6 +456,94 @@ namespace Locus
             }
         }
 
+        private static CompiledSkillPackageAssembly CompileOrGetSkillPackageAssembly(
+            SkillPackageCompileRequest request,
+            out bool cacheHit)
+        {
+            string cacheKey = BuildSkillPackageAssemblyCacheKey(request);
+
+            lock (_skillPackageAssemblyCacheLock)
+            {
+                CompiledSkillPackageAssembly cached;
+                if (_skillPackageAssemblyCache.TryGetValue(cacheKey, out cached))
+                {
+                    ActivateSkillPackageAssembly(cached);
+                    cacheHit = true;
+                    return cached;
+                }
+
+                CompiledSkillPackageAssembly compiled = CompileSkillPackageAssembly(request);
+                _skillPackageAssemblyCache[cacheKey] = compiled;
+                cacheHit = false;
+                return compiled;
+            }
+        }
+
+        private static void ActivateSkillPackageAssembly(CompiledSkillPackageAssembly compiled)
+        {
+            if (compiled == null)
+                return;
+
+            string previousFingerprint = ComputeTypeIndexFingerprint();
+            string previousAssemblyId;
+            bool changed = RegisterActiveSkillPackageAssembly(
+                compiled.PackageId,
+                compiled.AssemblyId,
+                out previousAssemblyId);
+            string currentFingerprint = ComputeTypeIndexFingerprint();
+
+            compiled.PreviousAssemblyId = previousAssemblyId ?? "";
+            compiled.PreviousTypeIndexFingerprint = previousFingerprint;
+            compiled.TypeIndexFingerprint = currentFingerprint;
+
+            if (changed)
+                InvalidateExecuteCodeMetadataReferences();
+        }
+
+        private static bool RegisterActiveSkillPackageAssembly(
+            string packageId,
+            string assemblyId,
+            out string previousAssemblyId)
+        {
+            previousAssemblyId = "";
+            if (string.IsNullOrWhiteSpace(packageId) || string.IsNullOrWhiteSpace(assemblyId))
+                return false;
+
+            lock (_skillPackageAssemblyRegistryLock)
+            {
+                string previous = "";
+                if (_activeSkillPackageAssemblyByPackage.TryGetValue(packageId, out previous))
+                {
+                    if (string.Equals(previous, assemblyId, StringComparison.Ordinal))
+                    {
+                        _activeSkillPackageAssemblyIds.Add(assemblyId);
+                        return false;
+                    }
+
+                    previousAssemblyId = previous ?? "";
+                }
+
+                if (!string.IsNullOrEmpty(previous))
+                    _activeSkillPackageAssemblyIds.Remove(previous);
+
+                _activeSkillPackageAssemblyByPackage[packageId] = assemblyId;
+                _activeSkillPackageAssemblyIds.Add(assemblyId);
+                return true;
+            }
+        }
+
+        private static bool IsInactiveSkillPackageAssemblyName(string assemblyName)
+        {
+            if (string.IsNullOrEmpty(assemblyName) ||
+                !assemblyName.StartsWith(SkillPackageAssemblyPrefix, StringComparison.Ordinal))
+                return false;
+
+            lock (_skillPackageAssemblyRegistryLock)
+            {
+                return !_activeSkillPackageAssemblyIds.Contains(assemblyName);
+            }
+        }
+
         private static bool TryGetViewScriptFromCache(
             ViewCompileNamedRequest request,
             out CompiledViewScript compiled)
@@ -281,6 +560,13 @@ namespace Locus
             return (request.viewId ?? "") + "|" +
                    (request.scriptName ?? "") + "|" +
                    (request.entryType ?? "") + "|" +
+                   (request.sourceHash ?? "") + "|" +
+                   _viewScriptDomainFingerprint;
+        }
+
+        private static string BuildSkillPackageAssemblyCacheKey(SkillPackageCompileRequest request)
+        {
+            return (request.packageId ?? "") + "|" +
                    (request.sourceHash ?? "") + "|" +
                    _viewScriptDomainFingerprint;
         }
@@ -352,6 +638,124 @@ namespace Locus
             }
         }
 
+        private static CompiledSkillPackageAssembly CompileSkillPackageAssembly(SkillPackageCompileRequest request)
+        {
+            SyntaxTree[] syntaxTrees = new SyntaxTree[request.scripts.Length];
+            try
+            {
+                for (int i = 0; i < request.scripts.Length; i++)
+                {
+                    SkillPackageScriptSource script = request.scripts[i];
+                    syntaxTrees[i] = CSharpSyntaxTree.ParseText(
+                        script.source ?? "",
+                        SnippetParseOptions,
+                        path: string.IsNullOrWhiteSpace(script.path) ? "SkillPackageScript.cs" : script.path.Replace('\\', '/'),
+                        encoding: Utf8NoBom
+                    );
+                }
+            }
+            catch (Exception ex)
+            {
+                throw new Exception("parse failed: " + ex.Message);
+            }
+
+            string shortHash = SanitizeAssemblyNamePart(request.sourceHash);
+            if (shortHash.Length > 12)
+                shortHash = shortHash.Substring(0, 12);
+
+            string assemblyId =
+                "__LocusSkillPackage_" +
+                SanitizeAssemblyNamePart(request.packageId) +
+                "_" +
+                shortHash;
+
+            CSharpCompilation compilation = CSharpCompilation.Create(
+                assemblyName: assemblyId,
+                syntaxTrees: syntaxTrees,
+                references: EnsureMetadataReferences(),
+                options: SnippetCompilationOptions
+            );
+
+            using (var peStream = new MemoryStream(64 * 1024))
+            {
+                EmitResult emitResult;
+                try
+                {
+                    emitResult = compilation.Emit(peStream);
+                }
+                catch (Exception ex)
+                {
+                    throw new Exception("emit failed: " + ex.Message);
+                }
+
+                if (!emitResult.Success)
+                    throw new Exception(BuildViewScriptDiagnosticErrorText(emitResult.Diagnostics));
+
+                try
+                {
+                    string assemblyPath = SkillPackageAssemblyPath(assemblyId);
+                    Assembly assembly = FindLoadedAssemblyByName(assemblyId);
+                    if (assembly == null)
+                    {
+                        Directory.CreateDirectory(Path.GetDirectoryName(assemblyPath));
+                        File.WriteAllBytes(assemblyPath, peStream.ToArray());
+                        assembly = Assembly.LoadFile(assemblyPath);
+                    }
+                    else
+                    {
+                        string loadedPath = SafeAssemblyLocation(assembly);
+                        if (!string.IsNullOrEmpty(loadedPath))
+                            assemblyPath = loadedPath;
+                    }
+
+                    Type[] assemblyTypes = SafeGetAssemblyTypes(assembly) ?? new Type[0];
+                    int publicTypeCount = assemblyTypes
+                        .Count(type => type != null && type.IsPublic && !type.IsNested);
+
+                    var compiled = new CompiledSkillPackageAssembly
+                    {
+                        PackageId = request.packageId,
+                        Hash = request.sourceHash,
+                        AssemblyId = assemblyId,
+                        AssemblyPath = assemblyPath.Replace('\\', '/'),
+                        ScriptCount = request.scripts.Length,
+                        PublicTypeCount = publicTypeCount,
+                        PublicTypes = BuildTypeIndexEntriesForAssembly(assembly, assemblyId),
+                        Assembly = assembly
+                    };
+                    ActivateSkillPackageAssembly(compiled);
+                    return compiled;
+                }
+                catch (Exception ex)
+                {
+                    throw new Exception("assembly load/bootstrap failed: " + ex.Message);
+                }
+            }
+        }
+
+        private static Assembly FindLoadedAssemblyByName(string assemblyName)
+        {
+            Assembly[] assemblies = AppDomain.CurrentDomain.GetAssemblies();
+            for (int i = 0; i < assemblies.Length; i++)
+            {
+                Assembly assembly = assemblies[i];
+                if (assembly == null || assembly.IsDynamic)
+                    continue;
+
+                string name = SafeAssemblyName(assembly);
+                if (string.Equals(name, assemblyName, StringComparison.Ordinal))
+                    return assembly;
+            }
+
+            return null;
+        }
+
+        private static string SkillPackageAssemblyPath(string assemblyId)
+        {
+            string projectRoot = Path.GetDirectoryName(Application.dataPath);
+            return Path.Combine(projectRoot, "Library", "Locus", "SkillAssemblies", assemblyId + ".dll");
+        }
+
         private static Type ResolveEntryType(Assembly assembly, string entryTypeName)
         {
             Type type = assembly.GetType(entryTypeName, false);
@@ -407,12 +811,151 @@ namespace Locus
             string json = string.IsNullOrWhiteSpace(argsJson) ? "{}" : argsJson;
             try
             {
-                return JsonUtility.FromJson(json, parameterType);
+                return Locus.Json.LocusJson.Deserialize(json, parameterType);
             }
             catch (Exception ex)
             {
                 throw new Exception("failed to parse View Script args as " + parameterType.FullName + ": " + ex.Message);
             }
+        }
+
+        private static string EffectiveSkillPackageInvokeTypeName(SkillPackageInvokeRequest request)
+        {
+            if (request == null)
+                return "";
+            if (!string.IsNullOrWhiteSpace(request.typeName))
+                return request.typeName.Trim();
+            return (request.entryType ?? "").Trim();
+        }
+
+        private static object InvokeCompiledSkillPackageMethod(SkillPackageInvokeRequest request)
+        {
+            string typeName = EffectiveSkillPackageInvokeTypeName(request);
+            Assembly assembly = FindSkillPackageInvokeAssembly(request);
+            Type type = ResolveSkillPackageInvokeType(request, assembly, typeName);
+            if (type == null)
+                throw new Exception("Skill package " + request.packageId + " cannot find type: " + typeName);
+
+            MethodInfo method = type.GetMethod(
+                request.method,
+                BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static
+            );
+            if (method == null)
+                throw new Exception("Skill package " + request.packageId + " cannot find static method: " + typeName + "." + request.method);
+
+            ParameterInfo[] parameters = method.GetParameters();
+            object[] args;
+            if (parameters.Length == 0)
+            {
+                args = null;
+            }
+            else if (parameters.Length == 1)
+            {
+                args = new[] { ConvertViewScriptArgument(parameters[0].ParameterType, request.argsJson) };
+            }
+            else
+            {
+                throw new Exception("Skill package methods may accept zero parameters or one JSON argument");
+            }
+
+            return CompleteTaskResult(method.Invoke(null, args));
+        }
+
+        private static Assembly FindSkillPackageInvokeAssembly(SkillPackageInvokeRequest request)
+        {
+            if (!string.IsNullOrWhiteSpace(request.assemblyId))
+            {
+                Assembly exact = FindLoadedAssemblyByName(request.assemblyId.Trim());
+                if (exact == null)
+                    throw new Exception("Skill package " + request.packageId + " cannot find assembly: " + request.assemblyId);
+                return exact;
+            }
+
+            return null;
+        }
+
+        private static Assembly FindActiveSkillPackageAssembly(string packageId)
+        {
+            if (string.IsNullOrWhiteSpace(packageId))
+                return null;
+
+            string assemblyId = "";
+            lock (_skillPackageAssemblyRegistryLock)
+            {
+                _activeSkillPackageAssemblyByPackage.TryGetValue(packageId.Trim(), out assemblyId);
+            }
+
+            return string.IsNullOrWhiteSpace(assemblyId)
+                ? null
+                : FindLoadedAssemblyByName(assemblyId.Trim());
+        }
+
+        private static Type ResolveSkillPackageInvokeType(
+            SkillPackageInvokeRequest request,
+            Assembly assembly,
+            string typeName)
+        {
+            if (assembly != null)
+                return ResolveTypeByFullOrSimpleName(assembly, typeName);
+
+            Assembly activeAssembly = FindActiveSkillPackageAssembly(request.packageId);
+            Type activeType = ResolveTypeByFullOrSimpleName(activeAssembly, typeName);
+            if (activeType != null)
+                return activeType;
+
+            Assembly[] assemblies = AppDomain.CurrentDomain.GetAssemblies();
+            for (int i = 0; i < assemblies.Length; i++)
+            {
+                Assembly candidateAssembly = assemblies[i];
+                if (candidateAssembly == null || candidateAssembly.IsDynamic)
+                    continue;
+
+                if (IsInactiveSkillPackageAssemblyName(SafeAssemblyName(candidateAssembly)))
+                    continue;
+
+                Type type = ResolveTypeByFullOrSimpleName(candidateAssembly, typeName);
+                if (type != null)
+                    return type;
+            }
+
+            return null;
+        }
+
+        private static Type ResolveTypeByFullOrSimpleName(Assembly assembly, string typeName)
+        {
+            if (assembly == null || string.IsNullOrWhiteSpace(typeName))
+                return null;
+
+            Type type = assembly.GetType(typeName, false);
+            if (type != null)
+                return type;
+
+            Type[] types = SafeGetAssemblyTypes(assembly);
+            if (types == null)
+                return null;
+
+            for (int i = 0; i < types.Length; i++)
+            {
+                Type candidate = types[i];
+                if (candidate == null)
+                    continue;
+                if (string.Equals(candidate.FullName, typeName, StringComparison.Ordinal) ||
+                    string.Equals(candidate.Name, typeName, StringComparison.Ordinal))
+                    return candidate;
+            }
+
+            return null;
+        }
+
+        private static object CompleteTaskResult(object result)
+        {
+            Task task = result as Task;
+            if (task == null)
+                return result;
+
+            task.GetAwaiter().GetResult();
+            PropertyInfo resultProperty = task.GetType().GetProperty("Result");
+            return resultProperty != null ? resultProperty.GetValue(task, null) : null;
         }
 
         private static string BuildCompileNamedResponse(CompiledViewScript compiled, bool cacheHit)
@@ -425,6 +968,58 @@ namespace Locus
                    "\"domainFingerprint\":\"" + JsonEscape(_viewScriptDomainFingerprint) + "\"," +
                    "\"path\":\"" + JsonEscape(compiled.Path) + "\"" +
                    "}";
+        }
+
+        private static string BuildCompileSkillPackageResponse(CompiledSkillPackageAssembly compiled, bool cacheHit)
+        {
+            return "{" +
+                   "\"packageId\":\"" + JsonEscape(compiled.PackageId) + "\"," +
+                   "\"hash\":\"" + JsonEscape(compiled.Hash) + "\"," +
+                   "\"cacheHit\":" + (cacheHit ? "true" : "false") + "," +
+                   "\"assemblyId\":\"" + JsonEscape(compiled.AssemblyId) + "\"," +
+                   "\"previousAssemblyId\":\"" + JsonEscape(compiled.PreviousAssemblyId) + "\"," +
+                   "\"assemblyPath\":\"" + JsonEscape(compiled.AssemblyPath) + "\"," +
+                   "\"scriptCount\":" + compiled.ScriptCount.ToString(CultureInfo.InvariantCulture) + "," +
+                   "\"publicTypeCount\":" + compiled.PublicTypeCount.ToString(CultureInfo.InvariantCulture) + "," +
+                   "\"previousTypeIndexFingerprint\":\"" + JsonEscape(compiled.PreviousTypeIndexFingerprint) + "\"," +
+                   "\"typeIndexFingerprint\":\"" + JsonEscape(compiled.TypeIndexFingerprint) + "\"," +
+                   "\"types\":" + BuildTypeIndexEntriesJson(compiled.PublicTypes) + "," +
+                   "\"domainFingerprint\":\"" + JsonEscape(_viewScriptDomainFingerprint) + "\"" +
+                   "}";
+        }
+
+        private static string BuildInvokeSkillPackageResponse(SkillPackageInvokeRequest request, object result)
+        {
+            return "{" +
+                   "\"packageId\":\"" + JsonEscape(request.packageId) + "\"," +
+                   "\"assemblyId\":\"" + JsonEscape(request.assemblyId) + "\"," +
+                   "\"typeName\":\"" + JsonEscape(EffectiveSkillPackageInvokeTypeName(request)) + "\"," +
+                   "\"method\":\"" + JsonEscape(request.method) + "\"," +
+                   "\"result\":" + ToJsonValue(result, 0) +
+                   "}";
+        }
+
+        private static string BuildTypeIndexEntriesJson(TypeIndexEntry[] entries)
+        {
+            if (entries == null || entries.Length == 0)
+                return "[]";
+
+            var sb = new StringBuilder();
+            sb.Append("[");
+            for (int i = 0; i < entries.Length; i++)
+            {
+                TypeIndexEntry entry = entries[i];
+                if (i > 0)
+                    sb.Append(",");
+                sb.Append("{");
+                sb.Append("\"simpleName\":\"").Append(JsonEscape(entry.simpleName)).Append("\",");
+                sb.Append("\"ns\":\"").Append(JsonEscape(entry.ns)).Append("\",");
+                sb.Append("\"fullName\":\"").Append(JsonEscape(entry.fullName)).Append("\",");
+                sb.Append("\"assembly\":\"").Append(JsonEscape(entry.assembly)).Append("\"");
+                sb.Append("}");
+            }
+            sb.Append("]");
+            return sb.ToString();
         }
 
         private static string BuildInvokeNamedResponse(
@@ -494,8 +1089,6 @@ namespace Locus
         {
             if (value == null)
                 return "null";
-            if (depth > 5)
-                return "\"...\"";
 
             string stringValue = value as string;
             if (stringValue != null)
@@ -514,6 +1107,9 @@ namespace Locus
                     return "null";
                 return number;
             }
+
+            if (depth > 12)
+                return "\"...\"";
 
             UnityEngine.Object unityObject = value as UnityEngine.Object;
             if (unityObject != null)

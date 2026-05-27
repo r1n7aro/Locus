@@ -38,7 +38,6 @@ namespace Locus
 
             var entries = new List<TypeIndexEntry>(16384);
             var seen = new HashSet<string>(StringComparer.Ordinal);
-            ulong fingerprint = 1469598103934665603UL;
 
             for (int i = 0; i < assemblies.Length; i++)
             {
@@ -50,55 +49,29 @@ namespace Locus
                 if (ShouldSkipTypeIndexAssembly(assemblyName))
                     continue;
 
-                fingerprint = HashString(fingerprint, assemblyName);
-                fingerprint = HashString(fingerprint, SafeAssemblyLocation(asm));
-                fingerprint = HashString(fingerprint, SafeAssemblyMvid(asm));
-                fingerprint = HashString(fingerprint, SafeAssemblyWriteStamp(asm));
-
-                Type[] types = SafeGetAssemblyTypes(asm);
-                if (types == null)
-                    continue;
-
-                for (int j = 0; j < types.Length; j++)
-                {
-                    Type type = types[j];
-                    if (type == null || type.IsNested || !type.IsPublic)
-                        continue;
-
-                    string ns = type.Namespace ?? "";
-                    string simpleName = StripGenericArity(type.Name);
-                    if (string.IsNullOrEmpty(simpleName))
-                        continue;
-
-                    string fullName = string.IsNullOrEmpty(ns)
-                        ? simpleName
-                        : ns + "." + simpleName;
-
-                    string key = fullName;
-                    if (!seen.Add(key))
-                        continue;
-
-                    entries.Add(new TypeIndexEntry
-                    {
-                        simpleName = simpleName,
-                        ns = ns,
-                        fullName = fullName,
-                        assembly = assemblyName
-                    });
-                }
+                AddTypeIndexEntriesForAssembly(asm, assemblyName, entries, seen);
             }
 
             entries.Sort(CompareTypeIndexEntries);
 
             var export = new TypeIndexExport
             {
-                fingerprint = fingerprint.ToString("x16"),
+                fingerprint = ComputeTypeIndexFingerprint(),
                 types = entries.ToArray()
             };
             return JsonUtility.ToJson(export);
         }
 
         private static string ExportTypeIndexFingerprintJson()
+        {
+            var export = new TypeIndexFingerprintExport
+            {
+                fingerprint = ComputeTypeIndexFingerprint()
+            };
+            return JsonUtility.ToJson(export);
+        }
+
+        private static string ComputeTypeIndexFingerprint()
         {
             Assembly[] assemblies = AppDomain.CurrentDomain.GetAssemblies();
             Array.Sort(assemblies, CompareAssembliesByName);
@@ -120,11 +93,54 @@ namespace Locus
                 fingerprint = HashString(fingerprint, SafeAssemblyWriteStamp(asm));
             }
 
-            var export = new TypeIndexFingerprintExport
+            return fingerprint.ToString("x16");
+        }
+
+        private static TypeIndexEntry[] BuildTypeIndexEntriesForAssembly(Assembly asm, string assemblyName)
+        {
+            var entries = new List<TypeIndexEntry>();
+            AddTypeIndexEntriesForAssembly(asm, assemblyName, entries, new HashSet<string>(StringComparer.Ordinal));
+            entries.Sort(CompareTypeIndexEntries);
+            return entries.ToArray();
+        }
+
+        private static void AddTypeIndexEntriesForAssembly(
+            Assembly asm,
+            string assemblyName,
+            List<TypeIndexEntry> entries,
+            HashSet<string> seen)
+        {
+            Type[] types = SafeGetAssemblyTypes(asm);
+            if (types == null)
+                return;
+
+            for (int j = 0; j < types.Length; j++)
             {
-                fingerprint = fingerprint.ToString("x16")
-            };
-            return JsonUtility.ToJson(export);
+                Type type = types[j];
+                if (type == null || type.IsNested || !type.IsPublic)
+                    continue;
+
+                string ns = type.Namespace ?? "";
+                string simpleName = StripGenericArity(type.Name);
+                if (string.IsNullOrEmpty(simpleName))
+                    continue;
+
+                string fullName = string.IsNullOrEmpty(ns)
+                    ? simpleName
+                    : ns + "." + simpleName;
+
+                string key = fullName;
+                if (!seen.Add(key))
+                    continue;
+
+                entries.Add(new TypeIndexEntry
+                {
+                    simpleName = simpleName,
+                    ns = ns,
+                    fullName = fullName,
+                    assembly = assemblyName
+                });
+            }
         }
 
         private static int CompareAssembliesByName(Assembly a, Assembly b)
@@ -151,7 +167,9 @@ namespace Locus
                 return true;
 
             return assemblyName.StartsWith("__LocusRuntimeAsync_", StringComparison.Ordinal)
+                || assemblyName.StartsWith("__LocusView_", StringComparison.Ordinal)
                 || assemblyName.StartsWith("__LocusRunStates_", StringComparison.Ordinal)
+                || IsInactiveSkillPackageAssemblyName(assemblyName)
                 || assemblyName == "Locus.Editor"
                 || assemblyName.StartsWith("Microsoft.CodeAnalysis", StringComparison.Ordinal)
                 || assemblyName == "System.Collections.Immutable"

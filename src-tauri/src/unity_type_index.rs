@@ -7,8 +7,12 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tree_sitter::{Node, Parser};
 
-const CACHE_VERSION: u32 = 1;
-const CACHE_REL_PATH: &[&str] = &["Library", "Locus", "TypeIndex", "unity-type-index-v1.json"];
+const CACHE_VERSION: u32 = 2;
+const CACHE_REL_PATH: &[&str] = &["Library", "Locus", "TypeIndex", "unity-type-index-v2.json"];
+const LEGACY_CACHE_REL_PATH: &[&str] =
+    &["Library", "Locus", "TypeIndex", "unity-type-index-v1.json"];
+const LEGACY_CACHE_VERSION: u32 = 1;
+const SKILL_PACKAGE_ASSEMBLY_PREFIX: &str = "__LocusSkillPackage_";
 
 const DEFAULT_NAMESPACE_USINGS: &[&str] = &[
     "System",
@@ -92,12 +96,28 @@ struct UnityTypeIndexCacheFile {
     #[serde(default)]
     fingerprint: String,
     exported_at_unix_ms: u64,
+    #[serde(default)]
+    assemblies: BTreeMap<String, UnityTypeIndexAssemblyInfo>,
+    #[serde(default)]
     types: Vec<UnityTypeIndexEntry>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UnityTypeIndexAssemblyInfo {
+    #[serde(default)]
+    pub package_id: String,
+    #[serde(default)]
+    pub source_hash: String,
+    #[serde(default)]
+    pub active: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct UnityTypeIndex {
     pub fingerprint: String,
+    entries: Vec<UnityTypeIndexEntry>,
+    assemblies: BTreeMap<String, UnityTypeIndexAssemblyInfo>,
     by_simple_name: HashMap<String, Vec<UnityTypeIndexEntry>>,
 }
 
@@ -143,8 +163,16 @@ fn strip_extended_path_prefix(path: &str) -> &str {
 }
 
 pub fn type_index_cache_path(project_path: &str) -> PathBuf {
+    type_index_cache_path_for(project_path, CACHE_REL_PATH)
+}
+
+fn legacy_type_index_cache_path(project_path: &str) -> PathBuf {
+    type_index_cache_path_for(project_path, LEGACY_CACHE_REL_PATH)
+}
+
+fn type_index_cache_path_for(project_path: &str, rel_path: &[&str]) -> PathBuf {
     let mut path = PathBuf::from(strip_extended_path_prefix(project_path));
-    for segment in CACHE_REL_PATH {
+    for segment in rel_path {
         path.push(segment);
     }
     path
@@ -164,15 +192,19 @@ pub async fn invalidate_cached_type_index(project_path: &str) {
     let key = normalize_project_key(project_path);
     type_index_cache().lock().await.remove(&key);
 
-    let path = type_index_cache_path(project_path);
-    match std::fs::remove_file(&path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => eprintln!(
-            "[Locus] Failed to remove Unity type index cache '{}': {}",
-            path.display(),
-            error
-        ),
+    for path in [
+        type_index_cache_path(project_path),
+        legacy_type_index_cache_path(project_path),
+    ] {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => eprintln!(
+                "[Locus] Failed to remove Unity type index cache '{}': {}",
+                path.display(),
+                error
+            ),
+        }
     }
 }
 
@@ -183,31 +215,11 @@ pub async fn load_cached_type_index(
         return Ok(Some(index));
     }
 
-    let path = type_index_cache_path(project_path);
-    if !path.is_file() {
+    let Some(cache) = read_type_index_cache_file(project_path)? else {
         return Ok(None);
-    }
+    };
 
-    let content = std::fs::read_to_string(&path).map_err(|e| {
-        format!(
-            "Failed to read Unity type index cache '{}': {}",
-            path.display(),
-            e
-        )
-    })?;
-    let cache: UnityTypeIndexCacheFile = serde_json::from_str(&content).map_err(|e| {
-        format!(
-            "Failed to parse Unity type index cache '{}': {}",
-            path.display(),
-            e
-        )
-    })?;
-
-    if cache.version != CACHE_VERSION {
-        return Ok(None);
-    }
-
-    let index = Arc::new(UnityTypeIndex::from_entries(cache.fingerprint, cache.types));
+    let index = Arc::new(UnityTypeIndex::from_cache(cache));
     set_cached_type_index(project_path, index.clone()).await;
     Ok(Some(index))
 }
@@ -226,12 +238,162 @@ pub async fn persist_exported_type_index(
         version: CACHE_VERSION,
         fingerprint,
         exported_at_unix_ms: now_unix_ms(),
+        assemblies: BTreeMap::new(),
         types: export.types,
     };
-    let index = Arc::new(UnityTypeIndex::from_entries(
-        cache.fingerprint.clone(),
-        cache.types.clone(),
-    ));
+    let index = write_type_index_cache_file(project_path, cache).await?;
+
+    set_cached_type_index(project_path, index.clone()).await;
+    Ok(index)
+}
+
+pub async fn persist_skill_package_type_index_delta(
+    project_path: &str,
+    base_fingerprint: &str,
+    fingerprint: &str,
+    package_id: &str,
+    source_hash: &str,
+    assembly_id: &str,
+    previous_assembly_id: &str,
+    types: Vec<UnityTypeIndexEntry>,
+) -> Result<Option<Arc<UnityTypeIndex>>, String> {
+    let base_fingerprint = base_fingerprint.trim();
+    if base_fingerprint.is_empty() {
+        return Err("Unity type index delta is missing base fingerprint".to_string());
+    }
+    let fingerprint = fingerprint.trim();
+    if fingerprint.is_empty() {
+        return Err("Unity type index delta is missing fingerprint".to_string());
+    }
+    let package_id = package_id.trim();
+    if package_id.is_empty() {
+        return Err("Unity type index delta is missing packageId".to_string());
+    }
+    let assembly_id = assembly_id.trim();
+    if assembly_id.is_empty() {
+        return Err("Unity type index delta is missing assemblyId".to_string());
+    }
+
+    let Some(mut cache) = read_type_index_cache_file(project_path)? else {
+        return Ok(None);
+    };
+    if cache.fingerprint != base_fingerprint {
+        return Ok(None);
+    }
+
+    let previous_assembly_id = previous_assembly_id.trim();
+    let mut assemblies_to_remove = BTreeSet::new();
+    assemblies_to_remove.insert(assembly_id.to_string());
+    if !previous_assembly_id.is_empty() {
+        assemblies_to_remove.insert(previous_assembly_id.to_string());
+    }
+    for (assembly, info) in &cache.assemblies {
+        if info.package_id == package_id {
+            assemblies_to_remove.insert(assembly.clone());
+        }
+    }
+
+    let package_assembly_prefix = skill_package_assembly_prefix_for_package(package_id);
+    let has_untracked_package_assembly = cache.types.iter().any(|entry| {
+        let assembly = entry.assembly.trim();
+        assembly.starts_with(&package_assembly_prefix)
+            && !assemblies_to_remove.contains(assembly)
+            && cache
+                .assemblies
+                .get(assembly)
+                .map(|info| info.package_id != package_id)
+                .unwrap_or(true)
+    });
+    if has_untracked_package_assembly {
+        return Ok(None);
+    }
+
+    cache.types.retain(|entry| {
+        let assembly = entry.assembly.trim();
+        !assemblies_to_remove.contains(assembly)
+    });
+
+    cache.assemblies.retain(|assembly, info| {
+        !assemblies_to_remove.contains(assembly.as_str()) && info.package_id != package_id
+    });
+
+    for mut entry in types {
+        if entry.assembly.trim().is_empty() {
+            entry.assembly = assembly_id.to_string();
+        }
+        cache.types.push(entry);
+    }
+
+    cache.assemblies.insert(
+        assembly_id.to_string(),
+        UnityTypeIndexAssemblyInfo {
+            package_id: package_id.to_string(),
+            source_hash: source_hash.to_string(),
+            active: true,
+        },
+    );
+    cache.version = CACHE_VERSION;
+    cache.fingerprint = fingerprint.to_string();
+    cache.exported_at_unix_ms = now_unix_ms();
+
+    let index = write_type_index_cache_file(project_path, cache).await?;
+    set_cached_type_index(project_path, index.clone()).await;
+    Ok(Some(index))
+}
+
+fn read_type_index_cache_file(
+    project_path: &str,
+) -> Result<Option<UnityTypeIndexCacheFile>, String> {
+    let path = type_index_cache_path(project_path);
+    if path.is_file() {
+        return read_type_index_cache_file_from_path(&path);
+    }
+
+    let legacy_path = legacy_type_index_cache_path(project_path);
+    if legacy_path.is_file() {
+        return read_type_index_cache_file_from_path(&legacy_path);
+    }
+
+    Ok(None)
+}
+
+fn read_type_index_cache_file_from_path(
+    path: &Path,
+) -> Result<Option<UnityTypeIndexCacheFile>, String> {
+    let content = std::fs::read_to_string(&path).map_err(|e| {
+        format!(
+            "Failed to read Unity type index cache '{}': {}",
+            path.display(),
+            e
+        )
+    })?;
+    let cache: UnityTypeIndexCacheFile = serde_json::from_str(&content).map_err(|e| {
+        format!(
+            "Failed to parse Unity type index cache '{}': {}",
+            path.display(),
+            e
+        )
+    })?;
+
+    if cache.version != CACHE_VERSION && cache.version != LEGACY_CACHE_VERSION {
+        return Ok(None);
+    }
+
+    Ok(Some(cache))
+}
+
+async fn write_type_index_cache_file(
+    project_path: &str,
+    cache: UnityTypeIndexCacheFile,
+) -> Result<Arc<UnityTypeIndex>, String> {
+    let index = Arc::new(UnityTypeIndex::from_cache(cache));
+    let cache = UnityTypeIndexCacheFile {
+        version: CACHE_VERSION,
+        fingerprint: index.fingerprint.clone(),
+        exported_at_unix_ms: now_unix_ms(),
+        assemblies: index.assemblies.clone(),
+        types: index.entries.clone(),
+    };
 
     let path = type_index_cache_path(project_path);
     if let Some(parent) = path.parent() {
@@ -253,8 +415,31 @@ pub async fn persist_exported_type_index(
         )
     })?;
 
-    set_cached_type_index(project_path, index.clone()).await;
     Ok(index)
+}
+
+fn skill_package_assembly_prefix_for_package(package_id: &str) -> String {
+    format!(
+        "{}{}_",
+        SKILL_PACKAGE_ASSEMBLY_PREFIX,
+        sanitize_assembly_name_part(package_id)
+    )
+}
+
+fn sanitize_assembly_name_part(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        "Script".to_string()
+    } else {
+        out
+    }
 }
 
 pub fn parse_exported_type_index_fingerprint(export_json: &str) -> Result<String, String> {
@@ -414,7 +599,20 @@ pub fn append_auto_using_notes(error: String, prepared: &PreparedUnityCode) -> S
 }
 
 impl UnityTypeIndex {
+    fn from_cache(cache: UnityTypeIndexCacheFile) -> Self {
+        Self::from_entries_with_assemblies(cache.fingerprint, cache.types, cache.assemblies)
+    }
+
+    #[cfg(test)]
     fn from_entries(fingerprint: String, entries: Vec<UnityTypeIndexEntry>) -> Self {
+        Self::from_entries_with_assemblies(fingerprint, entries, BTreeMap::new())
+    }
+
+    fn from_entries_with_assemblies(
+        fingerprint: String,
+        entries: Vec<UnityTypeIndexEntry>,
+        assemblies: BTreeMap<String, UnityTypeIndexAssemblyInfo>,
+    ) -> Self {
         let mut by_key: BTreeMap<(String, String), UnityTypeIndexEntry> = BTreeMap::new();
         for mut entry in entries {
             entry.simple_name = entry.simple_name.trim().to_string();
@@ -437,6 +635,7 @@ impl UnityTypeIndex {
                 .or_insert(entry);
         }
 
+        let normalized_entries = by_key.values().cloned().collect::<Vec<_>>();
         let mut by_simple_name: HashMap<String, Vec<UnityTypeIndexEntry>> = HashMap::new();
         for ((simple_name, _), entry) in by_key {
             by_simple_name.entry(simple_name).or_default().push(entry);
@@ -452,6 +651,8 @@ impl UnityTypeIndex {
 
         Self {
             fingerprint,
+            entries: normalized_entries,
+            assemblies,
             by_simple_name,
         }
     }
@@ -915,6 +1116,19 @@ mod tests {
         )
     }
 
+    fn test_entry(simple: &str, namespace: &str, assembly: &str) -> UnityTypeIndexEntry {
+        UnityTypeIndexEntry {
+            simple_name: simple.to_string(),
+            namespace: namespace.to_string(),
+            full_name: if namespace.is_empty() {
+                simple.to_string()
+            } else {
+                format!("{}.{}", namespace, simple)
+            },
+            assembly: assembly.to_string(),
+        }
+    }
+
     #[test]
     fn prepare_injects_unique_namespace_before_compile() {
         let index = test_index(&[
@@ -1070,6 +1284,176 @@ mod tests {
 
             assert!(cached_type_index(&project_path).await.is_none());
             assert!(!cache_path.exists());
+        });
+    }
+
+    #[test]
+    fn skill_package_delta_updates_cached_type_index() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let project = tempfile::tempdir().expect("project");
+            let project_path = project.path().to_string_lossy();
+            let base = UnityTypeIndexCacheFile {
+                version: CACHE_VERSION,
+                fingerprint: "base".to_string(),
+                exported_at_unix_ms: 1,
+                assemblies: BTreeMap::new(),
+                types: vec![
+                    test_entry("ProjectType", "Game", "Assembly-CSharp"),
+                    test_entry(
+                        "OldSkillType",
+                        "Locus.SkillPackages.Com.Example.Tool",
+                        "__LocusSkillPackage_com_example_tool_aaaaaaaaaaaa",
+                    ),
+                ],
+            };
+            write_type_index_cache_file(&project_path, base)
+                .await
+                .expect("write base cache");
+
+            let updated = persist_skill_package_type_index_delta(
+                &project_path,
+                "base",
+                "next",
+                "com.example.tool",
+                "bbbbbbbbbbbbbbbb",
+                "__LocusSkillPackage_com_example_tool_bbbbbbbbbbbb",
+                "__LocusSkillPackage_com_example_tool_aaaaaaaaaaaa",
+                vec![test_entry(
+                    "NewSkillType",
+                    "Locus.SkillPackages.Com.Example.Tool",
+                    "__LocusSkillPackage_com_example_tool_bbbbbbbbbbbb",
+                )],
+            )
+            .await
+            .expect("persist delta")
+            .expect("cache exists");
+
+            assert_eq!(updated.fingerprint, "next");
+            assert!(updated.by_simple_name.contains_key("ProjectType"));
+            assert!(updated.by_simple_name.contains_key("NewSkillType"));
+            assert!(!updated.by_simple_name.contains_key("OldSkillType"));
+            assert!(updated
+                .assemblies
+                .contains_key("__LocusSkillPackage_com_example_tool_bbbbbbbbbbbb"));
+        });
+    }
+
+    #[test]
+    fn skill_package_delta_falls_back_on_untracked_prefix_collision() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let project = tempfile::tempdir().expect("project");
+            let project_path = project.path().to_string_lossy();
+            let base = UnityTypeIndexCacheFile {
+                version: CACHE_VERSION,
+                fingerprint: "base".to_string(),
+                exported_at_unix_ms: 1,
+                assemblies: BTreeMap::new(),
+                types: vec![
+                    test_entry(
+                        "NeighborType",
+                        "Locus.SkillPackages.Com.Foo.Bar",
+                        "__LocusSkillPackage_com_foo_bar_hash",
+                    ),
+                    test_entry("ProjectType", "Game", "Assembly-CSharp"),
+                ],
+            };
+            write_type_index_cache_file(&project_path, base)
+                .await
+                .expect("write base cache");
+
+            let result = persist_skill_package_type_index_delta(
+                &project_path,
+                "base",
+                "next",
+                "com.foo",
+                "hash",
+                "__LocusSkillPackage_com_foo_hash",
+                "",
+                vec![test_entry(
+                    "SkillType",
+                    "Locus.SkillPackages.Com.Foo",
+                    "__LocusSkillPackage_com_foo_hash",
+                )],
+            )
+            .await
+            .expect("prefix collision falls back");
+
+            assert!(result.is_none());
+            let cache = read_type_index_cache_file(&project_path)
+                .expect("read cache")
+                .expect("cache");
+            assert!(cache
+                .types
+                .iter()
+                .any(|entry| entry.simple_name == "NeighborType"));
+            assert_eq!(cache.fingerprint, "base");
+        });
+    }
+
+    #[test]
+    fn skill_package_delta_requires_existing_cache() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let project = tempfile::tempdir().expect("project");
+            let project_path = project.path().to_string_lossy();
+            let result = persist_skill_package_type_index_delta(
+                &project_path,
+                "base",
+                "next",
+                "com.example.tool",
+                "hash",
+                "__LocusSkillPackage_com_example_tool_hash",
+                "",
+                vec![test_entry(
+                    "SkillType",
+                    "Locus.SkillPackages.Com.Example.Tool",
+                    "__LocusSkillPackage_com_example_tool_hash",
+                )],
+            )
+            .await
+            .expect("delta without cache");
+
+            assert!(result.is_none());
+        });
+    }
+
+    #[test]
+    fn skill_package_delta_rejects_stale_base_cache() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let project = tempfile::tempdir().expect("project");
+            let project_path = project.path().to_string_lossy();
+            let base = UnityTypeIndexCacheFile {
+                version: CACHE_VERSION,
+                fingerprint: "stale".to_string(),
+                exported_at_unix_ms: 1,
+                assemblies: BTreeMap::new(),
+                types: vec![test_entry("ProjectType", "Game", "Assembly-CSharp")],
+            };
+            write_type_index_cache_file(&project_path, base)
+                .await
+                .expect("write base cache");
+
+            let result = persist_skill_package_type_index_delta(
+                &project_path,
+                "expected-base",
+                "next",
+                "com.example.tool",
+                "hash",
+                "__LocusSkillPackage_com_example_tool_hash",
+                "",
+                vec![test_entry(
+                    "SkillType",
+                    "Locus.SkillPackages.Com.Example.Tool",
+                    "__LocusSkillPackage_com_example_tool_hash",
+                )],
+            )
+            .await
+            .expect("stale delta returns fallback");
+
+            assert!(result.is_none());
         });
     }
 

@@ -9,7 +9,8 @@
     "allowUnsafeCode": false,
     "overrideReferences": true,
     "precompiledReferences": [
-        "Locus.Roslyn.dll"
+        "Locus.Roslyn.dll",
+        "Locus.Json.dll"
     ],
     "autoReferenced": false,
     "defineConstraints": [],

@@ -61,7 +61,7 @@ It collects:
 - installer input manifests and lockfiles under \`manifests/\`
 - third-party license and notice texts for redistributed binary/runtime components under \`binaries/\`
 
-Roslyn notices remain bundled with \`locus_unity/Editor/Roslyn\` and are not duplicated here.
+Unity Editor DLL bundle notices remain bundled with \`locus_unity/Editor/Roslyn\` and \`locus_unity/Editor/Json\` and are not duplicated here.
 `
   );
 

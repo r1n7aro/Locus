@@ -1,11 +1,14 @@
 import {
+  BookText,
   Box,
   Clapperboard,
   File as LucideFile,
+  FileBraces,
   FileCode,
   FileCog,
   FileImage,
   FileMusic,
+  FileTerminal,
   FileText,
   FileType,
   FileVideo,
@@ -22,7 +25,11 @@ export type UnityAssetIconKind =
   | "scene"
   | "prefab"
   | "material"
+  | "csharp"
+  | "python"
   | "script"
+  | "json"
+  | "markdown"
   | "shader"
   | "texture"
   | "model"
@@ -41,11 +48,29 @@ export type UnityAssetIconTone = "primary" | "resource" | "media" | "neutral";
 
 export const UNITY_FOLDER_OPEN_ICON = FolderOpen;
 
+const FileHash: IconNode = [
+  [
+    "path",
+    {
+      d: "M6 22a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h8a2.4 2.4 0 0 1 1.704.706l3.588 3.588A2.4 2.4 0 0 1 20 8v12a2 2 0 0 1-2 2z",
+    },
+  ],
+  ["path", { d: "M14 2v5a1 1 0 0 0 1 1h5" }],
+  ["path", { d: "M10 12v6" }],
+  ["path", { d: "M14 12v6" }],
+  ["path", { d: "M8 14h8" }],
+  ["path", { d: "M8 16h8" }],
+];
+
 export const UNITY_ASSET_ICON_NODES: Record<UnityAssetIconKind, IconNode> = {
   scene: MapIcon,
   prefab: Box,
   material: Palette,
+  csharp: FileHash,
+  python: FileTerminal,
   script: FileCode,
+  json: FileBraces,
+  markdown: BookText,
   shader: Sparkles,
   texture: FileImage,
   model: PackageIcon,
@@ -62,7 +87,11 @@ export const UNITY_ASSET_ICON_NODES: Record<UnityAssetIconKind, IconNode> = {
 };
 
 const UNITY_MATERIAL_EXTENSIONS = [".mat", ".physicmaterial", ".physicsmaterial2d"];
-const UNITY_SCRIPT_EXTENSIONS = [".cs", ".asmdef", ".asmref"];
+const UNITY_CSHARP_EXTENSIONS = [".cs"];
+const UNITY_PYTHON_EXTENSIONS = [".py", ".pyw"];
+const UNITY_SCRIPT_EXTENSIONS = [".asmdef", ".asmref", ".js", ".jsx", ".ts", ".tsx"];
+const UNITY_JSON_EXTENSIONS = [".json", ".jsonc"];
+const UNITY_MARKDOWN_EXTENSIONS = [".md", ".markdown", ".mdx"];
 const UNITY_SHADER_EXTENSIONS = [".shader", ".shadergraph", ".compute", ".hlsl", ".cginc"];
 const UNITY_TEXTURE_EXTENSIONS = [
   ".png",
@@ -85,7 +114,7 @@ const UNITY_ANIMATION_EXTENSIONS = [".anim", ".controller", ".overridecontroller
 const UNITY_AUDIO_EXTENSIONS = [".wav", ".mp3", ".ogg", ".aif", ".aiff", ".flac", ".xm", ".mod", ".it", ".s3m"];
 const UNITY_FONT_EXTENSIONS = [".ttf", ".otf", ".fontsettings"];
 const UNITY_VIDEO_EXTENSIONS = [".mp4", ".mov", ".webm", ".avi", ".mpeg", ".mpg"];
-const UNITY_TEXT_EXTENSIONS = [".txt", ".md", ".json", ".xml", ".yaml", ".yml", ".csv", ".bytes", ".uxml", ".uss"];
+const UNITY_TEXT_EXTENSIONS = [".txt", ".xml", ".yaml", ".yml", ".csv", ".bytes", ".uxml", ".uss"];
 
 export const UNITY_ASSET_ICON_FILE_EXTENSIONS = [
   ".unity",
@@ -93,7 +122,11 @@ export const UNITY_ASSET_ICON_FILE_EXTENSIONS = [
   ".asset",
   ".meta",
   ...UNITY_MATERIAL_EXTENSIONS,
+  ...UNITY_CSHARP_EXTENSIONS,
+  ...UNITY_PYTHON_EXTENSIONS,
   ...UNITY_SCRIPT_EXTENSIONS,
+  ...UNITY_JSON_EXTENSIONS,
+  ...UNITY_MARKDOWN_EXTENSIONS,
   ...UNITY_SHADER_EXTENSIONS,
   ...UNITY_TEXTURE_EXTENSIONS,
   ...UNITY_MODEL_EXTENSIONS,
@@ -124,7 +157,11 @@ export function unityAssetIconKindForPath(filePath: string, options: IconKindOpt
   if (fileName.endsWith(".unity")) return "scene";
   if (fileName.endsWith(".prefab")) return "prefab";
   if (hasExtension(fileName, UNITY_MATERIAL_EXTENSIONS)) return "material";
+  if (hasExtension(fileName, UNITY_CSHARP_EXTENSIONS)) return "csharp";
+  if (hasExtension(fileName, UNITY_PYTHON_EXTENSIONS)) return "python";
   if (hasExtension(fileName, UNITY_SCRIPT_EXTENSIONS)) return "script";
+  if (hasExtension(fileName, UNITY_JSON_EXTENSIONS)) return "json";
+  if (hasExtension(fileName, UNITY_MARKDOWN_EXTENSIONS)) return "markdown";
   if (hasExtension(fileName, UNITY_SHADER_EXTENSIONS)) return "shader";
   if (hasExtension(fileName, UNITY_TEXTURE_EXTENSIONS)) return "texture";
   if (hasExtension(fileName, UNITY_MODEL_EXTENSIONS)) return "model";

@@ -6,6 +6,7 @@ using UnityEditor.Compilation;
 using UnityEditor.SceneManagement;
 
 using System;
+using System.Globalization;
 using System.IO;
 using System.IO.Pipes;
 using System.Text;
@@ -114,11 +115,14 @@ namespace Locus
         private static readonly List<string> _recompileErrors = new List<string>();
         private static readonly object _recompileErrorsLock = new object();
 
+        private static readonly string[] SnippetPreprocessorSymbols = BuildSnippetPreprocessorSymbols();
+
         private static readonly CSharpParseOptions SnippetParseOptions =
             new CSharpParseOptions(
                 kind: SourceCodeKind.Regular,
                 documentationMode: DocumentationMode.None,
-                languageVersion: LanguageVersion.CSharp9
+                languageVersion: LanguageVersion.CSharp9,
+                preprocessorSymbols: SnippetPreprocessorSymbols
             );
 
         private static readonly CSharpCompilationOptions SnippetCompilationOptions =
@@ -128,6 +132,146 @@ namespace Locus
                 allowUnsafe: false,
                 assemblyIdentityComparer: DesktopAssemblyIdentityComparer.Default
             );
+
+        private static string[] BuildSnippetPreprocessorSymbols()
+        {
+            var symbols = new HashSet<string>(StringComparer.Ordinal)
+            {
+                "UNITY_EDITOR"
+            };
+
+#if UNITY_EDITOR_WIN
+            symbols.Add("UNITY_EDITOR_WIN");
+            symbols.Add("UNITY_STANDALONE_WIN");
+#endif
+#if UNITY_EDITOR_OSX
+            symbols.Add("UNITY_EDITOR_OSX");
+            symbols.Add("UNITY_STANDALONE_OSX");
+#endif
+#if UNITY_EDITOR_LINUX
+            symbols.Add("UNITY_EDITOR_LINUX");
+            symbols.Add("UNITY_STANDALONE_LINUX");
+#endif
+            AddUnityVersionPreprocessorSymbols(symbols);
+
+#if UNITY_2020
+            symbols.Add("UNITY_2020");
+#endif
+#if UNITY_2021
+            symbols.Add("UNITY_2021");
+#endif
+#if UNITY_2022
+            symbols.Add("UNITY_2022");
+#endif
+#if UNITY_2023
+            symbols.Add("UNITY_2023");
+#endif
+#if UNITY_6000_0_OR_NEWER
+            symbols.Add("UNITY_6000_0_OR_NEWER");
+#endif
+#if UNITY_2020_3_OR_NEWER
+            symbols.Add("UNITY_2020_3_OR_NEWER");
+#endif
+#if UNITY_2021_3_OR_NEWER
+            symbols.Add("UNITY_2021_3_OR_NEWER");
+#endif
+#if UNITY_2022_3_OR_NEWER
+            symbols.Add("UNITY_2022_3_OR_NEWER");
+#endif
+#if UNITY_2023_1_OR_NEWER
+            symbols.Add("UNITY_2023_1_OR_NEWER");
+#endif
+#if ENABLE_INPUT_SYSTEM
+            symbols.Add("ENABLE_INPUT_SYSTEM");
+#endif
+#if ENABLE_LEGACY_INPUT_MANAGER
+            symbols.Add("ENABLE_LEGACY_INPUT_MANAGER");
+#endif
+
+            try
+            {
+                var group = EditorUserBuildSettings.selectedBuildTargetGroup;
+                string raw = PlayerSettings.GetScriptingDefineSymbolsForGroup(group);
+                if (!string.IsNullOrEmpty(raw))
+                {
+                    string[] customSymbols = raw.Split(';');
+                    for (int i = 0; i < customSymbols.Length; i++)
+                    {
+                        string symbol = customSymbols[i].Trim();
+                        if (!string.IsNullOrEmpty(symbol))
+                            symbols.Add(symbol);
+                    }
+                }
+            }
+            catch
+            {
+            }
+
+            var list = new List<string>(symbols);
+            list.Sort(StringComparer.Ordinal);
+            return list.ToArray();
+        }
+
+        private static void AddUnityVersionPreprocessorSymbols(HashSet<string> symbols)
+        {
+            string version = Application.unityVersion ?? "";
+            string[] parts = version.Split('.');
+            int major = parts.Length > 0 ? ReadLeadingInt(parts[0]) : -1;
+            int minor = parts.Length > 1 ? ReadLeadingInt(parts[1]) : -1;
+            int patch = parts.Length > 2 ? ReadLeadingInt(parts[2]) : -1;
+            if (major <= 0)
+                return;
+
+            symbols.Add("UNITY_" + major.ToString(CultureInfo.InvariantCulture));
+            if (minor >= 0)
+            {
+                string majorMinor = "UNITY_" +
+                    major.ToString(CultureInfo.InvariantCulture) +
+                    "_" +
+                    minor.ToString(CultureInfo.InvariantCulture);
+                symbols.Add(majorMinor);
+                symbols.Add(majorMinor + "_OR_NEWER");
+
+                int firstMinor = major >= 6000 ? 0 : 1;
+                for (int currentMinor = firstMinor; currentMinor <= minor; currentMinor++)
+                {
+                    symbols.Add(
+                        "UNITY_" +
+                        major.ToString(CultureInfo.InvariantCulture) +
+                        "_" +
+                        currentMinor.ToString(CultureInfo.InvariantCulture) +
+                        "_OR_NEWER");
+                }
+            }
+
+            if (minor >= 0 && patch >= 0)
+            {
+                symbols.Add(
+                    "UNITY_" +
+                    major.ToString(CultureInfo.InvariantCulture) +
+                    "_" +
+                    minor.ToString(CultureInfo.InvariantCulture) +
+                    "_" +
+                    patch.ToString(CultureInfo.InvariantCulture));
+            }
+        }
+
+        private static int ReadLeadingInt(string value)
+        {
+            if (string.IsNullOrEmpty(value))
+                return -1;
+
+            int end = 0;
+            while (end < value.Length && char.IsDigit(value[end]))
+                end++;
+            if (end == 0)
+                return -1;
+
+            int result;
+            return int.TryParse(value.Substring(0, end), NumberStyles.None, CultureInfo.InvariantCulture, out result)
+                ? result
+                : -1;
+        }
 
         [Serializable]
         private sealed class EditorUpdatePayload
@@ -361,14 +505,20 @@ namespace Locus
             SetCompileResult("ok");
         }
 
-        private static void InvalidateCompilationCaches()
+        private static void InvalidateExecuteCodeMetadataReferences()
         {
             lock (_compileCacheLock)
             {
                 _metadataReferencesReady = false;
                 _cachedMetadataReferences = null;
             }
+        }
+
+        private static void InvalidateCompilationCaches()
+        {
+            InvalidateExecuteCodeMetadataReferences();
             InvalidateViewScriptCache();
+            InvalidateSkillPackageAssemblyCache();
         }
 
         // ───────────────── Main-thread dispatcher ─────────────────
@@ -1019,6 +1169,23 @@ namespace Locus
                         return OkResponse(reqId, status);
                     }
 
+                    case "get_console_text":
+                    {
+                        var tcs = new TaskCompletionSource<PipeEnvelope>();
+                        PostToMainThread(delegate
+                        {
+                            try
+                            {
+                                tcs.SetResult(OkResponse(reqId, BuildConsoleTextPayloadJson()));
+                            }
+                            catch (Exception ex)
+                            {
+                                tcs.SetResult(ErrorResponse(reqId, ex.ToString()));
+                            }
+                        });
+                        return await tcs.Task;
+                    }
+
                     case "exit_play_mode":
                     {
                         if (!_isPlaying)
@@ -1088,6 +1255,12 @@ namespace Locus
                     case "compile_named":
                         return await HandleCompileNamed(reqId, msg.message);
 
+                    case "compile_skill_package":
+                        return await HandleCompileSkillPackage(reqId, msg.message);
+
+                    case "invoke_skill_package":
+                        return await HandleInvokeSkillPackage(reqId, msg.message);
+
                     case "invoke_named":
                         return await HandleInvokeNamed(reqId, msg.message);
 
@@ -1102,6 +1275,9 @@ namespace Locus
 
                     case "view_binding_apply":
                         return await HandleViewBindingApply(reqId, msg.message);
+
+                    case "view_binding_discover":
+                        return await HandleViewBindingDiscover(reqId, msg.message);
 
                     case "capture_viewport":
                         return await HandleCaptureViewport(reqId, msg.message);

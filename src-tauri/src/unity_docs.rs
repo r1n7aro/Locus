@@ -2012,6 +2012,7 @@ fn build_reference_document_from_raw_html(
         skill_surface: None,
         command_trigger: None,
         argument_hint: None,
+        tools: Vec::new(),
         summary: if summary.is_empty() {
             None
         } else {
@@ -4298,6 +4299,7 @@ mod tests {
             skill_surface: None,
             command_trigger: None,
             argument_hint: None,
+            tools: Vec::new(),
             summary: Some(format!("{} 摘要", title)),
             body: format!("{} 正文", title),
             maintenance_rules: None,

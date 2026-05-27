@@ -16,6 +16,22 @@
   color: color-mix(in srgb, var(--status-warn-fg) 62%, var(--text-color) 38%);
 }
 
+.unity-asset-icon.unity-asset-icon--csharp {
+  color: color-mix(in srgb, var(--accent-color) 64%, var(--text-color) 36%);
+}
+
+.unity-asset-icon.unity-asset-icon--python {
+  color: color-mix(in srgb, var(--status-warn-fg) 64%, var(--text-color) 36%);
+}
+
+.unity-asset-icon.unity-asset-icon--json {
+  color: color-mix(in srgb, var(--status-good-fg) 60%, var(--text-color) 40%);
+}
+
+.unity-asset-icon.unity-asset-icon--markdown {
+  color: color-mix(in srgb, var(--accent-color) 38%, var(--text-secondary) 62%);
+}
+
 .unity-asset-icon.unity-asset-icon--prefab path:first-child,
 .unity-asset-icon.unity-asset-icon--folder-solid path:first-child {
   fill: currentColor;

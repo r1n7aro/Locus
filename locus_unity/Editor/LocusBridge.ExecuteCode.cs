@@ -247,6 +247,10 @@ namespace Locus
                     if (asm == null || asm.IsDynamic)
                         continue;
 
+                    string assemblyName = SafeAssemblyName(asm);
+                    if (IsInactiveSkillPackageAssemblyName(assemblyName))
+                        continue;
+
                     TryAddMetadataReference(references, referencedPaths, SafeGetAssemblyLocation(asm));
                 }
                 catch (OperationCanceledException)

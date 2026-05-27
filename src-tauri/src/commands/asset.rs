@@ -772,6 +772,7 @@ pub async fn set_watcher_tuning(
 /// Maximum results returned to the frontend. Anything beyond this is
 /// truncated; the frontend renders a "(truncated)" hint when this is hit.
 const SEARCH_RESULT_LIMIT: usize = 200;
+const SEARCH_RESULT_MAX_LIMIT: usize = 5000;
 
 /// Maximum recursion depth for the WalkDir fallback. Deep enough for typical
 /// Unity projects, shallow enough that pathological junk dirs don't blow up.
@@ -1003,10 +1004,44 @@ fn walk_root_for_search(
     }
 }
 
-/// Strip the known DSL prefixes (`t:` `n:` `n=` `n^` `n$` `under:` `guid:`)
-/// from a query and return the remaining bare terms. Spaces behave as AND on
-/// the asset page, so bare terms must stay split instead of being collapsed
-/// into one phrase.
+fn is_script_ref_filter_token(token: &str) -> bool {
+    let lower = token.to_ascii_lowercase();
+    lower.starts_with("component:")
+        || lower.starts_with("script:")
+        || lower.starts_with("uses:")
+        || lower.starts_with("inherits:")
+}
+
+fn extract_script_ref_terms(query: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for token in query.split_whitespace() {
+        if !is_script_ref_filter_token(token) {
+            continue;
+        }
+        let Some((_, value)) = token.split_once(':') else {
+            continue;
+        };
+        let term = value.trim().trim_matches('"').to_ascii_lowercase();
+        if term.is_empty() || !seen.insert(term.clone()) {
+            continue;
+        }
+        out.push(term);
+    }
+    out
+}
+
+fn strip_script_ref_filters(query: &str) -> String {
+    query
+        .split_whitespace()
+        .filter(|token| !is_script_ref_filter_token(token))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Strip the known DSL prefixes from a query and return the remaining bare
+/// terms. Spaces behave as AND on the asset page, so bare terms must stay
+/// split instead of being collapsed into one phrase.
 fn extract_bare_terms(query: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
@@ -1018,6 +1053,7 @@ fn extract_bare_terms(query: &str) -> Vec<String> {
             || token.starts_with("n$")
             || token.starts_with("under:")
             || token.starts_with("guid:")
+            || is_script_ref_filter_token(token)
         {
             continue;
         }
@@ -1055,6 +1091,7 @@ fn ui_score_match(row: &crate::asset_db::AssetSearchRowDb, bare_terms: &[String]
 pub async fn search_workspace_assets(
     query: String,
     roots: Vec<String>,
+    limit: Option<usize>,
     workspace: State<'_, Arc<Workspace>>,
     ref_graph_state: State<'_, AssetDbState>,
 ) -> Result<Vec<AssetSearchResult>, AppError> {
@@ -1062,10 +1099,12 @@ pub async fn search_workspace_assets(
     if trimmed.is_empty() {
         return Ok(Vec::new());
     }
+    let script_ref_terms = extract_script_ref_terms(trimmed);
+    let search_query = strip_script_ref_filters(trimmed);
     // For walker-fallback substring matching and the UI score tier we want
     // ONLY the bare-text portion of the query — matching against literal
     // `t:prefab` would never hit anything.
-    let bare_terms = extract_bare_terms(trimmed);
+    let bare_terms = extract_bare_terms(&search_query);
 
     // Parse the requested root set; an unknown name is silently dropped.
     let requested_roots: Vec<AssetSearchRoot> = roots
@@ -1075,6 +1114,9 @@ pub async fn search_workspace_assets(
     if requested_roots.is_empty() {
         return Ok(Vec::new());
     }
+    let result_limit = limit
+        .unwrap_or(SEARCH_RESULT_LIMIT)
+        .clamp(1, SEARCH_RESULT_MAX_LIMIT);
 
     let cwd = workspace.path.read().await.clone();
     if cwd.is_empty() {
@@ -1109,13 +1151,26 @@ pub async fn search_workspace_assets(
                     .filter(|r| !matches!(r, AssetSearchRoot::ProjectSettings))
                     .map(|r| r.to_db_root())
                     .collect();
-                Some(
-                    graph
-                        .search_assets_for_command(trimmed, &db_roots, SEARCH_RESULT_LIMIT as u32)
-                        .map_err(|e| AppError::new("ref_graph.search_for_command_failed", e))?,
-                )
+                let search_limit = if script_ref_terms.is_empty() {
+                    result_limit
+                } else {
+                    SEARCH_RESULT_MAX_LIMIT
+                };
+                let mut rows = graph
+                    .search_assets_for_command(&search_query, &db_roots, search_limit as u32)
+                    .map_err(|e| AppError::new("ref_graph.search_for_command_failed", e))?;
+                if !script_ref_terms.is_empty() {
+                    let ref_paths: HashSet<String> = graph
+                        .find_asset_paths_referencing_script_terms(&script_ref_terms)
+                        .map_err(|e| AppError::new("ref_graph.script_ref_search_failed", e))?
+                        .into_iter()
+                        .collect();
+                    rows.retain(|row| ref_paths.contains(&row.path));
+                }
+                Some(rows)
             }
-            None => None,
+            None if script_ref_terms.is_empty() => None,
+            None => Some(Vec::new()),
         }
     } else {
         None
@@ -1179,7 +1234,7 @@ pub async fn search_workspace_assets(
     }
 
     // ── Phase 2: ProjectSettings always uses the walker ──
-    if requested_roots.contains(&AssetSearchRoot::ProjectSettings) {
+    if script_ref_terms.is_empty() && requested_roots.contains(&AssetSearchRoot::ProjectSettings) {
         walk_root_for_search(
             &cwd_path,
             AssetSearchRoot::ProjectSettings,
@@ -1195,8 +1250,8 @@ pub async fn search_workspace_assets(
     let mut seen: HashSet<String> = HashSet::new();
     results.retain(|r| seen.insert(r.path.clone()));
 
-    if results.len() > SEARCH_RESULT_LIMIT {
-        results.truncate(SEARCH_RESULT_LIMIT);
+    if results.len() > result_limit {
+        results.truncate(result_limit);
     }
     Ok(results)
 }
@@ -2452,6 +2507,22 @@ mod tests {
         assert_eq!(
             extract_bare_terms("t:prefab hero enemy under:Assets/UI hero"),
             vec!["hero".to_string(), "enemy".to_string()]
+        );
+    }
+
+    #[test]
+    fn script_ref_filters_are_removed_from_bare_search_terms() {
+        assert_eq!(
+            extract_script_ref_terms("t:prefab component:Entity inherits:IData hero"),
+            vec!["entity".to_string(), "idata".to_string()]
+        );
+        assert_eq!(
+            strip_script_ref_filters("t:prefab component:Entity hero"),
+            "t:prefab hero"
+        );
+        assert_eq!(
+            extract_bare_terms("t:prefab component:Entity hero"),
+            vec!["hero".to_string()]
         );
     }
 

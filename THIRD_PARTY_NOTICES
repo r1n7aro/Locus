@@ -19,9 +19,12 @@ The Locus source tree is distributed under `GPL-3.0-or-later`. See [LICENSE](LIC
 - The default Windows desktop application bundle includes Git for Windows PortableGit prepared under `managed-git/`. Its license files are kept inside the bundled Git runtime directory.
 - The `without_embed_python_git` Windows bundle omits `managed-python/` and `managed-git/` and relies on user-provided Python and Git installations when those workflows need them.
 - `locus_unity/Editor/Roslyn` contains precompiled Roslyn and .NET assemblies used inside the Unity Editor integration.
-- Redistribution of the bundled Roslyn files must keep:
+- `locus_unity/Editor/Json` contains a private precompiled JSON parser bundle used inside the Unity Editor integration.
+- Redistribution of the bundled Unity Editor files must keep:
   - [locus_unity/Editor/Roslyn/THIRD_PARTY.md](locus_unity/Editor/Roslyn/THIRD_PARTY.md)
   - The full `locus_unity/Editor/Roslyn/licenses/` directory
+  - [locus_unity/Editor/Json/THIRD_PARTY.md](locus_unity/Editor/Json/THIRD_PARTY.md)
+  - The full `locus_unity/Editor/Json/licenses/` directory
 
 ## Application Dependency Manifests
 
@@ -44,3 +47,5 @@ The Locus source tree is distributed under `GPL-3.0-or-later`. See [LICENSE](LIC
 3. Keep the generated `licenses/third_party/` bundle.
 4. Keep [locus_unity/Editor/Roslyn/THIRD_PARTY.md](locus_unity/Editor/Roslyn/THIRD_PARTY.md).
 5. Keep the full `locus_unity/Editor/Roslyn/licenses/` directory.
+6. Keep [locus_unity/Editor/Json/THIRD_PARTY.md](locus_unity/Editor/Json/THIRD_PARTY.md).
+7. Keep the full `locus_unity/Editor/Json/licenses/` directory.

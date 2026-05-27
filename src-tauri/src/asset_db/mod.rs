@@ -895,6 +895,14 @@ impl AssetDb {
         db::search_assets_for_command(&self.conn, query, roots, limit)
     }
 
+    pub fn find_asset_paths_referencing_script_terms(
+        &self,
+        lookup_terms: &[String],
+    ) -> Result<Vec<String>, String> {
+        let script_guids = db::find_script_guids_matching_terms(&self.conn, lookup_terms)?;
+        db::find_asset_paths_referencing_any_guid(&self.conn, &script_guids)
+    }
+
     pub fn get_stats(&self) -> Result<(u64, u64), String> {
         db::get_stats(&self.conn)
     }

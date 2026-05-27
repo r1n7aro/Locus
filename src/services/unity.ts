@@ -101,6 +101,13 @@ export interface UnityEmbedTextDropPayload {
   source?: string;
 }
 
+export interface UnityConsoleTextPayload {
+  text: string;
+  entries?: UnityEmbedTextDropEntry[];
+  title?: string;
+  source?: string;
+}
+
 export interface LocusFileDropRef {
   path: string;
   name?: string;
@@ -132,6 +139,10 @@ export function subscribeUnityEmbedTextDrop(
   const runtime = getLocusRuntime();
   if (runtime.kind !== "tauri") return Promise.resolve(() => {});
   return runtime.subscribe<UnityEmbedTextDropPayload>("unity-embed-text-drop", handler);
+}
+
+export function getUnityConsoleText(): Promise<UnityConsoleTextPayload> {
+  return ipcInvoke<UnityConsoleTextPayload>("get_unity_console_text");
 }
 
 export function subscribeLocusFileDrop(

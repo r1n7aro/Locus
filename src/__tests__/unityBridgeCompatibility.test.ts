@@ -32,6 +32,21 @@ describe("unityBridgeCompatibility", () => {
     expect(transport).toContain(".filter(|value| !value.is_empty())");
   });
 
+  it("keeps transient View assemblies out of the Unity type index", () => {
+    const typeIndex = read("locus_unity/Editor/LocusBridge.TypeIndex.cs");
+    const viewScripts = read("locus_unity/Editor/LocusBridge.ViewScripts.cs");
+    const bridge = read("locus_unity/Editor/LocusBridge.cs");
+
+    expect(typeIndex).toContain('assemblyName.StartsWith("__LocusView_"');
+    expect(typeIndex).toContain("IsInactiveSkillPackageAssemblyName(assemblyName)");
+    expect(viewScripts).toContain("PreviousAssemblyId");
+    expect(viewScripts).toContain("FindActiveSkillPackageAssembly");
+    expect(viewScripts).toContain('\\"previousAssemblyId\\"');
+    expect(viewScripts).toContain("HandleInvokeSkillPackage");
+    expect(bridge).toContain("preprocessorSymbols: SnippetPreprocessorSymbols");
+    expect(bridge).toContain("AddUnityVersionPreprocessorSymbols");
+  });
+
   it("drops the cached Unity pipe connection after a response timeout", () => {
     const transport = read("src-tauri/src/unity_bridge/transport.rs");
 

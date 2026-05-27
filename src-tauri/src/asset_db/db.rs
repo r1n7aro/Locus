@@ -1501,6 +1501,101 @@ pub fn find_asset_paths_referencing_guid(
     Ok(paths)
 }
 
+pub fn find_script_guids_matching_terms(
+    conn: &Connection,
+    lookup_terms: &[String],
+) -> Result<Vec<Guid>, String> {
+    let lowered: Vec<String> = lookup_terms
+        .iter()
+        .map(|name| name.trim().to_ascii_lowercase())
+        .filter(|name| !name.is_empty())
+        .collect();
+    if lowered.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let placeholders: Vec<&str> = lowered.iter().map(|_| "?").collect();
+    let in_sql = placeholders.join(",");
+    let sql = format!(
+        "SELECT DISTINCT a.guid
+         FROM assets a
+         LEFT JOIN script_inheritance_terms t ON t.script_guid = a.guid
+         WHERE a.exists_on_disk = 1
+           AND a.kind = ?
+           AND (
+             a.script_class_lower IN ({0})
+             OR a.script_full_name_lower IN ({0})
+             OR t.term IN ({0})
+           )
+         ORDER BY a.path",
+        in_sql
+    );
+
+    let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+    params_vec.push(Box::new(AssetKind::Script as i32));
+    for _ in 0..3 {
+        for term in &lowered {
+            params_vec.push(Box::new(term.clone()));
+        }
+    }
+
+    let refs: Vec<&dyn rusqlite::types::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| format!("Failed to prepare script term query: {}", e))?;
+    let rows = stmt
+        .query_map(refs.as_slice(), |row| {
+            let guid_blob: Vec<u8> = row.get(0)?;
+            Ok(blob_to_guid(&guid_blob))
+        })
+        .map_err(|e| format!("Failed to query script terms: {}", e))?;
+
+    let mut guids = Vec::new();
+    for row in rows {
+        guids.push(row.map_err(|e| format!("Failed to read script term row: {}", e))?);
+    }
+    Ok(guids)
+}
+
+pub fn find_asset_paths_referencing_any_guid(
+    conn: &Connection,
+    target_guids: &[Guid],
+) -> Result<Vec<String>, String> {
+    if target_guids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let placeholders: Vec<&str> = target_guids.iter().map(|_| "?").collect();
+    let sql = format!(
+        "SELECT DISTINCT a.path
+         FROM edges e
+         JOIN assets a ON a.guid = e.src_guid
+         WHERE e.dst_guid IN ({})
+           AND a.exists_on_disk = 1
+         ORDER BY a.path",
+        placeholders.join(",")
+    );
+
+    let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+    for guid in target_guids {
+        params_vec.push(Box::new(guid.to_vec()));
+    }
+
+    let refs: Vec<&dyn rusqlite::types::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| format!("Failed to prepare asset script referrer query: {}", e))?;
+    let rows = stmt
+        .query_map(refs.as_slice(), |row| row.get::<_, String>(0))
+        .map_err(|e| format!("Failed to query asset script referrers: {}", e))?;
+
+    let mut paths = Vec::new();
+    for row in rows {
+        paths.push(row.map_err(|e| format!("Failed to read asset script referrer row: {}", e))?);
+    }
+    Ok(paths)
+}
+
 pub fn find_script_descendant_paths(
     conn: &Connection,
     lookup_terms: &[String],
@@ -3002,6 +3097,72 @@ mod tests {
         )
         .unwrap();
         assert_eq!(rows, vec!["Assets/Game/CustomYield.cs".to_string()]);
+    }
+
+    #[test]
+    fn script_reference_lookup_matches_exact_and_inherited_script_terms() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        let entity = test_script_asset(
+            "Assets/Game/Entity.cs",
+            "Entity",
+            "game",
+            "entity game.entity monobehaviour",
+            "monobehaviour",
+        );
+        let enemy = test_script_asset(
+            "Assets/Game/Enemy.cs",
+            "Enemy",
+            "game",
+            "enemy game.enemy entity game.entity monobehaviour",
+            "entity game.entity monobehaviour",
+        );
+        let player_prefab = test_asset("Assets/Prefabs/Player.prefab", AssetKind::Prefab, "");
+        let enemy_prefab = test_asset("Assets/Prefabs/Enemy.prefab", AssetKind::Prefab, "");
+        let material = test_asset("Assets/Materials/Entity.mat", AssetKind::Material, "");
+        seed_assets(
+            &mut conn,
+            &[
+                entity.clone(),
+                enemy.clone(),
+                player_prefab.clone(),
+                enemy_prefab.clone(),
+                material.clone(),
+            ],
+        );
+
+        conn.execute(
+            "INSERT INTO edges (src_guid, dst_guid, dst_file_id, class_id_hint, field_hint, ref_path)
+             VALUES (?1, ?2, NULL, NULL, NULL, NULL)",
+            params![player_prefab.guid.as_slice(), entity.guid.as_slice()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO edges (src_guid, dst_guid, dst_file_id, class_id_hint, field_hint, ref_path)
+             VALUES (?1, ?2, NULL, NULL, NULL, NULL)",
+            params![enemy_prefab.guid.as_slice(), enemy.guid.as_slice()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO edges (src_guid, dst_guid, dst_file_id, class_id_hint, field_hint, ref_path)
+             VALUES (?1, ?2, NULL, NULL, NULL, NULL)",
+            params![material.guid.as_slice(), entity.guid.as_slice()],
+        )
+        .unwrap();
+
+        let script_guids =
+            find_script_guids_matching_terms(&conn, &[String::from("Entity")]).unwrap();
+        assert!(script_guids.contains(&entity.guid));
+        assert!(script_guids.contains(&enemy.guid));
+
+        let paths = find_asset_paths_referencing_any_guid(&conn, &script_guids).unwrap();
+        assert_eq!(
+            paths,
+            vec![
+                "Assets/Materials/Entity.mat".to_string(),
+                "Assets/Prefabs/Enemy.prefab".to_string(),
+                "Assets/Prefabs/Player.prefab".to_string(),
+            ]
+        );
     }
 
     #[test]

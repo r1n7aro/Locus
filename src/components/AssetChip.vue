@@ -8,10 +8,10 @@ import {
   classifyUnitySceneObjectError,
   openFileExternal,
 } from "../services/unity";
-import { knowledgeRevealTarget } from "../services/knowledge";
 import { normalizeAppError } from "../services/errors";
 import { t } from "../i18n";
 import { useNotificationStore } from "../stores/notification";
+import { useUiStore } from "../stores/ui";
 import type { AssetRefKind, KnowledgeDocumentType } from "../types";
 import LucideIcon from "./icons/LucideIcon.vue";
 import {
@@ -31,6 +31,7 @@ const emit = defineEmits<{
 }>();
 
 const notificationStore = useNotificationStore();
+const uiStore = useUiStore();
 const KNOWLEDGE_REF_ROOT_RE = /^(design|memory|skill|reference)\/.+\.md$/i;
 
 const normalizedPath = computed(() =>
@@ -84,11 +85,11 @@ const unitySelectableAsset = computed(() => /^(Assets|Packages)\//i.test(normali
 async function handleClick(e: MouseEvent) {
   try {
     if (knowledgeRef.value) {
-      await knowledgeRevealTarget({
-        kind: "document",
-        docType: knowledgeRef.value.docType,
+      uiStore.stageKnowledgeSelection({
+        dashboard: knowledgeRef.value.docType,
         path: knowledgeRef.value.path,
       });
+      uiStore.setTab("knowledge");
       return;
     }
     if (sceneObjectRef.value) {

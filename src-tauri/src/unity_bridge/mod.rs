@@ -1,6 +1,7 @@
 mod capture;
 mod focus;
 mod plugin;
+mod process;
 mod transport;
 
 use std::{
@@ -18,6 +19,9 @@ pub use capture::{capture_viewport, UnityViewportCapture};
 pub use plugin::{
     check_plugin_status, emit_plugin_status, find_plugin_source_dir, install_or_update_plugin,
     plugin_install_root, plugin_skills_root, PluginStatus,
+};
+pub use process::{
+    query_current_project_editor_process, UnityEditorProcessInfo, UnityEditorProcessState,
 };
 pub use transport::{
     send_message, send_message_with_timeout, send_message_without_timeout, set_event_app_handle,
@@ -61,6 +65,17 @@ pub struct UnityConnectionStatus {
     pub editor_status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scene_path: Option<String>,
+    pub editor_process_state: UnityEditorProcessState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub editor_process_id: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub editor_process_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub editor_project_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub process_checked_at_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub process_last_error: Option<String>,
     pub pipe_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latency_ms: Option<u64>,
@@ -469,6 +484,18 @@ fn parse_unity_status_message(message: &str) -> (&'static str, Option<String>) {
     )
 }
 
+fn apply_unity_process_info(
+    status: &mut UnityConnectionStatus,
+    process_info: UnityEditorProcessInfo,
+) {
+    status.editor_process_state = process_info.state;
+    status.editor_process_id = process_info.process_id;
+    status.editor_process_path = process_info.executable_path;
+    status.editor_project_path = process_info.project_path;
+    status.process_checked_at_ms = Some(process_info.checked_at_ms);
+    status.process_last_error = process_info.last_error;
+}
+
 pub async fn query_unity_connection_status(project_path: &str) -> UnityConnectionStatus {
     let pipe_name = get_pipe_name(project_path);
     let checked_at_ms = unix_now_ms();
@@ -483,6 +510,12 @@ pub async fn query_unity_connection_status(project_path: &str) -> UnityConnectio
                 connected: true,
                 editor_status: editor_status.to_string(),
                 scene_path,
+                editor_process_state: UnityEditorProcessState::Running,
+                editor_process_id: None,
+                editor_process_path: None,
+                editor_project_path: None,
+                process_checked_at_ms: None,
+                process_last_error: None,
                 pipe_name,
                 latency_ms: Some(latency_ms),
                 reconnect_attempts: 0,
@@ -492,10 +525,16 @@ pub async fn query_unity_connection_status(project_path: &str) -> UnityConnectio
         }
         Ok(resp) => {
             let latency_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-            UnityConnectionStatus {
+            let mut status = UnityConnectionStatus {
                 connected: false,
                 editor_status: UNITY_EDITOR_STATUS_DISCONNECTED.to_string(),
                 scene_path: None,
+                editor_process_state: UnityEditorProcessState::Unknown,
+                editor_process_id: None,
+                editor_process_path: None,
+                editor_project_path: None,
+                process_checked_at_ms: None,
+                process_last_error: None,
                 pipe_name,
                 latency_ms: Some(latency_ms),
                 reconnect_attempts: 0,
@@ -504,23 +543,37 @@ pub async fn query_unity_connection_status(project_path: &str) -> UnityConnectio
                         .unwrap_or_else(|| "Unity status returned ok=false".to_string()),
                 ),
                 checked_at_ms,
-            }
+            };
+            let process_info = query_current_project_editor_process(project_path).await;
+            apply_unity_process_info(&mut status, process_info);
+            status
         }
-        Err(error) => UnityConnectionStatus {
-            connected: false,
-            editor_status: UNITY_EDITOR_STATUS_DISCONNECTED.to_string(),
-            scene_path: None,
-            pipe_name,
-            latency_ms: None,
-            reconnect_attempts: 0,
-            last_error: Some(error),
-            checked_at_ms,
-        },
+        Err(error) => {
+            let mut status = UnityConnectionStatus {
+                connected: false,
+                editor_status: UNITY_EDITOR_STATUS_DISCONNECTED.to_string(),
+                scene_path: None,
+                editor_process_state: UnityEditorProcessState::Unknown,
+                editor_process_id: None,
+                editor_process_path: None,
+                editor_project_path: None,
+                process_checked_at_ms: None,
+                process_last_error: None,
+                pipe_name,
+                latency_ms: None,
+                reconnect_attempts: 0,
+                last_error: Some(error),
+                checked_at_ms,
+            };
+            let process_info = query_current_project_editor_process(project_path).await;
+            apply_unity_process_info(&mut status, process_info);
+            status
+        }
     }
 }
 
 pub async fn is_unity_connected(project_path: &str) -> bool {
-    query_unity_connection_status(project_path).await.connected
+    query_unity_status(project_path).await.0
 }
 
 pub async fn select_asset(
@@ -951,6 +1004,51 @@ pub async fn compile_named(
     }
 }
 
+pub async fn compile_skill_package(
+    project_path: &str,
+    request: &serde_json::Value,
+) -> Result<String, String> {
+    let op_lock = project_unity_op_lock(project_path).await;
+    let _guard = op_lock.lock().await;
+    let payload = serde_json::to_string(request).map_err(|error| {
+        format!(
+            "Failed to serialize compile_skill_package request: {}",
+            error
+        )
+    })?;
+    let resp =
+        send_message_without_timeout(project_path, "compile_skill_package", &payload).await?;
+    if resp.ok {
+        Ok(resp.message.unwrap_or_default())
+    } else {
+        Err(resp
+            .error
+            .unwrap_or_else(|| "compile_skill_package failed".to_string()))
+    }
+}
+
+pub async fn invoke_skill_package(
+    project_path: &str,
+    request: &serde_json::Value,
+) -> Result<String, String> {
+    let op_lock = project_unity_op_lock(project_path).await;
+    let _guard = op_lock.lock().await;
+    let payload = serde_json::to_string(request).map_err(|error| {
+        format!(
+            "Failed to serialize invoke_skill_package request: {}",
+            error
+        )
+    })?;
+    let resp = send_message_without_timeout(project_path, "invoke_skill_package", &payload).await?;
+    if resp.ok {
+        Ok(resp.message.unwrap_or_default())
+    } else {
+        Err(resp
+            .error
+            .unwrap_or_else(|| "invoke_skill_package failed".to_string()))
+    }
+}
+
 pub async fn invoke_named(
     project_path: &str,
     request: &serde_json::Value,
@@ -992,6 +1090,13 @@ pub async fn view_binding_read(
     request: &serde_json::Value,
 ) -> Result<String, String> {
     send_view_binding_message(project_path, "view_binding_read", request).await
+}
+
+pub async fn view_binding_discover(
+    project_path: &str,
+    request: &serde_json::Value,
+) -> Result<String, String> {
+    send_view_binding_message(project_path, "view_binding_discover", request).await
 }
 
 pub async fn view_binding_write(
@@ -1264,6 +1369,10 @@ pub async fn refresh_unity_type_index(
     crate::unity_type_index::persist_exported_type_index(project_path, &message).await
 }
 
+pub struct UnityTypeIndexUpdateResult {
+    pub mode: String,
+}
+
 async fn current_unity_type_index_fingerprint(project_path: &str) -> Result<String, String> {
     let resp = send_message_with_timeout(
         project_path,
@@ -1289,6 +1398,113 @@ async fn cached_unity_type_index_is_current(
 ) -> Result<bool, String> {
     let current_fingerprint = current_unity_type_index_fingerprint(project_path).await?;
     Ok(!index.fingerprint.is_empty() && index.fingerprint == current_fingerprint)
+}
+
+pub async fn ensure_unity_type_index_current(
+    project_path: &str,
+) -> Result<UnityTypeIndexUpdateResult, String> {
+    match crate::unity_type_index::load_cached_type_index(project_path).await {
+        Ok(Some(index)) if cached_unity_type_index_is_current(project_path, &index).await? => {
+            Ok(UnityTypeIndexUpdateResult {
+                mode: "current".to_string(),
+            })
+        }
+        Ok(Some(_)) | Ok(None) => {
+            refresh_unity_type_index(project_path).await?;
+            Ok(UnityTypeIndexUpdateResult {
+                mode: "full".to_string(),
+            })
+        }
+        Err(error) => Err(error),
+    }
+}
+
+pub async fn update_unity_type_index_after_skill_package_compile(
+    project_path: &str,
+    compile_response: &serde_json::Value,
+) -> Result<UnityTypeIndexUpdateResult, String> {
+    let package_id = compile_response
+        .get("packageId")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let source_hash = compile_response
+        .get("hash")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let assembly_id = compile_response
+        .get("assemblyId")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let previous_assembly_id = compile_response
+        .get("previousAssemblyId")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let previous_fingerprint = compile_response
+        .get("previousTypeIndexFingerprint")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let current_fingerprint = compile_response
+        .get("typeIndexFingerprint")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let types = serde_json::from_value::<Vec<crate::unity_type_index::UnityTypeIndexEntry>>(
+        compile_response
+            .get("types")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!([])),
+    )
+    .map_err(|error| format!("Failed to parse Skill package type index delta: {}", error))?;
+
+    if package_id.is_empty() || source_hash.is_empty() || assembly_id.is_empty() {
+        refresh_unity_type_index(project_path).await?;
+        return Ok(UnityTypeIndexUpdateResult {
+            mode: "full".to_string(),
+        });
+    }
+
+    let cached = crate::unity_type_index::load_cached_type_index(project_path).await?;
+    if let Some(index) = cached.as_ref() {
+        if !current_fingerprint.is_empty() && index.fingerprint == current_fingerprint {
+            return Ok(UnityTypeIndexUpdateResult {
+                mode: "current".to_string(),
+            });
+        }
+    }
+
+    if !previous_fingerprint.is_empty() && !current_fingerprint.is_empty() {
+        if let Some(index) = cached.as_ref() {
+            if index.fingerprint == previous_fingerprint {
+                if crate::unity_type_index::persist_skill_package_type_index_delta(
+                    project_path,
+                    previous_fingerprint,
+                    current_fingerprint,
+                    package_id,
+                    source_hash,
+                    assembly_id,
+                    previous_assembly_id,
+                    types,
+                )
+                .await?
+                .is_some()
+                {
+                    return Ok(UnityTypeIndexUpdateResult {
+                        mode: "incremental".to_string(),
+                    });
+                }
+            }
+        }
+    }
+
+    refresh_unity_type_index(project_path).await?;
+    Ok(UnityTypeIndexUpdateResult {
+        mode: "full".to_string(),
+    })
 }
 
 async fn unity_type_index_for_execute(

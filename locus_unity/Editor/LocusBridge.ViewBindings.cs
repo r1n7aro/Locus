@@ -22,6 +22,7 @@ namespace Locus
             public string scenePath;
             public string objectPath;
             public string componentType;
+            public int componentIndex;
             public string propertyPath;
         }
 
@@ -47,36 +48,41 @@ namespace Locus
         }
 
         [Serializable]
-        private sealed class Vector2Json
+        private sealed class ViewBindingDiscoverRequest
         {
-            public float x;
-            public float y;
+            public string bindingId;
+            public ViewBindingTarget target;
+            public string query;
+            public string fieldName;
+            public string fieldType;
+            public int maxDepth;
+            public int maxResults;
         }
 
-        [Serializable]
-        private sealed class Vector3Json
+        private sealed class ViewBindingDiscoverMatch
         {
-            public float x;
-            public float y;
-            public float z;
+            public string propertyPath;
+            public string displayName;
+            public string name;
+            public string type;
+            public string valueType;
+            public string fieldTypeFullName;
+            public string fieldTypeAssembly;
+            public string displayValue;
+            public bool editable;
+            public bool hasChildren;
+            public bool isArray;
+            public bool isManagedReference;
+            public int depth;
         }
 
-        [Serializable]
-        private sealed class Vector4Json
+        private sealed class ViewBindingDiscoverResponse
         {
-            public float x;
-            public float y;
-            public float z;
-            public float w;
-        }
-
-        [Serializable]
-        private sealed class ColorJson
-        {
-            public float r;
-            public float g;
-            public float b;
-            public float a = 1f;
+            public bool ok;
+            public string bindingId;
+            public string message;
+            public ViewBindingTarget target;
+            public ViewBindingDiscoverMatch[] matches;
         }
 
         private static async Task<PipeEnvelope> HandleViewBindingRead(string requestId, string message)
@@ -135,6 +141,27 @@ namespace Locus
                 delegate { return ApplyViewBindings(request); });
         }
 
+        private static async Task<PipeEnvelope> HandleViewBindingDiscover(string requestId, string message)
+        {
+            ViewBindingDiscoverRequest request;
+            try
+            {
+                request = JsonUtility.FromJson<ViewBindingDiscoverRequest>(message ?? "{}");
+                if (request == null)
+                    throw new Exception("View binding discover request is empty");
+                ValidateViewBindingObjectTarget(request.target);
+            }
+            catch (Exception ex)
+            {
+                return ErrorResponse(requestId, ex.Message);
+            }
+
+            return await RunViewBindingOnMainThread(
+                requestId,
+                "view_binding_discover",
+                delegate { return DiscoverViewBindingProperties(request); });
+        }
+
         private static async Task<PipeEnvelope> RunViewBindingOnMainThread(
             string requestId,
             string operation,
@@ -162,12 +189,17 @@ namespace Locus
 
         private static void ValidateViewBindingTarget(ViewBindingTarget target)
         {
+            ValidateViewBindingObjectTarget(target);
+            if (string.IsNullOrWhiteSpace(target.propertyPath))
+                throw new Exception("View binding target propertyPath is required");
+        }
+
+        private static void ValidateViewBindingObjectTarget(ViewBindingTarget target)
+        {
             if (target == null)
                 throw new Exception("View binding target is required");
             if (string.IsNullOrWhiteSpace(target.kind))
                 throw new Exception("View binding target kind is required");
-            if (string.IsNullOrWhiteSpace(target.propertyPath))
-                throw new Exception("View binding target propertyPath is required");
         }
 
         private sealed class ResolvedViewBindingWrite
@@ -277,16 +309,14 @@ namespace Locus
                     }
 
                     if (applied.Count > 0)
-                    {
-                        serialized.ApplyModifiedProperties();
-                        MarkViewBindingObjectDirty(obj);
-                    }
+                        ApplyViewBindingSerializedChanges(serialized, obj);
 
                     for (int i = 0; i < applied.Count; i++)
                     {
                         AppliedViewBindingWrite item = applied[i];
+                        SerializedProperty freshProp = serialized.FindProperty(item.write.target.propertyPath);
                         resultItems[item.write.index] =
-                            BuildBindingReadJson(item.write.bindingId, item.write.target, item.prop, true);
+                            BuildBindingReadJson(item.write.bindingId, item.write.target, freshProp != null ? freshProp : item.prop, true);
                     }
                 }
                 catch (Exception ex)
@@ -322,13 +352,15 @@ namespace Locus
                    (target.path ?? "").Trim().Replace('\\', '/') + "|" +
                    (target.scenePath ?? "").Trim().Replace('\\', '/') + "|" +
                    (target.objectPath ?? "").Trim().Replace('\\', '/') + "|" +
-                   (target.componentType ?? "").Trim();
+                   (target.componentType ?? "").Trim() + "|" +
+                   target.componentIndex.ToString(CultureInfo.InvariantCulture);
         }
 
         private static string ReadViewBinding(string bindingId, ViewBindingTarget target)
         {
             UnityEngine.Object obj = ResolveViewBindingObject(target);
             var serialized = new SerializedObject(obj);
+            serialized.Update();
             SerializedProperty prop = serialized.FindProperty(target.propertyPath);
             if (prop == null)
                 throw new Exception("SerializedProperty not found: " + target.propertyPath);
@@ -339,14 +371,61 @@ namespace Locus
         {
             UnityEngine.Object obj = ResolveViewBindingObject(target);
             var serialized = new SerializedObject(obj);
+            serialized.Update();
             SerializedProperty prop = serialized.FindProperty(target.propertyPath);
             if (prop == null)
                 throw new Exception("SerializedProperty not found: " + target.propertyPath);
-            serialized.Update();
             SetSerializedPropertyValue(prop, valueJson);
-            serialized.ApplyModifiedProperties();
-            MarkViewBindingObjectDirty(obj);
-            return BuildBindingReadJson(bindingId, target, prop, true);
+            ApplyViewBindingSerializedChanges(serialized, obj);
+            SerializedProperty updated = serialized.FindProperty(target.propertyPath);
+            return BuildBindingReadJson(bindingId, target, updated != null ? updated : prop, true);
+        }
+
+        private static string DiscoverViewBindingProperties(ViewBindingDiscoverRequest request)
+        {
+            string query = NormalizeSearchText(request.query);
+            string fieldName = (request.fieldName ?? "").Trim();
+            string fieldType = (request.fieldType ?? "").Trim();
+            if (string.IsNullOrEmpty(query) && string.IsNullOrEmpty(fieldName) && string.IsNullOrEmpty(fieldType))
+                throw new Exception("View binding discover requires query, fieldName, or fieldType");
+
+            int maxDepth = request.maxDepth > 0 ? Math.Min(request.maxDepth, 32) : 8;
+            int maxResults = request.maxResults > 0 ? Math.Min(request.maxResults, 500) : 100;
+            UnityEngine.Object obj = ResolveViewBindingObject(request.target);
+            var serialized = new SerializedObject(obj);
+            serialized.Update();
+
+            var matches = new List<ViewBindingDiscoverMatch>();
+            SerializedProperty cursor = serialized.GetIterator();
+            bool enterChildren = true;
+            while (cursor.NextVisible(enterChildren))
+            {
+                int depth = SerializedPropertyDepth(cursor.propertyPath);
+                enterChildren = depth < maxDepth;
+                if (depth > maxDepth)
+                    continue;
+
+                Type resolvedType = ResolveSerializedPropertyFieldType(cursor);
+                if (!MatchesViewBindingDiscoveryName(cursor, fieldName))
+                    continue;
+                if (!MatchesViewBindingDiscoveryQuery(cursor, resolvedType, query))
+                    continue;
+                if (!string.IsNullOrEmpty(fieldType) && !TypeMatches(resolvedType, fieldType))
+                    continue;
+
+                matches.Add(BuildViewBindingDiscoverMatch(cursor, resolvedType, depth));
+                if (matches.Count >= maxResults)
+                    break;
+            }
+
+            return ToJsonValue(new ViewBindingDiscoverResponse
+            {
+                ok = true,
+                bindingId = request.bindingId ?? "",
+                message = matches.Count == 0 ? "No matching properties." : "ok",
+                target = request.target,
+                matches = matches.ToArray()
+            }, 0);
         }
 
         private static UnityEngine.Object ResolveViewBindingObject(ViewBindingTarget target)
@@ -397,22 +476,30 @@ namespace Locus
             if (parts.Length == 0)
                 throw new Exception("GameObject target objectPath is empty");
 
+            ObjectPathSegment rootSegment = ParseObjectPathSegment(parts[0]);
             GameObject current = scene.GetRootGameObjects()
-                .FirstOrDefault(root => string.Equals(NormalizeObjectPathSegment(root.name), NormalizeObjectPathSegment(parts[0]), StringComparison.Ordinal));
+                .Where(root => string.Equals(root.name, rootSegment.name, StringComparison.Ordinal))
+                .Skip(rootSegment.index)
+                .FirstOrDefault();
             if (current == null)
                 throw new Exception("Root GameObject not found: " + parts[0]);
 
             for (int i = 1; i < parts.Length; i++)
             {
-                string name = NormalizeObjectPathSegment(parts[i]);
+                ObjectPathSegment segment = ParseObjectPathSegment(parts[i]);
                 Transform child = null;
+                int matchIndex = 0;
                 for (int j = 0; j < current.transform.childCount; j++)
                 {
                     Transform candidate = current.transform.GetChild(j);
-                    if (string.Equals(candidate.name, name, StringComparison.Ordinal))
+                    if (string.Equals(candidate.name, segment.name, StringComparison.Ordinal))
                     {
-                        child = candidate;
-                        break;
+                        if (matchIndex == segment.index)
+                        {
+                            child = candidate;
+                            break;
+                        }
+                        matchIndex++;
                     }
                 }
                 if (child == null)
@@ -429,14 +516,19 @@ namespace Locus
             string typeName = target.componentType;
             if (string.IsNullOrWhiteSpace(typeName))
                 throw new Exception("Component target componentType is required");
+            if (target.componentIndex < 0)
+                throw new Exception("Component target componentIndex cannot be negative");
 
-            Component component = go.GetComponents<Component>()
-                .FirstOrDefault(candidate =>
+            Component[] components = go.GetComponents<Component>()
+                .Where(candidate =>
                     candidate != null &&
-                    (string.Equals(candidate.GetType().FullName, typeName, StringComparison.Ordinal) ||
-                     string.Equals(candidate.GetType().Name, typeName, StringComparison.Ordinal)));
+                    TypeMatches(candidate.GetType(), typeName))
+                .ToArray();
+            Component component = target.componentIndex < components.Length
+                ? components[target.componentIndex]
+                : null;
             if (component == null)
-                throw new Exception("Component not found: " + typeName);
+                throw new Exception("Component not found: " + typeName + "[" + target.componentIndex.ToString(CultureInfo.InvariantCulture) + "]");
             return component;
         }
 
@@ -454,14 +546,71 @@ namespace Locus
             throw new Exception("Scene is not loaded: " + scenePath);
         }
 
-        private static string NormalizeObjectPathSegment(string segment)
+        private struct ObjectPathSegment
         {
-            if (string.IsNullOrEmpty(segment))
-                return "";
-            int ordinal = segment.LastIndexOf('[');
-            return ordinal > 0 && segment.EndsWith("]", StringComparison.Ordinal)
-                ? segment.Substring(0, ordinal)
-                : segment;
+            public string name;
+            public int index;
+        }
+
+        private static ObjectPathSegment ParseObjectPathSegment(string segment)
+        {
+            string source = segment ?? "";
+            int ordinal = source.LastIndexOf('[');
+            if (ordinal > 0 && source.EndsWith("]", StringComparison.Ordinal))
+            {
+                string indexText = source.Substring(ordinal + 1, source.Length - ordinal - 2);
+                int index;
+                if (int.TryParse(indexText, NumberStyles.Integer, CultureInfo.InvariantCulture, out index))
+                {
+                    if (index < 0)
+                        throw new Exception("GameObject path index cannot be negative: " + segment);
+                    return new ObjectPathSegment
+                    {
+                        name = source.Substring(0, ordinal),
+                        index = index
+                    };
+                }
+            }
+
+            return new ObjectPathSegment
+            {
+                name = source,
+                index = 0
+            };
+        }
+
+        private static bool ApplyViewBindingSerializedChanges(SerializedObject serialized, UnityEngine.Object obj)
+        {
+            int undoGroup = Undo.GetCurrentGroup();
+            Undo.SetCurrentGroupName("Locus View Binding");
+            bool changed = serialized.ApplyModifiedProperties();
+            if (changed)
+            {
+                RecordViewBindingPrefabModifications(obj);
+                MarkViewBindingObjectDirty(obj);
+                Undo.CollapseUndoOperations(undoGroup);
+            }
+            serialized.Update();
+            return changed;
+        }
+
+        private static void RecordViewBindingPrefabModifications(UnityEngine.Object obj)
+        {
+            if (obj == null)
+                return;
+
+            try
+            {
+                Component component = obj as Component;
+                GameObject go = obj as GameObject;
+                if (go == null && component != null)
+                    go = component.gameObject;
+                if (go != null && PrefabUtility.GetNearestPrefabInstanceRoot(go) != null)
+                    PrefabUtility.RecordPrefabInstancePropertyModifications(obj);
+            }
+            catch
+            {
+            }
         }
 
         private static void MarkViewBindingObjectDirty(UnityEngine.Object obj)
@@ -480,22 +629,104 @@ namespace Locus
                 AssetDatabase.SaveAssetIfDirty(obj);
         }
 
+        private static ViewBindingDiscoverMatch BuildViewBindingDiscoverMatch(
+            SerializedProperty prop,
+            Type resolvedType,
+            int depth)
+        {
+            return new ViewBindingDiscoverMatch
+            {
+                propertyPath = prop.propertyPath,
+                displayName = prop.displayName ?? "",
+                name = prop.name ?? "",
+                type = prop.propertyType.ToString(),
+                valueType = prop.propertyType.ToString(),
+                fieldTypeFullName = FieldTypeFullName(resolvedType),
+                fieldTypeAssembly = FieldTypeAssembly(resolvedType),
+                displayValue = SerializedPropertyDisplayValue(prop),
+                editable = IsSerializedPropertyWritable(prop),
+                hasChildren = prop.hasVisibleChildren,
+                isArray = prop.isArray && prop.propertyType == SerializedPropertyType.Generic,
+                isManagedReference = prop.propertyType == SerializedPropertyType.ManagedReference,
+                depth = depth
+            };
+        }
+
+        private static bool MatchesViewBindingDiscoveryName(SerializedProperty prop, string fieldName)
+        {
+            if (string.IsNullOrWhiteSpace(fieldName))
+                return true;
+
+            string expected = fieldName.Trim();
+            return string.Equals(prop.name ?? "", expected, StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(prop.displayName ?? "", expected, StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(SerializedPropertyLeafName(prop.propertyPath), expected, StringComparison.OrdinalIgnoreCase) ||
+                   (prop.propertyPath ?? "").EndsWith("." + expected, StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool MatchesViewBindingDiscoveryQuery(SerializedProperty prop, Type resolvedType, string query)
+        {
+            if (string.IsNullOrEmpty(query))
+                return true;
+
+            return ContainsNormalized(prop.propertyPath, query) ||
+                   ContainsNormalized(prop.displayName, query) ||
+                   ContainsNormalized(prop.name, query) ||
+                   ContainsNormalized(prop.propertyType.ToString(), query) ||
+                   ContainsNormalized(FieldTypeFullName(resolvedType), query) ||
+                   ContainsNormalized(FieldTypeAssembly(resolvedType), query);
+        }
+
+        private static string SerializedPropertyLeafName(string propertyPath)
+        {
+            if (string.IsNullOrEmpty(propertyPath))
+                return "";
+            int dot = propertyPath.LastIndexOf('.');
+            return dot >= 0 ? propertyPath.Substring(dot + 1) : propertyPath;
+        }
+
+        private static int SerializedPropertyDepth(string propertyPath)
+        {
+            if (string.IsNullOrEmpty(propertyPath))
+                return 0;
+
+            string normalized = propertyPath.Replace(".Array.data[", "[");
+            int depth = 0;
+            for (int i = 0; i < normalized.Length; i++)
+            {
+                if (normalized[i] == '.')
+                    depth++;
+                else if (normalized[i] == '[')
+                    depth++;
+            }
+            return depth;
+        }
+
+        private static string NormalizeSearchText(string value)
+        {
+            return (value ?? "").Trim().ToLowerInvariant();
+        }
+
+        private static bool ContainsNormalized(string source, string query)
+        {
+            return !string.IsNullOrEmpty(source) &&
+                   source.ToLowerInvariant().IndexOf(query, StringComparison.Ordinal) >= 0;
+        }
+
         private static string BuildBindingReadJson(
             string bindingId,
             ViewBindingTarget target,
             SerializedProperty prop,
             bool saved)
         {
+            SerializedPropertySnapshot snapshot = SnapshotSerializedProperty(prop);
+            string snapshotFields = SerializedPropertySnapshotFieldsToJson(snapshot);
             return "{" +
                    "\"ok\":true," +
                    "\"bindingId\":" + NullableJsonString(bindingId) + "," +
                    "\"message\":\"ok\"," +
                    "\"target\":" + TargetToJson(target) + "," +
-                   "\"propertyPath\":\"" + JsonEscape(prop.propertyPath) + "\"," +
-                   "\"displayName\":\"" + JsonEscape(prop.displayName) + "\"," +
-                   "\"valueType\":\"" + JsonEscape(prop.propertyType.ToString()) + "\"," +
-                   "\"value\":" + SerializedPropertyValueToJson(prop) + "," +
-                   "\"editable\":" + (IsSerializedPropertyEditable(prop) ? "true" : "false") + "," +
+                   snapshotFields + "," +
                    "\"saved\":" + (saved ? "true" : "false") +
                    "}";
         }
@@ -509,217 +740,40 @@ namespace Locus
                    "\"target\":" + TargetToJson(target) + "," +
                    "\"propertyPath\":\"" + JsonEscape(target != null ? target.propertyPath : "") + "\"," +
                    "\"displayName\":\"\"," +
+                   "\"name\":\"\"," +
+                   "\"type\":\"Error\"," +
                    "\"valueType\":\"Error\"," +
+                   "\"fieldTypeFullName\":\"\"," +
+                   "\"fieldTypeAssembly\":\"\"," +
                    "\"value\":null," +
+                   "\"displayValue\":\"\"," +
                    "\"editable\":false," +
+                   "\"hasChildren\":false," +
+                   "\"isArray\":false," +
+                   "\"arraySize\":-1," +
+                   "\"isFlagsEnum\":false," +
+                   "\"enumValueIndex\":-1," +
+                   "\"enumValueFlag\":0," +
+                   "\"enumOptions\":[]," +
+                   "\"children\":[]," +
+                   "\"isManagedReference\":false," +
+                   "\"managedReferenceFullTypename\":\"\"," +
+                   "\"managedReferenceFieldTypename\":\"\"," +
+                   "\"managedReferenceDisplayName\":\"\"," +
+                   "\"managedReferenceTypes\":[]," +
                    "\"saved\":false" +
                    "}";
         }
 
-        private static bool IsSerializedPropertyEditable(SerializedProperty prop)
+        private static string SerializedPropertySnapshotFieldsToJson(SerializedPropertySnapshot snapshot)
         {
-            return prop.propertyType != SerializedPropertyType.Generic;
-        }
-
-        private static string SerializedPropertyValueToJson(SerializedProperty prop)
-        {
-            switch (prop.propertyType)
-            {
-                case SerializedPropertyType.Integer:
-                case SerializedPropertyType.ArraySize:
-                    return prop.intValue.ToString(CultureInfo.InvariantCulture);
-                case SerializedPropertyType.Boolean:
-                    return prop.boolValue ? "true" : "false";
-                case SerializedPropertyType.Float:
-                    return prop.floatValue.ToString(CultureInfo.InvariantCulture);
-                case SerializedPropertyType.String:
-                    return "\"" + JsonEscape(prop.stringValue) + "\"";
-                case SerializedPropertyType.Enum:
-                    return "{" +
-                           "\"index\":" + prop.enumValueIndex.ToString(CultureInfo.InvariantCulture) + "," +
-                           "\"name\":\"" + JsonEscape(prop.enumDisplayNames != null && prop.enumValueIndex >= 0 && prop.enumValueIndex < prop.enumDisplayNames.Length ? prop.enumDisplayNames[prop.enumValueIndex] : "") + "\"" +
-                           "}";
-                case SerializedPropertyType.ObjectReference:
-                    return "\"" + JsonEscape(prop.objectReferenceValue != null ? AssetDatabase.GetAssetPath(prop.objectReferenceValue) : "") + "\"";
-                case SerializedPropertyType.Vector2:
-                    return VectorToJson(prop.vector2Value);
-                case SerializedPropertyType.Vector3:
-                    return VectorToJson(prop.vector3Value);
-                case SerializedPropertyType.Vector4:
-                    return VectorToJson(prop.vector4Value);
-                case SerializedPropertyType.Color:
-                    return "\"" + JsonEscape("#" + ColorUtility.ToHtmlStringRGBA(prop.colorValue)) + "\"";
-                case SerializedPropertyType.Rect:
-                    Rect rect = prop.rectValue;
-                    return "{" +
-                           "\"x\":" + rect.x.ToString(CultureInfo.InvariantCulture) + "," +
-                           "\"y\":" + rect.y.ToString(CultureInfo.InvariantCulture) + "," +
-                           "\"width\":" + rect.width.ToString(CultureInfo.InvariantCulture) + "," +
-                           "\"height\":" + rect.height.ToString(CultureInfo.InvariantCulture) +
-                           "}";
-                default:
-                    return "null";
-            }
-        }
-
-        private static void SetSerializedPropertyValue(SerializedProperty prop, string valueJson)
-        {
-            string json = string.IsNullOrWhiteSpace(valueJson) ? "null" : valueJson.Trim();
-            switch (prop.propertyType)
-            {
-                case SerializedPropertyType.Integer:
-                case SerializedPropertyType.ArraySize:
-                    prop.intValue = ParseIntJson(json);
-                    break;
-                case SerializedPropertyType.Boolean:
-                    prop.boolValue = ParseBoolJson(json);
-                    break;
-                case SerializedPropertyType.Float:
-                    prop.floatValue = ParseFloatJson(json);
-                    break;
-                case SerializedPropertyType.String:
-                    prop.stringValue = ParseStringJson(json);
-                    break;
-                case SerializedPropertyType.Enum:
-                    SetEnumValue(prop, json);
-                    break;
-                case SerializedPropertyType.ObjectReference:
-                    string assetPath = ParseStringJson(json);
-                    prop.objectReferenceValue = string.IsNullOrWhiteSpace(assetPath)
-                        ? null
-                        : AssetDatabase.LoadAssetAtPath<UnityEngine.Object>(assetPath);
-                    break;
-                case SerializedPropertyType.Vector2:
-                    Vector2Json v2 = JsonUtility.FromJson<Vector2Json>(json);
-                    prop.vector2Value = new Vector2(v2.x, v2.y);
-                    break;
-                case SerializedPropertyType.Vector3:
-                    Vector3Json v3 = JsonUtility.FromJson<Vector3Json>(json);
-                    prop.vector3Value = new Vector3(v3.x, v3.y, v3.z);
-                    break;
-                case SerializedPropertyType.Vector4:
-                    Vector4Json v4 = JsonUtility.FromJson<Vector4Json>(json);
-                    prop.vector4Value = new Vector4(v4.x, v4.y, v4.z, v4.w);
-                    break;
-                case SerializedPropertyType.Color:
-                    prop.colorValue = ParseColorJson(json);
-                    break;
-                default:
-                    throw new Exception("SerializedProperty type is not writable: " + prop.propertyType);
-            }
-        }
-
-        private static int ParseIntJson(string json)
-        {
-            int value;
-            if (!int.TryParse(TrimJsonString(json), NumberStyles.Integer, CultureInfo.InvariantCulture, out value))
-                throw new Exception("Expected integer value");
-            return value;
-        }
-
-        private static float ParseFloatJson(string json)
-        {
-            float value;
-            if (!float.TryParse(TrimJsonString(json), NumberStyles.Float, CultureInfo.InvariantCulture, out value))
-                throw new Exception("Expected float value");
-            return value;
-        }
-
-        private static bool ParseBoolJson(string json)
-        {
-            bool value;
-            if (!bool.TryParse(TrimJsonString(json), out value))
-                throw new Exception("Expected boolean value");
-            return value;
-        }
-
-        private static string ParseStringJson(string json)
-        {
-            return TrimJsonString(json);
-        }
-
-        private static Color ParseColorJson(string json)
-        {
-            string text = TrimJsonString(json);
-            Color color;
-            if (!string.IsNullOrWhiteSpace(text) && ColorUtility.TryParseHtmlString(text, out color))
-                return color;
-
-            ColorJson value = JsonUtility.FromJson<ColorJson>(json);
-            return new Color(value.r, value.g, value.b, value.a);
-        }
-
-        private static void SetEnumValue(SerializedProperty prop, string json)
-        {
-            string text = TrimJsonString(json);
-            int index;
-            if (int.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out index))
-            {
-                prop.enumValueIndex = index;
-                return;
-            }
-
-            string[] names = prop.enumDisplayNames;
-            if (names != null)
-            {
-                for (int i = 0; i < names.Length; i++)
-                {
-                    if (string.Equals(names[i], text, StringComparison.OrdinalIgnoreCase))
-                    {
-                        prop.enumValueIndex = i;
-                        return;
-                    }
-                }
-            }
-            throw new Exception("Enum value not found: " + text);
-        }
-
-        private static string TrimJsonString(string json)
-        {
-            if (string.IsNullOrWhiteSpace(json) || string.Equals(json, "null", StringComparison.OrdinalIgnoreCase))
+            string json = SerializedPropertySnapshotToJson(snapshot);
+            if (string.IsNullOrWhiteSpace(json) || json.Length < 2)
                 return "";
-
             json = json.Trim();
-            if (json.Length >= 2 && json[0] == '"' && json[json.Length - 1] == '"')
-                return UnescapeJsonString(json.Substring(1, json.Length - 2));
+            if (json[0] == '{' && json[json.Length - 1] == '}')
+                return json.Substring(1, json.Length - 2);
             return json;
-        }
-
-        private static string UnescapeJsonString(string value)
-        {
-            return value
-                .Replace("\\\"", "\"")
-                .Replace("\\\\", "\\")
-                .Replace("\\n", "\n")
-                .Replace("\\r", "\r")
-                .Replace("\\t", "\t");
-        }
-
-        private static string VectorToJson(Vector2 value)
-        {
-            return "{" +
-                   "\"x\":" + value.x.ToString(CultureInfo.InvariantCulture) + "," +
-                   "\"y\":" + value.y.ToString(CultureInfo.InvariantCulture) +
-                   "}";
-        }
-
-        private static string VectorToJson(Vector3 value)
-        {
-            return "{" +
-                   "\"x\":" + value.x.ToString(CultureInfo.InvariantCulture) + "," +
-                   "\"y\":" + value.y.ToString(CultureInfo.InvariantCulture) + "," +
-                   "\"z\":" + value.z.ToString(CultureInfo.InvariantCulture) +
-                   "}";
-        }
-
-        private static string VectorToJson(Vector4 value)
-        {
-            return "{" +
-                   "\"x\":" + value.x.ToString(CultureInfo.InvariantCulture) + "," +
-                   "\"y\":" + value.y.ToString(CultureInfo.InvariantCulture) + "," +
-                   "\"z\":" + value.z.ToString(CultureInfo.InvariantCulture) + "," +
-                   "\"w\":" + value.w.ToString(CultureInfo.InvariantCulture) +
-                   "}";
         }
 
         private static string TargetToJson(ViewBindingTarget target)
@@ -732,6 +786,7 @@ namespace Locus
                    "\"scenePath\":" + NullableJsonString(target.scenePath) + "," +
                    "\"objectPath\":" + NullableJsonString(target.objectPath) + "," +
                    "\"componentType\":" + NullableJsonString(target.componentType) + "," +
+                   "\"componentIndex\":" + target.componentIndex.ToString(CultureInfo.InvariantCulture) + "," +
                    "\"propertyPath\":" + NullableJsonString(target.propertyPath) +
                    "}";
         }

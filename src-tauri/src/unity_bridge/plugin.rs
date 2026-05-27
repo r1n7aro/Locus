@@ -23,6 +23,8 @@ const PLUGIN_LEGACY_ASSETS_INSTALL_DIRS: &[&str] = &["Assets/Locus", "Assets/Plu
 const PLUGIN_REQUIRED_SOURCE_FILES: &[&str] = &[
     "package.json",
     "Editor/Locus.Editor.asmdef",
+    "Editor/Json/Locus.Json.dll",
+    "Editor/Json/Locus.Json.dll.meta",
     "Editor/Roslyn/Locus.Roslyn.dll",
     "Editor/Roslyn/Locus.Roslyn.dll.meta",
 ];
@@ -229,8 +231,17 @@ fn should_skip_plugin_source_entry(source_dir: &Path, path: &Path) -> bool {
         return true;
     }
 
-    rel.starts_with("Editor/Roslyn/Locus.Roslyn.dll.")
+    if rel.starts_with("Editor/Roslyn/Locus.Roslyn.dll.")
         && rel != "Editor/Roslyn/Locus.Roslyn.dll.meta"
+    {
+        return true;
+    }
+
+    if rel.starts_with("Editor/Json/ILRepack-") {
+        return true;
+    }
+
+    rel.starts_with("Editor/Json/Locus.Json.dll.") && rel != "Editor/Json/Locus.Json.dll.meta"
 }
 
 fn validate_plugin_source_dir(source_dir: &Path) -> Result<(), String> {
@@ -567,6 +578,11 @@ mod tests {
     fn create_minimal_plugin_source(source_root: &Path) {
         write_file(&source_root.join("package.json"), b"{}");
         write_file(&source_root.join("Editor/Locus.Editor.asmdef"), b"{}");
+        write_file(&source_root.join("Editor/Json/Locus.Json.dll"), b"dll");
+        write_file(
+            &source_root.join("Editor/Json/Locus.Json.dll.meta"),
+            b"meta",
+        );
         write_file(&source_root.join("Editor/Roslyn/Locus.Roslyn.dll"), b"dll");
         write_file(
             &source_root.join("Editor/Roslyn/Locus.Roslyn.dll.meta"),
@@ -677,6 +693,11 @@ mod tests {
 
         write_file(&source.path().join("package.json"), b"{}");
         write_file(&source.path().join("Editor/Locus.Editor.asmdef"), b"{}");
+        write_file(&source.path().join("Editor/Json/Locus.Json.dll"), b"dll");
+        write_file(
+            &source.path().join("Editor/Json/Locus.Json.dll.meta"),
+            b"meta",
+        );
         write_file(
             &source.path().join("Editor/Roslyn/Locus.Roslyn.dll.meta"),
             b"meta",
@@ -702,6 +723,14 @@ mod tests {
             &source.path().join("Editor/Roslyn/Locus.Roslyn.dll.tmp"),
             b"temp",
         );
+        write_file(
+            &source.path().join("Editor/Json/ILRepack-123456/temp.dll"),
+            b"temp",
+        );
+        write_file(
+            &source.path().join("Editor/Json/Locus.Json.dll.tmp"),
+            b"temp",
+        );
 
         copy_plugin_dir(source.path(), target.path()).unwrap();
 
@@ -709,15 +738,21 @@ mod tests {
             .path()
             .join("Editor/Roslyn/Locus.Roslyn.dll")
             .is_file());
+        assert!(target.path().join("Editor/Json/Locus.Json.dll").is_file());
         assert!(!target.path().join("Editor/Roslyn/ILRepack-123456").exists());
         assert!(!target
             .path()
             .join("Editor/Roslyn/Locus.Roslyn.dll.tmp")
             .exists());
+        assert!(!target.path().join("Editor/Json/ILRepack-123456").exists());
+        assert!(!target
+            .path()
+            .join("Editor/Json/Locus.Json.dll.tmp")
+            .exists());
     }
 
     #[test]
-    fn install_copies_merged_roslyn_without_original_inputs() {
+    fn install_copies_merged_editor_bundles_without_original_inputs() {
         let temp = tempfile::tempdir().unwrap();
         let source_dir = fixture_source_dir();
         create_unity_project(temp.path());
@@ -734,8 +769,12 @@ mod tests {
         assert!(installed_root
             .join("Editor/Roslyn/Locus.Roslyn.dll")
             .is_file());
+        assert!(installed_root.join("Editor/Json/Locus.Json.dll").is_file());
         assert!(!installed_root
             .join("Editor/Roslyn/Microsoft.CodeAnalysis.dll")
+            .exists());
+        assert!(!installed_root
+            .join("Editor/Json/Newtonsoft.Json.dll")
             .exists());
 
         let status = check_plugin_status_with_source_dir(&source_dir, temp.path()).unwrap();
@@ -802,6 +841,10 @@ mod tests {
         assert!(temp
             .path()
             .join("Packages/com.farlocus.locus/Editor/Roslyn/Locus.Roslyn.dll",)
+            .is_file());
+        assert!(temp
+            .path()
+            .join("Packages/com.farlocus.locus/Editor/Json/Locus.Json.dll",)
             .is_file());
     }
 }
