@@ -537,7 +537,9 @@ pub async fn set_working_dir(
                     tracing::info!(
                         log_module = "Locus",
                         "ref_graph DB light-reconciled for new working dir: queued={}, processed={}, failed={}",
-                        stats.queued, stats.processed, stats.failed
+                        stats.queued,
+                        stats.processed,
+                        stats.failed
                     );
                     let db_path = std::path::Path::new(&canonical)
                         .join("Library")
@@ -717,33 +719,85 @@ pub fn save_recent_dir_pub(data_dir: &std::path::Path, dir: &str) {
     save_recent_dir(data_dir, dir);
 }
 
-fn save_recent_dir(data_dir: &std::path::Path, dir: &str) {
-    let file = data_dir.join("recent_dirs.json");
-    let mut dirs: Vec<String> = std::fs::read_to_string(&file)
+fn recent_dirs_file(data_dir: &std::path::Path) -> std::path::PathBuf {
+    data_dir.join("recent_dirs.json")
+}
+
+fn read_recent_dirs(data_dir: &std::path::Path) -> Vec<String> {
+    std::fs::read_to_string(recent_dirs_file(data_dir))
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
+        .unwrap_or_default()
+}
+
+fn write_recent_dirs(data_dir: &std::path::Path, dirs: &[String]) -> Result<(), AppError> {
+    let file = recent_dirs_file(data_dir);
+    let text = serde_json::to_string(dirs)
+        .map_err(|e| AppError::new("workspace.recent_dirs_serialize_failed", e.to_string()))?;
+    std::fs::write(&file, text).map_err(|e| {
+        AppError::new(
+            "workspace.recent_dirs_write_failed",
+            format!("Failed to save recent directories: {}", e),
+        )
+    })
+}
+
+fn existing_recent_dirs(dirs: Vec<String>) -> Vec<String> {
+    dirs.into_iter()
+        .filter(|d| std::path::Path::new(d).is_dir())
+        .collect()
+}
+
+fn save_recent_dir(data_dir: &std::path::Path, dir: &str) {
+    let mut dirs = read_recent_dirs(data_dir);
 
     dirs.retain(|d| d != dir);
     dirs.insert(0, dir.to_string());
     dirs.truncate(MAX_RECENT_DIRS);
 
-    let _ = std::fs::write(&file, serde_json::to_string(&dirs).unwrap_or_default());
+    let _ = write_recent_dirs(data_dir, &dirs);
 }
 
 #[tauri::command]
 pub async fn list_recent_dirs(app_handle: AppHandle) -> Result<Vec<String>, AppError> {
     let data_dir = super::resolve_runtime_storage_dir(&app_handle)
         .map_err(|e| format!("Failed to get app data dir: {}", e))?;
-    let file = data_dir.join("recent_dirs.json");
-    let dirs: Vec<String> = std::fs::read_to_string(&file)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
-    Ok(dirs
-        .into_iter()
-        .filter(|d| std::path::Path::new(d).is_dir())
-        .collect())
+    Ok(existing_recent_dirs(read_recent_dirs(&data_dir)))
+}
+
+#[tauri::command]
+pub async fn remove_recent_dir(
+    path: String,
+    app_handle: AppHandle,
+) -> Result<Vec<String>, AppError> {
+    let target = path.trim();
+    if target.is_empty() {
+        return Err("Path cannot be empty".to_string().into());
+    }
+
+    let data_dir = super::resolve_runtime_storage_dir(&app_handle)
+        .map_err(|e| format!("Failed to get app data dir: {}", e))?;
+    let mut dirs = read_recent_dirs(&data_dir);
+    dirs.retain(|d| d != target);
+    write_recent_dirs(&data_dir, &dirs)?;
+    Ok(existing_recent_dirs(dirs))
+}
+
+#[tauri::command]
+pub async fn open_dir_in_file_explorer(path: String) -> Result<(), AppError> {
+    let target = path.trim();
+    if target.is_empty() {
+        return Err("Path cannot be empty".to_string().into());
+    }
+
+    let path = std::path::Path::new(target);
+    if !path.is_dir() {
+        return Err(format!("Directory not found: {}", target).into());
+    }
+
+    let canonical =
+        dunce::canonicalize(path).map_err(|e| format!("Failed to resolve path: {}", e))?;
+    crate::commands::knowledge::reveal_path_native(&canonical).map_err(Into::into)
 }
 
 #[tauri::command]
@@ -1071,6 +1125,7 @@ pub(crate) fn normalize_custom_endpoint_config(endpoint: &mut CustomEndpoint) {
     if endpoint.replay_reasoning_content.is_none() {
         endpoint.replay_reasoning_content = Some(default_replay_reasoning_content(endpoint));
     }
+    endpoint.supports_tool_lazy_loading = false;
 }
 
 #[tauri::command]
@@ -2065,6 +2120,54 @@ pub async fn check_unity_connection_status(
     Ok(crate::unity_bridge::query_unity_connection_status(&cwd).await)
 }
 
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnityConsoleTextEntry {
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnityConsoleTextPayload {
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub entries: Vec<UnityConsoleTextEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
+#[tauri::command]
+pub async fn get_unity_console_text(
+    workspace: State<'_, Arc<Workspace>>,
+) -> Result<UnityConsoleTextPayload, AppError> {
+    let cwd = workspace.path.read().await.clone();
+    let resp = crate::unity_bridge::send_message(&cwd, "get_console_text", "").await?;
+    if !resp.ok {
+        return Err(resp
+            .error
+            .unwrap_or_else(|| "Failed to read Unity Console".to_string())
+            .into());
+    }
+
+    let message = resp.message.unwrap_or_default();
+    let mut payload: UnityConsoleTextPayload = serde_json::from_str(&message).map_err(|error| {
+        AppError::from(format!("Failed to parse Unity Console response: {error}"))
+    })?;
+    payload
+        .entries
+        .retain(|entry| !entry.text.trim().is_empty());
+    Ok(payload)
+}
+
 #[tauri::command]
 pub async fn check_unity_plugin(
     workspace: State<'_, Arc<Workspace>>,
@@ -2293,7 +2396,9 @@ pub async fn reset_all_config(
     auth.lock().await.logout();
     codex.lock().await.logout();
 
-    eprintln!("[Locus] All config reset (keychain + config files + runtime state + WebView browsing data)");
+    eprintln!(
+        "[Locus] All config reset (keychain + config files + runtime state + WebView browsing data)"
+    );
     Ok(())
 }
 
@@ -2397,6 +2502,24 @@ mod tests {
         assert!(!endpoints[0].server_tools.web_search);
         assert!(!endpoints[0].supports_tool_lazy_loading);
         assert!(endpoints[0].supports_vision);
+    }
+
+    #[test]
+    fn custom_endpoint_disables_tool_lazy_loading_for_all_formats() {
+        let raw = r#"[{
+            "id": "custom-1",
+            "name": "Custom",
+            "apiModel": "model",
+            "endpoint": "https://example.com/v1",
+            "apiFormat": "openai_responses",
+            "supportsToolLazyLoading": true
+        }]"#;
+
+        let mut endpoints: Vec<CustomEndpoint> =
+            serde_json::from_str(raw).expect("deserialize custom endpoint");
+        normalize_custom_endpoint_config(&mut endpoints[0]);
+
+        assert!(!endpoints[0].supports_tool_lazy_loading);
     }
 
     #[test]

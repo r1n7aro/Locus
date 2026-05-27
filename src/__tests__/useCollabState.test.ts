@@ -787,6 +787,51 @@ describe("useCollabState", () => {
     expect(state.workspaceChangeCount.value).toBe(2);
   });
 
+  it("surfaces git status warnings through the shared banner", async () => {
+    gitServiceMocks.gitHistorySnapshot.mockResolvedValue(snapshot([], null));
+    gitServiceMocks.gitStatus.mockResolvedValue({
+      unstaged: [{ path: "src/App.vue", status: "M", lfs: false }],
+      staged: [],
+      blocked: [],
+      unmerged: [],
+      operation: null,
+      warnings: [{
+        code: "git.index_lock",
+        message: "Git index is locked: F:/repo/.git/index.lock",
+        detail: "fatal: Unable to create 'F:/repo/.git/index.lock': File exists.",
+        operation: "git_status",
+        retryable: true,
+        severity: "warning",
+      }],
+    });
+
+    const props = reactive({
+      workingDir: "",
+      isActive: false,
+      selectedModelId: "",
+      selectedAgentId: "",
+      models: [],
+    });
+
+    const state = useCollabState(props);
+
+    props.workingDir = "F:/repo";
+    await nextTick();
+    await flushPromises();
+
+    expect(state.unstagedFiles.value.map(file => file.path)).toEqual(["src/App.vue"]);
+    expect(notificationStoreMock.addNotice).toHaveBeenCalledWith(
+      "warning",
+      "collab.gitIndexLocked",
+      expect.objectContaining({
+        code: "git.index_lock",
+        operation: "git_status",
+        replaceOperation: true,
+        ttl: 10_000,
+      }),
+    );
+  });
+
   it("reports partial stage-all results as warnings instead of failures", async () => {
     const terminalOutput = vi.fn();
 

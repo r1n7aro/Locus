@@ -170,6 +170,14 @@ export const useProjectStore = defineStore("project", () => {
     }
   }
 
+  async function removeRecentDir(path: string) {
+    recentDirs.value = await projectService.removeRecentDir(path);
+  }
+
+  async function openDirInFileExplorer(path: string) {
+    await projectService.openDirInFileExplorer(path);
+  }
+
   async function startScan() {
     if (scanInFlight || isScanRunning(scanPhase.value)) return;
     scanInFlight = true;
@@ -348,6 +356,8 @@ export const useProjectStore = defineStore("project", () => {
     loadWorkingDir,
     setWorkingDir,
     loadRecentDirs,
+    removeRecentDir,
+    openDirInFileExplorer,
     startScan,
     checkUnityConnection,
     checkUnityPlugin,

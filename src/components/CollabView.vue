@@ -15,6 +15,7 @@ import MergeQueuePanel from "./collab/MergeQueuePanel.vue";
 import MergeResolutionPanel from "./collab/MergeResolutionPanel.vue";
 import WorkspaceRequiredState from "./WorkspaceRequiredState.vue";
 import FileDiffViewer from "./diff/FileDiffViewer.vue";
+import BaseContextMenu from "./ui/BaseContextMenu.vue";
 import { useCollabState } from "../composables/useCollabState";
 import { useProjectStore } from "../stores/project";
 import { useNotificationStore } from "../stores/notification";
@@ -37,7 +38,6 @@ import { collectUnanchoredStashHashes } from "./collab/graph/normalize";
 import { extractLocalBranchNamesForHash } from "./collab/graph/refs";
 import { resolveBranchDblclickAction, resolveBranchTargetHash } from "./collab/branchInteraction";
 import type { GitGraphPublicApi, GitGraphSelectionTarget, GitGraphSelectOptions } from "./collab/gitGraphSelection";
-import { clampFloatingPosition } from "./ui/floatingPosition";
 import {
   COLLAB_SEARCH_SELECT_EVENT,
   openCollabSearchWindow,
@@ -335,13 +335,7 @@ type CollabContextMenuState = {
   target: CollabContextMenuTarget;
 };
 
-const CONTEXT_MENU_VIEWPORT_MARGIN = 8;
 const ctxMenu = ref<CollabContextMenuState | null>(null);
-const ctxMenuRef = ref<HTMLElement | null>(null);
-const ctxMenuStyle = computed(() => ({
-  left: `${ctxMenu.value?.x ?? 0}px`,
-  top: `${ctxMenu.value?.y ?? 0}px`,
-}));
 
 const promptDialog = ref<{
   title: string;
@@ -360,32 +354,8 @@ const confirmDialog = ref<{
 
 function closeCtxMenu() { ctxMenu.value = null; }
 
-function viewportSize() {
-  return {
-    width: window.innerWidth || document.documentElement.clientWidth,
-    height: window.innerHeight || document.documentElement.clientHeight,
-  };
-}
-
-function updateCtxMenuPosition() {
-  const menu = ctxMenu.value;
-  const el = ctxMenuRef.value;
-  if (!menu || !el) return;
-
-  const rect = el.getBoundingClientRect();
-  const next = clampFloatingPosition(
-    { x: menu.x, y: menu.y },
-    { width: rect.width, height: rect.height },
-    viewportSize(),
-    CONTEXT_MENU_VIEWPORT_MARGIN,
-  );
-  if (next.x === menu.x && next.y === menu.y) return;
-  ctxMenu.value = { ...menu, x: next.x, y: next.y };
-}
-
 function openCtxMenu(event: MouseEvent, target: CollabContextMenuTarget) {
   ctxMenu.value = { x: event.clientX, y: event.clientY, target };
-  void nextTick(updateCtxMenuPosition);
 }
 
 function addPendingDiscardPaths(paths: string[]) {
@@ -1116,82 +1086,90 @@ function copyBranchName() {
     </template>
 
     <!-- Context menu -->
-    <Teleport to="body">
-      <div v-if="ctxMenu" class="ctx-backdrop" @click="closeCtxMenu" @contextmenu.prevent="closeCtxMenu">
-        <div ref="ctxMenuRef" class="ctx-menu" :style="ctxMenuStyle" @click.stop>
-          <!-- disabled reason hint -->
-          <div v-if="hasConflictState" class="ctx-item ctx-hint">{{ conflictActionHint }}</div>
-          <div v-if="hasConflictState" class="ctx-sep" />
-          <!-- commit -->
-          <template v-if="ctxMenu.target.kind === 'commit'">
-            <template v-for="br in commitLocalBranches()" :key="br">
-              <div class="ctx-item" :class="{ disabled: hasConflictState }" @click="doCheckoutBranch(br)">Checkout Branch「{{ br }}」</div>
-            </template>
-            <div class="ctx-item" :class="{ disabled: hasConflictState }" @click="doCommitAction('checkoutDetached')">Checkout Detached HEAD</div>
-            <div class="ctx-sep" />
-            <div class="ctx-item" :class="{ disabled: hasConflictState }" @click="doCommitAction('reset', 'soft')">Soft Reset</div>
-            <div class="ctx-item" :class="{ disabled: hasConflictState }" @click="doCommitAction('reset', 'mixed')">Mixed Reset</div>
-            <div class="ctx-item ctx-danger" :class="{ disabled: hasConflictState }" @click="confirmResetHard()">Hard Reset</div>
-            <div class="ctx-sep" />
-            <div class="ctx-item" :class="{ disabled: hasConflictState }" @click="doCommitAction('revert')">Revert Commit</div>
-            <div class="ctx-item" :class="{ disabled: hasConflictState }" @click="promptNewBranch()">Create Branch…</div>
-          </template>
-          <!-- stash -->
-          <template v-else-if="ctxMenu.target.kind === 'stash'">
-            <template v-if="(ctxMenu.target.selectedStashes?.length ?? 1) <= 1">
-              <div class="ctx-item" :class="{ disabled: hasConflictState }" @click="doStashAction('apply')">Apply Stash</div>
-              <div class="ctx-item" :class="{ disabled: hasConflictState }" @click="doStashAction('pop')">Pop Stash</div>
-              <div class="ctx-item ctx-danger" :class="{ disabled: hasConflictState }" @click="confirmDropStash()">Drop Stash</div>
-            </template>
-            <template v-else>
-              <div class="ctx-item ctx-danger" :class="{ disabled: hasConflictState }" @click="confirmDropStash()">Drop {{ ctxMenu.target.selectedStashes?.length }} Stashes</div>
-            </template>
-          </template>
-          <!-- local branch -->
-          <template v-else-if="ctxMenu.target.kind === 'localBranch'">
-            <div class="ctx-item" :class="{ disabled: hasConflictState || ctxMenu.target.branch.isCurrent }" @click="doBranchAction('switch')">Switch to Branch</div>
-            <div class="ctx-item" :class="{ disabled: hasConflictState }" @click="doBranchAction('mergeIntoCurrent')">Merge into Current</div>
-            <div class="ctx-item" :class="{ disabled: hasConflictState }" @click="doBranchAction('rebaseCurrentOnto')">Rebase Current onto This</div>
-            <div class="ctx-sep" />
-            <div class="ctx-item" :class="{ disabled: hasConflictState }" @click="promptRenameBranch()">Rename Branch…</div>
-            <div class="ctx-item ctx-danger" :class="{ disabled: hasConflictState || ctxMenu.target.branch.isCurrent }" @click="confirmDeleteBranch()">Delete Branch</div>
-            <div class="ctx-sep" />
-            <div class="ctx-item" @click="copyBranchName()">Copy Branch Name</div>
-          </template>
-          <!-- remote branch -->
-          <template v-else-if="ctxMenu.target.kind === 'remoteBranch'">
-            <div class="ctx-item" :class="{ disabled: hasConflictState }" @click="doBranchAction('checkoutTracking')">Checkout as Local Tracking</div>
-            <div class="ctx-item" :class="{ disabled: hasConflictState }" @click="doBranchAction('mergeIntoCurrent')">Merge into Current</div>
-            <div class="ctx-item" :class="{ disabled: hasConflictState }" @click="doBranchAction('rebaseCurrentOnto')">Rebase Current onto This</div>
-            <div class="ctx-sep" />
-            <div class="ctx-item" @click="copyBranchName()">Copy Remote Branch Name</div>
-          </template>
-          <!-- file -->
-          <template v-else-if="ctxMenu.target.kind === 'file'">
-            <div class="ctx-item" @click="doShowInFolder()">Show In Folder</div>
-            <div class="ctx-sep" />
-            <div
-              v-if="ctxMenu.target.source === 'gitUnstaged'"
-              class="ctx-item"
-              :class="{ disabled: workspaceMutationBusy }"
-              @click="doFileStage()"
-            >{{ ctxMenu.target.selectedFiles.length > 1 ? `Stage ${ctxMenu.target.selectedFiles.length} Files` : 'Stage' }}</div>
-            <div
-              v-else
-              class="ctx-item"
-              :class="{ disabled: workspaceMutationBusy }"
-              @click="doFileUnstage()"
-            >{{ ctxMenu.target.selectedFiles.length > 1 ? `Unstage ${ctxMenu.target.selectedFiles.length} Files` : 'Unstage' }}</div>
-            <div class="ctx-sep" />
-            <div
-              class="ctx-item ctx-danger"
-              :class="{ disabled: workspaceMutationBusy }"
-              @click="confirmDiscardFile()"
-            >{{ ctxMenu.target.selectedFiles.length > 1 ? `Discard ${ctxMenu.target.selectedFiles.length} Files` : 'Discard Changes' }}</div>
-          </template>
-        </div>
-      </div>
+    <BaseContextMenu
+      v-if="ctxMenu"
+      class="ctx-menu"
+      :x="ctxMenu.x"
+      :y="ctxMenu.y"
+      :min-width="180"
+      @close="closeCtxMenu"
+    >
+      <!-- disabled reason hint -->
+      <div v-if="hasConflictState" class="ctx-hint">{{ conflictActionHint }}</div>
+      <div v-if="hasConflictState" class="ctx-sep" />
+      <!-- commit -->
+      <template v-if="ctxMenu.target.kind === 'commit'">
+        <template v-for="br in commitLocalBranches()" :key="br">
+          <button type="button" class="ctx-item" :disabled="hasConflictState" @click="doCheckoutBranch(br)">Checkout Branch「{{ br }}」</button>
+        </template>
+        <button type="button" class="ctx-item" :disabled="hasConflictState" @click="doCommitAction('checkoutDetached')">Checkout Detached HEAD</button>
+        <div class="ctx-sep" />
+        <button type="button" class="ctx-item" :disabled="hasConflictState" @click="doCommitAction('reset', 'soft')">Soft Reset</button>
+        <button type="button" class="ctx-item" :disabled="hasConflictState" @click="doCommitAction('reset', 'mixed')">Mixed Reset</button>
+        <button type="button" class="ctx-item ctx-danger" :disabled="hasConflictState" @click="confirmResetHard()">Hard Reset</button>
+        <div class="ctx-sep" />
+        <button type="button" class="ctx-item" :disabled="hasConflictState" @click="doCommitAction('revert')">Revert Commit</button>
+        <button type="button" class="ctx-item" :disabled="hasConflictState" @click="promptNewBranch()">Create Branch…</button>
+      </template>
+      <!-- stash -->
+      <template v-else-if="ctxMenu.target.kind === 'stash'">
+        <template v-if="(ctxMenu.target.selectedStashes?.length ?? 1) <= 1">
+          <button type="button" class="ctx-item" :disabled="hasConflictState" @click="doStashAction('apply')">Apply Stash</button>
+          <button type="button" class="ctx-item" :disabled="hasConflictState" @click="doStashAction('pop')">Pop Stash</button>
+          <button type="button" class="ctx-item ctx-danger" :disabled="hasConflictState" @click="confirmDropStash()">Drop Stash</button>
+        </template>
+        <template v-else>
+          <button type="button" class="ctx-item ctx-danger" :disabled="hasConflictState" @click="confirmDropStash()">Drop {{ ctxMenu.target.selectedStashes?.length }} Stashes</button>
+        </template>
+      </template>
+      <!-- local branch -->
+      <template v-else-if="ctxMenu.target.kind === 'localBranch'">
+        <button type="button" class="ctx-item" :disabled="hasConflictState || ctxMenu.target.branch.isCurrent" @click="doBranchAction('switch')">Switch to Branch</button>
+        <button type="button" class="ctx-item" :disabled="hasConflictState" @click="doBranchAction('mergeIntoCurrent')">Merge into Current</button>
+        <button type="button" class="ctx-item" :disabled="hasConflictState" @click="doBranchAction('rebaseCurrentOnto')">Rebase Current onto This</button>
+        <div class="ctx-sep" />
+        <button type="button" class="ctx-item" :disabled="hasConflictState" @click="promptRenameBranch()">Rename Branch…</button>
+        <button type="button" class="ctx-item ctx-danger" :disabled="hasConflictState || ctxMenu.target.branch.isCurrent" @click="confirmDeleteBranch()">Delete Branch</button>
+        <div class="ctx-sep" />
+        <button type="button" class="ctx-item" @click="copyBranchName()">Copy Branch Name</button>
+      </template>
+      <!-- remote branch -->
+      <template v-else-if="ctxMenu.target.kind === 'remoteBranch'">
+        <button type="button" class="ctx-item" :disabled="hasConflictState" @click="doBranchAction('checkoutTracking')">Checkout as Local Tracking</button>
+        <button type="button" class="ctx-item" :disabled="hasConflictState" @click="doBranchAction('mergeIntoCurrent')">Merge into Current</button>
+        <button type="button" class="ctx-item" :disabled="hasConflictState" @click="doBranchAction('rebaseCurrentOnto')">Rebase Current onto This</button>
+        <div class="ctx-sep" />
+        <button type="button" class="ctx-item" @click="copyBranchName()">Copy Remote Branch Name</button>
+      </template>
+      <!-- file -->
+      <template v-else-if="ctxMenu.target.kind === 'file'">
+        <button type="button" class="ctx-item" @click="doShowInFolder()">Show In Folder</button>
+        <div class="ctx-sep" />
+        <button
+          v-if="ctxMenu.target.source === 'gitUnstaged'"
+          type="button"
+          class="ctx-item"
+          :disabled="workspaceMutationBusy"
+          @click="doFileStage()"
+        >{{ ctxMenu.target.selectedFiles.length > 1 ? `Stage ${ctxMenu.target.selectedFiles.length} Files` : 'Stage' }}</button>
+        <button
+          v-else
+          type="button"
+          class="ctx-item"
+          :disabled="workspaceMutationBusy"
+          @click="doFileUnstage()"
+        >{{ ctxMenu.target.selectedFiles.length > 1 ? `Unstage ${ctxMenu.target.selectedFiles.length} Files` : 'Unstage' }}</button>
+        <div class="ctx-sep" />
+        <button
+          type="button"
+          class="ctx-item ctx-danger"
+          :disabled="workspaceMutationBusy"
+          @click="confirmDiscardFile()"
+        >{{ ctxMenu.target.selectedFiles.length > 1 ? `Discard ${ctxMenu.target.selectedFiles.length} Files` : 'Discard Changes' }}</button>
+      </template>
+    </BaseContextMenu>
 
+    <Teleport to="body">
       <!-- Prompt dialog -->
       <div v-if="promptDialog" class="commit-modal-overlay" @click.self="promptDialog = null">
         <div class="commit-modal" style="max-width: 400px">
@@ -3350,62 +3328,6 @@ function copyBranchName() {
 }
 .collab-btn.secondary:hover {
   background: var(--hover-bg, rgba(255,255,255,0.05));
-}
-
-/* ── Context menu ── */
-.ctx-backdrop {
-  position: fixed;
-  inset: 0;
-  z-index: 9999;
-}
-.ctx-menu {
-  position: fixed;
-  box-sizing: border-box;
-  min-width: min(180px, calc(100vw - 16px));
-  max-width: calc(100vw - 16px);
-  max-height: calc(100vh - 16px);
-  overflow: auto;
-  background: var(--sidebar-bg, #1e1e2e);
-  border: 1px solid var(--border-color, #333);
-  border-radius: 8px;
-  padding: 4px 0;
-  box-shadow: 0 4px 16px rgba(0,0,0,.25);
-  z-index: 10000;
-}
-.ctx-item {
-  padding: 6px 16px;
-  font-size: 13px;
-  cursor: pointer;
-  color: var(--text-color, #ccc);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  border-radius: 4px;
-  margin: 1px 4px;
-  transition: background 0.15s ease, color 0.15s ease;
-}
-.ctx-item:hover {
-  background: color-mix(in srgb, currentColor 10%, transparent);
-}
-.ctx-danger:hover {
-  background: rgba(238, 85, 85, 0.12);
-}
-.ctx-danger {
-  color: #e55;
-}
-.ctx-sep {
-  height: 1px;
-  background: var(--border-color, #333);
-  margin: 4px 0;
-}
-.ctx-hint {
-  color: #e5a545;
-  cursor: default;
-  pointer-events: none;
-}
-.ctx-item.disabled {
-  opacity: 0.4;
-  pointer-events: none;
 }
 
 </style>

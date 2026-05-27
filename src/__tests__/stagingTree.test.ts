@@ -24,9 +24,9 @@ describe("stagingTree", () => {
 
     expect(rows.map((row) => `${row.kind}:${row.kind === "folder" ? `${row.name}@${row.path}` : row.file.path}:${row.depth}`)).toEqual([
       "folder:Assets/Locus/Editor@Assets/Locus/Editor:0",
-      "file:Assets/Locus/Editor/LocusBridge.cs:1",
       "folder:Roslyn@Assets/Locus/Editor/Roslyn:1",
       "file:Assets/Locus/Editor/Roslyn/THIRD_PARTY.md:2",
+      "file:Assets/Locus/Editor/LocusBridge.cs:1",
       "file:README.md:0",
     ]);
   });
@@ -60,6 +60,25 @@ describe("stagingTree", () => {
       "file:Assets/Locus/Editor/LocusBridge.cs:2",
       "folder:Scenes@Assets/Scenes:1",
       "file:Assets/Scenes/Main.unity:2",
+    ]);
+  });
+
+  it("places sibling folders before sibling files while preserving incoming order within each group", () => {
+    const rows = buildStagingTreeRows([
+      makeFile("Locus/View/entity-prefab-table/unity/view.json"),
+      makeFile("Locus/View/entity-prefab-table/view.json"),
+      makeFile("Locus/View/entity-prefab-table/src/App.vue"),
+      makeFile("Locus/View/entity-prefab-table/README.md"),
+    ]);
+
+    expect(rows.map((row) => `${row.kind}:${row.kind === "folder" ? `${row.name}@${row.path}` : row.file.path}:${row.depth}`)).toEqual([
+      "folder:Locus/View/entity-prefab-table@Locus/View/entity-prefab-table:0",
+      "folder:unity@Locus/View/entity-prefab-table/unity:1",
+      "file:Locus/View/entity-prefab-table/unity/view.json:2",
+      "folder:src@Locus/View/entity-prefab-table/src:1",
+      "file:Locus/View/entity-prefab-table/src/App.vue:2",
+      "file:Locus/View/entity-prefab-table/view.json:1",
+      "file:Locus/View/entity-prefab-table/README.md:1",
     ]);
   });
 

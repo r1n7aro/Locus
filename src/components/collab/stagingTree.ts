@@ -93,6 +93,14 @@ function hasFileChildren<TFile extends StagingTreeFile>(node: StagingTreeNode<TF
   return node.children.some((child) => child.kind === "file");
 }
 
+function compareTreeChildKind<TFile extends StagingTreeFile>(
+  left: StagingTreeChild<TFile>,
+  right: StagingTreeChild<TFile>,
+): number {
+  if (left.kind === right.kind) return 0;
+  return left.kind === "folder" ? -1 : 1;
+}
+
 export function collectStagingFolderPaths(
   files: readonly Pick<GitFileChange, "path">[],
 ): Set<string> {
@@ -153,7 +161,7 @@ export function buildStagingTreeRows<TFile extends StagingTreeFile = GitFileChan
   const rows: StagingTreeRow<TFile>[] = [];
 
   function walk(children: readonly StagingTreeChild<TFile>[], depth: number) {
-    for (const child of children) {
+    for (const child of [...children].sort(compareTreeChildKind)) {
       if (child.kind === "folder") {
         let visibleNode = child.node;
         const chainNames = [child.node.name];

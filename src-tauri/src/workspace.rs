@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
@@ -116,54 +116,52 @@ fn unity_workspace_seed(dir: &str) -> Option<String> {
         }
     }
 
-    let application_identifier = extract_unity_yaml_scalar(&content, "applicationIdentifier");
-    let company_name = extract_unity_yaml_scalar(&content, "companyName");
-    let product_name = extract_unity_yaml_scalar(&content, "productName");
-    if application_identifier.is_some() || company_name.is_some() || product_name.is_some() {
-        return Some(format!(
-            "unity:applicationIdentifier={}|companyName={}|productName={}",
-            application_identifier.unwrap_or_default(),
-            company_name.unwrap_or_default(),
-            product_name.unwrap_or_default()
-        ));
-    }
-
     None
 }
 
-fn canonical_workspace_path(dir: &str) -> PathBuf {
-    dunce::canonicalize(Path::new(dir)).unwrap_or_else(|_| PathBuf::from(dir))
-}
-
-fn generated_workspace_id(dir: &str) -> String {
-    let seed = unity_workspace_seed(dir).unwrap_or_else(|| {
-        format!(
-            "path:{}",
-            canonical_workspace_path(dir)
-                .to_string_lossy()
-                .to_lowercase()
-        )
-    });
+fn workspace_id_from_seed(seed: &str) -> String {
     let digest = blake3::hash(seed.as_bytes()).to_hex().to_string();
     format!("unity-{}", &digest[..24])
 }
 
+fn random_workspace_id() -> String {
+    format!("workspace-{}", uuid::Uuid::new_v4().simple())
+}
+
+fn generated_workspace_id(dir: &str) -> String {
+    unity_workspace_seed(dir)
+        .map(|seed| workspace_id_from_seed(&seed))
+        .unwrap_or_else(random_workspace_id)
+}
+
 pub fn load_or_create_workspace(dir: &str) -> Result<String, String> {
+    let config_path = workspace_config_path(dir);
+    let mut should_write_config = !config_path.exists();
+
     match read_workspace_config(dir) {
         Ok(cfg) if !cfg.workspace_id.is_empty() => {
             return Ok(cfg.workspace_id);
         }
         Ok(_) => {
-            eprintln!("[Workspace] legacy config missing workspace_id, using generated id");
+            eprintln!("[Workspace] legacy config missing workspace_id, creating workspace id");
+            should_write_config = true;
         }
         Err(err) => {
-            if workspace_config_path(dir).exists() {
+            if config_path.exists() {
                 eprintln!("[Workspace] failed to read legacy config.json: {}", err);
             }
         }
     }
 
     let workspace_id = generated_workspace_id(dir);
+    if should_write_config {
+        write_workspace_config(
+            dir,
+            &WorkspaceConfig {
+                workspace_id: workspace_id.clone(),
+            },
+        )?;
+    }
     eprintln!("[Workspace] resolved workspace {} at {}", workspace_id, dir);
     Ok(workspace_id)
 }
@@ -172,7 +170,10 @@ pub fn load_or_create_workspace(dir: &str) -> Result<String, String> {
 mod tests {
     use std::fs;
 
-    use super::{generated_workspace_id, Workspace, WorkspaceConfig};
+    use super::{
+        generated_workspace_id, load_or_create_workspace, read_workspace_config, Workspace,
+        WorkspaceConfig,
+    };
 
     fn write_project_settings(root: &tempfile::TempDir, body: &str) {
         let settings_dir = root.path().join("ProjectSettings");
@@ -234,7 +235,7 @@ mod tests {
     }
 
     #[test]
-    fn generated_workspace_id_falls_back_to_project_identity_fields() {
+    fn generated_workspace_id_falls_back_to_random_id_without_unity_guid() {
         let dir = tempfile::tempdir().unwrap();
         write_project_settings(
             &dir,
@@ -242,7 +243,39 @@ mod tests {
         );
 
         let id = generated_workspace_id(&dir.path().to_string_lossy());
-        assert!(id.starts_with("unity-"));
-        assert_eq!(id.len(), 30);
+        assert!(id.starts_with("workspace-"));
+        assert_eq!(id.len(), "workspace-".len() + 32);
+    }
+
+    #[test]
+    fn load_or_create_workspace_persists_random_id_without_unity_guid() {
+        let dir = tempfile::tempdir().unwrap();
+        write_project_settings(
+            &dir,
+            "PlayerSettings:\n  companyName: OpenAI\n  productName: Locus\n  applicationIdentifier:\n    Standalone: com.openai.locus\n",
+        );
+
+        let first = load_or_create_workspace(&dir.path().to_string_lossy()).unwrap();
+        let second = load_or_create_workspace(&dir.path().to_string_lossy()).unwrap();
+        let cfg = read_workspace_config(&dir.path().to_string_lossy()).unwrap();
+
+        assert!(first.starts_with("workspace-"));
+        assert_eq!(first, second);
+        assert_eq!(cfg.workspace_id, first);
+    }
+
+    #[test]
+    fn load_or_create_workspace_persists_unity_guid_id_when_config_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        write_project_settings(
+            &dir,
+            "PlayerSettings:\n  productGUID: 2d9a8f42f0da40f2a22b9c4c93ce7d34\n",
+        );
+
+        let workspace_id = load_or_create_workspace(&dir.path().to_string_lossy()).unwrap();
+        let cfg = read_workspace_config(&dir.path().to_string_lossy()).unwrap();
+
+        assert!(workspace_id.starts_with("unity-"));
+        assert_eq!(cfg.workspace_id, workspace_id);
     }
 }

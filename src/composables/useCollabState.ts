@@ -689,12 +689,47 @@ export function useCollabState(props: CollabProps, options: CollabStateOptions =
   // ── Staging actions ─────────────────────────────────────────────
   const { hideMeta } = useHideMeta();
 
+  function extractGitIndexLockPath(message: string) {
+    const quotedMatch = message.match(/Unable to create '([^']*index\.lock)'/i);
+    if (quotedMatch?.[1]) return quotedMatch[1];
+
+    const prefix = "Git index is locked:";
+    const prefixStart = message.indexOf(prefix);
+    if (prefixStart === -1) return "";
+    const rest = message.slice(prefixStart + prefix.length).trim();
+    const marker = "index.lock";
+    const markerEnd = rest.toLowerCase().indexOf(marker);
+    if (markerEnd === -1) return "";
+    return rest.slice(0, markerEnd + marker.length).trim();
+  }
+
+  function formatGitStatusWarningMessage(warning: ReturnType<typeof normalizeAppError>) {
+    if (warning.code !== "git.index_lock") return warning.message;
+    const lockPath = extractGitIndexLockPath(warning.detail ?? warning.message);
+    return lockPath
+      ? t("collab.gitIndexLocked", lockPath)
+      : t("collab.gitIndexLockedNoPath");
+  }
+
+  function notifyGitStatusWarnings(result: GitStatusResult) {
+    for (const warning of result.warnings ?? []) {
+      const normalized = normalizeAppError(warning);
+      notificationStore.addNotice(normalized.severity, formatGitStatusWarningMessage(normalized), {
+        code: normalized.code,
+        operation: normalized.operation ?? "git_status",
+        replaceOperation: true,
+        ttl: 10_000,
+      });
+    }
+  }
+
   function applyGitStatusResult(result: GitStatusResult) {
     unstagedFiles.value = result.unstaged;
     stagedFiles.value = result.staged;
     blockedFiles.value = result.blocked ?? [];
     unmergedFiles.value = result.unmerged ?? [];
     mergeOperation.value = result.operation ?? null;
+    notifyGitStatusWarnings(result);
   }
 
   function addPendingPaths(target: Ref<Set<string>>, paths: string[]) {

@@ -23,6 +23,7 @@ import { APP_CLOSE_REQUESTED_EVENT, requestAppExit } from "./services/system";
 
 import TopBannerHost from "./components/TopBannerHost.vue";
 import BaseButton from "./components/ui/BaseButton.vue";
+import BaseContextMenu from "./components/ui/BaseContextMenu.vue";
 import AppUpdateModal from "./components/AppUpdateModal.vue";
 
 import { provideDiffOverlay } from "./composables/useDiffOverlay";
@@ -254,8 +255,15 @@ watch(() => uiStore.settingsMounted, (mounted) => {
 }, { immediate: true });
 
 // -- Workspace dropdown (local UI) --
+type RecentDirContextMenu = {
+  x: number;
+  y: number;
+  dir: string;
+};
+
 const showDirDropdown = ref(false);
 const dirDropdownRef = ref<HTMLElement | null>(null);
+const recentDirContextMenu = ref<RecentDirContextMenu | null>(null);
 const pendingWorkspaceSwitchPath = ref<string | null>(null);
 const switchingWorkspacePath = ref<string | null>(null);
 const workspaceSwitchBusy = ref(false);
@@ -336,6 +344,13 @@ function parentPath(dir: string): string {
 function toggleDirDropdown() {
   if (workspaceSwitchBusy.value) return;
   showDirDropdown.value = !showDirDropdown.value;
+  if (!showDirDropdown.value) {
+    recentDirContextMenu.value = null;
+  }
+}
+
+function closeRecentDirContextMenu() {
+  recentDirContextMenu.value = null;
 }
 
 function closeWorkspaceSwitchDialog() {
@@ -448,12 +463,14 @@ async function handleAppCloseRequest() {
 
 async function selectRecentDir(dir: string) {
   if (workspaceSwitchBusy.value) return;
+  closeRecentDirContextMenu();
   showDirDropdown.value = false;
   await requestWorkingDirChange(dir);
 }
 
 async function browseFromDropdown() {
   if (workspaceSwitchBusy.value) return;
+  closeRecentDirContextMenu();
   showDirDropdown.value = false;
   try {
     const selected = await open({ directory: true, multiple: false, defaultPath: projectStore.workingDir || undefined });
@@ -470,14 +487,64 @@ async function browseFromDropdown() {
   }
 }
 
+function openRecentDirContextMenu(event: MouseEvent, dir: string) {
+  if (workspaceSwitchBusy.value) return;
+  event.preventDefault();
+  event.stopPropagation();
+  recentDirContextMenu.value = {
+    x: event.clientX,
+    y: event.clientY,
+    dir,
+  };
+}
+
+async function openContextRecentDirInFileExplorer() {
+  const dir = recentDirContextMenu.value?.dir;
+  if (!dir) return;
+  closeRecentDirContextMenu();
+  try {
+    await projectStore.openDirInFileExplorer(dir);
+  } catch (error) {
+    const err = normalizeAppError(error);
+    notificationStore.addNotice("error", err.message, {
+      code: err.code,
+      operation: "openRecentDirInFileExplorer",
+      replaceOperation: true,
+      skipConsoleLog: true,
+    });
+  }
+}
+
+async function removeContextRecentDir() {
+  const dir = recentDirContextMenu.value?.dir;
+  if (!dir) return;
+  closeRecentDirContextMenu();
+  try {
+    await projectStore.removeRecentDir(dir);
+  } catch (error) {
+    const err = normalizeAppError(error);
+    notificationStore.addNotice("error", err.message, {
+      code: err.code,
+      operation: "removeRecentDir",
+      replaceOperation: true,
+      skipConsoleLog: true,
+    });
+  }
+}
+
 function handleDirClickOutside(e: MouseEvent) {
-  if (dirDropdownRef.value && !dirDropdownRef.value.contains(e.target as Node)) {
+  const target = e.target as Node;
+  const targetElement = target instanceof Element ? target : target.parentElement;
+  if (targetElement?.closest(".recent-dir-ctx-menu")) return;
+  if (dirDropdownRef.value && !dirDropdownRef.value.contains(target)) {
     showDirDropdown.value = false;
+    closeRecentDirContextMenu();
   }
 }
 
 function onResetOnboarding() {
   showDirDropdown.value = false;
+  closeRecentDirContextMenu();
   projectStore.resetWorkspaceState();
   chatStore.resetWorkspaceScope();
   uiStore.resetOnboarding();
@@ -785,8 +852,12 @@ watch(() => projectStore.workingDir, () => {
                 v-for="dir in projectStore.recentDirs"
                 :key="dir"
                 class="dir-item"
-                :class="{ active: dir === projectStore.workingDir }"
+                :class="{
+                  active: dir === projectStore.workingDir,
+                  'context-selected': recentDirContextMenu?.dir === dir,
+                }"
                 @click="selectRecentDir(dir)"
+                @contextmenu.prevent.stop="openRecentDirContextMenu($event, dir)"
                 :title="dir"
               >
                 <svg class="dir-item-icon" viewBox="0 0 16 16" fill="currentColor" width="12" height="12">
@@ -957,6 +1028,30 @@ watch(() => projectStore.workingDir, () => {
     @close="closeAppUpdateModal"
     @view="openAppUpdateRelease"
   />
+  <BaseContextMenu
+    v-if="recentDirContextMenu"
+    class="recent-dir-ctx-menu"
+    :x="recentDirContextMenu.x"
+    :y="recentDirContextMenu.y"
+    :min-width="180"
+    :z-index="260"
+    @close="closeRecentDirContextMenu"
+  >
+    <button
+      type="button"
+      class="recent-dir-ctx-item"
+      @click="openContextRecentDirInFileExplorer"
+    >
+      {{ t("common.openInFileExplorer") }}
+    </button>
+    <button
+      type="button"
+      class="recent-dir-ctx-item"
+      @click="removeContextRecentDir"
+    >
+      {{ t("app.dir.removeRecent") }}
+    </button>
+  </BaseContextMenu>
   <Transition name="workspace-switch-modal">
     <div
       v-if="pendingWorkspaceSwitchPath"
@@ -1594,6 +1689,11 @@ body.is-dragging-select-lock * {
 
 .dir-item.active {
   background: var(--active-bg);
+}
+
+.dir-item.context-selected,
+.dir-item.context-selected:hover {
+  background: color-mix(in srgb, var(--active-bg) 58%, var(--hover-bg) 42%);
 }
 
 .dir-item-icon {

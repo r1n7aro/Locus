@@ -10,7 +10,7 @@ use tauri::{AppHandle, State};
 use super::auth::CodexAuthStateHandle;
 use crate::auth::AuthState;
 use crate::config::AppConfig;
-use crate::error::AppError;
+use crate::error::{AppError, ErrorSeverity};
 use crate::llm::anthropic_agent_sdk::{
     self, ClaudeCodeSdkOptions, ClaudeSdkAssistantMessage, ClaudeSdkHost, ClaudeSdkHostFuture,
 };
@@ -2921,6 +2921,7 @@ pub struct GitStatusResult {
     pub blocked: Vec<GitBlockedPath>,
     pub unmerged: Vec<UnmergedFileEntry>,
     pub operation: Option<MergeOperation>,
+    pub warnings: Vec<AppError>,
 }
 
 #[tauri::command]
@@ -2933,6 +2934,7 @@ pub async fn git_status(workspace: State<'_, Arc<Workspace>>) -> Result<GitStatu
             blocked: vec![],
             unmerged: vec![],
             operation: None,
+            warnings: vec![],
         });
     }
 
@@ -2943,6 +2945,7 @@ pub async fn git_status(workspace: State<'_, Arc<Workspace>>) -> Result<GitStatu
         blocked,
         mut unmerged,
     } = parse_git_status_porcelain(&stdout);
+    let mut warnings = Vec::new();
 
     if unmerged.is_empty() {
         match load_rename_aware_unstaged_changes(&cwd) {
@@ -2951,6 +2954,9 @@ pub async fn git_status(workspace: State<'_, Arc<Workspace>>) -> Result<GitStatu
             }
             Err(err) => {
                 eprintln!("[git_status] rename-aware unstaged fallback: {}", err);
+                if let Some(warning) = git_status_warning_for_rename_aware_fallback(&err) {
+                    warnings.push(warning);
+                }
             }
         }
     }
@@ -2974,6 +2980,7 @@ pub async fn git_status(workspace: State<'_, Arc<Workspace>>) -> Result<GitStatu
         blocked,
         unmerged,
         operation,
+        warnings,
     })
 }
 
@@ -3349,6 +3356,46 @@ pub async fn git_commit_files(
     mark_lfs_files(&cwd, &mut files);
 
     Ok(files)
+}
+
+fn extract_git_index_lock_path(message: &str) -> Option<String> {
+    let marker = "Unable to create '";
+    let start = message.find(marker)? + marker.len();
+    let rest = &message[start..];
+    let end = rest.find("'")?;
+    let path = rest[..end].trim();
+    if path.is_empty() {
+        None
+    } else {
+        Some(path.to_string())
+    }
+}
+
+fn git_status_warning_for_rename_aware_fallback(error: &AppError) -> Option<AppError> {
+    let detail = error.detail.as_deref().unwrap_or(&error.message);
+    let lowered = detail.to_ascii_lowercase();
+    let is_index_lock = lowered.contains("index.lock")
+        && (lowered.contains("unable to create")
+            || lowered.contains("file exists")
+            || lowered.contains("another git process"));
+    if !is_index_lock {
+        return None;
+    }
+
+    let message = match extract_git_index_lock_path(detail) {
+        Some(path) => format!(
+            "Git index is locked: {path}. Close other Git processes, then retry. If none are running, remove index.lock manually."
+        ),
+        None => "Git index is locked. Close other Git processes, then retry. If none are running, remove index.lock manually.".to_string(),
+    };
+
+    Some(
+        AppError::new("git.index_lock", message)
+            .detail(detail.to_string())
+            .operation("git_status")
+            .retryable(true)
+            .severity(ErrorSeverity::Warning),
+    )
 }
 
 #[tauri::command]
@@ -4212,9 +4259,11 @@ pub async fn git_set_user_config(name: String, email: String) -> Result<(), AppE
 #[cfg(test)]
 mod git_name_status_tests {
     use super::{
-        build_commit_files_args, build_compare_files_args, load_rename_aware_unstaged_changes,
+        build_commit_files_args, build_compare_files_args,
+        git_status_warning_for_rename_aware_fallback, load_rename_aware_unstaged_changes,
         parse_name_status_lines,
     };
+    use crate::error::{AppError, ErrorSeverity};
     use crate::process_util::command;
     use tempfile::tempdir;
 
@@ -4255,6 +4304,23 @@ mod git_name_status_tests {
     fn compare_file_args_enable_rename_detection() {
         let args = build_compare_files_args("a..b");
         assert!(args.iter().any(|arg| arg == "--find-renames"));
+    }
+
+    #[test]
+    fn rename_aware_fallback_index_lock_error_becomes_status_warning() {
+        let raw = "git write-tree failed: fatal: Unable to create 'G:/SampleGame-Light/.git/index.lock': File exists.\n\nAnother git process seems to be running in this repository";
+        let error = AppError::from(raw.to_string());
+        let warning = git_status_warning_for_rename_aware_fallback(&error)
+            .expect("index.lock errors should become status warnings");
+
+        assert_eq!(warning.code, "git.index_lock");
+        assert_eq!(warning.operation.as_deref(), Some("git_status"));
+        assert_eq!(warning.severity, ErrorSeverity::Warning);
+        assert!(warning.retryable);
+        assert!(warning
+            .message
+            .contains("G:/SampleGame-Light/.git/index.lock"));
+        assert_eq!(warning.detail.as_deref(), Some(raw));
     }
 
     #[test]

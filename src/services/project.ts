@@ -33,6 +33,14 @@ export function listRecentDirs(): Promise<string[]> {
   return ipcInvoke<string[]>("list_recent_dirs");
 }
 
+export function removeRecentDir(path: string): Promise<string[]> {
+  return ipcInvoke<string[]>("remove_recent_dir", { path });
+}
+
+export function openDirInFileExplorer(path: string): Promise<void> {
+  return ipcInvoke<void>("open_dir_in_file_explorer", { path });
+}
+
 export function listDirEntries(subPath: string): Promise<DirEntry[]> {
   return ipcInvoke<DirEntry[]>("list_dir_entries", { subPath });
 }
