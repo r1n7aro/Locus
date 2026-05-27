@@ -13,6 +13,10 @@ describe("AgentView injected env entry", () => {
     const source = read("src/components/AgentView.vue");
 
     expect(source).toContain("const injectedContextEntryCount = computed(() =>");
+    expect(source).toContain("getAgentRenderedEnvPrompt");
+    expect(source).toContain("const envPreviewMode = ref<EnvPreviewMode>");
+    expect(source).toContain("<BaseSegmented");
+    expect(source).toContain('class="env-preview-mode"');
     expect(source).toContain('class="injected-section"');
     expect(source).toContain('class="kb-item injected-item"');
     expect(source).toContain(':class="{ selected: selected?.type === \'env\' }"');

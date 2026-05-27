@@ -23,6 +23,10 @@ export function getAgentEnvTemplate(agentId: string): Promise<string> {
   return ipcInvoke<string>("get_agent_env_template", { agentId });
 }
 
+export function getAgentRenderedEnvPrompt(agentId: string): Promise<string> {
+  return ipcInvoke<string>("get_agent_rendered_env_prompt", { agentId });
+}
+
 export function getAgentSystemPromptStats(agentId: string): Promise<AgentSystemPromptStats> {
   return ipcInvoke<AgentSystemPromptStats>("get_agent_system_prompt_stats", { agentId });
 }

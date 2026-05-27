@@ -1,10 +1,10 @@
 pub mod builtins;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 use tauri::AppHandle;
@@ -110,6 +110,16 @@ pub struct ToolRegistry {
 
 fn normalize_tool_name_key(name: &str) -> String {
     name.trim().to_ascii_lowercase()
+}
+
+pub fn built_in_tool_name_keys() -> BTreeSet<String> {
+    static BUILT_IN_TOOL_NAME_KEYS: OnceLock<BTreeSet<String>> = OnceLock::new();
+    BUILT_IN_TOOL_NAME_KEYS
+        .get_or_init(|| {
+            let registry = ToolRegistry::with_builtins();
+            registry.built_in_tools.iter().cloned().collect()
+        })
+        .clone()
 }
 
 pub fn default_load_mode_for_builtin_tool(name: &str) -> ToolLoadMode {

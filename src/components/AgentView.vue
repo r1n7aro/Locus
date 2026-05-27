@@ -1,12 +1,14 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, watch } from "vue";
-import { listAgents, listSubagentDefs, getAgentEnvTemplate, getAgentSystemPrompt, getAgentSystemPromptStats, listAgentInjectedItems, setAgentToolDirectLoad, listRules, readRule, saveRule, deleteRule, setRuleEnabled, setRuleOrder } from "../services/agent";
+import { listAgents, listSubagentDefs, getAgentEnvTemplate, getAgentRenderedEnvPrompt, getAgentSystemPrompt, getAgentSystemPromptStats, listAgentInjectedItems, setAgentToolDirectLoad, listRules, readRule, saveRule, deleteRule, setRuleEnabled, setRuleOrder } from "../services/agent";
 import type { AgentInfo, AgentSystemPromptStats, InjectedPromptItem, InjectedToolLoadMode, RuleItem } from "../types";
 import { getWarmup } from "../composables/warmupCache";
 import MarkdownRenderer from "./MarkdownRenderer.vue";
 import BaseButton from "./ui/BaseButton.vue";
 import BaseCheckbox from "./ui/BaseCheckbox.vue";
+import BaseContextMenu from "./ui/BaseContextMenu.vue";
+import BaseSegmented from "./ui/BaseSegmented.vue";
 import { t } from "../i18n";
 import { normalizeAppError } from "../services/errors";
 import { acquireSelectionLock } from "../composables/useSelectionLock";
@@ -42,6 +44,28 @@ let promptStatsRequestId = 0;
 // ── Env Template ──
 const envTemplateContent = ref("");
 const envTemplateLoading = ref(false);
+const envRenderedContent = ref("");
+const envRenderedLoading = ref(false);
+type EnvPreviewMode = "structure" | "rendered";
+const envPreviewMode = ref<EnvPreviewMode>("structure");
+let envRenderedRequestId = 0;
+
+const envPreviewModeOptions = computed(() => [
+  { value: "structure", label: t("agent.envPreview.structure") },
+  { value: "rendered", label: t("agent.envPreview.rendered") },
+]);
+
+const envPreviewContent = computed(() =>
+  envPreviewMode.value === "rendered"
+    ? envRenderedContent.value
+    : envTemplateContent.value,
+);
+
+const envPreviewLoading = computed(() =>
+  envPreviewMode.value === "rendered"
+    ? envRenderedLoading.value
+    : envTemplateLoading.value,
+);
 
 function highlightedEnv(raw: string): string {
   let s = raw
@@ -377,6 +401,9 @@ async function switchAgent(agentId: string) {
   confirmingDeleteRule.value = null;
   systemPromptContent.value = "";
   envTemplateContent.value = "";
+  envRenderedContent.value = "";
+  envRenderedLoading.value = false;
+  envRenderedRequestId += 1;
   injectedItems.value = [];
   promptStats.value = null;
   promptStatsError.value = "";
@@ -410,6 +437,7 @@ function selectEnv() {
   ruleCreating.value = false;
   confirmingDeleteRule.value = null;
   if (!envTemplateContent.value) loadEnvTemplate();
+  if (envPreviewMode.value === "rendered" && !envRenderedContent.value) loadRenderedEnvPrompt();
 }
 
 // ── Env Template ──
@@ -422,6 +450,32 @@ async function loadEnvTemplate() {
     envTemplateContent.value = t("common.loadFailed", normalizeAppError(e).message);
   } finally {
     envTemplateLoading.value = false;
+  }
+}
+
+function setEnvPreviewMode(value: string) {
+  if (value !== "structure" && value !== "rendered") return;
+  envPreviewMode.value = value;
+  if (value === "rendered" && !envRenderedContent.value) {
+    loadRenderedEnvPrompt();
+  }
+}
+
+async function loadRenderedEnvPrompt() {
+  if (!selectedAgentId.value) return;
+  const requestId = ++envRenderedRequestId;
+  envRenderedLoading.value = true;
+  try {
+    const content = await getAgentRenderedEnvPrompt(selectedAgentId.value);
+    if (requestId !== envRenderedRequestId) return;
+    envRenderedContent.value = content;
+  } catch (e) {
+    if (requestId !== envRenderedRequestId) return;
+    envRenderedContent.value = t("common.loadFailed", normalizeAppError(e).message);
+  } finally {
+    if (requestId === envRenderedRequestId) {
+      envRenderedLoading.value = false;
+    }
   }
 }
 
@@ -722,6 +776,12 @@ function refreshAll() {
   closeRuleContextMenu();
   loadSystemPrompt();
   loadEnvTemplate();
+  envRenderedContent.value = "";
+  envRenderedLoading.value = false;
+  envRenderedRequestId += 1;
+  if (envPreviewMode.value === "rendered") {
+    loadRenderedEnvPrompt();
+  }
   loadPromptStats();
   loadInjectedItems();
   loadRules();
@@ -984,10 +1044,17 @@ watch(
           <span v-if="selectedAgent?.source === 'app'" class="source-badge source-app">{{ t("common.builtIn") }}</span>
           <span v-else-if="selectedAgent?.source === 'project'" class="source-badge source-project">{{ t("common.project") }}</span>
           <span v-else-if="selectedAgent?.source === 'both'" class="source-badge source-both">{{ t("common.builtInAndProject") }}</span>
+          <BaseSegmented
+            class="env-preview-mode"
+            :model-value="envPreviewMode"
+            :options="envPreviewModeOptions"
+            size="sm"
+            @update:model-value="setEnvPreviewMode"
+          />
         </div>
-        <div class="preview-body env-template-body" :class="{ 'is-loading': envTemplateLoading }">
-          <div v-if="envTemplateLoading && !envTemplateContent" class="preview-loading">{{ t("common.loading") }}</div>
-          <pre v-show="!envTemplateLoading || envTemplateContent" class="env-template-pre" v-html="highlightedEnv(envTemplateContent)"></pre>
+        <div class="preview-body env-template-body" :class="{ 'is-loading': envPreviewLoading }">
+          <div v-if="envPreviewLoading && !envPreviewContent" class="preview-loading">{{ t("common.loading") }}</div>
+          <pre v-show="!envPreviewLoading || envPreviewContent" class="env-template-pre" v-html="highlightedEnv(envPreviewContent)"></pre>
         </div>
         <div class="preview-footer">
           <span class="preview-meta">{{ selectedAgentId }}</span>
@@ -1263,18 +1330,14 @@ watch(
         </div>
       </div>
 
-      <Teleport to="body">
-      <div
+      <BaseContextMenu
         v-if="ruleContextMenu"
-        class="agent-rule-ctx-backdrop"
-        @click="closeRuleContextMenu"
-        @contextmenu.prevent="closeRuleContextMenu"
+        class="agent-rule-ctx-menu"
+        :x="ruleContextMenu.x"
+        :y="ruleContextMenu.y"
+        :z-index="80"
+        @close="closeRuleContextMenu"
       >
-        <div
-          class="agent-rule-ctx-menu"
-          :style="{ left: ruleContextMenu.x + 'px', top: ruleContextMenu.y + 'px' }"
-          @click.stop
-        >
           <button type="button" class="agent-rule-ctx-item" @click="startCreateRule">
             {{ t("agent.newRule") }}
           </button>
@@ -1287,9 +1350,7 @@ watch(
           >
             {{ t("common.delete") }}
           </button>
-        </div>
-      </div>
-      </Teleport>
+      </BaseContextMenu>
     </template>
 
     <div v-else class="guide-panel" style="flex: 1;">
@@ -2286,62 +2347,12 @@ watch(
   min-width: 0;
 }
 
-.agent-rule-ctx-backdrop {
-  position: fixed;
-  inset: 0;
-  z-index: 80;
-}
-
-.agent-rule-ctx-menu {
-  position: fixed;
-  min-width: 156px;
-  padding: 6px;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  border: 1px solid var(--border-color);
-  border-radius: 8px;
-  background: var(--elevated-bg, var(--panel-bg));
-  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.24);
-}
-
-.agent-rule-ctx-item {
-  display: flex;
-  align-items: center;
-  width: 100%;
-  min-height: 28px;
-  padding: 0 10px;
-  border: none;
-  border-radius: 6px;
-  background: transparent;
-  color: var(--text-color);
-  font: inherit;
-  font-size: 12px;
-  text-align: left;
-  cursor: pointer;
-}
-
-.agent-rule-ctx-item:hover {
-  background: var(--hover-bg);
-}
-
-.agent-rule-ctx-item-danger {
-  color: var(--status-danger-fg);
-}
-
-.agent-rule-ctx-item-danger:hover {
-  background: var(--status-danger-bg);
-  color: var(--status-danger-fg);
-}
-
-.agent-rule-ctx-sep {
-  height: 1px;
-  margin: 4px 0;
-  background: var(--border-color);
-}
-
 .env-template-body {
   padding: 0 !important;
+}
+
+.env-preview-mode {
+  flex-shrink: 0;
 }
 
 .env-template-pre {

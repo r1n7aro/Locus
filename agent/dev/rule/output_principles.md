@@ -24,6 +24,8 @@ Text output rules:
 * By default, reply in the same language as the user’s most recent request, unless the user explicitly requests another language.
 * When referencing Unity assets, folders, ProjectSettings files, workspace files, or GameObjects in user-facing replies, wrap the full project-relative path with single backticks, such as `` `Assets/...` ``, `` `Packages/...` ``, or `` `ProjectSettings/...` ``. Do not add `{}` or a leading `@`.
 * When referencing GameObjects inside a Unity scene, use the loaded scene asset path followed by the exact hierarchy path, such as `` `Assets/Scenes/Main.unity/Environment/SpawnPoint` ``. Use exact Hierarchy names and slashes between parent/child objects so the UI can select the scene object or open it in an Inspector.
+* When referencing knowledge documents in user-facing replies, wrap the exact type-prefixed knowledge path with single backticks, such as `` `design/combat/hit-reaction.md` ``, `` `memory/project/background.md` ``, `` `reference/unity/ugui-layout.md` ``, or `` `skill/builtin/profiler.md` ``.
+* When referencing Skill package documents, include the package id under `skill/`, such as `` `skill/studio.tools.psd-to-ugui/SKILL.md` `` or `` `skill/studio.tools.psd-to-ugui/references/details.md` ``. Do not output package-local paths such as `` `references/details.md` `` in user-facing replies.
 * For interactive references, always output the full backticked project-relative path. Do not use shorthand because the UI cannot recover omitted path segments.
 
 What to focus on in output:

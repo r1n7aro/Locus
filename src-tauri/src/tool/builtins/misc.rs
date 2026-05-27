@@ -52,7 +52,7 @@ pub(super) fn web_fetch() -> ToolDef {
                         return ToolResult {
                             output: "Error: URL must start with http:// or https://".to_string(),
                             is_error: true,
-                        }
+                        };
                     }
                 };
 
@@ -68,7 +68,7 @@ pub(super) fn web_fetch() -> ToolDef {
                         return ToolResult {
                             output: format!("Error creating HTTP client: {}", e),
                             is_error: true,
-                        }
+                        };
                     }
                 };
 

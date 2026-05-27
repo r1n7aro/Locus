@@ -18,7 +18,7 @@ pub(super) fn read() -> ToolDef {
                         return ToolResult {
                             output: "Missing required parameter: filePath".to_string(),
                             is_error: true,
-                        }
+                        };
                     }
                 };
 
@@ -211,7 +211,7 @@ pub(super) fn write() -> ToolDef {
                         return ToolResult {
                             output: "Missing required parameter: filePath".to_string(),
                             is_error: true,
-                        }
+                        };
                     }
                 };
                 let content = match args.get("content").and_then(|v| v.as_str()) {
@@ -220,7 +220,7 @@ pub(super) fn write() -> ToolDef {
                         return ToolResult {
                             output: "Missing required parameter: content".to_string(),
                             is_error: true,
-                        }
+                        };
                     }
                 };
 
@@ -288,7 +288,7 @@ pub(super) fn edit() -> ToolDef {
                         return ToolResult {
                             output: "Missing required parameter: filePath".to_string(),
                             is_error: true,
-                        }
+                        };
                     }
                 };
 
@@ -298,7 +298,7 @@ pub(super) fn edit() -> ToolDef {
                         return ToolResult {
                             output: format!("File not found: {}", file_path),
                             is_error: true,
-                        }
+                        };
                     }
                 };
                 if metadata.is_dir() {
@@ -314,7 +314,7 @@ pub(super) fn edit() -> ToolDef {
                         return ToolResult {
                             output: format!("Failed to read file '{}': {}", file_path, e),
                             is_error: true,
-                        }
+                        };
                     }
                 };
                 let file_eol = resolve_preferred_line_ending(
@@ -343,7 +343,7 @@ pub(super) fn edit() -> ToolDef {
                                         i
                                     ),
                                     is_error: true,
-                                }
+                                };
                             }
                         };
                         let new_s = match edit.get("newString").and_then(|v| v.as_str()) {
@@ -355,7 +355,7 @@ pub(super) fn edit() -> ToolDef {
                                         i
                                     ),
                                     is_error: true,
-                                }
+                                };
                             }
                         };
                         let repl_all = edit
@@ -427,13 +427,13 @@ pub(super) fn edit() -> ToolDef {
                                 return ToolResult {
                                     output: format!("Created {}", file_path),
                                     is_error: false,
-                                }
+                                };
                             }
                             Err(e) => {
                                 return ToolResult {
                                     output: format!("Failed to write file '{}': {}", file_path, e),
                                     is_error: true,
-                                }
+                                };
                             }
                         }
                     }
@@ -678,7 +678,7 @@ pub(super) fn list() -> ToolDef {
                         return ToolResult {
                             output: "Missing required parameter: path".to_string(),
                             is_error: true,
-                        }
+                        };
                     }
                 };
 

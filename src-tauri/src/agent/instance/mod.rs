@@ -3,6 +3,7 @@ mod backend;
 mod prompt_context;
 mod read_file;
 mod unity_capture;
+mod view_capture;
 
 pub use backend::resolve_openrouter_model;
 pub use backend::{LlmBackend, RawContextStore, RawRound};
@@ -158,25 +159,6 @@ fn push_unique_tool_name(names: &mut Vec<String>, name: &str) {
     }
 }
 
-fn requested_tool_load_names(arguments: &str) -> Vec<String> {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(arguments) else {
-        return Vec::new();
-    };
-    value
-        .get("tools")
-        .and_then(|tools| tools.as_array())
-        .map(|tools| {
-            tools
-                .iter()
-                .filter_map(|tool| tool.as_str())
-                .map(str::trim)
-                .filter(|tool| !tool.is_empty())
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 fn parse_meta_tool_call_arguments(arguments: &str) -> Result<(String, serde_json::Value), String> {
     let value = serde_json::from_str::<serde_json::Value>(arguments)
         .map_err(|e| format!("tool_call arguments must be valid JSON: {}", e))?;
@@ -220,7 +202,8 @@ pub struct AgentInstance {
     undo_manager: Option<Arc<crate::vcs::UndoManager>>,
     subagent_model_overrides: std::collections::HashMap<String, String>,
     tool_runtime_state: Arc<ToolRuntimeState>,
-    loaded_tool_names: Arc<tokio::sync::Mutex<HashSet<String>>>,
+    loaded_tool_names: Mutex<HashSet<String>>,
+    document_skill_tool_names: Mutex<HashSet<String>>,
     partial_assistant: Arc<AssistantStreamState>,
     cancel_rx: tokio::sync::watch::Receiver<bool>,
 }
@@ -1118,6 +1101,7 @@ fn build_knowledge_document_create_preview(
         skill_surface: patch.skill_surface,
         command_trigger: patch.command_trigger.take().unwrap_or(None),
         argument_hint: patch.argument_hint.take().unwrap_or(None),
+        tools: Vec::new(),
         summary,
         body,
         maintenance_rules,
@@ -1797,6 +1781,8 @@ fn build_search_section() -> String {
         "1. Start with `knowledge_query` and split exact terms into `lexicalQuery` and intent-style retrieval into `semanticQuery` when useful.",
         "2. Use `knowledge_read` when you know the target document path or need a specific document. For Skill packages, `skill/<package-id>` reads the package root `SKILL.md`.",
         "3. Use `knowledge_list` to browse entries under a type-prefixed directory path prefix such as `design/` or `skill/unity/`.",
+        "4. In user-facing replies, cite knowledge documents with full type-prefixed paths such as `design/core-loop.md`, `memory/project/background.md`, `reference/unity/ugui-layout.md`, and `skill/builtin/profiler.md`.",
+        "5. Cite Skill package documents with the package id under `skill/`, such as `skill/psd-to-ugui/SKILL.md` or `skill/psd-to-ugui/references/details.md`; cite full knowledge paths in user-facing replies.",
     ]
     .join("\n")
 }
@@ -1833,7 +1819,7 @@ fn build_tools_section(access_mode: KnowledgeAccessMode) -> String {
             "- `knowledge_create`: Create a new non-Skill document or folder at a type-prefixed path. Document paths end with `.md`; directory paths do not. Document creation only accepts initial content.",
             "- `knowledge_move`: Move a document or folder using type-prefixed paths. Document paths end with `.md`; directory paths do not.",
             "- `knowledge_delete`: Delete an obsolete document or folder by type-prefixed path. Document paths end with `.md`; directory paths do not.",
-            "- `skill_create`: Create a Skill as `kind: \"md\"` with metadata or `kind: \"package\"` with package metadata. Use `kind: \"package\"` for Skills that require CLI tools, binaries, scripts, Unity C# files, bundled docs, or any package-local dependency environment.",
+            "- `skill_create`: Create a Skill as `kind: \"md\"` with metadata or `kind: \"package\"` with package metadata. Use `kind: \"package\"` for Skills that require CLI tools, binaries, scripts, Unity C# files, bundled docs, or any package-local dependency environment. Package creation returns `packageRoot` under the Locus app Skill package directory. For packages, omit `packageId` to derive a short kebab-case package id from `name`; provide `packageId` for distributed packages or a specific namespace.",
             "- `skill_reload`: Load or reload a Skill manifest after edits and return validation errors.",
             "- `skill_list`: List discoverable project Skills, built-in app Skills, and app Skill packages.",
         ]);
@@ -2344,7 +2330,7 @@ impl AgentInstance {
                     return Some(format!(
                         "Tool '{}' cannot access '{}': {}.",
                         tool_name, raw_path, error
-                    ))
+                    ));
                 }
             };
 
@@ -2436,6 +2422,22 @@ impl AgentInstance {
             | "unity_yaml_list"
             | "unity_yaml_search"
             | "unity_yaml_read"
+            | "view_create"
+            | "view_list"
+            | "view_reload"
+            | "view_run"
+            | "view_compile_script"
+            | "view_call_script"
+            | "view_binding_read"
+            | "view_binding_discover"
+            | "view_binding_write"
+            | "view_binding_apply"
+            | "view_capture"
+            | "view_snapshot"
+            | "view_action"
+            | "view_wait"
+            | "view_console_read"
+            | "view_debug_eval"
             | "knowledge_list"
             | "knowledge_query"
             | "knowledge_read"
@@ -2468,11 +2470,7 @@ impl AgentInstance {
         let started_at = Instant::now();
         eprintln!(
             "[Agent {}] knowledge context build start: session={} cwd={} include_index={} include_memory={}",
-            self.id,
-            self.session_id,
-            self.working_dir,
-            _include_index,
-            _include_memory
+            self.id, self.session_id, self.working_dir, _include_index, _include_memory
         );
         let mut sections = Vec::new();
 
@@ -2568,7 +2566,8 @@ impl AgentInstance {
             undo_manager,
             subagent_model_overrides,
             tool_runtime_state: Arc::new(ToolRuntimeState::default()),
-            loaded_tool_names: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            loaded_tool_names: Mutex::new(HashSet::new()),
+            document_skill_tool_names: Mutex::new(HashSet::new()),
             partial_assistant: Arc::new(AssistantStreamState::default()),
             cancel_rx,
         }
@@ -2623,14 +2622,22 @@ impl AgentInstance {
         tools
     }
 
-    fn supports_native_tool_lazy_loading(&self) -> bool {
-        match &self.backend {
-            LlmBackend::OpenAiCodex { .. } => true,
+    fn disables_tool_load_configuration(&self) -> bool {
+        matches!(
+            &self.backend,
             LlmBackend::Custom {
-                supports_tool_lazy_loading,
+                api_format: crate::commands::ApiFormat::OpenaiChat,
                 ..
-            } => *supports_tool_lazy_loading,
-            _ => false,
+            }
+        )
+    }
+
+    fn supports_image_understanding(&self) -> bool {
+        match &self.backend {
+            LlmBackend::Custom {
+                supports_vision, ..
+            } => *supports_vision,
+            _ => true,
         }
     }
 
@@ -2683,7 +2690,8 @@ impl AgentInstance {
     }
 
     fn can_configure_direct_load_tool(&self, name: &str) -> bool {
-        !Self::is_meta_tool(name)
+        !self.disables_tool_load_configuration()
+            && !Self::is_meta_tool(name)
             && self.tool_registry.is_built_in(name)
             && matches!(
                 self.default_tool_load_mode(name),
@@ -2707,6 +2715,9 @@ impl AgentInstance {
         if Self::is_meta_tool(name) || default_mode == ToolLoadMode::Skill {
             return default_mode;
         }
+        if self.disables_tool_load_configuration() {
+            return default_mode;
+        }
         if !self.tool_registry.is_built_in(name) {
             return default_mode;
         }
@@ -2721,10 +2732,6 @@ impl AgentInstance {
         self.default_tool_load_mode(name) == ToolLoadMode::Direct
     }
 
-    fn should_direct_load_tool(&self, name: &str, overrides: &HashMap<String, bool>) -> bool {
-        self.configured_tool_load_mode(name, overrides) == ToolLoadMode::Direct
-    }
-
     async fn allowed_tool_set(&self) -> HashSet<String> {
         self.resolve_effective_tool_names()
             .await
@@ -2737,61 +2744,133 @@ impl AgentInstance {
         self.allowed_tool_set().await.contains(tool_name)
     }
 
-    async fn seed_loaded_tools_from_history(
+    fn dynamic_tool_loading_mode_from_app_handle(
+        app_handle: &AppHandle,
+    ) -> crate::config::DynamicToolLoadingMode {
+        app_handle
+            .try_state::<Arc<crate::config::AppConfig>>()
+            .map(|config| config.dynamic_tool_loading_mode())
+            .unwrap_or_default()
+    }
+
+    fn dynamic_tool_loading_mode(
         &self,
-        messages: &[crate::session::models::ChatMessage],
-    ) {
-        let allowed = self.allowed_tool_set().await;
-        let mut loaded = HashSet::new();
-        for message in messages {
-            let Some(tool_calls) = message.tool_calls.as_ref() else {
-                continue;
-            };
-            for tool_call in tool_calls {
-                if tool_call.name != "tool_load" {
-                    continue;
-                }
-                if tool_call
-                    .outcome
-                    .is_some_and(|outcome| outcome != crate::commands::ToolCallOutcome::Done)
-                {
-                    continue;
-                }
-                for name in requested_tool_load_names(&tool_call.arguments) {
-                    let Some(canonical) = self.tool_registry.canonical_name(&name) else {
-                        continue;
-                    };
-                    if allowed.contains(&canonical) {
-                        loaded.insert(canonical);
-                    }
-                }
-            }
+        app_handle: &AppHandle,
+    ) -> crate::config::DynamicToolLoadingMode {
+        if matches!(self.backend, LlmBackend::AnthropicAgentSdk) {
+            return crate::config::DynamicToolLoadingMode::MetaTool;
         }
-        let mut guard = self.loaded_tool_names.lock().await;
-        *guard = loaded;
+        Self::dynamic_tool_loading_mode_from_app_handle(app_handle)
     }
 
     async fn build_request_tool_names(&self) -> Vec<String> {
+        self.build_request_tool_names_for_mode(crate::config::DynamicToolLoadingMode::MetaTool)
+            .await
+    }
+
+    async fn build_request_tool_names_for_mode(
+        &self,
+        dynamic_mode: crate::config::DynamicToolLoadingMode,
+    ) -> Vec<String> {
+        let active_skill_tool_names = HashSet::new();
+        self.build_request_tool_names_for_mode_and_skills(dynamic_mode, &active_skill_tool_names)
+            .await
+    }
+
+    async fn build_request_tool_names_for_mode_and_skills(
+        &self,
+        dynamic_mode: crate::config::DynamicToolLoadingMode,
+        active_skill_tool_names: &HashSet<String>,
+    ) -> Vec<String> {
         let allowed = self.allowed_tool_set().await;
-        let native_lazy = self.supports_native_tool_lazy_loading();
         let direct_overrides = self.tool_direct_load_overrides();
-        let loaded = self.loaded_tool_names.lock().await.clone();
+        let loaded_tool_names: HashSet<String> =
+            if dynamic_mode == crate::config::DynamicToolLoadingMode::Direct {
+                self.loaded_tool_names
+                    .lock()
+                    .map(|guard| guard.clone())
+                    .unwrap_or_default()
+            } else {
+                HashSet::new()
+            };
         let mut names = Vec::new();
         push_unique_tool_name(&mut names, "tool_load");
-        if !native_lazy {
+        if dynamic_mode != crate::config::DynamicToolLoadingMode::Direct {
             push_unique_tool_name(&mut names, "tool_call");
         }
 
         let mut allowed_sorted: Vec<_> = allowed.into_iter().collect();
         allowed_sorted.sort();
         for name in allowed_sorted {
-            if self.should_direct_load_tool(&name, &direct_overrides)
-                || (native_lazy && loaded.contains(&name))
+            let configured_load_mode = self.configured_tool_load_mode(&name, &direct_overrides);
+            if active_skill_tool_names.contains(&name)
+                || configured_load_mode == ToolLoadMode::Direct
+                || loaded_tool_names.contains(&name)
             {
                 push_unique_tool_name(&mut names, &name);
             }
         }
         names
+    }
+
+    fn requested_tool_load_names(args: &serde_json::Value) -> Vec<String> {
+        args.get("tools")
+            .and_then(|value| value.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str())
+                    .map(str::trim)
+                    .filter(|item| !item.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    async fn seed_loaded_tools_from_history(&self, messages: &[ChatMessage]) {
+        let allowed = self.allowed_tool_set().await;
+        let direct_overrides = self.tool_direct_load_overrides();
+        let mut names = Vec::new();
+
+        for tool_call in crate::session::history::collect_assistant_tool_calls(messages) {
+            if tool_call.name != "tool_load" {
+                continue;
+            }
+            let Ok(args) = serde_json::from_str::<serde_json::Value>(&tool_call.arguments) else {
+                continue;
+            };
+            for requested_name in Self::requested_tool_load_names(&args) {
+                let Some(canonical) = self.tool_registry.canonical_name(&requested_name) else {
+                    continue;
+                };
+                if Self::is_meta_tool(&canonical) || !allowed.contains(&canonical) {
+                    continue;
+                }
+                if self.configured_tool_load_mode(&canonical, &direct_overrides)
+                    == ToolLoadMode::Direct
+                {
+                    continue;
+                }
+                push_unique_tool_name(&mut names, &canonical);
+            }
+        }
+
+        if names.is_empty() {
+            return;
+        }
+
+        if let Ok(mut loaded) = self.loaded_tool_names.lock() {
+            for name in &names {
+                loaded.insert(name.clone());
+            }
+        }
+
+        eprintln!(
+            "[Agent {}] seeded direct dynamic tools from history: count={}",
+            self.id,
+            names.len()
+        );
     }
 
     async fn lazy_tool_manifest_names(&self) -> Vec<String> {
@@ -2839,56 +2918,7 @@ impl AgentInstance {
         }
     }
 
-    async fn rewrite_meta_tool_calls_for_execution(&self, tool_calls: &mut [ToolCallInfo]) {
-        let allowed = self.allowed_tool_set().await;
-        for tool_call in tool_calls {
-            if tool_call.name == "tool_call" {
-                match parse_meta_tool_call_arguments(&tool_call.arguments) {
-                    Ok((target_name, mut target_args)) => {
-                        let Some(canonical) = self.tool_registry.canonical_name(&target_name)
-                        else {
-                            eprintln!(
-                                "[Agent {}] meta-call target '{}' is not registered",
-                                self.id, target_name
-                            );
-                            continue;
-                        };
-                        if Self::is_meta_tool(&canonical) || !allowed.contains(&canonical) {
-                            eprintln!(
-                                "[Agent {}] meta-call target '{}' is not allowed for this agent",
-                                self.id, canonical
-                            );
-                            continue;
-                        }
-                        normalize_tool_args(&mut target_args);
-                        let target_arguments = serde_json::to_string(&target_args)
-                            .unwrap_or_else(|_| "{}".to_string());
-                        eprintln!(
-                            "[Agent {}] meta-call dispatch: tool_call -> '{}' args_len={}",
-                            self.id,
-                            canonical,
-                            target_arguments.len()
-                        );
-                        tool_call.name = canonical;
-                        tool_call.arguments = target_arguments;
-                    }
-                    Err(error) => {
-                        eprintln!(
-                            "[Agent {}] invalid meta-call arguments for tool_call id={}: {}",
-                            self.id, tool_call.id, error
-                        );
-                    }
-                }
-            }
-
-            if let Some(nested_tool_calls) = tool_call.nested_tool_calls.as_mut() {
-                Box::pin(self.rewrite_meta_tool_calls_for_execution(nested_tool_calls)).await;
-            }
-        }
-    }
-
     async fn available_tool_prompt_items(&self) -> Vec<InjectedPromptItem> {
-        let native_lazy = self.supports_native_tool_lazy_loading();
         let direct_overrides = self.tool_direct_load_overrides();
         let request_tool_names = self.build_request_tool_names().await;
         let mut direct_tool_names = HashSet::new();
@@ -2966,7 +2996,7 @@ impl AgentInstance {
                         "directLoadDefault": default_direct_load,
                         "directLoadOverride": direct_load_override,
                         "canConfigureDirectLoad": can_configure_direct_load,
-                        "nativeLazy": native_lazy,
+                        "nativeLazy": false,
                         "toolSource": tool_source,
                     })),
                 })
@@ -3061,6 +3091,10 @@ impl AgentInstance {
             knowledge_chars,
             total_chars: base_chars + env_chars + rules_chars + knowledge_chars,
         }
+    }
+
+    pub async fn rendered_env_prompt(&self) -> String {
+        self.build_system_prompt_parts().await.env_prompt
     }
 
     async fn build_api_tools(&self, tool_names: &[String]) -> Vec<serde_json::Value> {
@@ -4830,7 +4864,6 @@ impl AgentInstance {
                 reasoning_param_format,
                 replay_reasoning_content,
                 server_tools,
-                supports_tool_lazy_loading: _,
                 supports_vision,
                 ..
             } => {
@@ -5138,7 +5171,6 @@ impl AgentInstance {
     ) -> Result<u32, String> {
         let messages = store.get_messages_for_prompt(&self.session_id)?;
         let prepared_messages = compact::prepare_messages_for_llm(&messages);
-        self.seed_loaded_tools_from_history(&messages).await;
         let request_tools = self.build_request_tool_names().await;
         let api_tools = self.build_api_tools(&request_tools).await;
         Ok(compact::estimate_request_tokens(
@@ -5686,6 +5718,95 @@ impl AgentInstance {
             })
     }
 
+    fn add_canonical_skill_tool_name(&self, candidate: &str, names: &mut HashSet<String>) {
+        let candidate = candidate.trim();
+        if candidate.len() < 2 {
+            return;
+        }
+        let Some(canonical) = self.tool_registry.canonical_name(candidate) else {
+            return;
+        };
+        if Self::is_meta_tool(&canonical) {
+            return;
+        }
+        names.insert(canonical);
+    }
+
+    fn selected_skill_tool_names(
+        &self,
+        user_intent: Option<&crate::session::models::UserIntentPayload>,
+    ) -> HashSet<String> {
+        let Some(intent) = user_intent else {
+            return HashSet::new();
+        };
+        if intent.skills.is_empty() {
+            return HashSet::new();
+        }
+
+        let skills = crate::commands::list_skills_sync(
+            &self.working_dir,
+            self.app_knowledge_dir.as_ref().as_ref(),
+        );
+        let mut names = HashSet::new();
+
+        for skill in &intent.skills {
+            let manifest = Self::find_selected_skill_manifest(&skills, skill);
+
+            if let Some(package_id) = manifest.and_then(|manifest| manifest.package_id.as_deref()) {
+                for tool_name in
+                    crate::commands::skill_package_tool_names_for_package_sync(package_id)
+                {
+                    names.insert(tool_name);
+                }
+            }
+
+            if let Some(manifest) = manifest {
+                for tool_name in &manifest.tools {
+                    self.add_canonical_skill_tool_name(tool_name, &mut names);
+                }
+            }
+        }
+
+        names
+    }
+
+    fn clear_document_skill_tool_names(&self) {
+        if let Ok(mut names) = self.document_skill_tool_names.lock() {
+            names.clear();
+        }
+    }
+
+    fn active_skill_tool_names(
+        &self,
+        selected_skill_tool_names: &HashSet<String>,
+    ) -> HashSet<String> {
+        let mut names = selected_skill_tool_names.clone();
+        if let Ok(document_names) = self.document_skill_tool_names.lock() {
+            names.extend(document_names.iter().cloned());
+        }
+        names
+    }
+
+    fn activate_document_skill_tool_names(&self, tool_names: &[String]) -> Vec<String> {
+        let mut activated = Vec::new();
+        let Ok(mut names) = self.document_skill_tool_names.lock() else {
+            return activated;
+        };
+
+        for tool_name in tool_names {
+            let before = names.len();
+            self.add_canonical_skill_tool_name(tool_name, &mut names);
+            if names.len() > before {
+                if let Some(canonical) = self.tool_registry.canonical_name(tool_name) {
+                    activated.push(canonical);
+                }
+            }
+        }
+        activated.sort();
+        activated.dedup();
+        activated
+    }
+
     fn resolve_selected_skill_reminder_path(
         skills: &[crate::commands::SkillManifest],
         app_knowledge_dir: Option<&std::path::PathBuf>,
@@ -6100,6 +6221,23 @@ impl AgentInstance {
             session_id: self.session_id.clone(),
         });
 
+        let dynamic_tool_loading_mode = self.dynamic_tool_loading_mode(app_handle);
+        if dynamic_tool_loading_mode == crate::config::DynamicToolLoadingMode::Direct {
+            let messages = store.get_messages_for_prompt(&self.session_id)?;
+            self.seed_loaded_tools_from_history(&messages).await;
+        }
+        self.clear_document_skill_tool_names();
+        let selected_skill_tool_names = self.selected_skill_tool_names(user_intent.as_ref());
+        if !selected_skill_tool_names.is_empty() {
+            eprintln!(
+                "[Agent {}] selected Skill tools ready: session={} run={} count={}",
+                self.id,
+                self.session_id,
+                run_id,
+                selected_skill_tool_names.len()
+            );
+        }
+
         if initial_mode == "compact" {
             let prompt_parts = self.build_system_prompt_parts().await;
             let system_parts: Vec<&str> = {
@@ -6119,8 +6257,13 @@ impl AgentInstance {
             };
             let messages = store.get_messages_for_prompt(&self.session_id)?;
             let prepared_messages = compact::prepare_messages_for_llm(&messages);
-            self.seed_loaded_tools_from_history(&messages).await;
-            let request_tools = self.build_request_tool_names().await;
+            let active_skill_tool_names = self.active_skill_tool_names(&selected_skill_tool_names);
+            let request_tools = self
+                .build_request_tool_names_for_mode_and_skills(
+                    dynamic_tool_loading_mode,
+                    &active_skill_tool_names,
+                )
+                .await;
             let api_tools = self.build_api_tools(&request_tools).await;
             let estimated_input_tokens =
                 compact::estimate_request_tokens(&system_parts, &prepared_messages, &api_tools);
@@ -6289,9 +6432,6 @@ impl AgentInstance {
             first_user_message_id.is_some()
         );
 
-        let prompt_messages_after_user = store.get_messages_for_prompt(&self.session_id)?;
-        self.seed_loaded_tools_from_history(&prompt_messages_after_user).await;
-
         if matches!(&self.backend, LlmBackend::AnthropicAgentSdk) {
             let prompt_text = crate::session::history::render_prompt_content(
                 &actual_user_text,
@@ -6308,6 +6448,7 @@ impl AgentInstance {
                 }
                 parts.join("\n\n")
             };
+            let active_skill_tool_names = self.active_skill_tool_names(&selected_skill_tool_names);
             return self
                 .run_anthropic_agent_sdk(
                     app_handle,
@@ -6317,21 +6458,28 @@ impl AgentInstance {
                     images,
                     initial_mode,
                     &run_id,
+                    &active_skill_tool_names,
                 )
                 .await;
         }
 
         // Filter tools based on gating config
         let api_tools_started_at = Instant::now();
-        let request_tools = self.build_request_tool_names().await;
+        let active_skill_tool_names = self.active_skill_tool_names(&selected_skill_tool_names);
+        let request_tools = self
+            .build_request_tool_names_for_mode_and_skills(
+                dynamic_tool_loading_mode,
+                &active_skill_tool_names,
+            )
+            .await;
         let api_tools = self.build_api_tools(&request_tools).await;
         eprintln!(
-            "[Agent {}] api tools ready: session={} run={} elapsed_ms={} native_lazy={} request_tools={} api_tools={}",
+            "[Agent {}] api tools ready: session={} run={} elapsed_ms={} lazy_strategy=tool_load_fallback dynamic_tool_loading_mode={:?} request_tools={} api_tools={}",
             self.id,
             self.session_id,
             run_id,
             api_tools_started_at.elapsed().as_millis(),
-            self.supports_native_tool_lazy_loading(),
+            dynamic_tool_loading_mode,
             request_tools.len(),
             api_tools.len()
         );
@@ -6415,7 +6563,13 @@ impl AgentInstance {
                 model_context_limit(&self.effective_model)
             };
             let prepared_messages = compact::prepare_messages_for_llm(&messages);
-            let request_tools = self.build_request_tool_names().await;
+            let active_skill_tool_names = self.active_skill_tool_names(&selected_skill_tool_names);
+            let request_tools = self
+                .build_request_tool_names_for_mode_and_skills(
+                    dynamic_tool_loading_mode,
+                    &active_skill_tool_names,
+                )
+                .await;
             let api_tools = self.build_api_tools(&request_tools).await;
             let estimated_input_tokens =
                 compact::estimate_request_tokens(&system_parts, &prepared_messages, &api_tools);
@@ -6899,8 +7053,6 @@ impl AgentInstance {
                 })
                 .unwrap_or_else(|_| response.tool_calls.clone());
             self.normalize_tool_call_names(&mut ordered_tool_calls);
-            self.rewrite_meta_tool_calls_for_execution(&mut ordered_tool_calls)
-                .await;
             let response_content_order = response_text_part.as_ref().map(|part| part.seq);
             let response_thinking_order = response_thinking_part.as_ref().map(|part| part.seq);
             let response_render_parts = assistant_render_parts_for_response(
@@ -7063,22 +7215,11 @@ impl AgentInstance {
                     thinking_dur,
                 );
 
-                let direct_overrides = self.tool_direct_load_overrides();
                 let mut prepared: Vec<(ToolCallInfo, serde_json::Value)> = Vec::new();
                 for tc in &ordered_tool_calls {
                     // Skip server tools that already have pre-computed output.
                     if tc.is_server_tool() {
                         continue;
-                    }
-
-                    let native_lazy_invocation = self.supports_native_tool_lazy_loading()
-                        && !self.should_direct_load_tool(&tc.name, &direct_overrides)
-                        && self.loaded_tool_names.lock().await.contains(&tc.name);
-                    if native_lazy_invocation {
-                        eprintln!(
-                            "[Agent {}] native lazy tool invocation '{}' (id={})",
-                            self.id, tc.name, tc.id
-                        );
                     }
 
                     eprintln!(
@@ -7765,6 +7906,10 @@ impl AgentInstance {
                 | "unity_yaml_search"
                 | "unity_yaml_read"
                 | "unity_recompile"
+                | "view_capture"
+                | "view_snapshot"
+                | "view_wait"
+                | "view_console_read"
                 | "knowledge_list"
                 | "knowledge_query"
                 | "knowledge_read"
@@ -8238,21 +8383,60 @@ impl AgentInstance {
         }
 
         if tc.name == "tool_load" {
-            return ExecutedToolResult::from_tool_result(self.execute_tool_load(args).await);
+            let dynamic_mode = self.dynamic_tool_loading_mode(app_handle);
+            return ExecutedToolResult::from_tool_result(
+                self.execute_tool_load_with_mode(args, dynamic_mode).await,
+            );
         }
 
         if tc.name == "tool_call" {
-            let output = match parse_meta_tool_call_arguments(&tc.arguments) {
-                Ok((target, _)) => format!(
-                    "tool_call target '{}' could not be dispatched. Check that the target tool exists and is allowed for this agent.",
-                    target
-                ),
-                Err(error) => error,
+            let (target_name, mut target_args) = match parse_meta_tool_call_arguments(&tc.arguments)
+            {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    return ExecutedToolResult::from_tool_result(ToolResult {
+                        output: error,
+                        is_error: true,
+                    });
+                }
             };
-            return ExecutedToolResult::from_tool_result(ToolResult {
-                output,
-                is_error: true,
-            });
+            let Some(canonical) = self.tool_registry.canonical_name(&target_name) else {
+                return ExecutedToolResult::from_tool_result(ToolResult {
+                    output: format!("tool_call target '{}' is not registered.", target_name),
+                    is_error: true,
+                });
+            };
+            if Self::is_meta_tool(&canonical) || !self.is_allowed_agent_tool(&canonical).await {
+                return ExecutedToolResult::from_tool_result(ToolResult {
+                    output: format!(
+                        "tool_call target '{}' is not allowed for this agent.",
+                        canonical
+                    ),
+                    is_error: true,
+                });
+            }
+
+            normalize_tool_args(&mut target_args);
+            let target_arguments =
+                serde_json::to_string(&target_args).unwrap_or_else(|_| "{}".to_string());
+            eprintln!(
+                "[Agent {}] meta-call dispatch: tool_call -> '{}' args_len={}",
+                self.id,
+                canonical,
+                target_arguments.len()
+            );
+            let mut target_call = tc.clone();
+            target_call.name = canonical;
+            target_call.arguments = target_arguments;
+            return Box::pin(self.execute_single_tool(
+                app_handle,
+                store,
+                &target_call,
+                &target_args,
+                run_id,
+                mode,
+            ))
+            .await;
         }
 
         if !self.is_allowed_agent_tool(&tc.name).await {
@@ -8346,7 +8530,8 @@ impl AgentInstance {
             self.await_tool_result(self.execute_knowledge_query(app_handle, args))
                 .await
         } else if tc.name == "knowledge_read" {
-            ExecutedToolResult::from_tool_result(self.execute_knowledge_read(args))
+            self.execute_knowledge_read(app_handle, &tc.id, args, run_id)
+                .await
         } else if tc.name == "knowledge_create" {
             self.await_tool_result(self.execute_knowledge_create(app_handle, args))
                 .await
@@ -8378,6 +8563,9 @@ impl AgentInstance {
                 .await
         } else if tc.name == "unity_capture_viewport" {
             self.await_executed_tool_result(self.execute_unity_capture_viewport(args))
+                .await
+        } else if tc.name == "view_capture" {
+            self.await_executed_tool_result(self.execute_view_capture(app_handle, args))
                 .await
         } else if tc.name == "unity_ref_search" {
             ExecutedToolResult::from_tool_result(self.execute_unity_ref_search(app_handle, args))
@@ -8442,22 +8630,19 @@ impl AgentInstance {
         }
     }
 
+    #[cfg(test)]
     async fn execute_tool_load(&self, args: &serde_json::Value) -> ToolResult {
-        let native_lazy = self.supports_native_tool_lazy_loading();
+        self.execute_tool_load_with_mode(args, crate::config::DynamicToolLoadingMode::MetaTool)
+            .await
+    }
+
+    async fn execute_tool_load_with_mode(
+        &self,
+        args: &serde_json::Value,
+        dynamic_mode: crate::config::DynamicToolLoadingMode,
+    ) -> ToolResult {
         let allowed = self.allowed_tool_set().await;
-        let requested: Vec<String> = args
-            .get("tools")
-            .and_then(|value| value.as_array())
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(|item| item.as_str())
-                    .map(str::trim)
-                    .filter(|item| !item.is_empty())
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default();
+        let requested = Self::requested_tool_load_names(args);
 
         if requested.is_empty() {
             return ToolResult {
@@ -8467,8 +8652,8 @@ impl AgentInstance {
         }
 
         let direct_overrides = self.tool_direct_load_overrides();
-        let mut loaded_guard = self.loaded_tool_names.lock().await;
         let mut items = Vec::new();
+        let mut loaded_now = 0usize;
         for requested_name in requested {
             let Some(canonical) = self.tool_registry.canonical_name(&requested_name) else {
                 items.push(serde_json::json!({
@@ -8489,12 +8674,23 @@ impl AgentInstance {
 
             let configured_load_mode =
                 self.configured_tool_load_mode(&canonical, &direct_overrides);
-            let already_available = configured_load_mode == ToolLoadMode::Direct
-                || (native_lazy && loaded_guard.contains(&canonical));
-            let loaded = native_lazy && !already_available;
-            if loaded {
-                loaded_guard.insert(canonical.clone());
+            let direct_mode = dynamic_mode == crate::config::DynamicToolLoadingMode::Direct;
+            let was_loaded = self
+                .loaded_tool_names
+                .lock()
+                .map(|loaded| loaded.contains(&canonical))
+                .unwrap_or(false);
+            let already_available = configured_load_mode == ToolLoadMode::Direct || was_loaded;
+            let loaded_by_request =
+                direct_mode && configured_load_mode != ToolLoadMode::Direct && !was_loaded;
+            if loaded_by_request {
+                if let Ok(mut loaded) = self.loaded_tool_names.lock() {
+                    if loaded.insert(canonical.clone()) {
+                        loaded_now += 1;
+                    }
+                }
             }
+            let direct_available = direct_mode && (already_available || loaded_by_request);
 
             let mut item = serde_json::Map::new();
             item.insert("name".to_string(), serde_json::json!(canonical.clone()));
@@ -8508,55 +8704,64 @@ impl AgentInstance {
             );
             item.insert(
                 "status".to_string(),
-                serde_json::json!(if native_lazy { "loaded" } else { "described" }),
+                serde_json::json!(if direct_available {
+                    if already_available {
+                        "already_available"
+                    } else {
+                        "loaded"
+                    }
+                } else {
+                    "described"
+                }),
             );
-            item.insert("loaded".to_string(), serde_json::json!(loaded));
+            item.insert("loaded".to_string(), serde_json::json!(direct_available));
             item.insert(
                 "alreadyAvailable".to_string(),
                 serde_json::json!(already_available),
             );
 
-            if !native_lazy {
-                let Some((description, parameters)) =
-                    self.tool_registry.tool_description(&canonical)
-                else {
-                    items.push(serde_json::json!({
-                        "requested": requested_name,
-                        "name": canonical,
-                        "status": "unknown_tool",
-                    }));
-                    continue;
-                };
-                item.insert("description".to_string(), serde_json::json!(description));
-                item.insert("parameters".to_string(), parameters.clone());
-                item.insert("callWith".to_string(), serde_json::json!("tool_call"));
-            }
+            let Some((description, parameters)) = self.tool_registry.tool_description(&canonical)
+            else {
+                items.push(serde_json::json!({
+                    "requested": requested_name,
+                    "name": canonical,
+                    "status": "unknown_tool",
+                }));
+                continue;
+            };
+            item.insert("description".to_string(), serde_json::json!(description));
+            item.insert("parameters".to_string(), parameters.clone());
+            item.insert(
+                "callWith".to_string(),
+                serde_json::json!(if direct_available {
+                    canonical.as_str()
+                } else {
+                    "tool_call"
+                }),
+            );
+            item.insert(
+                "callPath".to_string(),
+                serde_json::json!(if direct_available {
+                    "direct"
+                } else {
+                    "meta_tool"
+                }),
+            );
 
             items.push(serde_json::Value::Object(item));
         }
-        drop(loaded_guard);
 
         eprintln!(
-            "[Agent {}] tool_load mode={} requested={} loaded_now={}",
+            "[Agent {}] tool_load dynamic_mode={:?} requested={} loaded_now={}",
             self.id,
-            if native_lazy {
-                "native_lazy"
-            } else {
-                "meta_call"
-            },
+            dynamic_mode,
             items.len(),
-            items
-                .iter()
-                .filter(|item| item
-                    .get("loaded")
-                    .and_then(|value| value.as_bool())
-                    .unwrap_or(false))
-                .count()
+            loaded_now
         );
 
         ToolResult {
             output: serde_json::to_string_pretty(&serde_json::json!({
-                "mode": if native_lazy { "native_lazy" } else { "meta_call" },
+                "mode": if dynamic_mode == crate::config::DynamicToolLoadingMode::Direct { "direct" } else { "meta_tool" },
                 "tools": items,
             }))
             .unwrap_or_else(|_| "{\"tools\":[]}".to_string()),
@@ -8886,28 +9091,45 @@ impl AgentInstance {
 
     // ─── knowledge_read ──────────────────────────────────────────────────────
 
-    fn execute_knowledge_read(&self, args: &serde_json::Value) -> ToolResult {
+    async fn execute_knowledge_read(
+        &self,
+        app_handle: &AppHandle,
+        tool_call_id: &str,
+        args: &serde_json::Value,
+        run_id: &str,
+    ) -> ExecutedToolResult {
         let parsed = match serde_json::from_value::<AgentKnowledgeReadArgs>(args.clone()) {
             Ok(value) if !value.path.trim().is_empty() => value,
             Ok(_) => {
-                return ToolResult {
+                return ExecutedToolResult::from_tool_result(ToolResult {
                     output: "Error: 'path' parameter is required.".to_string(),
                     is_error: true,
-                };
+                });
             }
             Err(error) => {
-                return ToolResult {
+                return ExecutedToolResult::from_tool_result(ToolResult {
                     output: format!("Error parsing knowledge_read arguments: {}", error),
                     is_error: true,
-                };
+                });
             }
         };
 
+        emit_tool_progress(
+            app_handle,
+            run_id,
+            &self.session_id,
+            tool_call_id,
+            "Reading knowledge document",
+            parsed.path.trim(),
+            None,
+            "running",
+        );
+
         let request = crate::knowledge_store::KnowledgeReadRequest {
             kind: crate::knowledge_store::KnowledgeTargetKind::Document,
-            path: parsed.path,
+            path: parsed.path.clone(),
             doc_type: None,
-            part: parsed.part,
+            part: parsed.part.clone(),
         };
 
         match crate::commands::execute_knowledge_read_request(
@@ -8916,26 +9138,185 @@ impl AgentInstance {
             request.clone(),
         ) {
             Ok(mut result) => {
+                let activated_tools = result
+                    .document
+                    .as_ref()
+                    .map(|document| {
+                        self.activate_document_skill_tool_names(&document.document.tools)
+                    })
+                    .unwrap_or_default();
                 Self::prefix_knowledge_read_response_paths(&mut result);
                 let sanitized = match Self::sanitize_knowledge_read_response(result) {
                     Ok(value) => value,
                     Err(error) => {
-                        return ToolResult {
+                        return ExecutedToolResult::from_tool_result(ToolResult {
                             output: format!("Error reading knowledge document: {}", error),
                             is_error: true,
-                        };
+                        });
                     }
                 };
-                ToolResult {
-                    output: Self::format_knowledge_read_output(&sanitized),
-                    is_error: false,
+                let mut output = Self::format_knowledge_read_output(&sanitized);
+
+                let compile_note = match self
+                    .compile_skill_package_unity_scripts_for_knowledge_read(
+                        app_handle,
+                        tool_call_id,
+                        run_id,
+                        &parsed.path,
+                    )
+                    .await
+                {
+                    Ok(note) => note,
+                    Err(error) => {
+                        emit_tool_progress(
+                            app_handle,
+                            run_id,
+                            &self.session_id,
+                            tool_call_id,
+                            "Skill C# compile skipped",
+                            "",
+                            None,
+                            "running",
+                        );
+                        Some(format!(
+                            "Locus Skill runtime: Unity C# scripts are not ready.\n{}",
+                            error
+                        ))
+                    }
+                };
+                if let Some(note) = compile_note {
+                    output.push_str("\n\n");
+                    output.push_str(&note);
                 }
+                if !activated_tools.is_empty() {
+                    output.push_str("\n\n");
+                    output.push_str("Loaded Skill document tools for the next step: ");
+                    output.push_str(&activated_tools.join(", "));
+                }
+                ExecutedToolResult::from_tool_result(ToolResult {
+                    output,
+                    is_error: false,
+                })
             }
-            Err(error) => ToolResult {
+            Err(error) => ExecutedToolResult::from_tool_result(ToolResult {
                 output: format!("Error reading knowledge document: {}", error),
                 is_error: true,
-            },
+            }),
         }
+    }
+
+    async fn compile_skill_package_unity_scripts_for_knowledge_read(
+        &self,
+        app_handle: &AppHandle,
+        tool_call_id: &str,
+        run_id: &str,
+        knowledge_path: &str,
+    ) -> Result<Option<String>, String> {
+        let Some(bundle) =
+            crate::commands::skill_package_unity_script_bundle_for_document_sync(knowledge_path)?
+        else {
+            return Ok(None);
+        };
+
+        emit_tool_progress(
+            app_handle,
+            run_id,
+            &self.session_id,
+            tool_call_id,
+            "Preparing Skill C# compile",
+            &format!("{} · {} script(s)", bundle.package_id, bundle.script_count),
+            Some(0.1),
+            "running",
+        );
+
+        if !self.has_selected_working_dir() {
+            return Ok(Some(format!(
+                "Locus Skill runtime: Unity C# compile skipped for `{}` because no Unity project working directory is selected.",
+                bundle.package_id
+            )));
+        }
+
+        let (connected, _status, _scene) =
+            crate::unity_bridge::query_unity_status(&self.working_dir).await;
+        if !connected {
+            return Ok(Some(format!(
+                "Locus Skill runtime: Unity C# compile skipped for `{}` because Unity Editor is disconnected.",
+                bundle.package_id
+            )));
+        }
+
+        emit_tool_progress(
+            app_handle,
+            run_id,
+            &self.session_id,
+            tool_call_id,
+            "Compiling Skill C# scripts",
+            &bundle.package_id,
+            Some(0.35),
+            "running",
+        );
+
+        let compile_raw =
+            crate::unity_bridge::compile_skill_package(&self.working_dir, &bundle.request).await?;
+        let compile_json = serde_json::from_str::<serde_json::Value>(&compile_raw)
+            .map_err(|error| format!("Failed to parse Skill C# compile response: {}", error))?;
+        let cache_hit = compile_json
+            .get("cacheHit")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        let assembly_id = compile_json
+            .get("assemblyId")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let public_type_count = compile_json
+            .get("publicTypeCount")
+            .and_then(|value| value.as_i64())
+            .unwrap_or(0);
+
+        emit_tool_progress(
+            app_handle,
+            run_id,
+            &self.session_id,
+            tool_call_id,
+            "Updating Unity type index",
+            &bundle.package_id,
+            Some(0.75),
+            "running",
+        );
+
+        let type_index_update =
+            crate::unity_bridge::update_unity_type_index_after_skill_package_compile(
+                &self.working_dir,
+                &compile_json,
+            )
+            .await?;
+
+        emit_tool_progress(
+            app_handle,
+            run_id,
+            &self.session_id,
+            tool_call_id,
+            "Skill C# scripts ready",
+            &bundle.package_id,
+            Some(1.0),
+            "running",
+        );
+
+        let cache_text = if cache_hit { "cache hit" } else { "compiled" };
+        let assembly_text = if assembly_id.trim().is_empty() {
+            bundle.source_hash.chars().take(12).collect::<String>()
+        } else {
+            assembly_id.to_string()
+        };
+        Ok(Some(format!(
+            "Locus Skill runtime: Unity C# scripts {} for `{}` (scripts: {}, public types: {}, assembly: `{}`, type index: {}).",
+            cache_text,
+            bundle.package_id,
+            bundle.script_count,
+            public_type_count,
+            assembly_text,
+            type_index_update.mode
+        )))
     }
 
     async fn reconcile_knowledge_workspace_with_source(
@@ -9265,7 +9646,16 @@ impl AgentInstance {
             };
         }
 
-        match crate::commands::create_skill_sync(&self.working_dir, parsed) {
+        let default_namespace = app_handle
+            .try_state::<Arc<crate::config::AppConfig>>()
+            .map(|config| config.default_skill_package_namespace())
+            .unwrap_or_default();
+
+        match crate::commands::create_skill_sync_with_default_package_namespace(
+            &self.working_dir,
+            parsed,
+            Some(&default_namespace),
+        ) {
             Ok(skill) => match self.reconcile_knowledge_workspace(app_handle).await {
                 Ok(()) => ToolResult {
                     output: Self::format_skill_manifest_detail_with_package_root("Created", &skill),
@@ -9364,16 +9754,19 @@ impl AgentInstance {
             return Self::interrupted_tool_result();
         }
 
-        let request = match crate::commands::agent_graph_tool_request_from_args(args, tool_call_id)
-        {
-            Ok(request) => request,
-            Err(error) => {
-                return ExecutedToolResult::from_tool_result(ToolResult {
-                    output: format!("Error parsing graph_view arguments: {}", error),
-                    is_error: true,
-                });
-            }
-        };
+        let mut request =
+            match crate::commands::agent_graph_tool_request_from_args(args, tool_call_id) {
+                Ok(request) => request,
+                Err(error) => {
+                    return ExecutedToolResult::from_tool_result(ToolResult {
+                        output: format!("Error parsing graph_view arguments: {}", error),
+                        is_error: true,
+                    });
+                }
+            };
+        let layout_image_requested = request.return_image;
+        let layout_image_enabled = layout_image_requested && self.supports_image_understanding();
+        request.return_image = layout_image_enabled;
         let request_id = request.request_id.clone();
         let editable = request.editable;
         let (tx, rx) = if editable {
@@ -9438,16 +9831,35 @@ impl AgentInstance {
                     "[Agent {}] graph_view: user submitted graph (request_id={})",
                     self.id, request_id
                 );
+                let images = if layout_image_enabled {
+                    answer.images.unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                let mut output = serde_json::json!({
+                    "status": "submitted",
+                    "requestId": answer.request_id,
+                    "option": answer.option,
+                    "graph": answer.graph,
+                });
+                if layout_image_requested {
+                    output["layoutImage"] = serde_json::Value::String(
+                        if layout_image_enabled && !images.is_empty() {
+                            "attached"
+                        } else if layout_image_enabled {
+                            "missing"
+                        } else {
+                            "skipped_endpoint_without_image_understanding"
+                        }
+                        .to_string(),
+                    );
+                }
                 ExecutedToolResult::from_tool_result(ToolResult {
-                    output: serde_json::to_string_pretty(&serde_json::json!({
-                        "status": "submitted",
-                        "requestId": answer.request_id,
-                        "option": answer.option,
-                        "graph": answer.graph,
-                    }))
-                    .unwrap_or_else(|_| "Graph submitted.".to_string()),
+                    output: serde_json::to_string_pretty(&output)
+                        .unwrap_or_else(|_| "Graph submitted.".to_string()),
                     is_error: false,
                 })
+                .with_images(images)
             }
             Some(Ok(crate::commands::AgentGraphToolAnswer::Cancelled)) => {
                 eprintln!(
@@ -10150,7 +10562,10 @@ impl AgentInstance {
             Ok(Some(g)) => g,
             Ok(None) => {
                 return ToolResult {
-                    output: format!("Asset not found in reference graph: '{}'. Make sure the path is relative to the project root (e.g. 'Assets/Scenes/Main.unity').", asset_path),
+                    output: format!(
+                        "Asset not found in reference graph: '{}'. Make sure the path is relative to the project root (e.g. 'Assets/Scenes/Main.unity').",
+                        asset_path
+                    ),
                     is_error: true,
                 };
             }
@@ -11729,11 +12144,15 @@ impl AgentInstance {
                                 eprintln!(
                                     "[Agent {}] merged subagent tokens: +{}in/+{}out/+{}cache_r/+{}cache_w/${:.6} -> parent total: {}in/{}out/{}cache_r/{}cache_w/${:.6}",
                                     self.id,
-                                    child_usage.total_input_tokens, child_usage.total_output_tokens,
-                                    child_usage.total_cache_read_tokens, child_usage.total_cache_write_tokens,
+                                    child_usage.total_input_tokens,
+                                    child_usage.total_output_tokens,
+                                    child_usage.total_cache_read_tokens,
+                                    child_usage.total_cache_write_tokens,
                                     child_usage.total_cost_usd,
-                                    parent_totals.total_input_tokens, parent_totals.total_output_tokens,
-                                    parent_totals.total_cache_read_tokens, parent_totals.total_cache_write_tokens,
+                                    parent_totals.total_input_tokens,
+                                    parent_totals.total_output_tokens,
+                                    parent_totals.total_cache_read_tokens,
+                                    parent_totals.total_cache_write_tokens,
                                     parent_totals.total_cost_usd,
                                 );
                                 emit_stream(
@@ -11948,7 +12367,10 @@ mod tests {
     use crate::tool::{ToolDef, ToolRegistry, ToolResult};
     use crate::unity_docs::seed_managed_documents_for_tests;
     use serde_json::json;
-    use std::{collections::HashMap, sync::Arc};
+    use std::{
+        collections::{HashMap, HashSet},
+        sync::Arc,
+    };
     use tempfile::tempdir;
 
     #[test]
@@ -12833,6 +13255,283 @@ PrefabInstance:
     }
 
     #[tokio::test]
+    async fn openai_chat_custom_backend_uses_meta_tool_lazy_loading_without_manual_config() {
+        let temp = tempdir().expect("temp dir");
+        let working_dir = temp.path().to_string_lossy().to_string();
+        crate::commands::save_tool_direct_load_override(
+            &working_dir,
+            "test",
+            "knowledge_create",
+            false,
+            true,
+        )
+        .expect("save lazy override");
+
+        let (_, cancel_rx) = tokio::sync::watch::channel(false);
+        let instance = AgentInstance::new(
+            Arc::new(AgentDef {
+                id: "test".to_string(),
+                name: "Test".to_string(),
+                description: String::new(),
+                system_prompt: String::new(),
+                env_template: String::new(),
+                tools: vec![
+                    "edit".to_string(),
+                    "knowledge_create".to_string(),
+                    "unity_run_states".to_string(),
+                    "web_fetch".to_string(),
+                ],
+                sub_agents: Vec::new(),
+                default: false,
+                default_effort: None,
+                model_recommendation: None,
+                source: "test".to_string(),
+            }),
+            "session-test",
+            crate::agent::instance::LlmBackend::Custom {
+                api_key: String::new(),
+                api_model: "test-model".to_string(),
+                endpoint: "https://example.com/v1".to_string(),
+                api_format: crate::commands::ApiFormat::OpenaiChat,
+                context_length: 256_000,
+                beta_flags: Vec::new(),
+                supported_reasoning_efforts: Vec::new(),
+                reasoning_param_format:
+                    crate::commands::CustomReasoningParamFormat::OpenaiChatReasoningEffort,
+                replay_reasoning_content: true,
+                server_tools: crate::commands::CustomEndpointServerTools::default(),
+                supports_vision: true,
+            },
+            false,
+            Arc::new(AgentDefRegistry::load(None, None)),
+            Arc::new(ToolRegistry::with_builtins()),
+            working_dir,
+            RawContextStore::default(),
+            None,
+            "test-model".to_string(),
+            None,
+            Arc::new(None),
+            Arc::new(None),
+            KnowledgeAccessMode::Full,
+            None,
+            HashMap::new(),
+            cancel_rx,
+        );
+
+        let request_tool_names = instance.build_request_tool_names().await;
+        assert!(request_tool_names.contains(&"tool_load".to_string()));
+        assert!(request_tool_names.contains(&"tool_call".to_string()));
+        assert!(request_tool_names.contains(&"edit".to_string()));
+        assert!(!request_tool_names.contains(&"knowledge_create".to_string()));
+        assert!(!request_tool_names.contains(&"unity_run_states".to_string()));
+        assert!(!request_tool_names.contains(&"web_fetch".to_string()));
+
+        let manifest_names = instance.lazy_tool_manifest_names().await;
+        assert!(manifest_names.contains(&"knowledge_create".to_string()));
+        assert!(manifest_names.contains(&"unity_run_states".to_string()));
+        assert!(manifest_names.contains(&"web_fetch".to_string()));
+        assert!(!manifest_names.contains(&"edit".to_string()));
+
+        let items = instance.available_tool_prompt_items().await;
+        assert_eq!(tool_load_mode(&items, "tool_load"), "direct");
+        assert_eq!(tool_load_mode(&items, "tool_call"), "direct");
+        assert_eq!(tool_load_mode(&items, "edit"), "direct");
+        assert_eq!(tool_load_mode(&items, "knowledge_create"), "lazy");
+        assert_eq!(tool_load_mode(&items, "unity_run_states"), "lazy");
+        assert_eq!(tool_load_mode(&items, "web_fetch"), "lazy");
+        assert_eq!(
+            tool_meta_bool(&items, "knowledge_create", "canConfigureDirectLoad"),
+            Some(false)
+        );
+        assert_eq!(
+            tool_meta_bool(&items, "edit", "canConfigureDirectLoad"),
+            Some(false)
+        );
+        assert_eq!(
+            tool_meta_bool(&items, "knowledge_create", "directLoadOverride"),
+            None
+        );
+
+        let load_result = instance
+            .execute_tool_load(&serde_json::json!({ "tools": ["web_fetch"] }))
+            .await;
+        assert!(!load_result.is_error, "{}", load_result.output);
+        let load_json: serde_json::Value =
+            serde_json::from_str(&load_result.output).expect("tool_load json");
+        assert_eq!(load_json["tools"][0]["name"], "web_fetch");
+        assert_eq!(load_json["tools"][0]["status"], "described");
+        assert_eq!(load_json["tools"][0]["callWith"], "tool_call");
+    }
+
+    #[tokio::test]
+    async fn responses_custom_backend_uses_tool_load_fallback_for_lazy_tools() {
+        let temp = tempdir().expect("temp dir");
+        let working_dir = temp.path().to_string_lossy().to_string();
+        let (_, cancel_rx) = tokio::sync::watch::channel(false);
+        let instance = AgentInstance::new(
+            Arc::new(AgentDef {
+                id: "test".to_string(),
+                name: "Test".to_string(),
+                description: String::new(),
+                system_prompt: String::new(),
+                env_template: String::new(),
+                tools: vec![
+                    "edit".to_string(),
+                    "knowledge_create".to_string(),
+                    "web_fetch".to_string(),
+                ],
+                sub_agents: Vec::new(),
+                default: false,
+                default_effort: None,
+                model_recommendation: None,
+                source: "test".to_string(),
+            }),
+            "session-test",
+            crate::agent::instance::LlmBackend::Custom {
+                api_key: String::new(),
+                api_model: "test-model".to_string(),
+                endpoint: "https://example.com/v1".to_string(),
+                api_format: crate::commands::ApiFormat::OpenaiResponses,
+                context_length: 256_000,
+                beta_flags: Vec::new(),
+                supported_reasoning_efforts: Vec::new(),
+                reasoning_param_format:
+                    crate::commands::CustomReasoningParamFormat::OpenaiResponsesReasoningEffort,
+                replay_reasoning_content: true,
+                server_tools: crate::commands::CustomEndpointServerTools::default(),
+                supports_vision: true,
+            },
+            false,
+            Arc::new(AgentDefRegistry::load(None, None)),
+            Arc::new(ToolRegistry::with_builtins()),
+            working_dir,
+            RawContextStore::default(),
+            None,
+            "test-model".to_string(),
+            None,
+            Arc::new(None),
+            Arc::new(None),
+            KnowledgeAccessMode::Full,
+            None,
+            HashMap::new(),
+            cancel_rx,
+        );
+
+        let request_tool_names = instance.build_request_tool_names().await;
+        assert!(request_tool_names.contains(&"tool_load".to_string()));
+        assert!(request_tool_names.contains(&"tool_call".to_string()));
+        assert!(request_tool_names.contains(&"edit".to_string()));
+        assert!(!request_tool_names.contains(&"knowledge_create".to_string()));
+        assert!(!request_tool_names.contains(&"web_fetch".to_string()));
+
+        let api_tools = instance.build_api_tools(&request_tool_names).await;
+        assert!(api_tools
+            .iter()
+            .all(|tool| tool["function"].get("defer_loading").is_none()));
+
+        let manifest = instance
+            .lazy_tool_manifest_prompt()
+            .await
+            .expect("lazy manifest");
+        assert!(manifest.contains("- `knowledge_create`"));
+        assert!(manifest.contains("- `web_fetch`"));
+
+        let load_result = instance
+            .execute_tool_load(&serde_json::json!({ "tools": ["web_fetch"] }))
+            .await;
+        assert!(!load_result.is_error, "{}", load_result.output);
+        let load_json: serde_json::Value =
+            serde_json::from_str(&load_result.output).expect("tool_load json");
+        assert_eq!(load_json["mode"], "meta_tool");
+        assert_eq!(load_json["tools"][0]["name"], "web_fetch");
+        assert_eq!(load_json["tools"][0]["status"], "described");
+        assert_eq!(load_json["tools"][0]["callWith"], "tool_call");
+    }
+
+    #[tokio::test]
+    async fn direct_dynamic_tool_loading_adds_loaded_tool_to_native_request_tools() {
+        let temp = tempdir().expect("temp dir");
+        let working_dir = temp.path().to_string_lossy().to_string();
+        let (_, cancel_rx) = tokio::sync::watch::channel(false);
+        let instance = AgentInstance::new(
+            Arc::new(AgentDef {
+                id: "test".to_string(),
+                name: "Test".to_string(),
+                description: String::new(),
+                system_prompt: String::new(),
+                env_template: String::new(),
+                tools: vec!["edit".to_string(), "web_fetch".to_string()],
+                sub_agents: Vec::new(),
+                default: false,
+                default_effort: None,
+                model_recommendation: None,
+                source: "test".to_string(),
+            }),
+            "session-test",
+            crate::agent::instance::LlmBackend::Custom {
+                api_key: String::new(),
+                api_model: "test-model".to_string(),
+                endpoint: "https://example.com/v1".to_string(),
+                api_format: crate::commands::ApiFormat::OpenaiResponses,
+                context_length: 256_000,
+                beta_flags: Vec::new(),
+                supported_reasoning_efforts: Vec::new(),
+                reasoning_param_format:
+                    crate::commands::CustomReasoningParamFormat::OpenaiResponsesReasoningEffort,
+                replay_reasoning_content: true,
+                server_tools: crate::commands::CustomEndpointServerTools::default(),
+                supports_vision: true,
+            },
+            false,
+            Arc::new(AgentDefRegistry::load(None, None)),
+            Arc::new(ToolRegistry::with_builtins()),
+            working_dir,
+            RawContextStore::default(),
+            None,
+            "test-model".to_string(),
+            None,
+            Arc::new(None),
+            Arc::new(None),
+            KnowledgeAccessMode::Full,
+            None,
+            HashMap::new(),
+            cancel_rx,
+        );
+
+        let request_tool_names = instance
+            .build_request_tool_names_for_mode(crate::config::DynamicToolLoadingMode::Direct)
+            .await;
+        assert!(request_tool_names.contains(&"tool_load".to_string()));
+        assert!(!request_tool_names.contains(&"tool_call".to_string()));
+        assert!(request_tool_names.contains(&"edit".to_string()));
+        assert!(!request_tool_names.contains(&"web_fetch".to_string()));
+
+        let load_result = instance
+            .execute_tool_load_with_mode(
+                &serde_json::json!({ "tools": ["web_fetch"] }),
+                crate::config::DynamicToolLoadingMode::Direct,
+            )
+            .await;
+        assert!(!load_result.is_error, "{}", load_result.output);
+        let load_json: serde_json::Value =
+            serde_json::from_str(&load_result.output).expect("tool_load json");
+        assert_eq!(load_json["mode"], "direct");
+        assert_eq!(load_json["tools"][0]["name"], "web_fetch");
+        assert_eq!(load_json["tools"][0]["status"], "loaded");
+        assert_eq!(load_json["tools"][0]["loaded"], true);
+        assert_eq!(load_json["tools"][0]["callWith"], "web_fetch");
+        assert_eq!(load_json["tools"][0]["callPath"], "direct");
+
+        let direct_request_tool_names = instance
+            .build_request_tool_names_for_mode(crate::config::DynamicToolLoadingMode::Direct)
+            .await;
+        assert!(direct_request_tool_names.contains(&"web_fetch".to_string()));
+
+        let meta_request_tool_names = instance.build_request_tool_names().await;
+        assert!(!meta_request_tool_names.contains(&"web_fetch".to_string()));
+    }
+
+    #[tokio::test]
     async fn lazy_tool_names_are_injected_into_prompt_and_preview_items() {
         let temp = tempdir().expect("temp dir");
         let (_, cancel_rx) = tokio::sync::watch::channel(false);
@@ -12948,12 +13647,86 @@ PrefabInstance:
         assert!(!manifest_names.contains(&"read".to_string()));
         assert!(!manifest_names.contains(&"skill_special".to_string()));
 
+        let request_tool_names = instance.build_request_tool_names().await;
+        assert!(request_tool_names.contains(&"tool_call".to_string()));
+        assert!(!request_tool_names.contains(&"skill_special".to_string()));
+
+        let direct_request_tool_names = instance
+            .build_request_tool_names_for_mode(crate::config::DynamicToolLoadingMode::Direct)
+            .await;
+        assert!(!direct_request_tool_names.contains(&"tool_call".to_string()));
+        assert!(!direct_request_tool_names.contains(&"skill_special".to_string()));
+
         let items = instance.available_tool_prompt_items().await;
         assert_eq!(tool_load_mode(&items, "skill_special"), "skill");
+        assert_eq!(
+            tool_meta_bool(&items, "skill_special", "directLoaded"),
+            Some(false)
+        );
         assert_eq!(
             tool_meta_bool(&items, "skill_special", "canConfigureDirectLoad"),
             Some(false)
         );
+    }
+
+    #[tokio::test]
+    async fn selected_skill_tools_enter_native_request_tools_for_command_intent() {
+        let temp = tempdir().expect("temp dir");
+        let (_, cancel_rx) = tokio::sync::watch::channel(false);
+        let mut registry = ToolRegistry::with_builtins();
+        registry.register(noop_tool("skill_special"));
+        let instance = AgentInstance::new(
+            Arc::new(AgentDef {
+                id: "test".to_string(),
+                name: "Test".to_string(),
+                description: String::new(),
+                system_prompt: String::new(),
+                env_template: String::new(),
+                tools: vec!["read".to_string(), "skill_special".to_string()],
+                sub_agents: Vec::new(),
+                default: false,
+                default_effort: None,
+                model_recommendation: None,
+                source: "test".to_string(),
+            }),
+            "session-test",
+            crate::agent::instance::LlmBackend::AnthropicAgentSdk,
+            false,
+            Arc::new(AgentDefRegistry::load(None, None)),
+            Arc::new(registry),
+            temp.path().to_string_lossy().to_string(),
+            RawContextStore::default(),
+            None,
+            "test-model".to_string(),
+            None,
+            Arc::new(None),
+            Arc::new(None),
+            KnowledgeAccessMode::Full,
+            None,
+            HashMap::new(),
+            cancel_rx,
+        );
+        let active_skill_tool_names = HashSet::from(["skill_special".to_string()]);
+
+        let request_tool_names = instance
+            .build_request_tool_names_for_mode_and_skills(
+                crate::config::DynamicToolLoadingMode::MetaTool,
+                &active_skill_tool_names,
+            )
+            .await;
+        assert!(request_tool_names.contains(&"tool_load".to_string()));
+        assert!(request_tool_names.contains(&"tool_call".to_string()));
+        assert!(request_tool_names.contains(&"skill_special".to_string()));
+
+        let direct_request_tool_names = instance
+            .build_request_tool_names_for_mode_and_skills(
+                crate::config::DynamicToolLoadingMode::Direct,
+                &active_skill_tool_names,
+            )
+            .await;
+        assert!(direct_request_tool_names.contains(&"tool_load".to_string()));
+        assert!(!direct_request_tool_names.contains(&"tool_call".to_string()));
+        assert!(direct_request_tool_names.contains(&"skill_special".to_string()));
     }
 
     #[tokio::test]
@@ -13157,6 +13930,113 @@ Use profiler helpers.
         );
     }
 
+    #[tokio::test]
+    async fn selected_command_skill_declared_tools_enter_initial_request_tools() {
+        let root = tempdir().expect("temp dir");
+        let workspace = root.path().join("workspace");
+        let app_knowledge_dir = root.path().join("app-knowledge");
+        let skill_dir = app_knowledge_dir.join("skill").join("builtin");
+        std::fs::create_dir_all(&workspace).expect("create workspace");
+        std::fs::create_dir_all(&skill_dir).expect("create skill dir");
+        std::fs::write(
+            skill_dir.join("create-skill.md"),
+            r#"---
+id: kd_skill_create_skill
+type: skill
+path: builtin/create-skill.md
+title: Create Skill
+injectMode: none
+summaryEnabled: true
+commandEnabled: true
+readOnly: true
+aiMaintained: false
+skillEnabled: true
+skillSurface: command
+commandTrigger: /create-skill
+argumentHint:
+tools:
+  - skill_create
+  - skill_reload
+  - skill_list
+createdAt: 1
+updatedAt: 1
+---
+
+# Create Skill
+
+## Summary
+Create a Skill.
+
+## Content
+Create a reusable Skill.
+"#,
+        )
+        .expect("write create skill");
+
+        let (_, cancel_rx) = tokio::sync::watch::channel(false);
+        let agent = AgentInstance::new(
+            Arc::new(AgentDef {
+                id: "test".to_string(),
+                name: "Test".to_string(),
+                description: String::new(),
+                system_prompt: String::new(),
+                env_template: String::new(),
+                tools: vec![
+                    "skill_create".to_string(),
+                    "skill_reload".to_string(),
+                    "skill_list".to_string(),
+                ],
+                sub_agents: Vec::new(),
+                default: false,
+                default_effort: None,
+                model_recommendation: None,
+                source: "test".to_string(),
+            }),
+            "session-test",
+            crate::agent::instance::LlmBackend::AnthropicAgentSdk,
+            false,
+            Arc::new(AgentDefRegistry::load(None, None)),
+            Arc::new(ToolRegistry::with_builtins()),
+            workspace.to_string_lossy().to_string(),
+            RawContextStore::default(),
+            None,
+            "test-model".to_string(),
+            None,
+            Arc::new(Some(app_knowledge_dir)),
+            Arc::new(None),
+            KnowledgeAccessMode::Full,
+            None,
+            HashMap::new(),
+            cancel_rx,
+        );
+        let intent = UserIntentPayload {
+            kind: "user_intent_v1".to_string(),
+            mode: "build".to_string(),
+            skills: vec![UserIntentSkill {
+                dir_name: "create-skill".to_string(),
+                source: "app".to_string(),
+                name: "Create Skill".to_string(),
+            }],
+            client_message_id: None,
+        };
+        let active_skill_tool_names = agent.selected_skill_tool_names(Some(&intent));
+
+        assert!(active_skill_tool_names.contains("skill_create"));
+        assert!(active_skill_tool_names.contains("skill_reload"));
+        assert!(active_skill_tool_names.contains("skill_list"));
+
+        let request_tool_names = agent
+            .build_request_tool_names_for_mode_and_skills(
+                crate::config::DynamicToolLoadingMode::MetaTool,
+                &active_skill_tool_names,
+            )
+            .await;
+
+        assert!(request_tool_names.contains(&"skill_create".to_string()));
+        assert!(request_tool_names.contains(&"skill_reload".to_string()));
+        assert!(request_tool_names.contains(&"skill_list".to_string()));
+    }
+
     fn sample_agent_knowledge_document(path: &str, title: &str) -> KnowledgeDocument {
         KnowledgeDocument {
             id: format!("kd_{}", title.replace(' ', "_").to_lowercase()),
@@ -13179,6 +14059,7 @@ Use profiler helpers.
             skill_surface: None,
             command_trigger: None,
             argument_hint: None,
+            tools: Vec::new(),
             summary: Some("Summary".to_string()),
             body: "Body".to_string(),
             maintenance_rules: Some("Rules".to_string()),
@@ -13459,6 +14340,7 @@ Use profiler helpers.
                 skill_surface: None,
                 command_trigger: None,
                 argument_hint: None,
+                tools: Vec::new(),
                 summary: None,
                 body: "Body".to_string(),
                 maintenance_rules: None,
@@ -13620,6 +14502,7 @@ Use profiler helpers.
                 skill_surface: None,
                 command_trigger: None,
                 argument_hint: None,
+                tools: Vec::new(),
                 summary: None,
                 body: "Body".to_string(),
                 maintenance_rules: None,
@@ -13672,6 +14555,7 @@ Use profiler helpers.
                 skill_surface: None,
                 command_trigger: None,
                 argument_hint: None,
+                tools: Vec::new(),
                 summary: None,
                 body: "Body".to_string(),
                 maintenance_rules: None,
@@ -13723,6 +14607,7 @@ Use profiler helpers.
                 skill_surface: None,
                 command_trigger: Some("/create-skill".to_string()),
                 argument_hint: None,
+                tools: Vec::new(),
                 summary: Some("Create reusable Skills.".to_string()),
                 body: "Body".to_string(),
                 maintenance_rules: None,
@@ -13807,6 +14692,7 @@ Use profiler helpers.
             skill_surface: None,
             command_trigger: None,
             argument_hint: None,
+            tools: Vec::new(),
             summary: None,
             body: "Execution order details".to_string(),
             maintenance_rules: None,
@@ -13925,6 +14811,7 @@ Use profiler helpers.
                 skill_surface: None,
                 command_trigger: None,
                 argument_hint: None,
+                tools: Vec::new(),
                 summary: None,
                 body: String::new(),
                 maintenance_rules: None,
@@ -13968,6 +14855,7 @@ Use profiler helpers.
                 skill_surface: None,
                 command_trigger: None,
                 argument_hint: None,
+                tools: Vec::new(),
                 summary: None,
                 body: "# 一级\n## 二级\n正文".to_string(),
                 maintenance_rules: None,
@@ -14002,6 +14890,12 @@ Use profiler helpers.
         assert!(prompt_parts
             .knowledge_prompt
             .contains("#### memory/project-mistake-note.md"));
+        assert!(prompt_parts
+            .knowledge_prompt
+            .contains("`skill/psd-to-ugui/references/details.md`"));
+        assert!(prompt_parts
+            .knowledge_prompt
+            .contains("`reference/unity/ugui-layout.md`"));
         let search_index = prompt_parts
             .knowledge_prompt
             .find("### Search")
@@ -14207,6 +15101,7 @@ Use profiler helpers.
                     skill_surface: None,
                     command_trigger: None,
                     argument_hint: None,
+                    tools: Vec::new(),
                     summary: Some("Summary".to_string()),
                     body: "Body".to_string(),
                     maintenance_rules: Some("Rules".to_string()),

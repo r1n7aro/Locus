@@ -18,7 +18,7 @@ pub(super) fn unity_execute() -> ToolDef {
                         return ToolResult {
                             output: "Missing required parameter: code".to_string(),
                             is_error: true,
-                        }
+                        };
                     }
                 };
 
@@ -33,7 +33,7 @@ pub(super) fn unity_execute() -> ToolDef {
                         return ToolResult {
                             output: "Missing required parameter: request_editor_status".to_string(),
                             is_error: true,
-                        }
+                        };
                     }
                 };
 
@@ -299,7 +299,7 @@ pub(super) fn unity_recompile() -> ToolDef {
                                 crate::unity_bridge::UNITY_EDITOR_STATUS_SCHEMA
                             ),
                             is_error: true,
-                        }
+                        };
                     }
                 };
 
@@ -320,7 +320,7 @@ pub(super) fn unity_recompile() -> ToolDef {
                         return ToolResult {
                             output: "Missing required parameter: project_path".to_string(),
                             is_error: true,
-                        }
+                        };
                     }
                 };
 

@@ -10,6 +10,8 @@
 
 * Use `unity_execute` to execute code inside the Unity Editor, and use `bash` to run scripts on the system.
 
+* For Unity debugging, use `unity_execute` / `unity_run_states` with `print` / `ctx.Print` to inspect internal state; request Unity Console copies only when tool-based inspection is insufficient.
+
 * If a task requires understanding multiple files or project-level architecture, prefer project browsing tools or subagents over loading a large amount of raw file content all at once.
 
 * **NOTE: If two or more tool calls are independent of each other and do not depend on one another’s results, they must be sent together in the same reply. Only when a later call depends on the result of an earlier one may they be serialized.**

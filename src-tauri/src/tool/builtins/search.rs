@@ -18,7 +18,7 @@ pub(super) fn grep() -> ToolDef {
                         return ToolResult {
                             output: "Missing required parameter: pattern".to_string(),
                             is_error: true,
-                        }
+                        };
                     }
                 };
                 let search_path = args
@@ -33,7 +33,7 @@ pub(super) fn grep() -> ToolDef {
                         return ToolResult {
                             output: "Missing required parameter: path".to_string(),
                             is_error: true,
-                        }
+                        };
                     }
                 };
                 let include = args
@@ -47,7 +47,7 @@ pub(super) fn grep() -> ToolDef {
                         return ToolResult {
                             output: format!("Invalid regex pattern '{}': {}", pattern, e),
                             is_error: true,
-                        }
+                        };
                     }
                 };
 

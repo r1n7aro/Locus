@@ -52,8 +52,15 @@ pub fn register_all(registry: &mut ToolRegistry) {
     registry.register_builtin_with_load_mode(view::view_compile_script(), ToolLoadMode::Skill);
     registry.register_builtin_with_load_mode(view::view_call_script(), ToolLoadMode::Skill);
     registry.register_builtin_with_load_mode(view::view_binding_read(), ToolLoadMode::Skill);
+    registry.register_builtin_with_load_mode(view::view_binding_discover(), ToolLoadMode::Skill);
     registry.register_builtin_with_load_mode(view::view_binding_write(), ToolLoadMode::Skill);
     registry.register_builtin_with_load_mode(view::view_binding_apply(), ToolLoadMode::Skill);
+    registry.register_builtin_with_load_mode(view::view_capture(), ToolLoadMode::Skill);
+    registry.register_builtin_with_load_mode(view::view_snapshot(), ToolLoadMode::Skill);
+    registry.register_builtin_with_load_mode(view::view_action(), ToolLoadMode::Skill);
+    registry.register_builtin_with_load_mode(view::view_wait(), ToolLoadMode::Skill);
+    registry.register_builtin_with_load_mode(view::view_console_read(), ToolLoadMode::Skill);
+    registry.register_builtin_with_load_mode(view::view_debug_eval(), ToolLoadMode::Skill);
     registry.register_builtin(config_query_tool());
     registry.register_builtin(tool_load_tool());
     registry.register_builtin(tool_call_tool());
@@ -119,7 +126,7 @@ fn tool_call_tool() -> ToolDef {
     let execute: ToolExecuteFn = std::sync::Arc::new(|_args, _ctx| {
         Box::pin(async {
             ToolResult {
-                output: "Error: tool_call tool should be rewritten by agent loop".to_string(),
+                output: "Error: tool_call tool should be dispatched by agent loop".to_string(),
                 is_error: true,
             }
         })

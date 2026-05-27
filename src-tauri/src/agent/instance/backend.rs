@@ -6,15 +6,14 @@ use serde::Serialize;
 use crate::session::models::ToolCallInfo;
 
 pub type RawContextStore = Arc<tokio::sync::Mutex<HashMap<String, Vec<RawRound>>>>;
+type SessionUnityStateStore = tokio::sync::Mutex<HashMap<String, (String, Option<String>)>>;
 
 pub(super) const MAX_TOOL_ITERATIONS: usize = 200;
 
 pub use crate::commands::CodexTransportMode;
 
-pub(super) fn session_unity_state(
-) -> &'static tokio::sync::Mutex<HashMap<String, (String, Option<String>)>> {
-    static STORE: OnceLock<tokio::sync::Mutex<HashMap<String, (String, Option<String>)>>> =
-        OnceLock::new();
+pub(super) fn session_unity_state() -> &'static SessionUnityStateStore {
+    static STORE: OnceLock<SessionUnityStateStore> = OnceLock::new();
     STORE.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
 }
 
@@ -232,7 +231,6 @@ pub enum LlmBackend {
         reasoning_param_format: crate::commands::CustomReasoningParamFormat,
         replay_reasoning_content: bool,
         server_tools: crate::commands::CustomEndpointServerTools,
-        supports_tool_lazy_loading: bool,
         supports_vision: bool,
     },
 }

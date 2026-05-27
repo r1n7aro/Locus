@@ -62,7 +62,7 @@ pub(super) fn bash() -> ToolDef {
                         return ToolResult {
                             output: "Missing required parameter: command".to_string(),
                             is_error: true,
-                        }
+                        };
                     }
                 };
                 let _desc = args

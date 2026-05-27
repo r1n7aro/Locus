@@ -1,5 +1,5 @@
 {
-  "description": "Load one or more specialized tools by name. On endpoints that support native lazy tool loading, the result only reports load status and the loaded tools become available as normal tools in the next model turn. On other endpoints, the result includes tool descriptions and parameter schemas; call the target tool through `tool_call`.",
+  "description": "Load one or more specialized tools by name. The result returns the call path. In meta-tool mode, call targets through `tool_call`; in direct mode, loaded targets become native tools on the next model step.",
   "parameters": {
     "type": "object",
     "properties": {

@@ -24,8 +24,7 @@ const RESPONSES_ENDPOINT_PATH: &str = "/responses";
 const RESPONSES_WEBSOCKETS_V2_BETA_HEADER_VALUE: &str = "responses_websockets=2026-02-06";
 const X_CODEX_TURN_STATE_HEADER: &str = "x-codex-turn-state";
 const WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE: &str = "websocket_connection_limit_reached";
-const WEBSOCKET_CONNECTION_LIMIT_REACHED_MESSAGE: &str =
-    "Responses websocket connection limit reached (60 minutes). Create a new websocket connection to continue.";
+const WEBSOCKET_CONNECTION_LIMIT_REACHED_MESSAGE: &str = "Responses websocket connection limit reached (60 minutes). Create a new websocket connection to continue.";
 const CODEX_ORIGINATOR_HEADER_VALUE: &str = "opencode";
 const MAX_SAFE_STREAM_RECOVERY_RETRIES: u32 = 2;
 const SAFE_STREAM_RECOVERY_DELAY_MS: u64 = 1200;

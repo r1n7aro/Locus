@@ -1109,10 +1109,9 @@ where
             } else {
                 (tc.name, tc.input_json)
             };
-            let server_tool = if tc.server_tool_output.is_some() && name == "web_search" {
-                Some(ServerToolKind::WebSearch)
-            } else {
-                None
+            let server_tool = match name.as_str() {
+                "web_search" if tc.server_tool_output.is_some() => Some(ServerToolKind::WebSearch),
+                _ => None,
             };
 
             ToolCallInfo {
@@ -1325,14 +1324,17 @@ fn build_anthropic_messages(
 
                 if let Some(tool_calls) = tool_calls {
                     for tc in tool_calls {
-                        // Server tools (e.g. web_search) should not be sent back as tool_use
-                        // blocks — include their output as text for context continuity.
+                        // Server tools should not be sent back as tool_use blocks. Web search
+                        // output is useful conversational context; tool search output is provider
+                        // control-plane state and should stay out of replayed text.
                         if tc.is_server_tool() {
-                            if let Some(ref output) = tc.server_tool_output {
-                                content_blocks.push(serde_json::json!({
-                                    "type": "text",
-                                    "text": format!("[Web Search Result]\n{}", output),
-                                }));
+                            if tc.server_tool.as_ref() == Some(&ServerToolKind::WebSearch) {
+                                if let Some(ref output) = tc.server_tool_output {
+                                    content_blocks.push(serde_json::json!({
+                                        "type": "text",
+                                        "text": format!("[Web Search Result]\n{}", output),
+                                    }));
+                                }
                             }
                             continue;
                         }

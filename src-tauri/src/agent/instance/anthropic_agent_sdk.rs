@@ -573,8 +573,19 @@ impl AgentInstance {
         images: Option<&[ImageData]>,
         initial_mode: &str,
         run_id: &str,
+        active_skill_tool_names: &HashSet<String>,
     ) -> Result<String, String> {
-        let request_tools = self.build_request_tool_names().await;
+        let dynamic_tool_loading_mode = self.dynamic_tool_loading_mode(app_handle);
+        if dynamic_tool_loading_mode == crate::config::DynamicToolLoadingMode::Direct {
+            let messages = store.get_messages_for_prompt(&self.session_id)?;
+            self.seed_loaded_tools_from_history(&messages).await;
+        }
+        let request_tools = self
+            .build_request_tool_names_for_mode_and_skills(
+                dynamic_tool_loading_mode,
+                active_skill_tool_names,
+            )
+            .await;
         let api_tools = self.build_api_tools(&request_tools).await;
 
         let resume_session_id = anthropic_agent_sdk::cached_session_id(&self.session_id).await;
