@@ -58,7 +58,7 @@ describe("Unity embedded session view", () => {
     expect(app).toContain("window.emit(MAIN_WINDOW_CLOSE_REQUESTED_EVENT, ())");
     expect(app).toContain("commands::request_app_exit");
     expect(system).toContain("pub fn request_app_exit(app_handle: AppHandle)");
-    expect(system).toContain("crate::commands::destroy_unity_embed_control_window_on_main(&app_handle);");
+    expect(system).toContain("crate::commands::destroy_unity_embed_control_window_on_main(app_handle);");
     expect(system).toContain("app_handle.exit(0);");
     expect(command).toContain("pub(crate) fn destroy_unity_embed_control_window_on_main");
     expect(command).toContain("window.destroy().or_else(|_| window.close())");
