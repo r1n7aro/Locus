@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 use crate::error::AppError;
 
 const PUBLIC_UPDATE_BASE_URL: &str = "https://unity.farlocus.com";
-const UPDATE_MANIFEST_PATH: &str = "/data/update.json";
-const PUBLIC_UPDATE_MANIFEST_URL: &str = "https://unity.farlocus.com/data/update.json";
+const STABLE_UPDATE_MANIFEST_PATH: &str = "/data/update.json";
+const EXPERIMENTAL_UPDATE_MANIFEST_PATH: &str = "/data/update-experimental.json";
 const LOCAL_UPDATE_PORT_RANGE: std::ops::RangeInclusive<u16> = 3000..=3005;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,6 +62,37 @@ pub struct AppUpdateManifest {
     pub locales: HashMap<String, AppUpdateLocaleEntry>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AppUpdateChannel {
+    Stable,
+    Experimental,
+}
+
+impl AppUpdateChannel {
+    fn as_str(self) -> &'static str {
+        match self {
+            AppUpdateChannel::Stable => "stable",
+            AppUpdateChannel::Experimental => "experimental",
+        }
+    }
+
+    fn manifest_path(self) -> &'static str {
+        match self {
+            AppUpdateChannel::Stable => STABLE_UPDATE_MANIFEST_PATH,
+            AppUpdateChannel::Experimental => EXPERIMENTAL_UPDATE_MANIFEST_PATH,
+        }
+    }
+
+    fn from_manifest_channel(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "stable" => Some(AppUpdateChannel::Stable),
+            "experimental" => Some(AppUpdateChannel::Experimental),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AppUpdateSourceKind {
@@ -80,42 +111,79 @@ pub struct AppUpdateManifestFetchResult {
 #[derive(Debug, Clone)]
 struct AppUpdateSource {
     kind: AppUpdateSourceKind,
+    channel: AppUpdateChannel,
     base_url: String,
     manifest_url: String,
     connect_timeout: Duration,
     request_timeout: Duration,
 }
 
-fn build_update_sources() -> Vec<AppUpdateSource> {
+fn channel_fallbacks(channel: AppUpdateChannel) -> Vec<AppUpdateChannel> {
+    match channel {
+        AppUpdateChannel::Stable => vec![AppUpdateChannel::Stable],
+        AppUpdateChannel::Experimental => {
+            vec![AppUpdateChannel::Experimental, AppUpdateChannel::Stable]
+        }
+    }
+}
+
+fn build_update_sources(channel: AppUpdateChannel) -> Vec<AppUpdateSource> {
     let mut sources = Vec::new();
+    let fallback_channels = channel_fallbacks(channel);
 
     if cfg!(debug_assertions) {
-        for port in LOCAL_UPDATE_PORT_RANGE {
-            let base_url = format!("http://localhost:{}", port);
-            sources.push(AppUpdateSource {
-                kind: AppUpdateSourceKind::Local,
-                manifest_url: format!("{}{}", base_url, UPDATE_MANIFEST_PATH),
-                base_url,
-                connect_timeout: Duration::from_millis(180),
-                request_timeout: Duration::from_millis(450),
-            });
+        for source_channel in fallback_channels.iter().copied() {
+            for port in LOCAL_UPDATE_PORT_RANGE.clone() {
+                let base_url = format!("http://localhost:{}", port);
+                sources.push(AppUpdateSource {
+                    kind: AppUpdateSourceKind::Local,
+                    channel: source_channel,
+                    manifest_url: format!("{}{}", base_url, source_channel.manifest_path()),
+                    base_url,
+                    connect_timeout: Duration::from_millis(180),
+                    request_timeout: Duration::from_millis(450),
+                });
+            }
         }
     }
 
-    sources.push(AppUpdateSource {
-        kind: AppUpdateSourceKind::Remote,
-        base_url: PUBLIC_UPDATE_BASE_URL.to_string(),
-        manifest_url: PUBLIC_UPDATE_MANIFEST_URL.to_string(),
-        connect_timeout: Duration::from_secs(5),
-        request_timeout: Duration::from_secs(8),
-    });
+    for source_channel in fallback_channels {
+        sources.push(AppUpdateSource {
+            kind: AppUpdateSourceKind::Remote,
+            channel: source_channel,
+            base_url: PUBLIC_UPDATE_BASE_URL.to_string(),
+            manifest_url: format!(
+                "{}{}",
+                PUBLIC_UPDATE_BASE_URL,
+                source_channel.manifest_path()
+            ),
+            connect_timeout: Duration::from_secs(5),
+            request_timeout: Duration::from_secs(8),
+        });
+    }
 
     sources
 }
 
-fn validate_manifest(manifest: &AppUpdateManifest) -> Result<(), AppError> {
+fn validate_manifest(
+    manifest: &AppUpdateManifest,
+    expected_channel: AppUpdateChannel,
+) -> Result<(), AppError> {
     if manifest.version.trim().is_empty() {
         return Err("Update manifest version is empty".into());
+    }
+
+    if manifest.channel.trim().is_empty() {
+        return Err("Update manifest channel is empty".into());
+    }
+
+    if AppUpdateChannel::from_manifest_channel(&manifest.channel) != Some(expected_channel) {
+        return Err(format!(
+            "Update manifest channel mismatch: expected {}, got {}",
+            expected_channel.as_str(),
+            manifest.channel
+        )
+        .into());
     }
 
     if manifest.locales.is_empty() {
@@ -154,15 +222,18 @@ async fn fetch_manifest_from_source(
         .await
         .map_err(|e| format!("Failed to parse update manifest: {}", e))?;
 
-    validate_manifest(&manifest)?;
+    validate_manifest(&manifest, source.channel)?;
     Ok(manifest)
 }
 
 #[tauri::command]
-pub async fn fetch_app_update_manifest() -> Result<AppUpdateManifestFetchResult, AppError> {
+pub async fn fetch_app_update_manifest(
+    channel: Option<AppUpdateChannel>,
+) -> Result<AppUpdateManifestFetchResult, AppError> {
     let mut last_error: Option<AppError> = None;
+    let requested_channel = channel.unwrap_or(AppUpdateChannel::Stable);
 
-    for source in build_update_sources() {
+    for source in build_update_sources(requested_channel) {
         match fetch_manifest_from_source(&source).await {
             Ok(manifest) => {
                 return Ok(AppUpdateManifestFetchResult {

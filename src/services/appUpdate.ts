@@ -2,6 +2,7 @@ import type { Locale } from "../i18n";
 import type {
   AppUpdateChangeGroup,
   AppUpdateDownloadChannel,
+  AppUpdateChannel,
   AppUpdateInfo,
   AppUpdateInstallerDownload,
   AppUpdateLocaleEntry,
@@ -13,6 +14,8 @@ import { ipcInvoke } from "./ipc";
 
 const DOCS_BASE_URL = "https://unity.farlocus.com";
 const GITHUB_RELEASES_URL = "https://github.com/r1n7aro/Locus/releases";
+const STABLE_UPDATE_CHANNEL: AppUpdateChannel = "stable";
+const EXPERIMENTAL_UPDATE_CHANNEL: AppUpdateChannel = "experimental";
 const SEMVER_PATTERN =
   /^v?(?<core>\d+(?:\.\d+)*)(?:-(?<prerelease>[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+(?<build>[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$/i;
 
@@ -118,6 +121,13 @@ export function publicDocsBaseUrl(): string {
   return DOCS_BASE_URL;
 }
 
+export function normalizeAppUpdateChannel(value: unknown): AppUpdateChannel {
+  const normalized = typeof value === "string" ? value.trim().toLowerCase() : value;
+  return normalized === EXPERIMENTAL_UPDATE_CHANNEL
+    ? EXPERIMENTAL_UPDATE_CHANNEL
+    : STABLE_UPDATE_CHANNEL;
+}
+
 function parseVersion(value: string): ParsedVersion | null {
   const trimmed = value.trim();
   if (!trimmed) return null;
@@ -144,6 +154,18 @@ function parseVersion(value: string): ParsedVersion | null {
       ? match.groups.prerelease.split(".").filter((segment) => segment.length > 0)
       : [],
   };
+}
+
+export function resolveAppReleaseChannel(_version: string, explicitChannel?: string | null): AppUpdateChannel {
+  const normalizedChannel = explicitChannel?.trim().toLowerCase();
+  if (normalizedChannel === STABLE_UPDATE_CHANNEL || normalizedChannel === EXPERIMENTAL_UPDATE_CHANNEL) {
+    return normalizedChannel;
+  }
+  return STABLE_UPDATE_CHANNEL;
+}
+
+export function isExperimentalAppUpdateChannel(channel: string | null | undefined): boolean {
+  return normalizeAppUpdateChannel(channel) === EXPERIMENTAL_UPDATE_CHANNEL;
 }
 
 function comparePrerelease(left: string[], right: string[]): number {
@@ -323,6 +345,7 @@ export function resolveAppUpdateInfo(
   targetLocale: Locale,
   sourceBaseUrl = DOCS_BASE_URL,
   sourceKind: AppUpdateSourceKind = "remote",
+  currentReleaseChannel: AppUpdateChannel = STABLE_UPDATE_CHANNEL,
 ): AppUpdateInfo | null {
   if (compareReleaseVersions(currentVersion, manifest.version) >= 0) {
     return null;
@@ -337,12 +360,18 @@ export function resolveAppUpdateInfo(
   const installer = selectInstaller(installers);
   const changelogUrl = resolveUpdateUrl(localeEntry.changelogUrl, sourceBaseUrl);
   const releaseUrl = resolveGitHubReleaseUrl(localeEntry, installers, sourceBaseUrl);
+  const currentChannel = normalizeAppUpdateChannel(currentReleaseChannel);
+  const latestChannel = resolveAppReleaseChannel(manifest.version, manifest.channel);
 
   return {
     currentVersion: currentVersion.trim().replace(/^v/i, ""),
     latestVersion: manifest.version.trim().replace(/^v/i, ""),
     releasedAt: manifest.releasedAt.trim(),
-    channel: manifest.channel.trim(),
+    channel: latestChannel,
+    currentChannel,
+    latestChannel,
+    currentIsExperimental: currentChannel === EXPERIMENTAL_UPDATE_CHANNEL,
+    latestIsExperimental: latestChannel === EXPERIMENTAL_UPDATE_CHANNEL,
     title: localeEntry.title.trim(),
     summary: localeEntry.summary.trim(),
     changelogUrl,
@@ -358,10 +387,11 @@ export function resolveAppUpdateInfo(
 
 export async function fetchAppUpdateManifest(options?: {
   throwOnError?: boolean;
+  channel?: AppUpdateChannel;
 }): Promise<AppUpdateManifestFetchResult | null> {
   const result = await ipcInvoke<unknown>(
     "fetch_app_update_manifest",
-    undefined,
+    { channel: normalizeAppUpdateChannel(options?.channel) },
     {
       throwOnError: options?.throwOnError ?? false,
     },

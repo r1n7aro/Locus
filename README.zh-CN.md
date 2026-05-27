@@ -71,7 +71,7 @@ bun tauri dev
 bun tauri build
 ```
 
-该命令会重新生成合并后的 Roslyn DLL、完成前端构建、生成第三方许可证 bundle，并打包桌面应用。当前默认输出 Windows `NSIS` 安装包，产物位于 `src-tauri/target/release/bundle/nsis/`。
+该命令会重新生成合并后的 Unity Editor DLL bundle、完成前端构建、生成第三方许可证 bundle，并打包桌面应用。当前默认输出 Windows `NSIS` 安装包，产物位于 `src-tauri/target/release/bundle/nsis/`。
 
 ## 发布版本
 
@@ -99,9 +99,9 @@ bun run release:installers
 
 根级第三方说明见 [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES)。
 
-`locus_unity/Editor/Roslyn` 中 Roslyn 与相关 .NET 依赖的许可证和分发说明见 [locus_unity/Editor/Roslyn/THIRD_PARTY.md](locus_unity/Editor/Roslyn/THIRD_PARTY.md)。
+`locus_unity/Editor/Roslyn` 中 Roslyn 与相关 .NET 依赖的许可证和分发说明见 [locus_unity/Editor/Roslyn/THIRD_PARTY.md](locus_unity/Editor/Roslyn/THIRD_PARTY.md)。私有 JSON 解析 bundle 说明见 [locus_unity/Editor/Json/THIRD_PARTY.md](locus_unity/Editor/Json/THIRD_PARTY.md)。
 
-发布安装包时会同时携带根级许可证文件、根级第三方说明、生成的 `licenses/third_party/` bundle 与 `locus_unity/` 目录中的 Roslyn notices。
+发布安装包时会同时携带根级许可证文件、根级第三方说明、生成的 `licenses/third_party/` bundle 与 `locus_unity/` 目录中的 Unity Editor bundle notices。
 
 ## 免责声明
 

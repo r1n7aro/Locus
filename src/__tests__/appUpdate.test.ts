@@ -123,6 +123,25 @@ describe("resolveAppUpdateInfo", () => {
     expect(info?.changes[0]?.title).toBe("Added");
   });
 
+  it("carries explicit release channels for current and latest versions", () => {
+    const info = resolveAppUpdateInfo(
+      {
+        ...manifest,
+        channel: "experimental",
+      },
+      "0.1.0",
+      "zh",
+      undefined,
+      "remote",
+      "experimental",
+    );
+
+    expect(info?.currentChannel).toBe("experimental");
+    expect(info?.latestChannel).toBe("experimental");
+    expect(info?.currentIsExperimental).toBe(true);
+    expect(info?.latestIsExperimental).toBe(true);
+  });
+
   it("resolves the browser update target to the GitHub release page", () => {
     const info = resolveAppUpdateInfo({
       ...manifest,

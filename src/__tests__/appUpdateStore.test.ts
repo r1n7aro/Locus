@@ -11,6 +11,7 @@ vi.mock("../services/appUpdate", async () => {
   };
 });
 vi.mock("../services/appVersion", () => ({
+  getAppRuntimeReleaseChannel: vi.fn(),
   getAppRuntimeVersion: vi.fn(),
 }));
 
@@ -37,6 +38,7 @@ function createLocalStorageMock() {
 describe("app update store", () => {
   let localStorageMock: ReturnType<typeof createLocalStorageMock>;
   const fetchAppUpdateManifestMock = vi.mocked(appUpdateService.fetchAppUpdateManifest);
+  const getAppRuntimeReleaseChannelMock = vi.mocked(appVersionService.getAppRuntimeReleaseChannel);
   const getAppRuntimeVersionMock = vi.mocked(appVersionService.getAppRuntimeVersion);
 
   beforeEach(() => {
@@ -45,6 +47,7 @@ describe("app update store", () => {
     localStorageMock = createLocalStorageMock();
     vi.stubGlobal("localStorage", localStorageMock as unknown as Storage);
     localStorageMock.clear();
+    getAppRuntimeReleaseChannelMock.mockResolvedValue("stable");
     getAppRuntimeVersionMock.mockResolvedValue("0.1.0");
   });
 
@@ -87,6 +90,10 @@ describe("app update store", () => {
     );
     expect(info?.latestVersion).toBe("0.2.0");
     expect(store.hasUpdate).toBe(true);
+    expect(fetchAppUpdateManifestMock).toHaveBeenCalledWith({
+      throwOnError: false,
+      channel: "stable",
+    });
     expect(store.sourceKind).toBe("local");
     expect(store.sourceBaseUrl).toBe("http://localhost:3002");
     expect(store.sourceLabel).toBe("本地服务器 (localhost:3002)");
@@ -134,5 +141,45 @@ describe("app update store", () => {
     expect(info).toBeNull();
     expect(store.hasUpdate).toBe(false);
     expect(store.sourceLabel).toBe("unity.farlocus.com");
+  });
+
+  it("uses the selected experimental channel for update checks", async () => {
+    fetchAppUpdateManifestMock.mockResolvedValue({
+      manifest: {
+        version: "0.2.0",
+        releasedAt: "2026-04-23",
+        channel: "experimental",
+        locales: {
+          zh: {
+            title: "发现新版本",
+            summary: "Locus 0.2.0 已发布。",
+            changelogUrl: "/overview/experimental-version",
+            changes: [
+              {
+                title: "新增",
+                items: ["新增实验通道更新"],
+              },
+            ],
+          },
+        },
+      },
+      sourceKind: "remote",
+      sourceBaseUrl: "https://unity.farlocus.com",
+    });
+
+    const store = useAppUpdateStore();
+    store.setUpdateChannel("experimental");
+    const info = await store.checkForUpdates({ silent: true });
+
+    expect(localStorageMock.setItem).toHaveBeenCalledWith(
+      "locus-app-update-channel",
+      "experimental",
+    );
+    expect(fetchAppUpdateManifestMock).toHaveBeenCalledWith({
+      throwOnError: false,
+      channel: "experimental",
+    });
+    expect(info?.latestChannel).toBe("experimental");
+    expect(store.updateChannel).toBe("experimental");
   });
 });

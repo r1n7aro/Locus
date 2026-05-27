@@ -11,6 +11,7 @@
       "./gen/ort-runtime": "ort-runtime/",
       "../agent": "agent/",
       "../knowledge": "knowledge/",
+      "../skills": "skills/",
       "../locus_unity": "locus_unity/"
     }
   }

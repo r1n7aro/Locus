@@ -2,15 +2,17 @@ import { computed, ref } from "vue";
 import { defineStore } from "pinia";
 import { locale, t } from "../i18n";
 import { normalizeAppError } from "../services/errors";
-import { getAppRuntimeVersion } from "../services/appVersion";
+import { getAppRuntimeReleaseChannel, getAppRuntimeVersion } from "../services/appVersion";
 import {
   fetchAppUpdateManifest,
+  normalizeAppUpdateChannel,
   resolveAppUpdateInfo,
 } from "../services/appUpdate";
-import type { AppUpdateInfo, AppUpdateManifest, AppUpdateSourceKind } from "../types";
+import type { AppUpdateChannel, AppUpdateInfo, AppUpdateManifest, AppUpdateSourceKind } from "../types";
 import { useNotificationStore } from "./notification";
 
 const LAST_CHECKED_AT_STORAGE_KEY = "locus-app-update-last-checked-at";
+const UPDATE_CHANNEL_STORAGE_KEY = "locus-app-update-channel";
 
 function loadLastCheckedAt(): number | null {
   try {
@@ -35,15 +37,38 @@ function persistLastCheckedAt(value: number | null) {
   }
 }
 
+function loadPreferredUpdateChannel(): AppUpdateChannel | null {
+  try {
+    const raw = localStorage.getItem(UPDATE_CHANNEL_STORAGE_KEY);
+    return raw ? normalizeAppUpdateChannel(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+function persistPreferredUpdateChannel(value: AppUpdateChannel) {
+  try {
+    localStorage.setItem(UPDATE_CHANNEL_STORAGE_KEY, value);
+  } catch {
+    /* ignore */
+  }
+}
+
 export const useAppUpdateStore = defineStore("appUpdate", () => {
   const manifest = ref<AppUpdateManifest | null>(null);
   const currentVersion = ref("");
+  const currentChannel = ref<AppUpdateChannel>("stable");
+  const preferredUpdateChannel = ref<AppUpdateChannel | null>(loadPreferredUpdateChannel());
   const sourceKind = ref<AppUpdateSourceKind | null>(null);
   const sourceBaseUrl = ref("");
   const lastCheckedAt = ref<number | null>(loadLastCheckedAt());
   const lastError = ref<string | null>(null);
   const checking = ref(false);
   const dialogDismissed = ref(false);
+  const currentIsExperimental = computed(() => currentChannel.value === "experimental");
+  const updateChannel = computed<AppUpdateChannel>(() =>
+    preferredUpdateChannel.value ?? currentChannel.value,
+  );
 
   const updateInfo = computed<AppUpdateInfo | null>(() => {
     if (!manifest.value || !currentVersion.value) {
@@ -56,6 +81,7 @@ export const useAppUpdateStore = defineStore("appUpdate", () => {
       locale.value,
       sourceBaseUrl.value || undefined,
       sourceKind.value ?? "remote",
+      currentChannel.value,
     );
   });
 
@@ -85,15 +111,30 @@ export const useAppUpdateStore = defineStore("appUpdate", () => {
     persistLastCheckedAt(value);
   }
 
+  function setUpdateChannel(value: AppUpdateChannel) {
+    const nextChannel = normalizeAppUpdateChannel(value);
+    preferredUpdateChannel.value = nextChannel;
+    persistPreferredUpdateChannel(nextChannel);
+    manifest.value = null;
+    sourceKind.value = null;
+    sourceBaseUrl.value = "";
+    lastError.value = null;
+    dialogDismissed.value = false;
+  }
+
   async function ensureCurrentVersion(): Promise<string> {
     if (currentVersion.value) {
       return currentVersion.value;
     }
 
     if (!currentVersionPromise) {
-      currentVersionPromise = getAppRuntimeVersion()
-        .then((version) => {
+      currentVersionPromise = Promise.all([
+        getAppRuntimeVersion(),
+        getAppRuntimeReleaseChannel(),
+      ])
+        .then(([version, channel]) => {
           currentVersion.value = version;
+          currentChannel.value = channel;
           return version;
         })
         .finally(() => {
@@ -116,12 +157,12 @@ export const useAppUpdateStore = defineStore("appUpdate", () => {
     checking.value = true;
     activeCheckPromise = (async () => {
       try {
-        const [version, nextManifestResult] = await Promise.all([
-          ensureCurrentVersion(),
-          fetchAppUpdateManifest({ throwOnError: !silent }),
-        ]);
-
+        const version = await ensureCurrentVersion();
         currentVersion.value = version;
+        const nextManifestResult = await fetchAppUpdateManifest({
+          throwOnError: !silent,
+          channel: updateChannel.value,
+        });
         if (!nextManifestResult) {
           throw new Error("Missing update manifest");
         }
@@ -177,6 +218,10 @@ export const useAppUpdateStore = defineStore("appUpdate", () => {
   return {
     manifest,
     currentVersion,
+    currentChannel,
+    currentIsExperimental,
+    preferredUpdateChannel,
+    updateChannel,
     sourceKind,
     sourceBaseUrl,
     sourceLabel,
@@ -188,6 +233,7 @@ export const useAppUpdateStore = defineStore("appUpdate", () => {
     hasUpdate,
     ensureCurrentVersion,
     checkForUpdates,
+    setUpdateChannel,
     dismissDialog,
   };
 });

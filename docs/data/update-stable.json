@@ -1,0 +1,129 @@
+{
+  "version": "0.2.15",
+  "releasedAt": "2026-05-17",
+  "channel": "stable",
+  "installers": [
+    {
+      "id": "windows-x64",
+      "label": "Windows x64",
+      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.2.15/locus_0.2.15_x64-setup.exe",
+      "platform": "windows",
+      "arch": "x64",
+      "includesManagedPython": true,
+      "includesManagedGit": true,
+      "requiresSystemPython": false,
+      "requiresSystemGit": false
+    },
+    {
+      "id": "windows-x64-without-embed-python-git",
+      "label": "Windows x64 - system Python/Git",
+      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.2.15/locus_0.2.15_x64-without_embed_python_git-setup.exe",
+      "platform": "windows",
+      "arch": "x64",
+      "includesManagedPython": false,
+      "includesManagedGit": false,
+      "requiresSystemPython": true,
+      "requiresSystemGit": true
+    }
+  ],
+  "locales": {
+    "zh": {
+      "title": "发现新版本",
+      "summary": "Locus v0.2.15 (2026-05-17)",
+      "changelogUrl": "/overview/latest-version",
+      "changes": [
+        {
+          "title": "新增",
+          "items": [
+            "设置页新增代理配置，后端请求、更新检查、知识下载、模型下载和 agent 子进程会使用代理路由。",
+            "新增 ONNX Runtime 打包准备流程，用于向量检索运行时发布。",
+            "知识库在全文索引关闭时支持文本扫描匹配。",
+            "聊天新增会话复制和撤回上一轮对话流程。",
+            "更新流程新增安装包元数据和安装包选择。",
+            "控制台新增日志导出，系统通知新增 subagent 完成提醒。"
+          ]
+        },
+        {
+          "title": "修复",
+          "items": [
+            "聊天流式渲染中的工具调用折叠和交接状态更稳定。",
+            "聊天发送失败后会移除待发送消息并重新加载会话状态。",
+            "知识索引状态会遵循全局全文检索与语义检索开关。",
+            "全文检索关闭时会隐藏全文索引重建进度。",
+            "Windows 安装器会检测系统 Git，并可跳过内置 Git 资源。",
+            "工具权限保存失败时会恢复界面状态。"
+          ]
+        },
+        {
+          "title": "移除",
+          "items": [
+            "无。"
+          ]
+        }
+      ],
+      "downloadChannels": [
+        {
+          "label": "Windows x64",
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.2.15/locus_0.2.15_x64-setup.exe"
+        },
+        {
+          "label": "Windows x64（系统 Python/Git）",
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.2.15/locus_0.2.15_x64-without_embed_python_git-setup.exe"
+        },
+        {
+          "label": "GitHub Releases",
+          "url": "https://github.com/r1n7aro/Locus/releases"
+        }
+      ]
+    },
+    "en": {
+      "title": "Update available",
+      "summary": "Locus v0.2.15 (2026-05-17)",
+      "changelogUrl": "/en/overview/latest-version",
+      "changes": [
+        {
+          "title": "Added",
+          "items": [
+            "Added proxy settings and backend proxy routing for update checks, LLM clients, knowledge downloads, and agent subprocesses.",
+            "Added bundled ONNX Runtime preparation for vector search runtime packaging.",
+            "Added text-scan fallback search for knowledge when lexical indexing is disabled.",
+            "Added chat session fork and latest-turn undo workflows.",
+            "Added installer metadata and package selection in the update flow.",
+            "Added console log export and subagent completion notifications."
+          ]
+        },
+        {
+          "title": "Fixed",
+          "items": [
+            "Chat streaming keeps tool-call collapse and handoff rendering more stable.",
+            "Failed chat sends now remove pending messages and reload session state.",
+            "Knowledge index status now follows global lexical and semantic search settings.",
+            "Lexical rebuild progress is suppressed when lexical search is disabled.",
+            "Windows installer detects system Git and can skip bundled Git resources.",
+            "Tool permission saves restore UI state on failure."
+          ]
+        },
+        {
+          "title": "Removed",
+          "items": [
+            "None."
+          ]
+        }
+      ],
+      "downloadChannels": [
+        {
+          "label": "Windows x64",
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.2.15/locus_0.2.15_x64-setup.exe"
+        },
+        {
+          "label": "Windows x64 (system Python/Git)",
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.2.15/locus_0.2.15_x64-without_embed_python_git-setup.exe"
+        },
+        {
+          "label": "GitHub Releases",
+          "url": "https://github.com/r1n7aro/Locus/releases"
+        }
+      ]
+    }
+  }
+}

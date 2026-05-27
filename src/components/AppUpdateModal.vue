@@ -14,15 +14,21 @@ const emit = defineEmits<{
   view: [];
 }>();
 
+function channelLabel(channel: AppUpdateInfo["channel"]) {
+  return channel === "experimental"
+    ? t("app.update.channelExperimental")
+    : t("app.update.channelStable");
+}
+
 const visibleChanges = computed(() => props.info?.changes ?? []);
 const latestVersionLabel = computed(() => {
   if (!props.info) return "";
-  return `Locus v${props.info.latestVersion} (${props.info.releasedAt})`;
+  return `Locus v${props.info.latestVersion} (${props.info.releasedAt}) - ${channelLabel(props.info.latestChannel)}`;
 });
 
 const currentVersionLabel = computed(() => {
   if (!props.info) return "";
-  return `Locus v${props.info.currentVersion}`;
+  return `Locus v${props.info.currentVersion} - ${channelLabel(props.info.currentChannel)}`;
 });
 
 const downloadPackageLabel = computed(() => props.info?.downloadLabel.trim() ?? "");

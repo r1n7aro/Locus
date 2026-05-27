@@ -71,7 +71,7 @@ This command starts the Vite development server and opens the Tauri desktop app.
 bun tauri build
 ```
 
-This command rebuilds the merged Roslyn DLL, prepares the managed Python and Git runtimes, builds the frontend, generates the third-party license bundle, and packages the desktop app. The default output is a Windows `NSIS` installer under `src-tauri/target/release/bundle/nsis/`.
+This command rebuilds the merged Unity Editor DLL bundles, prepares the managed Python and Git runtimes, builds the frontend, generates the third-party license bundle, and packages the desktop app. The default output is a Windows `NSIS` installer under `src-tauri/target/release/bundle/nsis/`.
 
 ## Releases
 
@@ -99,9 +99,9 @@ The desktop app installer does not include `docs/node_modules` or the Mint docum
 
 See [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES) for root-level third-party notices.
 
-For Roslyn and related .NET dependency license and distribution notes inside `locus_unity/Editor/Roslyn`, see [locus_unity/Editor/Roslyn/THIRD_PARTY.md](locus_unity/Editor/Roslyn/THIRD_PARTY.md).
+For Roslyn and related .NET dependency license and distribution notes inside `locus_unity/Editor/Roslyn`, see [locus_unity/Editor/Roslyn/THIRD_PARTY.md](locus_unity/Editor/Roslyn/THIRD_PARTY.md). For the private JSON parser bundle, see [locus_unity/Editor/Json/THIRD_PARTY.md](locus_unity/Editor/Json/THIRD_PARTY.md).
 
-Published installers include the root license file, the root third-party notices, the generated `licenses/third_party/` bundle, and the Roslyn notices under `locus_unity/`.
+Published installers include the root license file, the root third-party notices, the generated `licenses/third_party/` bundle, and the Unity Editor bundle notices under `locus_unity/`.
 
 ## Disclaimer
 

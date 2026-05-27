@@ -1,21 +1,44 @@
-import { readFile } from "node:fs/promises";
+import { access, readFile } from "node:fs/promises";
 import path from "node:path";
 
-export const releaseNoteConfigs = {
-  zh: {
-    sourcePath: "overview/latest-version.mdx",
-    changesHeading: "## 变更列表",
-    downloadsHeadings: ["## 下载", "## 下载渠道"],
-    expectedChangelogUrl: "/overview/latest-version",
+export const releaseNoteChannelConfigs = {
+  stable: {
+    required: true,
+    locales: {
+      zh: {
+        sourcePath: "overview/latest-version.mdx",
+        changesHeading: "## 变更列表",
+        downloadsHeadings: ["## 下载", "## 下载渠道"],
+        expectedChangelogUrl: "/overview/latest-version",
+      },
+      en: {
+        sourcePath: "en/overview/latest-version.mdx",
+        changesHeading: "## Changes",
+        downloadsHeadings: ["## Download", "## Download Channels"],
+        expectedChangelogUrl: "/en/overview/latest-version",
+      },
+    },
   },
-  en: {
-    sourcePath: "en/overview/latest-version.mdx",
-    changesHeading: "## Changes",
-    downloadsHeadings: ["## Download", "## Download Channels"],
-    expectedChangelogUrl: "/en/overview/latest-version",
+  experimental: {
+    required: false,
+    locales: {
+      zh: {
+        sourcePath: "overview/experimental-version.mdx",
+        changesHeading: "## 变更列表",
+        downloadsHeadings: ["## 下载", "## 下载渠道"],
+        expectedChangelogUrl: "/overview/experimental-version",
+      },
+      en: {
+        sourcePath: "en/overview/experimental-version.mdx",
+        changesHeading: "## Changes",
+        downloadsHeadings: ["## Download", "## Download Channels"],
+        expectedChangelogUrl: "/en/overview/experimental-version",
+      },
+    },
   },
 };
 
+export const releaseNoteConfigs = releaseNoteChannelConfigs.stable.locales;
 export const releaseNoteSharedFrontmatterKeys = ["version", "releasedAt", "channel"];
 export const releaseNoteLocalizedFrontmatterKeys = [
   "title",
@@ -35,6 +58,27 @@ const releaseNoteRequiredFrontmatterKeys = [
 function assert(condition, message) {
   if (!condition) {
     throw new Error(message);
+  }
+}
+
+function normalizeReleaseNoteChannel(channel) {
+  return channel === "experimental" ? "experimental" : "stable";
+}
+
+function releaseNoteChannelConfig(channel) {
+  const normalizedChannel = normalizeReleaseNoteChannel(channel);
+  return {
+    channel: normalizedChannel,
+    config: releaseNoteChannelConfigs[normalizedChannel],
+  };
+}
+
+async function fileExists(filePath) {
+  try {
+    await access(filePath);
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -225,14 +269,59 @@ async function parseLocaleReleaseNotes(docsDir, locale, config) {
   };
 }
 
-export async function parseAllReleaseNotes(docsDir) {
+async function shouldParseChannelReleaseNotes(docsDir, channel, config) {
+  const sourcePaths = Object.values(config.locales).map((localeConfig) =>
+    path.join(docsDir, localeConfig.sourcePath),
+  );
+  const sourceStates = await Promise.all(sourcePaths.map(fileExists));
+  const existingCount = sourceStates.filter(Boolean).length;
+
+  if (existingCount === sourceStates.length) {
+    return true;
+  }
+
+  if (existingCount === 0 && !config.required) {
+    return false;
+  }
+
+  const missingPaths = sourcePaths
+    .filter((_, index) => !sourceStates[index])
+    .map((sourcePath) => path.relative(docsDir, sourcePath))
+    .join(", ");
+  throw new Error(`${channel} release notes source files are incomplete: ${missingPaths}`);
+}
+
+export async function parseAllReleaseNotes(docsDir, channel = "stable") {
+  const { channel: normalizedChannel, config } = releaseNoteChannelConfig(channel);
+  const shouldParse = await shouldParseChannelReleaseNotes(docsDir, normalizedChannel, config);
+  assert(shouldParse, `${normalizedChannel} release notes source files are missing`);
+
   const parsedByLocale = {};
 
-  for (const [locale, config] of Object.entries(releaseNoteConfigs)) {
-    parsedByLocale[locale] = await parseLocaleReleaseNotes(docsDir, locale, config);
+  for (const [locale, localeConfig] of Object.entries(config.locales)) {
+    parsedByLocale[locale] = await parseLocaleReleaseNotes(docsDir, locale, localeConfig);
   }
 
   return parsedByLocale;
+}
+
+export async function parseAllChannelReleaseNotes(docsDir) {
+  const parsedByChannel = {};
+
+  for (const [channel, config] of Object.entries(releaseNoteChannelConfigs)) {
+    const shouldParse = await shouldParseChannelReleaseNotes(docsDir, channel, config);
+    if (!shouldParse) {
+      continue;
+    }
+
+    const parsedByLocale = {};
+    for (const [locale, localeConfig] of Object.entries(config.locales)) {
+      parsedByLocale[locale] = await parseLocaleReleaseNotes(docsDir, locale, localeConfig);
+    }
+    parsedByChannel[channel] = parsedByLocale;
+  }
+
+  return parsedByChannel;
 }
 
 function assertSameFrontmatterShape(reference, target) {
@@ -246,14 +335,19 @@ function assertSameFrontmatterShape(reference, target) {
   );
 }
 
-export async function validateReleaseNotesMetadata(docsDir) {
-  const parsedByLocale = await parseAllReleaseNotes(docsDir);
+function validateChannelReleaseNotesMetadata(channel, parsedByLocale) {
   const reference = parsedByLocale.zh;
   assert(reference, "缺少中文 latest-version.mdx，无法作为事实源校验");
+  const channelConfig = releaseNoteChannelConfigs[channel];
 
   for (const [locale, parsed] of Object.entries(parsedByLocale)) {
-    const config = releaseNoteConfigs[locale];
+    const config = channelConfig.locales[locale];
     assertSameFrontmatterShape(reference, parsed);
+
+    assert(
+      parsed.frontmatter.channel === channel,
+      `${parsed.filePath} 的 channel 必须为 ${channel}`,
+    );
 
     for (const key of releaseNoteSharedFrontmatterKeys) {
       assert(
@@ -284,17 +378,28 @@ export async function validateReleaseNotesMetadata(docsDir) {
   return parsedByLocale;
 }
 
-export async function buildUpdateJson(docsDir) {
-  const parsedByLocale = await parseAllReleaseNotes(docsDir);
+export async function validateReleaseNotesMetadata(docsDir) {
+  const parsedByChannel = await parseAllChannelReleaseNotes(docsDir);
+
+  for (const [channel, parsedByLocale] of Object.entries(parsedByChannel)) {
+    validateChannelReleaseNotesMetadata(channel, parsedByLocale);
+  }
+
+  return parsedByChannel.stable;
+}
+
+function buildUpdateJsonFromParsed(parsedByLocale) {
   const reference = parsedByLocale.zh;
   assert(reference, "缺少中文 latest-version.mdx，无法生成 update manifest");
+  const referenceChannel = normalizeReleaseNoteChannel(reference.channel);
+  const channelConfig = releaseNoteChannelConfigs[referenceChannel];
   const locales = {};
 
   for (const [locale, parsed] of Object.entries(parsedByLocale)) {
     for (const key of releaseNoteSharedFrontmatterKeys) {
       assert(
         parsed.frontmatter[key] === reference.frontmatter[key],
-        `${releaseNoteConfigs[locale].sourcePath} 的 ${key} 与中文事实源不一致`,
+        `${channelConfig.locales[locale].sourcePath} 的 ${key} 与中文事实源不一致`,
       );
     }
 
@@ -308,4 +413,19 @@ export async function buildUpdateJson(docsDir) {
     installers: buildInstallerDownloads(reference.version),
     locales,
   };
+}
+
+export async function buildUpdateJson(docsDir, channel = "stable") {
+  return buildUpdateJsonFromParsed(await parseAllReleaseNotes(docsDir, channel));
+}
+
+export async function buildUpdateManifests(docsDir) {
+  const parsedByChannel = await parseAllChannelReleaseNotes(docsDir);
+  const manifests = {};
+
+  for (const [channel, parsedByLocale] of Object.entries(parsedByChannel)) {
+    manifests[channel] = buildUpdateJsonFromParsed(parsedByLocale);
+  }
+
+  return manifests;
 }
