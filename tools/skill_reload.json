@@ -6,7 +6,7 @@
     "properties": {
       "name": {
         "type": "string",
-        "description": "Skill dir name or package id, for example `asset-audit`, `unity/asset-audit`, or `com.example.asset-audit`."
+        "description": "Skill dir name or package id, for example `asset-audit`, `unity/asset-audit`, or `studio.tools.asset-audit`."
       },
       "source": {
         "type": "string",

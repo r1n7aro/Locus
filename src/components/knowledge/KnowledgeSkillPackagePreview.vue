@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
-import { FileText, Package, Terminal } from "lucide";
+import { Download, Package, Terminal } from "lucide";
 import { t } from "../../i18n";
 import type {
   KnowledgeDocumentPatch,
@@ -23,7 +23,12 @@ import {
   labelForInjectMode,
 } from "./knowledgeMetaLabels";
 import LucideIcon from "../icons/LucideIcon.vue";
+import {
+  unityAssetIconClassForPath,
+  unityAssetIconNodeForPath,
+} from "../icons/unityAssetIcons";
 import BaseDropdown from "../ui/BaseDropdown.vue";
+import BaseButton from "../ui/BaseButton.vue";
 
 const props = defineProps<{
   packageDocument: KnowledgeDocumentSummary;
@@ -34,6 +39,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   (e: "selectDocument", document: KnowledgeDocumentSummary): void;
   (e: "updateConfig", patch: KnowledgeDocumentPatch): void;
+  (e: "exportPackage", packageId: string): void;
 }>();
 
 const { skillItems, loadSkills } = useSkills();
@@ -112,6 +118,18 @@ const injectModeOptions = computed(() => [
 function documentFileName(document: KnowledgeDocumentSummary): string {
   const normalizedPath = normalizeRelativePath(document.path);
   return normalizedPath.split("/").pop() || document.title || normalizedPath;
+}
+
+function documentIconNode(document: KnowledgeDocumentSummary) {
+  return unityAssetIconNodeForPath(document.path || document.title, {
+    isFolder: false,
+  });
+}
+
+function documentIconClass(document: KnowledgeDocumentSummary) {
+  return unityAssetIconClassForPath(document.path || document.title, {
+    isFolder: false,
+  });
 }
 
 function formatDateTime(value: number): string {
@@ -385,6 +403,11 @@ function onSkillCommandKeydown(event: KeyboardEvent) {
     (event.target as HTMLInputElement | null)?.blur();
   }
 }
+
+function onExportPackage() {
+  if (!packageId.value) return;
+  emit("exportPackage", packageId.value);
+}
 </script>
 
 <template>
@@ -401,7 +424,19 @@ function onSkillCommandKeydown(event: KeyboardEvent) {
           <h1 class="skill-package-title">{{ displayName }}</h1>
         </div>
       </div>
-      <div class="skill-package-path">{{ packagePath }}</div>
+      <div class="skill-package-header-side">
+        <BaseButton
+          class="skill-package-header-action"
+          type="button"
+          :disabled="!packageId || saveLoading"
+          :title="t('knowledge.skillPackage.export')"
+          @click="onExportPackage"
+        >
+          <LucideIcon :icon="Download" :size="13" :stroke-width="2.2" />
+          <span>{{ t("knowledge.skillPackage.export") }}</span>
+        </BaseButton>
+        <div class="skill-package-path">{{ packagePath }}</div>
+      </div>
     </header>
 
     <main class="skill-package-body">
@@ -532,7 +567,8 @@ function onSkillCommandKeydown(event: KeyboardEvent) {
           >
             <LucideIcon
               class="skill-package-doc-icon"
-              :icon="FileText"
+              :class="documentIconClass(document)"
+              :icon="documentIconNode(document)"
               :size="14"
               :stroke-width="2"
             />
@@ -626,14 +662,26 @@ function onSkillCommandKeydown(event: KeyboardEvent) {
 }
 
 .skill-package-path {
-  max-width: 40%;
-  padding-top: 8px;
+  max-width: 100%;
   font-family: var(--font-mono-identifier);
   font-size: 12px;
   color: var(--text-secondary);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.skill-package-header-side {
+  max-width: 42%;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.skill-package-header-action {
   flex-shrink: 0;
 }
 

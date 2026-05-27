@@ -12,8 +12,10 @@ skillEnabled: true
 skillSurface: auto
 commandTrigger:
 argumentHint:
+tools:
+  - unity_run_states
 createdAt: 1777332556825
-updatedAt: 1777332556825
+updatedAt: 1779840000000
 ---
 
 # Unity Profiler Runtime Sampling

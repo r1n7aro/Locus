@@ -12,8 +12,10 @@ skillEnabled: true
 skillSurface: command
 commandTrigger: /unity-project-setup
 argumentHint: <focus area>
+tools:
+  - web_fetch
 createdAt: 1775735250000
-updatedAt: 1777966392569
+updatedAt: 1779840000000
 ---
 
 # Unity Project Setup

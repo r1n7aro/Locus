@@ -39,6 +39,7 @@ import type {
   UnityReferenceImportStatus,
   SkillConfig,
   SkillManifest,
+  SkillPackageArchiveResult,
   SkillUnityInstallStatus,
 } from "../types";
 
@@ -63,6 +64,7 @@ interface KnowledgeReadPayload {
   skillSurface?: KnowledgeDocument["skillSurface"];
   commandTrigger?: KnowledgeDocument["commandTrigger"];
   argumentHint?: KnowledgeDocument["argumentHint"];
+  tools?: KnowledgeDocument["tools"];
   summary?: string | null;
   body?: string;
   maintenanceRules?: string | null;
@@ -215,6 +217,7 @@ function normalizeDocument(payload: KnowledgeReadPayload): KnowledgeDocument {
     skillSurface: payload.skillSurface ?? null,
     commandTrigger: payload.commandTrigger ?? null,
     argumentHint: payload.argumentHint ?? null,
+    tools: payload.tools ?? [],
     summary: payload.summary ?? null,
     body: payload.body ?? "",
     maintenanceRules: payload.maintenanceRules ?? null,
@@ -812,6 +815,14 @@ export function readSkillManifest(
   return ipcInvoke<string>("read_skill_manifest", { dirName, source });
 }
 
+export function getDefaultSkillPackageNamespace(): Promise<string> {
+  return ipcInvoke<string>("get_default_skill_package_namespace");
+}
+
+export function setDefaultSkillPackageNamespace(value: string): Promise<string> {
+  return ipcInvoke<string>("set_default_skill_package_namespace", { value });
+}
+
 export function createSkillScaffold(input: SkillCreateInput): Promise<SkillManifest> {
   return ipcInvoke<SkillManifest>("create_skill_scaffold", {
     kind: input.kind ?? "md",
@@ -825,12 +836,29 @@ export function createSkillScaffold(input: SkillCreateInput): Promise<SkillManif
     commandTrigger: input.commandTrigger,
     commandEnabled: input.commandEnabled,
     modelInvocationEnabled: input.modelInvocationEnabled,
+    tools: input.tools,
   });
 }
 
 export function deleteSkillPackage(packageId: string): Promise<void> {
   return ipcInvoke<void>("delete_skill_package", {
     packageId,
+  });
+}
+
+export function importSkillPackage(sourcePath: string): Promise<SkillManifest> {
+  return ipcInvoke<SkillManifest>("import_skill_package", {
+    sourcePath,
+  });
+}
+
+export function exportSkillPackage(
+  packageId: string,
+  filePath: string,
+): Promise<SkillPackageArchiveResult> {
+  return ipcInvoke<SkillPackageArchiveResult>("export_skill_package", {
+    packageId,
+    filePath,
   });
 }
 

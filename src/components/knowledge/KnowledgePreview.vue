@@ -27,6 +27,7 @@ import BaseDropdown from "../ui/BaseDropdown.vue";
 import BaseMarkdownEditor from "../ui/BaseMarkdownEditor.vue";
 import BaseSwitch from "../ui/BaseSwitch.vue";
 import MarkdownRenderer from "../MarkdownRenderer.vue";
+import SemanticCodeRenderer from "../ui/SemanticCodeRenderer.vue";
 import KnowledgeChatPane from "./KnowledgeChatPane.vue";
 import {
   getSkillUnityInstallStatus,
@@ -63,6 +64,7 @@ import {
   useMarkdownEditorViewMode,
   type MarkdownEditorViewMode,
 } from "../ui/markdownEditorViewMode";
+import { semanticCodeLanguageFromPath } from "../../composables/semanticCodeRendering";
 
 const AUTO_SAVE_DELAY_MS = 700;
 const DEFAULT_SIDE_PANEL_WIDTH = 420;
@@ -70,6 +72,7 @@ const COLLAPSED_SIDE_PANEL_WIDTH = 42;
 const MIN_SIDE_PANEL_WIDTH = 280;
 const MAX_SIDE_PANEL_WIDTH = 720;
 const MIN_MAIN_COLUMN_WIDTH = 320;
+const SIDE_RAIL_COLLAPSED_STORAGE_KEY = "locus:knowledgePreviewSideRailCollapsed";
 const SUPPORT_PANELS_STORAGE_KEY = "locus:knowledgePreviewSupportPanelsCollapsed";
 const SUPPORT_STRIP_HEIGHT_STORAGE_KEY = "locus:knowledgePreviewSupportStripHeight";
 const SUPPORT_SECTION_WIDTH_STORAGE_KEY = "locus:knowledgePreviewSupportSectionWidth";
@@ -112,7 +115,7 @@ const dirtySections = ref<Set<KnowledgeDocumentSection>>(new Set());
 const autoSaveQueued = ref(false);
 const autoSaveInFlight = ref(false);
 const confirmDelete = ref(false);
-const metaCollapsed = ref(false);
+const metaCollapsed = ref(loadStoredBoolean(SIDE_RAIL_COLLAPSED_STORAGE_KEY) ?? false);
 const isSideResizing = ref(false);
 const isSupportHeightResizing = ref(false);
 const isSupportWidthResizing = ref(false);
@@ -498,14 +501,19 @@ const searchQueryTerms = computed(() => {
 const showSearchRenderedContent = computed(() =>
   !!activeSearchContext.value && editorViewMode.value === "rendered"
 );
+const bodyCodeLanguage = computed(() => semanticCodeLanguageFromPath(documentPath.value));
 const searchHighlightRe = computed<RegExp | null>(() => {
   if (!searchQueryTerms.value.length) return null;
   return new RegExp(`(${searchQueryTerms.value.map(escapeRegExp).join("|")})`, "gi");
 });
 
 function loadStoredSupportPanelsCollapsed(): boolean | null {
+  return loadStoredBoolean(SUPPORT_PANELS_STORAGE_KEY);
+}
+
+function loadStoredBoolean(storageKey: string): boolean | null {
   try {
-    const raw = localStorage.getItem(SUPPORT_PANELS_STORAGE_KEY);
+    const raw = localStorage.getItem(storageKey);
     if (raw === "true") return true;
     if (raw === "false") return false;
   } catch {
@@ -533,12 +541,22 @@ function persistStoredPanelSize(storageKey: string, value: number) {
   }
 }
 
-function persistSupportPanelsCollapsed(value: boolean) {
+function persistStoredBoolean(storageKey: string, value: boolean) {
   try {
-    localStorage.setItem(SUPPORT_PANELS_STORAGE_KEY, String(value));
+    localStorage.setItem(storageKey, String(value));
   } catch {
     // ignore persistence failures
   }
+}
+
+function persistSupportPanelsCollapsed(value: boolean) {
+  persistStoredBoolean(SUPPORT_PANELS_STORAGE_KEY, value);
+}
+
+function toggleSideRail() {
+  const nextValue = !metaCollapsed.value;
+  metaCollapsed.value = nextValue;
+  persistStoredBoolean(SIDE_RAIL_COLLAPSED_STORAGE_KEY, nextValue);
 }
 
 function toggleSupportPanels() {
@@ -1739,7 +1757,14 @@ function labelForProvider(provider?: string | null): string {
                   ref="bodyRenderedSearchRef"
                   class="preview-rendered-search preview-rendered-search-body"
                 >
+                  <SemanticCodeRenderer
+                    v-if="bodyCodeLanguage"
+                    :content="bodyDraft"
+                    :language="bodyCodeLanguage"
+                    :highlight-terms="searchQueryTerms"
+                  />
                   <MarkdownRenderer
+                    v-else
                     :content="bodyDraft"
                     :highlight-terms="searchQueryTerms"
                   />
@@ -1749,6 +1774,7 @@ function labelForProvider(provider?: string | null): string {
                   :model-value="bodyDraft"
                   :disabled="isReadOnly"
                   :view-mode="editorViewMode"
+                  :content-path="documentPath"
                   :placeholder="t('knowledge.preview.bodyPlaceholder')"
                   @update:model-value="onSectionInput('body', $event)"
                   @shortcut-save="flushPendingChanges('manual')"
@@ -1782,7 +1808,7 @@ function labelForProvider(provider?: string | null): string {
               class="preview-side-toggle preview-side-toggle-tab"
               :title="metaCollapsed ? t('knowledge.side.expand') : t('knowledge.side.collapse')"
               :aria-expanded="!metaCollapsed"
-              @click="metaCollapsed = !metaCollapsed"
+              @click="toggleSideRail"
             >
               <span class="preview-side-toggle-chevron">{{ metaCollapsed ? "◀" : "▶" }}</span>
             </button>

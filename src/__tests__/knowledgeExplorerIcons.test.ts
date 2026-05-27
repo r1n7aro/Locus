@@ -15,13 +15,16 @@ describe("KnowledgeExplorer row icons", () => {
     expect(explorer).toContain(
       'import LucideIcon from "../icons/LucideIcon.vue"',
     );
+    expect(explorer).toContain("unityAssetIconClassForPath");
+    expect(explorer).toContain("unityAssetIconNodeForPath");
     expect(explorer).toContain('class="kx-kind-icon folder"');
     expect(explorer).toContain('class="kx-kind-icon package"');
     expect(explorer).toContain('class="kx-kind-icon document"');
     expect(explorer).toContain(':class="{ open: entry.row.expanded }"');
     expect(explorer).toContain(':icon="entry.row.expanded ? FolderOpen : Folder"');
     expect(explorer).toContain(':icon="Package"');
-    expect(explorer).toContain(':icon="FileText"');
+    expect(explorer).toContain(':class="documentIconClass(entry.row.node)"');
+    expect(explorer).toContain(':icon="documentIconNode(entry.row.node)"');
     expect(explorer).toContain(".kx-kind-icon.folder {");
     expect(explorer).toContain(".kx-kind-icon.package {");
     expect(explorer).toContain(".kx-kind-icon.document.skill-document {");

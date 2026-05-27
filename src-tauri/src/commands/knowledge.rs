@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::agent::definition::{canonical_agent_id, AgentDefRegistry};
+use crate::binary_cache::BinaryCache;
 use crate::error::{AppError, ErrorSeverity};
 use crate::feishu_docs::{
     self, FeishuReferenceConfigInput, FeishuReferenceConnectionTestResult,
@@ -2709,9 +2710,26 @@ fn resolve_knowledge_reveal_path(
 
     let normalized_path = match kind {
         KnowledgeTargetKind::Document => {
-            let (_, path) = resolve_knowledge_document_target(Some(doc_type), raw_path)
-                .map_err(AppError::from)?;
-            path
+            if doc_type == KnowledgeType::Skill {
+                match resolve_knowledge_document_target(Some(doc_type), raw_path) {
+                    Ok((_, path)) => path,
+                    Err(error) => {
+                        let virtual_path =
+                            normalize_knowledge_directory_path(raw_path).map_err(AppError::from)?;
+                        if let Some(package_path) =
+                            super::skill::resolve_skill_package_document_path_sync(&virtual_path)
+                                .map_err(AppError::from)?
+                        {
+                            return canonicalize_existing_path(&package_path);
+                        }
+                        return Err(AppError::from(error));
+                    }
+                }
+            } else {
+                let (_, path) = resolve_knowledge_document_target(Some(doc_type), raw_path)
+                    .map_err(AppError::from)?;
+                path
+            }
         }
         KnowledgeTargetKind::Directory => {
             let (_, path) = resolve_knowledge_directory_target(Some(doc_type), raw_path)
@@ -2846,6 +2864,17 @@ const BINARY_EXTS: &[&str] = &[
     ".pdf", ".doc", ".docx", ".xls", ".xlsx",
 ];
 
+const MARKDOWN_IMAGE_MAX_FILE_BYTES: u64 = 20 * 1024 * 1024;
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarkdownImagePreview {
+    pub url: String,
+    pub mime_type: String,
+    pub byte_size: u64,
+    pub display_path: String,
+}
+
 const CODE_EXTS: &[&str] = &[
     ".cs", ".js", ".ts", ".jsx", ".tsx", ".py", ".rs", ".go", ".java", ".c", ".cpp", ".h", ".hpp",
     ".lua", ".rb", ".sh", ".bat", ".ps1", ".json", ".xml", ".yaml", ".yml", ".toml", ".ini",
@@ -2860,6 +2889,118 @@ fn ext_lower(path: &str) -> Option<String> {
 
 fn is_binary_ext(ext: &str) -> bool {
     BINARY_EXTS.contains(&ext)
+}
+
+fn markdown_image_mime_for_ext(ext: &str) -> Option<&'static str> {
+    match ext.trim_start_matches('.') {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "bmp" => Some("image/bmp"),
+        "webp" => Some("image/webp"),
+        "svg" => Some("image/svg+xml"),
+        _ => None,
+    }
+}
+
+fn markdown_image_mime_for_path(path: &std::path::Path) -> Option<&'static str> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    markdown_image_mime_for_ext(&ext)
+}
+
+fn markdown_image_path_from_file_url(source: &str) -> Option<std::path::PathBuf> {
+    let url = url::Url::parse(source).ok()?;
+    if url.scheme() != "file" {
+        return None;
+    }
+    url.to_file_path().ok()
+}
+
+fn resolve_markdown_image_path(
+    source: &str,
+    working_dir: &str,
+) -> Result<std::path::PathBuf, AppError> {
+    let trimmed = source.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::new(
+            "markdown_image.empty_source",
+            "Image path is empty",
+        ));
+    }
+
+    if let Some(file_path) = markdown_image_path_from_file_url(trimmed) {
+        return canonicalize_existing_path(&file_path);
+    }
+
+    let normalized = trimmed.replace('\\', std::path::MAIN_SEPARATOR_STR);
+    if is_absolute_local_path(&normalized) {
+        return canonicalize_existing_path(std::path::Path::new(&normalized));
+    }
+
+    if working_dir.trim().is_empty() {
+        return Err(AppError::new(
+            "markdown_image.no_workspace",
+            "A workspace is required for relative image paths",
+        ));
+    }
+
+    validate_workspace_path(&normalized, working_dir)
+}
+
+#[tauri::command]
+pub async fn resolve_markdown_image(
+    source: String,
+    workspace: State<'_, Arc<Workspace>>,
+    binary_cache: State<'_, Arc<BinaryCache>>,
+) -> Result<MarkdownImagePreview, AppError> {
+    let working_dir = workspace.path.read().await.clone();
+    let canonical = resolve_markdown_image_path(&source, &working_dir)?;
+    if !canonical.is_file() {
+        return Err(AppError::new(
+            "markdown_image.not_file",
+            format!("Image path is not a file: {}", canonical.display()),
+        ));
+    }
+
+    let mime = markdown_image_mime_for_path(&canonical).ok_or_else(|| {
+        AppError::new(
+            "markdown_image.unsupported_type",
+            format!("Unsupported image type: {}", source),
+        )
+    })?;
+
+    let metadata = std::fs::metadata(&canonical).map_err(|error| {
+        AppError::new(
+            "markdown_image.metadata_failed",
+            format!("Failed to read image metadata: {}", error),
+        )
+    })?;
+    let byte_size = metadata.len();
+    if byte_size > MARKDOWN_IMAGE_MAX_FILE_BYTES {
+        return Err(AppError::new(
+            "markdown_image.too_large",
+            format!(
+                "Image is larger than {} MB",
+                MARKDOWN_IMAGE_MAX_FILE_BYTES / 1024 / 1024
+            ),
+        ));
+    }
+
+    let bytes = std::fs::read(&canonical).map_err(|error| {
+        AppError::new(
+            "markdown_image.read_failed",
+            format!("Failed to read image: {}", error),
+        )
+    })?;
+    let blob_id = binary_cache.insert(bytes, mime.to_string());
+    let display_path = canonical.to_string_lossy().replace('\\', "/");
+
+    Ok(MarkdownImagePreview {
+        url: format!("http://locus-binary.localhost/blob/{}", blob_id),
+        mime_type: mime.to_string(),
+        byte_size,
+        display_path,
+    })
 }
 
 fn is_code_ext(ext: &str) -> bool {

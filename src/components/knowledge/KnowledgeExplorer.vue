@@ -4,7 +4,6 @@ import type { ComponentPublicInstance } from "vue";
 import {
   Check,
   ChevronRight,
-  FileText,
   Folder,
   FolderOpen,
   Package,
@@ -20,6 +19,7 @@ import type {
   KnowledgeSearchResult,
 } from "../../types";
 import BaseButton from "../ui/BaseButton.vue";
+import BaseContextMenu from "../ui/BaseContextMenu.vue";
 import FileTreeList from "../explorer/FileTreeList.vue";
 import {
   buildFolderListTags,
@@ -33,6 +33,10 @@ import {
   resolveKnowledgeExplorerSelection,
 } from "./knowledgeExplorerSelection";
 import LucideIcon from "../icons/LucideIcon.vue";
+import {
+  unityAssetIconClassForPath,
+  unityAssetIconNodeForPath,
+} from "../icons/unityAssetIcons";
 
 type FolderNode = Extract<ExplorerNode, { kind: "folder" }>;
 type PackageNode = Extract<ExplorerNode, { kind: "package" }>;
@@ -64,6 +68,8 @@ const emit = defineEmits<{
   (e: "selectSearchResult", result: KnowledgeSearchResult): void;
   (e: "selectFolderConfig", path: string): void;
   (e: "toggle", path: string): void;
+  (e: "importSkillPackage"): void;
+  (e: "exportPackage", node: PackageNode): void;
   (e: "requestExternalImportFolder", parentDir: string): void;
   (e: "createFolder", parentDir: string, name: string): void;
   (e: "createDocument", parentDir: string, name: string): void;
@@ -646,6 +652,20 @@ function openExternalImportFolderDialog() {
   emit("requestExternalImportFolder", parentDir);
 }
 
+function importSkillPackageArchive() {
+  if (!ctxMenu.value || props.activeType !== "skill") return;
+  if (ctxMenu.value.kind !== "root") return;
+  closeContextMenu();
+  emit("importSkillPackage");
+}
+
+function exportSelectedPackage() {
+  const menu = ctxMenu.value;
+  if (!menu || menu.kind !== "package" || menu.targetNodes.length !== 1) return;
+  closeContextMenu();
+  emit("exportPackage", menu.node);
+}
+
 async function openCreateInline(kind: InlineCreateState["kind"]) {
   if (!ctxMenu.value) return;
   if (ctxMenu.value.kind === "leaf" || ctxMenu.value.kind === "package") return;
@@ -851,27 +871,33 @@ function documentKindIconClass(node: DocumentNode): string {
   return node.document.type === "skill" ? "skill-document" : "document";
 }
 
+function documentIconNode(node: DocumentNode) {
+  return unityAssetIconNodeForPath(node.document.path || node.path, {
+    isFolder: false,
+  });
+}
+
+function documentIconClass(node: DocumentNode) {
+  return unityAssetIconClassForPath(node.document.path || node.path, {
+    isFolder: false,
+  });
+}
+
 function packageTags(node: PackageNode): Array<{
   text: string;
-  tone: "external" | "auto";
+  tone: "command";
   title: string;
 }> {
   const tags: Array<{
     text: string;
-    tone: "external" | "auto";
+    tone: "command";
     title: string;
-  }> = [
-    {
-      text: "PKG",
-      tone: "external",
-      title: t("knowledge.skillPackage.badge"),
-    },
-  ];
+  }> = [];
   const trigger = node.document.commandTrigger?.trim();
   if (trigger) {
     tags.push({
-      text: trigger.length > 10 ? `${trigger.slice(0, 9)}...` : trigger,
-      tone: "auto",
+      text: trigger,
+      tone: "command",
       title: t("knowledge.skill.commandTrigger"),
     });
   }
@@ -1059,7 +1085,12 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
                   :class="documentKindIconClass(entry.row.node)"
                   aria-hidden="true"
                 >
-                  <LucideIcon :icon="FileText" :size="13" :stroke-width="2" />
+                  <LucideIcon
+                    :class="documentIconClass(entry.row.node)"
+                    :icon="documentIconNode(entry.row.node)"
+                    :size="13"
+                    :stroke-width="2"
+                  />
                 </span>
 
                 <template v-if="isRenamingRow(entry.row)">
@@ -1109,8 +1140,7 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
                   :key="`${entry.row.node.path}-${tag.text}`"
                   class="kx-flag"
                   :class="{
-                    'flag-external': tag.tone === 'external',
-                    'flag-auto': tag.tone === 'auto',
+                    'flag-command': tag.tone === 'command',
                   }"
                   :title="tag.title"
                 >
@@ -1206,18 +1236,14 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
       </div>
     </div>
 
-    <Teleport to="body">
-      <div
-        v-if="ctxMenu"
-        class="kx-ctx-backdrop"
-        @click="closeContextMenu"
-        @contextmenu.prevent="closeContextMenu"
-      >
-        <div
-          class="kx-ctx-menu"
-          :style="{ left: ctxMenu.x + 'px', top: ctxMenu.y + 'px' }"
-          @click.stop
-        >
+    <BaseContextMenu
+      v-if="ctxMenu"
+      class="kx-ctx-menu"
+      :x="ctxMenu.x"
+      :y="ctxMenu.y"
+      :z-index="80"
+      @close="closeContextMenu"
+    >
           <template v-if="ctxMenu.kind === 'folder' || ctxMenu.kind === 'root'">
             <button
               v-if="
@@ -1284,6 +1310,14 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
               {{ t("knowledge.explorer.importExternalFolder") }}
             </button>
             <button
+              v-if="props.activeType === 'skill' && ctxMenu.kind === 'root'"
+              type="button"
+              class="kx-ctx-item"
+              @click="importSkillPackageArchive"
+            >
+              {{ t("knowledge.explorer.importSkillPackage") }}
+            </button>
+            <button
               v-if="
                 ctxMenu.kind === 'root' ||
                 (ctxMenu.kind === 'folder' && ctxMenu.targetNodes.length === 1)
@@ -1307,6 +1341,14 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
             </button>
           </template>
           <template v-else-if="ctxMenu.kind === 'package'">
+            <button
+              v-if="ctxMenu.targetNodes.length === 1"
+              type="button"
+              class="kx-ctx-item"
+              @click="exportSelectedPackage"
+            >
+              {{ t("knowledge.explorer.exportSkillPackage") }}
+            </button>
             <button
               v-if="ctxMenu.targetNodes.length === 1"
               type="button"
@@ -1364,9 +1406,7 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
               {{ deleteMenuLabel(ctxMenu) }}
             </button>
           </template>
-        </div>
-      </div>
-    </Teleport>
+    </BaseContextMenu>
   </div>
 </template>
 
@@ -1732,6 +1772,20 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
   background: color-mix(in srgb, var(--hover-bg) 86%, transparent);
 }
 
+.kx-flag.flag-command {
+  color: var(--text-color);
+  border-color: color-mix(
+    in srgb,
+    var(--border-color) 78%,
+    var(--text-secondary) 22%
+  );
+  background: color-mix(in srgb, var(--hover-bg) 86%, transparent);
+  font-family: var(--font-mono-identifier);
+  font-weight: 600;
+  text-transform: none;
+  letter-spacing: 0;
+}
+
 .kx-flag.flag-search-on {
   color: var(--text-color);
   border-color: color-mix(
@@ -1833,51 +1887,4 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
   color: var(--text-secondary);
 }
 
-.kx-ctx-backdrop {
-  position: fixed;
-  inset: 0;
-  z-index: 80;
-}
-
-.kx-ctx-menu {
-  position: fixed;
-  min-width: 156px;
-  padding: 6px;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  border: 1px solid var(--border-color);
-  border-radius: 8px;
-  background: var(--elevated-bg, var(--panel-bg));
-  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.24);
-}
-
-.kx-ctx-item {
-  display: flex;
-  align-items: center;
-  width: 100%;
-  min-height: 28px;
-  padding: 0 10px;
-  border: none;
-  border-radius: 6px;
-  background: transparent;
-  color: var(--text-color);
-  font: inherit;
-  font-size: 12px;
-  text-align: left;
-  cursor: pointer;
-}
-
-.kx-ctx-item:hover {
-  background: var(--hover-bg);
-}
-
-.kx-ctx-item-danger {
-  color: var(--status-danger-fg);
-}
-
-.kx-ctx-item-danger:hover {
-  background: var(--status-danger-bg);
-  color: var(--status-danger-fg);
-}
 </style>

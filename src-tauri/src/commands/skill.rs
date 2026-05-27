@@ -1,4 +1,5 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -39,6 +40,8 @@ pub struct SkillManifest {
     pub skill_surface: SkillSurface,
     pub skill_description: Option<String>,
     pub command_trigger: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<String>,
     #[serde(default)]
     pub kind: SkillManifestKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -195,12 +198,29 @@ pub struct SkillPackageManifestFile {
     pub tools: Vec<SkillPackageToolManifest>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct SkillPackageDocumentFrontmatter {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    tools: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct SkillPackageRecord {
     pub root: PathBuf,
     pub manifest: SkillPackageManifestFile,
     pub doc_levels: SkillPackageDocLevels,
     pub updated_at: i64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SkillPackageUnityScriptBundle {
+    pub package_id: String,
+    pub source_hash: String,
+    pub script_count: usize,
+    pub request: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -233,6 +253,15 @@ pub struct SkillUnityInstallStatus {
     pub files: Vec<SkillUnityFileStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillPackageArchiveResult {
+    pub package_id: String,
+    pub path: String,
+    pub file_count: usize,
+    pub byte_size: u64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -273,6 +302,8 @@ pub struct SkillCreateRequest {
     pub command_enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_invocation_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -577,6 +608,7 @@ fn build_skill_manifest(
         skill_surface,
         skill_description,
         command_trigger,
+        tools: document.tools.clone(),
         kind: SkillManifestKind::Document,
         package_id: None,
         package_version: None,
@@ -602,6 +634,49 @@ fn normalize_package_id(value: &str) -> Result<String, String> {
         return Err("Invalid skill package id".to_string());
     }
     Ok(id.to_string())
+}
+
+fn normalize_default_skill_package_namespace(value: &str) -> Result<String, String> {
+    let namespace = value.trim();
+    if namespace.is_empty() {
+        return Ok(String::new());
+    }
+    normalize_package_id(namespace)
+        .map_err(|_| "Invalid default skill package namespace".to_string())
+}
+
+fn skill_package_slug_from_name(value: &str) -> String {
+    let mut slug = String::new();
+    let mut last_was_separator = true;
+    for ch in value.trim().chars() {
+        let lower = ch.to_ascii_lowercase();
+        if lower.is_ascii_alphanumeric() {
+            slug.push(lower);
+            last_was_separator = false;
+        } else if !last_was_separator {
+            slug.push('-');
+            last_was_separator = true;
+        }
+    }
+    slug.trim_matches('-').to_string()
+}
+
+fn resolve_skill_create_package_id(
+    package_id: Option<String>,
+    _default_namespace: Option<&str>,
+    name: &str,
+) -> Result<String, String> {
+    if let Some(package_id) = optional_trimmed(package_id) {
+        return normalize_package_id(&package_id);
+    }
+
+    let slug = skill_package_slug_from_name(name);
+    if slug.is_empty() {
+        return Err(
+            "Cannot derive Skill package id from package name; provide packageId.".to_string(),
+        );
+    }
+    normalize_package_id(&slug)
 }
 
 fn normalize_package_rel_path(value: &str) -> Result<String, String> {
@@ -650,6 +725,37 @@ fn package_file_path(root: &Path, rel_path: &str) -> Result<PathBuf, String> {
     Ok(root.join(rel_path))
 }
 
+fn package_file_modified_at(path: &Path, fallback: i64) -> i64 {
+    get_updated_at(path).max(fallback)
+}
+
+fn package_doc_is_root(manifest: &SkillPackageManifestFile, doc_rel_path: &str) -> bool {
+    doc_rel_path == package_root_doc_rel_path(manifest)
+}
+
+fn package_document_virtual_path(
+    manifest: &SkillPackageManifestFile,
+    doc_rel_path: &str,
+) -> String {
+    if package_doc_is_root(manifest, doc_rel_path) {
+        format!("{}/SKILL.md", manifest.id)
+    } else {
+        format!("{}/{}", manifest.id, doc_rel_path)
+    }
+}
+
+fn package_document_title(manifest: &SkillPackageManifestFile, doc_rel_path: &str) -> String {
+    if package_doc_is_root(manifest, doc_rel_path) {
+        return manifest.name.clone();
+    }
+    Path::new(doc_rel_path)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(doc_rel_path)
+        .to_string()
+}
+
 fn package_manifest_path(root: &Path) -> PathBuf {
     root.join(SKILL_PACKAGE_MANIFEST_FILE_NAME)
 }
@@ -663,20 +769,27 @@ fn is_skill_package_root(root: &Path) -> bool {
 }
 
 pub(crate) fn app_skill_package_dirs() -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
-    #[cfg(debug_assertions)]
-    {
-        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        candidates.push(manifest_dir.join("..").join("skills"));
-    }
-    if let Ok(config_dir) = super::persistent_config_dir() {
-        candidates.push(config_dir.join("skills"));
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(exe_dir) = exe.parent() {
-            candidates.push(exe_dir.join("skills"));
+    #[cfg(test)]
+    let candidates: Vec<PathBuf> = Vec::new();
+
+    #[cfg(not(test))]
+    let candidates: Vec<PathBuf> = {
+        let mut candidates = Vec::new();
+        if let Ok(config_dir) = super::persistent_config_dir() {
+            candidates.push(config_dir.join("skills"));
         }
-    }
+        #[cfg(debug_assertions)]
+        {
+            let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            candidates.push(manifest_dir.join("..").join("skills"));
+        }
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(exe_dir) = exe.parent() {
+                candidates.push(exe_dir.join("skills"));
+            }
+        }
+        candidates
+    };
 
     let mut seen = BTreeSet::new();
     candidates
@@ -909,6 +1022,96 @@ fn strip_utf8_bom(content: &str) -> &str {
     content.strip_prefix('\u{feff}').unwrap_or(content)
 }
 
+fn split_optional_package_frontmatter(
+    content: &str,
+) -> Result<(SkillPackageDocumentFrontmatter, String), String> {
+    let content = strip_utf8_bom(content);
+    let normalized = content.strip_prefix("\r\n").unwrap_or(content);
+    let Some(after_open) = normalized
+        .strip_prefix("---\r\n")
+        .or_else(|| normalized.strip_prefix("---\n"))
+    else {
+        return Ok((
+            SkillPackageDocumentFrontmatter::default(),
+            content.to_string(),
+        ));
+    };
+
+    let (yaml, rest) = if let Some(index) = after_open.find("\r\n---\r\n") {
+        (&after_open[..index], &after_open[index + 7..])
+    } else if let Some(index) = after_open.find("\n---\n") {
+        (&after_open[..index], &after_open[index + 5..])
+    } else {
+        return Err("Skill package document frontmatter is not terminated".to_string());
+    };
+    let frontmatter = serde_yaml::from_str::<SkillPackageDocumentFrontmatter>(yaml)
+        .map_err(|e| format!("Failed to parse Skill package document frontmatter: {}", e))?;
+    Ok((frontmatter, rest.to_string()))
+}
+
+fn normalize_package_document_tool_names(
+    record: &SkillPackageRecord,
+    values: &[String],
+) -> Vec<String> {
+    let built_ins = crate::tool::built_in_tool_name_keys();
+    let mut names = values
+        .iter()
+        .filter_map(|value| {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            let lower = trimmed.to_ascii_lowercase();
+            if built_ins.contains(&lower) {
+                return Some(lower);
+            }
+            if let Some(tool) = record
+                .manifest
+                .tools
+                .iter()
+                .find(|tool| tool.name.eq_ignore_ascii_case(trimmed))
+            {
+                return Some(package_tool_api_name(&record.manifest.id, &tool.name));
+            }
+            canonical_skill_package_tool_name(trimmed).or_else(|| Some(trimmed.to_string()))
+        })
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn package_manifest_tool_names(record: &SkillPackageRecord) -> Vec<String> {
+    let mut names = record
+        .manifest
+        .tools
+        .iter()
+        .map(|tool| package_tool_api_name(&record.manifest.id, &tool.name))
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn package_document_tool_names(
+    record: &SkillPackageRecord,
+    doc_rel_path: &str,
+    frontmatter: &SkillPackageDocumentFrontmatter,
+) -> Vec<String> {
+    let mut names = if package_doc_is_root(&record.manifest, doc_rel_path) {
+        package_manifest_tool_names(record)
+    } else {
+        Vec::new()
+    };
+    names.extend(normalize_package_document_tool_names(
+        record,
+        &frontmatter.tools,
+    ));
+    names.sort();
+    names.dedup();
+    names
+}
+
 fn scan_package_document_levels(body: &str) -> SkillPackageDocLevels {
     SkillPackageDocLevels {
         has_l0: markdown_has_l_section(body, "L0"),
@@ -928,8 +1131,8 @@ fn load_skill_package_record(root: &Path) -> Result<SkillPackageRecord, String> 
     let root_doc_path = package_root_doc_path(root);
     let raw = std::fs::read_to_string(&root_doc_path)
         .map_err(|e| format!("Failed to read {}: {}", root_doc_path.display(), e))?;
-    let body = strip_utf8_bom(&raw);
-    let doc_levels = scan_package_document_levels(body);
+    let (_, body) = split_optional_package_frontmatter(&raw)?;
+    let doc_levels = scan_package_document_levels(&body);
     let updated_at = get_updated_at(&manifest_path).max(get_updated_at(&root_doc_path));
     Ok(SkillPackageRecord {
         root: root.to_path_buf(),
@@ -1089,7 +1292,47 @@ fn truncate_ascii_segment(value: &str, max_len: usize) -> String {
     value.chars().take(max_len).collect()
 }
 
-fn package_tool_api_name(package_id: &str, tool_name: &str) -> String {
+const MAX_PACKAGE_TOOL_API_NAME_LEN: usize = 64;
+
+fn package_tool_name_key(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
+}
+
+fn package_tool_hash_suffix(package_id: &str, tool_name: &str, salt: &str) -> String {
+    let hash = blake3::hash(format!("{}:{}:{}", package_id, tool_name, salt).as_bytes())
+        .to_hex()
+        .to_string();
+    format!("_{}", &hash[..8])
+}
+
+fn truncate_package_tool_api_name(name: String, package_id: &str, tool_name: &str) -> String {
+    if name.len() <= MAX_PACKAGE_TOOL_API_NAME_LEN {
+        return name;
+    }
+
+    let suffix = package_tool_hash_suffix(package_id, tool_name, &name);
+    let budget = MAX_PACKAGE_TOOL_API_NAME_LEN
+        .saturating_sub(suffix.len())
+        .max(1);
+    format!("{}{}", truncate_ascii_segment(&name, budget), suffix)
+}
+
+fn package_tool_short_api_name(tool_name: &str) -> String {
+    let tool_segment = sanitize_tool_name_segment(tool_name);
+    truncate_package_tool_api_name(tool_segment, "", tool_name)
+}
+
+fn package_tool_qualified_api_name(package_id: &str, tool_name: &str) -> String {
+    let package_segment = sanitize_tool_name_segment(package_id);
+    let tool_segment = sanitize_tool_name_segment(tool_name);
+    truncate_package_tool_api_name(
+        format!("{}_{}", package_segment, tool_segment),
+        package_id,
+        tool_name,
+    )
+}
+
+fn legacy_package_tool_api_name(package_id: &str, tool_name: &str) -> String {
     const MAX_TOOL_NAME_LEN: usize = 64;
     let package_segment = sanitize_tool_name_segment(package_id);
     let tool_segment = sanitize_tool_name_segment(tool_name);
@@ -1115,12 +1358,124 @@ fn package_tool_api_name(package_id: &str, tool_name: &str) -> String {
     )
 }
 
+fn default_package_tool_reserved_names() -> BTreeSet<String> {
+    let mut names = crate::tool::built_in_tool_name_keys();
+    names.insert("task".to_string());
+    names
+}
+
+fn package_tool_record_key(package_id: &str, tool_name: &str) -> (String, String) {
+    (package_id.to_string(), tool_name.to_string())
+}
+
+fn package_tool_unique_api_name(
+    preferred: String,
+    package_id: &str,
+    tool_name: &str,
+    used: &mut BTreeSet<String>,
+) -> String {
+    let preferred_key = package_tool_name_key(&preferred);
+    if used.insert(preferred_key) {
+        return preferred;
+    }
+
+    let qualified = package_tool_qualified_api_name(package_id, tool_name);
+    for attempt in 0..128 {
+        let suffix = package_tool_hash_suffix(package_id, tool_name, &attempt.to_string());
+        let budget = MAX_PACKAGE_TOOL_API_NAME_LEN
+            .saturating_sub(suffix.len())
+            .max(1);
+        let candidate = format!("{}{}", truncate_ascii_segment(&qualified, budget), suffix);
+        if used.insert(package_tool_name_key(&candidate)) {
+            return candidate;
+        }
+    }
+
+    qualified
+}
+
+fn package_tool_api_names_for_records(
+    records: &[SkillPackageRecord],
+    reserved: &BTreeSet<String>,
+) -> BTreeMap<(String, String), String> {
+    let mut short_name_counts = BTreeMap::<String, usize>::new();
+    let mut candidates = Vec::<(String, String, String)>::new();
+
+    for record in records {
+        for tool in &record.manifest.tools {
+            let short_name = package_tool_short_api_name(&tool.name);
+            *short_name_counts
+                .entry(package_tool_name_key(&short_name))
+                .or_insert(0) += 1;
+            candidates.push((record.manifest.id.clone(), tool.name.clone(), short_name));
+        }
+    }
+    candidates.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+
+    let mut used = reserved
+        .iter()
+        .map(|name| package_tool_name_key(name))
+        .collect::<BTreeSet<_>>();
+    let mut names = BTreeMap::new();
+
+    for (package_id, tool_name, short_name) in candidates {
+        let short_key = package_tool_name_key(&short_name);
+        let short_conflicts = used.contains(&short_key)
+            || short_name_counts.get(&short_key).copied().unwrap_or(0) > 1;
+        let preferred = if short_conflicts {
+            package_tool_qualified_api_name(&package_id, &tool_name)
+        } else {
+            short_name
+        };
+        let api_name = package_tool_unique_api_name(preferred, &package_id, &tool_name, &mut used);
+        names.insert(package_tool_record_key(&package_id, &tool_name), api_name);
+    }
+
+    names
+}
+
+fn package_tool_api_name_with_records(
+    package_id: &str,
+    tool_name: &str,
+    records: &[SkillPackageRecord],
+    reserved: &BTreeSet<String>,
+) -> String {
+    let names = package_tool_api_names_for_records(records, reserved);
+    names
+        .get(&package_tool_record_key(package_id, tool_name))
+        .cloned()
+        .unwrap_or_else(|| {
+            let short_name = package_tool_short_api_name(tool_name);
+            if reserved.contains(&package_tool_name_key(&short_name)) {
+                package_tool_qualified_api_name(package_id, tool_name)
+            } else {
+                short_name
+            }
+        })
+}
+
+fn package_tool_api_name(package_id: &str, tool_name: &str) -> String {
+    let records = list_skill_packages_sync();
+    package_tool_api_name_with_records(
+        package_id,
+        tool_name,
+        &records,
+        &default_package_tool_reserved_names(),
+    )
+}
+
 pub(crate) fn register_skill_package_tools(registry: &mut ToolRegistry) -> usize {
     let mut count = 0usize;
-    for record in list_skill_packages_sync() {
+    let records = list_skill_packages_sync();
+    let tool_names =
+        package_tool_api_names_for_records(&records, &default_package_tool_reserved_names());
+    for record in records {
         for tool in &record.manifest.tools {
-            let tool_name = package_tool_api_name(&record.manifest.id, &tool.name);
-            if registry.canonical_name(&tool_name).is_some() {
+            let tool_name = tool_names
+                .get(&package_tool_record_key(&record.manifest.id, &tool.name))
+                .cloned()
+                .unwrap_or_else(|| package_tool_api_name(&record.manifest.id, &tool.name));
+            if registry.get(&tool_name).is_some() {
                 eprintln!(
                     "[Locus] skipped duplicate Skill package tool '{}'",
                     tool_name
@@ -1149,10 +1504,19 @@ fn find_skill_package_tool_by_api_name(
     if requested.is_empty() {
         return None;
     }
-    for record in list_skill_packages_sync() {
+    let records = list_skill_packages_sync();
+    let tool_names =
+        package_tool_api_names_for_records(&records, &default_package_tool_reserved_names());
+    for record in records {
         for tool in &record.manifest.tools {
-            let api_name = package_tool_api_name(&record.manifest.id, &tool.name);
-            if api_name.to_ascii_lowercase() == requested {
+            let api_name = tool_names
+                .get(&package_tool_record_key(&record.manifest.id, &tool.name))
+                .cloned()
+                .unwrap_or_else(|| package_tool_api_name(&record.manifest.id, &tool.name));
+            let legacy_name = legacy_package_tool_api_name(&record.manifest.id, &tool.name);
+            if api_name.to_ascii_lowercase() == requested
+                || legacy_name.to_ascii_lowercase() == requested
+            {
                 return Some((record.clone(), tool.clone(), api_name));
             }
         }
@@ -1161,15 +1525,39 @@ fn find_skill_package_tool_by_api_name(
 }
 
 pub(crate) fn skill_package_tool_names_sync() -> Vec<String> {
-    let mut names = list_skill_packages_sync()
-        .into_iter()
+    let records = list_skill_packages_sync();
+    let names_by_key =
+        package_tool_api_names_for_records(&records, &default_package_tool_reserved_names());
+    let mut names = records
+        .iter()
         .flat_map(|record| {
-            record
-                .manifest
-                .tools
-                .iter()
-                .map(|tool| package_tool_api_name(&record.manifest.id, &tool.name))
-                .collect::<Vec<_>>()
+            record.manifest.tools.iter().filter_map(|tool| {
+                names_by_key
+                    .get(&package_tool_record_key(&record.manifest.id, &tool.name))
+                    .cloned()
+            })
+        })
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    names
+}
+
+pub(crate) fn skill_package_tool_names_for_package_sync(package_id: &str) -> Vec<String> {
+    let Ok(record) = find_skill_package(package_id) else {
+        return Vec::new();
+    };
+    let records = list_skill_packages_sync();
+    let names_by_key =
+        package_tool_api_names_for_records(&records, &default_package_tool_reserved_names());
+    let mut names = record
+        .manifest
+        .tools
+        .iter()
+        .filter_map(|tool| {
+            names_by_key
+                .get(&package_tool_record_key(&record.manifest.id, &tool.name))
+                .cloned()
         })
         .collect::<Vec<_>>();
     names.sort();
@@ -1702,9 +2090,6 @@ async fn run_skill_package_dynamic_unity_tool(
             script_rel
         ));
     }
-    let source = std::fs::read_to_string(&script_path)
-        .map_err(|e| format!("Failed to read {}: {}", script_path.display(), e))?;
-    let source_hash = blake3::hash(source.as_bytes()).to_hex().to_string();
     let entry_type = tool
         .entry_type
         .as_deref()
@@ -1726,41 +2111,37 @@ async fn run_skill_package_dynamic_unity_tool(
         .method
         .as_deref()
         .ok_or_else(|| format!("Skill package Unity tool '{}' is missing method", tool.name))?;
-    let args_json = serde_json::to_string(args)
-        .map_err(|e| format!("Failed to serialize Skill package Unity arguments: {}", e))?;
 
-    let cached_payload = serde_json::json!({
-        "viewId": format!("skill:{}", package_id),
-        "scriptName": tool.name,
-        "entryType": entry_type.clone(),
-        "sourceHash": source_hash.clone(),
-        "path": script_rel,
-        "method": method,
-        "argsJson": args_json,
-    });
-    let raw = match crate::unity_bridge::invoke_named_cached(project_path, &cached_payload).await {
-        Ok(raw) => raw,
-        Err(error) if is_named_script_compile_required(&error) => {
-            let payload = serde_json::json!({
-                "viewId": format!("skill:{}", package_id),
-                "scriptName": tool.name,
-                "entryType": entry_type,
-                "source": source,
-                "sourceHash": source_hash,
-                "path": script_rel,
-                "method": method,
-                "argsJson": cached_payload["argsJson"].clone(),
-            });
-            crate::unity_bridge::invoke_named(project_path, &payload).await?
-        }
-        Err(error) => return Err(error),
-    };
+    let record = find_skill_package(package_id)?;
+    let bundle = skill_package_unity_script_bundle_for_record(&record)?.ok_or_else(|| {
+        format!(
+            "Skill package '{}' has no Unity C# scripts to compile",
+            package_id
+        )
+    })?;
+    let compile_raw =
+        crate::unity_bridge::compile_skill_package(project_path, &bundle.request).await?;
+    let compile_json = serde_json::from_str::<serde_json::Value>(&compile_raw)
+        .map_err(|error| format!("Failed to parse Skill C# compile response: {}", error))?;
+    crate::unity_bridge::update_unity_type_index_after_skill_package_compile(
+        project_path,
+        &compile_json,
+    )
+    .await?;
+
+    let assembly_id = compile_json
+        .get("assemblyId")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .trim();
+    if assembly_id.is_empty() {
+        return Err("Skill package compile response is missing assemblyId".to_string());
+    }
+    let payload =
+        skill_package_invoke_payload(package_id, Some(assembly_id), &entry_type, method, args)?;
+    let raw = crate::unity_bridge::invoke_skill_package(project_path, &payload).await?;
 
     Ok(format_json_or_text(&raw))
-}
-
-fn is_named_script_compile_required(error: &str) -> bool {
-    error.trim().starts_with("compile_required:") || error.trim() == "compile_required"
 }
 
 fn format_json_or_text(raw: &str) -> String {
@@ -1790,97 +2171,26 @@ async fn run_skill_package_loaded_unity_tool(
         .method
         .as_deref()
         .ok_or_else(|| format!("Skill package Unity tool '{}' is missing method", tool.name))?;
-    let args_json = serde_json::to_string(args)
-        .map_err(|e| format!("Failed to serialize Skill package Unity arguments: {}", e))?;
-    let code = build_skill_unity_invocation_code(package_id, type_name, method, &args_json);
-    let output = crate::unity_bridge::unity_execute_code(project_path, &code).await?;
-    let trimmed = output.trim();
-    if trimmed.is_empty() {
-        Ok("Code executed successfully (no output).".to_string())
-    } else {
-        Ok(trimmed.to_string())
-    }
+    let payload = skill_package_invoke_payload(package_id, None, type_name, method, args)?;
+    let raw = crate::unity_bridge::invoke_skill_package(project_path, &payload).await?;
+    Ok(format_json_or_text(&raw))
 }
 
-fn csharp_string_literal(value: &str) -> String {
-    let mut out = String::from("\"");
-    for ch in value.chars() {
-        match ch {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            ch if ch.is_control() => out.push_str(&format!("\\u{:04x}", ch as u32)),
-            ch => out.push(ch),
-        }
-    }
-    out.push('"');
-    out
-}
-
-fn build_skill_unity_invocation_code(
+fn skill_package_invoke_payload(
     package_id: &str,
+    assembly_id: Option<&str>,
     type_name: &str,
     method: &str,
-    args_json: &str,
-) -> String {
-    format!(
-        r#"
-var __locusSkillPackageId = {package_id};
-var __locusSkillTypeName = {type_name};
-var __locusSkillMethodName = {method};
-var __locusSkillArgsJson = {args_json};
-System.Type __locusSkillType = System.Type.GetType(__locusSkillTypeName);
-if (__locusSkillType == null)
-{{
-    foreach (var __locusAssembly in System.AppDomain.CurrentDomain.GetAssemblies())
-    {{
-        __locusSkillType = __locusAssembly.GetType(__locusSkillTypeName);
-        if (__locusSkillType != null) break;
-    }}
-}}
-if (__locusSkillType == null)
-{{
-    throw new System.Exception("Skill package " + __locusSkillPackageId + " cannot find type: " + __locusSkillTypeName);
-}}
-var __locusSkillMethod = __locusSkillType.GetMethod(
-    __locusSkillMethodName,
-    System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
-if (__locusSkillMethod == null)
-{{
-    throw new System.Exception("Skill package " + __locusSkillPackageId + " cannot find static method: " + __locusSkillTypeName + "." + __locusSkillMethodName);
-}}
-var __locusSkillParameters = __locusSkillMethod.GetParameters();
-object __locusSkillResult;
-if (__locusSkillParameters.Length == 0)
-{{
-    __locusSkillResult = __locusSkillMethod.Invoke(null, null);
-}}
-else if (__locusSkillParameters.Length == 1 && __locusSkillParameters[0].ParameterType == typeof(string))
-{{
-    __locusSkillResult = __locusSkillMethod.Invoke(null, new object[] {{ __locusSkillArgsJson }});
-}}
-else
-{{
-    throw new System.Exception("Skill package " + __locusSkillPackageId + " method must accept no parameters or one string JSON parameter.");
-}}
-if (__locusSkillResult is System.Threading.Tasks.Task __locusSkillTask)
-{{
-    __locusSkillTask.GetAwaiter().GetResult();
-    var __locusSkillResultProperty = __locusSkillTask.GetType().GetProperty("Result");
-    __locusSkillResult = __locusSkillResultProperty != null ? __locusSkillResultProperty.GetValue(__locusSkillTask) : null;
-}}
-if (__locusSkillResult != null)
-{{
-    UnityEngine.Debug.Log(__locusSkillResult.ToString());
-}}
-"#,
-        package_id = csharp_string_literal(package_id),
-        type_name = csharp_string_literal(type_name),
-        method = csharp_string_literal(method),
-        args_json = csharp_string_literal(args_json)
-    )
+    args: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    Ok(serde_json::json!({
+        "packageId": package_id,
+        "assemblyId": assembly_id.unwrap_or(""),
+        "typeName": type_name,
+        "method": method,
+        "argsJson": serde_json::to_string(args)
+            .map_err(|e| format!("Failed to serialize Skill package Unity arguments: {}", e))?,
+    }))
 }
 
 fn package_source_summary(
@@ -1897,12 +2207,36 @@ fn package_source_summary(
     })
 }
 
-fn package_document_id(package_id: &str) -> String {
+fn package_document_id(package_id: &str, doc_rel_path: &str) -> String {
     let normalized = package_id
         .chars()
         .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
         .collect::<String>();
-    format!("kd_skill_package_{}", normalized)
+    if doc_rel_path == SKILL_PACKAGE_ROOT_DOC_FILE_NAME {
+        return format!("kd_skill_package_{}", normalized);
+    }
+
+    let mut rel_segment = doc_rel_path
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+        .collect::<String>()
+        .trim_matches('_')
+        .to_string();
+    if rel_segment.is_empty() {
+        rel_segment = "file".to_string();
+    }
+    if rel_segment.len() > 48 {
+        rel_segment = rel_segment.chars().take(48).collect();
+    }
+    let hash = blake3::hash(format!("{}:{}", package_id, doc_rel_path).as_bytes())
+        .to_hex()
+        .to_string();
+    format!(
+        "kd_skill_package_{}__{}_{}",
+        normalized,
+        rel_segment,
+        &hash[..8]
+    )
 }
 
 fn package_command_enabled(manifest: &SkillPackageManifestFile) -> bool {
@@ -2011,28 +2345,52 @@ fn package_command_trigger(manifest: &SkillPackageManifestFile) -> String {
 fn package_to_document(
     record: &SkillPackageRecord,
     doc_rel_path: &str,
-    body: String,
+    raw_body: String,
     override_config: Option<&SkillConfig>,
-) -> KnowledgeDocument {
+) -> Result<KnowledgeDocument, String> {
+    let (frontmatter, body) = split_optional_package_frontmatter(&raw_body)?;
     let manifest = &record.manifest;
-    let path = if doc_rel_path == package_root_doc_rel_path(manifest) {
-        format!("{}/SKILL.md", manifest.id)
+    let is_root = package_doc_is_root(manifest, doc_rel_path);
+    let command_enabled = is_root && configured_package_command_enabled(manifest, override_config);
+    let skill_enabled = if is_root {
+        configured_package_skill_enabled(manifest, override_config)
     } else {
-        format!("{}/{}", manifest.id, doc_rel_path)
+        false
     };
-    let command_enabled = configured_package_command_enabled(manifest, override_config);
-    let skill_enabled = configured_package_skill_enabled(manifest, override_config);
-    let skill_surface = configured_package_skill_surface(manifest, override_config);
-    let description = configured_package_description(manifest, override_config);
-    KnowledgeDocument {
-        id: package_document_id(&manifest.id),
+    let skill_surface = if is_root {
+        configured_package_skill_surface(manifest, override_config)
+    } else {
+        SkillSurface::Command
+    };
+    let description = if is_root {
+        configured_package_description(manifest, override_config)
+    } else {
+        String::new()
+    };
+    let file_path = package_file_path(&record.root, doc_rel_path).ok();
+    let updated_at = file_path
+        .as_ref()
+        .map(|path| package_file_modified_at(path, record.updated_at))
+        .unwrap_or(record.updated_at);
+    Ok(KnowledgeDocument {
+        id: package_document_id(&manifest.id, doc_rel_path),
         doc_type: KnowledgeType::Skill,
-        path,
-        title: manifest.name.clone(),
-        inject_mode: configured_package_inject_mode(override_config),
+        path: package_document_virtual_path(manifest, doc_rel_path),
+        title: frontmatter
+            .title
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| package_document_title(manifest, doc_rel_path)),
+        inject_mode: if is_root {
+            configured_package_inject_mode(override_config)
+        } else {
+            KnowledgeInjectMode::None
+        },
         inherit_inject_mode: false,
         inject_mode_source: Default::default(),
-        summary_enabled: true,
+        summary_enabled: is_root,
         command_enabled,
         read_only: true,
         ai_maintained: false,
@@ -2043,17 +2401,16 @@ fn package_to_document(
         external_source: package_source_summary(manifest),
         skill_enabled: Some(skill_enabled),
         skill_surface: Some(skill_surface),
-        command_trigger: Some(configured_package_command_trigger(
-            manifest,
-            override_config,
-        )),
-        argument_hint: package_argument_hint(manifest),
+        command_trigger: is_root
+            .then(|| configured_package_command_trigger(manifest, override_config)),
+        argument_hint: is_root.then(|| package_argument_hint(manifest)).flatten(),
+        tools: package_document_tool_names(record, doc_rel_path, &frontmatter),
         summary: (!description.trim().is_empty()).then_some(description),
         body,
         maintenance_rules: None,
-        created_at: record.updated_at,
-        updated_at: record.updated_at,
-    }
+        created_at: updated_at,
+        updated_at,
+    })
 }
 
 pub(crate) fn read_skill_package_document_sync(
@@ -2091,7 +2448,7 @@ pub(crate) fn read_skill_package_document_sync(
         let raw = std::fs::read_to_string(&file_path)
             .map_err(|e| format!("Failed to read skill package document: {}", e))?;
         let body = strip_utf8_bom(&raw).to_string();
-        let mut document = package_to_document(&record, &doc_rel_path, body, config);
+        let mut document = package_to_document(&record, &doc_rel_path, body, config)?;
         match normalized_part {
             "full" => {}
             "summary" => {
@@ -2117,22 +2474,161 @@ pub(crate) fn read_skill_package_document_sync(
     Ok(None)
 }
 
+fn package_unity_script_rel_paths(record: &SkillPackageRecord) -> Result<Vec<String>, String> {
+    let mut paths = BTreeSet::new();
+
+    for capability in &record.manifest.capabilities.unity {
+        if capability.path.to_ascii_lowercase().ends_with(".cs") {
+            paths.insert(normalize_package_rel_path(&capability.path)?);
+        }
+    }
+
+    for tool in &record.manifest.tools {
+        if tool.runtime == "unity" {
+            if let Some(path) = tool.path.as_deref() {
+                if path.to_ascii_lowercase().ends_with(".cs") {
+                    paths.insert(normalize_package_rel_path(path)?);
+                }
+            }
+        }
+    }
+
+    let unity_editor_root = record.root.join("unity").join("Editor");
+    if unity_editor_root.is_dir() {
+        for entry in WalkDir::new(&unity_editor_root)
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_file())
+        {
+            let path = entry.path();
+            let is_csharp = path
+                .extension()
+                .and_then(|value| value.to_str())
+                .map(|value| value.eq_ignore_ascii_case("cs"))
+                .unwrap_or(false);
+            if !is_csharp {
+                continue;
+            }
+
+            let rel = path
+                .strip_prefix(&record.root)
+                .map_err(|e| format!("Failed to resolve Skill package Unity script path: {}", e))?;
+            paths.insert(normalize_package_rel_path(
+                &rel.to_string_lossy().replace('\\', "/"),
+            )?);
+        }
+    }
+
+    Ok(paths.into_iter().collect())
+}
+
+pub(crate) fn skill_package_unity_script_bundle_for_document_sync(
+    virtual_path: &str,
+) -> Result<Option<SkillPackageUnityScriptBundle>, String> {
+    for record in list_skill_packages_sync() {
+        let Some(_doc_rel_path) =
+            package_doc_rel_path_for_virtual_path(&record.manifest, virtual_path)?
+        else {
+            continue;
+        };
+
+        return skill_package_unity_script_bundle_for_record(&record);
+    }
+
+    Ok(None)
+}
+
+fn skill_package_unity_script_bundle_for_record(
+    record: &SkillPackageRecord,
+) -> Result<Option<SkillPackageUnityScriptBundle>, String> {
+    let script_paths = package_unity_script_rel_paths(record)?;
+    if script_paths.is_empty() {
+        return Ok(None);
+    }
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(record.manifest.id.as_bytes());
+    let mut scripts = Vec::with_capacity(script_paths.len());
+    for rel_path in script_paths {
+        let source_path = package_file_path(&record.root, &rel_path)?;
+        let source = std::fs::read_to_string(&source_path).map_err(|e| {
+            format!(
+                "Failed to read Skill package Unity script '{}': {}",
+                rel_path, e
+            )
+        })?;
+        hasher.update(rel_path.as_bytes());
+        hasher.update(source.as_bytes());
+        scripts.push(serde_json::json!({
+            "path": rel_path,
+            "source": source,
+        }));
+    }
+
+    let source_hash = hasher.finalize().to_hex().to_string();
+    let script_count = scripts.len();
+    Ok(Some(SkillPackageUnityScriptBundle {
+        package_id: record.manifest.id.clone(),
+        source_hash: source_hash.clone(),
+        script_count,
+        request: serde_json::json!({
+            "packageId": record.manifest.id.clone(),
+            "sourceHash": source_hash,
+            "scripts": scripts,
+        }),
+    }))
+}
+
 fn package_to_list_item(
     record: &SkillPackageRecord,
+    doc_rel_path: &str,
     override_config: Option<&SkillConfig>,
 ) -> knowledge_store::KnowledgeListItem {
     let manifest = &record.manifest;
-    let command_enabled = configured_package_command_enabled(manifest, override_config);
-    let skill_enabled = configured_package_skill_enabled(manifest, override_config);
-    let skill_surface = configured_package_skill_surface(manifest, override_config);
-    let description = configured_package_description(manifest, override_config);
+    let is_root = package_doc_is_root(manifest, doc_rel_path);
+    let command_enabled = is_root && configured_package_command_enabled(manifest, override_config);
+    let skill_enabled = if is_root {
+        configured_package_skill_enabled(manifest, override_config)
+    } else {
+        false
+    };
+    let skill_surface = if is_root {
+        configured_package_skill_surface(manifest, override_config)
+    } else {
+        SkillSurface::Command
+    };
+    let description = if is_root {
+        configured_package_description(manifest, override_config)
+    } else {
+        String::new()
+    };
+    let file_path = package_file_path(&record.root, doc_rel_path).ok();
+    let body = file_path
+        .as_ref()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .unwrap_or_default();
+    let (frontmatter, body) = split_optional_package_frontmatter(&body).unwrap_or_default();
+    let updated_at = file_path
+        .as_ref()
+        .map(|path| package_file_modified_at(path, record.updated_at))
+        .unwrap_or(record.updated_at);
     knowledge_store::KnowledgeListItem {
-        id: package_document_id(&manifest.id),
+        id: package_document_id(&manifest.id, doc_rel_path),
         doc_type: KnowledgeType::Skill,
-        path: format!("{}/SKILL.md", manifest.id),
-        title: manifest.name.clone(),
-        inject_mode: configured_package_inject_mode(override_config),
-        summary_enabled: true,
+        path: package_document_virtual_path(manifest, doc_rel_path),
+        title: frontmatter
+            .title
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| package_document_title(manifest, doc_rel_path)),
+        inject_mode: if is_root {
+            configured_package_inject_mode(override_config)
+        } else {
+            KnowledgeInjectMode::None
+        },
+        summary_enabled: is_root,
         command_enabled,
         read_only: true,
         ai_maintained: false,
@@ -2141,23 +2637,79 @@ fn package_to_list_item(
         external_source: package_source_summary(manifest),
         skill_enabled: Some(skill_enabled),
         skill_surface: Some(skill_surface),
-        command_trigger: Some(configured_package_command_trigger(
-            manifest,
-            override_config,
-        )),
-        argument_hint: package_argument_hint(manifest),
-        created_at: record.updated_at,
-        updated_at: record.updated_at,
+        command_trigger: is_root
+            .then(|| configured_package_command_trigger(manifest, override_config)),
+        argument_hint: is_root.then(|| package_argument_hint(manifest)).flatten(),
+        created_at: updated_at,
+        updated_at,
         has_summary: !description.trim().is_empty(),
-        has_body_content: true,
-        byte_size: package_file_path(&record.root, &package_root_doc_rel_path(manifest))
-            .ok()
+        has_body_content: !body.trim().is_empty(),
+        byte_size: file_path
             .and_then(|path| std::fs::metadata(path).ok())
             .map(|meta| meta.len()),
         lexical_search_enabled: Some(false),
         semantic_search_enabled: Some(false),
         summary: (!description.trim().is_empty()).then_some(description),
     }
+}
+
+fn is_ignored_package_walk_dir(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    matches!(
+        name,
+        "__pycache__" | ".git" | ".hg" | ".svn" | "node_modules" | ".venv" | "venv"
+    ) || name.starts_with('.')
+}
+
+fn is_ignored_package_walk_file(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    name.starts_with('.')
+}
+
+fn list_package_document_rel_paths(record: &SkillPackageRecord) -> Vec<String> {
+    let mut paths = BTreeSet::new();
+    let root = &record.root;
+    for entry in WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| {
+            if entry.depth() == 0 {
+                return true;
+            }
+            !entry.file_type().is_dir() || !is_ignored_package_walk_dir(entry.path())
+        })
+        .flatten()
+    {
+        if !entry.file_type().is_file() || is_ignored_package_walk_file(entry.path()) {
+            continue;
+        }
+        let Ok(rel_path) = entry.path().strip_prefix(root) else {
+            continue;
+        };
+        let raw_rel_path = rel_path.to_string_lossy().replace('\\', "/");
+        let Ok(normalized_rel_path) = normalize_package_rel_path(&raw_rel_path) else {
+            continue;
+        };
+        if std::fs::read_to_string(entry.path()).is_err() {
+            continue;
+        }
+        paths.insert(normalized_rel_path);
+    }
+    paths.into_iter().collect()
+}
+
+fn package_to_list_items(
+    record: &SkillPackageRecord,
+    override_config: Option<&SkillConfig>,
+) -> Vec<knowledge_store::KnowledgeListItem> {
+    list_package_document_rel_paths(record)
+        .into_iter()
+        .map(|doc_rel_path| package_to_list_item(record, &doc_rel_path, override_config))
+        .collect()
 }
 
 pub(crate) fn list_skill_package_knowledge_items_sync(
@@ -2176,9 +2728,9 @@ pub(crate) fn list_skill_package_knowledge_items_sync(
     let configs = load_skill_config(working_dir);
     list_skill_packages_sync()
         .into_iter()
-        .map(|record| {
+        .flat_map(|record| {
             let config = lookup_skill_config_override(&configs, "app", &record.manifest.id);
-            package_to_list_item(&record, config)
+            package_to_list_items(&record, config)
         })
         .filter(|item| normalized_prefix.is_empty() || item.path.starts_with(&normalized_prefix))
         .collect()
@@ -2206,6 +2758,13 @@ fn build_package_skill_manifest(
     let command_trigger = override_config
         .and_then(resolve_config_command_trigger)
         .unwrap_or_else(|| package_command_trigger(manifest));
+    let root_doc_tools = std::fs::read_to_string(package_root_doc_path(&record.root))
+        .ok()
+        .and_then(|raw| split_optional_package_frontmatter(&raw).ok())
+        .map(|(frontmatter, _)| {
+            package_document_tool_names(record, &package_root_doc_rel_path(manifest), &frontmatter)
+        })
+        .unwrap_or_else(|| package_manifest_tool_names(record));
 
     SkillManifest {
         name: manifest.name.clone(),
@@ -2219,6 +2778,7 @@ fn build_package_skill_manifest(
         skill_surface,
         skill_description,
         command_trigger,
+        tools: root_doc_tools,
         kind: SkillManifestKind::Package,
         package_id: Some(package_id.to_string()),
         package_version: (!manifest.version.trim().is_empty()).then(|| manifest.version.clone()),
@@ -2459,6 +3019,17 @@ fn optional_trimmed(value: Option<String>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn normalize_tool_name_list(values: Vec<String>) -> Vec<String> {
+    let mut names = values
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    names
+}
+
 fn required_skill_create_text(value: Option<String>, field: &str) -> Result<String, String> {
     optional_trimmed(value).ok_or_else(|| format!("'{}' parameter is required.", field))
 }
@@ -2504,6 +3075,7 @@ pub fn create_skill_document_sync(
     let title = skill_title_from_name(&name);
     let summary = required_skill_create_text(request.summary, "summary")?;
     let argument_hint = optional_trimmed(request.argument_hint);
+    let tools = normalize_tool_name_list(request.tools);
     let command_enabled = request.command_enabled.unwrap_or(true);
     let command_trigger = if command_enabled {
         let trigger = optional_trimmed(request.command_trigger)
@@ -2539,6 +3111,7 @@ pub fn create_skill_document_sync(
         }),
         command_trigger,
         argument_hint,
+        tools,
         summary: Some(summary),
         body: request
             .body
@@ -2560,9 +3133,10 @@ pub fn create_skill_document_sync(
     ))
 }
 
-fn create_skill_package_in_parent_sync(
+fn create_skill_package_in_parent_sync_with_default_namespace(
     package_parent: &Path,
     request: SkillCreateRequest,
+    default_namespace: Option<&str>,
 ) -> Result<SkillManifest, String> {
     if request.kind != SkillCreateKind::Package {
         return Err("Use kind='package' for app Skill packages".to_string());
@@ -2572,10 +3146,7 @@ fn create_skill_package_in_parent_sync(
     }
 
     let name = required_skill_create_text(Some(request.name), "name")?;
-    let package_id = normalize_package_id(&required_skill_create_text(
-        request.package_id,
-        "packageId",
-    )?)?;
+    let package_id = resolve_skill_create_package_id(request.package_id, default_namespace, &name)?;
     let version = required_skill_create_text(request.version, "version")?;
     let summary = required_skill_create_text(request.summary, "summary")?;
     let argument_hint = optional_trimmed(request.argument_hint);
@@ -2592,7 +3163,10 @@ fn create_skill_package_in_parent_sync(
     let model_invocation_enabled = request.model_invocation_enabled.unwrap_or(true);
 
     let package_root = package_parent.join(&package_id);
-    if package_root.exists() {
+    if package_root.exists()
+        || find_skill_package_in_parent(package_parent, &package_id).is_ok()
+        || find_skill_package(&package_id).is_ok()
+    {
         return Err(format!("Skill package already exists: {}", package_id));
     }
     std::fs::create_dir_all(&package_root)
@@ -2636,19 +3210,47 @@ fn create_skill_package_in_parent_sync(
     write_result
 }
 
-pub fn create_skill_package_sync(request: SkillCreateRequest) -> Result<SkillManifest, String> {
+fn create_skill_package_in_parent_sync(
+    package_parent: &Path,
+    request: SkillCreateRequest,
+) -> Result<SkillManifest, String> {
+    create_skill_package_in_parent_sync_with_default_namespace(package_parent, request, None)
+}
+
+pub fn create_skill_package_sync_with_default_namespace(
+    request: SkillCreateRequest,
+    default_namespace: Option<&str>,
+) -> Result<SkillManifest, String> {
     let package_parent = writable_app_skill_package_dir()?;
-    create_skill_package_in_parent_sync(&package_parent, request)
+    create_skill_package_in_parent_sync_with_default_namespace(
+        &package_parent,
+        request,
+        default_namespace,
+    )
+}
+
+pub fn create_skill_package_sync(request: SkillCreateRequest) -> Result<SkillManifest, String> {
+    create_skill_package_sync_with_default_namespace(request, None)
+}
+
+pub fn create_skill_sync_with_default_package_namespace(
+    working_dir: &str,
+    request: SkillCreateRequest,
+    default_namespace: Option<&str>,
+) -> Result<SkillManifest, String> {
+    match request.kind {
+        SkillCreateKind::Md => create_skill_document_sync(working_dir, request),
+        SkillCreateKind::Package => {
+            create_skill_package_sync_with_default_namespace(request, default_namespace)
+        }
+    }
 }
 
 pub fn create_skill_sync(
     working_dir: &str,
     request: SkillCreateRequest,
 ) -> Result<SkillManifest, String> {
-    match request.kind {
-        SkillCreateKind::Md => create_skill_document_sync(working_dir, request),
-        SkillCreateKind::Package => create_skill_package_sync(request),
-    }
+    create_skill_sync_with_default_package_namespace(working_dir, request, None)
 }
 
 fn delete_skill_package_from_parent_sync(
@@ -2699,6 +3301,349 @@ fn delete_skill_package_from_parent_sync(
 pub fn delete_skill_package_sync(working_dir: &str, package_id: &str) -> Result<String, String> {
     let package_parent = writable_app_skill_package_dir()?;
     delete_skill_package_from_parent_sync(working_dir, &package_parent, package_id)
+}
+
+fn archive_output_path(file_path: &str) -> Result<PathBuf, String> {
+    let trimmed = file_path.trim();
+    if trimmed.is_empty() {
+        return Err("Skill package export path is empty".to_string());
+    }
+    let mut path = PathBuf::from(trimmed);
+    let has_zip_extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.eq_ignore_ascii_case("zip"))
+        .unwrap_or(false);
+    if !has_zip_extension {
+        path.set_extension("zip");
+    }
+    Ok(path)
+}
+
+fn package_archive_entries(
+    record: &SkillPackageRecord,
+    target_path: &Path,
+) -> Result<Vec<(PathBuf, String, u64)>, String> {
+    let target_canonical = target_path
+        .is_file()
+        .then(|| dunce::canonicalize(target_path).ok())
+        .flatten();
+    let mut entries = Vec::new();
+
+    for entry in WalkDir::new(&record.root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| {
+            if entry.depth() == 0 {
+                return true;
+            }
+            !entry.file_type().is_dir() || !is_ignored_package_walk_dir(entry.path())
+        })
+    {
+        let entry = entry.map_err(|e| format!("Failed to read Skill package files: {}", e))?;
+        if entry.depth() == 0 {
+            continue;
+        }
+        if entry.file_type().is_symlink() {
+            return Err(format!(
+                "Skill package export does not support symlinks: {}",
+                entry.path().display()
+            ));
+        }
+        if !entry.file_type().is_file() || is_ignored_package_walk_file(entry.path()) {
+            continue;
+        }
+        if target_canonical
+            .as_ref()
+            .is_some_and(|target| dunce::canonicalize(entry.path()).ok().as_ref() == Some(target))
+        {
+            continue;
+        }
+        let rel_path = entry
+            .path()
+            .strip_prefix(&record.root)
+            .map_err(|e| format!("Failed to resolve package file path: {}", e))?
+            .to_string_lossy()
+            .replace('\\', "/");
+        let rel_path = normalize_package_rel_path(&rel_path)?;
+        let archive_path = format!("{}/{}", record.manifest.id, rel_path);
+        let size = entry
+            .metadata()
+            .map_err(|e| format!("Failed to read {} metadata: {}", entry.path().display(), e))?
+            .len();
+        entries.push((entry.path().to_path_buf(), archive_path, size));
+    }
+
+    entries.sort_by(|left, right| left.1.cmp(&right.1));
+    Ok(entries)
+}
+
+fn export_skill_package_record_to_path(
+    record: &SkillPackageRecord,
+    file_path: &str,
+) -> Result<SkillPackageArchiveResult, String> {
+    let target_path = archive_output_path(file_path)?;
+    let entries = package_archive_entries(record, &target_path)?;
+    if entries.is_empty() {
+        return Err(format!(
+            "Skill package '{}' has no exportable files",
+            record.manifest.id
+        ));
+    }
+
+    if let Some(parent) = target_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create export directory: {}", e))?;
+    }
+
+    let zip_file = std::fs::File::create(&target_path)
+        .map_err(|e| format!("Failed to create {}: {}", target_path.display(), e))?;
+    let mut zip_writer = zip::ZipWriter::new(zip_file);
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    let mut buffer = Vec::new();
+
+    for (source_path, archive_path, _) in &entries {
+        zip_writer
+            .start_file(archive_path, options)
+            .map_err(|e| format!("Failed to write archive entry '{}': {}", archive_path, e))?;
+        let mut source = std::fs::File::open(source_path)
+            .map_err(|e| format!("Failed to read {}: {}", source_path.display(), e))?;
+        buffer.clear();
+        source
+            .read_to_end(&mut buffer)
+            .map_err(|e| format!("Failed to read {}: {}", source_path.display(), e))?;
+        zip_writer
+            .write_all(&buffer)
+            .map_err(|e| format!("Failed to write archive entry '{}': {}", archive_path, e))?;
+    }
+
+    zip_writer
+        .finish()
+        .map_err(|e| format!("Failed to finish Skill package archive: {}", e))?;
+    let byte_size = std::fs::metadata(&target_path)
+        .map(|meta| meta.len())
+        .unwrap_or(0);
+
+    Ok(SkillPackageArchiveResult {
+        package_id: record.manifest.id.clone(),
+        path: target_path.to_string_lossy().to_string(),
+        file_count: entries.len(),
+        byte_size,
+    })
+}
+
+#[cfg(test)]
+fn export_skill_package_from_parent_sync(
+    package_parent: &Path,
+    package_id: &str,
+    file_path: &str,
+) -> Result<SkillPackageArchiveResult, String> {
+    let record = find_skill_package_in_parent(package_parent, package_id)?;
+    export_skill_package_record_to_path(&record, file_path)
+}
+
+pub fn export_skill_package_sync(
+    package_id: &str,
+    file_path: &str,
+) -> Result<SkillPackageArchiveResult, String> {
+    let record = find_skill_package(package_id)?;
+    export_skill_package_record_to_path(&record, file_path)
+}
+
+fn normalize_import_entry_path(name: &str) -> Result<Option<String>, String> {
+    let normalized = name.trim().replace('\\', "/");
+    if normalized.is_empty() {
+        return Ok(None);
+    }
+    if normalized.contains('\0')
+        || normalized.contains(':')
+        || normalized.starts_with('/')
+        || normalized
+            .split('/')
+            .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+    {
+        return Err(format!("Invalid archive entry path: {}", name));
+    }
+    Ok(Some(normalized))
+}
+
+fn extract_skill_package_archive(source_path: &Path, staging_root: &Path) -> Result<(), String> {
+    let zip_file = std::fs::File::open(source_path)
+        .map_err(|e| format!("Failed to open Skill package archive: {}", e))?;
+    let mut archive = zip::ZipArchive::new(zip_file)
+        .map_err(|e| format!("Invalid Skill package archive: {}", e))?;
+
+    for index in 0..archive.len() {
+        let mut entry = archive
+            .by_index(index)
+            .map_err(|e| format!("Failed to read archive entry: {}", e))?;
+        let Some(rel_path) = normalize_import_entry_path(entry.name())? else {
+            continue;
+        };
+        let output_path = staging_root.join(&rel_path);
+        if entry.is_dir() || rel_path.ends_with('/') {
+            std::fs::create_dir_all(&output_path)
+                .map_err(|e| format!("Failed to create {}: {}", output_path.display(), e))?;
+            continue;
+        }
+        if let Some(parent) = output_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create {}: {}", parent.display(), e))?;
+        }
+        let mut output = std::fs::File::create(&output_path)
+            .map_err(|e| format!("Failed to create {}: {}", output_path.display(), e))?;
+        std::io::copy(&mut entry, &mut output)
+            .map_err(|e| format!("Failed to extract {}: {}", output_path.display(), e))?;
+    }
+    Ok(())
+}
+
+fn locate_imported_skill_package_root(root: &Path) -> Result<PathBuf, String> {
+    if is_skill_package_root(root) {
+        return Ok(root.to_path_buf());
+    }
+
+    let mut package_roots = Vec::new();
+    let entries = std::fs::read_dir(root)
+        .map_err(|e| format!("Failed to read imported Skill package: {}", e))?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() && is_skill_package_root(&path) {
+            package_roots.push(path);
+        }
+    }
+    if package_roots.len() == 1 {
+        return Ok(package_roots.remove(0));
+    }
+
+    Err("Imported Skill package must contain skill.json and SKILL.md".to_string())
+}
+
+fn copy_skill_package_dir(source_root: &Path, target_root: &Path) -> Result<usize, String> {
+    let mut copied_files = 0usize;
+    for entry in WalkDir::new(source_root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| {
+            if entry.depth() == 0 {
+                return true;
+            }
+            !entry.file_type().is_dir() || !is_ignored_package_walk_dir(entry.path())
+        })
+    {
+        let entry = entry.map_err(|e| format!("Failed to read Skill package files: {}", e))?;
+        if entry.depth() == 0 {
+            continue;
+        }
+        if entry.file_type().is_symlink() {
+            return Err(format!(
+                "Skill package import does not support symlinks: {}",
+                entry.path().display()
+            ));
+        }
+        let rel_path = entry
+            .path()
+            .strip_prefix(source_root)
+            .map_err(|e| format!("Failed to resolve package file path: {}", e))?;
+        let target_path = target_root.join(rel_path);
+        if entry.file_type().is_dir() {
+            std::fs::create_dir_all(&target_path)
+                .map_err(|e| format!("Failed to create {}: {}", target_path.display(), e))?;
+            continue;
+        }
+        if !entry.file_type().is_file() || is_ignored_package_walk_file(entry.path()) {
+            continue;
+        }
+        if let Some(parent) = target_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create {}: {}", parent.display(), e))?;
+        }
+        std::fs::copy(entry.path(), &target_path).map_err(|e| {
+            format!(
+                "Failed to copy {} to {}: {}",
+                entry.path().display(),
+                target_path.display(),
+                e
+            )
+        })?;
+        copied_files += 1;
+    }
+    Ok(copied_files)
+}
+
+fn import_skill_package_to_parent_sync(
+    package_parent: &Path,
+    source_path: &Path,
+) -> Result<SkillManifest, String> {
+    if !source_path.exists() {
+        return Err(format!(
+            "Skill package import source not found: {}",
+            source_path.display()
+        ));
+    }
+
+    let staging_root =
+        std::env::temp_dir().join(format!("locus-skill-import-{}", uuid::Uuid::new_v4()));
+    let source_package_root = if source_path.is_dir() {
+        locate_imported_skill_package_root(source_path)?
+    } else {
+        std::fs::create_dir_all(&staging_root)
+            .map_err(|e| format!("Failed to create import staging directory: {}", e))?;
+        let extract_result = extract_skill_package_archive(source_path, &staging_root);
+        if let Err(error) = extract_result {
+            let _ = std::fs::remove_dir_all(&staging_root);
+            return Err(error);
+        }
+        match locate_imported_skill_package_root(&staging_root) {
+            Ok(root) => root,
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&staging_root);
+                return Err(error);
+            }
+        }
+    };
+
+    let source_record = load_skill_package_record(&source_package_root)?;
+    let package_id = source_record.manifest.id.clone();
+    std::fs::create_dir_all(package_parent)
+        .map_err(|e| format!("Failed to create app Skill package directory: {}", e))?;
+    let target_root = package_parent.join(&package_id);
+    if target_root.exists() {
+        let _ = std::fs::remove_dir_all(&staging_root);
+        return Err(format!("Skill package already exists: {}", package_id));
+    }
+
+    let install_result = (|| {
+        std::fs::create_dir_all(&target_root).map_err(|e| {
+            format!(
+                "Failed to create Skill package directory '{}': {}",
+                target_root.display(),
+                e
+            )
+        })?;
+        copy_skill_package_dir(&source_package_root, &target_root)?;
+        let record = load_skill_package_record(&target_root)?;
+        Ok(build_package_skill_manifest(&record, "app", None))
+    })();
+
+    let _ = std::fs::remove_dir_all(&staging_root);
+    if install_result.is_err() {
+        let _ = std::fs::remove_dir_all(&target_root);
+    }
+    install_result
+}
+
+pub fn import_skill_package_sync(source_path: &str) -> Result<SkillManifest, String> {
+    let source_path = source_path.trim();
+    if source_path.is_empty() {
+        return Err("Skill package import source path is empty".to_string());
+    }
+    let package_parent = writable_app_skill_package_dir()?;
+    import_skill_package_to_parent_sync(&package_parent, &PathBuf::from(source_path))
 }
 
 fn normalize_skill_source(source: Option<&str>) -> Result<&str, String> {
@@ -2799,6 +3744,25 @@ pub fn list_skills_filtered_sync(
 }
 
 #[tauri::command]
+pub fn get_default_skill_package_namespace(
+    config: State<'_, Arc<crate::config::AppConfig>>,
+) -> Result<String, AppError> {
+    Ok(config.default_skill_package_namespace())
+}
+
+#[tauri::command]
+pub fn set_default_skill_package_namespace(
+    value: String,
+    config: State<'_, Arc<crate::config::AppConfig>>,
+) -> Result<String, AppError> {
+    let normalized = normalize_default_skill_package_namespace(&value).map_err(AppError::from)?;
+    config
+        .set_default_skill_package_namespace(normalized.clone())
+        .map_err(AppError::from)?;
+    Ok(normalized)
+}
+
+#[tauri::command]
 pub async fn create_skill_scaffold(
     kind: Option<SkillCreateKind>,
     name: String,
@@ -2811,6 +3775,8 @@ pub async fn create_skill_scaffold(
     command_trigger: Option<String>,
     command_enabled: Option<bool>,
     model_invocation_enabled: Option<bool>,
+    tools: Option<Vec<String>>,
+    config: State<'_, Arc<crate::config::AppConfig>>,
     app_handle: AppHandle,
     workspace: State<'_, Arc<Workspace>>,
     knowledge_index_state: State<'_, Arc<KnowledgeIndexState>>,
@@ -2823,7 +3789,8 @@ pub async fn create_skill_scaffold(
     } else {
         summary
     };
-    let manifest = create_skill_sync(
+    let default_namespace = config.default_skill_package_namespace();
+    let manifest = create_skill_sync_with_default_package_namespace(
         &working_dir,
         SkillCreateRequest {
             kind,
@@ -2837,7 +3804,9 @@ pub async fn create_skill_scaffold(
             command_trigger,
             command_enabled,
             model_invocation_enabled,
+            tools: tools.unwrap_or_default(),
         },
+        Some(&default_namespace),
     )?;
     reconcile_and_emit_knowledge_changed(
         &app_handle,
@@ -2866,6 +3835,33 @@ pub async fn delete_skill_package(
     )
     .await?;
     Ok(())
+}
+
+#[tauri::command]
+pub async fn import_skill_package(
+    source_path: String,
+    app_handle: AppHandle,
+    workspace: State<'_, Arc<Workspace>>,
+    knowledge_index_state: State<'_, Arc<KnowledgeIndexState>>,
+) -> Result<SkillManifest, AppError> {
+    let working_dir = workspace.path.read().await.clone();
+    let manifest = import_skill_package_sync(&source_path).map_err(AppError::from)?;
+    reconcile_and_emit_knowledge_changed(
+        &app_handle,
+        &working_dir,
+        knowledge_index_state.inner().clone(),
+        "import_skill_package",
+    )
+    .await?;
+    Ok(manifest)
+}
+
+#[tauri::command]
+pub async fn export_skill_package(
+    package_id: String,
+    file_path: String,
+) -> Result<SkillPackageArchiveResult, AppError> {
+    export_skill_package_sync(&package_id, &file_path).map_err(AppError::from)
 }
 
 fn hash_file(path: &Path) -> Result<String, String> {
@@ -3094,10 +4090,13 @@ pub async fn remove_skill_unity_files(
 mod tests {
     use super::{
         is_valid_skill_scaffold_name, list_skills_sync, read_skill_manifest_sync,
-        SkillPackageManifestFile,
+        SkillPackageDocLevels, SkillPackageManifestFile, SkillPackageRecord,
+        SkillPackageToolManifest,
     };
     use crate::commands::knowledge::SkillConfig;
     use crate::knowledge_store::{KnowledgeInjectMode, SkillSurface};
+    use std::io::Write as _;
+    use std::path::PathBuf;
     use tempfile::TempDir;
 
     #[test]
@@ -3257,7 +4256,7 @@ Do the work.
         assert_eq!(record.manifest.tools.len(), 1);
         assert_eq!(
             super::package_tool_api_name(&record.manifest.id, &record.manifest.tools[0].name),
-            "skill_com_example_asset_audit__capture_frame"
+            "capture_frame"
         );
         assert_eq!(
             super::package_skill_surface(&record.manifest),
@@ -3299,6 +4298,7 @@ Use Feishu safely.
         let record = super::load_skill_package_record(temp.path()).unwrap();
         let item = super::package_to_list_item(
             &record,
+            "SKILL.md",
             Some(&SkillConfig {
                 enabled: true,
                 surface: SkillSurface::Auto,
@@ -3350,6 +4350,208 @@ Use Feishu safely.
     }
 
     #[test]
+    fn package_knowledge_items_include_utf8_subfiles() {
+        let temp = TempDir::new().unwrap();
+        std::fs::create_dir_all(temp.path().join("references")).unwrap();
+        std::fs::create_dir_all(temp.path().join("scripts").join("__pycache__")).unwrap();
+        std::fs::create_dir_all(temp.path().join("unity").join("Editor")).unwrap();
+        std::fs::write(
+            temp.path().join("skill.json"),
+            r#"{
+  "schema": "locus.skill.v1",
+  "id": "com.locus.psd-to-ugui",
+  "version": "0.1.0",
+  "name": "PSD to uGUI",
+  "description": "Parse PSD files.",
+  "command": {
+    "enabled": true,
+    "trigger": "/psd-to-ugui"
+  }
+}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("SKILL.md"),
+            "# PSD to uGUI\n\n## Instructions\nConvert PSD files.",
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("references").join("details.md"),
+            "# Details\n\nCoordinate mapping notes.",
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("scripts").join("parse_psd.py"),
+            "print('parse')\n",
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path()
+                .join("scripts")
+                .join("__pycache__")
+                .join("parse.pyc"),
+            [0, 159, 146, 150],
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path()
+                .join("unity")
+                .join("Editor")
+                .join("PsdToUguiBridge.cs"),
+            "public static class PsdToUguiBridge {}\n",
+        )
+        .unwrap();
+
+        let record = super::load_skill_package_record(temp.path()).unwrap();
+        let items = super::package_to_list_items(&record, None);
+        let paths = items
+            .iter()
+            .map(|item| item.path.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            paths,
+            vec![
+                "com.locus.psd-to-ugui/SKILL.md",
+                "com.locus.psd-to-ugui/references/details.md",
+                "com.locus.psd-to-ugui/scripts/parse_psd.py",
+                "com.locus.psd-to-ugui/skill.json",
+                "com.locus.psd-to-ugui/unity/Editor/PsdToUguiBridge.cs",
+            ]
+        );
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            items.len()
+        );
+        let script = items
+            .iter()
+            .find(|item| item.path.ends_with("scripts/parse_psd.py"))
+            .expect("script item");
+        assert_eq!(script.title, "parse_psd.py");
+        assert_eq!(script.skill_enabled, Some(false));
+        assert_eq!(script.command_trigger, None);
+        assert!(!script.summary_enabled);
+
+        let document = super::package_to_document(
+            &record,
+            "scripts/parse_psd.py",
+            "print('parse')\n".to_string(),
+            None,
+        )
+        .expect("package document");
+        assert_eq!(document.title, "parse_psd.py");
+        assert_eq!(document.body, "print('parse')\n");
+        assert_eq!(document.path, "com.locus.psd-to-ugui/scripts/parse_psd.py");
+    }
+
+    #[test]
+    fn package_document_frontmatter_declares_document_scoped_tools() {
+        let record = SkillPackageRecord {
+            root: PathBuf::new(),
+            updated_at: 0,
+            doc_levels: SkillPackageDocLevels::default(),
+            manifest: SkillPackageManifestFile {
+                id: "view".to_string(),
+                name: "View".to_string(),
+                ..Default::default()
+            },
+        };
+
+        let document = super::package_to_document(
+            &record,
+            "debug.md",
+            "---\ntitle: View Debug\ntools:\n  - view_capture\n  - view_snapshot\n---\n\n# Debug\n"
+                .to_string(),
+            None,
+        )
+        .expect("package document");
+
+        assert_eq!(document.title, "View Debug");
+        assert_eq!(document.body.trim(), "# Debug");
+        assert_eq!(
+            document.tools,
+            vec!["view_capture".to_string(), "view_snapshot".to_string()]
+        );
+    }
+
+    #[test]
+    fn package_unity_bundle_includes_unity_tool_script_paths() {
+        let temp = TempDir::new().unwrap();
+        std::fs::create_dir_all(temp.path().join("tools")).unwrap();
+        std::fs::write(
+            temp.path().join("skill.json"),
+            r#"{
+  "schema": "locus.skill.v1",
+  "id": "com.example.tool",
+  "version": "0.1.0",
+  "name": "Example Tool",
+  "description": "Run a Unity helper.",
+  "tools": [
+    {
+      "name": "read",
+      "description": "Read state.",
+      "runtime": "unity",
+      "path": "tools/Bridge.cs",
+      "entryType": "ExampleBridge",
+      "method": "Read",
+      "parameters": { "type": "object", "properties": {} }
+    }
+  ]
+}"#,
+        )
+        .unwrap();
+        std::fs::write(temp.path().join("SKILL.md"), "# Example Tool\n").unwrap();
+        std::fs::write(
+            temp.path().join("tools").join("Bridge.cs"),
+            "public static class ExampleBridge { public static string Read() => \"ok\"; }\n",
+        )
+        .unwrap();
+
+        let record = super::load_skill_package_record(temp.path()).expect("load package");
+        let bundle = super::skill_package_unity_script_bundle_for_record(&record)
+            .expect("bundle")
+            .expect("has scripts");
+        let scripts = bundle
+            .request
+            .get("scripts")
+            .and_then(serde_json::Value::as_array)
+            .expect("scripts");
+
+        assert_eq!(bundle.package_id, "com.example.tool");
+        assert_eq!(bundle.script_count, 1);
+        assert_eq!(
+            scripts[0].get("path").and_then(serde_json::Value::as_str),
+            Some("tools/Bridge.cs")
+        );
+    }
+
+    #[test]
+    fn skill_package_invoke_payload_targets_compiled_package_assembly() {
+        let payload = super::skill_package_invoke_payload(
+            "com.example.tool",
+            Some("__LocusSkillPackage_com_example_tool_hash"),
+            "ExampleBridge",
+            "Read",
+            &serde_json::json!({ "id": 1 }),
+        )
+        .expect("payload");
+
+        assert_eq!(payload["packageId"], "com.example.tool");
+        assert_eq!(
+            payload["assemblyId"],
+            "__LocusSkillPackage_com_example_tool_hash"
+        );
+        assert_eq!(payload["typeName"], "ExampleBridge");
+        assert_eq!(payload["method"], "Read");
+        assert_eq!(payload["argsJson"], "{\"id\":1}");
+        assert!(payload.get("source").is_none());
+    }
+
+    #[test]
     fn create_skill_document_sync_requires_summary_metadata() {
         let temp = TempDir::new().unwrap();
         let working_dir = temp.path().to_string_lossy().to_string();
@@ -3371,6 +4573,7 @@ Use Feishu safely.
                 kind: super::SkillCreateKind::Md,
                 name: "asset-audit".to_string(),
                 summary: Some("Audit Unity assets.".to_string()),
+                tools: vec!["skill_create".to_string(), "skill_reload".to_string()],
                 ..Default::default()
             },
         )
@@ -3378,6 +4581,7 @@ Use Feishu safely.
         assert_eq!(manifest.dir_name, "asset-audit");
         assert_eq!(manifest.command_trigger, "/asset-audit");
         assert_eq!(manifest.description, "Audit Unity assets.");
+        assert_eq!(manifest.tools, vec!["skill_create", "skill_reload"]);
 
         let saved = crate::knowledge_store::read_document(
             &working_dir,
@@ -3387,6 +4591,104 @@ Use Feishu safely.
         )
         .expect("read created skill document");
         assert_eq!(saved.document.body, "## Instructions");
+        assert_eq!(saved.document.tools, vec!["skill_create", "skill_reload"]);
+    }
+
+    #[test]
+    fn package_tool_api_names_use_package_prefix_only_for_conflicts() {
+        fn test_python_tool(name: &str, path: &str) -> SkillPackageToolManifest {
+            SkillPackageToolManifest {
+                name: name.to_string(),
+                description: String::new(),
+                runtime: "python".to_string(),
+                path: Some(path.to_string()),
+                command: None,
+                args: Vec::new(),
+                input: None,
+                output: None,
+                timeout_ms: None,
+                type_name: None,
+                method: None,
+                entry_type: None,
+                request_editor_status: None,
+                parameters: super::default_tool_parameters(),
+            }
+        }
+
+        let records = vec![
+            SkillPackageRecord {
+                root: PathBuf::new(),
+                updated_at: 0,
+                doc_levels: SkillPackageDocLevels::default(),
+                manifest: SkillPackageManifestFile {
+                    id: "psd-to-ugui".to_string(),
+                    name: "PSD to uGUI".to_string(),
+                    tools: vec![test_python_tool(
+                        "extract-psd-layer-tree",
+                        "scripts/extract.py",
+                    )],
+                    ..Default::default()
+                },
+            },
+            SkillPackageRecord {
+                root: PathBuf::new(),
+                updated_at: 0,
+                doc_levels: SkillPackageDocLevels::default(),
+                manifest: SkillPackageManifestFile {
+                    id: "ui-audit".to_string(),
+                    name: "UI Audit".to_string(),
+                    tools: vec![test_python_tool(
+                        "extract-psd-layer-tree",
+                        "scripts/extract.py",
+                    )],
+                    ..Default::default()
+                },
+            },
+            SkillPackageRecord {
+                root: PathBuf::new(),
+                updated_at: 0,
+                doc_levels: SkillPackageDocLevels::default(),
+                manifest: SkillPackageManifestFile {
+                    id: "capture-tools".to_string(),
+                    name: "Capture Tools".to_string(),
+                    tools: vec![
+                        test_python_tool("capture-frame", "scripts/capture.py"),
+                        test_python_tool("read", "scripts/read.py"),
+                    ],
+                    ..Default::default()
+                },
+            },
+        ];
+        let names = super::package_tool_api_names_for_records(
+            &records,
+            &super::default_package_tool_reserved_names(),
+        );
+
+        assert_eq!(
+            names.get(&super::package_tool_record_key(
+                "capture-tools",
+                "capture-frame"
+            )),
+            Some(&"capture_frame".to_string())
+        );
+        assert_eq!(
+            names.get(&super::package_tool_record_key("capture-tools", "read")),
+            Some(&"capture_tools_read".to_string())
+        );
+        assert_eq!(
+            names.get(&super::package_tool_record_key(
+                "psd-to-ugui",
+                "extract-psd-layer-tree"
+            )),
+            Some(&"psd_to_ugui_extract_psd_layer_tree".to_string())
+        );
+        assert_eq!(
+            names.get(&super::package_tool_record_key(
+                "ui-audit",
+                "extract-psd-layer-tree"
+            )),
+            Some(&"ui_audit_extract_psd_layer_tree".to_string())
+        );
     }
 
     #[test]
@@ -3455,6 +4757,55 @@ Use Feishu safely.
                 .and_then(|command| command.enabled),
             Some(true)
         );
+    }
+
+    #[test]
+    fn create_skill_package_derives_short_id_from_name() {
+        let temp = TempDir::new().unwrap();
+        let manifest = super::create_skill_package_in_parent_sync_with_default_namespace(
+            temp.path(),
+            super::SkillCreateRequest {
+                kind: super::SkillCreateKind::Package,
+                name: "Asset Audit".to_string(),
+                version: Some("0.1.0".to_string()),
+                summary: Some("Audit Unity assets.".to_string()),
+                ..Default::default()
+            },
+            Some("studio.tools"),
+        )
+        .expect("create package from name");
+
+        assert_eq!(manifest.package_id.as_deref(), Some("asset-audit"));
+        assert!(temp.path().join("asset-audit").is_dir());
+    }
+
+    #[test]
+    fn create_skill_package_uses_short_id_when_default_namespace_is_empty() {
+        let temp = TempDir::new().unwrap();
+        let manifest = super::create_skill_package_in_parent_sync_with_default_namespace(
+            temp.path(),
+            super::SkillCreateRequest {
+                kind: super::SkillCreateKind::Package,
+                name: "Asset Audit".to_string(),
+                version: Some("0.1.0".to_string()),
+                summary: Some("Audit Unity assets.".to_string()),
+                ..Default::default()
+            },
+            Some(""),
+        )
+        .expect("create package from name");
+
+        assert_eq!(manifest.package_id.as_deref(), Some("asset-audit"));
+        assert!(temp.path().join("asset-audit").is_dir());
+    }
+
+    #[test]
+    fn skill_package_ids_allow_single_segment_namespaces() {
+        assert_eq!(
+            super::normalize_package_id("studio.asset-audit").unwrap(),
+            "studio.asset-audit"
+        );
+        assert_eq!(super::normalize_package_id("studio").unwrap(), "studio");
     }
 
     #[test]
@@ -3554,7 +4905,7 @@ Use Feishu safely.
         .unwrap();
 
         let record = super::load_skill_package_record(temp.path()).unwrap();
-        let item = super::package_to_list_item(&record, None);
+        let item = super::package_to_list_item(&record, "SKILL.md", None);
 
         assert_eq!(item.command_trigger.as_deref(), Some("/cli"));
     }
@@ -3659,5 +5010,75 @@ Create a project skill.
         )
         .expect("read legacy app builtin skill name");
         assert!(content.contains("path: builtin/create-skill.md"));
+    }
+
+    #[test]
+    fn export_and_import_skill_package_round_trip_zip() {
+        let source_parent = TempDir::new().unwrap();
+        let target_parent = TempDir::new().unwrap();
+        super::create_skill_package_in_parent_sync(
+            source_parent.path(),
+            super::SkillCreateRequest {
+                kind: super::SkillCreateKind::Package,
+                name: "Asset Audit".to_string(),
+                package_id: Some("com.example.asset-audit".to_string()),
+                version: Some("0.1.0".to_string()),
+                summary: Some("Audit assets.".to_string()),
+                body: Some("## Instructions\nAudit imported assets.".to_string()),
+                ..Default::default()
+            },
+        )
+        .expect("create package");
+        let package_root = source_parent.path().join("com.example.asset-audit");
+        std::fs::create_dir_all(package_root.join("docs")).unwrap();
+        std::fs::write(package_root.join("docs").join("usage.md"), "# Usage\n").unwrap();
+        std::fs::create_dir_all(package_root.join("scripts")).unwrap();
+        std::fs::write(
+            package_root.join("scripts").join("audit.py"),
+            "print('ok')\n",
+        )
+        .unwrap();
+
+        let zip_path = source_parent.path().join("asset-audit.zip");
+        let exported = super::export_skill_package_from_parent_sync(
+            source_parent.path(),
+            "com.example.asset-audit",
+            &zip_path.to_string_lossy(),
+        )
+        .expect("export package");
+        assert_eq!(exported.package_id, "com.example.asset-audit");
+        assert!(exported.file_count >= 4);
+        assert!(zip_path.is_file());
+
+        let imported = super::import_skill_package_to_parent_sync(target_parent.path(), &zip_path)
+            .expect("import package");
+        assert_eq!(
+            imported.package_id.as_deref(),
+            Some("com.example.asset-audit")
+        );
+        let imported_root = target_parent.path().join("com.example.asset-audit");
+        assert!(imported_root.join("skill.json").is_file());
+        assert!(imported_root.join("SKILL.md").is_file());
+        assert!(imported_root.join("docs").join("usage.md").is_file());
+        assert!(imported_root.join("scripts").join("audit.py").is_file());
+    }
+
+    #[test]
+    fn import_skill_package_rejects_archive_traversal() {
+        let target_parent = TempDir::new().unwrap();
+        let archive_dir = TempDir::new().unwrap();
+        let zip_path = archive_dir.path().join("bad.zip");
+        let zip_file = std::fs::File::create(&zip_path).expect("create zip");
+        let mut zip_writer = zip::ZipWriter::new(zip_file);
+        zip_writer
+            .start_file("../escape.txt", zip::write::SimpleFileOptions::default())
+            .expect("start bad entry");
+        zip_writer.write_all(b"escape").expect("write bad entry");
+        zip_writer.finish().expect("finish zip");
+
+        let err = super::import_skill_package_to_parent_sync(target_parent.path(), &zip_path)
+            .expect_err("archive traversal should fail");
+        assert!(err.contains("Invalid archive entry path"));
+        assert!(!target_parent.path().join("escape.txt").exists());
     }
 }

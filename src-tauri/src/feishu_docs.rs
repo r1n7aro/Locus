@@ -3559,6 +3559,7 @@ async fn run_feishu_reference_import(
             skill_surface: None,
             command_trigger: None,
             argument_hint: None,
+            tools: Vec::new(),
             summary: None,
             body: content,
             maintenance_rules: None,

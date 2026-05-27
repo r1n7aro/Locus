@@ -1,12 +1,14 @@
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { listen } from "@tauri-apps/api/event";
 import type { UnlistenFn } from "@tauri-apps/api/event";
-import { open } from "@tauri-apps/plugin-dialog";
+import { open, save } from "@tauri-apps/plugin-dialog";
 import { getWarmup } from "./warmupCache";
 import {
   knowledgeActivateEmbedding,
   createSkillScaffold,
   deleteSkillPackage,
+  exportSkillPackage,
+  importSkillPackage,
   knowledgeCreate,
   knowledgeDeactivateEmbedding,
   knowledgeDelete,
@@ -242,6 +244,10 @@ function fullDocumentPath(type: KnowledgeDocumentType, path: string): string {
   return `${type}/${path.replace(/\\/g, "/").replace(/^\/+/, "")}`;
 }
 
+function ensureMarkdownDocumentPath(path: string): string {
+  return path.toLowerCase().endsWith(".md") ? path : `${path}.md`;
+}
+
 function buildCreatePath(
   type: KnowledgeDocumentType,
   name: string,
@@ -263,9 +269,10 @@ function buildCreatePath(
       ? `${normalizedParent}/${skillPath}.md`
       : `${skillPath}.md`;
   }
+  const markdownName = ensureMarkdownDocumentPath(normalizedName);
   return normalizedParent
-    ? `${normalizedParent}/${normalizedName}`
-    : normalizedName;
+    ? `${normalizedParent}/${markdownName}`
+    : markdownName;
 }
 
 function normalizeDirectorySelectionPath(path: string): string {
@@ -2886,11 +2893,12 @@ export function useKnowledgeState(props: KnowledgeProps) {
     creatingDocument.value = true;
     error.value = "";
     try {
+      const documentTitle = trimmed.replace(/\.md$/i, "");
       const relativeDir = parentDir
         .trim()
         .replace(/\\/g, "/")
         .replace(/^\/+|\/+$/g, "");
-      const slug = slugifyKnowledgePath(trimmed);
+      const slug = slugifyKnowledgePath(documentTitle);
       if (activeType.value === "skill") {
         const path = buildCreatePath(activeType.value, slug, relativeDir);
         const manifest = await enqueueMutation(() =>
@@ -2898,7 +2906,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
             kind: "md",
             name: slug,
             path,
-            summary: trimmed.replace(/\.md$/i, ""),
+            summary: documentTitle,
             commandTrigger: `/${slug}`,
           }),
         );
@@ -2922,7 +2930,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
           type: activeType.value,
           path: filePath,
           document: {
-            title: trimmed.replace(/\.md$/i, ""),
+            title: documentTitle,
             body: "",
             inheritInjectMode: defaults.inheritInjectMode,
             summaryEnabled: defaults.summaryEnabled,
@@ -3227,6 +3235,99 @@ export function useKnowledgeState(props: KnowledgeProps) {
       notifyError("knowledge_delete.document", cause);
     } finally {
       deletingDocument.value = false;
+    }
+  }
+
+  function skillPackageArchiveFileName(packageId: string): string {
+    const safeId = packageId
+      .trim()
+      .replace(/[^a-zA-Z0-9._-]+/g, "-")
+      .replace(/^-+|-+$/g, "");
+    return `${safeId || "skill-package"}.zip`;
+  }
+
+  async function importSkillPackageArchive() {
+    if (!hasWorkspace.value) return;
+    try {
+      const selected = await open({
+        multiple: false,
+        filters: [
+          {
+            name: t("knowledge.skillPackage.archiveFilter"),
+            extensions: ["zip"],
+          },
+        ],
+      });
+      if (!selected || typeof selected !== "string") return;
+
+      beginSave();
+      error.value = "";
+      try {
+        const manifest = await enqueueMutation(() =>
+          importSkillPackage(selected),
+        );
+        activeType.value = "skill";
+        await refreshKnowledgeData({ force: true, includeOverview: true });
+        const importedPackageId = manifest.packageId ?? manifest.dirName;
+        const importedDocument = documents.value.find(
+          (doc) =>
+            doc.type === "skill" &&
+            skillPackageIdForDocument(doc) === importedPackageId &&
+            isSkillPackageRootDocument(doc),
+        );
+        if (importedDocument) {
+          await selectPackage(importedDocument);
+        } else {
+          expandPath(fullDocumentPath("skill", importedPackageId));
+        }
+        notificationStore.addNotice(
+          "success",
+          t("knowledge.skillPackage.imported", importedPackageId),
+          {
+            operation: "importSkillPackage",
+            replaceOperation: true,
+          },
+        );
+      } finally {
+        endSave();
+      }
+    } catch (cause) {
+      notifyError("import_skill_package", cause);
+    }
+  }
+
+  async function exportSkillPackageArchive(packageId: string) {
+    const normalizedPackageId = packageId.trim();
+    if (!normalizedPackageId) return;
+    try {
+      const filePath = await save({
+        defaultPath: skillPackageArchiveFileName(normalizedPackageId),
+        filters: [
+          {
+            name: t("knowledge.skillPackage.archiveFilter"),
+            extensions: ["zip"],
+          },
+        ],
+      });
+      if (!filePath) return;
+
+      beginSave();
+      error.value = "";
+      try {
+        const result = await exportSkillPackage(normalizedPackageId, filePath);
+        notificationStore.addNotice(
+          "success",
+          t("knowledge.skillPackage.exported", result.path),
+          {
+            operation: "exportSkillPackage",
+            replaceOperation: true,
+          },
+        );
+      } finally {
+        endSave();
+      }
+    } catch (cause) {
+      notifyError("export_skill_package", cause);
     }
   }
 
@@ -3928,6 +4029,8 @@ export function useKnowledgeState(props: KnowledgeProps) {
     updateSection,
     updateMeta,
     updatePackageConfig,
+    importSkillPackageArchive,
+    exportSkillPackageArchive,
     saveDirectoryConfig,
     deleteDocument,
     deleteExplorerNode,

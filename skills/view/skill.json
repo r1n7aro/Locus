@@ -1,0 +1,13 @@
+{
+  "schema": "locus.skill.v1",
+  "id": "view",
+  "name": "View",
+  "version": "1.0.0",
+  "description": "Create, edit, reload, and open Locus Views for Unity editor interfaces.",
+  "argumentHint": "<view requirement>",
+  "command": {
+    "enabled": true,
+    "trigger": "/view",
+    "argumentHint": "<view requirement>"
+  }
+}

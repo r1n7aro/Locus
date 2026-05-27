@@ -102,6 +102,8 @@ const {
   updateSection,
   updateMeta,
   updatePackageConfig,
+  importSkillPackageArchive,
+  exportSkillPackageArchive,
   saveDirectoryConfig,
   deleteDocument,
   deleteExplorerNode,
@@ -382,6 +384,18 @@ function handleUpdatePackageConfig(patch: KnowledgeDocumentPatch) {
   void updatePackageConfig(patch);
 }
 
+function handleImportSkillPackage() {
+  void importSkillPackageArchive();
+}
+
+function handleExportPackage(packageId: string) {
+  void exportSkillPackageArchive(packageId);
+}
+
+function handleExportPackageNode(node: Extract<ExplorerNode, { kind: "package" }>) {
+  void exportSkillPackageArchive(node.packageId);
+}
+
 function handleSaveDirectoryConfig(
   path: string,
   config: Parameters<typeof saveDirectoryConfig>[1],
@@ -532,6 +546,8 @@ onUnmounted(() => {
           @select-package="handleSelectPackage"
           @select-search-result="handleSelectSearchResult"
           @select-folder-config="handleSelectDirectory"
+          @import-skill-package="handleImportSkillPackage"
+          @export-package="handleExportPackageNode"
           @request-external-import-folder="
             (parentDir) => void openExternalImportWindow(parentDir)
           "
@@ -575,6 +591,7 @@ onUnmounted(() => {
             :save-loading="savingDocument"
             @select-document="handleSelectDocument"
             @update-config="handleUpdatePackageConfig"
+            @export-package="handleExportPackage"
           />
 
           <KnowledgePreview

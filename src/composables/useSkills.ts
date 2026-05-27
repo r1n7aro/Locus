@@ -3,13 +3,20 @@ import { listSkills } from "../services/knowledge";
 import type { SkillManifest } from "../types";
 
 const skillItems = ref<SkillManifest[]>([]);
+let loadSkillsRequestId = 0;
 
 export function useSkills() {
   async function loadSkills() {
+    const requestId = ++loadSkillsRequestId;
     try {
-      skillItems.value = await listSkills();
+      const nextSkills = await listSkills();
+      if (requestId === loadSkillsRequestId) {
+        skillItems.value = nextSkills;
+      }
     } catch {
-      skillItems.value = [];
+      if (requestId === loadSkillsRequestId) {
+        skillItems.value = [];
+      }
     }
   }
 

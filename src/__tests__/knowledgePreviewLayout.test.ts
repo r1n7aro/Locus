@@ -89,16 +89,23 @@ describe("KnowledgePreview layout", () => {
     expect(preview).toContain("const COLLAPSED_SIDE_PANEL_WIDTH = 42");
     expect(preview).toContain("const MAX_SIDE_PANEL_WIDTH = 720");
     expect(preview).toContain("const MIN_MAIN_COLUMN_WIDTH = 320");
+    expect(preview).toContain('const SIDE_RAIL_COLLAPSED_STORAGE_KEY = "locus:knowledgePreviewSideRailCollapsed"');
+    expect(preview).toContain("const metaCollapsed = ref(loadStoredBoolean(SIDE_RAIL_COLLAPSED_STORAGE_KEY) ?? false)");
     expect(preview).toContain("const sidePanelWidth = ref(DEFAULT_SIDE_PANEL_WIDTH)");
     expect(preview).toContain("const isSideResizing = ref(false)");
     expect(preview).toContain("const sideRailStyle = computed(() => {");
     expect(preview).toContain('width: `clamp(${MIN_SIDE_PANEL_WIDTH}px, ${sidePanelWidth.value}px, calc(100% - ${MIN_MAIN_COLUMN_WIDTH}px))`');
+    expect(preview).toContain("function loadStoredBoolean(storageKey: string): boolean | null");
+    expect(preview).toContain("function persistStoredBoolean(storageKey: string, value: boolean)");
+    expect(preview).toContain("function toggleSideRail()");
+    expect(preview).toContain("persistStoredBoolean(SIDE_RAIL_COLLAPSED_STORAGE_KEY, nextValue)");
     expect(preview).toContain("function onSideResizeStart(event: MouseEvent)");
     expect(preview).toContain("event.preventDefault()");
     expect(preview).toContain('class="preview-side-rail"');
     expect(preview).toContain('class="preview-side-resize-handle"');
     expect(preview).toContain('class="preview-side-tabs"');
     expect(preview).toContain('class="preview-side-toggle preview-side-toggle-tab"');
+    expect(preview).toContain('@click="toggleSideRail"');
     expect(preview).toContain("import BaseSegmented from \"../ui/BaseSegmented.vue\"");
     expect(preview).toContain("<KnowledgeChatPane :document=\"document\" />");
     expect(preview).toMatch(/\.preview-side-rail\s*\{[\s\S]*display:\s*flex;[\s\S]*flex-direction:\s*column;/);
@@ -217,10 +224,13 @@ describe("KnowledgePreview layout", () => {
     const preview = read("src/components/knowledge/KnowledgePreview.vue");
 
     expect(preview).toContain('import MarkdownRenderer from "../MarkdownRenderer.vue"');
+    expect(preview).toContain('import SemanticCodeRenderer from "../ui/SemanticCodeRenderer.vue"');
+    expect(preview).toContain('import { semanticCodeLanguageFromPath } from "../../composables/semanticCodeRendering"');
     expect(preview).toContain("searchContext?: KnowledgeSearchSelectionContext | null;");
     expect(preview).toContain("const activeSearchContext = computed(() => {");
     expect(preview).toContain("const matchesCurrentDocument = props.document.id === result.id");
     expect(preview).toContain("const showSearchRenderedContent = computed(() =>");
+    expect(preview).toContain("const bodyCodeLanguage = computed(() => semanticCodeLanguageFromPath(documentPath.value))");
     expect(preview).toContain('const summaryRenderedSearchRef = ref<HTMLElement | null>(null)');
     expect(preview).toContain('const rulesRenderedSearchRef = ref<HTMLElement | null>(null)');
     expect(preview).toContain('const bodyRenderedSearchRef = ref<HTMLElement | null>(null)');
@@ -234,6 +244,9 @@ describe("KnowledgePreview layout", () => {
     expect(preview).toContain('class="preview-search-hit"');
     expect(preview).toContain('class="preview-search-hit-mark"');
     expect(preview).toContain('class="preview-rendered-search"');
+    expect(preview).toContain("<SemanticCodeRenderer");
+    expect(preview).toContain('v-if="bodyCodeLanguage"');
+    expect(preview).toContain(':content-path="documentPath"');
     expect(preview).toContain(':highlight-terms="searchQueryTerms"');
     expect(preview).toContain('ref="summaryRenderedSearchRef"');
     expect(preview).toContain('ref="rulesRenderedSearchRef"');

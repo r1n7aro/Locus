@@ -210,6 +210,8 @@ pub struct KnowledgeDocument {
     pub command_trigger: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub argument_hint: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
     pub body: String,
@@ -258,6 +260,8 @@ struct KnowledgeFrontmatter {
     pub command_trigger: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub argument_hint: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<String>,
     #[serde(default)]
     pub created_at: i64,
     #[serde(default)]
@@ -1404,6 +1408,7 @@ pub fn ensure_memory_builtin_documents(working_dir: &str) -> Result<(), String> 
                 skill_surface: None,
                 command_trigger: None,
                 argument_hint: None,
+                tools: Vec::new(),
                 summary: None,
                 body: String::new(),
                 maintenance_rules: Some(seed.maintenance_rules.to_string()),
@@ -1490,6 +1495,17 @@ fn normalize_optional_text(value: Option<String>) -> Option<String> {
     value
         .map(|item| item.trim().to_string())
         .filter(|item| !item.is_empty())
+}
+
+fn normalize_tool_names(values: Vec<String>) -> Vec<String> {
+    let mut names = values
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    names
 }
 
 fn normalize_command_trigger_value(value: Option<String>) -> Option<String> {
@@ -1635,6 +1651,7 @@ fn ensure_skill_defaults(document: &mut KnowledgeDocument) {
         document.skill_surface = None;
         document.command_trigger = None;
         document.argument_hint = None;
+        document.tools.clear();
         return;
     }
 
@@ -1644,6 +1661,7 @@ fn ensure_skill_defaults(document: &mut KnowledgeDocument) {
     document.skill_surface = Some(surface);
     document.command_trigger = normalize_command_trigger_value(document.command_trigger.take());
     document.argument_hint = normalize_optional_text(document.argument_hint.take());
+    document.tools = normalize_tool_names(std::mem::take(&mut document.tools));
     document.command_enabled = enabled && surface.allows_command();
 }
 
@@ -3217,6 +3235,7 @@ fn render_frontmatter(doc: &KnowledgeDocument) -> Result<String, String> {
         skill_surface: doc.skill_surface,
         command_trigger: doc.command_trigger.clone(),
         argument_hint: doc.argument_hint.clone(),
+        tools: doc.tools.clone(),
         created_at: doc.created_at,
         updated_at: doc.updated_at,
     };
@@ -3413,6 +3432,7 @@ fn parse_document(content: &str, path_hint: Option<&str>) -> Result<KnowledgeDoc
         skill_surface: frontmatter.skill_surface,
         command_trigger: frontmatter.command_trigger,
         argument_hint: frontmatter.argument_hint,
+        tools: normalize_tool_names(frontmatter.tools),
         summary,
         body,
         maintenance_rules,
@@ -5195,6 +5215,7 @@ pub fn update_document(
                 skill_surface: request.skill_surface,
                 command_trigger: request.command_trigger.and_then(|value| value),
                 argument_hint: request.argument_hint.and_then(|value| value),
+                tools: Vec::new(),
                 summary,
                 body,
                 maintenance_rules,
@@ -5692,6 +5713,7 @@ mod tests {
             skill_surface: None,
             command_trigger: None,
             argument_hint: None,
+            tools: Vec::new(),
             summary: Some("Short summary".to_string()),
             body: "Body content".to_string(),
             maintenance_rules: None,
@@ -5750,6 +5772,7 @@ mod tests {
             skill_surface: None,
             command_trigger: None,
             argument_hint: None,
+            tools: Vec::new(),
             summary: Some("Execution order summary".to_string()),
             body: "Execution order body".to_string(),
             maintenance_rules: None,
@@ -5780,6 +5803,7 @@ mod tests {
             skill_surface: None,
             command_trigger: None,
             argument_hint: None,
+            tools: Vec::new(),
             summary: None,
             body: "# 输出方式\n## 细节\n- 先给答案".to_string(),
             maintenance_rules: Some("- 直接给结论".to_string()),
@@ -6002,6 +6026,7 @@ Body content
             skill_surface: Some(SkillSurface::Both),
             command_trigger: Some("/create-skill".to_string()),
             argument_hint: Some("<skill-name>".to_string()),
+            tools: vec!["skill_create".to_string(), "skill_reload".to_string()],
             summary: Some("Create a new Skill.".to_string()),
             body: "## Instructions\n\n1. Do the work.".to_string(),
             maintenance_rules: None,
@@ -6015,6 +6040,7 @@ Body content
         assert_eq!(parsed.skill_surface, Some(SkillSurface::Both));
         assert_eq!(parsed.command_trigger.as_deref(), Some("/create-skill"));
         assert_eq!(parsed.argument_hint.as_deref(), Some("<skill-name>"));
+        assert_eq!(parsed.tools, vec!["skill_create", "skill_reload"]);
         assert_eq!(parsed.summary.as_deref(), Some("Create a new Skill."));
     }
 
@@ -7098,6 +7124,7 @@ Body content
                     skill_surface: None,
                     command_trigger: None,
                     argument_hint: None,
+                    tools: Vec::new(),
                     summary: None,
                     body: String::new(),
                     maintenance_rules: Some(rules.to_string()),
@@ -7164,6 +7191,7 @@ Body content
                 skill_surface: None,
                 command_trigger: None,
                 argument_hint: None,
+                tools: Vec::new(),
                 summary: None,
                 body: String::new(),
                 maintenance_rules: Some("- 自定义错题规则".to_string()),
@@ -7216,6 +7244,7 @@ Body content
                 skill_surface: None,
                 command_trigger: None,
                 argument_hint: None,
+                tools: Vec::new(),
                 summary: None,
                 body: "- 统一使用中文".to_string(),
                 maintenance_rules: Some(MEMORY_USER_PREFERENCE_RULES.to_string()),
@@ -7273,6 +7302,7 @@ Body content
                 skill_surface: None,
                 command_trigger: None,
                 argument_hint: None,
+                tools: Vec::new(),
                 summary: None,
                 body: "- 汇报先给结论".to_string(),
                 maintenance_rules: Some(MEMORY_USER_PREFERENCE_RULES.to_string()),
@@ -7369,6 +7399,7 @@ Body content
                     skill_surface: None,
                     command_trigger: None,
                     argument_hint: None,
+                    tools: Vec::new(),
                     summary: None,
                     body: String::new(),
                     maintenance_rules: Some(rules.to_string()),
@@ -7498,6 +7529,7 @@ Body content
                 skill_surface: None,
                 command_trigger: None,
                 argument_hint: None,
+                tools: Vec::new(),
                 summary: None,
                 body: "已有内容".to_string(),
                 maintenance_rules: Some("已有规则".to_string()),

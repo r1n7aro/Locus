@@ -1,5 +1,5 @@
 {
-  "description": "Create a project Skill document or an app Skill package with explicit metadata. Use this instead of `knowledge_create` whenever the target is a Skill. Dependency-bearing Skills that require CLI tools, binaries, scripts, Unity C# files, package-local runtime assets, or package-registered tools must use `kind: \"package\"`. Package creation writes `skill.json` for Locus metadata and a plain `SKILL.md` for model-facing instructions. Returns a plain-text status line with the created Skill path and command trigger.",
+  "description": "Create a project Skill document or an app Skill package with explicit metadata. Use this instead of `knowledge_create` whenever the target is a Skill. Dependency-bearing Skills that require CLI tools, binaries, scripts, Unity C# files, package-local runtime assets, or package-registered tools must use `kind: \"package\"`. Package creation writes under the Locus app Skill package directory, such as `%APPDATA%/locus/skills/<package-id>/` on Windows, with `skill.json` for Locus metadata and a plain `SKILL.md` for model-facing instructions. Returns a plain-text status line with the created Skill path, command trigger, and packageRoot for package Skills. For packages, omit `packageId` to derive a short kebab-case package id from `name`; provide `packageId` for distributed packages or when a specific namespace is needed.",
   "parameters": {
     "type": "object",
     "additionalProperties": false,
@@ -18,8 +18,8 @@
         "description": "Document-only Skill path. Accepts `asset-audit.md`, `unity/asset-audit.md`, or `skill/unity/asset-audit.md`. When omitted, uses `<name>.md`."
       },
       "packageId": {
-        "type": "string",
-        "description": "Package-only required app Skill package id, for example `com.example.asset-audit`."
+        "type": ["string", "null"],
+        "description": "Package-only app Skill package id, for example `asset-audit`, `studio.tools.asset-audit`, or `io.github.user.asset-audit`. When omitted, Locus derives the short `<name-slug>` package id."
       },
       "version": {
         "type": "string",
@@ -44,6 +44,11 @@
       "commandEnabled": {
         "type": "boolean",
         "description": "Whether the Skill should expose a slash command. Defaults to true."
+      },
+      "tools": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Document-only list of Locus tool names this Skill needs on the first turn when invoked by slash command. Use for lazy or Skill-mode tools such as skill_create, skill_reload, or graph_view."
       },
       "modelInvocationEnabled": {
         "type": "boolean",
