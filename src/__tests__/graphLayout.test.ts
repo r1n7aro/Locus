@@ -3,12 +3,16 @@ import {
   GRAPH_NODE_MIN_WIDTH,
   colorGraphOverlappingRoutes,
   estimateGraphNodeWidth,
+  graphNodePortAnchor,
   graphConnections,
   graphIsDag,
-  graphNodePortAnchor,
   graphRoutePointsWithAnchors,
+  graphStateNodePortSide,
   locusGraphCss,
   layoutGraphDocument,
+  normalizeGraphLayoutMode,
+  normalizeGraphNodeStyle,
+  normalizeGraphStatePortPlacement,
   normalizeGraphData,
 } from "../components/graph";
 
@@ -467,5 +471,160 @@ describe("graphLayout", () => {
         { from: { nodeId: "c" }, to: { nodeId: "a" } },
       ],
     })).toBe(false);
+  });
+
+  it("normalizes layout mode aliases", () => {
+    expect(normalizeGraphLayoutMode("stress")).toBe("dependency");
+    expect(normalizeGraphLayoutMode("state-machine")).toBe("state");
+    expect(normalizeGraphLayoutMode("circle")).toBe("radial");
+    expect(normalizeGraphLayoutMode("fixed")).toBe("manual");
+    expect(normalizeGraphLayoutMode("unknown")).toBe("flow");
+  });
+
+  it("normalizes node style aliases", () => {
+    expect(normalizeGraphNodeStyle("state-machine")).toBe("state");
+    expect(normalizeGraphNodeStyle("unreal")).toBe("state");
+    expect(normalizeGraphNodeStyle("unknown")).toBe("blueprint");
+  });
+
+  it("normalizes state port placement aliases", () => {
+    expect(normalizeGraphStatePortPlacement("top-bottom")).toBe("vertical");
+    expect(normalizeGraphStatePortPlacement("sides")).toBe("horizontal");
+    expect(normalizeGraphStatePortPlacement("unknown")).toBe("auto");
+  });
+
+  it("keeps directed graph link configuration", () => {
+    const graph = normalizeGraphData({
+      layout: { directed: true },
+      nodes: [{ id: "source" }, { id: "target" }],
+      links: [
+        { id: "default", from: { nodeId: "source" }, to: { nodeId: "target" } },
+        { id: "undirected", from: { nodeId: "target" }, to: { nodeId: "source" }, directed: false },
+      ],
+    });
+
+    expect(graph.layout?.directed).toBe(true);
+    expect(graphConnections(graph).find((connection) => connection.id === "undirected")?.directed).toBe(false);
+  });
+
+  it("supports dependency layout mode without persisted orthogonal routes", async () => {
+    const graph = await layoutGraphDocument({
+      schema: "locus.graph.v1",
+      layout: { mode: "dependency", direction: "right" },
+      nodes: [
+        { id: "scene", title: "Scene" },
+        { id: "prefab", title: "Prefab" },
+        { id: "material", title: "Material" },
+        { id: "texture", title: "Texture" },
+      ],
+      links: [
+        { id: "scene-prefab", from: { nodeId: "scene" }, to: { nodeId: "prefab" } },
+        { id: "prefab-material", from: { nodeId: "prefab" }, to: { nodeId: "material" } },
+        { id: "material-texture", from: { nodeId: "material" }, to: { nodeId: "texture" } },
+        { id: "scene-material", from: { nodeId: "scene" }, to: { nodeId: "material" } },
+      ],
+    });
+
+    expect(graph.layout?.mode).toBe("dependency");
+    expect(graph.nodes.every((node) => Number.isFinite(node.x) && Number.isFinite(node.y))).toBe(true);
+    expect(graphConnections(graph).every((connection) => connection.points === undefined)).toBe(true);
+  });
+
+  it("supports state layout mode for cyclic graphs", async () => {
+    const graph = await layoutGraphDocument({
+      schema: "locus.graph.v1",
+      layout: { mode: "state" },
+      nodes: [
+        { id: "idle", title: "Idle" },
+        { id: "chase", title: "Chase" },
+        { id: "attack", title: "Attack" },
+        { id: "recover", title: "Recover" },
+      ],
+      links: [
+        { id: "idle-chase", from: { nodeId: "idle" }, to: { nodeId: "chase" } },
+        { id: "chase-attack", from: { nodeId: "chase" }, to: { nodeId: "attack" } },
+        { id: "attack-recover", from: { nodeId: "attack" }, to: { nodeId: "recover" } },
+        { id: "recover-idle", from: { nodeId: "recover" }, to: { nodeId: "idle" } },
+      ],
+    });
+
+    expect(graph.layout?.mode).toBe("state");
+    expect(graph.nodes.every((node) => Number.isFinite(node.x) && Number.isFinite(node.y))).toBe(true);
+    expect(graphConnections(graph).every((connection) => connection.points === undefined)).toBe(true);
+  });
+
+  it("supports manual layout mode with preserved coordinates", async () => {
+    const graph = await layoutGraphDocument({
+      schema: "locus.graph.v1",
+      layout: { mode: "manual", auto: "off" },
+      nodes: [
+        { id: "root", title: "Root", x: 320, y: 140 },
+        { id: "missing", title: "Missing position" },
+      ],
+      links: [
+        { id: "root-missing", from: { nodeId: "root" }, to: { nodeId: "missing" } },
+      ],
+    });
+
+    const root = graph.nodes.find((node) => node.id === "root");
+    const missing = graph.nodes.find((node) => node.id === "missing");
+
+    expect(graph.layout?.mode).toBe("manual");
+    expect(graph.layout?.engine).toBe("none");
+    expect(root?.x).toBe(320);
+    expect(root?.y).toBe(140);
+    expect(missing?.x).toEqual(expect.any(Number));
+    expect(missing?.y).toEqual(expect.any(Number));
+    expect(graphConnections(graph)[0].points).toBeUndefined();
+  });
+
+  it("supports compact state machine node style", () => {
+    const graph = normalizeGraphData({
+      layout: { nodeStyle: "state" },
+      nodes: [
+        {
+          id: "idle",
+          title: "Idle",
+          subtitle: "Default State",
+        },
+      ],
+      links: [],
+    });
+
+    const node = graph.nodes[0];
+    const inputAnchor = graphNodePortAnchor(node, "input");
+    const outputAnchor = graphNodePortAnchor(node, "output");
+
+    expect(node.nodeStyle).toBe("state");
+    expect(node.height).toBeLessThan(90);
+    expect(node.width).toBeLessThan(260);
+    expect(inputAnchor.y).toBe((node.y ?? 0) + Math.round((node.height ?? 0) / 2));
+    expect(outputAnchor.x).toBe((node.x ?? 0) + (node.width ?? 0));
+  });
+
+  it("supports top and bottom ports for state nodes", () => {
+    const graph = normalizeGraphData({
+      layout: { nodeStyle: "state", direction: "down", statePortPlacement: "vertical" },
+      nodes: [
+        {
+          id: "idle",
+          title: "Idle",
+          x: 40,
+          y: 80,
+        },
+      ],
+      links: [],
+    });
+
+    const node = graph.nodes[0];
+    const inputAnchor = graphNodePortAnchor(node, "input", null, "down", "vertical");
+    const outputAnchor = graphNodePortAnchor(node, "output", null, "down", "vertical");
+
+    expect(graphStateNodePortSide("input", "down", "vertical")).toBe("top");
+    expect(graphStateNodePortSide("output", "down", "vertical")).toBe("bottom");
+    expect(inputAnchor.x).toBe((node.x ?? 0) + Math.round((node.width ?? 0) / 2));
+    expect(inputAnchor.y).toBe(node.y);
+    expect(outputAnchor.x).toBe(inputAnchor.x);
+    expect(outputAnchor.y).toBe((node.y ?? 0) + (node.height ?? 0));
   });
 });

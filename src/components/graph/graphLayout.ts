@@ -2,6 +2,7 @@ import type { ElkExtendedEdge, ElkNode, ElkPort } from "elkjs";
 import type {
   GraphData,
   GraphLayoutDirection,
+  GraphLayoutMode,
   GraphLayoutOptions,
   GraphLink,
   GraphNode,
@@ -11,15 +12,17 @@ import {
   GRAPH_NODE_BODY_PADDING_TOP,
   GRAPH_NODE_HEADER_HEIGHT,
   GRAPH_NODE_PORT_ID,
-  GRAPH_NODE_WIDTH,
   GRAPH_PORT_ROW_PITCH,
   GRAPH_PORT_SIZE,
   colorGraphOverlappingRoutes,
-  estimateGraphNodeHeight,
-  estimateGraphNodeWidth,
+  estimateGraphNodeHeightForStyle,
+  estimateGraphNodeWidthForStyle,
   graphConnections,
   graphIsDag,
   graphNodePortAnchor,
+  normalizeGraphStatePortPlacement,
+  normalizeGraphLayoutMode,
+  normalizeGraphNodeStyle,
   normalizeGraphData,
 } from "./graphTypes";
 
@@ -30,6 +33,14 @@ const ELK_DIRECTION: Record<GraphLayoutDirection, string> = {
   left: "LEFT",
   down: "DOWN",
   up: "UP",
+};
+
+const ELK_LAYOUT_ALGORITHM: Record<GraphLayoutMode, string> = {
+  flow: "layered",
+  dependency: "stress",
+  state: "force",
+  radial: "radial",
+  manual: "layered",
 };
 
 let elkInstancePromise: Promise<InstanceType<ElkConstructor>> | null = null;
@@ -92,16 +103,16 @@ function elkPort(
   };
 }
 
-function toElkNode(node: GraphNode, layoutDirection: GraphLayoutDirection): ElkNode {
-  const width = node.width ?? estimateGraphNodeWidth(node);
-  const height = node.height ?? estimateGraphNodeHeight(node);
+function toElkNode(node: GraphNode, layoutDirection: GraphLayoutDirection, usePorts: boolean): ElkNode {
+  const width = node.width ?? estimateGraphNodeWidthForStyle(node);
+  const height = node.height ?? estimateGraphNodeHeightForStyle(node);
   return {
     id: node.id,
     width,
     height,
-    ports: elkPorts(node, layoutDirection, width),
+    ports: usePorts ? elkPorts(node, layoutDirection, width) : undefined,
     layoutOptions: {
-      "elk.portConstraints": "FIXED_POS",
+      ...(usePorts ? { "elk.portConstraints": "FIXED_POS" } : {}),
       "elk.nodeSize.constraints": "MINIMUM_SIZE",
       "elk.nodeSize.minimum": `(${width},${height})`,
     },
@@ -116,11 +127,11 @@ function endpointShapeId(graph: GraphData, endpoint: GraphLink["from"], directio
   return hasPort ? portShapeId(endpoint.nodeId, endpoint.portId) : endpoint.nodeId;
 }
 
-function toElkEdge(graph: GraphData, connection: GraphLink, index: number): ElkExtendedEdge {
+function toElkEdge(graph: GraphData, connection: GraphLink, index: number, usePorts: boolean): ElkExtendedEdge {
   return {
     id: connection.id || `edge-${index + 1}`,
-    sources: [endpointShapeId(graph, connection.from, "output")],
-    targets: [endpointShapeId(graph, connection.to, "input")],
+    sources: [usePorts ? endpointShapeId(graph, connection.from, "output") : connection.from.nodeId],
+    targets: [usePorts ? endpointShapeId(graph, connection.to, "input") : connection.to.nodeId],
     labels: connection.label ? [{ text: connection.label }] : undefined,
   };
 }
@@ -139,6 +150,135 @@ function edgePoints(edge: ElkExtendedEdge | undefined) {
   }));
 }
 
+function elkLayoutOptions(
+  mode: GraphLayoutMode,
+  direction: GraphLayoutDirection,
+  padding: number,
+  nodeSpacing: number,
+  layerSpacing: number,
+  dag: boolean,
+): Record<string, string> {
+  const common = {
+    "elk.algorithm": ELK_LAYOUT_ALGORITHM[mode],
+    "elk.spacing.nodeNode": String(nodeSpacing),
+    "elk.spacing.componentComponent": String(Math.max(nodeSpacing, 96)),
+    "elk.padding": `[top=${padding},left=${padding},bottom=${padding},right=${padding}]`,
+    "elk.separateConnectedComponents": "true",
+  };
+
+  if (mode === "dependency") {
+    return {
+      ...common,
+      "elk.stress.desiredEdgeLength": String(Math.max(120, layerSpacing)),
+      "elk.stress.iterationLimit": "400",
+    };
+  }
+
+  if (mode === "state") {
+    return {
+      ...common,
+      "elk.force.iterations": "600",
+      "elk.force.repulsion": "8",
+      "elk.aspectRatio": "1.45",
+    };
+  }
+
+  if (mode === "radial") {
+    return {
+      ...common,
+      "elk.direction": ELK_DIRECTION[direction],
+      "elk.radial.radius": String(Math.max(140, layerSpacing)),
+      "elk.radial.centerOnRoot": "true",
+    };
+  }
+
+  return {
+    ...common,
+    "elk.direction": ELK_DIRECTION[direction],
+    "elk.edgeRouting": "ORTHOGONAL",
+    "elk.spacing.edgeNode": "28",
+    "elk.spacing.edgeEdge": "14",
+    "elk.spacing.portPort": "11",
+    "elk.layered.spacing.nodeNodeBetweenLayers": String(layerSpacing),
+    "elk.layered.spacing.edgeNodeBetweenLayers": "36",
+    "elk.layered.spacing.edgeEdgeBetweenLayers": "18",
+    "elk.layered.layering.strategy": "NETWORK_SIMPLEX",
+    "elk.layered.crossingMinimization.strategy": "LAYER_SWEEP",
+    "elk.layered.nodePlacement.strategy": "BRANDES_KOEPF",
+    "elk.layered.cycleBreaking.strategy": dag ? "DEPTH_FIRST" : "GREEDY",
+    "elk.layered.portSortingStrategy": "INPUT_ORDER",
+    "elk.layered.considerModelOrder.strategy": "NODES_AND_EDGES",
+  };
+}
+
+function manualNodePosition(
+  node: GraphNode,
+  index: number,
+  nodeCount: number,
+  padding: number,
+  nodeSpacing: number,
+): { x: number; y: number } {
+  const hasX = typeof node.x === "number" && Number.isFinite(node.x);
+  const hasY = typeof node.y === "number" && Number.isFinite(node.y);
+  if (hasX && hasY) {
+    return { x: Math.round(node.x as number), y: Math.round(node.y as number) };
+  }
+
+  const columns = Math.max(1, Math.ceil(Math.sqrt(Math.max(1, nodeCount))));
+  const width = node.width ?? estimateGraphNodeWidthForStyle(node);
+  const height = node.height ?? estimateGraphNodeHeightForStyle(node);
+  const column = index % columns;
+  const row = Math.floor(index / columns);
+  return {
+    x: Math.round(padding + column * (width + nodeSpacing)),
+    y: Math.round(padding + row * (height + nodeSpacing)),
+  };
+}
+
+function layoutManualGraphDocument(
+  graph: GraphData,
+  layoutOptions: GraphLayoutOptions,
+  direction: GraphLayoutDirection,
+  padding: number,
+  nodeSpacing: number,
+): GraphData {
+  const nextNodes = graph.nodes.map((node, index) => {
+    const position = manualNodePosition(node, index, graph.nodes.length, padding, nodeSpacing);
+    return {
+      ...node,
+      x: position.x,
+      y: position.y,
+      width: Math.round(node.width ?? estimateGraphNodeWidthForStyle(node)),
+      height: Math.round(node.height ?? estimateGraphNodeHeightForStyle(node)),
+    };
+  });
+  const nextConnections = graphConnections(graph).map((connection, index) => ({
+    ...connection,
+    id: connection.id || `edge-${index + 1}`,
+    points: connection.points?.map((point) => ({
+      x: Math.round(point.x),
+      y: Math.round(point.y),
+    })),
+  }));
+  const coloredConnections = colorGraphOverlappingRoutes({
+    connections: nextConnections,
+  });
+
+  return {
+    ...graph,
+    layout: {
+      ...graph.layout,
+      ...layoutOptions,
+      engine: "none",
+      mode: "manual",
+      direction,
+    },
+    nodes: nextNodes,
+    connections: coloredConnections,
+    links: coloredConnections,
+  };
+}
+
 export async function layoutGraphDocument(
   source: GraphData,
   options: GraphLayoutOptions = {},
@@ -150,38 +290,28 @@ export async function layoutGraphDocument(
     ...graph.layout,
     ...options,
   };
+  const mode = normalizeGraphLayoutMode(layoutOptions.mode);
   const direction = layoutOptions.direction ?? "right";
+  const statePortPlacement = normalizeGraphStatePortPlacement(layoutOptions.statePortPlacement);
   const padding = layoutOptions.padding ?? 32;
   const nodeSpacing = layoutOptions.nodeSpacing ?? 84;
   const layerSpacing = layoutOptions.layerSpacing ?? 180;
+  if (mode === "manual") {
+    return layoutManualGraphDocument(graph, layoutOptions, direction, padding, nodeSpacing);
+  }
+
   const elk = await getElk();
   const connections = graphConnections(graph);
   const dag = graphIsDag(graph);
+  const hasStateNodeStyle = graph.nodes.some((node) =>
+    normalizeGraphNodeStyle(node.nodeStyle ?? layoutOptions.nodeStyle) === "state",
+  );
+  const usePorts = mode === "flow" && !hasStateNodeStyle;
   const elkGraph: ElkNode = {
     id: "root",
-    layoutOptions: {
-      "elk.algorithm": "layered",
-      "elk.direction": ELK_DIRECTION[direction],
-      "elk.edgeRouting": "ORTHOGONAL",
-      "elk.spacing.nodeNode": String(nodeSpacing),
-      "elk.spacing.edgeNode": "28",
-      "elk.spacing.edgeEdge": "14",
-      "elk.spacing.portPort": "11",
-      "elk.spacing.componentComponent": String(Math.max(nodeSpacing, 96)),
-      "elk.layered.spacing.nodeNodeBetweenLayers": String(layerSpacing),
-      "elk.layered.spacing.edgeNodeBetweenLayers": "36",
-      "elk.layered.spacing.edgeEdgeBetweenLayers": "18",
-      "elk.layered.layering.strategy": "NETWORK_SIMPLEX",
-      "elk.layered.crossingMinimization.strategy": "LAYER_SWEEP",
-      "elk.layered.nodePlacement.strategy": "BRANDES_KOEPF",
-      "elk.layered.cycleBreaking.strategy": dag ? "DEPTH_FIRST" : "GREEDY",
-      "elk.layered.portSortingStrategy": "INPUT_ORDER",
-      "elk.layered.considerModelOrder.strategy": "NODES_AND_EDGES",
-      "elk.padding": `[top=${padding},left=${padding},bottom=${padding},right=${padding}]`,
-      "elk.separateConnectedComponents": "true",
-    },
-    children: graph.nodes.map((node) => toElkNode(node, direction)),
-    edges: connections.map((connection, index) => toElkEdge(graph, connection, index)),
+    layoutOptions: elkLayoutOptions(mode, direction, padding, nodeSpacing, layerSpacing, dag),
+    children: graph.nodes.map((node) => toElkNode(node, direction, usePorts)),
+    edges: connections.map((connection, index) => toElkEdge(graph, connection, index, usePorts)),
   };
 
   const result = await elk.layout(elkGraph);
@@ -193,19 +323,25 @@ export async function layoutGraphDocument(
       ...node,
       x: Math.round(layoutNode?.x ?? node.x ?? 0),
       y: Math.round(layoutNode?.y ?? node.y ?? 0),
-      width: Math.round(node.width ?? layoutNode?.width ?? GRAPH_NODE_WIDTH),
-      height: Math.round(node.height ?? layoutNode?.height ?? estimateGraphNodeHeight(node)),
+      width: Math.round(node.width ?? layoutNode?.width ?? estimateGraphNodeWidthForStyle(node)),
+      height: Math.round(node.height ?? layoutNode?.height ?? estimateGraphNodeHeightForStyle(node)),
     };
   });
   const graphWithLayout = { ...graph, nodes: nextNodes };
   const nextConnections = connections.map((connection, index) => {
     const id = connection.id || `edge-${index + 1}`;
-    const points = edgePoints(layoutEdgeById.get(id) as ElkExtendedEdge | undefined);
+    const points = mode === "flow"
+      ? edgePoints(layoutEdgeById.get(id) as ElkExtendedEdge | undefined)
+      : undefined;
     const startNode = graphWithLayout.nodes.find((node) => node.id === connection.from.nodeId);
     const endNode = graphWithLayout.nodes.find((node) => node.id === connection.to.nodeId);
     if (points && points.length >= 2) {
-      if (startNode) points[0] = graphNodePortAnchor(startNode, "output", connection.from.portId);
-      if (endNode) points[points.length - 1] = graphNodePortAnchor(endNode, "input", connection.to.portId);
+      if (startNode) {
+        points[0] = graphNodePortAnchor(startNode, "output", connection.from.portId, direction, statePortPlacement);
+      }
+      if (endNode) {
+        points[points.length - 1] = graphNodePortAnchor(endNode, "input", connection.to.portId, direction, statePortPlacement);
+      }
     }
     return {
       ...connection,
@@ -223,6 +359,7 @@ export async function layoutGraphDocument(
       ...graph.layout,
       ...layoutOptions,
       engine: "elk",
+      mode,
       direction,
     },
     nodes: nextNodes,

@@ -6,7 +6,7 @@ let graphStyleUsers = 0;
 export function locusGraphCss(): string {
   return `.locus-graph-view {
   width: 100%;
-  height: 100vh;
+  height: 100%;
   min-width: 0;
   min-height: 0;
   display: flex;
@@ -66,10 +66,8 @@ export function locusGraphCss(): string {
   gap: 6px;
 }
 
-.locus-graph-actions button {
-  min-height: 28px;
-  padding: 0 9px;
-  font-size: 12px;
+.locus-graph-layout-mode {
+  width: 124px;
 }
 
 .locus-graph-error {
@@ -79,6 +77,12 @@ export function locusGraphCss(): string {
   background: var(--status-danger-bg);
   color: var(--status-danger-fg);
   font-size: 12px;
+}
+
+.locus-graph-view > .locus-canvas-view {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
 }
 
 .locus-graph-viewport {
@@ -189,6 +193,92 @@ export function locusGraphCss(): string {
 
 .locus-graph-node.selected {
   border-color: var(--accent-color);
+}
+
+.locus-graph-node.node-style-state {
+  border-radius: 10px;
+  background:
+    linear-gradient(
+      180deg,
+      color-mix(in srgb, var(--surface-elevated) 88%, var(--sidebar-bg) 12%),
+      color-mix(in srgb, var(--panel-bg) 84%, var(--surface-elevated) 16%)
+    );
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--text-color) 8%, transparent),
+    0 1px 0 color-mix(in srgb, var(--border-color) 60%, transparent);
+}
+
+.locus-graph-state-node {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  min-height: 56px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 10px 20px;
+}
+
+.locus-graph-state-node-main {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+  text-align: center;
+}
+
+.locus-graph-state-node-title {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-color);
+  font-size: 13px;
+  font-weight: 650;
+  line-height: 16px;
+}
+
+.locus-graph-state-node-subtitle {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 13px;
+}
+
+.locus-graph-node.node-style-state .locus-graph-port {
+  position: absolute;
+}
+
+.locus-graph-node.node-style-state .locus-graph-port-side-left,
+.locus-graph-node.node-style-state .locus-graph-port-side-right {
+  top: 50%;
+  transform: translateY(-50%);
+}
+
+.locus-graph-node.node-style-state .locus-graph-port-side-left {
+  left: -7px;
+}
+
+.locus-graph-node.node-style-state .locus-graph-port-side-right {
+  right: -7px;
+}
+
+.locus-graph-node.node-style-state .locus-graph-port-side-top,
+.locus-graph-node.node-style-state .locus-graph-port-side-bottom {
+  left: 50%;
+  transform: translateX(-50%);
+}
+
+.locus-graph-node.node-style-state .locus-graph-port-side-top {
+  top: -7px;
+}
+
+.locus-graph-node.node-style-state .locus-graph-port-side-bottom {
+  bottom: -7px;
 }
 
 .locus-graph-node-header {

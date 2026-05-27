@@ -42,4 +42,33 @@ describe("agentGraphTool service", () => {
     expect(source).toContain('title=""');
     expect(source).not.toContain(':title="payload.title"');
   });
+
+  it("documents manual layout image return for vision-capable endpoints", () => {
+    const definition = JSON.parse(read("tools/graph_view.json"));
+
+    expect(definition.parameters.properties.returnImage.type).toBe("boolean");
+    expect(definition.parameters.properties.returnImage.description).toContain("image understanding");
+    expect(definition.parameters.properties.layout.properties.mode.enum).toContain("manual");
+  });
+
+  it("documents Unreal and Unity style state nodes", () => {
+    const definition = JSON.parse(read("tools/graph_view.json"));
+
+    expect(definition.parameters.properties.layout.properties.nodeStyle.enum).toEqual(["blueprint", "state"]);
+    expect(definition.parameters.properties.nodes.items.properties.nodeStyle.enum).toEqual(["blueprint", "state"]);
+    expect(definition.description).toContain("layout.nodeStyle=state");
+  });
+
+  it("documents directed links and vertical state ports", () => {
+    const definition = JSON.parse(read("tools/graph_view.json"));
+
+    expect(definition.parameters.properties.layout.properties.directed.type).toBe("boolean");
+    expect(definition.parameters.properties.layout.properties.statePortPlacement.enum).toEqual([
+      "auto",
+      "horizontal",
+      "vertical",
+    ]);
+    expect(definition.parameters.properties.links.items.properties.directed.type).toBe("boolean");
+    expect(definition.description).toContain("layout.directed=true");
+  });
 });

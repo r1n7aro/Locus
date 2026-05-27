@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, State, WebviewUrl, WindowEvent};
 
 use crate::error::AppError;
+use crate::session::models::ImageData;
 
 pub const AGENT_GRAPH_TOOL_ROUTE: &str = "/agent-graph";
 const AGENT_GRAPH_TOOL_LABEL_PREFIX: &str = "agent-graph-";
@@ -31,6 +32,8 @@ pub struct AgentGraphToolRequest {
     pub graph: serde_json::Value,
     #[serde(default)]
     pub options: Vec<AgentGraphToolOption>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub return_image: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -45,6 +48,8 @@ pub struct AgentGraphToolPayload {
     pub graph: serde_json::Value,
     #[serde(default)]
     pub options: Vec<AgentGraphToolOption>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub return_image: bool,
 }
 
 impl From<&AgentGraphToolRequest> for AgentGraphToolPayload {
@@ -57,6 +62,7 @@ impl From<&AgentGraphToolRequest> for AgentGraphToolPayload {
             editable: request.editable,
             graph: request.graph.clone(),
             options: request.options.clone(),
+            return_image: request.return_image,
         }
     }
 }
@@ -77,6 +83,8 @@ pub struct AgentGraphToolSubmitRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub option: Option<AgentGraphToolSelectedOption>,
     pub graph: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub images: Option<Vec<ImageData>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -116,6 +124,10 @@ pub struct AgentGraphToolEntry {
 
 pub type AgentGraphToolStore = Arc<tokio::sync::Mutex<HashMap<String, AgentGraphToolEntry>>>;
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 pub fn agent_graph_tool_window_label(request_id: &str) -> String {
     format!("{}{}", AGENT_GRAPH_TOOL_LABEL_PREFIX, request_id)
 }
@@ -145,6 +157,11 @@ pub fn agent_graph_tool_request_from_args(
         .unwrap_or(false);
     let graph = normalize_graph_arg(args)?;
     let options = normalize_graph_tool_options(args.get("options"))?;
+    let return_image = args
+        .get("returnImage")
+        .or_else(|| args.get("return_image"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
 
     Ok(AgentGraphToolRequest {
         request_id: uuid::Uuid::new_v4().to_string(),
@@ -154,6 +171,7 @@ pub fn agent_graph_tool_request_from_args(
         editable,
         graph,
         options,
+        return_image,
     })
 }
 
@@ -205,6 +223,7 @@ fn agent_graph_tool_reopen_request_from_record(
     graph_request.request_id = agent_graph_tool_snapshot_request_id(request);
     graph_request.editable = false;
     graph_request.options = Vec::new();
+    graph_request.return_image = false;
     Ok(graph_request)
 }
 
@@ -293,6 +312,30 @@ fn validate_graph_value(graph: &serde_json::Value) -> Result<(), String> {
         }
     }
 
+    Ok(())
+}
+
+fn validate_submit_images(images: Option<&Vec<ImageData>>) -> Result<(), String> {
+    let Some(images) = images else {
+        return Ok(());
+    };
+    if images.len() > 1 {
+        return Err("Graph submission supports at most one layout image.".to_string());
+    }
+    for image in images {
+        if image.data.trim().is_empty() {
+            return Err("Graph layout image data is empty.".to_string());
+        }
+        if image.data.len() > 16 * 1024 * 1024 {
+            return Err("Graph layout image is too large.".to_string());
+        }
+        if image.mime_type != "image/png"
+            && image.mime_type != "image/jpeg"
+            && image.mime_type != "image/webp"
+        {
+            return Err("Graph layout image must be PNG, JPEG, or WebP.".to_string());
+        }
+    }
     Ok(())
 }
 
@@ -463,6 +506,7 @@ pub async fn agent_graph_tool_submit(
     store: State<'_, AgentGraphToolStore>,
 ) -> Result<AgentGraphToolSubmitResult, AppError> {
     validate_graph_value(&request.graph).map_err(AppError::from)?;
+    validate_submit_images(request.images.as_ref()).map_err(AppError::from)?;
     let Some(mut entry) = remove_agent_graph_tool_request(store.inner(), &request.request_id).await
     else {
         return Err(format!("Graph request '{}' not found.", request.request_id).into());
@@ -550,6 +594,28 @@ mod tests {
         assert_eq!(request.graph["links"].as_array().unwrap().len(), 1);
         assert_eq!(request.graph["layout"]["direction"], "right");
         assert_eq!(request.options[0].value.as_deref(), Some("apply"));
+        assert!(!request.return_image);
+    }
+
+    #[test]
+    fn graph_tool_accepts_manual_layout_image_request() {
+        let args = serde_json::json!({
+            "editable": true,
+            "returnImage": true,
+            "nodes": [
+                { "id": "a", "x": 20, "y": 30 },
+                { "id": "b", "x": 280, "y": 30 }
+            ],
+            "links": [
+                { "from": { "nodeId": "a" }, "to": { "nodeId": "b" } }
+            ],
+            "layout": { "mode": "manual", "auto": "off" }
+        });
+
+        let request = agent_graph_tool_request_from_args(&args, "tool-1").unwrap();
+
+        assert!(request.return_image);
+        assert_eq!(request.graph["layout"]["mode"], "manual");
     }
 
     #[test]
@@ -578,6 +644,24 @@ mod tests {
         let error = agent_graph_tool_request_from_args(&args, "tool-1").unwrap_err();
 
         assert!(error.contains("at most 3"));
+    }
+
+    #[test]
+    fn graph_tool_validates_submit_images() {
+        let image = ImageData {
+            data: "abc".to_string(),
+            mime_type: "image/png".to_string(),
+        };
+
+        assert!(validate_submit_images(Some(&vec![image])).is_ok());
+
+        let unsupported = ImageData {
+            data: "abc".to_string(),
+            mime_type: "image/svg+xml".to_string(),
+        };
+        let error = validate_submit_images(Some(&vec![unsupported])).unwrap_err();
+
+        assert!(error.contains("PNG"));
     }
 
     #[test]

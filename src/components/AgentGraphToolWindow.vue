@@ -17,10 +17,12 @@ import {
   GraphView,
   GraphViewController,
   cloneGraphData,
+  normalizeGraphLayoutMode,
   normalizeGraphData,
   type GraphController,
   type GraphData,
 } from "./graph";
+import { renderGraphPngAttachment } from "./graph/graphImage";
 import BaseButton from "./ui/BaseButton.vue";
 import LucideIcon from "./icons/LucideIcon.vue";
 
@@ -120,10 +122,17 @@ async function submitGraph(option: AgentGraphToolOption) {
       description: option.description,
       value: option.value ?? null,
     };
+    const graph = cloneGraphData(currentGraph.value);
+    const shouldReturnLayoutImage = !!payload.value.returnImage
+      && normalizeGraphLayoutMode(graph.layout?.mode) === "manual";
+    const image = shouldReturnLayoutImage
+      ? await renderGraphPngAttachment(graph)
+      : null;
     await agentGraphToolSubmit({
       requestId,
       option: selectedOption,
-      graph: cloneGraphData(currentGraph.value),
+      graph,
+      images: image ? [image] : undefined,
     });
     settled.value = true;
     await closeWindow();

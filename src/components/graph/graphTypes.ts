@@ -1,6 +1,13 @@
 export type GraphPortDirection = "input" | "output";
 export type GraphParameterType = "string" | "text" | "number" | "boolean" | "select" | "color";
 export type GraphLayoutDirection = "right" | "left" | "down" | "up";
+export type GraphPortSide = "left" | "right" | "top" | "bottom";
+export const GRAPH_LAYOUT_MODES = ["flow", "dependency", "state", "radial", "manual"] as const;
+export type GraphLayoutMode = typeof GRAPH_LAYOUT_MODES[number];
+export const GRAPH_NODE_STYLES = ["blueprint", "state"] as const;
+export type GraphNodeStyle = typeof GRAPH_NODE_STYLES[number];
+export const GRAPH_STATE_PORT_PLACEMENTS = ["auto", "horizontal", "vertical"] as const;
+export type GraphStatePortPlacement = typeof GRAPH_STATE_PORT_PLACEMENTS[number];
 export type GraphAutoLayoutMode = boolean | "missing" | "always" | "off";
 export type GraphNodePortsConfig = boolean | {
   input?: boolean;
@@ -43,6 +50,7 @@ export interface GraphNode {
   type?: string;
   title?: string;
   subtitle?: string;
+  nodeStyle?: GraphNodeStyle;
   x?: number;
   y?: number;
   width?: number;
@@ -70,6 +78,7 @@ export interface GraphLink {
   to: GraphEndpoint;
   label?: string;
   type?: string;
+  directed?: boolean;
   points?: GraphPoint[];
   style?: GraphLinkStyle;
   data?: unknown;
@@ -77,7 +86,11 @@ export interface GraphLink {
 
 export interface GraphLayoutOptions {
   engine?: "elk" | "none";
+  mode?: GraphLayoutMode;
+  nodeStyle?: GraphNodeStyle;
   direction?: GraphLayoutDirection;
+  directed?: boolean;
+  statePortPlacement?: GraphStatePortPlacement;
   auto?: GraphAutoLayoutMode;
   nodePorts?: GraphNodePortsConfig;
   nodeSpacing?: number;
@@ -107,6 +120,11 @@ export const GRAPH_NODE_WIDTH = 240;
 export const GRAPH_NODE_MIN_WIDTH = 220;
 export const GRAPH_NODE_MAX_WIDTH = 420;
 export const GRAPH_NODE_MIN_HEIGHT = 112;
+export const GRAPH_STATE_NODE_WIDTH = 190;
+export const GRAPH_STATE_NODE_MIN_WIDTH = 158;
+export const GRAPH_STATE_NODE_MAX_WIDTH = 320;
+export const GRAPH_STATE_NODE_HEIGHT = 68;
+export const GRAPH_STATE_NODE_MIN_HEIGHT = 56;
 export const GRAPH_NODE_PORT_ID = "__node__";
 export const GRAPH_PORT_SIZE = 13;
 export const GRAPH_NODE_HEADER_HEIGHT = 42;
@@ -165,11 +183,56 @@ function clampNodeWidth(width: number): number {
   return Math.min(GRAPH_NODE_MAX_WIDTH, Math.max(GRAPH_NODE_MIN_WIDTH, Math.ceil(width)));
 }
 
+function clampStateNodeWidth(width: number): number {
+  return Math.min(GRAPH_STATE_NODE_MAX_WIDTH, Math.max(GRAPH_STATE_NODE_MIN_WIDTH, Math.ceil(width)));
+}
+
 export function graphConnections(data: Pick<GraphData, "connections" | "links" | "edges">): GraphLink[] {
   if (Array.isArray(data.connections)) return data.connections;
   if (Array.isArray(data.links)) return data.links;
   if (Array.isArray(data.edges)) return data.edges;
   return [];
+}
+
+export function normalizeGraphLayoutMode(value: unknown): GraphLayoutMode {
+  if (typeof value !== "string") return "flow";
+  const normalized = value.trim().toLowerCase().replace(/[\s_-]+/g, "");
+  if (normalized === "dependency" || normalized === "dependencies" || normalized === "network" || normalized === "stress") {
+    return "dependency";
+  }
+  if (normalized === "state" || normalized === "statemachine" || normalized === "machine" || normalized === "force") {
+    return "state";
+  }
+  if (normalized === "radial" || normalized === "circle" || normalized === "hub") {
+    return "radial";
+  }
+  if (normalized === "manual" || normalized === "position" || normalized === "positions" || normalized === "fixed") {
+    return "manual";
+  }
+  return "flow";
+}
+
+export function normalizeGraphNodeStyle(value: unknown): GraphNodeStyle {
+  if (typeof value !== "string") return "blueprint";
+  const normalized = value.trim().toLowerCase().replace(/[\s_-]+/g, "");
+  if (
+    normalized === "state"
+    || normalized === "statemachine"
+    || normalized === "unity"
+    || normalized === "unreal"
+    || normalized === "animationstate"
+  ) {
+    return "state";
+  }
+  return "blueprint";
+}
+
+export function normalizeGraphStatePortPlacement(value: unknown): GraphStatePortPlacement {
+  if (typeof value !== "string") return "auto";
+  const normalized = value.trim().toLowerCase().replace(/[\s_-]+/g, "");
+  if (normalized === "horizontal" || normalized === "side" || normalized === "sides") return "horizontal";
+  if (normalized === "vertical" || normalized === "topbottom" || normalized === "topbottoms") return "vertical";
+  return "auto";
 }
 
 export function cloneGraphData(graph: GraphData): GraphData {
@@ -230,6 +293,58 @@ export function estimateGraphNodeHeight(node: GraphNode): number {
   return Math.max(GRAPH_NODE_MIN_HEIGHT, 58 + portsHeight + parametersHeight);
 }
 
+export function estimateGraphStateNodeWidth(node: GraphNode): number {
+  const title = node.title || node.id;
+  const subtitle = node.subtitle || node.type || "";
+  return clampStateNodeWidth(Math.max(
+    GRAPH_STATE_NODE_WIDTH,
+    estimateTextWidth(title) + 72,
+    subtitle ? estimateTextWidth(subtitle) + 72 : 0,
+  ));
+}
+
+export function estimateGraphStateNodeHeight(node: GraphNode): number {
+  return Math.max(GRAPH_STATE_NODE_MIN_HEIGHT, node.subtitle || node.type ? GRAPH_STATE_NODE_HEIGHT : 60);
+}
+
+export function estimateGraphNodeWidthForStyle(
+  node: GraphNode,
+  style: GraphNodeStyle = normalizeGraphNodeStyle(node.nodeStyle),
+): number {
+  return style === "state"
+    ? estimateGraphStateNodeWidth(node)
+    : estimateGraphNodeWidth(node);
+}
+
+export function estimateGraphNodeHeightForStyle(
+  node: GraphNode,
+  style: GraphNodeStyle = normalizeGraphNodeStyle(node.nodeStyle),
+): number {
+  return style === "state"
+    ? estimateGraphStateNodeHeight(node)
+    : estimateGraphNodeHeight(node);
+}
+
+function normalizeGraphNodeWidth(node: GraphNode, style: GraphNodeStyle): number {
+  if (typeof node.width === "number" && Number.isFinite(node.width)) {
+    const minWidth = style === "state" ? GRAPH_STATE_NODE_MIN_WIDTH : GRAPH_NODE_MIN_WIDTH;
+    if (Number(node.width) < minWidth) {
+      return estimateGraphNodeWidthForStyle(node, style);
+    }
+    return style === "state"
+      ? clampStateNodeWidth(Number(node.width))
+      : clampNodeWidth(Number(node.width));
+  }
+  return estimateGraphNodeWidthForStyle(node, style);
+}
+
+function normalizeGraphNodeHeight(node: GraphNode, style: GraphNodeStyle): number {
+  if (typeof node.height === "number" && Number.isFinite(node.height)) {
+    return Math.max(Number(node.height), estimateGraphNodeHeightForStyle(node, style));
+  }
+  return estimateGraphNodeHeightForStyle(node, style);
+}
+
 export function normalizeGraphData(data: GraphData | null | undefined): GraphData {
   const source = data ?? { nodes: [], connections: [] };
   const nodes = Array.isArray(source.nodes) ? source.nodes : [];
@@ -254,21 +369,23 @@ export function normalizeGraphData(data: GraphData | null | undefined): GraphDat
   return {
     schema: source.schema ?? "locus.graph.v1",
     layout: source.layout ? { ...source.layout } : undefined,
-    nodes: nodes.map((node, index) => ({
-      ...node,
-      id: String(node.id || `node-${index + 1}`),
-      x: typeof node.x === "number" && Number.isFinite(node.x) ? Number(node.x) : undefined,
-      y: typeof node.y === "number" && Number.isFinite(node.y) ? Number(node.y) : undefined,
-      width: typeof node.width === "number" && Number.isFinite(node.width) && Number(node.width) >= GRAPH_NODE_MIN_WIDTH
-        ? clampNodeWidth(Number(node.width))
-        : estimateGraphNodeWidth(node),
-      height: typeof node.height === "number" && Number.isFinite(node.height)
-        ? Math.max(Number(node.height), estimateGraphNodeHeight(node))
-        : estimateGraphNodeHeight(node),
-      inputs: (node.inputs ?? []).map((port) => ({ ...port, direction: "input" })),
-      outputs: (node.outputs ?? []).map((port) => ({ ...port, direction: "output" })),
-      parameters: (node.parameters ?? []).map((parameter) => ({ ...parameter })),
-    })),
+    nodes: nodes.map((node, index) => {
+      const styleSource = node.nodeStyle ?? source.layout?.nodeStyle;
+      const nodeStyle = normalizeGraphNodeStyle(styleSource);
+      const shouldPersistStyle = styleSource !== undefined;
+      const styledNode = shouldPersistStyle ? { ...node, nodeStyle } : node;
+      return {
+        ...styledNode,
+        id: String(node.id || `node-${index + 1}`),
+        x: typeof node.x === "number" && Number.isFinite(node.x) ? Number(node.x) : undefined,
+        y: typeof node.y === "number" && Number.isFinite(node.y) ? Number(node.y) : undefined,
+        width: normalizeGraphNodeWidth(styledNode, nodeStyle),
+        height: normalizeGraphNodeHeight(styledNode, nodeStyle),
+        inputs: (node.inputs ?? []).map((port) => ({ ...port, direction: "input" })),
+        outputs: (node.outputs ?? []).map((port) => ({ ...port, direction: "output" })),
+        parameters: (node.parameters ?? []).map((parameter) => ({ ...parameter })),
+      };
+    }),
     connections: normalizedConnections,
     links: normalizedConnections,
   };
@@ -308,10 +425,13 @@ export function graphIsDag(data: Pick<GraphData, "nodes" | "connections" | "link
 }
 
 export function graphPortOffsetY(
-  node: Pick<GraphNode, "inputs" | "outputs">,
+  node: Pick<GraphNode, "height" | "inputs" | "nodeStyle" | "outputs">,
   direction: GraphPortDirection,
   portId?: string | null,
 ): number {
+  if (normalizeGraphNodeStyle(node.nodeStyle) === "state") {
+    return Math.round((node.height ?? GRAPH_STATE_NODE_HEIGHT) / 2);
+  }
   if (!portId) return GRAPH_NODE_HEADER_HEIGHT / 2;
   const ports = direction === "input" ? node.inputs ?? [] : node.outputs ?? [];
   const index = ports.findIndex((port) => port.id === portId);
@@ -322,12 +442,59 @@ export function graphPortOffsetY(
     + index * GRAPH_PORT_ROW_PITCH;
 }
 
+function graphStatePortsUseVertical(
+  layoutDirection: GraphLayoutDirection,
+  placement: GraphStatePortPlacement,
+): boolean {
+  if (placement === "vertical") return true;
+  if (placement === "horizontal") return false;
+  return layoutDirection === "down" || layoutDirection === "up";
+}
+
+export function graphStateNodePortSide(
+  direction: GraphPortDirection,
+  layoutDirection: GraphLayoutDirection = "right",
+  placement: GraphStatePortPlacement = "auto",
+): GraphPortSide {
+  const normalizedPlacement = normalizeGraphStatePortPlacement(placement);
+  if (graphStatePortsUseVertical(layoutDirection, normalizedPlacement)) {
+    if (layoutDirection === "up") return direction === "input" ? "bottom" : "top";
+    return direction === "input" ? "top" : "bottom";
+  }
+
+  if (layoutDirection === "left") return direction === "input" ? "right" : "left";
+  return direction === "input" ? "left" : "right";
+}
+
 export function graphNodePortAnchor(
   node: GraphNode,
   direction: GraphPortDirection,
   portId?: string | null,
+  layoutDirection: GraphLayoutDirection = "right",
+  statePortPlacement: GraphStatePortPlacement = "auto",
 ): GraphPoint {
-  const width = node.width ?? estimateGraphNodeWidth(node);
+  const width = node.width ?? estimateGraphNodeWidthForStyle(node);
+  const height = node.height ?? estimateGraphNodeHeightForStyle(node);
+  if (normalizeGraphNodeStyle(node.nodeStyle) === "state") {
+    const side = graphStateNodePortSide(direction, layoutDirection, statePortPlacement);
+    if (side === "top") {
+      return {
+        x: (node.x ?? 0) + Math.round(width / 2),
+        y: node.y ?? 0,
+      };
+    }
+    if (side === "bottom") {
+      return {
+        x: (node.x ?? 0) + Math.round(width / 2),
+        y: (node.y ?? 0) + height,
+      };
+    }
+    return {
+      x: (node.x ?? 0) + (side === "right" ? width : 0),
+      y: (node.y ?? 0) + Math.round(height / 2),
+    };
+  }
+
   return {
     x: (node.x ?? 0) + (direction === "output" ? width : 0),
     y: (node.y ?? 0) + graphPortOffsetY(node, direction, portId),

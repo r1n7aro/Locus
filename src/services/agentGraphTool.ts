@@ -1,4 +1,5 @@
 import type { GraphData } from "../components/graph";
+import type { ImageAttachment } from "../types";
 import { ipcInvoke } from "./ipc";
 
 export const AGENT_GRAPH_TOOL_WINDOW_PATH = "/agent-graph";
@@ -18,6 +19,7 @@ export interface AgentGraphToolPayload {
   editable: boolean;
   graph: GraphData;
   options: AgentGraphToolOption[];
+  returnImage?: boolean;
 }
 
 export interface AgentGraphToolSelectedOption {
@@ -30,6 +32,7 @@ export interface AgentGraphToolSubmitRequest {
   requestId: string;
   option?: AgentGraphToolSelectedOption | null;
   graph: GraphData;
+  images?: ImageAttachment[] | null;
 }
 
 export interface AgentGraphToolSubmitResult {

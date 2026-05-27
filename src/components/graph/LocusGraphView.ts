@@ -5,13 +5,14 @@ import {
   markRaw,
   nextTick,
   onBeforeUnmount,
-  onBeforeUpdate,
   onMounted,
   reactive,
   ref,
   type PropType,
-  type VNodeRef,
 } from "vue";
+import { CanvasView, type CanvasItemMoveEvent, type CanvasViewExpose } from "../canvas";
+import BaseButton from "../ui/BaseButton.vue";
+import BaseDropdown from "../ui/BaseDropdown.vue";
 import { GraphViewController, type GraphController } from "./graphController";
 import { layoutGraphDocument } from "./graphLayout";
 import { useLocusGraphStyles } from "./graphStyles";
@@ -20,17 +21,21 @@ import type {
   GraphData,
   GraphEndpoint,
   GraphLayoutDirection,
+  GraphLayoutMode,
   GraphLayoutOptions,
   GraphLink,
   GraphNode,
   GraphNodePortsConfig,
+  GraphNodeStyle,
   GraphParameter,
+  GraphPortSide,
   GraphPoint,
   GraphPort,
   GraphPortDirection,
+  GraphStatePortPlacement,
 } from "./graphTypes";
 import {
-  GRAPH_NODE_WIDTH,
+  GRAPH_LAYOUT_MODES,
   GRAPH_NODE_PORT_ID,
   GRAPH_WORLD_SIZE,
   cloneGraphData,
@@ -39,11 +44,26 @@ import {
   graphNodePortAnchor,
   graphRouteColorIndexById,
   graphRoutePointsWithAnchors,
+  graphStateNodePortSide,
+  normalizeGraphLayoutMode,
+  normalizeGraphNodeStyle,
+  normalizeGraphStatePortPlacement,
   normalizeGraphData,
 } from "./graphTypes";
 
 const GRAPH_EDGE_CORNER_RADIUS = 12;
 const GRAPH_EDGE_COLOR_COUNT = 6;
+const GRAPH_LAYOUT_MODE_LABELS: Record<GraphLayoutMode, string> = {
+  flow: "Flow",
+  dependency: "Dependency",
+  state: "State",
+  radial: "Radial",
+  manual: "Manual",
+};
+const GRAPH_LAYOUT_MODE_OPTIONS = GRAPH_LAYOUT_MODES.map((mode) => ({
+  value: mode,
+  label: GRAPH_LAYOUT_MODE_LABELS[mode],
+}));
 
 interface PendingGraphConnection {
   nodeId: string;
@@ -51,14 +71,9 @@ interface PendingGraphConnection {
   direction: GraphPortDirection;
 }
 
-function shouldIgnoreNodeDrag(target: EventTarget | null): boolean {
-  return target instanceof Element
-    && !!target.closest("input, select, textarea, button, .locus-graph-port");
-}
-
 function shouldAutoLayout(graph: GraphData, mode: GraphAutoLayoutMode, force = false): boolean {
   const graphMode = graph.layout?.auto ?? mode;
-  if (force) return graphMode !== false && graphMode !== "off";
+  if (force) return true;
   if (graphMode === "always") return true;
   if (graphMode === false || graphMode === "off") return false;
   return graphHasMissingPositions(graph);
@@ -174,7 +189,7 @@ function createGraphViewComponent() {
         default: true,
       },
     },
-    setup(props) {
+    setup(props, { slots }) {
       useLocusGraphStyles();
 
       const graph = reactive<GraphData>({
@@ -192,11 +207,10 @@ function createGraphViewComponent() {
       const pendingConnection = ref<PendingGraphConnection | null>(null);
       const draggingNodeId = ref("");
       const edgeVersion = ref(0);
-      const viewport = reactive({ x: 24, y: 24, scale: 1 });
-      const viewportEl = ref<HTMLElement | null>(null);
-      const nodeElements = new Map<string, HTMLElement>();
+      const canvasRef = ref<CanvasViewExpose | null>(null);
       let edgeRenderScheduled = false;
       let edgeRenderFrame = 0;
+      const arrowMarkerId = `locus-graph-arrow-${Math.random().toString(36).slice(2)}`;
       const routeColorIndexById = computed(() => {
         return graphRouteColorIndexById({ connections: graphConnections(graph) });
       });
@@ -259,8 +273,38 @@ function createGraphViewComponent() {
         return graph.layout?.direction ?? props.layoutOptions.direction ?? "right";
       }
 
+      function currentStatePortPlacement(): GraphStatePortPlacement {
+        return normalizeGraphStatePortPlacement(
+          graph.layout?.statePortPlacement ?? props.layoutOptions.statePortPlacement,
+        );
+      }
+
+      function currentLayoutMode(): GraphLayoutMode {
+        return normalizeGraphLayoutMode(graph.layout?.mode ?? props.layoutOptions.mode);
+      }
+
+      function effectiveLayoutOptions(overrides: GraphLayoutOptions = {}): GraphLayoutOptions {
+        return {
+          ...props.layoutOptions,
+          ...graph.layout,
+          ...overrides,
+        };
+      }
+
       function nodePortsConfig(): GraphNodePortsConfig {
         return graph.layout?.nodePorts ?? props.layoutOptions.nodePorts ?? true;
+      }
+
+      function effectiveNodeStyle(node: GraphNode): GraphNodeStyle {
+        return normalizeGraphNodeStyle(node.nodeStyle ?? graph.layout?.nodeStyle ?? props.layoutOptions.nodeStyle);
+      }
+
+      function graphUsesDirectedConnections(): boolean {
+        return graph.layout?.directed ?? props.layoutOptions.directed ?? false;
+      }
+
+      function connectionIsDirected(connection: GraphLink): boolean {
+        return connection.directed ?? graphUsesDirectedConnections();
       }
 
       function shouldRenderNodePort(direction: GraphPortDirection) {
@@ -308,7 +352,7 @@ function createGraphViewComponent() {
         const currentGraph = snapshotGraph();
         if (!shouldAutoLayout(currentGraph, props.autoLayout, force)) return false;
         status.value = "Layout";
-        const nextGraph = await layoutGraphDocument(currentGraph, props.layoutOptions);
+        const nextGraph = await layoutGraphDocument(currentGraph, effectiveLayoutOptions());
         replaceGraphData(nextGraph, { dirty: markDirty });
         if (markDirty) props.controller.onGraphChange?.(snapshotGraph());
         return true;
@@ -324,7 +368,10 @@ function createGraphViewComponent() {
             : { schema: "locus.graph.v1", nodes: [], connections: [] };
           const normalized = normalizeGraphData(nextGraph);
           if (shouldAutoLayout(normalized, props.autoLayout)) {
-            replaceGraphData(await layoutGraphDocument(normalized, props.layoutOptions));
+            replaceGraphData(await layoutGraphDocument(normalized, {
+              ...props.layoutOptions,
+              ...normalized.layout,
+            }));
           } else {
             replaceGraphData(normalized);
           }
@@ -334,6 +381,7 @@ function createGraphViewComponent() {
         } catch (loadError) {
           error.value = loadError instanceof Error ? loadError.message : String(loadError);
           status.value = "Error";
+          console.error("[GraphView] loadGraph failed", loadError);
         } finally {
           loading.value = false;
         }
@@ -349,6 +397,7 @@ function createGraphViewComponent() {
         } catch (saveError) {
           error.value = saveError instanceof Error ? saveError.message : String(saveError);
           status.value = "Error";
+          console.error("[GraphView] saveGraph failed", saveError);
         }
       }
 
@@ -362,6 +411,7 @@ function createGraphViewComponent() {
         } catch (applyError) {
           error.value = applyError instanceof Error ? applyError.message : String(applyError);
           status.value = "Error";
+          console.error("[GraphView] applyGraph failed", applyError);
         }
       }
 
@@ -377,39 +427,29 @@ function createGraphViewComponent() {
         } catch (layoutError) {
           error.value = layoutError instanceof Error ? layoutError.message : String(layoutError);
           status.value = "Error";
+          console.error("[GraphView] layout failed", layoutError);
         } finally {
           loading.value = false;
         }
       }
 
+      async function selectLayoutMode(modeValue: string) {
+        const mode = normalizeGraphLayoutMode(modeValue);
+        graph.layout = effectiveLayoutOptions({ mode });
+        if (mode === "manual") {
+          notifyGraphChange();
+          status.value = "Manual";
+          return;
+        }
+        if (!graph.nodes.length) {
+          notifyGraphChange();
+          return;
+        }
+        await autoLayoutGraph();
+      }
+
       function fitGraph() {
-        const container = viewportEl.value;
-        if (!container || !graph.nodes.length) return;
-
-        const bounds = graph.nodes.reduce(
-          (result, node) => {
-            const width = node.width ?? GRAPH_NODE_WIDTH;
-            const height = nodeElements.get(node.id)?.offsetHeight ?? node.height ?? 112;
-            return {
-              minX: Math.min(result.minX, node.x ?? 0),
-              minY: Math.min(result.minY, node.y ?? 0),
-              maxX: Math.max(result.maxX, (node.x ?? 0) + width),
-              maxY: Math.max(result.maxY, (node.y ?? 0) + height),
-            };
-          },
-          { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity },
-        );
-
-        const width = Math.max(bounds.maxX - bounds.minX, 1);
-        const height = Math.max(bounds.maxY - bounds.minY, 1);
-        const nextScale = Math.min(
-          1.25,
-          Math.max(0.45, Math.min((container.clientWidth - 72) / width, (container.clientHeight - 72) / height)),
-        );
-        viewport.scale = Number.isFinite(nextScale) ? nextScale : 1;
-        viewport.x = Math.round((container.clientWidth - width * viewport.scale) / 2 - bounds.minX * viewport.scale);
-        viewport.y = Math.round((container.clientHeight - height * viewport.scale) / 2 - bounds.minY * viewport.scale);
-        scheduleEdgeRender();
+        canvasRef.value?.fitContent();
       }
 
       function nodeById(id: string) {
@@ -419,12 +459,38 @@ function createGraphViewComponent() {
       function endpointPoint(endpoint: GraphEndpoint, direction: GraphPortDirection) {
         const node = nodeById(endpoint.nodeId);
         if (!node) return null;
-        return graphNodePortAnchor(node, direction, endpoint.portId);
+        return graphNodePortAnchor(
+          node,
+          direction,
+          endpoint.portId,
+          currentLayoutDirection(),
+          currentStatePortPlacement(),
+        );
       }
 
-      function connectionBezierPath(start: GraphPoint, end: GraphPoint) {
+      function portSideForEndpoint(endpoint: GraphEndpoint, direction: GraphPortDirection): GraphPortSide {
+        const node = nodeById(endpoint.nodeId);
+        if (node && effectiveNodeStyle(node) === "state") {
+          return graphStateNodePortSide(direction, currentLayoutDirection(), currentStatePortPlacement());
+        }
+        return direction === "input" ? "left" : "right";
+      }
+
+      function connectionUsesVerticalPorts(connection: GraphLink): boolean {
+        const fromSide = portSideForEndpoint(connection.from, "output");
+        const toSide = portSideForEndpoint(connection.to, "input");
+        return fromSide === "top" || fromSide === "bottom" || toSide === "top" || toSide === "bottom";
+      }
+
+      function connectionBezierPath(start: GraphPoint, end: GraphPoint, vertical = false) {
+        if (vertical) {
+          const dy = Math.max(56, Math.abs(end.y - start.y) * 0.5);
+          const offsetY = end.y >= start.y ? dy : -dy;
+          return `M ${start.x} ${start.y} C ${start.x} ${start.y + offsetY}, ${end.x} ${end.y - offsetY}, ${end.x} ${end.y}`;
+        }
         const dx = Math.max(56, Math.abs(end.x - start.x) * 0.5);
-        return `M ${start.x} ${start.y} C ${start.x + dx} ${start.y}, ${end.x - dx} ${end.y}, ${end.x} ${end.y}`;
+        const offsetX = end.x >= start.x ? dx : -dx;
+        return `M ${start.x} ${start.y} C ${start.x + offsetX} ${start.y}, ${end.x - offsetX} ${end.y}, ${end.x} ${end.y}`;
       }
 
       function connectionPath(connection: GraphLink) {
@@ -433,12 +499,12 @@ function createGraphViewComponent() {
         const end = endpointPoint(connection.to, "input");
         if (!start || !end) return "";
         if (draggingNodeId.value && connectionTouchesNode(connection, draggingNodeId.value)) {
-          return connectionBezierPath(start, end);
+          return connectionBezierPath(start, end, connectionUsesVerticalPorts(connection));
         }
         if (connection.points && connection.points.length >= 2) {
           return graphPathWithEndpoints(connection.points, start, end, currentLayoutDirection());
         }
-        return connectionBezierPath(start, end);
+        return connectionBezierPath(start, end, connectionUsesVerticalPorts(connection));
       }
 
       function connectionColorIndex(connection: GraphLink) {
@@ -539,13 +605,6 @@ function createGraphViewComponent() {
         }
       }
 
-      function onGraphKeydown(event: KeyboardEvent) {
-        if ((event.key === "Delete" || event.key === "Backspace") && (selectedConnectionId.value || selectedNodeId.value)) {
-          event.preventDefault();
-          removeSelectedItem();
-        }
-      }
-
       function addNodeFromController() {
         const nextNode = props.controller.createNode?.(snapshotGraph());
         if (!nextNode || props.readonly) return;
@@ -574,11 +633,12 @@ function createGraphViewComponent() {
 
       function maybeRenderCreateNodeButton() {
         if (!canCreateNode()) return null;
-        return h("button", {
-          type: "button",
+        return h(BaseButton, {
+          size: "sm",
+          variant: "neutral",
           onClick: addNodeFromController,
           disabled: props.readonly || loading.value,
-        }, "Add");
+        }, () => "Add");
       }
 
       function updateParameter(node: GraphNode, parameter: GraphParameter, value: unknown) {
@@ -588,102 +648,33 @@ function createGraphViewComponent() {
         notifyGraphChange();
       }
 
-      function onNodePointerDown(event: PointerEvent, node: GraphNode) {
-        if (shouldIgnoreNodeDrag(event.target)) return;
-        event.preventDefault();
-        event.stopPropagation();
-        selectedNodeId.value = node.id;
+      function onCanvasSelectionUpdate(itemId: string) {
+        selectedNodeId.value = itemId;
         selectedConnectionId.value = "";
-        const target = event.currentTarget as HTMLElement;
-        const startX = event.clientX;
-        const startY = event.clientY;
-        const nodeStartX = node.x ?? 0;
-        const nodeStartY = node.y ?? 0;
-        let didDrag = false;
-        target.setPointerCapture(event.pointerId);
-
-        const onMove = (moveEvent: PointerEvent) => {
-          if (!didDrag) {
-            didDrag = true;
-            draggingNodeId.value = node.id;
-            clearConnectionRoutesForNode(node.id);
-          }
-          node.x = Math.round(nodeStartX + (moveEvent.clientX - startX) / viewport.scale);
-          node.y = Math.round(nodeStartY + (moveEvent.clientY - startY) / viewport.scale);
-          if (!props.readonly) dirty.value = true;
-          scheduleEdgeRender();
-        };
-        const onUp = (upEvent: PointerEvent) => {
-          try {
-            target.releasePointerCapture(upEvent.pointerId);
-          } catch {
-            // Pointer capture may already be released by the host WebView.
-          }
-          target.removeEventListener("pointermove", onMove);
-          target.removeEventListener("pointerup", onUp);
-          target.removeEventListener("pointercancel", onUp);
-          draggingNodeId.value = "";
-          if (didDrag && !props.readonly) notifyGraphChange();
-          if (didDrag) scheduleEdgeRender();
-        };
-
-        target.addEventListener("pointermove", onMove);
-        target.addEventListener("pointerup", onUp);
-        target.addEventListener("pointercancel", onUp);
       }
 
-      function onViewportPointerDown(event: PointerEvent) {
-        if (event.button !== 0 || shouldIgnoreNodeDrag(event.target)) return;
-        const targetElement = event.target instanceof Element ? event.target : null;
-        if (targetElement?.closest(".locus-graph-node")) return;
-        const viewportNode = viewportEl.value;
-        if (!viewportNode) return;
-        event.preventDefault();
-        selectedNodeId.value = "";
-        selectedConnectionId.value = "";
-        const startX = event.clientX;
-        const startY = event.clientY;
-        const viewportStartX = viewport.x;
-        const viewportStartY = viewport.y;
-        viewportNode.setPointerCapture(event.pointerId);
-
-        const onMove = (moveEvent: PointerEvent) => {
-          viewport.x = Math.round(viewportStartX + moveEvent.clientX - startX);
-          viewport.y = Math.round(viewportStartY + moveEvent.clientY - startY);
-          scheduleEdgeRender();
-        };
-        const onUp = (upEvent: PointerEvent) => {
-          try {
-            viewportNode.releasePointerCapture(upEvent.pointerId);
-          } catch {
-            // Pointer capture may already be released by the host WebView.
-          }
-          viewportNode.removeEventListener("pointermove", onMove);
-          viewportNode.removeEventListener("pointerup", onUp);
-          viewportNode.removeEventListener("pointercancel", onUp);
-        };
-
-        viewportNode.addEventListener("pointermove", onMove);
-        viewportNode.addEventListener("pointerup", onUp);
-        viewportNode.addEventListener("pointercancel", onUp);
+      function onCanvasItemDragStart(event: CanvasItemMoveEvent) {
+        draggingNodeId.value = event.item.id;
+        clearConnectionRoutesForNode(event.item.id);
       }
 
-      function onWheel(event: WheelEvent) {
-        const container = viewportEl.value;
-        if (!container) return;
-        event.preventDefault();
-        const rect = container.getBoundingClientRect();
-        const graphX = (event.clientX - rect.left - viewport.x) / viewport.scale;
-        const graphY = (event.clientY - rect.top - viewport.y) / viewport.scale;
-        const factor = event.deltaY < 0 ? 1.08 : 0.92;
-        const nextScale = Math.min(1.8, Math.max(0.35, viewport.scale * factor));
-        viewport.x = Math.round(event.clientX - rect.left - graphX * nextScale);
-        viewport.y = Math.round(event.clientY - rect.top - graphY * nextScale);
-        viewport.scale = nextScale;
+      function onCanvasItemMove() {
+        if (!props.readonly) dirty.value = true;
         scheduleEdgeRender();
       }
 
-      function renderPort(node: GraphNode, direction: GraphPortDirection, port?: GraphPort | null) {
+      function onCanvasItemMoveEnd(event: CanvasItemMoveEvent) {
+        draggingNodeId.value = "";
+        if (event.didDrag && !props.readonly) notifyGraphChange();
+        if (event.didDrag) scheduleEdgeRender();
+      }
+
+      function renderPort(
+        node: GraphNode,
+        direction: GraphPortDirection,
+        port?: GraphPort | null,
+        side?: GraphPortSide,
+      ) {
         const portId = port?.id ?? null;
         const pending = pendingConnection.value;
         const active = !!pending
@@ -697,6 +688,7 @@ function createGraphViewComponent() {
           class: [
             "locus-graph-port",
             `locus-graph-port-${direction}`,
+            side ? `locus-graph-port-side-${side}` : "",
             connected ? "connected" : "",
             connected ? `route-color-${colorIndex}` : "",
             active ? "active" : "",
@@ -796,7 +788,47 @@ function createGraphViewComponent() {
         );
       }
 
+      function graphNodeClass(item: GraphNode) {
+        const hasInputs = (item.inputs ?? []).length > 0;
+        const hasOutputs = (item.outputs ?? []).length > 0;
+        const nodeStyle = effectiveNodeStyle(item);
+        return [
+          "locus-graph-node",
+          `node-style-${nodeStyle}`,
+          hasInputs ? "has-inputs" : "no-inputs",
+          hasOutputs ? "has-outputs" : "no-outputs",
+          !hasInputs && hasOutputs ? "output-only" : "",
+          hasInputs && !hasOutputs ? "input-only" : "",
+        ];
+      }
+
+      function renderStateNode(node: GraphNode) {
+        const title = node.title || node.id;
+        const subtitle = node.subtitle || node.type || "";
+        const hasNodeInputPort = shouldRenderNodePort("input");
+        const hasNodeOutputPort = shouldRenderNodePort("output");
+        const inputSide = graphStateNodePortSide("input", currentLayoutDirection(), currentStatePortPlacement());
+        const outputSide = graphStateNodePortSide("output", currentLayoutDirection(), currentStatePortPlacement());
+        return h("div", { class: "locus-graph-state-node" }, [
+          hasNodeInputPort ? renderPort(node, "input", null, inputSide) : null,
+          h("div", { class: "locus-graph-state-node-main" }, [
+            h("div", { class: "locus-graph-state-node-title" }, title),
+            subtitle ? h("div", { class: "locus-graph-state-node-subtitle" }, subtitle) : null,
+          ]),
+          hasNodeOutputPort ? renderPort(node, "output", null, outputSide) : null,
+        ]);
+      }
+
       function renderNode(node: GraphNode) {
+        const customNode = slots.node?.({
+          node,
+          selected: selectedNodeId.value === node.id,
+          readonly: props.readonly,
+          updateParameter: (parameter: GraphParameter, value: unknown) => updateParameter(node, parameter, value),
+        });
+        if (customNode?.length) return customNode;
+        if (effectiveNodeStyle(node) === "state") return renderStateNode(node);
+
         const parameters = node.parameters ?? [];
         const title = node.title || node.id;
         const subtitle = node.subtitle || node.type || "";
@@ -804,40 +836,7 @@ function createGraphViewComponent() {
         const hasOutputs = (node.outputs ?? []).length > 0;
         const hasNodeInputPort = shouldRenderNodePort("input");
         const hasNodeOutputPort = shouldRenderNodePort("output");
-        const setNodeRef: VNodeRef = (element) => {
-          if (element instanceof HTMLElement) nodeElements.set(node.id, element);
-        };
-        return h("div", {
-          key: node.id,
-          class: [
-            "locus-graph-node",
-            selectedNodeId.value === node.id ? "selected" : "",
-            hasInputs ? "has-inputs" : "no-inputs",
-            hasOutputs ? "has-outputs" : "no-outputs",
-            !hasInputs && hasOutputs ? "output-only" : "",
-            hasInputs && !hasOutputs ? "input-only" : "",
-          ],
-          style: {
-            left: `${node.x ?? 0}px`,
-            top: `${node.y ?? 0}px`,
-            width: `${node.width ?? GRAPH_NODE_WIDTH}px`,
-          },
-          tabindex: 0,
-          role: "button",
-          ref: setNodeRef,
-          onPointerdown: (event: PointerEvent) => onNodePointerDown(event, node),
-          onClick: () => {
-            selectedNodeId.value = node.id;
-            selectedConnectionId.value = "";
-          },
-          onKeydown: (event: KeyboardEvent) => {
-            if (event.key === "Enter" || event.key === " ") {
-              event.preventDefault();
-              selectedNodeId.value = node.id;
-              selectedConnectionId.value = "";
-            }
-          },
-        }, [
+        return [
           h("div", {
             class: [
               "locus-graph-node-header",
@@ -867,6 +866,26 @@ function createGraphViewComponent() {
                 }, parameters.map((parameter) => renderParameter(node, parameter)))
               : null,
           ]),
+        ];
+      }
+
+      function renderEdgeMarkers() {
+        return h("defs", [
+          h("marker", {
+            id: arrowMarkerId,
+            viewBox: "0 0 8 8",
+            refX: 7.2,
+            refY: 4,
+            markerWidth: 7,
+            markerHeight: 7,
+            orient: "auto",
+          }, [
+            h("path", {
+              d: "M 0 0 L 8 4 L 0 8 z",
+              fill: "context-stroke",
+              stroke: "none",
+            }),
+          ]),
         ]);
       }
 
@@ -882,6 +901,8 @@ function createGraphViewComponent() {
             selected ? "selected" : "",
           ],
           d: connectionPath(connection),
+          "marker-end": connectionIsDirected(connection) ? `url(#${arrowMarkerId})` : undefined,
+          onPointerdown: (event: PointerEvent) => event.stopPropagation(),
           onClick: (event: MouseEvent) => {
             event.stopPropagation();
             selectedConnectionId.value = connection.id || "";
@@ -889,10 +910,6 @@ function createGraphViewComponent() {
           },
         });
       }
-
-      onBeforeUpdate(() => {
-        nodeElements.clear();
-      });
 
       onMounted(() => {
         void loadGraph();
@@ -904,6 +921,20 @@ function createGraphViewComponent() {
         window.removeEventListener("resize", scheduleEdgeRender);
       });
 
+      function renderToolbarButton(
+        label: string,
+        onClick: () => void,
+        disabled = false,
+        variant: "neutral" | "danger" = "neutral",
+      ) {
+        return h(BaseButton, {
+          size: "sm",
+          variant,
+          disabled,
+          onClick,
+        }, () => label);
+      }
+
       return () => h("section", { class: "locus-graph-view" }, [
         h("header", { class: "locus-graph-toolbar" }, [
           h("div", { class: "locus-graph-heading" }, [
@@ -911,46 +942,61 @@ function createGraphViewComponent() {
             h("div", { class: "locus-graph-status" }, dirty.value ? `${status.value} · Modified` : status.value),
           ]),
           h("div", { class: "locus-graph-actions" }, [
-            h("button", { type: "button", onClick: loadGraph, disabled: loading.value }, "Reload"),
-            h("button", { type: "button", onClick: fitGraph, disabled: loading.value }, "Fit"),
-            h("button", { type: "button", onClick: autoLayoutGraph, disabled: loading.value || !graph.nodes.length }, "Layout"),
+            renderToolbarButton("Reload", loadGraph, loading.value),
+            renderToolbarButton("Fit", fitGraph, loading.value),
+            h(BaseDropdown, {
+              class: "locus-graph-layout-mode",
+              modelValue: currentLayoutMode(),
+              selectedLabel: GRAPH_LAYOUT_MODE_LABELS[currentLayoutMode()],
+              options: GRAPH_LAYOUT_MODE_OPTIONS,
+              ariaLabel: "Layout mode",
+              size: "sm",
+              menuAlign: "end",
+              disabled: loading.value || !graph.nodes.length,
+              "onUpdate:modelValue": selectLayoutMode,
+            }),
+            renderToolbarButton("Layout", autoLayoutGraph, loading.value || !graph.nodes.length),
             maybeRenderCreateNodeButton(),
-            h("button", { type: "button", onClick: removeSelectedItem, disabled: props.readonly || !hasSelection() }, "Delete"),
+            renderToolbarButton("Delete", removeSelectedItem, props.readonly || !hasSelection(), "danger"),
             props.showPersistenceActions
-              ? h("button", { type: "button", onClick: saveGraph, disabled: loading.value || props.readonly }, "Save")
+              ? renderToolbarButton("Save", saveGraph, loading.value || props.readonly)
               : null,
             props.showPersistenceActions
-              ? h("button", { type: "button", onClick: applyGraph, disabled: loading.value || props.readonly }, "Apply")
+              ? renderToolbarButton("Apply", applyGraph, loading.value || props.readonly)
               : null,
           ]),
         ]),
         error.value ? h("div", { class: "locus-graph-error" }, error.value) : null,
-        h("div", {
-          class: "locus-graph-viewport",
-          ref: viewportEl,
-          tabindex: 0,
-          onPointerdown: onViewportPointerDown,
-          onKeydown: onGraphKeydown,
-          onWheel,
-        }, [
-          h("div", {
-            class: "locus-graph-world",
-            style: {
-              width: `${GRAPH_WORLD_SIZE}px`,
-              height: `${GRAPH_WORLD_SIZE}px`,
-              transform: `translate(${viewport.x}px, ${viewport.y}px) scale(${viewport.scale})`,
-            },
-          }, [
+        h(CanvasView, {
+          ref: canvasRef,
+          items: graph.nodes,
+          selectedItemId: selectedNodeId.value,
+          selectionActive: hasSelection(),
+          readonly: props.readonly,
+          moveReadonly: true,
+          worldSize: GRAPH_WORLD_SIZE,
+          itemClass: (item: unknown) => graphNodeClass(item as GraphNode),
+          ignoreDragSelector: "input, select, textarea, button, .locus-graph-port",
+          "onUpdate:selectedItemId": onCanvasSelectionUpdate,
+          onItemDragStart: onCanvasItemDragStart,
+          onItemMove: onCanvasItemMove,
+          onItemMoveEnd: onCanvasItemMoveEnd,
+          onDeleteSelection: removeSelectedItem,
+          onRender: scheduleEdgeRender,
+        }, {
+          overlay: () =>
             h("svg", {
               class: "locus-graph-edge-layer",
               viewBox: `0 0 ${GRAPH_WORLD_SIZE} ${GRAPH_WORLD_SIZE}`,
               width: GRAPH_WORLD_SIZE,
               height: GRAPH_WORLD_SIZE,
               "aria-hidden": "true",
-            }, graphConnections(graph).map(renderConnection)),
-            graph.nodes.map(renderNode),
-          ]),
-        ]),
+            }, [
+              renderEdgeMarkers(),
+              ...graphConnections(graph).map(renderConnection),
+            ]),
+          default: ({ item }: { item: unknown }) => renderNode(item as GraphNode),
+        }),
       ]);
     },
   });
