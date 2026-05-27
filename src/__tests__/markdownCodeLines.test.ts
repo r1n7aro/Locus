@@ -68,4 +68,11 @@ describe("markdown code line rendering", () => {
       '<span class="hljs-meta">B</span>',
     ]);
   });
+
+  it("does not render separator newlines between visual code lines", () => {
+    const rendered = renderHighlightedCodeLines("alpha\nbeta");
+
+    expect(rendered).not.toContain("</span>\n<span");
+    expect(rendered).toContain('</span></span><span class="code-line">');
+  });
 });

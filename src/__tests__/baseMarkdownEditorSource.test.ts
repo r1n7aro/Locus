@@ -19,9 +19,12 @@ describe("BaseMarkdownEditor source", () => {
 
   it("supports a shared native markdown source view", () => {
     expect(source).toContain("viewMode?: MarkdownEditorViewMode;");
+    expect(source).toContain("contentPath?: string;");
     expect(source).toContain("viewMode: \"rendered\"");
+    expect(source).toContain("contentPath: \"\"");
     expect(source).toContain("const isNativeMode = computed(() => props.viewMode === \"native\")");
     expect(source).toContain("const isReadonlyRenderedMode = computed(() => props.disabled && props.viewMode === \"rendered\")");
+    expect(source).toContain("const readonlyCodeLanguage = computed(() =>");
     expect(source).toContain("const shouldUseVditor = computed(() => !isNativeMode.value && !isReadonlyRenderedMode.value)");
     expect(source).toContain("class=\"base-markdown-editor-textarea\"");
     expect(source).toContain("font-family: var(--font-mono-editor);");
@@ -66,7 +69,10 @@ describe("BaseMarkdownEditor source", () => {
     expect(source).toMatch(/\.base-markdown-editor\.disabled\s*\{[\s\S]*cursor:\s*default;/);
     expect(source).toMatch(/pre\.vditor-reset\[contenteditable="false"\]\)\s*\{[\s\S]*cursor:\s*default;/);
     expect(source).toContain("import MarkdownRenderer from \"../MarkdownRenderer.vue\"");
-    expect(source).toContain("<MarkdownRenderer :content=\"modelValue\" />");
+    expect(source).toContain("import SemanticCodeRenderer from \"./SemanticCodeRenderer.vue\"");
+    expect(source).toContain("semanticCodeLanguageFromPath(props.contentPath)");
+    expect(source).toContain("<SemanticCodeRenderer");
+    expect(source).toContain("<MarkdownRenderer v-else :content=\"modelValue\" />");
     expect(source).not.toContain("cursor: wait;");
   });
 });

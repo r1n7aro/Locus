@@ -5,6 +5,7 @@ import {
   injectFileRefs,
   injectWorkspaceMentions,
 } from "../composables/markdownInject";
+import { prepareMarkdownImages } from "../composables/markdownImages";
 
 describe("walkHtmlText", () => {
   it("transforms plain text", () => {
@@ -106,13 +107,21 @@ describe("injectAssetRefs", () => {
       "@Assets/Scenes/Main.unity",
       "@Assets/Materials/Ground.mat",
       "@Assets/Scripts/Player.cs",
+      "@Assets/Tools/extract_psd.py",
+      "@Assets/Data/skill.json",
+      "@Assets/Docs/SKILL.md",
       "@Assets/Textures/Icon.png",
     ].join(" ");
     const result = injectAssetRefs(html);
     expect(result).toContain('data-asset-kind="scene"');
     expect(result).toContain('data-asset-kind="material"');
-    expect(result).toContain('data-asset-kind="script"');
+    expect(result).toContain('data-asset-kind="csharp"');
+    expect(result).toContain('data-asset-kind="python"');
+    expect(result).toContain('data-asset-kind="json"');
+    expect(result).toContain('data-asset-kind="markdown"');
     expect(result).toContain('data-asset-kind="texture"');
+    expect(result).toContain('md-unity-asset-icon--csharp" src="/unity-asset-icons/script.svg"');
+    expect(result).toContain('md-unity-asset-icon--json" src="/unity-asset-icons/text.svg"');
   });
 
   it("converts @scene/object references to Unity scene object refs", () => {
@@ -267,6 +276,26 @@ describe("injectAssetRefs", () => {
     expect(result).toContain("locus-temp-test.txt");
   });
 
+  it("keeps slash commands inside inline code out of file refs", () => {
+    const html = "<code>/psd-to-ugui &lt;psd-path&gt; [output-folder]</code>";
+    const result = injectAssetRefs(html);
+    expect(result).toContain("md-command-ref");
+    expect(result).toContain('data-command-trigger="/psd-to-ugui"');
+    expect(result).toContain("/psd-to-ugui &lt;psd-path&gt; [output-folder]");
+    expect(result).not.toContain("md-file-ref");
+    expect(result).not.toContain("data-file-path");
+  });
+
+  it("converts knowledge paths inside inline code to knowledge refs", () => {
+    const html = "<code>skill/com.locus.psd-to-ugui/SKILL.md</code>";
+    const result = injectAssetRefs(html);
+    expect(result).toContain("md-knowledge-ref");
+    expect(result).toContain('data-knowledge-type="skill"');
+    expect(result).toContain('data-knowledge-path="skill/com.locus.psd-to-ugui/SKILL.md"');
+    expect(result).toContain("SKILL.md");
+    expect(result).not.toContain("<code>");
+  });
+
   it("does not convert generic workspace mentions", () => {
     const html = "See @UIElementsSchema/UnityEditor.Overlays.xsd";
     const result = injectAssetRefs(html);
@@ -329,6 +358,15 @@ describe("injectWorkspaceMentions", () => {
     expect(result).toContain('data-workspace-path="ProjectSettings/Tag Manager.asset"');
     expect(result).toContain("@</span>Tag Manager.asset");
   });
+
+  it("converts knowledge mentions to knowledge refs", () => {
+    const html = "Inspect @skill/com.locus.psd-to-ugui/SKILL.md";
+    const result = injectWorkspaceMentions(html);
+    expect(result).toContain("md-knowledge-ref");
+    expect(result).toContain('data-knowledge-type="skill"');
+    expect(result).toContain('data-knowledge-path="skill/com.locus.psd-to-ugui/SKILL.md"');
+    expect(result).not.toContain("md-workspace-ref");
+  });
 });
 
 describe("injectFileRefs", () => {
@@ -368,6 +406,15 @@ describe("injectFileRefs", () => {
     const html = "Update utils/helpers.ts";
     const result = injectFileRefs(html);
     expect(result).toContain('data-file-path="utils/helpers.ts"');
+  });
+
+  it("converts bare knowledge document paths to knowledge refs", () => {
+    const html = "Created skill/com.locus.psd-to-ugui/SKILL.md for the package";
+    const result = injectFileRefs(html);
+    expect(result).toContain("md-knowledge-ref");
+    expect(result).toContain('data-knowledge-type="skill"');
+    expect(result).toContain('data-knowledge-path="skill/com.locus.psd-to-ugui/SKILL.md"');
+    expect(result).not.toContain('data-file-path="skill/com.locus.psd-to-ugui/SKILL.md"');
   });
 
   it("converts bare absolute local file paths", () => {
@@ -496,5 +543,44 @@ describe("injectFileRefs", () => {
     const result = injectFileRefs(html);
     const matches = result.match(/md-file-ref/g);
     expect(matches).toHaveLength(2);
+  });
+});
+
+describe("prepareMarkdownImages", () => {
+  it("converts a standalone local image path to a resolvable image preview", () => {
+    const result = prepareMarkdownImages("<p>C:/Users/ExampleUser/AppData/Roaming/Locus/temp/result.png</p>");
+    expect(result).toContain("md-image-frame");
+    expect(result).toContain("md-image-preview");
+    expect(result).toContain('data-md-image-source="C:/Users/ExampleUser/AppData/Roaming/Locus/temp/result.png"');
+    expect(result).toContain('data-md-image-state="pending"');
+    expect(result).not.toContain("md-file-ref");
+  });
+
+  it("converts a bare autolinked network image URL to an image preview", () => {
+    const result = prepareMarkdownImages(
+      '<p><a href="https://example.com/output/result.webp">https://example.com/output/result.webp</a></p>',
+    );
+    expect(result).toContain("md-image-preview");
+    expect(result).toContain('src="https://example.com/output/result.webp"');
+    expect(result).toContain('data-md-image-state="ready"');
+    expect(result).not.toContain("<a ");
+  });
+
+  it("wraps explicit markdown image tags and keeps local paths for backend resolution", () => {
+    const result = prepareMarkdownImages('<p><img src="Assets/Textures/Hero.png" alt="Hero"></p>');
+    expect(result).toContain("md-image-frame");
+    expect(result).toContain('data-md-image-source="Assets/Textures/Hero.png"');
+    expect(result).toContain('alt="Hero"');
+    expect(result).not.toContain('src="Assets/Textures/Hero.png"');
+  });
+
+  it("keeps non-image paths as text", () => {
+    const html = "<p>src/components/ChatView.vue</p>";
+    expect(prepareMarkdownImages(html)).toBe(html);
+  });
+
+  it("does not convert image paths inside code", () => {
+    const html = "<pre><code>C:/temp/result.png</code></pre>";
+    expect(prepareMarkdownImages(html)).toBe(html);
   });
 });

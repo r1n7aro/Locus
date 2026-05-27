@@ -2,7 +2,9 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import Vditor from "vditor";
 import "vditor/dist/index.css";
+import { semanticCodeLanguageFromPath } from "../../composables/semanticCodeRendering";
 import MarkdownRenderer from "../MarkdownRenderer.vue";
+import SemanticCodeRenderer from "./SemanticCodeRenderer.vue";
 import {
   canSyncMarkdownEditorWhileFocused,
   normalizeMarkdownEditorLineEndings,
@@ -21,10 +23,12 @@ const props = withDefaults(defineProps<{
   disabled?: boolean;
   placeholder?: string;
   viewMode?: MarkdownEditorViewMode;
+  contentPath?: string;
 }>(), {
   disabled: false,
   placeholder: "",
   viewMode: "rendered",
+  contentPath: "",
 });
 
 const emit = defineEmits<{
@@ -40,6 +44,9 @@ const syncing = ref(false);
 const pendingModelValue = ref<string | null>(null);
 const isNativeMode = computed(() => props.viewMode === "native");
 const isReadonlyRenderedMode = computed(() => props.disabled && props.viewMode === "rendered");
+const readonlyCodeLanguage = computed(() =>
+  isReadonlyRenderedMode.value ? semanticCodeLanguageFromPath(props.contentPath) : null
+);
 const shouldUseVditor = computed(() => !isNativeMode.value && !isReadonlyRenderedMode.value);
 let editor: Vditor | null = null;
 let themeObserver: MutationObserver | null = null;
@@ -319,7 +326,12 @@ onBeforeUnmount(() => {
       />
     </div>
     <div v-else-if="isReadonlyRenderedMode" class="base-markdown-editor-rendered">
-      <MarkdownRenderer :content="modelValue" />
+      <SemanticCodeRenderer
+        v-if="readonlyCodeLanguage"
+        :content="modelValue"
+        :language="readonlyCodeLanguage"
+      />
+      <MarkdownRenderer v-else :content="modelValue" />
     </div>
     <div v-else ref="mountRef" class="base-markdown-editor-host" />
   </div>

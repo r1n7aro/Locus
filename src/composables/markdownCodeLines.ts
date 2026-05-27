@@ -93,5 +93,5 @@ export function renderHighlightedCodeLines(source: string, showLineNumbers = tru
         ? `<span class="code-line"><span class="line-number">${i + 1}</span><span class="line-content">${line || " "}</span></span>`
         : `<span class="code-line code-line-tree"><span class="line-content">${line || " "}</span></span>`
     ))
-    .join("\n");
+    .join("");
 }

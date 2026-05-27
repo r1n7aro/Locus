@@ -46,11 +46,14 @@ const INLINE_CODE_BRACED_REF_RE = /^\{@?([^{}\r\n]+\/[^{}\r\n]*)\}$/;
 const INLINE_CODE_PATH_SUFFIX_RE = /^(.+?)(?::(\d+)|#L(\d+)|#fileID:-?\d+)?$/i;
 const INLINE_WORKSPACE_ROOT_RE = /^(?:ProjectSettings|src|src-tauri|Library|Editor)\//i;
 const INLINE_GENERIC_FILE_PATH_RE = /^(?:[^/\r\n]+\/)+[^/\r\n]+\.[A-Za-z0-9][^/\r\n]*$/;
+const INLINE_SLASH_COMMAND_RE = /^\/[A-Za-z0-9_-]+(?:\s|$)/;
 const UNQUOTED_SCENE_OBJECT_START_RE = /@(?:Assets|Packages)\//g;
 const UNQUOTED_UNITY_ASSET_START_RE = /@(?:Assets|Packages)\//g;
 const BARE_UNITY_ASSET_START_RE = /(?<![@`\/])(?:Assets|Packages)\//g;
 const BRACED_WORKSPACE_MENTION_RE = /\{@([^{}\r\n]*\/[^{}\r\n]*)\}/g;
 const WORKSPACE_MENTION_RE = /@((?:[^\s@<]+\/)+[^\s@<]*)/g;
+const KNOWLEDGE_DOCUMENT_ROOT_RE = /^(design|memory|skill|reference)\/(.+\.md)$/i;
+const KNOWLEDGE_DOCUMENT_FILE_RE = /^Locus\/knowledge\/(design|memory|skill|reference)\/(.+\.md)$/i;
 const UNITY_ASSET_ICON_BASE = "/unity-asset-icons";
 const WINDOWS_DRIVE_ABSOLUTE_RE = /^[A-Za-z]:[\\/]/;
 const UNC_ABSOLUTE_RE = /^(?:\\\\|\/\/)[^\\/]+[\\/][^\\/]+/;
@@ -78,6 +81,29 @@ function displayFileRef(filePath: string, line = ""): string {
 
 function normalizeFileRefPath(filePath: string): string {
   return filePath.trim().replace(/\\/g, "/");
+}
+
+interface KnowledgeRefParts {
+  docType: string;
+  path: string;
+}
+
+function parseKnowledgeRefPath(filePath: string): KnowledgeRefParts | null {
+  const normalized = normalizeFileRefPath(filePath).replace(/^\/+|\/+$/g, "");
+  if (!normalized) return null;
+
+  const fileMatch = normalized.match(KNOWLEDGE_DOCUMENT_FILE_RE);
+  if (fileMatch) {
+    const docType = fileMatch[1].toLowerCase();
+    const path = normalizeFileRefPath(fileMatch[2]).replace(/^\/+|\/+$/g, "");
+    return path ? { docType, path: `${docType}/${path}` } : null;
+  }
+
+  const rootMatch = normalized.match(KNOWLEDGE_DOCUMENT_ROOT_RE);
+  if (!rootMatch) return null;
+  const docType = rootMatch[1].toLowerCase();
+  const path = normalizeFileRefPath(rootMatch[2]).replace(/^\/+|\/+$/g, "");
+  return path ? { docType, path: `${docType}/${path}` } : null;
 }
 
 export function isAbsoluteLocalRefPath(filePath: string): boolean {
@@ -130,8 +156,21 @@ function unityAssetKind(filePath: string): UnityAssetIconKind {
   return unityAssetIconKindForPath(filePath, { fallbackKind: "asset" });
 }
 
+function unityAssetIconImageKind(kind: UnityAssetIconKind): UnityAssetIconKind {
+  switch (kind) {
+    case "csharp":
+    case "python":
+      return "script";
+    case "json":
+    case "markdown":
+      return "text";
+    default:
+      return kind;
+  }
+}
+
 function unityAssetIconSrc(kind: UnityAssetIconKind): string {
-  return `${UNITY_ASSET_ICON_BASE}/${kind}.svg`;
+  return `${UNITY_ASSET_ICON_BASE}/${unityAssetIconImageKind(kind)}.svg`;
 }
 
 function renderSvgAttrs(attrs: Record<string, string | number | undefined>): string {
@@ -200,8 +239,30 @@ function renderUnityAssetRef(filePath: string, line = ""): string {
   );
 }
 
+function renderKnowledgeRef(filePath: string): string {
+  const ref = parseKnowledgeRefPath(filePath);
+  if (!ref) return escapeAttr(filePath);
+  const escapedPath = escapeAttr(ref.path);
+  const escapedType = escapeAttr(ref.docType);
+  const icon = renderLucideRefIcon("text", "md-knowledge-ref-icon");
+  return `<span class="md-file-ref md-knowledge-ref ui-select-text" data-knowledge-type="${escapedType}" data-knowledge-path="${escapedPath}" data-entry-kind="knowledge" title="${escapedPath}" aria-label="${escapedPath}">${icon}<span class="md-ref-label">${displayFileRef(ref.path)}</span></span>`;
+}
+
+function renderInlineCommandRef(source: string): string {
+  const display = source.trim();
+  const command = display.match(/^\/[A-Za-z0-9_-]+/)?.[0] ?? display;
+  const escapedDisplay = escapeAttr(display);
+  const escapedCommand = escapeAttr(command);
+  return `<code class="md-command-ref" data-command-trigger="${escapedCommand}" title="${escapedDisplay}" aria-label="${escapedDisplay}">${escapedDisplay}</code>`;
+}
+
 function renderWorkspaceMention(path: string, match: string): string {
   const isDir = path.endsWith("/");
+  const knowledgeRef = parseKnowledgeRefPath(path);
+  if (knowledgeRef) {
+    return renderKnowledgeRef(knowledgeRef.path);
+  }
+
   if (isUsableAbsoluteLocalRefPath(path)) {
     return renderLocalFileRef(path);
   }
@@ -429,8 +490,17 @@ function renderWorkspaceInlineRef(filePath: string, line = ""): string {
 
 function assetRefFromInlineCode(source: string): string | null {
   const refText = normalizeInlineCodeRefText(source);
+  if (INLINE_SLASH_COMMAND_RE.test(refText)) {
+    return renderInlineCommandRef(refText);
+  }
+
   const parsed = splitInlineCodePathSuffix(refText);
   if (!parsed) return null;
+
+  const knowledgeRef = parseKnowledgeRefPath(parsed.path);
+  if (knowledgeRef) {
+    return renderKnowledgeRef(knowledgeRef.path);
+  }
 
   if (isUsableAbsoluteLocalRefPath(parsed.path)) {
     return renderLocalFileRef(parsed.path, parsed.line);
@@ -610,6 +680,10 @@ export function injectFileRefs(html: string): string {
       let filePath = match;
       if (lineColon) filePath = match.slice(0, match.lastIndexOf(":" + lineColon));
       else if (lineHash) filePath = match.slice(0, match.lastIndexOf("#L" + lineHash));
+      const knowledgeRef = parseKnowledgeRefPath(filePath);
+      if (knowledgeRef) {
+        return renderKnowledgeRef(knowledgeRef.path);
+      }
       if (SCENE_OBJECT_ROOT_RE.test(filePath)) {
         return renderUnitySceneObjectRef(filePath);
       }

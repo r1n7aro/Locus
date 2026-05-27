@@ -1,15 +1,21 @@
 
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, nextTick, ref, watch } from "vue";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { Marked } from "marked";
 import { markedHighlight } from "marked-highlight";
 import hljs from "../hljs";
+import {
+  markdownImageDirectSrc,
+  prepareMarkdownImages,
+  shouldResolveMarkdownImageSource,
+} from "../composables/markdownImages";
 import { renderHighlightedCodeLines } from "../composables/markdownCodeLines";
 import { normalizeExternalMarkdownHref } from "../composables/markdownExternalLinks";
 import { injectAssetRefs, injectFileRefs, injectWorkspaceMentions } from "../composables/markdownInject";
 import { normalizeMarkdownForRender } from "../composables/markdownRender";
 import { wrapMarkdownTables } from "../composables/markdownTableHtml";
+import { resolveMarkdownImage } from "../services/markdownImage";
 import { hasTauriWindowRuntime } from "../services/tauriRuntime";
 
 const props = defineProps<{
@@ -18,6 +24,12 @@ const props = defineProps<{
   enableFileRefs?: boolean;
   highlightTerms?: string[];
 }>();
+
+const emit = defineEmits<{
+  (e: "openImage", src: string): void;
+}>();
+
+const rootRef = ref<HTMLElement | null>(null);
 
 function escapeHtml(source: string): string {
   return source
@@ -142,6 +154,7 @@ const renderedHtml = computed(() => {
   if (!props.content) return "";
   try {
     let html = md.parse(normalizeMarkdownForRender(props.content)) as string;
+    html = prepareMarkdownImages(html);
     html = injectAssetRefs(html);
     html = injectWorkspaceMentions(html);
     if (props.enableFileRefs) {
@@ -163,6 +176,98 @@ const renderedHtml = computed(() => {
   }
 });
 
+interface ResolvedMarkdownImage {
+  url: string;
+  displayPath: string;
+}
+
+const markdownImageCache = new Map<string, ResolvedMarkdownImage>();
+let markdownImageResolveRun = 0;
+
+function setMarkdownImageState(image: HTMLImageElement, state: "pending" | "loading" | "ready" | "error") {
+  image.dataset.mdImageState = state;
+  const frame = image.closest("[data-md-image-frame]") as HTMLElement | null;
+  if (frame) {
+    frame.dataset.mdImageState = state;
+  }
+}
+
+function applyResolvedMarkdownImage(
+  image: HTMLImageElement,
+  source: string,
+  resolved: ResolvedMarkdownImage,
+) {
+  image.src = resolved.url;
+  image.dataset.mdImageResolvedFor = source;
+  if (resolved.displayPath) {
+    image.title = resolved.displayPath;
+  }
+  setMarkdownImageState(image, "ready");
+}
+
+async function resolveMarkdownImages() {
+  const root = rootRef.value;
+  if (!root) return;
+
+  const run = ++markdownImageResolveRun;
+  const images = Array.from(root.querySelectorAll<HTMLImageElement>("img[data-md-image-source]"));
+  for (const image of images) {
+    const source = image.dataset.mdImageSource?.trim() ?? "";
+    if (!source || image.dataset.mdImageResolvedFor === source) continue;
+
+    if (!shouldResolveMarkdownImageSource(source)) {
+      applyResolvedMarkdownImage(image, source, {
+        url: markdownImageDirectSrc(source),
+        displayPath: source,
+      });
+      continue;
+    }
+
+    const cached = markdownImageCache.get(source);
+    if (cached) {
+      applyResolvedMarkdownImage(image, source, cached);
+      continue;
+    }
+
+    setMarkdownImageState(image, "loading");
+    try {
+      const preview = await resolveMarkdownImage(source);
+      const resolved = {
+        url: preview.url,
+        displayPath: preview.displayPath || source,
+      };
+      markdownImageCache.set(source, resolved);
+      if (
+        run !== markdownImageResolveRun
+        || !image.isConnected
+        || image.dataset.mdImageSource?.trim() !== source
+      ) {
+        continue;
+      }
+      applyResolvedMarkdownImage(image, source, resolved);
+    } catch (error) {
+      if (
+        run !== markdownImageResolveRun
+        || !image.isConnected
+        || image.dataset.mdImageSource?.trim() !== source
+      ) {
+        continue;
+      }
+      console.warn("Failed to resolve markdown image:", error);
+      image.removeAttribute("src");
+      setMarkdownImageState(image, "error");
+    }
+  }
+}
+
+watch(
+  renderedHtml,
+  () => {
+    void nextTick(resolveMarkdownImages);
+  },
+  { immediate: true, flush: "post" },
+);
+
 function isHandledMarkdownMouseButton(event: MouseEvent): boolean {
   return event.button === 0 || event.button === 1;
 }
@@ -178,28 +283,38 @@ async function openMarkdownHref(href: string): Promise<void> {
   }
 }
 
-function handleMarkdownLinkActivation(event: MouseEvent) {
+function handleMarkdownContentActivation(event: MouseEvent) {
   if (event.defaultPrevented || !isHandledMarkdownMouseButton(event)) return;
   if (!(event.target instanceof Element)) return;
 
   const anchor = event.target.closest("a[href]") as HTMLAnchorElement | null;
-  if (!anchor) return;
+  if (anchor) {
+    event.preventDefault();
+    event.stopPropagation();
+
+    const href = normalizeExternalMarkdownHref(anchor.getAttribute("href"));
+    if (!href) return;
+
+    void openMarkdownHref(href);
+    return;
+  }
+
+  if (event.type !== "click" || event.button !== 0) return;
+  const image = event.target.closest("img.md-image-preview[src]") as HTMLImageElement | null;
+  if (!image || image.dataset.mdImageState !== "ready") return;
 
   event.preventDefault();
   event.stopPropagation();
-
-  const href = normalizeExternalMarkdownHref(anchor.getAttribute("href"));
-  if (!href) return;
-
-  void openMarkdownHref(href);
+  emit("openImage", image.currentSrc || image.src);
 }
 </script>
 
 <template>
   <div
+    ref="rootRef"
     class="markdown-body ui-select-text"
-    @click="handleMarkdownLinkActivation"
-    @auxclick="handleMarkdownLinkActivation"
+    @click="handleMarkdownContentActivation"
+    @auxclick="handleMarkdownContentActivation"
     v-html="renderedHtml"
   />
 </template>
@@ -446,6 +561,50 @@ function handleMarkdownLinkActivation(event: MouseEvent) {
   border-radius: 8px;
   border: 1px solid color-mix(in srgb, var(--border-color) 76%, transparent);
   cursor: pointer;
+}
+
+.markdown-body .md-image-frame {
+  display: block;
+  width: fit-content;
+  max-width: 100%;
+  margin: 4px 0 12px;
+  padding: 4px;
+  box-sizing: border-box;
+  border: 1px solid color-mix(in srgb, var(--border-color) 86%, transparent);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--sidebar-bg, var(--hover-bg)) 42%, transparent);
+  overflow: hidden;
+}
+
+.markdown-body .md-image-frame[data-md-image-state="pending"],
+.markdown-body .md-image-frame[data-md-image-state="loading"],
+.markdown-body .md-image-frame[data-md-image-state="error"] {
+  width: min(320px, 100%);
+  min-height: 120px;
+  background:
+    linear-gradient(
+      135deg,
+      color-mix(in srgb, var(--panel-bg) 80%, transparent),
+      color-mix(in srgb, var(--hover-bg) 58%, transparent)
+    );
+}
+
+.markdown-body .md-image-preview {
+  display: block;
+  max-width: min(720px, 100%);
+  max-height: 420px;
+  object-fit: contain;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+}
+
+.markdown-body .md-image-preview[data-md-image-state="pending"],
+.markdown-body .md-image-preview[data-md-image-state="loading"],
+.markdown-body .md-image-preview[data-md-image-state="error"] {
+  width: 100%;
+  min-height: 110px;
+  cursor: default;
 }
 
 .markdown-body strong {
