@@ -28,6 +28,7 @@ const props = withDefaults(defineProps<{
 
 const emit = defineEmits<{
   "update:modelValue": [value: string];
+  open: [];
 }>();
 
 const open = ref(false);
@@ -103,8 +104,12 @@ function moveActive(step: 1 | -1) {
 }
 
 function openMenu() {
+  const wasOpen = open.value;
   open.value = true;
   activeIndex.value = selectedEnabledIndex();
+  if (!wasOpen) {
+    emit("open");
+  }
 }
 
 function onKeydown(event: KeyboardEvent) {

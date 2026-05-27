@@ -430,6 +430,68 @@ describe("useAppBootstrap onboarding completion", () => {
     cleanup();
   });
 
+  it("reloads skills when knowledge changes can affect slash commands", async () => {
+    projectStoreMock.workingDir = "F:/Project";
+    const eventModule = await import("@tauri-apps/api/event");
+    const listenMock = eventModule.listen as unknown as ReturnType<typeof vi.fn>;
+    const handlers = new Map<string, (event: { payload: any }) => void>();
+
+    listenMock.mockImplementation(
+      async (name: string, handler: (event: { payload: any }) => void) => {
+        handlers.set(name, handler);
+        return vi.fn();
+      },
+    );
+
+    const useAppBootstrap = await loadUseAppBootstrap();
+    const { registerListeners } = useAppBootstrap();
+    await registerListeners();
+    loadSkillsMock.mockClear();
+
+    const knowledgeChangedHandler = handlers.get("knowledge-changed");
+    expect(knowledgeChangedHandler).toBeTypeOf("function");
+
+    knowledgeChangedHandler?.({
+      payload: {
+        workingDir: "F:/Project",
+        source: "create_skill_scaffold",
+        changedAt: 1,
+      },
+    });
+    expect(loadSkillsMock).toHaveBeenCalledTimes(1);
+
+    knowledgeChangedHandler?.({
+      payload: {
+        workingDir: "F:/Other",
+        source: "delete_skill_package",
+        changedAt: 2,
+      },
+    });
+    expect(loadSkillsMock).toHaveBeenCalledTimes(1);
+
+    knowledgeChangedHandler?.({
+      payload: {
+        workingDir: "F:/Project",
+        source: "knowledge_edit",
+        changedAt: 3,
+        docType: "reference",
+      },
+    });
+    expect(loadSkillsMock).toHaveBeenCalledTimes(1);
+
+    knowledgeChangedHandler?.({
+      payload: {
+        workingDir: "F:/Project",
+        source: "knowledge_fs_watcher",
+        changedAt: 4,
+        docType: "skill",
+        targetKind: "document",
+        changeKind: "structure",
+      },
+    });
+    expect(loadSkillsMock).toHaveBeenCalledTimes(2);
+  });
+
   it("dispatches system notifications only after the chat store accepts a stream event", async () => {
     const eventModule = await import("@tauri-apps/api/event");
     const listenMock = eventModule.listen as unknown as ReturnType<typeof vi.fn>;

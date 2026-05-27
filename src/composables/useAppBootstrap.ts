@@ -41,6 +41,7 @@ import type {
   UnityConnectionStatus,
   AppErrorPayload,
   LexicalRebuildStatus,
+  KnowledgeChangedEvent,
 } from "../types";
 import { filterVisibleProviders } from "../config/providerVisibility";
 import { t } from "../i18n";
@@ -103,6 +104,7 @@ export function useAppBootstrap() {
   let unlistenActiveSessionSelection: RuntimeUnsubscribe | null = null;
   let unlistenAppError: RuntimeUnsubscribe | null = null;
   let unlistenLexicalRebuildStatus: RuntimeUnsubscribe | null = null;
+  let unlistenKnowledgeChanged: RuntimeUnsubscribe | null = null;
   let lastAutoOpenedLexicalProgressRun = "";
 
   // -- Cross-domain watchers --
@@ -120,6 +122,39 @@ export function useAppBootstrap() {
     }
     const agent = agentStore.agents.find((a) => a.id === agentId);
     modelStore.applyContextEffort(agent?.defaultEffort ?? "none");
+  }
+
+  function normalizeKnowledgeEventWorkspace(path: string | null | undefined): string {
+    return (path ?? "").trim().replace(/\\/g, "/").replace(/\/+$/g, "").toLowerCase();
+  }
+
+  function knowledgeChangeBelongsToCurrentWorkspace(change: KnowledgeChangedEvent): boolean {
+    const eventWorkspace = normalizeKnowledgeEventWorkspace(change.workingDir);
+    const currentWorkspace = normalizeKnowledgeEventWorkspace(projectStore.workingDir);
+    return !!eventWorkspace && eventWorkspace === currentWorkspace;
+  }
+
+  function knowledgeChangeMayAffectSkills(change: KnowledgeChangedEvent): boolean {
+    if (change.docType === "skill") return true;
+
+    const source = (change.source ?? "").trim();
+    return !change.docType && (
+      source === "agent_knowledge_tool" ||
+      source === "create_skill_scaffold" ||
+      source === "delete_skill_package" ||
+      source === "import_skill_package" ||
+      source === "knowledge_create" ||
+      source === "knowledge_edit" ||
+      source === "knowledge_move" ||
+      source === "knowledge_delete" ||
+      source === "undo_perform"
+    );
+  }
+
+  function handleKnowledgeChanged(change: KnowledgeChangedEvent) {
+    if (!knowledgeChangeBelongsToCurrentWorkspace(change)) return;
+    if (!knowledgeChangeMayAffectSkills(change)) return;
+    void loadSkills();
   }
 
   // active session/agent selection -> current effort, preserving the user's saved default.
@@ -446,6 +481,10 @@ export function useAppBootstrap() {
         void maybeOpenLexicalProgressWindow(status);
       },
     );
+    unlistenKnowledgeChanged = await runtime.subscribe<KnowledgeChangedEvent>(
+      "knowledge-changed",
+      handleKnowledgeChanged,
+    );
     markStartupPhase("register_listeners_subscriptions_ready");
 
     // Initial Unity/AssetDb state
@@ -467,6 +506,7 @@ export function useAppBootstrap() {
     unlistenActiveSessionSelection?.();
     unlistenAppError?.();
     unlistenLexicalRebuildStatus?.();
+    unlistenKnowledgeChanged?.();
     lastAutoOpenedLexicalProgressRun = "";
     resetSystemNotificationState();
     uiStore.cleanup();

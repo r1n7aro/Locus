@@ -33,6 +33,8 @@ const tauriEventMocks = vi.hoisted(() => ({
 const knowledgeMocks = vi.hoisted(() => ({
   createSkillScaffold: vi.fn(),
   deleteSkillPackage: vi.fn(),
+  exportSkillPackage: vi.fn(),
+  importSkillPackage: vi.fn(),
   knowledgeActivateEmbedding: vi.fn(),
   knowledgeCreate: vi.fn(),
   knowledgeDelete: vi.fn(),
@@ -119,6 +121,7 @@ vi.mock("@tauri-apps/api/window", () => ({
 }));
 vi.mock("@tauri-apps/plugin-dialog", () => ({
   open: vi.fn(async () => null),
+  save: vi.fn(async () => null),
 }));
 
 function createUnityReferenceImportStatus(
@@ -2180,6 +2183,7 @@ describe("useKnowledgeState", () => {
     expect(knowledgeMocks.knowledgeCreate).toHaveBeenCalledWith(
       expect.objectContaining({
         kind: "document",
+        path: "新文档.md",
         document: expect.objectContaining({
           title: "新文档",
           body: "",
@@ -2208,6 +2212,7 @@ describe("useKnowledgeState", () => {
       expect.objectContaining({
         kind: "document",
         type: "memory",
+        path: "项目记忆.md",
         document: expect.objectContaining({
           title: "项目记忆",
           body: "",
@@ -2216,6 +2221,38 @@ describe("useKnowledgeState", () => {
           readOnly: false,
           inheritAiConfig: true,
         }),
+      }),
+    );
+  });
+
+  it("appends .md when creating a document from the explorer name", async () => {
+    const state = useKnowledgeState(
+      reactive({
+        workingDir: "F:/repo",
+        selectedModelId: "",
+        modelDefaults: {} as any,
+      }),
+    );
+
+    await state.createDocumentAt("systems", "core-loop");
+
+    expect(knowledgeMocks.knowledgeCreate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kind: "document",
+        type: "design",
+        path: "systems/core-loop.md",
+      }),
+    );
+
+    knowledgeMocks.knowledgeCreate.mockClear();
+
+    await state.createDocumentAt("systems", "combat.md");
+
+    expect(knowledgeMocks.knowledgeCreate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kind: "document",
+        type: "design",
+        path: "systems/combat.md",
       }),
     );
   });

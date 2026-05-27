@@ -40,6 +40,12 @@ export function useCommandRegistry(
         commandType: "undo",
       },
       {
+        name: "/unity-console",
+        description: t("chat.command.unityConsoleDesc"),
+        commandKind: "action",
+        commandType: "unity-console",
+      },
+      {
         name: "/plan",
         description: t("chat.command.planDesc"),
         commandKind: "intent",

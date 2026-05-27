@@ -84,10 +84,18 @@ export interface AssetRefAttachment {
   source?: "unity" | "manual";
 }
 
+export type UnityEditorProcessState = "running" | "not_running" | "unknown";
+
 export interface UnityConnectionStatus {
   connected: boolean;
   editorStatus: string;
   scenePath?: string | null;
+  editorProcessState: UnityEditorProcessState;
+  editorProcessId?: number | null;
+  editorProcessPath?: string | null;
+  editorProjectPath?: string | null;
+  processCheckedAtMs?: number | null;
+  processLastError?: string | null;
   pipeName: string;
   latencyMs?: number | null;
   reconnectAttempts: number;
@@ -440,6 +448,8 @@ export interface AppUpdateDownloadChannel {
   url: string;
 }
 
+export type AppUpdateChannel = "stable" | "experimental";
+
 export interface AppUpdateInstallerDownload {
   id: string;
   label: string;
@@ -480,7 +490,11 @@ export interface AppUpdateInfo {
   currentVersion: string;
   latestVersion: string;
   releasedAt: string;
-  channel: string;
+  channel: AppUpdateChannel;
+  currentChannel: AppUpdateChannel;
+  latestChannel: AppUpdateChannel;
+  currentIsExperimental: boolean;
+  latestIsExperimental: boolean;
   title: string;
   summary: string;
   changelogUrl: string;
@@ -819,6 +833,7 @@ export interface SkillManifest {
   skillSurface: SkillSurface;
   skillDescription: string | null;
   commandTrigger: string;
+  tools?: string[];
   kind?: "document" | "package";
   packageId?: string | null;
   packageVersion?: string | null;
@@ -863,6 +878,13 @@ export interface SkillUnityInstallStatus {
   message?: string | null;
 }
 
+export interface SkillPackageArchiveResult {
+  packageId: string;
+  path: string;
+  fileCount: number;
+  byteSize: number;
+}
+
 export interface SkillCreateInput {
   kind?: "md" | "package";
   name: string;
@@ -875,6 +897,7 @@ export interface SkillCreateInput {
   commandTrigger?: string | null;
   commandEnabled?: boolean;
   modelInvocationEnabled?: boolean;
+  tools?: string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -936,6 +959,7 @@ export interface KnowledgeDocumentSummary {
   skillSurface?: SkillSurface | null;
   commandTrigger?: string | null;
   argumentHint?: string | null;
+  tools?: string[];
   summary?: string | null;
   createdAt: number;
   updatedAt: number;
@@ -1977,6 +2001,7 @@ export interface GitStatusResult {
   blocked?: GitBlockedPath[];
   unmerged: UnmergedFileEntry[];
   operation: MergeOperation | null;
+  warnings?: AppErrorPayload[];
 }
 
 export interface GitStageAllResult {
