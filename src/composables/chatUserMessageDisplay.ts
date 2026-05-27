@@ -10,6 +10,12 @@ const LOCUS_REFERENCES_BLOCK_RE =
 const LOCUS_CONSOLE_BLOCK_RE =
   /(?:^|\r?\n)[ \t]*<locus-console>([\s\S]*?)<\/locus-console>[ \t]*(?:\r?\n)?/gi;
 
+const LOCUS_LOCAL_FILES_BLOCK_RE =
+  /(?:^|\r?\n)[ \t]*<locus-local-files>([\s\S]*?)<\/locus-local-files>[ \t]*(?:\r?\n)?/gi;
+
+const LOCUS_LOCAL_FILE_ENTRY_RE =
+  /^[ \t]*-\s*(file|folder):\s*`([^`\r\n]+)`(?:\s*;\s*type:\s*([^\r\n]+?))?[ \t]*$/gim;
+
 const UNITY_EDITOR_STATUS_CHANGED_PREFIX_RE =
   /^[ \t]*\[Unity Editor Status Changed\][^\r\n]*(?:\r?\n[ \t]*){0,2}/;
 
@@ -19,6 +25,12 @@ export interface UserConsoleEntryDisplay {
   source: string;
   chars: number;
   text: string;
+}
+
+export interface UserLocalFileEntryDisplay {
+  path: string;
+  kind: "file" | "folder";
+  typeLabel: string;
 }
 
 function trimInjectedPadding(text: string) {
@@ -39,6 +51,10 @@ function stripUnityAssetRefBlocks(text: string) {
 
 function stripLocusConsoleBlocks(text: string) {
   return text.replace(LOCUS_CONSOLE_BLOCK_RE, "\n");
+}
+
+function stripLocusLocalFileBlocks(text: string) {
+  return text.replace(LOCUS_LOCAL_FILES_BLOCK_RE, "\n");
 }
 
 function stripKnownLocusPrefixes(text: string) {
@@ -94,13 +110,44 @@ export function userMessageConsoleEntries(content: string): UserConsoleEntryDisp
   return entries;
 }
 
+function parseLocalFileBlock(block: string): UserLocalFileEntryDisplay[] {
+  const entries: UserLocalFileEntryDisplay[] = [];
+  for (const match of block.matchAll(LOCUS_LOCAL_FILE_ENTRY_RE)) {
+    const kind = match[1] === "folder" ? "folder" : "file";
+    const path = (match[2] ?? "").trim();
+    if (!path) continue;
+    entries.push({
+      kind,
+      path,
+      typeLabel: (match[3] ?? "").trim(),
+    });
+  }
+  return entries;
+}
+
+export function userMessageLocalFileEntries(content: string): UserLocalFileEntryDisplay[] {
+  const entries: UserLocalFileEntryDisplay[] = [];
+  for (const match of content.matchAll(LOCUS_LOCAL_FILES_BLOCK_RE)) {
+    entries.push(...parseLocalFileBlock(match[1] ?? ""));
+  }
+  return entries;
+}
+
 export function displayUserMessageContent(content: string) {
   let next = content;
   let previous = "";
 
   while (next !== previous) {
     previous = next;
-    next = stripKnownLocusPrefixes(stripLocusConsoleBlocks(stripUnityAssetRefBlocks(stripSystemReminderBlocks(next))));
+    next = stripKnownLocusPrefixes(
+      stripLocusLocalFileBlocks(
+        stripLocusConsoleBlocks(
+          stripUnityAssetRefBlocks(
+            stripSystemReminderBlocks(next),
+          ),
+        ),
+      ),
+    );
     next = trimInjectedPadding(next);
   }
 

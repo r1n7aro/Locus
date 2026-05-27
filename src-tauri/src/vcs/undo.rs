@@ -91,6 +91,15 @@ fn changed_file_overlaps(
             .unwrap_or(false)
 }
 
+fn is_internal_generated_changed_file(file: &ChangedFile) -> bool {
+    crate::view::is_view_frontend_log_workspace_path(&file.path)
+        || file
+            .old_path
+            .as_deref()
+            .map(crate::view::is_view_frontend_log_workspace_path)
+            .unwrap_or(false)
+}
+
 fn push_changed_file_if_new_target(
     seen: &mut std::collections::HashSet<String>,
     files: &mut Vec<ChangedFile>,
@@ -261,19 +270,24 @@ impl UndoManager {
                         return None;
                     }
                     let status = parts[0].chars().next()?.to_string();
-                    if parts.len() >= 3 {
+                    let file = if parts.len() >= 3 {
                         // Rename: "R100\told_path\tnew_path"
-                        Some(ChangedFile {
+                        ChangedFile {
                             status,
                             path: parts[2].trim().to_string(),
                             old_path: Some(parts[1].trim().to_string()),
-                        })
+                        }
                     } else {
-                        Some(ChangedFile {
+                        ChangedFile {
                             status,
                             path: parts[1].trim().to_string(),
                             old_path: None,
-                        })
+                        }
+                    };
+                    if is_internal_generated_changed_file(&file) {
+                        None
+                    } else {
+                        Some(file)
                     }
                 })
                 .collect();
@@ -629,6 +643,37 @@ mod tests {
         assert_eq!(entries[0].changed_files[0].status, "D");
         assert_eq!(entries[0].changed_files[0].path, "test1.cs");
         assert_eq!(entries[0].changed_files[0].old_path, None);
+
+        std::fs::remove_dir_all(&repo).expect("cleanup temp repo");
+    }
+
+    #[tokio::test]
+    async fn after_round_ignores_view_frontend_log_changes() {
+        if !git_available() {
+            return;
+        }
+
+        let repo = setup_repo("undo-ignore-view-log");
+        let repo_str = repo.to_string_lossy().to_string();
+        let manager = UndoManager::new(GitProvider);
+
+        let round = manager
+            .before_round(&repo_str, "round-view-log")
+            .await
+            .expect("before_round")
+            .expect("checkpoint");
+
+        let log_path =
+            repo.join("Locus/View/ProjectName/material-inspector/.locus/logs/frontend.log");
+        std::fs::create_dir_all(log_path.parent().expect("log parent")).expect("create log parent");
+        write_file(&log_path, "{\"level\":\"warn\"}\n");
+
+        let recorded = manager
+            .after_round("session-a", "msg-a", Some("run-a"), round, false, &repo_str)
+            .await
+            .expect("after_round should succeed");
+        assert!(!recorded);
+        assert!(manager.list_entries("session-a").await.is_empty());
 
         std::fs::remove_dir_all(&repo).expect("cleanup temp repo");
     }

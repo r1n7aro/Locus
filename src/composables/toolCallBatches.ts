@@ -74,6 +74,11 @@ export interface ToolCallInfoRenderSource {
   displayToolCalls?: ToolCallInfo[];
 }
 
+export interface ToolCallDisplayShape {
+  name: string;
+  arguments: string;
+}
+
 interface OrderedToolCallLike {
   order?: number;
   nestedToolCalls?: readonly OrderedToolCallLike[];
@@ -254,15 +259,45 @@ function normalizeToolCallArguments(argumentsText: string): string {
   }
 }
 
+export function resolveToolCallDisplayShape(
+  toolCall: ToolCallDisplayShape,
+): ToolCallDisplayShape {
+  if (toolCall.name !== "tool_call") {
+    return toolCall;
+  }
+  try {
+    const parsed = JSON.parse(toolCall.arguments) as {
+      toolName?: unknown;
+      arguments?: unknown;
+    };
+    const targetName = typeof parsed.toolName === "string" ? parsed.toolName.trim() : "";
+    if (!targetName) {
+      return toolCall;
+    }
+    const targetArguments =
+      parsed.arguments && typeof parsed.arguments === "object" && !Array.isArray(parsed.arguments)
+        ? parsed.arguments
+        : {};
+    return {
+      name: targetName,
+      arguments: stableSerialize(canonicalizeArgumentValue(targetName, targetArguments, true)),
+    };
+  } catch {
+    return toolCall;
+  }
+}
+
 export function getToolCallInfoFingerprint(toolCall: Pick<ToolCallInfo, "name" | "arguments" | "nestedToolCalls">): string {
   const nestedFingerprints = toolCall.nestedToolCalls?.map((nestedToolCall) => getToolCallInfoFingerprint(nestedToolCall)) ?? [];
-  return `${toolCall.name}\u241f${normalizeToolCallArgumentsForTool(toolCall.name, toolCall.arguments)}\u241f${nestedFingerprints.join("\u241e")}`;
+  const display = resolveToolCallDisplayShape(toolCall);
+  return `${display.name}\u241f${normalizeToolCallArgumentsForTool(display.name, display.arguments)}\u241f${nestedFingerprints.join("\u241e")}`;
 }
 
 export function getToolCallDisplayFingerprint(toolCall: Pick<ToolCallDisplay, "name" | "arguments" | "nestedToolCalls">): string {
   const nestedFingerprints =
     toolCall.nestedToolCalls?.map((nestedToolCall) => getToolCallDisplayFingerprint(nestedToolCall)) ?? [];
-  return `${toolCall.name}\u241f${normalizeToolCallArgumentsForTool(toolCall.name, toolCall.arguments)}\u241f${nestedFingerprints.join("\u241e")}`;
+  const display = resolveToolCallDisplayShape(toolCall);
+  return `${display.name}\u241f${normalizeToolCallArgumentsForTool(display.name, display.arguments)}\u241f${nestedFingerprints.join("\u241e")}`;
 }
 
 function normalizeToolCallArgumentsForTool(toolName: string, argumentsText: string): string {
@@ -537,11 +572,12 @@ export function buildMessageToolCall(
     ?? toolCall.serverToolOutput
     ?? toolOutputMap[toolCall.id];
   const images = toolOutputImageMap[toolCall.id];
+  const displayShape = resolveToolCallDisplayShape(toolCall);
 
   const display: ToolCallDisplay = {
     id: toolCall.id,
-    name: toolCall.name,
-    arguments: toolCall.arguments,
+    name: displayShape.name,
+    arguments: displayShape.arguments,
     order: toolCall.order,
     status: inferToolCallStatus(toolCall, output),
     output,

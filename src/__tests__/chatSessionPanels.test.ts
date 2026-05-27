@@ -11,6 +11,7 @@ const sessionServiceMocks = vi.hoisted(() => ({
   cancelChat: vi.fn(),
   deleteSession: vi.fn(),
   forkSession: vi.fn(),
+  forkSessionFromMessage: vi.fn(),
   getActiveSessionSelection: vi.fn(),
   getSessionUsage: vi.fn(),
   getSessionActiveRun: vi.fn(),
@@ -25,12 +26,14 @@ const sessionServiceMocks = vi.hoisted(() => ({
   renameSession: vi.fn(),
   saveActiveSessionSelection: vi.fn(),
   staleKnowledgeProposals: vi.fn(),
+  rollbackSessionToMessage: vi.fn(),
   undoLatestConversationTurn: vi.fn(),
 }));
 
 const undoServiceMocks = vi.hoisted(() => ({
   undoList: vi.fn(),
   undoPerform: vi.fn(),
+  undoPerformToMessage: vi.fn(),
 }));
 
 const displaySettingsState = vi.hoisted(() => ({
@@ -189,6 +192,7 @@ describe("chat session panel state", () => {
     sessionServiceMocks.cancelChat.mockResolvedValue(undefined);
     sessionServiceMocks.deleteSession.mockResolvedValue(undefined);
     sessionServiceMocks.forkSession.mockResolvedValue("s-copy");
+    sessionServiceMocks.forkSessionFromMessage.mockResolvedValue("s-copy");
     sessionServiceMocks.getActiveSessionSelection.mockResolvedValue(null);
     sessionServiceMocks.getSessionUsage.mockImplementation(async () => emptyUsage());
     sessionServiceMocks.getSessionActiveRun.mockResolvedValue(null);
@@ -235,6 +239,9 @@ describe("chat session panel state", () => {
       updatedAt: 2,
     }));
     sessionServiceMocks.renameSession.mockResolvedValue(undefined);
+    sessionServiceMocks.rollbackSessionToMessage.mockImplementation(async (sessionId: string) =>
+      sessionServiceMocks.loadSession(sessionId),
+    );
     sessionServiceMocks.saveActiveSessionSelection.mockResolvedValue(undefined);
     sessionServiceMocks.staleKnowledgeProposals.mockResolvedValue(undefined);
     sessionServiceMocks.undoLatestConversationTurn.mockImplementation(async (sessionId: string) =>
@@ -242,6 +249,7 @@ describe("chat session panel state", () => {
     );
     undoServiceMocks.undoList.mockImplementation(async (sessionId: string) => undoData[sessionId] ?? []);
     undoServiceMocks.undoPerform.mockResolvedValue(undefined);
+    undoServiceMocks.undoPerformToMessage.mockResolvedValue(undefined);
   });
 
   it("keeps historical todos closed on first session switch and allows manual reopen", async () => {
@@ -2092,6 +2100,42 @@ describe("chat session panel state", () => {
     );
   });
 
+  it("forks from a specific message boundary", async () => {
+    const chatStore = useChatStore();
+
+    chatStore.sessions = [
+      {
+        id: "s1",
+        title: "Root session",
+        agentId: null,
+        sessionType: "chat",
+        parentSessionId: null,
+        updatedAt: 1,
+      },
+    ] as any;
+    chatStore.activeSessionId = "s1";
+    sessionServiceMocks.forkSessionFromMessage.mockResolvedValueOnce("s-copy");
+    sessionServiceMocks.listSessions.mockResolvedValueOnce([
+      {
+        id: "s-copy",
+        title: "Root session copy",
+        agentId: null,
+        sessionType: "chat",
+        parentSessionId: null,
+        updatedAt: 2,
+      },
+    ]);
+
+    await chatStore.forkSessionFromMessage("user-2");
+
+    expect(sessionServiceMocks.forkSessionFromMessage).toHaveBeenCalledWith(
+      "s1",
+      "user-2",
+      "Root session",
+    );
+    expect(chatStore.activeSessionId).toBe("s-copy");
+  });
+
   it("blocks child session forks before calling the backend", async () => {
     const chatStore = useChatStore();
 
@@ -2252,6 +2296,92 @@ describe("chat session panel state", () => {
       id: "user-kept",
       content: "保留的上一轮",
     });
+  });
+
+  it("rolls back conversation from an exact message without file undo", async () => {
+    const chatStore = useChatStore();
+
+    const rollbackDetail = {
+      id: "s1",
+      title: "Session s1",
+      messages: [
+        {
+          id: "user-before",
+          role: "user",
+          content: "保留",
+          createdAt: 1,
+        },
+        {
+          id: "user-target",
+          role: "user",
+          content: "选中消息",
+          createdAt: 2,
+        },
+      ],
+      agentId: null,
+      sessionType: "chat",
+      parentSessionId: null,
+      latestCompletedRunId: null,
+      createdAt: 0,
+      updatedAt: 0,
+    };
+    sessionServiceMocks.rollbackSessionToMessage.mockResolvedValueOnce(rollbackDetail);
+    sessionServiceMocks.loadSession.mockResolvedValue(rollbackDetail);
+    undoData.s1 = [];
+
+    await chatStore.selectSession("s1");
+    const result = await chatStore.rollbackToMessage("user-target", { includeFiles: false });
+
+    expect(result).toBe(true);
+    expect(sessionServiceMocks.rollbackSessionToMessage).toHaveBeenCalledWith("s1", "user-target");
+    expect(undoServiceMocks.undoPerformToMessage).not.toHaveBeenCalled();
+    expect(chatStore.messages.map((message) => message.id)).toEqual(["user-before", "user-target"]);
+  });
+
+  it("rolls back files from the requested assistant while preserving the selected message", async () => {
+    const chatStore = useChatStore();
+
+    sessionServiceMocks.loadSession.mockImplementation(async (sessionId: string) => ({
+      id: sessionId,
+      title: "Session s1",
+      messages: [
+        {
+          id: "user-before",
+          role: "user",
+          content: "保留",
+          createdAt: 1,
+        },
+        {
+          id: "user-target",
+          role: "user",
+          content: "选中消息",
+          createdAt: 2,
+        },
+      ],
+      agentId: null,
+      sessionType: "chat",
+      parentSessionId: null,
+      latestCompletedRunId: null,
+      createdAt: 0,
+      updatedAt: 0,
+    }));
+    undoData.s1 = [];
+
+    await chatStore.selectSession("s1");
+    const result = await chatStore.rollbackToMessage("user-target", {
+      includeFiles: true,
+      fileUndoTarget: "assistant-after",
+    });
+
+    expect(result).toBe(true);
+    expect(undoServiceMocks.undoPerformToMessage).toHaveBeenCalledWith(
+      "s1",
+      "assistant-after",
+      "user-target",
+      false,
+    );
+    expect(sessionServiceMocks.rollbackSessionToMessage).not.toHaveBeenCalled();
+    expect(chatStore.messages.map((message) => message.id)).toEqual(["user-before", "user-target"]);
   });
 
   it("returns false when undo fails", async () => {

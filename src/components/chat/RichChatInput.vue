@@ -34,14 +34,21 @@ import {
   type ComposerIntentState,
 } from "../../composables/chatInputIntents";
 import { buildProjectKnowledgeRefPath, extractChatAssetRefs } from "../../composables/chatAssetRefs";
+import {
+  readUserMessageDraftFromClipboardData,
+  type UserMessageDraft,
+} from "../../composables/chatMessageDraft";
 import { rankSearchResults } from "../../composables/searchMatcher";
 import { useCommandRegistry } from "../../composables/useCommandRegistry";
+import { normalizeAppError } from "../../services/errors";
 import {
   shouldSelectPopupOnEnter,
   shouldSubmitOnEnter,
   useChatInputSettings,
 } from "../../composables/useChatInputSettings";
 import {
+  checkUnityConnectionStatus,
+  getUnityConsoleText,
   subscribeLocusFileDrop,
   subscribeUnityEmbedAssetDrop,
   subscribeUnityEmbedTextDrop,
@@ -180,6 +187,7 @@ const assetRefAttachments = ref<AssetRefAttachment[]>([]);
 const showAssetRefDetails = ref(false);
 const consoleTextAttachments = ref<ConsoleTextAttachment[]>([]);
 const showConsoleTextDetails = ref(false);
+const unityConsoleCommandPending = ref(false);
 const localFileAttachments = ref<LocalFileAttachment[]>([]);
 const showLocalFileDetails = ref(false);
 const previewImageIndex = ref<number | null>(null);
@@ -1235,26 +1243,26 @@ function isExternalLocalFile(file: Pick<LocalFileAttachment, "path">) {
 }
 
 function showLocalFileBoundaryWarning() {
-  notificationStore.addNotice("warning", t("chat.fileRefs.boundaryOffWarning"), {
+  notificationStore.addNotice("warning", t("chat.fileRefs.boundaryOnWarning"), {
     operation: LOCAL_FILE_BOUNDARY_WARNING_OPERATION,
     replaceOperation: true,
     ttl: 8000,
   });
 }
 
-async function warnIfFileBoundaryAllowsExternalFiles(files: LocalFileAttachment[]) {
+async function warnIfFileBoundaryBlocksExternalFiles(files: LocalFileAttachment[]) {
   if (!files.some(isExternalLocalFile)) return;
 
   const cachedBoundary = getCachedFileToolWorkspaceBoundary();
-  if (cachedBoundary === false) {
+  if (cachedBoundary === true) {
     showLocalFileBoundaryWarning();
     return;
   }
-  if (cachedBoundary === true) return;
+  if (cachedBoundary === false) return;
 
   try {
     const boundaryEnabled = await getFileToolWorkspaceBoundary();
-    if (!boundaryEnabled) {
+    if (boundaryEnabled) {
       showLocalFileBoundaryWarning();
     }
   } catch {
@@ -1274,7 +1282,7 @@ function addLocalFileAttachments(files: LocusFileDropRef[]) {
   if (!shouldGroupLocalFiles.value) {
     closeLocalFileDetails();
   }
-  void warnIfFileBoundaryAllowsExternalFiles(normalized);
+  void warnIfFileBoundaryBlocksExternalFiles(normalized);
   nextTick(() => composerRef.value?.focus());
 }
 
@@ -1434,8 +1442,106 @@ async function applyPrefill(text: string) {
   syncOperatorState();
 }
 
+function appendDraftText(text: string) {
+  if (!text) {
+    return props.modelValue.length;
+  }
+  const textarea = getComposerTextarea();
+  const current = props.modelValue;
+  const start = textarea?.selectionStart ?? current.length;
+  const end = textarea?.selectionEnd ?? start;
+  const nextText = `${current.slice(0, start)}${text}${current.slice(end)}`;
+  setInputValue(nextText);
+  return start + text.length;
+}
+
+async function applyUserMessageDraft(draft: UserMessageDraft) {
+  const cursor = appendDraftText(draft.text);
+  const remainingImageSlots = Math.max(0, props.maxImages - imageAttachments.value.length);
+  if (remainingImageSlots > 0) {
+    imageAttachments.value.push(
+      ...draft.images.slice(0, remainingImageSlots).map((image) => ({
+        data: image.data,
+        mimeType: image.mimeType,
+      })),
+    );
+  }
+
+  setAssetRefAttachments([...assetRefAttachments.value, ...draft.assetRefs]);
+  const consoleTexts = draft.consoleTexts
+    .map((entry) => normalizeConsoleTextAttachment(entry))
+    .filter((entry): entry is ConsoleTextAttachment => !!entry);
+  if (consoleTexts.length > 0) {
+    consoleTextAttachments.value.push(...consoleTexts);
+  }
+
+  addLocalFileAttachments(draft.localFiles);
+  composerIntent.value = mergeComposerIntent(composerIntent.value, draft.intent);
+  await nextTick();
+  autoResizeTextarea();
+  focusComposerSelection(cursor);
+  syncOperatorState();
+}
+
 function showUserIntentMissingInputNotice() {
   notificationStore.addNotice("error", t("chat.operator.intentNeedsInput"), { operation: "chatIntent" });
+}
+
+function hasUnityConsolePayloadText(payload: {
+  text?: string | null;
+  entries?: UnityEmbedTextDropEntry[] | null;
+}) {
+  if ((payload.text ?? "").trim()) return true;
+  return (payload.entries ?? []).some((entry) => (entry.text ?? "").trim());
+}
+
+function clearActionCommandInput() {
+  setInputValue("");
+  activeOperator.value = null;
+  dismissedOperatorKey.value = null;
+  showCommandPopup.value = false;
+  nextTick(() => {
+    autoResizeTextarea();
+    composerRef.value?.focus();
+  });
+}
+
+async function attachUnityConsoleFromCommand() {
+  if (unityConsoleCommandPending.value) return;
+
+  unityConsoleCommandPending.value = true;
+  try {
+    const status = await checkUnityConnectionStatus();
+    if (!status.connected) {
+      notificationStore.addNotice("error", t("chat.command.unityConsoleDisconnected"), {
+        operation: "unityConsoleCommand",
+        replaceOperation: true,
+      });
+      return;
+    }
+
+    const payload = await getUnityConsoleText();
+    if (!hasUnityConsolePayloadText(payload)) {
+      clearActionCommandInput();
+      notificationStore.addNotice("warning", t("chat.command.unityConsoleEmpty"), {
+        operation: "unityConsoleCommand",
+        replaceOperation: true,
+      });
+      return;
+    }
+
+    clearActionCommandInput();
+    addConsoleTextAttachment(payload);
+  } catch (error) {
+    const normalized = normalizeAppError(error);
+    notificationStore.addNotice("error", t("chat.command.unityConsoleFailed", normalized.message), {
+      code: normalized.code,
+      operation: "unityConsoleCommand",
+      replaceOperation: true,
+    });
+  } finally {
+    unityConsoleCommandPending.value = false;
+  }
 }
 
 function buildSendPayload(
@@ -1456,7 +1562,8 @@ function buildSendPayload(
 }
 
 function canExecuteActionCommand(): boolean {
-  return !pastedContent.value
+  return !unityConsoleCommandPending.value
+    && !pastedContent.value
     && imageAttachments.value.length === 0
     && assetRefAttachments.value.length === 0
     && consoleTextAttachments.value.length === 0
@@ -1491,6 +1598,11 @@ function executeActionCommand(command: CommandDef): boolean {
     return true;
   }
 
+  if (command.commandType === "unity-console") {
+    void attachUnityConsoleFromCommand();
+    return true;
+  }
+
   return false;
 }
 
@@ -1505,6 +1617,10 @@ function tryHandleExactActionCommand(): boolean {
 }
 
 function handleSend() {
+  if (unityConsoleCommandPending.value) {
+    return;
+  }
+
   if (!props.isStreaming && tryHandleExactActionCommand()) {
     return;
   }
@@ -1668,6 +1784,13 @@ function handleTextareaKeyup(event: KeyboardEvent) {
 }
 
 function handlePaste(event: ClipboardEvent) {
+  const draft = readUserMessageDraftFromClipboardData(event.clipboardData);
+  if (draft) {
+    event.preventDefault();
+    void applyUserMessageDraft(draft);
+    return;
+  }
+
   const items = event.clipboardData?.items;
   if (props.allowImages && items) {
     for (let index = 0; index < items.length; index += 1) {

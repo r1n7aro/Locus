@@ -105,6 +105,18 @@ export function forkSession(sessionId: string, title?: string | null): Promise<s
   return ipcInvoke<string>("fork_session", { sessionId, title: title ?? null });
 }
 
+export function forkSessionFromMessage(
+  sessionId: string,
+  messageId: string,
+  title?: string | null,
+): Promise<string> {
+  return ipcInvoke<string>("fork_session_from_message", {
+    sessionId,
+    messageId,
+    title: title ?? null,
+  });
+}
+
 export function listSessions(): Promise<SessionSummary[]> {
   return ipcInvoke<SessionSummary[]>("list_sessions");
 }
@@ -143,6 +155,13 @@ export function deleteSession(sessionId: string): Promise<void> {
 
 export function undoLatestConversationTurn(sessionId: string): Promise<SessionDetail> {
   return ipcInvoke<SessionDetail>("undo_latest_conversation_turn", { sessionId });
+}
+
+export function rollbackSessionToMessage(
+  sessionId: string,
+  messageId: string,
+): Promise<SessionDetail> {
+  return ipcInvoke<SessionDetail>("rollback_session_to_message", { sessionId, messageId });
 }
 
 export function getSessionUsage(sessionId: string): Promise<TokenUsage> {

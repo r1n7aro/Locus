@@ -1,5 +1,6 @@
 import { hydrateChatMessageIntent, parseUserIntentMeta } from "./chatInputIntents";
 import { sortedAssistantRenderParts } from "./assistantRenderParts";
+import { resolveToolCallDisplayShape } from "./toolCallBatches";
 import type { StreamEvent, ChatMessage, TokenUsage, TodoItem, ToolCallDisplay, ToolCallInfo, PendingQuestion, PendingToolConfirm, ImageAttachment, AssetRefAttachment, ToolCallProgress, AssistantRenderPart } from "../types";
 
 export interface StreamState {
@@ -455,6 +456,12 @@ export function reduceStreamEvent(state: StreamState, event: StreamEvent): Strea
       const legacyOrder = markToolOrder(existing, event.order);
       const liveOrder = liveOrderFromEvent(event, legacyOrder, event.toolCallId);
       const currentPart = existingLivePart(state, "toolCall", liveOrder.id);
+      const rawName = event.toolName || currentPart?.toolCall.name || existing?.name || "";
+      const rawArguments = event.arguments || currentPart?.toolCall.arguments || existing?.arguments || "";
+      const displayShape = resolveToolCallDisplayShape({
+        name: rawName,
+        arguments: rawArguments,
+      });
       mutations.push({
         type: "upsertLiveRenderPart",
         part: {
@@ -464,23 +471,23 @@ export function reduceStreamEvent(state: StreamState, event: StreamEvent): Strea
           toolCall: {
             ...(currentPart?.toolCall ?? {
               id: event.toolCallId,
-              name: event.toolName,
+              name: displayShape.name,
               arguments: "",
             }),
             id: event.toolCallId,
-            name: event.toolName,
-            arguments: event.arguments || currentPart?.toolCall.arguments || "",
+            name: displayShape.name,
+            arguments: displayShape.arguments,
             order: liveOrder.order.seq,
           },
         },
       });
       if (existing) {
         const updates: Partial<ToolCallDisplay> = {};
-        if (event.toolName && event.toolName !== existing.name) {
-          updates.name = event.toolName;
+        if (displayShape.name && displayShape.name !== existing.name) {
+          updates.name = displayShape.name;
         }
-        if (event.arguments) {
-          updates.arguments = event.arguments;
+        if (displayShape.arguments && displayShape.arguments !== existing.arguments) {
+          updates.arguments = displayShape.arguments;
         }
         if (!existing.order || existing.order <= 0 || existing.order !== liveOrder.order.seq) {
           updates.order = liveOrder.order.seq;
@@ -491,7 +498,13 @@ export function reduceStreamEvent(state: StreamState, event: StreamEvent): Strea
       } else {
         mutations.push({
           type: "addToolCall",
-          toolCall: { id: event.toolCallId, name: event.toolName, arguments: event.arguments, status: "running", order: liveOrder.order.seq },
+          toolCall: {
+            id: event.toolCallId,
+            name: displayShape.name,
+            arguments: displayShape.arguments,
+            status: "running",
+            order: liveOrder.order.seq,
+          },
         });
       }
       break;
@@ -551,16 +564,35 @@ export function reduceStreamEvent(state: StreamState, event: StreamEvent): Strea
       const parentTc = state.activeToolCalls.find((t) => t.id === event.parentToolCallId);
       if (parentTc) {
         const existingNested = parentTc.nestedToolCalls?.find((t) => t.id === event.toolCallId);
+        const rawName = event.toolName || existingNested?.name || "";
+        const rawArguments = event.arguments || existingNested?.arguments || "";
+        const displayShape = resolveToolCallDisplayShape({
+          name: rawName,
+          arguments: rawArguments,
+        });
         if (existingNested) {
-          if (event.arguments) {
-            mutations.push({ type: "updateNestedToolCall", parentId: event.parentToolCallId, childId: event.toolCallId, updates: { arguments: event.arguments } });
+          const updates: Partial<ToolCallDisplay> = {};
+          if (displayShape.name && displayShape.name !== existingNested.name) {
+            updates.name = displayShape.name;
+          }
+          if (displayShape.arguments && displayShape.arguments !== existingNested.arguments) {
+            updates.arguments = displayShape.arguments;
+          }
+          if (Object.keys(updates).length > 0) {
+            mutations.push({ type: "updateNestedToolCall", parentId: event.parentToolCallId, childId: event.toolCallId, updates });
           }
         } else {
           const order = markToolOrder(undefined, event.order);
           mutations.push({
             type: "addNestedToolCall",
             parentId: event.parentToolCallId,
-            toolCall: { id: event.toolCallId, name: event.toolName, arguments: event.arguments, status: "running", order },
+            toolCall: {
+              id: event.toolCallId,
+              name: displayShape.name,
+              arguments: displayShape.arguments,
+              status: "running",
+              order,
+            },
           });
         }
       }

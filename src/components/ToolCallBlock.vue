@@ -14,7 +14,10 @@ import { resolveToolBlockOverride } from "./tool-block-overrides/toolBlockOverri
 import { buildToolCallArgsSummary } from "./toolCallSummary";
 import { persistedOutputDisplay } from "./toolPersistedOutput";
 import { agentGraphToolReopen } from "../services/agentGraphTool";
+import { normalizeViewError, viewRun } from "../services/view";
+import { useNotificationStore } from "../stores/notification";
 import { traceToolBlockLayoutChange } from "../services/layoutDiagnostics";
+import { resolveViewToolOpenId } from "./viewToolCallActions";
 
 import type { ToolCallDisplay, FileDiffPayload } from "../types";
 
@@ -39,9 +42,11 @@ function shouldAutoExpandSubagentTool(toolCall: ToolCallDisplay) {
 
 const expanded = ref(shouldAutoExpandSubagentTool(props.toolCall));
 const openingGraphView = ref(false);
+const openingViewTool = ref(false);
 const rootRef = ref<HTMLElement | null>(null);
 const headerRef = ref<HTMLElement | null>(null);
 const outputPre = ref<HTMLPreElement | null>(null);
+const notificationStore = useNotificationStore();
 
 watch(
   () => [props.toolCall.output, props.toolCall.nestedToolCalls?.length],
@@ -179,6 +184,15 @@ const isEditTool = computed(() => props.toolCall.name === "edit");
 const showGraphViewOpenButton = computed(() =>
   props.toolCall.name === "graph_view" && props.toolCall.status !== "running",
 );
+const viewToolOpenId = computed(() =>
+  resolveViewToolOpenId({
+    name: props.toolCall.name,
+    arguments: props.toolCall.arguments,
+    output: props.toolCall.output,
+    status: props.toolCall.status,
+  }),
+);
+const showViewOpenButton = computed(() => viewToolOpenId.value.length > 0);
 const GRAPH_VIEW_HIDDEN_ARG_KEYS = new Set(["description"]);
 
 interface EditDiffItem {
@@ -355,6 +369,25 @@ async function reopenGraphView() {
   }
 }
 
+async function openViewTool() {
+  if (openingViewTool.value) return;
+  const viewId = viewToolOpenId.value;
+  if (!viewId) return;
+  openingViewTool.value = true;
+  try {
+    await viewRun(viewId);
+  } catch (error) {
+    const err = normalizeViewError(error);
+    notificationStore.addNotice("error", err.message, {
+      code: err.code,
+      operation: "viewRunFromToolCall",
+      replaceOperation: true,
+    });
+  } finally {
+    openingViewTool.value = false;
+  }
+}
+
 function getFilePath(): string {
   try {
     const args = JSON.parse(props.toolCall.arguments);
@@ -448,6 +481,18 @@ const highlightedOutput = computed(() => {
       >
         <LucideIcon :icon="PanelTopOpen" :size="13" />
         <span>{{ t("tool.graphView.open") }}</span>
+      </button>
+      <button
+        v-if="showViewOpenButton"
+        type="button"
+        class="tool-call-action-button"
+        :title="t('tool.view.open')"
+        :aria-label="t('tool.view.open')"
+        :disabled="openingViewTool"
+        @click.stop="openViewTool"
+      >
+        <LucideIcon :icon="PanelTopOpen" :size="13" />
+        <span>{{ t("tool.view.open") }}</span>
       </button>
     </div>
     <div v-if="showRecompileHint" class="recompile-hint">

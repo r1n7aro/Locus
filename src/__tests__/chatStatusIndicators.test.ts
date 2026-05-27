@@ -53,11 +53,17 @@ describe("chat status indicators", () => {
     expect(indicators).toContain('return `\\\\\\\\.\\\\pipe\\\\locus_unity_${sanitized}`;');
     expect(indicators).toContain('label: t("chat.status.unity.pipe")');
     expect(indicators).toContain('label: t("chat.status.unity.workingDir")');
+    expect(indicators).toContain('label: t("chat.status.unity.process")');
+    expect(indicators).toContain('label: t("chat.status.unity.processId")');
+    expect(indicators).toContain('label: t("chat.status.unity.editorProjectPath")');
     expect(indicators).toContain('label: t("chat.status.unity.lastError")');
+    expect(indicators).toContain('label: t("chat.status.unity.processLastError")');
     expect(indicators).toContain('label: t("chat.status.unity.reconnectAttempts")');
     expect(indicators).toContain(':class="{ \'is-mono\': row.mono }"');
     expect(zh).toContain('"chat.status.unity.pipe": "管道"');
     expect(zh).toContain('"chat.status.unity.workingDir": "工作目录"');
+    expect(zh).toContain('"chat.status.unity.process": "进程"');
+    expect(zh).toContain('"chat.unity.runningDisconnected": "Unity编辑器已打开，等待连接"');
     expect(zh).toContain('"chat.status.unity.lastError": "最后错误"');
   });
 
@@ -111,6 +117,7 @@ describe("chat status indicators", () => {
     expect(indicators).toContain('&& !props.unityConnected');
     expect(indicators).toContain('&& !props.unityPluginStatus');
     expect(indicators).toContain('&& !unityRecompileWaitingConnection.value');
+    expect(indicators).toContain('&& unityEditorProcessState.value !== "running"');
     expect(indicators).toContain('const effectiveUnityLaunchState = computed<UnityLaunchState>(() =>');
     expect(indicators).toContain('if (effectiveUnityLaunchState.value === "starting") return t("chat.unity.launching");');
     expect(indicators).toContain('return t("chat.status.unity.waitingConnection");');
@@ -144,7 +151,8 @@ describe("chat status indicators", () => {
     expect(chatView).toContain("const unityRecompileActive = computed(() => hasRunningUnityRecompile(props.activeToolCalls));");
     expect(indicators).toContain("const unityRecompileWaitingConnection = computed(() =>");
     expect(indicators).toContain('if (unityRecompileWaitingConnection.value) return t("chat.unity.waitingRecompileConnection");');
-    expect(indicators).toContain('unityRecompileWaitingConnection.value || effectiveUnityLaunchState.value !== "idle"');
+    expect(indicators).toContain('|| unityRecompileWaitingConnection.value');
+    expect(indicators).toContain('|| effectiveUnityLaunchState.value !== "idle"');
     expect(zh).toContain('"chat.unity.waitingRecompileConnection": "Unity 重编译中，等待重连"');
     expect(en).toContain('"chat.unity.waitingRecompileConnection": "Unity recompiling, waiting for reconnect"');
   });

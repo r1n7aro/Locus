@@ -9,7 +9,7 @@ function read(relPath: string) {
 }
 
 describe("RichChatInput external file boundary warning", () => {
-  it("shows a global warning when external file refs are added while the file boundary is off", () => {
+  it("shows a global warning when external file refs are added while the file boundary is on", () => {
     const richInput = read("src/components/chat/RichChatInput.vue");
     const zh = read("src/language/zh.json");
     const en = read("src/language/en.json");
@@ -21,11 +21,14 @@ describe("RichChatInput external file boundary warning", () => {
     expect(richInput).toContain("function isPathInsideWorkspace");
     expect(richInput).toContain("function isExternalLocalFile");
     expect(richInput).toContain("function showLocalFileBoundaryWarning");
-    expect(richInput).toContain("function warnIfFileBoundaryAllowsExternalFiles");
-    expect(richInput).toContain("notificationStore.addNotice(\"warning\", t(\"chat.fileRefs.boundaryOffWarning\")");
+    expect(richInput).toContain("function warnIfFileBoundaryBlocksExternalFiles");
+    expect(richInput).toContain("if (cachedBoundary === true)");
+    expect(richInput).toContain("if (cachedBoundary === false) return;");
+    expect(richInput).toContain("if (boundaryEnabled) {");
+    expect(richInput).toContain("notificationStore.addNotice(\"warning\", t(\"chat.fileRefs.boundaryOnWarning\")");
     expect(richInput).toContain("replaceOperation: true");
-    expect(richInput).toContain("void warnIfFileBoundaryAllowsExternalFiles(normalized);");
-    expect(zh).toContain('"chat.fileRefs.boundaryOffWarning"');
-    expect(en).toContain('"chat.fileRefs.boundaryOffWarning"');
+    expect(richInput).toContain("void warnIfFileBoundaryBlocksExternalFiles(normalized);");
+    expect(zh).toContain('"chat.fileRefs.boundaryOnWarning"');
+    expect(en).toContain('"chat.fileRefs.boundaryOnWarning"');
   });
 });

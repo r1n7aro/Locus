@@ -276,6 +276,28 @@ describe("reduceStreamEvent", () => {
       }
     });
 
+    it("renders meta tool_call starts as the target tool", () => {
+      const state = makeState({ isStreaming: true });
+      const event: StreamEvent = { runId: "test-run",
+        type: "toolCallStart",
+        sessionId: "s1",
+        toolCallId: "tc1",
+        toolName: "tool_call",
+        arguments: JSON.stringify({
+          toolName: "web_fetch",
+          arguments: { url: "https://example.com" },
+        }),
+      };
+      const mutations = reduceStreamEvent(state, event);
+
+      const addMut = mutations.find((m) => m.type === "addToolCall");
+      expect(addMut).toBeDefined();
+      if (addMut?.type === "addToolCall") {
+        expect(addMut.toolCall.name).toBe("web_fetch");
+        expect(addMut.toolCall.arguments).toBe("{\"url\":\"https://example.com\"}");
+      }
+    });
+
     it("closes active thinking before adding a tool call", () => {
       const state = makeState({ isStreaming: true, isThinking: true, thinkingStartTime: Date.now() - 4000 });
       const event: StreamEvent = { runId: "test-run",
@@ -672,6 +694,30 @@ describe("reduceStreamEvent", () => {
       if (addMut?.type === "addNestedToolCall") {
         expect(addMut.parentId).toBe("p1");
         expect(addMut.toolCall.id).toBe("c1");
+      }
+    });
+
+    it("renders nested meta tool_call starts as the target tool", () => {
+      const parent: ToolCallDisplay = { id: "p1", name: "task", arguments: "{}", status: "running", nestedToolCalls: [] };
+      const state = makeState({ isStreaming: true, activeToolCalls: [parent] });
+      const event: StreamEvent = { runId: "test-run",
+        type: "subagentToolCallStart",
+        sessionId: "s1",
+        parentToolCallId: "p1",
+        toolCallId: "c1",
+        toolName: "tool_call",
+        arguments: JSON.stringify({
+          toolName: "web_fetch",
+          arguments: { url: "https://example.com" },
+        }),
+      };
+      const mutations = reduceStreamEvent(state, event);
+
+      const addMut = mutations.find((m) => m.type === "addNestedToolCall");
+      expect(addMut).toBeDefined();
+      if (addMut?.type === "addNestedToolCall") {
+        expect(addMut.toolCall.name).toBe("web_fetch");
+        expect(addMut.toolCall.arguments).toBe("{\"url\":\"https://example.com\"}");
       }
     });
 

@@ -18,6 +18,7 @@ import type {
   LexicalRebuildStatus,
   ScanStats,
   UnityConnectionStatus,
+  UnityEditorProcessState,
 } from "../../types";
 import BaseButton from "../ui/BaseButton.vue";
 import BaseSegmented, { type SegmentedOption } from "../ui/BaseSegmented.vue";
@@ -147,9 +148,20 @@ const unityEditorStatus = computed(() =>
   props.unityConnectionStatus?.editorStatus || (props.unityConnected ? "editing" : "disconnected"),
 );
 
+const unityEditorProcessState = computed<UnityEditorProcessState>(() =>
+  props.unityConnectionStatus?.editorProcessState ?? (props.unityConnected ? "running" : "unknown"),
+);
+
 function unityEditorStatusLabel(status: string) {
   const normalized = status || "disconnected";
   const key = `chat.toolConfirm.unityStatus.status.${normalized}`;
+  const label = t(key);
+  return label === key ? normalized : label;
+}
+
+function unityEditorProcessStateLabel(status: string | null | undefined) {
+  const normalized = status || "unknown";
+  const key = `chat.status.unity.processState.${normalized}`;
   const label = t(key);
   return label === key ? normalized : label;
 }
@@ -268,6 +280,9 @@ const unitySummary = computed(() => {
   if (unityRecompileWaitingConnection.value) return t("chat.unity.waitingRecompileConnection");
   if (effectiveUnityLaunchState.value === "starting") return t("chat.unity.launching");
   if (effectiveUnityLaunchState.value === "waitingConnection") return t("chat.unity.waitingConnection");
+  if (!props.unityConnected && unityEditorProcessState.value === "running") {
+    return t("chat.unity.runningDisconnected");
+  }
   return props.unityConnected ? t("chat.unity.connected") : t("chat.unity.disconnected");
 });
 
@@ -276,7 +291,9 @@ const unityTone = computed<StatusTone>(() =>
     ? "danger"
     : props.unityConnected
       ? "success"
-      : unityRecompileWaitingConnection.value || effectiveUnityLaunchState.value !== "idle"
+      : unityEditorProcessState.value === "running"
+        || unityRecompileWaitingConnection.value
+        || effectiveUnityLaunchState.value !== "idle"
         ? "accent"
         : "danger",
 );
@@ -285,7 +302,8 @@ const unityCanLaunch = computed(() =>
   !!props.isUnityProject
   && !props.unityConnected
   && !props.unityPluginStatus
-  && !unityRecompileWaitingConnection.value,
+  && !unityRecompileWaitingConnection.value
+  && unityEditorProcessState.value !== "running",
 );
 
 const unityActionLabel = computed(() => {
@@ -420,6 +438,34 @@ const unityRows = computed<StatusDetailRow[]>(() => {
     value: unityEditorStatusLabel(unityEditorStatus.value),
   });
 
+  rows.push({
+    label: t("chat.status.unity.process"),
+    value: unityEditorProcessStateLabel(unityEditorProcessState.value),
+  });
+
+  if (typeof status?.editorProcessId === "number") {
+    rows.push({
+      label: t("chat.status.unity.processId"),
+      value: String(status.editorProcessId),
+    });
+  }
+
+  if (status?.editorProjectPath) {
+    rows.push({
+      label: t("chat.status.unity.editorProjectPath"),
+      value: status.editorProjectPath,
+      mono: true,
+    });
+  }
+
+  if (status?.editorProcessPath) {
+    rows.push({
+      label: t("chat.status.unity.editorProcessPath"),
+      value: status.editorProcessPath,
+      mono: true,
+    });
+  }
+
   if (status?.scenePath) {
     rows.push({
       label: t("chat.status.unity.scene"),
@@ -445,6 +491,16 @@ const unityRows = computed<StatusDetailRow[]>(() => {
     }
   }
 
+  if (status?.processCheckedAtMs) {
+    const checkedAt = formatTimestamp(status.processCheckedAtMs);
+    if (checkedAt) {
+      rows.push({
+        label: t("chat.status.unity.processCheckedAt"),
+        value: checkedAt,
+      });
+    }
+  }
+
   if (!props.unityConnected && (status?.reconnectAttempts ?? 0) > 0) {
     rows.push({
       label: t("chat.status.unity.reconnectAttempts"),
@@ -456,6 +512,14 @@ const unityRows = computed<StatusDetailRow[]>(() => {
     rows.push({
       label: t("chat.status.unity.lastError"),
       value: status.lastError,
+      mono: true,
+    });
+  }
+
+  if (status?.processLastError) {
+    rows.push({
+      label: t("chat.status.unity.processLastError"),
+      value: status.processLastError,
       mono: true,
     });
   }

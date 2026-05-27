@@ -339,6 +339,7 @@ fn apply_knowledge_target(
                 skill_surface: None,
                 command_trigger: None,
                 argument_hint: None,
+                tools: Vec::new(),
                 summary: None,
                 body: draft.to_string(),
                 maintenance_rules: None,
@@ -428,6 +429,49 @@ pub async fn get_agent_env_template(
         Some(def) => Ok(def.env_template.clone()),
         None => Err(format!("Agent '{}' not found", agent_id).into()),
     }
+}
+
+#[tauri::command]
+pub async fn get_agent_rendered_env_prompt(
+    agent_id: String,
+    registry: State<'_, Arc<AgentDefRegistry>>,
+    tool_registry: State<'_, Arc<ToolRegistry>>,
+    workspace: State<'_, Arc<Workspace>>,
+    raw_store: State<'_, RawContextStore>,
+    app_knowledge_dir: State<'_, crate::commands::AppKnowledgeDir>,
+    app_agent_dir: State<'_, crate::AppAgentDir>,
+) -> Result<String, AppError> {
+    let def = registry
+        .get(&agent_id)
+        .ok_or_else(|| format!("Agent '{}' not found", agent_id))?;
+    let working_dir = workspace.path.read().await.clone();
+    let workspace_id = if working_dir.trim().is_empty() {
+        None
+    } else {
+        workspace.workspace_id.read().await.clone()
+    };
+
+    let instance = AgentInstance::new(
+        Arc::new(def.clone()),
+        "__agent-preview__",
+        LlmBackend::AnthropicAgentSdk,
+        false,
+        registry.inner().clone(),
+        tool_registry.inner().clone(),
+        working_dir,
+        raw_store.inner().clone(),
+        workspace_id,
+        "__agent-preview__".to_string(),
+        None,
+        app_knowledge_dir.0.clone(),
+        app_agent_dir.0.clone(),
+        KnowledgeAccessMode::Full,
+        None,
+        HashMap::new(),
+        tokio::sync::watch::channel(false).1,
+    );
+
+    Ok(instance.rendered_env_prompt().await)
 }
 
 #[tauri::command]
@@ -530,7 +574,6 @@ async fn resolve_model_backend(
                 .unwrap_or(crate::commands::CustomReasoningParamFormat::OpenaiChatReasoningEffort),
             replay_reasoning_content: endpoint.replay_reasoning_content.unwrap_or(false),
             server_tools: endpoint.server_tools.clone(),
-            supports_tool_lazy_loading: endpoint.supports_tool_lazy_loading,
             supports_vision: endpoint.supports_vision,
         });
     }
@@ -699,6 +742,28 @@ pub async fn fork_session(
 }
 
 #[tauri::command]
+pub async fn fork_session_from_message(
+    session_id: String,
+    message_id: String,
+    title: Option<String>,
+    store: State<'_, Arc<SessionStore>>,
+) -> Result<String, AppError> {
+    store
+        .fork_session_from_message(&session_id, &message_id, title.as_deref())
+        .map_err(|error| {
+            if error == CHILD_SESSION_FORK_ERROR {
+                AppError::new("session.fork_child", "Child sessions cannot be forked.")
+                    .detail(error)
+                    .operation("forkSession")
+            } else {
+                AppError::new("session.fork_failed", "Failed to fork session.")
+                    .detail(error)
+                    .operation("forkSession")
+            }
+        })
+}
+
+#[tauri::command]
 pub async fn chat(
     session_id: Option<String>,
     text: String,
@@ -830,7 +895,6 @@ pub async fn chat(
                 .unwrap_or(crate::commands::CustomReasoningParamFormat::OpenaiChatReasoningEffort),
             replay_reasoning_content: ep.replay_reasoning_content.unwrap_or(false),
             server_tools: ep.server_tools.clone(),
-            supports_tool_lazy_loading: ep.supports_tool_lazy_loading,
             supports_vision: ep.supports_vision,
         }
     } else if is_openrouter {
@@ -857,7 +921,7 @@ pub async fn chat(
                 }
             }
             Err(e) => {
-                return Err(format!("OpenAI Codex token failed (please re-login): {}", e).into())
+                return Err(format!("OpenAI Codex token failed (please re-login): {}", e).into());
             }
         }
     } else if is_anthropic_sdk {
@@ -1419,6 +1483,19 @@ pub async fn undo_latest_conversation_turn(
         )
         .operation("undo"));
     }
+    crate::llm::codex::reset_cached_session_window(&session_id).await;
+    store.load_session(&session_id).map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn rollback_session_to_message(
+    session_id: String,
+    message_id: String,
+    store: State<'_, Arc<SessionStore>>,
+) -> Result<SessionDetail, AppError> {
+    store
+        .truncate_after_message(&session_id, &message_id)
+        .map_err(AppError::from)?;
     crate::llm::codex::reset_cached_session_window(&session_id).await;
     store.load_session(&session_id).map_err(Into::into)
 }

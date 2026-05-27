@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   displayUserMessageContent,
   userMessageConsoleEntries,
+  userMessageLocalFileEntries,
 } from "../composables/chatUserMessageDisplay";
 
 describe("displayUserMessageContent", () => {
@@ -35,6 +36,12 @@ describe("displayUserMessageContent", () => {
     )).toBe("分析原因");
   });
 
+  it("hides structured local file blocks from user text", () => {
+    expect(displayUserMessageContent(
+      "分析这个 PSD\n\n<locus-local-files>\nThese are local paths supplied by drag and drop. Read contents only when needed, using `read` for files and `list` for folders.\n- file: `E:/cache/Mobile Game GUI.psd`; type: psd\n</locus-local-files>",
+    )).toBe("分析这个 PSD");
+  });
+
   it("extracts structured Console entries for attachment display", () => {
     const entries = userMessageConsoleEntries(
       "<locus-console>\nUse these Unity Console entries as diagnostic context.\n\n## Entry 1: [Error] InvalidCastException\nSource: unity-console\nChars: 18\n\n[Error] InvalidCastException\n\n---\n\n## Entry 2: [Warning] Slow call\nSource: unity-console\nChars: 14\n\n[Warning] Slow call\n</locus-console>",
@@ -54,6 +61,25 @@ describe("displayUserMessageContent", () => {
         source: "unity-console",
         chars: 14,
         text: "[Warning] Slow call",
+      },
+    ]);
+  });
+
+  it("extracts structured local file entries for attachment display", () => {
+    const entries = userMessageLocalFileEntries(
+      "<locus-local-files>\nThese are local paths supplied by drag and drop. Read contents only when needed, using `read` for files and `list` for folders.\n- file: `E:/cache/Mobile Game GUI.psd`; type: psd\n- folder: `E:/cache/exports`\n</locus-local-files>",
+    );
+
+    expect(entries).toEqual([
+      {
+        kind: "file",
+        path: "E:/cache/Mobile Game GUI.psd",
+        typeLabel: "psd",
+      },
+      {
+        kind: "folder",
+        path: "E:/cache/exports",
+        typeLabel: "",
       },
     ]);
   });

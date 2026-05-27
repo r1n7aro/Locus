@@ -1138,6 +1138,24 @@ impl SessionStore {
     }
 
     pub fn fork_session(&self, source_id: &str, title: Option<&str>) -> Result<String, String> {
+        self.fork_session_with_cutoff(source_id, title, None)
+    }
+
+    pub fn fork_session_from_message(
+        &self,
+        source_id: &str,
+        message_id: &str,
+        title: Option<&str>,
+    ) -> Result<String, String> {
+        self.fork_session_with_cutoff(source_id, title, Some(message_id))
+    }
+
+    fn fork_session_with_cutoff(
+        &self,
+        source_id: &str,
+        title: Option<&str>,
+        cutoff_message_id: Option<&str>,
+    ) -> Result<String, String> {
         #[derive(Debug)]
         struct PersistedMessageRow {
             role: String,
@@ -1202,6 +1220,18 @@ impl SessionStore {
                 return Err(CHILD_SESSION_FORK_ERROR.to_string());
             }
 
+            let cutoff_rowid = match cutoff_message_id {
+                Some(message_id) => Some(
+                    conn.query_row(
+                        "SELECT rowid FROM messages WHERE id = ?1 AND session_id = ?2",
+                        params![message_id, source_id],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .map_err(|e| format!("Fork message not found: {}", e))?,
+                ),
+                None => None,
+            };
+
             if source_tool_dir.is_dir() {
                 copy_dir_recursively(&source_tool_dir, &target_tool_dir)?;
             }
@@ -1233,8 +1263,16 @@ impl SessionStore {
                     workspace_id,
                     session_type,
                     agent_id,
-                    latest_completed_run_id,
-                    latest_todo_run_id,
+                    if cutoff_rowid.is_some() {
+                        Option::<String>::None
+                    } else {
+                        latest_completed_run_id
+                    },
+                    if cutoff_rowid.is_some() {
+                        Option::<String>::None
+                    } else {
+                        latest_todo_run_id
+                    },
                     now,
                 ],
             )
@@ -1246,11 +1284,12 @@ impl SessionStore {
                         "SELECT role, content, created_at, prompt_prefix, prompt_suffix, tool_calls, tool_call_id, images, asset_refs, thinking_content, thinking_duration, thinking_signature, metadata_json, include_in_prompt
                          FROM messages
                          WHERE session_id = ?1
+                           AND (?2 IS NULL OR rowid <= ?2)
                          ORDER BY rowid ASC",
                     )
                     .map_err(|e| format!("Failed to prepare fork message query: {}", e))?;
                 let rows = stmt
-                    .query_map(params![source_id], |row| {
+                    .query_map(params![source_id, cutoff_rowid], |row| {
                         Ok(PersistedMessageRow {
                             role: row.get(0)?,
                             content: row.get(1)?,
@@ -1323,42 +1362,44 @@ impl SessionStore {
                 .map_err(|e| format!("Failed to copy message into fork: {}", e))?;
             }
 
-            conn.execute(
-                "INSERT INTO token_usage (
-                    session_id,
-                    total_input_tokens,
-                    total_output_tokens,
-                    total_cache_read_tokens,
-                    total_cache_write_tokens,
-                    total_cost_usd,
-                    priced_rounds,
-                    last_context_tokens,
-                    last_context_limit
-                 )
-                 SELECT ?1,
-                    total_input_tokens,
-                    total_output_tokens,
-                    total_cache_read_tokens,
-                    total_cache_write_tokens,
-                    total_cost_usd,
-                    priced_rounds,
-                    last_context_tokens,
-                    last_context_limit
-                 FROM token_usage
-                 WHERE session_id = ?2",
-                params![new_id, source_id],
-            )
-            .map_err(|e| format!("Failed to copy token usage into fork: {}", e))?;
+            if cutoff_rowid.is_none() {
+                conn.execute(
+                    "INSERT INTO token_usage (
+                        session_id,
+                        total_input_tokens,
+                        total_output_tokens,
+                        total_cache_read_tokens,
+                        total_cache_write_tokens,
+                        total_cost_usd,
+                        priced_rounds,
+                        last_context_tokens,
+                        last_context_limit
+                     )
+                     SELECT ?1,
+                        total_input_tokens,
+                        total_output_tokens,
+                        total_cache_read_tokens,
+                        total_cache_write_tokens,
+                        total_cost_usd,
+                        priced_rounds,
+                        last_context_tokens,
+                        last_context_limit
+                     FROM token_usage
+                     WHERE session_id = ?2",
+                    params![new_id, source_id],
+                )
+                .map_err(|e| format!("Failed to copy token usage into fork: {}", e))?;
 
-            conn.execute(
-                "INSERT INTO todos (session_id, position, content, status, priority)
-                 SELECT ?1, position, content, status, priority
-                 FROM todos
-                 WHERE session_id = ?2
-                 ORDER BY position ASC",
-                params![new_id, source_id],
-            )
-            .map_err(|e| format!("Failed to copy todos into fork: {}", e))?;
+                conn.execute(
+                    "INSERT INTO todos (session_id, position, content, status, priority)
+                     SELECT ?1, position, content, status, priority
+                     FROM todos
+                     WHERE session_id = ?2
+                     ORDER BY position ASC",
+                    params![new_id, source_id],
+                )
+                .map_err(|e| format!("Failed to copy todos into fork: {}", e))?;
+            }
 
             Ok(new_id.clone())
         })();
@@ -1999,6 +2040,56 @@ impl SessionStore {
             .map_err(|e| format!("Failed to truncate messages: {}", e))?;
 
         Ok(deleted as u64)
+    }
+
+    pub fn truncate_after_message(
+        &self,
+        session_id: &str,
+        message_id: &str,
+    ) -> Result<u64, String> {
+        let now = Self::now_ts();
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        conn.execute_batch("BEGIN IMMEDIATE")
+            .map_err(|e| format!("Failed to begin message truncation: {}", e))?;
+
+        let result = (|| -> Result<u64, String> {
+            let message_rowid: i64 = conn
+                .query_row(
+                    "SELECT rowid FROM messages WHERE id = ?1 AND session_id = ?2",
+                    params![message_id, session_id],
+                    |row| row.get(0),
+                )
+                .map_err(|e| format!("Message not found: {}", e))?;
+
+            let deleted = conn
+                .execute(
+                    "DELETE FROM messages WHERE session_id = ?1 AND rowid > ?2",
+                    params![session_id, message_rowid],
+                )
+                .map_err(|e| format!("Failed to truncate messages: {}", e))?;
+
+            if deleted > 0 {
+                conn.execute(
+                    "UPDATE sessions SET latest_completed_run_id = NULL, latest_todo_run_id = NULL, updated_at = ?1 WHERE id = ?2",
+                    params![now, session_id],
+                )
+                .map_err(|e| format!("Failed to update session after message truncation: {}", e))?;
+            }
+
+            Ok(deleted as u64)
+        })();
+
+        match result {
+            Ok(deleted) => {
+                conn.execute_batch("COMMIT")
+                    .map_err(|e| format!("Failed to commit message truncation: {}", e))?;
+                Ok(deleted)
+            }
+            Err(error) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
     }
 
     pub fn truncate_latest_conversation_turn(&self, session_id: &str) -> Result<u64, String> {
@@ -5165,6 +5256,98 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].id, "user-old");
         assert_eq!(messages[1].id, "assistant-old");
+    }
+
+    #[test]
+    fn truncate_after_message_keeps_selected_consecutive_user_message() {
+        let dir = tempdir().expect("create temp dir");
+        let store = SessionStore::new(dir.path()).expect("initialize store");
+        let session_id = store
+            .create_session("Exact Boundary", None, None, "chat", None)
+            .expect("create session");
+
+        {
+            let conn = store.conn.lock().expect("lock store connection");
+            for (id, role, content) in [
+                ("user-old", "user", "older user"),
+                ("assistant-old", "assistant", "older assistant"),
+                ("user-interrupted", "user", "interrupted user"),
+                ("user-target", "user", "target user"),
+                ("assistant-after", "assistant", "after target"),
+            ] {
+                conn.execute(
+                    "INSERT INTO messages (id, session_id, role, content, created_at, prompt_prefix, prompt_suffix, tool_calls, tool_call_id, images, thinking_content, thinking_duration, thinking_signature, metadata_json)
+                     VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)",
+                    params![id, session_id, role, content, 100i64],
+                )
+                .expect("insert message");
+            }
+        }
+
+        let deleted = store
+            .truncate_after_message(&session_id, "user-target")
+            .expect("truncate messages");
+        assert_eq!(deleted, 1);
+
+        let messages = store.get_messages(&session_id).expect("load messages");
+        let ids = messages
+            .iter()
+            .map(|message| message.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            vec![
+                "user-old",
+                "assistant-old",
+                "user-interrupted",
+                "user-target"
+            ]
+        );
+    }
+
+    #[test]
+    fn fork_session_from_message_keeps_exact_consecutive_user_boundary() {
+        let dir = tempdir().expect("create temp dir");
+        let store = SessionStore::new(dir.path()).expect("initialize store");
+        let session_id = store
+            .create_session("Fork Boundary", None, None, "chat", None)
+            .expect("create session");
+
+        {
+            let conn = store.conn.lock().expect("lock store connection");
+            for (id, role, content) in [
+                ("user-old", "user", "older user"),
+                ("assistant-old", "assistant", "older assistant"),
+                ("user-interrupted", "user", "interrupted user"),
+                ("user-target", "user", "target user"),
+                ("assistant-after", "assistant", "after target"),
+            ] {
+                conn.execute(
+                    "INSERT INTO messages (id, session_id, role, content, created_at, prompt_prefix, prompt_suffix, tool_calls, tool_call_id, images, thinking_content, thinking_duration, thinking_signature, metadata_json)
+                     VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)",
+                    params![id, session_id, role, content, 100i64],
+                )
+                .expect("insert message");
+            }
+        }
+
+        let fork_id = store
+            .fork_session_from_message(&session_id, "user-target", Some("Forked"))
+            .expect("fork from message");
+        let messages = store.get_messages(&fork_id).expect("load fork messages");
+        let contents = messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            contents,
+            vec![
+                "older user",
+                "older assistant",
+                "interrupted user",
+                "target user"
+            ]
+        );
     }
 
     #[test]

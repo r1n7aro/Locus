@@ -13,6 +13,20 @@ export function undoPerform(
   return ipcInvoke("undo_perform", { sessionId, assistantMessageId, force });
 }
 
+export function undoPerformToMessage(
+  sessionId: string,
+  assistantMessageId: string,
+  truncateMessageId: string,
+  force = false,
+): Promise<void> {
+  return ipcInvoke("undo_perform_to_message", {
+    sessionId,
+    assistantMessageId,
+    truncateMessageId,
+    force,
+  });
+}
+
 export function undoPreview(sessionId: string, assistantMessageId: string): Promise<ChangedFile[]> {
   return ipcInvoke<ChangedFile[]>("undo_preview", { sessionId, assistantMessageId });
 }

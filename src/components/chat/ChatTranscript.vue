@@ -38,7 +38,9 @@ import { parseChatAssetRefs } from "../../composables/chatAssetRefs";
 import {
   displayUserMessageContent,
   userMessageConsoleEntries,
+  userMessageLocalFileEntries,
   type UserConsoleEntryDisplay,
+  type UserLocalFileEntryDisplay,
 } from "../../composables/chatUserMessageDisplay";
 import { logToolCollapseTrace, previewTraceText } from "../../services/toolCollapseTrace";
 import {
@@ -121,6 +123,7 @@ const props = withDefaults(defineProps<{
   showUserImages?: boolean;
   userContentMode?: UserContentMode;
   sessionKey?: string | null;
+  selectedMessageId?: string | null;
 }>(), {
   variant: "embedded",
   hasThinking: undefined,
@@ -145,6 +148,7 @@ const props = withDefaults(defineProps<{
   showUserImages: false,
   userContentMode: "plain",
   sessionKey: null,
+  selectedMessageId: null,
 });
 
 const emit = defineEmits<{
@@ -221,8 +225,27 @@ function messageConsoleEntries(message: ChatMessage): UserConsoleEntryDisplay[] 
   return userMessageConsoleEntries(message.content);
 }
 
+function messageLocalFileEntries(message: ChatMessage): UserLocalFileEntryDisplay[] {
+  return userMessageLocalFileEntries(message.content);
+}
+
 function consoleEntryClass(entry: UserConsoleEntryDisplay) {
   return `level-${entry.level.toLowerCase()}`;
+}
+
+function markdownInlineCode(value: string) {
+  const backtickRuns = value.match(/`+/g) ?? [];
+  const fence = "`".repeat(Math.max(0, ...backtickRuns.map((run) => run.length)) + 1);
+  const padding = value.startsWith("`") || value.endsWith("`") ? " " : "";
+  return `${fence}${padding}${value}${padding}${fence}`;
+}
+
+function localFileEntryMarkdown(entry: UserLocalFileEntryDisplay) {
+  return markdownInlineCode(entry.path);
+}
+
+function localFileEntryKey(entry: UserLocalFileEntryDisplay, index: number) {
+  return `${entry.kind}:${entry.path}:${index}`;
 }
 
 function isCompactHandoffMessage(msg: ChatMessage) {
@@ -644,6 +667,7 @@ function hasVisibleMessagePayload(message: ChatMessage) {
     || message.images?.length
     || message.assetRefs?.length
     || (message.role === "user" && messageConsoleEntries(message).length > 0)
+    || (message.role === "user" && messageLocalFileEntries(message).length > 0)
     || (message.role === "user" && userMessageDisplayContent(message).trim())
   );
 }
@@ -897,6 +921,7 @@ function shouldRenderItem(item: MessageRenderItem) {
   if (item.message.role === "user") {
     return !!(
       userMessageDisplayContent(item.message)
+      || messageLocalFileEntries(item.message).length > 0
       || (props.showUserImages && item.message.images && item.message.images.length > 0)
       || (props.enableIntentBadges && messageIntentBadges(item.message).length > 0)
     );
@@ -1437,10 +1462,10 @@ function shouldKeepToolItemExpanded(itemId: string) {
 }
 
 type HistoryRenderSegment =
-  | { type: "thinking"; key: string; part: AssistantRenderPart; content: string; duration?: number }
+  | { type: "thinking"; key: string; part: AssistantRenderPart; itemId: string; content: string; duration?: number }
   | { type: "toolCalls"; key: string; part: Extract<AssistantRenderPart, { kind: "toolCall" }>; itemId: string; itemIds: string[]; toolCalls: ToolCallDisplay[] }
-  | { type: "content"; key: string; part: AssistantRenderPart; content: string }
-  | { type: "knowledgeProposal"; key: string; part: AssistantRenderPart; message: ChatMessage };
+  | { type: "content"; key: string; part: AssistantRenderPart; itemId: string; content: string }
+  | { type: "knowledgeProposal"; key: string; part: AssistantRenderPart; itemId: string; message: ChatMessage };
 
 type TransientRenderSegment =
   | { type: "thinking"; key: string; part: AssistantRenderPart; active: boolean; duration?: number }
@@ -1569,6 +1594,7 @@ function historyRenderSegments(item: MessageRenderItem): HistoryRenderSegment[] 
         type: "thinking",
         key: `${item.id}:${part.id}`,
         part,
+        itemId: item.id,
         content: part.content,
         duration: part.duration,
       });
@@ -1578,6 +1604,7 @@ function historyRenderSegments(item: MessageRenderItem): HistoryRenderSegment[] 
         type: "content",
         key: `${item.id}:${part.id}`,
         part,
+        itemId: item.id,
         content: part.content,
       });
     } else if (part.kind === "toolCall") {
@@ -1593,6 +1620,7 @@ function historyRenderSegments(item: MessageRenderItem): HistoryRenderSegment[] 
         type: "knowledgeProposal",
         key: `${item.id}:${part.id}`,
         part,
+        itemId: item.id,
         message: part.message,
       });
     }
@@ -2184,6 +2212,14 @@ function shouldRightAlignUserMessageGroup(group: Pick<MessageGroup, "role">) {
   return props.variant === "session" && displaySettings.rightAlignUserMessages && group.role === "user";
 }
 
+function isContextSelectedMessage(messageId: string | null | undefined) {
+  return !!messageId && props.selectedMessageId === messageId;
+}
+
+function isContextSelectedAssistantGroup(group: MessageGroup) {
+  return group.role === "assistant" && group.items.some((item) => isContextSelectedMessage(item.id));
+}
+
 function shouldShowSessionRoundDivider(group: Pick<MessageGroup, "role">, index: number) {
   if (props.variant !== "session" || group.role !== "user" || index <= 0) return false;
   const previousGroup = groupedMessages.value[index - 1];
@@ -2279,6 +2315,11 @@ function openImage(src: string) {
               'user-align-right': shouldRightAlignUserMessageGroup(group),
             },
           ]"
+          :data-chat-message-id="group.items[0]?.id"
+          :data-chat-message-role="group.role"
+          :data-chat-message-group-role="group.role"
+          :data-chat-message-group-start-id="group.items[0]?.id"
+          :data-chat-message-group-end-id="group.items[group.items.length - 1]?.id"
           >
           <div class="chat-transcript-message-role" :class="`is-${variant}`">
             {{ messageGroupLabel(group) }}
@@ -2291,8 +2332,13 @@ function openImage(src: string) {
                 v-show="shouldRenderItem(item)"
                 :key="item.id"
                 class="chat-transcript-item-stack"
-                :class="`is-${variant}`"
+                :class="[
+                  `is-${variant}`,
+                  { 'is-context-selected': isContextSelectedMessage(item.id) },
+                ]"
                 :data-scroll-anchor-id="item.id"
+                :data-chat-message-id="item.id"
+                :data-chat-message-role="item.message.role"
               >
                 <div
                   v-if="enableIntentBadges && messageIntentBadges(item.message).length > 0"
@@ -2361,6 +2407,30 @@ function openImage(src: string) {
                   </div>
                 </div>
 
+                <div
+                  v-if="messageLocalFileEntries(item.message).length > 0"
+                  class="chat-transcript-user-local-files"
+                >
+                  <div
+                    v-for="(entry, fileIdx) in messageLocalFileEntries(item.message)"
+                    :key="localFileEntryKey(entry, fileIdx)"
+                    class="chat-transcript-user-local-file"
+                    :title="entry.path"
+                  >
+                    <MarkdownRenderer
+                      class="chat-transcript-user-local-file-ref"
+                      :content="localFileEntryMarkdown(entry)"
+                      enable-file-refs
+                    />
+                    <span
+                      v-if="entry.typeLabel"
+                      class="chat-transcript-user-local-file-type"
+                    >
+                      {{ entry.typeLabel }}
+                    </span>
+                  </div>
+                </div>
+
                 <div v-if="userMessageDisplayContent(item.message)" class="chat-transcript-plain-text ui-select-text">
                   <template
                     v-for="(segment, segmentIdx) in userMessageDisplaySegments(item.message)"
@@ -2384,9 +2454,12 @@ function openImage(src: string) {
                 `is-${variant}`,
                 {
                   'tool-only': isToolOnlyMessageGroup(group),
+                  'is-context-selected': isContextSelectedAssistantGroup(group),
                 },
               ]"
               :data-scroll-anchor-id="group.items[0]?.id"
+              :data-chat-message-id="group.items[0]?.id"
+              data-chat-message-role="assistant"
             >
               <template
                 v-for="segment in historyRenderSegmentsForGroup(group)"
@@ -2398,6 +2471,8 @@ function openImage(src: string) {
                   data-render-part-kind="thinking"
                   data-render-part-scope="history"
                   :data-render-part-key="segment.key"
+                  :data-chat-message-id="segment.itemId"
+                  data-chat-message-role="assistant"
                 >
                   <button
                     v-if="variant === 'session'"
@@ -2429,6 +2504,8 @@ function openImage(src: string) {
                   data-tool-layout-kind="group"
                   data-tool-layout-scope="history"
                   :data-tool-layout-key="segment.key"
+                  :data-chat-message-id="segment.itemId"
+                  data-chat-message-role="assistant"
                   :data-tool-layout-tool-call-ids="toolLayoutToolCallIds(segment.toolCalls)"
                   :data-tool-layout-statuses="toolLayoutStatuses(segment.toolCalls)"
                   :data-tool-layout-keep-expanded="String(shouldKeepToolSegmentExpanded(segment))"
@@ -2456,8 +2533,11 @@ function openImage(src: string) {
                   data-render-part-kind="text"
                   data-render-part-scope="history"
                   :data-render-part-key="segment.key"
+                  :data-chat-message-id="segment.itemId"
+                  data-chat-message-role="assistant"
                   :content="segment.content"
                   enable-file-refs
+                  @open-image="openImage"
                 />
 
                 <KnowledgeProposalCard
@@ -2465,6 +2545,8 @@ function openImage(src: string) {
                   data-render-part-kind="knowledgeProposal"
                   data-render-part-scope="history"
                   :data-render-part-key="segment.key"
+                  :data-chat-message-id="segment.itemId"
+                  data-chat-message-role="assistant"
                   :proposal="segment.message.knowledgeProposal!"
                   @apply="emit('applyKnowledgeProposal', $event)"
                   @ignore="emit('ignoreKnowledgeProposal', $event)"
@@ -2599,6 +2681,7 @@ function openImage(src: string) {
                   :content="segment.content"
                   cursor
                   enable-file-refs
+                  @open-image="openImage"
                 />
               </template>
             </div>
@@ -2635,10 +2718,16 @@ function openImage(src: string) {
 
 .chat-transcript-scroll.is-session {
   --chat-transcript-session-segment-gap: 10px;
-  padding: 24px 0;
+  --chat-transcript-session-bottom-gap: 40px;
+  padding: 24px 0 0;
   background: var(--msg-assistant-bg);
   overflow-anchor: none;
   contain: layout paint;
+}
+
+.chat-transcript-scroll.is-session > .chat-transcript-content {
+  box-sizing: border-box;
+  padding-bottom: var(--chat-transcript-session-bottom-gap);
 }
 
 .chat-transcript-scroll.is-embedded {
@@ -2875,6 +2964,14 @@ function openImage(src: string) {
   z-index: 1;
 }
 
+.chat-transcript-item-stack.is-context-selected {
+  border-radius: 8px;
+  outline: 1px solid color-mix(in srgb, var(--accent-color) 42%, var(--border-color));
+  outline-offset: 4px;
+  background: color-mix(in srgb, var(--accent-soft) 36%, transparent);
+  transition: background 120ms ease, outline-color 120ms ease;
+}
+
 .chat-transcript-intent-row {
   display: flex;
   flex-wrap: wrap;
@@ -3086,6 +3183,64 @@ function openImage(src: string) {
 }
 
 .chat-transcript-user-console-chars {
+  color: var(--text-secondary);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.chat-transcript-user-local-files {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  max-width: min(100%, 78ch);
+}
+
+.chat-transcript-message.is-session.user.user-align-right .chat-transcript-user-local-files {
+  justify-content: flex-end;
+}
+
+.chat-transcript-user-local-file {
+  min-width: 0;
+  max-width: min(360px, 100%);
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.chat-transcript-user-local-file :deep(.markdown-body) {
+  min-width: 0;
+  display: inline-flex;
+  line-height: 22px;
+}
+
+.chat-transcript-user-local-file :deep(.markdown-body p) {
+  min-width: 0;
+  display: inline-flex;
+  margin: 0;
+}
+
+.chat-transcript-user-local-file :deep(.md-file-ref) {
+  max-width: 100%;
+  background: color-mix(in srgb, var(--panel-bg) 68%, var(--msg-user-bg) 32%);
+  border-color: color-mix(in srgb, var(--border-color) 88%, transparent);
+}
+
+.chat-transcript-user-local-file :deep(.md-file-ref:hover) {
+  background: color-mix(in srgb, var(--hover-bg) 82%, var(--panel-bg) 18%);
+  border-color: var(--border-strong);
+}
+
+.chat-transcript-user-local-file :deep(.md-ref-label) {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-transcript-user-local-file-type {
+  flex: 0 0 auto;
+  max-width: 72px;
+  overflow: hidden;
+  text-overflow: ellipsis;
   color: var(--text-secondary);
   font-size: 11px;
   white-space: nowrap;

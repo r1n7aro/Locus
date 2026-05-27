@@ -2321,6 +2321,45 @@ export const useChatStore = defineStore("chat", () => {
     }
   }
 
+  async function forkSessionFromMessage(messageId: string) {
+    const sourceSessionId = activeSessionId.value;
+    if (!sourceSessionId || isStreaming.value || !messageId) return;
+
+    const sourceSession = sessions.value.find((session) => session.id === sourceSessionId);
+    if (sourceSession?.parentSessionId) {
+      useNotificationStore().addNotice("warning", t("chat.session.forkChildBlocked"), {
+        code: "session.fork_child",
+        operation: "forkSession",
+      });
+      return;
+    }
+
+    try {
+      const forkedId = await sessionService.forkSessionFromMessage(
+        sourceSessionId,
+        messageId,
+        forkedSessionTitle(sourceSession),
+      );
+      await refreshSessions();
+      await selectSession(forkedId);
+      useNotificationStore().addNotice("success", t("chat.session.forked"), {
+        operation: "forkSession",
+      });
+    } catch (e) {
+      const err = normalizeAppError(e);
+      const isChildFork = err.code === "session.fork_child";
+      useNotificationStore().addNotice(
+        isChildFork ? "warning" : "error",
+        isChildFork ? t("chat.session.forkChildBlocked") : t("chat.session.forkFailed", err.message),
+        {
+          code: err.code,
+          operation: "forkSession",
+          skipConsoleLog: true,
+        },
+      );
+    }
+  }
+
   async function cancelSession(sessionId: string) {
     if (!sessionId) return;
     const trackedRunId = sessionRunIds.value.get(sessionId)
@@ -2470,6 +2509,64 @@ export const useChatStore = defineStore("chat", () => {
     }
   }
 
+  async function rollbackToMessage(
+    messageId: string,
+    options?: { includeFiles?: boolean; fileUndoTarget?: string | null },
+  ): Promise<boolean> {
+    if (!activeSessionId.value || !messageId) return false;
+    const sessionId = activeSessionId.value;
+    const includeFiles = options?.includeFiles === true;
+    const fileUndoTarget = options?.fileUndoTarget ?? null;
+    if (includeFiles && !fileUndoTarget) {
+      useNotificationStore().addNotice("warning", t("chat.undo.noFileUndo"), {
+        code: "undo.no_file_target",
+        operation: "rollbackToMessage",
+      });
+      return false;
+    }
+
+    try {
+      if (includeFiles) {
+        await undoService.undoPerformToMessage(
+          sessionId,
+          fileUndoTarget!,
+          messageId,
+          false,
+        );
+      } else {
+        await sessionService.rollbackSessionToMessage(sessionId, messageId);
+      }
+
+      const [detail, undoEntries] = await Promise.all([
+        sessionService.loadSession(sessionId),
+        useChatChangesStore().loadChanges(sessionId, { allowAutoOpen: false }),
+      ]);
+      useChatChangesStore().setLatestCompletedRunId(
+        sessionId,
+        detail.latestCompletedRunId ?? null,
+      );
+      sessionLatestCompletedRunIds.value.set(
+        sessionId,
+        detail.latestCompletedRunId ?? null,
+      );
+      setSessionPendingInputs(sessionId, detail.pendingInputs ?? []);
+      messages.value = hydrateMessages(detail.messages);
+      undoableMessageIds.value = new Set(undoEntries.map((e) => e.assistantMessageId));
+      activeSessionType.value = detail.sessionType;
+      await refreshSessions();
+      return true;
+    } catch (e) {
+      console.error("rollback_to_message failed:", e);
+      const err = normalizeAppError(e);
+      useNotificationStore().addNotice("error", t("app.undoFailed", err.message), {
+        code: err.code,
+        operation: "rollbackToMessage",
+        skipConsoleLog: true,
+      });
+      return false;
+    }
+  }
+
   async function undoLatestConversationTurn(): Promise<boolean> {
     if (!activeSessionId.value) return false;
     try {
@@ -2567,6 +2664,7 @@ export const useChatStore = defineStore("chat", () => {
     sendMessage,
     compactSession,
     forkSession,
+    forkSessionFromMessage,
     cancelSession,
     cancelSessions,
     cancelChat,
@@ -2577,6 +2675,7 @@ export const useChatStore = defineStore("chat", () => {
     applyKnowledgeProposal,
     checkUndoConflicts,
     performUndo,
+    rollbackToMessage,
     undoLatestConversationTurn,
     cleanupAnim,
   };

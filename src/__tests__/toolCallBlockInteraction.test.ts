@@ -18,6 +18,16 @@ describe("tool call block interactions", () => {
     expect(source).toContain(".tool-call-block:not(.is-expanded)");
   });
 
+  it("exposes open actions for completed View tool calls", () => {
+    const source = read("src/components/ToolCallBlock.vue");
+
+    expect(source).toContain("const showViewOpenButton = computed");
+    expect(source).toContain("resolveViewToolOpenId");
+    expect(source).toContain("async function openViewTool()");
+    expect(source).toContain("await viewRun(viewId)");
+    expect(source).toContain("@click.stop=\"openViewTool\"");
+  });
+
   it("keeps override tool blocks aligned with the base block click behavior", () => {
     for (const relPath of [
       "src/components/tool-block-overrides/UnityExecuteToolBlock.vue",

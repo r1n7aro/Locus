@@ -10,25 +10,31 @@ import {
   watch,
   type ComponentPublicInstance,
 } from "vue";
-import { Check, ChevronRight, Folder, FolderOpen, X } from "lucide";
+import { Check, ChevronRight, Folder, FolderOpen, HelpCircle, X } from "lucide";
 import { t } from "../../i18n";
 import { buildSessionTree, nodeContainsSession, nodeHasActiveDescendant } from "./sessionTree";
 import BaseButton from "../ui/BaseButton.vue";
+import BaseContextMenu from "../ui/BaseContextMenu.vue";
 import LucideIcon from "../icons/LucideIcon.vue";
 import { resolveLocusViewIcon } from "../icons/locusViewIcons";
 import { formatShortcut, useKeyboardShortcuts } from "../../composables/useKeyboardShortcuts";
 import { normalizeAppError } from "../../services/errors";
 import {
+  checkViewOpenRequirements,
+  normalizeViewError,
   viewCreateFolder,
   viewDeleteEntry,
   viewMoveEntry,
+  viewRequiresUnityConnection,
   viewRun,
   viewTree,
+  viewUnityConnectionRequiredError,
   type ViewFolderSummary,
   type ViewPackageSummary,
 } from "../../services/view";
 import { getLocusRuntime, type RuntimeUnsubscribe } from "../../services/locusRuntime";
 import { useNotificationStore } from "../../stores/notification";
+import { useProjectStore } from "../../stores/project";
 
 interface VisibleTreeRow {
   node: SessionTreeNode;
@@ -121,6 +127,7 @@ function persistExpandedState() {
 
 const { state: shortcutState } = useKeyboardShortcuts();
 const notificationStore = useNotificationStore();
+const projectStore = useProjectStore();
 const newChatTitle = computed(() =>
   t("chat.session.newWithShortcut", formatShortcut(shortcutState.newChat)),
 );
@@ -128,13 +135,14 @@ const viewSummaries = ref<ViewPackageSummary[]>([]);
 const viewFolders = ref<ViewFolderSummary[]>([]);
 const viewsLoading = ref(false);
 const viewOpeningKey = ref("");
-const viewError = ref("");
 const viewCtxMenu = ref<ViewContextMenuState | null>(null);
 const viewDeleteConfirm = ref<ViewTreeNode | null>(null);
 const viewCreateFolderDraft = ref<ViewCreateFolderDraft | null>(null);
 const viewCreateFolderInputRef = ref<HTMLInputElement | null>(null);
 const draggingViewNode = ref<ViewTreeNode | null>(null);
 const viewDragTargetKey = ref("");
+const viewHelpOpen = ref(false);
+const viewHelpDialogRef = ref<HTMLElement | null>(null);
 const hasWorkspace = computed(() => !!props.workingDir?.trim());
 const viewExpandedState = ref<Record<string, boolean>>(loadViewExpandedState());
 const sessionPanelRef = ref<HTMLElement | null>(null);
@@ -221,7 +229,7 @@ function packageRelPath(view: ViewPackageSummary): string {
   const packageRoot = normalizeViewPath(view.packageRoot);
   const workingDir = props.workingDir?.trim();
   if (workingDir) {
-    const viewsRoot = normalizeViewPath(`${workingDir}/Locus/views`);
+    const viewsRoot = normalizeViewPath(`${workingDir}/Locus/View`);
     const lowerPackageRoot = packageRoot.toLowerCase();
     const lowerViewsRoot = viewsRoot.toLowerCase();
     if (lowerPackageRoot.startsWith(`${lowerViewsRoot}/`)) {
@@ -372,33 +380,61 @@ async function loadViews() {
   if (!showSessionViews.value || !hasWorkspace.value) {
     viewSummaries.value = [];
     viewFolders.value = [];
-    viewError.value = "";
     return;
   }
   viewsLoading.value = true;
-  viewError.value = "";
   try {
     const snapshot = await viewTree();
     viewSummaries.value = snapshot.views;
     viewFolders.value = snapshot.folders;
   } catch (error) {
     const err = normalizeAppError(error);
-    viewError.value = err.message;
+    notificationStore.addNotice("error", err.message, {
+      code: err.code,
+      operation: "loadSessionPanelViews",
+      replaceOperation: true,
+      skipConsoleLog: true,
+    });
   } finally {
     viewsLoading.value = false;
   }
 }
 
+function notifyViewOpenError(error: { code?: string; message: string }) {
+  notificationStore.addNotice("error", error.message, {
+    code: error.code,
+    operation: "openViewFromSessionPanel",
+    skipConsoleLog: true,
+  });
+}
+
+function cachedViewOpenRequirementError(view: ViewPackageSummary) {
+  if (!viewRequiresUnityConnection(view)) return null;
+  const status = projectStore.unityConnectionStatus;
+  return status && !status.connected
+    ? viewUnityConnectionRequiredError(view.name)
+    : null;
+}
+
 async function openView(view: ViewPackageSummary) {
   if (viewOpeningKey.value) return;
+  const cachedRequirementError = cachedViewOpenRequirementError(view);
+  if (cachedRequirementError) {
+    notifyViewOpenError(cachedRequirementError);
+    return;
+  }
+
   const key = `${packageRelPath(view)}:${view.id}`;
   viewOpeningKey.value = key;
-  viewError.value = "";
   try {
+    const requirementError = await checkViewOpenRequirements(view);
+    if (requirementError) {
+      notifyViewOpenError(requirementError);
+      return;
+    }
     await viewRun(view.id);
   } catch (error) {
-    const err = normalizeAppError(error);
-    viewError.value = err.message;
+    const err = normalizeViewError(error, { viewName: view.name });
     notificationStore.addNotice("error", err.message, {
       code: err.code,
       operation: "openViewFromSessionPanel",
@@ -491,7 +527,6 @@ async function submitViewCreateFolder() {
     await loadViews();
   } catch (error) {
     const err = normalizeAppError(error);
-    viewError.value = err.message;
     notificationStore.addNotice("error", err.message, {
       code: err.code,
       operation: "createViewFolder",
@@ -521,7 +556,6 @@ async function confirmDeleteViewEntry() {
     closeViewDeleteConfirm();
   } catch (error) {
     const err = normalizeAppError(error);
-    viewError.value = err.message;
     notificationStore.addNotice("error", err.message, {
       code: err.code,
       operation: "deleteViewEntry",
@@ -595,7 +629,6 @@ async function moveDraggingViewNode(targetDirRelPath: string) {
     viewFolders.value = snapshot.folders;
   } catch (error) {
     const err = normalizeAppError(error);
-    viewError.value = err.message;
     notificationStore.addNotice("error", err.message, {
       code: err.code,
       operation: "moveViewEntry",
@@ -674,6 +707,29 @@ function onViewResizeMouseDown(event: MouseEvent) {
   window.addEventListener("mousemove", viewResizeMoveListener);
   window.addEventListener("mouseup", viewResizeUpListener);
   document.body.classList.add("sp-view-resizing");
+}
+
+function closeViewHelp() {
+  viewHelpOpen.value = false;
+}
+
+function openViewHelp() {
+  viewHelpOpen.value = true;
+  void nextTick(() => viewHelpDialogRef.value?.focus());
+}
+
+function toggleViewHelp() {
+  if (viewHelpOpen.value) {
+    closeViewHelp();
+  } else {
+    openViewHelp();
+  }
+}
+
+function onViewHelpKeydown(event: KeyboardEvent) {
+  if (event.key === "Escape") {
+    closeViewHelp();
+  }
 }
 
 watch(
@@ -1006,7 +1062,7 @@ function ctxArchive() {
   <div
     ref="sessionPanelRef"
     class="session-panel"
-    :style="{ width: sessionPanelWidth + 'px', minWidth: sessionPanelWidth + 'px' }"
+    :style="{ width: sessionPanelWidth + 'px', minWidth: sessionPanelWidth + 'px', '--session-panel-width': sessionPanelWidth + 'px' }"
   >
     <div class="sp-header">
       <span class="sp-title">{{ t('chat.session.title') }}</span>
@@ -1146,6 +1202,20 @@ function ctxArchive() {
     >
       <div class="sp-view-header">
         <span class="sp-view-title">{{ t('view.list.title') }}</span>
+        <div class="sp-view-help-wrap">
+          <button
+            type="button"
+            class="sp-view-help-btn"
+            :title="t('view.list.helpLabel')"
+            :aria-label="t('view.list.helpLabel')"
+            :aria-expanded="viewHelpOpen"
+            aria-controls="session-view-help-dialog"
+            @click.stop="toggleViewHelp"
+            @keydown="onViewHelpKeydown"
+          >
+            <LucideIcon :icon="HelpCircle" :size="14" :stroke-width="2" />
+          </button>
+        </div>
       </div>
 
       <div
@@ -1265,33 +1335,90 @@ function ctxArchive() {
         </template>
 
         <div v-if="viewsLoading" class="sp-view-empty">{{ t('common.loading') }}</div>
-        <div v-else-if="viewError" class="sp-view-empty is-error">{{ viewError }}</div>
         <div v-else-if="!viewTreeNodes.length && !viewCreateFolderDraft" class="sp-view-empty">{{ t('view.list.empty') }}</div>
       </div>
     </section>
 
     <Teleport to="body">
-      <div
-        v-if="viewCtxMenu"
-        class="sp-ctx-backdrop"
-        @click="closeViewContextMenu"
-        @contextmenu.prevent="closeViewContextMenu"
-      >
-        <div class="sp-ctx-menu" :style="{ left: viewCtxMenu.x + 'px', top: viewCtxMenu.y + 'px' }" @click.stop>
-          <template v-if="viewCtxMenu.kind === 'root' || viewCtxMenu.kind === 'folder'">
-            <div class="sp-ctx-item" @click="beginCreateViewFolder">{{ t('view.tree.createFolder') }}</div>
-            <div v-if="viewCtxMenu.kind === 'folder'" class="sp-ctx-sep"></div>
-          </template>
-          <div
-            v-if="viewCtxMenu.kind === 'folder' || viewCtxMenu.kind === 'view'"
-            class="sp-ctx-item danger"
-            @click.stop="requestDeleteViewEntry"
-          >
-            {{ t('view.tree.delete') }}
-          </div>
-        </div>
+      <Transition name="sp-view-help-modal">
         <div
-          v-if="viewDeleteConfirm"
+          v-if="viewHelpOpen"
+          class="sp-view-help-overlay"
+          @mousedown.self="closeViewHelp"
+        >
+          <section
+            id="session-view-help-dialog"
+            ref="viewHelpDialogRef"
+            class="sp-view-help-dialog"
+            role="dialog"
+            aria-modal="true"
+            :aria-labelledby="'session-view-help-title'"
+            tabindex="-1"
+            @keydown.esc.stop="closeViewHelp"
+          >
+            <header class="sp-view-help-header">
+              <div class="sp-view-help-header-copy">
+                <h2 id="session-view-help-title" class="sp-view-help-title">{{ t('view.list.helpLabel') }}</h2>
+              </div>
+              <button
+                type="button"
+                class="sp-view-help-close"
+                :title="t('common.close')"
+                :aria-label="t('common.close')"
+                @click="closeViewHelp"
+              >
+                <LucideIcon :icon="X" :size="14" :stroke-width="2" />
+              </button>
+            </header>
+            <div class="sp-view-help-body">
+              <section class="sp-view-help-section">
+                <div class="sp-view-help-section-title">{{ t('view.list.helpFeatureTitle') }}</div>
+                <p>{{ t('view.list.helpBody') }}</p>
+              </section>
+              <section class="sp-view-help-section">
+                <div class="sp-view-help-section-title">{{ t('view.list.helpCreateTitle') }}</div>
+                <p>{{ t('view.list.helpCreate') }}</p>
+              </section>
+              <section class="sp-view-help-section">
+                <div class="sp-view-help-section-title">{{ t('view.list.helpSettingsTitle') }}</div>
+                <p>{{ t('view.list.helpSettings') }}</p>
+              </section>
+            </div>
+            <footer class="sp-view-help-footer">
+              <BaseButton size="md" @click="closeViewHelp">
+                {{ t('common.close') }}
+              </BaseButton>
+            </footer>
+          </section>
+        </div>
+      </Transition>
+    </Teleport>
+
+    <BaseContextMenu
+      v-if="viewCtxMenu"
+      class="sp-ctx-menu"
+      :x="viewCtxMenu.x"
+      :y="viewCtxMenu.y"
+      :min-width="120"
+      @close="closeViewContextMenu"
+    >
+      <template v-if="viewCtxMenu.kind === 'root' || viewCtxMenu.kind === 'folder'">
+        <button type="button" class="sp-ctx-item" @click="beginCreateViewFolder">{{ t('view.tree.createFolder') }}</button>
+        <div v-if="viewCtxMenu.kind === 'folder'" class="sp-ctx-sep"></div>
+      </template>
+      <button
+        v-if="viewCtxMenu.kind === 'folder' || viewCtxMenu.kind === 'view'"
+        type="button"
+        class="sp-ctx-item danger"
+        @click.stop="requestDeleteViewEntry"
+      >
+        {{ t('view.tree.delete') }}
+      </button>
+    </BaseContextMenu>
+
+    <Teleport to="body">
+        <div
+          v-if="viewCtxMenu && viewDeleteConfirm"
           class="sp-delete-confirm"
           :style="{ left: viewCtxMenu.x + 'px', top: viewCtxMenu.y + 'px' }"
           @click.stop
@@ -1307,25 +1434,31 @@ function ctxArchive() {
             </BaseButton>
           </div>
         </div>
-      </div>
     </Teleport>
 
+    <BaseContextMenu
+      v-if="ctxMenu"
+      class="sp-ctx-menu"
+      :x="ctxMenu.x"
+      :y="ctxMenu.y"
+      :min-width="120"
+      @close="closeCtxMenu"
+    >
+      <template v-if="ctxMenu.ids.length <= 1">
+        <button type="button" class="sp-ctx-item" @click="startRename(ctxMenu!.session)">{{ t('chat.session.rename') }}</button>
+        <button type="button" class="sp-ctx-item" @click="ctxSaveContext(true)">{{ t('chat.saveContextWithSystemPrompt') }}</button>
+        <button type="button" class="sp-ctx-item" @click="ctxSaveContext(false)">{{ t('chat.saveContextWithoutSystemPrompt') }}</button>
+        <div class="sp-ctx-sep"></div>
+        <button type="button" class="sp-ctx-item" @click="ctxArchive">{{ t('chat.session.archive') }}</button>
+        <button type="button" class="sp-ctx-item danger" @click.stop="requestDelete">{{ t('chat.session.delete') }}</button>
+      </template>
+      <template v-else>
+        <button type="button" class="sp-ctx-item" @click="ctxArchive">{{ t('chat.session.archiveMany', ctxMenu.ids.length) }}</button>
+        <button type="button" class="sp-ctx-item danger" @click.stop="requestDelete">{{ t('chat.session.deleteMany', ctxMenu.ids.length) }}</button>
+      </template>
+    </BaseContextMenu>
+
     <Teleport to="body">
-      <div v-if="ctxMenu" class="sp-ctx-backdrop" @click="closeCtxMenu" @contextmenu.prevent="closeCtxMenu">
-        <div class="sp-ctx-menu" :style="{ left: ctxMenu.x + 'px', top: ctxMenu.y + 'px' }" @click.stop>
-          <template v-if="ctxMenu.ids.length <= 1">
-            <div class="sp-ctx-item" @click="startRename(ctxMenu!.session)">{{ t('chat.session.rename') }}</div>
-            <div class="sp-ctx-item" @click="ctxSaveContext(true)">{{ t('chat.saveContextWithSystemPrompt') }}</div>
-            <div class="sp-ctx-item" @click="ctxSaveContext(false)">{{ t('chat.saveContextWithoutSystemPrompt') }}</div>
-            <div class="sp-ctx-sep"></div>
-            <div class="sp-ctx-item" @click="ctxArchive">{{ t('chat.session.archive') }}</div>
-            <div class="sp-ctx-item danger" @click.stop="requestDelete">{{ t('chat.session.delete') }}</div>
-          </template>
-          <template v-else>
-            <div class="sp-ctx-item" @click="ctxArchive">{{ t('chat.session.archiveMany', ctxMenu.ids.length) }}</div>
-            <div class="sp-ctx-item danger" @click.stop="requestDelete">{{ t('chat.session.deleteMany', ctxMenu.ids.length) }}</div>
-          </template>
-        </div>
         <div
           v-if="deleteConfirm"
           class="sp-delete-confirm"
@@ -1343,7 +1476,6 @@ function ctxArchive() {
             </BaseButton>
           </div>
         </div>
-      </div>
     </Teleport>
   </div>
 </template>
@@ -1399,6 +1531,7 @@ function ctxArchive() {
   min-height: 140px;
   display: flex;
   flex-direction: column;
+  position: relative;
   background: color-mix(in srgb, var(--sidebar-bg) 94%, var(--panel-bg) 6%);
   overflow: hidden;
 }
@@ -1407,7 +1540,7 @@ function ctxArchive() {
   flex-shrink: 0;
   display: flex;
   align-items: center;
-  justify-content: flex-start;
+  justify-content: space-between;
   gap: 8px;
   min-height: 34px;
   padding: 6px 8px 4px 12px;
@@ -1419,6 +1552,185 @@ function ctxArchive() {
   font-weight: 600;
   letter-spacing: 0.5px;
   text-transform: uppercase;
+}
+
+.sp-view-help-wrap {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+}
+
+.sp-view-help-btn {
+  width: 24px;
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-secondary);
+  padding: 0;
+  cursor: pointer;
+  transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+}
+
+.sp-view-help-btn:hover,
+.sp-view-help-btn[aria-expanded="true"] {
+  border-color: var(--border-color);
+  background: var(--hover-bg);
+  color: var(--text-color);
+}
+
+.sp-view-help-btn:focus-visible {
+  outline: 2px solid var(--accent-color);
+  outline-offset: -2px;
+}
+
+.sp-view-help-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 10001;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  background: rgba(8, 10, 14, 0.34);
+}
+
+.sp-view-help-dialog {
+  width: min(620px, 100%);
+  max-height: min(680px, calc(100vh - 40px));
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border-color);
+  border-radius: 12px;
+  background: var(--surface-elevated);
+  box-shadow: 0 18px 40px rgba(15, 17, 21, 0.16);
+  overflow: hidden;
+}
+
+.sp-view-help-dialog:focus {
+  outline: none;
+}
+
+.sp-view-help-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 18px 20px 14px;
+}
+
+.sp-view-help-header-copy {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.sp-view-help-title {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 700;
+  line-height: 1.3;
+  color: var(--text-color);
+}
+
+.sp-view-help-close {
+  width: 28px;
+  height: 28px;
+  flex-shrink: 0;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-secondary);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.sp-view-help-close:hover {
+  background: var(--hover-bg);
+  color: var(--text-color);
+}
+
+.sp-view-help-close:focus-visible {
+  outline: 2px solid var(--accent-color);
+  outline-offset: -2px;
+}
+
+.sp-view-help-body {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  padding: 0 20px 18px;
+  overflow: auto;
+}
+
+.sp-view-help-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.sp-view-help-section + .sp-view-help-section {
+  padding-top: 16px;
+  border-top: 1px solid var(--border-color);
+}
+
+.sp-view-help-section-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-color);
+}
+
+.sp-view-help-section p {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.65;
+  color: var(--text-secondary);
+}
+
+.sp-view-help-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 14px 20px 18px;
+  border-top: 1px solid var(--border-color);
+}
+
+.sp-view-help-modal-enter-active,
+.sp-view-help-modal-leave-active {
+  transition: opacity 0.15s ease;
+}
+
+.sp-view-help-modal-enter-active .sp-view-help-dialog,
+.sp-view-help-modal-leave-active .sp-view-help-dialog {
+  transition: transform 0.15s ease, opacity 0.15s ease;
+}
+
+.sp-view-help-modal-enter-from,
+.sp-view-help-modal-leave-to {
+  opacity: 0;
+}
+
+.sp-view-help-modal-enter-from .sp-view-help-dialog,
+.sp-view-help-modal-leave-to .sp-view-help-dialog {
+  opacity: 0;
+  transform: scale(0.96) translateY(8px);
+}
+
+@media (max-width: 720px) {
+  .sp-view-help-dialog {
+    max-height: min(720px, calc(100vh - 24px));
+  }
+
+  .sp-view-help-overlay {
+    padding: 12px;
+  }
 }
 
 .sp-view-list {
@@ -1642,10 +1954,6 @@ function ctxArchive() {
   line-height: 1.5;
 }
 
-.sp-view-empty.is-error {
-  color: var(--status-danger-fg);
-}
-
 .sp-tree-row.virtual {
   opacity: 0.86;
 }
@@ -1866,49 +2174,6 @@ function ctxArchive() {
   height: 6px;
   background: var(--status-danger-fg);
   box-shadow: 0 0 0 1px color-mix(in srgb, var(--status-danger-border) 60%, transparent);
-}
-
-.sp-ctx-backdrop {
-  position: fixed;
-  inset: 0;
-  z-index: 9999;
-}
-
-.sp-ctx-menu {
-  position: fixed;
-  min-width: 120px;
-  background: var(--sidebar-bg);
-  border: 1px solid var(--border-color);
-  border-radius: 8px;
-  padding: 4px 0;
-  box-shadow: 0 4px 16px rgba(0,0,0,.15);
-  z-index: 10000;
-}
-
-.sp-ctx-item {
-  padding: 6px 16px;
-  font-size: 13px;
-  cursor: pointer;
-  color: var(--text-color);
-}
-
-.sp-ctx-item:hover {
-  background: var(--hover-bg);
-}
-
-.sp-ctx-item.danger {
-  color: var(--status-danger-fg);
-}
-
-.sp-ctx-item.danger:hover {
-  background: var(--status-danger-bg);
-  color: var(--status-danger-fg);
-}
-
-.sp-ctx-sep {
-  height: 1px;
-  background: var(--border-color);
-  margin: 4px 0;
 }
 
 .sp-delete-confirm {

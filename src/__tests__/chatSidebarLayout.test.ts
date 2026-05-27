@@ -101,6 +101,9 @@ describe("chat sidebar layout", () => {
     expect(app).toContain("--msg-user-bg: #212125;");
     expect(transcript).toContain(".chat-transcript-scroll.is-session {");
     expect(transcript).toContain("background: var(--msg-assistant-bg);");
+    expect(transcript).toContain("--chat-transcript-session-bottom-gap: 40px;");
+    expect(transcript).toContain(".chat-transcript-scroll.is-session > .chat-transcript-content {");
+    expect(transcript).toContain("padding-bottom: var(--chat-transcript-session-bottom-gap);");
     expect(transcript).toContain(".chat-transcript-message.is-session.user {");
     expect(transcript).toContain("background: var(--msg-assistant-bg);");
     expect(transcript).toContain("function shouldShowSessionRoundDivider(group: Pick<MessageGroup, \"role\">, index: number) {");

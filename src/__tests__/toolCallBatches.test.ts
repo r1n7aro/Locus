@@ -60,6 +60,31 @@ describe("toolCallBatches", () => {
     ]);
   });
 
+  it("renders meta tool_call as the target tool", () => {
+    const message: Pick<ChatMessage, "toolCalls"> = {
+      toolCalls: [
+        {
+          id: "tc-meta",
+          name: "tool_call",
+          arguments: JSON.stringify({
+            toolName: "web_fetch",
+            arguments: { url: "https://example.com" },
+          }),
+        },
+      ],
+    };
+
+    expect(buildMessageToolCalls(message, { "tc-meta": "fetched" })).toEqual([
+      {
+        id: "tc-meta",
+        name: "web_fetch",
+        arguments: "{\"url\":\"https://example.com\"}",
+        status: "done",
+        output: "fetched",
+      },
+    ]);
+  });
+
   it("attaches persisted tool result images to historical tool calls", () => {
     const image = { data: "iVBORw0KGgo=", mimeType: "image/png" };
     const message: Pick<ChatMessage, "toolCalls"> = {

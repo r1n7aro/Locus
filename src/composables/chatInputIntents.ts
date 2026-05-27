@@ -2,7 +2,14 @@
 
 export type IntentMode = "build" | "plan";
 export type IntentCommandKind = "action" | "intent";
-export type IntentCommandType = "plan" | "skill" | "compact" | "clear" | "fork" | "undo";
+export type IntentCommandType =
+  | "plan"
+  | "skill"
+  | "compact"
+  | "clear"
+  | "fork"
+  | "undo"
+  | "unity-console";
 
 export interface ComposerIntentState {
   mode: IntentMode;

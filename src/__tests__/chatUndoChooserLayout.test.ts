@@ -28,4 +28,37 @@ describe("chat undo chooser", () => {
     expect(chatView).toContain(':class="{ \'is-selected\': selectedUndoChoice === \'files\' }"');
     expect(chatView).toContain(".undo-chooser-action.is-selected:not(:disabled)");
   });
+
+  it("routes message context menu actions through exact message rollback and fork", () => {
+    const chatView = read("src/components/ChatView.vue");
+    const transcript = read("src/components/chat/ChatTranscript.vue");
+    const sessionService = read("src/services/session.ts");
+    const undoService = read("src/services/undo.ts");
+
+    expect(transcript).toContain('data-chat-message-id');
+    expect(chatView).toContain('e.target.closest("[data-chat-message-id]")');
+    expect(chatView).toContain("messageCtxMenu");
+    expect(chatView).toContain("contextSelectedMessageId");
+    expect(chatView).toContain(":selected-message-id=\"contextSelectedMessageId\"");
+    expect(chatView).toContain("rollbackTargetForMessage");
+    expect(chatView).toContain("props.messages.slice(messageIndex + 1)");
+    expect(chatView).toContain('userText: ""');
+    expect(chatView).toContain("chatStore.rollbackToMessage(targetMessageId");
+    expect(chatView).toContain("chatStore.forkSessionFromMessage(messageId)");
+    expect(transcript).toContain("selectedMessageId?: string | null");
+    expect(transcript).toContain("isContextSelectedMessage");
+    expect(transcript).toContain("isContextSelectedAssistantGroup");
+    expect(transcript).toContain("data-chat-message-group-end-id");
+    expect(chatView).toContain("chatMessageGroupEndId");
+    expect(transcript).toContain("historyRenderSegmentsForGroup(group)");
+    expect(transcript).toContain("v-for=\"segment in historyRenderSegmentsForGroup(group)\"");
+    expect(transcript).not.toContain("historyRenderMessageBlocksForGroup");
+    expect(transcript).toContain("'is-context-selected': isContextSelectedAssistantGroup(group)");
+    expect(transcript).toContain("'is-context-selected'");
+    expect(transcript).not.toContain("'is-context-selected': isContextSelectedMessage(block.itemId)");
+    expect(transcript).not.toContain("'is-context-selected': isContextSelectedMessage(segment.itemId)");
+    expect(sessionService).toContain('ipcInvoke<string>("fork_session_from_message"');
+    expect(sessionService).toContain('ipcInvoke<SessionDetail>("rollback_session_to_message"');
+    expect(undoService).toContain('ipcInvoke("undo_perform_to_message"');
+  });
 });

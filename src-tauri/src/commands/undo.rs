@@ -174,6 +174,63 @@ fn knowledge_undo_sync_plan(files: &[ChangedFile]) -> KnowledgeUndoSyncPlan {
     }
 }
 
+async fn sync_knowledge_after_undo(
+    app_handle: &AppHandle,
+    working_dir: &str,
+    knowledge_index_state: Arc<KnowledgeIndexState>,
+    files: &[ChangedFile],
+) {
+    match knowledge_undo_sync_plan(files) {
+        KnowledgeUndoSyncPlan::None => {}
+        KnowledgeUndoSyncPlan::Incremental(targets) => {
+            if let Err(error) =
+                crate::commands::knowledge::sync_visible_documents_for_paths_and_emit(
+                    app_handle,
+                    working_dir,
+                    knowledge_index_state.clone(),
+                    "undo_perform",
+                    &targets,
+                )
+                .await
+            {
+                eprintln!(
+                    "[undo_perform] failed to sync knowledge documents after undo: {}",
+                    error
+                );
+                if let Err(error) =
+                    crate::commands::knowledge::reconcile_and_emit_knowledge_changed(
+                        app_handle,
+                        working_dir,
+                        knowledge_index_state,
+                        "undo_perform",
+                    )
+                    .await
+                {
+                    eprintln!(
+                        "[undo_perform] failed to reconcile knowledge index after incremental sync failure: {}",
+                        error
+                    );
+                }
+            }
+        }
+        KnowledgeUndoSyncPlan::Reconcile => {
+            if let Err(error) = crate::commands::knowledge::reconcile_and_emit_knowledge_changed(
+                app_handle,
+                working_dir,
+                knowledge_index_state,
+                "undo_perform",
+            )
+            .await
+            {
+                eprintln!(
+                    "[undo_perform] failed to reconcile knowledge index after undo: {}",
+                    error
+                );
+            }
+        }
+    }
+}
+
 #[tauri::command]
 pub async fn undo_perform(
     session_id: String,
@@ -207,8 +264,6 @@ pub async fn undo_perform(
         }
         Err(UndoPerformError::Other(msg)) => return Err(msg.into()),
     };
-    let knowledge_sync_plan = knowledge_undo_sync_plan(&result.restored_files);
-
     if let Err(e) = store.truncate_from_message(&session_id, &result.entry.assistant_message_id) {
         eprintln!("[undo_perform] failed to truncate messages: {}", e);
     } else {
@@ -221,55 +276,68 @@ pub async fn undo_perform(
         crate::llm::codex::reset_cached_session_window(&session_id).await;
     }
 
-    match knowledge_sync_plan {
-        KnowledgeUndoSyncPlan::None => {}
-        KnowledgeUndoSyncPlan::Incremental(targets) => {
-            if let Err(error) =
-                crate::commands::knowledge::sync_visible_documents_for_paths_and_emit(
-                    &app_handle,
-                    &working_dir,
-                    knowledge_index_state.inner().clone(),
-                    "undo_perform",
-                    &targets,
-                )
-                .await
-            {
-                eprintln!(
-                    "[undo_perform] failed to sync knowledge documents after undo: {}",
-                    error
-                );
-                if let Err(error) =
-                    crate::commands::knowledge::reconcile_and_emit_knowledge_changed(
-                        &app_handle,
-                        &working_dir,
-                        knowledge_index_state.inner().clone(),
-                        "undo_perform",
-                    )
-                    .await
-                {
-                    eprintln!(
-                        "[undo_perform] failed to reconcile knowledge index after incremental sync failure: {}",
-                        error
-                    );
-                }
-            }
-        }
-        KnowledgeUndoSyncPlan::Reconcile => {
-            if let Err(error) = crate::commands::knowledge::reconcile_and_emit_knowledge_changed(
-                &app_handle,
-                &working_dir,
-                knowledge_index_state.inner().clone(),
-                "undo_perform",
+    sync_knowledge_after_undo(
+        &app_handle,
+        &working_dir,
+        knowledge_index_state.inner().clone(),
+        &result.restored_files,
+    )
+    .await;
+
+    Ok(result.entry)
+}
+
+#[tauri::command]
+pub async fn undo_perform_to_message(
+    session_id: String,
+    assistant_message_id: String,
+    truncate_message_id: String,
+    force: Option<bool>,
+    app_handle: AppHandle,
+    workspace: State<'_, Arc<Workspace>>,
+    undo_manager: State<'_, UndoManagerHandle>,
+    store: State<'_, Arc<SessionStore>>,
+    knowledge_index_state: State<'_, Arc<KnowledgeIndexState>>,
+) -> Result<UndoEntry, AppError> {
+    let working_dir = workspace.path.read().await.clone();
+    let result = match undo_manager
+        .perform_undo_checked(
+            &session_id,
+            &assistant_message_id,
+            &working_dir,
+            force.unwrap_or(false),
+        )
+        .await
+    {
+        Ok(entry) => entry,
+        Err(UndoPerformError::Conflict(conflicts)) => {
+            let conflicts = enrich_conflicts(store.inner(), conflicts);
+            return Err(AppError::new(
+                "undo.conflict",
+                "Undo blocked because newer changes from other sessions would be overwritten.",
             )
-            .await
-            {
-                eprintln!(
-                    "[undo_perform] failed to reconcile knowledge index after undo: {}",
-                    error
-                );
-            }
+            .detail(format_conflict_detail(&conflicts))
+            .operation("undo"));
         }
+        Err(UndoPerformError::Other(msg)) => return Err(msg.into()),
+    };
+
+    if let Err(e) = store.truncate_after_message(&session_id, &truncate_message_id) {
+        eprintln!(
+            "[undo_perform_to_message] failed to truncate messages after {}: {}",
+            truncate_message_id, e
+        );
+    } else {
+        crate::llm::codex::reset_cached_session_window(&session_id).await;
     }
+
+    sync_knowledge_after_undo(
+        &app_handle,
+        &working_dir,
+        knowledge_index_state.inner().clone(),
+        &result.restored_files,
+    )
+    .await;
 
     Ok(result.entry)
 }

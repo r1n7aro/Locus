@@ -26,9 +26,9 @@ import ToolConfirmCard from "./chat/ToolConfirmCard.vue";
 import ToolConfirmBatchCard from "./chat/ToolConfirmBatchCard.vue";
 import FileDiffViewer from "./diff/FileDiffViewer.vue";
 import BaseButton from "./ui/BaseButton.vue";
+import BaseContextMenu from "./ui/BaseContextMenu.vue";
 import BaseSegmented from "./ui/BaseSegmented.vue";
 import LucideIcon from "./icons/LucideIcon.vue";
-import { clampFloatingPosition } from "./ui/floatingPosition";
 import { refetchDiffByKey } from "../services/diff";
 import { openChatDiffReviewWindow } from "../services/chatDiffReviewWindow";
 import { normalizeAppError } from "../services/errors";
@@ -70,6 +70,10 @@ import {
 } from "../composables/useChatInputSettings";
 import { useDisplaySettings } from "../composables/useDisplaySettings";
 import { useKnowledgeAccessMode } from "../composables/useKnowledgeAccessMode";
+import {
+  buildChatMessageClipboardPayload,
+  writeChatMessageClipboard,
+} from "../composables/chatMessageDraft";
 import { logToolCollapseTrace, previewTraceText } from "../services/toolCollapseTrace";
 import {
   captureTranscriptLayoutSnapshot,
@@ -285,15 +289,16 @@ type AssetRefContextMenuState = {
   target: AssetRefContextMenuTarget;
 };
 
-const ASSET_REF_CONTEXT_MENU_VIEWPORT_MARGIN = 8;
+type MessageContextMenuState = {
+  x: number;
+  y: number;
+  messageId: string;
+};
+
 const KNOWLEDGE_DOCUMENT_ROOT_RE = /^(design|memory|skill|reference)\/(.+\.md)$/i;
 const KNOWLEDGE_DOCUMENT_FILE_RE = /^Locus\/knowledge\/(design|memory|skill|reference)\/(.+\.md)$/i;
 const assetRefCtxMenu = ref<AssetRefContextMenuState | null>(null);
-const assetRefCtxMenuRef = ref<HTMLElement | null>(null);
-const assetRefCtxMenuStyle = computed(() => ({
-  left: `${assetRefCtxMenu.value?.x ?? 0}px`,
-  top: `${assetRefCtxMenu.value?.y ?? 0}px`,
-}));
+const messageCtxMenu = ref<MessageContextMenuState | null>(null);
 
 function isUnityRuntime() {
   return getLocusRuntime().kind === "unity";
@@ -355,31 +360,12 @@ const assetRefContextSupportsUnity = computed(() => {
   return target?.kind === "asset" || target?.kind === "sceneObject";
 });
 
-function viewportSize() {
-  return {
-    width: window.innerWidth || document.documentElement.clientWidth,
-    height: window.innerHeight || document.documentElement.clientHeight,
-  };
-}
-
-function updateAssetRefContextMenuPosition() {
-  const menu = assetRefCtxMenu.value;
-  const el = assetRefCtxMenuRef.value;
-  if (!menu || !el) return;
-
-  const rect = el.getBoundingClientRect();
-  const next = clampFloatingPosition(
-    { x: menu.x, y: menu.y },
-    { width: rect.width, height: rect.height },
-    viewportSize(),
-    ASSET_REF_CONTEXT_MENU_VIEWPORT_MARGIN,
-  );
-  if (next.x === menu.x && next.y === menu.y) return;
-  assetRefCtxMenu.value = { ...menu, x: next.x, y: next.y };
-}
-
 function closeAssetRefContextMenu() {
   assetRefCtxMenu.value = null;
+}
+
+function closeMessageContextMenu() {
+  messageCtxMenu.value = null;
 }
 
 function normalizeAssetRefDatasetPath(path: string | undefined): string {
@@ -435,10 +421,13 @@ function parseKnowledgeDocumentRefPath(filePath: string): AssetRefContextMenuTar
 }
 
 function assetContextTargetFromElement(target: Element): AssetRefContextMenuTarget | null {
-  const knowledgeRef = target.closest(".asset-chip[data-ref-kind='knowledge']") as HTMLElement | null;
+  const knowledgeRef = target.closest(
+    ".md-knowledge-ref[data-knowledge-path], .asset-chip[data-ref-kind='knowledge']",
+  ) as HTMLElement | null;
   if (knowledgeRef) {
-    const docType = toKnowledgeDocumentType(knowledgeRef.dataset.knowledgeType ?? "");
     const path = normalizeAssetRefDatasetPath(knowledgeRef.dataset.knowledgePath);
+    const docType = toKnowledgeDocumentType(knowledgeRef.dataset.knowledgeType ?? "")
+      ?? toKnowledgeDocumentType(path.split("/")[0] ?? "");
     if (docType && path) {
       return {
         kind: "knowledge",
@@ -526,23 +515,56 @@ function assetContextTargetFromElement(target: Element): AssetRefContextMenuTarg
 function handleContentContextMenu(e: MouseEvent) {
   if (!(e.target instanceof Element)) return;
   const target = assetContextTargetFromElement(e.target);
-  if (!target) return;
+  if (target) {
+    e.preventDefault();
+    e.stopPropagation();
+    closeMessageContextMenu();
+    assetRefCtxMenu.value = {
+      x: e.clientX,
+      y: e.clientY,
+      target,
+    };
+    return;
+  }
+
+  const messageEl = e.target.closest("[data-chat-message-id]") as HTMLElement | null;
+  const hitMessageId = messageEl?.dataset.chatMessageId?.trim();
+  if (!hitMessageId) return;
+  const groupEl = messageEl?.closest("[data-chat-message-group-end-id]") as HTMLElement | null;
+  const groupEndMessageId = groupEl?.dataset.chatMessageGroupEndId?.trim();
+  const messageId =
+    groupEl?.dataset.chatMessageGroupRole === "assistant" && groupEndMessageId
+      ? groupEndMessageId
+      : hitMessageId;
+  if (!props.messages.some((message) => message.id === messageId)) return;
 
   e.preventDefault();
   e.stopPropagation();
-  assetRefCtxMenu.value = {
+  closeAssetRefContextMenu();
+  messageCtxMenu.value = {
     x: e.clientX,
     y: e.clientY,
-    target,
+    messageId,
   };
-  void nextTick(updateAssetRefContextMenuPosition);
 }
 
 function handleContentClick(e: MouseEvent) {
+  closeMessageContextMenu();
   const target = e.target as HTMLElement;
   if (target.tagName === "IMG") {
     e.preventDefault();
     openLightbox((target as HTMLImageElement).src);
+    return;
+  }
+  const knowledgeRef = target.closest(".md-knowledge-ref[data-knowledge-path]") as HTMLElement | null;
+  if (knowledgeRef) {
+    e.preventDefault();
+    const path = normalizeAssetRefDatasetPath(knowledgeRef.dataset.knowledgePath);
+    const docType = toKnowledgeDocumentType(knowledgeRef.dataset.knowledgeType ?? "")
+      ?? toKnowledgeDocumentType(path.split("/")[0] ?? "");
+    if (docType && path) {
+      handleKnowledgeRefClick(docType, path);
+    }
     return;
   }
   const workspaceRef = target.closest(".md-workspace-ref") as HTMLElement | null;
@@ -551,6 +573,11 @@ function handleContentClick(e: MouseEvent) {
     const workspacePath = workspaceRef.dataset.workspacePath;
     const entryKind = workspaceRef.dataset.entryKind;
     if (!workspacePath) return;
+    const knowledgeTarget = parseKnowledgeDocumentRefPath(workspacePath);
+    if (knowledgeTarget) {
+      handleKnowledgeRefClick(knowledgeTarget.docType, knowledgeTarget.path);
+      return;
+    }
     if (entryKind === "folder") {
       handleFolderRefClick(workspacePath);
       return;
@@ -589,6 +616,11 @@ function handleContentClick(e: MouseEvent) {
     e.preventDefault();
     const filePath = fileRef.dataset.filePath;
     if (!filePath) return;
+    const knowledgeTarget = parseKnowledgeDocumentRefPath(filePath);
+    if (knowledgeTarget) {
+      handleKnowledgeRefClick(knowledgeTarget.docType, knowledgeTarget.path);
+      return;
+    }
     if (fileRef.dataset.entryKind === "folder") {
       handleFolderRefClick(filePath);
       return;
@@ -600,6 +632,14 @@ function handleContentClick(e: MouseEvent) {
     }
     handleFileRefClick(filePath);
   }
+}
+
+function handleKnowledgeRefClick(docType: KnowledgeDocumentType, path: string) {
+  uiStore.stageKnowledgeSelection({
+    dashboard: docType,
+    path,
+  });
+  uiStore.setTab("knowledge");
 }
 
 function handleUnityAssetInspectorClick(filePath: string) {
@@ -670,6 +710,9 @@ function notifyAssetRefContextMenuError(error: unknown, operation: string, fallb
 function assetRefContextCopyPath(target: AssetRefContextMenuTarget): string {
   if (target.kind === "sceneObject") {
     return `${target.scenePath}/${target.objectPath}`;
+  }
+  if (target.kind === "knowledge") {
+    return target.path;
   }
   return target.filePath;
 }
@@ -771,6 +814,57 @@ async function doAssetRefSelectInUnity() {
   }
 }
 
+const messageContextMessage = computed(() => {
+  const messageId = messageCtxMenu.value?.messageId;
+  if (!messageId) return null;
+  return props.messages.find((message) => message.id === messageId) ?? null;
+});
+
+const messageContextCanCopy = computed(() =>
+  !!messageContextMessage.value && messageContextMessage.value.role !== "tool",
+);
+
+const messageContextCanAct = computed(() =>
+  !!props.activeSessionId
+  && !props.isStreaming
+  && !!messageContextMessage.value
+  && messageContextMessage.value.role !== "tool",
+);
+
+async function doMessageCopy() {
+  const message = messageContextMessage.value;
+  if (!message || !messageContextCanCopy.value) return;
+  closeMessageContextMenu();
+  try {
+    await writeChatMessageClipboard(buildChatMessageClipboardPayload(message));
+    notificationStore.addNotice("success", t("common.copied"), {
+      operation: "messageCopy",
+      replaceOperation: true,
+      skipConsoleLog: true,
+    });
+  } catch (error) {
+    console.warn("copy chat message failed:", error);
+    notificationStore.addNotice("warning", t("chat.messageMenu.copyFailed"), {
+      operation: "messageCopy",
+      replaceOperation: true,
+    });
+  }
+}
+
+async function doMessageRollback() {
+  const messageId = messageCtxMenu.value?.messageId ?? null;
+  if (!messageId || !messageContextCanAct.value) return;
+  closeMessageContextMenu();
+  await openUndoChooser(messageId);
+}
+
+async function doMessageFork() {
+  const messageId = messageCtxMenu.value?.messageId ?? null;
+  if (!messageId || !messageContextCanAct.value) return;
+  closeMessageContextMenu();
+  await chatStore.forkSessionFromMessage(messageId);
+}
+
 function handleQuestionAnswer(answer: string) {
   emit("answerQuestion", answer);
 }
@@ -792,6 +886,8 @@ const undoChooserRef = ref<HTMLElement | null>(null);
 const selectedUndoChoice = ref<UndoChoice>("conversation");
 const undoAction = ref<"conversation" | "files" | null>(null);
 const undoChooserBusy = computed(() => undoAction.value !== null);
+const undoTargetMessageId = ref<string | null>(null);
+const contextSelectedMessageId = computed(() => messageCtxMenu.value?.messageId ?? undoTargetMessageId.value);
 
 const latestConversationTurn = computed(() => {
   let userIndex = -1;
@@ -814,11 +910,36 @@ const latestConversationTurn = computed(() => {
   };
 });
 
+function rollbackTargetForMessage(messageId: string) {
+  const messageIndex = props.messages.findIndex((message) => message.id === messageId);
+  if (messageIndex < 0) return null;
+  const message = props.messages[messageIndex];
+  if (!message || message.role === "tool") return null;
+
+  const rollbackMessages = props.messages.slice(messageIndex + 1);
+  const fileUndoTarget = rollbackMessages.find(
+    (candidate) => candidate.role === "assistant" && !!props.undoableMessageIds?.has(candidate.id),
+  )?.id ?? null;
+
+  return {
+    messageId,
+    userText: "",
+    fileUndoTarget,
+  };
+}
+
+const currentUndoTarget = computed(() => {
+  if (undoTargetMessageId.value) {
+    return rollbackTargetForMessage(undoTargetMessageId.value);
+  }
+  return latestConversationTurn.value;
+});
+
 const canUndoConversation = computed(() =>
-  !!props.activeSessionId && !!latestConversationTurn.value && !props.isStreaming,
+  !!props.activeSessionId && !!currentUndoTarget.value && !props.isStreaming,
 );
 const canUndoFilesAndConversation = computed(() =>
-  canUndoConversation.value && !!latestConversationTurn.value?.fileUndoTarget,
+  canUndoConversation.value && !!currentUndoTarget.value?.fileUndoTarget,
 );
 const undoChoices = computed<UndoChoice[]>(() => {
   if (!canUndoConversation.value) return [];
@@ -861,7 +982,8 @@ function defaultUndoChoice(): UndoChoice {
   return canUndoFilesAndConversation.value ? "files" : "conversation";
 }
 
-async function openUndoChooser() {
+async function openUndoChooser(messageId: string | null = null) {
+  undoTargetMessageId.value = messageId;
   selectedUndoChoice.value = defaultUndoChoice();
   undoChooserVisible.value = true;
   await nextTick();
@@ -871,6 +993,7 @@ async function openUndoChooser() {
 function closeUndoChooser() {
   if (undoChooserBusy.value) return;
   undoChooserVisible.value = false;
+  undoTargetMessageId.value = null;
 }
 
 function restoreUndoText(text: string) {
@@ -924,14 +1047,18 @@ function handleUndoChooserKeydown(event: KeyboardEvent) {
 }
 
 async function undoConversationOnly() {
-  const turn = latestConversationTurn.value;
+  const targetMessageId = undoTargetMessageId.value;
+  const turn = currentUndoTarget.value;
   if (!turn || !canUndoConversation.value || undoChooserBusy.value) return;
   undoAction.value = "conversation";
   chatChangesStore.closeInlineDiff();
   try {
-    const undone = await chatStore.undoLatestConversationTurn();
+    const undone = targetMessageId
+      ? await chatStore.rollbackToMessage(targetMessageId, { includeFiles: false })
+      : await chatStore.undoLatestConversationTurn();
     if (undone) {
       undoChooserVisible.value = false;
+      undoTargetMessageId.value = null;
       restoreUndoText(turn.userText);
     }
   } finally {
@@ -940,15 +1067,22 @@ async function undoConversationOnly() {
 }
 
 async function undoFilesAndConversation() {
-  const turn = latestConversationTurn.value;
+  const targetMessageId = undoTargetMessageId.value;
+  const turn = currentUndoTarget.value;
   const targetId = turn?.fileUndoTarget;
   if (!targetId || !canUndoFilesAndConversation.value || undoChooserBusy.value) return;
   undoAction.value = "files";
   chatChangesStore.closeInlineDiff();
   try {
-    const undone = await chatStore.performUndo(targetId);
+    const undone = targetMessageId
+      ? await chatStore.rollbackToMessage(targetMessageId, {
+          includeFiles: true,
+          fileUndoTarget: targetId,
+        })
+      : await chatStore.performUndo(targetId);
     if (undone) {
       undoChooserVisible.value = false;
+      undoTargetMessageId.value = null;
       restoreUndoText(turn.userText);
     }
   } finally {
@@ -1969,6 +2103,7 @@ onUnmounted(() => {
           :thinking-duration="thinkingDuration"
           :live-render-parts="liveRenderParts"
           :active-tool-calls="activeToolCalls"
+          :selected-message-id="contextSelectedMessageId"
           user-label="You"
           assistant-label="Locus"
           :handoff-label="t('chat.transcript.handoff')"
@@ -2244,19 +2379,52 @@ onUnmounted(() => {
       </Transition>
     </Teleport>
 
-    <Teleport to="body">
-      <div
-        v-if="assetRefCtxMenu"
-        class="asset-ref-ctx-backdrop"
-        @click="closeAssetRefContextMenu"
-        @contextmenu.prevent="closeAssetRefContextMenu"
-      >
-        <div
-          ref="assetRefCtxMenuRef"
-          class="asset-ref-ctx-menu"
-          :style="assetRefCtxMenuStyle"
-          @click.stop
-        >
+    <BaseContextMenu
+      v-if="messageCtxMenu"
+      class="asset-ref-ctx-menu"
+      :x="messageCtxMenu.x"
+      :y="messageCtxMenu.y"
+      :min-width="184"
+      @close="closeMessageContextMenu"
+    >
+          <button
+            type="button"
+            class="asset-ref-ctx-item ui-select-none"
+            role="menuitem"
+            :disabled="!messageContextCanCopy"
+            @click="doMessageCopy"
+          >
+            {{ t("chat.messageMenu.copyMessage") }}
+          </button>
+          <div class="asset-ref-ctx-sep"></div>
+          <button
+            type="button"
+            class="asset-ref-ctx-item ui-select-none"
+            role="menuitem"
+            :disabled="!messageContextCanAct"
+            @click="doMessageRollback"
+          >
+            {{ t("chat.messageMenu.rollbackToMessage") }}
+          </button>
+          <button
+            type="button"
+            class="asset-ref-ctx-item ui-select-none"
+            role="menuitem"
+            :disabled="!messageContextCanAct"
+            @click="doMessageFork"
+          >
+            {{ t("chat.messageMenu.forkFromMessage") }}
+          </button>
+    </BaseContextMenu>
+
+    <BaseContextMenu
+      v-if="assetRefCtxMenu"
+      class="asset-ref-ctx-menu"
+      :x="assetRefCtxMenu.x"
+      :y="assetRefCtxMenu.y"
+      :min-width="184"
+      @close="closeAssetRefContextMenu"
+    >
           <button
             v-if="assetRefContextIsKnowledge"
             type="button"
@@ -2291,9 +2459,7 @@ onUnmounted(() => {
               {{ t("common.selectInUnity") }}
             </button>
           </template>
-        </div>
-      </div>
-    </Teleport>
+    </BaseContextMenu>
 
     <Transition name="lightbox">
       <div v-if="lightboxSrc" class="lightbox-overlay" @click="closeLightbox">
@@ -2772,7 +2938,7 @@ onUnmounted(() => {
 }
 
 .chat-view.is-vertical-layout :deep(.chat-transcript-scroll.is-session) {
-  padding: 14px 0;
+  padding: 14px 0 0;
 }
 
 .chat-view.is-vertical-layout :deep(.chat-transcript-message.is-session) {
@@ -3106,27 +3272,27 @@ onUnmounted(() => {
   inset: 0;
   z-index: 1300;
   display: flex;
-  align-items: flex-end;
+  align-items: center;
   justify-content: center;
-  padding: 0 16px 112px;
-  background: color-mix(in srgb, var(--bg-color) 26%, transparent);
+  padding: 16px;
+  background: rgba(0, 0, 0, 0.28);
 }
 
 .undo-chooser {
-  width: min(420px, calc(100vw - 32px));
+  width: min(360px, calc(100vw - 32px));
   overflow: hidden;
   border: 1px solid var(--border-color);
   border-radius: 8px;
-  background: var(--panel-bg);
-  box-shadow: var(--shadow-popover, 0 12px 28px rgba(0, 0, 0, 0.24));
+  background: var(--elevated-bg, var(--sidebar-bg));
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.22);
 }
 
 .undo-chooser-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  min-height: 40px;
-  padding: 0 10px 0 14px;
+  min-height: 38px;
+  padding: 0 8px 0 12px;
   border-bottom: 1px solid var(--border-color);
 }
 
@@ -3163,8 +3329,8 @@ onUnmounted(() => {
 .undo-chooser-actions {
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  padding: 12px;
+  gap: 6px;
+  padding: 10px 12px 12px;
 }
 
 .undo-chooser-action {
@@ -3172,27 +3338,31 @@ onUnmounted(() => {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  min-height: 36px;
-  padding: 0 12px;
+  min-height: 34px;
+  padding: 0 10px;
   border: 1px solid var(--border-color);
   border-radius: 6px;
-  background: var(--bg-color);
-  color: var(--text-color);
-  font-size: 13px;
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 500;
   text-align: left;
   cursor: pointer;
+  box-shadow: none;
 }
 
 .undo-chooser-action:hover:not(:disabled),
 .undo-chooser-action:focus-visible:not(:disabled) {
-  border-color: color-mix(in srgb, var(--accent-color) 32%, var(--border-color));
+  border-color: var(--border-strong);
   background: var(--hover-bg);
+  color: var(--text-color);
 }
 
 .undo-chooser-action.is-selected:not(:disabled) {
-  border-color: color-mix(in srgb, var(--accent-color) 42%, var(--border-color));
-  background: color-mix(in srgb, var(--accent-soft) 84%, var(--panel-bg) 16%);
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent-color) 12%, transparent);
+  border-color: var(--border-strong);
+  background: var(--active-bg);
+  color: var(--text-color);
 }
 
 .undo-chooser-action:disabled {
@@ -3213,70 +3383,6 @@ onUnmounted(() => {
 
 .undo-chooser-empty {
   padding: 14px;
-}
-
-.asset-ref-ctx-backdrop {
-  position: fixed;
-  inset: 0;
-  z-index: 9999;
-}
-
-.asset-ref-ctx-menu {
-  position: fixed;
-  z-index: 10000;
-  box-sizing: border-box;
-  min-width: min(184px, calc(100vw - 16px));
-  max-width: calc(100vw - 16px);
-  max-height: calc(100vh - 16px);
-  overflow: auto;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  padding: 5px;
-  border: 1px solid var(--border-color);
-  border-radius: 8px;
-  background: var(--elevated-bg, var(--panel-bg));
-  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.24);
-}
-
-.asset-ref-ctx-item {
-  display: flex;
-  align-items: center;
-  width: 100%;
-  min-height: 28px;
-  padding: 0 10px;
-  border: none;
-  border-radius: 6px;
-  background: transparent;
-  color: var(--text-color);
-  font: inherit;
-  font-size: 12px;
-  line-height: 1;
-  text-align: left;
-  white-space: nowrap;
-  cursor: pointer;
-}
-
-.asset-ref-ctx-item:hover:not(:disabled),
-.asset-ref-ctx-item:focus-visible:not(:disabled) {
-  background: var(--hover-bg);
-}
-
-.asset-ref-ctx-item:focus-visible {
-  outline: none;
-}
-
-.asset-ref-ctx-item.disabled,
-.asset-ref-ctx-item:disabled {
-  color: var(--text-secondary);
-  cursor: default;
-  opacity: 0.48;
-}
-
-.asset-ref-ctx-sep {
-  height: 1px;
-  margin: 4px 0;
-  background: var(--border-color);
 }
 
 .lightbox-overlay {
