@@ -19,11 +19,14 @@ describe("Python runtime settings", () => {
     expect(source).toContain('t("settings.general.pythonRuntime")');
     expect(source).toContain("<BaseDropdown");
     expect(source).toContain('menu-align="start"');
-    expect(source).toContain("void refreshPythonRuntimeState(false)");
-    expect(source).toContain('@click="refreshPythonRuntimeState(true)"');
+    expect(source).toContain("void refreshPythonRuntimeState(false, false)");
+    expect(source).toContain('t("settings.general.pythonSearching")');
+    expect(source).toContain('@open="openPythonRuntimeOptions"');
+    expect(source).toContain('@click="refreshPythonRuntimeState(true, true)"');
     expect(source).toContain("@update:model-value=\"selectPythonRuntime\"");
     expect(service).toContain("let pythonRuntimeStateCache");
-    expect(service).toContain('ipcInvoke<PythonRuntimeState>("get_python_runtime_state", { refresh })');
+    expect(service).toContain("let currentPythonRuntimeStateCache");
+    expect(service).toContain('ipcInvoke<PythonRuntimeState>("get_python_runtime_state", { refresh, discover })');
     expect(service).toContain('ipcInvoke<PythonRuntimeState>("save_python_runtime_selection"');
   });
 
@@ -34,9 +37,11 @@ describe("Python runtime settings", () => {
 
     expect(command).toContain("spawn_blocking");
     expect(command).toContain("refresh.unwrap_or(false)");
+    expect(command).toContain("discover.unwrap_or(true)");
     expect(runtime).toContain("command_output_with_timeout");
     expect(runtime).toContain("PY_RUNTIME_PROBE_TIMEOUT");
     expect(runtime).toContain("discover_python_runtimes_cached");
+    expect(runtime).toContain("current_python_runtime_state");
     expect(runtime).toContain("suppress_command_window(&mut command)");
     expect(runtime).toContain("managed_python_package_dir");
     expect(runtime).toContain("write_pip_module_shim");
@@ -53,10 +58,12 @@ describe("Python runtime settings", () => {
     expect(zh).toContain("托管 Python 的依赖安装到数据目录");
     expect(zh).toContain('"settings.general.pythonManaged": "托管 Python"');
     expect(zh).toContain('"settings.general.pythonSystem": "系统 Python"');
+    expect(zh).toContain('"settings.general.pythonSearching": "搜索中.."');
     expect(en).toContain('"settings.general.pythonRuntime": "Python Runtime"');
     expect(en).toContain("Managed Python installs packages into the data directory");
     expect(en).toContain('"settings.general.pythonManaged": "Managed Python"');
     expect(en).toContain('"settings.general.pythonSystem": "System Python"');
+    expect(en).toContain('"settings.general.pythonSearching": "Searching.."');
   });
 
   it("adds Git runtime status to general settings", () => {

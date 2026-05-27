@@ -7,7 +7,13 @@ import BaseSegmented from "../ui/BaseSegmented.vue";
 import BaseSwitch from "../ui/BaseSwitch.vue";
 import { getCachedDebugMode, getDebugMode, setDebugMode } from "../../services/permissions";
 import { gitRuntimeState, gitSaveRuntimeSelection } from "../../services/git";
-import { getPythonRuntimeState, savePythonRuntimeSelection } from "../../services/system";
+import {
+  getCloseBehavior,
+  getPythonRuntimeState,
+  savePythonRuntimeSelection,
+  setCloseBehavior,
+  type AppCloseBehavior,
+} from "../../services/system";
 import {
   clearAppTempDir,
   clearAppStorageMigration,
@@ -46,6 +52,9 @@ const initialDebugMode = getCachedDebugMode();
 const debugEnabled = ref(initialDebugMode ?? false);
 const debugReady = ref(initialDebugMode !== null);
 const debugBusy = ref(false);
+const closeBehavior = ref<AppCloseBehavior>("exit");
+const closeBehaviorReady = ref(false);
+const closeBehaviorBusy = ref(false);
 const storageInfo = ref<AppStorageInfo | null>(null);
 const storageBusy = ref(false);
 const storageInfoLoadFailed = ref(false);
@@ -58,12 +67,26 @@ const gitState = ref<GitRuntimeState | null>(null);
 const gitBusy = ref(false);
 const pythonState = ref<PythonRuntimeState | null>(null);
 const pythonBusy = ref(false);
+const pythonRuntimeDiscovered = ref(false);
 let gitLoadToken = 0;
 let pythonLoadToken = 0;
 
 const languageOptions = computed(() => [
   { value: "zh", label: t("language.zh") },
   { value: "en", label: t("language.en") },
+]);
+
+const closeBehaviorOptions = computed(() => [
+  {
+    value: "exit",
+    label: t("settings.general.closeBehaviorExit"),
+    disabled: !closeBehaviorReady.value || closeBehaviorBusy.value,
+  },
+  {
+    value: "minimizeToTray",
+    label: t("settings.general.closeBehaviorTray"),
+    disabled: !closeBehaviorReady.value || closeBehaviorBusy.value,
+  },
 ]);
 
 const debugStatusLabel = computed(() => {
@@ -73,16 +96,27 @@ const debugStatusLabel = computed(() => {
     : t("settings.general.debugModeOff");
 });
 
-const pythonOptions = computed(() =>
-  (pythonState.value?.runtimes ?? []).map((runtime) => ({
+const pythonOptions = computed(() => {
+  const options = (pythonState.value?.runtimes ?? []).map((runtime) => ({
     value: runtime.id,
     label: pythonRuntimeLabel(runtime),
     hint: runtime.available
       ? pythonRuntimeHint(runtime)
       : t("settings.general.pythonUnavailable"),
     disabled: !runtime.available,
-  })),
-);
+  }));
+  if (pythonBusy.value && !pythonRuntimeDiscovered.value) {
+    return [
+      {
+        value: "__python_runtime_searching",
+        label: t("settings.general.pythonSearching"),
+        disabled: true,
+      },
+      ...options,
+    ];
+  }
+  return options;
+});
 
 const selectedPythonId = computed(() => pythonState.value?.selectedId ?? "");
 const selectedPythonLabel = computed(() => {
@@ -114,10 +148,11 @@ const hasAvailableGitOption = computed(() => gitOptions.value.some((option) => !
 
 onMounted(() => {
   void refreshDebugMode();
+  void refreshCloseBehavior();
   void refreshStorageInfo();
   void refreshTempInfo();
   void refreshGitRuntimeState(false);
-  void refreshPythonRuntimeState(false);
+  void refreshPythonRuntimeState(false, false);
 });
 
 async function refreshDebugMode() {
@@ -149,6 +184,41 @@ async function toggleDebug() {
     });
   } finally {
     debugBusy.value = false;
+  }
+}
+
+async function refreshCloseBehavior() {
+  try {
+    closeBehavior.value = await getCloseBehavior();
+  } catch (e) {
+    const err = normalizeAppError(e);
+    notificationStore.addNotice("error", err.message, {
+      code: err.code,
+      operation: "loadCloseBehavior",
+    });
+  } finally {
+    closeBehaviorReady.value = true;
+  }
+}
+
+async function selectCloseBehavior(value: string) {
+  if (!closeBehaviorReady.value || closeBehaviorBusy.value) return;
+  const next = value === "minimizeToTray" ? "minimizeToTray" : "exit";
+  if (next === closeBehavior.value) return;
+  const previous = closeBehavior.value;
+  closeBehavior.value = next;
+  closeBehaviorBusy.value = true;
+  try {
+    await setCloseBehavior(next);
+  } catch (e) {
+    closeBehavior.value = previous;
+    const err = normalizeAppError(e);
+    notificationStore.addNotice("error", err.message, {
+      code: err.code,
+      operation: "saveCloseBehavior",
+    });
+  } finally {
+    closeBehaviorBusy.value = false;
   }
 }
 
@@ -423,13 +493,16 @@ function pythonRuntimeHint(runtime: PythonRuntimeInfo): string {
   return runtime.path;
 }
 
-async function refreshPythonRuntimeState(refresh = false) {
+async function refreshPythonRuntimeState(refresh = false, discover = true) {
   const token = ++pythonLoadToken;
   pythonBusy.value = true;
   try {
-    const nextState = await getPythonRuntimeState(refresh);
+    const nextState = await getPythonRuntimeState(refresh, discover);
     if (token === pythonLoadToken) {
       pythonState.value = nextState;
+      if (discover) {
+        pythonRuntimeDiscovered.value = true;
+      }
     }
   } catch (e) {
     if (token !== pythonLoadToken) return;
@@ -445,6 +518,11 @@ async function refreshPythonRuntimeState(refresh = false) {
   }
 }
 
+function openPythonRuntimeOptions() {
+  if (pythonBusy.value || pythonRuntimeDiscovered.value) return;
+  void refreshPythonRuntimeState(false, true);
+}
+
 async function selectPythonRuntime(selectedId: string) {
   if (pythonBusy.value || !selectedId) return;
   const token = ++pythonLoadToken;
@@ -453,6 +531,7 @@ async function selectPythonRuntime(selectedId: string) {
     const nextState = await savePythonRuntimeSelection(selectedId);
     if (token === pythonLoadToken) {
       pythonState.value = nextState;
+      pythonRuntimeDiscovered.value = true;
     }
   } catch (e) {
     if (token !== pythonLoadToken) return;
@@ -461,7 +540,7 @@ async function selectPythonRuntime(selectedId: string) {
       code: err.code,
       operation: "savePythonRuntime",
     });
-    await refreshPythonRuntimeState(true);
+    await refreshPythonRuntimeState(true, true);
   } finally {
     if (token === pythonLoadToken) {
       pythonBusy.value = false;
@@ -495,6 +574,19 @@ async function selectPythonRuntime(selectedId: string) {
       <span v-else class="debug-toggle-placeholder" aria-hidden="true" />
       <span class="debug-toggle-label">{{ debugStatusLabel }}</span>
     </label>
+  </div>
+
+  <div class="settings-section">
+    <div class="section-label">{{ t("settings.general.closeBehavior") }}</div>
+    <p class="section-desc">{{ t("settings.general.closeBehaviorDesc") }}</p>
+    <BaseSegmented
+      class="close-behavior-segmented"
+      :model-value="closeBehavior"
+      :options="closeBehaviorOptions"
+      :aria-label="t('settings.general.closeBehavior')"
+      size="sm"
+      @update:model-value="selectCloseBehavior"
+    />
   </div>
 
   <div class="settings-section">
@@ -651,10 +743,11 @@ async function selectPythonRuntime(selectedId: string) {
           menu-align="start"
           :placeholder="t('settings.general.pythonNone')"
           :aria-label="t('settings.general.pythonRuntime')"
-          :disabled="pythonBusy || !hasAvailablePythonOption"
+          :disabled="pythonBusy || (pythonRuntimeDiscovered && !hasAvailablePythonOption)"
+          @open="openPythonRuntimeOptions"
           @update:model-value="selectPythonRuntime"
         />
-        <button class="action-btn python-btn" :disabled="pythonBusy" @click="refreshPythonRuntimeState(true)">
+        <button class="action-btn python-btn" :disabled="pythonBusy" @click="refreshPythonRuntimeState(true, true)">
           {{ t("common.refresh") }}
         </button>
       </div>
@@ -710,6 +803,10 @@ async function selectPythonRuntime(selectedId: string) {
 }
 .debug-toggle-label {
   font-size: 13px;
+}
+.close-behavior-segmented {
+  width: fit-content;
+  max-width: 100%;
 }
 .storage-block {
   display: flex;

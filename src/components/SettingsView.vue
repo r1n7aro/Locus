@@ -12,6 +12,7 @@ import { t, locale, setLocale } from "../i18n";
 import { useSettingsState } from "../composables/useSettingsState";
 import GeneralSettings from "./settings/GeneralSettings.vue";
 import DisplaySettings from "./settings/DisplaySettings.vue";
+import NotificationsSettings from "./settings/NotificationsSettings.vue";
 import ShortcutSettings from "./settings/ShortcutSettings.vue";
 import ConsoleSettings from "./settings/ConsoleSettings.vue";
 import AboutSettings from "./settings/AboutSettings.vue";
@@ -21,6 +22,7 @@ import CustomEndpointModal from "./settings/CustomEndpointModal.vue";
 import ModelDefaultsPanel from "./settings/ModelDefaults.vue";
 import ToolPermissions from "./settings/ToolPermissions.vue";
 import ArchivedSessionsSettings from "./settings/ArchivedSessionsSettings.vue";
+import KnowledgeSettings from "./settings/KnowledgeSettings.vue";
 import SubscriptionDisclaimerModal from "./SubscriptionDisclaimerModal.vue";
 import { useUiStore } from "../stores/ui";
 import { useChatStore } from "../stores/chat";
@@ -44,6 +46,7 @@ const {
   resetConfirm, handleResetOnboarding, activeCategory,
   providers, editingProvider, editKey, errorMsg, successMsg, isLoading,
   startEdit, cancelEdit, saveKey, deleteKey, handleKeydown,
+  dynamicToolLoadingMode, dynamicToolLoadingBusy, setDynamicToolLoadingMode,
   oauthStep, oauthCode, submitOAuthCode, cancelOAuth, oauthLogout, handleOAuthKeydown,
   codexStep, codexStatus, codexQuota, codexRetrying, codexModelConfig, codexUserCode, codexUrl, codexCodeCopied, cancelCodexLogin, codexLogout, retryCodexValidation, copyCode, setCodexTransportMode, loadCodexRateLimits,
   showDisclaimer, requestOAuthLogin, requestCodexLogin, cancelDisclaimer,
@@ -104,6 +107,16 @@ watch(
         </button>
         <button
           class="sidebar-item"
+          :class="{ active: activeCategory === 'notifications' }"
+          @click="activeCategory = 'notifications'"
+        >
+          <svg viewBox="0 0 16 16" fill="currentColor" width="14" height="14">
+            <path d="M8 1.5a3.75 3.75 0 0 0-3.75 3.75v1.9c0 .7-.2 1.38-.57 1.96L3.04 10.1A1.25 1.25 0 0 0 4.1 12h7.8a1.25 1.25 0 0 0 1.06-1.9l-.64-.99a3.7 3.7 0 0 1-.57-1.96v-1.9A3.75 3.75 0 0 0 8 1.5zM6.25 13a1.75 1.75 0 0 0 3.5 0h-3.5z"/>
+          </svg>
+          <span>{{ t("settings.tab.notifications") }}</span>
+        </button>
+        <button
+          class="sidebar-item"
           :class="{ active: activeCategory === 'shortcuts' }"
           @click="activeCategory = 'shortcuts'"
         >
@@ -141,6 +154,16 @@ watch(
             <path d="M8 1a3.5 3.5 0 0 0-3.5 3.5v1H3.25A1.25 1.25 0 0 0 2 6.75v7A1.25 1.25 0 0 0 3.25 15h9.5A1.25 1.25 0 0 0 14 13.75v-7A1.25 1.25 0 0 0 12.75 5.5H11.5v-1A3.5 3.5 0 0 0 8 1zm-2 4.5v-1a2 2 0 1 1 4 0v1H6z"/>
           </svg>
           <span>{{ t("settings.tab.permissions") }}</span>
+        </button>
+        <button
+          class="sidebar-item"
+          :class="{ active: activeCategory === 'knowledge' }"
+          @click="activeCategory = 'knowledge'"
+        >
+          <svg viewBox="0 0 16 16" fill="currentColor" width="14" height="14">
+            <path d="M3 2.25A1.25 1.25 0 0 1 4.25 1h8.25A1.5 1.5 0 0 1 14 2.5v10A1.5 1.5 0 0 1 12.5 14H4.25A1.25 1.25 0 0 1 3 12.75V2.25zM4.25 2a.25.25 0 0 0-.25.25v10.5c0 .138.112.25.25.25H12.5a.5.5 0 0 0 .5-.5v-10a.5.5 0 0 0-.5-.5H4.25zM5.5 4h5.75a.75.75 0 0 1 0 1.5H5.5A.75.75 0 0 1 5.5 4zm0 3h5.75a.75.75 0 0 1 0 1.5H5.5A.75.75 0 0 1 5.5 7z"/>
+          </svg>
+          <span>{{ t("settings.tab.knowledge") }}</span>
         </button>
         <button
           class="sidebar-item"
@@ -205,6 +228,8 @@ watch(
           :codex-quota="codexQuota"
           :codex-retrying="codexRetrying"
           :codex-transport="codexModelConfig.transport"
+          :dynamic-tool-loading-mode="dynamicToolLoadingMode"
+          :dynamic-tool-loading-busy="dynamicToolLoadingBusy"
           :codex-user-code="codexUserCode"
           :codex-url="codexUrl"
           :codex-code-copied="codexCodeCopied"
@@ -228,6 +253,7 @@ watch(
           @refresh-codex-quota="loadCodexRateLimits"
           @copy-code="copyCode"
           @update:codex-transport="setCodexTransportMode"
+          @update:dynamic-tool-loading-mode="setDynamicToolLoadingMode"
           @start-add-endpoint="startAddEndpoint"
           @start-edit-endpoint="startEditEndpoint"
           @delete-endpoint="deleteEndpoint"
@@ -264,12 +290,20 @@ watch(
         />
       </template>
 
+      <template v-if="activeCategory === 'knowledge'">
+        <KnowledgeSettings />
+      </template>
+
       <template v-if="activeCategory === 'proxy'">
         <ProxySettings />
       </template>
 
       <template v-if="activeCategory === 'display'">
         <DisplaySettings />
+      </template>
+
+      <template v-if="activeCategory === 'notifications'">
+        <NotificationsSettings />
       </template>
 
       <template v-if="activeCategory === 'shortcuts'">

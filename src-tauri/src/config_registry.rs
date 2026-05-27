@@ -38,6 +38,7 @@ pub fn collect_all(app_handle: &tauri::AppHandle) -> Result<Vec<ConfigEntry>, Ap
 
     collect_general(&mut entries);
     collect_display(&mut entries);
+    collect_notifications(&mut entries);
     collect_api(&mut entries);
     collect_models(&mut entries);
     collect_permissions(app_handle, &mut entries);
@@ -54,6 +55,7 @@ pub fn collect_by_category(
     match category {
         "general" => collect_general(&mut entries),
         "display" => collect_display(&mut entries),
+        "notifications" => collect_notifications(&mut entries),
         "api" => collect_api(&mut entries),
         "models" => collect_models(&mut entries),
         "permissions" => collect_permissions(app_handle, &mut entries),
@@ -62,7 +64,7 @@ pub fn collect_by_category(
             return Err(AppError::new(
                 "invalid_category",
                 format!(
-                    "Unknown category '{}'. Valid: general, display, api, models, permissions, knowledge",
+                    "Unknown category '{}'. Valid: general, display, notifications, api, models, permissions, knowledge",
                     category
                 ),
             ));
@@ -132,31 +134,6 @@ fn collect_display(out: &mut Vec<ConfigEntry>) {
             "Auto-close Changes Panel",
             "Automatically close the file-changes panel when a new tool-call round starts.",
         ),
-        (
-            "system_notifications_enabled",
-            "Background System Notifications",
-            "Enable desktop notifications for key chat events while the app is unfocused.",
-        ),
-        (
-            "notify_on_chat_done",
-            "Notify on Chat Complete",
-            "Send a desktop notification when a chat run completes.",
-        ),
-        (
-            "notify_on_ask_user",
-            "Notify on User Input Request",
-            "Send a desktop notification when the agent asks the user for input.",
-        ),
-        (
-            "notify_on_chat_error",
-            "Notify on Chat Error",
-            "Send a desktop notification when a chat run fails.",
-        ),
-        (
-            "notify_on_tool_confirm",
-            "Notify on Tool Approval",
-            "Send a desktop notification when a tool action waits for approval.",
-        ),
     ] {
         out.push(ConfigEntry {
             key: format!("display.{}", key_suffix),
@@ -184,6 +161,102 @@ fn collect_display(out: &mut Vec<ConfigEntry>) {
                 slot
             ),
             storage: "localStorage: locus-display-settings → fonts".into(),
+            current_value: "(frontend-only)".into(),
+        });
+    }
+}
+
+// ── notifications ────────────────────────────────────────────────────────────
+
+fn collect_notifications(out: &mut Vec<ConfigEntry>) {
+    for (key_suffix, label, desc) in [
+        (
+            "system_notifications_enabled",
+            "Background System Notifications",
+            "Enable desktop notifications for key chat events while the app is unfocused.",
+        ),
+        (
+            "notify_on_chat_done",
+            "Notify on Chat Complete",
+            "Send a desktop notification when a chat run completes.",
+        ),
+        (
+            "notify_on_subagent_done",
+            "Notify on Sub-agent Complete",
+            "Send a desktop notification when a sub-agent run completes.",
+        ),
+        (
+            "notify_on_ask_user",
+            "Notify on User Input Request",
+            "Send a desktop notification when the agent asks the user for input.",
+        ),
+        (
+            "notify_on_chat_error",
+            "Notify on Chat Error",
+            "Send a desktop notification when a chat run fails.",
+        ),
+        (
+            "notify_on_tool_confirm",
+            "Notify on Tool Approval",
+            "Send a desktop notification when a tool action waits for approval.",
+        ),
+        (
+            "sound_alerts_enabled",
+            "Sound Alerts",
+            "Enable sound alerts for key chat events.",
+        ),
+        (
+            "sound_alert_mode",
+            "Sound Alert Mode",
+            "Sound profile used for sound alerts: soft, bright, or urgent.",
+        ),
+        (
+            "sound_alert_source",
+            "Sound Alert Source",
+            "Sound source used for sound alerts: built-in or custom.",
+        ),
+        (
+            "sound_alert_custom_file_path",
+            "Custom Sound File",
+            "Audio file path used when custom sound alerts are selected.",
+        ),
+        (
+            "sound_alert_volume",
+            "Sound Alert Volume",
+            "Volume used for built-in and custom sound alerts.",
+        ),
+        (
+            "sound_on_chat_done",
+            "Sound on Chat Complete",
+            "Play a sound when a chat run completes.",
+        ),
+        (
+            "sound_on_subagent_done",
+            "Sound on Sub-agent Complete",
+            "Play a sound when a sub-agent run completes.",
+        ),
+        (
+            "sound_on_ask_user",
+            "Sound on User Input Request",
+            "Play a sound when the agent asks the user for input.",
+        ),
+        (
+            "sound_on_chat_error",
+            "Sound on Chat Error",
+            "Play a sound when a chat run fails.",
+        ),
+        (
+            "sound_on_tool_confirm",
+            "Sound on Tool Approval",
+            "Play a sound when a tool action waits for approval.",
+        ),
+    ] {
+        out.push(ConfigEntry {
+            key: format!("notifications.{}", key_suffix),
+            category: "notifications".into(),
+            label: label.into(),
+            description: desc.into(),
+            storage: "localStorage: locus-display-settings".into(),
             current_value: "(frontend-only)".into(),
         });
     }
@@ -503,6 +576,10 @@ fn collect_knowledge(app_handle: &tauri::AppHandle, out: &mut Vec<ConfigEntry>) 
         .and_then(|wd| crate::knowledge_store::list_documents(wd, None, None).ok())
         .map(|docs| docs.len())
         .unwrap_or(0);
+    let default_skill_package_namespace = app_handle
+        .try_state::<Arc<crate::config::AppConfig>>()
+        .map(|config| config.default_skill_package_namespace())
+        .unwrap_or_default();
 
     out.push(ConfigEntry {
         key: "knowledge.documents.root".into(),
@@ -521,5 +598,20 @@ fn collect_knowledge(app_handle: &tauri::AppHandle, out: &mut Vec<ConfigEntry>) 
         description: "Number of knowledge documents currently indexed in this workspace.".into(),
         storage: "<project>/Locus/knowledge/**/*.md".into(),
         current_value: knowledge_doc_count.to_string(),
+    });
+
+    out.push(ConfigEntry {
+        key: "knowledge.skill.default_package_namespace".into(),
+        category: "knowledge".into(),
+        label: "Default Skill Package Namespace".into(),
+        description:
+            "Optional author namespace for manually assigned published or shared Skill package IDs."
+                .into(),
+        storage: "persistent_config_dir/config.json → default_skill_package_namespace".into(),
+        current_value: if default_skill_package_namespace.is_empty() {
+            "(empty)".into()
+        } else {
+            default_skill_package_namespace
+        },
     });
 }

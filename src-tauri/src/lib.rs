@@ -5,6 +5,8 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+use tauri::menu::MenuBuilder;
+use tauri::tray::{MouseButton, TrayIconBuilder, TrayIconEvent};
 use tauri::webview::PageLoadEvent;
 use tauri::{Emitter, Manager, WindowEvent};
 
@@ -51,6 +53,9 @@ use commands::AppKnowledgeDir;
 
 const MAIN_WINDOW_LABEL: &str = "main";
 const MAIN_WINDOW_CLOSE_REQUESTED_EVENT: &str = "locus-main-window-close-requested";
+const MAIN_TRAY_ID: &str = "locus-main-tray";
+const TRAY_MENU_SHOW_ID: &str = "locus-tray-show";
+const TRAY_MENU_EXIT_ID: &str = "locus-tray-exit";
 
 #[derive(Clone)]
 struct StartupTrace {
@@ -87,6 +92,101 @@ impl StartupTrace {
     }
 }
 
+fn emit_main_window_close_request(window: &tauri::Window) {
+    if let Err(error) = window.emit(MAIN_WINDOW_CLOSE_REQUESTED_EVENT, ()) {
+        eprintln!(
+            "[Locus] failed to emit main window close request event: {}",
+            error
+        );
+    }
+}
+
+fn set_main_tray_visible(app_handle: &tauri::AppHandle, visible: bool) -> bool {
+    let Some(tray) = app_handle.tray_by_id(MAIN_TRAY_ID) else {
+        return false;
+    };
+    if let Err(error) = tray.set_visible(visible) {
+        eprintln!("[Locus] failed to update tray icon visibility: {}", error);
+        return false;
+    }
+    true
+}
+
+fn reveal_main_window(app_handle: &tauri::AppHandle) {
+    if let Some(window) = app_handle.get_webview_window(MAIN_WINDOW_LABEL) {
+        if let Err(error) = window.show() {
+            eprintln!("[Locus] failed to show main window from tray: {}", error);
+        }
+        if let Err(error) = window.set_focus() {
+            eprintln!("[Locus] failed to focus main window from tray: {}", error);
+        }
+    }
+    let _ = set_main_tray_visible(app_handle, false);
+}
+
+fn hide_main_window_to_tray(window: &tauri::Window) {
+    let app_handle = window.app_handle();
+    if !set_main_tray_visible(app_handle, true) {
+        emit_main_window_close_request(window);
+        return;
+    }
+
+    if let Err(error) = window.hide() {
+        eprintln!("[Locus] failed to hide main window to tray: {}", error);
+        let _ = set_main_tray_visible(app_handle, false);
+    }
+}
+
+fn tray_menu_labels() -> (&'static str, &'static str) {
+    let is_zh = sys_locale::get_locale()
+        .map(|locale| locale.to_ascii_lowercase().starts_with("zh"))
+        .unwrap_or(false);
+    if is_zh {
+        ("显示 Locus", "退出")
+    } else {
+        ("Show Locus", "Exit")
+    }
+}
+
+fn install_main_tray(app: &mut tauri::App) -> tauri::Result<()> {
+    let (show_label, exit_label) = tray_menu_labels();
+    let menu = MenuBuilder::new(app)
+        .text(TRAY_MENU_SHOW_ID, show_label)
+        .separator()
+        .text(TRAY_MENU_EXIT_ID, exit_label)
+        .build()?;
+
+    let Some(icon) = app.default_window_icon().cloned() else {
+        eprintln!("[Locus] warning: default tray icon is unavailable");
+        return Ok(());
+    };
+
+    let tray = TrayIconBuilder::with_id(MAIN_TRAY_ID)
+        .icon(icon)
+        .tooltip("Locus")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app_handle, event| match event.id().as_ref() {
+            TRAY_MENU_SHOW_ID => reveal_main_window(app_handle),
+            TRAY_MENU_EXIT_ID => commands::exit_app(app_handle),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| match event {
+            TrayIconEvent::Click {
+                button: MouseButton::Left,
+                ..
+            }
+            | TrayIconEvent::DoubleClick {
+                button: MouseButton::Left,
+                ..
+            } => reveal_main_window(tray.app_handle()),
+            _ => {}
+        })
+        .build(app)?;
+    tray.set_visible(false)?;
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct AppAgentDir(pub Arc<Option<std::path::PathBuf>>);
 use asset_db::watcher::AssetDbWatcher;
@@ -94,7 +194,7 @@ pub use asset_db::AssetDbState;
 use auth::codex::CodexAuthState;
 use auth::AuthState;
 use commands::CodexAuthStateHandle;
-use config::AppConfig;
+use config::{AppCloseBehavior, AppConfig};
 
 pub type AssetDbWatcherHandle = Arc<std::sync::Mutex<Option<AssetDbWatcher>>>;
 pub type KnowledgeFsWatcherHandle =
@@ -248,12 +348,12 @@ pub fn run() {
 
             if let WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
-                if let Err(error) = window.emit(MAIN_WINDOW_CLOSE_REQUESTED_EVENT, ()) {
-                    eprintln!(
-                        "[Locus] failed to emit main window close request event: {}",
-                        error
-                    );
+                let config = window.app_handle().state::<Arc<AppConfig>>();
+                if config.close_behavior() == AppCloseBehavior::MinimizeToTray {
+                    hide_main_window_to_tray(window);
+                    return;
                 }
+                emit_main_window_close_request(window);
             }
         })
         .setup(move |app| {
@@ -453,6 +553,7 @@ pub fn run() {
                 Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
             let undo_manager: UndoManagerHandle = Arc::new(vcs::UndoManager::new(vcs::GitProvider));
+            let view_automation_store = Arc::new(view::ViewAutomationStore::default());
 
             let tool_mode_path = data_dir.join("tool_permission_mode.txt");
             let initial_tool_mode = std::fs::read_to_string(&tool_mode_path)
@@ -723,6 +824,7 @@ pub fn run() {
             app.manage(agent_graph_tool_store);
             app.manage(knowledge_proposal_drafts);
             app.manage(undo_manager);
+            app.manage(view_automation_store);
             app.manage(tool_permission_mode);
             app.manage(tool_permissions);
             app.manage(binary_cache);
@@ -743,6 +845,9 @@ pub fn run() {
             startup_for_setup.mark("main_window_build_start");
             tauri::WebviewWindowBuilder::from_config(app.handle(), main_window_config)?.build()?;
             startup_for_setup.mark("main_window_build_done");
+            if let Err(error) = install_main_tray(app) {
+                eprintln!("[Locus] warning: failed to install tray icon: {}", error);
+            }
 
             commands::start_unity_embed_control_server(app.handle().clone());
             #[cfg(target_os = "windows")]
@@ -819,6 +924,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::create_session,
             commands::fork_session,
+            commands::fork_session_from_message,
             commands::chat,
             commands::queue_chat_input,
             commands::insert_pending_chat_input,
@@ -826,6 +932,7 @@ pub fn run() {
             commands::list_subagent_defs,
             commands::get_agent_system_prompt,
             commands::get_agent_env_template,
+            commands::get_agent_rendered_env_prompt,
             commands::get_agent_system_prompt_stats,
             commands::list_agent_injected_items,
             commands::set_agent_tool_direct_load,
@@ -860,6 +967,8 @@ pub fn run() {
             commands::get_working_dir,
             commands::set_working_dir,
             commands::list_recent_dirs,
+            commands::remove_recent_dir,
+            commands::open_dir_in_file_explorer,
             commands::list_dir_entries,
             commands::list_dir_entries_page,
             commands::search_workspace_entries,
@@ -871,6 +980,7 @@ pub fn run() {
             commands::apply_knowledge_proposal,
             commands::check_unity_connection,
             commands::check_unity_connection_status,
+            commands::get_unity_console_text,
             commands::check_unity_plugin,
             commands::install_unity_plugin,
             commands::launch_unity_project,
@@ -993,14 +1103,19 @@ pub fn run() {
             commands::knowledge_edit,
             commands::list_skills,
             commands::read_skill_manifest,
+            commands::get_default_skill_package_namespace,
+            commands::set_default_skill_package_namespace,
             commands::create_skill_scaffold,
             commands::delete_skill_package,
+            commands::import_skill_package,
+            commands::export_skill_package,
             commands::get_skill_unity_install_status,
             commands::install_skill_unity_files,
             commands::remove_skill_unity_files,
             commands::open_file_external,
             commands::reveal_workspace_file,
             commands::knowledge_reveal_target,
+            commands::resolve_markdown_image,
             commands::preview_workspace_file,
             commands::list_rules,
             commands::save_rule,
@@ -1031,7 +1146,9 @@ pub fn run() {
             commands::diff_text_for_large,
             commands::diff_strings,
             commands::undo_latest_conversation_turn,
+            commands::rollback_session_to_message,
             commands::undo_perform,
+            commands::undo_perform_to_message,
             commands::undo_preview,
             commands::undo_list,
             commands::undo_check_conflicts,
@@ -1047,11 +1164,16 @@ pub fn run() {
             commands::save_plan_artifact,
             commands::get_system_fonts,
             commands::get_system_locale,
+            commands::get_close_behavior,
+            commands::set_close_behavior,
+            commands::get_dynamic_tool_loading_mode,
+            commands::set_dynamic_tool_loading_mode,
             commands::get_proxy_status,
             commands::save_proxy_config,
             commands::get_python_runtime_state,
             commands::save_python_runtime_selection,
             commands::send_system_notification,
+            commands::play_custom_notification_sound,
             commands::request_app_exit,
             commands::get_config_registry,
             commands::get_log_entries,
@@ -1069,13 +1191,19 @@ pub fn run() {
             commands::view_create_folder,
             commands::view_delete_entry,
             commands::view_move_entry,
+            commands::view_export_package,
+            commands::view_import_package,
             commands::view_read,
             commands::view_reload,
             commands::view_run,
             commands::view_compile_script,
             commands::view_call_script,
             commands::view_append_frontend_log,
+            commands::view_read_frontend_log,
+            commands::view_open_frontend_log,
+            commands::view_automation_respond,
             commands::view_binding_read,
+            commands::view_binding_discover,
             commands::view_binding_write,
             commands::view_binding_apply,
             commands::agent_graph_tool_request,

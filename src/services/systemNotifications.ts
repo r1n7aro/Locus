@@ -8,6 +8,7 @@ import { t } from "../i18n";
 import { sendSystemNotification } from "./system";
 import { getUnityEmbedFocusDebugSnapshot } from "./unity";
 import type { StreamEvent, ToolConfirmDisplay } from "../types";
+import { playNotificationSound, type NotificationSoundIntent } from "./notificationSounds";
 
 interface StreamNotificationContext {
   sessionTitle?: string | null;
@@ -21,7 +22,8 @@ type NotifiableStreamEvent = Extract<
 
 const MAX_RECENT_NOTIFICATION_KEYS = 128;
 
-const recentNotificationKeys = new Map<string, number>();
+const recentSystemNotificationKeys = new Map<string, number>();
+const recentSoundNotificationKeys = new Map<string, number>();
 
 let permissionRequested = false;
 let permissionCheckInFlight: Promise<boolean> | null = null;
@@ -36,12 +38,12 @@ function isNotifiableStreamEvent(event: StreamEvent): event is NotifiableStreamE
   );
 }
 
-function rememberNotificationKey(key: string) {
-  recentNotificationKeys.set(key, Date.now());
-  while (recentNotificationKeys.size > MAX_RECENT_NOTIFICATION_KEYS) {
-    const oldestKey = recentNotificationKeys.keys().next().value;
+function rememberRecentKey(keys: Map<string, number>, key: string) {
+  keys.set(key, Date.now());
+  while (keys.size > MAX_RECENT_NOTIFICATION_KEYS) {
+    const oldestKey = keys.keys().next().value;
     if (!oldestKey) break;
-    recentNotificationKeys.delete(oldestKey);
+    keys.delete(oldestKey);
   }
 }
 
@@ -152,7 +154,10 @@ async function ensureNotificationPermission(): Promise<boolean> {
   }
 }
 
-function isEventEnabled(event: NotifiableStreamEvent, context: StreamNotificationContext): boolean {
+function isSystemNotificationEventEnabled(
+  event: NotifiableStreamEvent,
+  context: StreamNotificationContext,
+): boolean {
   const { state } = useDisplaySettings();
   if (!state.systemNotificationsEnabled) return false;
 
@@ -170,19 +175,77 @@ function isEventEnabled(event: NotifiableStreamEvent, context: StreamNotificatio
   }
 }
 
-export function resetSystemNotificationState() {
-  recentNotificationKeys.clear();
+function isSoundEventEnabled(
+  event: NotifiableStreamEvent,
+  context: StreamNotificationContext,
+): boolean {
+  const { state } = useDisplaySettings();
+  if (!state.soundAlertsEnabled) return false;
+
+  switch (event.type) {
+    case "done":
+      return context.isSubagent ? state.soundOnSubagentDone : state.soundOnChatDone;
+    case "askUser":
+      return state.soundOnAskUser;
+    case "error":
+      return state.soundOnChatError;
+    case "toolConfirm":
+      return state.soundOnToolConfirm;
+    case "knowledgeProposal":
+      return state.soundOnToolConfirm;
+  }
 }
 
-export async function maybeNotifyStreamEvent(
-  event: StreamEvent,
-  context: StreamNotificationContext = {},
+function getSoundIntent(
+  event: NotifiableStreamEvent,
+  context: StreamNotificationContext,
+): NotificationSoundIntent {
+  switch (event.type) {
+    case "done":
+      return context.isSubagent ? "subagentComplete" : "complete";
+    case "askUser":
+      return "input";
+    case "error":
+      return "error";
+    case "toolConfirm":
+    case "knowledgeProposal":
+      return "confirm";
+  }
+}
+
+async function maybePlayEventSound(
+  event: NotifiableStreamEvent,
+  context: StreamNotificationContext,
 ) {
-  if (!isNotifiableStreamEvent(event)) return;
-  if (!isEventEnabled(event, context)) return;
+  const { state } = useDisplaySettings();
+  if (!isSoundEventEnabled(event, context)) return;
 
   const notificationKey = getNotificationKey(event);
-  if (recentNotificationKeys.has(notificationKey)) return;
+  if (recentSoundNotificationKeys.has(notificationKey)) return;
+
+  const customFilePath = state.soundAlertSource === "custom"
+    ? state.soundAlertCustomFilePath
+    : "";
+
+  await Promise.resolve(
+    playNotificationSound(
+      getSoundIntent(event, context),
+      state.soundAlertMode,
+      customFilePath,
+      state.soundAlertVolume,
+    ),
+  ).catch(() => undefined);
+  rememberRecentKey(recentSoundNotificationKeys, notificationKey);
+}
+
+async function maybeSendSystemStreamNotification(
+  event: NotifiableStreamEvent,
+  context: StreamNotificationContext,
+) {
+  if (!isSystemNotificationEventEnabled(event, context)) return;
+
+  const notificationKey = getNotificationKey(event);
+  if (recentSystemNotificationKeys.has(notificationKey)) return;
 
   if (await hasFocusedLocusWindow()) return;
   if (!(await ensureNotificationPermission())) return;
@@ -225,5 +288,19 @@ export async function maybeNotifyStreamEvent(
       break;
   }
 
-  rememberNotificationKey(notificationKey);
+  rememberRecentKey(recentSystemNotificationKeys, notificationKey);
+}
+
+export function resetSystemNotificationState() {
+  recentSystemNotificationKeys.clear();
+  recentSoundNotificationKeys.clear();
+}
+
+export async function maybeNotifyStreamEvent(
+  event: StreamEvent,
+  context: StreamNotificationContext = {},
+) {
+  if (!isNotifiableStreamEvent(event)) return;
+  await maybePlayEventSound(event, context);
+  await maybeSendSystemStreamNotification(event, context);
 }

@@ -1,4 +1,7 @@
+use std::path::PathBuf;
+
 use tauri::AppHandle;
+use tauri::State;
 
 #[cfg(not(windows))]
 use tauri_plugin_notification::NotificationExt;
@@ -27,11 +30,13 @@ pub fn save_proxy_config(
 pub async fn get_python_runtime_state(
     app_handle: AppHandle,
     refresh: Option<bool>,
+    discover: Option<bool>,
 ) -> Result<crate::python_runtime::PythonRuntimeState, crate::error::AppError> {
     tauri::async_runtime::spawn_blocking(move || {
-        crate::python_runtime::python_runtime_state_with_refresh(
+        crate::python_runtime::python_runtime_state_with_options(
             Some(&app_handle),
             refresh.unwrap_or(false),
+            discover.unwrap_or(true),
         )
     })
     .await
@@ -72,9 +77,80 @@ pub fn send_system_notification(
 }
 
 #[tauri::command]
+pub fn play_custom_notification_sound(path: String, volume: Option<f32>) -> Result<(), String> {
+    let path = PathBuf::from(path.trim());
+    if path.as_os_str().is_empty() {
+        return Err("Audio file path is empty".into());
+    }
+    if !path.is_file() {
+        return Err(format!("Audio file does not exist: {}", path.display()));
+    }
+
+    let file = std::fs::File::open(&path)
+        .map_err(|error| format!("Failed to open audio file: {error}"))?;
+    let reader = std::io::BufReader::new(file);
+    let sink_handle = rodio::DeviceSinkBuilder::open_default_sink()
+        .map_err(|error| format!("Failed to open default audio output: {error}"))?;
+    let player = rodio::play(sink_handle.mixer(), reader)
+        .map_err(|error| format!("Failed to play audio file: {error}"))?;
+    let volume = volume
+        .filter(|value| value.is_finite())
+        .unwrap_or(1.0)
+        .clamp(0.0, 2.0);
+    player.set_volume(volume);
+
+    std::thread::Builder::new()
+        .name("locus-custom-notification-sound".into())
+        .spawn(move || {
+            player.sleep_until_end();
+            drop(sink_handle);
+        })
+        .map(|_| ())
+        .map_err(|error| format!("Failed to start audio playback thread: {error}"))
+}
+
+#[tauri::command]
 pub fn request_app_exit(app_handle: AppHandle) {
-    crate::commands::destroy_unity_embed_control_window_on_main(&app_handle);
+    exit_app(&app_handle);
+}
+
+pub(crate) fn exit_app(app_handle: &AppHandle) {
+    crate::commands::destroy_unity_embed_control_window_on_main(app_handle);
     app_handle.exit(0);
+}
+
+#[tauri::command]
+pub fn get_close_behavior(
+    config: State<'_, std::sync::Arc<crate::config::AppConfig>>,
+) -> Result<crate::config::AppCloseBehavior, crate::error::AppError> {
+    Ok(config.close_behavior())
+}
+
+#[tauri::command]
+pub fn set_close_behavior(
+    value: crate::config::AppCloseBehavior,
+    config: State<'_, std::sync::Arc<crate::config::AppConfig>>,
+) -> Result<(), crate::error::AppError> {
+    config
+        .set_close_behavior(value)
+        .map_err(crate::error::AppError::from)
+}
+
+#[tauri::command]
+pub fn get_dynamic_tool_loading_mode(
+    config: State<'_, std::sync::Arc<crate::config::AppConfig>>,
+) -> Result<crate::config::DynamicToolLoadingMode, crate::error::AppError> {
+    Ok(config.dynamic_tool_loading_mode())
+}
+
+#[tauri::command]
+pub fn set_dynamic_tool_loading_mode(
+    value: crate::config::DynamicToolLoadingMode,
+    config: State<'_, std::sync::Arc<crate::config::AppConfig>>,
+) -> Result<(), crate::error::AppError> {
+    config
+        .set_dynamic_tool_loading_mode(value)
+        .map_err(crate::error::AppError::from)
 }
 
 #[cfg(windows)]

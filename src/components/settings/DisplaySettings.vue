@@ -28,10 +28,6 @@ const diffReviewTargetOptions = computed(() => [
   { value: "window", label: t("settings.display.diffReviewWindow") },
 ]);
 
-const systemNotificationOptionsDisabled = computed(
-  () => !display.systemNotificationsEnabled,
-);
-
 const fontSlots: { slot: FontSlot; labelKey: string; mono: boolean }[] = [
   { slot: "ui",        labelKey: "settings.display.fontUi",        mono: false },
   { slot: "prose",     labelKey: "settings.display.fontProse",     mono: false },
@@ -195,85 +191,6 @@ onMounted(async () => {
         @update:model-value="setDisplay('hideGitCommandSuggestions', $event)"
       />
       <span>{{ t("settings.display.hideGitCommandSuggestions") }}</span>
-    </div>
-  </div>
-
-  <div class="settings-section">
-    <div class="section-label">{{ t("settings.display.notificationsTitle") }}</div>
-    <p class="section-desc">{{ t("settings.display.notificationsDesc") }}</p>
-
-    <div class="toggle-row">
-      <BaseSwitch
-        :model-value="display.systemNotificationsEnabled"
-        :aria-label="t('settings.display.systemNotificationsEnabled')"
-        @update:model-value="setDisplay('systemNotificationsEnabled', $event)"
-      />
-      <span>{{ t("settings.display.systemNotificationsEnabled") }}</span>
-    </div>
-
-    <div
-      class="toggle-row"
-      :class="{ disabled: systemNotificationOptionsDisabled }"
-    >
-      <BaseSwitch
-        :model-value="display.notifyOnChatDone"
-        :disabled="systemNotificationOptionsDisabled"
-        :aria-label="t('settings.display.notifyOnChatDone')"
-        @update:model-value="setDisplay('notifyOnChatDone', $event)"
-      />
-      <span>{{ t("settings.display.notifyOnChatDone") }}</span>
-    </div>
-
-    <div
-      class="toggle-row"
-      :class="{ disabled: systemNotificationOptionsDisabled }"
-    >
-      <BaseSwitch
-        :model-value="display.notifyOnSubagentDone"
-        :disabled="systemNotificationOptionsDisabled"
-        :aria-label="t('settings.display.notifyOnSubagentDone')"
-        @update:model-value="setDisplay('notifyOnSubagentDone', $event)"
-      />
-      <span>{{ t("settings.display.notifyOnSubagentDone") }}</span>
-    </div>
-
-    <div
-      class="toggle-row"
-      :class="{ disabled: systemNotificationOptionsDisabled }"
-    >
-      <BaseSwitch
-        :model-value="display.notifyOnAskUser"
-        :disabled="systemNotificationOptionsDisabled"
-        :aria-label="t('settings.display.notifyOnAskUser')"
-        @update:model-value="setDisplay('notifyOnAskUser', $event)"
-      />
-      <span>{{ t("settings.display.notifyOnAskUser") }}</span>
-    </div>
-
-    <div
-      class="toggle-row"
-      :class="{ disabled: systemNotificationOptionsDisabled }"
-    >
-      <BaseSwitch
-        :model-value="display.notifyOnChatError"
-        :disabled="systemNotificationOptionsDisabled"
-        :aria-label="t('settings.display.notifyOnChatError')"
-        @update:model-value="setDisplay('notifyOnChatError', $event)"
-      />
-      <span>{{ t("settings.display.notifyOnChatError") }}</span>
-    </div>
-
-    <div
-      class="toggle-row"
-      :class="{ disabled: systemNotificationOptionsDisabled }"
-    >
-      <BaseSwitch
-        :model-value="display.notifyOnToolConfirm"
-        :disabled="systemNotificationOptionsDisabled"
-        :aria-label="t('settings.display.notifyOnToolConfirm')"
-        @update:model-value="setDisplay('notifyOnToolConfirm', $event)"
-      />
-      <span>{{ t("settings.display.notifyOnToolConfirm") }}</span>
     </div>
   </div>
 

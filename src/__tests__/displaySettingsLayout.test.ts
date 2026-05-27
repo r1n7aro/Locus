@@ -130,6 +130,8 @@ describe("display settings transcript alignment", () => {
   it("adds a subagent completion notification toggle that defaults to off", () => {
     const displaySettings = read("src/composables/useDisplaySettings.ts");
     const displayPanel = read("src/components/settings/DisplaySettings.vue");
+    const notificationPanel = read("src/components/settings/NotificationsSettings.vue");
+    const settingsView = read("src/components/SettingsView.vue");
     const notifications = read("src/services/systemNotifications.ts");
     const bootstrap = read("src/composables/useAppBootstrap.ts");
     const zh = read("src/language/zh.json");
@@ -138,19 +140,119 @@ describe("display settings transcript alignment", () => {
     expect(displaySettings).toContain("notifyOnSubagentDone: boolean;");
     expect(displaySettings).toContain("notifyOnSubagentDone: false,");
 
-    expect(displayPanel).toContain(":model-value=\"display.notifyOnSubagentDone\"");
-    expect(displayPanel).toContain(":aria-label=\"t('settings.display.notifyOnSubagentDone')\"");
-    expect(displayPanel).toContain("@update:model-value=\"setDisplay('notifyOnSubagentDone', $event)\"");
-    expect(displayPanel).toContain("{{ t(\"settings.display.notifyOnSubagentDone\") }}");
+    expect(settingsView).toContain('import NotificationsSettings from "./settings/NotificationsSettings.vue";');
+    expect(settingsView).toContain(`:class="{ active: activeCategory === 'notifications' }"`);
+    expect(settingsView).toContain(`@click="activeCategory = 'notifications'"`);
+    expect(settingsView).toContain(`<template v-if="activeCategory === 'notifications'">`);
+    expect(settingsView).toContain("<NotificationsSettings />");
+
+    expect(displayPanel).not.toContain("settings.display.notificationsTitle");
+    expect(notificationPanel).toContain(":model-value=\"display.notifyOnSubagentDone\"");
+    expect(notificationPanel).toContain(":aria-label=\"t('settings.notifications.notifyOnSubagentDone')\"");
+    expect(notificationPanel).toContain("@update:model-value=\"setDisplay('notifyOnSubagentDone', $event)\"");
+    expect(notificationPanel).toContain("{{ t(\"settings.notifications.notifyOnSubagentDone\") }}");
 
     expect(notifications).toContain("context.isSubagent ? state.notifyOnSubagentDone : state.notifyOnChatDone");
     expect(notifications).toContain('context.isSubagent ? "notifications.subagentDoneTitle" : "notifications.chatDoneTitle"');
     expect(bootstrap).toContain("...(session?.parentSessionId ? { isSubagent: true } : {})");
 
-    expect(zh).toContain('"settings.display.notifyOnSubagentDone": "Subagent 完成时通知"');
+    expect(zh).toContain('"settings.tab.notifications": "通知"');
+    expect(zh).toContain('"settings.notifications.notifyOnSubagentDone": "Subagent 完成时通知"');
     expect(zh).toContain('"notifications.subagentDoneTitle": "Subagent 已完成"');
-    expect(en).toContain('"settings.display.notifyOnSubagentDone": "Notify when a Sub-agent completes"');
+    expect(en).toContain('"settings.tab.notifications": "Notifications"');
+    expect(en).toContain('"settings.notifications.notifyOnSubagentDone": "Notify when a Sub-agent completes"');
     expect(en).toContain('"notifications.subagentDoneTitle": "Sub-agent complete"');
+  });
+
+  it("adds independent sound alert toggles and selectable modes that default to off", () => {
+    const displaySettings = read("src/composables/useDisplaySettings.ts");
+    const displayPanel = read("src/components/settings/DisplaySettings.vue");
+    const notificationPanel = read("src/components/settings/NotificationsSettings.vue");
+    const soundService = read("src/services/notificationSounds.ts");
+    const notifications = read("src/services/systemNotifications.ts");
+    const zh = read("src/language/zh.json");
+    const en = read("src/language/en.json");
+
+    expect(displaySettings).toContain("soundAlertsEnabled: boolean;");
+    expect(displaySettings).toContain("soundAlertMode: NotificationSoundMode;");
+    expect(displaySettings).toContain("soundAlertSource: NotificationSoundSource;");
+    expect(displaySettings).toContain("soundAlertCustomFilePath: string;");
+    expect(displaySettings).toContain("soundAlertVolume: number;");
+    expect(displaySettings).toContain("soundOnChatDone: boolean;");
+    expect(displaySettings).toContain("soundOnSubagentDone: boolean;");
+    expect(displaySettings).toContain("soundOnAskUser: boolean;");
+    expect(displaySettings).toContain("soundOnChatError: boolean;");
+    expect(displaySettings).toContain("soundOnToolConfirm: boolean;");
+    expect(displaySettings).toContain("soundAlertsEnabled: false,");
+    expect(displaySettings).toContain('soundAlertMode: "bright",');
+    expect(displaySettings).toContain('soundAlertSource: "builtin",');
+    expect(displaySettings).toContain('soundAlertCustomFilePath: "",');
+    expect(displaySettings).toContain("soundAlertVolume: 50,");
+    expect(displaySettings).toContain("soundOnSubagentDone: false,");
+
+    expect(displayPanel).not.toContain("settings.display.soundAlertsTitle");
+    expect(notificationPanel).toContain("settings.notifications.soundTitle");
+    expect(notificationPanel).toContain('import BaseSegmented from "../ui/BaseSegmented.vue";');
+    expect(notificationPanel).toContain('import { open } from "@tauri-apps/plugin-dialog";');
+    expect(notificationPanel).toContain("function setSoundAlertsEnabled(value: boolean)");
+    expect(notificationPanel).toContain("function setSoundAlertMode(value: string)");
+    expect(notificationPanel).toContain("function setSoundAlertSource(value: string)");
+    expect(notificationPanel).toContain("async function chooseSoundFile()");
+    expect(notificationPanel).toContain(":model-value=\"display.soundAlertsEnabled\"");
+    expect(notificationPanel).toContain(":aria-label=\"t('settings.notifications.soundAlertsEnabled')\"");
+    expect(notificationPanel).toContain('setDisplay("soundAlertsEnabled", value);');
+    expect(notificationPanel).toContain("@update:model-value=\"setSoundAlertsEnabled\"");
+    expect(notificationPanel).toContain(":model-value=\"display.soundAlertSource\"");
+    expect(notificationPanel).toContain("@update:model-value=\"setSoundAlertSource\"");
+    expect(notificationPanel).toContain('setDisplay("soundAlertCustomFilePath", selected);');
+    expect(notificationPanel).toContain('setDisplay("soundAlertSource", "custom");');
+    expect(notificationPanel).toContain('setDisplay("soundAlertVolume", volume);');
+    expect(notificationPanel).toContain(":value=\"normalizedSoundAlertVolume\"");
+    expect(notificationPanel).toContain("settings.notifications.soundVolume");
+    expect(notificationPanel).toContain(":model-value=\"display.soundAlertMode\"");
+    expect(notificationPanel).toContain("@update:model-value=\"setSoundAlertMode\"");
+    expect(notificationPanel).toContain("display.soundAlertSource === \"custom\" ? display.soundAlertCustomFilePath : \"\"");
+    expect(notificationPanel).toContain("display.soundAlertVolume");
+    expect(notificationPanel).toContain(":model-value=\"display.soundOnChatDone\"");
+    expect(notificationPanel).toContain(":model-value=\"display.soundOnSubagentDone\"");
+    expect(notificationPanel).toContain(":model-value=\"display.soundOnAskUser\"");
+    expect(notificationPanel).toContain(":model-value=\"display.soundOnChatError\"");
+    expect(notificationPanel).toContain(":model-value=\"display.soundOnToolConfirm\"");
+
+    expect(soundService).toContain('export type NotificationSoundMode = "soft" | "bright" | "urgent";');
+    expect(soundService).toContain('export type NotificationSoundSource = "builtin" | "custom";');
+    expect(soundService).toContain("const SOUND_OUTPUT_GAIN = 1.35;");
+    expect(soundService).toContain("return Math.min(100, Math.max(0, value)) / 100;");
+    expect(soundService).toContain("const outputVolumeScale = volumeScale * SOUND_OUTPUT_GAIN;");
+    expect(soundService).toContain("playCustomNotificationSound(trimmedCustomFilePath, outputVolumeScale)");
+    expect(soundService).toContain("createOscillator()");
+    expect(soundService).toContain("createGain()");
+    expect(soundService).toContain("profile.volume * outputVolumeScale");
+    expect(soundService).toContain("frequencies: [720, 960, 1240]");
+    expect(soundService).toContain("const soundProfiles: Record<NotificationSoundMode, Record<NotificationSoundIntent, SoundProfile>>");
+
+    expect(notifications).toContain("if (!state.soundAlertsEnabled) return false;");
+    expect(notifications).toContain("context.isSubagent ? state.soundOnSubagentDone : state.soundOnChatDone");
+    expect(notifications).toContain('state.soundAlertSource === "custom"');
+    expect(notifications).toContain("state.soundAlertCustomFilePath");
+    expect(notifications).toContain("state.soundAlertVolume");
+    expect(notifications).toContain("await maybePlayEventSound(event, context);");
+    expect(notifications).toContain("await maybeSendSystemStreamNotification(event, context);");
+
+    expect(zh).toContain('"settings.notifications.soundTitle": "提示音"');
+    expect(zh).toContain('"settings.notifications.soundAlertsEnabled": "启用提示音"');
+    expect(zh).toContain('"settings.notifications.soundSourceCustom": "自定义"');
+    expect(zh).toContain('"settings.notifications.soundFileChoose": "选择音频"');
+    expect(zh).toContain('"settings.notifications.soundVolume": "音量"');
+    expect(zh).toContain('"settings.notifications.soundModeBright": "清脆"');
+    expect(zh).toContain('"settings.notifications.soundOnToolConfirm": "需要确认时播放提示音"');
+    expect(en).toContain('"settings.notifications.soundTitle": "Sound Alerts"');
+    expect(en).toContain('"settings.notifications.soundAlertsEnabled": "Enable sound alerts"');
+    expect(en).toContain('"settings.notifications.soundSourceCustom": "Custom"');
+    expect(en).toContain('"settings.notifications.soundFileChoose": "Choose Audio"');
+    expect(en).toContain('"settings.notifications.soundVolume": "Volume"');
+    expect(en).toContain('"settings.notifications.soundModeBright": "Bright"');
+    expect(en).toContain('"settings.notifications.soundOnToolConfirm": "Play a sound when approval is needed"');
   });
 
   it("adds file diff review target settings that default to the current window", () => {

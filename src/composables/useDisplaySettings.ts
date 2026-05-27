@@ -1,4 +1,8 @@
 import { reactive } from "vue";
+import type {
+  NotificationSoundMode,
+  NotificationSoundSource,
+} from "../services/notificationSounds";
 
 export type FontSlot = "ui" | "prose" | "monoInline" | "monoBlock" | "monoEditor";
 export type DiffReviewTarget = "inline" | "window";
@@ -40,6 +44,26 @@ export interface DisplaySettings {
   notifyOnChatError: boolean;
   /** Notify when tool approval is required */
   notifyOnToolConfirm: boolean;
+  /** Enable sound alerts for key chat events */
+  soundAlertsEnabled: boolean;
+  /** Sound profile used for sound alerts */
+  soundAlertMode: NotificationSoundMode;
+  /** Sound source used for sound alerts */
+  soundAlertSource: NotificationSoundSource;
+  /** Custom sound file path used when soundAlertSource is custom */
+  soundAlertCustomFilePath: string;
+  /** Sound alert volume, stored as a percentage from 0 to 100 */
+  soundAlertVolume: number;
+  /** Play a sound when a chat run completes */
+  soundOnChatDone: boolean;
+  /** Play a sound when a subagent run completes */
+  soundOnSubagentDone: boolean;
+  /** Play a sound when the agent asks the user a question */
+  soundOnAskUser: boolean;
+  /** Play a sound when a chat run fails */
+  soundOnChatError: boolean;
+  /** Play a sound when tool approval is required */
+  soundOnToolConfirm: boolean;
   /** Per-slot font-family overrides (empty string = use default) */
   fonts: Record<FontSlot, string>;
 }
@@ -72,6 +96,16 @@ const defaults: DisplaySettings = {
   notifyOnAskUser: true,
   notifyOnChatError: true,
   notifyOnToolConfirm: true,
+  soundAlertsEnabled: false,
+  soundAlertMode: "bright",
+  soundAlertSource: "builtin",
+  soundAlertCustomFilePath: "",
+  soundAlertVolume: 50,
+  soundOnChatDone: true,
+  soundOnSubagentDone: false,
+  soundOnAskUser: true,
+  soundOnChatError: true,
+  soundOnToolConfirm: true,
   fonts: { ...defaultFonts },
 };
 

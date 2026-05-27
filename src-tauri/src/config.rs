@@ -25,6 +25,100 @@ fn default_debug_flag() -> Arc<AtomicBool> {
     Arc::new(AtomicBool::new(false))
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum AppCloseBehavior {
+    Exit,
+    MinimizeToTray,
+}
+
+impl Default for AppCloseBehavior {
+    fn default() -> Self {
+        Self::Exit
+    }
+}
+
+mod serde_close_behavior {
+    use super::*;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(
+        v: &Arc<Mutex<AppCloseBehavior>>,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        let value = *v.lock().map_err(serde::ser::Error::custom)?;
+        value.serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<Arc<Mutex<AppCloseBehavior>>, D::Error> {
+        let value = AppCloseBehavior::deserialize(d)?;
+        Ok(Arc::new(Mutex::new(value)))
+    }
+}
+
+fn default_close_behavior() -> Arc<Mutex<AppCloseBehavior>> {
+    Arc::new(Mutex::new(AppCloseBehavior::Exit))
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum DynamicToolLoadingMode {
+    #[serde(alias = "meta-tool", alias = "meta_tool")]
+    MetaTool,
+    Direct,
+}
+
+impl Default for DynamicToolLoadingMode {
+    fn default() -> Self {
+        Self::MetaTool
+    }
+}
+
+mod serde_dynamic_tool_loading_mode {
+    use super::*;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(
+        v: &Arc<Mutex<DynamicToolLoadingMode>>,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        let value = *v.lock().map_err(serde::ser::Error::custom)?;
+        value.serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<Arc<Mutex<DynamicToolLoadingMode>>, D::Error> {
+        let value = DynamicToolLoadingMode::deserialize(d)?;
+        Ok(Arc::new(Mutex::new(value)))
+    }
+}
+
+fn default_dynamic_tool_loading_mode() -> Arc<Mutex<DynamicToolLoadingMode>> {
+    Arc::new(Mutex::new(DynamicToolLoadingMode::MetaTool))
+}
+
+mod serde_string_mutex {
+    use super::*;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &Arc<Mutex<String>>, s: S) -> Result<S::Ok, S::Error> {
+        let value = v.lock().map_err(serde::ser::Error::custom)?;
+        value.serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Arc<Mutex<String>>, D::Error> {
+        let value = String::deserialize(d)?;
+        Ok(Arc::new(Mutex::new(value)))
+    }
+}
+
+fn default_skill_package_namespace() -> Arc<Mutex<String>> {
+    Arc::new(Mutex::new(String::new()))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub model: String,
@@ -34,6 +128,18 @@ pub struct AppConfig {
     pub debug: Arc<AtomicBool>,
     #[serde(default = "default_debug_flag", with = "serde_atomic_bool")]
     pub file_tool_workspace_boundary: Arc<AtomicBool>,
+    #[serde(default = "default_close_behavior", with = "serde_close_behavior")]
+    pub close_behavior: Arc<Mutex<AppCloseBehavior>>,
+    #[serde(
+        default = "default_dynamic_tool_loading_mode",
+        with = "serde_dynamic_tool_loading_mode"
+    )]
+    pub dynamic_tool_loading_mode: Arc<Mutex<DynamicToolLoadingMode>>,
+    #[serde(
+        default = "default_skill_package_namespace",
+        with = "serde_string_mutex"
+    )]
+    pub default_skill_package_namespace: Arc<Mutex<String>>,
     #[serde(skip)]
     config_path: Arc<Mutex<Option<PathBuf>>>,
 }
@@ -70,6 +176,9 @@ impl AppConfig {
             base_url,
             debug: Arc::new(AtomicBool::new(debug)),
             file_tool_workspace_boundary: default_debug_flag(),
+            close_behavior: default_close_behavior(),
+            dynamic_tool_loading_mode: default_dynamic_tool_loading_mode(),
+            default_skill_package_namespace: default_skill_package_namespace(),
             config_path: Arc::new(Mutex::new(Some(primary_path.to_path_buf()))),
         };
 
@@ -149,6 +258,54 @@ impl AppConfig {
     pub fn set_file_tool_workspace_boundary_enabled(&self, value: bool) -> Result<(), String> {
         self.file_tool_workspace_boundary
             .store(value, Ordering::Relaxed);
+        self.persist()
+    }
+
+    pub fn close_behavior(&self) -> AppCloseBehavior {
+        self.close_behavior
+            .lock()
+            .map(|guard| *guard)
+            .unwrap_or_default()
+    }
+
+    pub fn set_close_behavior(&self, value: AppCloseBehavior) -> Result<(), String> {
+        *self
+            .close_behavior
+            .lock()
+            .map_err(|e| format!("close behavior lock poisoned: {}", e))? = value;
+        self.persist()
+    }
+
+    pub fn dynamic_tool_loading_mode(&self) -> DynamicToolLoadingMode {
+        self.dynamic_tool_loading_mode
+            .lock()
+            .map(|guard| *guard)
+            .unwrap_or_default()
+    }
+
+    pub fn set_dynamic_tool_loading_mode(
+        &self,
+        value: DynamicToolLoadingMode,
+    ) -> Result<(), String> {
+        *self
+            .dynamic_tool_loading_mode
+            .lock()
+            .map_err(|e| format!("dynamic tool loading mode lock poisoned: {}", e))? = value;
+        self.persist()
+    }
+
+    pub fn default_skill_package_namespace(&self) -> String {
+        self.default_skill_package_namespace
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn set_default_skill_package_namespace(&self, value: String) -> Result<(), String> {
+        *self
+            .default_skill_package_namespace
+            .lock()
+            .map_err(|e| format!("default skill package namespace lock poisoned: {}", e))? = value;
         self.persist()
     }
 
@@ -291,5 +448,107 @@ mod tests {
         let config = AppConfig::load_from_path(&config_path);
 
         assert!(!config.file_tool_workspace_boundary_enabled());
+    }
+
+    #[test]
+    fn close_behavior_defaults_to_exit() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("config.json");
+        fs::write(
+            &config_path,
+            r#"{
+  "model": "legacy-model",
+  "debug": false
+}"#,
+        )
+        .expect("legacy config");
+
+        let config = AppConfig::load_from_path(&config_path);
+
+        assert_eq!(config.close_behavior(), AppCloseBehavior::Exit);
+    }
+
+    #[test]
+    fn dynamic_tool_loading_mode_defaults_to_meta_tool() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("config.json");
+        fs::write(
+            &config_path,
+            r#"{
+  "model": "legacy-model",
+  "debug": false
+}"#,
+        )
+        .expect("legacy config");
+
+        let config = AppConfig::load_from_path(&config_path);
+
+        assert_eq!(
+            config.dynamic_tool_loading_mode(),
+            DynamicToolLoadingMode::MetaTool
+        );
+    }
+
+    #[test]
+    fn default_skill_package_namespace_defaults_to_empty() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("config.json");
+        fs::write(
+            &config_path,
+            r#"{
+  "model": "legacy-model",
+  "debug": false
+}"#,
+        )
+        .expect("legacy config");
+
+        let config = AppConfig::load_from_path(&config_path);
+
+        assert_eq!(config.default_skill_package_namespace(), "");
+    }
+
+    #[test]
+    fn close_behavior_persists_minimize_to_tray() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("config.json");
+        let config = AppConfig::load_from_path(&config_path);
+
+        config
+            .set_close_behavior(AppCloseBehavior::MinimizeToTray)
+            .expect("persist close behavior");
+
+        let reloaded = AppConfig::load_from_path(&config_path);
+        assert_eq!(reloaded.close_behavior(), AppCloseBehavior::MinimizeToTray);
+    }
+
+    #[test]
+    fn dynamic_tool_loading_mode_persists_direct() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("config.json");
+        let config = AppConfig::load_from_path(&config_path);
+
+        config
+            .set_dynamic_tool_loading_mode(DynamicToolLoadingMode::Direct)
+            .expect("persist dynamic tool loading mode");
+
+        let reloaded = AppConfig::load_from_path(&config_path);
+        assert_eq!(
+            reloaded.dynamic_tool_loading_mode(),
+            DynamicToolLoadingMode::Direct
+        );
+    }
+
+    #[test]
+    fn default_skill_package_namespace_persists() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("config.json");
+        let config = AppConfig::load_from_path(&config_path);
+
+        config
+            .set_default_skill_package_namespace("studio.tools".to_string())
+            .expect("persist skill package namespace");
+
+        let reloaded = AppConfig::load_from_path(&config_path);
+        assert_eq!(reloaded.default_skill_package_namespace(), "studio.tools");
     }
 }

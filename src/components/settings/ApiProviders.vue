@@ -10,6 +10,7 @@ import type {
 } from "../../types";
 import type { CodexQuotaState, CodexQuotaWindowState, CodexStatusState, ProviderStatus } from "../../composables/useSettingsState";
 import { visibleProviderOrder } from "../../config/providerVisibility";
+import type { DynamicToolLoadingMode } from "../../services/system";
 
 interface ModelGroup {
   provider: string;
@@ -31,6 +32,8 @@ const props = defineProps<{
   codexQuota: CodexQuotaState;
   codexRetrying: boolean;
   codexTransport: CodexTransportMode;
+  dynamicToolLoadingMode: DynamicToolLoadingMode;
+  dynamicToolLoadingBusy?: boolean;
   codexUserCode: string;
   codexUrl: string;
   codexCodeCopied: boolean;
@@ -59,6 +62,7 @@ const emit = defineEmits<{
   refreshCodexQuota: [];
   copyCode: [];
   "update:codexTransport": [value: CodexTransportMode];
+  "update:dynamicToolLoadingMode": [value: DynamicToolLoadingMode];
   startAddEndpoint: [];
   startEditEndpoint: [ep: CustomEndpoint];
   deleteEndpoint: [id: string];
@@ -143,8 +147,25 @@ const codexTransportOptions = [
   },
 ] satisfies Array<{ value: CodexTransportMode; label: string; hint: string }>;
 
+const dynamicToolLoadingOptions = [
+  {
+    value: "metaTool",
+    label: t("settings.dynamicToolLoading.metaTool"),
+    hint: t("settings.dynamicToolLoading.metaToolDesc"),
+  },
+  {
+    value: "direct",
+    label: t("settings.dynamicToolLoading.direct"),
+    hint: t("settings.dynamicToolLoading.directDesc"),
+  },
+] satisfies Array<{ value: DynamicToolLoadingMode; label: string; hint: string }>;
+
 function updateCodexTransport(value: string) {
   emit("update:codexTransport", value === "websocket" ? "websocket" : "http");
+}
+
+function updateDynamicToolLoadingMode(value: string) {
+  emit("update:dynamicToolLoadingMode", value === "direct" ? "direct" : "metaTool");
 }
 
 function focusSectionClass(section: "custom" | "codex") {
@@ -236,6 +257,31 @@ function quotaCreditsLabel() {
   <div class="settings-section" v-else-if="!isOnboardingMode">
     <div class="section-label">{{ t("settings.models.available") }}</div>
     <p class="section-desc" style="opacity:0.6;">{{ t("settings.models.noModels") }}</p>
+  </div>
+
+  <div class="settings-section" v-if="!isOnboardingMode">
+    <div class="section-label">{{ t("settings.dynamicToolLoading.title") }}</div>
+    <div class="provider-card dynamic-tool-card">
+      <div class="provider-header dynamic-tool-header">
+        <div class="provider-info">
+          <span class="provider-name">{{ t("settings.dynamicToolLoading.mode") }}</span>
+          <span class="provider-desc">
+            {{
+              dynamicToolLoadingMode === "direct"
+                ? t("settings.dynamicToolLoading.directDesc")
+                : t("settings.dynamicToolLoading.metaToolDesc")
+            }}
+          </span>
+        </div>
+        <BaseSegmented
+          size="sm"
+          :model-value="dynamicToolLoadingMode"
+          :options="dynamicToolLoadingOptions"
+          :class="{ 'is-saving': dynamicToolLoadingBusy }"
+          @update:model-value="updateDynamicToolLoadingMode"
+        />
+      </div>
+    </div>
   </div>
 
   <div class="settings-section" v-if="!isOnboardingMode && anthropicProvider">
@@ -638,6 +684,15 @@ function quotaCreditsLabel() {
   align-items: flex-start;
   justify-content: space-between;
   gap: 12px;
+}
+
+.dynamic-tool-header {
+  align-items: center;
+}
+
+.dynamic-tool-header :deep(.base-segmented.is-saving) {
+  opacity: 0.65;
+  pointer-events: none;
 }
 
 .provider-info {

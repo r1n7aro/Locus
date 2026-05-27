@@ -2,12 +2,31 @@
 import { computed, onMounted } from "vue";
 import { locale, t } from "../../i18n";
 import { useAppUpdateStore } from "../../stores/appUpdate";
+import type { AppUpdateChannel } from "../../types";
 import BaseButton from "../ui/BaseButton.vue";
+import BaseSegmented, { type SegmentedOption } from "../ui/BaseSegmented.vue";
 
 const APP_NAME = "Locus";
 const ORGANIZATION = "FarLocus";
 const CONTACT_EMAIL = "open@farlocus.com";
 const appUpdateStore = useAppUpdateStore();
+
+const updateChannelOptions = computed<SegmentedOption[]>(() => [
+  {
+    value: "stable",
+    label: t("app.update.channelStable"),
+  },
+  {
+    value: "experimental",
+    label: t("app.update.channelExperimental"),
+  },
+]);
+
+const currentVersionChannelLabel = computed(() =>
+  appUpdateStore.currentIsExperimental
+    ? t("app.update.channelExperimental")
+    : t("app.update.channelStable"),
+);
 
 const lastCheckedLabel = computed(() => {
   if (!appUpdateStore.lastCheckedAt) {
@@ -33,6 +52,11 @@ onMounted(async () => {
 async function checkForUpdates() {
   await appUpdateStore.checkForUpdates();
 }
+
+async function selectUpdateChannel(value: string) {
+  appUpdateStore.setUpdateChannel(value as AppUpdateChannel);
+  await appUpdateStore.checkForUpdates();
+}
 </script>
 
 <template>
@@ -53,7 +77,10 @@ async function checkForUpdates() {
         </div>
         <div class="about-row">
           <dt class="about-label">{{ t("settings.about.version") }}</dt>
-          <dd class="about-value mono">v{{ appUpdateStore.currentVersion || "-" }}</dd>
+          <dd class="about-value about-version-value">
+            <span class="mono">v{{ appUpdateStore.currentVersion || "-" }}</span>
+            <span class="about-release-channel">{{ currentVersionChannelLabel }}</span>
+          </dd>
         </div>
         <div class="about-row">
           <dt class="about-label">{{ t("settings.about.organization") }}</dt>
@@ -66,6 +93,17 @@ async function checkForUpdates() {
         <div class="about-row">
           <dt class="about-label">{{ t("settings.about.versionSource") }}</dt>
           <dd class="about-value">{{ appUpdateStore.sourceLabel }}</dd>
+        </div>
+        <div class="about-row about-row-actions">
+          <dt class="about-label">{{ t("settings.about.updateChannel") }}</dt>
+          <dd class="about-update-controls">
+            <BaseSegmented
+              :model-value="appUpdateStore.updateChannel"
+              :options="updateChannelOptions"
+              size="sm"
+              @update:model-value="selectUpdateChannel"
+            />
+          </dd>
         </div>
         <div class="about-row about-row-actions">
           <dt class="about-label">{{ t("settings.about.lastChecked") }}</dt>
@@ -149,9 +187,21 @@ async function checkForUpdates() {
   color: var(--text-color);
 }
 
-.about-value.mono {
+.about-value .mono {
   font-family: var(--font-mono-identifier);
   word-break: break-all;
+}
+
+.about-version-value {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.about-release-channel {
+  font-size: 12px;
+  color: var(--text-secondary);
 }
 
 .about-update-controls {

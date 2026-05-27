@@ -31,6 +31,11 @@ import {
   testCustomEndpoint,
 } from "../services/model";
 import {
+  getDynamicToolLoadingMode,
+  setDynamicToolLoadingMode as serviceSetDynamicToolLoadingMode,
+  type DynamicToolLoadingMode,
+} from "../services/system";
+import {
   getFileToolWorkspaceBoundary,
   getToolPermissions,
   setFileToolWorkspaceBoundary,
@@ -270,6 +275,8 @@ export function useSettingsState(emit: SettingsEmit) {
     modelSaveMsg.value = "";
     toolPermissions.value = {};
     permSaveMsg.value = "";
+    dynamicToolLoadingMode.value = "metaTool";
+    dynamicToolLoadingBusy.value = false;
     customEndpoints.value = [];
     editingEndpoint.value = null;
     isAddingEndpoint.value = false;
@@ -283,7 +290,7 @@ export function useSettingsState(emit: SettingsEmit) {
   }
 
   // ── Navigation ───────────────────────────────────────────────────────
-  const activeCategory = ref<"api" | "models" | "permissions" | "proxy" | "general" | "display" | "shortcuts" | "knowledge" | "archived" | "console" | "about">("general");
+  const activeCategory = ref<"api" | "models" | "permissions" | "proxy" | "general" | "display" | "notifications" | "shortcuts" | "knowledge" | "archived" | "console" | "about">("general");
 
   // ── Provider / API key state ─────────────────────────────────────────
   const providers = ref<ProviderStatus[]>([]);
@@ -461,6 +468,49 @@ export function useSettingsState(emit: SettingsEmit) {
       submitOAuthCode();
     } else if (e.key === "Escape") {
       cancelOAuth();
+    }
+  }
+
+  // ── Dynamic tool loading ────────────────────────────────────────────
+  const dynamicToolLoadingMode = ref<DynamicToolLoadingMode>("metaTool");
+  const dynamicToolLoadingBusy = ref(false);
+
+  function normalizeDynamicToolLoadingMode(value: string): DynamicToolLoadingMode {
+    return value === "direct" ? "direct" : "metaTool";
+  }
+
+  async function loadDynamicToolLoadingMode() {
+    try {
+      dynamicToolLoadingMode.value = await getDynamicToolLoadingMode();
+    } catch (e) {
+      const err = normalizeAppError(e);
+      useNotificationStore().addNotice("error", t("settings.dynamicToolLoading.loadFailed", err.message), {
+        code: err.code,
+        operation: "loadDynamicToolLoadingMode",
+        skipConsoleLog: true,
+      });
+    }
+  }
+
+  async function setDynamicToolLoadingMode(value: string) {
+    const next = normalizeDynamicToolLoadingMode(value);
+    if (dynamicToolLoadingMode.value === next) return;
+    const previous = dynamicToolLoadingMode.value;
+    dynamicToolLoadingMode.value = next;
+    dynamicToolLoadingBusy.value = true;
+    try {
+      await serviceSetDynamicToolLoadingMode(next);
+      successMsg.value = t("settings.dynamicToolLoading.saved");
+      setTimeout(() => { successMsg.value = ""; }, 2000);
+    } catch (e) {
+      dynamicToolLoadingMode.value = previous;
+      const err = normalizeAppError(e);
+      useNotificationStore().addNotice("error", t("settings.dynamicToolLoading.saveFailed", err.message), {
+        code: err.code,
+        operation: "saveDynamicToolLoadingMode",
+      });
+    } finally {
+      dynamicToolLoadingBusy.value = false;
     }
   }
 
@@ -921,7 +971,7 @@ export function useSettingsState(emit: SettingsEmit) {
         ? ep.replayReasoningContent
         : defaultReplayReasoningContent(ep),
       serverTools: normalizeServerTools(ep.serverTools),
-      supportsToolLazyLoading: ep.supportsToolLazyLoading === true,
+      supportsToolLazyLoading: false,
       supportsVision: ep.supportsVision !== false,
     };
   }
@@ -1097,6 +1147,7 @@ export function useSettingsState(emit: SettingsEmit) {
 
     if (cachedProviders) providers.value = cachedProviders;
     else await loadProviders();
+    await loadDynamicToolLoadingMode();
 
     if (cachedCodex) codexStatus.value = normalizeCodexStatus(cachedCodex);
     else await loadCodexStatus();
@@ -1147,6 +1198,12 @@ export function useSettingsState(emit: SettingsEmit) {
     saveKey,
     deleteKey,
     handleKeydown,
+
+    // dynamic tool loading
+    dynamicToolLoadingMode,
+    dynamicToolLoadingBusy,
+    loadDynamicToolLoadingMode,
+    setDynamicToolLoadingMode,
 
     // oauth
     oauthStep,

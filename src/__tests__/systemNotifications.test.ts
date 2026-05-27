@@ -31,7 +31,7 @@ function createDisplayState(): DisplaySettings {
     rightAlignUserMessages: false,
     compactToolCalls: true,
     hideThinkingBlocks: true,
-    showViewsInSessionPanel: true,
+    showViewsInSessionPanel: false,
     mergeGitTreeStatusIcon: true,
     hideGitCommandSuggestions: false,
     systemNotificationsEnabled: true,
@@ -40,6 +40,16 @@ function createDisplayState(): DisplaySettings {
     notifyOnAskUser: true,
     notifyOnChatError: true,
     notifyOnToolConfirm: true,
+    soundAlertsEnabled: false,
+    soundAlertMode: "bright",
+    soundAlertSource: "builtin",
+    soundAlertCustomFilePath: "",
+    soundAlertVolume: 50,
+    soundOnChatDone: true,
+    soundOnSubagentDone: false,
+    soundOnAskUser: true,
+    soundOnChatError: true,
+    soundOnToolConfirm: true,
     fonts: {
       ui: "",
       prose: "",
@@ -63,6 +73,10 @@ const unityMocks = vi.hoisted(() => ({
   getUnityEmbedFocusDebugSnapshot: vi.fn(),
 }));
 
+const soundMocks = vi.hoisted(() => ({
+  playNotificationSound: vi.fn(),
+}));
+
 const windowMocks = vi.hoisted(() => ({
   getFocusedWindow: vi.fn(),
 }));
@@ -72,6 +86,7 @@ const displayState = createDisplayState();
 vi.mock("@tauri-apps/plugin-notification", () => notificationMocks);
 vi.mock("../services/system", () => systemMocks);
 vi.mock("../services/unity", () => unityMocks);
+vi.mock("../services/notificationSounds", () => soundMocks);
 vi.mock("@tauri-apps/api/window", () => ({
   Window: windowMocks,
 }));
@@ -103,7 +118,7 @@ describe("systemNotifications", () => {
     displayState.gitDiffReviewTarget = "inline";
     displayState.compactToolCalls = true;
     displayState.hideThinkingBlocks = true;
-    displayState.showViewsInSessionPanel = true;
+    displayState.showViewsInSessionPanel = false;
     displayState.mergeGitTreeStatusIcon = true;
     displayState.hideGitCommandSuggestions = false;
     displayState.systemNotificationsEnabled = true;
@@ -112,9 +127,20 @@ describe("systemNotifications", () => {
     displayState.notifyOnAskUser = true;
     displayState.notifyOnChatError = true;
     displayState.notifyOnToolConfirm = true;
+    displayState.soundAlertsEnabled = false;
+    displayState.soundAlertMode = "bright";
+    displayState.soundAlertSource = "builtin";
+    displayState.soundAlertCustomFilePath = "";
+    displayState.soundAlertVolume = 50;
+    displayState.soundOnChatDone = true;
+    displayState.soundOnSubagentDone = false;
+    displayState.soundOnAskUser = true;
+    displayState.soundOnChatError = true;
+    displayState.soundOnToolConfirm = true;
 
     notificationMocks.isPermissionGranted.mockResolvedValue(true);
     notificationMocks.requestPermission.mockResolvedValue("granted");
+    soundMocks.playNotificationSound.mockResolvedValue(undefined);
     windowMocks.getFocusedWindow.mockResolvedValue(null);
     unityMocks.getUnityEmbedFocusDebugSnapshot.mockResolvedValue(null);
   });
@@ -135,6 +161,7 @@ describe("systemNotifications", () => {
       "对话已完成",
       "登录修复\n已完成输出",
     );
+    expect(soundMocks.playNotificationSound).not.toHaveBeenCalled();
   });
 
   it("skips subagent completion notifications by default", async () => {
@@ -243,6 +270,103 @@ describe("systemNotifications", () => {
       options: [],
     });
 
+    expect(systemMocks.sendSystemNotification).not.toHaveBeenCalled();
+  });
+
+  it("plays sound alerts when system notifications are disabled", async () => {
+    displayState.systemNotificationsEnabled = false;
+    displayState.soundAlertsEnabled = true;
+
+    await maybeNotifyStreamEvent({
+      type: "done",
+      runId: "run-sound-1",
+      sessionId: "session-1",
+      messageId: "message-sound-1",
+      fullText: "已完成输出",
+    });
+
+    expect(soundMocks.playNotificationSound).toHaveBeenCalledWith("complete", "bright", "", 50);
+    expect(systemMocks.sendSystemNotification).not.toHaveBeenCalled();
+  });
+
+  it("plays sound alerts while a Locus window is focused", async () => {
+    displayState.soundAlertsEnabled = true;
+    displayState.soundAlertMode = "bright";
+    windowMocks.getFocusedWindow.mockResolvedValue({ label: "main" });
+
+    await maybeNotifyStreamEvent({
+      type: "askUser",
+      runId: "run-sound-2",
+      sessionId: "session-1",
+      questionId: "question-sound-2",
+      toolCallId: "tool-1",
+      question: "请确认目录",
+      options: [],
+    });
+
+    expect(soundMocks.playNotificationSound).toHaveBeenCalledWith("input", "bright", "", 50);
+    expect(systemMocks.sendSystemNotification).not.toHaveBeenCalled();
+  });
+
+  it("plays custom sound files when selected", async () => {
+    displayState.systemNotificationsEnabled = false;
+    displayState.soundAlertsEnabled = true;
+    displayState.soundAlertSource = "custom";
+    displayState.soundAlertCustomFilePath = "C:\\Users\\test\\alert.wav";
+
+    await maybeNotifyStreamEvent({
+      type: "done",
+      runId: "run-sound-custom",
+      sessionId: "session-1",
+      messageId: "message-sound-custom",
+      fullText: "已完成输出",
+    });
+
+    expect(soundMocks.playNotificationSound).toHaveBeenCalledWith(
+      "complete",
+      "bright",
+      "C:\\Users\\test\\alert.wav",
+      50,
+    );
+    expect(systemMocks.sendSystemNotification).not.toHaveBeenCalled();
+  });
+
+  it("passes the configured sound alert volume", async () => {
+    displayState.systemNotificationsEnabled = false;
+    displayState.soundAlertsEnabled = true;
+    displayState.soundAlertVolume = 45;
+
+    await maybeNotifyStreamEvent({
+      type: "done",
+      runId: "run-sound-volume",
+      sessionId: "session-1",
+      messageId: "message-sound-volume",
+      fullText: "已完成输出",
+    });
+
+    expect(soundMocks.playNotificationSound).toHaveBeenCalledWith("complete", "bright", "", 45);
+    expect(systemMocks.sendSystemNotification).not.toHaveBeenCalled();
+  });
+
+  it("obeys per-event sound alert toggles", async () => {
+    displayState.systemNotificationsEnabled = false;
+    displayState.soundAlertsEnabled = true;
+    displayState.soundOnToolConfirm = false;
+
+    await maybeNotifyStreamEvent({
+      type: "toolConfirm",
+      runId: "run-sound-3",
+      sessionId: "session-1",
+      questionId: "question-sound-3",
+      toolCallId: "tool-2",
+      display: {
+        kind: "basic",
+        toolName: "edit",
+        arguments: "{\"path\":\"a.ts\"}",
+      },
+    });
+
+    expect(soundMocks.playNotificationSound).not.toHaveBeenCalled();
     expect(systemMocks.sendSystemNotification).not.toHaveBeenCalled();
   });
 

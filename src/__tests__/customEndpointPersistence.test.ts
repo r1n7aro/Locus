@@ -267,6 +267,22 @@ describe("custom endpoint persistence", () => {
     expect(state.customEndpoints.value[0].supportsToolLazyLoading).toBe(false);
   });
 
+  it("normalizes saved endpoints to disabled tool lazy loading", async () => {
+    const state = useSettingsState((() => undefined) as never);
+    modelServiceMocks.getCustomEndpoints.mockResolvedValueOnce([
+      endpoint({
+        id: "chat-tool-loading",
+        name: "Chat Tool Loading",
+        apiFormat: "openai_responses",
+        supportsToolLazyLoading: true,
+      }),
+    ]);
+
+    await state.loadCustomEndpoints();
+
+    expect(state.customEndpoints.value[0].supportsToolLazyLoading).toBe(false);
+  });
+
   it("normalizes legacy endpoints to enabled image understanding", async () => {
     const state = useSettingsState((() => undefined) as never);
     modelServiceMocks.getCustomEndpoints.mockResolvedValueOnce([

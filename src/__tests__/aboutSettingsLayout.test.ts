@@ -26,14 +26,18 @@ describe("AboutSettings layout", () => {
 
     expect(source).toContain('import { useAppUpdateStore } from "../../stores/appUpdate"');
     expect(source).toContain('import BaseButton from "../ui/BaseButton.vue"');
+    expect(source).toContain('import BaseSegmented, { type SegmentedOption } from "../ui/BaseSegmented.vue"');
     expect(source).toContain('const APP_NAME = "Locus"');
     expect(source).toContain('const ORGANIZATION = "FarLocus"');
     expect(source).toContain('const CONTACT_EMAIL = "open@farlocus.com"');
     expect(source).toContain("await appUpdateStore.ensureCurrentVersion();");
     expect(source).toContain("Unity Dev Agent");
-    expect(source).toContain('<dd class="about-value mono">v{{ appUpdateStore.currentVersion || "-" }}</dd>');
+    expect(source).toContain('<dd class="about-value about-version-value">');
+    expect(source).toContain("{{ currentVersionChannelLabel }}");
     expect(source).toContain('t("settings.about.versionSource")');
     expect(source).toContain("{{ appUpdateStore.sourceLabel }}");
+    expect(source).toContain('t("settings.about.updateChannel")');
+    expect(source).toContain(':model-value="appUpdateStore.updateChannel"');
     expect(source).toContain('t("settings.about.lastChecked")');
     expect(source).toContain('t("settings.about.checkUpdates")');
     expect(source).toContain("await appUpdateStore.checkForUpdates();");
@@ -54,6 +58,7 @@ describe("AboutSettings layout", () => {
     expect(zh).toContain('"settings.about.versionSource": "版本来源"');
     expect(zh).toContain('"settings.about.versionSourceLocal": "本地服务器 ({0})"');
     expect(zh).toContain('"settings.about.versionSourceRemote": "{0}"');
+    expect(zh).toContain('"settings.about.updateChannel": "更新通道"');
     expect(zh).toContain('"settings.about.lastChecked": "上次检查"');
     expect(zh).toContain('"settings.about.checkUpdates": "检查更新"');
     expect(en).toContain('"settings.tab.about": "About"');
@@ -62,6 +67,7 @@ describe("AboutSettings layout", () => {
     expect(en).toContain('"settings.about.versionSource": "Version source"');
     expect(en).toContain('"settings.about.versionSourceLocal": "Local server ({0})"');
     expect(en).toContain('"settings.about.versionSourceRemote": "{0}"');
+    expect(en).toContain('"settings.about.updateChannel": "Update channel"');
     expect(en).toContain('"settings.about.lastChecked": "Last checked"');
     expect(en).toContain('"settings.about.checkUpdates": "Check for updates"');
   });

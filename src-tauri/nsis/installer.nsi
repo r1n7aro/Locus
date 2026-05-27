@@ -728,6 +728,7 @@ Section Install
   Delete "$INSTDIR\knowledge\skill\create-skill.md"
   Delete "$INSTDIR\knowledge\skill\unity-editor-tooling.md"
   Delete "$INSTDIR\knowledge\skill\unity-project-setup.md"
+  Delete "$INSTDIR\knowledge\skill\builtin\view.md"
 
   !ifmacrodef NSIS_HOOK_PREINSTALL
     !insertmacro NSIS_HOOK_PREINSTALL

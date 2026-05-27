@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, watch } from "vue";
 import { openPath } from "@tauri-apps/plugin-opener";
 import BaseButton from "../ui/BaseButton.vue";
 import BaseCheckbox from "../ui/BaseCheckbox.vue";
@@ -53,6 +53,16 @@ const showReplayReasoningContent = computed(() =>
   endpoint.value?.apiFormat === "openai_chat" || endpoint.value?.apiFormat === "anthropic_messages"
 );
 
+watch(
+  () => [endpoint.value?.id, endpoint.value?.apiFormat] as const,
+  () => {
+    if (endpoint.value) {
+      endpoint.value.supportsToolLazyLoading = false;
+    }
+  },
+  { immediate: true },
+);
+
 function defaultReasoningParamFormat(apiFormat: ApiFormat): ReasoningParamFormat {
   switch (apiFormat) {
     case "openai_responses": return "openai_responses_reasoning_effort";
@@ -71,6 +81,7 @@ function updateEndpointApiFormat(event: Event) {
   endpoint.value.apiFormat = apiFormat;
   endpoint.value.reasoningParamFormat = defaultReasoningParamFormat(apiFormat);
   endpoint.value.replayReasoningContent = defaultReplayReasoningContent(apiFormat);
+  endpoint.value.supportsToolLazyLoading = false;
 }
 
 function setReasoningEffortEnabled(effort: EffortLevel, enabled: boolean) {
@@ -324,19 +335,6 @@ function handleEndpointKeydown(e: KeyboardEvent) {
                     <span class="custom-option-desc">{{ t("settings.custom.serverToolWebSearch") }}</span>
                   </div>
                 </div>
-              </div>
-            </div>
-            <div class="custom-form-row">
-              <label class="custom-form-label">
-                {{ t("settings.custom.toolLazyLoading") }}
-                <span class="custom-form-hint">{{ t("settings.custom.toolLazyLoadingHint") }}</span>
-              </label>
-              <div class="custom-checkbox-control">
-                <BaseCheckbox
-                  v-model="endpoint.supportsToolLazyLoading"
-                  :disabled="saving"
-                  :aria-label="t('settings.custom.toolLazyLoading')"
-                />
               </div>
             </div>
             <div class="custom-form-row">

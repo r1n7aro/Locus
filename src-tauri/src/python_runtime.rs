@@ -76,6 +76,18 @@ pub fn python_runtime_state_with_refresh(
     app_handle: Option<&AppHandle>,
     refresh: bool,
 ) -> Result<PythonRuntimeState, String> {
+    python_runtime_state_with_options(app_handle, refresh, true)
+}
+
+pub fn python_runtime_state_with_options(
+    app_handle: Option<&AppHandle>,
+    refresh: bool,
+    discover: bool,
+) -> Result<PythonRuntimeState, String> {
+    if !discover {
+        return current_python_runtime_state(app_handle);
+    }
+
     let config = load_config().unwrap_or_default();
     let mut runtimes = discover_python_runtimes_cached(app_handle, refresh);
 
@@ -150,6 +162,126 @@ pub fn python_runtime_state_with_refresh(
         effective,
         missing_selected,
     })
+}
+
+fn current_python_runtime_state(
+    app_handle: Option<&AppHandle>,
+) -> Result<PythonRuntimeState, String> {
+    let config = load_config().unwrap_or_default();
+    let mut runtimes = Vec::new();
+    let managed_path = managed_python_executable_path(app_handle);
+
+    if let Some(path) = config
+        .selected_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+    {
+        let source = if config.selected_id.as_deref() == Some(MANAGED_WINDOWS_X64_ID)
+            || managed_path
+                .as_ref()
+                .is_some_and(|managed| same_path_str(&path.display().to_string(), managed))
+        {
+            PythonRuntimeSource::Managed
+        } else {
+            PythonRuntimeSource::System
+        };
+        runtimes.push(lightweight_runtime_info(
+            config
+                .selected_id
+                .clone()
+                .unwrap_or_else(|| runtime_id_for_path(&path)),
+            source,
+            path,
+        ));
+        if let Some(managed) = managed_path {
+            let already_listed = runtimes
+                .iter()
+                .any(|runtime| same_path_str(&runtime.path, &managed));
+            if !already_listed {
+                runtimes.push(lightweight_runtime_info(
+                    MANAGED_WINDOWS_X64_ID.to_string(),
+                    PythonRuntimeSource::Managed,
+                    managed,
+                ));
+            }
+        }
+    } else if let Some(path) = managed_path {
+        runtimes.push(lightweight_runtime_info(
+            MANAGED_WINDOWS_X64_ID.to_string(),
+            PythonRuntimeSource::Managed,
+            path,
+        ));
+    }
+
+    let selected_id = config.selected_id.clone();
+    let effective_id = selected_id
+        .as_deref()
+        .and_then(|id| {
+            runtimes
+                .iter()
+                .find(|runtime| runtime.available && runtime.id == id)
+                .map(|runtime| runtime.id.clone())
+        })
+        .or_else(|| {
+            runtimes
+                .iter()
+                .find(|runtime| runtime.available && runtime.source == PythonRuntimeSource::Managed)
+                .map(|runtime| runtime.id.clone())
+        })
+        .or_else(|| {
+            runtimes
+                .iter()
+                .find(|runtime| runtime.available)
+                .map(|runtime| runtime.id.clone())
+        });
+
+    let missing_selected = selected_id
+        .as_deref()
+        .map(|id| {
+            !runtimes
+                .iter()
+                .any(|runtime| runtime.available && runtime.id == id)
+        })
+        .unwrap_or(false);
+
+    for runtime in &mut runtimes {
+        runtime.selected = effective_id
+            .as_deref()
+            .map(|id| runtime.id == id)
+            .unwrap_or(false);
+    }
+
+    let effective = effective_id
+        .as_deref()
+        .and_then(|id| runtimes.iter().find(|runtime| runtime.id == id))
+        .cloned();
+
+    Ok(PythonRuntimeState {
+        runtimes,
+        selected_id: effective_id,
+        effective,
+        missing_selected,
+    })
+}
+
+fn lightweight_runtime_info(
+    id: String,
+    source: PythonRuntimeSource,
+    path: PathBuf,
+) -> PythonRuntimeInfo {
+    let available = path.is_file();
+    let canonical = dunce::canonicalize(&path).unwrap_or(path);
+    PythonRuntimeInfo {
+        id,
+        label: runtime_label(source.clone(), None),
+        path: canonical.display().to_string(),
+        version: None,
+        source,
+        selected: false,
+        available,
+    }
 }
 
 pub fn save_python_runtime_selection(
