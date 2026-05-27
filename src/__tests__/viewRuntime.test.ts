@@ -1,11 +1,13 @@
 import { describe, expect, it } from "vitest";
 import { compile } from "vue";
+import * as VueRuntime from "vue";
 import {
   extractVueScriptSetup,
   transformModuleSource,
   transformViewScriptSetup,
   ViewCompileError,
 } from "../components/view/viewCompiler";
+import { compileViewSfc } from "../components/view/viewSfcCompiler";
 
 describe("viewRuntime", () => {
   it("extracts and transforms Vue script setup TypeScript", () => {
@@ -219,6 +221,58 @@ export { answer as alias };
     expect(typeof render).toBe("function");
   });
 
+  it("compiles View SFCs through the official Vue compiler", () => {
+    const compiled = compileViewSfc(`
+<script setup lang="ts">
+const props = withDefaults(defineProps<{ label?: string }>(), {
+  label: "Ready",
+});
+const emit = defineEmits<{ save: [value: string] }>();
+
+function save() {
+  emit("save", props.label);
+}
+</script>
+
+<template>
+  <button class="title" type="button" @click="save">
+    {{ props.label }}
+    <template v-if="props.label">
+      <span>active</span>
+    </template>
+  </button>
+</template>
+
+<style scoped>
+.title {
+  color: red;
+}
+</style>`, "src/App.vue");
+    const module = { exports: {} as Record<string, unknown> };
+    const execute = new Function("__import", "exports", "module", "__vue", "__runtime", compiled.code);
+
+    execute(
+      (specifier: string) => {
+        if (specifier === "vue") return VueRuntime;
+        throw new Error(`Unexpected import: ${specifier}`);
+      },
+      module.exports,
+      module,
+      VueRuntime,
+      {},
+    );
+
+    const component = module.exports.default as {
+      props?: Record<string, { default?: string }>;
+      render?: unknown;
+      __scopeId?: string;
+    };
+    expect(component.props?.label.default).toBe("Ready");
+    expect(typeof component.render).toBe("function");
+    expect(component.__scopeId).toBe(compiled.scopeId);
+    expect(compiled.styles[0]).toContain(`[${compiled.scopeId}]`);
+  });
+
   it("exposes Unity editor update handlers through the View runtime", () => {
     const script = extractVueScriptSetup(`
 <script setup lang="ts">
@@ -242,6 +296,34 @@ onMounted(async () => {
     expect(transformed.code).toContain("await onEditorUpdate((event) =>");
     expect(transformed.introducedNames).toContain("onEditorUpdate");
     expect(transformed.introducedNames).toContain("view");
+  });
+
+  it("exposes LLM and session helpers through the View runtime", () => {
+    const script = extractVueScriptSetup(`
+<script setup lang="ts">
+import { llm, session, view } from "@locus/view-runtime";
+
+async function rewriteGraph(graph: unknown) {
+  const createdSessionId = await session.create({ title: "Shader Graph", sessionType: "view" });
+  await session.show(createdSessionId);
+  const response = await llm.call({
+    sessionId: createdSessionId,
+    prompt: JSON.stringify(graph),
+  });
+  view.session.display(response.sessionId);
+  return response.text;
+}
+</script>`);
+
+    const transformed = transformViewScriptSetup(script);
+
+    expect(transformed.code).toContain('const __module0 = __import("@locus/view-runtime")');
+    expect(transformed.code).toContain("const { llm, session, view } = __module0");
+    expect(transformed.code).toContain("async function rewriteGraph(graph)");
+    expect(transformed.introducedNames).toContain("llm");
+    expect(transformed.introducedNames).toContain("session");
+    expect(transformed.introducedNames).toContain("view");
+    expect(transformed.introducedNames).toContain("rewriteGraph");
   });
 
   it("supports graph template controllers from the View runtime", () => {
@@ -277,5 +359,133 @@ const graphView = defineGraphView(new TemplateGraphView());
     expect(transformed.introducedNames).toContain("defineGraphView");
     expect(transformed.introducedNames).toContain("TemplateGraphView");
     expect(transformed.introducedNames).toContain("graphView");
+  });
+
+  it("exposes the canvas component to View packages", () => {
+    const script = extractVueScriptSetup(`
+<script setup lang="ts">
+import { CanvasView } from "@locus/view-runtime";
+
+const blocks = [{ id: "a", x: 0, y: 0, width: 240, height: 120 }];
+</script>`);
+
+    const transformed = transformViewScriptSetup(script);
+
+    expect(transformed.code).toContain('const __module0 = __import("@locus/view-runtime")');
+    expect(transformed.code).toContain("const { CanvasView } = __module0");
+    expect(transformed.introducedNames).toContain("CanvasView");
+    expect(transformed.introducedNames).toContain("blocks");
+  });
+
+  it("exposes View log helpers to View packages", () => {
+    const script = extractVueScriptSetup(`
+<script setup lang="ts">
+import { view } from "@locus/view-runtime";
+
+async function openLogs() {
+  const latest = await view.logs.latest();
+  await view.logs.open();
+  return latest;
+}
+</script>`);
+
+    const transformed = transformViewScriptSetup(script);
+
+    expect(transformed.code).toContain('const __module0 = __import("@locus/view-runtime")');
+    expect(transformed.code).toContain("const { view } = __module0");
+    expect(transformed.code).toContain("await view.logs.latest()");
+    expect(transformed.code).toContain("await view.logs.open()");
+    expect(transformed.introducedNames).toContain("view");
+    expect(transformed.introducedNames).toContain("openLogs");
+  });
+
+  it("exposes Unity property editor components to View packages", () => {
+    const script = extractVueScriptSetup(`
+<script setup lang="ts">
+import { UnityPropertyDraw, UnityPropertyEditor, UnityNumberField, createPropertyTree } from "@locus/components";
+
+const cell = { type: "Integer", value: 1 };
+const tree = createPropertyTree({ propertyPath: "m_Name", valueType: "String" });
+</script>`);
+
+    const transformed = transformViewScriptSetup(script);
+
+    expect(transformed.code).toContain('const __module0 = __import("@locus/components")');
+    expect(transformed.code).toContain("const { UnityPropertyDraw, UnityPropertyEditor, UnityNumberField, createPropertyTree } = __module0");
+    expect(transformed.introducedNames).toContain("UnityPropertyDraw");
+    expect(transformed.introducedNames).toContain("UnityPropertyEditor");
+    expect(transformed.introducedNames).toContain("UnityNumberField");
+    expect(transformed.introducedNames).toContain("createPropertyTree");
+    expect(transformed.introducedNames).toContain("cell");
+    expect(transformed.introducedNames).toContain("tree");
+  });
+
+  it("exposes PropertyTree helpers through the View runtime module", () => {
+    const script = extractVueScriptSetup(`
+<script setup lang="ts">
+import {
+  createInspectorPropertyDrawLibrary,
+  createPropertyTree,
+  projectInspectorPropertyDrawLibrary,
+  propertyTreeService,
+  publicInspectorPropertyDrawLibrary,
+  UnityPropertyDraw,
+  view,
+} from "@locus/view-runtime";
+
+const tree = createPropertyTree({ propertyPath: "m_Name", valueType: "String" });
+const library = createInspectorPropertyDrawLibrary();
+const publicLibrary = publicInspectorPropertyDrawLibrary;
+const projectLibrary = projectInspectorPropertyDrawLibrary;
+const runtimeLibrary = view.propertyDraw.library;
+const serviceTree = propertyTreeService.createTree({ propertyPath: "m_Enabled", valueType: "Boolean" });
+</script>`);
+
+    const transformed = transformViewScriptSetup(script);
+
+    expect(transformed.code).toContain('const __module0 = __import("@locus/view-runtime")');
+    expect(transformed.code).toContain("const { createInspectorPropertyDrawLibrary, createPropertyTree, projectInspectorPropertyDrawLibrary, propertyTreeService, publicInspectorPropertyDrawLibrary, UnityPropertyDraw, view } = __module0");
+    expect(transformed.introducedNames).toContain("createInspectorPropertyDrawLibrary");
+    expect(transformed.introducedNames).toContain("createPropertyTree");
+    expect(transformed.introducedNames).toContain("projectInspectorPropertyDrawLibrary");
+    expect(transformed.introducedNames).toContain("propertyTreeService");
+    expect(transformed.introducedNames).toContain("publicInspectorPropertyDrawLibrary");
+    expect(transformed.introducedNames).toContain("UnityPropertyDraw");
+    expect(transformed.introducedNames).toContain("view");
+    expect(transformed.introducedNames).toContain("library");
+    expect(transformed.introducedNames).toContain("publicLibrary");
+    expect(transformed.introducedNames).toContain("projectLibrary");
+    expect(transformed.introducedNames).toContain("runtimeLibrary");
+    expect(transformed.introducedNames).toContain("tree");
+    expect(transformed.introducedNames).toContain("serviceTree");
+  });
+
+  it("exposes View undo and undoable property binding helpers", () => {
+    const script = extractVueScriptSetup(`
+<script setup lang="ts">
+import { undo, useUnityBinding, view } from "@locus/view-runtime";
+
+const nameBinding = useUnityBinding({ target: { kind: "selection", propertyPath: "m_Name" } });
+
+async function rename(commit) {
+  await view.binding.writeProperty({ target: { kind: "selection", propertyPath: "m_Name" } }, commit);
+  await nameBinding.writeProperty(commit);
+  await undo.undo();
+  await undo.redo();
+}
+</script>`);
+
+    const transformed = transformViewScriptSetup(script);
+
+    expect(transformed.code).toContain('const __module0 = __import("@locus/view-runtime")');
+    expect(transformed.code).toContain("const { undo, useUnityBinding, view } = __module0");
+    expect(transformed.code).toContain("await view.binding.writeProperty");
+    expect(transformed.code).toContain("await nameBinding.writeProperty(commit)");
+    expect(transformed.code).toContain("await undo.undo()");
+    expect(transformed.code).toContain("await undo.redo()");
+    expect(transformed.introducedNames).toContain("undo");
+    expect(transformed.introducedNames).toContain("useUnityBinding");
+    expect(transformed.introducedNames).toContain("nameBinding");
+    expect(transformed.introducedNames).toContain("rename");
   });
 });

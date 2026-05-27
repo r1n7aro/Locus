@@ -1,0 +1,42 @@
+{
+  "description": "Discover Unity SerializedProperty propertyPath values for a View Binding target without writing data. Provide either bindingId from bindings.json or a concrete target, then filter by fieldName, fieldType, or query. Returns matching property paths with reflected field type metadata.",
+  "parameters": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "viewId": {
+        "type": "string",
+        "description": "View id containing bindings.json, for example material-inspector."
+      },
+      "bindingId": {
+        "type": ["string", "null"],
+        "description": "Optional binding id from bindings.json. Its target object is used as the discovery root."
+      },
+      "target": {
+        "type": ["object", "null"],
+        "description": "Concrete binding target without propertyPath. Fields: kind, path, scenePath, objectPath, componentType, componentIndex."
+      },
+      "query": {
+        "type": ["string", "null"],
+        "description": "Optional text search across property path, display name, field type, and assembly."
+      },
+      "fieldName": {
+        "type": ["string", "null"],
+        "description": "Optional field name or display name to find, for example speed or settings."
+      },
+      "fieldType": {
+        "type": ["string", "null"],
+        "description": "Optional C# field type name or full name. Base classes and interfaces match when Unity can reflect the type."
+      },
+      "maxDepth": {
+        "type": ["number", "null"],
+        "description": "Optional traversal depth cap. Defaults to 8."
+      },
+      "maxResults": {
+        "type": ["number", "null"],
+        "description": "Optional result cap. Defaults to 100, maximum 500."
+      }
+    },
+    "required": ["viewId"]
+  }
+}

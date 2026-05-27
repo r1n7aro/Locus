@@ -22,6 +22,13 @@ export interface TransformResult {
   diagnostics: ViewCompileDiagnostic[];
 }
 
+export interface ViewSfcCompileResult {
+  code: string;
+  styles: string[];
+  scopeId: string | null;
+  diagnostics: ViewCompileDiagnostic[];
+}
+
 export class ViewCompileError extends Error {
   diagnostics: ViewCompileDiagnostic[];
 
@@ -78,6 +85,29 @@ function toViewDiagnostic(diagnostic: ts.Diagnostic): ViewCompileDiagnostic {
     line: location ? location.line + 1 : undefined,
     column: location ? location.character + 1 : undefined,
   };
+}
+
+export function sfcErrorCode(error: unknown): number {
+  const code = (error as { code?: unknown }).code;
+  return typeof code === "number" ? code : 0;
+}
+
+export function toSfcDiagnostic(error: unknown, fileName: string): ViewCompileDiagnostic {
+  const loc = (error as { loc?: { start?: { line?: number; column?: number } } }).loc?.start;
+  const message = error instanceof Error ? error.message : String(error);
+  return {
+    category: "error",
+    code: sfcErrorCode(error),
+    message,
+    fileName,
+    line: loc?.line,
+    column: loc?.column,
+  };
+}
+
+export function throwOnSfcErrors(errors: readonly unknown[], fileName: string) {
+  if (!errors.length) return;
+  throw new ViewCompileError(errors.map((error) => toSfcDiagnostic(error, fileName)));
 }
 
 function formatDiagnosticLocation(diagnostic: ViewCompileDiagnostic): string {

@@ -1,0 +1,14 @@
+{
+  "description": "Capture the currently open Locus View host window as a PNG image attachment. Use after `view_run` when visual inspection is needed.",
+  "parameters": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "viewId": {
+        "type": "string",
+        "description": "View id of the open View host window, for example material-inspector."
+      }
+    },
+    "required": ["viewId"]
+  }
+}

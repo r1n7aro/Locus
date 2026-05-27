@@ -1,0 +1,30 @@
+{
+  "description": "Inspect an open Locus View host window and return runtime state, viewport information, focused element, and a bounded list of visible actionable DOM elements.",
+  "parameters": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "viewId": {
+        "type": "string",
+        "description": "View id of the open View host window."
+      },
+      "selector": {
+        "type": ["string", "null"],
+        "description": "Optional CSS selector to scope the snapshot."
+      },
+      "maxElements": {
+        "type": "integer",
+        "description": "Maximum DOM elements to return. Defaults to 120 and is capped by the host."
+      },
+      "includeHidden": {
+        "type": "boolean",
+        "description": "Include hidden elements when true. Defaults to false."
+      },
+      "timeoutMs": {
+        "type": "integer",
+        "description": "Response timeout in milliseconds."
+      }
+    },
+    "required": ["viewId"]
+  }
+}

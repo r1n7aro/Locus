@@ -1,4 +1,19 @@
+import { t } from "../i18n";
+import type {
+  AppErrorPayload,
+  AssetRefAttachment,
+  ChatMessage,
+  ImageAttachment,
+  KnowledgeAccessMode,
+  PendingSessionInput,
+  SessionDetail,
+  SessionEventRecord,
+  SessionRunSummary,
+  UserIntentMeta,
+} from "../types";
+import { normalizeAppError } from "./errors";
 import { ipcInvoke } from "./ipc";
+import { checkUnityConnectionStatus } from "./unity";
 
 export interface ViewScriptManifest {
   name: string;
@@ -10,6 +25,10 @@ export interface ViewCapabilities {
   unity: boolean;
   bindings: boolean;
   writeBack: boolean;
+}
+
+export interface ViewRequirements {
+  unityConnection: boolean;
 }
 
 export interface ViewManifest {
@@ -24,6 +43,7 @@ export interface ViewManifest {
   bindings: string;
   scripts: ViewScriptManifest[];
   capabilities: ViewCapabilities;
+  requirements: ViewRequirements;
 }
 
 export interface ViewTemplateSummary {
@@ -43,6 +63,7 @@ export interface ViewPackageSummary {
   manifestPath: string;
   updatedAt: number;
   capabilities: ViewCapabilities;
+  requirements: ViewRequirements;
   temporary?: boolean;
 }
 
@@ -74,6 +95,7 @@ export interface ViewPackageDetail {
 
 export interface ViewCreateRequest {
   id: string;
+  packageName?: string | null;
   name?: string | null;
   template?: string | null;
   icon?: string | null;
@@ -94,12 +116,29 @@ export interface ViewMoveEntryRequest {
   targetDirRelPath?: string | null;
 }
 
+export interface ViewExportPackageRequest {
+  viewId: string;
+  filePath: string;
+}
+
+export interface ViewImportPackageRequest {
+  filePath: string;
+  targetDirRelPath?: string | null;
+}
+
+export interface ViewPackageImportResult {
+  summary: ViewPackageSummary;
+  snapshot: ViewTreeSnapshot;
+}
+
 export interface ViewRunResult {
   id: string;
   windowLabel: string;
   hostUrl: string;
   packageRoot: string;
 }
+
+export const VIEW_UNITY_CONNECTION_REQUIRED_ERROR_CODE = "view.unity_connection_required";
 
 export interface ViewCompileScriptRequest {
   viewId: string;
@@ -136,13 +175,73 @@ export interface ViewFrontendLogRequest {
   message: string;
 }
 
+export interface ViewFrontendLogReadRequest {
+  viewId: string;
+  limit?: number;
+}
+
+export interface ViewFrontendLogEntry {
+  time: number;
+  level: ViewFrontendLogLevel;
+  message: string;
+}
+
+export interface ViewAutomationRequest {
+  requestId: string;
+  viewId: string;
+  kind: string;
+  payload: Record<string, unknown>;
+}
+
 export interface ViewBindingTarget {
   kind: string;
   path?: string | null;
   scenePath?: string | null;
   objectPath?: string | null;
   componentType?: string | null;
+  componentIndex?: number | null;
   propertyPath?: string | null;
+}
+
+export interface ViewManagedReferenceTypeOption {
+  label: string;
+  value: string;
+  fullName: string;
+  assembly: string;
+}
+
+export interface ViewEnumOption {
+  label: string;
+  value: string;
+  name: string;
+  index: number;
+  numericValue: number;
+}
+
+export interface ViewSerializedPropertySnapshot {
+  propertyPath: string;
+  displayName: string;
+  name: string;
+  type: string;
+  valueType: string;
+  fieldTypeFullName: string;
+  fieldTypeAssembly: string;
+  value: unknown;
+  displayValue: string;
+  editable: boolean;
+  hasChildren: boolean;
+  isArray: boolean;
+  arraySize: number;
+  isFlagsEnum: boolean;
+  enumValueIndex: number;
+  enumValueFlag: number;
+  enumOptions: ViewEnumOption[];
+  children: ViewSerializedPropertySnapshot[];
+  isManagedReference: boolean;
+  managedReferenceFullTypename: string;
+  managedReferenceFieldTypename: string;
+  managedReferenceDisplayName: string;
+  managedReferenceTypes: ViewManagedReferenceTypeOption[];
 }
 
 export interface ViewBindingReadRequest {
@@ -151,16 +250,46 @@ export interface ViewBindingReadRequest {
   target?: ViewBindingTarget | null;
 }
 
-export interface ViewBindingReadResult {
+export interface ViewBindingDiscoverRequest {
+  viewId: string;
+  bindingId?: string | null;
+  target?: ViewBindingTarget | null;
+  query?: string | null;
+  fieldName?: string | null;
+  fieldType?: string | null;
+  maxDepth?: number | null;
+  maxResults?: number | null;
+}
+
+export interface ViewBindingDiscoverMatch {
+  propertyPath: string;
+  displayName: string;
+  name: string;
+  type: string;
+  valueType: string;
+  fieldTypeFullName: string;
+  fieldTypeAssembly: string;
+  displayValue: string;
+  editable: boolean;
+  hasChildren: boolean;
+  isArray: boolean;
+  isManagedReference: boolean;
+  depth: number;
+}
+
+export interface ViewBindingDiscoverResult {
   ok: boolean;
   bindingId?: string | null;
   message: string;
   target: ViewBindingTarget;
-  propertyPath: string;
-  displayName: string;
-  valueType: string;
-  value: unknown;
-  editable: boolean;
+  matches: ViewBindingDiscoverMatch[];
+}
+
+export interface ViewBindingReadResult extends ViewSerializedPropertySnapshot {
+  ok: boolean;
+  bindingId?: string | null;
+  message: string;
+  target: ViewBindingTarget;
 }
 
 export interface ViewBindingWriteRequest {
@@ -208,6 +337,114 @@ export interface ViewRuntimeUpdateEvent {
   selection: ViewRuntimeSelectionSnapshot;
 }
 
+export interface ViewSessionCreateRequest {
+  title?: string | null;
+  parentSessionId?: string | null;
+  sessionType?: string | null;
+  agentId?: string | null;
+}
+
+export type ViewSessionWaitStatus =
+  | "running"
+  | "waiting_input"
+  | "done"
+  | "cancelled"
+  | "error"
+  | "timeout"
+  | "unknown";
+
+export interface ViewSessionWaitRequest {
+  sessionId: string;
+  runId?: string | null;
+  afterSeq?: number | null;
+  timeoutMs?: number | null;
+  pollIntervalMs?: number | null;
+  includeEvents?: boolean | null;
+  returnOnWaitingInput?: boolean | null;
+}
+
+export interface ViewSessionWaitResult {
+  sessionId: string;
+  runId?: string | null;
+  status: ViewSessionWaitStatus;
+  detail: SessionDetail;
+  activeRun?: SessionRunSummary | null;
+  events: SessionEventRecord[];
+  message?: ChatMessage | null;
+  finalText: string;
+  error?: AppErrorPayload | null;
+}
+
+export interface ViewSessionChatRequest {
+  sessionId?: string | null;
+  text: string;
+  title?: string | null;
+  sessionTitle?: string | null;
+  sessionType?: string | null;
+  agentId?: string | null;
+  model?: string | null;
+  effort?: string | null;
+  images?: ImageAttachment[] | null;
+  assetRefs?: AssetRefAttachment[] | null;
+  mode?: string | null;
+  userIntent?: UserIntentMeta | null;
+  subagentModels?: Record<string, string> | null;
+  knowledgeMode?: KnowledgeAccessMode | null;
+  show?: boolean | null;
+  wait?: boolean | ViewSessionWaitRequest | null;
+}
+
+export interface ViewSessionChatResult {
+  sessionId: string;
+  runId: string;
+  result?: ViewSessionWaitResult | null;
+}
+
+export interface ViewSessionQueueInputRequest {
+  sessionId: string;
+  runId: string;
+  mergeGroupId: string;
+  text: string;
+  displayText?: string | null;
+  images?: ImageAttachment[] | null;
+  assetRefs?: AssetRefAttachment[] | null;
+  mode?: string | null;
+  userIntent?: UserIntentMeta | null;
+  clientMessageId?: string | null;
+  delivery?: "after_run" | "immediate" | string | null;
+}
+
+export type ViewSessionQueueInputResult = PendingSessionInput;
+
+export interface ViewLlmCallRequest {
+  prompt: string;
+  sessionId?: string | null;
+  title?: string | null;
+  sessionTitle?: string | null;
+  sessionType?: string | null;
+  agentId?: string | null;
+  model?: string | null;
+  effort?: string | null;
+  mode?: string | null;
+  userIntent?: UserIntentMeta | null;
+  subagentModels?: Record<string, string> | null;
+  knowledgeMode?: KnowledgeAccessMode | null;
+  show?: boolean | null;
+  wait?: boolean | ViewSessionWaitRequest | null;
+  timeoutMs?: number | null;
+}
+
+export interface ViewLlmCallResult {
+  sessionId: string;
+  runId: string;
+  status: ViewSessionWaitStatus;
+  text: string;
+  message?: ChatMessage | null;
+  detail?: SessionDetail | null;
+  events: SessionEventRecord[];
+  error?: AppErrorPayload | null;
+}
+
 export const VIEW_HOST_PATH = "/view-host";
 
 export function isViewHostWindowLocation(): boolean {
@@ -246,6 +483,16 @@ export function viewMoveEntry(request: ViewMoveEntryRequest): Promise<ViewTreeSn
   return ipcInvoke<ViewTreeSnapshot>("view_move_entry", { request });
 }
 
+export function viewExportPackage(request: ViewExportPackageRequest): Promise<string> {
+  return ipcInvoke<string>("view_export_package", { request });
+}
+
+export function viewImportPackage(
+  request: ViewImportPackageRequest,
+): Promise<ViewPackageImportResult> {
+  return ipcInvoke<ViewPackageImportResult>("view_import_package", { request });
+}
+
 export function viewRead(viewId: string): Promise<ViewPackageDetail> {
   return ipcInvoke<ViewPackageDetail>("view_read", { viewId });
 }
@@ -256,6 +503,69 @@ export function viewReload(viewId: string): Promise<ViewPackageSummary> {
 
 export function viewRun(viewId: string): Promise<ViewRunResult> {
   return ipcInvoke<ViewRunResult>("view_run", { viewId });
+}
+
+export function viewRequiresUnityConnection(
+  view: { requirements?: ViewRequirements | null; capabilities?: ViewCapabilities | null },
+): boolean {
+  return view.requirements?.unityConnection
+    ?? !!(view.capabilities?.unity || view.capabilities?.bindings || view.capabilities?.writeBack);
+}
+
+export function viewUnityConnectionRequiredMessage(viewName?: string | null): string {
+  const name = viewName?.trim();
+  return name
+    ? t("view.error.unityConnectionRequiredNamed", name)
+    : t("view.host.unityConnectionRequired");
+}
+
+export function viewUnityConnectionRequiredError(viewName?: string | null): AppErrorPayload {
+  return {
+    code: VIEW_UNITY_CONNECTION_REQUIRED_ERROR_CODE,
+    message: viewUnityConnectionRequiredMessage(viewName),
+    retryable: false,
+    severity: "error",
+  };
+}
+
+export async function checkViewOpenRequirements(
+  view: {
+    name?: string | null;
+    requirements?: ViewRequirements | null;
+    capabilities?: ViewCapabilities | null;
+  },
+): Promise<AppErrorPayload | null> {
+  if (!viewRequiresUnityConnection(view)) return null;
+
+  const status = await checkUnityConnectionStatus();
+  return status.connected ? null : viewUnityConnectionRequiredError(view.name);
+}
+
+function parseLegacyUnityConnectionRequiredMessage(message: string): string | null {
+  const prefix = "View '";
+  const suffix = "' requires a Unity Editor connection.";
+  if (!message.startsWith(prefix) || !message.endsWith(suffix)) return null;
+  return message.slice(prefix.length, message.length - suffix.length).trim() || null;
+}
+
+export function normalizeViewError(
+  error: unknown,
+  options: { viewName?: string | null } = {},
+): AppErrorPayload {
+  const normalized = normalizeAppError(error);
+  const legacyViewName = parseLegacyUnityConnectionRequiredMessage(normalized.message);
+  if (
+    normalized.code === VIEW_UNITY_CONNECTION_REQUIRED_ERROR_CODE
+    || legacyViewName
+  ) {
+    const viewName = options.viewName?.trim() ? options.viewName : legacyViewName;
+    return {
+      ...normalized,
+      code: VIEW_UNITY_CONNECTION_REQUIRED_ERROR_CODE,
+      message: viewUnityConnectionRequiredMessage(viewName),
+    };
+  }
+  return normalized;
 }
 
 export function viewCompileScript(
@@ -272,8 +582,34 @@ export function viewAppendFrontendLog(request: ViewFrontendLogRequest): Promise<
   return ipcInvoke<void>("view_append_frontend_log", { request });
 }
 
+export function viewReadFrontendLog(request: ViewFrontendLogReadRequest): Promise<ViewFrontendLogEntry[]> {
+  return ipcInvoke<ViewFrontendLogEntry[]>("view_read_frontend_log", { request });
+}
+
+export function viewOpenFrontendLog(viewId: string): Promise<void> {
+  return ipcInvoke<void>("view_open_frontend_log", { viewId });
+}
+
+export function viewAutomationRespond(
+  requestId: string,
+  ok: boolean,
+  result?: unknown,
+  error?: string | null,
+): Promise<void> {
+  return ipcInvoke<void>("view_automation_respond", {
+    requestId,
+    ok,
+    result: result ?? null,
+    error: error ?? null,
+  });
+}
+
 export function viewBindingRead(request: ViewBindingReadRequest): Promise<ViewBindingReadResult> {
   return ipcInvoke<ViewBindingReadResult>("view_binding_read", { request });
+}
+
+export function viewBindingDiscover(request: ViewBindingDiscoverRequest): Promise<ViewBindingDiscoverResult> {
+  return ipcInvoke<ViewBindingDiscoverResult>("view_binding_discover", { request });
 }
 
 export function viewBindingWrite(request: ViewBindingWriteRequest): Promise<ViewBindingWriteResult> {

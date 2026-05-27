@@ -1,5 +1,5 @@
 {
-  "description": "List valid View Packages under the selected Unity project's Locus/views directory. Use this only inside the /view workflow before creating or opening a View.",
+  "description": "List valid View Packages under the selected Unity project's Locus/View directory. Use this only inside the /view workflow before creating or opening a View.",
   "parameters": {
     "type": "object",
     "additionalProperties": false,

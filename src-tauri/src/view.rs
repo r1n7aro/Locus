@@ -1,6 +1,6 @@
 use std::collections::{BTreeSet, HashMap};
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -11,14 +11,86 @@ use tauri::{AppHandle, Emitter, Manager, WebviewUrl};
 
 pub const VIEW_SCHEMA: &str = "locus.view.v1";
 pub const VIEW_BINDINGS_SCHEMA: &str = "locus.view.bindings.v1";
-pub const VIEW_ROOT_RELATIVE: &str = "Locus/views";
+pub const VIEW_ROOT_RELATIVE: &str = "Locus/View";
+pub const VIEW_WORKSPACE_SRC_DIR: &str = "src";
 pub const TEMP_VIEW_ROOT_RELATIVE: &str = "view-packages";
 pub const VIEW_RELOAD_EVENT: &str = "view-package-reloaded";
 pub const VIEW_TREE_CHANGED_EVENT: &str = "view-tree-changed";
+pub const VIEW_AUTOMATION_REQUEST_EVENT: &str = "view-automation-request";
 
 const VIEW_HOST_ROUTE: &str = "/view-host";
 const VIEW_FRONTEND_LOG_REL_PATH: &str = ".locus/logs/frontend.log";
 const VIEW_FRONTEND_LOG_MAX_CHARS: usize = 16_384;
+const VIEW_PACKAGE_ARCHIVE_MAX_ENTRIES: usize = 20_000;
+const VIEW_PACKAGE_ARCHIVE_MAX_UNCOMPRESSED_BYTES: u64 = 256 * 1024 * 1024;
+
+mod templates;
+
+#[derive(Debug, Default)]
+pub struct ViewAutomationStore {
+    pending: Mutex<HashMap<String, tokio::sync::oneshot::Sender<ViewAutomationReply>>>,
+}
+
+#[derive(Debug)]
+pub struct ViewAutomationReply {
+    pub ok: bool,
+    pub result: Option<serde_json::Value>,
+    pub error: Option<String>,
+}
+
+impl ViewAutomationStore {
+    pub fn insert(
+        &self,
+        request_id: String,
+        tx: tokio::sync::oneshot::Sender<ViewAutomationReply>,
+    ) -> Result<(), String> {
+        let mut pending = self
+            .pending
+            .lock()
+            .map_err(|_| "View automation store is unavailable".to_string())?;
+        pending.insert(request_id, tx);
+        Ok(())
+    }
+
+    pub fn complete(&self, request_id: &str, reply: ViewAutomationReply) -> bool {
+        let Ok(mut pending) = self.pending.lock() else {
+            return false;
+        };
+        let Some(tx) = pending.remove(request_id) else {
+            return false;
+        };
+        tx.send(reply).is_ok()
+    }
+
+    pub fn cancel(&self, request_id: &str) {
+        if let Ok(mut pending) = self.pending.lock() {
+            pending.remove(request_id);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ViewAutomationRequestEvent {
+    pub request_id: String,
+    pub view_id: String,
+    pub kind: String,
+    pub payload: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ViewCaptureResult {
+    pub view_id: String,
+    pub window_label: String,
+    pub mime_type: String,
+    pub format: String,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub byte_size: usize,
+    #[serde(skip_serializing)]
+    pub bytes: Vec<u8>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -39,6 +111,13 @@ pub struct ViewCapabilities {
     pub write_back: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ViewRequirements {
+    #[serde(default)]
+    pub unity_connection: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ViewManifest {
@@ -56,12 +135,16 @@ pub struct ViewManifest {
     pub scripts: Vec<ViewScriptManifest>,
     #[serde(default)]
     pub capabilities: ViewCapabilities,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requirements: Option<ViewRequirements>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ViewCreateRequest {
     pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -92,6 +175,7 @@ pub struct ViewPackageSummary {
     pub manifest_path: String,
     pub updated_at: i64,
     pub capabilities: ViewCapabilities,
+    pub requirements: ViewRequirements,
     #[serde(default)]
     pub temporary: bool,
 }
@@ -134,6 +218,21 @@ pub struct ViewMoveEntryRequest {
     pub target_dir_rel_path: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ViewExportPackageRequest {
+    pub view_id: String,
+    pub file_path: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ViewImportPackageRequest {
+    pub file_path: String,
+    #[serde(default)]
+    pub target_dir_rel_path: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ViewPackageFile {
@@ -150,6 +249,13 @@ pub struct ViewPackageDetail {
     pub summary: ViewPackageSummary,
     pub manifest: ViewManifest,
     pub files: Vec<ViewPackageFile>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ViewPackageImportResult {
+    pub summary: ViewPackageSummary,
+    pub snapshot: ViewTreeSnapshot,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -207,6 +313,22 @@ pub struct ViewFrontendLogRequest {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ViewFrontendLogReadRequest {
+    pub view_id: String,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ViewFrontendLogEntry {
+    pub time: i64,
+    pub level: String,
+    pub message: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ViewBindingTarget {
@@ -219,6 +341,8 @@ pub struct ViewBindingTarget {
     pub object_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub component_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub component_index: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub property_path: Option<String>,
 }
@@ -233,6 +357,105 @@ pub struct ViewBindingReadRequest {
     pub target: Option<ViewBindingTarget>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ViewBindingDiscoverRequest {
+    pub view_id: String,
+    #[serde(default)]
+    pub binding_id: Option<String>,
+    #[serde(default)]
+    pub target: Option<ViewBindingTarget>,
+    #[serde(default)]
+    pub query: Option<String>,
+    #[serde(default)]
+    pub field_name: Option<String>,
+    #[serde(default)]
+    pub field_type: Option<String>,
+    #[serde(default)]
+    pub max_depth: Option<i32>,
+    #[serde(default)]
+    pub max_results: Option<i32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ViewManagedReferenceTypeOption {
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub value: String,
+    #[serde(default)]
+    pub full_name: String,
+    #[serde(default)]
+    pub assembly: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ViewEnumOption {
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub value: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub index: i32,
+    #[serde(default)]
+    pub numeric_value: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ViewSerializedPropertySnapshot {
+    #[serde(default)]
+    pub property_path: String,
+    #[serde(default)]
+    pub display_name: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default, rename = "type")]
+    pub property_type: String,
+    #[serde(default)]
+    pub value_type: String,
+    #[serde(default)]
+    pub field_type_full_name: String,
+    #[serde(default)]
+    pub field_type_assembly: String,
+    #[serde(default)]
+    pub value: serde_json::Value,
+    #[serde(default)]
+    pub display_value: String,
+    #[serde(default)]
+    pub editable: bool,
+    #[serde(default)]
+    pub has_children: bool,
+    #[serde(default)]
+    pub is_array: bool,
+    #[serde(default)]
+    pub array_size: i32,
+    #[serde(default)]
+    pub is_flags_enum: bool,
+    #[serde(default)]
+    pub enum_value_index: i32,
+    #[serde(default)]
+    pub enum_value_flag: i64,
+    #[serde(default)]
+    pub enum_options: Vec<ViewEnumOption>,
+    #[serde(default)]
+    pub children: Vec<ViewSerializedPropertySnapshot>,
+    #[serde(default)]
+    pub is_managed_reference: bool,
+    #[serde(default)]
+    pub managed_reference_full_typename: String,
+    #[serde(default)]
+    pub managed_reference_field_typename: String,
+    #[serde(default)]
+    pub managed_reference_display_name: String,
+    #[serde(default)]
+    pub managed_reference_types: Vec<ViewManagedReferenceTypeOption>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ViewBindingReadResult {
@@ -241,12 +464,51 @@ pub struct ViewBindingReadResult {
     pub binding_id: Option<String>,
     pub message: String,
     pub target: ViewBindingTarget,
+    #[serde(flatten)]
+    pub property: ViewSerializedPropertySnapshot,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ViewBindingDiscoverMatch {
+    #[serde(default)]
     pub property_path: String,
+    #[serde(default)]
     pub display_name: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default, rename = "type")]
+    pub property_type: String,
+    #[serde(default)]
     pub value_type: String,
     #[serde(default)]
-    pub value: serde_json::Value,
+    pub field_type_full_name: String,
+    #[serde(default)]
+    pub field_type_assembly: String,
+    #[serde(default)]
+    pub display_value: String,
+    #[serde(default)]
     pub editable: bool,
+    #[serde(default)]
+    pub has_children: bool,
+    #[serde(default)]
+    pub is_array: bool,
+    #[serde(default)]
+    pub is_managed_reference: bool,
+    #[serde(default)]
+    pub depth: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ViewBindingDiscoverResult {
+    pub ok: bool,
+    #[serde(default)]
+    pub binding_id: Option<String>,
+    pub message: String,
+    pub target: ViewBindingTarget,
+    #[serde(default)]
+    pub matches: Vec<ViewBindingDiscoverMatch>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -324,36 +586,7 @@ struct LoadedViewBindings {
 }
 
 pub fn supported_view_templates() -> Vec<ViewTemplateSummary> {
-    vec![
-        ViewTemplateSummary {
-            id: "blank".to_string(),
-            name: "Blank".to_string(),
-            description: "Minimal editable View package.".to_string(),
-        },
-        ViewTemplateSummary {
-            id: "inspector-form".to_string(),
-            name: "Inspector Form".to_string(),
-            description: "Field-oriented form scaffold for Unity data.".to_string(),
-        },
-        ViewTemplateSummary {
-            id: "node-graph".to_string(),
-            name: "Node Graph".to_string(),
-            description: "Draggable node graph scaffold with serialized edges.".to_string(),
-        },
-        ViewTemplateSummary {
-            id: "link-board".to_string(),
-            name: "Link Board".to_string(),
-            description: "Two-column link mapping scaffold with serialized connections."
-                .to_string(),
-        },
-    ]
-}
-
-fn is_supported_template(template: &str) -> bool {
-    matches!(
-        template,
-        "blank" | "inspector-form" | "node-graph" | "link-board"
-    )
+    templates::supported_view_templates()
 }
 
 fn now_millis() -> i64 {
@@ -457,7 +690,7 @@ pub fn validate_view_manifest(manifest: &ViewManifest) -> Result<(), String> {
     if manifest.version.trim().is_empty() {
         return Err("View version cannot be empty.".to_string());
     }
-    if !is_supported_template(&manifest.template) {
+    if !templates::is_supported_template(&manifest.template) {
         return Err(format!("Unsupported View template: {}", manifest.template));
     }
     if let Some(icon) = manifest
@@ -528,6 +761,39 @@ pub fn views_root_for_workspace(working_dir: &str) -> Result<PathBuf, String> {
     Ok(workspace_root(working_dir)?.join(VIEW_ROOT_RELATIVE))
 }
 
+fn default_view_package_name(working_dir: &str) -> Result<String, String> {
+    let root = workspace_root(working_dir)?;
+    let raw_name = root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("Project");
+    normalize_view_folder_name(raw_name).or_else(|_| Ok("Project".to_string()))
+}
+
+fn normalize_view_package_name(value: &str) -> Result<String, String> {
+    normalize_view_folder_name(value)
+}
+
+fn request_view_package_name(
+    working_dir: &str,
+    request: &ViewCreateRequest,
+) -> Result<String, String> {
+    match request
+        .package_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(package_name) => normalize_view_package_name(package_name),
+        None => default_view_package_name(working_dir),
+    }
+}
+
+fn view_package_workspace_root(working_dir: &str, package_name: &str) -> Result<PathBuf, String> {
+    let package_name = normalize_view_package_name(package_name)?;
+    Ok(views_root_for_workspace(working_dir)?.join(package_name))
+}
+
 fn temp_workspace_dir_name(working_dir: &str) -> Result<String, String> {
     let root = workspace_root(working_dir)?;
     let normalized = root.display().to_string().replace('\\', "/");
@@ -578,12 +844,9 @@ pub fn temporary_views_root_for_workspace(working_dir: &str) -> Result<PathBuf, 
 
 pub fn view_package_root(working_dir: &str, id: &str) -> Result<PathBuf, String> {
     let id = normalize_view_id(id)?;
+    let package_name = default_view_package_name(working_dir)?;
     let views_root = views_root_for_workspace(working_dir)?;
-    let direct_root = views_root.join(&id);
-    if manifest_matches_id(&direct_root, &id) {
-        return Ok(direct_root);
-    }
-
+    let direct_root = views_root.join(package_name).join(&id);
     let matches = find_view_package_roots_by_id(&views_root, &id)?;
     match matches.len() {
         0 => Ok(direct_root),
@@ -598,6 +861,16 @@ pub fn view_package_root(working_dir: &str, id: &str) -> Result<PathBuf, String>
                 .join(", ")
         )),
     }
+}
+
+fn view_package_root_for_request(
+    working_dir: &str,
+    request: &ViewCreateRequest,
+    id: &str,
+) -> Result<PathBuf, String> {
+    let id = normalize_view_id(id)?;
+    let package_name = request_view_package_name(working_dir, request)?;
+    Ok(view_package_workspace_root(working_dir, &package_name)?.join(id))
 }
 
 pub fn resolve_view_package_root(working_dir: &str, id: &str) -> Result<PathBuf, String> {
@@ -671,12 +944,32 @@ fn view_rel_path_for_root(views_root: &Path, root: &Path) -> Result<String, Stri
     normalize_view_tree_rel_path(&rel_path, false)
 }
 
+fn inferred_view_requirements(capabilities: &ViewCapabilities) -> ViewRequirements {
+    ViewRequirements {
+        unity_connection: capabilities.unity || capabilities.bindings || capabilities.write_back,
+    }
+}
+
+fn normalize_view_requirements(manifest: &mut ViewManifest) {
+    if manifest.requirements.is_none() {
+        manifest.requirements = Some(inferred_view_requirements(&manifest.capabilities));
+    }
+}
+
+fn view_manifest_requirements(manifest: &ViewManifest) -> ViewRequirements {
+    manifest
+        .requirements
+        .clone()
+        .unwrap_or_else(|| inferred_view_requirements(&manifest.capabilities))
+}
+
 fn load_manifest_from_root(root: &Path) -> Result<ViewManifest, String> {
     let path = manifest_path(root);
     let raw = std::fs::read_to_string(&path)
         .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
-    let manifest: ViewManifest = serde_json::from_str(&raw)
+    let mut manifest: ViewManifest = serde_json::from_str(&raw)
         .map_err(|e| format!("Invalid View manifest {}: {}", path.display(), e))?;
+    normalize_view_requirements(&mut manifest);
     validate_view_manifest(&manifest)?;
     Ok(manifest)
 }
@@ -703,6 +996,7 @@ fn summary_from_manifest(
         manifest_path: manifest_path(root).display().to_string().replace('\\', "/"),
         updated_at: updated_at(&manifest_path(root)),
         capabilities: manifest.capabilities.clone(),
+        requirements: view_manifest_requirements(manifest),
         temporary,
     }
 }
@@ -718,6 +1012,27 @@ fn is_skippable_view_scan_dir(name: &str) -> bool {
         name,
         "node_modules" | ".git" | "dist" | "target" | "Library" | "Temp"
     )
+}
+
+fn is_view_workspace_source_dir(_scan_root: &Path, path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name == VIEW_WORKSPACE_SRC_DIR)
+        .unwrap_or(false)
+}
+
+fn is_skippable_view_scan_entry(scan_root: &Path, entry: &walkdir::DirEntry) -> bool {
+    if !entry.file_type().is_dir() {
+        return false;
+    }
+    if is_view_workspace_source_dir(scan_root, entry.path()) {
+        return true;
+    }
+    entry
+        .file_name()
+        .to_str()
+        .map(is_skippable_view_scan_dir)
+        .unwrap_or(false)
 }
 
 fn manifest_matches_id(root: &Path, id: &str) -> bool {
@@ -740,12 +1055,7 @@ fn find_view_package_roots_by_id(views_root: &Path, id: &str) -> Result<Vec<Path
         .follow_links(false)
         .into_iter()
         .filter_entry(|entry| {
-            entry.file_type().is_file()
-                || entry
-                    .file_name()
-                    .to_str()
-                    .map(|name| !is_skippable_view_scan_dir(name))
-                    .unwrap_or(true)
+            entry.file_type().is_file() || !is_skippable_view_scan_entry(views_root, entry)
         })
     {
         let entry = entry.map_err(|error| format!("Failed to scan View packages: {}", error))?;
@@ -776,12 +1086,7 @@ pub fn list_views_sync(working_dir: &str) -> Result<Vec<ViewPackageSummary>, Str
         .follow_links(false)
         .into_iter()
         .filter_entry(|entry| {
-            entry.file_type().is_file()
-                || entry
-                    .file_name()
-                    .to_str()
-                    .map(|name| !is_skippable_view_scan_dir(name))
-                    .unwrap_or(true)
+            entry.file_type().is_file() || !is_skippable_view_scan_entry(&views_root, entry)
         })
     {
         let entry = entry.map_err(|error| format!("Failed to scan View packages: {}", error))?;
@@ -831,12 +1136,7 @@ pub fn list_view_tree_sync(working_dir: &str) -> Result<ViewTreeSnapshot, String
             if entry.file_type().is_file() {
                 return false;
             }
-            if entry
-                .file_name()
-                .to_str()
-                .map(is_skippable_view_scan_dir)
-                .unwrap_or(false)
-            {
+            if is_skippable_view_scan_entry(&views_root, entry) {
                 return false;
             }
             !manifest_path(entry.path()).is_file()
@@ -975,6 +1275,13 @@ pub fn move_view_entry_sync(
         ));
     }
 
+    if manifest_path(&source).is_file() {
+        if target_dir_rel_path.is_empty() {
+            return Err("Cannot move a View outside a package workspace.".to_string());
+        }
+        ensure_view_package_workspace(&target_dir)?;
+    }
+
     std::fs::rename(&source, &target).map_err(|e| {
         format!(
             "Failed to move {} to {}: {}",
@@ -984,6 +1291,367 @@ pub fn move_view_entry_sync(
         )
     })?;
     list_view_tree_sync(working_dir)
+}
+
+fn view_archive_output_path(file_path: &str) -> Result<PathBuf, String> {
+    let trimmed = file_path.trim();
+    if trimmed.is_empty() {
+        return Err("Export path cannot be empty.".to_string());
+    }
+    let mut path = PathBuf::from(trimmed);
+    let has_zip_extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.eq_ignore_ascii_case("zip"))
+        .unwrap_or(false);
+    if !has_zip_extension {
+        path.set_extension("zip");
+    }
+    Ok(path)
+}
+
+fn zip_error(context: &str, error: impl std::fmt::Display) -> String {
+    format!("{}: {}", context, error)
+}
+
+pub fn export_view_package_sync(
+    working_dir: &str,
+    request: ViewExportPackageRequest,
+) -> Result<String, String> {
+    let root = resolve_view_package_root(working_dir, &request.view_id)?;
+    if !root.is_dir() {
+        return Err(format!("View package not found: {}", request.view_id));
+    }
+    let manifest = load_manifest_from_root(&root)?;
+    if manifest.id != normalize_view_id(&request.view_id)? {
+        return Err(format!(
+            "View id mismatch: requested {}, manifest has {}",
+            request.view_id, manifest.id
+        ));
+    }
+
+    let output_path = view_archive_output_path(&request.file_path)?;
+    if let Some(parent) = output_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create {}: {}", parent.display(), e))?;
+    }
+
+    let output = std::fs::File::create(&output_path)
+        .map_err(|e| format!("Failed to create {}: {}", output_path.display(), e))?;
+    let mut archive = zip::ZipWriter::new(output);
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated)
+        .unix_permissions(0o644);
+
+    let mut paths = Vec::new();
+    for entry in walkdir::WalkDir::new(&root)
+        .min_depth(1)
+        .follow_links(false)
+        .into_iter()
+    {
+        let entry =
+            entry.map_err(|error| format!("Failed to scan View package for export: {}", error))?;
+        paths.push(entry.path().to_path_buf());
+    }
+    paths.sort();
+
+    for path in paths {
+        if is_view_internal_path(&path) {
+            continue;
+        }
+        let metadata = std::fs::symlink_metadata(&path)
+            .map_err(|e| format!("Failed to inspect {}: {}", path.display(), e))?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "Refusing to export symlinked View package entry: {}",
+                path.display()
+            ));
+        }
+        if metadata.is_dir() {
+            continue;
+        }
+        if !metadata.is_file() {
+            return Err(format!(
+                "Unsupported View package entry type: {}",
+                path.display()
+            ));
+        }
+
+        let rel_path = path
+            .strip_prefix(&root)
+            .map_err(|error| format!("Failed to resolve View package path: {}", error))?
+            .to_string_lossy()
+            .replace('\\', "/");
+        let rel_path = normalize_package_rel_path(&rel_path)?;
+        archive
+            .start_file(rel_path, options)
+            .map_err(|error| zip_error("Failed to write View package archive entry", error))?;
+        let mut input = std::fs::File::open(&path)
+            .map_err(|e| format!("Failed to open {}: {}", path.display(), e))?;
+        std::io::copy(&mut input, &mut archive)
+            .map_err(|e| format!("Failed to write archive data for {}: {}", path.display(), e))?;
+    }
+
+    archive
+        .finish()
+        .map_err(|error| zip_error("Failed to finish View package archive", error))?;
+    Ok(output_path.display().to_string().replace('\\', "/"))
+}
+
+fn zip_entry_rel_path(file: &zip::read::ZipFile<'_>) -> Result<String, String> {
+    let path = file
+        .enclosed_name()
+        .ok_or_else(|| format!("Unsafe archive entry path: {}", file.name()))?;
+    let rel_path = path.to_string_lossy().replace('\\', "/");
+    normalize_package_rel_path(&rel_path)
+}
+
+fn view_archive_manifest_candidate(candidates: &[String]) -> Result<String, String> {
+    if candidates.iter().any(|path| path == "view.json") {
+        return Ok("view.json".to_string());
+    }
+
+    let top_level = candidates
+        .iter()
+        .filter(|path| {
+            let mut parts = path.split('/');
+            parts.next().is_some() && parts.next() == Some("view.json") && parts.next().is_none()
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if top_level.len() == 1 {
+        return Ok(top_level[0].clone());
+    }
+
+    if candidates.len() == 1 {
+        return Ok(candidates[0].clone());
+    }
+
+    Err("View package archive must contain one view.json manifest.".to_string())
+}
+
+fn view_archive_package_prefix(manifest_rel_path: &str) -> String {
+    manifest_rel_path
+        .strip_suffix("view.json")
+        .unwrap_or("")
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn strip_view_archive_prefix(entry_rel_path: &str, prefix: &str) -> Option<String> {
+    if prefix.is_empty() {
+        return Some(entry_rel_path.to_string());
+    }
+    if entry_rel_path == prefix {
+        return Some(String::new());
+    }
+    entry_rel_path
+        .strip_prefix(&format!("{}/", prefix))
+        .map(str::to_string)
+}
+
+fn read_view_archive_manifest(
+    archive: &mut zip::ZipArchive<std::fs::File>,
+) -> Result<(String, ViewManifest), String> {
+    let mut candidates = Vec::new();
+    for index in 0..archive.len() {
+        let file = archive
+            .by_index(index)
+            .map_err(|error| zip_error("Failed to read View package archive", error))?;
+        if file.is_dir() {
+            continue;
+        }
+        let rel_path = zip_entry_rel_path(&file)?;
+        if rel_path == "view.json" || rel_path.ends_with("/view.json") {
+            candidates.push(rel_path);
+        }
+    }
+
+    let manifest_rel_path = view_archive_manifest_candidate(&candidates)?;
+    let mut manifest_file = archive
+        .by_name(&manifest_rel_path)
+        .map_err(|error| zip_error("Failed to read View package manifest from archive", error))?;
+    let mut raw = String::new();
+    manifest_file
+        .read_to_string(&mut raw)
+        .map_err(|error| format!("Failed to read View package manifest: {}", error))?;
+    let mut manifest: ViewManifest = serde_json::from_str(&raw)
+        .map_err(|error| format!("Invalid View manifest in archive: {}", error))?;
+    normalize_view_requirements(&mut manifest);
+    validate_view_manifest(&manifest)?;
+    Ok((view_archive_package_prefix(&manifest_rel_path), manifest))
+}
+
+fn view_import_target_workspace_root(
+    working_dir: &str,
+    target_dir_rel_path: Option<&str>,
+) -> Result<PathBuf, String> {
+    let views_root = views_root_for_workspace(working_dir)?;
+    let target_dir_rel_path = target_dir_rel_path.unwrap_or("").trim();
+    if target_dir_rel_path.is_empty() {
+        return Ok(views_root.join(default_view_package_name(working_dir)?));
+    }
+
+    let target_dir_rel_path = normalize_view_tree_rel_path(target_dir_rel_path, false)?;
+    let target_dir = view_tree_path(&views_root, &target_dir_rel_path, false)?;
+    if !target_dir.is_dir() {
+        return Err(format!(
+            "Target View folder not found: {}",
+            target_dir_rel_path
+        ));
+    }
+    if manifest_path(&target_dir).is_file() {
+        return Err("Cannot import a View inside a View package.".to_string());
+    }
+    Ok(target_dir)
+}
+
+fn is_zip_entry_symlink(file: &zip::read::ZipFile<'_>) -> bool {
+    const UNIX_FILE_TYPE_MASK: u32 = 0o170000;
+    const UNIX_SYMLINK_TYPE: u32 = 0o120000;
+    file.unix_mode()
+        .map(|mode| mode & UNIX_FILE_TYPE_MASK == UNIX_SYMLINK_TYPE)
+        .unwrap_or(false)
+}
+
+fn extract_view_package_archive(
+    archive: &mut zip::ZipArchive<std::fs::File>,
+    package_prefix: &str,
+    target_root: &Path,
+) -> Result<(), String> {
+    let mut extracted_entries = 0usize;
+    let mut uncompressed_bytes = 0u64;
+
+    for index in 0..archive.len() {
+        let mut file = archive
+            .by_index(index)
+            .map_err(|error| zip_error("Failed to read View package archive", error))?;
+        let entry_rel_path = zip_entry_rel_path(&file)?;
+        let Some(package_rel_path) = strip_view_archive_prefix(&entry_rel_path, package_prefix)
+        else {
+            continue;
+        };
+        if package_rel_path.is_empty() {
+            continue;
+        }
+        let package_rel_path = normalize_package_rel_path(&package_rel_path)?;
+        if is_view_internal_path(Path::new(&package_rel_path)) {
+            continue;
+        }
+        if is_zip_entry_symlink(&file) {
+            return Err(format!(
+                "Refusing to import symlinked View package entry: {}",
+                entry_rel_path
+            ));
+        }
+
+        extracted_entries += 1;
+        if extracted_entries > VIEW_PACKAGE_ARCHIVE_MAX_ENTRIES {
+            return Err("View package archive has too many entries.".to_string());
+        }
+        uncompressed_bytes = uncompressed_bytes.saturating_add(file.size());
+        if uncompressed_bytes > VIEW_PACKAGE_ARCHIVE_MAX_UNCOMPRESSED_BYTES {
+            return Err("View package archive is too large.".to_string());
+        }
+
+        let output_path = target_root.join(&package_rel_path);
+        if !path_is_under_root(&output_path, target_root) {
+            return Err(format!(
+                "Archive entry resolves outside of View package: {}",
+                entry_rel_path
+            ));
+        }
+        if file.is_dir() {
+            std::fs::create_dir_all(&output_path)
+                .map_err(|e| format!("Failed to create {}: {}", output_path.display(), e))?;
+            continue;
+        }
+
+        if let Some(parent) = output_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create {}: {}", parent.display(), e))?;
+        }
+        let mut output = std::fs::File::create(&output_path)
+            .map_err(|e| format!("Failed to create {}: {}", output_path.display(), e))?;
+        std::io::copy(&mut file, &mut output)
+            .map_err(|e| format!("Failed to extract {}: {}", entry_rel_path, e))?;
+    }
+
+    if !manifest_path(target_root).is_file() {
+        return Err("View package archive did not extract a root view.json.".to_string());
+    }
+    Ok(())
+}
+
+pub fn import_view_package_sync(
+    working_dir: &str,
+    request: ViewImportPackageRequest,
+) -> Result<ViewPackageImportResult, String> {
+    let archive_path = PathBuf::from(request.file_path.trim());
+    if archive_path.as_os_str().is_empty() {
+        return Err("Import path cannot be empty.".to_string());
+    }
+    if !archive_path.is_file() {
+        return Err(format!(
+            "View package archive not found: {}",
+            archive_path.display()
+        ));
+    }
+
+    let archive_file = std::fs::File::open(&archive_path)
+        .map_err(|e| format!("Failed to open {}: {}", archive_path.display(), e))?;
+    let mut archive = zip::ZipArchive::new(archive_file)
+        .map_err(|error| zip_error("Invalid View package archive", error))?;
+    let (package_prefix, manifest) = read_view_archive_manifest(&mut archive)?;
+
+    let views_root = views_root_for_workspace(working_dir)?;
+    let existing = find_view_package_roots_by_id(&views_root, &manifest.id)?;
+    if !existing.is_empty() {
+        return Err(format!("View package id already exists: {}", manifest.id));
+    }
+
+    let workspace_root =
+        view_import_target_workspace_root(working_dir, request.target_dir_rel_path.as_deref())?;
+    if manifest_path(&workspace_root).is_file() {
+        return Err("Cannot import a View inside a View package.".to_string());
+    }
+    ensure_view_package_workspace(&workspace_root)?;
+    let target_root = workspace_root.join(&manifest.id);
+    if target_root.exists() {
+        return Err(format!(
+            "View package already exists: {}",
+            target_root.display()
+        ));
+    }
+    std::fs::create_dir_all(&target_root)
+        .map_err(|e| format!("Failed to create {}: {}", target_root.display(), e))?;
+
+    if let Err(error) = extract_view_package_archive(&mut archive, &package_prefix, &target_root) {
+        let _ = std::fs::remove_dir_all(&target_root);
+        return Err(error);
+    }
+
+    let imported_manifest = match load_manifest_from_root(&target_root) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            let _ = std::fs::remove_dir_all(&target_root);
+            return Err(error);
+        }
+    };
+    if imported_manifest.id != manifest.id {
+        let _ = std::fs::remove_dir_all(&target_root);
+        return Err(format!(
+            "View id mismatch after import: archive has {}, extracted manifest has {}",
+            manifest.id, imported_manifest.id
+        ));
+    }
+
+    let summary = summary_from_manifest(&views_root, &target_root, &imported_manifest, false);
+    let snapshot = list_view_tree_sync(working_dir)?;
+    Ok(ViewPackageImportResult { summary, snapshot })
 }
 
 pub fn create_view_sync(
@@ -1010,7 +1678,7 @@ pub fn create_view_sync_with_scope(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or("blank");
-    if !is_supported_template(template) {
+    if !templates::is_supported_template(template) {
         return Err(format!("Unsupported View template: {}", template));
     }
 
@@ -1032,26 +1700,94 @@ pub fn create_view_sync_with_scope(
     }
 
     let root = if temporary {
-        temporary_view_package_root(working_dir, &id)?
+        temporary_view_package_root(working_dir, request.package_name.as_deref(), &id)?
     } else {
-        view_package_root(working_dir, &id)?
+        view_package_root_for_request(working_dir, &request, &id)?
     };
+    if !temporary {
+        let views_root = views_root_for_workspace(working_dir)?;
+        let existing = find_view_package_roots_by_id(&views_root, &id)?;
+        if !existing.is_empty() {
+            return Err(format!(
+                "View package id already exists: {} at {}",
+                id,
+                existing
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
     if root.exists() {
         return Err(format!("View package already exists: {}", root.display()));
+    }
+    let workspace_root = root
+        .parent()
+        .ok_or_else(|| format!("Invalid View package root: {}", root.display()))?
+        .to_path_buf();
+    if !temporary {
+        ensure_view_package_workspace(&workspace_root)?;
+    } else {
+        std::fs::create_dir_all(&workspace_root)
+            .map_err(|e| format!("Failed to create {}: {}", workspace_root.display(), e))?;
     }
     std::fs::create_dir_all(&root)
         .map_err(|e| format!("Failed to create {}: {}", root.display(), e))?;
 
-    let manifest = template_manifest(&id, &name, template, icon.as_deref());
+    let manifest = templates::template_manifest(&id, &name, template, icon.as_deref());
     let manifest_raw = serde_json::to_string_pretty(&manifest)
         .map_err(|e| format!("Failed to serialize View manifest: {}", e))?;
     write_package_file(&root, "view.json", &(manifest_raw + "\n"))?;
 
-    for (rel_path, content) in template_files(&id, &name, template) {
+    for (rel_path, content) in templates::template_files(&id, &name, template) {
         write_package_file(&root, rel_path, &content)?;
     }
 
     read_view_sync(working_dir, &id)
+}
+
+fn ensure_view_package_workspace(workspace_root: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(workspace_root)
+        .map_err(|e| format!("Failed to create {}: {}", workspace_root.display(), e))?;
+    let src_root = workspace_root.join(VIEW_WORKSPACE_SRC_DIR);
+    std::fs::create_dir_all(&src_root)
+        .map_err(|e| format!("Failed to create {}: {}", src_root.display(), e))?;
+
+    let package_json_path = workspace_root.join("package.json");
+    if !package_json_path.exists() {
+        std::fs::write(&package_json_path, templates::view_workspace_package_json())
+            .map_err(|e| format!("Failed to write {}: {}", package_json_path.display(), e))?;
+    }
+
+    let tsconfig_path = workspace_root.join("tsconfig.json");
+    if !tsconfig_path.exists() {
+        std::fs::write(&tsconfig_path, templates::view_workspace_tsconfig_json())
+            .map_err(|e| format!("Failed to write {}: {}", tsconfig_path.display(), e))?;
+    }
+
+    let index_path = src_root.join("index.ts");
+    if !index_path.exists() {
+        std::fs::write(&index_path, templates::view_workspace_index_ts())
+            .map_err(|e| format!("Failed to write {}: {}", index_path.display(), e))?;
+    }
+
+    let property_draw_path = src_root.join("propertyDraw.ts");
+    if !property_draw_path.exists() {
+        std::fs::write(
+            &property_draw_path,
+            templates::view_workspace_property_draw_ts(),
+        )
+        .map_err(|e| format!("Failed to write {}: {}", property_draw_path.display(), e))?;
+    }
+
+    let readme_path = workspace_root.join("README.md");
+    if !readme_path.exists() {
+        std::fs::write(&readme_path, templates::view_workspace_readme_md())
+            .map_err(|e| format!("Failed to write {}: {}", readme_path.display(), e))?;
+    }
+
+    Ok(())
 }
 
 fn unique_temporary_view_id(base_id: &str) -> String {
@@ -1059,12 +1795,23 @@ fn unique_temporary_view_id(base_id: &str) -> String {
     format!("{}-tmp-{}", base_id, &suffix[..8])
 }
 
-fn temporary_view_package_root(working_dir: &str, id: &str) -> Result<PathBuf, String> {
+fn temporary_view_package_root(
+    working_dir: &str,
+    package_name: Option<&str>,
+    id: &str,
+) -> Result<PathBuf, String> {
     let id = normalize_view_id(id)?;
     let root = temporary_views_root_for_workspace(working_dir)?;
     std::fs::create_dir_all(&root)
         .map_err(|e| format!("Failed to create {}: {}", root.display(), e))?;
-    Ok(root.join(id))
+    let package_name = match package_name
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(package_name) => normalize_view_package_name(package_name)?,
+        None => default_view_package_name(working_dir)?,
+    };
+    Ok(root.join(package_name).join(id))
 }
 
 pub fn read_view_sync(working_dir: &str, view_id: &str) -> Result<ViewPackageDetail, String> {
@@ -1085,6 +1832,9 @@ pub fn read_view_sync(working_dir: &str, view_id: &str) -> Result<ViewPackageDet
     let temporary = path_is_under_root(&root, &temp_root);
     let summary_root = if temporary { &temp_root } else { &views_root };
     let summary = summary_from_manifest(summary_root, &root, &manifest, temporary);
+    let workspace_root = root
+        .parent()
+        .ok_or_else(|| format!("Invalid View package root: {}", root.display()))?;
     let mut rel_paths = BTreeSet::new();
     rel_paths.insert("view.json".to_string());
     rel_paths.insert("README.md".to_string());
@@ -1104,8 +1854,10 @@ pub fn read_view_sync(working_dir: &str, view_id: &str) -> Result<ViewPackageDet
         if !path.is_file() {
             continue;
         }
-        files.push(read_package_file(&root, &rel_path)?);
+        let workspace_rel_path = workspace_relative_view_path(summary_root, &path)?;
+        files.push(read_view_file(&path, &workspace_rel_path)?);
     }
+    collect_view_package_workspace_source_files(summary_root, workspace_root, &mut files)?;
 
     Ok(ViewPackageDetail {
         summary,
@@ -1154,6 +1906,58 @@ fn collect_view_runtime_source_paths(
     Ok(())
 }
 
+fn collect_view_package_workspace_source_files(
+    root_base: &Path,
+    workspace_root: &Path,
+    files: &mut Vec<ViewPackageFile>,
+) -> Result<(), String> {
+    let src_root = workspace_root.join(VIEW_WORKSPACE_SRC_DIR);
+    if !src_root.is_dir() {
+        return Ok(());
+    }
+
+    for entry in walkdir::WalkDir::new(&src_root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| {
+            entry.file_type().is_file()
+                || entry
+                    .file_name()
+                    .to_str()
+                    .map(|name| !matches!(name, "node_modules" | ".git" | "dist" | "target"))
+                    .unwrap_or(true)
+        })
+    {
+        let entry = entry.map_err(|error| {
+            format!(
+                "Failed to scan View package workspace source {}: {}",
+                src_root.display(),
+                error
+            )
+        })?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if !is_view_runtime_source_file(path) {
+            continue;
+        }
+        let rel_path = workspace_relative_view_path(root_base, path)?;
+        files.push(read_view_file(path, &rel_path)?);
+    }
+
+    Ok(())
+}
+
+fn workspace_relative_view_path(root_base: &Path, path: &Path) -> Result<String, String> {
+    let rel_path = path
+        .strip_prefix(root_base)
+        .map_err(|error| format!("Failed to resolve View workspace path: {}", error))?
+        .to_string_lossy()
+        .replace('\\', "/");
+    normalize_package_rel_path(&rel_path)
+}
+
 fn is_view_runtime_source_file(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
@@ -1171,12 +1975,13 @@ pub fn reload_view_sync(working_dir: &str, view_id: &str) -> Result<ViewPackageS
     Ok(detail.summary)
 }
 
-pub fn open_view_window(
+pub async fn open_view_window(
     app_handle: &AppHandle,
     working_dir: &str,
     view_id: &str,
 ) -> Result<ViewRunResult, String> {
     let detail = read_view_sync(working_dir, view_id)?;
+    ensure_view_open_requirements(working_dir, &detail.manifest).await?;
     let id = detail.summary.id.clone();
     let label = view_window_label(&id);
     let host_url = format!("{}?id={}", VIEW_HOST_ROUTE, id);
@@ -1194,6 +1999,7 @@ pub fn open_view_window(
         .title(format!("{} - Locus View", detail.summary.name))
         .inner_size(1180.0, 760.0)
         .min_inner_size(760.0, 480.0)
+        .decorations(false)
         .resizable(true)
         .visible(true)
         .disable_drag_drop_handler()
@@ -1216,8 +2022,220 @@ pub fn open_view_window(
     })
 }
 
+async fn ensure_view_open_requirements(
+    working_dir: &str,
+    manifest: &ViewManifest,
+) -> Result<(), String> {
+    if !view_manifest_requirements(manifest).unity_connection {
+        return Ok(());
+    }
+
+    let status = crate::unity_bridge::query_unity_connection_status(working_dir).await;
+    if status.connected {
+        return Ok(());
+    }
+
+    Err(format!(
+        "View '{}' requires a Unity Editor connection.",
+        manifest.name
+    ))
+}
+
 pub fn view_window_label(view_id: &str) -> String {
     format!("view-{}", view_id)
+}
+
+pub async fn request_view_automation(
+    app_handle: &AppHandle,
+    view_id: &str,
+    kind: &str,
+    payload: serde_json::Value,
+    timeout_ms: u64,
+) -> Result<serde_json::Value, String> {
+    let label = view_window_label(view_id);
+    let window = app_handle
+        .get_webview_window(&label)
+        .ok_or_else(|| format!("View '{}' is not open. Use view_run first.", view_id))?;
+    let store = app_handle.state::<std::sync::Arc<ViewAutomationStore>>();
+    let request_id = format!("view-auto-{}", uuid::Uuid::new_v4());
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    store.insert(request_id.clone(), tx)?;
+    let event = ViewAutomationRequestEvent {
+        request_id: request_id.clone(),
+        view_id: view_id.to_string(),
+        kind: kind.to_string(),
+        payload,
+    };
+
+    let timeout = Duration::from_millis(timeout_ms.clamp(250, 60_000));
+    let retry_interval = Duration::from_millis(200);
+    let started_at = Instant::now();
+    let mut rx = rx;
+    let reply = loop {
+        if let Err(error) = window.emit(VIEW_AUTOMATION_REQUEST_EVENT, event.clone()) {
+            store.cancel(&request_id);
+            return Err(format!("Failed to send View automation request: {}", error));
+        }
+
+        let elapsed = started_at.elapsed();
+        if elapsed >= timeout {
+            store.cancel(&request_id);
+            return Err(format!(
+                "View automation request timed out after {} ms",
+                timeout.as_millis(),
+            ));
+        }
+
+        let wait_for = std::cmp::min(timeout - elapsed, retry_interval);
+        match tokio::time::timeout(wait_for, &mut rx).await {
+            Ok(Ok(reply)) => break reply,
+            Ok(Err(_)) => {
+                store.cancel(&request_id);
+                return Err("View automation response channel closed".to_string());
+            }
+            Err(_) => continue,
+        }
+    };
+
+    if reply.ok {
+        Ok(reply.result.unwrap_or_else(|| serde_json::json!({})))
+    } else {
+        Err(reply
+            .error
+            .unwrap_or_else(|| "View automation request failed".to_string()))
+    }
+}
+
+pub fn complete_view_automation_request(
+    store: &ViewAutomationStore,
+    request_id: String,
+    ok: bool,
+    result: Option<serde_json::Value>,
+    error: Option<String>,
+) -> bool {
+    store.complete(&request_id, ViewAutomationReply { ok, result, error })
+}
+
+fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+    if bytes.len() < 24 || &bytes[..8] != PNG_SIGNATURE {
+        return None;
+    }
+    let width = u32::from_be_bytes(bytes[16..20].try_into().ok()?);
+    let height = u32::from_be_bytes(bytes[20..24].try_into().ok()?);
+    Some((width, height))
+}
+
+#[cfg(target_os = "windows")]
+pub async fn capture_view_window(
+    app_handle: &AppHandle,
+    view_id: &str,
+) -> Result<ViewCaptureResult, String> {
+    use base64::Engine as _;
+    use webview2_com::{
+        CallDevToolsProtocolMethodCompletedHandler, CoTaskMemPWSTR,
+        Microsoft::Web::WebView2::Win32::ICoreWebView2,
+    };
+
+    let label = view_window_label(view_id);
+    let window = app_handle
+        .get_webview_window(&label)
+        .ok_or_else(|| format!("View '{}' is not open. Use view_run first.", view_id))?;
+    let (tx, rx) = tokio::sync::oneshot::channel::<Result<String, String>>();
+    let tx = std::sync::Arc::new(std::sync::Mutex::new(Some(tx)));
+
+    window
+        .with_webview(move |webview| {
+            let controller = webview.controller();
+            let core: ICoreWebView2 = match unsafe { controller.CoreWebView2() } {
+                Ok(core) => core,
+                Err(error) => {
+                    if let Ok(mut guard) = tx.lock() {
+                        if let Some(tx) = guard.take() {
+                            let _ =
+                                tx.send(Err(format!("Failed to access WebView2 core: {}", error)));
+                        }
+                    }
+                    return;
+                }
+            };
+            let method = CoTaskMemPWSTR::from("Page.captureScreenshot");
+            let params = CoTaskMemPWSTR::from(
+                serde_json::json!({
+                    "format": "png",
+                    "fromSurface": true,
+                    "captureBeyondViewport": false
+                })
+                .to_string()
+                .as_str(),
+            );
+            let handler_tx = std::sync::Arc::clone(&tx);
+            let handler = CallDevToolsProtocolMethodCompletedHandler::create(Box::new(
+                move |error_code, result_json| {
+                    if let Ok(mut guard) = handler_tx.lock() {
+                        let Some(tx) = guard.take() else {
+                            return Ok(());
+                        };
+                        let result = match error_code {
+                            Ok(()) => Ok(result_json),
+                            Err(error) => {
+                                Err(format!("WebView2 captureScreenshot failed: {}", error))
+                            }
+                        };
+                        let _ = tx.send(result);
+                    }
+                    Ok(())
+                },
+            ));
+            if let Err(error) = unsafe {
+                core.CallDevToolsProtocolMethod(
+                    *method.as_ref().as_pcwstr(),
+                    *params.as_ref().as_pcwstr(),
+                    &handler,
+                )
+            } {
+                if let Ok(mut guard) = tx.lock() {
+                    if let Some(tx) = guard.take() {
+                        let _ =
+                            tx.send(Err(format!("Failed to request View screenshot: {}", error)));
+                    }
+                }
+            }
+        })
+        .map_err(|error| format!("Failed to access View webview: {}", error))?;
+
+    let result_json = tokio::time::timeout(Duration::from_secs(10), rx)
+        .await
+        .map_err(|_| "View screenshot timed out after 10000 ms".to_string())?
+        .map_err(|_| "View screenshot response channel closed".to_string())??;
+    let payload = serde_json::from_str::<serde_json::Value>(&result_json)
+        .map_err(|error| format!("Invalid screenshot response: {}", error))?;
+    let data = payload
+        .get("data")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| "Screenshot response did not include image data".to_string())?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .map_err(|error| format!("Failed to decode screenshot PNG: {}", error))?;
+    let dimensions = png_dimensions(&bytes);
+    Ok(ViewCaptureResult {
+        view_id: view_id.to_string(),
+        window_label: label,
+        mime_type: "image/png".to_string(),
+        format: "png".to_string(),
+        width: dimensions.map(|item| item.0),
+        height: dimensions.map(|item| item.1),
+        byte_size: bytes.len(),
+        bytes,
+    })
+}
+
+#[cfg(not(target_os = "windows"))]
+pub async fn capture_view_window(
+    _app_handle: &AppHandle,
+    _view_id: &str,
+) -> Result<ViewCaptureResult, String> {
+    Err("view_capture currently requires the Windows WebView2 runtime.".to_string())
 }
 
 pub fn emit_view_reload(app_handle: &AppHandle, summary: &ViewPackageSummary) {
@@ -1235,7 +2253,54 @@ fn view_file_watcher_keys() -> &'static Mutex<BTreeSet<String>> {
 }
 
 fn should_reload_for_view_event(event: &notify::Event) -> bool {
-    !matches!(event.kind, EventKind::Access(_) | EventKind::Other)
+    if matches!(event.kind, EventKind::Access(_) | EventKind::Other) {
+        return false;
+    }
+
+    if !event.paths.is_empty() && event.paths.iter().all(|path| is_view_internal_path(path)) {
+        return false;
+    }
+
+    true
+}
+
+fn is_view_internal_path(path: &Path) -> bool {
+    path.components().any(|component| {
+        component
+            .as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(".locus")
+    })
+}
+
+fn canonical_view_watch_path(path: &Path) -> PathBuf {
+    dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn view_file_watch_roots(root: &Path) -> Result<Vec<PathBuf>, String> {
+    let root = canonical_view_watch_path(root);
+    let mut roots = vec![root.clone()];
+    let workspace_src_root = root
+        .parent()
+        .ok_or_else(|| format!("Invalid View package root: {}", root.display()))?
+        .join(VIEW_WORKSPACE_SRC_DIR);
+    if workspace_src_root.is_dir() {
+        let workspace_src_root = canonical_view_watch_path(&workspace_src_root);
+        if !roots.iter().any(|path| path == &workspace_src_root) {
+            roots.push(workspace_src_root);
+        }
+    }
+    Ok(roots)
+}
+
+pub fn is_view_frontend_log_workspace_path(path: &str) -> bool {
+    let normalized = path.replace('\\', "/");
+    let trimmed = normalized.trim_matches('/');
+    let lower = trimmed.to_ascii_lowercase();
+    let view_root = VIEW_ROOT_RELATIVE.to_ascii_lowercase();
+    let log_rel_path = VIEW_FRONTEND_LOG_REL_PATH.to_ascii_lowercase();
+
+    lower.starts_with(&(view_root + "/")) && lower.ends_with(&format!("/{}", log_rel_path))
 }
 
 fn start_view_file_watcher(
@@ -1244,8 +2309,12 @@ fn start_view_file_watcher(
     view_id: &str,
 ) -> Result<(), String> {
     let root = resolve_view_package_root(working_dir, view_id)?;
-    let root = dunce::canonicalize(&root).unwrap_or(root);
-    let key = root.display().to_string().replace('\\', "/");
+    let roots = view_file_watch_roots(&root)?;
+    let key = roots
+        .iter()
+        .map(|root| root.display().to_string().replace('\\', "/"))
+        .collect::<Vec<_>>()
+        .join("|");
     {
         let mut keys = view_file_watcher_keys()
             .lock()
@@ -1273,9 +2342,11 @@ fn start_view_file_watcher(
         }
     };
 
-    if let Err(error) = watcher.watch(&root, RecursiveMode::Recursive) {
-        remove_view_file_watcher_key(&key);
-        return Err(format!("Failed to watch {}: {}", root.display(), error));
+    for root in &roots {
+        if let Err(error) = watcher.watch(root, RecursiveMode::Recursive) {
+            remove_view_file_watcher_key(&key);
+            return Err(format!("Failed to watch {}: {}", root.display(), error));
+        }
     }
 
     let key_for_thread = key.clone();
@@ -1370,13 +2441,7 @@ pub fn append_view_frontend_log_sync(
     working_dir: &str,
     request: ViewFrontendLogRequest,
 ) -> Result<(), String> {
-    let root = resolve_view_package_root(working_dir, &request.view_id)?;
-    if !root.is_dir() || !manifest_path(&root).is_file() {
-        return Err(format!("View package not found: {}", request.view_id));
-    }
-    load_manifest_from_root(&root)?;
-
-    let log_path = package_path(&root, VIEW_FRONTEND_LOG_REL_PATH)?;
+    let log_path = frontend_log_path_for_view(working_dir, &request.view_id)?;
     if let Some(parent) = log_path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|error| format!("Failed to create {}: {}", parent.display(), error))?;
@@ -1400,6 +2465,60 @@ pub fn append_view_frontend_log_sync(
         .map_err(|error| format!("Failed to write {}: {}", log_path.display(), error))
 }
 
+pub fn read_view_frontend_log_sync(
+    working_dir: &str,
+    request: ViewFrontendLogReadRequest,
+) -> Result<Vec<ViewFrontendLogEntry>, String> {
+    let log_path = frontend_log_path_for_view(working_dir, &request.view_id)?;
+    if !log_path.is_file() {
+        return Ok(Vec::new());
+    }
+
+    let raw = std::fs::read_to_string(&log_path)
+        .map_err(|error| format!("Failed to read {}: {}", log_path.display(), error))?;
+    let limit = request.limit.unwrap_or(20).clamp(1, 200);
+    let mut entries = Vec::new();
+    for line in raw.lines().rev() {
+        if entries.len() >= limit {
+            break;
+        }
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(entry) = serde_json::from_str::<ViewFrontendLogEntry>(line) {
+            entries.push(entry);
+        }
+    }
+    entries.reverse();
+    Ok(entries)
+}
+
+pub fn open_view_frontend_log_sync(working_dir: &str, view_id: &str) -> Result<(), String> {
+    let log_path = frontend_log_path_for_view(working_dir, view_id)?;
+    if let Some(parent) = log_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("Failed to create {}: {}", parent.display(), error))?;
+    }
+    if !log_path.exists() {
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .map_err(|error| format!("Failed to create {}: {}", log_path.display(), error))?;
+    }
+    crate::commands::open_file_native(&log_path)
+}
+
+fn frontend_log_path_for_view(working_dir: &str, view_id: &str) -> Result<PathBuf, String> {
+    let root = resolve_view_package_root(working_dir, view_id)?;
+    if !root.is_dir() || !manifest_path(&root).is_file() {
+        return Err(format!("View package not found: {}", view_id));
+    }
+    load_manifest_from_root(&root)?;
+    package_path(&root, VIEW_FRONTEND_LOG_REL_PATH)
+}
+
 pub async fn view_binding_read(
     working_dir: &str,
     request: ViewBindingReadRequest,
@@ -1417,6 +2536,40 @@ pub async fn view_binding_read(
     let raw = crate::unity_bridge::view_binding_read(working_dir, &payload).await?;
     serde_json::from_str(&raw)
         .map_err(|error| format!("Invalid view_binding_read response: {}", error))
+}
+
+pub async fn view_binding_discover(
+    working_dir: &str,
+    request: ViewBindingDiscoverRequest,
+) -> Result<ViewBindingDiscoverResult, String> {
+    let ViewBindingDiscoverRequest {
+        view_id,
+        binding_id,
+        target,
+        query,
+        field_name,
+        field_type,
+        max_depth,
+        max_results,
+    } = request;
+    let target = if let Some(target) = target {
+        validate_view_binding_object_target(&target)?;
+        target
+    } else {
+        resolve_view_binding(working_dir, &view_id, binding_id.as_deref(), None)?.target
+    };
+    let payload = serde_json::json!({
+        "bindingId": binding_id,
+        "target": target,
+        "query": query.unwrap_or_default(),
+        "fieldName": field_name.unwrap_or_default(),
+        "fieldType": field_type.unwrap_or_default(),
+        "maxDepth": max_depth.unwrap_or_default(),
+        "maxResults": max_results.unwrap_or_default(),
+    });
+    let raw = crate::unity_bridge::view_binding_discover(working_dir, &payload).await?;
+    serde_json::from_str(&raw)
+        .map_err(|error| format!("Invalid view_binding_discover response: {}", error))
 }
 
 pub async fn view_binding_write(
@@ -1572,9 +2725,7 @@ fn ensure_view_binding_write_allowed(mode: Option<&str>) -> Result<(), String> {
 }
 
 fn validate_view_binding_target(target: &ViewBindingTarget) -> Result<(), String> {
-    if target.kind.trim().is_empty() {
-        return Err("View binding target kind cannot be empty.".to_string());
-    }
+    validate_view_binding_object_target(target)?;
     if target
         .property_path
         .as_deref()
@@ -1583,6 +2734,16 @@ fn validate_view_binding_target(target: &ViewBindingTarget) -> Result<(), String
         .is_none()
     {
         return Err("View binding target propertyPath is required.".to_string());
+    }
+    Ok(())
+}
+
+fn validate_view_binding_object_target(target: &ViewBindingTarget) -> Result<(), String> {
+    if target.kind.trim().is_empty() {
+        return Err("View binding target kind cannot be empty.".to_string());
+    }
+    if matches!(target.component_index, Some(index) if index < 0) {
+        return Err("View binding target componentIndex cannot be negative.".to_string());
     }
     for path in [
         target.path.as_deref(),
@@ -1756,8 +2917,7 @@ fn write_package_file(root: &Path, rel_path: &str, content: &str) -> Result<(), 
     std::fs::write(&path, content).map_err(|e| format!("Failed to write {}: {}", path.display(), e))
 }
 
-fn read_package_file(root: &Path, rel_path: &str) -> Result<ViewPackageFile, String> {
-    let path = package_path(root, rel_path)?;
+fn read_view_file(path: &Path, rel_path: &str) -> Result<ViewPackageFile, String> {
     let metadata = path
         .metadata()
         .map_err(|e| format!("Failed to stat {}: {}", path.display(), e))?;
@@ -1781,7 +2941,7 @@ fn read_package_file(root: &Path, rel_path: &str) -> Result<ViewPackageFile, Str
 }
 
 fn package_file_kind(rel_path: &str) -> String {
-    if rel_path == "view.json" {
+    if rel_path == "view.json" || rel_path.ends_with("/view.json") {
         "manifest"
     } else if rel_path.ends_with(".vue") || rel_path.ends_with(".ts") {
         "source"
@@ -1811,626 +2971,36 @@ fn title_from_id(id: &str) -> String {
         .join(" ")
 }
 
-fn default_icon_for_template(template: &str) -> &'static str {
-    match template {
-        "inspector-form" => "InspectionPanel",
-        "node-graph" => "Network",
-        "link-board" => "Link2",
-        _ => "View",
-    }
-}
-
-fn template_manifest(id: &str, name: &str, template: &str, icon: Option<&str>) -> ViewManifest {
-    let scripts = if template == "inspector-form" {
-        vec![ViewScriptManifest {
-            name: "InspectorViewApi".to_string(),
-            path: "unity/ViewApi.cs".to_string(),
-            entry_type: "InspectorViewApi".to_string(),
-        }]
-    } else {
-        Vec::new()
-    };
-
-    ViewManifest {
-        schema: VIEW_SCHEMA.to_string(),
-        id: id.to_string(),
-        name: name.to_string(),
-        version: "0.1.0".to_string(),
-        template: template.to_string(),
-        icon: Some(
-            icon.unwrap_or_else(|| default_icon_for_template(template))
-                .to_string(),
-        ),
-        entry: "src/main.ts".to_string(),
-        style: "src/style.css".to_string(),
-        bindings: "bindings.json".to_string(),
-        scripts,
-        capabilities: ViewCapabilities {
-            unity: template == "inspector-form",
-            bindings: template == "inspector-form",
-            write_back: false,
-        },
-    }
-}
-
-fn template_files(id: &str, name: &str, template: &str) -> Vec<(&'static str, String)> {
-    let created_at = now_millis();
-    let readme = format!(
-        "# {name}\n\nView Package `{id}` generated from `{template}`.\n\nEdit files under this directory and reload the View from Locus.\n"
-    );
-    let bindings = format!(
-        "{{\n  \"schema\": \"{}\",\n  \"bindings\": []\n}}\n",
-        VIEW_BINDINGS_SCHEMA
-    );
-
-    let mut files = vec![
-        ("README.md", readme),
-        ("src/main.ts", main_ts()),
-        ("src/store.ts", store_ts()),
-        ("bindings.json", bindings),
-    ];
-
-    match template {
-        "inspector-form" => {
-            files.push(("src/App.vue", inspector_app_vue(name)));
-            files.push(("src/style.css", inspector_style_css()));
-            files.push(("unity/ViewApi.cs", inspector_view_api_cs()));
-        }
-        "node-graph" => {
-            files.push(("src/App.vue", node_graph_app_vue(name)));
-            files.push(("src/style.css", node_graph_style_css()));
-        }
-        "link-board" => {
-            files.push(("src/App.vue", link_board_app_vue(name)));
-            files.push(("src/style.css", link_board_style_css()));
-        }
-        _ => {
-            files.push(("src/App.vue", blank_app_vue(name)));
-            files.push(("src/style.css", blank_style_css()));
-        }
-    }
-
-    files.push((
-        ".locus-view",
-        format!("createdAt={created_at}\ntemplate={template}\n"),
-    ));
-    files
-}
-
-fn main_ts() -> String {
-    r##"import { createApp } from "vue";
-import App from "./App.vue";
-import "./style.css";
-
-createApp(App).mount("#app");
-"##
-    .to_string()
-}
-
-fn store_ts() -> String {
-    r#"import { reactive } from "vue";
-
-export const viewState = reactive({
-  dirty: false,
-  status: "idle",
-});
-"#
-    .to_string()
-}
-
-fn blank_app_vue(name: &str) -> String {
-    format!(
-        r#"<template>
-  <main class="view-shell">
-    <header class="view-header">
-      <span class="view-kicker">View Package</span>
-      <h1>{name}</h1>
-    </header>
-
-    <section class="view-panel">
-      <div class="view-row">
-        <label>Context</label>
-        <span>Waiting for Unity data</span>
-      </div>
-      <div class="view-row">
-        <label>Status</label>
-        <span>Ready</span>
-      </div>
-    </section>
-  </main>
-</template>
-"#
-    )
-}
-
-fn blank_style_css() -> String {
-    r#":root {
-  color-scheme: light dark;
-  font-family: var(--font-ui);
-}
-
-body {
-  margin: 0;
-  background: var(--bg-color);
-  color: var(--text-color);
-  font-family: var(--font-ui);
-}
-
-.view-shell {
-  min-height: 100vh;
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
-  padding: 20px;
-  box-sizing: border-box;
-}
-
-.view-header {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-
-.view-kicker {
-  color: var(--text-secondary);
-  font-size: 12px;
-  font-weight: 600;
-}
-
-h1 {
-  margin: 0;
-  font-size: 20px;
-  line-height: 1.25;
-}
-
-.view-panel {
-  border: 1px solid var(--border-color);
-  border-radius: 8px;
-  background: var(--panel-bg);
-  overflow: hidden;
-}
-
-.view-row {
-  display: grid;
-  grid-template-columns: 140px minmax(0, 1fr);
-  gap: 12px;
-  padding: 10px 12px;
-  font-size: 13px;
-}
-
-.view-row + .view-row {
-  border-top: 1px solid var(--border-color);
-}
-
-label {
-  color: var(--text-secondary);
-}
-"#
-    .to_string()
-}
-
-fn inspector_app_vue(name: &str) -> String {
-    format!(
-        r##"<template>
-  <main class="view-shell inspector-view">
-    <header class="view-toolbar">
-      <div>
-        <span class="view-kicker">Inspector Form</span>
-        <h1>{name}</h1>
-      </div>
-      <button type="button">Apply</button>
-    </header>
-
-    <section class="inspector-grid">
-      <label>
-        <span>Target</span>
-        <input value="Assets/Materials/Example.mat" />
-      </label>
-      <label>
-        <span>Base Color</span>
-        <input value="#d9dde5" />
-      </label>
-      <label>
-        <span>Metallic</span>
-        <input value="0.00" />
-      </label>
-      <label>
-        <span>Smoothness</span>
-        <input value="0.50" />
-      </label>
-    </section>
-  </main>
-</template>
-"##
-    )
-}
-
-fn inspector_style_css() -> String {
-    r#":root {
-  color-scheme: light dark;
-  font-family: var(--font-ui);
-}
-
-body {
-  margin: 0;
-  background: var(--bg-color);
-  color: var(--text-color);
-  font-family: var(--font-ui);
-}
-
-.view-shell {
-  min-height: 100vh;
-  padding: 18px;
-  box-sizing: border-box;
-}
-
-.view-toolbar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  padding-bottom: 12px;
-  border-bottom: 1px solid var(--border-color);
-}
-
-.view-kicker {
-  color: var(--text-secondary);
-  font-size: 12px;
-  font-weight: 600;
-}
-
-h1 {
-  margin: 2px 0 0;
-  font-size: 18px;
-  line-height: 1.25;
-}
-
-button {
-  min-height: 30px;
-  padding: 0 12px;
-  border: 1px solid var(--border-color);
-  border-radius: 6px;
-  background: color-mix(in srgb, var(--panel-bg) 72%, var(--sidebar-bg) 28%);
-  color: var(--text-color);
-  font: inherit;
-}
-
-.inspector-grid {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr);
-  gap: 10px;
-  max-width: 620px;
-  padding-top: 16px;
-}
-
-label {
-  display: grid;
-  grid-template-columns: 150px minmax(0, 1fr);
-  align-items: center;
-  gap: 12px;
-  font-size: 13px;
-}
-
-label span {
-  color: var(--text-secondary);
-}
-
-input {
-  min-height: 30px;
-  padding: 0 9px;
-  border: 1px solid var(--border-color);
-  border-radius: 6px;
-  background: var(--input-bg);
-  color: var(--text-color);
-  font: inherit;
-}
-"#
-    .to_string()
-}
-
-fn inspector_view_api_cs() -> String {
-    r#"using System;
-using UnityEditor;
-using UnityEngine;
-
-public static class InspectorViewApi
-{
-    public static object Read(object args)
-    {
-        return new
-        {
-            ok = true,
-            message = "View Script runtime is ready for this package."
-        };
-    }
-}
-"#
-    .to_string()
-}
-
-fn node_graph_app_vue(name: &str) -> String {
-    r##"<script setup lang="ts">
-import { GraphView, GraphViewController, defineGraphView } from "@locus/view-runtime";
-
-class TemplateGraphView extends GraphViewController {
-  loadGraph() {
-    return {
-      layout: { auto: "missing", direction: "right" },
-      nodes: [
-        {
-          id: "selection",
-          type: "source",
-          title: "Selection",
-          subtitle: "Unity data",
-          outputs: [
-            { id: "object", label: "Object", type: "Unity.Object" },
-            { id: "path", label: "Path", type: "string" }
-          ],
-          parameters: [
-            { id: "mode", label: "Mode", type: "select", value: "active", options: [
-              { label: "Active", value: "active" },
-              { label: "Pinned", value: "pinned" }
-            ] }
-          ]
-        },
-        {
-          id: "process",
-          type: "processor",
-          title: "Process",
-          subtitle: "Transform",
-          inputs: [
-            { id: "input", label: "Input", type: "Unity.Object" }
-          ],
-          outputs: [
-            { id: "result", label: "Result", type: "object" }
-          ],
-          parameters: [
-            { id: "enabled", label: "Enabled", type: "boolean", value: true },
-            { id: "weight", label: "Weight", type: "number", value: 1, min: 0, max: 4, step: 0.1 }
-          ]
-        },
-        {
-          id: "apply",
-          type: "output",
-          title: "Apply",
-          subtitle: "Write back",
-          inputs: [
-            { id: "value", label: "Value", type: "object" }
-          ],
-          parameters: [
-            { id: "target", label: "Target", type: "string", value: "Selection" }
-          ]
-        }
-      ],
-      connections: [
-        {
-          id: "selection-process",
-          from: { nodeId: "selection", portId: "object" },
-          to: { nodeId: "process", portId: "input" }
-        },
-        {
-          id: "process-apply",
-          from: { nodeId: "process", portId: "result" },
-          to: { nodeId: "apply", portId: "value" }
-        }
-      ]
-    };
-  }
-
-  validateConnection(connection, graph) {
-    const targetIsUsed = graph.connections.some((item) => {
-      return item.to.nodeId === connection.to.nodeId
-        && item.to.portId === connection.to.portId
-        && item.id !== connection.id;
-    });
-    return targetIsUsed ? "Input port already has a connection." : true;
-  }
-
-  saveGraph(graph) {
-    console.info("Graph saved", graph);
-  }
-
-  applyGraph(graph) {
-    console.info("Graph applied", graph);
-  }
-}
-
-const graphView = defineGraphView(new TemplateGraphView());
-</script>
-
-<template>
-  <GraphView :controller="graphView" title="__VIEW_NAME__" />
-</template>
-"##
-    .replace("__VIEW_NAME__", name)
-}
-
-fn node_graph_style_css() -> String {
-    r#":root {
-  color-scheme: light dark;
-  font-family: var(--font-ui);
-}
-
-body {
-  margin: 0;
-  background: var(--bg-color);
-  color: var(--text-color);
-  font-family: var(--font-ui);
-}
-"#
-    .to_string()
-}
-
-fn link_board_app_vue(name: &str) -> String {
-    format!(
-        r##"<template>
-  <main class="view-shell link-board-view" data-locus-template="link-board">
-    <header class="view-toolbar">
-      <div>
-        <span class="view-kicker">Link Board</span>
-        <h1>{name}</h1>
-      </div>
-      <button type="button" data-link-save>Save Links</button>
-    </header>
-
-    <section class="link-board" data-link-board>
-      <div class="link-column">
-        <div class="link-column-title">Sources</div>
-        <button type="button" class="link-item" data-link-source="albedo">Albedo Map</button>
-        <button type="button" class="link-item" data-link-source="normal">Normal Map</button>
-        <button type="button" class="link-item" data-link-source="mask">Mask Texture</button>
-      </div>
-
-      <svg class="link-lines" data-link-lines aria-hidden="true"></svg>
-
-      <div class="link-column">
-        <div class="link-column-title">Targets</div>
-        <button type="button" class="link-item" data-link-target="_BaseMap">_BaseMap</button>
-        <button type="button" class="link-item" data-link-target="_BumpMap">_BumpMap</button>
-        <button type="button" class="link-item" data-link-target="_MaskMap">_MaskMap</button>
-      </div>
-    </section>
-
-    <section class="link-data-panel">
-      <div class="view-section-title">Link Data</div>
-      <pre data-link-output></pre>
-    </section>
-  </main>
-</template>
-"##
-    )
-}
-
-fn link_board_style_css() -> String {
-    r#":root {
-  color-scheme: light dark;
-  font-family: var(--font-ui);
-}
-
-body {
-  margin: 0;
-  background: var(--bg-color);
-  color: var(--text-color);
-  font-family: var(--font-ui);
-}
-
-.view-shell {
-  min-height: 100vh;
-  padding: 18px;
-  box-sizing: border-box;
-}
-
-.view-toolbar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  padding-bottom: 12px;
-  border-bottom: 1px solid var(--border-color);
-}
-
-.view-kicker {
-  color: var(--text-secondary);
-  font-size: 12px;
-  font-weight: 600;
-}
-
-h1 {
-  margin: 2px 0 0;
-  font-size: 18px;
-  line-height: 1.25;
-}
-
-.link-board {
-  position: relative;
-  min-height: 330px;
-  display: grid;
-  grid-template-columns: minmax(180px, 240px) minmax(120px, 1fr) minmax(180px, 240px);
-  gap: 18px;
-  margin-top: 14px;
-  padding: 16px;
-  border: 1px solid var(--border-color);
-  border-radius: 8px;
-  background: var(--panel-bg);
-  overflow: hidden;
-}
-
-.link-column {
-  position: relative;
-  z-index: 1;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.link-column-title {
-  color: var(--text-secondary);
-  font-size: 12px;
-  font-weight: 600;
-}
-
-.link-item {
-  min-height: 36px;
-  justify-content: flex-start;
-  text-align: left;
-}
-
-.link-item.active,
-.link-item.linked {
-  border-color: var(--accent-color);
-  background: var(--accent-soft);
-}
-
-.link-lines {
-  position: absolute;
-  inset: 0;
-  width: 100%;
-  height: 100%;
-  pointer-events: none;
-}
-
-.link-data-panel {
-  margin-top: 12px;
-  border: 1px solid var(--border-color);
-  border-radius: 8px;
-  background: var(--panel-bg);
-  overflow: hidden;
-}
-
-.view-section-title {
-  padding: 8px 10px;
-  border-bottom: 1px solid var(--border-color);
-  color: var(--text-secondary);
-  font-size: 12px;
-  font-weight: 600;
-}
-
-pre {
-  margin: 0;
-  min-height: 88px;
-  padding: 10px;
-  overflow: auto;
-  color: var(--text-color);
-  font-family: var(--font-mono-identifier);
-  font-size: 12px;
-}
-"#
-    .to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         append_view_frontend_log_sync, create_view_folder_sync, create_view_sync,
-        delete_view_entry_sync, ensure_view_binding_write_allowed, is_valid_view_id,
-        list_view_tree_sync, list_views_sync, move_view_entry_sync, normalize_package_rel_path,
-        parse_view_create_request, read_view_sync, resolve_view_binding_target,
-        resolve_view_script_sync, supported_view_templates, validate_view_manifest,
-        view_package_root, view_script_bridge_payload, view_script_cached_invoke_payload,
-        ViewBindingTarget, ViewFrontendLogRequest, ViewManifest, VIEW_BINDINGS_SCHEMA, VIEW_SCHEMA,
+        default_view_package_name, delete_view_entry_sync, ensure_view_binding_write_allowed,
+        export_view_package_sync, import_view_package_sync, is_valid_view_id,
+        is_view_frontend_log_workspace_path, list_view_tree_sync, list_views_sync,
+        move_view_entry_sync, normalize_package_rel_path, parse_view_create_request,
+        read_view_frontend_log_sync, read_view_sync, resolve_view_binding_target,
+        resolve_view_script_sync, should_reload_for_view_event, supported_view_templates,
+        validate_view_binding_object_target, validate_view_binding_target, validate_view_manifest,
+        view_file_watch_roots, view_manifest_requirements, view_package_root,
+        view_script_bridge_payload, view_script_cached_invoke_payload, ViewBindingDiscoverResult,
+        ViewBindingTarget, ViewBindingWriteResult, ViewExportPackageRequest,
+        ViewFrontendLogReadRequest, ViewFrontendLogRequest, ViewImportPackageRequest, ViewManifest,
+        VIEW_BINDINGS_SCHEMA, VIEW_ROOT_RELATIVE, VIEW_SCHEMA,
+    };
+    use notify::{
+        event::{DataChange, ModifyKind},
+        Event, EventKind,
     };
     use serde_json::json;
+    use std::path::PathBuf;
     use tempfile::tempdir;
+
+    fn default_test_view_package_root(working_dir: &str) -> PathBuf {
+        PathBuf::from(working_dir)
+            .join(VIEW_ROOT_RELATIVE)
+            .join(default_view_package_name(working_dir).expect("default package name"))
+    }
 
     #[test]
     fn view_id_validation_uses_kebab_case() {
@@ -2457,6 +3027,38 @@ mod tests {
     }
 
     #[test]
+    fn view_frontend_log_workspace_path_matches_log_only() {
+        assert!(is_view_frontend_log_workspace_path(
+            "Locus/View/ProjectName/material-inspector/.locus/logs/frontend.log"
+        ));
+        assert!(is_view_frontend_log_workspace_path(
+            "Locus\\View\\Tools\\material-inspector\\.locus\\logs\\frontend.log"
+        ));
+        assert!(!is_view_frontend_log_workspace_path(
+            "Locus/View/ProjectName/material-inspector/.locus/data/state.json"
+        ));
+        assert!(!is_view_frontend_log_workspace_path(
+            "Locus/View/ProjectName/material-inspector/src/App.vue"
+        ));
+        assert!(!is_view_frontend_log_workspace_path(
+            "Locus/knowledge/memory/.locus/notes.md"
+        ));
+    }
+
+    #[test]
+    fn view_watcher_ignores_internal_locus_files() {
+        let event = Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Content))).add_path(
+            PathBuf::from("Locus/View/ProjectName/material-inspector/.locus/logs/frontend.log"),
+        );
+        assert!(!should_reload_for_view_event(&event));
+
+        let event = Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Content))).add_path(
+            PathBuf::from("Locus/View/ProjectName/material-inspector/src/App.vue"),
+        );
+        assert!(should_reload_for_view_event(&event));
+    }
+
+    #[test]
     fn view_create_request_parses_temporary_flag() {
         let (request, temporary) = parse_view_create_request(json!({
             "id": "scratch-panel",
@@ -2470,6 +3072,15 @@ mod tests {
         assert_eq!(request.id, "scratch-panel");
         assert_eq!(request.name.as_deref(), Some("Scratch Panel"));
         assert_eq!(request.template.as_deref(), Some("blank"));
+
+        let (request, temporary) = parse_view_create_request(json!({
+            "id": "package-panel",
+            "packageName": "Gameplay",
+            "template": "blank"
+        }))
+        .expect("parse package view_create request");
+        assert!(!temporary);
+        assert_eq!(request.package_name.as_deref(), Some("Gameplay"));
     }
 
     #[test]
@@ -2486,6 +3097,7 @@ mod tests {
             bindings: "bindings.json".to_string(),
             scripts: Vec::new(),
             capabilities: Default::default(),
+            requirements: None,
         };
         validate_view_manifest(&manifest).unwrap();
 
@@ -2501,6 +3113,7 @@ mod tests {
             &working_dir,
             super::ViewCreateRequest {
                 id: "material-inspector".to_string(),
+                package_name: None,
                 name: Some("Material Inspector".to_string()),
                 template: Some("blank".to_string()),
                 icon: None,
@@ -2510,13 +3123,165 @@ mod tests {
 
         assert_eq!(created.manifest.id, "material-inspector");
         assert_eq!(created.manifest.icon.as_deref(), Some("View"));
-        assert!(temp
-            .path()
-            .join("Locus/views/material-inspector/view.json")
-            .is_file());
+        let package_root = default_test_view_package_root(&working_dir);
+        assert!(package_root.join("material-inspector/view.json").is_file());
 
         let read = read_view_sync(&working_dir, "material-inspector").expect("read view");
-        assert!(read.files.iter().any(|file| file.rel_path == "src/App.vue"));
+        assert!(read
+            .files
+            .iter()
+            .any(|file| file.rel_path.ends_with("/material-inspector/src/App.vue")));
+    }
+
+    #[test]
+    fn create_view_writes_package_workspace_library_and_hides_workspace_src_from_tree() {
+        let temp = tempdir().unwrap();
+        let working_dir = temp.path().to_string_lossy().to_string();
+        create_view_sync(
+            &working_dir,
+            super::ViewCreateRequest {
+                id: "material-inspector".to_string(),
+                package_name: None,
+                name: Some("Material Inspector".to_string()),
+                template: Some("blank".to_string()),
+                icon: None,
+            },
+        )
+        .expect("create view");
+
+        let package_root = default_test_view_package_root(&working_dir);
+        assert!(package_root.join("package.json").is_file());
+        assert!(package_root.join("tsconfig.json").is_file());
+        assert!(package_root.join("src/index.ts").is_file());
+        assert!(package_root.join("src/propertyDraw.ts").is_file());
+
+        let read = read_view_sync(&working_dir, "material-inspector").expect("read view");
+        assert!(read
+            .files
+            .iter()
+            .any(|file| file.rel_path.ends_with("/src/index.ts")));
+        assert!(read
+            .files
+            .iter()
+            .any(|file| file.rel_path.ends_with("/src/propertyDraw.ts")));
+
+        let tree = list_view_tree_sync(&working_dir).expect("list view tree");
+        assert!(!tree
+            .folders
+            .iter()
+            .any(|folder| folder.rel_path.ends_with("/src")));
+    }
+
+    #[test]
+    fn view_watcher_roots_include_package_workspace_src() {
+        let temp = tempdir().unwrap();
+        let working_dir = temp.path().to_string_lossy().to_string();
+        create_view_sync(
+            &working_dir,
+            super::ViewCreateRequest {
+                id: "material-inspector".to_string(),
+                package_name: None,
+                name: Some("Material Inspector".to_string()),
+                template: Some("blank".to_string()),
+                icon: None,
+            },
+        )
+        .expect("create view");
+
+        let package_root = default_test_view_package_root(&working_dir);
+        let roots =
+            view_file_watch_roots(&package_root.join("material-inspector")).expect("watch roots");
+        let root_paths = roots
+            .iter()
+            .map(|path| path.display().to_string().replace('\\', "/"))
+            .collect::<Vec<_>>();
+
+        assert!(root_paths
+            .iter()
+            .any(|path| path.ends_with("/material-inspector")));
+        assert!(root_paths.iter().any(|path| path.ends_with("/src")));
+    }
+
+    #[test]
+    fn create_view_can_place_multiple_views_in_one_package_workspace() {
+        let temp = tempdir().unwrap();
+        let working_dir = temp.path().to_string_lossy().to_string();
+        create_view_sync(
+            &working_dir,
+            super::ViewCreateRequest {
+                id: "material-inspector".to_string(),
+                package_name: Some("Gameplay".to_string()),
+                name: Some("Material Inspector".to_string()),
+                template: Some("blank".to_string()),
+                icon: None,
+            },
+        )
+        .expect("create first view");
+        create_view_sync(
+            &working_dir,
+            super::ViewCreateRequest {
+                id: "stat-table".to_string(),
+                package_name: Some("Gameplay".to_string()),
+                name: Some("Stat Table".to_string()),
+                template: Some("serialized-table".to_string()),
+                icon: None,
+            },
+        )
+        .expect("create second view");
+
+        let package_root = temp.path().join("Locus/View/Gameplay");
+        assert!(package_root.join("src/index.ts").is_file());
+        assert!(package_root.join("material-inspector/view.json").is_file());
+        assert!(package_root.join("stat-table/view.json").is_file());
+
+        let listed = list_views_sync(&working_dir).expect("list views");
+        assert!(listed
+            .iter()
+            .any(|view| view.package_rel_path == "Gameplay/material-inspector"));
+        assert!(listed
+            .iter()
+            .any(|view| view.package_rel_path == "Gameplay/stat-table"));
+
+        let read = read_view_sync(&working_dir, "stat-table").expect("read second view");
+        assert!(read
+            .files
+            .iter()
+            .any(|file| file.rel_path == "Gameplay/src/propertyDraw.ts"));
+        assert!(read
+            .files
+            .iter()
+            .any(|file| file.rel_path == "Gameplay/stat-table/src/App.vue"));
+    }
+
+    #[test]
+    fn create_view_rejects_duplicate_id_across_package_workspaces() {
+        let temp = tempdir().unwrap();
+        let working_dir = temp.path().to_string_lossy().to_string();
+        create_view_sync(
+            &working_dir,
+            super::ViewCreateRequest {
+                id: "material-inspector".to_string(),
+                package_name: Some("Gameplay".to_string()),
+                name: Some("Material Inspector".to_string()),
+                template: Some("blank".to_string()),
+                icon: None,
+            },
+        )
+        .expect("create first view");
+
+        let error = create_view_sync(
+            &working_dir,
+            super::ViewCreateRequest {
+                id: "material-inspector".to_string(),
+                package_name: Some("Tools".to_string()),
+                name: Some("Material Inspector".to_string()),
+                template: Some("blank".to_string()),
+                icon: None,
+            },
+        )
+        .expect_err("duplicate view id should fail");
+
+        assert!(error.contains("View package id already exists"));
     }
 
     #[test]
@@ -2527,6 +3292,7 @@ mod tests {
             &working_dir,
             super::ViewCreateRequest {
                 id: "material-inspector".to_string(),
+                package_name: None,
                 name: Some("Material Inspector".to_string()),
                 template: Some("blank".to_string()),
                 icon: None,
@@ -2534,7 +3300,8 @@ mod tests {
         )
         .expect("create view");
 
-        let root = temp.path().join("Locus/views/material-inspector");
+        let package_root = default_test_view_package_root(&working_dir);
+        let root = package_root.join("material-inspector");
         std::fs::create_dir_all(root.join("src/components")).expect("create components dir");
         std::fs::write(
             root.join("src/components/FieldRow.vue"),
@@ -2553,9 +3320,125 @@ mod tests {
             .map(|file| file.rel_path.as_str())
             .collect::<Vec<_>>();
 
-        assert!(paths.contains(&"src/components/FieldRow.vue"));
-        assert!(paths.contains(&"src/runtime.ts"));
-        assert!(paths.contains(&"src/theme.css"));
+        assert!(paths
+            .iter()
+            .any(|path| path.ends_with("/material-inspector/src/components/FieldRow.vue")));
+        assert!(paths
+            .iter()
+            .any(|path| path.ends_with("/material-inspector/src/runtime.ts")));
+        assert!(paths
+            .iter()
+            .any(|path| path.ends_with("/material-inspector/src/theme.css")));
+    }
+
+    #[test]
+    fn export_and_import_view_package_zip_round_trip() {
+        let source = tempdir().unwrap();
+        let source_working_dir = source.path().to_string_lossy().to_string();
+        create_view_sync(
+            &source_working_dir,
+            super::ViewCreateRequest {
+                id: "material-inspector".to_string(),
+                package_name: None,
+                name: Some("Material Inspector".to_string()),
+                template: Some("blank".to_string()),
+                icon: None,
+            },
+        )
+        .expect("create view");
+
+        let source_package_root = default_test_view_package_root(&source_working_dir);
+        std::fs::write(
+            source_package_root.join("material-inspector/src/custom.ts"),
+            "export const value = 42;\n",
+        )
+        .expect("write custom source");
+        append_view_frontend_log_sync(
+            &source_working_dir,
+            ViewFrontendLogRequest {
+                view_id: "material-inspector".to_string(),
+                level: "warn".to_string(),
+                message: "runtime log".to_string(),
+            },
+        )
+        .expect("write frontend log");
+
+        let archive_path = source.path().join("material-inspector.zip");
+        let saved_path = export_view_package_sync(
+            &source_working_dir,
+            ViewExportPackageRequest {
+                view_id: "material-inspector".to_string(),
+                file_path: archive_path.to_string_lossy().to_string(),
+            },
+        )
+        .expect("export view package");
+        assert!(PathBuf::from(saved_path).is_file());
+
+        let target = tempdir().unwrap();
+        let target_working_dir = target.path().to_string_lossy().to_string();
+        let imported = import_view_package_sync(
+            &target_working_dir,
+            ViewImportPackageRequest {
+                file_path: archive_path.to_string_lossy().to_string(),
+                target_dir_rel_path: None,
+            },
+        )
+        .expect("import view package");
+
+        assert_eq!(imported.summary.id, "material-inspector");
+        assert_eq!(imported.summary.name, "Material Inspector");
+        assert!(imported
+            .snapshot
+            .views
+            .iter()
+            .any(|view| view.id == "material-inspector"));
+
+        let imported_root =
+            default_test_view_package_root(&target_working_dir).join("material-inspector");
+        assert!(imported_root.join("view.json").is_file());
+        assert!(imported_root.join("src/custom.ts").is_file());
+        assert!(!imported_root.join(".locus/logs/frontend.log").exists());
+        assert!(default_test_view_package_root(&target_working_dir)
+            .join("package.json")
+            .is_file());
+    }
+
+    #[test]
+    fn import_view_package_rejects_duplicate_view_id() {
+        let temp = tempdir().unwrap();
+        let working_dir = temp.path().to_string_lossy().to_string();
+        create_view_sync(
+            &working_dir,
+            super::ViewCreateRequest {
+                id: "material-inspector".to_string(),
+                package_name: None,
+                name: Some("Material Inspector".to_string()),
+                template: Some("blank".to_string()),
+                icon: None,
+            },
+        )
+        .expect("create view");
+
+        let archive_path = temp.path().join("material-inspector.zip");
+        export_view_package_sync(
+            &working_dir,
+            ViewExportPackageRequest {
+                view_id: "material-inspector".to_string(),
+                file_path: archive_path.to_string_lossy().to_string(),
+            },
+        )
+        .expect("export view package");
+
+        let error = import_view_package_sync(
+            &working_dir,
+            ViewImportPackageRequest {
+                file_path: archive_path.to_string_lossy().to_string(),
+                target_dir_rel_path: None,
+            },
+        )
+        .expect_err("duplicate view id should fail");
+
+        assert!(error.contains("View package id already exists"));
     }
 
     #[test]
@@ -2566,6 +3449,7 @@ mod tests {
             &working_dir,
             super::ViewCreateRequest {
                 id: "material-inspector".to_string(),
+                package_name: None,
                 name: Some("Material Inspector".to_string()),
                 template: Some("blank".to_string()),
                 icon: None,
@@ -2584,19 +3468,31 @@ mod tests {
         .expect("append log");
 
         let log = std::fs::read_to_string(
-            temp.path()
-                .join("Locus/views/material-inspector/.locus/logs/frontend.log"),
+            default_test_view_package_root(&working_dir)
+                .join("material-inspector/.locus/logs/frontend.log"),
         )
         .expect("read log");
         assert!(log.contains("\"level\":\"warn\""));
         assert!(log.contains("\"message\":\"shader property failed\""));
+
+        let entries = read_view_frontend_log_sync(
+            &working_dir,
+            ViewFrontendLogReadRequest {
+                view_id: "material-inspector".to_string(),
+                limit: Some(1),
+            },
+        )
+        .expect("read frontend log");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].level, "warn");
+        assert_eq!(entries[0].message, "shader property failed");
     }
 
     #[test]
     fn list_and_resolve_nested_view_packages() {
         let temp = tempdir().unwrap();
         let working_dir = temp.path().to_string_lossy().to_string();
-        let root = temp.path().join("Locus/views/tools/material-inspector");
+        let root = temp.path().join("Locus/View/Tools/material-inspector");
         std::fs::create_dir_all(root.join("src")).expect("create nested view");
 
         let manifest = ViewManifest {
@@ -2611,6 +3507,7 @@ mod tests {
             bindings: "bindings.json".to_string(),
             scripts: Vec::new(),
             capabilities: Default::default(),
+            requirements: None,
         };
         std::fs::write(
             root.join("view.json"),
@@ -2631,7 +3528,7 @@ mod tests {
             .iter()
             .find(|view| view.id == "material-inspector")
             .expect("nested view listed");
-        assert_eq!(summary.package_rel_path, "tools/material-inspector");
+        assert_eq!(summary.package_rel_path, "Tools/material-inspector");
 
         let resolved = view_package_root(&working_dir, "material-inspector").expect("resolve view");
         assert_eq!(
@@ -2654,12 +3551,13 @@ mod tests {
         )
         .expect("create root folder");
         assert_eq!(folder.rel_path, "Tools");
-        assert!(temp.path().join("Locus/views/Tools").is_dir());
+        assert!(temp.path().join("Locus/View/Tools").is_dir());
 
         create_view_sync(
             &working_dir,
             super::ViewCreateRequest {
                 id: "material-inspector".to_string(),
+                package_name: None,
                 name: Some("Material Inspector".to_string()),
                 template: Some("blank".to_string()),
                 icon: None,
@@ -2669,24 +3567,27 @@ mod tests {
 
         let tree = list_view_tree_sync(&working_dir).expect("list tree");
         assert!(tree.folders.iter().any(|item| item.rel_path == "Tools"));
+        let default_package = default_view_package_name(&working_dir).expect("default package");
         assert!(tree
             .views
             .iter()
-            .any(|item| item.package_rel_path == "material-inspector"));
+            .any(|item| item.package_rel_path == format!("{default_package}/material-inspector")));
 
         let moved = move_view_entry_sync(
             &working_dir,
             super::ViewMoveEntryRequest {
-                source_rel_path: "material-inspector".to_string(),
+                source_rel_path: format!("{default_package}/material-inspector"),
                 target_dir_rel_path: Some("Tools".to_string()),
             },
         )
         .expect("move view into folder");
         assert!(temp
             .path()
-            .join("Locus/views/Tools/material-inspector")
+            .join("Locus/View/Tools/material-inspector")
             .is_dir());
-        assert!(!temp.path().join("Locus/views/material-inspector").exists());
+        assert!(!default_test_view_package_root(&working_dir)
+            .join("material-inspector")
+            .exists());
         assert!(moved
             .views
             .iter()
@@ -2699,20 +3600,26 @@ mod tests {
             },
         )
         .expect("delete folder");
-        assert!(!temp.path().join("Locus/views/Tools").exists());
+        assert!(!temp.path().join("Locus/View/Tools").exists());
         assert!(deleted.views.is_empty());
-        assert!(deleted.folders.is_empty());
+        assert!(deleted
+            .folders
+            .iter()
+            .any(|item| item.rel_path == default_package));
     }
 
     #[test]
-    fn supported_templates_include_graph_and_link_board() {
+    fn supported_templates_include_graph_link_board_and_serialized_table() {
         let ids = supported_view_templates()
             .into_iter()
             .map(|template| template.id)
             .collect::<Vec<_>>();
 
+        assert!(ids.contains(&"canvas-board".to_string()));
+        assert!(ids.contains(&"field-blocks".to_string()));
         assert!(ids.contains(&"node-graph".to_string()));
         assert!(ids.contains(&"link-board".to_string()));
+        assert!(ids.contains(&"serialized-table".to_string()));
     }
 
     #[test]
@@ -2723,6 +3630,7 @@ mod tests {
             &working_dir,
             super::ViewCreateRequest {
                 id: "flow-editor".to_string(),
+                package_name: None,
                 name: Some("Flow Editor".to_string()),
                 template: Some("node-graph".to_string()),
                 icon: None,
@@ -2731,16 +3639,182 @@ mod tests {
         .expect("create view");
 
         assert_eq!(created.manifest.template, "node-graph");
+        assert!(created.manifest.capabilities.unity);
+        assert!(created.manifest.capabilities.write_back);
+        assert!(view_manifest_requirements(&created.manifest).unity_connection);
+        assert_eq!(created.manifest.scripts[0].name, "GraphViewApi");
         let app = created
             .files
             .iter()
-            .find(|file| file.rel_path == "src/App.vue")
+            .find(|file| file.rel_path.ends_with("/flow-editor/src/App.vue"))
             .expect("app file");
         assert!(app.content.contains("GraphViewController"));
         assert!(app.content.contains("<GraphView :controller=\"graphView\""));
+        assert!(app
+            .content
+            .contains("view.callScript(\"GraphViewApi\", \"Read\""));
+        assert!(app
+            .content
+            .contains("view.callScript(\"GraphViewApi\", \"Save\""));
         assert!(app.content.contains("validateConnection"));
         assert!(app.content.contains("parameters:"));
         assert!(app.content.contains("portId: \"object\""));
+
+        let api = created
+            .files
+            .iter()
+            .find(|file| file.rel_path.ends_with("/flow-editor/unity/ViewApi.cs"))
+            .expect("api file");
+        assert!(api.content.contains("public static class GraphViewApi"));
+        assert!(api.content.contains("public static object Apply"));
+    }
+
+    #[test]
+    fn create_view_writes_loadable_canvas_board_package() {
+        let temp = tempdir().unwrap();
+        let working_dir = temp.path().to_string_lossy().to_string();
+        let created = create_view_sync(
+            &working_dir,
+            super::ViewCreateRequest {
+                id: "canvas-board".to_string(),
+                package_name: None,
+                name: Some("Canvas Board".to_string()),
+                template: Some("canvas-board".to_string()),
+                icon: None,
+            },
+        )
+        .expect("create view");
+
+        assert_eq!(created.manifest.template, "canvas-board");
+        assert_eq!(created.manifest.icon.as_deref(), Some("PanelsTopLeft"));
+        assert!(!created.manifest.capabilities.unity);
+        assert!(!view_manifest_requirements(&created.manifest).unity_connection);
+
+        let app = created
+            .files
+            .iter()
+            .find(|file| file.rel_path.ends_with("/canvas-board/src/App.vue"))
+            .expect("app file");
+        assert!(app.content.contains("CanvasView"));
+        assert!(app.content.contains("data-locus-template=\"canvas-board\""));
+        assert!(app.content.contains("v-model:selected-item-ids"));
+        assert!(app.content.contains(":edit-behavior=\"canvasBehavior\""));
+        assert!(app.content.contains("@copy-selection=\"copySelection\""));
+        assert!(app
+            .content
+            .contains("@context-menu=\"onCanvasContextMenu\""));
+    }
+
+    #[test]
+    fn create_view_writes_loadable_field_blocks_package() {
+        let temp = tempdir().unwrap();
+        let working_dir = temp.path().to_string_lossy().to_string();
+        let created = create_view_sync(
+            &working_dir,
+            super::ViewCreateRequest {
+                id: "field-blocks".to_string(),
+                package_name: None,
+                name: Some("Field Blocks".to_string()),
+                template: Some("field-blocks".to_string()),
+                icon: None,
+            },
+        )
+        .expect("create view");
+
+        assert_eq!(created.manifest.template, "field-blocks");
+        assert_eq!(created.manifest.icon.as_deref(), Some("FormInput"));
+        assert!(created.manifest.capabilities.unity);
+        assert!(created.manifest.capabilities.bindings);
+        assert!(created.manifest.capabilities.write_back);
+        assert!(view_manifest_requirements(&created.manifest).unity_connection);
+
+        let app = created
+            .files
+            .iter()
+            .find(|file| file.rel_path.ends_with("/field-blocks/src/App.vue"))
+            .expect("app file");
+        assert!(app.content.contains("CanvasView"));
+        assert!(app.content.contains("UnityPropertyEditor"));
+        assert!(app.content.contains("view.binding.read"));
+        assert!(app.content.contains("view.binding.write"));
+        assert!(app.content.contains("data-locus-template=\"field-blocks\""));
+    }
+
+    #[test]
+    fn create_view_writes_loadable_serialized_table_package() {
+        let temp = tempdir().unwrap();
+        let working_dir = temp.path().to_string_lossy().to_string();
+        let created = create_view_sync(
+            &working_dir,
+            super::ViewCreateRequest {
+                id: "serialized-browser".to_string(),
+                package_name: None,
+                name: Some("Serialized Browser".to_string()),
+                template: Some("serialized-table".to_string()),
+                icon: None,
+            },
+        )
+        .expect("create view");
+
+        assert_eq!(created.manifest.template, "serialized-table");
+        assert_eq!(created.manifest.icon.as_deref(), Some("TableProperties"));
+        assert!(created.manifest.capabilities.unity);
+        assert!(created.manifest.capabilities.write_back);
+        assert!(view_manifest_requirements(&created.manifest).unity_connection);
+        assert_eq!(created.manifest.scripts[0].name, "SerializedTableApi");
+
+        let app = created
+            .files
+            .iter()
+            .find(|file| file.rel_path.ends_with("/serialized-browser/src/App.vue"))
+            .expect("app file");
+        assert!(app.content.contains("SerializedTableApi"));
+        assert!(app.content.contains("view.assets.search"));
+        assert!(app
+            .content
+            .contains("data-locus-template=\"serialized-table\""));
+        assert!(app.content.contains("UnityPropertyEditor"));
+        assert!(app.content.contains("commitCell"));
+        assert!(app.content.contains("TableLoadProgress"));
+        assert!(app.content.contains("Preparing C# reader"));
+        assert!(app.content.contains("table-progress-status"));
+        assert!(!app.content.contains("Add Row"));
+        assert!(!app.content.contains("Add Column"));
+        assert!(!app.content.contains("config-pane"));
+        assert!(app.content.contains("localStorage"));
+        assert!(app.content.contains("persistColumnWidths"));
+        assert!(!app.content.contains("cache hit"));
+
+        let config = created
+            .files
+            .iter()
+            .find(|file| {
+                file.rel_path
+                    .ends_with("/serialized-browser/src/tableConfig.ts")
+            })
+            .expect("config file");
+        assert!(config.content.contains("tableColumns"));
+        assert!(config.content.contains("tableSources"));
+        assert!(config.content.contains("tableSourceProviders"));
+        assert!(config.content.contains("t:prefab component:Entity"));
+        assert!(config.content.contains("t:scriptableObject inherits:IData"));
+        assert!(config.content.contains("maxRows: 1000"));
+
+        let api = created
+            .files
+            .iter()
+            .find(|file| {
+                file.rel_path
+                    .ends_with("/serialized-browser/unity/ViewApi.cs")
+            })
+            .expect("api file");
+        assert!(api
+            .content
+            .contains("public static class SerializedTableApi"));
+        assert!(api.content.contains("SerializedProperty"));
+        assert!(api.content.contains("public static object Write"));
+        assert!(api.content.contains("TypeMatches"));
+        assert!(!api.content.contains("Selection.active"));
     }
 
     #[test]
@@ -2751,6 +3825,7 @@ mod tests {
             &working_dir,
             super::ViewCreateRequest {
                 id: "material-inspector".to_string(),
+                package_name: None,
                 name: Some("Material Inspector".to_string()),
                 template: Some("inspector-form".to_string()),
                 icon: None,
@@ -2783,6 +3858,7 @@ mod tests {
             &working_dir,
             super::ViewCreateRequest {
                 id: "material-inspector".to_string(),
+                package_name: None,
                 name: Some("Material Inspector".to_string()),
                 template: Some("inspector-form".to_string()),
                 icon: None,
@@ -2814,6 +3890,7 @@ mod tests {
             &working_dir,
             super::ViewCreateRequest {
                 id: "material-inspector".to_string(),
+                package_name: None,
                 name: Some("Material Inspector".to_string()),
                 template: Some("blank".to_string()),
                 icon: None,
@@ -2821,8 +3898,7 @@ mod tests {
         )
         .expect("create view");
         std::fs::write(
-            temp.path()
-                .join("Locus/views/material-inspector/bindings.json"),
+            default_test_view_package_root(&working_dir).join("material-inspector/bindings.json"),
             r#"{
   "schema": "locus.view.bindings.v1",
   "bindings": [
@@ -2859,6 +3935,7 @@ mod tests {
                 scene_path: Some("Assets/Scenes/Main.unity".to_string()),
                 object_path: Some("Root/Player".to_string()),
                 component_type: None,
+                component_index: None,
                 property_path: Some("m_Name".to_string()),
             }
         );
@@ -2872,6 +3949,7 @@ mod tests {
             &working_dir,
             super::ViewCreateRequest {
                 id: "material-inspector".to_string(),
+                package_name: None,
                 name: Some("Material Inspector".to_string()),
                 template: Some("blank".to_string()),
                 icon: None,
@@ -2879,8 +3957,7 @@ mod tests {
         )
         .expect("create view");
         std::fs::write(
-            temp.path()
-                .join("Locus/views/material-inspector/bindings.json"),
+            default_test_view_package_root(&working_dir).join("material-inspector/bindings.json"),
             r#"{
   "schema": "locus.view.bindings.v1",
   "bindings": [
@@ -2920,5 +3997,152 @@ mod tests {
         assert!(ensure_view_binding_write_allowed(None).is_ok());
         assert!(ensure_view_binding_write_allowed(Some("readOnly")).is_err());
         assert!(ensure_view_binding_write_allowed(Some("readonly")).is_err());
+    }
+
+    #[test]
+    fn view_binding_object_target_validation_allows_property_discovery_root() {
+        let target = ViewBindingTarget {
+            kind: "component".to_string(),
+            path: None,
+            scene_path: Some("Assets/Scenes/Main.unity".to_string()),
+            object_path: Some("Root/Player".to_string()),
+            component_type: Some("Game.Settings".to_string()),
+            component_index: Some(0),
+            property_path: None,
+        };
+
+        assert!(validate_view_binding_object_target(&target).is_ok());
+        assert!(validate_view_binding_target(&target).is_err());
+    }
+
+    #[test]
+    fn view_binding_read_result_preserves_serialized_property_tree_snapshot() {
+        let raw = r#"{
+  "ok": true,
+  "bindingId": "settings",
+  "message": "ok",
+  "target": {
+    "kind": "component",
+    "scenePath": "Assets/Scenes/Main.unity",
+    "objectPath": "Root/Player[1]",
+    "componentType": "Game.Settings",
+    "componentIndex": 2,
+    "propertyPath": "items"
+  },
+  "propertyPath": "items",
+  "displayName": "Items",
+  "name": "items",
+  "type": "Generic",
+  "valueType": "Generic",
+  "fieldTypeFullName": "Game.Inventory.Items",
+  "fieldTypeAssembly": "Assembly-CSharp",
+  "value": null,
+  "displayValue": "Array (1)",
+  "editable": true,
+  "hasChildren": true,
+  "isArray": true,
+  "arraySize": 1,
+  "children": [
+    {
+      "propertyPath": "items.Array.data[0]",
+      "displayName": "Element 0",
+      "name": "data[0]",
+      "type": "String",
+      "valueType": "String",
+      "fieldTypeFullName": "System.String",
+      "fieldTypeAssembly": "mscorlib",
+      "value": "alpha",
+      "displayValue": "alpha",
+      "editable": true,
+      "hasChildren": false,
+      "isArray": false,
+      "arraySize": -1,
+      "children": [],
+      "isManagedReference": false,
+      "managedReferenceFullTypename": "",
+      "managedReferenceFieldTypename": "",
+      "managedReferenceDisplayName": "",
+      "managedReferenceTypes": []
+    }
+  ],
+  "isManagedReference": false,
+  "managedReferenceFullTypename": "",
+  "managedReferenceFieldTypename": "",
+  "managedReferenceDisplayName": "",
+  "managedReferenceTypes": [],
+  "saved": false
+}
+"#;
+
+        let result: ViewBindingWriteResult = serde_json::from_str(raw).expect("deserialize result");
+        assert_eq!(result.read.target.component_index, Some(2));
+        assert!(result.read.property.is_array);
+        assert_eq!(result.read.property.array_size, 1);
+        assert_eq!(result.read.property.children.len(), 1);
+        assert_eq!(
+            result.read.property.children[0].property_path,
+            "items.Array.data[0]"
+        );
+        assert_eq!(
+            result.read.property.field_type_full_name,
+            "Game.Inventory.Items"
+        );
+        assert_eq!(
+            result.read.property.children[0].field_type_full_name,
+            "System.String"
+        );
+
+        let encoded = serde_json::to_value(&result).expect("serialize result");
+        assert_eq!(encoded["children"][0]["value"], "alpha");
+        assert_eq!(encoded["type"], "Generic");
+        assert_eq!(encoded["fieldTypeFullName"], "Game.Inventory.Items");
+        assert_eq!(encoded["target"]["componentIndex"], 2);
+    }
+
+    #[test]
+    fn view_binding_discover_result_preserves_field_type_metadata() {
+        let raw = r#"{
+  "ok": true,
+  "bindingId": "settings",
+  "message": "ok",
+  "target": {
+    "kind": "component",
+    "scenePath": "Assets/Scenes/Main.unity",
+    "objectPath": "Root/Player",
+    "componentType": "Game.Settings"
+  },
+  "matches": [
+    {
+      "propertyPath": "stats",
+      "displayName": "Stats",
+      "name": "stats",
+      "type": "Generic",
+      "valueType": "Generic",
+      "fieldTypeFullName": "Game.SharedStat",
+      "fieldTypeAssembly": "Assembly-CSharp",
+      "displayValue": "",
+      "editable": true,
+      "hasChildren": true,
+      "isArray": false,
+      "isManagedReference": false,
+      "depth": 0
+    }
+  ]
+}
+"#;
+
+        let result: ViewBindingDiscoverResult =
+            serde_json::from_str(raw).expect("deserialize discover result");
+        assert_eq!(result.matches.len(), 1);
+        assert_eq!(result.matches[0].property_path, "stats");
+        assert_eq!(result.matches[0].property_type, "Generic");
+        assert_eq!(result.matches[0].field_type_full_name, "Game.SharedStat");
+
+        let encoded = serde_json::to_value(&result).expect("serialize discover result");
+        assert_eq!(encoded["matches"][0]["type"], "Generic");
+        assert_eq!(
+            encoded["matches"][0]["fieldTypeAssembly"],
+            "Assembly-CSharp"
+        );
     }
 }

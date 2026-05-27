@@ -18,7 +18,7 @@
       },
       "args": {
         "type": "object",
-        "description": "JSON object passed to the script method. Methods can accept zero parameters, a string JSON payload, object, or a serializable request type."
+        "description": "JSON object passed to the script method. Methods can accept zero parameters, a string JSON payload, object, or a typed request DTO; Locus deserializes typed DTOs in the Unity Bridge protocol layer."
       }
     },
     "required": ["viewId", "scriptName", "method", "args"]

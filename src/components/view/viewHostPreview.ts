@@ -1,4 +1,8 @@
-import type { ViewPackageDetail, ViewPackageFile } from "../../services/view";
+import { parse as parseVueSfc } from "@vue/compiler-sfc";
+import type { ViewPackageDetail } from "../../services/view";
+import { sanitizeCssForPreview, viewFileContent } from "./viewPackageFiles";
+
+export { sanitizeCssForPreview, viewFileContent, viewPackageRelPath } from "./viewPackageFiles";
 
 const LOCUS_THEME_VARIABLES = [
   "--bg-color",
@@ -42,17 +46,10 @@ const DEFAULT_LOCUS_THEME: Record<(typeof LOCUS_THEME_VARIABLES)[number], string
   "--font-mono-identifier": "ui-monospace, SFMono-Regular, Cascadia Mono, Consolas, monospace",
 };
 
-function fileByPath(detail: ViewPackageDetail | null, relPath: string): ViewPackageFile | null {
-  return detail?.files.find((file) => file.relPath === relPath) ?? null;
-}
-
-export function viewFileContent(detail: ViewPackageDetail | null, relPath: string): string {
-  return fileByPath(detail, relPath)?.content ?? "";
-}
-
 export function extractVueTemplate(source: string): string {
-  const match = source.match(/<template[^>]*>([\s\S]*?)<\/template>/i);
-  return match?.[1]?.trim() || "";
+  const parsed = parseVueSfc(source, { filename: "src/App.vue", sourceMap: false });
+  if (parsed.errors.length) return "";
+  return parsed.descriptor.template?.content.trim() || "";
 }
 
 function stripScripts(html: string): string {
@@ -61,12 +58,6 @@ function stripScripts(html: string): string {
     .replace(/\son[a-z]+\s*=\s*"[^"]*"/gi, "")
     .replace(/\son[a-z]+\s*=\s*'[^']*'/gi, "")
     .replace(/\son[a-z]+\s*=\s*[^\s>]+/gi, "");
-}
-
-export function sanitizeCssForPreview(css: string): string {
-  return css
-    .replace(/@import\s+[^;]+;/gi, "")
-    .replace(/url\s*\([^)]*\)/gi, "none");
 }
 
 function escapeHtml(value: string): string {

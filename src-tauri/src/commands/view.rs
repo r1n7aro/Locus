@@ -4,17 +4,23 @@ use tauri::{AppHandle, State};
 
 use crate::error::AppError;
 use crate::view::{
-    append_view_frontend_log_sync, call_view_script, compile_view_script, create_view_folder_sync,
-    create_view_sync_with_scope, delete_view_entry_sync, emit_view_reload, emit_view_tree_changed,
-    list_view_tree_sync, list_views_sync, move_view_entry_sync, open_view_window,
-    parse_view_create_request, read_view_sync, reload_view_sync, supported_view_templates,
-    view_binding_apply as view_binding_apply_impl, view_binding_read as view_binding_read_impl,
-    view_binding_write as view_binding_write_impl, ViewBindingApplyRequest, ViewBindingApplyResult,
-    ViewBindingReadRequest, ViewBindingReadResult, ViewBindingWriteRequest, ViewBindingWriteResult,
-    ViewCallScriptRequest, ViewCallScriptResult, ViewCompileScriptRequest, ViewCompileScriptResult,
-    ViewCreateFolderRequest, ViewDeleteEntryRequest, ViewFolderSummary, ViewFrontendLogRequest,
-    ViewMoveEntryRequest, ViewPackageDetail, ViewPackageSummary, ViewRunResult,
-    ViewTemplateSummary, ViewTreeSnapshot,
+    append_view_frontend_log_sync, call_view_script, compile_view_script,
+    complete_view_automation_request, create_view_folder_sync, create_view_sync_with_scope,
+    delete_view_entry_sync, emit_view_reload, emit_view_tree_changed, export_view_package_sync,
+    import_view_package_sync, list_view_tree_sync, list_views_sync, move_view_entry_sync,
+    open_view_frontend_log_sync, open_view_window, parse_view_create_request,
+    read_view_frontend_log_sync, read_view_sync, reload_view_sync, supported_view_templates,
+    view_binding_apply as view_binding_apply_impl,
+    view_binding_discover as view_binding_discover_impl,
+    view_binding_read as view_binding_read_impl, view_binding_write as view_binding_write_impl,
+    ViewAutomationStore, ViewBindingApplyRequest, ViewBindingApplyResult,
+    ViewBindingDiscoverRequest, ViewBindingDiscoverResult, ViewBindingReadRequest,
+    ViewBindingReadResult, ViewBindingWriteRequest, ViewBindingWriteResult, ViewCallScriptRequest,
+    ViewCallScriptResult, ViewCompileScriptRequest, ViewCompileScriptResult,
+    ViewCreateFolderRequest, ViewDeleteEntryRequest, ViewExportPackageRequest, ViewFolderSummary,
+    ViewFrontendLogEntry, ViewFrontendLogReadRequest, ViewFrontendLogRequest,
+    ViewImportPackageRequest, ViewMoveEntryRequest, ViewPackageDetail, ViewPackageImportResult,
+    ViewPackageSummary, ViewRunResult, ViewTemplateSummary, ViewTreeSnapshot,
 };
 use crate::workspace::Workspace;
 
@@ -88,6 +94,27 @@ pub async fn view_move_entry(
 }
 
 #[tauri::command]
+pub async fn view_export_package(
+    request: ViewExportPackageRequest,
+    workspace: State<'_, Arc<Workspace>>,
+) -> Result<String, AppError> {
+    let working_dir = workspace.path.read().await.clone();
+    export_view_package_sync(&working_dir, request).map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn view_import_package(
+    request: ViewImportPackageRequest,
+    workspace: State<'_, Arc<Workspace>>,
+    app_handle: AppHandle,
+) -> Result<ViewPackageImportResult, AppError> {
+    let working_dir = workspace.path.read().await.clone();
+    let result = import_view_package_sync(&working_dir, request).map_err(AppError::from)?;
+    emit_view_tree_changed(&app_handle);
+    Ok(result)
+}
+
+#[tauri::command]
 pub async fn view_read(
     view_id: String,
     workspace: State<'_, Arc<Workspace>>,
@@ -115,7 +142,9 @@ pub async fn view_run(
     app_handle: AppHandle,
 ) -> Result<ViewRunResult, AppError> {
     let working_dir = workspace.path.read().await.clone();
-    open_view_window(&app_handle, &working_dir, &view_id).map_err(Into::into)
+    open_view_window(&app_handle, &working_dir, &view_id)
+        .await
+        .map_err(Into::into)
 }
 
 #[tauri::command]
@@ -150,12 +179,58 @@ pub async fn view_append_frontend_log(
 }
 
 #[tauri::command]
+pub async fn view_read_frontend_log(
+    request: ViewFrontendLogReadRequest,
+    workspace: State<'_, Arc<Workspace>>,
+) -> Result<Vec<ViewFrontendLogEntry>, AppError> {
+    let working_dir = workspace.path.read().await.clone();
+    read_view_frontend_log_sync(&working_dir, request).map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn view_open_frontend_log(
+    view_id: String,
+    workspace: State<'_, Arc<Workspace>>,
+) -> Result<(), AppError> {
+    let working_dir = workspace.path.read().await.clone();
+    open_view_frontend_log_sync(&working_dir, &view_id).map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn view_automation_respond(
+    request_id: String,
+    ok: bool,
+    result: Option<serde_json::Value>,
+    error: Option<String>,
+    store: State<'_, Arc<ViewAutomationStore>>,
+) -> Result<(), AppError> {
+    if complete_view_automation_request(store.inner().as_ref(), request_id, ok, result, error) {
+        Ok(())
+    } else {
+        Err(AppError::from(
+            "View automation request is no longer pending",
+        ))
+    }
+}
+
+#[tauri::command]
 pub async fn view_binding_read(
     request: ViewBindingReadRequest,
     workspace: State<'_, Arc<Workspace>>,
 ) -> Result<ViewBindingReadResult, AppError> {
     let working_dir = workspace.path.read().await.clone();
     view_binding_read_impl(&working_dir, request)
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn view_binding_discover(
+    request: ViewBindingDiscoverRequest,
+    workspace: State<'_, Arc<Workspace>>,
+) -> Result<ViewBindingDiscoverResult, AppError> {
+    let working_dir = workspace.path.read().await.clone();
+    view_binding_discover_impl(&working_dir, request)
         .await
         .map_err(Into::into)
 }

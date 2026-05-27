@@ -1,0 +1,25 @@
+{
+  "description": "Evaluate a JavaScript expression inside an open Locus View host window and return a JSON-safe value. Use for focused debugging after `view_snapshot` or `view_console_read`.",
+  "parameters": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "viewId": {
+        "type": "string",
+        "description": "View id of the open View host window."
+      },
+      "expression": {
+        "type": "string",
+        "description": "JavaScript expression or function body. It receives root, detail, and args."
+      },
+      "args": {
+        "description": "Optional JSON-compatible arguments passed to the expression."
+      },
+      "timeoutMs": {
+        "type": "integer",
+        "description": "Response timeout in milliseconds."
+      }
+    },
+    "required": ["viewId", "expression"]
+  }
+}

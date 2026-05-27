@@ -38,6 +38,56 @@ fn view_id_arg(args: &serde_json::Value) -> Result<String, ToolResult> {
         })
 }
 
+fn app_handle_or_error(
+    ctx: &ToolExecutionContext,
+    tool_name: &str,
+) -> Result<tauri::AppHandle, ToolResult> {
+    ctx.app_handle.clone().ok_or_else(|| ToolResult {
+        output: format!("Tool '{}' requires the Locus desktop runtime.", tool_name),
+        is_error: true,
+    })
+}
+
+async fn request_view_automation_tool(
+    args: serde_json::Value,
+    ctx: ToolExecutionContext,
+    tool_name: &str,
+    kind: &str,
+    default_timeout_ms: u64,
+) -> ToolResult {
+    let working_dir = match working_dir_or_error(&ctx, tool_name) {
+        Ok(path) => path,
+        Err(result) => return result,
+    };
+    let view_id = match view_id_arg(&args) {
+        Ok(value) => value,
+        Err(result) => return result,
+    };
+    if let Err(error) = crate::view::read_view_sync(&working_dir, &view_id) {
+        return ToolResult {
+            output: error,
+            is_error: true,
+        };
+    }
+    let app_handle = match app_handle_or_error(&ctx, tool_name) {
+        Ok(value) => value,
+        Err(result) => return result,
+    };
+    let timeout_ms = args
+        .get("timeoutMs")
+        .or_else(|| args.get("timeout_ms"))
+        .and_then(|value| value.as_u64())
+        .unwrap_or(default_timeout_ms);
+    match crate::view::request_view_automation(&app_handle, &view_id, kind, args, timeout_ms).await
+    {
+        Ok(result) => json_output(&result),
+        Err(error) => ToolResult {
+            output: error,
+            is_error: true,
+        },
+    }
+}
+
 pub(super) fn view_create() -> ToolDef {
     let prompt = crate::prompt::parse_tool_prompt(crate::prompt::tools::VIEW_CREATE);
     ToolDef {
@@ -56,7 +106,7 @@ pub(super) fn view_create() -> ToolDef {
                         return ToolResult {
                             output: format!("Error parsing view_create arguments: {}", error),
                             is_error: true,
-                        }
+                        };
                     }
                 };
 
@@ -154,7 +204,8 @@ pub(super) fn view_run() -> ToolDef {
                         is_error: true,
                     };
                 };
-                match crate::view::open_view_window(app_handle, &working_dir, &view_id) {
+                let app_handle = app_handle.clone();
+                match crate::view::open_view_window(&app_handle, &working_dir, &view_id).await {
                     Ok(result) => json_output(&result),
                     Err(error) => ToolResult {
                         output: error,
@@ -188,7 +239,7 @@ pub(super) fn view_compile_script() -> ToolDef {
                                     error
                                 ),
                                 is_error: true,
-                            }
+                            };
                         }
                     };
 
@@ -226,7 +277,7 @@ pub(super) fn view_call_script() -> ToolDef {
                                     error
                                 ),
                                 is_error: true,
-                            }
+                            };
                         }
                     };
 
@@ -264,11 +315,49 @@ pub(super) fn view_binding_read() -> ToolDef {
                                     error
                                 ),
                                 is_error: true,
-                            }
+                            };
                         }
                     };
 
                 match crate::view::view_binding_read(&working_dir, request).await {
+                    Ok(result) => json_output(&result),
+                    Err(error) => ToolResult {
+                        output: error,
+                        is_error: true,
+                    },
+                }
+            })
+        }),
+    }
+}
+
+pub(super) fn view_binding_discover() -> ToolDef {
+    let prompt = crate::prompt::parse_tool_prompt(crate::prompt::tools::VIEW_BINDING_DISCOVER);
+    ToolDef {
+        name: "view_binding_discover".to_string(),
+        description: prompt.description,
+        parameters: prompt.parameters,
+        execute: make_exec(|args, ctx| {
+            Box::pin(async move {
+                let working_dir = match working_dir_or_error(&ctx, "view_binding_discover") {
+                    Ok(path) => path,
+                    Err(result) => return result,
+                };
+                let request =
+                    match serde_json::from_value::<crate::view::ViewBindingDiscoverRequest>(args) {
+                        Ok(request) => request,
+                        Err(error) => {
+                            return ToolResult {
+                                output: format!(
+                                    "Error parsing view_binding_discover arguments: {}",
+                                    error
+                                ),
+                                is_error: true,
+                            };
+                        }
+                    };
+
+                match crate::view::view_binding_discover(&working_dir, request).await {
                     Ok(result) => json_output(&result),
                     Err(error) => ToolResult {
                         output: error,
@@ -302,7 +391,7 @@ pub(super) fn view_binding_write() -> ToolDef {
                                     error
                                 ),
                                 is_error: true,
-                            }
+                            };
                         }
                     };
 
@@ -340,12 +429,180 @@ pub(super) fn view_binding_apply() -> ToolDef {
                                     error
                                 ),
                                 is_error: true,
-                            }
+                            };
                         }
                     };
 
                 match crate::view::view_binding_apply(&working_dir, request).await {
                     Ok(result) => json_output(&result),
+                    Err(error) => ToolResult {
+                        output: error,
+                        is_error: true,
+                    },
+                }
+            })
+        }),
+    }
+}
+
+pub(super) fn view_snapshot() -> ToolDef {
+    let prompt = crate::prompt::parse_tool_prompt(crate::prompt::tools::VIEW_SNAPSHOT);
+    ToolDef {
+        name: "view_snapshot".to_string(),
+        description: prompt.description,
+        parameters: prompt.parameters,
+        execute: make_exec(|args, ctx| {
+            Box::pin(async move {
+                request_view_automation_tool(args, ctx, "view_snapshot", "snapshot", 5_000).await
+            })
+        }),
+    }
+}
+
+pub(super) fn view_action() -> ToolDef {
+    let prompt = crate::prompt::parse_tool_prompt(crate::prompt::tools::VIEW_ACTION);
+    ToolDef {
+        name: "view_action".to_string(),
+        description: prompt.description,
+        parameters: prompt.parameters,
+        execute: make_exec(|args, ctx| {
+            Box::pin(async move {
+                request_view_automation_tool(args, ctx, "view_action", "action", 5_000).await
+            })
+        }),
+    }
+}
+
+pub(super) fn view_wait() -> ToolDef {
+    let prompt = crate::prompt::parse_tool_prompt(crate::prompt::tools::VIEW_WAIT);
+    ToolDef {
+        name: "view_wait".to_string(),
+        description: prompt.description,
+        parameters: prompt.parameters,
+        execute: make_exec(|args, ctx| {
+            Box::pin(async move {
+                request_view_automation_tool(args, ctx, "view_wait", "wait", 10_000).await
+            })
+        }),
+    }
+}
+
+pub(super) fn view_debug_eval() -> ToolDef {
+    let prompt = crate::prompt::parse_tool_prompt(crate::prompt::tools::VIEW_DEBUG_EVAL);
+    ToolDef {
+        name: "view_debug_eval".to_string(),
+        description: prompt.description,
+        parameters: prompt.parameters,
+        execute: make_exec(|args, ctx| {
+            Box::pin(async move {
+                request_view_automation_tool(args, ctx, "view_debug_eval", "debugEval", 5_000).await
+            })
+        }),
+    }
+}
+
+pub(super) fn view_console_read() -> ToolDef {
+    let prompt = crate::prompt::parse_tool_prompt(crate::prompt::tools::VIEW_CONSOLE_READ);
+    ToolDef {
+        name: "view_console_read".to_string(),
+        description: prompt.description,
+        parameters: prompt.parameters,
+        execute: make_exec(|args, ctx| {
+            Box::pin(async move {
+                let working_dir = match working_dir_or_error(&ctx, "view_console_read") {
+                    Ok(path) => path,
+                    Err(result) => return result,
+                };
+                let view_id = match view_id_arg(&args) {
+                    Ok(value) => value,
+                    Err(result) => return result,
+                };
+                let limit = args
+                    .get("limit")
+                    .and_then(|value| value.as_u64())
+                    .map(|value| value as usize);
+                let level = args
+                    .get("level")
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string);
+                let contains = args
+                    .get("contains")
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(|value| value.to_ascii_lowercase());
+                let request = crate::view::ViewFrontendLogReadRequest { view_id, limit };
+                match crate::view::read_view_frontend_log_sync(&working_dir, request) {
+                    Ok(entries) => {
+                        let entries = entries
+                            .into_iter()
+                            .filter(|entry| {
+                                level
+                                    .as_deref()
+                                    .map(|level| entry.level.eq_ignore_ascii_case(level))
+                                    .unwrap_or(true)
+                            })
+                            .filter(|entry| {
+                                contains
+                                    .as_deref()
+                                    .map(|needle| {
+                                        entry.message.to_ascii_lowercase().contains(needle)
+                                    })
+                                    .unwrap_or(true)
+                            })
+                            .collect::<Vec<_>>();
+                        json_output(&entries)
+                    }
+                    Err(error) => ToolResult {
+                        output: error,
+                        is_error: true,
+                    },
+                }
+            })
+        }),
+    }
+}
+
+pub(super) fn view_capture() -> ToolDef {
+    let prompt = crate::prompt::parse_tool_prompt(crate::prompt::tools::VIEW_CAPTURE);
+    ToolDef {
+        name: "view_capture".to_string(),
+        description: prompt.description,
+        parameters: prompt.parameters,
+        execute: make_exec(|args, ctx| {
+            Box::pin(async move {
+                let working_dir = match working_dir_or_error(&ctx, "view_capture") {
+                    Ok(path) => path,
+                    Err(result) => return result,
+                };
+                let view_id = match view_id_arg(&args) {
+                    Ok(value) => value,
+                    Err(result) => return result,
+                };
+                if let Err(error) = crate::view::read_view_sync(&working_dir, &view_id) {
+                    return ToolResult {
+                        output: error,
+                        is_error: true,
+                    };
+                }
+                let app_handle = match app_handle_or_error(&ctx, "view_capture") {
+                    Ok(value) => value,
+                    Err(result) => return result,
+                };
+                match crate::view::capture_view_window(&app_handle, &view_id).await {
+                    Ok(capture) => json_output(&serde_json::json!({
+                        "status": "captured",
+                        "viewId": capture.view_id,
+                        "windowLabel": capture.window_label,
+                        "format": capture.format,
+                        "mimeType": capture.mime_type,
+                        "width": capture.width,
+                        "height": capture.height,
+                        "byteSize": capture.byte_size,
+                        "image": "captured"
+                    })),
                     Err(error) => ToolResult {
                         output: error,
                         is_error: true,

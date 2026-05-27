@@ -1,0 +1,41 @@
+{
+  "description": "Wait for a condition inside an open Locus View host window, then return elapsed timing. Use it after reloads, async data loads, or UI actions.",
+  "parameters": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "viewId": {
+        "type": "string",
+        "description": "View id of the open View host window."
+      },
+      "condition": {
+        "type": "string",
+        "description": "Condition name: runtimeReady, selectorVisible, selectorHidden, textPresent, textAbsent, noConsoleError, or expression."
+      },
+      "selector": {
+        "type": ["string", "null"],
+        "description": "CSS selector for selectorVisible or selectorHidden."
+      },
+      "text": {
+        "type": ["string", "null"],
+        "description": "Text for textPresent or textAbsent."
+      },
+      "expression": {
+        "type": ["string", "null"],
+        "description": "JavaScript expression for condition expression. It receives root, detail, and args."
+      },
+      "args": {
+        "description": "Optional JSON-compatible arguments passed to expression."
+      },
+      "timeoutMs": {
+        "type": "integer",
+        "description": "Timeout in milliseconds. Defaults to 5000 and is capped by the host."
+      },
+      "pollIntervalMs": {
+        "type": "integer",
+        "description": "Polling interval in milliseconds."
+      }
+    },
+    "required": ["viewId"]
+  }
+}

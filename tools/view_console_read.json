@@ -1,0 +1,26 @@
+{
+  "description": "Read recent frontend console log entries captured from a Locus View host window. Use it to inspect runtime errors, warnings, and debug output.",
+  "parameters": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "viewId": {
+        "type": "string",
+        "description": "View id whose frontend.log should be read."
+      },
+      "limit": {
+        "type": "integer",
+        "description": "Maximum entries to return. Defaults to 20 and is capped by the backend."
+      },
+      "level": {
+        "type": ["string", "null"],
+        "description": "Optional log level filter: debug, log, info, warn, or error."
+      },
+      "contains": {
+        "type": ["string", "null"],
+        "description": "Optional case-insensitive substring filter for log messages."
+      }
+    },
+    "required": ["viewId"]
+  }
+}

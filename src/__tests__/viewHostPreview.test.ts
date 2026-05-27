@@ -3,12 +3,43 @@ import {
   buildViewPreviewSrcdoc,
   extractVueTemplate,
   sanitizeCssForPreview,
+  viewPackageRelPath,
 } from "../components/view/viewHostPreview";
 import type { ViewPackageDetail } from "../services/view";
 
 describe("viewHostPreview", () => {
   it("extracts the Vue template body", () => {
     expect(extractVueTemplate("<template><main>View</main></template>")).toBe("<main>View</main>");
+  });
+
+  it("extracts the full Vue template body when nested template tags are used", () => {
+    const source = `<script setup lang="ts">
+const mode = "group";
+</script>
+
+<template>
+  <main class="view-shell">
+    <section>
+      <template v-if="mode === 'group'">
+        <div>Group</div>
+      </template>
+      <template v-else>
+        <div>Other</div>
+      </template>
+    </section>
+  </main>
+</template>`;
+
+    expect(extractVueTemplate(source)).toBe(`<main class="view-shell">
+    <section>
+      <template v-if="mode === 'group'">
+        <div>Group</div>
+      </template>
+      <template v-else>
+        <div>Other</div>
+      </template>
+    </section>
+  </main>`);
   });
 
   it("removes script blocks and css urls from preview srcdoc", () => {
@@ -18,10 +49,12 @@ describe("viewHostPreview", () => {
         name: "Test View",
         version: "0.1.0",
         template: "blank",
-        packageRoot: "F:/Project/Locus/views/test-view",
-        manifestPath: "F:/Project/Locus/views/test-view/view.json",
+        packageRelPath: "Project/test-view",
+        packageRoot: "F:/Project/Locus/View/Project/test-view",
+        manifestPath: "F:/Project/Locus/View/Project/test-view/view.json",
         updatedAt: 1,
         capabilities: { unity: false, bindings: false, writeBack: false },
+        requirements: { unityConnection: false },
       },
       manifest: {
         schema: "locus.view.v1",
@@ -34,6 +67,7 @@ describe("viewHostPreview", () => {
         bindings: "bindings.json",
         scripts: [],
         capabilities: { unity: false, bindings: false, writeBack: false },
+        requirements: { unityConnection: false },
       },
       files: [
         {
@@ -79,10 +113,12 @@ describe("viewHostPreview", () => {
         name: "Graph View",
         version: "0.1.0",
         template: "node-graph",
-        packageRoot: "F:/Project/Locus/views/graph-view",
-        manifestPath: "F:/Project/Locus/views/graph-view/view.json",
+        packageRelPath: "Project/graph-view",
+        packageRoot: "F:/Project/Locus/View/Project/graph-view",
+        manifestPath: "F:/Project/Locus/View/Project/graph-view/view.json",
         updatedAt: 1,
         capabilities: { unity: false, bindings: false, writeBack: false },
+        requirements: { unityConnection: false },
       },
       manifest: {
         schema: "locus.view.v1",
@@ -95,6 +131,7 @@ describe("viewHostPreview", () => {
         bindings: "bindings.json",
         scripts: [],
         capabilities: { unity: false, bindings: false, writeBack: false },
+        requirements: { unityConnection: false },
       },
       files: [
         {
@@ -124,5 +161,54 @@ describe("viewHostPreview", () => {
 
   it("sanitizes css url references", () => {
     expect(sanitizeCssForPreview("@import \"x.css\";.x{background:url(test.png)}")).toBe(".x{background:none}");
+  });
+
+  it("resolves View files relative to the package workspace view folder", () => {
+    const detail: ViewPackageDetail = {
+      summary: {
+        id: "material-inspector",
+        name: "Material Inspector",
+        version: "0.1.0",
+        template: "blank",
+        packageRelPath: "Gameplay/material-inspector",
+        packageRoot: "F:/Project/Locus/View/Gameplay/material-inspector",
+        manifestPath: "F:/Project/Locus/View/Gameplay/material-inspector/view.json",
+        updatedAt: 1,
+        capabilities: { unity: false, bindings: false, writeBack: false },
+        requirements: { unityConnection: false },
+      },
+      manifest: {
+        schema: "locus.view.v1",
+        id: "material-inspector",
+        name: "Material Inspector",
+        version: "0.1.0",
+        template: "blank",
+        entry: "src/main.ts",
+        style: "src/style.css",
+        bindings: "bindings.json",
+        scripts: [],
+        capabilities: { unity: false, bindings: false, writeBack: false },
+        requirements: { unityConnection: false },
+      },
+      files: [
+        {
+          relPath: "Gameplay/material-inspector/src/App.vue",
+          kind: "source",
+          content: "<template><main /></template>",
+          size: 1,
+          truncated: false,
+        },
+        {
+          relPath: "Gameplay/src/index.ts",
+          kind: "source",
+          content: "export {};",
+          size: 1,
+          truncated: false,
+        },
+      ],
+    };
+
+    expect(viewPackageRelPath(detail, "src/App.vue")).toBe("Gameplay/material-inspector/src/App.vue");
+    expect(viewPackageRelPath(detail, "Gameplay/src/index.ts")).toBe("Gameplay/src/index.ts");
   });
 });

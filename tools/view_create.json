@@ -1,5 +1,5 @@
 {
-  "description": "Create a View Package. By default it writes a persistent package under the selected Unity project at Locus/views/<view-id>. Set temporary=true for one-off display Views; Locus writes them under the app temp directory, appends a unique suffix to the requested id, keeps them out of the user-visible View registry, and returns the actual id plus packageRoot. Use this only inside the /view workflow. Use normal file tools to read or edit files inside packageRoot.",
+  "description": "Create a View inside a Locus View package workspace. By default it writes under the selected Unity project at Locus/View/<project-name>/<view-id>, with shared package code under Locus/View/<project-name>/src. Set packageName to create or reuse another package workspace. Set temporary=true for one-off display Views; Locus writes them under the app temp directory, appends a unique suffix to the requested id, keeps them out of the user-visible View registry, and returns the actual id plus packageRoot. Use this only inside the /view workflow. Use normal file tools to read or edit files inside packageRoot.",
   "parameters": {
     "type": "object",
     "additionalProperties": false,
@@ -8,14 +8,18 @@
         "type": "string",
         "description": "Lowercase kebab-case View id, for example material-inspector."
       },
+      "packageName": {
+        "type": ["string", "null"],
+        "description": "Optional View package workspace folder name under Locus/View. Defaults to the Unity project folder name."
+      },
       "name": {
         "type": ["string", "null"],
         "description": "Display name for the View. Defaults to a title generated from id."
       },
       "template": {
         "type": "string",
-        "enum": ["blank", "inspector-form", "node-graph", "link-board"],
-        "description": "Built-in View template to copy. Supported values: blank, inspector-form, node-graph, link-board."
+        "enum": ["blank", "inspector-form", "canvas-board", "field-blocks", "node-graph", "link-board", "serialized-table"],
+        "description": "Built-in View template to copy. Supported values: blank, inspector-form, canvas-board, field-blocks, node-graph, link-board, serialized-table."
       },
       "icon": {
         "type": ["string", "null"],
@@ -45,7 +49,7 @@
       },
       "temporary": {
         "type": "boolean",
-        "description": "Create a one-off View package outside Locus/views. Temporary Views can be opened with the returned id but do not appear in view_list or the user-visible View tree."
+        "description": "Create a one-off View outside Locus/View. Temporary Views can be opened with the returned id but do not appear in view_list or the user-visible View tree."
       }
     },
     "required": ["id", "template"]

@@ -1,0 +1,49 @@
+{
+  "description": "Perform an interaction in an open Locus View host window. Use `view_snapshot` first to get element ids, selectors, text, roles, or screen coordinates.",
+  "parameters": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "viewId": {
+        "type": "string",
+        "description": "View id of the open View host window."
+      },
+      "action": {
+        "type": "string",
+        "description": "Action name: click, doubleClick, hover, focus, type, press, setValue, selectOption, check, uncheck, scroll, or drag."
+      },
+      "target": {
+        "type": ["object", "null"],
+        "description": "Target locator. Supported fields: elementId, selector, text, name, role, x, y."
+      },
+      "text": {
+        "type": ["string", "null"],
+        "description": "Text for type or press."
+      },
+      "value": {
+        "description": "Value for setValue or selectOption."
+      },
+      "key": {
+        "type": ["string", "null"],
+        "description": "Keyboard key for press, for example Enter, Escape, Tab, ArrowDown."
+      },
+      "deltaX": {
+        "type": "number",
+        "description": "Horizontal scroll delta for scroll."
+      },
+      "deltaY": {
+        "type": "number",
+        "description": "Vertical scroll delta for scroll."
+      },
+      "to": {
+        "type": ["object", "null"],
+        "description": "Destination locator for drag. Supported fields match target."
+      },
+      "timeoutMs": {
+        "type": "integer",
+        "description": "Response timeout in milliseconds."
+      }
+    },
+    "required": ["viewId", "action"]
+  }
+}
