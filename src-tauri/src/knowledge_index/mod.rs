@@ -3239,6 +3239,77 @@ pub async fn build_overview(
     })
 }
 
+#[derive(Debug, Clone)]
+pub struct KnowledgeQueryProgress {
+    pub title: String,
+    pub info: String,
+    pub progress: Option<f32>,
+}
+
+impl KnowledgeQueryProgress {
+    fn new(title: impl Into<String>, info: impl Into<String>, progress: Option<f32>) -> Self {
+        Self {
+            title: title.into(),
+            info: info.into(),
+            progress,
+        }
+    }
+}
+
+fn emit_query_progress<F>(
+    on_progress: &mut F,
+    title: impl Into<String>,
+    info: impl Into<String>,
+    progress: f32,
+) where
+    F: FnMut(KnowledgeQueryProgress),
+{
+    on_progress(KnowledgeQueryProgress::new(
+        title,
+        info,
+        Some(progress.clamp(0.0, 1.0)),
+    ));
+}
+
+fn truncate_query_progress_info(value: &str, max_chars: usize) -> String {
+    let value = value.trim();
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+
+    let mut truncated = value
+        .chars()
+        .take(max_chars.saturating_sub(3))
+        .collect::<String>();
+    truncated.push_str("...");
+    truncated
+}
+
+fn query_progress_filter_info(
+    types: Option<&[KnowledgeType]>,
+    path_prefix: Option<&str>,
+) -> String {
+    if let Some(path_prefix) = path_prefix.filter(|value| !value.trim().is_empty()) {
+        return format!(
+            "pathPrefix: {}",
+            truncate_query_progress_info(path_prefix, 80)
+        );
+    }
+
+    if let Some(types) = types.filter(|values| !values.is_empty()) {
+        return format!(
+            "types: {}",
+            types
+                .iter()
+                .map(|value| value.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
+    "all knowledge".to_string()
+}
+
 pub async fn query_documents(
     working_dir: &str,
     app_knowledge_dir: Option<&std::path::PathBuf>,
@@ -3249,11 +3320,52 @@ pub async fn query_documents(
     limit: usize,
     state: Arc<KnowledgeIndexState>,
 ) -> Result<Vec<KnowledgeSearchHit>, String> {
+    query_documents_with_progress(
+        working_dir,
+        app_knowledge_dir,
+        lexical_query,
+        semantic_query,
+        types,
+        path_prefix,
+        limit,
+        state,
+        |_| {},
+    )
+    .await
+}
+
+pub async fn query_documents_with_progress<F>(
+    working_dir: &str,
+    app_knowledge_dir: Option<&std::path::PathBuf>,
+    lexical_query: Option<&str>,
+    semantic_query: Option<&str>,
+    types: Option<&[KnowledgeType]>,
+    path_prefix: Option<&str>,
+    limit: usize,
+    state: Arc<KnowledgeIndexState>,
+    mut on_progress: F,
+) -> Result<Vec<KnowledgeSearchHit>, String>
+where
+    F: FnMut(KnowledgeQueryProgress) + Send,
+{
+    emit_query_progress(
+        &mut on_progress,
+        "Loading knowledge search config",
+        query_progress_filter_info(types, path_prefix),
+        0.06,
+    );
+
     let general_config = load_general_config(&library_dir_for_working_dir(working_dir));
     if !general_config.enabled {
         return Ok(Vec::new());
     }
 
+    emit_query_progress(
+        &mut on_progress,
+        "Checking knowledge catalog",
+        query_progress_filter_info(types, path_prefix),
+        0.14,
+    );
     ensure_document_catalog_available(working_dir, app_knowledge_dir, state.clone()).await?;
     let db = state.db();
     let tantivy = state.tantivy();
@@ -3261,32 +3373,56 @@ pub async fn query_documents(
     let query_limit = limit.max(1).min(50);
     let lexical_query = lexical_query.filter(|value| !value.trim().is_empty());
     let (lexical_hits, lexical_kind) = match lexical_query {
-        Some(value) if general_config.lexical_search_enabled => (
-            lexical_index_search_documents(
-                working_dir,
-                app_knowledge_dir,
-                &db,
-                &tantivy,
-                value,
-                types,
-                path_prefix,
-                query_limit * 6,
-            )?,
-            Some(KeywordSearchKind::LexicalIndex),
-        ),
-        Some(value) => (
-            text_scan_search_documents(
-                working_dir,
-                app_knowledge_dir,
-                value,
-                types,
-                path_prefix,
-                query_limit * 6,
-            )?,
-            Some(KeywordSearchKind::TextScan),
-        ),
+        Some(value) if general_config.lexical_search_enabled => {
+            emit_query_progress(
+                &mut on_progress,
+                "Running lexical index search",
+                truncate_query_progress_info(value, 80),
+                0.28,
+            );
+            (
+                lexical_index_search_documents(
+                    working_dir,
+                    app_knowledge_dir,
+                    &db,
+                    &tantivy,
+                    value,
+                    types,
+                    path_prefix,
+                    query_limit * 6,
+                )?,
+                Some(KeywordSearchKind::LexicalIndex),
+            )
+        }
+        Some(value) => {
+            emit_query_progress(
+                &mut on_progress,
+                "Running text scan",
+                truncate_query_progress_info(value, 80),
+                0.28,
+            );
+            (
+                text_scan_search_documents(
+                    working_dir,
+                    app_knowledge_dir,
+                    value,
+                    types,
+                    path_prefix,
+                    query_limit * 6,
+                )?,
+                Some(KeywordSearchKind::TextScan),
+            )
+        }
         None => (Vec::new(), None),
     };
+    emit_query_progress(
+        &mut on_progress,
+        "Checking semantic search",
+        semantic_query
+            .map(|value| truncate_query_progress_info(value, 80))
+            .unwrap_or_else(|| "semanticQuery empty".to_string()),
+        0.46,
+    );
     let semantic_hits = if general_config.semantic_search_enabled
         && semantic_query
             .map(|value| should_use_semantic_recall(value))
@@ -3294,6 +3430,14 @@ pub async fn query_documents(
     {
         if let Ok(mgr) = state.embedding_mgr().try_lock() {
             if mgr.config().enabled && mgr.is_ready() {
+                emit_query_progress(
+                    &mut on_progress,
+                    "Running semantic search",
+                    semantic_query
+                        .map(|value| truncate_query_progress_info(value, 80))
+                        .unwrap_or_default(),
+                    0.52,
+                );
                 semantic_recall(
                     &db,
                     &mgr,
@@ -3317,7 +3461,23 @@ pub async fn query_documents(
         .collect::<HashSet<_>>()
         .into_iter()
         .collect();
+    emit_query_progress(
+        &mut on_progress,
+        "Loading matched documents",
+        format!("{} candidate(s)", hit_doc_ids.len()),
+        0.66,
+    );
     let doc_map = load_cached_documents_by_ids(&db, &hit_doc_ids)?;
+    emit_query_progress(
+        &mut on_progress,
+        "Filtering knowledge access",
+        format!(
+            "{} lexical, {} semantic",
+            lexical_hits.len(),
+            semantic_hits.len()
+        ),
+        0.76,
+    );
     let mut access_cache = HashMap::new();
     let mut filtered_lexical = Vec::new();
     for hit in lexical_hits {
@@ -3357,6 +3517,16 @@ pub async fn query_documents(
         }
     }
 
+    emit_query_progress(
+        &mut on_progress,
+        "Ranking knowledge results",
+        format!(
+            "{} lexical, {} semantic",
+            filtered_lexical.len(),
+            filtered_semantic.len()
+        ),
+        0.88,
+    );
     let mut entries: HashMap<String, FusionEntry> = HashMap::new();
     for (rank, hit) in filtered_lexical.iter().enumerate() {
         let entry = entries

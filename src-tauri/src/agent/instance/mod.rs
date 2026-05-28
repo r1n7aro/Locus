@@ -8792,7 +8792,7 @@ impl AgentInstance {
         } else if tc.name == "knowledge_list" {
             ExecutedToolResult::from_tool_result(self.execute_knowledge_list(args))
         } else if tc.name == "knowledge_query" {
-            self.await_tool_result(self.execute_knowledge_query(app_handle, args))
+            self.await_tool_result(self.execute_knowledge_query(app_handle, &tc.id, args, run_id))
                 .await
         } else if tc.name == "knowledge_read" {
             self.execute_knowledge_read(app_handle, &tc.id, args, run_id)
@@ -9265,7 +9265,9 @@ impl AgentInstance {
     async fn execute_knowledge_query(
         &self,
         app_handle: &AppHandle,
+        tool_call_id: &str,
         args: &serde_json::Value,
+        run_id: &str,
     ) -> ToolResult {
         #[derive(serde::Deserialize)]
         #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -9286,6 +9288,19 @@ impl AgentInstance {
                 };
             }
         };
+
+        fn truncate_progress_info(value: &str, max_chars: usize) -> String {
+            let value = value.trim();
+            if value.chars().count() <= max_chars {
+                return value.to_string();
+            }
+            let mut truncated = value
+                .chars()
+                .take(max_chars.saturating_sub(3))
+                .collect::<String>();
+            truncated.push_str("...");
+            truncated
+        }
 
         let lexical_query = parsed
             .lexical_query
@@ -9318,6 +9333,22 @@ impl AgentInstance {
             }
         };
 
+        let query_info = lexical_query
+            .as_deref()
+            .or(semantic_query.as_deref())
+            .map(|value| truncate_progress_info(value, 80))
+            .unwrap_or_else(|| "query parsed".to_string());
+        emit_tool_progress(
+            app_handle,
+            run_id,
+            &self.session_id,
+            tool_call_id,
+            "Preparing knowledge query",
+            query_info,
+            Some(0.03),
+            "running",
+        );
+
         let mut parsed_types: Option<Vec<crate::knowledge_store::KnowledgeType>> = None;
         if let Some(prefix_type) = prefix_type {
             parsed_types = Some(vec![prefix_type]);
@@ -9329,7 +9360,12 @@ impl AgentInstance {
             state.inner().clone()
         };
 
-        match crate::knowledge_index::query_documents(
+        let progress_handle = app_handle.clone();
+        let progress_session_id = self.session_id.clone();
+        let progress_tool_call_id = tool_call_id.to_string();
+        let progress_run_id = run_id.to_string();
+
+        match crate::knowledge_index::query_documents_with_progress(
             &self.working_dir,
             self.app_knowledge_dir.as_ref().as_ref(),
             lexical_query.as_deref(),
@@ -9338,10 +9374,32 @@ impl AgentInstance {
             normalized_prefix.as_deref(),
             parsed.limit.unwrap_or(5).min(20),
             knowledge_index_state,
+            move |progress| {
+                emit_tool_progress(
+                    &progress_handle,
+                    &progress_run_id,
+                    &progress_session_id,
+                    &progress_tool_call_id,
+                    progress.title,
+                    progress.info,
+                    progress.progress,
+                    "running",
+                );
+            },
         )
         .await
         {
             Ok(mut items) => {
+                emit_tool_progress(
+                    app_handle,
+                    run_id,
+                    &self.session_id,
+                    tool_call_id,
+                    "Formatting knowledge results",
+                    format!("{} result(s)", items.len()),
+                    Some(0.96),
+                    "running",
+                );
                 Self::prefix_knowledge_search_hit_paths(&mut items);
                 let items = Self::sanitize_knowledge_search_hits(items);
                 ToolResult {
@@ -9349,10 +9407,22 @@ impl AgentInstance {
                     is_error: false,
                 }
             }
-            Err(error) => ToolResult {
-                output: format!("Error querying knowledge documents: {}", error),
-                is_error: true,
-            },
+            Err(error) => {
+                emit_tool_progress(
+                    app_handle,
+                    run_id,
+                    &self.session_id,
+                    tool_call_id,
+                    "Knowledge query failed",
+                    "",
+                    None,
+                    "error",
+                );
+                ToolResult {
+                    output: format!("Error querying knowledge documents: {}", error),
+                    is_error: true,
+                }
+            }
         }
     }
 
