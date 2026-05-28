@@ -286,6 +286,8 @@ type AssetRefContextMenuTarget =
       objectPath: string;
     };
 
+type KnowledgeRefContextMenuTarget = Extract<AssetRefContextMenuTarget, { kind: "knowledge" }>;
+
 type AssetRefContextMenuState = {
   x: number;
   y: number;
@@ -388,7 +390,7 @@ function toKnowledgeDocumentType(value: string): KnowledgeDocumentType | null {
   return null;
 }
 
-function parseKnowledgeDocumentRefPath(filePath: string): AssetRefContextMenuTarget | null {
+function parseKnowledgeDocumentRefPath(filePath: string): KnowledgeRefContextMenuTarget | null {
   const normalized = normalizeAssetRefDatasetPath(filePath).replace(/^\/+/, "");
   if (!normalized) return null;
 
