@@ -2771,6 +2771,10 @@ function openImage(src: string) {
     contain-intrinsic-size: auto 180px;
   }
 
+  .chat-transcript-scroll.is-session.is-session-restore-stabilizing .chat-transcript-message.is-session {
+    content-visibility: visible;
+  }
+
   .chat-transcript-message.is-session.assistant.transient.has-live-thinking,
   .chat-transcript-message.is-session.assistant.transient.has-tool-waiting-status {
     content-visibility: visible;

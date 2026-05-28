@@ -8,6 +8,7 @@ import {
   restoreLiveScrollAnchor,
   resolveSessionScrollTop,
   restoreScrollAnchor,
+  shouldRestoreBottomFromTopAnchorState,
   type SessionScrollState,
 } from "../composables/chatScrollState";
 
@@ -114,6 +115,30 @@ describe("chatScrollState", () => {
       clientHeight: 300,
       scrollHeight: 700,
     }, state)).toBe(400);
+  });
+
+  it("detects stale top anchors that should recover to bottom on session restore", () => {
+    expect(shouldRestoreBottomFromTopAnchorState({
+      mode: "anchor",
+      anchorId: "first",
+      offsetTop: 25,
+      fallbackScrollTop: 33,
+    }, "first", {
+      scrollTop: 0,
+      clientHeight: 849,
+      scrollHeight: 1417,
+    })).toBe(true);
+
+    expect(shouldRestoreBottomFromTopAnchorState({
+      mode: "anchor",
+      anchorId: "middle",
+      offsetTop: 25,
+      fallbackScrollTop: 240,
+    }, "first", {
+      scrollTop: 240,
+      clientHeight: 849,
+      scrollHeight: 1417,
+    })).toBe(false);
   });
 
   it("restores an anchor by adjusting scrollTop to keep the same offset", () => {

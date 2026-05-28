@@ -68,6 +68,18 @@ export function resolveSessionScrollTop(
   return Math.max(0, Math.min(state.scrollTop, maxScrollTop));
 }
 
+export function shouldRestoreBottomFromTopAnchorState(
+  state: SessionScrollState | null | undefined,
+  firstAnchorId: string | null | undefined,
+  metrics: ScrollMetrics,
+  threshold = CHAT_SCROLL_BOTTOM_THRESHOLD,
+): boolean {
+  if (!state || state.mode !== "anchor") return false;
+  if (!firstAnchorId || state.anchorId !== firstAnchorId) return false;
+  if (state.fallbackScrollTop > threshold) return false;
+  return metrics.scrollHeight - metrics.clientHeight > threshold;
+}
+
 function iterScrollAnchors(
   container: Pick<HTMLElement, "querySelectorAll">,
   selector = CHAT_SCROLL_ANCHOR_SELECTOR,
