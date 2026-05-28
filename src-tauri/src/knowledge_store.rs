@@ -711,6 +711,8 @@ pub struct KnowledgeSearchHit {
     pub updated_at: i64,
     #[serde(default)]
     pub match_kind: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub matched_terms: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_score: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4660,10 +4662,15 @@ pub fn list_directory_configs_with_app_root_excluding_prefixes(
     Ok(records)
 }
 
-pub(crate) fn score_document_text_match(
+pub(crate) fn score_document_text_match_with_terms(
     query: &str,
     doc: &KnowledgeDocument,
-) -> Option<(f32, String, Option<KnowledgeSearchMatchSection>)> {
+) -> Option<(
+    f32,
+    String,
+    Option<KnowledgeSearchMatchSection>,
+    Vec<String>,
+)> {
     let needle = query.trim().to_lowercase();
     if needle.is_empty() {
         return None;
@@ -4756,11 +4763,16 @@ pub(crate) fn score_document_text_match(
                 .map(str::to_string)
                 .unwrap_or_else(|| extract_snippet(&doc.body, &needle, &terms));
         }
-        Some((score, snippet, matched_section))
+        Some((
+            score,
+            snippet,
+            matched_section,
+            document_text_match_terms(query, doc),
+        ))
     }
 }
 
-fn text_match_terms(query: &str) -> Vec<String> {
+pub(crate) fn text_match_terms(query: &str) -> Vec<String> {
     let mut terms = Vec::new();
     let mut current = String::new();
     for ch in query.chars() {
@@ -4779,6 +4791,57 @@ fn text_match_terms(query: &str) -> Vec<String> {
     terms.sort();
     terms.dedup();
     terms
+}
+
+pub(crate) fn matched_text_terms_in_fields<'a, I>(query: &str, fields: I) -> Vec<String>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let needle = query.trim().to_lowercase();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+
+    let terms = text_match_terms(&needle);
+    let lowered_fields = fields
+        .into_iter()
+        .map(|field| field.to_lowercase())
+        .collect::<Vec<_>>();
+    let mut matched_terms = terms
+        .into_iter()
+        .filter(|term| {
+            !term.is_empty()
+                && lowered_fields
+                    .iter()
+                    .any(|field| field.contains(term.as_str()))
+        })
+        .collect::<Vec<_>>();
+
+    if matched_terms.is_empty()
+        && lowered_fields
+            .iter()
+            .any(|field| field.contains(needle.as_str()))
+    {
+        matched_terms.push(needle);
+    }
+    matched_terms.sort();
+    matched_terms.dedup();
+    matched_terms
+}
+
+pub(crate) fn document_text_match_terms(query: &str, doc: &KnowledgeDocument) -> Vec<String> {
+    let summary_text = active_summary(doc).unwrap_or_default();
+    let rules_text = active_maintenance_rules(doc).unwrap_or_default();
+    matched_text_terms_in_fields(
+        query,
+        [
+            doc.title.as_str(),
+            doc.path.as_str(),
+            summary_text,
+            rules_text,
+            doc.body.as_str(),
+        ],
+    )
 }
 
 fn contains_all_text_match_terms(text: &str, terms: &[String]) -> bool {
@@ -4832,7 +4895,8 @@ pub fn query_documents(
             let Ok(doc) = load_document_by_path(working_dir, ty, &item.path) else {
                 continue;
             };
-            let Some((score, snippet, matched_section)) = score_document_text_match(query, &doc)
+            let Some((score, snippet, matched_section, matched_terms)) =
+                score_document_text_match_with_terms(query, &doc)
             else {
                 continue;
             };
@@ -4850,6 +4914,7 @@ pub fn query_documents(
                 has_summary: doc.summary_enabled && has_summary_content(doc.summary.as_deref()),
                 updated_at: doc.updated_at,
                 match_kind: "lexical".to_string(),
+                matched_terms,
                 semantic_score: None,
                 semantic_confidence: None,
                 estimated_tokens: None,

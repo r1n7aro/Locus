@@ -32,6 +32,7 @@ pub struct LexicalHit {
     pub path: String,
     pub score: f32,
     pub snippet: String,
+    pub matched_terms: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -396,6 +397,7 @@ impl KnowledgeTantivyIndex {
                 path: get_text(&retrieved, self.f_path),
                 score,
                 snippet: truncate_snippet(&body, 220),
+                matched_terms: Vec::new(),
             });
         }
 

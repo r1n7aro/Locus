@@ -766,6 +766,7 @@ struct AgentKnowledgeSearchHit {
     matched_section: Option<crate::knowledge_store::KnowledgeSearchMatchSection>,
     score: f32,
     match_kind: String,
+    matched_terms: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1951,16 +1952,20 @@ fn build_structure_section(
     Ok(lines.join("\n"))
 }
 
-fn build_search_section() -> String {
-    [
-        "### Search",
-        "1. Start with `knowledge_query` and split exact terms into `lexicalQuery` and intent-style retrieval into `semanticQuery` when useful.",
+fn build_search_section(semantic_search_enabled: bool) -> String {
+    let mut lines = vec!["### Search"];
+    if semantic_search_enabled {
+        lines.push("1. Start with `knowledge_query` and split exact terms into `lexicalQuery` and intent-style retrieval into `semanticQuery` when useful.");
+    } else {
+        lines.push("1. Start with `knowledge_query` and put exact terms, titles, paths, identifiers, or short keyword combinations into `lexicalQuery`.");
+    }
+    lines.extend([
         "2. Use `knowledge_read` when you know the target document path or need a specific document. For Skill packages, `skill/<package-id>` reads the package root `SKILL.md`.",
         "3. Use `knowledge_list` to browse entries under a type-prefixed directory path prefix such as `design/` or `skill/unity/`.",
         "4. In user-facing replies, cite knowledge documents with full type-prefixed paths such as `design/core-loop.md`, `memory/project/background.md`, `reference/unity/ugui-layout.md`, and `skill/builtin/profiler.md`.",
         "5. Cite Skill package documents with the package id under `skill/`, such as `skill/psd-to-ugui/SKILL.md` or `skill/psd-to-ugui/references/details.md`; cite full knowledge paths in user-facing replies.",
-    ]
-    .join("\n")
+    ]);
+    lines.join("\n")
 }
 
 fn build_maintenance_section(access_mode: KnowledgeAccessMode) -> String {
@@ -1982,10 +1987,15 @@ fn build_maintenance_section(access_mode: KnowledgeAccessMode) -> String {
     .join("\n")
 }
 
-fn build_tools_section(access_mode: KnowledgeAccessMode) -> String {
+fn build_tools_section(access_mode: KnowledgeAccessMode, semantic_search_enabled: bool) -> String {
+    let query_line = if semantic_search_enabled {
+        "- `knowledge_query`: Search knowledge with separate `lexicalQuery` and `semanticQuery` inputs, plus an optional type-prefixed `pathPrefix`."
+    } else {
+        "- `knowledge_query`: Search knowledge with `lexicalQuery` plus an optional type-prefixed `pathPrefix`."
+    };
     let mut lines = vec![
         "### Tools",
-        "- `knowledge_query`: Search knowledge with separate `lexicalQuery` and `semanticQuery` inputs, plus an optional type-prefixed `pathPrefix`.",
+        query_line,
         "- `knowledge_read`: Read a specific document by type-prefixed path. For Skill packages, `skill/<package-id>` reads the package root `SKILL.md` and `skill/<package-id>/docs/file.md` reads package child docs.",
         "- `knowledge_list`: Browse entries under a type-prefixed directory path prefix.",
     ];
@@ -2376,6 +2386,16 @@ impl AgentInstance {
         Self::has_selected_working_dir_value(&self.working_dir)
     }
 
+    fn knowledge_semantic_search_enabled(&self) -> bool {
+        if !self.has_selected_working_dir() {
+            return false;
+        }
+        let config = crate::knowledge_index::load_general_config(
+            &crate::knowledge_index::library_dir_for_working_dir(&self.working_dir),
+        );
+        config.enabled && config.semantic_search_enabled
+    }
+
     fn display_working_dir_value(working_dir: &str) -> String {
         let trimmed = working_dir.trim();
         if trimmed.is_empty() {
@@ -2661,9 +2681,13 @@ impl AgentInstance {
             sections.len()
         );
 
-        sections.push(build_search_section());
+        let semantic_search_enabled = self.knowledge_semantic_search_enabled();
+        sections.push(build_search_section(semantic_search_enabled));
         sections.push(build_maintenance_section(self.knowledge_access_mode));
-        sections.push(build_tools_section(self.knowledge_access_mode));
+        sections.push(build_tools_section(
+            self.knowledge_access_mode,
+            semantic_search_enabled,
+        ));
 
         if _include_memory {
             if let Ok(full_document_section) = build_l2_full_document_section(
@@ -3118,6 +3142,7 @@ impl AgentInstance {
         tool_names
             .iter()
             .filter_map(|name| self.tool_registry.resolve_api_tool(name))
+            .map(|tool| self.contextualize_api_tool(tool))
             .filter_map(|tool| {
                 let (name, description) = extract_api_tool_name_and_description(&tool)?;
                 let direct_loaded = direct_tool_names.contains(&name);
@@ -3269,8 +3294,71 @@ impl AgentInstance {
         self.build_system_prompt_parts().await.env_prompt
     }
 
+    fn knowledge_query_lexical_only_description() -> &'static str {
+        "Search the unified knowledge store with `lexicalQuery`. When lexical indexing is off, `lexicalQuery` falls back to direct text scanning. Returns plain-text ranked results with canonical type-prefixed `.md` document path, title, match metadata, matched lexical terms, and snippets from summary or body."
+    }
+
+    fn remove_knowledge_query_semantic_parameter(parameters: &mut serde_json::Value) {
+        if let Some(properties) = parameters
+            .get_mut("properties")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            properties.remove("semanticQuery");
+        }
+        if let Some(required) = parameters
+            .get_mut("required")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            required.retain(|item| item.as_str() != Some("semanticQuery"));
+        }
+    }
+
+    fn contextualize_tool_description(
+        &self,
+        name: &str,
+        description: String,
+        mut parameters: serde_json::Value,
+    ) -> (String, serde_json::Value) {
+        if name == "knowledge_query" && !self.knowledge_semantic_search_enabled() {
+            Self::remove_knowledge_query_semantic_parameter(&mut parameters);
+            (
+                Self::knowledge_query_lexical_only_description().to_string(),
+                parameters,
+            )
+        } else {
+            (description, parameters)
+        }
+    }
+
+    fn contextualize_api_tool(&self, mut tool: serde_json::Value) -> serde_json::Value {
+        let name = tool
+            .get("function")
+            .and_then(|function| function.get("name"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if name == "knowledge_query" && !self.knowledge_semantic_search_enabled() {
+            if let Some(function) = tool
+                .get_mut("function")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                function.insert(
+                    "description".to_string(),
+                    serde_json::json!(Self::knowledge_query_lexical_only_description()),
+                );
+                if let Some(parameters) = function.get_mut("parameters") {
+                    Self::remove_knowledge_query_semantic_parameter(parameters);
+                }
+            }
+        }
+        tool
+    }
+
     async fn build_api_tools(&self, tool_names: &[String]) -> Vec<serde_json::Value> {
-        self.tool_registry.resolve_api_tools(tool_names)
+        self.tool_registry
+            .resolve_api_tools(tool_names)
+            .into_iter()
+            .map(|tool| self.contextualize_api_tool(tool))
+            .collect()
     }
 
     ///
@@ -4523,6 +4611,7 @@ impl AgentInstance {
                 matched_section: item.matched_section,
                 score: item.score,
                 match_kind: item.match_kind,
+                matched_terms: item.matched_terms,
             })
             .collect()
     }
@@ -4636,6 +4725,10 @@ impl AgentInstance {
                 });
             }
             output.push_str(&format!(" | score={:.3}", item.score));
+            if !item.matched_terms.is_empty() {
+                output.push_str(" | terms=");
+                output.push_str(&item.matched_terms.join(", "));
+            }
 
             let snippet = item.snippet.trim();
             if !snippet.is_empty() {
@@ -8901,8 +8994,10 @@ impl AgentInstance {
                 }));
                 continue;
             };
+            let (description, parameters) =
+                self.contextualize_tool_description(&canonical, description, parameters);
             item.insert("description".to_string(), serde_json::json!(description));
-            item.insert("parameters".to_string(), parameters.clone());
+            item.insert("parameters".to_string(), parameters);
             item.insert(
                 "callWith".to_string(),
                 serde_json::json!(if direct_available {
@@ -13944,6 +14039,69 @@ PrefabInstance:
     }
 
     #[tokio::test]
+    async fn knowledge_query_schema_omits_semantic_query_when_semantic_search_disabled() {
+        let temp = tempdir().expect("temp dir");
+        let working_dir = temp.path().to_string_lossy().to_string();
+        let instance = test_agent_instance_with_tools_and_mode(
+            working_dir,
+            vec!["knowledge_query".to_string()],
+            KnowledgeAccessMode::Full,
+        );
+
+        let api_tools = instance
+            .build_api_tools(&["knowledge_query".to_string()])
+            .await;
+        let properties = api_tools[0]["function"]["parameters"]["properties"]
+            .as_object()
+            .expect("knowledge_query properties");
+
+        assert!(properties.contains_key("lexicalQuery"));
+        assert!(!properties.contains_key("semanticQuery"));
+
+        let load_result = instance
+            .execute_tool_load(&serde_json::json!({ "tools": ["knowledge_query"] }))
+            .await;
+        assert!(!load_result.is_error, "{}", load_result.output);
+        let load_json: serde_json::Value =
+            serde_json::from_str(&load_result.output).expect("tool_load json");
+        let load_properties = load_json["tools"][0]["parameters"]["properties"]
+            .as_object()
+            .expect("loaded knowledge_query properties");
+        assert!(load_properties.contains_key("lexicalQuery"));
+        assert!(!load_properties.contains_key("semanticQuery"));
+    }
+
+    #[tokio::test]
+    async fn knowledge_query_schema_keeps_semantic_query_when_semantic_search_enabled() {
+        let temp = tempdir().expect("temp dir");
+        let working_dir = temp.path().to_string_lossy().to_string();
+        crate::knowledge_index::save_general_config(
+            &crate::knowledge_index::library_dir_for_working_dir(&working_dir),
+            &crate::knowledge_index::KnowledgeGeneralConfig {
+                enabled: true,
+                lexical_search_enabled: false,
+                semantic_search_enabled: true,
+            },
+        )
+        .expect("save knowledge config");
+        let instance = test_agent_instance_with_tools_and_mode(
+            working_dir,
+            vec!["knowledge_query".to_string()],
+            KnowledgeAccessMode::Full,
+        );
+
+        let api_tools = instance
+            .build_api_tools(&["knowledge_query".to_string()])
+            .await;
+        let properties = api_tools[0]["function"]["parameters"]["properties"]
+            .as_object()
+            .expect("knowledge_query properties");
+
+        assert!(properties.contains_key("lexicalQuery"));
+        assert!(properties.contains_key("semanticQuery"));
+    }
+
+    #[tokio::test]
     async fn knowledge_access_disabled_omits_context_injection() {
         let temp = tempdir().expect("temp dir");
         let instance = test_agent_instance_with_tools_and_mode(
@@ -15485,11 +15643,13 @@ Create a reusable Skill.
             matched_section: Some(KnowledgeSearchMatchSection::Summary),
             score: 0.875,
             match_kind: "lexical".to_string(),
+            matched_terms: vec!["core".to_string(), "loop".to_string()],
         }]);
 
         assert!(output.contains("design/project-overview.md"));
         assert!(output.contains("Project Overview"));
         assert!(output.contains("match=lexical | section=summary | score=0.875"));
+        assert!(output.contains("terms=core, loop"));
         assert!(output.contains("Core loop summary"));
         assert!(!output.trim_start().starts_with('{'));
         assert!(!output.trim_start().starts_with('['));

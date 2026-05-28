@@ -761,6 +761,7 @@ struct FusionEntry {
     semantic_score: Option<f32>,
     section: String,
     snippet: String,
+    matched_terms: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -3368,12 +3369,14 @@ pub async fn query_documents(
                 semantic_score: None,
                 section: hit.section.clone(),
                 snippet: hit.snippet.clone(),
+                matched_terms: hit.matched_terms.clone(),
             });
         if entry.lexical_rank.is_none() {
             entry.lexical_rank = Some(rank);
             entry.lexical_kind = lexical_kind;
             entry.section = hit.section.clone();
             entry.snippet = hit.snippet.clone();
+            entry.matched_terms = hit.matched_terms.clone();
         }
     }
     for (rank, hit) in filtered_semantic.iter().enumerate() {
@@ -3387,6 +3390,7 @@ pub async fn query_documents(
                 semantic_score: None,
                 section: hit.section.clone(),
                 snippet: hit.snippet.clone(),
+                matched_terms: Vec::new(),
             });
         if entry.semantic_rank.is_none() {
             entry.semantic_rank = Some(rank);
@@ -3424,7 +3428,43 @@ pub async fn query_documents(
             {
                 score += 0.3;
             }
-            let match_kind = match (entry.lexical_rank.is_some(), entry.semantic_rank.is_some()) {
+            let has_lexical_match = entry.lexical_rank.is_some();
+            let has_semantic_match = entry.semantic_rank.is_some();
+            let matched_terms = if has_lexical_match && entry.matched_terms.is_empty() {
+                let fallback_terms = lexical_query
+                    .map(|query| {
+                        knowledge_store::matched_text_terms_in_fields(
+                            query,
+                            [
+                                document.item.title.as_str(),
+                                document.item.path.as_str(),
+                                entry.snippet.as_str(),
+                            ],
+                        )
+                    })
+                    .unwrap_or_default();
+                if fallback_terms.is_empty() {
+                    lexical_query
+                        .and_then(|query| {
+                            knowledge_store::load_document_by_path_with_app_root(
+                                working_dir,
+                                app_knowledge_dir,
+                                document.item.doc_type,
+                                &document.item.path,
+                            )
+                            .ok()
+                            .map(|doc| knowledge_store::document_text_match_terms(query, &doc))
+                        })
+                        .unwrap_or_default()
+                } else {
+                    fallback_terms
+                }
+            } else if has_lexical_match {
+                entry.matched_terms
+            } else {
+                Vec::new()
+            };
+            let match_kind = match (has_lexical_match, has_semantic_match) {
                 (true, true) => match entry.lexical_kind {
                     Some(KeywordSearchKind::TextScan) => "grepHybrid",
                     _ => "hybrid",
@@ -3451,6 +3491,7 @@ pub async fn query_documents(
                 has_summary: document.item.has_summary,
                 updated_at: document.item.updated_at,
                 match_kind: match_kind.to_string(),
+                matched_terms,
                 semantic_score: entry.semantic_score,
                 semantic_confidence: entry.semantic_score.map(semantic_confidence),
                 estimated_tokens: Some(document.estimated_tokens),
@@ -4366,7 +4407,12 @@ fn lexical_index_search_documents(
                 continue;
             }
             if seen_doc_ids.insert(hit.doc_id.clone()) {
-                filtered_hits.push(hit.clone());
+                let mut hit = hit.clone();
+                hit.matched_terms = knowledge_store::matched_text_terms_in_fields(
+                    query,
+                    [hit.title.as_str(), hit.path.as_str(), hit.snippet.as_str()],
+                );
+                filtered_hits.push(hit);
                 if filtered_hits.len() >= target_limit {
                     return Ok(filtered_hits);
                 }
@@ -4430,8 +4476,8 @@ fn text_scan_search_documents(
             if !access.lexical_enabled {
                 return None;
             }
-            let (score, snippet, matched_section) =
-                knowledge_store::score_document_text_match(query, &document)?;
+            let (score, snippet, matched_section, matched_terms) =
+                knowledge_store::score_document_text_match_with_terms(query, &document)?;
             Some(LexicalHit {
                 doc_id: document.id,
                 section: match_section_name(matched_section).to_string(),
@@ -4439,6 +4485,7 @@ fn text_scan_search_documents(
                 path: document.path,
                 score,
                 snippet: truncate_snippet(&snippet, 220),
+                matched_terms,
             })
         })
         .collect::<Vec<_>>();
@@ -5129,6 +5176,7 @@ mod tests {
             hit.id == "kd_test_design_doc"
                 && hit.match_kind == "grep"
                 && hit.matched_section == Some(KnowledgeSearchMatchSection::Summary)
+                && hit.matched_terms.contains(&"战斗核心".to_string())
         }));
         assert!(indexed_hits.is_empty());
     }
@@ -5158,6 +5206,8 @@ mod tests {
             hit.id == "kd_test_design_doc"
                 && hit.match_kind == "grep"
                 && hit.matched_section == Some(KnowledgeSearchMatchSection::Summary)
+                && hit.matched_terms.contains(&"战斗".to_string())
+                && hit.matched_terms.contains(&"核心".to_string())
         }));
     }
 
@@ -5249,6 +5299,7 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id, "kd_target_doc");
         assert_eq!(hits[0].match_kind, "lexical");
+        assert_eq!(hits[0].matched_terms, vec!["共享检索词".to_string()]);
     }
 
     #[tokio::test]

@@ -86,6 +86,7 @@ interface KnowledgeQueryPayload {
   score: number;
   snippet: string;
   matchedSection?: KnowledgeSearchResult["matchedSection"] | null;
+  matchedTerms?: string[];
   hasSummary: boolean;
   updatedAt: number;
   matchKind?: KnowledgeSearchResult["matchKind"];
@@ -397,6 +398,7 @@ export async function knowledgeQuery(
     snippet: result.snippet,
     matchKind: result.matchKind ?? "lexical",
     matchedSection: result.matchedSection ?? null,
+    matchedTerms: result.matchedTerms ?? [],
     semanticScore: result.semanticScore ?? null,
     semanticConfidence: result.semanticConfidence ?? null,
     estimatedTokens: result.estimatedTokens ?? undefined,

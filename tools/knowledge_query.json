@@ -1,5 +1,5 @@
 {
-  "description": "Search the unified knowledge store. Provide at least one of `lexicalQuery` or `semanticQuery`. When lexical indexing is off, `lexicalQuery` falls back to direct text scanning. Returns plain-text ranked results with canonical type-prefixed `.md` document path, title, match metadata, and snippets from summary or body.",
+  "description": "Search the unified knowledge store. Provide at least one of `lexicalQuery` or `semanticQuery`. When lexical indexing is off, `lexicalQuery` falls back to direct text scanning. Returns plain-text ranked results with canonical type-prefixed `.md` document path, title, match metadata, matched lexical terms, and snippets from summary or body.",
   "parameters": {
     "type": "object",
     "additionalProperties": false,

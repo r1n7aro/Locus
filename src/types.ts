@@ -1045,6 +1045,7 @@ export interface KnowledgeSearchResult {
   snippet: string;
   matchKind: KnowledgeSearchMatchKind;
   matchedSection?: KnowledgeSearchMatchSection | null;
+  matchedTerms?: string[];
   score: number;
   semanticScore?: number | null;
   semanticConfidence?: number | null;
