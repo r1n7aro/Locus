@@ -16,6 +16,8 @@ export interface DisplaySettings {
   changesAutoOpen: boolean;
   /** Auto-close file changes panel when a new round starts */
   changesAutoClose: boolean;
+  /** Enable hover preview popovers for file changes */
+  fileChangePopoverEnabled: boolean;
   /** Default target for reviewing chat file diffs */
   chatDiffReviewTarget: DiffReviewTarget;
   /** Default target for reviewing Git file diffs */
@@ -82,6 +84,7 @@ const defaults: DisplaySettings = {
   todoAutoOpen: true,
   changesAutoOpen: true,
   changesAutoClose: true,
+  fileChangePopoverEnabled: true,
   chatDiffReviewTarget: "window",
   gitDiffReviewTarget: "window",
   rightAlignUserMessages: true,

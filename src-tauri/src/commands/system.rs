@@ -153,6 +153,23 @@ pub fn set_dynamic_tool_loading_mode(
         .map_err(crate::error::AppError::from)
 }
 
+#[tauri::command]
+pub fn get_view_windows_above_main(
+    config: State<'_, std::sync::Arc<crate::config::AppConfig>>,
+) -> Result<bool, crate::error::AppError> {
+    Ok(config.view_windows_above_main_enabled())
+}
+
+#[tauri::command]
+pub fn set_view_windows_above_main(
+    value: bool,
+    config: State<'_, std::sync::Arc<crate::config::AppConfig>>,
+) -> Result<(), crate::error::AppError> {
+    config
+        .set_view_windows_above_main_enabled(value)
+        .map_err(crate::error::AppError::from)
+}
+
 #[cfg(windows)]
 pub(crate) fn ensure_windows_notification_identity(app_handle: &AppHandle) -> Result<(), String> {
     use winreg::enums::HKEY_CURRENT_USER;

@@ -61,6 +61,14 @@ export function setDynamicToolLoadingMode(value: DynamicToolLoadingMode): Promis
   });
 }
 
+export function getViewWindowsAboveMain(): Promise<boolean> {
+  return ipcInvoke<boolean>("get_view_windows_above_main");
+}
+
+export function setViewWindowsAboveMain(value: boolean): Promise<void> {
+  return ipcInvoke<void>("set_view_windows_above_main", { value });
+}
+
 export function getProxyStatus(): Promise<ProxyStatus> {
   return ipcInvoke<ProxyStatus>("get_proxy_status");
 }

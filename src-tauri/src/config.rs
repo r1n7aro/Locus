@@ -25,6 +25,10 @@ fn default_debug_flag() -> Arc<AtomicBool> {
     Arc::new(AtomicBool::new(false))
 }
 
+fn default_view_windows_above_main() -> Arc<AtomicBool> {
+    Arc::new(AtomicBool::new(false))
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum AppCloseBehavior {
@@ -140,6 +144,11 @@ pub struct AppConfig {
         with = "serde_string_mutex"
     )]
     pub default_skill_package_namespace: Arc<Mutex<String>>,
+    #[serde(
+        default = "default_view_windows_above_main",
+        with = "serde_atomic_bool"
+    )]
+    pub view_windows_above_main: Arc<AtomicBool>,
     #[serde(skip)]
     config_path: Arc<Mutex<Option<PathBuf>>>,
 }
@@ -179,6 +188,7 @@ impl AppConfig {
             close_behavior: default_close_behavior(),
             dynamic_tool_loading_mode: default_dynamic_tool_loading_mode(),
             default_skill_package_namespace: default_skill_package_namespace(),
+            view_windows_above_main: default_view_windows_above_main(),
             config_path: Arc::new(Mutex::new(Some(primary_path.to_path_buf()))),
         };
 
@@ -306,6 +316,15 @@ impl AppConfig {
             .default_skill_package_namespace
             .lock()
             .map_err(|e| format!("default skill package namespace lock poisoned: {}", e))? = value;
+        self.persist()
+    }
+
+    pub fn view_windows_above_main_enabled(&self) -> bool {
+        self.view_windows_above_main.load(Ordering::Relaxed)
+    }
+
+    pub fn set_view_windows_above_main_enabled(&self, value: bool) -> Result<(), String> {
+        self.view_windows_above_main.store(value, Ordering::Relaxed);
         self.persist()
     }
 
@@ -508,6 +527,24 @@ mod tests {
     }
 
     #[test]
+    fn view_windows_above_main_defaults_to_disabled() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("config.json");
+        fs::write(
+            &config_path,
+            r#"{
+  "model": "legacy-model",
+  "debug": false
+}"#,
+        )
+        .expect("legacy config");
+
+        let config = AppConfig::load_from_path(&config_path);
+
+        assert!(!config.view_windows_above_main_enabled());
+    }
+
+    #[test]
     fn close_behavior_persists_minimize_to_tray() {
         let temp = tempfile::tempdir().expect("tempdir");
         let config_path = temp.path().join("config.json");
@@ -550,5 +587,19 @@ mod tests {
 
         let reloaded = AppConfig::load_from_path(&config_path);
         assert_eq!(reloaded.default_skill_package_namespace(), "studio.tools");
+    }
+
+    #[test]
+    fn view_windows_above_main_persists_enabled() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("config.json");
+        let config = AppConfig::load_from_path(&config_path);
+
+        config
+            .set_view_windows_above_main_enabled(true)
+            .expect("persist view window z-order setting");
+
+        let reloaded = AppConfig::load_from_path(&config_path);
+        assert!(reloaded.view_windows_above_main_enabled());
     }
 }

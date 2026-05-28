@@ -37,7 +37,7 @@ pub fn collect_all(app_handle: &tauri::AppHandle) -> Result<Vec<ConfigEntry>, Ap
     let mut entries = Vec::with_capacity(40);
 
     collect_general(&mut entries);
-    collect_display(&mut entries);
+    collect_display(app_handle, &mut entries);
     collect_notifications(&mut entries);
     collect_api(&mut entries);
     collect_models(&mut entries);
@@ -54,7 +54,7 @@ pub fn collect_by_category(
     let mut entries = Vec::new();
     match category {
         "general" => collect_general(&mut entries),
-        "display" => collect_display(&mut entries),
+        "display" => collect_display(app_handle, &mut entries),
         "notifications" => collect_notifications(&mut entries),
         "api" => collect_api(&mut entries),
         "models" => collect_models(&mut entries),
@@ -98,7 +98,7 @@ fn collect_general(out: &mut Vec<ConfigEntry>) {
 
 // ── display ──────────────────────────────────────────────────────────────────
 
-fn collect_display(out: &mut Vec<ConfigEntry>) {
+fn collect_display(app_handle: &tauri::AppHandle, out: &mut Vec<ConfigEntry>) {
     out.push(ConfigEntry {
         key: "display.theme.main_window".into(),
         category: "display".into(),
@@ -116,6 +116,19 @@ fn collect_display(out: &mut Vec<ConfigEntry>) {
                 .into(),
         storage: "localStorage: locus-unity-embed-theme-preference".into(),
         current_value: "(frontend-only)".into(),
+    });
+    let view_windows_above_main = app_handle
+        .try_state::<Arc<crate::config::AppConfig>>()
+        .map(|config| config.view_windows_above_main_enabled())
+        .unwrap_or(false);
+    out.push(ConfigEntry {
+        key: "display.view_windows_above_main".into(),
+        category: "display".into(),
+        label: "Keep View Windows Above Main Window".into(),
+        description: "Open View windows as owned windows so they stay above the Locus main window."
+            .into(),
+        storage: "persistent_config_dir/config.json → view_windows_above_main".into(),
+        current_value: view_windows_above_main.to_string(),
     });
 
     for (key_suffix, label, desc) in [

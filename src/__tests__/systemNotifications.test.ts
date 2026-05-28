@@ -26,6 +26,7 @@ function createDisplayState(): DisplaySettings {
     todoAutoOpen: true,
     changesAutoOpen: true,
     changesAutoClose: true,
+    fileChangePopoverEnabled: true,
     chatDiffReviewTarget: "inline",
     gitDiffReviewTarget: "inline",
     rightAlignUserMessages: false,
@@ -114,6 +115,7 @@ describe("systemNotifications", () => {
     displayState.todoAutoOpen = true;
     displayState.changesAutoOpen = true;
     displayState.changesAutoClose = true;
+    displayState.fileChangePopoverEnabled = true;
     displayState.chatDiffReviewTarget = "inline";
     displayState.gitDiffReviewTarget = "inline";
     displayState.compactToolCalls = true;

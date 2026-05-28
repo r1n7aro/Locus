@@ -78,7 +78,7 @@ type ViewContextMenuState =
 const STORAGE_KEY_EXPANDED = "locus:sessionPanelExpanded";
 const STORAGE_KEY_VIEW_EXPANDED = "locus:sessionPanelViewExpanded";
 const STORAGE_KEY_VIEW_SPLIT = "locus:sessionPanelViewSplitRatio";
-const DEFAULT_VIEW_SECTION_RATIO = 0.52;
+const DEFAULT_VIEW_SECTION_RATIO = 1 / 3;
 const MIN_VIEW_SECTION_RATIO = 0.24;
 const MAX_VIEW_SECTION_RATIO = 0.72;
 const VIEW_RESIZE_HANDLE_PX = 10;
@@ -1490,7 +1490,7 @@ function ctxArchive() {
 }
 
 .sp-session-list {
-  flex: 1 1 40%;
+  flex: 1 1 66.667%;
   min-height: 96px;
   height: 0;
   overflow-y: auto;
@@ -1527,7 +1527,7 @@ function ctxArchive() {
 }
 
 .sp-view-section {
-  flex: 0 0 52%;
+  flex: 0 0 33.333%;
   min-height: 140px;
   display: flex;
   flex-direction: column;

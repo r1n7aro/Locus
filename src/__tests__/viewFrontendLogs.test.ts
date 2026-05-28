@@ -76,7 +76,8 @@ describe("View frontend logs", () => {
     expect(runtime).toContain("let retry_interval = Duration::from_millis(200)");
     expect(runtime).toContain("window.emit(VIEW_AUTOMATION_REQUEST_EVENT, event.clone())");
     expect(host).toContain("function shouldHandleAutomationRequest");
-    expect(host.indexOf("unsubscribeAutomation = await")).toBeLessThan(host.indexOf("await loadView()"));
+    const mountedBlock = host.slice(host.indexOf("onMounted(async () => {"), host.indexOf("onUnmounted(() => {"));
+    expect(mountedBlock.indexOf("unsubscribeAutomation = await")).toBeLessThan(mountedBlock.indexOf("await loadView()"));
     expect(host).toContain("function dispatchDragSequence");
     expect(host).toContain("new PointerEvent");
     expect(canvas).toContain("function trySetPointerCapture");

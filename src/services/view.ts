@@ -138,6 +138,18 @@ export interface ViewRunResult {
   packageRoot: string;
 }
 
+export interface ViewSetTabHostRequest {
+  hostLabel: string;
+  viewIds: string[];
+}
+
+export interface ViewDetachTabRequest {
+  viewId: string;
+  sourceHostLabel?: string | null;
+  x?: number | null;
+  y?: number | null;
+}
+
 export const VIEW_UNITY_CONNECTION_REQUIRED_ERROR_CODE = "view.unity_connection_required";
 
 export interface ViewCompileScriptRequest {
@@ -503,6 +515,14 @@ export function viewReload(viewId: string): Promise<ViewPackageSummary> {
 
 export function viewRun(viewId: string): Promise<ViewRunResult> {
   return ipcInvoke<ViewRunResult>("view_run", { viewId });
+}
+
+export function viewSetTabHost(request: ViewSetTabHostRequest): Promise<void> {
+  return ipcInvoke<void>("view_set_tab_host", { request });
+}
+
+export function viewDetachTab(request: ViewDetachTabRequest): Promise<ViewRunResult> {
+  return ipcInvoke<ViewRunResult>("view_detach_tab", { request });
 }
 
 export function viewRequiresUnityConnection(

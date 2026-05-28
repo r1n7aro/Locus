@@ -1,6 +1,12 @@
 <script setup lang="ts">
 import { computed, markRaw, nextTick, onMounted, onUnmounted, ref, shallowRef, watch, type Component } from "vue";
-import { getCurrentWindow } from "@tauri-apps/api/window";
+import {
+  cursorPosition,
+  getCurrentWindow,
+  Window as TauriWindow,
+  type Window as TauriWindowHandle,
+} from "@tauri-apps/api/window";
+import { emitTo, type UnlistenFn } from "@tauri-apps/api/event";
 import { t } from "../i18n";
 import { searchWorkspaceAssets } from "../services/asset";
 import { normalizeAppError } from "../services/errors";
@@ -25,11 +31,13 @@ import {
   viewBindingRead,
   viewBindingWrite,
   viewCallScript,
+  viewDetachTab,
   viewHostIdFromLocation,
   viewOpenFrontendLog,
   viewRead,
   viewReadFrontendLog,
   viewRequiresUnityConnection,
+  viewSetTabHost,
   type ViewFrontendLogEntry,
   type ViewFrontendLogLevel,
   type ViewAutomationRequest,
@@ -58,13 +66,49 @@ import { createViewRuntimeComponent } from "./view/viewRuntime";
 
 const CONSOLE_LOG_LEVELS: ViewFrontendLogLevel[] = ["debug", "log", "info", "warn", "error"];
 const AUTOMATION_REQUEST_TTL_MS = 120_000;
+const VIEW_HOST_TABS_MERGE_EVENT = "view-host-tabs-merge";
+const VIEW_HOST_TABS_SELECT_EVENT = "view-host-tabs-select";
+const VIEW_HOST_WINDOW_LABEL_PREFIX = "view-";
+const VIEW_HOST_TAB_DROP_HEIGHT_PX = 40;
+const VIEW_HOST_TAB_DRAG_THRESHOLD_PX = 8;
+const VIEW_HOST_TAB_DRAG_FRAME_MS = 16;
+const VIEW_HOST_DETACH_OFFSET_X = 96;
+const VIEW_HOST_DETACH_OFFSET_Y = 18;
+
+interface ViewHostTab {
+  id: string;
+  title: string;
+  packageRoot: string;
+  icon?: string | null;
+}
+
+interface ViewHostTabsMergePayload {
+  sourceLabel: string;
+  viewIds: string[];
+  activeViewId: string;
+}
+
+interface ViewHostTabsSelectPayload {
+  viewId: string;
+}
+
+interface ViewHostDragState {
+  pointerId: number;
+  tabId: string;
+  originX: number;
+  originY: number;
+  cursorX: number;
+  cursorY: number;
+  dragging: boolean;
+  raf: number | null;
+}
 
 interface AutomationPoint {
   x: number;
   y: number;
 }
 
-let appWindow: ReturnType<typeof getCurrentWindow> | null = null;
+let appWindow: TauriWindowHandle | null = null;
 if (hasTauriWindowRuntime()) {
   try {
     appWindow = getCurrentWindow();
@@ -73,20 +117,32 @@ if (hasTauriWindowRuntime()) {
   }
 }
 
-const viewId = viewHostIdFromLocation();
+const initialViewId = viewHostIdFromLocation();
+const currentWindowLabel = appWindow?.label ?? "";
+const activeViewId = ref(initialViewId);
+const tabs = ref<ViewHostTab[]>(initialViewId
+  ? [{ id: initialViewId, title: initialViewId, packageRoot: "" }]
+  : []);
 const detail = ref<ViewPackageDetail | null>(null);
 const runtimeComponent = shallowRef<Component | null>(null);
 const loading = ref(false);
 const error = ref("");
 const isMaximized = ref(false);
+const alwaysOnTop = ref(false);
+const tabDragState = ref<ViewHostDragState | null>(null);
+const tabDropTargetLabel = ref("");
 const latestFrontendLog = ref<ViewFrontendLogEntry | null>(null);
 const runtimeFrameRef = ref<HTMLElement | null>(null);
 const embeddedLogbarSlot = shallowRef<HTMLElement | null>(null);
 let unsubscribeReload: RuntimeUnsubscribe | null = null;
 let restoreConsoleLogCapture: (() => void) | null = null;
+let unlistenTabMerge: UnlistenFn | null = null;
+let unlistenTabSelect: UnlistenFn | null = null;
 let loadViewPromise: Promise<void> | null = null;
 let reloadTimer: ReturnType<typeof setTimeout> | null = null;
 let reloadQueued = false;
+let suppressNextTabClickId = "";
+let suppressNextTabClickTimer: ReturnType<typeof setTimeout> | null = null;
 let statusbarObserver: MutationObserver | null = null;
 let embeddedLogbarSyncTimer: ReturnType<typeof setTimeout> | null = null;
 let unsubscribeAutomation: RuntimeUnsubscribe | null = null;
@@ -104,10 +160,11 @@ const RUNTIME_STATUSBAR_SELECTOR = [
 ].join(", ");
 
 const manifest = computed(() => detail.value?.manifest ?? null);
+const activeTab = computed(() => tabs.value.find((tab) => tab.id === activeViewId.value) ?? null);
 const windowTitle = computed(() =>
-  manifest.value?.name || detail.value?.summary.name || viewId || t("view.host.title"),
+  manifest.value?.name || detail.value?.summary.name || activeTab.value?.title || activeViewId.value || t("view.host.title"),
 );
-const runtimeLabel = computed(() => manifest.value?.name || viewId || t("view.host.untitled"));
+const runtimeLabel = computed(() => manifest.value?.name || activeViewId.value || t("view.host.untitled"));
 const latestFrontendLogLevel = computed(() => latestFrontendLog.value?.level ?? "log");
 const latestFrontendLogText = computed(() => {
   const entry = latestFrontendLog.value;
@@ -131,6 +188,17 @@ async function syncMaximizedState() {
 
 async function minimizeWindow() {
   await appWindow?.minimize().catch(() => undefined);
+}
+
+async function toggleAlwaysOnTop() {
+  if (!appWindow) return;
+  alwaysOnTop.value = !alwaysOnTop.value;
+  try {
+    await appWindow.setAlwaysOnTop(alwaysOnTop.value);
+  } catch (topError) {
+    alwaysOnTop.value = !alwaysOnTop.value;
+    console.error("[view-host] Failed to set always on top", topError);
+  }
 }
 
 async function toggleMaximizeWindow() {
@@ -237,6 +305,7 @@ function formatErrorEvent(event: ErrorEvent) {
 }
 
 async function refreshLatestFrontendLog() {
+  const viewId = activeViewId.value;
   if (!viewId) return;
   try {
     const entries = await viewReadFrontendLog({ viewId, limit: 1 });
@@ -247,12 +316,366 @@ async function refreshLatestFrontendLog() {
 }
 
 async function openFrontendLog() {
+  const viewId = activeViewId.value;
   if (!viewId) return;
   try {
     await viewOpenFrontendLog(viewId);
   } catch (openError) {
     console.error("[view-host] Failed to open frontend log", openError);
   }
+}
+
+function tabFromDetail(next: ViewPackageDetail): ViewHostTab {
+  return {
+    id: next.manifest.id,
+    title: next.manifest.name || next.summary.name || next.manifest.id,
+    packageRoot: next.summary.packageRoot,
+    icon: next.manifest.icon ?? next.summary.icon ?? null,
+  };
+}
+
+function tabFromSummary(summary: ViewPackageSummary): ViewHostTab {
+  return {
+    id: summary.id,
+    title: summary.name || summary.id,
+    packageRoot: summary.packageRoot,
+    icon: summary.icon ?? null,
+  };
+}
+
+function normalizeTabIds(ids: string[]): string[] {
+  const seen = new Set<string>();
+  const normalized: string[] = [];
+  for (const id of ids) {
+    const value = String(id || "").trim();
+    if (!value || seen.has(value)) continue;
+    seen.add(value);
+    normalized.push(value);
+  }
+  return normalized;
+}
+
+function upsertTab(tab: ViewHostTab) {
+  const index = tabs.value.findIndex((item) => item.id === tab.id);
+  if (index >= 0) {
+    tabs.value = tabs.value.map((item, itemIndex) => itemIndex === index ? { ...item, ...tab } : item);
+    return;
+  }
+  tabs.value = [...tabs.value, tab];
+}
+
+function removeTab(tabId: string): ViewHostTab | null {
+  const index = tabs.value.findIndex((tab) => tab.id === tabId);
+  if (index < 0) return null;
+  const removed = tabs.value[index];
+  const nextTabs = tabs.value.filter((tab) => tab.id !== tabId);
+  tabs.value = nextTabs;
+  if (activeViewId.value === tabId) {
+    const nextActive = nextTabs[Math.min(index, nextTabs.length - 1)]?.id ?? "";
+    activeViewId.value = nextActive;
+    error.value = "";
+    runtimeComponent.value = null;
+    latestFrontendLog.value = null;
+    clearEmbeddedLogbarSlot();
+    refreshConsoleLogCapture();
+    if (nextActive) {
+      scheduleLoadView(0);
+      void refreshLatestFrontendLog();
+    }
+  }
+  return removed;
+}
+
+async function resolveViewTab(id: string): Promise<ViewHostTab> {
+  if (detail.value?.manifest.id === id) return tabFromDetail(detail.value);
+  const existing = tabs.value.find((tab) => tab.id === id);
+  try {
+    const next = await viewRead(id);
+    return tabFromDetail(next);
+  } catch {
+    return existing ?? { id, title: id, packageRoot: "" };
+  }
+}
+
+async function registerCurrentTabHost() {
+  if (!currentWindowLabel || !currentWindowLabel.startsWith(VIEW_HOST_WINDOW_LABEL_PREFIX)) return;
+  const viewIds = normalizeTabIds(tabs.value.map((tab) => tab.id));
+  if (viewIds.length === 0) return;
+  try {
+    await viewSetTabHost({ hostLabel: currentWindowLabel, viewIds });
+  } catch (hostError) {
+    console.warn("[view-host] Failed to register tab host", hostError);
+  }
+}
+
+function refreshConsoleLogCapture() {
+  restoreConsoleLogCapture?.();
+  restoreConsoleLogCapture = activeViewId.value
+    ? installViewConsoleLogCapture(activeViewId.value)
+    : null;
+}
+
+async function setActiveViewTab(viewId: string, options: { loadNow?: boolean } = {}) {
+  const normalized = String(viewId || "").trim();
+  if (!normalized) return;
+  if (!tabs.value.some((tab) => tab.id === normalized)) {
+    upsertTab(await resolveViewTab(normalized));
+  }
+  const changed = activeViewId.value !== normalized;
+  if (changed) {
+    activeViewId.value = normalized;
+    error.value = "";
+    runtimeComponent.value = null;
+    latestFrontendLog.value = null;
+    clearEmbeddedLogbarSlot();
+    refreshConsoleLogCapture();
+  }
+  void refreshLatestFrontendLog();
+  await registerCurrentTabHost();
+  if (options.loadNow) {
+    const inFlightLoad = loadViewPromise;
+    if (inFlightLoad) await inFlightLoad.catch(() => undefined);
+    await loadView();
+  } else if (changed) {
+    scheduleLoadView(0);
+  }
+}
+
+function suppressNextTabClick(tabId: string) {
+  suppressNextTabClickId = tabId;
+  if (suppressNextTabClickTimer) clearTimeout(suppressNextTabClickTimer);
+  suppressNextTabClickTimer = setTimeout(() => {
+    if (suppressNextTabClickId === tabId) suppressNextTabClickId = "";
+    suppressNextTabClickTimer = null;
+  }, 250);
+}
+
+function onTabClick(event: MouseEvent, tabId: string) {
+  if (suppressNextTabClickId === tabId) {
+    event.preventDefault();
+    suppressNextTabClickId = "";
+    if (suppressNextTabClickTimer) {
+      clearTimeout(suppressNextTabClickTimer);
+      suppressNextTabClickTimer = null;
+    }
+    return;
+  }
+  void setActiveViewTab(tabId);
+}
+
+async function applyMergedViewTabs(payload: ViewHostTabsMergePayload) {
+  const incomingIds = normalizeTabIds(payload.viewIds);
+  if (incomingIds.length === 0) return;
+  const nextIds = normalizeTabIds([...tabs.value.map((tab) => tab.id), ...incomingIds]);
+  const nextTabs = await Promise.all(nextIds.map((id) => resolveViewTab(id)));
+  tabs.value = nextTabs;
+  await setActiveViewTab(payload.activeViewId || incomingIds[incomingIds.length - 1] || nextIds[0] || activeViewId.value);
+  await registerCurrentTabHost();
+}
+
+async function selectHostedViewTab(payload: ViewHostTabsSelectPayload) {
+  await setActiveViewTab(payload.viewId, { loadNow: true });
+}
+
+async function findTabDropTargetAt(point: { x: number; y: number }): Promise<string> {
+  if (!currentWindowLabel) return "";
+  let windows: TauriWindowHandle[] = [];
+  try {
+    windows = await TauriWindow.getAll();
+  } catch {
+    return "";
+  }
+
+  for (const candidate of windows) {
+    if (
+      candidate.label === currentWindowLabel
+      || !candidate.label.startsWith(VIEW_HOST_WINDOW_LABEL_PREFIX)
+    ) {
+      continue;
+    }
+    try {
+      const [position, size] = await Promise.all([
+        candidate.outerPosition(),
+        candidate.outerSize(),
+      ]);
+      const withinX = point.x >= position.x && point.x <= position.x + size.width;
+      const withinY = point.y >= position.y && point.y <= position.y + size.height;
+      const withinDropBand = point.y >= position.y && point.y <= position.y + VIEW_HOST_TAB_DROP_HEIGHT_PX;
+      if (withinX && withinY && withinDropBand) return candidate.label;
+    } catch {
+      continue;
+    }
+  }
+  return "";
+}
+
+async function isCurrentTabBandAt(point: { x: number; y: number }): Promise<boolean> {
+  if (!appWindow) return false;
+  try {
+    const [position, size] = await Promise.all([
+      appWindow.outerPosition(),
+      appWindow.outerSize(),
+    ]);
+    const withinX = point.x >= position.x && point.x <= position.x + size.width;
+    const withinY = point.y >= position.y && point.y <= position.y + size.height;
+    const withinTabBand = point.y >= position.y && point.y <= position.y + VIEW_HOST_TAB_DROP_HEIGHT_PX;
+    return withinX && withinY && withinTabBand;
+  } catch {
+    return false;
+  }
+}
+
+async function updateTabDropTarget(point: { x: number; y: number }) {
+  tabDropTargetLabel.value = await findTabDropTargetAt(point);
+}
+
+function scheduleTabDragFrame() {
+  const state = tabDragState.value;
+  if (!state || state.raf !== null) return;
+  state.raf = window.setTimeout(() => {
+    const current = tabDragState.value;
+    if (!current) return;
+    current.raf = null;
+    void updateDraggedTabFrame();
+  }, VIEW_HOST_TAB_DRAG_FRAME_MS);
+}
+
+async function updateDraggedTabFrame() {
+  const state = tabDragState.value;
+  if (!state || !state.dragging) return;
+  try {
+    const cursor = await cursorPosition();
+    state.cursorX = cursor.x;
+    state.cursorY = cursor.y;
+    await updateTabDropTarget(cursor);
+  } catch (dragError) {
+    console.warn("[view-host] Failed to inspect View tab drag", dragError);
+  }
+  if (tabDragState.value?.dragging) scheduleTabDragFrame();
+}
+
+function onTabDragPointerMove(event: PointerEvent) {
+  const state = tabDragState.value;
+  if (!state || event.pointerId !== state.pointerId) return;
+  const distance = Math.hypot(event.screenX - state.originX, event.screenY - state.originY);
+  if (!state.dragging && distance >= VIEW_HOST_TAB_DRAG_THRESHOLD_PX) {
+    state.dragging = true;
+    scheduleTabDragFrame();
+  }
+  if (state.dragging) event.preventDefault();
+}
+
+async function mergeTabIntoWindow(tabId: string, targetLabel: string) {
+  if (!targetLabel || targetLabel === currentWindowLabel) return;
+  const tab = tabs.value.find((item) => item.id === tabId);
+  if (!tab) return;
+  await emitTo<ViewHostTabsMergePayload>(targetLabel, VIEW_HOST_TABS_MERGE_EVENT, {
+    sourceLabel: currentWindowLabel,
+    viewIds: [tab.id],
+    activeViewId: tab.id,
+  });
+  removeTab(tab.id);
+  if (tabs.value.length > 0) {
+    await registerCurrentTabHost();
+  }
+  const targetWindow = await TauriWindow.getByLabel(targetLabel).catch(() => null);
+  await targetWindow?.setFocus().catch(() => undefined);
+  if (tabs.value.length === 0) {
+    await appWindow?.close().catch(() => appWindow?.destroy().catch(() => undefined));
+  }
+}
+
+async function detachTab(tabId: string, point: { x: number; y: number }) {
+  if (tabs.value.length <= 1) return;
+  const tab = tabs.value.find((item) => item.id === tabId);
+  if (!tab) return;
+  removeTab(tab.id);
+  await registerCurrentTabHost();
+  try {
+    await viewDetachTab({
+      viewId: tab.id,
+      sourceHostLabel: currentWindowLabel,
+      x: Math.max(0, Math.round(point.x - VIEW_HOST_DETACH_OFFSET_X)),
+      y: Math.max(0, Math.round(point.y - VIEW_HOST_DETACH_OFFSET_Y)),
+    });
+  } catch (detachError) {
+    upsertTab(tab);
+    await setActiveViewTab(tab.id, { loadNow: true });
+    console.error("[view-host] Failed to detach View tab", detachError);
+  }
+}
+
+async function finishTabDrag(event?: PointerEvent) {
+  const state = tabDragState.value;
+  if (!state) return;
+  if (event && event.pointerId !== state.pointerId) return;
+  if (state.raf !== null) clearTimeout(state.raf);
+  tabDragState.value = null;
+  window.removeEventListener("pointermove", onTabDragPointerMove);
+  window.removeEventListener("pointerup", onTabDragPointerUp);
+  window.removeEventListener("pointercancel", onTabDragPointerCancel);
+
+  const wasDragging = state.dragging;
+  if (!wasDragging) {
+    tabDropTargetLabel.value = "";
+    return;
+  }
+  suppressNextTabClick(state.tabId);
+  let targetLabel = tabDropTargetLabel.value;
+  let releasePoint = { x: state.cursorX, y: state.cursorY };
+  try {
+    const cursor = await cursorPosition();
+    releasePoint = { x: cursor.x, y: cursor.y };
+    targetLabel = await findTabDropTargetAt(cursor) || targetLabel;
+  } catch {
+    targetLabel = targetLabel || "";
+  }
+  tabDropTargetLabel.value = "";
+  if (targetLabel) {
+    await mergeTabIntoWindow(state.tabId, targetLabel);
+    return;
+  }
+  if (await isCurrentTabBandAt(releasePoint)) {
+    return;
+  }
+  await detachTab(state.tabId, releasePoint);
+}
+
+function onTabDragPointerUp(event: PointerEvent) {
+  void finishTabDrag(event);
+}
+
+function onTabDragPointerCancel(event: PointerEvent) {
+  void finishTabDrag(event);
+}
+
+async function startTabDrag(event: PointerEvent, tabId: string) {
+  if (!appWindow || event.button !== 0 || event.detail > 1) return;
+  event.preventDefault();
+  if (tabId !== activeViewId.value) {
+    void setActiveViewTab(tabId);
+  }
+  let cursor: { x: number; y: number };
+  try {
+    cursor = await cursorPosition();
+  } catch (dragError) {
+    console.warn("[view-host] Failed to start View tab drag", dragError);
+    return;
+  }
+  (event.currentTarget as HTMLElement | null)?.setPointerCapture?.(event.pointerId);
+  tabDragState.value = {
+    pointerId: event.pointerId,
+    tabId,
+    originX: event.screenX,
+    originY: event.screenY,
+    cursorX: cursor.x,
+    cursorY: cursor.y,
+    dragging: false,
+    raf: null,
+  };
+  window.addEventListener("pointermove", onTabDragPointerMove);
+  window.addEventListener("pointerup", onTabDragPointerUp);
+  window.addEventListener("pointercancel", onTabDragPointerCancel);
 }
 
 function automationRoot(): HTMLElement {
@@ -388,7 +811,7 @@ function automationSnapshot(payload: Record<string, unknown> = {}) {
   const rect = root.getBoundingClientRect();
   return {
     ok: true,
-    viewId,
+    viewId: activeViewId.value,
     status: {
       loading: loading.value,
       error: error.value,
@@ -772,7 +1195,10 @@ function shouldHandleAutomationRequest(requestId: string): boolean {
 }
 
 async function handleAutomationRequest(request: ViewAutomationRequest) {
-  if (request.viewId !== viewId) return;
+  if (request.viewId !== activeViewId.value) {
+    if (!tabs.value.some((tab) => tab.id === request.viewId)) return;
+    await setActiveViewTab(request.viewId, { loadNow: true });
+  }
   if (!shouldHandleAutomationRequest(request.requestId)) return;
   const payload = request.payload || {};
   try {
@@ -1168,6 +1594,7 @@ async function loadView() {
     return loadViewPromise;
   }
 
+  const viewId = activeViewId.value;
   if (!viewId) {
     error.value = t("view.host.missingId");
     return;
@@ -1179,9 +1606,13 @@ async function loadView() {
     error.value = "";
     try {
       const next = await viewRead(viewId);
+      if (activeViewId.value !== viewId) return;
       detail.value = next;
+      upsertTab(tabFromDetail(next));
+      void registerCurrentTabHost();
       if (viewRequiresUnityConnection(next.manifest)) {
         const status = await checkUnityConnectionStatus();
+        if (activeViewId.value !== viewId) return;
         if (!status.connected) {
           error.value = t("view.host.unityConnectionRequired");
           runtimeComponent.value = null;
@@ -1249,8 +1680,22 @@ watch(runtimeComponent, () => {
 
 onMounted(async () => {
   void syncMaximizedState();
-  restoreConsoleLogCapture = installViewConsoleLogCapture(viewId);
+  refreshConsoleLogCapture();
   void refreshLatestFrontendLog();
+  if (appWindow) {
+    unlistenTabMerge = await appWindow.listen<ViewHostTabsMergePayload>(
+      VIEW_HOST_TABS_MERGE_EVENT,
+      (event) => {
+        void applyMergedViewTabs(event.payload);
+      },
+    );
+    unlistenTabSelect = await appWindow.listen<ViewHostTabsSelectPayload>(
+      VIEW_HOST_TABS_SELECT_EVENT,
+      (event) => {
+        void selectHostedViewTab(event.payload);
+      },
+    );
+  }
   unsubscribeAutomation = await getLocusRuntime().subscribe<ViewAutomationRequest>(
     "view-automation-request",
     (payload) => {
@@ -1260,7 +1705,10 @@ onMounted(async () => {
   unsubscribeReload = await getLocusRuntime().subscribe<ViewPackageSummary>(
     "view-package-reloaded",
     (payload) => {
-      if (payload.id === viewId) scheduleLoadView();
+      if (!tabs.value.some((tab) => tab.id === payload.id)) return;
+      upsertTab(tabFromSummary(payload));
+      void registerCurrentTabHost();
+      if (payload.id === activeViewId.value) scheduleLoadView();
     },
   );
   await loadView();
@@ -1269,6 +1717,13 @@ onMounted(async () => {
 });
 
 onUnmounted(() => {
+  if (tabDragState.value?.raf !== null) clearTimeout(tabDragState.value.raf);
+  tabDragState.value = null;
+  window.removeEventListener("pointermove", onTabDragPointerMove);
+  window.removeEventListener("pointerup", onTabDragPointerUp);
+  window.removeEventListener("pointercancel", onTabDragPointerCancel);
+  if (suppressNextTabClickTimer) clearTimeout(suppressNextTabClickTimer);
+  suppressNextTabClickTimer = null;
   if (reloadTimer) clearTimeout(reloadTimer);
   reloadTimer = null;
   if (embeddedLogbarSyncTimer) clearTimeout(embeddedLogbarSyncTimer);
@@ -1280,6 +1735,10 @@ onUnmounted(() => {
   unsubscribeReload = null;
   unsubscribeAutomation?.();
   unsubscribeAutomation = null;
+  unlistenTabMerge?.();
+  unlistenTabMerge = null;
+  unlistenTabSelect?.();
+  unlistenTabSelect = null;
   handledAutomationRequests.clear();
   restoreConsoleLogCapture?.();
   restoreConsoleLogCapture = null;
@@ -1287,12 +1746,52 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <main class="view-host-window">
+  <main
+    class="view-host-window"
+    :class="{ 'is-tab-dragging': tabDragState?.dragging, 'is-tab-drop-target': !!tabDropTargetLabel }"
+  >
     <header class="view-host-titlebar" data-tauri-drag-region @dblclick="toggleMaximizeWindow">
-      <div class="view-host-title" data-tauri-drag-region>
-        <span class="view-host-title-main" data-tauri-drag-region>{{ windowTitle }}</span>
+      <div
+        class="view-host-tabs"
+        data-tauri-drag-region
+        role="tablist"
+        @dblclick.stop="toggleMaximizeWindow"
+      >
+        <button
+          v-for="tab in tabs"
+          :key="tab.id"
+          type="button"
+          class="view-host-tab"
+          :class="{ active: tab.id === activeViewId }"
+          :title="tab.title"
+          role="tab"
+          :aria-selected="tab.id === activeViewId"
+          @pointerdown="startTabDrag($event, tab.id)"
+          @click="onTabClick($event, tab.id)"
+        >
+          <span class="view-host-tab-title">{{ tab.title }}</span>
+        </button>
+        <span v-if="tabs.length === 0" class="view-host-title-main">{{ windowTitle }}</span>
       </div>
       <div class="view-host-window-controls" data-window-no-drag @dblclick.stop>
+        <button
+          type="button"
+          class="view-host-win-ctrl-btn"
+          :class="{ 'view-host-win-pinned': alwaysOnTop }"
+          :title="alwaysOnTop ? t('app.pin.unpin') : t('app.pin.pin')"
+          @click="toggleAlwaysOnTop"
+        >
+          <svg
+            viewBox="0 0 16 16"
+            width="12"
+            height="12"
+            fill="currentColor"
+            :style="{ transform: alwaysOnTop ? 'rotate(0deg)' : 'rotate(45deg)' }"
+            aria-hidden="true"
+          >
+            <path d="M9.828 1.282a.75.75 0 0 1 .955.073l3.862 3.862a.75.75 0 0 1-.564 1.272h-.862L11.2 8.507a2.25 2.25 0 0 1-.039 2.994l-.56.56a.75.75 0 0 1-1.06 0L7.05 9.57l-3.72 3.72a.75.75 0 1 1-1.06-1.06l3.72-3.72L3.5 6.02a.75.75 0 0 1 0-1.06l.56-.56a2.25 2.25 0 0 1 2.994-.04L9.07 2.342V1.48a.75.75 0 0 1 .758-.198z"/>
+          </svg>
+        </button>
         <button
           type="button"
           class="view-host-win-ctrl-btn"
@@ -1390,15 +1889,70 @@ onUnmounted(() => {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  padding: 0 0 0 10px;
+  padding: 0 0 0 8px;
   border-bottom: 1px solid var(--border-color);
   background: var(--sidebar-bg);
 }
 
-.view-host-title {
+.view-host-tabs {
+  -webkit-app-region: drag;
+  align-self: stretch;
   min-width: 0;
+  flex: 1;
   display: flex;
+  align-items: flex-end;
+  gap: 2px;
+  overflow: hidden;
+}
+
+.view-host-tab {
+  -webkit-app-region: no-drag;
+  max-width: 220px;
+  min-width: 96px;
+  height: 29px;
+  min-height: 29px;
+  display: inline-flex;
   align-items: center;
+  padding: 0 12px;
+  border: 1px solid var(--border-color);
+  border-bottom-color: transparent;
+  border-radius: 5px 5px 0 0;
+  background: color-mix(in srgb, var(--panel-bg) 64%, var(--sidebar-bg) 36%);
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 550;
+  text-align: left;
+  cursor: grab;
+  user-select: none;
+  transition: background 0.1s ease, border-color 0.1s ease, color 0.1s ease;
+}
+
+.view-host-tab:hover,
+.view-host-tab:focus-visible {
+  border-color: var(--border-strong);
+  border-bottom-color: transparent;
+  background: color-mix(in srgb, var(--panel-bg) 78%, var(--sidebar-bg) 22%);
+  color: var(--text-color);
+  outline: none;
+}
+
+.view-host-tab.active {
+  height: 31px;
+  min-height: 31px;
+  border-color: var(--border-strong);
+  border-bottom-color: var(--bg-color);
+  background: var(--bg-color);
+  color: var(--text-color);
+  box-shadow: inset 0 2px 0 var(--accent-color);
+  font-weight: 650;
+}
+
+.view-host-tab-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .view-host-title-main {
@@ -1410,6 +1964,18 @@ onUnmounted(() => {
   line-height: 1;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.view-host-window.is-tab-dragging {
+  cursor: grabbing;
+}
+
+.view-host-window.is-tab-dragging .view-host-tab {
+  cursor: grabbing;
+}
+
+.view-host-window.is-tab-drop-target .view-host-titlebar {
+  box-shadow: inset 0 2px 0 var(--accent-color);
 }
 
 .view-host-window-controls {
@@ -1438,6 +2004,10 @@ onUnmounted(() => {
   background: var(--hover-bg);
   color: var(--text-color);
   outline: none;
+}
+
+.view-host-win-ctrl-btn.view-host-win-pinned {
+  color: var(--accent-color);
 }
 
 .view-host-win-close:hover,

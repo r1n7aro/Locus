@@ -40,6 +40,7 @@ const displaySettingsState = vi.hoisted(() => ({
   todoAutoOpen: true,
   changesAutoOpen: true,
   changesAutoClose: true,
+  fileChangePopoverEnabled: true,
   chatDiffReviewTarget: "inline",
   gitDiffReviewTarget: "inline",
   rightAlignUserMessages: false,
@@ -156,6 +157,7 @@ describe("chat session panel state", () => {
     displaySettingsState.todoAutoOpen = true;
     displaySettingsState.changesAutoOpen = true;
     displaySettingsState.changesAutoClose = true;
+    displaySettingsState.fileChangePopoverEnabled = true;
     displaySettingsState.rightAlignUserMessages = false;
     displaySettingsState.compactToolCalls = true;
     displaySettingsState.hideThinkingBlocks = true;

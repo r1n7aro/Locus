@@ -6,9 +6,9 @@ use crate::error::AppError;
 use crate::view::{
     append_view_frontend_log_sync, call_view_script, compile_view_script,
     complete_view_automation_request, create_view_folder_sync, create_view_sync_with_scope,
-    delete_view_entry_sync, emit_view_reload, emit_view_tree_changed, export_view_package_sync,
-    import_view_package_sync, list_view_tree_sync, list_views_sync, move_view_entry_sync,
-    open_view_frontend_log_sync, open_view_window, parse_view_create_request,
+    delete_view_entry_sync, detach_view_tab_window, emit_view_reload, emit_view_tree_changed,
+    export_view_package_sync, import_view_package_sync, list_view_tree_sync, list_views_sync,
+    move_view_entry_sync, open_view_frontend_log_sync, open_view_window, parse_view_create_request,
     read_view_frontend_log_sync, read_view_sync, reload_view_sync, supported_view_templates,
     view_binding_apply as view_binding_apply_impl,
     view_binding_discover as view_binding_discover_impl,
@@ -17,10 +17,11 @@ use crate::view::{
     ViewBindingDiscoverRequest, ViewBindingDiscoverResult, ViewBindingReadRequest,
     ViewBindingReadResult, ViewBindingWriteRequest, ViewBindingWriteResult, ViewCallScriptRequest,
     ViewCallScriptResult, ViewCompileScriptRequest, ViewCompileScriptResult,
-    ViewCreateFolderRequest, ViewDeleteEntryRequest, ViewExportPackageRequest, ViewFolderSummary,
-    ViewFrontendLogEntry, ViewFrontendLogReadRequest, ViewFrontendLogRequest,
-    ViewImportPackageRequest, ViewMoveEntryRequest, ViewPackageDetail, ViewPackageImportResult,
-    ViewPackageSummary, ViewRunResult, ViewTemplateSummary, ViewTreeSnapshot,
+    ViewCreateFolderRequest, ViewDeleteEntryRequest, ViewDetachTabRequest,
+    ViewExportPackageRequest, ViewFolderSummary, ViewFrontendLogEntry, ViewFrontendLogReadRequest,
+    ViewFrontendLogRequest, ViewImportPackageRequest, ViewMoveEntryRequest, ViewPackageDetail,
+    ViewPackageImportResult, ViewPackageSummary, ViewRunResult, ViewSetTabHostRequest,
+    ViewTemplateSummary, ViewTreeSnapshot,
 };
 use crate::workspace::Workspace;
 
@@ -139,12 +140,41 @@ pub async fn view_reload(
 pub async fn view_run(
     view_id: String,
     workspace: State<'_, Arc<Workspace>>,
+    config: State<'_, Arc<crate::config::AppConfig>>,
     app_handle: AppHandle,
 ) -> Result<ViewRunResult, AppError> {
     let working_dir = workspace.path.read().await.clone();
-    open_view_window(&app_handle, &working_dir, &view_id)
-        .await
-        .map_err(Into::into)
+    open_view_window(
+        &app_handle,
+        &working_dir,
+        &view_id,
+        config.view_windows_above_main_enabled(),
+    )
+    .await
+    .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn view_set_tab_host(request: ViewSetTabHostRequest) -> Result<(), AppError> {
+    crate::view::set_view_tab_host_sync(request).map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn view_detach_tab(
+    request: ViewDetachTabRequest,
+    workspace: State<'_, Arc<Workspace>>,
+    config: State<'_, Arc<crate::config::AppConfig>>,
+    app_handle: AppHandle,
+) -> Result<ViewRunResult, AppError> {
+    let working_dir = workspace.path.read().await.clone();
+    detach_view_tab_window(
+        &app_handle,
+        &working_dir,
+        request,
+        config.view_windows_above_main_enabled(),
+    )
+    .await
+    .map_err(Into::into)
 }
 
 #[tauri::command]

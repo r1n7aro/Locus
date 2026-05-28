@@ -37,6 +37,9 @@ describe("View sidebar settings", () => {
     expect(chatView).toContain(":show-views=\"displaySettings.showViewsInSessionPanel\"");
 
     expect(sessionPanel).toContain("const showSessionViews = computed(() => props.showViews !== false)");
+    expect(sessionPanel).toContain("const DEFAULT_VIEW_SECTION_RATIO = 1 / 3;");
+    expect(sessionPanel).toContain("flex: 1 1 66.667%;");
+    expect(sessionPanel).toContain("flex: 0 0 33.333%;");
     expect(sessionPanel).toContain("view-package-reloaded");
     expect(sessionPanel).toContain("class=\"sp-view-resize\"");
     expect(sessionPanel).toContain(":icon=\"HelpCircle\"");

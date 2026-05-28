@@ -18,11 +18,14 @@ pub const VIEW_RELOAD_EVENT: &str = "view-package-reloaded";
 pub const VIEW_TREE_CHANGED_EVENT: &str = "view-tree-changed";
 pub const VIEW_AUTOMATION_REQUEST_EVENT: &str = "view-automation-request";
 
+const MAIN_WINDOW_LABEL: &str = "main";
 const VIEW_HOST_ROUTE: &str = "/view-host";
+const VIEW_HOST_TABS_SELECT_EVENT: &str = "view-host-tabs-select";
 const VIEW_FRONTEND_LOG_REL_PATH: &str = ".locus/logs/frontend.log";
 const VIEW_FRONTEND_LOG_MAX_CHARS: usize = 16_384;
 const VIEW_PACKAGE_ARCHIVE_MAX_ENTRIES: usize = 20_000;
 const VIEW_PACKAGE_ARCHIVE_MAX_UNCOMPRESSED_BYTES: u64 = 256 * 1024 * 1024;
+const VIEW_WINDOW_LABEL_PREFIX: &str = "view-";
 
 mod templates;
 
@@ -265,6 +268,25 @@ pub struct ViewRunResult {
     pub window_label: String,
     pub host_url: String,
     pub package_root: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ViewSetTabHostRequest {
+    pub host_label: String,
+    pub view_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ViewDetachTabRequest {
+    pub view_id: String,
+    #[serde(default)]
+    pub source_host_label: Option<String>,
+    #[serde(default)]
+    pub x: Option<f64>,
+    #[serde(default)]
+    pub y: Option<f64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1975,28 +1997,121 @@ pub fn reload_view_sync(working_dir: &str, view_id: &str) -> Result<ViewPackageS
     Ok(detail.summary)
 }
 
-pub async fn open_view_window(
-    app_handle: &AppHandle,
-    working_dir: &str,
-    view_id: &str,
-) -> Result<ViewRunResult, String> {
-    let detail = read_view_sync(working_dir, view_id)?;
-    ensure_view_open_requirements(working_dir, &detail.manifest).await?;
-    let id = detail.summary.id.clone();
-    let label = view_window_label(&id);
-    let host_url = format!("{}?id={}", VIEW_HOST_ROUTE, id);
+fn view_tab_hosts() -> &'static Mutex<HashMap<String, String>> {
+    static VIEW_TAB_HOSTS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    VIEW_TAB_HOSTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
-    if let Some(window) = app_handle.get_webview_window(&label) {
-        window
-            .set_focus()
-            .map_err(|e| format!("Failed to focus View window: {}", e))?;
+fn sanitize_view_host_label(label: &str) -> Result<String, String> {
+    let normalized = label.trim();
+    if !normalized.starts_with(VIEW_WINDOW_LABEL_PREFIX)
+        || normalized.len() <= VIEW_WINDOW_LABEL_PREFIX.len()
+    {
+        return Err(format!("Invalid View host window label: {}", label));
+    }
+    Ok(normalized.to_string())
+}
+
+pub fn set_view_tab_host_sync(request: ViewSetTabHostRequest) -> Result<(), String> {
+    let host_label = sanitize_view_host_label(&request.host_label)?;
+    let mut view_ids = Vec::new();
+    for view_id in request.view_ids {
+        let normalized = normalize_view_id(&view_id)?;
+        if !view_ids.contains(&normalized) {
+            view_ids.push(normalized);
+        }
+    }
+    if view_ids.is_empty() {
+        return Err("View tab host must contain at least one View id.".to_string());
+    }
+
+    let mut hosts = view_tab_hosts()
+        .lock()
+        .map_err(|_| "View tab host registry is unavailable".to_string())?;
+    hosts.retain(|view_id, label| label != &host_label && !view_ids.contains(view_id));
+    for view_id in view_ids {
+        hosts.insert(view_id, host_label.clone());
+    }
+    Ok(())
+}
+
+fn registered_view_host_label(view_id: &str) -> Option<String> {
+    view_tab_hosts()
+        .lock()
+        .ok()
+        .and_then(|hosts| hosts.get(view_id).cloned())
+}
+
+fn clear_registered_view_host(view_id: &str) {
+    if let Ok(mut hosts) = view_tab_hosts().lock() {
+        hosts.remove(view_id);
+    }
+}
+
+fn active_view_window_label(app_handle: &AppHandle, view_id: &str) -> String {
+    let default_label = view_window_label(view_id);
+    let Some(host_label) = registered_view_host_label(view_id) else {
+        return default_label;
+    };
+    if app_handle.get_webview_window(&host_label).is_some() {
+        return host_label;
+    }
+    clear_registered_view_host(view_id);
+    default_label
+}
+
+fn emit_view_host_tab_select(app_handle: &AppHandle, window_label: &str, view_id: &str) {
+    if let Some(window) = app_handle.get_webview_window(window_label) {
+        let _ = window.emit(
+            VIEW_HOST_TABS_SELECT_EVENT,
+            serde_json::json!({ "viewId": view_id }),
+        );
+    }
+}
+
+fn detached_view_window_label(view_id: &str) -> String {
+    let suffix = uuid::Uuid::new_v4()
+        .simple()
+        .to_string()
+        .chars()
+        .take(8)
+        .collect::<String>();
+    format!("{}{}-{}", VIEW_WINDOW_LABEL_PREFIX, view_id, suffix)
+}
+
+fn build_view_window(
+    app_handle: &AppHandle,
+    label: &str,
+    host_url: &str,
+    title: &str,
+    position: Option<(f64, f64)>,
+    view_windows_above_main: bool,
+) -> Result<(), String> {
+    let builder = tauri::WebviewWindowBuilder::new(
+        app_handle,
+        label,
+        WebviewUrl::App(host_url.to_string().into()),
+    )
+    .title(title.to_string());
+    let main_window = if view_windows_above_main {
+        app_handle.get_webview_window(MAIN_WINDOW_LABEL)
     } else {
-        tauri::WebviewWindowBuilder::new(
-            app_handle,
-            &label,
-            WebviewUrl::App(host_url.clone().into()),
-        )
-        .title(format!("{} - Locus View", detail.summary.name))
+        None
+    };
+    let builder = if let Some(main_window) = main_window {
+        builder
+            .parent(&main_window)
+            .map_err(|e| format!("Failed to attach View window to main window: {}", e))?
+    } else {
+        builder
+    };
+    let builder = if let Some((x, y)) = position {
+        builder.position(x, y)
+    } else {
+        builder
+    };
+
+    builder
         .inner_size(1180.0, 760.0)
         .min_inner_size(760.0, 480.0)
         .decorations(false)
@@ -2004,8 +2119,129 @@ pub async fn open_view_window(
         .visible(true)
         .disable_drag_drop_handler()
         .build()
-        .map_err(|e| format!("Failed to open View window: {}", e))?;
+        .map(|_| ())
+        .map_err(|e| format!("Failed to open View window: {}", e))
+}
+
+pub async fn open_view_window(
+    app_handle: &AppHandle,
+    working_dir: &str,
+    view_id: &str,
+    view_windows_above_main: bool,
+) -> Result<ViewRunResult, String> {
+    let detail = read_view_sync(working_dir, view_id)?;
+    ensure_view_open_requirements(working_dir, &detail.manifest).await?;
+    let id = detail.summary.id.clone();
+    let label = view_window_label(&id);
+    let host_url = format!("{}?id={}", VIEW_HOST_ROUTE, id);
+
+    if let Some(host_label) = registered_view_host_label(&id) {
+        if host_label != label {
+            if let Some(window) = app_handle.get_webview_window(&host_label) {
+                emit_view_host_tab_select(app_handle, &host_label, &id);
+                window
+                    .set_focus()
+                    .map_err(|e| format!("Failed to focus View window: {}", e))?;
+                if let Err(error) = start_view_file_watcher(app_handle, working_dir, &id) {
+                    eprintln!(
+                        "[Locus] failed to watch View package '{}' for reload: {}",
+                        id, error
+                    );
+                }
+                return Ok(ViewRunResult {
+                    id,
+                    window_label: host_label,
+                    host_url,
+                    package_root: detail.summary.package_root,
+                });
+            }
+            clear_registered_view_host(&id);
+        }
     }
+
+    if let Some(window) = app_handle.get_webview_window(&label) {
+        emit_view_host_tab_select(app_handle, &label, &id);
+        window
+            .set_focus()
+            .map_err(|e| format!("Failed to focus View window: {}", e))?;
+    } else {
+        build_view_window(
+            app_handle,
+            &label,
+            &host_url,
+            &format!("{} - Locus View", detail.summary.name),
+            None,
+            view_windows_above_main,
+        )?;
+    }
+
+    let _ = set_view_tab_host_sync(ViewSetTabHostRequest {
+        host_label: label.clone(),
+        view_ids: vec![id.clone()],
+    });
+
+    if let Err(error) = start_view_file_watcher(app_handle, working_dir, &id) {
+        eprintln!(
+            "[Locus] failed to watch View package '{}' for reload: {}",
+            id, error
+        );
+    }
+
+    Ok(ViewRunResult {
+        id,
+        window_label: label,
+        host_url,
+        package_root: detail.summary.package_root,
+    })
+}
+
+pub async fn detach_view_tab_window(
+    app_handle: &AppHandle,
+    working_dir: &str,
+    request: ViewDetachTabRequest,
+    view_windows_above_main: bool,
+) -> Result<ViewRunResult, String> {
+    let detail = read_view_sync(working_dir, &request.view_id)?;
+    ensure_view_open_requirements(working_dir, &detail.manifest).await?;
+    let id = detail.summary.id.clone();
+    let default_label = view_window_label(&id);
+    let source_label = request
+        .source_host_label
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_default();
+    let label = if source_label == default_label {
+        detached_view_window_label(&id)
+    } else {
+        default_label
+    };
+    let host_url = format!("{}?id={}", VIEW_HOST_ROUTE, id);
+    let position = match (request.x, request.y) {
+        (Some(x), Some(y)) => Some((x.max(0.0), y.max(0.0))),
+        _ => None,
+    };
+
+    if let Some(window) = app_handle.get_webview_window(&label) {
+        emit_view_host_tab_select(app_handle, &label, &id);
+        window
+            .set_focus()
+            .map_err(|e| format!("Failed to focus View window: {}", e))?;
+    } else {
+        build_view_window(
+            app_handle,
+            &label,
+            &host_url,
+            &format!("{} - Locus View", detail.summary.name),
+            position,
+            view_windows_above_main,
+        )?;
+    }
+
+    let _ = set_view_tab_host_sync(ViewSetTabHostRequest {
+        host_label: label.clone(),
+        view_ids: vec![id.clone()],
+    });
 
     if let Err(error) = start_view_file_watcher(app_handle, working_dir, &id) {
         eprintln!(
@@ -2052,10 +2288,11 @@ pub async fn request_view_automation(
     payload: serde_json::Value,
     timeout_ms: u64,
 ) -> Result<serde_json::Value, String> {
-    let label = view_window_label(view_id);
+    let label = active_view_window_label(app_handle, view_id);
     let window = app_handle
         .get_webview_window(&label)
         .ok_or_else(|| format!("View '{}' is not open. Use view_run first.", view_id))?;
+    emit_view_host_tab_select(app_handle, &label, view_id);
     let store = app_handle.state::<std::sync::Arc<ViewAutomationStore>>();
     let request_id = format!("view-auto-{}", uuid::Uuid::new_v4());
     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -2137,10 +2374,22 @@ pub async fn capture_view_window(
         Microsoft::Web::WebView2::Win32::ICoreWebView2,
     };
 
-    let label = view_window_label(view_id);
+    let label = active_view_window_label(app_handle, view_id);
     let window = app_handle
         .get_webview_window(&label)
         .ok_or_else(|| format!("View '{}' is not open. Use view_run first.", view_id))?;
+    emit_view_host_tab_select(app_handle, &label, view_id);
+    let _ = request_view_automation(
+        app_handle,
+        view_id,
+        "wait",
+        serde_json::json!({
+            "condition": "runtimeReady",
+            "timeoutMs": 3000,
+        }),
+        3500,
+    )
+    .await;
     let (tx, rx) = tokio::sync::oneshot::channel::<Result<String, String>>();
     let tx = std::sync::Arc::new(std::sync::Mutex::new(Some(tx)));
 
