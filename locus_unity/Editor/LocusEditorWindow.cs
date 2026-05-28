@@ -40,6 +40,21 @@ namespace Locus
         private static volatile bool _globalAssetDragStateSendInFlight;
         private static double _nextGlobalAssetDragStateAt;
         private static string _lastGlobalAssetDragSignature = "";
+        private static readonly DroppedAssetRef[] EmptyDroppedAssetRefs = new DroppedAssetRef[0];
+        private static readonly DroppedAssetRefKeyComparer DroppedAssetRefKeys =
+            new DroppedAssetRefKeyComparer();
+        private static readonly List<DroppedAssetRef> DroppedAssetRefsScratch =
+            new List<DroppedAssetRef>(16);
+        private static readonly HashSet<DroppedAssetRefKey> DroppedAssetRefsSeenScratch =
+            new HashSet<DroppedAssetRefKey>(DroppedAssetRefKeys);
+        private static readonly List<DroppedAssetRef> SelectedAssetRefsScratch =
+            new List<DroppedAssetRef>(16);
+        private static readonly HashSet<DroppedAssetRefKey> SelectedAssetRefsSeenScratch =
+            new HashSet<DroppedAssetRefKey>(DroppedAssetRefKeys);
+        private static readonly List<DroppedAssetRef> SanitizedAssetRefsScratch =
+            new List<DroppedAssetRef>(16);
+        private static readonly HashSet<DroppedAssetRefKey> SanitizedAssetRefsSeenScratch =
+            new HashSet<DroppedAssetRefKey>(DroppedAssetRefKeys);
         private double _nextSyncAt;
         private double _resizeBoostUntil;
         private volatile bool _sendInFlight;
@@ -95,6 +110,37 @@ namespace Locus
             public string source;
         }
 
+        private struct DroppedAssetRefKey
+        {
+            public readonly string Kind;
+            public readonly string Path;
+
+            public DroppedAssetRefKey(string kind, string path)
+            {
+                Kind = kind ?? "";
+                Path = path ?? "";
+            }
+        }
+
+        private sealed class DroppedAssetRefKeyComparer : IEqualityComparer<DroppedAssetRefKey>
+        {
+            public bool Equals(DroppedAssetRefKey left, DroppedAssetRefKey right)
+            {
+                return string.Equals(left.Kind, right.Kind, StringComparison.Ordinal)
+                    && string.Equals(left.Path, right.Path, StringComparison.OrdinalIgnoreCase);
+            }
+
+            public int GetHashCode(DroppedAssetRefKey key)
+            {
+                unchecked
+                {
+                    int kindHash = StringComparer.Ordinal.GetHashCode(key.Kind ?? "");
+                    int pathHash = StringComparer.OrdinalIgnoreCase.GetHashCode(key.Path ?? "");
+                    return (kindHash * 397) ^ pathHash;
+                }
+            }
+        }
+
         private sealed class LocusDesktopInstall
         {
             public static readonly LocusDesktopInstall NotFound = new LocusDesktopInstall(false, "");
@@ -139,6 +185,18 @@ namespace Locus
                 }
             }
             return queued;
+        }
+
+        internal static void CancelOutboundAssetDrag()
+        {
+            LocusExternalAssetDragBridge.CancelAssetDrag();
+            foreach (LocusEditorWindow window in Resources.FindObjectsOfTypeAll<LocusEditorWindow>())
+            {
+                if (window == null)
+                    continue;
+                window._statusMessage = "Unity drag reference cleared.";
+                window.Repaint();
+            }
         }
 
         [MenuItem("Assets/Send to Locus", false, 0)]
@@ -363,13 +421,7 @@ namespace Locus
             DroppedAssetRef[] assetRefs = BuildDroppedAssetRefs();
             if (assetRefs.Length == 0)
             {
-                if (_lastGlobalAssetDragSignature.Length > 0)
-                {
-                    _lastGlobalAssetDragSignature = "";
-                    _nextGlobalAssetDragStateAt = 0d;
-                    SendAssetDragStateMessageOnce(assetRefs);
-                }
-                _lastGlobalAssetDragSignature = "";
+                ClearPublishedUnityAssetDragState();
                 return;
             }
 
@@ -383,6 +435,34 @@ namespace Locus
             _lastGlobalAssetDragSignature = signature;
             _nextGlobalAssetDragStateAt = now + AssetDragStateRefreshSeconds;
             SendAssetDragStateMessageOnce(assetRefs);
+        }
+
+        internal static bool HasCurrentUnityDragAndDropRefs()
+        {
+            return HasAnyDragAndDropObjectReferences()
+                || HasAnyDragAndDropPaths();
+        }
+
+        internal static void ClearPublishedUnityAssetDragState()
+        {
+            if (_lastGlobalAssetDragSignature.Length == 0)
+                return;
+
+            _lastGlobalAssetDragSignature = "";
+            _nextGlobalAssetDragStateAt = 0d;
+            SendAssetDragStateMessageOnce(EmptyDroppedAssetRefs);
+        }
+
+        private static bool HasAnyDragAndDropObjectReferences()
+        {
+            UnityEngine.Object[] objects = DragAndDrop.objectReferences;
+            return objects != null && objects.Length > 0;
+        }
+
+        private static bool HasAnyDragAndDropPaths()
+        {
+            string[] paths = DragAndDrop.paths;
+            return paths != null && paths.Length > 0;
         }
 
         private static void SendAssetDragStateMessageOnce(DroppedAssetRef[] assetRefs)
@@ -464,78 +544,94 @@ namespace Locus
 
         private static DroppedAssetRef[] BuildDroppedAssetRefs()
         {
-            List<DroppedAssetRef> refs = new List<DroppedAssetRef>();
-            HashSet<string> seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            List<DroppedAssetRef> refs = DroppedAssetRefsScratch;
+            HashSet<DroppedAssetRefKey> seen = DroppedAssetRefsSeenScratch;
 
-            UnityEngine.Object[] objects = DragAndDrop.objectReferences;
-            if (objects != null)
+            try
             {
-                foreach (UnityEngine.Object obj in objects)
+                UnityEngine.Object[] objects = DragAndDrop.objectReferences;
+                if (objects != null)
                 {
-                    DroppedAssetRef assetRef = BuildDroppedObjectRef(obj);
-                    AddDroppedAssetRef(refs, seen, assetRef);
-                }
-            }
-
-            string[] paths = DragAndDrop.paths;
-            if (paths != null)
-            {
-                foreach (string path in paths)
-                {
-                    string normalizedPath = NormalizeProjectRelativePath(path);
-                    if (!IsSupportedUnityRefPath(normalizedPath))
-                        continue;
-                    AddDroppedAssetRef(refs, seen, new DroppedAssetRef
+                    foreach (UnityEngine.Object obj in objects)
                     {
-                        path = normalizedPath,
-                        kind = "asset",
-                        name = Path.GetFileNameWithoutExtension(normalizedPath),
-                        typeLabel = "",
-                        source = "unity"
-                    });
+                        DroppedAssetRef assetRef = BuildDroppedObjectRef(obj);
+                        AddDroppedAssetRef(refs, seen, assetRef);
+                    }
                 }
-            }
 
-            return refs.ToArray();
+                string[] paths = DragAndDrop.paths;
+                if (paths != null)
+                {
+                    foreach (string path in paths)
+                    {
+                        string normalizedPath = NormalizeProjectRelativePath(path);
+                        if (!IsSupportedUnityRefPath(normalizedPath))
+                            continue;
+                        AddDroppedAssetRef(refs, seen, new DroppedAssetRef
+                        {
+                            path = normalizedPath,
+                            kind = "asset",
+                            name = Path.GetFileNameWithoutExtension(normalizedPath),
+                            typeLabel = "",
+                            source = "unity"
+                        });
+                    }
+                }
+
+                return refs.Count == 0 ? EmptyDroppedAssetRefs : refs.ToArray();
+            }
+            finally
+            {
+                refs.Clear();
+                seen.Clear();
+            }
         }
 
         private static DroppedAssetRef[] BuildSelectedAssetRefs()
         {
-            List<DroppedAssetRef> refs = new List<DroppedAssetRef>();
-            HashSet<string> seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            List<DroppedAssetRef> refs = SelectedAssetRefsScratch;
+            HashSet<DroppedAssetRefKey> seen = SelectedAssetRefsSeenScratch;
 
-            UnityEngine.Object[] objects = Selection.objects;
-            if (objects != null)
+            try
             {
-                foreach (UnityEngine.Object obj in objects)
+                UnityEngine.Object[] objects = Selection.objects;
+                if (objects != null)
                 {
-                    DroppedAssetRef assetRef = BuildDroppedObjectRef(obj);
-                    AddDroppedAssetRef(refs, seen, assetRef);
-                }
-            }
-
-            string[] assetGuids = Selection.assetGUIDs;
-            if (assetGuids != null)
-            {
-                foreach (string guid in assetGuids)
-                {
-                    string path = NormalizeUnityPath(AssetDatabase.GUIDToAssetPath(guid));
-                    if (!IsSupportedUnityRefPath(path))
-                        continue;
-
-                    UnityEngine.Object obj = AssetDatabase.LoadMainAssetAtPath(path);
-                    AddDroppedAssetRef(refs, seen, new DroppedAssetRef
+                    foreach (UnityEngine.Object obj in objects)
                     {
-                        path = path,
-                        kind = "asset",
-                        name = obj != null ? obj.name : Path.GetFileNameWithoutExtension(path),
-                        typeLabel = obj != null ? obj.GetType().Name : "",
-                        source = "unity"
-                    });
+                        DroppedAssetRef assetRef = BuildDroppedObjectRef(obj);
+                        AddDroppedAssetRef(refs, seen, assetRef);
+                    }
                 }
-            }
 
-            return refs.ToArray();
+                string[] assetGuids = Selection.assetGUIDs;
+                if (assetGuids != null)
+                {
+                    foreach (string guid in assetGuids)
+                    {
+                        string path = NormalizeUnityPath(AssetDatabase.GUIDToAssetPath(guid));
+                        if (!IsSupportedUnityRefPath(path))
+                            continue;
+
+                        UnityEngine.Object obj = AssetDatabase.LoadMainAssetAtPath(path);
+                        AddDroppedAssetRef(refs, seen, new DroppedAssetRef
+                        {
+                            path = path,
+                            kind = "asset",
+                            name = obj != null ? obj.name : Path.GetFileNameWithoutExtension(path),
+                            typeLabel = obj != null ? obj.GetType().Name : "",
+                            source = "unity"
+                        });
+                    }
+                }
+
+                return refs.Count == 0 ? EmptyDroppedAssetRefs : refs.ToArray();
+            }
+            finally
+            {
+                refs.Clear();
+                seen.Clear();
+            }
         }
 
         private static string BuildAssetRefsSignature(DroppedAssetRef[] assetRefs)
@@ -556,35 +652,43 @@ namespace Locus
         private static DroppedAssetRef[] SanitizeOutboundAssetDragRefs(DroppedAssetRef[] assetRefs)
         {
             if (assetRefs == null || assetRefs.Length == 0)
-                return new DroppedAssetRef[0];
+                return EmptyDroppedAssetRefs;
 
-            List<DroppedAssetRef> sanitized = new List<DroppedAssetRef>();
-            HashSet<string> seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            foreach (DroppedAssetRef assetRef in assetRefs)
+            List<DroppedAssetRef> sanitized = SanitizedAssetRefsScratch;
+            HashSet<DroppedAssetRefKey> seen = SanitizedAssetRefsSeenScratch;
+
+            try
             {
-                if (assetRef == null)
-                    continue;
-
-                string path = NormalizeUnityPath(assetRef.path);
-                string kind = (assetRef.kind ?? "").Trim();
-                if (string.IsNullOrEmpty(path) || (kind != "asset" && kind != "sceneObject"))
-                    continue;
-
-                string key = kind + "\n" + path;
-                if (!seen.Add(key))
-                    continue;
-
-                sanitized.Add(new DroppedAssetRef
+                foreach (DroppedAssetRef assetRef in assetRefs)
                 {
-                    path = path,
-                    kind = kind,
-                    name = (assetRef.name ?? "").Trim(),
-                    typeLabel = (assetRef.typeLabel ?? "").Trim(),
-                    source = (assetRef.source ?? "").Trim()
-                });
-            }
+                    if (assetRef == null)
+                        continue;
 
-            return sanitized.ToArray();
+                    string path = NormalizeUnityPath(assetRef.path);
+                    string kind = (assetRef.kind ?? "").Trim();
+                    if (string.IsNullOrEmpty(path) || (kind != "asset" && kind != "sceneObject"))
+                        continue;
+
+                    if (!seen.Add(new DroppedAssetRefKey(kind, path)))
+                        continue;
+
+                    sanitized.Add(new DroppedAssetRef
+                    {
+                        path = path,
+                        kind = kind,
+                        name = (assetRef.name ?? "").Trim(),
+                        typeLabel = (assetRef.typeLabel ?? "").Trim(),
+                        source = (assetRef.source ?? "").Trim()
+                    });
+                }
+
+                return sanitized.Count == 0 ? EmptyDroppedAssetRefs : sanitized.ToArray();
+            }
+            finally
+            {
+                sanitized.Clear();
+                seen.Clear();
+            }
         }
 
         private static DroppedAssetRef BuildDroppedObjectRef(UnityEngine.Object obj)
@@ -636,18 +740,14 @@ namespace Locus
 
         private static void AddDroppedAssetRef(
             List<DroppedAssetRef> refs,
-            HashSet<string> seen,
+            HashSet<DroppedAssetRefKey> seen,
             DroppedAssetRef assetRef)
         {
             if (assetRef == null || string.IsNullOrEmpty(assetRef.path))
                 return;
 
-            string key = assetRef.kind + "\n" + assetRef.path;
-            if (seen.Contains(key))
-                return;
-
-            seen.Add(key);
-            refs.Add(assetRef);
+            if (seen.Add(new DroppedAssetRefKey(assetRef.kind, assetRef.path)))
+                refs.Add(assetRef);
         }
 
         private static string BuildHierarchyPath(Transform transform)

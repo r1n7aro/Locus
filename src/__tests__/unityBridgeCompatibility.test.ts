@@ -32,6 +32,35 @@ describe("unityBridgeCompatibility", () => {
     expect(transport).toContain(".filter(|value| !value.is_empty())");
   });
 
+  it("samples Unity editor state only for confirmed desktop bridge work", () => {
+    const bridge = read("locus_unity/Editor/LocusBridge.cs");
+    const pump = bridge.slice(
+      bridge.indexOf("private static void PumpMainThreadQueue()"),
+      bridge.indexOf("private static bool HasDesktopPipeConnection()"),
+    );
+    const statusHandler = bridge.slice(
+      bridge.indexOf("private static async Task<PipeEnvelope> HandleStatus"),
+      bridge.indexOf("private static string BuildCachedEditorStatusMessage"),
+    );
+
+    expect(bridge).toContain("private static volatile bool _desktopPipeConnected;");
+    expect(bridge).toContain("if (ReferenceEquals(_currentServer, server))");
+    expect(bridge).toContain("_desktopPipeConnected = true;");
+    expect(bridge).toContain("_desktopPipeConnected = false;");
+    expect(pump).toContain("bool desktopConnected = HasDesktopPipeConnection();");
+    expect(pump).toContain("bool hasRuntimeWork = HasMainThreadRuntimeWork();");
+    expect(pump).toContain("if (desktopConnected || hasRuntimeWork)");
+    expect(pump).toContain("RefreshCachedEditorState();");
+    expect(pump).toMatch(/if \(_activeRunStatesSession != null\)\s+PumpRunStates\(\);/);
+    expect(pump).toMatch(/if \(HasActiveExecuteCodeAsyncRuntime\(\)\)\s+PumpExecuteCodeAsyncRuntime\(\);/);
+    expect(pump).toMatch(/if \(desktopConnected\)\s+MaybeSendEditorUpdateEvent\(\);/);
+    expect(bridge).toContain('case "status":');
+    expect(bridge).toContain("return await HandleStatus(reqId);");
+    expect(statusHandler).toContain("PostToMainThread(delegate");
+    expect(statusHandler).toContain("RefreshCachedEditorState();");
+    expect(statusHandler).toContain("BuildCachedEditorStatusMessage()");
+  });
+
   it("keeps transient View assemblies out of the Unity type index", () => {
     const typeIndex = read("locus_unity/Editor/LocusBridge.TypeIndex.cs");
     const viewScripts = read("locus_unity/Editor/LocusBridge.ViewScripts.cs");

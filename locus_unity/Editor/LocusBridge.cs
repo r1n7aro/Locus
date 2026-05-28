@@ -45,6 +45,7 @@ namespace Locus
 
         private static NamedPipeServerStream _currentServer;
         private static StreamWriter _currentWriter;
+        private static volatile bool _desktopPipeConnected;
 
         private static readonly UTF8Encoding Utf8NoBom = new UTF8Encoding(false);
 
@@ -408,6 +409,7 @@ namespace Locus
 
                     _currentWriter = null;
                     _currentServer = null;
+                    _desktopPipeConnected = false;
                 }
             }
             catch
@@ -657,13 +659,17 @@ namespace Locus
 
         private static void PumpMainThreadQueue()
         {
-            _isPlaying = EditorApplication.isPlaying;
-            _isPaused = EditorApplication.isPaused;
-            _activeScenePath = EditorSceneManager.GetActiveScene().path ?? "";
+            bool desktopConnected = HasDesktopPipeConnection();
+            bool hasRuntimeWork = HasMainThreadRuntimeWork();
+            if (desktopConnected || hasRuntimeWork)
+                RefreshCachedEditorState();
 
-            PumpRunStates();
-            PumpExecuteCodeAsyncRuntime();
-            MaybeSendEditorUpdateEvent();
+            if (_activeRunStatesSession != null)
+                PumpRunStates();
+            if (HasActiveExecuteCodeAsyncRuntime())
+                PumpExecuteCodeAsyncRuntime();
+            if (desktopConnected)
+                MaybeSendEditorUpdateEvent();
 
             // Detect "no compilation started" after request_recompile
             if (_recompileCheckFrames >= 0)
@@ -719,6 +725,31 @@ namespace Locus
                     Debug.LogError("[Locus] Main-thread action failed: " + ex);
                 }
             }
+        }
+
+        private static bool HasDesktopPipeConnection()
+        {
+            return _desktopPipeConnected;
+        }
+
+        private static bool HasMainThreadRuntimeWork()
+        {
+            return _activeRunStatesSession != null
+                || HasActiveExecuteCodeAsyncRuntime()
+                || _recompileCheckFrames >= 0
+                || _domainReloadCheckFrames >= 0;
+        }
+
+        private static bool HasActiveExecuteCodeAsyncRuntime()
+        {
+            return _activeAsyncExecuteCount > 0;
+        }
+
+        private static void RefreshCachedEditorState()
+        {
+            _isPlaying = EditorApplication.isPlaying;
+            _isPaused = EditorApplication.isPaused;
+            _activeScenePath = EditorSceneManager.GetActiveScene().path ?? "";
         }
 
         private static void MaybeSendEditorUpdateEvent()
@@ -896,6 +927,12 @@ namespace Locus
                         message = "connected"
                     });
 
+                    lock (_connectionLock)
+                    {
+                        if (ReferenceEquals(_currentServer, server))
+                            _desktopPipeConnected = true;
+                    }
+
                     while (!ct.IsCancellationRequested)
                     {
                         string line = await reader.ReadLineAsync();
@@ -913,6 +950,7 @@ namespace Locus
                     {
                         _currentWriter = null;
                         _currentServer = null;
+                        _desktopPipeConnected = false;
                     }
                     await _writeLock.WaitAsync();
                     _writeLock.Release();
@@ -936,6 +974,7 @@ namespace Locus
                     {
                         _currentWriter = null;
                         _currentServer = null;
+                        _desktopPipeConnected = false;
                     }
                 }
 
@@ -1202,15 +1241,7 @@ namespace Locus
                         return OkResponse(reqId, "pong");
 
                     case "status":
-                    {
-                        string status = _isPlaying
-                            ? (_isPaused ? "playing_paused" : "playing")
-                            : "editing";
-                        string scenePath = _activeScenePath;
-                        if (!string.IsNullOrEmpty(scenePath))
-                            status += "|" + scenePath;
-                        return OkResponse(reqId, status);
-                    }
+                        return await HandleStatus(reqId);
 
                     case "get_console_text":
                     {
@@ -1535,6 +1566,24 @@ namespace Locus
                         return await tcs.Task;
                     }
 
+                    case "cancel_asset_drag":
+                    {
+                        var tcs = new TaskCompletionSource<PipeEnvelope>();
+                        PostToMainThread(delegate
+                        {
+                            try
+                            {
+                                LocusEditorWindow.CancelOutboundAssetDrag();
+                                tcs.SetResult(OkResponse(reqId, "cancelled"));
+                            }
+                            catch (Exception ex)
+                            {
+                                tcs.SetResult(ErrorResponse(reqId, ex.Message));
+                            }
+                        });
+                        return await tcs.Task;
+                    }
+
                     case "list_yaml":
                         return await HandleListYaml(reqId, msg.message);
 
@@ -1581,6 +1630,35 @@ namespace Locus
                 PostToMainThread(delegate { Debug.LogError("[Locus] HandleMessage exception for type '" + (msg.type ?? "null") + "': " + ex); });
                 return ErrorResponse(reqId, ex.ToString());
             }
+        }
+
+        private static async Task<PipeEnvelope> HandleStatus(string requestId)
+        {
+            var tcs = new TaskCompletionSource<PipeEnvelope>();
+            PostToMainThread(delegate
+            {
+                try
+                {
+                    RefreshCachedEditorState();
+                    tcs.SetResult(OkResponse(requestId, BuildCachedEditorStatusMessage()));
+                }
+                catch (Exception ex)
+                {
+                    tcs.SetResult(ErrorResponse(requestId, ex.ToString()));
+                }
+            });
+            return await tcs.Task;
+        }
+
+        private static string BuildCachedEditorStatusMessage()
+        {
+            string status = _isPlaying
+                ? (_isPaused ? "playing_paused" : "playing")
+                : "editing";
+            string scenePath = _activeScenePath;
+            if (!string.IsNullOrEmpty(scenePath))
+                status += "|" + scenePath;
+            return status;
         }
     }
 }

@@ -16,11 +16,14 @@ import { injectAssetRefs, injectFileRefs, injectWorkspaceMentions } from "../com
 import { normalizeMarkdownForRender } from "../composables/markdownRender";
 import { wrapMarkdownTables } from "../composables/markdownTableHtml";
 import {
+  armLocusFilePointerDrag,
   armUnityReferencePointerDrag,
+  startLocusFileHtmlDrag,
   startUnityReferenceHtmlDrag,
 } from "../composables/useUnityReferenceDragSource";
 import { resolveMarkdownImage } from "../services/markdownImage";
 import { hasTauriWindowRuntime } from "../services/tauriRuntime";
+import type { LocusFileDropRef } from "../services/unity";
 import type { AssetRefAttachment } from "../types";
 
 const props = defineProps<{
@@ -346,18 +349,56 @@ function unityRefFromMarkdownDragTarget(target: Element): AssetRefAttachment | n
   return null;
 }
 
+function localFileFromMarkdownDragTarget(target: Element): LocusFileDropRef | null {
+  const workspaceRef = target.closest(".md-workspace-ref[data-workspace-path]") as HTMLElement | null;
+  if (workspaceRef) {
+    const path = normalizeUnityRefDatasetPath(workspaceRef.dataset.workspacePath);
+    if (path) {
+      return {
+        path,
+        isDir: workspaceRef.dataset.entryKind === "folder",
+        source: "locus",
+      };
+    }
+  }
+
+  const fileRef = target.closest(".md-file-ref[data-file-path]") as HTMLElement | null;
+  if (!fileRef || fileRef.classList.contains("md-knowledge-ref")) return null;
+  if (fileRef.classList.contains("md-unity-asset-ref") || fileRef.classList.contains("md-unity-scene-object-ref")) {
+    return null;
+  }
+
+  const path = normalizeUnityRefDatasetPath(fileRef.dataset.filePath);
+  if (!path) return null;
+  return {
+    path,
+    isDir: fileRef.dataset.entryKind === "folder",
+    source: "locus",
+  };
+}
+
 function handleMarkdownDragStart(event: DragEvent) {
   if (!(event.target instanceof Element)) return;
   const ref = unityRefFromMarkdownDragTarget(event.target);
-  if (!ref) return;
-  startUnityReferenceHtmlDrag(event, [ref]);
+  if (ref) {
+    startUnityReferenceHtmlDrag(event, [ref]);
+    return;
+  }
+  const file = localFileFromMarkdownDragTarget(event.target);
+  if (!file) return;
+  startLocusFileHtmlDrag(event, [file]);
 }
 
 function handleMarkdownPointerDown(event: PointerEvent) {
   if (!(event.target instanceof Element)) return;
   const ref = unityRefFromMarkdownDragTarget(event.target);
-  if (!ref) return;
-  armUnityReferencePointerDrag(event, [ref]);
+  if (ref) {
+    armUnityReferencePointerDrag(event, [ref]);
+    return;
+  }
+  const file = localFileFromMarkdownDragTarget(event.target);
+  if (!file) return;
+  armLocusFilePointerDrag(event, [file]);
 }
 </script>
 

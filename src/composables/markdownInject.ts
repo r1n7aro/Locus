@@ -223,7 +223,7 @@ function renderLocalFileRef(filePath: string, line = ""): string {
   const icon = isDir
     ? renderRefIcon("folder", "md-workspace-ref-icon")
     : renderRefIcon();
-  return renderFileRef(cleanPath, line, classes, ` data-entry-kind="${entryKind}"`, icon);
+  return renderFileRef(cleanPath, line, classes, ` data-entry-kind="${entryKind}" draggable="true"`, icon);
 }
 
 function renderUnityAssetRef(filePath: string, line = ""): string {
@@ -286,7 +286,7 @@ function renderWorkspaceMention(path: string, match: string): string {
     ? renderRefIcon("folder", "md-workspace-ref-icon")
     : renderLucideRefIcon("file", "md-workspace-ref-icon md-workspace-file-icon");
 
-  return `<span class="${classes} ui-select-text" data-workspace-path="${escapedPath}" data-entry-kind="${isDir ? "folder" : "file"}"${fileAttr} title="${title}" aria-label="${title}">${icon}<span class="md-workspace-ref-prefix">@</span>${escapeAttr(name)}${isDir ? "/" : ""}</span>`;
+  return `<span class="${classes} ui-select-text" data-workspace-path="${escapedPath}" data-entry-kind="${isDir ? "folder" : "file"}"${fileAttr} draggable="true" title="${title}" aria-label="${title}">${icon}<span class="md-workspace-ref-prefix">@</span>${escapeAttr(name)}${isDir ? "/" : ""}</span>`;
 }
 
 interface SceneObjectRefParts {

@@ -101,6 +101,12 @@ export function startUnityNativeAssetFileDrag(refs: AssetRefAttachment[]): Promi
   return runtime.invoke("unity_embed_start_native_asset_file_drag", { request: { refs } });
 }
 
+export function startLocusNativeFileDrag(files: LocusFileDropRef[]): Promise<void> {
+  const runtime = getLocusRuntime();
+  if (runtime.kind !== "tauri" || files.length === 0) return Promise.resolve();
+  return runtime.invoke("locus_start_native_file_drag", { request: { files } });
+}
+
 export interface UnityEmbedAssetDropPayload {
   refs: AssetRefAttachment[];
 }

@@ -679,6 +679,19 @@ pub async fn start_asset_drag(project_path: &str, payload: &str) -> Result<(), S
     }
 }
 
+pub async fn cancel_asset_drag(project_path: &str) -> Result<(), String> {
+    let op_lock = project_unity_op_lock(project_path).await;
+    let _guard = op_lock.lock().await;
+    let resp = send_message(project_path, "cancel_asset_drag", "").await?;
+    if resp.ok {
+        Ok(())
+    } else {
+        Err(resp
+            .error
+            .unwrap_or_else(|| "cancel_asset_drag failed".to_string()))
+    }
+}
+
 /// Canonical status values: "disconnected" | "editing" | "playing" | "playing_paused"
 pub async fn query_unity_status(project_path: &str) -> (bool, &'static str, Option<String>) {
     match send_message(project_path, "status", "").await {

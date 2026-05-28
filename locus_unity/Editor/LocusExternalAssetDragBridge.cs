@@ -65,6 +65,16 @@ namespace Locus
             return true;
         }
 
+        internal static void CancelAssetDrag()
+        {
+            ClearArmedDrag();
+            DragAndDrop.PrepareStartDrag();
+            DragAndDrop.objectReferences = new Object[0];
+            DragAndDrop.paths = new string[0];
+            DragAndDrop.visualMode = DragAndDropVisualMode.None;
+            LocusEditorWindow.ClearPublishedUnityAssetDragState();
+        }
+
         private static void SetArmedDrag(
             Object[] objectReferences,
             string[] paths,
@@ -172,7 +182,28 @@ namespace Locus
 
         private static void HandleGlobalUpdate()
         {
+            if (!ShouldPublishAssetDragStateOnGlobalUpdate())
+            {
+                LocusEditorWindow.ClearPublishedUnityAssetDragState();
+                return;
+            }
+
             LocusEditorWindow.PublishCurrentUnityAssetDragState(false);
+        }
+
+        private static bool ShouldPublishAssetDragStateOnGlobalUpdate()
+        {
+            return HasActiveArmedDrag()
+                || LocusEditorWindow.HasCurrentUnityDragAndDropRefs();
+        }
+
+        private static bool HasActiveArmedDrag()
+        {
+            lock (ArmedDragLock)
+            {
+                ExpireArmedDragIfNeededLocked();
+                return HasArmedDragLocked();
+            }
         }
 
         private static bool ApplyArmedDragPayload()

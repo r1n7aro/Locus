@@ -108,7 +108,7 @@ struct UnityEmbedTextDropPayload {
     source: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct LocusFileDropRef {
     path: String,
@@ -123,6 +123,12 @@ struct LocusFileDropRef {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct LocusFileDropPayload {
+    files: Vec<LocusFileDropRef>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocusNativeFileDragRequest {
     files: Vec<LocusFileDropRef>,
 }
 
@@ -781,6 +787,9 @@ async fn monitor_unity_embed_asset_drag_release(app_handle: AppHandle) {
 }
 
 fn clear_unity_embed_asset_drag_after_release(app_handle: &AppHandle) {
+    #[cfg(target_os = "windows")]
+    windows_impl::stop_reference_drag_preview();
+
     cache_unity_embed_asset_drag_refs(Vec::new());
     if let Err(error) = emit_unity_embed_asset_drag_state(app_handle, Vec::new()) {
         eprintln!("[Locus] failed to clear Unity asset drag state: {error}");
@@ -796,6 +805,8 @@ pub async fn unity_embed_commit_asset_drop(app_handle: AppHandle) -> Result<(), 
 
     emit_unity_embed_asset_drop(&app_handle, refs).map_err(AppError::from)?;
     cache_unity_embed_asset_drag_refs(Vec::new());
+    #[cfg(target_os = "windows")]
+    windows_impl::stop_reference_drag_preview();
     emit_unity_embed_asset_drag_state(&app_handle, Vec::new()).map_err(AppError::from)
 }
 
@@ -816,6 +827,9 @@ pub async fn unity_embed_start_asset_drag(
             "No Unity workspace is active.",
         ));
     }
+
+    #[cfg(target_os = "windows")]
+    windows_impl::start_reference_drag_preview(unity_ref_drag_preview_label(&refs, refs.len()));
 
     let payload = serde_json::json!({ "refs": refs }).to_string();
     crate::unity_bridge::start_asset_drag(&cwd, &payload).await?;
@@ -844,29 +858,78 @@ pub async fn unity_embed_start_native_asset_file_drag(
     if paths.is_empty() {
         return Ok("no_files".to_string());
     }
+    let preview_label = unity_ref_drag_preview_label(&refs, paths.len());
 
+    dispatch_native_file_drag(app_handle, paths, preview_label, Some(cwd)).await
+}
+
+#[tauri::command]
+pub async fn locus_start_native_file_drag(
+    app_handle: AppHandle,
+    request: LocusNativeFileDragRequest,
+) -> Result<String, AppError> {
+    let cwd = current_workspace_path(&app_handle).await;
+    if cwd.trim().is_empty() {
+        return Err(AppError::new(
+            "file.drag.workspace_missing",
+            "No workspace is active.",
+        ));
+    }
+
+    let paths = native_locus_file_drag_paths(&cwd, &request.files);
+    if paths.is_empty() {
+        return Ok("no_files".to_string());
+    }
+    let preview_label = locus_file_drag_preview_label(&request.files, paths.len());
+
+    dispatch_native_file_drag(app_handle, paths, preview_label, None).await
+}
+
+async fn dispatch_native_file_drag(
+    app_handle: AppHandle,
+    paths: Vec<String>,
+    preview_label: String,
+    unity_asset_drag_workspace: Option<String>,
+) -> Result<String, AppError> {
     #[cfg(target_os = "windows")]
     {
+        windows_impl::start_reference_drag_preview(preview_label.clone());
+        let clear_unity_asset_drag_after_finish = unity_asset_drag_workspace.is_some();
+
         let (tx, rx) = tokio::sync::oneshot::channel();
         app_handle
             .run_on_main_thread(move || {
-                let result = windows_impl::start_native_file_drag(paths);
+                let result = windows_impl::start_native_file_drag(paths, preview_label);
                 let _ = tx.send(result);
             })
             .map_err(|error| {
+                clear_native_file_drag_preview_and_cache(
+                    &app_handle,
+                    clear_unity_asset_drag_after_finish,
+                );
                 AppError::new(
                     "unity.drag.native_dispatch_failed",
                     format!("Failed to dispatch native asset file drag: {error}"),
                 )
             })?;
 
-        let result = rx.await.map_err(|_| {
-            AppError::new(
-                "unity.drag.native_cancelled",
-                "Native asset file drag was cancelled before it started.",
-            )
-        })?;
+        let result = match rx.await {
+            Ok(result) => result,
+            Err(_) => {
+                finish_native_file_drag_after_finish(
+                    &app_handle,
+                    unity_asset_drag_workspace.as_deref(),
+                )
+                .await;
+                return Err(AppError::new(
+                    "unity.drag.native_cancelled",
+                    "Native asset file drag was cancelled before it started.",
+                ));
+            }
+        };
 
+        finish_native_file_drag_after_finish(&app_handle, unity_asset_drag_workspace.as_deref())
+            .await;
         return result.map_err(|error| {
             AppError::new("unity.drag.native_failed", error).operation("nativeAssetFileDrag")
         });
@@ -874,8 +937,44 @@ pub async fn unity_embed_start_native_asset_file_drag(
 
     #[cfg(not(target_os = "windows"))]
     {
+        let _ = app_handle;
+        let _ = paths;
+        let _ = preview_label;
+        let _ = unity_asset_drag_workspace;
         Ok("unsupported".to_string())
     }
+}
+
+#[cfg(target_os = "windows")]
+fn clear_native_file_drag_preview_and_cache(
+    app_handle: &AppHandle,
+    clear_unity_asset_drag_after_finish: bool,
+) {
+    windows_impl::stop_reference_drag_preview();
+    if !clear_unity_asset_drag_after_finish {
+        return;
+    }
+    cache_unity_embed_asset_drag_refs(Vec::new());
+    if let Err(error) = emit_unity_embed_asset_drag_state(app_handle, Vec::new()) {
+        eprintln!("[Locus] failed to clear Unity asset drag state: {error}");
+    }
+}
+
+#[cfg(target_os = "windows")]
+async fn finish_native_file_drag_after_finish(
+    app_handle: &AppHandle,
+    unity_asset_drag_workspace: Option<&str>,
+) {
+    let Some(workspace_path) = unity_asset_drag_workspace else {
+        clear_native_file_drag_preview_and_cache(app_handle, false);
+        return;
+    };
+
+    clear_native_file_drag_preview_and_cache(app_handle, true);
+    if let Err(error) = crate::unity_bridge::cancel_asset_drag(workspace_path).await {
+        eprintln!("[Locus] failed to cancel Unity asset drag after native file drag: {error}");
+    }
+    clear_native_file_drag_preview_and_cache(app_handle, true);
 }
 
 fn sanitize_locus_outbound_drag_refs(refs: Vec<UnityEmbedAssetRef>) -> Vec<UnityEmbedAssetRef> {
@@ -921,6 +1020,22 @@ fn native_asset_file_drag_paths(workspace_path: &str, refs: &[UnityEmbedAssetRef
     paths
 }
 
+fn native_locus_file_drag_paths(workspace_path: &str, files: &[LocusFileDropRef]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut paths = Vec::new();
+
+    for file in files {
+        let Some(path) = native_locus_file_drag_path(workspace_path, &file.path) else {
+            continue;
+        };
+        if seen.insert(path.to_ascii_lowercase()) {
+            paths.push(path);
+        }
+    }
+
+    paths
+}
+
 fn native_asset_file_drag_path(
     workspace_path: &str,
     asset_ref: &UnityEmbedAssetRef,
@@ -953,6 +1068,144 @@ fn native_asset_file_drag_path(
     let normalized = normalize_existing_path_text(&local_path);
     unity_relative_drop_path(&workspace_path, Path::new(&normalized))?;
     Some(normalized)
+}
+
+fn native_locus_file_drag_path(workspace_path: &str, source_path: &str) -> Option<String> {
+    let source_path = normalize_unity_path_text(source_path);
+    if source_path.is_empty() {
+        return None;
+    }
+
+    let workspace_path = normalize_existing_path_text(Path::new(workspace_path));
+    if workspace_path.is_empty() {
+        return None;
+    }
+
+    let local_path = if is_absolute_local_file_ref_path(&source_path) {
+        PathBuf::from(&source_path)
+    } else {
+        if !is_safe_relative_file_ref_path(&source_path) {
+            return None;
+        }
+        source_path
+            .split('/')
+            .fold(PathBuf::from(&workspace_path), |mut path, part| {
+                path.push(part);
+                path
+            })
+    };
+
+    if !local_path.exists() {
+        return None;
+    }
+
+    let normalized = normalize_existing_path_text(&local_path);
+    if normalized.is_empty() {
+        return None;
+    }
+    Some(normalized)
+}
+
+fn is_absolute_local_file_ref_path(path: &str) -> bool {
+    Path::new(path).is_absolute()
+        || path.starts_with('/')
+        || path.starts_with("//")
+        || matches!(path.as_bytes().get(1), Some(b':'))
+}
+
+fn is_safe_relative_file_ref_path(path: &str) -> bool {
+    !is_absolute_local_file_ref_path(path)
+        && path
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
+}
+
+fn unity_ref_drag_preview_label(refs: &[UnityEmbedAssetRef], ref_count: usize) -> String {
+    let first_name = refs
+        .iter()
+        .find(|asset_ref| asset_ref.kind == "asset" || asset_ref.kind == "sceneObject")
+        .map(unity_ref_display_name)
+        .unwrap_or_else(|| "Unity Reference".to_string());
+
+    if ref_count <= 1 {
+        return first_name;
+    }
+
+    format!("{first_name} +{}", ref_count - 1)
+}
+
+fn unity_ref_display_name(asset_ref: &UnityEmbedAssetRef) -> String {
+    let normalized = normalize_unity_path_text(&asset_ref.path);
+    let file_name = normalized
+        .rsplit('/')
+        .next()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(normalized.as_str());
+
+    if asset_ref.kind == "asset" {
+        let label = sanitize_drag_preview_label(file_name);
+        if !label.is_empty() {
+            return label;
+        }
+    }
+
+    if let Some(name) = asset_ref.name.as_deref() {
+        let label = sanitize_drag_preview_label(name);
+        if !label.is_empty() {
+            return label;
+        }
+    }
+
+    let stem = file_name
+        .rsplit_once('.')
+        .map(|(stem, _)| stem)
+        .filter(|stem| !stem.trim().is_empty())
+        .unwrap_or(file_name);
+    let label = sanitize_drag_preview_label(stem);
+    if label.is_empty() {
+        "Unity Reference".to_string()
+    } else {
+        label
+    }
+}
+
+fn locus_file_drag_preview_label(files: &[LocusFileDropRef], ref_count: usize) -> String {
+    let first_name = files
+        .iter()
+        .find_map(locus_file_drag_display_name)
+        .unwrap_or_else(|| "File".to_string());
+
+    if ref_count <= 1 {
+        return first_name;
+    }
+
+    format!("{first_name} +{}", ref_count - 1)
+}
+
+fn locus_file_drag_display_name(file: &LocusFileDropRef) -> Option<String> {
+    if let Some(name) = file.name.as_deref() {
+        let label = sanitize_drag_preview_label(name);
+        if !label.is_empty() {
+            return Some(label);
+        }
+    }
+
+    let normalized = normalize_unity_path_text(&file.path);
+    let file_name = normalized
+        .rsplit('/')
+        .next()
+        .map(sanitize_drag_preview_label)
+        .filter(|value| !value.is_empty());
+    file_name
+}
+
+fn sanitize_drag_preview_label(value: &str) -> String {
+    value
+        .trim()
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .take(80)
+        .collect()
 }
 
 fn unity_file_drop_asset_refs(workspace_path: &str, paths: &[PathBuf]) -> Vec<UnityEmbedAssetRef> {
@@ -1439,6 +1692,9 @@ fn apply_control_message_on_main(
             Ok(())
         }
         "close" => {
+            #[cfg(target_os = "windows")]
+            windows_impl::stop_reference_drag_preview();
+
             if is_transient_close_reason(&msg.reason) {
                 schedule_transient_close_destroy(app_handle);
                 return Ok(());
@@ -1457,14 +1713,22 @@ fn apply_control_message_on_main(
         "assetDrop" => {
             let refs = msg.asset_refs.unwrap_or_default();
             if refs.is_empty() {
+                #[cfg(target_os = "windows")]
+                windows_impl::stop_reference_drag_preview();
                 return Ok(());
             }
             emit_unity_embed_asset_drop(app_handle, refs)?;
             cache_unity_embed_asset_drag_refs(Vec::new());
+            #[cfg(target_os = "windows")]
+            windows_impl::stop_reference_drag_preview();
             emit_unity_embed_asset_drag_state(app_handle, Vec::new())
         }
         "assetDrag" => {
             let refs = msg.asset_refs.unwrap_or_default();
+            if refs.is_empty() {
+                #[cfg(target_os = "windows")]
+                windows_impl::stop_reference_drag_preview();
+            }
             cache_unity_embed_asset_drag_refs(refs.clone());
             ensure_unity_embed_asset_drag_release_monitor(app_handle);
             emit_unity_embed_asset_drag_state(app_handle, refs)
@@ -1575,8 +1839,11 @@ fn apply_overlay_geometry(
 mod windows_impl {
     use super::*;
     use std::path::Path;
-    use std::sync::{Mutex, OnceLock};
-    use std::time::Duration;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, OnceLock,
+    };
+    use std::time::{Duration, Instant};
     use std::{io, mem::ManuallyDrop, ptr};
     use tokio::{
         io::{AsyncBufReadExt, BufReader},
@@ -1588,14 +1855,24 @@ mod windows_impl {
     };
     use windows::Win32::{
         Foundation::{
-            DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS, DV_E_FORMATETC,
-            E_NOTIMPL, E_POINTER, HGLOBAL, HWND, LPARAM, LRESULT, POINT, RECT, S_OK, WPARAM,
+            COLORREF, DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS,
+            DV_E_FORMATETC, E_NOTIMPL, E_POINTER, HGLOBAL, HWND, LPARAM, LRESULT, POINT, RECT,
+            SIZE, S_OK, WPARAM,
         },
-        Graphics::Gdi::ScreenToClient,
+        Graphics::Gdi::{
+            CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreatePen, CreateSolidBrush,
+            DeleteDC, DeleteObject, DrawTextW, FillRect, GetDC, GetStockObject,
+            GetTextExtentPoint32W, LineTo, MoveToEx, ReleaseDC, RoundRect, ScreenToClient,
+            SelectObject, SetBkMode, SetTextColor, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS,
+            DEFAULT_CHARSET, DEFAULT_GUI_FONT, DEFAULT_PITCH, DT_END_ELLIPSIS, DT_NOPREFIX,
+            DT_SINGLELINE, DT_VCENTER, FW_SEMIBOLD, HBITMAP, HDC, HGDIOBJ, OUT_DEFAULT_PRECIS,
+            PS_SOLID, TRANSPARENT,
+        },
         System::{
             Com::{
-                IAdviseSink, IDataObject, IDataObject_Impl, IEnumFORMATETC, IEnumSTATDATA,
-                DATADIR_GET, DVASPECT_CONTENT, FORMATETC, STGMEDIUM, STGMEDIUM_0, TYMED_HGLOBAL,
+                CoCreateInstance, IAdviseSink, IDataObject, IDataObject_Impl, IEnumFORMATETC,
+                IEnumSTATDATA, CLSCTX_INPROC_SERVER, DATADIR_GET, DVASPECT_CONTENT, FORMATETC,
+                STGMEDIUM, STGMEDIUM_0, TYMED_HGLOBAL,
             },
             Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE, GMEM_ZEROINIT},
             Ole::{
@@ -1611,21 +1888,22 @@ mod windows_impl {
                 SetFocus as SetKeyboardFocus,
             },
             Shell::{
-                Common::ITEMIDLIST, DefSubclassProc, ILCreateFromPathW, ILFindLastID, ILFree,
-                RemoveWindowSubclass, SHCreateDataObject, SHCreateStdEnumFmtEtc, SetWindowSubclass,
-                DROPFILES,
+                CLSID_DragDropHelper, Common::ITEMIDLIST, DefSubclassProc, IDragSourceHelper,
+                ILCreateFromPathW, ILFindLastID, ILFree, RemoveWindowSubclass, SHCreateDataObject,
+                SHCreateStdEnumFmtEtc, SetWindowSubclass, DROPFILES, SHDRAGIMAGE,
             },
             WindowsAndMessaging::{
-                BringWindowToTop, GetAncestor, GetCursorPos, GetForegroundWindow, GetGUIThreadInfo,
-                GetParent, GetTopWindow, GetWindow, GetWindowLongPtrW, GetWindowRect,
-                GetWindowTextW, GetWindowThreadProcessId, IsChild, IsIconic, IsWindow,
-                IsWindowVisible, SetForegroundWindow, SetParent, SetWindowLongPtrW, SetWindowPos,
-                ShowWindow, WindowFromPoint, GA_ROOT, GUITHREADINFO, GWLP_HWNDPARENT, GWL_EXSTYLE,
-                GWL_STYLE, GW_CHILD, GW_HWNDNEXT, HWND_TOP, MA_NOACTIVATE, SWP_FRAMECHANGED,
-                SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SW_HIDE,
-                SW_SHOWNOACTIVATE, WM_MOUSEACTIVATE, WM_NCDESTROY, WS_CAPTION, WS_CHILD,
-                WS_EX_NOACTIVATE, WS_EX_TRANSPARENT, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP,
-                WS_SYSMENU, WS_THICKFRAME,
+                BringWindowToTop, CreateWindowExW, DestroyWindow, GetAncestor, GetCursorPos,
+                GetForegroundWindow, GetGUIThreadInfo, GetParent, GetTopWindow, GetWindow,
+                GetWindowLongPtrW, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId,
+                IsChild, IsIconic, IsWindow, IsWindowVisible, SetForegroundWindow, SetParent,
+                SetWindowLongPtrW, SetWindowPos, ShowWindow, UpdateLayeredWindow, WindowFromPoint,
+                GA_ROOT, GUITHREADINFO, GWLP_HWNDPARENT, GWL_EXSTYLE, GWL_STYLE, GW_CHILD,
+                GW_HWNDNEXT, HWND_TOP, MA_NOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
+                SWP_NOOWNERZORDER, SWP_NOSIZE, SW_HIDE, SW_SHOWNOACTIVATE, ULW_COLORKEY,
+                WM_MOUSEACTIVATE, WM_NCDESTROY, WS_CAPTION, WS_CHILD, WS_EX_LAYERED,
+                WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
+                WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_THICKFRAME,
             },
         },
     };
@@ -1633,6 +1911,10 @@ mod windows_impl {
     const POPUP_SYNC_ACTIVE_INTERVAL_MS: u64 = 16;
     const POPUP_SYNC_IDLE_INTERVAL_MS: u64 = 120;
     const MOUSE_HOOK_SYNC_INTERVAL_MS: u64 = 250;
+    const REFERENCE_DRAG_PREVIEW_INTERVAL_MS: u64 = 16;
+    const REFERENCE_DRAG_PREVIEW_TIMEOUT: Duration = Duration::from_secs(120);
+    const REFERENCE_DRAG_PREVIEW_OFFSET_X: i32 = 6;
+    const REFERENCE_DRAG_PREVIEW_OFFSET_Y: i32 = 8;
     const Z_ORDER_SCAN_LIMIT: usize = 2048;
     const MOUSE_ACTIVATE_SUBCLASS_ID: usize = 0x4c6f637573;
     const VK_LBUTTON_CODE: i32 = 0x01;
@@ -1701,7 +1983,145 @@ mod windows_impl {
         hwnd == parent || IsChild(parent, hwnd).as_bool() || GetAncestor(hwnd, GA_ROOT) == parent
     }
 
-    pub(super) fn start_native_file_drag(paths: Vec<String>) -> Result<String, String> {
+    fn reference_drag_preview_state() -> &'static Mutex<Option<Arc<AtomicBool>>> {
+        static STATE: OnceLock<Mutex<Option<Arc<AtomicBool>>>> = OnceLock::new();
+        STATE.get_or_init(|| Mutex::new(None))
+    }
+
+    pub(super) fn start_reference_drag_preview(preview_label: String) {
+        stop_reference_drag_preview();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        if let Ok(mut state) = reference_drag_preview_state().lock() {
+            *state = Some(stop.clone());
+        }
+
+        std::thread::spawn(move || {
+            if let Err(error) = unsafe { run_reference_drag_preview(preview_label, stop) } {
+                eprintln!("[Locus] native reference drag preview failed: {error}");
+            }
+        });
+    }
+
+    pub(super) fn stop_reference_drag_preview() {
+        if let Ok(mut state) = reference_drag_preview_state().lock() {
+            if let Some(stop) = state.take() {
+                stop.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+
+    unsafe fn run_reference_drag_preview(
+        preview_label: String,
+        stop: Arc<AtomicBool>,
+    ) -> Result<(), String> {
+        let image = create_native_file_drag_image(&preview_label)?;
+        let screen_dc = GetDC(None);
+        if screen_dc.0.is_null() {
+            return Err("GetDC failed".to_string());
+        }
+
+        let mem_dc = CreateCompatibleDC(Some(screen_dc));
+        if mem_dc.0.is_null() {
+            let _ = ReleaseDC(None, screen_dc);
+            return Err("CreateCompatibleDC failed".to_string());
+        }
+
+        let old_bitmap = SelectObject(mem_dc, HGDIOBJ(image.bitmap.0));
+        let class_name = wide_null("STATIC");
+        let title = wide_null("");
+        let hwnd = CreateWindowExW(
+            WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE,
+            PCWSTR(class_name.as_ptr()),
+            PCWSTR(title.as_ptr()),
+            WS_POPUP,
+            0,
+            0,
+            image.width,
+            image.height,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let hwnd = match hwnd {
+            Ok(hwnd) => hwnd,
+            Err(error) => {
+                if !old_bitmap.0.is_null() {
+                    let _ = SelectObject(mem_dc, old_bitmap);
+                }
+                let _ = DeleteDC(mem_dc);
+                let _ = ReleaseDC(None, screen_dc);
+                return Err(format!("CreateWindowExW failed: {error}"));
+            }
+        };
+
+        let size = SIZE {
+            cx: image.width,
+            cy: image.height,
+        };
+        let src = POINT { x: 0, y: 0 };
+        let started_at = Instant::now();
+        let mut shown = false;
+        let mut result = Ok(());
+
+        loop {
+            if stop.load(Ordering::SeqCst) || started_at.elapsed() > REFERENCE_DRAG_PREVIEW_TIMEOUT
+            {
+                break;
+            }
+
+            let mut cursor = POINT::default();
+            if let Err(error) = GetCursorPos(&mut cursor) {
+                result = Err(format!("GetCursorPos failed: {error}"));
+                break;
+            }
+
+            let dst = POINT {
+                x: cursor.x + REFERENCE_DRAG_PREVIEW_OFFSET_X,
+                y: cursor.y + REFERENCE_DRAG_PREVIEW_OFFSET_Y,
+            };
+            if let Err(error) = UpdateLayeredWindow(
+                hwnd,
+                Some(screen_dc),
+                Some(&dst as *const POINT),
+                Some(&size as *const SIZE),
+                Some(mem_dc),
+                Some(&src as *const POINT),
+                drag_image_transparent_color(),
+                None,
+                ULW_COLORKEY,
+            ) {
+                result = Err(format!("UpdateLayeredWindow failed: {error}"));
+                break;
+            }
+
+            if !shown {
+                let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                shown = true;
+            }
+
+            std::thread::sleep(Duration::from_millis(REFERENCE_DRAG_PREVIEW_INTERVAL_MS));
+        }
+
+        let _ = DestroyWindow(hwnd);
+        if !old_bitmap.0.is_null() {
+            let _ = SelectObject(mem_dc, old_bitmap);
+        }
+        let _ = DeleteDC(mem_dc);
+        let _ = ReleaseDC(None, screen_dc);
+        result
+    }
+
+    fn wide_null(value: &str) -> Vec<u16> {
+        value.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    pub(super) fn start_native_file_drag(
+        paths: Vec<String>,
+        preview_label: String,
+    ) -> Result<String, String> {
         if paths.is_empty() {
             return Ok("no_files".to_string());
         }
@@ -1714,6 +2134,12 @@ mod windows_impl {
             let _ = ReleaseCapture();
 
             let (data_object, _pidls) = create_native_file_data_object(paths);
+            let _drag_image = initialize_native_file_drag_image(&data_object, &preview_label)
+                .map_err(|error| {
+                    eprintln!("[Locus] failed to initialize native drag image: {error}");
+                    error
+                })
+                .ok();
             let drop_source: IDropSource = NativeFileDropSource.into();
             let mut effect = DROPEFFECT(0);
             let result = DoDragDrop(&data_object, &drop_source, DROPEFFECT_COPY, &mut effect);
@@ -1725,6 +2151,308 @@ mod windows_impl {
 
             Ok(format!("effect:{}", effect.0))
         }
+    }
+
+    struct NativeDragImage {
+        bitmap: HBITMAP,
+        width: i32,
+        height: i32,
+    }
+
+    impl Drop for NativeDragImage {
+        fn drop(&mut self) {
+            if !self.bitmap.0.is_null() {
+                unsafe {
+                    let _ = DeleteObject(HGDIOBJ(self.bitmap.0));
+                }
+            }
+        }
+    }
+
+    unsafe fn initialize_native_file_drag_image(
+        data_object: &IDataObject,
+        preview_label: &str,
+    ) -> Result<NativeDragImage, String> {
+        let drag_image = create_native_file_drag_image(preview_label)?;
+        let helper: IDragSourceHelper =
+            CoCreateInstance(&CLSID_DragDropHelper, None, CLSCTX_INPROC_SERVER).map_err(
+                |error| format!("CoCreateInstance(CLSID_DragDropHelper) failed: {error}"),
+            )?;
+        let shell_image = SHDRAGIMAGE {
+            sizeDragImage: SIZE {
+                cx: drag_image.width,
+                cy: drag_image.height,
+            },
+            ptOffset: POINT { x: 16, y: 14 },
+            hbmpDragImage: drag_image.bitmap,
+            crColorKey: drag_image_transparent_color(),
+        };
+        helper
+            .InitializeFromBitmap(&shell_image, data_object)
+            .map_err(|error| format!("IDragSourceHelper.InitializeFromBitmap failed: {error}"))?;
+        Ok(drag_image)
+    }
+
+    unsafe fn create_native_file_drag_image(
+        preview_label: &str,
+    ) -> Result<NativeDragImage, String> {
+        const HEIGHT: i32 = 24;
+        const MIN_WIDTH: i32 = 52;
+        const MAX_WIDTH: i32 = 340;
+        const TEXT_LEFT: i32 = 24;
+        const TEXT_RIGHT_PADDING: i32 = 7;
+
+        let label = sanitize_drag_image_label(preview_label);
+        let mut text = label.encode_utf16().collect::<Vec<u16>>();
+        if text.is_empty() {
+            text.extend("Unity Reference".encode_utf16());
+        }
+
+        let screen_dc = GetDC(None);
+        if screen_dc.0.is_null() {
+            return Err("GetDC failed".to_string());
+        }
+
+        let mem_dc = CreateCompatibleDC(Some(screen_dc));
+        if mem_dc.0.is_null() {
+            let _ = ReleaseDC(None, screen_dc);
+            return Err("CreateCompatibleDC failed".to_string());
+        }
+
+        let font_name = wide_null("Cascadia Mono");
+        let created_font = CreateFontW(
+            -12,
+            0,
+            0,
+            0,
+            FW_SEMIBOLD.0 as i32,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET,
+            OUT_DEFAULT_PRECIS,
+            CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY,
+            DEFAULT_PITCH.0 as u32,
+            PCWSTR(font_name.as_ptr()),
+        );
+        let (font, delete_font) = if created_font.0.is_null() {
+            (GetStockObject(DEFAULT_GUI_FONT), false)
+        } else {
+            (HGDIOBJ(created_font.0), true)
+        };
+        let old_font = if !font.0.is_null() {
+            SelectObject(mem_dc, font)
+        } else {
+            HGDIOBJ::default()
+        };
+
+        let mut text_size = SIZE::default();
+        let measured = GetTextExtentPoint32W(mem_dc, &text, &mut text_size).as_bool();
+        let measured_width = if measured {
+            text_size.cx
+        } else {
+            estimate_drag_label_width(&label)
+        };
+        let width = (TEXT_LEFT + measured_width + TEXT_RIGHT_PADDING).clamp(MIN_WIDTH, MAX_WIDTH);
+
+        let bitmap = CreateCompatibleBitmap(screen_dc, width, HEIGHT);
+        if bitmap.0.is_null() {
+            if !old_font.0.is_null() {
+                let _ = SelectObject(mem_dc, old_font);
+            }
+            if delete_font && !font.0.is_null() {
+                let _ = DeleteObject(font);
+            }
+            let _ = DeleteDC(mem_dc);
+            let _ = ReleaseDC(None, screen_dc);
+            return Err("CreateCompatibleBitmap failed".to_string());
+        }
+
+        let old_bitmap = SelectObject(mem_dc, HGDIOBJ(bitmap.0));
+        draw_native_file_drag_image(mem_dc, width, HEIGHT, &mut text);
+
+        if !old_bitmap.0.is_null() {
+            let _ = SelectObject(mem_dc, old_bitmap);
+        }
+        if !old_font.0.is_null() {
+            let _ = SelectObject(mem_dc, old_font);
+        }
+        if delete_font && !font.0.is_null() {
+            let _ = DeleteObject(font);
+        }
+        let _ = DeleteDC(mem_dc);
+        let _ = ReleaseDC(None, screen_dc);
+
+        Ok(NativeDragImage {
+            bitmap,
+            width,
+            height: HEIGHT,
+        })
+    }
+
+    unsafe fn draw_native_file_drag_image(hdc: HDC, width: i32, height: i32, text: &mut [u16]) {
+        let transparent = drag_image_transparent_color();
+        let transparent_brush = CreateSolidBrush(transparent);
+        if !transparent_brush.0.is_null() {
+            let rect = RECT {
+                left: 0,
+                top: 0,
+                right: width,
+                bottom: height,
+            };
+            let _ = FillRect(hdc, &rect, transparent_brush);
+            let _ = DeleteObject(HGDIOBJ(transparent_brush.0));
+        }
+
+        let body_brush = CreateSolidBrush(rgb_color(31, 36, 44));
+        let border_pen = CreatePen(PS_SOLID, 1, rgb_color(74, 84, 98));
+        let old_brush = if !body_brush.0.is_null() {
+            SelectObject(hdc, HGDIOBJ(body_brush.0))
+        } else {
+            HGDIOBJ::default()
+        };
+        let old_pen = if !border_pen.0.is_null() {
+            SelectObject(hdc, HGDIOBJ(border_pen.0))
+        } else {
+            HGDIOBJ::default()
+        };
+        let _ = RoundRect(hdc, 0, 0, width, height, 6, 6);
+        if !old_brush.0.is_null() {
+            let _ = SelectObject(hdc, old_brush);
+        }
+        if !old_pen.0.is_null() {
+            let _ = SelectObject(hdc, old_pen);
+        }
+        if !body_brush.0.is_null() {
+            let _ = DeleteObject(HGDIOBJ(body_brush.0));
+        }
+        if !border_pen.0.is_null() {
+            let _ = DeleteObject(HGDIOBJ(border_pen.0));
+        }
+
+        draw_drag_reference_icon(hdc, drag_icon_tone_for_label_text(text));
+
+        let _ = SetBkMode(hdc, TRANSPARENT);
+        let _ = SetTextColor(hdc, rgb_color(238, 242, 248));
+        let mut text_rect = RECT {
+            left: 24,
+            top: 0,
+            right: width - 6,
+            bottom: height,
+        };
+        let _ = DrawTextW(
+            hdc,
+            text,
+            &mut text_rect,
+            DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
+        );
+    }
+
+    #[derive(Clone, Copy)]
+    enum DragIconTone {
+        Primary,
+        Resource,
+        Neutral,
+    }
+
+    fn drag_icon_tone_for_label_text(text: &[u16]) -> DragIconTone {
+        let label = String::from_utf16_lossy(text).to_ascii_lowercase();
+        if label.ends_with(".unity") || label.ends_with(".prefab") || !label.contains('.') {
+            return DragIconTone::Primary;
+        }
+        if label.ends_with(".mat")
+            || label.ends_with(".shader")
+            || label.ends_with(".shadergraph")
+            || label.ends_with(".shadersubgraph")
+            || label.ends_with(".compute")
+            || label.ends_with(".hlsl")
+            || label.ends_with(".cginc")
+            || label.ends_with(".png")
+            || label.ends_with(".jpg")
+            || label.ends_with(".jpeg")
+            || label.ends_with(".psd")
+            || label.ends_with(".tga")
+            || label.ends_with(".svg")
+        {
+            return DragIconTone::Resource;
+        }
+        DragIconTone::Neutral
+    }
+
+    unsafe fn draw_drag_reference_icon(hdc: HDC, tone: DragIconTone) {
+        let color = match tone {
+            DragIconTone::Primary => rgb_color(116, 154, 222),
+            DragIconTone::Resource => rgb_color(121, 205, 154),
+            DragIconTone::Neutral => rgb_color(168, 178, 190),
+        };
+        let pen = CreatePen(PS_SOLID, 1, color);
+        if pen.0.is_null() {
+            return;
+        }
+
+        let old_pen = SelectObject(hdc, HGDIOBJ(pen.0));
+        match tone {
+            DragIconTone::Resource => draw_drag_sparkle_icon(hdc),
+            _ => draw_drag_file_icon(hdc),
+        }
+        if !old_pen.0.is_null() {
+            let _ = SelectObject(hdc, old_pen);
+        }
+        let _ = DeleteObject(HGDIOBJ(pen.0));
+    }
+
+    unsafe fn draw_drag_file_icon(hdc: HDC) {
+        draw_drag_icon_line(hdc, 7, 5, 14, 5);
+        draw_drag_icon_line(hdc, 14, 5, 18, 9);
+        draw_drag_icon_line(hdc, 18, 9, 18, 18);
+        draw_drag_icon_line(hdc, 18, 18, 7, 18);
+        draw_drag_icon_line(hdc, 7, 18, 7, 5);
+        draw_drag_icon_line(hdc, 14, 5, 14, 9);
+        draw_drag_icon_line(hdc, 14, 9, 18, 9);
+    }
+
+    unsafe fn draw_drag_sparkle_icon(hdc: HDC) {
+        draw_drag_icon_line(hdc, 11, 4, 11, 16);
+        draw_drag_icon_line(hdc, 5, 10, 17, 10);
+        draw_drag_icon_line(hdc, 7, 6, 15, 14);
+        draw_drag_icon_line(hdc, 15, 6, 7, 14);
+        draw_drag_icon_line(hdc, 18, 4, 18, 8);
+        draw_drag_icon_line(hdc, 16, 6, 20, 6);
+    }
+
+    unsafe fn draw_drag_icon_line(hdc: HDC, x1: i32, y1: i32, x2: i32, y2: i32) {
+        let _ = MoveToEx(hdc, x1, y1, None);
+        let _ = LineTo(hdc, x2, y2);
+    }
+
+    fn sanitize_drag_image_label(value: &str) -> String {
+        let label = value
+            .trim()
+            .chars()
+            .filter(|ch| !ch.is_control())
+            .take(80)
+            .collect::<String>();
+        if label.is_empty() {
+            "Unity Reference".to_string()
+        } else {
+            label
+        }
+    }
+
+    fn estimate_drag_label_width(value: &str) -> i32 {
+        value
+            .chars()
+            .map(|ch| if ch.is_ascii() { 7 } else { 13 })
+            .sum::<i32>()
+    }
+
+    fn drag_image_transparent_color() -> COLORREF {
+        rgb_color(255, 0, 255)
+    }
+
+    fn rgb_color(red: u8, green: u8, blue: u8) -> COLORREF {
+        COLORREF(red as u32 | ((green as u32) << 8) | ((blue as u32) << 16))
     }
 
     fn create_native_file_data_object(paths: Vec<String>) -> (IDataObject, Vec<OwnedItemIdList>) {
@@ -3262,7 +3990,8 @@ mod tests {
 
     use super::{
         control_pipe_name_for_project_path, locus_file_drop_refs, native_asset_file_drag_paths,
-        normalize_pipe_project_path, unity_file_drop_asset_refs, unity_relative_drop_path,
+        native_locus_file_drag_paths, normalize_pipe_project_path, unity_file_drop_asset_refs,
+        unity_ref_drag_preview_label, unity_relative_drop_path, LocusFileDropRef,
         UnityEmbedAssetRef,
     };
 
@@ -3385,5 +4114,105 @@ mod tests {
         );
 
         assert!(paths.is_empty());
+    }
+
+    #[test]
+    fn native_locus_file_drag_maps_workspace_relative_files() {
+        let project = tempfile::tempdir().unwrap();
+        let file_path = project.path().join("src/main.ts");
+        fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        fs::write(&file_path, "main").unwrap();
+
+        let paths = native_locus_file_drag_paths(
+            &project.path().to_string_lossy(),
+            &[LocusFileDropRef {
+                path: "src/main.ts".to_string(),
+                name: None,
+                type_label: None,
+                is_dir: false,
+                source: "locus".to_string(),
+            }],
+        );
+
+        assert_eq!(paths.len(), 1);
+        assert!(paths[0].ends_with("src/main.ts"));
+    }
+
+    #[test]
+    fn native_locus_file_drag_rejects_missing_or_traversal_paths() {
+        let project = tempfile::tempdir().unwrap();
+        let outside = project.path().join("outside.txt");
+        fs::write(&outside, "outside").unwrap();
+
+        let paths = native_locus_file_drag_paths(
+            &project.path().to_string_lossy(),
+            &[
+                LocusFileDropRef {
+                    path: "src/missing.ts".to_string(),
+                    name: None,
+                    type_label: None,
+                    is_dir: false,
+                    source: "locus".to_string(),
+                },
+                LocusFileDropRef {
+                    path: "../outside.txt".to_string(),
+                    name: None,
+                    type_label: None,
+                    is_dir: false,
+                    source: "locus".to_string(),
+                },
+            ],
+        );
+
+        assert!(paths.is_empty());
+    }
+
+    #[test]
+    fn unity_ref_drag_preview_label_uses_name_and_count() {
+        let refs = [
+            UnityEmbedAssetRef {
+                path: "Assets/Prefabs/Enemy.prefab".to_string(),
+                kind: "asset".to_string(),
+                name: Some("Enemy".to_string()),
+                type_label: None,
+                source: None,
+            },
+            UnityEmbedAssetRef {
+                path: "Assets/Prefabs/Ally.prefab".to_string(),
+                kind: "asset".to_string(),
+                name: Some("Ally".to_string()),
+                type_label: None,
+                source: None,
+            },
+        ];
+
+        assert_eq!(unity_ref_drag_preview_label(&refs, 1), "Enemy.prefab");
+        assert_eq!(unity_ref_drag_preview_label(&refs, 2), "Enemy.prefab +1");
+    }
+
+    #[test]
+    fn unity_ref_drag_preview_label_falls_back_to_asset_stem() {
+        let refs = [UnityEmbedAssetRef {
+            path: "Assets/Textures/Stone Wall.png".to_string(),
+            kind: "asset".to_string(),
+            name: None,
+            type_label: None,
+            source: None,
+        }];
+
+        assert_eq!(unity_ref_drag_preview_label(&refs, 1), "Stone Wall.png");
+    }
+
+    #[test]
+    fn unity_ref_drag_preview_label_uses_scene_object_name() {
+        let refs = [UnityEmbedAssetRef {
+            path: "Assets/Scenes/Main.unity/Environment/Player".to_string(),
+            kind: "sceneObject".to_string(),
+            name: None,
+            type_label: None,
+            source: None,
+        }];
+
+        assert_eq!(unity_ref_drag_preview_label(&refs, 1), "Player");
     }
 }

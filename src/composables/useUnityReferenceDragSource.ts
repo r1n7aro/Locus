@@ -1,7 +1,9 @@
 import {
+  startLocusNativeFileDrag,
   setUnityEmbedDragPassthrough,
   startUnityEmbedAssetDrag,
   startUnityNativeAssetFileDrag,
+  type LocusFileDropRef,
 } from "../services/unity";
 import type { AssetRefAttachment } from "../types";
 
@@ -51,6 +53,22 @@ async function beginNativeAssetFileDrag(refs: AssetRefAttachment[]) {
   }
 }
 
+async function beginNativeFileDrag(files: LocusFileDropRef[]) {
+  const shouldResetPassthrough = isUnityEmbedWindow();
+  try {
+    if (shouldResetPassthrough) {
+      await setUnityEmbedDragPassthrough(true);
+    }
+    await startLocusNativeFileDrag(files);
+  } catch (error) {
+    console.warn("[Locus] Failed to start native file drag", error);
+  } finally {
+    if (shouldResetPassthrough) {
+      void setUnityEmbedDragPassthrough(false);
+    }
+  }
+}
+
 export function startUnityReferenceHtmlDrag(event: DragEvent, refs: AssetRefAttachment[]) {
   if (refs.length === 0) return;
   event.preventDefault();
@@ -61,6 +79,12 @@ export function startUnityReferenceHtmlDrag(event: DragEvent, refs: AssetRefAtta
   }
 
   void beginUnityReferencePointerDrag(refs);
+}
+
+export function startLocusFileHtmlDrag(event: DragEvent, files: LocusFileDropRef[]) {
+  if (files.length === 0) return;
+  event.preventDefault();
+  event.stopPropagation();
 }
 
 function isUnityEmbedWindow(): boolean {
@@ -130,6 +154,61 @@ export function armUnityReferencePointerDrag(event: PointerEvent, refs: AssetRef
     const drag = useNativeFileDrag
       ? beginNativeAssetFileDrag(refs)
       : beginUnityReferencePointerDrag(refs);
+    const restoreTimer = restoreHtmlDraggable
+      ? window.setTimeout(restoreHtmlDraggableOnce, NATIVE_FILE_DRAG_RESTORE_MS)
+      : null;
+    void drag.finally(() => {
+      if (restoreTimer !== null) {
+        window.clearTimeout(restoreTimer);
+      }
+      restoreHtmlDraggableOnce();
+    });
+  };
+
+  const handlePointerEnd = () => {
+    cleanup();
+  };
+
+  window.addEventListener("pointermove", handlePointerMove, true);
+  window.addEventListener("pointerup", handlePointerEnd, true);
+  window.addEventListener("pointercancel", handlePointerEnd, true);
+}
+
+export function armLocusFilePointerDrag(event: PointerEvent, files: LocusFileDropRef[]) {
+  if (files.length === 0 || event.button !== 0) return;
+
+  const restoreHtmlDraggable = suppressHtmlDraggable(event);
+  const startX = event.clientX;
+  const startY = event.clientY;
+  let started = false;
+  let restored = false;
+
+  const restoreHtmlDraggableOnce = () => {
+    if (restored) return;
+    restored = true;
+    restoreHtmlDraggable?.();
+  };
+
+  const cleanup = (restoreDraggable = true) => {
+    window.removeEventListener("pointermove", handlePointerMove, true);
+    window.removeEventListener("pointerup", handlePointerEnd, true);
+    window.removeEventListener("pointercancel", handlePointerEnd, true);
+    if (restoreDraggable) {
+      restoreHtmlDraggableOnce();
+    }
+  };
+
+  const handlePointerMove = (moveEvent: PointerEvent) => {
+    if (started) return;
+    const dx = moveEvent.clientX - startX;
+    const dy = moveEvent.clientY - startY;
+    if (Math.hypot(dx, dy) < POINTER_DRAG_THRESHOLD_PX) return;
+
+    started = true;
+    moveEvent.preventDefault();
+    moveEvent.stopPropagation();
+    cleanup(false);
+    const drag = beginNativeFileDrag(files);
     const restoreTimer = restoreHtmlDraggable
       ? window.setTimeout(restoreHtmlDraggableOnce, NATIVE_FILE_DRAG_RESTORE_MS)
       : null;

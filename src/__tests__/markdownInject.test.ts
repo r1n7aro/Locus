@@ -310,6 +310,7 @@ describe("injectWorkspaceMentions", () => {
     expect(result).toContain("md-workspace-ref");
     expect(result).toContain("md-file-ref");
     expect(result).toContain('data-workspace-path="UIElementsSchema/UnityEditor.Overlays.xsd"');
+    expect(result).toContain('draggable="true"');
     expect(result).toContain('data-entry-kind="file"');
     expect(result).toContain('title="UIElementsSchema/UnityEditor.Overlays.xsd"');
     expect(result).toContain("@</span>UnityEditor.Overlays.xsd");
@@ -376,6 +377,7 @@ describe("injectFileRefs", () => {
     expect(result).toContain("md-file-ref");
     expect(result).toContain("ui-select-text");
     expect(result).toContain('data-file-path="src/components/ChatView.vue"');
+    expect(result).toContain('draggable="true"');
     expect(result).toContain('title="src/components/ChatView.vue"');
     expect(result).toContain("ChatView.vue");
   });
