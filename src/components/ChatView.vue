@@ -78,7 +78,6 @@ import {
 import { logToolCollapseTrace, previewTraceText } from "../services/toolCollapseTrace";
 import {
   captureTranscriptLayoutSnapshot,
-  isLayoutDiagnosticsEnabled,
   recordLayoutDiagnostic,
   traceViewportAnchorSample,
 } from "../services/layoutDiagnostics";
@@ -1197,15 +1196,13 @@ function clearSessionRestoreLayoutTimer() {
   sessionRestoreLayoutTimer = null;
 }
 
-function beginSessionRestoreLayoutStabilization(reason: string) {
+function beginSessionRestoreLayoutStabilization() {
   clearSessionRestoreLayoutTimer();
   sessionRestoreLayoutStabilizing.value = true;
   sessionRestoreViewportGuarding.value = true;
-  traceSessionScroll("layout-stabilize:begin", { reason });
 }
 
 function finishSessionRestoreLayoutStabilization(
-  reason: string,
   finalRestore?: {
     targetSessionId: string;
     state: ReturnType<typeof chatStore.getSessionScrollState>;
@@ -1215,59 +1212,34 @@ function finishSessionRestoreLayoutStabilization(
   sessionRestoreLayoutTimer = setTimeout(() => {
     sessionRestoreLayoutTimer = null;
     sessionRestoreLayoutStabilizing.value = false;
-    traceSessionScroll("layout-stabilize:end", {
-      reason,
-      finalRestoreTargetSessionId: finalRestore?.targetSessionId ?? null,
-    });
     if (!finalRestore) {
       sessionRestoreViewportGuarding.value = false;
       return;
     }
 
-    const restoreAfterLayoutClassSettled = (
-      stage: "layout-stabilize:final-restore" | "layout-stabilize:final-restore-settled",
-    ) => {
-      traceSessionScroll(`${stage}:before`, {
-        targetSessionId: finalRestore.targetSessionId,
-        state: finalRestore.state,
-      });
+    const restoreAfterLayoutClassSettled = () => {
       restoreMessagesScrollState(finalRestore.state, finalRestore.targetSessionId);
-      traceSessionScroll(`${stage}:after`, {
-        targetSessionId: finalRestore.targetSessionId,
-        state: finalRestore.state,
-      });
     };
 
     nextTick(() => {
       sessionRestoreFrame = requestViewportFrame(() => {
         sessionRestoreFrame = 0;
         if (props.activeSessionId !== finalRestore.targetSessionId) {
-          traceSessionScroll("layout-stabilize:final-restore:skip-stale-session", {
-            targetSessionId: finalRestore.targetSessionId,
-            state: finalRestore.state,
-          });
           sessionRestoreViewportGuarding.value = false;
           return;
         }
 
-        restoreAfterLayoutClassSettled("layout-stabilize:final-restore");
+        restoreAfterLayoutClassSettled();
         sessionRestoreFrame = requestViewportFrame(() => {
           sessionRestoreFrame = 0;
           if (props.activeSessionId !== finalRestore.targetSessionId) {
-            traceSessionScroll("layout-stabilize:final-restore-settled:skip-stale-session", {
-              targetSessionId: finalRestore.targetSessionId,
-              state: finalRestore.state,
-            });
             sessionRestoreViewportGuarding.value = false;
             return;
           }
 
-          restoreAfterLayoutClassSettled("layout-stabilize:final-restore-settled");
+          restoreAfterLayoutClassSettled();
           requestViewportFrame(() => {
             sessionRestoreViewportGuarding.value = false;
-            traceSessionScroll("layout-stabilize:guard-end", {
-              targetSessionId: finalRestore.targetSessionId,
-            });
           });
         });
       });
@@ -1275,12 +1247,11 @@ function finishSessionRestoreLayoutStabilization(
   }, SESSION_RESTORE_LAYOUT_STABILIZE_MS);
 }
 
-function cancelSessionRestoreLayoutStabilization(reason: string) {
+function cancelSessionRestoreLayoutStabilization() {
   clearSessionRestoreLayoutTimer();
   if (!sessionRestoreLayoutStabilizing.value && !sessionRestoreViewportGuarding.value) return;
   sessionRestoreLayoutStabilizing.value = false;
   sessionRestoreViewportGuarding.value = false;
-  traceSessionScroll("layout-stabilize:cancel", { reason });
 }
 
 function isSessionRestoreViewportGuardActive() {
@@ -1368,86 +1339,6 @@ function readSessionScrollMetrics(el: HTMLElement | null = getMessagesElement())
   };
 }
 
-function summarizeTranscriptElementForScrollLog(
-  sample: ReturnType<typeof captureTranscriptLayoutSnapshot>["currentAnchor"],
-) {
-  if (!sample) return null;
-  return {
-    key: sample.key,
-    kind: sample.kind,
-    scrollAnchorId: sample.scrollAnchorId,
-    messageAnchorId: sample.messageAnchorId,
-    renderPartKind: sample.renderPartKind,
-    textLength: sample.textLength,
-    textPreview: sample.textPreview,
-    rect: sample.rect,
-    offsetTop: sample.offsetTop,
-    contentTop: sample.contentTop,
-  };
-}
-
-function readSessionScrollSnapshot(stage: string) {
-  const scrollElement = getMessagesElement();
-  const contentElement = getMessagesContentElement();
-  if (!scrollElement) {
-    return {
-      metrics: null,
-      transcript: null,
-    };
-  }
-
-  const transcript = captureTranscriptLayoutSnapshot(
-    "chat-view",
-    `session-scroll:${stage}`,
-    scrollElement,
-    contentElement,
-  );
-  return {
-    metrics: readSessionScrollMetrics(scrollElement),
-    transcript: {
-      reason: transcript.reason,
-      contentHeight: transcript.contentHeight,
-      messageCount: transcript.messages.length,
-      anchorCount: transcript.anchors.length,
-      renderPartCount: transcript.renderParts.length,
-      currentAnchor: summarizeTranscriptElementForScrollLog(transcript.currentAnchor),
-      firstMessage: summarizeTranscriptElementForScrollLog(transcript.messages[0] ?? null),
-      lastMessage: summarizeTranscriptElementForScrollLog(transcript.messages[transcript.messages.length - 1] ?? null),
-      firstAnchor: summarizeTranscriptElementForScrollLog(transcript.anchors[0] ?? null),
-      lastAnchor: summarizeTranscriptElementForScrollLog(transcript.anchors[transcript.anchors.length - 1] ?? null),
-    },
-  };
-}
-
-function traceSessionScroll(stage: string, detail: Record<string, unknown> = {}) {
-  if (!isLayoutDiagnosticsEnabled()) return;
-
-  console.debug(`[Locus chat-scroll] ${stage}`, {
-    sessionId: props.activeSessionId ?? null,
-    pendingRestoreSessionId: pendingRestoreSessionId.value,
-    pendingRestoreMessagesRefEqualsCurrent: pendingRestoreMessagesRef.value === props.messages,
-    pendingRestoreAwaitingMessages: isPendingSessionRestoreAwaitingMessages(),
-    messages: {
-      count: props.messages.length,
-      firstId: props.messages[0]?.id ?? null,
-      lastId: props.messages[props.messages.length - 1]?.id ?? null,
-      lastRole: props.messages[props.messages.length - 1]?.role ?? null,
-    },
-    runtime: {
-      isStreaming: props.isStreaming,
-      activeToolCallCount: props.activeToolCalls.length,
-      toolHandoffViewportQuiet: toolHandoffViewportQuiet.value,
-      suppressScrollCapture,
-      hasSessionRestoreFrame: !!sessionRestoreFrame,
-      sessionRestoreLayoutStabilizing: sessionRestoreLayoutStabilizing.value,
-      sessionRestoreViewportGuarding: sessionRestoreViewportGuarding.value,
-    },
-    remembered: props.activeSessionId ? chatStore.getSessionScrollState(props.activeSessionId) : null,
-    ...readSessionScrollSnapshot(stage),
-    detail,
-  });
-}
-
 function traceToolViewportAnchor(phase: string, anchor: HTMLElement | null | undefined, detail: Record<string, unknown> = {}) {
   traceViewportAnchorSample({
     scope: "chat-view",
@@ -1483,21 +1374,12 @@ function runProgrammaticScrollUpdate(
   const el = getMessagesElement();
   if (!el) return;
 
-  const beforeMetrics = readSessionScrollMetrics(el);
   suppressScrollCapture = true;
   update(el);
-  const afterMetrics = readSessionScrollMetrics(el);
 
   if (sessionId) {
     chatStore.rememberSessionScrollState(sessionId, captureCurrentSessionScrollState(el));
   }
-
-  traceSessionScroll("programmatic-scroll", {
-    sessionId,
-    beforeMetrics,
-    afterMetrics,
-    capturedState: sessionId ? chatStore.getSessionScrollState(sessionId) : null,
-  });
 
   requestAnimationFrame(() => {
     suppressScrollCapture = false;
@@ -1541,9 +1423,6 @@ function restoreToolViewportAnchor() {
   const el = getMessagesElement();
   if (!anchorState || !el) return false;
   if (isSessionRestoreViewportGuardActive()) {
-    traceSessionScroll("tool-anchor:skip-session-restore", {
-      hasToolViewportAnchor: !!anchorState,
-    });
     clearToolViewportAnchor();
     return false;
   }
@@ -1663,21 +1542,11 @@ function restoreMessagesScrollState(
   if (!el) return;
 
   const nextScrollTop = resolveSessionScrollTop(readMessageMetrics(el), state);
-  traceSessionScroll("restore-scroll:before", {
-    sessionId,
-    state,
-    nextScrollTop,
-  });
   runProgrammaticScrollUpdate((element) => {
     if (!restoreScrollAnchor(element, state)) {
       element.scrollTop = nextScrollTop;
     }
   }, sessionId);
-  traceSessionScroll("restore-scroll:after", {
-    sessionId,
-    state,
-    nextScrollTop,
-  });
 }
 
 function resolvePendingSessionRestoreState(state: SessionScrollState | null): SessionScrollState | null {
@@ -1690,7 +1559,6 @@ function resolvePendingSessionRestoreState(state: SessionScrollState | null): Se
       readMessageMetrics(el),
     )
   ) {
-    traceSessionScroll("pending-restore:top-anchor-to-bottom", { state });
     return { mode: "bottom" };
   }
   return state;
@@ -1705,7 +1573,6 @@ function isPendingSessionRestoreAwaitingMessages() {
 
 function scrollToBottomNow(force = false) {
   if (isPendingSessionRestoreAwaitingMessages()) {
-    traceSessionScroll("scroll-bottom:skip-pending-restore", { force });
     return;
   }
 
@@ -1715,15 +1582,9 @@ function scrollToBottomNow(force = false) {
   const metrics = readMessageMetrics(el);
   const remembered = props.activeSessionId ? chatStore.getSessionScrollState(props.activeSessionId) : null;
   if (!shouldAutoScrollToBottom({ force, metrics, remembered })) {
-    traceSessionScroll("scroll-bottom:skip-auto-scroll", { force, metrics, remembered });
     return;
   }
 
-  traceSessionScroll("scroll-bottom:apply", {
-    force,
-    metrics,
-    remembered,
-  });
   setMessagesScrollTop(resolveSessionScrollTop(metrics, { mode: "bottom" }));
 }
 
@@ -1737,7 +1598,6 @@ const preserveScrollAnchorScheduler = createCoalescedScrollScheduler(() => {
   nextTick(() => {
     if (isPendingSessionRestoreAwaitingMessages()) return;
     if (isSessionRestoreViewportGuardActive()) {
-      traceSessionScroll("preserve-anchor:skip-session-restore");
       return;
     }
 
@@ -1783,22 +1643,17 @@ watch(toolHandoffViewportQuiet, (quiet, previousQuiet) => {
 });
 
 function reconcileViewport(forceBottom = false) {
-  traceSessionScroll("reconcile:start", { forceBottom });
   if (toolHandoffViewportQuiet.value) {
-    traceSessionScroll("reconcile:skip-tool-handoff-quiet", { forceBottom });
     return;
   }
   if (pendingRestoreSessionId.value && pendingRestoreSessionId.value === props.activeSessionId) {
-    traceSessionScroll("reconcile:pending-session-restore", { forceBottom });
     restorePendingSessionScroll();
     return;
   }
   if (sessionRestoreLayoutStabilizing.value) {
-    traceSessionScroll("reconcile:skip-session-restore-stabilizing", { forceBottom });
     return;
   }
   if (restoreToolViewportAnchor()) {
-    traceSessionScroll("reconcile:restored-tool-anchor", { forceBottom });
     return;
   }
 
@@ -1807,20 +1662,10 @@ function reconcileViewport(forceBottom = false) {
 
   const remembered = props.activeSessionId ? chatStore.getSessionScrollState(props.activeSessionId) : null;
   if (shouldAutoScrollToBottom({ force: forceBottom, metrics: readMessageMetrics(el), remembered })) {
-    traceSessionScroll("reconcile:auto-scroll-bottom", {
-      forceBottom,
-      remembered,
-      metrics: readMessageMetrics(el),
-    });
     scrollToBottom(forceBottom);
     return;
   }
 
-  traceSessionScroll("reconcile:preserve-anchor", {
-    forceBottom,
-    remembered,
-    metrics: readMessageMetrics(el),
-  });
   preserveScrollAnchor();
 }
 
@@ -1850,31 +1695,15 @@ function scheduleSessionRestoreFollowup(
   state: ReturnType<typeof chatStore.getSessionScrollState>,
 ) {
   cancelSessionRestoreFrame();
-  traceSessionScroll("session-restore-followup:schedule", {
-    targetSessionId,
-    state,
-  });
   sessionRestoreFrame = requestViewportFrame(() => {
     sessionRestoreFrame = 0;
     if (props.activeSessionId !== targetSessionId) {
-      traceSessionScroll("session-restore-followup:skip-stale-session", {
-        targetSessionId,
-        state,
-      });
-      cancelSessionRestoreLayoutStabilization("stale-session-followup");
+      cancelSessionRestoreLayoutStabilization();
       return;
     }
 
-    traceSessionScroll("session-restore-followup:before", {
-      targetSessionId,
-      state,
-    });
     restoreMessagesScrollState(state, targetSessionId);
-    traceSessionScroll("session-restore-followup:after", {
-      targetSessionId,
-      state,
-    });
-    finishSessionRestoreLayoutStabilization("session-restore-followup", {
+    finishSessionRestoreLayoutStabilization({
       targetSessionId,
       state,
     });
@@ -1884,49 +1713,25 @@ function scheduleSessionRestoreFollowup(
 function restorePendingSessionScroll(options: { defer?: boolean } = {}) {
   const targetSessionId = pendingRestoreSessionId.value;
   if (!targetSessionId || targetSessionId !== props.activeSessionId) {
-    traceSessionScroll("pending-restore:skip-session-mismatch", {
-      targetSessionId,
-      activeSessionId: props.activeSessionId,
-      options,
-    });
     return;
   }
   if (isPendingSessionRestoreAwaitingMessages()) {
-    traceSessionScroll("pending-restore:skip-awaiting-messages", {
-      targetSessionId,
-      options,
-    });
     return;
   }
 
   const restore = () => {
     const el = getMessagesElement();
     if (!el || pendingRestoreSessionId.value !== props.activeSessionId) {
-      traceSessionScroll("pending-restore:skip-before-apply", {
-        targetSessionId,
-        hasScrollElement: !!el,
-        pendingRestoreSessionId: pendingRestoreSessionId.value,
-        activeSessionId: props.activeSessionId,
-      });
       return;
     }
 
     const remembered = resolvePendingSessionRestoreState(chatStore.getSessionScrollState(targetSessionId));
-    traceSessionScroll("pending-restore:apply", {
-      targetSessionId,
-      remembered,
-      options,
-    });
     restoreMessagesScrollState(remembered, targetSessionId);
     finishPendingSessionRestore(targetSessionId);
     scheduleSessionRestoreFollowup(targetSessionId, remembered);
   };
 
   if (options.defer) {
-    traceSessionScroll("pending-restore:defer-next-tick", {
-      targetSessionId,
-      options,
-    });
     nextTick(restore);
     return;
   }
@@ -1943,9 +1748,6 @@ function onMessagesScroll() {
     return;
   }
   if (isSessionRestoreViewportGuardActive()) {
-    traceSessionScroll("scroll-capture:skip-session-restore", {
-      metrics: readSessionScrollMetrics(),
-    });
     recordLayoutDiagnostic("chat.sessionScroll.scrollEventSkippedDuringRestore", {
       sessionId: props.activeSessionId ?? null,
       pendingRestoreSessionId: pendingRestoreSessionId.value,
@@ -1955,7 +1757,7 @@ function onMessagesScroll() {
     return;
   }
   cancelSessionRestoreFrame();
-  cancelSessionRestoreLayoutStabilization("user-scroll");
+  cancelSessionRestoreLayoutStabilization();
   scrollToBottomScheduler.cancel();
   preserveScrollAnchorScheduler.cancel();
   streamEndScrollScheduler.cancel();
@@ -2000,31 +1802,19 @@ function cancelTranscriptResizeReconcileFrame() {
 }
 
 function performTranscriptResizeReconcile() {
-  traceSessionScroll("resize-reconcile:start", {
-    suppressScrollCapture,
-    toolHandoffViewportQuiet: toolHandoffViewportQuiet.value,
-  });
   if (suppressScrollCapture || toolHandoffViewportQuiet.value) {
-    traceSessionScroll("resize-reconcile:skip-suppressed-or-quiet", {
-      suppressScrollCapture,
-      toolHandoffViewportQuiet: toolHandoffViewportQuiet.value,
-    });
     return;
   }
   if (pendingRestoreSessionId.value && pendingRestoreSessionId.value === props.activeSessionId) {
-    traceSessionScroll("resize-reconcile:pending-session-restore");
     restorePendingSessionScroll();
     return;
   }
   if (sessionRestoreLayoutStabilizing.value) {
-    traceSessionScroll("resize-reconcile:skip-session-restore-stabilizing");
     return;
   }
   if (restoreToolViewportAnchor()) {
-    traceSessionScroll("resize-reconcile:restored-tool-anchor");
     return;
   }
-  traceSessionScroll("resize-reconcile:reconcile-viewport");
   reconcileViewport();
 }
 
@@ -2032,7 +1822,6 @@ function scheduleTranscriptResizeReconcile(reason: string) {
   transcriptResizeReconcilePending = true;
   if (transcriptResizeFrame) return;
 
-  traceSessionScroll("resize-reconcile:schedule", { reason });
   transcriptResizeFrame = requestViewportFrame(() => {
     transcriptResizeFrame = 0;
     if (!transcriptResizeReconcilePending) return;
@@ -2053,10 +1842,6 @@ function scheduleTranscriptResizeReconcile(reason: string) {
 
 function handleTranscriptResize() {
   const viewportResizing = noteTranscriptViewportResize();
-  traceSessionScroll("resize-observer", {
-    viewportResizing,
-    liveResizeInProgress: isLiveResizeInProgress(),
-  });
   if (viewportResizing || isLiveResizeInProgress()) {
     transcriptResizeReconcilePending = true;
     recordLayoutDiagnostic("chat.transcript.resize.defer", {
@@ -2105,16 +1890,10 @@ function connectTranscriptResizeObserver() {
 watch(
   () => props.activeSessionId,
   (nextSessionId, previousSessionId) => {
-    traceSessionScroll("session-id-change:start", {
-      nextSessionId,
-      previousSessionId,
-      nextRemembered: nextSessionId ? chatStore.getSessionScrollState(nextSessionId) : null,
-      previousRemembered: previousSessionId ? chatStore.getSessionScrollState(previousSessionId) : null,
-    });
     if (nextSessionId) {
-      beginSessionRestoreLayoutStabilization("session-id-change");
+      beginSessionRestoreLayoutStabilization();
     } else {
-      cancelSessionRestoreLayoutStabilization("session-id-cleared");
+      cancelSessionRestoreLayoutStabilization();
     }
     clearToolViewportAnchor();
     scrollToBottomScheduler.cancel();
@@ -2133,27 +1912,13 @@ watch(
     if (shouldRestoreImmediately) {
       restorePendingSessionScroll({ defer: true });
     }
-    traceSessionScroll("session-id-change:pending-restore-armed", {
-      nextSessionId,
-      previousSessionId,
-      shouldRestoreImmediately,
-      pendingRestoreMessagesRefEqualsCurrent: pendingRestoreMessagesRef.value === props.messages,
-      nextRemembered: nextSessionId ? chatStore.getSessionScrollState(nextSessionId) : null,
-    });
   },
   { flush: "sync" },
 );
 
 watch(
   () => props.messages,
-  (messages, previous) => {
-    traceSessionScroll("messages-changed:pending-watcher", {
-      previousCount: previous?.length ?? 0,
-      nextCount: messages.length,
-      pendingRestoreSessionId: pendingRestoreSessionId.value,
-      activeSessionId: props.activeSessionId,
-      sameAsPendingRef: messages === pendingRestoreMessagesRef.value,
-    });
+  (messages) => {
     if (!pendingRestoreSessionId.value || pendingRestoreSessionId.value !== props.activeSessionId) return;
     if (messages === pendingRestoreMessagesRef.value) return;
     restorePendingSessionScroll();
@@ -2164,12 +1929,6 @@ watch(
 watch(
   () => props.messages,
   (messages, previous) => {
-    traceSessionScroll("messages-changed:reconcile-watcher", {
-      previousCount: previous?.length ?? 0,
-      nextCount: messages.length,
-      hasPendingRestore: !!pendingRestoreSessionId.value,
-      sameRef: messages === previous,
-    });
     if (messages === previous || pendingRestoreSessionId.value) return;
     reconcileViewport();
   },
@@ -2177,12 +1936,7 @@ watch(
 );
 watch(
   () => props.messages.length,
-  (nextLength, previousLength) => {
-    traceSessionScroll("messages-length-changed", {
-      previousLength,
-      nextLength,
-      hasPendingRestore: !!pendingRestoreSessionId.value,
-    });
+  () => {
     reconcileViewport();
   },
   { flush: "post" },
@@ -2421,7 +2175,7 @@ onUnmounted(() => {
   preserveScrollAnchorScheduler.cancel();
   streamEndScrollScheduler.cancel();
   cancelSessionRestoreFrame();
-  cancelSessionRestoreLayoutStabilization("unmount");
+  cancelSessionRestoreLayoutStabilization();
   clearSessionRestoreLayoutTimer();
   clearToolViewportAnchor();
   clearStreamingTextFlushTimer();

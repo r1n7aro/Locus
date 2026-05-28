@@ -305,7 +305,7 @@ describe("chat sidebar layout", () => {
     expect(transcript).toContain("collapseFinished: handoff?.collapseFinished ?? false");
     expect(chatView).toContain("toolHandoffViewportQuiet.value = false;");
     expect(chatView).toContain("if (suppressScrollCapture || toolHandoffViewportQuiet.value) {");
-    expect(chatView).toContain('traceSessionScroll("resize-reconcile:skip-suppressed-or-quiet"');
+    expect(chatView).not.toContain("traceSessionScroll");
   });
 
   it("keeps handoff waiting out of the transient tool group layout", () => {
