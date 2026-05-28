@@ -43,7 +43,7 @@ export function selectUnityAsset(
   assetPath: string,
   options: SelectUnityAssetOptions = {},
 ): Promise<void> {
-  const focusProjectWindow = options.focusProjectWindow ?? getLocusRuntime().kind !== "unity";
+  const focusProjectWindow = options.focusProjectWindow ?? true;
   return ipcInvoke("select_unity_asset", { assetPath, focusProjectWindow });
 }
 
@@ -77,10 +77,28 @@ export function activateUnityEmbedForInput(): Promise<void> {
   return runtime.invoke("unity_embed_activate_for_input");
 }
 
+export function setUnityEmbedDragPassthrough(active: boolean): Promise<void> {
+  const runtime = getLocusRuntime();
+  if (runtime.kind !== "tauri") return Promise.resolve();
+  return runtime.invoke("unity_embed_set_drag_passthrough", { active });
+}
+
 export function commitUnityEmbedAssetDrop(): Promise<void> {
   const runtime = getLocusRuntime();
   if (runtime.kind !== "tauri") return Promise.resolve();
   return runtime.invoke("unity_embed_commit_asset_drop");
+}
+
+export function startUnityEmbedAssetDrag(refs: AssetRefAttachment[]): Promise<void> {
+  const runtime = getLocusRuntime();
+  if (runtime.kind !== "tauri" || refs.length === 0) return Promise.resolve();
+  return runtime.invoke("unity_embed_start_asset_drag", { request: { refs } });
+}
+
+export function startUnityNativeAssetFileDrag(refs: AssetRefAttachment[]): Promise<void> {
+  const runtime = getLocusRuntime();
+  if (runtime.kind !== "tauri" || refs.length === 0) return Promise.resolve();
+  return runtime.invoke("unity_embed_start_native_asset_file_drag", { request: { refs } });
 }
 
 export interface UnityEmbedAssetDropPayload {
@@ -120,6 +138,14 @@ export interface LocusFileDropPayload {
   files: LocusFileDropRef[];
 }
 
+export interface LocusFileDragStatePayload {
+  phase: "enter" | "over" | "drop" | "leave";
+  active: boolean;
+  fileCount: number;
+  x: number;
+  y: number;
+}
+
 export interface UnityEmbedAssetDragStatePayload {
   hasRefs: boolean;
   refs: AssetRefAttachment[];
@@ -151,6 +177,14 @@ export function subscribeLocusFileDrop(
   const runtime = getLocusRuntime();
   if (runtime.kind !== "tauri") return Promise.resolve(() => {});
   return runtime.subscribe<LocusFileDropPayload>("locus-file-drop", handler);
+}
+
+export function subscribeLocusFileDragState(
+  handler: (payload: LocusFileDragStatePayload) => void,
+): Promise<() => void> {
+  const runtime = getLocusRuntime();
+  if (runtime.kind !== "tauri") return Promise.resolve(() => {});
+  return runtime.subscribe<LocusFileDragStatePayload>("locus-file-drag-state", handler);
 }
 
 export function subscribeUnityEmbedAssetDragState(

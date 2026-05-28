@@ -324,11 +324,13 @@ describe("chat sidebar layout", () => {
     expect(transcript).toContain("const isToolWaitingRowVisible = computed(() => isToolWaitingForResponse.value && !hasToolCallHandoff.value);");
     expect(transcript).toContain("const isToolWaitingStatusVisible = computed(() => isToolWaitingForResponse.value && hasToolCallHandoff.value);");
     expect(transcript).toContain("const isStandaloneWaitingPlaceholder = computed(() => isWaitingForResponse.value && !hasTransientToolCalls.value);");
+    expect(transcript).toContain("const effectiveWaitingLabel = computed(() => props.isCompacting ? props.compactingLabel : props.waitingLabel);");
+    expect(transcript).toContain("const hasStandaloneCompactingPlaceholder = computed(() => props.isCompacting && !isWaitingForResponse.value);");
     expect(transcript).toContain("showWaiting: false,");
     expect(transcript).toContain("lastToolSegment.showWaiting = true;");
     expect(transcript).toContain("segment.showWaiting && isToolWaitingRowVisible");
     expect(transcript).toContain(":show-waiting-status=\"segment.showWaiting && isToolWaitingStatusVisible\"");
-    expect(transcript).toContain(":waiting-label=\"waitingLabel\"");
+    expect(transcript).toContain(":waiting-label=\"effectiveWaitingLabel\"");
     expect(transcript).toContain(":data-tool-layout-waiting-status=\"String(segment.showWaiting && isToolWaitingStatusVisible)\"");
     expect(transcript).not.toContain("segment.showWaiting && isToolWaitingForResponse");
     expect(toolCollection).toContain("showWaitingStatus?: boolean;");
@@ -339,7 +341,7 @@ describe("chat sidebar layout", () => {
     expect(toolCollection).toContain("top: calc(100% + 6px);");
     expect(toolCollection).toContain("pointer-events: none;");
     expect(transcript).toContain("import ChatWaitingIndicator from \"./ChatWaitingIndicator.vue\";");
-    expect(transcript).toContain("<ChatWaitingIndicator :label=\"waitingLabel\" compact />");
+    expect(transcript).toContain("<ChatWaitingIndicator :label=\"effectiveWaitingLabel\" compact />");
     expect(transcript).toContain("<ChatWaitingIndicator :label=\"segment.label\" />");
     expect(toolCollection).toContain("import ChatWaitingIndicator from \"./chat/ChatWaitingIndicator.vue\";");
     expect(toolCollection).toContain("<ChatWaitingIndicator :label=\"waitingLabel\" compact />");

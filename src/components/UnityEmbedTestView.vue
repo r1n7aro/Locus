@@ -24,24 +24,11 @@ interface PingResponse {
   };
 }
 
-interface EditorInfoResponse {
-  ok: boolean;
-  runtime: string;
-  unityVersion: string;
-  projectPath: string;
-  activeScenePath: string;
-  isPlaying: boolean;
-  isPaused: boolean;
-  port: number;
-}
-
 const runtime = getLocusRuntime();
 const loading = ref(false);
 const error = ref<string | null>(null);
 const ping = ref<PingResponse | null>(null);
-const editorInfo = ref<EditorInfoResponse | null>(null);
 const invokePing = ref<PingResponse | null>(null);
-const isUnityRuntime = computed(() => runtime.kind === "unity");
 
 const statusText = computed(() => {
   if (error.value) return t("unity.embed.status.failed");
@@ -54,21 +41,10 @@ async function refresh() {
   loading.value = true;
   error.value = null;
   try {
-    if (isUnityRuntime.value) {
-      const [nextPing, nextInfo] = await Promise.all([
-        runtime.request<PingResponse>("/ping"),
-        runtime.request<EditorInfoResponse>("/editor-info"),
-      ]);
-      ping.value = nextPing;
-      editorInfo.value = nextInfo;
-    } else {
-      ping.value = await runtime.invoke<PingResponse>("unity_embed_status");
-      editorInfo.value = null;
-    }
+    ping.value = await runtime.invoke<PingResponse>("unity_embed_status");
   } catch (cause) {
     error.value = cause instanceof Error ? cause.message : String(cause);
     ping.value = null;
-    editorInfo.value = null;
   } finally {
     loading.value = false;
   }
@@ -77,9 +53,7 @@ async function refresh() {
 async function runInvokePing() {
   error.value = null;
   try {
-    invokePing.value = await runtime.invoke<PingResponse>(
-      isUnityRuntime.value ? "unity_embed_ping" : "unity_embed_status",
-    );
+    invokePing.value = await runtime.invoke<PingResponse>("unity_embed_status");
   } catch (cause) {
     error.value = cause instanceof Error ? cause.message : String(cause);
     invokePing.value = null;
@@ -112,10 +86,10 @@ onMounted(() => {
         </div>
         <div class="uet-row">
           <span>Bridge</span>
-          <strong>{{ runtime.unityBridgeUrl || ping?.pipeName || "empty" }}</strong>
+          <strong>{{ ping?.pipeName || "empty" }}</strong>
         </div>
         <div class="uet-row">
-          <span>HTTP Ping</span>
+          <span>Status</span>
           <strong>{{ ping?.message || "empty" }}</strong>
         </div>
         <div class="uet-row">
@@ -134,24 +108,8 @@ onMounted(() => {
 
       <section class="uet-pane uet-main">
         <div class="uet-section">
-          <h2>Editor</h2>
+          <h2>Overlay</h2>
           <dl>
-            <div>
-              <dt>Unity</dt>
-              <dd>{{ editorInfo?.unityVersion || "empty" }}</dd>
-            </div>
-            <div>
-              <dt>Mode</dt>
-              <dd>{{ editorInfo?.isPlaying ? (editorInfo.isPaused ? "playing paused" : "playing") : "editing" }}</dd>
-            </div>
-            <div>
-              <dt>Project</dt>
-              <dd>{{ editorInfo?.projectPath || "empty" }}</dd>
-            </div>
-            <div>
-              <dt>Scene</dt>
-              <dd>{{ editorInfo?.activeScenePath || "empty" }}</dd>
-            </div>
             <div v-if="ping?.control">
               <dt>Updates</dt>
               <dd>{{ ping.control.updateCount }}</dd>

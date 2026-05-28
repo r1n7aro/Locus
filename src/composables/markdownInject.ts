@@ -234,7 +234,7 @@ function renderUnityAssetRef(filePath: string, line = ""): string {
     normalizedPath,
     line,
     "md-unity-asset-ref",
-    ` data-asset-path="${escaped}" data-asset-kind="${kind}"`,
+    ` data-asset-path="${escaped}" data-asset-kind="${kind}" draggable="true"`,
     renderUnityAssetIcon(kind),
   );
 }
@@ -313,7 +313,7 @@ function renderUnitySceneObjectRef(filePath: string): string {
   const escapedObjectPath = escapeAttr(ref.objectPath);
   const escapedLabel = escapeAttr(displaySceneObjectRef(ref.objectPath));
   const icon = renderRefIcon("gameobject", "md-unity-gameobject-icon");
-  return `<span class="md-file-ref md-unity-scene-object-ref ui-select-text" data-file-path="${escapedFullPath}" data-scene-path="${escapedScenePath}" data-scene-object-path="${escapedObjectPath}" title="${escapedFullPath}" aria-label="${escapedFullPath}">${icon}<span class="md-ref-label">${escapedLabel}</span></span>`;
+  return `<span class="md-file-ref md-unity-scene-object-ref ui-select-text" data-file-path="${escapedFullPath}" data-scene-path="${escapedScenePath}" data-scene-object-path="${escapedObjectPath}" draggable="true" title="${escapedFullPath}" aria-label="${escapedFullPath}">${icon}<span class="md-ref-label">${escapedLabel}</span></span>`;
 }
 
 function isSceneObjectRefTerminator(ch: string): boolean {

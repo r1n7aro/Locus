@@ -1340,7 +1340,8 @@ const isToolWaitingForResponse = computed(() => isWaitingForResponse.value && ha
 const isToolWaitingRowVisible = computed(() => isToolWaitingForResponse.value && !hasToolCallHandoff.value);
 const isToolWaitingStatusVisible = computed(() => isToolWaitingForResponse.value && hasToolCallHandoff.value);
 const isStandaloneWaitingPlaceholder = computed(() => isWaitingForResponse.value && !hasTransientToolCalls.value);
-const hasStandaloneCompactingPlaceholder = computed(() => props.isCompacting);
+const effectiveWaitingLabel = computed(() => props.isCompacting ? props.compactingLabel : props.waitingLabel);
+const hasStandaloneCompactingPlaceholder = computed(() => props.isCompacting && !isWaitingForResponse.value);
 const hasTransientAssistantMessage = computed(
   () =>
     hasStreamingContent.value
@@ -1929,10 +1930,11 @@ const transientRenderSegments = computed<TransientRenderSegment[]>(() => {
   }
 
   if (hasStandaloneCompactingPlaceholder.value || isStandaloneWaitingPlaceholder.value) {
+    const isCompactingPlaceholder = props.isCompacting;
     segments.push({
       type: "waiting",
-      key: hasStandaloneCompactingPlaceholder.value ? "transient:compacting" : "transient:waiting",
-      label: hasStandaloneCompactingPlaceholder.value ? props.compactingLabel : props.waitingLabel,
+      key: isCompactingPlaceholder ? "transient:compacting" : "transient:waiting",
+      label: isCompactingPlaceholder ? props.compactingLabel : props.waitingLabel,
     });
   }
 
@@ -2368,6 +2370,7 @@ function openImage(src: string) {
                     :key="`${assetRef.kind}:${assetRef.path}`"
                     :path="assetRef.path"
                     :kind="assetRef.kind"
+                    context-menu-mode="inherit"
                   />
                 </div>
 
@@ -2440,6 +2443,7 @@ function openImage(src: string) {
                       v-if="segment.type === 'asset' || segment.type === 'knowledge'"
                       :path="segment.value"
                       :kind="segment.type === 'knowledge' ? 'knowledge' : undefined"
+                      context-menu-mode="inherit"
                     />
                     <template v-else>{{ segment.value }}</template>
                   </template>
@@ -2642,7 +2646,7 @@ function openImage(src: string) {
                     :collapse-enabled="segment.collapseEnabled"
                     :animate-collapse-on-mount="segment.animateCollapseOnMount"
                     :show-waiting-status="segment.showWaiting && isToolWaitingStatusVisible"
-                    :waiting-label="waitingLabel"
+                    :waiting-label="effectiveWaitingLabel"
                     @collapse-finished="onTransientToolCallsCollapseFinished"
                     @viewport-anchor-start="emitToolViewportAnchorStart"
                     @viewport-anchor-end="emitToolViewportAnchorEnd"
@@ -2657,7 +2661,7 @@ function openImage(src: string) {
                     </template>
                   </ToolCallCollection>
                   <div v-if="segment.showWaiting && isToolWaitingRowVisible" class="chat-transcript-tool-waiting-row">
-                    <ChatWaitingIndicator :label="waitingLabel" compact />
+                    <ChatWaitingIndicator :label="effectiveWaitingLabel" compact />
                   </div>
                 </div>
 

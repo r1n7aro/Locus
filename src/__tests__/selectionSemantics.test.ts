@@ -28,6 +28,7 @@ describe("selection semantics", () => {
     const commitDetail = read("src/components/collab/CommitDetail.vue");
     const gitSidebar = read("src/components/collab/GitSidebar.vue");
     const markdownRenderer = read("src/components/MarkdownRenderer.vue");
+    const assetChip = read("src/components/AssetChip.vue");
 
     expect(chatView).toContain('class="chat-view-layout"');
     expect(chatTranscript).toMatch(/class="[^"]*\bchat-transcript-plain-text\b[^"]*\bui-select-text\b/);
@@ -46,5 +47,10 @@ describe("selection semantics", () => {
 
     expect(gitSidebar).toMatch(/class="[^"]*\bsidebar-item\b[^"]*\bui-select-none\b"[\s\S]*'stash-item': true/);
     expect(markdownRenderer).toContain('class="markdown-body ui-select-text"');
+    expect(markdownRenderer).toMatch(/\.md-asset-chip\s*\{[\s\S]*?user-select:\s*none;/);
+    expect(markdownRenderer).toMatch(/\.md-file-ref\s*\{[\s\S]*?user-select:\s*none;/);
+    expect(markdownRenderer).toMatch(/\.md-workspace-ref\s*\{[\s\S]*?user-select:\s*none;/);
+    expect(markdownRenderer).toContain(".markdown-body :is(.md-asset-chip, .md-file-ref, .md-workspace-ref)");
+    expect(assetChip).toMatch(/\.asset-chip\s*\{[\s\S]*?user-select:\s*none;/);
   });
 });

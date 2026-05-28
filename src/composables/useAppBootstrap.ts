@@ -427,7 +427,7 @@ export function useAppBootstrap() {
     markStartupPhase("register_listeners_enter");
     const runtime = getLocusRuntime();
     markStartupPhase("register_listeners_runtime_ready", { runtime: runtime.kind });
-    if ((runtime.kind === "browser" || runtime.kind === "unity") && !runtime.unityBridgeUrl) {
+    if (runtime.kind === "browser") {
       markStartupPhase("register_listeners_skipped");
       return;
     }

@@ -33,6 +33,9 @@ describe("chat composer draft persistence", () => {
     expect(richInput).toContain("function removeAssetRef(index: number)");
     expect(richInput).toContain("setAssetRefAttachments(next);");
     expect(richInput).toContain("applyAssetRefSyncMessage(event.data);");
+    expect(richInput).toContain("const RECENT_ASSET_REF_REMOVAL_SUPPRESS_MS = 100;");
+    expect(richInput).toContain("recentlyRemovedAssetRefKeys");
+    expect(richInput).toContain("respectRecentRemoval: true");
   });
 
   it("converts Unity mention refs into composer asset references", () => {

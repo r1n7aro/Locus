@@ -15,8 +15,13 @@ import { normalizeExternalMarkdownHref } from "../composables/markdownExternalLi
 import { injectAssetRefs, injectFileRefs, injectWorkspaceMentions } from "../composables/markdownInject";
 import { normalizeMarkdownForRender } from "../composables/markdownRender";
 import { wrapMarkdownTables } from "../composables/markdownTableHtml";
+import {
+  armUnityReferencePointerDrag,
+  startUnityReferenceHtmlDrag,
+} from "../composables/useUnityReferenceDragSource";
 import { resolveMarkdownImage } from "../services/markdownImage";
 import { hasTauriWindowRuntime } from "../services/tauriRuntime";
+import type { AssetRefAttachment } from "../types";
 
 const props = defineProps<{
   content: string;
@@ -307,6 +312,53 @@ function handleMarkdownContentActivation(event: MouseEvent) {
   event.stopPropagation();
   emit("openImage", image.currentSrc || image.src);
 }
+
+function normalizeUnityRefDatasetPath(value?: string): string {
+  return (value ?? "").trim().replace(/\\/g, "/").replace(/\/+$/g, "");
+}
+
+function unityRefFromMarkdownDragTarget(target: Element): AssetRefAttachment | null {
+  const sceneRef = target.closest(".md-unity-scene-object-ref") as HTMLElement | null;
+  if (sceneRef) {
+    const scenePath = normalizeUnityRefDatasetPath(sceneRef.dataset.scenePath);
+    const objectPath = normalizeUnityRefDatasetPath(sceneRef.dataset.sceneObjectPath);
+    if (scenePath && objectPath) {
+      return {
+        kind: "sceneObject",
+        path: `${scenePath}/${objectPath}`,
+        source: "manual",
+      };
+    }
+  }
+
+  const assetRef = target.closest(".md-unity-asset-ref, .md-file-ref[data-asset-path]") as HTMLElement | null;
+  if (assetRef) {
+    const assetPath = normalizeUnityRefDatasetPath(assetRef.dataset.assetPath || assetRef.dataset.filePath);
+    if (/^(Assets|Packages)\//i.test(assetPath)) {
+      return {
+        kind: "asset",
+        path: assetPath,
+        source: "manual",
+      };
+    }
+  }
+
+  return null;
+}
+
+function handleMarkdownDragStart(event: DragEvent) {
+  if (!(event.target instanceof Element)) return;
+  const ref = unityRefFromMarkdownDragTarget(event.target);
+  if (!ref) return;
+  startUnityReferenceHtmlDrag(event, [ref]);
+}
+
+function handleMarkdownPointerDown(event: PointerEvent) {
+  if (!(event.target instanceof Element)) return;
+  const ref = unityRefFromMarkdownDragTarget(event.target);
+  if (!ref) return;
+  armUnityReferencePointerDrag(event, [ref]);
+}
 </script>
 
 <template>
@@ -315,6 +367,8 @@ function handleMarkdownContentActivation(event: MouseEvent) {
     class="markdown-body ui-select-text"
     @click="handleMarkdownContentActivation"
     @auxclick="handleMarkdownContentActivation"
+    @pointerdown="handleMarkdownPointerDown"
+    @dragstart="handleMarkdownDragStart"
     v-html="renderedHtml"
   />
 </template>
@@ -649,6 +703,8 @@ function handleMarkdownContentActivation(event: MouseEvent) {
   vertical-align: baseline;
   font-weight: 500;
   color: var(--text-secondary);
+  user-select: none;
+  -webkit-user-select: none;
 }
 
 .md-asset-chip:hover {
@@ -679,6 +735,8 @@ function handleMarkdownContentActivation(event: MouseEvent) {
   vertical-align: -2px;
   font-weight: 400;
   color: color-mix(in srgb, var(--text-color) 90%, var(--text-secondary) 10%);
+  user-select: none;
+  -webkit-user-select: none;
 }
 
 .md-unity-asset-ref,
@@ -705,6 +763,13 @@ function handleMarkdownContentActivation(event: MouseEvent) {
   vertical-align: -2px;
   font-weight: 400;
   color: color-mix(in srgb, var(--text-color) 86%, var(--text-secondary) 14%);
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.markdown-body :is(.md-asset-chip, .md-file-ref, .md-workspace-ref) {
+  user-select: none;
+  -webkit-user-select: none;
 }
 
 .md-file-ref:hover,

@@ -36,7 +36,6 @@ import { isUnityReferenceImportWindowLocation } from "./services/unityReferenceI
 import { isReferenceExternalImportWindowLocation } from "./services/referenceExternalImportWindow";
 import { isCollabSearchWindowLocation } from "./services/collabSearchWindow";
 import { isChatDiffReviewWindowLocation } from "./services/chatDiffReviewWindow";
-import { isUnityHostLocation } from "./services/locusRuntime";
 import { isViewHostWindowLocation } from "./services/view";
 import { isAgentGraphToolWindowLocation } from "./services/agentGraphTool";
 import {
@@ -47,8 +46,7 @@ import {
 } from "./services/tauriRuntime";
 import { markStartupPhase } from "./services/startupPerf";
 const isUnityEmbedTestWindow = window.location.pathname === "/unity-embed-test";
-const isUnityEmbedWindow = !isUnityEmbedTestWindow
-  && (window.location.pathname === "/unity-embed" || isUnityHostLocation());
+const isUnityEmbedWindow = !isUnityEmbedTestWindow && window.location.pathname === "/unity-embed";
 const isKnowledgeDownloadWindow = isKnowledgeDownloadWindowLocation();
 const isKnowledgeLexicalProgressWindow = isKnowledgeLexicalProgressWindowLocation();
 const isFeishuReferenceImportWindow = isFeishuReferenceImportWindowLocation();

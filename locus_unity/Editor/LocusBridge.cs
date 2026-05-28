@@ -1122,6 +1122,49 @@ namespace Locus
             return new SceneObjectRequest();
         }
 
+        private static StartAssetDragRequest ParseStartAssetDragRequest(string message)
+        {
+            string payload = (message ?? "").Trim();
+            if (payload.StartsWith("{", StringComparison.Ordinal))
+            {
+                try
+                {
+                    StartAssetDragRequest request = JsonUtility.FromJson<StartAssetDragRequest>(payload);
+                    if (request != null)
+                    {
+                        NormalizeStartAssetDragRefs(request.refs);
+                        return request;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogWarning("[Locus] Failed to parse start_asset_drag payload: " + ex.Message);
+                }
+            }
+
+            return new StartAssetDragRequest
+            {
+                refs = new LocusEditorWindow.DroppedAssetRef[0]
+            };
+        }
+
+        private static void NormalizeStartAssetDragRefs(LocusEditorWindow.DroppedAssetRef[] refs)
+        {
+            if (refs == null)
+                return;
+
+            foreach (LocusEditorWindow.DroppedAssetRef assetRef in refs)
+            {
+                if (assetRef == null)
+                    continue;
+                assetRef.path = (assetRef.path ?? "").Trim().Replace('\\', '/').TrimEnd('/');
+                assetRef.kind = (assetRef.kind ?? "").Trim();
+                assetRef.name = (assetRef.name ?? "").Trim();
+                assetRef.typeLabel = (assetRef.typeLabel ?? "").Trim();
+                assetRef.source = (assetRef.source ?? "").Trim();
+            }
+        }
+
         // ───────────────── Message dispatch ─────────────────
 
         /// <summary>
@@ -1461,6 +1504,28 @@ namespace Locus
                             {
                                 LocusSceneObjectUtility.OpenSceneObjectInspector(request.scenePath, request.objectPath);
                                 tcs.SetResult(OkResponse(reqId, "ok"));
+                            }
+                            catch (Exception ex)
+                            {
+                                tcs.SetResult(ErrorResponse(reqId, ex.Message));
+                            }
+                        });
+                        return await tcs.Task;
+                    }
+
+                    case "start_asset_drag":
+                    {
+                        StartAssetDragRequest request = ParseStartAssetDragRequest(msg.message);
+                        var tcs = new TaskCompletionSource<PipeEnvelope>();
+                        PostToMainThread(delegate
+                        {
+                            try
+                            {
+                                string status;
+                                if (LocusEditorWindow.QueueOutboundAssetDrag(request.refs, out status))
+                                    tcs.SetResult(OkResponse(reqId, status));
+                                else
+                                    tcs.SetResult(ErrorResponse(reqId, status));
                             }
                             catch (Exception ex)
                             {

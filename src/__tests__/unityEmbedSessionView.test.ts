@@ -14,6 +14,7 @@ describe("Unity embedded session view", () => {
     const view = read("src/components/UnityEmbeddedSessionView.vue");
     const workspace = read("src/components/ChatWorkspaceView.vue");
     const command = read("src-tauri/src/commands/unity_embed.rs");
+    const runtime = read("src/services/locusRuntime.ts");
 
     expect(command).toContain(String.raw`const CONTROL_PIPE_NAME_PREFIX: &str = r"\\.\pipe\locus_tauri_unity_embed_";`);
     expect(command).toContain('const EMBED_URL: &str = "/unity-embed?host=tauri-overlay";');
@@ -43,6 +44,13 @@ describe("Unity embedded session view", () => {
     expect(workspace).toContain("@layout-mode-change=\"handleLayoutModeChange\"");
     expect(view).not.toContain("useEmbeddedChatSession");
     expect(view).not.toContain("<EmbeddedChatPane");
+    expect(runtime).toContain('export type LocusRuntimeKind = "tauri" | "browser";');
+    expect(runtime).not.toContain('"unity"');
+    expect(runtime).not.toContain("locusUnityBridge");
+    expect(runtime).not.toContain("EventSource");
+    expect(runtime).not.toContain("fetch(");
+    expect(runtime).not.toContain("/invoke");
+    expect(app).not.toContain("isUnityHostLocation");
   });
 
   it("exits the desktop app when the main window closes", () => {
@@ -201,6 +209,9 @@ describe("Unity embedded session view", () => {
     expect(command).toContain("tauri::WindowEvent::DragDrop");
     expect(command).toContain("handle_locus_drop_paths");
     expect(command).toContain("tauri::DragDropEvent::Drop { paths, .. }");
+    expect(command).toContain("commit_cached_unity_asset_drag_drop_to(webview.app_handle(), webview.label())");
+    expect(command).toContain("commit_cached_unity_asset_drag_drop_to(window.app_handle(), window.label())");
+    expect(command).toContain("fn commit_cached_unity_asset_drag_drop_to");
     expect(command).toContain("unity_file_drop_asset_refs(&workspace_path, &paths)");
     expect(command).toContain("locus_file_drop_refs(&workspace_path, &paths)");
     expect(command).toContain('"locus-file-drop"');
@@ -213,6 +224,14 @@ describe("Unity embedded session view", () => {
     expect(command).toContain('"unity-embed-asset-drop"');
     expect(command).toContain("UnityEmbedAssetDragStatePayload");
     expect(command).toContain('"unity-embed-asset-drag-state"');
+    expect(command).toContain("ensure_unity_embed_asset_drag_release_monitor(app_handle)");
+    expect(command).toContain("monitor_unity_embed_asset_drag_release");
+    expect(command).toContain("unity_asset_drag_release_probe");
+    expect(command).toContain("UnityAssetDragReleaseTarget::MainWindow");
+    expect(command).toContain("if !saw_left_button_down");
+    expect(command).toContain("emit_locus_asset_drop_to(&app_handle, MAIN_WINDOW_LABEL, refs)");
+    expect(command).toContain("WindowFromPoint");
+    expect(command).toContain("GetAsyncKeyState");
     expect(command).toContain(".disable_drag_drop_handler()");
     expect(unityWindow).toContain("public DroppedAssetRef[] assetRefs;");
     expect(unityWindow).toContain('[MenuItem("Assets/Send to Locus", false, 0)');
@@ -240,6 +259,8 @@ describe("Unity embedded session view", () => {
     expect(unityWindow).toContain("HandleUnityObjectDrag();");
     expect(unityWindow).toContain("SendAssetDragState(false);");
     expect(unityWindow).toContain("SendAssetDragStateMessage(assetRefs);");
+    expect(unityWindow).toContain("internal static void PublishCurrentUnityAssetDragState(bool force)");
+    expect(unityWindow).toContain("SendAssetDragStateMessageOnce(assetRefs)");
     expect(unityWindow).toContain('type = "assetDrag"');
     expect(unityWindow).toContain("BuildAssetRefsSignature");
     expect(unityWindow).toContain("DragAndDrop.objectReferences");
@@ -327,7 +348,6 @@ describe("Unity embedded session view", () => {
     const bridge = read("src-tauri/src/unity_bridge/mod.rs");
     const unityBridge = read("locus_unity/Editor/LocusBridge.cs");
     const unityTypes = read("locus_unity/Editor/LocusBridge.Types.cs");
-    const embedServer = read("locus_unity/Editor/LocusEmbedHttpServer.cs");
     const app = read("src-tauri/src/lib.rs");
 
     expect(chat).toContain("function isUnityEmbeddedWindow()");
@@ -343,7 +363,6 @@ describe("Unity embedded session view", () => {
     expect(unityTypes).toContain("TryOpenPropertyEditor");
     expect(unityTypes).toContain("LocusLockedAssetInspectorWindow");
     expect(unityTypes).not.toContain("Selection.activeObject = obj");
-    expect(embedServer).toContain('request.command == "open_unity_asset_inspector"');
   });
 
   it("offers reference context-menu actions for assets and knowledge documents", () => {
@@ -355,6 +374,7 @@ describe("Unity embedded session view", () => {
 
     expect(transcript).toContain('(e: "contentContextmenu", event: MouseEvent): void;');
     expect(transcript).toContain("@contextmenu=\"emitContentContextmenu\"");
+    expect(transcript).toContain('context-menu-mode="inherit"');
     expect(chat).toContain("@content-contextmenu=\"handleContentContextMenu\"");
     expect(chat).toContain("function handleContentContextMenu(e: MouseEvent)");
     expect(chat).toContain("function assetContextTargetFromElement(target: Element)");
@@ -387,6 +407,11 @@ describe("Unity embedded session view", () => {
     expect(assetChip).toContain("uiStore.setTab(\"knowledge\")");
     expect(assetChip).toContain(':data-asset-path="effectiveKind === \'asset\' ? normalizedPath : undefined"');
     expect(assetChip).toContain(":data-scene-path=\"sceneObjectRef?.scenePath\"");
+    expect(assetChip).toContain('contextMenuMode?: "copyPath" | "inherit";');
+    expect(assetChip).toContain('@contextmenu="handleContextMenu"');
+    expect(assetChip).toContain("async function handleContextMenu(event: MouseEvent)");
+    expect(assetChip).toContain("navigator.clipboard.writeText(path)");
+    expect(assetChip).toContain('operation: "assetChipCopyPath"');
     expect(zh).toContain('"common.openInFileExplorer": "在文件资源管理器中打开"');
     expect(zh).toContain('"common.openInKnowledge": "在知识页中打开"');
     expect(zh).toContain('"common.copyPath": "复制路径"');
@@ -404,7 +429,6 @@ describe("Unity embedded session view", () => {
     const bridge = read("src-tauri/src/unity_bridge/mod.rs");
     const unityBridge = read("locus_unity/Editor/LocusBridge.cs");
     const unityTypes = read("locus_unity/Editor/LocusBridge.Types.cs");
-    const embedServer = read("locus_unity/Editor/LocusEmbedHttpServer.cs");
     const app = read("src-tauri/src/lib.rs");
 
     expect(markdownInject).toContain("md-unity-scene-object-ref");
@@ -430,7 +454,86 @@ describe("Unity embedded session view", () => {
     expect(unityTypes).toContain("internal static class LocusSceneObjectUtility");
     expect(unityTypes).toContain("Selection.activeGameObject = target");
     expect(unityTypes).toContain("OpenLockedObjectInspector(target)");
-    expect(embedServer).toContain('request.command == "select_unity_scene_object"');
-    expect(embedServer).toContain('request.command == "open_unity_scene_object_inspector"');
+  });
+
+  it("queues Locus refs for Unity native IMGUI drag start", () => {
+    const markdownInject = read("src/composables/markdownInject.ts");
+    const markdownRenderer = read("src/components/MarkdownRenderer.vue");
+    const assetChip = read("src/components/AssetChip.vue");
+    const dragSource = read("src/composables/useUnityReferenceDragSource.ts");
+    const service = read("src/services/unity.ts");
+    const command = read("src-tauri/src/commands/unity_embed.rs");
+    const bridge = read("src-tauri/src/unity_bridge/mod.rs");
+    const app = read("src-tauri/src/lib.rs");
+    const unityBridge = read("locus_unity/Editor/LocusBridge.cs");
+    const editorWindow = read("locus_unity/Editor/LocusEditorWindow.cs");
+    const unityTypes = read("locus_unity/Editor/LocusBridge.Types.cs");
+
+    expect(markdownInject).toContain('draggable="true"');
+    expect(markdownRenderer).toContain("function handleMarkdownDragStart(event: DragEvent)");
+    expect(markdownRenderer).toContain("function handleMarkdownPointerDown(event: PointerEvent)");
+    expect(markdownRenderer).toContain("startUnityReferenceHtmlDrag(event, [ref])");
+    expect(markdownRenderer).toContain("armUnityReferencePointerDrag(event, [ref])");
+    expect(assetChip).toContain(':draggable="!!unityDragRef"');
+    expect(assetChip).toContain('@pointerdown="handlePointerDown"');
+    expect(assetChip).toContain('@dragstart="handleDragStart"');
+    expect(assetChip).toContain('@pointerdown.stop.prevent');
+    expect(assetChip).toContain('@dragstart.stop.prevent');
+    expect(dragSource).toContain("POINTER_DRAG_THRESHOLD_PX");
+    expect(dragSource).toContain("NATIVE_FILE_DRAG_RESTORE_MS");
+    expect(dragSource).toContain('window.location.pathname === "/unity-embed"');
+    expect(dragSource).toContain("event.preventDefault()");
+    expect(dragSource).toContain("shouldStartNativeAssetFileDrag(refs)");
+    expect(dragSource).toContain("suppressHtmlDraggable(event)");
+    expect(dragSource).toContain("startUnityNativeAssetFileDrag(refs)");
+    expect(dragSource).toContain("setUnityEmbedDragPassthrough(true)");
+    expect(dragSource).toContain("startUnityEmbedAssetDrag(refs)");
+    expect(service).toContain("unity_embed_set_drag_passthrough");
+    expect(service).toContain("unity_embed_start_asset_drag");
+    expect(service).toContain("unity_embed_start_native_asset_file_drag");
+    expect(command).toContain("pub async fn unity_embed_set_drag_passthrough");
+    expect(command).toContain("pub async fn unity_embed_start_asset_drag");
+    expect(command).toContain("pub async fn unity_embed_start_native_asset_file_drag");
+    expect(command).toContain("run_on_main_thread");
+    expect(command).toContain("native_asset_file_drag_paths");
+    expect(command).toContain("CF_HDROP");
+    expect(command).toContain("DROPFILES");
+    expect(command).toContain("DoDragDrop");
+    expect(command).toContain("sanitize_locus_outbound_drag_refs");
+    expect(command).toContain("WS_EX_TRANSPARENT");
+    expect(command).toContain("ReleaseCapture");
+    expect(command).toContain("set_drag_passthrough");
+    expect(bridge).toContain('send_message(project_path, "start_asset_drag"');
+    expect(app).toContain("commands::unity_embed_set_drag_passthrough");
+    expect(app).toContain("commands::unity_embed_start_asset_drag");
+    expect(app).toContain("commands::unity_embed_start_native_asset_file_drag");
+    expect(unityBridge).toContain('case "start_asset_drag"');
+    expect(unityBridge).toContain("QueueOutboundAssetDrag(request.refs");
+    expect(editorWindow).toContain("internal static bool QueueOutboundAssetDrag");
+    const externalDragBridge = read("locus_unity/Editor/LocusExternalAssetDragBridge.cs");
+    const queueMethod = editorWindow.slice(
+      editorWindow.indexOf("internal static bool QueueOutboundAssetDrag"),
+      editorWindow.indexOf('[MenuItem("Assets/Send to Locus"', editorWindow.indexOf("internal static bool QueueOutboundAssetDrag")),
+    );
+    expect(queueMethod).toContain("LocusExternalAssetDragBridge.QueueAssetDrag(sanitized, out message)");
+    expect(queueMethod).not.toContain("GetWindow<LocusEditorWindow>()");
+    expect(queueMethod).not.toContain("window.Show()");
+    expect(externalDragBridge).toContain('typeof(GUIUtility).GetField("beforeEventProcessed"');
+    expect(externalDragBridge).toContain("InstallBeforeEventProcessedHandler();");
+    expect(externalDragBridge).toContain("EditorApplication.update += GlobalUpdateHandler;");
+    expect(externalDragBridge).toContain("HandleBeforeEventProcessed(EventType eventType, KeyCode keyCode)");
+    expect(externalDragBridge).toContain("HandleGlobalUpdate()");
+    expect(externalDragBridge).toContain("LocusEditorWindow.PublishCurrentUnityAssetDragState(false)");
+    expect(externalDragBridge).toContain("LocusEditorWindow.PublishCurrentUnityAssetDragState(eventType == EventType.DragPerform)");
+    expect(externalDragBridge).toContain("internal static bool QueueAssetDrag");
+    expect(externalDragBridge).toContain("EventType.MouseDrag");
+    expect(externalDragBridge).toContain("StartQueuedDrag()");
+    expect(externalDragBridge).toContain("ApplyArmedDragPayload()");
+    expect(externalDragBridge).toContain("DragAndDrop.PrepareStartDrag();");
+    expect(externalDragBridge).toContain("DragAndDrop.StartDrag(title)");
+    expect(externalDragBridge).toContain("DragAndDrop.objectReferences = references;");
+    expect(externalDragBridge).toContain("TrySplitSceneObjectRefPath");
+    expect(externalDragBridge).toContain("LocusSceneObjectUtility.ResolveSceneObject(scenePath, objectPath)");
+    expect(unityTypes).toContain("public static GameObject ResolveSceneObject");
   });
 });

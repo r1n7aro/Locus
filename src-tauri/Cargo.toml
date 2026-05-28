@@ -84,7 +84,8 @@ rodio = "0.22.2"
 [target.'cfg(windows)'.dependencies]
 ort = { version = "=2.0.0-rc.11", default-features = false, features = ["load-dynamic"] }
 tauri-winrt-notification = "0.7.2"
-windows = { version = "0.61.3", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Graphics_Dxgi", "Win32_Graphics_Gdi", "Win32_Networking_WinHttp", "Win32_Storage_FileSystem", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+windows = { version = "0.61.3", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Graphics_Dxgi", "Win32_Graphics_Gdi", "Win32_Networking_WinHttp", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Memory", "Win32_System_Ole", "Win32_System_SystemServices", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_UI_WindowsAndMessaging"] }
+windows-core = "0.61.2"
 webview2-com = "0.38.2"
 winreg = "0.55.0"
 

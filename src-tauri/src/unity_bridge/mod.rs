@@ -666,6 +666,19 @@ pub async fn open_scene_object_inspector(
     }
 }
 
+pub async fn start_asset_drag(project_path: &str, payload: &str) -> Result<(), String> {
+    let op_lock = project_unity_op_lock(project_path).await;
+    let _guard = op_lock.lock().await;
+    let resp = send_message(project_path, "start_asset_drag", payload).await?;
+    if resp.ok {
+        Ok(())
+    } else {
+        Err(resp
+            .error
+            .unwrap_or_else(|| "start_asset_drag failed".to_string()))
+    }
+}
+
 /// Canonical status values: "disconnected" | "editing" | "playing" | "playing_paused"
 pub async fn query_unity_status(project_path: &str) -> (bool, &'static str, Option<String>) {
     match send_message(project_path, "status", "").await {

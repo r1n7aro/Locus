@@ -65,7 +65,6 @@ import { canOpenInEditor } from "../composables/useHideMeta";
 import { useDiffProgress } from "../composables/useDiffProgress";
 import { acquireSelectionLock } from "../composables/useSelectionLock";
 import { matchesShortcut, useKeyboardShortcuts } from "../composables/useKeyboardShortcuts";
-import { getLocusRuntime } from "../services/locusRuntime";
 import {
   getChatSubmitModifierLabel,
   useChatInputSettings,
@@ -305,12 +304,7 @@ const KNOWLEDGE_DOCUMENT_FILE_RE = /^Locus\/knowledge\/(design|memory|skill|refe
 const assetRefCtxMenu = ref<AssetRefContextMenuState | null>(null);
 const messageCtxMenu = ref<MessageContextMenuState | null>(null);
 
-function isUnityRuntime() {
-  return getLocusRuntime().kind === "unity";
-}
-
 function isUnityEmbeddedWindow() {
-  if (isUnityRuntime()) return true;
   if (typeof window === "undefined") return false;
   return window.location.pathname === "/unity-embed";
 }
@@ -320,7 +314,7 @@ function isUnityAssetPath(filePath: string) {
 }
 
 function shouldSelectUnityAsset(filePath: string) {
-  return isUnityAssetPath(filePath) && (props.unityConnected || isUnityRuntime());
+  return isUnityAssetPath(filePath) && props.unityConnected;
 }
 
 function shouldOpenUnityAssetInspector(e: MouseEvent, filePath: string) {
@@ -333,7 +327,7 @@ function shouldOpenUnityAssetInspector(e: MouseEvent, filePath: string) {
 function shouldUseUnitySceneObjectRef(scenePath: string, objectPath: string) {
   return /\.unity$/i.test(scenePath.replace(/\\/g, "/"))
     && objectPath.trim().length > 0
-    && (props.unityConnected || isUnityRuntime());
+    && props.unityConnected;
 }
 
 function shouldOpenUnitySceneObjectInspector(e: MouseEvent, scenePath: string, objectPath: string) {

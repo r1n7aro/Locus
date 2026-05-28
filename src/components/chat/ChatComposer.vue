@@ -20,6 +20,8 @@ const props = withDefaults(defineProps<{
   showAction?: boolean;
   showHeader?: boolean | null;
   extendTop?: boolean;
+  dropActive?: boolean;
+  dropLabel?: string;
 }>(), {
   placeholder: "",
   disabled: false,
@@ -33,6 +35,8 @@ const props = withDefaults(defineProps<{
   showAction: true,
   showHeader: null,
   extendTop: false,
+  dropActive: false,
+  dropLabel: "",
 });
 
 const emit = defineEmits<{
@@ -43,6 +47,10 @@ const emit = defineEmits<{
   (e: "keyup", event: KeyboardEvent): void;
   (e: "input", event: Event): void;
   (e: "paste", event: ClipboardEvent): void;
+  (e: "dragenter", event: DragEvent): void;
+  (e: "dragover", event: DragEvent): void;
+  (e: "dragleave", event: DragEvent): void;
+  (e: "drop", event: DragEvent): void;
   (e: "click", event: MouseEvent): void;
   (e: "mouseup", event: MouseEvent): void;
   (e: "focus", event: FocusEvent): void;
@@ -147,7 +155,25 @@ watch(() => props.compact, () => {
 </script>
 
 <template>
-  <div class="chat-composer" :class="{ 'is-compact': compact, 'has-top-extension': extendTop }">
+  <div
+    class="chat-composer"
+    :class="{ 'is-compact': compact, 'has-top-extension': extendTop, 'is-drop-active': dropActive }"
+    @dragenter="emit('dragenter', $event as DragEvent)"
+    @dragover="emit('dragover', $event as DragEvent)"
+    @dragleave="emit('dragleave', $event as DragEvent)"
+    @drop="emit('drop', $event as DragEvent)"
+  >
+    <Transition name="chat-composer-drop">
+      <div
+        v-if="dropActive"
+        class="chat-composer-drop-overlay"
+        role="status"
+        aria-live="polite"
+      >
+        <span class="chat-composer-drop-label">{{ dropLabel }}</span>
+      </div>
+    </Transition>
+
     <div v-if="hasOverlay" class="chat-composer-overlay">
       <slot name="overlay" />
     </div>
@@ -229,6 +255,47 @@ watch(() => props.compact, () => {
   transition: border-color 0.2s ease;
 }
 
+.chat-composer.is-drop-active {
+  border-color: color-mix(in srgb, var(--accent-color) 48%, var(--border-color));
+  background: color-mix(in srgb, var(--accent-soft) 12%, var(--input-bg) 88%);
+}
+
+.chat-composer-drop-overlay {
+  position: absolute;
+  inset: 0;
+  box-sizing: border-box;
+  z-index: 4;
+  display: grid;
+  place-items: center;
+  padding: 4px 8px;
+  border-radius: inherit;
+  background: color-mix(in srgb, var(--input-bg) 70%, var(--accent-soft) 30%);
+  color: var(--text-color);
+  pointer-events: none;
+}
+
+.chat-composer-drop-label {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: color-mix(in srgb, var(--text-color) 88%, var(--accent-color) 12%);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.4;
+  text-align: center;
+  white-space: nowrap;
+}
+
+.chat-composer-drop-enter-active,
+.chat-composer-drop-leave-active {
+  transition: opacity 0.12s ease;
+}
+
+.chat-composer-drop-enter-from,
+.chat-composer-drop-leave-to {
+  opacity: 0;
+}
+
 .chat-composer-overlay {
   position: relative;
   z-index: 2;
@@ -271,6 +338,7 @@ watch(() => props.compact, () => {
 }
 
 .chat-composer-body {
+  position: relative;
   display: flex;
   flex: 1 1 auto;
   align-items: flex-start;

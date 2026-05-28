@@ -8,11 +8,15 @@ import {
   classifyUnitySceneObjectError,
   openFileExternal,
 } from "../services/unity";
+import {
+  armUnityReferencePointerDrag,
+  startUnityReferenceHtmlDrag,
+} from "../composables/useUnityReferenceDragSource";
 import { normalizeAppError } from "../services/errors";
 import { t } from "../i18n";
 import { useNotificationStore } from "../stores/notification";
 import { useUiStore } from "../stores/ui";
-import type { AssetRefKind, KnowledgeDocumentType } from "../types";
+import type { AssetRefAttachment, AssetRefKind, KnowledgeDocumentType } from "../types";
 import LucideIcon from "./icons/LucideIcon.vue";
 import {
   unityAssetIconClassForKind,
@@ -24,6 +28,7 @@ const props = defineProps<{
   path: string;
   kind?: AssetRefKind;
   removable?: boolean;
+  contextMenuMode?: "copyPath" | "inherit";
 }>();
 
 const emit = defineEmits<{
@@ -81,6 +86,25 @@ const iconKind = computed(() =>
 
 const iconNode = computed(() => unityAssetIconNodeForKind(iconKind.value));
 const unitySelectableAsset = computed(() => /^(Assets|Packages)\//i.test(normalizedPath.value));
+const unityDragRef = computed<AssetRefAttachment | null>(() => {
+  if (sceneObjectRef.value) {
+    return {
+      kind: "sceneObject",
+      path: `${sceneObjectRef.value.scenePath}/${sceneObjectRef.value.objectPath}`,
+      name: displayName.value,
+      source: "manual",
+    };
+  }
+  if (effectiveKind.value === "asset" && unitySelectableAsset.value) {
+    return {
+      kind: "asset",
+      path: normalizedPath.value,
+      name: displayName.value,
+      source: "manual",
+    };
+  }
+  return null;
+});
 
 async function handleClick(e: MouseEvent) {
   try {
@@ -139,6 +163,44 @@ function notifyUnitySceneObjectError(error: unknown, scenePath: string, objectPa
     replaceOperation: true,
   });
 }
+
+async function handleContextMenu(event: MouseEvent) {
+  if (props.contextMenuMode === "inherit") return;
+
+  event.preventDefault();
+  event.stopPropagation();
+
+  const path = normalizedPath.value || props.path;
+  if (!path) return;
+
+  try {
+    await navigator.clipboard.writeText(path);
+    notificationStore.addNotice("success", t("common.copied"), {
+      operation: "assetChipCopyPath",
+      replaceOperation: true,
+      skipConsoleLog: true,
+    });
+  } catch (error) {
+    const err = normalizeAppError(error);
+    notificationStore.addNotice("warning", err.message || t("common.copyPathFailed"), {
+      code: err.code,
+      operation: "assetChipCopyPath",
+      replaceOperation: true,
+    });
+  }
+}
+
+function handleDragStart(event: DragEvent) {
+  const ref = unityDragRef.value;
+  if (!ref) return;
+  startUnityReferenceHtmlDrag(event, [ref]);
+}
+
+function handlePointerDown(event: PointerEvent) {
+  const ref = unityDragRef.value;
+  if (!ref) return;
+  armUnityReferencePointerDrag(event, [ref]);
+}
 </script>
 
 <template>
@@ -152,7 +214,11 @@ function notifyUnitySceneObjectError(error: unknown, scenePath: string, objectPa
     :data-asset-path="effectiveKind === 'asset' ? normalizedPath : undefined"
     :data-scene-path="sceneObjectRef?.scenePath"
     :data-scene-object-path="sceneObjectRef?.objectPath"
+    :draggable="!!unityDragRef"
     @click.stop="handleClick"
+    @contextmenu="handleContextMenu"
+    @pointerdown="handlePointerDown"
+    @dragstart="handleDragStart"
   >
     <LucideIcon
       class="asset-chip-icon"
@@ -160,7 +226,15 @@ function notifyUnitySceneObjectError(error: unknown, scenePath: string, objectPa
       :icon="iconNode"
     />
     <span class="asset-chip-name">{{ displayName }}</span>
-    <button v-if="removable" class="asset-chip-remove" @click.stop="emit('remove')">&times;</button>
+    <button
+      v-if="removable"
+      type="button"
+      class="asset-chip-remove"
+      draggable="false"
+      @pointerdown.stop.prevent
+      @dragstart.stop.prevent
+      @click.stop="emit('remove')"
+    >&times;</button>
   </span>
 </template>
 
@@ -180,6 +254,8 @@ function notifyUnitySceneObjectError(error: unknown, scenePath: string, objectPa
   transition: background 0.15s, border-color 0.15s;
   max-width: 300px;
   white-space: nowrap;
+  user-select: none;
+  -webkit-user-select: none;
 }
 
 .asset-chip:hover {

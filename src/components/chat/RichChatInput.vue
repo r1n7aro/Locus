@@ -50,8 +50,10 @@ import {
   checkUnityConnectionStatus,
   getUnityConsoleText,
   subscribeLocusFileDrop,
+  subscribeLocusFileDragState,
   subscribeUnityEmbedAssetDrop,
   subscribeUnityEmbedTextDrop,
+  type LocusFileDragStatePayload,
   type LocusFileDropRef,
   type UnityEmbedTextDropEntry,
 } from "../../services/unity";
@@ -91,7 +93,9 @@ const PASTE_THRESHOLD = 500;
 const ASSET_REF_COLLAPSE_THRESHOLD = 5;
 const ASSET_REF_SYNC_CHANNEL = "locus-chat-asset-ref-drafts";
 const ASSET_REF_SYNC_STORAGE_KEY = "locus:chatAssetRefDraftSync";
+const RECENT_ASSET_REF_REMOVAL_SUPPRESS_MS = 100;
 const LOCAL_FILE_BOUNDARY_WARNING_OPERATION = "local-file-boundary-warning";
+const LOCAL_FILE_DRAG_STATE_TTL_MS = 1200;
 const UNITY_ASSET_REF_ROOT_RE = /^(?:Assets|Packages|ProjectSettings)(?:\/|$)/i;
 const PROJECT_KNOWLEDGE_REF_ROOT_RE = /^(?:design|memory|skill|reference)\/.+\.md$/i;
 const KNOWLEDGE_MENTION_TYPES: KnowledgeDocumentType[] = ["design", "memory", "skill", "reference"];
@@ -189,6 +193,7 @@ const consoleTextAttachments = ref<ConsoleTextAttachment[]>([]);
 const showConsoleTextDetails = ref(false);
 const unityConsoleCommandPending = ref(false);
 const localFileAttachments = ref<LocalFileAttachment[]>([]);
+const localFileDragActive = ref(false);
 const showLocalFileDetails = ref(false);
 const previewImageIndex = ref<number | null>(null);
 const composerIntent = ref<ComposerIntentState>(emptyComposerIntent());
@@ -216,6 +221,7 @@ const mentionSubPath = ref("");
 const mentionLoading = ref(false);
 const mentionSearchSettledQuery = ref("");
 const assetRefDrafts = new Map<string, AssetRefAttachment[]>();
+const recentlyRemovedAssetRefKeys = new Map<string, number>();
 
 let mentionDebounceTimer: ReturnType<typeof setTimeout> | null = null;
 let mentionRequestSeq = 0;
@@ -224,9 +230,13 @@ let pendingMentionCursor: number | null = null;
 let releaseUnityAssetDrop: (() => void) | null = null;
 let releaseUnityTextDrop: (() => void) | null = null;
 let releaseLocusFileDrop: (() => void) | null = null;
+let releaseLocusFileDragState: (() => void) | null = null;
 let unityAssetDropSubscriptionDisposed = false;
 let unityTextDropSubscriptionDisposed = false;
 let locusFileDropSubscriptionDisposed = false;
+let locusFileDragStateSubscriptionDisposed = false;
+let localFileDragDepth = 0;
+let localFileDragStateClearTimer = 0;
 let assetRefSyncChannel: BroadcastChannel | null = null;
 let assetRefSyncSeq = 0;
 let lastAssetRefSyncKey = "";
@@ -991,6 +1001,31 @@ function dedupeAssetRefs(assetRefs: AssetRefAttachment[]) {
   return next;
 }
 
+function pruneRecentlyRemovedAssetRefs(now = Date.now()) {
+  for (const [key, expiresAt] of recentlyRemovedAssetRefKeys) {
+    if (expiresAt <= now) {
+      recentlyRemovedAssetRefKeys.delete(key);
+    }
+  }
+}
+
+function rememberRecentlyRemovedAssetRefs(assetRefs: AssetRefAttachment[]) {
+  pruneRecentlyRemovedAssetRefs();
+  const expiresAt = Date.now() + RECENT_ASSET_REF_REMOVAL_SUPPRESS_MS;
+  for (const assetRef of assetRefs) {
+    const normalized = normalizeAssetRef(assetRef);
+    if (!normalized) continue;
+    recentlyRemovedAssetRefKeys.set(assetRefKey(normalized), expiresAt);
+  }
+}
+
+function filterRecentlyRemovedAssetRefs(assetRefs: AssetRefAttachment[]) {
+  pruneRecentlyRemovedAssetRefs();
+  return dedupeAssetRefs(assetRefs).filter((assetRef) =>
+    !recentlyRemovedAssetRefKeys.has(assetRefKey(assetRef)),
+  );
+}
+
 function cloneAssetRefs(assetRefs: AssetRefAttachment[]) {
   return assetRefs.map((assetRef) => ({ ...assetRef }));
 }
@@ -1059,7 +1094,7 @@ function applyAssetRefSyncMessage(message: unknown) {
   if (payload.kind !== "assetRefs") return;
   if (!payload.syncKey || payload.sourceId === assetRefSyncSourceId) return;
 
-  const refs = dedupeAssetRefs(Array.isArray(payload.refs) ? payload.refs : []);
+  const refs = filterRecentlyRemovedAssetRefs(Array.isArray(payload.refs) ? payload.refs : []);
   rememberAssetRefDraft(refs, payload.syncKey);
   if (payload.syncKey === currentAssetRefSyncKey()) {
     assetRefAttachments.value = cloneAssetRefs(refs);
@@ -1091,8 +1126,16 @@ function teardownAssetRefSync() {
   assetRefSyncChannel = null;
 }
 
-function addAssetRefs(assetRefs: AssetRefAttachment[]) {
-  const next = setAssetRefAttachments([...assetRefAttachments.value, ...assetRefs]);
+function addAssetRefs(
+  assetRefs: AssetRefAttachment[],
+  options: { respectRecentRemoval?: boolean } = {},
+) {
+  const refsToAdd = options.respectRecentRemoval
+    ? filterRecentlyRemovedAssetRefs(assetRefs)
+    : assetRefs;
+  if (refsToAdd.length === 0) return;
+
+  const next = setAssetRefAttachments([...assetRefAttachments.value, ...refsToAdd]);
   if (next.length > 0) {
     nextTick(() => composerRef.value?.focus());
   }
@@ -1100,7 +1143,8 @@ function addAssetRefs(assetRefs: AssetRefAttachment[]) {
 
 function removeAssetRef(index: number) {
   const next = [...assetRefAttachments.value];
-  next.splice(index, 1);
+  const removed = next.splice(index, 1);
+  rememberRecentlyRemovedAssetRefs(removed);
   setAssetRefAttachments(next);
   if (next.length <= ASSET_REF_COLLAPSE_THRESHOLD) {
     closeAssetRefDetails();
@@ -1108,6 +1152,7 @@ function removeAssetRef(index: number) {
 }
 
 function clearAssetRefs() {
+  rememberRecentlyRemovedAssetRefs(assetRefAttachments.value);
   setAssetRefAttachments([]);
   closeAssetRefDetails();
 }
@@ -1811,6 +1856,98 @@ function handlePaste(event: ClipboardEvent) {
   }
 }
 
+function isExternalFileDrag(event: DragEvent): boolean {
+  const types = event.dataTransfer ? Array.from(event.dataTransfer.types) : [];
+  return types.includes("Files");
+}
+
+function setFileDragDropEffect(event: DragEvent) {
+  if (!event.dataTransfer) return;
+  event.dataTransfer.dropEffect = "copy";
+}
+
+function clearLocalFileDragStateTimer() {
+  if (!localFileDragStateClearTimer) return;
+  window.clearTimeout(localFileDragStateClearTimer);
+  localFileDragStateClearTimer = 0;
+}
+
+function resetLocalFileDragState() {
+  clearLocalFileDragStateTimer();
+  localFileDragDepth = 0;
+  localFileDragActive.value = false;
+}
+
+function scheduleLocalFileDragStateExpiry() {
+  clearLocalFileDragStateTimer();
+  localFileDragStateClearTimer = window.setTimeout(() => {
+    localFileDragStateClearTimer = 0;
+    localFileDragDepth = 0;
+    localFileDragActive.value = false;
+  }, LOCAL_FILE_DRAG_STATE_TTL_MS);
+}
+
+function handleLocusFileDragState(payload: LocusFileDragStatePayload) {
+  if (payload.active) {
+    localFileDragDepth = 0;
+    localFileDragActive.value = true;
+    scheduleLocalFileDragStateExpiry();
+    return;
+  }
+  resetLocalFileDragState();
+}
+
+function handleLocalFileDragEnter(event: DragEvent) {
+  const external = isExternalFileDrag(event);
+  if (!external) return;
+  event.preventDefault();
+  setFileDragDropEffect(event);
+  localFileDragDepth += 1;
+  localFileDragActive.value = true;
+}
+
+function handleLocalFileDragOver(event: DragEvent) {
+  const external = isExternalFileDrag(event);
+  if (!external) return;
+  event.preventDefault();
+  setFileDragDropEffect(event);
+  localFileDragActive.value = true;
+}
+
+function handleLocalFileDragLeave(event: DragEvent) {
+  const external = isExternalFileDrag(event);
+  if (!localFileDragActive.value) return;
+  if (external) {
+    localFileDragDepth = Math.max(0, localFileDragDepth - 1);
+  } else {
+    localFileDragDepth = 0;
+  }
+  if (localFileDragDepth === 0) {
+    localFileDragActive.value = false;
+  }
+}
+
+function handleLocalFileDrop(event: DragEvent) {
+  const external = isExternalFileDrag(event);
+  if (external) {
+    event.preventDefault();
+    setFileDragDropEffect(event);
+  }
+  resetLocalFileDragState();
+}
+
+function handleDocumentLocalFileDrop() {
+  resetLocalFileDragState();
+}
+
+function handleDocumentLocalFileDragEnd() {
+  resetLocalFileDragState();
+}
+
+function handleWindowLocalFileDragBlur() {
+  resetLocalFileDragState();
+}
+
 function addImageFile(file: File) {
   if (imageAttachments.value.length >= props.maxImages) return;
   const reader = new FileReader();
@@ -1961,11 +2098,15 @@ onMounted(() => {
   unityAssetDropSubscriptionDisposed = false;
   unityTextDropSubscriptionDisposed = false;
   locusFileDropSubscriptionDisposed = false;
+  locusFileDragStateSubscriptionDisposed = false;
   setupAssetRefSync();
   document.addEventListener("keydown", handleDocumentKeydown);
   document.addEventListener("mousedown", handleDocumentMouseDown);
+  document.addEventListener("drop", handleDocumentLocalFileDrop);
+  document.addEventListener("dragend", handleDocumentLocalFileDragEnd);
+  window.addEventListener("blur", handleWindowLocalFileDragBlur);
   subscribeUnityEmbedAssetDrop((payload) => {
-    addAssetRefs(payload.refs ?? []);
+    addAssetRefs(payload.refs ?? [], { respectRecentRemoval: true });
   })
     .then((release) => {
       if (unityAssetDropSubscriptionDisposed) {
@@ -2003,14 +2144,29 @@ onMounted(() => {
     .catch((error) => {
       console.warn("[Locus] local file drop subscription failed:", error);
     });
+  subscribeLocusFileDragState(handleLocusFileDragState)
+    .then((release) => {
+      if (locusFileDragStateSubscriptionDisposed) {
+        release();
+        return;
+      }
+      releaseLocusFileDragState = release;
+    })
+    .catch((error) => {
+      console.warn("[Locus] local file drag state subscription failed:", error);
+    });
 });
 
 onUnmounted(() => {
   unityAssetDropSubscriptionDisposed = true;
   unityTextDropSubscriptionDisposed = true;
   locusFileDropSubscriptionDisposed = true;
+  locusFileDragStateSubscriptionDisposed = true;
   document.removeEventListener("keydown", handleDocumentKeydown);
   document.removeEventListener("mousedown", handleDocumentMouseDown);
+  document.removeEventListener("drop", handleDocumentLocalFileDrop);
+  document.removeEventListener("dragend", handleDocumentLocalFileDragEnd);
+  window.removeEventListener("blur", handleWindowLocalFileDragBlur);
   teardownAssetRefSync();
   releaseUnityAssetDrop?.();
   releaseUnityAssetDrop = null;
@@ -2018,6 +2174,9 @@ onUnmounted(() => {
   releaseUnityTextDrop = null;
   releaseLocusFileDrop?.();
   releaseLocusFileDrop = null;
+  releaseLocusFileDragState?.();
+  releaseLocusFileDragState = null;
+  resetLocalFileDragState();
   clearMentionDebounce();
   invalidateMentionRequests();
 });
@@ -2248,9 +2407,15 @@ defineExpose({
       :show-action="showAction"
       :show-header="hasHeaderContent"
       :extend-top="hasTopAttachments"
+      :drop-active="localFileDragActive"
+      :drop-label="t('chat.input.dropFileHint')"
       @update:model-value="setInputValue"
       @keydown="handleKeydown"
       @paste="handlePaste"
+      @dragenter="handleLocalFileDragEnter"
+      @dragover="handleLocalFileDragOver"
+      @dragleave="handleLocalFileDragLeave"
+      @drop="handleLocalFileDrop"
       @click="handleTextareaInteraction"
       @keyup="handleTextareaKeyup"
       @mouseup="handleTextareaInteraction"

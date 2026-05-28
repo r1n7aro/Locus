@@ -37,7 +37,9 @@ namespace Locus
         private static bool _lifecycleHooksRegistered;
         private static bool _assemblyReloadInProgress;
         private static bool _editorQuitting;
-
+        private static volatile bool _globalAssetDragStateSendInFlight;
+        private static double _nextGlobalAssetDragStateAt;
+        private static string _lastGlobalAssetDragSignature = "";
         private double _nextSyncAt;
         private double _resizeBoostUntil;
         private volatile bool _sendInFlight;
@@ -84,7 +86,7 @@ namespace Locus
         }
 
         [Serializable]
-        private sealed class DroppedAssetRef
+        internal sealed class DroppedAssetRef
         {
             public string path;
             public string kind;
@@ -114,6 +116,29 @@ namespace Locus
             window.titleContent = CreateTitleContent();
             window.minSize = new Vector2(360f, 420f);
             window.Show();
+        }
+
+        internal static bool QueueOutboundAssetDrag(DroppedAssetRef[] assetRefs, out string message)
+        {
+            DroppedAssetRef[] sanitized = SanitizeOutboundAssetDragRefs(assetRefs);
+            if (sanitized.Length == 0)
+            {
+                message = "No supported Unity references were provided.";
+                return false;
+            }
+
+            bool queued = LocusExternalAssetDragBridge.QueueAssetDrag(sanitized, out message);
+            if (queued)
+            {
+                foreach (LocusEditorWindow window in Resources.FindObjectsOfTypeAll<LocusEditorWindow>())
+                {
+                    if (window == null)
+                        continue;
+                    window._statusMessage = "Unity drag reference armed.";
+                    window.Repaint();
+                }
+            }
+            return queued;
         }
 
         [MenuItem("Assets/Send to Locus", false, 0)]
@@ -333,6 +358,62 @@ namespace Locus
             });
         }
 
+        internal static void PublishCurrentUnityAssetDragState(bool force)
+        {
+            DroppedAssetRef[] assetRefs = BuildDroppedAssetRefs();
+            if (assetRefs.Length == 0)
+            {
+                if (_lastGlobalAssetDragSignature.Length > 0)
+                {
+                    _lastGlobalAssetDragSignature = "";
+                    _nextGlobalAssetDragStateAt = 0d;
+                    SendAssetDragStateMessageOnce(assetRefs);
+                }
+                _lastGlobalAssetDragSignature = "";
+                return;
+            }
+
+            double now = EditorApplication.timeSinceStartup;
+            string signature = BuildAssetRefsSignature(assetRefs);
+            if (!force
+                && string.Equals(signature, _lastGlobalAssetDragSignature, StringComparison.Ordinal)
+                && now < _nextGlobalAssetDragStateAt)
+                return;
+
+            _lastGlobalAssetDragSignature = signature;
+            _nextGlobalAssetDragStateAt = now + AssetDragStateRefreshSeconds;
+            SendAssetDragStateMessageOnce(assetRefs);
+        }
+
+        private static void SendAssetDragStateMessageOnce(DroppedAssetRef[] assetRefs)
+        {
+            if (assetRefs == null || _globalAssetDragStateSendInFlight)
+                return;
+
+            string json = JsonUtility.ToJson(new EmbedControlMessage
+            {
+                type = "assetDrag",
+                assetRefs = assetRefs
+            });
+            string pipeName = GetControlPipeName();
+            _globalAssetDragStateSendInFlight = true;
+
+            Task.Run(() =>
+            {
+                try
+                {
+                    WritePipeLineOnce(pipeName, json);
+                }
+                catch
+                {
+                }
+                finally
+                {
+                    _globalAssetDragStateSendInFlight = false;
+                }
+            });
+        }
+
         private string GetCloseReason()
         {
             if (_editorQuitting)
@@ -470,6 +551,40 @@ namespace Locus
                 sb.Append(assetRef.kind).Append('\n').Append(assetRef.path).Append('\n');
             }
             return sb.ToString();
+        }
+
+        private static DroppedAssetRef[] SanitizeOutboundAssetDragRefs(DroppedAssetRef[] assetRefs)
+        {
+            if (assetRefs == null || assetRefs.Length == 0)
+                return new DroppedAssetRef[0];
+
+            List<DroppedAssetRef> sanitized = new List<DroppedAssetRef>();
+            HashSet<string> seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (DroppedAssetRef assetRef in assetRefs)
+            {
+                if (assetRef == null)
+                    continue;
+
+                string path = NormalizeUnityPath(assetRef.path);
+                string kind = (assetRef.kind ?? "").Trim();
+                if (string.IsNullOrEmpty(path) || (kind != "asset" && kind != "sceneObject"))
+                    continue;
+
+                string key = kind + "\n" + path;
+                if (!seen.Add(key))
+                    continue;
+
+                sanitized.Add(new DroppedAssetRef
+                {
+                    path = path,
+                    kind = kind,
+                    name = (assetRef.name ?? "").Trim(),
+                    typeLabel = (assetRef.typeLabel ?? "").Trim(),
+                    source = (assetRef.source ?? "").Trim()
+                });
+            }
+
+            return sanitized.ToArray();
         }
 
         private static DroppedAssetRef BuildDroppedObjectRef(UnityEngine.Object obj)

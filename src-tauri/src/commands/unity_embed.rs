@@ -15,11 +15,13 @@ const ASSET_DROP_EVENT: &str = "unity-embed-asset-drop";
 const TEXT_DROP_EVENT: &str = "unity-embed-text-drop";
 const ASSET_DRAG_STATE_EVENT: &str = "unity-embed-asset-drag-state";
 const FILE_DROP_EVENT: &str = "locus-file-drop";
+const FILE_DRAG_STATE_EVENT: &str = "locus-file-drag-state";
 const CONTROL_PIPE_NAME_PREFIX: &str = r"\\.\pipe\locus_tauri_unity_embed_";
 const EMBED_URL: &str = "/unity-embed?host=tauri-overlay";
 const CLOSE_REASON_DOMAIN_RELOAD: &str = "domainReload";
 const TRANSIENT_CLOSE_DESTROY_DELAY: Duration = Duration::from_secs(30);
 const ASSET_DRAG_CACHE_TTL: Duration = Duration::from_secs(3);
+const ASSET_DRAG_RELEASE_POLL_INTERVAL: Duration = Duration::from_millis(35);
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -73,6 +75,18 @@ struct UnityEmbedAssetDropPayload {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct UnityEmbedStartAssetDragRequest {
+    refs: Vec<UnityEmbedAssetRef>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnityEmbedNativeAssetFileDragRequest {
+    refs: Vec<UnityEmbedAssetRef>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct UnityEmbedTextDropEntry {
     text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -114,6 +128,16 @@ struct LocusFileDropPayload {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct LocusFileDragStatePayload {
+    phase: String,
+    active: bool,
+    file_count: usize,
+    x: f64,
+    y: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct UnityEmbedAssetDragStatePayload {
     has_refs: bool,
     refs: Vec<UnityEmbedAssetRef>,
@@ -123,6 +147,11 @@ struct UnityEmbedAssetDragStatePayload {
 struct UnityEmbedAssetDragCache {
     refs: Vec<UnityEmbedAssetRef>,
     updated_at: Option<Instant>,
+}
+
+#[derive(Default)]
+struct UnityEmbedAssetDragReleaseMonitorState {
+    running: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -426,11 +455,20 @@ pub(crate) fn handle_unity_embed_webview_event(
         return;
     }
 
+    if let tauri::WebviewEvent::DragDrop(drag_event) = event {
+        if let Err(error) =
+            emit_locus_file_drag_state_to(webview.app_handle(), webview.label(), drag_event)
+        {
+            eprintln!("[Locus] failed to emit local file drag state: {error}");
+        }
+    }
+
     let paths = match event {
         tauri::WebviewEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) => paths.clone(),
         _ => return,
     };
     if paths.is_empty() {
+        commit_cached_unity_asset_drag_drop_to(webview.app_handle(), webview.label());
         return;
     }
 
@@ -446,11 +484,20 @@ pub(crate) fn handle_locus_window_event(window: &tauri::Window, event: &tauri::W
         return;
     }
 
+    if let tauri::WindowEvent::DragDrop(drag_event) = event {
+        if let Err(error) =
+            emit_locus_file_drag_state_to(window.app_handle(), window.label(), drag_event)
+        {
+            eprintln!("[Locus] failed to emit local file drag state: {error}");
+        }
+    }
+
     let paths = match event {
         tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) => paths.clone(),
         _ => return,
     };
     if paths.is_empty() {
+        commit_cached_unity_asset_drag_drop_to(window.app_handle(), window.label());
         return;
     }
 
@@ -478,6 +525,17 @@ fn handle_locus_drop_paths(app_handle: AppHandle, target_label: String, paths: V
             }
         }
     });
+}
+
+fn commit_cached_unity_asset_drag_drop_to(app_handle: &AppHandle, label: &str) {
+    let refs = current_unity_embed_asset_drag_refs();
+    if refs.is_empty() {
+        return;
+    }
+    if let Err(error) = emit_locus_asset_drop_to(app_handle, label, refs) {
+        eprintln!("[Locus] failed to emit cached Unity asset drop: {error}");
+    }
+    clear_unity_embed_asset_drag_after_release(app_handle);
 }
 
 fn is_locus_drop_target_label(label: &str) -> bool {
@@ -586,6 +644,11 @@ fn asset_drag_cache() -> &'static Mutex<UnityEmbedAssetDragCache> {
     CACHE.get_or_init(|| Mutex::new(UnityEmbedAssetDragCache::default()))
 }
 
+fn asset_drag_release_monitor_state() -> &'static Mutex<UnityEmbedAssetDragReleaseMonitorState> {
+    static STATE: OnceLock<Mutex<UnityEmbedAssetDragReleaseMonitorState>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(UnityEmbedAssetDragReleaseMonitorState::default()))
+}
+
 fn cache_unity_embed_asset_drag_refs(refs: Vec<UnityEmbedAssetRef>) {
     let Ok(mut cache) = asset_drag_cache().lock() else {
         return;
@@ -616,6 +679,114 @@ fn current_unity_embed_asset_drag_refs() -> Vec<UnityEmbedAssetRef> {
     cache.refs.clone()
 }
 
+fn ensure_unity_embed_asset_drag_release_monitor(app_handle: &AppHandle) {
+    #[cfg(target_os = "windows")]
+    {
+        if current_unity_embed_asset_drag_refs().is_empty() {
+            return;
+        }
+
+        let should_spawn = asset_drag_release_monitor_state()
+            .lock()
+            .map(|mut state| {
+                if state.running {
+                    false
+                } else {
+                    state.running = true;
+                    true
+                }
+            })
+            .unwrap_or(false);
+        if !should_spawn {
+            return;
+        }
+
+        let app_for_monitor = app_handle.clone();
+        tauri::async_runtime::spawn(async move {
+            monitor_unity_embed_asset_drag_release(app_for_monitor).await;
+        });
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = app_handle;
+    }
+}
+
+#[cfg(target_os = "windows")]
+async fn monitor_unity_embed_asset_drag_release(app_handle: AppHandle) {
+    let mut probe_error_logged = false;
+    let mut saw_left_button_down = match windows_impl::unity_asset_drag_release_probe(&app_handle) {
+        Ok(probe) => probe.left_button_down,
+        Err(error) => {
+            probe_error_logged = true;
+            eprintln!("[Locus] Unity asset drag release probe failed: {error}");
+            false
+        }
+    };
+
+    loop {
+        tokio::time::sleep(ASSET_DRAG_RELEASE_POLL_INTERVAL).await;
+        if current_unity_embed_asset_drag_refs().is_empty() {
+            break;
+        }
+
+        let probe = match windows_impl::unity_asset_drag_release_probe(&app_handle) {
+            Ok(probe) => probe,
+            Err(error) => {
+                if !probe_error_logged {
+                    probe_error_logged = true;
+                    eprintln!("[Locus] Unity asset drag release probe failed: {error}");
+                }
+                continue;
+            }
+        };
+
+        if probe.left_button_down {
+            saw_left_button_down = true;
+            continue;
+        }
+
+        if !saw_left_button_down {
+            continue;
+        }
+
+        match probe.target {
+            windows_impl::UnityAssetDragReleaseTarget::MainWindow => {
+                let refs = current_unity_embed_asset_drag_refs();
+                if !refs.is_empty() {
+                    if let Err(error) =
+                        emit_locus_asset_drop_to(&app_handle, MAIN_WINDOW_LABEL, refs)
+                    {
+                        eprintln!(
+                            "[Locus] failed to emit Unity asset drop to main window: {error}"
+                        );
+                    }
+                    clear_unity_embed_asset_drag_after_release(&app_handle);
+                }
+                break;
+            }
+            windows_impl::UnityAssetDragReleaseTarget::EmbedWindow => {
+                break;
+            }
+            windows_impl::UnityAssetDragReleaseTarget::Other => {
+                break;
+            }
+        }
+    }
+
+    if let Ok(mut state) = asset_drag_release_monitor_state().lock() {
+        state.running = false;
+    }
+}
+
+fn clear_unity_embed_asset_drag_after_release(app_handle: &AppHandle) {
+    cache_unity_embed_asset_drag_refs(Vec::new());
+    if let Err(error) = emit_unity_embed_asset_drag_state(app_handle, Vec::new()) {
+        eprintln!("[Locus] failed to clear Unity asset drag state: {error}");
+    }
+}
+
 #[tauri::command]
 pub async fn unity_embed_commit_asset_drop(app_handle: AppHandle) -> Result<(), AppError> {
     let refs = current_unity_embed_asset_drag_refs();
@@ -626,6 +797,162 @@ pub async fn unity_embed_commit_asset_drop(app_handle: AppHandle) -> Result<(), 
     emit_unity_embed_asset_drop(&app_handle, refs).map_err(AppError::from)?;
     cache_unity_embed_asset_drag_refs(Vec::new());
     emit_unity_embed_asset_drag_state(&app_handle, Vec::new()).map_err(AppError::from)
+}
+
+#[tauri::command]
+pub async fn unity_embed_start_asset_drag(
+    app_handle: AppHandle,
+    request: UnityEmbedStartAssetDragRequest,
+) -> Result<String, AppError> {
+    let refs = sanitize_locus_outbound_drag_refs(request.refs);
+    if refs.is_empty() {
+        return Ok("no_refs".to_string());
+    }
+
+    let cwd = current_workspace_path(&app_handle).await;
+    if cwd.trim().is_empty() {
+        return Err(AppError::new(
+            "unity.drag.workspace_missing",
+            "No Unity workspace is active.",
+        ));
+    }
+
+    let payload = serde_json::json!({ "refs": refs }).to_string();
+    crate::unity_bridge::start_asset_drag(&cwd, &payload).await?;
+    Ok("ok".to_string())
+}
+
+#[tauri::command]
+pub async fn unity_embed_start_native_asset_file_drag(
+    app_handle: AppHandle,
+    request: UnityEmbedNativeAssetFileDragRequest,
+) -> Result<String, AppError> {
+    let refs = sanitize_locus_outbound_drag_refs(request.refs);
+    if refs.is_empty() {
+        return Ok("no_refs".to_string());
+    }
+
+    let cwd = current_workspace_path(&app_handle).await;
+    if cwd.trim().is_empty() {
+        return Err(AppError::new(
+            "unity.drag.workspace_missing",
+            "No Unity workspace is active.",
+        ));
+    }
+
+    let paths = native_asset_file_drag_paths(&cwd, &refs);
+    if paths.is_empty() {
+        return Ok("no_files".to_string());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app_handle
+            .run_on_main_thread(move || {
+                let result = windows_impl::start_native_file_drag(paths);
+                let _ = tx.send(result);
+            })
+            .map_err(|error| {
+                AppError::new(
+                    "unity.drag.native_dispatch_failed",
+                    format!("Failed to dispatch native asset file drag: {error}"),
+                )
+            })?;
+
+        let result = rx.await.map_err(|_| {
+            AppError::new(
+                "unity.drag.native_cancelled",
+                "Native asset file drag was cancelled before it started.",
+            )
+        })?;
+
+        return result.map_err(|error| {
+            AppError::new("unity.drag.native_failed", error).operation("nativeAssetFileDrag")
+        });
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        Ok("unsupported".to_string())
+    }
+}
+
+fn sanitize_locus_outbound_drag_refs(refs: Vec<UnityEmbedAssetRef>) -> Vec<UnityEmbedAssetRef> {
+    let mut seen = HashSet::new();
+    let mut sanitized = Vec::new();
+
+    for mut asset_ref in refs {
+        asset_ref.path = normalize_unity_path_text(&asset_ref.path);
+        asset_ref.kind = asset_ref.kind.trim().to_string();
+
+        if asset_ref.path.is_empty()
+            || (asset_ref.kind != "asset" && asset_ref.kind != "sceneObject")
+        {
+            continue;
+        }
+
+        let key = format!(
+            "{}\n{}",
+            asset_ref.kind,
+            asset_ref.path.to_ascii_lowercase()
+        );
+        if seen.insert(key) {
+            sanitized.push(asset_ref);
+        }
+    }
+
+    sanitized
+}
+
+fn native_asset_file_drag_paths(workspace_path: &str, refs: &[UnityEmbedAssetRef]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut paths = Vec::new();
+
+    for asset_ref in refs {
+        let Some(path) = native_asset_file_drag_path(workspace_path, asset_ref) else {
+            continue;
+        };
+        if seen.insert(path.to_ascii_lowercase()) {
+            paths.push(path);
+        }
+    }
+
+    paths
+}
+
+fn native_asset_file_drag_path(
+    workspace_path: &str,
+    asset_ref: &UnityEmbedAssetRef,
+) -> Option<String> {
+    if asset_ref.kind != "asset" {
+        return None;
+    }
+
+    let relative_path = normalize_unity_path_text(&asset_ref.path);
+    if !is_safe_supported_unity_ref_path(&relative_path) {
+        return None;
+    }
+
+    let workspace_path = normalize_existing_path_text(Path::new(workspace_path));
+    if workspace_path.is_empty() {
+        return None;
+    }
+
+    let local_path =
+        relative_path
+            .split('/')
+            .fold(PathBuf::from(&workspace_path), |mut path, part| {
+                path.push(part);
+                path
+            });
+    if !local_path.exists() {
+        return None;
+    }
+
+    let normalized = normalize_existing_path_text(&local_path);
+    unity_relative_drop_path(&workspace_path, Path::new(&normalized))?;
+    Some(normalized)
 }
 
 fn unity_file_drop_asset_refs(workspace_path: &str, paths: &[PathBuf]) -> Vec<UnityEmbedAssetRef> {
@@ -695,6 +1022,46 @@ fn emit_locus_file_drop_to(
     )
 }
 
+fn emit_locus_file_drag_state_to(
+    app_handle: &AppHandle,
+    label: &str,
+    event: &tauri::DragDropEvent,
+) -> Result<(), String> {
+    let payload = match event {
+        tauri::DragDropEvent::Enter { paths, position } => LocusFileDragStatePayload {
+            phase: "enter".to_string(),
+            active: true,
+            file_count: paths.len(),
+            x: position.x,
+            y: position.y,
+        },
+        tauri::DragDropEvent::Over { position } => LocusFileDragStatePayload {
+            phase: "over".to_string(),
+            active: true,
+            file_count: 0,
+            x: position.x,
+            y: position.y,
+        },
+        tauri::DragDropEvent::Drop { paths, position } => LocusFileDragStatePayload {
+            phase: "drop".to_string(),
+            active: false,
+            file_count: paths.len(),
+            x: position.x,
+            y: position.y,
+        },
+        tauri::DragDropEvent::Leave => LocusFileDragStatePayload {
+            phase: "leave".to_string(),
+            active: false,
+            file_count: 0,
+            x: 0.0,
+            y: 0.0,
+        },
+        _ => return Ok(()),
+    };
+
+    emit_to_existing_window(app_handle, label, FILE_DRAG_STATE_EVENT, payload)
+}
+
 fn unity_file_drop_asset_ref(workspace_path: &str, path: &Path) -> Option<UnityEmbedAssetRef> {
     let relative_path = unity_relative_drop_path(workspace_path, path)?;
     let name = unity_drop_name(path, &relative_path);
@@ -759,6 +1126,14 @@ fn is_supported_unity_ref_path(path: &str) -> bool {
         || lower.starts_with("assets/")
         || lower.starts_with("packages/")
         || lower.starts_with("projectsettings/")
+}
+
+fn is_safe_supported_unity_ref_path(path: &str) -> bool {
+    let normalized = normalize_unity_path_text(path);
+    is_supported_unity_ref_path(&normalized)
+        && normalized
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
 }
 
 fn unity_drop_name(path: &Path, relative_path: &str) -> Option<String> {
@@ -873,6 +1248,38 @@ pub async fn unity_embed_activate_for_input(app_handle: AppHandle) -> Result<(),
     #[cfg(not(target_os = "windows"))]
     {
         let _ = app_handle;
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn unity_embed_set_drag_passthrough(
+    app_handle: AppHandle,
+    active: bool,
+) -> Result<(), AppError> {
+    #[cfg(target_os = "windows")]
+    {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let app_for_main = app_handle.clone();
+        app_handle
+            .run_on_main_thread(move || {
+                let result = windows_impl::set_drag_passthrough(
+                    app_for_main.get_webview_window(WINDOW_LABEL).as_ref(),
+                    active,
+                );
+                let _ = tx.send(result);
+            })
+            .map_err(|error| format!("Failed to dispatch Unity embed drag passthrough: {error}"))?;
+
+        rx.await
+            .map_err(|_| "Unity embed drag passthrough was cancelled".to_string())??;
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = app_handle;
+        let _ = active;
     }
 
     Ok(())
@@ -1059,6 +1466,7 @@ fn apply_control_message_on_main(
         "assetDrag" => {
             let refs = msg.asset_refs.unwrap_or_default();
             cache_unity_embed_asset_drag_refs(refs.clone());
+            ensure_unity_embed_asset_drag_release_monitor(app_handle);
             emit_unity_embed_asset_drag_state(app_handle, refs)
         }
         "consoleText" => {
@@ -1166,31 +1574,58 @@ fn apply_overlay_geometry(
 #[cfg(target_os = "windows")]
 mod windows_impl {
     use super::*;
-    use std::io;
+    use std::path::Path;
     use std::sync::{Mutex, OnceLock};
     use std::time::Duration;
+    use std::{io, mem::ManuallyDrop, ptr};
     use tokio::{
         io::{AsyncBufReadExt, BufReader},
         net::windows::named_pipe::{NamedPipeServer, ServerOptions},
     };
     use webview2_com::Microsoft::Web::WebView2::Win32::COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC;
+    use windows::core::{
+        implement, Error as WinError, Ref as WinRef, Result as WinResult, BOOL, PCWSTR,
+    };
     use windows::Win32::{
-        Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
+        Foundation::{
+            DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS, DV_E_FORMATETC,
+            E_NOTIMPL, E_POINTER, HGLOBAL, HWND, LPARAM, LRESULT, POINT, RECT, S_OK, WPARAM,
+        },
         Graphics::Gdi::ScreenToClient,
-        System::Threading::{AttachThreadInput, GetCurrentThreadId},
+        System::{
+            Com::{
+                IAdviseSink, IDataObject, IDataObject_Impl, IEnumFORMATETC, IEnumSTATDATA,
+                DATADIR_GET, DVASPECT_CONTENT, FORMATETC, STGMEDIUM, STGMEDIUM_0, TYMED_HGLOBAL,
+            },
+            Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE, GMEM_ZEROINIT},
+            Ole::{
+                DoDragDrop, IDropSource, IDropSource_Impl, OleInitialize, OleUninitialize,
+                CF_HDROP, DROPEFFECT, DROPEFFECT_COPY,
+            },
+            SystemServices::{MK_LBUTTON, MODIFIERKEYS_FLAGS},
+            Threading::{AttachThreadInput, GetCurrentThreadId},
+        },
         UI::{
-            Input::KeyboardAndMouse::{GetFocus, SetActiveWindow, SetFocus as SetKeyboardFocus},
-            Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
+            Input::KeyboardAndMouse::{
+                GetAsyncKeyState, GetFocus, ReleaseCapture, SetActiveWindow,
+                SetFocus as SetKeyboardFocus,
+            },
+            Shell::{
+                Common::ITEMIDLIST, DefSubclassProc, ILCreateFromPathW, ILFindLastID, ILFree,
+                RemoveWindowSubclass, SHCreateDataObject, SHCreateStdEnumFmtEtc, SetWindowSubclass,
+                DROPFILES,
+            },
             WindowsAndMessaging::{
-                BringWindowToTop, GetAncestor, GetForegroundWindow, GetGUIThreadInfo, GetParent,
-                GetTopWindow, GetWindow, GetWindowLongPtrW, GetWindowRect, GetWindowTextW,
-                GetWindowThreadProcessId, IsChild, IsIconic, IsWindow, IsWindowVisible,
-                SetForegroundWindow, SetParent, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-                GA_ROOT, GUITHREADINFO, GWLP_HWNDPARENT, GWL_EXSTYLE, GWL_STYLE, GW_CHILD,
-                GW_HWNDNEXT, HWND_TOP, MA_NOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
-                SWP_NOOWNERZORDER, SWP_NOSIZE, SW_HIDE, SW_SHOWNOACTIVATE, WM_MOUSEACTIVATE,
-                WM_NCDESTROY, WS_CAPTION, WS_CHILD, WS_EX_NOACTIVATE, WS_MAXIMIZEBOX,
-                WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_THICKFRAME,
+                BringWindowToTop, GetAncestor, GetCursorPos, GetForegroundWindow, GetGUIThreadInfo,
+                GetParent, GetTopWindow, GetWindow, GetWindowLongPtrW, GetWindowRect,
+                GetWindowTextW, GetWindowThreadProcessId, IsChild, IsIconic, IsWindow,
+                IsWindowVisible, SetForegroundWindow, SetParent, SetWindowLongPtrW, SetWindowPos,
+                ShowWindow, WindowFromPoint, GA_ROOT, GUITHREADINFO, GWLP_HWNDPARENT, GWL_EXSTYLE,
+                GWL_STYLE, GW_CHILD, GW_HWNDNEXT, HWND_TOP, MA_NOACTIVATE, SWP_FRAMECHANGED,
+                SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SW_HIDE,
+                SW_SHOWNOACTIVATE, WM_MOUSEACTIVATE, WM_NCDESTROY, WS_CAPTION, WS_CHILD,
+                WS_EX_NOACTIVATE, WS_EX_TRANSPARENT, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP,
+                WS_SYSMENU, WS_THICKFRAME,
             },
         },
     };
@@ -1200,6 +1635,356 @@ mod windows_impl {
     const MOUSE_HOOK_SYNC_INTERVAL_MS: u64 = 250;
     const Z_ORDER_SCAN_LIMIT: usize = 2048;
     const MOUSE_ACTIVATE_SUBCLASS_ID: usize = 0x4c6f637573;
+    const VK_LBUTTON_CODE: i32 = 0x01;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum UnityAssetDragReleaseTarget {
+        MainWindow,
+        EmbedWindow,
+        Other,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    pub(super) struct UnityAssetDragReleaseProbe {
+        pub left_button_down: bool,
+        pub target: UnityAssetDragReleaseTarget,
+    }
+
+    pub(super) fn unity_asset_drag_release_probe(
+        app_handle: &AppHandle,
+    ) -> Result<UnityAssetDragReleaseProbe, String> {
+        unsafe {
+            let mut point = POINT::default();
+            GetCursorPos(&mut point)
+                .map_err(|error| format!("GetCursorPos failed for Unity asset drag: {error}"))?;
+
+            let hwnd = WindowFromPoint(point);
+            let target = unity_asset_drag_release_target(app_handle, hwnd)?;
+            Ok(UnityAssetDragReleaseProbe {
+                left_button_down: (GetAsyncKeyState(VK_LBUTTON_CODE) as u16 & 0x8000) != 0,
+                target,
+            })
+        }
+    }
+
+    unsafe fn unity_asset_drag_release_target(
+        app_handle: &AppHandle,
+        hwnd: HWND,
+    ) -> Result<UnityAssetDragReleaseTarget, String> {
+        if window_label_contains_hwnd(app_handle, MAIN_WINDOW_LABEL, hwnd)? {
+            return Ok(UnityAssetDragReleaseTarget::MainWindow);
+        }
+        if window_label_contains_hwnd(app_handle, WINDOW_LABEL, hwnd)? {
+            return Ok(UnityAssetDragReleaseTarget::EmbedWindow);
+        }
+        Ok(UnityAssetDragReleaseTarget::Other)
+    }
+
+    unsafe fn window_label_contains_hwnd(
+        app_handle: &AppHandle,
+        label: &str,
+        hwnd: HWND,
+    ) -> Result<bool, String> {
+        let Some(window) = app_handle.get_webview_window(label) else {
+            return Ok(false);
+        };
+        let root = window
+            .hwnd()
+            .map_err(|error| format!("Failed to read {label} window handle: {error}"))?;
+        Ok(is_same_or_descendant_window(root, hwnd))
+    }
+
+    unsafe fn is_same_or_descendant_window(parent: HWND, hwnd: HWND) -> bool {
+        if !is_valid_window(parent) || !is_valid_window(hwnd) {
+            return false;
+        }
+        hwnd == parent || IsChild(parent, hwnd).as_bool() || GetAncestor(hwnd, GA_ROOT) == parent
+    }
+
+    pub(super) fn start_native_file_drag(paths: Vec<String>) -> Result<String, String> {
+        if paths.is_empty() {
+            return Ok("no_files".to_string());
+        }
+
+        unsafe {
+            OleInitialize(None)
+                .map_err(|error| format!("OleInitialize failed for native file drag: {error}"))?;
+            let _ole_scope = OleScope;
+
+            let _ = ReleaseCapture();
+
+            let (data_object, _pidls) = create_native_file_data_object(paths);
+            let drop_source: IDropSource = NativeFileDropSource.into();
+            let mut effect = DROPEFFECT(0);
+            let result = DoDragDrop(&data_object, &drop_source, DROPEFFECT_COPY, &mut effect);
+            if result != DRAGDROP_S_DROP && result != DRAGDROP_S_CANCEL && result != S_OK {
+                return Err(format!(
+                    "DoDragDrop failed for native file drag: {result:?}"
+                ));
+            }
+
+            Ok(format!("effect:{}", effect.0))
+        }
+    }
+
+    fn create_native_file_data_object(paths: Vec<String>) -> (IDataObject, Vec<OwnedItemIdList>) {
+        match unsafe { create_shell_file_data_object(&paths) } {
+            Ok(result) => result,
+            Err(error) => {
+                eprintln!(
+                    "[Locus] failed to create shell data object for native file drag, using CF_HDROP fallback: {error}"
+                );
+                (NativeFileDataObject { paths }.into(), Vec::new())
+            }
+        }
+    }
+
+    unsafe fn create_shell_file_data_object(
+        paths: &[String],
+    ) -> WinResult<(IDataObject, Vec<OwnedItemIdList>)> {
+        let parent_path = common_drag_parent_path(paths)?;
+        let parent_pidl = OwnedItemIdList::new(&parent_path)?;
+        let mut pidls = Vec::with_capacity(paths.len() + 1);
+        pidls.push(parent_pidl);
+
+        let mut items = Vec::with_capacity(paths.len());
+        for path in paths {
+            let pidl = OwnedItemIdList::new(path)?;
+            let child = ILFindLastID(pidl.item);
+            if child.is_null() {
+                return Err(WinError::from_hresult(E_POINTER));
+            }
+            items.push(child as *const ITEMIDLIST);
+            pidls.push(pidl);
+        }
+
+        let data_object =
+            SHCreateDataObject(Some(pidls[0].item), Some(&items), None::<&IDataObject>)?;
+        Ok((data_object, pidls))
+    }
+
+    fn common_drag_parent_path(paths: &[String]) -> WinResult<String> {
+        let Some(first) = paths.first() else {
+            return Err(WinError::from_hresult(E_POINTER));
+        };
+        let Some(parent) = Path::new(first).parent().and_then(Path::to_str) else {
+            return Err(WinError::from_hresult(E_POINTER));
+        };
+        let parent = parent.to_string();
+
+        for path in paths.iter().skip(1) {
+            let Some(next_parent) = Path::new(path).parent().and_then(Path::to_str) else {
+                return Err(WinError::from_hresult(E_POINTER));
+            };
+            if !parent.eq_ignore_ascii_case(next_parent) {
+                return Err(WinError::from_hresult(E_NOTIMPL));
+            }
+        }
+
+        Ok(parent)
+    }
+
+    struct OwnedItemIdList {
+        _path: Vec<u16>,
+        item: *const ITEMIDLIST,
+    }
+
+    impl OwnedItemIdList {
+        fn new(path: &str) -> WinResult<Self> {
+            let path = windows_file_drag_path_text(path)
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect::<Vec<_>>();
+            let item = unsafe { ILCreateFromPathW(PCWSTR(path.as_ptr())) };
+            if item.is_null() {
+                return Err(WinError::from_hresult(E_POINTER));
+            }
+
+            Ok(Self { _path: path, item })
+        }
+    }
+
+    impl Drop for OwnedItemIdList {
+        fn drop(&mut self) {
+            if !self.item.is_null() {
+                unsafe { ILFree(Some(self.item)) };
+            }
+        }
+    }
+
+    struct OleScope;
+
+    impl Drop for OleScope {
+        fn drop(&mut self) {
+            unsafe {
+                OleUninitialize();
+            }
+        }
+    }
+
+    #[implement(IDataObject)]
+    struct NativeFileDataObject {
+        paths: Vec<String>,
+    }
+
+    #[allow(non_snake_case)]
+    impl IDataObject_Impl for NativeFileDataObject_Impl {
+        fn GetData(&self, format: *const FORMATETC) -> WinResult<STGMEDIUM> {
+            if !supports_hdrop_format(format) {
+                return Err(WinError::from_hresult(DV_E_FORMATETC));
+            }
+
+            let hglobal = unsafe { build_hdrop_global(&self.paths)? };
+            Ok(STGMEDIUM {
+                tymed: TYMED_HGLOBAL.0 as u32,
+                u: STGMEDIUM_0 { hGlobal: hglobal },
+                pUnkForRelease: ManuallyDrop::new(None),
+            })
+        }
+
+        fn GetDataHere(&self, _format: *const FORMATETC, _medium: *mut STGMEDIUM) -> WinResult<()> {
+            Err(WinError::from_hresult(E_NOTIMPL))
+        }
+
+        fn QueryGetData(&self, format: *const FORMATETC) -> windows::core::HRESULT {
+            if supports_hdrop_format(format) {
+                S_OK
+            } else {
+                DV_E_FORMATETC
+            }
+        }
+
+        fn GetCanonicalFormatEtc(
+            &self,
+            _format_in: *const FORMATETC,
+            _format_out: *mut FORMATETC,
+        ) -> windows::core::HRESULT {
+            E_NOTIMPL
+        }
+
+        fn SetData(
+            &self,
+            _format: *const FORMATETC,
+            _medium: *const STGMEDIUM,
+            _release: BOOL,
+        ) -> WinResult<()> {
+            Err(WinError::from_hresult(E_NOTIMPL))
+        }
+
+        fn EnumFormatEtc(&self, direction: u32) -> WinResult<IEnumFORMATETC> {
+            if direction != DATADIR_GET.0 as u32 {
+                return Err(WinError::from_hresult(E_NOTIMPL));
+            }
+
+            unsafe { SHCreateStdEnumFmtEtc(&[hdrop_format()]) }
+        }
+
+        fn DAdvise(
+            &self,
+            _format: *const FORMATETC,
+            _advf: u32,
+            _sink: WinRef<'_, IAdviseSink>,
+        ) -> WinResult<u32> {
+            Err(WinError::from_hresult(E_NOTIMPL))
+        }
+
+        fn DUnadvise(&self, _connection: u32) -> WinResult<()> {
+            Err(WinError::from_hresult(E_NOTIMPL))
+        }
+
+        fn EnumDAdvise(&self) -> WinResult<IEnumSTATDATA> {
+            Err(WinError::from_hresult(E_NOTIMPL))
+        }
+    }
+
+    #[implement(IDropSource)]
+    struct NativeFileDropSource;
+
+    #[allow(non_snake_case)]
+    impl IDropSource_Impl for NativeFileDropSource_Impl {
+        fn QueryContinueDrag(
+            &self,
+            escape_pressed: BOOL,
+            key_state: MODIFIERKEYS_FLAGS,
+        ) -> windows::core::HRESULT {
+            if escape_pressed.as_bool() {
+                return DRAGDROP_S_CANCEL;
+            }
+            if (key_state & MK_LBUTTON).0 == 0 {
+                return DRAGDROP_S_DROP;
+            }
+            S_OK
+        }
+
+        fn GiveFeedback(&self, _effect: DROPEFFECT) -> windows::core::HRESULT {
+            DRAGDROP_S_USEDEFAULTCURSORS
+        }
+    }
+
+    fn hdrop_format() -> FORMATETC {
+        FORMATETC {
+            cfFormat: CF_HDROP.0,
+            ptd: ptr::null_mut(),
+            dwAspect: DVASPECT_CONTENT.0,
+            lindex: -1,
+            tymed: TYMED_HGLOBAL.0 as u32,
+        }
+    }
+
+    fn supports_hdrop_format(format: *const FORMATETC) -> bool {
+        if format.is_null() {
+            return false;
+        }
+
+        unsafe {
+            let format = *format;
+            format.cfFormat == CF_HDROP.0
+                && format.dwAspect == DVASPECT_CONTENT.0
+                && (format.tymed & TYMED_HGLOBAL.0 as u32) != 0
+        }
+    }
+
+    unsafe fn build_hdrop_global(paths: &[String]) -> WinResult<HGLOBAL> {
+        let mut encoded_paths = Vec::<u16>::new();
+        for path in paths {
+            encoded_paths.extend(windows_file_drag_path_text(path).encode_utf16());
+            encoded_paths.push(0);
+        }
+        encoded_paths.push(0);
+
+        let header_size = std::mem::size_of::<DROPFILES>();
+        let paths_size = encoded_paths.len() * std::mem::size_of::<u16>();
+        let total_size = header_size + paths_size;
+        let hglobal = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, total_size)?;
+        let locked = GlobalLock(hglobal);
+        if locked.is_null() {
+            return Err(WinError::from_hresult(E_POINTER));
+        }
+
+        let header = DROPFILES {
+            pFiles: header_size as u32,
+            pt: POINT { x: 0, y: 0 },
+            fNC: false.into(),
+            fWide: true.into(),
+        };
+        ptr::copy_nonoverlapping(
+            ptr::addr_of!(header).cast::<u8>(),
+            locked.cast::<u8>(),
+            header_size,
+        );
+        ptr::copy_nonoverlapping(
+            encoded_paths.as_ptr().cast::<u8>(),
+            locked.cast::<u8>().add(header_size),
+            paths_size,
+        );
+
+        let _ = GlobalUnlock(hglobal);
+        Ok(hglobal)
+    }
+
+    fn windows_file_drag_path_text(path: &str) -> String {
+        path.replace('/', "\\")
+    }
 
     #[derive(Debug, Clone, Copy, Default)]
     struct PopupSyncSnapshot {
@@ -1874,6 +2659,30 @@ mod windows_impl {
         apply_mouse_activation_style(window, suppressed)
     }
 
+    pub(super) fn set_drag_passthrough(
+        window: Option<&tauri::WebviewWindow>,
+        active: bool,
+    ) -> Result<(), String> {
+        let Some(window) = window else {
+            return Ok(());
+        };
+        let hwnd = window
+            .hwnd()
+            .map_err(|error| format!("Failed to read Tauri window handle: {error}"))?;
+
+        let mut hwnds = vec![hwnd];
+        unsafe {
+            if active {
+                let _ = ReleaseCapture();
+            }
+            collect_descendant_windows(hwnd, &mut hwnds);
+            for target in hwnds {
+                apply_drag_passthrough_style_to_hwnd(target, active)?;
+            }
+        }
+        Ok(())
+    }
+
     fn apply_mouse_activation_style(
         window: &tauri::WebviewWindow,
         suppressed: bool,
@@ -1911,6 +2720,32 @@ mod windows_impl {
             SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED,
         )
         .map_err(|error| format!("SetWindowPos failed for Unity embed activation style: {error}"))
+    }
+
+    unsafe fn apply_drag_passthrough_style_to_hwnd(hwnd: HWND, active: bool) -> Result<(), String> {
+        let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        let current = ex_style as u32;
+        let next = if active {
+            current | WS_EX_TRANSPARENT.0
+        } else {
+            current & !WS_EX_TRANSPARENT.0
+        };
+
+        if next == current {
+            return Ok(());
+        }
+
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, next as isize);
+        SetWindowPos(
+            hwnd,
+            None,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED,
+        )
+        .map_err(|error| format!("SetWindowPos failed for Unity embed drag passthrough: {error}"))
     }
 
     unsafe fn has_no_activate_style(hwnd: HWND) -> bool {
@@ -2422,11 +3257,13 @@ mod windows_impl {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::path::{Path, PathBuf};
 
     use super::{
-        control_pipe_name_for_project_path, locus_file_drop_refs, normalize_pipe_project_path,
-        unity_file_drop_asset_refs, unity_relative_drop_path,
+        control_pipe_name_for_project_path, locus_file_drop_refs, native_asset_file_drag_paths,
+        normalize_pipe_project_path, unity_file_drop_asset_refs, unity_relative_drop_path,
+        UnityEmbedAssetRef,
     };
 
     #[test]
@@ -2497,5 +3334,56 @@ mod tests {
         );
 
         assert!(refs.is_empty());
+    }
+
+    #[test]
+    fn native_file_drag_maps_asset_refs_to_existing_project_files() {
+        let project = tempfile::tempdir().unwrap();
+        let asset_path = project.path().join("Assets/Prefabs/Enemy.prefab");
+        fs::create_dir_all(asset_path.parent().unwrap()).unwrap();
+        fs::write(&asset_path, "prefab").unwrap();
+
+        let paths = native_asset_file_drag_paths(
+            &project.path().to_string_lossy(),
+            &[UnityEmbedAssetRef {
+                path: "Assets/Prefabs/Enemy.prefab".to_string(),
+                kind: "asset".to_string(),
+                name: None,
+                type_label: None,
+                source: None,
+            }],
+        );
+
+        assert_eq!(paths.len(), 1);
+        assert!(paths[0].ends_with("Assets/Prefabs/Enemy.prefab"));
+    }
+
+    #[test]
+    fn native_file_drag_rejects_traversal_and_scene_objects() {
+        let project = tempfile::tempdir().unwrap();
+        let outside = project.path().join("outside.txt");
+        fs::write(&outside, "outside").unwrap();
+
+        let paths = native_asset_file_drag_paths(
+            &project.path().to_string_lossy(),
+            &[
+                UnityEmbedAssetRef {
+                    path: "Assets/../outside.txt".to_string(),
+                    kind: "asset".to_string(),
+                    name: None,
+                    type_label: None,
+                    source: None,
+                },
+                UnityEmbedAssetRef {
+                    path: "Assets/Scene.unity/Player".to_string(),
+                    kind: "sceneObject".to_string(),
+                    name: None,
+                    type_label: None,
+                    source: None,
+                },
+            ],
+        );
+
+        assert!(paths.is_empty());
     }
 }
