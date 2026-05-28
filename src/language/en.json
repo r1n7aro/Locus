@@ -1442,7 +1442,7 @@
   "knowledge.meta.inject.noneHint": "Available for search and recall without proactive context injection.",
   "knowledge.meta.inject.pathHint": "L0. Provide the title and path in context, then read the body on demand.",
   "knowledge.meta.inject.excerptHint": "L1. Provide the summary in context, or fall back to the opening body snippet.",
-  "knowledge.meta.inject.fullHint": "L2. Inject maintenance rules and the full body as always-on knowledge in the Knowledge L2 Memory section.",
+  "knowledge.meta.inject.fullHint": "L2. Inject maintenance rules and the full body as always-on knowledge in the Knowledge L2 Full Documents section.",
   "knowledge.meta.inject.ruleHint": "L3. Inject both maintenance rules and the full document body as active rules for high-priority long-term constraints.",
   "knowledge.meta.tag.auto": "AUTO",
   "knowledge.meta.tag.lexicalOn": "LX",

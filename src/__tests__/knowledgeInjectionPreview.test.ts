@@ -49,7 +49,7 @@ describe("Knowledge injection preview", () => {
     expect(runtime).toContain('"### Search"');
     expect(runtime).toContain('"### Maintenance"');
     expect(runtime).toContain('"### Tools"');
-    expect(runtime).toContain('"### L2 Memory');
+    expect(runtime).toContain('"### L2 Full Documents');
     expect(runtime).toContain('"## L3 Rules');
     expect(runtime).toContain('knowledge_rule::');
     expect(markdownRenderer).toContain('normalizedLang === "tree"');

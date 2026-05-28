@@ -1378,12 +1378,23 @@ struct PromptTreeFile {
     desc: String,
 }
 
+#[derive(Debug, Clone)]
+struct PromptKnowledgeItem {
+    doc_type: crate::knowledge_store::KnowledgeType,
+    path: String,
+    title: String,
+    inject_mode: crate::knowledge_store::KnowledgeInjectMode,
+    summary: Option<String>,
+    body_excerpt: Option<String>,
+}
+
 #[derive(Debug, Default, Clone)]
 struct PromptTreeNode {
     desc: Option<String>,
     dirs: BTreeMap<String, PromptTreeNode>,
     notes: Vec<String>,
     files: Vec<PromptTreeFile>,
+    hidden_files: usize,
 }
 
 fn clip_single_line(value: &str, max_chars: usize) -> String {
@@ -1433,7 +1444,132 @@ fn prompt_file_name(path: &str) -> String {
         .to_string()
 }
 
-fn prompt_file_desc(item: &crate::knowledge_store::KnowledgeListItem) -> String {
+fn prompt_path_parts(path: &str) -> Vec<String> {
+    path.replace('\\', "/")
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .map(|part| part.to_string())
+        .collect()
+}
+
+fn prompt_optional_excerpt(value: &str, max_chars: usize) -> Option<String> {
+    let clipped = clip_single_line(value, max_chars);
+    if clipped.trim().is_empty() {
+        None
+    } else {
+        Some(clipped)
+    }
+}
+
+fn prompt_item_from_document(
+    doc: crate::knowledge_store::KnowledgeDocument,
+) -> PromptKnowledgeItem {
+    let summary =
+        crate::knowledge_store::active_summary(&doc).map(|value| value.trim().to_string());
+    let body_excerpt = prompt_optional_excerpt(&doc.body, 160);
+    PromptKnowledgeItem {
+        doc_type: doc.doc_type,
+        path: doc.path,
+        title: doc.title,
+        inject_mode: doc.inject_mode,
+        summary,
+        body_excerpt,
+    }
+}
+
+fn prompt_item_from_list_item(
+    item: crate::knowledge_store::KnowledgeListItem,
+) -> PromptKnowledgeItem {
+    PromptKnowledgeItem {
+        doc_type: item.doc_type,
+        path: item.path,
+        title: item.title,
+        inject_mode: item.inject_mode,
+        summary: item
+            .summary
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        body_excerpt: None,
+    }
+}
+
+fn prompt_items_from_documents(
+    docs: Vec<crate::knowledge_store::KnowledgeDocument>,
+) -> Vec<PromptKnowledgeItem> {
+    docs.into_iter().map(prompt_item_from_document).collect()
+}
+
+fn prompt_items_from_list_items(
+    items: Vec<crate::knowledge_store::KnowledgeListItem>,
+) -> Vec<PromptKnowledgeItem> {
+    items.into_iter().map(prompt_item_from_list_item).collect()
+}
+
+fn prompt_item_is_structure_injected(item: &PromptKnowledgeItem) -> bool {
+    !matches!(
+        item.inject_mode,
+        crate::knowledge_store::KnowledgeInjectMode::None
+    )
+}
+
+fn prompt_directory_is_structure_injected(
+    record: &crate::knowledge_store::KnowledgeDirectoryConfigRecord,
+) -> bool {
+    !matches!(
+        record.config.inject_mode,
+        crate::knowledge_store::KnowledgeInjectMode::None
+    )
+}
+
+fn prompt_hidden_skill_root_parts(item: &PromptKnowledgeItem) -> Option<Vec<String>> {
+    if item.doc_type != crate::knowledge_store::KnowledgeType::Skill
+        || prompt_item_is_structure_injected(item)
+    {
+        return None;
+    }
+
+    let parts = prompt_path_parts(&item.path);
+    let is_root_skill_doc = parts
+        .last()
+        .is_some_and(|name| name.eq_ignore_ascii_case("SKILL.md"));
+    if is_root_skill_doc && parts.len() > 1 {
+        Some(parts[..parts.len() - 1].to_vec())
+    } else {
+        None
+    }
+}
+
+fn prompt_hidden_parent_parts_for(
+    parts: &[String],
+    hidden_roots: &[Vec<String>],
+) -> Option<Vec<String>> {
+    hidden_roots
+        .iter()
+        .filter(|root| {
+            !root.is_empty()
+                && parts.len() >= root.len()
+                && parts
+                    .iter()
+                    .zip(root.iter())
+                    .all(|(part, root_part)| part == root_part)
+        })
+        .min_by_key(|root| root.len())
+        .map(|root| root[..root.len() - 1].to_vec())
+}
+
+fn prompt_file_desc(item: &PromptKnowledgeItem) -> String {
+    if item.inject_mode == crate::knowledge_store::KnowledgeInjectMode::Excerpt {
+        if let Some(summary) = item
+            .summary
+            .as_deref()
+            .and_then(|value| prompt_optional_excerpt(value, 160))
+        {
+            return summary;
+        }
+        if let Some(body_excerpt) = item.body_excerpt.as_deref() {
+            return body_excerpt.to_string();
+        }
+    }
     let title = item.title.trim();
     if title.is_empty() {
         prompt_file_name(&item.path)
@@ -1487,6 +1623,15 @@ fn insert_prompt_tree_file(node: &mut PromptTreeNode, parts: &[String], file: Pr
     insert_prompt_tree_file(child, &parts[1..], file);
 }
 
+fn insert_prompt_tree_hidden_at(node: &mut PromptTreeNode, parent_parts: &[String]) {
+    if parent_parts.is_empty() {
+        node.hidden_files += 1;
+        return;
+    }
+    let child = node.dirs.entry(parent_parts[0].clone()).or_default();
+    insert_prompt_tree_hidden_at(child, &parent_parts[1..]);
+}
+
 fn insert_prompt_tree_directory(node: &mut PromptTreeNode, parts: &[String], desc: Option<&str>) {
     if parts.is_empty() {
         return;
@@ -1521,19 +1666,34 @@ fn sort_prompt_tree(node: &mut PromptTreeNode) {
 }
 
 fn build_prompt_tree(
-    items: &[crate::knowledge_store::KnowledgeListItem],
+    items: &[PromptKnowledgeItem],
     directories: &[crate::knowledge_store::KnowledgeDirectoryConfigRecord],
     flatten_skill: bool,
 ) -> PromptTreeNode {
     let mut root = PromptTreeNode::default();
+    let mut hidden_roots: Vec<Vec<String>> = if flatten_skill {
+        Vec::new()
+    } else {
+        directories
+            .iter()
+            .filter(|directory| !prompt_directory_is_structure_injected(directory))
+            .map(|directory| prompt_path_parts(&directory.path))
+            .filter(|parts| !parts.is_empty())
+            .collect()
+    };
     if !flatten_skill {
-        for directory in directories {
-            let parts: Vec<String> = directory
-                .path
-                .split('/')
-                .filter(|part| !part.is_empty())
-                .map(|part| part.to_string())
-                .collect();
+        hidden_roots.extend(items.iter().filter_map(prompt_hidden_skill_root_parts));
+    }
+
+    if !flatten_skill {
+        for directory in directories
+            .iter()
+            .filter(|directory| prompt_directory_is_structure_injected(directory))
+        {
+            let parts = prompt_path_parts(&directory.path);
+            if prompt_hidden_parent_parts_for(&parts, &hidden_roots).is_some() {
+                continue;
+            }
             let desc = prompt_directory_desc(directory);
             insert_prompt_tree_directory(&mut root, &parts, desc.as_deref());
         }
@@ -1552,9 +1712,18 @@ fn build_prompt_tree(
         let parts: Vec<String> = if flatten_skill {
             vec![file.name.clone()]
         } else {
-            item.path.split('/').map(|part| part.to_string()).collect()
+            prompt_path_parts(&item.path)
         };
-        insert_prompt_tree_file(&mut root, &parts, file);
+        if let Some(parent_parts) = prompt_hidden_parent_parts_for(&parts, &hidden_roots) {
+            insert_prompt_tree_hidden_at(&mut root, &parent_parts);
+            continue;
+        }
+        if prompt_item_is_structure_injected(item) {
+            insert_prompt_tree_file(&mut root, &parts, file);
+        } else {
+            let parent_parts = parts[..parts.len().saturating_sub(1)].to_vec();
+            insert_prompt_tree_hidden_at(&mut root, &parent_parts);
+        }
     }
     sort_prompt_tree(&mut root);
     root
@@ -1587,22 +1756,25 @@ fn render_tree_lines(
         for file in node.files.iter().take(max_visible_files) {
             entries.push((format!("{} :: {}", file.name, file.desc), Vec::new()));
         }
-        let hidden = node.files.len().saturating_sub(max_visible_files);
+        let hidden = node
+            .files
+            .len()
+            .saturating_sub(max_visible_files)
+            .saturating_add(node.hidden_files);
         if hidden > 0 {
             entries.push((
                 format!("<{} {} hidden>", hidden, pluralize_files(hidden)),
                 Vec::new(),
             ));
         }
-    } else if !node.files.is_empty() {
-        entries.push((
-            format!(
-                "<{} {} hidden>",
-                node.files.len(),
-                pluralize_files(node.files.len())
-            ),
-            Vec::new(),
-        ));
+    } else {
+        let hidden = node.files.len().saturating_add(node.hidden_files);
+        if hidden > 0 {
+            entries.push((
+                format!("<{} {} hidden>", hidden, pluralize_files(hidden)),
+                Vec::new(),
+            ));
+        }
     }
 
     if entries.is_empty() {
@@ -1638,35 +1810,39 @@ fn build_structure_section(
         Vec::new()
     };
 
-    let design_items = crate::knowledge_store::list_documents_with_app_root(
-        working_dir,
-        app_knowledge_dir,
-        Some(crate::knowledge_store::KnowledgeType::Design),
-        None,
-    )?;
-    let reference_items = crate::knowledge_store::list_documents_with_app_root_excluding_prefixes(
-        working_dir,
-        app_knowledge_dir,
-        Some(crate::knowledge_store::KnowledgeType::Reference),
-        None,
-        &excluded_reference_prefixes,
-    )?;
-    let mut skill_items = crate::knowledge_store::list_documents_with_app_root(
-        working_dir,
-        app_knowledge_dir,
-        Some(crate::knowledge_store::KnowledgeType::Skill),
-        None,
-    )?;
-    skill_items.extend(crate::commands::list_skill_package_knowledge_items_sync(
-        working_dir,
-        None,
+    let design_items =
+        prompt_items_from_documents(crate::knowledge_store::load_documents_with_app_root(
+            working_dir,
+            app_knowledge_dir,
+            Some(crate::knowledge_store::KnowledgeType::Design),
+            None,
+        )?);
+    let reference_items = prompt_items_from_documents(
+        crate::knowledge_store::load_documents_with_app_root_excluding_prefixes(
+            working_dir,
+            app_knowledge_dir,
+            Some(crate::knowledge_store::KnowledgeType::Reference),
+            None,
+            &excluded_reference_prefixes,
+        )?,
+    );
+    let mut skill_items =
+        prompt_items_from_documents(crate::knowledge_store::load_documents_with_app_root(
+            working_dir,
+            app_knowledge_dir,
+            Some(crate::knowledge_store::KnowledgeType::Skill),
+            None,
+        )?);
+    skill_items.extend(prompt_items_from_list_items(
+        crate::commands::list_skill_package_knowledge_items_sync(working_dir, None),
     ));
-    let memory_items = crate::knowledge_store::list_documents_with_app_root(
-        working_dir,
-        app_knowledge_dir,
-        Some(crate::knowledge_store::KnowledgeType::Memory),
-        None,
-    )?;
+    let memory_items =
+        prompt_items_from_documents(crate::knowledge_store::load_documents_with_app_root(
+            working_dir,
+            app_knowledge_dir,
+            Some(crate::knowledge_store::KnowledgeType::Memory),
+            None,
+        )?);
 
     let design_directories = crate::knowledge_store::list_directory_configs_with_app_root(
         working_dir,
@@ -1827,57 +2003,52 @@ fn build_tools_section(access_mode: KnowledgeAccessMode) -> String {
     lines.join("\n")
 }
 
-fn build_l2_memory_section(
+fn build_l2_full_document_section(
     working_dir: &str,
     app_knowledge_dir: Option<&std::path::PathBuf>,
 ) -> Result<String, String> {
     crate::knowledge_store::ensure_memory_builtin_documents(working_dir)?;
-    let items = crate::knowledge_store::list_documents_with_app_root(
-        working_dir,
-        app_knowledge_dir,
-        Some(crate::knowledge_store::KnowledgeType::Memory),
-        None,
-    )?;
-
     let mut blocks = Vec::new();
-    for item in items {
-        if item.inject_mode != crate::knowledge_store::KnowledgeInjectMode::Full {
-            continue;
-        }
-
-        let doc = crate::knowledge_store::read_document_with_app_root(
+    for doc_type in [
+        crate::knowledge_store::KnowledgeType::Design,
+        crate::knowledge_store::KnowledgeType::Memory,
+    ] {
+        let docs = crate::knowledge_store::load_documents_with_app_root(
             working_dir,
             app_knowledge_dir,
-            crate::knowledge_store::KnowledgeType::Memory,
-            &item.path,
-            "full",
-        )?
-        .document;
+            Some(doc_type),
+            None,
+        )?;
+        for doc in docs {
+            if doc.inject_mode != crate::knowledge_store::KnowledgeInjectMode::Full {
+                continue;
+            }
 
-        let rules = doc
-            .maintenance_rules
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or("<empty>");
-        let body = if doc.body.trim().is_empty() {
-            "<empty>".to_string()
-        } else {
-            remap_document_body_headings(&doc.body, 4)
-        };
+            let rules = doc
+                .maintenance_rules
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("<empty>");
+            let body = if doc.body.trim().is_empty() {
+                "<empty>".to_string()
+            } else {
+                remap_document_body_headings(&doc.body, 4)
+            };
 
-        blocks.push(
-            [
-                format!("#### memory/{}", doc.path),
-                String::new(),
-                "Rules:".to_string(),
-                rules.to_string(),
-                String::new(),
-                "Body:".to_string(),
-                body,
-            ]
-            .join("\n"),
-        );
+            blocks.push(
+                [
+                    format!("#### {}/{}", doc.doc_type, doc.path),
+                    String::new(),
+                    "Rules:".to_string(),
+                    rules.to_string(),
+                    String::new(),
+                    "Body:".to_string(),
+                    body,
+                ]
+                .join("\n"),
+            );
+        }
     }
 
     if blocks.is_empty() {
@@ -1885,7 +2056,7 @@ fn build_l2_memory_section(
     }
 
     Ok(format!(
-        "### L2 Memory\nThese memory documents stay in the always-on knowledge context as full injections.\n\n{}",
+        "### L2 Full Documents\nThese Design and Memory documents stay in the always-on knowledge context as full injections.\n\n{}",
         blocks.join("\n\n")
     ))
 }
@@ -2495,11 +2666,12 @@ impl AgentInstance {
         sections.push(build_tools_section(self.knowledge_access_mode));
 
         if _include_memory {
-            if let Ok(memory_section) =
-                build_l2_memory_section(&self.working_dir, self.app_knowledge_dir.as_ref().as_ref())
-            {
-                if !memory_section.trim().is_empty() {
-                    sections.push(memory_section);
+            if let Ok(full_document_section) = build_l2_full_document_section(
+                &self.working_dir,
+                self.app_knowledge_dir.as_ref().as_ref(),
+            ) {
+                if !full_document_section.trim().is_empty() {
+                    sections.push(full_document_section);
                 }
             }
         }
@@ -12346,12 +12518,12 @@ impl AgentInstance {
 #[cfg(test)]
 mod tests {
     use super::{
-        assess_knowledge_tool_confirmation, build_l2_memory_section, build_l3_rule_section,
-        build_structure_section, finalize_tool_call_record, AgentInstance,
-        AgentKnowledgeDocumentContent, AgentKnowledgeDocumentContentPatch, AgentKnowledgeListItem,
-        AgentKnowledgeMutationResponse, AgentKnowledgeReadResponse, AgentKnowledgeSearchHit,
-        ExecutedToolResult, InjectedPromptItem, KnowledgeAccessMode, ParentToolCall,
-        RawContextStore, ToolRunOutcome,
+        assess_knowledge_tool_confirmation, build_l2_full_document_section, build_l3_rule_section,
+        build_prompt_tree, build_structure_section, finalize_tool_call_record, render_tree_lines,
+        AgentInstance, AgentKnowledgeDocumentContent, AgentKnowledgeDocumentContentPatch,
+        AgentKnowledgeListItem, AgentKnowledgeMutationResponse, AgentKnowledgeReadResponse,
+        AgentKnowledgeSearchHit, ExecutedToolResult, InjectedPromptItem, KnowledgeAccessMode,
+        ParentToolCall, PromptKnowledgeItem, RawContextStore, ToolRunOutcome,
     };
     use crate::agent::definition::{AgentDef, AgentDefRegistry};
     use crate::commands::{
@@ -14591,7 +14763,7 @@ Create a reusable Skill.
                 doc_type: KnowledgeType::Skill,
                 path: "builtin/create-skill.md".to_string(),
                 title: "Create Skill".to_string(),
-                inject_mode: KnowledgeInjectMode::None,
+                inject_mode: KnowledgeInjectMode::Path,
                 inherit_inject_mode: false,
                 inject_mode_source: Default::default(),
                 summary_enabled: true,
@@ -14636,6 +14808,286 @@ Create a reusable Skill.
 
         assert!(skill_index < builtin_index);
         assert!(builtin_index < doc_index);
+    }
+
+    #[test]
+    fn structure_section_counts_search_only_documents_as_hidden() {
+        let temp = tempdir().expect("temp dir");
+        let working_dir = temp.path().to_string_lossy().to_string();
+
+        save_document(
+            &working_dir,
+            KnowledgeDocument {
+                id: "kd_design_hidden".to_string(),
+                doc_type: KnowledgeType::Design,
+                path: "combat/hidden.md".to_string(),
+                title: "Hidden Design".to_string(),
+                inject_mode: KnowledgeInjectMode::None,
+                inherit_inject_mode: false,
+                inject_mode_source: Default::default(),
+                summary_enabled: true,
+                command_enabled: false,
+                read_only: false,
+                ai_maintained: false,
+                storage_source: crate::knowledge_store::KnowledgeStorageSource::Project,
+                inherit_ai_config: false,
+                ai_config_source: Default::default(),
+                explicit_maintenance_rules: false,
+                external_source: None,
+                skill_enabled: None,
+                skill_surface: None,
+                command_trigger: None,
+                argument_hint: None,
+                tools: Vec::new(),
+                summary: Some("Search only summary".to_string()),
+                body: "Search only body".to_string(),
+                maintenance_rules: None,
+                created_at: 0,
+                updated_at: 0,
+            },
+        )
+        .expect("save hidden design");
+
+        let structure = build_structure_section(&working_dir, None, KnowledgeAccessMode::Full)
+            .expect("build structure");
+        assert!(structure.contains("combat/"), "{}", structure);
+        assert!(structure.contains("<1 file hidden>"), "{}", structure);
+        assert!(!structure.contains("hidden.md"), "{}", structure);
+        assert!(!structure.contains("Hidden Design"), "{}", structure);
+        assert!(!structure.contains("Search only summary"), "{}", structure);
+        assert!(!structure.contains("Search only body"), "{}", structure);
+    }
+
+    #[test]
+    fn prompt_tree_counts_search_only_skill_package_root_as_hidden() {
+        let items = vec![
+            PromptKnowledgeItem {
+                doc_type: KnowledgeType::Skill,
+                path: "studio.tools.psd-to-ugui/SKILL.md".to_string(),
+                title: "PSD To UGUI".to_string(),
+                inject_mode: KnowledgeInjectMode::None,
+                summary: Some("Parse PSD layer structure".to_string()),
+                body_excerpt: Some("Package body should stay hidden".to_string()),
+            },
+            PromptKnowledgeItem {
+                doc_type: KnowledgeType::Skill,
+                path: "studio.tools.psd-to-ugui/references/psd-tools.md".to_string(),
+                title: "PSD Tools".to_string(),
+                inject_mode: KnowledgeInjectMode::None,
+                summary: None,
+                body_excerpt: None,
+            },
+            PromptKnowledgeItem {
+                doc_type: KnowledgeType::Skill,
+                path: "studio.tools.psd-to-ugui/scripts/psd_structure.py".to_string(),
+                title: "PSD Structure".to_string(),
+                inject_mode: KnowledgeInjectMode::None,
+                summary: None,
+                body_excerpt: None,
+            },
+        ];
+
+        let tree = build_prompt_tree(&items, &[], false);
+        let structure = render_tree_lines(&tree, true, 6).join("\n");
+        assert!(structure.contains("<3 files hidden>"), "{}", structure);
+        assert!(
+            !structure.contains("studio.tools.psd-to-ugui/"),
+            "{}",
+            structure
+        );
+        assert!(!structure.contains("references/"), "{}", structure);
+        assert!(!structure.contains("scripts/"), "{}", structure);
+        assert!(!structure.contains("SKILL.md"), "{}", structure);
+        assert!(!structure.contains("PSD To UGUI"), "{}", structure);
+        assert!(
+            !structure.contains("Parse PSD layer structure"),
+            "{}",
+            structure
+        );
+        assert!(
+            !structure.contains("Package body should stay hidden"),
+            "{}",
+            structure
+        );
+    }
+
+    #[test]
+    fn structure_section_collapses_search_only_directory_to_parent_hidden_count() {
+        let temp = tempdir().expect("temp dir");
+        let working_dir = temp.path().to_string_lossy().to_string();
+
+        save_document(
+            &working_dir,
+            KnowledgeDocument {
+                id: "kd_design_hidden_dir_doc".to_string(),
+                doc_type: KnowledgeType::Design,
+                path: "combat/core-loop.md".to_string(),
+                title: "Combat Core Loop".to_string(),
+                inject_mode: KnowledgeInjectMode::None,
+                inherit_inject_mode: true,
+                inject_mode_source: Default::default(),
+                summary_enabled: false,
+                command_enabled: false,
+                read_only: false,
+                ai_maintained: false,
+                storage_source: crate::knowledge_store::KnowledgeStorageSource::Project,
+                inherit_ai_config: false,
+                ai_config_source: Default::default(),
+                explicit_maintenance_rules: false,
+                external_source: None,
+                skill_enabled: None,
+                skill_surface: None,
+                command_trigger: None,
+                argument_hint: None,
+                tools: Vec::new(),
+                summary: None,
+                body: "Hidden directory body".to_string(),
+                maintenance_rules: None,
+                created_at: 0,
+                updated_at: 0,
+            },
+        )
+        .expect("save hidden directory doc");
+        save_document(
+            &working_dir,
+            KnowledgeDocument {
+                id: "kd_design_hidden_dir_nested_doc".to_string(),
+                doc_type: KnowledgeType::Design,
+                path: "combat/sub/chain.md".to_string(),
+                title: "Combat Chain".to_string(),
+                inject_mode: KnowledgeInjectMode::None,
+                inherit_inject_mode: true,
+                inject_mode_source: Default::default(),
+                summary_enabled: false,
+                command_enabled: false,
+                read_only: false,
+                ai_maintained: false,
+                storage_source: crate::knowledge_store::KnowledgeStorageSource::Project,
+                inherit_ai_config: false,
+                ai_config_source: Default::default(),
+                explicit_maintenance_rules: false,
+                external_source: None,
+                skill_enabled: None,
+                skill_surface: None,
+                command_trigger: None,
+                argument_hint: None,
+                tools: Vec::new(),
+                summary: None,
+                body: "Nested hidden directory body".to_string(),
+                maintenance_rules: None,
+                created_at: 0,
+                updated_at: 0,
+            },
+        )
+        .expect("save nested hidden directory doc");
+
+        let mut config = default_directory_config_for_type(KnowledgeType::Design);
+        config.inject_mode = KnowledgeInjectMode::None;
+        config.inherit_inject_mode = false;
+        update_directory_config(&working_dir, KnowledgeType::Design, "combat", config)
+            .expect("hide directory config");
+
+        let structure = build_structure_section(&working_dir, None, KnowledgeAccessMode::Full)
+            .expect("build structure");
+        assert!(structure.contains("<2 files hidden>"), "{}", structure);
+        assert!(!structure.contains("combat/"), "{}", structure);
+        assert!(!structure.contains("sub/"), "{}", structure);
+        assert!(!structure.contains("core-loop.md"), "{}", structure);
+        assert!(!structure.contains("chain.md"), "{}", structure);
+        assert!(
+            !structure.contains("Hidden directory body"),
+            "{}",
+            structure
+        );
+    }
+
+    #[test]
+    fn structure_section_uses_excerpt_summary_and_body_fallback() {
+        let temp = tempdir().expect("temp dir");
+        let working_dir = temp.path().to_string_lossy().to_string();
+
+        save_document(
+            &working_dir,
+            KnowledgeDocument {
+                id: "kd_design_summary".to_string(),
+                doc_type: KnowledgeType::Design,
+                path: "combat/summary.md".to_string(),
+                title: "Summary Design".to_string(),
+                inject_mode: KnowledgeInjectMode::Excerpt,
+                inherit_inject_mode: false,
+                inject_mode_source: Default::default(),
+                summary_enabled: true,
+                command_enabled: false,
+                read_only: false,
+                ai_maintained: false,
+                storage_source: crate::knowledge_store::KnowledgeStorageSource::Project,
+                inherit_ai_config: false,
+                ai_config_source: Default::default(),
+                explicit_maintenance_rules: false,
+                external_source: None,
+                skill_enabled: None,
+                skill_surface: None,
+                command_trigger: None,
+                argument_hint: None,
+                tools: Vec::new(),
+                summary: Some("Use this compact summary.".to_string()),
+                body: "Body should stay behind the summary.".to_string(),
+                maintenance_rules: None,
+                created_at: 0,
+                updated_at: 0,
+            },
+        )
+        .expect("save summary design");
+        save_document(
+            &working_dir,
+            KnowledgeDocument {
+                id: "kd_design_body".to_string(),
+                doc_type: KnowledgeType::Design,
+                path: "combat/body.md".to_string(),
+                title: "Body Design".to_string(),
+                inject_mode: KnowledgeInjectMode::Excerpt,
+                inherit_inject_mode: false,
+                inject_mode_source: Default::default(),
+                summary_enabled: true,
+                command_enabled: false,
+                read_only: false,
+                ai_maintained: false,
+                storage_source: crate::knowledge_store::KnowledgeStorageSource::Project,
+                inherit_ai_config: false,
+                ai_config_source: Default::default(),
+                explicit_maintenance_rules: false,
+                external_source: None,
+                skill_enabled: None,
+                skill_surface: None,
+                command_trigger: None,
+                argument_hint: None,
+                tools: Vec::new(),
+                summary: None,
+                body: "Fallback body excerpt enters the structure tree.".to_string(),
+                maintenance_rules: None,
+                created_at: 0,
+                updated_at: 0,
+            },
+        )
+        .expect("save body design");
+
+        let structure = build_structure_section(&working_dir, None, KnowledgeAccessMode::Full)
+            .expect("build structure");
+        assert!(
+            structure.contains("summary.md :: Use this compact summary."),
+            "{}",
+            structure
+        );
+        assert!(
+            !structure.contains("Body should stay behind the summary."),
+            "{}",
+            structure
+        );
+        assert!(
+            structure.contains("body.md :: Fallback body excerpt enters the structure tree."),
+            "{}",
+            structure
+        );
     }
 
     #[test]
@@ -14753,16 +15205,74 @@ Create a reusable Skill.
     }
 
     #[test]
-    fn l2_memory_section_keeps_project_mistake_note_in_knowledge_context() {
+    fn l2_full_document_section_keeps_project_mistake_note_in_knowledge_context() {
         let temp = tempdir().expect("temp dir");
         let working_dir = temp.path().to_string_lossy().to_string();
 
-        let memory = build_l2_memory_section(&working_dir, None).expect("build l2 memory");
-        assert!(memory.contains("### L2 Memory"));
+        let memory =
+            build_l2_full_document_section(&working_dir, None).expect("build l2 documents");
+        assert!(memory.contains("### L2 Full Documents"));
         assert!(memory.contains("#### memory/project-mistake-note.md"));
         assert!(memory.contains("Rules:"));
         assert!(memory.contains("Body:\n<empty>"));
         assert!(!memory.contains("user-preference.md"));
+    }
+
+    #[test]
+    fn l2_full_document_section_injects_design_full_documents() {
+        let temp = tempdir().expect("temp dir");
+        let working_dir = temp.path().to_string_lossy().to_string();
+
+        save_document(
+            &working_dir,
+            KnowledgeDocument {
+                id: "kd_design_full".to_string(),
+                doc_type: KnowledgeType::Design,
+                path: "combat/full-design.md".to_string(),
+                title: "Full Design".to_string(),
+                inject_mode: KnowledgeInjectMode::Full,
+                inherit_inject_mode: false,
+                inject_mode_source: Default::default(),
+                summary_enabled: false,
+                command_enabled: false,
+                read_only: false,
+                ai_maintained: false,
+                storage_source: crate::knowledge_store::KnowledgeStorageSource::Project,
+                inherit_ai_config: false,
+                ai_config_source: Default::default(),
+                explicit_maintenance_rules: true,
+                external_source: None,
+                skill_enabled: None,
+                skill_surface: None,
+                command_trigger: None,
+                argument_hint: None,
+                tools: Vec::new(),
+                summary: None,
+                body: "# Full Heading\nDesign body enters L2.".to_string(),
+                maintenance_rules: Some("- Keep design conclusion current".to_string()),
+                created_at: 0,
+                updated_at: 0,
+            },
+        )
+        .expect("save full design");
+
+        let section =
+            build_l2_full_document_section(&working_dir, None).expect("build l2 documents");
+        assert!(
+            section.contains("#### design/combat/full-design.md"),
+            "{}",
+            section
+        );
+        assert!(
+            section.contains("Rules:\n- Keep design conclusion current"),
+            "{}",
+            section
+        );
+        assert!(
+            section.contains("Body:\n#### Full Heading\nDesign body enters L2."),
+            "{}",
+            section
+        );
     }
 
     #[test]
@@ -14886,7 +15396,9 @@ Create a reusable Skill.
 
         assert_eq!(prompt_parts.base_prompt, "You are a test agent.");
         assert!(prompt_parts.knowledge_prompt.contains("## Knowledge"));
-        assert!(prompt_parts.knowledge_prompt.contains("### L2 Memory"));
+        assert!(prompt_parts
+            .knowledge_prompt
+            .contains("### L2 Full Documents"));
         assert!(prompt_parts
             .knowledge_prompt
             .contains("#### memory/project-mistake-note.md"));
@@ -14906,8 +15418,8 @@ Create a reusable Skill.
             .expect("tools section");
         let memory_index = prompt_parts
             .knowledge_prompt
-            .find("### L2 Memory")
-            .expect("l2 memory section");
+            .find("### L2 Full Documents")
+            .expect("l2 full document section");
         assert!(search_index < tools_index);
         assert!(tools_index < memory_index);
         assert!(!prompt_parts.knowledge_prompt.contains("## L3 Rules"));

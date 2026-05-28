@@ -1442,7 +1442,7 @@
   "knowledge.meta.inject.noneHint": "只参与检索与召回，不主动进入 Agent 上下文。",
   "knowledge.meta.inject.pathHint": "L0。向 Agent 提供文档标题与路径，正文按需读取。",
   "knowledge.meta.inject.excerptHint": "L1。向 Agent 提供摘要；没有摘要时使用正文前段。",
-  "knowledge.meta.inject.fullHint": "L2。将维护规则与正文作为常驻知识注入，保留在 Knowledge 的 L2 Memory 段。",
+  "knowledge.meta.inject.fullHint": "L2。将维护规则与正文作为常驻知识注入，保留在 Knowledge 的 L2 全文段。",
   "knowledge.meta.inject.ruleHint": "L3。将维护规则与正文完整注入为规则，适合高优先级长期约束。",
   "knowledge.meta.tag.auto": "AUTO",
   "knowledge.meta.tag.lexicalOn": "LX",
