@@ -1766,7 +1766,7 @@
   "knowledge.dashboard.retrieval.hybrid": "全文+语义",
   "knowledge.dashboard.retrieval.disabled": "关闭",
   "knowledge.dashboard.tokenUsage": "Token消耗",
-  "knowledge.dashboard.l2Memory": "L2记忆",
+  "knowledge.dashboard.l2FullDocuments": "L2全文",
   "knowledge.dashboard.l3Rules": "L3规则",
   "knowledge.dashboard.totalTokenUsage": "合计",
   "knowledge.dashboard.directories": "目录数",

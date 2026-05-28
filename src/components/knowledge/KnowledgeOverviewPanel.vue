@@ -264,6 +264,30 @@ function extractKnowledgeNamedBlock(content: string, heading: string): string {
   return sectionLines.join("\n").trim();
 }
 
+function extractL2FullDocumentBlock(
+  content: string,
+  type: KnowledgeDocumentType,
+): string {
+  const section =
+    extractKnowledgeNamedBlock(content, "### L2 Full Documents") ||
+    extractKnowledgeNamedBlock(content, "### L2 Memory");
+  if (!section) return "";
+
+  const lines = section.replace(/\r\n/g, "\n").split("\n");
+  const blocks: string[] = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    if (lines[index].trim().startsWith(`#### ${type}/`)) {
+      const blockLines = [lines[index]];
+      for (let next = index + 1; next < lines.length; next += 1) {
+        if (/^####\s+/.test(lines[next].trim())) break;
+        blockLines.push(lines[next]);
+      }
+      blocks.push(blockLines.join("\n").trim());
+    }
+  }
+  return blocks.join("\n\n");
+}
+
 function extractStructureBranch(
   structureSection: string,
   type: KnowledgeDocumentType,
@@ -475,12 +499,10 @@ const structureTokenEstimate = computed(() => {
     ? estimateTextTokens(typeBranch)
     : fallbackAlwaysOnTokens.value;
 });
-const l2MemoryTokenEstimate = computed(() =>
-  props.activeType === "memory"
-    ? estimateTextTokens(
-        extractKnowledgeNamedBlock(knowledgeContext.value, "### L2 Memory"),
-      )
-    : 0,
+const l2FullDocumentTokenEstimate = computed(() =>
+  estimateTextTokens(
+    extractL2FullDocumentBlock(knowledgeContext.value, props.activeType),
+  ),
 );
 const l3RuleTokenEstimate = computed(() =>
   injectedItems.value
@@ -494,7 +516,7 @@ const l3RuleTokenEstimate = computed(() =>
 const alwaysOnTokenEstimate = computed(
   () =>
     structureTokenEstimate.value +
-    l2MemoryTokenEstimate.value +
+    l2FullDocumentTokenEstimate.value +
     l3RuleTokenEstimate.value,
 );
 const tokenBreakdownItems = computed(() => {
@@ -504,10 +526,10 @@ const tokenBreakdownItems = computed(() => {
       value: structureTokenEstimate.value,
     },
   ];
-  if (props.activeType === "memory" && l2MemoryTokenEstimate.value > 0) {
+  if (l2FullDocumentTokenEstimate.value > 0) {
     items.push({
-      label: t("knowledge.dashboard.l2Memory"),
-      value: l2MemoryTokenEstimate.value,
+      label: t("knowledge.dashboard.l2FullDocuments"),
+      value: l2FullDocumentTokenEstimate.value,
     });
   }
   items.push(

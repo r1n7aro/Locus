@@ -1766,7 +1766,7 @@
   "knowledge.dashboard.retrieval.hybrid": "Lexical + Semantic",
   "knowledge.dashboard.retrieval.disabled": "Disabled",
   "knowledge.dashboard.tokenUsage": "Token Usage",
-  "knowledge.dashboard.l2Memory": "L2 Memory",
+  "knowledge.dashboard.l2FullDocuments": "L2 Full Docs",
   "knowledge.dashboard.l3Rules": "L3 Rules",
   "knowledge.dashboard.totalTokenUsage": "Total",
   "knowledge.dashboard.directories": "Directories",
