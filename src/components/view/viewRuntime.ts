@@ -61,6 +61,7 @@ import {
 import type {
   ViewBindingApplyRequest,
   ViewBindingApplyResult,
+  ViewBindingApplyWrite,
   ViewBindingDiscoverRequest,
   ViewBindingDiscoverResult,
   ViewBindingReadRequest,
@@ -80,6 +81,7 @@ import type {
   ViewSessionQueueInputResult,
   ViewSessionWaitRequest,
   ViewSessionWaitResult,
+  ViewSerializedPropertySnapshot,
   ViewRuntimeUpdateEvent,
 } from "../../services/view";
 import {
@@ -525,16 +527,16 @@ function createViewBindingRuntime(api: ViewRuntimeApi, undo: ReturnType<typeof c
       : [];
     const result = await api.bindingApply(request);
     if (shouldRecord) {
-      const undoWrites = result.results
-        .map((after, index) => before[index] && after.target
+      const undoWrites: ViewBindingApplyWrite[] = result.results
+        .map((after, index): ViewBindingApplyWrite | null => before[index] && after.target
           ? {
             bindingId: after.bindingId,
             target: after.target,
             value: snapshotRestoreValue(before[index]!),
           }
           : null)
-        .filter((item): item is ViewBindingApplyRequest["writes"][number] => !!item);
-      const redoWrites = result.results
+        .filter((item): item is ViewBindingApplyWrite => !!item);
+      const redoWrites: ViewBindingApplyWrite[] = result.results
         .filter((after) => after.target)
         .map((after) => ({
           bindingId: after.bindingId,

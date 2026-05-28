@@ -302,13 +302,14 @@ function automationSelector(element: Element): string {
   let current: Element | null = element;
   const root = automationRoot();
   while (current && current !== root && current !== document.body) {
-    const parent = current.parentElement;
+    const parent: Element | null = current.parentElement;
     const tag = current.tagName.toLowerCase();
     if (!parent) {
       parts.unshift(tag);
       break;
     }
-    const siblings = Array.from(parent.children).filter((item) => item.tagName === current?.tagName);
+    const currentTagName = current.tagName;
+    const siblings = Array.from(parent.children).filter((item) => item.tagName === currentTagName);
     const index = siblings.indexOf(current) + 1;
     parts.unshift(siblings.length > 1 ? `${tag}:nth-of-type(${index})` : tag);
     current = parent;
