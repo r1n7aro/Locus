@@ -71,6 +71,34 @@ describe("display settings transcript alignment", () => {
     expect(en).toContain('"settings.display.rightAlignUserMessages": "Right-align user messages in the session view"');
   });
 
+  it("adds a file change hover preview toggle that defaults to on", () => {
+    const displaySettings = read("src/composables/useDisplaySettings.ts");
+    const displayPanel = read("src/components/settings/DisplaySettings.vue");
+    const chatChangesPanel = read("src/components/ChatChangesPanel.vue");
+    const fileDiffTrigger = read("src/components/diff/FileDiffTrigger.vue");
+    const zh = read("src/language/zh.json");
+    const en = read("src/language/en.json");
+
+    expect(displaySettings).toContain("fileChangePopoverEnabled: boolean;");
+    expect(displaySettings).toContain("fileChangePopoverEnabled: true,");
+
+    expect(displayPanel).toContain(":model-value=\"display.fileChangePopoverEnabled\"");
+    expect(displayPanel).toContain(":aria-label=\"t('settings.display.fileChangePopoverEnabled')\"");
+    expect(displayPanel).toContain("@update:model-value=\"setDisplay('fileChangePopoverEnabled', $event)\"");
+    expect(displayPanel).toContain("{{ t(\"settings.display.fileChangePopoverEnabled\") }}");
+
+    expect(chatChangesPanel).toContain("displaySettings.fileChangePopoverEnabled");
+    expect(chatChangesPanel).toContain("if (!displaySettings.fileChangePopoverEnabled) return;");
+    expect(chatChangesPanel).toContain("watch(() => displaySettings.fileChangePopoverEnabled");
+    expect(fileDiffTrigger).toContain('import { useDisplaySettings } from "../../composables/useDisplaySettings";');
+    expect(fileDiffTrigger).toContain("const { state: displaySettings } = useDisplaySettings();");
+    expect(fileDiffTrigger).toContain("if (!displaySettings.fileChangePopoverEnabled) return;");
+    expect(fileDiffTrigger).toContain("watch(() => displaySettings.fileChangePopoverEnabled");
+
+    expect(zh).toContain('"settings.display.fileChangePopoverEnabled": "启用文件修改悬浮窗"');
+    expect(en).toContain('"settings.display.fileChangePopoverEnabled": "Enable file change hover preview"');
+  });
+
   it("adds a Git tree status icon merge toggle", () => {
     const displaySettings = read("src/composables/useDisplaySettings.ts");
     const displayPanel = read("src/components/settings/DisplaySettings.vue");
@@ -301,13 +329,16 @@ describe("display settings transcript alignment", () => {
     expect(chatReviewWindow).toContain("canToggleFullTextCompare");
     expect(chatReviewWindow).toContain("toggleFullTextCompare");
     expect(chatReviewWindow).toContain("diff.mode.fullTextCompare");
-    expect(chatReviewWindow).toContain('FULL_CONTEXT_DEFAULT_STORAGE_KEY = "locus:diff-review:full-context"');
-    expect(chatReviewWindow).toContain("readDefaultFullContext");
-    expect(chatReviewWindow).toContain("persistDefaultFullContext(nextFullContext)");
-    expect(chatReviewWindow).toContain("useDefaultFullContext: true");
+    expect(chatReviewWindow).not.toContain("FULL_CONTEXT_DEFAULT_STORAGE_KEY");
+    expect(chatReviewWindow).not.toContain("readDefaultFullContext");
+    expect(chatReviewWindow).not.toContain("persistDefaultFullContext");
+    expect(chatReviewWindow).not.toContain("useDefaultFullContext");
+    expect(chatReviewWindow).not.toContain(":initial-tab=\"fullContext ? 'text' : undefined\"");
+    expect(chatReviewWindow).toContain("if (options?.preferTextTab) {");
     expect(chatReviewWindow.indexOf("common.openInEditor")).toBeLessThan(
       chatReviewWindow.indexOf("diff.mode.sideBySide"),
     );
+    expect(fileDiffViewer).toContain('return payload.semantic ? "semantic" : "text";');
     expect(fileDiffViewer).toContain("hideTextDisplayControls?: boolean;");
     expect(fileDiffViewer).toContain("hasTextDisplayModeControl");
     expect(fileDiffViewer).toContain("toggleTextDisplayMode,");

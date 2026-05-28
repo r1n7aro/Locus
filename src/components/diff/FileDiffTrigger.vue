@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { ref, onUnmounted } from "vue";
+import { ref, onUnmounted, watch } from "vue";
 import FileDiffPopover from "./FileDiffPopover.vue";
 import { diffSingleFile, createRequestToken, isTokenStale } from "../../services/diff";
 import { useDiffOverlay } from "../../composables/useDiffOverlay";
+import { useDisplaySettings } from "../../composables/useDisplaySettings";
 import type { GitFileChange, DiffSource, FileDiffPayload } from "../../types";
 
 const props = defineProps<{
@@ -14,12 +15,16 @@ const props = defineProps<{
 }>();
 
 const overlay = useDiffOverlay();
+const { state: displaySettings } = useDisplaySettings();
 
 const triggerRef = ref<HTMLElement | null>(null);
 const showPopover = ref(false);
 const previewPayload = ref<FileDiffPayload | null>(null);
 
 let hoverTimer: ReturnType<typeof setTimeout> | null = null;
+let closeTimer: ReturnType<typeof setTimeout> | null = null;
+let hoverSeq = 0;
+const HOVER_CLOSE_DELAY_MS = 140;
 
 function buildRequest(detail: "preview" | "full") {
   return {
@@ -34,11 +39,19 @@ function buildRequest(detail: "preview" | "full") {
 }
 
 function onMouseEnter() {
+  if (!displaySettings.fileChangePopoverEnabled) return;
+  cancelPopoverClose();
+  if (showPopover.value && previewPayload.value) return;
+  if (hoverTimer) {
+    clearTimeout(hoverTimer);
+    hoverTimer = null;
+  }
+  const seq = ++hoverSeq;
   hoverTimer = setTimeout(async () => {
     const token = createRequestToken();
     try {
       const payload = await diffSingleFile(buildRequest("preview"));
-      if (isTokenStale(token)) return; // Stale — user already moved away
+      if (seq !== hoverSeq || isTokenStale(token)) return; // Stale — user already moved away
       previewPayload.value = payload;
       showPopover.value = true;
     } catch {
@@ -47,24 +60,58 @@ function onMouseEnter() {
   }, 150);
 }
 
-function onMouseLeave() {
+function cancelPopoverClose() {
+  if (closeTimer) {
+    clearTimeout(closeTimer);
+    closeTimer = null;
+  }
+}
+
+function closePopover() {
   if (hoverTimer) {
     clearTimeout(hoverTimer);
     hoverTimer = null;
   }
+  if (closeTimer) {
+    clearTimeout(closeTimer);
+    closeTimer = null;
+  }
   // Bump token to discard any in-flight preview response
+  hoverSeq++;
   createRequestToken();
   showPopover.value = false;
   previewPayload.value = null;
 }
 
-async function onClick() {
-  // Close popover
-  showPopover.value = false;
+watch(() => displaySettings.fileChangePopoverEnabled, (enabled) => {
+  if (!enabled) closePopover();
+});
+
+function schedulePopoverClose() {
   if (hoverTimer) {
     clearTimeout(hoverTimer);
     hoverTimer = null;
   }
+  cancelPopoverClose();
+  closeTimer = setTimeout(closePopover, HOVER_CLOSE_DELAY_MS);
+}
+
+function onMouseLeave() {
+  schedulePopoverClose();
+}
+
+function onPopoverMouseEnter() {
+  cancelPopoverClose();
+}
+
+function onPopoverMouseLeave() {
+  schedulePopoverClose();
+}
+
+async function onClick() {
+  // Close popover
+  cancelPopoverClose();
+  closePopover();
 
   try {
     const payload = await diffSingleFile(buildRequest("full"));
@@ -75,12 +122,12 @@ async function onClick() {
 }
 
 function onPopoverClose() {
-  showPopover.value = false;
-  previewPayload.value = null;
+  closePopover();
 }
 
 onUnmounted(() => {
   if (hoverTimer) clearTimeout(hoverTimer);
+  if (closeTimer) clearTimeout(closeTimer);
 });
 </script>
 
@@ -99,6 +146,9 @@ onUnmounted(() => {
       :payload="previewPayload"
       :anchor="triggerRef"
       @close="onPopoverClose"
+      @enter="onPopoverMouseEnter"
+      @leave="onPopoverMouseLeave"
+      @open="onClick"
     />
   </div>
 </template>

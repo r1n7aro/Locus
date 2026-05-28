@@ -21,7 +21,6 @@ import LucideIcon from "./icons/LucideIcon.vue";
 
 const appWindow = getCurrentWindow();
 const diffProgress = useDiffProgress();
-const FULL_CONTEXT_DEFAULT_STORAGE_KEY = "locus:diff-review:full-context";
 const payload = ref<FileDiffPayload | null>(null);
 const loading = ref(false);
 const error = ref<string | null>(null);
@@ -29,7 +28,6 @@ const fileDiffViewerRef = ref<InstanceType<typeof FileDiffViewer> | null>(null);
 const requestSeq = ref(0);
 const currentRequest = ref<FileDiffRequest | null>(null);
 const fullContext = ref(false);
-const defaultFullContext = ref(readDefaultFullContext());
 
 let unlistenPayload: UnlistenFn | null = null;
 
@@ -61,33 +59,13 @@ const canToggleFullTextCompare = computed(() =>
   && payload.value.contentState.type !== "lfsNotFetched",
 );
 
-function readDefaultFullContext(): boolean {
-  try {
-    return localStorage.getItem(FULL_CONTEXT_DEFAULT_STORAGE_KEY) === "1";
-  } catch {
-    return false;
-  }
-}
-
-function persistDefaultFullContext(value: boolean) {
-  defaultFullContext.value = value;
-  try {
-    localStorage.setItem(FULL_CONTEXT_DEFAULT_STORAGE_KEY, value ? "1" : "0");
-  } catch {
-    // Keep the in-memory preference for the current window.
-  }
-}
-
 function normalizeReviewRequest(
   request: FileDiffRequest,
-  options?: { useDefaultFullContext?: boolean },
 ): FileDiffRequest {
   return {
     ...request,
     detail: "full",
-    fullContext: options?.useDefaultFullContext
-      ? defaultFullContext.value
-      : Boolean(request.fullContext),
+    fullContext: Boolean(request.fullContext),
   };
 }
 
@@ -107,11 +85,9 @@ async function selectTextTabIfAvailable() {
 
 async function loadRequest(
   request: FileDiffRequest,
-  options?: { invalidateKey?: string; preferTextTab?: boolean; useDefaultFullContext?: boolean },
+  options?: { invalidateKey?: string; preferTextTab?: boolean },
 ): Promise<boolean> {
-  const normalizedRequest = normalizeReviewRequest(request, {
-    useDefaultFullContext: options?.useDefaultFullContext,
-  });
+  const normalizedRequest = normalizeReviewRequest(request);
   const seq = ++requestSeq.value;
   applyCurrentRequest(normalizedRequest);
   loading.value = true;
@@ -125,7 +101,7 @@ async function loadRequest(
     const nextPayload = await diffSingleFile(normalizedRequest);
     if (seq !== requestSeq.value) return false;
     payload.value = nextPayload;
-    if (options?.preferTextTab || normalizedRequest.fullContext) {
+    if (options?.preferTextTab) {
       await selectTextTabIfAvailable();
     }
     return true;
@@ -152,20 +128,12 @@ async function loadDiffKey(diffKey: string): Promise<boolean> {
   }
   return loadRequest(request, {
     invalidateKey: diffKey,
-    useDefaultFullContext: true,
   });
 }
 
 function applyWindowPayload(next: ChatDiffReviewWindowPayload) {
   if (next.payload) {
     const request = parseDiffRequestKey(next.payload.key);
-    if (request && Boolean(request.fullContext) !== defaultFullContext.value) {
-      void loadRequest(request, {
-        invalidateKey: next.payload.key,
-        useDefaultFullContext: true,
-      });
-      return;
-    }
     requestSeq.value += 1;
     applyCurrentRequest(request);
     payload.value = next.payload;
@@ -174,7 +142,7 @@ function applyWindowPayload(next: ChatDiffReviewWindowPayload) {
     return;
   }
   if (next.request) {
-    void loadRequest(next.request, { useDefaultFullContext: true });
+    void loadRequest(next.request);
     return;
   }
   if (next.diffKey?.trim()) {
@@ -192,13 +160,10 @@ async function onLfsPulled() {
 async function toggleFullTextCompare() {
   if (!currentRequest.value || loading.value) return;
   const nextFullContext = !fullContext.value;
-  const loaded = await loadRequest({
+  await loadRequest({
     ...currentRequest.value,
     fullContext: nextFullContext,
   }, { preferTextTab: true });
-  if (loaded) {
-    persistDefaultFullContext(nextFullContext);
-  }
 }
 
 async function closeWindow() {
@@ -302,7 +267,6 @@ onUnmounted(() => {
         v-if="payload"
         ref="fileDiffViewerRef"
         :payload="payload"
-        :initial-tab="fullContext ? 'text' : undefined"
         :hide-builtin-tabs="true"
         :hide-text-display-controls="true"
         @lfs-pulled="onLfsPulled"

@@ -52,20 +52,53 @@ watch(() => chatStore.activeSessionId, () => {
 const hoverAnchor = ref<HTMLElement | null>(null);
 const showPopover = ref(false);
 const previewPayload = ref<FileDiffPayload | null>(null);
+const previewItem = ref<DisplayItem | null>(null);
 let hoverTimer: ReturnType<typeof setTimeout> | null = null;
+let hoverCloseTimer: ReturnType<typeof setTimeout> | null = null;
+let hoverSeq = 0;
+const HOVER_CLOSE_DELAY_MS = 140;
 
 function clearHover() {
   if (hoverTimer) {
     clearTimeout(hoverTimer);
     hoverTimer = null;
   }
+  if (hoverCloseTimer) {
+    clearTimeout(hoverCloseTimer);
+    hoverCloseTimer = null;
+  }
+  hoverSeq++;
   createRequestToken(); // bump to stale any in-flight
   showPopover.value = false;
   previewPayload.value = null;
   hoverAnchor.value = null;
+  previewItem.value = null;
 }
 
-onUnmounted(() => { if (hoverTimer) clearTimeout(hoverTimer); });
+watch(() => displaySettings.fileChangePopoverEnabled, (enabled) => {
+  if (!enabled) clearHover();
+});
+
+function cancelHoverClose() {
+  if (hoverCloseTimer) {
+    clearTimeout(hoverCloseTimer);
+    hoverCloseTimer = null;
+  }
+}
+
+function scheduleHoverClose() {
+  if (hoverTimer) {
+    clearTimeout(hoverTimer);
+    hoverTimer = null;
+  }
+  cancelHoverClose();
+  hoverCloseTimer = setTimeout(clearHover, HOVER_CLOSE_DELAY_MS);
+}
+
+onUnmounted(() => {
+  if (hoverTimer) clearTimeout(hoverTimer);
+  if (hoverCloseTimer) clearTimeout(hoverCloseTimer);
+});
 
 // ── Data ──
 
@@ -227,21 +260,44 @@ function pruneCollapsedFolders(validPaths: Set<string>) {
 // ── Hover ──
 
 function onItemMouseEnter(ev: MouseEvent, item: DisplayItem) {
+  if (!displaySettings.fileChangePopoverEnabled) return;
   const el = ev.currentTarget as HTMLElement;
+  cancelHoverClose();
+  if (showPopover.value && previewPayload.value && previewItem.value?.key === item.key) return;
+  if (hoverTimer) {
+    clearTimeout(hoverTimer);
+    hoverTimer = null;
+  }
+  const seq = ++hoverSeq;
   hoverTimer = setTimeout(async () => {
     const token = createRequestToken();
     try {
       const payload = await diffSingleFile(buildRequest(item, "preview"));
-      if (isTokenStale(token)) return;
+      if (seq !== hoverSeq || isTokenStale(token)) return;
       previewPayload.value = payload;
       hoverAnchor.value = el;
+      previewItem.value = item;
       showPopover.value = true;
     } catch { /* silently ignore */ }
   }, 150);
 }
 
 function onItemMouseLeave() {
-  clearHover();
+  scheduleHoverClose();
+}
+
+function onPopoverMouseEnter() {
+  cancelHoverClose();
+}
+
+function onPopoverMouseLeave() {
+  scheduleHoverClose();
+}
+
+function onPopoverOpen() {
+  const item = previewItem.value;
+  if (!item) return;
+  void onItemClick(item);
 }
 
 // ── Click → inline diff ──
@@ -606,6 +662,9 @@ function onOpenInEditor(ev: MouseEvent, path: string) {
       :payload="previewPayload"
       :anchor="hoverAnchor"
       @close="clearHover"
+      @enter="onPopoverMouseEnter"
+      @leave="onPopoverMouseLeave"
+      @open="onPopoverOpen"
     />
   </aside>
 </template>
