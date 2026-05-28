@@ -118,7 +118,7 @@ export type GraphConnectionValidation =
 export const GRAPH_WORLD_SIZE = 4096;
 export const GRAPH_NODE_WIDTH = 240;
 export const GRAPH_NODE_MIN_WIDTH = 220;
-export const GRAPH_NODE_MAX_WIDTH = 420;
+export const GRAPH_NODE_MAX_WIDTH = 520;
 export const GRAPH_NODE_MIN_HEIGHT = 112;
 export const GRAPH_STATE_NODE_WIDTH = 190;
 export const GRAPH_STATE_NODE_MIN_WIDTH = 158;
@@ -134,6 +134,10 @@ export const GRAPH_PORT_ROW_PITCH = GRAPH_PORT_SIZE + GRAPH_PORT_ROW_GAP;
 export const GRAPH_EDGE_COLOR_COUNT = 6;
 const GRAPH_ROUTE_FIXED_OVERLAP_TOLERANCE = 16;
 const GRAPH_ROUTE_MIN_OVERLAP_LENGTH = 8;
+const GRAPH_PARAMETER_VALUE_WIDTH_CAP = 340;
+const GRAPH_PARAMETER_ROW_BASE_HEIGHT = 28;
+const GRAPH_PARAMETER_ROW_LINE_HEIGHT = 16;
+const GRAPH_PARAMETER_ROW_GAP = 7;
 
 interface GraphRouteSegment {
   connectionIndex: number;
@@ -185,6 +189,25 @@ function clampNodeWidth(width: number): number {
 
 function clampStateNodeWidth(width: number): number {
   return Math.min(GRAPH_STATE_NODE_MAX_WIDTH, Math.max(GRAPH_STATE_NODE_MIN_WIDTH, Math.ceil(width)));
+}
+
+function estimateGraphParameterValueColumnWidth(nodeWidth: number): number {
+  const contentWidth = Math.max(0, nodeWidth - 18);
+  const gridWidth = Math.max(0, contentWidth - 8);
+  const labelWidth = Math.max(74, gridWidth * (0.42 / 1.42));
+  return Math.max(120, gridWidth - labelWidth - 14);
+}
+
+function estimateGraphParameterValueLines(parameter: GraphParameter, valueColumnWidth: number): number {
+  const valueWidth = estimateTextWidth(textValue(parameter.value));
+  if (valueWidth <= 0) return 1;
+  return Math.min(6, Math.max(1, Math.ceil(valueWidth / valueColumnWidth)));
+}
+
+function estimateGraphParameterRowHeight(parameter: GraphParameter, valueColumnWidth: number): number {
+  const lines = estimateGraphParameterValueLines(parameter, valueColumnWidth);
+  const textHeight = GRAPH_PARAMETER_ROW_BASE_HEIGHT + (lines - 1) * GRAPH_PARAMETER_ROW_LINE_HEIGHT;
+  return parameter.type === "text" ? Math.max(54, textHeight) : textHeight;
 }
 
 export function graphConnections(data: Pick<GraphData, "connections" | "links" | "edges">): GraphLink[] {
@@ -277,19 +300,24 @@ export function estimateGraphNodeWidth(node: GraphNode): number {
     ? inputLabelWidth + outputLabelWidth + 92
     : 0;
   const parameterWidth = parameterLabelWidth || parameterValueWidth
-    ? parameterLabelWidth + Math.min(parameterValueWidth, 210) + 88
+    ? parameterLabelWidth + Math.min(parameterValueWidth, GRAPH_PARAMETER_VALUE_WIDTH_CAP) + 88
     : 0;
 
   return clampNodeWidth(Math.max(GRAPH_NODE_WIDTH, headerWidth, portWidth, parameterWidth));
 }
 
-export function estimateGraphNodeHeight(node: GraphNode): number {
+export function estimateGraphNodeHeight(node: GraphNode, measuredWidth?: number): number {
   const inputCount = node.inputs?.length ?? 0;
   const outputCount = node.outputs?.length ?? 0;
   const portRows = Math.max(inputCount, outputCount);
   const parameterCount = node.parameters?.length ?? 0;
   const portsHeight = portRows > 0 ? portRows * 21 + 2 : 0;
-  const parametersHeight = parameterCount > 0 ? parameterCount * 35 + 12 : 0;
+  const nodeWidth = measuredWidth ?? node.width ?? estimateGraphNodeWidth(node);
+  const valueColumnWidth = estimateGraphParameterValueColumnWidth(nodeWidth);
+  const parametersHeight = parameterCount > 0
+    ? (node.parameters ?? []).reduce((height, parameter) => height + estimateGraphParameterRowHeight(parameter, valueColumnWidth), 12)
+      + Math.max(0, parameterCount - 1) * GRAPH_PARAMETER_ROW_GAP
+    : 0;
   return Math.max(GRAPH_NODE_MIN_HEIGHT, 58 + portsHeight + parametersHeight);
 }
 
@@ -319,10 +347,11 @@ export function estimateGraphNodeWidthForStyle(
 export function estimateGraphNodeHeightForStyle(
   node: GraphNode,
   style: GraphNodeStyle = normalizeGraphNodeStyle(node.nodeStyle),
+  measuredWidth?: number,
 ): number {
   return style === "state"
     ? estimateGraphStateNodeHeight(node)
-    : estimateGraphNodeHeight(node);
+    : estimateGraphNodeHeight(node, measuredWidth);
 }
 
 function normalizeGraphNodeWidth(node: GraphNode, style: GraphNodeStyle): number {
@@ -338,11 +367,13 @@ function normalizeGraphNodeWidth(node: GraphNode, style: GraphNodeStyle): number
   return estimateGraphNodeWidthForStyle(node, style);
 }
 
-function normalizeGraphNodeHeight(node: GraphNode, style: GraphNodeStyle): number {
+function normalizeGraphNodeHeight(node: GraphNode, style: GraphNodeStyle, measuredWidth?: number): number {
+  const estimated = estimateGraphNodeHeightForStyle(node, style, measuredWidth);
   if (typeof node.height === "number" && Number.isFinite(node.height)) {
-    return Math.max(Number(node.height), estimateGraphNodeHeightForStyle(node, style));
+    if (style === "state") return Math.max(Number(node.height), estimated);
+    return estimated;
   }
-  return estimateGraphNodeHeightForStyle(node, style);
+  return estimated;
 }
 
 export function normalizeGraphData(data: GraphData | null | undefined): GraphData {
@@ -374,13 +405,14 @@ export function normalizeGraphData(data: GraphData | null | undefined): GraphDat
       const nodeStyle = normalizeGraphNodeStyle(styleSource);
       const shouldPersistStyle = styleSource !== undefined;
       const styledNode = shouldPersistStyle ? { ...node, nodeStyle } : node;
+      const width = normalizeGraphNodeWidth(styledNode, nodeStyle);
       return {
         ...styledNode,
         id: String(node.id || `node-${index + 1}`),
         x: typeof node.x === "number" && Number.isFinite(node.x) ? Number(node.x) : undefined,
         y: typeof node.y === "number" && Number.isFinite(node.y) ? Number(node.y) : undefined,
-        width: normalizeGraphNodeWidth(styledNode, nodeStyle),
-        height: normalizeGraphNodeHeight(styledNode, nodeStyle),
+        width,
+        height: normalizeGraphNodeHeight(styledNode, nodeStyle, width),
         inputs: (node.inputs ?? []).map((port) => ({ ...port, direction: "input" })),
         outputs: (node.outputs ?? []).map((port) => ({ ...port, direction: "output" })),
         parameters: (node.parameters ?? []).map((parameter) => ({ ...parameter })),

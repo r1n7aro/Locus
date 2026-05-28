@@ -127,27 +127,44 @@ export function locusGraphCss(): string {
   vector-effect: non-scaling-stroke;
 }
 
-.locus-graph-edge.route-color-0 {
+.locus-graph-edge-direction {
+  fill: none;
+  stroke: var(--locus-graph-edge-color-0);
+  stroke-width: 1.35;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  pointer-events: none;
+  vector-effect: non-scaling-stroke;
+  opacity: 0.58;
+}
+
+.locus-graph-edge.route-color-0,
+.locus-graph-edge-direction.route-color-0 {
   stroke: var(--locus-graph-edge-color-0);
 }
 
-.locus-graph-edge.route-color-1 {
+.locus-graph-edge.route-color-1,
+.locus-graph-edge-direction.route-color-1 {
   stroke: var(--locus-graph-edge-color-1);
 }
 
-.locus-graph-edge.route-color-2 {
+.locus-graph-edge.route-color-2,
+.locus-graph-edge-direction.route-color-2 {
   stroke: var(--locus-graph-edge-color-2);
 }
 
-.locus-graph-edge.route-color-3 {
+.locus-graph-edge.route-color-3,
+.locus-graph-edge-direction.route-color-3 {
   stroke: var(--locus-graph-edge-color-3);
 }
 
-.locus-graph-edge.route-color-4 {
+.locus-graph-edge.route-color-4,
+.locus-graph-edge-direction.route-color-4 {
   stroke: var(--locus-graph-edge-color-4);
 }
 
-.locus-graph-edge.route-color-5 {
+.locus-graph-edge.route-color-5,
+.locus-graph-edge-direction.route-color-5 {
   stroke: var(--locus-graph-edge-color-5);
 }
 
@@ -159,6 +176,12 @@ export function locusGraphCss(): string {
 .locus-graph-edge.selected {
   stroke: var(--accent-color);
   stroke-width: 3;
+}
+
+.locus-graph-edge-direction.selected {
+  stroke: var(--accent-color);
+  stroke-width: 1.55;
+  opacity: 0.66;
 }
 
 .locus-graph-node {
@@ -491,8 +514,8 @@ export function locusGraphCss(): string {
 
 .locus-graph-parameter {
   display: grid;
-  grid-template-columns: minmax(74px, 0.62fr) minmax(0, 1fr);
-  align-items: center;
+  grid-template-columns: minmax(74px, 0.42fr) minmax(0, 1fr);
+  align-items: start;
   gap: 8px;
 }
 
@@ -503,11 +526,13 @@ export function locusGraphCss(): string {
   white-space: nowrap;
   color: var(--text-secondary);
   font-size: 11px;
+  line-height: 16px;
+  padding-top: 5px;
 }
 
 .locus-graph-parameters.align-output .locus-graph-parameter {
-  width: min(100%, 240px);
-  grid-template-columns: minmax(0, 0.9fr) minmax(74px, 1fr);
+  width: 100%;
+  grid-template-columns: minmax(74px, 0.42fr) minmax(0, 1fr);
 }
 
 .locus-graph-parameters.align-output .locus-graph-parameter-label {
@@ -516,7 +541,8 @@ export function locusGraphCss(): string {
 
 .locus-graph-parameters.align-output .locus-graph-parameter input,
 .locus-graph-parameters.align-output .locus-graph-parameter select,
-.locus-graph-parameters.align-output .locus-graph-parameter textarea {
+.locus-graph-parameters.align-output .locus-graph-parameter textarea,
+.locus-graph-parameters.align-output .locus-graph-parameter-value {
   justify-self: end;
 }
 
@@ -529,7 +555,21 @@ export function locusGraphCss(): string {
   width: 100%;
   min-height: 26px;
   padding: 0 7px;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--panel-bg) 78%, var(--surface-elevated) 22%);
+  color: var(--text-color);
+  font-family: inherit;
   font-size: 12px;
+  line-height: 16px;
+}
+
+.locus-graph-parameter input:disabled,
+.locus-graph-parameter select:disabled,
+.locus-graph-parameter textarea:disabled {
+  opacity: 1;
+  color: var(--text-color);
+  -webkit-text-fill-color: var(--text-color);
 }
 
 .locus-graph-parameter input[type="checkbox"] {
@@ -546,7 +586,65 @@ export function locusGraphCss(): string {
   width: 100%;
   min-height: 54px;
   padding: 6px 7px;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--panel-bg) 78%, var(--surface-elevated) 22%);
+  color: var(--text-color);
+  font-family: inherit;
   font-size: 12px;
+  line-height: 16px;
+}
+
+.locus-graph-parameter-value {
+  width: 100%;
+  min-width: 0;
+  min-height: 26px;
+  padding: 4px 7px;
+  border: 1px solid color-mix(in srgb, var(--border-color) 88%, transparent);
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--panel-bg) 82%, var(--surface-elevated) 18%);
+  color: color-mix(in srgb, var(--text-color) 92%, var(--accent-color) 8%);
+  font-family: var(--font-mono-inline);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 16px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.locus-graph-formula {
+  display: block;
+  font: inherit;
+  color: inherit;
+  white-space: inherit;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.locus-graph-formula-token.token-identifier {
+  color: var(--text-color);
+}
+
+.locus-graph-formula-token.token-number {
+  color: color-mix(in srgb, var(--status-warn-fg) 88%, var(--text-color) 12%);
+}
+
+.locus-graph-formula-token.token-operator {
+  color: color-mix(in srgb, var(--accent-color) 86%, var(--text-color) 14%);
+  font-weight: 700;
+}
+
+.locus-graph-formula-token.token-punctuation {
+  color: var(--text-secondary);
+}
+
+.locus-graph-formula-token.token-string {
+  color: color-mix(in srgb, var(--status-good-fg) 88%, var(--text-color) 12%);
+}
+
+.locus-graph-formula-token.token-text {
+  color: color-mix(in srgb, var(--text-color) 88%, var(--text-secondary) 12%);
 }`;
 }
 

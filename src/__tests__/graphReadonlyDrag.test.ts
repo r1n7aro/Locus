@@ -34,6 +34,28 @@ describe("LocusGraphView readonly dragging", () => {
     expect(graphSource).not.toContain("edgeVersion.value;\n        return graphRouteColorIndexById");
   });
 
+  it("renders directed edge direction as a light middle chevron", () => {
+    expect(graphSource).toContain("function graphDirectionChevronPath");
+    expect(graphSource).toContain("function connectionDirectionPath");
+    expect(graphSource).toContain("\"locus-graph-edge-direction\"");
+    expect(graphSource).not.toContain("\"marker-end\"");
+    expect(graphStylesSource).toContain(".locus-graph-edge-direction");
+    expect(graphStylesSource).toContain("opacity: 0.58");
+  });
+
+  it("renders readonly parameter formulas as wrapping node text", () => {
+    expect(graphSource).toContain("function graphFormulaTokens");
+    expect(graphSource).toContain("function renderGraphFormulaCode");
+    expect(graphSource).toContain("disabled && type !== \"boolean\" && type !== \"color\"");
+    expect(graphSource).toContain("\"locus-graph-parameter-value\"");
+    expect(graphSource).toContain("\"locus-graph-formula-token\"");
+    expect(graphStylesSource).toContain(".locus-graph-parameter-value");
+    expect(graphStylesSource).toContain("font-family: var(--font-mono-inline)");
+    expect(graphStylesSource).toContain("overflow-wrap: anywhere");
+    expect(graphStylesSource).toContain(".locus-graph-formula-token.token-operator");
+    expect(graphStylesSource).toContain(".locus-graph-parameters.align-output .locus-graph-parameter {\n  width: 100%;");
+  });
+
   it("renders connected port fills and configurable node-level ports", () => {
     expect(graphSource).toContain("const portColorIndexByKey = computed");
     expect(graphSource).toContain("connected ? \"connected\" : \"\"");

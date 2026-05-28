@@ -10,7 +10,7 @@ import {
   ref,
   type PropType,
 } from "vue";
-import { CanvasView, type CanvasItemMoveEvent, type CanvasViewExpose } from "../canvas";
+import { CanvasView, type CanvasItemMoveEvent, type CanvasViewExpose, type CanvasViewport } from "../canvas";
 import BaseButton from "../ui/BaseButton.vue";
 import BaseDropdown from "../ui/BaseDropdown.vue";
 import { GraphViewController, type GraphController } from "./graphController";
@@ -71,6 +71,17 @@ interface PendingGraphConnection {
   direction: GraphPortDirection;
 }
 
+interface GraphDirectionMarker {
+  x: number;
+  y: number;
+  angle: number;
+}
+
+interface GraphFormulaToken {
+  text: string;
+  type: "identifier" | "number" | "operator" | "punctuation" | "string" | "text" | "space";
+}
+
 function shouldAutoLayout(graph: GraphData, mode: GraphAutoLayoutMode, force = false): boolean {
   const graphMode = graph.layout?.auto ?? mode;
   if (force) return true;
@@ -86,6 +97,44 @@ function endpointKey(nodeId: string, direction: GraphPortDirection, portId?: str
 function graphCoord(value: number): string {
   if (Number.isInteger(value)) return String(value);
   return value.toFixed(2).replace(/\.?0+$/, "");
+}
+
+function graphDisplayValue(value: unknown): string {
+  if (value === null || value === undefined) return "";
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function graphFormulaTokens(value: string): GraphFormulaToken[] {
+  const tokens: GraphFormulaToken[] = [];
+  const pattern = /(\s+|"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|->|\u2192|[+\-*/=\u00d7\u00f7<>!&|]+|\d+(?:\.\d+)?|[()[\]{},.;:]|[A-Za-z_][A-Za-z0-9_]*|[^\s]+)/g;
+  for (const match of value.matchAll(pattern)) {
+    const text = match[0];
+    let type: GraphFormulaToken["type"] = "text";
+    if (/^\s+$/.test(text)) type = "space";
+    else if (/^"(?:\\.|[^"])*"$|^'(?:\\.|[^'])*'$/.test(text)) type = "string";
+    else if (/^\d+(?:\.\d+)?$/.test(text)) type = "number";
+    else if (/^(?:->|\u2192|[+\-*/=\u00d7\u00f7<>!&|]+)$/.test(text)) type = "operator";
+    else if (/^[()[\]{},.;:]$/.test(text)) type = "punctuation";
+    else if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(text)) type = "identifier";
+    tokens.push({ text, type });
+  }
+  return tokens;
+}
+
+function renderGraphFormulaCode(value: string) {
+  return h("code", { class: "locus-graph-formula" }, graphFormulaTokens(value).map((token, index) => {
+    if (token.type === "space") return token.text;
+    return h("span", {
+      key: `${index}:${token.type}`,
+      class: ["locus-graph-formula-token", `token-${token.type}`],
+    }, token.text);
+  }));
 }
 
 function graphDistance(a: GraphPoint, b: GraphPoint): number {
@@ -160,6 +209,140 @@ function graphPathWithEndpoints(
   return roundedGraphPathFromPoints(next);
 }
 
+function graphBezierControls(start: GraphPoint, end: GraphPoint, vertical = false) {
+  if (vertical) {
+    const dy = Math.max(56, Math.abs(end.y - start.y) * 0.5);
+    const offsetY = end.y >= start.y ? dy : -dy;
+    return {
+      controlA: { x: start.x, y: start.y + offsetY },
+      controlB: { x: end.x, y: end.y - offsetY },
+    };
+  }
+  const dx = Math.max(56, Math.abs(end.x - start.x) * 0.5);
+  const offsetX = end.x >= start.x ? dx : -dx;
+  return {
+    controlA: { x: start.x + offsetX, y: start.y },
+    controlB: { x: end.x - offsetX, y: end.y },
+  };
+}
+
+function graphCubicPoint(
+  start: GraphPoint,
+  controlA: GraphPoint,
+  controlB: GraphPoint,
+  end: GraphPoint,
+  t: number,
+): GraphPoint {
+  const mt = 1 - t;
+  return {
+    x: mt ** 3 * start.x + 3 * mt ** 2 * t * controlA.x + 3 * mt * t ** 2 * controlB.x + t ** 3 * end.x,
+    y: mt ** 3 * start.y + 3 * mt ** 2 * t * controlA.y + 3 * mt * t ** 2 * controlB.y + t ** 3 * end.y,
+  };
+}
+
+function graphCubicTangent(
+  start: GraphPoint,
+  controlA: GraphPoint,
+  controlB: GraphPoint,
+  end: GraphPoint,
+  t: number,
+): GraphPoint {
+  const mt = 1 - t;
+  return {
+    x: 3 * mt ** 2 * (controlA.x - start.x)
+      + 6 * mt * t * (controlB.x - controlA.x)
+      + 3 * t ** 2 * (end.x - controlB.x),
+    y: 3 * mt ** 2 * (controlA.y - start.y)
+      + 6 * mt * t * (controlB.y - controlA.y)
+      + 3 * t ** 2 * (end.y - controlB.y),
+  };
+}
+
+function graphDirectionMarkerFromBezier(
+  start: GraphPoint,
+  end: GraphPoint,
+  vertical = false,
+): GraphDirectionMarker | null {
+  const { controlA, controlB } = graphBezierControls(start, end, vertical);
+  const point = graphCubicPoint(start, controlA, controlB, end, 0.5);
+  const tangent = graphCubicTangent(start, controlA, controlB, end, 0.5);
+  if (Math.hypot(tangent.x, tangent.y) < 0.5) return null;
+  return {
+    x: point.x,
+    y: point.y,
+    angle: Math.atan2(tangent.y, tangent.x),
+  };
+}
+
+function graphDirectionMarkerFromPoints(points: GraphPoint[]): GraphDirectionMarker | null {
+  const route = compactGraphPoints(points);
+  if (route.length < 2) return null;
+
+  let total = 0;
+  for (let index = 1; index < route.length; index += 1) {
+    total += graphDistance(route[index - 1], route[index]);
+  }
+  if (total < 1) return null;
+
+  const target = total / 2;
+  let offset = 0;
+  for (let index = 1; index < route.length; index += 1) {
+    const from = route[index - 1];
+    const to = route[index];
+    const segmentLength = graphDistance(from, to);
+    if (segmentLength < 1) continue;
+    if (offset + segmentLength >= target) {
+      const t = (target - offset) / segmentLength;
+      return {
+        x: from.x + (to.x - from.x) * t,
+        y: from.y + (to.y - from.y) * t,
+        angle: Math.atan2(to.y - from.y, to.x - from.x),
+      };
+    }
+    offset += segmentLength;
+  }
+
+  const previous = route[route.length - 2];
+  const last = route[route.length - 1];
+  return {
+    x: last.x,
+    y: last.y,
+    angle: Math.atan2(last.y - previous.y, last.x - previous.x),
+  };
+}
+
+function graphDirectionChevronPath(marker: GraphDirectionMarker, viewportScale: number): string {
+  const scale = Number.isFinite(viewportScale)
+    ? Math.min(2, Math.max(0.35, viewportScale))
+    : 1;
+  const length = 9 / scale;
+  const spread = 4.5 / scale;
+  const forward = { x: Math.cos(marker.angle), y: Math.sin(marker.angle) };
+  const normal = { x: -forward.y, y: forward.x };
+  const apex = {
+    x: marker.x + forward.x * length * 0.5,
+    y: marker.y + forward.y * length * 0.5,
+  };
+  const tail = {
+    x: marker.x - forward.x * length * 0.5,
+    y: marker.y - forward.y * length * 0.5,
+  };
+  const left = {
+    x: tail.x + normal.x * spread,
+    y: tail.y + normal.y * spread,
+  };
+  const right = {
+    x: tail.x - normal.x * spread,
+    y: tail.y - normal.y * spread,
+  };
+  return [
+    "M", graphCoord(left.x), graphCoord(left.y),
+    "L", graphCoord(apex.x), graphCoord(apex.y),
+    "M", graphCoord(right.x), graphCoord(right.y),
+    "L", graphCoord(apex.x), graphCoord(apex.y),
+  ].join(" ");
+}
+
 function createGraphViewComponent() {
   return defineComponent({
     name: "LocusGraphView",
@@ -210,7 +393,6 @@ function createGraphViewComponent() {
       const canvasRef = ref<CanvasViewExpose | null>(null);
       let edgeRenderScheduled = false;
       let edgeRenderFrame = 0;
-      const arrowMarkerId = `locus-graph-arrow-${Math.random().toString(36).slice(2)}`;
       const routeColorIndexById = computed(() => {
         return graphRouteColorIndexById({ connections: graphConnections(graph) });
       });
@@ -483,14 +665,13 @@ function createGraphViewComponent() {
       }
 
       function connectionBezierPath(start: GraphPoint, end: GraphPoint, vertical = false) {
-        if (vertical) {
-          const dy = Math.max(56, Math.abs(end.y - start.y) * 0.5);
-          const offsetY = end.y >= start.y ? dy : -dy;
-          return `M ${start.x} ${start.y} C ${start.x} ${start.y + offsetY}, ${end.x} ${end.y - offsetY}, ${end.x} ${end.y}`;
-        }
-        const dx = Math.max(56, Math.abs(end.x - start.x) * 0.5);
-        const offsetX = end.x >= start.x ? dx : -dx;
-        return `M ${start.x} ${start.y} C ${start.x + offsetX} ${start.y}, ${end.x - offsetX} ${end.y}, ${end.x} ${end.y}`;
+        const { controlA, controlB } = graphBezierControls(start, end, vertical);
+        return [
+          "M", start.x, start.y,
+          "C", controlA.x, controlA.y,
+          controlB.x, controlB.y,
+          end.x, end.y,
+        ].join(" ");
       }
 
       function connectionPath(connection: GraphLink) {
@@ -505,6 +686,18 @@ function createGraphViewComponent() {
           return graphPathWithEndpoints(connection.points, start, end, currentLayoutDirection());
         }
         return connectionBezierPath(start, end, connectionUsesVerticalPorts(connection));
+      }
+
+      function connectionDirectionPath(connection: GraphLink, viewportScale: number) {
+        edgeVersion.value;
+        const start = endpointPoint(connection.from, "output");
+        const end = endpointPoint(connection.to, "input");
+        if (!start || !end) return "";
+
+        const marker = !draggingNodeId.value && connection.points && connection.points.length >= 2
+          ? graphDirectionMarkerFromPoints(graphRoutePointsWithAnchors(connection.points, start, end, currentLayoutDirection()))
+          : graphDirectionMarkerFromBezier(start, end, connectionUsesVerticalPorts(connection));
+        return marker ? graphDirectionChevronPath(marker, viewportScale) : "";
       }
 
       function connectionColorIndex(connection: GraphLink) {
@@ -706,12 +899,18 @@ function createGraphViewComponent() {
         const type = parameter.type || "string";
         const disabled = props.readonly || !!parameter.readOnly;
         const label = parameter.label || parameter.id;
+        const displayValue = graphDisplayValue(parameter.value);
         const commonProps = {
           disabled,
           "aria-label": label,
         };
         let control;
-        if (type === "boolean") {
+        if (disabled && type !== "boolean" && type !== "color") {
+          control = h("span", {
+            class: "locus-graph-parameter-value",
+            title: displayValue,
+          }, renderGraphFormulaCode(displayValue));
+        } else if (type === "boolean") {
           control = h("input", {
             ...commonProps,
             type: "checkbox",
@@ -869,31 +1068,12 @@ function createGraphViewComponent() {
         ];
       }
 
-      function renderEdgeMarkers() {
-        return h("defs", [
-          h("marker", {
-            id: arrowMarkerId,
-            viewBox: "0 0 8 8",
-            refX: 7.2,
-            refY: 4,
-            markerWidth: 7,
-            markerHeight: 7,
-            orient: "auto",
-          }, [
-            h("path", {
-              d: "M 0 0 L 8 4 L 0 8 z",
-              fill: "context-stroke",
-              stroke: "none",
-            }),
-          ]),
-        ]);
-      }
-
-      function renderConnection(connection: GraphLink) {
+      function renderConnection(connection: GraphLink, viewportScale: number) {
         const selected = selectedConnectionId.value === connection.id;
         const colorIndex = connectionColorIndex(connection);
-        return h("path", {
-          key: connection.id,
+        const key = connection.id || `${connection.from.nodeId}:${connection.from.portId ?? ""}:${connection.to.nodeId}:${connection.to.portId ?? ""}`;
+        const edge = h("path", {
+          key,
           class: [
             "locus-graph-edge",
             `route-color-${colorIndex}`,
@@ -901,7 +1081,6 @@ function createGraphViewComponent() {
             selected ? "selected" : "",
           ],
           d: connectionPath(connection),
-          "marker-end": connectionIsDirected(connection) ? `url(#${arrowMarkerId})` : undefined,
           onPointerdown: (event: PointerEvent) => event.stopPropagation(),
           onClick: (event: MouseEvent) => {
             event.stopPropagation();
@@ -909,6 +1088,20 @@ function createGraphViewComponent() {
             selectedNodeId.value = "";
           },
         });
+        const directionPath = connectionIsDirected(connection) ? connectionDirectionPath(connection, viewportScale) : "";
+        if (!directionPath) return [edge];
+        return [
+          edge,
+          h("path", {
+            key: `${key}:direction`,
+            class: [
+              "locus-graph-edge-direction",
+              `route-color-${colorIndex}`,
+              selected ? "selected" : "",
+            ],
+            d: directionPath,
+          }),
+        ];
       }
 
       onMounted(() => {
@@ -984,17 +1177,14 @@ function createGraphViewComponent() {
           onDeleteSelection: removeSelectedItem,
           onRender: scheduleEdgeRender,
         }, {
-          overlay: () =>
+          overlay: ({ viewport }: { viewport: CanvasViewport }) =>
             h("svg", {
               class: "locus-graph-edge-layer",
               viewBox: `0 0 ${GRAPH_WORLD_SIZE} ${GRAPH_WORLD_SIZE}`,
               width: GRAPH_WORLD_SIZE,
               height: GRAPH_WORLD_SIZE,
               "aria-hidden": "true",
-            }, [
-              renderEdgeMarkers(),
-              ...graphConnections(graph).map(renderConnection),
-            ]),
+            }, graphConnections(graph).flatMap((connection) => renderConnection(connection, viewport.scale))),
           default: ({ item }: { item: unknown }) => renderNode(item as GraphNode),
         }),
       ]);

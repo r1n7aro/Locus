@@ -40,6 +40,12 @@ interface GraphImageBounds {
   bottom: number;
 }
 
+interface GraphDirectionMarker {
+  x: number;
+  y: number;
+  angle: number;
+}
+
 function finiteNumber(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value);
 }
@@ -114,24 +120,45 @@ function connectionColor(connection: GraphLink, index: number): string {
   return GRAPH_IMAGE_EDGE_COLORS[normalized % GRAPH_IMAGE_EDGE_COLORS.length];
 }
 
-function bezierPath(start: GraphPoint, end: GraphPoint, vertical = false): string {
+function graphDistance(a: GraphPoint, b: GraphPoint): number {
+  return Math.hypot(b.x - a.x, b.y - a.y);
+}
+
+function compactGraphPoints(points: GraphPoint[]): GraphPoint[] {
+  const result: GraphPoint[] = [];
+  for (const point of points) {
+    if (!finiteNumber(point.x) || !finiteNumber(point.y)) continue;
+    const previous = result[result.length - 1];
+    if (previous && graphDistance(previous, point) < 0.5) continue;
+    result.push(point);
+  }
+  return result;
+}
+
+function bezierControls(start: GraphPoint, end: GraphPoint, vertical = false) {
   if (vertical) {
     const dy = Math.max(56, Math.abs(end.y - start.y) * 0.5);
     const offsetY = end.y >= start.y ? dy : -dy;
-    return [
-      "M", svgNumber(start.x), svgNumber(start.y),
-      "C", svgNumber(start.x), svgNumber(start.y + offsetY),
-      svgNumber(end.x), svgNumber(end.y - offsetY),
-      svgNumber(end.x), svgNumber(end.y),
-    ].join(" ");
+    return {
+      controlA: { x: start.x, y: start.y + offsetY },
+      controlB: { x: end.x, y: end.y - offsetY },
+    };
   }
 
   const dx = Math.max(56, Math.abs(end.x - start.x) * 0.5);
   const offsetX = end.x >= start.x ? dx : -dx;
+  return {
+    controlA: { x: start.x + offsetX, y: start.y },
+    controlB: { x: end.x - offsetX, y: end.y },
+  };
+}
+
+function bezierPath(start: GraphPoint, end: GraphPoint, vertical = false): string {
+  const { controlA, controlB } = bezierControls(start, end, vertical);
   return [
     "M", svgNumber(start.x), svgNumber(start.y),
-    "C", svgNumber(start.x + offsetX), svgNumber(start.y),
-    svgNumber(end.x - offsetX), svgNumber(end.y),
+    "C", svgNumber(controlA.x), svgNumber(controlA.y),
+    svgNumber(controlB.x), svgNumber(controlB.y),
     svgNumber(end.x), svgNumber(end.y),
   ].join(" ");
 }
@@ -143,6 +170,116 @@ function routePath(points: GraphPoint[]): string {
       return `${command} ${svgNumber(point.x)} ${svgNumber(point.y)}`;
     })
     .join(" ");
+}
+
+function cubicPoint(
+  start: GraphPoint,
+  controlA: GraphPoint,
+  controlB: GraphPoint,
+  end: GraphPoint,
+  t: number,
+): GraphPoint {
+  const mt = 1 - t;
+  return {
+    x: mt ** 3 * start.x + 3 * mt ** 2 * t * controlA.x + 3 * mt * t ** 2 * controlB.x + t ** 3 * end.x,
+    y: mt ** 3 * start.y + 3 * mt ** 2 * t * controlA.y + 3 * mt * t ** 2 * controlB.y + t ** 3 * end.y,
+  };
+}
+
+function cubicTangent(
+  start: GraphPoint,
+  controlA: GraphPoint,
+  controlB: GraphPoint,
+  end: GraphPoint,
+  t: number,
+): GraphPoint {
+  const mt = 1 - t;
+  return {
+    x: 3 * mt ** 2 * (controlA.x - start.x)
+      + 6 * mt * t * (controlB.x - controlA.x)
+      + 3 * t ** 2 * (end.x - controlB.x),
+    y: 3 * mt ** 2 * (controlA.y - start.y)
+      + 6 * mt * t * (controlB.y - controlA.y)
+      + 3 * t ** 2 * (end.y - controlB.y),
+  };
+}
+
+function directionMarkerFromBezier(start: GraphPoint, end: GraphPoint, vertical = false): GraphDirectionMarker | null {
+  const { controlA, controlB } = bezierControls(start, end, vertical);
+  const point = cubicPoint(start, controlA, controlB, end, 0.5);
+  const tangent = cubicTangent(start, controlA, controlB, end, 0.5);
+  if (Math.hypot(tangent.x, tangent.y) < 0.5) return null;
+  return {
+    x: point.x,
+    y: point.y,
+    angle: Math.atan2(tangent.y, tangent.x),
+  };
+}
+
+function directionMarkerFromPoints(points: GraphPoint[]): GraphDirectionMarker | null {
+  const route = compactGraphPoints(points);
+  if (route.length < 2) return null;
+
+  let total = 0;
+  for (let index = 1; index < route.length; index += 1) {
+    total += graphDistance(route[index - 1], route[index]);
+  }
+  if (total < 1) return null;
+
+  const target = total / 2;
+  let offset = 0;
+  for (let index = 1; index < route.length; index += 1) {
+    const from = route[index - 1];
+    const to = route[index];
+    const segmentLength = graphDistance(from, to);
+    if (segmentLength < 1) continue;
+    if (offset + segmentLength >= target) {
+      const t = (target - offset) / segmentLength;
+      return {
+        x: from.x + (to.x - from.x) * t,
+        y: from.y + (to.y - from.y) * t,
+        angle: Math.atan2(to.y - from.y, to.x - from.x),
+      };
+    }
+    offset += segmentLength;
+  }
+
+  const previous = route[route.length - 2];
+  const last = route[route.length - 1];
+  return {
+    x: last.x,
+    y: last.y,
+    angle: Math.atan2(last.y - previous.y, last.x - previous.x),
+  };
+}
+
+function directionChevronPath(marker: GraphDirectionMarker): string {
+  const length = 9;
+  const spread = 4.5;
+  const forward = { x: Math.cos(marker.angle), y: Math.sin(marker.angle) };
+  const normal = { x: -forward.y, y: forward.x };
+  const apex = {
+    x: marker.x + forward.x * length * 0.5,
+    y: marker.y + forward.y * length * 0.5,
+  };
+  const tail = {
+    x: marker.x - forward.x * length * 0.5,
+    y: marker.y - forward.y * length * 0.5,
+  };
+  const left = {
+    x: tail.x + normal.x * spread,
+    y: tail.y + normal.y * spread,
+  };
+  const right = {
+    x: tail.x - normal.x * spread,
+    y: tail.y - normal.y * spread,
+  };
+  return [
+    "M", svgNumber(left.x), svgNumber(left.y),
+    "L", svgNumber(apex.x), svgNumber(apex.y),
+    "M", svgNumber(right.x), svgNumber(right.y),
+    "L", svgNumber(apex.x), svgNumber(apex.y),
+  ].join(" ");
 }
 
 function connectionIsDirected(graph: GraphData, connection: GraphLink): boolean {
@@ -179,12 +316,24 @@ function renderConnection(
 
   const start = graphNodePortAnchor(from, "output", connection.from.portId, direction, statePortPlacement);
   const end = graphNodePortAnchor(to, "input", connection.to.portId, direction, statePortPlacement);
-  const path = connection.points && connection.points.length >= 2
-    ? routePath(graphRoutePointsWithAnchors(connection.points, start, end, direction))
-    : bezierPath(start, end, connectionUsesVerticalPorts(graph, connection, direction, statePortPlacement));
+  const routePoints = connection.points && connection.points.length >= 2
+    ? graphRoutePointsWithAnchors(connection.points, start, end, direction)
+    : null;
+  const vertical = connectionUsesVerticalPorts(graph, connection, direction, statePortPlacement);
+  const path = routePoints ? routePath(routePoints) : bezierPath(start, end, vertical);
   const color = connectionColor(connection, index);
-  const marker = connectionIsDirected(graph, connection) ? ' marker-end="url(#graph-image-arrow)"' : "";
-  return `<path d="${escapeSvgAttr(path)}" fill="none" stroke="${color}" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" opacity="0.88"${marker}/>`;
+  const directionMarker = connectionIsDirected(graph, connection)
+    ? routePoints
+      ? directionMarkerFromPoints(routePoints)
+      : directionMarkerFromBezier(start, end, vertical)
+    : null;
+  const directionPath = directionMarker ? directionChevronPath(directionMarker) : "";
+  return [
+    `<path d="${escapeSvgAttr(path)}" fill="none" stroke="${color}" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" opacity="0.88"/>`,
+    directionPath
+      ? `<path d="${escapeSvgAttr(directionPath)}" fill="none" stroke="${color}" stroke-width="1.55" stroke-linecap="round" stroke-linejoin="round" opacity="0.58"/>`
+      : "",
+  ].join("");
 }
 
 function renderNode(
@@ -285,10 +434,6 @@ function buildGraphSvg(graph: GraphData): { svg: string; width: number; height: 
   const height = Math.max(GRAPH_IMAGE_MIN_HEIGHT, Math.ceil(viewHeight * scale));
   const direction = graph.layout?.direction ?? "right";
   const statePortPlacement = normalizeGraphStatePortPlacement(graph.layout?.statePortPlacement);
-  const hasDirectedLinks = graphConnections(graph).some((connection) => connectionIsDirected(graph, connection));
-  const defs = hasDirectedLinks
-    ? '<defs><marker id="graph-image-arrow" viewBox="0 0 8 8" refX="7.2" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path d="M 0 0 L 8 4 L 0 8 z" fill="context-stroke" stroke="none"/></marker></defs>'
-    : "";
   const links = graphConnections(graph)
     .map((connection, index) => renderConnection(graph, connection, index, direction, statePortPlacement))
     .join("");
@@ -296,7 +441,6 @@ function buildGraphSvg(graph: GraphData): { svg: string; width: number; height: 
 
   const svg = [
     `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="${svgNumber(viewLeft)} ${svgNumber(viewTop)} ${svgNumber(viewWidth)} ${svgNumber(viewHeight)}">`,
-    defs,
     `<rect x="${svgNumber(viewLeft)}" y="${svgNumber(viewTop)}" width="${svgNumber(viewWidth)}" height="${svgNumber(viewHeight)}" fill="#101217"/>`,
     `<g>${links}</g>`,
     `<g>${nodes}</g>`,

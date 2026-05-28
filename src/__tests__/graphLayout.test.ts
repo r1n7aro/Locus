@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  GRAPH_NODE_MAX_WIDTH,
   GRAPH_NODE_MIN_WIDTH,
   colorGraphOverlappingRoutes,
   estimateGraphNodeWidth,
@@ -440,6 +441,48 @@ describe("graphLayout", () => {
     expect(graph.nodes[0].width).toBeGreaterThanOrEqual(GRAPH_NODE_MIN_WIDTH);
     expect(graph.nodes[0].width).toBe(estimateGraphNodeWidth(graph.nodes[0]));
     expect(graph.nodes[0].height).toBeGreaterThan(112);
+  });
+
+  it("expands graph nodes for long parameter formulas", () => {
+    const graph = normalizeGraphData({
+      nodes: [
+        {
+          id: "gerstner",
+          title: "Gerstner Waves",
+          parameters: [
+            {
+              id: "nodes",
+              label: "Nodes",
+              type: "string",
+              value: "Position + Time + WaveAmplitude/WavePeriod + Direction + Steepness + PhaseOffset + NormalizedDistance",
+              readOnly: true,
+            },
+          ],
+        },
+      ],
+      links: [],
+    });
+
+    expect(graph.nodes[0].width).toBeGreaterThan(420);
+    expect(graph.nodes[0].width).toBeLessThanOrEqual(GRAPH_NODE_MAX_WIDTH);
+    expect(graph.nodes[0].height).toBeGreaterThan(112);
+  });
+
+  it("shrinks stale generated graph node heights back toward content", () => {
+    const graph = normalizeGraphData({
+      nodes: [
+        {
+          id: "compact",
+          height: 260,
+          parameters: [
+            { id: "formula", label: "Formula", type: "string", value: "A + B", readOnly: true },
+          ],
+        },
+      ],
+      links: [],
+    });
+
+    expect(graph.nodes[0].height).toBeLessThan(160);
   });
 
   it("keeps graph-level node port display options", () => {
