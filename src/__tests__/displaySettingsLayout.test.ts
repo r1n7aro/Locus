@@ -255,7 +255,7 @@ describe("display settings transcript alignment", () => {
     expect(en).toContain('"settings.notifications.soundOnToolConfirm": "Play a sound when approval is needed"');
   });
 
-  it("adds file diff review target settings that default to the current window", () => {
+  it("adds file diff review target settings that default to a separate window", () => {
     const displaySettings = read("src/composables/useDisplaySettings.ts");
     const displayPanel = read("src/components/settings/DisplaySettings.vue");
     const chatChangesPanel = read("src/components/ChatChangesPanel.vue");
@@ -271,8 +271,8 @@ describe("display settings transcript alignment", () => {
     expect(displaySettings).toContain('export type DiffReviewTarget = "inline" | "window";');
     expect(displaySettings).toContain("chatDiffReviewTarget: DiffReviewTarget;");
     expect(displaySettings).toContain("gitDiffReviewTarget: DiffReviewTarget;");
-    expect(displaySettings).toContain('chatDiffReviewTarget: "inline",');
-    expect(displaySettings).toContain('gitDiffReviewTarget: "inline",');
+    expect(displaySettings).toContain('chatDiffReviewTarget: "window",');
+    expect(displaySettings).toContain('gitDiffReviewTarget: "window",');
 
     expect(displayPanel).toContain('<div class="section-label">{{ t("settings.display.diffReviewTitle") }}</div>');
     expect(displayPanel).toContain('<p class="section-desc">{{ t("settings.display.diffReviewDesc") }}</p>');
@@ -298,12 +298,24 @@ describe("display settings transcript alignment", () => {
     expect(chatReviewWindow).toContain(":hide-text-display-controls=\"true\"");
     expect(chatReviewWindow).toContain("fileDiffViewerRef?.hasTextDisplayModeControl");
     expect(chatReviewWindow).toContain("fileDiffViewerRef.toggleTextDisplayMode()");
+    expect(chatReviewWindow).toContain("canToggleFullTextCompare");
+    expect(chatReviewWindow).toContain("toggleFullTextCompare");
+    expect(chatReviewWindow).toContain("diff.mode.fullTextCompare");
+    expect(chatReviewWindow).toContain('FULL_CONTEXT_DEFAULT_STORAGE_KEY = "locus:diff-review:full-context"');
+    expect(chatReviewWindow).toContain("readDefaultFullContext");
+    expect(chatReviewWindow).toContain("persistDefaultFullContext(nextFullContext)");
+    expect(chatReviewWindow).toContain("useDefaultFullContext: true");
     expect(chatReviewWindow.indexOf("common.openInEditor")).toBeLessThan(
       chatReviewWindow.indexOf("diff.mode.sideBySide"),
     );
     expect(fileDiffViewer).toContain("hideTextDisplayControls?: boolean;");
     expect(fileDiffViewer).toContain("hasTextDisplayModeControl");
     expect(fileDiffViewer).toContain("toggleTextDisplayMode,");
+    expect(fileDiffViewer).toContain("showChangeNavigator");
+    expect(fileDiffViewer).toContain("data-change-anchor");
+    expect(fileDiffViewer).toContain('document.addEventListener("keydown", onDocumentKeydown)');
+    expect(fileDiffViewer).toContain('event.key === "ArrowDown"');
+    expect(fileDiffViewer).toContain('class="diff-change-nav"');
 
     expect(app).toContain("isChatDiffReviewWindowLocation");
     expect(app).toContain("<ChatDiffReviewWindow v-else-if=\"isChatDiffReviewWindow\" />");
@@ -315,12 +327,20 @@ describe("display settings transcript alignment", () => {
     expect(zh).toContain('"settings.display.diffReviewChatTarget": "会话修改"');
     expect(zh).toContain('"settings.display.diffReviewGitTarget": "Git 修改"');
     expect(zh).toContain('"settings.display.diffReviewWindow": "独立窗口"');
+    expect(zh).toContain('"diff.mode.fullTextCompare": "全文"');
+    expect(zh).toContain('"diff.nav.changeNavigation": "修改导航"');
+    expect(zh).toContain('"diff.nav.previousChange": "上一个修改"');
+    expect(zh).toContain('"diff.nav.nextChange": "下一个修改"');
     expect(en).toContain('"settings.display.panelBehaviorDesc": "Control how session panels open and close"');
     expect(en).toContain('"settings.display.diffReviewTitle": "File Change Review"');
     expect(en).toContain('"settings.display.diffReviewDesc": "Choose where file change reviews open by default"');
     expect(en).toContain('"settings.display.diffReviewChatTarget": "Session changes"');
     expect(en).toContain('"settings.display.diffReviewGitTarget": "Git changes"');
     expect(en).toContain('"settings.display.diffReviewWindow": "Separate window"');
+    expect(en).toContain('"diff.mode.fullTextCompare": "Full"');
+    expect(en).toContain('"diff.nav.changeNavigation": "Change navigation"');
+    expect(en).toContain('"diff.nav.previousChange": "Previous change"');
+    expect(en).toContain('"diff.nav.nextChange": "Next change"');
   });
 
   it("adds a completed thinking block visibility toggle that defaults to hidden", () => {

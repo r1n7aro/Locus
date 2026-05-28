@@ -43,6 +43,22 @@ function computeRequestKey(req: FileDiffRequest): string {
   ].join(":");
 }
 
+export function parseDiffRequestKey(key: string): FileDiffRequest | null {
+  const parts = key.split(":");
+  if (parts.length < 8) return null;
+  const [source, filePath, oldPath, commitHash, sessionId, assistantMessageId, detail, fc] = parts;
+  return {
+    source: source as FileDiffRequest["source"],
+    filePath,
+    oldPath: oldPath || undefined,
+    commitHash: commitHash || undefined,
+    sessionId: sessionId || undefined,
+    assistantMessageId: assistantMessageId || undefined,
+    detail: detail as FileDiffRequest["detail"],
+    fullContext: fc === "fc",
+  };
+}
+
 // ── LRU cache ──
 
 const LRU_CAPACITY = 50;
@@ -152,20 +168,9 @@ export function invalidateDiffCache(key: string) {
  * Returns the new payload or null if the key cannot be parsed.
  */
 export async function refetchDiffByKey(key: string): Promise<FileDiffPayload | null> {
-  const parts = key.split(":");
-  if (parts.length < 8) return null;
-  const [source, filePath, oldPath, commitHash, sessionId, assistantMessageId, detail, fc] = parts;
+  const request = parseDiffRequestKey(key);
+  if (!request) return null;
   invalidateDiffCache(key);
-  const request: FileDiffRequest = {
-    source: source as FileDiffRequest["source"],
-    filePath,
-    oldPath: oldPath || undefined,
-    commitHash: commitHash || undefined,
-    sessionId: sessionId || undefined,
-    assistantMessageId: assistantMessageId || undefined,
-    detail: detail as FileDiffRequest["detail"],
-    fullContext: fc === "fc",
-  };
   return diffSingleFile(request);
 }
 

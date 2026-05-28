@@ -1,13 +1,13 @@
 <script setup lang="ts">
-import { computed, ref, watch, nextTick } from "vue";
-import { diffSemanticTarget, diffTextForLarge, invalidateDiffCache } from "../../services/diff";
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
+import { ChevronDown, ChevronUp } from "lucide";
+import { diffSemanticTarget, diffTextForLarge, invalidateDiffCache, parseDiffRequestKey } from "../../services/diff";
 import { gitExecute } from "../../services/git";
 import { t } from "../../i18n";
 import { useResizablePanel } from "../../composables/useResizablePanel";
 import { highlightDiffHunk } from "./fileDiffText";
 import type {
   FileDiffPayload,
-  FileDiffRequest,
   DiffHunk,
   DiffLine,
   TextDiff,
@@ -18,6 +18,7 @@ import type {
 import UnityHierarchyPane from "./UnityHierarchyPane.vue";
 import UnityInspectorPane from "./UnityInspectorPane.vue";
 import BinaryPreviewHost from "./BinaryPreviewHost.vue";
+import LucideIcon from "../icons/LucideIcon.vue";
 
 const props = withDefaults(
   defineProps<{
@@ -30,6 +31,8 @@ const props = withDefaults(
     hideBuiltinTabs?: boolean;
     /** When true, the parent controls text display mode actions — hide the built-in toolbar */
     hideTextDisplayControls?: boolean;
+    /** Preferred initial tab when a fresh payload is mounted */
+    initialTab?: "semantic" | "text";
   }>(),
   { mode: "unified", compact: false, filter: "all", hideBuiltinTabs: false, hideTextDisplayControls: false },
 );
@@ -60,7 +63,13 @@ async function pullLfsObject() {
   }
 }
 
-const activeTab = ref<"text" | "semantic">(props.payload.semantic ? "semantic" : "text");
+function resolveInitialTab(payload: FileDiffPayload): "text" | "semantic" {
+  if (props.initialTab === "text" && (!!payload.text || payload.isLarge || !payload.semantic)) return "text";
+  if (props.initialTab === "semantic" && !!payload.semantic) return "semantic";
+  return payload.semantic ? "semantic" : "text";
+}
+
+const activeTab = ref<"text" | "semantic">(resolveInitialTab(props.payload));
 const textDisplayMode = ref<"unified" | "side-by-side">(props.mode);
 const selectedTargetId = ref<string | null>(null);
 const includeUnchanged = ref(false);
@@ -74,24 +83,8 @@ const lazyText = ref<TextDiff | null>(null);
 const lazyTextLoading = ref(false);
 const lazyTextError = ref<string | null>(null);
 
-function parseRequestFromKey(key: string): FileDiffRequest | null {
-  const parts = key.split(":");
-  if (parts.length < 8) return null;
-  const [source, filePath, oldPath, commitHash, sessionId, assistantMessageId, detail, fc] = parts;
-  return {
-    source: source as FileDiffRequest["source"],
-    filePath,
-    oldPath: oldPath || undefined,
-    commitHash: commitHash || undefined,
-    sessionId: sessionId || undefined,
-    assistantMessageId: assistantMessageId || undefined,
-    detail: detail as FileDiffRequest["detail"],
-    fullContext: fc === "fc",
-  };
-}
-
 async function loadTextDiff() {
-  const request = parseRequestFromKey(props.payload.key);
+  const request = parseDiffRequestKey(props.payload.key);
   if (!request) return;
   lazyTextLoading.value = true;
   lazyTextError.value = null;
@@ -150,11 +143,11 @@ const visibleHunks = computed<{ hunk: DiffHunk; originalIndex: number }[]>(() =>
 const hasMoreLines = computed(() => totalLineCount.value > renderLimit.value);
 
 function onTextScroll(e: Event) {
-  if (!hasMoreLines.value) return;
   const el = e.target as HTMLElement;
-  if (el.scrollTop + el.clientHeight >= el.scrollHeight - 300) {
+  if (hasMoreLines.value && el.scrollTop + el.clientHeight >= el.scrollHeight - 300) {
     renderLimit.value += CHUNK_SIZE;
   }
+  updateActiveChangeFromScroll();
 }
 
 function scheduleTextReady() {
@@ -243,7 +236,7 @@ const hierarchyColumnStyle = computed(() =>
 watch(
   () => props.payload,
   (payload) => {
-    activeTab.value = payload.semantic ? "semantic" : "text";
+    activeTab.value = resolveInitialTab(payload);
     textDisplayMode.value = props.mode;
     includeUnchanged.value = false;
     semanticError.value = null;
@@ -346,40 +339,262 @@ function highlightedHunkForRender(hunk: DiffHunk): DiffHunk {
 }
 
 interface SideBySideRow {
-  left: DiffLine | null;
-  right: DiffLine | null;
+  left: IndexedDiffLine | null;
+  right: IndexedDiffLine | null;
+  anchorKey: string | null;
 }
 
-function alignHunk(hunk: DiffHunk): SideBySideRow[] {
+interface IndexedDiffLine extends DiffLine {
+  sourceLineIndex: number;
+}
+
+interface ChangeBlock {
+  key: string;
+  hunkIndex: number;
+  startLineIndex: number;
+  endLineIndex: number;
+  renderLineOffset: number;
+  lineLabel: string;
+}
+
+interface ScrollChangeCandidate {
+  key: string;
+  index: number;
+  line: string;
+  top: number;
+  bottom: number;
+  distance: number;
+}
+
+const fullContextTextMode = computed(() => Boolean(parseDiffRequestKey(props.payload.key)?.fullContext));
+
+const isTextVisible = computed(() =>
+  Boolean(effectiveText.value) && (activeTab.value === "text" || !props.payload.semantic),
+);
+
+const changeBlocks = computed<ChangeBlock[]>(() => {
+  const text = effectiveText.value;
+  if (!text) return [];
+  const blocks: ChangeBlock[] = [];
+  let lineOffset = 0;
+  for (let hunkIndex = 0; hunkIndex < text.hunks.length; hunkIndex += 1) {
+    const hunk = text.hunks[hunkIndex];
+    let lineIndex = 0;
+    while (lineIndex < hunk.lines.length) {
+      if (hunk.lines[lineIndex].kind === "context") {
+        lineIndex += 1;
+        continue;
+      }
+      const startLineIndex = lineIndex;
+      let endLineIndex = lineIndex;
+      while (endLineIndex + 1 < hunk.lines.length && hunk.lines[endLineIndex + 1].kind !== "context") {
+        endLineIndex += 1;
+      }
+      const firstChangedLine = hunk.lines[startLineIndex];
+      const lineNo = firstChangedLine.newLineNo ?? firstChangedLine.oldLineNo ?? hunk.newStart ?? hunk.oldStart;
+      blocks.push({
+        key: `${hunkIndex}-${startLineIndex}`,
+        hunkIndex,
+        startLineIndex,
+        endLineIndex,
+        renderLineOffset: lineOffset + startLineIndex,
+        lineLabel: String(lineNo),
+      });
+      lineIndex = endLineIndex + 1;
+    }
+    lineOffset += hunk.lines.length;
+  }
+  return blocks;
+});
+
+const changeBlockKeyByPosition = computed(() => {
+  const map = new Map<string, string>();
+  for (const block of changeBlocks.value) {
+    map.set(`${block.hunkIndex}:${block.startLineIndex}`, block.key);
+  }
+  return map;
+});
+
+const activeChangeIndex = ref(0);
+let suppressScrollActiveUntil = 0;
+const PROGRAMMATIC_SCROLL_SUPPRESS_MS = 650;
+
+const activeChange = computed(() => changeBlocks.value[activeChangeIndex.value] ?? null);
+
+const showChangeNavigator = computed(() =>
+  !props.compact
+  && fullContextTextMode.value
+  && isTextVisible.value
+  && textReady.value
+  && changeBlocks.value.length > 0,
+);
+
+watch(changeBlocks, (blocks) => {
+  activeChangeIndex.value = Math.min(activeChangeIndex.value, Math.max(0, blocks.length - 1));
+});
+
+watch(showChangeNavigator, (show) => {
+  if (!show) return;
+  nextTick(() => updateActiveChangeFromScroll());
+});
+
+function changeAnchorKey(hunkIndex: number, lineIndex: number): string | null {
+  return changeBlockKeyByPosition.value.get(`${hunkIndex}:${lineIndex}`) ?? null;
+}
+
+function isActiveChangeAnchor(hunkIndex: number, lineIndex: number): boolean {
+  const key = changeAnchorKey(hunkIndex, lineIndex);
+  return !!key && key === activeChange.value?.key;
+}
+
+function changeAnchorSelector(key: string): string {
+  return `[data-change-anchor="${key}"]`;
+}
+
+async function ensureChangeRendered(block: ChangeBlock) {
+  if (block.renderLineOffset < renderLimit.value) return;
+  const nextLimit = Math.min(
+    totalLineCount.value,
+    Math.ceil((block.renderLineOffset + 80) / CHUNK_SIZE) * CHUNK_SIZE,
+  );
+  renderLimit.value = Math.max(renderLimit.value, nextLimit);
+  await nextTick();
+  await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+}
+
+function updateActiveChangeFromScroll() {
+  if (!showChangeNavigator.value || !textScrollEl.value) return;
+  const now = Date.now();
+  if (now < suppressScrollActiveUntil) {
+    return;
+  }
+  const container = textScrollEl.value;
+  const containerRect = container.getBoundingClientRect();
+  const centerY = containerRect.top + containerRect.height / 2;
+  const anchors = Array.from(container.querySelectorAll<HTMLElement>("[data-change-anchor]"));
+  const candidates = anchors
+    .flatMap((anchor): ScrollChangeCandidate[] => {
+      const key = anchor.dataset.changeAnchor;
+      if (!key) return [];
+      const index = changeBlocks.value.findIndex((block) => block.key === key);
+      if (index < 0) return [];
+      const rect = anchor.getBoundingClientRect();
+      const anchorCenterY = rect.top + rect.height / 2;
+      return [{
+        key,
+        index,
+        line: changeBlocks.value[index]?.lineLabel ?? "",
+        top: Math.round(rect.top - containerRect.top),
+        bottom: Math.round(rect.bottom - containerRect.top),
+        distance: Math.round(Math.abs(anchorCenterY - centerY)),
+      }];
+    })
+    .filter((candidate) => candidate.bottom >= 0 && candidate.top <= containerRect.height)
+    .sort((a, b) => a.distance - b.distance);
+
+  const nextIndex = candidates[0]?.index ?? activeChangeIndex.value;
+  const clampedIndex = Math.min(Math.max(nextIndex, 0), Math.max(0, changeBlocks.value.length - 1));
+  activeChangeIndex.value = clampedIndex;
+}
+
+async function navigateChange(direction: -1 | 1) {
+  if (!showChangeNavigator.value || changeBlocks.value.length === 0) {
+    return;
+  }
+  const previousIndex = activeChangeIndex.value;
+  const nextIndex = Math.min(
+    Math.max(activeChangeIndex.value + direction, 0),
+    changeBlocks.value.length - 1,
+  );
+  if (nextIndex === previousIndex) {
+    return;
+  }
+  activeChangeIndex.value = nextIndex;
+  const block = changeBlocks.value[nextIndex];
+  await ensureChangeRendered(block);
+  const anchor = textScrollEl.value?.querySelector<HTMLElement>(changeAnchorSelector(block.key));
+  if (!anchor) return;
+  suppressScrollActiveUntil = Date.now() + PROGRAMMATIC_SCROLL_SUPPRESS_MS;
+  anchor.scrollIntoView({ block: "center", behavior: "smooth" });
+  window.setTimeout(() => {
+    suppressScrollActiveUntil = 0;
+    updateActiveChangeFromScroll();
+  }, 180);
+}
+
+function goPreviousChange() {
+  void navigateChange(-1);
+}
+
+function goNextChange() {
+  void navigateChange(1);
+}
+
+function isTextInputTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  if (target.isContentEditable) return true;
+  const tag = target.tagName.toLowerCase();
+  return tag === "input" || tag === "textarea" || tag === "select";
+}
+
+function onDocumentKeydown(event: KeyboardEvent) {
+  if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
+  if (!showChangeNavigator.value || event.defaultPrevented || isTextInputTarget(event.target)) {
+    return;
+  }
+  if (event.key === "ArrowDown") {
+    event.preventDefault();
+    void navigateChange(1);
+  } else if (event.key === "ArrowUp") {
+    event.preventDefault();
+    void navigateChange(-1);
+  }
+}
+
+function indexedLine(line: DiffLine, sourceLineIndex: number): IndexedDiffLine {
+  return { ...line, sourceLineIndex };
+}
+
+function alignHunk(hunk: DiffHunk, hunkIndex: number): SideBySideRow[] {
   const rows: SideBySideRow[] = [];
   let index = 0;
 
   while (index < hunk.lines.length) {
     const line = hunk.lines[index];
     if (line.kind === "context") {
-      rows.push({ left: line, right: line });
+      const indexed = indexedLine(line, index);
+      rows.push({ left: indexed, right: indexed, anchorKey: null });
       index += 1;
       continue;
     }
     if (line.kind === "delete") {
-      const deletes: DiffLine[] = [];
+      const deletes: IndexedDiffLine[] = [];
       while (index < hunk.lines.length && hunk.lines[index].kind === "delete") {
-        deletes.push(hunk.lines[index++]);
+        deletes.push(indexedLine(hunk.lines[index], index));
+        index += 1;
       }
-      const adds: DiffLine[] = [];
+      const adds: IndexedDiffLine[] = [];
       while (index < hunk.lines.length && hunk.lines[index].kind === "add") {
-        adds.push(hunk.lines[index++]);
+        adds.push(indexedLine(hunk.lines[index], index));
+        index += 1;
       }
       const rowCount = Math.max(deletes.length, adds.length);
       for (let i = 0; i < rowCount; i += 1) {
         rows.push({
           left: deletes[i] ?? null,
           right: adds[i] ?? null,
+          anchorKey: i === 0
+            ? changeAnchorKey(hunkIndex, deletes[0]?.sourceLineIndex ?? adds[0]?.sourceLineIndex ?? -1)
+            : null,
         });
       }
       continue;
     }
-    rows.push({ left: null, right: line });
+    rows.push({
+      left: null,
+      right: indexedLine(line, index),
+      anchorKey: changeAnchorKey(hunkIndex, index),
+    });
     index += 1;
   }
 
@@ -397,11 +612,11 @@ function filterRows(rows: SideBySideRow[]): SideBySideRow[] {
   if (props.filter === "before") {
     return rows
       .filter((r) => r.left !== null)
-      .map((r) => ({ left: r.left, right: null }));
+      .map((r) => ({ left: r.left, right: null, anchorKey: r.anchorKey }));
   }
   return rows
     .filter((r) => r.right !== null)
-    .map((r) => ({ left: null, right: r.right }));
+    .map((r) => ({ left: null, right: r.right, anchorKey: r.anchorKey }));
 }
 
 function treeNodes(): SemanticTreeNode[] {
@@ -420,6 +635,14 @@ defineExpose({
   hasTextDisplayModeControl,
   textDisplayMode,
   toggleTextDisplayMode,
+});
+
+onMounted(() => {
+  document.addEventListener("keydown", onDocumentKeydown);
+});
+
+onUnmounted(() => {
+  document.removeEventListener("keydown", onDocumentKeydown);
 });
 </script>
 
@@ -580,7 +803,13 @@ defineExpose({
           {{ t('diff.mode.sideBySide') }}
         </button>
       </div>
-      <div v-if="effectiveText && (activeTab === 'text' || !payload.semantic)" ref="textScrollEl" class="diff-text" :class="[textDisplayMode]" @scroll="onTextScroll">
+      <div
+        v-if="effectiveText && (activeTab === 'text' || !payload.semantic)"
+        ref="textScrollEl"
+        class="diff-text"
+        :class="[textDisplayMode, { 'has-change-nav': showChangeNavigator }]"
+        @scroll="onTextScroll"
+      >
         <!-- Loading indicator while preparing large text -->
         <div v-if="!textReady" class="diff-loading">Loading…</div>
         <template v-else>
@@ -594,7 +823,8 @@ defineExpose({
                 v-for="(line, lineIndex) in filterLines(highlightedHunkForRender(hunk).lines)"
                 :key="`${originalIndex}-${lineIndex}`"
                 class="diff-line"
-                :class="line.kind"
+                :class="[line.kind, { 'change-anchor-active': isActiveChangeAnchor(originalIndex, lineIndex) }]"
+                :data-change-anchor="changeAnchorKey(originalIndex, lineIndex) || undefined"
               >
                 <span class="diff-ln">{{ filter === 'before' ? (line.oldLineNo ?? "") : filter === 'after' ? (line.newLineNo ?? "") : (line.kind === 'delete' ? (line.oldLineNo ?? "") : (line.newLineNo ?? "")) }}</span>
                 <span class="diff-indicator">
@@ -605,7 +835,13 @@ defineExpose({
             </template>
 
             <template v-else>
-              <div v-for="(row, rowIndex) in filterRows(alignHunk(highlightedHunkForRender(hunk)))" :key="`${originalIndex}-${rowIndex}`" class="diff-sbs-row">
+              <div
+                v-for="(row, rowIndex) in filterRows(alignHunk(highlightedHunkForRender(hunk), originalIndex))"
+                :key="`${originalIndex}-${rowIndex}`"
+                class="diff-sbs-row"
+                :class="{ 'change-anchor-active': row.anchorKey === activeChange?.key }"
+                :data-change-anchor="row.anchorKey || undefined"
+              >
                 <div class="diff-sbs-cell left" :class="row.left?.kind ?? 'empty'">
                   <span class="diff-ln">{{ row.left?.oldLineNo ?? "" }}</span>
                   <span class="diff-content" v-html="row.left?.content ?? '&nbsp;'"></span>
@@ -622,12 +858,37 @@ defineExpose({
           </div>
         </template>
       </div>
+      <div v-if="showChangeNavigator" class="diff-change-nav" role="toolbar" :aria-label="t('diff.nav.changeNavigation')">
+        <button
+          type="button"
+          class="diff-change-nav-btn"
+          :title="t('diff.nav.previousChange')"
+          :disabled="activeChangeIndex <= 0"
+          @click="goPreviousChange"
+        >
+          <LucideIcon :icon="ChevronUp" :size="15" />
+        </button>
+        <span class="diff-change-nav-count">
+          {{ activeChangeIndex + 1 }} / {{ changeBlocks.length }}
+          <span v-if="activeChange" class="diff-change-nav-line">L{{ activeChange.lineLabel }}</span>
+        </span>
+        <button
+          type="button"
+          class="diff-change-nav-btn"
+          :title="t('diff.nav.nextChange')"
+          :disabled="activeChangeIndex >= changeBlocks.length - 1"
+          @click="goNextChange"
+        >
+          <LucideIcon :icon="ChevronDown" :size="15" />
+        </button>
+      </div>
     </template>
   </div>
 </template>
 
 <style scoped>
 .diff-viewer {
+  position: relative;
   display: flex;
   flex-direction: column;
   height: 100%;
@@ -1007,6 +1268,10 @@ defineExpose({
   overflow: auto;
 }
 
+.diff-text.has-change-nav {
+  padding-bottom: 52px;
+}
+
 .diff-line {
   display: grid;
   grid-template-columns: 52px 18px minmax(0, 1fr);
@@ -1021,6 +1286,11 @@ defineExpose({
 
 .diff-line.delete {
   background: color-mix(in srgb, var(--git-status-deleted) 10%, var(--bg-color));
+}
+
+.diff-line.change-anchor-active,
+.diff-sbs-row.change-anchor-active .diff-sbs-cell {
+  box-shadow: inset 2px 0 0 var(--accent-color);
 }
 
 .diff-ln {
@@ -1081,5 +1351,68 @@ defineExpose({
   color: var(--text-secondary);
   font-size: 11px;
   border-top: 1px solid var(--border-color);
+}
+
+.diff-change-nav {
+  position: absolute;
+  left: 50%;
+  bottom: 14px;
+  z-index: 12;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 34px;
+  padding: 4px 6px;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--panel-bg) 94%, var(--sidebar-bg) 6%);
+  color: var(--text-color);
+  box-shadow: 0 8px 24px color-mix(in srgb, var(--text-color) 18%, transparent);
+  transform: translateX(-50%);
+}
+
+.diff-change-nav-btn {
+  width: 26px;
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+
+.diff-change-nav-btn:hover:not(:disabled),
+.diff-change-nav-btn:focus-visible:not(:disabled) {
+  background: var(--hover-bg);
+  border-color: var(--border-color);
+  color: var(--text-color);
+  outline: none;
+}
+
+.diff-change-nav-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.diff-change-nav-count {
+  min-width: 72px;
+  display: inline-flex;
+  align-items: baseline;
+  justify-content: center;
+  gap: 6px;
+  color: var(--text-color);
+  font-family: var(--font-mono-identifier);
+  font-size: 12px;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.diff-change-nav-line {
+  color: var(--text-secondary);
+  font-size: 11px;
 }
 </style>
