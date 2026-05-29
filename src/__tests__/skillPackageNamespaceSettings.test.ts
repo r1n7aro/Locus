@@ -37,6 +37,12 @@ describe("skill package namespace settings", () => {
     expect(knowledgeSettings).toContain("getDefaultSkillPackageNamespace");
     expect(knowledgeSettings).toContain("setDefaultSkillPackageNamespace");
     expect(knowledgeSettings).toContain("settings.knowledge.defaultSkillPackageNamespace");
+    expect(knowledgeSettings).toContain('<div class="settings-section">');
+    expect(knowledgeSettings).toContain('<p class="section-desc">{{ t("settings.knowledge.defaultSkillPackageNamespaceHint") }}</p>');
+    expect(knowledgeSettings).not.toContain("knowledgeList");
+    expect(knowledgeSettings).not.toContain("settings.knowledge.rootLabel");
+    expect(knowledgeSettings).not.toContain("settings.knowledge.typeBreakdown");
+    expect(knowledgeSettings).not.toContain("settings.knowledge.recentTitle");
     expect(knowledgeService).toContain("get_default_skill_package_namespace");
     expect(knowledgeService).toContain("set_default_skill_package_namespace");
 
