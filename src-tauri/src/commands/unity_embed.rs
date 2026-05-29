@@ -77,16 +77,12 @@ struct UnityEmbedAssetDropPayload {
 #[serde(rename_all = "camelCase")]
 pub struct UnityEmbedStartAssetDragRequest {
     refs: Vec<UnityEmbedAssetRef>,
-    #[serde(default)]
-    trace_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UnityEmbedNativeAssetFileDragRequest {
     refs: Vec<UnityEmbedAssetRef>,
-    #[serde(default)]
-    trace_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -689,45 +685,6 @@ fn current_unity_embed_asset_drag_refs() -> Vec<UnityEmbedAssetRef> {
     cache.refs.clone()
 }
 
-fn normalize_unity_asset_drag_trace_id(trace_id: Option<String>) -> String {
-    let cleaned: String = trace_id
-        .unwrap_or_else(|| "none".to_string())
-        .trim()
-        .chars()
-        .take(96)
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
-                ch
-            } else {
-                '-'
-            }
-        })
-        .collect();
-
-    if cleaned.is_empty() {
-        "none".to_string()
-    } else {
-        cleaned
-    }
-}
-
-fn log_unity_asset_drag_trace(
-    trace_id: &str,
-    phase: &str,
-    started_at: Instant,
-    detail: impl AsRef<str>,
-) {
-    let detail = detail.as_ref();
-    let elapsed_ms = started_at.elapsed().as_millis();
-    if detail.is_empty() {
-        eprintln!("[Locus][UnityAssetDrag] trace={trace_id} phase={phase} elapsedMs={elapsed_ms}");
-    } else {
-        eprintln!(
-            "[Locus][UnityAssetDrag] trace={trace_id} phase={phase} elapsedMs={elapsed_ms} {detail}"
-        );
-    }
-}
-
 fn ensure_unity_embed_asset_drag_release_monitor(app_handle: &AppHandle) {
     #[cfg(target_os = "windows")]
     {
@@ -858,35 +815,13 @@ pub async fn unity_embed_start_asset_drag(
     app_handle: AppHandle,
     request: UnityEmbedStartAssetDragRequest,
 ) -> Result<String, AppError> {
-    let trace_id = normalize_unity_asset_drag_trace_id(request.trace_id);
-    let started_at = Instant::now();
-    log_unity_asset_drag_trace(
-        &trace_id,
-        "tauri_start_asset_drag_command",
-        started_at,
-        format!("requestRefs={}", request.refs.len()),
-    );
-
     let refs = sanitize_locus_outbound_drag_refs(request.refs);
     if refs.is_empty() {
-        log_unity_asset_drag_trace(&trace_id, "tauri_start_asset_drag_no_refs", started_at, "");
         return Ok("no_refs".to_string());
     }
-    log_unity_asset_drag_trace(
-        &trace_id,
-        "tauri_start_asset_drag_sanitized",
-        started_at,
-        format!("refs={}", refs.len()),
-    );
 
     let cwd = current_workspace_path(&app_handle).await;
     if cwd.trim().is_empty() {
-        log_unity_asset_drag_trace(
-            &trace_id,
-            "tauri_start_asset_drag_workspace_missing",
-            started_at,
-            "",
-        );
         return Err(AppError::new(
             "unity.drag.workspace_missing",
             "No Unity workspace is active.",
@@ -896,15 +831,8 @@ pub async fn unity_embed_start_asset_drag(
     #[cfg(target_os = "windows")]
     windows_impl::start_reference_drag_preview(unity_ref_drag_preview_label(&refs, refs.len()));
 
-    log_unity_asset_drag_trace(
-        &trace_id,
-        "tauri_start_asset_drag_send_unity",
-        started_at,
-        "",
-    );
-    let payload = serde_json::json!({ "refs": refs, "traceId": trace_id.clone() }).to_string();
-    crate::unity_bridge::start_asset_drag(&cwd, &payload, &trace_id).await?;
-    log_unity_asset_drag_trace(&trace_id, "tauri_start_asset_drag_unity_ok", started_at, "");
+    let payload = serde_json::json!({ "refs": refs }).to_string();
+    crate::unity_bridge::start_asset_drag(&cwd, &payload).await?;
     Ok("ok".to_string())
 }
 
@@ -933,29 +861,13 @@ pub async fn unity_embed_start_native_asset_file_drag(
     app_handle: AppHandle,
     request: UnityEmbedNativeAssetFileDragRequest,
 ) -> Result<String, AppError> {
-    let trace_id = normalize_unity_asset_drag_trace_id(request.trace_id);
-    let started_at = Instant::now();
-    log_unity_asset_drag_trace(
-        &trace_id,
-        "tauri_native_drag_command",
-        started_at,
-        format!("requestRefs={}", request.refs.len()),
-    );
-
     let refs = sanitize_locus_outbound_drag_refs(request.refs);
     if refs.is_empty() {
-        log_unity_asset_drag_trace(&trace_id, "tauri_native_drag_no_refs", started_at, "");
         return Ok("no_refs".to_string());
     }
 
     let cwd = current_workspace_path(&app_handle).await;
     if cwd.trim().is_empty() {
-        log_unity_asset_drag_trace(
-            &trace_id,
-            "tauri_native_drag_workspace_missing",
-            started_at,
-            "",
-        );
         return Err(AppError::new(
             "unity.drag.workspace_missing",
             "No Unity workspace is active.",
@@ -964,23 +876,11 @@ pub async fn unity_embed_start_native_asset_file_drag(
 
     let paths = native_asset_file_drag_paths(&cwd, &refs);
     if paths.is_empty() {
-        log_unity_asset_drag_trace(
-            &trace_id,
-            "tauri_native_drag_no_files",
-            started_at,
-            format!("refs={}", refs.len()),
-        );
         return Ok("no_files".to_string());
     }
     let preview_label = unity_ref_drag_preview_label(&refs, paths.len());
-    log_unity_asset_drag_trace(
-        &trace_id,
-        "tauri_native_drag_paths_ready",
-        started_at,
-        format!("refs={} paths={}", refs.len(), paths.len()),
-    );
 
-    dispatch_native_file_drag(app_handle, paths, preview_label, Some(cwd), Some(trace_id)).await
+    dispatch_native_file_drag(app_handle, paths, preview_label, Some(cwd)).await
 }
 
 #[tauri::command]
@@ -1002,7 +902,7 @@ pub async fn locus_start_native_file_drag(
     }
     let preview_label = locus_file_drag_preview_label(&request.files, paths.len());
 
-    dispatch_native_file_drag(app_handle, paths, preview_label, None, None).await
+    dispatch_native_file_drag(app_handle, paths, preview_label, None).await
 }
 
 async fn dispatch_native_file_drag(
@@ -1010,44 +910,16 @@ async fn dispatch_native_file_drag(
     paths: Vec<String>,
     preview_label: String,
     unity_asset_drag_workspace: Option<String>,
-    trace_id: Option<String>,
 ) -> Result<String, AppError> {
     #[cfg(target_os = "windows")]
     {
-        let started_at = Instant::now();
-        if let Some(trace_id) = trace_id.as_deref() {
-            log_unity_asset_drag_trace(
-                trace_id,
-                "tauri_dispatch_native_drag_start",
-                started_at,
-                format!("paths={}", paths.len()),
-            );
-        }
         windows_impl::start_reference_drag_preview(preview_label.clone());
         let clear_unity_asset_drag_after_finish = unity_asset_drag_workspace.is_some();
 
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let main_trace_id = trace_id.clone();
         app_handle
             .run_on_main_thread(move || {
-                let main_started_at = Instant::now();
-                if let Some(trace_id) = main_trace_id.as_deref() {
-                    log_unity_asset_drag_trace(
-                        trace_id,
-                        "tauri_do_drag_drop_enter",
-                        main_started_at,
-                        "",
-                    );
-                }
                 let result = windows_impl::start_native_file_drag(paths, preview_label);
-                if let Some(trace_id) = main_trace_id.as_deref() {
-                    log_unity_asset_drag_trace(
-                        trace_id,
-                        "tauri_do_drag_drop_return",
-                        main_started_at,
-                        "",
-                    );
-                }
                 let _ = tx.send(result);
             })
             .map_err(|error| {
@@ -1067,7 +939,6 @@ async fn dispatch_native_file_drag(
                 finish_native_file_drag_after_finish(
                     &app_handle,
                     unity_asset_drag_workspace.as_deref(),
-                    trace_id.as_deref(),
                 )
                 .await;
                 return Err(AppError::new(
@@ -1077,18 +948,8 @@ async fn dispatch_native_file_drag(
             }
         };
 
-        if let Some(trace_id) = trace_id.as_deref() {
-            log_unity_asset_drag_trace(trace_id, "tauri_native_drag_rx_done", started_at, "");
-        }
-        finish_native_file_drag_after_finish(
-            &app_handle,
-            unity_asset_drag_workspace.as_deref(),
-            trace_id.as_deref(),
-        )
-        .await;
-        if let Some(trace_id) = trace_id.as_deref() {
-            log_unity_asset_drag_trace(trace_id, "tauri_dispatch_native_drag_done", started_at, "");
-        }
+        finish_native_file_drag_after_finish(&app_handle, unity_asset_drag_workspace.as_deref())
+            .await;
         return result.map_err(|error| {
             AppError::new("unity.drag.native_failed", error).operation("nativeAssetFileDrag")
         });
@@ -1100,7 +961,6 @@ async fn dispatch_native_file_drag(
         let _ = paths;
         let _ = preview_label;
         let _ = unity_asset_drag_workspace;
-        let _ = trace_id;
         Ok("unsupported".to_string())
     }
 }
@@ -1124,32 +984,17 @@ fn clear_native_file_drag_preview_and_cache(
 async fn finish_native_file_drag_after_finish(
     app_handle: &AppHandle,
     unity_asset_drag_workspace: Option<&str>,
-    trace_id: Option<&str>,
 ) {
     let Some(workspace_path) = unity_asset_drag_workspace else {
         clear_native_file_drag_preview_and_cache(app_handle, false);
         return;
     };
 
-    let started_at = Instant::now();
-    let trace_id = trace_id.unwrap_or("none");
-    log_unity_asset_drag_trace(
-        trace_id,
-        "tauri_finish_native_drag_cleanup_start",
-        started_at,
-        "",
-    );
     clear_native_file_drag_preview_and_cache(app_handle, true);
     if let Err(error) = crate::unity_bridge::cancel_asset_drag(workspace_path).await {
         eprintln!("[Locus] failed to cancel Unity asset drag after native file drag: {error}");
     }
     clear_native_file_drag_preview_and_cache(app_handle, true);
-    log_unity_asset_drag_trace(
-        trace_id,
-        "tauri_finish_native_drag_cleanup_done",
-        started_at,
-        "",
-    );
 }
 
 fn sanitize_locus_outbound_drag_refs(refs: Vec<UnityEmbedAssetRef>) -> Vec<UnityEmbedAssetRef> {

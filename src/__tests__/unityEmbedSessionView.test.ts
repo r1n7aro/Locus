@@ -491,11 +491,10 @@ describe("Unity embedded session view", () => {
     expect(dragSource).toContain("shouldWarmupUnityDrag(refs)");
     expect(dragSource).toContain("isUnityAssetRefPath(ref.path)");
     expect(dragSource).toContain("suppressHtmlDraggable(event)");
-    expect(dragSource).toContain("startUnityNativeAssetFileDrag(refs,");
+    expect(dragSource).toContain("startUnityNativeAssetFileDrag(refs)");
     expect(dragSource).toContain("startLocusNativeFileDrag(files)");
     expect(dragSource).toContain("setUnityEmbedDragPassthrough(true)");
-    expect(dragSource).toContain("startUnityEmbedAssetDrag(refs, { traceId })");
-    expect(dragSource).toContain("[Locus][UnityAssetDrag]");
+    expect(dragSource).toContain("startUnityEmbedAssetDrag(refs)");
     expect(dragSource).toContain("startUnityAssetDragWarmup(refs)");
     expect(dragSource).toContain("cancelUnityAssetDragWarmup(warmup)");
     expect(dragSource).toContain("beginNativeAssetFileDrag(refs, warmup)");
@@ -504,7 +503,6 @@ describe("Unity embedded session view", () => {
     expect(dragSource).toContain("Promise.all([armPromise, passthroughPromise])");
     expect(service).toContain("unity_embed_set_drag_passthrough");
     expect(service).toContain("unity_embed_start_asset_drag");
-    expect(service).toContain("traceId: options.traceId");
     expect(service).toContain("unity_embed_cancel_asset_drag");
     expect(service).toContain("unity_embed_start_native_asset_file_drag");
     expect(service).toContain("locus_start_native_file_drag");
@@ -535,16 +533,14 @@ describe("Unity embedded session view", () => {
     expect(app).toContain("commands::unity_embed_start_native_asset_file_drag");
     expect(app).toContain("commands::locus_start_native_file_drag");
     expect(unityBridge).toContain('case "start_asset_drag"');
-    expect(unityBridge).toContain("QueueOutboundAssetDrag(request.refs, request.traceId");
+    expect(unityBridge).toContain("QueueOutboundAssetDrag(request.refs, out status)");
     expect(editorWindow).toContain("internal static bool QueueOutboundAssetDrag");
-    expect(editorWindow).toContain("LogAssetDragTrace");
-    expect(editorWindow).toContain("[Locus][UnityAssetDrag]");
     const externalDragBridge = read("locus_unity/Editor/LocusExternalAssetDragBridge.cs");
     const queueMethod = editorWindow.slice(
       editorWindow.indexOf("internal static bool QueueOutboundAssetDrag"),
       editorWindow.indexOf('[MenuItem("Assets/Send to Locus"', editorWindow.indexOf("internal static bool QueueOutboundAssetDrag")),
     );
-    expect(queueMethod).toContain("LocusExternalAssetDragBridge.QueueAssetDrag(sanitized, traceId, out message)");
+    expect(queueMethod).toContain("LocusExternalAssetDragBridge.QueueAssetDrag(sanitized, out message)");
     expect(queueMethod).not.toContain("GetWindow<LocusEditorWindow>()");
     expect(queueMethod).not.toContain("window.Show()");
     expect(externalDragBridge).toContain('typeof(GUIUtility).GetField("beforeEventProcessed"');
@@ -560,18 +556,17 @@ describe("Unity embedded session view", () => {
     expect(editorWindow).toContain("HashSet<DroppedAssetRefKey>");
     expect(externalDragBridge).toContain("internal static bool QueueAssetDrag");
     expect(externalDragBridge).toContain("EventType.MouseDrag");
-    expect(externalDragBridge).toContain("StartQueuedDrag(\"");
-    expect(externalDragBridge).toContain("ApplyArmedDragPayload(\"");
-    expect(externalDragBridge).toContain("HandleHierarchyChanged");
-    expect(externalDragBridge).toContain("unity_hierarchy_changed_after_drag_perform");
+    expect(externalDragBridge).toContain("StartQueuedDrag()");
+    expect(externalDragBridge).toContain("ApplyArmedDragPayload()");
+    expect(externalDragBridge).toContain("PostPerformRepaintFrames");
+    expect(externalDragBridge).toContain("RepaintAfterDragPerformIfNeeded");
     expect(externalDragBridge).toContain("RepaintDropTargetWindowsAfterDragPerform");
     expect(externalDragBridge).toContain("SceneView.RepaintAll();");
     expect(externalDragBridge).toContain("EditorApplication.RepaintHierarchyWindow();");
     expect(externalDragBridge).toContain("DropTargetWindowKind");
-    expect(externalDragBridge).toContain("unity_repaint_after_drag_perform");
     expect(externalDragBridge).toContain("RepaintAfterInstanceDetectedIfNeeded");
     expect(externalDragBridge).toContain("IsSceneInstanceObject");
-    expect(externalDragBridge).toContain("unity_repaint_after_instance_detected");
+    expect(externalDragBridge).toContain("SnapshotObjectArray");
     expect(externalDragBridge).toContain("DragAndDrop.PrepareStartDrag();");
     expect(externalDragBridge).toContain("DragAndDrop.StartDrag(title)");
     expect(externalDragBridge).toContain("DragAndDrop.objectReferences = references;");

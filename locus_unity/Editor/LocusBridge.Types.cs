@@ -39,7 +39,6 @@ namespace Locus
         private class StartAssetDragRequest
         {
             public LocusEditorWindow.DroppedAssetRef[] refs;
-            public string traceId;
         }
 
         [Serializable]
