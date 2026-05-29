@@ -1172,6 +1172,7 @@ namespace Locus
                     if (request != null)
                     {
                         NormalizeStartAssetDragRefs(request.refs);
+                        request.traceId = LocusEditorWindow.NormalizeAssetDragTraceId(request.traceId);
                         return request;
                     }
                 }
@@ -1183,7 +1184,8 @@ namespace Locus
 
             return new StartAssetDragRequest
             {
-                refs = new LocusEditorWindow.DroppedAssetRef[0]
+                refs = new LocusEditorWindow.DroppedAssetRef[0],
+                traceId = "none"
             };
         }
 
@@ -1552,8 +1554,12 @@ namespace Locus
                         {
                             try
                             {
+                                LocusEditorWindow.LogAssetDragTrace(
+                                    request.traceId,
+                                    "unity_start_asset_drag_message_main",
+                                    "refs=" + (request.refs == null ? 0 : request.refs.Length));
                                 string status;
-                                if (LocusEditorWindow.QueueOutboundAssetDrag(request.refs, out status))
+                                if (LocusEditorWindow.QueueOutboundAssetDrag(request.refs, request.traceId, out status))
                                     tcs.SetResult(OkResponse(reqId, status));
                                 else
                                     tcs.SetResult(ErrorResponse(reqId, status));

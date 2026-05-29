@@ -1,4 +1,5 @@
 import {
+  cancelUnityEmbedAssetDrag,
   startLocusNativeFileDrag,
   setUnityEmbedDragPassthrough,
   startUnityEmbedAssetDrag,
@@ -10,8 +11,54 @@ import type { AssetRefAttachment } from "../types";
 const POINTER_DRAG_THRESHOLD_PX = 4;
 const DRAG_PASSTHROUGH_RESET_MS = 12000;
 const NATIVE_FILE_DRAG_RESTORE_MS = 12000;
+const UNITY_ASSET_REF_ROOT_RE = /^(?:Assets|Packages|ProjectSettings)(?:\/|$)/i;
 
 let passthroughResetTimer: number | null = null;
+
+interface UnityReferenceDragWarmup {
+  promise: Promise<boolean>;
+  committed: boolean;
+  traceId: string;
+  startedAtMs: number;
+}
+
+function normalizeUnityReferencePath(path: string): string {
+  return path.trim().replace(/\\/g, "/").replace(/\/+$/g, "");
+}
+
+function isUnityAssetRefPath(path: string): boolean {
+  return UNITY_ASSET_REF_ROOT_RE.test(normalizeUnityReferencePath(path));
+}
+
+function isUnityDragWarmupRef(ref: AssetRefAttachment): boolean {
+  if (ref.kind === "sceneObject") return true;
+  if (ref.kind !== "asset") return false;
+  return isUnityAssetRefPath(ref.path);
+}
+
+function shouldWarmupUnityDrag(refs: AssetRefAttachment[]): boolean {
+  return refs.length > 0 && refs.every(isUnityDragWarmupRef);
+}
+
+function nextUnityAssetDragTraceId(): string {
+  return `uad-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function unityAssetDragElapsedMs(startedAtMs: number): number {
+  return Math.round(performance.now() - startedAtMs);
+}
+
+function logUnityAssetDragTrace(
+  traceId: string,
+  phase: string,
+  startedAtMs: number,
+  detail = "",
+) {
+  const suffix = detail ? ` ${detail}` : "";
+  console.info(
+    `[Locus][UnityAssetDrag] trace=${traceId} phase=${phase} elapsedMs=${unityAssetDragElapsedMs(startedAtMs)}${suffix}`,
+  );
+}
 
 function scheduleDragPassthroughReset() {
   if (passthroughResetTimer !== null) {
@@ -23,30 +70,148 @@ function scheduleDragPassthroughReset() {
   }, DRAG_PASSTHROUGH_RESET_MS);
 }
 
-async function beginUnityReferencePointerDrag(refs: AssetRefAttachment[]) {
-  try {
-    await startUnityEmbedAssetDrag(refs);
-    await setUnityEmbedDragPassthrough(true);
-    scheduleDragPassthroughReset();
-  } catch (error) {
-    console.warn("[Locus] Failed to start Unity reference drag", error);
-    void setUnityEmbedDragPassthrough(false);
-  }
+function startUnityAssetDragWarmup(refs: AssetRefAttachment[]): UnityReferenceDragWarmup | null {
+  if (!shouldWarmupUnityDrag(refs)) return null;
+
+  const traceId = nextUnityAssetDragTraceId();
+  const startedAtMs = performance.now();
+  logUnityAssetDragTrace(traceId, "frontend_warmup_start", startedAtMs, `refs=${refs.length}`);
+
+  const promise = startUnityEmbedAssetDrag(refs, { traceId })
+    .then(() => {
+      logUnityAssetDragTrace(traceId, "frontend_warmup_ok", startedAtMs);
+      return true;
+    })
+    .catch((error) => {
+      logUnityAssetDragTrace(traceId, "frontend_warmup_failed", startedAtMs);
+      console.warn("[Locus] Failed to arm Unity asset drag", error);
+      return false;
+    });
+
+  return {
+    promise,
+    committed: false,
+    traceId,
+    startedAtMs,
+  };
 }
 
-async function beginNativeAssetFileDrag(refs: AssetRefAttachment[]) {
+function cancelUnityAssetDragWarmup(warmup: UnityReferenceDragWarmup | null) {
+  if (!warmup || warmup.committed) return;
+
+  logUnityAssetDragTrace(warmup.traceId, "frontend_warmup_cancel_requested", warmup.startedAtMs);
+  void warmup.promise.then((armed) => {
+    if (!armed || warmup.committed) return;
+    logUnityAssetDragTrace(warmup.traceId, "frontend_warmup_cancel_armed", warmup.startedAtMs);
+    void cancelUnityEmbedAssetDrag().catch((error) => {
+      console.warn("[Locus] Failed to cancel Unity reference drag", error);
+    });
+  });
+}
+
+async function beginUnityReferencePointerDrag(
+  refs: AssetRefAttachment[],
+  warmup?: UnityReferenceDragWarmup | null,
+) {
+  const activeWarmup = warmup ?? startUnityAssetDragWarmup(refs);
+  if (!activeWarmup) return;
+  activeWarmup.committed = true;
+
+  logUnityAssetDragTrace(activeWarmup.traceId, "frontend_embed_drag_threshold", activeWarmup.startedAtMs);
+  const armPromise = activeWarmup.promise;
+  const passthroughPromise = setUnityEmbedDragPassthrough(true)
+    .then(() => {
+      logUnityAssetDragTrace(
+        activeWarmup.traceId,
+        "frontend_passthrough_enabled",
+        activeWarmup.startedAtMs,
+      );
+      return true;
+    })
+    .catch((error) => {
+      logUnityAssetDragTrace(
+        activeWarmup.traceId,
+        "frontend_passthrough_failed",
+        activeWarmup.startedAtMs,
+      );
+      console.warn("[Locus] Failed to enable Unity drag passthrough", error);
+      return false;
+    });
+
+  const [armed, passthroughEnabled] = await Promise.all([armPromise, passthroughPromise]);
+  if (armed && passthroughEnabled) {
+    logUnityAssetDragTrace(activeWarmup.traceId, "frontend_embed_drag_ready", activeWarmup.startedAtMs);
+    scheduleDragPassthroughReset();
+    return;
+  }
+
+  if (armed) {
+    logUnityAssetDragTrace(
+      activeWarmup.traceId,
+      "frontend_embed_drag_cancel_after_failure",
+      activeWarmup.startedAtMs,
+    );
+    void cancelUnityEmbedAssetDrag().catch((error) => {
+      console.warn("[Locus] Failed to cancel Unity reference drag", error);
+    });
+  }
+  void setUnityEmbedDragPassthrough(false);
+}
+
+async function beginNativeAssetFileDrag(
+  refs: AssetRefAttachment[],
+  warmup?: UnityReferenceDragWarmup | null,
+) {
   const shouldResetPassthrough = isUnityEmbedWindow();
+  const activeWarmup = warmup ?? startUnityAssetDragWarmup(refs);
+  if (activeWarmup) {
+    activeWarmup.committed = true;
+    logUnityAssetDragTrace(activeWarmup.traceId, "frontend_native_drag_threshold", activeWarmup.startedAtMs);
+  }
+
+  const armPromise = activeWarmup?.promise ?? Promise.resolve(false);
+  let armed = false;
   try {
     if (shouldResetPassthrough) {
       await setUnityEmbedDragPassthrough(true);
     }
-    await startUnityEmbedAssetDrag(refs).catch((error) => {
-      console.warn("[Locus] Failed to arm Unity asset drag", error);
+    if (activeWarmup) {
+      logUnityAssetDragTrace(activeWarmup.traceId, "frontend_native_drag_start", activeWarmup.startedAtMs);
+    }
+    const nativeDragPromise = startUnityNativeAssetFileDrag(refs, {
+      traceId: activeWarmup?.traceId,
     });
-    await startUnityNativeAssetFileDrag(refs);
+    const [armResult, nativeDragResult] = await Promise.allSettled([armPromise, nativeDragPromise]);
+    armed = armResult.status === "fulfilled" && armResult.value;
+    if (activeWarmup) {
+      logUnityAssetDragTrace(
+        activeWarmup.traceId,
+        "frontend_native_drag_done",
+        activeWarmup.startedAtMs,
+        `armed=${armed}`,
+      );
+    }
+    if (nativeDragResult.status === "rejected") {
+      throw nativeDragResult.reason;
+    }
   } catch (error) {
+    if (activeWarmup) {
+      logUnityAssetDragTrace(activeWarmup.traceId, "frontend_native_drag_failed", activeWarmup.startedAtMs);
+    }
     console.warn("[Locus] Failed to start native asset file drag", error);
   } finally {
+    if (armed) {
+      if (activeWarmup) {
+        logUnityAssetDragTrace(
+          activeWarmup.traceId,
+          "frontend_native_drag_cancel_armed_payload",
+          activeWarmup.startedAtMs,
+        );
+      }
+      void cancelUnityEmbedAssetDrag().catch((error) => {
+        console.warn("[Locus] Failed to cancel Unity reference drag", error);
+      });
+    }
     if (shouldResetPassthrough) {
       void setUnityEmbedDragPassthrough(false);
     }
@@ -92,7 +257,7 @@ function isUnityEmbedWindow(): boolean {
 }
 
 function canStartNativeAssetFileDrag(refs: AssetRefAttachment[]): boolean {
-  return refs.every((ref) => ref.kind === "asset");
+  return refs.every((ref) => ref.kind === "asset" && isUnityAssetRefPath(ref.path));
 }
 
 function shouldStartNativeAssetFileDrag(refs: AssetRefAttachment[]): boolean {
@@ -120,7 +285,11 @@ export function armUnityReferencePointerDrag(event: PointerEvent, refs: AssetRef
   if (refs.length === 0 || event.button !== 0) return;
 
   const useNativeFileDrag = shouldStartNativeAssetFileDrag(refs);
-  const restoreHtmlDraggable = useNativeFileDrag ? suppressHtmlDraggable(event) : null;
+  const warmup = shouldWarmupUnityDrag(refs) ? startUnityAssetDragWarmup(refs) : null;
+  const shouldSuppressHtmlDrag = useNativeFileDrag || (isUnityEmbedWindow() && !!warmup);
+  const restoreHtmlDraggable = shouldSuppressHtmlDrag
+    ? suppressHtmlDraggable(event)
+    : null;
   const startX = event.clientX;
   const startY = event.clientY;
   let started = false;
@@ -152,8 +321,8 @@ export function armUnityReferencePointerDrag(event: PointerEvent, refs: AssetRef
     moveEvent.stopPropagation();
     cleanup(false);
     const drag = useNativeFileDrag
-      ? beginNativeAssetFileDrag(refs)
-      : beginUnityReferencePointerDrag(refs);
+      ? beginNativeAssetFileDrag(refs, warmup)
+      : beginUnityReferencePointerDrag(refs, warmup);
     const restoreTimer = restoreHtmlDraggable
       ? window.setTimeout(restoreHtmlDraggableOnce, NATIVE_FILE_DRAG_RESTORE_MS)
       : null;
@@ -166,6 +335,9 @@ export function armUnityReferencePointerDrag(event: PointerEvent, refs: AssetRef
   };
 
   const handlePointerEnd = () => {
+    if (!started) {
+      cancelUnityAssetDragWarmup(warmup);
+    }
     cleanup();
   };
 

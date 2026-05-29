@@ -8,7 +8,7 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     sync::{Arc, OnceLock},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
@@ -666,16 +666,57 @@ pub async fn open_scene_object_inspector(
     }
 }
 
-pub async fn start_asset_drag(project_path: &str, payload: &str) -> Result<(), String> {
+pub async fn start_asset_drag(
+    project_path: &str,
+    payload: &str,
+    trace_id: &str,
+) -> Result<(), String> {
+    let started_at = Instant::now();
+    log_unity_asset_drag_trace(
+        trace_id,
+        "bridge_start_asset_drag_lock_wait",
+        started_at,
+        "",
+    );
     let op_lock = project_unity_op_lock(project_path).await;
     let _guard = op_lock.lock().await;
+    log_unity_asset_drag_trace(
+        trace_id,
+        "bridge_start_asset_drag_lock_acquired",
+        started_at,
+        "",
+    );
+    log_unity_asset_drag_trace(
+        trace_id,
+        "bridge_start_asset_drag_pipe_send",
+        started_at,
+        "",
+    );
     let resp = send_message(project_path, "start_asset_drag", payload).await?;
     if resp.ok {
+        log_unity_asset_drag_trace(trace_id, "bridge_start_asset_drag_pipe_ok", started_at, "");
         Ok(())
     } else {
+        log_unity_asset_drag_trace(
+            trace_id,
+            "bridge_start_asset_drag_pipe_error",
+            started_at,
+            "",
+        );
         Err(resp
             .error
             .unwrap_or_else(|| "start_asset_drag failed".to_string()))
+    }
+}
+
+fn log_unity_asset_drag_trace(trace_id: &str, phase: &str, started_at: Instant, detail: &str) {
+    let elapsed_ms = started_at.elapsed().as_millis();
+    if detail.is_empty() {
+        eprintln!("[Locus][UnityAssetDrag] trace={trace_id} phase={phase} elapsedMs={elapsed_ms}");
+    } else {
+        eprintln!(
+            "[Locus][UnityAssetDrag] trace={trace_id} phase={phase} elapsedMs={elapsed_ms} {detail}"
+        );
     }
 }
 

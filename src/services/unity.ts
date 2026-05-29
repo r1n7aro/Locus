@@ -89,16 +89,42 @@ export function commitUnityEmbedAssetDrop(): Promise<void> {
   return runtime.invoke("unity_embed_commit_asset_drop");
 }
 
-export function startUnityEmbedAssetDrag(refs: AssetRefAttachment[]): Promise<void> {
-  const runtime = getLocusRuntime();
-  if (runtime.kind !== "tauri" || refs.length === 0) return Promise.resolve();
-  return runtime.invoke("unity_embed_start_asset_drag", { request: { refs } });
+export interface UnityAssetDragTraceOptions {
+  traceId?: string;
 }
 
-export function startUnityNativeAssetFileDrag(refs: AssetRefAttachment[]): Promise<void> {
+export function startUnityEmbedAssetDrag(
+  refs: AssetRefAttachment[],
+  options: UnityAssetDragTraceOptions = {},
+): Promise<void> {
   const runtime = getLocusRuntime();
   if (runtime.kind !== "tauri" || refs.length === 0) return Promise.resolve();
-  return runtime.invoke("unity_embed_start_native_asset_file_drag", { request: { refs } });
+  return runtime.invoke("unity_embed_start_asset_drag", {
+    request: {
+      refs,
+      traceId: options.traceId,
+    },
+  });
+}
+
+export function cancelUnityEmbedAssetDrag(): Promise<void> {
+  const runtime = getLocusRuntime();
+  if (runtime.kind !== "tauri") return Promise.resolve();
+  return runtime.invoke("unity_embed_cancel_asset_drag");
+}
+
+export function startUnityNativeAssetFileDrag(
+  refs: AssetRefAttachment[],
+  options: UnityAssetDragTraceOptions = {},
+): Promise<void> {
+  const runtime = getLocusRuntime();
+  if (runtime.kind !== "tauri" || refs.length === 0) return Promise.resolve();
+  return runtime.invoke("unity_embed_start_native_asset_file_drag", {
+    request: {
+      refs,
+      traceId: options.traceId,
+    },
+  });
 }
 
 export function startLocusNativeFileDrag(files: LocusFileDropRef[]): Promise<void> {

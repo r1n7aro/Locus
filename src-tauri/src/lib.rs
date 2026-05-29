@@ -1188,6 +1188,7 @@ pub fn run() {
             commands::unity_embed_focus_debug_snapshot,
             commands::unity_embed_commit_asset_drop,
             commands::unity_embed_start_asset_drag,
+            commands::unity_embed_cancel_asset_drag,
             commands::unity_embed_start_native_asset_file_drag,
             commands::locus_start_native_file_drag,
             commands::view_templates,

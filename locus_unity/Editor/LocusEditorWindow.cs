@@ -4,6 +4,7 @@ using UnityEditor;
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.IO.Pipes;
 using System.Reflection;
@@ -155,6 +156,40 @@ namespace Locus
             }
         }
 
+        internal static string NormalizeAssetDragTraceId(string traceId)
+        {
+            string raw = (traceId ?? "").Trim();
+            if (string.IsNullOrEmpty(raw))
+                return "none";
+
+            StringBuilder builder = new StringBuilder(Math.Min(raw.Length, 96));
+            for (int i = 0; i < raw.Length && builder.Length < 96; i++)
+            {
+                char ch = raw[i];
+                builder.Append(char.IsLetterOrDigit(ch) || ch == '-' || ch == '_' ? ch : '-');
+            }
+
+            return builder.Length == 0 ? "none" : builder.ToString();
+        }
+
+        internal static void LogAssetDragTrace(string traceId, string phase, string detail = "")
+        {
+            string safeTraceId = NormalizeAssetDragTraceId(traceId);
+            string safePhase = (phase ?? "").Trim().Replace(' ', '_');
+            if (string.IsNullOrEmpty(safePhase))
+                safePhase = "unknown";
+            string suffix = string.IsNullOrEmpty(detail)
+                ? ""
+                : " " + detail.Replace('\r', ' ').Replace('\n', ' ');
+            string unityMs = (EditorApplication.timeSinceStartup * 1000d)
+                .ToString("F1", CultureInfo.InvariantCulture);
+            UnityEngine.Debug.Log(
+                "[Locus][UnityAssetDrag] trace=" + safeTraceId +
+                " phase=" + safePhase +
+                " unityMs=" + unityMs +
+                suffix);
+        }
+
         [MenuItem("Window/Locus")]
         public static void OpenWindow()
         {
@@ -164,16 +199,34 @@ namespace Locus
             window.Show();
         }
 
-        internal static bool QueueOutboundAssetDrag(DroppedAssetRef[] assetRefs, out string message)
+        internal static bool QueueOutboundAssetDrag(
+            DroppedAssetRef[] assetRefs,
+            string traceId,
+            out string message)
         {
+            traceId = NormalizeAssetDragTraceId(traceId);
+            LogAssetDragTrace(
+                traceId,
+                "unity_queue_outbound_start",
+                "requestRefs=" + (assetRefs == null ? 0 : assetRefs.Length).ToString(CultureInfo.InvariantCulture));
+
             DroppedAssetRef[] sanitized = SanitizeOutboundAssetDragRefs(assetRefs);
             if (sanitized.Length == 0)
             {
                 message = "No supported Unity references were provided.";
+                LogAssetDragTrace(traceId, "unity_queue_outbound_no_refs");
                 return false;
             }
 
-            bool queued = LocusExternalAssetDragBridge.QueueAssetDrag(sanitized, out message);
+            LogAssetDragTrace(
+                traceId,
+                "unity_queue_outbound_sanitized",
+                "refs=" + sanitized.Length.ToString(CultureInfo.InvariantCulture));
+            bool queued = LocusExternalAssetDragBridge.QueueAssetDrag(sanitized, traceId, out message);
+            LogAssetDragTrace(
+                traceId,
+                queued ? "unity_queue_outbound_queued" : "unity_queue_outbound_failed",
+                "message=" + (message ?? ""));
             if (queued)
             {
                 foreach (LocusEditorWindow window in Resources.FindObjectsOfTypeAll<LocusEditorWindow>())
@@ -187,8 +240,9 @@ namespace Locus
             return queued;
         }
 
-        internal static void CancelOutboundAssetDrag()
+        internal static void CancelOutboundAssetDrag(string traceId = "")
         {
+            LogAssetDragTrace(traceId, "unity_cancel_outbound_requested");
             LocusExternalAssetDragBridge.CancelAssetDrag();
             foreach (LocusEditorWindow window in Resources.FindObjectsOfTypeAll<LocusEditorWindow>())
             {
