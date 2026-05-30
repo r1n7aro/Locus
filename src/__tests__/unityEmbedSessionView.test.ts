@@ -200,6 +200,14 @@ describe("Unity embedded session view", () => {
     expect(command).toContain("guard_enabled");
     expect(command).toContain("const USE_CHILD_EMBED_OVERLAY: bool = true;");
     expect(command).toContain("return position_popup_overlay(window, msg);");
+    expect(command).toContain("transient_unity_embed_parent_owner");
+    expect(command).toContain("position_transient_parent_overlay");
+    expect(command).toContain("position_popup_overlay_with_owner");
+    expect(command).toContain('hwnd_class(parent) != "UnityContainerWndClass"');
+    expect(command).toContain('title != "Locus" && title != expected_title');
+    expect(command).toContain("SetWindowLongPtrW(child, GWLP_HWNDPARENT, owner.0 as isize)");
+    expect(command).toContain("let reparent_from_popup = (current_style & WS_CHILD.0) == 0;");
+    expect(command).toContain("let needs_parent_update = current_parent != parent || reparent_from_popup;");
     expect(command).toContain("position_child_overlay");
     expect(command).toContain("ScreenToClient");
     expect(command).toContain("SetParent");

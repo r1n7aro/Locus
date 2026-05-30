@@ -2261,17 +2261,18 @@ mod windows_impl {
                 SHCreateStdEnumFmtEtc, SetWindowSubclass, DROPFILES, SHDRAGIMAGE,
             },
             WindowsAndMessaging::{
-                BringWindowToTop, CreateWindowExW, DestroyWindow, GetAncestor, GetCursorPos,
-                GetForegroundWindow, GetGUIThreadInfo, GetParent, GetTopWindow, GetWindow,
-                GetWindowLongPtrW, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId,
-                IsChild, IsIconic, IsWindow, IsWindowVisible, SetForegroundWindow, SetParent,
-                SetWindowLongPtrW, SetWindowPos, ShowWindow, UpdateLayeredWindow, WindowFromPoint,
-                GA_ROOT, GUITHREADINFO, GWLP_HWNDPARENT, GWL_EXSTYLE, GWL_STYLE, GW_CHILD,
-                GW_HWNDNEXT, HWND_TOP, MA_NOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
-                SWP_NOOWNERZORDER, SWP_NOSIZE, SW_HIDE, SW_SHOWNOACTIVATE, ULW_COLORKEY,
-                WM_MOUSEACTIVATE, WM_NCDESTROY, WS_CAPTION, WS_CHILD, WS_EX_LAYERED,
-                WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
-                WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_THICKFRAME,
+                BringWindowToTop, CreateWindowExW, DestroyWindow, GetAncestor, GetClassNameW,
+                GetCursorPos, GetForegroundWindow, GetGUIThreadInfo, GetParent, GetTopWindow,
+                GetWindow, GetWindowLongPtrW, GetWindowRect, GetWindowTextW,
+                GetWindowThreadProcessId, IsChild, IsIconic, IsWindow, IsWindowVisible,
+                SetForegroundWindow, SetParent, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+                UpdateLayeredWindow, WindowFromPoint, GA_ROOT, GUITHREADINFO, GWLP_HWNDPARENT,
+                GWL_EXSTYLE, GWL_STYLE, GW_CHILD, GW_HWNDNEXT, HWND_TOP, MA_NOACTIVATE,
+                SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE,
+                SW_HIDE, SW_SHOWNOACTIVATE, ULW_COLORKEY, WM_MOUSEACTIVATE, WM_NCDESTROY,
+                WS_CAPTION, WS_CHILD, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+                WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP,
+                WS_SYSMENU, WS_THICKFRAME,
             },
         },
     };
@@ -3871,6 +3872,20 @@ mod windows_impl {
         (style & WS_CHILD.0) != 0
     }
 
+    unsafe fn hwnd_class(hwnd: HWND) -> String {
+        if hwnd.0.is_null() {
+            return String::new();
+        }
+
+        let mut class_name = [0u16; 256];
+        let len = GetClassNameW(hwnd, &mut class_name);
+        if len <= 0 {
+            return String::new();
+        }
+
+        String::from_utf16_lossy(&class_name[..len as usize])
+    }
+
     unsafe fn hwnd_title(hwnd: HWND) -> String {
         if hwnd.0.is_null() {
             return String::new();
@@ -4232,6 +4247,11 @@ mod windows_impl {
             return position_popup_overlay(window, msg);
         }
 
+        if let Some(stable_owner) = transient_unity_embed_parent_owner(msg) {
+            set_activation_guard_enabled(Some(window), true)?;
+            return position_transient_parent_overlay(window, msg, stable_owner);
+        }
+
         match position_child_overlay(window, msg) {
             Ok(()) => {
                 remove_popup_sync_for_window(window);
@@ -4277,9 +4297,10 @@ mod windows_impl {
                 | WS_MAXIMIZEBOX.0
                 | WS_SYSMENU.0;
             let next_style = (current_style & !frame_style_mask) | WS_CHILD.0;
+            let reparent_from_popup = (current_style & WS_CHILD.0) == 0;
             let needs_style_update = next_style != current_style;
             let current_parent = GetParent(child).unwrap_or(HWND(std::ptr::null_mut()));
-            let needs_parent_update = current_parent != parent;
+            let needs_parent_update = current_parent != parent || reparent_from_popup;
 
             if needs_style_update {
                 SetWindowLongPtrW(child, GWL_STYLE, next_style as isize);
@@ -4320,9 +4341,61 @@ mod windows_impl {
         Ok(())
     }
 
+    fn transient_unity_embed_parent_owner(msg: &UnityEmbedControlMessage) -> Option<HWND> {
+        let parent = HWND(msg.parent_hwnd as isize as *mut std::ffi::c_void);
+        unsafe {
+            if !IsWindow(Some(parent)).as_bool() {
+                return None;
+            }
+
+            let parent_parent = GetParent(parent).unwrap_or(HWND(std::ptr::null_mut()));
+            if parent_parent.0.is_null() {
+                return None;
+            }
+
+            if hwnd_class(parent) != "UnityContainerWndClass" {
+                return None;
+            }
+
+            let title = hwnd_title(parent);
+            let expected_title = unity_embed_window_title(msg);
+            if title != "Locus" && title != expected_title {
+                return None;
+            }
+
+            let root = GetAncestor(parent, GA_ROOT);
+            let owner = if !root.0.is_null() && root != parent {
+                root
+            } else {
+                parent_parent
+            };
+            if owner.0.is_null() || owner == parent {
+                return None;
+            }
+
+            Some(owner)
+        }
+    }
+
+    fn position_transient_parent_overlay(
+        window: &tauri::WebviewWindow,
+        msg: &UnityEmbedControlMessage,
+        stable_owner: HWND,
+    ) -> Result<(), String> {
+        position_popup_overlay_with_owner(window, msg, Some(stable_owner))
+    }
+
     fn position_popup_overlay(
         window: &tauri::WebviewWindow,
         msg: &UnityEmbedControlMessage,
+    ) -> Result<(), String> {
+        position_popup_overlay_with_owner(window, msg, None)
+    }
+
+    fn position_popup_overlay_with_owner(
+        window: &tauri::WebviewWindow,
+        msg: &UnityEmbedControlMessage,
+        owner_override: Option<HWND>,
     ) -> Result<(), String> {
         let child = window
             .hwnd()
@@ -4331,6 +4404,7 @@ mod windows_impl {
         record_child_hwnd(child_hwnd);
         let parent_hwnd = msg.parent_hwnd;
         let parent = HWND(parent_hwnd as isize as *mut std::ffi::c_void);
+        let owner = owner_override.unwrap_or(parent);
         let (x, y, width, height) = normalized_rect(msg);
         let width_i32 = width as i32;
         let height_i32 = height as i32;
@@ -4367,7 +4441,7 @@ mod windows_impl {
             if needs_style_update || needs_owner_update {
                 let next_style = (current_style & !frame_style_mask) | WS_POPUP.0;
                 SetWindowLongPtrW(child, GWL_STYLE, next_style as isize);
-                SetWindowLongPtrW(child, GWLP_HWNDPARENT, parent.0 as isize);
+                SetWindowLongPtrW(child, GWLP_HWNDPARENT, owner.0 as isize);
             }
 
             let flags = if needs_style_update || needs_owner_update {
