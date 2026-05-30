@@ -174,6 +174,27 @@ fn knowledge_undo_sync_plan(files: &[ChangedFile]) -> KnowledgeUndoSyncPlan {
     }
 }
 
+fn normalized_workspace_path(path: &str) -> String {
+    path.trim()
+        .replace('\\', "/")
+        .trim_matches('/')
+        .to_ascii_lowercase()
+}
+
+fn is_workspace_view_path(path: &str) -> bool {
+    let normalized = normalized_workspace_path(path);
+    let view_root = crate::view::VIEW_ROOT_RELATIVE.to_ascii_lowercase();
+    normalized == view_root || normalized.starts_with(&format!("{view_root}/"))
+}
+
+fn undo_touches_view_tree(files: &[ChangedFile]) -> bool {
+    files.iter().any(|file| {
+        std::iter::once(file.path.as_str())
+            .chain(file.old_path.as_deref())
+            .any(is_workspace_view_path)
+    })
+}
+
 async fn sync_knowledge_after_undo(
     app_handle: &AppHandle,
     working_dir: &str,
@@ -284,6 +305,12 @@ pub async fn undo_perform(
     )
     .await;
 
+    if undo_touches_view_tree(&result.restored_files) {
+        crate::view::emit_view_tree_changed(&app_handle);
+    }
+
+    super::emit_session_content_changed(&app_handle, &working_dir, &session_id, "undo_perform");
+
     Ok(result.entry)
 }
 
@@ -339,6 +366,17 @@ pub async fn undo_perform_to_message(
     )
     .await;
 
+    if undo_touches_view_tree(&result.restored_files) {
+        crate::view::emit_view_tree_changed(&app_handle);
+    }
+
+    super::emit_session_content_changed(
+        &app_handle,
+        &working_dir,
+        &session_id,
+        "undo_perform_to_message",
+    );
+
     Ok(result.entry)
 }
 
@@ -379,7 +417,7 @@ pub async fn undo_check_conflicts(
 
 #[cfg(test)]
 mod tests {
-    use super::{knowledge_undo_sync_plan, KnowledgeUndoSyncPlan};
+    use super::{knowledge_undo_sync_plan, undo_touches_view_tree, KnowledgeUndoSyncPlan};
     use crate::knowledge_store::KnowledgeType;
     use crate::vcs::undo::ChangedFile;
 
@@ -454,5 +492,31 @@ mod tests {
             knowledge_undo_sync_plan(&[changed("src/main.rs")]),
             KnowledgeUndoSyncPlan::None
         );
+    }
+
+    #[test]
+    fn undo_touches_view_tree_detects_view_paths() {
+        assert!(undo_touches_view_tree(&[changed(
+            "Locus/View/ProjectName/player-tool/view.json"
+        )]));
+        assert!(undo_touches_view_tree(&[changed(
+            "locus\\view\\ProjectName\\player-tool\\src\\App.vue"
+        )]));
+        assert!(undo_touches_view_tree(&[changed("Locus/View")]));
+    }
+
+    #[test]
+    fn undo_touches_view_tree_detects_renamed_old_view_path() {
+        assert!(undo_touches_view_tree(&[renamed(
+            "Locus/View/ProjectName/player-tool/view.json",
+            "Assets/player-tool-view.json"
+        )]));
+    }
+
+    #[test]
+    fn undo_touches_view_tree_ignores_adjacent_paths() {
+        assert!(!undo_touches_view_tree(&[changed("Locus/Viewer/tool.json")]));
+        assert!(!undo_touches_view_tree(&[changed("Assets/Locus/View/tool.json")]));
+        assert!(!undo_touches_view_tree(&[changed("src/main.rs")]));
     }
 }

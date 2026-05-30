@@ -19,8 +19,47 @@ mod view;
 mod workspace;
 
 use serde::{Deserialize, Serialize};
+use tauri::{AppHandle, Emitter};
 
 use crate::error::AppError;
+
+pub const SESSION_CONTENT_CHANGED_EVENT: &str = "session-content-changed";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionContentChangedEvent {
+    pub working_dir: String,
+    pub session_id: String,
+    pub source: String,
+    pub changed_at: i64,
+}
+
+fn unix_time_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+
+pub fn emit_session_content_changed(
+    app_handle: &AppHandle,
+    working_dir: &str,
+    session_id: &str,
+    source: &str,
+) {
+    let event = SessionContentChangedEvent {
+        working_dir: working_dir.to_string(),
+        session_id: session_id.to_string(),
+        source: source.to_string(),
+        changed_at: unix_time_millis(),
+    };
+    if let Err(error) = app_handle.emit(SESSION_CONTENT_CHANGED_EVENT, event) {
+        eprintln!(
+            "[Locus] failed to emit session content changed event for session {}: {}",
+            session_id, error
+        );
+    }
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]

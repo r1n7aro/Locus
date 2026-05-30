@@ -265,6 +265,18 @@ export interface ActiveSessionSelectionChanged {
   sessionId: string | null;
 }
 
+export interface SessionContentChangedEvent {
+  workingDir: string;
+  sessionId: string;
+  source:
+    | "undo_perform"
+    | "undo_perform_to_message"
+    | "undo_latest_conversation_turn"
+    | "rollback_session_to_message"
+    | string;
+  changedAt: number;
+}
+
 export interface SaveRawContextRequest {
   sessionId: string;
   includeSystemPrompt: boolean;

@@ -1471,8 +1471,11 @@ pub async fn load_session(
 #[tauri::command]
 pub async fn undo_latest_conversation_turn(
     session_id: String,
+    app_handle: AppHandle,
+    workspace: State<'_, Arc<Workspace>>,
     store: State<'_, Arc<SessionStore>>,
 ) -> Result<SessionDetail, AppError> {
+    let working_dir = workspace.path.read().await.clone();
     let deleted = store
         .truncate_latest_conversation_turn(&session_id)
         .map_err(AppError::from)?;
@@ -1484,20 +1487,37 @@ pub async fn undo_latest_conversation_turn(
         .operation("undo"));
     }
     crate::llm::codex::reset_cached_session_window(&session_id).await;
-    store.load_session(&session_id).map_err(Into::into)
+    let detail = store.load_session(&session_id).map_err(AppError::from)?;
+    super::emit_session_content_changed(
+        &app_handle,
+        &working_dir,
+        &session_id,
+        "undo_latest_conversation_turn",
+    );
+    Ok(detail)
 }
 
 #[tauri::command]
 pub async fn rollback_session_to_message(
     session_id: String,
     message_id: String,
+    app_handle: AppHandle,
+    workspace: State<'_, Arc<Workspace>>,
     store: State<'_, Arc<SessionStore>>,
 ) -> Result<SessionDetail, AppError> {
+    let working_dir = workspace.path.read().await.clone();
     store
         .truncate_after_message(&session_id, &message_id)
         .map_err(AppError::from)?;
     crate::llm::codex::reset_cached_session_window(&session_id).await;
-    store.load_session(&session_id).map_err(Into::into)
+    let detail = store.load_session(&session_id).map_err(AppError::from)?;
+    super::emit_session_content_changed(
+        &app_handle,
+        &working_dir,
+        &session_id,
+        "rollback_session_to_message",
+    );
+    Ok(detail)
 }
 
 #[tauri::command]

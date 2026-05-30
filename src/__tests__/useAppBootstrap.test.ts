@@ -205,6 +205,7 @@ describe("useAppBootstrap onboarding completion", () => {
       refreshSessions: vi.fn().mockResolvedValue(undefined),
       loadToolPermissionMode: vi.fn().mockResolvedValue(undefined),
       handleStreamEvent: vi.fn().mockReturnValue(true),
+      refreshSessionAfterExternalChange: vi.fn().mockResolvedValue(undefined),
       cleanupAnim: vi.fn(),
     });
 
@@ -490,6 +491,49 @@ describe("useAppBootstrap onboarding completion", () => {
       },
     });
     expect(loadSkillsMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("refreshes the active session when session content changes in the current workspace", async () => {
+    projectStoreMock.workingDir = "F:/Project";
+    const eventModule = await import("@tauri-apps/api/event");
+    const listenMock = eventModule.listen as unknown as ReturnType<typeof vi.fn>;
+    const handlers = new Map<string, (event: { payload: any }) => void>();
+
+    listenMock.mockImplementation(
+      async (name: string, handler: (event: { payload: any }) => void) => {
+        handlers.set(name, handler);
+        return vi.fn();
+      },
+    );
+
+    const useAppBootstrap = await loadUseAppBootstrap();
+    const { registerListeners } = useAppBootstrap();
+    await registerListeners();
+
+    const sessionChangedHandler = handlers.get("session-content-changed");
+    expect(sessionChangedHandler).toBeTypeOf("function");
+
+    sessionChangedHandler?.({
+      payload: {
+        workingDir: "F:/Project",
+        sessionId: "session-1",
+        source: "undo_perform",
+        changedAt: 1,
+      },
+    });
+
+    expect(chatStoreMock.refreshSessionAfterExternalChange).toHaveBeenCalledWith("session-1");
+
+    sessionChangedHandler?.({
+      payload: {
+        workingDir: "F:/Other",
+        sessionId: "session-2",
+        source: "undo_perform",
+        changedAt: 2,
+      },
+    });
+
+    expect(chatStoreMock.refreshSessionAfterExternalChange).toHaveBeenCalledTimes(1);
   });
 
   it("dispatches system notifications only after the chat store accepts a stream event", async () => {

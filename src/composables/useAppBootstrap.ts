@@ -42,6 +42,7 @@ import type {
   AppErrorPayload,
   LexicalRebuildStatus,
   KnowledgeChangedEvent,
+  SessionContentChangedEvent,
 } from "../types";
 import { filterVisibleProviders } from "../config/providerVisibility";
 import { t } from "../i18n";
@@ -105,6 +106,7 @@ export function useAppBootstrap() {
   let unlistenAppError: RuntimeUnsubscribe | null = null;
   let unlistenLexicalRebuildStatus: RuntimeUnsubscribe | null = null;
   let unlistenKnowledgeChanged: RuntimeUnsubscribe | null = null;
+  let unlistenSessionContentChanged: RuntimeUnsubscribe | null = null;
   let lastAutoOpenedLexicalProgressRun = "";
 
   // -- Cross-domain watchers --
@@ -124,13 +126,19 @@ export function useAppBootstrap() {
     modelStore.applyContextEffort(agent?.defaultEffort ?? "none");
   }
 
-  function normalizeKnowledgeEventWorkspace(path: string | null | undefined): string {
+  function normalizeWorkspacePath(path: string | null | undefined): string {
     return (path ?? "").trim().replace(/\\/g, "/").replace(/\/+$/g, "").toLowerCase();
   }
 
   function knowledgeChangeBelongsToCurrentWorkspace(change: KnowledgeChangedEvent): boolean {
-    const eventWorkspace = normalizeKnowledgeEventWorkspace(change.workingDir);
-    const currentWorkspace = normalizeKnowledgeEventWorkspace(projectStore.workingDir);
+    const eventWorkspace = normalizeWorkspacePath(change.workingDir);
+    const currentWorkspace = normalizeWorkspacePath(projectStore.workingDir);
+    return !!eventWorkspace && eventWorkspace === currentWorkspace;
+  }
+
+  function sessionContentChangeBelongsToCurrentWorkspace(change: SessionContentChangedEvent): boolean {
+    const eventWorkspace = normalizeWorkspacePath(change.workingDir);
+    const currentWorkspace = normalizeWorkspacePath(projectStore.workingDir);
     return !!eventWorkspace && eventWorkspace === currentWorkspace;
   }
 
@@ -155,6 +163,11 @@ export function useAppBootstrap() {
     if (!knowledgeChangeBelongsToCurrentWorkspace(change)) return;
     if (!knowledgeChangeMayAffectSkills(change)) return;
     void loadSkills();
+  }
+
+  function handleSessionContentChanged(change: SessionContentChangedEvent) {
+    if (!sessionContentChangeBelongsToCurrentWorkspace(change)) return;
+    void chatStore.refreshSessionAfterExternalChange(change.sessionId);
   }
 
   // active session/agent selection -> current effort, preserving the user's saved default.
@@ -485,6 +498,10 @@ export function useAppBootstrap() {
       "knowledge-changed",
       handleKnowledgeChanged,
     );
+    unlistenSessionContentChanged = await runtime.subscribe<SessionContentChangedEvent>(
+      "session-content-changed",
+      handleSessionContentChanged,
+    );
     markStartupPhase("register_listeners_subscriptions_ready");
 
     // Initial Unity/AssetDb state
@@ -507,6 +524,7 @@ export function useAppBootstrap() {
     unlistenAppError?.();
     unlistenLexicalRebuildStatus?.();
     unlistenKnowledgeChanged?.();
+    unlistenSessionContentChanged?.();
     lastAutoOpenedLexicalProgressRun = "";
     resetSystemNotificationState();
     uiStore.cleanup();

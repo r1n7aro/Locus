@@ -2463,6 +2463,14 @@ export const useChatStore = defineStore("chat", () => {
     }
   }
 
+  async function refreshSessionAfterExternalChange(sessionId: string): Promise<void> {
+    if (!sessionId) return;
+    await refreshSessions();
+    if (activeSessionId.value !== sessionId) return;
+    useChatChangesStore().closeInlineDiff();
+    await loadSessionState(sessionId);
+  }
+
   async function checkUndoConflicts(assistantMessageId: string): Promise<UndoConflictInfo[]> {
     if (!activeSessionId.value) return [];
     return undoService.undoCheckConflicts(activeSessionId.value, assistantMessageId);
@@ -2482,7 +2490,7 @@ export const useChatStore = defineStore("chat", () => {
       // loadChanges returns undo entries, so we reuse it instead of calling undoList twice
       const [detail, undoEntries] = await Promise.all([
         sessionService.loadSession(activeSessionId.value),
-        useChatChangesStore().loadChanges(activeSessionId.value),
+        useChatChangesStore().loadChanges(activeSessionId.value, { allowAutoOpen: false }),
       ]);
       useChatChangesStore().setLatestCompletedRunId(
         activeSessionId.value,
@@ -2673,6 +2681,7 @@ export const useChatStore = defineStore("chat", () => {
     answerAllToolConfirms,
     ignoreKnowledgeProposal,
     applyKnowledgeProposal,
+    refreshSessionAfterExternalChange,
     checkUndoConflicts,
     performUndo,
     rollbackToMessage,
