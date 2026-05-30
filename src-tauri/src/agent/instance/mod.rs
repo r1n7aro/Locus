@@ -15,7 +15,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use tauri::{AppHandle, Manager};
@@ -34,6 +34,8 @@ use crate::session::models::{
 };
 use crate::session::store::SessionStore;
 use crate::tool::{ToolExecutionContext, ToolLoadMode, ToolRegistry, ToolResult, ToolRuntimeState};
+
+const KNOWLEDGE_QUERY_TOOL_TIMEOUT: Duration = Duration::from_secs(45);
 
 use backend::{
     is_prompt_too_long_error, is_retryable_llm_error, model_context_limit, normalize_tool_args,
@@ -7549,7 +7551,7 @@ impl AgentInstance {
 
                 let needs_undo = prepared
                     .iter()
-                    .any(|(tc, _)| Self::needs_undo_tracking(&tc.name));
+                    .any(|(tc, args)| self.tool_call_needs_undo_tracking(&tc.name, args));
                 let has_unity_execute = prepared
                     .iter()
                     .any(|(tc, _)| tc.name == "unity_execute" || tc.name == "unity_run_states");
@@ -7802,6 +7804,14 @@ impl AgentInstance {
                             .await;
                         match recorded {
                             Ok(true) => {
+                                if let Some(entry) = undo_mgr
+                                    .find_entry(&self.session_id, &assistant_msg_id)
+                                    .await
+                                {
+                                    if Self::changed_files_touch_view_tree(&entry.changed_files) {
+                                        crate::view::emit_view_tree_changed(app_handle);
+                                    }
+                                }
                                 eprintln!(
                                     "[Agent {}] emitting UndoAvailable for session {} run {} message {}",
                                     self.id, self.session_id, run_id, assistant_msg_id
@@ -8193,12 +8203,56 @@ impl AgentInstance {
                 | "write"
                 | "edit"
                 | "bash"
+                | "view_create"
                 | "knowledge_create"
                 | "knowledge_edit"
                 | "knowledge_move"
                 | "knowledge_delete"
                 | "skill_create"
         )
+    }
+
+    fn tool_call_needs_undo_tracking(&self, name: &str, args: &serde_json::Value) -> bool {
+        if Self::needs_undo_tracking(name) {
+            return true;
+        }
+        if name != "tool_call" {
+            return false;
+        }
+
+        let Some(target_name) = args
+            .get("toolName")
+            .or_else(|| args.get("tool_name"))
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return false;
+        };
+
+        let canonical = self
+            .tool_registry
+            .canonical_name(target_name)
+            .unwrap_or_else(|| target_name.to_ascii_lowercase());
+        Self::needs_undo_tracking(&canonical)
+    }
+
+    fn workspace_path_touches_view_tree(path: &str) -> bool {
+        let normalized = path
+            .trim()
+            .replace('\\', "/")
+            .trim_matches('/')
+            .to_ascii_lowercase();
+        let view_root = crate::view::VIEW_ROOT_RELATIVE.to_ascii_lowercase();
+        normalized == view_root || normalized.starts_with(&format!("{view_root}/"))
+    }
+
+    fn changed_files_touch_view_tree(files: &[crate::vcs::undo::ChangedFile]) -> bool {
+        files.iter().any(|file| {
+            std::iter::once(file.path.as_str())
+                .chain(file.old_path.as_deref())
+                .any(Self::workspace_path_touches_view_tree)
+        })
     }
 
     fn default_tool_requires_confirm(name: &str) -> bool {
@@ -9365,30 +9419,40 @@ impl AgentInstance {
         let progress_tool_call_id = tool_call_id.to_string();
         let progress_run_id = run_id.to_string();
 
-        match crate::knowledge_index::query_documents_with_progress(
-            &self.working_dir,
-            self.app_knowledge_dir.as_ref().as_ref(),
-            lexical_query.as_deref(),
-            semantic_query.as_deref(),
-            parsed_types.as_deref(),
-            normalized_prefix.as_deref(),
-            parsed.limit.unwrap_or(5).min(20),
-            knowledge_index_state,
-            move |progress| {
-                emit_tool_progress(
-                    &progress_handle,
-                    &progress_run_id,
-                    &progress_session_id,
-                    &progress_tool_call_id,
-                    progress.title,
-                    progress.info,
-                    progress.progress,
-                    "running",
-                );
-            },
+        let query_result = tokio::time::timeout(
+            KNOWLEDGE_QUERY_TOOL_TIMEOUT,
+            crate::knowledge_index::query_documents_with_progress(
+                &self.working_dir,
+                self.app_knowledge_dir.as_ref().as_ref(),
+                lexical_query.as_deref(),
+                semantic_query.as_deref(),
+                parsed_types.as_deref(),
+                normalized_prefix.as_deref(),
+                parsed.limit.unwrap_or(5).min(20),
+                knowledge_index_state,
+                move |progress| {
+                    emit_tool_progress(
+                        &progress_handle,
+                        &progress_run_id,
+                        &progress_session_id,
+                        &progress_tool_call_id,
+                        progress.title,
+                        progress.info,
+                        progress.progress,
+                        "running",
+                    );
+                },
+            ),
         )
         .await
-        {
+        .unwrap_or_else(|_| {
+            Err(format!(
+                "knowledge_query timed out after {}ms",
+                KNOWLEDGE_QUERY_TOOL_TIMEOUT.as_millis()
+            ))
+        });
+
+        match query_result {
             Ok(mut items) => {
                 emit_tool_progress(
                     app_handle,
@@ -9408,13 +9472,18 @@ impl AgentInstance {
                 }
             }
             Err(error) => {
+                let failed_title = if error.contains("timed out") {
+                    "Knowledge query timed out"
+                } else {
+                    "Knowledge query failed"
+                };
                 emit_tool_progress(
                     app_handle,
                     run_id,
                     &self.session_id,
                     tool_call_id,
-                    "Knowledge query failed",
-                    "",
+                    failed_title,
+                    error.clone(),
                     None,
                     "error",
                 );
@@ -12877,12 +12946,65 @@ mod tests {
         assert!(AgentInstance::needs_undo_tracking("write"));
         assert!(AgentInstance::needs_undo_tracking("edit"));
         assert!(AgentInstance::needs_undo_tracking("unity_execute"));
+        assert!(AgentInstance::needs_undo_tracking("view_create"));
         assert!(AgentInstance::needs_undo_tracking("knowledge_create"));
         assert!(AgentInstance::needs_undo_tracking("knowledge_edit"));
         assert!(AgentInstance::needs_undo_tracking("knowledge_move"));
         assert!(AgentInstance::needs_undo_tracking("knowledge_delete"));
         assert!(!AgentInstance::needs_undo_tracking("read"));
         assert!(!AgentInstance::needs_undo_tracking("grep"));
+    }
+
+    #[test]
+    fn needs_undo_tracking_follows_meta_tool_call_target() {
+        let agent = test_agent_instance_with_tools_and_mode(
+            String::new(),
+            vec!["view_create".to_string(), "view_list".to_string()],
+            KnowledgeAccessMode::Full,
+        );
+
+        assert!(agent.tool_call_needs_undo_tracking(
+            "tool_call",
+            &json!({
+                "toolName": "view_create",
+                "arguments": {}
+            })
+        ));
+        assert!(!agent.tool_call_needs_undo_tracking(
+            "tool_call",
+            &json!({
+                "toolName": "view_list",
+                "arguments": {}
+            })
+        ));
+    }
+
+    #[test]
+    fn changed_files_touch_view_tree_detects_agent_file_tool_changes() {
+        let changed = |path: &str| crate::vcs::undo::ChangedFile {
+            status: "D".to_string(),
+            path: path.to_string(),
+            old_path: None,
+        };
+        let renamed = |old_path: &str, path: &str| crate::vcs::undo::ChangedFile {
+            status: "R".to_string(),
+            path: path.to_string(),
+            old_path: Some(old_path.to_string()),
+        };
+
+        assert!(AgentInstance::changed_files_touch_view_tree(&[changed(
+            "Locus/View/LocusTest3/player-skill-equip-tool/view.json"
+        )]));
+        assert!(AgentInstance::changed_files_touch_view_tree(&[changed(
+            "locus\\view\\LocusTest3\\player-skill-equip-tool\\src\\App.vue"
+        )]));
+        assert!(AgentInstance::changed_files_touch_view_tree(&[renamed(
+            "Locus/View/LocusTest3/player-skill-equip-tool/view.json",
+            "Assets/player-skill-equip-tool.json"
+        )]));
+        assert!(!AgentInstance::changed_files_touch_view_tree(&[changed(
+            "Locus/Viewer/player-skill-equip-tool/view.json"
+        )]));
     }
 
     #[test]

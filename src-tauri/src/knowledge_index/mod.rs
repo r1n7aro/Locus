@@ -52,6 +52,8 @@ const UNITY_IMPORT_BULK_MAX_DOCS_PER_COMMIT: usize = 1024;
 const UNITY_IMPORT_BULK_MAX_CHUNKS_PER_COMMIT: usize = 8192;
 const KNOWLEDGE_RUNTIME_LOCK_RETRY_ATTEMPTS: usize = 20;
 const KNOWLEDGE_RUNTIME_LOCK_RETRY_DELAY_MS: u64 = 50;
+const KNOWLEDGE_QUERY_TEXT_SCAN_TIMEOUT: Duration = Duration::from_secs(30);
+const TEXT_SCAN_PROGRESS_EMIT_DOC_INTERVAL: usize = 32;
 pub const KNOWLEDGE_LEXICAL_REBUILD_STATUS_EVENT: &str = "knowledge-lexical-rebuild-status";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3343,6 +3345,36 @@ pub async fn query_documents_with_progress<F>(
     path_prefix: Option<&str>,
     limit: usize,
     state: Arc<KnowledgeIndexState>,
+    on_progress: F,
+) -> Result<Vec<KnowledgeSearchHit>, String>
+where
+    F: FnMut(KnowledgeQueryProgress) + Send,
+{
+    query_documents_with_progress_with_timeout(
+        working_dir,
+        app_knowledge_dir,
+        lexical_query,
+        semantic_query,
+        types,
+        path_prefix,
+        limit,
+        state,
+        KNOWLEDGE_QUERY_TEXT_SCAN_TIMEOUT,
+        on_progress,
+    )
+    .await
+}
+
+async fn query_documents_with_progress_with_timeout<F>(
+    working_dir: &str,
+    app_knowledge_dir: Option<&std::path::PathBuf>,
+    lexical_query: Option<&str>,
+    semantic_query: Option<&str>,
+    types: Option<&[KnowledgeType]>,
+    path_prefix: Option<&str>,
+    limit: usize,
+    state: Arc<KnowledgeIndexState>,
+    text_scan_timeout: Duration,
     mut on_progress: F,
 ) -> Result<Vec<KnowledgeSearchHit>, String>
 where
@@ -3402,14 +3434,17 @@ where
                 0.28,
             );
             (
-                text_scan_search_documents(
+                text_scan_search_documents_with_progress(
                     working_dir,
                     app_knowledge_dir,
                     value,
                     types,
                     path_prefix,
                     query_limit * 6,
-                )?,
+                    text_scan_timeout,
+                    &mut on_progress,
+                )
+                .await?,
                 Some(KeywordSearchKind::TextScan),
             )
         }
@@ -4601,22 +4636,163 @@ fn lexical_index_search_documents(
     }
 }
 
-fn text_scan_search_documents(
+#[derive(Clone)]
+struct TextScanDeadline {
+    started_at: Instant,
+    timeout: Duration,
+    cancel_requested: Arc<AtomicBool>,
+}
+
+impl TextScanDeadline {
+    fn new(timeout: Duration, cancel_requested: Arc<AtomicBool>) -> Self {
+        Self {
+            started_at: Instant::now(),
+            timeout,
+            cancel_requested,
+        }
+    }
+
+    fn check(&self, stage: &str) -> Result<(), String> {
+        if self.cancel_requested.load(Ordering::Relaxed)
+            || self.started_at.elapsed() >= self.timeout
+        {
+            return Err(text_scan_timeout_error(self.timeout, stage));
+        }
+        Ok(())
+    }
+}
+
+fn text_scan_timeout_error(timeout: Duration, stage: &str) -> String {
+    format!(
+        "knowledge_query text scan timed out after {}ms while {}",
+        timeout.as_millis(),
+        stage
+    )
+}
+
+fn text_scan_progress(start: f32, end: f32, processed: usize, total: usize) -> f32 {
+    if total == 0 {
+        return end;
+    }
+    let ratio = processed.min(total) as f32 / total as f32;
+    start + ((end - start) * ratio)
+}
+
+async fn text_scan_search_documents_with_progress<F>(
     working_dir: &str,
     app_knowledge_dir: Option<&std::path::PathBuf>,
     query: &str,
     types: Option<&[KnowledgeType]>,
     path_prefix: Option<&str>,
     limit: usize,
-) -> Result<Vec<LexicalHit>, String> {
+    text_scan_timeout: Duration,
+    on_progress: &mut F,
+) -> Result<Vec<LexicalHit>, String>
+where
+    F: FnMut(KnowledgeQueryProgress) + Send,
+{
+    if text_scan_timeout.is_zero() {
+        on_progress(KnowledgeQueryProgress::new(
+            "Text scan timed out",
+            "timeout: 0ms",
+            Some(0.44),
+        ));
+        return Err(text_scan_timeout_error(
+            text_scan_timeout,
+            "starting text scan",
+        ));
+    }
+
+    let (progress_tx, mut progress_rx) =
+        tokio::sync::mpsc::unbounded_channel::<KnowledgeQueryProgress>();
+    let cancel_requested = Arc::new(AtomicBool::new(false));
+    let deadline = TextScanDeadline::new(text_scan_timeout, cancel_requested.clone());
+
+    let working_dir = working_dir.to_string();
+    let app_knowledge_dir = app_knowledge_dir.cloned();
+    let query = query.to_string();
+    let types = types.map(|values| values.to_vec());
+    let path_prefix = path_prefix.map(str::to_string);
+
+    let mut handle = tokio::task::spawn_blocking(move || {
+        text_scan_search_documents_blocking(
+            &working_dir,
+            app_knowledge_dir.as_ref(),
+            &query,
+            types.as_deref(),
+            path_prefix.as_deref(),
+            limit,
+            deadline,
+            move |progress| {
+                let _ = progress_tx.send(progress);
+            },
+        )
+    });
+    let timeout = tokio::time::sleep(text_scan_timeout);
+    tokio::pin!(timeout);
+    let mut progress_closed = false;
+
+    loop {
+        tokio::select! {
+            progress = progress_rx.recv(), if !progress_closed => {
+                match progress {
+                    Some(progress) => on_progress(progress),
+                    None => progress_closed = true,
+                }
+            }
+            result = &mut handle => {
+                while let Ok(progress) = progress_rx.try_recv() {
+                    on_progress(progress);
+                }
+                return result
+                    .map_err(|error| format!("knowledge_query text scan task failed: {}", error))?;
+            }
+            _ = &mut timeout => {
+                cancel_requested.store(true, Ordering::Relaxed);
+                on_progress(KnowledgeQueryProgress::new(
+                    "Text scan timed out",
+                    format!("timeout: {}ms", text_scan_timeout.as_millis()),
+                    Some(0.44),
+                ));
+                return Err(text_scan_timeout_error(
+                    text_scan_timeout,
+                    "scanning knowledge documents",
+                ));
+            }
+        }
+    }
+}
+
+fn text_scan_search_documents_blocking<F>(
+    working_dir: &str,
+    app_knowledge_dir: Option<&std::path::PathBuf>,
+    query: &str,
+    types: Option<&[KnowledgeType]>,
+    path_prefix: Option<&str>,
+    limit: usize,
+    deadline: TextScanDeadline,
+    mut on_progress: F,
+) -> Result<Vec<LexicalHit>, String>
+where
+    F: FnMut(KnowledgeQueryProgress),
+{
     let query = query.trim();
     if query.is_empty() {
         return Ok(Vec::new());
     }
 
+    deadline.check("starting text scan")?;
+    emit_query_progress(
+        &mut on_progress,
+        "Loading text scan documents",
+        truncate_query_progress_info(query, 80),
+        0.30,
+    );
+
     let mut documents = Vec::new();
     if let Some(types) = types {
         for doc_type in types {
+            deadline.check("loading text scan documents")?;
             documents.extend(knowledge_store::load_documents_with_app_root(
                 working_dir,
                 app_knowledge_dir,
@@ -4625,6 +4801,7 @@ fn text_scan_search_documents(
             )?);
         }
     } else {
+        deadline.check("loading text scan documents")?;
         documents = knowledge_store::load_documents_with_app_root(
             working_dir,
             app_knowledge_dir,
@@ -4633,22 +4810,41 @@ fn text_scan_search_documents(
         )?;
     }
 
-    let mut hits = documents
-        .into_iter()
-        .filter_map(|document| {
-            let access = knowledge_store::effective_document_search_access_with_app_root(
-                working_dir,
-                app_knowledge_dir,
-                document.doc_type,
-                &document.path,
-            )
-            .ok()?;
-            if !access.lexical_enabled {
-                return None;
-            }
-            let (score, snippet, matched_section, matched_terms) =
-                knowledge_store::score_document_text_match_with_terms(query, &document)?;
-            Some(LexicalHit {
+    deadline.check("loading text scan documents")?;
+    let total_documents = documents.len();
+    emit_query_progress(
+        &mut on_progress,
+        "Scanning knowledge text",
+        format!("0 / {} document(s)", total_documents),
+        0.34,
+    );
+
+    let mut hits = Vec::new();
+    for (index, document) in documents.into_iter().enumerate() {
+        deadline.check("scanning knowledge documents")?;
+        if index == 0 || index % TEXT_SCAN_PROGRESS_EMIT_DOC_INTERVAL == 0 {
+            emit_query_progress(
+                &mut on_progress,
+                "Scanning knowledge text",
+                format!("{} / {} document(s)", index, total_documents),
+                text_scan_progress(0.34, 0.43, index, total_documents),
+            );
+        }
+
+        let access = knowledge_store::effective_document_search_access_with_app_root(
+            working_dir,
+            app_knowledge_dir,
+            document.doc_type,
+            &document.path,
+        )
+        .ok();
+        if !access.map(|value| value.lexical_enabled).unwrap_or(false) {
+            continue;
+        }
+        if let Some((score, snippet, matched_section, matched_terms)) =
+            knowledge_store::score_document_text_match_with_terms(query, &document)
+        {
+            hits.push(LexicalHit {
                 doc_id: document.id,
                 section: match_section_name(matched_section).to_string(),
                 title: document.title,
@@ -4656,9 +4852,23 @@ fn text_scan_search_documents(
                 score,
                 snippet: truncate_snippet(&snippet, 220),
                 matched_terms,
-            })
-        })
-        .collect::<Vec<_>>();
+            });
+        }
+    }
+
+    emit_query_progress(
+        &mut on_progress,
+        "Scanning knowledge text",
+        format!("{} / {} document(s)", total_documents, total_documents),
+        0.43,
+    );
+    deadline.check("sorting text scan results")?;
+    emit_query_progress(
+        &mut on_progress,
+        "Sorting text scan results",
+        format!("{} match(es)", hits.len()),
+        0.44,
+    );
 
     hits.sort_by(|left, right| {
         right
@@ -4875,10 +5085,11 @@ mod tests {
         build_embedding_backend_state_marker, build_overview, embedding_rebuild_detail,
         embedding_stage_progress, lexical_stage_progress, library_dir_for_working_dir,
         list_cached_documents, needs_embedding_backfill, plan_managed_directory_reuse,
-        query_documents, rebuild_plan_for_document, rebuild_reason_for_document,
-        reconcile_unity_reference_import, reconcile_workspace_internal, save_general_config,
-        DirectorySearchAccess, KnowledgeGeneralConfig, KnowledgeIndexState, KnowledgeRuntime,
-        RebuildReason, INDEX_VERSION, LARGE_LEXICAL_REBUILD_DOC_THRESHOLD,
+        query_documents, query_documents_with_progress_with_timeout, rebuild_plan_for_document,
+        rebuild_reason_for_document, reconcile_unity_reference_import,
+        reconcile_workspace_internal, save_general_config, DirectorySearchAccess,
+        KnowledgeGeneralConfig, KnowledgeIndexState, KnowledgeRuntime, RebuildReason,
+        INDEX_VERSION, LARGE_LEXICAL_REBUILD_DOC_THRESHOLD,
     };
     use crate::knowledge_index::db::{ChunkRecord, DocIndexState, KnowledgeDb};
     use crate::knowledge_store::{
@@ -5413,6 +5624,75 @@ mod tests {
         .expect("query documents");
 
         assert!(hits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn query_documents_text_scan_emits_staged_progress() {
+        let workspace = tempdir().expect("workspace");
+        let working_dir = workspace.path().to_string_lossy().to_string();
+        seed_design_document(&working_dir);
+        save_test_general_config(&working_dir, false, false);
+        let state = create_state(&working_dir);
+        let mut progress_events = Vec::new();
+
+        let hits = query_documents_with_progress_with_timeout(
+            &working_dir,
+            None,
+            Some("战斗核心"),
+            None,
+            Some(&[KnowledgeType::Design]),
+            None,
+            5,
+            state,
+            Duration::from_secs(5),
+            |progress| progress_events.push(progress),
+        )
+        .await
+        .expect("query documents");
+
+        assert!(!hits.is_empty());
+        assert!(progress_events
+            .iter()
+            .any(|progress| progress.title == "Loading text scan documents"));
+        assert!(progress_events
+            .iter()
+            .any(|progress| progress.title == "Scanning knowledge text"));
+        assert!(progress_events
+            .iter()
+            .any(|progress| progress.title == "Sorting text scan results"));
+        assert!(progress_events.iter().any(|progress| {
+            progress.title == "Scanning knowledge text"
+                && progress
+                    .progress
+                    .map(|value| (0.34..=0.43).contains(&value))
+                    .unwrap_or(false)
+        }));
+    }
+
+    #[tokio::test]
+    async fn query_documents_text_scan_times_out_with_clear_error() {
+        let workspace = tempdir().expect("workspace");
+        let working_dir = workspace.path().to_string_lossy().to_string();
+        seed_design_document(&working_dir);
+        save_test_general_config(&working_dir, false, false);
+        let state = create_state(&working_dir);
+
+        let error = query_documents_with_progress_with_timeout(
+            &working_dir,
+            None,
+            Some("战斗核心"),
+            None,
+            Some(&[KnowledgeType::Design]),
+            None,
+            5,
+            state,
+            Duration::ZERO,
+            |_| {},
+        )
+        .await
+        .expect_err("text scan timeout");
+
+        assert!(error.contains("knowledge_query text scan timed out"));
     }
 
     #[tokio::test]

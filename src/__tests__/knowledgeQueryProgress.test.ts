@@ -16,6 +16,8 @@ describe("knowledgeQueryProgress", () => {
     expect(agentSource).toContain("execute_knowledge_query(app_handle, &tc.id, args, run_id)");
     expect(agentSource).toContain("Preparing knowledge query");
     expect(agentSource).toContain("Formatting knowledge results");
+    expect(agentSource).toContain("Knowledge query timed out");
+    expect(agentSource).toContain("tokio::time::timeout");
     expect(agentSource).toContain("query_documents_with_progress");
     expect(agentSource).toContain("StreamEvent::ToolCallProgress");
 
@@ -24,6 +26,10 @@ describe("knowledgeQueryProgress", () => {
     expect(indexSource).toContain("Checking knowledge catalog");
     expect(indexSource).toContain("Running lexical index search");
     expect(indexSource).toContain("Running text scan");
+    expect(indexSource).toContain("Loading text scan documents");
+    expect(indexSource).toContain("Scanning knowledge text");
+    expect(indexSource).toContain("Sorting text scan results");
+    expect(indexSource).toContain("knowledge_query text scan timed out");
     expect(indexSource).toContain("Checking semantic search");
     expect(indexSource).toContain("Running semantic search");
     expect(indexSource).toContain("Loading matched documents");
