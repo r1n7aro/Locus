@@ -5,6 +5,7 @@ import type { Window as TauriWindow } from "@tauri-apps/api/window";
 import { listen } from "@tauri-apps/api/event";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { hasTauriWindowRuntime } from "../services/tauriRuntime";
+import type { UserMessageDraft } from "../composables/chatMessageDraft";
 
 const WINDOW_RESIZE_SETTLE_DELAY_MS = 420;
 const MIN_TRACKABLE_WINDOW_WIDTH_PX = 320;
@@ -25,7 +26,7 @@ export const useUiStore = defineStore("ui", () => {
   const nativeWindowWidth = ref<number | null>(null);
   const nativeWindowHeight = ref<number | null>(null);
   const showOnboarding = ref(false);
-  const pendingChatPrefill = ref<{ id: number; text: string } | null>(null);
+  const pendingChatPrefill = ref<{ id: number; text: string; draft?: UserMessageDraft | null } | null>(null);
   const pendingKnowledgeSelection = ref<{
     id: number;
     dashboard: "design" | "memory" | "skill" | "reference";
@@ -210,6 +211,14 @@ export const useUiStore = defineStore("ui", () => {
     };
   }
 
+  function stageChatDraftPrefill(draft: UserMessageDraft) {
+    pendingChatPrefill.value = {
+      id: Date.now(),
+      text: draft.text,
+      draft,
+    };
+  }
+
   function clearPendingChatPrefill(id?: number) {
     if (!pendingChatPrefill.value) return;
     if (id != null && pendingChatPrefill.value.id !== id) return;
@@ -292,6 +301,7 @@ export const useUiStore = defineStore("ui", () => {
     openSettingsCategory,
     clearSettingsCategoryHint,
     stageChatPrefill,
+    stageChatDraftPrefill,
     clearPendingChatPrefill,
     stageKnowledgeSelection,
     clearPendingKnowledgeSelection,

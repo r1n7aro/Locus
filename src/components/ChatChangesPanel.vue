@@ -6,7 +6,7 @@ import { useProjectStore } from "../stores/project";
 import { useUiStore } from "../stores/ui";
 import { diffSingleFile, createRequestToken, isTokenStale } from "../services/diff";
 import { normalizeAppError } from "../services/errors";
-import { findUndoRestoreUserText } from "../services/chatUndo";
+import { findUndoRestoreUserMessage } from "../services/chatUndo";
 import { selectUnityAsset, openFileExternal } from "../services/unity";
 import { openChatDiffReviewWindow } from "../services/chatDiffReviewWindow";
 import { t } from "../i18n";
@@ -14,6 +14,7 @@ import { useNotificationStore } from "../stores/notification";
 import FileDiffPopover from "./diff/FileDiffPopover.vue";
 import type { GitFileChange, FileDiffPayload, UndoConflictInfo } from "../types";
 import type { ChatMergedFileItem } from "../services/chatChanges";
+import { buildUserMessageDraft } from "../composables/chatMessageDraft";
 import { useHideMeta, isMetaFile, canOpenInEditor } from "../composables/useHideMeta";
 import { buildStagingTreeRows, collectStagingFolderPaths } from "./collab/stagingTree";
 import type { StagingTreeRow } from "./collab/stagingTree";
@@ -355,9 +356,10 @@ const undoTargetId = computed(() => {
   return rounds.length > 0 ? rounds[0].assistantMessageId : null;
 });
 
-const undoRestoreText = computed(() => {
+const undoRestoreDraft = computed(() => {
   if (mode.value !== "current" || !undoTargetId.value) return null;
-  return findUndoRestoreUserText(chatStore.messages, undoTargetId.value);
+  const message = findUndoRestoreUserMessage(chatStore.messages, undoTargetId.value);
+  return message ? buildUserMessageDraft(message) : null;
 });
 
 const undoButtonBusy = computed(() => checkingUndoConflicts.value || isUndoing.value);
@@ -399,13 +401,13 @@ async function onUndoClick() {
 async function confirmUndo(force = false) {
   const targetId = undoTargetId.value;
   if (!targetId || isUndoing.value) return;
-  const restoreText = undoRestoreText.value;
+  const restoreDraft = undoRestoreDraft.value;
   isUndoing.value = true;
   changesStore.closeInlineDiff();
   try {
     const undone = await chatStore.performUndo(targetId, { force });
-    if (undone && restoreText) {
-      uiStore.stageChatPrefill(restoreText);
+    if (undone && restoreDraft) {
+      uiStore.stageChatDraftPrefill(restoreDraft);
     }
   } finally {
     isUndoing.value = false;

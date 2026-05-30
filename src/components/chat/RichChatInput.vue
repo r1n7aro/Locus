@@ -1487,6 +1487,11 @@ async function applyPrefill(text: string) {
   syncOperatorState();
 }
 
+async function applyDraftPrefill(draft: UserMessageDraft) {
+  resetDraft();
+  await applyUserMessageDraft(draft);
+}
+
 function appendDraftText(text: string) {
   if (!text) {
     return props.modelValue.length;
@@ -2196,6 +2201,7 @@ defineExpose({
   },
   resetDraft,
   applyPrefill,
+  applyDraftPrefill,
 });
 </script>
 

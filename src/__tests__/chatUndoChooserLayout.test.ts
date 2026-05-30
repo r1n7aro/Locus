@@ -42,7 +42,7 @@ describe("chat undo chooser", () => {
     expect(chatView).toContain(":selected-message-id=\"contextSelectedMessageId\"");
     expect(chatView).toContain("rollbackTargetForMessage");
     expect(chatView).toContain("props.messages.slice(messageIndex + 1)");
-    expect(chatView).toContain('userText: ""');
+    expect(chatView).toContain("userMessage: null");
     expect(chatView).toContain("chatStore.rollbackToMessage(targetMessageId");
     expect(chatView).toContain("chatStore.forkSessionFromMessage(messageId)");
     expect(transcript).toContain("selectedMessageId?: string | null");

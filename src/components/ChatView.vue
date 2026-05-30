@@ -73,6 +73,7 @@ import { useDisplaySettings } from "../composables/useDisplaySettings";
 import { useKnowledgeAccessMode } from "../composables/useKnowledgeAccessMode";
 import {
   buildChatMessageClipboardPayload,
+  buildUserMessageDraft,
   writeChatMessageClipboard,
 } from "../composables/chatMessageDraft";
 import { logToolCollapseTrace, previewTraceText } from "../services/toolCollapseTrace";
@@ -903,7 +904,7 @@ const latestConversationTurn = computed(() => {
   )?.id ?? null;
 
   return {
-    userText: props.messages[userIndex]?.content ?? "",
+    userMessage: props.messages[userIndex] ?? null,
     fileUndoTarget,
   };
 });
@@ -921,7 +922,7 @@ function rollbackTargetForMessage(messageId: string) {
 
   return {
     messageId,
-    userText: "",
+    userMessage: null,
     fileUndoTarget,
   };
 }
@@ -994,10 +995,9 @@ function closeUndoChooser() {
   undoTargetMessageId.value = null;
 }
 
-function restoreUndoText(text: string) {
-  if (text.trim()) {
-    uiStore.stageChatPrefill(text);
-  }
+function restoreUndoMessage(message: ChatMessage | null) {
+  if (!message) return;
+  uiStore.stageChatDraftPrefill(buildUserMessageDraft(message));
 }
 
 function moveUndoChoice(delta: number) {
@@ -1057,7 +1057,7 @@ async function undoConversationOnly() {
     if (undone) {
       undoChooserVisible.value = false;
       undoTargetMessageId.value = null;
-      restoreUndoText(turn.userText);
+      restoreUndoMessage(turn.userMessage);
     }
   } finally {
     undoAction.value = null;
@@ -1081,7 +1081,7 @@ async function undoFilesAndConversation() {
     if (undone) {
       undoChooserVisible.value = false;
       undoTargetMessageId.value = null;
-      restoreUndoText(turn.userText);
+      restoreUndoMessage(turn.userMessage);
     }
   } finally {
     undoAction.value = null;
@@ -1112,7 +1112,16 @@ watch(
   async (prefillId) => {
     const prefill = uiStore.pendingChatPrefill;
     if (!prefillId || !prefill) return;
-    await applyExternalComposerPrefill(prefill.text);
+    if (prefill.draft) {
+      await nextTick();
+      if (composerPanelRef.value) {
+        await composerPanelRef.value.applyDraftPrefill(prefill.draft);
+      } else {
+        await applyExternalComposerPrefill(prefill.text);
+      }
+    } else {
+      await applyExternalComposerPrefill(prefill.text);
+    }
     uiStore.clearPendingChatPrefill(prefillId);
   },
 );
