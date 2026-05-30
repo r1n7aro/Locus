@@ -191,7 +191,7 @@ interface TableColumnResizeState {
 const sourceProviders: SerializedTableSourceProvider[] = Array.isArray(defaultSourceProviders)
   ? defaultSourceProviders
   : [];
-const storageKey = `locus.view.serialized-table.${view.manifest.id}`;
+const storageKey = "serialized-table.config";
 const readMaxRows = Math.max(1, Math.min(defaultTableOptions?.maxRows ?? 1000, 5000));
 const TABLE_ASSET_COLUMN_WIDTH = 220;
 const TABLE_STATUS_COLUMN_WIDTH = 160;
@@ -353,30 +353,32 @@ function normalizeStoredColumnWidths(value: unknown): Record<string, number> {
   return result;
 }
 
-function readStoredConfigObject(): Record<string, unknown> {
+async function readStoredConfigObject(): Promise<Record<string, unknown>> {
   try {
-    const raw = localStorage.getItem(storageKey);
-    if (!raw) return {};
-    const parsed = JSON.parse(raw);
+    const parsed = await view.storage.get(storageKey);
     return isPlainRecord(parsed) ? parsed : {};
   } catch (error) {
     console.error("[serialized-table] Stored config read failed", error);
-    localStorage.removeItem(storageKey);
     return {};
   }
 }
 
-function loadStoredConfig() {
-  const stored = readStoredConfigObject();
+async function loadStoredConfig() {
+  const stored = await readStoredConfigObject();
   columnWidthOverrides.value = normalizeStoredColumnWidths(stored.columnWidths);
+  scheduleTableLayoutCheck();
 }
 
 function persistColumnWidths() {
-  const stored = readStoredConfigObject();
-  localStorage.setItem(storageKey, JSON.stringify({
-    ...stored,
-    columnWidths: columnWidthOverrides.value,
-  }));
+  void (async () => {
+    const stored = await readStoredConfigObject();
+    await view.storage.set(storageKey, {
+      ...stored,
+      columnWidths: columnWidthOverrides.value,
+    });
+  })().catch((error) => {
+    console.error("[serialized-table] Stored config write failed", error);
+  });
 }
 
 function resizeHandleLabel(label: string): string {
@@ -749,7 +751,7 @@ watch(tableRows, scheduleTableLayoutCheck, { deep: true });
 
 onMounted(() => {
   window.addEventListener("resize", scheduleTableLayoutCheck);
-  loadStoredConfig();
+  void loadStoredConfig();
   void refresh();
   scheduleTableLayoutCheck();
 });

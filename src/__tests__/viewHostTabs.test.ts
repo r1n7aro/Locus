@@ -43,7 +43,10 @@ describe("View host tabs", () => {
     expect(host).toContain("startTabDragPreview(state.tabId)");
     expect(host).toContain("is-external-tab-drop-target");
     expect(host).toContain(".view-host-tab.dragging");
-    expect(host).toContain("const canClaimPoolTab = isViewHostPoolWindow && tabs.value.length === 0");
+    expect(host).toContain("targetLabel?: string");
+    expect(host).toContain("allowPoolClaim?: boolean");
+    expect(host).toContain('viewHostContentLog("claim-ignored-target"');
+    expect(host).toContain("payload.allowPoolClaim === true");
     expect(host).toContain("if (!hasHostedTab && !canClaimPoolTab)");
     expect(host).toContain('prepareViewHostPool("host-mounted")');
     expect(host).toContain('prepareViewHostPool("host-ready")');
@@ -99,6 +102,9 @@ describe("View host tabs", () => {
     expect(appView).toContain('<ViewHostWindow v-else-if="isViewContentWindow" embedded />');
     expect(runtime).toContain("fn view_tab_hosts()");
     expect(runtime).toContain("set_view_tab_host_sync");
+    expect(runtime).toContain("emit_to(");
+    expect(runtime).toContain('"targetLabel": window_label');
+    expect(runtime).toContain('"allowPoolClaim": allow_pool_claim');
     expect(runtime).toContain("keep_existing_for_host");
     expect(runtime).toContain("ensure_view_host_pool_window");
     expect(runtime).toContain("mark_view_host_pool_ready");

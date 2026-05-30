@@ -9,20 +9,23 @@ use crate::view::{
     delete_view_entry_sync, destroy_view_content_window, detach_view_tab_window, emit_view_reload,
     emit_view_tree_changed, ensure_view_host_pool_window, export_view_package_sync,
     hide_view_content_window, import_view_package_sync, list_view_tree_sync, list_views_sync,
-    mark_view_host_pool_ready, mount_view_content_window, move_view_entry_sync,
-    open_view_frontend_log_sync, open_view_unity_embed_window, open_view_window,
-    parse_view_create_request, read_view_frontend_log_sync, read_view_sync, reload_view_sync,
-    supported_view_templates, view_binding_apply as view_binding_apply_impl,
+    mark_view_host_pool_ready, mark_view_host_revealed, mount_view_content_window,
+    move_view_entry_sync, open_view_frontend_log_sync, open_view_unity_embed_window,
+    open_view_window, parse_view_create_request, read_view_frontend_log_sync, read_view_sync,
+    reload_view_sync, rename_view_entry_sync, supported_view_templates,
+    view_binding_apply as view_binding_apply_impl,
     view_binding_discover as view_binding_discover_impl,
     view_binding_read as view_binding_read_impl, view_binding_write as view_binding_write_impl,
-    ViewAutomationStore, ViewBindingApplyRequest, ViewBindingApplyResult,
-    ViewBindingDiscoverRequest, ViewBindingDiscoverResult, ViewBindingReadRequest,
-    ViewBindingReadResult, ViewBindingWriteRequest, ViewBindingWriteResult, ViewCallScriptRequest,
-    ViewCallScriptResult, ViewCompileScriptRequest, ViewCompileScriptResult,
-    ViewContentMountRequest, ViewCreateFolderRequest, ViewDeleteEntryRequest, ViewDetachTabRequest,
+    view_storage_get_sync, view_storage_remove_sync, view_storage_set_sync, ViewAutomationStore,
+    ViewBindingApplyRequest, ViewBindingApplyResult, ViewBindingDiscoverRequest,
+    ViewBindingDiscoverResult, ViewBindingReadRequest, ViewBindingReadResult,
+    ViewBindingWriteRequest, ViewBindingWriteResult, ViewCallScriptRequest, ViewCallScriptResult,
+    ViewCompileScriptRequest, ViewCompileScriptResult, ViewContentMountRequest,
+    ViewCreateFolderRequest, ViewDeleteEntryRequest, ViewDetachTabRequest,
     ViewExportPackageRequest, ViewFolderSummary, ViewFrontendLogEntry, ViewFrontendLogReadRequest,
     ViewFrontendLogRequest, ViewImportPackageRequest, ViewMoveEntryRequest, ViewPackageDetail,
-    ViewPackageImportResult, ViewPackageSummary, ViewRunResult, ViewSetTabHostRequest,
+    ViewPackageImportResult, ViewPackageSummary, ViewRenameEntryRequest, ViewRunResult,
+    ViewSetTabHostRequest, ViewStorageGetRequest, ViewStorageRemoveRequest, ViewStorageSetRequest,
     ViewTemplateSummary, ViewTreeSnapshot,
 };
 use crate::workspace::Workspace;
@@ -80,6 +83,18 @@ pub async fn view_delete_entry(
 ) -> Result<ViewTreeSnapshot, AppError> {
     let working_dir = workspace.path.read().await.clone();
     let snapshot = delete_view_entry_sync(&working_dir, request).map_err(AppError::from)?;
+    emit_view_tree_changed(&app_handle);
+    Ok(snapshot)
+}
+
+#[tauri::command]
+pub async fn view_rename_entry(
+    request: ViewRenameEntryRequest,
+    workspace: State<'_, Arc<Workspace>>,
+    app_handle: AppHandle,
+) -> Result<ViewTreeSnapshot, AppError> {
+    let working_dir = workspace.path.read().await.clone();
+    let snapshot = rename_view_entry_sync(&working_dir, request).map_err(AppError::from)?;
     emit_view_tree_changed(&app_handle);
     Ok(snapshot)
 }
@@ -151,6 +166,7 @@ pub async fn view_run(
         &working_dir,
         &view_id,
         config.view_windows_above_main_enabled(),
+        config.view_open_in_existing_window_enabled(),
     )
     .await
     .map_err(Into::into)
@@ -206,6 +222,18 @@ pub async fn view_host_pool_ready(
     app_handle: AppHandle,
 ) -> Result<(), AppError> {
     mark_view_host_pool_ready(&app_handle, &host_label).map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn view_host_revealed(
+    host_label: String,
+    workspace: State<'_, Arc<Workspace>>,
+    app_handle: AppHandle,
+) -> Result<(), AppError> {
+    let working_dir = workspace.path.read().await.clone();
+    mark_view_host_revealed(&app_handle, &working_dir, &host_label)
+        .await
+        .map_err(Into::into)
 }
 
 #[tauri::command]
@@ -277,6 +305,33 @@ pub async fn view_open_frontend_log(
 ) -> Result<(), AppError> {
     let working_dir = workspace.path.read().await.clone();
     open_view_frontend_log_sync(&working_dir, &view_id).map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn view_storage_get(
+    request: ViewStorageGetRequest,
+    workspace: State<'_, Arc<Workspace>>,
+) -> Result<Option<serde_json::Value>, AppError> {
+    let working_dir = workspace.path.read().await.clone();
+    view_storage_get_sync(&working_dir, request).map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn view_storage_set(
+    request: ViewStorageSetRequest,
+    workspace: State<'_, Arc<Workspace>>,
+) -> Result<(), AppError> {
+    let working_dir = workspace.path.read().await.clone();
+    view_storage_set_sync(&working_dir, request).map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn view_storage_remove(
+    request: ViewStorageRemoveRequest,
+    workspace: State<'_, Arc<Workspace>>,
+) -> Result<(), AppError> {
+    let working_dir = workspace.path.read().await.clone();
+    view_storage_remove_sync(&working_dir, request).map_err(Into::into)
 }
 
 #[tauri::command]

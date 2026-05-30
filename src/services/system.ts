@@ -81,6 +81,14 @@ export function setViewWindowsAboveMain(value: boolean): Promise<void> {
   return ipcInvoke<void>("set_view_windows_above_main", { value });
 }
 
+export function getViewOpenInExistingWindow(): Promise<boolean> {
+  return ipcInvoke<boolean>("get_view_open_in_existing_window");
+}
+
+export function setViewOpenInExistingWindow(value: boolean): Promise<void> {
+  return ipcInvoke<void>("set_view_open_in_existing_window", { value });
+}
+
 export function getProxyStatus(): Promise<ProxyStatus> {
   return ipcInvoke<ProxyStatus>("get_proxy_status");
 }

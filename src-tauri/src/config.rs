@@ -29,6 +29,10 @@ fn default_view_windows_above_main() -> Arc<AtomicBool> {
     Arc::new(AtomicBool::new(false))
 }
 
+fn default_view_open_in_existing_window() -> Arc<AtomicBool> {
+    Arc::new(AtomicBool::new(true))
+}
+
 fn default_unity_background_hook_enabled() -> Arc<AtomicBool> {
     Arc::new(AtomicBool::new(true))
 }
@@ -154,6 +158,11 @@ pub struct AppConfig {
     )]
     pub view_windows_above_main: Arc<AtomicBool>,
     #[serde(
+        default = "default_view_open_in_existing_window",
+        with = "serde_atomic_bool"
+    )]
+    pub view_open_in_existing_window: Arc<AtomicBool>,
+    #[serde(
         default = "default_unity_background_hook_enabled",
         with = "serde_atomic_bool"
     )]
@@ -198,6 +207,7 @@ impl AppConfig {
             dynamic_tool_loading_mode: default_dynamic_tool_loading_mode(),
             default_skill_package_namespace: default_skill_package_namespace(),
             view_windows_above_main: default_view_windows_above_main(),
+            view_open_in_existing_window: default_view_open_in_existing_window(),
             unity_background_hook_enabled: default_unity_background_hook_enabled(),
             config_path: Arc::new(Mutex::new(Some(primary_path.to_path_buf()))),
         };
@@ -335,6 +345,16 @@ impl AppConfig {
 
     pub fn set_view_windows_above_main_enabled(&self, value: bool) -> Result<(), String> {
         self.view_windows_above_main.store(value, Ordering::Relaxed);
+        self.persist()
+    }
+
+    pub fn view_open_in_existing_window_enabled(&self) -> bool {
+        self.view_open_in_existing_window.load(Ordering::Relaxed)
+    }
+
+    pub fn set_view_open_in_existing_window_enabled(&self, value: bool) -> Result<(), String> {
+        self.view_open_in_existing_window
+            .store(value, Ordering::Relaxed);
         self.persist()
     }
 
@@ -565,6 +585,24 @@ mod tests {
     }
 
     #[test]
+    fn view_open_in_existing_window_defaults_to_enabled() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("config.json");
+        fs::write(
+            &config_path,
+            r#"{
+  "model": "legacy-model",
+  "debug": false
+}"#,
+        )
+        .expect("legacy config");
+
+        let config = AppConfig::load_from_path(&config_path);
+
+        assert!(config.view_open_in_existing_window_enabled());
+    }
+
+    #[test]
     fn unity_background_hook_defaults_to_enabled() {
         let temp = tempfile::tempdir().expect("tempdir");
         let config_path = temp.path().join("config.json");
@@ -639,6 +677,20 @@ mod tests {
 
         let reloaded = AppConfig::load_from_path(&config_path);
         assert!(reloaded.view_windows_above_main_enabled());
+    }
+
+    #[test]
+    fn view_open_in_existing_window_persists_disabled() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("config.json");
+        let config = AppConfig::load_from_path(&config_path);
+
+        config
+            .set_view_open_in_existing_window_enabled(false)
+            .expect("persist view tab opening setting");
+
+        let reloaded = AppConfig::load_from_path(&config_path);
+        assert!(!reloaded.view_open_in_existing_window_enabled());
     }
 
     #[test]

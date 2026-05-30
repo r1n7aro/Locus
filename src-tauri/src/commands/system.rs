@@ -243,6 +243,23 @@ pub fn set_view_windows_above_main(
         .map_err(crate::error::AppError::from)
 }
 
+#[tauri::command]
+pub fn get_view_open_in_existing_window(
+    config: State<'_, std::sync::Arc<crate::config::AppConfig>>,
+) -> Result<bool, crate::error::AppError> {
+    Ok(config.view_open_in_existing_window_enabled())
+}
+
+#[tauri::command]
+pub fn set_view_open_in_existing_window(
+    value: bool,
+    config: State<'_, std::sync::Arc<crate::config::AppConfig>>,
+) -> Result<(), crate::error::AppError> {
+    config
+        .set_view_open_in_existing_window_enabled(value)
+        .map_err(crate::error::AppError::from)
+}
+
 #[cfg(windows)]
 pub(crate) fn ensure_windows_notification_identity(app_handle: &AppHandle) -> Result<(), String> {
     use winreg::enums::HKEY_CURRENT_USER;

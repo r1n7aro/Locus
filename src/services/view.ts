@@ -79,6 +79,7 @@ export interface ViewFolderSummary {
 export interface ViewTreeSnapshot {
   views: ViewPackageSummary[];
   folders: ViewFolderSummary[];
+  order?: string[];
 }
 
 export interface ViewPackageFile {
@@ -114,9 +115,16 @@ export interface ViewDeleteEntryRequest {
   relPath: string;
 }
 
+export interface ViewRenameEntryRequest {
+  relPath: string;
+  name: string;
+}
+
 export interface ViewMoveEntryRequest {
   sourceRelPath: string;
   targetDirRelPath?: string | null;
+  insertBeforeRelPath?: string | null;
+  insertAfterRelPath?: string | null;
 }
 
 export interface ViewExportPackageRequest {
@@ -210,6 +218,22 @@ export interface ViewFrontendLogEntry {
   time: number;
   level: ViewFrontendLogLevel;
   message: string;
+}
+
+export interface ViewStorageGetRequest {
+  viewId: string;
+  key: string;
+}
+
+export interface ViewStorageSetRequest {
+  viewId: string;
+  key: string;
+  value: unknown;
+}
+
+export interface ViewStorageRemoveRequest {
+  viewId: string;
+  key: string;
 }
 
 export interface ViewAutomationRequest {
@@ -515,6 +539,10 @@ export function viewDeleteEntry(request: ViewDeleteEntryRequest): Promise<ViewTr
   return ipcInvoke<ViewTreeSnapshot>("view_delete_entry", { request });
 }
 
+export function viewRenameEntry(request: ViewRenameEntryRequest): Promise<ViewTreeSnapshot> {
+  return ipcInvoke<ViewTreeSnapshot>("view_rename_entry", { request });
+}
+
 export function viewMoveEntry(request: ViewMoveEntryRequest): Promise<ViewTreeSnapshot> {
   return ipcInvoke<ViewTreeSnapshot>("view_move_entry", { request });
 }
@@ -559,6 +587,10 @@ export function viewHostPoolPrepare(): Promise<ViewRunResult> {
 
 export function viewHostPoolReady(hostLabel: string): Promise<void> {
   return ipcInvoke<void>("view_host_pool_ready", { hostLabel });
+}
+
+export function viewHostRevealed(hostLabel: string): Promise<void> {
+  return ipcInvoke<void>("view_host_revealed", { hostLabel });
 }
 
 export function viewContentMount(request: ViewContentMountRequest): Promise<ViewRunResult> {
@@ -656,6 +688,18 @@ export function viewReadFrontendLog(request: ViewFrontendLogReadRequest): Promis
 
 export function viewOpenFrontendLog(viewId: string): Promise<void> {
   return ipcInvoke<void>("view_open_frontend_log", { viewId });
+}
+
+export function viewStorageGet(request: ViewStorageGetRequest): Promise<unknown | null> {
+  return ipcInvoke<unknown | null>("view_storage_get", { request });
+}
+
+export function viewStorageSet(request: ViewStorageSetRequest): Promise<void> {
+  return ipcInvoke<void>("view_storage_set", { request });
+}
+
+export function viewStorageRemove(request: ViewStorageRemoveRequest): Promise<void> {
+  return ipcInvoke<void>("view_storage_remove", { request });
 }
 
 export function viewAutomationRespond(

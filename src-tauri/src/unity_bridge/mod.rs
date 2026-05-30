@@ -2363,6 +2363,15 @@ pub async fn start_unity_monitor(
             }
 
             last_detected_editor_process = unity_process_info_from_status(&status);
+            crate::view::sync_unity_owned_view_windows_for_project(
+                &app_handle,
+                &project_path,
+                status.editor_process_id,
+                matches!(
+                    status.editor_process_state,
+                    UnityEditorProcessState::Running
+                ),
+            );
 
             let _ = app_handle.emit("unity-connection-status-detail", status.clone());
 

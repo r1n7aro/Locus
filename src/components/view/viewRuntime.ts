@@ -232,6 +232,9 @@ export interface ViewRuntimeApi {
   onSessionEvent(handler: (event: StreamEvent) => void): Promise<ViewRuntimeUnsubscribe>;
   readFrontendLog(limit?: number): Promise<ViewFrontendLogEntry[]>;
   openFrontendLog(): Promise<void>;
+  storageGet(key: string): Promise<unknown | null>;
+  storageSet(key: string, value: unknown): Promise<void>;
+  storageRemove(key: string): Promise<void>;
   onUpdate(handler: (event: ViewRuntimeUpdateEvent) => void): Promise<ViewRuntimeUnsubscribe>;
   reload(): Promise<void>;
 }
@@ -1185,6 +1188,12 @@ function createViewRuntimeApiUncached(detail: ViewPackageDetail, api: ViewRuntim
     call: (request: ViewLlmCallRequest) => api.callLlm(request),
   };
 
+  const storage = {
+    get: (key: string) => api.storageGet(key),
+    set: (key: string, value: unknown) => api.storageSet(key, value),
+    remove: (key: string) => api.storageRemove(key),
+  };
+
   const unity = {
     callScript: async (scriptName: string, method: string, args?: unknown) => {
       const response = await api.callScript(scriptName, method, args);
@@ -1255,6 +1264,7 @@ function createViewRuntimeApiUncached(detail: ViewPackageDetail, api: ViewRuntim
     },
     session,
     llm,
+    storage,
     unity,
     files,
     undo,
@@ -1275,6 +1285,7 @@ function createViewRuntimeApiUncached(detail: ViewPackageDetail, api: ViewRuntim
     view,
     session,
     llm,
+    storage,
     unity,
     files,
     undo,
@@ -1698,6 +1709,15 @@ function createInstrumentedRuntimeApi(detail: ViewPackageDetail, api: ViewRuntim
       measureRequest("readFrontendLog", () => api.readFrontendLog(limit), { limit: limit ?? "" }, "log"),
     openFrontendLog: () =>
       measureRequest("openFrontendLog", () => api.openFrontendLog(), {}, "log"),
+    storageGet: (key) =>
+      measureRequest("storageGet", () => api.storageGet(key), { key }),
+    storageSet: (key, value) =>
+      measureRequest("storageSet", () => api.storageSet(key, value), {
+        key,
+        valueType: Array.isArray(value) ? "array" : typeof value,
+      }),
+    storageRemove: (key) =>
+      measureRequest("storageRemove", () => api.storageRemove(key), { key }),
     onUpdate: (handler) =>
       measureRequest("onUpdate", () => api.onUpdate(handler), {}, "subscription"),
     reload: () =>

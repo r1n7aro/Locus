@@ -25,6 +25,7 @@ import {
   viewCreateFolder,
   viewDeleteEntry,
   viewMoveEntry,
+  viewRenameEntry,
   viewRequiresUnityConnection,
   viewRun,
   viewRunInUnity,
@@ -73,6 +74,15 @@ interface ViewCreateFolderDraft {
   name: string;
 }
 
+interface ViewRenameDraft {
+  relPath: string;
+  kind: "folder" | "view";
+  anchorKey: string;
+  depth: number;
+  currentName: string;
+  name: string;
+}
+
 type ViewContextMenuState =
   | { x: number; y: number; kind: "root" }
   | { x: number; y: number; kind: "folder" | "view"; node: ViewTreeNode };
@@ -87,7 +97,10 @@ interface ViewPointerDragState {
 
 interface ViewDropTarget {
   key: string;
-  relPath: string;
+  targetDirRelPath: string;
+  position: "inside" | "before" | "after";
+  insertBeforeRelPath?: string;
+  insertAfterRelPath?: string;
 }
 
 const STORAGE_KEY_EXPANDED = "locus:sessionPanelExpanded";
@@ -149,14 +162,18 @@ const newChatTitle = computed(() =>
 );
 const viewSummaries = ref<ViewPackageSummary[]>([]);
 const viewFolders = ref<ViewFolderSummary[]>([]);
+const viewTreeOrder = ref<string[]>([]);
 const viewsLoading = ref(false);
 const viewOpeningKey = ref("");
 const viewCtxMenu = ref<ViewContextMenuState | null>(null);
 const viewDeleteConfirm = ref<ViewTreeNode | null>(null);
 const viewCreateFolderDraft = ref<ViewCreateFolderDraft | null>(null);
 const viewCreateFolderInputRef = ref<HTMLInputElement | null>(null);
+const viewRenameDraft = ref<ViewRenameDraft | null>(null);
+const viewRenameInputRef = ref<HTMLInputElement | null>(null);
 const draggingViewNode = ref<ViewTreeNode | null>(null);
 const viewDragTargetKey = ref("");
+const viewDragTargetPosition = ref<ViewDropTarget["position"] | "">("");
 const viewHelpOpen = ref(false);
 const viewHelpDialogRef = ref<HTMLElement | null>(null);
 const hasWorkspace = computed(() => !!props.workingDir?.trim());
@@ -164,6 +181,7 @@ const viewExpandedState = ref<Record<string, boolean>>(loadViewExpandedState());
 const sessionPanelRef = ref<HTMLElement | null>(null);
 const showSessionViews = computed(() => props.showViews !== false);
 const viewSectionRatio = ref(loadViewSplitRatio());
+const canSubmitViewRename = computed(() => !!viewRenameDraft.value?.name.trim());
 let viewResizeMoveListener: ((event: MouseEvent) => void) | null = null;
 let viewResizeUpListener: (() => void) | null = null;
 let viewReloadUnsubscribe: RuntimeUnsubscribe | null = null;
@@ -285,9 +303,16 @@ function viewPathDirname(relPath: string): string {
   return parts.slice(0, -1).join("/");
 }
 
-function buildViewTree(views: ViewPackageSummary[], folders: ViewFolderSummary[]): ViewTreeNode[] {
+function buildViewTree(
+  views: ViewPackageSummary[],
+  folders: ViewFolderSummary[],
+  order: string[],
+): ViewTreeNode[] {
   const root = makeFolderNode("", "views");
   const folderMap = new Map<string, ViewTreeNode>([["", root]]);
+  const orderMap = new Map(
+    order.map((relPath, index) => [normalizeViewPath(relPath), index] as const),
+  );
   const ensureFolder = (relPath: string, folder?: ViewFolderSummary) => {
     const normalized = normalizeViewPath(relPath);
     if (!normalized) return root;
@@ -342,6 +367,11 @@ function buildViewTree(views: ViewPackageSummary[], folders: ViewFolderSummary[]
 
   const sortChildren = (node: ViewTreeNode) => {
     node.children.sort((left, right) => {
+      const leftOrder = orderMap.get(normalizeViewPath(left.relPath));
+      const rightOrder = orderMap.get(normalizeViewPath(right.relPath));
+      if (leftOrder !== undefined && rightOrder !== undefined) return leftOrder - rightOrder;
+      if (leftOrder !== undefined) return -1;
+      if (rightOrder !== undefined) return 1;
       if (left.kind !== right.kind) return left.kind === "folder" ? -1 : 1;
       return left.label.localeCompare(right.label, undefined, { sensitivity: "base" });
     });
@@ -351,7 +381,9 @@ function buildViewTree(views: ViewPackageSummary[], folders: ViewFolderSummary[]
   return root.children;
 }
 
-const viewTreeNodes = computed(() => buildViewTree(viewSummaries.value, viewFolders.value));
+const viewTreeNodes = computed(() =>
+  buildViewTree(viewSummaries.value, viewFolders.value, viewTreeOrder.value),
+);
 
 function isViewNodeExpanded(node: ViewTreeNode): boolean {
   if (node.kind !== "folder") return false;
@@ -408,6 +440,7 @@ async function loadViews() {
   if (!showSessionViews.value || !hasWorkspace.value) {
     viewSummaries.value = [];
     viewFolders.value = [];
+    viewTreeOrder.value = [];
     return;
   }
   viewsLoading.value = true;
@@ -415,6 +448,7 @@ async function loadViews() {
     const snapshot = await viewTree();
     viewSummaries.value = snapshot.views;
     viewFolders.value = snapshot.folders;
+    viewTreeOrder.value = snapshot.order ?? [];
   } catch (error) {
     const err = normalizeAppError(error);
     notificationStore.addNotice("error", err.message, {
@@ -516,11 +550,16 @@ function closeViewContextMenu() {
   viewCtxMenu.value = null;
 }
 
+function closeViewRename() {
+  viewRenameDraft.value = null;
+}
+
 function onViewTreeContextMenu(event: MouseEvent) {
   const target = event.target;
   if (target instanceof Element && target.closest(".sp-view-row-shell, .sp-view-create-row")) return;
   event.preventDefault();
   event.stopPropagation();
+  closeViewRename();
   viewDeleteConfirm.value = null;
   viewCtxMenu.value = { x: event.clientX, y: event.clientY, kind: "root" };
 }
@@ -528,6 +567,7 @@ function onViewTreeContextMenu(event: MouseEvent) {
 function openViewContextMenu(event: MouseEvent, row: VisibleViewRow) {
   event.preventDefault();
   event.stopPropagation();
+  closeViewRename();
   viewDeleteConfirm.value = null;
   viewCtxMenu.value = {
     x: event.clientX,
@@ -548,9 +588,18 @@ function viewCreateDepthForMenu(menu: ViewContextMenuState): number {
   return 0;
 }
 
+function viewDepthForNode(node: ViewTreeNode): number {
+  const row = visibleViewEntries.value.find(
+    (entry): entry is Extract<VisibleViewEntry, { type: "row" }> =>
+      entry.type === "row" && entry.row.node.key === node.key,
+  );
+  return row?.row.depth ?? 0;
+}
+
 async function beginCreateViewFolder() {
   const menu = viewCtxMenu.value;
   if (!menu || menu.kind === "view") return;
+  closeViewRename();
   if (menu.kind === "folder" && !isViewNodeExpanded(menu.node)) {
     setViewNodeExpanded(menu.node.key, true);
   }
@@ -574,6 +623,10 @@ function setViewCreateFolderInputRef(element: Element | ComponentPublicInstance 
   viewCreateFolderInputRef.value = element instanceof HTMLInputElement ? element : null;
 }
 
+function setViewRenameInputRef(element: Element | ComponentPublicInstance | null) {
+  viewRenameInputRef.value = element instanceof HTMLInputElement ? element : null;
+}
+
 async function submitViewCreateFolder() {
   const draft = viewCreateFolderDraft.value;
   const name = draft?.name.trim();
@@ -587,6 +640,60 @@ async function submitViewCreateFolder() {
     notificationStore.addNotice("error", err.message, {
       code: err.code,
       operation: "createViewFolder",
+      skipConsoleLog: true,
+    });
+  }
+}
+
+async function beginRenameViewEntry() {
+  const menu = viewCtxMenu.value;
+  if (!menu || menu.kind === "root") return;
+  closeViewCreateFolder();
+  viewDeleteConfirm.value = null;
+  viewRenameDraft.value = {
+    relPath: menu.node.relPath,
+    kind: menu.node.kind,
+    anchorKey: menu.node.key,
+    depth: viewDepthForNode(menu.node),
+    currentName: menu.node.label,
+    name: menu.node.label,
+  };
+  closeViewContextMenu();
+  await nextTick();
+  viewRenameInputRef.value?.focus();
+  viewRenameInputRef.value?.select();
+}
+
+function isRenamingViewNode(node: ViewTreeNode): boolean {
+  return viewRenameDraft.value?.anchorKey === node.key;
+}
+
+function updateViewRenameName(event: Event) {
+  const target = event.target;
+  if (target instanceof HTMLInputElement && viewRenameDraft.value) {
+    viewRenameDraft.value.name = target.value;
+  }
+}
+
+async function submitViewRename() {
+  const draft = viewRenameDraft.value;
+  const name = draft?.name.trim();
+  if (!draft || !name) return;
+  if (name === draft.currentName) {
+    closeViewRename();
+    return;
+  }
+  try {
+    const snapshot = await viewRenameEntry({ relPath: draft.relPath, name });
+    viewSummaries.value = snapshot.views;
+    viewFolders.value = snapshot.folders;
+    viewTreeOrder.value = snapshot.order ?? [];
+    closeViewRename();
+  } catch (error) {
+    const err = normalizeAppError(error);
+    notificationStore.addNotice("error", err.message, {
+      code: err.code,
+      operation: "renameViewEntry",
       skipConsoleLog: true,
     });
   }
@@ -610,6 +717,7 @@ async function confirmDeleteViewEntry() {
     const snapshot = await viewDeleteEntry({ relPath: node.relPath });
     viewSummaries.value = snapshot.views;
     viewFolders.value = snapshot.folders;
+    viewTreeOrder.value = snapshot.order ?? [];
     closeViewDeleteConfirm();
   } catch (error) {
     const err = normalizeAppError(error);
@@ -624,20 +732,30 @@ async function confirmDeleteViewEntry() {
 function clearViewDragState() {
   draggingViewNode.value = null;
   viewDragTargetKey.value = "";
+  viewDragTargetPosition.value = "";
 }
 
 function viewNodeParentRelPath(node: ViewTreeNode): string {
   return viewPathDirname(node.relPath);
 }
 
-function canDropViewNodeOnDir(node: ViewTreeNode | null, targetDirRelPath: string): boolean {
+function canPlaceViewNodeInDir(node: ViewTreeNode | null, targetDirRelPath: string): boolean {
   if (!node) return false;
   const targetDir = normalizeViewPath(targetDirRelPath);
-  if (targetDir === viewNodeParentRelPath(node)) return false;
   if (node.kind === "folder") {
     return targetDir !== node.relPath && !targetDir.startsWith(`${node.relPath}/`);
   }
   return true;
+}
+
+function canDropViewNodeInsideDir(node: ViewTreeNode | null, targetDirRelPath: string): boolean {
+  if (!canPlaceViewNodeInDir(node, targetDirRelPath) || !node) return false;
+  return normalizeViewPath(targetDirRelPath) !== viewNodeParentRelPath(node);
+}
+
+function canDropViewNodeNearRow(node: ViewTreeNode | null, row: VisibleViewRow): boolean {
+  if (!node || row.node.relPath === node.relPath) return false;
+  return canPlaceViewNodeInDir(node, viewNodeParentRelPath(row.node));
 }
 
 function canDragViewNode(node: ViewTreeNode): boolean {
@@ -708,21 +826,42 @@ function resolveViewDropTargetFromPoint(
 
   const rowElement = target.closest<HTMLElement>(".sp-view-row-shell");
   if (rowElement) {
-    if (rowElement.dataset.viewNodeKind !== "folder") return null;
     const row = visibleViewRowByNodeKey(rowElement.dataset.viewNodeKey ?? "");
-    if (!row || row.node.kind !== "folder") return null;
-    if (!canDropViewNodeOnDir(node, row.node.relPath)) return null;
+    if (!row) return null;
+    const rect = rowElement.getBoundingClientRect();
+    const offsetRatio = rect.height > 0 ? (y - rect.top) / rect.height : 0.5;
+    if (row.node.kind === "folder" && offsetRatio >= 0.25 && offsetRatio <= 0.75) {
+      if (!canDropViewNodeInsideDir(node, row.node.relPath)) return null;
+      return {
+        key: row.node.key,
+        targetDirRelPath: row.node.relPath,
+        position: "inside",
+      };
+    }
+    if (!canDropViewNodeNearRow(node, row)) return null;
+    const targetDirRelPath = viewNodeParentRelPath(row.node);
+    if (offsetRatio < 0.5) {
+      return {
+        key: row.node.key,
+        targetDirRelPath,
+        position: "before",
+        insertBeforeRelPath: row.node.relPath,
+      };
+    }
     return {
       key: row.node.key,
-      relPath: row.node.relPath,
+      targetDirRelPath,
+      position: "after",
+      insertAfterRelPath: row.node.relPath,
     };
   }
 
   const listElement = target.closest<HTMLElement>(".sp-view-list");
-  if (listElement && canDropViewNodeOnDir(node, "")) {
+  if (listElement && canDropViewNodeInsideDir(node, "")) {
     return {
       key: VIEW_ROOT_ANCHOR_KEY,
-      relPath: "",
+      targetDirRelPath: "",
+      position: "inside",
     };
   }
 
@@ -734,12 +873,14 @@ function updateViewPointerDropTarget(event: PointerEvent) {
   if (!state?.active) return;
   const target = resolveViewDropTargetFromPoint(event.clientX, event.clientY, state.node);
   viewDragTargetKey.value = target?.key ?? "";
+  viewDragTargetPosition.value = target?.position ?? "";
 }
 
 function onViewPointerDown(row: VisibleViewRow, event: PointerEvent) {
   if (
     event.button !== 0 ||
     viewCreateFolderDraft.value ||
+    viewRenameDraft.value ||
     !canDragViewNode(row.node) ||
     shouldIgnoreViewPointerDrag(event)
   ) {
@@ -782,6 +923,7 @@ function onViewPointerMove(event: PointerEvent) {
     viewDragTargetKey.value = "";
     closeViewContextMenu();
     closeViewCreateFolder();
+    closeViewRename();
     document.body.classList.add("sp-view-pointer-dragging");
   }
 
@@ -808,17 +950,18 @@ async function finishViewPointerDrag(event: PointerEvent) {
     return;
   }
 
-  await moveViewNodeToDir(state.node, target.relPath, target.key);
+  await moveViewNodeToTarget(state.node, target);
 }
 
 function onViewDragStart(row: VisibleViewRow, event: DragEvent) {
-  if (viewCreateFolderDraft.value || !canDragViewNode(row.node)) {
+  if (viewCreateFolderDraft.value || viewRenameDraft.value || !canDragViewNode(row.node)) {
     event.preventDefault();
     return;
   }
   closeViewContextMenu();
   draggingViewNode.value = row.node;
   viewDragTargetKey.value = "";
+  viewDragTargetPosition.value = "";
   if (event.dataTransfer) {
     event.dataTransfer.effectAllowed = "move";
     event.dataTransfer.setData("text/plain", row.node.relPath);
@@ -830,33 +973,41 @@ function onViewDragEnd() {
 }
 
 function onViewFolderDragOver(row: VisibleViewRow, event: DragEvent) {
-  if (row.node.kind !== "folder" || !draggingViewNode.value) return;
-  if (!canDropViewNodeOnDir(draggingViewNode.value, row.node.relPath)) return;
+  if (!draggingViewNode.value) return;
+  const target = resolveViewDropTargetFromPoint(event.clientX, event.clientY, draggingViewNode.value);
+  if (!target || target.key !== row.node.key) return;
   event.preventDefault();
   if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
-  viewDragTargetKey.value = row.node.key;
+  viewDragTargetKey.value = target.key;
+  viewDragTargetPosition.value = target.position;
 }
 
-async function moveViewNodeToDir(
+async function moveViewNodeToTarget(
   node: ViewTreeNode,
-  targetDirRelPath: string,
-  targetKey = targetDirRelPath ? viewFolderKeyForRelPath(targetDirRelPath) : VIEW_ROOT_ANCHOR_KEY,
+  target: ViewDropTarget,
 ) {
-  if (!canDropViewNodeOnDir(node, targetDirRelPath)) {
+  const canDrop =
+    target.position === "inside"
+      ? canDropViewNodeInsideDir(node, target.targetDirRelPath)
+      : canPlaceViewNodeInDir(node, target.targetDirRelPath);
+  if (!canDrop) {
     clearViewDragState();
     return;
   }
   clearViewDragState();
-  if (targetKey !== VIEW_ROOT_ANCHOR_KEY) {
-    setViewNodeExpanded(targetKey, true);
+  if (target.position === "inside" && target.key !== VIEW_ROOT_ANCHOR_KEY) {
+    setViewNodeExpanded(target.key, true);
   }
   try {
     const snapshot = await viewMoveEntry({
       sourceRelPath: node.relPath,
-      targetDirRelPath,
+      targetDirRelPath: target.targetDirRelPath,
+      insertBeforeRelPath: target.insertBeforeRelPath,
+      insertAfterRelPath: target.insertAfterRelPath,
     });
     viewSummaries.value = snapshot.views;
     viewFolders.value = snapshot.folders;
+    viewTreeOrder.value = snapshot.order ?? [];
   } catch (error) {
     const err = normalizeAppError(error);
     notificationStore.addNotice("error", err.message, {
@@ -865,6 +1016,18 @@ async function moveViewNodeToDir(
       skipConsoleLog: true,
     });
   }
+}
+
+async function moveViewNodeToDir(
+  node: ViewTreeNode,
+  targetDirRelPath: string,
+  targetKey = targetDirRelPath ? viewFolderKeyForRelPath(targetDirRelPath) : VIEW_ROOT_ANCHOR_KEY,
+) {
+  await moveViewNodeToTarget(node, {
+    key: targetKey,
+    targetDirRelPath,
+    position: "inside",
+  });
 }
 
 async function moveDraggingViewNode(targetDirRelPath: string, targetKey?: string) {
@@ -877,29 +1040,31 @@ async function moveDraggingViewNode(targetDirRelPath: string, targetKey?: string
 }
 
 function onViewFolderDrop(row: VisibleViewRow, event: DragEvent) {
-  if (row.node.kind !== "folder" || !draggingViewNode.value) return;
-  if (!canDropViewNodeOnDir(draggingViewNode.value, row.node.relPath)) {
+  if (!draggingViewNode.value) return;
+  const target = resolveViewDropTargetFromPoint(event.clientX, event.clientY, draggingViewNode.value);
+  if (!target || target.key !== row.node.key) {
     clearViewDragState();
     return;
   }
   event.preventDefault();
   event.stopPropagation();
-  void moveDraggingViewNode(row.node.relPath, row.node.key);
+  void moveViewNodeToTarget(draggingViewNode.value, target);
 }
 
 function onViewRootDragOver(event: DragEvent) {
   const target = event.target;
   if (target instanceof Element && target.closest(".sp-view-row-shell, .sp-view-create-row")) return;
-  if (!canDropViewNodeOnDir(draggingViewNode.value, "")) return;
+  if (!canDropViewNodeInsideDir(draggingViewNode.value, "")) return;
   event.preventDefault();
   if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
   viewDragTargetKey.value = VIEW_ROOT_ANCHOR_KEY;
+  viewDragTargetPosition.value = "inside";
 }
 
 function onViewRootDrop(event: DragEvent) {
   const target = event.target;
   if (target instanceof Element && target.closest(".sp-view-row-shell, .sp-view-create-row")) return;
-  if (!canDropViewNodeOnDir(draggingViewNode.value, "")) {
+  if (!canDropViewNodeInsideDir(draggingViewNode.value, "")) {
     clearViewDragState();
     return;
   }
@@ -1003,6 +1168,10 @@ function onViewHelpKeydown(event: KeyboardEvent) {
 watch(
   () => [props.workingDir, showSessionViews.value] as const,
   () => {
+    closeViewContextMenu();
+    closeViewCreateFolder();
+    closeViewRename();
+    viewDeleteConfirm.value = null;
     void loadViews();
   },
 );
@@ -1526,7 +1695,15 @@ function ctxArchive() {
               folder: entry.row.node.kind === 'folder',
               open: entry.row.expanded,
               dragging: draggingViewNode?.key === entry.row.node.key,
-              'drop-target': viewDragTargetKey === entry.row.node.key,
+              'drop-target':
+                viewDragTargetKey === entry.row.node.key &&
+                viewDragTargetPosition === 'inside',
+              'drop-before':
+                viewDragTargetKey === entry.row.node.key &&
+                viewDragTargetPosition === 'before',
+              'drop-after':
+                viewDragTargetKey === entry.row.node.key &&
+                viewDragTargetPosition === 'after',
               opening: entry.row.node.kind === 'view' && entry.row.node.view && viewOpeningKey === `${viewDisplayPath(entry.row.node.view)}:${entry.row.node.view.id}`,
             }"
             draggable="false"
@@ -1540,7 +1717,73 @@ function ctxArchive() {
             @dragover="onViewFolderDragOver(entry.row, $event)"
             @drop="onViewFolderDrop(entry.row, $event)"
           >
+            <div
+              v-if="isRenamingViewNode(entry.row.node)"
+              class="sp-view-rename-row"
+              :style="{ paddingLeft: `${viewTreeIndentPx(entry.row.depth)}px` }"
+              @click.stop
+              @pointerdown.stop
+            >
+              <span class="sp-view-branch-spacer" aria-hidden="true"></span>
+              <span
+                v-if="entry.row.node.kind === 'folder'"
+                class="sp-view-kind-icon folder"
+                :class="{ open: entry.row.expanded }"
+                aria-hidden="true"
+              >
+                <LucideIcon
+                  :icon="entry.row.expanded ? FolderOpen : Folder"
+                  :size="13"
+                  :stroke-width="2"
+                />
+              </span>
+              <span
+                v-else
+                class="sp-view-kind-icon view"
+                aria-hidden="true"
+              >
+                <LucideIcon
+                  :icon="resolveLocusViewIcon(entry.row.node.view?.icon)"
+                  :size="13"
+                  :stroke-width="2"
+                />
+              </span>
+              <div class="sp-view-rename-body">
+                <input
+                  :ref="setViewRenameInputRef"
+                  :value="viewRenameDraft?.name ?? ''"
+                  class="sp-view-rename-input"
+                  :placeholder="t('view.tree.renamePlaceholder')"
+                  :aria-label="t('view.tree.rename')"
+                  @input="updateViewRenameName"
+                  @keydown.enter.prevent="submitViewRename"
+                  @keydown.esc.prevent="closeViewRename"
+                />
+                <div class="sp-view-rename-actions">
+                  <BaseButton
+                    class="sp-view-rename-action"
+                    type="button"
+                    :title="t('common.confirm')"
+                    :disabled="!canSubmitViewRename"
+                    @pointerdown.prevent
+                    @click="submitViewRename"
+                  >
+                    <LucideIcon :icon="Check" :size="12" :stroke-width="2.4" />
+                  </BaseButton>
+                  <BaseButton
+                    class="sp-view-rename-action"
+                    type="button"
+                    :title="t('common.cancel')"
+                    @pointerdown.prevent
+                    @click="closeViewRename"
+                  >
+                    <LucideIcon :icon="X" :size="12" :stroke-width="2.4" />
+                  </BaseButton>
+                </div>
+              </div>
+            </div>
             <button
+              v-else
               type="button"
               class="sp-view-row"
               :style="{ paddingLeft: `${viewTreeIndentPx(entry.row.depth)}px` }"
@@ -1702,6 +1945,15 @@ function ctxArchive() {
         <button type="button" class="sp-ctx-item" @click="beginCreateViewFolder">{{ t('view.tree.createFolder') }}</button>
         <div v-if="viewCtxMenu.kind === 'folder'" class="sp-ctx-sep"></div>
       </template>
+      <button
+        v-if="viewCtxMenu.kind === 'folder' || viewCtxMenu.kind === 'view'"
+        type="button"
+        class="sp-ctx-item"
+        @click.stop="beginRenameViewEntry"
+      >
+        {{ t('view.tree.rename') }}
+      </button>
+      <div v-if="viewCtxMenu.kind === 'folder' || viewCtxMenu.kind === 'view'" class="sp-ctx-sep"></div>
       <button
         v-if="viewCtxMenu.kind === 'view'"
         type="button"
@@ -2098,6 +2350,27 @@ function ctxArchive() {
   box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent-color) 32%, var(--border-color));
 }
 
+.sp-view-row-shell.drop-before::before,
+.sp-view-row-shell.drop-after::after {
+  content: "";
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  height: 2px;
+  border-radius: 2px;
+  background: var(--accent-color);
+  pointer-events: none;
+  z-index: 1;
+}
+
+.sp-view-row-shell.drop-before::before {
+  top: 0;
+}
+
+.sp-view-row-shell.drop-after::after {
+  bottom: 0;
+}
+
 .sp-view-row {
   width: 100%;
   min-width: 0;
@@ -2264,6 +2537,58 @@ function ctxArchive() {
 }
 
 .sp-view-create-action {
+  width: 24px;
+  min-width: 24px;
+  height: 24px;
+  padding: 0;
+}
+
+.sp-view-rename-row {
+  width: 100%;
+  min-width: 0;
+  min-height: 30px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 8px 2px 16px;
+  background: color-mix(in srgb, var(--active-bg) 78%, transparent);
+}
+
+.sp-view-rename-body {
+  min-width: 0;
+  flex: 1 1 auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.sp-view-rename-input {
+  min-width: 0;
+  flex: 1 1 auto;
+  height: 24px;
+  padding: 0 8px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--panel-bg) 82%, var(--bg-color));
+  color: var(--text-color);
+  font: inherit;
+  font-size: 12px;
+}
+
+.sp-view-rename-input:focus {
+  outline: none;
+  border-color: var(--accent-color);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent-color) 24%, transparent);
+}
+
+.sp-view-rename-actions {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.sp-view-rename-action {
   width: 24px;
   min-width: 24px;
   height: 24px;

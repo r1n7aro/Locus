@@ -50,6 +50,7 @@ import {
   viewContentHide,
   viewContentMount,
   viewDetachTab,
+  viewHostRevealed,
   viewHostPoolPrepare,
   viewHostPoolReady,
   viewHostIdFromLocation,
@@ -59,6 +60,9 @@ import {
   viewReadFrontendLog,
   viewRequiresUnityConnection,
   viewSetTabHost,
+  viewStorageGet,
+  viewStorageRemove,
+  viewStorageSet,
   type ViewFrontendLogEntry,
   type ViewFrontendLogLevel,
   type ViewAutomationRequest,
@@ -102,6 +106,7 @@ const VIEW_HOST_DETACH_OFFSET_Y = 18;
 const UNITY_EMBED_WINDOW_LABEL_PREFIX = "unity-embed-";
 const VIEW_CONTENT_WINDOW_LABEL_PREFIX = "view-content-";
 const VIEW_CONTENT_SYNC_FRAME_MS = 16;
+const VIEW_HOST_CONTENT_DEBUG = false;
 
 const props = withDefaults(defineProps<{
   embedded?: boolean;
@@ -130,6 +135,8 @@ interface ViewHostTabsMergeDonePayload {
 
 interface ViewHostTabsSelectPayload {
   viewId: string;
+  targetLabel?: string;
+  allowPoolClaim?: boolean;
 }
 
 interface ViewHostTabsDropTargetPayload {
@@ -334,6 +341,7 @@ const latestFrontendLogText = computed(() => {
 });
 
 function viewHostContentLog(event: string, detail: Record<string, unknown> = {}) {
+  if (!VIEW_HOST_CONTENT_DEBUG) return;
   const now = perfNowMs();
   const payload = {
     hostLabel: currentWindowLabel,
@@ -362,6 +370,14 @@ async function revealViewHostWindow(reason: string) {
         message: normalizeAppError(focusError).message,
       });
     });
+    if (currentWindowLabel) {
+      await viewHostRevealed(currentWindowLabel).catch((ownerError) => {
+        viewHostContentLog("host-reveal-owner-sync-failed", {
+          reason,
+          message: normalizeAppError(ownerError).message,
+        });
+      });
+    }
     viewHostContentLog("host-reveal-done", {
       reason,
       elapsedMs: elapsedMs(revealStartedAt),
@@ -411,6 +427,15 @@ async function syncMaximizedState() {
     isMaximized.value = await appWindow.isMaximized();
   } catch {
     isMaximized.value = false;
+  }
+}
+
+async function syncAlwaysOnTopState() {
+  if (!appWindow) return;
+  try {
+    alwaysOnTop.value = await appWindow.isAlwaysOnTop();
+  } catch {
+    alwaysOnTop.value = false;
   }
 }
 
@@ -764,10 +789,23 @@ async function applyMergedViewTabs(payload: ViewHostTabsMergePayload) {
 
 async function selectHostedViewTab(payload: ViewHostTabsSelectPayload) {
   const claimStartedAt = perfNowMs();
+  const targetLabel = String(payload.targetLabel || "").trim();
+  if (targetLabel && currentWindowLabel && targetLabel !== currentWindowLabel) {
+    viewHostContentLog("claim-ignored-target", {
+      viewId: payload.viewId,
+      targetLabel,
+      elapsedMs: elapsedMs(claimStartedAt),
+    });
+    return;
+  }
   const hasHostedTab = tabs.value.some((tab) => tab.id === payload.viewId);
-  const canClaimPoolTab = isViewHostPoolWindow && tabs.value.length === 0;
+  const canClaimPoolTab = isViewHostPoolWindow
+    && tabs.value.length === 0
+    && payload.allowPoolClaim === true;
   viewHostContentLog("claim-start", {
     viewId: payload.viewId,
+    targetLabel,
+    allowPoolClaim: payload.allowPoolClaim === true,
     hasTab: hasHostedTab,
     canClaimPoolTab,
   });
@@ -1019,8 +1057,8 @@ async function detachTab(tabId: string, point: { x: number; y: number }) {
     const result = await viewDetachTab({
       viewId: tab.id,
       sourceHostLabel: currentWindowLabel,
-      x: Math.max(0, Math.round(point.x - VIEW_HOST_DETACH_OFFSET_X)),
-      y: Math.max(0, Math.round(point.y - VIEW_HOST_DETACH_OFFSET_Y)),
+      x: Math.round(point.x - VIEW_HOST_DETACH_OFFSET_X),
+      y: Math.round(point.y - VIEW_HOST_DETACH_OFFSET_Y),
     });
     viewHostContentLog("detach-command-done", {
       tabId,
@@ -2361,6 +2399,9 @@ async function loadView(
               getLocusRuntime().subscribe<StreamEvent>("stream-event", handler),
             readFrontendLog: (limit) => viewReadFrontendLog({ viewId: next.manifest.id, limit }),
             openFrontendLog: () => viewOpenFrontendLog(next.manifest.id),
+            storageGet: (key) => viewStorageGet({ viewId: next.manifest.id, key }),
+            storageSet: (key, value) => viewStorageSet({ viewId: next.manifest.id, key, value }),
+            storageRemove: (key) => viewStorageRemove({ viewId: next.manifest.id, key }),
             onUpdate: (handler) =>
               getLocusRuntime().subscribe<ViewRuntimeUpdateEvent>("unity-editor-update", handler),
             reload: () => loadView(record.viewId, { force: true }),
@@ -2446,6 +2487,7 @@ onMounted(async () => {
   hostMountedAt = perfNowMs();
   viewHostContentLog("host-mounted", { initialViewId });
   void syncMaximizedState();
+  void syncAlwaysOnTopState();
   refreshConsoleLogCapture();
   void refreshLatestFrontendLog();
   installViewContentPoolObservers();

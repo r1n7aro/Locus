@@ -130,6 +130,19 @@ fn collect_display(app_handle: &tauri::AppHandle, out: &mut Vec<ConfigEntry>) {
         storage: "persistent_config_dir/config.json → view_windows_above_main".into(),
         current_value: view_windows_above_main.to_string(),
     });
+    let view_open_in_existing_window = app_handle
+        .try_state::<Arc<crate::config::AppConfig>>()
+        .map(|config| config.view_open_in_existing_window_enabled())
+        .unwrap_or(true);
+    out.push(ConfigEntry {
+        key: "display.view_open_in_existing_window".into(),
+        category: "display".into(),
+        label: "Open New Views In Existing Window".into(),
+        description: "Open a new View as a tab in an existing View window when one is available."
+            .into(),
+        storage: "persistent_config_dir/config.json → view_open_in_existing_window".into(),
+        current_value: view_open_in_existing_window.to_string(),
+    });
 
     for (key_suffix, label, desc) in [
         (

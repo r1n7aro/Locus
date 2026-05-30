@@ -5,7 +5,12 @@ import { useTheme, type ThemePreference } from "../../composables/useTheme";
 import { useDisplaySettings, type DiffReviewTarget, type FontSlot } from "../../composables/useDisplaySettings";
 import { normalizeAppError } from "../../services/errors";
 import { ipcInvoke } from "../../services/ipc";
-import { getViewWindowsAboveMain, setViewWindowsAboveMain } from "../../services/system";
+import {
+  getViewOpenInExistingWindow,
+  getViewWindowsAboveMain,
+  setViewOpenInExistingWindow,
+  setViewWindowsAboveMain,
+} from "../../services/system";
 import { useNotificationStore } from "../../stores/notification";
 import BaseSegmented from "../ui/BaseSegmented.vue";
 import BaseSwitch from "../ui/BaseSwitch.vue";
@@ -13,6 +18,9 @@ import BaseSwitch from "../ui/BaseSwitch.vue";
 const { mainPreference, unityEmbedPreference, setThemePreference } = useTheme();
 const { state: display, set: setDisplay, setFont } = useDisplaySettings();
 const notificationStore = useNotificationStore();
+const viewOpenInExistingWindow = ref(true);
+const viewOpenInExistingWindowReady = ref(false);
+const viewOpenInExistingWindowBusy = ref(false);
 const viewWindowsAboveMain = ref(false);
 const viewWindowsAboveMainReady = ref(false);
 const viewWindowsAboveMainBusy = ref(false);
@@ -46,11 +54,26 @@ const fontSlots: { slot: FontSlot; labelKey: string; mono: boolean }[] = [
 const systemFonts = ref<string[]>([]);
 
 onMounted(async () => {
+  void refreshViewOpenInExistingWindow();
   void refreshViewWindowsAboveMain();
   try {
     systemFonts.value = await ipcInvoke<string[]>("get_system_fonts");
   } catch { /* fallback: empty list, user can still type */ }
 });
+
+async function refreshViewOpenInExistingWindow() {
+  try {
+    viewOpenInExistingWindow.value = await getViewOpenInExistingWindow();
+  } catch (e) {
+    const err = normalizeAppError(e);
+    notificationStore.addNotice("error", err.message, {
+      code: err.code,
+      operation: "loadViewOpenInExistingWindow",
+    });
+  } finally {
+    viewOpenInExistingWindowReady.value = true;
+  }
+}
 
 async function refreshViewWindowsAboveMain() {
   try {
@@ -63,6 +86,25 @@ async function refreshViewWindowsAboveMain() {
     });
   } finally {
     viewWindowsAboveMainReady.value = true;
+  }
+}
+
+async function updateViewOpenInExistingWindow(value: boolean) {
+  if (!viewOpenInExistingWindowReady.value || viewOpenInExistingWindowBusy.value) return;
+  const previous = viewOpenInExistingWindow.value;
+  viewOpenInExistingWindow.value = value;
+  viewOpenInExistingWindowBusy.value = true;
+  try {
+    await setViewOpenInExistingWindow(value);
+  } catch (e) {
+    viewOpenInExistingWindow.value = previous;
+    const err = normalizeAppError(e);
+    notificationStore.addNotice("error", err.message, {
+      code: err.code,
+      operation: "saveViewOpenInExistingWindow",
+    });
+  } finally {
+    viewOpenInExistingWindowBusy.value = false;
   }
 }
 
@@ -190,6 +232,16 @@ async function updateViewWindowsAboveMain(value: boolean) {
         @update:model-value="setDisplay('showViewsInSessionPanel', $event)"
       />
       <span>{{ t("settings.display.showViewsInSessionPanel") }}</span>
+    </div>
+
+    <div class="toggle-row" :class="{ disabled: !viewOpenInExistingWindowReady || viewOpenInExistingWindowBusy }">
+      <BaseSwitch
+        :model-value="viewOpenInExistingWindow"
+        :disabled="!viewOpenInExistingWindowReady || viewOpenInExistingWindowBusy"
+        :aria-label="t('settings.display.viewOpenInExistingWindow')"
+        @update:model-value="updateViewOpenInExistingWindow"
+      />
+      <span>{{ t("settings.display.viewOpenInExistingWindow") }}</span>
     </div>
 
     <div class="toggle-row" :class="{ disabled: !viewWindowsAboveMainReady || viewWindowsAboveMainBusy }">

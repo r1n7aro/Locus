@@ -62,6 +62,8 @@ describe("View sidebar settings", () => {
     expect(sessionPanel).toContain("class=\"sp-view-row-shell\"");
     expect(sessionPanel).toContain("@drop=\"onViewFolderDrop(entry.row, $event)\"");
     expect(sessionPanel).toContain("class=\"sp-view-create-actions\"");
+    expect(sessionPanel).toContain("class=\"sp-view-rename-input\"");
+    expect(sessionPanel).toContain("beginRenameViewEntry");
     expect(sessionPanel).toContain("@click=\"closeViewCreateFolder\"");
     expect(sessionPanel).not.toContain("sp-view-refresh");
 
@@ -74,7 +76,9 @@ describe("View sidebar settings", () => {
     expect(en).toContain('"view.list.helpBody": "Views are experimental tools for creating, opening, and running project editors through Locus\'s own frontend. The agent can combine a Vue frontend, runtime scripts, and Unity data bindings into a View package that runs inside Locus as a standalone tool."');
     expect(en).toContain('"view.list.helpCreate": "Type /view with a request in a session and the agent enters the View workflow to create or update a View package. Generated Views appear in the current workspace Locus/View list and open when selected."');
     expect(zh).toContain('"view.tree.createFolder": "新建文件夹"');
+    expect(zh).toContain('"view.tree.rename": "重命名"');
     expect(en).toContain('"view.tree.createFolder": "New Folder"');
+    expect(en).toContain('"view.tree.rename": "Rename"');
     expect(zh).toContain('"view.action.reveal": "在文件游览器中显示"');
     expect(en).toContain('"view.action.reveal": "Show in File Explorer"');
   });
@@ -103,6 +107,7 @@ describe("View sidebar settings", () => {
     expect(viewPage).toContain("viewTree()");
     expect(viewPage).toContain("viewCreateFolder");
     expect(viewPage).toContain("viewDeleteEntry");
+    expect(viewPage).toContain("viewRenameEntry");
     expect(viewPage).toContain("viewMoveEntry");
     expect(viewPage).toContain("view-tree-changed");
     expect(viewPage).toContain("visibleViewEntries");
@@ -115,6 +120,8 @@ describe("View sidebar settings", () => {
     expect(viewPage).toContain("class=\"view-tree-row-actions\"");
     expect(viewPage).toContain("@click.stop=\"openTreeView(entry.row)\"");
     expect(viewPage).toContain(".view-tree-row-shell:hover .view-tree-row-actions");
+    expect(viewPage).toContain("class=\"view-tree-rename-input\"");
+    expect(viewPage).toContain("beginRenameFromContext");
     expect(viewPage).toContain("class=\"view-tree-create-actions\"");
     expect(viewPage).toContain("view.tree.deleteConfirmMessage");
   });
@@ -147,18 +154,22 @@ describe("View sidebar settings", () => {
     expect(service).toContain("export function viewTree");
     expect(service).toContain("export function viewCreateFolder");
     expect(service).toContain("export function viewDeleteEntry");
+    expect(service).toContain("export function viewRenameEntry");
     expect(service).toContain("export function viewMoveEntry");
     expect(commands).toContain("pub async fn view_tree");
     expect(commands).toContain("pub async fn view_create_folder");
     expect(commands).toContain("pub async fn view_delete_entry");
+    expect(commands).toContain("pub async fn view_rename_entry");
     expect(commands).toContain("pub async fn view_move_entry");
     expect(lib).toContain("commands::view_tree");
     expect(lib).toContain("commands::view_create_folder");
     expect(lib).toContain("commands::view_delete_entry");
+    expect(lib).toContain("commands::view_rename_entry");
     expect(lib).toContain("commands::view_move_entry");
     expect(runtime).toContain("pub display_path: Option<String>");
     expect(runtime).toContain("VIEW_TREE_METADATA_REL_PATH");
     expect(runtime).toContain("set_view_manifest_display_path");
+    expect(runtime).toContain("pub fn rename_view_entry_sync");
     expect(runtime).toContain("std::fs::remove_dir_all(root)");
     expect(runtime).not.toContain("std::fs::rename(&source, &target)");
   });

@@ -211,11 +211,16 @@ pub(super) fn view_run() -> ToolDef {
                     .try_state::<Arc<crate::config::AppConfig>>()
                     .map(|config| config.view_windows_above_main_enabled())
                     .unwrap_or(false);
+                let view_open_in_existing_window = app_handle
+                    .try_state::<Arc<crate::config::AppConfig>>()
+                    .map(|config| config.view_open_in_existing_window_enabled())
+                    .unwrap_or(true);
                 match crate::view::open_view_window(
                     &app_handle,
                     &working_dir,
                     &view_id,
                     view_windows_above_main,
+                    view_open_in_existing_window,
                 )
                 .await
                 {
