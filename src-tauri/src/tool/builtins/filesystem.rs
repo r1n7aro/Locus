@@ -614,6 +614,9 @@ fn line_trimmed_match(content: &str, find: &str) -> Option<String> {
     if search.is_empty() {
         return None;
     }
+    if search.len() > orig.len() {
+        return None;
+    }
     for i in 0..=orig.len().saturating_sub(search.len()) {
         if search.iter().enumerate().all(|(j, l)| {
             orig.get(i + j)
@@ -647,6 +650,9 @@ fn whitespace_normalized_match(content: &str, find: &str) -> Option<String> {
         return None;
     }
     let cl: Vec<&str> = content.lines().collect();
+    if fl.len() > cl.len() {
+        return None;
+    }
     for i in 0..=cl.len().saturating_sub(fl.len()) {
         let block = cl[i..i + fl.len()].join(line_sep);
         if normalize(&block) == nf {
@@ -1091,6 +1097,40 @@ mod tests {
             .output
             .contains("Found multiple matches for oldString"));
         assert!(result.output.contains("at lines: 3, 5"));
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("read untouched file"),
+            original
+        );
+    }
+
+    #[test]
+    fn edit_reports_missing_old_string_when_search_block_is_longer_than_file() {
+        let root = tempdir().expect("temp dir");
+        let target = root.path().join("short.txt");
+        let original = "one\ntwo\nthree\nfour\nfive\nsix\nseven\n";
+        let old_string = (1..=15)
+            .map(|index| format!("missing line {}", index))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&target, original).expect("seed short file");
+
+        let result = tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(async {
+                (edit().execute)(
+                    json!({
+                        "filePath": target.to_string_lossy().to_string(),
+                        "oldString": old_string,
+                        "newString": "replacement",
+                        "replaceAll": false
+                    }),
+                    ToolExecutionContext::default(),
+                )
+                .await
+            });
+
+        assert!(result.is_error);
+        assert!(result.output.contains("Could not find oldString"));
         assert_eq!(
             std::fs::read_to_string(&target).expect("read untouched file"),
             original
