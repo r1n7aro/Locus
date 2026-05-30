@@ -380,6 +380,7 @@ pub fn run() {
             debug_flag_for_setup.store(loaded_config.debug_enabled(), Ordering::Relaxed);
             loaded_config.debug = debug_flag_for_setup.clone();
             let config = Arc::new(loaded_config);
+            unity_bridge::initialize_background_hook(config.unity_background_hook_enabled());
             startup_for_setup.mark("setup_config_ready");
 
             // Load OpenRouter API key from OS keychain only.
@@ -1168,6 +1169,9 @@ pub fn run() {
             commands::set_close_behavior,
             commands::get_dynamic_tool_loading_mode,
             commands::set_dynamic_tool_loading_mode,
+            commands::get_unity_background_hook_enabled,
+            commands::set_unity_background_hook_enabled,
+            commands::get_unity_background_hook_status,
             commands::get_view_windows_above_main,
             commands::set_view_windows_above_main,
             commands::get_proxy_status,
@@ -1192,6 +1196,8 @@ pub fn run() {
             commands::unity_embed_cancel_asset_drag,
             commands::unity_embed_start_native_asset_file_drag,
             commands::locus_start_native_file_drag,
+            commands::locus_start_drag_preview,
+            commands::locus_stop_drag_preview,
             commands::view_templates,
             commands::view_list,
             commands::view_tree,
@@ -1207,6 +1213,11 @@ pub fn run() {
             commands::view_run_in_unity,
             commands::view_set_tab_host,
             commands::view_detach_tab,
+            commands::view_host_pool_prepare,
+            commands::view_host_pool_ready,
+            commands::view_content_mount,
+            commands::view_content_hide,
+            commands::view_content_destroy,
             commands::view_compile_script,
             commands::view_call_script,
             commands::view_append_frontend_log,
