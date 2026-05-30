@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
+import { TableProperties } from "lucide";
 import {
   walkHtmlText,
   injectAssetRefs,
   injectFileRefs,
+  injectViewRefs,
   injectWorkspaceMentions,
 } from "../composables/markdownInject";
 import { prepareMarkdownImages } from "../composables/markdownImages";
@@ -367,6 +369,54 @@ describe("injectWorkspaceMentions", () => {
     expect(result).toContain('data-knowledge-type="skill"');
     expect(result).toContain('data-knowledge-path="skill/com.locus.psd-to-ugui/SKILL.md"');
     expect(result).not.toContain("md-workspace-ref");
+  });
+});
+
+describe("injectViewRefs", () => {
+  it("converts standalone view refs to openable View blocks", () => {
+    const result = injectViewRefs("<p>view:attack-config-table</p>", {
+      openLabel: "Open View",
+    });
+
+    expect(result).toContain("md-view-ref-block");
+    expect(result).toContain('data-view-id="attack-config-table"');
+    expect(result).toContain("md-view-open-button");
+    expect(result).toContain("Open View");
+    expect(result).not.toContain("<p>view:attack-config-table</p>");
+  });
+
+  it("converts standalone inline-code view refs", () => {
+    const result = injectViewRefs("<p><code>view:attack-config-table</code></p>");
+
+    expect(result).toContain("md-view-ref-block");
+    expect(result).toContain('data-view-id="attack-config-table"');
+  });
+
+  it("uses resolved View metadata for the View block icon and run id", () => {
+    const result = injectViewRefs("<p>view:{Gameplay/Attack Config Table}</p>", {
+      resolveViewRef: () => ({
+        id: "attack-config-table",
+        icon: TableProperties,
+        iconName: "TableProperties",
+      }),
+    });
+
+    expect(result).toContain('data-view-id="attack-config-table"');
+    expect(result).toContain('data-view-ref="Gameplay/Attack Config Table"');
+    expect(result).toContain('data-view-icon="TableProperties"');
+    expect(result).toContain("md-view-ref-kind-icon");
+  });
+
+  it("keeps non-standalone view refs as text", () => {
+    const html = "<p>Created view:attack-config-table for editing.</p>";
+
+    expect(injectViewRefs(html)).toBe(html);
+  });
+
+  it("does not convert fenced code block content", () => {
+    const html = "<pre><code>view:attack-config-table</code></pre>";
+
+    expect(injectViewRefs(html)).toBe(html);
   });
 });
 
