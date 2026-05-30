@@ -1,5 +1,8 @@
 use std::{collections::HashMap, path::Path, process::Stdio, sync::OnceLock, time::Duration};
 
+#[cfg(windows)]
+use std::ffi::c_void;
+
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
@@ -83,6 +86,96 @@ impl UnityEditorProcessInfo {
             last_error: None,
         }
     }
+}
+
+pub(super) async fn refresh_known_project_editor_process_liveness(
+    project_path: &str,
+    known_process: Option<UnityEditorProcessInfo>,
+) -> Option<UnityEditorProcessInfo> {
+    let key = process_cache_key(project_path);
+    let cached = {
+        let cache = unity_process_probe_cache().lock().await;
+        cache.get(&key).cloned()
+    };
+    let previous = known_process
+        .filter(|info| info.process_id.is_some())
+        .or_else(|| cached.filter(|info| info.process_id.is_some()))?;
+    let process_id = previous.process_id?;
+    let checked_at_ms = unix_now_ms();
+
+    let refreshed = match is_process_alive(process_id) {
+        Ok(true) => UnityEditorProcessInfo {
+            state: UnityEditorProcessState::Running,
+            process_id: previous.process_id,
+            executable_path: previous.executable_path,
+            project_path: previous.project_path,
+            checked_at_ms,
+            last_error: None,
+        },
+        Ok(false) => UnityEditorProcessInfo::not_running(checked_at_ms),
+        Err(error) => UnityEditorProcessInfo::unknown(checked_at_ms, error),
+    };
+
+    let mut cache = unity_process_probe_cache().lock().await;
+    cache.insert(key, refreshed.clone());
+    Some(refreshed)
+}
+
+#[cfg(windows)]
+fn is_process_alive(process_id: u32) -> Result<bool, String> {
+    type Bool = i32;
+    type Dword = u32;
+    type Handle = *mut c_void;
+
+    const FALSE: Bool = 0;
+    const PROCESS_QUERY_LIMITED_INFORMATION: Dword = 0x1000;
+    const STILL_ACTIVE: Dword = 259;
+    const ERROR_INVALID_PARAMETER: i32 = 87;
+
+    unsafe extern "system" {
+        fn CloseHandle(hObject: Handle) -> Bool;
+        fn GetExitCodeProcess(hProcess: Handle, lpExitCode: *mut Dword) -> Bool;
+        fn OpenProcess(dwDesiredAccess: Dword, bInheritHandle: Bool, dwProcessId: Dword) -> Handle;
+    }
+
+    struct OwnedHandle(Handle);
+
+    impl Drop for OwnedHandle {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
+
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, process_id) };
+    if handle.is_null() {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER) {
+            return Ok(false);
+        }
+        return Err(format!(
+            "Failed to open Unity process {} for liveness check: {}",
+            process_id, error
+        ));
+    }
+
+    let handle = OwnedHandle(handle);
+    let mut exit_code: Dword = 0;
+    if unsafe { GetExitCodeProcess(handle.0, &mut exit_code) } == 0 {
+        return Err(format!(
+            "Failed to query Unity process {} exit code: {}",
+            process_id,
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    Ok(exit_code == STILL_ACTIVE)
+}
+
+#[cfg(not(windows))]
+fn is_process_alive(_process_id: u32) -> Result<bool, String> {
+    Err("Unity process liveness detection is only supported on Windows".to_string())
 }
 
 fn normalize_project_identity(path: &str) -> Option<String> {

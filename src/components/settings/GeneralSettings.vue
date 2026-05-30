@@ -10,8 +10,11 @@ import { gitRuntimeState, gitSaveRuntimeSelection } from "../../services/git";
 import {
   getCloseBehavior,
   getPythonRuntimeState,
+  getUnityBackgroundHookEnabled,
+  getUnityBackgroundHookStatus,
   savePythonRuntimeSelection,
   setCloseBehavior,
+  setUnityBackgroundHookEnabled,
   type AppCloseBehavior,
 } from "../../services/system";
 import {
@@ -30,6 +33,7 @@ import type {
   GitRuntimeState,
   PythonRuntimeInfo,
   PythonRuntimeState,
+  UnityBackgroundHookStatus,
 } from "../../types";
 import { confirm, open } from "@tauri-apps/plugin-dialog";
 import { normalizeAppError } from "../../services/errors";
@@ -55,6 +59,10 @@ const debugBusy = ref(false);
 const closeBehavior = ref<AppCloseBehavior>("exit");
 const closeBehaviorReady = ref(false);
 const closeBehaviorBusy = ref(false);
+const unityBackgroundHookEnabled = ref(true);
+const unityBackgroundHookReady = ref(false);
+const unityBackgroundHookBusy = ref(false);
+const unityBackgroundHookStatus = ref<UnityBackgroundHookStatus | null>(null);
 const storageInfo = ref<AppStorageInfo | null>(null);
 const storageBusy = ref(false);
 const storageInfoLoadFailed = ref(false);
@@ -94,6 +102,18 @@ const debugStatusLabel = computed(() => {
   return debugEnabled.value
     ? t("settings.general.debugModeOn")
     : t("settings.general.debugModeOff");
+});
+
+const unityBackgroundHookStatusLabel = computed(() => {
+  if (!unityBackgroundHookReady.value) return t("common.loading");
+  const status = unityBackgroundHookStatus.value;
+  if (!unityBackgroundHookEnabled.value || status?.state === "disabled") {
+    return t("settings.general.unityBackgroundHookOff");
+  }
+  if (status?.state === "patched") return t("settings.general.unityBackgroundHookPatched");
+  if (status?.state === "failed") return t("settings.general.unityBackgroundHookFailed");
+  if (status?.state === "unsupported") return t("settings.general.unityBackgroundHookUnsupported");
+  return t("settings.general.unityBackgroundHookOn");
 });
 
 const pythonOptions = computed(() => {
@@ -148,6 +168,7 @@ const hasAvailableGitOption = computed(() => gitOptions.value.some((option) => !
 
 onMounted(() => {
   void refreshDebugMode();
+  void refreshUnityBackgroundHook();
   void refreshCloseBehavior();
   void refreshStorageInfo();
   void refreshTempInfo();
@@ -184,6 +205,52 @@ async function toggleDebug() {
     });
   } finally {
     debugBusy.value = false;
+  }
+}
+
+async function refreshUnityBackgroundHook() {
+  try {
+    const [enabled, status] = await Promise.all([
+      getUnityBackgroundHookEnabled(),
+      getUnityBackgroundHookStatus(),
+    ]);
+    unityBackgroundHookEnabled.value = enabled;
+    unityBackgroundHookStatus.value = status;
+  } catch (e) {
+    const err = normalizeAppError(e);
+    notificationStore.addNotice("error", err.message, {
+      code: err.code,
+      operation: "loadUnityBackgroundHook",
+    });
+  } finally {
+    unityBackgroundHookReady.value = true;
+  }
+}
+
+async function toggleUnityBackgroundHook() {
+  if (!unityBackgroundHookReady.value || unityBackgroundHookBusy.value) return;
+  unityBackgroundHookBusy.value = true;
+  const next = !unityBackgroundHookEnabled.value;
+  unityBackgroundHookEnabled.value = next;
+  try {
+    const status = await setUnityBackgroundHookEnabled(next);
+    unityBackgroundHookStatus.value = status;
+    if (status.state === "failed" && status.error) {
+      notificationStore.addNotice("error", status.error, {
+        operation: "unity-background-hook",
+        replaceOperation: true,
+      });
+    }
+  } catch (e) {
+    const err = normalizeAppError(e);
+    notificationStore.addNotice("error", err.message, {
+      code: err.code,
+      operation: "unity-background-hook",
+      replaceOperation: true,
+    });
+    await refreshUnityBackgroundHook();
+  } finally {
+    unityBackgroundHookBusy.value = false;
   }
 }
 
@@ -573,6 +640,22 @@ async function selectPythonRuntime(selectedId: string) {
       />
       <span v-else class="debug-toggle-placeholder" aria-hidden="true" />
       <span class="debug-toggle-label">{{ debugStatusLabel }}</span>
+    </label>
+  </div>
+
+  <div class="settings-section">
+    <div class="section-label">{{ t("settings.general.unityBackgroundHook") }}</div>
+    <p class="section-desc">{{ t("settings.general.unityBackgroundHookDesc") }}</p>
+    <label class="debug-toggle" :aria-busy="!unityBackgroundHookReady">
+      <BaseSwitch
+        v-if="unityBackgroundHookReady"
+        :model-value="unityBackgroundHookEnabled"
+        :disabled="unityBackgroundHookBusy"
+        :aria-label="t('settings.general.unityBackgroundHook')"
+        @update:model-value="toggleUnityBackgroundHook"
+      />
+      <span v-else class="debug-toggle-placeholder" aria-hidden="true" />
+      <span class="debug-toggle-label">{{ unityBackgroundHookStatusLabel }}</span>
     </label>
   </div>
 

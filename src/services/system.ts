@@ -1,5 +1,5 @@
 import { ipcInvoke } from "./ipc";
-import type { ProxyConfig, ProxyStatus, PythonRuntimeState } from "../types";
+import type { ProxyConfig, ProxyStatus, PythonRuntimeState, UnityBackgroundHookStatus } from "../types";
 
 export const APP_CLOSE_REQUESTED_EVENT = "locus-main-window-close-requested";
 export type AppCloseBehavior = "exit" | "minimizeToTray";
@@ -59,6 +59,18 @@ export function setDynamicToolLoadingMode(value: DynamicToolLoadingMode): Promis
   return ipcInvoke<void>("set_dynamic_tool_loading_mode", {
     value: normalizeDynamicToolLoadingMode(value),
   });
+}
+
+export function getUnityBackgroundHookEnabled(): Promise<boolean> {
+  return ipcInvoke<boolean>("get_unity_background_hook_enabled");
+}
+
+export function setUnityBackgroundHookEnabled(value: boolean): Promise<UnityBackgroundHookStatus> {
+  return ipcInvoke<UnityBackgroundHookStatus>("set_unity_background_hook_enabled", { value });
+}
+
+export function getUnityBackgroundHookStatus(): Promise<UnityBackgroundHookStatus> {
+  return ipcInvoke<UnityBackgroundHookStatus>("get_unity_background_hook_status");
 }
 
 export function getViewWindowsAboveMain(): Promise<boolean> {

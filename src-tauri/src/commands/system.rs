@@ -115,6 +115,9 @@ pub fn request_app_exit(app_handle: AppHandle) {
 }
 
 pub(crate) fn exit_app(app_handle: &AppHandle) {
+    if let Err(error) = crate::unity_bridge::restore_background_hook_runtime() {
+        eprintln!("[Locus] failed to restore Unity background hook before exit: {error}");
+    }
     crate::commands::destroy_unity_embed_control_window_on_main(app_handle);
     app_handle.exit(0);
 }
@@ -151,6 +154,76 @@ pub fn set_dynamic_tool_loading_mode(
     config
         .set_dynamic_tool_loading_mode(value)
         .map_err(crate::error::AppError::from)
+}
+
+#[tauri::command]
+pub fn get_unity_background_hook_enabled(
+    config: State<'_, std::sync::Arc<crate::config::AppConfig>>,
+) -> Result<bool, crate::error::AppError> {
+    Ok(config.unity_background_hook_enabled())
+}
+
+#[tauri::command]
+pub async fn set_unity_background_hook_enabled(
+    value: bool,
+    config: State<'_, std::sync::Arc<crate::config::AppConfig>>,
+    workspace: State<'_, std::sync::Arc<crate::workspace::Workspace>>,
+) -> Result<crate::unity_bridge::UnityBackgroundHookStatus, crate::error::AppError> {
+    config
+        .set_unity_background_hook_enabled(value)
+        .map_err(crate::error::AppError::from)?;
+
+    let status = crate::unity_bridge::set_background_hook_enabled(value).map_err(|error| {
+        crate::error::AppError::new("unity.background_hook.restore_failed", error)
+            .operation("setUnityBackgroundHookEnabled")
+    })?;
+
+    if !value {
+        return Ok(status);
+    }
+
+    let cwd = workspace.path.read().await.clone();
+    if cwd.trim().is_empty() || !crate::unity_bridge::is_unity_project(&cwd) {
+        return Ok(status);
+    }
+
+    match crate::unity_bridge::ensure_background_hook_for_project(&cwd).await {
+        Ok(status) => {
+            if status.enabled
+                && status.state == crate::unity_bridge::UnityBackgroundHookState::Failed
+            {
+                let message = status
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "Unity background hook failed".to_string());
+                return Err(
+                    crate::error::AppError::new("unity.background_hook.failed", message)
+                        .operation("setUnityBackgroundHookEnabled"),
+                );
+            }
+            Ok(status)
+        }
+        Err(error) => {
+            let process_info =
+                crate::unity_bridge::query_current_project_editor_process(&cwd).await;
+            if matches!(
+                process_info.state,
+                crate::unity_bridge::UnityEditorProcessState::NotRunning
+            ) {
+                return Ok(status);
+            }
+            Err(
+                crate::error::AppError::new("unity.background_hook.failed", error)
+                    .operation("setUnityBackgroundHookEnabled"),
+            )
+        }
+    }
+}
+
+#[tauri::command]
+pub fn get_unity_background_hook_status(
+) -> Result<crate::unity_bridge::UnityBackgroundHookStatus, crate::error::AppError> {
+    Ok(crate::unity_bridge::background_hook_status())
 }
 
 #[tauri::command]

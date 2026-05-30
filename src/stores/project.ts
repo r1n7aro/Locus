@@ -18,6 +18,7 @@ type PluginNoticeStatus = "missing" | "outdated";
 export type UnityLaunchState = "idle" | "starting" | "waitingConnection";
 
 const PLUGIN_STATUS_NOTICE_OPERATION = "unity-plugin-status";
+const UNITY_BACKGROUND_HOOK_NOTICE_OPERATION = "unity-background-hook";
 const UNITY_LAUNCH_CONNECTION_POLL_MS = 1500;
 const UNITY_LAUNCH_WAIT_TIMEOUT_MS = 120_000;
 
@@ -86,6 +87,17 @@ export const useProjectStore = defineStore("project", () => {
   function setUnityConnectionStatus(status: UnityConnectionStatus) {
     unityConnectionStatus.value = status;
     setUnityConnected(status.connected);
+    const hook = status.backgroundHook;
+    const notificationStore = useNotificationStore();
+    if (hook?.enabled && hook.state === "failed" && hook.error) {
+      notificationStore.addNotice("error", hook.error, {
+        operation: UNITY_BACKGROUND_HOOK_NOTICE_OPERATION,
+        replaceOperation: true,
+        skipConsoleLog: true,
+      });
+    } else if (hook?.state === "patched" || hook?.state === "disabled") {
+      notificationStore.clearByOperation(UNITY_BACKGROUND_HOOK_NOTICE_OPERATION);
+    }
   }
 
   function scheduleUnityLaunchConnectionCheck(delayMs = UNITY_LAUNCH_CONNECTION_POLL_MS) {

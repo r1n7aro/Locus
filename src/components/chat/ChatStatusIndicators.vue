@@ -166,6 +166,13 @@ function unityEditorProcessStateLabel(status: string | null | undefined) {
   return label === key ? normalized : label;
 }
 
+function unityBackgroundHookLabel(status: UnityConnectionStatus["backgroundHook"] | null | undefined) {
+  const normalized = status?.state || "inactive";
+  const key = `chat.status.unity.backgroundHook.${normalized}`;
+  const label = t(key);
+  return label === key ? normalized : label;
+}
+
 function formatTimestamp(ms: number | null | undefined) {
   if (!Number.isFinite(ms ?? Number.NaN) || !ms) return "";
   return new Date(ms).toLocaleTimeString();
@@ -479,6 +486,20 @@ const unityRows = computed<StatusDetailRow[]>(() => {
       label: t("chat.status.unity.latency"),
       value: formatElapsed(status.latencyMs),
     });
+  }
+
+  if (status?.backgroundHook) {
+    rows.push({
+      label: t("chat.status.unity.backgroundHook"),
+      value: unityBackgroundHookLabel(status.backgroundHook),
+    });
+    if (status.backgroundHook.error) {
+      rows.push({
+        label: t("chat.status.unity.backgroundHookError"),
+        value: status.backgroundHook.error,
+        mono: true,
+      });
+    }
   }
 
   if (status?.checkedAtMs) {

@@ -29,6 +29,10 @@ fn default_view_windows_above_main() -> Arc<AtomicBool> {
     Arc::new(AtomicBool::new(false))
 }
 
+fn default_unity_background_hook_enabled() -> Arc<AtomicBool> {
+    Arc::new(AtomicBool::new(true))
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum AppCloseBehavior {
@@ -149,6 +153,11 @@ pub struct AppConfig {
         with = "serde_atomic_bool"
     )]
     pub view_windows_above_main: Arc<AtomicBool>,
+    #[serde(
+        default = "default_unity_background_hook_enabled",
+        with = "serde_atomic_bool"
+    )]
+    pub unity_background_hook_enabled: Arc<AtomicBool>,
     #[serde(skip)]
     config_path: Arc<Mutex<Option<PathBuf>>>,
 }
@@ -189,6 +198,7 @@ impl AppConfig {
             dynamic_tool_loading_mode: default_dynamic_tool_loading_mode(),
             default_skill_package_namespace: default_skill_package_namespace(),
             view_windows_above_main: default_view_windows_above_main(),
+            unity_background_hook_enabled: default_unity_background_hook_enabled(),
             config_path: Arc::new(Mutex::new(Some(primary_path.to_path_buf()))),
         };
 
@@ -325,6 +335,16 @@ impl AppConfig {
 
     pub fn set_view_windows_above_main_enabled(&self, value: bool) -> Result<(), String> {
         self.view_windows_above_main.store(value, Ordering::Relaxed);
+        self.persist()
+    }
+
+    pub fn unity_background_hook_enabled(&self) -> bool {
+        self.unity_background_hook_enabled.load(Ordering::Relaxed)
+    }
+
+    pub fn set_unity_background_hook_enabled(&self, value: bool) -> Result<(), String> {
+        self.unity_background_hook_enabled
+            .store(value, Ordering::Relaxed);
         self.persist()
     }
 
@@ -545,6 +565,24 @@ mod tests {
     }
 
     #[test]
+    fn unity_background_hook_defaults_to_enabled() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("config.json");
+        fs::write(
+            &config_path,
+            r#"{
+  "model": "legacy-model",
+  "debug": false
+}"#,
+        )
+        .expect("legacy config");
+
+        let config = AppConfig::load_from_path(&config_path);
+
+        assert!(config.unity_background_hook_enabled());
+    }
+
+    #[test]
     fn close_behavior_persists_minimize_to_tray() {
         let temp = tempfile::tempdir().expect("tempdir");
         let config_path = temp.path().join("config.json");
@@ -601,5 +639,19 @@ mod tests {
 
         let reloaded = AppConfig::load_from_path(&config_path);
         assert!(reloaded.view_windows_above_main_enabled());
+    }
+
+    #[test]
+    fn unity_background_hook_persists_disabled() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("config.json");
+        let config = AppConfig::load_from_path(&config_path);
+
+        config
+            .set_unity_background_hook_enabled(false)
+            .expect("persist unity background hook setting");
+
+        let reloaded = AppConfig::load_from_path(&config_path);
+        assert!(!reloaded.unity_background_hook_enabled());
     }
 }

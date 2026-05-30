@@ -16,6 +16,7 @@ import { persistedOutputDisplay } from "./toolPersistedOutput";
 import { agentGraphToolReopen } from "../services/agentGraphTool";
 import { normalizeViewError, viewRun } from "../services/view";
 import { useNotificationStore } from "../stores/notification";
+import { useProjectStore } from "../stores/project";
 import { traceToolBlockLayoutChange } from "../services/layoutDiagnostics";
 import { resolveViewToolOpenId } from "./viewToolCallActions";
 
@@ -47,6 +48,7 @@ const rootRef = ref<HTMLElement | null>(null);
 const headerRef = ref<HTMLElement | null>(null);
 const outputPre = ref<HTMLPreElement | null>(null);
 const notificationStore = useNotificationStore();
+const projectStore = useProjectStore();
 
 watch(
   () => [props.toolCall.output, props.toolCall.nestedToolCalls?.length],
@@ -70,7 +72,14 @@ const waitingLabel = computed(() => (
   isSubagentTool.value ? t("tool.subagentWaiting") : t("tool.waiting")
 ));
 
-const showRecompileHint = computed(() => props.toolCall.name === "unity_recompile" && props.toolCall.status === "running");
+const unityBackgroundHookSolved = computed(() =>
+  projectStore.unityConnectionStatus?.backgroundHook?.patched === true,
+);
+const showRecompileHint = computed(() =>
+  props.toolCall.name === "unity_recompile"
+  && props.toolCall.status === "running"
+  && !unityBackgroundHookSolved.value,
+);
 const toolBlockOverride = computed(() => resolveToolBlockOverride(props.toolCall.name));
 const toolLayoutKey = computed(() => props.toolCall.id || props.toolCall.name);
 const toolLayoutToolCallIds = computed(() => props.toolCall.id);

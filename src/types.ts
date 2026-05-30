@@ -86,6 +86,25 @@ export interface AssetRefAttachment {
 
 export type UnityEditorProcessState = "running" | "not_running" | "unknown";
 
+export type UnityBackgroundHookState =
+  | "disabled"
+  | "inactive"
+  | "patched"
+  | "failed"
+  | "unsupported";
+
+export interface UnityBackgroundHookStatus {
+  enabled: boolean;
+  supported: boolean;
+  state: UnityBackgroundHookState;
+  patched: boolean;
+  processId?: number | null;
+  editorProcessPath?: string | null;
+  symbolCount: number;
+  error?: string | null;
+  updatedAtMs: number;
+}
+
 export interface UnityConnectionStatus {
   connected: boolean;
   editorStatus: string;
@@ -100,6 +119,7 @@ export interface UnityConnectionStatus {
   latencyMs?: number | null;
   reconnectAttempts: number;
   lastError?: string | null;
+  backgroundHook: UnityBackgroundHookStatus;
   checkedAtMs: number;
 }
 
