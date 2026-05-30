@@ -1,5 +1,5 @@
 {
-  "description": "Create a View inside a Locus View package workspace. By default it writes under the selected Unity project at Locus/View/<project-name>/<view-id>, with shared package code under Locus/View/<project-name>/src. Set packageName to create or reuse another package workspace. Set temporary=true for one-off display Views; Locus writes them under the app temp directory, appends a unique suffix to the requested id, keeps them out of the user-visible View registry, and returns the actual id plus packageRoot. Use this only inside the /view workflow. Use normal file tools to read or edit files inside packageRoot.",
+  "description": "Create a View inside a Locus View package workspace. By default it writes under the selected Unity project at Locus/View/<project-name>/<view-id>, with shared package code under Locus/View/<project-name>/src. Set packageName to create or reuse another package workspace. Set displayPath to choose the user-visible tree path; this is stored in view.json and does not move the packageRoot. Set temporary=true for one-off display Views; Locus writes them under the app temp directory, appends a unique suffix to the requested id, keeps them out of the user-visible View registry, and returns the actual id plus packageRoot. Use this only inside the /view workflow. Use normal file tools to read or edit files inside packageRoot.",
   "parameters": {
     "type": "object",
     "additionalProperties": false,
@@ -46,6 +46,10 @@
           null
         ],
         "description": "Optional Locus icon library name for the View list. Defaults by template."
+      },
+      "displayPath": {
+        "type": ["string", "null"],
+        "description": "Optional user-visible View tree path stored in view.json, for example Tools/material-inspector. The physical packageRoot stays unchanged."
       },
       "temporary": {
         "type": "boolean",

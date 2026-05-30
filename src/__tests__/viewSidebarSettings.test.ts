@@ -52,7 +52,13 @@ describe("View sidebar settings", () => {
     expect(sessionPanel).not.toContain("view.list.helpUseCases");
     expect(sessionPanel).toContain("onViewResizeMouseDown");
     expect(sessionPanel).toContain("visibleViewEntries");
+    expect(sessionPanel).toContain("interface ViewPointerDragState");
+    expect(sessionPanel).toContain("@pointerdown=\"onViewPointerDown(entry.row, $event)\"");
+    expect(sessionPanel).toContain("sp-view-pointer-dragging");
     expect(sessionPanel).toContain("@contextmenu.prevent.stop=\"openViewContextMenu($event, entry.row)\"");
+    expect(sessionPanel).toContain("async function revealViewContextLocation");
+    expect(sessionPanel).toContain("projectStore.openDirInFileExplorer(targetPath)");
+    expect(sessionPanel).toContain("t('view.action.reveal')");
     expect(sessionPanel).toContain("class=\"sp-view-row-shell\"");
     expect(sessionPanel).toContain("@drop=\"onViewFolderDrop(entry.row, $event)\"");
     expect(sessionPanel).toContain("class=\"sp-view-create-actions\"");
@@ -69,6 +75,8 @@ describe("View sidebar settings", () => {
     expect(en).toContain('"view.list.helpCreate": "Type /view with a request in a session and the agent enters the View workflow to create or update a View package. Generated Views appear in the current workspace Locus/View list and open when selected."');
     expect(zh).toContain('"view.tree.createFolder": "新建文件夹"');
     expect(en).toContain('"view.tree.createFolder": "New Folder"');
+    expect(zh).toContain('"view.action.reveal": "在文件游览器中显示"');
+    expect(en).toContain('"view.action.reveal": "Show in File Explorer"');
   });
 
   it("renders View list icons from manifest icon configuration", () => {
@@ -128,13 +136,14 @@ describe("View sidebar settings", () => {
     expect(tool).toContain("create_view_sync_with_scope(&working_dir, request, temporary)");
   });
 
-  it("keeps View tree operations package-level and disk-backed", () => {
+  it("keeps View tree operations display-path based and package-aware", () => {
     const service = read("src/services/view.ts");
     const commands = read("src-tauri/src/commands/view.rs");
     const runtime = read("src-tauri/src/view.rs");
     const lib = read("src-tauri/src/lib.rs");
 
     expect(service).toContain("export interface ViewTreeSnapshot");
+    expect(service).toContain("displayPath: string;");
     expect(service).toContain("export function viewTree");
     expect(service).toContain("export function viewCreateFolder");
     expect(service).toContain("export function viewDeleteEntry");
@@ -147,8 +156,11 @@ describe("View sidebar settings", () => {
     expect(lib).toContain("commands::view_create_folder");
     expect(lib).toContain("commands::view_delete_entry");
     expect(lib).toContain("commands::view_move_entry");
-    expect(runtime).toContain("std::fs::remove_dir_all(&target)");
-    expect(runtime).toContain("std::fs::rename(&source, &target)");
+    expect(runtime).toContain("pub display_path: Option<String>");
+    expect(runtime).toContain("VIEW_TREE_METADATA_REL_PATH");
+    expect(runtime).toContain("set_view_manifest_display_path");
+    expect(runtime).toContain("std::fs::remove_dir_all(root)");
+    expect(runtime).not.toContain("std::fs::rename(&source, &target)");
   });
 
   it("adds View package import and export actions", () => {

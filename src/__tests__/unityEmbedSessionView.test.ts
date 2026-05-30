@@ -293,7 +293,10 @@ describe("Unity embedded session view", () => {
     expect(command).toContain("unity_file_drop_asset_refs(&workspace_path, &paths)");
     expect(command).toContain("locus_file_drop_refs(&workspace_path, &paths)");
     expect(command).toContain('"locus-file-drop"');
-    expect(command).toContain("is_unity_embed_window_label(label) || label == MAIN_WINDOW_LABEL");
+    expect(command).toContain("fn is_locus_view_window_label");
+    expect(command).toContain("fn locus_view_window_labels");
+    expect(command).toContain("fn locus_frontend_drop_window_labels");
+    expect(command).toContain("is_locus_view_window_label(label)");
     expect(command).toContain("fn unity_relative_drop_path");
     expect(command).toContain("fn cache_unity_embed_asset_drag_refs");
     expect(command).toContain("pub async fn unity_embed_commit_asset_drop");
@@ -306,8 +309,10 @@ describe("Unity embedded session view", () => {
     expect(command).toContain("monitor_unity_embed_asset_drag_release");
     expect(command).toContain("unity_asset_drag_release_probe");
     expect(command).toContain("UnityAssetDragReleaseTarget::MainWindow");
+    expect(command).toContain("UnityAssetDragReleaseTarget::ViewWindow");
     expect(command).toContain("if !saw_left_button_down");
     expect(command).toContain("emit_locus_asset_drop_to(&app_handle, MAIN_WINDOW_LABEL, refs)");
+    expect(command).toContain("emit_locus_asset_drop_to(&app_handle, &label, refs)");
     expect(command).toContain("WindowFromPoint");
     expect(command).toContain("GetAsyncKeyState");
     expect(command).toContain(".disable_drag_drop_handler()");

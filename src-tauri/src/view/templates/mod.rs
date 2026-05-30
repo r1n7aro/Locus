@@ -112,6 +112,7 @@ pub(super) fn template_manifest(
         name: name.to_string(),
         version: "0.1.0".to_string(),
         template: template.to_string(),
+        display_path: None,
         icon: Some(
             icon.unwrap_or_else(|| default_icon_for_template(template))
                 .to_string(),

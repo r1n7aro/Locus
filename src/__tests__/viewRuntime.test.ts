@@ -488,4 +488,53 @@ async function rename(commit) {
     expect(transformed.introducedNames).toContain("nameBinding");
     expect(transformed.introducedNames).toContain("rename");
   });
+
+  it("exposes Unity selection and drag helpers through the View runtime", () => {
+    const script = extractVueScriptSetup(`
+<script setup lang="ts">
+import {
+  UnityDropZone,
+  UnityReferenceChip,
+  unity,
+  useLocusFileDrag,
+  useLocusFileDropTarget,
+  useUnityAssetDropTarget,
+  useUnityReferenceDrag,
+} from "@locus/view-runtime";
+
+const materialRef = { kind: "asset", path: "Assets/Materials/M_Wood.mat", name: "M_Wood" };
+const refDrag = useUnityReferenceDrag(() => [materialRef]);
+const fileDrag = useLocusFileDrag({ path: "Assets/Materials/M_Wood.mat", isDir: false });
+const assetDrop = useUnityAssetDropTarget({ onDrop: refs => refs.length });
+const fileDrop = useLocusFileDropTarget();
+
+async function openMaterial() {
+  await unity.select(materialRef);
+  await unity.inspect(materialRef);
+  await unity.selectAsset(materialRef.path);
+  await unity.inspectSceneObject("Assets/Scenes/Main.unity", "Player/Camera");
+  unity.drag.onDrop(() => undefined);
+  unity.drag.onState(() => undefined);
+  refDrag.draggable.value;
+  fileDrag.draggable.value;
+  assetDrop.active.value;
+  fileDrop.active.value;
+  return [UnityDropZone, UnityReferenceChip];
+}
+</script>`);
+
+    const transformed = transformViewScriptSetup(script);
+
+    expect(transformed.code).toContain('const __module0 = __import("@locus/view-runtime")');
+    expect(transformed.code).toContain("const { UnityDropZone, UnityReferenceChip, unity, useLocusFileDrag, useLocusFileDropTarget, useUnityAssetDropTarget, useUnityReferenceDrag } = __module0");
+    expect(transformed.code).toContain("const refDrag = useUnityReferenceDrag(() => [materialRef])");
+    expect(transformed.code).toContain("const assetDrop = useUnityAssetDropTarget({ onDrop: refs => refs.length })");
+    expect(transformed.code).toContain("await unity.select(materialRef)");
+    expect(transformed.code).toContain("await unity.inspect(materialRef)");
+    expect(transformed.introducedNames).toContain("unity");
+    expect(transformed.introducedNames).toContain("useUnityReferenceDrag");
+    expect(transformed.introducedNames).toContain("useUnityAssetDropTarget");
+    expect(transformed.introducedNames).toContain("UnityReferenceChip");
+    expect(transformed.introducedNames).toContain("UnityDropZone");
+  });
 });

@@ -55,9 +55,14 @@ import {
   GraphViewController,
   CanvasView,
   defineGraphView,
+  unity,
   useViewScript,
   onEditorUpdate,
   useUnityBinding,
+  useUnityReferenceDrag,
+  useUnityAssetDropTarget,
+  UnityReferenceChip,
+  UnityDropZone,
 } from "@locus/view-runtime";
 ```
 
@@ -66,6 +71,8 @@ import {
    - Unknown property paths: `view_binding_discover` before hardcoding paths.
    - Custom Unity logic: `view.callScript` from package code or `view_compile_script` / `view_call_script` from the agent.
    - Selection-driven panels: `onEditorUpdate(handler)`.
+   - Unity selection and inspectors: `unity.select(...)`, `unity.inspect(...)`, `unity.selectAsset(...)`, `unity.selectSceneObject(...)`.
+   - Locus <-> Unity drag and drop: `useUnityReferenceDrag`, `useUnityAssetDropTarget`, `UnityReferenceChip`, and `UnityDropZone`.
    - LLM-assisted semantic editors: `view.session` and `view.llm`.
 
 6. Keep the UI aligned with Locus / Unity Editor tool style.
@@ -80,7 +87,8 @@ import {
    - Do not write absolute Unity project paths into `view.json`.
    - Use `view_reload` after edits.
    - Use `view_run` to open the View host.
+   - When a user-facing reply should reference the finished View, put a standalone line in this exact format: `view:<view-id>`. Use the package `id` from `view_create`, `view_list`, or `view_reload`. The Locus frontend renders that line as a View reference block with an Open View button.
 
 For visual inspection, DOM interaction, frontend log reading, or live debugging of an open View host, read `skill/view/debug.md`. That document loads the View debugging tools only when needed.
 
-Report the result with the View id, package root, template used, files changed, and reload or run result.
+Report the result with the View id, package root, template used, files changed, reload or run result, and the standalone `view:<view-id>` reference line.

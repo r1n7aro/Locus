@@ -177,6 +177,19 @@ export function startLocusNativeFileDrag(files: LocusFileDropRef[]): Promise<voi
   return runtime.invoke("locus_start_native_file_drag", { request: { files } });
 }
 
+export function startLocusDragPreview(label: string): Promise<void> {
+  const runtime = getLocusRuntime();
+  const normalized = label.trim();
+  if (runtime.kind !== "tauri" || !normalized) return Promise.resolve();
+  return runtime.invoke("locus_start_drag_preview", { label: normalized });
+}
+
+export function stopLocusDragPreview(): Promise<void> {
+  const runtime = getLocusRuntime();
+  if (runtime.kind !== "tauri") return Promise.resolve();
+  return runtime.invoke("locus_stop_drag_preview");
+}
+
 export interface UnityEmbedAssetDropPayload {
   refs: AssetRefAttachment[];
 }

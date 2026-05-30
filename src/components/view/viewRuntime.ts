@@ -1,7 +1,10 @@
 import {
   defineComponent,
+  computed,
   h,
   markRaw,
+  nextTick,
+  onMounted,
   onBeforeUnmount,
   onErrorCaptured,
   reactive,
@@ -9,6 +12,8 @@ import {
   ref,
   shallowRef,
   type Component,
+  type ComputedRef,
+  type PropType,
 } from "vue";
 import * as VueRuntime from "vue";
 import BaseButton from "../ui/BaseButton.vue";
@@ -85,6 +90,30 @@ import type {
   ViewRuntimeUpdateEvent,
 } from "../../services/view";
 import {
+  checkUnityConnectionStatus,
+  commitUnityEmbedAssetDrop,
+  openUnityAssetInspector,
+  openUnitySceneObjectInspector,
+  selectUnityAsset,
+  selectUnitySceneObject,
+  subscribeLocusFileDragState,
+  subscribeLocusFileDrop,
+  subscribeUnityEmbedAssetDragState,
+  subscribeUnityEmbedAssetDrop,
+  type LocusFileDragStatePayload,
+  type LocusFileDropPayload,
+  type LocusFileDropRef,
+  type UnityEmbedAssetDragStatePayload,
+  type UnityEmbedAssetDropPayload,
+} from "../../services/unity";
+import {
+  armLocusFilePointerDrag,
+  armUnityReferencePointerDrag,
+  startLocusFileHtmlDrag,
+  startUnityReferenceHtmlDrag,
+} from "../../composables/useUnityReferenceDragSource";
+import { useUnityAssetDropTarget as useUnityAssetDropTargetBase } from "../../composables/useUnityAssetDropTarget";
+import {
   sanitizeCssForPreview,
   viewPackageRelPath,
   viewFileContent,
@@ -108,8 +137,17 @@ import {
   type GraphPort,
   type GraphPortDirection,
 } from "../graph";
-import type { AssetSearchResult, SessionDetail, SessionEventRecord, SessionRunSummary, StreamEvent } from "../../types";
+import type {
+  AssetRefAttachment,
+  AssetRefKind,
+  AssetSearchResult,
+  SessionDetail,
+  SessionEventRecord,
+  SessionRunSummary,
+  StreamEvent,
+} from "../../types";
 import * as PropertyTreeService from "../../services/propertyTree";
+import { markStartupPhase } from "../../services/startupPerf";
 
 export type {
   ViewLlmCallRequest,
@@ -272,6 +310,417 @@ export type ViewGraphConnection = GraphLink;
 export type ViewGraphData = GraphData;
 export type ViewGraphConnectionValidation = GraphConnectionValidation;
 export type ViewGraphController = GraphController;
+
+export type ViewUnityReferenceInput =
+  | string
+  | AssetRefAttachment
+  | {
+    path: string;
+    kind?: AssetRefKind;
+    name?: string;
+    typeLabel?: string;
+    source?: "unity" | "manual";
+  };
+
+export interface ViewUnitySceneObjectTarget {
+  scenePath: string;
+  objectPath: string;
+}
+
+export interface ViewUnityReferenceDragBinding {
+  refs: ComputedRef<AssetRefAttachment[]>;
+  draggable: ComputedRef<boolean>;
+  attrs: ComputedRef<Record<string, unknown>>;
+  dragstart: (event: DragEvent) => void;
+  pointerdown: (event: PointerEvent) => void;
+}
+
+export interface ViewUnityAssetDropTargetOptions {
+  enabled?: () => boolean;
+  onDrop?: (refs: AssetRefAttachment[], payload: UnityEmbedAssetDropPayload) => void;
+}
+
+export interface ViewLocusFileDropTargetOptions {
+  enabled?: () => boolean;
+  onDrop?: (files: LocusFileDropRef[], payload: LocusFileDropPayload) => void;
+}
+
+type ViewRuntimeUnsubscribeMaybeAsync = (() => void) | null;
+type ViewUnityReferenceSource =
+  | ViewUnityReferenceInput
+  | ViewUnityReferenceInput[]
+  | (() => ViewUnityReferenceInput | ViewUnityReferenceInput[] | null | undefined)
+  | null
+  | undefined;
+type ViewLocusFileSource =
+  | LocusFileDropRef
+  | LocusFileDropRef[]
+  | (() => LocusFileDropRef | LocusFileDropRef[] | null | undefined)
+  | null
+  | undefined;
+
+const UNITY_ASSET_REF_ROOT_RE = /^(?:Assets|Packages|ProjectSettings)(?:\/|$)/i;
+const UNITY_SCENE_OBJECT_PATH_RE = /^((?:Assets|Packages)\/.+?\.unity)\/(.+)$/i;
+
+function normalizeRuntimePath(path: string): string {
+  return path.trim().replace(/\\/g, "/").replace(/\/+$/g, "");
+}
+
+function basenameWithoutExtension(path: string): string {
+  const normalized = normalizeRuntimePath(path);
+  const name = normalized.split("/").filter(Boolean).pop() || normalized;
+  const dotIdx = name.lastIndexOf(".");
+  return dotIdx > 0 ? name.slice(0, dotIdx) : name;
+}
+
+function inferUnityRefKind(path: string, fallback?: AssetRefKind): AssetRefKind {
+  if (UNITY_SCENE_OBJECT_PATH_RE.test(normalizeRuntimePath(path))) return "sceneObject";
+  return fallback ?? "asset";
+}
+
+function normalizeUnityReference(input: ViewUnityReferenceInput | null | undefined): AssetRefAttachment | null {
+  if (!input) return null;
+  const raw = typeof input === "string"
+    ? { path: input }
+    : input;
+  const path = normalizeRuntimePath(raw.path ?? "");
+  if (!path) return null;
+  const kind = inferUnityRefKind(path, raw.kind);
+  return {
+    kind,
+    path,
+    name: raw.name?.trim() || basenameWithoutExtension(path),
+    typeLabel: raw.typeLabel?.trim() || undefined,
+    source: raw.source ?? "manual",
+  };
+}
+
+function normalizeUnityReferences(source: ViewUnityReferenceSource): AssetRefAttachment[] {
+  const value = typeof source === "function" ? source() : source;
+  const items = Array.isArray(value) ? value : value ? [value] : [];
+  return items
+    .map((item) => normalizeUnityReference(item))
+    .filter((item): item is AssetRefAttachment => !!item);
+}
+
+function normalizeLocusFiles(source: ViewLocusFileSource): LocusFileDropRef[] {
+  const value = typeof source === "function" ? source() : source;
+  const items = Array.isArray(value) ? value : value ? [value] : [];
+  return items
+    .map((file) => ({
+      ...file,
+      path: normalizeRuntimePath(file.path ?? ""),
+      name: file.name?.trim() || basenameWithoutExtension(file.path ?? ""),
+      source: file.source ?? "view",
+    }))
+    .filter((file) => !!file.path);
+}
+
+function sceneObjectTargetFromReference(input: ViewUnityReferenceInput | AssetRefAttachment): ViewUnitySceneObjectTarget | null {
+  const ref = normalizeUnityReference(input);
+  if (!ref || ref.kind !== "sceneObject") return null;
+  const match = ref.path.match(UNITY_SCENE_OBJECT_PATH_RE);
+  if (!match) return null;
+  return {
+    scenePath: normalizeRuntimePath(match[1]),
+    objectPath: normalizeRuntimePath(match[2]).replace(/^\/+|\/+$/g, ""),
+  };
+}
+
+function isUnityAssetReference(ref: AssetRefAttachment): boolean {
+  return ref.kind === "asset" && UNITY_ASSET_REF_ROOT_RE.test(normalizeRuntimePath(ref.path));
+}
+
+async function selectUnityReference(input: ViewUnityReferenceInput, options: { focusProjectWindow?: boolean } = {}) {
+  const sceneObject = sceneObjectTargetFromReference(input);
+  if (sceneObject) {
+    await selectUnitySceneObject(sceneObject.scenePath, sceneObject.objectPath);
+    return;
+  }
+  const ref = normalizeUnityReference(input);
+  if (!ref || !isUnityAssetReference(ref)) return;
+  await selectUnityAsset(ref.path, options);
+}
+
+async function inspectUnityReference(input: ViewUnityReferenceInput) {
+  const sceneObject = sceneObjectTargetFromReference(input);
+  if (sceneObject) {
+    await openUnitySceneObjectInspector(sceneObject.scenePath, sceneObject.objectPath);
+    return;
+  }
+  const ref = normalizeUnityReference(input);
+  if (!ref || !isUnityAssetReference(ref)) return;
+  await openUnityAssetInspector(ref.path);
+}
+
+function useUnityReferenceDrag(source: ViewUnityReferenceSource): ViewUnityReferenceDragBinding {
+  const refs = computed(() => normalizeUnityReferences(source));
+  const draggable = computed(() => refs.value.length > 0);
+
+  function dragstart(event: DragEvent) {
+    startUnityReferenceHtmlDrag(event, refs.value);
+  }
+
+  function pointerdown(event: PointerEvent) {
+    armUnityReferencePointerDrag(event, refs.value);
+  }
+
+  const attrs = computed<Record<string, unknown>>(() => ({
+    draggable: draggable.value,
+    onDragstart: dragstart,
+    onPointerdown: pointerdown,
+  }));
+
+  return {
+    refs,
+    draggable,
+    attrs,
+    dragstart,
+    pointerdown,
+  };
+}
+
+function useLocusFileDrag(source: ViewLocusFileSource) {
+  const files = computed(() => normalizeLocusFiles(source));
+  const draggable = computed(() => files.value.length > 0);
+
+  function dragstart(event: DragEvent) {
+    startLocusFileHtmlDrag(event, files.value);
+  }
+
+  function pointerdown(event: PointerEvent) {
+    armLocusFilePointerDrag(event, files.value);
+  }
+
+  const attrs = computed<Record<string, unknown>>(() => ({
+    draggable: draggable.value,
+    onDragstart: dragstart,
+    onPointerdown: pointerdown,
+  }));
+
+  return {
+    files,
+    draggable,
+    attrs,
+    dragstart,
+    pointerdown,
+  };
+}
+
+function useUnityAssetDropTargetRuntime(options: ViewUnityAssetDropTargetOptions = {}) {
+  const refs = ref<AssetRefAttachment[]>([]);
+  const active = ref(false);
+  const base = useUnityAssetDropTargetBase({
+    enabled: options.enabled,
+    warnPrefix: "[view-runtime]",
+  });
+  let releaseDrop: ViewRuntimeUnsubscribeMaybeAsync = null;
+  let releaseState: ViewRuntimeUnsubscribeMaybeAsync = null;
+  let disposed = false;
+
+  const isEnabled = () => options.enabled?.() ?? true;
+
+  onMounted(() => {
+    disposed = false;
+    subscribeUnityEmbedAssetDrop((payload) => {
+      if (!isEnabled()) return;
+      const nextRefs = Array.isArray(payload.refs) ? payload.refs : [];
+      refs.value = nextRefs;
+      active.value = false;
+      options.onDrop?.(nextRefs, payload);
+    }).then((release) => {
+      if (disposed) release();
+      else releaseDrop = release;
+    }).catch((error) => console.warn("[view-runtime] Unity asset drop subscription failed", error));
+
+    subscribeUnityEmbedAssetDragState((payload: UnityEmbedAssetDragStatePayload) => {
+      if (!isEnabled()) return;
+      const nextRefs = Array.isArray(payload.refs) ? payload.refs : [];
+      refs.value = nextRefs;
+      active.value = !!payload.hasRefs && nextRefs.length > 0;
+    }).then((release) => {
+      if (disposed) release();
+      else releaseState = release;
+    }).catch((error) => console.warn("[view-runtime] Unity asset drag subscription failed", error));
+  });
+
+  onBeforeUnmount(() => {
+    disposed = true;
+    releaseDrop?.();
+    releaseDrop = null;
+    releaseState?.();
+    releaseState = null;
+    active.value = false;
+    refs.value = [];
+  });
+
+  function dragenter(event: DragEvent) {
+    if (!isEnabled()) return;
+    active.value = true;
+    base.handleUnityAssetDrag(event);
+  }
+
+  function dragover(event: DragEvent) {
+    if (!isEnabled()) return;
+    active.value = true;
+    base.handleUnityAssetDrag(event);
+  }
+
+  function dragleave() {
+    active.value = base.hasUnityAssetDragState();
+  }
+
+  function drop(event: DragEvent) {
+    if (!isEnabled()) return;
+    active.value = false;
+    base.handleUnityAssetDrop(event);
+  }
+
+  const attrs = computed<Record<string, unknown>>(() => ({
+    onDragenter: dragenter,
+    onDragover: dragover,
+    onDragleave: dragleave,
+    onDrop: drop,
+  }));
+
+  return {
+    refs,
+    active,
+    attrs,
+    dragenter,
+    dragover,
+    dragleave,
+    drop,
+  };
+}
+
+function useLocusFileDropTargetRuntime(options: ViewLocusFileDropTargetOptions = {}) {
+  const files = ref<LocusFileDropRef[]>([]);
+  const dragState = ref<LocusFileDragStatePayload | null>(null);
+  const active = computed(() => !!dragState.value?.active);
+  let releaseDrop: ViewRuntimeUnsubscribeMaybeAsync = null;
+  let releaseState: ViewRuntimeUnsubscribeMaybeAsync = null;
+  let disposed = false;
+  const isEnabled = () => options.enabled?.() ?? true;
+
+  onMounted(() => {
+    disposed = false;
+    subscribeLocusFileDrop((payload) => {
+      if (!isEnabled()) return;
+      const nextFiles = Array.isArray(payload.files) ? payload.files : [];
+      files.value = nextFiles;
+      options.onDrop?.(nextFiles, payload);
+    }).then((release) => {
+      if (disposed) release();
+      else releaseDrop = release;
+    }).catch((error) => console.warn("[view-runtime] file drop subscription failed", error));
+
+    subscribeLocusFileDragState((payload) => {
+      if (!isEnabled()) return;
+      dragState.value = payload;
+    }).then((release) => {
+      if (disposed) release();
+      else releaseState = release;
+    }).catch((error) => console.warn("[view-runtime] file drag subscription failed", error));
+  });
+
+  onBeforeUnmount(() => {
+    disposed = true;
+    releaseDrop?.();
+    releaseDrop = null;
+    releaseState?.();
+    releaseState = null;
+    files.value = [];
+    dragState.value = null;
+  });
+
+  return {
+    files,
+    dragState,
+    active,
+  };
+}
+
+const UnityReferenceChip = defineComponent({
+  name: "UnityReferenceChip",
+  props: {
+    reference: {
+      type: [String, Object] as unknown as PropType<ViewUnityReferenceInput>,
+      default: null,
+    },
+    path: {
+      type: String,
+      default: "",
+    },
+    kind: {
+      type: String as PropType<AssetRefKind>,
+      default: undefined,
+    },
+    name: {
+      type: String,
+      default: "",
+    },
+    inspectOnMeta: {
+      type: Boolean,
+      default: true,
+    },
+  },
+  setup(props, { slots }) {
+    const refItem = computed(() => normalizeUnityReference(
+      props.reference ?? {
+        path: props.path,
+        kind: props.kind,
+        name: props.name,
+      },
+    ));
+    const drag = useUnityReferenceDrag(() => refItem.value ? [refItem.value] : []);
+    const label = computed(() => props.name || refItem.value?.name || basenameWithoutExtension(props.path));
+
+    async function click(event: MouseEvent) {
+      const current = refItem.value;
+      if (!current) return;
+      if (props.inspectOnMeta && (event.ctrlKey || event.metaKey)) {
+        await inspectUnityReference(current);
+        return;
+      }
+      await selectUnityReference(current);
+    }
+
+    return () => h("button", {
+      type: "button",
+      class: "locus-unity-reference-chip",
+      title: refItem.value?.path ?? props.path,
+      draggable: drag.draggable.value,
+      onClick: click,
+      onDragstart: drag.dragstart,
+      onPointerdown: drag.pointerdown,
+    }, slots.default?.({ reference: refItem.value }) ?? label.value);
+  },
+});
+
+const UnityDropZone = defineComponent({
+  name: "UnityDropZone",
+  emits: ["drop"],
+  setup(_props, { emit, slots }) {
+    const target = useUnityAssetDropTargetRuntime({
+      onDrop: (refs, payload) => emit("drop", refs, payload),
+    });
+    return () => h("div", {
+      class: [
+        "locus-unity-drop-zone",
+        target.active.value ? "is-active" : "",
+      ],
+      onDragenter: target.dragenter,
+      onDragover: target.dragover,
+      onDragleave: target.dragleave,
+      onDrop: target.drop,
+    }, slots.default?.({
+      active: target.active.value,
+      refs: target.refs.value,
+    }));
+  },
+});
+
 const LOCUS_COMPONENTS = {
   BaseButton,
   BaseCheckbox,
@@ -290,13 +739,38 @@ const LOCUS_COMPONENTS = {
   UnityPropertyDraw,
   UnityPropertyEditor,
   UnitySerializedPropertyTree,
+  UnityReferenceChip,
+  UnityDropZone,
   UnityVectorField,
 };
 
 type ViewRuntimeModuleApi = ReturnType<typeof createViewRuntimeApiUncached>;
 
 const runtimeApiCache = new WeakMap<ViewRuntimeApi, ViewRuntimeModuleApi>();
+const MAX_RUNTIME_API_REQUEST_LOGS = 48;
 let undoEntrySequence = 0;
+
+function perfNowMs(): number {
+  return typeof performance !== "undefined" && typeof performance.now === "function"
+    ? performance.now()
+    : Date.now();
+}
+
+function elapsedMs(startedAt: number): number {
+  return Math.round(perfNowMs() - startedAt);
+}
+
+function runtimeErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function afterNextFrame(task: () => void) {
+  if (typeof requestAnimationFrame === "function") {
+    requestAnimationFrame(() => task());
+    return;
+  }
+  setTimeout(task, 0);
+}
 
 function createViewUndoService() {
   const undoStack: Required<ViewRuntimeUndoEntry>[] = [];
@@ -711,6 +1185,53 @@ function createViewRuntimeApiUncached(detail: ViewPackageDetail, api: ViewRuntim
     call: (request: ViewLlmCallRequest) => api.callLlm(request),
   };
 
+  const unity = {
+    callScript: async (scriptName: string, method: string, args?: unknown) => {
+      const response = await api.callScript(scriptName, method, args);
+      return response.result;
+    },
+    checkConnection: checkUnityConnectionStatus,
+    connectionStatus: checkUnityConnectionStatus,
+    normalizeReference: normalizeUnityReference,
+    sceneObjectTarget: sceneObjectTargetFromReference,
+    selectAsset: (path: string, options?: { focusProjectWindow?: boolean }) =>
+      selectUnityAsset(path, options),
+    inspectAsset: (path: string) => openUnityAssetInspector(path),
+    openAssetInspector: (path: string) => openUnityAssetInspector(path),
+    selectSceneObject: (scenePath: string, objectPath: string) =>
+      selectUnitySceneObject(scenePath, objectPath),
+    inspectSceneObject: (scenePath: string, objectPath: string) =>
+      openUnitySceneObjectInspector(scenePath, objectPath),
+    openSceneObjectInspector: (scenePath: string, objectPath: string) =>
+      openUnitySceneObjectInspector(scenePath, objectPath),
+    select: selectUnityReference,
+    inspect: inspectUnityReference,
+    drag: {
+      start: (event: DragEvent, refs: ViewUnityReferenceInput | ViewUnityReferenceInput[]) =>
+        startUnityReferenceHtmlDrag(event, normalizeUnityReferences(refs)),
+      arm: (event: PointerEvent, refs: ViewUnityReferenceInput | ViewUnityReferenceInput[]) =>
+        armUnityReferencePointerDrag(event, normalizeUnityReferences(refs)),
+      commitDrop: commitUnityEmbedAssetDrop,
+      onDrop: subscribeUnityEmbedAssetDrop,
+      onState: subscribeUnityEmbedAssetDragState,
+    },
+    onDrop: subscribeUnityEmbedAssetDrop,
+    onDragState: subscribeUnityEmbedAssetDragState,
+  };
+
+  const files = {
+    drag: {
+      start: (event: DragEvent, refs: LocusFileDropRef | LocusFileDropRef[]) =>
+        startLocusFileHtmlDrag(event, normalizeLocusFiles(refs)),
+      arm: (event: PointerEvent, refs: LocusFileDropRef | LocusFileDropRef[]) =>
+        armLocusFilePointerDrag(event, normalizeLocusFiles(refs)),
+      onDrop: subscribeLocusFileDrop,
+      onState: subscribeLocusFileDragState,
+    },
+    onDrop: subscribeLocusFileDrop,
+    onDragState: subscribeLocusFileDragState,
+  };
+
   const view = {
     manifest: readonly(detail.manifest),
     summary: readonly(detail.summary),
@@ -734,6 +1255,8 @@ function createViewRuntimeApiUncached(detail: ViewPackageDetail, api: ViewRuntim
     },
     session,
     llm,
+    unity,
+    files,
     undo,
     propertyDraw,
     drawLibrary: propertyDraw.library,
@@ -752,6 +1275,8 @@ function createViewRuntimeApiUncached(detail: ViewPackageDetail, api: ViewRuntim
     view,
     session,
     llm,
+    unity,
+    files,
     undo,
     propertyDraw,
     defineView: <T>(value: T) => value,
@@ -762,9 +1287,15 @@ function createViewRuntimeApiUncached(detail: ViewPackageDetail, api: ViewRuntim
     UnityPropertyDraw,
     UnityPropertyEditor,
     UnitySerializedPropertyTree,
+    UnityReferenceChip,
+    UnityDropZone,
     layoutGraphDocument,
     ...PropertyTreeService,
     onEditorUpdate: (handler: (event: ViewRuntimeUpdateEvent) => void) => view.onUpdate(handler),
+    useUnityReferenceDrag,
+    useUnityAssetDropTarget: useUnityAssetDropTargetRuntime,
+    useLocusFileDrag,
+    useLocusFileDropTarget: useLocusFileDropTargetRuntime,
     useViewState: <T extends object>(initial: T) => reactive(initial),
     useViewScript: (scriptName: string) => ({
       call: (method: string, args?: unknown) => view.callScript(scriptName, method, args),
@@ -845,9 +1376,7 @@ function installLegacyWindowApi(runtime: ReturnType<typeof createViewRuntimeApi>
   target.locus = {
     ...(target.locus ?? {}),
     view: runtime.view,
-    unity: {
-      callScript: runtime.view.callScript,
-    },
+    unity: runtime.unity,
   };
 }
 
@@ -971,6 +1500,45 @@ function viewRuntimeBaseCss(): string {
   -webkit-appearance: none;
 }
 
+.locus-unity-reference-chip {
+  max-width: 100%;
+  min-height: 24px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 7px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-color);
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.3;
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: default;
+}
+
+.locus-unity-reference-chip:hover,
+.locus-unity-reference-chip:focus-visible {
+  border-color: var(--border-strong);
+  background: var(--hover-bg);
+  outline: none;
+}
+
+.locus-unity-drop-zone {
+  min-height: 32px;
+  border: 1px dashed var(--border-color);
+  border-radius: 6px;
+}
+
+.locus-unity-drop-zone.is-active {
+  border-color: var(--accent-color);
+  background: var(--accent-soft);
+}
+
 .view-runtime-error {
   margin: 12px;
   padding: 8px 10px;
@@ -990,8 +1558,156 @@ function viewRuntimeBaseCss(): string {
 }`;
 }
 
+function createInstrumentedRuntimeApi(detail: ViewPackageDetail, api: ViewRuntimeApi): ViewRuntimeApi {
+  const viewId = detail.manifest.id;
+  let requestSequence = 0;
+  let dataRequestSequence = 0;
+
+  function measureRequest<T>(
+    request: string,
+    task: () => Promise<T>,
+    requestDetail: Record<string, unknown> = {},
+    kind: "data" | "subscription" | "log" | "control" = "data",
+  ): Promise<T> {
+    requestSequence += 1;
+    const callId = requestSequence;
+    const startedAt = perfNowMs();
+    const phasePrefix = kind === "data" ? "runtimeDataRequest" : "runtimeApiRequest";
+    let dataCallId: number | undefined;
+    if (kind === "data") {
+      dataRequestSequence += 1;
+      dataCallId = dataRequestSequence;
+    }
+    const shouldLog = callId <= MAX_RUNTIME_API_REQUEST_LOGS
+      || (kind === "data" && (dataCallId ?? 0) <= MAX_RUNTIME_API_REQUEST_LOGS);
+    const detailBase = {
+      viewId,
+      request,
+      callId,
+      dataCallId,
+      kind,
+      ...requestDetail,
+    };
+    if (dataCallId === 1) {
+      markStartupPhase("runtimeFirstDataRequest", detailBase);
+    }
+    if (shouldLog) {
+      markStartupPhase(`${phasePrefix}_start`, detailBase);
+    }
+    return Promise.resolve()
+      .then(task)
+      .then((result) => {
+        if (shouldLog) {
+          markStartupPhase(`${phasePrefix}_done`, {
+            ...detailBase,
+            elapsedMs: elapsedMs(startedAt),
+          });
+        }
+        return result;
+      }, (error) => {
+        if (shouldLog) {
+          markStartupPhase(`${phasePrefix}_error`, {
+            ...detailBase,
+            elapsedMs: elapsedMs(startedAt),
+            message: runtimeErrorMessage(error),
+          });
+        }
+        throw error;
+      });
+  }
+
+  return {
+    callScript: (scriptName, method, args) =>
+      measureRequest("callScript", () => api.callScript(scriptName, method, args), {
+        scriptName,
+        method,
+      }),
+    bindingRead: (request) =>
+      measureRequest("bindingRead", () => api.bindingRead(request), {
+        bindingId: request.bindingId ?? "",
+        targetKind: request.target?.kind ?? "",
+        propertyPath: request.target?.propertyPath ?? "",
+      }),
+    bindingDiscover: (request) =>
+      measureRequest("bindingDiscover", () => api.bindingDiscover(request), {
+        bindingId: request.bindingId ?? "",
+        targetKind: request.target?.kind ?? "",
+        query: request.query ?? "",
+      }),
+    bindingWrite: (request) =>
+      measureRequest("bindingWrite", () => api.bindingWrite(request), {
+        bindingId: request.bindingId ?? "",
+        targetKind: request.target?.kind ?? "",
+        propertyPath: request.target?.propertyPath ?? "",
+      }),
+    bindingApply: (request) =>
+      measureRequest("bindingApply", () => api.bindingApply(request), {
+        writeCount: request.writes.length,
+      }),
+    searchAssets: (query, roots, limit) =>
+      measureRequest("searchAssets", () => api.searchAssets(query, roots, limit), {
+        query,
+        roots: roots?.join(",") ?? "",
+        limit: limit ?? "",
+      }),
+    createSession: (request) =>
+      measureRequest("createSession", () => api.createSession(request), {
+        sessionType: request?.sessionType ?? "",
+        agentId: request?.agentId ?? "",
+      }),
+    showSession: (sessionId) =>
+      measureRequest("showSession", () => api.showSession(sessionId), { sessionId }),
+    loadSession: (sessionId) =>
+      measureRequest("loadSession", () => api.loadSession(sessionId), { sessionId }),
+    getSessionActiveRun: (sessionId) =>
+      measureRequest("getSessionActiveRun", () => api.getSessionActiveRun(sessionId), { sessionId }),
+    listSessionEvents: (sessionId, afterSeq, limit) =>
+      measureRequest("listSessionEvents", () => api.listSessionEvents(sessionId, afterSeq, limit), {
+        sessionId,
+        afterSeq: afterSeq ?? "",
+        limit: limit ?? "",
+      }),
+    queueSessionInput: (request) =>
+      measureRequest("queueSessionInput", () => api.queueSessionInput(request), {
+        sessionId: request.sessionId,
+        runId: request.runId,
+        mergeGroupId: request.mergeGroupId,
+      }),
+    sendSessionMessage: (request) =>
+      measureRequest("sendSessionMessage", () => api.sendSessionMessage(request), {
+        sessionId: request.sessionId ?? "",
+        sessionType: request.sessionType ?? "",
+        textLength: request.text?.length ?? 0,
+        wait: !!request.wait,
+      }),
+    waitSession: (request) =>
+      measureRequest("waitSession", () => api.waitSession(request), {
+        sessionId: request.sessionId,
+        runId: request.runId ?? "",
+        timeoutMs: request.timeoutMs ?? "",
+      }),
+    callLlm: (request) =>
+      measureRequest("callLlm", () => api.callLlm(request), {
+        sessionId: request.sessionId ?? "",
+        promptLength: request.prompt?.length ?? 0,
+        wait: !!request.wait,
+      }),
+    onSessionEvent: (handler) =>
+      measureRequest("onSessionEvent", () => api.onSessionEvent(handler), {}, "subscription"),
+    readFrontendLog: (limit) =>
+      measureRequest("readFrontendLog", () => api.readFrontendLog(limit), { limit: limit ?? "" }, "log"),
+    openFrontendLog: () =>
+      measureRequest("openFrontendLog", () => api.openFrontendLog(), {}, "log"),
+    onUpdate: (handler) =>
+      measureRequest("onUpdate", () => api.onUpdate(handler), {}, "subscription"),
+    reload: () =>
+      measureRequest("reload", () => api.reload(), {}, "control"),
+  };
+}
+
 export function createViewRuntimeComponent(options: ViewRuntimeComponentOptions): Component {
-  const runtime = createViewRuntimeApi(options.detail, options.api);
+  const instrumentedApi = createInstrumentedRuntimeApi(options.detail, options.api);
+  const runtime = createViewRuntimeApi(options.detail, instrumentedApi);
   installLegacyWindowApi(runtime);
 
   return markRaw(
@@ -1009,12 +1725,25 @@ export function createViewRuntimeComponent(options: ViewRuntimeComponentOptions)
         });
 
         const prepare = async () => {
+          const viewId = options.detail.manifest.id;
+          const prepareStartedAt = perfNowMs();
+          markStartupPhase("runtimePrepare_start", {
+            viewId,
+            entry: options.detail.manifest.entry,
+            fileCount: options.detail.files.length,
+          });
           try {
+            const compilerImportStartedAt = perfNowMs();
+            markStartupPhase("runtimeCompilerImport_start", { viewId });
             const { compileViewSfc, transformModuleSource } = await import("./viewSfcCompiler");
+            markStartupPhase("runtimeCompilerImport_done", {
+              viewId,
+              elapsedMs: elapsedMs(compilerImportStartedAt),
+            });
             const styles: string[] = [];
             const context: RuntimeContext = {
               detail: options.detail,
-              api: options.api,
+              api: instrumentedApi,
               styles,
               compileViewSfc,
               transformModuleSource,
@@ -1022,10 +1751,24 @@ export function createViewRuntimeComponent(options: ViewRuntimeComponentOptions)
                 throw new Error("View module loader is not ready.");
               },
             };
+            const moduleLoaderStartedAt = perfNowMs();
             context.importModule = createModuleLoader(context);
+            markStartupPhase("runtimeModuleLoader_ready", {
+              viewId,
+              elapsedMs: elapsedMs(moduleLoaderStartedAt),
+            });
             const appPath = viewPackageRelPath(options.detail, "src/App.vue");
             const entryPath = viewPackageRelPath(options.detail, options.detail.manifest.entry);
+            const entryImportStartedAt = perfNowMs();
+            markStartupPhase("runtimeEntryImport_start", { viewId, entryPath });
             const entryExports = context.importModule(entryPath, appPath);
+            markStartupPhase("runtimeEntryImport_done", {
+              viewId,
+              entryPath,
+              elapsedMs: elapsedMs(entryImportStartedAt),
+              styleCount: styles.length,
+            });
+            const componentResolveStartedAt = perfNowMs();
             const entryComponent = context.entryComponent
               ?? ((entryExports.default as Component | undefined) || undefined);
             const appFile = fileByPath(options.detail, appPath);
@@ -1035,15 +1778,54 @@ export function createViewRuntimeComponent(options: ViewRuntimeComponentOptions)
                 : defineComponent({
                     setup: () => () => h("main", { class: "view-preview-empty" }, options.detail.manifest.name),
                   }));
+            markStartupPhase("runtimeComponentResolve_done", {
+              viewId,
+              elapsedMs: elapsedMs(componentResolveStartedAt),
+              usedEntryComponent: !!entryComponent,
+              hasAppFile: !!appFile,
+            });
 
-            if (disposed) return;
+            if (disposed) {
+              markStartupPhase("runtimePrepare_aborted", {
+                viewId,
+                elapsedMs: elapsedMs(prepareStartedAt),
+              });
+              return;
+            }
+            const styleApplyStartedAt = perfNowMs();
             applyStyles(styles);
+            markStartupPhase("runtimeStylesApply_done", {
+              viewId,
+              elapsedMs: elapsedMs(styleApplyStartedAt),
+              styleCount: styles.length,
+            });
             appComponent.value = markRaw(resolvedComponent);
+            const firstInteractiveStartedAt = perfNowMs();
+            markStartupPhase("runtimePrepare_done", {
+              viewId,
+              elapsedMs: elapsedMs(prepareStartedAt),
+              styleCount: styles.length,
+            });
+            void nextTick().then(() => {
+              afterNextFrame(() => {
+                if (disposed) return;
+                markStartupPhase("viewFirstInteractive", {
+                  viewId,
+                  elapsedMs: elapsedMs(prepareStartedAt),
+                  sinceRuntimePrepareDoneMs: elapsedMs(firstInteractiveStartedAt),
+                });
+              });
+            });
           } catch (prepareError) {
             if (disposed) return;
             runtimeError.value = prepareError instanceof Error
               ? prepareError.message
               : String(prepareError);
+            markStartupPhase("runtimePrepare_error", {
+              viewId,
+              elapsedMs: elapsedMs(prepareStartedAt),
+              message: runtimeError.value,
+            });
             console.error("[view-runtime]", prepareError);
           } finally {
             if (!disposed) {

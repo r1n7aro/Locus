@@ -131,6 +131,9 @@ const selectedView = computed(() =>
 const selectedViewExporting = computed(() =>
   !!selectedView.value && exportingViewId.value === selectedView.value.id,
 );
+const selectedViewDisplayPath = computed(() =>
+  selectedView.value ? viewDisplayPath(selectedView.value) : "",
+);
 const selectedViewPath = computed(() => selectedView.value?.packageRoot || "");
 const selectedViewUpdatedAt = computed(() =>
   selectedView.value ? formatTimestamp(selectedView.value.updatedAt) : "",
@@ -228,7 +231,7 @@ function normalizeViewPath(value: string): string {
   return value.replace(/\\/g, "/").replace(/\/+/g, "/").replace(/\/$/, "");
 }
 
-function packageRelPath(view: ViewPackageSummary): string {
+function physicalPackageRelPath(view: ViewPackageSummary): string {
   const explicitRelPath = view.packageRelPath?.trim();
   if (explicitRelPath) return normalizeViewPath(explicitRelPath);
 
@@ -245,6 +248,12 @@ function packageRelPath(view: ViewPackageSummary): string {
 
   const parts = packageRoot.split("/").filter(Boolean);
   return parts.length > 0 ? parts[parts.length - 1] : view.id;
+}
+
+function viewDisplayPath(view: ViewPackageSummary): string {
+  const explicitDisplayPath = view.displayPath?.trim();
+  if (explicitDisplayPath) return normalizeViewPath(explicitDisplayPath);
+  return physicalPackageRelPath(view);
 }
 
 function makeFolderNode(
@@ -318,7 +327,7 @@ function buildViewTree(
 
   const sortedViews = [...viewSummaries].sort(
     (left, right) =>
-      packageRelPath(left).localeCompare(packageRelPath(right), undefined, {
+      viewDisplayPath(left).localeCompare(viewDisplayPath(right), undefined, {
         sensitivity: "base",
       }) ||
       left.name.localeCompare(right.name, undefined, { sensitivity: "base" }) ||
@@ -326,7 +335,7 @@ function buildViewTree(
   );
 
   for (const view of sortedViews) {
-    const relPath = packageRelPath(view);
+    const relPath = viewDisplayPath(view);
     const parent = ensureFolder(viewPathDirname(relPath));
     parent.children.push({
       kind: "view",
@@ -855,7 +864,9 @@ async function importViewPackage(targetDirRelPath = "") {
     });
     applyTreeSnapshot(result.snapshot);
     selectedViewId.value = result.summary.id;
-    expandViewPathAncestors(result.summary.packageRelPath || result.summary.id);
+    expandViewPathAncestors(
+      result.summary.displayPath || result.summary.packageRelPath || result.summary.id,
+    );
     notificationStore.addNotice(
       "success",
       t("view.import.imported", result.summary.name),
@@ -1266,6 +1277,10 @@ onUnmounted(() => {
               <div class="view-metadata-row">
                 <dt>{{ t("view.metadata.updatedAt") }}</dt>
                 <dd>{{ selectedViewUpdatedAt }}</dd>
+              </div>
+              <div class="view-metadata-row">
+                <dt>{{ t("view.metadata.displayPath") }}</dt>
+                <dd class="mono path">{{ selectedViewDisplayPath }}</dd>
               </div>
               <div class="view-metadata-row">
                 <dt>{{ t("view.metadata.location") }}</dt>

@@ -12,6 +12,8 @@ use crate::workspace::Workspace;
 const WINDOW_LABEL: &str = "unity-embed";
 const WINDOW_LABEL_PREFIX: &str = "unity-embed";
 const MAIN_WINDOW_LABEL: &str = "main";
+const VIEW_WINDOW_LABEL_PREFIX: &str = "view-";
+const VIEW_CONTENT_WINDOW_LABEL_PREFIX: &str = "view-content-";
 const ASSET_DROP_EVENT: &str = "unity-embed-asset-drop";
 const TEXT_DROP_EVENT: &str = "unity-embed-text-drop";
 const ASSET_DRAG_STATE_EVENT: &str = "unity-embed-asset-drag-state";
@@ -409,6 +411,15 @@ fn is_unity_embed_window_label(label: &str) -> bool {
             .unwrap_or(false)
 }
 
+fn is_locus_view_window_label(label: &str) -> bool {
+    label.starts_with(VIEW_WINDOW_LABEL_PREFIX)
+        && !label.starts_with(VIEW_CONTENT_WINDOW_LABEL_PREFIX)
+}
+
+fn is_locus_view_content_window_label(label: &str) -> bool {
+    label.starts_with(VIEW_CONTENT_WINDOW_LABEL_PREFIX)
+}
+
 fn unity_embed_window_labels(app_handle: &AppHandle) -> Vec<String> {
     app_handle
         .webview_windows()
@@ -416,6 +427,39 @@ fn unity_embed_window_labels(app_handle: &AppHandle) -> Vec<String> {
         .filter(|label| is_unity_embed_window_label(label))
         .cloned()
         .collect()
+}
+
+fn locus_view_window_labels(app_handle: &AppHandle) -> Vec<String> {
+    app_handle
+        .webview_windows()
+        .keys()
+        .filter(|label| is_locus_view_window_label(label))
+        .cloned()
+        .collect()
+}
+
+fn locus_view_content_window_labels(app_handle: &AppHandle) -> Vec<String> {
+    app_handle
+        .webview_windows()
+        .keys()
+        .filter(|label| is_locus_view_content_window_label(label))
+        .cloned()
+        .collect()
+}
+
+fn locus_frontend_drop_window_labels(app_handle: &AppHandle) -> Vec<String> {
+    let mut labels = Vec::new();
+    let mut seen = HashSet::new();
+    for label in std::iter::once(MAIN_WINDOW_LABEL.to_string())
+        .chain(unity_embed_window_labels(app_handle))
+        .chain(locus_view_window_labels(app_handle))
+        .chain(locus_view_content_window_labels(app_handle))
+    {
+        if seen.insert(label.clone()) {
+            labels.push(label);
+        }
+    }
+    labels
 }
 
 fn normalize_open_frontend_window_request(
@@ -832,7 +876,10 @@ fn commit_cached_unity_asset_drag_drop_to(app_handle: &AppHandle, label: &str) {
 }
 
 fn is_locus_drop_target_label(label: &str) -> bool {
-    is_unity_embed_window_label(label) || label == MAIN_WINDOW_LABEL
+    is_unity_embed_window_label(label)
+        || is_locus_view_window_label(label)
+        || is_locus_view_content_window_label(label)
+        || label == MAIN_WINDOW_LABEL
 }
 
 fn emit_to_existing_window<T>(
@@ -877,13 +924,7 @@ fn emit_locus_asset_drop_to_chat_windows(
     }
 
     let payload = UnityEmbedAssetDropPayload { refs };
-    emit_to_existing_window(
-        app_handle,
-        MAIN_WINDOW_LABEL,
-        ASSET_DROP_EVENT,
-        payload.clone(),
-    )?;
-    for label in unity_embed_window_labels(app_handle) {
+    for label in locus_frontend_drop_window_labels(app_handle) {
         emit_to_existing_window(app_handle, &label, ASSET_DROP_EVENT, payload.clone())?;
     }
     Ok(())
@@ -929,13 +970,7 @@ fn emit_unity_embed_asset_drag_state(
         has_refs: !refs.is_empty(),
         refs,
     };
-    emit_to_existing_window(
-        app_handle,
-        MAIN_WINDOW_LABEL,
-        ASSET_DRAG_STATE_EVENT,
-        payload.clone(),
-    )?;
-    for label in unity_embed_window_labels(app_handle) {
+    for label in locus_frontend_drop_window_labels(app_handle) {
         emit_to_existing_window(app_handle, &label, ASSET_DRAG_STATE_EVENT, payload.clone())?;
     }
     Ok(())
@@ -1062,6 +1097,18 @@ async fn monitor_unity_embed_asset_drag_release(app_handle: AppHandle) {
                     {
                         eprintln!(
                             "[Locus] failed to emit Unity asset drop to main window: {error}"
+                        );
+                    }
+                    clear_unity_embed_asset_drag_after_release(&app_handle);
+                }
+                break;
+            }
+            windows_impl::UnityAssetDragReleaseTarget::ViewWindow(label) => {
+                let refs = current_unity_embed_asset_drag_refs();
+                if !refs.is_empty() {
+                    if let Err(error) = emit_locus_asset_drop_to(&app_handle, &label, refs) {
+                        eprintln!(
+                            "[Locus] failed to emit Unity asset drop to view window {label}: {error}"
                         );
                     }
                     clear_unity_embed_asset_drag_after_release(&app_handle);
@@ -1199,6 +1246,22 @@ pub async fn locus_start_native_file_drag(
     let preview_label = locus_file_drag_preview_label(&request.files, paths.len());
 
     dispatch_native_file_drag(app_handle, paths, preview_label, None).await
+}
+
+#[tauri::command]
+pub async fn locus_start_drag_preview(label: String) -> Result<(), AppError> {
+    #[cfg(target_os = "windows")]
+    windows_impl::start_reference_drag_preview(label);
+
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn locus_stop_drag_preview() -> Result<(), AppError> {
+    #[cfg(target_os = "windows")]
+    windows_impl::stop_reference_drag_preview();
+
+    Ok(())
 }
 
 async fn dispatch_native_file_drag(
@@ -2289,14 +2352,15 @@ mod windows_impl {
     const MOUSE_ACTIVATE_SUBCLASS_ID: usize = 0x4c6f637573;
     const VK_LBUTTON_CODE: i32 = 0x01;
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(Debug, Clone, PartialEq, Eq)]
     pub(super) enum UnityAssetDragReleaseTarget {
         MainWindow,
+        ViewWindow(String),
         EmbedWindow,
         Other,
     }
 
-    #[derive(Debug, Clone, Copy)]
+    #[derive(Debug, Clone)]
     pub(super) struct UnityAssetDragReleaseProbe {
         pub left_button_down: bool,
         pub target: UnityAssetDragReleaseTarget,
@@ -2325,6 +2389,16 @@ mod windows_impl {
     ) -> Result<UnityAssetDragReleaseTarget, String> {
         if window_label_contains_hwnd(app_handle, MAIN_WINDOW_LABEL, hwnd)? {
             return Ok(UnityAssetDragReleaseTarget::MainWindow);
+        }
+        for label in locus_view_content_window_labels(app_handle) {
+            if window_label_contains_hwnd(app_handle, &label, hwnd)? {
+                return Ok(UnityAssetDragReleaseTarget::ViewWindow(label));
+            }
+        }
+        for label in locus_view_window_labels(app_handle) {
+            if window_label_contains_hwnd(app_handle, &label, hwnd)? {
+                return Ok(UnityAssetDragReleaseTarget::ViewWindow(label));
+            }
         }
         if unity_embed_window_contains_hwnd(app_handle, hwnd)? {
             return Ok(UnityAssetDragReleaseTarget::EmbedWindow);

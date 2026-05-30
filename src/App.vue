@@ -36,7 +36,7 @@ import { isUnityReferenceImportWindowLocation } from "./services/unityReferenceI
 import { isReferenceExternalImportWindowLocation } from "./services/referenceExternalImportWindow";
 import { isCollabSearchWindowLocation } from "./services/collabSearchWindow";
 import { isChatDiffReviewWindowLocation } from "./services/chatDiffReviewWindow";
-import { isViewHostWindowLocation } from "./services/view";
+import { isViewContentWindowLocation, isViewHostWindowLocation } from "./services/view";
 import { isAgentGraphToolWindowLocation } from "./services/agentGraphTool";
 import {
   canStartWindowDragFromTarget,
@@ -59,6 +59,7 @@ const isReferenceExternalImportWindow = isReferenceExternalImportWindowLocation(
 const isCollabSearchWindow = isCollabSearchWindowLocation();
 const isChatDiffReviewWindow = isChatDiffReviewWindowLocation();
 const isViewHostWindow = isViewHostWindowLocation();
+const isViewContentWindow = isViewContentWindowLocation();
 const isAgentGraphToolWindow = isAgentGraphToolWindowLocation();
 const isStandaloneWindow = isUnityEmbedWindow
   || isUnityEmbedTestWindow
@@ -70,6 +71,7 @@ const isStandaloneWindow = isUnityEmbedWindow
   || isCollabSearchWindow
   || isChatDiffReviewWindow
   || isViewHostWindow
+  || isViewContentWindow
   || isAgentGraphToolWindow;
 
 const KnowledgeDownloadProgressWindow = defineAsyncComponent(() => import("./components/KnowledgeDownloadProgressWindow.vue"));
@@ -755,6 +757,7 @@ watch(() => projectStore.workingDir, () => {
   <ReferenceExternalImportWindow v-else-if="isReferenceExternalImportWindow" />
   <CollabSearchWindow v-else-if="isCollabSearchWindow" />
   <ChatDiffReviewWindow v-else-if="isChatDiffReviewWindow" />
+  <ViewHostWindow v-else-if="isViewContentWindow" embedded />
   <ViewHostWindow v-else-if="isViewHostWindow" />
   <AgentGraphToolWindow v-else-if="isAgentGraphToolWindow" />
   <div v-else-if="!authStore.authChecked" class="app-startup-state">
