@@ -1,9 +1,9 @@
 ---
 title: "Latest Version"
-description: "Locus v0.2.15 (2026-05-17)"
+description: "Locus v0.3.0 (2026-05-31)"
 sidebarTitle: "Latest Version"
-version: "0.2.15"
-releasedAt: "2026-05-17"
+version: "0.3.0"
+releasedAt: "2026-05-31"
 channel: "stable"
 updateTitle: "Update available"
 changelogUrl: "/en/overview/latest-version"
@@ -11,30 +11,62 @@ changelogUrl: "/en/overview/latest-version"
 
 ## Download
 
-- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.2.15/locus_0.2.15_x64-setup.exe)
-- [Windows x64 (system Python/Git)](https://github.com/r1n7aro/Locus/releases/download/v0.2.15/locus_0.2.15_x64-without_embed_python_git-setup.exe)
+- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.3.0/locus_0.3.0_x64-setup.exe)
+- [Windows x64 (system Python/Git)](https://github.com/r1n7aro/Locus/releases/download/v0.3.0/locus_0.3.0_x64-without_embed_python_git-setup.exe)
 - [GitHub Releases](https://github.com/r1n7aro/Locus/releases)
 
 ## Changes
 
 ### Added
 
-- Added proxy settings and backend proxy routing for update checks, LLM clients, knowledge downloads, and agent subprocesses.
-- Added bundled ONNX Runtime preparation for vector search runtime packaging.
-- Added text-scan fallback search for knowledge when lexical indexing is disabled.
-- Added chat session fork and latest-turn undo workflows.
-- Added installer metadata and package selection in the update flow.
-- Added console log export and subagent completion notifications.
+- Added View (`/view`): Agents can create interactive editor tools for Unity projects, including inspectors, graphs, tables, canvases, and project-specific workbenches. Created Views appear in the Views list and session list, support folders, rename, drag ordering, import, export, and can open in Locus or Unity.
+- Added Skill Package support for packaging reusable workflows, documents, commands, and tools. The Knowledge panel can preview, import, export, install Unity scripts, and configure command entry points.
+- Added Unity Background Boost so the Unity editor loop can keep responding while the Unity window is in the background. The setting can be toggled from Settings, and the status area reports waiting, patched, failed, and disabled states.
+- Added Unity viewport screenshot results for Game View, Scene View, and specific Editor windows.
+- Added a Unity Console attach command in the chat input.
+- Added Unity embedded windows for sessions and Views, with multi-window handling, drag references, and focus handling inside Unity.
+- Added Unity asset and local file drag bridging for Locus and embedded Unity sessions.
+- Added a graph window for nodes, ports, parameters, links, state machines, and dependency graphs, with readonly previews, manual layout, directed arrows, and confirmation options.
+- Added Agent tool loading modes, with direct tools, lazy tools, and Skill-provided tools visible in the Agent panel.
+- Added Agent environment and prompt details, including rendered environment prompts, structured prompts, and context usage.
+- Added running-send behavior so input can be queued for the next turn or inserted into the active session flow.
+- Added message draft, copy, fork, and rollback actions for continuing or rewinding from a selected user message.
+- Added session archive actions across settings and session lists.
+- Added local file drops in chat, with structured file references and a warning when workspace-only file boundaries block external paths.
+- Added Knowledge modes and status details for off, read-only, and full access, including retrieval, index, and context cost status.
+- Added Knowledge query progress for loading, scanning, sorting, text scanning, and query stages.
+- Added full document knowledge injection and richer match details, including matched terms, summaries, and body snippets.
+- Added notification settings for background system notifications, sound alerts, volume, built-in or custom sounds, and event-specific triggers.
+- Added close behavior settings for exiting or minimizing to tray, plus a confirmation dialog when closing while tasks are running.
+- Added temporary file management for viewing, opening, and cleaning large tool outputs and run temp files. Cleaned historical outputs are shown as deleted.
+- Added recent workspace directory context actions for opening in File Explorer or removing from the list.
+- Added file-change hover previews and full diff navigation with previous and next change actions.
+- Added Markdown rendering for images, local file references, knowledge references, View references, and semantic code.
+- Added Asset DB reconcile progress for scanning, discovering, syncing, queued, and failed states.
+- Added stable and experimental update channels, plus a stable update manifest.
+- Added managed Python pip package storage and a managed Git fallback. Release packaging now supports installers with and without embedded runtimes.
+- Added image-understanding settings for custom endpoints, with larger default context and reasoning controls for new endpoints.
+- Added Codex WebSocket transport settings.
+- Added installer icon updates and third-party notices for the Unity Editor bundle and JSON bundle.
 
 ### Fixed
 
-- Chat streaming keeps tool-call collapse and handoff rendering more stable.
-- Failed chat sends now remove pending messages and reload session state.
-- Knowledge index status now follows global lexical and semantic search settings.
-- Lexical rebuild progress is suppressed when lexical search is disabled.
-- Windows installer detects system Git and can skip bundled Git resources.
-- Tool permission saves restore UI state on failure.
+- Fixed filesystem edit handling when the search block is larger than the target file. The tool now reports “Could not find oldString” and leaves the file untouched.
+- Fixed chat tool-call handoff layout, waiting states, historical tool result recovery, and collapsed block expansion.
+- Fixed user message handling during tool rounds so queued and inserted inputs enter the session at the correct time.
+- Fixed session scroll restoration, session switching stability, and historical file-changes panel state.
+- Fixed session content, View tree, and Knowledge index refresh after undo, rollback, and message restore actions.
+- Fixed VCS restore paths that were missing from checkpoints and preserved meta sidecars during modified restores.
+- Fixed View window tabs, always-on-top behavior, focus, negative coordinates, multi-monitor placement, and host sync.
+- Fixed Unity embedded overlays, drag bridging, post-domain-reload connection stability, and transient overlay behavior.
+- Fixed Knowledge full-document token overview, Knowledge reference target scope, and query match accuracy.
+- Fixed diff highlight escaping, hover preview sizing, and file review window navigation.
+- Fixed Git index.lock warnings, workspace snapshot failure logging, and managed Git package fallback.
+- Fixed historical tool result images, nested tool calls, persisted output order, and deleted large-output display.
 
 ### Removed
 
-- None.
+- Removed the old Canvas tool, Canvas page, Canvas service, and backend command. Graphs and Views now use the new dedicated windows.
+- Removed the old `webfetch` tool in favor of the new `web_fetch` tool.
+- Removed the old Unity Embed HTTP Server and SerializedData bridge.
+- Removed the long tool-collapse export document and several Unity drag or scroll trace logs.

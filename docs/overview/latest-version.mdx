@@ -1,9 +1,9 @@
 ---
 title: "当前版本"
-description: "Locus v0.2.15 (2026-05-17)"
+description: "Locus v0.3.0 (2026-05-31)"
 sidebarTitle: "当前版本"
-version: "0.2.15"
-releasedAt: "2026-05-17"
+version: "0.3.0"
+releasedAt: "2026-05-31"
 channel: "stable"
 updateTitle: "发现新版本"
 changelogUrl: "/overview/latest-version"
@@ -11,30 +11,62 @@ changelogUrl: "/overview/latest-version"
 
 ## 下载
 
-- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.2.15/locus_0.2.15_x64-setup.exe)
-- [Windows x64（系统 Python/Git）](https://github.com/r1n7aro/Locus/releases/download/v0.2.15/locus_0.2.15_x64-without_embed_python_git-setup.exe)
+- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.3.0/locus_0.3.0_x64-setup.exe)
+- [Windows x64（系统 Python/Git）](https://github.com/r1n7aro/Locus/releases/download/v0.3.0/locus_0.3.0_x64-without_embed_python_git-setup.exe)
 - [GitHub Releases](https://github.com/r1n7aro/Locus/releases)
 
 ## 变更列表
 
 ### 新增
 
-- 设置页新增代理配置，后端请求、更新检查、知识下载、模型下载和 agent 子进程会使用代理路由。
-- 新增 ONNX Runtime 打包准备流程，用于向量检索运行时发布。
-- 知识库在全文索引关闭时支持文本扫描匹配。
-- 聊天新增会话复制和撤回上一轮对话流程。
-- 更新流程新增安装包元数据和安装包选择。
-- 控制台新增日志导出，系统通知新增 subagent 完成提醒。
+- 新增 View 功能（`/view`）：Agent 可以为 Unity 项目创建可交互的编辑器工具，用于检查面板、图表、数据表、画布和项目专用工作台；生成后的 View 会出现在 Views 列表与会话列表中，支持文件夹整理、重命名、拖拽排序、导入导出，并可在 Locus 或 Unity 中打开。
+- 新增 Skill Package：支持把可复用工作流、文档、命令和工具打包管理；知识面板可预览、导入、导出、安装 Unity 脚本并配置命令入口。
+- 新增 Unity 后台加速：Unity 窗口在后台时保持编辑器循环响应，重编译和域重载等待流程可以继续推进；设置页可开关，状态区会显示等待进程、已生效、失败等状态。
+- 新增 Unity 视口截图结果，Agent 可直接获取 Game View、Scene View 或指定 Editor Window 的截图并用于后续分析。
+- 新增 Unity Console 附加命令，可从聊天输入框把当前 Console 消息带入对话。
+- 新增 Unity 内嵌窗口能力，会话与 View 可在 Unity 内打开，并支持多窗口、拖拽引用和嵌入窗口焦点处理。
+- 新增 Unity 资源与本地文件拖拽桥接，支持把 Unity 对象、资源引用和本地文件带入 Locus 或嵌入式会话。
+- 新增图表窗口，可展示和编辑节点、端口、参数、连线、状态机和依赖图，并支持只读预览、手动布局、方向箭头和确认选项。
+- 新增 Agent 工具加载模式，支持按需加载专项工具，并在 Agent 面板展示直接工具、延迟工具和 Skill 带入工具。
+- 新增 Agent 环境与提示词面板信息，能查看渲染后的环境提示、结构化提示和上下文占用。
+- 新增运行中发送策略：会话执行时可把新输入排为下一条，或插入到当前会话后续流程。
+- 新增消息草稿、复制、Fork 和回滚入口，可从指定用户消息继续或撤回会话。
+- 新增会话归档入口，并在设置与会话列表中补齐归档相关交互。
+- 新增本地文件拖入聊天输入框，文件路径会作为结构化引用显示；文件工具边界开启时会提示外部路径限制。
+- 新增知识模式与状态面板，支持关闭、只读、启用三种模式，并展示检索、索引和上下文成本。
+- 新增知识查询进度展示，包括加载、扫描、排序、文本扫描和查询阶段状态。
+- 新增知识全文注入与更细的匹配信息，支持完整文档段落、匹配词、摘要和正文片段参与上下文。
+- 新增通知设置页，支持后台系统通知、提示音、音量、内置/自定义声音和不同事件触发项。
+- 新增关闭行为设置，支持直接退出或最小化到托盘；有运行任务时关闭主窗口会弹出确认。
+- 新增临时文件管理，可查看、打开、清理工具大输出和运行临时文件；历史记录中的已清理输出会显示为已删除。
+- 新增工作区最近目录右键菜单，可打开文件资源管理器或从列表移除。
+- 新增文件修改悬浮预览与全文 diff 导航，支持从预览进入完整差异并跳转上一处/下一处修改。
+- 新增 Markdown 图片、本地文件引用、知识引用、View 引用和语义化代码渲染。
+- 新增 Asset DB 校验进度展示，可看到扫描、发现、同步、排队和失败状态。
+- 新增稳定版/实验性更新通道与稳定版更新 manifest。
+- 新增托管 Python pip 包安装路径和托管 Git fallback，打包流程支持带嵌入运行时与不带嵌入运行时两种安装包。
+- 新增自定义端点图像理解开关；新端点默认包含更大的上下文、推理强度和图像能力配置。
+- 新增 Codex WebSocket 传输设置相关配置入口。
+- 新增安装包图标和 Unity Editor bundle / JSON bundle 的第三方说明。
 
 ### 修复
 
-- 聊天流式渲染中的工具调用折叠和交接状态更稳定。
-- 聊天发送失败后会移除待发送消息并重新加载会话状态。
-- 知识索引状态会遵循全局全文检索与语义检索开关。
-- 全文检索关闭时会隐藏全文索引重建进度。
-- Windows 安装器会检测系统 Git，并可跳过内置 Git 资源。
-- 工具权限保存失败时会恢复界面状态。
+- 修复文件编辑工具在搜索块大于目标文件时的处理，现在会稳定返回 “Could not find oldString”，并保持原文件不变。
+- 修复聊天工具调用交接布局、等待状态、历史工具结果恢复和折叠展开行为。
+- 修复工具轮次中的用户消息处理，排队输入和插入输入会在正确时机进入会话。
+- 修复会话滚动恢复、会话切换稳定性和历史文件变更面板状态。
+- 修复撤回、回滚和 undo 后的会话内容、View 树与知识索引刷新。
+- 修复 VCS 恢复路径缺失和 modified restore 的 meta sidecar 保留问题。
+- 修复 View 窗口标签、置顶、焦点、负坐标、多显示器和宿主窗口同步问题。
+- 修复 Unity 嵌入式覆盖层、拖拽桥接、域重载后连接和临时 overlay 稳定性。
+- 修复知识全文 token 概览、知识引用目标范围和查询匹配准确性。
+- 修复 diff 高亮转义、悬浮预览尺寸和文件审阅窗口导航。
+- 修复 Git index.lock 提示、工作区快照失败日志和托管 Git 包 fallback。
+- 修复历史工具结果中的图片、嵌套工具调用、持久化输出顺序和已删除大输出显示。
 
 ### 移除
 
-- 无。
+- 移除旧 Canvas 工具、Canvas 页面、Canvas 服务和后端命令；图表与 View 使用新的专用窗口承载。
+- 移除旧 `webfetch` 工具，改为新的 `web_fetch` 工具。
+- 移除旧 Unity Embed HTTP Server 与旧 SerializedData bridge。
+- 移除工具折叠导出长文档和若干 Unity 拖拽/滚动调试日志。

@@ -97,7 +97,6 @@ const VIEW_HOST_TABS_MERGE_DONE_EVENT = "view-host-tabs-merge-done";
 const VIEW_HOST_TABS_SELECT_EVENT = "view-host-tabs-select";
 const VIEW_HOST_TABS_DROP_TARGET_EVENT = "view-host-tabs-drop-target";
 const VIEW_HOST_WINDOW_LABEL_PREFIX = "view-";
-const VIEW_HOST_POOL_LABEL_PREFIX = "view-pool-";
 const VIEW_HOST_TAB_DROP_HEIGHT_PX = 40;
 const VIEW_HOST_TAB_DRAG_THRESHOLD_PX = 8;
 const VIEW_HOST_TAB_DRAG_FRAME_MS = 16;
@@ -302,11 +301,12 @@ function activeRuntimeFrame(): HTMLElement | null {
 }
 
 function setRuntimeFrameRef(viewId: string, value: Element | ComponentPublicInstance | null) {
-  const element = value instanceof HTMLElement
-    ? value
-    : value?.$el instanceof HTMLElement
-      ? value.$el
-      : null;
+  let element: HTMLElement | null = null;
+  if (value instanceof HTMLElement) {
+    element = value;
+  } else if (value && !(value instanceof Element) && value.$el instanceof HTMLElement) {
+    element = value.$el;
+  }
   if (element) {
     runtimeFrameRefs.set(viewId, element);
   } else {
@@ -331,7 +331,6 @@ const activeTab = computed(() => tabs.value.find((tab) => tab.id === activeViewI
 const windowTitle = computed(() =>
   manifest.value?.name || detail.value?.summary.name || activeTab.value?.title || activeViewId.value || t("view.host.title"),
 );
-const runtimeLabel = computed(() => manifest.value?.name || activeViewId.value || t("view.host.untitled"));
 const latestFrontendLogLevel = computed(() => latestFrontendLog.value?.level ?? "log");
 const latestFrontendLogText = computed(() => {
   const entry = latestFrontendLog.value;
