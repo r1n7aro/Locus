@@ -42,4 +42,14 @@ describe("file diff popover interaction", () => {
     expect(chatChanges).toContain("@open=\"onPopoverOpen\"");
     expect(trigger).toContain("@open=\"onClick\"");
   });
+
+  it("lets the hover preview shrink to its rendered content height", () => {
+    const popover = read("src/components/diff/FileDiffPopover.vue");
+
+    expect(popover).toContain("--diff-popover-max-height");
+    expect(popover).toContain("max-height: min(var(--diff-popover-max-height");
+    expect(popover).toContain(".popover-body :deep(.diff-viewer.compact)");
+    expect(popover).not.toContain("height: min(var(--diff-popover-height");
+    expect(popover).not.toContain("min-height: min(360px");
+  });
 });

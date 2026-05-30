@@ -3,8 +3,8 @@ import { computed, ref, onMounted, onUnmounted, watch, nextTick, type CSSPropert
 import FileDiffViewer from "./FileDiffViewer.vue";
 import { clampFloatingPosition } from "../ui/floatingPosition";
 import {
-  DIFF_POPOVER_WIDTH_PX,
   estimateDiffPopoverHeight,
+  estimateDiffPopoverWidth,
 } from "./fileDiffPopoverLayout";
 import type { FileDiffPayload } from "../../types";
 
@@ -16,8 +16,8 @@ const props = defineProps<{
 const popoverRef = ref<HTMLElement | null>(null);
 const positionStyle = ref<CSSProperties>({ top: "0px", left: "0px" });
 const sizeStyle = computed<CSSProperties>(() => ({
-  "--diff-popover-width": `${DIFF_POPOVER_WIDTH_PX}px`,
-  "--diff-popover-height": `${estimateDiffPopoverHeight(props.payload)}px`,
+  "--diff-popover-width": `${estimateDiffPopoverWidth(props.payload)}px`,
+  "--diff-popover-max-height": `${estimateDiffPopoverHeight(props.payload)}px`,
 } as CSSProperties));
 
 const emit = defineEmits<{
@@ -53,6 +53,17 @@ function updatePosition() {
   positionStyle.value = { top: `${clamped.y}px`, left: `${clamped.x}px` };
 }
 
+let resizeObserver: ResizeObserver | null = null;
+let positionFrame = 0;
+
+function schedulePositionUpdate() {
+  if (positionFrame) window.cancelAnimationFrame(positionFrame);
+  positionFrame = window.requestAnimationFrame(() => {
+    positionFrame = 0;
+    updatePosition();
+  });
+}
+
 // Close on scroll in any ancestor
 let scrollParents: Element[] = [];
 
@@ -78,7 +89,13 @@ function onWindowResize() {
 }
 
 onMounted(() => {
-  nextTick(updatePosition);
+  nextTick(() => {
+    updatePosition();
+    if (popoverRef.value && typeof ResizeObserver !== "undefined") {
+      resizeObserver = new ResizeObserver(schedulePositionUpdate);
+      resizeObserver.observe(popoverRef.value);
+    }
+  });
   scrollParents = findScrollParents(props.anchor);
   scrollParents.forEach((p) => p.addEventListener("scroll", onScroll, { passive: true }));
   window.addEventListener("resize", onWindowResize, { passive: true });
@@ -87,10 +104,12 @@ onMounted(() => {
 onUnmounted(() => {
   scrollParents.forEach((p) => p.removeEventListener("scroll", onScroll));
   window.removeEventListener("resize", onWindowResize);
+  resizeObserver?.disconnect();
+  if (positionFrame) window.cancelAnimationFrame(positionFrame);
 });
 
-watch(() => props.anchor, () => nextTick(updatePosition));
-watch(() => props.payload, () => nextTick(updatePosition));
+watch(() => props.anchor, () => nextTick(schedulePositionUpdate));
+watch(() => props.payload, () => nextTick(schedulePositionUpdate));
 </script>
 
 <template>
@@ -120,10 +139,8 @@ watch(() => props.payload, () => nextTick(updatePosition));
   position: fixed;
   z-index: 150;
   box-sizing: border-box;
-  width: min(var(--diff-popover-width, 760px), calc(100vw - 16px));
-  min-height: min(360px, calc(100vh - 16px));
-  height: min(var(--diff-popover-height, 520px), calc(100vh - 16px));
-  max-height: calc(100vh - 16px);
+  width: min(var(--diff-popover-width, 520px), calc(100vw - 16px));
+  max-height: min(var(--diff-popover-max-height, 360px), calc(100vh - 16px));
   background: var(--sidebar-bg);
   border: 1px solid var(--border-color);
   border-radius: 6px;
@@ -142,9 +159,12 @@ watch(() => props.payload, () => nextTick(updatePosition));
   flex-wrap: wrap;
 }
 .popover-body {
-  flex: 1;
+  flex: 0 1 auto;
   overflow: auto;
   min-height: 0;
+}
+.popover-body :deep(.diff-viewer.compact) {
+  height: auto;
 }
 .popover-hint {
   padding: 4px 10px;

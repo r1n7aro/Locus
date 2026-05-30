@@ -1,9 +1,12 @@
 import { describe, expect, it } from "vitest";
 import {
   DIFF_POPOVER_MAX_HEIGHT_PX,
+  DIFF_POPOVER_MAX_WIDTH_PX,
   DIFF_POPOVER_MIN_HEIGHT_PX,
+  DIFF_POPOVER_MIN_WIDTH_PX,
   DIFF_POPOVER_WIDTH_PX,
   estimateDiffPopoverHeight,
+  estimateDiffPopoverWidth,
 } from "../components/diff/fileDiffPopoverLayout";
 import type { FileDiffPayload, InspectorField } from "../types";
 
@@ -35,11 +38,54 @@ function makeField(id: string, children: InspectorField[] = []): InspectorField 
 }
 
 describe("fileDiffPopoverLayout", () => {
-  it("uses a wider desktop popover width", () => {
+  it("keeps the desktop popover width ceiling available", () => {
     expect(DIFF_POPOVER_WIDTH_PX).toBeGreaterThanOrEqual(720);
   });
 
-  it("keeps small previews readable", () => {
+  it("adapts width to short and long text previews", () => {
+    const short = makePayload();
+    const long = makePayload({
+      text: {
+        hunks: [{
+          header: "@@ -1,1 +1,1 @@",
+          oldStart: 1,
+          oldCount: 1,
+          newStart: 1,
+          newCount: 1,
+          lines: [{
+            kind: "add",
+            content: "const configuredEnemyBlockValueRepositoryInitializer = createConfiguredEnemyBlockValueRepositoryInitializer();",
+            oldLineNo: null,
+            newLineNo: 1,
+          }],
+        }],
+      },
+    });
+    const longVueTag = makePayload({
+      text: {
+        hunks: [{
+          header: "@@ -1,1 +1,1 @@",
+          oldStart: 1,
+          oldCount: 1,
+          newStart: 1,
+          newCount: 1,
+          lines: [{
+            kind: "add",
+            content: '<EnemyBlockValuesTable :rows="enemyBlockValueRows" :health="selectedHealth" :defense="selectedDefense" />',
+            oldLineNo: null,
+            newLineNo: 1,
+          }],
+        }],
+      },
+    });
+
+    expect(estimateDiffPopoverWidth(short)).toBe(DIFF_POPOVER_MIN_WIDTH_PX);
+    expect(estimateDiffPopoverWidth(long)).toBeGreaterThan(estimateDiffPopoverWidth(short));
+    expect(estimateDiffPopoverWidth(longVueTag)).toBeGreaterThan(estimateDiffPopoverWidth(short));
+    expect(estimateDiffPopoverWidth(long)).toBeLessThanOrEqual(DIFF_POPOVER_MAX_WIDTH_PX);
+  });
+
+  it("keeps small preview max-height compact", () => {
     expect(estimateDiffPopoverHeight(makePayload())).toBe(DIFF_POPOVER_MIN_HEIGHT_PX);
   });
 
