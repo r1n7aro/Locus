@@ -1,5 +1,15 @@
 import { createHash } from "node:crypto";
-import { createWriteStream, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  createWriteStream,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import https from "node:https";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
@@ -81,13 +91,23 @@ function request(url, { json = false } = {}) {
 }
 
 async function download(url, destination) {
-  const response = await request(url);
-  await new Promise((resolve, reject) => {
-    const file = createWriteStream(destination);
-    response.pipe(file);
-    file.on("finish", () => file.close(resolve));
-    file.on("error", reject);
-  });
+  const tempDestination = `${destination}.download`;
+  rmSync(tempDestination, { force: true });
+
+  try {
+    const response = await request(url);
+    await new Promise((resolve, reject) => {
+      const file = createWriteStream(tempDestination);
+      response.pipe(file);
+      response.on("error", reject);
+      file.on("finish", () => file.close(resolve));
+      file.on("error", reject);
+    });
+    renameSync(tempDestination, destination);
+  } catch (error) {
+    rmSync(tempDestination, { force: true });
+    throw error;
+  }
 }
 
 async function resolveGitAsset() {
@@ -117,6 +137,41 @@ function sha256(filePath) {
   const hash = createHash("sha256");
   hash.update(readFileSync(filePath));
   return hash.digest("hex");
+}
+
+function findCachedGitArchive() {
+  if (!existsSync(cacheDir)) {
+    return null;
+  }
+
+  const candidates = readdirSync(cacheDir, { withFileTypes: true })
+    .filter((entry) => entry.isFile() && GIT_ASSET_PATTERN.test(entry.name))
+    .map((entry) => {
+      const archivePath = path.join(cacheDir, entry.name);
+      const stat = statSync(archivePath);
+      return {
+        name: entry.name,
+        path: archivePath,
+        mtimeMs: stat.mtimeMs,
+        size: stat.size,
+      };
+    })
+    .filter((entry) => entry.size > 0)
+    .sort((left, right) => right.mtimeMs - left.mtimeMs || right.name.localeCompare(left.name));
+
+  return candidates[0] ?? null;
+}
+
+function formatError(error) {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function gitReleaseForManifest(asset, version) {
+  return asset.tagName ?? `v${version}`;
+}
+
+function gitSourceUrlForManifest(asset, release) {
+  return asset.url ?? `https://github.com/git-for-windows/git/releases/download/${release}/${asset.name}`;
 }
 
 function run(command, args, options = {}) {
@@ -156,26 +211,47 @@ async function main() {
     return;
   }
 
-  const asset = await resolveGitAsset();
-  const archivePath = path.join(cacheDir, asset.name);
   mkdirSync(cacheDir, { recursive: true });
 
-  if (!existsSync(archivePath)) {
-    console.log(`[locus] Downloading managed Git ${asset.tagName}...`);
-    await download(asset.url, archivePath);
-  } else {
-    console.log(`[locus] Using cached managed Git archive: ${path.relative(repoRoot, archivePath)}`);
+  let asset;
+  let archivePath;
+  try {
+    asset = await resolveGitAsset();
+    archivePath = path.join(cacheDir, asset.name);
+
+    if (!existsSync(archivePath)) {
+      console.log(`[locus] Downloading managed Git ${asset.tagName}...`);
+      await download(asset.url, archivePath);
+    } else {
+      console.log(`[locus] Using cached managed Git archive: ${path.relative(repoRoot, archivePath)}`);
+    }
+  } catch (error) {
+    const cached = findCachedGitArchive();
+    if (!cached) {
+      throw error;
+    }
+
+    asset = {
+      tagName: null,
+      name: cached.name,
+      url: null,
+    };
+    archivePath = cached.path;
+
+    console.warn(`[locus] Managed Git metadata or download unavailable: ${formatError(error)}`);
+    console.warn(`[locus] Falling back to cached managed Git archive: ${path.relative(repoRoot, archivePath)}`);
   }
 
   expandPortableGit(archivePath, targetDir);
 
   const gitExe = path.join(targetDir, "cmd", "git.exe");
   const version = verifyGit(gitExe);
+  const release = gitReleaseForManifest(asset, version);
   writeManifest({
     id: "windows-x64",
     version,
-    release: asset.tagName,
-    sourceUrl: asset.url,
+    release,
+    sourceUrl: gitSourceUrlForManifest(asset, release),
     archiveSha256: sha256(archivePath),
     executable: "windows-x64/cmd/git.exe",
     license: "windows-x64/LICENSE.txt",

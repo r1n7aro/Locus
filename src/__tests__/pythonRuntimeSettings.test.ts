@@ -119,6 +119,8 @@ describe("Python runtime settings", () => {
         .or_else(resolve_git_from_managed_resource)`);
     expect(lib).toContain("set_managed_git_resource_dir");
     expect(script).toContain("PortableGit");
+    expect(script).toContain("findCachedGitArchive");
+    expect(script).toContain("Falling back to cached managed Git archive");
   });
 
   it("routes managed Python pip installs into the app data directory", () => {
