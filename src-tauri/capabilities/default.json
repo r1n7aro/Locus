@@ -12,6 +12,7 @@
     "collab-history-search",
     "chat-diff-review",
     "unity-embed",
+    "unity-embed-*",
     "view-*",
     "agent-graph-*"
   ],

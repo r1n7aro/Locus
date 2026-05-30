@@ -2195,6 +2195,45 @@ pub async fn open_view_window(
     })
 }
 
+pub async fn open_view_unity_embed_window(
+    app_handle: &AppHandle,
+    working_dir: &str,
+    view_id: &str,
+) -> Result<ViewRunResult, String> {
+    let detail = read_view_sync(working_dir, view_id)?;
+    ensure_view_open_requirements(working_dir, &detail.manifest).await?;
+    let id = detail.summary.id.clone();
+    let result = crate::commands::open_unity_embed_frontend_window_for_request(
+        working_dir,
+        crate::commands::UnityEmbedOpenFrontendWindowRequest {
+            window_id: Some(format!("view-{id}")),
+            target_kind: "view".to_string(),
+            target_id: Some(id.clone()),
+            title: Some(detail.summary.name.clone()),
+        },
+    )
+    .await?;
+
+    let _ = set_view_tab_host_sync(ViewSetTabHostRequest {
+        host_label: result.window_label.clone(),
+        view_ids: vec![id.clone()],
+    });
+
+    if let Err(error) = start_view_file_watcher(app_handle, working_dir, &id) {
+        eprintln!(
+            "[Locus] failed to watch View package '{}' for reload: {}",
+            id, error
+        );
+    }
+
+    Ok(ViewRunResult {
+        id,
+        window_label: result.window_label,
+        host_url: result.host_url,
+        package_root: detail.summary.package_root,
+    })
+}
+
 pub async fn detach_view_tab_window(
     app_handle: &AppHandle,
     working_dir: &str,

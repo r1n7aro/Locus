@@ -1,15 +1,16 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, WebviewUrl};
+use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, State, WebviewUrl};
 
 use crate::error::AppError;
 use crate::workspace::Workspace;
 
 const WINDOW_LABEL: &str = "unity-embed";
+const WINDOW_LABEL_PREFIX: &str = "unity-embed";
 const MAIN_WINDOW_LABEL: &str = "main";
 const ASSET_DROP_EVENT: &str = "unity-embed-asset-drop";
 const TEXT_DROP_EVENT: &str = "unity-embed-text-drop";
@@ -18,6 +19,10 @@ const FILE_DROP_EVENT: &str = "locus-file-drop";
 const FILE_DRAG_STATE_EVENT: &str = "locus-file-drag-state";
 const CONTROL_PIPE_NAME_PREFIX: &str = r"\\.\pipe\locus_tauri_unity_embed_";
 const EMBED_URL: &str = "/unity-embed?host=tauri-overlay";
+const DEFAULT_WINDOW_ID: &str = "session";
+const DEFAULT_TARGET_KIND: &str = "session";
+const TARGET_KIND_VIEW: &str = "view";
+const TARGET_KIND_SESSION: &str = "session";
 const CLOSE_REASON_DOMAIN_RELOAD: &str = "domainReload";
 const TRANSIENT_CLOSE_DESTROY_DELAY: Duration = Duration::from_secs(30);
 const ASSET_DRAG_CACHE_TTL: Duration = Duration::from_secs(3);
@@ -28,6 +33,16 @@ const ASSET_DRAG_RELEASE_POLL_INTERVAL: Duration = Duration::from_millis(35);
 struct UnityEmbedControlMessage {
     #[serde(rename = "type")]
     kind: String,
+    #[serde(default)]
+    window_id: String,
+    #[serde(default)]
+    target_kind: String,
+    #[serde(default)]
+    target_id: String,
+    #[serde(default)]
+    instance_id: String,
+    #[serde(default)]
+    revision: u64,
     #[serde(default)]
     x: i32,
     #[serde(default)]
@@ -52,6 +67,29 @@ struct UnityEmbedControlMessage {
     title: Option<String>,
     #[serde(default)]
     source: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnityEmbedOpenFrontendWindowRequest {
+    #[serde(default)]
+    pub window_id: Option<String>,
+    pub target_kind: String,
+    #[serde(default)]
+    pub target_id: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnityEmbedOpenFrontendWindowResult {
+    pub window_id: String,
+    pub window_label: String,
+    pub target_kind: String,
+    pub target_id: String,
+    pub title: String,
+    pub host_url: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -242,8 +280,184 @@ struct UnityEmbedTransientCloseState {
     generation: u64,
 }
 
+#[derive(Debug, Clone, Default)]
+struct UnityEmbedControlRevisionState {
+    instance_id: String,
+    revision: u64,
+}
+
+fn control_revisions() -> &'static Mutex<HashMap<String, UnityEmbedControlRevisionState>> {
+    static STATE: OnceLock<Mutex<HashMap<String, UnityEmbedControlRevisionState>>> =
+        OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 fn default_visible() -> bool {
     true
+}
+
+fn sanitize_unity_embed_id(raw: &str) -> String {
+    let sanitized = raw
+        .trim()
+        .chars()
+        .filter_map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                Some(ch.to_ascii_lowercase())
+            } else if ch == '-' || ch == '_' {
+                Some('-')
+            } else {
+                None
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .chars()
+        .take(96)
+        .collect::<String>();
+    if sanitized.is_empty() {
+        DEFAULT_WINDOW_ID.to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn normalize_target_kind(raw: &str) -> String {
+    match raw.trim() {
+        TARGET_KIND_VIEW => TARGET_KIND_VIEW.to_string(),
+        _ => TARGET_KIND_SESSION.to_string(),
+    }
+}
+
+fn default_window_id_for_target(target_kind: &str, target_id: &str) -> String {
+    let target_id = target_id.trim();
+    if target_kind == TARGET_KIND_VIEW {
+        return sanitize_unity_embed_id(&format!("view-{target_id}"));
+    }
+    if target_id.is_empty() {
+        DEFAULT_WINDOW_ID.to_string()
+    } else {
+        sanitize_unity_embed_id(&format!("session-{target_id}"))
+    }
+}
+
+fn query_escape(value: &str) -> String {
+    url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
+}
+
+pub(crate) fn unity_embed_window_label_for_id(window_id: &str) -> String {
+    let normalized = sanitize_unity_embed_id(window_id);
+    if normalized == DEFAULT_WINDOW_ID {
+        WINDOW_LABEL.to_string()
+    } else {
+        format!("{WINDOW_LABEL_PREFIX}-{normalized}")
+    }
+}
+
+fn unity_embed_window_label_for_optional_id(window_id: Option<&str>) -> String {
+    unity_embed_window_label_for_id(window_id.unwrap_or(DEFAULT_WINDOW_ID))
+}
+
+pub(crate) fn unity_embed_host_url(window_id: &str, target_kind: &str, target_id: &str) -> String {
+    let window_id = sanitize_unity_embed_id(window_id);
+    let target_kind = normalize_target_kind(target_kind);
+    let mut url = format!(
+        "{EMBED_URL}&windowId={}&target={}",
+        query_escape(&window_id),
+        query_escape(&target_kind)
+    );
+    let target_id = target_id.trim();
+    if !target_id.is_empty() {
+        url.push_str("&id=");
+        url.push_str(&query_escape(target_id));
+    }
+    url
+}
+
+fn unity_embed_window_id_for_msg(msg: &UnityEmbedControlMessage) -> String {
+    sanitize_unity_embed_id(&msg.window_id)
+}
+
+fn unity_embed_window_label_for_msg(msg: &UnityEmbedControlMessage) -> String {
+    unity_embed_window_label_for_id(&unity_embed_window_id_for_msg(msg))
+}
+
+fn unity_embed_window_title(msg: &UnityEmbedControlMessage) -> String {
+    msg.title
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("Locus")
+        .to_string()
+}
+
+fn unity_embed_host_url_for_msg(msg: &UnityEmbedControlMessage) -> String {
+    let window_id = unity_embed_window_id_for_msg(msg);
+    let target_kind = if msg.target_kind.trim().is_empty() {
+        DEFAULT_TARGET_KIND
+    } else {
+        msg.target_kind.as_str()
+    };
+    unity_embed_host_url(&window_id, target_kind, &msg.target_id)
+}
+
+fn is_unity_embed_window_label(label: &str) -> bool {
+    label == WINDOW_LABEL
+        || label
+            .strip_prefix(WINDOW_LABEL_PREFIX)
+            .and_then(|suffix| suffix.strip_prefix('-'))
+            .map(|suffix| !suffix.is_empty())
+            .unwrap_or(false)
+}
+
+fn unity_embed_window_labels(app_handle: &AppHandle) -> Vec<String> {
+    app_handle
+        .webview_windows()
+        .keys()
+        .filter(|label| is_unity_embed_window_label(label))
+        .cloned()
+        .collect()
+}
+
+fn normalize_open_frontend_window_request(
+    request: UnityEmbedOpenFrontendWindowRequest,
+) -> UnityEmbedOpenFrontendWindowResult {
+    let target_kind = normalize_target_kind(&request.target_kind);
+    let target_id = request
+        .target_id
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_string();
+    let window_id = request
+        .window_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(sanitize_unity_embed_id)
+        .unwrap_or_else(|| default_window_id_for_target(&target_kind, &target_id));
+    let title = request
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| {
+            if target_kind == TARGET_KIND_VIEW && !target_id.is_empty() {
+                target_id.as_str()
+            } else {
+                "Locus"
+            }
+        })
+        .to_string();
+    let window_label = unity_embed_window_label_for_id(&window_id);
+    let host_url = unity_embed_host_url(&window_id, &target_kind, &target_id);
+    UnityEmbedOpenFrontendWindowResult {
+        window_id,
+        window_label,
+        target_kind,
+        target_id,
+        title,
+        host_url,
+    }
 }
 
 fn control_state() -> &'static Mutex<UnityEmbedControlState> {
@@ -251,14 +465,14 @@ fn control_state() -> &'static Mutex<UnityEmbedControlState> {
     STATE.get_or_init(|| Mutex::new(UnityEmbedControlState::default()))
 }
 
-fn applied_state() -> &'static Mutex<UnityEmbedAppliedState> {
-    static STATE: OnceLock<Mutex<UnityEmbedAppliedState>> = OnceLock::new();
-    STATE.get_or_init(|| Mutex::new(UnityEmbedAppliedState::default()))
+fn applied_states() -> &'static Mutex<HashMap<String, UnityEmbedAppliedState>> {
+    static STATE: OnceLock<Mutex<HashMap<String, UnityEmbedAppliedState>>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn transient_close_state() -> &'static Mutex<UnityEmbedTransientCloseState> {
-    static STATE: OnceLock<Mutex<UnityEmbedTransientCloseState>> = OnceLock::new();
-    STATE.get_or_init(|| Mutex::new(UnityEmbedTransientCloseState::default()))
+fn transient_close_states() -> &'static Mutex<HashMap<String, UnityEmbedTransientCloseState>> {
+    static STATE: OnceLock<Mutex<HashMap<String, UnityEmbedTransientCloseState>>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn record_control_message(msg: &UnityEmbedControlMessage) {
@@ -285,44 +499,85 @@ fn record_mount_result(mounted: bool, error: Option<String>) {
     }
 }
 
-fn next_transient_close_generation() -> u64 {
-    transient_close_state()
+fn should_ignore_stale_control_message(label: &str, msg: &UnityEmbedControlMessage) -> bool {
+    if msg.revision == 0 || (msg.kind != "open" && msg.kind != "update" && msg.kind != "close") {
+        return false;
+    }
+
+    let Ok(mut revisions) = control_revisions().lock() else {
+        return false;
+    };
+    let instance_id = msg.instance_id.trim();
+    if let Some(state) = revisions.get(label) {
+        let same_instance = instance_id.is_empty() || state.instance_id == instance_id;
+        if same_instance && msg.revision < state.revision {
+            return true;
+        }
+        if !same_instance && msg.kind != "open" {
+            return true;
+        }
+    }
+    revisions.insert(
+        label.to_string(),
+        UnityEmbedControlRevisionState {
+            instance_id: instance_id.to_string(),
+            revision: msg.revision,
+        },
+    );
+    false
+}
+
+fn next_transient_close_generation(label: &str) -> u64 {
+    transient_close_states()
         .lock()
-        .map(|mut state| {
+        .map(|mut states| {
+            let state = states.entry(label.to_string()).or_default();
             state.generation = state.generation.saturating_add(1);
             state.generation
         })
         .unwrap_or(0)
 }
 
-fn cancel_transient_close_destroy() {
-    let _ = next_transient_close_generation();
+fn cancel_transient_close_destroy(label: &str) {
+    let _ = next_transient_close_generation(label);
 }
 
-fn is_transient_close_generation_current(generation: u64) -> bool {
-    transient_close_state()
+fn cancel_all_transient_close_destroys(app_handle: &AppHandle) {
+    for label in unity_embed_window_labels(app_handle) {
+        cancel_transient_close_destroy(&label);
+    }
+    cancel_transient_close_destroy(WINDOW_LABEL);
+}
+
+fn is_transient_close_generation_current(label: &str, generation: u64) -> bool {
+    transient_close_states()
         .lock()
-        .map(|state| state.generation == generation)
+        .map(|states| {
+            states
+                .get(label)
+                .map(|state| state.generation == generation)
+                .unwrap_or(false)
+        })
         .unwrap_or(false)
 }
 
 fn is_transient_close_reason(reason: &str) -> bool {
-    reason == CLOSE_REASON_DOMAIN_RELOAD
+    reason == CLOSE_REASON_DOMAIN_RELOAD || reason == "windowDisabled"
 }
 
-fn schedule_transient_close_destroy(app_handle: &AppHandle) {
-    let generation = next_transient_close_generation();
+fn schedule_transient_close_destroy(app_handle: &AppHandle, label: String) {
+    let generation = next_transient_close_generation(&label);
     let app_for_timer = app_handle.clone();
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(TRANSIENT_CLOSE_DESTROY_DELAY).await;
-        if !is_transient_close_generation_current(generation) {
+        if !is_transient_close_generation_current(&label, generation) {
             return;
         }
 
         let app_for_main = app_for_timer.clone();
         if let Err(error) = app_for_timer.run_on_main_thread(move || {
-            if is_transient_close_generation_current(generation) {
-                destroy_unity_embed_control_window_on_main(&app_for_main);
+            if is_transient_close_generation_current(&label, generation) {
+                destroy_unity_embed_window_on_main(&app_for_main, &label);
             }
         }) {
             eprintln!("[Locus] failed to dispatch Unity embed transient close cleanup: {error}");
@@ -330,8 +585,11 @@ fn schedule_transient_close_destroy(app_handle: &AppHandle) {
     });
 }
 
-fn needs_geometry_apply(msg: &UnityEmbedControlMessage) -> bool {
-    if let Ok(state) = applied_state().lock() {
+fn needs_geometry_apply(label: &str, msg: &UnityEmbedControlMessage) -> bool {
+    if let Ok(states) = applied_states().lock() {
+        let Some(state) = states.get(label) else {
+            return true;
+        };
         return !state.has_window
             || state.x != msg.x
             || state.y != msg.y
@@ -343,16 +601,20 @@ fn needs_geometry_apply(msg: &UnityEmbedControlMessage) -> bool {
     true
 }
 
-fn needs_visibility_apply(visible: bool) -> bool {
-    if let Ok(state) = applied_state().lock() {
+fn needs_visibility_apply(label: &str, visible: bool) -> bool {
+    if let Ok(states) = applied_states().lock() {
+        let Some(state) = states.get(label) else {
+            return true;
+        };
         return !state.has_window || state.visible != visible;
     }
 
     true
 }
 
-fn record_applied_geometry(msg: &UnityEmbedControlMessage) {
-    if let Ok(mut state) = applied_state().lock() {
+fn record_applied_geometry(label: &str, msg: &UnityEmbedControlMessage) {
+    if let Ok(mut states) = applied_states().lock() {
+        let state = states.entry(label.to_string()).or_default();
         state.has_window = true;
         state.x = msg.x;
         state.y = msg.y;
@@ -362,16 +624,41 @@ fn record_applied_geometry(msg: &UnityEmbedControlMessage) {
     }
 }
 
-fn record_applied_visibility(visible: bool) {
-    if let Ok(mut state) = applied_state().lock() {
+fn record_applied_visibility(label: &str, visible: bool) {
+    if let Ok(mut states) = applied_states().lock() {
+        let state = states.entry(label.to_string()).or_default();
         state.has_window = true;
         state.visible = visible;
     }
 }
 
-fn record_window_destroyed() {
-    if let Ok(mut state) = applied_state().lock() {
-        *state = UnityEmbedAppliedState::default();
+fn record_window_destroyed(label: &str) {
+    let mut has_remaining_window = false;
+    if let Ok(mut states) = applied_states().lock() {
+        states.remove(label);
+        has_remaining_window = !states.is_empty();
+    }
+    if let Ok(mut revisions) = control_revisions().lock() {
+        revisions.remove(label);
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if has_remaining_window {
+            return;
+        }
+        windows_impl::disable_popup_sync();
+        windows_impl::remove_mouse_activate_hook();
+        windows_impl::reset_mouse_activation_suppressed();
+    }
+}
+
+fn record_all_embed_windows_destroyed() {
+    if let Ok(mut states) = applied_states().lock() {
+        states.clear();
+    }
+    if let Ok(mut revisions) = control_revisions().lock() {
+        revisions.clear();
     }
 
     #[cfg(target_os = "windows")]
@@ -545,7 +832,7 @@ fn commit_cached_unity_asset_drag_drop_to(app_handle: &AppHandle, label: &str) {
 }
 
 fn is_locus_drop_target_label(label: &str) -> bool {
-    label == WINDOW_LABEL || label == MAIN_WINDOW_LABEL
+    is_unity_embed_window_label(label) || label == MAIN_WINDOW_LABEL
 }
 
 fn emit_to_existing_window<T>(
@@ -596,7 +883,10 @@ fn emit_locus_asset_drop_to_chat_windows(
         ASSET_DROP_EVENT,
         payload.clone(),
     )?;
-    emit_to_existing_window(app_handle, WINDOW_LABEL, ASSET_DROP_EVENT, payload)
+    for label in unity_embed_window_labels(app_handle) {
+        emit_to_existing_window(app_handle, &label, ASSET_DROP_EVENT, payload.clone())?;
+    }
+    Ok(())
 }
 
 fn emit_unity_embed_asset_drop(
@@ -625,7 +915,10 @@ fn emit_unity_embed_text_drop(
         TEXT_DROP_EVENT,
         payload.clone(),
     )?;
-    emit_to_existing_window(app_handle, WINDOW_LABEL, TEXT_DROP_EVENT, payload)
+    for label in unity_embed_window_labels(app_handle) {
+        emit_to_existing_window(app_handle, &label, TEXT_DROP_EVENT, payload.clone())?;
+    }
+    Ok(())
 }
 
 fn emit_unity_embed_asset_drag_state(
@@ -642,7 +935,10 @@ fn emit_unity_embed_asset_drag_state(
         ASSET_DRAG_STATE_EVENT,
         payload.clone(),
     )?;
-    emit_to_existing_window(app_handle, WINDOW_LABEL, ASSET_DRAG_STATE_EVENT, payload)
+    for label in unity_embed_window_labels(app_handle) {
+        emit_to_existing_window(app_handle, &label, ASSET_DRAG_STATE_EVENT, payload.clone())?;
+    }
+    Ok(())
 }
 
 fn asset_drag_cache() -> &'static Mutex<UnityEmbedAssetDragCache> {
@@ -1450,6 +1746,28 @@ async fn is_current_control_pipe(app_handle: &AppHandle, pipe_name: &str) -> boo
         .unwrap_or(false)
 }
 
+pub(crate) async fn open_unity_embed_frontend_window_for_request(
+    working_dir: &str,
+    request: UnityEmbedOpenFrontendWindowRequest,
+) -> Result<UnityEmbedOpenFrontendWindowResult, String> {
+    let result = normalize_open_frontend_window_request(request);
+    let payload = serde_json::to_string(&result)
+        .map_err(|error| format!("Failed to serialize Unity frontend window request: {error}"))?;
+    crate::unity_bridge::open_frontend_window(working_dir, &payload).await?;
+    Ok(result)
+}
+
+#[tauri::command]
+pub async fn unity_embed_open_frontend_window(
+    request: UnityEmbedOpenFrontendWindowRequest,
+    workspace: State<'_, Arc<Workspace>>,
+) -> Result<UnityEmbedOpenFrontendWindowResult, AppError> {
+    let working_dir = workspace.path.read().await.clone();
+    open_unity_embed_frontend_window_for_request(&working_dir, request)
+        .await
+        .map_err(Into::into)
+}
+
 #[tauri::command]
 pub async fn unity_embed_status(app_handle: AppHandle) -> Result<UnityEmbedStatus, AppError> {
     let pipe_name = current_control_pipe_name(&app_handle)
@@ -1468,16 +1786,18 @@ pub async fn unity_embed_status(app_handle: AppHandle) -> Result<UnityEmbedStatu
 #[tauri::command]
 pub async fn unity_embed_set_mouse_activation_suppressed(
     app_handle: AppHandle,
+    window_id: Option<String>,
     suppressed: bool,
 ) -> Result<(), AppError> {
     #[cfg(target_os = "windows")]
     {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let app_for_main = app_handle.clone();
+        let label = unity_embed_window_label_for_optional_id(window_id.as_deref());
         app_handle
             .run_on_main_thread(move || {
                 let result = windows_impl::set_mouse_activation_suppressed(
-                    app_for_main.get_webview_window(WINDOW_LABEL).as_ref(),
+                    app_for_main.get_webview_window(&label).as_ref(),
                     suppressed,
                 );
                 let _ = tx.send(result);
@@ -1493,6 +1813,7 @@ pub async fn unity_embed_set_mouse_activation_suppressed(
     #[cfg(not(target_os = "windows"))]
     {
         let _ = app_handle;
+        let _ = window_id;
         let _ = suppressed;
     }
 
@@ -1500,15 +1821,19 @@ pub async fn unity_embed_set_mouse_activation_suppressed(
 }
 
 #[tauri::command]
-pub async fn unity_embed_activate_for_input(app_handle: AppHandle) -> Result<(), AppError> {
+pub async fn unity_embed_activate_for_input(
+    app_handle: AppHandle,
+    window_id: Option<String>,
+) -> Result<(), AppError> {
     #[cfg(target_os = "windows")]
     {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let app_for_main = app_handle.clone();
+        let label = unity_embed_window_label_for_optional_id(window_id.as_deref());
         app_handle
             .run_on_main_thread(move || {
                 let result = windows_impl::activate_for_input(
-                    app_for_main.get_webview_window(WINDOW_LABEL).as_ref(),
+                    app_for_main.get_webview_window(&label).as_ref(),
                 );
                 let _ = tx.send(result);
             })
@@ -1521,6 +1846,7 @@ pub async fn unity_embed_activate_for_input(app_handle: AppHandle) -> Result<(),
     #[cfg(not(target_os = "windows"))]
     {
         let _ = app_handle;
+        let _ = window_id;
     }
 
     Ok(())
@@ -1529,16 +1855,18 @@ pub async fn unity_embed_activate_for_input(app_handle: AppHandle) -> Result<(),
 #[tauri::command]
 pub async fn unity_embed_set_drag_passthrough(
     app_handle: AppHandle,
+    window_id: Option<String>,
     active: bool,
 ) -> Result<(), AppError> {
     #[cfg(target_os = "windows")]
     {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let app_for_main = app_handle.clone();
+        let label = unity_embed_window_label_for_optional_id(window_id.as_deref());
         app_handle
             .run_on_main_thread(move || {
                 let result = windows_impl::set_drag_passthrough(
-                    app_for_main.get_webview_window(WINDOW_LABEL).as_ref(),
+                    app_for_main.get_webview_window(&label).as_ref(),
                     active,
                 );
                 let _ = tx.send(result);
@@ -1552,6 +1880,7 @@ pub async fn unity_embed_set_drag_passthrough(
     #[cfg(not(target_os = "windows"))]
     {
         let _ = app_handle;
+        let _ = window_id;
         let _ = active;
     }
 
@@ -1561,15 +1890,17 @@ pub async fn unity_embed_set_drag_passthrough(
 #[tauri::command]
 pub async fn unity_embed_focus_debug_snapshot(
     app_handle: AppHandle,
+    window_id: Option<String>,
 ) -> Result<UnityEmbedFocusDebugSnapshot, AppError> {
     #[cfg(target_os = "windows")]
     {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let app_for_main = app_handle.clone();
+        let label = unity_embed_window_label_for_optional_id(window_id.as_deref());
         app_handle
             .run_on_main_thread(move || {
                 let result = windows_impl::focus_debug_snapshot(
-                    app_for_main.get_webview_window(WINDOW_LABEL).as_ref(),
+                    app_for_main.get_webview_window(&label).as_ref(),
                 );
                 let _ = tx.send(result);
             })
@@ -1586,6 +1917,7 @@ pub async fn unity_embed_focus_debug_snapshot(
     #[cfg(not(target_os = "windows"))]
     {
         let _ = app_handle;
+        let _ = window_id;
         Ok(UnityEmbedFocusDebugSnapshot {
             ok: false,
             reason: "focus debug is only available on Windows".to_string(),
@@ -1624,13 +1956,27 @@ pub(crate) fn reset_unity_embed_control_window(app_handle: &AppHandle) {
 }
 
 pub(crate) fn destroy_unity_embed_control_window_on_main(app_handle: &AppHandle) {
-    cancel_transient_close_destroy();
-    if let Some(window) = app_handle.get_webview_window(WINDOW_LABEL) {
+    cancel_all_transient_close_destroys(app_handle);
+    for label in unity_embed_window_labels(app_handle) {
+        if let Some(window) = app_handle.get_webview_window(&label) {
+            if let Err(close_error) = window.destroy().or_else(|_| window.close()) {
+                eprintln!("[Locus] failed to destroy Unity embed window: {close_error}");
+            }
+        }
+    }
+    record_all_embed_windows_destroyed();
+}
+
+fn destroy_unity_embed_window_on_main(app_handle: &AppHandle, label: &str) {
+    cancel_transient_close_destroy(label);
+    if let Some(window) = app_handle.get_webview_window(label) {
+        #[cfg(target_os = "windows")]
+        windows_impl::disable_popup_sync_for_window(&window);
         if let Err(close_error) = window.destroy().or_else(|_| window.close()) {
             eprintln!("[Locus] failed to destroy Unity embed window: {close_error}");
         }
     }
-    record_window_destroyed();
+    record_window_destroyed(label);
 }
 
 fn normalized_rect(msg: &UnityEmbedControlMessage) -> (i32, i32, u32, u32) {
@@ -1646,7 +1992,8 @@ fn ensure_embed_window(
     app_handle: &AppHandle,
     msg: &UnityEmbedControlMessage,
 ) -> Result<(tauri::WebviewWindow, bool), String> {
-    if let Some(window) = app_handle.get_webview_window(WINDOW_LABEL) {
+    let label = unity_embed_window_label_for_msg(msg);
+    if let Some(window) = app_handle.get_webview_window(&label) {
         #[cfg(target_os = "windows")]
         if let Ok(hwnd) = window.hwnd() {
             record_child_hwnd(hwnd.0 as isize as i64);
@@ -1655,12 +2002,14 @@ fn ensure_embed_window(
     }
 
     let (x, y, width, height) = normalized_rect(msg);
+    let host_url = unity_embed_host_url_for_msg(msg);
+    let title = unity_embed_window_title(msg);
     let builder = tauri::WebviewWindowBuilder::new(
         app_handle,
-        WINDOW_LABEL,
-        WebviewUrl::App(EMBED_URL.into()),
+        label.clone(),
+        WebviewUrl::App(host_url.into()),
     )
-    .title("Locus")
+    .title(title)
     .position(x as f64, y as f64)
     .inner_size(width as f64, height as f64)
     .decorations(false)
@@ -1689,26 +2038,32 @@ fn apply_control_message_on_main(
     app_handle: &AppHandle,
     msg: UnityEmbedControlMessage,
 ) -> Result<(), String> {
+    let label = unity_embed_window_label_for_msg(&msg);
+    if should_ignore_stale_control_message(&label, &msg) {
+        return Ok(());
+    }
     if msg.kind != "assetDrop" && msg.kind != "assetDrag" && msg.kind != "consoleText" {
         record_control_message(&msg);
     }
     match msg.kind.as_str() {
         "open" | "update" => {
-            cancel_transient_close_destroy();
+            cancel_transient_close_destroy(&label);
             let (window, created) = ensure_embed_window(app_handle, &msg)?;
 
-            if created || needs_geometry_apply(&msg) {
+            let apply_geometry = created || needs_geometry_apply(&label, &msg);
+            let desired_visible = should_show_window_now(&window, &msg);
+            let apply_visibility = created || needs_visibility_apply(&label, desired_visible);
+            if apply_geometry {
                 apply_window_geometry(&window, &msg)?;
-                record_applied_geometry(&msg);
+                record_applied_geometry(&label, &msg);
             }
 
-            let desired_visible = should_show_window_now(&window, &msg);
-            if created || needs_visibility_apply(desired_visible) {
+            if apply_visibility {
                 apply_embed_window_visibility(&window, desired_visible)?;
-                record_applied_visibility(desired_visible);
+                record_applied_visibility(&label, desired_visible);
             }
             #[cfg(target_os = "windows")]
-            windows_impl::set_popup_sync_visible(msg.visible);
+            windows_impl::set_popup_sync_visible(&window, msg.visible);
             Ok(())
         }
         "close" => {
@@ -1716,18 +2071,11 @@ fn apply_control_message_on_main(
             windows_impl::stop_reference_drag_preview();
 
             if is_transient_close_reason(&msg.reason) {
-                schedule_transient_close_destroy(app_handle);
+                schedule_transient_close_destroy(app_handle, label);
                 return Ok(());
             }
 
-            cancel_transient_close_destroy();
-            if let Some(window) = app_handle.get_webview_window(WINDOW_LABEL) {
-                window
-                    .destroy()
-                    .or_else(|_| window.close())
-                    .map_err(|error| format!("Failed to close Unity embed window: {error}"))?;
-            }
-            record_window_destroyed();
+            destroy_unity_embed_window_on_main(app_handle, &label);
             Ok(())
         }
         "assetDrop" => {
@@ -1737,7 +2085,7 @@ fn apply_control_message_on_main(
                 windows_impl::stop_reference_drag_preview();
                 return Ok(());
             }
-            emit_unity_embed_asset_drop(app_handle, refs)?;
+            emit_locus_asset_drop_to(app_handle, &label, refs)?;
             cache_unity_embed_asset_drag_refs(Vec::new());
             #[cfg(target_os = "windows")]
             windows_impl::stop_reference_drag_preview();
@@ -1802,7 +2150,7 @@ fn apply_window_geometry(
         if let Err(error) = windows_impl::position_owned_overlay(window, msg) {
             eprintln!("[Locus] Unity embed Win32 overlay failed, using Tauri fallback: {error}");
             record_mount_result(false, Some(error.clone()));
-            windows_impl::disable_popup_sync();
+            windows_impl::disable_popup_sync_for_window(window);
             return apply_overlay_geometry(window, msg);
         }
         record_mount_result(true, None);
@@ -1812,7 +2160,7 @@ fn apply_window_geometry(
     record_mount_result(false, Some("Unity parent HWND is missing".to_string()));
     #[cfg(target_os = "windows")]
     {
-        windows_impl::disable_popup_sync();
+        windows_impl::disable_popup_sync_for_window(window);
         windows_impl::set_activation_guard_enabled(Some(window), true)?;
     }
     apply_overlay_geometry(window, msg)
@@ -1936,6 +2284,7 @@ mod windows_impl {
     const REFERENCE_DRAG_PREVIEW_OFFSET_X: i32 = 6;
     const REFERENCE_DRAG_PREVIEW_OFFSET_Y: i32 = 8;
     const Z_ORDER_SCAN_LIMIT: usize = 2048;
+    const USE_CHILD_EMBED_OVERLAY: bool = true;
     const MOUSE_ACTIVATE_SUBCLASS_ID: usize = 0x4c6f637573;
     const VK_LBUTTON_CODE: i32 = 0x01;
 
@@ -1976,10 +2325,22 @@ mod windows_impl {
         if window_label_contains_hwnd(app_handle, MAIN_WINDOW_LABEL, hwnd)? {
             return Ok(UnityAssetDragReleaseTarget::MainWindow);
         }
-        if window_label_contains_hwnd(app_handle, WINDOW_LABEL, hwnd)? {
+        if unity_embed_window_contains_hwnd(app_handle, hwnd)? {
             return Ok(UnityAssetDragReleaseTarget::EmbedWindow);
         }
         Ok(UnityAssetDragReleaseTarget::Other)
+    }
+
+    unsafe fn unity_embed_window_contains_hwnd(
+        app_handle: &AppHandle,
+        hwnd: HWND,
+    ) -> Result<bool, String> {
+        for label in unity_embed_window_labels(app_handle) {
+            if window_label_contains_hwnd(app_handle, &label, hwnd)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     unsafe fn window_label_contains_hwnd(
@@ -2744,11 +3105,15 @@ mod windows_impl {
         height: i32,
     }
 
-    #[derive(Debug, Default)]
-    struct PopupSyncState {
-        active: bool,
+    #[derive(Debug, Clone, Copy, Default)]
+    struct PopupSyncEntry {
         visible: bool,
         snapshot: PopupSyncSnapshot,
+    }
+
+    #[derive(Debug, Default)]
+    struct PopupSyncState {
+        entries: HashMap<i64, PopupSyncEntry>,
     }
 
     #[derive(Debug)]
@@ -3602,7 +3967,13 @@ mod windows_impl {
         loop {
             let app_for_main = app_handle.clone();
             let _ = app_handle.run_on_main_thread(move || {
-                if let Some(window) = app_for_main.get_webview_window(WINDOW_LABEL) {
+                let windows = app_for_main.webview_windows();
+                let mut synced_any = false;
+                for (label, window) in windows {
+                    if !is_unity_embed_window_label(&label) {
+                        continue;
+                    }
+                    synced_any = true;
                     if is_activation_guard_enabled() {
                         if let Err(error) = sync_mouse_activation_style(&window) {
                             eprintln!(
@@ -3618,95 +3989,112 @@ mod windows_impl {
                                 "[Locus] failed to clear Unity embed activation style: {error}"
                             );
                         }
-                        remove_mouse_activate_hook();
                     }
+                }
+                if !synced_any || !is_activation_guard_enabled() {
+                    remove_mouse_activate_hook();
                 }
             });
             tokio::time::sleep(Duration::from_millis(MOUSE_HOOK_SYNC_INTERVAL_MS)).await;
         }
     }
 
-    fn popup_sync_snapshot() -> Option<PopupSyncSnapshot> {
-        let state = popup_sync_state().lock().ok()?;
-        if !state.active || !state.visible {
-            return None;
-        }
-
-        let snapshot = state.snapshot;
-        if snapshot.parent_hwnd <= 0
-            || snapshot.child_hwnd <= 0
-            || snapshot.width <= 0
-            || snapshot.height <= 0
-        {
-            return None;
-        }
-
-        Some(snapshot)
+    fn popup_sync_snapshots() -> Vec<PopupSyncSnapshot> {
+        popup_sync_state()
+            .lock()
+            .map(|state| {
+                state
+                    .entries
+                    .values()
+                    .filter_map(|entry| {
+                        if !entry.visible {
+                            return None;
+                        }
+                        let snapshot = entry.snapshot;
+                        if snapshot.parent_hwnd <= 0
+                            || snapshot.child_hwnd <= 0
+                            || snapshot.width <= 0
+                            || snapshot.height <= 0
+                        {
+                            return None;
+                        }
+                        Some(snapshot)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     fn sync_popup_overlay_position() -> bool {
-        let Some(snapshot) = popup_sync_snapshot() else {
+        let snapshots = popup_sync_snapshots();
+        if snapshots.is_empty() {
             return false;
-        };
+        }
 
-        let parent = HWND(snapshot.parent_hwnd as isize as *mut std::ffi::c_void);
-        let child = HWND(snapshot.child_hwnd as isize as *mut std::ffi::c_void);
+        let mut active = false;
 
-        unsafe {
-            if !IsWindow(Some(parent)).as_bool() || !IsWindow(Some(child)).as_bool() {
-                disable_popup_sync();
-                return false;
-            }
+        for snapshot in snapshots {
+            let parent = HWND(snapshot.parent_hwnd as isize as *mut std::ffi::c_void);
+            let child = HWND(snapshot.child_hwnd as isize as *mut std::ffi::c_void);
 
-            let mut parent_rect = RECT::default();
-            if GetWindowRect(parent, &mut parent_rect).is_err() {
-                return true;
-            }
+            unsafe {
+                if !IsWindow(Some(parent)).as_bool() || !IsWindow(Some(child)).as_bool() {
+                    remove_popup_sync_entry(snapshot.child_hwnd);
+                    continue;
+                }
 
-            let x = parent_rect.left + snapshot.offset_x;
-            let y = parent_rect.top + snapshot.offset_y;
-            let width = snapshot.width;
-            let height = snapshot.height;
+                let mut parent_rect = RECT::default();
+                if GetWindowRect(parent, &mut parent_rect).is_err() {
+                    active = true;
+                    continue;
+                }
 
-            let target_rect = RECT {
-                left: x,
-                top: y,
-                right: x + width,
-                bottom: y + height,
-            };
-            let should_show = is_overlay_parent_visible_at(parent);
-            sync_overlay_visibility(child, should_show);
-            if !should_show {
-                return false;
-            }
+                let x = parent_rect.left + snapshot.offset_x;
+                let y = parent_rect.top + snapshot.offset_y;
+                let width = snapshot.width;
+                let height = snapshot.height;
 
-            let mut child_rect = RECT::default();
-            let child_matches = GetWindowRect(child, &mut child_rect)
-                .map(|_| {
-                    child_rect.left == x
-                        && child_rect.top == y
-                        && child_rect.right - child_rect.left == width
-                        && child_rect.bottom - child_rect.top == height
-                })
-                .unwrap_or(false);
-            let insert_after = overlay_insert_after(parent, child, target_rect);
+                let target_rect = RECT {
+                    left: x,
+                    top: y,
+                    right: x + width,
+                    bottom: y + height,
+                };
+                let should_show = is_overlay_parent_visible_at(parent);
+                sync_overlay_visibility(child, should_show);
+                if !should_show {
+                    continue;
+                }
 
-            let _ = SetWindowPos(
-                child,
-                Some(insert_after),
-                x,
-                y,
-                width,
-                height,
-                SWP_NOACTIVATE | SWP_NOOWNERZORDER,
-            );
+                let mut child_rect = RECT::default();
+                let child_matches = GetWindowRect(child, &mut child_rect)
+                    .map(|_| {
+                        child_rect.left == x
+                            && child_rect.top == y
+                            && child_rect.right - child_rect.left == width
+                            && child_rect.bottom - child_rect.top == height
+                    })
+                    .unwrap_or(false);
+                let insert_after = overlay_insert_after(parent, child, target_rect);
 
-            if !child_matches {
-                return true;
+                let _ = SetWindowPos(
+                    child,
+                    Some(insert_after),
+                    x,
+                    y,
+                    width,
+                    height,
+                    SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+                );
+
+                active = true;
+                if !child_matches {
+                    continue;
+                }
             }
         }
 
-        true
+        active
     }
 
     pub(super) fn disable_popup_sync() {
@@ -3715,9 +4103,31 @@ mod windows_impl {
         }
     }
 
-    pub(super) fn set_popup_sync_visible(visible: bool) {
+    pub(super) fn disable_popup_sync_for_window(window: &tauri::WebviewWindow) {
+        remove_popup_sync_for_window(window);
+    }
+
+    pub(super) fn set_popup_sync_visible(window: &tauri::WebviewWindow, visible: bool) {
+        let child_hwnd = match window.hwnd() {
+            Ok(hwnd) => hwnd.0 as isize as i64,
+            Err(_) => return,
+        };
         if let Ok(mut state) = popup_sync_state().lock() {
-            state.visible = visible;
+            if let Some(entry) = state.entries.get_mut(&child_hwnd) {
+                entry.visible = visible;
+            }
+        }
+    }
+
+    fn remove_popup_sync_entry(child_hwnd: i64) {
+        if let Ok(mut state) = popup_sync_state().lock() {
+            state.entries.remove(&child_hwnd);
+        }
+    }
+
+    fn remove_popup_sync_for_window(window: &tauri::WebviewWindow) {
+        if let Ok(hwnd) = window.hwnd() {
+            remove_popup_sync_entry(hwnd.0 as isize as i64);
         }
     }
 
@@ -3745,16 +4155,20 @@ mod windows_impl {
                 .map_err(|error| format!("GetWindowRect failed for Unity parent HWND: {error}"))?;
 
             if let Ok(mut state) = popup_sync_state().lock() {
-                state.active = true;
-                state.visible = visible;
-                state.snapshot = PopupSyncSnapshot {
-                    parent_hwnd,
+                state.entries.insert(
                     child_hwnd,
-                    offset_x: x - parent_rect.left,
-                    offset_y: y - parent_rect.top,
-                    width,
-                    height,
-                };
+                    PopupSyncEntry {
+                        visible,
+                        snapshot: PopupSyncSnapshot {
+                            parent_hwnd,
+                            child_hwnd,
+                            offset_x: x - parent_rect.left,
+                            offset_y: y - parent_rect.top,
+                            width,
+                            height,
+                        },
+                    },
+                );
             }
         }
 
@@ -3813,9 +4227,14 @@ mod windows_impl {
         window: &tauri::WebviewWindow,
         msg: &UnityEmbedControlMessage,
     ) -> Result<(), String> {
+        if !USE_CHILD_EMBED_OVERLAY {
+            set_activation_guard_enabled(Some(window), true)?;
+            return position_popup_overlay(window, msg);
+        }
+
         match position_child_overlay(window, msg) {
             Ok(()) => {
-                disable_popup_sync();
+                remove_popup_sync_for_window(window);
                 Ok(())
             }
             Err(child_error) => {
@@ -3928,9 +4347,15 @@ mod windows_impl {
             let needs_detach = (current_style & WS_CHILD.0) != 0;
             let needs_style_update =
                 (current_style & frame_style_mask) != 0 || (current_style & WS_POPUP.0) == 0;
-            let needs_owner_update = applied_state()
+            let label = unity_embed_window_label_for_msg(msg);
+            let needs_owner_update = applied_states()
                 .lock()
-                .map(|state| !state.has_window || state.parent_hwnd != msg.parent_hwnd)
+                .map(|states| {
+                    states
+                        .get(&label)
+                        .map(|state| !state.has_window || state.parent_hwnd != msg.parent_hwnd)
+                        .unwrap_or(true)
+                })
                 .unwrap_or(true);
 
             if needs_detach {

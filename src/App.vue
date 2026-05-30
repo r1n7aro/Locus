@@ -47,6 +47,10 @@ import {
 import { markStartupPhase } from "./services/startupPerf";
 const isUnityEmbedTestWindow = window.location.pathname === "/unity-embed-test";
 const isUnityEmbedWindow = !isUnityEmbedTestWindow && window.location.pathname === "/unity-embed";
+const unityEmbedParams = new URLSearchParams(window.location.search);
+const unityEmbedTarget = unityEmbedParams.get("target") || "session";
+const unityEmbedTargetId = unityEmbedParams.get("id") || "";
+const isUnityEmbedViewWindow = isUnityEmbedWindow && unityEmbedTarget === "view";
 const isKnowledgeDownloadWindow = isKnowledgeDownloadWindowLocation();
 const isKnowledgeLexicalProgressWindow = isKnowledgeLexicalProgressWindowLocation();
 const isFeishuReferenceImportWindow = isFeishuReferenceImportWindowLocation();
@@ -732,10 +736,16 @@ watch(() => projectStore.workingDir, () => {
 </script>
 
 <template>
+  <template v-if="isUnityEmbedViewWindow">
+    <div v-if="unityEmbedBootstrapError" class="app-startup-state">{{ unityEmbedBootstrapError }}</div>
+    <div v-else-if="!unityEmbedBootstrapped" class="app-startup-state">{{ t("common.loading") }}</div>
+    <ViewHostWindow v-else embedded />
+  </template>
   <UnityEmbeddedSessionView
-    v-if="isUnityEmbedWindow"
+    v-else-if="isUnityEmbedWindow"
     :bootstrapped="unityEmbedBootstrapped"
     :bootstrap-error="unityEmbedBootstrapError"
+    :initial-session-id="unityEmbedTargetId"
   />
   <UnityEmbedTestView v-else-if="isUnityEmbedTestWindow" />
   <KnowledgeDownloadProgressWindow v-else-if="isKnowledgeDownloadWindow" />

@@ -1584,6 +1584,24 @@ namespace Locus
                         return await tcs.Task;
                     }
 
+                    case "open_frontend_window":
+                    {
+                        var tcs = new TaskCompletionSource<PipeEnvelope>();
+                        PostToMainThread(delegate
+                        {
+                            try
+                            {
+                                string status = LocusEditorWindow.OpenFrontendWindowFromJson(msg.message);
+                                tcs.SetResult(OkResponse(reqId, status));
+                            }
+                            catch (Exception ex)
+                            {
+                                tcs.SetResult(ErrorResponse(reqId, ex.Message));
+                            }
+                        });
+                        return await tcs.Task;
+                    }
+
                     case "list_yaml":
                         return await HandleListYaml(reqId, msg.message);
 

@@ -65,22 +65,78 @@ export function openUnitySceneObjectInspector(
   return ipcInvoke("open_unity_scene_object_inspector", { scenePath, objectPath });
 }
 
+export type UnityEmbeddedFrontendTarget = "session" | "view";
+
+export interface UnityEmbeddedFrontendWindowRequest {
+  windowId?: string | null;
+  targetKind: UnityEmbeddedFrontendTarget;
+  targetId?: string | null;
+  title?: string | null;
+}
+
+export interface UnityEmbeddedFrontendWindowResult {
+  windowId: string;
+  windowLabel: string;
+  targetKind: UnityEmbeddedFrontendTarget;
+  targetId: string;
+  title: string;
+  hostUrl: string;
+}
+
+export function currentUnityEmbedWindowId(): string | null {
+  try {
+    return new URLSearchParams(window.location.search).get("windowId");
+  } catch {
+    return null;
+  }
+}
+
+export function openUnityEmbeddedFrontendWindow(
+  request: UnityEmbeddedFrontendWindowRequest,
+): Promise<UnityEmbeddedFrontendWindowResult> {
+  return ipcInvoke<UnityEmbeddedFrontendWindowResult>("unity_embed_open_frontend_window", { request });
+}
+
+export function openUnityEmbeddedSessionWindow(request: {
+  sessionId?: string | null;
+  title?: string | null;
+} = {}): Promise<UnityEmbeddedFrontendWindowResult> {
+  const sessionId = request.sessionId?.trim() || null;
+  return openUnityEmbeddedFrontendWindow({
+    targetKind: "session",
+    targetId: sessionId,
+    title: request.title?.trim()
+      ? `Locus Session - ${request.title.trim()}${sessionId ? ` (${sessionId.slice(0, 8)})` : ""}`
+      : sessionId
+        ? `Locus Session (${sessionId.slice(0, 8)})`
+        : "Locus Session",
+  });
+}
+
 export function setUnityEmbedMouseActivationSuppressed(suppressed: boolean): Promise<void> {
   const runtime = getLocusRuntime();
   if (runtime.kind !== "tauri") return Promise.resolve();
-  return runtime.invoke("unity_embed_set_mouse_activation_suppressed", { suppressed });
+  return runtime.invoke("unity_embed_set_mouse_activation_suppressed", {
+    windowId: currentUnityEmbedWindowId(),
+    suppressed,
+  });
 }
 
 export function activateUnityEmbedForInput(): Promise<void> {
   const runtime = getLocusRuntime();
   if (runtime.kind !== "tauri") return Promise.resolve();
-  return runtime.invoke("unity_embed_activate_for_input");
+  return runtime.invoke("unity_embed_activate_for_input", {
+    windowId: currentUnityEmbedWindowId(),
+  });
 }
 
 export function setUnityEmbedDragPassthrough(active: boolean): Promise<void> {
   const runtime = getLocusRuntime();
   if (runtime.kind !== "tauri") return Promise.resolve();
-  return runtime.invoke("unity_embed_set_drag_passthrough", { active });
+  return runtime.invoke("unity_embed_set_drag_passthrough", {
+    windowId: currentUnityEmbedWindowId(),
+    active,
+  });
 }
 
 export function commitUnityEmbedAssetDrop(): Promise<void> {
@@ -244,7 +300,9 @@ export interface UnityEmbedFocusDebugSnapshot {
 export function getUnityEmbedFocusDebugSnapshot(): Promise<UnityEmbedFocusDebugSnapshot | null> {
   const runtime = getLocusRuntime();
   if (runtime.kind !== "tauri") return Promise.resolve(null);
-  return runtime.invoke<UnityEmbedFocusDebugSnapshot>("unity_embed_focus_debug_snapshot");
+  return runtime.invoke<UnityEmbedFocusDebugSnapshot>("unity_embed_focus_debug_snapshot", {
+    windowId: currentUnityEmbedWindowId(),
+  });
 }
 
 export type UnitySceneObjectErrorKind = "sceneNotLoaded" | "objectMissing" | "unknown";

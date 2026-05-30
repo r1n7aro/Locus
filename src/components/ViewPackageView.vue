@@ -33,6 +33,7 @@ import {
   viewMoveEntry,
   viewRequiresUnityConnection,
   viewRun,
+  viewRunInUnity,
   viewTree,
   type ViewFolderSummary,
   type ViewPackageSummary,
@@ -947,15 +948,56 @@ async function openViewPackage(view: ViewPackageSummary) {
   }
 }
 
+async function openViewPackageInUnity(view: ViewPackageSummary) {
+  if (!view || running.value) return;
+  selectedViewId.value = view.id;
+  running.value = true;
+  try {
+    const requirementError = await checkViewOpenRequirements(view);
+    if (requirementError) {
+      notificationStore.addNotice("error", requirementError.message, {
+        code: requirementError.code,
+        operation: "viewRunInUnity",
+        replaceOperation: true,
+      });
+      return;
+    }
+    await viewRunInUnity(view.id);
+  } catch (runError) {
+    const err = normalizeViewError(runError, { viewName: view.name });
+    notificationStore.addNotice("error", err.message, {
+      code: err.code,
+      operation: "viewRunInUnity",
+      replaceOperation: true,
+    });
+  } finally {
+    running.value = false;
+  }
+}
+
 async function openSelectedView() {
   const view = selectedView.value;
   if (!view) return;
   await openViewPackage(view);
 }
 
+async function openSelectedViewInUnity() {
+  const view = selectedView.value;
+  if (!view) return;
+  await openViewPackageInUnity(view);
+}
+
 async function openTreeView(row: VisibleViewRow) {
   if (row.node.kind !== "view" || !row.node.view) return;
   await openViewPackage(row.node.view);
+}
+
+async function openContextViewInUnity() {
+  const menu = contextMenu.value;
+  if (!menu || menu.kind !== "view" || !menu.node.view) return;
+  const view = menu.node.view;
+  closeContextMenu();
+  await openViewPackageInUnity(view);
 }
 
 watch(() => props.workingDir, () => {
@@ -1187,6 +1229,9 @@ onUnmounted(() => {
               <BaseButton :disabled="!selectedViewId || running" @click="openSelectedView">
                 {{ running ? t("view.action.opening") : t("view.action.open") }}
               </BaseButton>
+              <BaseButton :disabled="!selectedViewId || running" @click="openSelectedViewInUnity">
+                {{ t("view.action.openInUnity") }}
+              </BaseButton>
             </div>
           </div>
 
@@ -1248,6 +1293,14 @@ onUnmounted(() => {
               </button>
               <div class="view-ctx-sep"></div>
             </template>
+            <button
+              v-if="contextMenu.kind === 'view'"
+              type="button"
+              class="view-ctx-item"
+              @click.stop="openContextViewInUnity"
+            >
+              {{ t("view.action.openInUnity") }}
+            </button>
             <button
               v-if="contextMenu.kind === 'view'"
               type="button"

@@ -692,6 +692,19 @@ pub async fn cancel_asset_drag(project_path: &str) -> Result<(), String> {
     }
 }
 
+pub async fn open_frontend_window(project_path: &str, payload: &str) -> Result<(), String> {
+    let op_lock = project_unity_op_lock(project_path).await;
+    let _guard = op_lock.lock().await;
+    let resp = send_message(project_path, "open_frontend_window", payload).await?;
+    if resp.ok {
+        Ok(())
+    } else {
+        Err(resp
+            .error
+            .unwrap_or_else(|| "open_frontend_window failed".to_string()))
+    }
+}
+
 /// Canonical status values: "disconnected" | "editing" | "playing" | "playing_paused"
 pub async fn query_unity_status(project_path: &str) -> (bool, &'static str, Option<String>) {
     match send_message(project_path, "status", "").await {

@@ -27,11 +27,13 @@ import {
   viewMoveEntry,
   viewRequiresUnityConnection,
   viewRun,
+  viewRunInUnity,
   viewTree,
   viewUnityConnectionRequiredError,
   type ViewFolderSummary,
   type ViewPackageSummary,
 } from "../../services/view";
+import { openUnityEmbeddedSessionWindow } from "../../services/unity";
 import { getLocusRuntime, type RuntimeUnsubscribe } from "../../services/locusRuntime";
 import { useNotificationStore } from "../../stores/notification";
 import { useProjectStore } from "../../stores/project";
@@ -445,6 +447,29 @@ async function openView(view: ViewPackageSummary) {
   }
 }
 
+async function openViewInUnity(view: ViewPackageSummary) {
+  if (viewOpeningKey.value) return;
+  const key = `${packageRelPath(view)}:${view.id}:unity`;
+  viewOpeningKey.value = key;
+  try {
+    const requirementError = await checkViewOpenRequirements(view);
+    if (requirementError) {
+      notifyViewOpenError(requirementError);
+      return;
+    }
+    await viewRunInUnity(view.id);
+  } catch (error) {
+    const err = normalizeViewError(error, { viewName: view.name });
+    notificationStore.addNotice("error", err.message, {
+      code: err.code,
+      operation: "openViewInUnityFromSessionPanel",
+      skipConsoleLog: true,
+    });
+  } finally {
+    viewOpeningKey.value = "";
+  }
+}
+
 function onViewRowClick(row: VisibleViewRow) {
   if (row.node.kind === "folder") {
     toggleViewRow(row);
@@ -690,6 +715,14 @@ function applyViewSplit(clientY: number) {
   const viewHeight = rect.bottom - clientY - VIEW_RESIZE_HANDLE_PX / 2;
   viewSectionRatio.value = clampViewSplitRatio(viewHeight / availableHeight);
   persistViewSplitRatio();
+}
+
+async function openViewContextInUnity() {
+  const menu = viewCtxMenu.value;
+  if (!menu || menu.kind !== "view" || !menu.node.view) return;
+  const view = menu.node.view;
+  closeViewContextMenu();
+  await openViewInUnity(view);
 }
 
 function onViewResizeMouseDown(event: MouseEvent) {
@@ -1053,6 +1086,26 @@ function ctxSaveContext(includeSystemPrompt: boolean) {
   closeCtxMenu();
 }
 
+async function ctxOpenSessionInUnity() {
+  const menu = ctxMenu.value;
+  if (!menu || menu.ids.length !== 1) return;
+  const session = menu.session;
+  closeCtxMenu();
+  try {
+    await openUnityEmbeddedSessionWindow({
+      sessionId: session.id,
+      title: session.title || session.id,
+    });
+  } catch (error) {
+    const err = normalizeAppError(error);
+    notificationStore.addNotice("error", err.message, {
+      code: err.code,
+      operation: "openSessionInUnity",
+      skipConsoleLog: true,
+    });
+  }
+}
+
 function ctxArchive() {
   if (ctxMenu.value) performArchive(ctxMenu.value.ids);
 }
@@ -1407,6 +1460,15 @@ function ctxArchive() {
         <div v-if="viewCtxMenu.kind === 'folder'" class="sp-ctx-sep"></div>
       </template>
       <button
+        v-if="viewCtxMenu.kind === 'view'"
+        type="button"
+        class="sp-ctx-item"
+        @click.stop="openViewContextInUnity"
+      >
+        {{ t('view.action.openInUnity') }}
+      </button>
+      <div v-if="viewCtxMenu.kind === 'view'" class="sp-ctx-sep"></div>
+      <button
         v-if="viewCtxMenu.kind === 'folder' || viewCtxMenu.kind === 'view'"
         type="button"
         class="sp-ctx-item danger"
@@ -1446,6 +1508,7 @@ function ctxArchive() {
     >
       <template v-if="ctxMenu.ids.length <= 1">
         <button type="button" class="sp-ctx-item" @click="startRename(ctxMenu!.session)">{{ t('chat.session.rename') }}</button>
+        <button type="button" class="sp-ctx-item" @click="ctxOpenSessionInUnity">{{ t('chat.session.openInUnity') }}</button>
         <button type="button" class="sp-ctx-item" @click="ctxSaveContext(true)">{{ t('chat.saveContextWithSystemPrompt') }}</button>
         <button type="button" class="sp-ctx-item" @click="ctxSaveContext(false)">{{ t('chat.saveContextWithoutSystemPrompt') }}</button>
         <div class="sp-ctx-sep"></div>

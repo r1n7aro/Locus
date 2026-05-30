@@ -517,6 +517,10 @@ export function viewRun(viewId: string): Promise<ViewRunResult> {
   return ipcInvoke<ViewRunResult>("view_run", { viewId });
 }
 
+export function viewRunInUnity(viewId: string): Promise<ViewRunResult> {
+  return ipcInvoke<ViewRunResult>("view_run_in_unity", { viewId });
+}
+
 export function viewSetTabHost(request: ViewSetTabHostRequest): Promise<void> {
   return ipcInvoke<void>("view_set_tab_host", { request });
 }

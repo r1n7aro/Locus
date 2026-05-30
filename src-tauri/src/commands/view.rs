@@ -8,9 +8,9 @@ use crate::view::{
     complete_view_automation_request, create_view_folder_sync, create_view_sync_with_scope,
     delete_view_entry_sync, detach_view_tab_window, emit_view_reload, emit_view_tree_changed,
     export_view_package_sync, import_view_package_sync, list_view_tree_sync, list_views_sync,
-    move_view_entry_sync, open_view_frontend_log_sync, open_view_window, parse_view_create_request,
-    read_view_frontend_log_sync, read_view_sync, reload_view_sync, supported_view_templates,
-    view_binding_apply as view_binding_apply_impl,
+    move_view_entry_sync, open_view_frontend_log_sync, open_view_unity_embed_window,
+    open_view_window, parse_view_create_request, read_view_frontend_log_sync, read_view_sync,
+    reload_view_sync, supported_view_templates, view_binding_apply as view_binding_apply_impl,
     view_binding_discover as view_binding_discover_impl,
     view_binding_read as view_binding_read_impl, view_binding_write as view_binding_write_impl,
     ViewAutomationStore, ViewBindingApplyRequest, ViewBindingApplyResult,
@@ -152,6 +152,18 @@ pub async fn view_run(
     )
     .await
     .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn view_run_in_unity(
+    view_id: String,
+    workspace: State<'_, Arc<Workspace>>,
+    app_handle: AppHandle,
+) -> Result<ViewRunResult, AppError> {
+    let working_dir = workspace.path.read().await.clone();
+    open_view_unity_embed_window(&app_handle, &working_dir, &view_id)
+        .await
+        .map_err(Into::into)
 }
 
 #[tauri::command]

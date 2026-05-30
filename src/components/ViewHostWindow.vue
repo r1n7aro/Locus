@@ -74,6 +74,13 @@ const VIEW_HOST_TAB_DRAG_THRESHOLD_PX = 8;
 const VIEW_HOST_TAB_DRAG_FRAME_MS = 16;
 const VIEW_HOST_DETACH_OFFSET_X = 96;
 const VIEW_HOST_DETACH_OFFSET_Y = 18;
+const UNITY_EMBED_WINDOW_LABEL_PREFIX = "unity-embed-";
+
+const props = withDefaults(defineProps<{
+  embedded?: boolean;
+}>(), {
+  embedded: false,
+});
 
 interface ViewHostTab {
   id: string;
@@ -398,7 +405,10 @@ async function resolveViewTab(id: string): Promise<ViewHostTab> {
 }
 
 async function registerCurrentTabHost() {
-  if (!currentWindowLabel || !currentWindowLabel.startsWith(VIEW_HOST_WINDOW_LABEL_PREFIX)) return;
+  const canRegisterHost = currentWindowLabel
+    && (currentWindowLabel.startsWith(VIEW_HOST_WINDOW_LABEL_PREFIX)
+      || (props.embedded && currentWindowLabel.startsWith(UNITY_EMBED_WINDOW_LABEL_PREFIX)));
+  if (!canRegisterHost) return;
   const viewIds = normalizeTabIds(tabs.value.map((tab) => tab.id));
   if (viewIds.length === 0) return;
   try {
@@ -1717,7 +1727,8 @@ onMounted(async () => {
 });
 
 onUnmounted(() => {
-  if (tabDragState.value?.raf !== null) clearTimeout(tabDragState.value.raf);
+  const state = tabDragState.value;
+  if (state && state.raf !== null) clearTimeout(state.raf);
   tabDragState.value = null;
   window.removeEventListener("pointermove", onTabDragPointerMove);
   window.removeEventListener("pointerup", onTabDragPointerUp);
@@ -1748,9 +1759,18 @@ onUnmounted(() => {
 <template>
   <main
     class="view-host-window"
-    :class="{ 'is-tab-dragging': tabDragState?.dragging, 'is-tab-drop-target': !!tabDropTargetLabel }"
+    :class="{
+      'is-embedded': props.embedded,
+      'is-tab-dragging': tabDragState?.dragging,
+      'is-tab-drop-target': !!tabDropTargetLabel,
+    }"
   >
-    <header class="view-host-titlebar" data-tauri-drag-region @dblclick="toggleMaximizeWindow">
+    <header
+      v-if="!props.embedded"
+      class="view-host-titlebar"
+      data-tauri-drag-region
+      @dblclick="toggleMaximizeWindow"
+    >
       <div
         class="view-host-tabs"
         data-tauri-drag-region
@@ -1879,6 +1899,10 @@ onUnmounted(() => {
   color: var(--text-color);
   border: 1px solid var(--border-strong);
   box-sizing: border-box;
+}
+
+.view-host-window.is-embedded {
+  border: 0;
 }
 
 .view-host-titlebar {

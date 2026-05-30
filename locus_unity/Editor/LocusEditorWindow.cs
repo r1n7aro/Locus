@@ -29,14 +29,20 @@ namespace Locus
         private const double DesktopProbeIntervalSeconds = 2d;
         private const int PipeConnectTimeoutMs = 500;
         private const string CloseReasonWindowClosed = "windowClosed";
+        private const string CloseReasonWindowDisabled = "windowDisabled";
         private const string CloseReasonEditorQuit = "editorQuit";
         private const string CloseReasonDomainReload = "domainReload";
+        private const string DefaultWindowId = "session";
+        private const string DefaultTargetKind = "session";
+        private const string TargetKindSession = "session";
+        private const string TargetKindView = "view";
 
         private static readonly Encoding Utf8NoBom = new UTF8Encoding(false);
         private static Texture2D _titleIcon;
         private static bool _lifecycleHooksRegistered;
         private static bool _assemblyReloadInProgress;
         private static bool _editorQuitting;
+        private static bool _creatingFrontendWindow;
         private static volatile bool _globalAssetDragStateSendInFlight;
         private static double _nextGlobalAssetDragStateAt;
         private static string _lastGlobalAssetDragSignature = "";
@@ -79,17 +85,30 @@ namespace Locus
         private int _lastSentHeight;
         private bool _lastSentVisible;
         private long _lastSentParentHwnd;
+        private long _controlRevision;
         private double _nextDesktopProbeAt;
         private LocusDesktopInstall _desktopInstall = LocusDesktopInstall.NotFound;
         private bool _desktopProcessRunning;
         private volatile bool _desktopLaunchInFlight;
         private volatile bool _assetDragStateSendInFlight;
         private string _connectedPipeName = "";
+        [SerializeField] private string _windowId = DefaultWindowId;
+        [SerializeField] private string _targetKind = DefaultTargetKind;
+        [SerializeField] private string _targetId = "";
+        [SerializeField] private string _windowTitle = "Locus";
+        [SerializeField] private bool _frontendWindowConfigured = true;
+        private string _instanceId = "";
 
         [Serializable]
         private sealed class EmbedControlMessage
         {
             public string type;
+            public string windowId;
+            public string targetKind;
+            public string targetId;
+            public string title;
+            public string instanceId;
+            public long revision;
             public int x;
             public int y;
             public int width;
@@ -98,6 +117,17 @@ namespace Locus
             public long parentHwnd;
             public string reason;
             public DroppedAssetRef[] assetRefs;
+        }
+
+        [Serializable]
+        internal sealed class OpenFrontendWindowRequest
+        {
+            public string windowId;
+            public string targetKind;
+            public string targetId;
+            public string title;
+            public string windowLabel;
+            public string hostUrl;
         }
 
         [Serializable]
@@ -159,9 +189,62 @@ namespace Locus
         public static void OpenWindow()
         {
             LocusEditorWindow window = GetWindow<LocusEditorWindow>();
-            window.titleContent = CreateTitleContent();
+            window.ConfigureFrontendWindow(DefaultWindowId, TargetKindSession, "", "Locus");
             window.minSize = new Vector2(360f, 420f);
             window.Show();
+            if (OverlaySyncEnabled)
+                window.SendOpenOrUpdate(true);
+        }
+
+        internal static string OpenFrontendWindowFromJson(string json)
+        {
+            OpenFrontendWindowRequest request = ParseOpenFrontendWindowRequest(json);
+            LocusEditorWindow window = OpenFrontendWindow(
+                request.windowId,
+                request.targetKind,
+                request.targetId,
+                request.title);
+            return window != null ? "ok" : "failed";
+        }
+
+        internal static LocusEditorWindow OpenFrontendWindow(
+            string windowId,
+            string targetKind,
+            string targetId,
+            string title)
+        {
+            EnsureLifecycleHooks();
+            string normalizedWindowId = NormalizeWindowId(windowId);
+            string normalizedTargetKind = NormalizeTargetKind(targetKind);
+            string normalizedTargetId = (targetId ?? "").Trim();
+            string normalizedTitle = NormalizeWindowTitle(title, normalizedTargetKind, normalizedTargetId);
+
+            LocusEditorWindow window = FindFrontendWindow(normalizedWindowId);
+            bool reused = window != null;
+            if (!reused)
+            {
+                _creatingFrontendWindow = true;
+                try
+                {
+                    window = CreateInstance<LocusEditorWindow>();
+                }
+                finally
+                {
+                    _creatingFrontendWindow = false;
+                }
+            }
+
+            window.ConfigureFrontendWindow(
+                normalizedWindowId,
+                normalizedTargetKind,
+                normalizedTargetId,
+                normalizedTitle);
+            window.minSize = new Vector2(360f, 420f);
+            window.Show();
+            window.Focus();
+            if (OverlaySyncEnabled)
+                window.SendOpenOrUpdate(true);
+            return window;
         }
 
         internal static bool QueueOutboundAssetDrag(
@@ -261,6 +344,107 @@ namespace Locus
             EditorApplication.quitting += OnEditorQuitting;
         }
 
+        private static OpenFrontendWindowRequest ParseOpenFrontendWindowRequest(string json)
+        {
+            string payload = (json ?? "").Trim();
+            if (payload.StartsWith("{", StringComparison.Ordinal))
+            {
+                try
+                {
+                    OpenFrontendWindowRequest request =
+                        JsonUtility.FromJson<OpenFrontendWindowRequest>(payload);
+                    if (request != null)
+                        return request;
+                }
+                catch (Exception ex)
+                {
+                    UnityEngine.Debug.LogWarning("[Locus] Failed to parse open_frontend_window payload: " + ex.Message);
+                }
+            }
+            return new OpenFrontendWindowRequest();
+        }
+
+        private static LocusEditorWindow FindFrontendWindow(string windowId)
+        {
+            foreach (LocusEditorWindow window in Resources.FindObjectsOfTypeAll<LocusEditorWindow>())
+            {
+                if (window == null)
+                    continue;
+                window.EnsureWindowIdentity();
+                if (string.Equals(window._windowId, windowId, StringComparison.Ordinal))
+                    return window;
+            }
+            return null;
+        }
+
+        private static string NormalizeWindowId(string windowId)
+        {
+            string value = (windowId ?? "").Trim();
+            return string.IsNullOrEmpty(value) ? DefaultWindowId : value;
+        }
+
+        private static string NormalizeTargetKind(string targetKind)
+        {
+            return string.Equals((targetKind ?? "").Trim(), TargetKindView, StringComparison.Ordinal)
+                ? TargetKindView
+                : TargetKindSession;
+        }
+
+        private static string NormalizeWindowTitle(
+            string title,
+            string targetKind,
+            string targetId)
+        {
+            string value = (title ?? "").Trim();
+            if (!string.IsNullOrEmpty(value))
+                return value;
+
+            if (string.Equals(targetKind, TargetKindView, StringComparison.Ordinal))
+                return string.IsNullOrEmpty(targetId) ? "View" : targetId;
+
+            return string.IsNullOrEmpty(targetId) ? "Locus" : "Locus Session (" + targetId + ")";
+        }
+
+        private void ConfigureFrontendWindow(
+            string windowId,
+            string targetKind,
+            string targetId,
+            string title)
+        {
+            _windowId = NormalizeWindowId(windowId);
+            _targetKind = NormalizeTargetKind(targetKind);
+            _targetId = (targetId ?? "").Trim();
+            _windowTitle = NormalizeWindowTitle(title, _targetKind, _targetId);
+            _frontendWindowConfigured = true;
+            EnsureInstanceId();
+            titleContent = CreateTitleContent(_windowTitle);
+        }
+
+        private void EnsureWindowIdentity()
+        {
+            _windowId = NormalizeWindowId(_windowId);
+            _targetKind = NormalizeTargetKind(_targetKind);
+            _targetId = (_targetId ?? "").Trim();
+            _windowTitle = NormalizeWindowTitle(_windowTitle, _targetKind, _targetId);
+            EnsureInstanceId();
+            titleContent = CreateTitleContent(_windowTitle);
+        }
+
+        private void EnsureInstanceId()
+        {
+            if (string.IsNullOrEmpty(_instanceId))
+                _instanceId = Guid.NewGuid().ToString("N");
+        }
+
+        private void BeginControlEpoch()
+        {
+            _instanceId = Guid.NewGuid().ToString("N");
+            _controlRevision = 0;
+            _sentOpen = false;
+            _hasLastSent = false;
+            _nextHeartbeatAt = 0d;
+        }
+
         private static void OnBeforeAssemblyReload()
         {
             _assemblyReloadInProgress = true;
@@ -279,13 +463,19 @@ namespace Locus
         private void OnEnable()
         {
             EnsureLifecycleHooks();
-            titleContent = CreateTitleContent();
+            if (_creatingFrontendWindow)
+                _frontendWindowConfigured = false;
+            else if (!_frontendWindowConfigured)
+                _frontendWindowConfigured = true;
+            EnsureWindowIdentity();
+            BeginControlEpoch();
             minSize = new Vector2(360f, 420f);
             RefreshDesktopState(true);
             if (OverlaySyncEnabled)
             {
                 EditorApplication.update += SyncOverlay;
-                SendOpenOrUpdate(true);
+                if (_frontendWindowConfigured)
+                    SendOpenOrUpdate(true);
             }
         }
 
@@ -293,10 +483,22 @@ namespace Locus
         {
             if (OverlaySyncEnabled)
             {
+                string reason = GetDisableCloseReason();
                 EditorApplication.update -= SyncOverlay;
-                SendClose(GetCloseReason());
+                if (_frontendWindowConfigured)
+                    SendClose(reason);
             }
             DisconnectPipe();
+        }
+
+        private void OnDestroy()
+        {
+            if (!OverlaySyncEnabled || !_frontendWindowConfigured)
+                return;
+            if (_editorQuitting || _assemblyReloadInProgress)
+                return;
+
+            SendClose(CloseReasonWindowClosed);
         }
 
         private void OnFocus()
@@ -334,6 +536,8 @@ namespace Locus
 
         private void SendOpenOrUpdate(bool force)
         {
+            if (!_frontendWindowConfigured)
+                return;
             if (_sendInFlight && !force)
                 return;
 
@@ -347,7 +551,8 @@ namespace Locus
 
         private void SendClose(string reason)
         {
-            SendControlMessage(BuildMessage("close", false, reason), true);
+            EmbedControlMessage message = BuildMessage("close", false, reason);
+            SendControlMessage(message, true);
             _sentOpen = false;
         }
 
@@ -359,6 +564,11 @@ namespace Locus
             SendControlMessage(new EmbedControlMessage
             {
                 type = "assetDrop",
+                windowId = _windowId,
+                targetKind = _targetKind,
+                targetId = _targetId,
+                title = _windowTitle,
+                instanceId = _instanceId,
                 assetRefs = assetRefs
             }, true);
         }
@@ -396,6 +606,11 @@ namespace Locus
             string json = JsonUtility.ToJson(new EmbedControlMessage
             {
                 type = "assetDrag",
+                windowId = _windowId,
+                targetKind = _targetKind,
+                targetId = _targetId,
+                title = _windowTitle,
+                instanceId = _instanceId,
                 assetRefs = assetRefs
             });
             string pipeName = GetControlPipeName();
@@ -496,13 +711,13 @@ namespace Locus
             });
         }
 
-        private string GetCloseReason()
+        private string GetDisableCloseReason()
         {
             if (_editorQuitting)
                 return CloseReasonEditorQuit;
             if (_assemblyReloadInProgress)
                 return CloseReasonDomainReload;
-            return CloseReasonWindowClosed;
+            return CloseReasonWindowDisabled;
         }
 
         private EmbedControlMessage BuildMessage(string type, bool visible, string reason = "")
@@ -513,6 +728,12 @@ namespace Locus
             return new EmbedControlMessage
             {
                 type = type,
+                windowId = _windowId,
+                targetKind = _targetKind,
+                targetId = _targetId,
+                title = _windowTitle,
+                instanceId = _instanceId,
+                revision = ++_controlRevision,
                 x = _screenX,
                 y = _screenY,
                 width = _screenWidth,
@@ -1032,7 +1253,7 @@ namespace Locus
                 Mathf.Min(116f, inner.width),
                 24f);
 
-            GUI.Label(titleRect, "Locus", EditorStyles.boldLabel);
+            GUI.Label(titleRect, _windowTitle, EditorStyles.boldLabel);
             GUI.Label(statusRect, _statusMessage, EditorStyles.wordWrappedLabel);
             EditorGUI.SelectableLabel(pipeRect, GetFullControlPipeName(), EditorStyles.miniLabel);
             if (!string.IsNullOrEmpty(executablePathText))
@@ -1516,9 +1737,9 @@ namespace Locus
             return FullPipeNamePrefix + GetControlPipeName();
         }
 
-        private static GUIContent CreateTitleContent()
+        private static GUIContent CreateTitleContent(string title)
         {
-            return new GUIContent("Locus", GetTitleIcon());
+            return new GUIContent(string.IsNullOrEmpty(title) ? "Locus" : title, GetTitleIcon());
         }
 
         private static Texture2D GetTitleIcon()

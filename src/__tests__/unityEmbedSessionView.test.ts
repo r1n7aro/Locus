@@ -53,6 +53,52 @@ describe("Unity embedded session view", () => {
     expect(app).not.toContain("isUnityHostLocation");
   });
 
+  it("supports multiple Unity native frontend windows", () => {
+    const app = read("src/App.vue");
+    const viewHost = read("src/components/ViewHostWindow.vue");
+    const unityService = read("src/services/unity.ts");
+    const viewService = read("src/services/view.ts");
+    const command = read("src-tauri/src/commands/unity_embed.rs");
+    const viewCommand = read("src-tauri/src/commands/view.rs");
+    const viewRuntime = read("src-tauri/src/view.rs");
+    const unityBridge = read("src-tauri/src/unity_bridge/mod.rs");
+    const unityWindow = read("locus_unity/Editor/LocusEditorWindow.cs");
+    const bridge = read("locus_unity/Editor/LocusBridge.cs");
+    const capability = read("src-tauri/capabilities/default.json");
+
+    expect(command).toContain("pub struct UnityEmbedOpenFrontendWindowRequest");
+    expect(command).toContain("pub struct UnityEmbedOpenFrontendWindowResult");
+    expect(command).toContain("fn unity_embed_window_label_for_msg");
+    expect(command).toContain("fn unity_embed_host_url");
+    expect(command).toContain("HashMap<String, UnityEmbedAppliedState>");
+    expect(command).toContain("HashMap<String, UnityEmbedTransientCloseState>");
+    expect(command).toContain("unity_embed_open_frontend_window");
+    expect(command).toContain("crate::unity_bridge::open_frontend_window");
+    expect(unityBridge).toContain('send_message(project_path, "open_frontend_window", payload)');
+    expect(bridge).toContain('case "open_frontend_window"');
+    expect(unityWindow).toContain("OpenFrontendWindowFromJson");
+    expect(unityWindow).toContain("CreateInstance<LocusEditorWindow>()");
+    expect(unityWindow).toContain("public string windowId;");
+    expect(unityWindow).toContain("public string targetKind;");
+    expect(unityWindow).toContain("public string targetId;");
+    expect(unityWindow).toContain("titleContent = CreateTitleContent(_windowTitle)");
+    expect(app).toContain("const isUnityEmbedViewWindow");
+    expect(app).toContain("<ViewHostWindow v-else embedded");
+    expect(app).toContain(":initial-session-id=\"unityEmbedTargetId\"");
+    expect(viewHost).toContain("embedded?: boolean");
+    expect(viewHost).toContain("UNITY_EMBED_WINDOW_LABEL_PREFIX");
+    expect(viewService).toContain("viewRunInUnity");
+    expect(viewCommand).toContain("pub async fn view_run_in_unity");
+    expect(viewRuntime).toContain("open_view_unity_embed_window");
+    expect(viewRuntime).toContain('target_kind: "view".to_string()');
+    expect(viewRuntime).toContain("title: Some(detail.summary.name.clone())");
+    expect(viewRuntime).not.toContain('format!("Locus View - {} ({})"');
+    expect(unityWindow).toContain('return string.IsNullOrEmpty(targetId) ? "View" : targetId;');
+    expect(unityService).toContain("openUnityEmbeddedSessionWindow");
+    expect(unityService).toContain("currentUnityEmbedWindowId");
+    expect(capability).toContain('"unity-embed-*"');
+  });
+
   it("exits the desktop app when the main window closes", () => {
     const app = read("src-tauri/src/lib.rs");
     const command = read("src-tauri/src/commands/unity_embed.rs");
@@ -70,7 +116,8 @@ describe("Unity embedded session view", () => {
     expect(system).toContain("app_handle.exit(0);");
     expect(command).toContain("pub(crate) fn destroy_unity_embed_control_window_on_main");
     expect(command).toContain("window.destroy().or_else(|_| window.close())");
-    expect(command).toContain("record_window_destroyed();");
+    expect(command).toContain("record_all_embed_windows_destroyed();");
+    expect(command).toContain("record_window_destroyed(label);");
   });
 
   it("boosts Unity overlay sync while the editor window is resizing", () => {
@@ -90,10 +137,25 @@ describe("Unity embedded session view", () => {
     expect(unityWindow).toContain("AssemblyReloadEvents.beforeAssemblyReload += OnBeforeAssemblyReload;");
     expect(unityWindow).toContain("AssemblyReloadEvents.afterAssemblyReload += OnAfterAssemblyReload;");
     expect(unityWindow).toContain("EditorApplication.quitting += OnEditorQuitting;");
-    expect(unityWindow).toContain("SendClose(GetCloseReason())");
+    expect(unityWindow).toContain('private const string CloseReasonWindowDisabled = "windowDisabled";');
+    expect(unityWindow).toContain("string reason = GetDisableCloseReason();");
+    expect(unityWindow).toContain("SendClose(reason);");
     expect(unityWindow).toContain("if (_assemblyReloadInProgress)");
     expect(unityWindow).toContain("return CloseReasonDomainReload;");
+    expect(unityWindow).toContain("return CloseReasonWindowDisabled;");
     expect(unityWindow).toContain("public string reason;");
+    expect(unityWindow).toContain("public string instanceId;");
+    expect(unityWindow).toContain("public long revision;");
+    expect(unityWindow).toContain("Guid.NewGuid().ToString(\"N\")");
+    expect(unityWindow).toContain("private void BeginControlEpoch()");
+    expect(unityWindow).toContain("_sentOpen = false;");
+    expect(unityWindow).toContain("_hasLastSent = false;");
+    expect(unityWindow).toContain("private static bool _creatingFrontendWindow;");
+    expect(unityWindow).toContain("_frontendWindowConfigured = false;");
+    expect(unityWindow).toContain("private void OnDestroy()");
+    expect(unityWindow).toContain("SendClose(CloseReasonWindowClosed)");
+    expect(unityWindow).toContain("instanceId = _instanceId");
+    expect(unityWindow).toContain("revision = ++_controlRevision");
     expect(unityWindow).toContain("reason = reason ?? \"\"");
     expect(command).toContain('const CLOSE_REASON_DOMAIN_RELOAD: &str = "domainReload";');
     expect(command).toContain("const TRANSIENT_CLOSE_DESTROY_DELAY: Duration = Duration::from_secs(30);");
@@ -102,9 +164,14 @@ describe("Unity embedded session view", () => {
     expect(command).toContain("tokio::time::sleep(TRANSIENT_CLOSE_DESTROY_DELAY).await;");
     expect(command).toContain("fn is_transient_close_reason");
     expect(command).toContain("reason == CLOSE_REASON_DOMAIN_RELOAD");
+    expect(command).toContain('reason == "windowDisabled"');
     expect(command).toContain("if is_transient_close_reason(&msg.reason)");
-    expect(command).toContain("schedule_transient_close_destroy(app_handle);");
-    expect(command).toContain("cancel_transient_close_destroy();");
+    expect(command).toContain("fn should_ignore_stale_control_message");
+    expect(command).toContain("if should_ignore_stale_control_message(&label, &msg)");
+    expect(command).toContain("UnityEmbedControlRevisionState");
+    expect(command).toContain('msg.kind != "open"');
+    expect(command).toContain("schedule_transient_close_destroy(app_handle, label);");
+    expect(command).toContain("cancel_transient_close_destroy(&label);");
   });
 
   it("suppresses Windows mouse activation for the embedded overlay outside the composer", () => {
@@ -131,6 +198,8 @@ describe("Unity embedded session view", () => {
     expect(service).toContain("activationGuardEnabled");
     expect(command).toContain("MouseActivationState");
     expect(command).toContain("guard_enabled");
+    expect(command).toContain("const USE_CHILD_EMBED_OVERLAY: bool = true;");
+    expect(command).toContain("return position_popup_overlay(window, msg);");
     expect(command).toContain("position_child_overlay");
     expect(command).toContain("ScreenToClient");
     expect(command).toContain("SetParent");
@@ -143,8 +212,8 @@ describe("Unity embedded session view", () => {
     expect(command).toContain("SW_SHOWNOACTIVATE");
     expect(command).toContain("SW_HIDE");
     expect(command).toContain("let desired_visible = should_show_window_now(&window, &msg);");
-    expect(command).toContain("needs_visibility_apply(desired_visible)");
-    expect(command).toContain("record_applied_visibility(desired_visible)");
+    expect(command).toContain("needs_visibility_apply(&label, desired_visible)");
+    expect(command).toContain("record_applied_visibility(&label, desired_visible)");
     expect(command).toContain("collect_descendant_windows");
     expect(command).toContain("GW_CHILD");
     expect(command).toContain("mouse_hook_sync_loop");
@@ -154,7 +223,8 @@ describe("Unity embedded session view", () => {
     expect(command).toContain("SetKeyboardFocus");
     expect(command).toContain("COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC");
     expect(command).toContain("controller.MoveFocus");
-    expect(command).not.toContain("if !is_activation_guard_enabled()");
+    expect(command).toContain("for (label, window) in windows");
+    expect(command).toContain("if !synced_any || !is_activation_guard_enabled()");
     expect(command).toContain("mouse_activate_hook_installed");
     expect(command).toContain("mouse_activate_hooked_hwnd_count");
     expect(command).toContain("mouse_activate_block_count");
@@ -215,7 +285,7 @@ describe("Unity embedded session view", () => {
     expect(command).toContain("unity_file_drop_asset_refs(&workspace_path, &paths)");
     expect(command).toContain("locus_file_drop_refs(&workspace_path, &paths)");
     expect(command).toContain('"locus-file-drop"');
-    expect(command).toContain("label == WINDOW_LABEL || label == MAIN_WINDOW_LABEL");
+    expect(command).toContain("is_unity_embed_window_label(label) || label == MAIN_WINDOW_LABEL");
     expect(command).toContain("fn unity_relative_drop_path");
     expect(command).toContain("fn cache_unity_embed_asset_drag_refs");
     expect(command).toContain("pub async fn unity_embed_commit_asset_drop");
