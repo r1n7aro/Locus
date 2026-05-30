@@ -21,16 +21,16 @@ changelogUrl: "/en/overview/latest-version"
 
 - Added View (`/view`): Agents can create interactive editor tools for Unity projects, including inspectors, graphs, tables, canvases, and project-specific workbenches. Created Views appear in the Views list and session list, support folders, rename, drag ordering, import, export, and can open in Locus or Unity.
 - Added Skill Package support for packaging reusable workflows, documents, commands, and tools. The Knowledge panel can preview, import, export, install Unity scripts, and configure command entry points.
+- Added a chat message context menu: right-click a message in the chat transcript to copy it, roll back to that message, or fork from it. Message drafts can also be reused.
+- Added Unity asset and local file drag bridging for Locus and embedded Unity sessions.
 - Added Unity Background Boost so the Unity editor loop can keep responding while the Unity window is in the background. The setting can be toggled from Settings, and the status area reports waiting, patched, failed, and disabled states.
 - Added Unity viewport screenshot results for Game View, Scene View, and specific Editor windows.
 - Added a Unity Console attach command in the chat input.
 - Added Unity embedded windows for sessions and Views, with multi-window handling, drag references, and focus handling inside Unity.
-- Added Unity asset and local file drag bridging for Locus and embedded Unity sessions.
 - Added a graph window for nodes, ports, parameters, links, state machines, and dependency graphs, with readonly previews, manual layout, directed arrows, and confirmation options.
 - Added Agent tool loading modes, with direct tools, lazy tools, and Skill-provided tools visible in the Agent panel.
 - Added Agent environment and prompt details, including rendered environment prompts, structured prompts, and context usage.
 - Added running-send behavior so input can be queued for the next turn or inserted into the active session flow.
-- Added message draft, copy, fork, and rollback actions for continuing or rewinding from a selected user message.
 - Added session archive actions across settings and session lists.
 - Added local file drops in chat, with structured file references and a warning when workspace-only file boundaries block external paths.
 - Added Knowledge modes and status details for off, read-only, and full access, including retrieval, index, and context cost status.
