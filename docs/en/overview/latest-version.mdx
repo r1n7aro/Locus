@@ -59,6 +59,9 @@ changelogUrl: "/en/overview/latest-version"
 - Fixed VCS restore paths that were missing from checkpoints and preserved meta sidecars during modified restores.
 - Fixed View window tabs, always-on-top behavior, focus, negative coordinates, multi-monitor placement, and host sync.
 - Fixed Unity embedded overlays, drag bridging, post-domain-reload connection stability, and transient overlay behavior.
+- Fixed Unity reconnect status during recompiles by using the process ID and executable path reported by the Unity pipe, keeping the editor process state stable while Unity is still running.
+- Fixed Unity Background Boost symbol resolution for Unity versions where the engine module is `Unity.dll`.
+- Fixed Unity 6+ asset drag hook compatibility by using the `EventModifiers` callback signature.
 - Fixed Knowledge full-document token overview, Knowledge reference target scope, and query match accuracy.
 - Fixed diff highlight escaping, hover preview sizing, and file review window navigation.
 - Fixed Git index.lock warnings, workspace snapshot failure logging, and managed Git package fallback.

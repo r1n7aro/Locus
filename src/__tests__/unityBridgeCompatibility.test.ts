@@ -58,7 +58,11 @@ describe("unityBridgeCompatibility", () => {
     expect(bridge).toContain("return await HandleStatus(reqId);");
     expect(statusHandler).toContain("PostToMainThread(delegate");
     expect(statusHandler).toContain("RefreshCachedEditorState();");
-    expect(statusHandler).toContain("BuildCachedEditorStatusMessage()");
+    expect(statusHandler).toContain("OkStatusResponse(requestId)");
+    expect(bridge).toContain("private static PipeEnvelope OkStatusResponse(string replyTo)");
+    expect(bridge).toContain("OkResponse(replyTo, BuildCachedEditorStatusMessage())");
+    expect(bridge).toContain("response.processId = _editorProcessId;");
+    expect(bridge).toContain("response.processPath = _editorProcessPath;");
   });
 
   it("keeps transient View assemblies out of the Unity type index", () => {
