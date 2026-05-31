@@ -19,6 +19,8 @@ namespace Locus
             public bool ok;
             public string message;
             public string error;
+            public int processId;
+            public string processPath;
         }
 
         [Serializable]

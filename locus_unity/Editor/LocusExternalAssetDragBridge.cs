@@ -13,7 +13,11 @@ namespace Locus
     {
         private const double ArmedDragSeconds = 8d;
         private const int PostPerformRepaintFrames = 120;
+#if UNITY_6000_0_OR_NEWER
+        private static readonly Action<EventType, KeyCode, EventModifiers> BeforeEventProcessedHandler = HandleBeforeEventProcessed;
+#else
         private static readonly Action<EventType, KeyCode> BeforeEventProcessedHandler = HandleBeforeEventProcessed;
+#endif
         private static readonly EditorApplication.CallbackFunction GlobalEventHandler = HandleGlobalEvent;
         private static readonly EditorApplication.CallbackFunction GlobalUpdateHandler = HandleGlobalUpdate;
         private static readonly FieldInfo BeforeEventProcessedField =
@@ -112,9 +116,15 @@ namespace Locus
             if (BeforeEventProcessedField == null)
                 return;
 
+#if UNITY_6000_0_OR_NEWER
+            var current = BeforeEventProcessedField.GetValue(null) as Action<EventType, KeyCode, EventModifiers>;
+            current -= BeforeEventProcessedHandler;
+            current = (Action<EventType, KeyCode, EventModifiers>)Delegate.Combine(BeforeEventProcessedHandler, current);
+#else
             var current = BeforeEventProcessedField.GetValue(null) as Action<EventType, KeyCode>;
             current -= BeforeEventProcessedHandler;
             current = (Action<EventType, KeyCode>)Delegate.Combine(BeforeEventProcessedHandler, current);
+#endif
             BeforeEventProcessedField.SetValue(null, current);
         }
 
@@ -133,9 +143,15 @@ namespace Locus
         {
             if (BeforeEventProcessedField != null)
             {
+#if UNITY_6000_0_OR_NEWER
+                var beforeCurrent = BeforeEventProcessedField.GetValue(null) as Action<EventType, KeyCode, EventModifiers>;
+                beforeCurrent -= BeforeEventProcessedHandler;
+                BeforeEventProcessedField.SetValue(null, beforeCurrent);
+#else
                 var beforeCurrent = BeforeEventProcessedField.GetValue(null) as Action<EventType, KeyCode>;
                 beforeCurrent -= BeforeEventProcessedHandler;
                 BeforeEventProcessedField.SetValue(null, beforeCurrent);
+#endif
             }
 
             EditorApplication.update -= GlobalUpdateHandler;
@@ -148,7 +164,11 @@ namespace Locus
             GlobalEventHandlerField.SetValue(null, current);
         }
 
+#if UNITY_6000_0_OR_NEWER
+        private static void HandleBeforeEventProcessed(EventType eventType, KeyCode keyCode, EventModifiers modifiers)
+#else
         private static void HandleBeforeEventProcessed(EventType eventType, KeyCode keyCode)
+#endif
         {
             if (eventType == EventType.MouseDrag)
             {

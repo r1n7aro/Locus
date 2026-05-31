@@ -60,6 +60,10 @@ pub struct PipeResponse {
     pub error: Option<String>,
     #[serde(default)]
     pub message: Option<String>,
+    #[serde(default, rename = "processId")]
+    pub process_id: Option<u32>,
+    #[serde(default, rename = "processPath")]
+    pub process_path: Option<String>,
 }
 
 pub const UNITY_EXECUTE_PROGRESS_TAG: &str = "locus-unity-progress";
@@ -574,8 +578,40 @@ fn unity_process_info_from_status(
     })
 }
 
+fn process_hint_from_response(
+    resp: &PipeResponse,
+    project_path: &str,
+    checked_at_ms: u64,
+) -> Option<UnityEditorProcessInfo> {
+    let process_id = resp.process_id.filter(|id| *id > 0)?;
+    Some(UnityEditorProcessInfo {
+        state: UnityEditorProcessState::Running,
+        process_id: Some(process_id),
+        executable_path: resp
+            .process_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned),
+        project_path: Some(strip_extended_path_prefix(project_path).trim().to_string()),
+        checked_at_ms,
+        last_error: None,
+    })
+}
+
 async fn sync_background_hook_for_status(status: &mut UnityConnectionStatus) {
     let Some(process_id) = status.editor_process_id else {
+        let current = background_hook::status();
+        if matches!(
+            status.editor_process_state,
+            UnityEditorProcessState::Running
+        ) && current.enabled
+            && current.patched
+        {
+            status.background_hook = current;
+            return;
+        }
+
         status.background_hook = if background_hook::enabled() {
             UnityBackgroundHookStatus {
                 enabled: true,
@@ -629,6 +665,64 @@ async fn sync_background_hook_for_status(status: &mut UnityConnectionStatus) {
     status.background_hook = hook_status;
 }
 
+async fn query_process_info_for_connection_status(
+    project_path: &str,
+    connected: bool,
+    process_hint: Option<UnityEditorProcessInfo>,
+) -> UnityEditorProcessInfo {
+    if !connected && unity_recompile_waiting(project_path) {
+        if let Some(cached) = process::cached_project_editor_process(project_path).await {
+            if cached.process_id.is_some() {
+                return cached;
+            }
+        }
+        return UnityEditorProcessInfo::inferred_running(unix_now_ms());
+    }
+
+    let probe = query_current_project_editor_process(project_path).await;
+    let Some(hint) = process_hint else {
+        return probe;
+    };
+
+    if !connected {
+        return probe;
+    }
+
+    match (&probe.state, probe.process_id, hint.process_id) {
+        (UnityEditorProcessState::Running, Some(probe_id), Some(hint_id))
+            if probe_id == hint_id =>
+        {
+            let mut info = probe;
+            if info.executable_path.is_none() {
+                info.executable_path = hint.executable_path;
+            }
+            process::cache_project_editor_process(project_path, info.clone()).await;
+            info
+        }
+        (UnityEditorProcessState::Running, Some(probe_id), Some(hint_id)) => {
+            let info = UnityEditorProcessInfo {
+                state: UnityEditorProcessState::Running,
+                process_id: Some(hint_id),
+                executable_path: hint.executable_path.or(probe.executable_path),
+                project_path: hint.project_path.or(probe.project_path),
+                checked_at_ms: probe.checked_at_ms,
+                last_error: Some(format!(
+                    "Unity process probe PID {probe_id} does not match pipe PID {hint_id}"
+                )),
+            };
+            process::cache_project_editor_process(project_path, info.clone()).await;
+            info
+        }
+        _ => {
+            let mut info = hint;
+            info.checked_at_ms = probe.checked_at_ms.max(info.checked_at_ms);
+            info.last_error = probe.last_error;
+            process::cache_project_editor_process(project_path, info.clone()).await;
+            info
+        }
+    }
+}
+
 pub async fn query_unity_connection_status(project_path: &str) -> UnityConnectionStatus {
     let pipe_name = get_pipe_name(project_path);
     let checked_at_ms = unix_now_ms();
@@ -637,6 +731,7 @@ pub async fn query_unity_connection_status(project_path: &str) -> UnityConnectio
     match send_message(project_path, "status", "").await {
         Ok(resp) if resp.ok => {
             let latency_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+            let process_hint = process_hint_from_response(&resp, project_path, checked_at_ms);
             let message = resp.message.unwrap_or_default();
             let (editor_status, scene_path) = parse_unity_status_message(&message);
             let mut status = UnityConnectionStatus {
@@ -656,7 +751,8 @@ pub async fn query_unity_connection_status(project_path: &str) -> UnityConnectio
                 background_hook: background_hook::status(),
                 checked_at_ms,
             };
-            let process_info = query_current_project_editor_process(project_path).await;
+            let process_info =
+                query_process_info_for_connection_status(project_path, true, process_hint).await;
             apply_unity_process_info(&mut status, process_info);
             sync_background_hook_for_status(&mut status).await;
             status
@@ -683,7 +779,8 @@ pub async fn query_unity_connection_status(project_path: &str) -> UnityConnectio
                 background_hook: background_hook::status(),
                 checked_at_ms,
             };
-            let process_info = query_current_project_editor_process(project_path).await;
+            let process_info =
+                query_process_info_for_connection_status(project_path, false, None).await;
             apply_unity_process_info(&mut status, process_info);
             sync_background_hook_for_status(&mut status).await;
             status
@@ -706,7 +803,8 @@ pub async fn query_unity_connection_status(project_path: &str) -> UnityConnectio
                 background_hook: background_hook::status(),
                 checked_at_ms,
             };
-            let process_info = query_current_project_editor_process(project_path).await;
+            let process_info =
+                query_process_info_for_connection_status(project_path, false, None).await;
             apply_unity_process_info(&mut status, process_info);
             sync_background_hook_for_status(&mut status).await;
             status
@@ -2302,6 +2400,7 @@ pub async fn start_unity_monitor(
             let mut status = query_unity_connection_status(&project_path).await;
             let connected = status.connected;
             let disconnected_transition = last_status == Some(true) && !connected;
+            let recompile_waiting = unity_recompile_waiting(&project_path);
 
             if connected {
                 if last_status != Some(true) {
@@ -2342,7 +2441,15 @@ pub async fn start_unity_monitor(
                 }
             }
 
-            if disconnected_transition && !unity_recompile_waiting(&project_path) {
+            if recompile_waiting && !connected {
+                if let Some(process_info) = last_detected_editor_process
+                    .clone()
+                    .filter(|info| info.process_id.is_some())
+                {
+                    apply_unity_process_info(&mut status, process_info);
+                    sync_background_hook_for_status(&mut status).await;
+                }
+            } else if disconnected_transition {
                 if let Some(process_info) = process::refresh_known_project_editor_process_liveness(
                     &project_path,
                     last_detected_editor_process.clone(),

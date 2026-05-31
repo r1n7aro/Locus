@@ -44,6 +44,16 @@ mod windows_impl {
 
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub error: Option<String>,
+
+        #[serde(default, rename = "processId", skip_serializing_if = "Option::is_none")]
+        pub process_id: Option<u32>,
+
+        #[serde(
+            default,
+            rename = "processPath",
+            skip_serializing_if = "Option::is_none"
+        )]
+        pub process_path: Option<String>,
     }
 
     struct UnityPipeConnection {
@@ -291,6 +301,8 @@ mod windows_impl {
             ok: None,
             message: Some(message.to_string()),
             error: None,
+            process_id: None,
+            process_path: None,
         };
 
         let json =
@@ -362,6 +374,11 @@ mod windows_impl {
             ok: env.ok.unwrap_or(false),
             error: env.error,
             message: env.message,
+            process_id: env.process_id.filter(|id| *id > 0),
+            process_path: env
+                .process_path
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
         })
     }
 

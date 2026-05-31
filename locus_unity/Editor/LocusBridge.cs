@@ -46,6 +46,8 @@ namespace Locus
         private static NamedPipeServerStream _currentServer;
         private static StreamWriter _currentWriter;
         private static volatile bool _desktopPipeConnected;
+        private static readonly int _editorProcessId = ResolveCurrentProcessId();
+        private static readonly string _editorProcessPath = ResolveCurrentProcessPath();
 
         private static readonly UTF8Encoding Utf8NoBom = new UTF8Encoding(false);
 
@@ -325,6 +327,52 @@ namespace Locus
                 .Replace(' ', '_');
 
             return "locus_unity_" + sanitized;
+        }
+
+        private static int ResolveCurrentProcessId()
+        {
+            try
+            {
+                using (var process = System.Diagnostics.Process.GetCurrentProcess())
+                    return process.Id;
+            }
+            catch
+            {
+                return 0;
+            }
+        }
+
+        private static string ResolveCurrentProcessPath()
+        {
+            try
+            {
+                using (var process = System.Diagnostics.Process.GetCurrentProcess())
+                {
+                    try
+                    {
+                        if (process.MainModule != null && !string.IsNullOrEmpty(process.MainModule.FileName))
+                            return process.MainModule.FileName;
+                    }
+                    catch
+                    {
+                    }
+
+                    try
+                    {
+                        if (!string.IsNullOrEmpty(EditorApplication.applicationPath))
+                            return EditorApplication.applicationPath;
+                    }
+                    catch
+                    {
+                    }
+
+                    return process.ProcessName ?? "";
+                }
+            }
+            catch
+            {
+                return "";
+            }
         }
 
         private static bool IsProjectAssetPath(string path)
@@ -924,7 +972,9 @@ namespace Locus
                     await SendEnvelopeAsync(new PipeEnvelope
                     {
                         type = "unity_connected",
-                        message = "connected"
+                        message = "connected",
+                        processId = _editorProcessId,
+                        processPath = _editorProcessPath
                     });
 
                     lock (_connectionLock)
@@ -1078,6 +1128,14 @@ namespace Locus
                 ok = true,
                 message = message
             };
+        }
+
+        private static PipeEnvelope OkStatusResponse(string replyTo)
+        {
+            PipeEnvelope response = OkResponse(replyTo, BuildCachedEditorStatusMessage());
+            response.processId = _editorProcessId;
+            response.processPath = _editorProcessPath;
+            return response;
         }
 
         private static PipeEnvelope OkResponse(string replyTo)
@@ -1658,7 +1716,7 @@ namespace Locus
                 try
                 {
                     RefreshCachedEditorState();
-                    tcs.SetResult(OkResponse(requestId, BuildCachedEditorStatusMessage()));
+                    tcs.SetResult(OkStatusResponse(requestId));
                 }
                 catch (Exception ex)
                 {

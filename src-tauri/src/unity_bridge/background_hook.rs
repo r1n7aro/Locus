@@ -466,8 +466,10 @@ mod windows_impl {
 
     #[derive(Debug, Clone)]
     struct ModuleInfo {
+        name: String,
         base: u64,
         size: u32,
+        path: String,
     }
 
     pub(super) fn patch_process(
@@ -480,24 +482,29 @@ mod windows_impl {
                 "Unity executable is unavailable: {editor_process_path}"
             ));
         }
-        let editor_dir = image_path.parent().ok_or_else(|| {
-            format!("Unity executable has no parent directory: {editor_process_path}")
+
+        let module = find_unity_engine_module(process_id)?;
+        let image_path = Path::new(&module.path);
+        let symbol_dir = image_path.parent().ok_or_else(|| {
+            format!(
+                "Unity engine module has no parent directory: {}",
+                module.path
+            )
         })?;
-        let pdb_path = editor_dir.join("unity_x64.pdb");
+        let pdb_path = symbol_dir.join("unity_x64.pdb");
         if !pdb_path.is_file() {
             return Err(format!("Unity PDB is missing: {}", pdb_path.display()));
         }
-
-        let module = find_unity_module(process_id)?;
         let process = open_target_process(process_id)?;
         let mut records = Vec::new();
 
         for symbol in SYMBOLS {
-            let address = resolve_symbol(image_path, editor_dir, &module, symbol)?;
+            let address = resolve_symbol(image_path, symbol_dir, &module, symbol)?;
             if address < module.base || address >= module.base.saturating_add(module.size as u64) {
                 rollback_partial(process.raw(), &records);
                 return Err(format!(
-                    "Resolved symbol {symbol} outside Unity.exe module: 0x{address:X}"
+                    "Resolved symbol {symbol} outside {} module: 0x{address:X}",
+                    module.name
                 ));
             }
 
@@ -560,7 +567,7 @@ mod windows_impl {
         }
     }
 
-    fn find_unity_module(process_id: u32) -> Result<ModuleInfo, String> {
+    fn find_unity_engine_module(process_id: u32) -> Result<ModuleInfo, String> {
         let snapshot = unsafe {
             CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, process_id)
         };
@@ -571,19 +578,27 @@ mod windows_impl {
         let mut entry: ModuleEntry32W = unsafe { zeroed() };
         entry.dwSize = size_of::<ModuleEntry32W>() as u32;
         let mut has_entry = unsafe { Module32FirstW(snapshot.raw(), &mut entry) != 0 };
+        let mut exe_module = None;
         while has_entry {
             let name = wide_to_string(&entry.szModule);
+            if name.eq_ignore_ascii_case("Unity.dll") {
+                return Ok(module_info_from_entry(name, &entry));
+            }
             if name.eq_ignore_ascii_case("Unity.exe") {
-                return Ok(ModuleInfo {
-                    base: entry.modBaseAddr as usize as u64,
-                    size: entry.modBaseSize,
-                });
+                exe_module = Some(module_info_from_entry(name, &entry));
             }
             has_entry = unsafe { Module32NextW(snapshot.raw(), &mut entry) != 0 };
         }
-        Err(format!(
-            "Unity.exe module was not found in PID {process_id}"
-        ))
+        exe_module.ok_or_else(|| format!("Unity engine module was not found in PID {process_id}"))
+    }
+
+    fn module_info_from_entry(name: String, entry: &ModuleEntry32W) -> ModuleInfo {
+        ModuleInfo {
+            name,
+            base: entry.modBaseAddr as usize as u64,
+            size: entry.modBaseSize,
+            path: wide_to_string(&entry.szExePath),
+        }
     }
 
     fn resolve_symbol(

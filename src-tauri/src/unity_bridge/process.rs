@@ -249,6 +249,23 @@ pub async fn query_current_project_editor_process(project_path: &str) -> UnityEd
     probe
 }
 
+pub(super) async fn cached_project_editor_process(
+    project_path: &str,
+) -> Option<UnityEditorProcessInfo> {
+    let key = process_cache_key(project_path);
+    let cache = unity_process_probe_cache().lock().await;
+    cache.get(&key).cloned()
+}
+
+pub(super) async fn cache_project_editor_process(
+    project_path: &str,
+    process_info: UnityEditorProcessInfo,
+) {
+    let key = process_cache_key(project_path);
+    let mut cache = unity_process_probe_cache().lock().await;
+    cache.insert(key, process_info);
+}
+
 #[cfg(windows)]
 async fn query_current_project_editor_process_uncached(
     project_path: String,

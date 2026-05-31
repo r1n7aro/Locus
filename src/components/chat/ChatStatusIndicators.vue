@@ -282,6 +282,11 @@ const unityRecompileWaitingConnection = computed(() =>
   && !props.unityPluginStatus,
 );
 
+const unityRecompileProcessStable = computed(() =>
+  unityRecompileWaitingConnection.value
+  && unityEditorProcessState.value === "running",
+);
+
 const unitySummary = computed(() => {
   if (unityPluginLabel.value) return unityPluginLabel.value;
   if (unityRecompileWaitingConnection.value) return t("chat.unity.waitingRecompileConnection");
@@ -296,7 +301,7 @@ const unitySummary = computed(() => {
 const unityTone = computed<StatusTone>(() =>
   props.unityPluginStatus
     ? "danger"
-    : props.unityConnected
+    : props.unityConnected || unityRecompileProcessStable.value
       ? "success"
       : unityEditorProcessState.value === "running"
         || unityRecompileWaitingConnection.value

@@ -140,7 +140,7 @@ describe("chat status indicators", () => {
     expect(zh).toContain('"chat.status.unity.launchTitle": "启动 Unity 项目"');
   });
 
-  it("shows Unity recompile reconnect waits as the accent connection state", () => {
+  it("keeps Unity recompile reconnect waits stable when the editor process is still running", () => {
     const chatView = read("src/components/ChatView.vue");
     const indicators = read("src/components/chat/ChatStatusIndicators.vue");
     const zh = read("src/language/zh.json");
@@ -150,8 +150,10 @@ describe("chat status indicators", () => {
     expect(chatView).toContain('call.name === "unity_recompile" && call.status === "running"');
     expect(chatView).toContain("const unityRecompileActive = computed(() => hasRunningUnityRecompile(props.activeToolCalls));");
     expect(indicators).toContain("const unityRecompileWaitingConnection = computed(() =>");
+    expect(indicators).toContain("const unityRecompileProcessStable = computed(() =>");
+    expect(indicators).toContain('unityEditorProcessState.value === "running"');
     expect(indicators).toContain('if (unityRecompileWaitingConnection.value) return t("chat.unity.waitingRecompileConnection");');
-    expect(indicators).toContain('|| unityRecompileWaitingConnection.value');
+    expect(indicators).toContain('props.unityConnected || unityRecompileProcessStable.value');
     expect(indicators).toContain('|| effectiveUnityLaunchState.value !== "idle"');
     expect(zh).toContain('"chat.unity.waitingRecompileConnection": "Unity 重编译中，等待重连"');
     expect(en).toContain('"chat.unity.waitingRecompileConnection": "Unity recompiling, waiting for reconnect"');

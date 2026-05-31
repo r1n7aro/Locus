@@ -626,10 +626,15 @@ describe("Unity embedded session view", () => {
     expect(queueMethod).toContain("LocusExternalAssetDragBridge.QueueAssetDrag(sanitized, out message)");
     expect(queueMethod).not.toContain("GetWindow<LocusEditorWindow>()");
     expect(queueMethod).not.toContain("window.Show()");
+    expect(externalDragBridge).toContain("#if UNITY_6000_0_OR_NEWER");
     expect(externalDragBridge).toContain('typeof(GUIUtility).GetField("beforeEventProcessed"');
+    expect(externalDragBridge).toContain("Action<EventType, KeyCode, EventModifiers>");
     expect(externalDragBridge).toContain("InstallBeforeEventProcessedHandler();");
     expect(externalDragBridge).toContain("EditorApplication.update += GlobalUpdateHandler;");
     expect(externalDragBridge).toContain("HandleBeforeEventProcessed(EventType eventType, KeyCode keyCode)");
+    expect(externalDragBridge).toContain(
+      "HandleBeforeEventProcessed(EventType eventType, KeyCode keyCode, EventModifiers modifiers)",
+    );
     expect(externalDragBridge).toContain("HandleGlobalUpdate()");
     expect(externalDragBridge).toContain("ShouldPublishAssetDragStateOnGlobalUpdate()");
     expect(externalDragBridge).toContain("LocusEditorWindow.HasCurrentUnityDragAndDropRefs()");
