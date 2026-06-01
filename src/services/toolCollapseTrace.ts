@@ -53,6 +53,10 @@ function shouldTraceEvent(event: string) {
   return false;
 }
 
+export function isToolCollapseTraceEnabled(event: string) {
+  return shouldTraceEvent(event);
+}
+
 function nowMs() {
   return typeof performance !== "undefined" && typeof performance.now === "function"
     ? performance.now()
