@@ -1,12 +1,12 @@
 {
-  "version": "0.3.0",
-  "releasedAt": "2026-05-31",
+  "version": "0.3.1",
+  "releasedAt": "2026-06-04",
   "channel": "stable",
   "installers": [
     {
       "id": "windows-x64",
       "label": "Windows x64",
-      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.3.0/locus_0.3.0_x64-setup.exe",
+      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.3.1/locus_0.3.1_x64-setup.exe",
       "platform": "windows",
       "arch": "x64",
       "includesManagedPython": true,
@@ -17,7 +17,7 @@
     {
       "id": "windows-x64-without-embed-python-git",
       "label": "Windows x64 - system Python/Git",
-      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.3.0/locus_0.3.0_x64-without_embed_python_git-setup.exe",
+      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.3.1/locus_0.3.1_x64-without_embed_python_git-setup.exe",
       "platform": "windows",
       "arch": "x64",
       "includesManagedPython": false,
@@ -29,81 +29,24 @@
   "locales": {
     "zh": {
       "title": "发现新版本",
-      "summary": "Locus v0.3.0 (2026-05-31)",
+      "summary": "Locus v0.3.1 (2026-06-04)",
       "changelogUrl": "/overview/latest-version",
       "changes": [
         {
-          "title": "新增",
-          "items": [
-            "新增 View 功能（`/view`）：Agent 可以为 Unity 项目创建可交互的编辑器工具，用于检查面板、图表、数据表、画布和项目专用工作台；生成后的 View 会出现在 Views 列表与会话列表中，支持文件夹整理、重命名、拖拽排序、导入导出，并可在 Locus 或 Unity 中打开。",
-            "新增 Skill Package：支持把可复用工作流、文档、命令和工具打包管理；知识面板可预览、导入、导出、安装 Unity 脚本并配置命令入口。",
-            "新增聊天消息右键菜单：可在右侧聊天记录中右键消息，复制消息、撤回到该消息或从该消息 Fork；同时支持消息草稿复用。",
-            "新增 Unity 资源与本地文件拖拽桥接，支持把 Unity 对象、资源引用和本地文件带入 Locus 或嵌入式会话。",
-            "新增 Unity 后台加速：Unity 窗口在后台时保持编辑器循环响应，重编译和域重载等待流程可以继续推进；设置页可开关，状态区会显示等待进程、已生效、失败等状态。",
-            "新增 Unity 视口截图结果，Agent 可直接获取 Game View、Scene View 或指定 Editor Window 的截图并用于后续分析。",
-            "新增 Unity Console 附加命令，可从聊天输入框把当前 Console 消息带入对话。",
-            "新增 Unity 内嵌窗口能力，会话与 View 可在 Unity 内打开，并支持多窗口、拖拽引用和嵌入窗口焦点处理。",
-            "新增图表窗口，可展示和编辑节点、端口、参数、连线、状态机和依赖图，并支持只读预览、手动布局、方向箭头和确认选项。",
-            "新增 Agent 工具加载模式，支持按需加载专项工具，并在 Agent 面板展示直接工具、延迟工具和 Skill 带入工具。",
-            "新增 Agent 环境与提示词面板信息，能查看渲染后的环境提示、结构化提示和上下文占用。",
-            "新增运行中发送策略：会话执行时可把新输入排为下一条，或插入到当前会话后续流程。",
-            "新增会话归档入口，并在设置与会话列表中补齐归档相关交互。",
-            "新增本地文件拖入聊天输入框，文件路径会作为结构化引用显示；文件工具边界开启时会提示外部路径限制。",
-            "新增知识模式与状态面板，支持关闭、只读、启用三种模式，并展示检索、索引和上下文成本。",
-            "新增知识查询进度展示，包括加载、扫描、排序、文本扫描和查询阶段状态。",
-            "新增知识全文注入与更细的匹配信息，支持完整文档段落、匹配词、摘要和正文片段参与上下文。",
-            "新增通知设置页，支持后台系统通知、提示音、音量、内置/自定义声音和不同事件触发项。",
-            "新增关闭行为设置，支持直接退出或最小化到托盘；有运行任务时关闭主窗口会弹出确认。",
-            "新增临时文件管理，可查看、打开、清理工具大输出和运行临时文件；历史记录中的已清理输出会显示为已删除。",
-            "新增工作区最近目录右键菜单，可打开文件资源管理器或从列表移除。",
-            "新增文件修改悬浮预览与全文 diff 导航，支持从预览进入完整差异并跳转上一处/下一处修改。",
-            "新增 Markdown 图片、本地文件引用、知识引用、View 引用和语义化代码渲染。",
-            "新增 Asset DB 校验进度展示，可看到扫描、发现、同步、排队和失败状态。",
-            "新增稳定版/实验性更新通道与稳定版更新 manifest。",
-            "新增托管 Python pip 包安装路径和托管 Git fallback，打包流程支持带嵌入运行时与不带嵌入运行时两种安装包。",
-            "新增自定义端点图像理解开关；新端点默认包含更大的上下文、推理强度和图像能力配置。",
-            "新增 Codex WebSocket 传输设置相关配置入口。",
-            "新增安装包图标和 Unity Editor bundle / JSON bundle 的第三方说明。"
-          ]
-        },
-        {
           "title": "修复",
           "items": [
-            "修复文件编辑工具在搜索块大于目标文件时的处理，现在会稳定返回 “Could not find oldString”，并保持原文件不变。",
-            "修复聊天工具调用交接布局、等待状态、历史工具结果恢复和折叠展开行为。",
-            "修复工具轮次中的用户消息处理，排队输入和插入输入会在正确时机进入会话。",
-            "修复会话滚动恢复、会话切换稳定性和历史文件变更面板状态。",
-            "修复撤回、回滚和 undo 后的会话内容、View 树与知识索引刷新。",
-            "修复 VCS 恢复路径缺失和 modified restore 的 meta sidecar 保留问题。",
-            "修复 View 窗口标签、置顶、焦点、负坐标、多显示器和宿主窗口同步问题。",
-            "修复 Unity 嵌入式覆盖层、拖拽桥接、域重载后连接和临时 overlay 稳定性。",
-            "修复 Unity 重编译期间的重连状态识别，使用 Unity 管道返回的进程 ID 与可执行路径，在编辑器仍运行时保持进程状态稳定。",
-            "修复 Unity Background Boost 在引擎模块为 `Unity.dll` 的 Unity 版本中的符号解析。",
-            "修复 Unity 6+ 资源拖拽 hook 兼容性，使用带 `EventModifiers` 的回调签名。",
-            "修复知识全文 token 概览、知识引用目标范围和查询匹配准确性。",
-            "修复 diff 高亮转义、悬浮预览尺寸和文件审阅窗口导航。",
-            "修复 Git index.lock 提示、工作区快照失败日志和托管 Git 包 fallback。",
-            "修复历史工具结果中的图片、嵌套工具调用、持久化输出顺序和已删除大输出显示。"
-          ]
-        },
-        {
-          "title": "移除",
-          "items": [
-            "移除旧 Canvas 工具、Canvas 页面、Canvas 服务和后端命令；图表与 View 使用新的专用窗口承载。",
-            "移除旧 `webfetch` 工具，改为新的 `web_fetch` 工具。",
-            "移除旧 Unity Embed HTTP Server 与旧 SerializedData bridge。",
-            "移除工具折叠导出长文档和若干 Unity 拖拽/滚动调试日志。"
+            "降低聊天流式处理开销，工具折叠 trace 启用时才构造 trace 快照。"
           ]
         }
       ],
       "downloadChannels": [
         {
           "label": "Windows x64",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.3.0/locus_0.3.0_x64-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.3.1/locus_0.3.1_x64-setup.exe"
         },
         {
           "label": "Windows x64（系统 Python/Git）",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.3.0/locus_0.3.0_x64-without_embed_python_git-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.3.1/locus_0.3.1_x64-without_embed_python_git-setup.exe"
         },
         {
           "label": "GitHub Releases",
@@ -113,81 +56,24 @@
     },
     "en": {
       "title": "Update available",
-      "summary": "Locus v0.3.0 (2026-05-31)",
+      "summary": "Locus v0.3.1 (2026-06-04)",
       "changelogUrl": "/en/overview/latest-version",
       "changes": [
         {
-          "title": "Added",
-          "items": [
-            "Added View (`/view`): Agents can create interactive editor tools for Unity projects, including inspectors, graphs, tables, canvases, and project-specific workbenches. Created Views appear in the Views list and session list, support folders, rename, drag ordering, import, export, and can open in Locus or Unity.",
-            "Added Skill Package support for packaging reusable workflows, documents, commands, and tools. The Knowledge panel can preview, import, export, install Unity scripts, and configure command entry points.",
-            "Added a chat message context menu: right-click a message in the chat transcript to copy it, roll back to that message, or fork from it. Message drafts can also be reused.",
-            "Added Unity asset and local file drag bridging for Locus and embedded Unity sessions.",
-            "Added Unity Background Boost so the Unity editor loop can keep responding while the Unity window is in the background. The setting can be toggled from Settings, and the status area reports waiting, patched, failed, and disabled states.",
-            "Added Unity viewport screenshot results for Game View, Scene View, and specific Editor windows.",
-            "Added a Unity Console attach command in the chat input.",
-            "Added Unity embedded windows for sessions and Views, with multi-window handling, drag references, and focus handling inside Unity.",
-            "Added a graph window for nodes, ports, parameters, links, state machines, and dependency graphs, with readonly previews, manual layout, directed arrows, and confirmation options.",
-            "Added Agent tool loading modes, with direct tools, lazy tools, and Skill-provided tools visible in the Agent panel.",
-            "Added Agent environment and prompt details, including rendered environment prompts, structured prompts, and context usage.",
-            "Added running-send behavior so input can be queued for the next turn or inserted into the active session flow.",
-            "Added session archive actions across settings and session lists.",
-            "Added local file drops in chat, with structured file references and a warning when workspace-only file boundaries block external paths.",
-            "Added Knowledge modes and status details for off, read-only, and full access, including retrieval, index, and context cost status.",
-            "Added Knowledge query progress for loading, scanning, sorting, text scanning, and query stages.",
-            "Added full document knowledge injection and richer match details, including matched terms, summaries, and body snippets.",
-            "Added notification settings for background system notifications, sound alerts, volume, built-in or custom sounds, and event-specific triggers.",
-            "Added close behavior settings for exiting or minimizing to tray, plus a confirmation dialog when closing while tasks are running.",
-            "Added temporary file management for viewing, opening, and cleaning large tool outputs and run temp files. Cleaned historical outputs are shown as deleted.",
-            "Added recent workspace directory context actions for opening in File Explorer or removing from the list.",
-            "Added file-change hover previews and full diff navigation with previous and next change actions.",
-            "Added Markdown rendering for images, local file references, knowledge references, View references, and semantic code.",
-            "Added Asset DB reconcile progress for scanning, discovering, syncing, queued, and failed states.",
-            "Added stable and experimental update channels, plus a stable update manifest.",
-            "Added managed Python pip package storage and a managed Git fallback. Release packaging now supports installers with and without embedded runtimes.",
-            "Added image-understanding settings for custom endpoints, with larger default context and reasoning controls for new endpoints.",
-            "Added Codex WebSocket transport settings.",
-            "Added installer icon updates and third-party notices for the Unity Editor bundle and JSON bundle."
-          ]
-        },
-        {
           "title": "Fixed",
           "items": [
-            "Fixed filesystem edit handling when the search block is larger than the target file. The tool now reports “Could not find oldString” and leaves the file untouched.",
-            "Fixed chat tool-call handoff layout, waiting states, historical tool result recovery, and collapsed block expansion.",
-            "Fixed user message handling during tool rounds so queued and inserted inputs enter the session at the correct time.",
-            "Fixed session scroll restoration, session switching stability, and historical file-changes panel state.",
-            "Fixed session content, View tree, and Knowledge index refresh after undo, rollback, and message restore actions.",
-            "Fixed VCS restore paths that were missing from checkpoints and preserved meta sidecars during modified restores.",
-            "Fixed View window tabs, always-on-top behavior, focus, negative coordinates, multi-monitor placement, and host sync.",
-            "Fixed Unity embedded overlays, drag bridging, post-domain-reload connection stability, and transient overlay behavior.",
-            "Fixed Unity reconnect status during recompiles by using the process ID and executable path reported by the Unity pipe, keeping the editor process state stable while Unity is still running.",
-            "Fixed Unity Background Boost symbol resolution for Unity versions where the engine module is `Unity.dll`.",
-            "Fixed Unity 6+ asset drag hook compatibility by using the `EventModifiers` callback signature.",
-            "Fixed Knowledge full-document token overview, Knowledge reference target scope, and query match accuracy.",
-            "Fixed diff highlight escaping, hover preview sizing, and file review window navigation.",
-            "Fixed Git index.lock warnings, workspace snapshot failure logging, and managed Git package fallback.",
-            "Fixed historical tool result images, nested tool calls, persisted output order, and deleted large-output display."
-          ]
-        },
-        {
-          "title": "Removed",
-          "items": [
-            "Removed the old Canvas tool, Canvas page, Canvas service, and backend command. Graphs and Views now use the new dedicated windows.",
-            "Removed the old `webfetch` tool in favor of the new `web_fetch` tool.",
-            "Removed the old Unity Embed HTTP Server and SerializedData bridge.",
-            "Removed the long tool-collapse export document and several Unity drag or scroll trace logs."
+            "Reduced chat streaming overhead by building trace snapshots only when tool-collapse tracing is enabled."
           ]
         }
       ],
       "downloadChannels": [
         {
           "label": "Windows x64",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.3.0/locus_0.3.0_x64-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.3.1/locus_0.3.1_x64-setup.exe"
         },
         {
           "label": "Windows x64 (system Python/Git)",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.3.0/locus_0.3.0_x64-without_embed_python_git-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.3.1/locus_0.3.1_x64-without_embed_python_git-setup.exe"
         },
         {
           "label": "GitHub Releases",
