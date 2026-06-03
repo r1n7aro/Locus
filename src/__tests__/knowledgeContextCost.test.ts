@@ -51,7 +51,7 @@ describe("knowledgeContextCost", () => {
       source: "system",
     };
     const knowledgeRead = makeToolItem("knowledge_read");
-    const knowledgeCreate = makeToolItem("knowledge_create", "lazy");
+    const knowledgeCreate = makeToolItem("knowledge_create");
     const read = makeToolItem("read");
 
     const total = estimateKnowledgeContextCostTokens([
@@ -64,12 +64,13 @@ describe("knowledgeContextCost", () => {
 
     expect(isKnowledgeInjectionItem(knowledgeContext)).toBe(true);
     expect(isDirectKnowledgeToolItem(knowledgeRead)).toBe(true);
-    expect(isDirectKnowledgeToolItem(knowledgeCreate)).toBe(false);
+    expect(isDirectKnowledgeToolItem(knowledgeCreate)).toBe(true);
     expect(isDirectKnowledgeToolItem(read)).toBe(false);
     expect(total).toBe(
       estimatePromptTokens(knowledgeContext.content.length)
         + estimatePromptTokens(knowledgeRule.content.length)
-        + estimateToolPrompt(knowledgeRead.meta).tokens,
+        + estimateToolPrompt(knowledgeRead.meta).tokens
+        + estimateToolPrompt(knowledgeCreate.meta).tokens,
     );
   });
 });

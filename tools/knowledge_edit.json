@@ -1,5 +1,5 @@
 {
-  "description": "Edit an existing unified knowledge document by type-prefixed `.md` path. This tool only updates document content sections; knowledge metadata and directory config use dedicated knowledge tools. Returns a plain-text status line.",
+  "description": "Edit an existing unified knowledge document by type-prefixed `.md` path. This tool updates full content sections and can also replace specific text inside a section. Knowledge metadata and directory config use dedicated knowledge tools. Returns a plain-text status line.",
   "parameters": {
     "type": "object",
     "additionalProperties": false,
@@ -15,7 +15,35 @@
         "properties": {
           "summary": { "type": ["string", "null"] },
           "body": { "type": "string" },
-          "maintenanceRules": { "type": ["string", "null"] }
+          "maintenanceRules": { "type": ["string", "null"] },
+          "edits": {
+            "type": "array",
+            "description": "Partial replacements to apply sequentially after any full section fields in this request.",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "section": {
+                  "type": "string",
+                  "enum": ["summary", "body", "maintenanceRules"],
+                  "description": "Document section to edit."
+                },
+                "oldString": {
+                  "type": "string",
+                  "description": "Exact text to find inside the selected section. Use an empty string to replace the whole section."
+                },
+                "newString": {
+                  "type": "string",
+                  "description": "Replacement text for oldString."
+                },
+                "replaceAll": {
+                  "type": "boolean",
+                  "description": "Replace every occurrence in the selected section. Default is false."
+                }
+              },
+              "required": ["section", "oldString", "newString"]
+            }
+          }
         }
       }
     },

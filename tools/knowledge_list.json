@@ -7,6 +7,10 @@
       "pathPrefix": {
         "type": "string",
         "description": "Optional type-prefixed directory path prefix such as `design/`, `design/combat/`, or `skill/unity/`. Directory prefixes do not end with `.md`. When omitted, all knowledge types are listed."
+      },
+      "includeHidden": {
+        "type": "boolean",
+        "description": "When true, include search-only documents that are hidden from the injected knowledge structure. Skill workflows that do not allow model recall remain hidden."
       }
     }
   }

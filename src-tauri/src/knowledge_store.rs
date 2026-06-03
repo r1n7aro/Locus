@@ -319,6 +319,21 @@ pub fn list_item_has_injectable_content(item: &KnowledgeListItem) -> bool {
     }
 }
 
+pub fn document_allows_model_recall(document: &KnowledgeDocument) -> bool {
+    if document.doc_type != KnowledgeType::Skill {
+        return true;
+    }
+    document.skill_enabled.unwrap_or(true)
+        && document.skill_surface.unwrap_or_default().allows_auto()
+}
+
+pub fn list_item_allows_model_recall(item: &KnowledgeListItem) -> bool {
+    if item.doc_type != KnowledgeType::Skill {
+        return true;
+    }
+    item.skill_enabled.unwrap_or(true) && item.skill_surface.unwrap_or_default().allows_auto()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KnowledgeReadResult {
@@ -527,6 +542,34 @@ pub enum KnowledgeTargetKind {
     Directory,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum KnowledgeDocumentEditSection {
+    Summary,
+    Body,
+    MaintenanceRules,
+}
+
+impl KnowledgeDocumentEditSection {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Summary => "summary",
+            Self::Body => "body",
+            Self::MaintenanceRules => "maintenanceRules",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct KnowledgeDocumentEditOperation {
+    pub section: KnowledgeDocumentEditSection,
+    pub old_string: String,
+    pub new_string: String,
+    #[serde(default)]
+    pub replace_all: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct KnowledgeDocumentPatch {
@@ -568,6 +611,8 @@ pub struct KnowledgeDocumentPatch {
     pub body: Option<Option<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub maintenance_rules: Option<Option<String>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub edits: Vec<KnowledgeDocumentEditOperation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub new_path: Option<String>,
 }
@@ -2821,6 +2866,120 @@ pub fn update_directory_external_sources(
     )
 }
 
+fn normalize_partial_edit_text(value: &str) -> String {
+    value.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+fn line_number_at_offset(content: &str, offset: usize) -> usize {
+    content[..offset].matches('\n').count() + 1
+}
+
+fn replace_unique_text(
+    content: &str,
+    old_string: &str,
+    new_string: &str,
+    replace_all: bool,
+) -> Result<String, String> {
+    let content = normalize_partial_edit_text(content);
+    let old_string = normalize_partial_edit_text(old_string);
+    let new_string = normalize_partial_edit_text(new_string);
+
+    if old_string == new_string {
+        return Err("oldString and newString are identical, no changes to apply.".to_string());
+    }
+
+    if old_string.is_empty() {
+        return Ok(new_string);
+    }
+
+    let positions: Vec<usize> = content
+        .match_indices(&old_string)
+        .map(|(position, _)| position)
+        .collect();
+    match positions.as_slice() {
+        [] => Err(
+            "Could not find oldString in the selected knowledge section. It must match exactly."
+                .to_string(),
+        ),
+        [position] => {
+            let mut result =
+                String::with_capacity(content.len() - old_string.len() + new_string.len());
+            result.push_str(&content[..*position]);
+            result.push_str(&new_string);
+            result.push_str(&content[*position + old_string.len()..]);
+            Ok(result)
+        }
+        _ if replace_all => Ok(content.replace(&old_string, &new_string)),
+        _ => {
+            let display_limit = 20;
+            let mut line_numbers = positions
+                .iter()
+                .take(display_limit)
+                .map(|position| line_number_at_offset(&content, *position).to_string())
+                .collect::<Vec<_>>();
+            if positions.len() > display_limit {
+                line_numbers.push("...".to_string());
+            }
+            Err(format!(
+                "Found multiple matches for oldString at lines: {}. Provide more surrounding context or set replaceAll=true.",
+                line_numbers.join(", ")
+            ))
+        }
+    }
+}
+
+fn document_section_content(
+    document: &KnowledgeDocument,
+    section: KnowledgeDocumentEditSection,
+) -> String {
+    match section {
+        KnowledgeDocumentEditSection::Summary => document.summary.clone().unwrap_or_default(),
+        KnowledgeDocumentEditSection::Body => document.body.clone(),
+        KnowledgeDocumentEditSection::MaintenanceRules => {
+            document.maintenance_rules.clone().unwrap_or_default()
+        }
+    }
+}
+
+fn set_document_section_content(
+    document: &mut KnowledgeDocument,
+    section: KnowledgeDocumentEditSection,
+    content: String,
+) {
+    match section {
+        KnowledgeDocumentEditSection::Summary => document.summary = Some(content),
+        KnowledgeDocumentEditSection::Body => document.body = content,
+        KnowledgeDocumentEditSection::MaintenanceRules => {
+            document.maintenance_rules = Some(content)
+        }
+    }
+}
+
+pub fn apply_document_content_edits(
+    document: &mut KnowledgeDocument,
+    edits: &[KnowledgeDocumentEditOperation],
+) -> Result<(), String> {
+    for (index, edit) in edits.iter().enumerate() {
+        let current = document_section_content(document, edit.section);
+        let updated = replace_unique_text(
+            &current,
+            &edit.old_string,
+            &edit.new_string,
+            edit.replace_all,
+        )
+        .map_err(|error| {
+            format!(
+                "document.edits[{}] {}: {}",
+                index,
+                edit.section.as_str(),
+                error
+            )
+        })?;
+        set_document_section_content(document, edit.section, updated);
+    }
+    Ok(())
+}
+
 pub fn edit_document(
     working_dir: &str,
     path: &str,
@@ -2877,11 +3036,16 @@ pub fn edit_document(
     if let Some(ai_maintained) = patch.ai_maintained {
         doc.ai_maintained = ai_maintained;
     }
+    let edits_maintenance_rules = patch
+        .edits
+        .iter()
+        .any(|edit| edit.section == KnowledgeDocumentEditSection::MaintenanceRules);
     if let Some(inherit_ai_config) = patch.inherit_ai_config {
         doc.inherit_ai_config = inherit_ai_config;
     } else if patch.ai_maintained.is_some()
         || patch.explicit_maintenance_rules.is_some()
         || patch.maintenance_rules.is_some()
+        || edits_maintenance_rules
     {
         doc.inherit_ai_config = false;
     }
@@ -2911,6 +3075,9 @@ pub fn edit_document(
     }
     if let Some(maintenance_rules) = patch.maintenance_rules {
         doc.maintenance_rules = maintenance_rules;
+    }
+    if !patch.edits.is_empty() {
+        apply_document_content_edits(&mut doc, &patch.edits)?;
     }
     if let Some(new_path) = patch.new_path {
         sync_title_after_path_change(&mut doc, &new_path)?;
@@ -4689,47 +4856,25 @@ pub(crate) fn score_document_text_match_with_terms(
     let rules = rules_text.to_lowercase();
     let body = doc.body.to_lowercase();
 
-    if title.contains(&needle) {
-        score += 8.0;
-        snippet = doc.title.clone();
-    } else if contains_all_text_match_terms(&title, &terms) {
-        score += 5.5;
+    if let Some(field_score) = score_text_match_field(&title, &needle, &terms, 8.0, 5.5) {
+        score += field_score;
         snippet = doc.title.clone();
     }
-    if path.contains(&needle) {
-        score += 4.0;
-        if snippet.is_empty() {
-            snippet = doc.path.clone();
-        }
-    } else if contains_all_text_match_terms(&path, &terms) {
-        score += 3.0;
+    if let Some(field_score) = score_text_match_field(&path, &needle, &terms, 4.0, 3.0) {
+        score += field_score;
         if snippet.is_empty() {
             snippet = doc.path.clone();
         }
     }
-    if summary.contains(&needle) {
-        score += 6.0;
-        if snippet.is_empty() {
-            snippet = summary_text.to_string();
-        }
-        matched_section = Some(KnowledgeSearchMatchSection::Summary);
-    } else if contains_all_text_match_terms(&summary, &terms) {
-        score += 4.5;
+    if let Some(field_score) = score_text_match_field(&summary, &needle, &terms, 6.0, 4.5) {
+        score += field_score;
         if snippet.is_empty() {
             snippet = summary_text.to_string();
         }
         matched_section = Some(KnowledgeSearchMatchSection::Summary);
     }
-    if rules.contains(&needle) {
-        score += 4.0;
-        if snippet.is_empty() {
-            snippet = rules_text.to_string();
-        }
-        if matched_section.is_none() {
-            matched_section = Some(KnowledgeSearchMatchSection::MaintenanceRules);
-        }
-    } else if contains_all_text_match_terms(&rules, &terms) {
-        score += 3.0;
+    if let Some(field_score) = score_text_match_field(&rules, &needle, &terms, 4.0, 3.0) {
+        score += field_score;
         if snippet.is_empty() {
             snippet = rules_text.to_string();
         }
@@ -4737,16 +4882,8 @@ pub(crate) fn score_document_text_match_with_terms(
             matched_section = Some(KnowledgeSearchMatchSection::MaintenanceRules);
         }
     }
-    if body.contains(&needle) {
-        score += 3.0;
-        if snippet.is_empty() {
-            snippet = extract_snippet(&doc.body, &needle, &terms);
-        }
-        if matched_section.is_none() {
-            matched_section = Some(KnowledgeSearchMatchSection::Body);
-        }
-    } else if contains_all_text_match_terms(&body, &terms) {
-        score += 2.0;
+    if let Some(field_score) = score_text_match_field(&body, &needle, &terms, 3.0, 2.0) {
+        score += field_score;
         if snippet.is_empty() {
             snippet = extract_snippet(&doc.body, &needle, &terms);
         }
@@ -4844,8 +4981,27 @@ pub(crate) fn document_text_match_terms(query: &str, doc: &KnowledgeDocument) ->
     )
 }
 
-fn contains_all_text_match_terms(text: &str, terms: &[String]) -> bool {
-    !terms.is_empty() && terms.iter().all(|term| text.contains(term))
+fn score_text_match_field(
+    text: &str,
+    needle: &str,
+    terms: &[String],
+    phrase_score: f32,
+    term_score: f32,
+) -> Option<f32> {
+    if text.contains(needle) {
+        return Some(phrase_score);
+    }
+
+    let matched_count = terms
+        .iter()
+        .filter(|term| !term.is_empty() && text.contains(term.as_str()))
+        .count();
+    if matched_count == 0 {
+        return None;
+    }
+
+    let coverage = matched_count as f32 / terms.len().max(1) as f32;
+    Some(term_score * coverage + matched_count as f32 * 0.2)
 }
 
 fn extract_snippet(text: &str, query: &str, terms: &[String]) -> String {
@@ -5322,6 +5478,7 @@ pub fn update_document(
                 summary: request.summary,
                 body: request.body,
                 maintenance_rules: request.maintenance_rules,
+                edits: Vec::new(),
                 new_path: request.new_path,
             },
         ),
@@ -7695,6 +7852,76 @@ Body content
 
         assert_eq!(updated.path, "gameplay/systems-loop.md");
         assert_eq!(updated.title, "systems-loop");
+    }
+
+    #[test]
+    fn edit_document_applies_partial_section_replacements() {
+        let temp = TempDir::new().unwrap();
+        let working_dir = temp.path().to_string_lossy().to_string();
+        let mut doc = sample_doc();
+        doc.body = "alpha beta alpha".to_string();
+        doc.explicit_maintenance_rules = true;
+        doc.inherit_ai_config = false;
+        doc.maintenance_rules = Some("- Keep old facts".to_string());
+        save_document(&working_dir, doc).expect("save");
+
+        let updated = edit_document(
+            &working_dir,
+            "gameplay/core-loop.md",
+            Some(KnowledgeType::Design),
+            KnowledgeDocumentPatch {
+                edits: vec![
+                    KnowledgeDocumentEditOperation {
+                        section: KnowledgeDocumentEditSection::Body,
+                        old_string: "alpha".to_string(),
+                        new_string: "omega".to_string(),
+                        replace_all: true,
+                    },
+                    KnowledgeDocumentEditOperation {
+                        section: KnowledgeDocumentEditSection::MaintenanceRules,
+                        old_string: "old".to_string(),
+                        new_string: "new".to_string(),
+                        replace_all: false,
+                    },
+                ],
+                ..Default::default()
+            },
+        )
+        .expect("partial edit");
+
+        assert_eq!(updated.body, "omega beta omega");
+        assert_eq!(
+            updated.maintenance_rules.as_deref(),
+            Some("- Keep new facts")
+        );
+    }
+
+    #[test]
+    fn edit_document_rejects_ambiguous_partial_replacement() {
+        let temp = TempDir::new().unwrap();
+        let working_dir = temp.path().to_string_lossy().to_string();
+        let mut doc = sample_doc();
+        doc.body = "alpha\nbeta\nalpha".to_string();
+        save_document(&working_dir, doc).expect("save");
+
+        let error = edit_document(
+            &working_dir,
+            "gameplay/core-loop.md",
+            Some(KnowledgeType::Design),
+            KnowledgeDocumentPatch {
+                edits: vec![KnowledgeDocumentEditOperation {
+                    section: KnowledgeDocumentEditSection::Body,
+                    old_string: "alpha".to_string(),
+                    new_string: "omega".to_string(),
+                    replace_all: false,
+                }],
+                ..Default::default()
+            },
+        )
+        .expect_err("ambiguous edit should fail");
+
+        assert!(error.contains("document.edits[0] body"));
+        assert!(error.contains("Found multiple matches"));
     }
 
     #[test]

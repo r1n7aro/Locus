@@ -19,7 +19,7 @@
       },
       "pathPrefix": {
         "type": "string",
-        "description": "Optional type-prefixed directory path prefix such as `memory/agent/` or `reference/unity/`. Directory prefixes do not end with `.md`."
+        "description": "Optional type-prefixed directory path prefix. Valid roots: `design/`, `memory/`, `skill/`, and `reference/`. Use `skill/` for workflows, SOPs, slash-command skills, tool/package instructions, and reusable execution procedures. Examples: `skill/`, `skill/builtin/`, `memory/`, `design/`, `reference/unity/`. Directory prefixes do not end with `.md`."
       }
     }
   }

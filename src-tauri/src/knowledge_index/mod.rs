@@ -42,7 +42,7 @@ use self::tantivy_index::{
     KnowledgeTantivyIndex, LexicalBulkWriterGuard, LexicalDocumentRecord, LexicalHit,
 };
 
-pub const INDEX_VERSION: i32 = 3;
+pub const INDEX_VERSION: i32 = 4;
 const TANTIVY_BATCH_DOCS: usize = 128;
 const PARALLEL_PREPARE_DOC_THRESHOLD: usize = 16;
 const PREPARING_ANALYSIS_BATCH_DOCS: usize = 64;
@@ -3320,6 +3320,7 @@ pub async fn query_documents(
     types: Option<&[KnowledgeType]>,
     path_prefix: Option<&str>,
     limit: usize,
+    include_hidden: bool,
     state: Arc<KnowledgeIndexState>,
 ) -> Result<Vec<KnowledgeSearchHit>, String> {
     query_documents_with_progress(
@@ -3330,6 +3331,7 @@ pub async fn query_documents(
         types,
         path_prefix,
         limit,
+        include_hidden,
         state,
         |_| {},
     )
@@ -3344,6 +3346,7 @@ pub async fn query_documents_with_progress<F>(
     types: Option<&[KnowledgeType]>,
     path_prefix: Option<&str>,
     limit: usize,
+    include_hidden: bool,
     state: Arc<KnowledgeIndexState>,
     on_progress: F,
 ) -> Result<Vec<KnowledgeSearchHit>, String>
@@ -3358,6 +3361,7 @@ where
         types,
         path_prefix,
         limit,
+        include_hidden,
         state,
         KNOWLEDGE_QUERY_TEXT_SCAN_TIMEOUT,
         on_progress,
@@ -3373,6 +3377,7 @@ async fn query_documents_with_progress_with_timeout<F>(
     types: Option<&[KnowledgeType]>,
     path_prefix: Option<&str>,
     limit: usize,
+    include_hidden: bool,
     state: Arc<KnowledgeIndexState>,
     text_scan_timeout: Duration,
     mut on_progress: F,
@@ -3422,6 +3427,7 @@ where
                     types,
                     path_prefix,
                     query_limit * 6,
+                    include_hidden,
                 )?,
                 Some(KeywordSearchKind::LexicalIndex),
             )
@@ -3441,6 +3447,7 @@ where
                     types,
                     path_prefix,
                     query_limit * 6,
+                    include_hidden,
                     text_scan_timeout,
                     &mut on_progress,
                 )
@@ -3528,6 +3535,9 @@ where
             document,
             &mut access_cache,
         )?;
+        if !include_hidden && !cached_document_entry_allows_model_recall(working_dir, document)? {
+            continue;
+        }
         if access.lexical_enabled {
             filtered_lexical.push(hit);
         }
@@ -3547,6 +3557,9 @@ where
             document,
             &mut access_cache,
         )?;
+        if !include_hidden && !cached_document_entry_allows_model_recall(working_dir, document)? {
+            continue;
+        }
         if access.vector_enabled {
             filtered_semantic.push(hit);
         }
@@ -4114,13 +4127,68 @@ fn load_all_documents(
     app_knowledge_dir: Option<&std::path::PathBuf>,
     excluded_prefixes: &[(KnowledgeType, String)],
 ) -> Result<Vec<KnowledgeDocument>, String> {
-    knowledge_store::load_documents_with_app_root_excluding_prefixes(
+    let mut documents = knowledge_store::load_documents_with_app_root_excluding_prefixes(
         working_dir,
         app_knowledge_dir,
         None,
         None,
         excluded_prefixes,
-    )
+    )?;
+    documents.extend(
+        crate::commands::list_skill_package_knowledge_documents_sync_with_hidden(
+            working_dir,
+            None,
+            true,
+        )
+        .into_iter()
+        .filter(|document| !document_is_excluded(document, excluded_prefixes)),
+    );
+    Ok(documents)
+}
+
+fn document_is_excluded(
+    document: &KnowledgeDocument,
+    excluded_prefixes: &[(KnowledgeType, String)],
+) -> bool {
+    excluded_prefixes.iter().any(|(doc_type, prefix)| {
+        *doc_type == document.doc_type
+            && (document.path == prefix.as_str()
+                || document.path.starts_with(&format!("{}/", prefix)))
+    })
+}
+
+fn document_allows_model_recall(
+    working_dir: &str,
+    document: &KnowledgeDocument,
+) -> Result<bool, String> {
+    if document.doc_type != KnowledgeType::Skill {
+        return Ok(true);
+    }
+    if let Some(allowed) = crate::commands::skill_package_virtual_path_allows_model_recall_sync(
+        working_dir,
+        &document.path,
+    )? {
+        return Ok(allowed);
+    }
+    Ok(knowledge_store::document_allows_model_recall(document))
+}
+
+fn cached_document_entry_allows_model_recall(
+    working_dir: &str,
+    document: &CachedDocumentEntry,
+) -> Result<bool, String> {
+    if document.item.doc_type != KnowledgeType::Skill {
+        return Ok(true);
+    }
+    if let Some(allowed) = crate::commands::skill_package_virtual_path_allows_model_recall_sync(
+        working_dir,
+        &document.item.path,
+    )? {
+        return Ok(allowed);
+    }
+    Ok(knowledge_store::list_item_allows_model_recall(
+        &document.item,
+    ))
 }
 
 fn build_index_state(
@@ -4567,6 +4635,7 @@ fn lexical_index_search_documents(
     types: Option<&[KnowledgeType]>,
     path_prefix: Option<&str>,
     limit: usize,
+    include_hidden: bool,
 ) -> Result<Vec<LexicalHit>, String> {
     let query = query.trim();
     if query.is_empty() {
@@ -4609,6 +4678,10 @@ fn lexical_index_search_documents(
                 &mut access_cache,
             )?;
             if !access.lexical_enabled {
+                continue;
+            }
+            if !include_hidden && !cached_document_entry_allows_model_recall(working_dir, document)?
+            {
                 continue;
             }
             if seen_doc_ids.insert(hit.doc_id.clone()) {
@@ -4685,6 +4758,7 @@ async fn text_scan_search_documents_with_progress<F>(
     types: Option<&[KnowledgeType]>,
     path_prefix: Option<&str>,
     limit: usize,
+    include_hidden: bool,
     text_scan_timeout: Duration,
     on_progress: &mut F,
 ) -> Result<Vec<LexicalHit>, String>
@@ -4722,6 +4796,7 @@ where
             types.as_deref(),
             path_prefix.as_deref(),
             limit,
+            include_hidden,
             deadline,
             move |progress| {
                 let _ = progress_tx.send(progress);
@@ -4770,6 +4845,7 @@ fn text_scan_search_documents_blocking<F>(
     types: Option<&[KnowledgeType]>,
     path_prefix: Option<&str>,
     limit: usize,
+    include_hidden: bool,
     deadline: TextScanDeadline,
     mut on_progress: F,
 ) -> Result<Vec<LexicalHit>, String>
@@ -4809,6 +4885,18 @@ where
             path_prefix,
         )?;
     }
+    if types
+        .map(|values| values.contains(&KnowledgeType::Skill))
+        .unwrap_or(true)
+    {
+        documents.extend(
+            crate::commands::list_skill_package_knowledge_documents_sync_with_hidden(
+                working_dir,
+                path_prefix,
+                include_hidden,
+            ),
+        );
+    }
 
     deadline.check("loading text scan documents")?;
     let total_documents = documents.len();
@@ -4839,6 +4927,9 @@ where
         )
         .ok();
         if !access.map(|value| value.lexical_enabled).unwrap_or(false) {
+            continue;
+        }
+        if !include_hidden && !document_allows_model_recall(working_dir, &document)? {
             continue;
         }
         if let Some((score, snippet, matched_section, matched_terms)) =
@@ -5544,6 +5635,7 @@ mod tests {
             None,
             None,
             5,
+            false,
             state.clone(),
         )
         .await
@@ -5578,6 +5670,7 @@ mod tests {
             Some(&[KnowledgeType::Design]),
             Some("combat"),
             5,
+            false,
             state,
         )
         .await
@@ -5590,6 +5683,43 @@ mod tests {
                 && hit.matched_terms.contains(&"战斗".to_string())
                 && hit.matched_terms.contains(&"核心".to_string())
         }));
+    }
+
+    #[tokio::test]
+    async fn query_documents_text_scan_recalls_partial_keyword_terms() {
+        let workspace = tempdir().expect("workspace");
+        let working_dir = workspace.path().to_string_lossy().to_string();
+        seed_design_document(&working_dir);
+        save_test_general_config(&working_dir, false, false);
+        let state = create_state(&working_dir);
+
+        let hits = query_documents(
+            &working_dir,
+            None,
+            Some("战斗 unrelated_missing_term"),
+            None,
+            Some(&[KnowledgeType::Design]),
+            Some("combat"),
+            5,
+            false,
+            state,
+        )
+        .await
+        .expect("query documents");
+
+        let hit = hits
+            .iter()
+            .find(|hit| hit.id == "kd_test_design_doc")
+            .expect("partial term match should recall the document");
+        assert_eq!(hit.match_kind, "grep");
+        assert_eq!(
+            hit.matched_section,
+            Some(KnowledgeSearchMatchSection::Summary)
+        );
+        assert!(hit.matched_terms.contains(&"战斗".to_string()));
+        assert!(!hit
+            .matched_terms
+            .contains(&"unrelated_missing_term".to_string()));
     }
 
     #[tokio::test]
@@ -5618,6 +5748,7 @@ mod tests {
             None,
             None,
             5,
+            false,
             state,
         )
         .await
@@ -5643,6 +5774,7 @@ mod tests {
             Some(&[KnowledgeType::Design]),
             None,
             5,
+            false,
             state,
             Duration::from_secs(5),
             |progress| progress_events.push(progress),
@@ -5685,6 +5817,7 @@ mod tests {
             Some(&[KnowledgeType::Design]),
             None,
             5,
+            false,
             state,
             Duration::ZERO,
             |_| {},
@@ -5741,6 +5874,7 @@ mod tests {
             Some(&[KnowledgeType::Design]),
             Some("target"),
             1,
+            false,
             state,
         )
         .await

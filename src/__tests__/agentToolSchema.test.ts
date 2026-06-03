@@ -133,6 +133,17 @@ describe("parseAgentToolDefinition", () => {
       "document.summary",
       "document.body",
       "document.maintenanceRules",
+      "document.edits",
+      "document.edits[]",
+      "document.edits[].section",
+      "document.edits[].oldString",
+      "document.edits[].newString",
+      "document.edits[].replaceAll",
+    ]);
+    expect(tool?.parameterRows.find((row) => row.path === "document.edits[].section")?.enumValues).toEqual([
+      "summary",
+      "body",
+      "maintenanceRules",
     ]);
   });
 

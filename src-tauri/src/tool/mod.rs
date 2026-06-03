@@ -132,8 +132,7 @@ pub fn default_load_mode_for_builtin_tool(name: &str) -> ToolLoadMode {
 
     if matches!(
         normalize_tool_name_key(name).as_str(),
-        "knowledge_create"
-            | "knowledge_delete"
+        "knowledge_delete"
             | "knowledge_move"
             | "graph_view"
             | "skill_create"
@@ -449,6 +448,20 @@ mod tests {
             Some("graph_view")
         );
         assert_eq!(registry.default_load_mode("graph_view"), ToolLoadMode::Lazy);
+    }
+
+    #[test]
+    fn builtins_register_knowledge_create_as_direct() {
+        let registry = ToolRegistry::with_builtins();
+
+        assert_eq!(
+            registry.canonical_name("knowledge_create").as_deref(),
+            Some("knowledge_create")
+        );
+        assert_eq!(
+            registry.default_load_mode("knowledge_create"),
+            ToolLoadMode::Direct
+        );
     }
 
     #[test]
