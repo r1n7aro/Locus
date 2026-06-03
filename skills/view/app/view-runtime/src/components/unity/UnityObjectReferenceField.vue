@@ -4,6 +4,7 @@ import { searchWorkspaceAssets } from "../../services/asset";
 import {
   filterUnityObjectReferenceSearchResults,
   unityObjectReferenceAssetKey,
+  unityObjectReferenceDisplayParts,
   unityObjectReferenceSearchQuery,
   unityObjectReferenceTypeHint,
   unityObjectReferenceValueForSearchResult,
@@ -53,7 +54,6 @@ const searchError = ref("");
 const results = ref<AssetSearchResult[]>([]);
 const highlightedIndex = ref(-1);
 const rootEl = ref<HTMLElement | null>(null);
-const displayInputEl = ref<HTMLInputElement | null>(null);
 const searchInputEl = ref<HTMLInputElement | null>(null);
 let debounceTimer: number | null = null;
 let blurTimer: number | null = null;
@@ -61,6 +61,7 @@ let searchRun = 0;
 
 const editable = computed(() => !props.disabled && !props.readonly);
 const typeHint = computed(() => unityObjectReferenceTypeHint(props.referenceTypeFullName));
+const displayParts = computed(() => unityObjectReferenceDisplayParts(displayText.value));
 const filter = computed<UnityObjectReferenceFilter>(() => ({
   referenceTypeFullName: props.referenceTypeFullName,
   referenceTypeAssembly: props.referenceTypeAssembly,
@@ -124,6 +125,21 @@ function beginEdit() {
   open.value = true;
   scheduleSearch(true);
   focusSearchInput();
+}
+
+function handleDisplayFocus() {
+  if (!editable.value) return;
+  focused.value = true;
+  clearBlurTimer();
+}
+
+function toggleEdit() {
+  if (!editable.value) return;
+  if (open.value) {
+    closeDropdown();
+    return;
+  }
+  beginEdit();
 }
 
 function focusSearchInput() {
@@ -270,22 +286,23 @@ function handleSearchKeydown(event: KeyboardEvent) {
     class="unity-object-reference-field"
     :class="{ focused, disabled: disabled || readonly }"
   >
-    <input
-      ref="displayInputEl"
-      class="unity-object-reference-input"
-      type="text"
-      :value="displayText"
+    <button
+      class="unity-object-reference-display"
+      type="button"
       :disabled="disabled"
-      :readonly="true"
-      :placeholder="placeholder"
-      :title="title || displayText || undefined"
+      :aria-disabled="readonly ? 'true' : undefined"
+      :title="displayText || title || undefined"
       :aria-label="ariaLabel || undefined"
-      autocomplete="off"
-      @focus="beginEdit"
-      @click="beginEdit"
+      @focus="handleDisplayFocus"
+      @click="toggleEdit"
       @blur="scheduleBlurCheck"
       @keydown="handleDisplayKeydown"
-    />
+    >
+      <span v-if="displayText" class="unity-object-reference-display-content">
+        <span class="unity-object-reference-display-name">{{ displayParts.name }}</span>
+      </span>
+      <span v-else class="unity-object-reference-placeholder">{{ placeholder }}</span>
+    </button>
     <button
       v-if="displayText && editable"
       class="unity-object-reference-clear"
@@ -378,7 +395,8 @@ function handleSearchKeydown(event: KeyboardEvent) {
   opacity: 0.65;
 }
 
-.unity-object-reference-input {
+.unity-object-reference-display {
+  flex: 1 1 auto;
   width: 100%;
   min-width: 0;
   min-height: 24px;
@@ -390,10 +408,37 @@ function handleSearchKeydown(event: KeyboardEvent) {
   font-family: inherit;
   box-sizing: border-box;
   cursor: pointer;
+  text-align: left;
 }
 
-.unity-object-reference-input:focus {
+.unity-object-reference-display:focus {
   outline: none;
+}
+
+.unity-object-reference-display-content {
+  width: 100%;
+  min-width: 0;
+  display: block;
+}
+
+.unity-object-reference-display-name,
+.unity-object-reference-placeholder {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.unity-object-reference-display-name {
+  display: block;
+  max-width: 100%;
+  color: var(--text-color);
+  font-weight: 600;
+}
+
+.unity-object-reference-placeholder {
+  display: block;
+  color: var(--text-secondary);
 }
 
 .unity-object-reference-clear {

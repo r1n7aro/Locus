@@ -4,6 +4,7 @@ import {
   filterUnityObjectReferenceSearchResults,
   getUnityObjectReferenceTypeRule,
   isUnityObjectReferenceSearchResult,
+  unityObjectReferenceDisplayParts,
   unityObjectReferenceValueForSearchResult,
   unityObjectReferenceSearchQuery,
   UNITY_OBJECT_REFERENCE_SEARCH_ROOTS,
@@ -53,7 +54,16 @@ describe("unityObjectReferencePicker", () => {
     })).toBe("t:rendertexture");
     expect(unityObjectReferenceSearchQuery("", {
       referenceTypeFullName: "UnityEngine.PhysicMaterial",
-    })).toBe("t:physicmaterial");
+    })).toBe("t:PhysicsMaterial");
+    expect(unityObjectReferenceSearchQuery("", {
+      referenceTypeFullName: "UnityEngine.PhysicsMaterial",
+    })).toBe("t:PhysicsMaterial");
+    expect(unityObjectReferenceSearchQuery("", {
+      referenceTypeFullName: "UnityEngine.PhysicsMaterial2D",
+    })).toBe("t:PhysicsMaterial2D");
+    expect(unityObjectReferenceSearchQuery("", {
+      referenceTypeFullName: "UnityEngine.AudioResource",
+    })).toBe("t:AudioResource");
     expect(unityObjectReferenceSearchQuery("", {
       referenceTypeFullName: "UnityEngine.Camera",
     })).toBe("t:prefab");
@@ -99,6 +109,9 @@ describe("unityObjectReferencePicker", () => {
     const results = [
       asset("Assets/Audio/Main.wav", "audio"),
       asset("Assets/Audio/Main.asset", "genericAsset", "AudioCueSO"),
+      asset("Assets/Audio/Random.asset", "genericAsset", "AudioRandomContainer", {
+        typeSearch: "audiorandomcontainer audioresource scriptableobject",
+      }),
       asset("Assets/Settings/Audio/DefaultAudioMixer.mixer", "otherYaml"),
       asset("Assets/Settings/Audio/DefaultAudioMixer.mixer", "otherYaml", "AudioMixerGroupController", {
         name: "Music",
@@ -119,6 +132,13 @@ describe("unityObjectReferencePicker", () => {
     expect(filterUnityObjectReferenceSearchResults(results, {
       referenceTypeFullName: "UnityEngine.AudioClip",
     }).map((result) => result.path)).toEqual(["Assets/Audio/Main.wav"]);
+
+    expect(filterUnityObjectReferenceSearchResults(results, {
+      referenceTypeFullName: "UnityEngine.AudioResource",
+    }).map((result) => result.path)).toEqual([
+      "Assets/Audio/Main.wav",
+      "Assets/Audio/Random.asset",
+    ]);
 
     expect(filterUnityObjectReferenceSearchResults(results, {
       referenceTypeFullName: "UnityEngine.Audio.AudioMixerGroup",
@@ -163,6 +183,8 @@ describe("unityObjectReferencePicker", () => {
       asset("Assets/Render/Main.renderTexture", "otherYaml"),
       asset("Assets/Render/Main.png", "texture"),
       asset("Assets/Physics/Bouncy.physicMaterial", "otherYaml"),
+      asset("Assets/Physics/Ice.physicsMaterial", "otherYaml"),
+      asset("Assets/Physics/Rubber.physicsMaterial2D", "otherYaml"),
       asset("Assets/Physics/Bouncy.mat", "material"),
       asset("Assets/UI/Hud.uxml", "otherYaml"),
       asset("Assets/UI/Hud.uss", "otherYaml"),
@@ -188,7 +210,21 @@ describe("unityObjectReferencePicker", () => {
 
     expect(filterUnityObjectReferenceSearchResults(results, {
       referenceTypeFullName: "UnityEngine.PhysicMaterial",
-    }).map((result) => result.path)).toEqual(["Assets/Physics/Bouncy.physicMaterial"]);
+    }).map((result) => result.path)).toEqual([
+      "Assets/Physics/Bouncy.physicMaterial",
+      "Assets/Physics/Ice.physicsMaterial",
+    ]);
+
+    expect(filterUnityObjectReferenceSearchResults(results, {
+      referenceTypeFullName: "UnityEngine.PhysicsMaterial",
+    }).map((result) => result.path)).toEqual([
+      "Assets/Physics/Bouncy.physicMaterial",
+      "Assets/Physics/Ice.physicsMaterial",
+    ]);
+
+    expect(filterUnityObjectReferenceSearchResults(results, {
+      referenceTypeFullName: "UnityEngine.PhysicsMaterial2D",
+    }).map((result) => result.path)).toEqual(["Assets/Physics/Rubber.physicsMaterial2D"]);
 
     expect(filterUnityObjectReferenceSearchResults(results, {
       referenceTypeFullName: "UnityEngine.UIElements.VisualTreeAsset",
@@ -239,6 +275,25 @@ describe("unityObjectReferencePicker", () => {
       referenceTypeFullName: "UnityEngine.AnimationClip",
     })).toEqual([clip]);
     expect(unityObjectReferenceValueForSearchResult(sprite)).toBe("Assets/UI/Atlas.png/PrimaryButton");
+  });
+
+  it("formats object reference display with the object name before its path", () => {
+    expect(unityObjectReferenceDisplayParts("Assets/Data/GameConfig.asset")).toEqual({
+      name: "GameConfig.asset",
+      path: "Assets/Data",
+    });
+    expect(unityObjectReferenceDisplayParts("Assets/UI/Atlas.png/PrimaryButton")).toEqual({
+      name: "PrimaryButton",
+      path: "Assets/UI/Atlas.png",
+    });
+    expect(unityObjectReferenceDisplayParts("Assets/Data/Channels/")).toEqual({
+      name: "Channels",
+      path: "Assets/Data",
+    });
+    expect(unityObjectReferenceDisplayParts("Main Camera")).toEqual({
+      name: "Main Camera",
+      path: "",
+    });
   });
 
   it("keeps scriptable object subclasses constrained to matching generic assets", () => {
@@ -294,11 +349,18 @@ describe("unityObjectReferencePicker", () => {
     expect(field).toContain("filterUnityObjectReferenceSearchResults");
     expect(field).toContain("referenceTypeFullName?: string");
     expect(field).toContain("const displayText = ref");
+    expect(field).toContain("const displayParts = computed");
     expect(field).toContain("const searchText = ref(\"\")");
     expect(field).toContain("currentValue: displayText.value");
     expect(field).toContain("unityObjectReferenceSearchQuery(searchText.value");
-    expect(field).toContain(":value=\"displayText\"");
-    expect(field).toContain(":readonly=\"true\"");
+    expect(field).toContain(":title=\"displayText || title || undefined\"");
+    expect(field).toContain("function handleDisplayFocus()");
+    expect(field).toContain("function toggleEdit()");
+    expect(field).toContain("@focus=\"handleDisplayFocus\"");
+    expect(field).toContain("@click=\"toggleEdit\"");
+    expect(field).not.toContain("@click=\"beginEdit\"");
+    expect(field).toContain("unity-object-reference-display-name");
+    expect(field).not.toContain("unity-object-reference-display-path");
     expect(field).toContain("ref=\"searchInputEl\"");
     expect(field).toContain("<Teleport to=\"body\">");
     expect(field).toContain("ref=\"dropdownEl\"");
@@ -331,12 +393,16 @@ describe("unityObjectReferencePicker", () => {
     expect(builtInFields).toContain("UnityEngine.MeshRenderer");
     expect(builtInFields).toContain("m_AdditionalVertexStreams");
     expect(builtInFields).toContain("UnityEngine.BoxCollider");
-    expect(builtInFields).toContain("UnityEngine.Collider\", \"m_Material\"");
+    expect(builtInFields).toContain("UnityEngine.Collider\", \"m_Material\", \"UnityEngine.PhysicsMaterial\"");
     expect(builtInFields).toContain("UnityEngine.Animator\", \"m_Controller\", \"UnityEngine.RuntimeAnimatorController\"");
+    expect(builtInFields).toContain("UnityEngine.AnimatorOverrideController\", \"m_Controller\", \"UnityEngine.RuntimeAnimatorController\"");
+    expect(builtInFields).toContain("UnityEngine.AudioSource\", \"m_Resource\", \"UnityEngine.AudioResource\"");
     expect(builtInFields).toContain("UnityEngine.Video.VideoPlayer\", \"m_VideoClip\", \"UnityEngine.Video.VideoClip\"");
     expect(builtInFields).toContain("UnityEngine.ParticleSystem\", \"ShapeModule.m_Mesh\", \"UnityEngine.Mesh\"");
     expect(builtInFields).toContain("UnityEngine.ParticleSystem\", \"SubModule.subEmitters[].emitter\", \"UnityEngine.ParticleSystem\"");
+    expect(builtInFields).toContain("UnityEngine.ParticleSystemForceField\", \"m_Parameters.m_VectorField\", \"UnityEngine.Texture3D\"");
     expect(builtInFields).toContain("UnityEngine.BillboardRenderer\", \"m_Billboard\", \"UnityEngine.BillboardAsset\"");
+    expect(builtInFields).toContain("UnityEngine.BillboardAsset\", \"material\", \"UnityEngine.Material\"");
     expect(builtInFields).toContain("UnityEngine.UIElements.UIDocument\", \"m_PanelSettings\", \"UnityEngine.UIElements.PanelSettings\"");
     expect(builtInFields).toContain("UnityEngine.UIElements.PanelSettings\", \"themeUss\"");
     expect(builtInFields).toContain("UnityEngine.TextCore.Text.FontAsset\", \"m_SourceFontFile\"");
@@ -344,6 +410,10 @@ describe("unityObjectReferencePicker", () => {
     expect(builtInFields).toContain("UnityEngine.TerrainData\", \"m_TreeDatabase.m_TreePrototypes[].m_Prefab\"");
     expect(builtInFields).toContain("UnityEngine.Rigidbody2D\", \"m_Material\", \"UnityEngine.PhysicsMaterial2D\"");
     expect(builtInFields).toContain("UnityEngine.TerrainLayer\", \"m_DiffuseTexture\", \"UnityEngine.Texture2D\"");
+    expect(builtInFields).toContain("UnityEngine.ShaderVariantCollection\", \"m_Shaders[].first\", \"UnityEngine.Shader\"");
+    expect(builtInFields).toContain("UnityEngine.Sprite\", \"m_ScriptableObjects[]\", \"UnityEngine.ScriptableObject\"");
+    expect(builtInFields).toContain("UnityEngine.RenderSettings\", \"m_SkyboxMaterial\", \"UnityEngine.Material\"");
+    expect(builtInFields).toContain("UnityEngine.LightingSettings\", \"m_LightmapParameters\", \"UnityEngine.LightmapParameters\"");
     expect(builtInFields).toContain("NormalizeBuiltInSerializedPropertyPath");
   });
 });

@@ -90,7 +90,10 @@ export default defineComponent({
   white-space: nowrap;
 }
 
-:deep(.inspector-property-draw-label),
+:deep(.inspector-property-draw-label) {
+  color: var(--text-color);
+}
+
 :deep(.inspector-property-draw-type) {
   color: var(--text-secondary);
 }

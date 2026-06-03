@@ -8,11 +8,51 @@ export const LOCUS_ASSET_INSPECTOR_WINDOW_FLAG = "locusAssetInspector";
 export const LOCUS_ASSET_INSPECTOR_WINDOW_TITLE = "Locus Inspector";
 
 export interface LocusAssetInspectorWindowPayload {
-  assetPath: string;
+  kind?: "asset" | "sceneObject";
+  assetPath?: string;
+  scenePath?: string;
+  objectPath?: string;
 }
 
 function trimOrEmpty(value: string | null | undefined): string {
   return value?.trim().replace(/\\/g, "/").replace(/\/+$/, "") || "";
+}
+
+function parseSceneObjectAssetPath(assetPath: string): { scenePath: string; objectPath: string } | null {
+  const match = assetPath.match(/^((?:Assets|Packages)\/.+?\.unity)\/(.+)$/i);
+  const scenePath = trimOrEmpty(match?.[1]);
+  const objectPath = trimOrEmpty(match?.[2]);
+  return scenePath && objectPath ? { scenePath, objectPath } : null;
+}
+
+function normalizePayload(payload: LocusAssetInspectorWindowPayload): LocusAssetInspectorWindowPayload {
+  const assetPath = trimOrEmpty(payload.assetPath);
+  const scenePath = trimOrEmpty(payload.scenePath);
+  const objectPath = trimOrEmpty(payload.objectPath);
+  const parsedSceneObject = parseSceneObjectAssetPath(assetPath);
+  const resolvedScenePath = scenePath || parsedSceneObject?.scenePath || "";
+  const resolvedObjectPath = objectPath || parsedSceneObject?.objectPath || "";
+
+  if (
+    payload.kind === "sceneObject" ||
+    (!!scenePath && !!objectPath) ||
+    (!!parsedSceneObject && payload.kind !== "asset")
+  ) {
+    return {
+      kind: "sceneObject",
+      scenePath: resolvedScenePath,
+      objectPath: resolvedObjectPath,
+    };
+  }
+
+  return { assetPath };
+}
+
+function hasValidPayload(payload: LocusAssetInspectorWindowPayload): boolean {
+  if (payload.kind === "sceneObject") {
+    return !!trimOrEmpty(payload.scenePath) && !!trimOrEmpty(payload.objectPath);
+  }
+  return !!trimOrEmpty(payload.assetPath);
 }
 
 export function isLocusAssetInspectorWindowLocation(
@@ -26,18 +66,29 @@ export function getLocusAssetInspectorWindowPayload(
   search = window.location.search,
 ): LocusAssetInspectorWindowPayload {
   const params = new URLSearchParams(search);
-  return {
-    assetPath: trimOrEmpty(params.get("assetPath")),
-  };
+  const kind = params.get("kind");
+  return normalizePayload({
+    kind: kind === "sceneObject" || kind === "asset" ? kind : undefined,
+    assetPath: params.get("assetPath") ?? undefined,
+    scenePath: params.get("scenePath") ?? undefined,
+    objectPath: params.get("objectPath") ?? undefined,
+  });
 }
 
 export function buildLocusAssetInspectorWindowUrl(
   payload: LocusAssetInspectorWindowPayload,
 ): string {
+  const nextPayload = normalizePayload(payload);
   const params = new URLSearchParams({
     [LOCUS_ASSET_INSPECTOR_WINDOW_FLAG]: "1",
-    assetPath: trimOrEmpty(payload.assetPath),
   });
+  if (nextPayload.kind === "sceneObject") {
+    params.set("kind", "sceneObject");
+    params.set("scenePath", trimOrEmpty(nextPayload.scenePath));
+    params.set("objectPath", trimOrEmpty(nextPayload.objectPath));
+  } else {
+    params.set("assetPath", trimOrEmpty(nextPayload.assetPath));
+  }
   return `${LOCUS_ASSET_INSPECTOR_WINDOW_PATH}?${params.toString()}`;
 }
 
@@ -46,10 +97,8 @@ export async function openLocusAssetInspectorWindow(
 ): Promise<boolean> {
   if (!hasTauriWindowRuntime()) return false;
 
-  const nextPayload = {
-    assetPath: trimOrEmpty(payload.assetPath),
-  };
-  if (!nextPayload.assetPath) return false;
+  const nextPayload = normalizePayload(payload);
+  if (!hasValidPayload(nextPayload)) return false;
 
   const existingWindow = await WebviewWindow.getByLabel(LOCUS_ASSET_INSPECTOR_WINDOW_LABEL);
   if (existingWindow) {

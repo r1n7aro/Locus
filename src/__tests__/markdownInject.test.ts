@@ -433,11 +433,15 @@ describe("injectUnityPropertyFenceRefs", () => {
     ].join("\n"));
 
     expect(result.issues).toHaveLength(0);
+    expect(result.entries[0]?.objectLabel).toBe("Config");
+    expect(result.entries[0]?.objectTitle).toBe("Assets/Data/Config.asset");
     expect(result.entries[0]?.target).toEqual({
       kind: "asset",
       path: "Assets/Data/Config.asset",
       propertyPath: "m_Name",
     });
+    expect(result.entries[1]?.objectLabel).toBe("Player");
+    expect(result.entries[1]?.objectTitle).toBe("Assets/Scenes/Main.unity/Player");
     expect(result.entries[1]?.target).toEqual({
       kind: "component",
       scenePath: "Assets/Scenes/Main.unity",
@@ -446,6 +450,8 @@ describe("injectUnityPropertyFenceRefs", () => {
       componentIndex: 0,
       propertyPath: "m_LocalPosition",
     });
+    expect(result.entries[2]?.objectLabel).toBe("Body");
+    expect(result.entries[2]?.objectTitle).toBe("Assets/Prefabs/Enemy.prefab/Body");
     expect(result.entries[2]?.target).toEqual({
       kind: "component",
       path: "Assets/Prefabs/Enemy.prefab",
@@ -487,6 +493,8 @@ describe("injectUnityPropertyFenceRefs", () => {
     ]));
 
     expect(result.issues).toHaveLength(0);
+    expect(result.entries[0]?.objectLabel).toBe("Player");
+    expect(result.entries[0]?.objectTitle).toBe("Assets/Scenes/Main.unity/Player");
     expect(result.entries[0]?.target).toEqual({
       kind: "gameObject",
       scenePath: "Assets/Scenes/Main.unity",

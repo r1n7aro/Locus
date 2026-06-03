@@ -173,7 +173,7 @@
     },
     {
       "path": "src/components/unity/UnityObjectReferenceField.vue",
-      "bytes": 13684
+      "bytes": 15182
     },
     {
       "path": "src/components/unity/UnityPropertyDraw.vue",
@@ -293,7 +293,7 @@
     },
     {
       "path": "src/services/unityObjectReferencePicker.ts",
-      "bytes": 11474
+      "bytes": 12696
     },
     {
       "path": "src/services/propertyTree.ts",

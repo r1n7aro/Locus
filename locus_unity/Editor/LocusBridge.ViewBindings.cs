@@ -26,6 +26,9 @@ namespace Locus
             public long targetFileId;
             public string componentType;
             public int componentIndex;
+            public string targetTypeFullName;
+            public string targetTypeAssembly;
+            public string targetTypeName;
             public string propertyPath;
         }
 
@@ -269,7 +272,7 @@ namespace Locus
                     {
                         index = i,
                         bindingId = write.bindingId,
-                        target = write.target,
+                        target = ViewBindingTargetWithLocalFileIds(write.target, obj),
                         valueJson = write.valueJson,
                         mode = write.mode,
                         obj = obj
@@ -391,6 +394,7 @@ namespace Locus
         private static string ReadViewBinding(string bindingId, ViewBindingTarget target, int maxDepth = 0, int maxArrayItems = 0)
         {
             UnityEngine.Object obj = ResolveViewBindingObject(target);
+            target = ViewBindingTargetWithLocalFileIds(target, obj);
             var serialized = new SerializedObject(obj);
             serialized.Update();
             if (string.IsNullOrWhiteSpace(target.propertyPath))
@@ -402,20 +406,22 @@ namespace Locus
                     obj,
                     depthLimit,
                     arrayLimit);
-                SerializedPropertySnapshot snapshot = properties.Length == 1
+                SerializedPropertySnapshot objectSnapshot = properties.Length == 1
                     ? properties[0]
                     : BuildViewBindingAggregateSnapshot(target, obj, properties);
-                return BuildBindingReadJson(bindingId, target, snapshot, false, properties.Length > 1 ? properties : null);
+                return BuildBindingReadJson(bindingId, target, objectSnapshot, false, properties.Length > 1 ? properties : null);
             }
             SerializedProperty prop = serialized.FindProperty(target.propertyPath);
             if (prop == null)
                 throw new Exception("SerializedProperty not found: " + target.propertyPath);
             int propertyDepthLimit = maxDepth > 0 ? Math.Min(maxDepth, 16) : 4;
             int propertyArrayLimit = maxArrayItems > 0 ? Math.Min(maxArrayItems, 512) : 64;
+            SerializedPropertySnapshot propertySnapshot = SnapshotSerializedProperty(prop, propertyDepthLimit, propertyArrayLimit);
+            ApplyViewBindingTargetToSnapshotTree(propertySnapshot, ToSerializedPropertyBindingTarget(target));
             return BuildBindingReadJson(
                 bindingId,
                 target,
-                SnapshotSerializedProperty(prop, propertyDepthLimit, propertyArrayLimit),
+                propertySnapshot,
                 false);
         }
 
@@ -619,6 +625,9 @@ namespace Locus
                 targetFileId = source.targetFileId,
                 componentType = source.componentType ?? "",
                 componentIndex = source.componentIndex,
+                targetTypeFullName = source.targetTypeFullName ?? "",
+                targetTypeAssembly = source.targetTypeAssembly ?? "",
+                targetTypeName = source.targetTypeName ?? "",
                 propertyPath = source.propertyPath ?? ""
             };
         }
@@ -690,8 +699,19 @@ namespace Locus
                 targetFileId = source.targetFileId,
                 componentType = source.componentType,
                 componentIndex = source.componentIndex,
+                targetTypeFullName = source.targetTypeFullName,
+                targetTypeAssembly = source.targetTypeAssembly,
+                targetTypeName = source.targetTypeName,
                 propertyPath = source.propertyPath
             };
+
+            Type objectType = obj != null ? obj.GetType() : null;
+            if (objectType != null)
+            {
+                target.targetTypeFullName = FieldTypeFullName(objectType);
+                target.targetTypeAssembly = FieldTypeAssembly(objectType);
+                target.targetTypeName = objectType.Name ?? "";
+            }
 
             long objectFileId;
             GameObject go = obj as GameObject;
@@ -728,6 +748,9 @@ namespace Locus
                 targetFileId = source.targetFileId,
                 componentType = "",
                 componentIndex = 0,
+                targetTypeFullName = source.targetTypeFullName,
+                targetTypeAssembly = source.targetTypeAssembly,
+                targetTypeName = source.targetTypeName,
                 propertyPath = ""
             };
         }
@@ -747,6 +770,9 @@ namespace Locus
                 targetFileId = 0,
                 componentType = componentType,
                 componentIndex = componentIndex,
+                targetTypeFullName = "",
+                targetTypeAssembly = "",
+                targetTypeName = "",
                 propertyPath = ""
             };
         }
@@ -765,6 +791,9 @@ namespace Locus
                 targetFileId = source.targetFileId,
                 componentType = source.componentType ?? "",
                 componentIndex = source.componentIndex,
+                targetTypeFullName = source.targetTypeFullName ?? "",
+                targetTypeAssembly = source.targetTypeAssembly ?? "",
+                targetTypeName = source.targetTypeName ?? "",
                 propertyPath = source.propertyPath ?? ""
             };
         }
@@ -1697,6 +1726,12 @@ namespace Locus
             bool saved)
         {
             SerializedPropertySnapshot snapshot = SnapshotSerializedProperty(prop);
+            UnityEngine.Object obj = prop != null && prop.serializedObject != null
+                ? prop.serializedObject.targetObject
+                : null;
+            if (obj != null)
+                target = ViewBindingTargetWithLocalFileIds(target, obj);
+            ApplyViewBindingTargetToSnapshotTree(snapshot, ToSerializedPropertyBindingTarget(target));
             return BuildBindingReadJson(bindingId, target, snapshot, saved);
         }
 
@@ -1777,6 +1812,9 @@ namespace Locus
                    "\"targetFileId\":" + NullableJsonLong(target.targetFileId) + "," +
                    "\"componentType\":" + NullableJsonString(target.componentType) + "," +
                    "\"componentIndex\":" + target.componentIndex.ToString(CultureInfo.InvariantCulture) + "," +
+                   "\"targetTypeFullName\":" + NullableJsonString(target.targetTypeFullName) + "," +
+                   "\"targetTypeAssembly\":" + NullableJsonString(target.targetTypeAssembly) + "," +
+                   "\"targetTypeName\":" + NullableJsonString(target.targetTypeName) + "," +
                    "\"propertyPath\":" + NullableJsonString(target.propertyPath) +
                    "}";
         }

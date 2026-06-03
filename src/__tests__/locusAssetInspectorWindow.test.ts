@@ -32,6 +32,8 @@ import {
 
 describe("locusAssetInspectorWindow", () => {
   const assetPath = "Assets/Prefabs/Characters/NPCs_BasePrefabs/Gluecose.prefab";
+  const scenePath = "Assets/Scenes/WIP/TestingGround.unity";
+  const objectPath = "BardHare/DialogueShot/cm[1]";
 
   beforeEach(() => {
     webviewWindowMocks.getByLabelMock.mockReset();
@@ -57,6 +59,34 @@ describe("locusAssetInspectorWindow", () => {
     expect(getLocusAssetInspectorWindowPayload(url.slice(url.indexOf("?"))).assetPath).toBe(assetPath);
   });
 
+  it("builds and parses scene object URLs for the dedicated inspector window", () => {
+    const url = buildLocusAssetInspectorWindowUrl({
+      kind: "sceneObject",
+      scenePath,
+      objectPath,
+    });
+
+    const payload = getLocusAssetInspectorWindowPayload(url.slice(url.indexOf("?")));
+    expect(url).toContain("kind=sceneObject");
+    expect(payload).toEqual({
+      kind: "sceneObject",
+      scenePath,
+      objectPath,
+    });
+  });
+
+  it("normalizes full scene object paths passed through assetPath", () => {
+    const url = buildLocusAssetInspectorWindowUrl({
+      assetPath: `${scenePath}/${objectPath}`,
+    });
+
+    expect(getLocusAssetInspectorWindowPayload(url.slice(url.indexOf("?")))).toEqual({
+      kind: "sceneObject",
+      scenePath,
+      objectPath,
+    });
+  });
+
   it("focuses an existing inspector window and sends the next asset path", async () => {
     const existingWindow = {
       emit: vi.fn(),
@@ -69,6 +99,31 @@ describe("locusAssetInspectorWindow", () => {
     expect(existingWindow.emit).toHaveBeenCalledWith(
       LOCUS_ASSET_INSPECTOR_WINDOW_EVENT,
       { assetPath },
+    );
+    expect(existingWindow.setFocus).toHaveBeenCalledTimes(1);
+    expect(webviewWindowMocks.createdWindows).toHaveLength(0);
+  });
+
+  it("focuses an existing inspector window and sends the next scene object target", async () => {
+    const existingWindow = {
+      emit: vi.fn(),
+      setFocus: vi.fn(),
+    };
+    webviewWindowMocks.getByLabelMock.mockResolvedValue(existingWindow);
+
+    await openLocusAssetInspectorWindow({
+      kind: "sceneObject",
+      scenePath,
+      objectPath,
+    });
+
+    expect(existingWindow.emit).toHaveBeenCalledWith(
+      LOCUS_ASSET_INSPECTOR_WINDOW_EVENT,
+      {
+        kind: "sceneObject",
+        scenePath,
+        objectPath,
+      },
     );
     expect(existingWindow.setFocus).toHaveBeenCalledTimes(1);
     expect(webviewWindowMocks.createdWindows).toHaveLength(0);

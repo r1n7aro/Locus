@@ -62,6 +62,9 @@ namespace Locus
             public long targetFileId;
             public string componentType;
             public int componentIndex;
+            public string targetTypeFullName;
+            public string targetTypeAssembly;
+            public string targetTypeName;
             public string propertyPath;
         }
 

@@ -355,9 +355,14 @@ const assetRefContextCanOpenInEditor = computed(() => {
   return !!target && !(target.kind === "knowledge" || (target.kind === "file" && target.entryKind === "folder"));
 });
 
-const assetRefContextCanOpenLocusInspector = computed(() =>
-  assetRefCtxMenu.value?.target.kind === "asset",
-);
+const assetRefContextCanOpenLocusInspector = computed(() => {
+  const target = assetRefCtxMenu.value?.target;
+  if (!target) return false;
+  if (target.kind === "sceneObject") {
+    return shouldUseUnitySceneObjectRef(target.scenePath, target.objectPath);
+  }
+  return target.kind === "asset";
+});
 
 const assetRefContextSupportsUnity = computed(() => {
   const target = assetRefCtxMenu.value?.target;
@@ -786,9 +791,21 @@ async function doAssetRefOpenInEditor() {
 
 async function doAssetRefOpenInLocusInspector() {
   const target = assetRefCtxMenu.value?.target;
-  if (!target || target.kind !== "asset") return;
+  if (!target || !assetRefContextCanOpenLocusInspector.value) return;
   closeAssetRefContextMenu();
   try {
+    if (target.kind === "sceneObject") {
+      const opened = await openLocusAssetInspectorWindow({
+        kind: "sceneObject",
+        scenePath: target.scenePath,
+        objectPath: target.objectPath,
+      });
+      if (!opened) {
+        await openUnitySceneObjectInspector(target.scenePath, target.objectPath);
+      }
+      return;
+    }
+    if (target.kind !== "asset") return;
     const opened = await openLocusAssetInspectorWindow({ assetPath: target.assetPath });
     if (!opened) {
       await openFileExternal(target.filePath);

@@ -17,17 +17,33 @@ import type {
   UnityObjectPreviewSourceState,
 } from "./unity-preview/unityObjectPreview";
 
-const assetPath = ref("");
+type LocusInspectorTarget =
+  | {
+      kind: "asset";
+      path: string;
+    }
+  | {
+      kind: "sceneObject";
+      path: string;
+      scenePath: string;
+      objectPath: string;
+    };
+
+const inspectorTarget = ref<LocusInspectorTarget | null>(null);
 const inspectorSourceState = ref<UnityObjectPreviewSourceState>("disk");
 let unlistenPayload: UnlistenFn | null = null;
 
+const targetPath = computed(() => inspectorTarget.value?.path ?? "");
 const selectedName = computed(() => {
-  const segments = assetPath.value.split("/").filter(Boolean);
+  const path = inspectorTarget.value?.kind === "sceneObject"
+    ? inspectorTarget.value.objectPath
+    : targetPath.value;
+  const segments = path.split("/").filter(Boolean);
   return segments[segments.length - 1] || LOCUS_ASSET_INSPECTOR_WINDOW_TITLE;
 });
 const previewModel = computed<UnityObjectPreviewInput>(() => ({
-  kind: "asset",
-  path: assetPath.value,
+  kind: inspectorTarget.value?.kind ?? "asset",
+  path: targetPath.value,
   title: selectedName.value,
   writable: true,
   capabilities: {
@@ -39,7 +55,7 @@ const previewModel = computed<UnityObjectPreviewInput>(() => ({
   },
 }));
 const inspectorSourceBadgeState = computed(() => {
-  if (!assetPath.value) return "disk";
+  if (!targetPath.value) return "disk";
   return inspectorSourceState.value;
 });
 const inspectorSourceLabel = computed(() => {
@@ -58,8 +74,22 @@ function normalizeAssetPath(value: string | null | undefined): string {
 }
 
 function applyWindowPayload(next: LocusAssetInspectorWindowPayload) {
-  assetPath.value = normalizeAssetPath(next.assetPath);
-  inspectorSourceState.value = assetPath.value ? "loading" : "disk";
+  const assetPath = normalizeAssetPath(next.assetPath);
+  const scenePath = normalizeAssetPath(next.scenePath);
+  const objectPath = normalizeAssetPath(next.objectPath);
+  if (next.kind === "sceneObject" && scenePath && objectPath) {
+    inspectorTarget.value = {
+      kind: "sceneObject",
+      path: `${scenePath}/${objectPath}`,
+      scenePath,
+      objectPath,
+    };
+  } else {
+    inspectorTarget.value = assetPath
+      ? { kind: "asset", path: assetPath }
+      : null;
+  }
+  inspectorSourceState.value = targetPath.value ? "loading" : "disk";
 }
 
 function handlePreviewSourceChange(state: UnityObjectPreviewSourceState) {
@@ -95,7 +125,7 @@ onUnmounted(() => {
     <div class="locus-asset-inspector-titlebar">
       <div class="locus-asset-inspector-title">
         <span class="locus-asset-inspector-title-main">{{ t("asset.inspector.windowTitle") }}</span>
-        <span class="locus-asset-inspector-title-path" :title="assetPath">{{ assetPath }}</span>
+        <span class="locus-asset-inspector-title-path" :title="targetPath">{{ targetPath }}</span>
       </div>
       <span
         class="locus-asset-inspector-source"
@@ -117,12 +147,12 @@ onUnmounted(() => {
     </div>
 
     <div class="locus-asset-inspector-preview">
-      <div v-if="!assetPath" class="locus-asset-inspector-state">
+      <div v-if="!targetPath" class="locus-asset-inspector-state">
         {{ t("asset.inspector.missingAsset") }}
       </div>
       <UnityObjectPreview
         v-else
-        :key="assetPath"
+        :key="`${previewModel.kind}:${targetPath}`"
         :model="previewModel"
         level="inspector"
         :auto-load-preview="true"

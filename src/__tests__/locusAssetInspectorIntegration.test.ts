@@ -20,6 +20,9 @@ describe("Locus asset inspector integration", () => {
     expect(chat).toContain("openLocusAssetInspectorWindow");
     expect(chat).toContain("assetRefContextCanOpenLocusInspector");
     expect(chat).toContain("doAssetRefOpenInLocusInspector");
+    expect(chat).toContain('target.kind === "sceneObject"');
+    expect(chat).toContain('kind: "sceneObject"');
+    expect(chat).toContain("openUnitySceneObjectInspector(target.scenePath, target.objectPath)");
     expect(chat).toContain(".unity-object-identity[data-unity-ref-kind]");
     expect(chat).toContain('t("common.openInLocusInspector")');
     const selectInUnityIndex = chat.indexOf('t("common.selectInUnity")');
@@ -31,6 +34,9 @@ describe("Locus asset inspector integration", () => {
     expect(app).toContain("const LocusAssetInspectorWindow = defineAsyncComponent");
     expect(app).toContain("<LocusAssetInspectorWindow v-else-if=\"isLocusAssetInspectorWindow\" />");
     expect(windowComponent).toContain("UnityObjectPreview");
+    expect(windowComponent).toContain('kind: "sceneObject"');
+    expect(windowComponent).toContain("scenePath");
+    expect(windowComponent).toContain("objectPath");
     expect(windowComponent).toContain('level="inspector"');
     expect(windowComponent).toContain(":auto-load-preview=\"true\"");
     expect(windowComponent).toContain("@source-change=\"handlePreviewSourceChange\"");

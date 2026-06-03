@@ -868,6 +868,13 @@ function commitManagedType(event: Event) {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.property-name {
+  color: var(--text-color);
+}
+
+.property-type {
   color: var(--text-secondary);
 }
 
@@ -878,7 +885,7 @@ function commitManagedType(event: Event) {
   border: 0;
   border-radius: 0;
   background: transparent;
-  color: var(--text-secondary);
+  color: var(--text-color);
   font: inherit;
   text-align: left;
   cursor: ew-resize;

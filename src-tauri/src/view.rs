@@ -465,6 +465,12 @@ pub struct ViewBindingTarget {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub component_index: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_type_full_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_type_assembly: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_type_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub property_path: Option<String>,
 }
 
@@ -7195,6 +7201,9 @@ mod tests {
                 target_file_id: None,
                 component_type: None,
                 component_index: None,
+                target_type_full_name: None,
+                target_type_assembly: None,
+                target_type_name: None,
                 property_path: Some("m_Name".to_string()),
             }
         );
@@ -7270,6 +7279,9 @@ mod tests {
             target_file_id: None,
             component_type: Some("Game.Settings".to_string()),
             component_index: Some(0),
+            target_type_full_name: None,
+            target_type_assembly: None,
+            target_type_name: None,
             property_path: None,
         };
 

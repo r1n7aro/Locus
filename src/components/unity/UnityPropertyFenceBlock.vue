@@ -6,7 +6,8 @@ import {
   type UnityPropertyFenceEntry,
   type UnityPropertyFenceIssue,
 } from "../../composables/unityPropertyFence";
-import { normalizeAppError } from "../../services/errors";
+import { t } from "../../i18n";
+import { isUnityConnectionError, normalizeAppError } from "../../services/errors";
 import {
   readUnitySerializedProperty,
   writeUnitySerializedProperty,
@@ -77,7 +78,7 @@ async function loadProperty(entry: UnityPropertyFenceEntry, run = loadRun) {
     if (run !== loadRun) return;
     patchRow(entry.id, {
       loading: false,
-      error: normalizeAppError(error).message,
+      error: unityPropertyErrorMessage(error),
       property: null,
     });
   }
@@ -131,9 +132,16 @@ async function commitProperty(row: PropertyRow, event: UnitySerializedPropertyCo
   } catch (error) {
     patchRow(row.entry.id, {
       saving: false,
-      error: normalizeAppError(error).message,
+      error: unityPropertyErrorMessage(error),
     });
   }
+}
+
+function unityPropertyErrorMessage(error: unknown): string {
+  const normalized = normalizeAppError(error);
+  return isUnityConnectionError(normalized)
+    ? t("asset.preview.unityConnectionRequired")
+    : normalized.message;
 }
 
 function targetMeta(target: UnitySerializedPropertyTarget): string {
@@ -141,10 +149,26 @@ function targetMeta(target: UnitySerializedPropertyTarget): string {
     const index = Number.isFinite(target.componentIndex) && Number(target.componentIndex) > 0
       ? `[${target.componentIndex}]`
       : "";
-    return `${target.componentType || "Component"}${index}`;
+    return `${shortTypeName(target.componentType || "Component")}${index}`;
   }
   if (target.kind === "gameObject") return "GameObject";
+  const targetType = shortTypeName(target.targetTypeName || target.targetTypeFullName || "");
+  if (targetType) return targetType;
   return target.kind || "Unity";
+}
+
+function rowTarget(row: PropertyRow): UnitySerializedPropertyTarget {
+  return row.property?.target ?? row.property?.bindingTarget ?? row.entry.target;
+}
+
+function shortTypeName(typeName: string): string {
+  const normalized = typeName.trim();
+  if (!normalized) return "";
+  const withoutAssembly = normalized.includes(",")
+    ? normalized.slice(0, normalized.indexOf(",")).trim()
+    : normalized;
+  const dot = withoutAssembly.lastIndexOf(".");
+  return dot >= 0 ? withoutAssembly.slice(dot + 1) : withoutAssembly;
 }
 </script>
 
@@ -183,11 +207,11 @@ function targetMeta(target: UnitySerializedPropertyTarget): string {
         :class="{ saving: row.saving }"
       >
         <div class="unity-property-context">
-          <div class="unity-property-object" :title="row.entry.objectLabel">
+          <div class="unity-property-object" :title="row.entry.objectTitle || row.entry.objectLabel">
             {{ row.entry.objectLabel }}
           </div>
           <div class="unity-property-target" :title="row.entry.target.propertyPath || row.entry.propertyLabel">
-            {{ targetMeta(row.entry.target) }}
+            {{ targetMeta(rowTarget(row)) }}
           </div>
         </div>
 

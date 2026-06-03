@@ -255,6 +255,9 @@ export interface ViewBindingTarget {
   targetFileId?: number | null;
   componentType?: string | null;
   componentIndex?: number | null;
+  targetTypeFullName?: string | null;
+  targetTypeAssembly?: string | null;
+  targetTypeName?: string | null;
   propertyPath?: string | null;
 }
 

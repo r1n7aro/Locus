@@ -6,6 +6,7 @@ export interface UnityPropertyFenceEntry {
   source: string;
   target: UnitySerializedPropertyTarget;
   objectLabel: string;
+  objectTitle: string;
   propertyLabel: string;
 }
 
@@ -143,7 +144,8 @@ function entryFromJsonItem(
     line,
     source,
     target,
-    objectLabel: label || targetObjectLabel(target),
+    objectLabel: label || targetObjectDisplayLabel(target),
+    objectTitle: targetObjectTitle(target) || label || targetObjectDisplayLabel(target),
     propertyLabel: label || propertyPathLeaf(target.propertyPath || ""),
   });
 }
@@ -237,7 +239,8 @@ function entryFromCompactParts(
       line,
       source,
       target,
-      objectLabel: objectPath.rawPath,
+      objectLabel: unityObjectDisplayName(objectPath),
+      objectTitle: objectPath.rawPath,
       propertyLabel: selector.propertyPath,
     }),
   };
@@ -418,6 +421,37 @@ function targetObjectLabel(target: UnitySerializedPropertyTarget): string {
     return [target.scenePath, target.objectPath].filter(Boolean).join("/");
   }
   return target.path || target.kind;
+}
+
+function targetObjectTitle(target: UnitySerializedPropertyTarget): string {
+  return targetObjectLabel(target);
+}
+
+function targetObjectDisplayLabel(target: UnitySerializedPropertyTarget): string {
+  const objectPath = (target.objectPath || "").trim();
+  if (objectPath) return objectPathLeaf(objectPath);
+  const path = (target.path || target.scenePath || "").trim();
+  if (path) return assetNameFromPath(path);
+  return target.kind || "Unity";
+}
+
+function unityObjectDisplayName(path: UnityObjectPathParts): string {
+  if (path.objectPath) return objectPathLeaf(path.objectPath);
+  if (path.assetPath) return assetNameFromPath(path.assetPath);
+  if (path.scenePath) return assetNameFromPath(path.scenePath);
+  return assetNameFromPath(path.rawPath);
+}
+
+function objectPathLeaf(path: string): string {
+  const normalized = path.replace(/\/+$/g, "");
+  const slash = normalized.lastIndexOf("/");
+  return slash >= 0 ? normalized.slice(slash + 1) : normalized;
+}
+
+function assetNameFromPath(path: string): string {
+  const leaf = objectPathLeaf(path);
+  const dot = leaf.lastIndexOf(".");
+  return dot > 0 ? leaf.slice(0, dot) : leaf;
 }
 
 function propertyPathLeaf(propertyPath: string): string {

@@ -34,12 +34,18 @@ export interface UnityObjectReferenceTypeRule {
   queryText?: string;
   extensions?: string[];
   kinds?: string[];
+  assetTypeNames?: string[];
   subAssetTypeNames?: string[];
   requireSubAsset?: boolean;
   mainAssetOnly?: boolean;
   scriptableObject?: boolean;
   component?: boolean;
   broad?: boolean;
+}
+
+export interface UnityObjectReferenceDisplayParts {
+  name: string;
+  path: string;
 }
 
 const AUDIO_EXTENSIONS = ["wav", "mp3", "ogg", "aif", "aiff"];
@@ -126,6 +132,13 @@ const TYPE_RULES: UnityObjectReferenceTypeRule[] = [
     queryType: "audio",
     extensions: AUDIO_EXTENSIONS,
     kinds: ["audio"],
+  },
+  {
+    typeNames: ["audioresource"],
+    queryType: "AudioResource",
+    extensions: [...AUDIO_EXTENSIONS, "asset"],
+    kinds: ["audio", "genericAsset"],
+    assetTypeNames: ["audioresource", "audiorandomcontainer", "audioclip"],
   },
   {
     typeNames: ["font"],
@@ -263,9 +276,14 @@ const TYPE_RULES: UnityObjectReferenceTypeRule[] = [
     subAssetTypeNames: ["mesh"],
   },
   {
-    typeNames: ["physicmaterial", "physicsmaterial", "physicmaterial2d", "physicsmaterial2d"],
-    queryType: "physicmaterial",
-    extensions: ["physicmaterial", "physicsmaterial", "physicsmaterial2d"],
+    typeNames: ["physicsmaterial", "physicmaterial", "physicalmaterial"],
+    queryType: "PhysicsMaterial",
+    extensions: ["physicsmaterial", "physicmaterial"],
+  },
+  {
+    typeNames: ["physicsmaterial2d", "physicmaterial2d", "physicalmaterial2d"],
+    queryType: "PhysicsMaterial2D",
+    extensions: ["physicsmaterial2d"],
   },
   {
     typeNames: ["flare"],
@@ -453,6 +471,18 @@ export function normalizeUnityObjectReferencePath(path: string): string {
   return path.trim().replace(/\\/g, "/");
 }
 
+export function unityObjectReferenceDisplayParts(value: string): UnityObjectReferenceDisplayParts {
+  const path = normalizeUnityObjectReferencePath(value);
+  const trimmed = path.replace(/\/+$/, "");
+  const parts = trimmed.split("/").filter(Boolean);
+  const name = parts[parts.length - 1] || path;
+  const parentPath = parts.slice(0, -1).join("/");
+  return {
+    name,
+    path: parentPath,
+  };
+}
+
 function unityObjectReferenceBasePath(path: string): string {
   return normalizeUnityObjectReferencePath(path).split(/[?#]/)[0] || "";
 }
@@ -505,6 +535,22 @@ function resultSubAssetTypeMatches(result: AssetSearchResult, typeNames: readonl
   });
 }
 
+function resultAssetTypeMatches(result: AssetSearchResult, typeNames: readonly string[] = []): boolean {
+  if (typeNames.length === 0) return true;
+  const ext = unityObjectReferenceExtension(result.path);
+  const kind = (result.kind || "").toLowerCase();
+  if (ext !== "asset" && kind !== "genericasset") return true;
+  const typeLabel = normalizeSearchText(result.typeLabel || "");
+  const typeSearch = normalizeSearchText(result.typeSearch || "");
+  const text = normalizeSearchText(resultTypeText(result));
+  return typeNames.some((typeName) => {
+    const expected = normalizeSearchText(typeName);
+    return (typeLabel && (typeLabel === expected || typeLabel.includes(expected)))
+      || (typeSearch && (typeSearch === expected || typeSearch.includes(expected)))
+      || text.includes(expected);
+  });
+}
+
 function resultTypeText(result: AssetSearchResult): string {
   return [
     result.name,
@@ -539,6 +585,7 @@ export function isUnityObjectReferenceSearchResult(
   if (rule.requireSubAsset) return subAssetTypeMatch;
   if (result.isSubAsset && (rule.subAssetTypeNames?.length ?? 0) > 0) return subAssetTypeMatch;
   if (subAssetTypeMatch) return true;
+  if (!resultAssetTypeMatches(result, rule.assetTypeNames)) return false;
   const extensions = rule.extensions ?? [];
   const kinds = rule.kinds ?? [];
   const pathMatch = matchesExt(result.path, extensions);

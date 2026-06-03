@@ -27,6 +27,11 @@ export interface UnityObjectReferenceTypeRule {
   broad?: boolean;
 }
 
+export interface UnityObjectReferenceDisplayParts {
+  name: string;
+  path: string;
+}
+
 const AUDIO_EXTENSIONS = ["wav", "mp3", "ogg", "aif", "aiff"];
 const TEXTURE_EXTENSIONS = [
   "png",
@@ -238,6 +243,18 @@ export function unityObjectReferenceSearchQuery(
 
 export function normalizeUnityObjectReferencePath(path: string): string {
   return path.trim().replace(/\\/g, "/");
+}
+
+export function unityObjectReferenceDisplayParts(value: string): UnityObjectReferenceDisplayParts {
+  const path = normalizeUnityObjectReferencePath(value);
+  const trimmed = path.replace(/\/+$/, "");
+  const parts = trimmed.split("/").filter(Boolean);
+  const name = parts[parts.length - 1] || path;
+  const parentPath = parts.slice(0, -1).join("/");
+  return {
+    name,
+    path: parentPath,
+  };
 }
 
 function unityObjectReferenceBasePath(path: string): string {
