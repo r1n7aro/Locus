@@ -107,6 +107,7 @@ export function useAppBootstrap() {
   let unlistenLexicalRebuildStatus: RuntimeUnsubscribe | null = null;
   let unlistenKnowledgeChanged: RuntimeUnsubscribe | null = null;
   let unlistenSessionContentChanged: RuntimeUnsubscribe | null = null;
+  let unlistenPluginsChanged: RuntimeUnsubscribe | null = null;
   let lastAutoOpenedLexicalProgressRun = "";
 
   // -- Cross-domain watchers --
@@ -155,6 +156,8 @@ export function useAppBootstrap() {
       source === "knowledge_edit" ||
       source === "knowledge_move" ||
       source === "knowledge_delete" ||
+      source === "plugin_install" ||
+      source === "plugin_uninstall" ||
       source === "undo_perform"
     );
   }
@@ -502,6 +505,9 @@ export function useAppBootstrap() {
       "session-content-changed",
       handleSessionContentChanged,
     );
+    unlistenPluginsChanged = await runtime.subscribe<void>("plugins-changed", () => {
+      void agentStore.loadAgents();
+    });
     markStartupPhase("register_listeners_subscriptions_ready");
 
     // Initial Unity/AssetDb state
@@ -525,6 +531,7 @@ export function useAppBootstrap() {
     unlistenLexicalRebuildStatus?.();
     unlistenKnowledgeChanged?.();
     unlistenSessionContentChanged?.();
+    unlistenPluginsChanged?.();
     lastAutoOpenedLexicalProgressRun = "";
     resetSystemNotificationState();
     uiStore.cleanup();
@@ -556,6 +563,9 @@ export function useAppBootstrap() {
           target: path,
         }),
         measureWorkspaceSwitchAsync("load_recent_dirs", () => projectStore.loadRecentDirs(), {
+          target: path,
+        }),
+        measureWorkspaceSwitchAsync("load_agents", () => agentStore.loadAgents(), {
           target: path,
         }),
         measureWorkspaceSwitchAsync(
@@ -602,6 +612,7 @@ export function useAppBootstrap() {
     modelStore.resolveSelectedModel(true);
     await Promise.all([
       chatStore.refreshSessions(),
+      agentStore.loadAgents(),
       projectStore.loadWorkingDir(),
       projectStore.loadRecentDirs(),
       projectStore.checkUnityConnection(),

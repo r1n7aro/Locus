@@ -67,6 +67,9 @@ export interface ViewPackageSummary {
   capabilities: ViewCapabilities;
   requirements: ViewRequirements;
   temporary?: boolean;
+  source?: string;
+  pluginId?: string | null;
+  pluginScope?: "app" | "project" | string | null;
 }
 
 export interface ViewFolderSummary {
@@ -248,6 +251,8 @@ export interface ViewBindingTarget {
   path?: string | null;
   scenePath?: string | null;
   objectPath?: string | null;
+  objectFileId?: number | null;
+  targetFileId?: number | null;
   componentType?: string | null;
   componentIndex?: number | null;
   propertyPath?: string | null;
@@ -266,6 +271,12 @@ export interface ViewEnumOption {
   name: string;
   index: number;
   numericValue: number;
+}
+
+export interface ViewSerializedPropertyAttributeInfo {
+  type: string;
+  displayName: string;
+  value: string;
 }
 
 export interface ViewSerializedPropertySnapshot {
@@ -292,12 +303,26 @@ export interface ViewSerializedPropertySnapshot {
   managedReferenceFieldTypename: string;
   managedReferenceDisplayName: string;
   managedReferenceTypes: ViewManagedReferenceTypeOption[];
+  tooltip: string;
+  header: string;
+  hasRange: boolean;
+  rangeMin: number;
+  rangeMax: number;
+  numberStep: number;
+  multiline: boolean;
+  minLines: number;
+  maxLines: number;
+  referenceTypeFullName: string;
+  referenceTypeAssembly: string;
+  attributes: ViewSerializedPropertyAttributeInfo[];
 }
 
 export interface ViewBindingReadRequest {
   viewId: string;
   bindingId?: string | null;
   target?: ViewBindingTarget | null;
+  maxDepth?: number | null;
+  maxArrayItems?: number | null;
 }
 
 export interface ViewBindingDiscoverRequest {

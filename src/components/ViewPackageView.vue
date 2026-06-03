@@ -561,6 +561,7 @@ async function submitCreateFolder() {
 async function beginRenameFromContext() {
   const menu = contextMenu.value;
   if (!menu || menu.kind === "root") return;
+  if (!contextNodeEditable(menu.node)) return;
   closeCreateFolder();
   deleteConfirm.value = null;
   renameDraft.value = {
@@ -613,6 +614,7 @@ async function submitRename() {
 function requestDeleteEntry() {
   const menu = contextMenu.value;
   if (!menu || menu.kind === "root") return;
+  if (!contextNodeEditable(menu.node)) return;
   deleteConfirm.value = menu.node;
 }
 
@@ -648,8 +650,21 @@ function viewNodeParentRelPath(node: ViewTreeNode): string {
   return viewPathDirname(node.relPath);
 }
 
+function isPluginView(view: ViewPackageSummary | null | undefined): boolean {
+  return !!view?.pluginId || !!view?.source?.startsWith("plugin");
+}
+
+function nodeContainsPluginView(node: ViewTreeNode): boolean {
+  if (node.kind === "view") return isPluginView(node.view);
+  return node.children.some(nodeContainsPluginView);
+}
+
+function contextNodeEditable(node: ViewTreeNode): boolean {
+  return !nodeContainsPluginView(node);
+}
+
 function canDragNode(node: ViewTreeNode): boolean {
-  return !!node.relPath.trim();
+  return !!node.relPath.trim() && contextNodeEditable(node);
 }
 
 function canPlaceNodeInDir(node: ViewTreeNode | null, targetDirRelPath: string): boolean {
@@ -1534,14 +1549,23 @@ onUnmounted(() => {
               <div class="view-ctx-sep"></div>
             </template>
             <button
-              v-if="contextMenu.kind === 'folder' || contextMenu.kind === 'view'"
+              v-if="
+                (contextMenu.kind === 'folder' || contextMenu.kind === 'view') &&
+                contextNodeEditable(contextMenu.node)
+              "
               type="button"
               class="view-ctx-item"
               @click.stop="beginRenameFromContext"
             >
               {{ t("view.tree.rename") }}
             </button>
-            <div v-if="contextMenu.kind === 'folder' || contextMenu.kind === 'view'" class="view-ctx-sep"></div>
+            <div
+              v-if="
+                (contextMenu.kind === 'folder' || contextMenu.kind === 'view') &&
+                contextNodeEditable(contextMenu.node)
+              "
+              class="view-ctx-sep"
+            ></div>
             <button
               v-if="contextMenu.kind === 'view'"
               type="button"
@@ -1565,7 +1589,10 @@ onUnmounted(() => {
             </button>
             <div v-if="contextMenu.kind === 'view'" class="view-ctx-sep"></div>
             <button
-              v-if="contextMenu.kind === 'folder' || contextMenu.kind === 'view'"
+              v-if="
+                (contextMenu.kind === 'folder' || contextMenu.kind === 'view') &&
+                contextNodeEditable(contextMenu.node)
+              "
               type="button"
               class="view-ctx-item danger"
               @click.stop="requestDeleteEntry"

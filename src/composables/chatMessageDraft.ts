@@ -187,7 +187,11 @@ function normalizeConsoleText(value: unknown): UserMessageDraftConsoleText | nul
 
 function normalizeSkillIntent(value: unknown): SkillIntentItem | null {
   if (!isObject(value)) return null;
-  const source = value.source === "project" ? "project" : value.source === "app" ? "app" : null;
+  const source =
+    typeof value.source === "string" &&
+    ["app", "project", "pluginApp", "pluginProject"].includes(value.source)
+      ? value.source
+      : null;
   if (!source || typeof value.dirName !== "string" || typeof value.name !== "string") return null;
   const dirName = value.dirName.trim();
   const name = value.name.trim();

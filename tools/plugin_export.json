@@ -1,0 +1,86 @@
+{
+  "description": "Export an audited Locus plugin archive from existing Skill packages and Views. Use this only after the /create-plugin workflow has inspected the selected components, planned the plugin directory/manifest structure, classified project dependencies, and received explicit user approval for the export path. Do not use this as the first step or as a one-click export shortcut. The tool requires auditSummary, structurePlan, and userApproval so the tool call records the analysis that justified packaging.",
+  "parameters": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "id": {
+        "type": "string",
+        "description": "Plugin id, for example com.example.asset-tools. Use an author-owned namespace for published plugins."
+      },
+      "name": {
+        "type": "string",
+        "description": "Display name written to locus.plugin.json."
+      },
+      "version": {
+        "type": "string",
+        "description": "Plugin version written to locus.plugin.json, for example 0.1.0."
+      },
+      "filePath": {
+        "type": "string",
+        "description": "Absolute or workspace-resolved .zip output path approved by the user."
+      },
+      "skillPackageIds": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Existing Skill package ids to copy into skills/<package-id>. Markdown-only Skills are not valid here."
+      },
+      "viewIds": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Existing View ids to copy into views/<view-id>."
+      },
+      "projectDependencies": {
+        "type": "array",
+        "description": "Project dependencies that make this plugin project-dependent. Leave empty only after auditing that the plugin is project-independent.",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "type": "string",
+              "description": "Dependency kind, such as unityPackage, assembly, script, asset, or custom."
+            },
+            "name": {
+              "type": "string",
+              "description": "Concrete dependency name, type name, assembly name, package id, asset path, or script path."
+            },
+            "version": {
+              "type": ["string", "null"],
+              "description": "Optional dependency version."
+            },
+            "notes": {
+              "type": ["string", "null"],
+              "description": "Optional short note explaining why the dependency is required."
+            }
+          },
+          "required": ["kind", "name"]
+        }
+      },
+      "auditSummary": {
+        "type": "string",
+        "description": "Required summary of inspected files, completeness checks, project-dependency classification, plugin-managed source checks, and remaining risks."
+      },
+      "structurePlan": {
+        "type": "string",
+        "description": "Required planned plugin structure and manifest metadata, including components.skills/components.views layout and dependency metadata."
+      },
+      "userApproval": {
+        "type": "string",
+        "description": "Required user approval or direct user instruction authorizing this exact export after the audit and structure plan were presented."
+      }
+    },
+    "required": [
+      "id",
+      "name",
+      "version",
+      "filePath",
+      "skillPackageIds",
+      "viewIds",
+      "projectDependencies",
+      "auditSummary",
+      "structurePlan",
+      "userApproval"
+    ]
+  }
+}

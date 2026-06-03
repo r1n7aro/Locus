@@ -504,6 +504,7 @@ function parentDirectory(node: ExplorerNode): string {
 }
 
 function canDragNode(node: ExplorerNode): boolean {
+  if (isPluginManagedNode(node)) return false;
   if (node.kind === "document") return true;
   if (node.kind === "package") return false;
   return !!node.relativePath.trim();
@@ -614,18 +615,33 @@ function onTreeDrop(event: DragEvent) {
 function canDeleteFolder(
   menu: Extract<ContextMenuState, { kind: "folder" }>,
 ): boolean {
-  return menu.depth > 0;
+  return menu.depth > 0 && !menu.targetNodes.some(isPluginManagedNode);
+}
+
+function isPluginManagedNode(node: ExplorerNode): boolean {
+  if (node.kind === "package") {
+    return (
+      !!node.managedByPlugin ||
+      !!node.document.externalSource?.locator?.startsWith("plugin://")
+    );
+  }
+  if (node.kind === "document") {
+    return !!node.document.externalSource?.locator?.startsWith("plugin://");
+  }
+  return node.children.some(isPluginManagedNode);
+}
+
+function canDeleteContextTargets(
+  menu: Extract<ContextMenuState, { kind: "folder" | "leaf" | "package" }>,
+): boolean {
+  if (menu.targetNodes.some(isPluginManagedNode)) return false;
+  return menu.kind !== "folder" || menu.targetNodes.length > 1 || canDeleteFolder(menu);
 }
 
 function requestDeleteSelectedNodes() {
   const menu = ctxMenu.value;
   if (!menu || menu.kind === "root") return;
-  if (
-    menu.targetNodes.length === 1 &&
-    menu.kind === "folder" &&
-    !canDeleteFolder(menu)
-  )
-    return;
+  if (!canDeleteContextTargets(menu)) return;
   closeContextMenu();
   emit("requestDeleteNodes", menu.targetNodes);
 }
@@ -1329,10 +1345,7 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
               {{ t("knowledge.explorer.createDoc") }}
             </button>
             <button
-              v-if="
-                ctxMenu.kind === 'folder' &&
-                (ctxMenu.targetNodes.length > 1 || canDeleteFolder(ctxMenu))
-              "
+              v-if="ctxMenu.kind === 'folder' && canDeleteContextTargets(ctxMenu)"
               type="button"
               class="kx-ctx-item kx-ctx-item-danger"
               @click="requestDeleteSelectedNodes"
@@ -1366,6 +1379,7 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
               {{ t("knowledge.explorer.openInFileSystem") }}
             </button>
             <button
+              v-if="canDeleteContextTargets(ctxMenu)"
               type="button"
               class="kx-ctx-item kx-ctx-item-danger"
               @click="requestDeleteSelectedNodes"
@@ -1399,6 +1413,7 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
               {{ t("knowledge.explorer.openInFileSystem") }}
             </button>
             <button
+              v-if="canDeleteContextTargets(ctxMenu)"
               type="button"
               class="kx-ctx-item kx-ctx-item-danger"
               @click="requestDeleteSelectedNodes"

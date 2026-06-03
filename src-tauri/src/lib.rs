@@ -29,6 +29,7 @@ mod knowledge_watcher;
 mod llm;
 pub(crate) mod merge;
 pub mod network;
+pub mod plugin;
 pub mod process_util;
 pub mod prompt;
 pub mod python_runtime;
@@ -37,6 +38,7 @@ mod tool;
 pub mod unity_bridge;
 pub mod unity_csharp;
 mod unity_docs;
+pub mod unity_serialized_property;
 pub mod unity_type_index;
 pub mod unity_yaml;
 pub mod vcs;
@@ -189,6 +191,16 @@ fn install_main_tray(app: &mut tauri::App) -> tauri::Result<()> {
 
 #[derive(Clone)]
 pub struct AppAgentDir(pub Arc<Option<std::path::PathBuf>>);
+
+#[derive(Clone)]
+pub struct AgentDefRegistryState(pub Arc<tokio::sync::RwLock<AgentDefRegistry>>);
+
+impl AgentDefRegistryState {
+    pub async fn snapshot(&self) -> Arc<AgentDefRegistry> {
+        Arc::new(self.0.read().await.clone())
+    }
+}
+
 use asset_db::watcher::AssetDbWatcher;
 pub use asset_db::AssetDbState;
 use auth::codex::CodexAuthState;
@@ -473,10 +485,13 @@ pub fn run() {
                 None
             };
 
-            let registry = Arc::new(AgentDefRegistry::load(
+            let initial_registry = AgentDefRegistry::load_with_plugins(
                 app_agent_dir.0.as_deref(),
                 project_agent_opt,
-            ));
+                &crate::plugin::installed_agent_sources(&initial_working_dir_copy),
+            );
+            let initial_subagents = initial_registry.list_task_agent_descriptions();
+            let registry = AgentDefRegistryState(Arc::new(tokio::sync::RwLock::new(initial_registry)));
             startup_for_setup.mark("setup_agents_ready");
 
             let app_knowledge_dir = AppKnowledgeDir(Arc::new(
@@ -517,7 +532,7 @@ pub fn run() {
                     skill_tool_count
                 );
             }
-            let subagents = registry.list_task_agent_descriptions();
+            let subagents = initial_subagents;
             if !subagents.is_empty() {
                 tool_registry.register_task_tool(&subagents);
                 println!(
@@ -1000,7 +1015,15 @@ pub fn run() {
             commands::set_watcher_tuning,
             commands::search_workspace_assets,
             commands::preview_workspace_asset,
+            commands::preview_workspace_asset_thumbnail,
+            commands::read_workspace_asset_preview_frame_cache,
+            commands::cache_workspace_asset_preview_frame,
+            commands::render_workspace_asset_preview_frame,
             commands::preview_workspace_asset_target,
+            commands::unity_serialized_property_read,
+            commands::unity_serialized_property_discover,
+            commands::unity_serialized_property_write,
+            commands::unity_serialized_property_apply,
             commands::ref_graph_deps,
             commands::ref_graph_refs,
             commands::ref_graph_resolve_guid,
@@ -1113,6 +1136,10 @@ pub fn run() {
             commands::get_skill_unity_install_status,
             commands::install_skill_unity_files,
             commands::remove_skill_unity_files,
+            commands::plugin_list_installed,
+            commands::plugin_install_from_path,
+            commands::plugin_uninstall,
+            commands::plugin_export,
             commands::open_file_external,
             commands::reveal_workspace_file,
             commands::knowledge_reveal_target,

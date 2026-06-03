@@ -41,6 +41,7 @@ pub struct AgentDef {
     pub source: String,
 }
 
+#[derive(Clone)]
 pub struct AgentDefRegistry {
     defs: HashMap<String, AgentDef>,
     default_id: String,
@@ -49,12 +50,22 @@ pub struct AgentDefRegistry {
 impl AgentDefRegistry {
     ///
     pub fn load(app_agent_dir: Option<&Path>, project_agent_dir: Option<&Path>) -> Self {
+        Self::load_with_plugins(app_agent_dir, project_agent_dir, &[])
+    }
+
+    pub fn load_with_plugins(
+        app_agent_dir: Option<&Path>,
+        project_agent_dir: Option<&Path>,
+        plugin_agent_sources: &[crate::plugin::PluginComponentSource],
+    ) -> Self {
         let mut defs = HashMap::new();
         let mut default_id: Option<String> = None;
 
         if let Some(app_dir) = app_agent_dir {
             Self::scan_agent_dir(app_dir, &mut defs, &mut default_id);
         }
+
+        Self::scan_plugin_agent_sources(plugin_agent_sources, &mut defs, &mut default_id);
 
         if let Some(project_dir) = project_agent_dir {
             Self::scan_agent_dir_with_merge(project_dir, &mut defs, &mut default_id);
@@ -77,6 +88,53 @@ impl AgentDefRegistry {
         println!("[Locus] default agent: '{}'", default_id);
 
         AgentDefRegistry { defs, default_id }
+    }
+
+    fn scan_plugin_agent_sources(
+        sources: &[crate::plugin::PluginComponentSource],
+        defs: &mut HashMap<String, AgentDef>,
+        default_id: &mut Option<String>,
+    ) {
+        for source in sources {
+            let dir = if source.root.is_file() {
+                source
+                    .root
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| source.root.clone())
+            } else {
+                source.root.clone()
+            };
+            let id = source
+                .id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .or_else(|| {
+                    dir.file_name()
+                        .and_then(|value| value.to_str())
+                        .map(str::to_string)
+                });
+            let Some(id) = id else {
+                continue;
+            };
+            match Self::load_agent_from_dir(&dir, &id) {
+                Ok(mut def) => {
+                    def.source =
+                        format!("{}:{}", source.scope.component_source(), source.plugin_id);
+                    println!("[Locus] loaded plugin agent def '{}' from {:?}", id, dir);
+                    if def.default {
+                        *default_id = Some(id.clone());
+                    }
+                    defs.insert(id, def);
+                }
+                Err(error) => eprintln!(
+                    "[Locus] failed to load plugin agent '{}' from {:?}: {}",
+                    id, dir, error
+                ),
+            }
+        }
     }
 
     fn scan_agent_dir(

@@ -29,8 +29,8 @@ use crate::session::store::{SessionStore, CHILD_SESSION_FORK_ERROR};
 use crate::tool::ToolRegistry;
 use crate::workspace::Workspace;
 use crate::{
-    ActiveTaskHandle, ActiveTasks, ApiKeyState, PendingInputQueueHandle, ProviderKeysState,
-    QuestionStore,
+    ActiveTaskHandle, ActiveTasks, AgentDefRegistryState, ApiKeyState, PendingInputQueueHandle,
+    ProviderKeysState, QuestionStore,
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -354,8 +354,9 @@ fn apply_knowledge_target(
 
 #[tauri::command]
 pub async fn list_agents(
-    registry: State<'_, Arc<AgentDefRegistry>>,
+    registry: State<'_, AgentDefRegistryState>,
 ) -> Result<Vec<AgentInfo>, AppError> {
+    let registry = registry.0.read().await;
     let default_id = registry.default_id().to_string();
     let sub_agent_ids: std::collections::HashSet<&str> = registry
         .list_all()
@@ -384,8 +385,9 @@ pub async fn list_agents(
 
 #[tauri::command]
 pub async fn list_subagent_defs(
-    registry: State<'_, Arc<AgentDefRegistry>>,
+    registry: State<'_, AgentDefRegistryState>,
 ) -> Result<Vec<AgentInfo>, AppError> {
+    let registry = registry.0.read().await;
     let sub_agent_ids: std::collections::HashSet<String> = registry
         .list_all()
         .iter()
@@ -411,9 +413,10 @@ pub async fn list_subagent_defs(
 
 #[tauri::command]
 pub async fn get_agent_system_prompt(
-    registry: State<'_, Arc<AgentDefRegistry>>,
+    registry: State<'_, AgentDefRegistryState>,
     agent_id: String,
 ) -> Result<String, AppError> {
+    let registry = registry.0.read().await;
     match registry.get(&agent_id) {
         Some(def) => Ok(def.system_prompt.clone()),
         None => Err(format!("Agent '{}' not found", agent_id).into()),
@@ -422,9 +425,10 @@ pub async fn get_agent_system_prompt(
 
 #[tauri::command]
 pub async fn get_agent_env_template(
-    registry: State<'_, Arc<AgentDefRegistry>>,
+    registry: State<'_, AgentDefRegistryState>,
     agent_id: String,
 ) -> Result<String, AppError> {
+    let registry = registry.0.read().await;
     match registry.get(&agent_id) {
         Some(def) => Ok(def.env_template.clone()),
         None => Err(format!("Agent '{}' not found", agent_id).into()),
@@ -434,15 +438,17 @@ pub async fn get_agent_env_template(
 #[tauri::command]
 pub async fn get_agent_rendered_env_prompt(
     agent_id: String,
-    registry: State<'_, Arc<AgentDefRegistry>>,
+    registry: State<'_, AgentDefRegistryState>,
     tool_registry: State<'_, Arc<ToolRegistry>>,
     workspace: State<'_, Arc<Workspace>>,
     raw_store: State<'_, RawContextStore>,
     app_knowledge_dir: State<'_, crate::commands::AppKnowledgeDir>,
     app_agent_dir: State<'_, crate::AppAgentDir>,
 ) -> Result<String, AppError> {
-    let def = registry
+    let registry_snapshot = registry.snapshot().await;
+    let def = registry_snapshot
         .get(&agent_id)
+        .cloned()
         .ok_or_else(|| format!("Agent '{}' not found", agent_id))?;
     let working_dir = workspace.path.read().await.clone();
     let workspace_id = if working_dir.trim().is_empty() {
@@ -452,11 +458,11 @@ pub async fn get_agent_rendered_env_prompt(
     };
 
     let instance = AgentInstance::new(
-        Arc::new(def.clone()),
+        Arc::new(def),
         "__agent-preview__",
         LlmBackend::AnthropicAgentSdk,
         false,
-        registry.inner().clone(),
+        registry_snapshot,
         tool_registry.inner().clone(),
         working_dir,
         raw_store.inner().clone(),
@@ -477,15 +483,17 @@ pub async fn get_agent_rendered_env_prompt(
 #[tauri::command]
 pub async fn get_agent_system_prompt_stats(
     agent_id: String,
-    registry: State<'_, Arc<AgentDefRegistry>>,
+    registry: State<'_, AgentDefRegistryState>,
     tool_registry: State<'_, Arc<ToolRegistry>>,
     workspace: State<'_, Arc<Workspace>>,
     raw_store: State<'_, RawContextStore>,
     app_knowledge_dir: State<'_, crate::commands::AppKnowledgeDir>,
     app_agent_dir: State<'_, crate::AppAgentDir>,
 ) -> Result<AgentSystemPromptStats, AppError> {
-    let def = registry
+    let registry_snapshot = registry.snapshot().await;
+    let def = registry_snapshot
         .get(&agent_id)
+        .cloned()
         .ok_or_else(|| format!("Agent '{}' not found", agent_id))?;
     let working_dir = workspace.path.read().await.clone();
     let workspace_id = if working_dir.trim().is_empty() {
@@ -495,11 +503,11 @@ pub async fn get_agent_system_prompt_stats(
     };
 
     let instance = AgentInstance::new(
-        Arc::new(def.clone()),
+        Arc::new(def),
         "__agent-preview__",
         LlmBackend::AnthropicAgentSdk,
         false,
-        registry.inner().clone(),
+        registry_snapshot,
         tool_registry.inner().clone(),
         working_dir,
         raw_store.inner().clone(),
@@ -645,15 +653,17 @@ async fn resolve_model_backend(
 pub async fn list_agent_injected_items(
     agent_id: String,
     knowledge_mode: Option<String>,
-    registry: State<'_, Arc<AgentDefRegistry>>,
+    registry: State<'_, AgentDefRegistryState>,
     tool_registry: State<'_, Arc<ToolRegistry>>,
     workspace: State<'_, Arc<Workspace>>,
     raw_store: State<'_, RawContextStore>,
     app_knowledge_dir: State<'_, crate::commands::AppKnowledgeDir>,
     app_agent_dir: State<'_, crate::AppAgentDir>,
 ) -> Result<Vec<crate::agent::instance::InjectedPromptItem>, AppError> {
-    let def = registry
+    let registry_snapshot = registry.snapshot().await;
+    let def = registry_snapshot
         .get(&agent_id)
+        .cloned()
         .ok_or_else(|| format!("Agent '{}' not found", agent_id))?;
     let working_dir = workspace.path.read().await.clone();
     let workspace_id = if working_dir.trim().is_empty() {
@@ -665,11 +675,11 @@ pub async fn list_agent_injected_items(
         .map_err(|error| AppError::new("agent.invalid_knowledge_mode", error))?;
 
     let instance = AgentInstance::new(
-        Arc::new(def.clone()),
+        Arc::new(def),
         "__agent-preview__",
         LlmBackend::AnthropicAgentSdk,
         false,
-        registry.inner().clone(),
+        registry_snapshot,
         tool_registry.inner().clone(),
         working_dir,
         raw_store.inner().clone(),
@@ -780,7 +790,7 @@ pub async fn chat(
     knowledge_mode: Option<String>,
     app_handle: AppHandle,
     store: State<'_, Arc<SessionStore>>,
-    registry: State<'_, Arc<AgentDefRegistry>>,
+    registry: State<'_, AgentDefRegistryState>,
     config: State<'_, Arc<AppConfig>>,
     tool_registry: State<'_, Arc<ToolRegistry>>,
     auth: State<'_, Arc<tokio::sync::Mutex<AuthState>>>,
@@ -794,6 +804,7 @@ pub async fn chat(
     app_agent_dir: State<'_, crate::AppAgentDir>,
     undo_manager: State<'_, crate::UndoManagerHandle>,
 ) -> Result<ChatLaunch, AppError> {
+    let registry_snapshot = registry.snapshot().await;
     let cwd = workspace.path.read().await.clone();
     let ws_id = if cwd.trim().is_empty() {
         None
@@ -834,16 +845,18 @@ pub async fn chat(
 
     let def = match &effective_agent_id {
         Some(id) => {
-            let d = registry
+            let d = registry_snapshot
                 .get(id)
+                .cloned()
                 .ok_or_else(|| format!("Unknown agent: {}", id))?;
-            Arc::new(d.clone())
+            Arc::new(d)
         }
         None => {
-            let d = registry
+            let d = registry_snapshot
                 .default_def()
+                .cloned()
                 .ok_or_else(|| "No agent definitions found".to_string())?;
-            Arc::new(d.clone())
+            Arc::new(d)
         }
     };
 
@@ -955,7 +968,7 @@ pub async fn chat(
             selected_model
         ).into());
     };
-    let reg = registry.inner().clone();
+    let reg = registry_snapshot;
     let tools = tool_registry.inner().clone();
     let raw = raw_store.inner().clone();
 
@@ -2138,7 +2151,7 @@ pub async fn save_raw_context(
     raw_store: State<'_, RawContextStore>,
     store: State<'_, Arc<SessionStore>>,
     workspace: State<'_, Arc<Workspace>>,
-    registry: State<'_, Arc<AgentDefRegistry>>,
+    registry: State<'_, AgentDefRegistryState>,
 ) -> Result<String, AppError> {
     let working_dir = workspace.path.read().await.clone();
     let project_config = load_export_project_config(&working_dir);
@@ -2167,7 +2180,8 @@ pub async fn save_raw_context(
             .map(|snapshot| snapshot.items)
             .unwrap_or_default();
         let system_prompt = if include_system_prompt {
-            resolve_export_system_prompt(registry.inner(), detail.agent_id.as_deref())
+            let registry_snapshot = registry.snapshot().await;
+            resolve_export_system_prompt(&registry_snapshot, detail.agent_id.as_deref())
         } else {
             None
         };

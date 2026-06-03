@@ -172,7 +172,6 @@ function formatDocumentDisplayPath(document: KnowledgeDocument | null | undefine
 
 function packageIdForSkillDocument(document: KnowledgeDocument | null | undefined): string {
   if (!document || document.type !== "skill") return "";
-  if (document.storageSource !== "app") return "";
   if (document.externalSource?.provider !== "package") return "";
   return document.externalSource.sourceId || document.path.split("/")[0] || "";
 }
@@ -181,8 +180,7 @@ function skillPackageManifestForDocument(document: KnowledgeDocument | null | un
   const packageId = packageIdForSkillDocument(document);
   if (!packageId) return null;
   return skillItems.value.find((item) =>
-    item.source === "app"
-    && item.kind === "package"
+    item.kind === "package"
     && (item.packageId === packageId || item.dirName === packageId)
   ) ?? null;
 }

@@ -111,6 +111,7 @@ export type ExplorerNode =
       depth: number;
       document: KnowledgeDocumentSummary;
       children: ExplorerNode[];
+      managedByPlugin?: boolean;
     }
   | {
       kind: "document";
@@ -463,6 +464,35 @@ function isSkillPackageRootDocument(document: KnowledgeDocumentSummary): boolean
   return normalizedPath === `${packageId}/SKILL.md`;
 }
 
+function isPluginSkillPackageDocument(
+  document: KnowledgeDocumentSummary | KnowledgeDocument | null | undefined,
+): boolean {
+  return (
+    document?.type === "skill" &&
+    document.externalSource?.provider === "package" &&
+    !!document.externalSource.locator?.startsWith("plugin://")
+  );
+}
+
+function skillPackageConfigSource(
+  document: KnowledgeDocumentSummary | KnowledgeDocument,
+): string {
+  const locator = document.externalSource?.locator ?? "";
+  if (locator.startsWith("plugin://app/")) return "pluginApp";
+  if (locator.startsWith("plugin://project/")) return "pluginProject";
+  return "app";
+}
+
+function isPluginManagedExplorerNode(node: ExplorerNode): boolean {
+  if (node.kind === "package") {
+    return !!node.managedByPlugin || isPluginSkillPackageDocument(node.document);
+  }
+  if (node.kind === "document") {
+    return isPluginSkillPackageDocument(node.document);
+  }
+  return node.children.some(isPluginManagedExplorerNode);
+}
+
 function createPackageNode(
   document: KnowledgeDocumentSummary,
   existingChildren: ExplorerNode[] = [],
@@ -486,6 +516,7 @@ function createPackageNode(
     name: packageId,
     depth: 1,
     document,
+    managedByPlugin: isPluginSkillPackageDocument(document),
     children: [
       {
         kind: "document",
@@ -3161,7 +3192,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
     error.value = "";
     try {
       await enqueueMutation(() =>
-        setSkillConfig(`skill/${packageId}`, "app", nextConfig),
+        setSkillConfig(`skill/${packageId}`, skillPackageConfigSource(current), nextConfig),
       );
       selectedPackageDocument.value = {
         ...current,
@@ -3377,6 +3408,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
   }
 
   async function deletePackageNode(node: PackageNode) {
+    if (isPluginManagedExplorerNode(node)) return;
     const packageId = node.packageId.trim();
     if (!packageId) return;
     deletingDocument.value = true;
@@ -3420,6 +3452,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
 
   async function deleteExplorerNode(node: ExplorerNode) {
     if (!hasWorkspace.value) return;
+    if (isPluginManagedExplorerNode(node)) return;
     if (node.kind === "package") {
       await deletePackageNode(node);
       return;
@@ -3460,6 +3493,8 @@ export function useKnowledgeState(props: KnowledgeProps) {
 
   async function deleteExplorerNodes(nodes: ExplorerNode[]) {
     if (!hasWorkspace.value || nodes.length === 0) return;
+    nodes = nodes.filter((node) => !isPluginManagedExplorerNode(node));
+    if (nodes.length === 0) return;
     const packageNodes = nodes.filter(
       (node): node is PackageNode => node.kind === "package",
     );

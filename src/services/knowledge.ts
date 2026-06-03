@@ -313,6 +313,7 @@ export function knowledgeList(
   return ipcInvoke<KnowledgeDocumentSummary[]>("knowledge_list", {
     docType: input.type,
     pathPrefix: input.pathPrefix,
+    includeHidden: input.includeHidden ?? true,
   });
 }
 
@@ -384,6 +385,7 @@ export async function knowledgeQuery(
     limit: input.limit,
     types: input.types,
     pathPrefix: input.pathPrefix,
+    includeHidden: input.includeHidden ?? true,
   });
 
   return results.map((result) => ({
@@ -781,14 +783,14 @@ export function knowledgeDeleteExternalReferenceDirectory(
 
 export function getSkillConfig(
   relPath: string,
-  source?: "app" | "project",
+  source?: string,
 ): Promise<SkillConfig> {
   return ipcInvoke<SkillConfig>("get_skill_config", { relPath, source });
 }
 
 export function setSkillConfig(
   relPath: string,
-  source: "app" | "project" | undefined,
+  source: string | undefined,
   config: SkillConfig,
 ): Promise<void> {
   return ipcInvoke("set_skill_config", {

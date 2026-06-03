@@ -150,7 +150,6 @@ const manifest = computed<SkillManifest | null>(
   () =>
     skillItems.value.find(
       (item) =>
-        item.source === "app" &&
         item.kind === "package" &&
         (item.packageId === packageId.value || item.dirName === packageId.value),
     ) ?? null,

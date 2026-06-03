@@ -493,6 +493,30 @@ describe("useAppBootstrap onboarding completion", () => {
     expect(loadSkillsMock).toHaveBeenCalledTimes(2);
   });
 
+  it("reloads agents when installed plugins change", async () => {
+    const eventModule = await import("@tauri-apps/api/event");
+    const listenMock = eventModule.listen as unknown as ReturnType<typeof vi.fn>;
+    const handlers = new Map<string, (event: { payload: any }) => void>();
+
+    listenMock.mockImplementation(
+      async (name: string, handler: (event: { payload: any }) => void) => {
+        handlers.set(name, handler);
+        return vi.fn();
+      },
+    );
+
+    const useAppBootstrap = await loadUseAppBootstrap();
+    const { registerListeners } = useAppBootstrap();
+    await registerListeners();
+    agentStoreMock.loadAgents.mockClear();
+
+    const pluginsChangedHandler = handlers.get("plugins-changed");
+    expect(pluginsChangedHandler).toBeTypeOf("function");
+
+    pluginsChangedHandler?.({ payload: undefined });
+    expect(agentStoreMock.loadAgents).toHaveBeenCalledTimes(1);
+  });
+
   it("refreshes the active session when session content changes in the current workspace", async () => {
     projectStoreMock.workingDir = "F:/Project";
     const eventModule = await import("@tauri-apps/api/event");

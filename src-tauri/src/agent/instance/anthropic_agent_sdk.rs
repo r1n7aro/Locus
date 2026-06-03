@@ -32,6 +32,7 @@ struct ClaudeSdkRoundHost<'a> {
     store: &'a SessionStore,
     run_id: &'a str,
     mode: &'a str,
+    active_skill_tool_names: &'a HashSet<String>,
     streamed_text: String,
     partial_assistant: Arc<AssistantStreamState>,
     started_tool_calls: VecDeque<(String, String)>,
@@ -426,7 +427,10 @@ impl<'a> ClaudeSdkHost for ClaudeSdkRoundHost<'a> {
             if tool_call.name == "tool_call" {
                 match super::parse_meta_tool_call_arguments(&tool_call.arguments) {
                     Ok((target_name, mut target_args)) => {
-                        let allowed = self.agent.allowed_tool_set().await;
+                        let allowed = self
+                            .agent
+                            .allowed_tool_set_for_active_skills(self.active_skill_tool_names)
+                            .await;
                         if let Some(canonical) = self
                             .agent
                             .tool_registry
@@ -476,6 +480,7 @@ impl<'a> ClaudeSdkHost for ClaudeSdkRoundHost<'a> {
                     &args_for_exec,
                     self.run_id,
                     self.mode,
+                    self.active_skill_tool_names,
                 )
                 .await;
 
@@ -605,6 +610,7 @@ impl AgentInstance {
             store,
             run_id,
             mode: initial_mode,
+            active_skill_tool_names,
             streamed_text: String::new(),
             partial_assistant: self.partial_assistant_state(),
             started_tool_calls: VecDeque::new(),

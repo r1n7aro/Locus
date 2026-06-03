@@ -196,6 +196,11 @@ pub struct ViewPackageSummary {
     pub requirements: ViewRequirements,
     #[serde(default)]
     pub temporary: bool,
+    pub source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plugin_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plugin_scope: Option<crate::plugin::PluginInstallScope>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -264,6 +269,12 @@ pub struct ViewMoveEntryRequest {
 pub struct ViewExportPackageRequest {
     pub view_id: String,
     pub file_path: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ViewPluginExportCopy {
+    pub id: String,
+    pub file_count: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -446,6 +457,10 @@ pub struct ViewBindingTarget {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_file_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_file_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub component_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub component_index: Option<i32>,
@@ -461,6 +476,10 @@ pub struct ViewBindingReadRequest {
     pub binding_id: Option<String>,
     #[serde(default)]
     pub target: Option<ViewBindingTarget>,
+    #[serde(default)]
+    pub max_depth: Option<i32>,
+    #[serde(default)]
+    pub max_array_items: Option<i32>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -498,6 +517,17 @@ pub struct ViewManagedReferenceTypeOption {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ViewSerializedPropertyAttributeInfo {
+    #[serde(default)]
+    pub r#type: String,
+    #[serde(default)]
+    pub display_name: String,
+    #[serde(default)]
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ViewEnumOption {
     #[serde(default)]
     pub label: String,
@@ -516,6 +546,8 @@ pub struct ViewEnumOption {
 pub struct ViewSerializedPropertySnapshot {
     #[serde(default)]
     pub property_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding_target: Option<ViewBindingTarget>,
     #[serde(default)]
     pub display_name: String,
     #[serde(default)]
@@ -560,6 +592,30 @@ pub struct ViewSerializedPropertySnapshot {
     pub managed_reference_display_name: String,
     #[serde(default)]
     pub managed_reference_types: Vec<ViewManagedReferenceTypeOption>,
+    #[serde(default)]
+    pub tooltip: String,
+    #[serde(default)]
+    pub header: String,
+    #[serde(default)]
+    pub has_range: bool,
+    #[serde(default)]
+    pub range_min: f32,
+    #[serde(default)]
+    pub range_max: f32,
+    #[serde(default)]
+    pub number_step: f32,
+    #[serde(default)]
+    pub multiline: bool,
+    #[serde(default)]
+    pub min_lines: i32,
+    #[serde(default)]
+    pub max_lines: i32,
+    #[serde(default)]
+    pub reference_type_full_name: String,
+    #[serde(default)]
+    pub reference_type_assembly: String,
+    #[serde(default)]
+    pub attributes: Vec<ViewSerializedPropertyAttributeInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -572,6 +628,8 @@ pub struct ViewBindingReadResult {
     pub target: ViewBindingTarget,
     #[serde(flatten)]
     pub property: ViewSerializedPropertySnapshot,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub properties: Vec<ViewSerializedPropertySnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1052,6 +1110,10 @@ pub fn resolve_view_package_root(working_dir: &str, id: &str) -> Result<PathBuf,
         return Ok(persistent_root);
     }
 
+    if let Some(source) = find_plugin_view_source_by_id(working_dir, &id)? {
+        return Ok(source.root);
+    }
+
     let temp_root = temporary_views_root_for_workspace(working_dir)?;
     let matches = find_view_package_roots_by_id(&temp_root, &id)?;
     match matches.len() {
@@ -1117,6 +1179,7 @@ fn view_display_path_for_manifest(
     views_root: &Path,
     root: &Path,
     manifest: &ViewManifest,
+    fallback_display_path: Option<&str>,
 ) -> String {
     manifest
         .display_path
@@ -1125,6 +1188,13 @@ fn view_display_path_for_manifest(
             normalize_optional_view_display_path(Some(path))
                 .ok()
                 .flatten()
+        })
+        .or_else(|| {
+            fallback_display_path.and_then(|path| {
+                normalize_optional_view_display_path(Some(path))
+                    .ok()
+                    .flatten()
+            })
         })
         .unwrap_or_else(|| view_package_rel_path_for_root(views_root, root, manifest))
 }
@@ -1178,13 +1248,34 @@ fn summary_from_manifest(
     manifest: &ViewManifest,
     temporary: bool,
 ) -> ViewPackageSummary {
+    let source = if temporary { "temporary" } else { "project" };
+    summary_from_manifest_with_source(
+        views_root, root, manifest, temporary, source, None, None, None,
+    )
+}
+
+fn summary_from_manifest_with_source(
+    views_root: &Path,
+    root: &Path,
+    manifest: &ViewManifest,
+    temporary: bool,
+    source: &str,
+    plugin_id: Option<String>,
+    plugin_scope: Option<crate::plugin::PluginInstallScope>,
+    fallback_display_path: Option<String>,
+) -> ViewPackageSummary {
     ViewPackageSummary {
         id: manifest.id.clone(),
         name: manifest.name.clone(),
         version: manifest.version.clone(),
         template: manifest.template.clone(),
         icon: manifest.icon.clone(),
-        display_path: view_display_path_for_manifest(views_root, root, manifest),
+        display_path: view_display_path_for_manifest(
+            views_root,
+            root,
+            manifest,
+            fallback_display_path.as_deref(),
+        ),
         package_rel_path: view_package_rel_path_for_root(views_root, root, manifest),
         package_root: root.display().to_string().replace('\\', "/"),
         manifest_path: manifest_path(root).display().to_string().replace('\\', "/"),
@@ -1192,7 +1283,122 @@ fn summary_from_manifest(
         capabilities: manifest.capabilities.clone(),
         requirements: view_manifest_requirements(manifest),
         temporary,
+        source: source.to_string(),
+        plugin_id,
+        plugin_scope,
     }
+}
+
+fn plugin_view_summary_root(source: &crate::plugin::PluginComponentSource) -> PathBuf {
+    source
+        .root
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| source.root.clone())
+}
+
+fn plugin_view_default_display_path(source: &crate::plugin::PluginComponentSource) -> String {
+    let plugin_name = normalize_view_folder_name(&source.plugin_name)
+        .unwrap_or_else(|_| source.plugin_id.clone());
+    let leaf = source
+        .id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            Path::new(&source.rel_path)
+                .file_name()
+                .and_then(|value| value.to_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| source.plugin_id.clone());
+    join_view_display_path(&format!("Plugins/{}", plugin_name), &leaf)
+}
+
+fn summary_from_plugin_view_source(
+    source: &crate::plugin::PluginComponentSource,
+    manifest: &ViewManifest,
+) -> ViewPackageSummary {
+    let summary_root = plugin_view_summary_root(source);
+    summary_from_manifest_with_source(
+        &summary_root,
+        &source.root,
+        manifest,
+        false,
+        source.scope.component_source(),
+        Some(source.plugin_id.clone()),
+        Some(source.scope),
+        Some(plugin_view_default_display_path(source)),
+    )
+}
+
+fn plugin_view_source_for_root(
+    working_dir: &str,
+    root: &Path,
+) -> Option<crate::plugin::PluginComponentSource> {
+    let canonical_root = dunce::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    crate::plugin::installed_view_sources(working_dir)
+        .into_iter()
+        .find(|source| {
+            dunce::canonicalize(&source.root).unwrap_or_else(|_| source.root.clone())
+                == canonical_root
+        })
+}
+
+fn find_plugin_view_source_by_id(
+    working_dir: &str,
+    id: &str,
+) -> Result<Option<crate::plugin::PluginComponentSource>, String> {
+    let sources = crate::plugin::installed_view_sources(working_dir);
+    for scope in [
+        crate::plugin::PluginInstallScope::Project,
+        crate::plugin::PluginInstallScope::App,
+    ] {
+        for source in sources.iter().filter(|source| source.scope == scope) {
+            if !source.root.is_dir() {
+                continue;
+            }
+            match load_manifest_from_root(&source.root) {
+                Ok(manifest) if manifest.id == id => return Ok(Some(source.clone())),
+                Ok(_) => {}
+                Err(error) => eprintln!(
+                    "[Locus] skipped invalid plugin View package {}: {}",
+                    source.root.display(),
+                    error
+                ),
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn push_view_summary(views: &mut Vec<ViewPackageSummary>, summary: ViewPackageSummary) {
+    if summary.source == "pluginProject" {
+        views.retain(|existing| !(existing.id == summary.id && existing.source == "pluginApp"));
+    }
+    if views.iter().all(|existing| existing.id != summary.id) {
+        views.push(summary);
+    }
+}
+
+fn view_is_plugin_managed(view: &ViewPackageSummary) -> bool {
+    view.plugin_id.is_some() || view.source.starts_with("plugin")
+}
+
+fn ensure_no_plugin_managed_views<'a>(
+    views: impl IntoIterator<Item = &'a ViewPackageSummary>,
+    action: &str,
+) -> Result<(), String> {
+    if let Some(view) = views.into_iter().find(|view| view_is_plugin_managed(view)) {
+        return Err(format!(
+            "View '{}' is managed by plugin '{}'. Uninstall the plugin to {} it.",
+            view.name,
+            view.plugin_id.as_deref().unwrap_or("unknown"),
+            action
+        ));
+    }
+    Ok(())
 }
 
 fn path_is_under_root(path: &Path, root: &Path) -> bool {
@@ -1270,32 +1476,55 @@ fn find_view_package_roots_by_id(views_root: &Path, id: &str) -> Result<Vec<Path
 
 pub fn list_views_sync(working_dir: &str) -> Result<Vec<ViewPackageSummary>, String> {
     let views_root = views_root_for_workspace(working_dir)?;
-    if !views_root.is_dir() {
-        return Ok(Vec::new());
-    }
 
     let mut views = Vec::new();
-    for entry in walkdir::WalkDir::new(&views_root)
-        .min_depth(1)
-        .follow_links(false)
-        .into_iter()
-        .filter_entry(|entry| {
-            entry.file_type().is_file() || !is_skippable_view_scan_entry(&views_root, entry)
-        })
-    {
-        let entry = entry.map_err(|error| format!("Failed to scan View packages: {}", error))?;
-        if !entry.file_type().is_file() || entry.file_name() != "view.json" {
-            continue;
+    if views_root.is_dir() {
+        for entry in walkdir::WalkDir::new(&views_root)
+            .min_depth(1)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(|entry| {
+                entry.file_type().is_file() || !is_skippable_view_scan_entry(&views_root, entry)
+            })
+        {
+            let entry =
+                entry.map_err(|error| format!("Failed to scan View packages: {}", error))?;
+            if !entry.file_type().is_file() || entry.file_name() != "view.json" {
+                continue;
+            }
+            let Some(root) = entry.path().parent() else {
+                continue;
+            };
+            match load_manifest_from_root(root) {
+                Ok(manifest) => {
+                    push_view_summary(
+                        &mut views,
+                        summary_from_manifest(&views_root, root, &manifest, false),
+                    );
+                }
+                Err(error) => {
+                    eprintln!(
+                        "[Locus] skipped invalid View package {}: {}",
+                        root.display(),
+                        error
+                    );
+                }
+            }
         }
-        let Some(root) = entry.path().parent() else {
-            continue;
-        };
-        match load_manifest_from_root(root) {
-            Ok(manifest) => views.push(summary_from_manifest(&views_root, root, &manifest, false)),
+    }
+
+    for source in crate::plugin::installed_view_sources(working_dir) {
+        match load_manifest_from_root(&source.root) {
+            Ok(manifest) => {
+                push_view_summary(
+                    &mut views,
+                    summary_from_plugin_view_source(&source, &manifest),
+                );
+            }
             Err(error) => {
                 eprintln!(
-                    "[Locus] skipped invalid View package {}: {}",
-                    root.display(),
+                    "[Locus] skipped invalid plugin View package {}: {}",
+                    source.root.display(),
                     error
                 );
             }
@@ -1779,13 +2008,16 @@ pub fn delete_view_entry_sync(
 
     let mut roots_to_delete = Vec::new();
     if let Some(view) = unique_view_at_display_path(&views, &rel_path)? {
+        ensure_no_plugin_managed_views(std::iter::once(view), "remove")?;
         roots_to_delete.push(PathBuf::from(&view.package_root));
         metadata.order.retain(|path| path != &view.display_path);
     } else if folder_paths.contains(&rel_path) {
-        for view in views
+        let folder_views = views
             .iter()
             .filter(|view| display_path_is_under(&view.display_path, &rel_path))
-        {
+            .collect::<Vec<_>>();
+        ensure_no_plugin_managed_views(folder_views.iter().copied(), "remove")?;
+        for view in folder_views {
             roots_to_delete.push(PathBuf::from(&view.package_root));
         }
         metadata
@@ -1826,6 +2058,7 @@ pub fn rename_view_entry_sync(
         .collect::<BTreeSet<_>>();
 
     if let Some(view) = unique_view_at_display_path(&views, &source_rel_path)? {
+        ensure_no_plugin_managed_views(std::iter::once(view), "rename")?;
         set_view_manifest_name(&view.package_root, &request.name)?;
         return list_view_tree_sync(working_dir);
     }
@@ -1850,6 +2083,7 @@ pub fn rename_view_entry_sync(
         .iter()
         .filter(|view| display_path_is_under(&view.display_path, &source_rel_path))
         .collect::<Vec<_>>();
+    ensure_no_plugin_managed_views(moving_views.iter().copied(), "rename")?;
     for view in &moving_views {
         let next_path =
             replace_display_path_prefix(&view.display_path, &source_rel_path, &target_rel_path);
@@ -1941,6 +2175,7 @@ pub fn move_view_entry_sync(
     }
 
     if let Some(view) = unique_view_at_display_path(&views, &source_rel_path)? {
+        ensure_no_plugin_managed_views(std::iter::once(view), "move")?;
         if source_rel_path != target_rel_path {
             ensure_display_path_available(&views, &folder_paths, &target_rel_path, Some(&view.id))?;
             set_view_manifest_display_path(&view.package_root, &target_rel_path)?;
@@ -1991,6 +2226,7 @@ pub fn move_view_entry_sync(
         .iter()
         .filter(|view| display_path_is_under(&view.display_path, &source_rel_path))
         .collect::<Vec<_>>();
+    ensure_no_plugin_managed_views(moving_views.iter().copied(), "move")?;
     if source_rel_path != target_rel_path {
         for view in &moving_views {
             let next_path =
@@ -2151,6 +2387,98 @@ pub fn export_view_package_sync(
         .finish()
         .map_err(|error| zip_error("Failed to finish View package archive", error))?;
     Ok(output_path.display().to_string().replace('\\', "/"))
+}
+
+pub(crate) fn copy_view_package_for_plugin_sync(
+    working_dir: &str,
+    view_id: &str,
+    target_root: &Path,
+) -> Result<ViewPluginExportCopy, String> {
+    let normalized_id = normalize_view_id(view_id)?;
+    let root = resolve_view_package_root(working_dir, &normalized_id)?;
+    if !root.is_dir() {
+        return Err(format!("View package not found: {}", normalized_id));
+    }
+    let manifest = load_manifest_from_root(&root)?;
+    if manifest.id != normalized_id {
+        return Err(format!(
+            "View id mismatch: requested {}, manifest has {}",
+            normalized_id, manifest.id
+        ));
+    }
+    if plugin_view_source_for_root(working_dir, &root).is_some() {
+        return Err(format!(
+            "View '{}' is plugin-managed and must be exported through its plugin.",
+            normalized_id
+        ));
+    }
+    let temp_root = temporary_views_root_for_workspace(working_dir)?;
+    if path_is_under_root(&root, &temp_root) {
+        return Err(format!(
+            "Temporary View '{}' cannot be exported as a plugin component.",
+            normalized_id
+        ));
+    }
+
+    let mut paths = Vec::new();
+    for entry in walkdir::WalkDir::new(&root)
+        .min_depth(1)
+        .follow_links(false)
+        .into_iter()
+    {
+        let entry = entry
+            .map_err(|error| format!("Failed to scan View package for plugin export: {}", error))?;
+        paths.push(entry.path().to_path_buf());
+    }
+    paths.sort();
+
+    let mut file_count = 0usize;
+    for path in paths {
+        if is_view_internal_path(&path) {
+            continue;
+        }
+        let metadata = std::fs::symlink_metadata(&path)
+            .map_err(|e| format!("Failed to inspect {}: {}", path.display(), e))?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "Refusing to export symlinked View package entry: {}",
+                path.display()
+            ));
+        }
+        let rel_path = path
+            .strip_prefix(&root)
+            .map_err(|error| format!("Failed to resolve View package path: {}", error))?;
+        let target_path = target_root.join(rel_path);
+        if metadata.is_dir() {
+            std::fs::create_dir_all(&target_path)
+                .map_err(|e| format!("Failed to create {}: {}", target_path.display(), e))?;
+            continue;
+        }
+        if !metadata.is_file() {
+            return Err(format!(
+                "Unsupported View package entry type: {}",
+                path.display()
+            ));
+        }
+        if let Some(parent) = target_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create {}: {}", parent.display(), e))?;
+        }
+        std::fs::copy(&path, &target_path).map_err(|e| {
+            format!(
+                "Failed to copy View package file {} to {}: {}",
+                path.display(),
+                target_path.display(),
+                e
+            )
+        })?;
+        file_count += 1;
+    }
+
+    Ok(ViewPluginExportCopy {
+        id: manifest.id,
+        file_count,
+    })
 }
 
 fn zip_entry_rel_path(file: &zip::read::ZipFile<'_>) -> Result<String, String> {
@@ -2615,8 +2943,20 @@ pub fn read_view_sync(working_dir: &str, view_id: &str) -> Result<ViewPackageDet
     let views_root = views_root_for_workspace(working_dir)?;
     let temp_root = temporary_views_root_for_workspace(working_dir)?;
     let temporary = path_is_under_root(&root, &temp_root);
-    let summary_root = if temporary { &temp_root } else { &views_root };
-    let summary = summary_from_manifest(summary_root, &root, &manifest, temporary);
+    let plugin_source = plugin_view_source_for_root(working_dir, &root);
+    let (summary_root, summary) = if let Some(source) = plugin_source {
+        let summary_root = plugin_view_summary_root(&source);
+        let summary = summary_from_plugin_view_source(&source, &manifest);
+        (summary_root, summary)
+    } else {
+        let summary_root = if temporary {
+            temp_root.clone()
+        } else {
+            views_root.clone()
+        };
+        let summary = summary_from_manifest(&summary_root, &root, &manifest, temporary);
+        (summary_root, summary)
+    };
     let workspace_root = root
         .parent()
         .ok_or_else(|| format!("Invalid View package root: {}", root.display()))?;
@@ -2639,10 +2979,10 @@ pub fn read_view_sync(working_dir: &str, view_id: &str) -> Result<ViewPackageDet
         if !path.is_file() {
             continue;
         }
-        let workspace_rel_path = workspace_relative_view_path(summary_root, &path)?;
+        let workspace_rel_path = workspace_relative_view_path(&summary_root, &path)?;
         files.push(read_view_file(&path, &workspace_rel_path)?);
     }
-    collect_view_package_workspace_source_files(summary_root, workspace_root, &mut files)?;
+    collect_view_package_workspace_source_files(&summary_root, workspace_root, &mut files)?;
 
     Ok(ViewPackageDetail {
         summary,
@@ -3628,7 +3968,7 @@ pub fn ensure_view_host_pool_window(
     {
         let mut state = view_host_pool_state()
             .lock()
-        .map_err(|_| "View host pool state is unavailable".to_string())?;
+            .map_err(|_| "View host pool state is unavailable".to_string())?;
         if let Some(label) = state.available_label.clone() {
             if app_handle.get_webview_window(&label).is_some() {
                 return Ok(ViewRunResult {
@@ -4668,7 +5008,7 @@ fn should_reload_for_view_event(event: &notify::Event) -> bool {
     true
 }
 
-fn is_view_internal_path(path: &Path) -> bool {
+pub(crate) fn is_view_internal_path(path: &Path) -> bool {
     path.components().any(|component| {
         component
             .as_os_str()
@@ -5082,6 +5422,8 @@ pub async fn view_binding_read(
     let payload = serde_json::json!({
         "bindingId": request.binding_id,
         "target": binding.target,
+        "maxDepth": request.max_depth.unwrap_or_default(),
+        "maxArrayItems": request.max_array_items.unwrap_or_default(),
     });
     let raw = crate::unity_bridge::view_binding_read(working_dir, &payload).await?;
     serde_json::from_str(&raw)
@@ -5530,16 +5872,17 @@ mod tests {
         is_view_frontend_log_workspace_path, list_view_tree_sync, list_views_sync,
         move_view_entry_sync, normalize_package_rel_path, parse_view_create_request,
         read_view_frontend_log_sync, read_view_sync, registered_view_host_label,
-        rename_view_entry_sync, resolve_view_binding_target, resolve_view_script_sync,
-        set_view_tab_host_sync, should_reload_for_view_event, supported_view_templates,
-        validate_view_binding_object_target, validate_view_binding_target, validate_view_manifest,
-        view_file_watch_roots, view_manifest_requirements, view_package_root,
-        view_script_bridge_payload, view_script_cached_invoke_payload, view_storage_get_sync,
-        view_storage_remove_sync, view_storage_set_sync, view_tab_hosts, ViewBindingDiscoverResult,
-        ViewBindingTarget, ViewBindingWriteResult, ViewExportPackageRequest,
-        ViewFrontendLogReadRequest, ViewFrontendLogRequest, ViewImportPackageRequest, ViewManifest,
-        ViewSetTabHostRequest, ViewStorageGetRequest, ViewStorageRemoveRequest,
-        ViewStorageSetRequest, VIEW_BINDINGS_SCHEMA, VIEW_ROOT_RELATIVE, VIEW_SCHEMA,
+        rename_view_entry_sync, resolve_view_binding_target, resolve_view_package_root,
+        resolve_view_script_sync, set_view_tab_host_sync, should_reload_for_view_event,
+        supported_view_templates, validate_view_binding_object_target,
+        validate_view_binding_target, validate_view_manifest, view_file_watch_roots,
+        view_manifest_requirements, view_package_root, view_script_bridge_payload,
+        view_script_cached_invoke_payload, view_storage_get_sync, view_storage_remove_sync,
+        view_storage_set_sync, view_tab_hosts, ViewBindingDiscoverResult, ViewBindingTarget,
+        ViewBindingWriteResult, ViewExportPackageRequest, ViewFrontendLogReadRequest,
+        ViewFrontendLogRequest, ViewImportPackageRequest, ViewManifest, ViewSetTabHostRequest,
+        ViewStorageGetRequest, ViewStorageRemoveRequest, ViewStorageSetRequest,
+        VIEW_BINDINGS_SCHEMA, VIEW_ROOT_RELATIVE, VIEW_SCHEMA,
     };
     use notify::{
         event::{DataChange, ModifyKind},
@@ -5577,6 +5920,85 @@ mod tests {
         assert!(normalize_package_rel_path("F:/App.vue").is_err());
         assert!(normalize_package_rel_path("/tmp/App.vue").is_err());
         assert!(normalize_package_rel_path("src//App.vue").is_err());
+    }
+
+    #[test]
+    fn list_views_sync_reads_project_plugin_views_and_blocks_entry_delete() {
+        let temp = tempdir().unwrap();
+        let working_dir = temp.path().to_string_lossy().to_string();
+        let plugin_root = temp
+            .path()
+            .join("Locus")
+            .join("plugins")
+            .join("com.example.view-plugin");
+        let view_root = plugin_root.join("views").join("asset-inspector");
+        std::fs::create_dir_all(&view_root).unwrap();
+        std::fs::write(
+            plugin_root.join(crate::plugin::PLUGIN_MANIFEST_FILE_NAME),
+            r#"{
+  "schemaVersion": 1,
+  "id": "com.example.view-plugin",
+  "name": "Plugin Views",
+  "version": "0.1.0",
+  "components": {
+    "views": [{ "id": "asset-inspector", "path": "views/asset-inspector" }]
+  }
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            view_root.join("view.json"),
+            r#"{
+  "schema": "locus.view.v1",
+  "id": "plugin-asset-inspector",
+  "name": "Plugin Asset Inspector",
+  "version": "0.1.0",
+  "template": "blank",
+  "entry": "src/App.vue",
+  "style": "src/style.css",
+  "bindings": "bindings.json",
+  "capabilities": {}
+}
+"#,
+        )
+        .unwrap();
+
+        let views = list_views_sync(&working_dir).expect("list views");
+        let view = views
+            .iter()
+            .find(|view| view.id == "plugin-asset-inspector")
+            .expect("plugin view should be listed");
+        assert_eq!(view.source, "pluginProject");
+        assert_eq!(view.plugin_id.as_deref(), Some("com.example.view-plugin"));
+        assert_eq!(
+            view.plugin_scope,
+            Some(crate::plugin::PluginInstallScope::Project)
+        );
+        assert_eq!(view.display_path, "Plugins/Plugin Views/asset-inspector");
+        assert_eq!(
+            resolve_view_package_root(&working_dir, "plugin-asset-inspector").unwrap(),
+            view_root
+        );
+
+        let delete_error = delete_view_entry_sync(
+            &working_dir,
+            super::ViewDeleteEntryRequest {
+                rel_path: view.display_path.clone(),
+            },
+        )
+        .expect_err("plugin views should be removed through plugin uninstall");
+        assert!(delete_error.contains("managed by plugin"));
+
+        let rename_error = rename_view_entry_sync(
+            &working_dir,
+            super::ViewRenameEntryRequest {
+                rel_path: view.display_path.clone(),
+                name: "Renamed".to_string(),
+            },
+        )
+        .expect_err("plugin views should not be renamed directly");
+        assert!(rename_error.contains("managed by plugin"));
     }
 
     #[test]
@@ -6769,6 +7191,8 @@ mod tests {
                 path: None,
                 scene_path: Some("Assets/Scenes/Main.unity".to_string()),
                 object_path: Some("Root/Player".to_string()),
+                object_file_id: None,
+                target_file_id: None,
                 component_type: None,
                 component_index: None,
                 property_path: Some("m_Name".to_string()),
@@ -6842,6 +7266,8 @@ mod tests {
             path: None,
             scene_path: Some("Assets/Scenes/Main.unity".to_string()),
             object_path: Some("Root/Player".to_string()),
+            object_file_id: None,
+            target_file_id: None,
             component_type: Some("Game.Settings".to_string()),
             component_index: Some(0),
             property_path: None,

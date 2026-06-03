@@ -122,6 +122,7 @@ function detectMentionOperator(text: string, safeCursor: number): ActiveOperator
 function normalizeSkillSource(source: unknown): SkillIntentItem["source"] | null {
   if (source === "app" || source === "builtin" || source === "builtIn") return "app";
   if (source === "project") return "project";
+  if (source === "pluginApp" || source === "pluginProject") return source;
   return null;
 }
 
