@@ -63,11 +63,24 @@ import {
   useUnityAssetDropTarget,
   UnityReferenceChip,
   UnityDropZone,
+  UnityObjectPreview,
+  propertyDrawer,
+  unityObjectDrawer,
+  serializedProperty,
 } from "@locus/view-runtime";
 ```
 
-5. Use the right runtime path for Unity data.
+5. Resolve API details through the stable View contract.
+   - Reading Locus implementation files in a development checkout is normal when the public contract is insufficient for diagnosis.
+   - Installed releases expose the created View Package source under `packageRoot`, the bundled View skill files, exported View Runtime sources under this skill package's `app/view-runtime/`, and the `view_*` tools. The Locus application source tree is not part of the selected Unity workspace.
+   - Prefer the exported files under `app/view-runtime/src/` for runtime APIs, component props, graph/canvas data shapes, and release behavior before searching private app implementation files.
+   - Treat `@locus/view-runtime` and `@locus/components` as the public surface. Do not depend on private implementation paths such as `src/components/view/viewRuntime.ts` in generated View code.
+
+6. Use the right runtime path for Unity data.
+   - Asset or scene object `SerializedProperty` trees: `unity.serializedProperty.read/discover/write/apply` or `serializedProperty`.
    - Direct `SerializedProperty` fields: `view.binding.read/write/apply` or `useUnityBinding`.
+   - Custom property rendering: `propertyDrawer.registerValue/registerField/registerAttribute/registerPropertyPath/register(...)`; pass `propertyDrawers` into `UnitySerializedPropertyTree`, `UnityPropertyDraw`, or `UnityObjectPreview`.
+   - Custom Unity object or asset rendering: `unityObjectDrawer.register(...)`; pass `objectDrawers` into `UnityObjectPreview` when the override should be local to a View.
    - Unknown property paths: `view_binding_discover` before hardcoding paths.
    - Custom Unity logic: `view.callScript` from package code or `view_compile_script` / `view_call_script` from the agent.
    - Selection-driven panels: `onEditorUpdate(handler)`.
@@ -75,14 +88,14 @@ import {
    - Locus <-> Unity drag and drop: `useUnityReferenceDrag`, `useUnityAssetDropTarget`, `UnityReferenceChip`, and `UnityDropZone`.
    - LLM-assisted semantic editors: `view.session` and `view.llm`.
 
-6. Keep the UI aligned with Locus / Unity Editor tool style.
+7. Keep the UI aligned with Locus / Unity Editor tool style.
    - Prefer panels, split panes, inspectors, tables, trees, toolbars, and workspaces.
    - Keep controls compact, neutral, and useful for long editing sessions.
    - Use existing tokens for surfaces, borders, text, hover states, and accent color.
    - Use state badges only for strong statuses such as running, error, modified, enabled, or disabled.
    - Avoid marketing-style hero areas, decorative gradients, heavy shadows, oversized cards, colorful chip clusters, and continuous animation.
 
-7. Validate package paths and reload.
+8. Validate package paths and reload.
    - Use package-relative paths with forward slashes.
    - Do not write absolute Unity project paths into `view.json`.
    - Use `view_reload` after edits.

@@ -1,0 +1,323 @@
+{
+  "schema": "locus.view-runtime-source-export.v1",
+  "description": "Release-readable source export for Locus View Runtime APIs used by generated View packages.",
+  "sourceRoot": "src",
+  "files": [
+    {
+      "path": "src/components/view/viewRuntime.ts",
+      "bytes": 66647
+    },
+    {
+      "path": "src/components/view/viewCompiler.ts",
+      "bytes": 8744
+    },
+    {
+      "path": "src/components/view/viewSfcCompiler.ts",
+      "bytes": 3935
+    },
+    {
+      "path": "src/components/view/viewPackageFiles.ts",
+      "bytes": 1326
+    },
+    {
+      "path": "src/components/view/viewHostPreview.ts",
+      "bytes": 15790
+    },
+    {
+      "path": "src/components/canvas/index.ts",
+      "bytes": 379
+    },
+    {
+      "path": "src/components/canvas/canvasTypes.ts",
+      "bytes": 1428
+    },
+    {
+      "path": "src/components/canvas/canvasStyles.ts",
+      "bytes": 2186
+    },
+    {
+      "path": "src/components/canvas/LocusCanvasView.ts",
+      "bytes": 26062
+    },
+    {
+      "path": "src/components/graph/index.ts",
+      "bytes": 1850
+    },
+    {
+      "path": "src/components/graph/graphTypes.ts",
+      "bytes": 26800
+    },
+    {
+      "path": "src/components/graph/graphController.ts",
+      "bytes": 1418
+    },
+    {
+      "path": "src/components/graph/graphLayout.ts",
+      "bytes": 12182
+    },
+    {
+      "path": "src/components/graph/graphStyles.ts",
+      "bytes": 15239
+    },
+    {
+      "path": "src/components/graph/graphImage.ts",
+      "bytes": 17939
+    },
+    {
+      "path": "src/components/graph/LocusGraphView.ts",
+      "bytes": 44114
+    },
+    {
+      "path": "src/components/icons/LucideIcon.vue",
+      "bytes": 683
+    },
+    {
+      "path": "src/components/icons/unityAssetIcons.ts",
+      "bytes": 7030
+    },
+    {
+      "path": "src/components/diff/BinaryPreviewHost.vue",
+      "bytes": 1239
+    },
+    {
+      "path": "src/components/diff/FbxBinaryPreview.vue",
+      "bytes": 11762
+    },
+    {
+      "path": "src/components/diff/RasterBinaryPreview.vue",
+      "bytes": 20108
+    },
+    {
+      "path": "src/components/diff/UnityHierarchyPane.vue",
+      "bytes": 13088
+    },
+    {
+      "path": "src/components/diff/UnityInspectorPane.vue",
+      "bytes": 23490
+    },
+    {
+      "path": "src/components/diff/UnityInspectorFieldTree.vue",
+      "bytes": 22621
+    },
+    {
+      "path": "src/components/diff/OptimizedPanelRenderer.vue",
+      "bytes": 5686
+    },
+    {
+      "path": "src/components/diff/ParticleSystemPanelRenderer.vue",
+      "bytes": 8889
+    },
+    {
+      "path": "src/components/diff/fieldUtils.ts",
+      "bytes": 1646
+    },
+    {
+      "path": "src/components/diff/inspectorPanelDisplay.ts",
+      "bytes": 2555
+    },
+    {
+      "path": "src/components/diff/particleSystemSemantic.ts",
+      "bytes": 25137
+    },
+    {
+      "path": "src/components/diff/rasterPreview.ts",
+      "bytes": 2299
+    },
+    {
+      "path": "src/components/diff/rendererRegistry.ts",
+      "bytes": 13532
+    },
+    {
+      "path": "src/components/diff/unityInspectorFieldState.ts",
+      "bytes": 249
+    },
+    {
+      "path": "src/components/diff/unityInspectorHeader.ts",
+      "bytes": 2730
+    },
+    {
+      "path": "src/components/collab/mergeUi.ts",
+      "bytes": 5292
+    },
+    {
+      "path": "src/components/unity/index.ts",
+      "bytes": 956
+    },
+    {
+      "path": "src/components/unity/unitySerializedValue.ts",
+      "bytes": 11873
+    },
+    {
+      "path": "src/components/unity/UnityBoolField.vue",
+      "bytes": 1898
+    },
+    {
+      "path": "src/components/unity/UnityColorField.vue",
+      "bytes": 3164
+    },
+    {
+      "path": "src/components/unity/UnityEnumField.vue",
+      "bytes": 2961
+    },
+    {
+      "path": "src/components/unity/UnityFlagsField.vue",
+      "bytes": 3287
+    },
+    {
+      "path": "src/components/unity/UnityLayerMaskField.vue",
+      "bytes": 868
+    },
+    {
+      "path": "src/components/unity/UnityNumberField.vue",
+      "bytes": 8049
+    },
+    {
+      "path": "src/components/unity/UnityObjectReferenceField.vue",
+      "bytes": 13684
+    },
+    {
+      "path": "src/components/unity/UnityPropertyDraw.vue",
+      "bytes": 2817
+    },
+    {
+      "path": "src/components/unity/UnityPropertyEditor.vue",
+      "bytes": 8395
+    },
+    {
+      "path": "src/components/unity/UnitySerializedPropertyTree.vue",
+      "bytes": 24471
+    },
+    {
+      "path": "src/components/unity/UnityVectorField.vue",
+      "bytes": 3357
+    },
+    {
+      "path": "src/components/unity-preview/index.ts",
+      "bytes": 320
+    },
+    {
+      "path": "src/components/unity-preview/unityObjectPreview.ts",
+      "bytes": 11669
+    },
+    {
+      "path": "src/components/unity-preview/UnityObjectEditorPanel.vue",
+      "bytes": 4774
+    },
+    {
+      "path": "src/components/unity-preview/UnityObjectIdentity.vue",
+      "bytes": 8518
+    },
+    {
+      "path": "src/components/unity-preview/UnityObjectPreview.vue",
+      "bytes": 59226
+    },
+    {
+      "path": "src/components/ui/BaseButton.vue",
+      "bytes": 1961
+    },
+    {
+      "path": "src/components/ui/BaseCheckbox.vue",
+      "bytes": 2058
+    },
+    {
+      "path": "src/components/ui/BaseDropdown.vue",
+      "bytes": 9568
+    },
+    {
+      "path": "src/components/ui/BaseSegmented.vue",
+      "bytes": 3489
+    },
+    {
+      "path": "src/components/ui/BaseSwitch.vue",
+      "bytes": 3144
+    },
+    {
+      "path": "src/components/ui/floatingPosition.ts",
+      "bytes": 631
+    },
+    {
+      "path": "src/composables/useUnityAssetDropTarget.ts",
+      "bytes": 4016
+    },
+    {
+      "path": "src/composables/useUnityReferenceDragSource.ts",
+      "bytes": 10128
+    },
+    {
+      "path": "src/composables/resizeObserver.ts",
+      "bytes": 1743
+    },
+    {
+      "path": "src/composables/useSelectionLock.ts",
+      "bytes": 669
+    },
+    {
+      "path": "src/i18n.ts",
+      "bytes": 3211
+    },
+    {
+      "path": "src/language/en.json",
+      "bytes": 192865
+    },
+    {
+      "path": "src/language/zh.json",
+      "bytes": 187309
+    },
+    {
+      "path": "src/services/asset.ts",
+      "bytes": 4029
+    },
+    {
+      "path": "src/services/diff.ts",
+      "bytes": 4702
+    },
+    {
+      "path": "src/services/refGraph.ts",
+      "bytes": 341
+    },
+    {
+      "path": "src/services/view.ts",
+      "bytes": 20412
+    },
+    {
+      "path": "src/services/unity.ts",
+      "bytes": 11452
+    },
+    {
+      "path": "src/services/unitySerializedProperty.ts",
+      "bytes": 3457
+    },
+    {
+      "path": "src/services/unityObjectDrawer.ts",
+      "bytes": 11533
+    },
+    {
+      "path": "src/services/unityObjectReferencePicker.ts",
+      "bytes": 11474
+    },
+    {
+      "path": "src/services/propertyTree.ts",
+      "bytes": 57581
+    },
+    {
+      "path": "src/services/startupPerf.ts",
+      "bytes": 2885
+    },
+    {
+      "path": "src/services/errors.ts",
+      "bytes": 2702
+    },
+    {
+      "path": "src/services/ipc.ts",
+      "bytes": 1143
+    },
+    {
+      "path": "src/services/locusRuntime.ts",
+      "bytes": 1816
+    },
+    {
+      "path": "src/types.ts",
+      "bytes": 65222
+    }
+  ]
+}
