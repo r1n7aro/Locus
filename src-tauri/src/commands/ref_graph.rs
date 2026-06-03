@@ -864,6 +864,7 @@ pub async fn search_assets(
         "n".to_string(),
         "tp".to_string(),
         "guid".to_string(),
+        "fileID".to_string(),
     ];
     let result = graph.search_assets(&q, &fields, 30, 0)?;
 
@@ -876,6 +877,7 @@ pub async fn search_assets(
                 "path": row.p.unwrap_or_default(),
                 "type": row.tp.unwrap_or_default(),
                 "guid": row.guid.unwrap_or_default(),
+                "fileID": row.file_id,
             })
         })
         .collect())
@@ -900,6 +902,7 @@ fn edges_to_json(
                 .unwrap_or_default();
             serde_json::json!({
                 "src_guid": guid_to_hex(&e.src_guid),
+                "src_file_id": e.src_file_id,
                 "dst_guid": guid_to_hex(&e.dst_guid),
                 "src_path": src_path,
                 "dst_path": dst_path,

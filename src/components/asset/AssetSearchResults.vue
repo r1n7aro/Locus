@@ -10,6 +10,7 @@ const props = defineProps<{
   hasFallback: boolean;
   truncated: boolean;
   selectedPath?: string | null;
+  selectedKey?: string | null;
 }>();
 
 const emit = defineEmits<{
@@ -94,6 +95,17 @@ function segments(text: string): Segment[] {
   if (last < text.length) result.push({ text: text.slice(last), hit: false });
   return result;
 }
+
+function resultKey(result: AssetSearchResult): string {
+  if (result.objectKey) return result.objectKey;
+  if (result.isSubAsset && result.name.trim()) return `${result.path}/${result.name.trim()}`;
+  return result.path;
+}
+
+function resultDisplayPath(result: AssetSearchResult): string {
+  if (result.isSubAsset && result.name.trim()) return `${result.path}/${result.name.trim()}`;
+  return result.path;
+}
 </script>
 
 <template>
@@ -110,12 +122,12 @@ function segments(text: string): Segment[] {
     </div>
     <button
       v-for="(r, i) in results"
-      :key="r.path"
+      :key="resultKey(r)"
       type="button"
       class="asr-row"
-      :class="{ selected: selectedPath === r.path }"
+      :class="{ selected: selectedKey ? selectedKey === resultKey(r) : selectedPath === r.path }"
       @click="emit('select', r)"
-      :title="r.path"
+      :title="resultDisplayPath(r)"
     >
       <span class="asr-index">{{ i + 1 }}</span>
       <span class="asr-name">
@@ -126,10 +138,10 @@ function segments(text: string): Segment[] {
       <span
         class="asr-kind"
         :class="{ 'asr-kind-hit': kindMatches(r.kind) }"
-        :title="r.typeLabel ? `ScriptableObject: ${r.typeLabel} (${r.kind})` : r.kind"
+        :title="r.typeLabel ? `${r.typeLabel} (${r.kind})` : r.kind"
       >
         <template v-if="r.typeLabel"
-          ><span class="asr-kind-prefix">SO:</span
+          ><span v-if="!r.isSubAsset" class="asr-kind-prefix">SO:</span
           ><template v-for="(seg, si) in segments(r.typeLabel)" :key="si"
             ><mark v-if="seg.hit" class="asr-hit">{{ seg.text }}</mark
             ><template v-else>{{ seg.text }}</template></template
@@ -143,7 +155,7 @@ function segments(text: string): Segment[] {
         >
       </span>
       <span class="asr-path">
-        <template v-for="(seg, si) in segments(r.path)" :key="si"
+        <template v-for="(seg, si) in segments(resultDisplayPath(r))" :key="si"
           ><mark v-if="seg.hit" class="asr-hit">{{ seg.text }}</mark
           ><template v-else>{{ seg.text }}</template></template>
       </span>

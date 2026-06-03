@@ -5,6 +5,7 @@ import type { AssetRefAttachment, PluginStatus, UnityConnectionStatus } from "..
 export interface AssetSearchResult {
   name: string;
   guid: string;
+  fileID?: string;
   path: string;
   type: string;
 }

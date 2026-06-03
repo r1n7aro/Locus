@@ -3,11 +3,12 @@ import { defineAsyncComponent, computed, ref } from "vue";
 import { t } from "../../i18n";
 import { useProjectStore } from "../../stores/project";
 import { selectUnityAsset } from "../../services/unity";
+import { isUnityConnectionError } from "../../services/errors";
 import type { AssetPreviewPayload, SemanticTargetInspector, SemanticDisplayMode } from "../../types";
 import BaseButton from "../ui/BaseButton.vue";
 import BaseSegmented from "../ui/BaseSegmented.vue";
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   payload: AssetPreviewPayload | null;
   loading: boolean;
   error: string;
@@ -17,7 +18,10 @@ const props = defineProps<{
   targetCache: Map<string, SemanticTargetInspector>;
   targetLoading: boolean;
   loadTarget: (previewKey: string, targetId: string) => Promise<SemanticTargetInspector | null>;
-}>();
+  showClose?: boolean;
+}>(), {
+  showClose: true,
+});
 
 const emit = defineEmits<{
   (e: "close"): void;
@@ -37,6 +41,11 @@ const UnityInspectorPane = defineAsyncComponent(
 
 const projectStore = useProjectStore();
 const displayMode = ref<SemanticDisplayMode>("optimized");
+const displayErrorRequiresUnity = computed(() => isUnityConnectionError(props.error));
+const displayError = computed(() => {
+  if (!props.error) return "";
+  return displayErrorRequiresUnity.value ? t("asset.preview.unityConnectionRequired") : props.error;
+});
 
 const activeInspector = computed<SemanticTargetInspector | null>(() => {
   if (!props.activeTargetId) return null;
@@ -89,12 +98,23 @@ async function onTreeSelect(targetId: string) {
           :options="displayModeOptions"
         />
       </template>
-      <button class="aph-close" :title="t('asset.preview.close')" @click="emit('close')">×</button>
+      <button
+        v-if="showClose"
+        class="aph-close"
+        :title="t('asset.preview.close')"
+        @click="emit('close')"
+      >×</button>
     </div>
 
     <div class="aph-body">
       <div v-if="loading && !payload" class="aph-state">{{ t("asset.preview.loading") }}</div>
-      <div v-else-if="error && !payload" class="aph-state aph-error">{{ error }}</div>
+      <div
+        v-else-if="displayError && !payload"
+        class="aph-state"
+        :class="{ 'aph-error': !displayErrorRequiresUnity }"
+      >
+        {{ displayError }}
+      </div>
 
       <template v-else-if="payload">
         <!-- text -->

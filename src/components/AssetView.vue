@@ -40,6 +40,7 @@ const {
   searchTruncated,
   searchHasFallback,
   searching,
+  selectedSearchKey,
   runFilenameSearch,
   updateSearchScope,
   selectFromSearchResult,
@@ -177,6 +178,7 @@ const layoutToggleTitle = computed(() => (
               :has-fallback="searchHasFallback"
               :truncated="searchTruncated"
               :selected-path="selectedAssetPath"
+              :selected-key="selectedSearchKey"
               @select="selectFromSearchResult"
             />
 
@@ -267,6 +269,7 @@ const layoutToggleTitle = computed(() => (
               :has-fallback="searchHasFallback"
               :truncated="searchTruncated"
               :selected-path="selectedAssetPath"
+              :selected-key="selectedSearchKey"
               @select="selectFromSearchResult"
             />
 

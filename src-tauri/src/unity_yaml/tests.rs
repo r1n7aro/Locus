@@ -246,6 +246,20 @@ MonoBehaviour:
 }
 
 #[test]
+fn test_parse_yaml_docs_keeps_negative_file_id_and_non_gameobject_name() {
+    let yaml = br#"--- !u!243 &-2919845427630868010
+AudioMixerGroupController:
+  m_Name: Music
+"#;
+    let docs = parse_yaml_docs(yaml);
+    assert_eq!(docs.len(), 1);
+    assert_eq!(docs[0].class_id, 243);
+    assert_eq!(docs[0].file_id, -2919845427630868010);
+    assert_eq!(docs[0].m_name.as_deref(), Some("Music"));
+    assert_eq!(docs[0].type_name, "AudioMixerGroupController");
+}
+
+#[test]
 fn test_format_doc_state_lines_outputs_enabled_state() {
     let yaml = br#"--- !u!114 &200
 MonoBehaviour:

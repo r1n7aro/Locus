@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::{params, Connection, Transaction};
 
+use super::object_index;
 use super::types::*;
 
 #[allow(dead_code)]
@@ -11,7 +12,7 @@ const CURRENT_PARSER_VERSION: u32 = 1;
 /// Schema version. Bump on any incompatible asset-table schema change. Mismatch
 /// at `open_db` time triggers a full DB delete + rebuild — `locus.db` is a
 /// pure cache and we never migrate it.
-pub const ASSET_DB_VERSION: u32 = 8;
+pub const ASSET_DB_VERSION: u32 = 9;
 
 pub(crate) fn db_path(project_root: &Path) -> PathBuf {
     project_root.join("Library").join("Locus").join("locus.db")
@@ -130,11 +131,41 @@ fn create_tables(conn: &Connection) -> Result<(), String> {
 
         CREATE TABLE IF NOT EXISTS edges (
             src_guid BLOB NOT NULL,
+            src_file_id INTEGER,
             dst_guid BLOB NOT NULL,
             dst_file_id INTEGER,
             class_id_hint INTEGER,
             field_hint TEXT,
             ref_path TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS asset_objects (
+            object_key TEXT PRIMARY KEY,
+            asset_guid BLOB NOT NULL,
+            file_id INTEGER,
+            path TEXT NOT NULL,
+            kind INTEGER NOT NULL,
+            root INTEGER NOT NULL,
+            path_lower TEXT NOT NULL,
+            file_name_lower TEXT NOT NULL,
+            name TEXT NOT NULL,
+            name_lower TEXT NOT NULL,
+            type_name TEXT NOT NULL,
+            type_lower TEXT NOT NULL,
+            type_search TEXT NOT NULL,
+            script_class_name TEXT NOT NULL,
+            script_class_lower TEXT NOT NULL,
+            is_main INTEGER NOT NULL,
+            is_sub_asset INTEGER NOT NULL,
+            searchable INTEGER NOT NULL,
+            target_id TEXT NOT NULL,
+            sort_index INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS asset_object_type_terms (
+            term TEXT NOT NULL,
+            object_key TEXT NOT NULL,
+            PRIMARY KEY(term, object_key)
         );
 
         CREATE TABLE IF NOT EXISTS files (
@@ -168,20 +199,31 @@ fn create_tables(conn: &Connection) -> Result<(), String> {
         CREATE INDEX IF NOT EXISTS idx_assets_script_ns_class
             ON assets(exists_on_disk, kind, script_namespace_lower, script_class_lower);
         CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(src_guid);
+        CREATE INDEX IF NOT EXISTS idx_edges_src_object ON edges(src_guid, src_file_id);
         CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(dst_guid);
+        CREATE INDEX IF NOT EXISTS idx_edges_dst_object ON edges(dst_guid, dst_file_id);
+        CREATE INDEX IF NOT EXISTS idx_asset_objects_guid ON asset_objects(asset_guid);
+        CREATE INDEX IF NOT EXISTS idx_asset_objects_file
+            ON asset_objects(asset_guid, file_id);
+        CREATE INDEX IF NOT EXISTS idx_asset_objects_root_name
+            ON asset_objects(searchable, root, name_lower);
+        CREATE INDEX IF NOT EXISTS idx_asset_objects_kind_name
+            ON asset_objects(searchable, kind, name_lower);
+        CREATE INDEX IF NOT EXISTS idx_asset_objects_pathlower
+            ON asset_objects(searchable, path_lower);
+        CREATE INDEX IF NOT EXISTS idx_asset_object_type_terms_object
+            ON asset_object_type_terms(object_key);
         CREATE INDEX IF NOT EXISTS idx_files_owner_guid ON files(owner_guid);
         CREATE INDEX IF NOT EXISTS idx_script_inheritance_terms_guid
             ON script_inheritance_terms(script_guid);
 
         -- FTS5 trigram virtual table. Only consumed by
         -- `search_assets_for_command` (the asset-page free-text path).
-        -- The public `db::search_assets` predicate engine deliberately does
-        -- NOT touch this table — its `n:` semantics stay filename-only.
         CREATE VIRTUAL TABLE IF NOT EXISTS asset_search_fts USING fts5(
-            guid_hex UNINDEXED,
-            stem,
+            object_key UNINDEXED,
+            name,
             path,
-            script_types,
+            type_search,
             tokenize = 'trigram'
         );",
     )
@@ -214,25 +256,45 @@ pub(crate) mod asset_fts {
 
     pub fn insert_row(
         tx: &Transaction,
-        guid_hex: &str,
-        stem_lower: &str,
+        object_key: &str,
+        name_lower: &str,
         path_lower: &str,
-        script_types: &str,
+        type_search: &str,
     ) -> Result<(), String> {
         tx.execute(
-            "INSERT INTO asset_search_fts (guid_hex, stem, path, script_types) VALUES (?1, ?2, ?3, ?4)",
-            params![guid_hex, stem_lower, path_lower, script_types],
+            "INSERT INTO asset_search_fts (object_key, name, path, type_search) VALUES (?1, ?2, ?3, ?4)",
+            params![object_key, name_lower, path_lower, type_search],
         )
         .map_err(|e| format!("Failed to insert asset_search_fts row: {}", e))?;
         Ok(())
     }
 
-    pub fn delete_by_guid(tx: &Transaction, guid_hex: &str) -> Result<(), String> {
+    pub fn delete_by_object_key(tx: &Transaction, object_key: &str) -> Result<(), String> {
         tx.execute(
-            "DELETE FROM asset_search_fts WHERE guid_hex = ?1",
-            params![guid_hex],
+            "DELETE FROM asset_search_fts WHERE object_key = ?1",
+            params![object_key],
         )
         .map_err(|e| format!("Failed to delete asset_search_fts row: {}", e))?;
+        Ok(())
+    }
+
+    pub fn delete_by_asset_guid(tx: &Transaction, guid: &[u8]) -> Result<(), String> {
+        let object_keys = {
+            let mut stmt = tx
+                .prepare_cached("SELECT object_key FROM asset_objects WHERE asset_guid = ?1")
+                .map_err(|e| format!("Failed to prepare asset object FTS key query: {}", e))?;
+            let rows = stmt
+                .query_map(params![guid], |row| row.get::<_, String>(0))
+                .map_err(|e| format!("Failed to query asset object FTS keys: {}", e))?;
+            let mut keys = Vec::new();
+            for row in rows {
+                keys.push(row.map_err(|e| format!("Failed to read asset object FTS key: {}", e))?);
+            }
+            keys
+        };
+        for key in object_keys {
+            delete_by_object_key(tx, &key)?;
+        }
         Ok(())
     }
 
@@ -255,6 +317,8 @@ pub(crate) mod asset_fts {
 pub fn clear_all_in_tx(tx: &Transaction) -> Result<(), String> {
     tx.execute_batch(
         "DELETE FROM edges;
+         DELETE FROM asset_object_type_terms;
+         DELETE FROM asset_objects;
          DELETE FROM assets;
          DELETE FROM files;
          DELETE FROM script_inheritance_terms;
@@ -311,6 +375,123 @@ fn delete_script_inheritance_terms(tx: &Transaction, guid: &Guid) -> Result<(), 
     Ok(())
 }
 
+fn normalize_type_term(raw: &str) -> String {
+    raw.trim()
+        .trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '.' && ch != '_')
+        .to_ascii_lowercase()
+}
+
+fn push_unique_type_term(terms: &mut Vec<String>, seen: &mut HashSet<String>, raw: &str) {
+    for part in raw.split_whitespace() {
+        let normalized = normalize_type_term(part);
+        if normalized.is_empty() || !seen.insert(normalized.clone()) {
+            continue;
+        }
+        terms.push(normalized);
+    }
+}
+
+fn asset_kind_type_aliases(kind: AssetKind) -> &'static [&'static str] {
+    match kind {
+        AssetKind::Scene => &["scene", "unity"],
+        AssetKind::Prefab => &["prefab"],
+        AssetKind::GenericAsset => &["genericasset", "asset", "scriptableobject"],
+        AssetKind::Material => &["material", "mat"],
+        AssetKind::Animation => &["animation", "anim", "animationclip"],
+        AssetKind::Controller => &["animatorcontroller", "controller"],
+        AssetKind::OtherYaml => &["otheryaml", "yaml"],
+        AssetKind::MetaOnly => &["metaonly"],
+        AssetKind::Script => &["script", "cs", "csharp"],
+        AssetKind::Texture => &["texture", "tex", "image", "sprite"],
+        AssetKind::Audio => &["audio", "sound"],
+        AssetKind::Shader => &["shader"],
+        AssetKind::Model => &["model", "fbx", "mesh"],
+    }
+}
+
+fn object_type_terms(object: &AssetObject) -> Vec<String> {
+    let mut terms = Vec::new();
+    let mut seen = HashSet::new();
+    for alias in asset_kind_type_aliases(object.kind) {
+        push_unique_type_term(&mut terms, &mut seen, alias);
+    }
+    push_unique_type_term(&mut terms, &mut seen, object.type_lower.as_str());
+    push_unique_type_term(&mut terms, &mut seen, object.type_search.as_str());
+    push_unique_type_term(&mut terms, &mut seen, object.script_class_lower.as_str());
+    if let Some(ext) = object
+        .path
+        .rsplit_once('.')
+        .map(|(_, ext)| ext)
+        .filter(|ext| !ext.is_empty())
+    {
+        push_unique_type_term(&mut terms, &mut seen, ext);
+    }
+    if object.is_sub_asset {
+        push_unique_type_term(&mut terms, &mut seen, "subasset");
+    }
+    terms
+}
+
+fn insert_asset_object(tx: &Transaction, object: &AssetObject) -> Result<(), String> {
+    tx.execute(
+        "INSERT OR REPLACE INTO asset_objects
+         (object_key, asset_guid, file_id, path, kind, root,
+          path_lower, file_name_lower, name, name_lower,
+          type_name, type_lower, type_search,
+          script_class_name, script_class_lower,
+          is_main, is_sub_asset, searchable, target_id, sort_index)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6,
+                 ?7, ?8, ?9, ?10,
+                 ?11, ?12, ?13,
+                 ?14, ?15,
+                 ?16, ?17, ?18, ?19, ?20)",
+        params![
+            object.object_key.as_str(),
+            object.asset_guid.as_slice(),
+            object.file_id,
+            object.path.as_str(),
+            object.kind as i32,
+            object.root as i32,
+            object.path_lower.as_str(),
+            object.file_name_lower.as_str(),
+            object.name.as_str(),
+            object.name_lower.as_str(),
+            object.type_name.as_str(),
+            object.type_lower.as_str(),
+            object.type_search.as_str(),
+            object.script_class_name.as_deref().unwrap_or(""),
+            object.script_class_lower.as_str(),
+            object.is_main as i32,
+            object.is_sub_asset as i32,
+            object.searchable as i32,
+            object.target_id.as_deref().unwrap_or(""),
+            object.sort_index,
+        ],
+    )
+    .map_err(|e| format!("Failed to insert asset object: {}", e))?;
+
+    for term in object_type_terms(object) {
+        tx.execute(
+            "INSERT OR IGNORE INTO asset_object_type_terms (term, object_key)
+             VALUES (?1, ?2)",
+            params![term, object.object_key.as_str()],
+        )
+        .map_err(|e| format!("Failed to insert asset object type term: {}", e))?;
+    }
+
+    if object.searchable {
+        asset_fts::insert_row(
+            tx,
+            object.object_key.as_str(),
+            object.name_lower.as_str(),
+            object.path_lower.as_str(),
+            object.type_search.as_str(),
+        )?;
+    }
+
+    Ok(())
+}
+
 /// Incremental updates are keyed by the new meta GUID. If a path is reimported
 /// with a different GUID, remove the stale canonical row for that path so mtime
 /// scans converge instead of requeueing the same asset forever.
@@ -339,12 +520,25 @@ fn delete_same_path_asset_conflicts(tx: &Transaction, asset: &AssetNode) -> Resu
 
     let meta_path = format!("{}.meta", asset.path);
     for stale_guid in stale_guids {
-        let stale_guid_hex = guid_to_hex(&stale_guid);
+        asset_fts::delete_by_asset_guid(tx, stale_guid.as_slice())?;
         tx.execute(
             "DELETE FROM edges WHERE src_guid = ?1",
             params![stale_guid.as_slice()],
         )
         .map_err(|e| format!("Failed to delete stale outgoing edges: {}", e))?;
+        tx.execute(
+            "DELETE FROM asset_object_type_terms
+             WHERE object_key IN (
+                 SELECT object_key FROM asset_objects WHERE asset_guid = ?1
+             )",
+            params![stale_guid.as_slice()],
+        )
+        .map_err(|e| format!("Failed to delete stale asset object type terms: {}", e))?;
+        tx.execute(
+            "DELETE FROM asset_objects WHERE asset_guid = ?1",
+            params![stale_guid.as_slice()],
+        )
+        .map_err(|e| format!("Failed to delete stale asset objects: {}", e))?;
         tx.execute(
             "DELETE FROM files
              WHERE owner_guid = ?1
@@ -362,7 +556,6 @@ fn delete_same_path_asset_conflicts(tx: &Transaction, asset: &AssetNode) -> Resu
         )
         .map_err(|e| format!("Failed to delete stale same-path asset: {}", e))?;
         delete_script_inheritance_terms(tx, &stale_guid)?;
-        asset_fts::delete_by_guid(tx, &stale_guid_hex)?;
     }
 
     Ok(())
@@ -619,12 +812,6 @@ pub fn batch_insert_assets(tx: &Transaction, assets: &[AssetNode]) -> Result<u64
                          ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
             )
             .map_err(|e| format!("Failed to prepare asset insert: {}", e))?;
-        let mut fts_stmt = tx
-            .prepare(
-                "INSERT INTO asset_search_fts (guid_hex, stem, path, script_types) VALUES (?1, ?2, ?3, ?4)",
-            )
-            .map_err(|e| format!("Failed to prepare fts insert: {}", e))?;
-
         for a in assets {
             let (root, path_lower, file_name_lower, stem_lower) = derive_search_cols(&a.path);
             asset_stmt
@@ -651,18 +838,23 @@ pub fn batch_insert_assets(tx: &Transaction, assets: &[AssetNode]) -> Result<u64
                     a.script_inheritance_search.as_str(),
                 ])
                 .map_err(|e| format!("Failed to insert asset: {}", e))?;
-            let guid_hex = guid_to_hex(&a.guid);
-            fts_stmt
-                .execute(params![
-                    guid_hex,
-                    stem_lower,
-                    path_lower,
-                    a.script_type_search.as_str(),
-                ])
-                .map_err(|e| format!("Failed to insert asset_search_fts row: {}", e))?;
+            let main_object = object_index::main_asset_object(a);
+            insert_asset_object(tx, &main_object)?;
             insert_script_inheritance_terms(tx, a)?;
             count += 1;
         }
+    }
+    Ok(count)
+}
+
+pub fn batch_insert_asset_objects(
+    tx: &Transaction,
+    objects: &[AssetObject],
+) -> Result<u64, String> {
+    let mut count = 0u64;
+    for object in objects {
+        insert_asset_object(tx, object)?;
+        count += 1;
     }
     Ok(count)
 }
@@ -697,8 +889,8 @@ pub fn batch_insert_edges(tx: &Transaction, edges: &[RefEdge]) -> Result<u64, St
     let mut stmt = tx
         .prepare_cached(
             "INSERT OR IGNORE INTO edges
-             (src_guid, dst_guid, dst_file_id, class_id_hint, field_hint, ref_path)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+             (src_guid, src_file_id, dst_guid, dst_file_id, class_id_hint, field_hint, ref_path)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         )
         .map_err(|e| format!("Failed to prepare edge insert: {}", e))?;
 
@@ -707,6 +899,7 @@ pub fn batch_insert_edges(tx: &Transaction, edges: &[RefEdge]) -> Result<u64, St
         let rows = stmt
             .execute(params![
                 e.src_guid.as_slice(),
+                e.src_file_id,
                 e.dst_guid.as_slice(),
                 e.dst_file_id,
                 e.class_id_hint,
@@ -722,7 +915,7 @@ pub fn batch_insert_edges(tx: &Transaction, edges: &[RefEdge]) -> Result<u64, St
 pub fn get_direct_deps(conn: &Connection, guid: &Guid) -> Result<Vec<RefEdge>, String> {
     let mut stmt = conn
         .prepare_cached(
-            "SELECT src_guid, dst_guid, dst_file_id, class_id_hint, field_hint, ref_path
+            "SELECT src_guid, src_file_id, dst_guid, dst_file_id, class_id_hint, field_hint, ref_path
              FROM edges WHERE src_guid = ?1",
         )
         .map_err(|e| format!("Failed to prepare deps query: {}", e))?;
@@ -733,7 +926,7 @@ pub fn get_direct_deps(conn: &Connection, guid: &Guid) -> Result<Vec<RefEdge>, S
 pub fn get_direct_refs(conn: &Connection, guid: &Guid) -> Result<Vec<RefEdge>, String> {
     let mut stmt = conn
         .prepare_cached(
-            "SELECT src_guid, dst_guid, dst_file_id, class_id_hint, field_hint, ref_path
+            "SELECT src_guid, src_file_id, dst_guid, dst_file_id, class_id_hint, field_hint, ref_path
              FROM edges WHERE dst_guid = ?1",
         )
         .map_err(|e| format!("Failed to prepare refs query: {}", e))?;
@@ -741,28 +934,98 @@ pub fn get_direct_refs(conn: &Connection, guid: &Guid) -> Result<Vec<RefEdge>, S
     read_edges(&mut stmt, guid)
 }
 
+pub fn get_direct_deps_for_object(
+    conn: &Connection,
+    guid: &Guid,
+    file_id: i64,
+) -> Result<Vec<RefEdge>, String> {
+    let mut stmt = conn
+        .prepare_cached(
+            "SELECT src_guid, src_file_id, dst_guid, dst_file_id, class_id_hint, field_hint, ref_path
+             FROM edges WHERE src_guid = ?1 AND src_file_id = ?2",
+        )
+        .map_err(|e| format!("Failed to prepare object deps query: {}", e))?;
+
+    let rows = stmt
+        .query_map(params![guid.as_slice(), file_id], |row| {
+            let src: Vec<u8> = row.get(0)?;
+            let dst: Vec<u8> = row.get(2)?;
+            Ok(RefEdge {
+                src_guid: blob_to_guid(&src),
+                src_file_id: row.get(1)?,
+                dst_guid: blob_to_guid(&dst),
+                dst_file_id: row.get(3)?,
+                class_id_hint: row.get(4)?,
+                field_hint: row.get(5)?,
+                ref_path: row.get(6)?,
+            })
+        })
+        .map_err(|e| format!("Failed to query object deps: {}", e))?;
+    let mut edges = Vec::new();
+    for row in rows {
+        edges.push(row.map_err(|e| format!("Failed to read object deps edge: {}", e))?);
+    }
+    Ok(edges)
+}
+
+pub fn get_direct_refs_for_object(
+    conn: &Connection,
+    guid: &Guid,
+    file_id: i64,
+) -> Result<Vec<RefEdge>, String> {
+    let mut stmt = conn
+        .prepare_cached(
+            "SELECT src_guid, src_file_id, dst_guid, dst_file_id, class_id_hint, field_hint, ref_path
+             FROM edges WHERE dst_guid = ?1 AND dst_file_id = ?2",
+        )
+        .map_err(|e| format!("Failed to prepare object refs query: {}", e))?;
+
+    let rows = stmt
+        .query_map(params![guid.as_slice(), file_id], |row| {
+            let src: Vec<u8> = row.get(0)?;
+            let dst: Vec<u8> = row.get(2)?;
+            Ok(RefEdge {
+                src_guid: blob_to_guid(&src),
+                src_file_id: row.get(1)?,
+                dst_guid: blob_to_guid(&dst),
+                dst_file_id: row.get(3)?,
+                class_id_hint: row.get(4)?,
+                field_hint: row.get(5)?,
+                ref_path: row.get(6)?,
+            })
+        })
+        .map_err(|e| format!("Failed to query object refs: {}", e))?;
+    let mut edges = Vec::new();
+    for row in rows {
+        edges.push(row.map_err(|e| format!("Failed to read object refs edge: {}", e))?);
+    }
+    Ok(edges)
+}
+
 fn read_edges(stmt: &mut rusqlite::CachedStatement, guid: &Guid) -> Result<Vec<RefEdge>, String> {
     let rows = stmt
         .query_map(params![guid.as_slice()], |row| {
             let src: Vec<u8> = row.get(0)?;
-            let dst: Vec<u8> = row.get(1)?;
+            let dst: Vec<u8> = row.get(2)?;
             Ok((
                 src,
+                row.get::<_, Option<i64>>(1)?,
                 dst,
-                row.get::<_, Option<i64>>(2)?,
-                row.get::<_, Option<i32>>(3)?,
-                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, Option<i32>>(4)?,
                 row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
             ))
         })
         .map_err(|e| format!("Failed to query edges: {}", e))?;
 
     let mut edges = Vec::new();
     for row in rows {
-        let (src, dst, file_id, class_id, field, ref_path) =
+        let (src, src_file_id, dst, file_id, class_id, field, ref_path) =
             row.map_err(|e| format!("Failed to read edge: {}", e))?;
         edges.push(RefEdge {
             src_guid: blob_to_guid(&src),
+            src_file_id,
             dst_guid: blob_to_guid(&dst),
             dst_file_id: file_id,
             class_id_hint: class_id,
@@ -925,13 +1188,14 @@ fn bfs_walk(
 
 #[derive(Debug)]
 pub enum SearchPredicate {
-    Type(Vec<AssetKind>),
+    Type(Vec<String>),
     NameExact(Vec<String>),
     NamePrefix(Vec<String>),
     NameSuffix(Vec<String>),
     NameContains(Vec<String>),
     Under(String),
     GuidExact(Guid),
+    FileIdExact(i64),
     /// Restrict results to one or more workspace roots. Not parseable from
     /// the public DSL — only injected programmatically by the command layer.
     RootIn(Vec<AssetRoot>),
@@ -943,6 +1207,7 @@ pub struct AssetRow {
     pub n: Option<String>,
     pub p: Option<String>,
     pub guid: Option<String>,
+    pub file_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -951,12 +1216,11 @@ pub struct SearchResult {
     pub rows: Vec<AssetRow>,
 }
 
-fn format_tool_asset_type(kind: AssetKind, script_class_name: Option<&str>) -> String {
+fn format_tool_asset_type(kind: AssetKind, type_name: &str) -> String {
     let kind_name = kind.camel_str();
-    if kind == AssetKind::GenericAsset {
-        if let Some(class_name) = script_class_name.filter(|name| !name.is_empty()) {
-            return format!("{}({})", class_name, kind_name);
-        }
+    let type_name = type_name.trim();
+    if !type_name.is_empty() && !type_name.eq_ignore_ascii_case(kind_name) {
+        return format!("{}({})", type_name, kind_name);
     }
     kind_name.to_string()
 }
@@ -1000,22 +1264,36 @@ fn map_stored_script_metadata_row(
     })
 }
 
-fn parse_asset_type(s: &str) -> Option<AssetKind> {
-    match s.to_lowercase().as_str() {
-        "scene" => Some(AssetKind::Scene),
-        "prefab" => Some(AssetKind::Prefab),
-        "genericasset" | "scriptableobject" | "asset" => Some(AssetKind::GenericAsset),
-        "material" | "mat" => Some(AssetKind::Material),
-        "animation" | "anim" => Some(AssetKind::Animation),
-        "animatorcontroller" | "controller" => Some(AssetKind::Controller),
-        "otheryaml" => Some(AssetKind::OtherYaml),
-        "metaonly" => Some(AssetKind::MetaOnly),
-        "script" | "cs" => Some(AssetKind::Script),
-        "texture" | "tex" | "image" => Some(AssetKind::Texture),
-        "audio" | "sound" => Some(AssetKind::Audio),
-        "shader" => Some(AssetKind::Shader),
-        "model" | "mesh" | "fbx" => Some(AssetKind::Model),
-        _ => None,
+fn parse_asset_type_terms(s: &str) -> Vec<String> {
+    let lower = normalize_type_term(s);
+    let aliases: &[&str] = match lower.as_str() {
+        "scene" | "unity" => &["scene"],
+        "prefab" => &["prefab"],
+        "genericasset" | "scriptableobject" | "asset" => &["genericasset", "scriptableobject"],
+        "material" | "mat" => &["material"],
+        "animation" | "anim" | "animationclip" => &["animation", "animationclip"],
+        "animatorcontroller" | "controller" => &["animatorcontroller"],
+        "otheryaml" | "yaml" => &["otheryaml"],
+        "metaonly" => &["metaonly"],
+        "script" | "cs" | "csharp" => &["script"],
+        "texture" | "tex" | "image" => &["texture"],
+        "audio" | "sound" => &["audio"],
+        "shader" => &["shader"],
+        "model" | "fbx" => &["model"],
+        "mesh" => &["mesh", "model"],
+        "sprite" => &["sprite", "texture"],
+        "gameobject" | "game_object" => &["gameobject"],
+        "component" | "monobehaviour" => &["component", "monobehaviour"],
+        _ => &[],
+    };
+    if aliases.is_empty() {
+        if lower.is_empty() {
+            Vec::new()
+        } else {
+            vec![lower]
+        }
+    } else {
+        aliases.iter().map(|term| (*term).to_string()).collect()
     }
 }
 
@@ -1083,6 +1361,14 @@ fn split_query_tokens(q: &str) -> Result<Vec<String>, String> {
 
 fn split_query_tokens_lossy(q: &str) -> Vec<String> {
     split_query_tokens(q).unwrap_or_else(|_| q.split_whitespace().map(|s| s.to_string()).collect())
+}
+
+fn strip_prefix_ci<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    if value.len() < prefix.len() {
+        return None;
+    }
+    let (head, tail) = value.split_at(prefix.len());
+    head.eq_ignore_ascii_case(prefix).then_some(tail)
 }
 
 fn unquote_query_value(raw: &str) -> Result<String, String> {
@@ -1180,14 +1466,19 @@ pub fn parse_query(q: &str) -> Result<Vec<SearchPredicate>, String> {
 
     for token in split_query_tokens(q)? {
         if let Some(rest) = token.strip_prefix("t:") {
-            let mut kinds = Vec::new();
+            let mut type_terms = Vec::new();
+            let mut seen = HashSet::new();
             for part in split_or_values(rest)? {
-                match parse_asset_type(&part) {
-                    Some(kind) => kinds.push(kind),
-                    None => return Err(format!("Unknown asset type: '{}'. Valid types: scene, prefab, material, animation, animatorController, genericAsset, script, texture, audio, shader, model, otherYaml, metaOnly", part)),
+                for term in parse_asset_type_terms(&part) {
+                    if seen.insert(term.clone()) {
+                        type_terms.push(term);
+                    }
                 }
             }
-            predicates.push(SearchPredicate::Type(kinds));
+            if type_terms.is_empty() {
+                return Err("Empty type predicate after t:".to_string());
+            }
+            predicates.push(SearchPredicate::Type(type_terms));
         } else if let Some(rest) = token.strip_prefix("n=") {
             predicates.push(SearchPredicate::NameExact(split_or_values(rest)?));
         } else if let Some(rest) = token.strip_prefix("n^") {
@@ -1204,9 +1495,15 @@ pub fn parse_query(q: &str) -> Result<Vec<SearchPredicate>, String> {
                 Some(g) => predicates.push(SearchPredicate::GuidExact(g)),
                 None => return Err(format!("Invalid GUID: '{}' (expected 32 hex chars)", guid)),
             }
+        } else if let Some(rest) = strip_prefix_ci(&token, "fileid:") {
+            let raw = unquote_query_value(rest)?;
+            match raw.parse::<i64>() {
+                Ok(file_id) => predicates.push(SearchPredicate::FileIdExact(file_id)),
+                Err(_) => return Err(format!("Invalid fileID: '{}' (expected integer)", raw)),
+            }
         } else {
             return Err(format!(
-                "Unknown predicate: '{}'. Supported: t:, n=, n^, n$, n:, under:, guid:",
+                "Unknown predicate: '{}'. Supported: t:, n=, n^, n$, n:, under:, guid:, fileID:",
                 token
             ));
         }
@@ -1245,14 +1542,17 @@ pub fn parse_query_lenient(q: &str) -> LenientQuery {
     let mut bare_terms: Vec<String> = Vec::new();
     for token in split_query_tokens_lossy(q) {
         if let Some(rest) = token.strip_prefix("t:") {
-            let mut kinds = Vec::new();
+            let mut type_terms = Vec::new();
+            let mut seen = HashSet::new();
             for part in split_or_values_lossy(rest) {
-                if let Some(k) = parse_asset_type(&part) {
-                    kinds.push(k);
+                for term in parse_asset_type_terms(&part) {
+                    if seen.insert(term.clone()) {
+                        type_terms.push(term);
+                    }
                 }
             }
-            if !kinds.is_empty() {
-                predicates.push(SearchPredicate::Type(kinds));
+            if !type_terms.is_empty() {
+                predicates.push(SearchPredicate::Type(type_terms));
             }
         } else if let Some(rest) = token.strip_prefix("n=") {
             predicates.push(SearchPredicate::NameExact(split_or_values_lossy(rest)));
@@ -1269,6 +1569,11 @@ pub fn parse_query_lenient(q: &str) -> LenientQuery {
             let guid = unquote_query_value_lossy(rest);
             if let Some(g) = parse_guid_hex(&guid) {
                 predicates.push(SearchPredicate::GuidExact(g));
+            }
+        } else if let Some(rest) = strip_prefix_ci(&token, "fileid:") {
+            let raw = unquote_query_value_lossy(rest);
+            if let Ok(file_id) = raw.parse::<i64>() {
+                predicates.push(SearchPredicate::FileIdExact(file_id));
             }
         } else {
             // Bare token — kept out of `predicates` so the router can route
@@ -1303,8 +1608,13 @@ fn build_bare_term_filter_where(
     let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
 
     for term in bare_terms {
-        clauses.push("(path_lower LIKE ? OR script_type_search LIKE ?)".to_string());
+        clauses.push(
+            "(name_lower LIKE ? OR file_name_lower LIKE ? OR path_lower LIKE ? OR type_search LIKE ?)"
+                .to_string(),
+        );
         let like_pat = format!("%{}%", term);
+        params.push(Box::new(like_pat.clone()));
+        params.push(Box::new(like_pat.clone()));
         params.push(Box::new(like_pat.clone()));
         params.push(Box::new(like_pat));
     }
@@ -1327,9 +1637,10 @@ fn build_bare_score_order(bare_terms: &[String]) -> (String, Vec<Box<dyn rusqlit
     for term in bare_terms {
         score_parts.push("(CASE WHEN script_class_lower = ? THEN 32 ELSE 0 END)".to_string());
         score_parts.push("(CASE WHEN script_class_lower LIKE ? THEN 16 ELSE 0 END)".to_string());
-        score_parts.push("(CASE WHEN stem_lower = ? THEN 24 ELSE 0 END)".to_string());
-        score_parts.push("(CASE WHEN stem_lower LIKE ? THEN 12 ELSE 0 END)".to_string());
-        score_parts.push("(CASE WHEN script_type_search LIKE ? THEN 8 ELSE 0 END)".to_string());
+        score_parts.push("(CASE WHEN type_lower = ? THEN 30 ELSE 0 END)".to_string());
+        score_parts.push("(CASE WHEN name_lower = ? THEN 24 ELSE 0 END)".to_string());
+        score_parts.push("(CASE WHEN name_lower LIKE ? THEN 12 ELSE 0 END)".to_string());
+        score_parts.push("(CASE WHEN type_search LIKE ? THEN 8 ELSE 0 END)".to_string());
         score_parts.push("(CASE WHEN file_name_lower LIKE ? THEN 4 ELSE 0 END)".to_string());
 
         let exact = term.clone();
@@ -1337,6 +1648,7 @@ fn build_bare_score_order(bare_terms: &[String]) -> (String, Vec<Box<dyn rusqlit
         let contains = format!("%{}%", term);
         params.push(Box::new(exact.clone()));
         params.push(Box::new(prefix.clone()));
+        params.push(Box::new(exact.clone()));
         params.push(Box::new(exact));
         params.push(Box::new(prefix));
         params.push(Box::new(contains.clone()));
@@ -1366,15 +1678,26 @@ fn build_fts_and_match_query(bare_terms: &[String]) -> Option<String> {
 #[derive(Debug, Clone)]
 pub struct AssetSearchRowDb {
     pub guid: Guid,
+    pub file_id: Option<i64>,
+    pub object_key: String,
     pub path: String,
+    pub name: String,
     pub kind: AssetKind,
     pub root: AssetRoot,
-    pub stem_lower: String,
+    pub name_lower: String,
     pub file_name_lower: String,
+    pub type_name: String,
+    pub type_lower: String,
+    pub type_search: String,
     pub script_class_name: Option<String>,
     pub script_class_lower: String,
-    pub script_type_search: String,
+    pub is_sub_asset: bool,
+    pub target_id: Option<String>,
 }
+
+const ASSET_OBJECT_SELECT_COLUMNS: &str = "asset_guid, file_id, object_key, path, name, kind, root,
+        name_lower, file_name_lower, type_name, type_lower, type_search,
+        script_class_name, script_class_lower, is_sub_asset, target_id";
 
 pub fn get_stored_script_metadata(
     conn: &Connection,
@@ -1684,22 +2007,18 @@ pub fn search_assets_for_command(
         structured.push(&root_pred);
     }
 
-    // Always exclude MetaOnly from the asset-page surface (matches the
-    // walker fallback's `.meta` skip).
-    let exclude_meta = format!(" AND kind != {}", AssetKind::MetaOnly as i32);
     let limit_i = limit as i64;
 
     // ── Branch A: no bare token → pure structured query ───────────────
     if bare_terms.is_empty() {
         let (where_sql, params_vec) = build_structured_where(&structured);
         let sql = format!(
-            "SELECT guid, path, kind, root, stem_lower, file_name_lower,
-                    script_class_name, script_class_lower, script_type_search
-             FROM assets
-             WHERE exists_on_disk = 1 AND {}{}
-             ORDER BY path
+            "SELECT {}
+             FROM asset_objects
+             WHERE searchable = 1 AND {}
+             ORDER BY path, sort_index, name
              LIMIT ?",
-            where_sql, exclude_meta
+            ASSET_OBJECT_SELECT_COLUMNS, where_sql
         );
         return run_select(conn, &sql, params_vec, limit_i);
     }
@@ -1718,13 +2037,12 @@ pub fn search_assets_for_command(
         params_vec.extend(bare_params);
         params_vec.extend(score_params);
         let sql = format!(
-            "SELECT guid, path, kind, root, stem_lower, file_name_lower,
-                    script_class_name, script_class_lower, script_type_search
-             FROM assets
-             WHERE exists_on_disk = 1 AND {}{} AND {}
+            "SELECT {}
+             FROM asset_objects
+             WHERE searchable = 1 AND {} AND {}
              ORDER BY {}
              LIMIT ?",
-            struct_where, exclude_meta, bare_where, score_order
+            ASSET_OBJECT_SELECT_COLUMNS, struct_where, bare_where, score_order
         );
         return run_select(conn, &sql, params_vec, limit_i);
     };
@@ -1736,55 +2054,51 @@ pub fn search_assets_for_command(
     // Splitting lets us pass guids as plain BLOB params and hit the PK
     // autoindex.
     //
-    // Step 1 — query FTS for guid_hex strings (small, capped at limit*4).
-    let fts_buffer = (limit as i64).saturating_mul(4).max(50);
+    // Step 1 — query FTS for object keys (small, capped above the UI limit).
+    let fts_buffer = (limit as i64).saturating_mul(8).max(80);
     let mut fts_stmt = conn
         .prepare(
-            "SELECT guid_hex FROM asset_search_fts
+            "SELECT object_key FROM asset_search_fts
              WHERE asset_search_fts MATCH ?1 LIMIT ?2",
         )
         .map_err(|e| format!("Prepare fts query failed: {}", e))?;
-    let hex_rows = fts_stmt
+    let key_rows = fts_stmt
         .query_map(params![match_term, fts_buffer], |row| {
             row.get::<_, String>(0)
         })
         .map_err(|e| format!("FTS query failed: {}", e))?;
-    let mut guid_blobs: Vec<Vec<u8>> = Vec::new();
-    for h in hex_rows {
-        let hex = h.map_err(|e| format!("FTS row read failed: {}", e))?;
-        if let Some(g) = parse_guid_hex(&hex) {
-            guid_blobs.push(g.to_vec());
-        }
+    let mut object_keys: Vec<String> = Vec::new();
+    for row in key_rows {
+        object_keys.push(row.map_err(|e| format!("FTS row read failed: {}", e))?);
     }
     drop(fts_stmt);
 
-    if guid_blobs.is_empty() {
+    if object_keys.is_empty() {
         return Ok(Vec::new());
     }
 
-    // Step 2 — fetch full rows by guid IN (...) with the rest of the
+    // Step 2 — fetch full rows by object_key IN (...) with the rest of the
     // structured WHERE clauses applied.
-    let placeholders: Vec<&str> = guid_blobs.iter().map(|_| "?").collect();
-    let guid_in = placeholders.join(",");
+    let placeholders: Vec<&str> = object_keys.iter().map(|_| "?").collect();
+    let object_key_in = placeholders.join(",");
 
-    // Bind order: guid IN params, then structured / bare-term params, then
+    // Bind order: object_key IN params, then structured / bare-term params, then
     // ranking params, then LIMIT.
     let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-    for g in guid_blobs {
-        params_vec.push(Box::new(g));
+    for key in object_keys {
+        params_vec.push(Box::new(key));
     }
     params_vec.extend(struct_params);
     params_vec.extend(bare_params);
     params_vec.extend(score_params);
 
     let sql = format!(
-        "SELECT guid, path, kind, root, stem_lower, file_name_lower,
-                script_class_name, script_class_lower, script_type_search
-         FROM assets
-         WHERE guid IN ({}) AND exists_on_disk = 1 AND {}{} AND {}
+        "SELECT {}
+         FROM asset_objects
+         WHERE object_key IN ({}) AND searchable = 1 AND {} AND {}
          ORDER BY {}
          LIMIT ?",
-        guid_in, struct_where, exclude_meta, bare_where, score_order
+        ASSET_OBJECT_SELECT_COLUMNS, object_key_in, struct_where, bare_where, score_order
     );
 
     run_select(conn, &sql, params_vec, limit_i)
@@ -1801,25 +2115,28 @@ fn build_structured_where(
 
     for pred in predicates {
         match pred {
-            SearchPredicate::Type(kinds) => {
-                if kinds.len() == 1 {
-                    clauses.push("kind = ?".to_string());
-                    params.push(Box::new(kinds[0] as i32));
-                } else if !kinds.is_empty() {
-                    let placeholders: Vec<&str> = kinds.iter().map(|_| "?").collect();
-                    clauses.push(format!("kind IN ({})", placeholders.join(",")));
-                    for k in kinds {
-                        params.push(Box::new(*k as i32));
+            SearchPredicate::Type(type_terms) => {
+                if !type_terms.is_empty() {
+                    let placeholders: Vec<&str> = type_terms.iter().map(|_| "?").collect();
+                    clauses.push(format!(
+                        "object_key IN (
+                            SELECT object_key FROM asset_object_type_terms
+                            WHERE term IN ({})
+                        )",
+                        placeholders.join(",")
+                    ));
+                    for term in type_terms {
+                        params.push(Box::new(normalize_type_term(term)));
                     }
                 }
             }
             SearchPredicate::NameExact(names) => {
                 if names.len() == 1 {
-                    clauses.push("stem_lower = ?".to_string());
+                    clauses.push("name_lower = ?".to_string());
                     params.push(Box::new(names[0].to_ascii_lowercase()));
                 } else {
                     let placeholders: Vec<&str> = names.iter().map(|_| "?").collect();
-                    clauses.push(format!("stem_lower IN ({})", placeholders.join(",")));
+                    clauses.push(format!("name_lower IN ({})", placeholders.join(",")));
                     for n in names {
                         params.push(Box::new(n.to_ascii_lowercase()));
                     }
@@ -1828,7 +2145,7 @@ fn build_structured_where(
             SearchPredicate::NamePrefix(prefixes) => {
                 let parts: Vec<String> = prefixes
                     .iter()
-                    .map(|_| "(stem_lower >= ? AND stem_lower < ?)".to_string())
+                    .map(|_| "(name_lower >= ? AND name_lower < ?)".to_string())
                     .collect();
                 clauses.push(if parts.len() == 1 {
                     parts[0].clone()
@@ -1845,7 +2162,7 @@ fn build_structured_where(
             SearchPredicate::NameSuffix(suffixes) => {
                 let parts: Vec<String> = suffixes
                     .iter()
-                    .map(|_| "stem_lower LIKE ?".to_string())
+                    .map(|_| "name_lower LIKE ?".to_string())
                     .collect();
                 clauses.push(if parts.len() == 1 {
                     parts[0].clone()
@@ -1862,7 +2179,7 @@ fn build_structured_where(
                 // token case has already been pulled out as `bare_query`.
                 let parts: Vec<String> = substrs
                     .iter()
-                    .map(|_| "file_name_lower LIKE ?".to_string())
+                    .map(|_| "(name_lower LIKE ? OR file_name_lower LIKE ?)".to_string())
                     .collect();
                 clauses.push(if parts.len() == 1 {
                     parts[0].clone()
@@ -1870,7 +2187,9 @@ fn build_structured_where(
                     format!("({})", parts.join(" OR "))
                 });
                 for s in substrs {
-                    params.push(Box::new(format!("%{}%", s.to_ascii_lowercase())));
+                    let pat = format!("%{}%", s.to_ascii_lowercase());
+                    params.push(Box::new(pat.clone()));
+                    params.push(Box::new(pat));
                 }
             }
             SearchPredicate::Under(path_prefix) => {
@@ -1882,8 +2201,12 @@ fn build_structured_where(
                 params.push(Box::new(hi));
             }
             SearchPredicate::GuidExact(guid) => {
-                clauses.push("guid = ?".to_string());
+                clauses.push("asset_guid = ?".to_string());
                 params.push(Box::new(guid.to_vec()));
+            }
+            SearchPredicate::FileIdExact(file_id) => {
+                clauses.push("file_id = ?".to_string());
+                params.push(Box::new(*file_id));
             }
             SearchPredicate::RootIn(roots) => {
                 if roots.len() == 1 {
@@ -1923,24 +2246,38 @@ fn run_select(
     let rows = stmt
         .query_map(refs.as_slice(), |row| {
             let guid_blob: Vec<u8> = row.get(0)?;
-            let path: String = row.get(1)?;
-            let kind_i: i32 = row.get(2)?;
-            let root_i: i32 = row.get(3)?;
-            let stem_lower: String = row.get(4)?;
-            let file_name_lower: String = row.get(5)?;
-            let script_class_name: String = row.get(6)?;
-            let script_class_lower: String = row.get(7)?;
-            let script_type_search: String = row.get(8)?;
+            let file_id: Option<i64> = row.get(1)?;
+            let object_key: String = row.get(2)?;
+            let path: String = row.get(3)?;
+            let name: String = row.get(4)?;
+            let kind_i: i32 = row.get(5)?;
+            let root_i: i32 = row.get(6)?;
+            let name_lower: String = row.get(7)?;
+            let file_name_lower: String = row.get(8)?;
+            let type_name: String = row.get(9)?;
+            let type_lower: String = row.get(10)?;
+            let type_search: String = row.get(11)?;
+            let script_class_name: String = row.get(12)?;
+            let script_class_lower: String = row.get(13)?;
+            let is_sub_asset: i32 = row.get(14)?;
+            let target_id: String = row.get(15)?;
             Ok(AssetSearchRowDb {
                 guid: blob_to_guid(&guid_blob),
+                file_id,
+                object_key,
                 path,
+                name,
                 kind: AssetKind::from_i32(kind_i),
                 root: AssetRoot::from_i32(root_i),
-                stem_lower,
+                name_lower,
                 file_name_lower,
+                type_name,
+                type_lower,
+                type_search,
                 script_class_name: (!script_class_name.is_empty()).then_some(script_class_name),
                 script_class_lower,
-                script_type_search,
+                is_sub_asset: is_sub_asset != 0,
+                target_id: (!target_id.is_empty()).then_some(target_id),
             })
         })
         .map_err(|e| format!("Query failed: {}", e))?;
@@ -1985,127 +2322,13 @@ pub fn search_assets(
     limit: u32,
     offset: u64,
 ) -> Result<SearchResult, String> {
-    let mut where_clauses: Vec<String> = Vec::new();
-    let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+    let borrowed: Vec<&SearchPredicate> = predicates.iter().collect();
+    let (where_sql, params_vec) = build_structured_where(&borrowed);
 
-    // exists_on_disk goes first so it lines up with the leading column of the
-    // composite indexes.
-    where_clauses.push("exists_on_disk = 1".to_string());
-
-    for pred in predicates {
-        match pred {
-            SearchPredicate::Type(kinds) => {
-                if kinds.len() == 1 {
-                    where_clauses.push("kind = ?".to_string());
-                    params_vec.push(Box::new(kinds[0] as i32));
-                } else {
-                    let placeholders: Vec<&str> = kinds.iter().map(|_| "?").collect();
-                    where_clauses.push(format!("kind IN ({})", placeholders.join(",")));
-                    for k in kinds {
-                        params_vec.push(Box::new(*k as i32));
-                    }
-                }
-            }
-            SearchPredicate::NameExact(names) => {
-                // stem_lower = ? (B-tree). Public DSL is filename-only; no
-                // FTS path involvement.
-                if names.len() == 1 {
-                    where_clauses.push("stem_lower = ?".to_string());
-                    params_vec.push(Box::new(names[0].to_ascii_lowercase()));
-                } else {
-                    let placeholders: Vec<&str> = names.iter().map(|_| "?").collect();
-                    where_clauses.push(format!("stem_lower IN ({})", placeholders.join(",")));
-                    for n in names {
-                        params_vec.push(Box::new(n.to_ascii_lowercase()));
-                    }
-                }
-            }
-            SearchPredicate::NamePrefix(prefixes) => {
-                // Range query on stem_lower. For multiple prefixes we OR them
-                // together (each becomes its own range).
-                let parts: Vec<String> = prefixes
-                    .iter()
-                    .map(|_| "(stem_lower >= ? AND stem_lower < ?)".to_string())
-                    .collect();
-                if parts.len() == 1 {
-                    where_clauses.push(parts[0].clone());
-                } else {
-                    where_clauses.push(format!("({})", parts.join(" OR ")));
-                }
-                for p in prefixes {
-                    let lo = p.to_ascii_lowercase();
-                    let hi = next_prefix(&lo);
-                    params_vec.push(Box::new(lo));
-                    params_vec.push(Box::new(hi));
-                }
-            }
-            SearchPredicate::NameSuffix(suffixes) => {
-                // No leading-anchor index path; LIKE on stem_lower scans the
-                // index but at least dodges the old `replace(...)` expression.
-                let parts: Vec<String> = suffixes
-                    .iter()
-                    .map(|_| "stem_lower LIKE ?".to_string())
-                    .collect();
-                if parts.len() == 1 {
-                    where_clauses.push(parts[0].clone());
-                } else {
-                    where_clauses.push(format!("({})", parts.join(" OR ")));
-                }
-                for s in suffixes {
-                    params_vec.push(Box::new(format!("%{}", s.to_ascii_lowercase())));
-                }
-            }
-            SearchPredicate::NameContains(substrs) => {
-                // Filename-only contains. Public DSL semantics preserved
-                // exactly — we don't reach into FTS or path_lower here.
-                let parts: Vec<String> = substrs
-                    .iter()
-                    .map(|_| "file_name_lower LIKE ?".to_string())
-                    .collect();
-                if parts.len() == 1 {
-                    where_clauses.push(parts[0].clone());
-                } else {
-                    where_clauses.push(format!("({})", parts.join(" OR ")));
-                }
-                for s in substrs {
-                    params_vec.push(Box::new(format!("%{}%", s.to_ascii_lowercase())));
-                }
-            }
-            SearchPredicate::Under(path_prefix) => {
-                // Case-insensitive prefix range on path_lower (preserves the
-                // old `LIKE 'X/%'` ASCII case-insensitive behaviour).
-                let mut lo = path_prefix.trim_end_matches('/').to_ascii_lowercase();
-                lo.push('/');
-                let hi = next_prefix(&lo);
-                where_clauses.push("(path_lower >= ? AND path_lower < ?)".to_string());
-                params_vec.push(Box::new(lo));
-                params_vec.push(Box::new(hi));
-            }
-            SearchPredicate::GuidExact(guid) => {
-                where_clauses.push("guid = ?".to_string());
-                params_vec.push(Box::new(guid.to_vec()));
-            }
-            SearchPredicate::RootIn(roots) => {
-                // The public DSL doesn't expose `root:` parsing, but other
-                // callers (e.g. command layer) may inject this predicate
-                // programmatically. Honour it here too.
-                if roots.len() == 1 {
-                    where_clauses.push("root = ?".to_string());
-                    params_vec.push(Box::new(roots[0] as i32));
-                } else if !roots.is_empty() {
-                    let placeholders: Vec<&str> = roots.iter().map(|_| "?").collect();
-                    where_clauses.push(format!("root IN ({})", placeholders.join(",")));
-                    for r in roots {
-                        params_vec.push(Box::new(*r as i32));
-                    }
-                }
-            }
-        }
-    }
-
-    let where_sql = where_clauses.join(" AND ");
-
-    let count_sql = format!("SELECT COUNT(*) FROM assets WHERE {}", where_sql);
+    let count_sql = format!(
+        "SELECT COUNT(*) FROM asset_objects WHERE searchable = 1 AND {}",
+        where_sql
+    );
     let params_refs: Vec<&dyn rusqlite::types::ToSql> =
         params_vec.iter().map(|p| p.as_ref()).collect();
     let total: u64 = conn
@@ -2122,11 +2345,12 @@ pub fn search_assets(
     }
 
     let select_sql = format!(
-        "SELECT guid, path, kind, script_class_name
-         FROM assets
-         WHERE {}
-         ORDER BY path
+        "SELECT {}
+         FROM asset_objects
+         WHERE searchable = 1 AND {}
+         ORDER BY path, sort_index, name
          LIMIT ? OFFSET ?",
+        ASSET_OBJECT_SELECT_COLUMNS,
         where_sql
     );
 
@@ -2134,55 +2358,41 @@ pub fn search_assets(
     let mut all_params = params_vec;
     all_params.push(Box::new(limit as i64));
     all_params.push(Box::new(offset as i64));
-    let all_refs: Vec<&dyn rusqlite::types::ToSql> =
-        all_params.iter().map(|p| p.as_ref()).collect();
+    let object_rows = run_select(conn, &select_sql, all_params, -1)?;
 
     let field_set: std::collections::HashSet<&str> = fields.iter().map(|s| s.as_str()).collect();
     let want_all = fields.is_empty();
 
-    let mut stmt = conn
-        .prepare(&select_sql)
-        .map_err(|e| format!("Prepare failed: {}", e))?;
-
-    let rows_iter = stmt
-        .query_map(all_refs.as_slice(), |row| {
-            let guid_blob: Vec<u8> = row.get(0)?;
-            let path: String = row.get(1)?;
-            let kind_i: i32 = row.get(2)?;
-            let script_class_name: String = row.get(3)?;
-            Ok((guid_blob, path, kind_i, script_class_name))
-        })
-        .map_err(|e| format!("Query failed: {}", e))?;
-
     let mut result_rows = Vec::new();
-    for row_result in rows_iter {
-        let (guid_blob, path, kind_i, script_class_name) =
-            row_result.map_err(|e| format!("Row read failed: {}", e))?;
-
-        let kind = AssetKind::from_i32(kind_i);
-        let filename = extract_filename(&path);
-
+    for row in object_rows {
+        let name = if row.file_id.is_some() {
+            row.name.clone()
+        } else {
+            extract_filename(&row.path).to_string()
+        };
         result_rows.push(AssetRow {
             tp: if field_set.contains("tp") {
-                Some(format_tool_asset_type(
-                    kind,
-                    Some(script_class_name.as_str()),
-                ))
+                Some(format_tool_asset_type(row.kind, row.type_name.as_str()))
             } else {
                 None
             },
             n: if field_set.contains("n") {
-                Some(filename.to_string())
+                Some(name)
             } else {
                 None
             },
             p: if want_all || field_set.contains("p") {
-                Some(path.clone())
+                Some(row.path.clone())
             } else {
                 None
             },
             guid: if field_set.contains("guid") {
-                Some(guid_to_hex(&blob_to_guid(&guid_blob)))
+                Some(guid_to_hex(&row.guid))
+            } else {
+                None
+            },
+            file_id: if field_set.contains("fileID") || field_set.contains("file_id") {
+                row.file_id.map(|file_id| file_id.to_string())
             } else {
                 None
             },
@@ -2257,14 +2467,24 @@ pub fn delete_missing_asset_path(conn: &mut Connection, asset_path: &str) -> Res
 
     if let Some(guid) = canonical_guid {
         let g = guid.as_slice();
+        asset_fts::delete_by_asset_guid(&tx, g)?;
         tx.execute("DELETE FROM edges WHERE src_guid = ?1", params![g])
             .map_err(|e| format!("Failed to delete outgoing edges: {}", e))?;
+        tx.execute(
+            "DELETE FROM asset_object_type_terms
+             WHERE object_key IN (
+                 SELECT object_key FROM asset_objects WHERE asset_guid = ?1
+             )",
+            params![g],
+        )
+        .map_err(|e| format!("Failed to delete asset object type terms: {}", e))?;
+        tx.execute("DELETE FROM asset_objects WHERE asset_guid = ?1", params![g])
+            .map_err(|e| format!("Failed to delete asset objects: {}", e))?;
         tx.execute("DELETE FROM files WHERE owner_guid = ?1", params![g])
             .map_err(|e| format!("Failed to delete files: {}", e))?;
         tx.execute("DELETE FROM assets WHERE guid = ?1", params![g])
             .map_err(|e| format!("Failed to delete asset: {}", e))?;
         delete_script_inheritance_terms(&tx, &guid)?;
-        asset_fts::delete_by_guid(&tx, &guid_to_hex(&guid))?;
     }
 
     tx.commit()
@@ -2276,6 +2496,7 @@ pub fn delete_missing_asset_path(conn: &mut Connection, asset_path: &str) -> Res
 pub fn atomic_update_asset(
     conn: &mut Connection,
     asset: &AssetNode,
+    objects: &[AssetObject],
     new_edges: &[RefEdge],
     file_records: &[(String, FileRole, u64, u64, [u8; 16])],
 ) -> Result<(), String> {
@@ -2290,40 +2511,22 @@ pub fn atomic_update_asset(
         params![asset.guid.as_slice()],
     )
     .map_err(|e| format!("Failed to delete old edges: {}", e))?;
+    asset_fts::delete_by_asset_guid(&tx, asset.guid.as_slice())?;
+    tx.execute(
+        "DELETE FROM asset_object_type_terms
+         WHERE object_key IN (
+             SELECT object_key FROM asset_objects WHERE asset_guid = ?1
+         )",
+        params![asset.guid.as_slice()],
+    )
+    .map_err(|e| format!("Failed to delete old asset object type terms: {}", e))?;
+    tx.execute(
+        "DELETE FROM asset_objects WHERE asset_guid = ?1",
+        params![asset.guid.as_slice()],
+    )
+    .map_err(|e| format!("Failed to delete old asset objects: {}", e))?;
 
     let (root, path_lower, file_name_lower, stem_lower) = derive_search_cols(&asset.path);
-
-    // Read the existing search keys BEFORE the upsert overwrites them.
-    // Most watcher events are "content changed but file not renamed", in
-    // which case stem_lower / path_lower are identical and the FTS5 trigram
-    // rewrite below is pure waste. PK lookup, sub-millisecond.
-    let old_search_keys: Option<(String, String, String)> = {
-        let mut stmt = tx
-            .prepare_cached(
-                "SELECT stem_lower, path_lower, script_type_search FROM assets WHERE guid = ?1",
-            )
-            .map_err(|e| format!("Prepare FTS skip-check failed: {}", e))?;
-        match stmt.query_row(params![asset.guid.as_slice()], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-            ))
-        }) {
-            Ok(pair) => Some(pair),
-            Err(rusqlite::Error::QueryReturnedNoRows) => None,
-            Err(e) => return Err(format!("FTS skip-check query failed: {}", e)),
-        }
-    };
-
-    let need_fts_update = match &old_search_keys {
-        Some((old_stem, old_path, old_script_types)) => {
-            old_stem != &stem_lower
-                || old_path != &path_lower
-                || old_script_types != &asset.script_type_search
-        }
-        None => true, // brand-new asset, must populate FTS
-    };
 
     tx.execute(
         "INSERT OR REPLACE INTO assets
@@ -2359,16 +2562,10 @@ pub fn atomic_update_asset(
     )
     .map_err(|e| format!("Failed to upsert asset: {}", e))?;
 
-    if need_fts_update {
-        let guid_hex = guid_to_hex(&asset.guid);
-        asset_fts::delete_by_guid(&tx, &guid_hex)?;
-        asset_fts::insert_row(
-            &tx,
-            &guid_hex,
-            &stem_lower,
-            &path_lower,
-            asset.script_type_search.as_str(),
-        )?;
+    let main_object = object_index::main_asset_object(asset);
+    insert_asset_object(&tx, &main_object)?;
+    for object in objects {
+        insert_asset_object(&tx, object)?;
     }
 
     delete_script_inheritance_terms(&tx, &asset.guid)?;
@@ -2378,14 +2575,15 @@ pub fn atomic_update_asset(
         let mut stmt = tx
             .prepare_cached(
                 "INSERT OR IGNORE INTO edges
-                 (src_guid, dst_guid, dst_file_id, class_id_hint, field_hint, ref_path)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                 (src_guid, src_file_id, dst_guid, dst_file_id, class_id_hint, field_hint, ref_path)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             )
             .map_err(|e| format!("Failed to prepare edge insert: {}", e))?;
 
         for edge in new_edges {
             stmt.execute(params![
                 edge.src_guid.as_slice(),
+                edge.src_file_id,
                 edge.dst_guid.as_slice(),
                 edge.dst_file_id,
                 edge.class_id_hint,
@@ -2654,6 +2852,38 @@ mod tests {
         tx.commit().unwrap();
     }
 
+    fn test_sub_object(
+        asset: &AssetNode,
+        file_id: i64,
+        name: &str,
+        type_name: &str,
+        type_search: &str,
+    ) -> AssetObject {
+        let (root_i, path_lower, file_name_lower, _) = derive_search_cols(&asset.path);
+        AssetObject {
+            object_key: asset_object_key(&asset.guid, Some(file_id)),
+            asset_guid: asset.guid,
+            file_id: Some(file_id),
+            path: asset.path.clone(),
+            kind: asset.kind,
+            root: AssetRoot::from_i32(root_i),
+            path_lower,
+            file_name_lower,
+            name: name.to_string(),
+            name_lower: name.to_ascii_lowercase(),
+            type_name: type_name.to_string(),
+            type_lower: type_name.to_ascii_lowercase(),
+            type_search: type_search.to_string(),
+            script_class_name: Some(type_name.to_string()),
+            script_class_lower: type_name.to_ascii_lowercase(),
+            is_main: false,
+            is_sub_asset: true,
+            searchable: true,
+            target_id: Some(format!("doc:{}", file_id)),
+            sort_index: 10,
+        }
+    }
+
     #[test]
     fn parse_query_supports_quoted_or_name_values() {
         let parsed =
@@ -2662,8 +2892,8 @@ mod tests {
 
         assert_eq!(parsed.len(), 2);
         match &parsed[0] {
-            SearchPredicate::Type(kinds) => {
-                assert_eq!(kinds, &vec![AssetKind::Prefab, AssetKind::Material]);
+            SearchPredicate::Type(terms) => {
+                assert_eq!(terms, &vec!["prefab".to_string(), "material".to_string()]);
             }
             other => panic!("expected type predicate, got {other:?}"),
         }
@@ -2739,6 +2969,101 @@ mod tests {
         assert_eq!(
             result.rows[0].p.as_deref(),
             Some("Assets/Lighting/Point Light.prefab")
+        );
+    }
+
+    #[test]
+    fn search_assets_matches_sub_asset_name_type_and_file_id() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        let asset = test_asset(
+            "Assets/Data/EventChannels.asset",
+            AssetKind::GenericAsset,
+            "scriptableobject",
+        );
+        seed_assets(&mut conn, &[asset.clone()]);
+        let sub = test_sub_object(
+            &asset,
+            11400000,
+            "Cure Event",
+            "CureEventChannel",
+            "cureeventchannel scriptableobject monobehaviour",
+        );
+        let tx = conn.transaction().unwrap();
+        batch_insert_asset_objects(&tx, &[sub]).unwrap();
+        tx.commit().unwrap();
+
+        let result = search_assets(
+            &conn,
+            &parse_query(r#"t:CureEventChannel n:"Cure Event" fileID:11400000"#).unwrap(),
+            &[
+                "p".to_string(),
+                "n".to_string(),
+                "tp".to_string(),
+                "guid".to_string(),
+                "fileID".to_string(),
+            ],
+            20,
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(result.total, 1);
+        let row = &result.rows[0];
+        assert_eq!(row.p.as_deref(), Some("Assets/Data/EventChannels.asset"));
+        assert_eq!(row.n.as_deref(), Some("Cure Event"));
+        assert_eq!(row.tp.as_deref(), Some("CureEventChannel(genericAsset)"));
+        assert_eq!(row.file_id.as_deref(), Some("11400000"));
+
+        let rows = search_assets_for_command(
+            &conn,
+            "cure t:CureEventChannel",
+            &[AssetRoot::Assets],
+            20,
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].file_id, Some(11400000));
+        assert_eq!(rows[0].name, "Cure Event");
+    }
+
+    #[test]
+    fn direct_object_ref_queries_match_guid_and_file_id() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        let src = test_asset("Assets/Scenes/Main.prefab", AssetKind::Prefab, "");
+        let dst = test_asset("Assets/Data/EventChannels.asset", AssetKind::GenericAsset, "");
+        seed_assets(&mut conn, &[src.clone(), dst.clone()]);
+        let tx = conn.transaction().unwrap();
+        batch_insert_edges(
+            &tx,
+            &[RefEdge {
+                src_guid: src.guid,
+                src_file_id: Some(2000),
+                dst_guid: dst.guid,
+                dst_file_id: Some(11400000),
+                class_id_hint: Some(114),
+                field_hint: Some("target".to_string()),
+                ref_path: Some("Root/MyComponent.target".to_string()),
+            }],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        assert_eq!(
+            get_direct_deps_for_object(&conn, &src.guid, 2000)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            get_direct_refs_for_object(&conn, &dst.guid, 11400000)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            get_direct_refs_for_object(&conn, &dst.guid, 11400001)
+                .unwrap()
+                .is_empty()
         );
     }
 
@@ -2876,6 +3201,7 @@ mod tests {
             &tx,
             &[RefEdge {
                 src_guid: src.guid,
+                src_file_id: Some(1000),
                 dst_guid: dst.guid,
                 dst_file_id: Some(11500000),
                 class_id_hint: Some(114),
@@ -2934,6 +3260,7 @@ mod tests {
             &tx,
             &[RefEdge {
                 src_guid: old_guid,
+                src_file_id: None,
                 dst_guid: target.guid,
                 dst_file_id: None,
                 class_id_hint: None,
@@ -2951,6 +3278,7 @@ mod tests {
         atomic_update_asset(
             &mut conn,
             &fresh,
+            &[],
             &[],
             &[(
                 meta_path.clone(),
@@ -2976,7 +3304,7 @@ mod tests {
 
         let old_fts_count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM asset_search_fts WHERE guid_hex = ?1",
+                "SELECT COUNT(*) FROM asset_search_fts WHERE object_key = ?1",
                 rusqlite::params![guid_to_hex(&old_guid)],
                 |row| row.get(0),
             )
@@ -3131,20 +3459,20 @@ mod tests {
         );
 
         conn.execute(
-            "INSERT INTO edges (src_guid, dst_guid, dst_file_id, class_id_hint, field_hint, ref_path)
-             VALUES (?1, ?2, NULL, NULL, NULL, NULL)",
+            "INSERT INTO edges (src_guid, src_file_id, dst_guid, dst_file_id, class_id_hint, field_hint, ref_path)
+             VALUES (?1, NULL, ?2, NULL, NULL, NULL, NULL)",
             params![player_prefab.guid.as_slice(), entity.guid.as_slice()],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO edges (src_guid, dst_guid, dst_file_id, class_id_hint, field_hint, ref_path)
-             VALUES (?1, ?2, NULL, NULL, NULL, NULL)",
+            "INSERT INTO edges (src_guid, src_file_id, dst_guid, dst_file_id, class_id_hint, field_hint, ref_path)
+             VALUES (?1, NULL, ?2, NULL, NULL, NULL, NULL)",
             params![enemy_prefab.guid.as_slice(), enemy.guid.as_slice()],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO edges (src_guid, dst_guid, dst_file_id, class_id_hint, field_hint, ref_path)
-             VALUES (?1, ?2, NULL, NULL, NULL, NULL)",
+            "INSERT INTO edges (src_guid, src_file_id, dst_guid, dst_file_id, class_id_hint, field_hint, ref_path)
+             VALUES (?1, NULL, ?2, NULL, NULL, NULL, NULL)",
             params![material.guid.as_slice(), entity.guid.as_slice()],
         )
         .unwrap();
@@ -3199,6 +3527,42 @@ mod tests {
     }
 
     #[test]
+    fn generic_scriptable_object_search_matches_actual_type_and_base_terms() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        let mut asset = test_asset(
+            "Assets/ScriptableObjects/EventChannels/SlimeCritter_NPCMovementEventChannel.asset",
+            AssetKind::GenericAsset,
+            "npcmovementeventchannelso game.events.npcmovementeventchannelso movementeventchannelso eventchannelso scriptableobject",
+        );
+        asset.script_class_name = Some("NPCMovementEventChannelSO".to_string());
+        asset.script_class_lower = "npcmovementeventchannelso".to_string();
+        asset.script_namespace_lower = "game.events".to_string();
+        asset.script_full_name_lower = "game.events.npcmovementeventchannelso".to_string();
+        asset.script_inheritance_search =
+            "movementeventchannelso eventchannelso scriptableobject".to_string();
+        seed_assets(&mut conn, &[asset]);
+
+        for query in [
+            "t:NPCMovementEventChannelSO",
+            "t:MovementEventChannelSO",
+            "t:EventChannelSO",
+            "t:ScriptableObject",
+        ] {
+            let rows = search_assets_for_command(&conn, query, &[AssetRoot::Assets], 20).unwrap();
+            assert_eq!(rows.len(), 1, "query should match SO asset: {query}");
+            assert_eq!(
+                rows[0].path,
+                "Assets/ScriptableObjects/EventChannels/SlimeCritter_NPCMovementEventChannel.asset"
+            );
+            assert_eq!(
+                rows[0].script_class_name.as_deref(),
+                Some("NPCMovementEventChannelSO")
+            );
+            assert_eq!(rows[0].type_name, "NPCMovementEventChannelSO");
+        }
+    }
+
+    #[test]
     fn search_assets_formats_generic_asset_tp_with_script_class_name() {
         let mut conn = Connection::open_in_memory().unwrap();
         let mut asset = test_asset(
@@ -3211,7 +3575,7 @@ mod tests {
 
         let result = search_assets(
             &conn,
-            &[SearchPredicate::Type(vec![AssetKind::GenericAsset])],
+            &[SearchPredicate::Type(vec!["genericasset".to_string()])],
             &["tp".to_string(), "p".to_string()],
             20,
             0,

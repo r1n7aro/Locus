@@ -12,6 +12,7 @@ use serde::Serialize;
 
 use super::db;
 use super::meta_parser;
+use super::object_index;
 use super::scanner::{self, P1_EXTENSIONS};
 use super::script_parser;
 use super::types::*;
@@ -971,22 +972,40 @@ fn process_dirty_asset(
     let mut asset_mtime = meta_mtime;
     let mut asset_size = 0u64;
     let mut stored_script_meta: Option<db::StoredScriptMetadata> = None;
+    let mut yaml_docs: Option<Vec<unity_yaml::YamlDoc>> = None;
+    let mut script_type_by_guid: HashMap<Guid, db::StoredScriptMetadata> = HashMap::new();
 
     if asset_exists && is_yaml_asset_ext(&ext) {
         let content = std::fs::read(&asset_abs)
             .map_err(|e| format!("Failed to read {}: {}", asset_abs.display(), e))?;
         let guid_to_path = resolve_guid_paths_for_content(&content, graph_state)?;
         let refs = unity_yaml::extract_refs_with_resolver(&content, Some(&guid_to_path));
+        let docs = unity_yaml::parse_yaml_docs(&content);
         content_hash = hash128(&content);
         let metadata = std::fs::metadata(&asset_abs).ok();
         asset_mtime = metadata.as_ref().map(scanner::get_mtime_ns).unwrap_or(0);
         asset_size = metadata.map(|m| m.len()).unwrap_or(0);
         kind = AssetKind::from_ext(&ext);
 
+        let script_guids: HashSet<Guid> = docs.iter().filter_map(|doc| doc.m_script_guid).collect();
+        if !script_guids.is_empty() {
+            let guard = graph_state
+                .lock()
+                .map_err(|e| format!("Lock error: {}", e))?;
+            if let Some(graph) = guard.as_ref() {
+                for script_guid in script_guids {
+                    if let Some(meta) = db::get_stored_script_metadata(&graph.conn, &script_guid)? {
+                        script_type_by_guid.insert(script_guid, meta);
+                    }
+                }
+            }
+        }
+
         edges = refs
             .iter()
             .map(|r| RefEdge {
                 src_guid: guid,
+                src_file_id: r.src_file_id,
                 dst_guid: r.dst_guid,
                 dst_file_id: r.dst_file_id,
                 class_id_hint: r.class_id_hint,
@@ -996,24 +1015,20 @@ fn process_dirty_asset(
             .collect();
 
         if kind == AssetKind::GenericAsset {
-            let script_guid = unity_yaml::parse_yaml_docs(&content)
-                .into_iter()
+            let script_guid = docs
+                .iter()
                 .find(|doc| doc.doc_index == 0 && doc.class_id == 114)
                 .and_then(|doc| doc.m_script_guid);
 
             if let Some(script_guid) = script_guid {
-                let guard = graph_state
-                    .lock()
-                    .map_err(|e| format!("Lock error: {}", e))?;
-                if let Some(graph) = guard.as_ref() {
-                    if let Some(meta) = db::get_stored_script_metadata(&graph.conn, &script_guid)? {
-                        if meta.inherits_scriptable_object() {
-                            stored_script_meta = Some(meta);
-                        }
+                if let Some(meta) = script_type_by_guid.get(&script_guid) {
+                    if meta.inherits_scriptable_object() {
+                        stored_script_meta = Some(meta.clone());
                     }
                 }
             }
         }
+        yaml_docs = Some(docs);
     } else if asset_exists && ext == "cs" {
         let snapshot = script_parser::read_script_file_snapshot(&asset_abs)
             .ok_or_else(|| format!("Failed to read script file: {}", asset_abs.display()))?;
@@ -1142,6 +1157,31 @@ fn process_dirty_asset(
             .unwrap_or_default(),
     };
 
+    let mut asset_objects: Vec<AssetObject> = Vec::new();
+    if let Some(docs) = yaml_docs.as_ref() {
+        asset_objects.extend(object_index::build_yaml_asset_objects(
+            &node,
+            docs,
+            |script_guid| {
+                script_type_by_guid.get(script_guid).map(|meta| {
+                    object_index::ScriptTypeInfo {
+                        class_name: meta.class_name.clone(),
+                        class_name_lower: meta.class_name_lower.clone(),
+                        full_name_lower: meta.full_name_lower.clone(),
+                        type_search_lower: meta.type_search_lower.clone(),
+                    }
+                })
+            },
+        ));
+    }
+    let importer_subassets = object_index::parse_importer_subassets(&meta_content);
+    if !importer_subassets.is_empty() {
+        asset_objects.extend(object_index::build_importer_sub_asset_objects(
+            &node,
+            &importer_subassets,
+        ));
+    }
+
     let meta_rel = format!("{}.meta", asset_rel_path);
     let mut file_records = vec![(meta_rel, FileRole::Meta, meta_mtime, meta_size, meta_hash)];
     if asset_exists && is_yaml_asset_ext(&ext) {
@@ -1163,7 +1203,13 @@ fn process_dirty_asset(
         .map_err(|e| format!("Lock error: {}", e))?;
     let mut cascade_paths = Vec::new();
     if let Some(ref mut graph) = *guard {
-        db::atomic_update_asset(&mut graph.conn, &node, &edges, &file_records)?;
+        db::atomic_update_asset(
+            &mut graph.conn,
+            &node,
+            &asset_objects,
+            &edges,
+            &file_records,
+        )?;
         if ext == "cs" {
             let source_path = Some(asset_rel_path.to_string());
             for path in db::find_asset_paths_referencing_guid(&graph.conn, &guid)? {
@@ -2628,6 +2674,7 @@ mod tests {
             &mut graph.conn,
             &node,
             &[],
+            &[],
             &[(
                 format!("{}.meta", asset_path),
                 FileRole::Meta,
@@ -2689,6 +2736,7 @@ mod tests {
         db::atomic_update_asset(
             &mut graph.conn,
             &stale_node,
+            &[],
             &[],
             &[(
                 format!("{}.meta", asset_path),
@@ -2936,6 +2984,7 @@ mod tests {
         db::atomic_update_asset(
             &mut graph.conn,
             &node,
+            &[],
             &[],
             &[
                 (

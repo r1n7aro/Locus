@@ -24,6 +24,12 @@ vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn(async () => () => {}),
 }));
 vi.mock("../services/errors", () => ({
+  isUnityConnectionError: (error: unknown) => {
+    const message = typeof error === "object" && error !== null && "message" in error
+      ? String((error as { message: unknown }).message)
+      : String(error);
+    return /failed to connect to unity editor/i.test(message);
+  },
   normalizeAppError: (error: unknown) => {
     if (typeof error === "object" && error !== null && "message" in error) return error;
     return {

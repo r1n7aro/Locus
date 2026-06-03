@@ -19,6 +19,8 @@
 //!     payloads. Looks up a `WorkspacePreviewSession` by `previewKey` and
 //!     builds a `SemanticTargetInspector` for the requested target id. Cache
 //!     misses return a retryable `asset.preview.cache_miss` error.
+//!   - `preview_workspace_asset_thumbnail` — asks Unity for a real asset
+//!     preview image when the local parser cannot produce a visual thumbnail.
 //!   - `get_watcher_tuning` / `set_watcher_tuning` — live tunables for the
 //!     incremental ref_graph watcher (debounce + worker count).
 //!
@@ -35,8 +37,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Instant, UNIX_EPOCH};
 
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use tauri::State;
 use uuid::Uuid;
@@ -857,6 +860,12 @@ pub struct AssetSearchResult {
     pub path: String,
     /// Filename including extension.
     pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub object_key: Option<String>,
     pub root: AssetSearchRoot,
     /// camelCase asset kind string. For ref_graph results this is
     /// `AssetKind::camel_str()`; for filesystem-fallback results it falls back
@@ -866,6 +875,11 @@ pub struct AssetSearchResult {
     /// present, the frontend prefers this over the coarse `kind` badge.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub type_label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub type_search: Option<String>,
+    pub is_sub_asset: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_id: Option<String>,
     /// Higher = better match. Used for sorting; not exposed for ranking math.
     pub match_score: i32,
     pub source: AssetSearchSource,
@@ -995,9 +1009,15 @@ fn walk_root_for_search(
         out.push(AssetSearchResult {
             path: rel_str,
             name,
+            guid: None,
+            file_id: None,
+            object_key: None,
             root,
             kind,
             type_label: None,
+            type_search: None,
+            is_sub_asset: false,
+            target_id: None,
             match_score: score,
             source: AssetSearchSource::Filesystem,
         });
@@ -1053,6 +1073,7 @@ fn extract_bare_terms(query: &str) -> Vec<String> {
             || token.starts_with("n$")
             || token.starts_with("under:")
             || token.starts_with("guid:")
+            || token.to_ascii_lowercase().starts_with("fileid:")
             || is_script_ref_filter_token(token)
         {
             continue;
@@ -1074,11 +1095,11 @@ fn ui_score_match(row: &crate::asset_db::AssetSearchRowDb, bare_terms: &[String]
     let path_lower = row.path.to_ascii_lowercase();
     let mut score = 0;
     for term in bare_terms {
-        if row.script_class_lower == *term || row.stem_lower == *term {
+        if row.script_class_lower == *term || row.type_lower == *term || row.name_lower == *term {
             score += SCORE_FILENAME_EXACT;
-        } else if row.script_class_lower.starts_with(term) || row.stem_lower.starts_with(term) {
+        } else if row.script_class_lower.starts_with(term) || row.name_lower.starts_with(term) {
             score += SCORE_FILENAME_PREFIX;
-        } else if row.script_type_search.contains(term) || row.file_name_lower.contains(term) {
+        } else if row.type_search.contains(term) || row.file_name_lower.contains(term) {
             score += SCORE_FILENAME_CONTAINS;
         } else if path_lower.contains(term) {
             score += SCORE_PATH_CONTAINS;
@@ -1186,12 +1207,7 @@ pub async fn search_workspace_assets(
             let Some(ui_root) = AssetSearchRoot::from_db_root(row.root) else {
                 continue;
             };
-            let name = row
-                .path
-                .rsplit('/')
-                .next()
-                .unwrap_or(row.path.as_str())
-                .to_string();
+            let name = row.name.clone();
             // Coarse UI score tier computed against the BARE token only —
             // matching the whole raw query (incl. `t:prefab`) would collapse
             // every row to the lowest tier. Purely cosmetic; ordering is
@@ -1200,13 +1216,21 @@ pub async fn search_workspace_assets(
             results.push(AssetSearchResult {
                 path: row.path,
                 name,
+                guid: Some(crate::asset_db::types::guid_to_hex(&row.guid)),
+                file_id: row.file_id,
+                object_key: Some(row.object_key),
                 root: ui_root,
                 kind: row.kind.camel_str().to_string(),
-                type_label: if row.kind == crate::asset_db::types::AssetKind::GenericAsset {
+                type_label: if row.is_sub_asset {
+                    Some(row.type_name)
+                } else if row.kind == crate::asset_db::types::AssetKind::GenericAsset {
                     row.script_class_name
                 } else {
                     None
                 },
+                type_search: (!row.type_search.trim().is_empty()).then_some(row.type_search),
+                is_sub_asset: row.is_sub_asset,
+                target_id: row.target_id,
                 match_score: score,
                 source: AssetSearchSource::AssetDb,
             });
@@ -1248,7 +1272,14 @@ pub async fn search_workspace_assets(
     // are appended after. We keep the FIRST occurrence of each path so
     // index ordering wins over walker ordering.
     let mut seen: HashSet<String> = HashSet::new();
-    results.retain(|r| seen.insert(r.path.clone()));
+    results.retain(|r| {
+        let key = r
+            .object_key
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| r.path.clone());
+        seen.insert(key)
+    });
 
     if results.len() > result_limit {
         results.truncate(result_limit);
@@ -1309,6 +1340,54 @@ pub struct AssetBinaryMeta {
     /// Best-effort Unity importer hints from the sidecar `.meta` file.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unity_texture: Option<UnityTexturePreviewMeta>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssetThumbnailPreview {
+    pub asset_path: String,
+    pub url: String,
+    pub width: u32,
+    pub height: u32,
+    pub mime_type: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssetPreviewFrame {
+    pub asset_path: String,
+    pub url: String,
+    pub width: u32,
+    pub height: u32,
+    pub mime_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub yaw: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pitch: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub distance: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pan_x: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pan_y: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pan_z: Option<f32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AssetPreviewFrameCacheMeta {
+    asset_path: String,
+    source_mtime_ms: u64,
+    width: u32,
+    height: u32,
+    mime_type: String,
+    yaw: f32,
+    pitch: f32,
+    distance: f32,
+    pan_x: f32,
+    pan_y: f32,
+    pan_z: f32,
 }
 
 /// Lightweight target metadata returned in the first `structured` payload.
@@ -1899,6 +1978,7 @@ fn is_slice3c_yaml_ext(ext: &str) -> bool {
             | "anim"
             | "controller"
             | "overridecontroller"
+            | "mixer"
             | "physicmaterial"
             | "physicsmaterial2d"
             | "flare"
@@ -1907,8 +1987,12 @@ fn is_slice3c_yaml_ext(ext: &str) -> bool {
             | "preset"
             | "lighting"
             | "terrainlayer"
+            | "rendertexture"
             | "signal"
             | "playable"
+            | "cubemap"
+            | "guiskin"
+            | "brush"
     )
 }
 
@@ -1934,6 +2018,14 @@ fn label_for_doc(
         },
         _ => format!("{} (fileID:{})", title, doc.file_id),
     }
+}
+
+fn yaml_structured_preview_doc_should_include(rel_path: &str, doc: &YamlDoc) -> bool {
+    let ext = rel_path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    if ext == "playable" && doc.doc_index > 0 {
+        return false;
+    }
+    true
 }
 
 /// Construct a workspace-mode `SideContext` borrowed from `ref_graph_state`.
@@ -1965,7 +2057,15 @@ fn try_build_yaml_structured_payload(
     // Flat asset preview: docs + lines only. No hierarchy/component
     // indices — the inspector path for `doc:<fileId>` targets reads
     // neither.
-    let flat = UnityYamlDocs::parse(&bytes);
+    let mut flat = UnityYamlDocs::parse(&bytes);
+    if flat.docs.is_empty() {
+        return None;
+    }
+    flat.docs = flat
+        .docs
+        .into_iter()
+        .filter(|doc| yaml_structured_preview_doc_should_include(rel_path, doc))
+        .collect();
     if flat.docs.is_empty() {
         return None;
     }
@@ -2327,6 +2427,318 @@ pub async fn preview_workspace_asset_target(
 }
 
 #[tauri::command]
+pub async fn preview_workspace_asset_thumbnail(
+    file_path: String,
+    workspace: State<'_, Arc<Workspace>>,
+) -> Result<AssetThumbnailPreview, AppError> {
+    let cwd = workspace.path.read().await.clone();
+    if cwd.is_empty() {
+        return Err(AppError::new(
+            "asset.thumbnail.no_workspace",
+            "No workspace is currently open",
+        ));
+    }
+
+    let workspace_root = PathBuf::from(&cwd);
+    let (_canonical, asset_rel_path) = resolve_workspace_path(&workspace_root, &file_path)?;
+    if !asset_rel_path.to_ascii_lowercase().ends_with(".prefab") {
+        return Err(AppError::new(
+            "asset.thumbnail.unsupported",
+            format!("Asset thumbnail only supports prefab paths: {}", asset_rel_path),
+        ));
+    }
+
+    let thumbnail = crate::unity_bridge::asset_thumbnail(&cwd, &asset_rel_path, 192)
+        .await
+        .map_err(|error| {
+            AppError::new("asset.thumbnail.unavailable", error)
+                .operation("previewWorkspaceAssetThumbnail")
+        })?;
+    let mime_type = if thumbnail.mime_type.trim().is_empty() {
+        "image/png".to_string()
+    } else {
+        thumbnail.mime_type
+    };
+    let url = format!("data:{};base64,{}", mime_type, thumbnail.png_base64);
+
+    Ok(AssetThumbnailPreview {
+        asset_path: thumbnail.asset_path,
+        url,
+        width: thumbnail.width,
+        height: thumbnail.height,
+        mime_type,
+    })
+}
+
+const ASSET_PREVIEW_FRAME_CACHE_DIR: &str = "asset-preview-cache";
+
+fn asset_preview_frame_cache_key(asset_rel_path: &str) -> String {
+    blake3::hash(asset_rel_path.to_ascii_lowercase().as_bytes())
+        .to_hex()
+        .to_string()
+}
+
+fn asset_preview_frame_cache_paths(workspace_root: &Path, asset_rel_path: &str) -> (PathBuf, PathBuf) {
+    let key = asset_preview_frame_cache_key(asset_rel_path);
+    let dir = workspace_root
+        .join("Library")
+        .join("Locus")
+        .join(ASSET_PREVIEW_FRAME_CACHE_DIR);
+    (dir.join(format!("{}.png", key)), dir.join(format!("{}.json", key)))
+}
+
+fn source_mtime_ms(path: &Path) -> Result<u64, AppError> {
+    let modified = std::fs::metadata(path)
+        .map_err(|error| AppError::new("asset.preview_frame_cache.metadata", error.to_string()))?
+        .modified()
+        .map_err(|error| AppError::new("asset.preview_frame_cache.mtime", error.to_string()))?;
+    Ok(modified
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64)
+}
+
+fn decode_preview_frame_data_url(url: &str) -> Result<(String, Vec<u8>), AppError> {
+    let (header, encoded) = url.split_once(',').ok_or_else(|| {
+        AppError::new(
+            "asset.preview_frame_cache.invalid_data_url",
+            "Preview frame cache data URL is missing payload",
+        )
+    })?;
+    let mime_type = header
+        .strip_prefix("data:")
+        .and_then(|value| value.strip_suffix(";base64"))
+        .ok_or_else(|| {
+            AppError::new(
+                "asset.preview_frame_cache.invalid_data_url",
+                "Preview frame cache only accepts base64 data URLs",
+            )
+        })?;
+    if mime_type != "image/png" {
+        return Err(AppError::new(
+            "asset.preview_frame_cache.unsupported_mime",
+            format!("Preview frame cache only accepts image/png, got {}", mime_type),
+        ));
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|error| AppError::new("asset.preview_frame_cache.decode", error.to_string()))?;
+    Ok((mime_type.to_string(), bytes))
+}
+
+#[tauri::command]
+pub async fn read_workspace_asset_preview_frame_cache(
+    file_path: String,
+    workspace: State<'_, Arc<Workspace>>,
+) -> Result<Option<AssetPreviewFrame>, AppError> {
+    let cwd = workspace.path.read().await.clone();
+    if cwd.is_empty() {
+        return Err(AppError::new(
+            "asset.preview_frame_cache.no_workspace",
+            "No workspace is currently open",
+        ));
+    }
+
+    let workspace_root = PathBuf::from(&cwd);
+    let (canonical, asset_rel_path) = resolve_workspace_path(&workspace_root, &file_path)?;
+    if !asset_rel_path.to_ascii_lowercase().ends_with(".prefab") {
+        return Ok(None);
+    }
+
+    let (image_path, meta_path) = asset_preview_frame_cache_paths(&workspace_root, &asset_rel_path);
+    if !image_path.is_file() || !meta_path.is_file() {
+        return Ok(None);
+    }
+
+    let meta_raw = match std::fs::read_to_string(&meta_path) {
+        Ok(raw) => raw,
+        Err(_) => return Ok(None),
+    };
+    let meta = match serde_json::from_str::<AssetPreviewFrameCacheMeta>(&meta_raw) {
+        Ok(meta) => meta,
+        Err(_) => return Ok(None),
+    };
+    if meta.asset_path != asset_rel_path || meta.source_mtime_ms != source_mtime_ms(&canonical)? {
+        return Ok(None);
+    }
+
+    let bytes = match std::fs::read(&image_path) {
+        Ok(bytes) => bytes,
+        Err(_) => return Ok(None),
+    };
+    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+    let mime_type = if meta.mime_type.trim().is_empty() {
+        "image/png".to_string()
+    } else {
+        meta.mime_type
+    };
+
+    Ok(Some(AssetPreviewFrame {
+        asset_path: meta.asset_path,
+        url: format!("data:{};base64,{}", mime_type, encoded),
+        width: meta.width,
+        height: meta.height,
+        mime_type,
+        yaw: Some(meta.yaw),
+        pitch: Some(meta.pitch),
+        distance: Some(meta.distance),
+        pan_x: Some(meta.pan_x),
+        pan_y: Some(meta.pan_y),
+        pan_z: Some(meta.pan_z),
+    }))
+}
+
+#[tauri::command]
+pub async fn cache_workspace_asset_preview_frame(
+    file_path: String,
+    url: String,
+    width: u32,
+    height: u32,
+    mime_type: String,
+    yaw: f32,
+    pitch: f32,
+    distance: f32,
+    pan_x: f32,
+    pan_y: f32,
+    pan_z: f32,
+    workspace: State<'_, Arc<Workspace>>,
+) -> Result<(), AppError> {
+    let cwd = workspace.path.read().await.clone();
+    if cwd.is_empty() {
+        return Err(AppError::new(
+            "asset.preview_frame_cache.no_workspace",
+            "No workspace is currently open",
+        ));
+    }
+
+    let workspace_root = PathBuf::from(&cwd);
+    let (canonical, asset_rel_path) = resolve_workspace_path(&workspace_root, &file_path)?;
+    if !asset_rel_path.to_ascii_lowercase().ends_with(".prefab") {
+        return Ok(());
+    }
+
+    let (_mime_from_url, bytes) = decode_preview_frame_data_url(&url)?;
+    let (image_path, meta_path) = asset_preview_frame_cache_paths(&workspace_root, &asset_rel_path);
+    if let Some(parent) = image_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            AppError::new(
+                "asset.preview_frame_cache.create_dir",
+                format!("Failed to create preview frame cache directory: {}", error),
+            )
+        })?;
+    }
+    std::fs::write(&image_path, bytes).map_err(|error| {
+        AppError::new(
+            "asset.preview_frame_cache.write_image",
+            format!("Failed to write preview frame cache image: {}", error),
+        )
+    })?;
+    let meta = AssetPreviewFrameCacheMeta {
+        asset_path: asset_rel_path,
+        source_mtime_ms: source_mtime_ms(&canonical)?,
+        width,
+        height,
+        mime_type: if mime_type.trim().is_empty() {
+            "image/png".to_string()
+        } else {
+            mime_type
+        },
+        yaw,
+        pitch,
+        distance,
+        pan_x,
+        pan_y,
+        pan_z,
+    };
+    let meta_json = serde_json::to_vec_pretty(&meta).map_err(|error| {
+        AppError::new(
+            "asset.preview_frame_cache.serialize",
+            format!("Failed to serialize preview frame cache metadata: {}", error),
+        )
+    })?;
+    std::fs::write(&meta_path, meta_json).map_err(|error| {
+        AppError::new(
+            "asset.preview_frame_cache.write_meta",
+            format!("Failed to write preview frame cache metadata: {}", error),
+        )
+    })?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn render_workspace_asset_preview_frame(
+    file_path: String,
+    width: u32,
+    height: u32,
+    yaw: f32,
+    pitch: f32,
+    distance: f32,
+    pan_x: f32,
+    pan_y: f32,
+    pan_z: f32,
+    workspace: State<'_, Arc<Workspace>>,
+) -> Result<AssetPreviewFrame, AppError> {
+    let cwd = workspace.path.read().await.clone();
+    if cwd.is_empty() {
+        return Err(AppError::new(
+            "asset.preview_frame.no_workspace",
+            "No workspace is currently open",
+        ));
+    }
+
+    let workspace_root = PathBuf::from(&cwd);
+    let (_canonical, asset_rel_path) = resolve_workspace_path(&workspace_root, &file_path)?;
+    if !asset_rel_path.to_ascii_lowercase().ends_with(".prefab") {
+        return Err(AppError::new(
+            "asset.preview_frame.unsupported",
+            format!(
+                "Interactive asset preview only supports prefab paths: {}",
+                asset_rel_path
+            ),
+        ));
+    }
+
+    let frame = crate::unity_bridge::asset_preview_render(
+        &cwd,
+        &asset_rel_path,
+        width.clamp(96, 640),
+        height.clamp(96, 640),
+        yaw,
+        pitch,
+        distance,
+        pan_x,
+        pan_y,
+        pan_z,
+    )
+    .await
+    .map_err(|error| {
+        AppError::new("asset.preview_frame.unavailable", error)
+            .operation("renderWorkspaceAssetPreviewFrame")
+    })?;
+    let mime_type = if frame.mime_type.trim().is_empty() {
+        "image/png".to_string()
+    } else {
+        frame.mime_type
+    };
+    let url = format!("data:{};base64,{}", mime_type, frame.data_base64);
+
+    Ok(AssetPreviewFrame {
+        asset_path: frame.asset_path,
+        url,
+        width: frame.width,
+        height: frame.height,
+        mime_type,
+        yaw: Some(yaw),
+        pitch: Some(pitch),
+        distance: Some(distance),
+        pan_x: Some(pan_x),
+        pan_y: Some(pan_y),
+        pan_z: Some(pan_z),
+    })
+}
+
+#[tauri::command]
 pub async fn preview_workspace_asset(
     file_path: String,
     workspace: State<'_, Arc<Workspace>>,
@@ -2440,6 +2852,32 @@ mod tests {
         }
     }
 
+    fn test_yaml_doc(doc_index: usize) -> YamlDoc {
+        YamlDoc {
+            file_id: doc_index as i64 + 1,
+            class_id: 114,
+            type_name: "MonoBehaviour".to_string(),
+            line_start: 0,
+            line_end: 0,
+            m_name: None,
+            m_game_object_id: None,
+            m_father_id: None,
+            is_stripped: false,
+            source_prefab_guid: None,
+            transform_parent_id: None,
+            prefab_instance_id: None,
+            m_layer: None,
+            m_tag_string: None,
+            m_static_editor_flags: None,
+            m_is_active: None,
+            m_enabled: None,
+            transform_root_order: None,
+            transform_children: Vec::new(),
+            m_script_guid: None,
+            doc_index,
+        }
+    }
+
     #[test]
     fn root_for_rel_path_classifies_known_roots() {
         assert_eq!(
@@ -2524,6 +2962,22 @@ mod tests {
             extract_bare_terms("t:prefab component:Entity hero"),
             vec!["hero".to_string()]
         );
+    }
+
+    #[test]
+    fn playable_structured_preview_keeps_only_main_yaml_doc() {
+        assert!(yaml_structured_preview_doc_should_include(
+            "Assets/Timeline/Farming.playable",
+            &test_yaml_doc(0)
+        ));
+        assert!(!yaml_structured_preview_doc_should_include(
+            "Assets/Timeline/Farming.playable",
+            &test_yaml_doc(1)
+        ));
+        assert!(yaml_structured_preview_doc_should_include(
+            "Assets/Audio/DefaultAudioMixer.mixer",
+            &test_yaml_doc(1)
+        ));
     }
 
     #[test]

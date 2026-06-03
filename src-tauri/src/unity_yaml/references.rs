@@ -314,6 +314,7 @@ fn phase2_build_paths(
                 &stripped_to_pi,
             );
             ExtractedRef {
+                src_file_id: Some(raw.src_doc_file_id),
                 dst_guid: raw.dst_guid,
                 dst_file_id: raw.dst_file_id,
                 class_id_hint: raw.class_id_hint,

@@ -56,3 +56,35 @@ export function normalizeAppError(e: unknown): AppErrorPayload {
     severity: "error",
   };
 }
+
+const UNITY_CONNECTION_ERROR_PATTERNS = [
+  /failed to connect to unity editor/i,
+  /unity editor not connected/i,
+  /unity pipe disconnected/i,
+  /unity pipe connection is closing/i,
+  /unity pipe write timed out/i,
+  /unity response timed out/i,
+  /unity response failed/i,
+  /pipe write failed/i,
+  /newline write failed/i,
+  /pipe flush failed/i,
+  /unity bridge is only supported on windows/i,
+];
+
+export function isUnityConnectionError(e: unknown): boolean {
+  const err = normalizeAppError(e);
+  const code = err.code.trim().toLowerCase();
+  if (
+    code === "unity.connection_required" ||
+    code === "unity.connection_required_named" ||
+    code === "unity.not_connected" ||
+    code === "unity.disconnected"
+  ) {
+    return true;
+  }
+
+  const text = [err.message, err.detail, err.operation]
+    .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
+    .join("\n");
+  return UNITY_CONNECTION_ERROR_PATTERNS.some((pattern) => pattern.test(text));
+}

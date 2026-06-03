@@ -1,5 +1,6 @@
 mod db;
 pub(crate) mod meta_parser;
+pub(crate) mod object_index;
 mod scanner;
 pub mod script_parser;
 pub mod types;
@@ -354,7 +355,8 @@ impl AssetDb {
                         }
                     };
                     let meta_hash = hash128(&content);
-                    Ok((entry.clone(), guid, meta_hash))
+                    let importer_subassets = object_index::parse_importer_subassets(&content);
+                    Ok((entry.clone(), guid, meta_hash, importer_subassets))
                 })();
                 let completed = meta_progress.fetch_add(1, Ordering::Relaxed) + 1;
                 maybe_emit_scan_progress(
@@ -371,9 +373,20 @@ impl AssetDb {
         let t_meta_par = phase_start.elapsed();
         let mut parse_failures = Vec::new();
         let mut meta_results = Vec::with_capacity(meta_outcomes.len());
+        let mut importer_subasset_results = Vec::new();
         for outcome in meta_outcomes {
             match outcome {
-                Ok(parsed) => meta_results.push(parsed),
+                Ok((entry, guid, meta_hash, importer_subassets)) => {
+                    if !importer_subassets.is_empty() {
+                        let asset_path = entry
+                            .rel_path
+                            .strip_suffix(".meta")
+                            .unwrap_or(&entry.rel_path)
+                            .to_string();
+                        importer_subasset_results.push((asset_path, guid, importer_subassets));
+                    }
+                    meta_results.push((entry, guid, meta_hash));
+                }
                 Err(failure) => {
                     eprintln!("[AssetDb] warning: {}", failure.detail);
                     parse_failures.push(failure);
@@ -402,6 +415,7 @@ impl AssetDb {
                 .unwrap_or_default()
                 .to_string_lossy()
                 .to_lowercase();
+            let asset_exists = self.project_root.join(&asset_path).exists();
 
             let initial_kind = match ext.as_str() {
                 "cs" => AssetKind::Script,
@@ -418,7 +432,7 @@ impl AssetDb {
                 path: asset_path,
                 ext,
                 kind: initial_kind,
-                exists_on_disk: true,
+                exists_on_disk: asset_exists,
                 mtime_ns: entry.mtime_ns,
                 size: entry.size,
                 content_hash: [0u8; 16],
@@ -549,10 +563,10 @@ impl AssetDb {
                         &content,
                         Some(&guid_to_path),
                     );
+                    let docs = crate::unity_yaml::parse_yaml_docs(&content);
                     let content_hash = hash128(&content);
                     let main_script_guid = if entry.ext.eq_ignore_ascii_case("asset") {
-                        crate::unity_yaml::parse_yaml_docs(&content)
-                            .into_iter()
+                        docs.iter()
                             .find(|doc| doc.doc_index == 0 && doc.class_id == 114)
                             .and_then(|doc| doc.m_script_guid)
                     } else {
@@ -562,6 +576,7 @@ impl AssetDb {
                         entry.clone(),
                         src_guid,
                         refs,
+                        docs,
                         content_hash,
                         main_script_guid,
                     ))
@@ -597,10 +612,12 @@ impl AssetDb {
         // instead of being cloned. ~232k edges × 2 String clones removed.
         let yaml_count = yaml_results.len();
         let mut edges: Vec<RefEdge> = Vec::with_capacity(yaml_count * 16);
+        let mut asset_objects: Vec<AssetObject> = Vec::new();
 
-        for (entry, src_guid, extracted_refs, content_hash, main_script_guid) in
+        for (entry, src_guid, extracted_refs, docs, content_hash, main_script_guid) in
             yaml_results.into_iter()
         {
+            let mut updated_node: Option<AssetNode> = None;
             if let Some(&idx) = guid_to_node_idx.get(&src_guid) {
                 let node = &mut asset_nodes[idx];
                 node.kind = AssetKind::from_ext(&entry.ext);
@@ -622,11 +639,30 @@ impl AssetDb {
                         }
                     }
                 }
+                updated_node = Some(node.clone());
+            }
+
+            if let Some(node) = updated_node.as_ref() {
+                asset_objects.extend(object_index::build_yaml_asset_objects(
+                    node,
+                    &docs,
+                    |script_guid| {
+                        script_metadata_by_guid.get(script_guid).map(|meta| {
+                            object_index::ScriptTypeInfo {
+                                class_name: meta.class_name.clone(),
+                                class_name_lower: meta.class_name_lower.clone(),
+                                full_name_lower: meta.full_name_lower.clone(),
+                                type_search_lower: meta.type_search_lower.clone(),
+                            }
+                        })
+                    },
+                ));
             }
 
             for r in extracted_refs {
                 edges.push(RefEdge {
                     src_guid,
+                    src_file_id: r.src_file_id,
                     dst_guid: r.dst_guid,
                     dst_file_id: r.dst_file_id,
                     class_id_hint: r.class_id_hint,
@@ -645,11 +681,23 @@ impl AssetDb {
             ));
         }
 
+        for (_asset_path, guid, importer_entries) in &importer_subasset_results {
+            if let Some(&idx) = guid_to_node_idx.get(guid) {
+                let node = &asset_nodes[idx];
+                asset_objects.extend(object_index::build_importer_sub_asset_objects(
+                    node,
+                    importer_entries,
+                ));
+            }
+        }
+
         let t_yaml_backfill = phase_start.elapsed();
         let raw_edge_count = edges.len();
         eprintln!(
-            "[AssetDb] parsed {} yaml assets → {} edges",
-            yaml_count, raw_edge_count
+            "[AssetDb] parsed {} yaml assets → {} edges, {} sub-asset objects",
+            yaml_count,
+            raw_edge_count,
+            asset_objects.len()
         );
         eprintln!(
             "[AssetDb][timing] yaml_par={}ms yaml_backfill={}ms (avg {:.1} edges/yaml)",
@@ -686,6 +734,7 @@ impl AssetDb {
         let before_dedupe = edges.len();
         edges.dedup_by(|a, b| {
             a.src_guid == b.src_guid
+                && a.src_file_id == b.src_file_id
                 && a.dst_guid == b.dst_guid
                 && a.dst_file_id == b.dst_file_id
                 && a.class_id_hint == b.class_id_hint
@@ -729,6 +778,11 @@ impl AssetDb {
         let t0 = std::time::Instant::now();
         stats.nodes_added = db::batch_insert_assets(&tx, &asset_nodes)?;
         let t_assets = t0.elapsed();
+
+        ensure_scan_not_cancelled(cancel)?;
+        let t0 = std::time::Instant::now();
+        let objects_added = db::batch_insert_asset_objects(&tx, &asset_objects)?;
+        let t_objects = t0.elapsed();
 
         ensure_scan_not_cancelled(cancel)?;
         let t0 = std::time::Instant::now();
@@ -785,11 +839,13 @@ impl AssetDb {
         let t_risk_reports = t0.elapsed();
 
         eprintln!(
-            "[AssetDb][timing] db_write: tx_begin={}ms clear={}ms assets={}ms ({} rows) files={}ms ({} rows) metrics={}ms linked_roots={}ms ({} rows) edges={}ms ({} rows) commit={}ms",
+            "[AssetDb][timing] db_write: tx_begin={}ms clear={}ms assets={}ms ({} rows) objects={}ms ({} sub rows) files={}ms ({} rows) metrics={}ms linked_roots={}ms ({} rows) edges={}ms ({} rows) commit={}ms",
             t_tx_begin.as_millis(),
             t_clear.as_millis(),
             t_assets.as_millis(),
             stats.nodes_added,
+            t_objects.as_millis(),
+            objects_added,
             t_files.as_millis(),
             file_records.len(),
             t_metrics.as_millis(),
@@ -830,7 +886,7 @@ impl AssetDb {
             t_yaml_par.as_millis(),
             t_yaml_backfill.as_millis(),
             t_edge_prep.as_millis(),
-            (t_clear + t_assets + t_files + t_edges + t_commit + t_tx_begin).as_millis(),
+            (t_clear + t_assets + t_objects + t_files + t_edges + t_commit + t_tx_begin).as_millis(),
             t_risk_reports.as_millis()
         );
 
@@ -847,6 +903,22 @@ impl AssetDb {
 
     pub fn get_direct_refs(&self, guid: &Guid) -> Result<Vec<RefEdge>, String> {
         db::get_direct_refs(&self.conn, guid)
+    }
+
+    pub fn get_direct_deps_for_object(
+        &self,
+        guid: &Guid,
+        file_id: i64,
+    ) -> Result<Vec<RefEdge>, String> {
+        db::get_direct_deps_for_object(&self.conn, guid, file_id)
+    }
+
+    pub fn get_direct_refs_for_object(
+        &self,
+        guid: &Guid,
+        file_id: i64,
+    ) -> Result<Vec<RefEdge>, String> {
+        db::get_direct_refs_for_object(&self.conn, guid, file_id)
     }
 
     pub fn resolve_guid_by_path(&self, path: &str) -> Result<Option<Guid>, String> {
@@ -1932,4 +2004,5 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&root);
     }
+
 }

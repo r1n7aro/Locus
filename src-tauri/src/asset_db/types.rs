@@ -21,6 +21,14 @@ pub fn guid_to_hex(guid: &Guid) -> String {
     guid.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
+pub fn asset_object_key(guid: &Guid, file_id: Option<i64>) -> String {
+    let guid_hex = guid_to_hex(guid);
+    match file_id {
+        Some(file_id) => format!("{}:{}", guid_hex, file_id),
+        None => guid_hex,
+    }
+}
+
 pub fn hash128(data: &[u8]) -> [u8; 16] {
     let h = blake3::hash(data);
     let mut out = [0u8; 16];
@@ -190,9 +198,34 @@ pub struct AssetNode {
     pub script_inheritance_search: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct AssetObject {
+    pub object_key: String,
+    pub asset_guid: Guid,
+    pub file_id: Option<i64>,
+    pub path: String,
+    pub kind: AssetKind,
+    pub root: AssetRoot,
+    pub path_lower: String,
+    pub file_name_lower: String,
+    pub name: String,
+    pub name_lower: String,
+    pub type_name: String,
+    pub type_lower: String,
+    pub type_search: String,
+    pub script_class_name: Option<String>,
+    pub script_class_lower: String,
+    pub is_main: bool,
+    pub is_sub_asset: bool,
+    pub searchable: bool,
+    pub target_id: Option<String>,
+    pub sort_index: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RefEdge {
     pub src_guid: Guid,
+    pub src_file_id: Option<i64>,
     pub dst_guid: Guid,
     pub dst_file_id: Option<i64>,
     pub class_id_hint: Option<i32>,
@@ -202,6 +235,7 @@ pub struct RefEdge {
 
 #[derive(Debug, Clone)]
 pub struct ExtractedRef {
+    pub src_file_id: Option<i64>,
     pub dst_guid: Guid,
     pub dst_file_id: Option<i64>,
     pub class_id_hint: Option<i32>,

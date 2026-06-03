@@ -284,12 +284,13 @@ pub fn parse_yaml_docs(content: &[u8]) -> Vec<YamlDoc> {
         }
 
         if let Some(f) = extract_field_name_ref(trimmed) {
+            if f == "m_Name" {
+                if let Some(val) = extract_plain_value(trimmed, "m_Name:") {
+                    cur_m_name = Some(val);
+                }
+            }
             if cur_class_id == Some(1) {
-                if f == "m_Name" {
-                    if let Some(val) = extract_plain_value(trimmed, "m_Name:") {
-                        cur_m_name = Some(val);
-                    }
-                } else if f == "m_Layer" {
+                if f == "m_Layer" {
                     if let Some(val) = extract_plain_value(trimmed, "m_Layer:") {
                         if let Ok(n) = val.trim().parse::<i32>() {
                             cur_m_layer = Some(n);

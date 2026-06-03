@@ -588,8 +588,9 @@ pub(crate) fn lang_from_path(path: &str) -> Option<String> {
         "rs" => Some("rust".into()),
         "py" => Some("python".into()),
         "yaml" | "yml" | "unity" | "prefab" | "mat" | "asset" | "controller" | "anim"
-        | "overrideController" | "physicMaterial" | "physicsMaterial2D" | "flare" | "mask"
-        | "fontsettings" | "preset" | "lighting" | "terrainlayer" | "signal" | "playable" => {
+        | "overridecontroller" | "mixer" | "physicmaterial" | "physicsmaterial2d" | "flare"
+        | "mask" | "fontsettings" | "preset" | "lighting" | "terrainlayer"
+        | "rendertexture" | "signal" | "playable" | "cubemap" | "guiskin" | "brush" => {
             Some("yaml".into())
         }
         "sh" | "bash" | "zsh" => Some("bash".into()),
@@ -611,6 +612,7 @@ pub(crate) fn is_unity_yaml(path: &str) -> bool {
             | "controller"
             | "anim"
             | "overridecontroller"
+            | "mixer"
             | "physicmaterial"
             | "physicsmaterial2d"
             | "flare"
@@ -619,8 +621,12 @@ pub(crate) fn is_unity_yaml(path: &str) -> bool {
             | "preset"
             | "lighting"
             | "terrainlayer"
+            | "rendertexture"
             | "signal"
             | "playable"
+            | "cubemap"
+            | "guiskin"
+            | "brush"
     )
 }
 

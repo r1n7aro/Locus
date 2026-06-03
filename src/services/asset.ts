@@ -53,6 +53,80 @@ export function previewWorkspaceAsset(filePath: string): Promise<AssetPreviewPay
   return ipcInvoke<AssetPreviewPayload>("preview_workspace_asset", { filePath });
 }
 
+export interface AssetThumbnailPreview {
+  assetPath: string;
+  url: string;
+  width: number;
+  height: number;
+  mimeType: string;
+}
+
+export function previewWorkspaceAssetThumbnail(filePath: string): Promise<AssetThumbnailPreview> {
+  return ipcInvoke<AssetThumbnailPreview>("preview_workspace_asset_thumbnail", { filePath });
+}
+
+export interface AssetPreviewFrame {
+  assetPath: string;
+  url: string;
+  width: number;
+  height: number;
+  mimeType: string;
+  yaw?: number;
+  pitch?: number;
+  distance?: number;
+  panX?: number;
+  panY?: number;
+  panZ?: number;
+}
+
+export interface AssetPreviewFrameRequest {
+  width: number;
+  height: number;
+  yaw: number;
+  pitch: number;
+  distance: number;
+  panX: number;
+  panY: number;
+  panZ: number;
+}
+
+export function readWorkspaceAssetPreviewFrameCache(
+  filePath: string,
+): Promise<AssetPreviewFrame | null> {
+  return ipcInvoke<AssetPreviewFrame | null>("read_workspace_asset_preview_frame_cache", {
+    filePath,
+  });
+}
+
+export function cacheWorkspaceAssetPreviewFrame(
+  filePath: string,
+  frame: AssetPreviewFrame,
+): Promise<void> {
+  return ipcInvoke<void>("cache_workspace_asset_preview_frame", {
+    filePath,
+    url: frame.url,
+    width: frame.width,
+    height: frame.height,
+    mimeType: frame.mimeType,
+    yaw: frame.yaw ?? 25,
+    pitch: frame.pitch ?? -12,
+    distance: frame.distance ?? 1.15,
+    panX: frame.panX ?? 0,
+    panY: frame.panY ?? 0,
+    panZ: frame.panZ ?? 0,
+  });
+}
+
+export function renderWorkspaceAssetPreviewFrame(
+  filePath: string,
+  request: AssetPreviewFrameRequest,
+): Promise<AssetPreviewFrame> {
+  return ipcInvoke<AssetPreviewFrame>("render_workspace_asset_preview_frame", {
+    filePath,
+    ...request,
+  });
+}
+
 export function getWatcherTuning(): Promise<WatcherTuning> {
   return ipcInvoke<WatcherTuning>("get_watcher_tuning");
 }

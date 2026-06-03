@@ -11,7 +11,8 @@ import {
   setWatcherTuning,
 } from "../services/asset";
 import { listDirEntriesPage } from "../services/project";
-import { normalizeAppError } from "../services/errors";
+import { t } from "../i18n";
+import { isUnityConnectionError, normalizeAppError } from "../services/errors";
 import { getWarmup } from "./warmupCache";
 import { acquireSelectionLock } from "./useSelectionLock";
 import type {
@@ -63,6 +64,11 @@ type ViewMode = "stats" | "preview";
 type AssetSearchScope = "folder" | "global";
 type FolderRevealMode = "none" | "ancestors" | "self";
 
+function assetPreviewErrorMessage(error: unknown): string {
+  const err = normalizeAppError(error);
+  return isUnityConnectionError(err) ? t("asset.preview.unityConnectionRequired") : err.message;
+}
+
 export function useAssetState(props: AssetProps) {
   // ── Reactive state ────────────────────────────────────────
   const loading = ref(false);
@@ -84,6 +90,7 @@ export function useAssetState(props: AssetProps) {
   const searchTruncated = ref(false);
   const searchHasFallback = ref(false);
   const searching = ref(false);
+  const selectedSearchKey = ref<string | null>(null);
 
   // preview
   const previewPayload = ref<AssetPreviewPayload | null>(null);
@@ -499,6 +506,7 @@ export function useAssetState(props: AssetProps) {
 
   async function selectNode(node: AssetExplorerNode) {
     if (!hasWorkspace.value) return;
+    selectedSearchKey.value = null;
     if (node.kind === "folder") {
       await selectFolder(node.path, { revealInTree: "ancestors" });
       return;
@@ -515,12 +523,19 @@ export function useAssetState(props: AssetProps) {
   function closePreview() {
     invalidatePreviewSession();
     selectedNode.value = null;
+    selectedSearchKey.value = null;
     clearPreviewState();
     viewMode.value = "stats";
   }
 
   // ── Search ───────────────────────────────────────────────
   let searchDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function searchResultKey(result: AssetSearchResult): string {
+    if (result.objectKey) return result.objectKey;
+    if (result.isSubAsset && result.name.trim()) return `${result.path}/${result.name.trim()}`;
+    return result.path;
+  }
 
   function runFilenameSearch(query: string) {
     searchQuery.value = query;
@@ -592,15 +607,16 @@ export function useAssetState(props: AssetProps) {
 
   async function selectFromSearchResult(result: AssetSearchResult) {
     if (!hasWorkspace.value) return;
-      await expandToPath(result.path);
-      await materializePath(result.path);
-      const parentPath = parentFolderPath(result.path);
-      if (parentPath) {
+    selectedSearchKey.value = searchResultKey(result);
+    await expandToPath(result.path);
+    await materializePath(result.path);
+    const parentPath = parentFolderPath(result.path);
+    if (parentPath) {
       await selectFolder(parentPath, {
         preservePreview: true,
         revealInTree: "ancestors",
       });
-      }
+    }
     // Find or fabricate a leaf node entry to feed selectNode.
     let node = findNodeByPath(result.path);
     if (!node) {
@@ -615,6 +631,9 @@ export function useAssetState(props: AssetProps) {
       selectedNode.value = node;
       viewMode.value = "preview";
       await loadPreview(node);
+      if (result.targetId && previewPayload.value?.kind === "structured") {
+        await loadTarget(previewPayload.value.previewKey, result.targetId);
+      }
     }
   }
 
@@ -650,10 +669,9 @@ export function useAssetState(props: AssetProps) {
       }
     } catch (e) {
       if (session !== previewSession) return;
-      const err = normalizeAppError(e);
       previewPayload.value = null;
       previewNode.value = nextNode;
-      previewError.value = err.message;
+      previewError.value = assetPreviewErrorMessage(e);
     } finally {
       if (session === previewSession) {
         previewLoading.value = false;
@@ -704,7 +722,7 @@ export function useAssetState(props: AssetProps) {
           return loadTarget(newPayload.previewKey, targetId);
         }
       } else {
-        error.value = err.message;
+        error.value = assetPreviewErrorMessage(err);
       }
       return null;
     } finally {
@@ -1017,6 +1035,7 @@ export function useAssetState(props: AssetProps) {
     searchTruncated,
     searchHasFallback,
     searching,
+    selectedSearchKey,
     currentFolderLabel,
     visibleDirectoryEntries,
     currentFolderLoading,

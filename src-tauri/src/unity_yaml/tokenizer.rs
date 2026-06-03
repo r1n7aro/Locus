@@ -23,13 +23,22 @@ pub(super) fn parse_doc_header_full(line: &str) -> Option<(i32, i64)> {
 
     let rest = rest[end..].trim_start();
     let rest = rest.strip_prefix('&')?;
-    let end = rest
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(rest.len());
-    if end == 0 {
+    let digits = if let Some(stripped) = rest.strip_prefix('-') {
+        let end = stripped
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(stripped.len());
+        if end == 0 {
+            return None;
+        }
+        1 + end
+    } else {
+        rest.find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(rest.len())
+    };
+    if digits == 0 {
         return None;
     }
-    let file_id = rest[..end].parse::<i64>().ok()?;
+    let file_id = rest[..digits].parse::<i64>().ok()?;
 
     Some((class_id, file_id))
 }

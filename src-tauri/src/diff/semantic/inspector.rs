@@ -9,7 +9,7 @@ use super::script::{
 use super::{unity_class_name, FieldTreeNode, HierarchyEntry, ParsedFieldLine, SemanticBuildEnv};
 use crate::diff::context::SideContext;
 use crate::diff::types::*;
-use crate::unity_yaml::{HierarchyNode, YamlDoc};
+use crate::unity_yaml::{build_hierarchy_path_map, HierarchyNode, YamlDoc};
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
 
@@ -1304,13 +1304,18 @@ pub(crate) fn collect_hierarchy_entries(
         parent_id: Option<i64>,
         prefix: Option<&str>,
         docs_by_id: &HashMap<i64, &YamlDoc>,
+        path_by_file_id: &HashMap<i64, String>,
         order: &mut usize,
         out: &mut HashMap<i64, HierarchyEntry>,
     ) {
-        let path = match prefix {
+        let fallback_path = match prefix {
             Some(prefix) if !prefix.is_empty() => format!("{}/{}", prefix, node.name),
             _ => node.name.clone(),
         };
+        let path = path_by_file_id
+            .get(&node.file_id)
+            .cloned()
+            .unwrap_or(fallback_path);
         let object_kind = match docs_by_id.get(&node.file_id).map(|doc| doc.class_id) {
             Some(1001) => "prefabInstance",
             _ => "gameObject",
@@ -1333,6 +1338,7 @@ pub(crate) fn collect_hierarchy_entries(
                 Some(node.file_id),
                 Some(&path),
                 docs_by_id,
+                path_by_file_id,
                 order,
                 out,
             );
@@ -1340,9 +1346,18 @@ pub(crate) fn collect_hierarchy_entries(
     }
 
     let mut out = HashMap::new();
+    let path_by_file_id = build_hierarchy_path_map(roots);
     let mut order = 0usize;
     for root in roots {
-        walk(root, None, None, docs_by_id, &mut order, &mut out);
+        walk(
+            root,
+            None,
+            None,
+            docs_by_id,
+            &path_by_file_id,
+            &mut order,
+            &mut out,
+        );
     }
     out
 }
@@ -1351,5 +1366,37 @@ pub(crate) fn component_sort_key(class_id: i32) -> i32 {
     match class_id {
         4 | 224 => 0,
         _ => 10,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn collect_hierarchy_entries_uses_unity_yaml_ordinal_paths() {
+        let roots = vec![HierarchyNode {
+            name: "Root".to_string(),
+            file_id: 1,
+            children: vec![
+                HierarchyNode {
+                    name: "Enemy".to_string(),
+                    file_id: 2,
+                    ..Default::default()
+                },
+                HierarchyNode {
+                    name: "Enemy".to_string(),
+                    file_id: 3,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        }];
+        let docs_by_id = HashMap::new();
+
+        let entries = collect_hierarchy_entries(&roots, &docs_by_id);
+
+        assert_eq!(entries.get(&2).map(|entry| entry.path.as_str()), Some("Root/Enemy[1]"));
+        assert_eq!(entries.get(&3).map(|entry| entry.path.as_str()), Some("Root/Enemy[2]"));
     }
 }

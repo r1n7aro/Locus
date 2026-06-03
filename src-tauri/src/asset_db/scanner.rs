@@ -19,8 +19,30 @@ pub(crate) const IGNORED_DIRS: &[&str] = &[
     "node_modules",
 ];
 
-pub(crate) const P1_EXTENSIONS: &[&str] =
-    &["unity", "prefab", "asset", "mat", "anim", "controller"];
+pub(crate) const P1_EXTENSIONS: &[&str] = &[
+    "unity",
+    "prefab",
+    "asset",
+    "mat",
+    "anim",
+    "controller",
+    "overridecontroller",
+    "mixer",
+    "physicmaterial",
+    "physicsmaterial2d",
+    "flare",
+    "mask",
+    "preset",
+    "fontsettings",
+    "lighting",
+    "terrainlayer",
+    "rendertexture",
+    "signal",
+    "playable",
+    "cubemap",
+    "guiskin",
+    "brush",
+];
 
 #[derive(Debug, Clone)]
 pub struct FileEntry {

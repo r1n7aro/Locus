@@ -138,6 +138,47 @@ struct SceneObjectRequest<'a> {
     object_path: &'a str,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AssetThumbnailRequest<'a> {
+    asset_path: &'a str,
+    max_size: u32,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AssetPreviewRenderRequest<'a> {
+    asset_path: &'a str,
+    width: u32,
+    height: u32,
+    yaw: f32,
+    pitch: f32,
+    distance: f32,
+    pan_x: f32,
+    pan_y: f32,
+    pan_z: f32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnityAssetThumbnail {
+    pub asset_path: String,
+    pub width: u32,
+    pub height: u32,
+    pub mime_type: String,
+    pub png_base64: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnityAssetPreviewFrame {
+    pub asset_path: String,
+    pub width: u32,
+    pub height: u32,
+    pub mime_type: String,
+    pub data_base64: String,
+}
+
 type ProjectUnityOpLock = Arc<Mutex<()>>;
 
 fn unity_operation_locks() -> &'static Mutex<HashMap<String, ProjectUnityOpLock>> {
@@ -891,6 +932,70 @@ pub async fn open_asset_inspector(project_path: &str, asset_path: &str) -> Resul
             .error
             .unwrap_or_else(|| "open_asset_inspector failed".to_string()))
     }
+}
+
+pub async fn asset_thumbnail(
+    project_path: &str,
+    asset_path: &str,
+    max_size: u32,
+) -> Result<UnityAssetThumbnail, String> {
+    let op_lock = project_unity_op_lock(project_path).await;
+    let _guard = op_lock.lock().await;
+    let payload = serde_json::to_string(&AssetThumbnailRequest {
+        asset_path,
+        max_size,
+    })
+    .map_err(|e| format!("Failed to serialize asset_thumbnail request: {}", e))?;
+    let resp = send_message(project_path, "asset_thumbnail", &payload).await?;
+    if !resp.ok {
+        return Err(resp
+            .error
+            .unwrap_or_else(|| "asset_thumbnail failed".to_string()));
+    }
+    let message = resp
+        .message
+        .ok_or_else(|| "asset_thumbnail returned an empty response".to_string())?;
+    serde_json::from_str::<UnityAssetThumbnail>(&message)
+        .map_err(|e| format!("Failed to parse asset_thumbnail response: {}", e))
+}
+
+pub async fn asset_preview_render(
+    project_path: &str,
+    asset_path: &str,
+    width: u32,
+    height: u32,
+    yaw: f32,
+    pitch: f32,
+    distance: f32,
+    pan_x: f32,
+    pan_y: f32,
+    pan_z: f32,
+) -> Result<UnityAssetPreviewFrame, String> {
+    let op_lock = project_unity_op_lock(project_path).await;
+    let _guard = op_lock.lock().await;
+    let payload = serde_json::to_string(&AssetPreviewRenderRequest {
+        asset_path,
+        width,
+        height,
+        yaw,
+        pitch,
+        distance,
+        pan_x,
+        pan_y,
+        pan_z,
+    })
+    .map_err(|e| format!("Failed to serialize asset_preview_render request: {}", e))?;
+    let resp = send_message(project_path, "asset_preview_render", &payload).await?;
+    if !resp.ok {
+        return Err(resp
+            .error
+            .unwrap_or_else(|| "asset_preview_render failed".to_string()));
+    }
+    let message = resp
+        .message
+        .ok_or_else(|| "asset_preview_render returned an empty response".to_string())?;
+    serde_json::from_str::<UnityAssetPreviewFrame>(&message)
+        .map_err(|e| format!("Failed to parse asset_preview_render response: {}", e))
 }
 
 pub async fn select_scene_object(
