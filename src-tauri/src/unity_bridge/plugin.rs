@@ -411,15 +411,17 @@ fn check_plugin_status_with_source_dir(
     let source_hash = compute_dir_hash(source_dir)?;
     let hash_file = install_dir.root.join(PLUGIN_HASH_FILE);
     let installed_hash = std::fs::read_to_string(&hash_file).unwrap_or_default();
+    let installed_hash_trimmed = installed_hash.trim();
+    let installed_hash_display = if installed_hash_trimmed.len() >= 16 {
+        installed_hash_trimmed.chars().take(16).collect::<String>()
+    } else {
+        installed_hash_trimmed.to_string()
+    };
 
     eprintln!(
         "[Locus] plugin hash check: source={}, installed={}",
         &source_hash[..16],
-        if installed_hash.trim().len() >= 16 {
-            &installed_hash.trim()[..16]
-        } else {
-            installed_hash.trim()
-        }
+        installed_hash_display
     );
 
     if installed_hash.trim() == source_hash {

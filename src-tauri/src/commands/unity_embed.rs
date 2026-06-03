@@ -1722,15 +1722,14 @@ fn unity_relative_drop_path(workspace_path: &str, path: &Path) -> Option<String>
     }
 
     let dropped_path = normalize_existing_path_text(path);
-    let workspace_len = workspace_path.len();
-    let is_direct_child = dropped_path.len() > workspace_len
-        && dropped_path[..workspace_len].eq_ignore_ascii_case(&workspace_path)
-        && dropped_path.as_bytes().get(workspace_len) == Some(&b'/');
-    if !is_direct_child {
+    let Some(relative_path) =
+        strip_unity_path_prefix_ignore_ascii_case(&dropped_path, &workspace_path)
+            .and_then(|suffix| suffix.strip_prefix('/'))
+    else {
         return None;
-    }
+    };
 
-    let relative_path = normalize_unity_path_text(&dropped_path[workspace_len + 1..]);
+    let relative_path = normalize_unity_path_text(relative_path);
     if is_supported_unity_ref_path(&relative_path) {
         Some(relative_path)
     } else {
@@ -1749,6 +1748,15 @@ fn normalize_unity_path_text(path: &str) -> String {
         .replace('\\', "/")
         .trim_end_matches('/')
         .to_string()
+}
+
+fn strip_unity_path_prefix_ignore_ascii_case<'a>(path: &'a str, prefix: &str) -> Option<&'a str> {
+    let prefix_text = path.get(..prefix.len())?;
+    if prefix_text.eq_ignore_ascii_case(prefix) {
+        path.get(prefix.len()..)
+    } else {
+        None
+    }
 }
 
 fn is_supported_unity_ref_path(path: &str) -> bool {
@@ -4628,6 +4636,29 @@ mod tests {
     }
 
     #[test]
+    fn unity_drop_path_rejects_unrelated_unicode_path_without_panicking() {
+        assert_eq!(
+            unity_relative_drop_path(
+                "C:/aaaaaaaaaaaaaaaaaaaaaaa",
+                Path::new("J:/UserFile/桌面/QQ游戏.lnk"),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn unity_drop_path_maps_unicode_project_asset_to_relative_path() {
+        assert_eq!(
+            unity_relative_drop_path(
+                "J:/UserFile/桌面/QQ游戏",
+                Path::new("J:/UserFile/桌面/QQ游戏/Assets/中文.prefab"),
+            )
+            .as_deref(),
+            Some("Assets/中文.prefab")
+        );
+    }
+
+    #[test]
     fn file_drop_maps_non_asset_paths_to_local_refs() {
         let refs = locus_file_drop_refs(
             "F:/Game/Project",
@@ -4646,6 +4677,20 @@ mod tests {
         assert_eq!(refs[1].path, "D:/Notes/design.txt");
         assert_eq!(refs[1].name.as_deref(), Some("design"));
         assert_eq!(refs[1].type_label.as_deref(), Some("txt"));
+    }
+
+    #[test]
+    fn file_drop_maps_unrelated_unicode_path_to_local_ref() {
+        let refs = locus_file_drop_refs(
+            "C:/aaaaaaaaaaaaaaaaaaaaaaa",
+            &[PathBuf::from("J:/UserFile/桌面/QQ游戏.lnk")],
+        );
+
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].path, "J:/UserFile/桌面/QQ游戏.lnk");
+        assert_eq!(refs[0].name.as_deref(), Some("QQ游戏"));
+        assert_eq!(refs[0].type_label.as_deref(), Some("lnk"));
+        assert_eq!(refs[0].source, "local");
     }
 
     #[test]

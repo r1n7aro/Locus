@@ -515,8 +515,12 @@ mod tests {
 
     #[test]
     fn undo_touches_view_tree_ignores_adjacent_paths() {
-        assert!(!undo_touches_view_tree(&[changed("Locus/Viewer/tool.json")]));
-        assert!(!undo_touches_view_tree(&[changed("Assets/Locus/View/tool.json")]));
+        assert!(!undo_touches_view_tree(&[changed(
+            "Locus/Viewer/tool.json"
+        )]));
+        assert!(!undo_touches_view_tree(&[changed(
+            "Assets/Locus/View/tool.json"
+        )]));
         assert!(!undo_touches_view_tree(&[changed("src/main.rs")]));
     }
 }

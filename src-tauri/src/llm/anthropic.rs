@@ -509,7 +509,7 @@ where
                 attempt + 1,
                 MAX_RETRIES + 1,
                 delay,
-                &error_body[..error_body.len().min(200)]
+                utf8_prefix_chars(&error_body, 200)
             );
             tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
             last_error = format!("Anthropic API error ({}): {}", status, error_body);
@@ -1456,6 +1456,10 @@ fn is_oauth_generic_bad_request(status: reqwest::StatusCode, error_body: &str) -
     err_type == "invalid_request_error" && msg.eq_ignore_ascii_case("Error")
 }
 
+fn utf8_prefix_chars(value: &str, max_chars: usize) -> String {
+    value.chars().take(max_chars).collect()
+}
+
 fn apply_flattened_body_compat(body: &mut serde_json::Value) {
     if let Some(system) = body.get_mut("system") {
         if let Some(arr) = system.as_array() {
@@ -2048,7 +2052,7 @@ mod tests {
         apply_cache_control, build_anthropic_messages, build_native_anthropic_tools,
         build_oauth_system_blocks, build_text_blocks, convert_tools_to_oauth_sdk_like_anthropic,
         next_sse_separator, resolve_native_beta_flags, rewrite_oauth_tool_use_blocks,
-        sse_line_value, AnthropicHistoryOptions, CACHE_TTL,
+        sse_line_value, utf8_prefix_chars, AnthropicHistoryOptions, CACHE_TTL,
     };
     use crate::session::models::{ChatMessage, ImageData, MessageRole, ToolCallInfo};
     use serde_json::json;
@@ -2078,6 +2082,13 @@ mod tests {
             knowledge_proposal: None,
             render_parts: None,
         }
+    }
+
+    #[test]
+    fn utf8_prefix_chars_handles_unicode_error_body() {
+        let value = format!("{}x", "错".repeat(200));
+
+        assert_eq!(utf8_prefix_chars(&value, 200), "错".repeat(200));
     }
 
     #[test]

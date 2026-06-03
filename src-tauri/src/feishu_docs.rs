@@ -1751,7 +1751,7 @@ fn sanitize_segment(title: &str, fallback_prefix: &str, token: &str) -> String {
         sanitized.push_str(" file");
     }
     if sanitized.len() > 80 {
-        sanitized.truncate(80);
+        sanitized.truncate(sanitized.floor_char_boundary(80));
         sanitized = sanitized.trim().trim_matches('.').to_string();
     }
     sanitized
@@ -4622,6 +4622,13 @@ mod tests {
         let root = reference_target_dir_path(working_dir, target_path);
         std::fs::create_dir_all(&root).expect("create reference directory");
         std::fs::write(root.join("Imported.md"), "# Imported").expect("seed imported markdown");
+    }
+
+    #[test]
+    fn sanitize_segment_truncates_unicode_on_char_boundary() {
+        let segment = sanitize_segment(&"中".repeat(27), "doc", "token");
+
+        assert_eq!(segment, "中".repeat(26));
     }
 
     #[tokio::test]

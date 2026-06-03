@@ -155,7 +155,11 @@ impl DiffProfiler {
             let mut map = std::collections::HashMap::new();
             for r in &self.phases {
                 let key = format!("{:?}", r.phase);
-                let key = key[..1].to_lowercase() + &key[1..];
+                let mut chars = key.chars();
+                let key = chars
+                    .next()
+                    .map(|first| first.to_lowercase().chain(chars).collect::<String>())
+                    .unwrap_or_default();
                 map.insert(key, r.end_ms - r.start_ms);
             }
             for (label, ms) in &self.fetch_sides {

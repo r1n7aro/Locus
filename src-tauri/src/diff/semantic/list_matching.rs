@@ -225,8 +225,9 @@ fn reference_display_short(reference: &InspectorReference) -> String {
 }
 
 fn truncate_display(value: &str) -> String {
-    if value.len() > 30 {
-        format!("{}...", &value[..27])
+    if value.chars().count() > 30 {
+        let prefix = value.chars().take(27).collect::<String>();
+        format!("{prefix}...")
     } else {
         value.to_string()
     }
@@ -333,4 +334,17 @@ fn index_fallback_match(old_items: &[ListItemIR], new_items: &[ListItemIR]) -> V
     }
 
     pairs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truncate_display;
+
+    #[test]
+    fn truncate_display_handles_unicode_boundaries() {
+        assert_eq!(
+            truncate_display(&"项".repeat(31)),
+            format!("{}...", "项".repeat(27))
+        );
+    }
 }

@@ -232,11 +232,18 @@ fn mask_key(key: &str) -> String {
     if key.is_empty() {
         return String::new();
     }
-    if key.len() <= 8 {
+    if key.chars().count() <= 8 {
         return "****".to_string();
     }
-    let prefix = &key[..std::cmp::min(6, key.len())];
-    let suffix = &key[key.len() - 4..];
+    let prefix = key.chars().take(6).collect::<String>();
+    let suffix = key
+        .chars()
+        .rev()
+        .take(4)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
     format!("{}...{}", prefix, suffix)
 }
 
@@ -246,6 +253,16 @@ fn provider_display_name(id: &str) -> String {
         "anthropic" => "Anthropic (OAuth)".to_string(),
         "anthropic_sdk" => "Anthropic Agent SDK".to_string(),
         other => other.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mask_key;
+
+    #[test]
+    fn mask_key_handles_unicode_boundaries() {
+        assert_eq!(mask_key("中文中文中文中文中"), "中文中文中文...文中文中");
     }
 }
 

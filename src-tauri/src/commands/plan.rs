@@ -37,7 +37,7 @@ pub async fn save_plan_artifact(
     std::fs::create_dir_all(&plan_dir).map_err(|e| format!("Failed to create plan dir: {}", e))?;
 
     let now = chrono::Local::now();
-    let sid_short = &session_id[..8.min(session_id.len())];
+    let sid_short = session_id.chars().take(8).collect::<String>();
     let filename = format!(
         "{}__{}__{}.md",
         project_slug,
