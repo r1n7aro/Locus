@@ -4,9 +4,14 @@ import {
   walkHtmlText,
   injectAssetRefs,
   injectFileRefs,
+  injectUnityObjectFenceRefs,
+  injectUnityPropertyFenceRefs,
   injectViewRefs,
   injectWorkspaceMentions,
+  isMarkdownUnityObjectFenceLanguage,
+  isMarkdownUnityPropertyFenceLanguage,
 } from "../composables/markdownInject";
+import { parseUnityPropertyFence } from "../composables/unityPropertyFence";
 import { prepareMarkdownImages } from "../composables/markdownImages";
 
 describe("walkHtmlText", () => {
@@ -198,7 +203,41 @@ describe("injectAssetRefs", () => {
     const html = "找到了：主角预制件是 <code>Assets/Prefabs/Characters/PigChef.prefab</code>。";
     const result = injectAssetRefs(html);
     expect(result).toContain("md-unity-asset-ref");
+    expect(result).toContain("md-unity-object-ref");
+    expect(result).toContain('data-md-unity-object-preview="true"');
+    expect(result).toContain('data-md-unity-level="inline"');
     expect(result).toContain('data-file-path="Assets/Prefabs/Characters/PigChef.prefab"');
+  });
+
+  it("converts configured inline-code Unity refs to full-row preview placeholders", () => {
+    const html = "<code>asset:row Assets/Prefabs/Player.prefab</code>";
+    const result = injectAssetRefs(html);
+
+    expect(result).toContain("md-unity-asset-ref");
+    expect(result).toContain("md-unity-object-ref--row");
+    expect(result).toContain('data-md-unity-object-preview="true"');
+    expect(result).toContain('data-md-unity-level="row"');
+    expect(result).toContain('data-md-unity-ref-kind="asset"');
+    expect(result).toContain('data-asset-path="Assets/Prefabs/Player.prefab"');
+    expect(result).not.toContain("<code>");
+  });
+
+  it("converts preview aliases to thumbnail Unity object placeholders", () => {
+    const html = "<code>Assets/Models/Hero.fbx | preview</code>";
+    const result = injectAssetRefs(html);
+
+    expect(result).toContain("md-unity-object-ref--thumbnail");
+    expect(result).toContain('data-md-unity-level="thumbnail"');
+    expect(result).toContain('data-asset-path="Assets/Models/Hero.fbx"');
+  });
+
+  it("forces editable inline-code Unity refs into row placeholders", () => {
+    const html = "<code>asset:editable Assets/Data/Enemy.asset</code>";
+    const result = injectAssetRefs(html);
+
+    expect(result).toContain("md-unity-object-ref--row");
+    expect(result).toContain('data-md-unity-level="row"');
+    expect(result).toContain('data-md-unity-editable="true"');
   });
 
   it("converts legacy braced asset paths inside inline code", () => {
@@ -214,7 +253,20 @@ describe("injectAssetRefs", () => {
     const html = "<code>Assets/Scenes/Main.unity/UI/HUD</code>";
     const result = injectAssetRefs(html);
     expect(result).toContain("md-unity-scene-object-ref");
+    expect(result).toContain("md-unity-object-ref");
+    expect(result).toContain('data-md-unity-ref-kind="sceneObject"');
     expect(result).toContain('data-scene-path="Assets/Scenes/Main.unity"');
+    expect(result).toContain('data-scene-object-path="UI/HUD"');
+  });
+
+  it("converts configured scene/object references to row placeholders", () => {
+    const html = "<code>unity:row Assets/Scenes/Main.unity/UI/HUD</code>";
+    const result = injectAssetRefs(html);
+
+    expect(result).toContain("md-unity-scene-object-ref");
+    expect(result).toContain("md-unity-object-ref--row");
+    expect(result).toContain('data-md-unity-level="row"');
+    expect(result).toContain('data-md-unity-ref-kind="sceneObject"');
     expect(result).toContain('data-scene-object-path="UI/HUD"');
   });
 
@@ -302,6 +354,163 @@ describe("injectAssetRefs", () => {
     const html = "See @UIElementsSchema/UnityEditor.Overlays.xsd";
     const result = injectAssetRefs(html);
     expect(result).not.toContain("md-unity-asset-ref");
+  });
+});
+
+describe("injectUnityObjectFenceRefs", () => {
+  it("converts asset preview fenced blocks to Unity object placeholders", () => {
+    const html = '<pre><code class="hljs language-asset:preview">Assets/Models/Hero.fbx</code></pre>';
+    const result = injectUnityObjectFenceRefs(html);
+
+    expect(result).toContain("md-unity-object-ref--thumbnail");
+    expect(result).toContain('data-md-unity-level="thumbnail"');
+    expect(result).toContain('data-asset-path="Assets/Models/Hero.fbx"');
+    expect(result).not.toContain("<pre>");
+  });
+
+  it("converts row fenced blocks with multiple Unity asset paths", () => {
+    const html = [
+      '<pre><code class="hljs language-asset-row">',
+      "Assets/Prefabs/Player.prefab\n",
+      "Assets/Prefabs/Enemy.prefab",
+      "</code></pre>",
+    ].join("");
+    const result = injectUnityObjectFenceRefs(html);
+
+    expect(result.match(/data-md-unity-level="row"/g)).toHaveLength(2);
+    expect(result).toContain('data-asset-path="Assets/Prefabs/Player.prefab"');
+    expect(result).toContain('data-asset-path="Assets/Prefabs/Enemy.prefab"');
+  });
+
+  it("converts prefixed plain fenced blocks", () => {
+    const html = "<pre><code>asset:preview Assets/Prefabs/Player.prefab</code></pre>";
+    const result = injectUnityObjectFenceRefs(html);
+
+    expect(result).toContain("md-unity-object-ref--thumbnail");
+    expect(result).toContain('data-asset-path="Assets/Prefabs/Player.prefab"');
+  });
+
+  it("keeps plain Unity path fenced blocks as code", () => {
+    const html = "<pre><code>Assets/Prefabs/Player.prefab</code></pre>";
+
+    expect(injectUnityObjectFenceRefs(html)).toBe(html);
+  });
+
+  it("recognizes Unity object fence languages", () => {
+    expect(isMarkdownUnityObjectFenceLanguage("asset:preview")).toBe(true);
+    expect(isMarkdownUnityObjectFenceLanguage("unity-row")).toBe(true);
+    expect(isMarkdownUnityObjectFenceLanguage("json")).toBe(false);
+  });
+});
+
+describe("injectUnityPropertyFenceRefs", () => {
+  it("converts unity_property fenced blocks to property editor hosts", () => {
+    const html = [
+      '<pre><code class="hljs language-unity_property">',
+      "Assets/Data/Config.asset#m_Name",
+      "</code></pre>",
+    ].join("");
+    const result = injectUnityPropertyFenceRefs(html);
+
+    expect(result).toContain('data-md-unity-property-fence="true"');
+    expect(result).toContain('data-md-unity-property-source="true"');
+    expect(result).toContain("Assets/Data/Config.asset#m_Name");
+    expect(result).not.toContain("<pre><code class");
+  });
+
+  it("recognizes Unity property fence languages", () => {
+    expect(isMarkdownUnityPropertyFenceLanguage("unity_property")).toBe(true);
+    expect(isMarkdownUnityPropertyFenceLanguage("unity-property")).toBe(true);
+    expect(isMarkdownUnityPropertyFenceLanguage("unity:property")).toBe(true);
+    expect(isMarkdownUnityPropertyFenceLanguage("json")).toBe(false);
+  });
+
+  it("parses compact asset and component property targets", () => {
+    const result = parseUnityPropertyFence([
+      "Assets/Data/Config.asset#m_Name",
+      "Assets/Scenes/Main.unity/Player#UnityEngine.Transform:m_LocalPosition",
+      "Assets/Prefabs/Enemy.prefab/Body#Renderer[1]:m_Enabled",
+    ].join("\n"));
+
+    expect(result.issues).toHaveLength(0);
+    expect(result.entries[0]?.target).toEqual({
+      kind: "asset",
+      path: "Assets/Data/Config.asset",
+      propertyPath: "m_Name",
+    });
+    expect(result.entries[1]?.target).toEqual({
+      kind: "component",
+      scenePath: "Assets/Scenes/Main.unity",
+      objectPath: "Player",
+      componentType: "UnityEngine.Transform",
+      componentIndex: 0,
+      propertyPath: "m_LocalPosition",
+    });
+    expect(result.entries[2]?.target).toEqual({
+      kind: "component",
+      path: "Assets/Prefabs/Enemy.prefab",
+      objectPath: "Body",
+      componentType: "Renderer",
+      componentIndex: 1,
+      propertyPath: "m_Enabled",
+    });
+  });
+
+  it("preserves Unity YAML ordinal paths for scene object property targets", () => {
+    const result = parseUnityPropertyFence(
+      "Assets/Scenes/Main.unity/Root/Enemy[2]#UnityEngine.Transform:m_LocalPosition",
+    );
+
+    expect(result.issues).toHaveLength(0);
+    expect(result.entries[0]?.target).toEqual({
+      kind: "component",
+      scenePath: "Assets/Scenes/Main.unity",
+      objectPath: "Root/Enemy[2]",
+      componentType: "UnityEngine.Transform",
+      componentIndex: 0,
+      propertyPath: "m_LocalPosition",
+    });
+  });
+
+  it("parses JSON property targets", () => {
+    const result = parseUnityPropertyFence(JSON.stringify([
+      {
+        target: {
+          kind: "gameObject",
+          scenePath: "Assets/Scenes/Main.unity",
+          objectPath: "Player",
+          objectFileId: 100200300,
+          targetFileId: 100200300,
+          propertyPath: "m_Name",
+        },
+      },
+    ]));
+
+    expect(result.issues).toHaveLength(0);
+    expect(result.entries[0]?.target).toEqual({
+      kind: "gameObject",
+      scenePath: "Assets/Scenes/Main.unity",
+      objectPath: "Player",
+      objectFileId: 100200300,
+      targetFileId: 100200300,
+      propertyPath: "m_Name",
+    });
+  });
+
+  it("parses explicit component selector targets", () => {
+    const result = parseUnityPropertyFence(
+      "Assets/Scenes/Main.unity/Player#component:UnityEngine.Transform:m_LocalScale",
+    );
+
+    expect(result.issues).toHaveLength(0);
+    expect(result.entries[0]?.target).toEqual({
+      kind: "component",
+      scenePath: "Assets/Scenes/Main.unity",
+      objectPath: "Player",
+      componentType: "UnityEngine.Transform",
+      componentIndex: 0,
+      propertyPath: "m_LocalScale",
+    });
   });
 });
 

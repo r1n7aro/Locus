@@ -399,65 +399,101 @@ async function openLogs() {
     expect(transformed.introducedNames).toContain("openLogs");
   });
 
-  it("exposes Unity property editor components to View packages", () => {
+  it("exposes Unity property editor and object preview components to View packages", () => {
     const script = extractVueScriptSetup(`
 <script setup lang="ts">
-import { UnityPropertyDraw, UnityPropertyEditor, UnityNumberField, createPropertyTree } from "@locus/components";
+import { UnityObjectPreview, UnityPropertyDraw, UnityPropertyEditor, UnityNumberField, createInspectorPropertyTreeBinding, createPropertyTree } from "@locus/components";
 
 const cell = { type: "Integer", value: 1 };
 const tree = createPropertyTree({ propertyPath: "m_Name", valueType: "String" });
+const binding = createInspectorPropertyTreeBinding({ snapshots: { propertyPath: "m_Name", valueType: "String" } });
+const preview = UnityObjectPreview;
 </script>`);
 
     const transformed = transformViewScriptSetup(script);
 
     expect(transformed.code).toContain('const __module0 = __import("@locus/components")');
-    expect(transformed.code).toContain("const { UnityPropertyDraw, UnityPropertyEditor, UnityNumberField, createPropertyTree } = __module0");
+    expect(transformed.code).toContain("const { UnityObjectPreview, UnityPropertyDraw, UnityPropertyEditor, UnityNumberField, createInspectorPropertyTreeBinding, createPropertyTree } = __module0");
+    expect(transformed.introducedNames).toContain("UnityObjectPreview");
     expect(transformed.introducedNames).toContain("UnityPropertyDraw");
     expect(transformed.introducedNames).toContain("UnityPropertyEditor");
     expect(transformed.introducedNames).toContain("UnityNumberField");
+    expect(transformed.introducedNames).toContain("createInspectorPropertyTreeBinding");
     expect(transformed.introducedNames).toContain("createPropertyTree");
     expect(transformed.introducedNames).toContain("cell");
     expect(transformed.introducedNames).toContain("tree");
+    expect(transformed.introducedNames).toContain("binding");
+    expect(transformed.introducedNames).toContain("preview");
   });
 
-  it("exposes PropertyTree helpers through the View runtime module", () => {
+  it("exposes shared drawer services through the View runtime module", () => {
     const script = extractVueScriptSetup(`
 <script setup lang="ts">
 import {
-  createInspectorPropertyDrawLibrary,
+  createInspectorPropertyDrawerLibrary,
+  createInspectorPropertyTreeBinding,
   createPropertyTree,
-  projectInspectorPropertyDrawLibrary,
+  createUnityObjectDrawerLibrary,
+  propertyDrawer,
+  projectInspectorPropertyDrawerLibrary,
   propertyTreeService,
-  publicInspectorPropertyDrawLibrary,
+  publicInspectorPropertyDrawerLibrary,
+  publicUnityObjectDrawerLibrary,
+  registerInspectorValueDrawer,
+  registerUnityObjectDrawer,
+  unityObjectDrawer,
+  UnityObjectPreview,
   UnityPropertyDraw,
   view,
 } from "@locus/view-runtime";
 
 const tree = createPropertyTree({ propertyPath: "m_Name", valueType: "String" });
-const library = createInspectorPropertyDrawLibrary();
-const publicLibrary = publicInspectorPropertyDrawLibrary;
-const projectLibrary = projectInspectorPropertyDrawLibrary;
-const runtimeLibrary = view.propertyDraw.library;
+const binding = createInspectorPropertyTreeBinding({ snapshots: { propertyPath: "m_Name", valueType: "String" } });
+const library = createInspectorPropertyDrawerLibrary();
+const objectLibrary = createUnityObjectDrawerLibrary();
+const publicLibrary = publicInspectorPropertyDrawerLibrary;
+const projectLibrary = projectInspectorPropertyDrawerLibrary;
+const runtimeLibrary = view.propertyDrawer.library;
+const runtimeObjectLibrary = view.unityObjectDrawer.library;
 const serviceTree = propertyTreeService.createTree({ propertyPath: "m_Enabled", valueType: "Boolean" });
+const serviceBinding = propertyTreeService.createBinding({ snapshots: { propertyPath: "m_Enabled", valueType: "Boolean" } });
+propertyDrawer.registerValue("Float", UnityPropertyDraw);
+unityObjectDrawer.register(".prefab", UnityObjectPreview, { level: "thumbnail" });
+registerInspectorValueDrawer("Integer", UnityPropertyDraw);
+registerUnityObjectDrawer(".fbx", UnityObjectPreview, { level: "thumbnail" });
+const publicObjectLibrary = publicUnityObjectDrawerLibrary;
 </script>`);
 
     const transformed = transformViewScriptSetup(script);
 
     expect(transformed.code).toContain('const __module0 = __import("@locus/view-runtime")');
-    expect(transformed.code).toContain("const { createInspectorPropertyDrawLibrary, createPropertyTree, projectInspectorPropertyDrawLibrary, propertyTreeService, publicInspectorPropertyDrawLibrary, UnityPropertyDraw, view } = __module0");
-    expect(transformed.introducedNames).toContain("createInspectorPropertyDrawLibrary");
+    expect(transformed.code).toContain("const { createInspectorPropertyDrawerLibrary, createInspectorPropertyTreeBinding, createPropertyTree, createUnityObjectDrawerLibrary, propertyDrawer, projectInspectorPropertyDrawerLibrary, propertyTreeService, publicInspectorPropertyDrawerLibrary, publicUnityObjectDrawerLibrary, registerInspectorValueDrawer, registerUnityObjectDrawer, unityObjectDrawer, UnityObjectPreview, UnityPropertyDraw, view } = __module0");
+    expect(transformed.introducedNames).toContain("createInspectorPropertyDrawerLibrary");
+    expect(transformed.introducedNames).toContain("createInspectorPropertyTreeBinding");
     expect(transformed.introducedNames).toContain("createPropertyTree");
-    expect(transformed.introducedNames).toContain("projectInspectorPropertyDrawLibrary");
+    expect(transformed.introducedNames).toContain("createUnityObjectDrawerLibrary");
+    expect(transformed.introducedNames).toContain("propertyDrawer");
+    expect(transformed.introducedNames).toContain("projectInspectorPropertyDrawerLibrary");
     expect(transformed.introducedNames).toContain("propertyTreeService");
-    expect(transformed.introducedNames).toContain("publicInspectorPropertyDrawLibrary");
+    expect(transformed.introducedNames).toContain("publicInspectorPropertyDrawerLibrary");
+    expect(transformed.introducedNames).toContain("publicUnityObjectDrawerLibrary");
+    expect(transformed.introducedNames).toContain("registerInspectorValueDrawer");
+    expect(transformed.introducedNames).toContain("registerUnityObjectDrawer");
+    expect(transformed.introducedNames).toContain("unityObjectDrawer");
+    expect(transformed.introducedNames).toContain("UnityObjectPreview");
     expect(transformed.introducedNames).toContain("UnityPropertyDraw");
     expect(transformed.introducedNames).toContain("view");
     expect(transformed.introducedNames).toContain("library");
+    expect(transformed.introducedNames).toContain("objectLibrary");
     expect(transformed.introducedNames).toContain("publicLibrary");
     expect(transformed.introducedNames).toContain("projectLibrary");
     expect(transformed.introducedNames).toContain("runtimeLibrary");
+    expect(transformed.introducedNames).toContain("runtimeObjectLibrary");
     expect(transformed.introducedNames).toContain("tree");
+    expect(transformed.introducedNames).toContain("binding");
     expect(transformed.introducedNames).toContain("serviceTree");
+    expect(transformed.introducedNames).toContain("serviceBinding");
+    expect(transformed.introducedNames).toContain("publicObjectLibrary");
   });
 
   it("exposes View undo and undoable property binding helpers", () => {
@@ -495,7 +531,9 @@ async function rename(commit) {
 import {
   UnityDropZone,
   UnityReferenceChip,
+  serializedProperty,
   unity,
+  unitySerializedProperty,
   useLocusFileDrag,
   useLocusFileDropTarget,
   useUnityAssetDropTarget,
@@ -513,6 +551,15 @@ async function openMaterial() {
   await unity.inspect(materialRef);
   await unity.selectAsset(materialRef.path);
   await unity.inspectSceneObject("Assets/Scenes/Main.unity", "Player/Camera");
+  await unity.serializedProperty.read({ target: { kind: "asset", path: materialRef.path } });
+  await serializedProperty.write({
+    target: { kind: "asset", path: materialRef.path, propertyPath: "m_Name" },
+    value: "M_Wood",
+  });
+  await unitySerializedProperty.discover({
+    target: { kind: "asset", path: materialRef.path },
+    query: "name",
+  });
   unity.drag.onDrop(() => undefined);
   unity.drag.onState(() => undefined);
   refDrag.draggable.value;
@@ -526,12 +573,17 @@ async function openMaterial() {
     const transformed = transformViewScriptSetup(script);
 
     expect(transformed.code).toContain('const __module0 = __import("@locus/view-runtime")');
-    expect(transformed.code).toContain("const { UnityDropZone, UnityReferenceChip, unity, useLocusFileDrag, useLocusFileDropTarget, useUnityAssetDropTarget, useUnityReferenceDrag } = __module0");
+    expect(transformed.code).toContain("const { UnityDropZone, UnityReferenceChip, serializedProperty, unity, unitySerializedProperty, useLocusFileDrag, useLocusFileDropTarget, useUnityAssetDropTarget, useUnityReferenceDrag } = __module0");
     expect(transformed.code).toContain("const refDrag = useUnityReferenceDrag(() => [materialRef])");
     expect(transformed.code).toContain("const assetDrop = useUnityAssetDropTarget({ onDrop: refs => refs.length })");
     expect(transformed.code).toContain("await unity.select(materialRef)");
     expect(transformed.code).toContain("await unity.inspect(materialRef)");
+    expect(transformed.code).toContain("await unity.serializedProperty.read");
+    expect(transformed.code).toContain("await serializedProperty.write");
+    expect(transformed.code).toContain("await unitySerializedProperty.discover");
     expect(transformed.introducedNames).toContain("unity");
+    expect(transformed.introducedNames).toContain("serializedProperty");
+    expect(transformed.introducedNames).toContain("unitySerializedProperty");
     expect(transformed.introducedNames).toContain("useUnityReferenceDrag");
     expect(transformed.introducedNames).toContain("useUnityAssetDropTarget");
     expect(transformed.introducedNames).toContain("UnityReferenceChip");

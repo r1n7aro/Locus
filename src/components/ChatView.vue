@@ -31,6 +31,7 @@ import BaseSegmented from "./ui/BaseSegmented.vue";
 import LucideIcon from "./icons/LucideIcon.vue";
 import { refetchDiffByKey } from "../services/diff";
 import { openChatDiffReviewWindow } from "../services/chatDiffReviewWindow";
+import { openLocusAssetInspectorWindow } from "../services/locusAssetInspectorWindow";
 import { normalizeAppError } from "../services/errors";
 import { knowledgeRevealTarget } from "../services/knowledge";
 import { t } from "../i18n";
@@ -354,6 +355,10 @@ const assetRefContextCanOpenInEditor = computed(() => {
   return !!target && !(target.kind === "knowledge" || (target.kind === "file" && target.entryKind === "folder"));
 });
 
+const assetRefContextCanOpenLocusInspector = computed(() =>
+  assetRefCtxMenu.value?.target.kind === "asset",
+);
+
 const assetRefContextSupportsUnity = computed(() => {
   const target = assetRefCtxMenu.value?.target;
   return target?.kind === "asset" || target?.kind === "sceneObject";
@@ -420,6 +425,34 @@ function parseKnowledgeDocumentRefPath(filePath: string): KnowledgeRefContextMen
 }
 
 function assetContextTargetFromElement(target: Element): AssetRefContextMenuTarget | null {
+  const unityObjectIdentity = target.closest(
+    ".unity-object-identity[data-unity-ref-kind]",
+  ) as HTMLElement | null;
+  if (unityObjectIdentity) {
+    const refKind = unityObjectIdentity.dataset.unityRefKind;
+    const refPath = normalizeAssetRefDatasetPath(unityObjectIdentity.dataset.unityRefPath);
+    if ((refKind === "asset" || refKind === "subObject") && refPath && isUnityAssetPath(refPath)) {
+      return {
+        kind: "asset",
+        filePath: refPath,
+        assetPath: refPath,
+      };
+    }
+    if (refKind === "sceneObject") {
+      const sceneRef = refPath.match(/^((?:Assets|Packages)\/.+?\.unity)\/(.+)$/i);
+      const scenePath = normalizeAssetRefDatasetPath(sceneRef?.[1]);
+      const objectPath = normalizeAssetRefDatasetPath(sceneRef?.[2]);
+      if (scenePath && objectPath) {
+        return {
+          kind: "sceneObject",
+          filePath: scenePath,
+          scenePath,
+          objectPath,
+        };
+      }
+    }
+  }
+
   const knowledgeRef = target.closest(
     ".md-knowledge-ref[data-knowledge-path], .asset-chip[data-ref-kind='knowledge']",
   ) as HTMLElement | null;
@@ -550,6 +583,7 @@ function handleContentContextMenu(e: MouseEvent) {
 function handleContentClick(e: MouseEvent) {
   closeMessageContextMenu();
   const target = e.target as HTMLElement;
+  if (isInsidePassiveMarkdownUnityPreview(target)) return;
   if (target.tagName === "IMG") {
     e.preventDefault();
     openLightbox((target as HTMLImageElement).src);
@@ -631,6 +665,10 @@ function handleContentClick(e: MouseEvent) {
     }
     handleFileRefClick(filePath);
   }
+}
+
+function isInsidePassiveMarkdownUnityPreview(target: Element): boolean {
+  return !!target.closest("[data-md-unity-passive='true']");
 }
 
 function handleKnowledgeRefClick(docType: KnowledgeDocumentType, path: string) {
@@ -743,6 +781,21 @@ async function doAssetRefOpenInEditor() {
   } catch (error) {
     console.warn("openFileExternal failed:", error);
     notifyAssetRefContextMenuError(error, "assetRefOpenInEditor", "Failed to open file");
+  }
+}
+
+async function doAssetRefOpenInLocusInspector() {
+  const target = assetRefCtxMenu.value?.target;
+  if (!target || target.kind !== "asset") return;
+  closeAssetRefContextMenu();
+  try {
+    const opened = await openLocusAssetInspectorWindow({ assetPath: target.assetPath });
+    if (!opened) {
+      await openFileExternal(target.filePath);
+    }
+  } catch (error) {
+    console.warn("openLocusAssetInspectorWindow failed:", error);
+    notifyAssetRefContextMenuError(error, "assetRefOpenLocusInspector", t("asset.inspector.openFailed"));
   }
 }
 
@@ -2682,6 +2735,16 @@ onUnmounted(() => {
             >
               {{ t("common.selectInUnity") }}
             </button>
+            <template v-if="assetRefContextCanOpenLocusInspector">
+              <div class="asset-ref-ctx-sep"></div>
+              <button
+                type="button"
+                class="asset-ref-ctx-item"
+                @click="doAssetRefOpenInLocusInspector"
+              >
+                {{ t("common.openInLocusInspector") }}
+              </button>
+            </template>
           </template>
     </BaseContextMenu>
 

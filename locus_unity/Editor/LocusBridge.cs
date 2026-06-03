@@ -1564,6 +1564,12 @@ namespace Locus
                         return await tcs.Task;
                     }
 
+                    case "asset_thumbnail":
+                        return await HandleAssetThumbnail(reqId, msg.message);
+
+                    case "asset_preview_render":
+                        return await HandleAssetPreviewRender(reqId, msg.message);
+
                     case "select_scene_object":
                     {
                         SceneObjectRequest request = ParseSceneObjectRequest(msg.message);

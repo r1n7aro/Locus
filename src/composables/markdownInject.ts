@@ -17,6 +17,13 @@ import {
  * into rendered Markdown HTML. Extracted for testability.
  */
 
+export type MarkdownUnityObjectPreviewLevel = "inline" | "row" | "thumbnail" | "inspector" | "editor";
+
+interface MarkdownUnityObjectRefOptions {
+  level?: MarkdownUnityObjectPreviewLevel;
+  editable?: boolean;
+}
+
 /**
  * Walk HTML string, applying `transform` only to text segments outside
  * code/pre blocks and anchor tags. Tags and protected content pass through.
@@ -48,6 +55,8 @@ const BRACED_UNITY_REF_RE = /\{@?((?:Assets|Packages)\/[^{}\r\n]+?)\}/g;
 const PARENTHESIZED_UNITY_ASSET_REF_RE = /\(@?((?:Assets|Packages)\/[^()\r\n]+?\.[A-Za-z0-9][^()\r\n]*?(?:#fileID:-?\d+)?)\)/gi;
 const ASSET_REF_RE = /@((?:Assets|Packages)\/[\w.\/-]*[\w.-])(?!\/)/g;
 const INLINE_CODE_BRACED_REF_RE = /^\{@?([^{}\r\n]+\/[^{}\r\n]*)\}$/;
+const INLINE_CODE_UNITY_REF_PREFIX_RE = /^(?:asset|unity|ref)(?::([A-Za-z-]+))?\s+(.+)$/i;
+const INLINE_CODE_UNITY_REF_SUFFIX_RE = /^(.+?)\s+\|\s*([A-Za-z-]+)$/;
 const INLINE_CODE_PATH_SUFFIX_RE = /^(.+?)(?::(\d+)|#L(\d+)|#fileID:-?\d+)?$/i;
 const INLINE_WORKSPACE_ROOT_RE = /^(?:ProjectSettings|src|src-tauri|Library|Editor)\//i;
 const INLINE_GENERIC_FILE_PATH_RE = /^(?:[^/\r\n]+\/)+[^/\r\n]+\.[A-Za-z0-9][^/\r\n]*$/;
@@ -73,6 +82,8 @@ const VIEW_REF_PARAGRAPH_RE = new RegExp(
   `<p>\\s*(?:<code>)?view:${VIEW_REF_VALUE_SOURCE}(?:</code>)?\\s*</p>`,
   "gi",
 );
+const CODE_BLOCK_RE = /<pre><code([^>]*)>([\s\S]*?)<\/code><\/pre>/gi;
+const CODE_CLASS_LANGUAGE_RE = /\blanguage-([^"\s]+)/i;
 
 function escapeAttr(source: string): string {
   return source
@@ -214,6 +225,70 @@ function renderUnityAssetIcon(kind: UnityAssetIconKind): string {
   return renderRefIcon(kind, `md-unity-asset-icon md-unity-asset-icon--${kind}`);
 }
 
+function markdownUnityPreviewLevelFromToken(token: string | undefined): MarkdownUnityObjectPreviewLevel | null {
+  const normalized = token?.trim().toLowerCase();
+  if (!normalized) return null;
+  if (normalized === "inline" || normalized === "chip") return "inline";
+  if (normalized === "row" || normalized === "line" || normalized === "block" || normalized === "editable") return "row";
+  if (normalized === "preview" || normalized === "thumbnail" || normalized === "thumb") return "thumbnail";
+  if (normalized === "inspector" || normalized === "inspect") return "inspector";
+  if (normalized === "editor" || normalized === "edit") return "editor";
+  return null;
+}
+
+function markdownUnityRefOptionsFromToken(token: string | undefined): MarkdownUnityObjectRefOptions | null {
+  const level = markdownUnityPreviewLevelFromToken(token);
+  if (!level) return null;
+  const normalized = token?.trim().toLowerCase();
+  return {
+    level,
+    editable: normalized === "editable" || normalized === "editor" || normalized === "edit",
+  };
+}
+
+export function isMarkdownUnityObjectFenceLanguage(language: string | undefined): boolean {
+  if (!language) return false;
+  const normalized = language.trim().toLowerCase();
+  return /^(?:asset|unity|ref)(?::|-)?(?:inline|chip|row|line|block|preview|thumbnail|thumb|inspector|inspect|editor|edit|editable)?$/.test(normalized);
+}
+
+export function isMarkdownUnityPropertyFenceLanguage(language: string | undefined): boolean {
+  if (!language) return false;
+  const normalized = language.trim().toLowerCase();
+  return /^(?:unity[_-]?property|unity:property|property:unity|unity-property-editor)$/.test(normalized);
+}
+
+function markdownUnityRefOptionsFromFenceLanguage(language: string | undefined): MarkdownUnityObjectRefOptions | null {
+  if (!isMarkdownUnityObjectFenceLanguage(language)) return null;
+  const normalized = language?.trim().toLowerCase() ?? "";
+  const match = normalized.match(/^(?:asset|unity|ref)(?::|-)?(.+)?$/);
+  const tokenOptions = markdownUnityRefOptionsFromToken(match?.[1]);
+  return tokenOptions ?? { level: "row" };
+}
+
+function normalizeMarkdownUnityObjectOptions(options: MarkdownUnityObjectRefOptions = {}): Required<MarkdownUnityObjectRefOptions> {
+  const level = options.editable && (!options.level || options.level === "inline")
+    ? "row"
+    : options.level ?? "inline";
+  return {
+    level,
+    editable: !!options.editable,
+  };
+}
+
+function unityObjectPreviewAttrs(
+  refKind: "asset" | "sceneObject",
+  levelOptions: MarkdownUnityObjectRefOptions = {},
+): { classes: string; attrs: string } {
+  const options = normalizeMarkdownUnityObjectOptions(levelOptions);
+  const classes = `md-unity-object-ref md-unity-object-ref--${options.level}`;
+  const editableAttr = options.editable ? ` data-md-unity-editable="true"` : "";
+  return {
+    classes,
+    attrs: ` data-md-unity-object-preview="true" data-md-unity-level="${options.level}" data-md-unity-ref-kind="${refKind}"${editableAttr}`,
+  };
+}
+
 function renderFileRef(
   filePath: string,
   line = "",
@@ -240,15 +315,20 @@ function renderLocalFileRef(filePath: string, line = ""): string {
   return renderFileRef(cleanPath, line, classes, ` data-entry-kind="${entryKind}" draggable="true"`, icon);
 }
 
-function renderUnityAssetRef(filePath: string, line = ""): string {
+function renderUnityAssetRef(
+  filePath: string,
+  line = "",
+  options: MarkdownUnityObjectRefOptions = {},
+): string {
   const normalizedPath = normalizeUnityAssetRefPath(filePath);
   const escaped = escapeAttr(normalizedPath);
   const kind = unityAssetKind(normalizedPath);
+  const preview = unityObjectPreviewAttrs("asset", options);
   return renderFileRef(
     normalizedPath,
     line,
-    "md-unity-asset-ref",
-    ` data-asset-path="${escaped}" data-asset-kind="${kind}" draggable="true"`,
+    `md-unity-asset-ref ${preview.classes}`,
+    `${preview.attrs} data-asset-path="${escaped}" data-asset-kind="${kind}" draggable="true"`,
     renderUnityAssetIcon(kind),
   );
 }
@@ -372,7 +452,10 @@ function splitSceneObjectRef(filePath: string): SceneObjectRefParts | null {
   return { scenePath, objectPath };
 }
 
-function renderUnitySceneObjectRef(filePath: string): string {
+function renderUnitySceneObjectRef(
+  filePath: string,
+  options: MarkdownUnityObjectRefOptions = {},
+): string {
   const ref = splitSceneObjectRef(filePath);
   if (!ref) return escapeAttr(filePath);
   const fullPath = `${ref.scenePath}/${ref.objectPath}`;
@@ -381,7 +464,8 @@ function renderUnitySceneObjectRef(filePath: string): string {
   const escapedObjectPath = escapeAttr(ref.objectPath);
   const escapedLabel = escapeAttr(displaySceneObjectRef(ref.objectPath));
   const icon = renderRefIcon("gameobject", "md-unity-gameobject-icon");
-  return `<span class="md-file-ref md-unity-scene-object-ref ui-select-text" data-file-path="${escapedFullPath}" data-scene-path="${escapedScenePath}" data-scene-object-path="${escapedObjectPath}" draggable="true" title="${escapedFullPath}" aria-label="${escapedFullPath}">${icon}<span class="md-ref-label">${escapedLabel}</span></span>`;
+  const preview = unityObjectPreviewAttrs("sceneObject", options);
+  return `<span class="md-file-ref md-unity-scene-object-ref ${preview.classes} ui-select-text"${preview.attrs} data-file-path="${escapedFullPath}" data-scene-path="${escapedScenePath}" data-scene-object-path="${escapedObjectPath}" draggable="true" title="${escapedFullPath}" aria-label="${escapedFullPath}">${icon}<span class="md-ref-label">${escapedLabel}</span></span>`;
 }
 
 function isSceneObjectRefTerminator(ch: string): boolean {
@@ -469,13 +553,16 @@ export function findUnityAssetPathEnd(text: string, start: number): number {
   return bestEnd;
 }
 
-function renderUnityPathRef(filePath: string): string {
+function renderUnityPathRef(
+  filePath: string,
+  options: MarkdownUnityObjectRefOptions = {},
+): string {
   const normalized = filePath.trim().replace(/\\/g, "/");
   const sceneObjectRef = splitSceneObjectRef(normalized);
   if (sceneObjectRef) {
-    return renderUnitySceneObjectRef(`${sceneObjectRef.scenePath}/${sceneObjectRef.objectPath}`);
+    return renderUnitySceneObjectRef(`${sceneObjectRef.scenePath}/${sceneObjectRef.objectPath}`, options);
   }
-  return renderUnityAssetRef(normalized);
+  return renderUnityAssetRef(normalized, "", options);
 }
 
 function replaceLooseUnityAssetRefs(
@@ -521,11 +608,38 @@ function decodeCodeText(source: string): string {
     .replace(/&amp;/g, "&");
 }
 
-function normalizeInlineCodeRefText(source: string): string {
+interface ParsedInlineCodeRefText {
+  refText: string;
+  unityOptions?: MarkdownUnityObjectRefOptions;
+}
+
+function parseInlineCodeRefText(source: string): ParsedInlineCodeRefText {
   const decoded = decodeCodeText(source).trim();
   const braced = decoded.match(INLINE_CODE_BRACED_REF_RE);
-  const unwrapped = braced ? braced[1].trim() : decoded;
-  return unwrapped.replace(/^@(?=[^@\r\n]*\/)/, "");
+  let refText = braced ? braced[1].trim() : decoded;
+  let unityOptions: MarkdownUnityObjectRefOptions | undefined;
+
+  const prefixed = refText.match(INLINE_CODE_UNITY_REF_PREFIX_RE);
+  if (prefixed) {
+    const nextOptions = markdownUnityRefOptionsFromToken(prefixed[1]);
+    unityOptions = nextOptions ?? { level: "inline" };
+    refText = prefixed[2].trim();
+  }
+
+  const suffixed = refText.match(INLINE_CODE_UNITY_REF_SUFFIX_RE);
+  if (suffixed) {
+    const nextOptions = markdownUnityRefOptionsFromToken(suffixed[2]);
+    if (nextOptions) {
+      unityOptions = {
+        ...unityOptions,
+        ...nextOptions,
+      };
+      refText = suffixed[1].trim();
+    }
+  }
+
+  refText = refText.replace(/^@(?=[^@\r\n]*\/)/, "");
+  return { refText, unityOptions };
 }
 
 function splitInlineCodePathSuffix(source: string): { path: string; line: string } | null {
@@ -557,7 +671,8 @@ function renderWorkspaceInlineRef(filePath: string, line = ""): string {
 }
 
 function assetRefFromInlineCode(source: string): string | null {
-  const refText = normalizeInlineCodeRefText(source);
+  const inlineRef = parseInlineCodeRefText(source);
+  const refText = inlineRef.refText;
   if (INLINE_SLASH_COMMAND_RE.test(refText)) {
     return renderInlineCommandRef(refText);
   }
@@ -578,14 +693,79 @@ function assetRefFromInlineCode(source: string): string | null {
 
   const sceneObjectRef = splitSceneObjectRef(parsed.path);
   if (sceneObjectRef) {
-    return renderUnitySceneObjectRef(`${sceneObjectRef.scenePath}/${sceneObjectRef.objectPath}`);
+    return renderUnitySceneObjectRef(`${sceneObjectRef.scenePath}/${sceneObjectRef.objectPath}`, inlineRef.unityOptions);
   }
 
   if (ASSET_ROOT_RE.test(parsed.path)) {
-    return renderUnityAssetRef(parsed.path, parsed.line);
+    return renderUnityAssetRef(parsed.path, parsed.line, inlineRef.unityOptions);
   }
 
   return renderWorkspaceInlineRef(parsed.path, parsed.line);
+}
+
+function unityAssetRefFromCodeText(
+  source: string,
+  defaultUnityOptions?: MarkdownUnityObjectRefOptions,
+): string | null {
+  const inlineRef = parseInlineCodeRefText(source);
+  const parsed = splitInlineCodePathSuffix(inlineRef.refText);
+  if (!parsed || !isWorkspaceInlineRefPath(parsed.path)) return null;
+
+  const unityOptions = inlineRef.unityOptions ?? defaultUnityOptions;
+  if (!unityOptions && inlineRef.refText === source.trim()) return null;
+
+  const sceneObjectRef = splitSceneObjectRef(parsed.path);
+  if (sceneObjectRef) {
+    return renderUnitySceneObjectRef(`${sceneObjectRef.scenePath}/${sceneObjectRef.objectPath}`, unityOptions);
+  }
+
+  if (ASSET_ROOT_RE.test(parsed.path)) {
+    return renderUnityAssetRef(parsed.path, parsed.line, unityOptions);
+  }
+
+  return null;
+}
+
+function decodeHtmlTextFragment(source: string): string {
+  return decodeCodeText(source
+    .replace(/<span\b[^>]*\bline-number\b[^>]*>[\s\S]*?<\/span>/gi, "")
+    .replace(/<[^>]+>/g, ""));
+}
+
+function unityObjectFenceLanguageFromAttrs(attrs: string): string {
+  const match = attrs.match(CODE_CLASS_LANGUAGE_RE);
+  return match?.[1] ? decodeCodeText(match[1]) : "";
+}
+
+export function injectUnityPropertyFenceRefs(html: string): string {
+  return html.replace(CODE_BLOCK_RE, (match, attrs: string, content: string) => {
+    if (!isMarkdownUnityPropertyFenceLanguage(unityObjectFenceLanguageFromAttrs(attrs))) return match;
+    const source = decodeHtmlTextFragment(content).trim();
+    if (!source) return match;
+
+    return [
+      '<div class="md-unity-property-fence-host" data-md-unity-property-fence="true">',
+      '<pre class="md-unity-property-fallback"><code data-md-unity-property-source="true">',
+      escapeAttr(source),
+      "</code></pre>",
+      "</div>",
+    ].join("");
+  });
+}
+
+export function injectUnityObjectFenceRefs(html: string): string {
+  return html.replace(CODE_BLOCK_RE, (match, attrs: string, content: string) => {
+    const languageOptions = markdownUnityRefOptionsFromFenceLanguage(unityObjectFenceLanguageFromAttrs(attrs));
+    const source = decodeHtmlTextFragment(content).trim();
+    if (!source) return match;
+
+    const lines = source.split(/\r?\n/g).map((line) => line.trim()).filter(Boolean);
+    if (!lines.length) return match;
+
+    const refs = lines.map((line) => unityAssetRefFromCodeText(line, languageOptions ?? undefined));
+    if (refs.some((ref) => !ref)) return match;
+    return refs.join("");
+  });
 }
 
 function injectInlineCodeAssetRefs(html: string): string {

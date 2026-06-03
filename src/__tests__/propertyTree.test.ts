@@ -1,13 +1,16 @@
 import { describe, expect, it } from "vitest";
 import { defineComponent, isVNode } from "vue";
 import {
+  createInspectorPropertyTreeBinding,
   createPropertyTree,
-  createInspectorPropertyDrawLibrary,
-  defineInspectorPropertyDrawComponents,
-  projectInspectorPropertyDrawLibrary,
+  createInspectorPropertyDrawerLibrary,
+  defineInspectorPropertyDrawers,
+  projectInspectorPropertyDrawerLibrary,
   propertyTreeService,
-  publicInspectorPropertyDrawLibrary,
-  registerInspectorPropertyDrawComponent,
+  publicInspectorPropertyDrawerLibrary,
+  registerInspectorAttributeDrawer,
+  registerInspectorPropertyDrawer,
+  registerInspectorValueDrawer,
   resolveInspectorDrawer,
   type InspectorPropertySnapshot,
 } from "../services/propertyTree";
@@ -69,6 +72,49 @@ describe("propertyTree", () => {
     expect(tree.getProperty("root.tint")?.drawer.kind).toBe("color");
     expect(tree.getProperty("root.points")?.drawer.kind).toBe("array");
     expect(tree.getProperty("root.points.Array.data[0]")?.drawer.kind).toBe("vector");
+  });
+
+  it("keeps Unity structured values editable when snapshots include component children", () => {
+    const tree = createPropertyTree({
+      propertyPath: "root.transform",
+      displayName: "Transform",
+      valueType: "Generic",
+      children: [
+        {
+          propertyPath: "root.transform.m_LocalPosition",
+          displayName: "Local Position",
+          valueType: "Vector3",
+          value: { x: 1, y: 2, z: 3 },
+          editable: true,
+          children: [
+            { propertyPath: "root.transform.m_LocalPosition.x", displayName: "X", valueType: "Float", value: 1 },
+            { propertyPath: "root.transform.m_LocalPosition.y", displayName: "Y", valueType: "Float", value: 2 },
+            { propertyPath: "root.transform.m_LocalPosition.z", displayName: "Z", valueType: "Float", value: 3 },
+          ],
+        },
+        {
+          propertyPath: "root.transform.m_LocalRotation",
+          displayName: "Local Rotation",
+          valueType: "Quaternion",
+          value: { x: 0, y: 0, z: 0, w: 1 },
+          displayValue: "0, 0, 0",
+          editable: true,
+          children: [
+            { propertyPath: "root.transform.m_LocalRotation.x", displayName: "X", valueType: "Float", value: 0 },
+            { propertyPath: "root.transform.m_LocalRotation.y", displayName: "Y", valueType: "Float", value: 0 },
+            { propertyPath: "root.transform.m_LocalRotation.z", displayName: "Z", valueType: "Float", value: 0 },
+            { propertyPath: "root.transform.m_LocalRotation.w", displayName: "W", valueType: "Float", value: 1 },
+          ],
+        },
+      ],
+    });
+
+    const position = tree.requireProperty("root.transform.m_LocalPosition");
+    const rotation = tree.requireProperty("root.transform.m_LocalRotation");
+
+    expect(position.drawer).toMatchObject({ kind: "vector", container: false, valueType: "Vector3" });
+    expect(rotation.drawer).toMatchObject({ kind: "vector", container: false, valueType: "Quaternion" });
+    expect(tree.requireProperty("root.transform").drawer.kind).toBe("object");
   });
 
   it("tracks selection, changed fields, validation messages, and commit events", () => {
@@ -134,8 +180,21 @@ describe("propertyTree", () => {
       valueType: "Demo.Stat",
       value: { current: 3, max: 10 },
       editable: true,
+      tooltip: "Current stat value",
+      hasRange: true,
+      rangeMin: 0,
+      rangeMax: 10,
+      numberStep: 1,
+      multiline: true,
+      minLines: 2,
+      maxLines: 4,
+      referenceTypeFullName: "Demo.StatAsset",
+      referenceTypeAssembly: "Assembly-CSharp",
+      attributes: [
+        { type: "RangeAttribute", displayName: "Range", value: "0..10" },
+      ],
     }, {
-      drawComponents: {
+      propertyDrawers: {
         "Demo.Stat": StatDrawer,
       },
     });
@@ -145,13 +204,19 @@ describe("propertyTree", () => {
       onCommit: (commit) => commits.push(commit),
     });
 
-    expect(property.hasDrawComponent()).toBe(true);
-    expect(property.drawComponent()).toBe(StatDrawer);
+    expect(property.hasPropertyDrawer()).toBe(true);
+    expect(property.propertyDrawerComponent()).toBe(StatDrawer);
     expect(isVNode(drawn)).toBe(true);
     expect(isVNode(drawn) ? drawn.type : null).toBe(StatDrawer);
     const props = isVNode(drawn) ? drawn.props as Record<string, unknown> : {};
     expect(props.propertyPath).toBe("root.stat");
     expect(props.propertyType).toBe("Demo.Stat");
+    expect(props.tooltip).toBe("Current stat value");
+    expect(props.hasRange).toBe(true);
+    expect(props.rangeMax).toBe(10);
+    expect(props.multiline).toBe(true);
+    expect(props.referenceTypeFullName).toBe("Demo.StatAsset");
+    expect(props.attributes).toMatchObject([{ type: "RangeAttribute" }]);
     expect(typeof props.commit).toBe("function");
 
     (props.commit as (value: unknown) => void)(5);
@@ -165,15 +230,15 @@ describe("propertyTree", () => {
     ]);
   });
 
-  it("supports draw component helpers, dynamic libraries, global registrations, and tree drawing", () => {
+  it("supports property drawer helpers, dynamic libraries, global registrations, and tree drawing", () => {
     const NumberDrawer = defineComponent({ name: "NumberDrawer" });
     const TextDrawer = defineComponent({ name: "TextDrawer" });
     const GlobalBoolDrawer = defineComponent({ name: "GlobalBoolDrawer" });
-    const unregister = registerInspectorPropertyDrawComponent("Boolean", GlobalBoolDrawer);
-    const drawComponents = createInspectorPropertyDrawLibrary(defineInspectorPropertyDrawComponents([
+    const unregister = registerInspectorPropertyDrawer("Boolean", GlobalBoolDrawer);
+    const propertyDrawers = createInspectorPropertyDrawerLibrary(defineInspectorPropertyDrawers([
       {
         type: "Integer",
-        component: NumberDrawer,
+        drawer: NumberDrawer,
       },
     ]));
 
@@ -198,19 +263,62 @@ describe("propertyTree", () => {
           editable: true,
         },
       ], {
-        drawComponents,
+        propertyDrawers,
       });
 
-      expect(tree.requireProperty("count").drawComponent()).toBe(NumberDrawer);
-      expect(tree.requireProperty("name").drawComponent()).toBe(null);
-      drawComponents.register("String", TextDrawer);
-      expect(tree.requireProperty("name").drawComponent()).toBe(TextDrawer);
-      expect(tree.requireProperty("enabled").drawComponent()).toBe(GlobalBoolDrawer);
+      expect(tree.requireProperty("count").propertyDrawerComponent()).toBe(NumberDrawer);
+      expect(tree.requireProperty("name").propertyDrawerComponent()).toBe(null);
+      propertyDrawers.register("String", TextDrawer);
+      expect(tree.requireProperty("name").propertyDrawerComponent()).toBe(TextDrawer);
+      expect(tree.requireProperty("enabled").propertyDrawerComponent()).toBe(GlobalBoolDrawer);
       const treeDrawn = tree.draw();
       expect(isVNode(treeDrawn)).toBe(true);
       expect(isVNode(treeDrawn) ? treeDrawn.type : null).toBe("div");
     } finally {
       unregister();
+    }
+  });
+
+  it("matches property drawers by value, attribute, property path, and priority", () => {
+    const RangeDrawer = defineComponent({ name: "RangeDrawer" });
+    const FloatDrawer = defineComponent({ name: "FloatDrawer" });
+    const PathDrawer = defineComponent({ name: "PathDrawer" });
+    const registerFloat = registerInspectorValueDrawer("Float", FloatDrawer);
+    const registerRange = registerInspectorAttributeDrawer("RangeAttribute", RangeDrawer, {
+      valueType: "Float",
+      priority: 10,
+    });
+
+    try {
+      const tree = createPropertyTree([
+        {
+          propertyPath: "speed",
+          valueType: "Float",
+          value: 2,
+          editable: true,
+          attributes: [{ type: "UnityEngine.RangeAttribute", displayName: "Range" }],
+        },
+        {
+          propertyPath: "damage",
+          valueType: "Float",
+          value: 5,
+          editable: true,
+        },
+      ], {
+        propertyDrawers: [
+          {
+            propertyPath: "damage",
+            drawer: PathDrawer,
+            priority: 20,
+          },
+        ],
+      });
+
+      expect(tree.requireProperty("speed").propertyDrawerComponent()).toBe(RangeDrawer);
+      expect(tree.requireProperty("damage").propertyDrawerComponent()).toBe(PathDrawer);
+    } finally {
+      registerRange();
+      registerFloat();
     }
   });
 
@@ -226,18 +334,52 @@ describe("propertyTree", () => {
     });
     const property = tree.requireProperty("shared");
 
-    expect(property.drawComponent()).toBe(null);
-    expect(propertyTreeService.publicDrawLibrary).toBe(publicInspectorPropertyDrawLibrary);
-    expect(projectInspectorPropertyDrawLibrary).toBe(publicInspectorPropertyDrawLibrary);
+    expect(property.propertyDrawerComponent()).toBe(null);
+    expect(propertyTreeService.publicPropertyDrawerLibrary).toBe(publicInspectorPropertyDrawerLibrary);
+    expect(projectInspectorPropertyDrawerLibrary).toBe(publicInspectorPropertyDrawerLibrary);
 
-    const unregister = publicInspectorPropertyDrawLibrary.register("Project.SharedStat", SharedDrawer);
+    const unregister = publicInspectorPropertyDrawerLibrary.register("Project.SharedStat", SharedDrawer);
     try {
-      expect(property.drawComponent()).toBe(SharedDrawer);
+      expect(property.propertyDrawerComponent()).toBe(SharedDrawer);
       expect(property.searchText).toContain("assembly-csharp");
       expect(isVNode(property.draw())).toBe(true);
     } finally {
       unregister();
     }
+  });
+
+  it("creates property tree bindings as the edit source and commit sink", async () => {
+    const snapshot = makeSnapshot();
+    const tree = createPropertyTree(snapshot);
+    const property = tree.requireProperty("root.enabled");
+    const commits: unknown[] = [];
+    const binding = createInspectorPropertyTreeBinding({
+      id: "demo-tree",
+      targetId: "asset:demo",
+      snapshots: snapshot,
+      loading: true,
+      commit: (commit) => {
+        commits.push(commit);
+      },
+    });
+
+    expect(binding.id).toBe("demo-tree");
+    expect(binding.targetId).toBe("asset:demo");
+    expect(binding.snapshots).toBe(snapshot);
+    expect(binding.disabled).toBe(true);
+    expect(binding.readonly).toBe(false);
+    expect(binding.editable).toBe(true);
+
+    await binding.commit(property.createCommit(false));
+
+    expect(commits).toMatchObject([
+      {
+        propertyPath: "root.enabled",
+        value: false,
+        snapshot: { propertyPath: "root.enabled" },
+      },
+    ]);
+    expect(propertyTreeService.createBinding({ snapshots: null }).snapshots).toBeNull();
   });
 
   it("resolves default drawer metadata without a tree", () => {

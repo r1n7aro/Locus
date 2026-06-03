@@ -15,6 +15,7 @@
   --md-syntax-variable: color-mix(in srgb, var(--accent-color) 46%, var(--text-color));
   --md-syntax-literal: color-mix(in srgb, var(--accent-color) 72%, var(--text-color));
   --md-syntax-meta: color-mix(in srgb, var(--text-secondary) 62%, var(--accent-color));
+  --md-syntax-subst: var(--md-code-fg);
   --md-syntax-selector: #8a5db6;
   --md-syntax-regexp: #b45163;
 }
@@ -47,6 +48,9 @@
 }
 :root .hljs-string {
   color: var(--md-syntax-string);
+}
+:root .hljs-subst {
+  color: var(--md-syntax-subst);
 }
 :root .hljs-number {
   color: var(--md-syntax-number);

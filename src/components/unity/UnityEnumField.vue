@@ -76,18 +76,32 @@ function update(event: Event) {
   width: 100%;
   min-width: 0;
   min-height: 26px;
-  padding: 0 7px;
+  padding: 0 22px 0 7px;
   border: 1px solid var(--border-color);
   border-radius: 6px;
-  background: var(--input-bg);
+  background:
+    linear-gradient(45deg, transparent 50%, var(--text-secondary) 50%) right 11px center / 5px 5px no-repeat,
+    linear-gradient(135deg, var(--text-secondary) 50%, transparent 50%) right 7px center / 5px 5px no-repeat,
+    var(--input-bg);
   color: var(--text-color);
   font: inherit;
   box-sizing: border-box;
+  appearance: none;
 }
 
 .unity-enum-field:focus {
   outline: none;
-  border-color: var(--accent-color);
+  border-color: color-mix(in srgb, var(--text-secondary) 68%, var(--border-color) 32%);
+}
+
+.unity-enum-field option {
+  background: color-mix(in srgb, var(--input-bg) 76%, var(--panel-bg) 24%);
+  color: var(--text-color);
+}
+
+.unity-enum-field option:checked {
+  background: color-mix(in srgb, var(--text-secondary) 36%, var(--input-bg) 64%);
+  color: var(--text-color);
 }
 
 .unity-enum-field:disabled {

@@ -151,6 +151,11 @@ function propertyNumber(field: FieldBinding, key: string, fallback = 0): number 
   return Number.isFinite(value) ? value : fallback;
 }
 
+function propertyString(field: FieldBinding, key: string, fallback = ""): string {
+  const value = field.property?.[key];
+  return typeof value === "string" ? value : fallback;
+}
+
 function addSelectionNameBlock() {
   const index = blocks.value.length + 1;
   const id = `selection-${index}`;
@@ -213,7 +218,7 @@ onMounted(() => {
           </div>
         </div>
         <div class="field-block-body">
-          <label v-for="field in item.fields" :key="field.id" class="field-row">
+          <div v-for="field in item.fields" :key="field.id" class="field-row">
             <span class="field-label">{{ field.label }}</span>
             <UnitySerializedPropertyTree
               v-if="usesPropertyTree(field)"
@@ -232,13 +237,15 @@ onMounted(() => {
               :is-flags-enum="!!field.property?.isFlagsEnum"
               :enum-value-index="propertyNumber(field, 'enumValueIndex', -1)"
               :enum-value-flag="propertyNumber(field, 'enumValueFlag')"
+              :reference-type-full-name="propertyString(field, 'referenceTypeFullName')"
+              :reference-type-assembly="propertyString(field, 'referenceTypeAssembly')"
               :title="String(field.target.propertyPath || '')"
               @commit="commitField(field, $event)"
             />
             <small class="field-status" :class="{ error: !!field.error }">
               {{ field.error || field.status }}
             </small>
-          </label>
+          </div>
         </div>
       </template>
     </CanvasView>

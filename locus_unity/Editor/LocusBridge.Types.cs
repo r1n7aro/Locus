@@ -4,6 +4,7 @@ using UnityEditor;
 using UnityEditor.SceneManagement;
 
 using System;
+using System.Globalization;
 using System.Text;
 
 namespace Locus
@@ -303,13 +304,19 @@ namespace Locus
             if (parts.Length == 0)
                 return null;
 
+            SceneObjectPathSegment rootSegment = ParseSceneObjectPathSegment(parts[0]);
             GameObject current = null;
+            int rootMatchIndex = 0;
             foreach (GameObject root in roots)
             {
-                if (root != null && root.name == parts[0])
+                if (root != null && root.name == rootSegment.name)
                 {
-                    current = root;
-                    break;
+                    if (rootMatchIndex == rootSegment.zeroBasedIndex)
+                    {
+                        current = root;
+                        break;
+                    }
+                    rootMatchIndex++;
                 }
             }
 
@@ -318,13 +325,63 @@ namespace Locus
 
             for (int i = 1; i < parts.Length; i++)
             {
-                Transform child = current.transform.Find(parts[i]);
+                SceneObjectPathSegment segment = ParseSceneObjectPathSegment(parts[i]);
+                Transform child = FindChildByPathSegment(current.transform, segment);
                 if (child == null)
                     return null;
                 current = child.gameObject;
             }
 
             return current;
+        }
+
+        private struct SceneObjectPathSegment
+        {
+            public string name;
+            public int zeroBasedIndex;
+        }
+
+        private static SceneObjectPathSegment ParseSceneObjectPathSegment(string segment)
+        {
+            string source = segment ?? "";
+            int ordinal = source.LastIndexOf('[');
+            if (ordinal > 0 && source.EndsWith("]", StringComparison.Ordinal))
+            {
+                string indexText = source.Substring(ordinal + 1, source.Length - ordinal - 2);
+                int index;
+                if (int.TryParse(indexText, NumberStyles.Integer, CultureInfo.InvariantCulture, out index))
+                {
+                    if (index <= 0)
+                        throw new InvalidOperationException("Scene object path ordinal must be 1 or greater: " + segment);
+                    return new SceneObjectPathSegment
+                    {
+                        name = source.Substring(0, ordinal),
+                        zeroBasedIndex = index - 1
+                    };
+                }
+            }
+
+            return new SceneObjectPathSegment
+            {
+                name = source,
+                zeroBasedIndex = 0
+            };
+        }
+
+        private static Transform FindChildByPathSegment(Transform parent, SceneObjectPathSegment segment)
+        {
+            int matchIndex = 0;
+            for (int i = 0; i < parent.childCount; i++)
+            {
+                Transform candidate = parent.GetChild(i);
+                if (candidate != null && candidate.name == segment.name)
+                {
+                    if (matchIndex == segment.zeroBasedIndex)
+                        return candidate;
+                    matchIndex++;
+                }
+            }
+            return null;
         }
 
         private static string NormalizePath(string path)

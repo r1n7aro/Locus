@@ -10,6 +10,7 @@ export type UnitySerializedPropertyType =
   | "Vector2"
   | "Vector3"
   | "Vector4"
+  | "Quaternion"
   | "Color"
   | "Rect"
   | string;
@@ -29,8 +30,28 @@ export interface UnityManagedReferenceTypeOption {
   assembly?: string;
 }
 
+export interface UnitySerializedPropertyAttributeInfo {
+  type?: string;
+  displayName?: string;
+  value?: string;
+}
+
+export interface UnitySerializedPropertyTargetSnapshot {
+  kind: string;
+  path?: string | null;
+  scenePath?: string | null;
+  objectPath?: string | null;
+  objectFileId?: number | null;
+  targetFileId?: number | null;
+  componentType?: string | null;
+  componentIndex?: number | null;
+  propertyPath?: string | null;
+}
+
 export interface UnitySerializedPropertySnapshot {
   propertyPath: string;
+  bindingTarget?: UnitySerializedPropertyTargetSnapshot | null;
+  target?: UnitySerializedPropertyTargetSnapshot | null;
   displayName?: string;
   name?: string;
   type?: string;
@@ -53,12 +74,26 @@ export interface UnitySerializedPropertySnapshot {
   managedReferenceFieldTypename?: string;
   managedReferenceDisplayName?: string;
   managedReferenceTypes?: UnityManagedReferenceTypeOption[];
+  tooltip?: string;
+  header?: string;
+  hasRange?: boolean;
+  rangeMin?: number;
+  rangeMax?: number;
+  numberStep?: number;
+  multiline?: boolean;
+  minLines?: number;
+  maxLines?: number;
+  referenceTypeFullName?: string;
+  referenceTypeAssembly?: string;
+  attributes?: UnitySerializedPropertyAttributeInfo[];
 }
 
 export interface UnitySerializedPropertyCommitEvent {
   propertyPath: string;
   value: unknown;
   property: UnitySerializedPropertySnapshot;
+  target?: UnitySerializedPropertyTargetSnapshot | null;
+  writeMode?: "commit" | "preview";
 }
 
 export interface UnityParseResult {
@@ -67,12 +102,19 @@ export interface UnityParseResult {
   message?: string;
 }
 
+export interface UnityNumberConstraintOptions {
+  hasRange?: boolean;
+  rangeMin?: number;
+  rangeMax?: number;
+}
+
 type VectorKey = "x" | "y" | "z" | "w" | "width" | "height";
 
 const VECTOR_KEYS: Record<string, VectorKey[]> = {
   Vector2: ["x", "y"],
   Vector3: ["x", "y", "z"],
   Vector4: ["x", "y", "z", "w"],
+  Quaternion: ["x", "y", "z"],
   Rect: ["x", "y", "width", "height"],
 };
 
@@ -90,6 +132,10 @@ export function isUnityNumberPropertyType(type: string | null | undefined): bool
 
 export function isUnityVectorPropertyType(type: string | null | undefined): boolean {
   return Object.prototype.hasOwnProperty.call(VECTOR_KEYS, normalizeUnityPropertyType(type));
+}
+
+export function isUnityQuaternionPropertyType(type: string | null | undefined): boolean {
+  return normalizeUnityPropertyType(type) === "Quaternion";
 }
 
 export function unityVectorKeysForType(type: string | null | undefined): VectorKey[] {
@@ -181,6 +227,34 @@ export function parseUnitySerializedEditValue(
   return String(rawValue);
 }
 
+export function constrainUnityNumberValue(
+  type: string | null | undefined,
+  value: number,
+  options: UnityNumberConstraintOptions = {},
+): number {
+  if (!Number.isFinite(value)) throw new Error("Expected number value");
+  let next = value;
+  if (
+    options.hasRange === true &&
+    Number.isFinite(options.rangeMin) &&
+    Number.isFinite(options.rangeMax)
+  ) {
+    const min = Math.min(Number(options.rangeMin), Number(options.rangeMax));
+    const max = Math.max(Number(options.rangeMin), Number(options.rangeMax));
+    next = Math.max(min, Math.min(max, next));
+  }
+  if (isUnityIntegerPropertyType(type)) next = Math.round(next);
+  return normalizeUnityNumberPrecision(next);
+}
+
+export function formatUnityNumberValue(
+  type: string | null | undefined,
+  value: number,
+  options: UnityNumberConstraintOptions = {},
+): string {
+  return String(constrainUnityNumberValue(type, value, options));
+}
+
 export function formatUnityEnumValue(value: unknown, displayValue = ""): string {
   if (value && typeof value === "object") {
     const record = value as Record<string, unknown>;
@@ -212,12 +286,16 @@ export function unityEnumNumericValue(value: unknown, fallback = 0): number {
 export function parseUnityVectorValue(
   type: string | null | undefined,
   rawValue: string | number | boolean | unknown,
-): Record<VectorKey, number> {
+): Record<string, number | string> {
+  if (isUnityQuaternionPropertyType(type)) {
+    return parseUnityQuaternionEulerValue(rawValue);
+  }
+
   const keys = unityVectorKeysForType(type);
   if (!keys.length) throw new Error("Expected vector type");
   if (rawValue && typeof rawValue === "object") {
     const record = rawValue as Record<string, unknown>;
-    const next = {} as Record<VectorKey, number>;
+    const next = {} as Record<string, number>;
     for (const key of keys) {
       next[key] = parseUnityNumber(record[key] ?? 0);
     }
@@ -232,7 +310,7 @@ export function parseUnityVectorValue(
     throw new Error("Expected vector components");
   }
   const values = parts.map((part) => parseUnityNumber(part));
-  const next = {} as Record<VectorKey, number>;
+  const next = {} as Record<string, number>;
   keys.forEach((key, index) => {
     next[key] = values[index];
   });
@@ -244,6 +322,8 @@ export function formatUnityVectorValue(
   value: unknown,
   displayValue = "",
 ): string {
+  if (isUnityQuaternionPropertyType(type)) return formatUnityQuaternionEulerValue(value, displayValue);
+
   const keys = unityVectorKeysForType(type);
   if (!keys.length) return displayValue;
   if (value && typeof value === "object") {
@@ -251,6 +331,33 @@ export function formatUnityVectorValue(
     return keys.map((key) => String(record[key] ?? 0)).join(", ");
   }
   return displayValue || String(value ?? "");
+}
+
+export function parseUnityQuaternionEulerValue(rawValue: unknown): Record<string, number | string> {
+  const vector = parseUnityQuaternionEulerVector(rawValue);
+  return {
+    action: "setEuler",
+    x: vector.x,
+    y: vector.y,
+    z: vector.z,
+  };
+}
+
+export function formatUnityQuaternionEulerValue(value: unknown, displayValue = ""): string {
+  const displayText = displayValue.trim();
+  if (displayText) {
+    try {
+      return formatUnityVectorValue("Vector3", parseUnityVectorValue("Vector3", displayText));
+    } catch {
+      return displayText;
+    }
+  }
+
+  try {
+    return formatUnityVectorValue("Vector3", parseUnityQuaternionEulerVector(value));
+  } catch {
+    return typeof value === "string" ? value : "";
+  }
 }
 
 export function parseUnityColorValue(rawValue: unknown): string {
@@ -314,4 +421,76 @@ function parseUnityNumber(rawValue: unknown): number {
   const value = Number(text);
   if (!Number.isFinite(value)) throw new Error("Expected number value");
   return value;
+}
+
+function parseUnityQuaternionEulerVector(rawValue: unknown): { x: number; y: number; z: number } {
+  if (rawValue && typeof rawValue === "object") {
+    const record = rawValue as Record<string, unknown>;
+    const action = String(record.action ?? "").trim().toLowerCase();
+    if (action === "seteuler" || action === "euler") {
+      return {
+        x: parseUnityNumber(record.x ?? 0),
+        y: parseUnityNumber(record.y ?? 0),
+        z: parseUnityNumber(record.z ?? 0),
+      };
+    }
+    if ("w" in record) {
+      const euler = quaternionToEulerDegrees({
+        x: parseUnityNumber(record.x ?? 0),
+        y: parseUnityNumber(record.y ?? 0),
+        z: parseUnityNumber(record.z ?? 0),
+        w: parseUnityNumber(record.w ?? 1),
+      });
+      if (euler) return euler;
+    }
+  }
+
+  const parsed = parseUnityVectorValue("Vector3", rawValue);
+  return {
+    x: Number(parsed.x),
+    y: Number(parsed.y),
+    z: Number(parsed.z),
+  };
+}
+
+function quaternionToEulerDegrees(quaternion: { x: number; y: number; z: number; w: number }): {
+  x: number;
+  y: number;
+  z: number;
+} | null {
+  const length = Math.hypot(quaternion.x, quaternion.y, quaternion.z, quaternion.w);
+  if (!Number.isFinite(length) || length === 0) return null;
+
+  const x = quaternion.x / length;
+  const y = quaternion.y / length;
+  const z = quaternion.z / length;
+  const w = quaternion.w / length;
+
+  const eulerX = Math.asin(clamp(2 * (w * x - y * z), -1, 1));
+  const eulerY = Math.atan2(2 * (w * y + x * z), 1 - 2 * (x * x + y * y));
+  const eulerZ = Math.atan2(2 * (w * z + x * y), 1 - 2 * (x * x + z * z));
+  return {
+    x: normalizeEulerDegrees(radiansToDegrees(eulerX)),
+    y: normalizeEulerDegrees(radiansToDegrees(eulerY)),
+    z: normalizeEulerDegrees(radiansToDegrees(eulerZ)),
+  };
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
+function radiansToDegrees(value: number): number {
+  return value * 180 / Math.PI;
+}
+
+function normalizeEulerDegrees(value: number): number {
+  const normalized = normalizeUnityNumberPrecision(value % 360);
+  return normalized < 0 ? normalizeUnityNumberPrecision(normalized + 360) : normalized;
+}
+
+function normalizeUnityNumberPrecision(value: number): number {
+  if (Object.is(value, -0)) return 0;
+  if (Number.isInteger(value)) return value;
+  return Number(value.toPrecision(12));
 }

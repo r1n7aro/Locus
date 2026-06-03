@@ -3,7 +3,7 @@ import { defineComponent, type PropType } from "vue";
 import type {
   InspectorProperty,
   InspectorPropertyCommit,
-  InspectorPropertyDrawComponentsInput,
+  InspectorPropertyDrawerInput,
 } from "../../services/propertyTree";
 import type { UnitySerializedPropertyCommitEvent } from "./unitySerializedValue";
 
@@ -22,8 +22,8 @@ export default defineComponent({
       type: Object as PropType<InspectorProperty>,
       required: true,
     },
-    drawComponents: {
-      type: null as unknown as PropType<InspectorPropertyDrawComponentsInput>,
+    propertyDrawers: {
+      type: null as unknown as PropType<InspectorPropertyDrawerInput>,
       default: undefined,
     },
     disabled: {
@@ -49,7 +49,7 @@ export default defineComponent({
   setup(props, { emit }) {
     return () =>
       props.property.draw({
-        components: props.drawComponents,
+        drawers: props.propertyDrawers,
         disabled: props.disabled,
         readonly: props.readonly,
         compact: props.compact,

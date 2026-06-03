@@ -41,21 +41,10 @@ const FbxPreview = defineAsyncComponent(
     :unity-texture-meta="unityTextureMeta"
   />
   <FbxPreview
-    v-else-if="preview.kind === 'model' && !compact"
+    v-else-if="preview.kind === 'model'"
     :preview="preview"
     :diff-key="diffKey"
     :mode="mode"
+    :compact="compact"
   />
-  <div v-else-if="preview.kind === 'model' && compact" class="binary-compact-fallback">
-    3D Model — open full view to preview
-  </div>
 </template>
-
-<style scoped>
-.binary-compact-fallback {
-  padding: 12px 16px;
-  text-align: center;
-  color: var(--text-secondary);
-  font-size: 12px;
-}
-</style>

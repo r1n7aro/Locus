@@ -26,6 +26,24 @@ export interface InspectorManagedReferenceTypeOption {
   unavailable?: boolean;
 }
 
+export interface InspectorPropertyAttributeInfo {
+  type?: string;
+  displayName?: string;
+  value?: string;
+}
+
+export interface InspectorPropertyTargetSnapshot {
+  kind: string;
+  path?: string | null;
+  scenePath?: string | null;
+  objectPath?: string | null;
+  objectFileId?: number | null;
+  targetFileId?: number | null;
+  componentType?: string | null;
+  componentIndex?: number | null;
+  propertyPath?: string | null;
+}
+
 export interface InspectorSelectOption {
   label: string;
   value: string;
@@ -44,6 +62,8 @@ export type InspectorSelectOptionInput = {
 
 export interface InspectorPropertySnapshot {
   propertyPath: string;
+  bindingTarget?: InspectorPropertyTargetSnapshot | null;
+  target?: InspectorPropertyTargetSnapshot | null;
   displayName?: string;
   name?: string;
   type?: string;
@@ -66,9 +86,21 @@ export interface InspectorPropertySnapshot {
   managedReferenceFieldTypename?: string;
   managedReferenceDisplayName?: string;
   managedReferenceTypes?: InspectorManagedReferenceTypeOption[];
+  tooltip?: string;
+  header?: string;
+  hasRange?: boolean;
+  rangeMin?: number;
+  rangeMax?: number;
+  numberStep?: number;
+  multiline?: boolean;
+  minLines?: number;
+  maxLines?: number;
+  referenceTypeFullName?: string;
+  referenceTypeAssembly?: string;
+  attributes?: InspectorPropertyAttributeInfo[];
 }
 
-export interface InspectorPropertyDrawer {
+export interface InspectorPropertyResolvedDrawer {
   kind: InspectorDrawerKind;
   commitMode: InspectorCommitMode;
   container: boolean;
@@ -96,46 +128,84 @@ export interface InspectorPropertyCommit {
   snapshot: InspectorPropertySnapshot;
 }
 
-export type InspectorPropertyDrawMatcher = (
+export type InspectorPropertyTreeSnapshotInput =
+  | InspectorPropertySnapshot
+  | InspectorPropertySnapshot[];
+
+export type InspectorPropertyTreeCommitHandler = (
+  commit: InspectorPropertyCommit,
+) => void | Promise<void>;
+
+export interface InspectorPropertyTreeBindingInput {
+  id?: string;
+  targetId?: string;
+  snapshots?: InspectorPropertyTreeSnapshotInput | null;
+  loading?: boolean;
+  error?: string;
+  disabled?: boolean;
+  readonly?: boolean;
+  editable?: boolean;
+  commit?: InspectorPropertyTreeCommitHandler | null;
+}
+
+export interface InspectorPropertyTreeBinding {
+  id: string;
+  targetId: string;
+  snapshots: InspectorPropertyTreeSnapshotInput | null;
+  loading: boolean;
+  error: string;
+  disabled: boolean;
+  readonly: boolean;
+  editable: boolean;
+  commit: InspectorPropertyTreeCommitHandler;
+}
+
+export type InspectorPropertyDrawerMatcher = (
   property: InspectorProperty,
   context: InspectorPropertyTreeContext,
 ) => boolean;
 
-export type InspectorPropertyDrawComponentResolver = (
+export type InspectorPropertyDrawerResolver = (
   property: InspectorProperty,
   context: InspectorPropertyTreeContext,
 ) => Component | null | undefined;
 
-export interface InspectorPropertyDrawComponentRegistration {
+export interface InspectorPropertyDrawerRegistration {
   type?: string | string[];
-  component: Component;
-  match?: InspectorPropertyDrawMatcher;
+  valueType?: string | string[];
+  fieldType?: string | string[];
+  attribute?: string | string[];
+  propertyPath?: string | string[];
+  name?: string | string[];
+  drawerKind?: InspectorDrawerKind | InspectorDrawerKind[] | string | string[];
+  drawer: Component;
+  match?: InspectorPropertyDrawerMatcher;
   priority?: number;
 }
 
-export interface InspectorPropertyDrawLibrary {
-  readonly registrations: readonly InspectorPropertyDrawComponentRegistration[];
-  register(registration: InspectorPropertyDrawComponentRegistration): () => void;
+export interface InspectorPropertyDrawerLibrary {
+  readonly registrations: readonly InspectorPropertyDrawerRegistration[];
+  register(registration: InspectorPropertyDrawerRegistration): () => void;
   register(
     type: string | string[],
-    component: Component,
-    options?: Omit<InspectorPropertyDrawComponentRegistration, "type" | "component">,
+    drawer: Component,
+    options?: Omit<InspectorPropertyDrawerRegistration, "type" | "drawer">,
   ): () => void;
   clear(): void;
   resolve(property: InspectorProperty, context: InspectorPropertyTreeContext): Component | null;
 }
 
-export type InspectorPropertyDrawComponentsInput =
+export type InspectorPropertyDrawerInput =
   | Record<string, Component>
   | Map<string, Component>
-  | InspectorPropertyDrawComponentRegistration[]
-  | InspectorPropertyDrawLibrary
+  | InspectorPropertyDrawerRegistration[]
+  | InspectorPropertyDrawerLibrary
   | null
   | undefined;
 
-export interface InspectorPropertyDrawOptions {
-  component?: Component | null;
-  components?: InspectorPropertyDrawComponentsInput;
+export interface InspectorPropertyDrawerOptions {
+  drawer?: Component | null;
+  drawers?: InspectorPropertyDrawerInput;
   disabled?: boolean;
   readonly?: boolean;
   compact?: boolean;
@@ -143,7 +213,7 @@ export interface InspectorPropertyDrawOptions {
   onCommit?: (commit: InspectorPropertyCommit) => void;
 }
 
-export interface InspectorPropertyDrawComponentProps {
+export interface InspectorPropertyDrawerProps {
   property: InspectorProperty;
   snapshot: InspectorPropertySnapshot;
   propertyPath: string;
@@ -156,6 +226,18 @@ export interface InspectorPropertyDrawComponentProps {
   propertyType: string;
   fieldTypeFullName: string;
   fieldTypeAssembly: string;
+  tooltip: string;
+  header: string;
+  hasRange: boolean;
+  rangeMin: number;
+  rangeMax: number;
+  numberStep: number;
+  multiline: boolean;
+  minLines: number;
+  maxLines: number;
+  referenceTypeFullName: string;
+  referenceTypeAssembly: string;
+  attributes: InspectorPropertyAttributeInfo[];
   editable: boolean;
   disabled: boolean;
   readonly: boolean;
@@ -165,8 +247,8 @@ export interface InspectorPropertyDrawComponentProps {
   depth: number;
   children: InspectorProperty[];
   commit: (value: unknown, property?: InspectorProperty) => void;
-  draw: (property?: InspectorProperty, options?: InspectorPropertyDrawOptions) => VNodeChild;
-  drawChild: (propertyOrPath: InspectorProperty | string, options?: InspectorPropertyDrawOptions) => VNodeChild;
+  draw: (property?: InspectorProperty, options?: InspectorPropertyDrawerOptions) => VNodeChild;
+  drawChild: (propertyOrPath: InspectorProperty | string, options?: InspectorPropertyDrawerOptions) => VNodeChild;
 }
 
 export interface InspectorManagedReferenceTypeSearchOptions {
@@ -193,15 +275,15 @@ export interface InspectorPropertyTreeOptions {
   defaultExpandedDepth?: number;
   autoCollapseChildCount?: number;
   drawerResolvers?: InspectorDrawerResolver[];
-  drawComponents?: InspectorPropertyDrawComponentsInput;
-  drawComponentResolvers?: InspectorPropertyDrawComponentResolver[];
+  propertyDrawers?: InspectorPropertyDrawerInput;
+  propertyDrawerResolvers?: InspectorPropertyDrawerResolver[];
   stateUpdaters?: InspectorStateUpdater[];
 }
 
 export type InspectorDrawerResolver = (
   property: InspectorProperty,
   context: InspectorPropertyTreeContext,
-) => InspectorPropertyDrawer | null | undefined;
+) => InspectorPropertyResolvedDrawer | null | undefined;
 
 export type InspectorStateUpdater = (
   property: InspectorProperty,
@@ -239,8 +321,8 @@ interface NormalizedTreeOptions extends InspectorPropertyTreeContext {
   defaultExpandedDepth: number;
   autoCollapseChildCount: number;
   drawerResolvers: InspectorDrawerResolver[];
-  drawComponents: NormalizedDrawComponentRegistry;
-  drawComponentResolvers: InspectorPropertyDrawComponentResolver[];
+  propertyDrawers: NormalizedPropertyDrawerRegistry;
+  propertyDrawerResolvers: InspectorPropertyDrawerResolver[];
   stateUpdaters: InspectorStateUpdater[];
 }
 
@@ -251,29 +333,35 @@ interface InspectorPropertyInit {
   index: number;
 }
 
-interface InspectorPropertyDrawConfig {
+interface InspectorPropertyDrawerConfig {
   context: InspectorPropertyTreeContext;
-  components: NormalizedDrawComponentRegistry;
-  componentResolvers: InspectorPropertyDrawComponentResolver[];
+  drawers: NormalizedPropertyDrawerRegistry;
+  drawerResolvers: InspectorPropertyDrawerResolver[];
 }
 
-interface NormalizedDrawComponentRegistration {
+interface NormalizedPropertyDrawerRegistration {
   types: string[];
-  component: Component;
-  match?: InspectorPropertyDrawMatcher;
+  valueTypes: string[];
+  fieldTypes: string[];
+  attributes: string[];
+  propertyPaths: string[];
+  names: string[];
+  drawerKinds: string[];
+  drawer: Component;
+  match?: InspectorPropertyDrawerMatcher;
   priority: number;
   order: number;
 }
 
-interface NormalizedDrawComponentRegistry {
-  entries: NormalizedDrawComponentRegistration[];
-  libraries: InspectorPropertyDrawLibrary[];
+interface NormalizedPropertyDrawerRegistry {
+  entries: NormalizedPropertyDrawerRegistration[];
+  libraries: InspectorPropertyDrawerLibrary[];
 }
 
-const VECTOR_TYPES = new Set(["Vector2", "Vector3", "Vector4", "Rect"]);
+const VECTOR_TYPES = new Set(["Vector2", "Vector3", "Vector4", "Quaternion", "Rect"]);
 const NUMBER_TYPES = new Set(["Integer", "ArraySize", "Float"]);
 const DEFAULT_AUTO_COLLAPSE_CHILD_COUNT = 24;
-const EMPTY_DRAW_COMPONENT_REGISTRY: NormalizedDrawComponentRegistry = {
+const EMPTY_PROPERTY_DRAWER_REGISTRY: NormalizedPropertyDrawerRegistry = {
   entries: [],
   libraries: [],
 };
@@ -284,10 +372,10 @@ const DEFAULT_DRAW_CONTEXT: InspectorPropertyTreeContext = {
   readonly: false,
   disabled: false,
 };
-const DEFAULT_DRAW_CONFIG: InspectorPropertyDrawConfig = {
+const DEFAULT_PROPERTY_DRAWER_CONFIG: InspectorPropertyDrawerConfig = {
   context: DEFAULT_DRAW_CONTEXT,
-  components: EMPTY_DRAW_COMPONENT_REGISTRY,
-  componentResolvers: [],
+  drawers: EMPTY_PROPERTY_DRAWER_REGISTRY,
+  drawerResolvers: [],
 };
 
 export class InspectorProperty {
@@ -317,8 +405,20 @@ export class InspectorProperty {
   readonly managedReferenceFieldTypename: string;
   readonly managedReferenceDisplayName: string;
   readonly managedReferenceTypes: InspectorManagedReferenceTypeOption[];
+  readonly tooltip: string;
+  readonly header: string;
+  readonly hasRange: boolean;
+  readonly rangeMin: number;
+  readonly rangeMax: number;
+  readonly numberStep: number;
+  readonly multiline: boolean;
+  readonly minLines: number;
+  readonly maxLines: number;
+  readonly referenceTypeFullName: string;
+  readonly referenceTypeAssembly: string;
+  readonly attributes: InspectorPropertyAttributeInfo[];
   children: InspectorProperty[] = [];
-  drawer: InspectorPropertyDrawer = {
+  drawer: InspectorPropertyResolvedDrawer = {
     kind: "unsupported",
     commitMode: "none",
     container: false,
@@ -337,7 +437,7 @@ export class InspectorProperty {
     error: "",
     warning: "",
   };
-  private drawConfig: InspectorPropertyDrawConfig = DEFAULT_DRAW_CONFIG;
+  private propertyDrawerConfig: InspectorPropertyDrawerConfig = DEFAULT_PROPERTY_DRAWER_CONFIG;
 
   constructor(init: InspectorPropertyInit) {
     this.snapshot = init.snapshot;
@@ -370,6 +470,18 @@ export class InspectorProperty {
       this.managedReferenceFullTypename,
       this.managedReferenceDisplayName,
     );
+    this.tooltip = init.snapshot.tooltip || "";
+    this.header = init.snapshot.header || "";
+    this.hasRange = init.snapshot.hasRange === true;
+    this.rangeMin = Number.isFinite(init.snapshot.rangeMin) ? Number(init.snapshot.rangeMin) : 0;
+    this.rangeMax = Number.isFinite(init.snapshot.rangeMax) ? Number(init.snapshot.rangeMax) : 0;
+    this.numberStep = Number.isFinite(init.snapshot.numberStep) ? Number(init.snapshot.numberStep) : 0;
+    this.multiline = init.snapshot.multiline === true;
+    this.minLines = Number.isFinite(init.snapshot.minLines) ? Number(init.snapshot.minLines) : 0;
+    this.maxLines = Number.isFinite(init.snapshot.maxLines) ? Number(init.snapshot.maxLines) : 0;
+    this.referenceTypeFullName = init.snapshot.referenceTypeFullName || "";
+    this.referenceTypeAssembly = init.snapshot.referenceTypeAssembly || "";
+    this.attributes = normalizePropertyAttributes(init.snapshot.attributes);
   }
 
   get hasChildren(): boolean {
@@ -458,16 +570,16 @@ export class InspectorProperty {
     };
   }
 
-  draw(options: InspectorPropertyDrawOptions = {}): VNodeChild {
-    return drawInspectorProperty(this, options, this.drawConfig);
+  draw(options: InspectorPropertyDrawerOptions = {}): VNodeChild {
+    return drawInspectorProperty(this, options, this.propertyDrawerConfig);
   }
 
-  drawComponent(options: Pick<InspectorPropertyDrawOptions, "component" | "components"> = {}): Component | null {
-    return resolveInspectorPropertyDrawComponent(this, options, this.drawConfig);
+  propertyDrawerComponent(options: Pick<InspectorPropertyDrawerOptions, "drawer" | "drawers"> = {}): Component | null {
+    return resolveInspectorPropertyDrawerComponent(this, options, this.propertyDrawerConfig);
   }
 
-  hasDrawComponent(options: Pick<InspectorPropertyDrawOptions, "component" | "components"> = {}): boolean {
-    return this.drawComponent(options) !== null;
+  hasPropertyDrawer(options: Pick<InspectorPropertyDrawerOptions, "drawer" | "drawers"> = {}): boolean {
+    return this.propertyDrawerComponent(options) !== null;
   }
 
   searchManagedReferenceTypes(
@@ -483,8 +595,8 @@ export class InspectorProperty {
     return this.createCommit(createManagedReferenceTypeCommand(type));
   }
 
-  _setDrawConfig(config: InspectorPropertyDrawConfig) {
-    this.drawConfig = config;
+  _setDrawConfig(config: InspectorPropertyDrawerConfig) {
+    this.propertyDrawerConfig = config;
   }
 }
 
@@ -553,7 +665,7 @@ export class PropertyTree {
     return this.requireProperty(propertyPath).createManagedReferenceTypeCommit(type);
   }
 
-  draw(options: InspectorPropertyDrawOptions = {}): VNodeChild {
+  draw(options: InspectorPropertyDrawerOptions = {}): VNodeChild {
     if (this.rootProperties.length === 0) return null;
     if (this.rootProperties.length === 1) return this.rootProperties[0].draw(options);
     return h(
@@ -582,12 +694,28 @@ export function createPropertyTree(
   return new PropertyTree(snapshots, options);
 }
 
-export function resolveInspectorDrawer(property: InspectorProperty): InspectorPropertyDrawer {
+export function createInspectorPropertyTreeBinding(
+  input: InspectorPropertyTreeBindingInput = {},
+): InspectorPropertyTreeBinding {
+  const id = input.id?.trim() || "property-tree";
+  const targetId = input.targetId?.trim() || id;
+  const loading = input.loading === true;
+  return {
+    id,
+    targetId,
+    snapshots: input.snapshots ?? null,
+    loading,
+    error: input.error || "",
+    disabled: input.disabled === true || loading,
+    readonly: input.readonly === true,
+    editable: input.editable !== false,
+    commit: input.commit ?? noopInspectorPropertyTreeCommit,
+  };
+}
+
+export function resolveInspectorDrawer(property: InspectorProperty): InspectorPropertyResolvedDrawer {
   if (property.isArray) return drawer("array", "command", property.valueType, true);
   if (property.isManagedReference) return drawer("managedReference", "command", property.valueType, true);
-  if (property.children.length > 0 || property.snapshot.hasChildren) {
-    return drawer("object", "none", property.valueType, true);
-  }
 
   const valueType = property.valueType || property.type;
   if (valueType === "Boolean") return drawer("boolean", "change", valueType);
@@ -598,6 +726,9 @@ export function resolveInspectorDrawer(property: InspectorProperty): InspectorPr
   if (valueType === "Color") return drawer("color", "change", valueType);
   if (valueType === "ObjectReference") return drawer("objectReference", "blur", valueType);
   if (valueType === "String") return drawer("text", "blur", valueType);
+  if (property.children.length > 0 || property.snapshot.hasChildren) {
+    return drawer("object", "none", property.valueType, true);
+  }
   return drawer(property.editable ? "text" : "unsupported", property.editable ? "blur" : "none", valueType);
 }
 
@@ -631,102 +762,165 @@ export function searchManagedReferenceTypeOptions(
   return limit > 0 ? results.slice(0, limit) : results;
 }
 
-export function defineInspectorPropertyDrawComponents(
-  input: InspectorPropertyDrawComponentsInput,
-): InspectorPropertyDrawComponentRegistration[] {
-  return expandDrawComponentRegistrations(input).map((entry) => ({
+export function defineInspectorPropertyDrawers(
+  input: InspectorPropertyDrawerInput,
+): InspectorPropertyDrawerRegistration[] {
+  return expandPropertyDrawerRegistrations(input).map((entry) => ({
     ...entry,
-    type: normalizeDrawTypes(entry.type),
+    type: normalizeDrawerTypes(entry.type),
+    valueType: normalizeDrawerTypes(entry.valueType),
+    fieldType: normalizeDrawerTypes(entry.fieldType),
+    attribute: normalizeDrawerTypes(entry.attribute),
+    propertyPath: normalizeDrawerTypes(entry.propertyPath),
+    name: normalizeDrawerTypes(entry.name),
+    drawerKind: normalizeDrawerTypes(entry.drawerKind),
   }));
 }
 
-export function createInspectorPropertyDrawLibrary(
-  input?: InspectorPropertyDrawComponentsInput,
-): InspectorPropertyDrawLibrary {
-  const library = new MutableInspectorPropertyDrawLibrary();
-  for (const registration of expandDrawComponentRegistrations(input)) {
+export function createInspectorPropertyDrawerLibrary(
+  input?: InspectorPropertyDrawerInput,
+): InspectorPropertyDrawerLibrary {
+  const library = new MutableInspectorPropertyDrawerLibrary();
+  for (const registration of expandPropertyDrawerRegistrations(input)) {
     library.register(registration);
   }
   return library;
 }
 
-class MutableInspectorPropertyDrawLibrary implements InspectorPropertyDrawLibrary {
-  private readonly registeredComponents: InspectorPropertyDrawComponentRegistration[] = [];
+class MutableInspectorPropertyDrawerLibrary implements InspectorPropertyDrawerLibrary {
+  private readonly registeredDrawers: InspectorPropertyDrawerRegistration[] = [];
 
-  get registrations(): readonly InspectorPropertyDrawComponentRegistration[] {
-    return this.registeredComponents;
+  get registrations(): readonly InspectorPropertyDrawerRegistration[] {
+    return this.registeredDrawers;
   }
 
-  register(registration: InspectorPropertyDrawComponentRegistration): () => void;
+  register(registration: InspectorPropertyDrawerRegistration): () => void;
   register(
     type: string | string[],
-    component: Component,
-    options?: Omit<InspectorPropertyDrawComponentRegistration, "type" | "component">,
+    drawer: Component,
+    options?: Omit<InspectorPropertyDrawerRegistration, "type" | "drawer">,
   ): () => void;
   register(
-    registrationOrType: InspectorPropertyDrawComponentRegistration | string | string[],
-    component?: Component,
-    options: Omit<InspectorPropertyDrawComponentRegistration, "type" | "component"> = {},
+    registrationOrType: InspectorPropertyDrawerRegistration | string | string[],
+    drawer?: Component,
+    options: Omit<InspectorPropertyDrawerRegistration, "type" | "drawer"> = {},
   ): () => void {
     if (typeof registrationOrType === "string" || Array.isArray(registrationOrType)) {
-      if (!component) return () => undefined;
+      if (!drawer) return () => undefined;
       return this.register({
         ...options,
         type: registrationOrType,
-        component,
+        drawer,
       });
     }
     const registration = registrationOrType;
-    if (!registration.component) return () => undefined;
-    this.registeredComponents.push(registration);
+    if (!registration.drawer) return () => undefined;
+    this.registeredDrawers.push(registration);
     return () => {
-      const index = this.registeredComponents.indexOf(registration);
-      if (index >= 0) this.registeredComponents.splice(index, 1);
+      const index = this.registeredDrawers.indexOf(registration);
+      if (index >= 0) this.registeredDrawers.splice(index, 1);
     };
   }
 
   clear() {
-    this.registeredComponents.splice(0, this.registeredComponents.length);
+    this.registeredDrawers.splice(0, this.registeredDrawers.length);
   }
 
   resolve(property: InspectorProperty, context: InspectorPropertyTreeContext): Component | null {
-    return findDrawComponent(
+    return findPropertyDrawerComponent(
       property,
       context,
-      normalizeDrawComponents(this.registeredComponents),
+      normalizePropertyDrawers(this.registeredDrawers),
     );
   }
 }
 
-export const publicInspectorPropertyDrawLibrary = createInspectorPropertyDrawLibrary();
-export const projectInspectorPropertyDrawLibrary = publicInspectorPropertyDrawLibrary;
+export const publicInspectorPropertyDrawerLibrary = createInspectorPropertyDrawerLibrary();
+export const projectInspectorPropertyDrawerLibrary = publicInspectorPropertyDrawerLibrary;
 
-export function normalizeInspectorPropertyDrawComponents(
-  input: InspectorPropertyDrawComponentsInput,
-): InspectorPropertyDrawComponentRegistration[] {
-  return defineInspectorPropertyDrawComponents(input);
+export function normalizeInspectorPropertyDrawers(
+  input: InspectorPropertyDrawerInput,
+): InspectorPropertyDrawerRegistration[] {
+  return defineInspectorPropertyDrawers(input);
 }
 
-export function registerInspectorPropertyDrawComponent(
+export function registerInspectorPropertyDrawer(
   type: string | string[],
-  component: Component,
-  options: Omit<InspectorPropertyDrawComponentRegistration, "type" | "component"> = {},
+  drawer: Component,
+  options: Omit<InspectorPropertyDrawerRegistration, "type" | "drawer"> = {},
 ): () => void {
-  return publicInspectorPropertyDrawLibrary.register(type, component, options);
+  return publicInspectorPropertyDrawerLibrary.register(type, drawer, options);
+}
+
+export function registerInspectorValueDrawer(
+  valueType: string | string[],
+  drawer: Component,
+  options: Omit<InspectorPropertyDrawerRegistration, "valueType" | "drawer"> = {},
+): () => void {
+  return publicInspectorPropertyDrawerLibrary.register({
+    ...options,
+    valueType,
+    drawer,
+  });
+}
+
+export function registerInspectorFieldDrawer(
+  fieldType: string | string[],
+  drawer: Component,
+  options: Omit<InspectorPropertyDrawerRegistration, "fieldType" | "drawer"> = {},
+): () => void {
+  return publicInspectorPropertyDrawerLibrary.register({
+    ...options,
+    fieldType,
+    drawer,
+  });
+}
+
+export function registerInspectorAttributeDrawer(
+  attribute: string | string[],
+  drawer: Component,
+  options: Omit<InspectorPropertyDrawerRegistration, "attribute" | "drawer"> = {},
+): () => void {
+  return publicInspectorPropertyDrawerLibrary.register({
+    ...options,
+    attribute,
+    drawer,
+  });
+}
+
+export function registerInspectorPropertyPathDrawer(
+  propertyPath: string | string[],
+  drawer: Component,
+  options: Omit<InspectorPropertyDrawerRegistration, "propertyPath" | "drawer"> = {},
+): () => void {
+  return publicInspectorPropertyDrawerLibrary.register({
+    ...options,
+    propertyPath,
+    drawer,
+  });
 }
 
 export const propertyTreeService = {
   createTree: createPropertyTree,
+  createBinding: createInspectorPropertyTreeBinding,
   resolveDrawer: resolveInspectorDrawer,
   resolveManagedReferenceTypeOption,
   searchManagedReferenceTypeOptions,
-  defineDrawComponents: defineInspectorPropertyDrawComponents,
-  createDrawLibrary: createInspectorPropertyDrawLibrary,
-  publicDrawLibrary: publicInspectorPropertyDrawLibrary,
-  projectDrawLibrary: projectInspectorPropertyDrawLibrary,
-  normalizeDrawComponents: normalizeInspectorPropertyDrawComponents,
-  registerDrawComponent: registerInspectorPropertyDrawComponent,
+  definePropertyDrawers: defineInspectorPropertyDrawers,
+  createPropertyDrawerLibrary: createInspectorPropertyDrawerLibrary,
+  publicPropertyDrawerLibrary: publicInspectorPropertyDrawerLibrary,
+  projectPropertyDrawerLibrary: projectInspectorPropertyDrawerLibrary,
+  normalizePropertyDrawers: normalizeInspectorPropertyDrawers,
+  registerPropertyDrawer: registerInspectorPropertyDrawer,
+  registerValueDrawer: registerInspectorValueDrawer,
+  registerFieldDrawer: registerInspectorFieldDrawer,
+  registerAttributeDrawer: registerInspectorAttributeDrawer,
+  registerPropertyPathDrawer: registerInspectorPropertyPathDrawer,
 };
+
+function noopInspectorPropertyTreeCommit() {
+  return undefined;
+}
 
 function buildInspectorProperty(
   source: InspectorPropertySnapshot,
@@ -758,6 +952,18 @@ function normalizeSnapshot(
     valueType: source.valueType || source.type || "Generic",
     fieldTypeFullName: source.fieldTypeFullName || "",
     fieldTypeAssembly: source.fieldTypeAssembly || "",
+    tooltip: source.tooltip || "",
+    header: source.header || "",
+    hasRange: source.hasRange === true,
+    rangeMin: Number.isFinite(source.rangeMin) ? Number(source.rangeMin) : 0,
+    rangeMax: Number.isFinite(source.rangeMax) ? Number(source.rangeMax) : 0,
+    numberStep: Number.isFinite(source.numberStep) ? Number(source.numberStep) : 0,
+    multiline: source.multiline === true,
+    minLines: Number.isFinite(source.minLines) ? Number(source.minLines) : 0,
+    maxLines: Number.isFinite(source.maxLines) ? Number(source.maxLines) : 0,
+    referenceTypeFullName: source.referenceTypeFullName || "",
+    referenceTypeAssembly: source.referenceTypeAssembly || "",
+    attributes: normalizePropertyAttributes(source.attributes),
     displayValue: source.displayValue || "",
     editable: source.editable !== false,
     hasChildren: source.hasChildren === true || Boolean(source.children?.length),
@@ -788,13 +994,13 @@ function applyDrawersAndState(properties: InspectorProperty[], options: Normaliz
     readonly: options.readonly,
     disabled: options.disabled,
   };
-  const drawConfig: InspectorPropertyDrawConfig = {
+  const propertyDrawerConfig: InspectorPropertyDrawerConfig = {
     context,
-    components: options.drawComponents,
-    componentResolvers: options.drawComponentResolvers,
+    drawers: options.propertyDrawers,
+    drawerResolvers: options.propertyDrawerResolvers,
   };
   for (const property of properties) {
-    property._setDrawConfig(drawConfig);
+    property._setDrawConfig(propertyDrawerConfig);
     property.drawer = resolveDrawerWithResolvers(property, context, options.drawerResolvers);
     property.state = createBaseState(property, options);
   }
@@ -817,7 +1023,7 @@ function resolveDrawerWithResolvers(
   property: InspectorProperty,
   context: InspectorPropertyTreeContext,
   resolvers: InspectorDrawerResolver[],
-): InspectorPropertyDrawer {
+): InspectorPropertyResolvedDrawer {
   for (const resolver of resolvers) {
     const resolved = resolver(property, context);
     if (resolved) return resolved;
@@ -903,18 +1109,18 @@ function normalizeTreeOptions(options: InspectorPropertyTreeOptions): Normalized
     defaultExpandedDepth: Math.max(0, options.defaultExpandedDepth ?? 1),
     autoCollapseChildCount: Math.max(0, options.autoCollapseChildCount ?? DEFAULT_AUTO_COLLAPSE_CHILD_COUNT),
     drawerResolvers: options.drawerResolvers ?? [],
-    drawComponents: normalizeDrawComponents(options.drawComponents),
-    drawComponentResolvers: options.drawComponentResolvers ?? [],
+    propertyDrawers: normalizePropertyDrawers(options.propertyDrawers),
+    propertyDrawerResolvers: options.propertyDrawerResolvers ?? [],
     stateUpdaters: options.stateUpdaters ?? [],
   };
 }
 
 function drawInspectorProperty(
   property: InspectorProperty,
-  options: InspectorPropertyDrawOptions,
-  config: InspectorPropertyDrawConfig,
+  options: InspectorPropertyDrawerOptions,
+  config: InspectorPropertyDrawerConfig,
 ): VNodeChild {
-  const component = resolveInspectorPropertyDrawComponent(property, options, config);
+  const component = resolveInspectorPropertyDrawerComponent(property, options, config);
   if (!component) return drawInspectorPropertyFallback(property, options);
 
   const disabled = options.disabled ?? property.state.disabled;
@@ -927,11 +1133,11 @@ function drawInspectorProperty(
     options.onCommit?.(normalizeDrawCommit(targetProperty, value));
   };
   const drawOptions = childDrawOptions(options);
-  const draw = (targetProperty = property, nextOptions: InspectorPropertyDrawOptions = {}) =>
+  const draw = (targetProperty = property, nextOptions: InspectorPropertyDrawerOptions = {}) =>
     targetProperty.draw({ ...drawOptions, ...nextOptions });
   const drawChild = (
     propertyOrPath: InspectorProperty | string,
-    nextOptions: InspectorPropertyDrawOptions = {},
+    nextOptions: InspectorPropertyDrawerOptions = {},
   ) => {
     const child = typeof propertyOrPath === "string"
       ? findDrawChild(property, propertyOrPath)
@@ -952,6 +1158,18 @@ function drawInspectorProperty(
     propertyType: property.valueType,
     fieldTypeFullName: property.fieldTypeFullName,
     fieldTypeAssembly: property.fieldTypeAssembly,
+    tooltip: property.tooltip,
+    header: property.header,
+    hasRange: property.hasRange,
+    rangeMin: property.rangeMin,
+    rangeMax: property.rangeMax,
+    numberStep: property.numberStep,
+    multiline: property.multiline,
+    minLines: property.minLines,
+    maxLines: property.maxLines,
+    referenceTypeFullName: property.referenceTypeFullName,
+    referenceTypeAssembly: property.referenceTypeAssembly,
+    attributes: property.attributes,
     editable: property.editable,
     disabled,
     readonly,
@@ -967,51 +1185,72 @@ function drawInspectorProperty(
   });
 }
 
-function resolveInspectorPropertyDrawComponent(
+function resolveInspectorPropertyDrawerComponent(
   property: InspectorProperty,
-  options: Pick<InspectorPropertyDrawOptions, "component" | "components">,
-  config: InspectorPropertyDrawConfig,
+  options: Pick<InspectorPropertyDrawerOptions, "drawer" | "drawers">,
+  config: InspectorPropertyDrawerConfig,
 ): Component | null {
-  if (options.component) return options.component;
-  const optionComponent = findDrawComponent(
+  if (options.drawer) return options.drawer;
+  const optionComponent = findPropertyDrawerComponent(
     property,
     config.context,
-    normalizeDrawComponents(options.components),
+    normalizePropertyDrawers(options.drawers),
   );
   if (optionComponent) return optionComponent;
 
-  for (const resolver of config.componentResolvers) {
+  for (const resolver of config.drawerResolvers) {
     const resolved = resolver(property, config.context);
     if (resolved) return resolved;
   }
 
-  return findDrawComponent(property, config.context, config.components)
-    ?? findDrawComponent(
+  return findPropertyDrawerComponent(property, config.context, config.drawers)
+    ?? findPropertyDrawerComponent(
       property,
       config.context,
-      normalizeDrawComponents(publicInspectorPropertyDrawLibrary),
+      normalizePropertyDrawers(publicInspectorPropertyDrawerLibrary),
     );
 }
 
-function normalizeDrawComponents(
-  input: InspectorPropertyDrawComponentsInput,
-): NormalizedDrawComponentRegistry {
-  if (!input) return EMPTY_DRAW_COMPONENT_REGISTRY;
-  if (isInspectorPropertyDrawLibrary(input)) {
+function normalizePropertyDrawers(
+  input: InspectorPropertyDrawerInput,
+): NormalizedPropertyDrawerRegistry {
+  if (!input) return EMPTY_PROPERTY_DRAWER_REGISTRY;
+  if (isInspectorPropertyDrawerLibrary(input)) {
     return {
       entries: [],
       libraries: [input],
     };
   }
-  const entries: NormalizedDrawComponentRegistration[] = [];
+  const entries: NormalizedPropertyDrawerRegistration[] = [];
   let order = 0;
-  const pushRegistration = (registration: InspectorPropertyDrawComponentRegistration) => {
-    if (!registration.component) return;
-    const types = normalizeDrawTypes(registration.type);
-    if (!types.length && !registration.match) return;
+  const pushRegistration = (registration: InspectorPropertyDrawerRegistration) => {
+    if (!registration.drawer) return;
+    const types = normalizeDrawerTypes(registration.type);
+    const valueTypes = normalizeDrawerTypes(registration.valueType);
+    const fieldTypes = normalizeDrawerTypes(registration.fieldType);
+    const attributes = normalizeDrawerTypes(registration.attribute);
+    const propertyPaths = normalizeDrawerTypes(registration.propertyPath);
+    const names = normalizeDrawerTypes(registration.name);
+    const drawerKinds = normalizeDrawerTypes(registration.drawerKind);
+    if (
+      !types.length &&
+      !valueTypes.length &&
+      !fieldTypes.length &&
+      !attributes.length &&
+      !propertyPaths.length &&
+      !names.length &&
+      !drawerKinds.length &&
+      !registration.match
+    ) return;
     entries.push({
       types,
-      component: registration.component,
+      valueTypes,
+      fieldTypes,
+      attributes,
+      propertyPaths,
+      names,
+      drawerKinds,
+      drawer: registration.drawer,
       match: registration.match,
       priority: Number.isFinite(registration.priority) ? Number(registration.priority) : 0,
       order,
@@ -1019,27 +1258,27 @@ function normalizeDrawComponents(
     order += 1;
   };
 
-  for (const registration of expandDrawComponentRegistrations(input)) {
+  for (const registration of expandPropertyDrawerRegistrations(input)) {
     pushRegistration(registration);
   }
 
   entries.sort((left, right) => right.priority - left.priority || left.order - right.order);
-  return entries.length ? { entries, libraries: [] } : EMPTY_DRAW_COMPONENT_REGISTRY;
+  return entries.length ? { entries, libraries: [] } : EMPTY_PROPERTY_DRAWER_REGISTRY;
 }
 
-function expandDrawComponentRegistrations(
-  input: InspectorPropertyDrawComponentsInput,
-): InspectorPropertyDrawComponentRegistration[] {
+function expandPropertyDrawerRegistrations(
+  input: InspectorPropertyDrawerInput,
+): InspectorPropertyDrawerRegistration[] {
   if (!input) return [];
-  if (isInspectorPropertyDrawLibrary(input)) return [...input.registrations];
+  if (isInspectorPropertyDrawerLibrary(input)) return [...input.registrations];
   if (Array.isArray(input)) return [...input];
   if (input instanceof Map) {
-    return Array.from(input.entries()).map(([type, component]) => ({ type, component }));
+    return Array.from(input.entries()).map(([type, drawer]) => ({ type, drawer }));
   }
-  return Object.entries(input).map(([type, component]) => ({ type, component }));
+  return Object.entries(input).map(([type, drawer]) => ({ type, drawer }));
 }
 
-function isInspectorPropertyDrawLibrary(value: unknown): value is InspectorPropertyDrawLibrary {
+function isInspectorPropertyDrawerLibrary(value: unknown): value is InspectorPropertyDrawerLibrary {
   return Boolean(
     value &&
     typeof value === "object" &&
@@ -1049,22 +1288,51 @@ function isInspectorPropertyDrawLibrary(value: unknown): value is InspectorPrope
   );
 }
 
-function normalizeDrawTypes(type: string | string[] | undefined): string[] {
+function normalizeDrawerTypes(type: string | string[] | undefined): string[] {
   return (Array.isArray(type) ? type : [type])
     .map((value) => normalizeDrawTypeKey(value || ""))
     .filter(Boolean);
 }
 
-function findDrawComponent(
+function normalizePropertyAttributes(
+  attributes: InspectorPropertyAttributeInfo[] | null | undefined,
+): InspectorPropertyAttributeInfo[] {
+  return (attributes ?? [])
+    .map((attribute) => ({
+      type: attribute.type || "",
+      displayName: attribute.displayName || attribute.type || "",
+      value: attribute.value || "",
+    }))
+    .filter((attribute) => attribute.type || attribute.displayName || attribute.value);
+}
+
+function findPropertyDrawerComponent(
   property: InspectorProperty,
   context: InspectorPropertyTreeContext,
-  registry: NormalizedDrawComponentRegistry,
+  registry: NormalizedPropertyDrawerRegistry,
 ): Component | null {
   if (!registry.entries.length && !registry.libraries.length) return null;
-  const keys = drawLookupKeys(property);
+  const keys = propertyDrawerLookupKeys(property);
+  const valueType = normalizeDrawTypeKey(property.valueType);
+  const fieldType = normalizeDrawTypeKey(property.fieldTypeFullName || property.fieldTypeAssembly);
+  const attributes = propertyAttributeLookupKeys(property);
+  const propertyPath = normalizeDrawTypeKey(property.propertyPath);
+  const name = normalizeDrawTypeKey(property.name);
+  const drawerKind = normalizeDrawTypeKey(property.drawer.kind);
   for (const entry of registry.entries) {
-    if (entry.match?.(property, context)) return entry.component;
-    if (entry.types.some((type) => type === "*" || keys.has(type))) return entry.component;
+    if (
+      entryPropertyDrawerMatches(entry, {
+        property,
+        context,
+        keys,
+        valueType,
+        fieldType,
+        attributes,
+        propertyPath,
+        name,
+        drawerKind,
+      })
+    ) return entry.drawer;
   }
   for (const library of registry.libraries) {
     const resolved = library.resolve(property, context);
@@ -1073,19 +1341,81 @@ function findDrawComponent(
   return null;
 }
 
-function drawLookupKeys(property: InspectorProperty): Set<string> {
+function entryPropertyDrawerMatches(
+  entry: NormalizedPropertyDrawerRegistration,
+  target: {
+    property: InspectorProperty;
+    context: InspectorPropertyTreeContext;
+    keys: Set<string>;
+    valueType: string;
+    fieldType: string;
+    attributes: Set<string>;
+    propertyPath: string;
+    name: string;
+    drawerKind: string;
+  },
+): boolean {
+  if (entry.match && !entry.match(target.property, target.context)) return false;
+  if (entry.types.length && !entry.types.some((type) => type === "*" || target.keys.has(type))) return false;
+  if (
+    entry.valueTypes.length &&
+    !entry.valueTypes.some((type) => type === "*" || type === target.valueType || target.keys.has(type))
+  ) return false;
+  if (
+    entry.fieldTypes.length &&
+    !entry.fieldTypes.some((type) => type === "*" || type === target.fieldType || target.keys.has(type))
+  ) return false;
+  if (entry.attributes.length && !entry.attributes.some((type) => type === "*" || target.attributes.has(type))) {
+    return false;
+  }
+  if (entry.propertyPaths.length && !entry.propertyPaths.some((path) => path === "*" || path === target.propertyPath)) {
+    return false;
+  }
+  if (entry.names.length && !entry.names.some((item) => item === "*" || item === target.name)) return false;
+  if (entry.drawerKinds.length && !entry.drawerKinds.some((kind) => kind === "*" || kind === target.drawerKind)) {
+    return false;
+  }
+  return true;
+}
+
+function propertyDrawerLookupKeys(property: InspectorProperty): Set<string> {
   return new Set([
     property.valueType,
     property.type,
     property.fieldTypeFullName,
     property.fieldTypeAssembly,
+    property.referenceTypeFullName,
+    property.referenceTypeAssembly,
     property.drawer.kind,
+    property.propertyPath,
+    property.name,
     property.managedReferenceFullTypename,
     property.managedReferenceFieldTypename,
     property.managedReferenceDisplayName,
+    ...property.attributes.flatMap((attribute) => [
+      attribute.type || "",
+      attribute.displayName || "",
+    ]),
   ]
     .map(normalizeDrawTypeKey)
     .filter(Boolean));
+}
+
+function propertyAttributeLookupKeys(property: InspectorProperty): Set<string> {
+  return new Set(property.attributes
+    .flatMap((attribute) => [
+      attribute.type || "",
+      attribute.displayName || "",
+      shortTypeName(attribute.type || ""),
+    ])
+    .map(normalizeDrawTypeKey)
+    .filter(Boolean));
+}
+
+function shortTypeName(value: string): string {
+  const normalized = value.trim();
+  const dot = normalized.lastIndexOf(".");
+  return dot >= 0 ? normalized.slice(dot + 1) : normalized;
 }
 
 function normalizeDrawTypeKey(value: string): string {
@@ -1094,7 +1424,7 @@ function normalizeDrawTypeKey(value: string): string {
 
 function drawInspectorPropertyFallback(
   property: InspectorProperty,
-  options: InspectorPropertyDrawOptions,
+  options: InspectorPropertyDrawerOptions,
 ): VNodeChild {
   const showLabel = options.showLabel !== false;
   if (property.children.length > 0) {
@@ -1139,9 +1469,9 @@ function drawInspectorPropertyFallback(
   );
 }
 
-function childDrawOptions(options: InspectorPropertyDrawOptions): InspectorPropertyDrawOptions {
+function childDrawOptions(options: InspectorPropertyDrawerOptions): InspectorPropertyDrawerOptions {
   return {
-    components: options.components,
+    drawers: options.drawers,
     disabled: options.disabled,
     readonly: options.readonly,
     compact: options.compact,
@@ -1384,7 +1714,7 @@ function drawer(
   commitMode: InspectorCommitMode,
   valueType: string,
   container = false,
-): InspectorPropertyDrawer {
+): InspectorPropertyResolvedDrawer {
   return {
     kind,
     commitMode,

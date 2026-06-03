@@ -11,13 +11,14 @@ const props = defineProps<{
   preview: BinaryPreview;
   diffKey: string;
   mode?: "diff" | "neutral";
+  compact?: boolean;
 }>();
 
 const containerRef = ref<HTMLDivElement | null>(null);
 const activeSide = ref<"before" | "after">(props.preview.after ? "after" : "before");
 const loading = ref(false);
 const error = ref<string | null>(null);
-const showGrid = ref(true);
+const showGrid = ref(!props.compact);
 const wireframe = ref(false);
 
 const activeRef = computed(() =>
@@ -77,7 +78,7 @@ async function loadModel() {
     // Setup scene
     if (!scene) {
       scene = new THREE.Scene();
-      scene.background = new THREE.Color(0xf0f0f0);
+      scene.background = new THREE.Color(themeColor("--panel-bg", "#101116"));
     }
 
     // Remove previous model
@@ -164,6 +165,11 @@ async function loadModel() {
     controls = new OrbitControls(camera, sharedRenderer.domElement);
     controls.enableDamping = true;
     controls.dampingFactor = 0.1;
+    controls.enablePan = !props.compact;
+    controls.enableRotate = !props.compact;
+    controls.enableZoom = !props.compact;
+    controls.autoRotate = !!props.compact;
+    controls.autoRotateSpeed = 1.2;
 
     // Animate
     function animate() {
@@ -204,6 +210,11 @@ function observeContainerSize() {
     resizeRendererToContainer();
   });
   containerResizeObserver?.observe(containerRef.value);
+}
+
+function themeColor(token: string, fallback: string): string {
+  const value = getComputedStyle(document.documentElement).getPropertyValue(token).trim();
+  return value || fallback;
 }
 
 function disposeObject(obj: any) {
@@ -279,8 +290,8 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="fbx-preview">
-    <div class="preview-controls">
+  <div class="fbx-preview" :class="{ compact }">
+    <div v-if="!compact" class="preview-controls">
       <div v-if="hasBoth" class="side-toggle">
         <button :class="{ active: activeSide === 'before' }" @click="activeSide = 'before'">Before</button>
         <button :class="{ active: activeSide === 'after' }" @click="activeSide = 'after'">After</button>
@@ -306,6 +317,10 @@ onBeforeUnmount(() => {
   width: 100%;
   min-height: 0;
   overflow: hidden;
+}
+
+.fbx-preview.compact {
+  min-height: 96px;
 }
 .preview-controls {
   display: flex;
@@ -370,8 +385,12 @@ onBeforeUnmount(() => {
   flex: 1;
   width: 100%;
   min-height: 0;
-  background: #f0f0f0;
+  background: color-mix(in srgb, var(--panel-bg) 82%, var(--bg-color) 18%);
   overflow: hidden;
+}
+
+.fbx-preview.compact .three-container {
+  min-height: 96px;
 }
 .three-container canvas {
   display: block;

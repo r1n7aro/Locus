@@ -66,6 +66,12 @@ describe("unityExecuteProgress", () => {
     expect(read("src/components/tool-block-overrides/toolBlockOverrides.ts")).toContain("unity_execute");
     expect(read("src/components/tool-block-overrides/UnityExecuteToolBlock.vue")).toContain("parseUnityExecuteProgressOutput");
     expect(read("src/components/tool-block-overrides/UnityExecuteToolBlock.vue")).toContain("props.toolCall.progress");
+    expect(read("src/components/tool-block-overrides/UnityExecuteToolBlock.vue")).toContain("import hljs from \"../../hljs\";");
+    expect(read("src/components/tool-block-overrides/UnityExecuteToolBlock.vue")).toContain("hljs.highlight(code, { language: \"csharp\" }).value");
+    expect(read("src/components/tool-block-overrides/UnityExecuteToolBlock.vue")).toContain("v-html=\"highlightCSharp(codeArg)\"");
+    expect(read("src/components/tool-block-overrides/UnityExecuteToolBlock.vue")).toContain("class=\"tool-call-pre ui-select-text hljs\"");
+    expect(read("src/assets/hljs-theme.css")).toContain("--md-syntax-subst: var(--md-code-fg);");
+    expect(read("src/assets/hljs-theme.css")).toContain(":root .hljs-subst");
     expect(read("src/components/tool-block-overrides/UnityExecuteToolBlock.vue")).toContain("const liveProgressHasValue = computed(() => typeof liveProgress.value?.progress === \"number\")");
     expect(unityBridgeSource).toContain("unity_execute_code_with_progress");
     expect(unityBridgeSource).toContain("cancel_execute_code");

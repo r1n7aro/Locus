@@ -44,6 +44,7 @@ import UnityPropertyDraw from "../unity/UnityPropertyDraw.vue";
 import UnityPropertyEditor from "../unity/UnityPropertyEditor.vue";
 import UnitySerializedPropertyTree from "../unity/UnitySerializedPropertyTree.vue";
 import UnityVectorField from "../unity/UnityVectorField.vue";
+import UnityObjectPreview from "../unity-preview/UnityObjectPreview.vue";
 import {
   applyUnityRgbHexToColorText,
   formatUnityColorValue,
@@ -89,6 +90,16 @@ import type {
   ViewSerializedPropertySnapshot,
   ViewRuntimeUpdateEvent,
 } from "../../services/view";
+import type {
+  UnitySerializedPropertyApplyRequest,
+  UnitySerializedPropertyApplyResult,
+  UnitySerializedPropertyDiscoverRequest,
+  UnitySerializedPropertyDiscoverResult,
+  UnitySerializedPropertyReadRequest,
+  UnitySerializedPropertyReadResult,
+  UnitySerializedPropertyWriteRequest,
+  UnitySerializedPropertyWriteResult,
+} from "../../services/unitySerializedProperty";
 import {
   checkUnityConnectionStatus,
   commitUnityEmbedAssetDrop,
@@ -147,6 +158,8 @@ import type {
   StreamEvent,
 } from "../../types";
 import * as PropertyTreeService from "../../services/propertyTree";
+import * as UnityObjectDrawerService from "../../services/unityObjectDrawer";
+import * as UnityObjectReferencePickerService from "../../services/unityObjectReferencePicker";
 import { markStartupPhase } from "../../services/startupPerf";
 
 export type {
@@ -219,6 +232,10 @@ export interface ViewRuntimeApi {
   ): Promise<ViewBindingDiscoverResult>;
   bindingWrite(request: Omit<ViewBindingWriteRequest, "viewId">): Promise<ViewBindingWriteResult>;
   bindingApply(request: Omit<ViewBindingApplyRequest, "viewId">): Promise<ViewBindingApplyResult>;
+  unityPropertyRead(request: UnitySerializedPropertyReadRequest): Promise<UnitySerializedPropertyReadResult>;
+  unityPropertyDiscover(request: UnitySerializedPropertyDiscoverRequest): Promise<UnitySerializedPropertyDiscoverResult>;
+  unityPropertyWrite(request: UnitySerializedPropertyWriteRequest): Promise<UnitySerializedPropertyWriteResult>;
+  unityPropertyApply(request: UnitySerializedPropertyApplyRequest): Promise<UnitySerializedPropertyApplyResult>;
   searchAssets(query: string, roots?: string[], limit?: number): Promise<AssetSearchResult[]>;
   createSession(request?: ViewSessionCreateRequest): Promise<string>;
   showSession(sessionId: string): Promise<void>;
@@ -742,6 +759,7 @@ const LOCUS_COMPONENTS = {
   UnityPropertyDraw,
   UnityPropertyEditor,
   UnitySerializedPropertyTree,
+  UnityObjectPreview,
   UnityReferenceChip,
   UnityDropZone,
   UnityVectorField,
@@ -1044,6 +1062,7 @@ function createViewBindingRuntime(api: ViewRuntimeApi, undo: ReturnType<typeof c
 const LOCUS_COMPONENT_MODULE = {
   ...LOCUS_COMPONENTS,
   ...PropertyTreeService,
+  ...UnityObjectDrawerService,
   applyUnityRgbHexToColorText,
   formatUnityColorValue,
   formatUnityVectorValue,
@@ -1161,11 +1180,43 @@ function createViewRuntimeApi(detail: ViewPackageDetail, api: ViewRuntimeApi): V
 function createViewRuntimeApiUncached(detail: ViewPackageDetail, api: ViewRuntimeApi) {
   const undo = createViewUndoService();
   const binding = createViewBindingRuntime(api, undo);
-  const propertyDraw = {
-    library: PropertyTreeService.publicInspectorPropertyDrawLibrary,
-    projectLibrary: PropertyTreeService.projectInspectorPropertyDrawLibrary,
-    register: PropertyTreeService.registerInspectorPropertyDrawComponent,
-    createLibrary: PropertyTreeService.createInspectorPropertyDrawLibrary,
+  const serializedProperty = {
+    read: api.unityPropertyRead,
+    discover: api.unityPropertyDiscover,
+    write: api.unityPropertyWrite,
+    apply: api.unityPropertyApply,
+  };
+  const propertyDrawer = {
+    library: PropertyTreeService.publicInspectorPropertyDrawerLibrary,
+    projectLibrary: PropertyTreeService.projectInspectorPropertyDrawerLibrary,
+    register: PropertyTreeService.registerInspectorPropertyDrawer,
+    registerValue: PropertyTreeService.registerInspectorValueDrawer,
+    registerField: PropertyTreeService.registerInspectorFieldDrawer,
+    registerAttribute: PropertyTreeService.registerInspectorAttributeDrawer,
+    registerPropertyPath: PropertyTreeService.registerInspectorPropertyPathDrawer,
+    define: PropertyTreeService.defineInspectorPropertyDrawers,
+    normalize: PropertyTreeService.normalizeInspectorPropertyDrawers,
+    createLibrary: PropertyTreeService.createInspectorPropertyDrawerLibrary,
+  };
+  const unityObjectDrawer = {
+    library: UnityObjectDrawerService.publicUnityObjectDrawerLibrary,
+    projectLibrary: UnityObjectDrawerService.projectUnityObjectDrawerLibrary,
+    register: UnityObjectDrawerService.registerUnityObjectDrawer,
+    define: UnityObjectDrawerService.defineUnityObjectDrawers,
+    normalize: UnityObjectDrawerService.defineUnityObjectDrawers,
+    createLibrary: UnityObjectDrawerService.createUnityObjectDrawerLibrary,
+    resolve: UnityObjectDrawerService.resolveUnityObjectDrawer,
+  };
+  const objectReferencePicker = {
+    roots: UnityObjectReferencePickerService.UNITY_OBJECT_REFERENCE_SEARCH_ROOTS,
+    searchQuery: UnityObjectReferencePickerService.unityObjectReferenceSearchQuery,
+    filterResults: UnityObjectReferencePickerService.filterUnityObjectReferenceSearchResults,
+    isResult: UnityObjectReferencePickerService.isUnityObjectReferenceSearchResult,
+    typeHint: UnityObjectReferencePickerService.unityObjectReferenceTypeHint,
+    typeKey: UnityObjectReferencePickerService.unityObjectReferenceTypeKey,
+    typeRule: UnityObjectReferencePickerService.getUnityObjectReferenceTypeRule,
+    normalizePath: UnityObjectReferencePickerService.normalizeUnityObjectReferencePath,
+    extension: UnityObjectReferencePickerService.unityObjectReferenceExtension,
   };
   const session = {
     create: (request?: string | ViewSessionCreateRequest) =>
@@ -1226,6 +1277,9 @@ function createViewRuntimeApiUncached(detail: ViewPackageDetail, api: ViewRuntim
     },
     onDrop: subscribeUnityEmbedAssetDrop,
     onDragState: subscribeUnityEmbedAssetDragState,
+    serializedProperty,
+    objectDrawer: unityObjectDrawer,
+    objectReferencePicker,
   };
 
   const files = {
@@ -1268,8 +1322,11 @@ function createViewRuntimeApiUncached(detail: ViewPackageDetail, api: ViewRuntim
     unity,
     files,
     undo,
-    propertyDraw,
-    drawLibrary: propertyDraw.library,
+    propertyDrawer,
+    unityObjectDrawer,
+    objectReferencePicker,
+    serializedProperty,
+    unitySerializedProperty: serializedProperty,
     openLog: () => api.openFrontendLog(),
     onUpdate: (handler: (event: ViewRuntimeUpdateEvent) => void) => api.onUpdate(handler),
     readBinding: (bindingId: string, target?: ViewBindingReadRequest["target"]) =>
@@ -1289,7 +1346,10 @@ function createViewRuntimeApiUncached(detail: ViewPackageDetail, api: ViewRuntim
     unity,
     files,
     undo,
-    propertyDraw,
+    propertyDrawer,
+    unityObjectDrawer,
+    serializedProperty,
+    unitySerializedProperty: serializedProperty,
     defineView: <T>(value: T) => value,
     defineGraphView,
     CanvasView,
@@ -1298,10 +1358,13 @@ function createViewRuntimeApiUncached(detail: ViewPackageDetail, api: ViewRuntim
     UnityPropertyDraw,
     UnityPropertyEditor,
     UnitySerializedPropertyTree,
+    UnityObjectPreview,
     UnityReferenceChip,
     UnityDropZone,
     layoutGraphDocument,
     ...PropertyTreeService,
+    ...UnityObjectDrawerService,
+    ...UnityObjectReferencePickerService,
     onEditorUpdate: (handler: (event: ViewRuntimeUpdateEvent) => void) => view.onUpdate(handler),
     useUnityReferenceDrag,
     useUnityAssetDropTarget: useUnityAssetDropTargetRuntime,
@@ -1653,6 +1716,28 @@ function createInstrumentedRuntimeApi(detail: ViewPackageDetail, api: ViewRuntim
       }),
     bindingApply: (request) =>
       measureRequest("bindingApply", () => api.bindingApply(request), {
+        writeCount: request.writes.length,
+      }),
+    unityPropertyRead: (request) =>
+      measureRequest("unityPropertyRead", () => api.unityPropertyRead(request), {
+        bindingId: request.bindingId ?? "",
+        targetKind: request.target?.kind ?? "",
+        propertyPath: request.target?.propertyPath ?? "",
+      }),
+    unityPropertyDiscover: (request) =>
+      measureRequest("unityPropertyDiscover", () => api.unityPropertyDiscover(request), {
+        bindingId: request.bindingId ?? "",
+        targetKind: request.target?.kind ?? "",
+        query: request.query ?? "",
+      }),
+    unityPropertyWrite: (request) =>
+      measureRequest("unityPropertyWrite", () => api.unityPropertyWrite(request), {
+        bindingId: request.bindingId ?? "",
+        targetKind: request.target?.kind ?? "",
+        propertyPath: request.target?.propertyPath ?? "",
+      }),
+    unityPropertyApply: (request) =>
+      measureRequest("unityPropertyApply", () => api.unityPropertyApply(request), {
         writeCount: request.writes.length,
       }),
     searchAssets: (query, roots, limit) =>

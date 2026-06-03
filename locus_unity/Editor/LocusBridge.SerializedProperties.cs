@@ -5,6 +5,7 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
+using System.Reflection;
 using System.Runtime.Serialization;
 
 namespace Locus
@@ -14,6 +15,7 @@ namespace Locus
         public sealed class SerializedPropertySnapshot
         {
             public string propertyPath;
+            public SerializedPropertyBindingTarget bindingTarget;
             public string displayName;
             public string name;
             public string type;
@@ -36,6 +38,31 @@ namespace Locus
             public string managedReferenceFieldTypename;
             public string managedReferenceDisplayName;
             public SerializedManagedReferenceTypeOption[] managedReferenceTypes;
+            public string tooltip;
+            public string header;
+            public bool hasRange;
+            public float rangeMin;
+            public float rangeMax;
+            public float numberStep;
+            public bool multiline;
+            public int minLines;
+            public int maxLines;
+            public string referenceTypeFullName;
+            public string referenceTypeAssembly;
+            public SerializedPropertyAttributeInfo[] attributes;
+        }
+
+        public sealed class SerializedPropertyBindingTarget
+        {
+            public string kind;
+            public string path;
+            public string scenePath;
+            public string objectPath;
+            public long objectFileId;
+            public long targetFileId;
+            public string componentType;
+            public int componentIndex;
+            public string propertyPath;
         }
 
         public sealed class SerializedEnumOption
@@ -53,6 +80,13 @@ namespace Locus
             public string value;
             public string fullName;
             public string assembly;
+        }
+
+        public sealed class SerializedPropertyAttributeInfo
+        {
+            public string type;
+            public string displayName;
+            public string value;
         }
 
         private sealed class Vector2Json
@@ -74,6 +108,15 @@ namespace Locus
             public float y;
             public float z;
             public float w;
+        }
+
+        private sealed class QuaternionJson
+        {
+            public string action;
+            public float x;
+            public float y;
+            public float z;
+            public float w = 1f;
         }
 
         private sealed class ColorJson
@@ -131,6 +174,71 @@ namespace Locus
             return SnapshotSerializedProperty(prop.Copy(), 0, maxDepth, maxArrayItems);
         }
 
+        public static SerializedPropertySnapshot SnapshotSerializedObject(
+            UnityEngine.Object obj,
+            int maxDepth = 4,
+            int maxArrayItems = 64)
+        {
+            if (obj == null)
+                return null;
+
+            maxDepth = Math.Max(0, maxDepth);
+            maxArrayItems = Math.Max(0, maxArrayItems);
+
+            var serialized = new SerializedObject(obj);
+            serialized.Update();
+
+            var children = new List<SerializedPropertySnapshot>();
+            SerializedProperty cursor = serialized.GetIterator();
+            bool enterChildren = true;
+            while (cursor.NextVisible(enterChildren))
+            {
+                children.Add(SnapshotSerializedProperty(cursor, 1, maxDepth, maxArrayItems));
+                enterChildren = false;
+            }
+
+            Type type = obj.GetType();
+            string name = obj.name ?? "";
+            return new SerializedPropertySnapshot
+            {
+                propertyPath = "",
+                displayName = string.IsNullOrEmpty(name) ? type.Name : name,
+                name = name,
+                type = type.Name,
+                valueType = "Object",
+                fieldTypeFullName = FieldTypeFullName(type),
+                fieldTypeAssembly = FieldTypeAssembly(type),
+                value = name,
+                displayValue = string.IsNullOrEmpty(name) ? type.Name : name,
+                editable = false,
+                hasChildren = children.Count > 0,
+                isArray = false,
+                arraySize = -1,
+                isFlagsEnum = false,
+                enumValueIndex = -1,
+                enumValueFlag = 0,
+                enumOptions = new SerializedEnumOption[0],
+                children = children.ToArray(),
+                isManagedReference = false,
+                managedReferenceFullTypename = "",
+                managedReferenceFieldTypename = "",
+                managedReferenceDisplayName = "",
+                managedReferenceTypes = new SerializedManagedReferenceTypeOption[0],
+                tooltip = "",
+                header = "",
+                hasRange = false,
+                rangeMin = 0f,
+                rangeMax = 0f,
+                numberStep = 0f,
+                multiline = false,
+                minLines = 0,
+                maxLines = 0,
+                referenceTypeFullName = FieldTypeFullName(type),
+                referenceTypeAssembly = FieldTypeAssembly(type),
+                attributes = new SerializedPropertyAttributeInfo[0]
+            };
+        }
+
         public static string SerializedPropertySnapshotToJson(SerializedPropertySnapshot snapshot)
         {
             return ToJsonValue(snapshot, 0);
@@ -157,6 +265,7 @@ namespace Locus
                 case SerializedPropertyType.Vector2:
                 case SerializedPropertyType.Vector3:
                 case SerializedPropertyType.Vector4:
+                case SerializedPropertyType.Quaternion:
                 case SerializedPropertyType.Color:
                 case SerializedPropertyType.Rect:
                 case SerializedPropertyType.ManagedReference:
@@ -193,7 +302,7 @@ namespace Locus
                     };
                 case SerializedPropertyType.ObjectReference:
                     return prop.objectReferenceValue != null
-                        ? AssetDatabase.GetAssetPath(prop.objectReferenceValue)
+                        ? SerializedObjectReferencePath(prop.objectReferenceValue)
                         : "";
                 case SerializedPropertyType.Vector2:
                     return VectorValue(prop.vector2Value);
@@ -201,6 +310,8 @@ namespace Locus
                     return VectorValue(prop.vector3Value);
                 case SerializedPropertyType.Vector4:
                     return VectorValue(prop.vector4Value);
+                case SerializedPropertyType.Quaternion:
+                    return QuaternionValue(prop.quaternionValue);
                 case SerializedPropertyType.Color:
                     return "#" + ColorUtility.ToHtmlStringRGBA(prop.colorValue);
                 case SerializedPropertyType.Rect:
@@ -252,14 +363,15 @@ namespace Locus
                 case SerializedPropertyType.ObjectReference:
                     if (prop.objectReferenceValue == null)
                         return "";
-                    string path = AssetDatabase.GetAssetPath(prop.objectReferenceValue);
-                    return string.IsNullOrEmpty(path) ? prop.objectReferenceValue.name : path;
+                    return SerializedObjectReferencePath(prop.objectReferenceValue);
                 case SerializedPropertyType.Vector2:
                     return FormatVector(prop.vector2Value);
                 case SerializedPropertyType.Vector3:
                     return FormatVector(prop.vector3Value);
                 case SerializedPropertyType.Vector4:
                     return FormatVector(prop.vector4Value);
+                case SerializedPropertyType.Quaternion:
+                    return FormatVector(prop.quaternionValue.eulerAngles);
                 case SerializedPropertyType.Color:
                     return "#" + ColorUtility.ToHtmlStringRGBA(prop.colorValue);
                 case SerializedPropertyType.Rect:
@@ -316,9 +428,7 @@ namespace Locus
                     break;
                 case SerializedPropertyType.ObjectReference:
                     string assetPath = ParseStringJson(json);
-                    prop.objectReferenceValue = string.IsNullOrWhiteSpace(assetPath)
-                        ? null
-                        : AssetDatabase.LoadAssetAtPath<UnityEngine.Object>(assetPath);
+                    prop.objectReferenceValue = ResolveSerializedObjectReference(prop, assetPath);
                     break;
                 case SerializedPropertyType.Vector2:
                     Vector2Json v2 = DeserializeJson<Vector2Json>(json);
@@ -331,6 +441,9 @@ namespace Locus
                 case SerializedPropertyType.Vector4:
                     Vector4Json v4 = DeserializeJson<Vector4Json>(json);
                     prop.vector4Value = new Vector4(v4.x, v4.y, v4.z, v4.w);
+                    break;
+                case SerializedPropertyType.Quaternion:
+                    prop.quaternionValue = ParseQuaternionJson(json);
                     break;
                 case SerializedPropertyType.Color:
                     prop.colorValue = ParseColorJson(json);
@@ -345,6 +458,138 @@ namespace Locus
                 default:
                     throw new Exception("SerializedProperty type is not writable: " + prop.propertyType);
             }
+        }
+
+        private static string SerializedObjectReferencePath(UnityEngine.Object obj)
+        {
+            if (obj == null)
+                return "";
+            string path = AssetDatabase.GetAssetPath(obj);
+            if (string.IsNullOrEmpty(path))
+                return obj.name ?? "";
+            if (AssetDatabase.IsSubAsset(obj))
+            {
+                string name = obj.name ?? "";
+                if (!string.IsNullOrWhiteSpace(name))
+                    return path.TrimEnd('/') + "/" + name.Trim();
+            }
+            return path;
+        }
+
+        private static UnityEngine.Object ResolveSerializedObjectReference(
+            SerializedProperty prop,
+            string value)
+        {
+            string reference = (value ?? "").Trim().Replace('\\', '/');
+            if (string.IsNullOrWhiteSpace(reference))
+                return null;
+
+            Type targetType = ResolveSerializedPropertyFieldType(prop);
+            UnityEngine.Object exact = LoadAssetAtPathForSerializedReference(reference, targetType);
+            if (exact != null)
+                return exact;
+
+            UnityEngine.Object subAsset = ResolveSubAssetReference(reference, targetType);
+            if (subAsset != null)
+                return subAsset;
+
+            UnityEngine.Object fallback = AssetDatabase.LoadAssetAtPath<UnityEngine.Object>(reference);
+            return IsSerializedObjectReferenceCompatible(fallback, targetType) ? fallback : null;
+        }
+
+        private static UnityEngine.Object LoadAssetAtPathForSerializedReference(
+            string assetPath,
+            Type targetType)
+        {
+            if (targetType != null && typeof(UnityEngine.Object).IsAssignableFrom(targetType))
+            {
+                UnityEngine.Object typed = AssetDatabase.LoadAssetAtPath(assetPath, targetType) as UnityEngine.Object;
+                if (typed != null)
+                    return typed;
+            }
+            UnityEngine.Object fallback = AssetDatabase.LoadAssetAtPath<UnityEngine.Object>(assetPath);
+            return IsSerializedObjectReferenceCompatible(fallback, targetType) ? fallback : null;
+        }
+
+        private static UnityEngine.Object ResolveSubAssetReference(string reference, Type targetType)
+        {
+            int slash = reference.LastIndexOf('/');
+            while (slash > 0)
+            {
+                string assetPath = reference.Substring(0, slash);
+                string subAssetName = reference.Substring(slash + 1).Trim();
+                if (!string.IsNullOrWhiteSpace(subAssetName)
+                    && AssetDatabase.LoadMainAssetAtPath(assetPath) != null)
+                {
+                    if (!IsSubAssetReferenceAllowed(assetPath))
+                        return null;
+                    UnityEngine.Object resolved = FindSubAssetByName(assetPath, subAssetName, targetType);
+                    if (resolved != null)
+                        return resolved;
+                }
+                slash = reference.LastIndexOf('/', slash - 1);
+            }
+            return null;
+        }
+
+        private static bool IsSubAssetReferenceAllowed(string assetPath)
+        {
+            string ext = AssetPathExtension(assetPath);
+            return !string.Equals(ext, "playable", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static string AssetPathExtension(string assetPath)
+        {
+            if (string.IsNullOrWhiteSpace(assetPath))
+                return "";
+            int slash = assetPath.LastIndexOf('/');
+            int dot = assetPath.LastIndexOf('.');
+            if (dot < 0 || dot < slash)
+                return "";
+            return assetPath.Substring(dot + 1).Trim();
+        }
+
+        private static UnityEngine.Object FindSubAssetByName(
+            string assetPath,
+            string subAssetName,
+            Type targetType)
+        {
+            UnityEngine.Object[] objects = AssetDatabase.LoadAllAssetsAtPath(assetPath);
+            UnityEngine.Object fallback = null;
+            UnityEngine.Object caseInsensitiveFallback = null;
+            foreach (UnityEngine.Object obj in objects)
+            {
+                if (obj == null || !AssetDatabase.IsSubAsset(obj))
+                    continue;
+                string name = obj.name ?? "";
+                if (name == subAssetName)
+                {
+                    if (fallback == null)
+                        fallback = obj;
+                    if (IsSerializedObjectReferenceCompatible(obj, targetType))
+                        return obj;
+                }
+                else if (caseInsensitiveFallback == null
+                    && string.Equals(name, subAssetName, StringComparison.OrdinalIgnoreCase))
+                {
+                    caseInsensitiveFallback = obj;
+                }
+            }
+            if (fallback != null && IsSerializedObjectReferenceCompatible(fallback, targetType))
+                return fallback;
+            if (caseInsensitiveFallback != null
+                && IsSerializedObjectReferenceCompatible(caseInsensitiveFallback, targetType))
+                return caseInsensitiveFallback;
+            return null;
+        }
+
+        private static bool IsSerializedObjectReferenceCompatible(UnityEngine.Object obj, Type targetType)
+        {
+            if (obj == null)
+                return false;
+            if (targetType == null || !typeof(UnityEngine.Object).IsAssignableFrom(targetType))
+                return true;
+            return targetType.IsAssignableFrom(obj.GetType());
         }
 
         private sealed class RectJson
@@ -482,6 +727,8 @@ namespace Locus
                     return SnapshotVectorJson(snapshot.displayValue, new[] { "x", "y", "z" });
                 case "Vector4":
                     return SnapshotVectorJson(snapshot.displayValue, new[] { "x", "y", "z", "w" });
+                case "Quaternion":
+                    return SnapshotQuaternionEulerJson(snapshot.displayValue);
                 case "Rect":
                     return SnapshotVectorJson(snapshot.displayValue, new[] { "x", "y", "width", "height" });
                 default:
@@ -504,6 +751,12 @@ namespace Locus
             return ToJsonValue(values, 0);
         }
 
+        private static string SnapshotQuaternionEulerJson(string displayValue)
+        {
+            string vectorJson = SnapshotVectorJson(displayValue, new[] { "x", "y", "z" });
+            return "{\"action\":\"setEuler\"," + vectorJson.TrimStart('{');
+        }
+
         private static SerializedPropertySnapshot SnapshotSerializedProperty(
             SerializedProperty prop,
             int depth,
@@ -516,6 +769,7 @@ namespace Locus
                 TryGetArraySize(prop, out arraySize);
 
             Type fieldType = ResolveSerializedPropertyFieldType(prop);
+            FieldInfo fieldInfo = ResolveSerializedPropertyFieldInfo(prop);
             var snapshot = new SerializedPropertySnapshot
             {
                 propertyPath = prop.propertyPath,
@@ -543,7 +797,23 @@ namespace Locus
                 managedReferenceDisplayName = prop.propertyType == SerializedPropertyType.ManagedReference ? ManagedReferenceDisplayName(prop.managedReferenceFullTypename) : "",
                 managedReferenceTypes = prop.propertyType == SerializedPropertyType.ManagedReference
                     ? ManagedReferenceTypeOptions(prop)
-                    : new SerializedManagedReferenceTypeOption[0]
+                    : new SerializedManagedReferenceTypeOption[0],
+                tooltip = SerializedFieldTooltip(fieldInfo),
+                header = SerializedFieldHeader(fieldInfo),
+                hasRange = HasSerializedFieldRange(fieldInfo),
+                rangeMin = SerializedFieldRangeMin(fieldInfo),
+                rangeMax = SerializedFieldRangeMax(fieldInfo),
+                numberStep = SerializedFieldNumberStep(fieldInfo, prop),
+                multiline = IsSerializedFieldMultiline(fieldInfo),
+                minLines = SerializedFieldMinLines(fieldInfo),
+                maxLines = SerializedFieldMaxLines(fieldInfo),
+                referenceTypeFullName = prop.propertyType == SerializedPropertyType.ObjectReference
+                    ? FieldTypeFullName(fieldType)
+                    : "",
+                referenceTypeAssembly = prop.propertyType == SerializedPropertyType.ObjectReference
+                    ? FieldTypeAssembly(fieldType)
+                    : "",
+                attributes = SerializedFieldAttributes(fieldInfo)
             };
 
             if (depth < maxDepth)
@@ -924,6 +1194,18 @@ namespace Locus
             return TrimJsonString(json);
         }
 
+        private static Quaternion ParseQuaternionJson(string json)
+        {
+            QuaternionJson value = DeserializeJson<QuaternionJson>(json);
+            if (value == null)
+                return Quaternion.identity;
+            string action = (value != null ? value.action : null) ?? "";
+            action = action.Trim().ToLowerInvariant();
+            if (action == "seteuler" || action == "euler" || !JsonObjectHasKey(json, "w"))
+                return Quaternion.Euler(value.x, value.y, value.z);
+            return new Quaternion(value.x, value.y, value.z, value.w);
+        }
+
         private static Color ParseColorJson(string json)
         {
             string text = TrimJsonString(json);
@@ -1079,10 +1361,128 @@ namespace Locus
             return type != null && type.IsEnum && Attribute.IsDefined(type, typeof(FlagsAttribute), false);
         }
 
+        private static string SerializedFieldTooltip(FieldInfo field)
+        {
+            TooltipAttribute attr = field != null
+                ? field.GetCustomAttribute<TooltipAttribute>(true)
+                : null;
+            return attr != null ? attr.tooltip ?? "" : "";
+        }
+
+        private static string SerializedFieldHeader(FieldInfo field)
+        {
+            HeaderAttribute attr = field != null
+                ? field.GetCustomAttribute<HeaderAttribute>(true)
+                : null;
+            return attr != null ? attr.header ?? "" : "";
+        }
+
+        private static bool HasSerializedFieldRange(FieldInfo field)
+        {
+            return field != null && field.GetCustomAttribute<RangeAttribute>(true) != null;
+        }
+
+        private static float SerializedFieldRangeMin(FieldInfo field)
+        {
+            RangeAttribute attr = field != null
+                ? field.GetCustomAttribute<RangeAttribute>(true)
+                : null;
+            return attr != null ? attr.min : 0f;
+        }
+
+        private static float SerializedFieldRangeMax(FieldInfo field)
+        {
+            RangeAttribute attr = field != null
+                ? field.GetCustomAttribute<RangeAttribute>(true)
+                : null;
+            return attr != null ? attr.max : 0f;
+        }
+
+        private static float SerializedFieldNumberStep(FieldInfo field, SerializedProperty prop)
+        {
+            if (prop != null && prop.propertyType == SerializedPropertyType.Integer)
+                return 1f;
+            return 0f;
+        }
+
+        private static bool IsSerializedFieldMultiline(FieldInfo field)
+        {
+            return field != null &&
+                   (field.GetCustomAttribute<TextAreaAttribute>(true) != null ||
+                    field.GetCustomAttribute<MultilineAttribute>(true) != null);
+        }
+
+        private static int SerializedFieldMinLines(FieldInfo field)
+        {
+            if (field == null)
+                return 0;
+            TextAreaAttribute textArea = field.GetCustomAttribute<TextAreaAttribute>(true);
+            if (textArea != null)
+                return textArea.minLines;
+            MultilineAttribute multiline = field.GetCustomAttribute<MultilineAttribute>(true);
+            return multiline != null ? multiline.lines : 0;
+        }
+
+        private static int SerializedFieldMaxLines(FieldInfo field)
+        {
+            if (field == null)
+                return 0;
+            TextAreaAttribute textArea = field.GetCustomAttribute<TextAreaAttribute>(true);
+            return textArea != null ? textArea.maxLines : 0;
+        }
+
+        private static SerializedPropertyAttributeInfo[] SerializedFieldAttributes(FieldInfo field)
+        {
+            if (field == null)
+                return new SerializedPropertyAttributeInfo[0];
+
+            return field
+                .GetCustomAttributes(true)
+                .OfType<Attribute>()
+                .Take(32)
+                .Select(SerializedFieldAttributeInfo)
+                .ToArray();
+        }
+
+        private static SerializedPropertyAttributeInfo SerializedFieldAttributeInfo(Attribute attr)
+        {
+            string value = "";
+            RangeAttribute range = attr as RangeAttribute;
+            TooltipAttribute tooltip = attr as TooltipAttribute;
+            HeaderAttribute header = attr as HeaderAttribute;
+            TextAreaAttribute textArea = attr as TextAreaAttribute;
+            MultilineAttribute multiline = attr as MultilineAttribute;
+            MinAttribute min = attr as MinAttribute;
+            if (range != null)
+                value = range.min.ToString(CultureInfo.InvariantCulture) + ".." + range.max.ToString(CultureInfo.InvariantCulture);
+            else if (tooltip != null)
+                value = tooltip.tooltip ?? "";
+            else if (header != null)
+                value = header.header ?? "";
+            else if (textArea != null)
+                value = textArea.minLines.ToString(CultureInfo.InvariantCulture) + ".." + textArea.maxLines.ToString(CultureInfo.InvariantCulture);
+            else if (multiline != null)
+                value = multiline.lines.ToString(CultureInfo.InvariantCulture);
+            else if (min != null)
+                value = min.min.ToString(CultureInfo.InvariantCulture);
+
+            Type type = attr.GetType();
+            return new SerializedPropertyAttributeInfo
+            {
+                type = type.FullName ?? type.Name,
+                displayName = type.Name,
+                value = value
+            };
+        }
+
         private static Type ResolveSerializedPropertyFieldType(SerializedProperty prop)
         {
             if (prop == null || prop.serializedObject == null || prop.serializedObject.targetObject == null)
                 return null;
+
+            Type builtInType = ResolveBuiltInSerializedPropertyFieldType(prop);
+            if (builtInType != null)
+                return builtInType;
 
             Type current = prop.serializedObject.targetObject.GetType();
             string[] parts = (prop.propertyPath ?? "").Replace(".Array.data[", "[").Split('.');
@@ -1110,6 +1510,41 @@ namespace Locus
             return current;
         }
 
+        private static FieldInfo ResolveSerializedPropertyFieldInfo(SerializedProperty prop)
+        {
+            if (prop == null || prop.serializedObject == null || prop.serializedObject.targetObject == null)
+                return null;
+
+            Type current = prop.serializedObject.targetObject.GetType();
+            FieldInfo field = null;
+            string[] parts = (prop.propertyPath ?? "").Replace(".Array.data[", "[").Split('.');
+            for (int i = 0; i < parts.Length; i++)
+            {
+                string part = parts[i];
+                if (string.IsNullOrEmpty(part))
+                    continue;
+
+                int bracket = part.IndexOf('[');
+                string memberName = bracket >= 0 ? part.Substring(0, bracket) : part;
+                if (!string.IsNullOrEmpty(memberName))
+                {
+                    field = SerializedMemberField(current, memberName);
+                    current = field != null ? field.FieldType : SerializedMemberType(current, memberName);
+                }
+                if (current == null)
+                    return field;
+
+                while (bracket >= 0)
+                {
+                    current = SerializedElementType(current);
+                    if (current == null)
+                        return field;
+                    bracket = part.IndexOf('[', bracket + 1);
+                }
+            }
+            return field;
+        }
+
         private static string FieldTypeFullName(Type type)
         {
             return type != null ? type.FullName ?? type.Name ?? "" : "";
@@ -1131,21 +1566,32 @@ namespace Locus
         {
             for (Type current = ownerType; current != null; current = current.BaseType)
             {
-                var field = current.GetField(
-                    memberName,
-                    System.Reflection.BindingFlags.Instance |
-                    System.Reflection.BindingFlags.Public |
-                    System.Reflection.BindingFlags.NonPublic);
+                var field = SerializedMemberField(current, memberName);
                 if (field != null)
                     return field.FieldType;
 
                 var property = current.GetProperty(
                     memberName,
-                    System.Reflection.BindingFlags.Instance |
-                    System.Reflection.BindingFlags.Public |
-                    System.Reflection.BindingFlags.NonPublic);
+                    BindingFlags.Instance |
+                    BindingFlags.Public |
+                    BindingFlags.NonPublic);
                 if (property != null)
                     return property.PropertyType;
+            }
+            return null;
+        }
+
+        private static FieldInfo SerializedMemberField(Type ownerType, string memberName)
+        {
+            for (Type current = ownerType; current != null; current = current.BaseType)
+            {
+                var field = current.GetField(
+                    memberName,
+                    BindingFlags.Instance |
+                    BindingFlags.Public |
+                    BindingFlags.NonPublic);
+                if (field != null)
+                    return field;
             }
             return null;
         }
@@ -1204,6 +1650,13 @@ namespace Locus
             return Locus.Json.LocusJson.Deserialize<T>(string.IsNullOrWhiteSpace(json) ? "{}" : json);
         }
 
+        private static bool JsonObjectHasKey(string json, string key)
+        {
+            string text = json ?? "";
+            string quotedKey = "\"" + key + "\"";
+            return text.IndexOf(quotedKey, StringComparison.Ordinal) >= 0;
+        }
+
         private static string UnescapeJsonString(string value)
         {
             return value
@@ -1234,6 +1687,17 @@ namespace Locus
         }
 
         private static Dictionary<string, object> VectorValue(Vector4 value)
+        {
+            return new Dictionary<string, object>
+            {
+                { "x", value.x },
+                { "y", value.y },
+                { "z", value.z },
+                { "w", value.w }
+            };
+        }
+
+        private static Dictionary<string, object> QuaternionValue(Quaternion value)
         {
             return new Dictionary<string, object>
             {

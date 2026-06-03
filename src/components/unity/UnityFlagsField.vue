@@ -105,8 +105,8 @@ function toggle(option: UnitySelectOption) {
 }
 
 .flag-option.active {
-  border-color: color-mix(in srgb, var(--accent-color) 70%, var(--border-color) 30%);
-  background: color-mix(in srgb, var(--accent-color) 14%, var(--input-bg) 86%);
+  border-color: color-mix(in srgb, var(--text-secondary) 62%, var(--border-color) 38%);
+  background: color-mix(in srgb, var(--text-secondary) 12%, var(--input-bg) 88%);
 }
 
 .flag-option:disabled {
@@ -124,12 +124,13 @@ function toggle(option: UnitySelectOption) {
 .flag-check {
   width: 10px;
   height: 10px;
-  border: 1px solid var(--border-color);
-  border-radius: 3px;
+  border: 1px solid color-mix(in srgb, var(--text-secondary) 46%, var(--panel-bg) 54%);
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--input-bg) 72%, var(--panel-bg) 28%);
 }
 
 .flag-option.active .flag-check {
-  border-color: var(--accent-color);
-  background: var(--accent-color);
+  border-color: color-mix(in srgb, var(--text-secondary) 82%, var(--panel-bg) 18%);
+  background: color-mix(in srgb, var(--text-secondary) 78%, var(--panel-bg) 22%);
 }
 </style>

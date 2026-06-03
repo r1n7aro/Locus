@@ -50,7 +50,7 @@ describe("selection semantics", () => {
     expect(markdownRenderer).toMatch(/\.md-asset-chip\s*\{[\s\S]*?user-select:\s*none;/);
     expect(markdownRenderer).toMatch(/\.md-file-ref\s*\{[\s\S]*?user-select:\s*none;/);
     expect(markdownRenderer).toMatch(/\.md-workspace-ref\s*\{[\s\S]*?user-select:\s*none;/);
-    expect(markdownRenderer).toContain(".markdown-body :is(.md-asset-chip, .md-file-ref, .md-workspace-ref)");
+    expect(markdownRenderer).toContain(".markdown-body :is(.md-asset-chip, .md-file-ref, .md-workspace-ref, .md-unity-object-ref)");
     expect(assetChip).toMatch(/\.asset-chip\s*\{[\s\S]*?user-select:\s*none;/);
   });
 });

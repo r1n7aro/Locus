@@ -1,10 +1,15 @@
 import { describe, expect, it } from "vitest";
 import {
   applyUnityRgbHexToColorText,
+  constrainUnityNumberValue,
+  formatUnityNumberValue,
+  formatUnityQuaternionEulerValue,
   formatUnityVectorValue,
   isUnityNumberPropertyType,
+  isUnityQuaternionPropertyType,
   isUnityVectorPropertyType,
   normalizeUnityOptions,
+  parseUnityQuaternionEulerValue,
   parseUnityColorValue,
   parseUnitySerializedEditValue,
   parseUnityVectorValue,
@@ -30,6 +35,25 @@ describe("unitySerializedValue", () => {
     expect(parseUnityVectorValue("Vector3", "1, 2 3")).toEqual({ x: 1, y: 2, z: 3 });
     expect(formatUnityVectorValue("Vector2", { x: 4, y: 5 })).toBe("4, 5");
     expect(unitySerializedValueToEditText("Vector3", { x: 1, y: 2, z: 3 })).toBe("1, 2, 3");
+  });
+
+  it("edits Quaternion values as Euler angles", () => {
+    expect(isUnityQuaternionPropertyType("Quaternion")).toBe(true);
+    expect(unityVectorKeysForType("Quaternion")).toEqual(["x", "y", "z"]);
+    expect(formatUnityQuaternionEulerValue({ x: 0, y: 0.70710678, z: 0, w: 0.70710678 })).toBe("0, 90, 0");
+    expect(formatUnityQuaternionEulerValue({ x: 0, y: 0, z: 0, w: 1 }, "10, 20, 30")).toBe("10, 20, 30");
+    expect(parseUnityQuaternionEulerValue("10, 20, 30")).toEqual({
+      action: "setEuler",
+      x: 10,
+      y: 20,
+      z: 30,
+    });
+    expect(parseUnitySerializedEditValue("Quaternion", "1 2 3")).toEqual({
+      action: "setEuler",
+      x: 1,
+      y: 2,
+      z: 3,
+    });
   });
 
   it("supports Rect values as structured Unity serialized values", () => {
@@ -64,6 +88,13 @@ describe("unitySerializedValue", () => {
     expect(isUnityNumberPropertyType("ArraySize")).toBe(true);
     expect(isUnityNumberPropertyType("LayerMask")).toBe(true);
     expect(isUnityNumberPropertyType("String")).toBe(false);
+  });
+
+  it("constrains range-marked numeric values like Unity inspectors", () => {
+    expect(constrainUnityNumberValue("Float", 1.5, { hasRange: true, rangeMin: 0, rangeMax: 1 })).toBe(1);
+    expect(constrainUnityNumberValue("Float", -0.25, { hasRange: true, rangeMin: 0, rangeMax: 1 })).toBe(0);
+    expect(constrainUnityNumberValue("Integer", 2.6, { hasRange: true, rangeMin: 0, rangeMax: 10 })).toBe(3);
+    expect(formatUnityNumberValue("Float", 0.1 + 0.2, { hasRange: true, rangeMin: 0, rangeMax: 1 })).toBe("0.3");
   });
 
   it("rejects partial numeric input before committing", () => {

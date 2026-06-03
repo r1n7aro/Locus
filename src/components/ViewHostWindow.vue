@@ -40,6 +40,12 @@ import {
   stopLocusDragPreview,
 } from "../services/unity";
 import {
+  applyUnitySerializedProperties,
+  discoverUnitySerializedProperties,
+  readUnitySerializedProperty,
+  writeUnitySerializedProperty,
+} from "../services/unitySerializedProperty";
+import {
   viewAppendFrontendLog,
   viewAutomationRespond,
   viewBindingApply,
@@ -2382,6 +2388,10 @@ async function loadView(
               viewBindingDiscover({ viewId: next.manifest.id, ...request }),
             bindingWrite: (request) => viewBindingWrite({ viewId: next.manifest.id, ...request }),
             bindingApply: (request) => viewBindingApply({ viewId: next.manifest.id, ...request }),
+            unityPropertyRead: readUnitySerializedProperty,
+            unityPropertyDiscover: discoverUnitySerializedProperties,
+            unityPropertyWrite: writeUnitySerializedProperty,
+            unityPropertyApply: applyUnitySerializedProperties,
             searchAssets: (query, roots, limit) =>
               searchWorkspaceAssets(query, roots?.length ? roots : ["Assets", "Packages"], limit),
             createSession: (request) => createRuntimeSession(request),

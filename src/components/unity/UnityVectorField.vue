@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, reactive, watch } from "vue";
 import {
+  isUnityQuaternionPropertyType,
   parseUnityVectorValue,
   tryParseUnitySerializedEditValue,
   unityVectorKeysForType,
@@ -11,27 +12,31 @@ const props = withDefaults(defineProps<{
   propertyType?: string;
   disabled?: boolean;
   readonly?: boolean;
+  displayValue?: string;
   title?: string;
   ariaLabel?: string;
 }>(), {
   propertyType: "Vector3",
   disabled: false,
   readonly: false,
+  displayValue: "",
   title: "",
   ariaLabel: "",
 });
 
 const emit = defineEmits<{
-  "update:modelValue": [value: Record<string, number>];
+  "update:modelValue": [value: Record<string, number | string>];
   edit: [value: Record<string, string>];
-  commit: [value: Record<string, number>];
+  commit: [value: Record<string, number | string>];
 }>();
 
 const keys = computed(() => unityVectorKeysForType(props.propertyType));
 const parts = reactive<Record<string, string>>({});
 
 function syncParts() {
-  const parsed = tryParseUnitySerializedEditValue(props.propertyType, props.modelValue);
+  const parsed = isUnityQuaternionPropertyType(props.propertyType) && props.displayValue.trim()
+    ? tryParseUnitySerializedEditValue(props.propertyType, props.displayValue)
+    : tryParseUnitySerializedEditValue(props.propertyType, props.modelValue);
   const value = parsed.ok && parsed.value && typeof parsed.value === "object"
     ? parsed.value as Record<string, unknown>
     : {};
@@ -41,7 +46,7 @@ function syncParts() {
 }
 
 watch(
-  () => [props.modelValue, props.propertyType] as const,
+  () => [props.modelValue, props.propertyType, props.displayValue] as const,
   syncParts,
   { immediate: true },
 );
@@ -78,7 +83,12 @@ function blurOnEnter(event: KeyboardEvent) {
 </script>
 
 <template>
-  <div class="unity-vector-field" :title="title || undefined" :aria-label="ariaLabel || undefined">
+  <div
+    class="unity-vector-field"
+    :style="{ '--unity-vector-parts': String(keys.length || 1) }"
+    :title="title || undefined"
+    :aria-label="ariaLabel || undefined"
+  >
     <label v-for="key in keys" :key="key" class="unity-vector-part">
       <span>{{ key }}</span>
       <input
@@ -99,8 +109,9 @@ function blurOnEnter(event: KeyboardEvent) {
 .unity-vector-field {
   width: 100%;
   min-width: 0;
+  min-height: var(--unity-property-row-height, 26px);
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(52px, 1fr));
+  grid-template-columns: repeat(var(--unity-vector-parts, 3), minmax(0, 1fr));
   gap: 4px;
 }
 

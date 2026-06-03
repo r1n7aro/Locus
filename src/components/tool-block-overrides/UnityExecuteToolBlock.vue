@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, ref } from "vue";
+import hljs from "../../hljs";
 import { t } from "../../i18n";
 import {
   formatUnityExecuteProgressPercent,
@@ -48,6 +49,18 @@ function setExpanded(value: boolean) {
 
 function toggleExpanded() {
   setExpanded(!infoExpanded.value);
+}
+
+function escapeHtml(value: string): string {
+  return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function highlightCSharp(code: string): string {
+  try {
+    return hljs.highlight(code, { language: "csharp" }).value;
+  } catch {
+    return escapeHtml(code);
+  }
 }
 
 function expandFromBlockClick(event: MouseEvent) {
@@ -173,7 +186,7 @@ const isFramed = computed(() => infoExpanded.value || showProgressLine.value);
       <template v-if="!showRuntimeOnly">
         <div class="tool-call-section">
           <div class="tool-call-section-label">{{ t("tool.section.args") }}</div>
-          <pre v-if="codeArg" class="tool-call-pre ui-select-text">{{ codeArg }}</pre>
+          <pre v-if="codeArg" class="tool-call-pre ui-select-text hljs" v-html="highlightCSharp(codeArg)"></pre>
           <pre v-else class="tool-call-pre ui-select-text">{{ toolCall.arguments }}</pre>
         </div>
 

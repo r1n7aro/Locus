@@ -1,6 +1,6 @@
 
 <script setup lang="ts">
-import { computed, nextTick, ref, watch } from "vue";
+import { computed, getCurrentInstance, h, nextTick, onBeforeUnmount, ref, render, watch } from "vue";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { Marked } from "marked";
 import { markedHighlight } from "marked-highlight";
@@ -12,7 +12,16 @@ import {
 } from "../composables/markdownImages";
 import { renderHighlightedCodeLines } from "../composables/markdownCodeLines";
 import { normalizeExternalMarkdownHref } from "../composables/markdownExternalLinks";
-import { injectAssetRefs, injectFileRefs, injectViewRefs, injectWorkspaceMentions } from "../composables/markdownInject";
+import {
+  injectAssetRefs,
+  injectFileRefs,
+  injectUnityObjectFenceRefs,
+  injectUnityPropertyFenceRefs,
+  injectViewRefs,
+  injectWorkspaceMentions,
+  isMarkdownUnityObjectFenceLanguage,
+  isMarkdownUnityPropertyFenceLanguage,
+} from "../composables/markdownInject";
 import { normalizeMarkdownForRender } from "../composables/markdownRender";
 import { wrapMarkdownTables } from "../composables/markdownTableHtml";
 import {
@@ -27,14 +36,18 @@ import { normalizeViewError, viewRun, viewTree, type ViewPackageSummary } from "
 import { useNotificationStore } from "../stores/notification";
 import { t } from "../i18n";
 import { resolveLocusViewIcon } from "./icons/locusViewIcons";
+import UnityObjectPreview from "./unity-preview/UnityObjectPreview.vue";
+import UnityPropertyFenceBlock from "./unity/UnityPropertyFenceBlock.vue";
 import type { LocusFileDropRef } from "../services/unity";
 import type { AssetRefAttachment } from "../types";
+import type { UnityObjectPreviewInput, UnityObjectPreviewLevel } from "./unity-preview";
 
 const props = defineProps<{
   content: string;
   cursor?: boolean;
   enableFileRefs?: boolean;
   highlightTerms?: string[];
+  unityPreviewStateScope?: string | null;
 }>();
 
 const emit = defineEmits<{
@@ -44,6 +57,9 @@ const emit = defineEmits<{
 const rootRef = ref<HTMLElement | null>(null);
 const notificationStore = useNotificationStore();
 const viewRefSummaries = ref<ViewPackageSummary[]>([]);
+const appContext = getCurrentInstance()?.appContext ?? null;
+const markdownUnityObjectPreviewHosts = new Set<HTMLElement>();
+const markdownUnityPropertyFenceHosts = new Set<HTMLElement>();
 let markdownViewRefLoadRun = 0;
 
 function escapeHtml(source: string): string {
@@ -143,6 +159,12 @@ const md = new Marked(
     langPrefix: "hljs language-",
     highlight(code: string, lang: string) {
       const normalizedLang = lang.trim().toLowerCase();
+      if (
+        isMarkdownUnityObjectFenceLanguage(normalizedLang)
+        || isMarkdownUnityPropertyFenceLanguage(normalizedLang)
+      ) {
+        return escapeHtml(code);
+      }
       if (normalizedLang === "tree") {
         return renderHighlightedCodeLines(escapeHtml(code), false);
       }
@@ -171,6 +193,8 @@ const renderedHtml = computed(() => {
     let html = md.parse(normalizeMarkdownForRender(props.content)) as string;
     html = prepareMarkdownImages(html);
     html = injectAssetRefs(html);
+    html = injectUnityPropertyFenceRefs(html);
+    html = injectUnityObjectFenceRefs(html);
     html = injectWorkspaceMentions(html);
     html = injectViewRefs(html, {
       openLabel: t("tool.view.open"),
@@ -202,6 +226,160 @@ const renderedHtml = computed(() => {
     return props.content;
   }
 });
+
+function normalizeMarkdownUnityLevel(value?: string): UnityObjectPreviewLevel {
+  switch (value) {
+    case "row":
+    case "thumbnail":
+    case "inspector":
+    case "editor":
+      return value;
+    default:
+      return "inline";
+  }
+}
+
+function markdownUnityLevelForHost(host: HTMLElement): UnityObjectPreviewLevel {
+  const level = normalizeMarkdownUnityLevel(host.dataset.mdUnityLevel);
+  if (host.dataset.mdUnityEditable === "true" && level === "inline") return "row";
+  return level;
+}
+
+function isPassiveMarkdownUnityPreviewLevel(level: UnityObjectPreviewLevel): boolean {
+  return level !== "inline";
+}
+
+function isInsidePassiveMarkdownUnityPreview(target: Element): boolean {
+  return !!target.closest("[data-md-unity-passive='true']");
+}
+
+function markdownUnityObjectModelFromHost(host: HTMLElement): UnityObjectPreviewInput | null {
+  const refKind = host.dataset.mdUnityRefKind;
+  if (refKind === "sceneObject" || host.classList.contains("md-unity-scene-object-ref")) {
+    const scenePath = normalizeUnityRefDatasetPath(host.dataset.scenePath);
+    const objectPath = normalizeUnityRefDatasetPath(host.dataset.sceneObjectPath);
+    if (!scenePath || !objectPath) return null;
+    return {
+      kind: "sceneObject",
+      path: `${scenePath}/${objectPath}`,
+      writable: host.dataset.mdUnityEditable === "true" || undefined,
+    };
+  }
+
+  const assetPath = normalizeUnityRefDatasetPath(host.dataset.assetPath || host.dataset.filePath);
+  if (!assetPath) return null;
+  return {
+    kind: "asset",
+    path: assetPath,
+    writable: host.dataset.mdUnityEditable === "true" || undefined,
+  };
+}
+
+function markdownUnityPreviewStateKeyPart(value: string): string {
+  return encodeURIComponent(value.trim().replace(/\\/g, "/"));
+}
+
+function markdownUnityObjectPreviewStateKey(
+  host: HTMLElement,
+  index: number,
+  model: UnityObjectPreviewInput,
+  level: UnityObjectPreviewLevel,
+): string | undefined {
+  const scope = props.unityPreviewStateScope?.trim();
+  if (!scope) return undefined;
+
+  const refKind = model.kind ?? model.ref?.kind ?? host.dataset.mdUnityRefKind ?? "asset";
+  const path = normalizeUnityRefDatasetPath(model.path ?? model.ref?.path);
+  return [
+    "unity-object-preview",
+    scope,
+    level,
+    String(index),
+    refKind,
+    path.toLowerCase(),
+  ].map(markdownUnityPreviewStateKeyPart).join("|");
+}
+
+function unmountMarkdownUnityObjectPreviews() {
+  for (const host of markdownUnityObjectPreviewHosts) {
+    render(null, host);
+  }
+  markdownUnityObjectPreviewHosts.clear();
+}
+
+function unmountMarkdownUnityPropertyFences() {
+  for (const host of markdownUnityPropertyFenceHosts) {
+    render(null, host);
+  }
+  markdownUnityPropertyFenceHosts.clear();
+}
+
+function mountMarkdownUnityObjectPreviews() {
+  const root = rootRef.value;
+  if (!root) {
+    unmountMarkdownUnityObjectPreviews();
+    return;
+  }
+
+  unmountMarkdownUnityObjectPreviews();
+  const hosts = Array.from(root.querySelectorAll<HTMLElement>("[data-md-unity-object-preview='true']"));
+  for (const [index, host] of hosts.entries()) {
+    const model = markdownUnityObjectModelFromHost(host);
+    if (!model) continue;
+    const level = markdownUnityLevelForHost(host);
+    if (isPassiveMarkdownUnityPreviewLevel(level)) {
+      host.dataset.mdUnityPassive = "true";
+      host.removeAttribute("draggable");
+    }
+
+    const vnode = h(UnityObjectPreview, {
+      model,
+      level,
+      draggable: false,
+      autoLoadPreview: true,
+      previewStateKey: markdownUnityObjectPreviewStateKey(host, index, model, level),
+    });
+    if (appContext) {
+      vnode.appContext = appContext;
+    }
+    host.replaceChildren();
+    render(vnode, host);
+    markdownUnityObjectPreviewHosts.add(host);
+  }
+}
+
+function markdownUnityPropertySourceFromHost(host: HTMLElement): string {
+  return host.querySelector("[data-md-unity-property-source='true']")?.textContent ?? "";
+}
+
+function mountMarkdownUnityPropertyFences() {
+  const root = rootRef.value;
+  if (!root) {
+    unmountMarkdownUnityPropertyFences();
+    return;
+  }
+
+  unmountMarkdownUnityPropertyFences();
+  const hosts = Array.from(root.querySelectorAll<HTMLElement>("[data-md-unity-property-fence='true']"));
+  for (const host of hosts) {
+    const source = markdownUnityPropertySourceFromHost(host);
+    if (!source.trim()) continue;
+
+    const vnode = h(UnityPropertyFenceBlock, { source });
+    if (appContext) {
+      vnode.appContext = appContext;
+    }
+    host.replaceChildren();
+    render(vnode, host);
+    markdownUnityPropertyFenceHosts.add(host);
+  }
+}
+
+function refreshMarkdownEnhancements() {
+  mountMarkdownUnityPropertyFences();
+  mountMarkdownUnityObjectPreviews();
+  void resolveMarkdownImages();
+}
 
 interface ResolvedMarkdownImage {
   url: string;
@@ -290,10 +468,16 @@ async function resolveMarkdownImages() {
 watch(
   renderedHtml,
   () => {
-    void nextTick(resolveMarkdownImages);
+    void nextTick(refreshMarkdownEnhancements);
   },
   { immediate: true, flush: "post" },
 );
+
+onBeforeUnmount(() => {
+  markdownImageResolveRun++;
+  unmountMarkdownUnityPropertyFences();
+  unmountMarkdownUnityObjectPreviews();
+});
 
 function isHandledMarkdownMouseButton(event: MouseEvent): boolean {
   return event.button === 0 || event.button === 1;
@@ -439,6 +623,8 @@ function normalizeUnityRefDatasetPath(value?: string): string {
 }
 
 function unityRefFromMarkdownDragTarget(target: Element): AssetRefAttachment | null {
+  if (isInsidePassiveMarkdownUnityPreview(target)) return null;
+
   const sceneRef = target.closest(".md-unity-scene-object-ref") as HTMLElement | null;
   if (sceneRef) {
     const scenePath = normalizeUnityRefDatasetPath(sceneRef.dataset.scenePath);
@@ -468,6 +654,8 @@ function unityRefFromMarkdownDragTarget(target: Element): AssetRefAttachment | n
 }
 
 function localFileFromMarkdownDragTarget(target: Element): LocusFileDropRef | null {
+  if (isInsidePassiveMarkdownUnityPreview(target)) return null;
+
   const workspaceRef = target.closest(".md-workspace-ref[data-workspace-path]") as HTMLElement | null;
   if (workspaceRef) {
     const path = normalizeUnityRefDatasetPath(workspaceRef.dataset.workspacePath);
@@ -1000,6 +1188,46 @@ function handleMarkdownPointerDown(event: PointerEvent) {
   color: color-mix(in srgb, var(--text-color) 90%, var(--text-secondary) 10%);
 }
 
+.md-unity-object-ref {
+  max-width: 100%;
+}
+
+.md-unity-object-ref[data-md-unity-object-preview="true"] {
+  padding: 1px 6px 1px 5px;
+}
+
+.md-unity-object-ref[data-md-unity-level="row"],
+.md-unity-object-ref[data-md-unity-level="thumbnail"],
+.md-unity-object-ref[data-md-unity-level="inspector"],
+.md-unity-object-ref[data-md-unity-level="editor"] {
+  display: block;
+  width: min(560px, 100%);
+  min-height: 0;
+  margin: 4px 0 12px;
+  padding: 0;
+  line-height: normal;
+  vertical-align: baseline;
+}
+
+.md-unity-object-ref[data-md-unity-level="thumbnail"] {
+  width: min(420px, 100%);
+}
+
+.md-unity-object-ref[data-md-unity-level="inspector"],
+.md-unity-object-ref[data-md-unity-level="editor"] {
+  width: min(720px, 100%);
+}
+
+.md-unity-object-ref[data-md-unity-level="row"] .unity-object-identity {
+  min-height: 30px;
+}
+
+.md-unity-object-ref[data-md-unity-level="thumbnail"] .unity-object-preview,
+.md-unity-object-ref[data-md-unity-level="inspector"] .unity-object-preview,
+.md-unity-object-ref[data-md-unity-level="editor"] .unity-object-editor-panel {
+  width: 100%;
+}
+
 .md-workspace-ref {
   display: inline-flex;
   align-items: center;
@@ -1021,7 +1249,7 @@ function handleMarkdownPointerDown(event: PointerEvent) {
   -webkit-user-select: none;
 }
 
-.markdown-body :is(.md-asset-chip, .md-file-ref, .md-workspace-ref) {
+.markdown-body :is(.md-asset-chip, .md-file-ref, .md-workspace-ref, .md-unity-object-ref) {
   user-select: none;
   -webkit-user-select: none;
 }
@@ -1039,6 +1267,21 @@ function handleMarkdownPointerDown(event: PointerEvent) {
 .md-unity-scene-object-ref:active {
   background: color-mix(in srgb, var(--accent-color) 5%, var(--hover-bg) 95%);
   border-color: color-mix(in srgb, var(--accent-color) 18%, var(--border-strong) 82%);
+}
+
+.md-unity-object-ref[data-md-unity-level="thumbnail"],
+.md-unity-object-ref[data-md-unity-level="inspector"],
+.md-unity-object-ref[data-md-unity-level="editor"],
+.md-unity-object-ref[data-md-unity-level="thumbnail"]:hover,
+.md-unity-object-ref[data-md-unity-level="inspector"]:hover,
+.md-unity-object-ref[data-md-unity-level="editor"]:hover {
+  border: none;
+  background: transparent;
+  color: var(--text-color);
+}
+
+.md-unity-object-ref[data-md-unity-passive="true"] {
+  cursor: default;
 }
 
 .md-workspace-ref:hover {

@@ -31,6 +31,16 @@ const props = withDefaults(defineProps<{
   placeholder?: string;
   title?: string;
   ariaLabel?: string;
+  tooltip?: string;
+  hasRange?: boolean;
+  rangeMin?: number;
+  rangeMax?: number;
+  numberStep?: number;
+  multiline?: boolean;
+  minLines?: number;
+  maxLines?: number;
+  referenceTypeFullName?: string;
+  referenceTypeAssembly?: string;
 }>(), {
   propertyType: "String",
   displayValue: "",
@@ -44,11 +54,22 @@ const props = withDefaults(defineProps<{
   placeholder: "",
   title: "",
   ariaLabel: "",
+  tooltip: "",
+  hasRange: false,
+  rangeMin: 0,
+  rangeMax: 0,
+  numberStep: 0,
+  multiline: false,
+  minLines: 0,
+  maxLines: 0,
+  referenceTypeFullName: "",
+  referenceTypeAssembly: "",
 });
 
 const emit = defineEmits<{
   "update:modelValue": [value: unknown];
   edit: [value: unknown];
+  preview: [value: unknown];
   commit: [value: unknown];
 }>();
 
@@ -57,6 +78,12 @@ const text = ref(unitySerializedValueToEditText(props.propertyType, props.modelV
 const propertyType = computed(() => normalizeUnityPropertyType(props.propertyType));
 const disabled = computed(() => props.disabled || !props.editable);
 const readonly = computed(() => props.readonly || !props.editable);
+const effectiveTitle = computed(() => props.tooltip || props.title);
+const objectReferencePlaceholder = computed(() => {
+  if (props.placeholder) return props.placeholder;
+  if (props.referenceTypeFullName) return props.referenceTypeFullName;
+  return "Assets/...";
+});
 
 watch(
   () => [props.modelValue, props.propertyType, props.displayValue] as const,
@@ -78,8 +105,13 @@ function emitCommit(value: unknown) {
   emit("commit", value);
 }
 
+function emitPreview(value: unknown) {
+  emit("update:modelValue", value);
+  emit("preview", value);
+}
+
 function updateText(event: Event) {
-  const target = event.target as HTMLInputElement | null;
+  const target = event.target as HTMLInputElement | HTMLTextAreaElement | null;
   text.value = target?.value ?? "";
   emit("edit", text.value);
   emit("update:modelValue", text.value);
@@ -102,7 +134,7 @@ function blurOnEnter(event: KeyboardEvent) {
       :model-value="modelValue"
       :disabled="disabled"
       :readonly="readonly"
-      :title="title"
+      :title="effectiveTitle"
       :aria-label="ariaLabel"
       @update:model-value="emitUpdate"
       @commit="emitCommit"
@@ -114,7 +146,7 @@ function blurOnEnter(event: KeyboardEvent) {
       :enum-value-index="enumValueIndex"
       :disabled="disabled"
       :readonly="readonly"
-      :title="title"
+      :title="effectiveTitle"
       :aria-label="ariaLabel"
       @update:model-value="emitUpdate"
       @commit="emitCommit"
@@ -126,7 +158,7 @@ function blurOnEnter(event: KeyboardEvent) {
       :enum-value-flag="enumValueFlag"
       :disabled="disabled"
       :readonly="readonly"
-      :title="title"
+      :title="effectiveTitle"
       :aria-label="ariaLabel"
       @update:model-value="emitUpdate"
       @commit="emitCommit"
@@ -137,10 +169,11 @@ function blurOnEnter(event: KeyboardEvent) {
       :disabled="disabled"
       :readonly="readonly"
       :placeholder="placeholder"
-      :title="title"
+      :title="effectiveTitle"
       :aria-label="ariaLabel"
       @update:model-value="emitUpdate"
       @edit="emitEdit"
+      @preview="emitPreview"
       @commit="emitCommit"
     />
     <UnityNumberField
@@ -150,8 +183,12 @@ function blurOnEnter(event: KeyboardEvent) {
       :disabled="disabled"
       :readonly="readonly"
       :placeholder="placeholder"
-      :title="title"
+      :title="effectiveTitle"
       :aria-label="ariaLabel"
+      :has-range="hasRange"
+      :range-min="rangeMin"
+      :range-max="rangeMax"
+      :number-step="numberStep"
       @update:model-value="emitUpdate"
       @edit="emitEdit"
       @commit="emitCommit"
@@ -162,7 +199,8 @@ function blurOnEnter(event: KeyboardEvent) {
       :property-type="propertyType"
       :disabled="disabled"
       :readonly="readonly"
-      :title="title"
+      :display-value="displayValue"
+      :title="effectiveTitle"
       :aria-label="ariaLabel"
       @update:model-value="emitUpdate"
       @edit="emitEdit"
@@ -173,7 +211,7 @@ function blurOnEnter(event: KeyboardEvent) {
       :model-value="modelValue"
       :disabled="disabled"
       :readonly="readonly"
-      :title="title"
+      :title="effectiveTitle"
       :aria-label="ariaLabel"
       @update:model-value="emitUpdate"
       @edit="emitEdit"
@@ -185,12 +223,28 @@ function blurOnEnter(event: KeyboardEvent) {
       :display-value="displayValue"
       :disabled="disabled"
       :readonly="readonly"
-      :placeholder="placeholder || 'Assets/...'"
-      :title="title"
+      :placeholder="objectReferencePlaceholder"
+      :title="effectiveTitle"
       :aria-label="ariaLabel"
+      :reference-type-full-name="referenceTypeFullName"
+      :reference-type-assembly="referenceTypeAssembly"
       @update:model-value="emitUpdate"
       @edit="emitEdit"
       @commit="emitCommit"
+    />
+    <textarea
+      v-else-if="propertyType === 'String' && multiline"
+      class="unity-text-field unity-text-area"
+      :value="text"
+      :disabled="disabled"
+      :readonly="readonly"
+      :placeholder="placeholder"
+      :rows="Math.max(2, minLines || 3)"
+      :style="{ maxHeight: maxLines > 0 ? `${Math.max(maxLines, minLines || 3) * 20}px` : undefined }"
+      :title="effectiveTitle || undefined"
+      :aria-label="ariaLabel || undefined"
+      @input="updateText"
+      @change="commitText"
     />
     <input
       v-else
@@ -200,7 +254,7 @@ function blurOnEnter(event: KeyboardEvent) {
       :disabled="disabled"
       :readonly="readonly"
       :placeholder="placeholder"
-      :title="title || undefined"
+      :title="effectiveTitle || undefined"
       :aria-label="ariaLabel || undefined"
       @input="updateText"
       @change="commitText"
@@ -213,6 +267,7 @@ function blurOnEnter(event: KeyboardEvent) {
 .unity-property-editor {
   width: 100%;
   min-width: 0;
+  min-height: var(--unity-property-row-height, 26px);
   display: flex;
   align-items: center;
 }
@@ -237,6 +292,14 @@ function blurOnEnter(event: KeyboardEvent) {
 .unity-text-field:focus {
   outline: none;
   border-color: var(--accent-color);
+}
+
+.unity-text-area {
+  min-height: 56px;
+  padding-top: 5px;
+  padding-bottom: 5px;
+  line-height: 1.4;
+  resize: vertical;
 }
 
 .unity-text-field:disabled,

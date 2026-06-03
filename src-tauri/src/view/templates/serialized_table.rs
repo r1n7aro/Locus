@@ -114,6 +114,8 @@ interface SerializedCell {
   valueType: string;
   fieldTypeFullName: string;
   fieldTypeAssembly: string;
+  referenceTypeFullName: string;
+  referenceTypeAssembly: string;
   value: unknown;
   displayValue: string;
   editable: boolean;
@@ -850,6 +852,8 @@ onBeforeUnmount(() => {
                     :is-flags-enum="cell.isFlagsEnum"
                     :enum-value-index="cell.enumValueIndex"
                     :enum-value-flag="cell.enumValueFlag"
+                    :reference-type-full-name="cell.referenceTypeFullName"
+                    :reference-type-assembly="cell.referenceTypeAssembly"
                     :title="cell.propertyPath"
                     @commit="commitCell(row, cell, $event)"
                   />
@@ -1351,6 +1355,8 @@ public static class SerializedTableApi
         public string valueType;
         public string fieldTypeFullName;
         public string fieldTypeAssembly;
+        public string referenceTypeFullName;
+        public string referenceTypeAssembly;
         public object value;
         public string displayValue;
         public bool editable;
@@ -1529,6 +1535,8 @@ public static class SerializedTableApi
             valueType = snapshot.valueType,
             fieldTypeFullName = snapshot.fieldTypeFullName,
             fieldTypeAssembly = snapshot.fieldTypeAssembly,
+            referenceTypeFullName = snapshot.referenceTypeFullName,
+            referenceTypeAssembly = snapshot.referenceTypeAssembly,
             value = snapshot.value,
             displayValue = snapshot.displayValue,
             editable = writable,
@@ -1565,6 +1573,8 @@ public static class SerializedTableApi
             valueType = "Error",
             fieldTypeFullName = "",
             fieldTypeAssembly = "",
+            referenceTypeFullName = "",
+            referenceTypeAssembly = "",
             value = null,
             displayValue = "",
             editable = false,
