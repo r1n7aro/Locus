@@ -1,9 +1,9 @@
 ---
 title: "Latest Version"
-description: "Locus v0.3.1 (2026-06-04)"
+description: "Locus v0.3.2 (2026-06-07)"
 sidebarTitle: "Latest Version"
-version: "0.3.1"
-releasedAt: "2026-06-04"
+version: "0.3.2"
+releasedAt: "2026-06-07"
 channel: "stable"
 updateTitle: "Update available"
 changelogUrl: "/en/overview/latest-version"
@@ -11,12 +11,30 @@ changelogUrl: "/en/overview/latest-version"
 
 ## Download
 
-- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.3.1/locus_0.3.1_x64-setup.exe)
-- [Windows x64 (system Python/Git)](https://github.com/r1n7aro/Locus/releases/download/v0.3.1/locus_0.3.1_x64-without_embed_python_git-setup.exe)
+- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.3.2/locus_0.3.2_x64-setup.exe)
+- [Windows x64 (system Python/Git)](https://github.com/r1n7aro/Locus/releases/download/v0.3.2/locus_0.3.2_x64-without_embed_python_git-setup.exe)
 - [GitHub Releases](https://github.com/r1n7aro/Locus/releases)
 
 ## Changes
 
+### Added
+
+- Added Unity object previews and property editors for assets, scene objects, prefab objects, and object references.
+- Added Unity asset object indexing so search and object-reference pickers can match sub-assets, ScriptableObject types, components, and file IDs.
+- Added View Runtime API versioning, exported runtime source files, and expanded `property`, `fs`, `path`, drawer, and object-reference picker APIs.
+- Added active chat runtime snapshot restoration when switching or reopening sessions.
+- Added Markdown rendering for workspace path checks, Unity object references, and Unity property fences.
+- Added targeted section replacements for knowledge documents and filtered automatic recall by recall eligibility.
+
 ### Fixed
 
-- Reduced chat streaming overhead by building trace snapshots only when tool-collapse tracing is enabled.
+- Fixed Unicode path handling for Unity drag/drop and unrelated local file drops.
+- Scoped debug trace flags to session storage.
+- Prevented compacted tool output from being double-counted.
+- Hardened knowledge query/edit errors and Skill package loading.
+- Reduced hover diff preview chrome and guarded Windows corner preference.
+- Clarified Unity property fence targets and quantized serialized number drags.
+
+### Removed
+
+- Replaced the legacy View binding tool surface with `view_property_*` tools.

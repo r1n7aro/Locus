@@ -1,9 +1,9 @@
 ---
 title: "当前版本"
-description: "Locus v0.3.1 (2026-06-04)"
+description: "Locus v0.3.2 (2026-06-07)"
 sidebarTitle: "当前版本"
-version: "0.3.1"
-releasedAt: "2026-06-04"
+version: "0.3.2"
+releasedAt: "2026-06-07"
 channel: "stable"
 updateTitle: "发现新版本"
 changelogUrl: "/overview/latest-version"
@@ -11,12 +11,30 @@ changelogUrl: "/overview/latest-version"
 
 ## 下载
 
-- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.3.1/locus_0.3.1_x64-setup.exe)
-- [Windows x64（系统 Python/Git）](https://github.com/r1n7aro/Locus/releases/download/v0.3.1/locus_0.3.1_x64-without_embed_python_git-setup.exe)
+- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.3.2/locus_0.3.2_x64-setup.exe)
+- [Windows x64（系统 Python/Git）](https://github.com/r1n7aro/Locus/releases/download/v0.3.2/locus_0.3.2_x64-without_embed_python_git-setup.exe)
 - [GitHub Releases](https://github.com/r1n7aro/Locus/releases)
 
 ## 变更列表
 
+### 新增
+
+- 新增 Unity 对象预览与属性编辑能力，覆盖资产、场景对象、Prefab 对象和对象引用。
+- 新增 Unity 资产对象索引，资产搜索和对象引用选择器可以匹配 sub-asset、ScriptableObject 类型、组件和 file ID。
+- 新增 View Runtime API 版本化、运行时源码导出，以及 `property`、`fs`、`path`、drawer、对象引用选择器等 API。
+- 新增活跃聊天运行态快照恢复，切换或重新打开会话时保留运行中状态。
+- 新增 Markdown 中的工作区路径检测、Unity 对象引用和 Unity property fence 渲染。
+- 新增知识文档分段精确替换，并按可召回状态过滤自动注入候选。
+
 ### 修复
 
-- 降低聊天流式处理开销，工具折叠 trace 启用时才构造 trace 快照。
+- 修复 Unity 拖放和本地文件拖放中的 Unicode 路径处理。
+- 将调试 trace 开关限定到 session storage。
+- 修复压缩后的 tool output 重复计数。
+- 加固知识查询、知识编辑和 Skill package 加载错误处理。
+- 收敛 hover diff preview 外观，并保护 Windows 圆角偏好设置。
+- 明确 Unity property fence 目标解析，并量化序列化数字拖拽。
+
+### 移除
+
+- 将旧的 View binding 工具面切换为 `view_property_*` 工具面。

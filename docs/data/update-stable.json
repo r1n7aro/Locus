@@ -1,12 +1,12 @@
 {
-  "version": "0.3.1",
-  "releasedAt": "2026-06-04",
+  "version": "0.3.2",
+  "releasedAt": "2026-06-07",
   "channel": "stable",
   "installers": [
     {
       "id": "windows-x64",
       "label": "Windows x64",
-      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.3.1/locus_0.3.1_x64-setup.exe",
+      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.3.2/locus_0.3.2_x64-setup.exe",
       "platform": "windows",
       "arch": "x64",
       "includesManagedPython": true,
@@ -17,7 +17,7 @@
     {
       "id": "windows-x64-without-embed-python-git",
       "label": "Windows x64 - system Python/Git",
-      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.3.1/locus_0.3.1_x64-without_embed_python_git-setup.exe",
+      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.3.2/locus_0.3.2_x64-without_embed_python_git-setup.exe",
       "platform": "windows",
       "arch": "x64",
       "includesManagedPython": false,
@@ -29,24 +29,46 @@
   "locales": {
     "zh": {
       "title": "发现新版本",
-      "summary": "Locus v0.3.1 (2026-06-04)",
+      "summary": "Locus v0.3.2 (2026-06-07)",
       "changelogUrl": "/overview/latest-version",
       "changes": [
         {
+          "title": "新增",
+          "items": [
+            "新增 Unity 对象预览与属性编辑能力，覆盖资产、场景对象、Prefab 对象和对象引用。",
+            "新增 Unity 资产对象索引，资产搜索和对象引用选择器可以匹配 sub-asset、ScriptableObject 类型、组件和 file ID。",
+            "新增 View Runtime API 版本化、运行时源码导出，以及 `property`、`fs`、`path`、drawer、对象引用选择器等 API。",
+            "新增活跃聊天运行态快照恢复，切换或重新打开会话时保留运行中状态。",
+            "新增 Markdown 中的工作区路径检测、Unity 对象引用和 Unity property fence 渲染。",
+            "新增知识文档分段精确替换，并按可召回状态过滤自动注入候选。"
+          ]
+        },
+        {
           "title": "修复",
           "items": [
-            "降低聊天流式处理开销，工具折叠 trace 启用时才构造 trace 快照。"
+            "修复 Unity 拖放和本地文件拖放中的 Unicode 路径处理。",
+            "将调试 trace 开关限定到 session storage。",
+            "修复压缩后的 tool output 重复计数。",
+            "加固知识查询、知识编辑和 Skill package 加载错误处理。",
+            "收敛 hover diff preview 外观，并保护 Windows 圆角偏好设置。",
+            "明确 Unity property fence 目标解析，并量化序列化数字拖拽。"
+          ]
+        },
+        {
+          "title": "移除",
+          "items": [
+            "将旧的 View binding 工具面切换为 `view_property_*` 工具面。"
           ]
         }
       ],
       "downloadChannels": [
         {
           "label": "Windows x64",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.3.1/locus_0.3.1_x64-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.3.2/locus_0.3.2_x64-setup.exe"
         },
         {
           "label": "Windows x64（系统 Python/Git）",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.3.1/locus_0.3.1_x64-without_embed_python_git-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.3.2/locus_0.3.2_x64-without_embed_python_git-setup.exe"
         },
         {
           "label": "GitHub Releases",
@@ -56,24 +78,46 @@
     },
     "en": {
       "title": "Update available",
-      "summary": "Locus v0.3.1 (2026-06-04)",
+      "summary": "Locus v0.3.2 (2026-06-07)",
       "changelogUrl": "/en/overview/latest-version",
       "changes": [
         {
+          "title": "Added",
+          "items": [
+            "Added Unity object previews and property editors for assets, scene objects, prefab objects, and object references.",
+            "Added Unity asset object indexing so search and object-reference pickers can match sub-assets, ScriptableObject types, components, and file IDs.",
+            "Added View Runtime API versioning, exported runtime source files, and expanded `property`, `fs`, `path`, drawer, and object-reference picker APIs.",
+            "Added active chat runtime snapshot restoration when switching or reopening sessions.",
+            "Added Markdown rendering for workspace path checks, Unity object references, and Unity property fences.",
+            "Added targeted section replacements for knowledge documents and filtered automatic recall by recall eligibility."
+          ]
+        },
+        {
           "title": "Fixed",
           "items": [
-            "Reduced chat streaming overhead by building trace snapshots only when tool-collapse tracing is enabled."
+            "Fixed Unicode path handling for Unity drag/drop and unrelated local file drops.",
+            "Scoped debug trace flags to session storage.",
+            "Prevented compacted tool output from being double-counted.",
+            "Hardened knowledge query/edit errors and Skill package loading.",
+            "Reduced hover diff preview chrome and guarded Windows corner preference.",
+            "Clarified Unity property fence targets and quantized serialized number drags."
+          ]
+        },
+        {
+          "title": "Removed",
+          "items": [
+            "Replaced the legacy View binding tool surface with `view_property_*` tools."
           ]
         }
       ],
       "downloadChannels": [
         {
           "label": "Windows x64",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.3.1/locus_0.3.1_x64-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.3.2/locus_0.3.2_x64-setup.exe"
         },
         {
           "label": "Windows x64 (system Python/Git)",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.3.1/locus_0.3.1_x64-without_embed_python_git-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.3.2/locus_0.3.2_x64-without_embed_python_git-setup.exe"
         },
         {
           "label": "GitHub Releases",
