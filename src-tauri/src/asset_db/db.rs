@@ -2350,8 +2350,7 @@ pub fn search_assets(
          WHERE searchable = 1 AND {}
          ORDER BY path, sort_index, name
          LIMIT ? OFFSET ?",
-        ASSET_OBJECT_SELECT_COLUMNS,
-        where_sql
+        ASSET_OBJECT_SELECT_COLUMNS, where_sql
     );
 
     // Reuse the same params and append limit/offset.
@@ -2478,8 +2477,11 @@ pub fn delete_missing_asset_path(conn: &mut Connection, asset_path: &str) -> Res
             params![g],
         )
         .map_err(|e| format!("Failed to delete asset object type terms: {}", e))?;
-        tx.execute("DELETE FROM asset_objects WHERE asset_guid = ?1", params![g])
-            .map_err(|e| format!("Failed to delete asset objects: {}", e))?;
+        tx.execute(
+            "DELETE FROM asset_objects WHERE asset_guid = ?1",
+            params![g],
+        )
+        .map_err(|e| format!("Failed to delete asset objects: {}", e))?;
         tx.execute("DELETE FROM files WHERE owner_guid = ?1", params![g])
             .map_err(|e| format!("Failed to delete files: {}", e))?;
         tx.execute("DELETE FROM assets WHERE guid = ?1", params![g])
@@ -3014,13 +3016,9 @@ mod tests {
         assert_eq!(row.tp.as_deref(), Some("CureEventChannel(genericAsset)"));
         assert_eq!(row.file_id.as_deref(), Some("11400000"));
 
-        let rows = search_assets_for_command(
-            &conn,
-            "cure t:CureEventChannel",
-            &[AssetRoot::Assets],
-            20,
-        )
-        .unwrap();
+        let rows =
+            search_assets_for_command(&conn, "cure t:CureEventChannel", &[AssetRoot::Assets], 20)
+                .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].file_id, Some(11400000));
         assert_eq!(rows[0].name, "Cure Event");
@@ -3030,7 +3028,11 @@ mod tests {
     fn direct_object_ref_queries_match_guid_and_file_id() {
         let mut conn = Connection::open_in_memory().unwrap();
         let src = test_asset("Assets/Scenes/Main.prefab", AssetKind::Prefab, "");
-        let dst = test_asset("Assets/Data/EventChannels.asset", AssetKind::GenericAsset, "");
+        let dst = test_asset(
+            "Assets/Data/EventChannels.asset",
+            AssetKind::GenericAsset,
+            "",
+        );
         seed_assets(&mut conn, &[src.clone(), dst.clone()]);
         let tx = conn.transaction().unwrap();
         batch_insert_edges(
@@ -3060,11 +3062,9 @@ mod tests {
                 .len(),
             1
         );
-        assert!(
-            get_direct_refs_for_object(&conn, &dst.guid, 11400001)
-                .unwrap()
-                .is_empty()
-        );
+        assert!(get_direct_refs_for_object(&conn, &dst.guid, 11400001)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

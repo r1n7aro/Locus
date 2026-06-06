@@ -2021,7 +2021,11 @@ fn label_for_doc(
 }
 
 fn yaml_structured_preview_doc_should_include(rel_path: &str, doc: &YamlDoc) -> bool {
-    let ext = rel_path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    let ext = rel_path
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
     if ext == "playable" && doc.doc_index > 0 {
         return false;
     }
@@ -2444,7 +2448,10 @@ pub async fn preview_workspace_asset_thumbnail(
     if !asset_rel_path.to_ascii_lowercase().ends_with(".prefab") {
         return Err(AppError::new(
             "asset.thumbnail.unsupported",
-            format!("Asset thumbnail only supports prefab paths: {}", asset_rel_path),
+            format!(
+                "Asset thumbnail only supports prefab paths: {}",
+                asset_rel_path
+            ),
         ));
     }
 
@@ -2478,13 +2485,19 @@ fn asset_preview_frame_cache_key(asset_rel_path: &str) -> String {
         .to_string()
 }
 
-fn asset_preview_frame_cache_paths(workspace_root: &Path, asset_rel_path: &str) -> (PathBuf, PathBuf) {
+fn asset_preview_frame_cache_paths(
+    workspace_root: &Path,
+    asset_rel_path: &str,
+) -> (PathBuf, PathBuf) {
     let key = asset_preview_frame_cache_key(asset_rel_path);
     let dir = workspace_root
         .join("Library")
         .join("Locus")
         .join(ASSET_PREVIEW_FRAME_CACHE_DIR);
-    (dir.join(format!("{}.png", key)), dir.join(format!("{}.json", key)))
+    (
+        dir.join(format!("{}.png", key)),
+        dir.join(format!("{}.json", key)),
+    )
 }
 
 fn source_mtime_ms(path: &Path) -> Result<u64, AppError> {
@@ -2518,7 +2531,10 @@ fn decode_preview_frame_data_url(url: &str) -> Result<(String, Vec<u8>), AppErro
     if mime_type != "image/png" {
         return Err(AppError::new(
             "asset.preview_frame_cache.unsupported_mime",
-            format!("Preview frame cache only accepts image/png, got {}", mime_type),
+            format!(
+                "Preview frame cache only accepts image/png, got {}",
+                mime_type
+            ),
         ));
     }
     let bytes = base64::engine::general_purpose::STANDARD
@@ -2654,7 +2670,10 @@ pub async fn cache_workspace_asset_preview_frame(
     let meta_json = serde_json::to_vec_pretty(&meta).map_err(|error| {
         AppError::new(
             "asset.preview_frame_cache.serialize",
-            format!("Failed to serialize preview frame cache metadata: {}", error),
+            format!(
+                "Failed to serialize preview frame cache metadata: {}",
+                error
+            ),
         )
     })?;
     std::fs::write(&meta_path, meta_json).map_err(|error| {

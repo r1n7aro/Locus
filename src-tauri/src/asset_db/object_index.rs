@@ -368,10 +368,7 @@ fn parse_legacy_file_id_to_recycle_name(importer: &Value, entries: &mut Vec<Impo
         let Some(file_id) = parse_yaml_int(k) else {
             continue;
         };
-        let name = v
-            .as_str()
-            .map(normalize_importer_name)
-            .unwrap_or_default();
+        let name = v.as_str().map(normalize_importer_name).unwrap_or_default();
         let class_id =
             crate::diff::semantic::model_meta::legacy_class_id_from_short_file_id(file_id);
         entries.push(ImporterSubAsset {
@@ -430,7 +427,12 @@ fn class_aliases(class_id: i32) -> Vec<&'static str> {
             "mixer",
         ],
         244 => vec!["audiomixereffect", "audio_mixer_effect", "mixer"],
-        245 => vec!["audiomixersnapshot", "audio_mixer_snapshot", "snapshot", "mixer"],
+        245 => vec![
+            "audiomixersnapshot",
+            "audio_mixer_snapshot",
+            "snapshot",
+            "mixer",
+        ],
         1001 => vec!["prefabinstance", "prefab"],
         114 => vec!["monobehaviour", "component", "script"],
         213 => vec!["sprite", "texture"],
@@ -575,7 +577,13 @@ mod tests {
             true,
         );
         let docs = vec![
-            yaml_doc(24100000, 241, "AudioMixerController", Some("DefaultAudioMixer"), 0),
+            yaml_doc(
+                24100000,
+                241,
+                "AudioMixerController",
+                Some("DefaultAudioMixer"),
+                0,
+            ),
             yaml_doc(
                 -2919845427630868010,
                 243,
@@ -610,7 +618,10 @@ mod tests {
         assert_eq!(objects[1].type_name, "AudioMixerGroupController");
         assert!(objects[1].type_search.contains("audiomixergroup"));
         assert!(objects[2].type_search.contains("audiomixersnapshot"));
-        assert_eq!(objects[1].target_id.as_deref(), Some("doc:-2919845427630868010"));
+        assert_eq!(
+            objects[1].target_id.as_deref(),
+            Some("doc:-2919845427630868010")
+        );
     }
 
     #[test]
@@ -622,8 +633,20 @@ mod tests {
         );
         let docs = vec![
             yaml_doc(11400000, 114, "MonoBehaviour", Some("FarmingAnimation"), 0),
-            yaml_doc(-571814945566941427, 114, "MonoBehaviour", Some("Animation Track"), 1),
-            yaml_doc(-8784712527854523363, 114, "MonoBehaviour", Some("AnimationPlayableAsset"), 2),
+            yaml_doc(
+                -571814945566941427,
+                114,
+                "MonoBehaviour",
+                Some("Animation Track"),
+                1,
+            ),
+            yaml_doc(
+                -8784712527854523363,
+                114,
+                "MonoBehaviour",
+                Some("AnimationPlayableAsset"),
+                2,
+            ),
         ];
 
         let objects = build_yaml_asset_objects(&asset, &docs, |_| None);

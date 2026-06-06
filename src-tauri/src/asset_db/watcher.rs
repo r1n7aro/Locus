@@ -1163,14 +1163,14 @@ fn process_dirty_asset(
             &node,
             docs,
             |script_guid| {
-                script_type_by_guid.get(script_guid).map(|meta| {
-                    object_index::ScriptTypeInfo {
+                script_type_by_guid
+                    .get(script_guid)
+                    .map(|meta| object_index::ScriptTypeInfo {
                         class_name: meta.class_name.clone(),
                         class_name_lower: meta.class_name_lower.clone(),
                         full_name_lower: meta.full_name_lower.clone(),
                         type_search_lower: meta.type_search_lower.clone(),
-                    }
-                })
+                    })
             },
         ));
     }

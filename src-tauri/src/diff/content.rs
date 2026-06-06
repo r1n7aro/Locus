@@ -589,10 +589,8 @@ pub(crate) fn lang_from_path(path: &str) -> Option<String> {
         "py" => Some("python".into()),
         "yaml" | "yml" | "unity" | "prefab" | "mat" | "asset" | "controller" | "anim"
         | "overridecontroller" | "mixer" | "physicmaterial" | "physicsmaterial2d" | "flare"
-        | "mask" | "fontsettings" | "preset" | "lighting" | "terrainlayer"
-        | "rendertexture" | "signal" | "playable" | "cubemap" | "guiskin" | "brush" => {
-            Some("yaml".into())
-        }
+        | "mask" | "fontsettings" | "preset" | "lighting" | "terrainlayer" | "rendertexture"
+        | "signal" | "playable" | "cubemap" | "guiskin" | "brush" => Some("yaml".into()),
         "sh" | "bash" | "zsh" => Some("bash".into()),
         "md" | "markdown" => Some("markdown".into()),
         "toml" => Some("ini".into()),

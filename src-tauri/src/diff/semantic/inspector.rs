@@ -1396,7 +1396,13 @@ mod tests {
 
         let entries = collect_hierarchy_entries(&roots, &docs_by_id);
 
-        assert_eq!(entries.get(&2).map(|entry| entry.path.as_str()), Some("Root/Enemy[1]"));
-        assert_eq!(entries.get(&3).map(|entry| entry.path.as_str()), Some("Root/Enemy[2]"));
+        assert_eq!(
+            entries.get(&2).map(|entry| entry.path.as_str()),
+            Some("Root/Enemy[1]")
+        );
+        assert_eq!(
+            entries.get(&3).map(|entry| entry.path.as_str()),
+            Some("Root/Enemy[2]")
+        );
     }
 }
