@@ -13,6 +13,7 @@ import {
 import { renderHighlightedCodeLines } from "../composables/markdownCodeLines";
 import { normalizeExternalMarkdownHref } from "../composables/markdownExternalLinks";
 import {
+  collectInlineCodePathCandidates,
   injectAssetRefs,
   injectFileRefs,
   injectUnityObjectFenceRefs,
@@ -21,6 +22,8 @@ import {
   injectWorkspaceMentions,
   isMarkdownUnityObjectFenceLanguage,
   isMarkdownUnityPropertyFenceLanguage,
+  normalizeMarkdownPathStatusKey,
+  type MarkdownPathStatus,
 } from "../composables/markdownInject";
 import { normalizeMarkdownForRender } from "../composables/markdownRender";
 import { wrapMarkdownTables } from "../composables/markdownTableHtml";
@@ -31,9 +34,11 @@ import {
   startUnityReferenceHtmlDrag,
 } from "../composables/useUnityReferenceDragSource";
 import { resolveMarkdownImage } from "../services/markdownImage";
+import { statWorkspaceEntries, type WorkspaceEntryStat } from "../services/project";
 import { hasTauriWindowRuntime } from "../services/tauriRuntime";
 import { normalizeViewError, viewRun, viewTree, type ViewPackageSummary } from "../services/view";
 import { useNotificationStore } from "../stores/notification";
+import { useProjectStore } from "../stores/project";
 import { t } from "../i18n";
 import { resolveLocusViewIcon } from "./icons/locusViewIcons";
 import UnityObjectPreview from "./unity-preview/UnityObjectPreview.vue";
@@ -56,11 +61,15 @@ const emit = defineEmits<{
 
 const rootRef = ref<HTMLElement | null>(null);
 const notificationStore = useNotificationStore();
+const projectStore = useProjectStore();
 const viewRefSummaries = ref<ViewPackageSummary[]>([]);
+const inlinePathStatuses = ref<Map<string, MarkdownPathStatus>>(new Map());
 const appContext = getCurrentInstance()?.appContext ?? null;
 const markdownUnityObjectPreviewHosts = new Set<HTMLElement>();
 const markdownUnityPropertyFenceHosts = new Set<HTMLElement>();
 let markdownViewRefLoadRun = 0;
+let markdownInlinePathStatusLoadRun = 0;
+let markdownInlinePathStatusKey = "";
 
 function escapeHtml(source: string): string {
   return source
@@ -187,12 +196,62 @@ const md = new Marked(
   }
 );
 
+const parsedMarkdownHtml = computed(() => {
+  if (!props.content) return "";
+  return md.parse(normalizeMarkdownForRender(props.content)) as string;
+});
+
+function markdownPathStatusFromEntry(entry: WorkspaceEntryStat): MarkdownPathStatus {
+  const entryKind = entry.entryKind === "folder" || entry.entryKind === "file"
+    ? entry.entryKind
+    : null;
+  return {
+    path: entry.path,
+    exists: entry.exists && !!entryKind,
+    entryKind,
+  };
+}
+
+function resolveInlinePathStatus(path: string): MarkdownPathStatus | null | undefined {
+  return inlinePathStatuses.value.get(normalizeMarkdownPathStatusKey(path));
+}
+
+async function loadInlinePathStatuses(html: string) {
+  const candidates = collectInlineCodePathCandidates(html);
+  const nextKey = `${projectStore.workingDir}\n${candidates.join("\n")}`;
+  if (nextKey === markdownInlinePathStatusKey) return;
+  markdownInlinePathStatusKey = nextKey;
+  const run = ++markdownInlinePathStatusLoadRun;
+
+  if (!candidates.length) {
+    inlinePathStatuses.value = new Map();
+    return;
+  }
+
+  try {
+    const entries = await statWorkspaceEntries(candidates);
+    if (run !== markdownInlinePathStatusLoadRun) return;
+    const next = new Map<string, MarkdownPathStatus>();
+    for (const entry of entries) {
+      next.set(normalizeMarkdownPathStatusKey(entry.path), markdownPathStatusFromEntry(entry));
+    }
+    inlinePathStatuses.value = next;
+  } catch {
+    if (run === markdownInlinePathStatusLoadRun) {
+      inlinePathStatuses.value = new Map();
+    }
+  }
+}
+
 const renderedHtml = computed(() => {
   if (!props.content) return "";
   try {
-    let html = md.parse(normalizeMarkdownForRender(props.content)) as string;
+    let html = parsedMarkdownHtml.value;
     html = prepareMarkdownImages(html);
-    html = injectAssetRefs(html);
+    html = injectAssetRefs(html, {
+      inlinePathStatus: resolveInlinePathStatus,
+      requireInlinePathStatus: true,
+    });
     html = injectUnityPropertyFenceRefs(html);
     html = injectUnityObjectFenceRefs(html);
     html = injectWorkspaceMentions(html);
@@ -464,6 +523,21 @@ async function resolveMarkdownImages() {
     }
   }
 }
+
+watch(
+  parsedMarkdownHtml,
+  (html) => {
+    void loadInlinePathStatuses(html);
+  },
+  { immediate: true },
+);
+
+watch(
+  () => projectStore.workingDir,
+  () => {
+    void loadInlinePathStatuses(parsedMarkdownHtml.value);
+  },
+);
 
 watch(
   renderedHtml,

@@ -34,6 +34,7 @@ export interface InspectorPropertyAttributeInfo {
 
 export interface InspectorPropertyTargetSnapshot {
   kind: string;
+  guid?: string | null;
   path?: string | null;
   scenePath?: string | null;
   objectPath?: string | null;

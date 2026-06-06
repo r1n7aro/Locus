@@ -1500,6 +1500,14 @@ pub struct WorkspaceSearchEntry {
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct WorkspaceEntryStat {
+    pub path: String,
+    pub exists: bool,
+    pub entry_kind: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DirEntriesPage {
     pub entries: Vec<DirEntry>,
     pub total_count: usize,
@@ -1779,6 +1787,97 @@ fn collect_dir_entries(
     entries.sort_by_cached_key(|entry| (!entry.is_dir, entry.name.to_lowercase()));
 
     Ok(entries)
+}
+
+fn normalize_workspace_entry_stat_path(path: &str) -> String {
+    let mut normalized = path.trim().replace('\\', "/");
+    while normalized.len() > 1 && normalized.ends_with('/') && !normalized.ends_with(":/") {
+        normalized.pop();
+    }
+    normalized
+}
+
+fn missing_workspace_entry_stat(path: &str) -> WorkspaceEntryStat {
+    WorkspaceEntryStat {
+        path: normalize_workspace_entry_stat_path(path),
+        exists: false,
+        entry_kind: "missing".to_string(),
+    }
+}
+
+fn workspace_entry_stat_from_target(path: String, target: &std::path::Path) -> WorkspaceEntryStat {
+    let is_dir = target.is_dir();
+    let is_file = target.is_file();
+    let entry_kind = if is_dir {
+        "folder"
+    } else if is_file {
+        "file"
+    } else {
+        "other"
+    };
+
+    WorkspaceEntryStat {
+        path,
+        exists: target.exists(),
+        entry_kind: entry_kind.to_string(),
+    }
+}
+
+fn is_workspace_entry_stat_absolute_path(path: &str) -> bool {
+    let normalized = path.trim();
+    std::path::Path::new(normalized).is_absolute()
+        || normalized.starts_with("\\\\")
+        || normalized.starts_with("//")
+}
+
+fn workspace_entry_target_allowed(
+    workspace_root: &std::path::Path,
+    rel_path: &str,
+    target: &std::path::Path,
+) -> bool {
+    let canonical_base =
+        dunce::canonicalize(workspace_root).unwrap_or_else(|_| workspace_root.to_path_buf());
+    let canonical_target = match dunce::canonicalize(target) {
+        Ok(path) => path,
+        Err(_) => return false,
+    };
+    canonical_target.starts_with(&canonical_base)
+        || path_reaches_allowed_linked_asset_dir(workspace_root, rel_path)
+}
+
+fn workspace_entry_stat_for_path(cwd: &str, raw_path: &str) -> WorkspaceEntryStat {
+    let display_path = normalize_workspace_entry_stat_path(raw_path);
+    if display_path.is_empty() {
+        return missing_workspace_entry_stat(raw_path);
+    }
+
+    if is_workspace_entry_stat_absolute_path(&display_path) {
+        let target =
+            std::path::PathBuf::from(display_path.replace('/', std::path::MAIN_SEPARATOR_STR));
+        if !target.exists() {
+            return missing_workspace_entry_stat(&display_path);
+        }
+        return workspace_entry_stat_from_target(display_path, &target);
+    }
+
+    if cwd.trim().is_empty() {
+        return missing_workspace_entry_stat(&display_path);
+    }
+
+    let rel_path = match normalize_workspace_sub_path(&display_path) {
+        Ok(path) if !path.is_empty() => path,
+        _ => return missing_workspace_entry_stat(&display_path),
+    };
+    let workspace_root = std::path::Path::new(cwd);
+    let target = workspace_root.join(&rel_path);
+    if !target.exists() {
+        return missing_workspace_entry_stat(&rel_path);
+    }
+    if !workspace_entry_target_allowed(workspace_root, &rel_path, &target) {
+        return missing_workspace_entry_stat(&rel_path);
+    }
+
+    workspace_entry_stat_from_target(rel_path, &target)
 }
 
 fn workspace_search_tokens(value: &str) -> Vec<String> {
@@ -2109,6 +2208,26 @@ pub async fn search_workspace_entries(
 }
 
 #[tauri::command]
+pub async fn stat_workspace_entries(
+    paths: Vec<String>,
+    workspace: State<'_, Arc<Workspace>>,
+) -> Result<Vec<WorkspaceEntryStat>, AppError> {
+    let cwd = workspace.path.read().await.clone();
+    let mut stats = Vec::new();
+    let mut seen = HashSet::new();
+
+    for path in paths.into_iter().take(300) {
+        let normalized = normalize_workspace_entry_stat_path(&path);
+        if normalized.is_empty() || !seen.insert(normalized.clone()) {
+            continue;
+        }
+        stats.push(workspace_entry_stat_for_path(&cwd, &normalized));
+    }
+
+    Ok(stats)
+}
+
+#[tauri::command]
 pub async fn check_unity_connection(
     workspace: State<'_, Arc<Workspace>>,
 ) -> Result<bool, AppError> {
@@ -2424,8 +2543,8 @@ mod tests {
     use super::{
         collect_dir_entries, normalize_custom_endpoint_config,
         normalize_tool_permission_mode_request, normalize_workspace_sub_path,
-        resolve_workspace_dir_target, search_workspace_entries_in_dir, workspace_search_score,
-        CustomEndpoint,
+        resolve_workspace_dir_target, search_workspace_entries_in_dir,
+        workspace_entry_stat_for_path, workspace_search_score, CustomEndpoint,
     };
     use std::path::Path;
     use tempfile::tempdir;
@@ -2655,6 +2774,33 @@ mod tests {
         assert!(!folder_results
             .iter()
             .any(|entry| { entry.rel_path == "Assets/Scripts/UI/Hud.prefab" }));
+    }
+
+    #[test]
+    fn workspace_entry_stat_classifies_existing_roots_files_and_missing_paths() {
+        let temp = tempdir().expect("create temp dir");
+        std::fs::create_dir_all(temp.path().join("Assets")).expect("create assets dir");
+        std::fs::create_dir_all(temp.path().join("Packages")).expect("create packages dir");
+        std::fs::write(temp.path().join("Assets/LICENSE"), "license")
+            .expect("write extensionless file");
+
+        let cwd = temp.path().to_string_lossy();
+        let assets = workspace_entry_stat_for_path(&cwd, "Assets");
+        let packages = workspace_entry_stat_for_path(&cwd, "Packages/");
+        let license = workspace_entry_stat_for_path(&cwd, "Assets/LICENSE");
+        let missing = workspace_entry_stat_for_path(&cwd, "Assets/Missing.prefab");
+
+        assert!(assets.exists);
+        assert_eq!(assets.entry_kind, "folder");
+        assert_eq!(assets.path, "Assets");
+        assert!(packages.exists);
+        assert_eq!(packages.entry_kind, "folder");
+        assert_eq!(packages.path, "Packages");
+        assert!(license.exists);
+        assert_eq!(license.entry_kind, "file");
+        assert_eq!(license.path, "Assets/LICENSE");
+        assert!(!missing.exists);
+        assert_eq!(missing.entry_kind, "missing");
     }
 
     #[test]

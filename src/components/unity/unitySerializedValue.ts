@@ -38,6 +38,7 @@ export interface UnitySerializedPropertyAttributeInfo {
 
 export interface UnitySerializedPropertyTargetSnapshot {
   kind: string;
+  guid?: string | null;
   path?: string | null;
   scenePath?: string | null;
   objectPath?: string | null;

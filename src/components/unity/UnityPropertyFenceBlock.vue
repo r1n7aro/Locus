@@ -1,18 +1,27 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
 import BaseButton from "../ui/BaseButton.vue";
+import BaseContextMenu from "../ui/BaseContextMenu.vue";
 import {
+  groupUnityPropertyFenceItems,
   parseUnityPropertyFence,
   type UnityPropertyFenceEntry,
   type UnityPropertyFenceIssue,
+  unityPropertyFenceUnitySelectionTarget,
 } from "../../composables/unityPropertyFence";
 import { t } from "../../i18n";
 import { isUnityConnectionError, normalizeAppError } from "../../services/errors";
+import {
+  classifyUnitySceneObjectError,
+  selectUnityAsset,
+  selectUnitySceneObject,
+} from "../../services/unity";
 import {
   readUnitySerializedProperty,
   writeUnitySerializedProperty,
   type UnitySerializedPropertyTarget,
 } from "../../services/unitySerializedProperty";
+import { useNotificationStore } from "../../stores/notification";
 import UnitySerializedPropertyTree from "./UnitySerializedPropertyTree.vue";
 import type {
   UnitySerializedPropertyCommitEvent,
@@ -31,9 +40,29 @@ interface PropertyRow {
   property: UnitySerializedPropertySnapshot | null;
 }
 
+interface PropertyRowContextMenu {
+  x: number;
+  y: number;
+  rowId: string;
+}
+
+const notificationStore = useNotificationStore();
 const rows = ref<PropertyRow[]>([]);
 const issues = ref<UnityPropertyFenceIssue[]>([]);
+const selectedRowId = ref("");
+const rowContextMenu = ref<PropertyRowContextMenu | null>(null);
 const loading = computed(() => rows.value.some((row) => row.loading));
+const propertyBlocks = computed(() =>
+  groupUnityPropertyFenceItems(rows.value, (row) => row.entry),
+);
+const rowContextRow = computed(() =>
+  rowContextMenu.value ? rowById(rowContextMenu.value.rowId) : null,
+);
+const rowContextUnitySelection = computed(() => {
+  const row = rowContextRow.value;
+  return row ? unityPropertyFenceUnitySelectionTarget(rowTarget(row)) : null;
+});
+const rowContextCanSelectInUnity = computed(() => rowContextUnitySelection.value !== null);
 let loadRun = 0;
 
 watch(
@@ -161,6 +190,85 @@ function rowTarget(row: PropertyRow): UnitySerializedPropertyTarget {
   return row.property?.target ?? row.property?.bindingTarget ?? row.entry.target;
 }
 
+function rowById(rowId: string): PropertyRow | null {
+  return rows.value.find((row) => row.entry.id === rowId) ?? null;
+}
+
+function selectRow(row: PropertyRow) {
+  selectedRowId.value = row.entry.id;
+}
+
+function openRowContextMenu(event: MouseEvent) {
+  const target = event.target;
+  if (!(target instanceof Element)) return;
+  const rowElement = target.closest<HTMLElement>("[data-unity-property-row-id]");
+  const rowId = rowElement?.dataset.unityPropertyRowId?.trim() ?? "";
+  const row = rowId ? rowById(rowId) : null;
+  if (!row) return;
+
+  event.preventDefault();
+  event.stopPropagation();
+  selectRow(row);
+  rowContextMenu.value = {
+    x: event.clientX,
+    y: event.clientY,
+    rowId: row.entry.id,
+  };
+}
+
+function closeRowContextMenu() {
+  rowContextMenu.value = null;
+  selectedRowId.value = "";
+}
+
+async function selectContextRowInUnity() {
+  const row = rowContextRow.value;
+  const selection = rowContextUnitySelection.value;
+  if (!row || !selection) return;
+  selectRow(row);
+  closeRowContextMenu();
+
+  try {
+    if (selection.kind === "sceneObject") {
+      await selectUnitySceneObject(selection.scenePath, selection.objectPath);
+      return;
+    }
+    await selectUnityAsset(selection.path);
+  } catch (error) {
+    notifySelectInUnityError(error, selection);
+  }
+}
+
+function notifySelectInUnityError(
+  error: unknown,
+  selection: NonNullable<ReturnType<typeof unityPropertyFenceUnitySelectionTarget>>,
+) {
+  const normalized = normalizeAppError(error);
+  const message = selection.kind === "sceneObject"
+    ? unitySceneObjectErrorMessage(error, selection.scenePath, selection.objectPath)
+    : normalized.message || "Failed to select in Unity.";
+  notificationStore.addNotice("warning", message, {
+    code: normalized.code,
+    operation: "unityPropertySelectInUnity",
+    replaceOperation: true,
+  });
+}
+
+function unitySceneObjectErrorMessage(error: unknown, scenePath: string, objectPath: string): string {
+  const kind = classifyUnitySceneObjectError(error);
+  if (kind === "sceneNotLoaded") return t("chat.sceneObject.sceneNotLoaded", scenePath);
+  if (kind === "objectMissing") return t("chat.sceneObject.objectMissing", objectPath);
+  return t("chat.sceneObject.openFailed", `${scenePath}/${objectPath}`);
+}
+
+function blockTarget(row: PropertyRow | undefined): UnitySerializedPropertyTarget {
+  return row ? rowTarget(row) : { kind: "Unity" };
+}
+
+function blockSaving(blockRows: PropertyRow[]): boolean {
+  return blockRows.some((row) => row.saving);
+}
+
 function shortTypeName(typeName: string): string {
   const normalized = typeName.trim();
   if (!normalized) return "";
@@ -173,7 +281,7 @@ function shortTypeName(typeName: string): string {
 </script>
 
 <template>
-  <section class="unity-property-fence">
+  <section class="unity-property-fence" @contextmenu.capture="openRowContextMenu">
     <header class="unity-property-fence-header">
       <div class="unity-property-fence-title">
         <span>Unity Property</span>
@@ -201,32 +309,59 @@ function shortTypeName(typeName: string): string {
 
     <div v-else class="unity-property-list">
       <article
-        v-for="row in rows"
-        :key="row.entry.id"
-        class="unity-property-row"
-        :class="{ saving: row.saving }"
+        v-for="block in propertyBlocks"
+        :key="block.id"
+        class="unity-property-block"
+        :class="{ saving: blockSaving(block.items) }"
       >
-        <div class="unity-property-context">
-          <div class="unity-property-object" :title="row.entry.objectTitle || row.entry.objectLabel">
-            {{ row.entry.objectLabel }}
+        <div
+          v-for="(row, rowIndex) in block.items"
+          :key="row.entry.id"
+          class="unity-property-editor-row"
+          :class="{ saving: row.saving, selected: selectedRowId === row.entry.id }"
+          :data-unity-property-row-id="row.entry.id"
+        >
+          <div class="unity-property-context" :class="{ empty: rowIndex > 0 }">
+            <template v-if="rowIndex === 0">
+              <div class="unity-property-object" :title="block.entry.objectTitle || block.entry.objectLabel">
+                {{ block.entry.objectLabel }}
+              </div>
+              <div class="unity-property-target" :title="targetMeta(blockTarget(block.items[0]))">
+                {{ targetMeta(blockTarget(block.items[0])) }}
+              </div>
+            </template>
           </div>
-          <div class="unity-property-target" :title="row.entry.target.propertyPath || row.entry.propertyLabel">
-            {{ targetMeta(rowTarget(row)) }}
-          </div>
-        </div>
 
-        <div class="unity-property-editor-cell">
-          <div v-if="row.loading" class="unity-property-state">Loading...</div>
-          <div v-else-if="row.error" class="unity-property-state error">{{ row.error }}</div>
-          <UnitySerializedPropertyTree
-            v-else-if="row.property"
-            :property="row.property"
-            compact
-            @commit="commitProperty(row, $event)"
-          />
+          <div class="unity-property-editor-cell">
+            <div v-if="row.loading" class="unity-property-state">Loading...</div>
+            <div v-else-if="row.error" class="unity-property-state error">{{ row.error }}</div>
+            <UnitySerializedPropertyTree
+              v-else-if="row.property"
+              :property="row.property"
+              compact
+              @commit="commitProperty(row, $event)"
+            />
+          </div>
         </div>
       </article>
     </div>
+
+    <BaseContextMenu
+      v-if="rowContextMenu && rowContextRow"
+      :x="rowContextMenu.x"
+      :y="rowContextMenu.y"
+      :min-width="176"
+      @close="closeRowContextMenu"
+    >
+      <button
+        type="button"
+        class="unity-property-ctx-item"
+        :disabled="!rowContextCanSelectInUnity"
+        @click="selectContextRowInUnity"
+      >
+        {{ t("common.selectInUnity") }}
+      </button>
+    </BaseContextMenu>
   </section>
 </template>
 
@@ -280,20 +415,17 @@ function shortTypeName(typeName: string): string {
   display: grid;
 }
 
-.unity-property-row {
+.unity-property-block {
   min-width: 0;
   display: grid;
-  grid-template-columns: minmax(150px, 0.34fr) minmax(0, 1fr);
-  gap: 10px;
-  padding: 8px 10px;
   border-bottom: 1px solid color-mix(in srgb, var(--border-color) 72%, transparent);
 }
 
-.unity-property-row:last-child {
+.unity-property-block:last-child {
   border-bottom: 0;
 }
 
-.unity-property-row.saving {
+.unity-property-block.saving {
   background: color-mix(in srgb, var(--hover-bg) 42%, transparent);
 }
 
@@ -302,6 +434,10 @@ function shortTypeName(typeName: string): string {
   display: grid;
   align-content: center;
   gap: 2px;
+}
+
+.unity-property-context.empty {
+  min-height: 1px;
 }
 
 .unity-property-object,
@@ -325,6 +461,40 @@ function shortTypeName(typeName: string): string {
   line-height: 1.25;
 }
 
+.unity-property-editor-row {
+  position: relative;
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(150px, 0.34fr) minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  padding: 7px 10px;
+}
+
+.unity-property-editor-row + .unity-property-editor-row {
+  border-top: 1px solid color-mix(in srgb, var(--border-color) 54%, transparent);
+}
+
+.unity-property-editor-row.saving {
+  background: color-mix(in srgb, var(--hover-bg) 42%, transparent);
+}
+
+.unity-property-editor-row:hover,
+.unity-property-editor-row.selected {
+  background: color-mix(in srgb, var(--hover-bg) 48%, transparent);
+}
+
+.unity-property-editor-row.selected::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 5px;
+  bottom: 5px;
+  width: 2px;
+  border-radius: 999px;
+  background: var(--accent-color);
+}
+
 .unity-property-editor-cell {
   min-width: 0;
   align-self: center;
@@ -345,9 +515,17 @@ function shortTypeName(typeName: string): string {
 }
 
 @media (max-width: 720px) {
-  .unity-property-row {
+  .unity-property-editor-row {
     grid-template-columns: minmax(0, 1fr);
     gap: 6px;
+  }
+
+  .unity-property-context.empty {
+    display: none;
+  }
+
+  .unity-property-editor-row {
+    padding: 6px 10px 8px;
   }
 }
 </style>

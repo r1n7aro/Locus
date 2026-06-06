@@ -18,6 +18,18 @@ import {
  */
 
 export type MarkdownUnityObjectPreviewLevel = "inline" | "row" | "thumbnail" | "inspector" | "editor";
+export type MarkdownPathEntryKind = "file" | "folder";
+
+export interface MarkdownPathStatus {
+  path: string;
+  exists: boolean;
+  entryKind?: MarkdownPathEntryKind | null;
+}
+
+export interface MarkdownRefInjectOptions {
+  inlinePathStatus?: (path: string) => MarkdownPathStatus | null | undefined;
+  requireInlinePathStatus?: boolean;
+}
 
 interface MarkdownUnityObjectRefOptions {
   level?: MarkdownUnityObjectPreviewLevel;
@@ -58,6 +70,7 @@ const INLINE_CODE_BRACED_REF_RE = /^\{@?([^{}\r\n]+\/[^{}\r\n]*)\}$/;
 const INLINE_CODE_UNITY_REF_PREFIX_RE = /^(?:asset|unity|ref)(?::([A-Za-z-]+))?\s+(.+)$/i;
 const INLINE_CODE_UNITY_REF_SUFFIX_RE = /^(.+?)\s+\|\s*([A-Za-z-]+)$/;
 const INLINE_CODE_PATH_SUFFIX_RE = /^(.+?)(?::(\d+)|#L(\d+)|#fileID:-?\d+)?$/i;
+const INLINE_CODE_SINGLE_SEGMENT_ROOT_RE = /^(?:Assets|Packages|ProjectSettings|Library|Temp|Logs|Locus)$/i;
 const INLINE_WORKSPACE_ROOT_RE = /^(?:ProjectSettings|src|src-tauri|Library|Editor)\//i;
 const INLINE_GENERIC_FILE_PATH_RE = /^(?:[^/\r\n]+\/)+[^/\r\n]+\.[A-Za-z0-9][^/\r\n]*$/;
 const INLINE_SLASH_COMMAND_RE = /^\/[A-Za-z0-9_-]+(?:\s|$)/;
@@ -102,6 +115,11 @@ function displayFileRef(filePath: string, line = ""): string {
 
 function normalizeFileRefPath(filePath: string): string {
   return filePath.trim().replace(/\\/g, "/");
+}
+
+export function normalizeMarkdownPathStatusKey(filePath: string): string {
+  const normalized = normalizeFileRefPath(filePath).replace(/^\.\//, "");
+  return normalized.replace(/\/+$/, "") || normalized;
 }
 
 interface KnowledgeRefParts {
@@ -167,14 +185,18 @@ function normalizeUnityAssetRefPath(filePath: string): string {
   return normalized.replace(/\/+$/, "") || normalized;
 }
 
+function isUnityAssetRootPath(filePath: string): boolean {
+  return /^(?:Assets|Packages)\/?$/i.test(normalizeFileRefPath(filePath));
+}
+
 function displaySceneObjectRef(objectPath: string): string {
   const normalized = objectPath.replace(/\/+$/, "") || objectPath;
   const segments = normalized.split("/").filter(Boolean);
   return segments[segments.length - 1] || normalized;
 }
 
-function unityAssetKind(filePath: string): UnityAssetIconKind {
-  return unityAssetIconKindForPath(filePath, { fallbackKind: "asset" });
+function unityAssetKind(filePath: string, isFolder?: boolean): UnityAssetIconKind {
+  return unityAssetIconKindForPath(filePath, { fallbackKind: "asset", isFolder });
 }
 
 function unityAssetIconImageKind(kind: UnityAssetIconKind): UnityAssetIconKind {
@@ -303,32 +325,44 @@ function renderFileRef(
   return `<span class="${className}" data-file-path="${escaped}"${lineAttr}${attrs} title="${label}" aria-label="${label}">${icon}<span class="md-ref-label">${displayFileRef(filePath, line)}</span></span>`;
 }
 
-function renderLocalFileRef(filePath: string, line = ""): string {
+function renderLocalFileRef(
+  filePath: string,
+  line = "",
+  entryKind?: MarkdownPathEntryKind | null,
+): string {
   const normalizedPath = normalizeFileRefPath(filePath);
-  const isDir = isFolderFileRef(filePath, line);
+  const isDir = entryKind ? entryKind === "folder" : isFolderFileRef(filePath, line);
   const cleanPath = isDir ? (normalizedPath.replace(/\/+$/, "") || normalizedPath) : normalizedPath;
   const classes = isDir ? "md-folder-ref" : "";
-  const entryKind = isDir ? "folder" : "file";
+  const resolvedEntryKind = isDir ? "folder" : "file";
   const icon = isDir
     ? renderRefIcon("folder", "md-workspace-ref-icon")
     : renderRefIcon();
-  return renderFileRef(cleanPath, line, classes, ` data-entry-kind="${entryKind}" draggable="true"`, icon);
+  return renderFileRef(cleanPath, line, classes, ` data-entry-kind="${resolvedEntryKind}" draggable="true"`, icon);
 }
 
 function renderUnityAssetRef(
   filePath: string,
   line = "",
   options: MarkdownUnityObjectRefOptions = {},
+  status?: MarkdownPathStatus | null,
 ): string {
   const normalizedPath = normalizeUnityAssetRefPath(filePath);
   const escaped = escapeAttr(normalizedPath);
-  const kind = unityAssetKind(normalizedPath);
+  const inferredFolder = isFolderFileRef(filePath, line) || !hasFileExtension(normalizedPath);
+  const entryKind = status?.entryKind ?? (inferredFolder ? "folder" : "file");
+  const kind = unityAssetKind(normalizedPath, entryKind === "folder");
   const preview = unityObjectPreviewAttrs("asset", options);
+  const refClasses = [
+    "md-unity-asset-ref",
+    entryKind === "folder" ? "md-folder-ref" : "",
+    preview.classes,
+  ].filter(Boolean).join(" ");
   return renderFileRef(
     normalizedPath,
     line,
-    `md-unity-asset-ref ${preview.classes}`,
-    `${preview.attrs} data-asset-path="${escaped}" data-asset-kind="${kind}" draggable="true"`,
+    refClasses,
+    `${preview.attrs} data-asset-path="${escaped}" data-asset-kind="${kind}" data-entry-kind="${entryKind}" draggable="true"`,
     renderUnityAssetIcon(kind),
   );
 }
@@ -404,15 +438,19 @@ export function injectViewRefs(html: string, options: ViewRefInjectOptions = {})
   );
 }
 
-function renderWorkspaceMention(path: string, match: string): string {
-  const isDir = path.endsWith("/");
+function renderWorkspaceMention(
+  path: string,
+  match: string,
+  status?: MarkdownPathStatus | null,
+): string {
+  const isDir = status?.entryKind === "folder" || (!status && path.endsWith("/"));
   const knowledgeRef = parseKnowledgeRefPath(path);
   if (knowledgeRef) {
     return renderKnowledgeRef(knowledgeRef.path);
   }
 
   if (isUsableAbsoluteLocalRefPath(path)) {
-    return renderLocalFileRef(path);
+    return renderLocalFileRef(path, "", status?.entryKind);
   }
 
   if (/^(Assets|Packages)\//.test(path) && !isDir) {
@@ -642,15 +680,46 @@ function parseInlineCodeRefText(source: string): ParsedInlineCodeRefText {
   return { refText, unityOptions };
 }
 
-function splitInlineCodePathSuffix(source: string): { path: string; line: string } | null {
+function splitInlineCodePathSuffix(
+  source: string,
+  allowSingleSegment = false,
+): { path: string; line: string } | null {
   const match = source.match(INLINE_CODE_PATH_SUFFIX_RE);
   if (!match) return null;
   const path = match[1].trim().replace(/\\/g, "/");
-  if (!path.includes("/")) return null;
+  if (!allowSingleSegment && !path.includes("/")) return null;
   return {
     path,
     line: match[2] || match[3] || "",
   };
+}
+
+function isPotentialInlinePathStatusCandidate(filePath: string): boolean {
+  const normalized = normalizeFileRefPath(filePath);
+  if (!normalized || /[\r\n<>]/.test(normalized)) return false;
+  if (isUsableAbsoluteLocalRefPath(normalized)) return true;
+  if (normalized.includes("/")) return true;
+  if (hasFileExtension(normalized)) return true;
+  return INLINE_CODE_SINGLE_SEGMENT_ROOT_RE.test(normalized);
+}
+
+function inlinePathStatusFor(
+  filePath: string,
+  options: MarkdownRefInjectOptions,
+): MarkdownPathStatus | null | undefined {
+  const lookup = options.inlinePathStatus;
+  if (!lookup) return undefined;
+  const key = normalizeMarkdownPathStatusKey(filePath);
+  return lookup(key) ?? lookup(filePath) ?? undefined;
+}
+
+function resolvedInlinePathStatus(
+  filePath: string,
+  options: MarkdownRefInjectOptions,
+): MarkdownPathStatus | null | undefined {
+  const status = inlinePathStatusFor(filePath, options);
+  if (status) return status.exists ? status : null;
+  return options.requireInlinePathStatus ? null : undefined;
 }
 
 function isWorkspaceInlineRefPath(filePath: string): boolean {
@@ -662,22 +731,26 @@ function isWorkspaceInlineRefPath(filePath: string): boolean {
   return INLINE_GENERIC_FILE_PATH_RE.test(normalized);
 }
 
-function renderWorkspaceInlineRef(filePath: string, line = ""): string {
+function renderWorkspaceInlineRef(
+  filePath: string,
+  line = "",
+  status?: MarkdownPathStatus | null,
+): string {
   const normalizedPath = normalizeFileRefPath(filePath);
   if (line) {
-    return renderLocalFileRef(normalizedPath.replace(/\/+$/, ""), line);
+    return renderLocalFileRef(normalizedPath.replace(/\/+$/, ""), line, status?.entryKind);
   }
-  return renderWorkspaceMention(normalizedPath, normalizedPath);
+  return renderWorkspaceMention(normalizedPath, normalizedPath, status);
 }
 
-function assetRefFromInlineCode(source: string): string | null {
+function assetRefFromInlineCode(source: string, options: MarkdownRefInjectOptions = {}): string | null {
   const inlineRef = parseInlineCodeRefText(source);
   const refText = inlineRef.refText;
   if (INLINE_SLASH_COMMAND_RE.test(refText)) {
     return renderInlineCommandRef(refText);
   }
 
-  const parsed = splitInlineCodePathSuffix(refText);
+  const parsed = splitInlineCodePathSuffix(refText, !!options.inlinePathStatus || !!options.requireInlinePathStatus);
   if (!parsed) return null;
 
   const knowledgeRef = parseKnowledgeRefPath(parsed.path);
@@ -686,21 +759,33 @@ function assetRefFromInlineCode(source: string): string | null {
   }
 
   if (isUsableAbsoluteLocalRefPath(parsed.path)) {
-    return renderLocalFileRef(parsed.path, parsed.line);
+    const status = resolvedInlinePathStatus(parsed.path, options);
+    if (status === null) return null;
+    return renderLocalFileRef(parsed.path, parsed.line, status?.entryKind);
   }
-
-  if (!isWorkspaceInlineRefPath(parsed.path)) return null;
 
   const sceneObjectRef = splitSceneObjectRef(parsed.path);
   if (sceneObjectRef) {
+    const sceneStatus = resolvedInlinePathStatus(sceneObjectRef.scenePath, options);
+    if (sceneStatus === null || sceneStatus?.entryKind === "folder") return null;
     return renderUnitySceneObjectRef(`${sceneObjectRef.scenePath}/${sceneObjectRef.objectPath}`, inlineRef.unityOptions);
   }
 
-  if (ASSET_ROOT_RE.test(parsed.path)) {
-    return renderUnityAssetRef(parsed.path, parsed.line, inlineRef.unityOptions);
+  const status = resolvedInlinePathStatus(parsed.path, options);
+  const hasKnownStatus = status !== undefined;
+  if (status === null) return null;
+  if (!isWorkspaceInlineRefPath(parsed.path) && !hasKnownStatus) return null;
+
+  if (isUnityAssetRootPath(parsed.path)) {
+    return renderWorkspaceInlineRef(parsed.path, parsed.line, status);
   }
 
-  return renderWorkspaceInlineRef(parsed.path, parsed.line);
+  if (ASSET_ROOT_RE.test(parsed.path)) {
+    return renderUnityAssetRef(parsed.path, parsed.line, inlineRef.unityOptions, status);
+  }
+
+  if (!isPotentialInlinePathStatusCandidate(parsed.path)) return null;
+  return renderWorkspaceInlineRef(parsed.path, parsed.line, status);
 }
 
 function unityAssetRefFromCodeText(
@@ -768,7 +853,72 @@ export function injectUnityObjectFenceRefs(html: string): string {
   });
 }
 
-function injectInlineCodeAssetRefs(html: string): string {
+function collectInlineCodePathCandidatesFromSource(source: string): string[] {
+  const inlineRef = parseInlineCodeRefText(source);
+  const refText = inlineRef.refText;
+  if (INLINE_SLASH_COMMAND_RE.test(refText)) return [];
+
+  const parsed = splitInlineCodePathSuffix(refText, true);
+  if (!parsed) return [];
+
+  const knowledgeRef = parseKnowledgeRefPath(parsed.path);
+  if (knowledgeRef) return [];
+
+  const sceneObjectRef = splitSceneObjectRef(parsed.path);
+  if (sceneObjectRef) return [normalizeMarkdownPathStatusKey(sceneObjectRef.scenePath)];
+
+  if (!isPotentialInlinePathStatusCandidate(parsed.path)) return [];
+  return [normalizeMarkdownPathStatusKey(parsed.path)];
+}
+
+export function collectInlineCodePathCandidates(html: string): string[] {
+  const parts = html.split(/(<[^>]+>)/);
+  const candidates: string[] = [];
+  const seen = new Set<string>();
+  let inPre = 0;
+  let inAnchor = 0;
+
+  const addCandidate = (path: string) => {
+    const key = normalizeMarkdownPathStatusKey(path);
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    candidates.push(key);
+  };
+
+  for (let i = 0; i < parts.length; i++) {
+    const part = parts[i];
+    if (!part.startsWith("<")) continue;
+
+    if (/^<pre[\s>]/i.test(part)) {
+      inPre++;
+      continue;
+    }
+    if (/^<\/pre>/i.test(part)) {
+      inPre = Math.max(0, inPre - 1);
+      continue;
+    }
+    if (/^<a[\s>]/i.test(part)) {
+      inAnchor++;
+      continue;
+    }
+    if (/^<\/a>/i.test(part)) {
+      inAnchor = Math.max(0, inAnchor - 1);
+      continue;
+    }
+
+    if (inPre > 0 || inAnchor > 0) continue;
+    if (!/^<code[\s>]/i.test(part)) continue;
+    if (!parts[i + 2] || !/^<\/code>/i.test(parts[i + 2])) continue;
+
+    for (const candidate of collectInlineCodePathCandidatesFromSource(parts[i + 1] || "")) {
+      addCandidate(candidate);
+    }
+  }
+
+  return candidates;
+}
+
+function injectInlineCodeAssetRefs(html: string, options: MarkdownRefInjectOptions = {}): string {
   const parts = html.split(/(<[^>]+>)/);
   let inPre = 0;
   let inAnchor = 0;
@@ -797,14 +947,14 @@ function injectInlineCodeAssetRefs(html: string): string {
     if (!/^<code[\s>]/i.test(part)) continue;
     if (!parts[i + 2] || !/^<\/code>/i.test(parts[i + 2])) continue;
 
-    const ref = assetRefFromInlineCode(parts[i + 1] || "");
+    const ref = assetRefFromInlineCode(parts[i + 1] || "", options);
     if (!ref) continue;
     parts.splice(i, 3, ref);
   }
   return parts.join("");
 }
 
-export function injectAssetRefs(html: string): string {
+export function injectAssetRefs(html: string, options: MarkdownRefInjectOptions = {}): string {
   const injectedTextRefs = walkHtmlText(html, (text) => {
     const refs: string[] = [];
     const stashRef = (refHtml: string) => {
@@ -836,11 +986,11 @@ export function injectAssetRefs(html: string): string {
 
     return injected.replace(/\u0000mdref:(\d+)\u0000/g, (_match, index) => refs[Number(index)] ?? "");
   });
-  return injectInlineCodeAssetRefs(injectedTextRefs);
+  return injectInlineCodeAssetRefs(injectedTextRefs, options);
 }
 
-export function injectAssetChips(html: string): string {
-  return injectAssetRefs(html);
+export function injectAssetChips(html: string, options: MarkdownRefInjectOptions = {}): string {
+  return injectAssetRefs(html, options);
 }
 
 export function injectWorkspaceMentions(html: string): string {

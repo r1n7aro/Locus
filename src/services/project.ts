@@ -21,6 +21,14 @@ export interface WorkspaceSearchEntry {
   matchScore: number;
 }
 
+export type WorkspaceEntryKind = "file" | "folder" | "other" | "missing";
+
+export interface WorkspaceEntryStat {
+  path: string;
+  exists: boolean;
+  entryKind: WorkspaceEntryKind;
+}
+
 export function getWorkingDir(): Promise<string> {
   return ipcInvoke<string>("get_working_dir");
 }
@@ -64,6 +72,10 @@ export function searchWorkspaceEntries(
   limit = 200,
 ): Promise<WorkspaceSearchEntry[]> {
   return ipcInvoke<WorkspaceSearchEntry[]>("search_workspace_entries", { query, limit });
+}
+
+export function statWorkspaceEntries(paths: string[]): Promise<WorkspaceEntryStat[]> {
+  return ipcInvoke<WorkspaceEntryStat[]>("stat_workspace_entries", { paths });
 }
 
 export function resetAllConfig(): Promise<void> {

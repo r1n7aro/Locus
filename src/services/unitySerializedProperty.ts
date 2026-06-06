@@ -1,12 +1,13 @@
 import { ipcInvoke } from "./ipc";
 import type {
-  UnitySerializedPropertySnapshot,
+  UnitySerializedPropertySnapshot as UnitySerializedPropertySnapshotValue,
   UnitySerializedPropertyTargetSnapshot,
 } from "../components/unity/unitySerializedValue";
 
 export type UnitySerializedPropertyWriteMode = "commit" | "preview";
 
 export type UnitySerializedPropertyTarget = UnitySerializedPropertyTargetSnapshot;
+export type UnitySerializedPropertySnapshot = UnitySerializedPropertySnapshotValue;
 
 export interface UnitySerializedPropertyReadRequest {
   bindingId?: string | null;

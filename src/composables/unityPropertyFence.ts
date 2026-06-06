@@ -21,6 +21,16 @@ export interface UnityPropertyFenceParseResult {
   issues: UnityPropertyFenceIssue[];
 }
 
+export interface UnityPropertyFenceBlock<TItem = UnityPropertyFenceEntry> {
+  id: string;
+  entry: UnityPropertyFenceEntry;
+  items: TItem[];
+}
+
+export type UnityPropertyFenceUnitySelection =
+  | { kind: "asset"; path: string }
+  | { kind: "sceneObject"; scenePath: string; objectPath: string };
+
 interface UnityObjectPathParts {
   rawPath: string;
   assetPath: string;
@@ -71,6 +81,65 @@ export function parseUnityPropertyFence(source: string): UnityPropertyFenceParse
   });
 
   return { entries, issues };
+}
+
+export function groupUnityPropertyFenceItems<TItem>(
+  items: TItem[],
+  entryForItem: (item: TItem) => UnityPropertyFenceEntry,
+): UnityPropertyFenceBlock<TItem>[] {
+  const blocks: UnityPropertyFenceBlock<TItem>[] = [];
+  let activeKey = "";
+
+  items.forEach((item) => {
+    const entry = entryForItem(item);
+    const key = unityPropertyFenceTargetBlockKey(entry.target);
+    const activeBlock = blocks[blocks.length - 1];
+    if (activeBlock && key === activeKey) {
+      activeBlock.items.push(item);
+      return;
+    }
+
+    blocks.push({
+      id: `${entry.id}:block:${key}`,
+      entry,
+      items: [item],
+    });
+    activeKey = key;
+  });
+
+  return blocks;
+}
+
+export function unityPropertyFenceTargetBlockKey(target: UnitySerializedPropertyTarget): string {
+  return [
+    target.kind ?? "",
+    target.path ?? "",
+    target.scenePath ?? "",
+    target.objectPath ?? "",
+    target.objectFileId ?? "",
+    target.targetFileId ?? "",
+    target.componentType ?? "",
+    target.componentIndex ?? "",
+    target.targetTypeFullName ?? "",
+    target.targetTypeName ?? "",
+  ].join("|");
+}
+
+export function unityPropertyFenceUnitySelectionTarget(
+  target: UnitySerializedPropertyTarget,
+): UnityPropertyFenceUnitySelection | null {
+  const scenePath = stringField(target.scenePath);
+  const objectPath = stringField(target.objectPath);
+  if (scenePath && objectPath) {
+    return { kind: "sceneObject", scenePath, objectPath };
+  }
+
+  const assetPath = stringField(target.path) || scenePath;
+  if (/^(Assets|Packages)\//i.test(assetPath)) {
+    return { kind: "asset", path: assetPath };
+  }
+
+  return null;
 }
 
 function parseUnityPropertyFenceJson(

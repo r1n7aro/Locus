@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { TableProperties } from "lucide";
 import {
+  collectInlineCodePathCandidates,
   walkHtmlText,
   injectAssetRefs,
   injectFileRefs,
@@ -11,7 +12,11 @@ import {
   isMarkdownUnityObjectFenceLanguage,
   isMarkdownUnityPropertyFenceLanguage,
 } from "../composables/markdownInject";
-import { parseUnityPropertyFence } from "../composables/unityPropertyFence";
+import {
+  groupUnityPropertyFenceItems,
+  parseUnityPropertyFence,
+  unityPropertyFenceUnitySelectionTarget,
+} from "../composables/unityPropertyFence";
 import { prepareMarkdownImages } from "../composables/markdownImages";
 
 describe("walkHtmlText", () => {
@@ -301,6 +306,90 @@ describe("injectAssetRefs", () => {
     expect(result).not.toContain("<code>");
   });
 
+  it("renders existing inline-code workspace roots from path status", () => {
+    const html = "<code>Assets</code> <code>Assets/</code> <code>Packages/</code> <code>ProjectSettings/</code>";
+    const result = injectAssetRefs(html, {
+      requireInlinePathStatus: true,
+      inlinePathStatus(path) {
+        if (path === "Assets" || path === "Packages" || path === "ProjectSettings") {
+          return { path, exists: true, entryKind: "folder" };
+        }
+        return { path, exists: false };
+      },
+    });
+
+    expect(result).toContain("md-workspace-ref");
+    expect(result).toContain("md-folder-ref");
+    expect(result).toContain('data-workspace-path="Assets"');
+    expect(result).toContain('data-workspace-path="Packages"');
+    expect(result).toContain('data-workspace-path="ProjectSettings"');
+    expect(result).not.toContain('data-asset-path="Assets"');
+    expect(result).not.toContain('data-file-path="Assets"');
+    expect(result).not.toContain("<code>Assets</code>");
+  });
+
+  it("classifies exported assistant inline roots as folders", () => {
+    const html = "<li><code>list</code>：看到项目根目录有 <code>.git/</code>, <code>Assets/</code>, <code>Locus/</code>, <code>Packages/</code>, <code>ProjectSettings/</code></li>";
+    const result = injectAssetRefs(html, {
+      requireInlinePathStatus: true,
+      inlinePathStatus(path) {
+        if ([".git", "Assets", "Locus", "Packages", "ProjectSettings"].includes(path)) {
+          return { path, exists: true, entryKind: "folder" };
+        }
+        return { path, exists: false };
+      },
+    });
+
+    for (const path of [".git", "Assets", "Locus", "Packages", "ProjectSettings"]) {
+      expect(result).toContain(`data-workspace-path="${path}"`);
+    }
+    expect(result).toContain('data-entry-kind="folder"');
+    expect(result).not.toContain('data-asset-path="Assets"');
+    expect(result).not.toContain('data-file-path="Assets"');
+    expect(result).not.toContain('data-asset-path="Packages"');
+    expect(result).not.toContain('data-file-path="Packages"');
+  });
+
+  it("keeps missing inline-code paths as code when status is required", () => {
+    const html = "<code>Assets/Missing.prefab</code>";
+    const result = injectAssetRefs(html, {
+      requireInlinePathStatus: true,
+      inlinePathStatus: (path) => ({ path, exists: false }),
+    });
+
+    expect(result).toBe(html);
+    expect(result).not.toContain("md-unity-asset-ref");
+  });
+
+  it("uses path status to classify extensionless inline-code asset files", () => {
+    const html = "<code>Assets/LICENSE</code>";
+    const result = injectAssetRefs(html, {
+      requireInlinePathStatus: true,
+      inlinePathStatus: (path) => ({ path, exists: true, entryKind: "file" }),
+    });
+
+    expect(result).toContain("md-unity-asset-ref");
+    expect(result).toContain('data-file-path="Assets/LICENSE"');
+    expect(result).toContain('data-entry-kind="file"');
+    expect(result).not.toContain('data-asset-kind="folder"');
+  });
+
+  it("collects inline-code path candidates for workspace stat", () => {
+    const html = [
+      "<code>Assets</code>",
+      "<code>Packages/</code>",
+      "<code>list</code>",
+      "<code>Assets/Scenes/Main.unity/Root/Player</code>",
+      "<pre><code>Packages</code></pre>",
+    ].join(" ");
+
+    expect(collectInlineCodePathCandidates(html)).toEqual([
+      "Assets",
+      "Packages",
+      "Assets/Scenes/Main.unity",
+    ]);
+  });
+
   it("converts absolute local file paths inside inline code", () => {
     const html = "<code>C:\\Users\\ExampleUser\\AppData\\Roaming\\Locus\\temp\\locus-temp-test.txt</code>";
     const result = injectAssetRefs(html);
@@ -519,6 +608,71 @@ describe("injectUnityPropertyFenceRefs", () => {
       componentIndex: 0,
       propertyPath: "m_LocalScale",
     });
+  });
+
+  it("groups consecutive properties by the same object or component target", () => {
+    const result = parseUnityPropertyFence([
+      "Assets/Scenes/Main.unity/Player#m_Name",
+      "Assets/Scenes/Main.unity/Player#m_IsActive",
+      "Assets/Scenes/Main.unity/Player#UnityEngine.Transform:m_LocalPosition",
+      "Assets/Scenes/Main.unity/Player#UnityEngine.Transform:m_LocalRotation",
+      "Assets/Scenes/Main.unity/Player#UnityEngine.Animator:m_Enabled",
+      "Assets/Scenes/Main.unity/Player#UnityEngine.Transform:m_LocalScale",
+    ].join("\n"));
+
+    const groups = groupUnityPropertyFenceItems(result.entries, (entry) => entry);
+
+    expect(result.issues).toHaveLength(0);
+    expect(groups.map((group) =>
+      group.items.map((entry) => entry.target.propertyPath),
+    )).toEqual([
+      ["m_Name", "m_IsActive"],
+      ["m_LocalPosition", "m_LocalRotation"],
+      ["m_Enabled"],
+      ["m_LocalScale"],
+    ]);
+  });
+
+  it("resolves row targets for Unity selection actions", () => {
+    expect(unityPropertyFenceUnitySelectionTarget({
+      kind: "component",
+      scenePath: "Assets/Scenes/Main.unity",
+      objectPath: "Player",
+      componentType: "UnityEngine.Transform",
+      componentIndex: 0,
+      propertyPath: "m_LocalPosition",
+    })).toEqual({
+      kind: "sceneObject",
+      scenePath: "Assets/Scenes/Main.unity",
+      objectPath: "Player",
+    });
+
+    expect(unityPropertyFenceUnitySelectionTarget({
+      kind: "asset",
+      path: "Assets/Data/Config.asset",
+      propertyPath: "m_Name",
+    })).toEqual({
+      kind: "asset",
+      path: "Assets/Data/Config.asset",
+    });
+
+    expect(unityPropertyFenceUnitySelectionTarget({
+      kind: "component",
+      path: "Assets/Prefabs/Enemy.prefab",
+      objectPath: "Body",
+      componentType: "Renderer",
+      componentIndex: 0,
+      propertyPath: "m_Enabled",
+    })).toEqual({
+      kind: "asset",
+      path: "Assets/Prefabs/Enemy.prefab",
+    });
+
+    expect(unityPropertyFenceUnitySelectionTarget({
+      kind: "asset",
+      guid: "0123456789abcdef0123456789abcdef",
+      propertyPath: "m_Name",
+    })).toBeNull();
   });
 });
 
