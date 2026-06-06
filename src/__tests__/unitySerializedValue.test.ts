@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   applyUnityRgbHexToColorText,
+  constrainUnityNumberDragValue,
   constrainUnityNumberValue,
   formatUnityNumberValue,
   formatUnityQuaternionEulerValue,
@@ -95,6 +96,14 @@ describe("unitySerializedValue", () => {
     expect(constrainUnityNumberValue("Float", -0.25, { hasRange: true, rangeMin: 0, rangeMax: 1 })).toBe(0);
     expect(constrainUnityNumberValue("Integer", 2.6, { hasRange: true, rangeMin: 0, rangeMax: 10 })).toBe(3);
     expect(formatUnityNumberValue("Float", 0.1 + 0.2, { hasRange: true, rangeMin: 0, rangeMax: 1 })).toBe("0.3");
+  });
+
+  it("quantizes float drag values to 0.01 without changing typed float constraints", () => {
+    expect(constrainUnityNumberDragValue("Float", 1.234)).toBe(1.23);
+    expect(constrainUnityNumberDragValue("Float", 1.235)).toBe(1.24);
+    expect(constrainUnityNumberDragValue("Float", 0.1 + 0.2)).toBe(0.3);
+    expect(constrainUnityNumberDragValue("Integer", 2.6)).toBe(3);
+    expect(constrainUnityNumberValue("Float", 1.234)).toBe(1.234);
   });
 
   it("rejects partial numeric input before committing", () => {

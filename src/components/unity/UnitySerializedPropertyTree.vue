@@ -19,6 +19,8 @@ import type {
   UnitySerializedPropertySnapshot,
 } from "./unitySerializedValue";
 import {
+  UNITY_FLOAT_DRAG_STEP,
+  constrainUnityNumberDragValue,
   constrainUnityNumberValue,
   formatUnityNumberValue,
   isUnityIntegerPropertyType,
@@ -308,17 +310,22 @@ function numberValue(property: InspectorProperty, rawValue: unknown): number | n
 }
 
 function numberDragStep(property: InspectorProperty, startValue: number): number {
-  if (property.numberStep > 0) return property.numberStep;
-  if (isUnityIntegerPropertyType(property.valueType)) return 1;
+  const isInteger = isUnityIntegerPropertyType(property.valueType);
+  if (isInteger) return 1;
+  if (property.numberStep > 0) return Math.max(UNITY_FLOAT_DRAG_STEP, property.numberStep);
   if (property.hasRange && Number.isFinite(property.rangeMin) && Number.isFinite(property.rangeMax)) {
     const range = Math.abs(property.rangeMax - property.rangeMin);
-    if (range > 0) return range / 200;
+    if (range > 0) return Math.max(UNITY_FLOAT_DRAG_STEP, range / 200);
   }
   const magnitude = Math.abs(startValue);
   if (magnitude >= 1000) return 10;
   if (magnitude >= 100) return 1;
   if (magnitude >= 10) return 0.1;
-  return 0.01;
+  return UNITY_FLOAT_DRAG_STEP;
+}
+
+function numberDragValue(property: InspectorProperty, rawValue: number): number {
+  return constrainUnityNumberDragValue(property.valueType, rawValue, numberConstraints(property));
 }
 
 function numberDragMultiplier(event: PointerEvent | KeyboardEvent): number {
@@ -356,7 +363,7 @@ function handleNumberLabelDragMove(event: PointerEvent) {
   event.preventDefault();
   const delta = event.clientX - drag.startX;
   const rawValue = drag.startValue + delta * drag.step * numberDragMultiplier(event);
-  const nextValue = constrainUnityNumberValue(drag.property.valueType, rawValue, numberConstraints(drag.property));
+  const nextValue = numberDragValue(drag.property, rawValue);
   if (Object.is(nextValue, drag.latestValue)) return;
   drag.latestValue = nextValue;
   numberLabelDragPreview.value = { propertyPath: drag.propertyPath, value: nextValue };
@@ -403,7 +410,7 @@ function nudgeNumberLabel(property: InspectorProperty, direction: 1 | -1, event:
   if (currentValue == null) return;
   event.preventDefault();
   const rawValue = currentValue + direction * numberDragStep(property, currentValue) * numberDragMultiplier(event);
-  const nextValue = constrainUnityNumberValue(property.valueType, rawValue, numberConstraints(property));
+  const nextValue = numberDragValue(property, rawValue);
   numberLabelDragPreview.value = { propertyPath: property.propertyPath, value: nextValue };
   emitCommit(property, nextValue);
 }
