@@ -24,6 +24,10 @@ describe("native Windows resize sync", () => {
     expect(cargo).toContain('"Win32_Graphics_Dwm"');
     expect(tauriConfig).toContain('"shadow": true');
     expect(frame).toContain(".set_shadow(true)");
+    expect(frame).toContain("WINDOWS_11_MIN_BUILD: u32 = 22000");
+    expect(frame).toContain("supports_dwm_corner_preference()");
+    expect(frame).toContain("CurrentBuildNumber");
+    expect(frame).toMatch(/if\s+!supports_dwm_corner_preference\(\)\s*\{\s*return;\s*\}/);
     expect(frame).toContain("DwmSetWindowAttribute");
     expect(frame).toContain("DWMWA_WINDOW_CORNER_PREFERENCE");
     expect(frame).toContain("DWMWCP_ROUND");
