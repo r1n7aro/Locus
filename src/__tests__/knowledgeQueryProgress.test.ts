@@ -26,15 +26,22 @@ describe("knowledgeQueryProgress", () => {
     expect(indexSource).toContain("Checking knowledge catalog");
     expect(indexSource).toContain("Running lexical index search");
     expect(indexSource).toContain("Running text scan");
+    expect(indexSource).toContain("Checking text scan documents");
     expect(indexSource).toContain("Loading text scan documents");
     expect(indexSource).toContain("Scanning knowledge text");
     expect(indexSource).toContain("Sorting text scan results");
     expect(indexSource).toContain("knowledge_query text scan timed out");
+    expect(indexSource).toContain("Text scan document limit exceeded");
+    expect(indexSource).toContain("knowledge_query text scan can scan at most");
     expect(indexSource).toContain("Checking semantic search");
     expect(indexSource).toContain("Running semantic search");
     expect(indexSource).toContain("Loading matched documents");
     expect(indexSource).toContain("Filtering knowledge access");
     expect(indexSource).toContain("Ranking knowledge results");
+
+    expect(agentSource).toContain("knowledge.query_text_scan_too_large");
+    expect(agentSource).toContain("知识文档数量过多");
+    expect(agentSource).toContain("AppError::emit_background");
   });
 
   it("uses a dedicated knowledge_query tool block for visible runtime stages", () => {

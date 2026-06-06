@@ -96,6 +96,23 @@ fn user_friendly_llm_error(error: &str) -> String {
     error.to_string()
 }
 
+fn is_knowledge_query_text_scan_limit_error(error: &str) -> bool {
+    error.contains("knowledge_query text scan can scan at most")
+        && error.contains("Enable the knowledge lexical index")
+}
+
+fn knowledge_query_text_scan_limit_notice(error: &str) -> String {
+    let document_count = error
+        .split("this request would scan ")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .unwrap_or("500+");
+    format!(
+        "知识文档数量过多，回退 grep 最多扫描 500 个文档；当前需要扫描 {} 个。请开启全文检索并重建索引。",
+        document_count
+    )
+}
+
 async fn resolve_codex_request_auth(
     auth: &crate::commands::CodexAuthStateHandle,
     force_refresh: bool,
@@ -783,6 +800,7 @@ struct AgentSkillListArgs {
 enum ToolConfirmDecision {
     Allow,
     Deny { feedback: Option<String> },
+    PreflightError { output: String },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1411,6 +1429,24 @@ fn assess_knowledge_tool_confirmation(
             == KnowledgeToolConfirmDirectoryMode::Approval,
         preview,
     }))
+}
+
+fn knowledge_tool_confirm_preflight_error(tool_name: &str, error: String) -> ToolConfirmDecision {
+    ToolConfirmDecision::PreflightError {
+        output: format!(
+            "Error preparing {} confirmation preview: {}",
+            tool_name, error
+        ),
+    }
+}
+
+fn assess_knowledge_tool_confirmation_decision(
+    working_dir: &str,
+    tool_name: &str,
+    args: &serde_json::Value,
+) -> Result<Option<KnowledgeToolConfirmAssessment>, ToolConfirmDecision> {
+    assess_knowledge_tool_confirmation(working_dir, tool_name, args)
+        .map_err(|error| knowledge_tool_confirm_preflight_error(tool_name, error))
 }
 
 #[derive(Debug, Clone)]
@@ -8568,18 +8604,18 @@ impl AgentInstance {
             tool_name,
             "knowledge_create" | "knowledge_edit" | "knowledge_move" | "knowledge_delete"
         ) {
-            match assess_knowledge_tool_confirmation(&self.working_dir, tool_name, args) {
+            match assess_knowledge_tool_confirmation_decision(&self.working_dir, tool_name, args) {
                 Ok(Some(assessment)) => {
                     knowledge_governance_triggered = assessment.governance_requires_confirm;
                     knowledge_preview = Some(assessment.preview);
                 }
                 Ok(None) => {}
-                Err(error) => {
-                    knowledge_governance_triggered = true;
+                Err(decision) => {
                     eprintln!(
-                        "[Agent {}] knowledge tool confirm preview failed for '{}' (id={}): {}",
-                        self.id, tool_name, tool_call_id, error
+                        "[Agent {}] knowledge tool confirm preflight failed for '{}' (id={})",
+                        self.id, tool_name, tool_call_id
                     );
+                    return decision;
                 }
             }
         }
@@ -8687,6 +8723,9 @@ impl AgentInstance {
                         feedback: Some(feedback),
                     } => format!("rejected with feedback: {}", feedback),
                     ToolConfirmDecision::Deny { feedback: None } => "denied".to_string(),
+                    ToolConfirmDecision::PreflightError { output } => {
+                        format!("failed preflight: {}", output)
+                    }
                 };
                 eprintln!(
                     "[Agent {}] tool confirm: user {} '{}' (question_id={})",
@@ -8795,6 +8834,9 @@ impl AgentInstance {
                         feedback: Some(feedback),
                     } => format!("rejected with feedback: {}", feedback),
                     ToolConfirmDecision::Deny { feedback: None } => "denied".to_string(),
+                    ToolConfirmDecision::PreflightError { output } => {
+                        format!("failed preflight: {}", output)
+                    }
                 };
                 eprintln!(
                     "[Agent {}] {} status change confirm: user {} (question_id={})",
@@ -9000,6 +9042,12 @@ impl AgentInstance {
                     ),
                     None => format!("Tool '{}' was denied by user", tc.name),
                 };
+                return ExecutedToolResult::from_tool_result(ToolResult {
+                    output,
+                    is_error: true,
+                });
+            }
+            ToolConfirmDecision::PreflightError { output } => {
                 return ExecutedToolResult::from_tool_result(ToolResult {
                     output,
                     is_error: true,
@@ -9703,7 +9751,21 @@ impl AgentInstance {
                 }
             }
             Err(error) => {
-                let failed_title = if error.contains("timed out") {
+                if is_knowledge_query_text_scan_limit_error(&error) {
+                    crate::error::AppError::emit_background(
+                        app_handle,
+                        &crate::error::AppError::new(
+                            "knowledge.query_text_scan_too_large",
+                            knowledge_query_text_scan_limit_notice(&error),
+                        )
+                        .detail(error.clone())
+                        .operation("knowledge_query")
+                        .severity(crate::error::ErrorSeverity::Error),
+                    );
+                }
+                let failed_title = if is_knowledge_query_text_scan_limit_error(&error) {
+                    "Knowledge query document limit exceeded"
+                } else if error.contains("timed out") {
                     "Knowledge query timed out"
                 } else {
                     "Knowledge query failed"
@@ -10743,6 +10805,12 @@ impl AgentInstance {
                         is_error: true,
                     });
                 }
+                ToolConfirmDecision::PreflightError { output } => {
+                    return ExecutedToolResult::from_tool_result(ToolResult {
+                        output,
+                        is_error: true,
+                    });
+                }
             }
 
             if let Err(error) =
@@ -10884,6 +10952,12 @@ impl AgentInstance {
                         None => "User cancelled compilation".to_string(),
                     };
                     return ToolResult { output, is_error };
+                }
+                ToolConfirmDecision::PreflightError { output } => {
+                    return ToolResult {
+                        output,
+                        is_error: true,
+                    };
                 }
             }
 
@@ -11028,6 +11102,12 @@ impl AgentInstance {
                         ),
                         None => "user_denied_editor_state_change".to_string(),
                     };
+                    return ToolResult {
+                        output,
+                        is_error: true,
+                    };
+                }
+                ToolConfirmDecision::PreflightError { output } => {
                     return ToolResult {
                         output,
                         is_error: true,
@@ -13009,13 +13089,13 @@ impl AgentInstance {
 #[cfg(test)]
 mod tests {
     use super::{
-        assess_knowledge_tool_confirmation, build_l2_full_document_section, build_l3_rule_section,
-        build_prompt_tree, build_structure_section, finalize_tool_call_record, render_tree_lines,
-        utf8_prefix_chars, AgentInstance, AgentKnowledgeDocumentContent,
-        AgentKnowledgeDocumentContentPatch, AgentKnowledgeListItem, AgentKnowledgeMutationResponse,
-        AgentKnowledgeReadResponse, AgentKnowledgeSearchHit, ExecutedToolResult,
-        InjectedPromptItem, KnowledgeAccessMode, ParentToolCall, PromptKnowledgeItem,
-        RawContextStore, ToolRunOutcome,
+        assess_knowledge_tool_confirmation, assess_knowledge_tool_confirmation_decision,
+        build_l2_full_document_section, build_l3_rule_section, build_prompt_tree,
+        build_structure_section, finalize_tool_call_record, render_tree_lines, utf8_prefix_chars,
+        AgentInstance, AgentKnowledgeDocumentContent, AgentKnowledgeDocumentContentPatch,
+        AgentKnowledgeListItem, AgentKnowledgeMutationResponse, AgentKnowledgeReadResponse,
+        AgentKnowledgeSearchHit, ExecutedToolResult, InjectedPromptItem, KnowledgeAccessMode,
+        ParentToolCall, PromptKnowledgeItem, RawContextStore, ToolConfirmDecision, ToolRunOutcome,
     };
     use crate::agent::definition::{AgentDef, AgentDefRegistry};
     use crate::commands::{
@@ -15228,6 +15308,40 @@ Audit and export a plugin.
             preview.structure_after_paths,
             vec!["design/combat".to_string()]
         );
+    }
+
+    #[test]
+    fn knowledge_edit_confirm_preflight_errors_when_old_string_does_not_match() {
+        let temp = tempdir().expect("temp dir");
+        let working_dir = temp.path().to_string_lossy().to_string();
+        let mut document = sample_agent_knowledge_document("combat/core-loop.md", "Core Loop");
+        document.body = "Damage remains 20.".to_string();
+        save_document(&working_dir, document).expect("save document");
+
+        let decision = assess_knowledge_tool_confirmation_decision(
+            &working_dir,
+            "knowledge_edit",
+            &json!({
+                "path": "design/combat/core-loop.md",
+                "document": {
+                    "edits": [{
+                        "section": "body",
+                        "oldString": "Damage remains 15.",
+                        "newString": "Damage remains 30."
+                    }]
+                }
+            }),
+        )
+        .expect_err("knowledge_edit confirmation preflight should fail");
+
+        match decision {
+            ToolConfirmDecision::PreflightError { output } => {
+                assert!(output.contains("Error preparing knowledge_edit confirmation preview"));
+                assert!(output.contains("document.edits[0] body"));
+                assert!(output.contains("Could not find oldString"));
+            }
+            _ => panic!("expected knowledge_edit preflight error"),
+        }
     }
 
     #[test]

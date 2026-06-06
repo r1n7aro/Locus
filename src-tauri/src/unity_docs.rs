@@ -3872,6 +3872,123 @@ fn list_documents_from_store(
     }
 }
 
+fn list_document_paths_from_store(
+    store_path: &Path,
+    path_prefix: Option<&str>,
+) -> Result<Vec<String>, String> {
+    if !store_path.is_file() {
+        return Ok(Vec::new());
+    }
+    let conn = open_unity_reference_store_readonly(store_path)?;
+    let normalized_prefix = path_prefix
+        .map(|value| value.trim().trim_matches('/').replace('\\', "/"))
+        .filter(|value| !value.is_empty());
+
+    match normalized_prefix {
+        Some(prefix) => {
+            let like = format!("{}/%", prefix);
+            let mut stmt = conn
+                .prepare(
+                    "SELECT path
+                     FROM documents
+                     WHERE path = ?1 OR path LIKE ?2
+                     ORDER BY path",
+                )
+                .map_err(|e| {
+                    format!(
+                        "Failed to prepare Unity reference path prefix query '{}': {}",
+                        store_path.display(),
+                        e
+                    )
+                })?;
+            let rows = stmt
+                .query_map(params![prefix, like], |row| row.get::<_, String>(0))
+                .map_err(|e| {
+                    format!(
+                        "Failed to query Unity reference document paths '{}': {}",
+                        store_path.display(),
+                        e
+                    )
+                })?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(|e| {
+                format!(
+                    "Failed to decode Unity reference path row '{}': {}",
+                    store_path.display(),
+                    e
+                )
+            })
+        }
+        None => {
+            let mut stmt = conn
+                .prepare("SELECT path FROM documents ORDER BY path")
+                .map_err(|e| {
+                    format!(
+                        "Failed to prepare Unity reference path full scan '{}': {}",
+                        store_path.display(),
+                        e
+                    )
+                })?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|e| {
+                    format!(
+                        "Failed to query Unity reference document paths '{}': {}",
+                        store_path.display(),
+                        e
+                    )
+                })?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(|e| {
+                format!(
+                    "Failed to decode Unity reference path row '{}': {}",
+                    store_path.display(),
+                    e
+                )
+            })
+        }
+    }
+}
+
+fn count_document_paths_from_store(
+    store_path: &Path,
+    path_prefix: Option<&str>,
+) -> Result<usize, String> {
+    if !store_path.is_file() {
+        return Ok(0);
+    }
+    let conn = open_unity_reference_store_readonly(store_path)?;
+    let normalized_prefix = path_prefix
+        .map(|value| value.trim().trim_matches('/').replace('\\', "/"))
+        .filter(|value| !value.is_empty());
+
+    let count: i64 = match normalized_prefix {
+        Some(prefix) => {
+            let like = format!("{}/%", prefix);
+            conn.query_row(
+                "SELECT COUNT(*) FROM documents WHERE path = ?1 OR path LIKE ?2",
+                params![prefix, like],
+                |row| row.get(0),
+            )
+            .map_err(|e| {
+                format!(
+                    "Failed to count Unity reference document paths '{}': {}",
+                    store_path.display(),
+                    e
+                )
+            })?
+        }
+        None => conn
+            .query_row("SELECT COUNT(*) FROM documents", [], |row| row.get(0))
+            .map_err(|e| {
+                format!(
+                    "Failed to count Unity reference document paths '{}': {}",
+                    store_path.display(),
+                    e
+                )
+            })?,
+    };
+    Ok(count.max(0) as usize)
+}
+
 pub fn ensure_managed_store_available(_working_dir: &str) -> Result<(), String> {
     Ok(())
 }
@@ -3910,6 +4027,54 @@ pub fn list_managed_documents(
         return Ok(Vec::new());
     }
     list_documents_from_store(
+        &managed_store_path(working_dir),
+        normalized_prefix.as_deref(),
+    )
+}
+
+pub fn list_managed_document_paths(
+    working_dir: &str,
+    path_prefix: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let normalized_prefix = path_prefix
+        .map(|value| value.trim().trim_matches('/').replace('\\', "/"))
+        .filter(|value| !value.is_empty());
+    if normalized_prefix
+        .as_deref()
+        .map(|value| !is_unity_reference_managed_relative_path(value))
+        .unwrap_or(false)
+    {
+        return Ok(Vec::new());
+    }
+    ensure_managed_store_available(working_dir)?;
+    if !has_managed_store(working_dir) {
+        return Ok(Vec::new());
+    }
+    list_document_paths_from_store(
+        &managed_store_path(working_dir),
+        normalized_prefix.as_deref(),
+    )
+}
+
+pub fn count_managed_document_paths(
+    working_dir: &str,
+    path_prefix: Option<&str>,
+) -> Result<usize, String> {
+    let normalized_prefix = path_prefix
+        .map(|value| value.trim().trim_matches('/').replace('\\', "/"))
+        .filter(|value| !value.is_empty());
+    if normalized_prefix
+        .as_deref()
+        .map(|value| !is_unity_reference_managed_relative_path(value))
+        .unwrap_or(false)
+    {
+        return Ok(0);
+    }
+    ensure_managed_store_available(working_dir)?;
+    if !has_managed_store(working_dir) {
+        return Ok(0);
+    }
+    count_document_paths_from_store(
         &managed_store_path(working_dir),
         normalized_prefix.as_deref(),
     )

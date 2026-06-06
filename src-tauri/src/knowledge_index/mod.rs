@@ -53,6 +53,7 @@ const UNITY_IMPORT_BULK_MAX_CHUNKS_PER_COMMIT: usize = 8192;
 const KNOWLEDGE_RUNTIME_LOCK_RETRY_ATTEMPTS: usize = 20;
 const KNOWLEDGE_RUNTIME_LOCK_RETRY_DELAY_MS: u64 = 50;
 const KNOWLEDGE_QUERY_TEXT_SCAN_TIMEOUT: Duration = Duration::from_secs(30);
+const KNOWLEDGE_QUERY_TEXT_SCAN_MAX_DOCUMENTS: usize = 500;
 const TEXT_SCAN_PROGRESS_EMIT_DOC_INTERVAL: usize = 32;
 pub const KNOWLEDGE_LEXICAL_REBUILD_STATUS_EVENT: &str = "knowledge-lexical-rebuild-status";
 
@@ -4157,22 +4158,6 @@ fn document_is_excluded(
     })
 }
 
-fn document_allows_model_recall(
-    working_dir: &str,
-    document: &KnowledgeDocument,
-) -> Result<bool, String> {
-    if document.doc_type != KnowledgeType::Skill {
-        return Ok(true);
-    }
-    if let Some(allowed) = crate::commands::skill_package_virtual_path_allows_model_recall_sync(
-        working_dir,
-        &document.path,
-    )? {
-        return Ok(allowed);
-    }
-    Ok(knowledge_store::document_allows_model_recall(document))
-}
-
 fn cached_document_entry_allows_model_recall(
     working_dir: &str,
     document: &CachedDocumentEntry,
@@ -4716,6 +4701,12 @@ struct TextScanDeadline {
     cancel_requested: Arc<AtomicBool>,
 }
 
+#[derive(Debug, Clone)]
+struct TextScanDocumentCandidate {
+    doc_type: KnowledgeType,
+    path: String,
+}
+
 impl TextScanDeadline {
     fn new(timeout: Duration, cancel_requested: Arc<AtomicBool>) -> Self {
         Self {
@@ -4741,6 +4732,344 @@ fn text_scan_timeout_error(timeout: Duration, stage: &str) -> String {
         timeout.as_millis(),
         stage
     )
+}
+
+fn text_scan_document_limit_error(document_count: usize) -> String {
+    format!(
+        "knowledge_query text scan can scan at most {} documents; this request would scan {} documents. Enable the knowledge lexical index before searching larger knowledge sets.",
+        KNOWLEDGE_QUERY_TEXT_SCAN_MAX_DOCUMENTS, document_count
+    )
+}
+
+fn normalize_text_scan_path_prefix(path_prefix: Option<&str>) -> Result<Option<String>, String> {
+    let Some(path_prefix) = path_prefix else {
+        return Ok(None);
+    };
+    let trimmed = path_prefix.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.contains("..") || trimmed.starts_with('/') || trimmed.starts_with('\\') {
+        return Err("Path prefix must be relative to the knowledge root".to_string());
+    }
+
+    let normalized = trimmed.replace('\\', "/");
+    let normalized = normalized
+        .strip_prefix("Locus/knowledge/")
+        .unwrap_or(&normalized);
+    let normalized = normalized
+        .strip_prefix("design/")
+        .or_else(|| normalized.strip_prefix("memory/"))
+        .or_else(|| normalized.strip_prefix("skill/"))
+        .or_else(|| normalized.strip_prefix("reference/"))
+        .unwrap_or(normalized);
+    let normalized = normalized.trim_matches('/').to_string();
+    Ok((!normalized.is_empty()).then_some(normalized))
+}
+
+fn text_scan_path_matches_prefix(path: &str, prefix: Option<&str>) -> bool {
+    let Some(prefix) = prefix else {
+        return true;
+    };
+    path == prefix
+        || path
+            .strip_prefix(prefix)
+            .map(|suffix| suffix.starts_with('/'))
+            .unwrap_or(false)
+}
+
+fn text_scan_candidate_key(doc_type: KnowledgeType, path: &str) -> String {
+    format!("{}/{}", doc_type.as_str(), path)
+}
+
+fn collect_text_scan_file_candidates_from_root(
+    working_dir: &str,
+    root: &Path,
+    doc_type: KnowledgeType,
+    normalized_prefix: Option<&str>,
+    skip_managed_reference_dir: bool,
+    seen: &mut HashSet<String>,
+    candidates: &mut Vec<TextScanDocumentCandidate>,
+) {
+    if !root.is_dir() {
+        return;
+    }
+    let skip_managed_reference_dir = skip_managed_reference_dir
+        && doc_type == KnowledgeType::Reference
+        && crate::unity_docs::has_managed_store(working_dir);
+
+    for entry in WalkDir::new(root)
+        .into_iter()
+        .filter_entry(|entry| {
+            if !skip_managed_reference_dir {
+                return true;
+            }
+            let Ok(relative) = entry.path().strip_prefix(root) else {
+                return true;
+            };
+            let relative = relative.to_string_lossy().replace('\\', "/");
+            !crate::unity_docs::is_unity_reference_managed_relative_path(&relative)
+        })
+        .filter_map(Result::ok)
+    {
+        let path = entry.path();
+        if !path.is_file() || path.extension().and_then(|ext| ext.to_str()) != Some("md") {
+            continue;
+        }
+        let Ok(relative) = path.strip_prefix(root) else {
+            continue;
+        };
+        let relative_path = relative.to_string_lossy().replace('\\', "/");
+        if !text_scan_path_matches_prefix(&relative_path, normalized_prefix) {
+            continue;
+        }
+        if !seen.insert(text_scan_candidate_key(doc_type, &relative_path)) {
+            continue;
+        }
+        candidates.push(TextScanDocumentCandidate {
+            doc_type,
+            path: relative_path,
+        });
+    }
+}
+
+fn count_text_scan_file_candidates_from_root(
+    working_dir: &str,
+    root: &Path,
+    doc_type: KnowledgeType,
+    normalized_prefix: Option<&str>,
+    skip_managed_reference_dir: bool,
+    seen: &mut HashSet<String>,
+    count: &mut usize,
+) {
+    if !root.is_dir() || *count > KNOWLEDGE_QUERY_TEXT_SCAN_MAX_DOCUMENTS {
+        return;
+    }
+    let skip_managed_reference_dir = skip_managed_reference_dir
+        && doc_type == KnowledgeType::Reference
+        && crate::unity_docs::has_managed_store(working_dir);
+
+    for entry in WalkDir::new(root)
+        .into_iter()
+        .filter_entry(|entry| {
+            if !skip_managed_reference_dir {
+                return true;
+            }
+            let Ok(relative) = entry.path().strip_prefix(root) else {
+                return true;
+            };
+            let relative = relative.to_string_lossy().replace('\\', "/");
+            !crate::unity_docs::is_unity_reference_managed_relative_path(&relative)
+        })
+        .filter_map(Result::ok)
+    {
+        if *count > KNOWLEDGE_QUERY_TEXT_SCAN_MAX_DOCUMENTS {
+            return;
+        }
+        let path = entry.path();
+        if !path.is_file() || path.extension().and_then(|ext| ext.to_str()) != Some("md") {
+            continue;
+        }
+        let Ok(relative) = path.strip_prefix(root) else {
+            continue;
+        };
+        let relative_path = relative.to_string_lossy().replace('\\', "/");
+        if !text_scan_path_matches_prefix(&relative_path, normalized_prefix) {
+            continue;
+        }
+        if !seen.insert(text_scan_candidate_key(doc_type, &relative_path)) {
+            continue;
+        }
+        *count += 1;
+    }
+}
+
+fn add_text_scan_candidate_count(count: &mut usize, additional: usize) -> Result<(), String> {
+    *count = count.saturating_add(additional);
+    if *count > KNOWLEDGE_QUERY_TEXT_SCAN_MAX_DOCUMENTS {
+        return Err(text_scan_document_limit_error(*count));
+    }
+    Ok(())
+}
+
+fn count_text_scan_candidate_documents(
+    working_dir: &str,
+    app_knowledge_dir: Option<&std::path::PathBuf>,
+    types: Option<&[KnowledgeType]>,
+    path_prefix: Option<&str>,
+    include_hidden: bool,
+) -> Result<usize, String> {
+    knowledge_store::ensure_knowledge_roots(working_dir)?;
+    knowledge_store::ensure_memory_builtin_documents(working_dir)?;
+
+    let normalized_prefix = normalize_text_scan_path_prefix(path_prefix)?;
+    let selected_types = types
+        .map(|values| values.to_vec())
+        .unwrap_or_else(|| KnowledgeType::all().to_vec());
+    let mut seen = HashSet::new();
+    let mut count = 0usize;
+    let workspace_root = knowledge_store::knowledge_root(working_dir);
+
+    for doc_type in selected_types {
+        let root = workspace_root.join(doc_type.as_str());
+        count_text_scan_file_candidates_from_root(
+            working_dir,
+            &root,
+            doc_type,
+            normalized_prefix.as_deref(),
+            true,
+            &mut seen,
+            &mut count,
+        );
+        if count > KNOWLEDGE_QUERY_TEXT_SCAN_MAX_DOCUMENTS {
+            return Err(text_scan_document_limit_error(count));
+        }
+
+        if doc_type == KnowledgeType::Reference {
+            let managed_count = crate::unity_docs::count_managed_document_paths(
+                working_dir,
+                normalized_prefix.as_deref(),
+            )?;
+            add_text_scan_candidate_count(&mut count, managed_count)?;
+        }
+
+        if let Some(app_root) = app_knowledge_dir {
+            let app_type_root = app_root.join(doc_type.as_str());
+            count_text_scan_file_candidates_from_root(
+                working_dir,
+                &app_type_root,
+                doc_type,
+                normalized_prefix.as_deref(),
+                false,
+                &mut seen,
+                &mut count,
+            );
+            if count > KNOWLEDGE_QUERY_TEXT_SCAN_MAX_DOCUMENTS {
+                return Err(text_scan_document_limit_error(count));
+            }
+        }
+    }
+
+    if types
+        .map(|values| values.contains(&KnowledgeType::Skill))
+        .unwrap_or(true)
+    {
+        add_text_scan_candidate_count(
+            &mut count,
+            crate::commands::list_skill_package_knowledge_items_sync_with_hidden(
+                working_dir,
+                path_prefix,
+                include_hidden,
+            )
+            .len(),
+        )?;
+    }
+
+    Ok(count)
+}
+
+fn text_scan_candidate_allows_model_recall(
+    working_dir: &str,
+    candidate: &TextScanDocumentCandidate,
+) -> Result<bool, String> {
+    if candidate.doc_type != KnowledgeType::Skill {
+        return Ok(true);
+    }
+    if let Some(allowed) = crate::commands::skill_package_virtual_path_allows_model_recall_sync(
+        working_dir,
+        &candidate.path,
+    )? {
+        return Ok(allowed);
+    }
+    Ok(true)
+}
+
+fn collect_searchable_text_scan_candidates(
+    working_dir: &str,
+    app_knowledge_dir: Option<&std::path::PathBuf>,
+    types: Option<&[KnowledgeType]>,
+    path_prefix: Option<&str>,
+    include_hidden: bool,
+    deadline: &TextScanDeadline,
+) -> Result<Vec<TextScanDocumentCandidate>, String> {
+    knowledge_store::ensure_knowledge_roots(working_dir)?;
+    knowledge_store::ensure_memory_builtin_documents(working_dir)?;
+
+    let normalized_prefix = normalize_text_scan_path_prefix(path_prefix)?;
+    let selected_types = types
+        .map(|values| values.to_vec())
+        .unwrap_or_else(|| KnowledgeType::all().to_vec());
+    if selected_types.contains(&KnowledgeType::Reference) {
+        crate::unity_docs::ensure_managed_store_available(working_dir)?;
+    }
+
+    let mut seen = HashSet::new();
+    let mut candidates = Vec::new();
+    let workspace_root = knowledge_store::knowledge_root(working_dir);
+
+    for doc_type in selected_types {
+        deadline.check("checking text scan documents")?;
+        let root = workspace_root.join(doc_type.as_str());
+        collect_text_scan_file_candidates_from_root(
+            working_dir,
+            &root,
+            doc_type,
+            normalized_prefix.as_deref(),
+            true,
+            &mut seen,
+            &mut candidates,
+        );
+
+        if doc_type == KnowledgeType::Reference {
+            for path in crate::unity_docs::list_managed_document_paths(
+                working_dir,
+                normalized_prefix.as_deref(),
+            )? {
+                deadline.check("checking text scan documents")?;
+                if !seen.insert(text_scan_candidate_key(doc_type, &path)) {
+                    continue;
+                }
+                candidates.push(TextScanDocumentCandidate { doc_type, path });
+            }
+        }
+
+        if let Some(app_root) = app_knowledge_dir {
+            let app_type_root = app_root.join(doc_type.as_str());
+            collect_text_scan_file_candidates_from_root(
+                working_dir,
+                &app_type_root,
+                doc_type,
+                normalized_prefix.as_deref(),
+                false,
+                &mut seen,
+                &mut candidates,
+            );
+        }
+    }
+
+    let mut searchable = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        deadline.check("checking text scan documents")?;
+        let access = knowledge_store::effective_document_search_access_with_app_root(
+            working_dir,
+            app_knowledge_dir,
+            candidate.doc_type,
+            &candidate.path,
+        )
+        .ok();
+        if !access.map(|value| value.lexical_enabled).unwrap_or(false) {
+            continue;
+        }
+        if !include_hidden && !text_scan_candidate_allows_model_recall(working_dir, &candidate)? {
+            continue;
+        }
+        searchable.push(candidate);
+        if searchable.len() > KNOWLEDGE_QUERY_TEXT_SCAN_MAX_DOCUMENTS {
+            return Err(text_scan_document_limit_error(searchable.len()));
+        }
+    }
+
+    Ok(searchable)
 }
 
 fn text_scan_progress(start: f32, end: f32, processed: usize, total: usize) -> f32 {
@@ -4860,36 +5189,92 @@ where
     deadline.check("starting text scan")?;
     emit_query_progress(
         &mut on_progress,
-        "Loading text scan documents",
+        "Checking text scan documents",
         truncate_query_progress_info(query, 80),
         0.30,
     );
-
-    let mut documents = Vec::new();
-    if let Some(types) = types {
-        for doc_type in types {
-            deadline.check("loading text scan documents")?;
-            documents.extend(knowledge_store::load_documents_with_app_root(
-                working_dir,
-                app_knowledge_dir,
-                Some(*doc_type),
-                path_prefix,
-            )?);
+    if let Err(error) = count_text_scan_candidate_documents(
+        working_dir,
+        app_knowledge_dir,
+        types,
+        path_prefix,
+        include_hidden,
+    ) {
+        if error.contains("knowledge_query text scan can scan at most") {
+            emit_query_progress(
+                &mut on_progress,
+                "Text scan document limit exceeded",
+                error.clone(),
+                0.34,
+            );
         }
-    } else {
-        deadline.check("loading text scan documents")?;
-        documents = knowledge_store::load_documents_with_app_root(
-            working_dir,
-            app_knowledge_dir,
-            None,
-            path_prefix,
-        )?;
+        return Err(error);
     }
+    deadline.check("checking text scan documents")?;
+
+    let candidates = collect_searchable_text_scan_candidates(
+        working_dir,
+        app_knowledge_dir,
+        types,
+        path_prefix,
+        include_hidden,
+        &deadline,
+    )?;
+    let mut total_documents = candidates.len();
+
     if types
         .map(|values| values.contains(&KnowledgeType::Skill))
         .unwrap_or(true)
     {
-        documents.extend(
+        total_documents += crate::commands::list_skill_package_knowledge_items_sync_with_hidden(
+            working_dir,
+            path_prefix,
+            include_hidden,
+        )
+        .len();
+    }
+    if total_documents > KNOWLEDGE_QUERY_TEXT_SCAN_MAX_DOCUMENTS {
+        let error = text_scan_document_limit_error(total_documents);
+        emit_query_progress(
+            &mut on_progress,
+            "Text scan document limit exceeded",
+            error.clone(),
+            0.34,
+        );
+        return Err(error);
+    }
+
+    emit_query_progress(
+        &mut on_progress,
+        "Loading text scan documents",
+        format!("0 / {} document(s)", total_documents),
+        0.32,
+    );
+
+    let mut searchable_documents = Vec::with_capacity(total_documents);
+    for (index, candidate) in candidates.into_iter().enumerate() {
+        deadline.check("loading text scan documents")?;
+        if index == 0 || index % TEXT_SCAN_PROGRESS_EMIT_DOC_INTERVAL == 0 {
+            emit_query_progress(
+                &mut on_progress,
+                "Loading text scan documents",
+                format!("{} / {} document(s)", index, total_documents),
+                text_scan_progress(0.32, 0.34, index, total_documents),
+            );
+        }
+        searchable_documents.push(knowledge_store::load_document_by_path_with_app_root(
+            working_dir,
+            app_knowledge_dir,
+            candidate.doc_type,
+            &candidate.path,
+        )?);
+    }
+
+    if types
+        .map(|values| values.contains(&KnowledgeType::Skill))
+        .unwrap_or(true)
+    {
+        searchable_documents.extend(
             crate::commands::list_skill_package_knowledge_documents_sync_with_hidden(
                 working_dir,
                 path_prefix,
@@ -4898,8 +5283,6 @@ where
         );
     }
 
-    deadline.check("loading text scan documents")?;
-    let total_documents = documents.len();
     emit_query_progress(
         &mut on_progress,
         "Scanning knowledge text",
@@ -4908,7 +5291,7 @@ where
     );
 
     let mut hits = Vec::new();
-    for (index, document) in documents.into_iter().enumerate() {
+    for (index, document) in searchable_documents.into_iter().enumerate() {
         deadline.check("scanning knowledge documents")?;
         if index == 0 || index % TEXT_SCAN_PROGRESS_EMIT_DOC_INTERVAL == 0 {
             emit_query_progress(
@@ -4919,19 +5302,6 @@ where
             );
         }
 
-        let access = knowledge_store::effective_document_search_access_with_app_root(
-            working_dir,
-            app_knowledge_dir,
-            document.doc_type,
-            &document.path,
-        )
-        .ok();
-        if !access.map(|value| value.lexical_enabled).unwrap_or(false) {
-            continue;
-        }
-        if !include_hidden && !document_allows_model_recall(working_dir, &document)? {
-            continue;
-        }
         if let Some((score, snippet, matched_section, matched_terms)) =
             knowledge_store::score_document_text_match_with_terms(query, &document)
         {
@@ -5178,9 +5548,10 @@ mod tests {
         list_cached_documents, needs_embedding_backfill, plan_managed_directory_reuse,
         query_documents, query_documents_with_progress_with_timeout, rebuild_plan_for_document,
         rebuild_reason_for_document, reconcile_unity_reference_import,
-        reconcile_workspace_internal, save_general_config, DirectorySearchAccess,
-        KnowledgeGeneralConfig, KnowledgeIndexState, KnowledgeRuntime, RebuildReason,
-        INDEX_VERSION, LARGE_LEXICAL_REBUILD_DOC_THRESHOLD,
+        reconcile_workspace_internal, save_general_config,
+        text_scan_search_documents_with_progress, DirectorySearchAccess, KnowledgeGeneralConfig,
+        KnowledgeIndexState, KnowledgeRuntime, RebuildReason, INDEX_VERSION,
+        KNOWLEDGE_QUERY_TEXT_SCAN_MAX_DOCUMENTS, LARGE_LEXICAL_REBUILD_DOC_THRESHOLD,
     };
     use crate::knowledge_index::db::{ChunkRecord, DocIndexState, KnowledgeDb};
     use crate::knowledge_store::{
@@ -5826,6 +6197,74 @@ mod tests {
         .expect_err("text scan timeout");
 
         assert!(error.contains("knowledge_query text scan timed out"));
+    }
+
+    #[tokio::test]
+    async fn query_documents_text_scan_errors_when_document_limit_exceeded() {
+        let workspace = tempdir().expect("workspace");
+        let working_dir = workspace.path().to_string_lossy().to_string();
+        let document_count = KNOWLEDGE_QUERY_TEXT_SCAN_MAX_DOCUMENTS + 1;
+        for index in 0..document_count {
+            save_design_document(
+                &working_dir,
+                &format!("kd_limit_doc_{:03}", index),
+                &format!("large/doc-{:03}.md", index),
+                &format!("Large Doc {:03}", index),
+                Some("共享检索词 limit summary"),
+                "共享检索词 limit body",
+                1,
+            );
+        }
+        save_test_general_config(&working_dir, false, false);
+        let state = create_state(&working_dir);
+
+        let error = query_documents(
+            &working_dir,
+            None,
+            Some("共享检索词"),
+            None,
+            Some(&[KnowledgeType::Design]),
+            None,
+            5,
+            false,
+            state,
+        )
+        .await
+        .expect_err("text scan document limit");
+
+        assert!(error.contains("knowledge_query text scan can scan at most 500 documents"));
+        assert!(error.contains("this request would scan 501 documents"));
+        assert!(error.contains("Enable the knowledge lexical index"));
+    }
+
+    #[tokio::test]
+    async fn text_scan_errors_before_loading_large_unity_managed_documents() {
+        let workspace = tempdir().expect("workspace");
+        let working_dir = workspace.path().to_string_lossy().to_string();
+        seed_unity_reference_documents(&working_dir, KNOWLEDGE_QUERY_TEXT_SCAN_MAX_DOCUMENTS + 1);
+        let mut progress_events = Vec::new();
+
+        let error = text_scan_search_documents_with_progress(
+            &working_dir,
+            None,
+            "test",
+            Some(&[KnowledgeType::Reference]),
+            None,
+            5,
+            false,
+            Duration::from_secs(5),
+            &mut |progress| progress_events.push(progress),
+        )
+        .await
+        .expect_err("large unity text scan should fail before document loading");
+
+        assert!(error.contains("knowledge_query text scan can scan at most 500 documents"));
+        assert!(progress_events
+            .iter()
+            .any(|progress| progress.title == "Checking text scan documents"));
+        assert!(!progress_events
+            .iter()
+            .any(|progress| progress.title == "Loading text scan documents"));
     }
 
     #[tokio::test]
