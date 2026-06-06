@@ -1,0 +1,36 @@
+name: Feature Request
+description: Suggest an improvement or new capability for Locus.
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for suggesting an improvement. Please focus on the workflow or result you need.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Use case
+      description: Describe the workflow, limitation, or goal behind this request.
+      placeholder: "Describe the user workflow or problem this feature should support."
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the behavior or capability you want Locus to provide.
+      placeholder: "Describe the feature you want."
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Optional. Describe current workarounds or other approaches you considered.
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional context
+      description: Optional. Add screenshots, links, examples, or related issues.

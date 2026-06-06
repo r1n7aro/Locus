@@ -1,0 +1,62 @@
+name: Bug Report
+description: Report a reproducible problem in Locus.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. Please do not include API keys, tokens, or private project data.
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      description: Select the system where the problem occurred.
+      options:
+        - Windows 10
+        - Windows 11
+        - macOS
+        - Linux
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: locus-version
+    attributes:
+      label: Locus version
+      description: Use the version shown in Locus or the release package name.
+      placeholder: "0.3.1"
+    validations:
+      required: true
+  - type: input
+    id: model-endpoint
+    attributes:
+      label: Model endpoint
+      description: Optional. Include provider or endpoint type only; do not include secrets.
+      placeholder: "OpenAI API / Azure OpenAI / local endpoint / other"
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: Describe what happened and what you expected instead.
+      placeholder: "Describe the issue clearly."
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Provide the smallest set of steps that triggers the problem.
+      placeholder: |
+        1. Open ...
+        2. Click ...
+        3. Run ...
+        4. See error ...
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or screenshots
+      description: Optional. Paste relevant logs or attach screenshots.
