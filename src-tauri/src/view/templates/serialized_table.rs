@@ -90,8 +90,8 @@ export const tableSourceProviders: SerializedTableSourceProvider[] = [
 pub(super) fn app_vue(_name: &str) -> String {
     r####"<script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
-import { UnityPropertyEditor, UnitySerializedPropertyTree } from "@locus/components";
 import { view } from "@locus/view-runtime";
+import { UnityPropertyEditor, UnitySerializedPropertyTree } from "@locus/components";
 import {
   tableColumns as defaultColumns,
   tableOptions as defaultTableOptions,

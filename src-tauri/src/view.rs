@@ -8,9 +8,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, WebviewUrl};
+use tokio::io::AsyncWriteExt;
 
 pub const VIEW_SCHEMA: &str = "locus.view.v1";
-pub const VIEW_BINDINGS_SCHEMA: &str = "locus.view.bindings.v1";
+pub const VIEW_API_VERSION: u32 = 1;
 pub const VIEW_TREE_METADATA_SCHEMA: &str = "locus.view.tree.v1";
 pub const VIEW_ROOT_RELATIVE: &str = "Locus/View";
 pub const VIEW_WORKSPACE_SRC_DIR: &str = "src";
@@ -38,6 +39,10 @@ const VIEW_TREE_METADATA_REL_PATH: &str = ".locus/view-tree.json";
 const VIEW_STORAGE_REL_PATH: &str = ".locus/data/storage.json";
 
 mod templates;
+
+fn default_view_api_version() -> u32 {
+    VIEW_API_VERSION
+}
 
 #[derive(Debug, Default)]
 pub struct ViewAutomationStore {
@@ -113,15 +118,35 @@ pub struct ViewScriptManifest {
     pub entry_type: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ViewCapabilities {
     #[serde(default)]
     pub unity: bool,
-    #[serde(default)]
-    pub bindings: bool,
-    #[serde(default)]
-    pub write_back: bool,
+}
+
+impl<'de> Deserialize<'de> for ViewCapabilities {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize, Default)]
+        #[serde(deny_unknown_fields)]
+        #[serde(rename_all = "camelCase")]
+        struct CompatViewCapabilities {
+            #[serde(default)]
+            unity: bool,
+            #[serde(default)]
+            write_back: bool,
+            #[serde(default)]
+            bindings: bool,
+        }
+
+        let compat = CompatViewCapabilities::deserialize(deserializer)?;
+        Ok(Self {
+            unity: compat.unity || compat.bindings || compat.write_back,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -131,10 +156,12 @@ pub struct ViewRequirements {
     pub unity_connection: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 #[serde(rename_all = "camelCase")]
 pub struct ViewManifest {
     pub schema: String,
+    pub api_version: u32,
     pub id: String,
     pub name: String,
     pub version: String,
@@ -145,13 +172,63 @@ pub struct ViewManifest {
     pub icon: Option<String>,
     pub entry: String,
     pub style: String,
-    pub bindings: String,
     #[serde(default)]
     pub scripts: Vec<ViewScriptManifest>,
     #[serde(default)]
     pub capabilities: ViewCapabilities,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requirements: Option<ViewRequirements>,
+}
+
+impl<'de> Deserialize<'de> for ViewManifest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        #[serde(rename_all = "camelCase")]
+        struct CompatViewManifest {
+            schema: String,
+            #[serde(default = "default_view_api_version")]
+            api_version: u32,
+            id: String,
+            name: String,
+            version: String,
+            template: String,
+            #[serde(default)]
+            display_path: Option<String>,
+            #[serde(default)]
+            icon: Option<String>,
+            entry: String,
+            style: String,
+            #[serde(default)]
+            scripts: Vec<ViewScriptManifest>,
+            #[serde(default)]
+            capabilities: ViewCapabilities,
+            #[serde(default)]
+            requirements: Option<ViewRequirements>,
+            #[serde(default, rename = "bindings")]
+            _bindings: Option<serde_json::Value>,
+        }
+
+        let compat = CompatViewManifest::deserialize(deserializer)?;
+        Ok(Self {
+            schema: compat.schema,
+            api_version: compat.api_version,
+            id: compat.id,
+            name: compat.name,
+            version: compat.version,
+            template: compat.template,
+            display_path: compat.display_path,
+            icon: compat.icon,
+            entry: compat.entry,
+            style: compat.style,
+            scripts: compat.scripts,
+            capabilities: compat.capabilities,
+            requirements: compat.requirements,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -183,6 +260,7 @@ pub struct ViewTemplateSummary {
 pub struct ViewPackageSummary {
     pub id: String,
     pub name: String,
+    pub api_version: u32,
     pub version: String,
     pub template: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -446,10 +524,117 @@ pub struct ViewStorageRemoveRequest {
     pub key: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ViewFsPathRequest {
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ViewFsReadFileRequest {
+    pub path: String,
+    #[serde(default)]
+    pub encoding: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ViewFsReadFileResult {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoding: Option<String>,
+    pub data: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ViewFsWriteFileRequest {
+    pub path: String,
+    #[serde(default)]
+    pub data: serde_json::Value,
+    #[serde(default)]
+    pub encoding: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ViewFsMkdirRequest {
+    pub path: String,
+    #[serde(default)]
+    pub recursive: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ViewFsReaddirRequest {
+    pub path: String,
+    #[serde(default)]
+    pub with_file_types: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ViewFsDirEntry {
+    pub name: String,
+    pub path: String,
+    pub is_file: bool,
+    pub is_directory: bool,
+    pub is_symbolic_link: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ViewFsReaddirResult {
+    pub entries: Vec<ViewFsDirEntry>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ViewFsStatResult {
+    pub path: String,
+    pub size: u64,
+    pub is_file: bool,
+    pub is_directory: bool,
+    pub is_symbolic_link: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accessed_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_ms: Option<f64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ViewFsRmRequest {
+    pub path: String,
+    #[serde(default)]
+    pub recursive: Option<bool>,
+    #[serde(default)]
+    pub force: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ViewFsRenameRequest {
+    pub old_path: String,
+    pub new_path: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ViewFsCopyFileRequest {
+    pub src: String,
+    pub dest: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(rename_all = "camelCase")]
-pub struct ViewBindingTarget {
+pub struct UnitySerializedPropertyTarget {
     pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guid: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -474,43 +659,9 @@ pub struct ViewBindingTarget {
     pub property_path: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ViewBindingReadRequest {
-    pub view_id: String,
-    #[serde(default)]
-    pub binding_id: Option<String>,
-    #[serde(default)]
-    pub target: Option<ViewBindingTarget>,
-    #[serde(default)]
-    pub max_depth: Option<i32>,
-    #[serde(default)]
-    pub max_array_items: Option<i32>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ViewBindingDiscoverRequest {
-    pub view_id: String,
-    #[serde(default)]
-    pub binding_id: Option<String>,
-    #[serde(default)]
-    pub target: Option<ViewBindingTarget>,
-    #[serde(default)]
-    pub query: Option<String>,
-    #[serde(default)]
-    pub field_name: Option<String>,
-    #[serde(default)]
-    pub field_type: Option<String>,
-    #[serde(default)]
-    pub max_depth: Option<i32>,
-    #[serde(default)]
-    pub max_results: Option<i32>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ViewManagedReferenceTypeOption {
+pub struct UnityManagedReferenceTypeOption {
     #[serde(default)]
     pub label: String,
     #[serde(default)]
@@ -523,7 +674,7 @@ pub struct ViewManagedReferenceTypeOption {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ViewSerializedPropertyAttributeInfo {
+pub struct UnitySerializedPropertyAttributeInfo {
     #[serde(default)]
     pub r#type: String,
     #[serde(default)]
@@ -534,7 +685,7 @@ pub struct ViewSerializedPropertyAttributeInfo {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ViewEnumOption {
+pub struct UnityEnumOption {
     #[serde(default)]
     pub label: String,
     #[serde(default)]
@@ -549,11 +700,11 @@ pub struct ViewEnumOption {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ViewSerializedPropertySnapshot {
+pub struct UnitySerializedPropertySnapshot {
     #[serde(default)]
     pub property_path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub binding_target: Option<ViewBindingTarget>,
+    pub binding_target: Option<UnitySerializedPropertyTarget>,
     #[serde(default)]
     pub display_name: String,
     #[serde(default)]
@@ -585,9 +736,9 @@ pub struct ViewSerializedPropertySnapshot {
     #[serde(default)]
     pub enum_value_flag: i64,
     #[serde(default)]
-    pub enum_options: Vec<ViewEnumOption>,
+    pub enum_options: Vec<UnityEnumOption>,
     #[serde(default)]
-    pub children: Vec<ViewSerializedPropertySnapshot>,
+    pub children: Vec<UnitySerializedPropertySnapshot>,
     #[serde(default)]
     pub is_managed_reference: bool,
     #[serde(default)]
@@ -597,7 +748,7 @@ pub struct ViewSerializedPropertySnapshot {
     #[serde(default)]
     pub managed_reference_display_name: String,
     #[serde(default)]
-    pub managed_reference_types: Vec<ViewManagedReferenceTypeOption>,
+    pub managed_reference_types: Vec<UnityManagedReferenceTypeOption>,
     #[serde(default)]
     pub tooltip: String,
     #[serde(default)]
@@ -621,26 +772,26 @@ pub struct ViewSerializedPropertySnapshot {
     #[serde(default)]
     pub reference_type_assembly: String,
     #[serde(default)]
-    pub attributes: Vec<ViewSerializedPropertyAttributeInfo>,
+    pub attributes: Vec<UnitySerializedPropertyAttributeInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ViewBindingReadResult {
+pub struct UnitySerializedPropertyReadResult {
     pub ok: bool,
     #[serde(default)]
     pub binding_id: Option<String>,
     pub message: String,
-    pub target: ViewBindingTarget,
+    pub target: UnitySerializedPropertyTarget,
     #[serde(flatten)]
-    pub property: ViewSerializedPropertySnapshot,
+    pub property: UnitySerializedPropertySnapshot,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub properties: Vec<ViewSerializedPropertySnapshot>,
+    pub properties: Vec<UnitySerializedPropertySnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ViewBindingDiscoverMatch {
+pub struct UnitySerializedPropertyDiscoverMatch {
     #[serde(default)]
     pub property_path: String,
     #[serde(default)]
@@ -671,60 +822,30 @@ pub struct ViewBindingDiscoverMatch {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ViewBindingDiscoverResult {
+pub struct UnitySerializedPropertyDiscoverResult {
     pub ok: bool,
     #[serde(default)]
     pub binding_id: Option<String>,
     pub message: String,
-    pub target: ViewBindingTarget,
+    pub target: UnitySerializedPropertyTarget,
     #[serde(default)]
-    pub matches: Vec<ViewBindingDiscoverMatch>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ViewBindingWriteRequest {
-    pub view_id: String,
-    #[serde(default)]
-    pub binding_id: Option<String>,
-    #[serde(default)]
-    pub target: Option<ViewBindingTarget>,
-    #[serde(default)]
-    pub value: serde_json::Value,
+    pub matches: Vec<UnitySerializedPropertyDiscoverMatch>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ViewBindingWriteResult {
+pub struct UnitySerializedPropertyWriteResult {
     #[serde(flatten)]
-    pub read: ViewBindingReadResult,
+    pub read: UnitySerializedPropertyReadResult,
     pub saved: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ViewBindingApplyWrite {
-    #[serde(default)]
-    pub binding_id: Option<String>,
-    #[serde(default)]
-    pub target: Option<ViewBindingTarget>,
-    #[serde(default)]
-    pub value: serde_json::Value,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ViewBindingApplyRequest {
-    pub view_id: String,
-    pub writes: Vec<ViewBindingApplyWrite>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ViewBindingApplyResult {
+pub struct UnitySerializedPropertyApplyResult {
     pub ok: bool,
     pub message: String,
-    pub results: Vec<ViewBindingWriteResult>,
+    pub results: Vec<UnitySerializedPropertyWriteResult>,
 }
 
 #[derive(Debug, Clone)]
@@ -738,21 +859,10 @@ struct ResolvedViewScript {
 }
 
 #[derive(Debug, Clone)]
-struct ResolvedViewBinding {
-    target: ViewBindingTarget,
-    mode: Option<String>,
-}
-
-#[derive(Debug, Clone)]
 struct CachedViewScriptSource {
     modified: Option<SystemTime>,
     len: u64,
     resolved: ResolvedViewScript,
-}
-
-#[derive(Debug, Clone, Default)]
-struct LoadedViewBindings {
-    by_id: HashMap<String, serde_json::Value>,
 }
 
 pub fn supported_view_templates() -> Vec<ViewTemplateSummary> {
@@ -911,6 +1021,12 @@ pub fn validate_view_manifest(manifest: &ViewManifest) -> Result<(), String> {
     if manifest.schema != VIEW_SCHEMA {
         return Err(format!("Unsupported View schema: {}", manifest.schema));
     }
+    if manifest.api_version != VIEW_API_VERSION {
+        return Err(format!(
+            "Unsupported View apiVersion: {}. Expected {}.",
+            manifest.api_version, VIEW_API_VERSION
+        ));
+    }
     normalize_view_id(&manifest.id)?;
     if manifest.name.trim().is_empty() {
         return Err("View name cannot be empty.".to_string());
@@ -939,7 +1055,6 @@ pub fn validate_view_manifest(manifest: &ViewManifest) -> Result<(), String> {
     }
     normalize_package_rel_path(&manifest.entry)?;
     normalize_package_rel_path(&manifest.style)?;
-    normalize_package_rel_path(&manifest.bindings)?;
 
     let mut script_names = BTreeSet::new();
     for script in &manifest.scripts {
@@ -1207,7 +1322,7 @@ fn view_display_path_for_manifest(
 
 fn inferred_view_requirements(capabilities: &ViewCapabilities) -> ViewRequirements {
     ViewRequirements {
-        unity_connection: capabilities.unity || capabilities.bindings || capabilities.write_back,
+        unity_connection: capabilities.unity,
     }
 }
 
@@ -1273,6 +1388,7 @@ fn summary_from_manifest_with_source(
     ViewPackageSummary {
         id: manifest.id.clone(),
         name: manifest.name.clone(),
+        api_version: manifest.api_version,
         version: manifest.version.clone(),
         template: manifest.template.clone(),
         icon: manifest.icon.clone(),
@@ -2971,7 +3087,6 @@ pub fn read_view_sync(working_dir: &str, view_id: &str) -> Result<ViewPackageDet
     rel_paths.insert("README.md".to_string());
     rel_paths.insert(manifest.entry.clone());
     rel_paths.insert(manifest.style.clone());
-    rel_paths.insert(manifest.bindings.clone());
     rel_paths.insert("src/App.vue".to_string());
     rel_paths.insert("src/store.ts".to_string());
     collect_view_runtime_source_paths(&root, &mut rel_paths)?;
@@ -3342,8 +3457,8 @@ fn attach_view_window_to_unity_owner(
     owner: windows::Win32::Foundation::HWND,
 ) -> Result<(), String> {
     use windows::Win32::UI::WindowsAndMessaging::{
-        IsWindow, SetWindowLongPtrW, SetWindowPos, GWLP_HWNDPARENT, HWND_TOP, SWP_NOACTIVATE,
-        SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE,
+        GetWindowLongPtrW, IsWindow, SetWindowLongPtrW, SetWindowPos, GWLP_HWNDPARENT, HWND_TOP,
+        SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE,
     };
 
     let hwnd = window
@@ -3353,7 +3468,11 @@ fn attach_view_window_to_unity_owner(
         if !IsWindow(Some(owner)).as_bool() {
             return Err("Unity owner HWND is no longer valid".to_string());
         }
-        SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, owner.0 as isize);
+        let owner_hwnd = owner.0 as isize;
+        if GetWindowLongPtrW(hwnd, GWLP_HWNDPARENT) == owner_hwnd {
+            return Ok(());
+        }
+        SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, owner_hwnd);
         SetWindowPos(
             hwnd,
             Some(HWND_TOP),
@@ -3371,14 +3490,17 @@ fn attach_view_window_to_unity_owner(
 #[cfg(target_os = "windows")]
 fn clear_view_window_unity_owner(window: &tauri::WebviewWindow) -> Result<(), String> {
     use windows::Win32::UI::WindowsAndMessaging::{
-        SetWindowLongPtrW, SetWindowPos, GWLP_HWNDPARENT, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-        SWP_NOZORDER,
+        GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, GWLP_HWNDPARENT, SWP_NOACTIVATE,
+        SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
     };
 
     let hwnd = window
         .hwnd()
         .map_err(|error| format!("Failed to read View host HWND: {error}"))?;
     unsafe {
+        if GetWindowLongPtrW(hwnd, GWLP_HWNDPARENT) == 0 {
+            return Ok(());
+        }
         SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, 0);
         SetWindowPos(
             hwnd,
@@ -5415,247 +5537,266 @@ pub fn view_storage_remove_sync(
     write_view_storage_file(&path, &storage)
 }
 
-pub async fn view_binding_read(
-    working_dir: &str,
-    request: ViewBindingReadRequest,
-) -> Result<ViewBindingReadResult, String> {
-    let binding = resolve_view_binding(
-        working_dir,
-        &request.view_id,
-        request.binding_id.as_deref(),
-        request.target,
-    )?;
-    let payload = serde_json::json!({
-        "bindingId": request.binding_id,
-        "target": binding.target,
-        "maxDepth": request.max_depth.unwrap_or_default(),
-        "maxArrayItems": request.max_array_items.unwrap_or_default(),
-    });
-    let raw = crate::unity_bridge::view_binding_read(working_dir, &payload).await?;
-    serde_json::from_str(&raw)
-        .map_err(|error| format!("Invalid view_binding_read response: {}", error))
+fn view_fs_resolve_path(working_dir: &str, raw_path: &str) -> Result<PathBuf, String> {
+    if raw_path.is_empty() {
+        return Err("Path cannot be empty.".to_string());
+    }
+    let candidate = PathBuf::from(raw_path);
+    if candidate.is_absolute() {
+        return Ok(candidate);
+    }
+    Ok(workspace_root(working_dir)?.join(candidate))
 }
 
-pub async fn view_binding_discover(
-    working_dir: &str,
-    request: ViewBindingDiscoverRequest,
-) -> Result<ViewBindingDiscoverResult, String> {
-    let ViewBindingDiscoverRequest {
-        view_id,
-        binding_id,
-        target,
-        query,
-        field_name,
-        field_type,
-        max_depth,
-        max_results,
-    } = request;
-    let target = if let Some(target) = target {
-        validate_view_binding_object_target(&target)?;
-        target
-    } else {
-        resolve_view_binding(working_dir, &view_id, binding_id.as_deref(), None)?.target
+fn view_fs_display_path(path: &Path) -> String {
+    path.to_string_lossy().to_string()
+}
+
+fn view_fs_normalize_encoding(encoding: Option<&str>) -> Result<Option<String>, String> {
+    let Some(encoding) = encoding else {
+        return Ok(None);
     };
-    let payload = serde_json::json!({
-        "bindingId": binding_id,
-        "target": target,
-        "query": query.unwrap_or_default(),
-        "fieldName": field_name.unwrap_or_default(),
-        "fieldType": field_type.unwrap_or_default(),
-        "maxDepth": max_depth.unwrap_or_default(),
-        "maxResults": max_results.unwrap_or_default(),
-    });
-    let raw = crate::unity_bridge::view_binding_discover(working_dir, &payload).await?;
-    serde_json::from_str(&raw)
-        .map_err(|error| format!("Invalid view_binding_discover response: {}", error))
+    let normalized = encoding.trim().to_ascii_lowercase();
+    if normalized.is_empty() || normalized == "buffer" {
+        return Ok(None);
+    }
+    if normalized == "utf8" || normalized == "utf-8" {
+        return Ok(Some("utf8".to_string()));
+    }
+    Err(format!("Unsupported fs encoding: {}", encoding))
 }
 
-pub async fn view_binding_write(
-    working_dir: &str,
-    request: ViewBindingWriteRequest,
-) -> Result<ViewBindingWriteResult, String> {
-    let binding = resolve_view_binding(
-        working_dir,
-        &request.view_id,
-        request.binding_id.as_deref(),
-        request.target,
-    )?;
-    ensure_view_binding_write_allowed(binding.mode.as_deref())?;
-    let value_json = serde_json::to_string(&request.value)
-        .map_err(|error| format!("Failed to serialize binding value: {}", error))?;
-    let payload = serde_json::json!({
-        "bindingId": request.binding_id,
-        "target": binding.target,
-        "valueJson": value_json,
-    });
-    let raw = crate::unity_bridge::view_binding_write(working_dir, &payload).await?;
-    serde_json::from_str(&raw)
-        .map_err(|error| format!("Invalid view_binding_write response: {}", error))
-}
-
-pub async fn view_binding_apply(
-    working_dir: &str,
-    request: ViewBindingApplyRequest,
-) -> Result<ViewBindingApplyResult, String> {
-    let mut writes = Vec::with_capacity(request.writes.len());
-    let loaded_bindings = if request.writes.iter().any(|write| write.target.is_none()) {
-        Some(load_view_bindings(working_dir, &request.view_id)?)
-    } else {
-        None
+fn view_fs_data_bytes(data: &serde_json::Value, encoding: Option<&str>) -> Result<Vec<u8>, String> {
+    view_fs_normalize_encoding(encoding)?;
+    if let Some(text) = data.as_str() {
+        return Ok(text.as_bytes().to_vec());
+    }
+    let Some(items) = data.as_array() else {
+        return Err("fs data must be a string or byte array.".to_string());
     };
-    for write in request.writes {
-        let binding = match write.target {
-            Some(target) => {
-                validate_view_binding_target(&target)?;
-                ResolvedViewBinding { target, mode: None }
-            }
-            None => resolve_view_binding_from_loaded(
-                loaded_bindings
-                    .as_ref()
-                    .ok_or_else(|| "View bindings were not loaded.".to_string())?,
-                write.binding_id.as_deref(),
-            )?,
+    let mut bytes = Vec::with_capacity(items.len());
+    for item in items {
+        let Some(byte) = item.as_u64() else {
+            return Err("fs byte array must contain only numbers.".to_string());
         };
-        ensure_view_binding_write_allowed(binding.mode.as_deref())?;
-        writes.push(serde_json::json!({
-            "bindingId": write.binding_id,
-            "target": binding.target,
-            "valueJson": serde_json::to_string(&write.value)
-                .map_err(|error| format!("Failed to serialize binding value: {}", error))?,
-        }));
-    }
-
-    let payload = serde_json::json!({ "writes": writes });
-    let raw = crate::unity_bridge::view_binding_apply(working_dir, &payload).await?;
-    serde_json::from_str(&raw)
-        .map_err(|error| format!("Invalid view_binding_apply response: {}", error))
-}
-
-fn resolve_view_binding_target(
-    working_dir: &str,
-    view_id: &str,
-    binding_id: Option<&str>,
-    target: Option<ViewBindingTarget>,
-) -> Result<ViewBindingTarget, String> {
-    Ok(resolve_view_binding(working_dir, view_id, binding_id, target)?.target)
-}
-
-fn resolve_view_binding(
-    working_dir: &str,
-    view_id: &str,
-    binding_id: Option<&str>,
-    target: Option<ViewBindingTarget>,
-) -> Result<ResolvedViewBinding, String> {
-    if let Some(target) = target {
-        validate_view_binding_target(&target)?;
-        return Ok(ResolvedViewBinding { target, mode: None });
-    }
-
-    let loaded = load_view_bindings(working_dir, view_id)?;
-    resolve_view_binding_from_loaded(&loaded, binding_id)
-}
-
-fn load_view_bindings(working_dir: &str, view_id: &str) -> Result<LoadedViewBindings, String> {
-    let root = resolve_view_package_root(working_dir, view_id)?;
-    let manifest = load_manifest_from_root(&root)?;
-    let bindings_path = package_path(&root, &manifest.bindings)?;
-    let raw = std::fs::read_to_string(&bindings_path)
-        .map_err(|error| format!("Failed to read {}: {}", bindings_path.display(), error))?;
-    let bindings: serde_json::Value = serde_json::from_str(&raw).map_err(|error| {
-        format!(
-            "Invalid bindings.json {}: {}",
-            bindings_path.display(),
-            error
-        )
-    })?;
-    let by_id = bindings
-        .get("bindings")
-        .and_then(|value| value.as_array())
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| {
-                    item.get("id")
-                        .and_then(|value| value.as_str())
-                        .map(str::trim)
-                        .filter(|value| !value.is_empty())
-                        .map(|id| (id.to_string(), item.clone()))
-                })
-                .collect::<HashMap<_, _>>()
-        })
-        .unwrap_or_default();
-
-    Ok(LoadedViewBindings { by_id })
-}
-
-fn resolve_view_binding_from_loaded(
-    loaded: &LoadedViewBindings,
-    binding_id: Option<&str>,
-) -> Result<ResolvedViewBinding, String> {
-    let binding_id = binding_id
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| "View binding request requires target or bindingId.".to_string())?;
-    let binding = loaded
-        .by_id
-        .get(binding_id)
-        .ok_or_else(|| format!("View binding not found: {}", binding_id))?;
-    let target_value = binding
-        .get("target")
-        .cloned()
-        .ok_or_else(|| format!("View binding has no target: {}", binding_id))?;
-    let target: ViewBindingTarget = serde_json::from_value(target_value)
-        .map_err(|error| format!("Invalid target for binding {}: {}", binding_id, error))?;
-    validate_view_binding_target(&target)?;
-    let mode = binding
-        .get("mode")
-        .and_then(|value| value.as_str())
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-    Ok(ResolvedViewBinding { target, mode })
-}
-
-fn ensure_view_binding_write_allowed(mode: Option<&str>) -> Result<(), String> {
-    if matches!(mode.map(|value| value.to_ascii_lowercase()), Some(value) if value == "readonly") {
-        return Err("View binding is readOnly and cannot be written.".to_string());
-    }
-    Ok(())
-}
-
-fn validate_view_binding_target(target: &ViewBindingTarget) -> Result<(), String> {
-    validate_view_binding_object_target(target)?;
-    if target
-        .property_path
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .is_none()
-    {
-        return Err("View binding target propertyPath is required.".to_string());
-    }
-    Ok(())
-}
-
-fn validate_view_binding_object_target(target: &ViewBindingTarget) -> Result<(), String> {
-    if target.kind.trim().is_empty() {
-        return Err("View binding target kind cannot be empty.".to_string());
-    }
-    if matches!(target.component_index, Some(index) if index < 0) {
-        return Err("View binding target componentIndex cannot be negative.".to_string());
-    }
-    for path in [
-        target.path.as_deref(),
-        target.scene_path.as_deref(),
-        target.object_path.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        if path.contains('\0') {
-            return Err("View binding target path contains an invalid character.".to_string());
+        if byte > u8::MAX as u64 {
+            return Err("fs byte array contains a value outside 0..255.".to_string());
         }
+        bytes.push(byte as u8);
     }
-    Ok(())
+    Ok(bytes)
+}
+
+fn view_fs_system_time_ms(time: std::io::Result<SystemTime>) -> Option<f64> {
+    time.ok()
+        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs_f64() * 1000.0)
+}
+
+fn view_fs_stat_from_metadata(path: &Path, metadata: std::fs::Metadata) -> ViewFsStatResult {
+    let file_type = metadata.file_type();
+    ViewFsStatResult {
+        path: view_fs_display_path(path),
+        size: metadata.len(),
+        is_file: metadata.is_file(),
+        is_directory: metadata.is_dir(),
+        is_symbolic_link: file_type.is_symlink(),
+        modified_ms: view_fs_system_time_ms(metadata.modified()),
+        accessed_ms: view_fs_system_time_ms(metadata.accessed()),
+        created_ms: view_fs_system_time_ms(metadata.created()),
+    }
+}
+
+pub async fn view_fs_read_file(
+    working_dir: &str,
+    request: ViewFsReadFileRequest,
+) -> Result<ViewFsReadFileResult, String> {
+    let path = view_fs_resolve_path(working_dir, &request.path)?;
+    let encoding = view_fs_normalize_encoding(request.encoding.as_deref())?;
+    if encoding.is_some() {
+        let data = tokio::fs::read_to_string(&path)
+            .await
+            .map_err(|error| format!("Failed to read {}: {}", path.display(), error))?;
+        return Ok(ViewFsReadFileResult {
+            path: view_fs_display_path(&path),
+            encoding,
+            data: serde_json::Value::String(data),
+        });
+    }
+
+    let data = tokio::fs::read(&path)
+        .await
+        .map_err(|error| format!("Failed to read {}: {}", path.display(), error))?;
+    Ok(ViewFsReadFileResult {
+        path: view_fs_display_path(&path),
+        encoding: None,
+        data: serde_json::json!(data),
+    })
+}
+
+pub async fn view_fs_write_file(
+    working_dir: &str,
+    request: ViewFsWriteFileRequest,
+) -> Result<(), String> {
+    let path = view_fs_resolve_path(working_dir, &request.path)?;
+    let bytes = view_fs_data_bytes(&request.data, request.encoding.as_deref())?;
+    tokio::fs::write(&path, bytes)
+        .await
+        .map_err(|error| format!("Failed to write {}: {}", path.display(), error))
+}
+
+pub async fn view_fs_append_file(
+    working_dir: &str,
+    request: ViewFsWriteFileRequest,
+) -> Result<(), String> {
+    let path = view_fs_resolve_path(working_dir, &request.path)?;
+    let bytes = view_fs_data_bytes(&request.data, request.encoding.as_deref())?;
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .await
+        .map_err(|error| format!("Failed to open {}: {}", path.display(), error))?;
+    file.write_all(&bytes)
+        .await
+        .map_err(|error| format!("Failed to write {}: {}", path.display(), error))
+}
+
+pub async fn view_fs_mkdir(working_dir: &str, request: ViewFsMkdirRequest) -> Result<(), String> {
+    let path = view_fs_resolve_path(working_dir, &request.path)?;
+    if request.recursive.unwrap_or(false) {
+        return tokio::fs::create_dir_all(&path)
+            .await
+            .map_err(|error| format!("Failed to create {}: {}", path.display(), error));
+    }
+    tokio::fs::create_dir(&path)
+        .await
+        .map_err(|error| format!("Failed to create {}: {}", path.display(), error))
+}
+
+pub async fn view_fs_readdir(
+    working_dir: &str,
+    request: ViewFsReaddirRequest,
+) -> Result<ViewFsReaddirResult, String> {
+    let path = view_fs_resolve_path(working_dir, &request.path)?;
+    let mut reader = tokio::fs::read_dir(&path)
+        .await
+        .map_err(|error| format!("Failed to read directory {}: {}", path.display(), error))?;
+    let mut entries = Vec::new();
+    while let Some(entry) = reader
+        .next_entry()
+        .await
+        .map_err(|error| format!("Failed to read directory {}: {}", path.display(), error))?
+    {
+        let file_type = entry
+            .file_type()
+            .await
+            .map_err(|error| format!("Failed to read {}: {}", entry.path().display(), error))?;
+        entries.push(ViewFsDirEntry {
+            name: entry.file_name().to_string_lossy().to_string(),
+            path: view_fs_display_path(&entry.path()),
+            is_file: file_type.is_file(),
+            is_directory: file_type.is_dir(),
+            is_symbolic_link: file_type.is_symlink(),
+        });
+    }
+    Ok(ViewFsReaddirResult { entries })
+}
+
+pub async fn view_fs_stat(
+    working_dir: &str,
+    request: ViewFsPathRequest,
+) -> Result<ViewFsStatResult, String> {
+    let path = view_fs_resolve_path(working_dir, &request.path)?;
+    let metadata = tokio::fs::metadata(&path)
+        .await
+        .map_err(|error| format!("Failed to stat {}: {}", path.display(), error))?;
+    Ok(view_fs_stat_from_metadata(&path, metadata))
+}
+
+pub async fn view_fs_lstat(
+    working_dir: &str,
+    request: ViewFsPathRequest,
+) -> Result<ViewFsStatResult, String> {
+    let path = view_fs_resolve_path(working_dir, &request.path)?;
+    let metadata = tokio::fs::symlink_metadata(&path)
+        .await
+        .map_err(|error| format!("Failed to stat {}: {}", path.display(), error))?;
+    Ok(view_fs_stat_from_metadata(&path, metadata))
+}
+
+pub async fn view_fs_access(working_dir: &str, request: ViewFsPathRequest) -> Result<(), String> {
+    let path = view_fs_resolve_path(working_dir, &request.path)?;
+    tokio::fs::metadata(&path)
+        .await
+        .map(|_| ())
+        .map_err(|error| format!("Failed to access {}: {}", path.display(), error))
+}
+
+pub async fn view_fs_unlink(working_dir: &str, request: ViewFsPathRequest) -> Result<(), String> {
+    let path = view_fs_resolve_path(working_dir, &request.path)?;
+    tokio::fs::remove_file(&path)
+        .await
+        .map_err(|error| format!("Failed to remove {}: {}", path.display(), error))
+}
+
+pub async fn view_fs_rm(working_dir: &str, request: ViewFsRmRequest) -> Result<(), String> {
+    let path = view_fs_resolve_path(working_dir, &request.path)?;
+    let force = request.force.unwrap_or(false);
+    let metadata = match tokio::fs::symlink_metadata(&path).await {
+        Ok(metadata) => metadata,
+        Err(error) if force && error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("Failed to stat {}: {}", path.display(), error)),
+    };
+
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        if request.recursive.unwrap_or(false) {
+            return tokio::fs::remove_dir_all(&path)
+                .await
+                .map_err(|error| format!("Failed to remove {}: {}", path.display(), error));
+        }
+        return tokio::fs::remove_dir(&path)
+            .await
+            .map_err(|error| format!("Failed to remove {}: {}", path.display(), error));
+    }
+
+    tokio::fs::remove_file(&path)
+        .await
+        .map_err(|error| format!("Failed to remove {}: {}", path.display(), error))
+}
+
+pub async fn view_fs_rename(working_dir: &str, request: ViewFsRenameRequest) -> Result<(), String> {
+    let old_path = view_fs_resolve_path(working_dir, &request.old_path)?;
+    let new_path = view_fs_resolve_path(working_dir, &request.new_path)?;
+    tokio::fs::rename(&old_path, &new_path)
+        .await
+        .map_err(|error| {
+            format!(
+                "Failed to rename {} to {}: {}",
+                old_path.display(),
+                new_path.display(),
+                error
+            )
+        })
+}
+
+pub async fn view_fs_copy_file(
+    working_dir: &str,
+    request: ViewFsCopyFileRequest,
+) -> Result<(), String> {
+    let src = view_fs_resolve_path(working_dir, &request.src)?;
+    let dest = view_fs_resolve_path(working_dir, &request.dest)?;
+    tokio::fs::copy(&src, &dest)
+        .await
+        .map(|_| ())
+        .map_err(|error| {
+            format!(
+                "Failed to copy {} to {}: {}",
+                src.display(),
+                dest.display(),
+                error
+            )
+        })
 }
 
 fn resolve_view_script_sync(
@@ -5873,22 +6014,21 @@ fn title_from_id(id: &str) -> String {
 mod tests {
     use super::{
         append_view_frontend_log_sync, create_view_folder_sync, create_view_sync,
-        default_view_package_name, delete_view_entry_sync, ensure_view_binding_write_allowed,
-        export_view_package_sync, import_view_package_sync, is_valid_view_id,
-        is_view_frontend_log_workspace_path, list_view_tree_sync, list_views_sync,
-        move_view_entry_sync, normalize_package_rel_path, parse_view_create_request,
-        read_view_frontend_log_sync, read_view_sync, registered_view_host_label,
-        rename_view_entry_sync, resolve_view_binding_target, resolve_view_package_root,
-        resolve_view_script_sync, set_view_tab_host_sync, should_reload_for_view_event,
-        supported_view_templates, validate_view_binding_object_target,
-        validate_view_binding_target, validate_view_manifest, view_file_watch_roots,
-        view_manifest_requirements, view_package_root, view_script_bridge_payload,
-        view_script_cached_invoke_payload, view_storage_get_sync, view_storage_remove_sync,
-        view_storage_set_sync, view_tab_hosts, ViewBindingDiscoverResult, ViewBindingTarget,
-        ViewBindingWriteResult, ViewExportPackageRequest, ViewFrontendLogReadRequest,
+        default_view_package_name, delete_view_entry_sync, export_view_package_sync,
+        import_view_package_sync, is_valid_view_id, is_view_frontend_log_workspace_path,
+        list_view_tree_sync, list_views_sync, load_manifest_from_root, move_view_entry_sync,
+        normalize_package_rel_path, parse_view_create_request, read_view_frontend_log_sync,
+        read_view_sync, registered_view_host_label, rename_view_entry_sync,
+        resolve_view_package_root, resolve_view_script_sync, set_view_tab_host_sync,
+        should_reload_for_view_event, supported_view_templates, validate_view_manifest,
+        view_file_watch_roots, view_manifest_requirements, view_package_root,
+        view_script_bridge_payload, view_script_cached_invoke_payload, view_storage_get_sync,
+        view_storage_remove_sync, view_storage_set_sync, view_tab_hosts,
+        UnitySerializedPropertyDiscoverResult, UnitySerializedPropertyTarget,
+        UnitySerializedPropertyWriteResult, ViewExportPackageRequest, ViewFrontendLogReadRequest,
         ViewFrontendLogRequest, ViewImportPackageRequest, ViewManifest, ViewSetTabHostRequest,
-        ViewStorageGetRequest, ViewStorageRemoveRequest, ViewStorageSetRequest,
-        VIEW_BINDINGS_SCHEMA, VIEW_ROOT_RELATIVE, VIEW_SCHEMA,
+        ViewStorageGetRequest, ViewStorageRemoveRequest, ViewStorageSetRequest, VIEW_API_VERSION,
+        VIEW_ROOT_RELATIVE, VIEW_SCHEMA,
     };
     use notify::{
         event::{DataChange, ModifyKind},
@@ -5957,13 +6097,13 @@ mod tests {
             view_root.join("view.json"),
             r#"{
   "schema": "locus.view.v1",
+  "apiVersion": 1,
   "id": "plugin-asset-inspector",
   "name": "Plugin Asset Inspector",
   "version": "0.1.0",
   "template": "blank",
   "entry": "src/App.vue",
   "style": "src/style.css",
-  "bindings": "bindings.json",
   "capabilities": {}
 }
 "#,
@@ -6112,6 +6252,7 @@ mod tests {
     fn manifest_validation_checks_schema_id_and_paths() {
         let mut manifest = ViewManifest {
             schema: VIEW_SCHEMA.to_string(),
+            api_version: VIEW_API_VERSION,
             id: "material-inspector".to_string(),
             name: "Material Inspector".to_string(),
             version: "0.1.0".to_string(),
@@ -6120,7 +6261,6 @@ mod tests {
             icon: None,
             entry: "src/main.ts".to_string(),
             style: "src/style.css".to_string(),
-            bindings: "bindings.json".to_string(),
             scripts: Vec::new(),
             capabilities: Default::default(),
             requirements: None,
@@ -6129,6 +6269,49 @@ mod tests {
 
         manifest.entry = "../main.ts".to_string();
         assert!(validate_view_manifest(&manifest).is_err());
+    }
+
+    #[test]
+    fn legacy_view_manifest_bindings_load_as_unity_capabilities() {
+        let temp = tempdir().unwrap();
+        let working_dir = temp.path().to_string_lossy().to_string();
+        let root = temp.path().join("Locus/View/legacy-inspector");
+        std::fs::create_dir_all(root.join("src")).expect("create legacy view");
+        std::fs::write(
+            root.join("view.json"),
+            r#"{
+  "schema": "locus.view.v1",
+  "id": "legacy-inspector",
+  "name": "Legacy Inspector",
+  "version": "0.1.0",
+  "template": "blank",
+  "entry": "src/main.ts",
+  "style": "src/style.css",
+  "bindings": [{ "id": "main", "target": "selection" }],
+  "capabilities": { "bindings": true, "writeBack": true }
+}
+"#,
+        )
+        .expect("write legacy manifest");
+
+        let manifest = load_manifest_from_root(&root).expect("load legacy manifest");
+        assert_eq!(manifest.api_version, VIEW_API_VERSION);
+        assert!(manifest.capabilities.unity);
+        assert!(view_manifest_requirements(&manifest).unity_connection);
+
+        let serialized = serde_json::to_value(&manifest).expect("serialize manifest");
+        assert!(serialized.get("bindings").is_none());
+        assert!(serialized["capabilities"].get("bindings").is_none());
+        assert!(serialized["capabilities"].get("writeBack").is_none());
+
+        let listed = list_views_sync(&working_dir).expect("list legacy views");
+        let summary = listed
+            .iter()
+            .find(|view| view.id == "legacy-inspector")
+            .expect("legacy view should stay visible");
+        assert_eq!(summary.api_version, VIEW_API_VERSION);
+        assert!(summary.capabilities.unity);
+        assert!(summary.requirements.unity_connection);
     }
 
     #[test]
@@ -6601,6 +6784,7 @@ mod tests {
 
         let manifest = ViewManifest {
             schema: VIEW_SCHEMA.to_string(),
+            api_version: VIEW_API_VERSION,
             id: "material-inspector".to_string(),
             name: "Material Inspector".to_string(),
             version: "0.1.0".to_string(),
@@ -6609,7 +6793,6 @@ mod tests {
             icon: None,
             entry: "src/main.ts".to_string(),
             style: "src/style.css".to_string(),
-            bindings: "bindings.json".to_string(),
             scripts: Vec::new(),
             capabilities: Default::default(),
             requirements: None,
@@ -6619,15 +6802,6 @@ mod tests {
             serde_json::to_string_pretty(&manifest).expect("serialize manifest"),
         )
         .expect("write manifest");
-        std::fs::write(
-            root.join("bindings.json"),
-            format!(
-                "{{\"schema\":\"{}\",\"bindings\":[]}}\n",
-                VIEW_BINDINGS_SCHEMA
-            ),
-        )
-        .expect("write bindings");
-
         let listed = list_views_sync(&working_dir).expect("list views");
         let summary = listed
             .iter()
@@ -6897,7 +7071,6 @@ mod tests {
 
         assert_eq!(created.manifest.template, "node-graph");
         assert!(created.manifest.capabilities.unity);
-        assert!(created.manifest.capabilities.write_back);
         assert!(view_manifest_requirements(&created.manifest).unity_connection);
         assert_eq!(created.manifest.scripts[0].name, "GraphViewApi");
         let app = created
@@ -6983,8 +7156,6 @@ mod tests {
         assert_eq!(created.manifest.template, "field-blocks");
         assert_eq!(created.manifest.icon.as_deref(), Some("FormInput"));
         assert!(created.manifest.capabilities.unity);
-        assert!(created.manifest.capabilities.bindings);
-        assert!(created.manifest.capabilities.write_back);
         assert!(view_manifest_requirements(&created.manifest).unity_connection);
 
         let app = created
@@ -6994,8 +7165,8 @@ mod tests {
             .expect("app file");
         assert!(app.content.contains("CanvasView"));
         assert!(app.content.contains("UnityPropertyEditor"));
-        assert!(app.content.contains("view.binding.read"));
-        assert!(app.content.contains("view.binding.write"));
+        assert!(app.content.contains("property.readProperty"));
+        assert!(app.content.contains("property.write"));
         assert!(app.content.contains("data-locus-template=\"field-blocks\""));
     }
 
@@ -7019,7 +7190,6 @@ mod tests {
         assert_eq!(created.manifest.template, "serialized-table");
         assert_eq!(created.manifest.icon.as_deref(), Some("TableProperties"));
         assert!(created.manifest.capabilities.unity);
-        assert!(created.manifest.capabilities.write_back);
         assert!(view_manifest_requirements(&created.manifest).unity_connection);
         assert_eq!(created.manifest.scripts[0].name, "SerializedTableApi");
 
@@ -7145,152 +7315,28 @@ mod tests {
     }
 
     #[test]
-    fn resolve_view_binding_target_reads_bindings_json() {
-        let temp = tempdir().unwrap();
-        let working_dir = temp.path().to_string_lossy().to_string();
-        create_view_sync(
-            &working_dir,
-            super::ViewCreateRequest {
-                id: "material-inspector".to_string(),
-                package_name: None,
-                name: Some("Material Inspector".to_string()),
-                template: Some("blank".to_string()),
-                icon: None,
-                display_path: None,
-            },
-        )
-        .expect("create view");
-        std::fs::write(
-            default_test_view_package_root(&working_dir).join("material-inspector/bindings.json"),
-            r#"{
-  "schema": "locus.view.bindings.v1",
-  "bindings": [
-    {
-      "id": "object-name",
-      "statePath": "selection.name",
-      "target": {
-        "kind": "gameObject",
-        "scenePath": "Assets/Scenes/Main.unity",
-        "objectPath": "Root/Player",
-        "propertyPath": "m_Name"
-      },
-      "mode": "readWrite"
-    }
-  ]
-}
-"#,
-        )
-        .expect("write bindings");
+    fn view_property_target_round_trips_guid() {
+        let raw = r#"{
+  "kind": "asset",
+  "guid": "0123456789abcdef0123456789abcdef",
+  "propertyPath": "m_Name"
+}"#;
 
-        let target = resolve_view_binding_target(
-            &working_dir,
-            "material-inspector",
-            Some("object-name"),
-            None,
-        )
-        .expect("resolve target");
-
+        let target: UnitySerializedPropertyTarget =
+            serde_json::from_str(raw).expect("deserialize target");
         assert_eq!(
-            target,
-            ViewBindingTarget {
-                kind: "gameObject".to_string(),
-                path: None,
-                scene_path: Some("Assets/Scenes/Main.unity".to_string()),
-                object_path: Some("Root/Player".to_string()),
-                object_file_id: None,
-                target_file_id: None,
-                component_type: None,
-                component_index: None,
-                target_type_full_name: None,
-                target_type_assembly: None,
-                target_type_name: None,
-                property_path: Some("m_Name".to_string()),
-            }
+            target.guid.as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
         );
+        assert_eq!(target.property_path.as_deref(), Some("m_Name"));
+
+        let encoded = serde_json::to_value(&target).expect("serialize target");
+        assert_eq!(encoded["guid"], "0123456789abcdef0123456789abcdef");
+        assert!(encoded.get("path").is_none());
     }
 
     #[test]
-    fn loaded_view_bindings_resolve_valid_id_without_parsing_unused_targets() {
-        let temp = tempdir().unwrap();
-        let working_dir = temp.path().to_string_lossy().to_string();
-        create_view_sync(
-            &working_dir,
-            super::ViewCreateRequest {
-                id: "material-inspector".to_string(),
-                package_name: None,
-                name: Some("Material Inspector".to_string()),
-                template: Some("blank".to_string()),
-                icon: None,
-                display_path: None,
-            },
-        )
-        .expect("create view");
-        std::fs::write(
-            default_test_view_package_root(&working_dir).join("material-inspector/bindings.json"),
-            r#"{
-  "schema": "locus.view.bindings.v1",
-  "bindings": [
-    {
-      "id": "object-name",
-      "target": {
-        "kind": "gameObject",
-        "scenePath": "Assets/Scenes/Main.unity",
-        "objectPath": "Root/Player",
-        "propertyPath": "m_Name"
-      },
-      "mode": "readWrite"
-    },
-    {
-      "id": "unused-broken-binding",
-      "mode": "readWrite"
-    }
-  ]
-}
-"#,
-        )
-        .expect("write bindings");
-
-        let loaded =
-            super::load_view_bindings(&working_dir, "material-inspector").expect("load bindings");
-        let binding =
-            super::resolve_view_binding_from_loaded(&loaded, Some("object-name")).unwrap();
-
-        assert_eq!(binding.mode.as_deref(), Some("readWrite"));
-        assert_eq!(binding.target.kind, "gameObject");
-        assert_eq!(binding.target.property_path.as_deref(), Some("m_Name"));
-    }
-
-    #[test]
-    fn read_only_view_binding_rejects_write_path() {
-        assert!(ensure_view_binding_write_allowed(Some("readWrite")).is_ok());
-        assert!(ensure_view_binding_write_allowed(None).is_ok());
-        assert!(ensure_view_binding_write_allowed(Some("readOnly")).is_err());
-        assert!(ensure_view_binding_write_allowed(Some("readonly")).is_err());
-    }
-
-    #[test]
-    fn view_binding_object_target_validation_allows_property_discovery_root() {
-        let target = ViewBindingTarget {
-            kind: "component".to_string(),
-            path: None,
-            scene_path: Some("Assets/Scenes/Main.unity".to_string()),
-            object_path: Some("Root/Player".to_string()),
-            object_file_id: None,
-            target_file_id: None,
-            component_type: Some("Game.Settings".to_string()),
-            component_index: Some(0),
-            target_type_full_name: None,
-            target_type_assembly: None,
-            target_type_name: None,
-            property_path: None,
-        };
-
-        assert!(validate_view_binding_object_target(&target).is_ok());
-        assert!(validate_view_binding_target(&target).is_err());
-    }
-
-    #[test]
-    fn view_binding_read_result_preserves_serialized_property_tree_snapshot() {
+    fn view_property_read_result_preserves_serialized_property_tree_snapshot() {
         let raw = r#"{
   "ok": true,
   "bindingId": "settings",
@@ -7348,7 +7394,8 @@ mod tests {
 }
 "#;
 
-        let result: ViewBindingWriteResult = serde_json::from_str(raw).expect("deserialize result");
+        let result: UnitySerializedPropertyWriteResult =
+            serde_json::from_str(raw).expect("deserialize result");
         assert_eq!(result.read.target.component_index, Some(2));
         assert!(result.read.property.is_array);
         assert_eq!(result.read.property.array_size, 1);
@@ -7374,7 +7421,7 @@ mod tests {
     }
 
     #[test]
-    fn view_binding_discover_result_preserves_field_type_metadata() {
+    fn view_property_discover_result_preserves_field_type_metadata() {
         let raw = r#"{
   "ok": true,
   "bindingId": "settings",
@@ -7405,7 +7452,7 @@ mod tests {
 }
 "#;
 
-        let result: ViewBindingDiscoverResult =
+        let result: UnitySerializedPropertyDiscoverResult =
             serde_json::from_str(raw).expect("deserialize discover result");
         assert_eq!(result.matches.len(), 1);
         assert_eq!(result.matches[0].property_path, "stats");

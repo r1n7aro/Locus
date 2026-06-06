@@ -410,7 +410,7 @@ mod tests {
                     kind: "unityPackage".to_string(),
                     name: "com.example.runtime".to_string(),
                     version: Some("1.2.3".to_string()),
-                    notes: Some("Runtime scripts required by the View bindings.".to_string()),
+                    notes: Some("Runtime scripts required by View property editors.".to_string()),
                 }],
             },
         )

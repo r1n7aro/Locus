@@ -19,6 +19,7 @@ namespace Locus
         private sealed class ViewBindingTarget
         {
             public string kind;
+            public string guid;
             public string path;
             public string scenePath;
             public string objectPath;
@@ -382,6 +383,7 @@ namespace Locus
         private static string BuildViewBindingObjectKey(ViewBindingTarget target)
         {
             return (target.kind ?? "").Trim().ToLowerInvariant() + "|" +
+                   (target.guid ?? "").Trim().ToLowerInvariant() + "|" +
                    (target.path ?? "").Trim().Replace('\\', '/') + "|" +
                    (target.scenePath ?? "").Trim().Replace('\\', '/') + "|" +
                    (target.objectPath ?? "").Trim().Replace('\\', '/') + "|" +
@@ -618,6 +620,7 @@ namespace Locus
             return new SerializedPropertyBindingTarget
             {
                 kind = source.kind ?? "",
+                guid = source.guid ?? "",
                 path = source.path ?? "",
                 scenePath = source.scenePath ?? "",
                 objectPath = source.objectPath ?? "",
@@ -692,6 +695,7 @@ namespace Locus
             var target = new ViewBindingTarget
             {
                 kind = source.kind,
+                guid = source.guid,
                 path = source.path,
                 scenePath = source.scenePath,
                 objectPath = source.objectPath,
@@ -741,6 +745,7 @@ namespace Locus
             return new ViewBindingTarget
             {
                 kind = source.kind,
+                guid = source.guid,
                 path = source.path,
                 scenePath = source.scenePath,
                 objectPath = source.objectPath,
@@ -763,6 +768,7 @@ namespace Locus
             return new ViewBindingTarget
             {
                 kind = "component",
+                guid = source != null ? source.guid : "",
                 path = source != null ? source.path : "",
                 scenePath = source != null ? source.scenePath : "",
                 objectPath = source != null ? source.objectPath : "",
@@ -784,6 +790,7 @@ namespace Locus
             return new SerializedPropertyBindingTarget
             {
                 kind = source.kind ?? "",
+                guid = source.guid ?? "",
                 path = source.path ?? "",
                 scenePath = source.scenePath ?? "",
                 objectPath = source.objectPath ?? "",
@@ -1108,19 +1115,38 @@ namespace Locus
 
         private static UnityEngine.Object ResolveAssetTarget(ViewBindingTarget target)
         {
-            string path = target.path;
+            string path = ResolveViewBindingAssetPath(target);
             UnityEngine.Object obj = !string.IsNullOrWhiteSpace(path)
                 ? AssetDatabase.LoadMainAssetAtPath(path)
                 : Selection.activeObject;
             if (obj == null)
-                throw new Exception("Asset target not found: " + (path ?? "<selection>"));
+                throw new Exception("Asset target not found: " + (!string.IsNullOrWhiteSpace(path) ? path : "<selection>"));
             return obj;
+        }
+
+        private static string ResolveViewBindingAssetPath(ViewBindingTarget target)
+        {
+            string path = (target.path ?? "").Trim().Replace('\\', '/');
+            if (string.IsNullOrWhiteSpace(path) && !string.IsNullOrWhiteSpace(target.guid))
+            {
+                string guid = (target.guid ?? "").Trim();
+                path = AssetDatabase.GUIDToAssetPath(guid);
+                if (string.IsNullOrWhiteSpace(path))
+                    throw new Exception("Asset GUID target not found: " + guid);
+            }
+
+            if (!string.IsNullOrWhiteSpace(path))
+                target.path = path;
+            return path;
         }
 
         private static GameObject ResolveGameObjectTarget(ViewBindingTarget target)
         {
-            if (IsPrefabAssetPath(target.path))
+            string assetPath = ResolveViewBindingAssetPath(target);
+            if (IsPrefabAssetPath(assetPath))
                 return ResolvePrefabAssetGameObjectTarget(target);
+            if (string.IsNullOrWhiteSpace(target.scenePath) && IsSceneAssetPath(assetPath))
+                target.scenePath = assetPath;
 
             Scene scene = ResolveScene(target.scenePath);
             bool componentTarget = string.Equals((target.kind ?? "").Trim(), "component", StringComparison.OrdinalIgnoreCase);
@@ -1186,6 +1212,12 @@ namespace Locus
                    path.Trim().Replace('\\', '/').EndsWith(".prefab", StringComparison.OrdinalIgnoreCase);
         }
 
+        private static bool IsSceneAssetPath(string path)
+        {
+            return !string.IsNullOrWhiteSpace(path) &&
+                   path.Trim().Replace('\\', '/').EndsWith(".unity", StringComparison.OrdinalIgnoreCase);
+        }
+
         private static GameObject ResolvePrefabAssetGameObjectTarget(ViewBindingTarget target)
         {
             string path = (target.path ?? "").Trim().Replace('\\', '/');
@@ -1235,7 +1267,11 @@ namespace Locus
 
         private static Component ResolveComponentTarget(ViewBindingTarget target)
         {
-            if (target.targetFileId != 0 && !IsPrefabAssetPath(target.path))
+            string assetPath = ResolveViewBindingAssetPath(target);
+            if (string.IsNullOrWhiteSpace(target.scenePath) && IsSceneAssetPath(assetPath))
+                target.scenePath = assetPath;
+
+            if (target.targetFileId != 0 && !IsPrefabAssetPath(assetPath))
             {
                 if (target.objectFileId != 0 || !string.IsNullOrWhiteSpace(target.objectPath))
                 {
@@ -1805,6 +1841,7 @@ namespace Locus
                 return "null";
             return "{" +
                    "\"kind\":\"" + JsonEscape(target.kind) + "\"," +
+                   "\"guid\":" + NullableJsonString(target.guid) + "," +
                    "\"path\":" + NullableJsonString(target.path) + "," +
                    "\"scenePath\":" + NullableJsonString(target.scenePath) + "," +
                    "\"objectPath\":" + NullableJsonString(target.objectPath) + "," +

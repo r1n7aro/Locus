@@ -174,11 +174,18 @@ import {
   type UnityObjectDrawerInput,
 } from "../../services/unityObjectDrawer";
 import type { UnitySerializedPropertyCommitEvent } from "../unity/unitySerializedValue";
+import {
+  createUnityPropertyRuntime,
+  unityBoundPropertySnapshots,
+  type UnityBoundPropertyApplyWrite,
+  type UnityBoundPropertyTree,
+} from "../unity/unityPropertyBinding";
 import { t } from "../../i18n";
 import { isUnityConnectionError, normalizeAppError } from "../../services/errors";
 import {
   applyUnitySerializedProperties,
   readUnitySerializedProperty,
+  writeUnitySerializedProperty,
   type UnitySerializedPropertyTarget,
 } from "../../services/unitySerializedProperty";
 import BinaryPreviewHost from "../diff/BinaryPreviewHost.vue";
@@ -196,6 +203,12 @@ import {
 } from "./unityObjectPreview";
 import UnityObjectEditorPanel from "./UnityObjectEditorPanel.vue";
 import UnityObjectIdentity from "./UnityObjectIdentity.vue";
+
+const locusInspectorPropertyRuntime = createUnityPropertyRuntime({
+  read: readUnitySerializedProperty,
+  write: writeUnitySerializedProperty,
+  apply: applyUnitySerializedProperties,
+});
 
 const props = withDefaults(defineProps<{
   model: UnityObjectPreviewInput | UnityObjectPreviewModel;
@@ -264,6 +277,7 @@ const targetCache = ref<Map<string, SemanticTargetInspector>>(new Map());
 const autoTargetLoading = ref(false);
 const autoTargetError = ref("");
 const livePropertyTree = ref<UnityObjectPropertyTreeInput | null>(null);
+const liveBoundPropertyTree = ref<UnityBoundPropertyTree | null>(null);
 const livePropertyLoading = ref(false);
 const livePropertyError = ref("");
 let autoPreviewRun = 0;
@@ -642,21 +656,24 @@ async function loadLivePropertyTree(force = false, options: { background?: boole
   if (!background) livePropertyLoading.value = true;
   livePropertyError.value = "";
   try {
-    const result = await readUnitySerializedProperty({
-      target,
+    const boundTree = await locusInspectorPropertyRuntime.readTree(target, {
+      idPrefix: "unity-object",
       maxDepth: 5,
       maxArrayItems: 128,
     });
     if (run !== livePropertyRun || liveSerializedTargetKey.value === "") return null;
     if (background && writeVersion !== editorWriteVersion) return livePropertyTree.value;
-    livePropertyTree.value = Array.isArray(result.properties) && result.properties.length
-      ? result.properties
-      : result;
-    return result;
+    const snapshots = unityBoundPropertySnapshots(boundTree);
+    liveBoundPropertyTree.value = boundTree;
+    livePropertyTree.value = (snapshots.length > 1
+      ? snapshots
+      : snapshots[0] ?? null) as UnityObjectPropertyTreeInput | null;
+    return boundTree;
   } catch (error) {
     if (run !== livePropertyRun) return null;
     if (background && writeVersion !== editorWriteVersion) return livePropertyTree.value;
     if (!background) livePropertyTree.value = null;
+    if (!background) liveBoundPropertyTree.value = null;
     livePropertyError.value = normalizeAppError(error).message;
     return null;
   } finally {
@@ -776,14 +793,15 @@ async function flushEditorWrites() {
   editorWriteInFlight = true;
   if (!disposed) livePropertyError.value = "";
   try {
-    const result = await applyUnitySerializedProperties({
-      writes: writes.map((write) => ({
-        bindingId: write.bindingId,
-        target: write.target,
-        value: write.value,
-        writeMode: write.writeMode,
-      })),
-    });
+    const propertyWrites: UnityBoundPropertyApplyWrite[] = writes.map((write) => ({
+      bindingId: write.bindingId,
+      target: write.target,
+      value: write.value,
+      writeMode: write.writeMode,
+    }));
+    const result = liveBoundPropertyTree.value
+      ? await liveBoundPropertyTree.value.apply(propertyWrites, { refresh: false })
+      : await locusInspectorPropertyRuntime.apply(propertyWrites, { refresh: false });
     const successfulWrites = writes.filter((write, index) =>
       write.writeMode !== "preview" && result.results[index]?.ok === true
     );

@@ -48,14 +48,22 @@ import {
 import {
   viewAppendFrontendLog,
   viewAutomationRespond,
-  viewBindingApply,
-  viewBindingDiscover,
-  viewBindingRead,
-  viewBindingWrite,
   viewCallScript,
   viewContentHide,
   viewContentMount,
   viewDetachTab,
+  viewFsAccess,
+  viewFsAppendFile,
+  viewFsCopyFile,
+  viewFsLstat,
+  viewFsMkdir,
+  viewFsReadFile,
+  viewFsReaddir,
+  viewFsRename,
+  viewFsRm,
+  viewFsStat,
+  viewFsUnlink,
+  viewFsWriteFile,
   viewHostRevealed,
   viewHostPoolPrepare,
   viewHostPoolReady,
@@ -173,6 +181,16 @@ interface ViewRuntimeRecord {
   stale: boolean;
 }
 
+interface ViewContentMountGeometry {
+  viewId: string;
+  hostLabel: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  visible: boolean;
+}
+
 interface AutomationPoint {
   x: number;
   y: number;
@@ -237,6 +255,7 @@ let externalTabDropSourceLabel = "";
 let nativeTabDragPreviewActive = false;
 let hostWindowRevealStarted = false;
 let poolPreparePromise: Promise<void> | null = null;
+let lastViewContentMountGeometry: ViewContentMountGeometry | null = null;
 const handledAutomationRequests = new Map<string, number>();
 
 const RUNTIME_STATUSBAR_SELECTOR = [
@@ -2093,6 +2112,35 @@ async function callRuntimeLlm(request: ViewLlmCallRequest): Promise<ViewLlmCallR
   };
 }
 
+function viewContentMountGeometryFromRequest(
+  request: ViewContentMountRequest,
+): ViewContentMountGeometry {
+  return {
+    viewId: request.viewId,
+    hostLabel: request.hostLabel,
+    x: request.x,
+    y: request.y,
+    width: request.width,
+    height: request.height,
+    visible: request.visible !== false,
+  };
+}
+
+function viewContentMountGeometryMatches(
+  left: ViewContentMountGeometry | null,
+  right: ViewContentMountRequest,
+): boolean {
+  if (!left) return false;
+  const next = viewContentMountGeometryFromRequest(right);
+  return left.viewId === next.viewId
+    && left.hostLabel === next.hostLabel
+    && left.x === next.x
+    && left.y === next.y
+    && left.width === next.width
+    && left.height === next.height
+    && left.visible === next.visible;
+}
+
 async function buildViewContentMountRequest(
   viewId: string,
   visible: boolean,
@@ -2224,6 +2272,17 @@ async function mountViewContentFromPool(
 
       const mountRequest = await buildViewContentMountRequest(viewId, true);
       if (!mountRequest) return;
+      if (options.updateGeometryOnly
+        && viewContentMountGeometryMatches(lastViewContentMountGeometry, mountRequest)
+      ) {
+        viewHostContentLog("mount-geometry-unchanged", {
+          viewId,
+          hostLabel: mountRequest.hostLabel,
+          width: mountRequest.width,
+          height: mountRequest.height,
+        });
+        return;
+      }
       const mountStartedAt = perfNowMs();
       if (!options.updateGeometryOnly) {
         viewHostContentLog("mount-ipc-start", {
@@ -2237,6 +2296,7 @@ async function mountViewContentFromPool(
         markStartupPhase("viewContentMount_start", { viewId, hostLabel: mountRequest.hostLabel });
       }
       const mountResult = await viewContentMount(mountRequest);
+      lastViewContentMountGeometry = viewContentMountGeometryFromRequest(mountRequest);
       if (!options.updateGeometryOnly) {
         viewHostContentLog("mount-ipc-done", {
           viewId,
@@ -2383,11 +2443,6 @@ async function loadView(
           api: {
             callScript: (scriptName, method, args) =>
               viewCallScript({ viewId: next.manifest.id, scriptName, method, args }),
-            bindingRead: (request) => viewBindingRead({ viewId: next.manifest.id, ...request }),
-            bindingDiscover: (request) =>
-              viewBindingDiscover({ viewId: next.manifest.id, ...request }),
-            bindingWrite: (request) => viewBindingWrite({ viewId: next.manifest.id, ...request }),
-            bindingApply: (request) => viewBindingApply({ viewId: next.manifest.id, ...request }),
             unityPropertyRead: readUnitySerializedProperty,
             unityPropertyDiscover: discoverUnitySerializedProperties,
             unityPropertyWrite: writeUnitySerializedProperty,
@@ -2411,6 +2466,19 @@ async function loadView(
             storageGet: (key) => viewStorageGet({ viewId: next.manifest.id, key }),
             storageSet: (key, value) => viewStorageSet({ viewId: next.manifest.id, key, value }),
             storageRemove: (key) => viewStorageRemove({ viewId: next.manifest.id, key }),
+            fsReadFile: (path, encoding) => viewFsReadFile({ path, encoding }),
+            fsWriteFile: (path, data, encoding) => viewFsWriteFile({ path, data, encoding }),
+            fsAppendFile: (path, data, encoding) => viewFsAppendFile({ path, data, encoding }),
+            fsMkdir: (path, options) => viewFsMkdir({ path, recursive: options?.recursive }),
+            fsReaddir: (path, options) => viewFsReaddir({ path, withFileTypes: options?.withFileTypes }),
+            fsStat: (path) => viewFsStat({ path }),
+            fsLstat: (path) => viewFsLstat({ path }),
+            fsAccess: (path) => viewFsAccess({ path }),
+            fsUnlink: (path) => viewFsUnlink({ path }),
+            fsRm: (path, options) =>
+              viewFsRm({ path, recursive: options?.recursive, force: options?.force }),
+            fsRename: (oldPath, newPath) => viewFsRename({ oldPath, newPath }),
+            fsCopyFile: (src, dest) => viewFsCopyFile({ src, dest }),
             onUpdate: (handler) =>
               getLocusRuntime().subscribe<ViewRuntimeUpdateEvent>("unity-editor-update", handler),
             reload: () => loadView(record.viewId, { force: true }),

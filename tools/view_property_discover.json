@@ -1,20 +1,12 @@
 {
-  "description": "Discover Unity SerializedProperty propertyPath values for a View Binding target without writing data. Provide either bindingId from bindings.json or a concrete target, then filter by fieldName, fieldType, or query. Returns matching property paths with reflected field type metadata.",
+  "description": "Discover Unity SerializedProperty propertyPath values for a concrete View property target without writing data. Use this to validate unknown property paths before hardcoding them.",
   "parameters": {
     "type": "object",
     "additionalProperties": false,
     "properties": {
-      "viewId": {
-        "type": "string",
-        "description": "View id containing bindings.json, for example material-inspector."
-      },
-      "bindingId": {
-        "type": ["string", "null"],
-        "description": "Optional binding id from bindings.json. Its target object is used as the discovery root."
-      },
       "target": {
-        "type": ["object", "null"],
-        "description": "Concrete binding target without propertyPath. Fields: kind, path, scenePath, objectPath, componentType, componentIndex."
+        "type": "object",
+        "description": "Concrete object target without propertyPath. Fields: kind, guid, path, scenePath, objectPath, componentType, componentIndex."
       },
       "query": {
         "type": ["string", "null"],
@@ -37,6 +29,6 @@
         "description": "Optional result cap. Defaults to 100, maximum 500."
       }
     },
-    "required": ["viewId"]
+    "required": ["target"]
   }
 }

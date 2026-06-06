@@ -2299,8 +2299,8 @@ mod windows_impl {
             SIZE, S_OK, WPARAM,
         },
         Graphics::Gdi::{
-            CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreatePen, CreateSolidBrush,
-            DeleteDC, DeleteObject, DrawTextW, FillRect, GetDC, GetStockObject,
+            ClientToScreen, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreatePen,
+            CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, FillRect, GetDC, GetStockObject,
             GetTextExtentPoint32W, LineTo, MoveToEx, ReleaseDC, RoundRect, ScreenToClient,
             SelectObject, SetBkMode, SetTextColor, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS,
             DEFAULT_CHARSET, DEFAULT_GUI_FONT, DEFAULT_PITCH, DT_END_ELLIPSIS, DT_NOPREFIX,
@@ -4172,17 +4172,18 @@ mod windows_impl {
                             && child_rect.bottom - child_rect.top == height
                     })
                     .unwrap_or(false);
-                let insert_after = overlay_insert_after(parent, child, target_rect);
-
-                let _ = SetWindowPos(
-                    child,
-                    Some(insert_after),
-                    x,
-                    y,
-                    width,
-                    height,
-                    SWP_NOACTIVATE | SWP_NOOWNERZORDER,
-                );
+                if !child_matches {
+                    let insert_after = overlay_insert_after(parent, child, target_rect);
+                    let _ = SetWindowPos(
+                        child,
+                        Some(insert_after),
+                        x,
+                        y,
+                        width,
+                        height,
+                        SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+                    );
+                }
 
                 active = true;
                 if !child_matches {
@@ -4404,19 +4405,33 @@ mod windows_impl {
             } else {
                 SWP_NOACTIVATE
             };
+            let child_matches = if needs_style_update || needs_parent_update {
+                false
+            } else {
+                let mut parent_origin = POINT { x: 0, y: 0 };
+                let mut child_rect = RECT::default();
+                ClientToScreen(parent, &mut parent_origin).as_bool()
+                    && GetWindowRect(child, &mut child_rect).is_ok()
+                    && child_rect.left == parent_origin.x + top_left.x
+                    && child_rect.top == parent_origin.y + top_left.y
+                    && child_rect.right == parent_origin.x + top_left.x + width_i32
+                    && child_rect.bottom == parent_origin.y + top_left.y + height_i32
+            };
 
-            SetWindowPos(
-                child,
-                Some(HWND_TOP),
-                top_left.x,
-                top_left.y,
-                width_i32,
-                height_i32,
-                flags,
-            )
-            .map_err(|error| {
-                format!("SetWindowPos failed for Unity embed child window: {error}")
-            })?;
+            if !child_matches {
+                SetWindowPos(
+                    child,
+                    Some(HWND_TOP),
+                    top_left.x,
+                    top_left.y,
+                    width_i32,
+                    height_i32,
+                    flags,
+                )
+                .map_err(|error| {
+                    format!("SetWindowPos failed for Unity embed child window: {error}")
+                })?;
+            }
         }
 
         set_activation_guard_enabled(Some(window), false)?;
@@ -4503,16 +4518,9 @@ mod windows_impl {
             let needs_detach = (current_style & WS_CHILD.0) != 0;
             let needs_style_update =
                 (current_style & frame_style_mask) != 0 || (current_style & WS_POPUP.0) == 0;
-            let label = unity_embed_window_label_for_msg(msg);
-            let needs_owner_update = applied_states()
-                .lock()
-                .map(|states| {
-                    states
-                        .get(&label)
-                        .map(|state| !state.has_window || state.parent_hwnd != msg.parent_hwnd)
-                        .unwrap_or(true)
-                })
-                .unwrap_or(true);
+            let owner_hwnd = owner.0 as isize;
+            let needs_owner_update =
+                needs_detach || GetWindowLongPtrW(child, GWLP_HWNDPARENT) != owner_hwnd;
 
             if needs_detach {
                 SetParent(child, None).map_err(|error| {
@@ -4523,7 +4531,9 @@ mod windows_impl {
             if needs_style_update || needs_owner_update {
                 let next_style = (current_style & !frame_style_mask) | WS_POPUP.0;
                 SetWindowLongPtrW(child, GWL_STYLE, next_style as isize);
-                SetWindowLongPtrW(child, GWLP_HWNDPARENT, owner.0 as isize);
+            }
+            if needs_owner_update {
+                SetWindowLongPtrW(child, GWLP_HWNDPARENT, owner_hwnd);
             }
 
             let flags = if needs_style_update || needs_owner_update {
@@ -4541,17 +4551,27 @@ mod windows_impl {
                 sync_overlay_visibility(child, false);
             }
 
-            let insert_after = overlay_insert_after(parent, child, target_rect);
-            SetWindowPos(
-                child,
-                Some(insert_after),
-                x,
-                y,
-                width_i32,
-                height_i32,
-                flags,
-            )
-            .map_err(|error| format!("SetWindowPos failed for Unity embed window: {error}"))?;
+            let mut child_rect = RECT::default();
+            let child_matches = !needs_style_update
+                && !needs_owner_update
+                && GetWindowRect(child, &mut child_rect).is_ok()
+                && child_rect.left == x
+                && child_rect.top == y
+                && child_rect.right == x + width_i32
+                && child_rect.bottom == y + height_i32;
+            if !child_matches {
+                let insert_after = overlay_insert_after(parent, child, target_rect);
+                SetWindowPos(
+                    child,
+                    Some(insert_after),
+                    x,
+                    y,
+                    width_i32,
+                    height_i32,
+                    flags,
+                )
+                .map_err(|error| format!("SetWindowPos failed for Unity embed window: {error}"))?;
+            }
         }
 
         update_popup_sync(

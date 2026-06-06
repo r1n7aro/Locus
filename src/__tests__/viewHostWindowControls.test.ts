@@ -50,6 +50,8 @@ describe("View host window controls", () => {
     expect(runtime).toContain("sync_unity_owned_view_windows_for_project");
     expect(runtime).toContain("find_unity_owner_window_for_process");
     expect(runtime).toContain("GWLP_HWNDPARENT");
+    expect(runtime).toContain("GetWindowLongPtrW(hwnd, GWLP_HWNDPARENT) == owner_hwnd");
+    expect(runtime).toContain("GetWindowLongPtrW(hwnd, GWLP_HWNDPARENT) == 0");
     expect(runtime).toContain("SWP_NOACTIVATE");
     expect(runtime).toContain("revealed: bool");
     expect(runtime).toContain("attached_owner_hwnd: Option<isize>");

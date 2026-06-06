@@ -47,10 +47,11 @@ pub mod tools {
     pub const VIEW_RUN: &str = include_str!("../../tools/view_run.json");
     pub const VIEW_COMPILE_SCRIPT: &str = include_str!("../../tools/view_compile_script.json");
     pub const VIEW_CALL_SCRIPT: &str = include_str!("../../tools/view_call_script.json");
-    pub const VIEW_BINDING_READ: &str = include_str!("../../tools/view_binding_read.json");
-    pub const VIEW_BINDING_DISCOVER: &str = include_str!("../../tools/view_binding_discover.json");
-    pub const VIEW_BINDING_WRITE: &str = include_str!("../../tools/view_binding_write.json");
-    pub const VIEW_BINDING_APPLY: &str = include_str!("../../tools/view_binding_apply.json");
+    pub const VIEW_PROPERTY_READ: &str = include_str!("../../tools/view_property_read.json");
+    pub const VIEW_PROPERTY_DISCOVER: &str =
+        include_str!("../../tools/view_property_discover.json");
+    pub const VIEW_PROPERTY_WRITE: &str = include_str!("../../tools/view_property_write.json");
+    pub const VIEW_PROPERTY_APPLY: &str = include_str!("../../tools/view_property_apply.json");
     pub const VIEW_CAPTURE: &str = include_str!("../../tools/view_capture.json");
     pub const VIEW_SNAPSHOT: &str = include_str!("../../tools/view_snapshot.json");
     pub const VIEW_ACTION: &str = include_str!("../../tools/view_action.json");
@@ -134,10 +135,10 @@ mod tests {
             ("view_run", tools::VIEW_RUN),
             ("view_compile_script", tools::VIEW_COMPILE_SCRIPT),
             ("view_call_script", tools::VIEW_CALL_SCRIPT),
-            ("view_binding_read", tools::VIEW_BINDING_READ),
-            ("view_binding_discover", tools::VIEW_BINDING_DISCOVER),
-            ("view_binding_write", tools::VIEW_BINDING_WRITE),
-            ("view_binding_apply", tools::VIEW_BINDING_APPLY),
+            ("view_property_read", tools::VIEW_PROPERTY_READ),
+            ("view_property_discover", tools::VIEW_PROPERTY_DISCOVER),
+            ("view_property_write", tools::VIEW_PROPERTY_WRITE),
+            ("view_property_apply", tools::VIEW_PROPERTY_APPLY),
             ("view_capture", tools::VIEW_CAPTURE),
             ("view_snapshot", tools::VIEW_SNAPSHOT),
             ("view_action", tools::VIEW_ACTION),

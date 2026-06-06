@@ -1,7 +1,7 @@
 pub(super) fn app_vue(_name: &str) -> String {
     r##"<script setup lang="ts">
 import { computed, ref } from "vue";
-import { CanvasView } from "@locus/view-runtime";
+import { CanvasView } from "@locus/components";
 
 interface CanvasBlock {
   id: string;

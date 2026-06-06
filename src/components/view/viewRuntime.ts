@@ -44,37 +44,15 @@ import UnityPropertyDraw from "../unity/UnityPropertyDraw.vue";
 import UnityPropertyEditor from "../unity/UnityPropertyEditor.vue";
 import UnitySerializedPropertyTree from "../unity/UnitySerializedPropertyTree.vue";
 import UnityVectorField from "../unity/UnityVectorField.vue";
+import * as UnityPropertyBinding from "../unity/unityPropertyBinding";
+import * as UnitySerializedValue from "../unity/unitySerializedValue";
 import UnityObjectPreview from "../unity-preview/UnityObjectPreview.vue";
-import {
-  applyUnityRgbHexToColorText,
-  formatUnityColorValue,
-  formatUnityVectorValue,
-  isUnityIntegerPropertyType,
-  isUnityNumberPropertyType,
-  isUnityVectorPropertyType,
-  normalizeUnityOptions,
-  normalizeUnityPropertyType,
-  parseUnityColorValue,
-  parseUnitySerializedEditValue,
-  parseUnityVectorValue,
-  tryParseUnitySerializedEditValue,
-  unityColorTextToRgbHex,
-  unityEnumIndexValue,
-  unityEnumNumericValue,
-  unitySerializedValueToEditText,
-  unityVectorKeysForType,
-} from "../unity/unitySerializedValue";
 import type {
-  ViewBindingApplyRequest,
-  ViewBindingApplyResult,
-  ViewBindingApplyWrite,
-  ViewBindingDiscoverRequest,
-  ViewBindingDiscoverResult,
-  ViewBindingReadRequest,
-  ViewBindingReadResult,
-  ViewBindingWriteRequest,
-  ViewBindingWriteResult,
   ViewCallScriptResult,
+  ViewFsFileData,
+  ViewFsReadFileResult,
+  ViewFsReaddirResult,
+  ViewFsStatResult,
   ViewFrontendLogEntry,
   ViewLlmCallRequest,
   ViewLlmCallResult,
@@ -87,16 +65,17 @@ import type {
   ViewSessionQueueInputResult,
   ViewSessionWaitRequest,
   ViewSessionWaitResult,
-  ViewSerializedPropertySnapshot,
   ViewRuntimeUpdateEvent,
 } from "../../services/view";
 import type {
   UnitySerializedPropertyApplyRequest,
   UnitySerializedPropertyApplyResult,
+  UnitySerializedPropertyApplyWrite,
   UnitySerializedPropertyDiscoverRequest,
   UnitySerializedPropertyDiscoverResult,
   UnitySerializedPropertyReadRequest,
   UnitySerializedPropertyReadResult,
+  UnitySerializedPropertySnapshot,
   UnitySerializedPropertyWriteRequest,
   UnitySerializedPropertyWriteResult,
 } from "../../services/unitySerializedProperty";
@@ -158,6 +137,7 @@ import type {
   StreamEvent,
 } from "../../types";
 import * as PropertyTreeService from "../../services/propertyTree";
+import * as UnityPropertyPathService from "../../services/unityPropertyPath";
 import * as UnityObjectDrawerService from "../../services/unityObjectDrawer";
 import * as UnityObjectReferencePickerService from "../../services/unityObjectReferencePicker";
 import { markStartupPhase } from "../../services/startupPerf";
@@ -172,10 +152,13 @@ export type {
   ViewSessionQueueInputResult,
   ViewSessionWaitRequest,
   ViewSessionWaitResult,
-  ViewBindingDiscoverMatch,
-  ViewBindingDiscoverRequest,
-  ViewBindingDiscoverResult,
 } from "../../services/view";
+
+export type {
+  UnitySerializedPropertyDiscoverMatch,
+  UnitySerializedPropertyDiscoverRequest,
+  UnitySerializedPropertyDiscoverResult,
+} from "../../services/unitySerializedProperty";
 
 export type {
   TransformResult,
@@ -219,6 +202,19 @@ type ViewRuntimeUnsubscribe = () => void;
 type CompileViewSfc = (source: string, fileName?: string) => ViewSfcCompileResult;
 type TransformModuleSource = (source: string, fileName?: string) => string;
 
+export interface ViewRuntimeFsMkdirOptions {
+  recursive?: boolean | null;
+}
+
+export interface ViewRuntimeFsReaddirOptions {
+  withFileTypes?: boolean | null;
+}
+
+export interface ViewRuntimeFsRmOptions {
+  recursive?: boolean | null;
+  force?: boolean | null;
+}
+
 const PROJECT_VIEW_IMPORT_PREFIXES = [
   "@locus/project-view",
   "@project-view",
@@ -226,12 +222,6 @@ const PROJECT_VIEW_IMPORT_PREFIXES = [
 
 export interface ViewRuntimeApi {
   callScript(scriptName: string, method: string, args?: unknown): Promise<ViewCallScriptResult>;
-  bindingRead(request: Omit<ViewBindingReadRequest, "viewId">): Promise<ViewBindingReadResult>;
-  bindingDiscover(
-    request: Omit<ViewBindingDiscoverRequest, "viewId">,
-  ): Promise<ViewBindingDiscoverResult>;
-  bindingWrite(request: Omit<ViewBindingWriteRequest, "viewId">): Promise<ViewBindingWriteResult>;
-  bindingApply(request: Omit<ViewBindingApplyRequest, "viewId">): Promise<ViewBindingApplyResult>;
   unityPropertyRead(request: UnitySerializedPropertyReadRequest): Promise<UnitySerializedPropertyReadResult>;
   unityPropertyDiscover(request: UnitySerializedPropertyDiscoverRequest): Promise<UnitySerializedPropertyDiscoverResult>;
   unityPropertyWrite(request: UnitySerializedPropertyWriteRequest): Promise<UnitySerializedPropertyWriteResult>;
@@ -252,6 +242,18 @@ export interface ViewRuntimeApi {
   storageGet(key: string): Promise<unknown | null>;
   storageSet(key: string, value: unknown): Promise<void>;
   storageRemove(key: string): Promise<void>;
+  fsReadFile(path: string, encoding?: string | null): Promise<ViewFsReadFileResult>;
+  fsWriteFile(path: string, data: ViewFsFileData, encoding?: string | null): Promise<void>;
+  fsAppendFile(path: string, data: ViewFsFileData, encoding?: string | null): Promise<void>;
+  fsMkdir(path: string, options?: ViewRuntimeFsMkdirOptions): Promise<void>;
+  fsReaddir(path: string, options?: ViewRuntimeFsReaddirOptions): Promise<ViewFsReaddirResult>;
+  fsStat(path: string): Promise<ViewFsStatResult>;
+  fsLstat(path: string): Promise<ViewFsStatResult>;
+  fsAccess(path: string): Promise<void>;
+  fsUnlink(path: string): Promise<void>;
+  fsRm(path: string, options?: ViewRuntimeFsRmOptions): Promise<void>;
+  fsRename(oldPath: string, newPath: string): Promise<void>;
+  fsCopyFile(src: string, dest: string): Promise<void>;
   onUpdate(handler: (event: ViewRuntimeUpdateEvent) => void): Promise<ViewRuntimeUnsubscribe>;
   reload(): Promise<void>;
 }
@@ -285,29 +287,22 @@ export interface ViewRuntimeUndoEntry {
   redo: () => unknown | Promise<unknown>;
 }
 
-export type ViewSerializedPropertySnapshotInput = Partial<ViewSerializedPropertySnapshot> & {
+export type ViewSerializedPropertySnapshotInput = Partial<UnitySerializedPropertySnapshot> & {
   propertyPath: string;
   value?: unknown;
   children?: ViewSerializedPropertySnapshotInput[];
 };
 
-export interface ViewRuntimeBindingWriteOptions {
+export interface ViewRuntimePropertyWriteOptions {
   undoable?: boolean;
   label?: string;
   beforeSnapshot?: ViewSerializedPropertySnapshotInput | null;
-  onApplied?: (result: ViewBindingWriteResult) => void | Promise<void>;
+  onApplied?: (result: UnitySerializedPropertyWriteResult) => void | Promise<void>;
 }
 
-export interface ViewRuntimeBindingApplyOptions {
+export interface ViewRuntimePropertyApplyOptions {
   undoable?: boolean;
   label?: string;
-}
-
-export interface ViewSerializedPropertyCommitInput {
-  propertyPath: string;
-  value: unknown;
-  property?: ViewSerializedPropertySnapshotInput | null;
-  snapshot?: ViewSerializedPropertySnapshotInput | null;
 }
 
 export type ViewGraphPortDirection = GraphPortDirection;
@@ -909,18 +904,18 @@ function snapshotHistoryKey(snapshot: ViewSerializedPropertySnapshotInput | null
   }
 }
 
-function bindingWriteKey(request: Omit<ViewBindingWriteRequest, "viewId">): string {
+function propertyWriteKey(request: UnitySerializedPropertyWriteRequest): string {
   try {
     return JSON.stringify({
       bindingId: request.bindingId ?? "",
-      target: request.target ?? null,
+      target: request.target,
     });
   } catch {
     return `${request.bindingId ?? ""}`;
   }
 }
 
-function createViewBindingRuntime(api: ViewRuntimeApi, undo: ReturnType<typeof createViewUndoService>) {
+function createViewPropertyRuntime(api: ViewRuntimeApi, undo: ReturnType<typeof createViewUndoService>) {
   const writeQueues = new Map<string, Promise<unknown>>();
 
   function queueWrite<T>(key: string, job: () => Promise<T>): Promise<T> {
@@ -935,11 +930,11 @@ function createViewBindingRuntime(api: ViewRuntimeApi, undo: ReturnType<typeof c
   }
 
   async function readBeforeSnapshot(
-    request: Omit<ViewBindingWriteRequest, "viewId">,
-    options: ViewRuntimeBindingWriteOptions,
+    request: UnitySerializedPropertyWriteRequest,
+    options: ViewRuntimePropertyWriteOptions,
   ): Promise<ViewSerializedPropertySnapshotInput | null> {
     if (options.beforeSnapshot) return options.beforeSnapshot;
-    const result = await api.bindingRead({
+    const result = await api.unityPropertyRead({
       bindingId: request.bindingId,
       target: request.target,
     });
@@ -947,13 +942,13 @@ function createViewBindingRuntime(api: ViewRuntimeApi, undo: ReturnType<typeof c
   }
 
   function recordWriteUndo(
-    request: Omit<ViewBindingWriteRequest, "viewId">,
+    request: UnitySerializedPropertyWriteRequest,
     before: ViewSerializedPropertySnapshotInput,
-    after: ViewBindingWriteResult,
-    options: ViewRuntimeBindingWriteOptions,
+    after: UnitySerializedPropertyWriteResult,
+    options: ViewRuntimePropertyWriteOptions,
   ) {
     if (snapshotHistoryKey(before) === snapshotHistoryKey(after)) return;
-    const target = after.target ?? request.target ?? null;
+    const target = after.target ?? request.target;
     const bindingId = after.bindingId ?? request.bindingId ?? null;
     const label = options.label || after.displayName || after.propertyPath || "View property";
     const undoRequest = { bindingId, target, value: snapshotRestoreValue(before) };
@@ -966,12 +961,12 @@ function createViewBindingRuntime(api: ViewRuntimeApi, undo: ReturnType<typeof c
   }
 
   async function writeNow(
-    request: Omit<ViewBindingWriteRequest, "viewId">,
-    options: ViewRuntimeBindingWriteOptions = {},
-  ): Promise<ViewBindingWriteResult> {
+    request: UnitySerializedPropertyWriteRequest,
+    options: ViewRuntimePropertyWriteOptions = {},
+  ): Promise<UnitySerializedPropertyWriteResult> {
     const shouldRecord = options.undoable !== false && !undo.isRunning();
     const before = shouldRecord ? await readBeforeSnapshot(request, options) : null;
-    const result = await api.bindingWrite(request);
+    const result = await api.unityPropertyWrite(request);
     await options.onApplied?.(result);
     if (shouldRecord && before) {
       recordWriteUndo(request, before, result, options);
@@ -980,58 +975,37 @@ function createViewBindingRuntime(api: ViewRuntimeApi, undo: ReturnType<typeof c
   }
 
   function write(
-    request: Omit<ViewBindingWriteRequest, "viewId">,
-    options: ViewRuntimeBindingWriteOptions = {},
-  ): Promise<ViewBindingWriteResult> {
-    return queueWrite(bindingWriteKey(request), () => writeNow(request, options));
-  }
-
-  async function writeProperty(
-    request: Omit<ViewBindingReadRequest, "viewId">,
-    commit: ViewSerializedPropertyCommitInput,
-    options: ViewRuntimeBindingWriteOptions = {},
-  ): Promise<ViewBindingWriteResult> {
-    const baseTarget = request.target
-      ? { ...request.target, propertyPath: commit.propertyPath }
-      : (await api.bindingRead(request)).target;
-    const target = baseTarget
-      ? { ...baseTarget, propertyPath: commit.propertyPath }
-      : null;
-    return write({
-      bindingId: request.bindingId,
-      target,
-      value: commit.value,
-    }, {
-      ...options,
-      beforeSnapshot: options.beforeSnapshot ?? commit.property ?? commit.snapshot ?? null,
-    });
+    request: UnitySerializedPropertyWriteRequest,
+    options: ViewRuntimePropertyWriteOptions = {},
+  ): Promise<UnitySerializedPropertyWriteResult> {
+    return queueWrite(propertyWriteKey(request), () => writeNow(request, options));
   }
 
   async function apply(
-    request: Omit<ViewBindingApplyRequest, "viewId">,
-    options: ViewRuntimeBindingApplyOptions = {},
-  ): Promise<ViewBindingApplyResult> {
+    request: UnitySerializedPropertyApplyRequest,
+    options: ViewRuntimePropertyApplyOptions = {},
+  ): Promise<UnitySerializedPropertyApplyResult> {
     const shouldRecord = options.undoable !== false && !undo.isRunning();
     const before = shouldRecord
       ? await Promise.all(request.writes.map((writeRequest) =>
-        api.bindingRead({
+        api.unityPropertyRead({
           bindingId: writeRequest.bindingId,
           target: writeRequest.target,
         }).catch(() => null),
       ))
       : [];
-    const result = await api.bindingApply(request);
+    const result = await api.unityPropertyApply(request);
     if (shouldRecord) {
-      const undoWrites: ViewBindingApplyWrite[] = result.results
-        .map((after, index): ViewBindingApplyWrite | null => before[index] && after.target
+      const undoWrites: UnitySerializedPropertyApplyWrite[] = result.results
+        .map((after, index): UnitySerializedPropertyApplyWrite | null => before[index] && after.target
           ? {
             bindingId: after.bindingId,
             target: after.target,
             value: snapshotRestoreValue(before[index]!),
           }
           : null)
-        .filter((item): item is ViewBindingApplyWrite => !!item);
-      const redoWrites: ViewBindingApplyWrite[] = result.results
+        .filter((item): item is UnitySerializedPropertyApplyWrite => !!item);
+      const redoWrites: UnitySerializedPropertyApplyWrite[] = result.results
         .filter((after) => after.target)
         .map((after) => ({
           bindingId: after.bindingId,
@@ -1040,7 +1014,7 @@ function createViewBindingRuntime(api: ViewRuntimeApi, undo: ReturnType<typeof c
         }));
       if (undoWrites.length && redoWrites.length) {
         undo.record({
-          label: options.label || "View bindings",
+          label: options.label || "View properties",
           undo: () => apply({ writes: undoWrites }, { undoable: false }),
           redo: () => apply({ writes: redoWrites }, { undoable: false }),
         });
@@ -1050,36 +1024,13 @@ function createViewBindingRuntime(api: ViewRuntimeApi, undo: ReturnType<typeof c
   }
 
   return {
-    read: (request: Omit<ViewBindingReadRequest, "viewId">) => api.bindingRead(request),
-    discover: (request: Omit<ViewBindingDiscoverRequest, "viewId">) =>
-      api.bindingDiscover(request),
     write,
-    writeProperty,
     apply,
   };
 }
 
 const LOCUS_COMPONENT_MODULE = {
   ...LOCUS_COMPONENTS,
-  ...PropertyTreeService,
-  ...UnityObjectDrawerService,
-  applyUnityRgbHexToColorText,
-  formatUnityColorValue,
-  formatUnityVectorValue,
-  isUnityIntegerPropertyType,
-  isUnityNumberPropertyType,
-  isUnityVectorPropertyType,
-  normalizeUnityOptions,
-  normalizeUnityPropertyType,
-  parseUnityColorValue,
-  parseUnitySerializedEditValue,
-  parseUnityVectorValue,
-  tryParseUnitySerializedEditValue,
-  unityColorTextToRgbHex,
-  unityEnumIndexValue,
-  unityEnumNumericValue,
-  unitySerializedValueToEditText,
-  unityVectorKeysForType,
 };
 
 function createVueModule(context: RuntimeContext): ModuleExports {
@@ -1169,6 +1120,366 @@ function resolveFile(detail: ViewPackageDetail, specifier: string, importer?: st
   return null;
 }
 
+type ViewFsReadOptions = string | { encoding?: string | null } | null | undefined;
+type ViewFsWriteOptions = string | { encoding?: string | null } | null | undefined;
+type ViewFsReaddirOptionsInput = string | { withFileTypes?: boolean | null } | null | undefined;
+type ViewFsMkdirOptionsInput = number | { recursive?: boolean | null } | null | undefined;
+type ViewFsRmOptionsInput = { recursive?: boolean | null; force?: boolean | null } | null | undefined;
+type ViewFsCallback<T = void> = (error: unknown, result?: T) => void;
+type ViewFsBufferLike = Uint8Array & { toString: (encoding?: string) => string };
+
+const VIEW_FS_CONSTANTS = {
+  F_OK: 0,
+  R_OK: 4,
+  W_OK: 2,
+  X_OK: 1,
+};
+
+function fsPathString(path: unknown): string {
+  if (path instanceof URL) {
+    if (path.protocol !== "file:") {
+      throw new Error(`Unsupported URL protocol for fs path: ${path.protocol}`);
+    }
+    const decoded = decodeURIComponent(path.pathname);
+    return /^\/[A-Za-z]:\//.test(decoded) ? decoded.slice(1) : decoded;
+  }
+  return String(path);
+}
+
+function fsEncodingFromOptions(options?: ViewFsReadOptions | ViewFsWriteOptions): string | null {
+  if (typeof options === "string") return options;
+  if (options && typeof options === "object" && "encoding" in options) {
+    return options.encoding ?? null;
+  }
+  return null;
+}
+
+function fsReaddirOptions(options?: ViewFsReaddirOptionsInput): ViewRuntimeFsReaddirOptions {
+  if (options && typeof options === "object") {
+    return { withFileTypes: !!options.withFileTypes };
+  }
+  return {};
+}
+
+function fsMkdirOptions(options?: ViewFsMkdirOptionsInput): ViewRuntimeFsMkdirOptions {
+  if (options && typeof options === "object") {
+    return { recursive: !!options.recursive };
+  }
+  return {};
+}
+
+function fsRmOptions(options?: ViewFsRmOptionsInput): ViewRuntimeFsRmOptions {
+  if (options && typeof options === "object") {
+    return {
+      recursive: !!options.recursive,
+      force: !!options.force,
+    };
+  }
+  return {};
+}
+
+function fsBytesFromData(data: unknown): ViewFsFileData {
+  if (typeof data === "string") return data;
+  if (data instanceof ArrayBuffer) return Array.from(new Uint8Array(data));
+  if (ArrayBuffer.isView(data)) {
+    return Array.from(new Uint8Array(data.buffer, data.byteOffset, data.byteLength));
+  }
+  if (Array.isArray(data) && data.every((item) => typeof item === "number")) {
+    return data;
+  }
+  return String(data);
+}
+
+function createViewFsBuffer(bytes: number[]): ViewFsBufferLike {
+  const buffer = new Uint8Array(bytes) as ViewFsBufferLike;
+  Object.defineProperty(buffer, "toString", {
+    value: (encoding = "utf8") => {
+      const normalized = encoding.trim().toLowerCase();
+      if (normalized && normalized !== "utf8" && normalized !== "utf-8") {
+        throw new Error(`Unsupported buffer encoding: ${encoding}`);
+      }
+      return new TextDecoder().decode(buffer);
+    },
+    configurable: true,
+  });
+  return buffer;
+}
+
+function createViewFsStats(stat: ViewFsStatResult) {
+  const mtimeMs = stat.modifiedMs ?? 0;
+  const atimeMs = stat.accessedMs ?? 0;
+  const birthtimeMs = stat.createdMs ?? 0;
+  return {
+    path: stat.path,
+    size: stat.size,
+    mtimeMs,
+    atimeMs,
+    ctimeMs: mtimeMs,
+    birthtimeMs,
+    mtime: new Date(mtimeMs),
+    atime: new Date(atimeMs),
+    ctime: new Date(mtimeMs),
+    birthtime: new Date(birthtimeMs),
+    isFile: () => stat.isFile,
+    isDirectory: () => stat.isDirectory,
+    isSymbolicLink: () => stat.isSymbolicLink,
+    isBlockDevice: () => false,
+    isCharacterDevice: () => false,
+    isFIFO: () => false,
+    isSocket: () => false,
+  };
+}
+
+function createViewFsDirent(entry: ViewFsReaddirResult["entries"][number]) {
+  return {
+    name: entry.name,
+    path: entry.path,
+    parentPath: nodePathDirname(entry.path),
+    isFile: () => entry.isFile,
+    isDirectory: () => entry.isDirectory,
+    isSymbolicLink: () => entry.isSymbolicLink,
+    isBlockDevice: () => false,
+    isCharacterDevice: () => false,
+    isFIFO: () => false,
+    isSocket: () => false,
+  };
+}
+
+function withOptionalCallback<T>(promise: Promise<T>, callback?: ViewFsCallback<T>): Promise<T> | void {
+  if (typeof callback !== "function") return promise;
+  promise.then(
+    (result) => callback(null, result),
+    (error) => callback(error),
+  );
+}
+
+function createViewFsPromiseApi(api: ViewRuntimeApi) {
+  return {
+    constants: VIEW_FS_CONSTANTS,
+    readFile: async (path: unknown, options?: ViewFsReadOptions) => {
+      const encoding = fsEncodingFromOptions(options);
+      const result = await api.fsReadFile(fsPathString(path), encoding);
+      if (typeof result.data === "string") return result.data;
+      return createViewFsBuffer(result.data);
+    },
+    writeFile: (path: unknown, data: unknown, options?: ViewFsWriteOptions) =>
+      api.fsWriteFile(fsPathString(path), fsBytesFromData(data), fsEncodingFromOptions(options)),
+    appendFile: (path: unknown, data: unknown, options?: ViewFsWriteOptions) =>
+      api.fsAppendFile(fsPathString(path), fsBytesFromData(data), fsEncodingFromOptions(options)),
+    mkdir: (path: unknown, options?: ViewFsMkdirOptionsInput) =>
+      api.fsMkdir(fsPathString(path), fsMkdirOptions(options)),
+    readdir: async (path: unknown, options?: ViewFsReaddirOptionsInput) => {
+      const normalizedOptions = fsReaddirOptions(options);
+      const result = await api.fsReaddir(fsPathString(path), normalizedOptions);
+      if (normalizedOptions.withFileTypes) {
+        return result.entries.map(createViewFsDirent);
+      }
+      return result.entries.map((entry) => entry.name);
+    },
+    stat: async (path: unknown) => createViewFsStats(await api.fsStat(fsPathString(path))),
+    lstat: async (path: unknown) => createViewFsStats(await api.fsLstat(fsPathString(path))),
+    access: (path: unknown) => api.fsAccess(fsPathString(path)),
+    unlink: (path: unknown) => api.fsUnlink(fsPathString(path)),
+    rm: (path: unknown, options?: ViewFsRmOptionsInput) =>
+      api.fsRm(fsPathString(path), fsRmOptions(options)),
+    rename: (oldPath: unknown, newPath: unknown) =>
+      api.fsRename(fsPathString(oldPath), fsPathString(newPath)),
+    copyFile: (src: unknown, dest: unknown) =>
+      api.fsCopyFile(fsPathString(src), fsPathString(dest)),
+  };
+}
+
+function createNodeFsPromisesModule(api: ViewRuntimeApi): ModuleExports {
+  const fs = createViewFsPromiseApi(api);
+  return {
+    ...fs,
+    default: fs,
+  };
+}
+
+function createNodeFsModule(api: ViewRuntimeApi): ModuleExports {
+  const promises = createViewFsPromiseApi(api);
+  const fs = {
+    constants: VIEW_FS_CONSTANTS,
+    promises,
+    readFile: (path: unknown, options?: ViewFsReadOptions | ViewFsCallback<unknown>, callback?: ViewFsCallback<unknown>) => {
+      const actualCallback = typeof options === "function" ? options : callback;
+      const actualOptions = typeof options === "function" ? undefined : options;
+      return withOptionalCallback(promises.readFile(path, actualOptions), actualCallback);
+    },
+    writeFile: (path: unknown, data: unknown, options?: ViewFsWriteOptions | ViewFsCallback, callback?: ViewFsCallback) => {
+      const actualCallback = typeof options === "function" ? options : callback;
+      const actualOptions = typeof options === "function" ? undefined : options;
+      return withOptionalCallback(promises.writeFile(path, data, actualOptions), actualCallback);
+    },
+    appendFile: (path: unknown, data: unknown, options?: ViewFsWriteOptions | ViewFsCallback, callback?: ViewFsCallback) => {
+      const actualCallback = typeof options === "function" ? options : callback;
+      const actualOptions = typeof options === "function" ? undefined : options;
+      return withOptionalCallback(promises.appendFile(path, data, actualOptions), actualCallback);
+    },
+    mkdir: (path: unknown, options?: ViewFsMkdirOptionsInput | ViewFsCallback, callback?: ViewFsCallback) => {
+      const actualCallback = typeof options === "function" ? options : callback;
+      const actualOptions = typeof options === "function" ? undefined : options;
+      return withOptionalCallback(promises.mkdir(path, actualOptions), actualCallback);
+    },
+    readdir: (path: unknown, options?: ViewFsReaddirOptionsInput | ViewFsCallback<unknown>, callback?: ViewFsCallback<unknown>) => {
+      const actualCallback = typeof options === "function" ? options : callback;
+      const actualOptions = typeof options === "function" ? undefined : options;
+      return withOptionalCallback(promises.readdir(path, actualOptions), actualCallback);
+    },
+    stat: (path: unknown, callback?: ViewFsCallback<unknown>) =>
+      withOptionalCallback(promises.stat(path), callback),
+    lstat: (path: unknown, callback?: ViewFsCallback<unknown>) =>
+      withOptionalCallback(promises.lstat(path), callback),
+    access: (path: unknown, mode?: number | ViewFsCallback, callback?: ViewFsCallback) => {
+      const actualCallback = typeof mode === "function" ? mode : callback;
+      return withOptionalCallback(promises.access(path), actualCallback);
+    },
+    unlink: (path: unknown, callback?: ViewFsCallback) =>
+      withOptionalCallback(promises.unlink(path), callback),
+    rm: (path: unknown, options?: ViewFsRmOptionsInput | ViewFsCallback, callback?: ViewFsCallback) => {
+      const actualCallback = typeof options === "function" ? options : callback;
+      const actualOptions = typeof options === "function" ? undefined : options;
+      return withOptionalCallback(promises.rm(path, actualOptions), actualCallback);
+    },
+    rename: (oldPath: unknown, newPath: unknown, callback?: ViewFsCallback) =>
+      withOptionalCallback(promises.rename(oldPath, newPath), callback),
+    copyFile: (src: unknown, dest: unknown, mode?: number | ViewFsCallback, callback?: ViewFsCallback) => {
+      const actualCallback = typeof mode === "function" ? mode : callback;
+      return withOptionalCallback(promises.copyFile(src, dest), actualCallback);
+    },
+  };
+  return {
+    ...fs,
+    default: fs,
+  };
+}
+
+function normalizeNodePath(value: unknown): string {
+  const input = String(value).replace(/\\/g, "/");
+  const drive = input.match(/^[A-Za-z]:/)?.[0] ?? "";
+  const withoutDrive = drive ? input.slice(drive.length) : input;
+  const absolute = withoutDrive.startsWith("/");
+  const parts: string[] = [];
+  for (const part of withoutDrive.split("/")) {
+    if (!part || part === ".") continue;
+    if (part === "..") {
+      if (parts.length && parts[parts.length - 1] !== "..") {
+        parts.pop();
+      } else if (!absolute) {
+        parts.push(part);
+      }
+      continue;
+    }
+    parts.push(part);
+  }
+  const body = parts.join("/");
+  if (drive) return `${drive}${absolute ? "/" : ""}${body}` || drive;
+  if (absolute) return `/${body}`;
+  return body || ".";
+}
+
+function nodePathIsAbsolute(value: unknown): boolean {
+  const path = String(value);
+  return /^([A-Za-z]:)?[\\/]/.test(path) || /^\\\\/.test(path);
+}
+
+function nodePathJoin(...segments: unknown[]): string {
+  return normalizeNodePath(segments.map((segment) => String(segment)).filter(Boolean).join("/"));
+}
+
+function nodePathDirname(value: unknown): string {
+  const normalized = normalizeNodePath(value);
+  if (normalized === "/" || /^[A-Za-z]:\/?$/.test(normalized)) return normalized;
+  const index = normalized.lastIndexOf("/");
+  if (index <= 0) return nodePathIsAbsolute(normalized) ? "/" : ".";
+  return normalized.slice(0, index);
+}
+
+function nodePathBasename(value: unknown, suffix?: string): string {
+  const normalized = normalizeNodePath(value);
+  const base = normalized.slice(normalized.lastIndexOf("/") + 1);
+  if (suffix && base.endsWith(suffix)) return base.slice(0, -suffix.length);
+  return base;
+}
+
+function nodePathExtname(value: unknown): string {
+  const base = nodePathBasename(value);
+  const index = base.lastIndexOf(".");
+  if (index <= 0) return "";
+  return base.slice(index);
+}
+
+function nodePathResolve(...segments: unknown[]): string {
+  for (let index = segments.length - 1; index >= 0; index -= 1) {
+    if (nodePathIsAbsolute(segments[index])) {
+      return normalizeNodePath(segments.slice(index).join("/"));
+    }
+  }
+  return nodePathJoin(...segments);
+}
+
+function nodePathRelative(from: unknown, to: unknown): string {
+  const fromParts = normalizeNodePath(from).split("/").filter(Boolean);
+  const toParts = normalizeNodePath(to).split("/").filter(Boolean);
+  while (fromParts.length && toParts.length && fromParts[0] === toParts[0]) {
+    fromParts.shift();
+    toParts.shift();
+  }
+  return [...fromParts.map(() => ".."), ...toParts].join("/") || "";
+}
+
+function nodePathParse(value: unknown) {
+  const path = normalizeNodePath(value);
+  const root = nodePathIsAbsolute(path) ? (path.match(/^[A-Za-z]:\//)?.[0] ?? "/") : "";
+  const dir = nodePathDirname(path);
+  const base = nodePathBasename(path);
+  const ext = nodePathExtname(path);
+  const name = ext ? base.slice(0, -ext.length) : base;
+  return { root, dir, base, ext, name };
+}
+
+function nodePathFormat(value: Record<string, unknown>): string {
+  const dir = value.dir ? String(value.dir) : String(value.root ?? "");
+  const base = value.base ? String(value.base) : `${String(value.name ?? "")}${String(value.ext ?? "")}`;
+  return dir ? nodePathJoin(dir, base) : base;
+}
+
+function createNodePathModule(): ModuleExports & {
+  dirname: (value: unknown) => string;
+} {
+  const pathModule = {
+    sep: "/",
+    delimiter: ";",
+    basename: nodePathBasename,
+    dirname: nodePathDirname,
+    extname: nodePathExtname,
+    format: nodePathFormat,
+    isAbsolute: nodePathIsAbsolute,
+    join: nodePathJoin,
+    normalize: normalizeNodePath,
+    parse: nodePathParse,
+    relative: nodePathRelative,
+    resolve: nodePathResolve,
+  } as ModuleExports & { dirname: (value: unknown) => string };
+  pathModule.posix = pathModule;
+  pathModule.win32 = pathModule;
+  pathModule.default = pathModule;
+  return pathModule;
+}
+
+function isNodeFsSpecifier(specifier: string): boolean {
+  return specifier === "fs" || specifier === "node:fs";
+}
+
+function isNodeFsPromisesSpecifier(specifier: string): boolean {
+  return specifier === "fs/promises" || specifier === "node:fs/promises";
+}
+
+function isNodePathSpecifier(specifier: string): boolean {
+  return specifier === "path" || specifier === "node:path";
+}
+
 function createViewRuntimeApi(detail: ViewPackageDetail, api: ViewRuntimeApi): ViewRuntimeModuleApi {
   const cached = runtimeApiCache.get(api);
   if (cached) return cached;
@@ -1179,13 +1490,36 @@ function createViewRuntimeApi(detail: ViewPackageDetail, api: ViewRuntimeApi): V
 
 function createViewRuntimeApiUncached(detail: ViewPackageDetail, api: ViewRuntimeApi) {
   const undo = createViewUndoService();
-  const binding = createViewBindingRuntime(api, undo);
-  const serializedProperty = {
-    read: api.unityPropertyRead,
-    discover: api.unityPropertyDiscover,
-    write: api.unityPropertyWrite,
-    apply: api.unityPropertyApply,
-  };
+  const propertyWrites = createViewPropertyRuntime(api, undo);
+  const unityProperty = UnityPropertyBinding.createUnityPropertyRuntime({
+    read: (request) => api.unityPropertyRead(request),
+    write: (request, options = {}) => {
+      if (request.writeMode === "preview") {
+        return api.unityPropertyWrite(request);
+      }
+      return propertyWrites.write({
+        bindingId: request.bindingId,
+        target: request.target,
+        value: request.value,
+        writeMode: request.writeMode,
+      }, {
+        label: options.label,
+        undoable: options.undoable,
+        beforeSnapshot: (options.beforeSnapshot ?? null) as ViewSerializedPropertySnapshotInput | null,
+      });
+    },
+    apply: (request, options = {}) => {
+      if (request.writes.some((write) => write.writeMode === "preview")) {
+        return api.unityPropertyApply(request);
+      }
+      return propertyWrites.apply(request, {
+        label: options.label,
+        undoable: options.undoable,
+      });
+    },
+    undo: undo.undo,
+    redo: undo.redo,
+  });
   const propertyDrawer = {
     library: PropertyTreeService.publicInspectorPropertyDrawerLibrary,
     projectLibrary: PropertyTreeService.projectInspectorPropertyDrawerLibrary,
@@ -1203,7 +1537,7 @@ function createViewRuntimeApiUncached(detail: ViewPackageDetail, api: ViewRuntim
     projectLibrary: UnityObjectDrawerService.projectUnityObjectDrawerLibrary,
     register: UnityObjectDrawerService.registerUnityObjectDrawer,
     define: UnityObjectDrawerService.defineUnityObjectDrawers,
-    normalize: UnityObjectDrawerService.defineUnityObjectDrawers,
+    normalize: UnityObjectDrawerService.normalizeUnityObjectDrawers,
     createLibrary: UnityObjectDrawerService.createUnityObjectDrawerLibrary,
     resolve: UnityObjectDrawerService.resolveUnityObjectDrawer,
   };
@@ -1244,6 +1578,8 @@ function createViewRuntimeApiUncached(detail: ViewPackageDetail, api: ViewRuntim
     set: (key: string, value: unknown) => api.storageSet(key, value),
     remove: (key: string) => api.storageRemove(key),
   };
+  const fs = createViewFsPromiseApi(api);
+  const path = createNodePathModule();
 
   const unity = {
     callScript: async (scriptName: string, method: string, args?: unknown) => {
@@ -1277,7 +1613,6 @@ function createViewRuntimeApiUncached(detail: ViewPackageDetail, api: ViewRuntim
     },
     onDrop: subscribeUnityEmbedAssetDrop,
     onDragState: subscribeUnityEmbedAssetDragState,
-    serializedProperty,
     objectDrawer: unityObjectDrawer,
     objectReferencePicker,
   };
@@ -1303,7 +1638,6 @@ function createViewRuntimeApiUncached(detail: ViewPackageDetail, api: ViewRuntim
       const response = await api.callScript(scriptName, method, args);
       return response.result;
     },
-    binding,
     assets: {
       search: (query: string, roots = ["Assets", "Packages"], limit?: number) =>
         api.searchAssets(query, roots, limit),
@@ -1319,23 +1653,16 @@ function createViewRuntimeApiUncached(detail: ViewPackageDetail, api: ViewRuntim
     session,
     llm,
     storage,
+    fs,
+    path,
     unity,
     files,
     undo,
     propertyDrawer,
     unityObjectDrawer,
     objectReferencePicker,
-    serializedProperty,
-    unitySerializedProperty: serializedProperty,
     openLog: () => api.openFrontendLog(),
     onUpdate: (handler: (event: ViewRuntimeUpdateEvent) => void) => api.onUpdate(handler),
-    readBinding: (bindingId: string, target?: ViewBindingReadRequest["target"]) =>
-      binding.read({ bindingId, target }),
-    discoverBinding: (request: Omit<ViewBindingDiscoverRequest, "viewId">) =>
-      binding.discover(request),
-    writeBinding: (bindingId: string, value: unknown, target?: ViewBindingWriteRequest["target"]) =>
-      binding.write({ bindingId, value, target }),
-    applyBindings: (writes: ViewBindingApplyRequest["writes"]) => binding.apply({ writes }),
   };
 
   return {
@@ -1343,13 +1670,14 @@ function createViewRuntimeApiUncached(detail: ViewPackageDetail, api: ViewRuntim
     session,
     llm,
     storage,
+    fs,
+    path,
     unity,
     files,
     undo,
     propertyDrawer,
     unityObjectDrawer,
-    serializedProperty,
-    unitySerializedProperty: serializedProperty,
+    property: unityProperty,
     defineView: <T>(value: T) => value,
     defineGraphView,
     CanvasView,
@@ -1363,6 +1691,9 @@ function createViewRuntimeApiUncached(detail: ViewPackageDetail, api: ViewRuntim
     UnityDropZone,
     layoutGraphDocument,
     ...PropertyTreeService,
+    ...UnityPropertyBinding,
+    ...UnitySerializedValue,
+    ...UnityPropertyPathService,
     ...UnityObjectDrawerService,
     ...UnityObjectReferencePickerService,
     onEditorUpdate: (handler: (event: ViewRuntimeUpdateEvent) => void) => view.onUpdate(handler),
@@ -1374,71 +1705,6 @@ function createViewRuntimeApiUncached(detail: ViewPackageDetail, api: ViewRuntim
     useViewScript: (scriptName: string) => ({
       call: (method: string, args?: unknown) => view.callScript(scriptName, method, args),
     }),
-    useUnityBinding: (bindingIdOrRequest: string | Omit<ViewBindingReadRequest, "viewId">) => {
-      const value = ref<unknown>(null);
-      const property = ref<ViewBindingReadResult | null>(null);
-      const status = ref("idle");
-      const error = ref("");
-      const requestForBinding = (): Omit<ViewBindingReadRequest, "viewId"> =>
-        typeof bindingIdOrRequest === "string"
-          ? { bindingId: bindingIdOrRequest }
-          : bindingIdOrRequest;
-      const applyResultToState = (result: ViewBindingReadResult) => {
-        property.value = result;
-        value.value = result.value;
-      };
-      const read = async () => {
-        status.value = "reading";
-        error.value = "";
-        try {
-          const result = await binding.read(requestForBinding());
-          applyResultToState(result);
-          status.value = "ready";
-          return result;
-        } catch (readError) {
-          status.value = "error";
-          error.value = readError instanceof Error ? readError.message : String(readError);
-          throw readError;
-        }
-      };
-      const write = async (nextValue = value.value) => {
-        status.value = "writing";
-        error.value = "";
-        try {
-          const result = await binding.write({
-            ...requestForBinding(),
-            value: nextValue,
-          }, {
-            onApplied: applyResultToState,
-          });
-          status.value = "ready";
-          return result;
-        } catch (writeError) {
-          status.value = "error";
-          error.value = writeError instanceof Error ? writeError.message : String(writeError);
-          throw writeError;
-        }
-      };
-      const writeProperty = async (commit: ViewSerializedPropertyCommitInput) => {
-        status.value = "writing";
-        error.value = "";
-        try {
-          const result = await binding.writeProperty(requestForBinding(), commit, {
-            onApplied: async () => {
-              const refreshed = await binding.read(requestForBinding());
-              applyResultToState(refreshed);
-            },
-          });
-          status.value = "ready";
-          return result;
-        } catch (writeError) {
-          status.value = "error";
-          error.value = writeError instanceof Error ? writeError.message : String(writeError);
-          throw writeError;
-        }
-      };
-      return { value, property, status, error, read, write, writeProperty, undo: view.undo.undo, redo: view.undo.redo };
-    },
   };
 }
 
@@ -1461,6 +1727,9 @@ function createModuleLoader(context: RuntimeContext) {
     if (specifier === "vue") return createVueModule(context);
     if (specifier === "@locus/view-runtime") return createViewRuntimeApi(context.detail, context.api);
     if (specifier === "@locus/components") return LOCUS_COMPONENT_MODULE;
+    if (isNodeFsPromisesSpecifier(specifier)) return createNodeFsPromisesModule(context.api);
+    if (isNodeFsSpecifier(specifier)) return createNodeFsModule(context.api);
+    if (isNodePathSpecifier(specifier)) return createNodePathModule();
 
     const file = resolveFile(context.detail, specifier, importer);
     if (!file) {
@@ -1696,28 +1965,6 @@ function createInstrumentedRuntimeApi(detail: ViewPackageDetail, api: ViewRuntim
         scriptName,
         method,
       }),
-    bindingRead: (request) =>
-      measureRequest("bindingRead", () => api.bindingRead(request), {
-        bindingId: request.bindingId ?? "",
-        targetKind: request.target?.kind ?? "",
-        propertyPath: request.target?.propertyPath ?? "",
-      }),
-    bindingDiscover: (request) =>
-      measureRequest("bindingDiscover", () => api.bindingDiscover(request), {
-        bindingId: request.bindingId ?? "",
-        targetKind: request.target?.kind ?? "",
-        query: request.query ?? "",
-      }),
-    bindingWrite: (request) =>
-      measureRequest("bindingWrite", () => api.bindingWrite(request), {
-        bindingId: request.bindingId ?? "",
-        targetKind: request.target?.kind ?? "",
-        propertyPath: request.target?.propertyPath ?? "",
-      }),
-    bindingApply: (request) =>
-      measureRequest("bindingApply", () => api.bindingApply(request), {
-        writeCount: request.writes.length,
-      }),
     unityPropertyRead: (request) =>
       measureRequest("unityPropertyRead", () => api.unityPropertyRead(request), {
         bindingId: request.bindingId ?? "",
@@ -1803,6 +2050,51 @@ function createInstrumentedRuntimeApi(detail: ViewPackageDetail, api: ViewRuntim
       }),
     storageRemove: (key) =>
       measureRequest("storageRemove", () => api.storageRemove(key), { key }),
+    fsReadFile: (path, encoding) =>
+      measureRequest("fsReadFile", () => api.fsReadFile(path, encoding), {
+        path,
+        encoding: encoding ?? "",
+      }),
+    fsWriteFile: (path, data, encoding) =>
+      measureRequest("fsWriteFile", () => api.fsWriteFile(path, data, encoding), {
+        path,
+        dataLength: typeof data === "string" ? data.length : data.length,
+        encoding: encoding ?? "",
+      }),
+    fsAppendFile: (path, data, encoding) =>
+      measureRequest("fsAppendFile", () => api.fsAppendFile(path, data, encoding), {
+        path,
+        dataLength: typeof data === "string" ? data.length : data.length,
+        encoding: encoding ?? "",
+      }),
+    fsMkdir: (path, options) =>
+      measureRequest("fsMkdir", () => api.fsMkdir(path, options), {
+        path,
+        recursive: !!options?.recursive,
+      }),
+    fsReaddir: (path, options) =>
+      measureRequest("fsReaddir", () => api.fsReaddir(path, options), {
+        path,
+        withFileTypes: !!options?.withFileTypes,
+      }),
+    fsStat: (path) =>
+      measureRequest("fsStat", () => api.fsStat(path), { path }),
+    fsLstat: (path) =>
+      measureRequest("fsLstat", () => api.fsLstat(path), { path }),
+    fsAccess: (path) =>
+      measureRequest("fsAccess", () => api.fsAccess(path), { path }),
+    fsUnlink: (path) =>
+      measureRequest("fsUnlink", () => api.fsUnlink(path), { path }),
+    fsRm: (path, options) =>
+      measureRequest("fsRm", () => api.fsRm(path, options), {
+        path,
+        recursive: !!options?.recursive,
+        force: !!options?.force,
+      }),
+    fsRename: (oldPath, newPath) =>
+      measureRequest("fsRename", () => api.fsRename(oldPath, newPath), { oldPath, newPath }),
+    fsCopyFile: (src, dest) =>
+      measureRequest("fsCopyFile", () => api.fsCopyFile(src, dest), { src, dest }),
     onUpdate: (handler) =>
       measureRequest("onUpdate", () => api.onUpdate(handler), {}, "subscription"),
     reload: () =>

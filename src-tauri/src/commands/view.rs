@@ -13,20 +13,23 @@ use crate::view::{
     move_view_entry_sync, open_view_frontend_log_sync, open_view_unity_embed_window,
     open_view_window, parse_view_create_request, read_view_frontend_log_sync, read_view_sync,
     reload_view_sync, rename_view_entry_sync, supported_view_templates,
-    view_binding_apply as view_binding_apply_impl,
-    view_binding_discover as view_binding_discover_impl,
-    view_binding_read as view_binding_read_impl, view_binding_write as view_binding_write_impl,
+    view_fs_access as view_fs_access_impl, view_fs_append_file as view_fs_append_file_impl,
+    view_fs_copy_file as view_fs_copy_file_impl, view_fs_lstat as view_fs_lstat_impl,
+    view_fs_mkdir as view_fs_mkdir_impl, view_fs_read_file as view_fs_read_file_impl,
+    view_fs_readdir as view_fs_readdir_impl, view_fs_rename as view_fs_rename_impl,
+    view_fs_rm as view_fs_rm_impl, view_fs_stat as view_fs_stat_impl,
+    view_fs_unlink as view_fs_unlink_impl, view_fs_write_file as view_fs_write_file_impl,
     view_storage_get_sync, view_storage_remove_sync, view_storage_set_sync, ViewAutomationStore,
-    ViewBindingApplyRequest, ViewBindingApplyResult, ViewBindingDiscoverRequest,
-    ViewBindingDiscoverResult, ViewBindingReadRequest, ViewBindingReadResult,
-    ViewBindingWriteRequest, ViewBindingWriteResult, ViewCallScriptRequest, ViewCallScriptResult,
-    ViewCompileScriptRequest, ViewCompileScriptResult, ViewContentMountRequest,
-    ViewCreateFolderRequest, ViewDeleteEntryRequest, ViewDetachTabRequest,
+    ViewCallScriptRequest, ViewCallScriptResult, ViewCompileScriptRequest, ViewCompileScriptResult,
+    ViewContentMountRequest, ViewCreateFolderRequest, ViewDeleteEntryRequest, ViewDetachTabRequest,
     ViewExportPackageRequest, ViewFolderSummary, ViewFrontendLogEntry, ViewFrontendLogReadRequest,
-    ViewFrontendLogRequest, ViewImportPackageRequest, ViewMoveEntryRequest, ViewPackageDetail,
-    ViewPackageImportResult, ViewPackageSummary, ViewRenameEntryRequest, ViewRunResult,
-    ViewSetTabHostRequest, ViewStorageGetRequest, ViewStorageRemoveRequest, ViewStorageSetRequest,
-    ViewTemplateSummary, ViewTreeSnapshot,
+    ViewFrontendLogRequest, ViewFsCopyFileRequest, ViewFsMkdirRequest, ViewFsPathRequest,
+    ViewFsReadFileRequest, ViewFsReadFileResult, ViewFsReaddirRequest, ViewFsReaddirResult,
+    ViewFsRenameRequest, ViewFsRmRequest, ViewFsStatResult, ViewFsWriteFileRequest,
+    ViewImportPackageRequest, ViewMoveEntryRequest, ViewPackageDetail, ViewPackageImportResult,
+    ViewPackageSummary, ViewRenameEntryRequest, ViewRunResult, ViewSetTabHostRequest,
+    ViewStorageGetRequest, ViewStorageRemoveRequest, ViewStorageSetRequest, ViewTemplateSummary,
+    ViewTreeSnapshot,
 };
 use crate::workspace::Workspace;
 
@@ -335,6 +338,138 @@ pub async fn view_storage_remove(
 }
 
 #[tauri::command]
+pub async fn view_fs_read_file(
+    request: ViewFsReadFileRequest,
+    workspace: State<'_, Arc<Workspace>>,
+) -> Result<ViewFsReadFileResult, AppError> {
+    let working_dir = workspace.path.read().await.clone();
+    view_fs_read_file_impl(&working_dir, request)
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn view_fs_write_file(
+    request: ViewFsWriteFileRequest,
+    workspace: State<'_, Arc<Workspace>>,
+) -> Result<(), AppError> {
+    let working_dir = workspace.path.read().await.clone();
+    view_fs_write_file_impl(&working_dir, request)
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn view_fs_append_file(
+    request: ViewFsWriteFileRequest,
+    workspace: State<'_, Arc<Workspace>>,
+) -> Result<(), AppError> {
+    let working_dir = workspace.path.read().await.clone();
+    view_fs_append_file_impl(&working_dir, request)
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn view_fs_mkdir(
+    request: ViewFsMkdirRequest,
+    workspace: State<'_, Arc<Workspace>>,
+) -> Result<(), AppError> {
+    let working_dir = workspace.path.read().await.clone();
+    view_fs_mkdir_impl(&working_dir, request)
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn view_fs_readdir(
+    request: ViewFsReaddirRequest,
+    workspace: State<'_, Arc<Workspace>>,
+) -> Result<ViewFsReaddirResult, AppError> {
+    let working_dir = workspace.path.read().await.clone();
+    view_fs_readdir_impl(&working_dir, request)
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn view_fs_stat(
+    request: ViewFsPathRequest,
+    workspace: State<'_, Arc<Workspace>>,
+) -> Result<ViewFsStatResult, AppError> {
+    let working_dir = workspace.path.read().await.clone();
+    view_fs_stat_impl(&working_dir, request)
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn view_fs_lstat(
+    request: ViewFsPathRequest,
+    workspace: State<'_, Arc<Workspace>>,
+) -> Result<ViewFsStatResult, AppError> {
+    let working_dir = workspace.path.read().await.clone();
+    view_fs_lstat_impl(&working_dir, request)
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn view_fs_access(
+    request: ViewFsPathRequest,
+    workspace: State<'_, Arc<Workspace>>,
+) -> Result<(), AppError> {
+    let working_dir = workspace.path.read().await.clone();
+    view_fs_access_impl(&working_dir, request)
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn view_fs_unlink(
+    request: ViewFsPathRequest,
+    workspace: State<'_, Arc<Workspace>>,
+) -> Result<(), AppError> {
+    let working_dir = workspace.path.read().await.clone();
+    view_fs_unlink_impl(&working_dir, request)
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn view_fs_rm(
+    request: ViewFsRmRequest,
+    workspace: State<'_, Arc<Workspace>>,
+) -> Result<(), AppError> {
+    let working_dir = workspace.path.read().await.clone();
+    view_fs_rm_impl(&working_dir, request)
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn view_fs_rename(
+    request: ViewFsRenameRequest,
+    workspace: State<'_, Arc<Workspace>>,
+) -> Result<(), AppError> {
+    let working_dir = workspace.path.read().await.clone();
+    view_fs_rename_impl(&working_dir, request)
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn view_fs_copy_file(
+    request: ViewFsCopyFileRequest,
+    workspace: State<'_, Arc<Workspace>>,
+) -> Result<(), AppError> {
+    let working_dir = workspace.path.read().await.clone();
+    view_fs_copy_file_impl(&working_dir, request)
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
 pub async fn view_automation_respond(
     request_id: String,
     ok: bool,
@@ -349,48 +484,4 @@ pub async fn view_automation_respond(
             "View automation request is no longer pending",
         ))
     }
-}
-
-#[tauri::command]
-pub async fn view_binding_read(
-    request: ViewBindingReadRequest,
-    workspace: State<'_, Arc<Workspace>>,
-) -> Result<ViewBindingReadResult, AppError> {
-    let working_dir = workspace.path.read().await.clone();
-    view_binding_read_impl(&working_dir, request)
-        .await
-        .map_err(Into::into)
-}
-
-#[tauri::command]
-pub async fn view_binding_discover(
-    request: ViewBindingDiscoverRequest,
-    workspace: State<'_, Arc<Workspace>>,
-) -> Result<ViewBindingDiscoverResult, AppError> {
-    let working_dir = workspace.path.read().await.clone();
-    view_binding_discover_impl(&working_dir, request)
-        .await
-        .map_err(Into::into)
-}
-
-#[tauri::command]
-pub async fn view_binding_write(
-    request: ViewBindingWriteRequest,
-    workspace: State<'_, Arc<Workspace>>,
-) -> Result<ViewBindingWriteResult, AppError> {
-    let working_dir = workspace.path.read().await.clone();
-    view_binding_write_impl(&working_dir, request)
-        .await
-        .map_err(Into::into)
-}
-
-#[tauri::command]
-pub async fn view_binding_apply(
-    request: ViewBindingApplyRequest,
-    workspace: State<'_, Arc<Workspace>>,
-) -> Result<ViewBindingApplyResult, AppError> {
-    let working_dir = workspace.path.read().await.clone();
-    view_binding_apply_impl(&working_dir, request)
-        .await
-        .map_err(Into::into)
 }

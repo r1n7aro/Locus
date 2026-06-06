@@ -1,8 +1,9 @@
 use serde::{Deserialize, Serialize};
 
 use crate::view::{
-    ViewBindingApplyResult, ViewBindingDiscoverResult, ViewBindingReadResult,
-    ViewBindingTarget, ViewBindingWriteResult,
+    UnitySerializedPropertyApplyResult, UnitySerializedPropertyDiscoverResult,
+    UnitySerializedPropertyReadResult, UnitySerializedPropertyTarget,
+    UnitySerializedPropertyWriteResult,
 };
 
 #[derive(Debug, Clone, Deserialize)]
@@ -10,7 +11,7 @@ use crate::view::{
 pub struct UnitySerializedPropertyReadRequest {
     #[serde(default)]
     pub binding_id: Option<String>,
-    pub target: ViewBindingTarget,
+    pub target: UnitySerializedPropertyTarget,
     #[serde(default)]
     pub max_depth: Option<i32>,
     #[serde(default)]
@@ -22,7 +23,7 @@ pub struct UnitySerializedPropertyReadRequest {
 pub struct UnitySerializedPropertyDiscoverRequest {
     #[serde(default)]
     pub binding_id: Option<String>,
-    pub target: ViewBindingTarget,
+    pub target: UnitySerializedPropertyTarget,
     #[serde(default)]
     pub query: Option<String>,
     #[serde(default)]
@@ -40,7 +41,7 @@ pub struct UnitySerializedPropertyDiscoverRequest {
 pub struct UnitySerializedPropertyWriteRequest {
     #[serde(default)]
     pub binding_id: Option<String>,
-    pub target: ViewBindingTarget,
+    pub target: UnitySerializedPropertyTarget,
     pub value: serde_json::Value,
     #[serde(default)]
     pub write_mode: Option<String>,
@@ -51,7 +52,7 @@ pub struct UnitySerializedPropertyWriteRequest {
 pub struct UnitySerializedPropertyApplyWrite {
     #[serde(default)]
     pub binding_id: Option<String>,
-    pub target: ViewBindingTarget,
+    pub target: UnitySerializedPropertyTarget,
     pub value: serde_json::Value,
     #[serde(default)]
     pub write_mode: Option<String>,
@@ -66,7 +67,7 @@ pub struct UnitySerializedPropertyApplyRequest {
 pub async fn read(
     working_dir: &str,
     request: UnitySerializedPropertyReadRequest,
-) -> Result<ViewBindingReadResult, String> {
+) -> Result<UnitySerializedPropertyReadResult, String> {
     validate_object_target(&request.target)?;
     let payload = serde_json::json!({
         "bindingId": request.binding_id,
@@ -82,7 +83,7 @@ pub async fn read(
 pub async fn discover(
     working_dir: &str,
     request: UnitySerializedPropertyDiscoverRequest,
-) -> Result<ViewBindingDiscoverResult, String> {
+) -> Result<UnitySerializedPropertyDiscoverResult, String> {
     validate_object_target(&request.target)?;
     let payload = serde_json::json!({
         "bindingId": request.binding_id,
@@ -94,14 +95,18 @@ pub async fn discover(
         "maxResults": request.max_results.unwrap_or_default(),
     });
     let raw = crate::unity_bridge::view_binding_discover(working_dir, &payload).await?;
-    serde_json::from_str(&raw)
-        .map_err(|error| format!("Invalid unity_serialized_property_discover response: {}", error))
+    serde_json::from_str(&raw).map_err(|error| {
+        format!(
+            "Invalid unity_serialized_property_discover response: {}",
+            error
+        )
+    })
 }
 
 pub async fn write(
     working_dir: &str,
     request: UnitySerializedPropertyWriteRequest,
-) -> Result<ViewBindingWriteResult, String> {
+) -> Result<UnitySerializedPropertyWriteResult, String> {
     validate_property_target(&request.target)?;
     let value_json = serde_json::to_string(&request.value)
         .map_err(|error| format!("Failed to serialize serialized property value: {}", error))?;
@@ -112,14 +117,18 @@ pub async fn write(
         "mode": normalize_write_mode(request.write_mode.as_deref())?,
     });
     let raw = crate::unity_bridge::view_binding_write(working_dir, &payload).await?;
-    serde_json::from_str(&raw)
-        .map_err(|error| format!("Invalid unity_serialized_property_write response: {}", error))
+    serde_json::from_str(&raw).map_err(|error| {
+        format!(
+            "Invalid unity_serialized_property_write response: {}",
+            error
+        )
+    })
 }
 
 pub async fn apply(
     working_dir: &str,
     request: UnitySerializedPropertyApplyRequest,
-) -> Result<ViewBindingApplyResult, String> {
+) -> Result<UnitySerializedPropertyApplyResult, String> {
     for write in &request.writes {
         validate_property_target(&write.target)?;
     }
@@ -136,19 +145,31 @@ pub async fn apply(
     }
     let payload = serde_json::json!({ "writes": writes });
     let raw = crate::unity_bridge::view_binding_apply(working_dir, &payload).await?;
-    serde_json::from_str(&raw)
-        .map_err(|error| format!("Invalid unity_serialized_property_apply response: {}", error))
+    serde_json::from_str(&raw).map_err(|error| {
+        format!(
+            "Invalid unity_serialized_property_apply response: {}",
+            error
+        )
+    })
 }
 
 fn normalize_write_mode(mode: Option<&str>) -> Result<&'static str, String> {
-    match mode.unwrap_or("commit").trim().to_ascii_lowercase().as_str() {
+    match mode
+        .unwrap_or("commit")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "" | "commit" => Ok("commit"),
         "preview" => Ok("preview"),
-        other => Err(format!("Unsupported Unity serialized property write mode: {}", other)),
+        other => Err(format!(
+            "Unsupported Unity serialized property write mode: {}",
+            other
+        )),
     }
 }
 
-fn validate_property_target(target: &ViewBindingTarget) -> Result<(), String> {
+fn validate_property_target(target: &UnitySerializedPropertyTarget) -> Result<(), String> {
     validate_object_target(target)?;
     if target
         .property_path
@@ -162,14 +183,17 @@ fn validate_property_target(target: &ViewBindingTarget) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_object_target(target: &ViewBindingTarget) -> Result<(), String> {
+fn validate_object_target(target: &UnitySerializedPropertyTarget) -> Result<(), String> {
     if target.kind.trim().is_empty() {
         return Err("Unity serialized property target kind cannot be empty.".to_string());
     }
     if matches!(target.component_index, Some(index) if index < 0) {
-        return Err("Unity serialized property target componentIndex cannot be negative.".to_string());
+        return Err(
+            "Unity serialized property target componentIndex cannot be negative.".to_string(),
+        );
     }
     for path in [
+        target.guid.as_deref(),
         target.path.as_deref(),
         target.scene_path.as_deref(),
         target.object_path.as_deref(),
@@ -178,7 +202,9 @@ fn validate_object_target(target: &ViewBindingTarget) -> Result<(), String> {
     .flatten()
     {
         if path.contains('\0') {
-            return Err("Unity serialized property target path contains an invalid character.".to_string());
+            return Err(
+                "Unity serialized property target path contains an invalid character.".to_string(),
+            );
         }
     }
     Ok(())

@@ -1,13 +1,15 @@
 pub(super) fn app_vue(_name: &str) -> String {
     r##"<script setup lang="ts">
 import { onMounted, ref } from "vue";
-import { CanvasView, view } from "@locus/view-runtime";
-import { UnityPropertyEditor, UnitySerializedPropertyTree } from "@locus/components";
+import { property } from "@locus/view-runtime";
+import { CanvasView, UnityPropertyEditor, UnitySerializedPropertyTree } from "@locus/components";
+
+type PropertyTarget = Parameters<typeof property.readProperty>[0];
 
 interface FieldBinding {
   id: string;
   label: string;
-  target: Record<string, unknown>;
+  target: PropertyTarget;
   valueType: string;
   value: unknown;
   displayValue: string;
@@ -66,17 +68,28 @@ function fitCanvas() {
   canvasRef.value?.fitContent?.();
 }
 
+function fieldTarget(field: FieldBinding, propertyPath = ""): PropertyTarget {
+  return propertyPath
+    ? { ...(field.target as Record<string, unknown>), propertyPath } as PropertyTarget
+    : field.target;
+}
+
+function applySnapshotToField(field: FieldBinding, snapshot: Record<string, unknown>) {
+  field.valueType = String(snapshot.valueType || field.valueType);
+  field.value = snapshot.value;
+  field.displayValue = String(snapshot.displayValue ?? snapshot.value ?? "");
+  field.property = snapshot;
+  field.editable = snapshot.editable !== false;
+}
+
 async function readField(field: FieldBinding) {
   field.status = "Reading";
   field.error = "";
   try {
-    const result = await view.binding.read({ target: field.target });
-    field.valueType = result.valueType || field.valueType;
-    field.value = result.value;
-    field.displayValue = result.displayValue || String(result.value ?? "");
-    field.property = result as unknown as Record<string, unknown>;
-    field.editable = !!result.editable;
-    field.status = result.message || "Ready";
+    const result = await property.readProperty(fieldTarget(field));
+    const snapshot = result.raw.snapshot as Record<string, unknown>;
+    applySnapshotToField(field, snapshot);
+    field.status = String(snapshot.message || "Ready");
   } catch (error) {
     field.status = "Error";
     field.error = error instanceof Error ? error.message : String(error);
@@ -104,20 +117,11 @@ async function commitField(field: FieldBinding, value: unknown, propertyPath = "
   field.status = "Saving";
   field.error = "";
   try {
-    const target = propertyPath
-      ? { ...field.target, propertyPath }
-      : field.target;
-    const result = await view.binding.write({
-      target,
-      value,
-    });
-    field.valueType = result.valueType || field.valueType;
-    field.value = result.value;
-    field.displayValue = result.displayValue || String(result.value ?? "");
-    field.property = propertyPath
-      ? (await view.binding.read({ target: field.target }) as unknown as Record<string, unknown>)
+    const result = await property.write(fieldTarget(field, propertyPath), value);
+    const snapshot = propertyPath
+      ? (await property.readProperty(fieldTarget(field))).raw.snapshot as Record<string, unknown>
       : result as unknown as Record<string, unknown>;
-    field.editable = !!result.editable;
+    applySnapshotToField(field, snapshot);
     field.status = result.saved ? "Saved" : result.message || "Ready";
     statusText.value = "Saved";
   } catch (error) {

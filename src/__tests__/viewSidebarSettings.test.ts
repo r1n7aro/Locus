@@ -70,10 +70,10 @@ describe("View sidebar settings", () => {
     expect(zh).toContain('"settings.display.showViewsInSessionPanel": "会话列表中显示视图"');
     expect(en).toContain('"settings.display.showViewsInSessionPanel": "Show Views in session list"');
     expect(zh).toContain('"view.list.helpLabel": "视图（实验性）"');
-    expect(zh).toContain('"view.list.helpBody": "视图是实验性功能，用于通过 Locus 自身的前端创建、打开和运行项目编辑器。Agent 可以把 Vue 前端界面、运行脚本和 Unity 数据绑定组合为一个 View package，并在 Locus 中作为独立工具运行。"');
+    expect(zh).toContain('"view.list.helpBody": "视图是实验性功能，用于通过 Locus 自身的前端创建、打开和运行项目编辑器。Agent 可以把 Vue 前端界面、运行脚本和 Unity 属性数据组合为一个 View package，并在 Locus 中作为独立工具运行。"');
     expect(zh).toContain('"view.list.helpCreate": "在会话输入 /view 加上需求后，Agent 会进入 View workflow，按需求创建或更新 View package。生成后的视图会出现在当前工作区的 Locus/View 列表中，点击名称即可打开。"');
     expect(en).toContain('"view.list.helpLabel": "Views (Experimental)"');
-    expect(en).toContain('"view.list.helpBody": "Views are experimental tools for creating, opening, and running project editors through Locus\'s own frontend. The agent can combine a Vue frontend, runtime scripts, and Unity data bindings into a View package that runs inside Locus as a standalone tool."');
+    expect(en).toContain('"view.list.helpBody": "Views are experimental tools for creating, opening, and running project editors through Locus\'s own frontend. The agent can combine a Vue frontend, runtime scripts, and Unity property data into a View package that runs inside Locus as a standalone tool."');
     expect(en).toContain('"view.list.helpCreate": "Type /view with a request in a session and the agent enters the View workflow to create or update a View package. Generated Views appear in the current workspace Locus/View list and open when selected."');
     expect(zh).toContain('"view.tree.createFolder": "新建文件夹"');
     expect(zh).toContain('"view.tree.rename": "重命名"');

@@ -9,6 +9,3 @@ export { default as UnityPropertyDraw } from "./UnityPropertyDraw.vue";
 export { default as UnityPropertyEditor } from "./UnityPropertyEditor.vue";
 export { default as UnitySerializedPropertyTree } from "./UnitySerializedPropertyTree.vue";
 export { default as UnityVectorField } from "./UnityVectorField.vue";
-export * from "../../services/unityObjectReferencePicker";
-export * from "../../services/propertyTree";
-export * from "./unitySerializedValue";

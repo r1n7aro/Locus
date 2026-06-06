@@ -119,9 +119,7 @@ Locus/View/<project-name>/<view-id>/
     }
   ],
   "capabilities": {
-    "unity": true,
-    "bindings": true,
-    "writeBack": true
+    "unity": true
   }
 }
 ```
@@ -230,8 +228,8 @@ Unity 字段块模板。
 
 - `CanvasView` 自由画布。
 - `UnityPropertyEditor` 字段控件。
-- `view.binding.read` / `view.binding.write` 字段读写。
-- 可扩展到 `view.binding.apply` 批量写回。
+- `property.readProperty` / `property.write` 字段读写。
+- 可扩展到 `property.apply` 批量写回。
 
 ### link-board
 
@@ -287,7 +285,7 @@ Unity 项目资产序列化数据表格模板。
 
 内置能力：
 
-- `read()` / `transform()` / `writeBack()` 三段入口。
+- `read()` / `transform()` / `write()` 三段入口。
 - 进度状态。
 - 预览结果。
 - 写回确认。
@@ -315,7 +313,7 @@ Unity 项目资产序列化数据表格模板。
 View 前端使用 Vue 3、TypeScript、CSS、Pinia 或等价的 Locus 状态封装。Locus 暴露 View SDK：
 
 ```ts
-import { CanvasView, GraphView, defineView, useViewState, useUnityBinding, useViewScript } from "@locus/view-runtime";
+import { CanvasView, GraphView, defineView, property, useViewState, useViewScript } from "@locus/view-runtime";
 import { BaseButton, BaseSegmented, BaseCheckbox } from "@locus/components";
 ```
 
@@ -324,7 +322,7 @@ import { BaseButton, BaseSegmented, BaseCheckbox } from "@locus/components";
 - 加载 View Package manifest。
 - 编译并加载 package `entry` 指向的 TypeScript / Vue 前端入口。
 - 注入 Unity Bridge client。
-- 注入 View Binding client。
+- 注入 Unity property client。
 - 注入 View Script client。
 - 注入 Locus 主题 token、基础控件样式和组件语义类，模板默认继承 Locus 的字体、surface、border、text、button、input 风格。
 - 支持 agent 编写 `src/main.ts`、`src/store.ts`、`src/App.vue` 中的 TypeScript 逻辑，并在 reload 后重新编译运行。
@@ -584,7 +582,7 @@ Unity 写回边界：
 - View frontend 运行在 Locus 托管的 View host 页面内。
 - View 默认以真实 Tauri 子窗口打开，保留突破主窗口边界、跨屏和系统级窗口管理能力。
 - P3 起 View host 采用可信 View Runtime，直接编译运行 package TypeScript / Vue 逻辑。
-- View Runtime 暴露 `@locus/view-runtime`、Locus components、View Binding 和 View Script API。
+- View Runtime 暴露 `@locus/view-runtime`、Locus components、Unity property 和 View Script API。
 - 文件读写仍通过 View Package 路径边界和工具权限约束。
 - Unity 写回仍通过 View Binding / View Script API 执行状态检查、影响范围返回和高风险确认。
 
@@ -728,8 +726,8 @@ Unity 写回边界：
 
 - 实现发布版内置 View frontend compiler/runtime。
 - 编译 package `entry` 指向的 TypeScript 入口，支持 Vue SFC `<script setup>` / `<script>`、CSS 和 store 模块。
-- 提供 `@locus/view-runtime` SDK：`defineView`、`useViewState`、`useUnityBinding`、`useViewScript`、`view.reload`。
-- 提供 Locus components 运行时导入：`BaseButton`、`BaseSegmented`、`BaseCheckbox` 等常用控件。
+- 提供 `@locus/view-runtime` SDK：`defineView`、`useViewState`、`property`、`useViewScript`、`view.reload`。
+- 提供 component-only `@locus/components` 运行时导入：`BaseButton`、`BaseSegmented`、`BaseCheckbox` 等常用控件。
 - reload 时重新编译并运行 package TypeScript / Vue。
 - 新增 `bindings.json` schema。
 - 实现 `view_binding_read`。
@@ -752,7 +750,7 @@ Unity 写回边界：
 - 支持 Vue SFC `<script setup>` / `<script>`、`src/store.ts`、`src/` 下拆分的 `.ts` / `.vue` / `.css` / `.json` 模块。
 - 支持 `@locus/view-runtime`、`@locus/components` 和常用 Vue API 导入。
 - 支持 `view.callScript` / `useViewScript` 调用 View Script。
-- 支持 `view.binding.read`、`view.binding.write`、`view.binding.apply` 和 `useUnityBinding`。
+- 支持 `property.readProperty`、`property.write`、`property.apply` 和 `property.fromPath`。
 - Unity 侧支持 selection / asset / material / scriptableObject / gameObject / component 的 SerializedProperty 读写。
 - `readOnly` binding 在写入路径返回明确错误。
 - package 文件编辑继续走 agent 通用文件工具；`view_read` 只作为 View host 内部读取 command。
@@ -779,7 +777,7 @@ Unity 写回边界：
 工作项：
 
 - 完善 `scripted-transform` 模板。
-- 提供 `read` / `transform` / `writeBack` 示例。
+- 提供 `read` / `transform` / `write` 示例。
 - 支持长任务进度。
 - 支持结果预览。
 - 支持写回前 diff 或影响摘要。

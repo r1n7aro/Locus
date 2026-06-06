@@ -2663,10 +2663,10 @@ impl AgentInstance {
             | "view_run"
             | "view_compile_script"
             | "view_call_script"
-            | "view_binding_read"
-            | "view_binding_discover"
-            | "view_binding_write"
-            | "view_binding_apply"
+            | "view_property_read"
+            | "view_property_discover"
+            | "view_property_write"
+            | "view_property_apply"
             | "view_capture"
             | "view_snapshot"
             | "view_action"
@@ -11141,10 +11141,8 @@ impl AgentInstance {
             .get("fileID")
             .or_else(|| args.get("file_id"))
             .and_then(|v| {
-                v.as_i64().or_else(|| {
-                    v.as_str()
-                        .and_then(|s| s.trim().parse::<i64>().ok())
-                })
+                v.as_i64()
+                    .or_else(|| v.as_str().and_then(|s| s.trim().parse::<i64>().ok()))
             });
 
         let type_filter: Option<Vec<AssetKind>> = match args
@@ -11399,9 +11397,7 @@ impl AgentInstance {
                 format!(", type: {}", names.join("|"))
             })
             .unwrap_or_default();
-        let object_label = file_id
-            .map(|id| format!("#{}", id))
-            .unwrap_or_default();
+        let object_label = file_id.map(|id| format!("#{}", id)).unwrap_or_default();
         let mut out = format!(
             "{} {} '{}{}'{filter_label}:\n",
             groups.len(),

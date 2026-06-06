@@ -228,6 +228,7 @@ export interface SessionDetail {
   updatedAt: number;
   messages: ChatMessage[];
   pendingInputs?: PendingSessionInput[];
+  runtime?: SessionRuntimeSnapshot | null;
 }
 
 export type SessionRunStatus =
@@ -258,6 +259,14 @@ export interface SessionEventRecord {
   eventType: string;
   payload: Record<string, unknown>;
   createdAt: number;
+}
+
+export interface SessionRuntimeSnapshot {
+  activeRun: SessionRunSummary;
+  activeToolCalls: ToolCallDisplay[];
+  pendingQuestion?: PendingQuestion | null;
+  pendingToolConfirms: PendingToolConfirm[];
+  isCompacting: boolean;
 }
 
 export interface ActiveSessionSelectionChanged {

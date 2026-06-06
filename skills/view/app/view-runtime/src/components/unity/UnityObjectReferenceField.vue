@@ -75,6 +75,26 @@ const dropdownVisible = computed(() => open.value && editable.value);
 const showEmpty = computed(() =>
   dropdownVisible.value && !searching.value && !searchError.value && results.value.length === 0,
 );
+const dropdownEl = ref<HTMLElement | null>(null);
+const dropdownPosition = ref({
+  left: 0,
+  top: 0,
+  width: 0,
+  maxHeight: 246,
+  placement: "bottom" as "bottom" | "top",
+});
+const dropdownStyle = computed(() => ({
+  left: `${dropdownPosition.value.left}px`,
+  top: `${dropdownPosition.value.top}px`,
+  width: `${dropdownPosition.value.width}px`,
+  maxHeight: `${dropdownPosition.value.maxHeight}px`,
+  "--unity-object-reference-dropdown-origin": dropdownPosition.value.placement === "top" ? "bottom left" : "top left",
+}));
+let positionFrame = 0;
+const DROPDOWN_GAP = 4;
+const DROPDOWN_MARGIN = 8;
+const DROPDOWN_MAX_HEIGHT = 246;
+const DROPDOWN_MIN_HEIGHT = 112;
 
 watch(
   () => [props.modelValue, props.displayValue] as const,
@@ -90,9 +110,22 @@ watch(
   },
 );
 
+watch(dropdownVisible, (visible) => {
+  if (!visible) {
+    removeDropdownPositionListeners();
+    return;
+  }
+  addDropdownPositionListeners();
+  void nextTick(() => {
+    scheduleDropdownPositionUpdate();
+  });
+});
+
 onBeforeUnmount(() => {
   clearDebounce();
   clearBlurTimer();
+  cancelDropdownPositionUpdate();
+  removeDropdownPositionListeners();
 });
 
 function clearDebounce() {
@@ -105,6 +138,70 @@ function clearBlurTimer() {
   if (blurTimer === null) return;
   window.clearTimeout(blurTimer);
   blurTimer = null;
+}
+
+function cancelDropdownPositionUpdate() {
+  if (!positionFrame) return;
+  window.cancelAnimationFrame(positionFrame);
+  positionFrame = 0;
+}
+
+function viewportSize() {
+  return {
+    width: window.innerWidth || document.documentElement.clientWidth,
+    height: window.innerHeight || document.documentElement.clientHeight,
+  };
+}
+
+function updateDropdownPosition() {
+  positionFrame = 0;
+  const field = rootEl.value;
+  if (!field || !dropdownVisible.value) return;
+
+  const rect = field.getBoundingClientRect();
+  const viewport = viewportSize();
+  const width = Math.min(
+    Math.max(rect.width, 220),
+    Math.max(0, viewport.width - DROPDOWN_MARGIN * 2),
+  );
+  const left = Math.min(
+    Math.max(rect.left, DROPDOWN_MARGIN),
+    Math.max(DROPDOWN_MARGIN, viewport.width - width - DROPDOWN_MARGIN),
+  );
+  const availableBelow = viewport.height - rect.bottom - DROPDOWN_GAP - DROPDOWN_MARGIN;
+  const availableAbove = rect.top - DROPDOWN_GAP - DROPDOWN_MARGIN;
+  const placement = availableBelow < DROPDOWN_MIN_HEIGHT && availableAbove > availableBelow ? "top" : "bottom";
+  const availableHeight = placement === "top" ? availableAbove : availableBelow;
+  const maxHeight = Math.max(
+    DROPDOWN_MIN_HEIGHT,
+    Math.min(DROPDOWN_MAX_HEIGHT, Math.max(DROPDOWN_MIN_HEIGHT, availableHeight)),
+  );
+  const top = placement === "top"
+    ? Math.max(DROPDOWN_MARGIN, rect.top - DROPDOWN_GAP - maxHeight)
+    : Math.min(rect.bottom + DROPDOWN_GAP, viewport.height - DROPDOWN_MARGIN - maxHeight);
+
+  dropdownPosition.value = {
+    left,
+    top,
+    width,
+    maxHeight,
+    placement,
+  };
+}
+
+function scheduleDropdownPositionUpdate() {
+  if (positionFrame) return;
+  positionFrame = window.requestAnimationFrame(updateDropdownPosition);
+}
+
+function addDropdownPositionListeners() {
+  window.addEventListener("resize", scheduleDropdownPositionUpdate);
+  document.addEventListener("scroll", scheduleDropdownPositionUpdate, true);
+}
+
+function removeDropdownPositionListeners() {
+  window.removeEventListener("resize", scheduleDropdownPositionUpdate);
+  document.removeEventListener("scroll", scheduleDropdownPositionUpdate, true);
 }
 
 function updateSearchText(event: Event) {
@@ -155,6 +252,7 @@ function scheduleBlurCheck() {
   blurTimer = window.setTimeout(() => {
     const active = document.activeElement;
     if (active && rootEl.value?.contains(active)) return;
+    if (active && dropdownEl.value?.contains(active)) return;
     focused.value = false;
     closeDropdown();
   }, 80);
@@ -169,6 +267,7 @@ function closeDropdown() {
   results.value = [];
   highlightedIndex.value = -1;
   clearDebounce();
+  removeDropdownPositionListeners();
 }
 
 function scheduleSearch(immediate: boolean) {
@@ -314,10 +413,15 @@ function handleSearchKeydown(event: KeyboardEvent) {
     >
       x
     </button>
+  </div>
+
+  <Teleport to="body">
     <div
       v-if="dropdownVisible"
+      ref="dropdownEl"
       class="unity-object-reference-dropdown"
       role="dialog"
+      :style="dropdownStyle"
       :aria-label="`${typeHint} assets`"
     >
       <div class="unity-object-reference-search">
@@ -367,7 +471,7 @@ function handleSearchKeydown(event: KeyboardEvent) {
         </span>
       </button>
     </div>
-  </div>
+  </Teleport>
 </template>
 
 <style scoped>
@@ -462,22 +566,29 @@ function handleSearchKeydown(event: KeyboardEvent) {
 }
 
 .unity-object-reference-dropdown {
-  position: absolute;
-  z-index: 40;
-  left: 0;
-  right: 0;
-  top: calc(100% + 4px);
+  position: fixed;
+  z-index: 1000;
   max-height: 246px;
   overflow: auto;
-  border: 1px solid var(--border-color);
+  border: 1px solid var(--border-strong);
   border-radius: 7px;
-  background: var(--panel-bg);
-  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.28);
+  background: var(--surface-elevated, var(--panel-bg));
+  box-shadow:
+    0 0 0 1px color-mix(in srgb, var(--text-color) 6%, transparent),
+    0 14px 34px rgba(0, 0, 0, 0.34);
+  box-sizing: border-box;
+  transform-origin: var(--unity-object-reference-dropdown-origin, top left);
+}
+
+:global(:root[data-theme="dark"]) .unity-object-reference-dropdown {
+  box-shadow:
+    0 0 0 1px color-mix(in srgb, var(--text-color) 9%, transparent),
+    0 16px 38px rgba(0, 0, 0, 0.48);
 }
 
 .unity-object-reference-search {
   padding: 6px;
-  border-bottom: 1px solid var(--border-color);
+  border-bottom: 1px solid color-mix(in srgb, var(--border-color) 72%, transparent);
 }
 
 .unity-object-reference-search-input {
@@ -506,7 +617,7 @@ function handleSearchKeydown(event: KeyboardEvent) {
   min-width: 0;
   padding: 6px 8px;
   border: 0;
-  border-bottom: 1px solid var(--border-color);
+  border-bottom: 1px solid color-mix(in srgb, var(--border-color) 72%, transparent);
   background: transparent;
   color: var(--text-color);
   font: inherit;

@@ -1,6 +1,6 @@
 use super::{
     now_millis, ViewCapabilities, ViewManifest, ViewRequirements, ViewScriptManifest,
-    ViewTemplateSummary, VIEW_BINDINGS_SCHEMA, VIEW_SCHEMA,
+    ViewTemplateSummary, VIEW_API_VERSION, VIEW_SCHEMA,
 };
 
 mod blank;
@@ -108,6 +108,7 @@ pub(super) fn template_manifest(
 
     ViewManifest {
         schema: VIEW_SCHEMA.to_string(),
+        api_version: VIEW_API_VERSION,
         id: id.to_string(),
         name: name.to_string(),
         version: "0.1.0".to_string(),
@@ -119,15 +120,12 @@ pub(super) fn template_manifest(
         ),
         entry: "src/main.ts".to_string(),
         style: "src/style.css".to_string(),
-        bindings: "bindings.json".to_string(),
         scripts,
         capabilities: ViewCapabilities {
             unity: matches!(
                 template,
                 "inspector-form" | "field-blocks" | "node-graph" | "serialized-table"
             ),
-            bindings: matches!(template, "inspector-form" | "field-blocks"),
-            write_back: matches!(template, "field-blocks" | "node-graph" | "serialized-table"),
         },
         requirements: Some(ViewRequirements {
             unity_connection: matches!(
@@ -143,16 +141,11 @@ pub(super) fn template_files(id: &str, name: &str, template: &str) -> Vec<(&'sta
     let readme = format!(
         "# {name}\n\nView Package `{id}` generated from `{template}`.\n\nEdit files under this directory and reload the View from Locus.\n"
     );
-    let bindings = format!(
-        "{{\n  \"schema\": \"{}\",\n  \"bindings\": []\n}}\n",
-        VIEW_BINDINGS_SCHEMA
-    );
 
     let mut files = vec![
         ("README.md", readme),
         ("src/main.ts", common::main_ts()),
         ("src/store.ts", common::store_ts()),
-        ("bindings.json", bindings),
     ];
 
     match template {
@@ -228,21 +221,30 @@ pub(super) fn view_workspace_index_ts() -> &'static str {
 
 pub(super) fn view_workspace_property_draw_ts() -> &'static str {
     r#"import {
-  publicInspectorPropertyDrawLibrary,
-  registerInspectorPropertyDrawComponent,
-  type InspectorPropertyDrawComponentRegistration,
+  publicInspectorPropertyDrawerLibrary,
+  registerInspectorPropertyDrawer,
+  type InspectorPropertyDrawerRegistration,
 } from "@locus/view-runtime";
 
-export const projectPropertyDrawLibrary = publicInspectorPropertyDrawLibrary;
+export const projectPropertyDrawerLibrary = publicInspectorPropertyDrawerLibrary;
 
-export function registerProjectPropertyDraw(
-  registration: InspectorPropertyDrawComponentRegistration,
+export function registerProjectPropertyDrawer(
+  registration: InspectorPropertyDrawerRegistration,
 ) {
-  if (!registration.type && !registration.match) return () => undefined;
-  return projectPropertyDrawLibrary.register(registration);
+  if (
+    !registration.type &&
+    !registration.valueType &&
+    !registration.fieldType &&
+    !registration.attribute &&
+    !registration.propertyPath &&
+    !registration.name &&
+    !registration.drawerKind &&
+    !registration.match
+  ) return () => undefined;
+  return projectPropertyDrawerLibrary.register(registration);
 }
 
-export { registerInspectorPropertyDrawComponent };
+export { registerInspectorPropertyDrawer };
 "#
 }
 

@@ -31,6 +31,7 @@ import {
   viewExportPackage,
   viewImportPackage,
   viewMoveEntry,
+  viewRead,
   viewRenameEntry,
   viewRequiresUnityConnection,
   viewRun,
@@ -45,6 +46,8 @@ import LucideIcon from "./icons/LucideIcon.vue";
 import { resolveLocusViewIcon } from "./icons/locusViewIcons";
 import BaseButton from "./ui/BaseButton.vue";
 import BaseContextMenu from "./ui/BaseContextMenu.vue";
+import { findMigratedViewRuntimeApiUsage } from "./view/viewPackageDiagnostics";
+import { compileViewSfc, transformModuleSource } from "./view/viewSfcCompiler";
 
 interface ViewTreeNode {
   kind: "folder" | "view";
@@ -132,6 +135,12 @@ const renameInputRef = ref<HTMLInputElement | null>(null);
 const draggingNode = ref<ViewTreeNode | null>(null);
 const dragTargetKey = ref("");
 const dragTargetPosition = ref<ViewDropTarget["position"] | "">("");
+const viewCompileErrors = ref<Record<string, string>>({});
+const viewCompileCheckedKeys = ref<Record<string, string>>({});
+const viewCompilePendingKeys = ref<Record<string, string>>({});
+const viewCompileValidationPromises = new Map<string, Promise<string>>();
+const viewCompileValidationRuns = new Map<string, number>();
+let nextViewCompileValidationRun = 0;
 let unsubscribeViewReload: RuntimeUnsubscribe | null = null;
 let unsubscribeViewTreeChanged: RuntimeUnsubscribe | null = null;
 let pointerDragState: ViewPointerDragState | null = null;
@@ -156,13 +165,20 @@ const selectedViewPath = computed(() => selectedView.value?.packageRoot || "");
 const selectedViewUpdatedAt = computed(() =>
   selectedView.value ? formatTimestamp(selectedView.value.updatedAt) : "",
 );
+const selectedViewCompileError = computed(() =>
+  selectedView.value ? viewCompileError(selectedView.value) : "",
+);
+const selectedViewCompileStatusText = computed(() =>
+  selectedView.value ? viewCompileStatusText(selectedView.value) : "",
+);
+const selectedViewCompileStatusTitle = computed(() =>
+  selectedView.value ? viewCompileStatusTitle(selectedView.value) : "",
+);
 const selectedViewCapabilityText = computed(() => {
   const caps = selectedView.value?.capabilities;
   if (!caps) return "";
   const enabled = [
     caps.unity ? "Unity" : "",
-    caps.bindings ? "Bindings" : "",
-    caps.writeBack ? "Write Back" : "",
   ].filter(Boolean);
   return enabled.length ? enabled.join(" / ") : t("view.metadata.capabilityNone");
 });
@@ -394,6 +410,174 @@ function applyTreeSnapshot(snapshot: ViewTreeSnapshot) {
   if (!views.value.some((view) => view.id === selectedViewId.value)) {
     selectedViewId.value = views.value[0]?.id ?? "";
   }
+  pruneViewCompileDiagnostics(snapshot.views);
+}
+
+function isViewCompileFile(relPath: string): boolean {
+  return /\.(vue|ts|js)$/i.test(relPath);
+}
+
+function normalizeCompileErrorMessage(error: unknown): string {
+  const message = error instanceof Error ? error.message : normalizeAppError(error).message;
+  const lines = message
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  return lines.find((line) => line !== "View compile failed.") ?? lines[0] ?? message;
+}
+
+function viewCompileError(view: ViewPackageSummary | null | undefined): string {
+  return view && viewCompileCheckedKeys.value[view.id] === viewCompileKey(view)
+    ? viewCompileErrors.value[view.id] ?? ""
+    : "";
+}
+
+function viewCompileKey(view: ViewPackageSummary): string {
+  return `${view.updatedAt}:${view.manifestPath}:${view.packageRoot}`;
+}
+
+function viewCompilePending(view: ViewPackageSummary | null | undefined): boolean {
+  return !!view && viewCompilePendingKeys.value[view.id] === viewCompileKey(view);
+}
+
+function viewCompileChecked(view: ViewPackageSummary | null | undefined): boolean {
+  return !!view && viewCompileCheckedKeys.value[view.id] === viewCompileKey(view);
+}
+
+function viewCompileStatusText(view: ViewPackageSummary): string {
+  if (viewCompilePending(view)) return t("view.metadata.compileChecking");
+  const error = viewCompileError(view);
+  if (error) return error;
+  return viewCompileChecked(view)
+    ? t("view.metadata.compileOk")
+    : t("view.metadata.compileUnchecked");
+}
+
+function viewCompileStatusTitle(view: ViewPackageSummary): string {
+  return viewCompileStatusText(view);
+}
+
+function setCompileRecordValue(
+  target: typeof viewCompileErrors,
+  viewId: string,
+  value: string,
+) {
+  target.value = { ...target.value, [viewId]: value };
+}
+
+function deleteCompileRecordValue(target: typeof viewCompileErrors, viewId: string) {
+  const next = { ...target.value };
+  delete next[viewId];
+  target.value = next;
+}
+
+function pruneViewCompileDiagnostics(viewSummaries: ViewPackageSummary[]) {
+  const validKeys = new Map(viewSummaries.map((view) => [view.id, viewCompileKey(view)] as const));
+  const keepMatchingKeys = (record: Record<string, string>) => {
+    const next: Record<string, string> = {};
+    for (const [viewId, key] of Object.entries(record)) {
+      if (validKeys.get(viewId) === key) next[viewId] = key;
+    }
+    return next;
+  };
+  const nextCheckedKeys = keepMatchingKeys(viewCompileCheckedKeys.value);
+  viewCompileCheckedKeys.value = nextCheckedKeys;
+  viewCompilePendingKeys.value = keepMatchingKeys(viewCompilePendingKeys.value);
+
+  const nextErrors: Record<string, string> = {};
+  for (const [viewId, message] of Object.entries(viewCompileErrors.value)) {
+    if (nextCheckedKeys[viewId]) nextErrors[viewId] = message;
+  }
+  viewCompileErrors.value = nextErrors;
+}
+
+function clearViewCompileDiagnostics() {
+  viewCompileErrors.value = {};
+  viewCompileCheckedKeys.value = {};
+  viewCompilePendingKeys.value = {};
+  viewCompileValidationPromises.clear();
+  viewCompileValidationRuns.clear();
+}
+
+async function validateViewCompile(view: ViewPackageSummary): Promise<string> {
+  try {
+    const detail = await viewRead(view.id);
+    for (const file of detail.files) {
+      if (!isViewCompileFile(file.relPath)) continue;
+      if (file.truncated) {
+        throw new Error(`${file.relPath}: ${t("view.status.compileSourceTruncated")}`);
+      }
+      const migratedApiUsage = findMigratedViewRuntimeApiUsage(file);
+      if (migratedApiUsage) {
+        throw new Error(migratedApiUsage);
+      }
+      if (file.relPath.endsWith(".vue")) {
+        compileViewSfc(file.content, file.relPath);
+      } else {
+        transformModuleSource(file.content, file.relPath);
+      }
+    }
+    return "";
+  } catch (error) {
+    return normalizeCompileErrorMessage(error);
+  }
+}
+
+async function ensureViewCompileValidated(view: ViewPackageSummary): Promise<string> {
+  const key = viewCompileKey(view);
+  const viewId = view.id;
+  if (viewCompileCheckedKeys.value[viewId] === key) {
+    return viewCompileErrors.value[viewId] ?? "";
+  }
+
+  const pending = viewCompileValidationPromises.get(viewId);
+  if (viewCompilePendingKeys.value[viewId] === key && pending) {
+    return pending;
+  }
+
+  const promise = runViewCompileValidation(view, key);
+  viewCompileValidationPromises.set(viewId, promise);
+  void promise.finally(() => {
+    if (viewCompileValidationPromises.get(viewId) === promise) {
+      viewCompileValidationPromises.delete(viewId);
+    }
+  });
+  return promise;
+}
+
+async function runViewCompileValidation(
+  view: ViewPackageSummary,
+  key: string,
+): Promise<string> {
+  const viewId = view.id;
+  const run = ++nextViewCompileValidationRun;
+  viewCompileValidationRuns.set(viewId, run);
+  setCompileRecordValue(viewCompilePendingKeys, viewId, key);
+  deleteCompileRecordValue(viewCompileErrors, viewId);
+
+  const message = await validateViewCompile(view);
+  const currentView = views.value.find((item) => item.id === viewId);
+  const stillCurrent =
+    viewCompileValidationRuns.get(viewId) === run &&
+    !!currentView &&
+    viewCompileKey(currentView) === key;
+
+  if (stillCurrent) {
+    deleteCompileRecordValue(viewCompilePendingKeys, viewId);
+    setCompileRecordValue(viewCompileCheckedKeys, viewId, key);
+    if (message) {
+      setCompileRecordValue(viewCompileErrors, viewId, message);
+    } else {
+      deleteCompileRecordValue(viewCompileErrors, viewId);
+    }
+  }
+
+  return stillCurrent ? message : "";
+}
+
+function selectView(view: ViewPackageSummary) {
+  selectedViewId.value = view.id;
+  void ensureViewCompileValidated(view);
 }
 
 async function loadViews() {
@@ -407,6 +591,7 @@ async function loadViews() {
     views.value = [];
     folders.value = [];
     treeOrder.value = [];
+    clearViewCompileDiagnostics();
     loadError.value = err.message;
     notificationStore.addNotice("error", err.message, {
       code: err.code,
@@ -450,7 +635,7 @@ function selectTreeRow(row: VisibleViewRow, event?: MouseEvent) {
     return;
   }
   if (row.node.view) {
-    selectedViewId.value = row.node.view.id;
+    selectView(row.node.view);
   }
 }
 
@@ -931,7 +1116,7 @@ async function moveNodeToTarget(
       }),
     );
     if (node.kind === "view" && node.view) {
-      selectedViewId.value = node.view.id;
+      selectView(node.view);
     }
   } catch (error) {
     const err = normalizeAppError(error);
@@ -1028,7 +1213,7 @@ async function importViewPackage(targetDirRelPath = "") {
       targetDirRelPath,
     });
     applyTreeSnapshot(result.snapshot);
-    selectedViewId.value = result.summary.id;
+    selectView(result.summary);
     expandViewPathAncestors(
       result.summary.displayPath || result.summary.packageRelPath || result.summary.id,
     );
@@ -1102,6 +1287,14 @@ async function openViewPackage(view: ViewPackageSummary) {
   selectedViewId.value = view.id;
   running.value = true;
   try {
+    const compileError = await ensureViewCompileValidated(view);
+    if (compileError) {
+      notificationStore.addNotice("error", compileError, {
+        operation: "viewCompile",
+        replaceOperation: true,
+      });
+      return;
+    }
     const requirementError = await checkViewOpenRequirements(view);
     if (requirementError) {
       notificationStore.addNotice("error", requirementError.message, {
@@ -1129,6 +1322,14 @@ async function openViewPackageInUnity(view: ViewPackageSummary) {
   selectedViewId.value = view.id;
   running.value = true;
   try {
+    const compileError = await ensureViewCompileValidated(view);
+    if (compileError) {
+      notificationStore.addNotice("error", compileError, {
+        operation: "viewCompile",
+        replaceOperation: true,
+      });
+      return;
+    }
     const requirementError = await checkViewOpenRequirements(view);
     if (requirementError) {
       notificationStore.addNotice("error", requirementError.message, {
@@ -1178,6 +1379,7 @@ async function openContextViewInUnity() {
 
 watch(() => props.workingDir, () => {
   selectedViewId.value = "";
+  clearViewCompileDiagnostics();
   closeContextMenu();
   closeCreateFolder();
   closeRename();
@@ -1393,6 +1595,13 @@ onUnmounted(() => {
                     />
                   </span>
                   <span class="view-tree-label">{{ entry.row.node.label }}</span>
+                  <span
+                    v-if="entry.row.node.kind === 'view' && viewCompileError(entry.row.node.view)"
+                    class="view-tree-status-error"
+                    :title="viewCompileError(entry.row.node.view)"
+                  >
+                    {{ t("view.status.compileError") }}
+                  </span>
                 </button>
                 <div
                   v-if="entry.row.node.kind === 'view' && !isRenamingNode(entry.row.node)"
@@ -1505,6 +1714,19 @@ onUnmounted(() => {
               <div class="view-metadata-row">
                 <dt>{{ t("view.metadata.version") }}</dt>
                 <dd class="mono">{{ selectedView.version }}</dd>
+              </div>
+              <div class="view-metadata-row">
+                <dt>{{ t("view.metadata.apiVersion") }}</dt>
+                <dd class="mono">{{ selectedView.apiVersion }}</dd>
+              </div>
+              <div class="view-metadata-row">
+                <dt>{{ t("view.metadata.compile") }}</dt>
+                <dd
+                  :class="{ 'is-error': !!selectedViewCompileError }"
+                  :title="selectedViewCompileStatusTitle"
+                >
+                  {{ selectedViewCompileStatusText }}
+                </dd>
               </div>
               <div class="view-metadata-row">
                 <dt>{{ t("view.metadata.capabilities") }}</dt>
@@ -1922,6 +2144,18 @@ onUnmounted(() => {
   font-weight: 600;
 }
 
+.view-tree-status-error {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 92px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--status-danger-fg);
+  font-size: 11px;
+  line-height: 1.35;
+}
+
 .view-tree-create-row {
   min-height: 30px;
   display: flex;
@@ -2185,6 +2419,13 @@ onUnmounted(() => {
 
 .view-metadata-row dd.path {
   overflow-wrap: anywhere;
+}
+
+.view-metadata-row dd.is-error {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--status-danger-fg);
 }
 
 .view-delete-confirm {

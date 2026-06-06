@@ -1,6 +1,7 @@
 pub(super) fn app_vue(_name: &str) -> String {
     r##"<script setup lang="ts">
-import { GraphView, GraphViewController, defineGraphView, view } from "@locus/view-runtime";
+import { GraphViewController, defineGraphView, view } from "@locus/view-runtime";
+import { GraphView } from "@locus/components";
 
 function fallbackGraph() {
   return {

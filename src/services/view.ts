@@ -23,8 +23,6 @@ export interface ViewScriptManifest {
 
 export interface ViewCapabilities {
   unity: boolean;
-  bindings: boolean;
-  writeBack: boolean;
 }
 
 export interface ViewRequirements {
@@ -33,6 +31,7 @@ export interface ViewRequirements {
 
 export interface ViewManifest {
   schema: string;
+  apiVersion: number;
   id: string;
   name: string;
   version: string;
@@ -41,7 +40,6 @@ export interface ViewManifest {
   icon?: string | null;
   entry: string;
   style: string;
-  bindings: string;
   scripts: ViewScriptManifest[];
   capabilities: ViewCapabilities;
   requirements: ViewRequirements;
@@ -56,6 +54,7 @@ export interface ViewTemplateSummary {
 export interface ViewPackageSummary {
   id: string;
   name: string;
+  apiVersion: number;
   version: string;
   template: string;
   icon?: string | null;
@@ -239,163 +238,83 @@ export interface ViewStorageRemoveRequest {
   key: string;
 }
 
+export type ViewFsFileData = string | number[];
+
+export interface ViewFsPathRequest {
+  path: string;
+}
+
+export interface ViewFsReadFileRequest {
+  path: string;
+  encoding?: string | null;
+}
+
+export interface ViewFsReadFileResult {
+  path: string;
+  encoding?: string | null;
+  data: ViewFsFileData;
+}
+
+export interface ViewFsWriteFileRequest {
+  path: string;
+  data: ViewFsFileData;
+  encoding?: string | null;
+}
+
+export interface ViewFsMkdirRequest {
+  path: string;
+  recursive?: boolean | null;
+}
+
+export interface ViewFsReaddirRequest {
+  path: string;
+  withFileTypes?: boolean | null;
+}
+
+export interface ViewFsDirEntry {
+  name: string;
+  path: string;
+  isFile: boolean;
+  isDirectory: boolean;
+  isSymbolicLink: boolean;
+}
+
+export interface ViewFsReaddirResult {
+  entries: ViewFsDirEntry[];
+}
+
+export interface ViewFsStatResult {
+  path: string;
+  size: number;
+  isFile: boolean;
+  isDirectory: boolean;
+  isSymbolicLink: boolean;
+  modifiedMs?: number | null;
+  accessedMs?: number | null;
+  createdMs?: number | null;
+}
+
+export interface ViewFsRmRequest {
+  path: string;
+  recursive?: boolean | null;
+  force?: boolean | null;
+}
+
+export interface ViewFsRenameRequest {
+  oldPath: string;
+  newPath: string;
+}
+
+export interface ViewFsCopyFileRequest {
+  src: string;
+  dest: string;
+}
+
 export interface ViewAutomationRequest {
   requestId: string;
   viewId: string;
   kind: string;
   payload: Record<string, unknown>;
-}
-
-export interface ViewBindingTarget {
-  kind: string;
-  path?: string | null;
-  scenePath?: string | null;
-  objectPath?: string | null;
-  objectFileId?: number | null;
-  targetFileId?: number | null;
-  componentType?: string | null;
-  componentIndex?: number | null;
-  targetTypeFullName?: string | null;
-  targetTypeAssembly?: string | null;
-  targetTypeName?: string | null;
-  propertyPath?: string | null;
-}
-
-export interface ViewManagedReferenceTypeOption {
-  label: string;
-  value: string;
-  fullName: string;
-  assembly: string;
-}
-
-export interface ViewEnumOption {
-  label: string;
-  value: string;
-  name: string;
-  index: number;
-  numericValue: number;
-}
-
-export interface ViewSerializedPropertyAttributeInfo {
-  type: string;
-  displayName: string;
-  value: string;
-}
-
-export interface ViewSerializedPropertySnapshot {
-  propertyPath: string;
-  displayName: string;
-  name: string;
-  type: string;
-  valueType: string;
-  fieldTypeFullName: string;
-  fieldTypeAssembly: string;
-  value: unknown;
-  displayValue: string;
-  editable: boolean;
-  hasChildren: boolean;
-  isArray: boolean;
-  arraySize: number;
-  isFlagsEnum: boolean;
-  enumValueIndex: number;
-  enumValueFlag: number;
-  enumOptions: ViewEnumOption[];
-  children: ViewSerializedPropertySnapshot[];
-  isManagedReference: boolean;
-  managedReferenceFullTypename: string;
-  managedReferenceFieldTypename: string;
-  managedReferenceDisplayName: string;
-  managedReferenceTypes: ViewManagedReferenceTypeOption[];
-  tooltip: string;
-  header: string;
-  hasRange: boolean;
-  rangeMin: number;
-  rangeMax: number;
-  numberStep: number;
-  multiline: boolean;
-  minLines: number;
-  maxLines: number;
-  referenceTypeFullName: string;
-  referenceTypeAssembly: string;
-  attributes: ViewSerializedPropertyAttributeInfo[];
-}
-
-export interface ViewBindingReadRequest {
-  viewId: string;
-  bindingId?: string | null;
-  target?: ViewBindingTarget | null;
-  maxDepth?: number | null;
-  maxArrayItems?: number | null;
-}
-
-export interface ViewBindingDiscoverRequest {
-  viewId: string;
-  bindingId?: string | null;
-  target?: ViewBindingTarget | null;
-  query?: string | null;
-  fieldName?: string | null;
-  fieldType?: string | null;
-  maxDepth?: number | null;
-  maxResults?: number | null;
-}
-
-export interface ViewBindingDiscoverMatch {
-  propertyPath: string;
-  displayName: string;
-  name: string;
-  type: string;
-  valueType: string;
-  fieldTypeFullName: string;
-  fieldTypeAssembly: string;
-  displayValue: string;
-  editable: boolean;
-  hasChildren: boolean;
-  isArray: boolean;
-  isManagedReference: boolean;
-  depth: number;
-}
-
-export interface ViewBindingDiscoverResult {
-  ok: boolean;
-  bindingId?: string | null;
-  message: string;
-  target: ViewBindingTarget;
-  matches: ViewBindingDiscoverMatch[];
-}
-
-export interface ViewBindingReadResult extends ViewSerializedPropertySnapshot {
-  ok: boolean;
-  bindingId?: string | null;
-  message: string;
-  target: ViewBindingTarget;
-}
-
-export interface ViewBindingWriteRequest {
-  viewId: string;
-  bindingId?: string | null;
-  target?: ViewBindingTarget | null;
-  value: unknown;
-}
-
-export interface ViewBindingWriteResult extends ViewBindingReadResult {
-  saved: boolean;
-}
-
-export interface ViewBindingApplyWrite {
-  bindingId?: string | null;
-  target?: ViewBindingTarget | null;
-  value: unknown;
-}
-
-export interface ViewBindingApplyRequest {
-  viewId: string;
-  writes: ViewBindingApplyWrite[];
-}
-
-export interface ViewBindingApplyResult {
-  ok: boolean;
-  message: string;
-  results: ViewBindingWriteResult[];
 }
 
 export interface ViewRuntimeSelectionSnapshot {
@@ -637,7 +556,7 @@ export function viewRequiresUnityConnection(
   view: { requirements?: ViewRequirements | null; capabilities?: ViewCapabilities | null },
 ): boolean {
   return view.requirements?.unityConnection
-    ?? !!(view.capabilities?.unity || view.capabilities?.bindings || view.capabilities?.writeBack);
+    ?? !!view.capabilities?.unity;
 }
 
 export function viewUnityConnectionRequiredMessage(viewName?: string | null): string {
@@ -730,6 +649,54 @@ export function viewStorageRemove(request: ViewStorageRemoveRequest): Promise<vo
   return ipcInvoke<void>("view_storage_remove", { request });
 }
 
+export function viewFsReadFile(request: ViewFsReadFileRequest): Promise<ViewFsReadFileResult> {
+  return ipcInvoke<ViewFsReadFileResult>("view_fs_read_file", { request });
+}
+
+export function viewFsWriteFile(request: ViewFsWriteFileRequest): Promise<void> {
+  return ipcInvoke<void>("view_fs_write_file", { request });
+}
+
+export function viewFsAppendFile(request: ViewFsWriteFileRequest): Promise<void> {
+  return ipcInvoke<void>("view_fs_append_file", { request });
+}
+
+export function viewFsMkdir(request: ViewFsMkdirRequest): Promise<void> {
+  return ipcInvoke<void>("view_fs_mkdir", { request });
+}
+
+export function viewFsReaddir(request: ViewFsReaddirRequest): Promise<ViewFsReaddirResult> {
+  return ipcInvoke<ViewFsReaddirResult>("view_fs_readdir", { request });
+}
+
+export function viewFsStat(request: ViewFsPathRequest): Promise<ViewFsStatResult> {
+  return ipcInvoke<ViewFsStatResult>("view_fs_stat", { request });
+}
+
+export function viewFsLstat(request: ViewFsPathRequest): Promise<ViewFsStatResult> {
+  return ipcInvoke<ViewFsStatResult>("view_fs_lstat", { request });
+}
+
+export function viewFsAccess(request: ViewFsPathRequest): Promise<void> {
+  return ipcInvoke<void>("view_fs_access", { request });
+}
+
+export function viewFsUnlink(request: ViewFsPathRequest): Promise<void> {
+  return ipcInvoke<void>("view_fs_unlink", { request });
+}
+
+export function viewFsRm(request: ViewFsRmRequest): Promise<void> {
+  return ipcInvoke<void>("view_fs_rm", { request });
+}
+
+export function viewFsRename(request: ViewFsRenameRequest): Promise<void> {
+  return ipcInvoke<void>("view_fs_rename", { request });
+}
+
+export function viewFsCopyFile(request: ViewFsCopyFileRequest): Promise<void> {
+  return ipcInvoke<void>("view_fs_copy_file", { request });
+}
+
 export function viewAutomationRespond(
   requestId: string,
   ok: boolean,
@@ -742,20 +709,4 @@ export function viewAutomationRespond(
     result: result ?? null,
     error: error ?? null,
   });
-}
-
-export function viewBindingRead(request: ViewBindingReadRequest): Promise<ViewBindingReadResult> {
-  return ipcInvoke<ViewBindingReadResult>("view_binding_read", { request });
-}
-
-export function viewBindingDiscover(request: ViewBindingDiscoverRequest): Promise<ViewBindingDiscoverResult> {
-  return ipcInvoke<ViewBindingDiscoverResult>("view_binding_discover", { request });
-}
-
-export function viewBindingWrite(request: ViewBindingWriteRequest): Promise<ViewBindingWriteResult> {
-  return ipcInvoke<ViewBindingWriteResult>("view_binding_write", { request });
-}
-
-export function viewBindingApply(request: ViewBindingApplyRequest): Promise<ViewBindingApplyResult> {
-  return ipcInvoke<ViewBindingApplyResult>("view_binding_apply", { request });
 }

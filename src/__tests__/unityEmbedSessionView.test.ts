@@ -205,11 +205,15 @@ describe("Unity embedded session view", () => {
     expect(command).toContain("position_popup_overlay_with_owner");
     expect(command).toContain('hwnd_class(parent) != "UnityContainerWndClass"');
     expect(command).toContain('title != "Locus" && title != expected_title');
-    expect(command).toContain("SetWindowLongPtrW(child, GWLP_HWNDPARENT, owner.0 as isize)");
+    expect(command).toContain("GetWindowLongPtrW(child, GWLP_HWNDPARENT) != owner_hwnd");
+    expect(command).toContain("SetWindowLongPtrW(child, GWLP_HWNDPARENT, owner_hwnd)");
     expect(command).toContain("let reparent_from_popup = (current_style & WS_CHILD.0) == 0;");
     expect(command).toContain("let needs_parent_update = current_parent != parent || reparent_from_popup;");
     expect(command).toContain("position_child_overlay");
     expect(command).toContain("ScreenToClient");
+    expect(command).toContain("ClientToScreen(parent, &mut parent_origin)");
+    expect(command).toContain("let child_matches = if needs_style_update || needs_parent_update");
+    expect(command).toContain("if !child_matches");
     expect(command).toContain("SetParent");
     expect(command).toContain("SetWindowSubclass");
     expect(command).toContain("RemoveWindowSubclass");

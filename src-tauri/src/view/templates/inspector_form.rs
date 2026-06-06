@@ -1,27 +1,64 @@
 pub(super) fn app_vue(_name: &str) -> String {
-    r##"<template>
+    r##"<script setup lang="ts">
+import { computed, onMounted, ref } from "vue";
+import { property } from "@locus/view-runtime";
+import { UnitySerializedPropertyTree } from "@locus/components";
+
+type BoundTree = Awaited<ReturnType<typeof property.fromPath>>;
+type BoundCommit = Parameters<BoundTree["writeCommit"]>[0];
+
+const statusText = ref("Ready");
+const boundTree = ref<BoundTree | null>(null);
+
+const treeSource = computed(() => {
+  const tree = boundTree.value;
+  if (!tree) return null;
+  return {
+    id: tree.bindingId,
+    targetId: tree.bindingId,
+    snapshots: tree.snapshots,
+    commit: async (commit: BoundCommit) => {
+      statusText.value = "Saving";
+      await tree.writeCommit(commit, { refresh: true });
+      statusText.value = "Ready";
+    },
+  };
+});
+
+async function refreshSelectionName() {
+  statusText.value = "Reading";
+  try {
+    boundTree.value = await property.fromPath("selection/property/m_Name", {
+      maxDepth: 2,
+      maxArrayItems: 32,
+    });
+    statusText.value = "Ready";
+  } catch (error) {
+    statusText.value = error instanceof Error ? error.message : String(error);
+  }
+}
+
+onMounted(() => {
+  void refreshSelectionName();
+});
+</script>
+
+<template>
   <main class="view-shell inspector-view">
     <header class="view-toolbar">
-      <button type="button">Apply</button>
+      <div class="toolbar-title">
+        <span>Selection Inspector</span>
+        <small>{{ statusText }}</small>
+      </div>
+      <button type="button" @click="refreshSelectionName">Refresh</button>
     </header>
 
-    <section class="inspector-grid">
-      <label>
-        <span>Target</span>
-        <input value="Assets/Materials/Example.mat" />
-      </label>
-      <label>
-        <span>Base Color</span>
-        <input value="#d9dde5" />
-      </label>
-      <label>
-        <span>Metallic</span>
-        <input value="0.00" />
-      </label>
-      <label>
-        <span>Smoothness</span>
-        <input value="0.50" />
-      </label>
+    <section class="inspector-panel">
+      <UnitySerializedPropertyTree
+        v-if="treeSource"
+        :source="treeSource"
+      />
+      <div v-else class="inspector-state">{{ statusText }}</div>
     </section>
   </main>
 </template>
@@ -60,10 +97,31 @@ body,
 .view-toolbar {
   display: flex;
   align-items: center;
-  justify-content: flex-end;
+  justify-content: space-between;
   gap: 16px;
   padding-bottom: 12px;
   border-bottom: 1px solid var(--border-color);
+}
+
+.toolbar-title {
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.toolbar-title span {
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.toolbar-title small {
+  min-width: 0;
+  color: var(--text-secondary);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 button {
@@ -76,34 +134,17 @@ button {
   font: inherit;
 }
 
-.inspector-grid {
+.inspector-panel {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
-  gap: 10px;
   max-width: 620px;
   padding-top: 16px;
 }
 
-label {
-  display: grid;
-  grid-template-columns: 150px minmax(0, 1fr);
-  align-items: center;
-  gap: 12px;
-  font-size: 13px;
-}
-
-label span {
+.inspector-state {
+  padding: 12px;
   color: var(--text-secondary);
-}
-
-input {
-  min-height: 30px;
-  padding: 0 9px;
-  border: 1px solid var(--border-color);
-  border-radius: 6px;
-  background: var(--input-bg);
-  color: var(--text-color);
-  font: inherit;
+  font-size: 12px;
 }
 "#
     .to_string()

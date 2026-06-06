@@ -67,6 +67,9 @@ describe("View host tabs", () => {
     expect(host).toContain("viewContentHide(viewId)");
     expect(host).toContain('const VIEW_CONTENT_WINDOW_LABEL_PREFIX = "view-content-"');
     expect(host).toContain("geometrySyncQueued");
+    expect(host).toContain("lastViewContentMountGeometry");
+    expect(host).toContain("viewContentMountGeometryMatches");
+    expect(host).toContain('viewHostContentLog("mount-geometry-unchanged"');
     expect(host).toContain("removeTab(tab.id, { releaseContent: false })");
 
     expect(service).toContain("export interface ViewSetTabHostRequest");

@@ -1,0 +1,21 @@
+{
+  "description": "Write a Unity SerializedProperty for View property validation or scripted View work. Provide a concrete target with propertyPath plus the JSON value to write.",
+  "parameters": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "target": {
+        "type": "object",
+        "description": "Concrete property target. Fields: kind, guid, path, scenePath, objectPath, componentType, componentIndex, propertyPath."
+      },
+      "value": {
+        "description": "JSON value to write to the SerializedProperty."
+      },
+      "writeMode": {
+        "type": ["string", "null"],
+        "description": "Optional write mode: commit or preview. Defaults to commit."
+      }
+    },
+    "required": ["target", "value"]
+  }
+}

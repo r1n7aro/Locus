@@ -53,10 +53,10 @@ pub fn register_all(registry: &mut ToolRegistry) {
     registry.register_builtin_with_load_mode(view::view_run(), ToolLoadMode::Skill);
     registry.register_builtin_with_load_mode(view::view_compile_script(), ToolLoadMode::Skill);
     registry.register_builtin_with_load_mode(view::view_call_script(), ToolLoadMode::Skill);
-    registry.register_builtin_with_load_mode(view::view_binding_read(), ToolLoadMode::Skill);
-    registry.register_builtin_with_load_mode(view::view_binding_discover(), ToolLoadMode::Skill);
-    registry.register_builtin_with_load_mode(view::view_binding_write(), ToolLoadMode::Skill);
-    registry.register_builtin_with_load_mode(view::view_binding_apply(), ToolLoadMode::Skill);
+    registry.register_builtin_with_load_mode(view::view_property_read(), ToolLoadMode::Skill);
+    registry.register_builtin_with_load_mode(view::view_property_discover(), ToolLoadMode::Skill);
+    registry.register_builtin_with_load_mode(view::view_property_write(), ToolLoadMode::Skill);
+    registry.register_builtin_with_load_mode(view::view_property_apply(), ToolLoadMode::Skill);
     registry.register_builtin_with_load_mode(view::view_capture(), ToolLoadMode::Skill);
     registry.register_builtin_with_load_mode(view::view_snapshot(), ToolLoadMode::Skill);
     registry.register_builtin_with_load_mode(view::view_action(), ToolLoadMode::Skill);

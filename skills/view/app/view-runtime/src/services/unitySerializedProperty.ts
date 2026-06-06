@@ -1,17 +1,13 @@
 import { ipcInvoke } from "./ipc";
-import type { UnitySerializedPropertySnapshot } from "../components/unity/unitySerializedValue";
+import type {
+  UnitySerializedPropertySnapshot as UnitySerializedPropertySnapshotValue,
+  UnitySerializedPropertyTargetSnapshot,
+} from "../components/unity/unitySerializedValue";
 
 export type UnitySerializedPropertyWriteMode = "commit" | "preview";
 
-export interface UnitySerializedPropertyTarget {
-  kind: string;
-  path?: string | null;
-  scenePath?: string | null;
-  objectPath?: string | null;
-  componentType?: string | null;
-  componentIndex?: number | null;
-  propertyPath?: string | null;
-}
+export type UnitySerializedPropertyTarget = UnitySerializedPropertyTargetSnapshot;
+export type UnitySerializedPropertySnapshot = UnitySerializedPropertySnapshotValue;
 
 export interface UnitySerializedPropertyReadRequest {
   bindingId?: string | null;
@@ -69,6 +65,7 @@ export interface UnitySerializedPropertyReadResult extends UnitySerializedProper
   bindingId?: string | null;
   message: string;
   target: UnitySerializedPropertyTarget;
+  properties?: UnitySerializedPropertySnapshot[];
 }
 
 export interface UnitySerializedPropertyDiscoverResult {

@@ -1,0 +1,17 @@
+{
+  "description": "Apply multiple Unity SerializedProperty writes using concrete View property targets.",
+  "parameters": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "writes": {
+        "type": "array",
+        "description": "Property writes. Each item accepts target, value, and optional writeMode. Target fields include kind, guid, path, scenePath, objectPath, componentType, componentIndex, and propertyPath.",
+        "items": {
+          "type": "object"
+        }
+      }
+    },
+    "required": ["writes"]
+  }
+}

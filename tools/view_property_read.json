@@ -1,0 +1,22 @@
+{
+  "description": "Read a Unity SerializedProperty target for View property validation. Provide a concrete target; package files are still read and edited through normal file tools.",
+  "parameters": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "target": {
+        "type": "object",
+        "description": "Concrete property target. Fields: kind, guid, path, scenePath, objectPath, componentType, componentIndex, propertyPath."
+      },
+      "maxDepth": {
+        "type": ["number", "null"],
+        "description": "Optional traversal depth cap. Defaults to the Unity bridge default."
+      },
+      "maxArrayItems": {
+        "type": ["number", "null"],
+        "description": "Optional array item cap. Defaults to the Unity bridge default."
+      }
+    },
+    "required": ["target"]
+  }
+}

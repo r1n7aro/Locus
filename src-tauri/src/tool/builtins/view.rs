@@ -311,33 +311,35 @@ pub(super) fn view_call_script() -> ToolDef {
     }
 }
 
-pub(super) fn view_binding_read() -> ToolDef {
-    let prompt = crate::prompt::parse_tool_prompt(crate::prompt::tools::VIEW_BINDING_READ);
+pub(super) fn view_property_read() -> ToolDef {
+    let prompt = crate::prompt::parse_tool_prompt(crate::prompt::tools::VIEW_PROPERTY_READ);
     ToolDef {
-        name: "view_binding_read".to_string(),
+        name: "view_property_read".to_string(),
         description: prompt.description,
         parameters: prompt.parameters,
         execute: make_exec(|args, ctx| {
             Box::pin(async move {
-                let working_dir = match working_dir_or_error(&ctx, "view_binding_read") {
+                let working_dir = match working_dir_or_error(&ctx, "view_property_read") {
                     Ok(path) => path,
                     Err(result) => return result,
                 };
-                let request =
-                    match serde_json::from_value::<crate::view::ViewBindingReadRequest>(args) {
-                        Ok(request) => request,
-                        Err(error) => {
-                            return ToolResult {
-                                output: format!(
-                                    "Error parsing view_binding_read arguments: {}",
-                                    error
-                                ),
-                                is_error: true,
-                            };
-                        }
-                    };
+                let request = match serde_json::from_value::<
+                    crate::unity_serialized_property::UnitySerializedPropertyReadRequest,
+                >(args)
+                {
+                    Ok(request) => request,
+                    Err(error) => {
+                        return ToolResult {
+                            output: format!(
+                                "Error parsing view_property_read arguments: {}",
+                                error
+                            ),
+                            is_error: true,
+                        };
+                    }
+                };
 
-                match crate::view::view_binding_read(&working_dir, request).await {
+                match crate::unity_serialized_property::read(&working_dir, request).await {
                     Ok(result) => json_output(&result),
                     Err(error) => ToolResult {
                         output: error,
@@ -349,33 +351,35 @@ pub(super) fn view_binding_read() -> ToolDef {
     }
 }
 
-pub(super) fn view_binding_discover() -> ToolDef {
-    let prompt = crate::prompt::parse_tool_prompt(crate::prompt::tools::VIEW_BINDING_DISCOVER);
+pub(super) fn view_property_discover() -> ToolDef {
+    let prompt = crate::prompt::parse_tool_prompt(crate::prompt::tools::VIEW_PROPERTY_DISCOVER);
     ToolDef {
-        name: "view_binding_discover".to_string(),
+        name: "view_property_discover".to_string(),
         description: prompt.description,
         parameters: prompt.parameters,
         execute: make_exec(|args, ctx| {
             Box::pin(async move {
-                let working_dir = match working_dir_or_error(&ctx, "view_binding_discover") {
+                let working_dir = match working_dir_or_error(&ctx, "view_property_discover") {
                     Ok(path) => path,
                     Err(result) => return result,
                 };
-                let request =
-                    match serde_json::from_value::<crate::view::ViewBindingDiscoverRequest>(args) {
-                        Ok(request) => request,
-                        Err(error) => {
-                            return ToolResult {
-                                output: format!(
-                                    "Error parsing view_binding_discover arguments: {}",
-                                    error
-                                ),
-                                is_error: true,
-                            };
-                        }
-                    };
+                let request = match serde_json::from_value::<
+                    crate::unity_serialized_property::UnitySerializedPropertyDiscoverRequest,
+                >(args)
+                {
+                    Ok(request) => request,
+                    Err(error) => {
+                        return ToolResult {
+                            output: format!(
+                                "Error parsing view_property_discover arguments: {}",
+                                error
+                            ),
+                            is_error: true,
+                        };
+                    }
+                };
 
-                match crate::view::view_binding_discover(&working_dir, request).await {
+                match crate::unity_serialized_property::discover(&working_dir, request).await {
                     Ok(result) => json_output(&result),
                     Err(error) => ToolResult {
                         output: error,
@@ -387,33 +391,35 @@ pub(super) fn view_binding_discover() -> ToolDef {
     }
 }
 
-pub(super) fn view_binding_write() -> ToolDef {
-    let prompt = crate::prompt::parse_tool_prompt(crate::prompt::tools::VIEW_BINDING_WRITE);
+pub(super) fn view_property_write() -> ToolDef {
+    let prompt = crate::prompt::parse_tool_prompt(crate::prompt::tools::VIEW_PROPERTY_WRITE);
     ToolDef {
-        name: "view_binding_write".to_string(),
+        name: "view_property_write".to_string(),
         description: prompt.description,
         parameters: prompt.parameters,
         execute: make_exec(|args, ctx| {
             Box::pin(async move {
-                let working_dir = match working_dir_or_error(&ctx, "view_binding_write") {
+                let working_dir = match working_dir_or_error(&ctx, "view_property_write") {
                     Ok(path) => path,
                     Err(result) => return result,
                 };
-                let request =
-                    match serde_json::from_value::<crate::view::ViewBindingWriteRequest>(args) {
-                        Ok(request) => request,
-                        Err(error) => {
-                            return ToolResult {
-                                output: format!(
-                                    "Error parsing view_binding_write arguments: {}",
-                                    error
-                                ),
-                                is_error: true,
-                            };
-                        }
-                    };
+                let request = match serde_json::from_value::<
+                    crate::unity_serialized_property::UnitySerializedPropertyWriteRequest,
+                >(args)
+                {
+                    Ok(request) => request,
+                    Err(error) => {
+                        return ToolResult {
+                            output: format!(
+                                "Error parsing view_property_write arguments: {}",
+                                error
+                            ),
+                            is_error: true,
+                        };
+                    }
+                };
 
-                match crate::view::view_binding_write(&working_dir, request).await {
+                match crate::unity_serialized_property::write(&working_dir, request).await {
                     Ok(result) => json_output(&result),
                     Err(error) => ToolResult {
                         output: error,
@@ -425,33 +431,35 @@ pub(super) fn view_binding_write() -> ToolDef {
     }
 }
 
-pub(super) fn view_binding_apply() -> ToolDef {
-    let prompt = crate::prompt::parse_tool_prompt(crate::prompt::tools::VIEW_BINDING_APPLY);
+pub(super) fn view_property_apply() -> ToolDef {
+    let prompt = crate::prompt::parse_tool_prompt(crate::prompt::tools::VIEW_PROPERTY_APPLY);
     ToolDef {
-        name: "view_binding_apply".to_string(),
+        name: "view_property_apply".to_string(),
         description: prompt.description,
         parameters: prompt.parameters,
         execute: make_exec(|args, ctx| {
             Box::pin(async move {
-                let working_dir = match working_dir_or_error(&ctx, "view_binding_apply") {
+                let working_dir = match working_dir_or_error(&ctx, "view_property_apply") {
                     Ok(path) => path,
                     Err(result) => return result,
                 };
-                let request =
-                    match serde_json::from_value::<crate::view::ViewBindingApplyRequest>(args) {
-                        Ok(request) => request,
-                        Err(error) => {
-                            return ToolResult {
-                                output: format!(
-                                    "Error parsing view_binding_apply arguments: {}",
-                                    error
-                                ),
-                                is_error: true,
-                            };
-                        }
-                    };
+                let request = match serde_json::from_value::<
+                    crate::unity_serialized_property::UnitySerializedPropertyApplyRequest,
+                >(args)
+                {
+                    Ok(request) => request,
+                    Err(error) => {
+                        return ToolResult {
+                            output: format!(
+                                "Error parsing view_property_apply arguments: {}",
+                                error
+                            ),
+                            is_error: true,
+                        };
+                    }
+                };
 
-                match crate::view::view_binding_apply(&working_dir, request).await {
+                match crate::unity_serialized_property::apply(&working_dir, request).await {
                     Ok(result) => json_output(&result),
                     Err(error) => ToolResult {
                         output: error,

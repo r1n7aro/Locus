@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
@@ -330,6 +330,20 @@ impl AgentDefRegistry {
     }
 
     fn normalize_agent_tools(agent_id: &str, tools: &mut Vec<String>) {
+        for tool in tools.iter_mut() {
+            let normalized = match tool.as_str() {
+                "view_binding_read" => "view_property_read",
+                "view_binding_discover" => "view_property_discover",
+                "view_binding_write" => "view_property_write",
+                "view_binding_apply" => "view_property_apply",
+                _ => continue,
+            };
+            *tool = normalized.to_string();
+        }
+
+        let mut seen = HashSet::new();
+        tools.retain(|tool| seen.insert(tool.clone()));
+
         if !matches!(canonical_agent_id(agent_id), "dev" | KNOWLEDGE_AGENT_ID) {
             return;
         }
@@ -466,6 +480,46 @@ mod tests {
     }
 
     #[test]
+    fn normalize_agent_tools_replaces_legacy_view_property_aliases() {
+        let mut tools = vec![
+            "read".to_string(),
+            "view_binding_read".to_string(),
+            "view_property_read".to_string(),
+            "view_binding_discover".to_string(),
+            "view_binding_write".to_string(),
+            "view_binding_apply".to_string(),
+        ];
+
+        AgentDefRegistry::normalize_agent_tools("dev", &mut tools);
+
+        for tool in [
+            "view_property_read",
+            "view_property_discover",
+            "view_property_write",
+            "view_property_apply",
+        ] {
+            assert!(tools.iter().any(|name| name == tool));
+        }
+
+        for legacy_tool in [
+            "view_binding_read",
+            "view_binding_discover",
+            "view_binding_write",
+            "view_binding_apply",
+        ] {
+            assert!(tools.iter().all(|name| name != legacy_tool));
+        }
+
+        assert_eq!(
+            tools
+                .iter()
+                .filter(|name| name.as_str() == "view_property_read")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn dev_agent_exposes_knowledge_mutation_tools() {
         assert_knowledge_mutation_tools("dev");
     }
@@ -479,6 +533,38 @@ mod tests {
             agent.tools.iter().any(|name| name == "graph_view"),
             "dev agent should expose graph_view"
         );
+    }
+
+    #[test]
+    fn dev_agent_exposes_view_property_tools() {
+        let registry = AgentDefRegistry::load(Some(repo_agent_dir().as_path()), None);
+        let agent = registry.get("dev").expect("dev agent should be loadable");
+
+        for tool in [
+            "view_property_read",
+            "view_property_discover",
+            "view_property_write",
+            "view_property_apply",
+        ] {
+            assert!(
+                agent.tools.iter().any(|name| name == tool),
+                "dev agent should expose '{}'",
+                tool
+            );
+        }
+
+        for legacy_tool in [
+            "view_binding_read",
+            "view_binding_discover",
+            "view_binding_write",
+            "view_binding_apply",
+        ] {
+            assert!(
+                agent.tools.iter().all(|name| name != legacy_tool),
+                "dev agent should not expose legacy tool '{}'",
+                legacy_tool
+            );
+        }
     }
 
     #[test]

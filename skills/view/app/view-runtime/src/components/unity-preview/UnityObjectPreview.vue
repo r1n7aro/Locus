@@ -31,8 +31,38 @@ const workspacePreviewTargetCache = new Map<string, {
   promise?: ReturnType<typeof previewWorkspaceAssetTarget>;
 }>();
 
+const unityObjectPreviewExpandedStateCache = new Map<string, boolean>();
+const UNITY_OBJECT_PREVIEW_EXPANDED_STATE_CACHE_LIMIT = 2000;
+
 function normalizedPreviewCacheKey(value: string): string {
   return value.trim().replace(/\\/g, "/").replace(/\/+$/g, "");
+}
+
+function normalizedPreviewStateKey(value: string | undefined): string {
+  return (value ?? "").trim();
+}
+
+function readUnityObjectPreviewExpandedState(stateKey: string | undefined): boolean | null {
+  const key = normalizedPreviewStateKey(stateKey);
+  if (!key || !unityObjectPreviewExpandedStateCache.has(key)) return null;
+  const expanded = unityObjectPreviewExpandedStateCache.get(key)!;
+  unityObjectPreviewExpandedStateCache.delete(key);
+  unityObjectPreviewExpandedStateCache.set(key, expanded);
+  return expanded;
+}
+
+function rememberUnityObjectPreviewExpandedState(stateKey: string | undefined, expanded: boolean) {
+  const key = normalizedPreviewStateKey(stateKey);
+  if (!key) return;
+  if (unityObjectPreviewExpandedStateCache.has(key)) {
+    unityObjectPreviewExpandedStateCache.delete(key);
+  }
+  unityObjectPreviewExpandedStateCache.set(key, expanded);
+  while (unityObjectPreviewExpandedStateCache.size > UNITY_OBJECT_PREVIEW_EXPANDED_STATE_CACHE_LIMIT) {
+    const oldestKey = unityObjectPreviewExpandedStateCache.keys().next().value;
+    if (!oldestKey) break;
+    unityObjectPreviewExpandedStateCache.delete(oldestKey);
+  }
 }
 
 function loadWorkspaceAssetPreviewCached(path: string): ReturnType<typeof previewWorkspaceAsset> {
@@ -144,11 +174,18 @@ import {
   type UnityObjectDrawerInput,
 } from "../../services/unityObjectDrawer";
 import type { UnitySerializedPropertyCommitEvent } from "../unity/unitySerializedValue";
+import {
+  createUnityPropertyRuntime,
+  unityBoundPropertySnapshots,
+  type UnityBoundPropertyApplyWrite,
+  type UnityBoundPropertyTree,
+} from "../unity/unityPropertyBinding";
 import { t } from "../../i18n";
 import { isUnityConnectionError, normalizeAppError } from "../../services/errors";
 import {
   applyUnitySerializedProperties,
   readUnitySerializedProperty,
+  writeUnitySerializedProperty,
   type UnitySerializedPropertyTarget,
 } from "../../services/unitySerializedProperty";
 import BinaryPreviewHost from "../diff/BinaryPreviewHost.vue";
@@ -167,6 +204,12 @@ import {
 import UnityObjectEditorPanel from "./UnityObjectEditorPanel.vue";
 import UnityObjectIdentity from "./UnityObjectIdentity.vue";
 
+const locusInspectorPropertyRuntime = createUnityPropertyRuntime({
+  read: readUnitySerializedProperty,
+  write: writeUnitySerializedProperty,
+  apply: applyUnitySerializedProperties,
+});
+
 const props = withDefaults(defineProps<{
   model: UnityObjectPreviewInput | UnityObjectPreviewModel;
   level?: UnityObjectPreviewLevel;
@@ -184,6 +227,7 @@ const props = withDefaults(defineProps<{
   objectDrawers?: UnityObjectDrawerInput;
   disableObjectDrawer?: boolean;
   autoLoadPreview?: boolean;
+  previewStateKey?: string;
 }>(), {
   level: "inline",
   loading: false,
@@ -200,6 +244,7 @@ const props = withDefaults(defineProps<{
   objectDrawers: undefined,
   disableObjectDrawer: false,
   autoLoadPreview: true,
+  previewStateKey: "",
 });
 
 const emit = defineEmits<{
@@ -232,6 +277,7 @@ const targetCache = ref<Map<string, SemanticTargetInspector>>(new Map());
 const autoTargetLoading = ref(false);
 const autoTargetError = ref("");
 const livePropertyTree = ref<UnityObjectPropertyTreeInput | null>(null);
+const liveBoundPropertyTree = ref<UnityBoundPropertyTree | null>(null);
 const livePropertyLoading = ref(false);
 const livePropertyError = ref("");
 let autoPreviewRun = 0;
@@ -259,6 +305,7 @@ let disposed = false;
 
 interface PendingEditorPropertyWrite {
   targetKey: string;
+  refreshTargetKey: string;
   bindingId: string;
   target: UnitySerializedPropertyTarget;
   value: unknown;
@@ -275,6 +322,30 @@ const EDITOR_WRITE_MIN_INTERVAL_MS = 90;
 const interactiveMoveKeys = new Set<string>();
 const UNITY_ASSET_REF_ROOT_RE = /^(?:Assets|Packages|ProjectSettings)(?:\/|$)/i;
 const UNITY_SCENE_OBJECT_PATH_RE = /^((?:Assets|Packages)\/.+?\.unity)\/(.+)$/i;
+
+function unitySerializedTargetKey(target: UnitySerializedPropertyTarget | null | undefined): string {
+  if (!target) return "";
+  return [
+    target.kind,
+    target.path ?? "",
+    target.scenePath ?? "",
+    target.objectPath ?? "",
+    target.objectFileId ?? "",
+    target.targetFileId ?? "",
+    target.componentType ?? "",
+    target.componentIndex ?? "",
+  ].join("|");
+}
+
+function unitySerializedTargetWithProperty(
+  target: UnitySerializedPropertyTarget,
+  propertyPath: string,
+): UnitySerializedPropertyTarget {
+  return {
+    ...target,
+    propertyPath,
+  };
+}
 
 const previewPayload = computed(() => objectModel.value.previewPayload ?? autoPreviewPayload.value);
 const structuredPayload = computed(() => (
@@ -302,14 +373,18 @@ const liveSerializedTarget = computed<UnitySerializedPropertyTarget | null>(() =
   const model = objectModel.value;
   const path = model.ref.path.trim().replace(/\\/g, "/").replace(/\/+$/g, "");
   if (!path) return null;
+  const objectFileId = Number.isFinite(model.ref.fileId) && model.ref.fileId !== 0
+    ? model.ref.fileId
+    : undefined;
 
   if (model.ref.kind === "sceneObject") {
     const match = path.match(UNITY_SCENE_OBJECT_PATH_RE);
-    if (!match) return { kind: "gameObject", objectPath: path };
+    if (!match) return { kind: "gameObject", objectPath: path, objectFileId };
     return {
       kind: "gameObject",
       scenePath: match[1],
       objectPath: match[2].replace(/^\/+|\/+$/g, ""),
+      objectFileId,
     };
   }
 
@@ -319,16 +394,7 @@ const liveSerializedTarget = computed<UnitySerializedPropertyTarget | null>(() =
   return { kind: "asset", path };
 });
 const liveSerializedTargetKey = computed(() => {
-  const target = liveSerializedTarget.value;
-  if (!target) return "";
-  return [
-    target.kind,
-    target.path ?? "",
-    target.scenePath ?? "",
-    target.objectPath ?? "",
-    target.componentType ?? "",
-    target.componentIndex ?? "",
-  ].join("|");
+  return unitySerializedTargetKey(liveSerializedTarget.value);
 });
 const canAutoLoadPreview = computed(() => (
   props.autoLoadPreview
@@ -388,7 +454,6 @@ const editorPropertyTreeBinding = computed<InspectorPropertyTreeBinding>(() => {
     disabled: props.disabled || livePropertyLoading.value,
     readonly: props.readonly,
     editable: hasEditableUnityPropertySnapshot(propertyTree),
-    commit: commitEditorPropertyTree,
   });
 });
 const previewSourceState = computed<UnityObjectPreviewSourceState>(() => {
@@ -529,6 +594,7 @@ function previewErrorDisplayMessage(error: string): string {
 
 function toggleInspectorCollapsed() {
   inspectorCollapsed.value = !inspectorCollapsed.value;
+  rememberUnityObjectPreviewExpandedState(props.previewStateKey, !inspectorCollapsed.value);
 }
 
 function handlePreviewRootClick(event: MouseEvent) {
@@ -590,19 +656,24 @@ async function loadLivePropertyTree(force = false, options: { background?: boole
   if (!background) livePropertyLoading.value = true;
   livePropertyError.value = "";
   try {
-    const result = await readUnitySerializedProperty({
-      target,
+    const boundTree = await locusInspectorPropertyRuntime.readTree(target, {
+      idPrefix: "unity-object",
       maxDepth: 5,
       maxArrayItems: 128,
     });
     if (run !== livePropertyRun || liveSerializedTargetKey.value === "") return null;
     if (background && writeVersion !== editorWriteVersion) return livePropertyTree.value;
-    livePropertyTree.value = result;
-    return result;
+    const snapshots = unityBoundPropertySnapshots(boundTree);
+    liveBoundPropertyTree.value = boundTree;
+    livePropertyTree.value = (snapshots.length > 1
+      ? snapshots
+      : snapshots[0] ?? null) as UnityObjectPropertyTreeInput | null;
+    return boundTree;
   } catch (error) {
     if (run !== livePropertyRun) return null;
     if (background && writeVersion !== editorWriteVersion) return livePropertyTree.value;
     if (!background) livePropertyTree.value = null;
+    if (!background) liveBoundPropertyTree.value = null;
     livePropertyError.value = normalizeAppError(error).message;
     return null;
   } finally {
@@ -613,15 +684,45 @@ async function loadLivePropertyTree(force = false, options: { background?: boole
 }
 
 function toUnityCommitEvent(commit: InspectorPropertyCommit): UnitySerializedPropertyCommitEvent {
+  const target = commitRootTarget(commit);
   return {
     propertyPath: commit.propertyPath,
     value: commit.value,
     property: commit.snapshot as UnitySerializedPropertyCommitEvent["property"],
+    target,
   };
 }
 
+function propertyTreeSnapshots(): UnityObjectPropertyTreeInput[] {
+  const source = effectivePropertyTree.value;
+  if (!source) return [];
+  return Array.isArray(source) ? source : [source];
+}
+
+function snapshotBindingTarget(snapshot: unknown): UnitySerializedPropertyTarget | null {
+  if (!snapshot || typeof snapshot !== "object") return null;
+  const source = snapshot as {
+    bindingTarget?: UnitySerializedPropertyTarget | null;
+    target?: UnitySerializedPropertyTarget | null;
+  };
+  return source.bindingTarget ?? source.target ?? null;
+}
+
+function snapshotTargetKey(snapshot: unknown): string {
+  return unitySerializedTargetKey(snapshotBindingTarget(snapshot));
+}
+
+function commitRootTarget(commit: InspectorPropertyCommit): UnitySerializedPropertyTarget | null {
+  return snapshotBindingTarget(commit.property.root.snapshot)
+    ?? snapshotBindingTarget(commit.snapshot);
+}
+
 function commitFromUnityEvent(event: UnitySerializedPropertyCommitEvent): InspectorPropertyCommit | null {
-  const tree = createPropertyTree(effectivePropertyTree.value ?? event.property, {
+  const eventTargetKey = unitySerializedTargetKey(event.target);
+  const matchedSnapshot = eventTargetKey
+    ? propertyTreeSnapshots().find((snapshot) => snapshotTargetKey(snapshot) === eventTargetKey)
+    : null;
+  const tree = createPropertyTree(matchedSnapshot ?? effectivePropertyTree.value ?? event.property, {
     id: editorPropertyTreeBinding.value.id,
     targetId: editorPropertyTreeBinding.value.targetId,
     disabled: editorPropertyTreeBinding.value.disabled,
@@ -657,7 +758,7 @@ function queueEditorWriteRefresh(writes: PendingEditorPropertyWrite[]) {
   if (disposed) return;
   const currentTargetKey = liveSerializedTargetKey.value;
   if (!currentTargetKey) return;
-  if (writes.some((write) => write.targetKey === currentTargetKey)) {
+  if (writes.some((write) => write.refreshTargetKey === currentTargetKey)) {
     editorWriteRefreshTargetKey = currentTargetKey;
   }
 }
@@ -692,19 +793,23 @@ async function flushEditorWrites() {
   editorWriteInFlight = true;
   if (!disposed) livePropertyError.value = "";
   try {
-    const result = await applyUnitySerializedProperties({
-      writes: writes.map((write) => ({
-        bindingId: write.bindingId,
-        target: write.target,
-        value: write.value,
-        writeMode: write.writeMode,
-      })),
-    });
+    const propertyWrites: UnityBoundPropertyApplyWrite[] = writes.map((write) => ({
+      bindingId: write.bindingId,
+      target: write.target,
+      value: write.value,
+      writeMode: write.writeMode,
+    }));
+    const result = liveBoundPropertyTree.value
+      ? await liveBoundPropertyTree.value.apply(propertyWrites, { refresh: false })
+      : await locusInspectorPropertyRuntime.apply(propertyWrites, { refresh: false });
+    const successfulWrites = writes.filter((write, index) =>
+      write.writeMode !== "preview" && result.results[index]?.ok === true
+    );
+    if (successfulWrites.length > 0) queueEditorWriteRefresh(successfulWrites);
     const failed = result.results.find((item) => !item.ok);
     if (!result.ok || failed) {
       throw new Error(failed?.message || result.message || "Failed to apply serialized property writes.");
     }
-    queueEditorWriteRefresh(writes);
   } catch (error) {
     if (!disposed) {
       const message = normalizeAppError(error).message;
@@ -733,15 +838,16 @@ function commitEditorPropertyTree(
   commit: InspectorPropertyCommit,
   writeMode: PendingEditorPropertyWrite["writeMode"] = "commit",
 ) {
-  const target = liveSerializedTarget.value;
+  const target = commitRootTarget(commit) ?? liveSerializedTarget.value;
   if (!target) {
     emit("commit", toUnityCommitEvent(commit));
     return;
   }
 
   const propertyPath = commit.propertyPath.trim();
-  const targetKey = liveSerializedTargetKey.value;
-  if (!propertyPath || !targetKey) {
+  const targetKey = unitySerializedTargetKey(target);
+  const refreshTargetKey = liveSerializedTargetKey.value;
+  if (!propertyPath || !targetKey || !refreshTargetKey) {
     emit("blocked", objectModel.value);
     return;
   }
@@ -749,11 +855,9 @@ function commitEditorPropertyTree(
   editorWriteVersion += 1;
   pendingEditorWrites.set(editorPropertyWriteKey(targetKey, propertyPath), {
     targetKey,
+    refreshTargetKey,
     bindingId: editorPropertyTreeBinding.value.id,
-    target: {
-      ...target,
-      propertyPath,
-    },
+    target: unitySerializedTargetWithProperty(target, propertyPath),
     value: commit.value,
     writeMode,
     order: ++editorWriteOrder,
@@ -1152,6 +1256,17 @@ watch(
 );
 
 watch(
+  () => [props.previewStateKey, props.level] as const,
+  ([previewStateKey, level]) => {
+    if (level !== "inspector") return;
+    const expanded = readUnityObjectPreviewExpandedState(previewStateKey);
+    if (expanded === null) return;
+    inspectorCollapsed.value = !expanded;
+  },
+  { immediate: true },
+);
+
+watch(
   () => [props.level, structuredPayload.value?.previewKey ?? "", defaultStructuredTargetId.value ?? ""] as const,
   ([level, previewKey, targetId]) => {
     if (level !== "inspector" || !previewKey || !targetId || inspector.value) return;
@@ -1209,6 +1324,7 @@ onBeforeUnmount(() => {
       :property-drawers="propertyDrawers"
       :object-drawers="objectDrawers"
       :auto-load-preview="autoLoadPreview"
+      :preview-state-key="previewStateKey"
       disable-object-drawer
       @select="emit('select', $event)"
       @preview="handleEditorPreview"
@@ -1238,6 +1354,7 @@ onBeforeUnmount(() => {
     :readonly="readonly"
     :property-drawers="propertyDrawers"
     @preview="handleEditorPreview"
+    @commit="handleEditorCommit"
     @blocked="emit('blocked', $event)"
   />
 
@@ -1276,6 +1393,7 @@ onBeforeUnmount(() => {
         :show-header="false"
         :property-drawers="propertyDrawers"
         @preview="handleEditorPreview"
+        @commit="handleEditorCommit"
         @blocked="emit('blocked', $event)"
       />
       <div
