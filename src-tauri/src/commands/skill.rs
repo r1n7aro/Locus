@@ -1048,6 +1048,53 @@ fn strip_utf8_bom(content: &str) -> &str {
     content.strip_prefix('\u{feff}').unwrap_or(content)
 }
 
+fn find_package_frontmatter_close(content: &str) -> Option<(usize, usize)> {
+    let bytes = content.as_bytes();
+    let mut line_start = 0usize;
+
+    while line_start <= bytes.len() {
+        let mut line_end = line_start;
+        while line_end < bytes.len() && bytes[line_end] != b'\n' && bytes[line_end] != b'\r' {
+            line_end += 1;
+        }
+
+        let mut next_line_start = line_end;
+        if next_line_start < bytes.len() {
+            if bytes[next_line_start] == b'\r'
+                && next_line_start + 1 < bytes.len()
+                && bytes[next_line_start + 1] == b'\n'
+            {
+                next_line_start += 2;
+            } else {
+                next_line_start += 1;
+            }
+        }
+
+        if &content[line_start..line_end] == "---" {
+            let yaml_end = if line_start >= 2
+                && bytes[line_start - 2] == b'\r'
+                && bytes[line_start - 1] == b'\n'
+            {
+                line_start - 2
+            } else if line_start >= 1
+                && (bytes[line_start - 1] == b'\n' || bytes[line_start - 1] == b'\r')
+            {
+                line_start - 1
+            } else {
+                line_start
+            };
+            return Some((yaml_end, next_line_start));
+        }
+
+        if next_line_start == line_start || next_line_start >= bytes.len() {
+            break;
+        }
+        line_start = next_line_start;
+    }
+
+    None
+}
+
 fn split_optional_package_frontmatter(
     content: &str,
 ) -> Result<(SkillPackageDocumentFrontmatter, String), String> {
@@ -1063,13 +1110,11 @@ fn split_optional_package_frontmatter(
         ));
     };
 
-    let (yaml, rest) = if let Some(index) = after_open.find("\r\n---\r\n") {
-        (&after_open[..index], &after_open[index + 7..])
-    } else if let Some(index) = after_open.find("\n---\n") {
-        (&after_open[..index], &after_open[index + 5..])
-    } else {
+    let Some((yaml_end, rest_start)) = find_package_frontmatter_close(after_open) else {
         return Err("Skill package document frontmatter is not terminated".to_string());
     };
+    let yaml = &after_open[..yaml_end];
+    let rest = &after_open[rest_start..];
     let frontmatter = serde_yaml::from_str::<SkillPackageDocumentFrontmatter>(yaml)
         .map_err(|e| format!("Failed to parse Skill package document frontmatter: {}", e))?;
     Ok((frontmatter, rest.to_string()))
@@ -1204,16 +1249,46 @@ pub(crate) fn list_skill_packages_sync() -> Vec<SkillPackageRecord> {
     let mut seen = BTreeSet::new();
 
     for package_dir in app_skill_package_dirs() {
-        let Ok(entries) = std::fs::read_dir(&package_dir) else {
-            continue;
+        let entries = match std::fs::read_dir(&package_dir) {
+            Ok(entries) => entries,
+            Err(error) => {
+                tracing::error!(
+                    log_module = "Skill",
+                    package_dir = %package_dir.display(),
+                    error = %error,
+                    "failed to read app Skill package directory"
+                );
+                continue;
+            }
         };
-        for entry in entries.flatten() {
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    tracing::error!(
+                        log_module = "Skill",
+                        package_dir = %package_dir.display(),
+                        error = %error,
+                        "failed to read app Skill package directory entry"
+                    );
+                    continue;
+                }
+            };
             let root = entry.path();
             if !is_skill_package_root(&root) {
                 continue;
             }
-            let Ok(record) = load_skill_package_record(&root) else {
-                continue;
+            let record = match load_skill_package_record(&root) {
+                Ok(record) => record,
+                Err(error) => {
+                    tracing::error!(
+                        log_module = "Skill",
+                        package_root = %root.display(),
+                        error = %error,
+                        "failed to load app Skill package"
+                    );
+                    continue;
+                }
             };
             if seen.insert(record.manifest.id.clone()) {
                 records.push(record);
@@ -1222,8 +1297,19 @@ pub(crate) fn list_skill_packages_sync() -> Vec<SkillPackageRecord> {
     }
 
     for source in crate::plugin::installed_skill_sources("") {
-        let Ok(record) = load_plugin_skill_package_record(&source) else {
-            continue;
+        let record = match load_plugin_skill_package_record(&source) {
+            Ok(record) => record,
+            Err(error) => {
+                tracing::error!(
+                    log_module = "Skill",
+                    package_root = %source.root.display(),
+                    plugin_id = %source.plugin_id,
+                    plugin_scope = %source.scope.as_str(),
+                    error = %error,
+                    "failed to load app plugin Skill package"
+                );
+                continue;
+            }
         };
         push_skill_package_record(&mut records, record, false);
     }
@@ -1240,8 +1326,20 @@ pub(crate) fn list_skill_packages_sync_for_working_dir(
         if source.scope != crate::plugin::PluginInstallScope::Project {
             continue;
         }
-        let Ok(record) = load_plugin_skill_package_record(&source) else {
-            continue;
+        let record = match load_plugin_skill_package_record(&source) {
+            Ok(record) => record,
+            Err(error) => {
+                tracing::error!(
+                    log_module = "Skill",
+                    workspace = working_dir,
+                    package_root = %source.root.display(),
+                    plugin_id = %source.plugin_id,
+                    plugin_scope = %source.scope.as_str(),
+                    error = %error,
+                    "failed to load project plugin Skill package"
+                );
+                continue;
+            }
         };
         push_skill_package_record(&mut records, record, true);
     }
@@ -1260,16 +1358,46 @@ fn find_skill_package(package_id: &str) -> Result<SkillPackageRecord, String> {
     }
 
     for package_dir in app_skill_package_dirs() {
-        let Ok(entries) = std::fs::read_dir(&package_dir) else {
-            continue;
+        let entries = match std::fs::read_dir(&package_dir) {
+            Ok(entries) => entries,
+            Err(error) => {
+                tracing::error!(
+                    log_module = "Skill",
+                    package_dir = %package_dir.display(),
+                    error = %error,
+                    "failed to read app Skill package directory"
+                );
+                continue;
+            }
         };
-        for entry in entries.flatten() {
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    tracing::error!(
+                        log_module = "Skill",
+                        package_dir = %package_dir.display(),
+                        error = %error,
+                        "failed to read app Skill package directory entry"
+                    );
+                    continue;
+                }
+            };
             let root = entry.path();
             if !is_skill_package_root(&root) {
                 continue;
             }
-            let Ok(record) = load_skill_package_record(&root) else {
-                continue;
+            let record = match load_skill_package_record(&root) {
+                Ok(record) => record,
+                Err(error) => {
+                    tracing::error!(
+                        log_module = "Skill",
+                        package_root = %root.display(),
+                        error = %error,
+                        "failed to load app Skill package"
+                    );
+                    continue;
+                }
             };
             if record.manifest.id == normalized_id {
                 return Ok(record);
@@ -1334,13 +1462,34 @@ fn find_skill_package_in_parent(
             e
         )
     })?;
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                tracing::error!(
+                    log_module = "Skill",
+                    package_dir = %package_parent.display(),
+                    error = %error,
+                    "failed to read Skill package directory entry"
+                );
+                continue;
+            }
+        };
         let root = entry.path();
         if !is_skill_package_root(&root) {
             continue;
         }
-        let Ok(record) = load_skill_package_record(&root) else {
-            continue;
+        let record = match load_skill_package_record(&root) {
+            Ok(record) => record,
+            Err(error) => {
+                tracing::error!(
+                    log_module = "Skill",
+                    package_root = %root.display(),
+                    error = %error,
+                    "failed to load Skill package"
+                );
+                continue;
+            }
         };
         if record.manifest.id == normalized_id {
             return Ok(record);
@@ -3915,7 +4064,19 @@ fn locate_imported_skill_package_root(root: &Path) -> Result<PathBuf, String> {
     let mut package_roots = Vec::new();
     let entries = std::fs::read_dir(root)
         .map_err(|e| format!("Failed to read imported Skill package: {}", e))?;
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                tracing::error!(
+                    log_module = "Skill",
+                    package_dir = %root.display(),
+                    error = %error,
+                    "failed to read imported Skill package directory entry"
+                );
+                continue;
+            }
+        };
         let path = entry.path();
         if path.is_dir() && is_skill_package_root(&path) {
             package_roots.push(path);
@@ -4651,6 +4812,16 @@ Create a project skill.
         assert!(!levels.has_l0);
         assert!(!levels.has_l1);
         assert!(!levels.has_l2);
+    }
+
+    #[test]
+    fn split_package_frontmatter_accepts_mixed_line_endings() {
+        let raw = "---\r\ntools:\r\n  - view_list\n---\r\n\r\n# View\r\n";
+
+        let (frontmatter, body) = super::split_optional_package_frontmatter(raw).unwrap();
+
+        assert_eq!(frontmatter.tools, vec!["view_list"]);
+        assert_eq!(body, "\r\n# View\r\n");
     }
 
     #[test]
