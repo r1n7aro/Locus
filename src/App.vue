@@ -91,6 +91,7 @@ const UnityEmbeddedSessionView = defineAsyncComponent(() => import("./components
 const UnityEmbedTestView = defineAsyncComponent(() => import("./components/UnityEmbedTestView.vue"));
 const OnboardingView = defineAsyncComponent(() => import("./components/OnboardingView.vue"));
 const FileDiffOverlay = defineAsyncComponent(() => import("./components/diff/FileDiffOverlay.vue"));
+const showPluginEntry = false;
 
 initTheme(isUnityEmbedWindow ? "unityEmbed" : "main");
 initFonts();
@@ -261,7 +262,7 @@ watch(() => uiStore.viewMounted, (mounted) => {
 }, { immediate: true });
 
 watch(() => uiStore.pluginsMounted, (mounted) => {
-  if (!mounted) return;
+  if (!showPluginEntry || !mounted) return;
   void pluginView.ensureLoaded();
 }, { immediate: true });
 
@@ -822,6 +823,7 @@ watch(() => projectStore.workingDir, () => {
           @click="uiStore.setTab('views')"
         >{{ t("app.tab.views") }}</button>
         <button
+          v-if="showPluginEntry"
           class="tab-item"
           :class="{ active: uiStore.activeTab === 'plugins' }"
           @click="uiStore.setTab('plugins')"
@@ -1019,12 +1021,12 @@ watch(() => projectStore.workingDir, () => {
 
         <component
           :is="pluginViewComponent"
-          v-if="uiStore.pluginsMounted && pluginViewComponent"
+          v-if="showPluginEntry && uiStore.pluginsMounted && pluginViewComponent"
           v-show="uiStore.activeTab === 'plugins'"
           :working-dir="projectStore.workingDir"
         />
         <div
-          v-else-if="uiStore.pluginsMounted && uiStore.activeTab === 'plugins'"
+          v-else-if="showPluginEntry && uiStore.pluginsMounted && uiStore.activeTab === 'plugins'"
           class="tab-loading-state"
           :class="{ 'is-loading': pluginViewLoading, 'is-error': !!pluginViewError }"
         >
