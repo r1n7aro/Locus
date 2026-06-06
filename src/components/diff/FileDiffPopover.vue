@@ -127,7 +127,13 @@ watch(() => props.payload, () => nextTick(schedulePositionUpdate));
         </span>
       </div>
       <div class="popover-body">
-        <FileDiffViewer :payload="payload" mode="unified" :compact="true" />
+        <FileDiffViewer
+          :payload="payload"
+          mode="unified"
+          :compact="true"
+          :hide-builtin-tabs="true"
+          :hide-semantic-summary="true"
+        />
       </div>
       <button type="button" class="popover-hint" @click.stop="emit('open')">Click to see full diff</button>
     </div>

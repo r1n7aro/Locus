@@ -52,4 +52,14 @@ describe("file diff popover interaction", () => {
     expect(popover).not.toContain("height: min(var(--diff-popover-height");
     expect(popover).not.toContain("min-height: min(360px");
   });
+
+  it("keeps the hover preview chrome minimal", () => {
+    const popover = read("src/components/diff/FileDiffPopover.vue");
+    const viewer = read("src/components/diff/FileDiffViewer.vue");
+
+    expect(popover).toContain(':hide-builtin-tabs="true"');
+    expect(popover).toContain(':hide-semantic-summary="true"');
+    expect(viewer).toContain("hideSemanticSummary?: boolean;");
+    expect(viewer).toContain('v-if="!hideSemanticSummary" class="semantic-summary"');
+  });
 });

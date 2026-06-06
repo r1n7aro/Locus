@@ -13,7 +13,7 @@ describe("tool call edit diff layout", () => {
     const toolBlock = read("src/components/ToolCallBlock.vue");
     const fileDiffViewer = read("src/components/diff/FileDiffViewer.vue");
 
-    expect(fileDiffViewer).toContain('{ mode: "unified", compact: false, filter: "all", hideBuiltinTabs: false, hideTextDisplayControls: false }');
+    expect(fileDiffViewer).toContain('{ mode: "unified", compact: false, filter: "all", hideBuiltinTabs: false, hideSemanticSummary: false, hideTextDisplayControls: false }');
     expect(toolBlock).not.toContain('mode="side-by-side"');
   });
 

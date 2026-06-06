@@ -29,12 +29,14 @@ const props = withDefaults(
     filter?: "all" | "before" | "after";
     /** When true, the parent controls the tab switcher — hide the built-in tab bar */
     hideBuiltinTabs?: boolean;
+    /** When true, the parent supplies the surrounding preview header */
+    hideSemanticSummary?: boolean;
     /** When true, the parent controls text display mode actions — hide the built-in toolbar */
     hideTextDisplayControls?: boolean;
     /** Preferred initial tab when a fresh payload is mounted */
     initialTab?: "semantic" | "text";
   }>(),
-  { mode: "unified", compact: false, filter: "all", hideBuiltinTabs: false, hideTextDisplayControls: false },
+  { mode: "unified", compact: false, filter: "all", hideBuiltinTabs: false, hideSemanticSummary: false, hideTextDisplayControls: false },
 );
 
 const emit = defineEmits<{
@@ -687,7 +689,7 @@ onUnmounted(() => {
       </div>
 
       <div v-if="payload.semantic && activeTab === 'semantic'" class="semantic-view">
-        <div class="semantic-summary">
+        <div v-if="!hideSemanticSummary" class="semantic-summary">
           <template v-if="activeAssetTarget && !hasMultipleAssetTargets">
             <span class="summary-asset-name">{{ cleanLabel(activeAssetTarget.label) }}</span>
             <span v-if="payload.semantic?.summary.changedFields" class="summary-text">{{ t('diff.summary.fields', payload.semantic.summary.changedFields) }}</span>
