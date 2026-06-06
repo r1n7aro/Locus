@@ -5,8 +5,11 @@ import BaseContextMenu from "../ui/BaseContextMenu.vue";
 import {
   groupUnityPropertyFenceItems,
   parseUnityPropertyFence,
+  type UnityPropertyFenceBlock as UnityPropertyFenceGroup,
   type UnityPropertyFenceEntry,
   type UnityPropertyFenceIssue,
+  unityPropertyFenceDuplicateObjectLabels,
+  unityPropertyFenceObjectLabelKey,
   unityPropertyFenceUnitySelectionTarget,
 } from "../../composables/unityPropertyFence";
 import { t } from "../../i18n";
@@ -54,6 +57,9 @@ const rowContextMenu = ref<PropertyRowContextMenu | null>(null);
 const loading = computed(() => rows.value.some((row) => row.loading));
 const propertyBlocks = computed(() =>
   groupUnityPropertyFenceItems(rows.value, (row) => row.entry),
+);
+const duplicateObjectLabels = computed(() =>
+  unityPropertyFenceDuplicateObjectLabels(propertyBlocks.value.map((block) => block.entry)),
 );
 const rowContextRow = computed(() =>
   rowContextMenu.value ? rowById(rowContextMenu.value.rowId) : null,
@@ -269,6 +275,12 @@ function blockSaving(blockRows: PropertyRow[]): boolean {
   return blockRows.some((row) => row.saving);
 }
 
+function blockObjectPath(block: UnityPropertyFenceGroup<PropertyRow>): string {
+  const labelKey = unityPropertyFenceObjectLabelKey(block.entry.objectLabel);
+  if (!duplicateObjectLabels.value.has(labelKey)) return "";
+  return block.entry.objectTitle.trim();
+}
+
 function shortTypeName(typeName: string): string {
   const normalized = typeName.trim();
   if (!normalized) return "";
@@ -328,6 +340,13 @@ function shortTypeName(typeName: string): string {
               </div>
               <div class="unity-property-target" :title="targetMeta(blockTarget(block.items[0]))">
                 {{ targetMeta(blockTarget(block.items[0])) }}
+              </div>
+              <div
+                v-if="blockObjectPath(block)"
+                class="unity-property-object-path"
+                :title="blockObjectPath(block)"
+              >
+                {{ blockObjectPath(block) }}
               </div>
             </template>
           </div>
@@ -457,6 +476,17 @@ function shortTypeName(typeName: string): string {
 
 .unity-property-target {
   color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.25;
+}
+
+.unity-property-object-path {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-secondary);
+  font-family: var(--font-mono-inline);
   font-size: 11px;
   line-height: 1.25;
 }

@@ -125,6 +125,30 @@ export function unityPropertyFenceTargetBlockKey(target: UnitySerializedProperty
   ].join("|");
 }
 
+export function unityPropertyFenceDuplicateObjectLabels(
+  entries: readonly UnityPropertyFenceEntry[],
+): Set<string> {
+  const titlesByLabel = new Map<string, Set<string>>();
+  entries.forEach((entry) => {
+    const label = normalizeObjectLabelKey(entry.objectLabel);
+    if (!label) return;
+    const title = (entry.objectTitle || entry.objectLabel).trim();
+    const titles = titlesByLabel.get(label) ?? new Set<string>();
+    titles.add(title);
+    titlesByLabel.set(label, titles);
+  });
+
+  const duplicates = new Set<string>();
+  titlesByLabel.forEach((titles, label) => {
+    if (titles.size > 1) duplicates.add(label);
+  });
+  return duplicates;
+}
+
+export function unityPropertyFenceObjectLabelKey(label: string): string {
+  return normalizeObjectLabelKey(label);
+}
+
 export function unityPropertyFenceUnitySelectionTarget(
   target: UnitySerializedPropertyTarget,
 ): UnityPropertyFenceUnitySelection | null {
@@ -556,4 +580,8 @@ function nonZeroIntegerField(value: unknown): number | null {
     return parsed === 0 ? null : parsed;
   }
   return null;
+}
+
+function normalizeObjectLabelKey(label: string): string {
+  return label.trim();
 }

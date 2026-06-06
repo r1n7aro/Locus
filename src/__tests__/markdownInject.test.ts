@@ -15,6 +15,8 @@ import {
 import {
   groupUnityPropertyFenceItems,
   parseUnityPropertyFence,
+  unityPropertyFenceDuplicateObjectLabels,
+  unityPropertyFenceObjectLabelKey,
   unityPropertyFenceUnitySelectionTarget,
 } from "../composables/unityPropertyFence";
 import { prepareMarkdownImages } from "../composables/markdownImages";
@@ -631,6 +633,22 @@ describe("injectUnityPropertyFenceRefs", () => {
       ["m_Enabled"],
       ["m_LocalScale"],
     ]);
+  });
+
+  it("detects same object labels that point at different Unity paths", () => {
+    const result = parseUnityPropertyFence([
+      "Assets/Prefabs/Player.prefab/Player#PlayerPlatformerController:maxMoveSpeed",
+      "Assets/Scenes/Main.unity/Player#PlayerPlatformerController:maxMoveSpeed",
+      "Assets/Scenes/Main.unity/Enemy#m_Name",
+      "Assets/Scenes/Main.unity/Enemy#m_IsActive",
+    ].join("\n"));
+
+    const groups = groupUnityPropertyFenceItems(result.entries, (entry) => entry);
+    const duplicates = unityPropertyFenceDuplicateObjectLabels(groups.map((group) => group.entry));
+
+    expect(result.issues).toHaveLength(0);
+    expect(duplicates.has(unityPropertyFenceObjectLabelKey("Player"))).toBe(true);
+    expect(duplicates.has(unityPropertyFenceObjectLabelKey("Enemy"))).toBe(false);
   });
 
   it("resolves row targets for Unity selection actions", () => {
