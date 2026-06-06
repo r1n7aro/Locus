@@ -5,7 +5,7 @@
   "files": [
     {
       "path": "src/components/view/viewRuntime.ts",
-      "bytes": 62736
+      "bytes": 80234
     },
     {
       "path": "src/components/view/viewCompiler.ts",
@@ -145,7 +145,7 @@
     },
     {
       "path": "src/components/unity/unitySerializedValue.ts",
-      "bytes": 16336
+      "bytes": 16801
     },
     {
       "path": "src/components/unity/UnityBoolField.vue",
@@ -169,7 +169,7 @@
     },
     {
       "path": "src/components/unity/UnityNumberField.vue",
-      "bytes": 8348
+      "bytes": 8754
     },
     {
       "path": "src/components/unity/UnityObjectReferenceField.vue",
@@ -185,7 +185,7 @@
     },
     {
       "path": "src/components/unity/UnitySerializedPropertyTree.vue",
-      "bytes": 38077
+      "bytes": 38304
     },
     {
       "path": "src/components/unity/UnityVectorField.vue",
@@ -261,11 +261,11 @@
     },
     {
       "path": "src/language/en.json",
-      "bytes": 193850
+      "bytes": 193948
     },
     {
       "path": "src/language/zh.json",
-      "bytes": 187555
+      "bytes": 187652
     },
     {
       "path": "src/services/asset.ts",
@@ -281,7 +281,7 @@
     },
     {
       "path": "src/services/view.ts",
-      "bytes": 16134
+      "bytes": 19107
     },
     {
       "path": "src/services/unity.ts",
@@ -325,7 +325,7 @@
     },
     {
       "path": "src/types.ts",
-      "bytes": 65245
+      "bytes": 65832
     }
   ]
 }

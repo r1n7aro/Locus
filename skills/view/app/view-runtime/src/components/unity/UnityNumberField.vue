@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
 import {
+  UNITY_FLOAT_DRAG_STEP,
+  constrainUnityNumberDragValue,
   constrainUnityNumberValue,
   formatUnityNumberValue,
   isUnityIntegerPropertyType,
@@ -56,8 +58,9 @@ const numberConstraints = computed<UnityNumberConstraintOptions>(() => ({
   rangeMax: rangeMax.value,
 }));
 const inputStep = computed<number | "any">(() => {
-  if (props.numberStep > 0) return props.numberStep;
-  return isUnityIntegerPropertyType(props.propertyType) ? 1 : "any";
+  if (isUnityIntegerPropertyType(props.propertyType)) return 1;
+  if (props.numberStep > 0) return Math.max(UNITY_FLOAT_DRAG_STEP, props.numberStep);
+  return UNITY_FLOAT_DRAG_STEP;
 });
 const sliderValue = computed(() => {
   const parsedText = parsedNumber(text.value);
@@ -78,6 +81,12 @@ function parsedNumber(rawValue: unknown): number | null {
   const parsed = tryParseUnitySerializedEditValue(props.propertyType, rawValue);
   if (!parsed.ok || typeof parsed.value !== "number") return null;
   return constrainUnityNumberValue(props.propertyType, parsed.value, numberConstraints.value);
+}
+
+function draggedNumber(rawValue: unknown): number | null {
+  const parsed = tryParseUnitySerializedEditValue(props.propertyType, rawValue);
+  if (!parsed.ok || typeof parsed.value !== "number") return null;
+  return constrainUnityNumberDragValue(props.propertyType, parsed.value, numberConstraints.value);
 }
 
 function formatNumber(value: number): string {
@@ -101,7 +110,7 @@ function updateFromInput(event: Event) {
 
 function updateFromRange(event: Event) {
   const target = event.target as HTMLInputElement | null;
-  const parsed = parsedNumber(target?.value ?? "");
+  const parsed = draggedNumber(target?.value ?? "");
   if (parsed == null) return;
   emitNumberValue(parsed);
   if (!props.disabled && !props.readonly) {

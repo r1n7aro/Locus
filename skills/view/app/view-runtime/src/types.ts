@@ -264,6 +264,14 @@ export interface SessionEventRecord {
 export interface SessionRuntimeSnapshot {
   activeRun: SessionRunSummary;
   activeToolCalls: ToolCallDisplay[];
+  streamingText?: string;
+  streamingThinking?: string;
+  liveRenderParts?: AssistantRenderPart[];
+  streamSequence?: number;
+  streamingTextOrder?: number;
+  thinkingOrder?: number;
+  isThinking?: boolean;
+  thinkingDuration?: number;
   pendingQuestion?: PendingQuestion | null;
   pendingToolConfirms: PendingToolConfirm[];
   isCompacting: boolean;
@@ -641,6 +649,7 @@ export type StreamEvent = { runId: string } & (
   | { type: "runStart"; sessionId: string }
   | { type: "userMessage"; sessionId: string; message: ChatMessage }
   | { type: "pendingInputQueued"; sessionId: string; input: PendingSessionInput }
+  | { type: "pendingInputDeleted"; sessionId: string; pendingInputId: string }
   | { type: "pendingInputAccepted"; sessionId: string; pendingInputId: string; messageId: string }
   | { type: "textDelta"; sessionId: string; text: string; order?: number; partId?: string; renderSeq?: number }
   | { type: "thinkingDelta"; sessionId: string; text: string; order?: number; partId?: string; renderSeq?: number }

@@ -285,6 +285,8 @@
   "view.metadata.apiVersion": "API Version",
   "view.metadata.compile": "Compile",
   "view.metadata.compileOk": "Passed",
+  "view.metadata.compileUnchecked": "Not checked",
+  "view.metadata.compileChecking": "Checking",
   "view.metadata.capabilities": "Capabilities",
   "view.metadata.unityConnection": "Unity Connection",
   "view.metadata.unityConnectionRequired": "Requires Unity connection",

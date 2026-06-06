@@ -285,6 +285,8 @@
   "view.metadata.apiVersion": "API 版本",
   "view.metadata.compile": "编译",
   "view.metadata.compileOk": "通过",
+  "view.metadata.compileUnchecked": "未检查",
+  "view.metadata.compileChecking": "检查中",
   "view.metadata.capabilities": "能力",
   "view.metadata.unityConnection": "Unity 连接",
   "view.metadata.unityConnectionRequired": "需要 Unity 连接",

@@ -31,7 +31,7 @@ export interface ViewRequirements {
 
 export interface ViewManifest {
   schema: string;
-  apiVersion: number;
+  apiVersion: string;
   id: string;
   name: string;
   version: string;
@@ -54,7 +54,7 @@ export interface ViewTemplateSummary {
 export interface ViewPackageSummary {
   id: string;
   name: string;
-  apiVersion: number;
+  apiVersion: string;
   version: string;
   template: string;
   icon?: string | null;

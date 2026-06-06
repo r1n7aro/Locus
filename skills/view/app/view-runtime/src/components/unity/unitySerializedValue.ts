@@ -112,6 +112,8 @@ export interface UnityNumberConstraintOptions {
   rangeMax?: number;
 }
 
+export const UNITY_FLOAT_DRAG_STEP = 0.01;
+
 type VectorKey = "x" | "y" | "z" | "w" | "width" | "height";
 
 const VECTOR_KEYS: Record<string, VectorKey[]> = {
@@ -249,6 +251,17 @@ export function constrainUnityNumberValue(
   }
   if (isUnityIntegerPropertyType(type)) next = Math.round(next);
   return normalizeUnityNumberPrecision(next);
+}
+
+export function constrainUnityNumberDragValue(
+  type: string | null | undefined,
+  value: number,
+  options: UnityNumberConstraintOptions = {},
+): number {
+  const constrained = constrainUnityNumberValue(type, value, options);
+  if (isUnityIntegerPropertyType(type)) return constrained;
+  const rounded = Math.round(constrained / UNITY_FLOAT_DRAG_STEP) * UNITY_FLOAT_DRAG_STEP;
+  return constrainUnityNumberValue(type, rounded, options);
 }
 
 export function formatUnityNumberValue(
