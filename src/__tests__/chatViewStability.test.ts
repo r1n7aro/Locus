@@ -4,6 +4,7 @@ import {
   collectPendingContinuationToolSegmentItemIds,
   createCoalescedScrollScheduler,
   createSettledScrollScheduler,
+  createUserScrollIntentTracker,
   findTrailingAssistantToolMessageId,
   hasRunningToolCall,
   shouldAutoScrollToBottom,
@@ -207,6 +208,23 @@ describe("chatViewStability", () => {
         scrollHeight: 1200,
       },
     })).toBe(true);
+  });
+
+  it("tracks recent user scroll intent with a TTL", () => {
+    let now = 1000;
+    const tracker = createUserScrollIntentTracker(() => now, 500);
+
+    expect(tracker.isRecent()).toBe(false);
+    tracker.mark();
+    expect(tracker.isRecent()).toBe(true);
+
+    now += 501;
+    expect(tracker.isRecent()).toBe(false);
+
+    tracker.mark();
+    expect(tracker.lastIntentAt()).toBe(1501);
+    tracker.clear();
+    expect(tracker.isRecent()).toBe(false);
   });
 
   it("coalesces repeated scroll requests into one frame and preserves force", () => {

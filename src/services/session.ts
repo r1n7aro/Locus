@@ -75,6 +75,18 @@ export function insertPendingChatInput(
   });
 }
 
+export function deletePendingChatInput(
+  sessionId: string,
+  runId: string,
+  pendingInputId?: string | null,
+): Promise<boolean> {
+  return ipcInvoke<boolean>("delete_pending_chat_input", {
+    sessionId,
+    runId,
+    pendingInputId: pendingInputId ?? null,
+  });
+}
+
 export function cancelChat(sessionId: string): Promise<void> {
   return ipcInvoke("cancel_chat", { sessionId });
 }

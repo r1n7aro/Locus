@@ -125,6 +125,22 @@ impl PendingInputQueue {
         Some(input.clone())
     }
 
+    pub fn delete_input(
+        &mut self,
+        session_id: &str,
+        run_id: &str,
+        pending_input_id: Option<&str>,
+    ) -> Option<PendingSessionInput> {
+        let key = (session_id.to_string(), run_id.to_string());
+        let input = self.inputs.get(&key)?;
+        if let Some(id) = pending_input_id {
+            if id != input.id {
+                return None;
+            }
+        }
+        self.inputs.remove(&key)
+    }
+
     pub fn restore_claimed(&mut self, inputs: Vec<PendingSessionInput>) {
         for mut input in inputs {
             input.status = STATUS_QUEUED.to_string();
@@ -338,5 +354,37 @@ mod tests {
             .expect("claim after-run input");
         assert_eq!(claimed.id, first.id);
         assert!(queue.list_session("session-1").is_empty());
+    }
+
+    #[test]
+    fn queued_input_can_be_deleted_by_id() {
+        let mut queue = PendingInputQueue::default();
+        let first = queue.queue_input(request("run-1", "group-a", "first"));
+
+        assert!(queue
+            .delete_input("session-1", "run-1", Some("different-id"))
+            .is_none());
+        assert_eq!(queue.list_session("session-1").len(), 1);
+
+        let deleted = queue
+            .delete_input("session-1", "run-1", Some(&first.id))
+            .expect("delete queued input");
+        assert_eq!(deleted.id, first.id);
+        assert!(queue.list_session("session-1").is_empty());
+    }
+
+    #[test]
+    fn promoted_input_can_be_deleted_before_claim() {
+        let mut queue = PendingInputQueue::default();
+        let first = queue.queue_input(request("run-1", "group-a", "first"));
+        queue
+            .promote_to_immediate("session-1", "run-1", Some(&first.id))
+            .expect("promote queued input");
+
+        let deleted = queue
+            .delete_input("session-1", "run-1", Some(&first.id))
+            .expect("delete promoted input");
+        assert_eq!(deleted.delivery, DELIVERY_IMMEDIATE);
+        assert!(queue.claim_immediate("session-1", "run-1").is_empty());
     }
 }

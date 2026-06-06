@@ -40,6 +40,8 @@ pub struct SessionDetail {
     pub messages: Vec<ChatMessage>,
     #[serde(default)]
     pub pending_inputs: Vec<PendingSessionInput>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<SessionRuntimeSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,6 +56,101 @@ pub struct SessionRunSummary {
     pub finished_at: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolCallDisplayStatus {
+    Running,
+    Done,
+    Error,
+    Interrupted,
+}
+
+impl ToolCallDisplayStatus {
+    pub fn from_outcome(outcome: crate::commands::ToolCallOutcome) -> Self {
+        match outcome {
+            crate::commands::ToolCallOutcome::Done => Self::Done,
+            crate::commands::ToolCallOutcome::Error => Self::Error,
+            crate::commands::ToolCallOutcome::Interrupted => Self::Interrupted,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolCallProgressSnapshot {
+    pub title: String,
+    pub info: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<f32>,
+    pub state: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolCallDisplay {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
+    pub status: ToolCallDisplayStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub images: Option<Vec<ImageData>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<ToolCallProgressSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nested_tool_calls: Option<Vec<ToolCallDisplay>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingQuestion {
+    pub question_id: String,
+    pub tool_call_id: String,
+    pub question: String,
+    pub options: Vec<crate::commands::AskOption>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingToolConfirm {
+    pub question_id: String,
+    pub tool_call_id: String,
+    pub display: crate::commands::ToolConfirmDisplay,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRuntimeSnapshot {
+    pub active_run: SessionRunSummary,
+    #[serde(default)]
+    pub active_tool_calls: Vec<ToolCallDisplay>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub streaming_text: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub streaming_thinking: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub live_render_parts: Vec<AssistantRenderPart>,
+    #[serde(default)]
+    pub stream_sequence: u32,
+    #[serde(default)]
+    pub streaming_text_order: u32,
+    #[serde(default)]
+    pub thinking_order: u32,
+    #[serde(default)]
+    pub is_thinking: bool,
+    #[serde(default)]
+    pub thinking_duration: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_question: Option<PendingQuestion>,
+    #[serde(default)]
+    pub pending_tool_confirms: Vec<PendingToolConfirm>,
+    #[serde(default)]
+    pub is_compacting: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

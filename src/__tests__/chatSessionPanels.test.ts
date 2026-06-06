@@ -10,6 +10,7 @@ const sessionServiceMocks = vi.hoisted(() => ({
   chat: vi.fn(),
   cancelChat: vi.fn(),
   deleteSession: vi.fn(),
+  deletePendingChatInput: vi.fn(),
   forkSession: vi.fn(),
   forkSessionFromMessage: vi.fn(),
   getActiveSessionSelection: vi.fn(),
@@ -193,6 +194,7 @@ describe("chat session panel state", () => {
     sessionServiceMocks.chat.mockResolvedValue({ sessionId: "s1", runId: "run-default" });
     sessionServiceMocks.cancelChat.mockResolvedValue(undefined);
     sessionServiceMocks.deleteSession.mockResolvedValue(undefined);
+    sessionServiceMocks.deletePendingChatInput.mockResolvedValue(true);
     sessionServiceMocks.forkSession.mockResolvedValue("s-copy");
     sessionServiceMocks.forkSessionFromMessage.mockResolvedValue("s-copy");
     sessionServiceMocks.getActiveSessionSelection.mockResolvedValue(null);
@@ -756,7 +758,7 @@ describe("chat session panel state", () => {
     expect(chatStore.streamingSessionIds.has("s1")).toBe(false);
   });
 
-  it("hydrates active backend runs and replays current stream events on refresh", async () => {
+  it("hydrates active backend runs on refresh without replaying stream events", async () => {
     const chatStore = useChatStore();
 
     chatStore.activeSessionId = "s1";
@@ -779,41 +781,17 @@ describe("chat session panel state", () => {
       finishedAt: null,
       errorMessage: null,
     });
-    sessionServiceMocks.listSessionEvents.mockResolvedValueOnce([
-      {
-        sessionId: "s1",
-        runId: "run-1",
-        seq: 1,
-        eventType: "runStart",
-        payload: { type: "runStart", sessionId: "s1" },
-        createdAt: 1,
-      },
-      {
-        sessionId: "s1",
-        runId: "run-1",
-        seq: 2,
-        eventType: "toolCallStart",
-        payload: {
-          type: "toolCallStart",
-          sessionId: "s1",
-          toolCallId: "tc-active",
-          toolName: "read",
-          arguments: "{}",
-        },
-        createdAt: 2,
-      },
-    ]);
 
     await chatStore.refreshSessions();
 
     expect(chatStore.streamingSessionIds.has("s1")).toBe(true);
     expect(chatStore.currentRunId).toBe("run-1");
     expect(chatStore.isStreaming).toBe(true);
-    expect(chatStore.activeToolCalls).toHaveLength(1);
-    expect(chatStore.activeToolCalls[0]?.id).toBe("tc-active");
+    expect(chatStore.activeToolCalls).toHaveLength(0);
+    expect(sessionServiceMocks.listSessionEvents).not.toHaveBeenCalled();
   });
 
-  it("replays the active run tool chain after loading persisted messages", async () => {
+  it("restores the active run tool chain from the loaded session runtime", async () => {
     const chatStore = useChatStore();
 
     sessionServiceMocks.loadSession.mockResolvedValueOnce({
@@ -826,6 +804,14 @@ describe("chat session panel state", () => {
           content: "persisted round",
           createdAt: 1,
           toolCalls: [{ id: "tc-old", name: "read", arguments: "{}" }],
+          renderParts: [
+            {
+              kind: "toolCall",
+              id: "tc-old",
+              order: { runId: "run-1", seq: 1 },
+              toolCall: { id: "tc-old", name: "read", arguments: "{}" },
+            },
+          ],
         },
       ],
       agentId: null,
@@ -834,75 +820,29 @@ describe("chat session panel state", () => {
       latestCompletedRunId: null,
       createdAt: 0,
       updatedAt: 0,
+      runtime: {
+        activeRun: {
+          runId: "run-1",
+          sessionId: "s1",
+          status: "running",
+          startedAt: 1,
+          updatedAt: 2,
+          finishedAt: null,
+          errorMessage: null,
+        },
+        activeToolCalls: [
+          {
+            id: "tc-current",
+            name: "grep",
+            arguments: "{}",
+            status: "running",
+          },
+        ],
+        pendingQuestion: null,
+        pendingToolConfirms: [],
+        isCompacting: false,
+      },
     });
-    sessionServiceMocks.getSessionActiveRun.mockResolvedValueOnce({
-      runId: "run-1",
-      sessionId: "s1",
-      status: "running",
-      startedAt: 1,
-      updatedAt: 2,
-      finishedAt: null,
-      errorMessage: null,
-    });
-    sessionServiceMocks.listSessionEvents.mockResolvedValueOnce([
-      {
-        sessionId: "s1",
-        runId: "run-1",
-        seq: 1,
-        eventType: "toolCallStart",
-        payload: {
-          type: "toolCallStart",
-          sessionId: "s1",
-          toolCallId: "tc-old",
-          toolName: "read",
-          arguments: "{}",
-        },
-        createdAt: 1,
-      },
-      {
-        sessionId: "s1",
-        runId: "run-1",
-        seq: 2,
-        eventType: "toolCallDone",
-        payload: {
-          type: "toolCallDone",
-          sessionId: "s1",
-          toolCallId: "tc-old",
-          toolName: "read",
-          output: "old output",
-          outcome: "done",
-        },
-        createdAt: 2,
-      },
-      {
-        sessionId: "s1",
-        runId: "run-1",
-        seq: 3,
-        eventType: "toolCallRoundDone",
-        payload: {
-          type: "toolCallRoundDone",
-          sessionId: "s1",
-          messageId: "msg-round",
-          fullText: "persisted round",
-          toolCalls: [{ id: "tc-old", name: "read", arguments: "{}" }],
-        },
-        createdAt: 3,
-      },
-      {
-        sessionId: "s1",
-        runId: "run-1",
-        seq: 4,
-        eventType: "toolCallStart",
-        payload: {
-          type: "toolCallStart",
-          sessionId: "s1",
-          toolCallId: "tc-current",
-          toolName: "grep",
-          arguments: "{}",
-        },
-        createdAt: 4,
-      },
-    ]);
 
     await chatStore.selectSession("s1");
 
@@ -913,6 +853,8 @@ describe("chat session panel state", () => {
     expect(chatStore.activeToolCalls).toHaveLength(1);
     expect(chatStore.activeToolCalls.map((toolCall) => toolCall.id)).toEqual(["tc-current"]);
     expect(chatStore.activeToolCalls[0]?.status).toBe("running");
+    expect(sessionServiceMocks.getSessionActiveRun).not.toHaveBeenCalled();
+    expect(sessionServiceMocks.listSessionEvents).not.toHaveBeenCalled();
   });
 
   it("replaces a loaded assistant tool round when the live round-done event arrives", async () => {
@@ -936,32 +878,29 @@ describe("chat session panel state", () => {
       latestCompletedRunId: null,
       createdAt: 0,
       updatedAt: 0,
-    });
-    sessionServiceMocks.getSessionActiveRun.mockResolvedValueOnce({
-      runId: "run-1",
-      sessionId: "s1",
-      status: "running",
-      startedAt: 1,
-      updatedAt: 2,
-      finishedAt: null,
-      errorMessage: null,
-    });
-    sessionServiceMocks.listSessionEvents.mockResolvedValueOnce([
-      {
-        sessionId: "s1",
-        runId: "run-1",
-        seq: 1,
-        eventType: "toolCallStart",
-        payload: {
-          type: "toolCallStart",
+      runtime: {
+        activeRun: {
+          runId: "run-1",
           sessionId: "s1",
-          toolCallId: "tc-run",
-          toolName: "unity_run_states",
-          arguments: "{}",
+          status: "running",
+          startedAt: 1,
+          updatedAt: 2,
+          finishedAt: null,
+          errorMessage: null,
         },
-        createdAt: 1,
+        activeToolCalls: [
+          {
+            id: "tc-run",
+            name: "unity_run_states",
+            arguments: "{}",
+            status: "running",
+          },
+        ],
+        pendingQuestion: null,
+        pendingToolConfirms: [],
+        isCompacting: false,
       },
-    ]);
+    });
 
     await chatStore.selectSession("s1");
     chatStore.handleStreamEvent({
@@ -1166,7 +1105,7 @@ describe("chat session panel state", () => {
     expect(chatStore.pendingToolConfirms).toEqual([]);
   });
 
-  it("clears answered pending input cards from replayed stream events", () => {
+  it("clears answered pending input cards from stream events", () => {
     const chatStore = useChatStore();
 
     chatStore.sessions = [
@@ -1696,6 +1635,49 @@ describe("chat session panel state", () => {
       messageId: "msg-accepted",
     });
 
+    expect(chatStore.activeQueuedFollowUp).toBeNull();
+  });
+
+  it("deletes a queued follow-up while a run is active", async () => {
+    const chatStore = useChatStore();
+
+    chatStore.activeSessionId = "s1";
+    chatStore.currentRunId = "run-1";
+    chatStore.isStreaming = true;
+
+    await chatStore.sendMessage("queued");
+    expect(chatStore.activeQueuedFollowUp?.displayText).toBe("queued");
+
+    const deleted = await chatStore.deleteActiveQueuedFollowUp();
+
+    expect(deleted).toBe(true);
+    expect(sessionServiceMocks.deletePendingChatInput).toHaveBeenCalledWith(
+      "s1",
+      "run-1",
+      "pending-1",
+    );
+    expect(chatStore.activeQueuedFollowUp).toBeNull();
+  });
+
+  it("deletes an inserted follow-up before it is accepted", async () => {
+    const chatStore = useChatStore();
+
+    chatStore.activeSessionId = "s1";
+    chatStore.currentRunId = "run-1";
+    chatStore.isStreaming = true;
+
+    await chatStore.sendMessage("queued");
+    await chatStore.insertActiveQueuedFollowUp();
+    expect(chatStore.activeQueuedFollowUp?.isInserting).toBe(true);
+
+    const deleted = await chatStore.deleteActiveQueuedFollowUp();
+
+    expect(deleted).toBe(true);
+    expect(sessionServiceMocks.deletePendingChatInput).toHaveBeenCalledWith(
+      "s1",
+      "run-1",
+      "pending-1",
+    );
     expect(chatStore.activeQueuedFollowUp).toBeNull();
   });
 

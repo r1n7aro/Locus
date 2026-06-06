@@ -20,6 +20,7 @@ import {
   captureScrollAnchor,
   captureLiveScrollAnchor,
   captureSessionScrollState,
+  isNearBottom,
   resolveSessionScrollTop,
   restoreLiveScrollAnchor,
   restoreScrollAnchor,
@@ -29,6 +30,7 @@ import {
 import {
   createCoalescedScrollScheduler,
   createSettledScrollScheduler,
+  createUserScrollIntentTracker,
   shouldAutoScrollToBottom,
 } from "../../composables/chatViewStability";
 import {
@@ -129,6 +131,7 @@ const emit = defineEmits<{
   (e: "answerToolConfirm", questionId: string, answer: string): void;
   (e: "answerAllToolConfirms", questionIds: string[], answer: string): void;
   (e: "insertQueuedFollowUp"): void;
+  (e: "deleteQueuedFollowUp"): void;
   (e: "applyKnowledgeProposal", proposalId: string): void;
   (e: "ignoreKnowledgeProposal", proposalId: string): void;
 }>();
@@ -157,6 +160,7 @@ let transcriptResizeObserver: ResizeObserverHandle | null = null;
 const toolHandoffViewportQuiet = ref(false);
 let activeToolViewportAnchor: LiveScrollAnchorSnapshot | null = null;
 let toolViewportAnchorFrame = 0;
+const userScrollIntent = createUserScrollIntentTracker();
 const STREAM_END_SCROLL_SETTLE_MS = 320;
 
 function updateInput(value: string) {
@@ -437,6 +441,13 @@ function restoreViewportStateForKey(key = getViewportStateKey()) {
 
 function handleTranscriptScroll() {
   if (suppressScrollCapture) return;
+  if (!userScrollIntent.isRecent()) {
+    const el = getTranscriptElement();
+    if (el && isNearBottom(readTranscriptMetrics(el))) {
+      viewportStates.set(getViewportStateKey(), { mode: "bottom" });
+    }
+    return;
+  }
   scrollToBottomScheduler.cancel();
   preserveScrollAnchorScheduler.cancel();
   streamEndScrollScheduler.cancel();
@@ -472,7 +483,12 @@ function connectTranscriptResizeObserver() {
 }
 
 function handleBottomPanelWheel(event: WheelEvent) {
+  markTranscriptUserScrollIntent();
   forwardWheelToElement(event, getTranscriptElement());
+}
+
+function markTranscriptUserScrollIntent() {
+  userScrollIntent.mark();
 }
 
 const keepBatchToolConfirmLayout = ref(false);
@@ -638,6 +654,7 @@ onUnmounted(() => {
       :show-user-images="showUserImages"
       :user-content-mode="userContentMode"
       @scroll="handleTranscriptScroll"
+      @user-scroll-intent="markTranscriptUserScrollIntent"
       @apply-knowledge-proposal="emit('applyKnowledgeProposal', $event)"
       @ignore-knowledge-proposal="emit('ignoreKnowledgeProposal', $event)"
       @tool-handoff-quiet-change="handleToolHandoffQuietChange"
@@ -665,6 +682,15 @@ onUnmounted(() => {
             @click="emit('insertQueuedFollowUp')"
           >
             {{ t('chat.input.queuedFollowUpInsert') }}
+          </BaseButton>
+          <BaseButton
+            class="embedded-queued-delete"
+            size="sm"
+            variant="neutral"
+            type="button"
+            @click="emit('deleteQueuedFollowUp')"
+          >
+            {{ t('common.delete') }}
           </BaseButton>
         </div>
         <AskUserCard
@@ -839,7 +865,8 @@ onUnmounted(() => {
   white-space: nowrap;
 }
 
-.embedded-queued-insert {
+.embedded-queued-insert,
+.embedded-queued-delete {
   flex: 0 0 auto;
 }
 

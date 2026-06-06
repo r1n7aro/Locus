@@ -22,6 +22,7 @@ import {
   type StreamMutation,
   type StreamState,
 } from "./useStreamReducer";
+import { resolveToolCallDisplayShape } from "./toolCallBatches";
 import type {
   ChatMessage,
   EffortLevel,
@@ -35,6 +36,7 @@ import type {
   UserIntentMeta,
   AssistantRenderPart,
   PendingSessionInput,
+  SessionDetail,
 } from "../types";
 
 export interface EmbeddedChatRequest {
@@ -172,6 +174,11 @@ function traceEmbeddedStreamEvent(event: StreamEvent) {
         ...base,
         pendingInputId: event.pendingInputId,
         messageId: event.messageId,
+      };
+    case "pendingInputDeleted":
+      return {
+        ...base,
+        pendingInputId: event.pendingInputId,
       };
     case "toolCallRoundDone":
       return {
@@ -316,6 +323,29 @@ function isPendingInputFallbackError(code: string): boolean {
     || code === "session.run_locked";
 }
 
+function cloneRuntimeToolCalls(toolCalls: ToolCallDisplay[] | undefined): ToolCallDisplay[] {
+  return (toolCalls ?? []).map((toolCall) => {
+    const displayShape = resolveToolCallDisplayShape({
+      name: toolCall.name,
+      arguments: toolCall.arguments,
+    });
+    return {
+      ...toolCall,
+      name: displayShape.name,
+      arguments: displayShape.arguments,
+      images: toolCall.images?.map((image) => ({ ...image })),
+      progress: toolCall.progress ? { ...toolCall.progress } : toolCall.progress,
+      nestedToolCalls: toolCall.nestedToolCalls
+        ? cloneRuntimeToolCalls(toolCall.nestedToolCalls)
+        : undefined,
+    };
+  });
+}
+
+function cloneRuntimeJson<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
+}
+
 function clearState(state: EmbeddedChatState) {
   state.sessionId = null;
   state.currentRunId = null;
@@ -337,6 +367,41 @@ function clearState(state: EmbeddedChatState) {
   state.streamSequence = 0;
   state.isCompacting = false;
   resetRoundState(state);
+}
+
+function applySessionRuntimeSnapshot(state: EmbeddedChatState, detail: SessionDetail) {
+  const runtime = detail.runtime;
+  if (!runtime) {
+    state.currentRunId = null;
+    state.isStreaming = false;
+    state.pendingRun = false;
+    state.pendingQuestion = null;
+    state.pendingToolConfirms = [];
+    state.isCompacting = false;
+    resetRoundState(state);
+    return;
+  }
+
+  state.sessionId = detail.id;
+  state.currentRunId = runtime.activeRun.runId;
+  state.isStreaming = true;
+  state.pendingRun = false;
+  state.rawStreamText = runtime.streamingText ?? "";
+  state.streamingText = runtime.streamingText ?? "";
+  state.streamingThinking = runtime.streamingThinking ?? "";
+  state.streamSequence = runtime.streamSequence ?? 0;
+  state.streamingTextOrder = runtime.streamingTextOrder ?? 0;
+  state.thinkingOrder = runtime.thinkingOrder ?? 0;
+  state.liveRenderParts = cloneRuntimeJson(runtime.liveRenderParts ?? []);
+  state.isThinking = runtime.isThinking === true;
+  state.thinkingStartTime = state.isThinking ? Date.now() : 0;
+  state.thinkingDuration = runtime.thinkingDuration ?? 0;
+  state.activeToolCalls = cloneRuntimeToolCalls(runtime.activeToolCalls);
+  state.pendingQuestion = runtime.pendingQuestion
+    ? cloneRuntimeJson(runtime.pendingQuestion)
+    : null;
+  state.pendingToolConfirms = cloneRuntimeJson(runtime.pendingToolConfirms ?? []);
+  state.isCompacting = runtime.isCompacting === true;
 }
 
 function updateProposalStatus(
@@ -595,6 +660,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
       if (state.sessionId !== sessionId) return;
       state.messages = hydrateChatMessagesIntent(detail.messages);
       state.pendingInputs = visiblePendingInputs(detail.pendingInputs ?? []);
+      applySessionRuntimeSnapshot(state, detail);
     } catch (error) {
       console.warn("[embedded-chat] loadSession after stream error failed:", error);
     }
@@ -632,6 +698,18 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
       state.pendingInputs = visiblePendingInputs(
         mergePendingInputList(state.pendingInputs, event.input),
       );
+      return;
+    }
+
+    if (event.type === "pendingInputDeleted") {
+      const deleted = state.pendingInputs.find((input) => input.id === event.pendingInputId);
+      state.pendingInputs = state.pendingInputs.filter((input) => input.id !== event.pendingInputId);
+      if (deleted?.mergeGroupId === state.localMergeGroupId) {
+        state.localMergeGroupId = null;
+      }
+      if (deleted?.mergeGroupId === state.localFallbackMergeGroupId) {
+        state.localFallbackMergeGroupId = null;
+      }
       return;
     }
 
@@ -914,6 +992,37 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     }
   }
 
+  async function deleteQueuedFollowUp() {
+    const state = activeState.value;
+    const targets = visiblePendingInputs(state.pendingInputs);
+    if (!state.sessionId || targets.length === 0) return false;
+
+    try {
+      await Promise.all(
+        targets.map((input) =>
+          sessionService.deletePendingChatInput(
+            input.sessionId,
+            input.runId,
+            input.id,
+          )),
+      );
+      const targetIds = new Set(targets.map((input) => input.id));
+      state.pendingInputs = state.pendingInputs.filter((input) => !targetIds.has(input.id));
+      for (const input of targets) {
+        if (input.mergeGroupId === state.localMergeGroupId) {
+          state.localMergeGroupId = null;
+        }
+        if (input.mergeGroupId === state.localFallbackMergeGroupId) {
+          state.localFallbackMergeGroupId = null;
+        }
+      }
+      return true;
+    } catch (error) {
+      state.error = normalizeAppError(error).message;
+      return false;
+    }
+  }
+
   async function cancel() {
     const state = activeState.value;
     if (!state.sessionId || !state.isStreaming) return;
@@ -1074,6 +1183,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     sessionId,
     send,
     insertQueuedFollowUp,
+    deleteQueuedFollowUp,
     cancel,
     resetSession,
     answerQuestion,

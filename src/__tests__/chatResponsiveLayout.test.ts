@@ -80,6 +80,29 @@ describe("chat responsive layout", () => {
     expect(sidebar).toContain("document.body.style.cursor = props.layout === \"bottom\" ? \"row-resize\" : \"col-resize\"");
   });
 
+  it("keeps session tree expansion controlled by the explicit expand button", () => {
+    const sessionPanel = read("src/components/chat/SessionPanel.vue");
+    const isNodeExpandedStart = sessionPanel.indexOf("function isNodeExpanded");
+    const setNodeExpandedStart = sessionPanel.indexOf("function setNodeExpanded", isNodeExpandedStart);
+    const onRowClickStart = sessionPanel.indexOf("function onRowClick");
+    const contextMenuStart = sessionPanel.indexOf("/* Context menu */", onRowClickStart);
+
+    expect(isNodeExpandedStart).toBeGreaterThanOrEqual(0);
+    expect(setNodeExpandedStart).toBeGreaterThan(isNodeExpandedStart);
+    expect(onRowClickStart).toBeGreaterThanOrEqual(0);
+    expect(contextMenuStart).toBeGreaterThan(onRowClickStart);
+
+    const isNodeExpanded = sessionPanel.slice(isNodeExpandedStart, setNodeExpandedStart);
+    const onRowClick = sessionPanel.slice(onRowClickStart, contextMenuStart);
+
+    expect(sessionPanel).toContain('@click.stop="toggleNode(row)"');
+    expect(isNodeExpanded).toContain("return stored === true;");
+    expect(sessionPanel).not.toContain("nodeContainsSession");
+    expect(sessionPanel).not.toContain("nodeHasActiveDescendant");
+    expect(onRowClick).toContain('if (row.node.kind === "folder") {');
+    expect(onRowClick).not.toContain("toggleNode(row)");
+  });
+
   it("pins chat resize to parent width instead of intrinsic child width", () => {
     const app = read("src/App.vue");
     const chatView = read("src/components/ChatView.vue");

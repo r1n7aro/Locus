@@ -12,7 +12,7 @@ import {
 } from "vue";
 import { Check, ChevronRight, Folder, FolderOpen, HelpCircle, X } from "lucide";
 import { t } from "../../i18n";
-import { buildSessionTree, nodeContainsSession, nodeHasActiveDescendant } from "./sessionTree";
+import { buildSessionTree } from "./sessionTree";
 import BaseButton from "../ui/BaseButton.vue";
 import BaseContextMenu from "../ui/BaseContextMenu.vue";
 import LucideIcon from "../icons/LucideIcon.vue";
@@ -1207,12 +1207,7 @@ onUnmounted(() => {
 
 function isNodeExpanded(node: SessionTreeNode): boolean {
   const stored = expandedState.value[node.key];
-  if (stored !== undefined) return stored;
-  // Default: auto-expand if contains active session
-  if (nodeContainsSession(node, props.activeSessionId) || nodeHasActiveDescendant(node)) {
-    return true;
-  }
-  return false;
+  return stored === true;
 }
 
 function setNodeExpanded(key: string, value: boolean) {
@@ -1312,7 +1307,6 @@ function selectableSessionRows(): SessionVisibleTreeRow[] {
 
 function onRowClick(row: VisibleTreeRow, e: MouseEvent) {
   if (row.node.kind === "folder") {
-    if (row.hasChildren) toggleNode(row);
     return;
   }
   if (!row.node.selectable || !row.node.sessionId) return;

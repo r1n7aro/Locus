@@ -40,6 +40,7 @@ describe("EmbeddedChatPane contract", () => {
     expect(pane).toContain("watch(() => props.activeToolCalls, () => reconcileViewport(), { deep: true });");
     expect(pane).toContain("@tool-handoff-quiet-change=\"handleToolHandoffQuietChange\"");
     expect(pane).toContain("@scroll=\"handleTranscriptScroll\"");
+    expect(pane).toContain("@user-scroll-intent=\"markTranscriptUserScrollIntent\"");
     expect(pane).toContain(":session-key=\"getViewportStateKey()\"");
     expect(embeddedSession).toContain("buildToolResultMessages(sourceToolCalls)");
     expect(embeddedSession).toContain("function replaceMessageById");
@@ -48,10 +49,12 @@ describe("EmbeddedChatPane contract", () => {
     expect(embeddedSession).toContain("sessionService.loadSession(sessionId)");
     expect(embeddedSession).toContain("hydrateChatMessagesIntent(detail.messages)");
     expect(embeddedSession).toContain("sessionService.queueChatInput");
+    expect(embeddedSession).toContain("sessionService.deletePendingChatInput");
     expect(pane).toContain("<AskUserCard");
     expect(pane).toContain("<ToolConfirmCard");
     expect(pane).toContain('queuedFollowUp?: { displayText: string; canInsert?: boolean; isInserting?: boolean } | null;');
     expect(pane).toContain('@click="emit(\'insertQueuedFollowUp\')"');
+    expect(pane).toContain('@click="emit(\'deleteQueuedFollowUp\')"');
     expect(pane).toContain('class="embedded-queued-follow-up"');
     expect(pane).toContain('class="embedded-chat-pane"');
     expect(knowledgePane).toContain("<AgentSelector");
@@ -62,6 +65,7 @@ describe("EmbeddedChatPane contract", () => {
     expect(knowledgePane).toContain('user-content-mode="asset"');
     expect(knowledgePane).toContain(':tool-confirm-layout-key="sessionKey"');
     expect(knowledgePane).toContain(':queued-follow-up="queuedFollowUp"');
+    expect(knowledgePane).toContain('@delete-queued-follow-up="deleteQueuedFollowUp"');
     expect(knowledgePane).toContain(":waiting-label=\"t('chat.transcript.waiting')\"");
     expect(chatView).toContain("<RichChatInput");
     expect(chatView).toContain("<ChatTranscript");

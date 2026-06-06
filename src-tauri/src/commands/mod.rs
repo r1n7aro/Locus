@@ -87,6 +87,11 @@ pub enum StreamEvent {
         input: crate::session::models::PendingSessionInput,
     },
     #[serde(rename_all = "camelCase")]
+    PendingInputDeleted {
+        session_id: String,
+        pending_input_id: String,
+    },
+    #[serde(rename_all = "camelCase")]
     PendingInputAccepted {
         session_id: String,
         pending_input_id: String,

@@ -142,6 +142,30 @@ type FrameCancel = (id: number) => void;
 type TimeoutRequest = (cb: () => void, delay: number) => number;
 type TimeoutCancel = (id: number) => void;
 
+export const CHAT_USER_SCROLL_INTENT_TTL_MS = 1400;
+
+export function createUserScrollIntentTracker(
+  now: () => number = () => (typeof performance !== "undefined" ? performance.now() : Date.now()),
+  ttlMs = CHAT_USER_SCROLL_INTENT_TTL_MS,
+) {
+  let lastIntentAt = Number.NEGATIVE_INFINITY;
+
+  return {
+    mark() {
+      lastIntentAt = now();
+    },
+    isRecent(currentTime = now()) {
+      return currentTime - lastIntentAt <= ttlMs;
+    },
+    clear() {
+      lastIntentAt = Number.NEGATIVE_INFINITY;
+    },
+    lastIntentAt() {
+      return lastIntentAt;
+    },
+  };
+}
+
 function defaultFrameRequest(cb: FrameRequestCallback): number {
   if (typeof requestAnimationFrame === "function") {
     return requestAnimationFrame(cb);

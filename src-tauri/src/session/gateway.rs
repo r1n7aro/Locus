@@ -17,6 +17,7 @@ fn event_session_id(event: &StreamEvent) -> &str {
         StreamEvent::RunStart { session_id }
         | StreamEvent::UserMessage { session_id, .. }
         | StreamEvent::PendingInputQueued { session_id, .. }
+        | StreamEvent::PendingInputDeleted { session_id, .. }
         | StreamEvent::PendingInputAccepted { session_id, .. }
         | StreamEvent::TextDelta { session_id, .. }
         | StreamEvent::ThinkingDelta { session_id, .. }
@@ -46,6 +47,7 @@ fn event_type(event: &StreamEvent) -> &'static str {
         StreamEvent::RunStart { .. } => "runStart",
         StreamEvent::UserMessage { .. } => "userMessage",
         StreamEvent::PendingInputQueued { .. } => "pendingInputQueued",
+        StreamEvent::PendingInputDeleted { .. } => "pendingInputDeleted",
         StreamEvent::PendingInputAccepted { .. } => "pendingInputAccepted",
         StreamEvent::TextDelta { .. } => "textDelta",
         StreamEvent::ThinkingDelta { .. } => "thinkingDelta",
@@ -96,6 +98,7 @@ fn run_status_for_event(event: &StreamEvent) -> Option<(&'static str, Option<Str
         StreamEvent::Error { error, .. } => Some((RUN_STATUS_ERROR, Some(error.message.clone()))),
         StreamEvent::KnowledgeProposal { .. }
         | StreamEvent::PendingInputQueued { .. }
+        | StreamEvent::PendingInputDeleted { .. }
         | StreamEvent::PendingInputAccepted { .. } => None,
     }
 }
@@ -206,6 +209,8 @@ pub fn emit_stream(app_handle: &AppHandle, store: &SessionStore, run_id: &str, e
     }
     #[cfg(debug_assertions)]
     warn_if_run_session_mismatch(store, run_id, &session_id, event_kind);
+
+    store.apply_runtime_stream_event(run_id, &event);
 
     let mut run_status =
         run_status_for_event(&event).map(|(status, error_message)| SessionRunStatusUpdate {

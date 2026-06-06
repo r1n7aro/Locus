@@ -8,6 +8,7 @@ import { getToolPermissionMode, saveToolPermissionMode } from "../services/permi
 import * as sessionService from "../services/session";
 import * as undoService from "../services/undo";
 import { buildToolResultMessages, mergeUserMessage, reduceStreamEvent, type StreamMutation } from "../composables/useStreamReducer";
+import { resolveToolCallDisplayShape } from "../composables/toolCallBatches";
 import { hydrateChatMessagesIntent, withClientMessageId } from "../composables/chatInputIntents";
 import type { SessionScrollState } from "../composables/chatScrollState";
 import { t } from "../i18n";
@@ -25,7 +26,6 @@ import type {
   UndoConflictInfo,
   TodoSnapshot,
   TodoPanelMode,
-  SessionEventRecord,
   SessionRunSummary,
   AssistantRenderPart,
   PendingSessionInput,
@@ -112,6 +112,11 @@ function traceStreamEvent(event: StreamEvent) {
         pendingInputId: event.input.id,
         delivery: event.input.delivery ?? "after_run",
         mergeGroupId: event.input.mergeGroupId,
+      };
+    case "pendingInputDeleted":
+      return {
+        ...base,
+        pendingInputId: event.pendingInputId,
       };
     case "toolCallStart":
     case "toolCallDone":
@@ -241,22 +246,28 @@ function isActiveRunStatus(status: SessionRunSummary["status"] | null | undefine
     || status === "queued";
 }
 
-function streamEventFromRecord(record: SessionEventRecord): StreamEvent | null {
-  if (!record.payload || typeof record.payload !== "object") return null;
-  const payload = record.payload as Record<string, unknown>;
-  if (typeof payload.type !== "string") return null;
-  return {
-    ...payload,
-    runId: record.runId,
-  } as StreamEvent;
+function cloneRuntimeToolCalls(toolCalls: ToolCallDisplay[] | undefined): ToolCallDisplay[] {
+  return (toolCalls ?? []).map((toolCall) => {
+    const displayShape = resolveToolCallDisplayShape({
+      name: toolCall.name,
+      arguments: toolCall.arguments,
+    });
+    const nestedToolCalls = toolCall.nestedToolCalls
+      ? cloneRuntimeToolCalls(toolCall.nestedToolCalls)
+      : undefined;
+    return {
+      ...toolCall,
+      name: displayShape.name,
+      arguments: displayShape.arguments,
+      images: toolCall.images?.map((image) => ({ ...image })),
+      progress: toolCall.progress ? { ...toolCall.progress } : toolCall.progress,
+      nestedToolCalls,
+    };
+  });
 }
 
-function activeReplayEvents(
-  records: SessionEventRecord[],
-  afterSeq: number,
-): SessionEventRecord[] {
-  if (afterSeq > 0) return records;
-  return records;
+function cloneRuntimeJson<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
 }
 
 function normalizeToolPermissionMode(mode: string | null | undefined): ToolPermissionMode {
@@ -307,7 +318,6 @@ export const useChatStore = defineStore("chat", () => {
   const deferredUserMessagesByRun = new Map<string, ChatMessage[]>();
   const localPendingInputGroups = new Set<string>();
   const localFallbackPendingInputGroups = new Set<string>();
-  const replayedSessionEventSeqs = new Map<string, number>();
   const sessionScrollStates = ref(new Map<string, SessionScrollState>());
   const sessionAgentId = ref<string | null>(null);
   const toolPermissionMode = ref<ToolPermissionMode>("auto");
@@ -379,7 +389,6 @@ export const useChatStore = defineStore("chat", () => {
   const managedStreamingSessionIds = new Set<string>();
   const closedRunIds = new Map<string, string>();
   const cancelRequestedRunIds = new Map<string, string>();
-  let streamReplayDepth = 0;
   let activeSessionSelectionRestoreAttempted = false;
   let activeSessionSelectionPersistSeq = 0;
   const isCancelling = computed(() => {
@@ -509,6 +518,7 @@ export const useChatStore = defineStore("chat", () => {
     if (detail.agentId) {
       useAgentStore().selectAgent(detail.agentId);
     }
+    applySessionRuntimeSnapshot(detail);
   }
 
   function clearLoadedSessionState() {
@@ -530,22 +540,6 @@ export const useChatStore = defineStore("chat", () => {
     isCompacting.value = false;
   }
 
-  function runEventReplayKey(sessionId: string, runId: string): string {
-    return `${sessionId}\u{0}${runId}`;
-  }
-
-  function forgetRunReplaySeq(sessionId: string, runId?: string | null) {
-    if (runId) {
-      replayedSessionEventSeqs.delete(runEventReplayKey(sessionId, runId));
-      return;
-    }
-    for (const key of Array.from(replayedSessionEventSeqs.keys())) {
-      if (key.startsWith(`${sessionId}\u{0}`)) {
-        replayedSessionEventSeqs.delete(key);
-      }
-    }
-  }
-
   function trackActiveRun(sessionId: string, runId: string) {
     streamingSessionIds.value.add(sessionId);
     sessionRunIds.value.set(sessionId, runId);
@@ -562,10 +556,44 @@ export const useChatStore = defineStore("chat", () => {
     sessionRunIds.value.delete(sessionId);
     cancelRequestedRunIds.delete(sessionId);
     managedStreamingSessionIds.delete(sessionId);
-    forgetRunReplaySeq(sessionId, runId);
     if (runId) {
       deferredUserMessagesByRun.delete(runScopedKey(sessionId, runId));
     }
+  }
+
+  function applySessionRuntimeSnapshot(detail: SessionDetail) {
+    const runtime = detail.runtime;
+    if (!runtime || !isActiveRunStatus(runtime.activeRun.status)) {
+      const previousRunId = sessionRunIds.value.get(detail.id);
+      clearTrackedRun(detail.id, previousRunId);
+      if (activeSessionId.value === detail.id) {
+        currentRunId.value = null;
+        isStreaming.value = false;
+        resetStreamRuntimeState();
+      }
+      return;
+    }
+
+    trackActiveRun(detail.id, runtime.activeRun.runId);
+    if (activeSessionId.value !== detail.id) return;
+
+    resetStreamAnim();
+    rawStreamText.value = runtime.streamingText ?? "";
+    streamingText.value = rawStreamText.value;
+    streamingThinking.value = runtime.streamingThinking ?? "";
+    streamSequence.value = runtime.streamSequence ?? 0;
+    streamingTextOrder.value = runtime.streamingTextOrder ?? 0;
+    thinkingOrder.value = runtime.thinkingOrder ?? 0;
+    liveRenderParts.value = cloneRuntimeJson(runtime.liveRenderParts ?? []);
+    isThinking.value = runtime.isThinking === true;
+    thinkingStartTime.value = isThinking.value ? Date.now() : 0;
+    thinkingDuration.value = runtime.thinkingDuration ?? 0;
+    activeToolCalls.value = cloneRuntimeToolCalls(runtime.activeToolCalls);
+    pendingQuestion.value = runtime.pendingQuestion
+      ? cloneRuntimeJson(runtime.pendingQuestion)
+      : null;
+    pendingToolConfirms.value = cloneRuntimeJson(runtime.pendingToolConfirms ?? []);
+    isCompacting.value = runtime.isCompacting === true;
   }
 
   function clearDeferredUserMessagesForSession(sessionId: string) {
@@ -611,6 +639,21 @@ export const useChatStore = defineStore("chat", () => {
     pendingInputsBySession.value = next;
   }
 
+  function clearPendingInputTracking(sessionId: string, runId: string, mergeGroupId: string) {
+    const key = pendingInputMergeKey(sessionId, runId, mergeGroupId);
+    localPendingInputGroups.delete(key);
+    localFallbackPendingInputGroups.delete(key);
+  }
+
+  function markPendingInputDeleted(sessionId: string, pendingInputId: string) {
+    const deleted = visiblePendingInputs(pendingInputsBySession.value.get(sessionId))
+      .find((input) => input.id === pendingInputId);
+    if (deleted) {
+      clearPendingInputTracking(sessionId, deleted.runId, deleted.mergeGroupId);
+    }
+    removePendingInput(sessionId, (input) => input.id === pendingInputId);
+  }
+
   function clearRunPendingInputs(sessionId: string, runId: string) {
     removePendingInput(sessionId, (input) => input.runId === runId);
     for (const key of Array.from(localPendingInputGroups)) {
@@ -630,9 +673,7 @@ export const useChatStore = defineStore("chat", () => {
     const accepted = visiblePendingInputs(pendingInputsBySession.value.get(sessionId))
       .find((input) => input.id === pendingInputId);
     if (accepted) {
-      const key = pendingInputMergeKey(sessionId, accepted.runId, accepted.mergeGroupId);
-      localPendingInputGroups.delete(key);
-      localFallbackPendingInputGroups.delete(key);
+      clearPendingInputTracking(sessionId, accepted.runId, accepted.mergeGroupId);
     }
     removePendingInput(sessionId, (input) => input.id === pendingInputId);
   }
@@ -746,52 +787,8 @@ export const useChatStore = defineStore("chat", () => {
     return pending;
   }
 
-  async function listRunEvents(sessionId: string, runId: string, afterSeq: number) {
-    const all: SessionEventRecord[] = [];
-    let cursor = afterSeq;
-    const pageSize = 2_000;
-
-    for (;;) {
-      const page = await sessionService.listSessionEvents(sessionId, cursor, pageSize);
-      const runEvents = page.filter((record) => record.runId === runId);
-      all.push(...runEvents);
-      if (page.length === 0) break;
-      cursor = Math.max(cursor, ...page.map((record) => record.seq));
-      if (page.length < pageSize) break;
-    }
-
-    return all;
-  }
-
-  async function replayActiveRunEvents(sessionId: string, runId: string) {
-    const key = runEventReplayKey(sessionId, runId);
-    const afterSeq = replayedSessionEventSeqs.get(key) ?? 0;
-    const records = await listRunEvents(sessionId, runId, afterSeq);
-    if (records.length === 0) return;
-
-    replayedSessionEventSeqs.set(
-      key,
-      Math.max(afterSeq, ...records.map((record) => record.seq)),
-    );
-
-    const events = activeReplayEvents(records, afterSeq)
-      .map(streamEventFromRecord)
-      .filter((event): event is StreamEvent => !!event);
-    if (events.length === 0) return;
-
-    streamReplayDepth += 1;
-    try {
-      for (const event of events) {
-        handleStreamEvent(event);
-      }
-    } finally {
-      streamReplayDepth -= 1;
-    }
-  }
-
   async function hydrateSessionActiveRun(
     sessionId: string,
-    replay: boolean,
     options: { clearMissing?: boolean } = {},
   ) {
     try {
@@ -811,12 +808,10 @@ export const useChatStore = defineStore("chat", () => {
 
       const previousRunId = sessionRunIds.value.get(sessionId);
       trackActiveRun(sessionId, run.runId);
-      if (previousRunId && previousRunId !== run.runId) {
-        forgetRunReplaySeq(sessionId, previousRunId);
-      }
-
-      if (replay && activeSessionId.value === sessionId) {
-        await replayActiveRunEvents(sessionId, run.runId);
+      if (previousRunId && previousRunId !== run.runId && activeSessionId.value === sessionId) {
+        activeToolCalls.value = [];
+        pendingQuestion.value = null;
+        pendingToolConfirms.value = [];
       }
     } catch (e) {
       console.warn("hydrate active session run failed:", e);
@@ -827,10 +822,8 @@ export const useChatStore = defineStore("chat", () => {
     const activeSessions = nextSessions.filter((session) =>
       isActiveRuntimeStatus(session.runtimeStatus ?? null));
     await Promise.all(activeSessions.map(async (session) => {
-      const alreadyTracked = sessionRunIds.value.has(session.id);
       await hydrateSessionActiveRun(
         session.id,
-        activeSessionId.value === session.id && !alreadyTracked,
         { clearMissing: false },
       );
     }));
@@ -856,7 +849,6 @@ export const useChatStore = defineStore("chat", () => {
         detail.latestCompletedRunId ?? null,
       );
       applySessionData(detail, usage, sessionTodos, undoEntries);
-      await hydrateSessionActiveRun(id, true);
     } catch (e) {
       if (loadSeq !== sessionLoadSeq || activeSessionId.value !== id) return;
       console.error("load_session failed:", e);
@@ -1338,7 +1330,6 @@ export const useChatStore = defineStore("chat", () => {
       messagesAfterMutation: traceMessageOrder(messages.value),
       activeToolCallsBeforeMutation,
       activeToolCallsAfterMutation: traceToolCallOrder(activeToolCalls.value),
-      streamReplayDepth,
     }));
   }
 
@@ -1348,7 +1339,6 @@ export const useChatStore = defineStore("chat", () => {
       event: traceStreamEvent(event),
       expectedRunId: sessionRunIds.value.get(event.sessionId)
         ?? (event.sessionId === activeSessionId.value ? currentRunId.value : null),
-      streamReplayDepth,
       pendingInputs: visiblePendingInputs(pendingInputsBySession.value.get(event.sessionId)).map((input, index) => ({
         index,
         id: input.id,
@@ -1481,6 +1471,11 @@ export const useChatStore = defineStore("chat", () => {
 
     if (event.type === "pendingInputQueued") {
       upsertPendingInput(event.input);
+      return true;
+    }
+
+    if (event.type === "pendingInputDeleted") {
+      markPendingInputDeleted(event.sessionId, event.pendingInputId);
       return true;
     }
 
@@ -1645,7 +1640,6 @@ export const useChatStore = defineStore("chat", () => {
       event: traceStreamEvent(event),
       mutationCount: mutations.length,
       mutations: mutations.map(traceStreamMutation),
-      streamReplayDepth,
     }));
     for (const m of mutations) {
       applyMutation(m);
@@ -1774,7 +1768,6 @@ export const useChatStore = defineStore("chat", () => {
     pendingManagedUnboundSession = false;
     closedRunIds.clear();
     cancelRequestedRunIds.clear();
-    replayedSessionEventSeqs.clear();
     pendingInputsBySession.value = new Map();
     acceptedPendingInputIds.clear();
     deferredUserMessagesByRun.clear();
@@ -1811,7 +1804,6 @@ export const useChatStore = defineStore("chat", () => {
     pendingManagedUnboundSession = false;
     closedRunIds.clear();
     cancelRequestedRunIds.clear();
-    replayedSessionEventSeqs.clear();
     sessions.value = [];
     pendingInputsBySession.value = new Map();
     acceptedPendingInputIds.clear();
@@ -2052,6 +2044,35 @@ export const useChatStore = defineStore("chat", () => {
     }
   }
 
+  async function deleteActiveQueuedFollowUp(): Promise<boolean> {
+    const sessionId = activeSessionId.value;
+    const targets = activeQueuedFollowUps.value;
+    if (!sessionId || targets.length === 0) return false;
+
+    try {
+      await Promise.all(
+        targets.map((input) =>
+          sessionService.deletePendingChatInput(
+            input.sessionId,
+            input.runId,
+            input.id,
+          )),
+      );
+      for (const input of targets) {
+        markPendingInputDeleted(input.sessionId, input.id);
+      }
+      return true;
+    } catch (e) {
+      const err = normalizeAppError(e);
+      useNotificationStore().addNotice("error", t("app.sendFailed", err.message), {
+        code: err.code,
+        operation: "chat",
+        skipConsoleLog: true,
+      });
+      return false;
+    }
+  }
+
   async function sendMessage(
     text: string,
     images: ImageAttachment[] = [],
@@ -2146,13 +2167,9 @@ export const useChatStore = defineStore("chat", () => {
         pendingManagedSessionId,
       });
 
-      const previousRunId = sessionRunIds.value.get(sid) ?? null;
       streamingSessionIds.value.add(sid);
       sessionRunIds.value.set(sid, runId);
       useChatChangesStore().setActiveRunId(sid, runId);
-      if (previousRunId && previousRunId !== runId) {
-        forgetRunReplaySeq(sid, previousRunId);
-      }
       closedRunIds.delete(sid);
       cancelRequestedRunIds.delete(sid);
       pendingSessionId = null;
@@ -2248,13 +2265,9 @@ export const useChatStore = defineStore("chat", () => {
         pendingManagedSessionId,
       });
 
-      const previousRunId = sessionRunIds.value.get(sid) ?? null;
       streamingSessionIds.value.add(sid);
       sessionRunIds.value.set(sid, runId);
       useChatChangesStore().setActiveRunId(sid, runId);
-      if (previousRunId && previousRunId !== runId) {
-        forgetRunReplaySeq(sid, previousRunId);
-      }
       closedRunIds.delete(sid);
       cancelRequestedRunIds.delete(sid);
       pendingSessionId = null;
@@ -2654,6 +2667,7 @@ export const useChatStore = defineStore("chat", () => {
     activeQueuedFollowUps,
     activeQueuedFollowUp,
     insertActiveQueuedFollowUp,
+    deleteActiveQueuedFollowUp,
     streamingSessionIds,
     undoableMessageIds,
     rememberSessionScrollState,

@@ -21,8 +21,8 @@ use crate::knowledge_store::{self, KnowledgeDocument, KnowledgeInjectMode, Knowl
 use crate::session::models::{
     AssetRefData, ChatMessage, ImageData, KnowledgeProposalItem, KnowledgeProposalItemKind,
     KnowledgeProposalStatus, PendingSessionInput, SessionDetail, SessionEventRecord,
-    SessionRunSummary, SessionRuntimeStatus, SessionSummary, TodoItem, TodoSnapshot,
-    UserIntentPayload,
+    SessionRunSummary, SessionRuntimeSnapshot, SessionRuntimeStatus, SessionSummary, TodoItem,
+    TodoSnapshot, UserIntentPayload,
 };
 use crate::session::pending_inputs::QueuePendingInputRequest;
 use crate::session::store::{SessionStore, CHILD_SESSION_FORK_ERROR};
@@ -214,6 +214,52 @@ fn current_unix_millis() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
+}
+
+fn fallback_runtime_snapshot(session_id: &str, run_id: &str) -> SessionRuntimeSnapshot {
+    let now = current_unix_millis() / 1000;
+    SessionRuntimeSnapshot {
+        active_run: SessionRunSummary {
+            run_id: run_id.to_string(),
+            session_id: session_id.to_string(),
+            status: "running".to_string(),
+            started_at: now,
+            updated_at: now,
+            finished_at: None,
+            error_message: None,
+        },
+        active_tool_calls: Vec::new(),
+        streaming_text: String::new(),
+        streaming_thinking: String::new(),
+        live_render_parts: Vec::new(),
+        stream_sequence: 0,
+        streaming_text_order: 0,
+        thinking_order: 0,
+        is_thinking: false,
+        thinking_duration: 0,
+        pending_question: None,
+        pending_tool_confirms: Vec::new(),
+        is_compacting: false,
+    }
+}
+
+async fn active_task_run_id(active_tasks: &ActiveTasks, session_id: &str) -> Option<String> {
+    active_tasks
+        .lock()
+        .await
+        .get(session_id)
+        .map(|task| task.run_id.clone())
+}
+
+fn runtime_snapshot_for_active_task(
+    store: &SessionStore,
+    session_id: &str,
+    run_id: &str,
+) -> SessionRuntimeSnapshot {
+    store
+        .runtime_snapshot_for_session(session_id)
+        .filter(|snapshot| snapshot.active_run.run_id == run_id)
+        .unwrap_or_else(|| fallback_runtime_snapshot(session_id, run_id))
 }
 
 fn knowledge_title_from_path(path: &str) -> String {
@@ -1184,6 +1230,7 @@ pub async fn chat(
             "[Locus] active task cleared for session {} run {} removed={}",
             sid_for_cleanup, current_run_id, removed
         );
+        store_for_task.clear_runtime_run_if_current(&sid_for_cleanup, &current_run_id);
         let _ = done_tx.send(true);
     });
 
@@ -1292,18 +1339,8 @@ pub async fn queue_chat_input(
         }
     }
 
-    let run = store
-        .active_run_for_session(&session_id)
-        .map_err(AppError::from)?
-        .filter(|run| run.run_id == run_id);
-    let Some(run) = run else {
-        return Err(AppError::new(
-            "session.pending_input.no_active_run",
-            "Session has no active run for queued input.",
-        )
-        .operation("chat")
-        .retryable(true));
-    };
+    let run =
+        runtime_snapshot_for_active_task(store.inner().as_ref(), &session_id, &run_id).active_run;
     if !matches!(
         run.status.as_str(),
         "queued" | "starting" | "running" | "waiting_input"
@@ -1401,18 +1438,8 @@ pub async fn insert_pending_chat_input(
         }
     }
 
-    let run = store
-        .active_run_for_session(&session_id)
-        .map_err(AppError::from)?
-        .filter(|run| run.run_id == run_id);
-    let Some(run) = run else {
-        return Err(AppError::new(
-            "session.pending_input.no_active_run",
-            "Session has no active run for queued input.",
-        )
-        .operation("chat")
-        .retryable(true));
-    };
+    let run =
+        runtime_snapshot_for_active_task(store.inner().as_ref(), &session_id, &run_id).active_run;
     if !matches!(
         run.status.as_str(),
         "queued" | "starting" | "running" | "waiting_input"
@@ -1461,10 +1488,50 @@ pub async fn insert_pending_chat_input(
 }
 
 #[tauri::command]
+pub async fn delete_pending_chat_input(
+    session_id: String,
+    run_id: String,
+    pending_input_id: Option<String>,
+    app_handle: AppHandle,
+    store: State<'_, Arc<SessionStore>>,
+    pending_input_queue: State<'_, PendingInputQueueHandle>,
+) -> Result<bool, AppError> {
+    let deleted = {
+        let mut queue = pending_input_queue.lock().map_err(|e| {
+            AppError::new(
+                "session.pending_input.lock_failed",
+                "Pending input queue is unavailable.",
+            )
+            .detail(e.to_string())
+            .operation("chat")
+            .retryable(true)
+        })?;
+        queue.delete_input(&session_id, &run_id, pending_input_id.as_deref())
+    };
+
+    let Some(deleted) = deleted else {
+        return Ok(false);
+    };
+
+    emit_session_stream_with_run_id(
+        &app_handle,
+        store.inner().as_ref(),
+        run_id,
+        StreamEvent::PendingInputDeleted {
+            session_id,
+            pending_input_id: deleted.id,
+        },
+    );
+
+    Ok(true)
+}
+
+#[tauri::command]
 pub async fn load_session(
     session_id: String,
     store: State<'_, Arc<SessionStore>>,
     pending_input_queue: State<'_, PendingInputQueueHandle>,
+    active_tasks: State<'_, ActiveTasks>,
 ) -> Result<SessionDetail, AppError> {
     let mut detail = store.load_session(&session_id).map_err(AppError::from)?;
     detail.pending_inputs = pending_input_queue
@@ -1478,6 +1545,15 @@ pub async fn load_session(
             .operation("loadSession")
         })?
         .list_session(&session_id);
+    if let Some(run_id) = active_task_run_id(active_tasks.inner(), &session_id).await {
+        detail.runtime = Some(runtime_snapshot_for_active_task(
+            store.inner().as_ref(),
+            &session_id,
+            &run_id,
+        ));
+    } else {
+        store.clear_runtime_session(&session_id);
+    }
     Ok(detail)
 }
 
@@ -1548,16 +1624,21 @@ pub async fn list_sessions(
     let mut sessions = store
         .list_sessions(ws_id.as_deref())
         .map_err(AppError::from)?;
-    let active_session_ids: HashSet<String> = active_tasks.lock().await.keys().cloned().collect();
+    let active_session_runs: HashMap<String, String> = active_tasks
+        .lock()
+        .await
+        .iter()
+        .map(|(session_id, task)| (session_id.clone(), task.run_id.clone()))
+        .collect();
     for session in &mut sessions {
-        session.runtime_status = if active_session_ids.contains(&session.id) {
-            store
-                .active_run_for_session(&session.id)
-                .ok()
-                .flatten()
-                .map(|run| runtime_status_from_run_status(&run.status))
+        session.runtime_status = if let Some(run_id) = active_session_runs.get(&session.id) {
+            let snapshot = store.runtime_snapshot_for_session(&session.id);
+            snapshot
+                .filter(|snapshot| snapshot.active_run.run_id == *run_id)
+                .map(|snapshot| runtime_status_from_run_status(&snapshot.active_run.status))
                 .or(Some(SessionRuntimeStatus::Running))
         } else {
+            store.clear_runtime_session(&session.id);
             None
         };
     }
@@ -1677,10 +1758,15 @@ pub async fn get_session_usage(
 pub async fn get_session_active_run(
     session_id: String,
     store: State<'_, Arc<SessionStore>>,
+    active_tasks: State<'_, ActiveTasks>,
 ) -> Result<Option<SessionRunSummary>, AppError> {
-    store
-        .active_run_for_session(&session_id)
-        .map_err(Into::into)
+    let Some(run_id) = active_task_run_id(active_tasks.inner(), &session_id).await else {
+        store.clear_runtime_session(&session_id);
+        return Ok(None);
+    };
+    Ok(Some(
+        runtime_snapshot_for_active_task(store.inner().as_ref(), &session_id, &run_id).active_run,
+    ))
 }
 
 #[tauri::command]
@@ -3332,6 +3418,7 @@ mod tests {
                 render_parts: None,
             }],
             pending_inputs: vec![],
+            runtime: None,
         };
 
         let markdown = format_session_detail_as_markdown(&detail, &[], None, None, true, None);
@@ -3398,6 +3485,7 @@ mod tests {
                 render_parts: None,
             }],
             pending_inputs: vec![],
+            runtime: None,
         };
 
         let markdown = format_session_detail_as_markdown(&detail, &[], None, None, true, None);
@@ -3423,6 +3511,7 @@ mod tests {
             updated_at: 20,
             messages: vec![],
             pending_inputs: vec![],
+            runtime: None,
         };
 
         let markdown = format_session_detail_as_markdown(
