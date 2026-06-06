@@ -11,7 +11,8 @@ use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, Webview
 use tokio::io::AsyncWriteExt;
 
 pub const VIEW_SCHEMA: &str = "locus.view.v1";
-pub const VIEW_API_VERSION: u32 = 1;
+pub const VIEW_API_VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"));
+pub const LEGACY_VIEW_API_VERSION: &str = "v0.3.0";
 pub const VIEW_TREE_METADATA_SCHEMA: &str = "locus.view.tree.v1";
 pub const VIEW_ROOT_RELATIVE: &str = "Locus/View";
 pub const VIEW_WORKSPACE_SRC_DIR: &str = "src";
@@ -40,8 +41,90 @@ const VIEW_STORAGE_REL_PATH: &str = ".locus/data/storage.json";
 
 mod templates;
 
-fn default_view_api_version() -> u32 {
-    VIEW_API_VERSION
+fn default_view_api_version() -> String {
+    LEGACY_VIEW_API_VERSION.to_string()
+}
+
+fn normalize_view_api_version_value(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if trimmed == "1" {
+        return LEGACY_VIEW_API_VERSION.to_string();
+    }
+    if let Some(version) = trimmed
+        .strip_prefix('v')
+        .or_else(|| trimmed.strip_prefix('V'))
+    {
+        return format!("v{}", version);
+    }
+    format!("v{}", trimmed)
+}
+
+fn deserialize_view_api_version<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct ViewApiVersionVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for ViewApiVersionVisitor {
+        type Value = String;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a View API version string such as v0.3.0")
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(normalize_view_api_version_value(value))
+        }
+
+        fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(normalize_view_api_version_value(&value))
+        }
+
+        fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            if value == 1 {
+                Ok(LEGACY_VIEW_API_VERSION.to_string())
+            } else {
+                Ok(value.to_string())
+            }
+        }
+
+        fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            if value == 1 {
+                Ok(LEGACY_VIEW_API_VERSION.to_string())
+            } else {
+                Ok(value.to_string())
+            }
+        }
+    }
+
+    deserializer.deserialize_any(ViewApiVersionVisitor)
+}
+
+fn supported_view_api_version_labels() -> String {
+    if VIEW_API_VERSION == LEGACY_VIEW_API_VERSION {
+        VIEW_API_VERSION.to_string()
+    } else {
+        format!("{}, {}", VIEW_API_VERSION, LEGACY_VIEW_API_VERSION)
+    }
+}
+
+fn is_supported_view_api_version(value: &str) -> bool {
+    value == VIEW_API_VERSION || value == LEGACY_VIEW_API_VERSION
 }
 
 #[derive(Debug, Default)]
@@ -161,7 +244,7 @@ pub struct ViewRequirements {
 #[serde(rename_all = "camelCase")]
 pub struct ViewManifest {
     pub schema: String,
-    pub api_version: u32,
+    pub api_version: String,
     pub id: String,
     pub name: String,
     pub version: String,
@@ -190,8 +273,11 @@ impl<'de> Deserialize<'de> for ViewManifest {
         #[serde(rename_all = "camelCase")]
         struct CompatViewManifest {
             schema: String,
-            #[serde(default = "default_view_api_version")]
-            api_version: u32,
+            #[serde(
+                default = "default_view_api_version",
+                deserialize_with = "deserialize_view_api_version"
+            )]
+            api_version: String,
             id: String,
             name: String,
             version: String,
@@ -260,7 +346,7 @@ pub struct ViewTemplateSummary {
 pub struct ViewPackageSummary {
     pub id: String,
     pub name: String,
-    pub api_version: u32,
+    pub api_version: String,
     pub version: String,
     pub template: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1021,10 +1107,11 @@ pub fn validate_view_manifest(manifest: &ViewManifest) -> Result<(), String> {
     if manifest.schema != VIEW_SCHEMA {
         return Err(format!("Unsupported View schema: {}", manifest.schema));
     }
-    if manifest.api_version != VIEW_API_VERSION {
+    if !is_supported_view_api_version(&manifest.api_version) {
         return Err(format!(
-            "Unsupported View apiVersion: {}. Expected {}.",
-            manifest.api_version, VIEW_API_VERSION
+            "Unsupported View apiVersion: {}. Expected one of: {}.",
+            manifest.api_version,
+            supported_view_api_version_labels()
         ));
     }
     normalize_view_id(&manifest.id)?;
@@ -1388,7 +1475,7 @@ fn summary_from_manifest_with_source(
     ViewPackageSummary {
         id: manifest.id.clone(),
         name: manifest.name.clone(),
-        api_version: manifest.api_version,
+        api_version: manifest.api_version.clone(),
         version: manifest.version.clone(),
         template: manifest.template.clone(),
         icon: manifest.icon.clone(),
@@ -2496,9 +2583,20 @@ pub fn export_view_package_sync(
             .to_string_lossy()
             .replace('\\', "/");
         let rel_path = normalize_package_rel_path(&rel_path)?;
+        let is_manifest_file = rel_path == "view.json";
         archive
             .start_file(rel_path, options)
             .map_err(|error| zip_error("Failed to write View package archive entry", error))?;
+        if is_manifest_file {
+            let manifest_raw = serde_json::to_string_pretty(&manifest)
+                .map_err(|e| format!("Failed to serialize View manifest: {}", e))?;
+            archive
+                .write_all((manifest_raw + "\n").as_bytes())
+                .map_err(|e| {
+                    format!("Failed to write archive data for {}: {}", path.display(), e)
+                })?;
+            continue;
+        }
         let mut input = std::fs::File::open(&path)
             .map_err(|e| format!("Failed to open {}: {}", path.display(), e))?;
         std::io::copy(&mut input, &mut archive)
@@ -6027,14 +6125,15 @@ mod tests {
         UnitySerializedPropertyDiscoverResult, UnitySerializedPropertyTarget,
         UnitySerializedPropertyWriteResult, ViewExportPackageRequest, ViewFrontendLogReadRequest,
         ViewFrontendLogRequest, ViewImportPackageRequest, ViewManifest, ViewSetTabHostRequest,
-        ViewStorageGetRequest, ViewStorageRemoveRequest, ViewStorageSetRequest, VIEW_API_VERSION,
-        VIEW_ROOT_RELATIVE, VIEW_SCHEMA,
+        ViewStorageGetRequest, ViewStorageRemoveRequest, ViewStorageSetRequest,
+        LEGACY_VIEW_API_VERSION, VIEW_API_VERSION, VIEW_ROOT_RELATIVE, VIEW_SCHEMA,
     };
     use notify::{
         event::{DataChange, ModifyKind},
         Event, EventKind,
     };
     use serde_json::json;
+    use std::io::Read;
     use std::path::PathBuf;
     use tempfile::tempdir;
 
@@ -6116,6 +6215,7 @@ mod tests {
             .find(|view| view.id == "plugin-asset-inspector")
             .expect("plugin view should be listed");
         assert_eq!(view.source, "pluginProject");
+        assert_eq!(view.api_version, LEGACY_VIEW_API_VERSION);
         assert_eq!(view.plugin_id.as_deref(), Some("com.example.view-plugin"));
         assert_eq!(
             view.plugin_scope,
@@ -6252,7 +6352,7 @@ mod tests {
     fn manifest_validation_checks_schema_id_and_paths() {
         let mut manifest = ViewManifest {
             schema: VIEW_SCHEMA.to_string(),
-            api_version: VIEW_API_VERSION,
+            api_version: VIEW_API_VERSION.to_string(),
             id: "material-inspector".to_string(),
             name: "Material Inspector".to_string(),
             version: "0.1.0".to_string(),
@@ -6295,7 +6395,7 @@ mod tests {
         .expect("write legacy manifest");
 
         let manifest = load_manifest_from_root(&root).expect("load legacy manifest");
-        assert_eq!(manifest.api_version, VIEW_API_VERSION);
+        assert_eq!(manifest.api_version, LEGACY_VIEW_API_VERSION);
         assert!(manifest.capabilities.unity);
         assert!(view_manifest_requirements(&manifest).unity_connection);
 
@@ -6309,9 +6409,31 @@ mod tests {
             .iter()
             .find(|view| view.id == "legacy-inspector")
             .expect("legacy view should stay visible");
-        assert_eq!(summary.api_version, VIEW_API_VERSION);
+        assert_eq!(summary.api_version, LEGACY_VIEW_API_VERSION);
         assert!(summary.capabilities.unity);
         assert!(summary.requirements.unity_connection);
+
+        let archive_path = temp.path().join("legacy-inspector.zip");
+        export_view_package_sync(
+            &working_dir,
+            ViewExportPackageRequest {
+                view_id: "legacy-inspector".to_string(),
+                file_path: archive_path.to_string_lossy().to_string(),
+            },
+        )
+        .expect("export legacy view");
+        let archive_file = std::fs::File::open(&archive_path).expect("open legacy archive");
+        let mut archive = zip::ZipArchive::new(archive_file).expect("read legacy archive");
+        let mut manifest_file = archive
+            .by_name("view.json")
+            .expect("read exported manifest");
+        let mut manifest_raw = String::new();
+        manifest_file
+            .read_to_string(&mut manifest_raw)
+            .expect("read exported manifest content");
+        let exported: serde_json::Value =
+            serde_json::from_str(&manifest_raw).expect("parse exported manifest");
+        assert_eq!(exported["apiVersion"], LEGACY_VIEW_API_VERSION);
     }
 
     #[test]
@@ -6332,6 +6454,7 @@ mod tests {
         .expect("create view");
 
         assert_eq!(created.manifest.id, "material-inspector");
+        assert_eq!(created.manifest.api_version, VIEW_API_VERSION);
         assert_eq!(created.manifest.icon.as_deref(), Some("View"));
         let package_root = default_test_view_package_root(&working_dir);
         assert!(package_root.join("material-inspector/view.json").is_file());
@@ -6784,7 +6907,7 @@ mod tests {
 
         let manifest = ViewManifest {
             schema: VIEW_SCHEMA.to_string(),
-            api_version: VIEW_API_VERSION,
+            api_version: VIEW_API_VERSION.to_string(),
             id: "material-inspector".to_string(),
             name: "Material Inspector".to_string(),
             version: "0.1.0".to_string(),

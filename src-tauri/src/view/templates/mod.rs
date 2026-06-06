@@ -108,7 +108,7 @@ pub(super) fn template_manifest(
 
     ViewManifest {
         schema: VIEW_SCHEMA.to_string(),
-        api_version: VIEW_API_VERSION,
+        api_version: VIEW_API_VERSION.to_string(),
         id: id.to_string(),
         name: name.to_string(),
         version: "0.1.0".to_string(),
