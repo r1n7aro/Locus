@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   TranscriptElementSample,
   TranscriptLayoutSnapshot,
@@ -10,7 +10,26 @@ import type {
 import {
   compareToolBlockLayoutSnapshots,
   compareTranscriptLayoutSnapshots,
+  isLayoutDiagnosticsEnabled,
 } from "../services/layoutDiagnostics";
+
+function createStorageMock() {
+  const store = new Map<string, string>();
+  return {
+    getItem(key: string) {
+      return store.has(key) ? store.get(key)! : null;
+    },
+    setItem(key: string, value: string) {
+      store.set(key, value);
+    },
+    removeItem(key: string) {
+      store.delete(key);
+    },
+    clear() {
+      store.clear();
+    },
+  };
+}
 
 function style(overrides: Partial<ToolLayoutStyle> = {}): ToolLayoutStyle {
   return {
@@ -149,6 +168,36 @@ function transcriptSnapshot(
 }
 
 describe("layoutDiagnostics", () => {
+  describe("enablement", () => {
+    beforeEach(() => {
+      vi.stubGlobal("window", { location: { search: "" } });
+      vi.stubGlobal("localStorage", createStorageMock());
+      vi.stubGlobal("sessionStorage", createStorageMock());
+    });
+
+    afterEach(() => {
+      vi.unstubAllGlobals();
+    });
+
+    it("stays disabled by default even when the legacy persistent flag remains", () => {
+      localStorage.setItem("locus:layoutDiagnostics", "1");
+
+      expect(isLayoutDiagnosticsEnabled()).toBe(false);
+    });
+
+    it("can be enabled for the current browser session", () => {
+      sessionStorage.setItem("locus:layoutDiagnostics", "1");
+
+      expect(isLayoutDiagnosticsEnabled()).toBe(true);
+    });
+
+    it("can be enabled from the window query", () => {
+      vi.stubGlobal("window", { location: { search: "?layoutDiagnostics=1" } });
+
+      expect(isLayoutDiagnosticsEnabled()).toBe(true);
+    });
+  });
+
   it("classifies transient to history movement as handoff reposition", () => {
     const before = sample({});
     const after = sample({

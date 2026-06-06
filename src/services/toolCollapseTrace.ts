@@ -3,6 +3,14 @@ const traceStartMs =
     ? performance.now()
     : Date.now();
 
+const ENABLED_SESSION_STORAGE_KEY = "locus.toolCollapseTraceEnabled";
+const MODE_SESSION_STORAGE_KEY = "locus.toolCollapseTrace";
+const MODE_QUERY_KEYS = ["toolCollapseTrace", "locusToolCollapseTrace"];
+const ENABLED_QUERY_KEYS = ["toolCollapseTraceEnabled", "locusToolCollapseTraceEnabled"];
+const TOOL_COLLAPSE_TRACE_MODES = ["all", "handoff", "waiting"] as const;
+
+type ToolCollapseTraceMode = typeof TOOL_COLLAPSE_TRACE_MODES[number];
+
 const TOOL_COLLAPSE_HANDOFF_EVENTS = new Set([
   "activeToolCallsCleared",
   "activeToolCallsResumedWithHandoff",
@@ -40,13 +48,41 @@ const TOOL_COLLAPSE_HANDOFF_EVENTS = new Set([
   "transientRenderSegmentsChanged",
 ]);
 
+function normalizeTraceMode(value: string | null | undefined): ToolCollapseTraceMode | null {
+  return TOOL_COLLAPSE_TRACE_MODES.includes(value as ToolCollapseTraceMode)
+    ? value as ToolCollapseTraceMode
+    : null;
+}
+
+function queryTraceMode(): ToolCollapseTraceMode | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const params = new URLSearchParams(window.location.search);
+    for (const key of MODE_QUERY_KEYS) {
+      const mode = normalizeTraceMode(params.get(key));
+      if (mode) return mode;
+    }
+    if (ENABLED_QUERY_KEYS.some((key) => params.get(key) === "1")) {
+      return "handoff";
+    }
+  } catch {
+    // ignore URL parsing failures
+  }
+  return null;
+}
+
+function sessionTraceMode(): ToolCollapseTraceMode | null {
+  if (typeof sessionStorage === "undefined") return null;
+  try {
+    if (sessionStorage.getItem(ENABLED_SESSION_STORAGE_KEY) !== "true") return null;
+    return normalizeTraceMode(sessionStorage.getItem(MODE_SESSION_STORAGE_KEY));
+  } catch {
+    return null;
+  }
+}
+
 function shouldTraceEvent(event: string) {
-  if (typeof localStorage === "undefined") return false;
-
-  const enabled = localStorage.getItem("locus.toolCollapseTraceEnabled") === "true";
-  if (!enabled) return false;
-
-  const mode = localStorage.getItem("locus.toolCollapseTrace");
+  const mode = queryTraceMode() ?? sessionTraceMode();
   if (mode === "all") return true;
   if (mode === "handoff") return TOOL_COLLAPSE_HANDOFF_EVENTS.has(event);
   if (mode === "waiting") return event === "waitingLayoutStateChanged";

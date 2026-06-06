@@ -1,4 +1,4 @@
-const STORAGE_KEY = "locus:layoutDiagnostics";
+const SESSION_STORAGE_KEY = "locus:layoutDiagnostics";
 const QUERY_KEYS = ["layoutDiagnostics", "locusLayoutDiagnostics"];
 const FLUSH_DELAY_MS = 500;
 const TOOL_LAYOUT_SELECTOR = [
@@ -314,7 +314,7 @@ function diagnosticsEnabled(): boolean {
   }
 
   try {
-    return localStorage.getItem(STORAGE_KEY) === "1";
+    return sessionStorage.getItem(SESSION_STORAGE_KEY) === "1";
   } catch {
     return false;
   }
