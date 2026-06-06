@@ -183,23 +183,14 @@ fn is_real_user_message(message: &ChatMessage) -> bool {
 }
 
 fn estimate_tool_call_prompt_tokens(tool_call: &ToolCallInfo) -> u32 {
-    let mut total = TOOL_CALL_OVERHEAD_TOKENS
+    // Match provider payload builders: nested subagent history is display metadata,
+    // and local tool output is replayed through Tool messages rather than recorded_output.
+    TOOL_CALL_OVERHEAD_TOKENS
         .saturating_add(estimate_text_tokens(&tool_call.name))
         .saturating_add(estimate_text_tokens(&tool_call.arguments))
         .saturating_add(estimate_text_tokens(
             tool_call.server_tool_output.as_deref().unwrap_or_default(),
         ))
-        .saturating_add(estimate_text_tokens(
-            tool_call.recorded_output.as_deref().unwrap_or_default(),
-        ));
-
-    if let Some(nested_tool_calls) = tool_call.nested_tool_calls.as_ref() {
-        for nested in nested_tool_calls {
-            total = total.saturating_add(estimate_tool_call_prompt_tokens(nested));
-        }
-    }
-
-    total
 }
 
 fn estimate_message_prompt_tokens(message: &ChatMessage) -> u32 {
@@ -1764,6 +1755,141 @@ mod tests {
         let estimated = estimate_request_tokens(&["system"], &messages, &tools);
         assert!(estimated < 60_000);
         assert!(!should_codex_auto_compact(estimated, 258_400));
+    }
+
+    #[test]
+    fn token_estimator_ignores_nested_subagent_tool_history() {
+        let task_arguments =
+            r#"{"description":"scan","prompt":"inspect project","subagent_type":"explorer"}"#;
+        let task_call = ToolCallInfo {
+            id: "task-1".to_string(),
+            name: "task".to_string(),
+            arguments: task_arguments.to_string(),
+            order: None,
+            server_tool: None,
+            server_tool_output: None,
+            outcome: None,
+            recorded_output: None,
+            nested_tool_calls: None,
+        };
+        let mut task_call_with_nested = task_call.clone();
+        task_call_with_nested.nested_tool_calls = Some(vec![ToolCallInfo {
+            id: "read-1".to_string(),
+            name: "read".to_string(),
+            arguments: "large nested args ".repeat(20_000),
+            order: None,
+            server_tool: None,
+            server_tool_output: None,
+            outcome: Some(crate::commands::ToolCallOutcome::Done),
+            recorded_output: Some("nested output ".repeat(60_000)),
+            nested_tool_calls: None,
+        }]);
+
+        let without_nested = vec![
+            make_message("user-1", MessageRole::User, "delegate", 100, None, None),
+            make_message(
+                "assistant-1",
+                MessageRole::Assistant,
+                "",
+                101,
+                Some(vec![task_call]),
+                None,
+            ),
+            make_message(
+                "tool-1",
+                MessageRole::Tool,
+                "subagent final answer",
+                102,
+                None,
+                Some("task-1"),
+            ),
+        ];
+        let with_nested = vec![
+            make_message("user-1", MessageRole::User, "delegate", 100, None, None),
+            make_message(
+                "assistant-1",
+                MessageRole::Assistant,
+                "",
+                101,
+                Some(vec![task_call_with_nested]),
+                None,
+            ),
+            make_message(
+                "tool-1",
+                MessageRole::Tool,
+                "subagent final answer",
+                102,
+                None,
+                Some("task-1"),
+            ),
+        ];
+
+        let baseline = estimate_request_tokens(&["system"], &without_nested, &[]);
+        let estimated = estimate_request_tokens(&["system"], &with_nested, &[]);
+
+        assert_eq!(estimated, baseline);
+        assert!(!should_codex_auto_compact(estimated, 258_400));
+    }
+
+    #[test]
+    fn token_estimator_ignores_recorded_output_replayed_by_tool_message() {
+        let tool_call = ToolCallInfo {
+            id: "tc-1".to_string(),
+            name: "read".to_string(),
+            arguments: r#"{"path":"src/main.rs"}"#.to_string(),
+            order: None,
+            server_tool: None,
+            server_tool_output: None,
+            outcome: None,
+            recorded_output: None,
+            nested_tool_calls: None,
+        };
+        let mut tool_call_with_recorded_output = tool_call.clone();
+        tool_call_with_recorded_output.recorded_output = Some("duplicated output ".repeat(80_000));
+
+        let without_recorded_output = vec![
+            make_message("user-1", MessageRole::User, "inspect", 100, None, None),
+            make_message(
+                "assistant-1",
+                MessageRole::Assistant,
+                "running tool",
+                101,
+                Some(vec![tool_call]),
+                None,
+            ),
+            make_message(
+                "tool-1",
+                MessageRole::Tool,
+                "actual tool output",
+                102,
+                None,
+                Some("tc-1"),
+            ),
+        ];
+        let with_recorded_output = vec![
+            make_message("user-1", MessageRole::User, "inspect", 100, None, None),
+            make_message(
+                "assistant-1",
+                MessageRole::Assistant,
+                "running tool",
+                101,
+                Some(vec![tool_call_with_recorded_output]),
+                None,
+            ),
+            make_message(
+                "tool-1",
+                MessageRole::Tool,
+                "actual tool output",
+                102,
+                None,
+                Some("tc-1"),
+            ),
+        ];
+
+        assert_eq!(
+            estimate_request_tokens(&["system"], &with_recorded_output, &[]),
+            estimate_request_tokens(&["system"], &without_recorded_output, &[])
+        );
     }
 
     #[test]
