@@ -1,7 +1,8 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
-import { isUnityConnectionError } from "../services/errors";
+import { setLocale } from "../i18n";
+import { isUnityConnectionError, normalizeAppError } from "../services/errors";
 
 const cwd = process.cwd();
 
@@ -24,5 +25,18 @@ describe("isUnityConnectionError", () => {
     const component = read("src/components/unity/UnityPropertyFenceBlock.vue");
     expect(component).toContain("isUnityConnectionError");
     expect(component).toContain("asset.preview.unityConnectionRequired");
+  });
+
+  it("localizes plugin-managed View operation errors", () => {
+    setLocale("zh");
+
+    expect(normalizeAppError({
+      code: "legacy.string_error",
+      message: "View 'Plugin Import Hello' is managed by plugin 'com.locus.sample.asset-browser'. Uninstall the plugin to remove it.",
+      retryable: false,
+      severity: "error",
+    }).message).toBe(
+      "视图“Plugin Import Hello”由插件“com.locus.sample.asset-browser”管理。卸载该插件后再删除。",
+    );
   });
 });

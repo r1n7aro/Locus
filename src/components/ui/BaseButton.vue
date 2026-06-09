@@ -35,7 +35,9 @@ withDefaults(defineProps<{
   border: 1px solid var(--border-color);
   background: transparent;
   color: var(--text-secondary);
+  font-family: var(--font-ui);
   font-weight: 500;
+  line-height: 1;
   cursor: pointer;
   box-shadow: none;
   white-space: nowrap;

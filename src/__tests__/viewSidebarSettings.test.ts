@@ -124,6 +124,24 @@ describe("View sidebar settings", () => {
     expect(viewPage).toContain("beginRenameFromContext");
     expect(viewPage).toContain("class=\"view-tree-create-actions\"");
     expect(viewPage).toContain("view.tree.deleteConfirmMessage");
+    expect(viewPage).toContain("return !!node.relPath.trim();");
+  });
+
+  it("closes View context menus around delete confirmation", () => {
+    const sessionPanel = read("src/components/chat/SessionPanel.vue");
+    const viewPage = read("src/components/ViewPackageView.vue");
+
+    expect(sessionPanel).toContain("interface ViewDeleteConfirmState");
+    expect(sessionPanel).toContain("viewDeleteConfirm.value = {\n    x: menu.x,\n    y: menu.y,\n    node: menu.node,\n  };\n  closeViewContextMenu();");
+    expect(sessionPanel).toContain("} finally {\n    closeViewDeleteConfirm();\n  }");
+    expect(sessionPanel).toContain('v-if="viewDeleteConfirm"');
+    expect(sessionPanel).toContain("viewDeleteConfirm.node.label");
+
+    expect(viewPage).toContain("interface ViewDeleteConfirmState");
+    expect(viewPage).toContain("deleteConfirm.value = {\n    x: menu.x,\n    y: menu.y,\n    node: menu.node,\n  };\n  closeContextMenu();");
+    expect(viewPage).toContain("} finally {\n    closeDeleteConfirm();\n  }");
+    expect(viewPage).toContain('v-if="deleteConfirm"');
+    expect(viewPage).toContain("deleteConfirm.node.label");
   });
 
   it("lets view_create create temporary packages outside the visible View tree", () => {

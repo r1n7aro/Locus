@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -393,6 +393,8 @@ struct ViewTreeMetadata {
     folders: Vec<String>,
     #[serde(default)]
     order: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    view_display_paths: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -439,6 +441,7 @@ pub struct ViewExportPackageRequest {
 pub struct ViewPluginExportCopy {
     pub id: String,
     pub file_count: usize,
+    pub source_root: PathBuf,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1595,6 +1598,19 @@ fn view_is_plugin_managed(view: &ViewPackageSummary) -> bool {
     view.plugin_id.is_some() || view.source.starts_with("plugin")
 }
 
+fn apply_view_display_path_overrides(
+    views: &mut [ViewPackageSummary],
+    view_display_paths: &BTreeMap<String, String>,
+) {
+    for view in views {
+        if view_is_plugin_managed(view) {
+            if let Some(display_path) = view_display_paths.get(&view.id) {
+                view.display_path = display_path.clone();
+            }
+        }
+    }
+}
+
 fn ensure_no_plugin_managed_views<'a>(
     views: impl IntoIterator<Item = &'a ViewPackageSummary>,
     action: &str,
@@ -1740,6 +1756,10 @@ pub fn list_views_sync(working_dir: &str) -> Result<Vec<ViewPackageSummary>, Str
         }
     }
 
+    if let Ok(metadata) = load_view_tree_metadata(&views_root) {
+        apply_view_display_path_overrides(&mut views, &metadata.view_display_paths);
+    }
+
     views.sort_by(|left, right| {
         left.package_rel_path
             .cmp(&right.package_rel_path)
@@ -1756,6 +1776,7 @@ fn load_view_tree_metadata(views_root: &Path) -> Result<ViewTreeMetadata, String
             schema: VIEW_TREE_METADATA_SCHEMA.to_string(),
             folders: Vec::new(),
             order: Vec::new(),
+            view_display_paths: BTreeMap::new(),
         });
     }
 
@@ -1785,10 +1806,17 @@ fn load_view_tree_metadata(views_root: &Path) -> Result<ViewTreeMetadata, String
             order.push(rel_path);
         }
     }
+    let mut view_display_paths = BTreeMap::new();
+    for (view_id, display_path) in metadata.view_display_paths {
+        let view_id = normalize_view_id(&view_id)?;
+        let display_path = normalize_view_tree_rel_path(&display_path, false)?;
+        view_display_paths.insert(view_id, display_path);
+    }
     Ok(ViewTreeMetadata {
         schema: VIEW_TREE_METADATA_SCHEMA.to_string(),
         folders: folders.into_iter().collect(),
         order,
+        view_display_paths,
     })
 }
 
@@ -1796,6 +1824,7 @@ fn save_view_tree_metadata(
     views_root: &Path,
     folders: BTreeSet<String>,
     order: Vec<String>,
+    view_display_paths: BTreeMap<String, String>,
 ) -> Result<(), String> {
     let path = view_tree_metadata_path(views_root);
     if let Some(parent) = path.parent() {
@@ -1810,10 +1839,18 @@ fn save_view_tree_metadata(
             normalized_order.push(rel_path);
         }
     }
+    let mut normalized_view_display_paths = BTreeMap::new();
+    for (view_id, display_path) in view_display_paths {
+        normalized_view_display_paths.insert(
+            normalize_view_id(&view_id)?,
+            normalize_view_tree_rel_path(&display_path, false)?,
+        );
+    }
     let metadata = ViewTreeMetadata {
         schema: VIEW_TREE_METADATA_SCHEMA.to_string(),
         folders: folders.into_iter().collect(),
         order: normalized_order,
+        view_display_paths: normalized_view_display_paths,
     };
     let raw = serde_json::to_string_pretty(&metadata)
         .map_err(|e| format!("Failed to serialize View tree metadata: {}", e))?;
@@ -1982,6 +2019,8 @@ fn normalize_insert_anchor(value: Option<&str>) -> Result<Option<String>, String
 
 fn view_tree_order_after_move(
     order: &[String],
+    entries_before_move: &[ViewTreeOrderEntry],
+    valid_paths_before_move: &BTreeSet<String>,
     entries_after_move: &[ViewTreeOrderEntry],
     valid_paths_after_move: &BTreeSet<String>,
     source_rel_path: &str,
@@ -2013,6 +2052,7 @@ fn view_tree_order_after_move(
         ));
     }
 
+    let mut anchor_removed_by_move = false;
     for anchor in [insert_before.as_deref(), insert_after.as_deref()]
         .into_iter()
         .flatten()
@@ -2024,13 +2064,27 @@ fn view_tree_order_after_move(
             ));
         }
         if !valid_paths_after_move.contains(anchor) {
-            return Err(format!("View insert anchor not found: {}", anchor));
+            if !valid_paths_before_move.contains(anchor) {
+                return Err(format!("View insert anchor not found: {}", anchor));
+            }
+            anchor_removed_by_move = true;
         }
     }
 
     let remapped_order = remap_view_tree_order_for_move(order, source_rel_path, moved_rel_path);
-    let mut target_group =
-        view_tree_ordered_child_paths(entries_after_move, target_dir_rel_path, &remapped_order);
+    let mut target_group = if anchor_removed_by_move {
+        let mut paths =
+            view_tree_ordered_child_paths(entries_before_move, target_dir_rel_path, order);
+        paths.retain(|rel_path| {
+            valid_paths_after_move.contains(rel_path)
+                || insert_before.as_deref() == Some(rel_path.as_str())
+                || insert_after.as_deref() == Some(rel_path.as_str())
+        });
+        paths
+    } else {
+        view_tree_ordered_child_paths(entries_after_move, target_dir_rel_path, &remapped_order)
+    };
+    target_group.retain(|rel_path| rel_path != source_rel_path);
     target_group.retain(|rel_path| rel_path != moved_rel_path);
     match (insert_before, insert_after) {
         (Some(anchor), None) => {
@@ -2050,6 +2104,7 @@ fn view_tree_order_after_move(
         (None, None) => target_group.push(moved_rel_path.to_string()),
         (Some(_), Some(_)) => unreachable!(),
     }
+    target_group.retain(|rel_path| valid_paths_after_move.contains(rel_path));
 
     let target_group_set = target_group.iter().cloned().collect::<BTreeSet<_>>();
     let mut next_order = remapped_order
@@ -2108,6 +2163,33 @@ fn set_view_manifest_display_path(package_root: &str, display_path: &str) -> Res
     write_manifest_to_root(&root, &manifest)
 }
 
+fn stage_view_display_path_for_move(
+    view: &ViewPackageSummary,
+    display_path: &str,
+    metadata: &mut ViewTreeMetadata,
+) -> Result<String, String> {
+    let display_path = normalize_view_display_path(display_path)?;
+    if view_is_plugin_managed(view) {
+        metadata
+            .view_display_paths
+            .insert(view.id.clone(), display_path.clone());
+        return Ok(display_path);
+    }
+
+    metadata.view_display_paths.remove(&view.id);
+    Ok(display_path)
+}
+
+fn write_view_display_path_for_move(
+    view: &ViewPackageSummary,
+    display_path: &str,
+) -> Result<(), String> {
+    if view_is_plugin_managed(view) {
+        return Ok(());
+    }
+    set_view_manifest_display_path(&view.package_root, display_path)
+}
+
 fn set_view_manifest_name(package_root: &str, name: &str) -> Result<(), String> {
     let root = PathBuf::from(package_root);
     let mut manifest = load_manifest_from_root(&root)?;
@@ -2135,6 +2217,115 @@ fn remove_view_package_root(views_root: &Path, root: &Path, label: &str) -> Resu
         ));
     }
     std::fs::remove_dir_all(root).map_err(|e| format!("Failed to delete {}: {}", root.display(), e))
+}
+
+struct ViewPackageTransferPlan {
+    normalized_id: String,
+    views_root: PathBuf,
+    canonical_source_root: PathBuf,
+    display_path: Option<String>,
+}
+
+fn plan_view_package_transfer_to_plugin_sync(
+    working_dir: &str,
+    view_id: &str,
+    source_root: &Path,
+) -> Result<ViewPackageTransferPlan, String> {
+    let normalized_id = normalize_view_id(view_id)?;
+    let views_root = views_root_for_workspace(working_dir)?;
+    let canonical_views_root = dunce::canonicalize(&views_root).map_err(|e| {
+        format!(
+            "Failed to resolve View root '{}': {}",
+            views_root.display(),
+            e
+        )
+    })?;
+    let canonical_source_root = dunce::canonicalize(source_root).map_err(|e| {
+        format!(
+            "Failed to resolve View source root '{}': {}",
+            source_root.display(),
+            e
+        )
+    })?;
+    if canonical_source_root == canonical_views_root
+        || !canonical_source_root.starts_with(&canonical_views_root)
+    {
+        return Err(format!(
+            "View '{}' is not in the workspace View directory and cannot be transferred automatically.",
+            normalized_id
+        ));
+    }
+    if plugin_view_source_for_root(working_dir, &canonical_source_root).is_some() {
+        return Err(format!(
+            "View '{}' is already managed by a plugin.",
+            normalized_id
+        ));
+    }
+
+    let manifest = load_manifest_from_root(&canonical_source_root)?;
+    if manifest.id != normalized_id {
+        return Err(format!(
+            "View id mismatch before transfer: requested {}, manifest has {}",
+            normalized_id, manifest.id
+        ));
+    }
+
+    let display_path = list_views_sync(working_dir)
+        .ok()
+        .and_then(|views| {
+            views.into_iter().find(|view| {
+                view.id == normalized_id
+                    && !view_is_plugin_managed(view)
+                    && dunce::canonicalize(&view.package_root)
+                        .unwrap_or_else(|_| PathBuf::from(&view.package_root))
+                        == canonical_source_root
+            })
+        })
+        .map(|view| view.display_path);
+
+    Ok(ViewPackageTransferPlan {
+        normalized_id,
+        views_root,
+        canonical_source_root,
+        display_path,
+    })
+}
+
+pub(crate) fn preflight_view_package_transfer_to_plugin_sync(
+    working_dir: &str,
+    view_id: &str,
+    source_root: &Path,
+) -> Result<String, String> {
+    plan_view_package_transfer_to_plugin_sync(working_dir, view_id, source_root)
+        .map(|plan| plan.normalized_id)
+}
+
+pub(crate) fn transfer_view_package_to_plugin_sync(
+    working_dir: &str,
+    view_id: &str,
+    source_root: &Path,
+) -> Result<String, String> {
+    let plan = plan_view_package_transfer_to_plugin_sync(working_dir, view_id, source_root)?;
+
+    remove_view_package_root(
+        &plan.views_root,
+        &plan.canonical_source_root,
+        &plan.normalized_id,
+    )?;
+
+    let mut metadata = load_view_tree_metadata(&plan.views_root)?;
+    metadata.view_display_paths.remove(&plan.normalized_id);
+    if let Some(display_path) = plan.display_path {
+        metadata.order.retain(|path| path != &display_path);
+    }
+    save_view_tree_metadata(
+        &plan.views_root,
+        metadata.folders.into_iter().collect(),
+        metadata.order,
+        metadata.view_display_paths,
+    )?;
+
+    Ok(plan.normalized_id)
 }
 
 pub fn list_view_tree_sync(working_dir: &str) -> Result<ViewTreeSnapshot, String> {
@@ -2198,7 +2389,12 @@ pub fn create_view_folder_sync(
 
     metadata.folders.push(rel_path.clone());
     let folders = metadata.folders.into_iter().collect::<BTreeSet<_>>();
-    save_view_tree_metadata(&views_root, folders, metadata.order)?;
+    save_view_tree_metadata(
+        &views_root,
+        folders,
+        metadata.order,
+        metadata.view_display_paths,
+    )?;
     Ok(view_folder_summary(rel_path, &views_root))
 }
 
@@ -2220,6 +2416,7 @@ pub fn delete_view_entry_sync(
         ensure_no_plugin_managed_views(std::iter::once(view), "remove")?;
         roots_to_delete.push(PathBuf::from(&view.package_root));
         metadata.order.retain(|path| path != &view.display_path);
+        metadata.view_display_paths.remove(&view.id);
     } else if folder_paths.contains(&rel_path) {
         let folder_views = views
             .iter()
@@ -2227,6 +2424,7 @@ pub fn delete_view_entry_sync(
             .collect::<Vec<_>>();
         ensure_no_plugin_managed_views(folder_views.iter().copied(), "remove")?;
         for view in folder_views {
+            metadata.view_display_paths.remove(&view.id);
             roots_to_delete.push(PathBuf::from(&view.package_root));
         }
         metadata
@@ -2243,6 +2441,7 @@ pub fn delete_view_entry_sync(
         &views_root,
         metadata.folders.into_iter().collect(),
         metadata.order,
+        metadata.view_display_paths,
     )?;
 
     roots_to_delete.sort();
@@ -2334,7 +2533,12 @@ pub fn rename_view_entry_sync(
         remap_view_tree_order_for_move(&metadata.order, &source_rel_path, &target_rel_path),
         &valid_paths,
     );
-    save_view_tree_metadata(&views_root, next_folders, next_order)?;
+    save_view_tree_metadata(
+        &views_root,
+        next_folders,
+        next_order,
+        metadata.view_display_paths,
+    )?;
     list_view_tree_sync(working_dir)
 }
 
@@ -2370,6 +2574,8 @@ pub fn move_view_entry_sync(
         .into_iter()
         .chain(metadata.folders.iter().cloned())
         .collect::<BTreeSet<_>>();
+    let entries_before_move = view_tree_order_entries(&views, &folder_paths);
+    let valid_paths_before_move = view_tree_valid_order_paths(&views, &folder_paths);
     if !target_dir_rel_path.is_empty() && !folder_paths.contains(&target_dir_rel_path) {
         return Err(format!(
             "Target View folder not found: {}",
@@ -2384,10 +2590,15 @@ pub fn move_view_entry_sync(
     }
 
     if let Some(view) = unique_view_at_display_path(&views, &source_rel_path)? {
-        ensure_no_plugin_managed_views(std::iter::once(view), "move")?;
+        let mut next_metadata = metadata.clone();
+        let mut display_path_write: Option<String> = None;
         if source_rel_path != target_rel_path {
             ensure_display_path_available(&views, &folder_paths, &target_rel_path, Some(&view.id))?;
-            set_view_manifest_display_path(&view.package_root, &target_rel_path)?;
+            display_path_write = Some(stage_view_display_path_for_move(
+                view,
+                &target_rel_path,
+                &mut next_metadata,
+            )?);
         }
         let mut next_views = views.clone();
         for next_view in &mut next_views {
@@ -2397,12 +2608,14 @@ pub fn move_view_entry_sync(
         }
         let next_folder_paths = view_display_folder_paths(&next_views)
             .into_iter()
-            .chain(metadata.folders.iter().cloned())
+            .chain(next_metadata.folders.iter().cloned())
             .collect::<BTreeSet<_>>();
         let entries_after_move = view_tree_order_entries(&next_views, &next_folder_paths);
         let valid_paths = view_tree_valid_order_paths(&next_views, &next_folder_paths);
         let next_order = view_tree_order_after_move(
-            &metadata.order,
+            &next_metadata.order,
+            &entries_before_move,
+            &valid_paths_before_move,
             &entries_after_move,
             &valid_paths,
             &source_rel_path,
@@ -2411,10 +2624,14 @@ pub fn move_view_entry_sync(
             request.insert_before_rel_path.as_deref(),
             request.insert_after_rel_path.as_deref(),
         )?;
+        if let Some(display_path) = display_path_write.as_deref() {
+            write_view_display_path_for_move(view, display_path)?;
+        }
         save_view_tree_metadata(
             &views_root,
-            metadata.folders.into_iter().collect(),
+            next_metadata.folders.into_iter().collect(),
             next_order,
+            next_metadata.view_display_paths,
         )?;
         return list_view_tree_sync(working_dir);
     }
@@ -2433,19 +2650,25 @@ pub fn move_view_entry_sync(
 
     let moving_views = views
         .iter()
-        .filter(|view| display_path_is_under(&view.display_path, &source_rel_path))
+        .enumerate()
+        .filter(|(_, view)| display_path_is_under(&view.display_path, &source_rel_path))
         .collect::<Vec<_>>();
-    ensure_no_plugin_managed_views(moving_views.iter().copied(), "move")?;
     if source_rel_path != target_rel_path {
-        for view in &moving_views {
+        for (_, view) in &moving_views {
             let next_path =
                 replace_display_path_prefix(&view.display_path, &source_rel_path, &target_rel_path);
             ensure_display_path_available(&views, &folder_paths, &next_path, Some(&view.id))?;
         }
-        for view in moving_views {
+    }
+
+    let mut next_metadata = metadata.clone();
+    let mut display_path_writes = Vec::new();
+    if source_rel_path != target_rel_path {
+        for (view_index, view) in &moving_views {
             let next_path =
                 replace_display_path_prefix(&view.display_path, &source_rel_path, &target_rel_path);
-            set_view_manifest_display_path(&view.package_root, &next_path)?;
+            let next_path = stage_view_display_path_for_move(view, &next_path, &mut next_metadata)?;
+            display_path_writes.push((*view_index, next_path));
         }
     }
 
@@ -2458,15 +2681,15 @@ pub fn move_view_entry_sync(
     }
 
     let mut next_folders = BTreeSet::new();
-    for folder in metadata.folders {
+    for folder in &next_metadata.folders {
         if display_path_is_under(&folder, &source_rel_path) {
             next_folders.insert(replace_display_path_prefix(
-                &folder,
+                folder,
                 &source_rel_path,
                 &target_rel_path,
             ));
         } else {
-            next_folders.insert(folder);
+            next_folders.insert(folder.clone());
         }
     }
     next_folders.insert(target_rel_path.clone());
@@ -2477,7 +2700,9 @@ pub fn move_view_entry_sync(
     let entries_after_move = view_tree_order_entries(&next_views, &next_folder_paths);
     let valid_paths = view_tree_valid_order_paths(&next_views, &next_folder_paths);
     let next_order = view_tree_order_after_move(
-        &metadata.order,
+        &next_metadata.order,
+        &entries_before_move,
+        &valid_paths_before_move,
         &entries_after_move,
         &valid_paths,
         &source_rel_path,
@@ -2486,7 +2711,15 @@ pub fn move_view_entry_sync(
         request.insert_before_rel_path.as_deref(),
         request.insert_after_rel_path.as_deref(),
     )?;
-    save_view_tree_metadata(&views_root, next_folders, next_order)?;
+    for (view_index, display_path) in display_path_writes {
+        write_view_display_path_for_move(&views[view_index], &display_path)?;
+    }
+    save_view_tree_metadata(
+        &views_root,
+        next_folders,
+        next_order,
+        next_metadata.view_display_paths,
+    )?;
     list_view_tree_sync(working_dir)
 }
 
@@ -2698,6 +2931,7 @@ pub(crate) fn copy_view_package_for_plugin_sync(
     Ok(ViewPluginExportCopy {
         id: manifest.id,
         file_count,
+        source_root: root,
     })
 }
 
@@ -6168,7 +6402,7 @@ mod tests {
     }
 
     #[test]
-    fn list_views_sync_reads_project_plugin_views_and_blocks_entry_delete() {
+    fn list_views_sync_reads_project_plugin_views_moves_display_path_and_blocks_entry_delete() {
         let temp = tempdir().unwrap();
         let working_dir = temp.path().to_string_lossy().to_string();
         let plugin_root = temp
@@ -6227,10 +6461,43 @@ mod tests {
             view_root
         );
 
+        create_view_folder_sync(
+            &working_dir,
+            super::ViewCreateFolderRequest {
+                parent_rel_path: None,
+                name: "Tools".to_string(),
+            },
+        )
+        .expect("create user folder");
+        let moved = move_view_entry_sync(
+            &working_dir,
+            super::ViewMoveEntryRequest {
+                source_rel_path: view.display_path.clone(),
+                target_dir_rel_path: Some("Tools".to_string()),
+                insert_before_rel_path: None,
+                insert_after_rel_path: None,
+            },
+        )
+        .expect("plugin view display path can move");
+        assert!(moved
+            .views
+            .iter()
+            .any(|view| view.id == "plugin-asset-inspector"
+                && view.display_path == "Tools/asset-inspector"));
+        let plugin_manifest_raw = std::fs::read_to_string(view_root.join("view.json")).unwrap();
+        assert!(!plugin_manifest_raw.contains("\"displayPath\""));
+
+        let listed_after_move = list_views_sync(&working_dir).expect("list moved plugin view");
+        let moved_view = listed_after_move
+            .iter()
+            .find(|view| view.id == "plugin-asset-inspector")
+            .expect("moved plugin view should be listed");
+        assert_eq!(moved_view.display_path, "Tools/asset-inspector");
+
         let delete_error = delete_view_entry_sync(
             &working_dir,
             super::ViewDeleteEntryRequest {
-                rel_path: view.display_path.clone(),
+                rel_path: moved_view.display_path.clone(),
             },
         )
         .expect_err("plugin views should be removed through plugin uninstall");
@@ -6239,7 +6506,7 @@ mod tests {
         let rename_error = rename_view_entry_sync(
             &working_dir,
             super::ViewRenameEntryRequest {
-                rel_path: view.display_path.clone(),
+                rel_path: moved_view.display_path.clone(),
                 name: "Renamed".to_string(),
             },
         )
@@ -7095,6 +7362,98 @@ mod tests {
             .views
             .iter()
             .any(|view| view.display_path == "Tools/bravo-view"));
+    }
+
+    #[test]
+    fn view_tree_move_single_child_before_removed_parent_folder_succeeds() {
+        let temp = tempdir().unwrap();
+        let working_dir = temp.path().to_string_lossy().to_string();
+
+        create_view_sync(
+            &working_dir,
+            super::ViewCreateRequest {
+                id: "locus-workspace".to_string(),
+                package_name: None,
+                name: Some("Locus Workspace".to_string()),
+                template: Some("blank".to_string()),
+                icon: None,
+                display_path: Some("Tools/Locus Workspace".to_string()),
+            },
+        )
+        .expect("create view inside implicit folder");
+        create_view_sync(
+            &working_dir,
+            super::ViewCreateRequest {
+                id: "hello-view".to_string(),
+                package_name: None,
+                name: Some("Hello View".to_string()),
+                template: Some("blank".to_string()),
+                icon: None,
+                display_path: Some("Hello View".to_string()),
+            },
+        )
+        .expect("create root sibling");
+
+        let moved = move_view_entry_sync(
+            &working_dir,
+            super::ViewMoveEntryRequest {
+                source_rel_path: "Tools/Locus Workspace".to_string(),
+                target_dir_rel_path: Some(String::new()),
+                insert_before_rel_path: Some("Tools".to_string()),
+                insert_after_rel_path: None,
+            },
+        )
+        .expect("move view before its removed implicit parent folder");
+
+        assert!(moved
+            .views
+            .iter()
+            .any(|view| view.id == "locus-workspace" && view.display_path == "Locus Workspace"));
+        assert!(!moved
+            .folders
+            .iter()
+            .any(|folder| folder.rel_path == "Tools"));
+        assert!(!moved
+            .order
+            .iter()
+            .any(|path| path == "Tools/Locus Workspace"));
+        assert!(!moved.order.iter().any(|path| path == "Tools"));
+    }
+
+    #[test]
+    fn view_tree_move_invalid_anchor_does_not_change_display_path() {
+        let temp = tempdir().unwrap();
+        let working_dir = temp.path().to_string_lossy().to_string();
+
+        create_view_sync(
+            &working_dir,
+            super::ViewCreateRequest {
+                id: "locus-workspace".to_string(),
+                package_name: None,
+                name: Some("Locus Workspace".to_string()),
+                template: Some("blank".to_string()),
+                icon: None,
+                display_path: Some("Tools/Locus Workspace".to_string()),
+            },
+        )
+        .expect("create view inside folder");
+
+        let err = move_view_entry_sync(
+            &working_dir,
+            super::ViewMoveEntryRequest {
+                source_rel_path: "Tools/Locus Workspace".to_string(),
+                target_dir_rel_path: Some(String::new()),
+                insert_before_rel_path: Some("Missing".to_string()),
+                insert_after_rel_path: None,
+            },
+        )
+        .expect_err("invalid anchor should fail");
+        assert!(err.contains("View insert anchor not found: Missing"));
+
+        let listed = list_view_tree_sync(&working_dir).expect("list view tree after failed move");
+        assert!(listed.views.iter().any(
+            |view| view.id == "locus-workspace" && view.display_path == "Tools/Locus Workspace"
+        ));
     }
 
     #[test]

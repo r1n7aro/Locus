@@ -1,5 +1,5 @@
 {
-  "description": "Reload a View Package after files have been edited. P0 validates the manifest and key files, emits a reload event to the View host when open, and returns the refreshed summary.",
+  "description": "Reload a View Package after files have been edited, including plugin Views returned by view_list. P0 validates the manifest and key files, emits a reload event to the View host when open, and returns the refreshed summary.",
   "parameters": {
     "type": "object",
     "additionalProperties": false,

@@ -90,6 +90,12 @@ type ViewContextMenuState =
   | { x: number; y: number; kind: "root" }
   | { x: number; y: number; kind: "folder" | "view"; node: ViewTreeNode };
 
+interface ViewDeleteConfirmState {
+  x: number;
+  y: number;
+  node: ViewTreeNode;
+}
+
 interface ViewPointerDragState {
   node: ViewTreeNode;
   pointerId: number;
@@ -127,7 +133,7 @@ const exportingViewId = ref("");
 const loadError = ref("");
 const expandedState = ref<Record<string, boolean>>(loadExpandedState());
 const contextMenu = ref<ViewContextMenuState | null>(null);
-const deleteConfirm = ref<ViewTreeNode | null>(null);
+const deleteConfirm = ref<ViewDeleteConfirmState | null>(null);
 const createFolderDraft = ref<ViewCreateFolderDraft | null>(null);
 const createFolderInputRef = ref<HTMLInputElement | null>(null);
 const renameDraft = ref<ViewRenameDraft | null>(null);
@@ -800,20 +806,23 @@ function requestDeleteEntry() {
   const menu = contextMenu.value;
   if (!menu || menu.kind === "root") return;
   if (!contextNodeEditable(menu.node)) return;
-  deleteConfirm.value = menu.node;
+  deleteConfirm.value = {
+    x: menu.x,
+    y: menu.y,
+    node: menu.node,
+  };
+  closeContextMenu();
 }
 
 function closeDeleteConfirm() {
   deleteConfirm.value = null;
-  closeContextMenu();
 }
 
 async function confirmDeleteEntry() {
-  const node = deleteConfirm.value;
-  if (!node) return;
+  const confirm = deleteConfirm.value;
+  if (!confirm) return;
   try {
-    applyTreeSnapshot(await viewDeleteEntry({ relPath: node.relPath }));
-    closeDeleteConfirm();
+    applyTreeSnapshot(await viewDeleteEntry({ relPath: confirm.node.relPath }));
   } catch (error) {
     const err = normalizeAppError(error);
     loadError.value = err.message;
@@ -822,6 +831,8 @@ async function confirmDeleteEntry() {
       operation: "viewDeleteEntry",
       replaceOperation: true,
     });
+  } finally {
+    closeDeleteConfirm();
   }
 }
 
@@ -849,7 +860,7 @@ function contextNodeEditable(node: ViewTreeNode): boolean {
 }
 
 function canDragNode(node: ViewTreeNode): boolean {
-  return !!node.relPath.trim() && contextNodeEditable(node);
+  return !!node.relPath.trim();
 }
 
 function canPlaceNodeInDir(node: ViewTreeNode | null, targetDirRelPath: string): boolean {
@@ -1126,6 +1137,7 @@ async function moveNodeToTarget(
       operation: "viewMoveEntry",
       replaceOperation: true,
     });
+    void loadViews();
   }
 }
 
@@ -1825,16 +1837,16 @@ onUnmounted(() => {
 
       <Teleport to="body">
           <div
-            v-if="contextMenu && deleteConfirm"
+            v-if="deleteConfirm"
             class="view-delete-confirm"
-            :style="{ left: contextMenu.x + 'px', top: contextMenu.y + 'px' }"
+            :style="{ left: deleteConfirm.x + 'px', top: deleteConfirm.y + 'px' }"
             @click.stop
           >
             <div class="view-delete-confirm-title">
               {{ t("view.tree.deleteConfirmTitle") }}
             </div>
             <div class="view-delete-confirm-text">
-              {{ t("view.tree.deleteConfirmMessage", deleteConfirm.label) }}
+              {{ t("view.tree.deleteConfirmMessage", deleteConfirm.node.label) }}
             </div>
             <div class="view-delete-confirm-actions">
               <BaseButton class="view-delete-confirm-btn" @click="closeDeleteConfirm">

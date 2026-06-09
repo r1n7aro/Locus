@@ -1,3 +1,4 @@
+import { t } from "../i18n";
 import type { AppErrorPayload, NotificationLevel } from "../types";
 
 export function isAppErrorPayload(value: unknown): value is AppErrorPayload {
@@ -10,32 +11,48 @@ export function isAppErrorPayload(value: unknown): value is AppErrorPayload {
   );
 }
 
+const PLUGIN_MANAGED_VIEW_ERROR_PATTERN =
+  /^View '(.+)' is managed by plugin '(.+)'\. Uninstall the plugin to (remove|rename|move) it\.$/;
+
+function localizeErrorPayload(payload: AppErrorPayload): AppErrorPayload {
+  const pluginManagedViewMatch = payload.message.match(PLUGIN_MANAGED_VIEW_ERROR_PATTERN);
+  if (pluginManagedViewMatch) {
+    const [, viewName, pluginId, action] = pluginManagedViewMatch;
+    return {
+      ...payload,
+      message: t(`view.error.pluginManaged.${action}`, viewName, pluginId),
+    };
+  }
+
+  return payload;
+}
+
 export function normalizeAppError(e: unknown): AppErrorPayload {
-  if (isAppErrorPayload(e)) return e;
+  if (isAppErrorPayload(e)) return localizeErrorPayload(e);
 
   if (typeof e === "string") {
-    return {
+    return localizeErrorPayload({
       code: "unknown",
       message: e,
       retryable: false,
       severity: "error",
-    };
+    });
   }
 
   if (e instanceof Error) {
-    return {
+    return localizeErrorPayload({
       code: "unknown",
       message: e.message,
       detail: e.stack,
       retryable: false,
       severity: "error",
-    };
+    });
   }
 
   if (typeof e === "object" && e !== null) {
     const obj = e as Record<string, unknown>;
     if (typeof obj.message === "string") {
-      return {
+      return localizeErrorPayload({
         code: typeof obj.code === "string" ? obj.code : "unknown",
         message: obj.message,
         detail: typeof obj.detail === "string" ? obj.detail : undefined,
@@ -44,17 +61,17 @@ export function normalizeAppError(e: unknown): AppErrorPayload {
         severity: (typeof obj.severity === "string" && ["error", "warning", "success", "info"].includes(obj.severity))
           ? obj.severity as NotificationLevel
           : "error",
-      };
+      });
     }
   }
 
-  return {
+  return localizeErrorPayload({
     code: "unknown",
     message: "An unexpected error occurred",
     detail: JSON.stringify(e),
     retryable: false,
     severity: "error",
-  };
+  });
 }
 
 const UNITY_CONNECTION_ERROR_PATTERNS = [

@@ -87,6 +87,12 @@ type ViewContextMenuState =
   | { x: number; y: number; kind: "root" }
   | { x: number; y: number; kind: "folder" | "view"; node: ViewTreeNode };
 
+interface ViewDeleteConfirmState {
+  x: number;
+  y: number;
+  node: ViewTreeNode;
+}
+
 interface ViewPointerDragState {
   node: ViewTreeNode;
   pointerId: number;
@@ -166,7 +172,7 @@ const viewTreeOrder = ref<string[]>([]);
 const viewsLoading = ref(false);
 const viewOpeningKey = ref("");
 const viewCtxMenu = ref<ViewContextMenuState | null>(null);
-const viewDeleteConfirm = ref<ViewTreeNode | null>(null);
+const viewDeleteConfirm = ref<ViewDeleteConfirmState | null>(null);
 const viewCreateFolderDraft = ref<ViewCreateFolderDraft | null>(null);
 const viewCreateFolderInputRef = ref<HTMLInputElement | null>(null);
 const viewRenameDraft = ref<ViewRenameDraft | null>(null);
@@ -702,23 +708,26 @@ async function submitViewRename() {
 function requestDeleteViewEntry() {
   const menu = viewCtxMenu.value;
   if (!menu || menu.kind === "root") return;
-  viewDeleteConfirm.value = menu.node;
+  viewDeleteConfirm.value = {
+    x: menu.x,
+    y: menu.y,
+    node: menu.node,
+  };
+  closeViewContextMenu();
 }
 
 function closeViewDeleteConfirm() {
   viewDeleteConfirm.value = null;
-  closeViewContextMenu();
 }
 
 async function confirmDeleteViewEntry() {
-  const node = viewDeleteConfirm.value;
-  if (!node) return;
+  const confirm = viewDeleteConfirm.value;
+  if (!confirm) return;
   try {
-    const snapshot = await viewDeleteEntry({ relPath: node.relPath });
+    const snapshot = await viewDeleteEntry({ relPath: confirm.node.relPath });
     viewSummaries.value = snapshot.views;
     viewFolders.value = snapshot.folders;
     viewTreeOrder.value = snapshot.order ?? [];
-    closeViewDeleteConfirm();
   } catch (error) {
     const err = normalizeAppError(error);
     notificationStore.addNotice("error", err.message, {
@@ -726,6 +735,8 @@ async function confirmDeleteViewEntry() {
       operation: "deleteViewEntry",
       skipConsoleLog: true,
     });
+  } finally {
+    closeViewDeleteConfirm();
   }
 }
 
@@ -1977,13 +1988,13 @@ function ctxArchive() {
 
     <Teleport to="body">
         <div
-          v-if="viewCtxMenu && viewDeleteConfirm"
+          v-if="viewDeleteConfirm"
           class="sp-delete-confirm"
-          :style="{ left: viewCtxMenu.x + 'px', top: viewCtxMenu.y + 'px' }"
+          :style="{ left: viewDeleteConfirm.x + 'px', top: viewDeleteConfirm.y + 'px' }"
           @click.stop
         >
           <div class="sp-delete-confirm-title">{{ t('view.tree.deleteConfirmTitle') }}</div>
-          <div class="sp-delete-confirm-text">{{ t('view.tree.deleteConfirmMessage', viewDeleteConfirm.label) }}</div>
+          <div class="sp-delete-confirm-text">{{ t('view.tree.deleteConfirmMessage', viewDeleteConfirm.node.label) }}</div>
           <div class="sp-delete-confirm-actions">
             <BaseButton class="sp-delete-confirm-btn" @click="closeViewDeleteConfirm">
               {{ t('common.cancel') }}
