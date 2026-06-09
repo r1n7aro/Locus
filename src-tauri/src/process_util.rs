@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 const GIT_VERSION_TIMEOUT: Duration = Duration::from_millis(1500);
+const GITHUB_CLI_VERSION_TIMEOUT: Duration = Duration::from_millis(1500);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GitDiscoverySource {
@@ -40,7 +41,21 @@ pub struct GitRuntimeCandidate {
     pub version: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GithubCliDiscoverySource {
+    EnvOverride,
+    Managed,
+    Path,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedGithubCli {
+    pub path: PathBuf,
+    pub source: GithubCliDiscoverySource,
+}
+
 type GitResolutionCache = Option<Option<ResolvedGit>>;
+type GithubCliResolutionCache = Option<Option<ResolvedGithubCli>>;
 
 pub fn command(program: &str) -> std::process::Command {
     let mut cmd = Command::new(resolve_program(program));
@@ -114,6 +129,49 @@ pub fn set_managed_git_resource_dir(path: PathBuf) {
     clear_git_resolution_cache();
 }
 
+pub fn set_managed_github_cli_resource_dir(path: PathBuf) {
+    let roots = managed_github_cli_resource_dirs();
+    let mut roots = roots
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !roots.iter().any(|existing| same_path(existing, &path)) {
+        roots.push(path);
+    }
+    clear_github_cli_resolution_cache();
+}
+
+pub fn resolve_github_cli() -> Option<ResolvedGithubCli> {
+    let cache = github_cli_resolution_cache();
+    let mut cached = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(resolved) = cached.as_ref() {
+        return resolved.clone();
+    }
+
+    let resolved = discover_github_cli();
+    *cached = Some(resolved.clone());
+    resolved
+}
+
+pub fn refresh_github_cli_resolution() -> Option<ResolvedGithubCli> {
+    let resolved = discover_github_cli();
+    let cache = github_cli_resolution_cache();
+    let mut cached = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *cached = Some(resolved.clone());
+    resolved
+}
+
+pub fn clear_github_cli_resolution_cache() {
+    let cache = github_cli_resolution_cache();
+    let mut cached = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *cached = None;
+}
+
 pub fn discover_git_runtimes(include_env_override: bool) -> Vec<GitRuntimeCandidate> {
     let mut runtimes = Vec::new();
 
@@ -172,6 +230,13 @@ pub fn git_env_override() -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+pub fn github_cli_env_override() -> Option<String> {
+    std::env::var("LOCUS_GH_PATH")
+        .ok()
+        .map(|value| value.trim().trim_matches('"').to_string())
+        .filter(|value| !value.is_empty())
+}
+
 pub fn normalize_git_path(path: &Path) -> Option<PathBuf> {
     normalize_git_candidate(path).filter(|candidate| git_version_for(candidate).is_some())
 }
@@ -215,6 +280,12 @@ pub fn augment_path_with_git(current_path: Option<OsString>) -> Option<OsString>
     std::env::join_paths(paths).ok()
 }
 
+pub fn augment_path_with_github_cli(current_path: Option<OsString>) -> Option<OsString> {
+    let gh = resolve_github_cli()?;
+    let parent = gh.path.parent()?.to_path_buf();
+    prepend_paths(current_path, vec![parent])
+}
+
 pub fn prepend_paths(current_path: Option<OsString>, entries: Vec<PathBuf>) -> Option<OsString> {
     let mut paths: Vec<PathBuf> = current_path
         .as_ref()
@@ -243,6 +314,11 @@ fn resolve_program(program: &str) -> OsString {
             return git.path.into_os_string();
         }
     }
+    if program.eq_ignore_ascii_case("gh") {
+        if let Some(gh) = resolve_github_cli() {
+            return gh.path.into_os_string();
+        }
+    }
     OsString::from(program)
 }
 
@@ -256,11 +332,27 @@ fn managed_git_resource_dirs() -> &'static Mutex<Vec<PathBuf>> {
     DIRS.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+fn github_cli_resolution_cache() -> &'static Mutex<GithubCliResolutionCache> {
+    static CACHE: OnceLock<Mutex<GithubCliResolutionCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
+fn managed_github_cli_resource_dirs() -> &'static Mutex<Vec<PathBuf>> {
+    static DIRS: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
+    DIRS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
 fn discover_git() -> Option<ResolvedGit> {
     resolve_git_from_env()
         .or_else(resolve_git_from_path)
         .or_else(resolve_git_from_common_locations)
         .or_else(resolve_git_from_managed_resource)
+}
+
+fn discover_github_cli() -> Option<ResolvedGithubCli> {
+    resolve_github_cli_from_env()
+        .or_else(resolve_github_cli_from_managed_resource)
+        .or_else(resolve_github_cli_from_path)
 }
 
 fn git_version_for(path: &Path) -> Option<String> {
@@ -286,6 +378,29 @@ fn git_version_for(path: &Path) -> Option<String> {
     } else {
         Some(version)
     }
+}
+
+fn github_cli_version_for(path: &Path) -> Option<String> {
+    let mut cmd = Command::new(path);
+    cmd.arg("--version")
+        .env("GH_TELEMETRY", "false")
+        .env("DO_NOT_TRACK", "true")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(target_os = "windows")]
+    {
+        suppress_command_window(&mut cmd);
+    }
+    let output = command_output_with_timeout(cmd, GITHUB_CLI_VERSION_TIMEOUT)
+        .ok()
+        .flatten()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    version.starts_with("gh version ").then_some(version)
 }
 
 fn command_output_with_timeout(
@@ -320,6 +435,15 @@ fn resolve_git_from_env() -> Option<ResolvedGit> {
     })
 }
 
+fn resolve_github_cli_from_env() -> Option<ResolvedGithubCli> {
+    let raw = github_cli_env_override()?;
+    let path = PathBuf::from(raw);
+    normalize_github_cli_candidate(&path).map(|path| ResolvedGithubCli {
+        path,
+        source: GithubCliDiscoverySource::EnvOverride,
+    })
+}
+
 fn push_git_runtime_candidate(
     target: &mut Vec<GitRuntimeCandidate>,
     candidate: PathBuf,
@@ -346,6 +470,22 @@ fn push_git_runtime_candidate(
     });
 }
 
+fn resolve_first_github_cli_candidate(
+    candidates: Vec<PathBuf>,
+    source: GithubCliDiscoverySource,
+) -> Option<ResolvedGithubCli> {
+    for candidate in candidates {
+        let Some(path) = normalize_github_cli_candidate(&candidate) else {
+            continue;
+        };
+        let path = dunce::canonicalize(&path).unwrap_or(path);
+        if github_cli_version_for(&path).is_some() {
+            return Some(ResolvedGithubCli { path, source });
+        }
+    }
+    None
+}
+
 fn resolve_first_git_candidate(
     candidates: Vec<PathBuf>,
     source: GitDiscoverySource,
@@ -359,6 +499,13 @@ fn resolve_first_git_candidate(
         }
     }
     None
+}
+
+fn resolve_github_cli_from_managed_resource() -> Option<ResolvedGithubCli> {
+    resolve_first_github_cli_candidate(
+        github_cli_managed_resource_candidates(),
+        GithubCliDiscoverySource::Managed,
+    )
 }
 
 #[cfg(target_os = "windows")]
@@ -410,6 +557,49 @@ fn push_managed_git_root_candidates(target: &mut Vec<PathBuf>, base: &Path) {
     target.push(base.join("managed-git").join("windows-x64"));
 }
 
+fn managed_github_cli_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+
+    if let Ok(registered) = managed_github_cli_resource_dirs().lock() {
+        for root in registered.iter() {
+            push_managed_github_cli_root_candidates(&mut roots, root);
+        }
+    }
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            push_managed_github_cli_root_candidates(&mut roots, exe_dir);
+            push_managed_github_cli_root_candidates(&mut roots, &exe_dir.join("resources"));
+        }
+    }
+
+    push_managed_github_cli_root_candidates(
+        &mut roots,
+        &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("gen"),
+    );
+
+    let mut unique: Vec<PathBuf> = Vec::new();
+    for root in roots {
+        if root.is_dir() && !unique.iter().any(|existing| same_path(existing, &root)) {
+            unique.push(root);
+        }
+    }
+    unique
+}
+
+fn push_managed_github_cli_root_candidates(target: &mut Vec<PathBuf>, base: &Path) {
+    if let Some(runtime_id) = github_cli_runtime_id() {
+        target.push(base.join("gh-runtime").join(runtime_id));
+    }
+}
+
+fn github_cli_managed_resource_candidates() -> Vec<PathBuf> {
+    managed_github_cli_roots()
+        .into_iter()
+        .flat_map(|root| github_cli_candidates_inside(&root))
+        .collect()
+}
+
 #[cfg(target_os = "windows")]
 fn git_managed_resource_candidates() -> Vec<PathBuf> {
     managed_git_roots()
@@ -427,6 +617,10 @@ fn resolve_git_from_path() -> Option<ResolvedGit> {
     resolve_first_git_candidate(git_path_candidates(), GitDiscoverySource::Path)
 }
 
+fn resolve_github_cli_from_path() -> Option<ResolvedGithubCli> {
+    resolve_first_github_cli_candidate(github_cli_path_candidates(), GithubCliDiscoverySource::Path)
+}
+
 fn git_path_candidates() -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     let Some(path_var) = std::env::var_os("PATH") else {
@@ -435,6 +629,21 @@ fn git_path_candidates() -> Vec<PathBuf> {
 
     for dir in std::env::split_paths(&path_var) {
         for name in git_binary_names() {
+            candidates.push(dir.join(name));
+        }
+    }
+
+    candidates
+}
+
+fn github_cli_path_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    let Some(path_var) = std::env::var_os("PATH") else {
+        return candidates;
+    };
+
+    for dir in std::env::split_paths(&path_var) {
+        for name in github_cli_binary_names() {
             candidates.push(dir.join(name));
         }
     }
@@ -585,6 +794,29 @@ fn normalize_git_candidate(path: &Path) -> Option<PathBuf> {
     None
 }
 
+fn normalize_github_cli_candidate(path: &Path) -> Option<PathBuf> {
+    if path.is_file() {
+        return Some(path.to_path_buf());
+    }
+
+    if path.is_dir() {
+        for candidate in github_cli_candidates_inside(path) {
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+        return None;
+    }
+
+    for candidate in github_cli_candidates_from_hint(path) {
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+
+    None
+}
+
 fn git_candidates_inside(root: &Path) -> Vec<PathBuf> {
     #[cfg(target_os = "windows")]
     {
@@ -604,7 +836,40 @@ fn git_candidates_inside(root: &Path) -> Vec<PathBuf> {
     }
 }
 
+fn github_cli_candidates_inside(root: &Path) -> Vec<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        vec![
+            root.join("bin").join("gh.exe"),
+            root.join("gh.exe"),
+            root.join("gh.cmd"),
+            root.join("gh.bat"),
+        ]
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        vec![root.join("bin").join("gh"), root.join("gh")]
+    }
+}
+
 fn git_candidates_from_hint(path: &Path) -> Vec<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        if path.extension().is_none() {
+            return vec![
+                path.with_extension("exe"),
+                path.with_extension("cmd"),
+                path.with_extension("bat"),
+                path.to_path_buf(),
+            ];
+        }
+    }
+
+    vec![path.to_path_buf()]
+}
+
+fn github_cli_candidates_from_hint(path: &Path) -> Vec<PathBuf> {
     #[cfg(target_os = "windows")]
     {
         if path.extension().is_none() {
@@ -630,6 +895,47 @@ fn git_binary_names() -> &'static [&'static str] {
     {
         &["git"]
     }
+}
+
+fn github_cli_binary_names() -> &'static [&'static str] {
+    #[cfg(target_os = "windows")]
+    {
+        &["gh.exe", "gh.cmd", "gh.bat"]
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        &["gh"]
+    }
+}
+
+fn github_cli_runtime_id() -> Option<&'static str> {
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    {
+        return Some("windows-x64");
+    }
+    #[cfg(all(target_os = "windows", target_arch = "aarch64"))]
+    {
+        return Some("windows-arm64");
+    }
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    {
+        return Some("macos-x64");
+    }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        return Some("macos-arm64");
+    }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        return Some("linux-x64");
+    }
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    {
+        return Some("linux-arm64");
+    }
+    #[allow(unreachable_code)]
+    None
 }
 
 fn git_support_dirs(git_path: &Path) -> Vec<PathBuf> {

@@ -1,8 +1,10 @@
 use std::sync::OnceLock;
 
 use super::misc::truncate_utf8_prefix;
-use super::{make_exec, ToolDef, ToolResult};
-use crate::process_util::{async_command, augment_path_with_git, command};
+use super::{ToolDef, ToolResult, make_exec};
+use crate::process_util::{
+    async_command, augment_path_with_git, augment_path_with_github_cli, command,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellKind {
@@ -24,11 +26,7 @@ pub fn detect_shell() -> ShellKind {
                 probe.env("PATH", path);
             }
             let ok = probe.status().map(|s| s.success()).unwrap_or(false);
-            if ok {
-                ShellKind::Sh
-            } else {
-                ShellKind::Cmd
-            }
+            if ok { ShellKind::Sh } else { ShellKind::Cmd }
         } else {
             ShellKind::Sh
         }
@@ -169,6 +167,7 @@ pub(super) fn bash() -> ToolDef {
 
                 let mut path = augment_path_with_git(std::env::var_os("PATH"))
                     .or_else(|| std::env::var_os("PATH"));
+                path = augment_path_with_github_cli(path.clone()).or(path);
                 if let Some(ref python) = python {
                     path = crate::python_runtime::prepend_python_to_path(path, &python.path);
                 }

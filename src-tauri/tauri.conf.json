@@ -4,7 +4,7 @@
   "version": "0.3.2",
   "identifier": "com.locus.app",
   "build": {
-    "beforeDevCommand": "bun run ort:bundle && bun run dev",
+    "beforeDevCommand": "bun run ort:bundle && bun run github-cli:bundle && bun run dev",
     "devUrl": "http://localhost:14901",
     "beforeBuildCommand": "bun run build:tauri:without_embed_python_git",
     "frontendDist": "../dist"
@@ -47,6 +47,7 @@
       "../THIRD_PARTY_NOTICES": "licenses/THIRD_PARTY_NOTICES",
       "./gen/licenses-bundle": "licenses/third_party/",
       "./gen/ort-runtime": "ort-runtime/",
+      "./gen/gh-runtime": "gh-runtime/",
       "../agent": "agent/",
       "../knowledge": "knowledge/",
       "../skills": "skills/",

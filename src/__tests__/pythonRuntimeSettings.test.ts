@@ -96,21 +96,35 @@ describe("Python runtime settings", () => {
   it("bundles managed Git with the desktop package", () => {
     const pkg = read("package.json");
     const tauriConfig = read("src-tauri/tauri.with_embed_python_git.conf.json");
+    const baseTauriConfig = read("src-tauri/tauri.conf.json");
+    const withoutEmbedConfig = read("src-tauri/tauri.without_embed_python_git.conf.json");
     const installer = read("src-tauri/nsis/installer.nsi");
     const processUtil = read("src-tauri/src/process_util.rs");
     const lib = read("src-tauri/src/lib.rs");
     const script = read("scripts/prepare-managed-git.mjs");
+    const githubCliScript = read("scripts/prepare-managed-github-cli.mjs");
+    const licenseScript = read("scripts/generate-third-party-bundle.mjs");
 
     expect(pkg).toContain('"git:bundle": "bun run scripts/prepare-managed-git.mjs"');
+    expect(pkg).toContain('"github-cli:bundle": "bun run scripts/prepare-managed-github-cli.mjs"');
     expect(pkg).toContain("bun run git:bundle");
+    expect(pkg).toContain("bun run github-cli:bundle");
     expect(tauriConfig).toContain('"./gen/managed-git": "managed-git/"');
+    expect(tauriConfig).toContain('"./gen/gh-runtime": "gh-runtime/"');
+    expect(baseTauriConfig).toContain('"./gen/gh-runtime": "gh-runtime/"');
+    expect(baseTauriConfig).toContain("bun run github-cli:bundle && bun run dev");
+    expect(withoutEmbedConfig).toContain('"./gen/gh-runtime": "gh-runtime/"');
     expect(installer).toContain("Function LocusDetectSystemGit");
     expect(installer).toContain("SearchPath $LocusGitProbePath \"git.exe\"");
     expect(installer).toContain("System Git is available; skipping bundled Git resources.");
+    expect(installer).toContain("RMDir /r \"$INSTDIR\\gh-runtime\"");
     expect(installer).toContain("StrCpy $R0 \"{{this.[1]}}\" 11");
     expect(installer).toContain("$R0 != \"managed-git\"");
     expect(processUtil).toContain("GitDiscoverySource::Managed");
     expect(processUtil).toContain("resolve_git_from_managed_resource");
+    expect(processUtil).toContain("GithubCliDiscoverySource::Managed");
+    expect(processUtil).toContain("resolve_github_cli_from_managed_resource");
+    expect(processUtil).toContain("github_cli_env_override");
     expect(processUtil).toContain("git_runtime_key");
     expect(processUtil).toContain("push_git_registry_candidates");
     expect(processUtil).toContain(`resolve_git_from_env()
@@ -118,9 +132,16 @@ describe("Python runtime settings", () => {
         .or_else(resolve_git_from_common_locations)
         .or_else(resolve_git_from_managed_resource)`);
     expect(lib).toContain("set_managed_git_resource_dir");
+    expect(lib).toContain("set_managed_github_cli_resource_dir");
     expect(script).toContain("PortableGit");
     expect(script).toContain("findCachedGitArchive");
     expect(script).toContain("Falling back to cached managed Git archive");
+    expect(githubCliScript).toContain("GH_LATEST_RELEASE_URL");
+    expect(githubCliScript).toContain("resolveLatestReleaseTag");
+    expect(githubCliScript).toContain("findCachedGithubCliArchive");
+    expect(githubCliScript).toContain("Falling back to cached GitHub CLI archive");
+    expect(licenseScript).toContain("GITHUB_CLI_MANIFEST_PATH");
+    expect(licenseScript).toContain('name: "GitHub CLI"');
   });
 
   it("routes managed Python pip installs into the app data directory", () => {
@@ -153,6 +174,7 @@ describe("Python runtime settings", () => {
     expect(pkg).toContain('"build:tauri:without_embed_python_git"');
     expect(tauriConfig).not.toContain("managed-python");
     expect(tauriConfig).not.toContain("managed-git");
+    expect(tauriConfig).toContain("gh-runtime");
     expect(runTauri).toContain("tauri.with_embed_python_git.conf.json");
     expect(runTauri).toContain("shouldInjectDefaultReleaseFlavor");
     expect(releaseScript).toContain('"default"');
@@ -163,5 +185,6 @@ describe("Python runtime settings", () => {
     expect(withoutEmbedConfig).toContain('"beforeBuildCommand": "bun run build:tauri:without_embed_python_git"');
     expect(withoutEmbedConfig).not.toContain("managed-python");
     expect(withoutEmbedConfig).not.toContain("managed-git");
+    expect(withoutEmbedConfig).toContain("gh-runtime");
   });
 });

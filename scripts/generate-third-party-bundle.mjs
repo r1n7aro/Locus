@@ -9,6 +9,7 @@ const FRONTEND_MANIFEST_PATH = path.join(ROOT_DIR, "package.json");
 const FRONTEND_LOCK_PATH = path.join(ROOT_DIR, "bun.lock");
 const RUST_MANIFEST_PATH = path.join(ROOT_DIR, "src-tauri", "Cargo.toml");
 const RUST_LOCK_PATH = path.join(ROOT_DIR, "src-tauri", "Cargo.lock");
+const GITHUB_CLI_MANIFEST_PATH = path.join(ROOT_DIR, "src-tauri", "gen", "gh-runtime", "manifest.json");
 const THIRD_PARTY_SOURCE_DIR = path.join(ROOT_DIR, "third_party", "redistributables");
 const THIRD_PARTY_SPDX_DIR = path.join(ROOT_DIR, "third_party", "spdx");
 const STANDARD_LICENSE_FILES = {
@@ -216,7 +217,7 @@ function walkRustDependencies(packageId, nodeById, runtimePackageIds) {
 
 function generateBinaryBundle() {
   const records = [];
-  for (const binary of BUNDLED_BINARIES) {
+  for (const binary of bundledBinaryEntries()) {
     if (!fs.existsSync(binary.sourceDir)) {
       throw new Error(`Missing third-party source directory: ${binary.sourceDir}`);
     }
@@ -238,6 +239,7 @@ function generateBinaryBundle() {
       kind: binary.kind,
       name: binary.name,
       version: binary.version,
+      sourceUrl: binary.sourceUrl ?? null,
       sourceDir: toRepoRelative(binary.sourceDir),
       distributedFiles: binary.distributedFiles,
       texts: copiedFiles.map(toOutputRelative),
@@ -253,6 +255,39 @@ function generateBinaryBundle() {
   return {
     packageCount: records.length,
   };
+}
+
+function bundledBinaryEntries() {
+  return [...BUNDLED_BINARIES, ...githubCliBinaryEntries()];
+}
+
+function githubCliBinaryEntries() {
+  if (!fs.existsSync(GITHUB_CLI_MANIFEST_PATH)) {
+    return [];
+  }
+
+  const manifest = readJson(GITHUB_CLI_MANIFEST_PATH);
+  return (manifest.runtimes || []).map((runtime) => {
+    const sourceDir = path.join(ROOT_DIR, "src-tauri", "gen", "gh-runtime", runtime.id);
+    return {
+      kind: "redistributable-binary",
+      name: "GitHub CLI",
+      version: runtime.version ?? runtime.release ?? "unknown",
+      sourceUrl: runtime.sourceUrl ?? null,
+      sourceDir,
+      distributedFiles: [
+        stripRuntimePrefix(runtime.executable, runtime.id),
+        ...(runtime.legalFiles || []).map((filePath) => stripRuntimePrefix(filePath, runtime.id)),
+      ].filter(Boolean),
+    };
+  });
+}
+
+function stripRuntimePrefix(filePath, runtimeId) {
+  if (!filePath) return "";
+  const normalized = normalizePath(filePath);
+  const prefix = `${runtimeId}/`;
+  return normalized.startsWith(prefix) ? normalized.slice(prefix.length) : normalized;
 }
 
 function copyManifestInputs() {

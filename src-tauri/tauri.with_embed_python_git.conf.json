@@ -6,6 +6,7 @@
   "bundle": {
     "resources": {
       "./gen/ort-runtime": "ort-runtime/",
+      "./gen/gh-runtime": "gh-runtime/",
       "./gen/managed-python": "managed-python/",
       "./gen/managed-git": "managed-git/"
     }

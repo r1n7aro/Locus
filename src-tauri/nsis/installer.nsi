@@ -722,6 +722,8 @@ Section Install
   ; Locus: replace optional bundled Python and Git resources.
   RMDir /r "$INSTDIR\managed-python"
   RMDir /r "$INSTDIR\managed-git"
+  ; Locus: replace bundled GitHub CLI resources.
+  RMDir /r "$INSTDIR\gh-runtime"
   ; Locus: replace bundled Unity package resources.
   RMDir /r "$INSTDIR\locus_unity"
   ; Locus: remove legacy root-level bundled skill resources.
