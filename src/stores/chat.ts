@@ -2,6 +2,7 @@ import { ref, computed } from "vue";
 import { defineStore } from "pinia";
 import { useModelStore } from "./model";
 import { useAgentStore } from "./agent";
+import { useUiStore } from "./ui";
 import { useNotificationStore } from "./notification";
 import { normalizeAppError } from "../services/errors";
 import { getToolPermissionMode, saveToolPermissionMode } from "../services/permissions";
@@ -9,7 +10,8 @@ import * as sessionService from "../services/session";
 import * as undoService from "../services/undo";
 import { buildToolResultMessages, mergeUserMessage, reduceStreamEvent, type StreamMutation } from "../composables/useStreamReducer";
 import { resolveToolCallDisplayShape } from "../composables/toolCallBatches";
-import { hydrateChatMessagesIntent, withClientMessageId } from "../composables/chatInputIntents";
+import { hydrateChatMessagesIntent, parseUserIntentMeta, withClientMessageId } from "../composables/chatInputIntents";
+import { buildUserMessageDraft } from "../composables/chatMessageDraft";
 import type { SessionScrollState } from "../composables/chatScrollState";
 import { t } from "../i18n";
 import { useChatChangesStore } from "./chatChanges";
@@ -274,6 +276,46 @@ function normalizeToolPermissionMode(mode: string | null | undefined): ToolPermi
   return mode === "ask" ? "ask" : "auto";
 }
 
+function isLocalPendingUserMessage(message: ChatMessage): boolean {
+  return message.role === "user"
+    && (message.id.startsWith("user_pending_") || message.id.startsWith("embedded_user_"));
+}
+
+function messageClientMessageId(message: ChatMessage): string | null {
+  return message.intentMeta?.clientMessageId
+    ?? parseUserIntentMeta(message.thinkingSignature)?.clientMessageId
+    ?? null;
+}
+
+function attachmentsMatch(left: ChatMessage, right: ChatMessage): boolean {
+  const leftImages = left.images ?? [];
+  const rightImages = right.images ?? [];
+  if (leftImages.length !== rightImages.length) return false;
+  for (let index = 0; index < leftImages.length; index += 1) {
+    if (leftImages[index]?.data !== rightImages[index]?.data) return false;
+    if (leftImages[index]?.mimeType !== rightImages[index]?.mimeType) return false;
+  }
+
+  const leftRefs = left.assetRefs ?? [];
+  const rightRefs = right.assetRefs ?? [];
+  if (leftRefs.length !== rightRefs.length) return false;
+  for (let index = 0; index < leftRefs.length; index += 1) {
+    if (leftRefs[index]?.path !== rightRefs[index]?.path) return false;
+    if (leftRefs[index]?.kind !== rightRefs[index]?.kind) return false;
+  }
+  return true;
+}
+
+function userMessageMatchesPending(candidate: ChatMessage, pending: ChatMessage): boolean {
+  if (candidate.role !== "user") return false;
+  const pendingClientMessageId = messageClientMessageId(pending);
+  const candidateClientMessageId = messageClientMessageId(candidate);
+  if (pendingClientMessageId || candidateClientMessageId) {
+    return !!pendingClientMessageId && pendingClientMessageId === candidateClientMessageId;
+  }
+  return candidate.content === pending.content && attachmentsMatch(candidate, pending);
+}
+
 function logChatStreamDebug(message: string, detail?: Record<string, unknown>) {
   console.info(`[chat-stream] ${message}`, detail ?? {});
 }
@@ -426,6 +468,40 @@ export const useChatStore = defineStore("chat", () => {
       deferredUserMessages: deferredUserMessagesTraceState(),
       ...detail(),
     });
+  }
+
+  function restoreDraftFromFailedUserMessage(message: ChatMessage) {
+    useUiStore().stageChatDraftPrefill(buildUserMessageDraft(message));
+  }
+
+  function failedUserMessageFromPayload(
+    id: string,
+    displayText: string,
+    images: ImageAttachment[],
+    assetRefs: AssetRefAttachment[],
+    userIntent: UserIntentMeta | null | undefined,
+  ): ChatMessage {
+    return {
+      id,
+      role: "user",
+      content: displayText,
+      createdAt: Date.now() / 1000,
+      images: images.length > 0 ? images : undefined,
+      assetRefs: assetRefs.length > 0 ? assetRefs : undefined,
+      intentMeta: userIntent ?? undefined,
+      thinkingSignature: userIntent ? JSON.stringify(userIntent) : undefined,
+    };
+  }
+
+  async function loadSessionStatePreservingFailedUserDraft(sessionId: string) {
+    const pendingUserMessages = messages.value.filter(isLocalPendingUserMessage);
+    const pendingUserMessage = pendingUserMessages[pendingUserMessages.length - 1];
+    await loadSessionState(sessionId);
+    if (!pendingUserMessage) return;
+    if (messages.value.some((message) => userMessageMatchesPending(message, pendingUserMessage))) {
+      return;
+    }
+    restoreDraftFromFailedUserMessage(pendingUserMessage);
   }
 
   function resolveSessionType(sessionId: string | null): string | null {
@@ -1565,7 +1641,11 @@ export const useChatStore = defineStore("chat", () => {
         if (event.type === "done") {
           void useChatChangesStore().refresh(activeSessionId.value, { allowAutoOpen: false });
         }
-        void loadSessionState(event.sessionId);
+        if (event.type === "error") {
+          void loadSessionStatePreservingFailedUserDraft(event.sessionId);
+        } else {
+          void loadSessionState(event.sessionId);
+        }
       }
 
       if (event.type === "error") {
@@ -1654,7 +1734,7 @@ export const useChatStore = defineStore("chat", () => {
         code: event.error.code,
         operation: "chat",
       });
-      void loadSessionState(event.sessionId);
+      void loadSessionStatePreservingFailedUserDraft(event.sessionId);
     }
 
     if (event.type === "done") {
@@ -2009,6 +2089,13 @@ export const useChatStore = defineStore("chat", () => {
         operation: "chat",
         skipConsoleLog: true,
       });
+      restoreDraftFromFailedUserMessage(failedUserMessageFromPayload(
+        mergeGroupId,
+        displayText,
+        images,
+        assetRefs,
+        userIntent,
+      ));
       return false;
     }
   }
@@ -2108,7 +2195,7 @@ export const useChatStore = defineStore("chat", () => {
     const userIntent = withClientMessageId(overrides?.userIntent, pendingMessageId);
     const userIntentSignature = JSON.stringify(userIntent);
 
-    messages.value.push({
+    const pendingUserMessage: ChatMessage = {
       id: pendingMessageId,
       role: "user",
       content: displayText,
@@ -2117,7 +2204,8 @@ export const useChatStore = defineStore("chat", () => {
       assetRefs: assetRefs.length > 0 ? assetRefs : undefined,
       thinkingSignature: userIntentSignature,
       intentMeta: userIntent,
-    });
+    };
+    messages.value.push(pendingUserMessage);
     resetStreamRuntimeState();
     isStreaming.value = true;
 
@@ -2206,6 +2294,7 @@ export const useChatStore = defineStore("chat", () => {
       isStreaming.value = false;
       resetStreamAnim();
       messages.value = messages.value.filter((message) => message.id !== pendingMessageId);
+      restoreDraftFromFailedUserMessage(pendingUserMessage);
       pendingSessionId = null;
       if (activeSessionId.value) {
         managedStreamingSessionIds.delete(activeSessionId.value);

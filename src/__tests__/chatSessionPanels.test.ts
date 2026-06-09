@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createPinia, setActivePinia } from "pinia";
 import { useChatStore } from "../stores/chat";
 import { useChatChangesStore } from "../stores/chatChanges";
+import { useUiStore } from "../stores/ui";
 import type { TodoItem, TodoSnapshot } from "../types";
 
 const sessionServiceMocks = vi.hoisted(() => ({
@@ -38,6 +39,13 @@ const undoServiceMocks = vi.hoisted(() => ({
 }));
 
 const displaySettingsState = vi.hoisted(() => ({
+  showWelcomeSubtitle: true,
+  showKnowledgeTab: true,
+  showCollabTab: true,
+  showAssetTab: true,
+  showViewsTab: true,
+  showPluginsTab: true,
+  showAgentTab: true,
   todoAutoOpen: true,
   changesAutoOpen: true,
   changesAutoClose: true,
@@ -156,6 +164,13 @@ describe("chat session panel state", () => {
     vi.resetAllMocks();
 
     displaySettingsState.todoAutoOpen = true;
+    displaySettingsState.showWelcomeSubtitle = true;
+    displaySettingsState.showKnowledgeTab = true;
+    displaySettingsState.showCollabTab = true;
+    displaySettingsState.showAssetTab = true;
+    displaySettingsState.showViewsTab = true;
+    displaySettingsState.showPluginsTab = true;
+    displaySettingsState.showAgentTab = true;
     displaySettingsState.changesAutoOpen = true;
     displaySettingsState.changesAutoClose = true;
     displaySettingsState.fileChangePopoverEnabled = true;
@@ -1558,11 +1573,67 @@ describe("chat session panel state", () => {
 
   it("removes the local pending user message when chat launch fails", async () => {
     const chatStore = useChatStore();
+    const uiStore = useUiStore();
     sessionServiceMocks.chat.mockRejectedValueOnce(new Error("session locked"));
 
     await chatStore.sendMessage("will fail");
 
     expect(chatStore.isStreaming).toBe(false);
+    expect(chatStore.messages).toEqual([]);
+    expect(uiStore.pendingChatPrefill?.draft?.text).toBe("will fail");
+  });
+
+  it("restores attachments and intent to the composer draft when chat launch fails", async () => {
+    const chatStore = useChatStore();
+    const uiStore = useUiStore();
+    sessionServiceMocks.chat.mockRejectedValueOnce(new Error("missing token"));
+
+    await chatStore.sendMessage(
+      "prompt text",
+      [{ data: "data:image/png;base64,abc", mimeType: "image/png" }],
+      [{ kind: "asset", path: "Assets/Foo.prefab" }],
+      {
+        mode: "plan",
+        displayText: "visible text",
+        userIntent: {
+          kind: "user_intent_v1",
+          mode: "plan",
+          skills: [{ dirName: "view", source: "project", name: "View" }],
+        },
+      },
+    );
+
+    const draft = uiStore.pendingChatPrefill?.draft;
+    expect(draft?.text).toBe("visible text");
+    expect(draft?.images).toHaveLength(1);
+    expect(draft?.assetRefs[0]).toMatchObject({ kind: "asset", path: "Assets/Foo.prefab" });
+    expect(draft?.intent.mode).toBe("plan");
+    expect(draft?.intent.skills).toEqual([{ dirName: "view", source: "project", name: "View" }]);
+  });
+
+  it("restores the pending user draft when a run errors before the user message is persisted", async () => {
+    const chatStore = useChatStore();
+    const uiStore = useUiStore();
+    sessionServiceMocks.chat.mockResolvedValueOnce({ sessionId: "s1", runId: "run-before-user" });
+
+    await chatStore.sendMessage("before persistence");
+    expect(chatStore.messages[0]?.content).toBe("before persistence");
+
+    chatStore.handleStreamEvent({
+      runId: "run-before-user",
+      type: "error",
+      sessionId: "s1",
+      error: {
+        code: "chat.stream_failed",
+        message: "failed before user event",
+        retryable: false,
+        severity: "error",
+      },
+    });
+
+    await vi.waitFor(() => {
+      expect(uiStore.pendingChatPrefill?.draft?.text).toBe("before persistence");
+    });
     expect(chatStore.messages).toEqual([]);
   });
 
@@ -1679,6 +1750,33 @@ describe("chat session panel state", () => {
       "pending-1",
     );
     expect(chatStore.activeQueuedFollowUp).toBeNull();
+  });
+
+  it("restores a running follow-up to the composer draft when queueing fails", async () => {
+    const chatStore = useChatStore();
+    const uiStore = useUiStore();
+    sessionServiceMocks.queueChatInput.mockRejectedValueOnce({
+      code: "network.failed",
+      message: "offline",
+    });
+
+    chatStore.activeSessionId = "s1";
+    chatStore.currentRunId = "run-1";
+    chatStore.isStreaming = true;
+
+    await chatStore.sendMessage(
+      "queued prompt",
+      [],
+      [{ kind: "asset", path: "Assets/Queued.prefab" }],
+      { displayText: "queued visible" },
+    );
+
+    expect(chatStore.activeQueuedFollowUp).toBeNull();
+    expect(uiStore.pendingChatPrefill?.draft?.text).toBe("queued visible");
+    expect(uiStore.pendingChatPrefill?.draft?.assetRefs[0]).toMatchObject({
+      kind: "asset",
+      path: "Assets/Queued.prefab",
+    });
   });
 
   it("shows an inserted user message after the active tool round is persisted", () => {

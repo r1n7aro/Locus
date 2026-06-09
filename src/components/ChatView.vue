@@ -906,6 +906,37 @@ const messageContextCanAct = computed(() =>
   && messageContextMessage.value.role !== "tool",
 );
 
+function lastRenderableMessage() {
+  for (let index = props.messages.length - 1; index >= 0; index -= 1) {
+    const message = props.messages[index];
+    if (message && hasRenderableTranscriptMessage(message)) {
+      return message;
+    }
+  }
+  return null;
+}
+
+function isLastUserMessageWithoutAssistantAfter(message: ChatMessage) {
+  if (message.role !== "user") return false;
+  if (lastRenderableMessage()?.id !== message.id) return false;
+  const messageIndex = props.messages.findIndex((candidate) => candidate.id === message.id);
+  if (messageIndex < 0) return false;
+  return !props.messages
+    .slice(messageIndex + 1)
+    .some((candidate) => candidate.role === "assistant" && hasRenderableTranscriptMessage(candidate));
+}
+
+const messageContextShouldShowReEdit = computed(() => {
+  const message = messageContextMessage.value;
+  return !!message && isLastUserMessageWithoutAssistantAfter(message);
+});
+
+const messageContextCanReEdit = computed(() =>
+  !!props.activeSessionId
+  && !props.isStreaming
+  && messageContextShouldShowReEdit.value,
+);
+
 async function doMessageCopy() {
   const message = messageContextMessage.value;
   if (!message || !messageContextCanCopy.value) return;
@@ -923,6 +954,18 @@ async function doMessageCopy() {
       operation: "messageCopy",
       replaceOperation: true,
     });
+  }
+}
+
+async function doMessageReEdit() {
+  const message = messageContextMessage.value;
+  if (!message || !messageContextCanReEdit.value) return;
+  const draft = buildUserMessageDraft(message);
+  closeMessageContextMenu();
+  chatChangesStore.closeInlineDiff();
+  const undone = await chatStore.undoLatestConversationTurn();
+  if (undone) {
+    uiStore.stageChatDraftPrefill(draft);
   }
 }
 
@@ -2452,7 +2495,7 @@ onUnmounted(() => {
           <div class="empty-state">
             <div class="empty-icon">L</div>
             <div class="empty-title">Locus</div>
-            <div class="empty-subtitle">{{ t("onboarding.welcome.subtitle") }}</div>
+            <div v-if="displaySettings.showWelcomeSubtitle" class="empty-subtitle">{{ t("onboarding.welcome.subtitle") }}</div>
           </div>
         </div>
       </div>
@@ -2724,6 +2767,16 @@ onUnmounted(() => {
             @click="doMessageCopy"
           >
             {{ t("chat.messageMenu.copyMessage") }}
+          </button>
+          <button
+            v-if="messageContextShouldShowReEdit"
+            type="button"
+            class="asset-ref-ctx-item ui-select-none"
+            role="menuitem"
+            :disabled="!messageContextCanReEdit"
+            @click="doMessageReEdit"
+          >
+            {{ t("chat.messageMenu.reEditUserMessage") }}
           </button>
           <div class="asset-ref-ctx-sep"></div>
           <button

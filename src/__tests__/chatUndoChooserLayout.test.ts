@@ -45,6 +45,14 @@ describe("chat undo chooser", () => {
     expect(chatView).toContain("userMessage: null");
     expect(chatView).toContain("chatStore.rollbackToMessage(targetMessageId");
     expect(chatView).toContain("chatStore.forkSessionFromMessage(messageId)");
+    expect(chatView).toContain("messageContextShouldShowReEdit");
+    expect(chatView).toContain("isLastUserMessageWithoutAssistantAfter");
+    expect(chatView).toContain("lastRenderableMessage()?.id !== message.id");
+    expect(chatView).toContain("&& !props.isStreaming");
+    expect(chatView).toContain("chatStore.undoLatestConversationTurn()");
+    expect(chatView).toContain("uiStore.stageChatDraftPrefill(draft)");
+    expect(chatView).toContain('v-if="messageContextShouldShowReEdit"');
+    expect(chatView).toContain('t("chat.messageMenu.reEditUserMessage")');
     expect(transcript).toContain("selectedMessageId?: string | null");
     expect(transcript).toContain("isContextSelectedMessage");
     expect(transcript).toContain("isContextSelectedAssistantGroup");
