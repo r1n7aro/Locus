@@ -10,6 +10,20 @@ export type ChatDiffReviewTarget = DiffReviewTarget;
 export type GitDiffReviewTarget = DiffReviewTarget;
 
 export interface DisplaySettings {
+  /** Show the welcome subtitle above the chat input */
+  showWelcomeSubtitle: boolean;
+  /** Show Knowledge tab in the top navigation */
+  showKnowledgeTab: boolean;
+  /** Show Collab tab in the top navigation */
+  showCollabTab: boolean;
+  /** Show Asset tab in the top navigation */
+  showAssetTab: boolean;
+  /** Show Views tab in the top navigation */
+  showViewsTab: boolean;
+  /** Show Plugins tab in the top navigation */
+  showPluginsTab: boolean;
+  /** Show Agent tab in the top navigation */
+  showAgentTab: boolean;
   /** Auto-open TODO panel when todos arrive */
   todoAutoOpen: boolean;
   /** Auto-open file changes panel when changes arrive */
@@ -81,6 +95,13 @@ const defaultFonts: Record<FontSlot, string> = {
 };
 
 const defaults: DisplaySettings = {
+  showWelcomeSubtitle: true,
+  showKnowledgeTab: true,
+  showCollabTab: true,
+  showAssetTab: true,
+  showViewsTab: true,
+  showPluginsTab: true,
+  showAgentTab: true,
   todoAutoOpen: true,
   changesAutoOpen: true,
   changesAutoClose: true,

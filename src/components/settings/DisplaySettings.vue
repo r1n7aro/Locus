@@ -43,6 +43,15 @@ const diffReviewTargetOptions = computed(() => [
   { value: "window", label: t("settings.display.diffReviewWindow") },
 ]);
 
+const topNavigationToggles = [
+  { key: "showKnowledgeTab", labelKey: "settings.display.showKnowledgeTab" },
+  { key: "showCollabTab", labelKey: "settings.display.showCollabTab" },
+  { key: "showAssetTab", labelKey: "settings.display.showAssetTab" },
+  { key: "showViewsTab", labelKey: "settings.display.showViewsTab" },
+  { key: "showPluginsTab", labelKey: "settings.display.showPluginsTab" },
+  { key: "showAgentTab", labelKey: "settings.display.showAgentTab" },
+] as const;
+
 const fontSlots: { slot: FontSlot; labelKey: string; mono: boolean }[] = [
   { slot: "ui",        labelKey: "settings.display.fontUi",        mono: false },
   { slot: "prose",     labelKey: "settings.display.fontProse",     mono: false },
@@ -155,6 +164,29 @@ async function updateViewWindowsAboveMain(value: boolean) {
           @update:model-value="setThemePreference('unityEmbed', $event as ThemePreference)"
         />
       </div>
+    </div>
+  </div>
+
+  <div class="settings-section">
+    <div class="section-label">{{ t("settings.display.mainChromeTitle") }}</div>
+    <p class="section-desc">{{ t("settings.display.mainChromeDesc") }}</p>
+
+    <div class="toggle-row">
+      <BaseSwitch
+        :model-value="display.showWelcomeSubtitle"
+        :aria-label="t('settings.display.showWelcomeSubtitle')"
+        @update:model-value="setDisplay('showWelcomeSubtitle', $event)"
+      />
+      <span>{{ t("settings.display.showWelcomeSubtitle") }}</span>
+    </div>
+
+    <div v-for="item in topNavigationToggles" :key="item.key" class="toggle-row">
+      <BaseSwitch
+        :model-value="display[item.key]"
+        :aria-label="t(item.labelKey)"
+        @update:model-value="setDisplay(item.key, $event)"
+      />
+      <span>{{ t(item.labelKey) }}</span>
     </div>
   </div>
 

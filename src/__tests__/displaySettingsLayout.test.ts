@@ -44,6 +44,76 @@ describe("display settings transcript alignment", () => {
     expect(en).toContain('"settings.display.themeUnityEmbedWindow": "Unity Embedded Window"');
   });
 
+  it("adds main interface visibility toggles while keeping Sessions and Settings always visible", () => {
+    const displaySettings = read("src/composables/useDisplaySettings.ts");
+    const displayPanel = read("src/components/settings/DisplaySettings.vue");
+    const chatView = read("src/components/ChatView.vue");
+    const app = read("src/App.vue");
+    const zh = read("src/language/zh.json");
+    const en = read("src/language/en.json");
+
+    for (const field of [
+      "showWelcomeSubtitle",
+      "showKnowledgeTab",
+      "showCollabTab",
+      "showAssetTab",
+      "showViewsTab",
+      "showPluginsTab",
+      "showAgentTab",
+    ]) {
+      expect(displaySettings).toContain(`${field}: boolean;`);
+      expect(displaySettings).toContain(`${field}: true,`);
+    }
+
+    expect(displayPanel).toContain("settings.display.mainChromeTitle");
+    expect(displayPanel).toContain(":model-value=\"display.showWelcomeSubtitle\"");
+    expect(displayPanel).toContain("@update:model-value=\"setDisplay('showWelcomeSubtitle', $event)\"");
+    expect(displayPanel).toContain("const topNavigationToggles = [");
+    expect(displayPanel).toContain('{ key: "showKnowledgeTab", labelKey: "settings.display.showKnowledgeTab" }');
+    expect(displayPanel).toContain('{ key: "showCollabTab", labelKey: "settings.display.showCollabTab" }');
+    expect(displayPanel).toContain('{ key: "showAssetTab", labelKey: "settings.display.showAssetTab" }');
+    expect(displayPanel).toContain('{ key: "showViewsTab", labelKey: "settings.display.showViewsTab" }');
+    expect(displayPanel).toContain('{ key: "showPluginsTab", labelKey: "settings.display.showPluginsTab" }');
+    expect(displayPanel).toContain('{ key: "showAgentTab", labelKey: "settings.display.showAgentTab" }');
+    expect(displayPanel).toContain(":model-value=\"display[item.key]\"");
+    expect(displayPanel).toContain("@update:model-value=\"setDisplay(item.key, $event)\"");
+
+    expect(chatView).toContain('v-if="displaySettings.showWelcomeSubtitle"');
+
+    expect(app).toContain('import { initFonts, useDisplaySettings } from "./composables/useDisplaySettings";');
+    expect(app).toContain("const { state: displaySettings } = useDisplaySettings();");
+    expect(app).toContain('{ id: "chat", labelKey: "app.tab.dev", visible: true }');
+    expect(app).toContain('{ id: "settings", labelKey: "app.tab.settings", visible: true }');
+    expect(app).toContain('{ id: "knowledge", labelKey: "app.tab.knowledge", visible: displaySettings.showKnowledgeTab }');
+    expect(app).toContain('{ id: "collab", labelKey: "app.tab.collab", visible: displaySettings.showCollabTab }');
+    expect(app).toContain('{ id: "asset", labelKey: "app.tab.asset", visible: displaySettings.showAssetTab }');
+    expect(app).toContain('{ id: "views", labelKey: "app.tab.views", visible: displaySettings.showViewsTab }');
+    expect(app).toContain('{ id: "plugins", labelKey: "app.tab.plugins", visible: showPluginEntry && displaySettings.showPluginsTab }');
+    expect(app).toContain('{ id: "agent", labelKey: "app.tab.agent", visible: displaySettings.showAgentTab }');
+    expect(app).toContain('v-for="tab in visibleTopTabs"');
+    expect(app).toContain('@click="uiStore.setTab(tab.id)"');
+    expect(app).toContain('if (isTopTabVisible(uiStore.activeTab)) return;');
+    expect(app).not.toContain("showChatTab");
+    expect(app).not.toContain("showSettingsTab");
+
+    expect(zh).toContain('"settings.display.mainChromeTitle": "主界面"');
+    expect(zh).toContain('"settings.display.showWelcomeSubtitle": "显示上方子标题"');
+    expect(zh).toContain('"settings.display.showKnowledgeTab": "显示知识"');
+    expect(zh).toContain('"settings.display.showCollabTab": "显示协作"');
+    expect(zh).toContain('"settings.display.showAssetTab": "显示资产"');
+    expect(zh).toContain('"settings.display.showViewsTab": "显示视图"');
+    expect(zh).toContain('"settings.display.showPluginsTab": "显示插件"');
+    expect(zh).toContain('"settings.display.showAgentTab": "显示 Agent"');
+    expect(en).toContain('"settings.display.mainChromeTitle": "Main Interface"');
+    expect(en).toContain('"settings.display.showWelcomeSubtitle": "Show top subtitle"');
+    expect(en).toContain('"settings.display.showKnowledgeTab": "Show Knowledge"');
+    expect(en).toContain('"settings.display.showCollabTab": "Show Collab"');
+    expect(en).toContain('"settings.display.showAssetTab": "Show Assets"');
+    expect(en).toContain('"settings.display.showViewsTab": "Show Views"');
+    expect(en).toContain('"settings.display.showPluginsTab": "Show Plugins"');
+    expect(en).toContain('"settings.display.showAgentTab": "Show Agent"');
+  });
+
   it("adds a session user message right-align toggle that defaults to on", () => {
     const displaySettings = read("src/composables/useDisplaySettings.ts");
     const displayPanel = read("src/components/settings/DisplaySettings.vue");

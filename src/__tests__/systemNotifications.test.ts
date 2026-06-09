@@ -23,6 +23,13 @@ const translations = {
 
 function createDisplayState(): DisplaySettings {
   return {
+    showWelcomeSubtitle: true,
+    showKnowledgeTab: true,
+    showCollabTab: true,
+    showAssetTab: true,
+    showViewsTab: true,
+    showPluginsTab: true,
+    showAgentTab: true,
     todoAutoOpen: true,
     changesAutoOpen: true,
     changesAutoClose: true,
