@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use super::{make_exec, ToolDef, ToolExecuteFn, ToolResult};
+use super::{ToolDef, ToolExecuteFn, ToolResult, make_exec};
 
 // ─── web_fetch ───────────────────────────────────────────────────────────────
 
@@ -326,7 +326,7 @@ pub(super) fn ask() -> ToolDef {
 
 #[cfg(test)]
 mod tests {
-    use super::{html_to_markdown, render_web_fetch_content, truncate_utf8_prefix, WebFetchFormat};
+    use super::{WebFetchFormat, html_to_markdown, render_web_fetch_content, truncate_utf8_prefix};
 
     #[test]
     fn truncate_utf8_prefix_handles_cjk_boundary() {
