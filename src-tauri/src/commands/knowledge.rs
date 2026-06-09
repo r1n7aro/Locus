@@ -3409,9 +3409,13 @@ impl Default for RuleConfig {
 
 pub type AgentRuleConfig = std::collections::HashMap<String, RuleConfig>;
 
+const PLUGIN_RULE_KEY_PREFIX: &str = "plugin:";
+const PLUGIN_RULE_DEFAULT_ORDER_BASE: i32 = 10_000;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuleItem {
+    pub key: String,
     pub file_name: String,
     pub title: String,
     pub order: i32,
@@ -3419,10 +3423,48 @@ pub struct RuleItem {
     pub updated_at: i64,
     #[serde(default = "default_source_project")]
     pub source: String,
+    #[serde(default)]
+    pub read_only: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_scope: Option<String>,
 }
 
 fn default_source_project() -> String {
     "project".to_string()
+}
+
+#[derive(Debug, Clone)]
+pub struct AgentRuleFileEntry {
+    pub key: String,
+    pub file_name: String,
+    pub title: String,
+    pub order: i32,
+    pub enabled: bool,
+    pub updated_at: i64,
+    pub source: String,
+    pub read_only: bool,
+    pub path: std::path::PathBuf,
+    pub plugin_id: Option<String>,
+    pub plugin_scope: Option<String>,
+}
+
+impl AgentRuleFileEntry {
+    fn into_item(self) -> RuleItem {
+        RuleItem {
+            key: self.key,
+            file_name: self.file_name,
+            title: self.title,
+            order: self.order,
+            enabled: self.enabled,
+            updated_at: self.updated_at,
+            source: self.source,
+            read_only: self.read_only,
+            plugin_id: self.plugin_id,
+            plugin_scope: self.plugin_scope,
+        }
+    }
 }
 
 fn rules_dir(working_dir: &str, agent_id: &str) -> Result<std::path::PathBuf, String> {
@@ -3506,57 +3548,72 @@ fn hide_from_static_rule_list(agent_id: &str, file_name: &str) -> bool {
     agent_id == "dev" && matches!(file_name, "知识库使用.md" | "知识维护.md")
 }
 
-#[tauri::command]
-pub async fn list_rules(
-    agent_id: String,
-    workspace: State<'_, Arc<Workspace>>,
-    app_agent_dir: State<'_, crate::AppAgentDir>,
-) -> Result<Vec<RuleItem>, AppError> {
-    let agent_id = canonical_agent_id(&agent_id).to_string();
-    let working_dir = workspace.path.read().await.clone();
-    let configs = merged_rule_config_for_agent(app_agent_dir.0.as_ref(), &working_dir, &agent_id);
-    let mut items = Vec::new();
-    let mut seen_names = std::collections::HashSet::new();
-
-    let project_dir = rules_dir(&working_dir, &agent_id)?;
-    scan_rules_dir(
-        &project_dir,
-        "project",
-        &configs,
-        &mut seen_names,
-        &mut items,
-    );
-
-    if let Some(app_dir) = app_agent_dir.0.as_ref() {
-        let app_rules = app_dir.join(&agent_id).join("rule");
-        eprintln!(
-            "[list_rules] app_agent_dir={:?}, agent_id={}, app_rules={:?}, is_dir={}",
-            app_dir,
-            agent_id,
-            app_rules,
-            app_rules.is_dir()
-        );
-        if app_rules.is_dir() {
-            scan_rules_dir(&app_rules, "app", &configs, &mut seen_names, &mut items);
-        }
-    } else {
-        eprintln!(
-            "[list_rules] app_agent_dir is None for agent_id={}",
-            agent_id
-        );
-    }
-
-    items.retain(|item| !hide_from_static_rule_list(&agent_id, &item.file_name));
-    items.sort_by(|a, b| a.order.cmp(&b.order).then(a.file_name.cmp(&b.file_name)));
-    Ok(items)
+fn rule_config_or_default(
+    configs: &std::collections::HashMap<String, RuleConfig>,
+    key: &str,
+    enabled: bool,
+    order: i32,
+) -> RuleConfig {
+    configs
+        .get(key)
+        .cloned()
+        .unwrap_or(RuleConfig { enabled, order })
 }
 
-fn scan_rules_dir(
+fn plugin_rule_key(
+    scope: crate::plugin::PluginInstallScope,
+    plugin_id: &str,
+    rel_path: &str,
+) -> String {
+    format!(
+        "{}{}:{}:{}",
+        PLUGIN_RULE_KEY_PREFIX,
+        scope.as_str(),
+        plugin_id,
+        rel_path.replace('\\', "/")
+    )
+}
+
+fn plugin_rule_file_paths(
+    source: &crate::plugin::PluginComponentSource,
+) -> Vec<(std::path::PathBuf, String)> {
+    if source.root.is_file() {
+        if source.root.extension().and_then(|value| value.to_str()) == Some("md") {
+            return vec![(source.root.clone(), source.rel_path.clone())];
+        }
+        return Vec::new();
+    }
+
+    if !source.root.is_dir() {
+        return Vec::new();
+    }
+
+    let Ok(entries) = std::fs::read_dir(&source.root) else {
+        return Vec::new();
+    };
+    let mut files = entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if !path.is_file() || path.extension().and_then(|value| value.to_str()) != Some("md") {
+                return None;
+            }
+            let file_name = path.file_name()?.to_str()?.to_string();
+            let rel_path = format!("{}/{}", source.rel_path.trim_end_matches('/'), file_name);
+            Some((path, rel_path))
+        })
+        .collect::<Vec<_>>();
+    files.sort_by(|a, b| a.1.cmp(&b.1));
+    files
+}
+
+fn scan_static_rules_dir(
+    agent_id: &str,
     dir: &std::path::Path,
     source: &str,
     configs: &std::collections::HashMap<String, RuleConfig>,
     seen_names: &mut std::collections::HashSet<String>,
-    items: &mut Vec<RuleItem>,
+    items: &mut Vec<AgentRuleFileEntry>,
 ) {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
@@ -3573,20 +3630,146 @@ fn scan_rules_dir(
             if !seen_names.insert(file_name.clone()) {
                 continue;
             }
+            if hide_from_static_rule_list(agent_id, &file_name) {
+                continue;
+            }
             let title = extract_title_from_file(&path, &file_name);
             let updated_at = get_updated_at(&path);
             let cfg = configs.get(&file_name).cloned().unwrap_or_default();
 
-            items.push(RuleItem {
+            items.push(AgentRuleFileEntry {
+                key: file_name.clone(),
                 file_name,
                 title,
                 order: cfg.order,
                 enabled: cfg.enabled,
                 updated_at,
                 source: source.to_string(),
+                read_only: false,
+                path,
+                plugin_id: None,
+                plugin_scope: None,
             });
         }
     }
+}
+
+fn scan_plugin_rule_sources(
+    working_dir: &str,
+    configs: &std::collections::HashMap<String, RuleConfig>,
+    items: &mut Vec<AgentRuleFileEntry>,
+) {
+    let mut seen_keys = std::collections::HashSet::new();
+    let mut default_order = PLUGIN_RULE_DEFAULT_ORDER_BASE;
+    for source in crate::plugin::installed_rule_sources(working_dir) {
+        for (path, rel_path) in plugin_rule_file_paths(&source) {
+            let key = plugin_rule_key(source.scope, &source.plugin_id, &rel_path);
+            if !seen_keys.insert(key.clone()) {
+                continue;
+            }
+            let Some(file_name) = path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            let title = extract_title_from_file(&path, &file_name);
+            let updated_at = get_updated_at(&path);
+            let cfg = rule_config_or_default(configs, &key, false, default_order);
+            default_order = default_order.saturating_add(1);
+
+            items.push(AgentRuleFileEntry {
+                key,
+                file_name,
+                title,
+                order: cfg.order,
+                enabled: cfg.enabled,
+                updated_at,
+                source: source.scope.component_source().to_string(),
+                read_only: true,
+                path,
+                plugin_id: Some(source.plugin_id.clone()),
+                plugin_scope: Some(source.scope.as_str().to_string()),
+            });
+        }
+    }
+}
+
+pub fn collect_agent_rule_files(
+    app_agent_dir: &Option<std::path::PathBuf>,
+    working_dir: &str,
+    agent_id: &str,
+    create_project_dir: bool,
+) -> Result<Vec<AgentRuleFileEntry>, String> {
+    let agent_id = canonical_agent_id(agent_id).to_string();
+    let configs = merged_rule_config_for_agent(app_agent_dir, working_dir, &agent_id);
+    let mut items = Vec::new();
+    let mut seen_static_names = std::collections::HashSet::new();
+
+    if !working_dir.trim().is_empty() {
+        if create_project_dir {
+            let project_dir = rules_dir(working_dir, &agent_id)?;
+            scan_static_rules_dir(
+                &agent_id,
+                &project_dir,
+                "project",
+                &configs,
+                &mut seen_static_names,
+                &mut items,
+            );
+        } else {
+            let project_dir = std::path::Path::new(working_dir)
+                .join("Locus")
+                .join("agent")
+                .join(&agent_id)
+                .join("rule");
+            if project_dir.is_dir() {
+                scan_static_rules_dir(
+                    &agent_id,
+                    &project_dir,
+                    "project",
+                    &configs,
+                    &mut seen_static_names,
+                    &mut items,
+                );
+            }
+        }
+    }
+
+    scan_plugin_rule_sources(working_dir, &configs, &mut items);
+
+    if let Some(app_dir) = app_agent_dir {
+        let app_rules = app_dir.join(&agent_id).join("rule");
+        if app_rules.is_dir() {
+            scan_static_rules_dir(
+                &agent_id,
+                &app_rules,
+                "app",
+                &configs,
+                &mut seen_static_names,
+                &mut items,
+            );
+        }
+    }
+
+    items.sort_by(|a, b| a.order.cmp(&b.order).then(a.key.cmp(&b.key)));
+    Ok(items)
+}
+
+#[tauri::command]
+pub async fn list_rules(
+    agent_id: String,
+    workspace: State<'_, Arc<Workspace>>,
+    app_agent_dir: State<'_, crate::AppAgentDir>,
+) -> Result<Vec<RuleItem>, AppError> {
+    let agent_id = canonical_agent_id(&agent_id).to_string();
+    let working_dir = workspace.path.read().await.clone();
+    let items = collect_agent_rule_files(app_agent_dir.0.as_ref(), &working_dir, &agent_id, true)?
+        .into_iter()
+        .map(AgentRuleFileEntry::into_item)
+        .collect();
+    Ok(items)
 }
 
 #[tauri::command]
@@ -3635,12 +3818,16 @@ pub async fn save_rule(
     let cfg = configs.get(&file_name).cloned().unwrap_or_default();
 
     Ok(RuleItem {
+        key: file_name.clone(),
         file_name,
         title,
         order: cfg.order,
         enabled: cfg.enabled,
         updated_at,
         source: "project".to_string(),
+        read_only: false,
+        plugin_id: None,
+        plugin_scope: None,
     })
 }
 
@@ -3651,11 +3838,21 @@ pub async fn read_rule(
     workspace: State<'_, Arc<Workspace>>,
     app_agent_dir: State<'_, crate::AppAgentDir>,
 ) -> Result<String, AppError> {
+    let agent_id = canonical_agent_id(&agent_id).to_string();
+    let working_dir = workspace.path.read().await.clone();
+    if file_name.starts_with(PLUGIN_RULE_KEY_PREFIX) {
+        let entries =
+            collect_agent_rule_files(app_agent_dir.0.as_ref(), &working_dir, &agent_id, false)?;
+        if let Some(entry) = entries.into_iter().find(|entry| entry.key == file_name) {
+            return std::fs::read_to_string(&entry.path)
+                .map_err(|e| format!("Failed to read rule: {}", e))
+                .map_err(Into::into);
+        }
+        return Err(format!("Rule file not found: {}", file_name).into());
+    }
     if file_name.contains("..") || file_name.contains('/') || file_name.contains('\\') {
         return Err("Invalid file name".to_string().into());
     }
-    let agent_id = canonical_agent_id(&agent_id).to_string();
-    let working_dir = workspace.path.read().await.clone();
     let project_path = rules_dir(&working_dir, &agent_id)?.join(&file_name);
     if project_path.is_file() {
         return std::fs::read_to_string(&project_path)
@@ -3702,10 +3899,29 @@ pub async fn set_rule_enabled(
     file_name: String,
     enabled: bool,
     workspace: State<'_, Arc<Workspace>>,
+    app_agent_dir: State<'_, crate::AppAgentDir>,
 ) -> Result<(), AppError> {
+    if file_name.trim().is_empty() {
+        return Err("Invalid rule key".to_string().into());
+    }
+    let agent_id = canonical_agent_id(&agent_id).to_string();
     let working_dir = workspace.path.read().await.clone();
+    if working_dir.trim().is_empty() {
+        return Err("No working directory selected".to_string().into());
+    }
+    let existing_entry =
+        collect_agent_rule_files(app_agent_dir.0.as_ref(), &working_dir, &agent_id, false)?
+            .into_iter()
+            .find(|entry| entry.key == file_name || entry.file_name == file_name);
     let mut configs = load_rule_config(&working_dir, &agent_id);
-    let cfg = configs.entry(file_name).or_default();
+    let max_order = configs.values().map(|cfg| cfg.order).max().unwrap_or(-1);
+    let cfg = configs.entry(file_name).or_insert_with(|| RuleConfig {
+        enabled,
+        order: existing_entry
+            .as_ref()
+            .map(|entry| entry.order)
+            .unwrap_or(max_order.saturating_add(1)),
+    });
     cfg.enabled = enabled;
     save_rule_config(&working_dir, &agent_id, &configs).map_err(Into::into)
 }
@@ -3715,11 +3931,26 @@ pub async fn set_rule_order(
     agent_id: String,
     file_names: Vec<String>,
     workspace: State<'_, Arc<Workspace>>,
+    app_agent_dir: State<'_, crate::AppAgentDir>,
 ) -> Result<(), AppError> {
+    let agent_id = canonical_agent_id(&agent_id).to_string();
     let working_dir = workspace.path.read().await.clone();
+    if working_dir.trim().is_empty() {
+        return Err("No working directory selected".to_string().into());
+    }
+    let entries =
+        collect_agent_rule_files(app_agent_dir.0.as_ref(), &working_dir, &agent_id, false)?;
     let mut configs = load_rule_config(&working_dir, &agent_id);
     for (i, name) in file_names.iter().enumerate() {
-        let cfg = configs.entry(name.clone()).or_default();
+        let default_enabled = entries
+            .iter()
+            .find(|entry| entry.key == *name || entry.file_name == *name)
+            .map(|entry| entry.enabled)
+            .unwrap_or(true);
+        let cfg = configs.entry(name.clone()).or_insert_with(|| RuleConfig {
+            enabled: default_enabled,
+            order: i as i32,
+        });
         cfg.order = i as i32;
     }
     save_rule_config(&working_dir, &agent_id, &configs).map_err(Into::into)
@@ -3749,6 +3980,79 @@ mod tests {
             allow_move_directories: true,
             maintenance_rules: "- Keep inherited child knowledge stable".to_string(),
         }
+    }
+
+    fn write_plugin_rule(workspace: &TempDir, plugin_id: &str, file_name: &str, content: &str) {
+        let plugin_root = workspace
+            .path()
+            .join(crate::plugin::PROJECT_PLUGINS_RELATIVE)
+            .join(plugin_id);
+        std::fs::create_dir_all(plugin_root.join("rules")).expect("create plugin rules");
+        let manifest = serde_json::json!({
+            "schemaVersion": 1,
+            "id": plugin_id,
+            "name": plugin_id,
+            "version": "1.0.0",
+            "components": {
+                "agents": [],
+                "rules": [],
+                "skills": [],
+                "views": []
+            }
+        });
+        std::fs::write(
+            plugin_root.join(crate::plugin::PLUGIN_MANIFEST_FILE_NAME),
+            serde_json::to_string_pretty(&manifest).expect("serialize manifest"),
+        )
+        .expect("write plugin manifest");
+        std::fs::write(plugin_root.join("rules").join(file_name), content)
+            .expect("write plugin rule");
+    }
+
+    #[test]
+    fn plugin_rules_are_optional_per_agent() {
+        let workspace = TempDir::new().expect("workspace");
+        let working_dir = workspace.path().to_string_lossy().to_string();
+        write_plugin_rule(
+            &workspace,
+            "com.example.rules",
+            "risk_control.md",
+            "# Risk Control\n\nUse extra caution.",
+        );
+
+        let listed =
+            collect_agent_rule_files(&None, &working_dir, "dev", false).expect("collect rules");
+        let plugin_rule = listed
+            .iter()
+            .find(|item| item.plugin_id.as_deref() == Some("com.example.rules"))
+            .expect("plugin rule should be listed");
+
+        assert_eq!(plugin_rule.file_name, "risk_control.md");
+        assert_eq!(plugin_rule.source, "pluginProject");
+        assert!(plugin_rule.read_only);
+        assert!(!plugin_rule.enabled);
+        assert!(plugin_rule
+            .key
+            .starts_with("plugin:project:com.example.rules:"));
+
+        let mut config = AgentRuleConfig::new();
+        config.insert(
+            plugin_rule.key.clone(),
+            RuleConfig {
+                enabled: true,
+                order: 3,
+            },
+        );
+        save_rule_config(&working_dir, "dev", &config).expect("save rule config");
+
+        let enabled =
+            collect_agent_rule_files(&None, &working_dir, "dev", false).expect("collect enabled");
+        let plugin_rule = enabled
+            .iter()
+            .find(|item| item.plugin_id.as_deref() == Some("com.example.rules"))
+            .expect("plugin rule should still be listed");
+        assert!(plugin_rule.enabled);
+        assert_eq!(plugin_rule.order, 3);
     }
 
     #[test]

@@ -40,6 +40,10 @@ pub mod tools {
     pub const SKILL_CREATE: &str = include_str!("../../tools/skill_create.json");
     pub const SKILL_RELOAD: &str = include_str!("../../tools/skill_reload.json");
     pub const SKILL_LIST: &str = include_str!("../../tools/skill_list.json");
+    pub const PLUGIN_LIST: &str = include_str!("../../tools/plugin_list.json");
+    pub const PLUGIN_SEARCH: &str = include_str!("../../tools/plugin_search.json");
+    pub const PLUGIN_INSTALL: &str = include_str!("../../tools/plugin_install.json");
+    pub const PLUGIN_UNINSTALL: &str = include_str!("../../tools/plugin_uninstall.json");
     pub const PLUGIN_EXPORT: &str = include_str!("../../tools/plugin_export.json");
     pub const VIEW_CREATE: &str = include_str!("../../tools/view_create.json");
     pub const VIEW_LIST: &str = include_str!("../../tools/view_list.json");
@@ -128,6 +132,10 @@ mod tests {
             ("skill_create", tools::SKILL_CREATE),
             ("skill_reload", tools::SKILL_RELOAD),
             ("skill_list", tools::SKILL_LIST),
+            ("plugin_list", tools::PLUGIN_LIST),
+            ("plugin_search", tools::PLUGIN_SEARCH),
+            ("plugin_install", tools::PLUGIN_INSTALL),
+            ("plugin_uninstall", tools::PLUGIN_UNINSTALL),
             ("plugin_export", tools::PLUGIN_EXPORT),
             ("view_create", tools::VIEW_CREATE),
             ("view_list", tools::VIEW_LIST),

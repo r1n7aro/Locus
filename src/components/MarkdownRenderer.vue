@@ -26,6 +26,7 @@ import {
   type MarkdownPathStatus,
 } from "../composables/markdownInject";
 import { normalizeMarkdownForRender } from "../composables/markdownRender";
+import { sanitizeRenderedMarkdownHtml } from "../composables/markdownSanitize";
 import { wrapMarkdownTables } from "../composables/markdownTableHtml";
 import {
   armLocusFilePointerDrag,
@@ -280,9 +281,9 @@ const renderedHtml = computed(() => {
     if (highlightTerms.length) {
       html = highlightHtml(html, highlightTerms);
     }
-    return html;
+    return sanitizeRenderedMarkdownHtml(html);
   } catch {
-    return props.content;
+    return sanitizeRenderedMarkdownHtml(escapeHtml(props.content));
   }
 });
 

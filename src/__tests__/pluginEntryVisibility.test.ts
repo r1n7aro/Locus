@@ -9,12 +9,14 @@ function read(relPath: string) {
 }
 
 describe("plugin entry visibility", () => {
-  it("keeps the plugin page behind a release visibility flag", () => {
+  it("shows the plugin page and keeps lazy loading guarded by the entry flag", () => {
     const app = read("src/App.vue");
 
-    expect(app).toContain("const showPluginEntry = false;");
-    expect(app).toMatch(/v-if="showPluginEntry"[\s\S]*@click="uiStore\.setTab\('plugins'\)"/);
-    expect(app).toContain("if (!showPluginEntry || !mounted) return;");
+    expect(app).toContain("const showPluginEntry = true;");
+    expect(app).toContain('{ id: "plugins", labelKey: "app.tab.plugins", visible: showPluginEntry && displaySettings.showPluginsTab }');
+    expect(app).toContain('v-for="tab in visibleTopTabs"');
+    expect(app).toContain('@click="uiStore.setTab(tab.id)"');
+    expect(app).toContain("if (!showPluginEntry || !displaySettings.showPluginsTab || !mounted) return;");
     expect(app).toContain("v-if=\"showPluginEntry && uiStore.pluginsMounted && pluginViewComponent\"");
   });
 });

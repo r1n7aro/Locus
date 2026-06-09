@@ -1,0 +1,94 @@
+{
+  "description": "Install a Locus plugin from the official registry, a local plugin path, an archive URL, or a GitHub source. Use this in the /plugin workflow only after the user has identified the target clearly or confirmed a search result and install scope.",
+  "parameters": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "pluginId": {
+        "type": ["string", "null"],
+        "description": "Registry plugin id to install. Use this for official registry installs after the id is known."
+      },
+      "registryBaseUrl": {
+        "type": ["string", "null"],
+        "description": "Optional registry base URL for pluginId installs. Omit to use the official Locus plugin registry."
+      },
+      "expectedPluginId": {
+        "type": ["string", "null"],
+        "description": "Expected plugin id when installing from source, path, url, or repo."
+      },
+      "scope": {
+        "type": ["string", "null"],
+        "enum": ["app", "project", null],
+        "description": "Install scope. Use app for user-wide plugins and project for the current workspace."
+      },
+      "source": {
+        "type": ["object", "null"],
+        "additionalProperties": false,
+        "description": "Advanced source object matching PluginDownloadSource. Use when path, url, or repo shortcut fields are insufficient.",
+        "properties": {
+          "type": {
+            "type": "string",
+            "description": "Source kind: local, url, repo, branch, tag, commit, release, latestRelease, auto."
+          },
+          "id": { "type": "string" },
+          "input": { "type": "string" },
+          "url": { "type": "string" },
+          "repo": { "type": "string" },
+          "ref": { "type": "string" },
+          "branch": { "type": "string" },
+          "tag": { "type": "string" },
+          "commit": { "type": "string" },
+          "asset": { "type": "string" },
+          "assetPattern": { "type": "string" },
+          "sha256": { "type": "string" },
+          "sizeBytes": { "type": ["number", "null"] },
+          "version": { "type": "string" }
+        }
+      },
+      "path": {
+        "type": ["string", "null"],
+        "description": "Local plugin directory or .zip archive path."
+      },
+      "url": {
+        "type": ["string", "null"],
+        "description": "Plugin .zip archive URL."
+      },
+      "repo": {
+        "type": ["string", "null"],
+        "description": "GitHub repo in owner/name form or a git URL."
+      },
+      "ref": {
+        "type": ["string", "null"],
+        "description": "Git reference for repo installs."
+      },
+      "branch": {
+        "type": ["string", "null"],
+        "description": "Git branch for repo installs."
+      },
+      "tag": {
+        "type": ["string", "null"],
+        "description": "Git tag or GitHub release tag for repo installs."
+      },
+      "commit": {
+        "type": ["string", "null"],
+        "description": "Git commit for repo installs."
+      },
+      "asset": {
+        "type": ["string", "null"],
+        "description": "GitHub release asset name for release installs."
+      },
+      "assetPattern": {
+        "type": ["string", "null"],
+        "description": "GitHub release asset glob pattern for versioned release assets, for example locus-workspace-*.zip."
+      },
+      "sha256": {
+        "type": ["string", "null"],
+        "description": "Optional archive SHA-256 verification hash."
+      },
+      "version": {
+        "type": ["string", "null"],
+        "description": "Expected plugin version when installing from source."
+      }
+    }
+  }
+}

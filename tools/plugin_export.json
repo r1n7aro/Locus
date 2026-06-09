@@ -1,12 +1,12 @@
 {
-  "description": "Export an audited Locus plugin archive from existing Skill packages and Views. Use this only after the /create-plugin workflow has inspected the selected components, planned the plugin directory/manifest structure, classified project dependencies, and received explicit user approval for the export path. Do not use this as the first step or as a one-click export shortcut. The tool requires auditSummary, structurePlan, and userApproval so the tool call records the analysis that justified packaging.",
+  "description": "Export an audited Locus plugin archive from existing Skill packages, Views, and optional Rules. Use this only after the /plugin workflow has inspected the selected components, planned the plugin directory/manifest structure, classified project dependencies, and received explicit user approval for the export path. The tool requires auditSummary, structurePlan, and userApproval so the tool call records the analysis that justified packaging.",
   "parameters": {
     "type": "object",
     "additionalProperties": false,
     "properties": {
       "id": {
         "type": "string",
-        "description": "Plugin id, for example com.example.asset-tools. Use an author-owned namespace for published plugins."
+        "description": "Plugin id chosen by the user, for example asset-tools or unity-asset-browser. Prefer concise package-manager-style ids; use namespacing only when the user confirms it or a collision needs disambiguation."
       },
       "name": {
         "type": "string",
@@ -29,6 +29,25 @@
         "type": "array",
         "items": { "type": "string" },
         "description": "Existing View ids to copy into views/<view-id>."
+      },
+      "ruleFiles": {
+        "type": "array",
+        "description": "Optional plugin Rules to write into rules/<file-name>.md and declare under components.rules. These Rules are installed as read-only optional rules and can be enabled per Agent in the Agent view.",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "fileName": {
+              "type": "string",
+              "description": "Rule file name, with or without .md. Use lowercase letters, digits, hyphens, underscores, or dots."
+            },
+            "content": {
+              "type": "string",
+              "description": "Markdown content for the optional Rule."
+            }
+          },
+          "required": ["fileName", "content"]
+        }
       },
       "projectDependencies": {
         "type": "array",
@@ -57,13 +76,26 @@
           "required": ["kind", "name"]
         }
       },
+      "installAfterExport": {
+        "type": "boolean",
+        "description": "Install the exported plugin into the local Locus plugin directory after the archive is created. In the /plugin workflow this defaults to true."
+      },
+      "installScope": {
+        "type": ["string", "null"],
+        "enum": ["app", "project", null],
+        "description": "Local install scope used when installAfterExport is true. Use app for user-wide plugins and project for the current workspace."
+      },
+      "transferOwnership": {
+        "type": "boolean",
+        "description": "After a successful local install, remove the original exported Skill/View packages so the installed plugin becomes their owner. Rule files supplied through ruleFiles are created directly in the plugin archive. In the /plugin workflow this defaults to true and requires installAfterExport."
+      },
       "auditSummary": {
         "type": "string",
         "description": "Required summary of inspected files, completeness checks, project-dependency classification, plugin-managed source checks, and remaining risks."
       },
       "structurePlan": {
         "type": "string",
-        "description": "Required planned plugin structure and manifest metadata, including components.skills/components.views layout and dependency metadata."
+        "description": "Required planned plugin structure and manifest metadata, including components.skills/components.views/components.rules layout and dependency metadata."
       },
       "userApproval": {
         "type": "string",

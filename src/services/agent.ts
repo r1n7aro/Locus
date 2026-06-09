@@ -49,8 +49,8 @@ export function listRules(agentId: string): Promise<RuleItem[]> {
   return ipcInvoke<RuleItem[]>("list_rules", { agentId });
 }
 
-export function readRule(agentId: string, fileName: string): Promise<string> {
-  return ipcInvoke<string>("read_rule", { agentId, fileName });
+export function readRule(agentId: string, ruleKey: string): Promise<string> {
+  return ipcInvoke<string>("read_rule", { agentId, fileName: ruleKey });
 }
 
 export function saveRule(agentId: string, fileName: string, content: string): Promise<RuleItem> {
@@ -61,10 +61,10 @@ export function deleteRule(agentId: string, fileName: string): Promise<void> {
   return ipcInvoke("delete_rule", { agentId, fileName });
 }
 
-export function setRuleEnabled(agentId: string, fileName: string, enabled: boolean): Promise<void> {
-  return ipcInvoke("set_rule_enabled", { agentId, fileName, enabled });
+export function setRuleEnabled(agentId: string, ruleKey: string, enabled: boolean): Promise<void> {
+  return ipcInvoke("set_rule_enabled", { agentId, fileName: ruleKey, enabled });
 }
 
-export function setRuleOrder(agentId: string, fileNames: string[]): Promise<void> {
-  return ipcInvoke("set_rule_order", { agentId, fileNames });
+export function setRuleOrder(agentId: string, ruleKeys: string[]): Promise<void> {
+  return ipcInvoke("set_rule_order", { agentId, fileNames: ruleKeys });
 }

@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -38,8 +38,8 @@ use crate::tool::{ToolExecutionContext, ToolLoadMode, ToolRegistry, ToolResult, 
 const KNOWLEDGE_QUERY_TOOL_TIMEOUT: Duration = Duration::from_secs(45);
 
 use backend::{
-    is_prompt_too_long_error, is_retryable_llm_error, model_context_limit, normalize_tool_args,
-    session_unity_state, LlmCallResult, MAX_TOOL_ITERATIONS,
+    LlmCallResult, MAX_TOOL_ITERATIONS, is_prompt_too_long_error, is_retryable_llm_error,
+    model_context_limit, normalize_tool_args, session_unity_state,
 };
 use prompt_context::{
     detect_input_system, detect_render_pipeline, parse_physics_config, parse_tag_manager,
@@ -1491,11 +1491,7 @@ fn clip_single_line(value: &str, max_chars: usize) -> String {
 }
 
 fn pluralize_files(count: usize) -> &'static str {
-    if count == 1 {
-        "file"
-    } else {
-        "files"
-    }
+    if count == 1 { "file" } else { "files" }
 }
 
 fn prompt_flattened_skill_file_name(path: &str) -> String {
@@ -2454,10 +2450,6 @@ pub struct AgentSystemPromptStats {
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
 impl AgentInstance {
-    fn is_dev_runtime_knowledge_rule(file_name: &str) -> bool {
-        matches!(file_name, "知识库使用.md" | "知识维护.md")
-    }
-
     fn has_selected_working_dir_value(working_dir: &str) -> bool {
         !working_dir.trim().is_empty()
     }
@@ -3639,8 +3631,8 @@ impl AgentInstance {
         let mut git_available = false;
         let mut git_context_included = false;
         if has_working_dir {
-            use crate::vcs::git::GitProvider;
             use crate::vcs::VcsProvider;
+            use crate::vcs::git::GitProvider;
             let is_git = GitProvider.is_available(&self.working_dir).await;
             git_available = is_git;
             if is_git {
@@ -3763,71 +3755,27 @@ impl AgentInstance {
 
         let rules_started_at = Instant::now();
         let rules_prompt = {
-            let rule_configs = crate::commands::merged_rule_config_for_agent(
+            let rule_entries = crate::commands::collect_agent_rule_files(
                 self.app_agent_dir.as_ref(),
                 &self.working_dir,
                 &self.def.id,
-            );
+                false,
+            )
+            .unwrap_or_default();
             let mut rules_content = String::new();
 
-            let mut rules_dirs: Vec<std::path::PathBuf> = Vec::new();
-            if has_working_dir {
-                let project_rules = std::path::Path::new(&self.working_dir)
-                    .join("Locus")
-                    .join("agent")
-                    .join(&self.def.id)
-                    .join("rule");
-                if project_rules.is_dir() {
-                    rules_dirs.push(project_rules);
-                }
-            }
-            if let Some(app_dir) = self.app_agent_dir.as_ref() {
-                let app_rules = app_dir.join(&self.def.id).join("rule");
-                if app_rules.is_dir() {
-                    rules_dirs.push(app_rules);
-                }
-            }
-
-            if !rules_dirs.is_empty() {
-                let mut rule_entries: Vec<(
-                    String,
-                    std::path::PathBuf,
-                    crate::commands::RuleConfig,
-                )> = Vec::new();
-                for rules_path in &rules_dirs {
-                    if let Ok(entries) = std::fs::read_dir(rules_path) {
-                        for entry in entries.flatten() {
-                            let path = entry.path();
-                            if path.is_file()
-                                && path.extension().and_then(|e| e.to_str()) == Some("md")
-                            {
-                                let file_name = entry.file_name().to_string_lossy().to_string();
-                                if rule_entries.iter().any(|(n, _, _)| n == &file_name) {
-                                    continue;
-                                }
-                                if Self::is_dev_runtime_knowledge_rule(&file_name) {
-                                    continue;
-                                }
-                                let cfg = rule_configs.get(&file_name).cloned().unwrap_or_default();
-                                if cfg.enabled {
-                                    rule_entries.push((file_name, path, cfg));
-                                }
-                            }
+            for (i, entry) in rule_entries
+                .iter()
+                .filter(|entry| entry.enabled)
+                .enumerate()
+            {
+                if let Ok(content) = std::fs::read_to_string(&entry.path) {
+                    let content = content.trim();
+                    if !content.is_empty() {
+                        if !rules_content.is_empty() {
+                            rules_content.push('\n');
                         }
-                    }
-                }
-
-                rule_entries.sort_by(|a, b| a.2.order.cmp(&b.2.order).then(a.0.cmp(&b.0)));
-
-                for (i, (_, path, _)) in rule_entries.iter().enumerate() {
-                    if let Ok(content) = std::fs::read_to_string(path) {
-                        let content = content.trim();
-                        if !content.is_empty() {
-                            if !rules_content.is_empty() {
-                                rules_content.push('\n');
-                            }
-                            rules_content.push_str(&format!("{}. {}\n", i + 1, content));
-                        }
+                        rules_content.push_str(&format!("{}. {}\n", i + 1, content));
                     }
                 }
             }
@@ -11179,8 +11127,8 @@ impl AgentInstance {
         app_handle: &AppHandle,
         args: &serde_json::Value,
     ) -> ToolResult {
-        use crate::asset_db::types::{guid_to_hex, AssetKind};
         use crate::asset_db::AssetDbState;
+        use crate::asset_db::types::{AssetKind, guid_to_hex};
 
         let asset_path = match args.get("asset_path").and_then(|v| v.as_str()) {
             Some(p) => p.to_string(),
@@ -11249,11 +11197,7 @@ impl AgentInstance {
                         }
                     }
                 }
-                if kinds.is_empty() {
-                    None
-                } else {
-                    Some(kinds)
-                }
+                if kinds.is_empty() { None } else { Some(kinds) }
             }
             None => None,
         };
@@ -13089,13 +13033,13 @@ impl AgentInstance {
 #[cfg(test)]
 mod tests {
     use super::{
-        assess_knowledge_tool_confirmation, assess_knowledge_tool_confirmation_decision,
-        build_l2_full_document_section, build_l3_rule_section, build_prompt_tree,
-        build_structure_section, finalize_tool_call_record, render_tree_lines, utf8_prefix_chars,
         AgentInstance, AgentKnowledgeDocumentContent, AgentKnowledgeDocumentContentPatch,
         AgentKnowledgeListItem, AgentKnowledgeMutationResponse, AgentKnowledgeReadResponse,
         AgentKnowledgeSearchHit, ExecutedToolResult, InjectedPromptItem, KnowledgeAccessMode,
         ParentToolCall, PromptKnowledgeItem, RawContextStore, ToolConfirmDecision, ToolRunOutcome,
+        assess_knowledge_tool_confirmation, assess_knowledge_tool_confirmation_decision,
+        build_l2_full_document_section, build_l3_rule_section, build_prompt_tree,
+        build_structure_section, finalize_tool_call_record, render_tree_lines, utf8_prefix_chars,
     };
     use crate::agent::definition::{AgentDef, AgentDefRegistry};
     use crate::commands::{
@@ -13103,9 +13047,9 @@ mod tests {
         ToolCallOutcome,
     };
     use crate::knowledge_store::{
-        create_directory, default_directory_config_for_type, save_document,
-        update_directory_config, KnowledgeDocument, KnowledgeInjectMode, KnowledgeReadResponse,
-        KnowledgeReadResult, KnowledgeSearchMatchSection, KnowledgeTargetKind, KnowledgeType,
+        KnowledgeDocument, KnowledgeInjectMode, KnowledgeReadResponse, KnowledgeReadResult,
+        KnowledgeSearchMatchSection, KnowledgeTargetKind, KnowledgeType, create_directory,
+        default_directory_config_for_type, save_document, update_directory_config,
     };
     use crate::session::models::{ToolCallInfo, UserIntentPayload, UserIntentSkill};
     use crate::tool::{ToolDef, ToolRegistry, ToolResult};
@@ -13465,41 +13409,51 @@ PrefabInstance:
 
     #[test]
     fn validate_tool_paths_when_workspace_is_missing() {
-        assert!(AgentInstance::validate_tool_path_requirements(
-            "",
-            "bash",
-            &json!({"command":"pwd"}),
-            false
-        )
-        .is_some());
-        assert!(AgentInstance::validate_tool_path_requirements(
-            "",
-            "bash",
-            &json!({"command":"pwd","workdir":"C:/Temp"}),
-            false
-        )
-        .is_none());
-        assert!(AgentInstance::validate_tool_path_requirements(
-            "",
-            "read",
-            &json!({"filePath":"relative.txt"}),
-            false
-        )
-        .is_some());
-        assert!(AgentInstance::validate_tool_path_requirements(
-            "",
-            "read",
-            &json!({"filePath":"C:/Temp/file.txt"}),
-            false
-        )
-        .is_none());
-        assert!(AgentInstance::validate_tool_path_requirements(
-            "",
-            "knowledge_query",
-            &json!({"query":"player"}),
-            false
-        )
-        .is_some());
+        assert!(
+            AgentInstance::validate_tool_path_requirements(
+                "",
+                "bash",
+                &json!({"command":"pwd"}),
+                false
+            )
+            .is_some()
+        );
+        assert!(
+            AgentInstance::validate_tool_path_requirements(
+                "",
+                "bash",
+                &json!({"command":"pwd","workdir":"C:/Temp"}),
+                false
+            )
+            .is_none()
+        );
+        assert!(
+            AgentInstance::validate_tool_path_requirements(
+                "",
+                "read",
+                &json!({"filePath":"relative.txt"}),
+                false
+            )
+            .is_some()
+        );
+        assert!(
+            AgentInstance::validate_tool_path_requirements(
+                "",
+                "read",
+                &json!({"filePath":"C:/Temp/file.txt"}),
+                false
+            )
+            .is_none()
+        );
+        assert!(
+            AgentInstance::validate_tool_path_requirements(
+                "",
+                "knowledge_query",
+                &json!({"query":"player"}),
+                false
+            )
+            .is_some()
+        );
     }
 
     #[test]
@@ -13517,20 +13471,24 @@ PrefabInstance:
         let outside_file_str = outside_file.to_string_lossy().to_string();
         let outside_dir_str = outside.to_string_lossy().to_string();
 
-        assert!(AgentInstance::validate_tool_path_requirements(
-            &workspace_str,
-            "read",
-            &json!({"filePath":outside_file_str}),
-            false
-        )
-        .is_none());
-        assert!(AgentInstance::validate_tool_path_requirements(
-            &workspace_str,
-            "list",
-            &json!({"path":outside_dir_str}),
-            false
-        )
-        .is_none());
+        assert!(
+            AgentInstance::validate_tool_path_requirements(
+                &workspace_str,
+                "read",
+                &json!({"filePath":outside_file_str}),
+                false
+            )
+            .is_none()
+        );
+        assert!(
+            AgentInstance::validate_tool_path_requirements(
+                &workspace_str,
+                "list",
+                &json!({"path":outside_dir_str}),
+                false
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -13551,49 +13509,61 @@ PrefabInstance:
         let outside_file_str = outside_file.to_string_lossy().to_string();
         let outside_dir_str = outside.to_string_lossy().to_string();
 
-        assert!(AgentInstance::validate_tool_path_requirements(
-            &workspace_str,
-            "read",
-            &json!({"filePath":"inside.txt"}),
-            true
-        )
-        .is_none());
-        assert!(AgentInstance::validate_tool_path_requirements(
-            &workspace_str,
-            "write",
-            &json!({"filePath":"nested/new.txt","content":"ok"}),
-            true
-        )
-        .is_none());
+        assert!(
+            AgentInstance::validate_tool_path_requirements(
+                &workspace_str,
+                "read",
+                &json!({"filePath":"inside.txt"}),
+                true
+            )
+            .is_none()
+        );
+        assert!(
+            AgentInstance::validate_tool_path_requirements(
+                &workspace_str,
+                "write",
+                &json!({"filePath":"nested/new.txt","content":"ok"}),
+                true
+            )
+            .is_none()
+        );
 
-        assert!(AgentInstance::validate_tool_path_requirements(
-            &workspace_str,
-            "read",
-            &json!({"filePath":outside_file_str}),
-            true
-        )
-        .is_some());
-        assert!(AgentInstance::validate_tool_path_requirements(
-            &workspace_str,
-            "edit",
-            &json!({"filePath":"../outside/outside.txt","oldString":"nope","newString":"ok"}),
-            true
-        )
-        .is_some());
-        assert!(AgentInstance::validate_tool_path_requirements(
-            &workspace_str,
-            "list",
-            &json!({"path":"../outside"}),
-            true
-        )
-        .is_some());
-        assert!(AgentInstance::validate_tool_path_requirements(
-            &workspace_str,
-            "grep",
-            &json!({"pattern":"nope","path":outside_dir_str}),
-            true
-        )
-        .is_some());
+        assert!(
+            AgentInstance::validate_tool_path_requirements(
+                &workspace_str,
+                "read",
+                &json!({"filePath":outside_file_str}),
+                true
+            )
+            .is_some()
+        );
+        assert!(
+            AgentInstance::validate_tool_path_requirements(
+                &workspace_str,
+                "edit",
+                &json!({"filePath":"../outside/outside.txt","oldString":"nope","newString":"ok"}),
+                true
+            )
+            .is_some()
+        );
+        assert!(
+            AgentInstance::validate_tool_path_requirements(
+                &workspace_str,
+                "list",
+                &json!({"path":"../outside"}),
+                true
+            )
+            .is_some()
+        );
+        assert!(
+            AgentInstance::validate_tool_path_requirements(
+                &workspace_str,
+                "grep",
+                &json!({"pattern":"nope","path":outside_dir_str}),
+                true
+            )
+            .is_some()
+        );
     }
 
     #[test]
@@ -13610,20 +13580,24 @@ PrefabInstance:
         let temp_file_str = temp_file.to_string_lossy().to_string();
         let temp_dir_str = temp_dir.to_string_lossy().to_string();
 
-        assert!(AgentInstance::validate_tool_path_requirements(
-            &workspace_str,
-            "write",
-            &json!({"filePath":temp_file_str,"content":"ok"}),
-            true
-        )
-        .is_none());
-        assert!(AgentInstance::validate_tool_path_requirements(
-            &workspace_str,
-            "list",
-            &json!({"path":temp_dir_str}),
-            true
-        )
-        .is_none());
+        assert!(
+            AgentInstance::validate_tool_path_requirements(
+                &workspace_str,
+                "write",
+                &json!({"filePath":temp_file_str,"content":"ok"}),
+                true
+            )
+            .is_none()
+        );
+        assert!(
+            AgentInstance::validate_tool_path_requirements(
+                &workspace_str,
+                "list",
+                &json!({"path":temp_dir_str}),
+                true
+            )
+            .is_none()
+        );
     }
 
     #[cfg(windows)]
@@ -13642,13 +13616,15 @@ PrefabInstance:
             })
             .expect("windows drive prefix");
 
-        assert!(AgentInstance::validate_tool_path_requirements(
-            &workspace_str,
-            "list",
-            &json!({"path":drive_relative}),
-            true
-        )
-        .is_some());
+        assert!(
+            AgentInstance::validate_tool_path_requirements(
+                &workspace_str,
+                "list",
+                &json!({"path":drive_relative}),
+                true
+            )
+            .is_some()
+        );
     }
 
     #[test]
@@ -14229,9 +14205,11 @@ PrefabInstance:
         assert!(!request_tool_names.contains(&"web_fetch".to_string()));
 
         let api_tools = instance.build_api_tools(&request_tool_names).await;
-        assert!(api_tools
-            .iter()
-            .all(|tool| tool["function"].get("defer_loading").is_none()));
+        assert!(
+            api_tools
+                .iter()
+                .all(|tool| tool["function"].get("defer_loading").is_none())
+        );
 
         let manifest = instance
             .lazy_tool_manifest_prompt()
@@ -14552,9 +14530,11 @@ PrefabInstance:
             KnowledgeAccessMode::Disabled,
         );
         let disabled_tools = disabled.allowed_tool_set().await;
-        assert!(disabled_tools
-            .iter()
-            .all(|name| !AgentInstance::is_knowledge_tool_name(name)));
+        assert!(
+            disabled_tools
+                .iter()
+                .all(|name| !AgentInstance::is_knowledge_tool_name(name))
+        );
 
         let read_only = test_agent_instance_with_tools_and_mode(
             temp.path().to_string_lossy().to_string(),
@@ -14653,9 +14633,11 @@ PrefabInstance:
 
         let items = instance.list_injected_prompt_items().await;
         assert!(items.iter().all(|item| item.id != "knowledge_context"));
-        assert!(items
-            .iter()
-            .all(|item| !item.id.starts_with("knowledge_rule::")));
+        assert!(
+            items
+                .iter()
+                .all(|item| !item.id.starts_with("knowledge_rule::"))
+        );
     }
 
     #[tokio::test]
@@ -14905,7 +14887,7 @@ Create a reusable Skill.
     }
 
     #[tokio::test]
-    async fn selected_command_skill_can_bring_builtin_skill_mode_tool() {
+    async fn selected_plugin_skill_can_bring_builtin_skill_mode_tools() {
         let root = tempdir().expect("temp dir");
         let workspace = root.path().join("workspace");
         let app_knowledge_dir = root.path().join("app-knowledge");
@@ -14913,12 +14895,12 @@ Create a reusable Skill.
         std::fs::create_dir_all(&workspace).expect("create workspace");
         std::fs::create_dir_all(&skill_dir).expect("create skill dir");
         std::fs::write(
-            skill_dir.join("create-plugin.md"),
+            skill_dir.join("plugin.md"),
             r#"---
-id: kd_skill_create_plugin
+id: kd_skill_plugin
 type: skill
-path: builtin/create-plugin.md
-title: Create Plugin
+path: builtin/plugin.md
+title: Plugin
 injectMode: none
 summaryEnabled: true
 commandEnabled: true
@@ -14926,24 +14908,28 @@ readOnly: true
 aiMaintained: false
 skillEnabled: true
 skillSurface: command
-commandTrigger: /create-plugin
+commandTrigger: /plugin
 argumentHint:
 tools:
+  - plugin_list
+  - plugin_search
+  - plugin_install
+  - plugin_uninstall
   - plugin_export
 createdAt: 1
 updatedAt: 1
 ---
 
-# Create Plugin
+# Plugin
 
 ## Summary
-Create a Plugin.
+Manage plugins.
 
 ## Content
-Audit and export a plugin.
+Search, install, audit, and export a plugin.
 "#,
         )
-        .expect("write create plugin");
+        .expect("write plugin skill");
 
         let (_, cancel_rx) = tokio::sync::watch::channel(false);
         let agent = AgentInstance::new(
@@ -14978,41 +14964,59 @@ Audit and export a plugin.
             cancel_rx,
         );
 
-        assert_eq!(
-            agent.tool_registry.default_load_mode("plugin_export"),
-            crate::tool::ToolLoadMode::Skill
-        );
-        assert!(!agent
-            .build_request_tool_names()
-            .await
-            .contains(&"plugin_export".to_string()));
-        assert!(!agent
-            .lazy_tool_manifest_names()
-            .await
-            .contains(&"plugin_export".to_string()));
+        for tool_name in [
+            "plugin_list",
+            "plugin_search",
+            "plugin_install",
+            "plugin_uninstall",
+            "plugin_export",
+        ] {
+            assert_eq!(
+                agent.tool_registry.default_load_mode(tool_name),
+                crate::tool::ToolLoadMode::Skill
+            );
+            assert!(
+                !agent
+                    .build_request_tool_names()
+                    .await
+                    .contains(&tool_name.to_string())
+            );
+            assert!(
+                !agent
+                    .lazy_tool_manifest_names()
+                    .await
+                    .contains(&tool_name.to_string())
+            );
+        }
 
         let inactive_load = agent
             .execute_tool_load_with_mode_and_skills(
-                &serde_json::json!({ "tools": ["plugin_export"] }),
+                &serde_json::json!({ "tools": ["plugin_list", "plugin_search", "plugin_install", "plugin_uninstall", "plugin_export"] }),
                 crate::config::DynamicToolLoadingMode::MetaTool,
                 &HashSet::new(),
             )
             .await;
         let inactive_json: serde_json::Value =
             serde_json::from_str(&inactive_load.output).expect("inactive tool_load json");
-        assert_eq!(inactive_json["tools"][0]["status"], "not_allowed");
+        for index in 0..5 {
+            assert_eq!(inactive_json["tools"][index]["status"], "not_allowed");
+        }
 
         let intent = UserIntentPayload {
             kind: "user_intent_v1".to_string(),
             mode: "build".to_string(),
             skills: vec![UserIntentSkill {
-                dir_name: "create-plugin".to_string(),
+                dir_name: "plugin".to_string(),
                 source: "app".to_string(),
-                name: "Create Plugin".to_string(),
+                name: "Plugin".to_string(),
             }],
             client_message_id: None,
         };
         let active_skill_tool_names = agent.selected_skill_tool_names(Some(&intent));
+        assert!(active_skill_tool_names.contains("plugin_list"));
+        assert!(active_skill_tool_names.contains("plugin_search"));
+        assert!(active_skill_tool_names.contains("plugin_install"));
+        assert!(active_skill_tool_names.contains("plugin_uninstall"));
         assert!(active_skill_tool_names.contains("plugin_export"));
 
         let request_tool_names = agent
@@ -15021,19 +15025,25 @@ Audit and export a plugin.
                 &active_skill_tool_names,
             )
             .await;
+        assert!(request_tool_names.contains(&"plugin_list".to_string()));
+        assert!(request_tool_names.contains(&"plugin_search".to_string()));
+        assert!(request_tool_names.contains(&"plugin_install".to_string()));
+        assert!(request_tool_names.contains(&"plugin_uninstall".to_string()));
         assert!(request_tool_names.contains(&"plugin_export".to_string()));
 
         let active_load = agent
             .execute_tool_load_with_mode_and_skills(
-                &serde_json::json!({ "tools": ["plugin_export"] }),
+                &serde_json::json!({ "tools": ["plugin_list", "plugin_search", "plugin_install", "plugin_uninstall", "plugin_export"] }),
                 crate::config::DynamicToolLoadingMode::MetaTool,
                 &active_skill_tool_names,
             )
             .await;
         let active_json: serde_json::Value =
             serde_json::from_str(&active_load.output).expect("active tool_load json");
-        assert_eq!(active_json["tools"][0]["status"], "described");
-        assert_eq!(active_json["tools"][0]["loadMode"], "skill");
+        for index in 0..5 {
+            assert_eq!(active_json["tools"][index]["status"], "described");
+            assert_eq!(active_json["tools"][index]["loadMode"], "skill");
+        }
     }
 
     fn sample_agent_knowledge_document(path: &str, title: &str) -> KnowledgeDocument {
@@ -15172,12 +15182,14 @@ Audit and export a plugin.
             );
         }
 
-        assert!(agent
-            .validate_knowledge_tool_routing(
-                "bash",
-                &json!({"workdir":".","command":"git clean -fd Locus/knowledge/design"})
-            )
-            .is_some());
+        assert!(
+            agent
+                .validate_knowledge_tool_routing(
+                    "bash",
+                    &json!({"workdir":".","command":"git clean -fd Locus/knowledge/design"})
+                )
+                .is_some()
+        );
         assert!(agent
             .validate_knowledge_tool_routing(
                 "bash",
@@ -15272,10 +15284,12 @@ Audit and export a plugin.
         );
         assert_eq!(preview.directory_path, "design/combat");
         assert_eq!(preview.path, "design/combat/core-loop.md");
-        assert!(preview
-            .document_after_text
-            .as_deref()
-            .is_some_and(|text| text.contains("## Content")));
+        assert!(
+            preview
+                .document_after_text
+                .as_deref()
+                .is_some_and(|text| text.contains("## Content"))
+        );
     }
 
     #[test]
@@ -15400,12 +15414,16 @@ Audit and export a plugin.
         assert_eq!(preview.operation, KnowledgeToolConfirmOperation::Move);
         assert_eq!(preview.path, "design/combat");
         assert_eq!(preview.new_path.as_deref(), Some("design/gameplay/combat"));
-        assert!(preview
-            .structure_before_paths
-            .contains(&"design/combat/core-loop.md".to_string()));
-        assert!(preview
-            .structure_after_paths
-            .contains(&"design/gameplay/combat/core-loop.md".to_string()));
+        assert!(
+            preview
+                .structure_before_paths
+                .contains(&"design/combat/core-loop.md".to_string())
+        );
+        assert!(
+            preview
+                .structure_after_paths
+                .contains(&"design/gameplay/combat/core-loop.md".to_string())
+        );
     }
 
     #[test]
@@ -15556,8 +15574,11 @@ Audit and export a plugin.
 
         let structure = build_structure_section(&working_dir, None, KnowledgeAccessMode::Full)
             .expect("build structure");
-        assert!(structure
-            .contains("combat/ :: Combat systems summary | - Keep verified combat structure only"));
+        assert!(
+            structure.contains(
+                "combat/ :: Combat systems summary | - Keep verified combat structure only"
+            )
+        );
     }
 
     #[test]
@@ -16145,8 +16166,10 @@ Audit and export a plugin.
         assert!(rules.contains("## L3 Rules"));
         assert!(rules.contains("### User Preferences (memory/user-preference.md)"));
         assert!(rules.contains("Maintenance Rules:"));
-        assert!(rules
-            .contains("- Record only long-term user preferences that stay stable across tasks"));
+        assert!(
+            rules
+                .contains("- Record only long-term user preferences that stay stable across tasks")
+        );
         assert!(rules.contains(
             "- Keep each entry short and limited to stable preferences or hard constraints"
         ));
@@ -16257,18 +16280,26 @@ Audit and export a plugin.
 
         assert_eq!(prompt_parts.base_prompt, "You are a test agent.");
         assert!(prompt_parts.knowledge_prompt.contains("## Knowledge"));
-        assert!(prompt_parts
-            .knowledge_prompt
-            .contains("### L2 Full Documents"));
-        assert!(prompt_parts
-            .knowledge_prompt
-            .contains("#### memory/project-mistake-note.md"));
-        assert!(prompt_parts
-            .knowledge_prompt
-            .contains("`skill/psd-to-ugui/references/details.md`"));
-        assert!(prompt_parts
-            .knowledge_prompt
-            .contains("`reference/unity/ugui-layout.md`"));
+        assert!(
+            prompt_parts
+                .knowledge_prompt
+                .contains("### L2 Full Documents")
+        );
+        assert!(
+            prompt_parts
+                .knowledge_prompt
+                .contains("#### memory/project-mistake-note.md")
+        );
+        assert!(
+            prompt_parts
+                .knowledge_prompt
+                .contains("`skill/psd-to-ugui/references/details.md`")
+        );
+        assert!(
+            prompt_parts
+                .knowledge_prompt
+                .contains("`reference/unity/ugui-layout.md`")
+        );
         let search_index = prompt_parts
             .knowledge_prompt
             .find("### Search")
@@ -16286,9 +16317,11 @@ Audit and export a plugin.
         assert!(!prompt_parts.knowledge_prompt.contains("## L3 Rules"));
         assert!(!prompt_parts.knowledge_prompt.contains("Full Document:"));
         assert!(prompt_parts.rules_prompt.contains("## L3 Rules"));
-        assert!(prompt_parts
-            .rules_prompt
-            .contains("### User Preferences (memory/user-preference.md)"));
+        assert!(
+            prompt_parts
+                .rules_prompt
+                .contains("### User Preferences (memory/user-preference.md)")
+        );
         assert!(prompt_parts.env_prompt.contains("Working directory:"));
         assert!(!prompt_parts.env_prompt.contains("## Knowledge"));
         assert!(!prompt_parts.env_prompt.contains("project-mistake-note.md"));

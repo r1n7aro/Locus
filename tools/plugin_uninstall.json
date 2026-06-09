@@ -1,0 +1,19 @@
+{
+  "description": "Uninstall an installed Locus plugin from app or project scope. Use this in the /plugin workflow only after the user has identified the installed plugin clearly or confirmed which scope to remove.",
+  "parameters": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "pluginId": {
+        "type": "string",
+        "description": "Installed plugin id to uninstall."
+      },
+      "scope": {
+        "type": ["string", "null"],
+        "enum": ["app", "project", null],
+        "description": "Installed plugin scope. Omit only when plugin_list shows the id is installed in exactly one scope."
+      }
+    },
+    "required": ["pluginId"]
+  }
+}

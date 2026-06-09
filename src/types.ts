@@ -1834,12 +1834,16 @@ export interface VcsRevisionRef {
 // ---------------------------------------------------------------------------
 
 export interface RuleItem {
+  key: string;
   fileName: string;
   title: string;
   order: number;
   enabled: boolean;
   updatedAt: number;
   source: string;
+  readOnly: boolean;
+  pluginId?: string | null;
+  pluginScope?: "app" | "project" | string | null;
 }
 
 export interface AgentSystemPromptStats {

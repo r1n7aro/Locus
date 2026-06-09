@@ -9,6 +9,21 @@ function read(relPath: string) {
 }
 
 describe("Markdown table styles", () => {
+  it("sanitizes rendered markdown before v-html receives plugin descriptions", () => {
+    const renderer = read("src/components/MarkdownRenderer.vue");
+    const sanitizer = read("src/composables/markdownSanitize.ts");
+
+    expect(sanitizer).toContain('import DOMPurify, { type Config } from "dompurify";');
+    expect(sanitizer).toContain("FORBID_ATTR: [\"style\"]");
+    expect(sanitizer).toContain("FORBID_TAGS: [\"script\", \"style\", \"iframe\", \"object\", \"embed\", \"form\"]");
+    expect(sanitizer).toContain("ALLOW_DATA_ATTR: true");
+    expect(sanitizer).toContain("ADD_ATTR: [\"draggable\"]");
+    expect(renderer).toContain("import { sanitizeRenderedMarkdownHtml } from \"../composables/markdownSanitize\";");
+    expect(renderer).toContain("return sanitizeRenderedMarkdownHtml(html);");
+    expect(renderer).toContain("return sanitizeRenderedMarkdownHtml(escapeHtml(props.content));");
+    expect(renderer).toContain('v-html="renderedHtml"');
+  });
+
   it("wraps rendered tables and constrains cell styling in MarkdownRenderer", () => {
     const source = read("src/components/MarkdownRenderer.vue");
 

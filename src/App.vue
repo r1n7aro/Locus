@@ -28,7 +28,7 @@ import AppUpdateModal from "./components/AppUpdateModal.vue";
 
 import { provideDiffOverlay } from "./composables/useDiffOverlay";
 import { initTheme } from "./composables/useTheme";
-import { initFonts } from "./composables/useDisplaySettings";
+import { initFonts, useDisplaySettings } from "./composables/useDisplaySettings";
 import { isKnowledgeDownloadWindowLocation } from "./services/knowledgeDownloadWindow";
 import { isKnowledgeLexicalProgressWindowLocation } from "./services/knowledgeLexicalProgressWindow";
 import { isFeishuReferenceImportWindowLocation } from "./services/feishuReferenceImportWindow";
@@ -91,7 +91,7 @@ const UnityEmbeddedSessionView = defineAsyncComponent(() => import("./components
 const UnityEmbedTestView = defineAsyncComponent(() => import("./components/UnityEmbedTestView.vue"));
 const OnboardingView = defineAsyncComponent(() => import("./components/OnboardingView.vue"));
 const FileDiffOverlay = defineAsyncComponent(() => import("./components/diff/FileDiffOverlay.vue"));
-const showPluginEntry = false;
+const showPluginEntry = true;
 
 initTheme(isUnityEmbedWindow ? "unityEmbed" : "main");
 initFonts();
@@ -105,6 +105,7 @@ const projectStore = useProjectStore();
 const chatStore = useChatStore();
 const notificationStore = useNotificationStore();
 const appUpdateStore = useAppUpdateStore();
+const { state: displaySettings } = useDisplaySettings();
 const unityEmbedBootstrapped = ref(false);
 const unityEmbedBootstrapError = ref<string | null>(null);
 const KNOWLEDGE_RUNTIME_LOADING_OPERATION = "knowledgeEmbeddingRuntimeLoading";
@@ -236,6 +237,31 @@ const settingsViewComponent = settingsView.component;
 const settingsViewLoading = settingsView.loading;
 const settingsViewError = settingsView.error;
 
+type AppTab = typeof uiStore.activeTab;
+
+interface TopTabItem {
+  id: AppTab;
+  labelKey: string;
+  visible: boolean;
+}
+
+const topTabs = computed<TopTabItem[]>(() => [
+  { id: "chat", labelKey: "app.tab.dev", visible: true },
+  { id: "knowledge", labelKey: "app.tab.knowledge", visible: displaySettings.showKnowledgeTab },
+  { id: "collab", labelKey: "app.tab.collab", visible: displaySettings.showCollabTab },
+  { id: "asset", labelKey: "app.tab.asset", visible: displaySettings.showAssetTab },
+  { id: "views", labelKey: "app.tab.views", visible: displaySettings.showViewsTab },
+  { id: "plugins", labelKey: "app.tab.plugins", visible: showPluginEntry && displaySettings.showPluginsTab },
+  { id: "agent", labelKey: "app.tab.agent", visible: displaySettings.showAgentTab },
+  { id: "settings", labelKey: "app.tab.settings", visible: true },
+]);
+
+const visibleTopTabs = computed(() => topTabs.value.filter((tab) => tab.visible));
+
+function isTopTabVisible(tab: AppTab) {
+  return visibleTopTabs.value.some((item) => item.id === tab);
+}
+
 watch(() => uiStore.activeTab, (tab) => {
   if (tab !== "chat") return;
   void chatView.ensureLoaded();
@@ -261,8 +287,8 @@ watch(() => uiStore.viewMounted, (mounted) => {
   void viewPackageView.ensureLoaded();
 }, { immediate: true });
 
-watch(() => uiStore.pluginsMounted, (mounted) => {
-  if (!showPluginEntry || !mounted) return;
+watch(() => [uiStore.pluginsMounted, displaySettings.showPluginsTab] as const, ([mounted]) => {
+  if (!showPluginEntry || !displaySettings.showPluginsTab || !mounted) return;
   void pluginView.ensureLoaded();
 }, { immediate: true });
 
@@ -274,6 +300,11 @@ watch(() => uiStore.agentMounted, (mounted) => {
 watch(() => uiStore.settingsMounted, (mounted) => {
   if (!mounted) return;
   void settingsView.ensureLoaded();
+}, { immediate: true });
+
+watch([() => uiStore.activeTab, visibleTopTabs], () => {
+  if (isTopTabVisible(uiStore.activeTab)) return;
+  uiStore.setTab("chat");
 }, { immediate: true });
 
 // -- Workspace dropdown (local UI) --
@@ -798,46 +829,12 @@ watch(() => projectStore.workingDir, () => {
         <div class="tab-drag-region" aria-hidden="true"></div>
         <span class="tab-brand">Locus</span>
         <button
+          v-for="tab in visibleTopTabs"
+          :key="tab.id"
           class="tab-item"
-          :class="{ active: uiStore.activeTab === 'chat' }"
-          @click="uiStore.setTab('chat')"
-        >{{ t("app.tab.dev") }}</button>
-        <button
-          class="tab-item"
-          :class="{ active: uiStore.activeTab === 'knowledge' }"
-          @click="uiStore.setTab('knowledge')"
-        >{{ t("app.tab.knowledge") }}</button>
-        <button
-          class="tab-item"
-          :class="{ active: uiStore.activeTab === 'collab' }"
-          @click="uiStore.setTab('collab')"
-        >{{ t("app.tab.collab") }}</button>
-        <button
-          class="tab-item"
-          :class="{ active: uiStore.activeTab === 'asset' }"
-          @click="uiStore.setTab('asset')"
-        >{{ t("app.tab.asset") }}</button>
-        <button
-          class="tab-item"
-          :class="{ active: uiStore.activeTab === 'views' }"
-          @click="uiStore.setTab('views')"
-        >{{ t("app.tab.views") }}</button>
-        <button
-          v-if="showPluginEntry"
-          class="tab-item"
-          :class="{ active: uiStore.activeTab === 'plugins' }"
-          @click="uiStore.setTab('plugins')"
-        >{{ t("app.tab.plugins") }}</button>
-        <button
-          class="tab-item"
-          :class="{ active: uiStore.activeTab === 'agent' }"
-          @click="uiStore.setTab('agent')"
-        >{{ t("app.tab.agent") }}</button>
-        <button
-          class="tab-item"
-          :class="{ active: uiStore.activeTab === 'settings' }"
-          @click="uiStore.setTab('settings')"
-        >{{ t("app.tab.settings") }}</button>
+          :class="{ active: uiStore.activeTab === tab.id }"
+          @click="uiStore.setTab(tab.id)"
+        >{{ t(tab.labelKey) }}</button>
         <button
           v-if="projectStore.pluginToast"
           class="tab-plugin-warn"

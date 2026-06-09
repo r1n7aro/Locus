@@ -1,0 +1,13 @@
+{
+  "description": "List installed Locus plugins for the current app and workspace. Use this in the /plugin workflow before editing, replacing, publishing, or diagnosing plugin-managed Skill packages, Views, and optional Rules.",
+  "parameters": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "workingDir": {
+        "type": ["string", "null"],
+        "description": "Optional workspace path override. Omit to use the current agent workspace."
+      }
+    }
+  }
+}

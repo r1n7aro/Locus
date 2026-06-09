@@ -217,7 +217,7 @@
     },
     {
       "path": "src/components/ui/BaseButton.vue",
-      "bytes": 1961
+      "bytes": 2006
     },
     {
       "path": "src/components/ui/BaseCheckbox.vue",
@@ -261,11 +261,11 @@
     },
     {
       "path": "src/language/en.json",
-      "bytes": 193948
+      "bytes": 199649
     },
     {
       "path": "src/language/zh.json",
-      "bytes": 187652
+      "bytes": 193194
     },
     {
       "path": "src/services/asset.ts",
@@ -313,7 +313,7 @@
     },
     {
       "path": "src/services/errors.ts",
-      "bytes": 2743
+      "bytes": 3379
     },
     {
       "path": "src/services/ipc.ts",
@@ -325,7 +325,7 @@
     },
     {
       "path": "src/types.ts",
-      "bytes": 65832
+      "bytes": 65939
     }
   ]
 }

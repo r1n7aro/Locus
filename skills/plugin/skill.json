@@ -1,0 +1,13 @@
+{
+  "schema": "locus.skill.v1",
+  "id": "plugin",
+  "name": "Plugin",
+  "version": "1.0.0",
+  "description": "Search, install, uninstall, create, package, and publish Locus plugins from natural-language requests.",
+  "argumentHint": "<plugin request>",
+  "command": {
+    "enabled": true,
+    "trigger": "/plugin",
+    "argumentHint": "<plugin request>"
+  }
+}

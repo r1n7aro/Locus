@@ -157,6 +157,7 @@ pub fn delete_secret(key: &str) -> Result<(), String> {
 pub const KEY_OPENROUTER: &str = "openrouter_api_key";
 pub const KEY_CLAUDE_TOKENS: &str = "claude_tokens";
 pub const KEY_CODEX_TOKENS: &str = "codex_tokens";
+pub const KEY_PLUGIN_GITHUB_TOKEN: &str = "plugin_github_token";
 
 /// Provider key keychain name: "provider/{id}"
 pub fn provider_key_name(provider_id: &str) -> String {

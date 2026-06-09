@@ -47,6 +47,7 @@ pub struct InstalledPluginSummary {
     pub compatibility: LocusPluginCompatibility,
     pub dependencies: LocusPluginDependencies,
     pub agents: Vec<PluginComponentSummary>,
+    pub rules: Vec<PluginComponentSummary>,
     pub skills: Vec<PluginComponentSummary>,
     pub views: Vec<PluginComponentSummary>,
 }
@@ -130,6 +131,8 @@ pub struct LocusPluginManifest {
 pub struct LocusPluginComponents {
     #[serde(default)]
     pub agents: Vec<RawPluginComponentRef>,
+    #[serde(default)]
+    pub rules: Vec<RawPluginComponentRef>,
     #[serde(default)]
     pub skills: Vec<RawPluginComponentRef>,
     #[serde(default)]
@@ -312,6 +315,12 @@ fn installed_plugins_in_dir(scope: PluginInstallScope, dir: &Path) -> Vec<Instal
     let mut plugins = Vec::new();
     for entry in entries.flatten() {
         let root = entry.path();
+        let Some(dir_name) = root.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if dir_name.starts_with(".install-") || dir_name.starts_with(".backup-") {
+            continue;
+        }
         if !root.is_dir() || !root.join(PLUGIN_MANIFEST_FILE_NAME).is_file() {
             continue;
         }
@@ -378,6 +387,32 @@ fn fallback_component_refs(
     refs
 }
 
+fn fallback_rule_refs(plugin_root: &Path) -> Vec<PluginComponentRef> {
+    let root = plugin_root.join("rules");
+    if !root.is_dir() {
+        return Vec::new();
+    }
+    let Ok(entries) = fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut refs = entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if !path.is_file() || path.extension().and_then(|value| value.to_str()) != Some("md") {
+                return None;
+            }
+            let name = path.file_name()?.to_str()?.to_string();
+            Some(PluginComponentRef {
+                id: Some(name.trim_end_matches(".md").to_string()),
+                path: format!("rules/{}", name),
+            })
+        })
+        .collect::<Vec<_>>();
+    refs.sort_by(|a, b| a.path.cmp(&b.path));
+    refs
+}
+
 fn component_refs_for_kind(plugin: &InstalledPlugin, kind: &str) -> Vec<PluginComponentRef> {
     let explicit = match kind {
         "agents" => plugin
@@ -401,6 +436,13 @@ fn component_refs_for_kind(plugin: &InstalledPlugin, kind: &str) -> Vec<PluginCo
             .iter()
             .map(RawPluginComponentRef::normalize)
             .collect::<Vec<_>>(),
+        "rules" => plugin
+            .manifest
+            .components
+            .rules
+            .iter()
+            .map(RawPluginComponentRef::normalize)
+            .collect::<Vec<_>>(),
         _ => Vec::new(),
     };
     if !explicit.is_empty() {
@@ -408,6 +450,7 @@ fn component_refs_for_kind(plugin: &InstalledPlugin, kind: &str) -> Vec<PluginCo
     }
     match kind {
         "agents" => fallback_component_refs(&plugin.root, "agents", "config.json"),
+        "rules" => fallback_rule_refs(&plugin.root),
         "skills" => fallback_component_refs(&plugin.root, "skills", "skill.json"),
         "views" => fallback_component_refs(&plugin.root, "views", "view.json"),
         _ => Vec::new(),
@@ -453,6 +496,10 @@ pub fn installed_agent_sources(working_dir: &str) -> Vec<PluginComponentSource> 
     component_sources_for_kind(working_dir, "agents")
 }
 
+pub fn installed_rule_sources(working_dir: &str) -> Vec<PluginComponentSource> {
+    component_sources_for_kind(working_dir, "rules")
+}
+
 pub fn installed_skill_sources(working_dir: &str) -> Vec<PluginComponentSource> {
     component_sources_for_kind(working_dir, "skills")
 }
@@ -487,6 +534,10 @@ impl InstalledPlugin {
                 .into_iter()
                 .filter_map(|component| component_summary(self, component))
                 .collect(),
+            rules: component_refs_for_kind(self, "rules")
+                .into_iter()
+                .filter_map(|component| component_summary(self, component))
+                .collect(),
             skills: component_refs_for_kind(self, "skills")
                 .into_iter()
                 .filter_map(|component| component_summary(self, component))
@@ -506,6 +557,37 @@ pub fn list_installed_plugin_summaries(working_dir: &str) -> Vec<InstalledPlugin
         .collect()
 }
 
+pub fn inspect_plugin_source_manifest_sync(
+    source_path: &str,
+) -> Result<LocusPluginManifest, String> {
+    let source_path = PathBuf::from(source_path.trim());
+    if !source_path.exists() {
+        return Err(format!(
+            "Plugin source not found: {}",
+            source_path.display()
+        ));
+    }
+
+    if source_path.is_dir() {
+        let source_root = locate_plugin_root(&source_path)?;
+        return read_manifest(&source_root);
+    }
+
+    let staging_root =
+        std::env::temp_dir().join(format!("locus-plugin-inspect-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&staging_root)
+        .map_err(|e| format!("Failed to create plugin inspection directory: {}", e))?;
+    let result = (|| -> Result<LocusPluginManifest, String> {
+        extract_plugin_archive(&source_path, &staging_root)?;
+        let source_root = locate_plugin_root(&staging_root)?;
+        read_manifest(&source_root)
+    })();
+    if staging_root.exists() {
+        let _ = fs::remove_dir_all(&staging_root);
+    }
+    result
+}
+
 fn copy_plugin_dir(source_root: &Path, target_root: &Path) -> Result<(), String> {
     for entry in WalkDir::new(source_root).follow_links(false) {
         let entry = entry.map_err(|e| format!("Failed to read plugin files: {}", e))?;
@@ -514,6 +596,12 @@ fn copy_plugin_dir(source_root: &Path, target_root: &Path) -> Result<(), String>
             .strip_prefix(source_root)
             .map_err(|e| format!("Failed to resolve plugin file path: {}", e))?;
         if rel_path.as_os_str().is_empty() {
+            continue;
+        }
+        if rel_path
+            .components()
+            .any(|component| component.as_os_str() == ".git")
+        {
             continue;
         }
         let target = target_root.join(rel_path);
@@ -680,6 +768,7 @@ pub fn install_plugin_from_path_sync(
     }
     let target_parent = plugins_dir_for_scope(working_dir, scope, true)?;
     let staging_root = target_parent.join(format!(".install-{}", uuid::Uuid::new_v4()));
+    let mut cleanup_roots = vec![staging_root.clone()];
     fs::create_dir_all(&staging_root)
         .map_err(|e| format!("Failed to create staging plugin directory: {}", e))?;
 
@@ -712,6 +801,7 @@ pub fn install_plugin_from_path_sync(
             ensure_child_path(&target_parent, &target_root)?;
             let normalized_staging =
                 target_parent.join(format!(".install-{}", uuid::Uuid::new_v4()));
+            cleanup_roots.push(normalized_staging.clone());
             fs::create_dir_all(&normalized_staging)
                 .map_err(|e| format!("Failed to create plugin staging directory: {}", e))?;
             copy_plugin_dir(&source_root, &normalized_staging)?;
@@ -729,8 +819,10 @@ pub fn install_plugin_from_path_sync(
         }
     })();
 
-    if staging_root.exists() {
-        let _ = fs::remove_dir_all(&staging_root);
+    for cleanup_root in cleanup_roots {
+        if cleanup_root.exists() {
+            let _ = fs::remove_dir_all(cleanup_root);
+        }
     }
     install_result
 }
@@ -742,22 +834,64 @@ fn replace_plugin_dir(
 ) -> Result<(), String> {
     ensure_child_path(parent, target_root)?;
     ensure_child_path(parent, staging_root)?;
+    if !staging_root.is_dir() {
+        return Err(format!(
+            "Plugin staging directory is missing: {}",
+            staging_root.display()
+        ));
+    }
+    let backup_root = parent.join(format!(
+        ".backup-{}-{}",
+        target_root
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("plugin"),
+        uuid::Uuid::new_v4()
+    ));
+    ensure_child_path(parent, &backup_root)?;
+
+    let had_existing = target_root.exists();
     if target_root.exists() {
-        fs::remove_dir_all(target_root).map_err(|e| {
+        fs::rename(target_root, &backup_root).map_err(|e| {
             format!(
-                "Failed to replace existing plugin '{}': {}",
+                "Failed to move existing plugin '{}' aside: {}",
                 target_root.display(),
                 e
             )
         })?;
     }
-    fs::rename(staging_root, target_root).map_err(|e| {
-        format!(
-            "Failed to move plugin into {}: {}",
-            target_root.display(),
-            e
-        )
-    })
+
+    match fs::rename(staging_root, target_root) {
+        Ok(()) => {
+            if backup_root.exists() {
+                let _ = fs::remove_dir_all(&backup_root);
+            }
+            Ok(())
+        }
+        Err(error) => {
+            let move_error = format!(
+                "Failed to move plugin into {}: {}",
+                target_root.display(),
+                error
+            );
+            if target_root.exists() {
+                let _ = fs::remove_dir_all(target_root);
+                let _ = fs::remove_file(target_root);
+            }
+            if had_existing {
+                fs::rename(&backup_root, target_root).map_err(|rollback_error| {
+                    format!(
+                        "{}; failed to restore previous plugin from '{}': {}",
+                        move_error,
+                        backup_root.display(),
+                        rollback_error
+                    )
+                })?;
+                return Err(format!("{}; restored previous plugin", move_error));
+            }
+            Err(move_error)
+        }
+    }
 }
 
 pub fn uninstall_plugin_sync(
@@ -794,4 +928,212 @@ pub fn plugin_component_sources_by_plugin(working_dir: &str, plugin_id: &str) ->
         }
     }
     sources
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn write_plugin_source(root: &Path, id: &str, version: &str, marker: &str) {
+        fs::create_dir_all(root).expect("create plugin source");
+        let manifest = serde_json::json!({
+            "schemaVersion": 1,
+            "id": id,
+            "name": id,
+            "version": version,
+            "components": {
+                "agents": [],
+                "rules": [],
+                "skills": [],
+                "views": []
+            }
+        });
+        fs::write(
+            root.join(PLUGIN_MANIFEST_FILE_NAME),
+            serde_json::to_string_pretty(&manifest).expect("serialize manifest"),
+        )
+        .expect("write plugin manifest");
+        fs::write(root.join("marker.txt"), marker).expect("write marker");
+    }
+
+    fn workspace_path(workspace: &TempDir) -> String {
+        workspace.path().to_string_lossy().to_string()
+    }
+
+    fn project_plugin_parent(workspace: &TempDir) -> PathBuf {
+        project_plugins_dir(&workspace_path(workspace)).expect("project plugin dir")
+    }
+
+    fn assert_no_install_artifacts(parent: &Path) {
+        if !parent.is_dir() {
+            return;
+        }
+        for entry in fs::read_dir(parent).expect("read plugin parent") {
+            let entry = entry.expect("read plugin parent entry");
+            let name = entry.file_name().to_string_lossy().to_string();
+            assert!(
+                !name.starts_with(".install-") && !name.starts_with(".backup-"),
+                "left plugin install artifact: {}",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn plugin_id_accepts_package_manager_style_names() {
+        assert_eq!(
+            normalize_plugin_id(" locus-workspace ").expect("valid plugin id"),
+            "locus-workspace"
+        );
+        assert_eq!(
+            normalize_plugin_id("asset_browser.tools").expect("valid plugin id"),
+            "asset_browser.tools"
+        );
+
+        for invalid in [
+            "",
+            ".hidden",
+            "trailing.",
+            "bad/name",
+            "bad\\name",
+            "bad..name",
+        ] {
+            assert!(
+                normalize_plugin_id(invalid).is_err(),
+                "expected invalid plugin id: {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn install_project_plugin_accepts_concise_package_id() {
+        let workspace = TempDir::new().expect("workspace");
+        let source_parent = TempDir::new().expect("source parent");
+        let source = source_parent.path().join("plugin");
+        write_plugin_source(&source, "locus-workspace", "0.1.0", "simple");
+
+        let installed = install_plugin_from_path_sync(
+            &workspace_path(&workspace),
+            &source.to_string_lossy(),
+            PluginInstallScope::Project,
+        )
+        .expect("install plugin");
+
+        assert_eq!(installed.id, "locus-workspace");
+        assert_eq!(installed.version, "0.1.0");
+        assert!(project_plugin_parent(&workspace)
+            .join("locus-workspace")
+            .join(PLUGIN_MANIFEST_FILE_NAME)
+            .is_file());
+    }
+
+    #[test]
+    fn install_replaces_existing_project_plugin_and_cleans_artifacts() {
+        let workspace = TempDir::new().expect("workspace");
+        let source_parent = TempDir::new().expect("source parent");
+        let source = source_parent.path().join("plugin");
+        write_plugin_source(&source, "com.example.lifecycle", "1.0.0", "v1");
+
+        let installed = install_plugin_from_path_sync(
+            &workspace_path(&workspace),
+            &source.to_string_lossy(),
+            PluginInstallScope::Project,
+        )
+        .expect("install v1");
+        assert_eq!(installed.version, "1.0.0");
+
+        write_plugin_source(&source, "com.example.lifecycle", "2.0.0", "v2");
+        let updated = install_plugin_from_path_sync(
+            &workspace_path(&workspace),
+            &source.to_string_lossy(),
+            PluginInstallScope::Project,
+        )
+        .expect("install v2");
+
+        assert_eq!(updated.version, "2.0.0");
+        let target = project_plugin_parent(&workspace).join("com.example.lifecycle");
+        assert_eq!(
+            fs::read_to_string(target.join("marker.txt")).expect("read marker"),
+            "v2"
+        );
+        assert_no_install_artifacts(&project_plugin_parent(&workspace));
+    }
+
+    #[test]
+    fn installed_plugin_summary_includes_rule_files() {
+        let workspace = TempDir::new().expect("workspace");
+        let plugin_root = project_plugin_parent(&workspace).join("com.example.rules");
+        write_plugin_source(&plugin_root, "com.example.rules", "1.0.0", "");
+        fs::create_dir_all(plugin_root.join("rules")).expect("create rules dir");
+        fs::write(
+            plugin_root.join("rules").join("risk_control.md"),
+            "# Risk Control",
+        )
+        .expect("write rule");
+
+        let summaries = list_installed_plugin_summaries(&workspace_path(&workspace));
+        let summary = summaries
+            .iter()
+            .find(|plugin| plugin.id == "com.example.rules")
+            .expect("plugin summary");
+
+        assert_eq!(summary.rules.len(), 1);
+        assert_eq!(summary.rules[0].path, "rules/risk_control.md");
+    }
+
+    #[test]
+    fn installed_plugin_scan_skips_install_and_backup_artifacts() {
+        let workspace = TempDir::new().expect("workspace");
+        let parent = project_plugin_parent(&workspace);
+        write_plugin_source(
+            &parent.join("com.example.normal"),
+            "com.example.normal",
+            "1.0.0",
+            "",
+        );
+        write_plugin_source(
+            &parent.join(".install-temp"),
+            "com.example.temp",
+            "1.0.0",
+            "",
+        );
+        write_plugin_source(
+            &parent.join(".backup-temp"),
+            "com.example.backup",
+            "1.0.0",
+            "",
+        );
+
+        let plugins = installed_plugins_in_dir(PluginInstallScope::Project, &parent);
+
+        assert_eq!(plugins.len(), 1);
+        assert_eq!(plugins[0].id, "com.example.normal");
+    }
+
+    #[test]
+    fn uninstall_project_plugin_removes_installed_directory() {
+        let workspace = TempDir::new().expect("workspace");
+        let source_parent = TempDir::new().expect("source parent");
+        let source = source_parent.path().join("plugin");
+        write_plugin_source(&source, "com.example.uninstall", "1.0.0", "");
+        install_plugin_from_path_sync(
+            &workspace_path(&workspace),
+            &source.to_string_lossy(),
+            PluginInstallScope::Project,
+        )
+        .expect("install plugin");
+
+        let removed = uninstall_plugin_sync(
+            &workspace_path(&workspace),
+            "com.example.uninstall",
+            PluginInstallScope::Project,
+        )
+        .expect("uninstall plugin");
+
+        assert_eq!(removed, "com.example.uninstall");
+        assert!(!project_plugin_parent(&workspace)
+            .join("com.example.uninstall")
+            .exists());
+    }
 }

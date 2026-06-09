@@ -10,8 +10,8 @@
       },
       "source": {
         "type": "string",
-        "enum": ["project", "app"],
-        "description": "Skill source. Defaults to `project`; use `app` for built-in Skills or app-installed packages."
+        "enum": ["project", "app", "pluginApp", "pluginProject"],
+        "description": "Skill source. Defaults to `project`; use `app` for built-in Skills or app-installed packages, and `pluginApp` or `pluginProject` for plugin Skill packages."
       }
     },
     "required": ["name"]

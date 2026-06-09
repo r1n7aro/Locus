@@ -275,6 +275,7 @@ pub struct SkillPackageArchiveResult {
 pub(crate) struct SkillPluginExportCopy {
     pub id: String,
     pub file_count: usize,
+    pub source_root: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -3816,6 +3817,78 @@ pub fn delete_skill_package_sync(working_dir: &str, package_id: &str) -> Result<
     delete_skill_package_from_parent_sync(working_dir, &package_parent, package_id)
 }
 
+fn validate_skill_package_transfer_to_plugin_sync(
+    working_dir: &str,
+    package_id: &str,
+    source_root: &Path,
+) -> Result<String, String> {
+    let normalized_id = normalize_package_id(package_id)?;
+    let record = find_skill_package_for_working_dir(working_dir, &normalized_id)?;
+    if let Some(plugin_id) = record.plugin_id.as_deref() {
+        return Err(format!(
+            "Skill package '{}' is already managed by plugin '{}'.",
+            normalized_id, plugin_id
+        ));
+    }
+
+    let canonical_record_root = dunce::canonicalize(&record.root).map_err(|e| {
+        format!(
+            "Failed to resolve Skill package root '{}': {}",
+            record.root.display(),
+            e
+        )
+    })?;
+    let canonical_source_root = dunce::canonicalize(source_root).map_err(|e| {
+        format!(
+            "Failed to resolve Skill package source root '{}': {}",
+            source_root.display(),
+            e
+        )
+    })?;
+    if canonical_record_root != canonical_source_root {
+        return Err(format!(
+            "Skill package '{}' source changed before transfer.",
+            normalized_id
+        ));
+    }
+
+    let package_parent = writable_app_skill_package_dir()?;
+    let canonical_parent = dunce::canonicalize(&package_parent).map_err(|e| {
+        format!(
+            "Failed to resolve writable Skill package directory '{}': {}",
+            package_parent.display(),
+            e
+        )
+    })?;
+    if !canonical_source_root.starts_with(&canonical_parent) {
+        return Err(format!(
+            "Skill package '{}' is not in the writable app Skill package directory and cannot be transferred automatically.",
+            normalized_id
+        ));
+    }
+
+    Ok(normalized_id)
+}
+
+pub(crate) fn preflight_skill_package_transfer_to_plugin_sync(
+    working_dir: &str,
+    package_id: &str,
+    source_root: &Path,
+) -> Result<String, String> {
+    validate_skill_package_transfer_to_plugin_sync(working_dir, package_id, source_root)
+}
+
+pub(crate) fn transfer_skill_package_to_plugin_sync(
+    working_dir: &str,
+    package_id: &str,
+    source_root: &Path,
+) -> Result<String, String> {
+    let normalized_id =
+        validate_skill_package_transfer_to_plugin_sync(working_dir, package_id, source_root)?;
+    let package_parent = writable_app_skill_package_dir()?;
+    delete_skill_package_from_parent_sync(working_dir, &package_parent, &normalized_id)
+}
+
 fn archive_output_path(file_path: &str) -> Result<PathBuf, String> {
     let trimmed = file_path.trim();
     if trimmed.is_empty() {
@@ -4005,6 +4078,7 @@ pub(crate) fn copy_skill_package_for_plugin_sync(
     Ok(SkillPluginExportCopy {
         id: record.manifest.id,
         file_count,
+        source_root: record.root,
     })
 }
 

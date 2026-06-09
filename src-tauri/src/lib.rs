@@ -381,7 +381,8 @@ pub fn run() {
             let data_dir = commands::prepare_runtime_storage_dir(&app.handle().clone())
                 .map_err(|e| format!("Failed to prepare app storage dir: {}", e))?;
             if let Ok(resource_dir) = app.path().resource_dir() {
-                process_util::set_managed_git_resource_dir(resource_dir);
+                process_util::set_managed_git_resource_dir(resource_dir.clone());
+                process_util::set_managed_github_cli_resource_dir(resource_dir);
             }
             commands::restore_saved_git_override(&app.handle().clone());
 
@@ -1138,8 +1139,22 @@ pub fn run() {
             commands::get_skill_unity_install_status,
             commands::install_skill_unity_files,
             commands::remove_skill_unity_files,
+            commands::plugin_registry_fetch_manifest,
+            commands::plugin_registry_fetch_shard,
+            commands::plugin_registry_fetch_search_index,
+            commands::plugin_registry_fetch_plugin,
+            commands::plugin_registry_fetch_description,
             commands::plugin_list_installed,
             commands::plugin_install_from_path,
+            commands::plugin_install_from_registry,
+            commands::plugin_install_from_source,
+            commands::plugin_github_auth_status,
+            commands::plugin_github_repo_star_status,
+            commands::plugin_github_repo_set_starred,
+            commands::plugin_github_auth_save_token,
+            commands::plugin_github_oauth_start,
+            commands::plugin_github_oauth_poll,
+            commands::plugin_github_auth_logout,
             commands::plugin_uninstall,
             commands::plugin_export,
             commands::open_file_external,
