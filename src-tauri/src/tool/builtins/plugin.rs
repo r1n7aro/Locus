@@ -422,6 +422,7 @@ pub(super) fn plugin_list() -> ToolDef {
         name: "plugin_list".to_string(),
         description: prompt.description,
         parameters: prompt.parameters,
+        mutates_workspace: false,
         execute: make_exec(|args, ctx| {
             Box::pin(async move {
                 let parsed = match serde_json::from_value::<PluginListToolArgs>(args) {
@@ -454,6 +455,7 @@ pub(super) fn plugin_search() -> ToolDef {
         name: "plugin_search".to_string(),
         description: prompt.description,
         parameters: prompt.parameters,
+        mutates_workspace: false,
         execute: make_exec(|args, _ctx| {
             Box::pin(async move {
                 let parsed = match serde_json::from_value::<PluginSearchToolArgs>(args) {
@@ -582,6 +584,8 @@ pub(super) fn plugin_install() -> ToolDef {
         name: "plugin_install".to_string(),
         description: prompt.description,
         parameters: prompt.parameters,
+        // Project-scope installs write plugin files into the workspace.
+        mutates_workspace: true,
         execute: make_exec(|args, ctx| {
             Box::pin(async move {
                 let parsed = match serde_json::from_value::<PluginInstallToolArgs>(args) {
@@ -717,6 +721,7 @@ pub(super) fn plugin_set_enabled() -> ToolDef {
         name: "plugin_set_enabled".to_string(),
         description: prompt.description,
         parameters: prompt.parameters,
+        mutates_workspace: true,
         execute: make_exec(|args, ctx| {
             Box::pin(async move {
                 let parsed = match serde_json::from_value::<PluginSetEnabledToolArgs>(args) {
@@ -797,6 +802,7 @@ pub(super) fn plugin_uninstall() -> ToolDef {
         name: "plugin_uninstall".to_string(),
         description: prompt.description,
         parameters: prompt.parameters,
+        mutates_workspace: true,
         execute: make_exec(|args, ctx| {
             Box::pin(async move {
                 let parsed = match serde_json::from_value::<PluginUninstallToolArgs>(args) {
@@ -868,6 +874,8 @@ pub(super) fn plugin_export() -> ToolDef {
         name: "plugin_export".to_string(),
         description: prompt.description,
         parameters: prompt.parameters,
+        // Ownership transfer and install-after-export rewrite workspace files.
+        mutates_workspace: true,
         execute: make_exec(|args, ctx| {
             Box::pin(async move {
                 let parsed = match parse_args(args) {

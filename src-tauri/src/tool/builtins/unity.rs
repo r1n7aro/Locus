@@ -10,6 +10,7 @@ pub(super) fn unity_execute() -> ToolDef {
         name: "unity_execute".to_string(),
         description: prompt.description,
         parameters: prompt.parameters,
+        mutates_workspace: true,
         execute: make_exec(|args, ctx| {
             Box::pin(async move {
                 let code = match args.get("code").and_then(|v| v.as_str()) {
@@ -108,6 +109,7 @@ pub(super) fn unity_run_states() -> ToolDef {
         name: "unity_run_states".to_string(),
         description: prompt.description,
         parameters: prompt.parameters,
+        mutates_workspace: true,
         execute: make_exec(|args, ctx| {
             Box::pin(async move {
                 let project_path = match ctx.working_dir {
@@ -195,6 +197,7 @@ pub(super) fn unity_ref_search() -> ToolDef {
         name: "unity_ref_search".to_string(),
         description: prompt.description,
         parameters: prompt.parameters,
+        mutates_workspace: false,
         execute: Arc::new(|_args, _ctx| {
             Box::pin(async {
                 ToolResult {
@@ -214,6 +217,7 @@ pub(super) fn unity_asset_search() -> ToolDef {
         name: "unity_asset_search".to_string(),
         description: prompt.description,
         parameters: prompt.parameters,
+        mutates_workspace: false,
         execute: Arc::new(|_args, _ctx| {
             Box::pin(async {
                 ToolResult {
@@ -233,6 +237,7 @@ pub(super) fn unity_capture_viewport() -> ToolDef {
         name: "unity_capture_viewport".to_string(),
         description: prompt.description,
         parameters: prompt.parameters,
+        mutates_workspace: false,
         execute: Arc::new(|_args, _ctx| {
             Box::pin(async {
                 ToolResult {
@@ -253,6 +258,7 @@ fn intercepted_unity_yaml_tool(name: &str, prompt_json: &str) -> ToolDef {
         name: tool_name.clone(),
         description: prompt.description,
         parameters: prompt.parameters,
+        mutates_workspace: false,
         execute: Arc::new(move |_args, _ctx| {
             let tool_name = tool_name.clone();
             Box::pin(async move {
@@ -288,6 +294,8 @@ pub(super) fn unity_recompile() -> ToolDef {
         name: "unity_recompile".to_string(),
         description: prompt.description,
         parameters: prompt.parameters,
+        // Triggers compilation only; doesn't change tracked source files.
+        mutates_workspace: false,
         execute: make_exec(|args, _ctx| {
             Box::pin(async move {
                 let claimed_status = match args.get("editor_status").and_then(|v| v.as_str()) {

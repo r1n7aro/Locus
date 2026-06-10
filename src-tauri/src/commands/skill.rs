@@ -154,6 +154,10 @@ pub struct SkillPackageToolManifest {
     pub entry_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_editor_status: Option<String>,
+    /// Declares that running this tool can change files in the workspace, so
+    /// rounds containing it are checkpointed for undo.
+    #[serde(default)]
+    pub mutates_workspace: bool,
     #[serde(default = "default_tool_parameters")]
     pub parameters: serde_json::Value,
 }
@@ -1969,6 +1973,10 @@ pub(crate) fn skill_package_tool_description_sync(
     skill_package_tool_description_sync_for_working_dir("", name)
 }
 
+pub(crate) fn skill_package_tool_mutates_workspace_sync(name: &str) -> Option<bool> {
+    find_skill_package_tool_by_api_name(name).map(|(_, tool, _)| tool.mutates_workspace)
+}
+
 pub(crate) fn skill_package_tool_description_sync_for_working_dir(
     working_dir: &str,
     name: &str,
@@ -2025,6 +2033,7 @@ fn build_skill_package_tool_def(
         name,
         description,
         parameters,
+        mutates_workspace: tool.mutates_workspace,
         execute: Arc::new(move |args, ctx| {
             let package_root = package_root.clone();
             let package_id = package_id.clone();
@@ -3794,7 +3803,7 @@ fn create_skill_package_in_parent_sync_with_default_namespace(
             &root_doc_path,
             package_skill_body(&name, &manifest.description, request.body),
         )
-            .map_err(|e| format!("Failed to write {}: {}", root_doc_path.display(), e))?;
+        .map_err(|e| format!("Failed to write {}: {}", root_doc_path.display(), e))?;
         let record = load_skill_package_record(&package_root)?;
         Ok(build_package_skill_manifest(&record, "app", None))
     })();
@@ -5645,6 +5654,7 @@ Use Feishu safely.
                 method: None,
                 entry_type: None,
                 request_editor_status: None,
+                mutates_workspace: false,
                 parameters: super::default_tool_parameters(),
             }
         }

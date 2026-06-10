@@ -92,6 +92,10 @@ pub struct ToolDef {
     pub name: String,
     pub description: String,
     pub parameters: serde_json::Value,
+    /// Declares that executing this tool can change files in the workspace,
+    /// so rounds containing it must be checkpointed for undo. Every tool
+    /// definition states this explicitly — there is no central whitelist.
+    pub mutates_workspace: bool,
     pub execute: ToolExecuteFn,
 }
 
@@ -135,6 +139,7 @@ pub fn default_load_mode_for_builtin_tool(name: &str) -> ToolLoadMode {
         "knowledge_delete"
             | "knowledge_move"
             | "graph_view"
+            | "sheet"
             | "skill_create"
             | "unity_capture_viewport"
             | "unity_run_states"
@@ -193,6 +198,16 @@ impl ToolRegistry {
 
     pub fn is_built_in(&self, name: &str) -> bool {
         self.built_in_tools.contains(&normalize_tool_name_key(name))
+    }
+
+    /// Whether a tool declares workspace mutations (drives undo tracking).
+    /// Skill-package tools fall back to their manifest declaration; unknown
+    /// tools default to not mutating.
+    pub fn mutates_workspace(&self, name: &str) -> bool {
+        self.get(name)
+            .map(|def| def.mutates_workspace)
+            .or_else(|| crate::commands::skill_package_tool_mutates_workspace_sync(name))
+            .unwrap_or(false)
     }
 
     pub fn skill_tool_names(&self) -> Vec<String> {
@@ -293,6 +308,10 @@ impl ToolRegistry {
         self.register_builtin(ToolDef {
             name: "task".to_string(),
             description,
+            // Subagents run their own tracked rounds via the shared
+            // UndoManager; tracking the parent `task` round as well would
+            // double-record the same changes.
+            mutates_workspace: false,
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -330,6 +349,7 @@ mod tests {
             name: "edit".to_string(),
             description: "Edit a file".to_string(),
             parameters: serde_json::json!({"type": "object"}),
+            mutates_workspace: true,
             execute: Arc::new(|_, _| {
                 Box::pin(async {
                     ToolResult {
@@ -354,6 +374,7 @@ mod tests {
             name: "edit".to_string(),
             description: "Edit a file".to_string(),
             parameters: serde_json::json!({"type": "object"}),
+            mutates_workspace: true,
             execute: Arc::new(|_, _| {
                 Box::pin(async {
                     ToolResult {
@@ -377,6 +398,7 @@ mod tests {
             name: "skill_tool".to_string(),
             description: "Skill tool".to_string(),
             parameters: serde_json::json!({"type": "object"}),
+            mutates_workspace: false,
             execute: Arc::new(|_, _| {
                 Box::pin(async {
                     ToolResult {
@@ -391,6 +413,7 @@ mod tests {
                 name: "builtin_lazy".to_string(),
                 description: "Builtin lazy".to_string(),
                 parameters: serde_json::json!({"type": "object"}),
+                mutates_workspace: false,
                 execute: Arc::new(|_, _| {
                     Box::pin(async {
                         ToolResult {
@@ -448,6 +471,14 @@ mod tests {
             Some("graph_view")
         );
         assert_eq!(registry.default_load_mode("graph_view"), ToolLoadMode::Lazy);
+    }
+
+    #[test]
+    fn builtins_register_sheet_as_lazy() {
+        let registry = ToolRegistry::with_builtins();
+
+        assert_eq!(registry.canonical_name("sheet").as_deref(), Some("sheet"));
+        assert_eq!(registry.default_load_mode("sheet"), ToolLoadMode::Lazy);
     }
 
     #[test]

@@ -56,6 +56,8 @@ pub(super) fn bash() -> ToolDef {
         name: "bash".to_string(),
         description: prompt.description,
         parameters: prompt.parameters,
+        // Arbitrary shell commands can touch anything in the workspace.
+        mutates_workspace: true,
         execute: make_exec(|args, ctx| {
             Box::pin(async move {
                 let command = match args.get("command").and_then(|v| v.as_str()) {

@@ -10,6 +10,7 @@ pub(super) fn grep() -> ToolDef {
         name: "grep".to_string(),
         description: prompt.description,
         parameters: prompt.parameters,
+        mutates_workspace: false,
         execute: make_exec(|args, _ctx| {
             Box::pin(async move {
                 let pattern = match args.get("pattern").and_then(|v| v.as_str()) {
