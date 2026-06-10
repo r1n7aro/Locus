@@ -193,6 +193,8 @@ pub struct SkillPackageManifestFile {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub version: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inject_mode: Option<KnowledgeInjectMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<SkillPackageSource>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<SkillPackageCommand>,
@@ -627,9 +629,9 @@ fn build_skill_manifest(
         package_id: None,
         package_version: None,
         has_unity: false,
-        has_l0: true,
-        has_l1: true,
-        has_l2: true,
+        has_l0: markdown_has_l_section(&document.body, "L0"),
+        has_l1: markdown_has_l_section(&document.body, "L1"),
+        has_l2: markdown_has_l_section(&document.body, "L2"),
         plugin_id: None,
         plugin_scope: None,
     }
@@ -862,6 +864,14 @@ fn normalize_package_manifest(
     }
     manifest.description = manifest.description.trim().to_string();
     manifest.version = manifest.version.trim().to_string();
+    if matches!(
+        manifest.inject_mode,
+        Some(KnowledgeInjectMode::Full | KnowledgeInjectMode::Rule)
+    ) {
+        return Err(
+            "Skill package manifest injectMode only supports none, path, or excerpt".to_string(),
+        );
+    }
     manifest.argument_hint = manifest
         .argument_hint
         .take()
@@ -1031,18 +1041,34 @@ fn normalize_package_tool_manifest(tool: &mut SkillPackageToolManifest) -> Resul
     Ok(())
 }
 
+fn markdown_l_heading_matches(line: &str, level: &str) -> bool {
+    let trimmed = line.trim_start();
+    if !trimmed.starts_with('#') {
+        return false;
+    }
+    let title = trimmed.trim_start_matches('#').trim_start();
+    title == level
+        || title.strip_prefix(level).is_some_and(|rest| {
+            rest.starts_with(' ') || rest.starts_with(':') || rest.starts_with('-')
+        })
+}
+
 fn markdown_has_l_section(body: &str, level: &str) -> bool {
-    body.lines().any(|line| {
-        let trimmed = line.trim_start();
-        if !trimmed.starts_with('#') {
-            return false;
-        }
-        let title = trimmed.trim_start_matches('#').trim_start();
-        title == level
-            || title.strip_prefix(level).is_some_and(|rest| {
-                rest.starts_with(' ') || rest.starts_with(':') || rest.starts_with('-')
-            })
-    })
+    body.lines()
+        .any(|line| markdown_l_heading_matches(line, level))
+}
+
+fn markdown_l_section_text(body: &str, level: &str) -> Option<String> {
+    let mut lines = body.lines();
+    lines
+        .by_ref()
+        .find(|line| markdown_l_heading_matches(line, level))?;
+    let section = lines
+        .take_while(|line| !line.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let text = section.trim().to_string();
+    (!text.is_empty()).then_some(text)
 }
 
 fn strip_utf8_bom(content: &str) -> &str {
@@ -2689,14 +2715,18 @@ fn configured_package_model_recall_enabled(
         && configured_package_skill_surface(manifest, override_config).allows_auto()
 }
 
-fn configured_package_description(
+/// Summary text injected for a package root document at the excerpt (L1) level:
+/// workspace override, then the root doc `## L1` section, then the manifest description.
+fn configured_package_summary(
     manifest: &SkillPackageManifestFile,
     override_config: Option<&SkillConfig>,
+    root_doc_body: &str,
 ) -> String {
     override_config
         .and_then(|config| {
             (!config.description.trim().is_empty()).then(|| config.description.clone())
         })
+        .or_else(|| markdown_l_section_text(root_doc_body, "L1"))
         .unwrap_or_else(|| manifest.description.clone())
 }
 
@@ -2709,9 +2739,13 @@ fn configured_package_command_trigger(
         .unwrap_or_else(|| package_command_trigger(manifest))
 }
 
-fn configured_package_inject_mode(override_config: Option<&SkillConfig>) -> KnowledgeInjectMode {
+fn configured_package_inject_mode(
+    manifest: &SkillPackageManifestFile,
+    override_config: Option<&SkillConfig>,
+) -> KnowledgeInjectMode {
     override_config
         .map(|config| config.inject_mode)
+        .or(manifest.inject_mode)
         .unwrap_or(KnowledgeInjectMode::None)
 }
 
@@ -2754,8 +2788,8 @@ fn package_to_document(
     } else {
         SkillSurface::Command
     };
-    let description = if is_root {
-        configured_package_description(manifest, override_config)
+    let summary = if is_root {
+        configured_package_summary(manifest, override_config, &body)
     } else {
         String::new()
     };
@@ -2776,7 +2810,7 @@ fn package_to_document(
             .map(str::to_string)
             .unwrap_or_else(|| package_document_title(manifest, doc_rel_path)),
         inject_mode: if is_root {
-            configured_package_inject_mode(override_config)
+            configured_package_inject_mode(manifest, override_config)
         } else {
             KnowledgeInjectMode::None
         },
@@ -2801,7 +2835,7 @@ fn package_to_document(
             .then(|| configured_package_command_trigger(manifest, override_config)),
         argument_hint: is_root.then(|| package_argument_hint(manifest)).flatten(),
         tools: package_document_tool_names(record, doc_rel_path, &frontmatter),
-        summary: (!description.trim().is_empty()).then_some(description),
+        summary: (!summary.trim().is_empty()).then_some(summary),
         body,
         maintenance_rules: None,
         created_at: updated_at,
@@ -3005,17 +3039,17 @@ fn package_to_list_item(
     } else {
         SkillSurface::Command
     };
-    let description = if is_root {
-        configured_package_description(manifest, override_config)
-    } else {
-        String::new()
-    };
     let file_path = package_file_path(&record.root, doc_rel_path).ok();
     let body = file_path
         .as_ref()
         .and_then(|path| std::fs::read_to_string(path).ok())
         .unwrap_or_default();
     let (frontmatter, body) = split_optional_package_frontmatter(&body).unwrap_or_default();
+    let summary = if is_root {
+        configured_package_summary(manifest, override_config, &body)
+    } else {
+        String::new()
+    };
     let updated_at = file_path
         .as_ref()
         .map(|path| package_file_modified_at(path, record.updated_at))
@@ -3032,7 +3066,7 @@ fn package_to_list_item(
             .map(str::to_string)
             .unwrap_or_else(|| package_document_title(manifest, doc_rel_path)),
         inject_mode: if is_root {
-            configured_package_inject_mode(override_config)
+            configured_package_inject_mode(manifest, override_config)
         } else {
             KnowledgeInjectMode::None
         },
@@ -3054,14 +3088,14 @@ fn package_to_list_item(
         argument_hint: is_root.then(|| package_argument_hint(manifest)).flatten(),
         created_at: updated_at,
         updated_at,
-        has_summary: !description.trim().is_empty(),
+        has_summary: !summary.trim().is_empty(),
         has_body_content: !body.trim().is_empty(),
         byte_size: file_path
             .and_then(|path| std::fs::metadata(path).ok())
             .map(|meta| meta.len()),
         lexical_search_enabled: Some(false),
         semantic_search_enabled: Some(false),
-        summary: (!description.trim().is_empty()).then_some(description),
+        summary: (!summary.trim().is_empty()).then_some(summary),
     }
 }
 
@@ -3178,6 +3212,38 @@ pub(crate) fn list_skill_package_knowledge_items_sync_with_hidden(
         .collect()
 }
 
+pub(crate) fn skill_package_path_prefix_targets_package_sync(
+    working_dir: &str,
+    path_prefix: Option<&str>,
+) -> bool {
+    let normalized_prefix = path_prefix
+        .map(|value| {
+            value
+                .trim()
+                .replace('\\', "/")
+                .trim_matches('/')
+                .to_string()
+        })
+        .unwrap_or_default();
+    let normalized_prefix = normalized_prefix
+        .strip_prefix("skill/")
+        .unwrap_or(&normalized_prefix)
+        .trim_matches('/');
+    if normalized_prefix.is_empty() {
+        return false;
+    }
+
+    list_skill_packages_sync_for_working_dir(working_dir)
+        .into_iter()
+        .filter_map(|record| normalize_package_id(&record.manifest.id).ok())
+        .any(|package_id| {
+            normalized_prefix == package_id
+                || normalized_prefix
+                    .strip_prefix(&format!("{}/", package_id))
+                    .is_some()
+        })
+}
+
 pub(crate) fn list_skill_package_knowledge_items_sync(
     working_dir: &str,
     path_prefix: Option<&str>,
@@ -3238,6 +3304,18 @@ pub(crate) fn skill_package_virtual_path_allows_model_recall_sync(
     Ok(None)
 }
 
+pub(crate) fn skill_package_virtual_path_exists_sync(
+    working_dir: &str,
+    virtual_path: &str,
+) -> Result<bool, String> {
+    for record in list_skill_packages_sync_for_working_dir(working_dir) {
+        if package_doc_rel_path_for_virtual_path(&record.manifest, virtual_path)?.is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn build_package_skill_manifest(
     record: &SkillPackageRecord,
     source: &str,
@@ -3251,6 +3329,9 @@ fn build_package_skill_manifest(
     let skill_surface = override_config
         .map(|config| config.surface)
         .unwrap_or_else(|| package_skill_surface(manifest));
+    let root_doc = std::fs::read_to_string(package_root_doc_path(&record.root))
+        .ok()
+        .and_then(|raw| split_optional_package_frontmatter(&raw).ok());
     let manifest_description = manifest.description.trim().to_string();
     let skill_description = override_config
         .and_then(|config| {
@@ -3260,11 +3341,10 @@ fn build_package_skill_manifest(
     let command_trigger = override_config
         .and_then(resolve_config_command_trigger)
         .unwrap_or_else(|| package_command_trigger(manifest));
-    let root_doc_tools = std::fs::read_to_string(package_root_doc_path(&record.root))
-        .ok()
-        .and_then(|raw| split_optional_package_frontmatter(&raw).ok())
+    let root_doc_tools = root_doc
+        .as_ref()
         .map(|(frontmatter, _)| {
-            package_document_tool_names(record, &package_root_doc_rel_path(manifest), &frontmatter)
+            package_document_tool_names(record, &package_root_doc_rel_path(manifest), frontmatter)
         })
         .unwrap_or_else(|| package_manifest_tool_names(record));
 
@@ -3547,8 +3627,15 @@ fn default_package_command_name(package_id: &str) -> String {
         .to_string()
 }
 
-fn package_skill_body(name: &str, body: Option<String>) -> String {
-    let body = optional_trimmed(body).unwrap_or_else(|| "## Instructions\n".to_string());
+fn package_skill_body(name: &str, summary: &str, body: Option<String>) -> String {
+    let body = optional_trimmed(body).unwrap_or_else(|| {
+        let summary = summary.trim();
+        if summary.is_empty() {
+            "## Instructions\n".to_string()
+        } else {
+            format!("## L1\n{}\n\n## Instructions\n", summary)
+        }
+    });
     let body = if body.trim_start().starts_with("# ") {
         body
     } else {
@@ -3686,6 +3773,7 @@ fn create_skill_package_in_parent_sync_with_default_namespace(
             argument_hint: argument_hint.clone(),
             disable_model_invocation: Some(!model_invocation_enabled),
             user_invocable: Some(command_enabled),
+            inject_mode: None,
             source: None,
             command: Some(SkillPackageCommand {
                 enabled: Some(command_enabled),
@@ -3702,7 +3790,10 @@ fn create_skill_package_in_parent_sync_with_default_namespace(
             .map_err(|e| format!("Failed to write {}: {}", manifest_path.display(), e))?;
 
         let root_doc_path = package_root.join(SKILL_PACKAGE_ROOT_DOC_FILE_NAME);
-        std::fs::write(&root_doc_path, package_skill_body(&name, request.body))
+        std::fs::write(
+            &root_doc_path,
+            package_skill_body(&name, &manifest.description, request.body),
+        )
             .map_err(|e| format!("Failed to write {}: {}", root_doc_path.display(), e))?;
         let record = load_skill_package_record(&package_root)?;
         Ok(build_package_skill_manifest(&record, "app", None))
@@ -3772,6 +3863,14 @@ fn delete_skill_package_from_parent_sync(
         }
     }
 
+    delete_skill_package_copy_from_parent_sync(working_dir, package_parent, package_id)
+}
+
+fn delete_skill_package_copy_from_parent_sync(
+    working_dir: &str,
+    package_parent: &Path,
+    package_id: &str,
+) -> Result<String, String> {
     let record = find_skill_package_in_parent(package_parent, package_id)?;
     let canonical_parent = dunce::canonicalize(package_parent).map_err(|e| {
         format!(
@@ -3817,24 +3916,20 @@ pub fn delete_skill_package_sync(working_dir: &str, package_id: &str) -> Result<
     delete_skill_package_from_parent_sync(working_dir, &package_parent, package_id)
 }
 
+// Validates against the package copy at `source_root` itself (like the View
+// counterpart) instead of resolving the id through the merged package list:
+// after install-after-export the plugin-managed record replaces the app record
+// for the same id, which must not block transferring the app-writable copy.
 fn validate_skill_package_transfer_to_plugin_sync(
-    working_dir: &str,
     package_id: &str,
     source_root: &Path,
 ) -> Result<String, String> {
     let normalized_id = normalize_package_id(package_id)?;
-    let record = find_skill_package_for_working_dir(working_dir, &normalized_id)?;
-    if let Some(plugin_id) = record.plugin_id.as_deref() {
-        return Err(format!(
-            "Skill package '{}' is already managed by plugin '{}'.",
-            normalized_id, plugin_id
-        ));
-    }
-
-    let canonical_record_root = dunce::canonicalize(&record.root).map_err(|e| {
+    let package_parent = writable_app_skill_package_dir()?;
+    let canonical_parent = dunce::canonicalize(&package_parent).map_err(|e| {
         format!(
-            "Failed to resolve Skill package root '{}': {}",
-            record.root.display(),
+            "Failed to resolve writable Skill package directory '{}': {}",
+            package_parent.display(),
             e
         )
     })?;
@@ -3845,25 +3940,27 @@ fn validate_skill_package_transfer_to_plugin_sync(
             e
         )
     })?;
-    if canonical_record_root != canonical_source_root {
+    if canonical_source_root == canonical_parent
+        || !canonical_source_root.starts_with(&canonical_parent)
+    {
+        return Err(format!(
+            "Skill package '{}' is not in the writable app Skill package directory and cannot be transferred automatically.",
+            normalized_id
+        ));
+    }
+
+    let record = load_skill_package_record(&canonical_source_root)
+        .map_err(|error| format!("Invalid Skill package '{}': {}", normalized_id, error))?;
+    if record.manifest.id != normalized_id {
         return Err(format!(
             "Skill package '{}' source changed before transfer.",
             normalized_id
         ));
     }
-
-    let package_parent = writable_app_skill_package_dir()?;
-    let canonical_parent = dunce::canonicalize(&package_parent).map_err(|e| {
-        format!(
-            "Failed to resolve writable Skill package directory '{}': {}",
-            package_parent.display(),
-            e
-        )
-    })?;
-    if !canonical_source_root.starts_with(&canonical_parent) {
+    if let Some(plugin_id) = record.plugin_id.as_deref() {
         return Err(format!(
-            "Skill package '{}' is not in the writable app Skill package directory and cannot be transferred automatically.",
-            normalized_id
+            "Skill package '{}' is already managed by plugin '{}'.",
+            normalized_id, plugin_id
         ));
     }
 
@@ -3871,11 +3968,11 @@ fn validate_skill_package_transfer_to_plugin_sync(
 }
 
 pub(crate) fn preflight_skill_package_transfer_to_plugin_sync(
-    working_dir: &str,
+    _working_dir: &str,
     package_id: &str,
     source_root: &Path,
 ) -> Result<String, String> {
-    validate_skill_package_transfer_to_plugin_sync(working_dir, package_id, source_root)
+    validate_skill_package_transfer_to_plugin_sync(package_id, source_root)
 }
 
 pub(crate) fn transfer_skill_package_to_plugin_sync(
@@ -3883,10 +3980,12 @@ pub(crate) fn transfer_skill_package_to_plugin_sync(
     package_id: &str,
     source_root: &Path,
 ) -> Result<String, String> {
-    let normalized_id =
-        validate_skill_package_transfer_to_plugin_sync(working_dir, package_id, source_root)?;
+    let normalized_id = validate_skill_package_transfer_to_plugin_sync(package_id, source_root)?;
     let package_parent = writable_app_skill_package_dir()?;
-    delete_skill_package_from_parent_sync(working_dir, &package_parent, &normalized_id)
+    // Skip the merged-list plugin guard: at transfer time the id is expected
+    // to resolve to the freshly installed plugin copy; only the app-writable
+    // copy validated above is removed.
+    delete_skill_package_copy_from_parent_sync(working_dir, &package_parent, &normalized_id)
 }
 
 fn archive_output_path(file_path: &str) -> Result<PathBuf, String> {
@@ -4879,6 +4978,71 @@ Create a project skill.
     }
 
     #[test]
+    fn skill_package_path_prefix_targets_single_package_only() {
+        let temp = TempDir::new().unwrap();
+        let working_dir = temp.path().to_string_lossy().to_string();
+        let plugin_root = temp
+            .path()
+            .join(crate::plugin::PROJECT_PLUGINS_RELATIVE)
+            .join("com.example.view-plugin");
+        let skill_root = plugin_root.join("skills").join("view");
+        std::fs::create_dir_all(&skill_root).unwrap();
+        std::fs::write(
+            plugin_root.join(crate::plugin::PLUGIN_MANIFEST_FILE_NAME),
+            r#"{
+  "schemaVersion": 1,
+  "id": "com.example.view-plugin",
+  "name": "View Plugin",
+  "version": "1.0.0",
+  "components": {
+    "skills": [{ "id": "view", "path": "skills/view" }]
+  }
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            skill_root.join("skill.json"),
+            r#"{
+  "schema": "locus.skill.v1",
+  "id": "view",
+  "version": "1.0.0",
+  "name": "View",
+  "description": "View package.",
+  "injectMode": "excerpt"
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(skill_root.join("SKILL.md"), "# View\n").unwrap();
+
+        assert!(super::skill_package_path_prefix_targets_package_sync(
+            &working_dir,
+            Some("view")
+        ));
+        assert!(super::skill_package_path_prefix_targets_package_sync(
+            &working_dir,
+            Some("skill/view/")
+        ));
+        assert!(super::skill_package_path_prefix_targets_package_sync(
+            &working_dir,
+            Some("view/debug.md")
+        ));
+        assert!(!super::skill_package_path_prefix_targets_package_sync(
+            &working_dir,
+            None
+        ));
+        assert!(!super::skill_package_path_prefix_targets_package_sync(
+            &working_dir,
+            Some("v")
+        ));
+        assert!(!super::skill_package_path_prefix_targets_package_sync(
+            &working_dir,
+            Some("viewer")
+        ));
+    }
+
+    #[test]
     fn package_root_doc_level_detection_treats_levels_as_optional() {
         let body = "## Instructions\nDo the work.\n";
 
@@ -4908,6 +5072,7 @@ Create a project skill.
   "id": "com.example.asset-audit",
   "version": "0.1.0",
   "name": "Asset Audit",
+  "injectMode": "excerpt",
   "description": "Audit Unity assets and report cleanup tasks.",
   "argumentHint": "<scope>",
   "disableModelInvocation": true,
@@ -4969,6 +5134,10 @@ Do the work.
             "Audit Unity assets and report cleanup tasks."
         );
         assert_eq!(
+            record.manifest.inject_mode,
+            Some(KnowledgeInjectMode::Excerpt)
+        );
+        assert_eq!(
             record.manifest.command.as_ref().unwrap().trigger.as_deref(),
             Some("/asset-audit")
         );
@@ -4995,6 +5164,8 @@ Do the work.
             super::package_skill_surface(&record.manifest),
             SkillSurface::Command
         );
+        let item = super::package_to_list_item(&record, "SKILL.md", None);
+        assert_eq!(item.inject_mode, KnowledgeInjectMode::Excerpt);
         assert!(!record.doc_levels.has_l0);
         assert!(!record.doc_levels.has_l2);
     }
@@ -5046,6 +5217,117 @@ Use Feishu safely.
         assert_eq!(item.command_enabled, false);
         assert_eq!(item.command_trigger.as_deref(), Some("/lark"));
         assert_eq!(item.summary.as_deref(), Some("Workspace override."));
+    }
+
+    #[test]
+    fn markdown_l_section_text_extracts_until_next_heading() {
+        let body = "# Title\n\n## L1\nLine one.\nLine two.\n\n## Instructions\nDo work.\n";
+        assert_eq!(
+            super::markdown_l_section_text(body, "L1").as_deref(),
+            Some("Line one.\nLine two.")
+        );
+        assert_eq!(super::markdown_l_section_text(body, "L0"), None);
+        assert_eq!(
+            super::markdown_l_section_text("# Title\n\n## L1\n\n## Next\n", "L1"),
+            None
+        );
+    }
+
+    #[test]
+    fn package_root_summary_prefers_l1_section_over_manifest_description() {
+        let temp = TempDir::new().unwrap();
+        std::fs::write(
+            temp.path().join("skill.json"),
+            r#"{
+  "schema": "locus.skill.v1",
+  "id": "asset-audit",
+  "version": "0.1.0",
+  "name": "Asset Audit",
+  "description": "Manifest description."
+}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("SKILL.md"),
+            "# Asset Audit\n\n## L1\nUse when auditing project assets.\n\n## Instructions\nAudit.\n",
+        )
+        .unwrap();
+
+        let record = super::load_skill_package_record(temp.path()).unwrap();
+        let item = super::package_to_list_item(&record, "SKILL.md", None);
+        assert_eq!(
+            item.summary.as_deref(),
+            Some("Use when auditing project assets.")
+        );
+
+        let document = super::package_to_document(
+            &record,
+            "SKILL.md",
+            std::fs::read_to_string(temp.path().join("SKILL.md")).unwrap(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            document.summary.as_deref(),
+            Some("Use when auditing project assets.")
+        );
+
+        let manifest = super::build_package_skill_manifest(&record, "app", None);
+        assert!(manifest.has_l1);
+        assert_eq!(manifest.description, "Manifest description.");
+        assert_eq!(
+            manifest.skill_description.as_deref(),
+            Some("Manifest description.")
+        );
+    }
+
+    #[test]
+    fn package_root_summary_falls_back_to_manifest_description_without_l1() {
+        let temp = TempDir::new().unwrap();
+        std::fs::write(
+            temp.path().join("skill.json"),
+            r#"{
+  "schema": "locus.skill.v1",
+  "id": "asset-audit",
+  "version": "0.1.0",
+  "name": "Asset Audit",
+  "description": "Manifest description."
+}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("SKILL.md"),
+            "# Asset Audit\n\n## Instructions\nAudit.\n",
+        )
+        .unwrap();
+
+        let record = super::load_skill_package_record(temp.path()).unwrap();
+        let item = super::package_to_list_item(&record, "SKILL.md", None);
+        assert_eq!(item.summary.as_deref(), Some("Manifest description."));
+
+        let manifest = super::build_package_skill_manifest(&record, "app", None);
+        assert!(!manifest.has_l1);
+        assert_eq!(manifest.description, "Manifest description.");
+    }
+
+    #[test]
+    fn package_skill_body_seeds_l1_from_summary() {
+        let body = super::package_skill_body("Asset Audit", "Use when auditing assets.", None);
+        assert_eq!(
+            body,
+            "# Asset Audit\n\n## L1\nUse when auditing assets.\n\n## Instructions\n"
+        );
+        assert_eq!(
+            super::markdown_l_section_text(&body, "L1").as_deref(),
+            Some("Use when auditing assets.")
+        );
+
+        let custom = super::package_skill_body(
+            "Asset Audit",
+            "Use when auditing assets.",
+            Some("## Instructions\nCustom body.".to_string()),
+        );
+        assert_eq!(custom, "# Asset Audit\n\n## Instructions\nCustom body.\n");
     }
 
     #[test]

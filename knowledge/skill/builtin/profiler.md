@@ -15,13 +15,13 @@ argumentHint:
 tools:
   - unity_run_states
 createdAt: 1777332556825
-updatedAt: 1779840000000
+updatedAt: 1781049600000
 ---
 
 # Unity Profiler Runtime Sampling
 
 ## Summary
-Use `unity_run_states` profiler helpers to record Unity performance data at the right runtime moment, inspect trends, capture specific markers, record spike frames, and export Unity Profiler hierarchy rows for analysis.
+Use when a runtime debugging task needs Unity performance data: frame time, GC allocation, memory, rendering, physics, script cost, spike frames, or a specific Unity Profiler marker. Ignore static code-quality questions that need no live runtime data.
 
 ## Content
 Use this skill when a runtime debugging task asks for frame time, GC allocation, memory, rendering, physics, script update cost, spike analysis, or a specific Unity Profiler marker.

@@ -12,13 +12,18 @@ describe("View sidebar settings", () => {
   it("keeps the bundled /view skill display name short", () => {
     const manifest = JSON.parse(read("skills/view/skill.json")) as {
       name: string;
+      injectMode?: string;
+      description?: string;
       command?: { trigger?: string };
     };
     const skill = read("skills/view/SKILL.md");
 
     expect(manifest.name).toBe("View");
+    expect(manifest.injectMode).toBe("excerpt");
+    expect(manifest.description).toContain("explicit Locus View UI package");
     expect(manifest.command?.trigger).toBe("/view");
     expect(skill).toContain("# View");
+    expect(skill).toContain("## L1");
     expect(skill).not.toContain("# View Package");
   });
 

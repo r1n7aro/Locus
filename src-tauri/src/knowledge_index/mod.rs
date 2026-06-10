@@ -19,7 +19,7 @@ use walkdir::WalkDir;
 
 use crate::knowledge_store::{
     self, DirectorySearchAccess, KnowledgeDocument, KnowledgeListItem, KnowledgeSearchHit,
-    KnowledgeSearchMatchSection, KnowledgeType,
+    KnowledgeSearchMatchSection, KnowledgeSourceProvider, KnowledgeType,
 };
 use crate::unity_docs;
 
@@ -4165,15 +4165,29 @@ fn cached_document_entry_allows_model_recall(
     if document.item.doc_type != KnowledgeType::Skill {
         return Ok(true);
     }
-    if let Some(allowed) = crate::commands::skill_package_virtual_path_allows_model_recall_sync(
+    let package_recall = crate::commands::skill_package_virtual_path_allows_model_recall_sync(
         working_dir,
         &document.item.path,
-    )? {
+    )?;
+    if let Some(allowed) = package_recall {
         return Ok(allowed);
+    }
+    if cached_document_entry_is_skill_package(document) {
+        return Ok(false);
     }
     Ok(knowledge_store::list_item_allows_model_recall(
         &document.item,
     ))
+}
+
+fn cached_document_entry_is_skill_package(document: &CachedDocumentEntry) -> bool {
+    document.item.doc_type == KnowledgeType::Skill
+        && document
+            .item
+            .external_source
+            .as_ref()
+            .map(|source| source.provider == KnowledgeSourceProvider::Package)
+            .unwrap_or(false)
 }
 
 fn build_index_state(

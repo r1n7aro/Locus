@@ -19,6 +19,7 @@ import { useNotificationStore } from "../stores/notification";
 import { useProjectStore } from "../stores/project";
 import { traceToolBlockLayoutChange } from "../services/layoutDiagnostics";
 import { resolveViewToolOpenId } from "./viewToolCallActions";
+import { resolveSkillLoadedMarkerForToolCall } from "./toolCallSkillLoadedMarker";
 
 import type { ToolCallDisplay, FileDiffPayload } from "../types";
 
@@ -361,6 +362,12 @@ function prettifyKey(key: string): string {
 const argsSummary = computed(() =>
   buildToolCallArgsSummary(props.toolCall.name, props.toolCall.arguments),
 );
+const skillLoadedMarker = computed(() =>
+  resolveSkillLoadedMarkerForToolCall(props.toolCall, props.toolCall.output),
+);
+const skillLoadedLabel = computed(() =>
+  skillLoadedMarker.value ? t("tool.knowledgeRead.skillLoaded", skillLoadedMarker.value.name) : "",
+);
 
 async function reopenGraphView() {
   if (openingGraphView.value) return;
@@ -478,6 +485,7 @@ const highlightedOutput = computed(() => {
         </span>
         <span class="tool-call-name">{{ displayName }}</span>
         <span v-if="argsSummary" class="tool-call-summary">{{ argsSummary }}</span>
+        <span v-if="skillLoadedLabel" class="tool-call-inline-note">· {{ skillLoadedLabel }}</span>
       </button>
       <button
         v-if="showGraphViewOpenButton"
@@ -755,6 +763,17 @@ const highlightedOutput = computed(() => {
   overflow: hidden;
   text-overflow: ellipsis;
   min-width: 0;
+}
+
+.tool-call-inline-note {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 38%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-secondary);
+  font-size: 11px;
 }
 
 .tool-call-action-button {

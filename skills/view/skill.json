@@ -3,7 +3,8 @@
   "id": "view",
   "name": "View",
   "version": "1.0.0",
-  "description": "Create, edit, reload, and open Locus Views for Unity editor interfaces.",
+  "injectMode": "excerpt",
+  "description": "Use when the user asks to build or edit a Locus View (视图/面板): a Vue UI panel, inspector, table, board, or graph editor for the connected Unity project. Ignore Unity project View classes, folders, assets, and camera/runtime views.",
   "argumentHint": "<view requirement>",
   "command": {
     "enabled": true,

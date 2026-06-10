@@ -15,14 +15,16 @@
             },
             "status": {
               "type": "string",
-              "description": "Current status: pending, in_progress, completed, cancelled"
+              "enum": ["pending", "in_progress", "completed", "cancelled"],
+              "description": "Current status"
             },
             "priority": {
               "type": "string",
-              "description": "Priority level: high, medium, low"
+              "enum": ["high", "medium", "low"],
+              "description": "Priority level (default: medium)"
             }
           },
-          "required": ["content", "status", "priority"]
+          "required": ["content", "status"]
         }
       }
     },

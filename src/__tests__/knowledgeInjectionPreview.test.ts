@@ -48,7 +48,7 @@ describe("Knowledge injection preview", () => {
     expect(runtime).toContain('"```tree"');
     expect(runtime).toContain('"### Search"');
     expect(runtime).toContain('"### Maintenance"');
-    expect(runtime).toContain('"### Tools"');
+    expect(runtime).not.toContain("fn build_tools_section");
     expect(runtime).toContain('"### L2 Full Documents');
     expect(runtime).toContain('"## L3 Rules');
     expect(runtime).toContain('knowledge_rule::');

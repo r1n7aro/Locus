@@ -8,8 +8,8 @@
   "unity_asset_search_strategy.md": { "enabled": true, "order": 6 },
   "unity_file_modification_strategy.md": { "enabled": true, "order": 7 },
   "unity_safety_constraints.md": { "enabled": true, "order": 8 },
-  "common_unity_pitfalls.md": { "enabled": true, "order": 9 },
-  "tool_usage_strategy.md": { "enabled": true, "order": 10 },
-  "risk_control.md": { "enabled": true, "order": 11 },
-  "output_principles.md": { "enabled": true, "order": 12 }
+  "tool_usage_strategy.md": { "enabled": true, "order": 9 },
+  "risk_control.md": { "enabled": true, "order": 10 },
+  "output_principles.md": { "enabled": true, "order": 11 },
+  "unity_reference_protocol.md": { "enabled": true, "order": 12 }
 }

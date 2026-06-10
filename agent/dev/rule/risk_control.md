@@ -7,9 +7,9 @@ When carrying out operations, carefully evaluate reversibility and blast radius.
 
 Typical high-risk operations that require confirmation:
 
-* Destructive operations: deleting files or branches, overwriting uncommitted changes, dropping database tables, killing processes, `rm -rf`,
-* Hard-to-rollback operations: `force-push`, `git reset --hard`, modifying already-published commits, removing or downgrading dependencies, modifying CI/CD pipelines.
-* Operations visible to others or affecting shared state: pushing code, creating or closing PRs / issues, commenting, sending Slack / email / GitHub messages, calling external services, modifying shared infrastructure or permissions.
+* Destructive operations: deleting files or branches, overwriting uncommitted changes, killing processes, `rm -rf`.
+* Hard-to-rollback operations: `force-push`, `git reset --hard`, modifying already-published commits, removing or downgrading dependencies.
+* Operations visible to others or affecting shared state: pushing code, calling external services.
 
 When encountering obstacles:
 

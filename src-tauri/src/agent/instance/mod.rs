@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     sync::{
-        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
     },
     time::{Duration, Instant},
 };
@@ -38,8 +38,8 @@ use crate::tool::{ToolExecutionContext, ToolLoadMode, ToolRegistry, ToolResult, 
 const KNOWLEDGE_QUERY_TOOL_TIMEOUT: Duration = Duration::from_secs(45);
 
 use backend::{
-    LlmCallResult, MAX_TOOL_ITERATIONS, is_prompt_too_long_error, is_retryable_llm_error,
-    model_context_limit, normalize_tool_args, session_unity_state,
+    is_prompt_too_long_error, is_retryable_llm_error, model_context_limit, normalize_tool_args,
+    session_unity_state, LlmCallResult, MAX_TOOL_ITERATIONS,
 };
 use prompt_context::{
     detect_input_system, detect_render_pipeline, parse_physics_config, parse_tag_manager,
@@ -1468,6 +1468,7 @@ struct PromptKnowledgeItem {
 #[derive(Debug, Default, Clone)]
 struct PromptTreeNode {
     desc: Option<String>,
+    label_suffix: Option<String>,
     dirs: BTreeMap<String, PromptTreeNode>,
     notes: Vec<String>,
     files: Vec<PromptTreeFile>,
@@ -1491,7 +1492,11 @@ fn clip_single_line(value: &str, max_chars: usize) -> String {
 }
 
 fn pluralize_files(count: usize) -> &'static str {
-    if count == 1 { "file" } else { "files" }
+    if count == 1 {
+        "file"
+    } else {
+        "files"
+    }
 }
 
 fn prompt_flattened_skill_file_name(path: &str) -> String {
@@ -1612,6 +1617,22 @@ fn prompt_hidden_skill_root_parts(item: &PromptKnowledgeItem) -> Option<Vec<Stri
     }
 }
 
+fn prompt_skill_package_root_directory_parts(item: &PromptKnowledgeItem) -> Option<Vec<String>> {
+    if item.doc_type != crate::knowledge_store::KnowledgeType::Skill {
+        return None;
+    }
+
+    let parts = prompt_path_parts(&item.path);
+    let is_root_skill_doc = parts
+        .last()
+        .is_some_and(|name| name.eq_ignore_ascii_case("SKILL.md"));
+    if is_root_skill_doc && parts.len() > 1 {
+        Some(parts[..parts.len() - 1].to_vec())
+    } else {
+        None
+    }
+}
+
 fn prompt_hidden_parent_parts_for(
     parts: &[String],
     hidden_roots: &[Vec<String>],
@@ -1705,16 +1726,22 @@ fn insert_prompt_tree_hidden_at(node: &mut PromptTreeNode, parent_parts: &[Strin
     insert_prompt_tree_hidden_at(child, &parent_parts[1..]);
 }
 
-fn insert_prompt_tree_directory(node: &mut PromptTreeNode, parts: &[String], desc: Option<&str>) {
+fn insert_prompt_tree_directory(
+    node: &mut PromptTreeNode,
+    parts: &[String],
+    desc: Option<&str>,
+    label_suffix: Option<&str>,
+) {
     if parts.is_empty() {
         return;
     }
     let child = node.dirs.entry(parts[0].clone()).or_default();
     if parts.len() == 1 {
         child.desc = desc.map(str::to_string);
+        child.label_suffix = label_suffix.map(str::to_string);
         return;
     }
-    insert_prompt_tree_directory(child, &parts[1..], desc);
+    insert_prompt_tree_directory(child, &parts[1..], desc, label_suffix);
 }
 
 fn insert_prompt_tree_note(node: &mut PromptTreeNode, parts: &[String], note: &str) {
@@ -1768,10 +1795,27 @@ fn build_prompt_tree(
                 continue;
             }
             let desc = prompt_directory_desc(directory);
-            insert_prompt_tree_directory(&mut root, &parts, desc.as_deref());
+            insert_prompt_tree_directory(&mut root, &parts, desc.as_deref(), None);
         }
     }
     for item in items {
+        if !flatten_skill {
+            if let Some(package_parts) = prompt_skill_package_root_directory_parts(item) {
+                if prompt_item_is_structure_injected(item)
+                    && prompt_hidden_parent_parts_for(&package_parts, &hidden_roots).is_none()
+                {
+                    let desc = prompt_file_desc(item);
+                    insert_prompt_tree_directory(
+                        &mut root,
+                        &package_parts,
+                        Some(&desc),
+                        Some("[package]"),
+                    );
+                }
+                continue;
+            }
+        }
+
         let file_name =
             if flatten_skill && item.doc_type == crate::knowledge_store::KnowledgeType::Skill {
                 prompt_flattened_skill_file_name(&item.path)
@@ -1810,10 +1854,15 @@ fn render_tree_lines(
     let mut entries: Vec<(String, Vec<String>)> = Vec::new();
 
     for (dir_name, child) in &node.dirs {
+        let suffix = child
+            .label_suffix
+            .as_deref()
+            .map(|value| format!(" {}", value))
+            .unwrap_or_default();
         let label = if let Some(desc) = child.desc.as_deref() {
-            format!("{}/ :: {}", dir_name, desc)
+            format!("{}/{} :: {}", dir_name, suffix, desc)
         } else {
-            format!("{}/", dir_name)
+            format!("{}/{}", dir_name, suffix)
         };
         entries.push((
             label,
@@ -1954,6 +2003,7 @@ fn build_structure_section(
             Some(
                 "Unity official reference library. Keep the always-on prompt compact here and use `knowledge_query` or concrete `reference/unity-official-docs/...` paths when needed.",
             ),
+            None,
         );
         let unity_note = crate::unity_docs::managed_document_count_hint(working_dir)?
             .map(|count| format!("<{} {} managed externally>", count, pluralize_files(count)))
@@ -2036,10 +2086,10 @@ fn build_search_section(semantic_search_enabled: bool) -> String {
         lines.push("1. Start with `knowledge_query` across all roots first; usually leave `pathPrefix` empty on the first search so `design/`, `memory/`, `skill/`, and `reference/` can all match. Put exact terms, titles, paths, identifiers, or short keyword combinations into `lexicalQuery`.");
     }
     lines.extend([
-        "2. Use `knowledge_read` when you know the target document path or need a specific document. For Skill packages, `skill/<package-id>` reads the package root `SKILL.md`.",
+        "2. Use `knowledge_read` when you know the target document path or need a specific document. For `skill/<package-id>/ [package]` structure entries, read `skill/<package-id>` for the root `SKILL.md`.",
         "3. Use `knowledge_list` to browse entries under a type-prefixed directory path prefix such as `design/` or `skill/unity/`.",
-        "4. In user-facing replies, cite knowledge documents with full type-prefixed paths such as `design/core-loop.md`, `memory/project/background.md`, `reference/unity/ugui-layout.md`, and `skill/builtin/profiler.md`.",
-        "5. Cite Skill package documents with the package id under `skill/`, such as `skill/psd-to-ugui/SKILL.md` or `skill/psd-to-ugui/references/details.md`; cite full knowledge paths in user-facing replies.",
+        "4. In user-facing replies, wrap knowledge document references in single backticks with their full type-prefixed paths, such as `design/core-loop.md`, `memory/project/background.md`, `reference/unity/ugui-layout.md`, and `skill/builtin/profiler.md`; the UI cannot recover omitted path segments.",
+        "5. Cite Skill package documents with the package id under `skill/`, such as `skill/psd-to-ugui/SKILL.md` or `skill/psd-to-ugui/references/details.md`.",
     ]);
     lines.join("\n")
 }
@@ -2061,32 +2111,6 @@ fn build_maintenance_section(access_mode: KnowledgeAccessMode) -> String {
         "- Respect existing maintenance rules on any document or folder you maintain.",
     ]
     .join("\n")
-}
-
-fn build_tools_section(access_mode: KnowledgeAccessMode, semantic_search_enabled: bool) -> String {
-    let query_line = if semantic_search_enabled {
-        "- `knowledge_query`: Search knowledge with separate `lexicalQuery` and `semanticQuery` inputs, plus an optional type-prefixed `pathPrefix`."
-    } else {
-        "- `knowledge_query`: Search knowledge with `lexicalQuery` plus an optional type-prefixed `pathPrefix`."
-    };
-    let mut lines = vec![
-        "### Tools",
-        query_line,
-        "- `knowledge_read`: Read a specific document by type-prefixed path. For Skill packages, `skill/<package-id>` reads the package root `SKILL.md` and `skill/<package-id>/docs/file.md` reads package child docs.",
-        "- `knowledge_list`: Browse entries under a type-prefixed directory path prefix.",
-    ];
-    if access_mode == KnowledgeAccessMode::Full {
-        lines.extend([
-            "- `knowledge_edit`: Update an existing document's content sections or replace text inside a section by type-prefixed `.md` path.",
-            "- `knowledge_create`: Create a new non-Skill document or folder at a type-prefixed path. Document paths end with `.md`; directory paths do not. Document creation only accepts initial content.",
-            "- `knowledge_move`: Move a document or folder using type-prefixed paths. Document paths end with `.md`; directory paths do not.",
-            "- `knowledge_delete`: Delete an obsolete document or folder by type-prefixed path. Document paths end with `.md`; directory paths do not.",
-            "- `skill_create`: Create a Skill as `kind: \"md\"` with metadata or `kind: \"package\"` with package metadata. Use `kind: \"package\"` for Skills that require CLI tools, binaries, scripts, Unity C# files, bundled docs, or any package-local dependency environment. Package creation returns `packageRoot` under the Locus app Skill package directory. For packages, omit `packageId` to derive a short kebab-case package id from `name`; provide `packageId` for distributed packages or a specific namespace.",
-            "- `skill_reload`: Load or reload a Skill manifest after edits and return validation errors.",
-            "- `skill_list`: List discoverable project Skills, built-in app Skills, and app Skill packages.",
-        ]);
-    }
-    lines.join("\n")
 }
 
 fn build_l2_full_document_section(
@@ -2756,10 +2780,6 @@ impl AgentInstance {
         let semantic_search_enabled = self.knowledge_semantic_search_enabled();
         sections.push(build_search_section(semantic_search_enabled));
         sections.push(build_maintenance_section(self.knowledge_access_mode));
-        sections.push(build_tools_section(
-            self.knowledge_access_mode,
-            semantic_search_enabled,
-        ));
 
         if _include_memory {
             if let Ok(full_document_section) = build_l2_full_document_section(
@@ -3216,13 +3236,41 @@ impl AgentInstance {
         names
     }
 
-    fn format_lazy_tool_manifest(tool_names: &[String]) -> String {
+    fn summarize_tool_description(description: &str) -> String {
+        const MAX_SUMMARY_CHARS: usize = 160;
+        let first_line = description
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .unwrap_or_default()
+            .trim_start_matches("- ");
+        if first_line.chars().count() <= MAX_SUMMARY_CHARS {
+            return first_line.to_string();
+        }
+        if let Some(period) = first_line.find(". ") {
+            let candidate = &first_line[..=period];
+            if candidate.chars().count() <= MAX_SUMMARY_CHARS {
+                return candidate.to_string();
+            }
+        }
+        let mut truncated: String = first_line.chars().take(MAX_SUMMARY_CHARS).collect();
+        truncated.push('…');
+        truncated
+    }
+
+    fn format_lazy_tool_manifest(entries: &[(String, String)]) -> String {
         let mut lines = vec![
             "## Lazy Loaded Tools".to_string(),
             String::new(),
             "These tool schemas are available by name through `tool_load`:".to_string(),
         ];
-        lines.extend(tool_names.iter().map(|name| format!("- `{}`", name)));
+        lines.extend(entries.iter().map(|(name, summary)| {
+            if summary.is_empty() {
+                format!("- `{}`", name)
+            } else {
+                format!("- `{}` — {}", name, summary)
+            }
+        }));
         lines.join("\n")
     }
 
@@ -3231,7 +3279,18 @@ impl AgentInstance {
         if tool_names.is_empty() {
             return None;
         }
-        Some(Self::format_lazy_tool_manifest(&tool_names))
+        let entries: Vec<(String, String)> = tool_names
+            .into_iter()
+            .map(|name| {
+                let summary = self
+                    .tool_registry
+                    .tool_description(&name)
+                    .map(|(description, _)| Self::summarize_tool_description(&description))
+                    .unwrap_or_default();
+                (name, summary)
+            })
+            .collect();
+        Some(Self::format_lazy_tool_manifest(&entries))
     }
 
     fn normalize_tool_call_names(&self, tool_calls: &mut [ToolCallInfo]) {
@@ -3560,15 +3619,20 @@ impl AgentInstance {
 
         // ── Unity-specific data ──────────────────────────────────
         let unity_started_at = Instant::now();
-        if unity_version.is_some() {
-            let (connected, status, active_scene) =
-                crate::unity_bridge::query_unity_status(&self.working_dir).await;
-            eprintln!(
-                "[Agent {}] Unity status: connected={}, status={}, scene={:?}, cwd={}",
-                self.id, connected, status, active_scene, self.working_dir
-            );
-            unity_status = crate::unity_bridge::format_editor_status_for_prompt(status).to_string();
-            unity_active_scene = active_scene.unwrap_or_else(|| "unknown".to_string());
+        if unity_version.is_some() && self.def.env_template.contains("{{#unity}}") {
+            // Editor status placeholders are optional: agents without them get
+            // status through the per-run conversation announcements instead.
+            if self.def.env_template.contains("<unity_status>") {
+                let (connected, status, active_scene) =
+                    crate::unity_bridge::query_unity_status(&self.working_dir).await;
+                eprintln!(
+                    "[Agent {}] Unity status: connected={}, status={}, scene={:?}, cwd={}",
+                    self.id, connected, status, active_scene, self.working_dir
+                );
+                unity_status =
+                    crate::unity_bridge::format_editor_status_for_prompt(status).to_string();
+                unity_active_scene = active_scene.unwrap_or_else(|| "unknown".to_string());
+            }
 
             let project_path = std::path::Path::new(&self.working_dir);
             let (tags, layers) = parse_tag_manager(project_path);
@@ -3630,29 +3694,35 @@ impl AgentInstance {
         let git_started_at = Instant::now();
         let mut git_available = false;
         let mut git_context_included = false;
-        if has_working_dir {
-            use crate::vcs::VcsProvider;
+        if has_working_dir && env.contains("{{#git}}") {
             use crate::vcs::git::GitProvider;
+            use crate::vcs::VcsProvider;
             let is_git = GitProvider.is_available(&self.working_dir).await;
             git_available = is_git;
             if is_git {
-                let branch = GitProvider::current_branch(&self.working_dir)
-                    .await
-                    .unwrap_or_default();
-                let commits = GitProvider::recent_commits(&self.working_dir, 10)
-                    .await
-                    .unwrap_or_default();
+                git_context_included = true;
+                env = env.replace("{{#git}}", "");
+                env = env.replace("{{/git}}", "");
 
-                if !branch.is_empty() || !commits.is_empty() {
-                    git_context_included = true;
-                    env = env.replace("{{#git}}", "");
-                    env = env.replace("{{/git}}", "");
+                if env.contains("<git_branch>") {
+                    let branch = GitProvider::current_branch(&self.working_dir)
+                        .await
+                        .unwrap_or_default();
                     let branch_display = if branch.is_empty() {
                         "(detached HEAD)".to_string()
                     } else {
                         branch
                     };
                     env = env.replace("<git_branch>", &branch_display);
+                }
+
+                // Volatile git data is only queried when the template injects
+                // it; templates without these placeholders direct the model to
+                // run git commands instead, keeping the env prompt stable.
+                if env.contains("<git_recent_commits>") {
+                    let commits = GitProvider::recent_commits(&self.working_dir, 10)
+                        .await
+                        .unwrap_or_default();
                     env = env.replace(
                         "<git_recent_commits>",
                         if commits.is_empty() {
@@ -3661,7 +3731,9 @@ impl AgentInstance {
                             &commits
                         },
                     );
+                }
 
+                if env.contains("{{#git_uncommitted}}") {
                     let stat = GitProvider::uncommitted_summary(&self.working_dir)
                         .await
                         .unwrap_or_default();
@@ -3672,8 +3744,6 @@ impl AgentInstance {
                         env = env.replace("{{/git_uncommitted}}", "");
                         env = env.replace("<git_uncommitted_stat>", &stat);
                     }
-                } else {
-                    remove_block(&mut env, "git");
                 }
             } else {
                 remove_block(&mut env, "git");
@@ -3762,29 +3832,24 @@ impl AgentInstance {
                 false,
             )
             .unwrap_or_default();
-            let mut rules_content = String::new();
+            let mut rule_sections = Vec::new();
 
-            for (i, entry) in rule_entries
-                .iter()
-                .filter(|entry| entry.enabled)
-                .enumerate()
-            {
+            for entry in rule_entries.iter().filter(|entry| entry.enabled) {
                 if let Ok(content) = std::fs::read_to_string(&entry.path) {
                     let content = content.trim();
                     if !content.is_empty() {
-                        if !rules_content.is_empty() {
-                            rules_content.push('\n');
-                        }
-                        rules_content.push_str(&format!("{}. {}\n", i + 1, content));
+                        // Rule files use their own top heading levels; remap
+                        // them below the `## Rules` section heading.
+                        rule_sections.push(remap_document_body_headings(content, 3));
                     }
                 }
             }
 
             let mut sections = Vec::new();
-            if !rules_content.is_empty() {
+            if !rule_sections.is_empty() {
                 sections.push(format!(
-                    "## Rules (IMPORTANT — follow these rules strictly)\n{}",
-                    rules_content
+                    "## Rules (IMPORTANT — follow these rules strictly)\n\n{}",
+                    rule_sections.join("\n\n")
                 ));
             }
             if has_working_dir && self.knowledge_access_mode.allows_context() {
@@ -4728,6 +4793,19 @@ impl AgentInstance {
             return Ok(allowed);
         }
         Ok(crate::knowledge_store::list_item_allows_model_recall(item))
+    }
+
+    fn knowledge_list_item_is_skill_package_document(
+        item: &crate::knowledge_store::KnowledgeListItem,
+    ) -> bool {
+        item.doc_type == crate::knowledge_store::KnowledgeType::Skill
+            && item
+                .external_source
+                .as_ref()
+                .map(|source| {
+                    source.provider == crate::knowledge_store::KnowledgeSourceProvider::Package
+                })
+                .unwrap_or(false)
     }
 
     fn sanitize_knowledge_search_hits(
@@ -6720,24 +6798,33 @@ impl AgentInstance {
             let mut state_map = session_unity_state().lock().await;
             let prev = state_map.get(&self.session_id);
 
-            if let Some((prev_status, prev_scene)) = prev {
-                if prev_status != &current_state.0 || prev_scene != &current_state.1 {
-                    let status_text = crate::unity_bridge::format_editor_status_for_event(status);
-                    let scene_info = active_scene
-                        .as_deref()
-                        .map(|s| format!(", Active Scene: {}", s))
-                        .unwrap_or_default();
-                    actual_user_text = format!(
-                        "[Unity Editor Status Changed] Unity Editor Status: {}{}\n\n{}",
-                        status_text, scene_info, user_text
-                    );
+            // The env prompt no longer carries editor status, so the first run
+            // of a session (or the first run after a relaunch) announces the
+            // current state; later runs only announce changes.
+            let announcement_marker = match prev {
+                None => Some("[Unity Editor Status]"),
+                Some((prev_status, prev_scene))
+                    if prev_status != &current_state.0 || prev_scene != &current_state.1 =>
+                {
                     eprintln!(
                         "[Agent {}] Unity state changed: {:?} -> {:?}",
                         self.id, (prev_status, prev_scene), &current_state
                     );
-                } else {
-                    actual_user_text = user_text.to_string();
+                    Some("[Unity Editor Status Changed]")
                 }
+                Some(_) => None,
+            };
+
+            if let Some(marker) = announcement_marker {
+                let status_text = crate::unity_bridge::format_editor_status_for_event(status);
+                let scene_info = active_scene
+                    .as_deref()
+                    .map(|s| format!(", Active Scene: {}", s))
+                    .unwrap_or_default();
+                actual_user_text = format!(
+                    "{} Unity Editor Status: {}{}\n\n{}",
+                    marker, status_text, scene_info, user_text
+                );
             } else {
                 actual_user_text = user_text.to_string();
             }
@@ -9519,12 +9606,20 @@ impl AgentInstance {
                     });
                 }
                 let include_hidden = parsed.include_hidden.unwrap_or(false);
+                let include_package_documents = resolved_type
+                    == Some(crate::knowledge_store::KnowledgeType::Skill)
+                    && crate::commands::skill_package_path_prefix_targets_package_sync(
+                        &self.working_dir,
+                        resolved_prefix.as_deref(),
+                    );
                 items.retain(|item| {
                     Self::knowledge_list_item_model_recall_allowed(&self.working_dir, item)
                         .unwrap_or(false)
                         && (include_hidden
                             || item.inject_mode
-                                != crate::knowledge_store::KnowledgeInjectMode::None)
+                                != crate::knowledge_store::KnowledgeInjectMode::None
+                            || (include_package_documents
+                                && Self::knowledge_list_item_is_skill_package_document(item)))
                 });
                 Self::prefix_knowledge_list_item_paths(&mut items);
                 let items = Self::sanitize_knowledge_list_items(items);
@@ -11127,8 +11222,8 @@ impl AgentInstance {
         app_handle: &AppHandle,
         args: &serde_json::Value,
     ) -> ToolResult {
+        use crate::asset_db::types::{guid_to_hex, AssetKind};
         use crate::asset_db::AssetDbState;
-        use crate::asset_db::types::{AssetKind, guid_to_hex};
 
         let asset_path = match args.get("asset_path").and_then(|v| v.as_str()) {
             Some(p) => p.to_string(),
@@ -11197,7 +11292,11 @@ impl AgentInstance {
                         }
                     }
                 }
-                if kinds.is_empty() { None } else { Some(kinds) }
+                if kinds.is_empty() {
+                    None
+                } else {
+                    Some(kinds)
+                }
             }
             None => None,
         };
@@ -13033,13 +13132,13 @@ impl AgentInstance {
 #[cfg(test)]
 mod tests {
     use super::{
+        assess_knowledge_tool_confirmation, assess_knowledge_tool_confirmation_decision,
+        build_l2_full_document_section, build_l3_rule_section, build_prompt_tree,
+        build_structure_section, finalize_tool_call_record, render_tree_lines, utf8_prefix_chars,
         AgentInstance, AgentKnowledgeDocumentContent, AgentKnowledgeDocumentContentPatch,
         AgentKnowledgeListItem, AgentKnowledgeMutationResponse, AgentKnowledgeReadResponse,
         AgentKnowledgeSearchHit, ExecutedToolResult, InjectedPromptItem, KnowledgeAccessMode,
         ParentToolCall, PromptKnowledgeItem, RawContextStore, ToolConfirmDecision, ToolRunOutcome,
-        assess_knowledge_tool_confirmation, assess_knowledge_tool_confirmation_decision,
-        build_l2_full_document_section, build_l3_rule_section, build_prompt_tree,
-        build_structure_section, finalize_tool_call_record, render_tree_lines, utf8_prefix_chars,
     };
     use crate::agent::definition::{AgentDef, AgentDefRegistry};
     use crate::commands::{
@@ -13047,9 +13146,9 @@ mod tests {
         ToolCallOutcome,
     };
     use crate::knowledge_store::{
-        KnowledgeDocument, KnowledgeInjectMode, KnowledgeReadResponse, KnowledgeReadResult,
-        KnowledgeSearchMatchSection, KnowledgeTargetKind, KnowledgeType, create_directory,
-        default_directory_config_for_type, save_document, update_directory_config,
+        create_directory, default_directory_config_for_type, save_document,
+        update_directory_config, KnowledgeDocument, KnowledgeInjectMode, KnowledgeReadResponse,
+        KnowledgeReadResult, KnowledgeSearchMatchSection, KnowledgeTargetKind, KnowledgeType,
     };
     use crate::session::models::{ToolCallInfo, UserIntentPayload, UserIntentSkill};
     use crate::tool::{ToolDef, ToolRegistry, ToolResult};
@@ -13409,51 +13508,41 @@ PrefabInstance:
 
     #[test]
     fn validate_tool_paths_when_workspace_is_missing() {
-        assert!(
-            AgentInstance::validate_tool_path_requirements(
-                "",
-                "bash",
-                &json!({"command":"pwd"}),
-                false
-            )
-            .is_some()
-        );
-        assert!(
-            AgentInstance::validate_tool_path_requirements(
-                "",
-                "bash",
-                &json!({"command":"pwd","workdir":"C:/Temp"}),
-                false
-            )
-            .is_none()
-        );
-        assert!(
-            AgentInstance::validate_tool_path_requirements(
-                "",
-                "read",
-                &json!({"filePath":"relative.txt"}),
-                false
-            )
-            .is_some()
-        );
-        assert!(
-            AgentInstance::validate_tool_path_requirements(
-                "",
-                "read",
-                &json!({"filePath":"C:/Temp/file.txt"}),
-                false
-            )
-            .is_none()
-        );
-        assert!(
-            AgentInstance::validate_tool_path_requirements(
-                "",
-                "knowledge_query",
-                &json!({"query":"player"}),
-                false
-            )
-            .is_some()
-        );
+        assert!(AgentInstance::validate_tool_path_requirements(
+            "",
+            "bash",
+            &json!({"command":"pwd"}),
+            false
+        )
+        .is_some());
+        assert!(AgentInstance::validate_tool_path_requirements(
+            "",
+            "bash",
+            &json!({"command":"pwd","workdir":"C:/Temp"}),
+            false
+        )
+        .is_none());
+        assert!(AgentInstance::validate_tool_path_requirements(
+            "",
+            "read",
+            &json!({"filePath":"relative.txt"}),
+            false
+        )
+        .is_some());
+        assert!(AgentInstance::validate_tool_path_requirements(
+            "",
+            "read",
+            &json!({"filePath":"C:/Temp/file.txt"}),
+            false
+        )
+        .is_none());
+        assert!(AgentInstance::validate_tool_path_requirements(
+            "",
+            "knowledge_query",
+            &json!({"query":"player"}),
+            false
+        )
+        .is_some());
     }
 
     #[test]
@@ -13471,24 +13560,20 @@ PrefabInstance:
         let outside_file_str = outside_file.to_string_lossy().to_string();
         let outside_dir_str = outside.to_string_lossy().to_string();
 
-        assert!(
-            AgentInstance::validate_tool_path_requirements(
-                &workspace_str,
-                "read",
-                &json!({"filePath":outside_file_str}),
-                false
-            )
-            .is_none()
-        );
-        assert!(
-            AgentInstance::validate_tool_path_requirements(
-                &workspace_str,
-                "list",
-                &json!({"path":outside_dir_str}),
-                false
-            )
-            .is_none()
-        );
+        assert!(AgentInstance::validate_tool_path_requirements(
+            &workspace_str,
+            "read",
+            &json!({"filePath":outside_file_str}),
+            false
+        )
+        .is_none());
+        assert!(AgentInstance::validate_tool_path_requirements(
+            &workspace_str,
+            "list",
+            &json!({"path":outside_dir_str}),
+            false
+        )
+        .is_none());
     }
 
     #[test]
@@ -13509,61 +13594,49 @@ PrefabInstance:
         let outside_file_str = outside_file.to_string_lossy().to_string();
         let outside_dir_str = outside.to_string_lossy().to_string();
 
-        assert!(
-            AgentInstance::validate_tool_path_requirements(
-                &workspace_str,
-                "read",
-                &json!({"filePath":"inside.txt"}),
-                true
-            )
-            .is_none()
-        );
-        assert!(
-            AgentInstance::validate_tool_path_requirements(
-                &workspace_str,
-                "write",
-                &json!({"filePath":"nested/new.txt","content":"ok"}),
-                true
-            )
-            .is_none()
-        );
+        assert!(AgentInstance::validate_tool_path_requirements(
+            &workspace_str,
+            "read",
+            &json!({"filePath":"inside.txt"}),
+            true
+        )
+        .is_none());
+        assert!(AgentInstance::validate_tool_path_requirements(
+            &workspace_str,
+            "write",
+            &json!({"filePath":"nested/new.txt","content":"ok"}),
+            true
+        )
+        .is_none());
 
-        assert!(
-            AgentInstance::validate_tool_path_requirements(
-                &workspace_str,
-                "read",
-                &json!({"filePath":outside_file_str}),
-                true
-            )
-            .is_some()
-        );
-        assert!(
-            AgentInstance::validate_tool_path_requirements(
-                &workspace_str,
-                "edit",
-                &json!({"filePath":"../outside/outside.txt","oldString":"nope","newString":"ok"}),
-                true
-            )
-            .is_some()
-        );
-        assert!(
-            AgentInstance::validate_tool_path_requirements(
-                &workspace_str,
-                "list",
-                &json!({"path":"../outside"}),
-                true
-            )
-            .is_some()
-        );
-        assert!(
-            AgentInstance::validate_tool_path_requirements(
-                &workspace_str,
-                "grep",
-                &json!({"pattern":"nope","path":outside_dir_str}),
-                true
-            )
-            .is_some()
-        );
+        assert!(AgentInstance::validate_tool_path_requirements(
+            &workspace_str,
+            "read",
+            &json!({"filePath":outside_file_str}),
+            true
+        )
+        .is_some());
+        assert!(AgentInstance::validate_tool_path_requirements(
+            &workspace_str,
+            "edit",
+            &json!({"filePath":"../outside/outside.txt","oldString":"nope","newString":"ok"}),
+            true
+        )
+        .is_some());
+        assert!(AgentInstance::validate_tool_path_requirements(
+            &workspace_str,
+            "list",
+            &json!({"path":"../outside"}),
+            true
+        )
+        .is_some());
+        assert!(AgentInstance::validate_tool_path_requirements(
+            &workspace_str,
+            "grep",
+            &json!({"pattern":"nope","path":outside_dir_str}),
+            true
+        )
+        .is_some());
     }
 
     #[test]
@@ -13580,24 +13653,20 @@ PrefabInstance:
         let temp_file_str = temp_file.to_string_lossy().to_string();
         let temp_dir_str = temp_dir.to_string_lossy().to_string();
 
-        assert!(
-            AgentInstance::validate_tool_path_requirements(
-                &workspace_str,
-                "write",
-                &json!({"filePath":temp_file_str,"content":"ok"}),
-                true
-            )
-            .is_none()
-        );
-        assert!(
-            AgentInstance::validate_tool_path_requirements(
-                &workspace_str,
-                "list",
-                &json!({"path":temp_dir_str}),
-                true
-            )
-            .is_none()
-        );
+        assert!(AgentInstance::validate_tool_path_requirements(
+            &workspace_str,
+            "write",
+            &json!({"filePath":temp_file_str,"content":"ok"}),
+            true
+        )
+        .is_none());
+        assert!(AgentInstance::validate_tool_path_requirements(
+            &workspace_str,
+            "list",
+            &json!({"path":temp_dir_str}),
+            true
+        )
+        .is_none());
     }
 
     #[cfg(windows)]
@@ -13616,15 +13685,13 @@ PrefabInstance:
             })
             .expect("windows drive prefix");
 
-        assert!(
-            AgentInstance::validate_tool_path_requirements(
-                &workspace_str,
-                "list",
-                &json!({"path":drive_relative}),
-                true
-            )
-            .is_some()
-        );
+        assert!(AgentInstance::validate_tool_path_requirements(
+            &workspace_str,
+            "list",
+            &json!({"path":drive_relative}),
+            true
+        )
+        .is_some());
     }
 
     #[test]
@@ -14205,11 +14272,9 @@ PrefabInstance:
         assert!(!request_tool_names.contains(&"web_fetch".to_string()));
 
         let api_tools = instance.build_api_tools(&request_tool_names).await;
-        assert!(
-            api_tools
-                .iter()
-                .all(|tool| tool["function"].get("defer_loading").is_none())
-        );
+        assert!(api_tools
+            .iter()
+            .all(|tool| tool["function"].get("defer_loading").is_none()));
 
         let manifest = instance
             .lazy_tool_manifest_prompt()
@@ -14366,6 +14431,12 @@ PrefabInstance:
         assert!(parts.env_prompt.contains("- `graph_view`"));
         assert!(parts.env_prompt.contains("- `web_fetch`"));
         assert!(!parts.env_prompt.contains("- `read`"));
+        assert!(
+            parts
+                .env_prompt
+                .contains("- `web_fetch` — Fetch a URL for agent-readable content."),
+            "lazy manifest entries should carry a one-line summary"
+        );
 
         let items = instance.list_injected_prompt_items().await;
         let manifest = items
@@ -14530,11 +14601,9 @@ PrefabInstance:
             KnowledgeAccessMode::Disabled,
         );
         let disabled_tools = disabled.allowed_tool_set().await;
-        assert!(
-            disabled_tools
-                .iter()
-                .all(|name| !AgentInstance::is_knowledge_tool_name(name))
-        );
+        assert!(disabled_tools
+            .iter()
+            .all(|name| !AgentInstance::is_knowledge_tool_name(name)));
 
         let read_only = test_agent_instance_with_tools_and_mode(
             temp.path().to_string_lossy().to_string(),
@@ -14633,11 +14702,9 @@ PrefabInstance:
 
         let items = instance.list_injected_prompt_items().await;
         assert!(items.iter().all(|item| item.id != "knowledge_context"));
-        assert!(
-            items
-                .iter()
-                .all(|item| !item.id.starts_with("knowledge_rule::"))
-        );
+        assert!(items
+            .iter()
+            .all(|item| !item.id.starts_with("knowledge_rule::")));
     }
 
     #[tokio::test]
@@ -14975,18 +15042,14 @@ Search, install, audit, and export a plugin.
                 agent.tool_registry.default_load_mode(tool_name),
                 crate::tool::ToolLoadMode::Skill
             );
-            assert!(
-                !agent
-                    .build_request_tool_names()
-                    .await
-                    .contains(&tool_name.to_string())
-            );
-            assert!(
-                !agent
-                    .lazy_tool_manifest_names()
-                    .await
-                    .contains(&tool_name.to_string())
-            );
+            assert!(!agent
+                .build_request_tool_names()
+                .await
+                .contains(&tool_name.to_string()));
+            assert!(!agent
+                .lazy_tool_manifest_names()
+                .await
+                .contains(&tool_name.to_string()));
         }
 
         let inactive_load = agent
@@ -15182,14 +15245,12 @@ Search, install, audit, and export a plugin.
             );
         }
 
-        assert!(
-            agent
-                .validate_knowledge_tool_routing(
-                    "bash",
-                    &json!({"workdir":".","command":"git clean -fd Locus/knowledge/design"})
-                )
-                .is_some()
-        );
+        assert!(agent
+            .validate_knowledge_tool_routing(
+                "bash",
+                &json!({"workdir":".","command":"git clean -fd Locus/knowledge/design"})
+            )
+            .is_some());
         assert!(agent
             .validate_knowledge_tool_routing(
                 "bash",
@@ -15284,12 +15345,10 @@ Search, install, audit, and export a plugin.
         );
         assert_eq!(preview.directory_path, "design/combat");
         assert_eq!(preview.path, "design/combat/core-loop.md");
-        assert!(
-            preview
-                .document_after_text
-                .as_deref()
-                .is_some_and(|text| text.contains("## Content"))
-        );
+        assert!(preview
+            .document_after_text
+            .as_deref()
+            .is_some_and(|text| text.contains("## Content")));
     }
 
     #[test]
@@ -15414,16 +15473,12 @@ Search, install, audit, and export a plugin.
         assert_eq!(preview.operation, KnowledgeToolConfirmOperation::Move);
         assert_eq!(preview.path, "design/combat");
         assert_eq!(preview.new_path.as_deref(), Some("design/gameplay/combat"));
-        assert!(
-            preview
-                .structure_before_paths
-                .contains(&"design/combat/core-loop.md".to_string())
-        );
-        assert!(
-            preview
-                .structure_after_paths
-                .contains(&"design/gameplay/combat/core-loop.md".to_string())
-        );
+        assert!(preview
+            .structure_before_paths
+            .contains(&"design/combat/core-loop.md".to_string()));
+        assert!(preview
+            .structure_after_paths
+            .contains(&"design/gameplay/combat/core-loop.md".to_string()));
     }
 
     #[test]
@@ -15574,11 +15629,8 @@ Search, install, audit, and export a plugin.
 
         let structure = build_structure_section(&working_dir, None, KnowledgeAccessMode::Full)
             .expect("build structure");
-        assert!(
-            structure.contains(
-                "combat/ :: Combat systems summary | - Keep verified combat structure only"
-            )
-        );
+        assert!(structure
+            .contains("combat/ :: Combat systems summary | - Keep verified combat structure only"));
     }
 
     #[test]
@@ -15973,6 +16025,28 @@ Search, install, audit, and export a plugin.
     }
 
     #[test]
+    fn structure_section_promotes_skill_package_root_summary_to_package_dir() {
+        let items = vec![PromptKnowledgeItem {
+            doc_type: KnowledgeType::Skill,
+            path: "view/SKILL.md".to_string(),
+            title: "View".to_string(),
+            inject_mode: KnowledgeInjectMode::Excerpt,
+            summary: Some("Use for explicit Locus View UI package requests.".to_string()),
+            body_excerpt: None,
+        }];
+
+        let tree = build_prompt_tree(&items, &[], false);
+        let rendered = render_tree_lines(&tree, true, 3).join("\n");
+
+        assert!(
+            rendered.contains("view/ [package] :: Use for explicit Locus View UI package requests."),
+            "{}",
+            rendered
+        );
+        assert!(!rendered.contains("SKILL.md ::"), "{}", rendered);
+    }
+
+    #[test]
     fn structure_section_shows_builtin_memory_directory_rules_for_path_injection() {
         let temp = tempdir().expect("temp dir");
         let working_dir = temp.path().to_string_lossy().to_string();
@@ -16166,10 +16240,8 @@ Search, install, audit, and export a plugin.
         assert!(rules.contains("## L3 Rules"));
         assert!(rules.contains("### User Preferences (memory/user-preference.md)"));
         assert!(rules.contains("Maintenance Rules:"));
-        assert!(
-            rules
-                .contains("- Record only long-term user preferences that stay stable across tasks")
-        );
+        assert!(rules
+            .contains("- Record only long-term user preferences that stay stable across tasks"));
         assert!(rules.contains(
             "- Keep each entry short and limited to stable preferences or hard constraints"
         ));
@@ -16280,48 +16352,39 @@ Search, install, audit, and export a plugin.
 
         assert_eq!(prompt_parts.base_prompt, "You are a test agent.");
         assert!(prompt_parts.knowledge_prompt.contains("## Knowledge"));
-        assert!(
-            prompt_parts
-                .knowledge_prompt
-                .contains("### L2 Full Documents")
-        );
-        assert!(
-            prompt_parts
-                .knowledge_prompt
-                .contains("#### memory/project-mistake-note.md")
-        );
-        assert!(
-            prompt_parts
-                .knowledge_prompt
-                .contains("`skill/psd-to-ugui/references/details.md`")
-        );
-        assert!(
-            prompt_parts
-                .knowledge_prompt
-                .contains("`reference/unity/ugui-layout.md`")
-        );
+        assert!(prompt_parts
+            .knowledge_prompt
+            .contains("### L2 Full Documents"));
+        assert!(prompt_parts
+            .knowledge_prompt
+            .contains("#### memory/project-mistake-note.md"));
+        assert!(prompt_parts
+            .knowledge_prompt
+            .contains("`skill/psd-to-ugui/references/details.md`"));
+        assert!(prompt_parts
+            .knowledge_prompt
+            .contains("`reference/unity/ugui-layout.md`"));
         let search_index = prompt_parts
             .knowledge_prompt
             .find("### Search")
             .expect("search section");
-        let tools_index = prompt_parts
-            .knowledge_prompt
-            .find("### Tools")
-            .expect("tools section");
         let memory_index = prompt_parts
             .knowledge_prompt
             .find("### L2 Full Documents")
             .expect("l2 full document section");
-        assert!(search_index < tools_index);
-        assert!(tools_index < memory_index);
+        assert!(search_index < memory_index);
+        // Knowledge tool usage lives in the tool schemas and the lazy tool
+        // manifest; the knowledge block must not duplicate it.
+        assert!(!prompt_parts.knowledge_prompt.contains("### Tools"));
+        assert!(!prompt_parts.knowledge_prompt.contains("`skill_create`:"));
+        assert!(!prompt_parts.knowledge_prompt.contains("`skill_reload`:"));
+        assert!(!prompt_parts.knowledge_prompt.contains("`skill_list`:"));
         assert!(!prompt_parts.knowledge_prompt.contains("## L3 Rules"));
         assert!(!prompt_parts.knowledge_prompt.contains("Full Document:"));
         assert!(prompt_parts.rules_prompt.contains("## L3 Rules"));
-        assert!(
-            prompt_parts
-                .rules_prompt
-                .contains("### User Preferences (memory/user-preference.md)")
-        );
+        assert!(prompt_parts
+            .rules_prompt
+            .contains("### User Preferences (memory/user-preference.md)"));
         assert!(prompt_parts.env_prompt.contains("Working directory:"));
         assert!(!prompt_parts.env_prompt.contains("## Knowledge"));
         assert!(!prompt_parts.env_prompt.contains("project-mistake-note.md"));
@@ -16481,6 +16544,58 @@ Search, install, audit, and export a plugin.
 
         assert!(!result.is_error);
         assert_eq!(result.output, "design/project-overview.md");
+    }
+
+    #[test]
+    fn execute_knowledge_list_shows_package_docs_for_single_package_prefix() {
+        let temp = tempdir().expect("temp dir");
+        let working_dir = temp.path().to_string_lossy().to_string();
+        let plugin_root = temp
+            .path()
+            .join(crate::plugin::PROJECT_PLUGINS_RELATIVE)
+            .join("com.example.view-plugin");
+        let skill_root = plugin_root.join("skills").join("view");
+        std::fs::create_dir_all(&skill_root).expect("create skill package");
+        std::fs::write(
+            plugin_root.join(crate::plugin::PLUGIN_MANIFEST_FILE_NAME),
+            r#"{
+  "schemaVersion": 1,
+  "id": "com.example.view-plugin",
+  "name": "View Plugin",
+  "version": "1.0.0",
+  "components": {
+    "skills": [{ "id": "view", "path": "skills/view" }]
+  }
+}
+"#,
+        )
+        .expect("write plugin manifest");
+        std::fs::write(
+            skill_root.join("skill.json"),
+            r#"{
+  "schema": "locus.skill.v1",
+  "id": "view",
+  "version": "1.0.0",
+  "name": "View",
+  "injectMode": "excerpt",
+  "description": "Use explicit Locus View UI package requests."
+}
+"#,
+        )
+        .expect("write skill manifest");
+        std::fs::write(skill_root.join("SKILL.md"), "# View\n").expect("write skill root");
+        std::fs::write(skill_root.join("debug.md"), "# Debug\n").expect("write debug doc");
+        std::fs::write(skill_root.join("runtime-api.md"), "# Runtime API\n")
+            .expect("write runtime doc");
+
+        let agent = test_agent_instance(working_dir);
+        let result = agent.execute_knowledge_list(&json!({"pathPrefix":"skill/view/"}));
+
+        assert!(!result.is_error);
+        assert_eq!(
+            result.output,
+            "skill/view/SKILL.md\nskill/view/debug.md\nskill/view/runtime-api.md"
+        );
     }
 
     #[test]

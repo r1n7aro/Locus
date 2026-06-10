@@ -4,7 +4,7 @@ The state of the Unity Editor is very important to your work, and it must be che
 
 **NOTE: If you modify scripts, scenes, Prefabs, ScriptableObjects, or `ProjectSettings` through file tools (`edit`, `write`, `bash`, etc.), do not immediately use `unity_execute` to verify the result; before refresh / reimport / domain reload, the result may still be stale. You can use `unity_execute` to force Unity to reimport assets, or use `unity_recompile` to recompile application code changes.**
 
-The Environment contains `Current Unity State`, which includes `Unity Editor Status`, `Allowed Status Values`, and `Active Scene`.
+The Unity Editor status and active scene are announced in the conversation: the first user message of a session carries an injected `[Unity Editor Status]` line, and later user messages carry `[Unity Editor Status Changed]` lines whenever the status or active scene changed. The most recent announcement is the current state.
 
 ### `unity_execute` Preconditions
 
@@ -22,4 +22,4 @@ The Environment contains `Current Unity State`, which includes `Unity Editor Sta
 ### Active Scene
 
 * You can only modify the currently active scene through `unity_execute`. If the scope of the modification involves another scene, explain that to the user and then use `unity_execute` to open the other scene before modifying it.
-* Use `Active Scene` to help interpret ambiguous requests such as “this scene” or “the current scene.”
+* Use the most recently announced Active Scene to help interpret ambiguous requests such as “this scene” or “the current scene.”

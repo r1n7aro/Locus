@@ -13,31 +13,22 @@ skillSurface: command
 commandTrigger: /unity-editor-tooling
 argumentHint: <target data or workflow>
 createdAt: 1775552858000
-updatedAt: 1776383574781
+updatedAt: 1781049600000
 ---
 
 # Unity Editor UI Skill
 
 ## Summary
-Use when the task asks for a Unity Editor UI that edits scene data, serialized objects, assets, or project data inside the Unity Editor. This skill chooses the right host surface, defaults to UI Toolkit for new tools, preserves serialization, undo, and prefab correctness, and ships native-looking, production-ready editor workflows.
+Use when the task asks for a Unity Editor UI that edits scene data, serialized objects, assets, or project data inside the Unity Editor. Ignore runtime or player-facing UI and pipeline work with no editor UI surface.
 
 ## Content
 Use this skill when the task needs a reliable Unity Editor interface for editing data inside the Unity Editor.
 
 Goal: ship editor tools that are fast to build, hard to misuse, visually native, and correct under undo, multi-object, and prefab workflows.
 
-## When to use
+## Scope
 
-- Build or improve a Unity editor tool that edits data inside the Unity Editor.
-- Choose between a custom Inspector, EditorWindow, or PropertyDrawer.
-- Choose between UI Toolkit, IMGUI, or an Odin-based editor extension path.
-- Improve workflow speed, clarity, validation, preview, batch handling, or visual polish of an editor UI.
-
-## When NOT to use
-
-- Build runtime UI, in-game debug panels, or player-facing menus.
-- Build a tool that does not need a Unity Editor UI surface.
-- Modify import pipelines, build pipelines, scene handles, or menu-only commands unless the request also needs an Inspector or window UI.
+Covers Unity Editor UI for editing data: custom Inspectors, EditorWindows, PropertyDrawers, the UI Toolkit / IMGUI / Odin choice, and editor workflow polish. Out of scope: runtime or player-facing UI, and import/build-pipeline, scene-handle, or menu-only work with no editor UI surface.
 
 ## Core working model
 

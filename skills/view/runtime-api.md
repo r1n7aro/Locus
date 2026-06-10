@@ -102,6 +102,6 @@ The View skill grants these normal tools: `view_list`, `view_create`, `view_relo
 
 Debug-only tools live in `debug.md`: `view_capture`, `view_snapshot`, `view_action`, `view_wait`, `view_console_read`, `view_debug_eval`.
 
-## Design Notes
+## Usage Guidance
 
-The API shape is mostly sound: high-frequency work uses compact namespaces (`view`, `unity`, `property`, `session`), Unity writes flow through Unity property paths, and generated packages can build useful interfaces without a local bundler. The broad helper spread gives agents enough power for custom drawers and inspectors, so generated Views should start with `view`, `unity`, `property`, and components from `@locus/components`, then reach for expanded helpers only when custom rendering or value parsing is required.
+Start with `view`, `unity`, `property`, and components from `@locus/components`. Reach for the expanded helper exports only when custom rendering or value parsing requires them.

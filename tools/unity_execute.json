@@ -5,7 +5,7 @@
     "properties": {
       "code": {
         "type": "string",
-        "description": "C# code to compile and execute in Unity Editor. Written as the body of a static method. Use print(obj) or printJson(obj) to return results. When the user asks to display results, tool output is intermediate context only; the final assistant message must restate, summarize, or organize the relevant results."
+        "description": "C# code to compile and execute in Unity Editor. Written as the body of a static method. Use print(obj) or printJson(obj) to return results."
       },
       "request_editor_status": {
         "type": "string",

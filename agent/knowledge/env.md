@@ -10,12 +10,14 @@ Branch: <git_branch>
 
 ### Recent Commits
 ```
-<git_recent_commits>```
+<git_recent_commits>
+```
 {{#git_uncommitted}}
 
 ### Uncommitted Changes
 ```
-<git_uncommitted_stat>```
+<git_uncommitted_stat>
+```
 {{/git_uncommitted}}
 {{/git}}
 {{#unity}}

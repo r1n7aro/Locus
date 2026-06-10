@@ -1,12 +1,12 @@
 {
-  "description": "Read a unified knowledge document by type-prefixed path. Skill package root paths read that package's `SKILL.md`; package child docs can be read by their package-relative `.md` path. This tool returns plain-text document content in markdown form, not knowledge metadata or directory config.",
+  "description": "Read a unified knowledge document by type-prefixed path. When structure shows `skill/<package-id>/ [package]`, pass `skill/<package-id>` directly to read that package's root `SKILL.md`. Package child docs can be read by their package-relative `.md` path. This tool returns plain-text document content in markdown form, not knowledge metadata or directory config.",
   "parameters": {
     "type": "object",
     "additionalProperties": false,
     "properties": {
       "path": {
         "type": "string",
-        "description": "The exact type-prefixed knowledge document path. Preserve every directory segment from `knowledge_list` results. Regular document paths must end with `.md`, for example `design/core-loop.md`, `skill/unity/import-pipeline.md`, or `skill/builtin/profiler.md`. For Skill packages, `skill/<package-id>` reads `SKILL.md`, and `skill/<package-id>/docs/usage.md` reads a package child document."
+        "description": "The exact type-prefixed knowledge document path. Preserve every directory segment from `knowledge_list` results. Regular document paths must end with `.md`, for example `design/core-loop.md`, `skill/unity/import-pipeline.md`, or `skill/builtin/profiler.md`. For Skill package structure entries marked `skill/<package-id>/ [package]`, pass `skill/<package-id>` to read `SKILL.md`; pass `skill/<package-id>/docs/usage.md` to read a package child document."
       },
       "part": {
         "type": "string",

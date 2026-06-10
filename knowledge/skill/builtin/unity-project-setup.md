@@ -15,27 +15,18 @@ argumentHint: <focus area>
 tools:
   - web_fetch
 createdAt: 1775735250000
-updatedAt: 1779840000000
+updatedAt: 1781049600000
 ---
 
 # Unity Project Setup
 
 ## Summary
-Interactively plan and scaffold a Unity project's code infrastructure, package choices, and initial code layout by combining targeted questions with the Unity environment already exposed in Locus.
+Use when the user wants to bootstrap a new Unity project's code infrastructure, pick and install third-party packages, or redesign foundational systems. Ignore feature work on mature infrastructure, runtime content, and Editor tooling requests.
 
 ## Content
-## When to use
+## Scope
 
-- Bootstrap a new Unity project with production-grade code infrastructure.
-- Evaluate and install community best-practice third-party packages for a specific need (async, serialization, networking, etc.).
-- Redesign or upgrade an existing project's foundational systems.
-- The user says "set up my Unity project", "recommend packages", "I need an event system", or similar.
-
-## When NOT to use
-
-- The project already has mature infrastructure and the user just wants to add a feature or fix a bug.
-- The request is about runtime gameplay code, shaders, or visual content, and the target is not infrastructure.
-- The request is specifically about Editor tooling. Use `unity-editor-tooling` for that workflow.
+Covers bootstrapping or upgrading a Unity project's code infrastructure: third-party package selection and installation, foundational subsystems, and asmdef layout. Out of scope: feature work on already-mature infrastructure, runtime gameplay or visual content, and Editor tooling — route Editor UI work to `unity-editor-tooling`.
 
 ## Instructions
 
@@ -53,8 +44,8 @@ ask_user_question:
       description: "Writes gameplay logic, system architecture, and tools"
     - label: "Designer"
       description: "Owns game design, tuning data, and level editing"
-    - label: "Artist"
-      description: "Owns models, animation, VFX, and UI visuals"
+    - label: "Artist / other"
+      description: "Owns art, or type your own role"
 ```
 
 Adapt subsequent phases based on the role:
@@ -73,8 +64,8 @@ ask_user_question:
       description: "Just getting started with Unity"
     - label: "Experienced"
       description: "Has shipped or completed projects and understands basic architecture"
-    - label: "Senior"
-      description: "Knows asmdef, IL2CPP, Package Manager, and production constraints"
+    - label: "Senior / other"
+      description: "Knows asmdef, IL2CPP, and production constraints, or type your own level"
 ```
 
 Adapt based on level:

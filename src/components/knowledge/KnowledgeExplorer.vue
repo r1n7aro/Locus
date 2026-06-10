@@ -10,7 +10,10 @@ import {
   X,
 } from "lucide";
 import { t } from "../../i18n";
-import type { ExplorerNode } from "../../composables/useKnowledgeState";
+import {
+  isSkillPackageRootDocument,
+  type ExplorerNode,
+} from "../../composables/useKnowledgeState";
 import type {
   KnowledgeDirectoryConfigRecord,
   KnowledgeDocumentType,
@@ -26,6 +29,7 @@ import {
   buildExternalFolderTag,
   buildKnowledgeListTags,
   buildKnowledgeSearchMatchTags,
+  type KnowledgeListTag,
 } from "./knowledgeMetaLabels";
 import { buildFolderDisplayStats } from "./knowledgeExplorerFolderCounts";
 import {
@@ -843,11 +847,34 @@ watch(isSearchMode, (value) => {
   closeInlineRename();
 });
 
-function documentTags(node: DocumentNode) {
-  return buildKnowledgeListTags({
-    injectMode: node.document.injectMode,
-    aiMaintained: node.document.aiMaintained,
-  });
+function documentTags(node: DocumentNode): Array<{
+  text: string;
+  tone: KnowledgeListTag["tone"] | "command";
+  title: string;
+}> {
+  const tags: Array<{
+    text: string;
+    tone: KnowledgeListTag["tone"] | "command";
+    title: string;
+  }> = [];
+  // The package folder row already renders the command trigger via
+  // packageTags(); its SKILL.md child reuses the same document, so skip it here
+  // to avoid showing the same /command twice.
+  const trigger = node.document.commandTrigger?.trim();
+  if (trigger && !isSkillPackageRootDocument(node.document)) {
+    tags.push({
+      text: trigger,
+      tone: "command",
+      title: t("knowledge.skill.commandTrigger"),
+    });
+  }
+  tags.push(
+    ...buildKnowledgeListTags({
+      injectMode: node.document.injectMode,
+      aiMaintained: node.document.aiMaintained,
+    }),
+  );
+  return tags;
 }
 
 function searchResultTags(result: KnowledgeSearchResult) {
@@ -1178,6 +1205,7 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
                     'flag-inject': tag.tone === 'inject',
                     'flag-inject-strong': tag.tone === 'inject-strong',
                     'flag-auto': tag.tone === 'auto',
+                    'flag-command': tag.tone === 'command',
                   }"
                   :title="tag.title"
                 >

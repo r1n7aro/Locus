@@ -329,6 +329,10 @@ impl AgentDefRegistry {
         }
     }
 
+    /// config.json is not the sole source of truth for `dev` and `knowledge`:
+    /// legacy tool names are rewritten, and the required knowledge-mutation
+    /// tools (plus `graph_view` for `dev`) are re-added even when a config
+    /// overlay removes them.
     fn normalize_agent_tools(agent_id: &str, tools: &mut Vec<String>) {
         for tool in tools.iter_mut() {
             let normalized = match tool.as_str() {

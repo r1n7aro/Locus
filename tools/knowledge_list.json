@@ -6,7 +6,7 @@
     "properties": {
       "pathPrefix": {
         "type": "string",
-        "description": "Optional type-prefixed directory path prefix such as `design/`, `design/combat/`, or `skill/unity/`. Directory prefixes do not end with `.md`. When omitted, all knowledge types are listed."
+        "description": "Optional type-prefixed directory path prefix such as `design/`, `design/combat/`, or `skill/unity/`. Directory prefixes do not end with `.md`. When the prefix selects one Skill package, package child documents are listed by default. When omitted, all knowledge types are listed."
       },
       "includeHidden": {
         "type": "boolean",

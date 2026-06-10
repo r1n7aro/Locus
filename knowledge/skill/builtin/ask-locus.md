@@ -13,13 +13,13 @@ skillSurface: both
 commandTrigger: /ask-locus
 argumentHint: <question>
 createdAt: 1780934400000
-updatedAt: 1780934400000
+updatedAt: 1781049600000
 ---
 
 # Ask Locus
 
 ## Summary
-Answer questions about Locus by inspecting a cached checkout of the Locus source, docs, and bundled knowledge.
+Use when the user asks how Locus works, how to operate a Locus feature, how Locus connects to Unity, or where a Locus behavior is implemented. Ignore questions about the current Unity project itself.
 
 ## Content
 Use this skill when the user asks how Locus works, how to operate a Locus feature, how Locus connects to Unity, how a built-in workflow behaves, or where a Locus behavior is implemented.

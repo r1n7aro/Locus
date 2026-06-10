@@ -8,23 +8,10 @@ Working directory: <working_dir>
 ## Git Context
 Branch: <git_branch>
 
-### Recent Commits
-```
-<git_recent_commits>```
-{{#git_uncommitted}}
-
-### Uncommitted Changes
-```
-<git_uncommitted_stat>```
-{{/git_uncommitted}}
+This workspace is a Git repository. Recent commits and working-tree changes are not injected into context; run `git status`, `git log`, or `git diff` through the `bash` tool whenever you need them.
 {{/git}}
 {{#unity}}
 Unity Editor: <unity_version>
-
-## Current Unity State (IMPORTANT — read before every action)
-Unity Editor Status: <unity_status>
-Allowed Status Values: `disconnected` | `editing` | `playing` | `playing_paused`
-Active Scene: <unity_active_scene>
 
 ## Project Configuration
 Render Pipeline: <render_pipeline>
@@ -37,9 +24,6 @@ Input System: <input_system>
 ### Physics
 <physics_config>
 {{/unity}}
-{{#knowledge}}
-
-<knowledge_context>
-{{/knowledge}}
+{{#knowledge}}{{/knowledge}}
 {{#knowledge_index}}{{/knowledge_index}}
 {{#knowledge_memory}}{{/knowledge_memory}}
