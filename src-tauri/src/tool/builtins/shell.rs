@@ -221,10 +221,21 @@ pub(super) fn bash() -> ToolDef {
 fn collect_shell_env(
     python: Option<&crate::python_runtime::ResolvedPythonRuntime>,
 ) -> Vec<(String, OsString)> {
-    let mut envs: Vec<(String, OsString)> = vec![
-        ("PYTHONIOENCODING".to_string(), OsString::from("utf-8")),
-        ("PYTHONUTF8".to_string(), OsString::from("1")),
-    ];
+    let mut envs: Vec<(String, OsString)> = Vec::new();
+
+    // Fill in system (registry) variables missing from the process snapshot,
+    // e.g. JAVA_HOME registered by a tool installed after Locus started.
+    // Gap-fill only: session/launcher values are never overridden, and the
+    // Locus-managed keys below win because later env() calls take precedence.
+    #[cfg(target_os = "windows")]
+    for (key, value) in crate::process_util::read_registry_env_entries() {
+        if std::env::var_os(&key).is_none() {
+            envs.push((key, value.into()));
+        }
+    }
+
+    envs.push(("PYTHONIOENCODING".to_string(), OsString::from("utf-8")));
+    envs.push(("PYTHONUTF8".to_string(), OsString::from("1")));
     if let Some(python) = python {
         envs.push((
             "LOCUS_PYTHON".to_string(),

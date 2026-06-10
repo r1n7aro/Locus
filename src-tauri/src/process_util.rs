@@ -318,6 +318,9 @@ fn read_registry_path_entries() -> Vec<PathBuf> {
         (HKEY_CURRENT_USER, r"Environment"),
     ];
 
+    // PATH pieces may reference variables registered alongside them
+    // (e.g. `%JAVA_HOME%\bin`), so expand against the registry env too.
+    let extra = read_registry_env_entries();
     let mut entries = Vec::new();
     for (hive, key_path) in sources {
         let Ok(key) = RegKey::predef(hive).open_subkey(key_path) else {
@@ -327,7 +330,7 @@ fn read_registry_path_entries() -> Vec<PathBuf> {
             continue;
         };
         for piece in raw.split(';') {
-            let expanded = expand_windows_env(piece.trim());
+            let expanded = expand_windows_env(piece.trim(), &extra);
             if expanded.is_empty() {
                 continue;
             }
@@ -337,9 +340,74 @@ fn read_registry_path_entries() -> Vec<PathBuf> {
     entries
 }
 
-// Registry Path values are REG_EXPAND_SZ; winreg returns them unexpanded.
+/// All machine + user environment values from the Windows registry except
+/// `Path`, expanded, with user values overriding machine values — the same
+/// resolution a fresh Windows session performs.
 #[cfg(target_os = "windows")]
-fn expand_windows_env(value: &str) -> String {
+pub fn read_registry_env_entries() -> Vec<(String, String)> {
+    let raw = read_registry_env_raw();
+    raw.iter()
+        .map(|(key, value)| (key.clone(), expand_windows_env(value, &raw)))
+        .collect()
+}
+
+#[cfg(target_os = "windows")]
+fn read_registry_env_raw() -> Vec<(String, String)> {
+    use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
+    use winreg::types::FromRegValue;
+    use winreg::RegKey;
+
+    let sources = [
+        (
+            HKEY_LOCAL_MACHINE,
+            r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment",
+        ),
+        (HKEY_CURRENT_USER, r"Environment"),
+    ];
+
+    let mut entries: Vec<(String, String)> = Vec::new();
+    for (hive, key_path) in sources {
+        let Ok(key) = RegKey::predef(hive).open_subkey(key_path) else {
+            continue;
+        };
+        for (name, raw_value) in key.enum_values().flatten() {
+            if name.eq_ignore_ascii_case("Path") {
+                continue;
+            }
+            // Only string-typed values participate in the environment block.
+            let Ok(value) = String::from_reg_value(&raw_value) else {
+                continue;
+            };
+            if let Some(existing) = entries
+                .iter_mut()
+                .find(|(key, _)| key.eq_ignore_ascii_case(&name))
+            {
+                existing.1 = value;
+            } else {
+                entries.push((name, value));
+            }
+        }
+    }
+    entries
+}
+
+// Registry env values are often REG_EXPAND_SZ; winreg returns them
+// unexpanded. Lookup prefers `extra` (same-batch registry entries) over the
+// process environment.
+#[cfg(target_os = "windows")]
+fn expand_windows_env(value: &str, extra: &[(String, String)]) -> String {
+    let lookup = |name: &str| -> Option<String> {
+        extra
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.clone())
+            .or_else(|| {
+                std::env::vars_os()
+                    .find(|(key, _)| key.to_str().is_some_and(|k| k.eq_ignore_ascii_case(name)))
+                    .map(|(_, value)| value.to_string_lossy().into_owned())
+            })
+    };
+
     let mut out = String::with_capacity(value.len());
     let mut rest = value;
     while let Some(start) = rest.find('%') {
@@ -353,11 +421,8 @@ fn expand_windows_env(value: &str) -> String {
         let name = &after[..end];
         if name.is_empty() {
             out.push('%');
-        } else if let Some(value) = std::env::vars_os()
-            .find(|(key, _)| key.to_str().is_some_and(|k| k.eq_ignore_ascii_case(name)))
-            .map(|(_, value)| value)
-        {
-            out.push_str(&value.to_string_lossy());
+        } else if let Some(value) = lookup(name) {
+            out.push_str(&value);
         } else {
             out.push('%');
             out.push_str(name);
@@ -1152,14 +1217,22 @@ mod tests {
     fn expand_windows_env_expands_known_variables() {
         let system_root = std::env::var("SystemRoot").expect("SystemRoot should be set");
         assert_eq!(
-            super::expand_windows_env("%SystemRoot%\\system32"),
+            super::expand_windows_env("%SystemRoot%\\system32", &[]),
             format!("{}\\system32", system_root)
         );
         assert_eq!(
-            super::expand_windows_env("%LOCUS_NOT_A_REAL_VAR%"),
+            super::expand_windows_env("%LOCUS_NOT_A_REAL_VAR%", &[]),
             "%LOCUS_NOT_A_REAL_VAR%"
         );
-        assert_eq!(super::expand_windows_env("plain"), "plain");
+        assert_eq!(super::expand_windows_env("plain", &[]), "plain");
+
+        // Same-batch registry entries win over the process environment and
+        // match case-insensitively.
+        let extra = vec![("JAVA_HOME".to_string(), "C:\\jdk".to_string())];
+        assert_eq!(
+            super::expand_windows_env("%java_home%\\bin", &extra),
+            "C:\\jdk\\bin"
+        );
     }
 
     #[cfg(target_os = "windows")]
@@ -1173,6 +1246,22 @@ mod tests {
         assert!(
             entries.iter().all(|entry| !entry.as_os_str().is_empty()),
             "expanded entries should not be empty"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn registry_env_entries_exclude_path() {
+        let entries = super::read_registry_env_entries();
+        assert!(
+            !entries.is_empty(),
+            "machine/user registry env should produce entries"
+        );
+        assert!(
+            entries
+                .iter()
+                .all(|(key, _)| !key.eq_ignore_ascii_case("Path")),
+            "Path merges separately and must not appear"
         );
     }
 
