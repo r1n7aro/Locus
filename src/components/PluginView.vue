@@ -57,6 +57,7 @@ import {
   pluginRegistryFetchPlugin,
   pluginRegistryFetchSearchIndex,
   pluginRegistryFetchShard,
+  pluginSetEnabled,
   pluginUninstall,
   type InstalledPluginSummary,
   type PluginGithubAuthStatus,
@@ -73,6 +74,7 @@ import { hasTauriWindowRuntime } from "../services/tauriRuntime";
 import { useNotificationStore } from "../stores/notification";
 import BaseButton from "./ui/BaseButton.vue";
 import BaseContextMenu from "./ui/BaseContextMenu.vue";
+import BaseSwitch from "./ui/BaseSwitch.vue";
 import LucideIcon from "./icons/LucideIcon.vue";
 import { resolveLocusViewIcon } from "./icons/locusViewIcons";
 import MarkdownRenderer from "./MarkdownRenderer.vue";
@@ -130,6 +132,7 @@ const installedPlugins = ref<InstalledPluginSummary[]>([]);
 const loading = ref(false);
 const uninstallKey = ref("");
 const uninstallConfirmKey = ref("");
+const pluginEnableKey = ref("");
 const loadError = ref("");
 const selectedPluginKey = ref("");
 const registryBaseUrls = ref<Record<string, string>>({});
@@ -251,7 +254,7 @@ const hasMoreRegistryBuckets = computed(() =>
 const sortedRegistrySummaries = computed(() =>
   [...registrySummaries.value].sort((left, right) =>
     Number(installedPluginById.value.has(right.id)) - Number(installedPluginById.value.has(left.id))
-    || right.updatedAt.localeCompare(left.updatedAt)
+    || (right.updatedAt ?? "").localeCompare(left.updatedAt ?? "")
     || left.name.localeCompare(right.name)
     || left.registrySourceLabel.localeCompare(right.registrySourceLabel)
     || left.id.localeCompare(right.id),
@@ -402,6 +405,12 @@ function registryDescriptionSourceHasValue(
 
 function selectedPluginIdentity(plugin: InstalledPluginSummary): string {
   return `${plugin.scope}:${plugin.id}`;
+}
+
+function replaceInstalledPlugin(updated: InstalledPluginSummary) {
+  installedPlugins.value = installedPlugins.value.map((plugin) =>
+    selectedPluginIdentity(plugin) === selectedPluginIdentity(updated) ? updated : plugin,
+  );
 }
 
 function selectInstalledPlugin(plugin: InstalledPluginSummary) {
@@ -574,6 +583,10 @@ async function startGithubOAuth() {
   stopGithubOAuthPoll();
   resetGithubOAuthCopyState();
   githubOAuthError.value = "";
+  githubOAuthUserCode.value = "";
+  githubOAuthUrl.value = "";
+  githubOAuthDeviceCode.value = "";
+  githubOAuthInterval.value = 5;
   githubOAuthStep.value = "opening";
   try {
     const info = await pluginGithubOAuthStart();
@@ -588,13 +601,13 @@ async function startGithubOAuth() {
     githubOAuthUserCode.value = info.userCode ?? "";
     githubOAuthUrl.value = info.verificationUri ?? "";
     githubOAuthDeviceCode.value = info.deviceCode ?? "";
-    githubOAuthInterval.value = Math.max(info.interval || 5, 5);
+    githubOAuthInterval.value = Math.max(info.interval || 2, 2);
     githubOAuthStep.value = "waiting";
 
     if (githubOAuthUserCode.value && githubOAuthUrl.value) {
       void openUrl(githubOAuthUrl.value).catch(() => undefined);
     }
-    scheduleGithubOAuthPoll();
+    scheduleGithubOAuthPoll(githubOAuthUserCode.value ? undefined : 500);
   } catch (error) {
     githubOAuthStep.value = "error";
     githubOAuthError.value = errorMessage(error);
@@ -606,6 +619,12 @@ async function pollGithubOAuth() {
   githubOAuthPollInFlight = true;
   try {
     const result = await pluginGithubOAuthPoll(githubOAuthDeviceCode.value);
+    if (result.userCode) {
+      githubOAuthUserCode.value = result.userCode;
+    }
+    if (result.verificationUri) {
+      githubOAuthUrl.value = result.verificationUri;
+    }
     if (result.status === "success" && result.auth) {
       stopGithubOAuthPoll();
       githubAuthStatus.value = result.auth;
@@ -754,6 +773,7 @@ function saveRegistrySources() {
       owner: repo.owner,
       repo: repo.repo,
       url: repo.url,
+      provider: repo.provider,
       branch: repo.branch || draft.branch.trim() || DEFAULT_PLUGIN_REGISTRY_BRANCH,
       path,
     });
@@ -812,10 +832,27 @@ function setRegistryLoadedBucketSet(sourceId: string, buckets: Set<string>) {
   };
 }
 
+// Bumped by refreshRegistry; async loaders capture the value when they start
+// and drop their results if a newer refresh has replaced the source state.
+let registryRefreshGeneration = 0;
+let registryLoadingMoreGeneration = 0;
+
 function mergeRegistrySummaries(nextPlugins: RegistryPluginSummary[]) {
   const byKey = new Map(registrySummaries.value.map((plugin) => [plugin.registryKey, plugin]));
+  const staleDetailKeys: string[] = [];
   for (const plugin of nextPlugins) {
     byKey.set(plugin.registryKey, plugin);
+    const detail = registryDetails.value[plugin.registryKey];
+    if (detail && detail.latestVersion !== plugin.latestVersion) {
+      staleDetailKeys.push(plugin.registryKey);
+    }
+  }
+  if (staleDetailKeys.length > 0) {
+    const nextDetails = { ...registryDetails.value };
+    for (const key of staleDetailKeys) {
+      delete nextDetails[key];
+    }
+    registryDetails.value = nextDetails;
   }
   registrySummaries.value = Array.from(byKey.values());
   if (selectedRegistryKey.value && !byKey.has(selectedRegistryKey.value)) {
@@ -832,7 +869,7 @@ function registryEntryToSummary(entry: RegistryPluginEntry): RegistryPluginSumma
     author: entry.author,
     tags: entry.tags,
     latestVersion: entry.latestVersion,
-    updatedAt: entry.updatedAt,
+    updatedAt: entry.updatedAt ?? "",
     icon: entry.icon,
     stats: entry.stats,
     compatibility: entry.compatibility,
@@ -848,6 +885,7 @@ function registryEntryToSummary(entry: RegistryPluginEntry): RegistryPluginSumma
 
 async function loadInstalledRegistryEntries() {
   if (registryInstalledEntriesLoading.value) return;
+  const generation = registryRefreshGeneration;
   const installedIds = Array.from(installedPluginById.value.keys());
   if (installedIds.length === 0) return;
   const requests = registrySources.value.flatMap((source) => {
@@ -869,6 +907,7 @@ async function loadInstalledRegistryEntries() {
   try {
     for (let index = 0; index < requests.length; index += 4) {
       const settled = await Promise.allSettled(requests.slice(index, index + 4));
+      if (generation !== registryRefreshGeneration) return;
       const entries = settled
         .filter((result): result is PromiseFulfilledResult<RegistryPluginEntry> => result.status === "fulfilled")
         .map((result) => result.value);
@@ -913,7 +952,12 @@ function pendingRegistryBucketRefs(count: number): RegistryBucketRef[] {
   return refs;
 }
 
-async function loadRegistryBucket(source: PluginRegistrySource, bucket: string, options: RegistryLoadOptions = {}) {
+async function loadRegistryBucket(
+  source: PluginRegistrySource,
+  bucket: string,
+  options: RegistryLoadOptions = {},
+  generation = registryRefreshGeneration,
+) {
   const manifest = registryManifests.value[source.id];
   if (!manifest || registryLoadedBucketSet(source.id).has(bucket)) return;
   const shard = await pluginRegistryFetchShard({
@@ -922,35 +966,52 @@ async function loadRegistryBucket(source: PluginRegistrySource, bucket: string, 
     bucket,
     cacheMode: options.cacheMode,
   });
+  if (generation !== registryRefreshGeneration) return;
   mergeRegistrySummaries((shard.plugins ?? []).map((plugin) => withRegistrySource(plugin, source)));
   setRegistryLoadedBucketSet(source.id, new Set([...registryLoadedBucketSet(source.id), bucket]));
 }
 
-async function loadRegistryBuckets(refs: RegistryBucketRef[], options: RegistryLoadOptions = {}) {
+async function loadRegistryBuckets(
+  refs: RegistryBucketRef[],
+  options: RegistryLoadOptions = {},
+  generation = registryRefreshGeneration,
+) {
   for (let index = 0; index < refs.length; index += 4) {
+    if (generation !== registryRefreshGeneration) return;
     await Promise.all(refs.slice(index, index + 4).map((ref) =>
-      loadRegistryBucket(ref.source, ref.bucket, options),
+      loadRegistryBucket(ref.source, ref.bucket, options, generation),
     ));
   }
 }
 
-async function loadMoreRegistryBuckets(count = REGISTRY_BUCKET_BATCH_SIZE, options: RegistryLoadOptions = {}) {
-  if (registryLoadingMore.value) return;
+async function loadMoreRegistryBuckets(
+  count = REGISTRY_BUCKET_BATCH_SIZE,
+  options: RegistryLoadOptions = {},
+  generation = registryRefreshGeneration,
+) {
+  if (generation !== registryRefreshGeneration) return;
+  if (registryLoadingMore.value && registryLoadingMoreGeneration === registryRefreshGeneration) return;
   const nextBuckets = pendingRegistryBucketRefs(count);
   if (nextBuckets.length === 0) return;
   registryLoadingMore.value = true;
+  registryLoadingMoreGeneration = generation;
   registryError.value = "";
   try {
-    await loadRegistryBuckets(nextBuckets, options);
+    await loadRegistryBuckets(nextBuckets, options, generation);
   } catch (error) {
-    registryError.value = errorMessage(error);
+    if (generation === registryRefreshGeneration) {
+      registryError.value = errorMessage(error);
+    }
   } finally {
-    registryLoadingMore.value = false;
+    if (registryLoadingMoreGeneration === generation) {
+      registryLoadingMore.value = false;
+    }
   }
 }
 
 async function loadRegistrySearchIndex(source: PluginRegistrySource, options: RegistryLoadOptions = {}) {
   if (registrySearchIndexLoaded.value[source.id]) return;
+  const generation = registryRefreshGeneration;
   const manifest = registryManifests.value[source.id];
   const registryBaseUrl = registryBaseUrls.value[source.id];
   if (!manifest || !registryBaseUrl) return;
@@ -959,6 +1020,7 @@ async function loadRegistrySearchIndex(source: PluginRegistrySource, options: Re
     searchIndexPath: manifest.searchIndexPath,
     cacheMode: options.cacheMode,
   });
+  if (generation !== registryRefreshGeneration) return;
   mergeRegistrySummaries((index.plugins ?? []).map((plugin) => withRegistrySource(plugin, source)));
   registrySearchIndexLoaded.value = {
     ...registrySearchIndexLoaded.value,
@@ -1005,6 +1067,7 @@ function handleRegistryListScroll(event: Event) {
 }
 
 async function refreshRegistry(options: RegistryRefreshOptions = {}) {
+  const generation = ++registryRefreshGeneration;
   const preserveExisting = options.preserveExisting === true;
   const showLoading = !options.silent || registrySummaries.value.length === 0;
   if (showLoading) {
@@ -1032,6 +1095,7 @@ async function refreshRegistry(options: RegistryRefreshOptions = {}) {
       pluginRegistryFetchManifest(pluginRegistrySourceBaseUrl(source), options.cacheMode)
         .then((result) => ({ source, result })),
     ));
+    if (generation !== registryRefreshGeneration) return;
     const nextBaseUrls: Record<string, string> = {};
     const nextManifests: Record<string, PluginRegistryManifest> = {};
     const errors: string[] = [];
@@ -1051,14 +1115,15 @@ async function refreshRegistry(options: RegistryRefreshOptions = {}) {
       }
       return;
     }
-    await loadMoreRegistryBuckets(REGISTRY_BUCKET_BATCH_SIZE, { cacheMode: options.cacheMode });
+    await loadMoreRegistryBuckets(REGISTRY_BUCKET_BATCH_SIZE, { cacheMode: options.cacheMode }, generation);
     void loadInstalledRegistryEntries();
   } catch (error) {
+    if (generation !== registryRefreshGeneration) return;
     if (!preserveExisting || registrySummaries.value.length === 0) {
       registryError.value = errorMessage(error);
     }
   } finally {
-    if (showLoading) {
+    if (generation === registryRefreshGeneration) {
       registryLoading.value = false;
     }
   }
@@ -1679,6 +1744,28 @@ async function updateInstalledPlugin(plugin: InstalledPluginSummary) {
   await installRegistryPluginWithScope(candidate, plugin.scope, "update");
 }
 
+async function setPluginEnabledState(plugin: InstalledPluginSummary, enabled: boolean) {
+  const key = selectedPluginIdentity(plugin);
+  if (pluginEnableKey.value) return;
+  pluginEnableKey.value = key;
+  try {
+    const updated = await pluginSetEnabled(plugin.id, plugin.scope, enabled);
+    replaceInstalledPlugin(updated);
+    notificationStore.addNotice(
+      "success",
+      t(enabled ? "plugin.notice.enabled" : "plugin.notice.disabled", updated.name || updated.id),
+      { operation: "pluginSetEnabled" },
+    );
+    await refreshAll();
+  } catch (error) {
+    notificationStore.addNotice("error", errorMessage(error), { operation: "pluginSetEnabled" });
+  } finally {
+    if (pluginEnableKey.value === key) {
+      pluginEnableKey.value = "";
+    }
+  }
+}
+
 async function uninstallRegistryPlugin(plugin: RegistryPluginSummary | RegistryPluginEntry) {
   const installed = installedRegistryPlugin(plugin);
   if (!installed) return;
@@ -1978,7 +2065,10 @@ onUnmounted(() => {
               v-for="plugin in filteredInstalledPlugins"
               :key="`${plugin.scope}:${plugin.id}`"
               class="plugin-list-item plugin-registry-list-item plugin-installed-list-item"
-              :class="{ active: selectedPluginKey === `${plugin.scope}:${plugin.id}` }"
+              :class="{
+                active: selectedPluginKey === `${plugin.scope}:${plugin.id}`,
+                'is-disabled': !plugin.enabled,
+              }"
             >
               <button
                 type="button"
@@ -2001,6 +2091,7 @@ onUnmounted(() => {
                     <span class="plugin-name">{{ installedListDisplayName(plugin) }}</span>
                     <span class="plugin-version">{{ installedListVersion(plugin) }}</span>
                     <span class="plugin-scope-tag">{{ pluginScopeTag(plugin.scope) }}</span>
+                    <span v-if="!plugin.enabled" class="plugin-state-tag">{{ t("common.disabled") }}</span>
                   </div>
                   <div class="plugin-list-summary">{{ installedListSummary(plugin) }}</div>
                   <div class="plugin-list-meta">
@@ -2010,6 +2101,13 @@ onUnmounted(() => {
                 </div>
               </button>
               <div class="plugin-list-side">
+                <BaseSwitch
+                  class="plugin-enable-switch"
+                  :model-value="plugin.enabled"
+                  :disabled="pluginEnableKey === `${plugin.scope}:${plugin.id}`"
+                  :aria-label="plugin.enabled ? t('plugin.hub.disable') : t('plugin.hub.enable')"
+                  @update:model-value="setPluginEnabledState(plugin, $event)"
+                />
                 <BaseButton
                   v-if="installedUpdateCandidate(plugin)"
                   class="plugin-registry-action-button is-update-action"
@@ -2166,10 +2264,22 @@ onUnmounted(() => {
             </div>
             <div class="plugin-detail-heading">
               <div class="plugin-detail-title">{{ selectedInstalledPlugin.name || selectedInstalledPlugin.id }}</div>
-              <div class="plugin-detail-id">{{ selectedInstalledPlugin.id }}</div>
+              <div class="plugin-detail-id">
+                <span>{{ selectedInstalledPlugin.id }}</span>
+                <span v-if="!selectedInstalledPlugin.enabled" class="plugin-state-tag">{{ t("common.disabled") }}</span>
+              </div>
             </div>
           </div>
           <div class="plugin-detail-actions">
+            <label class="plugin-enable-control">
+              <span>{{ selectedInstalledPlugin.enabled ? t("common.enabled") : t("common.disabled") }}</span>
+              <BaseSwitch
+                :model-value="selectedInstalledPlugin.enabled"
+                :disabled="pluginEnableKey === `${selectedInstalledPlugin.scope}:${selectedInstalledPlugin.id}`"
+                :aria-label="selectedInstalledPlugin.enabled ? t('plugin.hub.disable') : t('plugin.hub.enable')"
+                @update:model-value="setPluginEnabledState(selectedInstalledPlugin, $event)"
+              />
+            </label>
             <BaseButton
               v-if="installedUpdateCandidate(selectedInstalledPlugin)"
               :disabled="registryInstallKey === installedUpdateCandidate(selectedInstalledPlugin)?.registryKey"
@@ -2190,6 +2300,10 @@ onUnmounted(() => {
         </header>
 
         <section class="plugin-detail-meta">
+          <div class="plugin-detail-meta-item">
+            <span>{{ t("plugin.detail.status") }}</span>
+            <strong>{{ selectedInstalledPlugin.enabled ? t("common.enabled") : t("common.disabled") }}</strong>
+          </div>
           <div class="plugin-detail-meta-item">
             <span>{{ t("plugin.install.scope") }}</span>
             <strong>{{ pluginScopeLabel(selectedInstalledPlugin.scope) }}</strong>
@@ -2899,6 +3013,10 @@ onUnmounted(() => {
   gap: 5px;
 }
 
+.plugin-enable-switch {
+  flex: 0 0 auto;
+}
+
 .plugin-list-stats {
   display: flex;
   align-items: center;
@@ -3029,6 +3147,25 @@ onUnmounted(() => {
   line-height: 1;
 }
 
+.plugin-state-tag {
+  flex-shrink: 0;
+  height: 16px;
+  padding: 0 5px;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  display: inline-flex;
+  align-items: center;
+  color: var(--text-secondary);
+  background: color-mix(in srgb, var(--hover-bg) 72%, transparent);
+  font-size: 10px;
+  font-weight: 650;
+  line-height: 1;
+}
+
+.plugin-installed-list-item.is-disabled .plugin-name {
+  color: var(--text-secondary);
+}
+
 .plugin-list-id {
   margin-top: 3px;
   overflow: hidden;
@@ -3133,6 +3270,20 @@ onUnmounted(() => {
   justify-content: flex-end;
   gap: 8px;
   flex-wrap: wrap;
+}
+
+.plugin-enable-control {
+  min-height: 26px;
+  padding: 0 8px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--text-secondary);
+  background: color-mix(in srgb, var(--panel-bg) 84%, var(--hover-bg) 16%);
+  font-size: 12px;
+  font-weight: 500;
 }
 
 .plugin-detail-actions :deep(.plugin-star-button.is-starred) {
@@ -3243,10 +3394,20 @@ onUnmounted(() => {
 
 .plugin-detail-id {
   margin-top: 4px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
   color: var(--text-secondary);
   font-family: var(--font-mono-identifier);
   font-size: 11px;
   word-break: break-all;
+}
+
+.plugin-detail-id > span:first-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .plugin-detail-grid {

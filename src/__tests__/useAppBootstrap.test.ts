@@ -483,17 +483,26 @@ describe("useAppBootstrap onboarding completion", () => {
     knowledgeChangedHandler?.({
       payload: {
         workingDir: "F:/Project",
-        source: "knowledge_fs_watcher",
+        source: "plugin_registry_install",
         changedAt: 4,
+      },
+    });
+    expect(loadSkillsMock).toHaveBeenCalledTimes(2);
+
+    knowledgeChangedHandler?.({
+      payload: {
+        workingDir: "F:/Project",
+        source: "knowledge_fs_watcher",
+        changedAt: 5,
         docType: "skill",
         targetKind: "document",
         changeKind: "structure",
       },
     });
-    expect(loadSkillsMock).toHaveBeenCalledTimes(2);
+    expect(loadSkillsMock).toHaveBeenCalledTimes(3);
   });
 
-  it("reloads agents when installed plugins change", async () => {
+  it("reloads agents and skills when installed plugins change", async () => {
     const eventModule = await import("@tauri-apps/api/event");
     const listenMock = eventModule.listen as unknown as ReturnType<typeof vi.fn>;
     const handlers = new Map<string, (event: { payload: any }) => void>();
@@ -509,12 +518,14 @@ describe("useAppBootstrap onboarding completion", () => {
     const { registerListeners } = useAppBootstrap();
     await registerListeners();
     agentStoreMock.loadAgents.mockClear();
+    loadSkillsMock.mockClear();
 
     const pluginsChangedHandler = handlers.get("plugins-changed");
     expect(pluginsChangedHandler).toBeTypeOf("function");
 
     pluginsChangedHandler?.({ payload: undefined });
     expect(agentStoreMock.loadAgents).toHaveBeenCalledTimes(1);
+    expect(loadSkillsMock).toHaveBeenCalledTimes(1);
   });
 
   it("refreshes the active session when session content changes in the current workspace", async () => {

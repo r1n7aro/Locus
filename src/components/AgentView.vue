@@ -1,6 +1,8 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, watch } from "vue";
+import { listen } from "@tauri-apps/api/event";
+import type { UnlistenFn } from "@tauri-apps/api/event";
 import { listAgents, listSubagentDefs, getAgentEnvTemplate, getAgentRenderedEnvPrompt, getAgentSystemPrompt, getAgentSystemPromptStats, listAgentInjectedItems, setAgentToolDirectLoad, listRules, readRule, saveRule, deleteRule, setRuleEnabled, setRuleOrder } from "../services/agent";
 import type { AgentInfo, AgentSystemPromptStats, InjectedPromptItem, InjectedToolLoadMode, RuleItem } from "../types";
 import { getWarmup } from "../composables/warmupCache";
@@ -144,6 +146,8 @@ let resizing: "sidebar" | "dir" | null = null;
 let resizeStartX = 0;
 let resizeStartWidth = 0;
 let releaseSelectionLock: (() => void) | null = null;
+let pluginsChangedUnlisten: UnlistenFn | null = null;
+let agentViewUnmounted = false;
 
 function selectedRule(): RuleItem | null {
   return selected.value?.type === "rule" ? selected.value.rule : null;
@@ -159,6 +163,10 @@ function selectedRuleKey(): string {
 
 function canEditRule(rule: RuleItem | null | undefined): boolean {
   return !!rule && !rule.readOnly;
+}
+
+function canToggleRule(rule: RuleItem | null | undefined): boolean {
+  return !!rule && !rule.pluginId;
 }
 
 function closeRuleContextMenu() {
@@ -411,22 +419,7 @@ function sourceBadgeClass(source: string | null | undefined): string {
   return "";
 }
 
-async function loadAllAgents() {
-  try {
-    const topLevel = await listAgents();
-    const subLevel = await listSubagentDefs();
-    allAgents.value = [...topLevel, ...subLevel];
-    if (!selectedAgentId.value && allAgents.value.length > 0) {
-      const def = allAgents.value.find(a => a.isDefault);
-      selectedAgentId.value = def ? def.id : allAgents.value[0].id;
-    }
-  } catch (e) {
-    console.error("loadAllAgents failed:", e);
-  }
-}
-
-async function switchAgent(agentId: string) {
-  selectedAgentId.value = agentId;
+function resetAgentDetailState() {
   selected.value = null;
   closeRuleContextMenu();
   ruleContent.value = "";
@@ -443,6 +436,37 @@ async function switchAgent(agentId: string) {
   promptStatsError.value = "";
   promptStatsLoading.value = false;
   promptStatsRequestId += 1;
+}
+
+function preferredAgentId(agents: AgentInfo[]): string {
+  if (agents.length === 0) return "";
+  const def = agents.find((agent) => agent.isDefault);
+  return def ? def.id : agents[0].id;
+}
+
+async function loadAllAgents() {
+  try {
+    const topLevel = await listAgents();
+    const subLevel = await listSubagentDefs();
+    allAgents.value = [...topLevel, ...subLevel];
+    const selectedStillAvailable = allAgents.value.some(
+      (agent) => agent.id === selectedAgentId.value,
+    );
+    if (!selectedStillAvailable) {
+      const nextAgentId = preferredAgentId(allAgents.value);
+      if (selectedAgentId.value !== nextAgentId) {
+        selectedAgentId.value = nextAgentId;
+        resetAgentDetailState();
+      }
+    }
+  } catch (e) {
+    console.error("loadAllAgents failed:", e);
+  }
+}
+
+async function switchAgent(agentId: string) {
+  selectedAgentId.value = agentId;
+  resetAgentDetailState();
   await loadAgentData();
 }
 
@@ -627,6 +651,7 @@ async function selectRuleItem(rule: RuleItem) {
 }
 
 async function setRuleEnabledState(rule: RuleItem, enabled: boolean) {
+  if (!canToggleRule(rule)) return;
   const previous = rule.enabled;
   rule.enabled = enabled;
   try {
@@ -835,29 +860,44 @@ function formatDate(ts: number): string {
 }
 
 onMounted(async () => {
+  agentViewUnmounted = false;
   // Use background warmup cache if available
   const cachedAgents = getWarmup<AgentInfo[]>("agent:agents");
   const cachedSubagents = getWarmup<AgentInfo[]>("agent:subagents");
   if (cachedAgents && cachedSubagents) {
     allAgents.value = [...cachedAgents, ...cachedSubagents];
-    if (!selectedAgentId.value && allAgents.value.length > 0) {
-      const def = allAgents.value.find(a => a.isDefault);
-      selectedAgentId.value = def ? def.id : allAgents.value[0].id;
+    if (!selectedAgentId.value) {
+      selectedAgentId.value = preferredAgentId(allAgents.value);
     }
   } else {
     await loadAllAgents();
   }
+  if (agentViewUnmounted) return;
   if (selectedAgentId.value) {
     loadAgentData();
+  }
+  const releasePluginsChanged = await listen<void>("plugins-changed", async () => {
+    await loadAllAgents();
+    if (selectedAgentId.value) {
+      refreshAll();
+    }
+  });
+  if (agentViewUnmounted) {
+    releasePluginsChanged();
+  } else {
+    pluginsChangedUnlisten = releasePluginsChanged;
   }
 });
 
 onUnmounted(() => {
+  agentViewUnmounted = true;
   closeRuleContextMenu();
   document.removeEventListener("mousemove", onResizeMove);
   document.removeEventListener("mouseup", onResizeEnd);
   releaseSelectionLock?.();
   releaseSelectionLock = null;
+  pluginsChangedUnlisten?.();
+  pluginsChangedUnlisten = null;
 });
 
 watch(
@@ -946,7 +986,9 @@ watch(
                 <label class="rule-toggle-label" @click.stop>
                   <BaseCheckbox
                     :model-value="rule.enabled"
+                    :disabled="!canToggleRule(rule)"
                     :aria-label="rule.enabled ? t('common.enabled') : t('common.disabled')"
+                    :title="!canToggleRule(rule) ? t('agent.rulePluginEnableManagedByPlugin') : undefined"
                     @update:model-value="setRuleEnabledState(rule, $event)"
                   />
                 </label>
@@ -1106,7 +1148,9 @@ watch(
           <label class="skill-toggle">
             <BaseCheckbox
               :model-value="!!selectedRule()?.enabled"
+              :disabled="!canToggleRule(selectedRule())"
               :aria-label="selectedRule()?.enabled ? t('common.enabled') : t('common.disabled')"
+              :title="!canToggleRule(selectedRule()) ? t('agent.rulePluginEnableManagedByPlugin') : undefined"
               @update:model-value="setRuleEnabledState(selectedRule()!, $event)"
             />
             <span>{{ selectedRule()?.enabled ? t("common.enabled") : t("common.disabled") }}</span>

@@ -32,7 +32,7 @@
       },
       "ruleFiles": {
         "type": "array",
-        "description": "Optional plugin Rules to write into rules/<file-name>.md and declare under components.rules. These Rules are installed as read-only optional rules and can be enabled per Agent in the Agent view.",
+        "description": "Optional plugin Rules to write into rules/<file-name>.md and declare under components.rules. These Rules are installed as read-only plugin rules and are enabled when the plugin is enabled.",
         "items": {
           "type": "object",
           "additionalProperties": false,

@@ -49,6 +49,7 @@ pub fn register_all(registry: &mut ToolRegistry) {
     registry.register_builtin_with_load_mode(plugin::plugin_list(), ToolLoadMode::Skill);
     registry.register_builtin_with_load_mode(plugin::plugin_search(), ToolLoadMode::Skill);
     registry.register_builtin_with_load_mode(plugin::plugin_install(), ToolLoadMode::Skill);
+    registry.register_builtin_with_load_mode(plugin::plugin_set_enabled(), ToolLoadMode::Skill);
     registry.register_builtin_with_load_mode(plugin::plugin_uninstall(), ToolLoadMode::Skill);
     registry.register_builtin_with_load_mode(plugin::plugin_export(), ToolLoadMode::Skill);
     registry.register_builtin_with_load_mode(view::view_create(), ToolLoadMode::Skill);

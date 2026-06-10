@@ -19,16 +19,23 @@ describe("plugin Skill package", () => {
   it("exposes /plugin as the single command entry", () => {
     const manifest = readJson<{
       id: string;
+      injectMode: string;
+      description: string;
       command: { enabled: boolean; trigger: string; argumentHint: string };
     }>("skills/plugin/skill.json");
     const skill = read("skills/plugin/SKILL.md");
 
     expect(manifest.id).toBe("plugin");
+    expect(manifest.injectMode).toBe("excerpt");
+    expect(manifest.description).toContain("mentions plugin or 插件");
     expect(manifest.command.enabled).toBe(true);
     expect(manifest.command.trigger).toBe("/plugin");
     expect(manifest.command.argumentHint).toBe("<plugin request>");
     expect(skill).toContain("plugin_search");
+    expect(skill).toContain("## L1");
+    expect(skill).toContain("targets Locus app extensions");
     expect(skill).toContain("plugin_install");
+    expect(skill).toContain("plugin_set_enabled");
     expect(skill).toContain("plugin_uninstall");
     expect(skill).toContain("plugin_export");
     expect(skill).toContain("Use progressive disclosure for specialized editing.");
@@ -38,6 +45,8 @@ describe("plugin Skill package", () => {
     expect(skill).toContain("gh auth login -h github.com -s repo,read:org");
     expect(skill).toContain("A public plugin GitHub repository must contain an installable plugin source tree at the repository root.");
     expect(skill).toContain("Optional plugin Rules live under the plugin root");
+    expect(skill).toContain("They are enabled by default while the plugin is enabled.");
+    expect(skill).toContain("Disabling a plugin keeps it installed and listed");
     expect(skill).toContain("components.rules");
     expect(skill).toContain("`rules/`");
     expect(skill).toContain("Do not create a repository that only contains README/LICENSE and a release asset.");
@@ -110,6 +119,8 @@ describe("plugin Skill package", () => {
     }>("tools/plugin_export.json");
     const searchTool = readJson<{ parameters: { required: string[] } }>("tools/plugin_search.json");
     const installTool = read("tools/plugin_install.json");
+    const setEnabledTool = readJson<{ parameters: { required: string[] } }>("tools/plugin_set_enabled.json");
+    const setEnabledToolText = read("tools/plugin_set_enabled.json");
     const uninstallTool = readJson<{ parameters: { required: string[] } }>("tools/plugin_uninstall.json");
     const skillReloadTool = read("tools/skill_reload.json");
     const viewListTool = read("tools/view_list.json");
@@ -128,6 +139,8 @@ describe("plugin Skill package", () => {
     expect(searchTool.parameters.required).toEqual(["query"]);
     expect(installTool).toContain("pluginId");
     expect(installTool).toContain("repo");
+    expect(setEnabledTool.parameters.required).toEqual(["pluginId", "enabled"]);
+    expect(setEnabledToolText).toContain("remain installed and listed");
     expect(uninstallTool.parameters.required).toEqual(["pluginId"]);
     expect(skillReloadTool).toContain("pluginApp");
     expect(skillReloadTool).toContain("pluginProject");

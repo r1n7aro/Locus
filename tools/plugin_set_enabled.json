@@ -1,0 +1,23 @@
+{
+  "description": "Enable or disable an installed Locus plugin. Disabled plugins remain installed and listed, but their Agent definitions, Rules, Skill packages, tools, and Views are no longer loaded from the plugin.",
+  "parameters": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "pluginId": {
+        "type": "string",
+        "description": "Installed plugin id."
+      },
+      "scope": {
+        "type": ["string", "null"],
+        "enum": ["app", "project", null],
+        "description": "Installed plugin scope. Omit only when plugin_list shows the id is installed in exactly one scope."
+      },
+      "enabled": {
+        "type": "boolean",
+        "description": "True enables the plugin; false disables it."
+      }
+    },
+    "required": ["pluginId", "enabled"]
+  }
+}

@@ -165,4 +165,40 @@ describe("plugin registry sources", () => {
       path: "",
     })).toBe("https://git.example.com/acme/locus-plugin-registry/raw/branch/main/public/v1");
   });
+
+  it("keeps self-hosted Gitea and GitLab base URLs across the save/load round-trip", () => {
+    const [gitea] = normalizePluginRegistrySources([{
+      id: "gitea",
+      name: "Gitea Registry",
+      url: "https://git.example.com/acme/locus-plugin-registry/src/branch/main/v1",
+    }]);
+
+    expect(gitea.url).toBe("https://git.example.com/acme/locus-plugin-registry");
+    expect(gitea.provider).toBe("gitea");
+    expect(gitea.branch).toBe("main");
+    expect(gitea.path).toBe("v1");
+    expect(pluginRegistrySourceBaseUrl(gitea)).toBe(
+      "https://git.example.com/acme/locus-plugin-registry/raw/branch/main/v1",
+    );
+
+    const [gitlab] = normalizePluginRegistrySources([{
+      id: "gitlab",
+      name: "GitLab Registry",
+      url: "https://git.example.com/acme/tools/locus-plugin-registry/-/tree/release/registry/v1",
+    }]);
+
+    expect(gitlab.url).toBe("https://git.example.com/acme/tools/locus-plugin-registry");
+    expect(gitlab.provider).toBe("gitlab");
+    expect(pluginRegistrySourceBaseUrl(gitlab)).toBe(
+      "https://git.example.com/acme/tools/locus-plugin-registry/-/raw/release/registry/v1",
+    );
+
+    // Simulates the localStorage persist/reload path: the bare repo URL plus
+    // the stored provider must re-normalize to the same base URL.
+    const [reloaded] = normalizePluginRegistrySources(JSON.parse(JSON.stringify([gitea])));
+    expect(reloaded.provider).toBe("gitea");
+    expect(pluginRegistrySourceBaseUrl(reloaded)).toBe(
+      "https://git.example.com/acme/locus-plugin-registry/raw/branch/main/v1",
+    );
+  });
 });

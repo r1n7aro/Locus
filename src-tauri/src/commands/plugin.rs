@@ -11,8 +11,8 @@ use regex::{Captures, Regex};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter, State};
-use tokio::io::AsyncWriteExt;
-use tokio::time::timeout;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::time::{sleep, timeout};
 use url::Url;
 use walkdir::WalkDir;
 
@@ -20,9 +20,9 @@ use crate::agent::definition::AgentDefRegistry;
 use crate::error::AppError;
 use crate::plugin::{
     inspect_plugin_source_manifest_sync, install_plugin_from_path_sync,
-    list_installed_plugin_summaries, normalize_plugin_id, uninstall_plugin_sync,
-    InstalledPluginSummary, LocusPluginProjectDependency, PluginInstallScope,
-    PLUGIN_MANIFEST_FILE_NAME,
+    list_installed_plugin_summaries, normalize_plugin_id, set_plugin_enabled_sync,
+    uninstall_plugin_sync, InstalledPluginSummary, LocusPluginProjectDependency,
+    PluginInstallScope, PLUGIN_MANIFEST_FILE_NAME,
 };
 use crate::process_util::{async_command, resolve_github_cli};
 use crate::workspace::Workspace;
@@ -44,11 +44,15 @@ const PLUGIN_GITHUB_CLI_HOSTNAME: &str = "github.com";
 const PLUGIN_GITHUB_CLI_SCOPES: &str = "repo,read:org";
 const PLUGIN_GITHUB_CLI_VERIFICATION_URI: &str = "https://github.com/login/device";
 const PLUGIN_GITHUB_CLI_LOGIN_INTERVAL: u64 = 2;
+const PLUGIN_GITHUB_CLI_LOGIN_CODE_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 const PLUGIN_GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 static MARKDOWN_LINK_DEST_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?P<prefix>!?\[[^\]\n]*\]\()(?P<url><[^>\n]+>|[^)\s\n]+)(?P<suffix>(?:\s+["'][^"'\n]*["'])?\))"#)
         .expect("markdown link destination regex")
+});
+static GITHUB_CLI_DEVICE_CODE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\b([A-Z0-9]{4}-[A-Z0-9]{4}|[A-Z0-9]{8})\b").expect("GitHub CLI device code regex")
 });
 static REGISTRY_HTTP_CLIENT: LazyLock<Result<reqwest::Client, String>> =
     LazyLock::new(|| build_registry_http_client(Duration::from_secs(12)));
@@ -343,6 +347,8 @@ pub struct PluginRegistryEntry {
     pub tags: Vec<String>,
     #[serde(default)]
     pub latest_version: String,
+    #[serde(default)]
+    pub updated_at: String,
     #[serde(default, skip_serializing_if = "PluginRegistryIcon::is_empty")]
     pub icon: PluginRegistryIcon,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1048,27 +1054,6 @@ async fn write_plugin_registry_cache(
     Ok(())
 }
 
-async fn fetch_registry_http_bytes(
-    url: &str,
-    max_bytes: u64,
-    error_label: &str,
-) -> Result<Vec<u8>, String> {
-    let parsed_url =
-        Url::parse(url).map_err(|error| format!("Invalid {} URL: {}", error_label, error))?;
-    let client = registry_http_client(Duration::from_secs(12))?;
-    let request = client.get(parsed_url.clone());
-    let request = with_github_auth_if_available(request, &parsed_url).await;
-    let response = request
-        .send()
-        .await
-        .map_err(|error| format!("Failed to fetch {}: {}", error_label, error))?;
-    let status = response.status();
-    if !status.is_success() {
-        return Err(http_error_message(response, error_label).await);
-    }
-    read_limited_response_bytes(response, max_bytes, error_label).await
-}
-
 async fn fetch_registry_http_bytes_optional(
     url: &str,
     max_bytes: u64,
@@ -1121,6 +1106,12 @@ async fn read_limited_response_bytes(
     Ok(bytes)
 }
 
+async fn remove_plugin_registry_cache(url: &str, extension: &str) {
+    if let Ok(path) = plugin_registry_cache_path(url, extension) {
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+}
+
 async fn fetch_registry_cached_bytes(
     url: &str,
     extension: &str,
@@ -1139,10 +1130,16 @@ async fn fetch_registry_cached_bytes(
             return Ok(bytes);
         }
     }
-    match fetch_registry_http_bytes(url, max_bytes, error_label).await {
-        Ok(bytes) => {
+    match fetch_registry_http_bytes_optional(url, max_bytes, error_label).await {
+        Ok(Some(bytes)) => {
             let _ = write_plugin_registry_cache(url, extension, &bytes).await;
             Ok(bytes)
+        }
+        // A definitive 404 means the resource is gone upstream: drop any stale
+        // cache instead of serving it forever.
+        Ok(None) => {
+            remove_plugin_registry_cache(url, extension).await;
+            Err(format!("Failed to fetch {}: HTTP 404 Not Found", error_label))
         }
         Err(error) => {
             if let Some(bytes) = read_plugin_registry_cache(url, extension, None).await {
@@ -1177,7 +1174,10 @@ async fn fetch_registry_cached_bytes_optional(
             let _ = write_plugin_registry_cache(url, extension, &bytes).await;
             Ok(Some(bytes))
         }
-        Ok(None) => Ok(None),
+        Ok(None) => {
+            remove_plugin_registry_cache(url, extension).await;
+            Ok(None)
+        }
         Err(error) => {
             if let Some(bytes) = read_plugin_registry_cache(url, extension, None).await {
                 Ok(Some(bytes))
@@ -1293,6 +1293,14 @@ pub struct PluginGithubRepoStarStatus {
 struct PluginGithubCliLoginSession {
     id: String,
     handle: tokio::task::JoinHandle<Result<PluginGithubAuthStatus, String>>,
+    progress: PluginGithubCliLoginProgressHandle,
+}
+
+type PluginGithubCliLoginProgressHandle = Arc<Mutex<PluginGithubCliLoginProgress>>;
+
+#[derive(Debug, Default)]
+struct PluginGithubCliLoginProgress {
+    user_code: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1313,6 +1321,8 @@ pub struct PluginGithubOAuthStartResult {
 #[serde(rename_all = "camelCase")]
 pub struct PluginGithubOAuthPollResult {
     pub status: String,
+    pub user_code: String,
+    pub verification_uri: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1477,9 +1487,86 @@ async fn import_github_cli_auth() -> Result<PluginGithubAuthStatus, String> {
     save_plugin_github_token_auth(&token).await
 }
 
-async fn run_github_cli_login() -> Result<(), String> {
-    run_github_cli_capture(
-        &[
+fn extract_github_cli_user_code(text: &str) -> Option<String> {
+    GITHUB_CLI_DEVICE_CODE_RE
+        .captures(text)
+        .and_then(|captures| captures.get(1))
+        .map(|code| code.as_str().to_ascii_uppercase())
+}
+
+fn update_github_cli_login_user_code(progress: &PluginGithubCliLoginProgressHandle, text: &str) {
+    let Some(user_code) = extract_github_cli_user_code(text) else {
+        return;
+    };
+
+    let mut guard = progress
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if guard.user_code.is_none() {
+        guard.user_code = Some(user_code);
+    }
+}
+
+fn github_cli_login_user_code(progress: &PluginGithubCliLoginProgressHandle) -> String {
+    progress
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .user_code
+        .clone()
+        .unwrap_or_default()
+}
+
+async fn wait_for_github_cli_user_code(progress: PluginGithubCliLoginProgressHandle) -> String {
+    let _ = timeout(PLUGIN_GITHUB_CLI_LOGIN_CODE_WAIT_TIMEOUT, async {
+        loop {
+            if !github_cli_login_user_code(&progress).is_empty() {
+                break;
+            }
+            sleep(Duration::from_millis(80)).await;
+        }
+    })
+    .await;
+
+    github_cli_login_user_code(&progress)
+}
+
+async fn read_github_cli_login_pipe<R>(
+    reader: R,
+    progress: PluginGithubCliLoginProgressHandle,
+) -> String
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut lines = BufReader::new(reader).lines();
+    let mut output = String::new();
+
+    loop {
+        match lines.next_line().await {
+            Ok(Some(line)) => {
+                update_github_cli_login_user_code(&progress, &line);
+                output.push_str(&line);
+                output.push('\n');
+            }
+            Ok(None) => break,
+            Err(error) => {
+                if !output.is_empty() {
+                    output.push('\n');
+                }
+                output.push_str(&format!("Failed to read GitHub CLI login output: {error}"));
+                break;
+            }
+        }
+    }
+
+    output.trim().to_string()
+}
+
+async fn run_github_cli_login(progress: PluginGithubCliLoginProgressHandle) -> Result<(), String> {
+    let gh = resolve_github_cli().ok_or_else(github_cli_unavailable_message)?;
+    let program = gh.path.to_string_lossy().to_string();
+    let mut command = async_command(&program);
+    command
+        .args([
             "auth",
             "login",
             "--web",
@@ -1490,20 +1577,62 @@ async fn run_github_cli_login() -> Result<(), String> {
             "https",
             "--scopes",
             PLUGIN_GITHUB_CLI_SCOPES,
-        ],
-        "GitHub CLI login",
-    )
-    .await
-    .map(|_| ())
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    apply_github_cli_env(&mut command);
+
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("Failed to run GitHub CLI login: {error}"))?;
+
+    let stdout_task = child
+        .stdout
+        .take()
+        .map(|stdout| tokio::spawn(read_github_cli_login_pipe(stdout, progress.clone())));
+    let stderr_task = child
+        .stderr
+        .take()
+        .map(|stderr| tokio::spawn(read_github_cli_login_pipe(stderr, progress)));
+
+    let status = child
+        .wait()
+        .await
+        .map_err(|error| format!("Failed to wait for GitHub CLI login: {error}"))?;
+
+    let stdout = match stdout_task {
+        Some(task) => task.await.unwrap_or_default(),
+        None => String::new(),
+    };
+    let stderr = match stderr_task {
+        Some(task) => task.await.unwrap_or_default(),
+        None => String::new(),
+    };
+
+    if !status.success() {
+        let detail = if stderr.trim().is_empty() {
+            stdout.trim()
+        } else {
+            stderr.trim()
+        };
+        if detail.is_empty() {
+            return Err("GitHub CLI login failed".to_string());
+        }
+        return Err(format!("GitHub CLI login failed: {detail}"));
+    }
+
+    Ok(())
 }
 
 fn github_cli_oauth_start_result(
     device_code: String,
+    user_code: String,
     message: Option<String>,
     auth: Option<PluginGithubAuthStatus>,
 ) -> PluginGithubOAuthStartResult {
     PluginGithubOAuthStartResult {
-        user_code: String::new(),
+        user_code,
         verification_uri: PLUGIN_GITHUB_CLI_VERIFICATION_URI.to_string(),
         device_code,
         interval: PLUGIN_GITHUB_CLI_LOGIN_INTERVAL,
@@ -1511,6 +1640,30 @@ fn github_cli_oauth_start_result(
         message,
         auth,
     }
+}
+
+fn github_cli_oauth_poll_result(
+    status: &str,
+    user_code: String,
+    message: Option<String>,
+    auth: Option<PluginGithubAuthStatus>,
+) -> PluginGithubOAuthPollResult {
+    PluginGithubOAuthPollResult {
+        status: status.to_string(),
+        user_code,
+        verification_uri: PLUGIN_GITHUB_CLI_VERIFICATION_URI.to_string(),
+        message,
+        auth,
+    }
+}
+
+fn github_cli_login_session_user_code(device_code: &str) -> Option<String> {
+    let guard = PLUGIN_GITHUB_CLI_LOGIN_SESSION
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.as_ref().and_then(|session| {
+        (session.id == device_code).then(|| github_cli_login_user_code(&session.progress))
+    })
 }
 
 async fn collect_finished_github_cli_login_session(
@@ -2299,7 +2452,8 @@ async fn resolve_plugin_download_source(
         }
         "release" | "releasetag" | "githubrelease" => {
             let tag = source_ref_value(source, "release", None);
-            resolve_github_release_source(source, Some(&tag), fallback_repo, id_hint).await
+            let tag = if tag.is_empty() { None } else { Some(tag) };
+            resolve_github_release_source(source, tag.as_deref(), fallback_repo, id_hint).await
         }
         "branch" | "tag" | "commit" => {
             let repo = source_repo_value(source, fallback_repo);
@@ -3213,6 +3367,35 @@ pub async fn plugin_install_from_source(
 }
 
 #[tauri::command]
+pub async fn plugin_set_enabled(
+    plugin_id: String,
+    scope: PluginInstallScope,
+    enabled: bool,
+    workspace: State<'_, Arc<Workspace>>,
+    registry: State<'_, AgentDefRegistryState>,
+    app_agent_dir: State<'_, AppAgentDir>,
+    app_handle: AppHandle,
+) -> Result<InstalledPluginSummary, AppError> {
+    let working_dir = workspace.path.read().await.clone();
+    if scope == PluginInstallScope::Project && working_dir.trim().is_empty() {
+        return Err("No working directory selected".to_string().into());
+    }
+    let summary = set_plugin_enabled_sync(&working_dir, &plugin_id, scope, enabled)
+        .map_err(AppError::from)?;
+    reload_agent_registry(&registry, &app_agent_dir, &working_dir).await;
+    emit_plugins_changed(
+        &app_handle,
+        &working_dir,
+        if enabled {
+            "plugin_enable"
+        } else {
+            "plugin_disable"
+        },
+    );
+    Ok(summary)
+}
+
+#[tauri::command]
 pub async fn plugin_github_auth_status() -> Result<PluginGithubAuthStatus, AppError> {
     let config = read_plugin_github_auth_config().await;
     Ok(plugin_github_auth_status_from_config(config))
@@ -3261,6 +3444,7 @@ pub async fn plugin_github_oauth_start() -> Result<PluginGithubOAuthStartResult,
     if let Ok(auth) = import_github_cli_auth().await {
         return Ok(github_cli_oauth_start_result(
             "completed".to_string(),
+            String::new(),
             Some("GitHub CLI authentication imported".to_string()),
             Some(auth),
         ));
@@ -3271,6 +3455,7 @@ pub async fn plugin_github_oauth_start() -> Result<PluginGithubOAuthStartResult,
             Ok(auth) => {
                 return Ok(github_cli_oauth_start_result(
                     "completed".to_string(),
+                    String::new(),
                     Some("GitHub CLI authentication imported".to_string()),
                     Some(auth),
                 ));
@@ -3287,6 +3472,7 @@ pub async fn plugin_github_oauth_start() -> Result<PluginGithubOAuthStartResult,
             if !session.handle.is_finished() {
                 return Ok(github_cli_oauth_start_result(
                     session.id.clone(),
+                    github_cli_login_user_code(&session.progress),
                     Some("GitHub CLI login is already in progress".to_string()),
                     None,
                 ));
@@ -3295,20 +3481,28 @@ pub async fn plugin_github_oauth_start() -> Result<PluginGithubOAuthStartResult,
     }
 
     let session_id = uuid::Uuid::new_v4().to_string();
-    let handle = tokio::spawn(async {
-        run_github_cli_login().await?;
+    let progress = Arc::new(Mutex::new(PluginGithubCliLoginProgress::default()));
+    let login_progress = progress.clone();
+    let handle = tokio::spawn(async move {
+        run_github_cli_login(login_progress).await?;
         import_github_cli_auth().await
     });
-    let mut guard = PLUGIN_GITHUB_CLI_LOGIN_SESSION
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    *guard = Some(PluginGithubCliLoginSession {
-        id: session_id.clone(),
-        handle,
-    });
+    {
+        let mut guard = PLUGIN_GITHUB_CLI_LOGIN_SESSION
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = Some(PluginGithubCliLoginSession {
+            id: session_id.clone(),
+            handle,
+            progress: progress.clone(),
+        });
+    }
+
+    let user_code = wait_for_github_cli_user_code(progress).await;
 
     Ok(github_cli_oauth_start_result(
         session_id,
+        user_code,
         Some("GitHub CLI login started".to_string()),
         None,
     ))
@@ -3325,26 +3519,31 @@ pub async fn plugin_github_oauth_poll(
         ));
     }
 
+    let user_code = github_cli_login_session_user_code(&device_code).unwrap_or_default();
+
     if let Ok(auth) = import_github_cli_auth().await {
-        return Ok(PluginGithubOAuthPollResult {
-            status: "success".to_string(),
-            message: None,
-            auth: Some(auth),
-        });
+        return Ok(github_cli_oauth_poll_result(
+            "success",
+            user_code,
+            None,
+            Some(auth),
+        ));
     }
 
     if let Some(result) = collect_finished_github_cli_login_session(Some(&device_code)).await {
         return match result {
-            Ok(auth) => Ok(PluginGithubOAuthPollResult {
-                status: "success".to_string(),
-                message: None,
-                auth: Some(auth),
-            }),
-            Err(error) => Ok(PluginGithubOAuthPollResult {
-                status: "failed".to_string(),
-                message: Some(error),
-                auth: None,
-            }),
+            Ok(auth) => Ok(github_cli_oauth_poll_result(
+                "success",
+                user_code,
+                None,
+                Some(auth),
+            )),
+            Err(error) => Ok(github_cli_oauth_poll_result(
+                "failed",
+                user_code,
+                Some(error),
+                None,
+            )),
         };
     }
 
@@ -3358,18 +3557,17 @@ pub async fn plugin_github_oauth_poll(
             .unwrap_or(false)
     };
     if !has_matching_session {
-        return Ok(PluginGithubOAuthPollResult {
-            status: "failed".to_string(),
-            message: Some("GitHub CLI login session expired".to_string()),
-            auth: None,
-        });
+        return Ok(github_cli_oauth_poll_result(
+            "failed",
+            user_code,
+            Some("GitHub CLI login session expired".to_string()),
+            None,
+        ));
     }
 
-    Ok(PluginGithubOAuthPollResult {
-        status: "pending".to_string(),
-        message: None,
-        auth: None,
-    })
+    Ok(github_cli_oauth_poll_result(
+        "pending", user_code, None, None,
+    ))
 }
 
 #[tauri::command]
@@ -3457,6 +3655,22 @@ mod tests {
         assert_eq!(
             String::from_utf8(decoded).expect("utf8 credential"),
             "x-access-token:ghp_test_token"
+        );
+    }
+
+    #[test]
+    fn extracts_github_cli_device_code_from_login_output() {
+        assert_eq!(
+            extract_github_cli_user_code("! First copy your one-time code: ABCD-EFGH"),
+            Some("ABCD-EFGH".to_string())
+        );
+        assert_eq!(
+            extract_github_cli_user_code("Enter the code displayed in the app: 12345678"),
+            Some("12345678".to_string())
+        );
+        assert_eq!(
+            extract_github_cli_user_code("Waiting for authorization..."),
+            None
         );
     }
 

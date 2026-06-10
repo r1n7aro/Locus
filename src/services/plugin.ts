@@ -28,6 +28,7 @@ export interface InstalledPluginSummary {
   name: string;
   version: string;
   scope: PluginInstallScope;
+  enabled: boolean;
   root: string;
   compatibility?: PluginCompatibilitySummary;
   dependencies?: PluginDependencySummary;
@@ -215,6 +216,8 @@ export interface PluginGithubOAuthStartResult {
 
 export interface PluginGithubOAuthPollResult {
   status: "pending" | "success" | "failed";
+  userCode?: string;
+  verificationUri?: string;
   message?: string | null;
   auth?: PluginGithubAuthStatus | null;
 }
@@ -240,6 +243,18 @@ export function pluginUninstall(
   return ipcInvoke<string>("plugin_uninstall", {
     pluginId,
     scope,
+  });
+}
+
+export function pluginSetEnabled(
+  pluginId: string,
+  scope: PluginInstallScope,
+  enabled: boolean,
+): Promise<InstalledPluginSummary> {
+  return ipcInvoke<InstalledPluginSummary>("plugin_set_enabled", {
+    pluginId,
+    scope,
+    enabled,
   });
 }
 

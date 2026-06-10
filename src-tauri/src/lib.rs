@@ -1148,6 +1148,7 @@ pub fn run() {
             commands::plugin_install_from_path,
             commands::plugin_install_from_registry,
             commands::plugin_install_from_source,
+            commands::plugin_set_enabled,
             commands::plugin_github_auth_status,
             commands::plugin_github_repo_star_status,
             commands::plugin_github_repo_set_starred,

@@ -2,8 +2,9 @@
   "schema": "locus.skill.v1",
   "id": "plugin",
   "name": "Plugin",
-  "version": "1.0.0",
-  "description": "Search, install, uninstall, create, package, and publish Locus plugins from natural-language requests.",
+  "version": "1.1.0",
+  "injectMode": "excerpt",
+  "description": "Load when plugin or 插件 means a Locus app extension: search, install, enable, disable, uninstall, create, package, publish. Ignore Unity project plugins.",
   "argumentHint": "<plugin request>",
   "command": {
     "enabled": true,

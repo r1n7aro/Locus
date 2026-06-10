@@ -1917,20 +1917,12 @@ pub async fn knowledge_list(
     .map_err(AppError::from)?;
     let mut items = items;
     if resolved_type.is_none() || resolved_type == Some(KnowledgeType::Skill) {
-        let existing_paths = items
-            .iter()
-            .filter(|item| item.doc_type == KnowledgeType::Skill)
-            .map(|item| item.path.clone())
-            .collect::<HashSet<_>>();
-        items.extend(
-            super::skill::list_skill_package_knowledge_items_sync_with_hidden(
-                &working_dir,
-                resolved_prefix.as_deref(),
-                include_hidden.unwrap_or(false),
-            )
-            .into_iter()
-            .filter(|item| !existing_paths.contains(&item.path)),
+        let package_items = super::skill::list_skill_package_knowledge_items_sync_with_hidden(
+            &working_dir,
+            resolved_prefix.as_deref(),
+            include_hidden.unwrap_or(false),
         );
+        merge_live_skill_package_items(&mut items, package_items);
         items.sort_by(|a, b| {
             a.doc_type
                 .as_str()
@@ -1939,9 +1931,15 @@ pub async fn knowledge_list(
                 .then(a.title.cmp(&b.title))
         });
     }
+    let include_package_documents = resolved_type == Some(KnowledgeType::Skill)
+        && super::skill::skill_package_path_prefix_targets_package_sync(
+            &working_dir,
+            resolved_prefix.as_deref(),
+        );
     if !include_hidden.unwrap_or(false) {
         items.retain(|item| {
-            item.inject_mode != KnowledgeInjectMode::None
+            (item.inject_mode != KnowledgeInjectMode::None
+                || (include_package_documents && is_skill_package_item(item)))
                 && item_model_recall_allowed(&working_dir, item).unwrap_or(false)
         });
     }
@@ -1957,6 +1955,36 @@ pub async fn knowledge_list(
         items.len()
     );
     Ok(items)
+}
+
+fn is_skill_package_item(item: &KnowledgeListItem) -> bool {
+    item.doc_type == KnowledgeType::Skill
+        && item
+            .external_source
+            .as_ref()
+            .map(|source| source.provider == KnowledgeSourceProvider::Package)
+            .unwrap_or(false)
+}
+
+fn remove_cached_skill_package_items(items: &mut Vec<KnowledgeListItem>) {
+    items.retain(|item| !is_skill_package_item(item));
+}
+
+fn merge_live_skill_package_items(
+    items: &mut Vec<KnowledgeListItem>,
+    package_items: Vec<KnowledgeListItem>,
+) {
+    remove_cached_skill_package_items(items);
+    let existing_paths = items
+        .iter()
+        .filter(|item| item.doc_type == KnowledgeType::Skill)
+        .map(|item| item.path.clone())
+        .collect::<HashSet<_>>();
+    items.extend(
+        package_items
+            .into_iter()
+            .filter(|item| !existing_paths.contains(&item.path)),
+    );
 }
 
 #[tauri::command]
@@ -2058,6 +2086,11 @@ fn enrich_knowledge_list_items(
 fn item_model_recall_allowed(working_dir: &str, item: &KnowledgeListItem) -> Result<bool, String> {
     if item.doc_type != KnowledgeType::Skill {
         return Ok(true);
+    }
+    if is_skill_package_item(item)
+        && !super::skill::skill_package_virtual_path_exists_sync(working_dir, &item.path)?
+    {
+        return Ok(false);
     }
     if let Some(allowed) =
         super::skill::skill_package_virtual_path_allows_model_recall_sync(working_dir, &item.path)?
@@ -3676,7 +3709,7 @@ fn scan_plugin_rule_sources(
             };
             let title = extract_title_from_file(&path, &file_name);
             let updated_at = get_updated_at(&path);
-            let cfg = rule_config_or_default(configs, &key, false, default_order);
+            let cfg = rule_config_or_default(configs, &key, true, default_order);
             default_order = default_order.saturating_add(1);
 
             items.push(AgentRuleFileEntry {
@@ -3684,7 +3717,7 @@ fn scan_plugin_rule_sources(
                 file_name,
                 title,
                 order: cfg.order,
-                enabled: cfg.enabled,
+                enabled: true,
                 updated_at,
                 source: source.scope.component_source().to_string(),
                 read_only: true,
@@ -3913,6 +3946,15 @@ pub async fn set_rule_enabled(
         collect_agent_rule_files(app_agent_dir.0.as_ref(), &working_dir, &agent_id, false)?
             .into_iter()
             .find(|entry| entry.key == file_name || entry.file_name == file_name);
+    if existing_entry
+        .as_ref()
+        .and_then(|entry| entry.plugin_id.as_ref())
+        .is_some()
+    {
+        return Err("Plugin Rule enablement is controlled by plugin state"
+            .to_string()
+            .into());
+    }
     let mut configs = load_rule_config(&working_dir, &agent_id);
     let max_order = configs.values().map(|cfg| cfg.order).max().unwrap_or(-1);
     let cfg = configs.entry(file_name).or_insert_with(|| RuleConfig {
@@ -3982,6 +4024,49 @@ mod tests {
         }
     }
 
+    fn package_list_item(path: &str) -> KnowledgeListItem {
+        KnowledgeListItem {
+            doc_type: KnowledgeType::Skill,
+            path: path.to_string(),
+            external_source: Some(knowledge_store::KnowledgeExternalSource {
+                provider: KnowledgeSourceProvider::Package,
+                locator: Some("plugin://app/example".to_string()),
+                source_id: Some("example".to_string()),
+                sync_enabled: false,
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn cached_skill_package_items_are_replaced_by_live_scan_results() {
+        let mut items = vec![
+            package_list_item("old-plugin/SKILL.md"),
+            package_list_item("current-plugin/SKILL.md"),
+            KnowledgeListItem {
+                doc_type: KnowledgeType::Skill,
+                path: "project-skill.md".to_string(),
+                ..Default::default()
+            },
+        ];
+        let mut live_current = package_list_item("current-plugin/SKILL.md");
+        live_current.inject_mode = KnowledgeInjectMode::Path;
+
+        merge_live_skill_package_items(&mut items, vec![live_current]);
+
+        let paths = items
+            .iter()
+            .map(|item| (item.path.as_str(), item.inject_mode))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            paths,
+            vec![
+                ("project-skill.md", KnowledgeInjectMode::None),
+                ("current-plugin/SKILL.md", KnowledgeInjectMode::Path),
+            ]
+        );
+    }
+
     fn write_plugin_rule(workspace: &TempDir, plugin_id: &str, file_name: &str, content: &str) {
         let plugin_root = workspace
             .path()
@@ -4010,7 +4095,7 @@ mod tests {
     }
 
     #[test]
-    fn plugin_rules_are_optional_per_agent() {
+    fn plugin_rules_default_enabled_and_keep_order_override() {
         let workspace = TempDir::new().expect("workspace");
         let working_dir = workspace.path().to_string_lossy().to_string();
         write_plugin_rule(
@@ -4030,7 +4115,7 @@ mod tests {
         assert_eq!(plugin_rule.file_name, "risk_control.md");
         assert_eq!(plugin_rule.source, "pluginProject");
         assert!(plugin_rule.read_only);
-        assert!(!plugin_rule.enabled);
+        assert!(plugin_rule.enabled);
         assert!(plugin_rule
             .key
             .starts_with("plugin:project:com.example.rules:"));
@@ -4039,15 +4124,15 @@ mod tests {
         config.insert(
             plugin_rule.key.clone(),
             RuleConfig {
-                enabled: true,
+                enabled: false,
                 order: 3,
             },
         );
         save_rule_config(&working_dir, "dev", &config).expect("save rule config");
 
-        let enabled =
-            collect_agent_rule_files(&None, &working_dir, "dev", false).expect("collect enabled");
-        let plugin_rule = enabled
+        let ordered =
+            collect_agent_rule_files(&None, &working_dir, "dev", false).expect("collect ordered");
+        let plugin_rule = ordered
             .iter()
             .find(|item| item.plugin_id.as_deref() == Some("com.example.rules"))
             .expect("plugin rule should still be listed");

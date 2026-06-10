@@ -12,6 +12,7 @@ pub const APP_PLUGINS_DIR_NAME: &str = "plugins";
 
 const PLUGIN_ARCHIVE_MAX_ENTRIES: usize = 20_000;
 const PLUGIN_ARCHIVE_MAX_UNCOMPRESSED_BYTES: u64 = 512 * 1024 * 1024;
+const PLUGIN_STATE_FILE_NAME: &str = "plugin_state.json";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "lowercase")]
@@ -43,6 +44,7 @@ pub struct InstalledPluginSummary {
     pub name: String,
     pub version: String,
     pub scope: PluginInstallScope,
+    pub enabled: bool,
     pub root: String,
     pub compatibility: LocusPluginCompatibility,
     pub dependencies: LocusPluginDependencies,
@@ -156,6 +158,19 @@ pub struct PluginComponentRef {
     pub path: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PluginStateEntry {
+    #[serde(default = "default_plugin_enabled")]
+    enabled: bool,
+}
+
+fn default_plugin_enabled() -> bool {
+    true
+}
+
+type PluginStateConfig = std::collections::BTreeMap<String, PluginStateEntry>;
+
 impl RawPluginComponentRef {
     fn normalize(&self) -> PluginComponentRef {
         match self {
@@ -244,6 +259,69 @@ pub fn project_plugins_dir(working_dir: &str) -> Result<PathBuf, String> {
         return Err("No working directory selected".to_string());
     }
     Ok(Path::new(trimmed).join(PROJECT_PLUGINS_RELATIVE))
+}
+
+fn project_plugin_state_path(working_dir: &str) -> Result<PathBuf, String> {
+    let trimmed = working_dir.trim();
+    if trimmed.is_empty() {
+        return Err("No working directory selected".to_string());
+    }
+    Ok(Path::new(trimmed)
+        .join("Library")
+        .join("Locus")
+        .join(PLUGIN_STATE_FILE_NAME))
+}
+
+fn plugin_state_path_for_scope(
+    working_dir: &str,
+    scope: PluginInstallScope,
+) -> Result<PathBuf, String> {
+    match scope {
+        PluginInstallScope::App => {
+            Ok(crate::commands::persistent_config_dir()?.join(PLUGIN_STATE_FILE_NAME))
+        }
+        PluginInstallScope::Project => project_plugin_state_path(working_dir),
+    }
+}
+
+fn load_plugin_state_for_scope(working_dir: &str, scope: PluginInstallScope) -> PluginStateConfig {
+    let Ok(path) = plugin_state_path_for_scope(working_dir, scope) else {
+        return PluginStateConfig::new();
+    };
+    match fs::read_to_string(path) {
+        Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
+        Err(_) => PluginStateConfig::new(),
+    }
+}
+
+fn save_plugin_state_for_scope(
+    working_dir: &str,
+    scope: PluginInstallScope,
+    config: &PluginStateConfig,
+) -> Result<(), String> {
+    let path = plugin_state_path_for_scope(working_dir, scope)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create plugin state directory: {}", e))?;
+    }
+    let json = serde_json::to_string_pretty(config)
+        .map_err(|e| format!("Failed to serialize plugin state: {}", e))?;
+    fs::write(&path, json).map_err(|e| format!("Failed to save plugin state: {}", e))?;
+    Ok(())
+}
+
+pub fn plugin_enabled_for_scope(
+    working_dir: &str,
+    plugin_id: &str,
+    scope: PluginInstallScope,
+) -> bool {
+    let Ok(plugin_id) = normalize_plugin_id(plugin_id) else {
+        return false;
+    };
+    load_plugin_state_for_scope(working_dir, scope)
+        .get(&plugin_id)
+        .map(|entry| entry.enabled)
+        .unwrap_or(true)
 }
 
 fn plugins_dir_for_scope(
@@ -460,6 +538,9 @@ fn component_refs_for_kind(plugin: &InstalledPlugin, kind: &str) -> Vec<PluginCo
 fn component_sources_for_kind(working_dir: &str, kind: &str) -> Vec<PluginComponentSource> {
     let mut sources = Vec::new();
     for plugin in installed_plugins(working_dir) {
+        if !plugin_enabled_for_scope(working_dir, &plugin.id, plugin.scope) {
+            continue;
+        }
         for component in component_refs_for_kind(&plugin, kind) {
             match safe_component_root(&plugin.root, &component.path) {
                 Ok((root, rel_path)) if root.exists() => sources.push(PluginComponentSource {
@@ -521,12 +602,13 @@ fn component_summary(
 }
 
 impl InstalledPlugin {
-    pub fn summary(&self) -> InstalledPluginSummary {
+    pub fn summary(&self, working_dir: &str) -> InstalledPluginSummary {
         InstalledPluginSummary {
             id: self.id.clone(),
             name: self.name.clone(),
             version: self.version.clone(),
             scope: self.scope,
+            enabled: plugin_enabled_for_scope(working_dir, &self.id, self.scope),
             root: self.root.display().to_string().replace('\\', "/"),
             compatibility: self.manifest.compatibility.clone(),
             dependencies: self.manifest.dependencies.clone(),
@@ -553,8 +635,30 @@ impl InstalledPlugin {
 pub fn list_installed_plugin_summaries(working_dir: &str) -> Vec<InstalledPluginSummary> {
     installed_plugins(working_dir)
         .into_iter()
-        .map(|plugin| plugin.summary())
+        .map(|plugin| plugin.summary(working_dir))
         .collect()
+}
+
+pub fn set_plugin_enabled_sync(
+    working_dir: &str,
+    plugin_id: &str,
+    scope: PluginInstallScope,
+    enabled: bool,
+) -> Result<InstalledPluginSummary, String> {
+    let plugin_id = normalize_plugin_id(plugin_id)?;
+    let plugin = installed_plugins(working_dir)
+        .into_iter()
+        .find(|plugin| plugin.id == plugin_id && plugin.scope == scope)
+        .ok_or_else(|| format!("Plugin not installed: {}", plugin_id))?;
+
+    let mut config = load_plugin_state_for_scope(working_dir, scope);
+    if enabled {
+        config.remove(&plugin_id);
+    } else {
+        config.insert(plugin_id.clone(), PluginStateEntry { enabled });
+    }
+    save_plugin_state_for_scope(working_dir, scope, &config)?;
+    Ok(plugin.summary(working_dir))
 }
 
 pub fn inspect_plugin_source_manifest_sync(
@@ -792,7 +896,7 @@ pub fn install_plugin_from_path_sync(
                 root: target_root,
                 manifest: staged_manifest,
             };
-            Ok(plugin.summary())
+            Ok(plugin.summary(working_dir))
         } else {
             extract_plugin_archive(&source_path, &staging_root)?;
             let source_root = locate_plugin_root(&staging_root)?;
@@ -815,7 +919,7 @@ pub fn install_plugin_from_path_sync(
                 root: target_root,
                 manifest: staged_manifest,
             };
-            Ok(plugin.summary())
+            Ok(plugin.summary(working_dir))
         }
     })();
 
@@ -913,6 +1017,10 @@ pub fn uninstall_plugin_sync(
             e
         )
     })?;
+    let mut config = load_plugin_state_for_scope(working_dir, scope);
+    if config.remove(&plugin_id).is_some() {
+        save_plugin_state_for_scope(working_dir, scope, &config)?;
+    }
     Ok(plugin_id)
 }
 
@@ -963,6 +1071,13 @@ mod tests {
 
     fn project_plugin_parent(workspace: &TempDir) -> PathBuf {
         project_plugins_dir(&workspace_path(workspace)).expect("project plugin dir")
+    }
+
+    fn rule_source_count(working_dir: &str, plugin_id: &str) -> usize {
+        installed_rule_sources(working_dir)
+            .into_iter()
+            .filter(|source| source.plugin_id == plugin_id)
+            .count()
     }
 
     fn assert_no_install_artifacts(parent: &Path) {
@@ -1080,6 +1195,53 @@ mod tests {
 
         assert_eq!(summary.rules.len(), 1);
         assert_eq!(summary.rules[0].path, "rules/risk_control.md");
+    }
+
+    #[test]
+    fn plugin_enabled_state_filters_project_components() {
+        let workspace = TempDir::new().expect("workspace");
+        let working_dir = workspace_path(&workspace);
+        let plugin_root = project_plugin_parent(&workspace).join("com.example.toggle");
+        write_plugin_source(&plugin_root, "com.example.toggle", "1.0.0", "");
+        fs::create_dir_all(plugin_root.join("rules")).expect("create rules dir");
+        fs::write(plugin_root.join("rules").join("style.md"), "# Style").expect("write rule");
+
+        let summaries = list_installed_plugin_summaries(&working_dir);
+        let summary = summaries
+            .iter()
+            .find(|plugin| plugin.id == "com.example.toggle")
+            .expect("plugin summary");
+        assert!(summary.enabled);
+        assert_eq!(rule_source_count(&working_dir, "com.example.toggle"), 1);
+
+        let disabled = set_plugin_enabled_sync(
+            &working_dir,
+            "com.example.toggle",
+            PluginInstallScope::Project,
+            false,
+        )
+        .expect("disable plugin");
+        assert!(!disabled.enabled);
+        assert_eq!(disabled.rules.len(), 1);
+        assert_eq!(rule_source_count(&working_dir, "com.example.toggle"), 0);
+
+        let summaries = list_installed_plugin_summaries(&working_dir);
+        let summary = summaries
+            .iter()
+            .find(|plugin| plugin.id == "com.example.toggle")
+            .expect("plugin summary");
+        assert!(!summary.enabled);
+        assert_eq!(summary.rules.len(), 1);
+
+        let enabled = set_plugin_enabled_sync(
+            &working_dir,
+            "com.example.toggle",
+            PluginInstallScope::Project,
+            true,
+        )
+        .expect("enable plugin");
+        assert!(enabled.enabled);
+        assert_eq!(rule_source_count(&working_dir, "com.example.toggle"), 1);
     }
 
     #[test]

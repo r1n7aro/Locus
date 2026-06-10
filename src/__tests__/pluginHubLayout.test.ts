@@ -311,6 +311,37 @@ describe("plugin hub layout", () => {
     expect(en).toContain('"plugin.import.link": "Import From Link"');
   });
 
+  it("uses plugin enabled state as the installed plugin switch", () => {
+    const source = read("src/components/PluginView.vue");
+    const service = read("src/services/plugin.ts");
+    const backend = read("src-tauri/src/commands/plugin.rs");
+    const pluginModel = read("src-tauri/src/plugin.rs");
+    const lib = read("src-tauri/src/lib.rs");
+    const zh = read("src/language/zh.json");
+    const en = read("src/language/en.json");
+
+    expect(source).toContain("BaseSwitch");
+    expect(source).toContain("pluginSetEnabled");
+    expect(source).toContain("const pluginEnableKey = ref(\"\")");
+    expect(source).toContain("function setPluginEnabledState");
+    expect(source).toContain(":model-value=\"plugin.enabled\"");
+    expect(source).toContain(":model-value=\"selectedInstalledPlugin.enabled\"");
+    expect(source).toContain("plugin-state-tag");
+    expect(source).toContain("plugin.notice.enabled");
+    expect(source).toContain("plugin.notice.disabled");
+    expect(service).toContain("enabled: boolean");
+    expect(service).toContain('ipcInvoke<InstalledPluginSummary>("plugin_set_enabled"');
+    expect(backend).toContain("pub async fn plugin_set_enabled");
+    expect(backend).toContain("set_plugin_enabled_sync");
+    expect(lib).toContain("commands::plugin_set_enabled");
+    expect(pluginModel).toContain("PLUGIN_STATE_FILE_NAME");
+    expect(pluginModel).toContain("plugin_enabled_for_scope");
+    expect(pluginModel).toContain("component_sources_for_kind");
+    expect(zh).toContain('"plugin.detail.status": "状态"');
+    expect(zh).toContain('"plugin.hub.disable": "停用"');
+    expect(en).toContain('"plugin.notice.disabled": "Disabled plugin: {0}"');
+  });
+
   it("keeps plugin list descriptions single-line", () => {
     const source = read("src/components/PluginView.vue");
     const summaryStyleStart = source.indexOf(".plugin-list-summary");
@@ -476,9 +507,9 @@ describe("plugin hub layout", () => {
     const selectEnd = source.indexOf("function registryCompatibilityLabel", selectStart);
     const selectBlock = source.slice(selectStart, selectEnd);
 
-    expect(refreshBlock).toContain("await loadMoreRegistryBuckets(REGISTRY_BUCKET_BATCH_SIZE, { cacheMode: options.cacheMode })");
+    expect(refreshBlock).toContain("await loadMoreRegistryBuckets(REGISTRY_BUCKET_BATCH_SIZE, { cacheMode: options.cacheMode }, generation)");
     expect(refreshBlock).toContain("void loadInstalledRegistryEntries()");
-    expect(refreshBlock.indexOf("await loadMoreRegistryBuckets(REGISTRY_BUCKET_BATCH_SIZE, { cacheMode: options.cacheMode })")).toBeLessThan(
+    expect(refreshBlock.indexOf("await loadMoreRegistryBuckets(REGISTRY_BUCKET_BATCH_SIZE, { cacheMode: options.cacheMode }, generation)")).toBeLessThan(
       refreshBlock.indexOf("void loadInstalledRegistryEntries()"),
     );
     expect(refreshBlock).not.toContain("await loadInstalledRegistryEntries()");

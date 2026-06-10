@@ -457,7 +457,9 @@ function skillPackageIdForDocument(
   return document.externalSource.sourceId?.trim() || firstSegment;
 }
 
-function isSkillPackageRootDocument(document: KnowledgeDocumentSummary): boolean {
+export function isSkillPackageRootDocument(
+  document: KnowledgeDocumentSummary,
+): boolean {
   const packageId = skillPackageIdForDocument(document);
   if (!packageId) return false;
   const normalizedPath = document.path.replace(/\\/g, "/").replace(/^\/+/, "");
@@ -680,6 +682,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
   let pendingSaveCount = 0;
   let releaseSelectionLock: (() => void) | null = null;
   let knowledgeChangedUnlisten: UnlistenFn | null = null;
+  let pluginsChangedUnlisten: UnlistenFn | null = null;
   let lexicalRebuildStatusUnlisten: UnlistenFn | null = null;
   let destroyed = false;
   let loadedDirectoryDocumentPaths = emptyLoadedDirectoryDocumentPaths();
@@ -3883,13 +3886,22 @@ export function useKnowledgeState(props: KnowledgeProps) {
         handleLexicalRebuildStatus(event.payload);
       },
     );
+    const releasePluginsChanged = await listen<void>(
+      "plugins-changed",
+      () => {
+        if (!hasWorkspace.value) return;
+        scheduleExternalRefresh();
+      },
+    );
 
     if (destroyed) {
       release();
+      releasePluginsChanged();
       releaseLexicalRebuildStatus();
       return;
     }
     knowledgeChangedUnlisten = release;
+    pluginsChangedUnlisten = releasePluginsChanged;
     lexicalRebuildStatusUnlisten = releaseLexicalRebuildStatus;
   });
 
@@ -3901,6 +3913,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
     stopFeishuReferenceStatusPoll();
     stopUnityReferenceStatusPoll();
     knowledgeChangedUnlisten?.();
+    pluginsChangedUnlisten?.();
     lexicalRebuildStatusUnlisten?.();
     endExplorerDrag();
   });

@@ -4,15 +4,18 @@ export interface PluginRegistrySource {
   owner: string;
   repo: string;
   url?: string;
+  provider?: PluginRegistryProvider;
   branch: string;
   path: string;
 }
+
+export type PluginRegistryProvider = "github" | "gitlab" | "gitee" | "gitea" | "raw";
 
 export interface ParsedPluginRegistryRepo {
   owner: string;
   repo: string;
   url: string;
-  provider: "github" | "gitlab" | "gitee" | "gitea" | "raw";
+  provider: PluginRegistryProvider;
   branch?: string;
   path?: string;
 }
@@ -212,24 +215,45 @@ export function pluginRegistrySourceRepoLabel(source: PluginRegistrySource): str
   return `${source.owner}/${source.repo}`;
 }
 
+const KNOWN_PLUGIN_REGISTRY_PROVIDERS: readonly PluginRegistryProvider[] = ["github", "gitlab", "gitee", "gitea", "raw"];
+
+function knownPluginRegistryProvider(value: unknown): PluginRegistryProvider | null {
+  return KNOWN_PLUGIN_REGISTRY_PROVIDERS.includes(value as PluginRegistryProvider)
+    ? value as PluginRegistryProvider
+    : null;
+}
+
+// Self-hosted Gitea/GitLab URLs are persisted as the bare repo URL, which
+// re-parses as provider "raw"; the stored provider keeps branch/path-based
+// base-URL construction working across the save/load round-trip.
+function resolvePluginRegistrySourceProvider(
+  stored: unknown,
+  parsed: ParsedPluginRegistryRepo,
+): PluginRegistryProvider {
+  if (parsed.provider !== "raw") return parsed.provider;
+  const known = knownPluginRegistryProvider(stored);
+  return known && known !== "raw" ? known : parsed.provider;
+}
+
 export function pluginRegistrySourceBaseUrl(source: PluginRegistrySource): string {
   const parsed = parsePluginRegistryRepoInput(pluginRegistrySourceRepoLabel(source));
   if (!parsed) return DEFAULT_PLUGIN_REGISTRY_SOURCE.url
     ? pluginRegistrySourceBaseUrl(DEFAULT_PLUGIN_REGISTRY_SOURCE)
     : `https://raw.githubusercontent.com/${DEFAULT_PLUGIN_REGISTRY_SOURCE.owner}/${DEFAULT_PLUGIN_REGISTRY_SOURCE.repo}/${DEFAULT_PLUGIN_REGISTRY_BRANCH}/${DEFAULT_PLUGIN_REGISTRY_PATH}`;
-  if (parsed.provider === "raw") {
+  const provider = resolvePluginRegistrySourceProvider(source.provider, parsed);
+  if (provider === "raw") {
     return parsed.url.trimEnd().replace(/\/+$/g, "");
   }
   const branch = encodeURIComponent(parsed.branch ?? normalizePluginRegistryBranch(source.branch));
   const path = normalizePluginRegistrySourcePath(parsed, source.path) ?? DEFAULT_PLUGIN_REGISTRY_PATH;
   const encodedPath = path.split("/").map((segment) => encodeURIComponent(segment)).join("/");
-  if (parsed.provider === "gitlab") {
+  if (provider === "gitlab") {
     return `${parsed.url}/-/raw/${branch}/${encodedPath}`;
   }
-  if (parsed.provider === "gitee") {
+  if (provider === "gitee") {
     return `${parsed.url}/raw/${branch}/${encodedPath}`;
   }
-  if (parsed.provider === "gitea") {
+  if (provider === "gitea") {
     return `${parsed.url}/raw/branch/${branch}/${encodedPath}`;
   }
   const owner = encodeURIComponent(parsed.owner);
@@ -245,6 +269,7 @@ export function normalizePluginRegistrySource(value: Partial<PluginRegistrySourc
   );
   const parsed = parsePluginRegistryRepoInput(input);
   if (!parsed) return null;
+  const provider = resolvePluginRegistrySourceProvider(value.provider, parsed);
   const branch = normalizePluginRegistryBranch(value.branch ?? parsed.branch ?? "");
   const path = normalizePluginRegistrySourcePath(parsed, value.path ?? parsed.path ?? DEFAULT_PLUGIN_REGISTRY_PATH);
   if (!path) return null;
@@ -258,10 +283,11 @@ export function normalizePluginRegistrySource(value: Partial<PluginRegistrySourc
     owner: parsed.owner,
     repo: parsed.repo,
     url,
+    provider,
     branch,
     path,
   });
-  return { id, name, owner: parsed.owner, repo: parsed.repo, url, branch, path };
+  return { id, name, owner: parsed.owner, repo: parsed.repo, url, provider, branch, path };
 }
 
 export function normalizePluginRegistrySources(values: unknown): PluginRegistrySource[] {

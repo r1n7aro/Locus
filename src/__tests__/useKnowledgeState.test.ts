@@ -914,6 +914,93 @@ describe("useKnowledgeState", () => {
     mounted.unmount();
   });
 
+  it("refreshes the active skill list when installed plugins change", async () => {
+    vi.useFakeTimers();
+    const designDocs: KnowledgeDocumentSummary[] = [
+      {
+        id: "design-1",
+        type: "design",
+        path: "combat/core-loop.md",
+        title: "核心循环",
+        injectMode: "excerpt",
+        summaryEnabled: true,
+        commandEnabled: false,
+        readOnly: false,
+        aiMaintained: false,
+        explicitMaintenanceRules: false,
+        summary: "摘要",
+        createdAt: 1,
+        updatedAt: 2,
+        hasSummary: true,
+      },
+    ];
+    let skillDocs: KnowledgeDocumentSummary[] = [
+      {
+        id: "skill-old",
+        type: "skill",
+        path: "old-plugin/SKILL.md",
+        title: "Old Plugin",
+        injectMode: "excerpt",
+        summaryEnabled: true,
+        commandEnabled: true,
+        readOnly: true,
+        aiMaintained: false,
+        explicitMaintenanceRules: false,
+        summary: "Old",
+        createdAt: 1,
+        updatedAt: 2,
+        hasSummary: true,
+      },
+    ];
+    knowledgeMocks.knowledgeList.mockImplementation(async (input: any = {}) =>
+      input.type === "skill" ? skillDocs : designDocs,
+    );
+
+    const props = reactive({
+      workingDir: "F:/repo",
+      selectedModelId: "",
+      modelDefaults: {} as any,
+    });
+    const mounted = mountKnowledgeState(props);
+    await flushPromises(8);
+    await mounted.state.selectType("skill");
+    await flushPromises(8);
+
+    knowledgeMocks.knowledgeList.mockClear();
+    skillDocs = [
+      {
+        id: "skill-new",
+        type: "skill",
+        path: "new-plugin/SKILL.md",
+        title: "New Plugin",
+        injectMode: "excerpt",
+        summaryEnabled: true,
+        commandEnabled: true,
+        readOnly: true,
+        aiMaintained: false,
+        explicitMaintenanceRules: false,
+        summary: "New",
+        createdAt: 3,
+        updatedAt: 4,
+        hasSummary: true,
+      },
+    ];
+
+    emitTauriEvent<void>("plugins-changed", undefined);
+    vi.advanceTimersByTime(100);
+    await flushPromises(8);
+
+    expect(knowledgeMocks.knowledgeList).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "skill" }),
+    );
+    expect(
+      mounted.state.documents.value
+        .filter((document) => document.type === "skill")
+        .map((document) => document.path),
+    ).toEqual(["new-plugin/SKILL.md"]);
+    mounted.unmount();
+  });
+
   it("refreshes external document changes without showing selected document loading", async () => {
     vi.useFakeTimers();
     const props = reactive({

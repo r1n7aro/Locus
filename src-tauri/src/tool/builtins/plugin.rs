@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use tauri::Manager;
 
-use super::{ToolDef, ToolResult, make_exec};
+use super::{make_exec, ToolDef, ToolResult};
 
 #[derive(Debug, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -109,6 +109,25 @@ struct PluginUninstallToolOutput {
     plugin_id: String,
     scope: crate::plugin::PluginInstallScope,
     removed: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PluginSetEnabledToolArgs {
+    plugin_id: String,
+    #[serde(default)]
+    scope: Option<crate::plugin::PluginInstallScope>,
+    enabled: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PluginSetEnabledToolOutput {
+    working_dir: String,
+    plugin_id: String,
+    scope: crate::plugin::PluginInstallScope,
+    enabled: bool,
+    plugin: crate::plugin::InstalledPluginSummary,
 }
 
 #[derive(Debug, Deserialize)]
@@ -264,7 +283,7 @@ fn registry_entry_to_summary(
         author: entry.author,
         tags: entry.tags,
         latest_version: entry.latest_version,
-        updated_at: String::new(),
+        updated_at: entry.updated_at,
         icon: entry.icon,
         stats: entry.stats,
         compatibility: entry.compatibility,
@@ -365,7 +384,8 @@ async fn reload_plugin_registries_after_install(
     Ok(())
 }
 
-fn resolve_plugin_uninstall_scope(
+fn resolve_installed_plugin_scope(
+    tool_name: &str,
     working_dir: &str,
     plugin_id: &str,
     requested_scope: Option<crate::plugin::PluginInstallScope>,
@@ -386,12 +406,12 @@ fn resolve_plugin_uninstall_scope(
     match scopes.as_slice() {
         [scope] => Ok(*scope),
         [] => Err(tool_error(format!(
-            "plugin_uninstall could not find installed plugin: {}",
-            normalized_id
+            "{} could not find installed plugin: {}",
+            tool_name, normalized_id
         ))),
         _ => Err(tool_error(format!(
-            "plugin_uninstall requires scope because '{}' is installed in multiple scopes",
-            normalized_id
+            "{} requires scope because '{}' is installed in multiple scopes",
+            tool_name, normalized_id
         ))),
     }
 }
@@ -691,6 +711,86 @@ pub(super) fn plugin_install() -> ToolDef {
     }
 }
 
+pub(super) fn plugin_set_enabled() -> ToolDef {
+    let prompt = crate::prompt::parse_tool_prompt(crate::prompt::tools::PLUGIN_SET_ENABLED);
+    ToolDef {
+        name: "plugin_set_enabled".to_string(),
+        description: prompt.description,
+        parameters: prompt.parameters,
+        execute: make_exec(|args, ctx| {
+            Box::pin(async move {
+                let parsed = match serde_json::from_value::<PluginSetEnabledToolArgs>(args) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return tool_error(format!(
+                            "Error parsing plugin_set_enabled arguments: {}",
+                            error
+                        ));
+                    }
+                };
+                let plugin_id = parsed.plugin_id.trim().to_string();
+                if plugin_id.is_empty() {
+                    return tool_error("plugin_set_enabled requires a non-empty pluginId");
+                }
+                let working_dir = ctx.working_dir.clone().unwrap_or_default();
+                let scope = match resolve_installed_plugin_scope(
+                    "plugin_set_enabled",
+                    &working_dir,
+                    &plugin_id,
+                    parsed.scope,
+                ) {
+                    Ok(value) => value,
+                    Err(result) => return result,
+                };
+                if scope == crate::plugin::PluginInstallScope::Project
+                    && working_dir.trim().is_empty()
+                {
+                    return tool_error("plugin_set_enabled requires a workspace for project scope");
+                }
+                if ctx.app_handle.is_none() {
+                    return tool_error("plugin_set_enabled requires an application context");
+                }
+
+                let plugin = match crate::plugin::set_plugin_enabled_sync(
+                    &working_dir,
+                    &plugin_id,
+                    scope,
+                    parsed.enabled,
+                ) {
+                    Ok(value) => value,
+                    Err(error) => return tool_error(error),
+                };
+
+                if let Err(result) = reload_plugin_registries_after_install(
+                    &ctx,
+                    &working_dir,
+                    if parsed.enabled {
+                        "plugin_tool_enable"
+                    } else {
+                        "plugin_tool_disable"
+                    },
+                    "plugin_set_enabled",
+                )
+                .await
+                {
+                    return result;
+                }
+
+                json_output(
+                    "plugin_set_enabled",
+                    &PluginSetEnabledToolOutput {
+                        working_dir,
+                        plugin_id,
+                        scope,
+                        enabled: parsed.enabled,
+                        plugin,
+                    },
+                )
+            })
+        }),
+    }
+}
+
 pub(super) fn plugin_uninstall() -> ToolDef {
     let prompt = crate::prompt::parse_tool_prompt(crate::prompt::tools::PLUGIN_UNINSTALL);
     ToolDef {
@@ -713,11 +813,15 @@ pub(super) fn plugin_uninstall() -> ToolDef {
                     return tool_error("plugin_uninstall requires a non-empty pluginId");
                 }
                 let working_dir = ctx.working_dir.clone().unwrap_or_default();
-                let scope =
-                    match resolve_plugin_uninstall_scope(&working_dir, &plugin_id, parsed.scope) {
-                        Ok(value) => value,
-                        Err(result) => return result,
-                    };
+                let scope = match resolve_installed_plugin_scope(
+                    "plugin_uninstall",
+                    &working_dir,
+                    &plugin_id,
+                    parsed.scope,
+                ) {
+                    Ok(value) => value,
+                    Err(result) => return result,
+                };
                 if scope == crate::plugin::PluginInstallScope::Project
                     && working_dir.trim().is_empty()
                 {
@@ -854,6 +958,7 @@ mod tests {
             "plugin_list",
             "plugin_search",
             "plugin_install",
+            "plugin_set_enabled",
             "plugin_uninstall",
             "plugin_export",
         ] {
@@ -866,7 +971,8 @@ mod tests {
 
     #[test]
     fn plugin_uninstall_scope_uses_requested_scope() {
-        let scope = resolve_plugin_uninstall_scope(
+        let scope = resolve_installed_plugin_scope(
+            "plugin_uninstall",
             "",
             "scope-demo",
             Some(crate::plugin::PluginInstallScope::App),
@@ -885,9 +991,13 @@ mod tests {
             .join("scope-demo");
         write_plugin_manifest(&plugin_root, "scope-demo");
 
-        let scope =
-            resolve_plugin_uninstall_scope(&workspace.path().to_string_lossy(), "scope-demo", None)
-                .expect("resolve installed scope");
+        let scope = resolve_installed_plugin_scope(
+            "plugin_uninstall",
+            &workspace.path().to_string_lossy(),
+            "scope-demo",
+            None,
+        )
+        .expect("resolve installed scope");
 
         assert_eq!(scope, crate::plugin::PluginInstallScope::Project);
     }

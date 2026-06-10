@@ -44,6 +44,7 @@ pub mod tools {
     pub const PLUGIN_SEARCH: &str = include_str!("../../tools/plugin_search.json");
     pub const PLUGIN_INSTALL: &str = include_str!("../../tools/plugin_install.json");
     pub const PLUGIN_UNINSTALL: &str = include_str!("../../tools/plugin_uninstall.json");
+    pub const PLUGIN_SET_ENABLED: &str = include_str!("../../tools/plugin_set_enabled.json");
     pub const PLUGIN_EXPORT: &str = include_str!("../../tools/plugin_export.json");
     pub const VIEW_CREATE: &str = include_str!("../../tools/view_create.json");
     pub const VIEW_LIST: &str = include_str!("../../tools/view_list.json");
@@ -136,6 +137,7 @@ mod tests {
             ("plugin_search", tools::PLUGIN_SEARCH),
             ("plugin_install", tools::PLUGIN_INSTALL),
             ("plugin_uninstall", tools::PLUGIN_UNINSTALL),
+            ("plugin_set_enabled", tools::PLUGIN_SET_ENABLED),
             ("plugin_export", tools::PLUGIN_EXPORT),
             ("view_create", tools::VIEW_CREATE),
             ("view_list", tools::VIEW_LIST),
@@ -162,5 +164,26 @@ mod tests {
             let prompt = parse_tool_prompt(json_str);
             assert_openai_compatible_tool_parameters(name, &prompt.parameters);
         }
+    }
+
+    #[test]
+    fn unity_run_states_profiler_skill_reference_resolves() {
+        let prompt = parse_tool_prompt(tools::UNITY_RUN_STATES);
+        assert!(
+            prompt.description.contains("skill/builtin/profiler.md"),
+            "unity_run_states should direct the agent to the profiler skill"
+        );
+
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("knowledge")
+            .join("skill")
+            .join("builtin")
+            .join("profiler.md");
+        assert!(
+            path.is_file(),
+            "skill/builtin/profiler.md is referenced by the unity_run_states tool prompt but missing at {:?}",
+            path
+        );
     }
 }
