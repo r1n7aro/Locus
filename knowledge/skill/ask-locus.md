@@ -1,7 +1,7 @@
 ---
 id: kd_skill_ask_locus
 type: skill
-path: builtin/ask-locus.md
+path: ask-locus.md
 title: Ask Locus
 injectMode: none
 summaryEnabled: true
@@ -93,7 +93,7 @@ if (Test-Path (Join-Path $repo ".git")) {
    - Frontend UI: `src/components/`, `src/composables/`, `src/stores/`, `src/services/`, `src/language/`.
    - Desktop backend: `src-tauri/src/commands/`, `src-tauri/src/agent/`, `src-tauri/src/session/`, `src-tauri/src/tool/`, `src-tauri/src/knowledge_*`.
    - Unity bridge and package: `locus_unity/`, `src-tauri/src/unity_*`, `src-tauri/src/commands/unity_*`.
-   - Built-in tools and workflows: `tools/`, `knowledge/skill/builtin/`, `skills/`, `agent/`.
+   - Built-in tools and workflows: `tools/`, `knowledge/skill/`, `skills/`, `agent/`.
 
 2. Search narrowly before reading files.
    - Start with docs for user-facing behavior.

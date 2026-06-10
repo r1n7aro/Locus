@@ -2424,7 +2424,7 @@
   "knowledge.skill.descriptionLabel": "描述",
   "knowledge.skill.argumentHint": "参数提示",
   "knowledge.skill.descPlaceholder": "简短描述（用于检索和匹配）",
-  "knowledge.skill.l1Unavailable": "根文档未提供 L1",
+  "knowledge.skill.l1FallbackDescription": "根文档未提供 L1，将注入包描述",
   "knowledge.skill.unityStatus.label": "Unity 脚本",
   "knowledge.skill.unityStatus.loading": "检测中",
   "knowledge.skill.unityStatus.path": "安装位置",

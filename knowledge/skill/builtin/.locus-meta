@@ -1,9 +1,0 @@
-version: 1
-summary: ''
-inheritInjectMode: true
-inheritAiConfig: true
-inheritToChildren: false
-allowCreateDocuments: false
-allowCreateDirectories: false
-allowMoveDocuments: false
-allowMoveDirectories: false

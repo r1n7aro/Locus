@@ -920,8 +920,9 @@ export interface SkillManifest {
 export interface SkillConfig {
   enabled: boolean;
   surface: SkillSurface;
-  description: string;
-  commandTrigger: string;
+  /** Omitted fields keep their stored workspace override untouched. */
+  description?: string;
+  commandTrigger?: string;
   injectMode?: KnowledgeInjectMode;
 }
 

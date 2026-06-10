@@ -1,7 +1,7 @@
 ---
 id: kd_skill_create_skill
 type: skill
-path: builtin/create-skill.md
+path: create-skill.md
 title: Create Skill
 injectMode: excerpt
 summaryEnabled: true
@@ -18,7 +18,7 @@ tools:
   - skill_list
   - knowledge_edit
 createdAt: 1775552858000
-updatedAt: 1781049600000
+updatedAt: 1781078400000
 ---
 
 # Create Skill
@@ -49,17 +49,18 @@ Command arguments: `<skill-name>` names the skill to create or edit; `--package`
    - Markdown document: call `skill_create` with `kind: "md"`, `name: <kebab-slug>`, `summary: <one line>`, `body`, and optionally `tools` (step 4). `path` defaults to `<slug>.md`, which maps to `Locus/knowledge/skill/<slug>.md`; use a nested path such as `unity/<slug>.md` only when topic grouping materially improves retrieval. Titles are human-readable Title Case.
    - Package: call `skill_create` with `kind: "package"`, `name: <display name>`, `version: <semver>`, `summary: <one line>`, plus optional `packageId`, `commandTrigger`, `argumentHint`, `commandEnabled`, and `modelInvocationEnabled`. When `packageId` is omitted, Locus derives a short kebab-case id from `name`; if the derived id already exists, ask the user for an exact package id before calling `skill_create` again.
    - Seed `summary` and `body` in `skill_create` so the skill is usable immediately. The default command trigger is `/<name>`.
-   - Storage locations: project skill documents live under the project knowledge root; built-in skills live under `skill/builtin/` in the app knowledge root and are user-level workflows; new app packages are created under the app skill package root, `%APPDATA%/locus/skills/<package-id>/` on Windows. The package result includes `packageRoot` — use it for all later file edits.
+   - Storage locations: project skill documents live under the project knowledge root; built-in skills live at the root of `skill/` in the app knowledge root and are user-level workflows; new app packages are created under the app skill package root, `%APPDATA%/locus/skills/<package-id>/` on Windows. The package result includes `packageRoot` — use it for all later file edits.
    - For an existing Markdown skill, update content with `knowledge_edit`. For an existing package, edit files under its package root with filesystem tools.
    - Run `skill_reload` after creation or content edits to validate that Locus can read the manifest. Pass `source` (`project`, `app`, `pluginApp`, `pluginProject`) when the same name exists in multiple sources.
 
 4. Author the body to match the trigger surface.
    - Declare the Locus tool names the skill needs on its first turn in frontmatter `tools` — the `tools` parameter of `skill_create` for documents, or `SKILL.md` frontmatter for packages. Mentioning tool names in the body does not register them; Locus loads the declared tools when the user invokes the slash command.
-   - For command-only skills, the body is `## Instructions` followed by execution steps, required checks, and output requirements. Skip selection guidance: the whole document is injected only on invocation.
+   - Skills default to `excerpt` (L1) injection: the knowledge structure carries each skill's one-line summary so the agent can decide when to load it. Write every summary as load guidance — when to load the skill and what to ignore — never as a recap of its content.
+   - For command-only skills, the body is `## Instructions` followed by execution steps, required checks, and output requirements. The full document is injected only on invocation, but the one-line summary still surfaces at the default `excerpt` level, so keep it discriminating.
    - For auto-recalled skills, put one or two selection sentences first — what to use the skill for and what it must ignore — then the instructions. Recall sees the one-line summary or package description, so make that line discriminating.
-   - Keep one `## L1` section right under a package root document's title: one or two load-guidance sentences telling the agent when to load this skill and what to ignore — selection guidance, not a recap of the skill's content or workflow. When the package inject mode is `excerpt`, Locus injects the `## L1` text as the package's line in the knowledge structure — a workspace description override wins, then `## L1`, then the manifest `description` — and the UI cannot enable `excerpt` for a package whose root document lacks `## L1`. `skill_create` seeds `## L1` from `summary`.
+   - Keep one `## L1` section right under a package root document's title: one or two load-guidance sentences telling the agent when to load this skill and what to ignore — selection guidance, not a recap of the skill's content or workflow. At the `excerpt` level Locus injects the `## L1` text as the package's line in the knowledge structure — a workspace description override wins, then `## L1`, then the manifest `description` (also the fallback when the root document lacks `## L1`). `skill_create` seeds `## L1` from `summary` and writes `"injectMode": "excerpt"` into `skill.json`.
    - Keep `## L1` aligned with the manifest `description`, which plays the same role on the recall surface. Do not add a `## Summary` section to package documents. `## L0`/`## L2` headings are recorded as presence flags only and are never injected.
-   - To repair a command-only Markdown skill file by hand, write this exact shape, then run `skill_reload` (`injectMode: none` keeps a command-only skill out of recall; use `excerpt` with `summaryEnabled: true` when its one-line summary should stay visible to the knowledge index, as this document does):
+   - To repair a command-only Markdown skill file by hand, write this exact shape, then run `skill_reload` (skills default to `excerpt` with `summaryEnabled: true`; set `injectMode: none` only when a skill must stay out of the knowledge structure and recall entirely):
 
 ```markdown
 ---
@@ -67,7 +68,7 @@ id: kd_skill_<slug_with_underscores>
 type: skill
 path: <relative-path>.md
 title: <Title Case Name>
-injectMode: none
+injectMode: excerpt
 summaryEnabled: true
 commandEnabled: true
 readOnly: false
@@ -85,7 +86,7 @@ updatedAt: <unix-ms>
 # <Title Case Name>
 
 ## Summary
-<one-line description>
+<one-line load guidance: when to load this skill, what to ignore>
 
 ## Content
 ## Instructions
@@ -119,6 +120,7 @@ updatedAt: <unix-ms>
   "version": "0.1.0",
   "name": "External Layout",
   "description": "Use when inspecting external layout files or APIs and converting the gathered facts into project assets.",
+  "injectMode": "excerpt",
   "argumentHint": "<scope>",
   "command": { "enabled": true, "trigger": "/external-layout" },
   "capabilities": {

@@ -172,7 +172,7 @@ mod tests {
     fn unity_run_states_profiler_skill_reference_resolves() {
         let prompt = parse_tool_prompt(tools::UNITY_RUN_STATES);
         assert!(
-            prompt.description.contains("skill/builtin/profiler.md"),
+            prompt.description.contains("skill/profiler.md"),
             "unity_run_states should direct the agent to the profiler skill"
         );
 
@@ -180,11 +180,10 @@ mod tests {
             .join("..")
             .join("knowledge")
             .join("skill")
-            .join("builtin")
             .join("profiler.md");
         assert!(
             path.is_file(),
-            "skill/builtin/profiler.md is referenced by the unity_run_states tool prompt but missing at {:?}",
+            "skill/profiler.md is referenced by the unity_run_states tool prompt but missing at {:?}",
             path
         );
     }

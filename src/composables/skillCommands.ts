@@ -77,19 +77,17 @@ export function findSkillCommandConflict(
 }
 
 export function buildSkillConfigForCommandToggle(
-  skill: Pick<
-    SkillManifest,
-    "name" | "skillEnabled" | "skillSurface" | "skillDescription"
-  >,
+  skill: Pick<SkillManifest, "name" | "skillEnabled" | "skillSurface">,
   commandEnabled: boolean,
   commandTrigger: string,
 ): SkillConfig {
   const allowsAuto = skillSurfaceAllowsAuto(skill.skillSurface);
 
+  // description is intentionally omitted: sending the effective summary here
+  // would pin it as a workspace override and shadow later `## L1` updates.
   return {
     enabled: commandEnabled ? true : allowsAuto ? skill.skillEnabled !== false : false,
     surface: commandEnabled ? (allowsAuto ? "both" : "command") : allowsAuto ? "auto" : "command",
-    description: skill.skillDescription ?? "",
     commandTrigger: normalizeSkillCommandTrigger(commandTrigger, skill.name),
   };
 }

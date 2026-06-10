@@ -894,9 +894,9 @@ pub fn default_summary_enabled_for_type(doc_type: KnowledgeType) -> bool {
 pub fn default_document_inject_mode_for_type(doc_type: KnowledgeType) -> KnowledgeInjectMode {
     match doc_type {
         KnowledgeType::Design => KnowledgeInjectMode::Path,
-        KnowledgeType::Memory | KnowledgeType::Skill | KnowledgeType::Reference => {
-            KnowledgeInjectMode::None
-        }
+        // Skills default to L1 so the knowledge tree carries their load guidance.
+        KnowledgeType::Skill => KnowledgeInjectMode::Excerpt,
+        KnowledgeType::Memory | KnowledgeType::Reference => KnowledgeInjectMode::None,
     }
 }
 

@@ -111,7 +111,9 @@ const injectModeOptions = computed(() => [
   {
     value: "excerpt",
     label: labelForInjectMode("excerpt"),
-    hint: hintForInjectMode("excerpt"),
+    hint: manifest.value?.hasL1 === false
+      ? t("knowledge.skill.l1FallbackDescription")
+      : hintForInjectMode("excerpt"),
   },
 ]);
 

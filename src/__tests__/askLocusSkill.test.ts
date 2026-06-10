@@ -15,11 +15,11 @@ function frontmatter(markdown: string): string {
 
 describe("Ask Locus builtin skill", () => {
   it("uses a natural command name without declaring built-in tool dependencies", () => {
-    const skill = read("knowledge/skill/builtin/ask-locus.md");
+    const skill = read("knowledge/skill/ask-locus.md");
     const meta = frontmatter(skill);
 
     expect(meta).toContain("title: Ask Locus");
-    expect(meta).toContain("path: builtin/ask-locus.md");
+    expect(meta).toContain("path: ask-locus.md");
     expect(meta).toContain("skillSurface: both");
     expect(meta).toContain("commandEnabled: true");
     expect(meta).toContain("commandTrigger: /ask-locus");
@@ -28,7 +28,7 @@ describe("Ask Locus builtin skill", () => {
   });
 
   it("keeps source browsing tied to a reusable temp cache", () => {
-    const skill = read("knowledge/skill/builtin/ask-locus.md");
+    const skill = read("knowledge/skill/ask-locus.md");
 
     expect(skill).toContain("<app-temp>/ask-locus/Locus/");
     expect(skill).toContain("Repository: `https://github.com/r1n7aro/Locus`");
@@ -41,7 +41,7 @@ describe("Ask Locus builtin skill", () => {
   });
 
   it("documents GitHub issue creation for confirmed Locus bugs", () => {
-    const skill = read("knowledge/skill/builtin/ask-locus.md");
+    const skill = read("knowledge/skill/ask-locus.md");
 
     expect(skill).toContain("## Bug reporting");
     expect(skill).toContain("gh auth status -h github.com");
@@ -52,7 +52,7 @@ describe("Ask Locus builtin skill", () => {
   });
 
   it("answers in the user's requested language", () => {
-    const skill = read("knowledge/skill/builtin/ask-locus.md");
+    const skill = read("knowledge/skill/ask-locus.md");
 
     expect(skill).toContain("Reply in the same language as the user's question");
     expect(skill).toContain("unless the user explicitly asks for another language");

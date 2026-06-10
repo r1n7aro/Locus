@@ -3189,15 +3189,17 @@ export function useKnowledgeState(props: KnowledgeProps) {
     const packageId = skillPackageIdForDocument(current);
     if (!packageId) return;
 
+    // description and injectMode are sent only when the user changed them;
+    // omitted fields keep their stored override state on the backend instead
+    // of pinning the currently effective manifest/L1 value into the workspace.
     const nextConfig: SkillConfig = {
       enabled: meta.skillEnabled ?? current.skillEnabled ?? true,
       surface: meta.skillSurface ?? current.skillSurface ?? "command",
-      description: current.summary ?? "",
       commandTrigger:
         meta.commandTrigger === undefined
           ? current.commandTrigger ?? ""
           : meta.commandTrigger ?? "",
-      injectMode: meta.injectMode ?? current.injectMode ?? "none",
+      injectMode: meta.injectMode,
     };
 
     beginSave();

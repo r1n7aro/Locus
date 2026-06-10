@@ -364,11 +364,20 @@ pub fn lookup_skill_config_override<'a>(
     dir_name: &str,
 ) -> Option<&'a SkillConfig> {
     let new_key = config_key(source, dir_name);
-    configs.get(&new_key).or_else(|| {
-        dir_name
-            .strip_prefix("builtin/")
-            .and_then(|legacy_name| configs.get(&config_key(source, legacy_name)))
-    })
+    configs
+        .get(&new_key)
+        .or_else(|| {
+            dir_name
+                .strip_prefix("builtin/")
+                .and_then(|legacy_name| configs.get(&config_key(source, legacy_name)))
+        })
+        .or_else(|| {
+            // Bundled skills lived under skill/builtin/ for a while; honor
+            // overrides saved against those keys now that they are root-level.
+            (!dir_name.contains('/'))
+                .then(|| config_key(source, &format!("builtin/{}", dir_name)))
+                .and_then(|legacy_key| configs.get(&legacy_key))
+        })
 }
 
 // ── Scanning ─────────────────────────────────────────────────
@@ -2753,9 +2762,9 @@ fn configured_package_inject_mode(
     override_config: Option<&SkillConfig>,
 ) -> KnowledgeInjectMode {
     override_config
-        .map(|config| config.inject_mode)
+        .and_then(|config| config.inject_mode)
         .or(manifest.inject_mode)
-        .unwrap_or(KnowledgeInjectMode::None)
+        .unwrap_or(KnowledgeInjectMode::Excerpt)
 }
 
 fn package_argument_hint(manifest: &SkillPackageManifestFile) -> Option<String> {
@@ -3691,7 +3700,7 @@ pub fn create_skill_document_sync(
         doc_type: KnowledgeType::Skill,
         path: document_path.clone(),
         title,
-        inject_mode: knowledge_store::KnowledgeInjectMode::None,
+        inject_mode: knowledge_store::default_document_inject_mode_for_type(KnowledgeType::Skill),
         inherit_inject_mode: true,
         inject_mode_source: Default::default(),
         summary_enabled: true,
@@ -3782,7 +3791,7 @@ fn create_skill_package_in_parent_sync_with_default_namespace(
             argument_hint: argument_hint.clone(),
             disable_model_invocation: Some(!model_invocation_enabled),
             user_invocable: Some(command_enabled),
-            inject_mode: None,
+            inject_mode: Some(KnowledgeInjectMode::Excerpt),
             source: None,
             command: Some(SkillPackageCommand {
                 enabled: Some(command_enabled),
@@ -5217,7 +5226,7 @@ Use Feishu safely.
                 surface: SkillSurface::Auto,
                 description: "Workspace override.".to_string(),
                 command_trigger: "/lark".to_string(),
-                inject_mode: KnowledgeInjectMode::Path,
+                inject_mode: Some(KnowledgeInjectMode::Path),
             }),
         );
 
@@ -5226,6 +5235,56 @@ Use Feishu safely.
         assert_eq!(item.command_enabled, false);
         assert_eq!(item.command_trigger.as_deref(), Some("/lark"));
         assert_eq!(item.summary.as_deref(), Some("Workspace override."));
+    }
+
+    #[test]
+    fn package_inject_mode_defaults_to_excerpt_and_ignores_override_without_value() {
+        let manifest_without_mode = SkillPackageManifestFile {
+            schema: "locus.skill.v1".to_string(),
+            id: "asset-audit".to_string(),
+            version: "0.1.0".to_string(),
+            name: "Asset Audit".to_string(),
+            description: "Audit assets.".to_string(),
+            ..Default::default()
+        };
+        let manifest_with_none = SkillPackageManifestFile {
+            inject_mode: Some(KnowledgeInjectMode::None),
+            ..manifest_without_mode.clone()
+        };
+        let override_without_mode = SkillConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        let override_with_mode = SkillConfig {
+            inject_mode: Some(KnowledgeInjectMode::Path),
+            ..Default::default()
+        };
+
+        // No override, no manifest value: skills default to L1 (excerpt).
+        assert_eq!(
+            super::configured_package_inject_mode(&manifest_without_mode, None),
+            KnowledgeInjectMode::Excerpt
+        );
+        // A workspace entry without an inject mode must not shadow the manifest.
+        assert_eq!(
+            super::configured_package_inject_mode(
+                &manifest_with_none,
+                Some(&override_without_mode)
+            ),
+            KnowledgeInjectMode::None
+        );
+        assert_eq!(
+            super::configured_package_inject_mode(
+                &manifest_without_mode,
+                Some(&override_without_mode)
+            ),
+            KnowledgeInjectMode::Excerpt
+        );
+        // An explicit workspace inject mode still wins over the manifest.
+        assert_eq!(
+            super::configured_package_inject_mode(&manifest_with_none, Some(&override_with_mode)),
+            KnowledgeInjectMode::Path
+        );
     }
 
     #[test]
@@ -5803,6 +5862,10 @@ Use Feishu safely.
         assert_eq!(record.manifest.version, "0.1.0");
         assert_eq!(record.manifest.disable_model_invocation, Some(true));
         assert_eq!(
+            record.manifest.inject_mode,
+            Some(KnowledgeInjectMode::Excerpt)
+        );
+        assert_eq!(
             record
                 .manifest
                 .command
@@ -5887,7 +5950,7 @@ Use Feishu safely.
                 surface: SkillSurface::Auto,
                 description: "override".to_string(),
                 command_trigger: "/audit".to_string(),
-                inject_mode: KnowledgeInjectMode::Path,
+                inject_mode: Some(KnowledgeInjectMode::Path),
             },
         );
         crate::commands::knowledge::save_skill_config(&working_dir, &configs).expect("save config");

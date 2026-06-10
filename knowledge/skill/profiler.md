@@ -1,7 +1,7 @@
 ---
 id: kd_skill_builtin_profiler
 type: skill
-path: builtin/profiler.md
+path: profiler.md
 title: Unity Profiler Runtime Sampling
 injectMode: none
 summaryEnabled: true

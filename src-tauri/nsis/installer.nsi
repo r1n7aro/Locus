@@ -726,11 +726,18 @@ Section Install
   RMDir /r "$INSTDIR\gh-runtime"
   ; Locus: replace bundled Unity package resources.
   RMDir /r "$INSTDIR\locus_unity"
-  ; Locus: remove legacy root-level bundled skill resources.
-  Delete "$INSTDIR\knowledge\skill\create-skill.md"
+  ; Locus: remove legacy root-level bundled skill resources that are no longer shipped.
   Delete "$INSTDIR\knowledge\skill\unity-editor-tooling.md"
   Delete "$INSTDIR\knowledge\skill\unity-project-setup.md"
+  ; Locus: remove the retired skill\builtin directory; bundled skills live at the skill root now.
   Delete "$INSTDIR\knowledge\skill\builtin\view.md"
+  Delete "$INSTDIR\knowledge\skill\builtin\create-skill.md"
+  Delete "$INSTDIR\knowledge\skill\builtin\ask-locus.md"
+  Delete "$INSTDIR\knowledge\skill\builtin\profiler.md"
+  Delete "$INSTDIR\knowledge\skill\builtin\unity-editor-tooling.md"
+  Delete "$INSTDIR\knowledge\skill\builtin\unity-project-setup.md"
+  Delete "$INSTDIR\knowledge\skill\builtin\.locus-meta"
+  RMDir "$INSTDIR\knowledge\skill\builtin"
 
   !ifmacrodef NSIS_HOOK_PREINSTALL
     !insertmacro NSIS_HOOK_PREINSTALL

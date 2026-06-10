@@ -327,8 +327,9 @@ pub struct SkillConfig {
     pub description: String,
     #[serde(default)]
     pub command_trigger: String,
-    #[serde(default)]
-    pub inject_mode: KnowledgeInjectMode,
+    /// `None` means no workspace override: the manifest or document value stays in effect.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inject_mode: Option<KnowledgeInjectMode>,
 }
 
 fn default_true() -> bool {
@@ -342,7 +343,7 @@ impl Default for SkillConfig {
             surface: SkillSurface::Command,
             description: String::new(),
             command_trigger: String::new(),
-            inject_mode: KnowledgeInjectMode::None,
+            inject_mode: None,
         }
     }
 }
@@ -430,8 +431,8 @@ pub async fn set_skill_config(
     source: Option<String>,
     enabled: bool,
     surface: SkillSurface,
-    description: String,
-    command_trigger: String,
+    description: Option<String>,
+    command_trigger: Option<String>,
     inject_mode: Option<KnowledgeInjectMode>,
     workspace: State<'_, Arc<Workspace>>,
 ) -> Result<(), AppError> {
@@ -439,12 +440,16 @@ pub async fn set_skill_config(
     let mut map = load_skill_config(&working_dir);
     let key = normalize_skill_config_key(&rel_path, source.as_deref());
     let existing = map.get(&key).cloned().unwrap_or_default();
+    // Omitted fields keep their stored override state instead of pinning the
+    // currently effective manifest value into the workspace config.
     let config = SkillConfig {
         enabled,
         surface,
-        description,
-        command_trigger: command_trigger.trim().to_string(),
-        inject_mode: inject_mode.unwrap_or(existing.inject_mode),
+        description: description.unwrap_or(existing.description),
+        command_trigger: command_trigger
+            .map(|value| value.trim().to_string())
+            .unwrap_or(existing.command_trigger),
+        inject_mode: inject_mode.or(existing.inject_mode),
     };
     let fallback = super::skill::fallback_command_name_for_skill_ref(&key);
     let config = super::skill::normalize_and_validate_skill_config(&config, &fallback)?;

@@ -6,7 +6,7 @@
     "properties": {
       "path": {
         "type": "string",
-        "description": "The exact type-prefixed knowledge document path. Preserve every directory segment from `knowledge_list` results. Regular document paths must end with `.md`, for example `design/core-loop.md`, `skill/unity/import-pipeline.md`, or `skill/builtin/profiler.md`. For Skill package structure entries marked `skill/<package-id>/ [package]`, pass `skill/<package-id>` to read `SKILL.md`; pass `skill/<package-id>/docs/usage.md` to read a package child document."
+        "description": "The exact type-prefixed knowledge document path. Preserve every directory segment from `knowledge_list` results. Regular document paths must end with `.md`, for example `design/core-loop.md`, `skill/unity/import-pipeline.md`, or `skill/profiler.md`. For Skill package structure entries marked `skill/<package-id>/ [package]`, pass `skill/<package-id>` to read `SKILL.md`; pass `skill/<package-id>/docs/usage.md` to read a package child document."
       },
       "part": {
         "type": "string",

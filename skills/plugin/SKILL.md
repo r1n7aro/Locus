@@ -39,7 +39,7 @@ Treat `/plugin <request>` as the only command entry. Interpret words such as sea
 3. Use progressive disclosure for specialized editing.
    - Keep `/plugin` focused on plugin lifecycle, ownership, packaging, dependency metadata, and publishing decisions.
    - To create or edit a View, load the View skill with `knowledge_read` using `path: "skill/view"` and `part: "body"`, then follow that skill.
-   - To create or edit a Skill, load the Create Skill workflow with `knowledge_read` using `path: "skill/builtin/create-skill.md"` and `part: "body"`, then follow that workflow.
+   - To create or edit a Skill, load the Create Skill workflow with `knowledge_read` using `path: "skill/create-skill.md"` and `part: "body"`, then follow that workflow.
    - Return to this workflow after the component edit is validated, then continue packaging, installation, ownership transfer, or publishing.
 
 4. Ask when a choice changes the result.

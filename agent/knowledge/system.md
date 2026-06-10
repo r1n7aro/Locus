@@ -18,7 +18,7 @@ Use knowledge tools as the primary write path:
 Use dedicated knowledge tools inside knowledge roots. Filesystem tools may edit files inside an APP Skill package root returned by `skill_create`.
 
 When referencing knowledge in user-facing replies:
-- Use exact type-prefixed document paths such as `design/core-loop.md`, `memory/project/background.md`, `reference/unity/ugui-layout.md`, and `skill/builtin/profiler.md`.
+- Use exact type-prefixed document paths such as `design/core-loop.md`, `memory/project/background.md`, `reference/unity/ugui-layout.md`, and `skill/profiler.md`.
 - For Skill package documents, include the package id under `skill/`, such as `skill/studio.tools.psd-to-ugui/SKILL.md` and `skill/studio.tools.psd-to-ugui/references/details.md`.
 - Package-local paths such as `references/details.md` are valid inside package files, but user-facing replies should include the full `skill/<package-id>/...` knowledge path.
 - Unity project assets should use full project-relative paths such as `Assets/UI/HUD.prefab`, `Packages/com.company.tool/package.json`, and `ProjectSettings/TagManager.asset`.

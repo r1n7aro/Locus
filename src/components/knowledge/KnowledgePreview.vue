@@ -226,9 +226,8 @@ const injectModeOptions = computed(() => [
     value: "excerpt",
     label: labelForInjectMode("excerpt"),
     hint: skillPackageL1Unavailable()
-      ? t("knowledge.skill.l1Unavailable")
+      ? t("knowledge.skill.l1FallbackDescription")
       : hintForInjectMode("excerpt"),
-    disabled: skillPackageL1Unavailable(),
   },
   {
     value: "full",

@@ -75,7 +75,6 @@ describe("skillCommands", () => {
     ).toEqual({
       enabled: true,
       surface: "auto",
-      description: "desc",
       commandTrigger: "/custom-trigger",
     });
   });

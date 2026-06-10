@@ -2424,7 +2424,7 @@
   "knowledge.skill.descriptionLabel": "Description",
   "knowledge.skill.argumentHint": "Argument hint",
   "knowledge.skill.descPlaceholder": "Short description used for retrieval and matching",
-  "knowledge.skill.l1Unavailable": "Root document has no L1",
+  "knowledge.skill.l1FallbackDescription": "Root document has no L1; the package description is injected instead",
   "knowledge.skill.unityStatus.label": "Unity scripts",
   "knowledge.skill.unityStatus.loading": "Checking",
   "knowledge.skill.unityStatus.path": "Install path",

@@ -2587,7 +2587,6 @@ describe("useKnowledgeState", () => {
       {
         enabled: true,
         surface: "auto",
-        description: "Use Feishu safely.",
         commandTrigger: "/lark",
         injectMode: "path",
       },
