@@ -1,4 +1,5 @@
 import { ipcInvoke } from "./ipc";
+import type { PluginRegistrySource } from "./pluginRegistrySources";
 
 export type PluginInstallScope = "app" | "project";
 
@@ -261,6 +262,27 @@ export function pluginSetEnabled(
 export function pluginExport(request: PluginExportRequest): Promise<PluginExportResult> {
   return ipcInvoke<PluginExportResult>("plugin_export", {
     request,
+  });
+}
+
+/**
+ * Registry source persisted by the backend for the plugin tools. `baseUrl` is
+ * the provider-resolved raw URL so the backend never re-derives it.
+ */
+export interface PluginRegistrySourceConfig extends PluginRegistrySource {
+  baseUrl: string;
+}
+
+/** Resolves to null when no registry sources file exists yet. */
+export function pluginRegistrySourcesGet(): Promise<PluginRegistrySourceConfig[] | null> {
+  return ipcInvoke<PluginRegistrySourceConfig[] | null>("plugin_registry_sources_get");
+}
+
+export function pluginRegistrySourcesSet(
+  sources: PluginRegistrySourceConfig[],
+): Promise<PluginRegistrySourceConfig[]> {
+  return ipcInvoke<PluginRegistrySourceConfig[]>("plugin_registry_sources_set", {
+    sources,
   });
 }
 

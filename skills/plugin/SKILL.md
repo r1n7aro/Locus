@@ -25,7 +25,7 @@ Load when plugin or 插件 means a Locus app extension: search, install, enable,
 Treat `/plugin <request>` as the only command entry. Interpret words such as search, install, uninstall, remove, create, import, pack, zip, publish, release, registry, PR, Skill, View, and Rule as intent signals inside the natural-language request.
 
 1. Route the request.
-   - Discovery: `plugin_search` for the registry, `plugin_list` for installed plugins.
+   - Discovery: `plugin_search` for the registries configured in Locus, `plugin_list` for installed plugins.
    - Install, enable, disable, uninstall: resolve the target with step 2, then call the matching tool.
    - Creation or packaging: locate source components with `skill_list` and `view_list`, then follow steps 8-10.
    - Editing: locate plugin-managed components with `plugin_list`, `skill_list`, and `view_list`; validate edits with `skill_reload` or `view_reload`.
@@ -52,7 +52,7 @@ Treat `/plugin <request>` as the only command entry. Interpret words such as sea
    - After the user chooses an id, check for duplicates before continuing.
 
 5. Install plugins.
-   - Prefer `pluginId` installs for official registry entries. Use `path`, `url`, `repo`, or `source` installs for local development, private plugins, archives, and GitHub sources.
+   - Prefer `pluginId` installs for registry entries; the id resolves across the configured registries in order, and `plugin_search` results carry the matching `registryBaseUrl`. Use `path`, `url`, `repo`, or `source` installs for local development, private plugins, archives, and GitHub sources.
    - After install, report installed id, version, scope, root, and included Skill/View/Rule components.
 
 6. Enable, disable, or uninstall plugins.

@@ -1,16 +1,16 @@
 {
-  "description": "Install a Locus plugin from the official registry, a local plugin path, an archive URL, or a GitHub source. Use this in the /plugin workflow only after the user has identified the target clearly or confirmed a search result and install scope.",
+  "description": "Install a Locus plugin from a configured registry, a local plugin path, an archive URL, or a GitHub source. Use this in the /plugin workflow only after the user has identified the target clearly or confirmed a search result and install scope.",
   "parameters": {
     "type": "object",
     "additionalProperties": false,
     "properties": {
       "pluginId": {
         "type": ["string", "null"],
-        "description": "Registry plugin id to install. Use this for official registry installs after the id is known."
+        "description": "Registry plugin id to install. Use this for registry installs after the id is known."
       },
       "registryBaseUrl": {
         "type": ["string", "null"],
-        "description": "Optional registry base URL for pluginId installs. Omit to use the official Locus plugin registry."
+        "description": "Optional registry base URL override for pluginId installs. Omit to resolve the plugin id across the registries configured in Locus, in configured order; the official Locus registry is used when none are configured."
       },
       "expectedPluginId": {
         "type": ["string", "null"],

@@ -37,16 +37,35 @@ struct PluginSearchShardError {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct PluginSearchToolOutput {
-    query: String,
-    registry_base_url: String,
+struct PluginSearchRegistryReport {
+    name: String,
+    base_url: String,
     registry_version: u32,
     updated_at: String,
     scanned_buckets: usize,
     search_index_used: bool,
     failed_buckets: Vec<PluginSearchShardError>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
     result_count: usize,
-    results: Vec<crate::commands::PluginRegistrySummary>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PluginSearchResultItem {
+    #[serde(flatten)]
+    summary: crate::commands::PluginRegistrySummary,
+    registry_name: String,
+    registry_base_url: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PluginSearchToolOutput {
+    query: String,
+    registries: Vec<PluginSearchRegistryReport>,
+    result_count: usize,
+    results: Vec<PluginSearchResultItem>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -290,6 +309,119 @@ fn registry_entry_to_summary(
     }
 }
 
+/// Explicit `registryBaseUrl` narrows the tool to that registry; otherwise the
+/// tool targets every registry registered in the plugin hub (official registry
+/// when none are configured).
+async fn resolve_tool_registry_sources(
+    registry_base_url: Option<String>,
+) -> Vec<crate::commands::PluginRegistryToolSource> {
+    match registry_base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(url) => vec![crate::commands::PluginRegistryToolSource {
+            name: url.trim_end_matches('/').to_string(),
+            base_url: url.to_string(),
+        }],
+        None => crate::commands::plugin_registry_tool_sources().await,
+    }
+}
+
+async fn search_registry_for_summaries(
+    name: &str,
+    registry_base_url: String,
+    query: &str,
+) -> Result<
+    (
+        PluginSearchRegistryReport,
+        Vec<crate::commands::PluginRegistrySummary>,
+    ),
+    String,
+> {
+    let manifest_result =
+        crate::commands::plugin_registry_fetch_manifest(Some(registry_base_url), None)
+            .await
+            .map_err(|error| error.to_string())?;
+    let base_url = manifest_result.base_url.clone();
+    let summary_base_path = manifest_result.manifest.summary_base_path.clone();
+    let entry_base_path = manifest_result.manifest.entry_base_path.clone();
+    let search_index_path = manifest_result.manifest.search_index_path.clone();
+    let mut summaries = Vec::new();
+    let mut failed_buckets = Vec::new();
+    let mut search_index_used = false;
+
+    if let Ok(index) = crate::commands::plugin_registry_fetch_search_index(
+        Some(base_url.clone()),
+        Some(search_index_path),
+        None,
+    )
+    .await
+    {
+        search_index_used = true;
+        summaries.extend(
+            index
+                .plugins
+                .into_iter()
+                .filter(|summary| plugin_summary_matches(summary, query)),
+        );
+    } else {
+        for bucket in &manifest_result.manifest.available_buckets {
+            match crate::commands::plugin_registry_fetch_shard(
+                Some(base_url.clone()),
+                Some(summary_base_path.clone()),
+                bucket.clone(),
+                None,
+            )
+            .await
+            {
+                Ok(shard) => {
+                    summaries.extend(
+                        shard
+                            .plugins
+                            .into_iter()
+                            .filter(|summary| plugin_summary_matches(summary, query)),
+                    );
+                }
+                Err(error) => failed_buckets.push(PluginSearchShardError {
+                    bucket: bucket.clone(),
+                    error: error.to_string(),
+                }),
+            }
+        }
+    }
+
+    if summaries.is_empty() {
+        if let Ok(entry) = crate::commands::plugin_registry_fetch_plugin(
+            Some(base_url.clone()),
+            Some(entry_base_path),
+            query.to_string(),
+            None,
+        )
+        .await
+        {
+            summaries.push(registry_entry_to_summary(entry));
+        }
+    }
+
+    let report = PluginSearchRegistryReport {
+        name: name.to_string(),
+        base_url,
+        registry_version: manifest_result.manifest.registry_version,
+        updated_at: manifest_result.manifest.updated_at,
+        scanned_buckets: if search_index_used {
+            0
+        } else {
+            manifest_result.manifest.available_buckets.len()
+        },
+        search_index_used,
+        failed_buckets,
+        error: None,
+        result_count: summaries.len(),
+    };
+    Ok((report, summaries))
+}
+
 fn source_from_install_args(
     parsed: &PluginInstallToolArgs,
 ) -> Option<crate::commands::PluginDownloadSource> {
@@ -472,103 +604,74 @@ pub(super) fn plugin_search() -> ToolDef {
                     return tool_error("plugin_search requires a non-empty query");
                 }
                 let limit = parsed.limit.unwrap_or(20).clamp(1, 50);
-                let manifest_result = match crate::commands::plugin_registry_fetch_manifest(
-                    parsed.registry_base_url,
-                    None,
-                )
-                .await
-                {
-                    Ok(value) => value,
-                    Err(error) => {
-                        return tool_error(format!(
-                            "Failed to fetch plugin registry manifest: {}",
-                            error
-                        ));
-                    }
-                };
-                let base_url = manifest_result.base_url.clone();
-                let summary_base_path = manifest_result.manifest.summary_base_path.clone();
-                let entry_base_path = manifest_result.manifest.entry_base_path.clone();
-                let search_index_path = manifest_result.manifest.search_index_path.clone();
-                let mut results = Vec::new();
-                let mut failed_buckets = Vec::new();
-                let mut search_index_used = false;
-
-                if let Ok(index) = crate::commands::plugin_registry_fetch_search_index(
-                    Some(base_url.clone()),
-                    Some(search_index_path),
-                    None,
-                )
-                .await
-                {
-                    search_index_used = true;
-                    results.extend(
-                        index
-                            .plugins
-                            .into_iter()
-                            .filter(|summary| plugin_summary_matches(summary, &query)),
-                    );
-                } else {
-                    for bucket in &manifest_result.manifest.available_buckets {
-                        match crate::commands::plugin_registry_fetch_shard(
-                            Some(base_url.clone()),
-                            Some(summary_base_path.clone()),
-                            bucket.clone(),
-                            None,
-                        )
-                        .await
-                        {
-                            Ok(shard) => {
-                                results.extend(
-                                    shard
-                                        .plugins
-                                        .into_iter()
-                                        .filter(|summary| plugin_summary_matches(summary, &query)),
-                                );
-                            }
-                            Err(error) => failed_buckets.push(PluginSearchShardError {
-                                bucket: bucket.clone(),
-                                error: error.to_string(),
-                            }),
-                        }
-                    }
-                }
-
-                if results.is_empty() {
-                    if let Ok(entry) = crate::commands::plugin_registry_fetch_plugin(
-                        Some(base_url.clone()),
-                        Some(entry_base_path),
-                        query.clone(),
-                        None,
+                let registries = resolve_tool_registry_sources(parsed.registry_base_url).await;
+                let mut reports = Vec::with_capacity(registries.len());
+                let mut results: Vec<PluginSearchResultItem> = Vec::new();
+                for source in &registries {
+                    match search_registry_for_summaries(
+                        &source.name,
+                        source.base_url.clone(),
+                        &query,
                     )
                     .await
                     {
-                        results.push(registry_entry_to_summary(entry));
+                        Ok((report, summaries)) => {
+                            results.extend(summaries.into_iter().map(|summary| {
+                                PluginSearchResultItem {
+                                    summary,
+                                    registry_name: source.name.clone(),
+                                    registry_base_url: report.base_url.clone(),
+                                }
+                            }));
+                            reports.push(report);
+                        }
+                        Err(error) => reports.push(PluginSearchRegistryReport {
+                            name: source.name.clone(),
+                            base_url: source.base_url.clone(),
+                            registry_version: 0,
+                            updated_at: String::new(),
+                            scanned_buckets: 0,
+                            search_index_used: false,
+                            failed_buckets: Vec::new(),
+                            error: Some(error),
+                            result_count: 0,
+                        }),
                     }
                 }
 
+                if reports.iter().all(|report| report.error.is_some()) {
+                    let detail = reports
+                        .iter()
+                        .map(|report| {
+                            format!(
+                                "{}: {}",
+                                report.base_url,
+                                report.error.as_deref().unwrap_or_default()
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    return tool_error(format!(
+                        "Failed to fetch plugin registry manifest: {}",
+                        detail
+                    ));
+                }
+
+                // Dedup before ranking so configured registry order wins id ties.
+                let mut seen_ids = std::collections::HashSet::new();
+                results.retain(|item| seen_ids.insert(item.summary.id.clone()));
                 results.sort_by(|a, b| {
-                    plugin_summary_score(b, &query)
-                        .cmp(&plugin_summary_score(a, &query))
-                        .then_with(|| a.id.cmp(&b.id))
+                    plugin_summary_score(&b.summary, &query)
+                        .cmp(&plugin_summary_score(&a.summary, &query))
+                        .then_with(|| a.summary.id.cmp(&b.summary.id))
                 });
-                results.dedup_by(|a, b| a.id == b.id);
                 results.truncate(limit);
 
                 json_output(
                     "plugin_search",
                     &PluginSearchToolOutput {
                         query,
-                        registry_base_url: base_url,
-                        registry_version: manifest_result.manifest.registry_version,
-                        updated_at: manifest_result.manifest.updated_at,
-                        scanned_buckets: if search_index_used {
-                            0
-                        } else {
-                            manifest_result.manifest.available_buckets.len()
-                        },
-                        search_index_used,
-                        failed_buckets,
+                        registries: reports,
                         result_count: results.len(),
                         results,
                     },
@@ -622,35 +725,46 @@ pub(super) fn plugin_install() -> ToolDef {
 
                 let (source_label, registry_base_url, installed) =
                     if let Some(plugin_id) = plugin_id {
-                        let manifest_result = match crate::commands::plugin_registry_fetch_manifest(
-                            parsed.registry_base_url.clone(),
-                            None,
-                        )
-                        .await
-                        {
-                            Ok(value) => value,
-                            Err(error) => {
-                                return tool_error(format!(
-                                    "Failed to fetch plugin registry manifest: {}",
-                                    error
-                                ));
+                        let registries =
+                            resolve_tool_registry_sources(parsed.registry_base_url.clone()).await;
+                        let mut resolved = None;
+                        let mut attempts = Vec::new();
+                        for registry in registries {
+                            let manifest_result =
+                                match crate::commands::plugin_registry_fetch_manifest(
+                                    Some(registry.base_url.clone()),
+                                    None,
+                                )
+                                .await
+                                {
+                                    Ok(value) => value,
+                                    Err(error) => {
+                                        attempts.push(format!("{}: {}", registry.base_url, error));
+                                        continue;
+                                    }
+                                };
+                            match crate::commands::plugin_registry_fetch_plugin(
+                                Some(manifest_result.base_url.clone()),
+                                Some(manifest_result.manifest.entry_base_path.clone()),
+                                plugin_id.clone(),
+                                None,
+                            )
+                            .await
+                            {
+                                Ok(entry) => {
+                                    resolved = Some((manifest_result.base_url, entry));
+                                    break;
+                                }
+                                Err(error) => attempts
+                                    .push(format!("{}: {}", manifest_result.base_url, error)),
                             }
-                        };
-                        let entry = match crate::commands::plugin_registry_fetch_plugin(
-                            Some(manifest_result.base_url.clone()),
-                            Some(manifest_result.manifest.entry_base_path.clone()),
-                            plugin_id.clone(),
-                            None,
-                        )
-                        .await
-                        {
-                            Ok(value) => value,
-                            Err(error) => {
-                                return tool_error(format!(
-                                    "Failed to fetch plugin registry entry '{}': {}",
-                                    plugin_id, error
-                                ));
-                            }
+                        }
+                        let Some((resolved_base_url, entry)) = resolved else {
+                            return tool_error(format!(
+                                "Failed to fetch plugin registry entry '{}': {}",
+                                plugin_id,
+                                attempts.join("; ")
+                            ));
                         };
                         let request = crate::commands::PluginRegistryInstallRequest {
                             id: entry.id.clone(),
@@ -670,7 +784,7 @@ pub(super) fn plugin_install() -> ToolDef {
                         };
                         (
                             format!("registry:{}", entry.id),
-                            Some(manifest_result.base_url),
+                            Some(resolved_base_url),
                             installed,
                         )
                     } else if let Some(source) = source {

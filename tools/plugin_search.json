@@ -1,5 +1,5 @@
 {
-  "description": "Search the Locus plugin registry by natural-language query, plugin id, name, summary, author, or tag. Use this when the /plugin request asks to find, discover, compare, or install a plugin but the exact registry id is not already confirmed.",
+  "description": "Search the Locus plugin registries by natural-language query, plugin id, name, summary, author, or tag. By default it searches every registry the user has registered in the Locus plugin hub. Use this when the /plugin request asks to find, discover, compare, or install a plugin but the exact registry id is not already confirmed.",
   "parameters": {
     "type": "object",
     "additionalProperties": false,
@@ -10,7 +10,7 @@
       },
       "registryBaseUrl": {
         "type": ["string", "null"],
-        "description": "Optional registry base URL. Omit to use the official Locus plugin registry."
+        "description": "Optional registry base URL override that narrows the search to one registry. Omit to search all registries configured in Locus; the official Locus registry is used when none are configured."
       },
       "limit": {
         "type": ["number", "null"],

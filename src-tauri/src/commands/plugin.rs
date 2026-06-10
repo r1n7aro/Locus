@@ -40,6 +40,8 @@ const DEFAULT_PLUGIN_REGISTRY_DESCRIPTION_PATH: &str = "README.md";
 const PLUGIN_REGISTRY_INDEX_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 const PLUGIN_REGISTRY_DESCRIPTION_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const PLUGIN_GITHUB_AUTH_CONFIG_FILE: &str = "plugin-github-auth.json";
+const PLUGIN_REGISTRY_SOURCES_CONFIG_FILE: &str = "plugin-registry-sources.json";
+pub(crate) const DEFAULT_PLUGIN_REGISTRY_NAME: &str = "Locus Registry";
 const PLUGIN_GITHUB_CLI_HOSTNAME: &str = "github.com";
 const PLUGIN_GITHUB_CLI_SCOPES: &str = "repo,read:org";
 const PLUGIN_GITHUB_CLI_VERIFICATION_URI: &str = "https://github.com/login/device";
@@ -1352,6 +1354,191 @@ fn cleanup_resolved_plugin_source(source: &ResolvedPluginInstallSource) {
             let _ = fs::remove_file(path);
         }
     }
+}
+
+/// Registry source registered in the plugin hub. The frontend resolves the
+/// provider-specific raw `base_url` before saving, so the backend never has to
+/// re-implement the GitHub/GitLab/Gitee/Gitea URL mapping; the remaining repo
+/// fields only round-trip back to the plugin hub config dialog.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginRegistrySourceConfig {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub owner: String,
+    #[serde(default)]
+    pub repo: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub branch: String,
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub base_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct PluginRegistrySourcesConfig {
+    #[serde(default)]
+    schema_version: u32,
+    #[serde(default)]
+    sources: Vec<PluginRegistrySourceConfig>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PluginRegistryToolSource {
+    pub name: String,
+    pub base_url: String,
+}
+
+fn default_plugin_registry_tool_source() -> PluginRegistryToolSource {
+    PluginRegistryToolSource {
+        name: DEFAULT_PLUGIN_REGISTRY_NAME.to_string(),
+        base_url: DEFAULT_PLUGIN_REGISTRY_BASE_URL.to_string(),
+    }
+}
+
+fn plugin_registry_sources_config_path() -> Result<PathBuf, String> {
+    Ok(super::persistent_config_dir()?.join(PLUGIN_REGISTRY_SOURCES_CONFIG_FILE))
+}
+
+fn normalize_plugin_registry_source_config(
+    source: PluginRegistrySourceConfig,
+) -> Result<PluginRegistrySourceConfig, String> {
+    let id = source.id.trim().to_string();
+    if id.is_empty() {
+        return Err("Plugin registry source id is required".to_string());
+    }
+    let base_url = source.base_url.trim().to_string();
+    if base_url.is_empty() {
+        return Err(format!(
+            "Plugin registry source '{}' is missing baseUrl",
+            id
+        ));
+    }
+    let base_url = normalize_registry_base_url(Some(base_url))?;
+    let name = source.name.trim().to_string();
+    Ok(PluginRegistrySourceConfig {
+        id,
+        name: if name.is_empty() {
+            base_url.clone()
+        } else {
+            name
+        },
+        owner: source.owner.trim().to_string(),
+        repo: source.repo.trim().to_string(),
+        url: source
+            .url
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        provider: source
+            .provider
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        branch: source.branch.trim().to_string(),
+        path: source.path.trim().to_string(),
+        base_url,
+    })
+}
+
+fn normalize_plugin_registry_source_configs(
+    sources: Vec<PluginRegistrySourceConfig>,
+) -> Result<Vec<PluginRegistrySourceConfig>, String> {
+    let mut normalized = Vec::with_capacity(sources.len());
+    let mut seen_ids = std::collections::HashSet::new();
+    for source in sources {
+        let source = normalize_plugin_registry_source_config(source)?;
+        if seen_ids.insert(source.id.clone()) {
+            normalized.push(source);
+        }
+    }
+    Ok(normalized)
+}
+
+async fn read_plugin_registry_sources_config() -> Option<PluginRegistrySourcesConfig> {
+    let path = plugin_registry_sources_config_path().ok()?;
+    let bytes = tokio::fs::read(path).await.ok()?;
+    serde_json::from_slice::<PluginRegistrySourcesConfig>(&bytes).ok()
+}
+
+fn plugin_registry_tool_sources_from_config(
+    config: Option<PluginRegistrySourcesConfig>,
+) -> Vec<PluginRegistryToolSource> {
+    let mut sources = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for source in config.map(|config| config.sources).unwrap_or_default() {
+        let Ok(source) = normalize_plugin_registry_source_config(source) else {
+            continue;
+        };
+        if seen.insert(source.base_url.clone()) {
+            sources.push(PluginRegistryToolSource {
+                name: source.name,
+                base_url: source.base_url,
+            });
+        }
+    }
+    if sources.is_empty() {
+        sources.push(default_plugin_registry_tool_source());
+    }
+    sources
+}
+
+/// Registries the plugin tools target when no explicit base URL is given:
+/// every source registered in the plugin hub, falling back to the official
+/// registry when none are configured.
+pub(crate) async fn plugin_registry_tool_sources() -> Vec<PluginRegistryToolSource> {
+    plugin_registry_tool_sources_from_config(read_plugin_registry_sources_config().await)
+}
+
+#[tauri::command]
+pub async fn plugin_registry_sources_get(
+) -> Result<Option<Vec<PluginRegistrySourceConfig>>, AppError> {
+    let path = plugin_registry_sources_config_path().map_err(AppError::from)?;
+    let bytes = match tokio::fs::read(&path).await {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(AppError::from(format!(
+                "Failed to read plugin registry sources: {}",
+                error
+            )))
+        }
+    };
+    // A corrupted file reads as "not configured" so the frontend can reseed it.
+    Ok(
+        serde_json::from_slice::<PluginRegistrySourcesConfig>(&bytes)
+            .ok()
+            .map(|config| config.sources),
+    )
+}
+
+#[tauri::command]
+pub async fn plugin_registry_sources_set(
+    sources: Vec<PluginRegistrySourceConfig>,
+) -> Result<Vec<PluginRegistrySourceConfig>, AppError> {
+    let normalized = normalize_plugin_registry_source_configs(sources).map_err(AppError::from)?;
+    let path = plugin_registry_sources_config_path().map_err(AppError::from)?;
+    let config = PluginRegistrySourcesConfig {
+        schema_version: 1,
+        sources: normalized.clone(),
+    };
+    let json = serde_json::to_vec_pretty(&config).map_err(|error| {
+        AppError::from(format!(
+            "Failed to serialize plugin registry sources: {}",
+            error
+        ))
+    })?;
+    tokio::fs::write(&path, json).await.map_err(|error| {
+        AppError::from(format!("Failed to save plugin registry sources: {}", error))
+    })?;
+    Ok(normalized)
 }
 
 fn plugin_github_auth_config_path() -> Result<PathBuf, String> {
@@ -3992,6 +4179,90 @@ mod tests {
         assert_eq!(manifest.entry_base_path, "plugins");
         assert_eq!(manifest.summary_base_path, "shards");
         assert_eq!(manifest.search_index_path, "search/summaries.json");
+    }
+
+    #[test]
+    fn registry_source_configs_normalize_and_dedup_by_id() {
+        let normalized = normalize_plugin_registry_source_configs(vec![
+            PluginRegistrySourceConfig {
+                id: " default ".to_string(),
+                name: "  ".to_string(),
+                base_url: "https://raw.githubusercontent.com/r1n7aro/locus-plugin-registry/test/public/v1/"
+                    .to_string(),
+                ..Default::default()
+            },
+            PluginRegistrySourceConfig {
+                id: "default".to_string(),
+                name: "Duplicate".to_string(),
+                base_url: "https://example.com/registry".to_string(),
+                ..Default::default()
+            },
+        ])
+        .expect("normalize registry sources");
+
+        assert_eq!(normalized.len(), 1);
+        assert_eq!(normalized[0].id, "default");
+        assert_eq!(
+            normalized[0].base_url,
+            "https://raw.githubusercontent.com/r1n7aro/locus-plugin-registry/test/public/v1"
+        );
+        assert_eq!(normalized[0].name, normalized[0].base_url);
+    }
+
+    #[test]
+    fn registry_source_configs_reject_insecure_base_url() {
+        let result = normalize_plugin_registry_source_configs(vec![PluginRegistrySourceConfig {
+            id: "insecure".to_string(),
+            base_url: "http://example.com/registry".to_string(),
+            ..Default::default()
+        }]);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn registry_tool_sources_fall_back_to_default_registry() {
+        assert_eq!(
+            plugin_registry_tool_sources_from_config(None)
+                .into_iter()
+                .map(|source| source.base_url)
+                .collect::<Vec<_>>(),
+            vec![DEFAULT_PLUGIN_REGISTRY_BASE_URL.to_string()]
+        );
+
+        let configured = plugin_registry_tool_sources_from_config(Some(PluginRegistrySourcesConfig {
+            schema_version: 1,
+            sources: vec![
+                PluginRegistrySourceConfig {
+                    id: "default".to_string(),
+                    name: "Locus Registry".to_string(),
+                    base_url:
+                        "https://raw.githubusercontent.com/r1n7aro/locus-plugin-registry/test/public/v1"
+                            .to_string(),
+                    ..Default::default()
+                },
+                PluginRegistrySourceConfig {
+                    id: "broken".to_string(),
+                    base_url: "not a url".to_string(),
+                    ..Default::default()
+                },
+                PluginRegistrySourceConfig {
+                    id: "same-base".to_string(),
+                    name: "Same base".to_string(),
+                    base_url:
+                        "https://raw.githubusercontent.com/r1n7aro/locus-plugin-registry/test/public/v1/"
+                            .to_string(),
+                    ..Default::default()
+                },
+            ],
+        }));
+
+        assert_eq!(configured.len(), 1);
+        assert_eq!(configured[0].name, "Locus Registry");
+        assert_eq!(
+            configured[0].base_url,
+            "https://raw.githubusercontent.com/r1n7aro/locus-plugin-registry/test/public/v1"
+        );
     }
 
     #[test]

@@ -57,6 +57,8 @@ import {
   pluginRegistryFetchPlugin,
   pluginRegistryFetchSearchIndex,
   pluginRegistryFetchShard,
+  pluginRegistrySourcesGet,
+  pluginRegistrySourcesSet,
   pluginSetEnabled,
   pluginUninstall,
   type InstalledPluginSummary,
@@ -682,29 +684,42 @@ async function logoutGithubAuth() {
   }
 }
 
-function loadRegistrySourceSettings() {
-  let nextSources: PluginRegistrySource[] = [{ ...DEFAULT_PLUGIN_REGISTRY_SOURCE }];
-  let shouldPersist = false;
+function legacyRegistrySourcesFromLocalStorage(): PluginRegistrySource[] {
   try {
     const rawSources = localStorage.getItem(PLUGIN_REGISTRY_SOURCES_STORAGE_KEY);
-    if (rawSources) {
-      nextSources = normalizePluginRegistrySources(JSON.parse(rawSources));
-      shouldPersist = rawSources !== JSON.stringify(nextSources);
+    if (rawSources) return normalizePluginRegistrySources(JSON.parse(rawSources));
+  } catch (error) {
+    console.warn("Failed to read legacy plugin registry sources:", error);
+  }
+  return [{ ...DEFAULT_PLUGIN_REGISTRY_SOURCE }];
+}
+
+async function loadRegistrySourceSettings() {
+  let nextSources: PluginRegistrySource[] = [{ ...DEFAULT_PLUGIN_REGISTRY_SOURCE }];
+  try {
+    const stored = await pluginRegistrySourcesGet();
+    if (stored) {
+      nextSources = normalizePluginRegistrySources(stored);
+    } else {
+      // One-time migration: seed the backend store from the legacy
+      // localStorage copy, then drop the frontend copy for good.
+      nextSources = legacyRegistrySourcesFromLocalStorage();
+      nextSources = await persistRegistrySources(nextSources);
+      localStorage.removeItem(PLUGIN_REGISTRY_SOURCES_STORAGE_KEY);
     }
   } catch (error) {
     console.warn("Failed to load plugin registry sources:", error);
   }
   registrySources.value = nextSources;
-  if (shouldPersist) persistRegistrySourceSettings();
   syncRegistryDraftsFromSources();
 }
 
-function persistRegistrySourceSettings() {
-  try {
-    localStorage.setItem(PLUGIN_REGISTRY_SOURCES_STORAGE_KEY, JSON.stringify(registrySources.value));
-  } catch (error) {
-    console.warn("Failed to save plugin registry sources:", error);
-  }
+async function persistRegistrySources(sources: PluginRegistrySource[]): Promise<PluginRegistrySource[]> {
+  const saved = await pluginRegistrySourcesSet(sources.map((source) => ({
+    ...source,
+    baseUrl: pluginRegistrySourceBaseUrl(source),
+  })));
+  return normalizePluginRegistrySources(saved);
 }
 
 function registrySourceToDraft(source: PluginRegistrySource): PluginRegistrySourceDraft {
@@ -753,7 +768,7 @@ function removeRegistrySourceDraft(index: number) {
   registrySourceDrafts.value = registrySourceDrafts.value.filter((_, itemIndex) => itemIndex !== index);
 }
 
-function saveRegistrySources() {
+async function saveRegistrySources() {
   const seenIds = new Set<string>();
   const nextSources: PluginRegistrySource[] = [];
   for (const draft of registrySourceDrafts.value) {
@@ -778,9 +793,13 @@ function saveRegistrySources() {
       path,
     });
   }
-  registrySources.value = normalizePluginRegistrySources(nextSources);
+  try {
+    registrySources.value = await persistRegistrySources(normalizePluginRegistrySources(nextSources));
+  } catch (error) {
+    registryConfigError.value = errorMessage(error);
+    return;
+  }
   registryConfigError.value = "";
-  persistRegistrySourceSettings();
   syncRegistryDraftsFromSources();
   registryConfigOpen.value = false;
   void refreshRegistry();
@@ -1851,7 +1870,7 @@ watch([selectedRegistryGithubRepo, () => githubAuthStatus.value.authenticated], 
 });
 
 onMounted(async () => {
-  loadRegistrySourceSettings();
+  await loadRegistrySourceSettings();
   void refreshGithubAuthStatus();
   await refreshAll();
   await refreshRegistry({ cacheMode: "cachePreferred", silent: true });

@@ -1152,6 +1152,8 @@ pub fn run() {
             commands::get_skill_unity_install_status,
             commands::install_skill_unity_files,
             commands::remove_skill_unity_files,
+            commands::plugin_registry_sources_get,
+            commands::plugin_registry_sources_set,
             commands::plugin_registry_fetch_manifest,
             commands::plugin_registry_fetch_shard,
             commands::plugin_registry_fetch_search_index,
