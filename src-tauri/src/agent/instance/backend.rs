@@ -87,7 +87,7 @@ pub(super) fn model_context_limit(model: &str) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{OPENAI_CODEX_CONTEXT_LIMIT, is_retryable_llm_error, model_context_limit};
+    use super::{is_retryable_llm_error, model_context_limit, OPENAI_CODEX_CONTEXT_LIMIT};
 
     #[test]
     fn uses_codex_runtime_context_limits_for_openai_subscription_models() {

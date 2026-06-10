@@ -1,6 +1,6 @@
 use super::filesystem::is_binary_extension;
 use super::misc::truncate_utf8_prefix;
-use super::{ToolDef, ToolResult, make_exec};
+use super::{make_exec, ToolDef, ToolResult};
 
 // ─── grep ───────────────────────────────────────────────────────────────────
 

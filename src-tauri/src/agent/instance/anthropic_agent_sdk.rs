@@ -4,8 +4,8 @@ use std::sync::Arc;
 use tauri::AppHandle;
 
 use super::{
-    AgentInstance, AssistantStreamState, ExecutedToolResult, StreamRenderOrderTracker,
-    emit_parent_stream, emit_stream, finalize_tool_call_record, normalize_tool_args,
+    emit_parent_stream, emit_stream, finalize_tool_call_record, normalize_tool_args, AgentInstance,
+    AssistantStreamState, ExecutedToolResult, StreamRenderOrderTracker,
 };
 use crate::commands::{StreamEvent, ToolCallOutcome};
 use crate::llm::anthropic_agent_sdk::{

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use super::{ToolDef, ToolResult, make_exec};
+use super::{make_exec, ToolDef, ToolResult};
 
 // ─── unity_execute ───────────────────────────────────────────────────────────
 

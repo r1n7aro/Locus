@@ -1,5 +1,5 @@
 use super::misc::truncate_utf8_prefix;
-use super::{ToolDef, ToolResult, make_exec};
+use super::{make_exec, ToolDef, ToolResult};
 use crate::eol::{apply_line_ending, normalize_lf, resolve_preferred_line_ending};
 
 // ─── read ───────────────────────────────────────────────────────────────────
@@ -1093,11 +1093,9 @@ mod tests {
             });
 
         assert!(result.is_error);
-        assert!(
-            result
-                .output
-                .contains("Found multiple matches for oldString")
-        );
+        assert!(result
+            .output
+            .contains("Found multiple matches for oldString"));
         assert!(result.output.contains("at lines: 3, 5"));
         assert_eq!(
             std::fs::read_to_string(&target).expect("read untouched file"),
