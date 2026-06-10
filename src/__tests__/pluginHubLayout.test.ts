@@ -208,13 +208,13 @@ describe("plugin hub layout", () => {
     expect(help).toContain("plugin.help.publishTitle");
     expect(source).toContain(".plugin-help-section");
     expect(source).not.toContain("plugin-help-card");
-    expect(zh).toContain('"plugin.help.commandTitle": "/plugin"');
-    expect(zh).toContain('"plugin.help.skillTitle": "Skill"');
-    expect(zh).toContain('"plugin.help.publishTitle": "如何发布自己的插件？"');
+    expect(zh).toContain('"plugin.help.commandTitle": "创建与更新"');
+    expect(zh).toContain('"plugin.help.skillTitle": "Skill 组件"');
+    expect(zh).toContain('"plugin.help.publishTitle": "发布自己的插件"');
     expect(zh).toContain("要求 Agent 创建插件仓库并向注册表发起 Pull Request");
-    expect(en).toContain('"plugin.help.commandTitle": "/plugin"');
-    expect(en).toContain('"plugin.help.skillTitle": "Skill"');
-    expect(en).toContain('"plugin.help.publishTitle": "How do I publish my own plugin?"');
+    expect(en).toContain('"plugin.help.commandTitle": "Create and update"');
+    expect(en).toContain('"plugin.help.skillTitle": "Skill components"');
+    expect(en).toContain('"plugin.help.publishTitle": "Publish your own plugin"');
     expect(en).toContain("ask the agent to create the plugin repository and open a pull request to the registry");
   });
 

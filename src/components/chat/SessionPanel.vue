@@ -10,7 +10,7 @@ import {
   watch,
   type ComponentPublicInstance,
 } from "vue";
-import { Check, ChevronRight, Folder, FolderOpen, HelpCircle, LoaderCircle, X } from "lucide";
+import { Check, ChevronRight, Folder, FolderOpen, HelpCircle, ListTree, LoaderCircle, MessageSquarePlus, Settings2, Sparkles, X } from "lucide";
 import { t } from "../../i18n";
 import { buildSessionTree } from "./sessionTree";
 import BaseButton from "../ui/BaseButton.vue";
@@ -185,7 +185,6 @@ const viewDragTargetPosition = ref<ViewDropTarget["position"] | "">("");
 const viewHelpOpen = ref(false);
 const viewHelpDialogRef = ref<HTMLElement | null>(null);
 const viewHelpBtnRef = ref<HTMLButtonElement | null>(null);
-const viewHelpPos = ref<{ top: number; right: number } | null>(null);
 const hasWorkspace = computed(() => !!props.workingDir?.trim());
 const viewExpandedState = ref<Record<string, boolean>>(loadViewExpandedState());
 const sessionPanelRef = ref<HTMLElement | null>(null);
@@ -1239,13 +1238,6 @@ function closeViewHelp() {
 }
 
 function openViewHelp() {
-  const rect = viewHelpBtnRef.value?.getBoundingClientRect();
-  viewHelpPos.value = rect
-    ? {
-        top: Math.round(rect.bottom + 6),
-        right: Math.max(8, Math.round(window.innerWidth - rect.right)),
-      }
-    : null;
   viewHelpOpen.value = true;
   void nextTick(() => viewHelpDialogRef.value?.focus());
 }
@@ -2008,7 +2000,6 @@ function ctxArchive() {
             ref="viewHelpDialogRef"
             class="sp-view-help-dialog"
             role="dialog"
-            :style="viewHelpPos ? { top: `${viewHelpPos.top}px`, right: `${viewHelpPos.right}px` } : undefined"
             :aria-labelledby="'session-view-help-title'"
             tabindex="-1"
             @keydown.esc.stop="closeViewHelp"
@@ -2029,20 +2020,40 @@ function ctxArchive() {
             </header>
             <div class="sp-view-help-body">
               <section class="sp-view-help-section">
-                <div class="sp-view-help-section-title">{{ t('view.list.helpFeatureTitle') }}</div>
-                <p>{{ t('view.list.helpBody') }}</p>
+                <span class="sp-view-help-section-icon" aria-hidden="true">
+                  <LucideIcon :icon="Sparkles" :size="15" :stroke-width="1.8" />
+                </span>
+                <div class="sp-view-help-section-copy">
+                  <div class="sp-view-help-section-title">{{ t('view.list.helpFeatureTitle') }}</div>
+                  <p>{{ t('view.list.helpBody') }}</p>
+                </div>
               </section>
               <section class="sp-view-help-section">
-                <div class="sp-view-help-section-title">{{ t('view.list.helpCreateTitle') }}</div>
-                <p>{{ t('view.list.helpCreate') }}</p>
+                <span class="sp-view-help-section-icon" aria-hidden="true">
+                  <LucideIcon :icon="MessageSquarePlus" :size="15" :stroke-width="1.8" />
+                </span>
+                <div class="sp-view-help-section-copy">
+                  <div class="sp-view-help-section-title">{{ t('view.list.helpCreateTitle') }}</div>
+                  <p>{{ t('view.list.helpCreate') }}</p>
+                </div>
               </section>
               <section class="sp-view-help-section">
-                <div class="sp-view-help-section-title">{{ t('view.list.helpOrganizeTitle') }}</div>
-                <p>{{ t('view.list.helpOrganize') }}</p>
+                <span class="sp-view-help-section-icon" aria-hidden="true">
+                  <LucideIcon :icon="ListTree" :size="15" :stroke-width="1.8" />
+                </span>
+                <div class="sp-view-help-section-copy">
+                  <div class="sp-view-help-section-title">{{ t('view.list.helpOrganizeTitle') }}</div>
+                  <p>{{ t('view.list.helpOrganize') }}</p>
+                </div>
               </section>
               <section class="sp-view-help-section">
-                <div class="sp-view-help-section-title">{{ t('view.list.helpSettingsTitle') }}</div>
-                <p>{{ t('view.list.helpSettings') }}</p>
+                <span class="sp-view-help-section-icon" aria-hidden="true">
+                  <LucideIcon :icon="Settings2" :size="15" :stroke-width="1.8" />
+                </span>
+                <div class="sp-view-help-section-copy">
+                  <div class="sp-view-help-section-title">{{ t('view.list.helpSettingsTitle') }}</div>
+                  <p>{{ t('view.list.helpSettings') }}</p>
+                </div>
               </section>
             </div>
             <footer class="sp-view-help-footer">
@@ -2313,23 +2324,24 @@ function ctxArchive() {
   position: fixed;
   inset: 0;
   z-index: 10001;
-  background: transparent;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(0, 0, 0, 0.32);
 }
 
 .sp-view-help-dialog {
-  position: fixed;
-  top: 48px;
-  right: 12px;
-  width: min(336px, calc(100vw - 24px));
-  max-height: min(520px, calc(100vh - 64px));
+  width: min(520px, 100%);
+  max-height: min(640px, 100%);
   display: flex;
   flex-direction: column;
   border: 1px solid var(--border-color);
-  border-radius: 10px;
+  border-radius: 12px;
   background: var(--surface-elevated);
-  box-shadow: 0 12px 28px rgba(15, 17, 21, 0.18);
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.28);
   overflow: hidden;
-  transform-origin: top right;
+  transform-origin: center;
 }
 
 .sp-view-help-dialog:focus {
@@ -2341,7 +2353,8 @@ function ctxArchive() {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  padding: 12px 14px 8px;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border-color);
 }
 
 .sp-view-help-header-copy {
@@ -2352,7 +2365,7 @@ function ctxArchive() {
 
 .sp-view-help-title {
   margin: 0;
-  font-size: 13px;
+  font-size: 14px;
   font-weight: 600;
   line-height: 1.3;
   color: var(--text-color);
@@ -2386,32 +2399,48 @@ function ctxArchive() {
 .sp-view-help-body {
   display: flex;
   flex-direction: column;
-  gap: 12px;
-  padding: 0 14px 12px;
+  gap: 16px;
+  padding: 16px;
   overflow: auto;
 }
 
 .sp-view-help-section {
   display: flex;
-  flex-direction: column;
-  gap: 5px;
+  align-items: flex-start;
+  gap: 12px;
 }
 
-.sp-view-help-section + .sp-view-help-section {
-  padding-top: 11px;
-  border-top: 1px solid var(--border-color);
+.sp-view-help-section-icon {
+  flex-shrink: 0;
+  width: 30px;
+  height: 30px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+  background: var(--hover-bg);
+  color: var(--accent-color);
+}
+
+.sp-view-help-section-copy {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding-top: 1px;
 }
 
 .sp-view-help-section-title {
-  font-size: 12px;
+  font-size: 13px;
   font-weight: 600;
+  line-height: 1.4;
   color: var(--text-color);
 }
 
 .sp-view-help-section p {
   margin: 0;
-  font-size: 12px;
-  line-height: 1.6;
+  font-size: 12.5px;
+  line-height: 1.65;
   color: var(--text-secondary);
 }
 
@@ -2419,7 +2448,7 @@ function ctxArchive() {
   display: flex;
   justify-content: flex-end;
   gap: 8px;
-  padding: 10px 14px 12px;
+  padding: 12px 16px;
   border-top: 1px solid var(--border-color);
 }
 
@@ -2441,7 +2470,7 @@ function ctxArchive() {
 .sp-view-help-modal-enter-from .sp-view-help-dialog,
 .sp-view-help-modal-leave-to .sp-view-help-dialog {
   opacity: 0;
-  transform: scale(0.97) translateY(-4px);
+  transform: scale(0.97) translateY(8px);
 }
 
 .sp-view-list {

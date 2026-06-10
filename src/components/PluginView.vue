@@ -8,11 +8,13 @@ import {
   Copy,
   ExternalLink,
   FolderOpen,
+  GitPullRequest,
   HelpCircle,
   KeyRound,
   Link,
   LoaderCircle,
   LogOut,
+  MessageSquarePlus,
   Package,
   PackageCheck,
   Plus,
@@ -24,6 +26,7 @@ import {
   Store,
   Trash2,
   UserCheck,
+  Workflow,
   X,
 } from "lucide";
 import type { IconNode } from "lucide";
@@ -2435,20 +2438,40 @@ onUnmounted(() => {
 
           <div class="plugin-hub-config-body plugin-help-body">
             <section class="plugin-help-section">
-              <div class="plugin-help-section-title">{{ t("plugin.help.featureTitle") }}</div>
-              <p>{{ t("plugin.help.featureBody") }}</p>
+              <span class="plugin-help-section-icon" aria-hidden="true">
+                <LucideIcon :icon="Package" :size="15" :stroke-width="1.8" />
+              </span>
+              <div class="plugin-help-section-copy">
+                <div class="plugin-help-section-title">{{ t("plugin.help.featureTitle") }}</div>
+                <p>{{ t("plugin.help.featureBody") }}</p>
+              </div>
             </section>
             <section class="plugin-help-section">
-              <div class="plugin-help-section-title">{{ t("plugin.help.commandTitle") }}</div>
-              <p>{{ t("plugin.help.commandBody") }}</p>
+              <span class="plugin-help-section-icon" aria-hidden="true">
+                <LucideIcon :icon="MessageSquarePlus" :size="15" :stroke-width="1.8" />
+              </span>
+              <div class="plugin-help-section-copy">
+                <div class="plugin-help-section-title">{{ t("plugin.help.commandTitle") }}</div>
+                <p>{{ t("plugin.help.commandBody") }}</p>
+              </div>
             </section>
             <section class="plugin-help-section">
-              <div class="plugin-help-section-title">{{ t("plugin.help.skillTitle") }}</div>
-              <p>{{ t("plugin.help.skillBody") }}</p>
+              <span class="plugin-help-section-icon" aria-hidden="true">
+                <LucideIcon :icon="Workflow" :size="15" :stroke-width="1.8" />
+              </span>
+              <div class="plugin-help-section-copy">
+                <div class="plugin-help-section-title">{{ t("plugin.help.skillTitle") }}</div>
+                <p>{{ t("plugin.help.skillBody") }}</p>
+              </div>
             </section>
             <section class="plugin-help-section">
-              <div class="plugin-help-section-title">{{ t("plugin.help.publishTitle") }}</div>
-              <p>{{ t("plugin.help.publishBody") }}</p>
+              <span class="plugin-help-section-icon" aria-hidden="true">
+                <LucideIcon :icon="GitPullRequest" :size="15" :stroke-width="1.8" />
+              </span>
+              <div class="plugin-help-section-copy">
+                <div class="plugin-help-section-title">{{ t("plugin.help.publishTitle") }}</div>
+                <p>{{ t("plugin.help.publishBody") }}</p>
+              </div>
             </section>
           </div>
 
@@ -3535,27 +3558,48 @@ onUnmounted(() => {
 }
 
 .plugin-help-body {
-  gap: 14px;
+  gap: 16px;
 }
 
 .plugin-help-section {
   min-width: 0;
   display: flex;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.plugin-help-section-icon {
+  flex-shrink: 0;
+  width: 30px;
+  height: 30px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+  background: var(--hover-bg);
+  color: var(--accent-color);
+}
+
+.plugin-help-section-copy {
+  min-width: 0;
+  display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 4px;
+  padding-top: 1px;
 }
 
 .plugin-help-section-title {
   color: var(--text-color);
-  font-size: 12px;
-  font-weight: 650;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.4;
 }
 
 .plugin-help-section p {
   margin: 0;
   color: var(--text-secondary);
-  font-size: 12px;
-  line-height: 1.55;
+  font-size: 12.5px;
+  line-height: 1.65;
 }
 
 .plugin-github-oauth-body {
