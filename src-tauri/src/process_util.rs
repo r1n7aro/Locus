@@ -286,6 +286,111 @@ pub fn augment_path_with_github_cli(current_path: Option<OsString>) -> Option<Os
     prepend_paths(current_path, vec![parent])
 }
 
+/// Appends the machine + user `Path` values from the Windows registry so
+/// CLIs installed after Locus started (which only update the registry) are
+/// found without a restart. Entries already present are skipped, so paths
+/// prepended by Locus (git, gh, python) keep their precedence. No-op on
+/// other platforms.
+#[cfg(target_os = "windows")]
+pub fn augment_path_with_registry_paths(current_path: Option<OsString>) -> Option<OsString> {
+    let entries = read_registry_path_entries();
+    if entries.is_empty() {
+        return current_path;
+    }
+    append_paths(current_path, entries)
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn augment_path_with_registry_paths(current_path: Option<OsString>) -> Option<OsString> {
+    current_path
+}
+
+#[cfg(target_os = "windows")]
+fn read_registry_path_entries() -> Vec<PathBuf> {
+    use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
+    use winreg::RegKey;
+
+    let sources = [
+        (
+            HKEY_LOCAL_MACHINE,
+            r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment",
+        ),
+        (HKEY_CURRENT_USER, r"Environment"),
+    ];
+
+    let mut entries = Vec::new();
+    for (hive, key_path) in sources {
+        let Ok(key) = RegKey::predef(hive).open_subkey(key_path) else {
+            continue;
+        };
+        let Ok(raw) = key.get_value::<String, _>("Path") else {
+            continue;
+        };
+        for piece in raw.split(';') {
+            let expanded = expand_windows_env(piece.trim());
+            if expanded.is_empty() {
+                continue;
+            }
+            entries.push(PathBuf::from(expanded));
+        }
+    }
+    entries
+}
+
+// Registry Path values are REG_EXPAND_SZ; winreg returns them unexpanded.
+#[cfg(target_os = "windows")]
+fn expand_windows_env(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(start) = rest.find('%') {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 1..];
+        let Some(end) = after.find('%') else {
+            out.push('%');
+            rest = after;
+            continue;
+        };
+        let name = &after[..end];
+        if name.is_empty() {
+            out.push('%');
+        } else if let Some(value) = std::env::vars_os()
+            .find(|(key, _)| key.to_str().is_some_and(|k| k.eq_ignore_ascii_case(name)))
+            .map(|(_, value)| value)
+        {
+            out.push_str(&value.to_string_lossy());
+        } else {
+            out.push('%');
+            out.push_str(name);
+            out.push('%');
+        }
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+pub fn append_paths(current_path: Option<OsString>, entries: Vec<PathBuf>) -> Option<OsString> {
+    let mut paths: Vec<PathBuf> = current_path
+        .as_ref()
+        .map(|value| std::env::split_paths(value).collect())
+        .unwrap_or_default();
+
+    let mut changed = false;
+    for entry in entries {
+        if paths.iter().any(|existing| same_path(existing, &entry)) {
+            continue;
+        }
+        paths.push(entry);
+        changed = true;
+    }
+
+    if !changed {
+        return current_path;
+    }
+
+    std::env::join_paths(paths).ok()
+}
+
 pub fn prepend_paths(current_path: Option<OsString>, entries: Vec<PathBuf>) -> Option<OsString> {
     let mut paths: Vec<PathBuf> = current_path
         .as_ref()
@@ -1018,6 +1123,58 @@ mod tests {
     use super::{
         refresh_git_resolution, resolve_git, set_git_resolution_cache_for_test, GitDiscoverySource,
     };
+
+    #[test]
+    fn append_paths_skips_existing_and_appends_new_entries() {
+        use std::path::PathBuf;
+
+        let current = std::env::join_paths([PathBuf::from("/locus/bin"), PathBuf::from("/usr/bin")])
+            .expect("join test paths");
+        let result = super::append_paths(
+            Some(current),
+            vec![PathBuf::from("/usr/bin"), PathBuf::from("/opt/new/bin")],
+        )
+        .expect("paths should join");
+
+        let parts: Vec<PathBuf> = std::env::split_paths(&result).collect();
+        assert_eq!(
+            parts,
+            vec![
+                PathBuf::from("/locus/bin"),
+                PathBuf::from("/usr/bin"),
+                PathBuf::from("/opt/new/bin"),
+            ]
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn expand_windows_env_expands_known_variables() {
+        let system_root = std::env::var("SystemRoot").expect("SystemRoot should be set");
+        assert_eq!(
+            super::expand_windows_env("%SystemRoot%\\system32"),
+            format!("{}\\system32", system_root)
+        );
+        assert_eq!(
+            super::expand_windows_env("%LOCUS_NOT_A_REAL_VAR%"),
+            "%LOCUS_NOT_A_REAL_VAR%"
+        );
+        assert_eq!(super::expand_windows_env("plain"), "plain");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn registry_path_entries_are_available() {
+        let entries = super::read_registry_path_entries();
+        assert!(
+            !entries.is_empty(),
+            "machine/user registry PATH should produce entries"
+        );
+        assert!(
+            entries.iter().all(|entry| !entry.as_os_str().is_empty()),
+            "expanded entries should not be empty"
+        );
+    }
 
     #[test]
     fn refresh_git_resolution_replaces_cached_missing_result() {
