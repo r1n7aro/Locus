@@ -2,7 +2,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -11,6 +12,9 @@ use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, Webview
 use tokio::io::AsyncWriteExt;
 
 pub const VIEW_SCHEMA: &str = "locus.view.v1";
+// apiVersion records the Locus version a package was created with. It is
+// informational metadata, not a compatibility gate: packages created by older
+// app versions keep loading after an upgrade.
 pub const VIEW_API_VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"));
 pub const LEGACY_VIEW_API_VERSION: &str = "v0.3.0";
 pub const VIEW_TREE_METADATA_SCHEMA: &str = "locus.view.tree.v1";
@@ -115,16 +119,8 @@ where
     deserializer.deserialize_any(ViewApiVersionVisitor)
 }
 
-fn supported_view_api_version_labels() -> String {
-    if VIEW_API_VERSION == LEGACY_VIEW_API_VERSION {
-        VIEW_API_VERSION.to_string()
-    } else {
-        format!("{}, {}", VIEW_API_VERSION, LEGACY_VIEW_API_VERSION)
-    }
-}
-
-fn is_supported_view_api_version(value: &str) -> bool {
-    value == VIEW_API_VERSION || value == LEGACY_VIEW_API_VERSION
+fn is_valid_view_api_version(value: &str) -> bool {
+    !value.trim().is_empty()
 }
 
 #[derive(Debug, Default)]
@@ -974,9 +970,21 @@ fn updated_at(path: &Path) -> i64 {
         .unwrap_or(0)
 }
 
+// Window labels derive from view ids (`view-<id>`, detached copies get a
+// `view-<id>-<uuid>` label), so ids that would land in the `view-content-*`
+// or `view-pool-*` label namespaces are reserved.
+fn view_id_uses_reserved_prefix(id: &str) -> bool {
+    ["content", "pool"]
+        .iter()
+        .any(|prefix| id == *prefix || id.starts_with(&format!("{}-", prefix)))
+}
+
 pub fn is_valid_view_id(id: &str) -> bool {
     let id = id.trim();
     if id.is_empty() || id.starts_with('-') || id.ends_with('-') || id.contains("--") {
+        return false;
+    }
+    if view_id_uses_reserved_prefix(id) {
         return false;
     }
     id.chars()
@@ -985,6 +993,9 @@ pub fn is_valid_view_id(id: &str) -> bool {
 
 pub fn normalize_view_id(id: &str) -> Result<String, String> {
     let normalized = id.trim();
+    if view_id_uses_reserved_prefix(normalized) {
+        return Err("Invalid view id: 'content' and 'pool' prefixes are reserved.".to_string());
+    }
     if !is_valid_view_id(normalized) {
         return Err("Invalid view id: use lowercase kebab-case.".to_string());
     }
@@ -1110,12 +1121,8 @@ pub fn validate_view_manifest(manifest: &ViewManifest) -> Result<(), String> {
     if manifest.schema != VIEW_SCHEMA {
         return Err(format!("Unsupported View schema: {}", manifest.schema));
     }
-    if !is_supported_view_api_version(&manifest.api_version) {
-        return Err(format!(
-            "Unsupported View apiVersion: {}. Expected one of: {}.",
-            manifest.api_version,
-            supported_view_api_version_labels()
-        ));
+    if !is_valid_view_api_version(&manifest.api_version) {
+        return Err("View apiVersion cannot be empty.".to_string());
     }
     normalize_view_id(&manifest.id)?;
     if manifest.name.trim().is_empty() {
@@ -1854,8 +1861,7 @@ fn save_view_tree_metadata(
     };
     let raw = serde_json::to_string_pretty(&metadata)
         .map_err(|e| format!("Failed to serialize View tree metadata: {}", e))?;
-    std::fs::write(&path, raw + "\n")
-        .map_err(|e| format!("Failed to write {}: {}", path.display(), e))
+    write_text_file_atomic(&path, &(raw + "\n"))
 }
 
 fn view_display_folder_paths(views: &[ViewPackageSummary]) -> BTreeSet<String> {
@@ -2216,6 +2222,7 @@ fn remove_view_package_root(views_root: &Path, root: &Path, label: &str) -> Resu
             label
         ));
     }
+    stop_view_file_watchers_under(root);
     std::fs::remove_dir_all(root).map_err(|e| format!("Failed to delete {}: {}", root.display(), e))
 }
 
@@ -2305,6 +2312,7 @@ pub(crate) fn transfer_view_package_to_plugin_sync(
     view_id: &str,
     source_root: &Path,
 ) -> Result<String, String> {
+    let _guard = lock_view_mutations();
     let plan = plan_view_package_transfer_to_plugin_sync(working_dir, view_id, source_root)?;
 
     remove_view_package_root(
@@ -2368,6 +2376,7 @@ pub fn create_view_folder_sync(
     working_dir: &str,
     request: ViewCreateFolderRequest,
 ) -> Result<ViewFolderSummary, String> {
+    let _guard = lock_view_mutations();
     let views_root = views_root_for_workspace(working_dir)?;
     let parent_rel_path = request.parent_rel_path.as_deref().unwrap_or("").trim();
     let parent_rel_path = normalize_view_tree_rel_path(parent_rel_path, true)?;
@@ -2402,6 +2411,7 @@ pub fn delete_view_entry_sync(
     working_dir: &str,
     request: ViewDeleteEntryRequest,
 ) -> Result<ViewTreeSnapshot, String> {
+    let _guard = lock_view_mutations();
     let views_root = views_root_for_workspace(working_dir)?;
     let rel_path = normalize_view_tree_rel_path(&request.rel_path, false)?;
     let views = list_views_sync(working_dir)?;
@@ -2456,6 +2466,7 @@ pub fn rename_view_entry_sync(
     working_dir: &str,
     request: ViewRenameEntryRequest,
 ) -> Result<ViewTreeSnapshot, String> {
+    let _guard = lock_view_mutations();
     let views_root = views_root_for_workspace(working_dir)?;
     let source_rel_path = normalize_view_tree_rel_path(&request.rel_path, false)?;
     let views = list_views_sync(working_dir)?;
@@ -2546,6 +2557,7 @@ pub fn move_view_entry_sync(
     working_dir: &str,
     request: ViewMoveEntryRequest,
 ) -> Result<ViewTreeSnapshot, String> {
+    let _guard = lock_view_mutations();
     let views_root = views_root_for_workspace(working_dir)?;
     let source_rel_path = normalize_view_tree_rel_path(&request.source_rel_path, false)?;
     let target_dir_rel_path = request.target_dir_rel_path.as_deref().unwrap_or("");
@@ -3135,6 +3147,7 @@ pub fn import_view_package_sync(
     working_dir: &str,
     request: ViewImportPackageRequest,
 ) -> Result<ViewPackageImportResult, String> {
+    let _guard = lock_view_mutations();
     let archive_path = PathBuf::from(request.file_path.trim());
     if archive_path.as_os_str().is_empty() {
         return Err("Import path cannot be empty.".to_string());
@@ -3220,6 +3233,7 @@ pub fn create_view_sync_with_scope(
     request: ViewCreateRequest,
     temporary: bool,
 ) -> Result<ViewPackageDetail, String> {
+    let _guard = lock_view_mutations();
     let requested_id = normalize_view_id(&request.id)?;
     let id = if temporary {
         unique_temporary_view_id(&requested_id)
@@ -5451,9 +5465,34 @@ pub fn emit_view_tree_changed(app_handle: &AppHandle) {
     let _ = app_handle.emit(VIEW_TREE_CHANGED_EVENT, serde_json::json!({}));
 }
 
-fn view_file_watcher_keys() -> &'static Mutex<BTreeSet<String>> {
-    static WATCHERS: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
-    WATCHERS.get_or_init(|| Mutex::new(BTreeSet::new()))
+struct ViewFileWatcherHandle {
+    roots: Vec<PathBuf>,
+    cancel: Arc<AtomicBool>,
+}
+
+fn view_file_watchers() -> &'static Mutex<HashMap<String, ViewFileWatcherHandle>> {
+    static WATCHERS: OnceLock<Mutex<HashMap<String, ViewFileWatcherHandle>>> = OnceLock::new();
+    WATCHERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+// Cancels watchers whose watched root lives under `target` so that deleting
+// or transferring a package releases its watcher thread instead of leaking it
+// for the rest of the process lifetime.
+pub(crate) fn stop_view_file_watchers_under(target: &Path) {
+    let target = canonical_view_watch_path(target);
+    let Ok(mut watchers) = view_file_watchers().lock() else {
+        return;
+    };
+    watchers.retain(|_, handle| {
+        let cancelled = handle
+            .roots
+            .iter()
+            .any(|root| root == &target || root.starts_with(&target));
+        if cancelled {
+            handle.cancel.store(true, Ordering::Relaxed);
+        }
+        !cancelled
+    });
 }
 
 fn should_reload_for_view_event(event: &notify::Event) -> bool {
@@ -5519,13 +5558,21 @@ fn start_view_file_watcher(
         .map(|root| root.display().to_string().replace('\\', "/"))
         .collect::<Vec<_>>()
         .join("|");
+    let cancel = Arc::new(AtomicBool::new(false));
     {
-        let mut keys = view_file_watcher_keys()
+        let mut watchers = view_file_watchers()
             .lock()
             .map_err(|_| "View file watcher registry is poisoned.".to_string())?;
-        if !keys.insert(key.clone()) {
+        if watchers.contains_key(&key) {
             return Ok(());
         }
+        watchers.insert(
+            key.clone(),
+            ViewFileWatcherHandle {
+                roots: roots.clone(),
+                cancel: cancel.clone(),
+            },
+        );
     }
 
     let app_handle = app_handle.clone();
@@ -5541,19 +5588,20 @@ fn start_view_file_watcher(
     ) {
         Ok(watcher) => watcher,
         Err(error) => {
-            remove_view_file_watcher_key(&key);
+            remove_view_file_watcher_entry(&key, &cancel);
             return Err(format!("Failed to create watcher: {}", error));
         }
     };
 
     for root in &roots {
         if let Err(error) = watcher.watch(root, RecursiveMode::Recursive) {
-            remove_view_file_watcher_key(&key);
+            remove_view_file_watcher_entry(&key, &cancel);
             return Err(format!("Failed to watch {}: {}", root.display(), error));
         }
     }
 
     let key_for_thread = key.clone();
+    let cancel_for_thread = cancel.clone();
     match std::thread::Builder::new()
         .name(thread_name)
         .spawn(move || {
@@ -5561,6 +5609,10 @@ fn start_view_file_watcher(
             let mut pending = false;
             let mut last_event_at = Instant::now();
             loop {
+                if cancel_for_thread.load(Ordering::Relaxed) {
+                    remove_view_file_watcher_entry(&key_for_thread, &cancel_for_thread);
+                    break;
+                }
                 match rx.recv_timeout(Duration::from_millis(160)) {
                     Ok(Ok(event)) => {
                         if should_reload_for_view_event(&event) {
@@ -5584,7 +5636,7 @@ fn start_view_file_watcher(
                         }
                     }
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                        remove_view_file_watcher_key(&key_for_thread);
+                        remove_view_file_watcher_entry(&key_for_thread, &cancel_for_thread);
                         break;
                     }
                 }
@@ -5592,15 +5644,24 @@ fn start_view_file_watcher(
         }) {
         Ok(_) => Ok(()),
         Err(error) => {
-            remove_view_file_watcher_key(&key);
+            remove_view_file_watcher_entry(&key, &cancel);
             Err(format!("Failed to spawn watcher thread: {}", error))
         }
     }
 }
 
-fn remove_view_file_watcher_key(key: &str) {
-    if let Ok(mut keys) = view_file_watcher_keys().lock() {
-        keys.remove(key);
+// Only removes the entry if it still belongs to this watcher instance: a
+// cancelled key may have been re-registered by a fresh watcher in the
+// meantime, and that newer registration must survive.
+fn remove_view_file_watcher_entry(key: &str, cancel: &Arc<AtomicBool>) {
+    if let Ok(mut watchers) = view_file_watchers().lock() {
+        let owned = watchers
+            .get(key)
+            .map(|handle| Arc::ptr_eq(&handle.cancel, cancel))
+            .unwrap_or(false);
+        if owned {
+            watchers.remove(key);
+        }
     }
 }
 
@@ -5755,6 +5816,21 @@ fn view_storage_lock() -> &'static Mutex<()> {
     VIEW_STORAGE_LOCK.get_or_init(|| Mutex::new(()))
 }
 
+// Serializes View registry mutations: the tree-metadata read-modify-write
+// cycles and the duplicate-id scan that precedes package creation/import.
+// Without it concurrent tree operations drop each other's updates. Must never
+// be taken by a function that is itself called while the lock is held.
+fn view_mutation_lock() -> &'static Mutex<()> {
+    static VIEW_MUTATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    VIEW_MUTATION_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn lock_view_mutations() -> std::sync::MutexGuard<'static, ()> {
+    view_mutation_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn normalize_view_storage_key(key: &str) -> Result<String, String> {
     let normalized = key.trim();
     if normalized.is_empty() {
@@ -5783,6 +5859,23 @@ fn storage_path_for_view(working_dir: &str, view_id: &str) -> Result<PathBuf, St
         ));
     }
     package_path(&root, VIEW_STORAGE_REL_PATH)
+}
+
+// Write-then-rename so a crash mid-write never leaves a truncated JSON file
+// behind; a half-written storage or tree file would fail every later read.
+fn write_text_file_atomic(path: &Path, contents: &str) -> Result<(), String> {
+    let mut tmp_name = path
+        .file_name()
+        .map(|name| name.to_os_string())
+        .ok_or_else(|| format!("Invalid file path: {}", path.display()))?;
+    tmp_name.push(".tmp");
+    let tmp_path = path.with_file_name(tmp_name);
+    std::fs::write(&tmp_path, contents)
+        .map_err(|error| format!("Failed to write {}: {}", tmp_path.display(), error))?;
+    std::fs::rename(&tmp_path, path).map_err(|error| {
+        let _ = std::fs::remove_file(&tmp_path);
+        format!("Failed to replace {}: {}", path.display(), error)
+    })
 }
 
 fn read_view_storage_file(
@@ -5824,8 +5917,7 @@ fn write_view_storage_file(
     }
     let json = serde_json::to_string_pretty(storage)
         .map_err(|error| format!("Failed to serialize View storage: {}", error))?;
-    std::fs::write(path, json + "\n")
-        .map_err(|error| format!("Failed to write {}: {}", path.display(), error))
+    write_text_file_atomic(path, &(json + "\n"))
 }
 
 pub fn view_storage_get_sync(
@@ -6389,6 +6481,19 @@ mod tests {
     }
 
     #[test]
+    fn view_id_validation_rejects_reserved_window_label_prefixes() {
+        assert!(!is_valid_view_id("content"));
+        assert!(!is_valid_view_id("content-foo"));
+        assert!(!is_valid_view_id("pool"));
+        assert!(!is_valid_view_id("pool-1"));
+        assert!(is_valid_view_id("contents-panel"));
+        assert!(is_valid_view_id("pooled-table"));
+        assert!(super::normalize_view_id("content-foo")
+            .unwrap_err()
+            .contains("reserved"));
+    }
+
+    #[test]
     fn package_relative_path_rejects_escapes_and_absolute_paths() {
         assert_eq!(
             normalize_package_rel_path("src\\App.vue").unwrap(),
@@ -6633,6 +6738,14 @@ mod tests {
             requirements: None,
         };
         validate_view_manifest(&manifest).unwrap();
+
+        // apiVersion records the creating app version and is not a
+        // compatibility gate: any non-empty version must stay loadable.
+        manifest.api_version = "v0.1.0".to_string();
+        validate_view_manifest(&manifest).unwrap();
+        manifest.api_version = "  ".to_string();
+        assert!(validate_view_manifest(&manifest).is_err());
+        manifest.api_version = VIEW_API_VERSION.to_string();
 
         manifest.entry = "../main.ts".to_string();
         assert!(validate_view_manifest(&manifest).is_err());
@@ -7273,7 +7386,19 @@ mod tests {
         assert!(!default_test_view_package_root(&working_dir)
             .join("material-inspector")
             .exists());
-        assert!(deleted.views.is_empty());
+        // Plugin-managed views from globally installed plugins may be listed
+        // on developer machines; only workspace views must be gone.
+        let workspace_views = deleted
+            .views
+            .iter()
+            .filter(|view| !super::view_is_plugin_managed(view))
+            .map(|view| (view.id.clone(), view.package_root.clone()))
+            .collect::<Vec<_>>();
+        assert!(
+            workspace_views.is_empty(),
+            "expected no workspace views after folder delete, found: {:?}",
+            workspace_views
+        );
         assert!(!deleted.folders.iter().any(|item| item.rel_path == "Tools"));
     }
 

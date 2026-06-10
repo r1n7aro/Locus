@@ -635,6 +635,17 @@ await view.fs.readFile(shaderPath, "utf8");
     expect(transformed.introducedNames).toContain("path");
   });
 
+  it("guards .vue module loading against circular imports", () => {
+    const runtime = read("src/components/view/viewRuntime.ts");
+    const skillRuntime = read("skills/view/app/view-runtime/src/components/view/viewRuntime.ts");
+
+    for (const source of [runtime, skillRuntime]) {
+      expect(source).toContain("const compilingSfcPaths = new Set<string>()");
+      expect(source).toContain("Circular import between .vue files is not supported");
+      expect(source).toContain("compilingSfcPaths.delete(file.relPath)");
+    }
+  });
+
   it("wires the View fs bridge through runtime, host, service, and Tauri commands", () => {
     const runtime = read("src/components/view/viewRuntime.ts");
     const host = read("src/components/ViewHostWindow.vue");

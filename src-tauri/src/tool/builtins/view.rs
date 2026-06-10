@@ -96,6 +96,7 @@ pub(super) fn view_create() -> ToolDef {
         name: "view_create".to_string(),
         description: prompt.description,
         parameters: prompt.parameters,
+        mutates_workspace: true,
         execute: make_exec(|args, ctx| {
             Box::pin(async move {
                 let working_dir = match working_dir_or_error(&ctx, "view_create") {
@@ -138,6 +139,7 @@ pub(super) fn view_list() -> ToolDef {
         name: "view_list".to_string(),
         description: prompt.description,
         parameters: prompt.parameters,
+        mutates_workspace: false,
         execute: make_exec(|_args, ctx| {
             Box::pin(async move {
                 let working_dir = match working_dir_or_error(&ctx, "view_list") {
@@ -162,6 +164,7 @@ pub(super) fn view_reload() -> ToolDef {
         name: "view_reload".to_string(),
         description: prompt.description,
         parameters: prompt.parameters,
+        mutates_workspace: false,
         execute: make_exec(|args, ctx| {
             Box::pin(async move {
                 let working_dir = match working_dir_or_error(&ctx, "view_reload") {
@@ -173,7 +176,12 @@ pub(super) fn view_reload() -> ToolDef {
                     Err(result) => return result,
                 };
                 match crate::view::reload_view_sync(&working_dir, &view_id) {
-                    Ok(summary) => json_output(&summary),
+                    Ok(summary) => {
+                        if let Some(app_handle) = ctx.app_handle.as_ref() {
+                            crate::view::emit_view_reload(app_handle, &summary);
+                        }
+                        json_output(&summary)
+                    }
                     Err(error) => ToolResult {
                         output: error,
                         is_error: true,
@@ -190,6 +198,7 @@ pub(super) fn view_run() -> ToolDef {
         name: "view_run".to_string(),
         description: prompt.description,
         parameters: prompt.parameters,
+        mutates_workspace: false,
         execute: make_exec(|args, ctx| {
             Box::pin(async move {
                 let working_dir = match working_dir_or_error(&ctx, "view_run") {
@@ -241,6 +250,7 @@ pub(super) fn view_compile_script() -> ToolDef {
         name: "view_compile_script".to_string(),
         description: prompt.description,
         parameters: prompt.parameters,
+        mutates_workspace: false,
         execute: make_exec(|args, ctx| {
             Box::pin(async move {
                 let working_dir = match working_dir_or_error(&ctx, "view_compile_script") {
@@ -279,6 +289,7 @@ pub(super) fn view_call_script() -> ToolDef {
         name: "view_call_script".to_string(),
         description: prompt.description,
         parameters: prompt.parameters,
+        mutates_workspace: false,
         execute: make_exec(|args, ctx| {
             Box::pin(async move {
                 let working_dir = match working_dir_or_error(&ctx, "view_call_script") {
@@ -317,6 +328,7 @@ pub(super) fn view_property_read() -> ToolDef {
         name: "view_property_read".to_string(),
         description: prompt.description,
         parameters: prompt.parameters,
+        mutates_workspace: false,
         execute: make_exec(|args, ctx| {
             Box::pin(async move {
                 let working_dir = match working_dir_or_error(&ctx, "view_property_read") {
@@ -357,6 +369,7 @@ pub(super) fn view_property_discover() -> ToolDef {
         name: "view_property_discover".to_string(),
         description: prompt.description,
         parameters: prompt.parameters,
+        mutates_workspace: false,
         execute: make_exec(|args, ctx| {
             Box::pin(async move {
                 let working_dir = match working_dir_or_error(&ctx, "view_property_discover") {
@@ -397,6 +410,7 @@ pub(super) fn view_property_write() -> ToolDef {
         name: "view_property_write".to_string(),
         description: prompt.description,
         parameters: prompt.parameters,
+        mutates_workspace: false,
         execute: make_exec(|args, ctx| {
             Box::pin(async move {
                 let working_dir = match working_dir_or_error(&ctx, "view_property_write") {
@@ -437,6 +451,7 @@ pub(super) fn view_property_apply() -> ToolDef {
         name: "view_property_apply".to_string(),
         description: prompt.description,
         parameters: prompt.parameters,
+        mutates_workspace: false,
         execute: make_exec(|args, ctx| {
             Box::pin(async move {
                 let working_dir = match working_dir_or_error(&ctx, "view_property_apply") {
@@ -477,6 +492,7 @@ pub(super) fn view_snapshot() -> ToolDef {
         name: "view_snapshot".to_string(),
         description: prompt.description,
         parameters: prompt.parameters,
+        mutates_workspace: false,
         execute: make_exec(|args, ctx| {
             Box::pin(async move {
                 request_view_automation_tool(args, ctx, "view_snapshot", "snapshot", 5_000).await
@@ -491,6 +507,7 @@ pub(super) fn view_action() -> ToolDef {
         name: "view_action".to_string(),
         description: prompt.description,
         parameters: prompt.parameters,
+        mutates_workspace: false,
         execute: make_exec(|args, ctx| {
             Box::pin(async move {
                 request_view_automation_tool(args, ctx, "view_action", "action", 5_000).await
@@ -505,6 +522,7 @@ pub(super) fn view_wait() -> ToolDef {
         name: "view_wait".to_string(),
         description: prompt.description,
         parameters: prompt.parameters,
+        mutates_workspace: false,
         execute: make_exec(|args, ctx| {
             Box::pin(async move {
                 request_view_automation_tool(args, ctx, "view_wait", "wait", 10_000).await
@@ -519,6 +537,7 @@ pub(super) fn view_debug_eval() -> ToolDef {
         name: "view_debug_eval".to_string(),
         description: prompt.description,
         parameters: prompt.parameters,
+        mutates_workspace: false,
         execute: make_exec(|args, ctx| {
             Box::pin(async move {
                 request_view_automation_tool(args, ctx, "view_debug_eval", "debugEval", 5_000).await
@@ -533,6 +552,7 @@ pub(super) fn view_console_read() -> ToolDef {
         name: "view_console_read".to_string(),
         description: prompt.description,
         parameters: prompt.parameters,
+        mutates_workspace: false,
         execute: make_exec(|args, ctx| {
             Box::pin(async move {
                 let working_dir = match working_dir_or_error(&ctx, "view_console_read") {
@@ -546,7 +566,9 @@ pub(super) fn view_console_read() -> ToolDef {
                 let limit = args
                     .get("limit")
                     .and_then(|value| value.as_u64())
-                    .map(|value| value as usize);
+                    .map(|value| value as usize)
+                    .unwrap_or(20)
+                    .clamp(1, 200);
                 let level = args
                     .get("level")
                     .and_then(|value| value.as_str())
@@ -559,10 +581,18 @@ pub(super) fn view_console_read() -> ToolDef {
                     .map(str::trim)
                     .filter(|value| !value.is_empty())
                     .map(|value| value.to_ascii_lowercase());
-                let request = crate::view::ViewFrontendLogReadRequest { view_id, limit };
+                // Filters drop entries, so read up to the backend maximum and
+                // trim to `limit` afterwards; filtering only the last `limit`
+                // lines would under-fill the result.
+                let has_filters = level.is_some() || contains.is_some();
+                let read_limit = if has_filters { 200 } else { limit };
+                let request = crate::view::ViewFrontendLogReadRequest {
+                    view_id,
+                    limit: Some(read_limit),
+                };
                 match crate::view::read_view_frontend_log_sync(&working_dir, request) {
                     Ok(entries) => {
-                        let entries = entries
+                        let mut entries = entries
                             .into_iter()
                             .filter(|entry| {
                                 level
@@ -579,6 +609,9 @@ pub(super) fn view_console_read() -> ToolDef {
                                     .unwrap_or(true)
                             })
                             .collect::<Vec<_>>();
+                        if entries.len() > limit {
+                            entries.drain(..entries.len() - limit);
+                        }
                         json_output(&entries)
                     }
                     Err(error) => ToolResult {
@@ -597,42 +630,19 @@ pub(super) fn view_capture() -> ToolDef {
         name: "view_capture".to_string(),
         description: prompt.description,
         parameters: prompt.parameters,
-        execute: make_exec(|args, ctx| {
+        mutates_workspace: false,
+        execute: make_exec(|_args, _ctx| {
             Box::pin(async move {
-                let working_dir = match working_dir_or_error(&ctx, "view_capture") {
-                    Ok(path) => path,
-                    Err(result) => return result,
-                };
-                let view_id = match view_id_arg(&args) {
-                    Ok(value) => value,
-                    Err(result) => return result,
-                };
-                if let Err(error) = crate::view::read_view_sync(&working_dir, &view_id) {
-                    return ToolResult {
-                        output: error,
-                        is_error: true,
-                    };
-                }
-                let app_handle = match app_handle_or_error(&ctx, "view_capture") {
-                    Ok(value) => value,
-                    Err(result) => return result,
-                };
-                match crate::view::capture_view_window(&app_handle, &view_id).await {
-                    Ok(capture) => json_output(&serde_json::json!({
-                        "status": "captured",
-                        "viewId": capture.view_id,
-                        "windowLabel": capture.window_label,
-                        "format": capture.format,
-                        "mimeType": capture.mime_type,
-                        "width": capture.width,
-                        "height": capture.height,
-                        "byteSize": capture.byte_size,
-                        "image": "captured"
-                    })),
-                    Err(error) => ToolResult {
-                        output: error,
-                        is_error: true,
-                    },
+                // The real implementation is AgentInstance::execute_view_capture
+                // (dispatched by name in execute_single_tool): image attachments
+                // only exist on ExecutedToolResult, which the registry cannot
+                // return. Fail loudly so no execution path can claim a
+                // screenshot was attached without actually attaching one.
+                ToolResult {
+                    output: "view_capture must be dispatched through the agent runtime so the \
+                             PNG can be attached; this execution path cannot return images."
+                        .to_string(),
+                    is_error: true,
                 }
             })
         }),

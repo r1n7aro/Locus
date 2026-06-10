@@ -5,7 +5,7 @@
   "files": [
     {
       "path": "src/components/view/viewRuntime.ts",
-      "bytes": 80234
+      "bytes": 81536
     },
     {
       "path": "src/components/view/viewCompiler.ts",
@@ -261,11 +261,11 @@
     },
     {
       "path": "src/language/en.json",
-      "bytes": 200130
+      "bytes": 200449
     },
     {
       "path": "src/language/zh.json",
-      "bytes": 193526
+      "bytes": 195038
     },
     {
       "path": "src/services/asset.ts",
@@ -325,7 +325,7 @@
     },
     {
       "path": "src/types.ts",
-      "bytes": 65939
+      "bytes": 67593
     }
   ]
 }

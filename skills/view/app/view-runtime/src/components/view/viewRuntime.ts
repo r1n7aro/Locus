@@ -1722,6 +1722,9 @@ function installLegacyWindowApi(runtime: ReturnType<typeof createViewRuntimeApi>
 
 function createModuleLoader(context: RuntimeContext) {
   const cache = new Map<string, ModuleExports>();
+  // .vue modules only enter the cache after compiling, so a circular import
+  // between SFCs would recurse forever; detect it and fail with the chain.
+  const compilingSfcPaths = new Set<string>();
 
   function load(specifier: string, importer = viewPackageRelPath(context.detail, "src/App.vue")): ModuleExports {
     if (specifier === "vue") return createVueModule(context);
@@ -1745,11 +1748,20 @@ function createModuleLoader(context: RuntimeContext) {
     }
 
     if (file.relPath.endsWith(".vue")) {
-      const exports = {
-        default: buildSfcComponent(context, file.content, file.relPath),
-      };
-      cache.set(file.relPath, exports);
-      return exports;
+      if (compilingSfcPaths.has(file.relPath)) {
+        const chain = [...compilingSfcPaths, file.relPath].join(" -> ");
+        throw new Error(`Circular import between .vue files is not supported: ${chain}`);
+      }
+      compilingSfcPaths.add(file.relPath);
+      try {
+        const exports = {
+          default: buildSfcComponent(context, file.content, file.relPath),
+        };
+        cache.set(file.relPath, exports);
+        return exports;
+      } finally {
+        compilingSfcPaths.delete(file.relPath);
+      }
     }
 
     const module = { exports: {} as ModuleExports };

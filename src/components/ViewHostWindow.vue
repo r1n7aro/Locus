@@ -1975,6 +1975,15 @@ async function waitRuntimeSession(request: ViewSessionWaitRequest): Promise<View
   let terminal: { status: ViewSessionWaitStatus; error?: AppErrorPayload | null } | null = null;
   let activeRun: SessionRunSummary | null = null;
 
+  // Anchor the wait to a concrete run before subscribing so terminal events
+  // from other runs of this session are never matched while targetRunId is
+  // still empty.
+  if (!targetRunId) {
+    activeRun = await getSessionActiveRun(sessionId);
+    targetRunId = nonEmptyString(activeRun?.runId);
+  }
+  const hadRunAnchorAtStart = !!targetRunId;
+
   const appendNewEvents = async () => {
     const batch = await listSessionEvents(sessionId, afterSeq, 2_000);
     if (batch.length === 0) return;
@@ -1994,11 +2003,23 @@ async function waitRuntimeSession(request: ViewSessionWaitRequest): Promise<View
 
   const startedAt = Date.now();
   try {
-    if (!targetRunId) {
-      activeRun = await getSessionActiveRun(sessionId);
-      targetRunId = nonEmptyString(activeRun?.runId);
-    }
     await appendNewEvents();
+    const settledFromHistory = terminal as
+      | { status: ViewSessionWaitStatus; error?: AppErrorPayload | null }
+      | null;
+    if (settledFromHistory && !hadRunAnchorAtStart) {
+      // The terminal state was reconstructed from session history while no run
+      // was active. If a run started in the meantime (input queued just before
+      // this wait), the caller wants that run — drop the stale terminal and
+      // wait on the live run instead.
+      const recheck = await getSessionActiveRun(sessionId);
+      const liveRunId = nonEmptyString(recheck?.runId);
+      if (liveRunId && liveRunId !== targetRunId) {
+        activeRun = recheck;
+        targetRunId = liveRunId;
+        terminal = null;
+      }
+    }
     while (!terminal && Date.now() - startedAt <= timeoutMs) {
       activeRun = await getSessionActiveRun(sessionId);
       if (!targetRunId) targetRunId = nonEmptyString(activeRun?.runId);
