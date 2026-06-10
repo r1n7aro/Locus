@@ -137,14 +137,14 @@ describe("View sidebar settings", () => {
     const viewPage = read("src/components/ViewPackageView.vue");
 
     expect(sessionPanel).toContain("interface ViewDeleteConfirmState");
-    expect(sessionPanel).toContain("viewDeleteConfirm.value = {\n    x: menu.x,\n    y: menu.y,\n    node: menu.node,\n  };\n  closeViewContextMenu();");
-    expect(sessionPanel).toContain("} finally {\n    closeViewDeleteConfirm();\n  }");
+    expect(sessionPanel).toMatch(/viewDeleteConfirm\.value = \{\r?\n\s+x: menu\.x,\r?\n\s+y: menu\.y,\r?\n\s+node: menu\.node,\r?\n\s+\};\r?\n\s+closeViewContextMenu\(\);/);
+    expect(sessionPanel).toMatch(/\} finally \{\r?\n\s+closeViewDeleteConfirm\(\);\r?\n\s+\}/);
     expect(sessionPanel).toContain('v-if="viewDeleteConfirm"');
     expect(sessionPanel).toContain("viewDeleteConfirm.node.label");
 
     expect(viewPage).toContain("interface ViewDeleteConfirmState");
-    expect(viewPage).toContain("deleteConfirm.value = {\n    x: menu.x,\n    y: menu.y,\n    node: menu.node,\n  };\n  closeContextMenu();");
-    expect(viewPage).toContain("} finally {\n    closeDeleteConfirm();\n  }");
+    expect(viewPage).toMatch(/deleteConfirm\.value = \{\r?\n\s+x: menu\.x,\r?\n\s+y: menu\.y,\r?\n\s+node: menu\.node,\r?\n\s+\};\r?\n\s+closeContextMenu\(\);/);
+    expect(viewPage).toMatch(/\} finally \{\r?\n\s+closeDeleteConfirm\(\);\r?\n\s+\}/);
     expect(viewPage).toContain('v-if="deleteConfirm"');
     expect(viewPage).toContain("deleteConfirm.node.label");
   });

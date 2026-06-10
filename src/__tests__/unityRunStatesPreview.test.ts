@@ -149,10 +149,10 @@ describe("unityRunStatesPreview", () => {
     expect(definition.description).toContain("ctx.Global<T>");
     expect(definition.description).toContain("100000 estimated tokens");
     expect(definition.description).toContain("knowledge_read");
-    expect(definition.description).toContain("skill/builtin/profiler.md");
-    expect(read("knowledge/skill/builtin/profiler.md")).toContain("Unity Profiler Runtime Sampling");
+    expect(definition.description).toContain("skill/profiler.md");
+    expect(read("knowledge/skill/profiler.md")).toContain("Unity Profiler Runtime Sampling");
     const runStatesBridge = read("locus_unity/Editor/LocusBridge.RunStates.cs");
-    const profilerSkill = read("knowledge/skill/builtin/profiler.md");
+    const profilerSkill = read("knowledge/skill/profiler.md");
     expect(runStatesBridge).toContain("StartProfiler(string name");
     expect(runStatesBridge).toContain("TryGetProfilerLastValue");
     expect(runStatesBridge).toContain("RecordProfilerSpike");

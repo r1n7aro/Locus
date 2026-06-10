@@ -38,7 +38,7 @@ describe("plugin Skill package", () => {
     expect(skill).toContain("plugin_export");
     expect(skill).toContain("Use progressive disclosure for specialized editing.");
     expect(skill).toContain('path: "skill/view"');
-    expect(skill).toContain('path: "skill/builtin/create-skill.md"');
+    expect(skill).toContain('path: "skill/create-skill.md"');
     expect(skill).toContain('path: "skill/plugin/publish.md"');
     expect(skill).toContain("ask_user_question");
     expect(skill).toContain("- sheet");
