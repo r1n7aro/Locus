@@ -168,9 +168,20 @@ describe("plugin hub layout", () => {
     expect(source).not.toContain("plugin-registry-source-select");
     expect(source).not.toContain("setSelectedRegistrySource");
     expect(source).not.toContain("selectedRegistrySourceId");
-    expect(source).toContain("let shouldPersist = false");
-    expect(source).toContain("shouldPersist = rawSources !== JSON.stringify(nextSources)");
-    expect(source).toContain("if (shouldPersist) persistRegistrySourceSettings()");
+    expect(source).toContain("pluginRegistrySourcesGet");
+    expect(source).toContain("pluginRegistrySourcesSet");
+    expect(source).toContain("legacyRegistrySourcesFromLocalStorage");
+    expect(source).toContain("async function loadRegistrySourceSettings");
+    expect(source).toContain("async function persistRegistrySources");
+    expect(source).toContain("localStorage.removeItem(PLUGIN_REGISTRY_SOURCES_STORAGE_KEY)");
+    expect(service).toContain("export interface PluginRegistrySourceConfig");
+    expect(service).toContain('"plugin_registry_sources_get"');
+    expect(service).toContain('"plugin_registry_sources_set"');
+    expect(backend).toContain("pub struct PluginRegistrySourceConfig");
+    expect(backend).toContain("pub async fn plugin_registry_sources_get");
+    expect(backend).toContain("pub async fn plugin_registry_sources_set");
+    expect(lib).toContain("commands::plugin_registry_sources_get");
+    expect(lib).toContain("commands::plugin_registry_sources_set");
   });
 
   it("adds a compact plugin help dialog from the plugin titlebar", () => {
