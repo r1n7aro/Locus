@@ -48,7 +48,7 @@ describe("skill package namespace settings", () => {
 
     expect(skillCreateTool).toContain("short kebab-case package id");
     expect(skillCreateTool).toContain("studio.tools.asset-audit");
-    expect(createSkillDoc).toContain("short kebab-case package IDs");
+    expect(createSkillDoc).toContain("short kebab-case package ids");
     expect(createSkillDoc).toContain("studio.tools.asset-audit");
     expect(zh).toContain('"settings.knowledge.defaultSkillPackageNamespace"');
     expect(en).toContain('"settings.knowledge.defaultSkillPackageNamespace"');

@@ -20,7 +20,7 @@ describe("View sidebar settings", () => {
 
     expect(manifest.name).toBe("View");
     expect(manifest.injectMode).toBe("excerpt");
-    expect(manifest.description).toContain("explicit Locus View UI package");
+    expect(manifest.description).toContain("build or edit a Locus View");
     expect(manifest.command?.trigger).toBe("/view");
     expect(skill).toContain("# View");
     expect(skill).toContain("## L1");
