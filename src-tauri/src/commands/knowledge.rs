@@ -903,6 +903,18 @@ pub(crate) fn execute_knowledge_read_request(
         KnowledgeTargetKind::Directory => {
             let (doc_type, normalized_path) =
                 resolve_knowledge_directory_target(request.doc_type, &request.path)?;
+            if doc_type == KnowledgeType::Skill {
+                if let Some(result) = super::skill::read_skill_package_directory_sync(
+                    working_dir,
+                    &normalized_path,
+                )? {
+                    return Ok(KnowledgeReadResponse {
+                        kind: KnowledgeTargetKind::Directory,
+                        document: None,
+                        directory: Some(result),
+                    });
+                }
+            }
             let result = knowledge_store::read_directory_config_with_app_root(
                 working_dir,
                 app_knowledge_dir,
@@ -1041,6 +1053,7 @@ pub(crate) fn execute_knowledge_edit_request(
                 .ok_or_else(|| "knowledge_edit document requires 'document'.".to_string())?;
             let (doc_type, normalized_path) =
                 resolve_knowledge_document_target(request.doc_type, &request.path)?;
+            ensure_skill_package_target_mutable(working_dir, doc_type, &normalized_path)?;
             ensure_memory_builtins_for_type(working_dir, Some(doc_type))?;
             let document = knowledge_store::edit_document(
                 working_dir,
@@ -1063,6 +1076,7 @@ pub(crate) fn execute_knowledge_edit_request(
                 .ok_or_else(|| "knowledge_edit directory requires 'config'.".to_string())?;
             let (doc_type, normalized_path) =
                 resolve_knowledge_directory_target(request.doc_type, &request.path)?;
+            ensure_skill_package_target_mutable(working_dir, doc_type, &normalized_path)?;
             let current =
                 knowledge_store::read_directory_config(working_dir, doc_type, &normalized_path)?;
             let merged = merge_directory_config(doc_type, Some(current), &config_patch);
@@ -1099,9 +1113,11 @@ pub(crate) fn execute_knowledge_move_request(
         KnowledgeTargetKind::Document => {
             let (doc_type, normalized_path) =
                 resolve_knowledge_document_target(request.doc_type, &request.path)?;
+            ensure_skill_package_target_mutable(working_dir, doc_type, &normalized_path)?;
             ensure_memory_builtins_for_type(working_dir, Some(doc_type))?;
             let (_, normalized_target_path) =
                 resolve_knowledge_document_target(Some(doc_type), &request.new_path)?;
+            ensure_skill_package_target_mutable(working_dir, doc_type, &normalized_target_path)?;
             let document = knowledge_store::edit_document(
                 working_dir,
                 &normalized_path,
@@ -1123,8 +1139,10 @@ pub(crate) fn execute_knowledge_move_request(
         KnowledgeTargetKind::Directory => {
             let (doc_type, normalized_path) =
                 resolve_knowledge_directory_target(request.doc_type, &request.path)?;
+            ensure_skill_package_target_mutable(working_dir, doc_type, &normalized_path)?;
             let (_, normalized_target_path) =
                 resolve_knowledge_directory_target(Some(doc_type), &request.new_path)?;
+            ensure_skill_package_target_mutable(working_dir, doc_type, &normalized_target_path)?;
             let result_path = knowledge_store::move_directory(
                 working_dir,
                 doc_type,
@@ -1155,6 +1173,7 @@ pub(crate) fn execute_knowledge_delete_request(
         KnowledgeTargetKind::Document => {
             let (doc_type, normalized_path) =
                 resolve_knowledge_document_target(request.doc_type, &request.path)?;
+            ensure_skill_package_target_mutable(working_dir, doc_type, &normalized_path)?;
             ensure_memory_builtins_for_type(working_dir, Some(doc_type))?;
             let document = knowledge_store::update_document(
                 working_dir,
@@ -1177,6 +1196,7 @@ pub(crate) fn execute_knowledge_delete_request(
         KnowledgeTargetKind::Directory => {
             let (doc_type, normalized_path) =
                 resolve_knowledge_directory_target(request.doc_type, &request.path)?;
+            ensure_skill_package_target_mutable(working_dir, doc_type, &normalized_path)?;
             let result_path =
                 knowledge_store::delete_directory(working_dir, doc_type, &normalized_path)?;
             Ok(KnowledgeMutationResponse {
@@ -1199,6 +1219,20 @@ fn ensure_memory_builtins_for_type(
         knowledge_store::ensure_memory_builtin_documents(working_dir)?;
     }
     Ok(())
+}
+
+// Skill packages are mounted into the skill tree as read-only virtual paths;
+// knowledge mutations must never write inside a package namespace, or they
+// would shadow package content with workspace files.
+fn ensure_skill_package_target_mutable(
+    working_dir: &str,
+    doc_type: KnowledgeType,
+    normalized_path: &str,
+) -> Result<(), String> {
+    if doc_type != KnowledgeType::Skill {
+        return Ok(());
+    }
+    super::skill::ensure_skill_package_virtual_path_mutable(working_dir, normalized_path)
 }
 
 #[tauri::command]

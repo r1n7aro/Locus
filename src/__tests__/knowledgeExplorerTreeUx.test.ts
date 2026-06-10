@@ -93,15 +93,17 @@ describe("KnowledgeExplorer tree UX", () => {
     expect(explorer).toContain('class="kx-empty-actions"');
   });
 
-  it("marks plugin-managed rows and disables their destructive menu items", () => {
+  it("marks managed rows and disables their destructive menu items", () => {
     const explorer = read("src/components/knowledge/KnowledgeExplorer.vue");
 
     expect(explorer).toContain("t('knowledge.explorer.pluginManaged')");
     expect(explorer).toContain('class="kx-lock"');
-    expect(explorer).toContain("function deleteBlockedByPlugin(");
-    expect(explorer).toContain("function renameBlockedByPlugin(");
-    expect(explorer).toContain("t('knowledge.explorer.pluginManagedHint')");
-    expect(explorer).toContain(':disabled="deleteBlockedByPlugin(ctxMenu)"');
+    expect(explorer).toContain("function isPackageContentNode(");
+    expect(explorer).toContain("function deleteBlocked(");
+    expect(explorer).toContain("function renameBlocked(");
+    expect(explorer).toContain('t("knowledge.explorer.pluginManagedHint")');
+    expect(explorer).toContain('t("knowledge.explorer.packageManagedHint")');
+    expect(explorer).toContain(':disabled="deleteBlocked(ctxMenu)"');
   });
 
   it("supports multi-node drags with pruning and batched moves", () => {
@@ -175,6 +177,8 @@ describe("KnowledgeExplorer tree UX", () => {
       "knowledge.explorer.legend",
       "knowledge.explorer.pluginManaged",
       "knowledge.explorer.pluginManagedHint",
+      "knowledge.explorer.packageManaged",
+      "knowledge.explorer.packageManagedHint",
       "knowledge.search.openResult",
       "knowledge.search.revealInTree",
       "knowledge.legend.autoDesc",

@@ -417,7 +417,7 @@ function activateNode(row: FlatRow) {
 function onRowDoubleClick(row: FlatRow) {
   if (isSearchMode.value) return;
   if (row.node.kind === "package") return;
-  if (isPluginManagedNode(row.node)) return;
+  if (isManagedNode(row.node)) return;
   void startRenameNode(row.node);
 }
 
@@ -598,7 +598,7 @@ function parentDirectory(node: ExplorerNode): string {
 }
 
 function canDragNode(node: ExplorerNode): boolean {
-  if (isPluginManagedNode(node)) return false;
+  if (isManagedNode(node)) return false;
   if (node.kind === "document") return true;
   if (node.kind === "package") return false;
   return !!node.relativePath.trim();
@@ -667,6 +667,10 @@ function onNodeDragEnd() {
 
 function onFolderDragOver(row: FlatRow, event: DragEvent) {
   if (row.node.kind !== "folder" || !draggingNodes.value.length) return;
+  if (isManagedNode(row.node)) {
+    cancelDragExpand();
+    return;
+  }
   const targetDir = row.node.relativePath;
   if (!dropTargetAccepts(targetDir)) {
     cancelDragExpand();
@@ -680,6 +684,10 @@ function onFolderDragOver(row: FlatRow, event: DragEvent) {
 
 function onFolderDrop(row: FlatRow, event: DragEvent) {
   if (row.node.kind !== "folder" || !draggingNodes.value.length) return;
+  if (isManagedNode(row.node)) {
+    clearDragState();
+    return;
+  }
   const targetDir = row.node.relativePath;
   const movable = droppableNodes(targetDir);
   if (!movable.length) {
@@ -735,7 +743,7 @@ function onTreeDrop(event: DragEvent) {
 function canDeleteFolder(
   menu: Extract<ContextMenuState, { kind: "folder" }>,
 ): boolean {
-  return menu.depth > 0 && !menu.targetNodes.some(isPluginManagedNode);
+  return menu.depth > 0 && !menu.targetNodes.some(isManagedNode);
 }
 
 function isPluginManagedNode(node: ExplorerNode): boolean {
@@ -751,10 +759,45 @@ function isPluginManagedNode(node: ExplorerNode): boolean {
   return node.children.some(isPluginManagedNode);
 }
 
+// Skill package contents are read-only virtual paths mounted into the tree;
+// the package root node keeps its own lifecycle menu, but nodes inside a
+// package cannot be created, renamed, moved, or deleted from here.
+function isPackageContentNode(node: ExplorerNode): boolean {
+  if (node.kind === "package") return false;
+  if (node.kind === "document") {
+    return node.document.externalSource?.provider === "package";
+  }
+  return node.children.some(isPackageContentNode);
+}
+
+function isManagedNode(node: ExplorerNode): boolean {
+  return isPluginManagedNode(node) || isPackageContentNode(node);
+}
+
+function managedHint(nodes: ExplorerNode[]): string | undefined {
+  if (nodes.some(isPluginManagedNode)) {
+    return t("knowledge.explorer.pluginManagedHint");
+  }
+  if (nodes.some(isPackageContentNode)) {
+    return t("knowledge.explorer.packageManagedHint");
+  }
+  return undefined;
+}
+
+function rowLockTitle(node: ExplorerNode): string | null {
+  if (isPluginManagedNode(node)) return t("knowledge.explorer.pluginManaged");
+  if (isPackageContentNode(node)) return t("knowledge.explorer.packageManaged");
+  return null;
+}
+
+function createBlockHint(menu: ContextMenuState): string | undefined {
+  return menu.kind === "folder" ? managedHint([menu.node]) : undefined;
+}
+
 function canDeleteContextTargets(
   menu: Extract<ContextMenuState, { kind: "folder" | "leaf" | "package" }>,
 ): boolean {
-  if (menu.targetNodes.some(isPluginManagedNode)) return false;
+  if (menu.targetNodes.some(isManagedNode)) return false;
   return menu.kind !== "folder" || menu.targetNodes.length > 1 || canDeleteFolder(menu);
 }
 
@@ -767,16 +810,16 @@ function canShowDeleteItem(
   return menu.targetNodes.length > 1 || menu.depth > 0;
 }
 
-function deleteBlockedByPlugin(
+function deleteBlocked(
   menu: Extract<ContextMenuState, { kind: "folder" | "leaf" | "package" }>,
 ): boolean {
-  return menu.targetNodes.some(isPluginManagedNode);
+  return menu.targetNodes.some(isManagedNode);
 }
 
-function renameBlockedByPlugin(
+function renameBlocked(
   menu: Extract<ContextMenuState, { kind: "folder" | "leaf" }>,
 ): boolean {
-  return menu.targetNodes.some(isPluginManagedNode);
+  return menu.targetNodes.some(isManagedNode);
 }
 
 function requestDeleteSelectedNodes() {
@@ -852,6 +895,9 @@ async function openInlineCreateAt(
 async function openCreateInline(kind: InlineCreateState["kind"]) {
   if (!ctxMenu.value) return;
   if (ctxMenu.value.kind === "leaf" || ctxMenu.value.kind === "package") return;
+  if (ctxMenu.value.kind === "folder" && isManagedNode(ctxMenu.value.node)) {
+    return;
+  }
   const menu = ctxMenu.value;
   await openInlineCreateAt(kind, {
     parentDir: menu.kind === "folder" ? menu.parentDir : "",
@@ -873,7 +919,7 @@ async function openToolbarCreate(kind: InlineCreateState["kind"]) {
   if (
     selected &&
     selected.node.kind === "folder" &&
-    !isPluginManagedNode(selected.node)
+    !isManagedNode(selected.node)
   ) {
     await openInlineCreateAt(kind, {
       parentDir: selected.node.relativePath,
@@ -963,7 +1009,7 @@ async function startRenameSelection() {
     menu.targetNodes.length !== 1
   )
     return;
-  if (renameBlockedByPlugin(menu)) return;
+  if (renameBlocked(menu)) return;
   await startRenameNode(menu.node);
 }
 
@@ -1202,7 +1248,7 @@ function applyKeyboardAction(action: KnowledgeTreeKeyboardAction) {
     case "rename": {
       const row = selectableRowMap.value.get(action.path);
       if (!row || row.node.kind === "package") return;
-      if (isPluginManagedNode(row.node)) return;
+      if (isManagedNode(row.node)) return;
       void startRenameNode(row.node);
       return;
     }
@@ -1217,7 +1263,7 @@ function applyKeyboardAction(action: KnowledgeTreeKeyboardAction) {
       const targetNodes = targetPaths
         .map((path) => selectableRowMap.value.get(path)?.node)
         .filter((node): node is ExplorerNode => !!node);
-      if (!targetNodes.length || targetNodes.some(isPluginManagedNode)) return;
+      if (!targetNodes.length || targetNodes.some(isManagedNode)) return;
       emit("requestDeleteNodes", targetNodes);
       return;
     }
@@ -1707,9 +1753,9 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
 
               <div v-if="entry.row.node.kind === 'folder'" class="kx-row-side">
                 <span
-                  v-if="isPluginManagedNode(entry.row.node)"
+                  v-if="rowLockTitle(entry.row.node)"
                   class="kx-lock"
-                  :title="t('knowledge.explorer.pluginManaged')"
+                  :title="rowLockTitle(entry.row.node) ?? undefined"
                 >
                   <LucideIcon :icon="Lock" :size="11" :stroke-width="2.2" />
                 </span>
@@ -1892,12 +1938,8 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
               "
               type="button"
               class="kx-ctx-item"
-              :disabled="renameBlockedByPlugin(ctxMenu)"
-              :title="
-                renameBlockedByPlugin(ctxMenu)
-                  ? t('knowledge.explorer.pluginManagedHint')
-                  : undefined
-              "
+              :disabled="renameBlocked(ctxMenu)"
+              :title="managedHint(ctxMenu.targetNodes)"
               @click="startRenameSelection"
             >
               {{ t("knowledge.explorer.rename") }}
@@ -1929,6 +1971,8 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
               "
               type="button"
               class="kx-ctx-item"
+              :disabled="!!createBlockHint(ctxMenu)"
+              :title="createBlockHint(ctxMenu)"
               @click="openCreateInline('folder')"
             >
               {{ t("knowledge.explorer.createFolder") }}
@@ -1961,6 +2005,8 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
               "
               type="button"
               class="kx-ctx-item"
+              :disabled="!!createBlockHint(ctxMenu)"
+              :title="createBlockHint(ctxMenu)"
               @click="openCreateInline('document')"
             >
               {{ t("knowledge.explorer.createDoc") }}
@@ -1969,12 +2015,8 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
               v-if="ctxMenu.kind === 'folder' && canShowDeleteItem(ctxMenu)"
               type="button"
               class="kx-ctx-item kx-ctx-item-danger"
-              :disabled="deleteBlockedByPlugin(ctxMenu)"
-              :title="
-                deleteBlockedByPlugin(ctxMenu)
-                  ? t('knowledge.explorer.pluginManagedHint')
-                  : undefined
-              "
+              :disabled="deleteBlocked(ctxMenu)"
+              :title="managedHint(ctxMenu.targetNodes)"
               @click="requestDeleteSelectedNodes"
             >
               {{ deleteMenuLabel(ctxMenu) }}
@@ -2009,12 +2051,8 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
               v-if="canShowDeleteItem(ctxMenu)"
               type="button"
               class="kx-ctx-item kx-ctx-item-danger"
-              :disabled="deleteBlockedByPlugin(ctxMenu)"
-              :title="
-                deleteBlockedByPlugin(ctxMenu)
-                  ? t('knowledge.explorer.pluginManagedHint')
-                  : undefined
-              "
+              :disabled="deleteBlocked(ctxMenu)"
+              :title="managedHint(ctxMenu.targetNodes)"
               @click="requestDeleteSelectedNodes"
             >
               {{ deleteMenuLabel(ctxMenu) }}
@@ -2025,12 +2063,8 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
               v-if="ctxMenu.targetNodes.length === 1"
               type="button"
               class="kx-ctx-item"
-              :disabled="renameBlockedByPlugin(ctxMenu)"
-              :title="
-                renameBlockedByPlugin(ctxMenu)
-                  ? t('knowledge.explorer.pluginManagedHint')
-                  : undefined
-              "
+              :disabled="renameBlocked(ctxMenu)"
+              :title="managedHint(ctxMenu.targetNodes)"
               @click="startRenameSelection"
             >
               {{ t("knowledge.explorer.rename") }}
@@ -2055,12 +2089,8 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
               v-if="canShowDeleteItem(ctxMenu)"
               type="button"
               class="kx-ctx-item kx-ctx-item-danger"
-              :disabled="deleteBlockedByPlugin(ctxMenu)"
-              :title="
-                deleteBlockedByPlugin(ctxMenu)
-                  ? t('knowledge.explorer.pluginManagedHint')
-                  : undefined
-              "
+              :disabled="deleteBlocked(ctxMenu)"
+              :title="managedHint(ctxMenu.targetNodes)"
               @click="requestDeleteSelectedNodes"
             >
               {{ deleteMenuLabel(ctxMenu) }}

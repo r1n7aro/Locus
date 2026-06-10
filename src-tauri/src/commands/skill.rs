@@ -2922,6 +2922,126 @@ pub(crate) fn read_skill_package_document_sync(
     Ok(None)
 }
 
+fn package_dir_rel_path_for_virtual_path(
+    manifest: &SkillPackageManifestFile,
+    virtual_path: &str,
+) -> Result<Option<String>, String> {
+    let normalized = normalize_package_rel_path(virtual_path)?;
+    let package_id = normalize_package_id(&manifest.id)?;
+    if normalized == package_id || normalized == format!("skill/{}", package_id) {
+        return Ok(Some(String::new()));
+    }
+    let Some(rest) = normalized
+        .strip_prefix(&format!("{}/", package_id))
+        .or_else(|| normalized.strip_prefix(&format!("skill/{}/", package_id)))
+    else {
+        return Ok(None);
+    };
+    Ok(Some(rest.to_string()))
+}
+
+fn package_directory_config_record(
+    record: &SkillPackageRecord,
+    dir_rel_path: &str,
+    dir_path: &Path,
+) -> knowledge_store::KnowledgeDirectoryConfigRecord {
+    let manifest = &record.manifest;
+    let path = if dir_rel_path.is_empty() {
+        manifest.id.clone()
+    } else {
+        format!("{}/{}", manifest.id, dir_rel_path)
+    };
+    let mut config = knowledge_store::default_directory_config_for_type(KnowledgeType::Skill);
+    config.inject_mode = KnowledgeInjectMode::None;
+    config.inherit_inject_mode = false;
+    config.ai_maintained = false;
+    config.inherit_ai_config = false;
+    config.explicit_maintenance_rules = false;
+    config.maintenance_rules = String::new();
+    config.allow_create_documents = false;
+    config.allow_create_directories = false;
+    config.allow_move_documents = false;
+    config.allow_move_directories = false;
+    let default_search = knowledge_store::EffectiveCapabilityState {
+        enabled: true,
+        source: "default".to_string(),
+        reason_code: None,
+        source_dir: None,
+    };
+    knowledge_store::KnowledgeDirectoryConfigRecord {
+        doc_type: KnowledgeType::Skill,
+        path,
+        config_path: String::new(),
+        exists: false,
+        read_only: true,
+        updated_at: package_file_modified_at(dir_path, record.updated_at),
+        inject_mode_source: Default::default(),
+        ai_config_source: Default::default(),
+        effective_lexical_search: default_search.clone(),
+        effective_vector_search: default_search,
+        external_sources: package_source_summary(record).into_iter().collect(),
+        config,
+    }
+}
+
+pub(crate) fn read_skill_package_directory_sync(
+    working_dir: &str,
+    virtual_path: &str,
+) -> Result<Option<knowledge_store::KnowledgeDirectoryConfigRecord>, String> {
+    for record in list_skill_packages_sync_for_working_dir(working_dir) {
+        let Some(dir_rel_path) =
+            package_dir_rel_path_for_virtual_path(&record.manifest, virtual_path)?
+        else {
+            continue;
+        };
+        let dir_path = if dir_rel_path.is_empty() {
+            record.root.clone()
+        } else {
+            package_file_path(&record.root, &dir_rel_path)?
+        };
+        if !dir_path.is_dir() {
+            return Err(format!(
+                "Skill package directory not found: {}",
+                virtual_path
+            ));
+        }
+        return Ok(Some(package_directory_config_record(
+            &record,
+            &dir_rel_path,
+            &dir_path,
+        )));
+    }
+
+    Ok(None)
+}
+
+pub(crate) fn skill_package_owning_virtual_path_sync(
+    working_dir: &str,
+    virtual_path: &str,
+) -> Option<String> {
+    let normalized = virtual_path.trim().replace('\\', "/");
+    let normalized = normalized.trim_matches('/');
+    let normalized = normalized.strip_prefix("skill/").unwrap_or(normalized);
+    let first_segment = normalized.split('/').find(|segment| !segment.is_empty())?;
+    list_skill_packages_sync_for_working_dir(working_dir)
+        .into_iter()
+        .map(|record| record.manifest.id)
+        .find(|package_id| package_id == first_segment)
+}
+
+pub(crate) fn ensure_skill_package_virtual_path_mutable(
+    working_dir: &str,
+    virtual_path: &str,
+) -> Result<(), String> {
+    if let Some(package_id) = skill_package_owning_virtual_path_sync(working_dir, virtual_path) {
+        return Err(format!(
+            "Skill package '{}' content is read-only: {}",
+            package_id, virtual_path
+        ));
+    }
+    Ok(())
+}
+
 fn package_unity_script_rel_paths(record: &SkillPackageRecord) -> Result<Vec<String>, String> {
     let mut paths = BTreeSet::new();
 
@@ -4993,6 +5113,118 @@ Create a project skill.
             super::delete_skill_package_sync(&working_dir, "com.example.plugin-asset-audit")
                 .expect_err("plugin skill package should be removed through plugin uninstall");
         assert!(delete_error.contains("managed by plugin"));
+    }
+
+    #[test]
+    fn skill_package_directory_reads_as_read_only_virtual_directory() {
+        let temp = TempDir::new().unwrap();
+        let working_dir = temp.path().to_string_lossy().to_string();
+        let plugin_root = temp
+            .path()
+            .join(crate::plugin::PROJECT_PLUGINS_RELATIVE)
+            .join("com.example.psd-plugin");
+        let skill_root = plugin_root.join("skills").join("psd-tools");
+        std::fs::create_dir_all(skill_root.join("references")).unwrap();
+        std::fs::write(
+            plugin_root.join(crate::plugin::PLUGIN_MANIFEST_FILE_NAME),
+            r#"{
+  "schemaVersion": 1,
+  "id": "com.example.psd-plugin",
+  "name": "PSD Plugin",
+  "version": "1.0.0",
+  "components": {
+    "skills": [{ "id": "psd-tools", "path": "skills/psd-tools" }]
+  }
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            skill_root.join("skill.json"),
+            r#"{
+  "schema": "locus.skill.v1",
+  "id": "psd-tools",
+  "version": "1.0.0",
+  "name": "PSD Tools",
+  "description": "PSD helpers."
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            skill_root.join("SKILL.md"),
+            "# PSD Tools\n\n## Instructions\nUse PSD tools.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            skill_root.join("references").join("psd-tools.md"),
+            "# PSD reference\n",
+        )
+        .unwrap();
+
+        let record =
+            super::read_skill_package_directory_sync(&working_dir, "psd-tools/references")
+                .expect("package directory read should succeed")
+                .expect("package directory should resolve");
+        assert_eq!(record.path, "psd-tools/references");
+        assert!(record.read_only);
+        assert!(!record.exists);
+        assert!(!record.config.allow_create_documents);
+        assert!(!record.config.allow_create_directories);
+        assert!(!record.config.allow_move_documents);
+        assert!(!record.config.allow_move_directories);
+        assert_eq!(record.config.inject_mode, KnowledgeInjectMode::None);
+        assert_eq!(
+            record
+                .external_sources
+                .first()
+                .map(|source| source.provider),
+            Some(crate::knowledge_store::KnowledgeSourceProvider::Package)
+        );
+
+        let root_record =
+            super::read_skill_package_directory_sync(&working_dir, "skill/psd-tools")
+                .expect("package root read should succeed")
+                .expect("package root should resolve");
+        assert_eq!(root_record.path, "psd-tools");
+        assert!(root_record.read_only);
+
+        assert!(
+            super::read_skill_package_directory_sync(&working_dir, "psd-tools/missing")
+                .expect_err("missing package directory should error")
+                .contains("not found")
+        );
+        assert!(
+            super::read_skill_package_directory_sync(&working_dir, "other/references")
+                .expect("non-package path should fall through")
+                .is_none()
+        );
+
+        let response = crate::commands::execute_knowledge_read_request(
+            &working_dir,
+            None,
+            crate::knowledge_store::KnowledgeReadRequest {
+                kind: crate::knowledge_store::KnowledgeTargetKind::Directory,
+                path: "skill/psd-tools/references".to_string(),
+                doc_type: None,
+                part: None,
+            },
+        )
+        .expect("knowledge_read directory should succeed for package subdirectory");
+        let directory = response
+            .directory
+            .expect("directory record should be returned");
+        assert!(directory.read_only);
+        assert_eq!(directory.path, "psd-tools/references");
+
+        assert!(super::ensure_skill_package_virtual_path_mutable(
+            &working_dir,
+            "psd-tools/references"
+        )
+        .expect_err("package paths must be immutable")
+        .contains("read-only"));
+        super::ensure_skill_package_virtual_path_mutable(&working_dir, "my-skill.md")
+            .expect("workspace skill paths stay mutable");
     }
 
     #[test]
