@@ -569,7 +569,20 @@ pub fn run() {
             let knowledge_proposal_drafts: KnowledgeProposalDraftStore =
                 Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
-            let undo_manager: UndoManagerHandle = Arc::new(vcs::UndoManager::new(vcs::GitProvider));
+            // Persistent undo stacks: survive restarts; entries for sessions
+            // deleted while the app was closed are dropped at load.
+            let undo_valid_sessions = match store.list_all_session_ids() {
+                Ok(ids) => Some(ids.into_iter().collect::<std::collections::HashSet<_>>()),
+                Err(e) => {
+                    eprintln!("[Locus] failed to list session ids for undo reconcile: {}", e);
+                    None
+                }
+            };
+            let undo_manager: UndoManagerHandle = Arc::new(vcs::UndoManager::with_persistence(
+                vcs::GitProvider,
+                data_dir.join("undo_stacks.json"),
+                undo_valid_sessions,
+            ));
             let view_automation_store = Arc::new(view::ViewAutomationStore::default());
 
             let tool_mode_path = data_dir.join("tool_permission_mode.txt");
@@ -1198,6 +1211,7 @@ pub fn run() {
             commands::undo_preview,
             commands::undo_list,
             commands::undo_check_conflicts,
+            commands::undo_check_dirty,
             commands::get_debug_mode,
             commands::set_debug_mode,
             commands::get_file_tool_workspace_boundary,

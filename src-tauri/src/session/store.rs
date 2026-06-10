@@ -2035,6 +2035,20 @@ impl SessionStore {
         Ok(())
     }
 
+    /// All session ids across every workspace, including archived sessions.
+    pub fn list_all_session_ids(&self) -> Result<Vec<String>, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare("SELECT id FROM sessions")
+            .map_err(|e| format!("Failed to list session ids: {}", e))?;
+        let ids = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| format!("Failed to list session ids: {}", e))?
+            .filter_map(|row| row.ok())
+            .collect();
+        Ok(ids)
+    }
+
     pub fn truncate_from_message(&self, session_id: &str, message_id: &str) -> Result<u64, String> {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
 
@@ -2063,6 +2077,25 @@ impl SessionStore {
             .map_err(|e| format!("Failed to truncate messages: {}", e))?;
 
         Ok(deleted as u64)
+    }
+
+    pub fn delete_message(&self, session_id: &str, message_id: &str) -> Result<bool, String> {
+        let now = Self::now_ts();
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let deleted = conn
+            .execute(
+                "DELETE FROM messages WHERE session_id = ?1 AND id = ?2",
+                params![session_id, message_id],
+            )
+            .map_err(|e| format!("Failed to delete message: {}", e))?;
+        if deleted > 0 {
+            conn.execute(
+                "UPDATE sessions SET updated_at = ?1 WHERE id = ?2",
+                params![now, session_id],
+            )
+            .map_err(|e| format!("Failed to update session after message deletion: {}", e))?;
+        }
+        Ok(deleted > 0)
     }
 
     pub fn truncate_after_message(
@@ -2512,6 +2545,54 @@ impl SessionStore {
                 message_id, e
             )
         })?;
+        Ok(())
+    }
+
+    /// Attaches a response-request metadata value to a message, e.g. the
+    /// encrypted Codex compaction item stored on a context-handoff message so
+    /// payload builders can replay it to the Codex API.
+    pub fn set_message_response_request_metadata(
+        &self,
+        session_id: &str,
+        message_id: &str,
+        response_request: &serde_json::Value,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let metadata_json: Option<String> = conn
+            .query_row(
+                "SELECT metadata_json FROM messages WHERE session_id = ?1 AND id = ?2",
+                params![session_id, message_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| format!("Failed to load message metadata: {}", e))?
+            .flatten();
+        let mut metadata: MessageMetadata = metadata_json
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(|e| format!("Failed to parse message metadata: {}", e))?
+            .unwrap_or_default();
+        metadata.response_request = Some(response_request.clone());
+        let metadata_json = serde_json::to_string(&metadata)
+            .map_err(|e| format!("Failed to serialize message metadata: {}", e))?;
+        let updated = conn
+            .execute(
+                "UPDATE messages SET metadata_json = ?1 WHERE session_id = ?2 AND id = ?3",
+                params![metadata_json, session_id, message_id],
+            )
+            .map_err(|e| {
+                format!(
+                    "Failed to update response request metadata for message '{}': {}",
+                    message_id, e
+                )
+            })?;
+        if updated == 0 {
+            return Err(format!(
+                "Message '{}' not found in session '{}'",
+                message_id, session_id
+            ));
+        }
         Ok(())
     }
 

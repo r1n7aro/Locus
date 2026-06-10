@@ -12,7 +12,7 @@ import { openChatDiffReviewWindow } from "../services/chatDiffReviewWindow";
 import { t } from "../i18n";
 import { useNotificationStore } from "../stores/notification";
 import FileDiffPopover from "./diff/FileDiffPopover.vue";
-import type { GitFileChange, FileDiffPayload, UndoConflictInfo } from "../types";
+import type { ChangedFile, GitFileChange, FileDiffPayload, UndoConflictInfo } from "../types";
 import type { ChatMergedFileItem } from "../services/chatChanges";
 import { buildUserMessageDraft } from "../composables/chatMessageDraft";
 import { useHideMeta, isMetaFile, canOpenInEditor } from "../composables/useHideMeta";
@@ -343,6 +343,9 @@ const showUndoConflictConfirm = ref(false);
 const checkingUndoConflicts = ref(false);
 const isUndoing = ref(false);
 const undoConflicts = ref<UndoConflictInfo[]>([]);
+const undoDirtyFiles = ref<ChangedFile[]>([]);
+/** Whether the dirty preflight completed — only then may confirm skip the backend re-check. */
+const undoDirtyChecked = ref(false);
 
 /** The assistantMessageId to undo — depends on mode */
 const undoTargetId = computed(() => {
@@ -381,8 +384,22 @@ async function onUndoClick() {
   if (!undoTargetId.value || undoButtonBusy.value) return;
   checkingUndoConflicts.value = true;
   try {
-    undoConflicts.value = await chatStore.checkUndoConflicts(undoTargetId.value);
-    if (undoConflicts.value.length > 0) {
+    const [conflicts, dirty] = await Promise.all([
+      chatStore.checkUndoConflicts(undoTargetId.value),
+      // Dirty preflight is advisory: on failure proceed without it and let
+      // undo_perform re-check on the backend.
+      chatStore.checkUndoDirty(undoTargetId.value).then(
+        (files) => ({ files, checked: true }),
+        (e) => {
+          console.warn("[ChatChangesPanel] undo_check_dirty failed:", e);
+          return { files: [] as ChangedFile[], checked: false };
+        },
+      ),
+    ]);
+    undoConflicts.value = conflicts;
+    undoDirtyFiles.value = dirty.files;
+    undoDirtyChecked.value = dirty.checked;
+    if (conflicts.length > 0) {
       showUndoConflictConfirm.value = true;
       return;
     }
@@ -402,10 +419,13 @@ async function confirmUndo(force = false) {
   const targetId = undoTargetId.value;
   if (!targetId || isUndoing.value) return;
   const restoreDraft = undoRestoreDraft.value;
+  // The dirty list was shown to the user (or verified empty) in this dialog;
+  // only skip the backend re-check when the preflight actually completed.
+  const acceptDirty = force || undoDirtyChecked.value;
   isUndoing.value = true;
   changesStore.closeInlineDiff();
   try {
-    const undone = await chatStore.performUndo(targetId, { force });
+    const undone = await chatStore.performUndo(targetId, { force, acceptDirty });
     if (undone && restoreDraft) {
       uiStore.stageChatDraftPrefill(restoreDraft);
     }
@@ -414,6 +434,8 @@ async function confirmUndo(force = false) {
     showUndoConfirm.value = false;
     showUndoConflictConfirm.value = false;
     undoConflicts.value = [];
+    undoDirtyFiles.value = [];
+    undoDirtyChecked.value = false;
   }
 }
 
@@ -422,6 +444,8 @@ function cancelUndo() {
   showUndoConfirm.value = false;
   showUndoConflictConfirm.value = false;
   undoConflicts.value = [];
+  undoDirtyFiles.value = [];
+  undoDirtyChecked.value = false;
 }
 
 function onSelectInUnity(ev: MouseEvent, path: string) {
@@ -626,6 +650,12 @@ function onOpenInEditor(ev: MouseEvent, path: string) {
           <p class="confirm-message">
             {{ mode === 'current' ? t('chat.changes.undoCurrentConfirm') : t('chat.changes.undoAllConfirm') }}
           </p>
+          <div v-if="undoDirtyFiles.length > 0" class="dirty-warning">
+            <p class="dirty-message">{{ t('chat.changes.undoDirtyMessage') }}</p>
+            <div class="dirty-files">
+              <div v-for="file in undoDirtyFiles" :key="file.path" class="dirty-file">{{ file.path }}</div>
+            </div>
+          </div>
           <div class="confirm-actions">
             <button type="button" class="confirm-cancel" :disabled="isUndoing" @click="cancelUndo">{{ t('chat.changes.cancel') }}</button>
             <button type="button" class="confirm-ok" :disabled="isUndoing" @click="confirmUndo()">
@@ -646,6 +676,12 @@ function onOpenInEditor(ev: MouseEvent, path: string) {
             <div v-for="conflict in undoConflicts" :key="`${conflict.sessionId}-${conflict.assistantMessageId}`" class="conflict-item">
               <div class="conflict-session">{{ sessionLabel(conflict) }}</div>
               <div class="conflict-files">{{ conflictFilesLabel(conflict) }}</div>
+            </div>
+          </div>
+          <div v-if="undoDirtyFiles.length > 0" class="dirty-warning">
+            <p class="dirty-message">{{ t('chat.changes.undoDirtyMessage') }}</p>
+            <div class="dirty-files">
+              <div v-for="file in undoDirtyFiles" :key="file.path" class="dirty-file">{{ file.path }}</div>
             </div>
           </div>
           <div class="confirm-actions">
@@ -1117,6 +1153,31 @@ function onOpenInEditor(ev: MouseEvent, path: string) {
   font-size: 11px;
   color: var(--text-secondary);
   line-height: 1.5;
+  word-break: break-word;
+  font-family: var(--font-mono-identifier);
+}
+
+.dirty-warning {
+  margin-bottom: 16px;
+  padding: 10px 12px;
+  border: 1px solid var(--warning-border, var(--border-color));
+  border-radius: 6px;
+  background: var(--warning-bg, var(--bg-color));
+}
+
+.dirty-message {
+  margin: 0 0 6px;
+  font-size: 12px;
+  color: var(--warning-text, var(--text-color));
+  line-height: 1.5;
+}
+
+.dirty-files {
+  max-height: 140px;
+  overflow-y: auto;
+  font-size: 11px;
+  color: var(--text-secondary);
+  line-height: 1.6;
   word-break: break-word;
   font-family: var(--font-mono-identifier);
 }

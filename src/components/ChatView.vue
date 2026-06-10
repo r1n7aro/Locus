@@ -13,7 +13,7 @@ import {
 } from "../services/unity";
 // undoPreview removed — undo UI moved to ChatChangesPanel
 import type { ChatComposerSendPayload, ChatMessage, AgentInfo, TokenUsage, ModelOption, PendingQuestion, PendingToolConfirm, EffortLevel, SessionSummary, AssetDbScanEvent, ScanStats, ImageAttachment, AssetRefAttachment, SkillManifest, UserIntentMeta, SaveRawContextRequest, CodexTransportMode, AssistantRenderPart, UnityConnectionStatus, KnowledgeDocumentType } from "../types";
-import type { ToolCallDisplay } from "../types";
+import type { ChangedFile, ToolCallDisplay } from "../types";
 import ModelEffortSelector from "./ModelEffortSelector.vue";
 import SessionPanel from "./chat/SessionPanel.vue";
 import SessionCompactPicker from "./chat/SessionCompactPicker.vue";
@@ -22,6 +22,7 @@ import ChatStatusIndicators from "./chat/ChatStatusIndicators.vue";
 import RichChatInput from "./chat/RichChatInput.vue";
 import TokenUsageBar from "./chat/TokenUsageBar.vue";
 import AskUserCard from "./chat/AskUserCard.vue";
+import SheetCard from "./chat/SheetCard.vue";
 import ToolConfirmCard from "./chat/ToolConfirmCard.vue";
 import ToolConfirmBatchCard from "./chat/ToolConfirmBatchCard.vue";
 import FileDiffViewer from "./diff/FileDiffViewer.vue";
@@ -64,6 +65,7 @@ import {
   type ResizeObserverHandle,
 } from "../composables/resizeObserver";
 import { forwardWheelToElement } from "../composables/chatWheelPassthrough";
+import { STREAMING_RENDER_THROTTLE_MS } from "../composables/streamingRenderThrottle";
 import { canOpenInEditor } from "../composables/useHideMeta";
 import { useDiffProgress } from "../composables/useDiffProgress";
 import { acquireSelectionLock } from "../composables/useSelectionLock";
@@ -179,6 +181,7 @@ const props = defineProps<{
   streamingText: string;
   streamingTextOrder?: number;
   isStreaming: boolean;
+  isCancelling?: boolean;
   isCompacting: boolean;
   isThinking: boolean;
   hasThinking: boolean;
@@ -1100,10 +1103,37 @@ function defaultUndoChoice(): UndoChoice {
   return canUndoFilesAndConversation.value ? "files" : "conversation";
 }
 
+const undoChooserDirtyFiles = ref<ChangedFile[]>([]);
+/** Whether the dirty preflight for the current chooser target completed. */
+const undoChooserDirtyChecked = ref(false);
+const undoChooserDirtyPreview = computed(() => {
+  const paths = undoChooserDirtyFiles.value.map((file) => file.path);
+  if (paths.length <= 5) return paths.join("\n");
+  return [...paths.slice(0, 5), `+${paths.length - 5}`].join("\n");
+});
+
+function refreshUndoChooserDirtyState() {
+  undoChooserDirtyFiles.value = [];
+  undoChooserDirtyChecked.value = false;
+  const targetId = currentUndoTarget.value?.fileUndoTarget;
+  if (!targetId) return;
+  void chatStore.checkUndoDirty(targetId).then(
+    (files) => {
+      if (currentUndoTarget.value?.fileUndoTarget !== targetId) return;
+      undoChooserDirtyFiles.value = files;
+      undoChooserDirtyChecked.value = true;
+    },
+    (e) => {
+      console.warn("[ChatView] undo_check_dirty failed:", e);
+    },
+  );
+}
+
 async function openUndoChooser(messageId: string | null = null) {
   undoTargetMessageId.value = messageId;
   selectedUndoChoice.value = defaultUndoChoice();
   undoChooserVisible.value = true;
+  refreshUndoChooserDirtyState();
   await nextTick();
   undoChooserRef.value?.focus();
 }
@@ -1112,6 +1142,8 @@ function closeUndoChooser() {
   if (undoChooserBusy.value) return;
   undoChooserVisible.value = false;
   undoTargetMessageId.value = null;
+  undoChooserDirtyFiles.value = [];
+  undoChooserDirtyChecked.value = false;
 }
 
 function restoreUndoMessage(message: ChatMessage | null) {
@@ -1190,16 +1222,22 @@ async function undoFilesAndConversation() {
   if (!targetId || !canUndoFilesAndConversation.value || undoChooserBusy.value) return;
   undoAction.value = "files";
   chatChangesStore.closeInlineDiff();
+  // The chooser showed the dirty file list (or verified it empty); if the
+  // preflight never completed, leave acceptDirty off so the backend re-checks.
+  const acceptDirty = undoChooserDirtyChecked.value;
   try {
     const undone = targetMessageId
       ? await chatStore.rollbackToMessage(targetMessageId, {
           includeFiles: true,
           fileUndoTarget: targetId,
+          acceptDirty,
         })
-      : await chatStore.performUndo(targetId);
+      : await chatStore.performUndo(targetId, { acceptDirty });
     if (undone) {
       undoChooserVisible.value = false;
       undoTargetMessageId.value = null;
+      undoChooserDirtyFiles.value = [];
+      undoChooserDirtyChecked.value = false;
       restoreUndoMessage(turn.userMessage);
     }
   } finally {
@@ -1330,7 +1368,7 @@ let pendingStreamingText = "";
 let streamingTextFlushTimer: ReturnType<typeof setTimeout> | null = null;
 let sessionRestoreLayoutTimer: ReturnType<typeof setTimeout> | null = null;
 const userScrollIntent = createUserScrollIntentTracker();
-const STREAMING_TEXT_RENDER_DELAY_MS = 80;
+const STREAMING_TEXT_RENDER_DELAY_MS = STREAMING_RENDER_THROTTLE_MS;
 const STREAM_END_SCROLL_SETTLE_MS = 320;
 const SESSION_RESTORE_LAYOUT_STABILIZE_MS = 180;
 const sessionRestoreLayoutStabilizing = ref(false);
@@ -2554,8 +2592,13 @@ onUnmounted(() => {
         </BaseButton>
       </div>
 
+      <SheetCard
+        v-if="pendingQuestion && pendingQuestion.sheet && !isViewingSubagent"
+        :question="pendingQuestion"
+        @answer="handleQuestionAnswer"
+      />
       <AskUserCard
-        v-if="pendingQuestion && !isViewingSubagent"
+        v-else-if="pendingQuestion && !isViewingSubagent"
         :question="pendingQuestion"
         @answer="handleQuestionAnswer"
       />
@@ -2679,6 +2722,7 @@ onUnmounted(() => {
         :skills="skills"
         :placeholder="chatInputPlaceholder"
         :is-streaming="isStreaming"
+        :cancelling="isCancelling"
         :send-label="isStreaming ? runningSendLabel : t('common.send')"
         :cancel-label="t('common.cancel')"
         :compact="inputControlsCollapsed"
@@ -2765,6 +2809,13 @@ onUnmounted(() => {
                   {{ t("chat.changes.undoing") }}
                 </span>
               </button>
+              <div
+                v-if="canUndoFilesAndConversation && undoChooserDirtyFiles.length > 0"
+                class="undo-chooser-warning"
+              >
+                <div>{{ t("chat.undo.dirtyWarning") }}</div>
+                <div class="undo-chooser-warning-files">{{ undoChooserDirtyPreview }}</div>
+              </div>
               <div v-if="!canUndoFilesAndConversation" class="undo-chooser-note">
                 {{ t("chat.undo.noFileUndo") }}
               </div>
@@ -3795,6 +3846,27 @@ onUnmounted(() => {
 
 .undo-chooser-note {
   padding: 0 2px 2px;
+}
+
+.undo-chooser-warning {
+  padding: 8px 10px;
+  border: 1px solid var(--warning-border, var(--border-color));
+  border-radius: 6px;
+  background: var(--warning-bg, var(--bg-color));
+  color: var(--warning-text, var(--text-color));
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.undo-chooser-warning-files {
+  margin-top: 4px;
+  color: var(--text-secondary);
+  font-family: var(--font-mono-identifier);
+  font-size: 11px;
+  white-space: pre-line;
+  word-break: break-word;
+  max-height: 120px;
+  overflow-y: auto;
 }
 
 .undo-chooser-empty {

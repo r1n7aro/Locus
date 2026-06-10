@@ -1,11 +1,31 @@
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use super::{Checkpoint, VcsChangedPath, VcsProvider, VcsRevisionRef};
 use crate::process_util::{async_command, augment_path_with_git};
 
 pub struct GitProvider;
+
+/// Persistent per-repository index used for worktree snapshots. Reusing one
+/// file keeps git's stat cache warm, so each snapshot only hashes files that
+/// changed since the previous snapshot instead of everything whose stat info
+/// is stale in the user's real index.
+const SHADOW_INDEX_FILE_NAME: &str = "locus-undo.index";
+/// A leftover `.lock` older than this is assumed to come from a crashed
+/// process and is removed; younger locks may belong to a live snapshot in
+/// another Locus instance.
+const SHADOW_LOCK_STALE_AFTER: Duration = Duration::from_secs(300);
+
+/// Result of capturing a round's file changes: the diff lines plus the
+/// snapshot ref of the worktree state the diff was taken against.
+pub struct RoundDiff {
+    pub after_state_id: String,
+    pub lines: Vec<String>,
+}
 
 struct TempGitIndex {
     path: PathBuf,
@@ -102,7 +122,7 @@ impl GitProvider {
     async fn git_with_index(
         working_dir: &str,
         args: &[&str],
-        index: Option<&TempGitIndex>,
+        index_file: Option<&Path>,
     ) -> Result<String, String> {
         let mut cmd = async_command("git");
         // Keep non-ASCII paths in UTF-8 instead of Git's quoted octal form.
@@ -111,8 +131,8 @@ impl GitProvider {
             .args(args)
             .current_dir(working_dir);
         cmd.env_remove("GIT_INDEX_FILE");
-        if let Some(index) = index {
-            cmd.env("GIT_INDEX_FILE", index.path());
+        if let Some(index_file) = index_file {
+            cmd.env("GIT_INDEX_FILE", index_file);
         }
         let output = cmd
             .output()
@@ -143,13 +163,128 @@ impl GitProvider {
         }
     }
 
-    // Capture the current working tree into a stash-style commit using a temporary
-    // index so the real staged/untracked state stays untouched.
-    async fn snapshot_worktree_once(working_dir: &str, label: &str) -> Result<String, String> {
+    fn shadow_snapshot_locks(
+    ) -> &'static std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>> {
+        static LOCKS: OnceLock<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
+            OnceLock::new();
+        LOCKS.get_or_init(Default::default)
+    }
+
+    async fn shadow_snapshot_guard(working_dir: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let normalized = working_dir.replace('\\', "/");
+        let key = if cfg!(windows) {
+            normalized.to_ascii_lowercase()
+        } else {
+            normalized
+        };
+        let lock = {
+            let mut locks = Self::shadow_snapshot_locks()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            locks
+                .entry(key)
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        lock.lock_owned().await
+    }
+
+    async fn shadow_index_path(working_dir: &str) -> Result<PathBuf, String> {
+        let repo_index = Self::repo_index_path(working_dir).await?;
+        let dir = repo_index
+            .parent()
+            .ok_or_else(|| "repository index path has no parent directory".to_string())?;
+        Ok(dir.join(SHADOW_INDEX_FILE_NAME))
+    }
+
+    /// Remove an abandoned `<index>.lock` so one crashed snapshot doesn't
+    /// permanently disable the shadow index. Returns whether a lock was removed.
+    fn remove_stale_index_lock(index_path: &Path, max_age: Duration) -> bool {
+        let mut lock = OsString::from(index_path.as_os_str());
+        lock.push(".lock");
+        let lock = PathBuf::from(lock);
+        let Ok(metadata) = std::fs::metadata(&lock) else {
+            return false;
+        };
+        let stale = match metadata.modified().ok().and_then(|m| m.elapsed().ok()) {
+            Some(age) => age >= max_age,
+            // Unreadable mtime: removing risks a live cross-process lock, but
+            // keeping it would disable the shadow index forever.
+            None => true,
+        };
+        if stale && std::fs::remove_file(&lock).is_ok() {
+            eprintln!(
+                "[UndoManager] removed stale shadow index lock '{}'",
+                lock.display()
+            );
+            return true;
+        }
+        false
+    }
+
+    /// Ensure the shadow index exists, seeding it from the real index on
+    /// first use so the initial snapshot starts with a warm stat cache.
+    async fn prepare_shadow_index(working_dir: &str) -> Result<PathBuf, String> {
+        let path = Self::shadow_index_path(working_dir).await?;
+        Self::remove_stale_index_lock(&path, SHADOW_LOCK_STALE_AFTER);
+        if !path.is_file() {
+            let repo_index = Self::repo_index_path(working_dir).await?;
+            if repo_index.is_file() {
+                tokio::fs::copy(&repo_index, &path).await.map_err(|e| {
+                    format!(
+                        "failed to seed shadow git index '{}' from '{}': {}",
+                        path.display(),
+                        repo_index.display(),
+                        e
+                    )
+                })?;
+            } else {
+                tokio::fs::File::create(&path).await.map_err(|e| {
+                    format!(
+                        "failed to create shadow git index '{}': {}",
+                        path.display(),
+                        e
+                    )
+                })?;
+            }
+            eprintln!("[UndoManager] seeded shadow git index '{}'", path.display());
+        }
+        Ok(path)
+    }
+
+    async fn discard_shadow_index(working_dir: &str) {
+        if let Ok(path) = Self::shadow_index_path(working_dir).await {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    async fn snapshot_worktree_with_shadow_index(
+        working_dir: &str,
+        label: &str,
+    ) -> Result<String, String> {
+        let index_path = Self::prepare_shadow_index(working_dir).await?;
+        Self::git_with_index(working_dir, &["add", "-A"], Some(&index_path))
+            .await
+            .map_err(|error| format!("stage workspace into shadow git index failed: {}", error))?;
+        Self::git_with_index(
+            working_dir,
+            &["stash", "create", "-m", label],
+            Some(&index_path),
+        )
+        .await
+        .map_err(|error| format!("create stash-style workspace snapshot failed: {}", error))
+    }
+
+    // Slow path: one-shot copy of the real index, as before the shadow index
+    // existed. Correct with any starting index; only the stat cache differs.
+    async fn snapshot_worktree_with_temp_index(
+        working_dir: &str,
+        label: &str,
+    ) -> Result<String, String> {
         let temp_index = TempGitIndex::create(working_dir)
             .await
             .map_err(|error| format!("create temporary git index failed: {}", error))?;
-        Self::git_with_index(working_dir, &["add", "-A"], Some(&temp_index))
+        Self::git_with_index(working_dir, &["add", "-A"], Some(temp_index.path()))
             .await
             .map_err(|error| {
                 format!("stage workspace into temporary git index failed: {}", error)
@@ -157,10 +292,34 @@ impl GitProvider {
         Self::git_with_index(
             working_dir,
             &["stash", "create", "-m", label],
-            Some(&temp_index),
+            Some(temp_index.path()),
         )
         .await
         .map_err(|error| format!("create stash-style workspace snapshot failed: {}", error))
+    }
+
+    // Capture the current working tree into a stash-style commit using a
+    // Locus-owned index so the real staged/untracked state stays untouched.
+    async fn snapshot_worktree_once(working_dir: &str, label: &str) -> Result<String, String> {
+        // One snapshot at a time per workspace: concurrent `git add -A`
+        // against the shared shadow index would trip git's index lock. Tool
+        // rounds themselves still run concurrently; only the snapshot moment
+        // is serialized.
+        let _guard = Self::shadow_snapshot_guard(working_dir).await;
+        match Self::snapshot_worktree_with_shadow_index(working_dir, label).await {
+            Ok(sha) => Ok(sha),
+            Err(error) => {
+                // Self-heal: drop the shadow index (re-seeded on next use) and
+                // fall back to the slow temp-index path so the snapshot still
+                // happens this round.
+                eprintln!(
+                    "[UndoManager] shadow index snapshot failed for '{}'; falling back to temporary index: {}",
+                    working_dir, error
+                );
+                Self::discard_shadow_index(working_dir).await;
+                Self::snapshot_worktree_with_temp_index(working_dir, label).await
+            }
+        }
     }
 
     fn should_auto_remove_root_nul(error: &str) -> bool {
@@ -252,7 +411,8 @@ impl GitProvider {
     // without forcing previously untracked files into the index.
     async fn snapshot_index_tree(working_dir: &str) -> Result<Option<String>, String> {
         let temp_index = TempGitIndex::create(working_dir).await?;
-        let tree = Self::git_with_index(working_dir, &["write-tree"], Some(&temp_index)).await?;
+        let tree =
+            Self::git_with_index(working_dir, &["write-tree"], Some(temp_index.path())).await?;
         if tree.is_empty() {
             Ok(None)
         } else {
@@ -616,16 +776,21 @@ impl GitProvider {
         Ok(output.lines().any(|line| line.trim() == path))
     }
 
-    pub async fn diff_files(working_dir: &str, checkpoint_id: &str) -> Result<Vec<String>, String> {
-        let after_sha = Self::snapshot_worktree(working_dir, "locus diff temp").await?;
-        let after_ref = if after_sha.is_empty() {
-            match Self::git(working_dir, &["rev-parse", "HEAD"]).await {
-                Ok(head) if !head.is_empty() => head,
-                Ok(_) | Err(_) => Self::empty_tree_id(working_dir).await?,
-            }
-        } else {
-            after_sha
-        };
+    /// Snapshot the current worktree and return a tree-ish ref for it
+    /// (stash-style commit; falls back to HEAD or the empty tree when clean).
+    pub async fn worktree_state_ref(working_dir: &str, label: &str) -> Result<String, String> {
+        let sha = Self::snapshot_worktree(working_dir, label).await?;
+        if !sha.is_empty() {
+            return Ok(sha);
+        }
+        match Self::git(working_dir, &["rev-parse", "HEAD"]).await {
+            Ok(head) if !head.is_empty() => Ok(head),
+            Ok(_) | Err(_) => Self::empty_tree_id(working_dir).await,
+        }
+    }
+
+    pub async fn diff_files(working_dir: &str, checkpoint_id: &str) -> Result<RoundDiff, String> {
+        let after_state_id = Self::worktree_state_ref(working_dir, "locus diff temp").await?;
 
         let output = Self::git(
             working_dir,
@@ -636,15 +801,117 @@ impl GitProvider {
                 "--find-renames",
                 "--no-commit-id",
                 checkpoint_id,
-                &after_ref,
+                &after_state_id,
             ],
         )
         .await?;
 
-        Ok(output
+        let lines = output
             .lines()
             .filter(|l| !l.is_empty())
             .map(|l| l.to_string())
+            .collect();
+        Ok(RoundDiff {
+            after_state_id,
+            lines,
+        })
+    }
+
+    /// Name-status diff between two tree-ish refs, limited to specific paths.
+    /// Paths are matched literally (no glob expansion).
+    pub async fn diff_paths_between(
+        working_dir: &str,
+        from_ref: &str,
+        to_ref: &str,
+        paths: &[String],
+    ) -> Result<Vec<String>, String> {
+        const PATHSPEC_CHUNK: usize = 64;
+        let mut lines = Vec::new();
+        for chunk in paths.chunks(PATHSPEC_CHUNK) {
+            let mut args: Vec<String> = vec![
+                "diff-tree".to_string(),
+                "-r".to_string(),
+                "--name-status".to_string(),
+                "--no-commit-id".to_string(),
+                from_ref.to_string(),
+                to_ref.to_string(),
+                "--".to_string(),
+            ];
+            args.extend(chunk.iter().map(|path| format!(":(literal){}", path)));
+            let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            let output = Self::git(working_dir, &arg_refs).await?;
+            lines.extend(
+                output
+                    .lines()
+                    .filter(|l| !l.is_empty())
+                    .map(|l| l.to_string()),
+            );
+        }
+        Ok(lines)
+    }
+
+    fn undo_ref_name(entry_id: &str, kind: &str) -> String {
+        format!("refs/locus/undo/{}/{}", entry_id, kind)
+    }
+
+    /// Pin an undo entry's snapshot commits with refs so `git gc` keeps them
+    /// alive while the entry can still be undone.
+    pub async fn pin_undo_refs(
+        working_dir: &str,
+        entry_id: &str,
+        pre_state_id: &str,
+        post_state_id: Option<&str>,
+    ) -> Result<(), String> {
+        Self::git(
+            working_dir,
+            &[
+                "update-ref",
+                &Self::undo_ref_name(entry_id, "pre"),
+                pre_state_id,
+            ],
+        )
+        .await?;
+        if let Some(post) = post_state_id {
+            Self::git(
+                working_dir,
+                &["update-ref", &Self::undo_ref_name(entry_id, "post"), post],
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Best-effort removal of an entry's pin refs. Once unpinned, the snapshot
+    /// objects become unreachable and are reclaimed by the user's normal
+    /// `git gc`; Locus never runs gc itself.
+    pub async fn release_undo_refs(working_dir: &str, entry_id: &str) {
+        for kind in ["pre", "post"] {
+            let _ = Self::git(
+                working_dir,
+                &["update-ref", "-d", &Self::undo_ref_name(entry_id, kind)],
+            )
+            .await;
+        }
+    }
+
+    /// Entry ids that still have pin refs in this repository.
+    pub async fn list_undo_ref_entry_ids(
+        working_dir: &str,
+    ) -> Result<std::collections::HashSet<String>, String> {
+        let output = Self::git(
+            working_dir,
+            &["for-each-ref", "--format=%(refname)", "refs/locus/undo"],
+        )
+        .await?;
+        Ok(output
+            .lines()
+            .filter_map(|line| {
+                line.trim()
+                    .strip_prefix("refs/locus/undo/")
+                    .and_then(|rest| rest.split('/').next())
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_string)
+            })
             .collect())
     }
 }
@@ -793,10 +1060,11 @@ mod tests {
         write_file(&repo.join("untracked.txt"), "user-untracked\nagent-more\n");
         write_file(&repo.join("new.txt"), "new-file\n");
 
-        let changed = GitProvider::diff_files(&repo.to_string_lossy(), &checkpoint.id)
+        let round_diff = GitProvider::diff_files(&repo.to_string_lossy(), &checkpoint.id)
             .await
             .expect("diff_files should succeed");
-        let mut changed = changed;
+        assert!(!round_diff.after_state_id.is_empty());
+        let mut changed = round_diff.lines;
         changed.sort();
         assert_eq!(
             changed,
@@ -960,7 +1228,8 @@ mod tests {
 
         let changed = GitProvider::diff_files(&repo.to_string_lossy(), &checkpoint.id)
             .await
-            .expect("diff_files should succeed");
+            .expect("diff_files should succeed")
+            .lines;
         assert_eq!(changed, vec!["D\ttest1.cs".to_string()]);
         assert_eq!(git(&repo, &["status", "--short"]), "");
 
@@ -1002,7 +1271,8 @@ mod tests {
 
         let changed = GitProvider::diff_files(&repo.to_string_lossy(), &checkpoint.id)
             .await
-            .expect("diff_files should succeed");
+            .expect("diff_files should succeed")
+            .lines;
         assert_eq!(changed.len(), 1);
         let parts: Vec<&str> = changed[0].split('\t').collect();
         assert_eq!(parts.len(), 3);
@@ -1041,7 +1311,8 @@ mod tests {
 
         let changed = GitProvider::diff_files(&repo.to_string_lossy(), &checkpoint.id)
             .await
-            .expect("diff_files should succeed");
+            .expect("diff_files should succeed")
+            .lines;
         assert_eq!(
             changed,
             vec!["A\tLocus/knowledge/design/system/主要玩法.md".to_string()]
@@ -1071,7 +1342,8 @@ mod tests {
 
         let mut changed = GitProvider::diff_files(&repo.to_string_lossy(), &checkpoint.id)
             .await
-            .expect("diff_files should succeed");
+            .expect("diff_files should succeed")
+            .lines;
         changed.sort();
         assert_eq!(
             changed,
@@ -1169,5 +1441,147 @@ mod tests {
         assert!(message.contains("workspace='C:\\repo'"));
         assert!(message.contains("label='agent round'"));
         assert!(message.contains("reason=git add -A failed: fatal: adding files failed"));
+    }
+
+    #[tokio::test]
+    async fn snapshot_creates_and_reuses_shadow_index() {
+        if !git_available() {
+            return;
+        }
+
+        let repo = setup_repo("git-shadow-index");
+        let repo_str = repo.to_string_lossy().to_string();
+        let shadow_path = repo.join(".git").join(super::SHADOW_INDEX_FILE_NAME);
+        assert!(!shadow_path.exists());
+
+        let status_before = git(&repo, &["status", "--short"]);
+
+        let provider = GitProvider;
+        let checkpoint = provider
+            .checkpoint(&repo_str, "round one")
+            .await
+            .expect("first checkpoint should succeed")
+            .expect("first checkpoint should exist");
+        assert!(
+            shadow_path.is_file(),
+            "first snapshot should seed the shadow index"
+        );
+
+        write_file(&repo.join("tracked.txt"), "base\nagent\n");
+        let changed = GitProvider::diff_files(&repo_str, &checkpoint.id)
+            .await
+            .expect("diff_files should succeed")
+            .lines;
+        assert_eq!(changed, vec!["M\ttracked.txt".to_string()]);
+        assert!(
+            shadow_path.is_file(),
+            "snapshots should keep reusing the shadow index"
+        );
+
+        // The Locus-owned index must never leak into the user's git state.
+        assert_eq!(git(&repo, &["status", "--short"]), "M tracked.txt");
+        write_file(&repo.join("tracked.txt"), "base\n");
+        assert_eq!(git(&repo, &["status", "--short"]), status_before);
+
+        std::fs::remove_dir_all(&repo).expect("cleanup temp repo");
+    }
+
+    #[tokio::test]
+    async fn snapshot_recovers_from_corrupt_shadow_index() {
+        if !git_available() {
+            return;
+        }
+
+        let repo = setup_repo("git-shadow-corrupt");
+        let repo_str = repo.to_string_lossy().to_string();
+        let shadow_path = repo.join(".git").join(super::SHADOW_INDEX_FILE_NAME);
+        write_file(&repo.join("untracked.txt"), "data\n");
+        std::fs::write(&shadow_path, b"not a git index").expect("corrupt shadow index");
+
+        let provider = GitProvider;
+        let checkpoint = provider
+            .checkpoint(&repo_str, "round after corruption")
+            .await
+            .expect("checkpoint should fall back to the temp index")
+            .expect("checkpoint should exist");
+        let untracked_ref = format!("{}:untracked.txt", checkpoint.id);
+        assert_eq!(git(&repo, &["show", &untracked_ref]), "data");
+        assert!(
+            !shadow_path.exists(),
+            "corrupt shadow index should be discarded for re-seeding"
+        );
+
+        let second = provider
+            .checkpoint(&repo_str, "round two")
+            .await
+            .expect("second checkpoint should succeed")
+            .expect("second checkpoint should exist");
+        assert!(!second.id.is_empty());
+        assert!(
+            shadow_path.is_file(),
+            "next snapshot should re-seed the shadow index"
+        );
+
+        std::fs::remove_dir_all(&repo).expect("cleanup temp repo");
+    }
+
+    #[test]
+    fn remove_stale_index_lock_respects_age() {
+        let dir = temp_repo_dir("git-shadow-lock");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let index_path = dir.join(super::SHADOW_INDEX_FILE_NAME);
+        let lock_path = dir.join(format!("{}.lock", super::SHADOW_INDEX_FILE_NAME));
+        std::fs::write(&lock_path, b"").expect("create lock file");
+
+        assert!(!GitProvider::remove_stale_index_lock(
+            &index_path,
+            std::time::Duration::from_secs(3600)
+        ));
+        assert!(lock_path.exists(), "fresh lock should be kept");
+
+        assert!(GitProvider::remove_stale_index_lock(
+            &index_path,
+            std::time::Duration::ZERO
+        ));
+        assert!(!lock_path.exists(), "stale lock should be removed");
+
+        std::fs::remove_dir_all(&dir).expect("cleanup temp dir");
+    }
+
+    #[tokio::test]
+    async fn concurrent_snapshots_share_shadow_index_safely() {
+        if !git_available() {
+            return;
+        }
+
+        let repo = setup_repo("git-shadow-concurrent");
+        let repo_str = repo.to_string_lossy().to_string();
+        write_file(&repo.join("tracked.txt"), "base\nchange\n");
+
+        let provider = GitProvider;
+        let baseline = provider
+            .checkpoint(&repo_str, "warmup")
+            .await
+            .expect("warmup checkpoint should succeed")
+            .expect("warmup checkpoint should exist");
+
+        let tasks: Vec<_> = (0..4)
+            .map(|_| {
+                let repo_for_task = repo_str.clone();
+                let baseline_id = baseline.id.clone();
+                tokio::spawn(
+                    async move { GitProvider::diff_files(&repo_for_task, &baseline_id).await },
+                )
+            })
+            .collect();
+        for task in tasks {
+            let diff = task
+                .await
+                .expect("snapshot task join")
+                .expect("concurrent snapshot should succeed");
+            assert!(!diff.after_state_id.is_empty());
+        }
+
+        std::fs::remove_dir_all(&repo).expect("cleanup temp repo");
     }
 }

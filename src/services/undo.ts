@@ -9,8 +9,9 @@ export function undoPerform(
   sessionId: string,
   assistantMessageId: string,
   force = false,
+  acceptDirty = false,
 ): Promise<void> {
-  return ipcInvoke("undo_perform", { sessionId, assistantMessageId, force });
+  return ipcInvoke("undo_perform", { sessionId, assistantMessageId, force, acceptDirty });
 }
 
 export function undoPerformToMessage(
@@ -18,12 +19,14 @@ export function undoPerformToMessage(
   assistantMessageId: string,
   truncateMessageId: string,
   force = false,
+  acceptDirty = false,
 ): Promise<void> {
   return ipcInvoke("undo_perform_to_message", {
     sessionId,
     assistantMessageId,
     truncateMessageId,
     force,
+    acceptDirty,
   });
 }
 
@@ -36,4 +39,12 @@ export function undoCheckConflicts(
   assistantMessageId: string,
 ): Promise<UndoConflictInfo[]> {
   return ipcInvoke<UndoConflictInfo[]>("undo_check_conflicts", { sessionId, assistantMessageId });
+}
+
+/** Files the undo would restore that were modified again after the round ended. */
+export function undoCheckDirty(
+  sessionId: string,
+  assistantMessageId: string,
+): Promise<ChangedFile[]> {
+  return ipcInvoke<ChangedFile[]>("undo_check_dirty", { sessionId, assistantMessageId });
 }

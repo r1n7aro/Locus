@@ -711,6 +711,7 @@ async fn abort_stash_apply_from_checkpoint(cwd: &str) -> AppResult<String> {
         .await
         .map_err(|e| AppError::new("merge.stash_abort_failed", e))?;
     let changed_files: Vec<ChangedFile> = changed
+        .lines
         .iter()
         .filter_map(|line| parse_changed_file(line))
         .collect();

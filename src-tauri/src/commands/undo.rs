@@ -7,7 +7,9 @@ use crate::error::AppError;
 use crate::knowledge_index::KnowledgeIndexState;
 use crate::knowledge_store::KnowledgeType;
 use crate::session::store::SessionStore;
-use crate::vcs::undo::{ChangedFile, UndoConflict, UndoEntry, UndoPerformError};
+use crate::vcs::undo::{
+    ChangedFile, UndoConflict, UndoEntry, UndoPerformError, UndoPerformOptions,
+};
 use crate::workspace::Workspace;
 use crate::UndoManagerHandle;
 
@@ -57,6 +59,38 @@ fn format_conflict_detail(conflicts: &[UndoConflictInfo]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn format_dirty_detail(files: &[ChangedFile]) -> String {
+    files
+        .iter()
+        .map(|file| match &file.old_path {
+            Some(old_path) => format!("- {} {} -> {}", file.status, old_path, file.path),
+            None => format!("- {} {}", file.status, file.path),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn undo_perform_error_to_app_error(error: UndoPerformError, store: &SessionStore) -> AppError {
+    match error {
+        UndoPerformError::Conflict(conflicts) => {
+            let conflicts = enrich_conflicts(store, conflicts);
+            AppError::new(
+                "undo.conflict",
+                "Undo blocked because newer changes from other sessions would be overwritten.",
+            )
+            .detail(format_conflict_detail(&conflicts))
+            .operation("undo")
+        }
+        UndoPerformError::Dirty(files) => AppError::new(
+            "undo.dirty",
+            "Undo blocked because files were modified after this round; confirming rolls those extra changes back too.",
+        )
+        .detail(format_dirty_detail(&files))
+        .operation("undo"),
+        UndoPerformError::Other(msg) => msg.into(),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -257,6 +291,7 @@ pub async fn undo_perform(
     session_id: String,
     assistant_message_id: String,
     force: Option<bool>,
+    accept_dirty: Option<bool>,
     app_handle: AppHandle,
     workspace: State<'_, Arc<Workspace>>,
     undo_manager: State<'_, UndoManagerHandle>,
@@ -269,21 +304,15 @@ pub async fn undo_perform(
             &session_id,
             &assistant_message_id,
             &working_dir,
-            force.unwrap_or(false),
+            UndoPerformOptions {
+                force: force.unwrap_or(false),
+                accept_dirty: accept_dirty.unwrap_or(false),
+            },
         )
         .await
     {
         Ok(entry) => entry,
-        Err(UndoPerformError::Conflict(conflicts)) => {
-            let conflicts = enrich_conflicts(store.inner(), conflicts);
-            return Err(AppError::new(
-                "undo.conflict",
-                "Undo blocked because newer changes from other sessions would be overwritten.",
-            )
-            .detail(format_conflict_detail(&conflicts))
-            .operation("undo"));
-        }
-        Err(UndoPerformError::Other(msg)) => return Err(msg.into()),
+        Err(error) => return Err(undo_perform_error_to_app_error(error, store.inner())),
     };
     if let Err(e) = store.truncate_from_message(&session_id, &result.entry.assistant_message_id) {
         eprintln!("[undo_perform] failed to truncate messages: {}", e);
@@ -320,6 +349,7 @@ pub async fn undo_perform_to_message(
     assistant_message_id: String,
     truncate_message_id: String,
     force: Option<bool>,
+    accept_dirty: Option<bool>,
     app_handle: AppHandle,
     workspace: State<'_, Arc<Workspace>>,
     undo_manager: State<'_, UndoManagerHandle>,
@@ -332,21 +362,15 @@ pub async fn undo_perform_to_message(
             &session_id,
             &assistant_message_id,
             &working_dir,
-            force.unwrap_or(false),
+            UndoPerformOptions {
+                force: force.unwrap_or(false),
+                accept_dirty: accept_dirty.unwrap_or(false),
+            },
         )
         .await
     {
         Ok(entry) => entry,
-        Err(UndoPerformError::Conflict(conflicts)) => {
-            let conflicts = enrich_conflicts(store.inner(), conflicts);
-            return Err(AppError::new(
-                "undo.conflict",
-                "Undo blocked because newer changes from other sessions would be overwritten.",
-            )
-            .detail(format_conflict_detail(&conflicts))
-            .operation("undo"));
-        }
-        Err(UndoPerformError::Other(msg)) => return Err(msg.into()),
+        Err(error) => return Err(undo_perform_error_to_app_error(error, store.inner())),
     };
 
     if let Err(e) = store.truncate_after_message(&session_id, &truncate_message_id) {
@@ -413,6 +437,23 @@ pub async fn undo_check_conflicts(
             .check_conflicts(&session_id, &assistant_message_id)
             .await?,
     ))
+}
+
+/// Files the undo would restore that were modified again after the round
+/// ended (by the user or another process). Advisory: perform re-checks under
+/// the workspace lock.
+#[tauri::command]
+pub async fn undo_check_dirty(
+    session_id: String,
+    assistant_message_id: String,
+    workspace: State<'_, Arc<Workspace>>,
+    undo_manager: State<'_, UndoManagerHandle>,
+) -> Result<Vec<ChangedFile>, AppError> {
+    let working_dir = workspace.path.read().await.clone();
+    undo_manager
+        .check_dirty(&session_id, &assistant_message_id, &working_dir)
+        .await
+        .map_err(AppError::from)
 }
 
 #[cfg(test)]
