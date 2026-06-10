@@ -6,6 +6,11 @@ const AUTO_COMPACT_THRESHOLD: f64 = 0.9;
 const AUTO_COMPACT_BUFFER_MIN_TOKENS: u32 = 4_000;
 const AUTO_COMPACT_BUFFER_MAX_TOKENS: u32 = 24_000;
 
+// The byte heuristic in `estimate_text_tokens` undercounts CJK and dense JSON
+// by 15-35%, so real usage feedback may only raise the estimate, never lower it.
+const ESTIMATE_CALIBRATION_RATIO_MIN: f64 = 1.0;
+const ESTIMATE_CALIBRATION_RATIO_MAX: f64 = 4.0;
+
 const MAX_CONSECUTIVE_FAILURES: u32 = 3;
 
 const MESSAGE_OVERHEAD_TOKENS: u32 = 12;
@@ -156,6 +161,77 @@ pub fn should_codex_block_normal_send(total_input_tokens: u32, context_limit: u3
         return false;
     }
     total_input_tokens >= context_limit.saturating_sub(24_000)
+}
+
+pub const CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE: &str =
+    "Output exceeded the available model context and was truncated";
+
+/// Codex-style pre-compaction trim, mirroring codex-rs
+/// `trim_function_call_history_to_fit_context_window`: walk from the newest
+/// message backwards, rewriting tool outputs to a short placeholder until the
+/// estimated request fits the context window. Stops at the first non-tool
+/// message because everything older was already accepted by the provider in
+/// the last successful request.
+pub fn trim_tool_outputs_to_fit_context_window(
+    messages: &mut [ChatMessage],
+    system_parts: &[&str],
+    tools: &[serde_json::Value],
+    context_limit: u32,
+) -> usize {
+    if context_limit == 0 || messages.is_empty() {
+        return 0;
+    }
+
+    let mut rewritten = 0usize;
+    for index in (0..messages.len()).rev() {
+        if estimate_request_tokens(system_parts, messages, tools) <= context_limit {
+            break;
+        }
+        let message = &mut messages[index];
+        if message.role != MessageRole::Tool {
+            break;
+        }
+        if message.content == CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE {
+            continue;
+        }
+        message.content = CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE.to_string();
+        rewritten += 1;
+    }
+
+    rewritten
+}
+
+/// Blend the local byte-heuristic estimate with real usage reported by the
+/// provider so auto-compact triggers on the provider's tokenization, not ours.
+///
+/// `calibration_sample` is `(actual_prompt_tokens, estimated_tokens)` for the
+/// most recent completed request in this run, where actual is
+/// `input + cache_read + cache_write` (every backend normalizes `input_tokens`
+/// to the uncached portion, so the sum is the full prompt without double
+/// counting). `persisted_context_tokens` is the session's `last_context_tokens`
+/// and covers the first request of a new run, before any in-run sample exists;
+/// it is capped relative to the estimate so a stale value recorded before
+/// messages were rolled back cannot trigger spurious compaction.
+pub fn calibrated_input_tokens(
+    estimated_tokens: u32,
+    calibration_sample: Option<(u32, u32)>,
+    persisted_context_tokens: u32,
+) -> u32 {
+    let ratio = calibration_sample
+        .filter(|(actual, estimated)| *actual > 0 && *estimated > 0)
+        .map(|(actual, estimated)| actual as f64 / estimated as f64)
+        .unwrap_or(1.0)
+        .clamp(
+            ESTIMATE_CALIBRATION_RATIO_MIN,
+            ESTIMATE_CALIBRATION_RATIO_MAX,
+        );
+
+    let calibrated = (estimated_tokens as f64 * ratio).min(u32::MAX as f64) as u32;
+    let floor_cap =
+        (estimated_tokens as f64 * ESTIMATE_CALIBRATION_RATIO_MAX).min(u32::MAX as f64) as u32;
+    let floor = persisted_context_tokens.min(floor_cap);
+
+    calibrated.max(floor).max(estimated_tokens)
 }
 
 fn auto_compact_buffer(context_limit: u32) -> u32 {
@@ -1697,6 +1773,91 @@ mod tests {
     fn should_auto_compact_uses_buffer() {
         assert!(should_auto_compact(87_000, 100_000));
         assert!(!should_auto_compact(60_000, 100_000));
+    }
+
+    #[test]
+    fn trim_tool_outputs_rewrites_newest_tool_outputs_until_request_fits() {
+        let huge = "工具输出".repeat(40_000);
+        let mut messages = vec![
+            make_message("user-1", MessageRole::User, "排查", 100, None, None),
+            make_message("assistant-1", MessageRole::Assistant, "running", 101, None, None),
+            make_message("tool-old", MessageRole::Tool, &huge, 102, None, Some("tc-1")),
+            make_message("assistant-2", MessageRole::Assistant, "running", 103, None, None),
+            make_message("tool-new-1", MessageRole::Tool, &huge, 104, None, Some("tc-2")),
+            make_message("tool-new-2", MessageRole::Tool, &huge, 105, None, Some("tc-3")),
+        ];
+
+        let rewritten =
+            trim_tool_outputs_to_fit_context_window(&mut messages, &["system"], &[], 200_000);
+
+        // Only the trailing tool-output run is rewritten; the walk stops at
+        // assistant-2, so tool-old keeps its content even though it is large.
+        assert_eq!(rewritten, 2);
+        assert_eq!(messages[5].content, CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE);
+        assert_eq!(messages[4].content, CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE);
+        assert_eq!(messages[2].content, huge);
+        assert!(estimate_request_tokens(&["system"], &messages, &[]) <= 200_000);
+
+        // Already-fitting histories are untouched.
+        let mut small = vec![make_message(
+            "user-1",
+            MessageRole::User,
+            "排查",
+            100,
+            None,
+            None,
+        )];
+        assert_eq!(
+            trim_tool_outputs_to_fit_context_window(&mut small, &["system"], &[], 200_000),
+            0
+        );
+    }
+
+    #[test]
+    fn calibrated_input_tokens_scales_by_actual_usage_ratio() {
+        // CJK/JSON-heavy histories: provider counted 130k where we estimated 100k.
+        assert_eq!(
+            calibrated_input_tokens(120_000, Some((130_000, 100_000)), 0),
+            156_000
+        );
+        // Never calibrates downward, even when the provider counted fewer tokens.
+        assert_eq!(
+            calibrated_input_tokens(120_000, Some((80_000, 100_000)), 0),
+            120_000
+        );
+        // Degenerate samples are ignored.
+        assert_eq!(
+            calibrated_input_tokens(120_000, Some((0, 100_000)), 0),
+            120_000
+        );
+        assert_eq!(
+            calibrated_input_tokens(120_000, Some((100_000, 0)), 0),
+            120_000
+        );
+        assert_eq!(calibrated_input_tokens(120_000, None, 0), 120_000);
+    }
+
+    #[test]
+    fn calibrated_input_tokens_floors_at_persisted_context_usage() {
+        // First request of a new run: no in-run sample yet, but the session's
+        // recorded real usage already shows the estimate is too low.
+        assert_eq!(calibrated_input_tokens(100_000, None, 150_000), 150_000);
+        // Stale persisted usage (e.g. recorded before a history rollback) is
+        // capped relative to the current estimate.
+        assert_eq!(calibrated_input_tokens(10_000, None, 1_000_000), 40_000);
+        assert_eq!(calibrated_input_tokens(100_000, None, 0), 100_000);
+    }
+
+    #[test]
+    fn calibrated_input_tokens_recovers_missed_auto_compact_trigger() {
+        let limit = 200_000;
+        // The raw estimate alone stays below the trigger line while real usage
+        // is already near the context limit.
+        assert!(!should_auto_compact(120_000, limit));
+        let effective = calibrated_input_tokens(120_000, Some((190_000, 120_000)), 0);
+        assert!(should_auto_compact(effective, limit));
+        let effective_from_floor = calibrated_input_tokens(120_000, None, 190_000);
+        assert!(should_auto_compact(effective_from_floor, limit));
     }
 
     #[test]

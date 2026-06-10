@@ -157,9 +157,40 @@ fn authority_host(host: &str) -> String {
     }
 }
 
+/// Extracts the opaque remote-compaction payload stored on a context-handoff
+/// message. The Codex `/responses/compact` endpoint returns the summary as an
+/// encrypted compaction item that must be replayed verbatim to the API; it is
+/// stashed in the handoff message's response-request metadata.
+fn codex_compaction_encrypted_content(metadata: &serde_json::Value) -> Option<&str> {
+    metadata
+        .get("codex_compaction")?
+        .get("encrypted_content")?
+        .as_str()
+        .filter(|content| !content.is_empty())
+}
+
 fn build_input(history: &[ChatMessage]) -> Vec<serde_json::Value> {
+    build_input_with_metadata(history, None)
+}
+
+fn build_input_with_metadata(
+    history: &[ChatMessage],
+    response_request_metadata: Option<&HashMap<String, serde_json::Value>>,
+) -> Vec<serde_json::Value> {
     let mut input = Vec::new();
     for msg in history {
+        if let Some(encrypted_content) = response_request_metadata
+            .and_then(|metadata| metadata.get(&msg.id))
+            .and_then(codex_compaction_encrypted_content)
+        {
+            // The handoff text is a local fallback for non-Codex backends; the
+            // Codex API receives the original compaction item instead.
+            input.push(serde_json::json!({
+                "type": "compaction",
+                "encrypted_content": encrypted_content,
+            }));
+            continue;
+        }
         match msg.role {
             MessageRole::User => {
                 input.push(serde_json::json!({
@@ -289,9 +320,10 @@ fn build_request_body(
     tools: &[serde_json::Value],
     thinking_level: Option<&str>,
     session_id: Option<&str>,
+    response_request_metadata: Option<&HashMap<String, serde_json::Value>>,
     options: CodexStreamOptions,
 ) -> serde_json::Value {
-    let input = build_input(history);
+    let input = build_input_with_metadata(history, response_request_metadata);
     let mut responses_tools = convert_tools(tools);
 
     if options.include_web_search {
@@ -356,7 +388,7 @@ fn build_history_request_input(
         .get("input")
         .and_then(|value| value.as_array())
         .cloned()
-        .unwrap_or_else(|| build_input(history));
+        .unwrap_or_else(|| build_input_with_metadata(history, response_request_metadata));
     let current_request = request_without_input(body);
 
     if let Some(response_request_metadata) = response_request_metadata {
@@ -380,7 +412,8 @@ fn build_history_request_input(
                 continue;
             }
 
-            let baseline = build_input(&history[..=index]);
+            let baseline =
+                build_input_with_metadata(&history[..=index], Some(response_request_metadata));
             if full_input.starts_with(&baseline) {
                 return ContinuationRequestInput {
                     input: full_input[baseline.len()..].to_vec(),
@@ -475,7 +508,7 @@ fn build_history_transport_request(
                 .get("input")
                 .and_then(|value| value.as_array())
                 .cloned()
-                .unwrap_or_else(|| build_input(history)),
+                .unwrap_or_else(|| build_input_with_metadata(history, response_request_metadata)),
             previous_response_id: None,
         }
     };
@@ -505,6 +538,168 @@ fn codex_responses_endpoint(base_url: Option<&str>) -> String {
     } else {
         format!("{base_url}{RESPONSES_ENDPOINT_PATH}")
     }
+}
+
+fn codex_compact_endpoint(base_url: Option<&str>) -> String {
+    format!("{}/compact", codex_responses_endpoint(base_url))
+}
+
+// `/responses/compact` is unary, so this covers the full response rather than
+// one idle period between stream events (codex-rs uses idle timeout x4).
+const COMPACT_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+
+pub struct CodexRemoteCompactOutcome {
+    pub encrypted_content: String,
+    pub output_item_count: usize,
+    pub raw_request: String,
+    pub raw_response: String,
+}
+
+/// Mirrors codex-rs `ApiCompactionInput`: the same shape as a normal Responses
+/// request minus `stream`/`store`, sent to the unary compact endpoint.
+fn build_compact_request_body(
+    model: &str,
+    system_prompt: &str,
+    history: &[ChatMessage],
+    tools: &[serde_json::Value],
+    thinking_level: Option<&str>,
+    session_id: Option<&str>,
+    response_request_metadata: Option<&HashMap<String, serde_json::Value>>,
+) -> serde_json::Value {
+    let input = build_input_with_metadata(history, response_request_metadata);
+    let mut body = serde_json::json!({
+        "model": model,
+        "input": input,
+        "tools": convert_tools(tools),
+        // Locus does not receive the server models manifest; codex-rs defaults
+        // ModelInfo.supports_parallel_tool_calls to false.
+        "parallel_tool_calls": false,
+    });
+    if !system_prompt.is_empty() {
+        body["instructions"] = serde_json::json!(system_prompt);
+    }
+    if let Some(sid) = session_id {
+        body["prompt_cache_key"] = serde_json::json!(sid);
+    }
+    apply_reasoning_effort(&mut body, model, thinking_level);
+    body
+}
+
+fn extract_compaction_encrypted_content(output: &[serde_json::Value]) -> Option<String> {
+    output
+        .iter()
+        .rev()
+        .find(|item| item.get("type").and_then(|value| value.as_str()) == Some("compaction"))
+        .and_then(|item| item.get("encrypted_content"))
+        .and_then(|value| value.as_str())
+        .filter(|content| !content.is_empty())
+        .map(|content| content.to_string())
+}
+
+/// Runs remote conversation compaction against the dedicated Codex
+/// `POST /responses/compact` endpoint (the default codex-rs strategy for
+/// ChatGPT subscription providers). Returns the encrypted compaction item that
+/// must be replayed to the API in subsequent requests.
+pub async fn compact_conversation_history(
+    access_token: &str,
+    account_id: Option<&str>,
+    base_url: Option<&str>,
+    model: &str,
+    system_prompt: &str,
+    history: &[ChatMessage],
+    tools: &[serde_json::Value],
+    thinking_level: Option<&str>,
+    session_id: Option<&str>,
+    response_request_metadata: Option<&HashMap<String, serde_json::Value>>,
+    debug: bool,
+) -> Result<CodexRemoteCompactOutcome, String> {
+    let body = build_compact_request_body(
+        model,
+        system_prompt,
+        history,
+        tools,
+        thinking_level,
+        session_id,
+        response_request_metadata,
+    );
+    let raw_request = serde_json::to_string_pretty(&body).unwrap_or_default();
+    let api_url = codex_compact_endpoint(base_url);
+
+    eprintln!(
+        "[OpenAI Codex][compact] POST model={} messages={} tools={}",
+        model,
+        history.len(),
+        tools.len()
+    );
+    if debug {
+        eprintln!(
+            "[DEBUG][OpenAI Codex][compact] request body:\n{}",
+            &raw_request
+        );
+        let mut headers: Vec<(&str, &str)> = vec![
+            ("Authorization", "Bearer <token>"),
+            ("Content-Type", "application/json"),
+            ("originator", CODEX_ORIGINATOR_HEADER_VALUE),
+            ("version", CODEX_CLIENT_VERSION),
+        ];
+        if let Some(aid) = account_id {
+            headers.push(("ChatGPT-Account-ID", aid));
+        }
+        super::debug::save_request("openai_codex_compact", &api_url, &headers, &raw_request);
+    }
+
+    let client = crate::network::reqwest_client(
+        crate::network::ReqwestClientOptions::new()
+            .tcp_keepalive(Duration::from_secs(20))
+            .connect_timeout(Duration::from_secs(30)),
+    )?;
+    let mut req = client
+        .post(&api_url)
+        .timeout(COMPACT_REQUEST_TIMEOUT)
+        .header("Authorization", format!("Bearer {}", access_token))
+        .header("Content-Type", "application/json")
+        .header("originator", CODEX_ORIGINATOR_HEADER_VALUE)
+        .header("version", CODEX_CLIENT_VERSION)
+        .json(&body);
+    if let Some(aid) = account_id {
+        req = req.header("ChatGPT-Account-ID", aid);
+    }
+
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("Codex compact request failed: {}", e))?;
+    let status = resp.status();
+    let response_text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(format!(
+            "OpenAI Codex API error ({} {}): {}",
+            status.as_u16(),
+            status.canonical_reason().unwrap_or(""),
+            response_text
+        ));
+    }
+
+    let parsed: serde_json::Value = serde_json::from_str(&response_text)
+        .map_err(|e| format!("Codex compact response was not valid JSON: {}", e))?;
+    let output = parsed
+        .get("output")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let Some(encrypted_content) = extract_compaction_encrypted_content(&output) else {
+        return Err(format!(
+            "Codex compact response contained no compaction item ({} output items)",
+            output.len()
+        ));
+    };
+
+    Ok(CodexRemoteCompactOutcome {
+        encrypted_content,
+        output_item_count: output.len(),
+        raw_request,
+        raw_response: response_text,
+    })
 }
 
 fn codex_websocket_url(base_url: Option<&str>) -> Result<Url, String> {
@@ -1796,6 +1991,9 @@ where
     G: Fn(String) + Send + Sync + 'static,
     H: Fn(String, String) + Send + Sync,
 {
+    // Compaction items must be replayed in every request shape (including full
+    // replay), so the body builder always receives the metadata map even when
+    // session continuation is disabled.
     let body = build_request_body(
         model,
         system_prompt,
@@ -1803,6 +2001,7 @@ where
         tools,
         thinking_level,
         session_id,
+        response_request_metadata,
         options,
     );
     let transport_session_id = options
@@ -2652,13 +2851,15 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        build_codex_websocket_handshake_request, build_history_transport_request, build_input,
+        build_codex_websocket_handshake_request, build_compact_request_body,
+        build_history_transport_request, build_input, build_input_with_metadata,
         build_request_body, build_websocket_transport_request, codex_websocket_url,
         collect_complete_tool_calls, drain_sse_buffer, establish_http_connect_tunnel,
-        process_sse_event_block, request_without_input, uri_host_port,
-        websocket_event_error_message, websocket_proxy_match_uri, CodexStreamOptions,
-        CodexStreamState, LastWebsocketResponse, PartialToolCall, CODEX_ORIGINATOR_HEADER_VALUE,
-        RESPONSES_WEBSOCKETS_V2_BETA_HEADER_VALUE, X_CODEX_TURN_STATE_HEADER,
+        extract_compaction_encrypted_content, process_sse_event_block, request_without_input,
+        uri_host_port, websocket_event_error_message, websocket_proxy_match_uri,
+        CodexStreamOptions, CodexStreamState, LastWebsocketResponse, PartialToolCall,
+        CODEX_ORIGINATOR_HEADER_VALUE, RESPONSES_WEBSOCKETS_V2_BETA_HEADER_VALUE,
+        X_CODEX_TURN_STATE_HEADER,
     };
     use crate::llm::CODEX_CLIENT_VERSION;
     use crate::session::models::{
@@ -3241,10 +3442,87 @@ mod tests {
             &[],
             None,
             None,
+            None,
             CodexStreamOptions::default(),
         );
 
         assert_eq!(body["text"]["verbosity"].as_str(), Some("low"));
+    }
+
+    #[test]
+    fn build_input_replays_codex_compaction_item_for_handoff_message() {
+        let handoff = assistant_message("handoff-1", "## Context Handoff\n\nlocal digest", None);
+        let user = user_message_with_images("继续", vec![]);
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "handoff-1".to_string(),
+            serde_json::json!({
+                "codex_compaction": { "encrypted_content": "opaque-blob" }
+            }),
+        );
+
+        let input = build_input_with_metadata(&[handoff.clone(), user], Some(&metadata));
+
+        assert_eq!(input[0]["type"].as_str(), Some("compaction"));
+        assert_eq!(input[0]["encrypted_content"].as_str(), Some("opaque-blob"));
+        assert!(
+            !input
+                .iter()
+                .any(|item| item["content"][0]["text"].as_str() == Some(handoff.content.as_str())),
+            "handoff text must not be sent alongside the compaction item"
+        );
+        assert_eq!(input[1]["role"].as_str(), Some("user"));
+
+        // Without metadata the handoff is sent as a regular assistant message.
+        let plain = build_input(&[handoff]);
+        assert_eq!(plain[0]["role"].as_str(), Some("assistant"));
+    }
+
+    #[test]
+    fn compact_request_body_matches_codex_compaction_input_shape() {
+        let body = build_compact_request_body(
+            "gpt-5.5",
+            "You are Codex",
+            &[user_message_with_images("排查阴影闪烁", vec![])],
+            &[serde_json::json!({
+                "type": "function",
+                "function": { "name": "read", "description": "Read file", "parameters": {} }
+            })],
+            Some("high"),
+            Some("session-1"),
+            None,
+        );
+
+        assert_eq!(body["model"].as_str(), Some("gpt-5.5"));
+        assert_eq!(body["instructions"].as_str(), Some("You are Codex"));
+        assert_eq!(body["prompt_cache_key"].as_str(), Some("session-1"));
+        assert_eq!(body["parallel_tool_calls"].as_bool(), Some(false));
+        assert_eq!(body["tools"][0]["name"].as_str(), Some("read"));
+        assert_eq!(body["reasoning"]["effort"].as_str(), Some("high"));
+        assert!(body.get("stream").is_none());
+        assert!(body.get("store").is_none());
+        assert!(body.get("type").is_none());
+    }
+
+    #[test]
+    fn extract_compaction_encrypted_content_takes_newest_compaction_item() {
+        let output = vec![
+            serde_json::json!({ "type": "message", "role": "user", "content": [] }),
+            serde_json::json!({ "type": "compaction", "encrypted_content": "old" }),
+            serde_json::json!({ "type": "compaction", "encrypted_content": "new" }),
+        ];
+        assert_eq!(
+            extract_compaction_encrypted_content(&output).as_deref(),
+            Some("new")
+        );
+        assert_eq!(
+            extract_compaction_encrypted_content(&[serde_json::json!({
+                "type": "compaction",
+                "encrypted_content": ""
+            })]),
+            None
+        );
+        assert_eq!(extract_compaction_encrypted_content(&[]), None);
     }
 
     #[test]
@@ -3257,6 +3535,7 @@ mod tests {
             &[],
             None,
             Some("session-1"),
+            None,
             options,
         );
 

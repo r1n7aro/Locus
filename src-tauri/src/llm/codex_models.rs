@@ -23,6 +23,10 @@ pub struct CodexAvailableModel {
     pub supported_efforts: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub additional_speed_tiers: Vec<String>,
+    /// Usable token budget derived from the /models manifest (context window
+    /// scaled by the server-advertised effective percentage).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_context_window: Option<u32>,
     pub is_default: bool,
 }
 
@@ -30,6 +34,10 @@ pub struct CodexAvailableModel {
 struct CodexModelsResponse {
     #[serde(default)]
     models: Vec<CodexRemoteModel>,
+}
+
+const fn default_effective_context_window_percent() -> i64 {
+    95
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,6 +56,39 @@ struct CodexRemoteModel {
     supported_reasoning_levels: Vec<CodexReasoningLevel>,
     #[serde(default)]
     additional_speed_tiers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    context_window: Option<i64>,
+    /// Maximum context window allowed for config overrides; fallback when
+    /// `context_window` is omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_context_window: Option<i64>,
+    /// Server-provided compaction threshold; carried for parity with Codex
+    /// even though Locus derives its own 90% trigger from the window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    auto_compact_token_limit: Option<i64>,
+    /// Percentage of the context window usable for inputs, after reserving
+    /// headroom for system prompts, tool overhead, and model output.
+    #[serde(default = "default_effective_context_window_percent")]
+    effective_context_window_percent: i64,
+}
+
+impl CodexRemoteModel {
+    /// Effective token budget: `context_window` (falling back to
+    /// `max_context_window`) scaled by `effective_context_window_percent`,
+    /// e.g. 272,000 × 95% = 258,400. Returns None when the manifest carries
+    /// no usable window so callers can fall back to static limits.
+    fn effective_context_window(&self) -> Option<u32> {
+        let resolved = self
+            .context_window
+            .or(self.max_context_window)
+            .filter(|window| *window > 0)?;
+        let percent = self.effective_context_window_percent;
+        if percent <= 0 {
+            return None;
+        }
+        let effective = resolved.saturating_mul(percent) / 100;
+        (effective > 0).then(|| effective.min(i64::from(u32::MAX)) as u32)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -172,6 +213,29 @@ async fn fetch_remote_models(
     })
 }
 
+/// Effective context window for a model id (`openai/<slug>` or bare slug),
+/// derived from the on-disk /models manifest cache. Deliberately ignores the
+/// cache TTL: even a stale manifest is authoritative over hardcoded
+/// per-family guesses, and the cache is refreshed whenever models are listed.
+pub fn cached_effective_context_window(cache_dir: &Path, model: &str) -> Option<u32> {
+    let key = normalize_model_key(model);
+    if key.is_empty() {
+        return None;
+    }
+    let cache = load_cache(cache_dir)?;
+    cache
+        .models
+        .iter()
+        .find(|model| normalize_model_key(&model.slug) == key)
+        .and_then(CodexRemoteModel::effective_context_window)
+}
+
+fn normalize_model_key(model: &str) -> String {
+    let trimmed = model.trim();
+    let trimmed = trimmed.strip_prefix("openai/").unwrap_or(trimmed);
+    trimmed.to_ascii_lowercase()
+}
+
 fn codex_models_endpoint(base_url: Option<&str>) -> String {
     let base_url = base_url
         .map(str::trim)
@@ -226,6 +290,7 @@ fn remote_model_to_available(model: CodexRemoteModel, is_default: bool) -> Codex
         .filter(|value| !value.is_empty())
         .unwrap_or(slug.as_str())
         .to_string();
+    let effective_context_window = model.effective_context_window();
     let supported_efforts = model
         .supported_reasoning_levels
         .into_iter()
@@ -242,6 +307,7 @@ fn remote_model_to_available(model: CodexRemoteModel, is_default: bool) -> Codex
         default_effort: model.default_reasoning_level,
         supported_efforts,
         additional_speed_tiers: model.additional_speed_tiers,
+        effective_context_window,
         is_default,
     }
 }
@@ -301,7 +367,8 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        codex_models_endpoint, remote_models_to_available, CodexReasoningLevel, CodexRemoteModel,
+        cached_effective_context_window, codex_models_endpoint, persist_cache,
+        remote_models_to_available, CodexReasoningLevel, CodexRemoteModel,
     };
 
     fn remote(slug: &str, priority: i32, visibility: &str) -> CodexRemoteModel {
@@ -320,6 +387,10 @@ mod tests {
                 },
             ],
             additional_speed_tiers: vec!["fast".to_string()],
+            context_window: None,
+            max_context_window: None,
+            auto_compact_token_limit: None,
+            effective_context_window_percent: 95,
         }
     }
 
@@ -354,5 +425,93 @@ mod tests {
         assert!(!models[1].is_default);
         assert_eq!(models[0].supported_efforts, vec!["low", "medium"]);
         assert_eq!(models[0].additional_speed_tiers, vec!["fast"]);
+    }
+
+    #[test]
+    fn remote_model_parses_context_window_metadata() {
+        let model: CodexRemoteModel = serde_json::from_value(serde_json::json!({
+            "slug": "gpt-5.3-codex-spark",
+            "context_window": 128_000,
+            "max_context_window": 272_000,
+            "auto_compact_token_limit": 115_200,
+            "effective_context_window_percent": 90
+        }))
+        .expect("parse remote model");
+
+        assert_eq!(model.context_window, Some(128_000));
+        assert_eq!(model.max_context_window, Some(272_000));
+        assert_eq!(model.auto_compact_token_limit, Some(115_200));
+        assert_eq!(model.effective_context_window_percent, 90);
+        assert_eq!(model.effective_context_window(), Some(115_200));
+    }
+
+    #[test]
+    fn remote_model_defaults_missing_context_window_metadata() {
+        let model: CodexRemoteModel =
+            serde_json::from_value(serde_json::json!({ "slug": "gpt-5.3-codex" }))
+                .expect("parse remote model");
+
+        assert_eq!(model.context_window, None);
+        assert_eq!(model.max_context_window, None);
+        assert_eq!(model.auto_compact_token_limit, None);
+        assert_eq!(model.effective_context_window_percent, 95);
+        assert_eq!(model.effective_context_window(), None);
+    }
+
+    #[test]
+    fn effective_context_window_scales_resolved_window_by_percent() {
+        let mut model = remote("gpt-5.3-codex", 1, "list");
+        model.context_window = Some(272_000);
+        assert_eq!(model.effective_context_window(), Some(258_400));
+
+        model.context_window = None;
+        model.max_context_window = Some(400_000);
+        assert_eq!(model.effective_context_window(), Some(380_000));
+
+        model.max_context_window = Some(-1);
+        assert_eq!(model.effective_context_window(), None);
+
+        model.context_window = Some(272_000);
+        model.max_context_window = None;
+        model.effective_context_window_percent = 0;
+        assert_eq!(model.effective_context_window(), None);
+    }
+
+    #[test]
+    fn available_models_carry_effective_context_window() {
+        let mut with_window = remote("gpt-5.3-codex-spark", 1, "list");
+        with_window.context_window = Some(272_000);
+        let models = remote_models_to_available(vec![with_window, remote("gpt-5.4", 2, "list")]);
+
+        assert_eq!(models[0].effective_context_window, Some(258_400));
+        assert_eq!(models[1].effective_context_window, None);
+    }
+
+    #[test]
+    fn cached_effective_context_window_reads_persisted_manifest() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let mut spark = remote("gpt-5.3-codex-spark", 1, "list");
+        spark.context_window = Some(200_000);
+        let plain = remote("gpt-5.3-codex", 2, "list");
+        persist_cache(dir.path(), &[spark, plain], None).expect("persist cache");
+
+        assert_eq!(
+            cached_effective_context_window(dir.path(), "openai/gpt-5.3-codex-spark"),
+            Some(190_000)
+        );
+        assert_eq!(
+            cached_effective_context_window(dir.path(), "GPT-5.3-Codex-Spark"),
+            Some(190_000)
+        );
+        // Manifest entries without window metadata yield None so callers can
+        // fall back to the static table, as do unknown models.
+        assert_eq!(
+            cached_effective_context_window(dir.path(), "openai/gpt-5.3-codex"),
+            None
+        );
+        assert_eq!(
+            cached_effective_context_window(dir.path(), "openai/unknown-model"),
+            None
+        );
     }
 }

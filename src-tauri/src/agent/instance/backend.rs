@@ -50,12 +50,14 @@ pub(super) fn model_context_limit(model: &str) -> u32 {
     let m = m.strip_prefix("openai/").unwrap_or(m);
     let m = m.to_ascii_lowercase();
     // Locus follows the effective context budget currently surfaced by Codex
-    // for ChatGPT subscription models, not the larger public API model-page limits.
+    // for ChatGPT subscription models, not the larger public API model-page
+    // limits. Codex-family variants (-spark, -mini, dated snapshots) share the
+    // runtime budget, so match them by family rather than exact version.
     if matches_versioned_model(&m, "gpt-5.5")
         || matches_versioned_model(&m, "gpt-5.5-pro")
         || matches_versioned_model(&m, "gpt-5.4")
         || matches_versioned_model(&m, "gpt-5.4-pro")
-        || matches_versioned_model(&m, "gpt-5.3-codex")
+        || (m.starts_with("gpt-5") && m.contains("codex"))
     {
         OPENAI_CODEX_CONTEXT_LIMIT
     } else if m.contains("gpt-5") {
@@ -117,6 +119,16 @@ mod tests {
         );
         assert_eq!(
             model_context_limit("openai/gpt-5.3-codex"),
+            OPENAI_CODEX_CONTEXT_LIMIT
+        );
+        // Codex-family speed/size variants share the runtime budget instead of
+        // falling through to the 400k general gpt-5 bucket.
+        assert_eq!(
+            model_context_limit("openai/gpt-5.3-codex-spark"),
+            OPENAI_CODEX_CONTEXT_LIMIT
+        );
+        assert_eq!(
+            model_context_limit("gpt-5.1-codex-mini"),
             OPENAI_CODEX_CONTEXT_LIMIT
         );
         assert_eq!(model_context_limit("gpt-5.2"), 400_000);

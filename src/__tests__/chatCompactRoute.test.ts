@@ -61,6 +61,23 @@ describe("chat compact route", () => {
     expect(streamEvents).toContain("context_limit: u32");
   });
 
+  it("warns with a banner when compaction reacts to a server context overflow", () => {
+    const chatStore = read("src/stores/chat.ts");
+    const streamEvents = read("src-tauri/src/commands/mod.rs");
+    const agentInstance = read("src-tauri/src/agent/instance/mod.rs");
+    const zh = read("src/language/zh.json");
+    const en = read("src/language/en.json");
+
+    expect(streamEvents).toContain("pub enum CompactTrigger");
+    expect(streamEvents).toContain("trigger: Option<CompactTrigger>");
+    expect(agentInstance).toContain("compact_trigger(force_compact, attempt_kind)");
+    expect(agentInstance).toContain("REACTIVE_COMPACT_ATTEMPT_KIND,");
+    expect(chatStore).toContain('event.type === "compactStart" && event.trigger === "reactive"');
+    expect(chatStore).toContain('addNotice("warning", t("chat.transcript.reactiveCompactNotice")');
+    expect(zh).toContain('"chat.transcript.reactiveCompactNotice"');
+    expect(en).toContain('"chat.transcript.reactiveCompactNotice"');
+  });
+
   it("renders compacted handoff messages as a transcript divider", () => {
     const transcript = read("src/components/chat/ChatTranscript.vue");
     const store = read("src-tauri/src/session/store.rs");
