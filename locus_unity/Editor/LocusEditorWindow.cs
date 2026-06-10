@@ -87,8 +87,9 @@ namespace Locus
         private long _lastSentParentHwnd;
         private long _controlRevision;
         private double _nextDesktopProbeAt;
-        private LocusDesktopInstall _desktopInstall = LocusDesktopInstall.NotFound;
-        private bool _desktopProcessRunning;
+        private volatile LocusDesktopInstall _desktopInstall = LocusDesktopInstall.NotFound;
+        private volatile bool _desktopProcessRunning;
+        private volatile bool _desktopProbeInFlight;
         private volatile bool _desktopLaunchInFlight;
         private volatile bool _assetDragStateSendInFlight;
         private string _connectedPipeName = "";
@@ -470,7 +471,7 @@ namespace Locus
             EnsureWindowIdentity();
             BeginControlEpoch();
             minSize = new Vector2(360f, 420f);
-            RefreshDesktopState(true);
+            RefreshDesktopState(false);
             if (OverlaySyncEnabled)
             {
                 EditorApplication.update += SyncOverlay;
@@ -1276,8 +1277,55 @@ namespace Locus
                 return;
 
             _nextDesktopProbeAt = now + DesktopProbeIntervalSeconds;
-            _desktopInstall = FindLocusDesktopInstall();
-            _desktopProcessRunning = IsLocusDesktopProcessRunning(_desktopInstall.ExecutablePath);
+
+            if (force)
+            {
+                _desktopInstall = ResolveDesktopInstall(_desktopInstall);
+                _desktopProcessRunning = IsLocusDesktopProcessRunning(_desktopInstall.ExecutablePath);
+                return;
+            }
+
+            // While the overlay pipe link is healthy, Locus desktop must be the
+            // connected pipe server, so the registry and process probes can be skipped.
+            if (_sentOpen && _failedSends == 0)
+            {
+                _desktopProcessRunning = true;
+                return;
+            }
+
+            if (_desktopProbeInFlight)
+                return;
+
+            _desktopProbeInFlight = true;
+            LocusDesktopInstall knownInstall = _desktopInstall;
+            Task.Run(() =>
+            {
+                try
+                {
+                    LocusDesktopInstall install = ResolveDesktopInstall(knownInstall);
+                    bool running = IsLocusDesktopProcessRunning(install.ExecutablePath);
+                    _desktopInstall = install;
+                    _desktopProcessRunning = running;
+                }
+                catch
+                {
+                }
+                finally
+                {
+                    _desktopProbeInFlight = false;
+                }
+            });
+        }
+
+        private static LocusDesktopInstall ResolveDesktopInstall(LocusDesktopInstall known)
+        {
+            if (known != null
+                && known.IsInstalled
+                && !string.IsNullOrEmpty(known.ExecutablePath)
+                && File.Exists(known.ExecutablePath))
+                return known;
+
+            return FindLocusDesktopInstall();
         }
 
         private bool ShouldShowStartButton()

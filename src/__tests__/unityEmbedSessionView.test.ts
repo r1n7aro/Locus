@@ -261,6 +261,14 @@ describe("Unity embedded session view", () => {
     expect(unityWindow).toContain("IntersectionArea");
   });
 
+  it("refreshes floating Unity overlay z-order when geometry is unchanged", () => {
+    const command = read("src-tauri/src/commands/unity_embed.rs");
+
+    expect(command).toContain("sync_popup_overlay_z_order(parent, child, target_rect);");
+    expect(command).toContain("fn sync_popup_overlay_z_order");
+    expect(command).toContain("SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOMOVE | SWP_NOSIZE");
+  });
+
   it("bridges Unity asset drops into the embedded composer attachment bar", () => {
     const unityWindow = read("locus_unity/Editor/LocusEditorWindow.cs");
     const app = read("src-tauri/src/lib.rs");

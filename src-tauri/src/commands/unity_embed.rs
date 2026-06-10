@@ -4172,7 +4172,9 @@ mod windows_impl {
                             && child_rect.bottom - child_rect.top == height
                     })
                     .unwrap_or(false);
-                if !child_matches {
+                if child_matches {
+                    sync_popup_overlay_z_order(parent, child, target_rect);
+                } else {
                     let insert_after = overlay_insert_after(parent, child, target_rect);
                     let _ = SetWindowPos(
                         child,
@@ -4294,6 +4296,19 @@ mod windows_impl {
         // order here creates a 16ms reorder loop. Anchoring Locus below the
         // lowest current blocker keeps Unity's own order stable.
         find_intersecting_window_above_parent(parent, child, target_rect).unwrap_or(HWND_TOP)
+    }
+
+    unsafe fn sync_popup_overlay_z_order(parent: HWND, child: HWND, target_rect: RECT) {
+        let insert_after = overlay_insert_after(parent, child, target_rect);
+        let _ = SetWindowPos(
+            child,
+            Some(insert_after),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOMOVE | SWP_NOSIZE,
+        );
     }
 
     fn find_intersecting_window_above_parent(
