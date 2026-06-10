@@ -1,9 +1,9 @@
 ---
 title: "当前版本"
-description: "Locus v0.3.2 (2026-06-07)"
+description: "Locus v0.4.0 (2026-06-11)"
 sidebarTitle: "当前版本"
-version: "0.3.2"
-releasedAt: "2026-06-07"
+version: "0.4.0"
+releasedAt: "2026-06-11"
 channel: "stable"
 updateTitle: "发现新版本"
 changelogUrl: "/overview/latest-version"
@@ -11,30 +11,36 @@ changelogUrl: "/overview/latest-version"
 
 ## 下载
 
-- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.3.2/locus_0.3.2_x64-setup.exe)
-- [Windows x64（系统 Python/Git）](https://github.com/r1n7aro/Locus/releases/download/v0.3.2/locus_0.3.2_x64-without_embed_python_git-setup.exe)
+- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.4.0/locus_0.4.0_x64-setup.exe)
+- [Windows x64（系统 Python/Git）](https://github.com/r1n7aro/Locus/releases/download/v0.4.0/locus_0.4.0_x64-without_embed_python_git-setup.exe)
 - [GitHub Releases](https://github.com/r1n7aro/Locus/releases)
 
 ## 变更列表
 
 ### 新增
 
-- 新增 Unity 对象预览与属性编辑能力，覆盖资产、场景对象、Prefab 对象和对象引用。
-- 新增 Unity 资产对象索引，资产搜索和对象引用选择器可以匹配 sub-asset、ScriptableObject 类型、组件和 file ID。
-- 新增 View Runtime API 版本化、运行时源码导出，以及 `property`、`fs`、`path`、drawer、对象引用选择器等 API。
-- 新增活跃聊天运行态快照恢复，切换或重新打开会话时保留运行中状态。
-- 新增 Markdown 中的工作区路径检测、Unity 对象引用和 Unity property fence 渲染。
-- 新增知识文档分段精确替换，并按可召回状态过滤自动注入候选。
+- 全新「插件」页面与插件 Hub：浏览插件注册表，搜索、安装、更新、启用/停用、卸载插件，可安装到 App 或单个项目。
+- 新增 /plugin 命令：在会话中输入 /plugin 加上需求，Agent 走完整插件工作流——生成插件清单与组件目录、打包、创建 GitHub 仓库并向注册表发起 Pull Request 完成发布。
+- 插件支持从本地 zip / 文件夹导入，也可直接粘贴仓库、release 或 zip 链接导入；支持配置多个插件注册表。
+- 插件页内置 GitHub 登录（浏览器授权）：提升 release 元数据请求额度、支持私有仓库、可为插件点 Star；Locus 现已自带 GitHub CLI。
+- 插件页内置帮助面板，讲解 /plugin、Skill 包与发布流程；Agent 也获得搜索、安装、启停、卸载插件的工具。
+- 新增 /ask-locus 内置技能：回答 Locus 本身的使用与原理问题，答案基于 Locus 源码与文档。
+- 新增确认清单：导出或发布插件等多字段操作前，Agent 弹出可编辑的确认清单，可逐项修改或整体驳回并附反馈。
+- 新增交互式终端命令：需要真实输入的命令（如 gh auth login、密码提示）会在可见终端窗口中打开，Windows 下支持 VT 转义。
+- 撤销历史跨重启保留，并能识别在 Locus 之外被修改过的文件。
+- 显示设置新增主界面控制，可隐藏欢迎区与顶部导航入口。
+- 知识浏览器改进导航与选中体验，新增按标题的兜底搜索。
+- 技能默认注入轻量摘要，完整内容按需加载；Codex 长会话支持远程压缩。
 
 ### 修复
 
-- 修复 Unity 拖放和本地文件拖放中的 Unicode 路径处理。
-- 将调试 trace 开关限定到 session storage。
-- 修复压缩后的 tool output 重复计数。
-- 加固知识查询、知识编辑和 Skill package 加载错误处理。
-- 收敛 hover diff preview 外观，并保护 Windows 圆角偏好设置。
-- 明确 Unity property fence 目标解析，并量化序列化数字拖拽。
+- 消息草稿不再丢失：发送失败会退回草稿框，刚开始的运行被取消时也能完整还原草稿。
+- 长回复流式输出时渲染更流畅。
+- 单轮变更文件列表会合并中间编辑，只显示净变更。
+- 插件管理的视图树更稳定，视图 id 校验与宿主同步更严格。
+- Unity：原生探测编辑器进程，减少嵌入探测与遮罩闪烁；资源搜索结果行对齐正确。
+- 每次执行 shell 命令前刷新 PATH，上一条命令安装的 CLI 可立即使用。
 
 ### 移除
 
-- 将旧的 View binding 工具面切换为 `view_property_*` 工具面。
+- 不再内置 Unity 技能 unity-editor-tooling 与 unity-project-setup。

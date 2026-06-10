@@ -1,9 +1,9 @@
 ---
 title: "Latest Version"
-description: "Locus v0.3.2 (2026-06-07)"
+description: "Locus v0.4.0 (2026-06-11)"
 sidebarTitle: "Latest Version"
-version: "0.3.2"
-releasedAt: "2026-06-07"
+version: "0.4.0"
+releasedAt: "2026-06-11"
 channel: "stable"
 updateTitle: "Update available"
 changelogUrl: "/en/overview/latest-version"
@@ -11,30 +11,36 @@ changelogUrl: "/en/overview/latest-version"
 
 ## Download
 
-- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.3.2/locus_0.3.2_x64-setup.exe)
-- [Windows x64 (system Python/Git)](https://github.com/r1n7aro/Locus/releases/download/v0.3.2/locus_0.3.2_x64-without_embed_python_git-setup.exe)
+- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.4.0/locus_0.4.0_x64-setup.exe)
+- [Windows x64 (system Python/Git)](https://github.com/r1n7aro/Locus/releases/download/v0.4.0/locus_0.4.0_x64-without_embed_python_git-setup.exe)
 - [GitHub Releases](https://github.com/r1n7aro/Locus/releases)
 
 ## Changes
 
 ### Added
 
-- Added Unity object previews and property editors for assets, scene objects, prefab objects, and object references.
-- Added Unity asset object indexing so search and object-reference pickers can match sub-assets, ScriptableObject types, components, and file IDs.
-- Added View Runtime API versioning, exported runtime source files, and expanded `property`, `fs`, `path`, drawer, and object-reference picker APIs.
-- Added active chat runtime snapshot restoration when switching or reopening sessions.
-- Added Markdown rendering for workspace path checks, Unity object references, and Unity property fences.
-- Added targeted section replacements for knowledge documents and filtered automatic recall by recall eligibility.
+- New Plugins page with a plugin Hub: browse the plugin registry, then search, install, update, enable/disable, and uninstall plugins, installed to the app or to a single project.
+- New /plugin command: type /plugin with a request in a session and the agent walks the whole plugin workflow — scaffolding the manifest and component folders, packaging, creating the GitHub repository, and opening a registry pull request to publish.
+- Plugins can be imported from a local zip or folder, or straight from a repository, release, or zip link; multiple plugin registries can be configured.
+- GitHub sign-in on the Plugins page (browser authorization) raises release metadata rate limits, enables private repositories, and lets you star plugins; GitHub CLI now ships with Locus.
+- Built-in help panel on the Plugins page covering /plugin, Skill packages, and the publish flow; the agent also gets tools to search, install, enable/disable, and uninstall plugins.
+- New /ask-locus built-in skill: answers questions about how Locus itself works, grounded in the Locus source and docs.
+- New confirmation sheets: before multi-field actions such as exporting or publishing a plugin, the agent presents an editable confirmation sheet where you adjust individual values inline or reject with feedback.
+- New interactive terminal commands: commands that need real typing (login wizards like gh auth login, password prompts) open in a visible terminal window, with VT support on Windows.
+- Undo history persists across app restarts and detects files modified outside Locus.
+- New display settings for the main interface: toggle the welcome area and top navigation entries.
+- Knowledge explorer navigation and selection improved, with title-based fallback search.
+- Skills inject a lightweight excerpt by default and load full content on demand; long Codex sessions support remote compaction.
 
 ### Fixed
 
-- Fixed Unicode path handling for Unity drag/drop and unrelated local file drops.
-- Scoped debug trace flags to session storage.
-- Prevented compacted tool output from being double-counted.
-- Hardened knowledge query/edit errors and Skill package loading.
-- Reduced hover diff preview chrome and guarded Windows corner preference.
-- Clarified Unity property fence targets and quantized serialized number drags.
+- Message drafts are no longer lost: a failed send returns to the draft box, and cancelling a just-started run restores the draft cleanly.
+- Smoother rendering while long replies stream in.
+- The changed-files list for a turn now nets out intermediate edits.
+- Plugin-managed view trees stay stable, with stricter view id validation and host sync.
+- Unity: editor processes are detected natively with less embed probing and overlay churn, and asset search result rows align correctly.
+- Shell PATH refreshes on every call, so a CLI installed by a previous command is immediately available.
 
 ### Removed
 
-- Replaced the legacy View binding tool surface with `view_property_*` tools.
+- The bundled Unity skills unity-editor-tooling and unity-project-setup are no longer shipped.

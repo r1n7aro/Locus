@@ -1,12 +1,12 @@
 {
-  "version": "0.3.2",
-  "releasedAt": "2026-06-07",
+  "version": "0.4.0",
+  "releasedAt": "2026-06-11",
   "channel": "stable",
   "installers": [
     {
       "id": "windows-x64",
       "label": "Windows x64",
-      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.3.2/locus_0.3.2_x64-setup.exe",
+      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.4.0/locus_0.4.0_x64-setup.exe",
       "platform": "windows",
       "arch": "x64",
       "includesManagedPython": true,
@@ -17,7 +17,7 @@
     {
       "id": "windows-x64-without-embed-python-git",
       "label": "Windows x64 - system Python/Git",
-      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.3.2/locus_0.3.2_x64-without_embed_python_git-setup.exe",
+      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.4.0/locus_0.4.0_x64-without_embed_python_git-setup.exe",
       "platform": "windows",
       "arch": "x64",
       "includesManagedPython": false,
@@ -29,46 +29,52 @@
   "locales": {
     "zh": {
       "title": "发现新版本",
-      "summary": "Locus v0.3.2 (2026-06-07)",
+      "summary": "Locus v0.4.0 (2026-06-11)",
       "changelogUrl": "/overview/latest-version",
       "changes": [
         {
           "title": "新增",
           "items": [
-            "新增 Unity 对象预览与属性编辑能力，覆盖资产、场景对象、Prefab 对象和对象引用。",
-            "新增 Unity 资产对象索引，资产搜索和对象引用选择器可以匹配 sub-asset、ScriptableObject 类型、组件和 file ID。",
-            "新增 View Runtime API 版本化、运行时源码导出，以及 `property`、`fs`、`path`、drawer、对象引用选择器等 API。",
-            "新增活跃聊天运行态快照恢复，切换或重新打开会话时保留运行中状态。",
-            "新增 Markdown 中的工作区路径检测、Unity 对象引用和 Unity property fence 渲染。",
-            "新增知识文档分段精确替换，并按可召回状态过滤自动注入候选。"
+            "全新「插件」页面与插件 Hub：浏览插件注册表，搜索、安装、更新、启用/停用、卸载插件，可安装到 App 或单个项目。",
+            "新增 /plugin 命令：在会话中输入 /plugin 加上需求，Agent 走完整插件工作流——生成插件清单与组件目录、打包、创建 GitHub 仓库并向注册表发起 Pull Request 完成发布。",
+            "插件支持从本地 zip / 文件夹导入，也可直接粘贴仓库、release 或 zip 链接导入；支持配置多个插件注册表。",
+            "插件页内置 GitHub 登录（浏览器授权）：提升 release 元数据请求额度、支持私有仓库、可为插件点 Star；Locus 现已自带 GitHub CLI。",
+            "插件页内置帮助面板，讲解 /plugin、Skill 包与发布流程；Agent 也获得搜索、安装、启停、卸载插件的工具。",
+            "新增 /ask-locus 内置技能：回答 Locus 本身的使用与原理问题，答案基于 Locus 源码与文档。",
+            "新增确认清单：导出或发布插件等多字段操作前，Agent 弹出可编辑的确认清单，可逐项修改或整体驳回并附反馈。",
+            "新增交互式终端命令：需要真实输入的命令（如 gh auth login、密码提示）会在可见终端窗口中打开，Windows 下支持 VT 转义。",
+            "撤销历史跨重启保留，并能识别在 Locus 之外被修改过的文件。",
+            "显示设置新增主界面控制，可隐藏欢迎区与顶部导航入口。",
+            "知识浏览器改进导航与选中体验，新增按标题的兜底搜索。",
+            "技能默认注入轻量摘要，完整内容按需加载；Codex 长会话支持远程压缩。"
           ]
         },
         {
           "title": "修复",
           "items": [
-            "修复 Unity 拖放和本地文件拖放中的 Unicode 路径处理。",
-            "将调试 trace 开关限定到 session storage。",
-            "修复压缩后的 tool output 重复计数。",
-            "加固知识查询、知识编辑和 Skill package 加载错误处理。",
-            "收敛 hover diff preview 外观，并保护 Windows 圆角偏好设置。",
-            "明确 Unity property fence 目标解析，并量化序列化数字拖拽。"
+            "消息草稿不再丢失：发送失败会退回草稿框，刚开始的运行被取消时也能完整还原草稿。",
+            "长回复流式输出时渲染更流畅。",
+            "单轮变更文件列表会合并中间编辑，只显示净变更。",
+            "插件管理的视图树更稳定，视图 id 校验与宿主同步更严格。",
+            "Unity：原生探测编辑器进程，减少嵌入探测与遮罩闪烁；资源搜索结果行对齐正确。",
+            "每次执行 shell 命令前刷新 PATH，上一条命令安装的 CLI 可立即使用。"
           ]
         },
         {
           "title": "移除",
           "items": [
-            "将旧的 View binding 工具面切换为 `view_property_*` 工具面。"
+            "不再内置 Unity 技能 unity-editor-tooling 与 unity-project-setup。"
           ]
         }
       ],
       "downloadChannels": [
         {
           "label": "Windows x64",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.3.2/locus_0.3.2_x64-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.4.0/locus_0.4.0_x64-setup.exe"
         },
         {
           "label": "Windows x64（系统 Python/Git）",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.3.2/locus_0.3.2_x64-without_embed_python_git-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.4.0/locus_0.4.0_x64-without_embed_python_git-setup.exe"
         },
         {
           "label": "GitHub Releases",
@@ -78,46 +84,52 @@
     },
     "en": {
       "title": "Update available",
-      "summary": "Locus v0.3.2 (2026-06-07)",
+      "summary": "Locus v0.4.0 (2026-06-11)",
       "changelogUrl": "/en/overview/latest-version",
       "changes": [
         {
           "title": "Added",
           "items": [
-            "Added Unity object previews and property editors for assets, scene objects, prefab objects, and object references.",
-            "Added Unity asset object indexing so search and object-reference pickers can match sub-assets, ScriptableObject types, components, and file IDs.",
-            "Added View Runtime API versioning, exported runtime source files, and expanded `property`, `fs`, `path`, drawer, and object-reference picker APIs.",
-            "Added active chat runtime snapshot restoration when switching or reopening sessions.",
-            "Added Markdown rendering for workspace path checks, Unity object references, and Unity property fences.",
-            "Added targeted section replacements for knowledge documents and filtered automatic recall by recall eligibility."
+            "New Plugins page with a plugin Hub: browse the plugin registry, then search, install, update, enable/disable, and uninstall plugins, installed to the app or to a single project.",
+            "New /plugin command: type /plugin with a request in a session and the agent walks the whole plugin workflow — scaffolding the manifest and component folders, packaging, creating the GitHub repository, and opening a registry pull request to publish.",
+            "Plugins can be imported from a local zip or folder, or straight from a repository, release, or zip link; multiple plugin registries can be configured.",
+            "GitHub sign-in on the Plugins page (browser authorization) raises release metadata rate limits, enables private repositories, and lets you star plugins; GitHub CLI now ships with Locus.",
+            "Built-in help panel on the Plugins page covering /plugin, Skill packages, and the publish flow; the agent also gets tools to search, install, enable/disable, and uninstall plugins.",
+            "New /ask-locus built-in skill: answers questions about how Locus itself works, grounded in the Locus source and docs.",
+            "New confirmation sheets: before multi-field actions such as exporting or publishing a plugin, the agent presents an editable confirmation sheet where you adjust individual values inline or reject with feedback.",
+            "New interactive terminal commands: commands that need real typing (login wizards like gh auth login, password prompts) open in a visible terminal window, with VT support on Windows.",
+            "Undo history persists across app restarts and detects files modified outside Locus.",
+            "New display settings for the main interface: toggle the welcome area and top navigation entries.",
+            "Knowledge explorer navigation and selection improved, with title-based fallback search.",
+            "Skills inject a lightweight excerpt by default and load full content on demand; long Codex sessions support remote compaction."
           ]
         },
         {
           "title": "Fixed",
           "items": [
-            "Fixed Unicode path handling for Unity drag/drop and unrelated local file drops.",
-            "Scoped debug trace flags to session storage.",
-            "Prevented compacted tool output from being double-counted.",
-            "Hardened knowledge query/edit errors and Skill package loading.",
-            "Reduced hover diff preview chrome and guarded Windows corner preference.",
-            "Clarified Unity property fence targets and quantized serialized number drags."
+            "Message drafts are no longer lost: a failed send returns to the draft box, and cancelling a just-started run restores the draft cleanly.",
+            "Smoother rendering while long replies stream in.",
+            "The changed-files list for a turn now nets out intermediate edits.",
+            "Plugin-managed view trees stay stable, with stricter view id validation and host sync.",
+            "Unity: editor processes are detected natively with less embed probing and overlay churn, and asset search result rows align correctly.",
+            "Shell PATH refreshes on every call, so a CLI installed by a previous command is immediately available."
           ]
         },
         {
           "title": "Removed",
           "items": [
-            "Replaced the legacy View binding tool surface with `view_property_*` tools."
+            "The bundled Unity skills unity-editor-tooling and unity-project-setup are no longer shipped."
           ]
         }
       ],
       "downloadChannels": [
         {
           "label": "Windows x64",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.3.2/locus_0.3.2_x64-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.4.0/locus_0.4.0_x64-setup.exe"
         },
         {
           "label": "Windows x64 (system Python/Git)",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.3.2/locus_0.3.2_x64-without_embed_python_git-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.4.0/locus_0.4.0_x64-without_embed_python_git-setup.exe"
         },
         {
           "label": "GitHub Releases",
