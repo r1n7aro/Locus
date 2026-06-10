@@ -16,6 +16,7 @@ const DEV_WITH_MCP_COMMAND = "dev-mcp";
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(scriptDir, "..");
 const srcTauriDir = path.join(repoRoot, "src-tauri");
+const tauriCliScript = path.join(repoRoot, "node_modules", "@tauri-apps", "cli", "tauri.js");
 const DEFAULT_RELEASE_FLAVOR_CONFIG = path.relative(
   repoRoot,
   path.join(srcTauriDir, "tauri.with_embed_python_git.conf.json"),
@@ -193,7 +194,13 @@ function getTauriCommand(currentArgs) {
 
 function runTauriCli() {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, ["x", "tauri", ...tauriArgs], {
+    if (!existsSync(tauriCliScript)) {
+      console.error(`[locus] Tauri CLI not found at ${tauriCliScript}. Run "bun install" first.`);
+      resolve({ code: 1, signal: null });
+      return;
+    }
+
+    const child = spawn(process.execPath, [tauriCliScript, ...tauriArgs], {
       stdio: "inherit",
       env,
     });
