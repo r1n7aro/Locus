@@ -586,6 +586,49 @@ impl KnowledgeDb {
         query_document_catalog_rows(&mut stmt, params_from_iter(doc_ids.iter()))
     }
 
+    pub fn search_document_catalog_entries_by_title_or_path(
+        &self,
+        needle: &str,
+        doc_types: Option<&[String]>,
+        path_prefix: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<DocumentCatalogRow>, String> {
+        let needle = needle.trim();
+        if needle.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let pattern = format!("%{}%", escape_like_pattern(needle));
+        let mut sql = String::from(
+            "SELECT doc_id, doc_type, doc_path, parent_path, title, updated_at, estimated_tokens, payload_json
+             FROM document_catalog
+             WHERE (title LIKE ? ESCAPE '\\' OR doc_path LIKE ? ESCAPE '\\')",
+        );
+        let mut params: Vec<rusqlite::types::Value> = vec![pattern.clone().into(), pattern.into()];
+
+        if let Some(doc_types) = doc_types.filter(|values| !values.is_empty()) {
+            sql.push_str(&format!(
+                " AND doc_type IN ({})",
+                sql_placeholders(doc_types.len())
+            ));
+            for doc_type in doc_types {
+                params.push(doc_type.clone().into());
+            }
+        }
+        if let Some(path_prefix) = path_prefix {
+            let (exact_prefix, like_prefix) = doc_path_prefix_params(path_prefix);
+            sql.push_str(" AND (doc_path = ? OR doc_path LIKE ?)");
+            params.push(exact_prefix.into());
+            params.push(like_prefix.into());
+        }
+        sql.push_str(" ORDER BY doc_type, doc_path, title, doc_id LIMIT ?");
+        params.push((limit.min(i64::MAX as usize) as i64).into());
+
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+        query_document_catalog_rows(&mut stmt, params_from_iter(params))
+    }
+
     pub fn find_document_catalog_entries_by_path(
         &self,
         doc_type: &str,
@@ -1629,6 +1672,13 @@ fn sql_placeholders(count: usize) -> String {
         .take(count)
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+fn escape_like_pattern(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
 }
 
 fn doc_path_prefix_params(doc_path_prefix: &str) -> (String, String) {

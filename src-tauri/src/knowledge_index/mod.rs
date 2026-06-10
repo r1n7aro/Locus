@@ -3410,7 +3410,24 @@ where
 
     let query_limit = limit.max(1).min(50);
     let lexical_query = lexical_query.filter(|value| !value.trim().is_empty());
-    let (lexical_hits, lexical_kind) = match lexical_query {
+
+    // Document name matching stays available regardless of the lexical and
+    // semantic index toggles so short queries (e.g. a single CJK character)
+    // can still hit exact titles and file names.
+    let catalog_title_hits = match lexical_query {
+        Some(value) => {
+            emit_query_progress(
+                &mut on_progress,
+                "Matching document names",
+                truncate_query_progress_info(value, 80),
+                0.22,
+            );
+            catalog_title_search_documents(&db, value, types, path_prefix, query_limit * 6)?
+        }
+        None => Vec::new(),
+    };
+
+    let (mut lexical_hits, lexical_kind) = match lexical_query {
         Some(value) if general_config.lexical_search_enabled => {
             emit_query_progress(
                 &mut on_progress,
@@ -3440,24 +3457,46 @@ where
                 truncate_query_progress_info(value, 80),
                 0.28,
             );
-            (
-                text_scan_search_documents_with_progress(
-                    working_dir,
-                    app_knowledge_dir,
-                    value,
-                    types,
-                    path_prefix,
-                    query_limit * 6,
-                    include_hidden,
-                    text_scan_timeout,
-                    &mut on_progress,
-                )
-                .await?,
-                Some(KeywordSearchKind::TextScan),
+            match text_scan_search_documents_with_progress(
+                working_dir,
+                app_knowledge_dir,
+                value,
+                types,
+                path_prefix,
+                query_limit * 6,
+                include_hidden,
+                text_scan_timeout,
+                &mut on_progress,
             )
+            .await
+            {
+                Ok(hits) => (hits, Some(KeywordSearchKind::TextScan)),
+                Err(error) if !catalog_title_hits.is_empty() => {
+                    emit_query_progress(
+                        &mut on_progress,
+                        "Text scan unavailable; keeping document name matches",
+                        truncate_query_progress_info(&error, 160),
+                        0.44,
+                    );
+                    (Vec::new(), Some(KeywordSearchKind::TextScan))
+                }
+                Err(error) => return Err(error),
+            }
         }
         None => (Vec::new(), None),
     };
+
+    if !catalog_title_hits.is_empty() {
+        let mut seen_doc_ids = lexical_hits
+            .iter()
+            .map(|hit| hit.doc_id.clone())
+            .collect::<HashSet<_>>();
+        for hit in catalog_title_hits {
+            if seen_doc_ids.insert(hit.doc_id.clone()) {
+                lexical_hits.push(hit);
+            }
+        }
+    }
     emit_query_progress(
         &mut on_progress,
         "Checking semantic search",
@@ -4623,6 +4662,107 @@ fn needs_embedding_backfill(db: &KnowledgeDb, doc_id: &str) -> Result<bool, Stri
     }
     let embedding_count = db.count_embeddings_for_doc(doc_id)?;
     Ok(embedding_count < chunk_count)
+}
+
+fn title_path_match_score(needle: &str, title: &str, path: &str) -> Option<f32> {
+    let title = title.to_lowercase();
+    let path = path.to_lowercase();
+    let file_name = path.rsplit('/').next().unwrap_or(path.as_str());
+    let file_stem = file_name
+        .rsplit_once('.')
+        .map(|(stem, _)| stem)
+        .unwrap_or(file_name);
+
+    if title == needle {
+        return Some(10.0);
+    }
+    if file_stem == needle || file_name == needle {
+        return Some(9.0);
+    }
+    if title.starts_with(needle) {
+        return Some(8.0);
+    }
+    if file_name.starts_with(needle) {
+        return Some(7.0);
+    }
+    if title.contains(needle) {
+        return Some(6.0);
+    }
+    if file_name.contains(needle) {
+        return Some(5.0);
+    }
+    if path.contains(needle) {
+        return Some(4.0);
+    }
+    None
+}
+
+/// Substring match over catalog titles and paths. Unlike the tantivy index
+/// (2-3 char n-grams) and semantic recall (>= 2 chars), this stays usable for
+/// single-character queries and does not depend on the search index toggles.
+fn catalog_title_search_documents(
+    db: &KnowledgeDb,
+    query: &str,
+    types: Option<&[KnowledgeType]>,
+    path_prefix: Option<&str>,
+    limit: usize,
+) -> Result<Vec<LexicalHit>, String> {
+    let needle = query.trim().to_lowercase();
+    if needle.is_empty() || limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    let type_names = types.map(|values| {
+        values
+            .iter()
+            .map(|value| value.as_str().to_string())
+            .collect::<Vec<_>>()
+    });
+    let rows = db.search_document_catalog_entries_by_title_or_path(
+        &needle,
+        type_names.as_deref(),
+        path_prefix,
+        limit.saturating_mul(2),
+    )?;
+
+    let mut scored = Vec::with_capacity(rows.len());
+    for row in rows {
+        let Some(score) = title_path_match_score(&needle, &row.title, &row.doc_path) else {
+            continue;
+        };
+        scored.push((score, row));
+    }
+    scored.sort_by(|left, right| {
+        right
+            .0
+            .partial_cmp(&left.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.1.doc_path.cmp(&right.1.doc_path))
+    });
+    scored.truncate(limit);
+
+    Ok(scored
+        .into_iter()
+        .map(|(score, row)| {
+            let snippet = if row.title.to_lowercase().contains(&needle) {
+                row.title.clone()
+            } else {
+                row.doc_path.clone()
+            };
+            LexicalHit {
+                matched_terms: knowledge_store::matched_text_terms_in_fields(
+                    query,
+                    [row.title.as_str(), row.doc_path.as_str()],
+                ),
+                doc_id: row.doc_id,
+                section: String::new(),
+                title: row.title,
+                path: row.doc_path,
+                score,
+                snippet,
+            }
+        })
+        .collect())
 }
 
 fn lexical_index_search_documents(
@@ -6037,6 +6177,126 @@ mod tests {
                 && hit.matched_terms.contains(&"战斗核心".to_string())
         }));
         assert!(indexed_hits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn query_documents_matches_single_char_document_name_with_lexical_index_enabled() {
+        let workspace = tempdir().expect("workspace");
+        let working_dir = workspace.path().to_string_lossy().to_string();
+        seed_design_document(&working_dir);
+        save_design_document(
+            &working_dir,
+            "kd_single_char_doc",
+            "notes/的.md",
+            "的",
+            None,
+            "是是",
+            1,
+        );
+        save_test_general_config(&working_dir, true, false);
+        let state = create_state(&working_dir);
+
+        let hits = query_documents(
+            &working_dir,
+            None,
+            Some("的"),
+            None,
+            None,
+            None,
+            5,
+            false,
+            state.clone(),
+        )
+        .await
+        .expect("query documents");
+        let indexed_hits = state
+            .tantivy()
+            .search("的", 5, 2.0)
+            .expect("query tantivy directly");
+
+        // The 2-3 char n-gram index cannot represent a single-character query;
+        // the catalog name fallback has to supply the hit.
+        assert!(indexed_hits.is_empty());
+        let hit = hits
+            .iter()
+            .find(|hit| hit.id == "kd_single_char_doc")
+            .expect("single char title should match by document name");
+        assert_eq!(hit.match_kind, "lexical");
+        assert!(hit.matched_terms.contains(&"的".to_string()));
+        assert!(!hits.iter().any(|hit| hit.id == "kd_test_design_doc"));
+    }
+
+    #[tokio::test]
+    async fn query_documents_matches_single_char_document_name_when_indexes_disabled() {
+        let workspace = tempdir().expect("workspace");
+        let working_dir = workspace.path().to_string_lossy().to_string();
+        save_design_document(
+            &working_dir,
+            "kd_single_char_doc",
+            "notes/的.md",
+            "的",
+            None,
+            "是是",
+            1,
+        );
+        save_test_general_config(&working_dir, false, false);
+        let state = create_state(&working_dir);
+
+        let hits = query_documents(
+            &working_dir,
+            None,
+            Some("的"),
+            None,
+            None,
+            None,
+            5,
+            false,
+            state,
+        )
+        .await
+        .expect("query documents");
+
+        let hit = hits
+            .iter()
+            .find(|hit| hit.id == "kd_single_char_doc")
+            .expect("single char title should match without any index");
+        assert!(hit.matched_terms.contains(&"的".to_string()));
+    }
+
+    #[tokio::test]
+    async fn query_documents_returns_document_name_matches_when_text_scan_limit_exceeded() {
+        let workspace = tempdir().expect("workspace");
+        let working_dir = workspace.path().to_string_lossy().to_string();
+        let document_count = KNOWLEDGE_QUERY_TEXT_SCAN_MAX_DOCUMENTS + 1;
+        for index in 0..document_count {
+            save_design_document(
+                &working_dir,
+                &format!("kd_limit_doc_{:03}", index),
+                &format!("large/doc-{:03}.md", index),
+                &format!("Large Doc {:03}", index),
+                Some("共享检索词 limit summary"),
+                "共享检索词 limit body",
+                1,
+            );
+        }
+        save_test_general_config(&working_dir, false, false);
+        let state = create_state(&working_dir);
+
+        let hits = query_documents(
+            &working_dir,
+            None,
+            Some("doc-000"),
+            None,
+            Some(&[KnowledgeType::Design]),
+            None,
+            5,
+            false,
+            state,
+        )
+        .await
+        .expect("document name matches should survive the text scan limit");
+
+        assert!(hits.iter().any(|hit| hit.id == "kd_limit_doc_000"));
     }
 
     #[tokio::test]
