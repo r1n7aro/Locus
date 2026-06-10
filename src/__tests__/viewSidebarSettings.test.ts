@@ -84,7 +84,7 @@ describe("View sidebar settings", () => {
     expect(zh).toContain('"view.tree.rename": "重命名"');
     expect(en).toContain('"view.tree.createFolder": "New Folder"');
     expect(en).toContain('"view.tree.rename": "Rename"');
-    expect(zh).toContain('"view.action.reveal": "在文件游览器中显示"');
+    expect(zh).toContain('"view.action.reveal": "在文件浏览器中显示"');
     expect(en).toContain('"view.action.reveal": "Show in File Explorer"');
   });
 

@@ -67,6 +67,7 @@ interface VisibleViewRow {
 }
 
 type VisibleViewEntry =
+  | { type: "empty-folder"; key: string; depth: number }
   | { type: "row"; key: string; row: VisibleViewRow }
   | { type: "create"; key: string; draft: ViewCreateFolderDraft };
 
@@ -219,8 +220,16 @@ const visibleViewEntries = computed<VisibleViewEntry[]>(() => {
           draft: createFolderDraft.value,
         });
       }
-      if (node.kind === "folder" && expanded && hasChildren) {
-        walk(node.children, depth + 1);
+      if (node.kind === "folder" && expanded) {
+        if (hasChildren) {
+          walk(node.children, depth + 1);
+        } else {
+          entries.push({
+            type: "empty-folder",
+            key: `view-empty:${node.key}`,
+            depth: depth + 1,
+          });
+        }
       }
     }
   };
@@ -1483,13 +1492,10 @@ onUnmounted(() => {
                     dragTargetPosition === 'after',
                 }"
                 draggable="false"
+                :style="{ '--view-tree-row-indent': `${treeIndentPx(entry.row.depth)}px` }"
                 :data-view-node-key="entry.row.node.key"
                 :data-view-node-kind="entry.row.node.kind"
-                :title="
-                  entry.row.node.view?.packageRoot ||
-                  entry.row.node.folder?.packageRoot ||
-                  entry.row.node.label
-                "
+                :title="entry.row.node.label"
                 @pointerdown="onTreePointerDown(entry.row, $event)"
                 @contextmenu.prevent.stop="openTreeContextMenu($event, entry.row)"
                 @dragstart="onTreeDragStart(entry.row, $event)"
@@ -1570,7 +1576,7 @@ onUnmounted(() => {
                   @click="selectTreeRow(entry.row, $event)"
                 >
                   <span
-                    v-if="entry.row.node.kind === 'folder' && entry.row.hasChildren"
+                    v-if="entry.row.node.kind === 'folder'"
                     class="view-tree-branch-slot"
                     @click.stop="toggleRow(entry.row)"
                   >
@@ -1636,6 +1642,15 @@ onUnmounted(() => {
               </div>
 
               <div
+                v-else-if="entry.type === 'empty-folder'"
+                class="view-tree-empty-folder-row"
+                :style="{ paddingLeft: `${treeIndentPx(entry.depth)}px` }"
+              >
+                <span class="view-tree-branch-spacer" aria-hidden="true"></span>
+                <span class="view-tree-empty-folder-text">{{ t("view.tree.emptyFolder") }}</span>
+              </div>
+
+              <div
                 v-else
                 class="view-tree-create-row"
                 :style="{ paddingLeft: `${treeIndentPx(entry.draft.depth)}px` }"
@@ -1680,7 +1695,7 @@ onUnmounted(() => {
             <div v-else-if="!viewTreeNodes.length && !loading && !createFolderDraft" class="view-empty">
               {{ t("view.list.empty") }}
             </div>
-            <div v-if="loading" class="view-empty">{{ t("common.loading") }}</div>
+            <div v-if="loading && !visibleViewEntries.length" class="view-empty">{{ t("common.loading") }}</div>
           </div>
         </aside>
 
@@ -1979,7 +1994,7 @@ onUnmounted(() => {
 .view-tree-row-shell.drop-after::after {
   content: "";
   position: absolute;
-  left: 8px;
+  left: var(--view-tree-row-indent, 8px);
   right: 8px;
   height: 2px;
   border-radius: 2px;
@@ -2166,6 +2181,24 @@ onUnmounted(() => {
   color: var(--status-danger-fg);
   font-size: 11px;
   line-height: 1.35;
+}
+
+.view-tree-empty-folder-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 24px;
+  padding: 2px 12px 2px 16px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  opacity: 0.75;
+}
+
+.view-tree-empty-folder-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .view-tree-create-row {
