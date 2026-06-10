@@ -78,11 +78,17 @@ where
     F: FnMut(&Guid) -> Option<ScriptTypeInfo>,
 {
     let mut out = Vec::new();
+    let mut seen_file_ids = HashSet::new();
     for doc in docs {
         if doc.file_id == 0 {
             continue;
         }
         if !yaml_doc_should_index_asset_object(asset, doc) {
+            continue;
+        }
+        // Duplicate fileIDs (e.g. botched merges) would collide on
+        // object_key and strand the first copy's FTS row — first doc wins.
+        if !seen_file_ids.insert(doc.file_id) {
             continue;
         }
         let script_type = doc
@@ -154,6 +160,21 @@ where
     out
 }
 
+/// A non-main YAML doc is a Unity sub-asset only when it is addressable from
+/// outside its file: extra documents of a multi-object `.asset`, or
+/// AudioMixer group/snapshot controllers (class 243/245). Scene/prefab
+/// interiors (GameObjects, components, prefab instances) and controller
+/// state machines are not — nothing can reference them cross-file, and every
+/// `asset_objects` reader filters on `searchable = 1`, so persisting them
+/// produced write-only rows (a 57 MiB scene expanded into ~35k rows and
+/// stalled the watcher's FTS delete path).
+fn yaml_doc_is_sub_asset(asset: &AssetNode, doc: &YamlDoc) -> bool {
+    if asset.kind == AssetKind::GenericAsset {
+        return true;
+    }
+    matches!(doc.class_id, 243 | 245)
+}
+
 fn yaml_doc_should_index_asset_object(asset: &AssetNode, doc: &YamlDoc) -> bool {
     if doc.doc_index == 0 {
         return true;
@@ -161,17 +182,14 @@ fn yaml_doc_should_index_asset_object(asset: &AssetNode, doc: &YamlDoc) -> bool 
     if asset.ext.eq_ignore_ascii_case("playable") {
         return false;
     }
-    true
+    yaml_doc_is_sub_asset(asset, doc)
 }
 
 fn yaml_doc_is_searchable_sub_asset(asset: &AssetNode, doc: &YamlDoc) -> bool {
     if !asset.exists_on_disk || doc.doc_index == 0 {
         return false;
     }
-    if asset.kind == AssetKind::GenericAsset {
-        return true;
-    }
-    matches!(doc.class_id, 243 | 245)
+    yaml_doc_is_sub_asset(asset, doc)
 }
 
 pub(crate) fn build_importer_sub_asset_objects(
@@ -608,11 +626,12 @@ mod tests {
         ];
 
         let objects = build_yaml_asset_objects(&asset, &docs, |_| None);
-        assert_eq!(objects.len(), 4);
+        // Main doc + group + snapshot. The effect controller (class 244) is
+        // not addressable from outside the mixer, so it is not persisted.
+        assert_eq!(objects.len(), 3);
         assert!(!objects[0].searchable);
         assert!(objects[1].searchable);
         assert!(objects[2].searchable);
-        assert!(!objects[3].searchable);
         assert!(objects[1].is_sub_asset);
         assert_eq!(objects[1].name, "Music");
         assert_eq!(objects[1].type_name, "AudioMixerGroupController");
@@ -622,6 +641,36 @@ mod tests {
             objects[1].target_id.as_deref(),
             Some("doc:-2919845427630868010")
         );
+    }
+
+    #[test]
+    fn scene_and_prefab_yaml_subdocs_are_not_indexed_as_asset_objects() {
+        let scene = asset_node("Assets/Scenes/Main.unity", AssetKind::Scene, true);
+        let scene_docs = vec![
+            yaml_doc(1660057539, 29, "OcclusionCullingSettings", None, 0),
+            yaml_doc(963194225, 1, "GameObject", Some("Player"), 1),
+            yaml_doc(963194228, 4, "Transform", None, 2),
+            yaml_doc(963194226, 114, "MonoBehaviour", None, 3),
+            yaml_doc(1426667978, 1001, "PrefabInstance", None, 4),
+        ];
+
+        let objects = build_yaml_asset_objects(&scene, &scene_docs, |_| None);
+        assert_eq!(objects.len(), 1);
+        assert!(objects[0].is_main);
+        assert!(!objects[0].is_sub_asset);
+
+        let prefab = asset_node("Assets/Prefabs/Enemy.prefab", AssetKind::Prefab, true);
+        let prefab_docs = vec![
+            yaml_doc(100000, 1, "GameObject", Some("Enemy"), 0),
+            yaml_doc(400000, 4, "Transform", None, 1),
+            yaml_doc(11400000, 114, "MonoBehaviour", None, 2),
+        ];
+
+        let objects = build_yaml_asset_objects(&prefab, &prefab_docs, |_| None);
+        assert_eq!(objects.len(), 1);
+        assert!(objects[0].is_main);
+        assert!(!objects[0].is_sub_asset);
+        assert_eq!(objects[0].name, "Enemy");
     }
 
     #[test]

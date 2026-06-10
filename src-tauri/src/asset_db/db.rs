@@ -12,7 +12,12 @@ const CURRENT_PARSER_VERSION: u32 = 1;
 /// Schema version. Bump on any incompatible asset-table schema change. Mismatch
 /// at `open_db` time triggers a full DB delete + rebuild — `locus.db` is a
 /// pure cache and we never migrate it.
-pub const ASSET_DB_VERSION: u32 = 9;
+///
+/// v10: scene/prefab YAML sub-docs are no longer persisted to `asset_objects`,
+/// and `asset_search_fts` rowids are now aligned with their `asset_objects`
+/// rows (deletes run by rowid). Old DBs hold both the dead sub-doc rows and
+/// FTS rowids with no alignment guarantee, so they must be rebuilt.
+pub const ASSET_DB_VERSION: u32 = 10;
 
 pub(crate) fn db_path(project_root: &Path) -> PathBuf {
     project_root.join("Library").join("Locus").join("locus.db")
@@ -251,49 +256,68 @@ pub(crate) fn derive_search_cols(path: &str) -> (i32, String, String, String) {
 /// FTS5 sync helpers. Every write to `assets` MUST go through one of these
 /// (or `clear_all_in_tx`) so the trigram index stays consistent. Centralising
 /// the writes here means watcher.rs never has to know FTS5 exists.
+///
+/// Every FTS row is inserted with an explicit rowid: the rowid of the
+/// `asset_objects` row it mirrors. All FTS columns are either trigram-indexed
+/// text or `UNINDEXED` (`object_key`), so the shared rowid is the only handle
+/// that lets deletes run as indexed point lookups. Deleting by `object_key`
+/// instead is a full virtual-table scan per statement — on a large Unity
+/// scene that meant 35k scans over a 518k-row FTS table inside one watcher
+/// transaction, stalling the whole queue (issue #89).
 pub(crate) mod asset_fts {
     use rusqlite::{params, Transaction};
 
     pub fn insert_row(
         tx: &Transaction,
+        rowid: i64,
         object_key: &str,
         name_lower: &str,
         path_lower: &str,
         type_search: &str,
     ) -> Result<(), String> {
-        tx.execute(
-            "INSERT INTO asset_search_fts (object_key, name, path, type_search) VALUES (?1, ?2, ?3, ?4)",
-            params![object_key, name_lower, path_lower, type_search],
+        tx.prepare_cached(
+            "INSERT INTO asset_search_fts (rowid, object_key, name, path, type_search)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
         )
+        .map_err(|e| format!("Failed to prepare asset_search_fts insert: {}", e))?
+        .execute(params![
+            rowid,
+            object_key,
+            name_lower,
+            path_lower,
+            type_search
+        ])
         .map_err(|e| format!("Failed to insert asset_search_fts row: {}", e))?;
         Ok(())
     }
 
-    pub fn delete_by_object_key(tx: &Transaction, object_key: &str) -> Result<(), String> {
-        tx.execute(
-            "DELETE FROM asset_search_fts WHERE object_key = ?1",
-            params![object_key],
-        )
-        .map_err(|e| format!("Failed to delete asset_search_fts row: {}", e))?;
-        Ok(())
-    }
-
     pub fn delete_by_asset_guid(tx: &Transaction, guid: &[u8]) -> Result<(), String> {
-        let object_keys = {
+        // `searchable = 1` mirrors the insert gate in `insert_asset_object`:
+        // non-searchable objects never received an FTS row. The rowids must
+        // be collected before the caller deletes the `asset_objects` rows.
+        let rowids = {
             let mut stmt = tx
-                .prepare_cached("SELECT object_key FROM asset_objects WHERE asset_guid = ?1")
-                .map_err(|e| format!("Failed to prepare asset object FTS key query: {}", e))?;
+                .prepare_cached(
+                    "SELECT rowid FROM asset_objects
+                     WHERE asset_guid = ?1 AND searchable = 1",
+                )
+                .map_err(|e| format!("Failed to prepare asset FTS rowid query: {}", e))?;
             let rows = stmt
-                .query_map(params![guid], |row| row.get::<_, String>(0))
-                .map_err(|e| format!("Failed to query asset object FTS keys: {}", e))?;
-            let mut keys = Vec::new();
+                .query_map(params![guid], |row| row.get::<_, i64>(0))
+                .map_err(|e| format!("Failed to query asset FTS rowids: {}", e))?;
+            let mut out = Vec::new();
             for row in rows {
-                keys.push(row.map_err(|e| format!("Failed to read asset object FTS key: {}", e))?);
+                out.push(row.map_err(|e| format!("Failed to read asset FTS rowid: {}", e))?);
             }
-            keys
+            out
         };
-        for key in object_keys {
-            delete_by_object_key(tx, &key)?;
+        let mut delete_stmt = tx
+            .prepare_cached("DELETE FROM asset_search_fts WHERE rowid = ?1")
+            .map_err(|e| format!("Failed to prepare asset_search_fts delete: {}", e))?;
+        for rowid in rowids {
+            delete_stmt
+                .execute(params![rowid])
+                .map_err(|e| format!("Failed to delete asset_search_fts row: {}", e))?;
         }
         Ok(())
     }
@@ -301,7 +325,7 @@ pub(crate) mod asset_fts {
     pub fn clear_all(tx: &Transaction) -> Result<(), String> {
         // NOTE: FTS5's `'delete-all'` fast-wipe command is only valid on
         // contentless or external-content tables. `asset_search_fts` stores
-        // its own content (`stem`, `path`, `script_types`), so we have to
+        // its own content (`name`, `path`, `type_search`), so we have to
         // fall back to a plain `DELETE FROM`. If full-scan clear latency
         // ever becomes a problem, the fix is to migrate the schema to
         // `content=''` rather than reintroduce `'delete-all'` here.
@@ -433,7 +457,7 @@ fn object_type_terms(object: &AssetObject) -> Vec<String> {
 }
 
 fn insert_asset_object(tx: &Transaction, object: &AssetObject) -> Result<(), String> {
-    tx.execute(
+    tx.prepare_cached(
         "INSERT OR REPLACE INTO asset_objects
          (object_key, asset_guid, file_id, path, kind, root,
           path_lower, file_name_lower, name, name_lower,
@@ -445,43 +469,50 @@ fn insert_asset_object(tx: &Transaction, object: &AssetObject) -> Result<(), Str
                  ?11, ?12, ?13,
                  ?14, ?15,
                  ?16, ?17, ?18, ?19, ?20)",
-        params![
-            object.object_key.as_str(),
-            object.asset_guid.as_slice(),
-            object.file_id,
-            object.path.as_str(),
-            object.kind as i32,
-            object.root as i32,
-            object.path_lower.as_str(),
-            object.file_name_lower.as_str(),
-            object.name.as_str(),
-            object.name_lower.as_str(),
-            object.type_name.as_str(),
-            object.type_lower.as_str(),
-            object.type_search.as_str(),
-            object.script_class_name.as_deref().unwrap_or(""),
-            object.script_class_lower.as_str(),
-            object.is_main as i32,
-            object.is_sub_asset as i32,
-            object.searchable as i32,
-            object.target_id.as_deref().unwrap_or(""),
-            object.sort_index,
-        ],
     )
+    .map_err(|e| format!("Failed to prepare asset object insert: {}", e))?
+    .execute(params![
+        object.object_key.as_str(),
+        object.asset_guid.as_slice(),
+        object.file_id,
+        object.path.as_str(),
+        object.kind as i32,
+        object.root as i32,
+        object.path_lower.as_str(),
+        object.file_name_lower.as_str(),
+        object.name.as_str(),
+        object.name_lower.as_str(),
+        object.type_name.as_str(),
+        object.type_lower.as_str(),
+        object.type_search.as_str(),
+        object.script_class_name.as_deref().unwrap_or(""),
+        object.script_class_lower.as_str(),
+        object.is_main as i32,
+        object.is_sub_asset as i32,
+        object.searchable as i32,
+        object.target_id.as_deref().unwrap_or(""),
+        object.sort_index,
+    ])
     .map_err(|e| format!("Failed to insert asset object: {}", e))?;
 
+    // Capture before the type-term inserts below advance last_insert_rowid.
+    // The FTS row reuses this rowid so deletes can run as point lookups.
+    let object_rowid = tx.last_insert_rowid();
+
     for term in object_type_terms(object) {
-        tx.execute(
+        tx.prepare_cached(
             "INSERT OR IGNORE INTO asset_object_type_terms (term, object_key)
              VALUES (?1, ?2)",
-            params![term, object.object_key.as_str()],
         )
+        .map_err(|e| format!("Failed to prepare asset object type term insert: {}", e))?
+        .execute(params![term, object.object_key.as_str()])
         .map_err(|e| format!("Failed to insert asset object type term: {}", e))?;
     }
 
     if object.searchable {
         asset_fts::insert_row(
             tx,
+            object_rowid,
             object.object_key.as_str(),
             object.name_lower.as_str(),
             object.path_lower.as_str(),
@@ -790,13 +821,13 @@ pub fn get_missing_reference_rows(
 /// **CALLER CONTRACT**: this function does NOT pre-delete existing FTS rows
 /// for each guid. It assumes the caller has just wiped `asset_search_fts`
 /// (e.g. via `clear_all_in_tx`) — which is true for the full_scan rebuild
-/// path. Doing per-row FTS deletes here would be O(n²): `guid_hex` is an
-/// `UNINDEXED` column, so each delete scans the entire growing FTS table.
-/// On a 16k-row Unity project that pushed `DbWrite` from a few seconds to
-/// effectively hanging.
+/// path. Inserting over live FTS rows would strand the old rows forever:
+/// FTS rowids are derived from the freshly inserted `asset_objects` rows
+/// (see `insert_asset_object`), so a stale row's rowid is unreachable once
+/// its `asset_objects` row has been replaced.
 ///
 /// Incremental writes (single asset add/update) live in `atomic_update_asset`
-/// and DO perform the FTS delete because their cardinality is 1.
+/// and DO perform the FTS delete first.
 pub fn batch_insert_assets(tx: &Transaction, assets: &[AssetNode]) -> Result<u64, String> {
     let mut count = 0u64;
     {
@@ -3310,6 +3341,79 @@ mod tests {
             )
             .unwrap();
         assert_eq!(old_fts_count, 0);
+    }
+
+    #[test]
+    fn atomic_update_asset_keeps_fts_rowids_aligned_and_drops_stale_rows() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+
+        let asset = test_asset(
+            "Assets/Data/EventChannels.asset",
+            AssetKind::GenericAsset,
+            "scriptableobject",
+        );
+        let sub_a = test_sub_object(
+            &asset,
+            11400001,
+            "Cure Event",
+            "EventChannel",
+            "eventchannel scriptableobject",
+        );
+        let sub_b = test_sub_object(
+            &asset,
+            11400002,
+            "Damage Event",
+            "EventChannel",
+            "eventchannel scriptableobject",
+        );
+
+        atomic_update_asset(&mut conn, &asset, &[sub_a.clone(), sub_b], &[], &[]).unwrap();
+
+        let fts_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM asset_search_fts", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(fts_count, 3); // main object + both sub-assets
+
+        // Re-import: one sub renamed, the other removed entirely.
+        let mut renamed = sub_a;
+        renamed.name = "Heal Event".to_string();
+        renamed.name_lower = "heal event".to_string();
+        atomic_update_asset(&mut conn, &asset, &[renamed], &[], &[]).unwrap();
+
+        let fts_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM asset_search_fts", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(fts_count, 2); // main + renamed sub, no stale rows
+
+        // Every FTS row must mirror a live searchable asset_objects row via
+        // the shared rowid — this is what keeps deletes point lookups.
+        let misaligned: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM asset_search_fts f
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM asset_objects o
+                     WHERE o.rowid = f.rowid
+                       AND o.object_key = f.object_key
+                       AND o.searchable = 1
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(misaligned, 0);
+
+        let rows = search_assets_for_command(&conn, "heal", &[AssetRoot::Assets], 20).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].file_id, Some(11400001));
+        assert_eq!(rows[0].name, "Heal Event");
+
+        let stale = search_assets_for_command(&conn, "cure", &[AssetRoot::Assets], 20).unwrap();
+        assert!(stale.is_empty());
     }
 
     #[test]
