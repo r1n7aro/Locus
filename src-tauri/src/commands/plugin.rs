@@ -1139,7 +1139,10 @@ async fn fetch_registry_cached_bytes(
         // cache instead of serving it forever.
         Ok(None) => {
             remove_plugin_registry_cache(url, extension).await;
-            Err(format!("Failed to fetch {}: HTTP 404 Not Found", error_label))
+            Err(format!(
+                "Failed to fetch {}: HTTP 404 Not Found",
+                error_label
+            ))
         }
         Err(error) => {
             if let Some(bytes) = read_plugin_registry_cache(url, extension, None).await {

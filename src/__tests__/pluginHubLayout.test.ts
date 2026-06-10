@@ -111,6 +111,9 @@ describe("plugin hub layout", () => {
     const config = source.slice(configStart, configEnd);
 
     expect(titlebarStart).toBeGreaterThan(-1);
+    expect(titlebar).toContain("refreshPluginListFromMenu");
+    expect(titlebar).toContain("plugin.hub.refresh");
+    expect(titlebar).toContain("RefreshCw");
     expect(titlebar).toContain("toggleRegistryConfig");
     expect(titlebar).toContain("Settings2");
     expect(titlebar).toContain("openGithubOAuth");

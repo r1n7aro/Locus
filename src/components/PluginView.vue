@@ -1904,6 +1904,14 @@ onUnmounted(() => {
           <div class="plugin-titlebar-actions">
             <BaseButton
               class="plugin-icon-button"
+              :title="t('plugin.hub.refresh')"
+              :aria-label="t('plugin.hub.refresh')"
+              @click="refreshPluginListFromMenu"
+            >
+              <LucideIcon :icon="RefreshCw" :size="13" />
+            </BaseButton>
+            <BaseButton
+              class="plugin-icon-button"
               :title="t('plugin.help.label')"
               :aria-label="t('plugin.help.label')"
               :aria-expanded="pluginHelpOpen"
