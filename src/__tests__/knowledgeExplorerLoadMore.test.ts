@@ -30,9 +30,15 @@ describe("KnowledgeExplorer load-more flow", () => {
     expect(explorer).toContain("folderDocumentsLoaded: (path: string) => boolean;");
     expect(explorer).toContain("? props.folderDocumentsLoaded(node.relativePath)");
     expect(explorer).toContain("folderLoaded &&");
-    expect(explorer).toContain("if (entry.path) continue;");
-    expect(explorer).toContain("function requestLoadMore(entry: VisibleEntry) {");
+    // Folder pages chain only on scroll-driven range changes (stable row
+    // count). Structural changes — expanding a folder, a page landing — keep
+    // the row count moving and therefore never cascade extra folder loads.
+    expect(explorer).toContain(
+      "const scrollDriven = rowCount === lastVisibleRangeRowCount;",
+    );
+    expect(explorer).toContain("if (!scrollDriven) continue;");
     expect(explorer).toContain('emit("loadMoreFolder", entry.path);');
+    expect(explorer).toContain("function requestLoadMore(entry: VisibleEntry) {");
     expect(explorer).toContain('@click="requestLoadMore(entry)"');
     expect(explorer).toContain(':disabled="entry.loading"');
   });

@@ -265,6 +265,53 @@ export function buildFolderSearchTags(meta: {
   return tags;
 }
 
+export interface KnowledgeLegendEntry {
+  tag: { text: string; tone: KnowledgeListTag["tone"] | "command" };
+  label: string;
+  description: string;
+}
+
+/** Rows for the badge-legend popover; reuses the live tag label functions. */
+export function buildKnowledgeLegendEntries(): KnowledgeLegendEntry[] {
+  const entries: KnowledgeLegendEntry[] = [];
+  const injectModes: KnowledgeInjectMode[] = ["path", "excerpt", "full", "rule"];
+  for (const mode of injectModes) {
+    const tag = injectLevelTag(mode);
+    if (!tag) continue;
+    entries.push({
+      tag: { text: tag.text, tone: tag.tone },
+      label: labelForInjectMode(mode),
+      description: hintForInjectMode(mode),
+    });
+  }
+  entries.push({
+    tag: { text: t("knowledge.meta.tag.auto"), tone: "auto" },
+    label: t("knowledge.meta.aiMaintained"),
+    description: t("knowledge.legend.autoDesc"),
+  });
+  entries.push({
+    tag: { text: tagForSearchKind("lexical"), tone: "search-on" },
+    label: labelForSearchKind("lexical"),
+    description: t("knowledge.legend.searchOnDesc"),
+  });
+  entries.push({
+    tag: { text: tagForSearchKind("semantic"), tone: "search-on" },
+    label: labelForSearchKind("semantic"),
+    description: t("knowledge.legend.searchOnDesc"),
+  });
+  entries.push({
+    tag: { text: "EXT", tone: "external" },
+    label: t("knowledge.source.external"),
+    description: t("knowledge.legend.externalDesc"),
+  });
+  entries.push({
+    tag: { text: "/cmd", tone: "command" },
+    label: t("knowledge.skill.commandTrigger"),
+    description: t("knowledge.legend.commandDesc"),
+  });
+  return entries;
+}
+
 export function buildKnowledgeSearchMatchTags(
   matchKind: KnowledgeSearchMatchKind,
 ): KnowledgeListTag[] {

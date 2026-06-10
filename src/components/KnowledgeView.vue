@@ -5,6 +5,7 @@ import type {
   ModelDefaults,
   KnowledgeDocumentSection,
   KnowledgeDocumentType,
+  KnowledgeSearchResult,
 } from "../types";
 import KnowledgeExplorer from "./knowledge/KnowledgeExplorer.vue";
 import KnowledgeOverviewPanel from "./knowledge/KnowledgeOverviewPanel.vue";
@@ -69,6 +70,8 @@ const {
   retrievalActionPending,
   isPathExpanded,
   togglePath,
+  expandAncestors,
+  collapseAllForType,
   hasMoreRootDocuments,
   hasMoreDirectoryDocuments,
   hasLoadedDirectoryDocuments,
@@ -111,8 +114,9 @@ const {
   renameExplorerFolder,
   renameExplorerDocument,
   copyExplorerRelativePath,
+  copySearchResultRelativePath,
   openExplorerInFileSystem,
-  moveExplorerNode,
+  moveExplorerNodes,
 } = useKnowledgeState(props);
 
 const deleteDialog = ref<ExplorerNode[] | null>(null);
@@ -279,6 +283,28 @@ function handleLoadMoreRoot() {
 
 function handleLoadMoreFolder(path: string) {
   void loadMoreDirectoryDocuments(activeType.value, path);
+}
+
+function handleCollapseAll() {
+  collapseAllForType(activeType.value);
+}
+
+function handleExpandToSelection() {
+  if (selectedPath.value) expandAncestors(selectedPath.value);
+}
+
+function handleMoveNodes(nodes: ExplorerNode[], targetDir: string) {
+  void moveExplorerNodes(nodes, targetDir);
+}
+
+async function handleRevealSearchResult(result: KnowledgeSearchResult) {
+  specialPage.value = null;
+  overviewDismissed.value = false;
+  await selectSearchResult(result);
+  clearSearch();
+  // Leaving search mode re-renders the tree; expanding ancestors here lets the
+  // explorer's reveal watcher scroll the selected row into view.
+  if (selectedPath.value) expandAncestors(selectedPath.value);
 }
 
 function handleClosePreview() {
@@ -557,9 +583,17 @@ onUnmounted(() => {
           @rename-folder="renameExplorerFolder"
           @rename-document="renameExplorerDocument"
           @copy-relative-path="copyExplorerRelativePath"
+          @copy-search-result-path="
+            (result) => void copySearchResultRelativePath(result)
+          "
           @open-in-file-system="openExplorerInFileSystem"
           @request-delete-nodes="requestDeleteNodes"
-          @move-node="moveExplorerNode"
+          @move-nodes="handleMoveNodes"
+          @collapse-all="handleCollapseAll"
+          @expand-to-selection="handleExpandToSelection"
+          @reveal-search-result="
+            (result) => void handleRevealSearchResult(result)
+          "
           @load-more-root="handleLoadMoreRoot"
           @load-more-folder="handleLoadMoreFolder"
           @drag-state-change="

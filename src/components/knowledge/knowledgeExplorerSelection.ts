@@ -112,6 +112,34 @@ export function resolveKnowledgeContextSelection(
   return [targetPath];
 }
 
+export interface KnowledgeDragNodeRef {
+  path: string;
+}
+
+/**
+ * Reduce a multi-selection drag set to its outermost nodes. A node whose tree
+ * path sits inside another dragged node already moves with that ancestor, so
+ * moving it separately would double-move it (and fail once the ancestor has
+ * landed in the target directory).
+ */
+export function pruneKnowledgeDragNodes<T extends KnowledgeDragNodeRef>(
+  nodes: T[],
+): T[] {
+  const paths = new Set(nodes.map((node) => node.path));
+  const seen = new Set<string>();
+  return nodes.filter((node) => {
+    if (seen.has(node.path)) return false;
+    seen.add(node.path);
+    let current = node.path;
+    while (true) {
+      const slash = current.lastIndexOf("/");
+      if (slash < 0) return true;
+      current = current.slice(0, slash);
+      if (paths.has(current)) return false;
+    }
+  });
+}
+
 export function pruneKnowledgeDeleteTargets(
   targets: KnowledgeDeleteTarget[],
 ): KnowledgeDeleteTarget[] {

@@ -87,6 +87,33 @@ watch(
   },
 );
 
+/**
+ * Scroll a row into view. "auto" only scrolls when the row is outside the
+ * viewport; "center" always re-centers (used for explicit reveal actions).
+ */
+function scrollToIndex(index: number, options?: { align?: "auto" | "center" }) {
+  const element = scrollRef.value;
+  if (!element || !props.items.length) return;
+  const rowHeight = Math.max(1, props.rowHeight);
+  const clamped = Math.max(0, Math.min(index, props.items.length - 1));
+  const top = clamped * rowHeight;
+  const bottom = top + rowHeight;
+  const viewTop = element.scrollTop;
+  const viewBottom = viewTop + element.clientHeight;
+  const align = options?.align ?? "auto";
+  if (align === "auto" && top >= viewTop && bottom <= viewBottom) return;
+  const nextTop =
+    align === "center"
+      ? top - Math.max(0, (element.clientHeight - rowHeight) / 2)
+      : top < viewTop
+        ? top
+        : bottom - element.clientHeight;
+  element.scrollTop = Math.max(0, nextTop);
+  updateViewportMetrics();
+}
+
+defineExpose({ scrollToIndex });
+
 onMounted(() => {
   updateViewportMetrics();
   if (scrollRef.value && typeof ResizeObserver !== "undefined") {

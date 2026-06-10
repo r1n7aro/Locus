@@ -40,4 +40,45 @@ describe("KnowledgeExplorer skill command tags", () => {
     );
     expect(state).toContain("export function isSkillPackageRootDocument(");
   });
+
+  it("keeps the command tag even when it matches the row name", () => {
+    const explorer = read("src/components/knowledge/KnowledgeExplorer.vue");
+    const labels = read("src/components/knowledge/knowledgeMetaLabels.ts");
+
+    // A skill's trigger almost always mirrors its package/file name (`/view`
+    // on the view package), so a "redundant name" filter would hide nearly
+    // every command chip. The chip is the row's primary command affordance —
+    // packageTags() must render the trigger unconditionally.
+    expect(labels).not.toContain("isRedundantCommandTrigger");
+    expect(explorer).not.toContain("isRedundantCommandTrigger");
+
+    const packageTagsStart = explorer.indexOf("function packageTags(");
+    const packageTagsEnd = explorer.indexOf(
+      "function deleteMenuLabel",
+      packageTagsStart,
+    );
+    const packageTagsBlock = explorer.slice(packageTagsStart, packageTagsEnd);
+    expect(packageTagsBlock).toContain("if (trigger) {");
+  });
+
+  it("renders L1 injection tags on package rows without surfacing L0", () => {
+    const explorer = read("src/components/knowledge/KnowledgeExplorer.vue");
+    const packageTagsStart = explorer.indexOf("function packageTags(");
+    const packageTagsEnd = explorer.indexOf(
+      "function deleteMenuLabel",
+      packageTagsStart,
+    );
+    const packageTagsBlock = explorer.slice(packageTagsStart, packageTagsEnd);
+
+    expect(packageTagsBlock).toContain(
+      'if (node.document.injectMode === "excerpt") {',
+    );
+    expect(packageTagsBlock).toContain("buildKnowledgeListTags({");
+    expect(packageTagsBlock).toContain("injectMode: node.document.injectMode,");
+    expect(packageTagsBlock).toContain("aiMaintained: false,");
+    expect(packageTagsBlock).not.toContain('"path"');
+    expect(explorer).toMatch(
+      /v-else-if="entry\.row\.node\.kind === 'package'"[\s\S]*'flag-inject': tag\.tone === 'inject'[\s\S]*'flag-command': tag\.tone === 'command'/,
+    );
+  });
 });

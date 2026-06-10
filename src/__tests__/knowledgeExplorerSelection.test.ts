@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   pruneKnowledgeDeleteTargets,
+  pruneKnowledgeDragNodes,
   resolveKnowledgeContextSelection,
   resolveKnowledgeExplorerSelection,
 } from "../components/knowledge/knowledgeExplorerSelection";
@@ -65,6 +66,22 @@ describe("knowledgeExplorerSelection", () => {
     expect(targets).toEqual([
       { kind: "folder", path: "systems" },
       { kind: "document", path: "ai/brain.md" },
+    ]);
+  });
+
+  it("prunes multi-drag sets to their outermost nodes by tree path", () => {
+    const nodes = pruneKnowledgeDragNodes([
+      { path: "design/systems/core-loop.md" },
+      { path: "design/systems" },
+      { path: "design/systems/rendering" },
+      { path: "design/ai/brain.md" },
+      // duplicate entries collapse to one
+      { path: "design/ai/brain.md" },
+    ]);
+
+    expect(nodes.map((node) => node.path)).toEqual([
+      "design/systems",
+      "design/ai/brain.md",
     ]);
   });
 });

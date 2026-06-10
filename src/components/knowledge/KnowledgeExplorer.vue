@@ -2,11 +2,20 @@
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import type { ComponentPublicInstance } from "vue";
 import {
+  BadgeInfo,
   Check,
   ChevronRight,
+  ChevronsDownUp,
+  FilePlus,
   Folder,
+  FolderInput,
   FolderOpen,
+  FolderPlus,
+  ListTree,
+  LocateFixed,
+  Lock,
   Package,
+  PackagePlus,
   X,
 } from "lucide";
 import { t } from "../../i18n";
@@ -27,15 +36,23 @@ import FileTreeList from "../explorer/FileTreeList.vue";
 import {
   buildFolderListTags,
   buildExternalFolderTag,
+  buildKnowledgeLegendEntries,
   buildKnowledgeListTags,
   buildKnowledgeSearchMatchTags,
   type KnowledgeListTag,
 } from "./knowledgeMetaLabels";
 import { buildFolderDisplayStats } from "./knowledgeExplorerFolderCounts";
 import {
+  pruneKnowledgeDragNodes,
   resolveKnowledgeContextSelection,
   resolveKnowledgeExplorerSelection,
 } from "./knowledgeExplorerSelection";
+import {
+  resolveKnowledgeTreeKeyboardAction,
+  type KnowledgeTreeKeyboardAction,
+  type KnowledgeTreeKeyboardRow,
+} from "./knowledgeExplorerKeyboard";
+import { buildKnowledgeSnippetSegments } from "./knowledgeSearchSnippet";
 import LucideIcon from "../icons/LucideIcon.vue";
 import {
   unityAssetIconClassForPath,
@@ -87,7 +104,11 @@ const emit = defineEmits<{
   (e: "copyRelativePath", node: ExplorerNode): void;
   (e: "openInFileSystem", node: ExplorerNode): void;
   (e: "requestDeleteNodes", nodes: ExplorerNode[]): void;
-  (e: "moveNode", node: ExplorerNode, targetDir: string): void;
+  (e: "moveNodes", nodes: ExplorerNode[], targetDir: string): void;
+  (e: "collapseAll"): void;
+  (e: "expandToSelection"): void;
+  (e: "revealSearchResult", result: KnowledgeSearchResult): void;
+  (e: "copySearchResultPath", result: KnowledgeSearchResult): void;
   (e: "loadMoreRoot"): void;
   (e: "loadMoreFolder", path: string): void;
   (e: "dragStateChange", dragging: boolean): void;
@@ -97,7 +118,6 @@ interface FlatRow {
   node: ExplorerNode;
   expanded: boolean;
   directChildCount: number;
-  descendantDocumentCount: number;
 }
 
 type ContextMenuState =
@@ -168,11 +188,24 @@ const inlineInputRef = ref<HTMLInputElement | null>(null);
 const inlineCreateRowRef = ref<HTMLElement | null>(null);
 const inlineRenameInputRef = ref<HTMLInputElement | null>(null);
 const inlineRenameRowRef = ref<HTMLElement | null>(null);
-const draggingNode = ref<ExplorerNode | null>(null);
+const treeListRef = ref<InstanceType<typeof FileTreeList> | null>(null);
+const draggingNodes = ref<ExplorerNode[]>([]);
 const dragTargetPath = ref<string | null>(null);
 const isSearchMode = computed(() => !!props.searchQuery.trim());
 const selectedPaths = ref<Set<string>>(new Set());
 const lastAnchorPath = ref<string | null>(null);
+const focusedPath = ref<string | null>(null);
+const pendingRevealPath = ref<string | null>(null);
+const legendMenu = ref<{ x: number; y: number } | null>(null);
+const searchCtxMenu = ref<{
+  x: number;
+  y: number;
+  result: KnowledgeSearchResult;
+} | null>(null);
+const legendEntries = computed(() => buildKnowledgeLegendEntries());
+const draggingPaths = computed(
+  () => new Set(draggingNodes.value.map((node) => node.path)),
+);
 const contextMenuPath = computed(() => {
   const menu = ctxMenu.value;
   if (!menu || menu.kind === "root") return null;
@@ -216,11 +249,10 @@ const visibleRows = computed<VisibleEntry[]>(() => {
       const directChildCount =
         folderStats?.directChildCount ??
         (branch ? node.children.length : 0);
-      const descendantDocumentCount = folderStats?.descendantDocumentCount ?? 0;
       out.push({
         type: "row",
         key: node.path,
-        row: { node, expanded, directChildCount, descendantDocumentCount },
+        row: { node, expanded, directChildCount },
       });
       if (inlineCreate.value?.anchorPath === node.path) {
         out.push({
@@ -339,6 +371,7 @@ function rowClick(row: FlatRow, event: MouseEvent) {
   closeContextMenu();
   closeInlineCreate();
   closeInlineRename();
+  focusedPath.value = row.node.path;
   const selection = resolveKnowledgeExplorerSelection({
     visiblePaths: selectablePaths.value,
     selectedPaths: selectedPaths.value,
@@ -352,15 +385,40 @@ function rowClick(row: FlatRow, event: MouseEvent) {
   selectedPaths.value = selection.nextSelectedPaths;
   lastAnchorPath.value = selection.nextLastAnchorPath;
   if (!selection.shouldHandleAsPlainClick) return;
+  // The first click of a double-click already ran the plain-click action;
+  // swallowing the second keeps dblclick-rename from toggling branches twice.
+  if (event.detail >= 2) return;
+  activateNode(row);
+}
+
+// Unified single-click semantics: every node selects (shows its detail on the
+// right) and branch nodes additionally toggle. Packages keep their detail
+// pane stable while expanded children are open, so a second click on the
+// already-open package only toggles.
+function activateNode(row: FlatRow) {
   if (row.node.kind === "folder") {
     emit("toggle", row.node.path);
+    if (props.selectedPath !== row.node.path) {
+      emit("selectFolderConfig", row.node.relativePath);
+    }
     return;
   }
   if (row.node.kind === "package") {
+    if (props.selectedPath === row.node.path) {
+      emit("toggle", row.node.path);
+      return;
+    }
     emit("selectPackage", row.node.document);
     return;
   }
   emit("selectDocument", row.node.document);
+}
+
+function onRowDoubleClick(row: FlatRow) {
+  if (isSearchMode.value) return;
+  if (row.node.kind === "package") return;
+  if (isPluginManagedNode(row.node)) return;
+  void startRenameNode(row.node);
 }
 
 function toggleExpansion(row: FlatRow) {
@@ -483,10 +541,42 @@ function closeInlineRename() {
   inlineRename.value = null;
 }
 
+const DRAG_EXPAND_DELAY_MS = 600;
+let dragExpandTimer: number | null = null;
+let dragExpandPath: string | null = null;
+
+function cancelDragExpand() {
+  if (dragExpandTimer !== null) {
+    window.clearTimeout(dragExpandTimer);
+    dragExpandTimer = null;
+  }
+  dragExpandPath = null;
+}
+
+// Hovering a collapsed folder mid-drag expands it after a short dwell so deep
+// targets are reachable in one drag.
+function scheduleDragExpand(row: FlatRow) {
+  if (row.node.kind !== "folder") return;
+  if (row.expanded || row.directChildCount === 0) {
+    cancelDragExpand();
+    return;
+  }
+  if (dragExpandPath === row.node.path) return;
+  cancelDragExpand();
+  dragExpandPath = row.node.path;
+  dragExpandTimer = window.setTimeout(() => {
+    dragExpandTimer = null;
+    const path = dragExpandPath;
+    dragExpandPath = null;
+    if (path && dragTargetPath.value === path) emit("toggle", path);
+  }, DRAG_EXPAND_DELAY_MS);
+}
+
 function clearDragState() {
-  if (draggingNode.value) emit("dragStateChange", false);
-  draggingNode.value = null;
+  if (draggingNodes.value.length) emit("dragStateChange", false);
+  draggingNodes.value = [];
   dragTargetPath.value = null;
+  cancelDragExpand();
 }
 
 function normalizeRelativePath(path: string): string {
@@ -528,6 +618,14 @@ function canDropOnDir(node: ExplorerNode, targetDir: string): boolean {
   return parentDirectory(node) !== normalizedTargetDir;
 }
 
+function dropTargetAccepts(targetDir: string): boolean {
+  return draggingNodes.value.some((node) => canDropOnDir(node, targetDir));
+}
+
+function droppableNodes(targetDir: string): ExplorerNode[] {
+  return draggingNodes.value.filter((node) => canDropOnDir(node, targetDir));
+}
+
 function onNodeDragStart(row: FlatRow, event: DragEvent) {
   if (isSearchMode.value) {
     event.preventDefault();
@@ -540,12 +638,26 @@ function onNodeDragStart(row: FlatRow, event: DragEvent) {
   closeContextMenu();
   closeInlineCreate();
   closeInlineRename();
-  draggingNode.value = row.node;
+  // Dragging a row that belongs to the multi-selection carries the whole
+  // selection; nested entries are pruned so an ancestor folder moves them.
+  const dragPaths =
+    selectedPaths.value.has(row.node.path) && selectedPaths.value.size > 1
+      ? selectablePaths.value.filter((path) => selectedPaths.value.has(path))
+      : [row.node.path];
+  const dragNodes = pruneKnowledgeDragNodes(
+    dragPaths
+      .map((path) => selectableRowMap.value.get(path)?.node)
+      .filter((node): node is ExplorerNode => !!node && canDragNode(node)),
+  );
+  draggingNodes.value = dragNodes.length ? dragNodes : [row.node];
   dragTargetPath.value = null;
   emit("dragStateChange", true);
   if (event.dataTransfer) {
     event.dataTransfer.effectAllowed = "move";
-    event.dataTransfer.setData("text/plain", row.node.path);
+    event.dataTransfer.setData(
+      "text/plain",
+      draggingNodes.value.map((node) => node.path).join("\n"),
+    );
   }
 }
 
@@ -554,31 +666,35 @@ function onNodeDragEnd() {
 }
 
 function onFolderDragOver(row: FlatRow, event: DragEvent) {
-  if (row.node.kind !== "folder" || !draggingNode.value) return;
+  if (row.node.kind !== "folder" || !draggingNodes.value.length) return;
   const targetDir = row.node.relativePath;
-  if (!canDropOnDir(draggingNode.value, targetDir)) return;
+  if (!dropTargetAccepts(targetDir)) {
+    cancelDragExpand();
+    return;
+  }
   event.preventDefault();
   if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
   dragTargetPath.value = row.node.path;
+  scheduleDragExpand(row);
 }
 
 function onFolderDrop(row: FlatRow, event: DragEvent) {
-  if (row.node.kind !== "folder" || !draggingNode.value) return;
+  if (row.node.kind !== "folder" || !draggingNodes.value.length) return;
   const targetDir = row.node.relativePath;
-  if (!canDropOnDir(draggingNode.value, targetDir)) {
+  const movable = droppableNodes(targetDir);
+  if (!movable.length) {
     clearDragState();
     return;
   }
   event.preventDefault();
   event.stopPropagation();
-  const node = draggingNode.value;
   clearDragState();
-  emit("moveNode", node, targetDir);
+  emit("moveNodes", movable, targetDir);
 }
 
 function onTreeDragOver(event: DragEvent) {
   if (isSearchMode.value) return;
-  if (!draggingNode.value) return;
+  if (!draggingNodes.value.length) return;
   const target = event.target;
   if (
     target instanceof Element &&
@@ -588,7 +704,7 @@ function onTreeDragOver(event: DragEvent) {
   ) {
     return;
   }
-  if (!canDropOnDir(draggingNode.value, "")) return;
+  if (!dropTargetAccepts("")) return;
   event.preventDefault();
   if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
   dragTargetPath.value = props.activeType;
@@ -596,7 +712,7 @@ function onTreeDragOver(event: DragEvent) {
 
 function onTreeDrop(event: DragEvent) {
   if (isSearchMode.value) return;
-  if (!draggingNode.value) return;
+  if (!draggingNodes.value.length) return;
   const target = event.target;
   if (
     target instanceof Element &&
@@ -606,14 +722,14 @@ function onTreeDrop(event: DragEvent) {
   ) {
     return;
   }
-  if (!canDropOnDir(draggingNode.value, "")) {
+  const movable = droppableNodes("");
+  if (!movable.length) {
     clearDragState();
     return;
   }
   event.preventDefault();
-  const node = draggingNode.value;
   clearDragState();
-  emit("moveNode", node, "");
+  emit("moveNodes", movable, "");
 }
 
 function canDeleteFolder(
@@ -640,6 +756,27 @@ function canDeleteContextTargets(
 ): boolean {
   if (menu.targetNodes.some(isPluginManagedNode)) return false;
   return menu.kind !== "folder" || menu.targetNodes.length > 1 || canDeleteFolder(menu);
+}
+
+// Plugin-managed targets keep their destructive menu items visible but
+// disabled (with an explanatory title) instead of silently vanishing.
+function canShowDeleteItem(
+  menu: Extract<ContextMenuState, { kind: "folder" | "leaf" | "package" }>,
+): boolean {
+  if (menu.kind !== "folder") return true;
+  return menu.targetNodes.length > 1 || menu.depth > 0;
+}
+
+function deleteBlockedByPlugin(
+  menu: Extract<ContextMenuState, { kind: "folder" | "leaf" | "package" }>,
+): boolean {
+  return menu.targetNodes.some(isPluginManagedNode);
+}
+
+function renameBlockedByPlugin(
+  menu: Extract<ContextMenuState, { kind: "folder" | "leaf" }>,
+): boolean {
+  return menu.targetNodes.some(isPluginManagedNode);
 }
 
 function requestDeleteSelectedNodes() {
@@ -686,26 +823,135 @@ function exportSelectedPackage() {
   emit("exportPackage", menu.node);
 }
 
-async function openCreateInline(kind: InlineCreateState["kind"]) {
-  if (!ctxMenu.value) return;
-  if (ctxMenu.value.kind === "leaf" || ctxMenu.value.kind === "package") return;
+async function openInlineCreateAt(
+  kind: InlineCreateState["kind"],
+  target: {
+    parentDir: string;
+    anchorPath: string;
+    depth: number;
+    expandPath?: string | null;
+  },
+) {
   closeInlineRename();
-
-  if (ctxMenu.value.kind === "folder" && !ctxMenu.value.expanded) {
-    emit("toggle", ctxMenu.value.anchorPath);
+  if (target.expandPath && !props.isPathExpanded(target.expandPath)) {
+    emit("toggle", target.expandPath);
   }
-
   inlineCreate.value = {
     kind,
-    parentDir: ctxMenu.value.kind === "folder" ? ctxMenu.value.parentDir : "",
-    anchorPath: ctxMenu.value.anchorPath,
-    depth: ctxMenu.value.kind === "folder" ? ctxMenu.value.depth + 1 : 1,
+    parentDir: target.parentDir,
+    anchorPath: target.anchorPath,
+    depth: target.depth,
     name: "",
   };
   closeContextMenu();
   await nextTick();
   inlineInputRef.value?.focus();
   inlineInputRef.value?.select();
+}
+
+async function openCreateInline(kind: InlineCreateState["kind"]) {
+  if (!ctxMenu.value) return;
+  if (ctxMenu.value.kind === "leaf" || ctxMenu.value.kind === "package") return;
+  const menu = ctxMenu.value;
+  await openInlineCreateAt(kind, {
+    parentDir: menu.kind === "folder" ? menu.parentDir : "",
+    anchorPath: menu.anchorPath,
+    depth: menu.kind === "folder" ? menu.depth + 1 : 1,
+    expandPath:
+      menu.kind === "folder" && !menu.expanded ? menu.anchorPath : null,
+  });
+}
+
+// Toolbar create targets the selected folder when one is open in the detail
+// pane, otherwise the type root.
+async function openToolbarCreate(kind: InlineCreateState["kind"]) {
+  if (isSearchMode.value) return;
+  closeContextMenu();
+  const selected = props.selectedPath
+    ? selectableRowMap.value.get(props.selectedPath)
+    : undefined;
+  if (
+    selected &&
+    selected.node.kind === "folder" &&
+    !isPluginManagedNode(selected.node)
+  ) {
+    await openInlineCreateAt(kind, {
+      parentDir: selected.node.relativePath,
+      anchorPath: selected.node.path,
+      depth: selected.node.depth + 1,
+      expandPath: selected.expanded ? null : selected.node.path,
+    });
+    return;
+  }
+  await openInlineCreateAt(kind, {
+    parentDir: "",
+    anchorPath: props.activeType,
+    depth: 1,
+  });
+}
+
+const showToolbarImport = computed(
+  () => props.activeType === "skill" || props.activeType === "reference",
+);
+
+const toolbarImportLabel = computed(() =>
+  props.activeType === "skill"
+    ? t("knowledge.explorer.importSkillPackage")
+    : t("knowledge.explorer.importExternalFolder"),
+);
+
+function toolbarImport() {
+  if (props.activeType === "skill") {
+    emit("importSkillPackage");
+    return;
+  }
+  if (props.activeType === "reference") {
+    emit("requestExternalImportFolder", "");
+  }
+}
+
+function openLegendMenu(event: MouseEvent) {
+  const button = event.currentTarget;
+  const rect =
+    button instanceof HTMLElement ? button.getBoundingClientRect() : null;
+  legendMenu.value = rect
+    ? { x: rect.left, y: rect.bottom + 4 }
+    : { x: event.clientX, y: event.clientY };
+}
+
+function legendFlagClass(tone: string): Record<string, boolean> {
+  return {
+    "flag-inject": tone === "inject",
+    "flag-inject-strong": tone === "inject-strong",
+    "flag-auto": tone === "auto",
+    "flag-command": tone === "command",
+    "flag-search-on": tone === "search-on",
+    "flag-external": tone === "external",
+  };
+}
+
+async function startRenameNode(node: FolderNode | DocumentNode) {
+  closeInlineCreate();
+  inlineRename.value =
+    node.kind === "folder"
+      ? {
+          kind: "folder",
+          anchorPath: node.path,
+          relativePath: node.relativePath,
+          currentName: node.name,
+          name: node.name,
+        }
+      : {
+          kind: "document",
+          anchorPath: node.path,
+          relativePath: node.document.path,
+          currentName: node.name,
+          name: node.name,
+        };
+  closeContextMenu();
+  await nextTick();
+  inlineRenameInputRef.value?.focus();
+  inlineRenameInputRef.value?.select();
 }
 
 async function startRenameSelection() {
@@ -717,27 +963,8 @@ async function startRenameSelection() {
     menu.targetNodes.length !== 1
   )
     return;
-  closeInlineCreate();
-  inlineRename.value =
-    menu.kind === "folder"
-      ? {
-          kind: "folder",
-          anchorPath: menu.node.path,
-          relativePath: menu.node.relativePath,
-          currentName: menu.node.name,
-          name: menu.node.name,
-        }
-      : {
-          kind: "document",
-          anchorPath: menu.node.path,
-          relativePath: menu.node.document.path,
-          currentName: menu.node.name,
-          name: menu.node.name,
-        };
-  closeContextMenu();
-  await nextTick();
-  inlineRenameInputRef.value?.focus();
-  inlineRenameInputRef.value?.select();
+  if (renameBlockedByPlugin(menu)) return;
+  await startRenameNode(menu.node);
 }
 
 function copySelectedRelativePath() {
@@ -784,8 +1011,11 @@ function isRenamingRow(row: FlatRow): boolean {
 function handleDocumentPointerDown(event: PointerEvent) {
   const target = event.target;
   if (!(target instanceof Node)) return;
+  // Clicking elsewhere commits both inline editors alike (empty input simply
+  // cancels) so create and rename do not behave differently on outside click.
   if (inlineCreate.value && !inlineCreateRowRef.value?.contains(target)) {
-    closeInlineCreate();
+    if (inlineCreate.value.name.trim()) submitInlineCreate();
+    else closeInlineCreate();
   }
   if (inlineRename.value && !inlineRenameRowRef.value?.contains(target)) {
     submitInlineRename();
@@ -798,7 +1028,43 @@ onMounted(() => {
 
 onUnmounted(() => {
   document.removeEventListener("pointerdown", handleDocumentPointerDown, true);
+  cancelDragExpand();
 });
+
+function indexOfVisiblePath(path: string): number {
+  return visibleRows.value.findIndex(
+    (entry) => entry.type === "row" && entry.row.node.path === path,
+  );
+}
+
+function revealVisiblePath(
+  path: string,
+  options?: { align?: "auto" | "center" },
+): boolean {
+  const index = indexOfVisiblePath(path);
+  if (index < 0) return false;
+  treeListRef.value?.scrollToIndex(index, options);
+  return true;
+}
+
+// Toolbar "reveal selection": the host expands ancestors, then the row scrolls
+// into view once it lands in the flattened rows.
+function requestRevealSelection() {
+  const path = props.selectedPath;
+  if (!path) return;
+  pendingRevealPath.value = path;
+  emit("expandToSelection");
+  void nextTick(() => flushPendingReveal());
+}
+
+function flushPendingReveal() {
+  const path = pendingRevealPath.value;
+  if (!path) return;
+  if (revealVisiblePath(path, { align: "center" })) {
+    pendingRevealPath.value = null;
+    focusedPath.value = path;
+  }
+}
 
 watch(
   selectablePaths,
@@ -815,6 +1081,9 @@ watch(
     if (lastAnchorPath.value && !visible.has(lastAnchorPath.value)) {
       lastAnchorPath.value = null;
     }
+    if (focusedPath.value && !visible.has(focusedPath.value)) {
+      focusedPath.value = null;
+    }
     if (inlineRename.value && !visible.has(inlineRename.value.anchorPath)) {
       closeInlineRename();
     }
@@ -824,6 +1093,9 @@ watch(
       !visible.has(ctxMenu.value.node.path)
     ) {
       closeContextMenu();
+    }
+    if (pendingRevealPath.value) {
+      void nextTick(() => flushPendingReveal());
     }
   },
   { immediate: true },
@@ -836,16 +1108,128 @@ watch(
     closeContextMenu();
     closeInlineCreate();
     closeInlineRename();
+    focusedPath.value = null;
+    pendingRevealPath.value = null;
+    legendMenu.value = null;
+    searchCtxMenu.value = null;
   },
 );
 
 watch(isSearchMode, (value) => {
-  if (!value) return;
-  clearMultiSelection(true);
-  closeContextMenu();
-  closeInlineCreate();
-  closeInlineRename();
+  if (value) {
+    clearMultiSelection(true);
+    closeContextMenu();
+    closeInlineCreate();
+    closeInlineRename();
+    return;
+  }
+  searchCtxMenu.value = null;
+  // Returning from search keeps the opened document on screen.
+  const path = props.selectedPath;
+  if (path) void nextTick(() => revealVisiblePath(path));
 });
+
+watch(
+  () => props.selectedPath,
+  (path) => {
+    if (!path || isSearchMode.value) return;
+    void nextTick(() => revealVisiblePath(path));
+  },
+);
+
+const keyboardRows = computed<KnowledgeTreeKeyboardRow[]>(() =>
+  selectableRows.value.map((entry) => ({
+    path: entry.row.node.path,
+    kind: entry.row.node.kind,
+    depth: entry.row.node.depth,
+    expanded: entry.row.expanded,
+    hasChildren: entry.row.directChildCount > 0,
+  })),
+);
+
+function rowDomId(path: string): string {
+  return `kx-node-${path.replace(/[^a-zA-Z0-9_-]+/g, "-")}`;
+}
+
+const focusedRowDomId = computed(() =>
+  focusedPath.value && selectableRowMap.value.has(focusedPath.value)
+    ? rowDomId(focusedPath.value)
+    : undefined,
+);
+
+function onTreeKeydown(event: KeyboardEvent) {
+  if (isSearchMode.value) return;
+  if (inlineCreate.value || inlineRename.value) return;
+  const target = event.target;
+  if (
+    target instanceof HTMLElement &&
+    target.closest("input, textarea, [contenteditable]")
+  ) {
+    return;
+  }
+  const action = resolveKnowledgeTreeKeyboardAction({
+    key: event.key,
+    ctrlKey: event.ctrlKey,
+    metaKey: event.metaKey,
+    rows: keyboardRows.value,
+    focusedPath: focusedPath.value ?? props.selectedPath,
+  });
+  if (!action) return;
+  event.preventDefault();
+  event.stopPropagation();
+  applyKeyboardAction(action);
+}
+
+function applyKeyboardAction(action: KnowledgeTreeKeyboardAction) {
+  switch (action.type) {
+    case "focus":
+      focusedPath.value = action.path;
+      revealVisiblePath(action.path);
+      return;
+    case "expand":
+    case "collapse":
+      focusedPath.value = action.path;
+      emit("toggle", action.path);
+      return;
+    case "activate": {
+      const row = selectableRowMap.value.get(action.path);
+      if (!row) return;
+      focusedPath.value = action.path;
+      clearMultiSelection();
+      activateNode(row);
+      return;
+    }
+    case "rename": {
+      const row = selectableRowMap.value.get(action.path);
+      if (!row || row.node.kind === "package") return;
+      if (isPluginManagedNode(row.node)) return;
+      void startRenameNode(row.node);
+      return;
+    }
+    case "delete": {
+      const row = selectableRowMap.value.get(action.path);
+      if (!row) return;
+      const targetPaths = resolveKnowledgeContextSelection({
+        visiblePaths: selectablePaths.value,
+        selectedPaths: selectedPaths.value,
+        targetPath: action.path,
+      });
+      const targetNodes = targetPaths
+        .map((path) => selectableRowMap.value.get(path)?.node)
+        .filter((node): node is ExplorerNode => !!node);
+      if (!targetNodes.length || targetNodes.some(isPluginManagedNode)) return;
+      emit("requestDeleteNodes", targetNodes);
+      return;
+    }
+    case "select-all":
+      selectedPaths.value = new Set(selectablePaths.value);
+      lastAnchorPath.value = selectablePaths.value[0] ?? null;
+      return;
+    case "clear-selection":
+      clearMultiSelection(true);
+      return;
+  }
+}
 
 function documentTags(node: DocumentNode): Array<{
   text: string;
@@ -879,6 +1263,48 @@ function documentTags(node: DocumentNode): Array<{
 
 function searchResultTags(result: KnowledgeSearchResult) {
   return buildKnowledgeSearchMatchTags(result.matchKind);
+}
+
+function searchSnippetSegments(result: KnowledgeSearchResult) {
+  return buildKnowledgeSnippetSegments(
+    result.snippet,
+    result.matchedTerms,
+    props.searchQuery,
+  );
+}
+
+function openSearchContextMenu(
+  event: MouseEvent,
+  result: KnowledgeSearchResult,
+) {
+  event.preventDefault();
+  event.stopPropagation();
+  searchCtxMenu.value = { x: event.clientX, y: event.clientY, result };
+}
+
+function closeSearchContextMenu() {
+  searchCtxMenu.value = null;
+}
+
+function openSearchResultFromMenu() {
+  const menu = searchCtxMenu.value;
+  if (!menu) return;
+  closeSearchContextMenu();
+  emit("selectSearchResult", menu.result);
+}
+
+function revealSearchResultFromMenu() {
+  const menu = searchCtxMenu.value;
+  if (!menu) return;
+  closeSearchContextMenu();
+  emit("revealSearchResult", menu.result);
+}
+
+function copySearchResultPathFromMenu() {
+  const menu = searchCtxMenu.value;
+  if (!menu) return;
+  closeSearchContextMenu();
+  emit("copySearchResultPath", menu.result);
 }
 
 function isSelectedSearchResult(result: KnowledgeSearchResult): boolean {
@@ -928,12 +1354,12 @@ function documentIconClass(node: DocumentNode) {
 
 function packageTags(node: PackageNode): Array<{
   text: string;
-  tone: "command";
+  tone: KnowledgeListTag["tone"] | "command";
   title: string;
 }> {
   const tags: Array<{
     text: string;
-    tone: "command";
+    tone: KnowledgeListTag["tone"] | "command";
     title: string;
   }> = [];
   const trigger = node.document.commandTrigger?.trim();
@@ -943,6 +1369,14 @@ function packageTags(node: PackageNode): Array<{
       tone: "command",
       title: t("knowledge.skill.commandTrigger"),
     });
+  }
+  if (node.document.injectMode === "excerpt") {
+    tags.push(
+      ...buildKnowledgeListTags({
+        injectMode: node.document.injectMode,
+        aiMaintained: false,
+      }),
+    );
   }
   return tags;
 }
@@ -964,15 +1398,27 @@ function loadMoreLabel(entry: VisibleEntry): string {
   return entry.loading ? t("common.loading") : t("asset.explorer.loadMore");
 }
 
+let lastVisibleRangeRowCount = -1;
+
 function handleVisibleRangeChange(payload: { start: number; end: number }) {
   if (payload.end < payload.start) return;
+  const rowCount = visibleRows.value.length;
+  // Folder pages only chain on scroll-driven range changes (row count stable).
+  // Structural changes — expanding a folder, a page landing — must not cascade
+  // extra folder loads; the user keeps explicit control right after expansion.
+  const scrollDriven = rowCount === lastVisibleRangeRowCount;
+  lastVisibleRangeRowCount = rowCount;
   for (const entry of visibleRows.value.slice(payload.start, payload.end + 1)) {
     if (entry.type !== "loadMore") continue;
     if (entry.loading) continue;
-    if (entry.path) continue;
+    if (entry.path) {
+      if (!scrollDriven) continue;
+      if (!props.hasMoreFolderDocuments(entry.path)) continue;
+      emit("loadMoreFolder", entry.path);
+      continue;
+    }
     if (!props.hasMoreRootDocuments) continue;
     emit("loadMoreRoot");
-    return;
   }
 }
 
@@ -994,9 +1440,71 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
 
 <template>
   <div class="kx-explorer">
+    <div v-if="!isSearchMode" class="kx-toolbar">
+      <BaseButton
+        class="kx-toolbar-btn"
+        type="button"
+        :title="t('knowledge.explorer.createDoc')"
+        @click="openToolbarCreate('document')"
+      >
+        <LucideIcon :icon="FilePlus" :size="13" :stroke-width="2" />
+      </BaseButton>
+      <BaseButton
+        class="kx-toolbar-btn"
+        type="button"
+        :title="t('knowledge.explorer.createFolder')"
+        @click="openToolbarCreate('folder')"
+      >
+        <LucideIcon :icon="FolderPlus" :size="13" :stroke-width="2" />
+      </BaseButton>
+      <BaseButton
+        v-if="showToolbarImport"
+        class="kx-toolbar-btn"
+        type="button"
+        :title="toolbarImportLabel"
+        @click="toolbarImport"
+      >
+        <LucideIcon
+          :icon="activeType === 'skill' ? PackagePlus : FolderInput"
+          :size="13"
+          :stroke-width="2"
+        />
+      </BaseButton>
+      <span class="kx-toolbar-spacer"></span>
+      <BaseButton
+        class="kx-toolbar-btn"
+        type="button"
+        :title="t('knowledge.explorer.collapseAll')"
+        @click="emit('collapseAll')"
+      >
+        <LucideIcon :icon="ChevronsDownUp" :size="13" :stroke-width="2" />
+      </BaseButton>
+      <BaseButton
+        class="kx-toolbar-btn"
+        type="button"
+        :disabled="!selectedPath"
+        :title="t('knowledge.explorer.revealSelection')"
+        @click="requestRevealSelection"
+      >
+        <LucideIcon :icon="LocateFixed" :size="13" :stroke-width="2" />
+      </BaseButton>
+      <BaseButton
+        class="kx-toolbar-btn"
+        type="button"
+        :title="t('knowledge.explorer.legend')"
+        @click="openLegendMenu"
+      >
+        <LucideIcon :icon="BadgeInfo" :size="13" :stroke-width="2" />
+      </BaseButton>
+    </div>
     <div
       class="kx-tree-shell"
       :class="{ 'is-root-drop-target': dragTargetPath === activeType }"
+      role="tree"
+      :aria-label="t('knowledge.explorer.title')"
+      :tabindex="isSearchMode ? -1 : 0"
+      :aria-activedescendant="focusedRowDomId"
+      @keydown="onTreeKeydown"
       @contextmenu.prevent="onTreeContextMenu($event)"
       @dragover="onTreeDragOver"
       @drop="onTreeDrop"
@@ -1005,17 +1513,35 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
         <div class="kx-empty">{{ t("common.loading") }}</div>
       </div>
       <div v-else-if="isSearchMode" class="kx-tree-static">
-        <button
+        <div
           v-for="result in searchResults"
           :key="`${result.id}-${result.path}`"
-          type="button"
+          role="button"
+          tabindex="0"
           class="kx-search-row"
           :class="{ selected: isSelectedSearchResult(result) }"
           @click="emit('selectSearchResult', result)"
+          @keydown.enter.prevent="emit('selectSearchResult', result)"
+          @keydown.space.prevent="emit('selectSearchResult', result)"
+          @contextmenu="openSearchContextMenu($event, result)"
         >
           <div class="kx-search-main">
             <span class="kx-search-title">{{ result.title }}</span>
             <span class="kx-search-path">{{ result.path }}</span>
+            <span
+              v-if="searchSnippetSegments(result).length"
+              class="kx-search-snippet"
+            >
+              <template
+                v-for="(segment, segmentIndex) in searchSnippetSegments(result)"
+                :key="segmentIndex"
+              >
+                <mark v-if="segment.highlighted" class="kx-search-mark">{{
+                  segment.text
+                }}</mark>
+                <template v-else>{{ segment.text }}</template>
+              </template>
+            </span>
           </div>
           <div class="kx-search-side">
             <div v-if="searchResultTags(result).length" class="kx-search-tags">
@@ -1032,8 +1558,16 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
                 {{ tag.text }}
               </span>
             </div>
+            <button
+              type="button"
+              class="kx-search-reveal"
+              :title="t('knowledge.search.revealInTree')"
+              @click.stop="emit('revealSearchResult', result)"
+            >
+              <LucideIcon :icon="ListTree" :size="13" :stroke-width="2" />
+            </button>
           </div>
-        </button>
+        </div>
         <div v-if="!searchResults.length" class="kx-empty">
           {{ t("knowledge.search.noResults") }}
         </div>
@@ -1043,6 +1577,7 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
       </div>
       <FileTreeList
         v-else-if="visibleRows.length"
+        ref="treeListRef"
         class="kx-tree"
         :items="visibleRows"
         :row-height="30"
@@ -1052,20 +1587,34 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
           <template v-for="entry in [asVisibleEntry(item)]" :key="entry.key">
             <div
               v-if="entry.type === 'row'"
+              :id="rowDomId(entry.row.node.path)"
               class="kx-row-shell"
               :class="{
                 'kx-folder': entry.row.node.kind === 'folder',
                 'kx-package': entry.row.node.kind === 'package',
                 'kx-leaf': entry.row.node.kind === 'document',
-                selected:
-                  selectedPath === entry.row.node.path ||
-                  selectedPaths.has(entry.row.node.path),
+                'is-open': selectedPath === entry.row.node.path,
+                'is-marked': selectedPaths.has(entry.row.node.path),
+                'is-focused': focusedPath === entry.row.node.path,
                 'context-selected': contextSelectedPath === entry.row.node.path,
-                dragging: draggingNode?.path === entry.row.node.path,
+                dragging: draggingPaths.has(entry.row.node.path),
                 'drop-target': dragTargetPath === entry.row.node.path,
               }"
+              role="treeitem"
+              :aria-level="entry.row.node.depth"
+              :aria-expanded="
+                entry.row.node.kind !== 'document' &&
+                entry.row.directChildCount > 0
+                  ? entry.row.expanded
+                  : undefined
+              "
+              :aria-selected="
+                selectedPath === entry.row.node.path ||
+                selectedPaths.has(entry.row.node.path)
+              "
               :draggable="!isRenamingRow(entry.row) && canDragNode(entry.row.node)"
               @contextmenu.prevent="openContextMenu($event, entry.row)"
+              @dblclick="onRowDoubleClick(entry.row)"
               @dragstart="onNodeDragStart(entry.row, $event)"
               @dragend="onNodeDragEnd"
               @dragover="onFolderDragOver(entry.row, $event)"
@@ -1077,6 +1626,7 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
                 class="kx-row"
                 :class="{ 'kx-row-editing': isRenamingRow(entry.row) }"
                 :style="{ paddingLeft: indentPx(entry.row.node) + 'px' }"
+                tabindex="-1"
                 @click="
                   !isRenamingRow(entry.row) && rowClick(entry.row, $event)
                 "
@@ -1098,7 +1648,7 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
                   />
                 </span>
                 <span
-                  v-else-if="entry.row.node.kind !== 'document'"
+                  v-else
                   class="kx-branch-spacer"
                   aria-hidden="true"
                 ></span>
@@ -1157,6 +1707,13 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
 
               <div v-if="entry.row.node.kind === 'folder'" class="kx-row-side">
                 <span
+                  v-if="isPluginManagedNode(entry.row.node)"
+                  class="kx-lock"
+                  :title="t('knowledge.explorer.pluginManaged')"
+                >
+                  <LucideIcon :icon="Lock" :size="11" :stroke-width="2.2" />
+                </span>
+                <span
                   v-for="tag in folderTags(entry.row.node)"
                   :key="`${entry.row.node.path}-${tag.text}`"
                   class="kx-flag"
@@ -1170,33 +1727,46 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
                 >
                   {{ tag.text }}
                 </span>
-                <span class="kx-count">{{
-                  entry.row.descendantDocumentCount
-                }}</span>
               </div>
               <div
                 v-else-if="entry.row.node.kind === 'package'"
                 class="kx-row-side"
               >
                 <span
+                  v-if="isPluginManagedNode(entry.row.node)"
+                  class="kx-lock"
+                  :title="t('knowledge.explorer.pluginManaged')"
+                >
+                  <LucideIcon :icon="Lock" :size="11" :stroke-width="2.2" />
+                </span>
+                <span
                   v-for="tag in packageTags(entry.row.node)"
                   :key="`${entry.row.node.path}-${tag.text}`"
                   class="kx-flag"
                   :class="{
+                    'flag-inject': tag.tone === 'inject',
+                    'flag-inject-strong': tag.tone === 'inject-strong',
                     'flag-command': tag.tone === 'command',
                   }"
                   :title="tag.title"
                 >
                   {{ tag.text }}
                 </span>
-                <span class="kx-count">{{
-                  entry.row.descendantDocumentCount
-                }}</span>
               </div>
               <div
-                v-else-if="documentTags(entry.row.node).length"
+                v-else-if="
+                  documentTags(entry.row.node).length ||
+                  isPluginManagedNode(entry.row.node)
+                "
                 class="kx-row-side"
               >
+                <span
+                  v-if="isPluginManagedNode(entry.row.node)"
+                  class="kx-lock"
+                  :title="t('knowledge.explorer.pluginManaged')"
+                >
+                  <LucideIcon :icon="Lock" :size="11" :stroke-width="2.2" />
+                </span>
                 <span
                   v-for="tag in documentTags(entry.row.node)"
                   :key="`${entry.row.node.document.id}-${tag.text}`"
@@ -1277,6 +1847,23 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
       >
         <div class="kx-empty-title">{{ t("knowledge.explorer.empty") }}</div>
         <div class="kx-empty-hint">{{ t("knowledge.noFilesHint") }}</div>
+        <div class="kx-empty-actions">
+          <BaseButton
+            class="kx-empty-action"
+            type="button"
+            @click="openToolbarCreate('document')"
+          >
+            {{ t("knowledge.explorer.createDoc") }}
+          </BaseButton>
+          <BaseButton
+            v-if="showToolbarImport"
+            class="kx-empty-action"
+            type="button"
+            @click="toolbarImport"
+          >
+            {{ toolbarImportLabel }}
+          </BaseButton>
+        </div>
       </div>
     </div>
 
@@ -1305,6 +1892,12 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
               "
               type="button"
               class="kx-ctx-item"
+              :disabled="renameBlockedByPlugin(ctxMenu)"
+              :title="
+                renameBlockedByPlugin(ctxMenu)
+                  ? t('knowledge.explorer.pluginManagedHint')
+                  : undefined
+              "
               @click="startRenameSelection"
             >
               {{ t("knowledge.explorer.rename") }}
@@ -1373,9 +1966,15 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
               {{ t("knowledge.explorer.createDoc") }}
             </button>
             <button
-              v-if="ctxMenu.kind === 'folder' && canDeleteContextTargets(ctxMenu)"
+              v-if="ctxMenu.kind === 'folder' && canShowDeleteItem(ctxMenu)"
               type="button"
               class="kx-ctx-item kx-ctx-item-danger"
+              :disabled="deleteBlockedByPlugin(ctxMenu)"
+              :title="
+                deleteBlockedByPlugin(ctxMenu)
+                  ? t('knowledge.explorer.pluginManagedHint')
+                  : undefined
+              "
               @click="requestDeleteSelectedNodes"
             >
               {{ deleteMenuLabel(ctxMenu) }}
@@ -1407,9 +2006,15 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
               {{ t("knowledge.explorer.openInFileSystem") }}
             </button>
             <button
-              v-if="canDeleteContextTargets(ctxMenu)"
+              v-if="canShowDeleteItem(ctxMenu)"
               type="button"
               class="kx-ctx-item kx-ctx-item-danger"
+              :disabled="deleteBlockedByPlugin(ctxMenu)"
+              :title="
+                deleteBlockedByPlugin(ctxMenu)
+                  ? t('knowledge.explorer.pluginManagedHint')
+                  : undefined
+              "
               @click="requestDeleteSelectedNodes"
             >
               {{ deleteMenuLabel(ctxMenu) }}
@@ -1420,6 +2025,12 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
               v-if="ctxMenu.targetNodes.length === 1"
               type="button"
               class="kx-ctx-item"
+              :disabled="renameBlockedByPlugin(ctxMenu)"
+              :title="
+                renameBlockedByPlugin(ctxMenu)
+                  ? t('knowledge.explorer.pluginManagedHint')
+                  : undefined
+              "
               @click="startRenameSelection"
             >
               {{ t("knowledge.explorer.rename") }}
@@ -1441,14 +2052,73 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
               {{ t("knowledge.explorer.openInFileSystem") }}
             </button>
             <button
-              v-if="canDeleteContextTargets(ctxMenu)"
+              v-if="canShowDeleteItem(ctxMenu)"
               type="button"
               class="kx-ctx-item kx-ctx-item-danger"
+              :disabled="deleteBlockedByPlugin(ctxMenu)"
+              :title="
+                deleteBlockedByPlugin(ctxMenu)
+                  ? t('knowledge.explorer.pluginManagedHint')
+                  : undefined
+              "
               @click="requestDeleteSelectedNodes"
             >
               {{ deleteMenuLabel(ctxMenu) }}
             </button>
           </template>
+    </BaseContextMenu>
+
+    <BaseContextMenu
+      v-if="searchCtxMenu"
+      class="kx-ctx-menu"
+      :x="searchCtxMenu.x"
+      :y="searchCtxMenu.y"
+      :z-index="80"
+      @close="closeSearchContextMenu"
+    >
+      <button type="button" class="kx-ctx-item" @click="openSearchResultFromMenu">
+        {{ t("knowledge.search.openResult") }}
+      </button>
+      <button
+        type="button"
+        class="kx-ctx-item"
+        @click="revealSearchResultFromMenu"
+      >
+        {{ t("knowledge.search.revealInTree") }}
+      </button>
+      <button
+        type="button"
+        class="kx-ctx-item"
+        @click="copySearchResultPathFromMenu"
+      >
+        {{ t("knowledge.explorer.copyRelativePath") }}
+      </button>
+    </BaseContextMenu>
+
+    <BaseContextMenu
+      v-if="legendMenu"
+      class="kx-legend-menu"
+      :x="legendMenu.x"
+      :y="legendMenu.y"
+      :z-index="80"
+      role="dialog"
+      :aria-label="t('knowledge.explorer.legend')"
+      @close="legendMenu = null"
+    >
+      <div class="kx-legend-title">{{ t("knowledge.explorer.legend") }}</div>
+      <div
+        v-for="entry in legendEntries"
+        :key="`${entry.tag.text}-${entry.label}`"
+        class="kx-legend-row"
+      >
+        <span class="kx-flag" :class="legendFlagClass(entry.tag.tone)">{{
+          entry.tag.text
+        }}</span>
+        <span class="kx-legend-text">
+          <span class="kx-legend-label">{{ entry.label }}</span>
+          <span class="kx-legend-desc">{{ entry.description }}</span>
+        </span>
+      </div>
     </BaseContextMenu>
   </div>
 </template>
@@ -1461,6 +2131,31 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
   min-width: 0;
   background: color-mix(in srgb, var(--panel-bg) 88%, var(--bg-color) 12%);
   overflow: hidden;
+  /* Inline-size container so badges can degrade at narrow sidebar widths. */
+  container-type: inline-size;
+}
+
+.kx-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 4px 8px;
+  border-bottom: 1px solid
+    color-mix(in srgb, var(--border-color) 72%, transparent);
+  flex-shrink: 0;
+}
+
+.kx-toolbar-spacer {
+  flex: 1;
+}
+
+.kx-toolbar-btn {
+  width: 24px;
+  min-width: 24px;
+  min-height: 24px;
+  height: 24px;
+  padding: 0;
+  border-color: transparent;
 }
 
 .kx-tree-shell {
@@ -1469,6 +2164,7 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
   display: flex;
   flex-direction: column;
   overflow: hidden;
+  outline: none;
 }
 
 .kx-tree {
@@ -1512,6 +2208,19 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
   font-size: 11px;
   color: var(--text-secondary);
   line-height: 1.5;
+}
+
+.kx-empty-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.kx-empty-action {
+  min-height: 26px;
+  padding: 0 10px;
+  font-size: 12px;
 }
 
 .kx-search-row {
@@ -1584,6 +2293,53 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
   white-space: nowrap;
 }
 
+.kx-search-snippet {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  margin-top: 2px;
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--text-secondary);
+  word-break: break-word;
+}
+
+.kx-search-mark {
+  background: color-mix(in srgb, var(--accent-color) 22%, transparent);
+  color: var(--text-color);
+  border-radius: 2px;
+  padding: 0 1px;
+}
+
+.kx-search-reveal {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border: none;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  opacity: 0;
+  transition:
+    opacity 0.12s,
+    background 0.12s;
+}
+
+.kx-search-row:hover .kx-search-reveal,
+.kx-search-row:focus-within .kx-search-reveal,
+.kx-search-reveal:focus-visible {
+  opacity: 1;
+}
+
+.kx-search-reveal:hover {
+  background: var(--hover-bg);
+  color: var(--text-color);
+}
+
 .kx-row-shell {
   position: relative;
   display: flex;
@@ -1591,6 +2347,8 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
   gap: 6px;
   width: 100%;
   min-width: 0;
+  /* Must equal FileTreeList's row-height so virtualization math stays exact. */
+  height: 30px;
   background: transparent;
   transition: background 0.1s;
 }
@@ -1599,9 +2357,28 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
   background: var(--hover-bg);
 }
 
-.kx-row-shell.selected,
-.kx-row-shell.selected:hover {
+/* The document open in the detail pane: filled row plus an accent bar. */
+.kx-row-shell.is-open,
+.kx-row-shell.is-open:hover {
   background: var(--active-bg);
+  box-shadow: inset 2px 0 0 var(--accent-color);
+}
+
+/* Multi-select marks stay visually lighter than the opened row. */
+.kx-row-shell.is-marked,
+.kx-row-shell.is-marked:hover {
+  background: color-mix(in srgb, var(--active-bg) 55%, transparent);
+}
+
+.kx-row-shell.is-open.is-marked,
+.kx-row-shell.is-open.is-marked:hover {
+  background: var(--active-bg);
+  box-shadow: inset 2px 0 0 var(--accent-color);
+}
+
+.kx-tree-shell:focus-within .kx-row-shell.is-focused {
+  outline: 1px solid color-mix(in srgb, var(--accent-color) 55%, transparent);
+  outline-offset: -1px;
 }
 
 .kx-row-shell.context-selected,
@@ -1627,7 +2404,7 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
   align-items: center;
   gap: 6px;
   width: 100%;
-  min-height: 26px;
+  height: 100%;
   padding: 2px 12px 2px 16px;
   border: none;
   background: transparent;
@@ -1655,10 +2432,13 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
   flex-shrink: 0;
 }
 
-.kx-count {
-  font-size: 11px;
+.kx-lock {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   color: var(--text-secondary);
-  opacity: 0.7;
+  opacity: 0.75;
+  flex-shrink: 0;
 }
 
 .kx-branch-slot,
@@ -1853,7 +2633,7 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
   display: flex;
   align-items: center;
   gap: 8px;
-  min-height: 30px;
+  height: 30px;
   padding: 2px 12px 2px 16px;
   background: color-mix(in srgb, var(--active-bg) 78%, transparent);
 }
@@ -1904,7 +2684,7 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
   align-items: center;
   gap: 6px;
   width: 100%;
-  min-height: 30px;
+  height: 30px;
   padding: 2px 12px 2px 16px;
   border: none;
   background: transparent;
@@ -1930,4 +2710,58 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
   color: var(--text-secondary);
 }
 
+.kx-legend-menu {
+  width: 264px;
+  padding: 8px;
+}
+
+.kx-legend-title {
+  padding: 2px 4px 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-color);
+}
+
+.kx-legend-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 4px;
+  border-radius: 6px;
+}
+
+.kx-legend-row .kx-flag {
+  margin-top: 1px;
+}
+
+.kx-legend-text {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.kx-legend-label {
+  font-size: 12px;
+  line-height: 1.35;
+  color: var(--text-color);
+}
+
+.kx-legend-desc {
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--text-secondary);
+  white-space: normal;
+}
+
+/* Narrow sidebar: keep only the inject level; secondary chips would
+   otherwise squeeze the file name into an ellipsis. */
+@container (max-width: 259px) {
+  .kx-row-side .kx-flag.flag-command,
+  .kx-row-side .kx-flag.flag-auto,
+  .kx-row-side .kx-flag.flag-search-on,
+  .kx-row-side .kx-flag.flag-external {
+    display: none;
+  }
+}
 </style>

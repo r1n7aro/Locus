@@ -2251,6 +2251,15 @@ export function useKnowledgeState(props: KnowledgeProps) {
     );
   }
 
+  function collapseAllForType(type: KnowledgeDocumentType) {
+    const prefix = `${type}/`;
+    expandedPaths.value = new Set(
+      Array.from(expandedPaths.value).filter(
+        (entry) => !entry.startsWith(prefix),
+      ),
+    );
+  }
+
   function pruneUnityReferenceManagedEntries() {
     documents.value = documents.value.filter(
       (doc) =>
@@ -3737,6 +3746,17 @@ export function useKnowledgeState(props: KnowledgeProps) {
         : node.kind === "package"
           ? fullDocumentPath("skill", node.packageId)
           : fullDocumentPath(node.document.type, node.document.path);
+    await copyKnowledgeRelativePath(relativePath);
+  }
+
+  async function copySearchResultRelativePath(result: KnowledgeSearchResult) {
+    const normalizedPath = result.path.replace(/\\/g, "/").replace(/^\/+/, "");
+    await copyKnowledgeRelativePath(
+      fullDocumentPath(result.type, normalizedPath),
+    );
+  }
+
+  async function copyKnowledgeRelativePath(relativePath: string) {
     if (!relativePath.trim()) return;
 
     try {
@@ -3849,6 +3869,15 @@ export function useKnowledgeState(props: KnowledgeProps) {
       ? `${normalizedTargetDir}/${fileName}`
       : fileName;
     await moveDocumentPath(node.document.path, nextPath, node.document.type);
+  }
+
+  async function moveExplorerNodes(nodes: ExplorerNode[], targetDir: string) {
+    // Sequential on purpose: each move funnels through enqueueMutation and
+    // refreshes shared state; firing them concurrently would race selection
+    // syncing for multi-node drags.
+    for (const node of nodes) {
+      await moveExplorerNode(node, targetDir);
+    }
   }
 
   async function selectDocumentByPath(path: string) {
@@ -4033,6 +4062,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
     togglePath,
     expandPath,
     expandAncestors,
+    collapseAllForType,
     hasMoreRootDocuments,
     hasMoreDirectoryDocuments,
     hasLoadedDirectoryDocuments,
@@ -4086,7 +4116,9 @@ export function useKnowledgeState(props: KnowledgeProps) {
     renameExplorerFolder,
     renameExplorerDocument,
     copyExplorerRelativePath,
+    copySearchResultRelativePath,
     openExplorerInFileSystem,
     moveExplorerNode,
+    moveExplorerNodes,
   };
 }
