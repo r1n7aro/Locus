@@ -327,6 +327,15 @@ async fn run_interactive_command(
         } else {
             envs
         };
+        // Runs before the user's command and never affects its exit status;
+        // only conhost needs it, other platforms handle ANSI natively.
+        let sh_command_with_vt;
+        let sh_command = if cfg!(target_os = "windows") {
+            sh_command_with_vt = format!("{}\n{}", vt_enable_sh_line(), sh_command);
+            sh_command_with_vt.as_str()
+        } else {
+            sh_command
+        };
         (
             temp_dir.join(format!("locus-interactive-{}.sh", run_id)),
             build_interactive_sh_script(sh_command, workdir, script_envs, &marker_path),
@@ -588,6 +597,39 @@ fn find_sh_for_interactive(envs: &[(String, OsString)]) -> Option<PathBuf> {
     None
 }
 
+// Classic conhost windows (opened via `start`) do not process ANSI escapes
+// by default, so TUI prompts re-render as appended duplicates instead of
+// redrawing in place. VT processing is a property of the console screen
+// buffer: enabling it once before the user's command makes every later write
+// in that window render correctly. The PowerShell snippet is passed as
+// -EncodedCommand (base64 of UTF-16LE) to stay immune to sh/cmd quoting.
+fn vt_enable_encoded_command() -> &'static str {
+    static ENCODED: OnceLock<String> = OnceLock::new();
+    ENCODED.get_or_init(|| {
+        use base64::Engine;
+        const SOURCE: &str = concat!(
+            "try{$sig='[DllImport(\"kernel32.dll\")]public static extern IntPtr GetStdHandle(int n);",
+            "[DllImport(\"kernel32.dll\")]public static extern bool GetConsoleMode(IntPtr h,out uint m);",
+            "[DllImport(\"kernel32.dll\")]public static extern bool SetConsoleMode(IntPtr h,uint m);';",
+            "$k=Add-Type -MemberDefinition $sig -Name Vt -Namespace LocusConsole -PassThru;",
+            "foreach($n in @(-11,-12)){$h=$k::GetStdHandle($n);$m=0;",
+            "if($k::GetConsoleMode($h,[ref]$m)){[void]$k::SetConsoleMode($h,$m -bor 4)}}}catch{}",
+        );
+        let utf16: Vec<u8> = SOURCE
+            .encode_utf16()
+            .flat_map(|unit| unit.to_le_bytes())
+            .collect();
+        base64::engine::general_purpose::STANDARD.encode(utf16)
+    })
+}
+
+fn vt_enable_sh_line() -> String {
+    format!(
+        "powershell.exe -NoProfile -NonInteractive -EncodedCommand {} >/dev/null 2>&1 || true",
+        vt_enable_encoded_command()
+    )
+}
+
 fn sh_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
@@ -631,6 +673,7 @@ fn build_interactive_cmd_script(command: &str, workdir: &str, marker_path: &Path
         concat!(
             "@echo off\r\n",
             "chcp 65001 >nul\r\n",
+            "powershell.exe -NoProfile -NonInteractive -EncodedCommand {vt} >nul 2>&1\r\n",
             "cd /d \"{workdir}\"\r\n",
             "if errorlevel 1 (\r\n",
             "  echo [Locus] Failed to enter the working directory.\r\n",
@@ -649,6 +692,7 @@ fn build_interactive_cmd_script(command: &str, workdir: &str, marker_path: &Path
         workdir = workdir,
         marker = marker,
         command = command,
+        vt = vt_enable_encoded_command(),
     )
 }
 
@@ -699,5 +743,19 @@ mod tests {
         // text would otherwise be parsed as a file-descriptor redirection.
         assert!(script.contains(">\"C:\\temp\\marker.exit\" echo %__LOCUS_STATUS%\r\n"));
         assert!(script.contains("pause >nul\r\n"));
+        assert!(script.contains("-EncodedCommand"));
+    }
+
+    #[test]
+    fn vt_enable_line_is_quoting_safe_and_never_fails() {
+        let line = vt_enable_sh_line();
+        assert!(line.contains("-EncodedCommand"));
+        assert!(line.ends_with("|| true"));
+        // base64 payload must not need any shell quoting
+        let encoded = vt_enable_encoded_command();
+        assert!(!encoded.is_empty());
+        assert!(encoded
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '='));
     }
 }
