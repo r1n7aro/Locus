@@ -1,0 +1,62 @@
+{
+  "description": "Present a multi-field confirmation sheet so the user can review, adjust, and approve a complex configuration before you execute it. The user can edit individual field values inline, or reject the whole proposal with overall feedback typed below the form.\n\n## When to Use\n- Before an irreversible or outward-facing step that bundles several values, such as publishing or exporting plugin metadata (id, name, version, components, output path)\n- Before applying a multi-field configuration where the user should be able to correct individual values instead of answering one question at a time\n- When a workflow or skill explicitly requires confirming collected metadata through this tool\n\n## When NOT to Use\n- A single question or an either/or decision: use ask_user_question\n- Approval of a single tool action: the tool confirmation flow already handles that\n- Values you can derive with certainty and that are cheap to change later\n\n## Outcome\nThe result reports either a confirmation with the final field values (including any user edits, listed under changedKeys) or a change request with the user's overall feedback. After a change request, revise the proposal and present an updated sheet before proceeding. Never proceed with the action while the latest sheet outcome is a change request.\n\n## Guidelines\n- Prefill every field with your best proposal; never present empty fields just to collect input\n- Use stable snake_case or camelCase keys; keys are echoed back in the result\n- Mark derived or locked values as readonly so the user sees them without editing them\n- Use options for a closed set of valid choices, and multiline for long text such as descriptions\n- Keep the sheet focused: one sheet per decision, at most 24 fields",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "title": {
+        "type": "string",
+        "description": "Short title stating what the user is confirming, for example 'Publish plugin asset-tools 0.1.0'."
+      },
+      "description": {
+        "type": "string",
+        "description": "Optional context shown under the title: what happens after confirmation and anything the user should double-check."
+      },
+      "confirmLabel": {
+        "type": "string",
+        "description": "Optional label for the confirm button, for example 'Publish' or 'Export'. Defaults to a generic confirm label."
+      },
+      "fields": {
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 24,
+        "description": "Fields to review. Each field is prefilled with the proposed value and editable unless marked readonly.",
+        "items": {
+          "type": "object",
+          "properties": {
+            "key": {
+              "type": "string",
+              "description": "Stable identifier echoed back in the result, for example 'version' or 'outputPath'."
+            },
+            "label": {
+              "type": "string",
+              "description": "Short display name for the field."
+            },
+            "value": {
+              "type": "string",
+              "description": "Proposed value shown to the user."
+            },
+            "description": {
+              "type": "string",
+              "description": "Optional one-line hint explaining the field or where the proposal came from."
+            },
+            "multiline": {
+              "type": "boolean",
+              "description": "Render a multi-line text area instead of a single-line input. Default false."
+            },
+            "options": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "Optional closed set of valid values rendered as a dropdown. Include the proposed value."
+            },
+            "readonly": {
+              "type": "boolean",
+              "description": "Show the value without allowing edits. Edits submitted for readonly fields are ignored. Default false."
+            }
+          },
+          "required": ["key", "label", "value"]
+        }
+      }
+    },
+    "required": ["title", "fields"]
+  }
+}

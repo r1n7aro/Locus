@@ -45,6 +45,21 @@ use prompt_context::{
     detect_input_system, detect_render_pipeline, parse_physics_config, parse_tag_manager,
 };
 
+const REACTIVE_COMPACT_ATTEMPT_KIND: &str = "reactive_compact";
+
+/// Classify a compaction for the UI: manual (user-invoked), auto (preflight
+/// estimate crossed the threshold), or reactive (the request was already sent
+/// and the server rejected it as over the context window).
+fn compact_trigger(force_compact: bool, attempt_kind: &str) -> crate::commands::CompactTrigger {
+    if force_compact {
+        crate::commands::CompactTrigger::Manual
+    } else if attempt_kind == REACTIVE_COMPACT_ATTEMPT_KIND {
+        crate::commands::CompactTrigger::Reactive
+    } else {
+        crate::commands::CompactTrigger::Auto
+    }
+}
+
 fn is_codex_unauthorized_error(error: &str) -> bool {
     let lower = error.to_ascii_lowercase();
     lower.contains("401 unauthorized")
@@ -218,6 +233,7 @@ pub struct AgentInstance {
     app_knowledge_dir: Arc<Option<std::path::PathBuf>>,
     app_agent_dir: Arc<Option<std::path::PathBuf>>,
     knowledge_access_mode: KnowledgeAccessMode,
+    knowledge_focus: Option<KnowledgeFocusDoc>,
     undo_manager: Option<Arc<crate::vcs::UndoManager>>,
     subagent_model_overrides: std::collections::HashMap<String, String>,
     tool_runtime_state: Arc<ToolRuntimeState>,
@@ -225,6 +241,15 @@ pub struct AgentInstance {
     document_skill_tool_names: Mutex<HashSet<String>>,
     partial_assistant: Arc<AssistantStreamState>,
     cancel_rx: tokio::sync::watch::Receiver<bool>,
+}
+
+/// Knowledge document the session is scoped to (the document open next to an
+/// embedded knowledge chat). Injected into the env prompt each run so the
+/// model always sees the current document without polluting user messages.
+#[derive(Debug, Clone)]
+pub struct KnowledgeFocusDoc {
+    pub doc_type: crate::knowledge_store::KnowledgeType,
+    pub path: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2171,6 +2196,60 @@ fn build_l2_full_document_section(
     ))
 }
 
+const KNOWLEDGE_FOCUS_BODY_CHAR_LIMIT: usize = 6000;
+
+fn build_knowledge_focus_section(doc: &crate::knowledge_store::KnowledgeDocument) -> String {
+    let scope = match doc.storage_source {
+        crate::knowledge_store::KnowledgeStorageSource::App => "user (app-level)",
+        _ => "project",
+    };
+    let mut lines = vec![
+        "## Active Knowledge Document".to_string(),
+        "The user has this knowledge document open in the Knowledge panel, and this conversation is scoped to it. When the user says \"this document\" or \"当前文档\", they mean this one. Prioritize working on it.".to_string(),
+        format!("- Title: {}", doc.title),
+        format!("- Path: {}/{}", doc.doc_type, doc.path),
+        format!("- Type: {}", doc.doc_type),
+        format!("- Scope: {}", scope),
+        format!("- Read-only: {}", if doc.read_only { "yes (do not edit; discuss content and produce suggestions only)" } else { "no" }),
+    ];
+
+    if doc.summary_enabled {
+        if let Some(summary) = doc.summary.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            lines.push("### Summary".to_string());
+            lines.push(summary.to_string());
+        }
+    }
+    if doc.explicit_maintenance_rules {
+        if let Some(rules) = doc
+            .maintenance_rules
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            lines.push("### Maintenance Rules".to_string());
+            lines.push(rules.to_string());
+        }
+    }
+
+    let body = doc.body.trim();
+    if body.is_empty() {
+        lines.push("### Body".to_string());
+        lines.push("<empty>".to_string());
+    } else if body.chars().count() <= KNOWLEDGE_FOCUS_BODY_CHAR_LIMIT {
+        lines.push("### Body".to_string());
+        lines.push(remap_document_body_headings(body, 4));
+    } else {
+        let excerpt: String = body.chars().take(KNOWLEDGE_FOCUS_BODY_CHAR_LIMIT).collect();
+        lines.push(format!(
+            "### Body (truncated to the first {} characters; use `knowledge_read` with the path above for the full document)",
+            KNOWLEDGE_FOCUS_BODY_CHAR_LIMIT
+        ));
+        lines.push(remap_document_body_headings(&excerpt, 4));
+    }
+
+    lines.join("\n")
+}
+
 fn parse_markdown_heading_level(line: &str) -> Option<(usize, &str, &str)> {
     let trimmed_start = line.trim_start_matches(' ');
     let indent_len = line.len().saturating_sub(trimmed_start.len());
@@ -2851,6 +2930,7 @@ impl AgentInstance {
             app_knowledge_dir,
             app_agent_dir,
             knowledge_access_mode,
+            knowledge_focus: None,
             undo_manager,
             subagent_model_overrides,
             tool_runtime_state: Arc::new(ToolRuntimeState::default()),
@@ -2863,6 +2943,10 @@ impl AgentInstance {
 
     pub fn partial_assistant_state(&self) -> Arc<AssistantStreamState> {
         self.partial_assistant.clone()
+    }
+
+    pub fn set_knowledge_focus(&mut self, focus: Option<KnowledgeFocusDoc>) {
+        self.knowledge_focus = focus;
     }
 
     async fn build_tool_execution_context(
@@ -3107,6 +3191,26 @@ impl AgentInstance {
             return crate::config::DynamicToolLoadingMode::MetaTool;
         }
         Self::dynamic_tool_loading_mode_from_app_handle(app_handle)
+    }
+
+    /// Context-window budget for the active backend/model. Codex models
+    /// prefer the per-model effective window from the cached /models
+    /// manifest; the static `model_context_limit` table only guesses
+    /// per-family budgets and mis-sizes new variants.
+    fn context_limit(&self) -> u32 {
+        match &self.backend {
+            LlmBackend::Custom { context_length, .. } => *context_length,
+            LlmBackend::OpenAiCodex { .. } => crate::commands::persistent_config_dir()
+                .ok()
+                .and_then(|cache_dir| {
+                    crate::llm::codex_models::cached_effective_context_window(
+                        &cache_dir,
+                        &self.effective_model,
+                    )
+                })
+                .unwrap_or_else(|| model_context_limit(&self.effective_model)),
+            _ => model_context_limit(&self.effective_model),
+        }
     }
 
     async fn build_request_tool_names(&self) -> Vec<String> {
@@ -3786,6 +3890,30 @@ impl AgentInstance {
         }
         remove_block(&mut env, "knowledge_index");
         remove_block(&mut env, "knowledge_memory");
+
+        // Session-scoped document focus (embedded knowledge chat). Loaded
+        // fresh every run so the env always reflects the document's latest state.
+        if let Some(focus) = &self.knowledge_focus {
+            if has_working_dir && self.knowledge_access_mode.allows_context() {
+                match crate::knowledge_store::load_document_by_path_with_app_root(
+                    &self.working_dir,
+                    self.app_knowledge_dir.as_ref().as_ref(),
+                    focus.doc_type,
+                    &focus.path,
+                ) {
+                    Ok(doc) => {
+                        env.push_str("\n\n");
+                        env.push_str(&build_knowledge_focus_section(&doc));
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "[Agent {}] knowledge focus document unavailable: session={} path={}/{} error={}",
+                            self.id, self.session_id, focus.doc_type, focus.path, error
+                        );
+                    }
+                }
+            }
+        }
         eprintln!(
             "[Agent {}] system prompt knowledge context ready: session={} elapsed_ms={} requested={} chars={}",
             self.id,
@@ -5705,6 +5833,207 @@ impl AgentInstance {
         context_tokens
     }
 
+    /// Default compaction path for the OpenAI Codex subscription backend,
+    /// aligned with codex-rs: a unary `POST /responses/compact` call whose
+    /// response carries an encrypted compaction item. The item is stored on the
+    /// handoff message and replayed to the Codex API by the payload builders;
+    /// the handoff text itself is only a local fallback for other backends.
+    async fn execute_codex_remote_compact(
+        &self,
+        app_handle: &AppHandle,
+        store: &SessionStore,
+        system_parts: &[&str],
+        context_tokens: u32,
+        context_limit: u32,
+        run_id: &str,
+        attempt_kind: &str,
+        trigger: crate::commands::CompactTrigger,
+        iteration: usize,
+    ) -> Result<bool, String> {
+        let LlmBackend::OpenAiCodex { auth, base_url, .. } = &self.backend else {
+            return Ok(false);
+        };
+
+        let messages = store.get_messages_for_prompt(&self.session_id)?;
+        if messages.len() < 2 {
+            return Ok(false);
+        }
+        let messages_before = messages.len() as u32;
+
+        let mut prepared = compact::prepare_messages_for_llm(&messages);
+        let request_tools = self.build_request_tool_names().await;
+        let api_tools = self.build_api_tools(&request_tools).await;
+        let rewritten = compact::trim_tool_outputs_to_fit_context_window(
+            &mut prepared,
+            system_parts,
+            &api_tools,
+            context_limit,
+        );
+        if rewritten > 0 {
+            eprintln!(
+                "[Agent {}] rewrote {} tool output(s) before remote compaction",
+                self.id, rewritten
+            );
+        }
+
+        let boundary_idx = compact::find_compact_boundary_by_budget(
+            &messages,
+            compact::compact_recent_tail_token_budget(context_limit),
+        );
+        let response_request_metadata = store.get_response_request_metadata(&self.session_id)?;
+        let system_prompt = system_parts.join("\n\n");
+        let model_name = &self.effective_model;
+        let actual_model = model_name.strip_prefix("openai/").unwrap_or(model_name);
+
+        emit_stream(
+            app_handle,
+            run_id,
+            StreamEvent::CompactStart {
+                session_id: self.session_id.clone(),
+                context_tokens,
+                context_limit,
+                trigger: Some(trigger),
+            },
+        );
+
+        let (access_token, account_id) = resolve_codex_request_auth(auth, false)
+            .await
+            .map_err(|e| format!("OpenAI Codex token failed (please re-login): {}", e))?;
+        let compact_result = match codex::compact_conversation_history(
+            &access_token,
+            account_id.as_deref(),
+            base_url.as_deref(),
+            actual_model,
+            &system_prompt,
+            &prepared,
+            &api_tools,
+            self.effort.as_deref(),
+            Some(&self.session_id),
+            Some(&response_request_metadata),
+            self.debug,
+        )
+        .await
+        {
+            Ok(outcome) => Ok(outcome),
+            Err(error) if is_codex_unauthorized_error(&error) => {
+                eprintln!(
+                    "[OpenAI Codex] compact received unauthorized response, refreshing auth and retrying once"
+                );
+                let (access_token, account_id) = resolve_codex_request_auth(auth, true)
+                    .await
+                    .map_err(|e| format!("OpenAI Codex token refresh failed: {}", e))?;
+                codex::compact_conversation_history(
+                    &access_token,
+                    account_id.as_deref(),
+                    base_url.as_deref(),
+                    actual_model,
+                    &system_prompt,
+                    &prepared,
+                    &api_tools,
+                    self.effort.as_deref(),
+                    Some(&self.session_id),
+                    Some(&response_request_metadata),
+                    self.debug,
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        };
+
+        let outcome = match compact_result {
+            Ok(outcome) => {
+                self.record_raw_attempt(
+                    attempt_kind,
+                    iteration,
+                    1,
+                    system_parts,
+                    &prepared,
+                    &api_tools,
+                    context_tokens,
+                    true,
+                    &outcome.raw_response,
+                    Some(false),
+                )
+                .await;
+                outcome
+            }
+            Err(error) => {
+                self.record_raw_attempt(
+                    attempt_kind,
+                    iteration,
+                    1,
+                    system_parts,
+                    &prepared,
+                    &api_tools,
+                    context_tokens,
+                    false,
+                    &error,
+                    Some(false),
+                )
+                .await;
+                return Err(error);
+            }
+        };
+
+        eprintln!(
+            "[Agent {}] codex remote compact returned {} output item(s), encrypted summary {} chars",
+            self.id,
+            outcome.output_item_count,
+            outcome.encrypted_content.len()
+        );
+
+        // The authoritative summary is encrypted for the Codex API only; keep a
+        // deterministic local digest so other backends and the UI retain usable
+        // handoff context if the session later switches models.
+        let summary = compact::build_emergency_compact_summary(
+            &messages,
+            boundary_idx,
+            "the Codex remote compaction summary is an encrypted item that only the Codex API can read",
+        );
+        let keep_from_msg = &messages[boundary_idx];
+        let restored_files_section =
+            compact::build_post_compact_restored_files_section(&messages, &self.working_dir);
+        let summary_msg = compact::build_post_compact_message(
+            &summary,
+            &restored_files_section,
+            keep_from_msg.created_at,
+            boundary_idx + 1 < messages.len(),
+        );
+
+        let (count_before, count_after) =
+            store.compact_messages(&self.session_id, &summary_msg, &keep_from_msg.id)?;
+        store.set_message_response_request_metadata(
+            &self.session_id,
+            &summary_msg.id,
+            &serde_json::json!({
+                "codex_compaction": { "encrypted_content": outcome.encrypted_content }
+            }),
+        )?;
+        crate::llm::codex::reset_cached_session_window(&self.session_id).await;
+        let compacted_context_tokens = self
+            .persist_compacted_context_usage(store, system_parts, context_limit)
+            .await;
+        let compacted_messages = store.get_messages(&self.session_id)?;
+        eprintln!(
+            "[Agent {}] codex remote compact done: {} → {} messages",
+            self.id, count_before, count_after
+        );
+        emit_stream(
+            app_handle,
+            run_id,
+            StreamEvent::CompactDone {
+                session_id: self.session_id.clone(),
+                messages_before,
+                messages_after: count_after,
+                context_tokens: compacted_context_tokens,
+                context_limit,
+                messages: compacted_messages,
+            },
+        );
+
+        Ok(true)
+    }
+
     async fn execute_auto_compact(
         &self,
         app_handle: &AppHandle,
@@ -5717,6 +6046,36 @@ impl AgentInstance {
         attempt_kind: &str,
         iteration: usize,
     ) -> Result<bool, String> {
+        let trigger = compact_trigger(force_compact, attempt_kind);
+        // Codex subscription sessions default to the remote compaction endpoint
+        // (codex-rs default strategy); the prompt-based flow below stays as the
+        // fallback when the endpoint is unavailable or returns no compaction.
+        if matches!(self.backend, LlmBackend::OpenAiCodex { .. }) {
+            match self
+                .execute_codex_remote_compact(
+                    app_handle,
+                    store,
+                    system_parts,
+                    context_tokens,
+                    context_limit,
+                    run_id,
+                    attempt_kind,
+                    trigger,
+                    iteration,
+                )
+                .await
+            {
+                Ok(true) => return Ok(true),
+                Ok(false) => return Ok(false),
+                Err(error) => {
+                    eprintln!(
+                        "[Agent {}] codex remote compact failed, falling back to prompt-based compact: {}",
+                        self.id, error
+                    );
+                }
+            }
+        }
+
         let messages = store.get_messages_for_prompt(&self.session_id)?;
         if messages.len() < 2 {
             return Ok(false);
@@ -5775,6 +6134,7 @@ impl AgentInstance {
                         session_id: self.session_id.clone(),
                         context_tokens,
                         context_limit,
+                        trigger: Some(trigger),
                     },
                 );
                 let summary = compact::build_emergency_compact_summary(&messages, boundary_idx, &e);
@@ -5861,6 +6221,7 @@ impl AgentInstance {
                 session_id: self.session_id.clone(),
                 context_tokens,
                 context_limit,
+                trigger: Some(trigger),
             },
         );
 
@@ -6594,16 +6955,48 @@ impl AgentInstance {
         }
     }
 
-    fn emit_cancelled(&self, app_handle: &AppHandle, store: &SessionStore, run_id: &str) {
+    fn emit_cancelled(
+        &self,
+        app_handle: &AppHandle,
+        store: &SessionStore,
+        run_id: &str,
+        revocable_user_message: Option<&crate::session::models::ChatMessage>,
+    ) {
         let interrupted = Self::persist_interrupted_assistant_snapshot(
             store,
             &self.session_id,
             &self.partial_assistant.snapshot(),
         );
         self.partial_assistant.reset();
+        // A cancel that lands before the run produced any assistant output
+        // takes the user message back: remove it from the session so the
+        // frontend can return the text to the composer.
+        let removed_user_message = if interrupted.is_none() {
+            revocable_user_message.and_then(|message| {
+                match store.delete_message(&self.session_id, &message.id) {
+                    Ok(true) => Some(message.clone()),
+                    Ok(false) => None,
+                    Err(error) => {
+                        eprintln!(
+                            "[Agent {}] failed to revoke user message {} for cancelled session {}: {}",
+                            self.id, message.id, self.session_id, error
+                        );
+                        None
+                    }
+                }
+            })
+        } else {
+            None
+        };
         eprintln!(
-            "[Agent {}] emitting Cancelled for session {} run {}",
-            self.id, self.session_id, run_id
+            "[Agent {}] emitting Cancelled for session {} run {} revoked_user_message={}",
+            self.id,
+            self.session_id,
+            run_id,
+            removed_user_message
+                .as_ref()
+                .map(|message| message.id.as_str())
+                .unwrap_or("none")
         );
         emit_stream(
             app_handle,
@@ -6621,6 +7014,7 @@ impl AgentInstance {
                     .and_then(|message| message.thinking_content.clone()),
                 thinking_duration: interrupted.and_then(|message| message.thinking_duration),
                 render_parts: None,
+                removed_user_message,
             },
         );
     }
@@ -6728,11 +7122,7 @@ impl AgentInstance {
                 }
                 parts
             };
-            let ctx_limit = if let LlmBackend::Custom { context_length, .. } = &self.backend {
-                *context_length
-            } else {
-                model_context_limit(&self.effective_model)
-            };
+            let ctx_limit = self.context_limit();
             let messages = store.get_messages_for_prompt(&self.session_id)?;
             let prepared_messages = compact::prepare_messages_for_llm(&messages);
             let active_skill_tool_names = self.active_skill_tool_names(&selected_skill_tool_names);
@@ -6788,11 +7178,25 @@ impl AgentInstance {
             return Ok(String::new());
         }
 
+        if self.is_cancel_requested() {
+            self.emit_cancelled(app_handle, store, &run_id, None);
+            return Ok(String::new());
+        }
+
         let user_text_started_at = Instant::now();
         let actual_user_text: String;
         if crate::unity_bridge::is_unity_project(&self.working_dir) {
-            let (_connected, status, active_scene) =
-                crate::unity_bridge::query_unity_status(&self.working_dir).await;
+            // The status probe can stall on a busy editor; race it against the
+            // cancel signal so a cancel during prep reacts immediately.
+            let mut cancel_rx = self.cancel_waiter();
+            let probed_status = tokio::select! {
+                status = crate::unity_bridge::query_unity_status(&self.working_dir) => Some(status),
+                _ = cancel_rx.changed() => None,
+            };
+            let Some((_connected, status, active_scene)) = probed_status else {
+                self.emit_cancelled(app_handle, store, &run_id, None);
+                return Ok(String::new());
+            };
             let current_state = (status.to_string(), active_scene.clone());
 
             let mut state_map = session_unity_state().lock().await;
@@ -6861,6 +7265,13 @@ impl AgentInstance {
             prompt_parts.rules_prompt.len(),
             prompt_parts.knowledge_prompt.len()
         );
+        // Never persist the user message once a cancel has been requested —
+        // the frontend returns the unsent draft to the composer instead.
+        if self.is_cancel_requested() {
+            self.emit_cancelled(app_handle, store, &run_id, None);
+            return Ok(String::new());
+        }
+
         let persist_user_message_started_at = Instant::now();
         let env_prompt_prefix = Self::wrap_system_reminder(&prompt_parts.env_prompt);
         let user_prompt_suffix = self.build_user_prompt_suffix(initial_mode, user_intent.as_ref());
@@ -6899,7 +7310,7 @@ impl AgentInstance {
             })?;
         emit_stream(app_handle, &run_id, StreamEvent::UserMessage {
             session_id: self.session_id.clone(),
-            message: current_user_message,
+            message: current_user_message.clone(),
         });
         if let Some(pending_input_id) = accepted_pending_input_id.as_deref() {
             emit_stream(app_handle, &run_id, StreamEvent::PendingInputAccepted {
@@ -7000,6 +7411,10 @@ impl AgentInstance {
         // 3. Agent Loop
         let mut iteration = 0;
         let mut compact_tracker = compact::CompactTracker::new();
+        // (actual_prompt_tokens, estimated_tokens) of the latest completed LLM
+        // call in this run; calibrates the byte-heuristic estimate against the
+        // provider's real tokenization for auto-compact decisions.
+        let mut estimate_calibration_sample: Option<(u32, u32)> = None;
         let final_text;
         let final_thinking_text;
         let final_thinking_duration: u32;
@@ -7010,6 +7425,9 @@ impl AgentInstance {
         let final_thinking_order;
         let mut done_already_emitted = false;
         let mut terminal_done_message_id: Option<String> = None;
+        // Tracks whether this run has persisted any assistant message yet; a
+        // cancel before that revokes the user message back to the composer.
+        let mut assistant_round_persisted = false;
         let mut codex_turn_state = matches!(self.backend, LlmBackend::OpenAiCodex { .. })
             .then(codex::TurnState::default);
         let render_order_tracker = Arc::new(Mutex::new(StreamRenderOrderTracker::default()));
@@ -7025,7 +7443,13 @@ impl AgentInstance {
 
             if self.is_cancel_requested() {
                 self.clear_pending_knowledge_proposal(app_handle).await;
-                self.emit_cancelled(app_handle, store, &run_id);
+                self.emit_cancelled(
+                    app_handle,
+                    store,
+                    &run_id,
+                    (iteration == 1 && !assistant_round_persisted)
+                        .then_some(&current_user_message),
+                );
                 return Ok(String::new());
             }
 
@@ -7044,11 +7468,7 @@ impl AgentInstance {
                 }
                 parts
             };
-            let ctx_limit = if let LlmBackend::Custom { context_length, .. } = &self.backend {
-                *context_length
-            } else {
-                model_context_limit(&self.effective_model)
-            };
+            let ctx_limit = self.context_limit();
             let prepared_messages = compact::prepare_messages_for_llm(&messages);
             let active_skill_tool_names = self.active_skill_tool_names(&selected_skill_tool_names);
             let request_tools = self
@@ -7060,11 +7480,23 @@ impl AgentInstance {
             let api_tools = self.build_api_tools(&request_tools).await;
             let estimated_input_tokens =
                 compact::estimate_request_tokens(&system_parts, &prepared_messages, &api_tools);
+            // Real usage recorded for the session (API-reported during normal
+            // rounds, locally estimated right after compact); floors the
+            // estimate for the first request of a run.
+            let persisted_context_tokens = store
+                .get_token_usage(&self.session_id)
+                .map(|usage| usage.context_tokens)
+                .unwrap_or(0);
+            let effective_input_tokens = compact::calibrated_input_tokens(
+                estimated_input_tokens,
+                estimate_calibration_sample,
+                persisted_context_tokens,
+            );
             let is_codex_backend = matches!(self.backend, LlmBackend::OpenAiCodex { .. });
             let should_preflight_compact = if is_codex_backend {
-                compact::should_codex_auto_compact(estimated_input_tokens, ctx_limit)
+                compact::should_codex_auto_compact(effective_input_tokens, ctx_limit)
             } else {
-                compact::should_auto_compact(estimated_input_tokens, ctx_limit)
+                compact::should_auto_compact(effective_input_tokens, ctx_limit)
             };
             let mut preflight_compact_error: Option<String> = None;
 
@@ -7072,9 +7504,12 @@ impl AgentInstance {
                 && should_preflight_compact
             {
                 eprintln!(
-                    "[Agent {}] preflight auto-compact candidate: estimated_tokens={}, limit={}, messages={} -> {}",
+                    "[Agent {}] preflight auto-compact candidate: estimated_tokens={}, effective_tokens={}, persisted_context_tokens={}, calibration_sample={:?}, limit={}, messages={} -> {}",
                     self.id,
                     estimated_input_tokens,
+                    effective_input_tokens,
+                    persisted_context_tokens,
+                    estimate_calibration_sample,
                     ctx_limit,
                     messages.len(),
                     prepared_messages.len()
@@ -7084,7 +7519,7 @@ impl AgentInstance {
                         app_handle,
                         store,
                         &system_parts,
-                        estimated_input_tokens,
+                        effective_input_tokens,
                         ctx_limit,
                         false,
                         &run_id,
@@ -7108,23 +7543,24 @@ impl AgentInstance {
             }
 
             if is_codex_backend
-                && compact::should_codex_block_normal_send(estimated_input_tokens, ctx_limit)
+                && compact::should_codex_block_normal_send(effective_input_tokens, ctx_limit)
             {
                 let reason = preflight_compact_error
                     .unwrap_or_else(|| "Codex request is too close to the context limit".to_string());
                 return Err(format!(
-                    "Refusing to send oversized Codex request after compact failed or was unavailable: estimated_input_tokens={}, limit={}, reason={}",
-                    estimated_input_tokens, ctx_limit, reason
+                    "Refusing to send oversized Codex request after compact failed or was unavailable: estimated_input_tokens={}, effective_input_tokens={}, limit={}, reason={}",
+                    estimated_input_tokens, effective_input_tokens, ctx_limit, reason
                 ));
             }
 
             eprintln!(
-                "[Agent {}] iteration {}, messages={}, prepared_messages={}, estimated_input_tokens={}",
+                "[Agent {}] iteration {}, messages={}, prepared_messages={}, estimated_input_tokens={}, effective_input_tokens={}",
                 self.id,
                 iteration,
                 messages.len(),
                 prepared_messages.len(),
-                estimated_input_tokens
+                estimated_input_tokens,
+                effective_input_tokens
             );
 
             const LLM_RETRIES: u32 = 2;
@@ -7327,7 +7763,13 @@ impl AgentInstance {
                             llm_call_started_at.elapsed().as_millis()
                         );
                         self.clear_pending_knowledge_proposal(app_handle).await;
-                        self.emit_cancelled(app_handle, store, &run_id);
+                        self.emit_cancelled(
+                            app_handle,
+                            store,
+                            &run_id,
+                            (iteration == 1 && !assistant_round_persisted)
+                                .then_some(&current_user_message),
+                        );
                         return Ok(String::new());
                     }
                     Some(Ok(resp)) => {
@@ -7481,11 +7923,11 @@ impl AgentInstance {
                             app_handle,
                             store,
                             &system_parts,
-                            estimated_input_tokens,
+                            effective_input_tokens,
                             ctx_limit,
                             false,
                             &run_id,
-                            "reactive_compact",
+                            REACTIVE_COMPACT_ATTEMPT_KIND,
                             iteration,
                         )
                         .await
@@ -7561,15 +8003,19 @@ impl AgentInstance {
                 } else {
                     0
                 };
+                let actual_prompt_tokens = response
+                    .input_tokens
+                    .saturating_add(response.cache_read_tokens)
+                    .saturating_add(response.cache_write_tokens);
+                if actual_prompt_tokens > 0 && estimated_input_tokens > 0 {
+                    estimate_calibration_sample =
+                        Some((actual_prompt_tokens, estimated_input_tokens));
+                }
                 let context_tokens = response.input_tokens
                     + response.cache_read_tokens
                     + response.cache_write_tokens
                     + response.output_tokens;
-                let context_limit = if let LlmBackend::Custom { context_length, .. } = &self.backend {
-                    *context_length
-                } else {
-                    model_context_limit(&self.effective_model)
-                };
+                let context_limit = self.context_limit();
                 match store.record_token_usage(
                     &self.session_id,
                     response.input_tokens as u64,
@@ -7701,6 +8147,7 @@ impl AgentInstance {
                     thinking_opt.map(str::to_string),
                     thinking_dur,
                 );
+                assistant_round_persisted = true;
 
                 let mut prepared: Vec<(ToolCallInfo, serde_json::Value)> = Vec::new();
                 for tc in &ordered_tool_calls {
@@ -7891,7 +8338,13 @@ impl AgentInstance {
                 }
                 if self.is_cancel_requested() {
                     self.clear_pending_knowledge_proposal(app_handle).await;
-                    self.emit_cancelled(app_handle, store, &run_id);
+                    self.emit_cancelled(
+                        app_handle,
+                        store,
+                        &run_id,
+                        (iteration == 1 && !assistant_round_persisted)
+                            .then_some(&current_user_message),
+                    );
                     return Ok(String::new());
                 }
 
@@ -8093,7 +8546,13 @@ impl AgentInstance {
 
                 if self.is_cancel_requested() {
                     self.clear_pending_knowledge_proposal(app_handle).await;
-                    self.emit_cancelled(app_handle, store, &run_id);
+                    self.emit_cancelled(
+                        app_handle,
+                        store,
+                        &run_id,
+                        (iteration == 1 && !assistant_round_persisted)
+                            .then_some(&current_user_message),
+                    );
                     return Ok(String::new());
                 }
 
@@ -8173,6 +8632,7 @@ impl AgentInstance {
                     thinking_opt.map(str::to_string),
                     thinking_dur,
                 );
+                assistant_round_persisted = true;
                 emit_stream(app_handle, &run_id, StreamEvent::ToolCallRoundDone {
                     session_id: self.session_id.clone(),
                     message_id: assistant_msg_id,
@@ -8410,6 +8870,7 @@ impl AgentInstance {
                 | "grep"
                 | "list"
                 | "ask_user_question"
+                | "sheet"
                 | "todowrite"
                 | "graph_view"
                 | "unity_ref_search"
@@ -8433,25 +8894,10 @@ impl AgentInstance {
         )
     }
 
-    fn needs_undo_tracking(name: &str) -> bool {
-        matches!(
-            name,
-            "unity_execute"
-                | "unity_run_states"
-                | "write"
-                | "edit"
-                | "bash"
-                | "view_create"
-                | "knowledge_create"
-                | "knowledge_edit"
-                | "knowledge_move"
-                | "knowledge_delete"
-                | "skill_create"
-        )
-    }
-
     fn tool_call_needs_undo_tracking(&self, name: &str, args: &serde_json::Value) -> bool {
-        if Self::needs_undo_tracking(name) {
+        // Undo tracking is driven by each tool's `mutates_workspace`
+        // declaration (ToolDef / skill-package manifest), not a central list.
+        if self.tool_registry.mutates_workspace(name) {
             return true;
         }
         if name != "tool_call" {
@@ -8468,11 +8914,7 @@ impl AgentInstance {
             return false;
         };
 
-        let canonical = self
-            .tool_registry
-            .canonical_name(target_name)
-            .unwrap_or_else(|| target_name.to_ascii_lowercase());
-        Self::needs_undo_tracking(&canonical)
+        self.tool_registry.mutates_workspace(target_name)
     }
 
     fn workspace_path_touches_view_tree(path: &str) -> bool {
@@ -9100,6 +9542,9 @@ impl AgentInstance {
             .await
         } else if tc.name == "ask_user_question" {
             self.await_tool_result(self.execute_ask(app_handle, &tc.id, args, run_id))
+                .await
+        } else if tc.name == "sheet" {
+            self.await_tool_result(self.execute_sheet(app_handle, &tc.id, args, run_id))
                 .await
         } else if tc.name == "graph_view" {
             self.execute_graph_view(app_handle, &tc.id, args).await
@@ -10719,6 +11164,7 @@ impl AgentInstance {
                 tool_call_id: tool_call_id.to_string(),
                 question: question.clone(),
                 options: options.clone(),
+                sheet: None,
             },
         );
 
@@ -10743,6 +11189,285 @@ impl AgentInstance {
             }
             Some(Err(_)) => ToolResult {
                 output: "Question was cancelled".to_string(),
+                is_error: true,
+            },
+            None => {
+                let question_store: tauri::State<crate::QuestionStore> = app_handle.state();
+                let mut store = question_store.lock().await;
+                store.remove(&question_id);
+                Self::interrupted_tool_result().into_tool_result()
+            }
+        }
+    }
+
+    fn parse_sheet_request(
+        args: &serde_json::Value,
+    ) -> Result<(String, crate::commands::SheetRequest), String> {
+        const MAX_SHEET_FIELDS: usize = 24;
+
+        let title = args
+            .get("title")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .unwrap_or("");
+        if title.is_empty() {
+            return Err("Missing required parameter: title".to_string());
+        }
+
+        let optional_text = |key: &str| {
+            args.get(key)
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        };
+
+        let raw_fields = args
+            .get("fields")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        if raw_fields.is_empty() {
+            return Err("sheet requires a non-empty fields array".to_string());
+        }
+        if raw_fields.len() > MAX_SHEET_FIELDS {
+            return Err(format!(
+                "sheet supports at most {} fields, got {}",
+                MAX_SHEET_FIELDS,
+                raw_fields.len()
+            ));
+        }
+
+        let mut seen_keys = HashSet::new();
+        let mut fields = Vec::with_capacity(raw_fields.len());
+        for (index, item) in raw_fields.iter().enumerate() {
+            let key = item
+                .get("key")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .unwrap_or("");
+            if key.is_empty() {
+                return Err(format!("fields[{}] is missing a non-empty key", index));
+            }
+            if !seen_keys.insert(key.to_string()) {
+                return Err(format!("fields[{}] duplicates key '{}'", index, key));
+            }
+
+            let label = item
+                .get("label")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .unwrap_or("");
+            if label.is_empty() {
+                return Err(format!("fields[{}] is missing a non-empty label", index));
+            }
+
+            let value = match item.get("value") {
+                Some(serde_json::Value::String(text)) => text.clone(),
+                Some(serde_json::Value::Number(number)) => number.to_string(),
+                Some(serde_json::Value::Bool(flag)) => flag.to_string(),
+                Some(serde_json::Value::Null) | None => String::new(),
+                Some(other) => serde_json::to_string(other).unwrap_or_default(),
+            };
+
+            let options = item
+                .get("options")
+                .and_then(|v| v.as_array())
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(|option| option.as_str())
+                        .map(str::trim)
+                        .filter(|option| !option.is_empty())
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+
+            fields.push(crate::commands::SheetField {
+                key: key.to_string(),
+                label: label.to_string(),
+                value,
+                description: item
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string),
+                multiline: item
+                    .get("multiline")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+                options,
+                readonly: item
+                    .get("readonly")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+            });
+        }
+
+        Ok((
+            title.to_string(),
+            crate::commands::SheetRequest {
+                description: optional_text("description"),
+                confirm_label: optional_text("confirmLabel"),
+                fields,
+            },
+        ))
+    }
+
+    fn sheet_result_from_answer(
+        title: &str,
+        sheet: &crate::commands::SheetRequest,
+        answer: &str,
+    ) -> ToolResult {
+        let parsed: serde_json::Value =
+            serde_json::from_str(answer).unwrap_or(serde_json::Value::Null);
+        let feedback = parsed
+            .get("feedback")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+
+        if parsed.get("action").and_then(|v| v.as_str()) != Some("confirm") {
+            // Unknown answer shapes are treated as a change request so the agent
+            // never proceeds on input it cannot interpret as a confirmation.
+            let feedback_text = feedback.unwrap_or_else(|| answer.trim().to_string());
+            return ToolResult {
+                output: format!(
+                    "User requested changes to '{}' instead of confirming.\nFeedback: {}\nRevise the proposal and present an updated sheet before proceeding.",
+                    title,
+                    if feedback_text.is_empty() {
+                        "(none)"
+                    } else {
+                        feedback_text.as_str()
+                    }
+                ),
+                is_error: false,
+            };
+        }
+
+        let submitted = parsed
+            .get("values")
+            .and_then(|v| v.as_object())
+            .cloned()
+            .unwrap_or_default();
+        let mut values = serde_json::Map::new();
+        let mut changed_keys = Vec::new();
+        for field in &sheet.fields {
+            let submitted_value = if field.readonly {
+                None
+            } else {
+                submitted.get(&field.key).and_then(|v| v.as_str())
+            };
+            let final_value = submitted_value.unwrap_or(field.value.as_str());
+            if final_value != field.value {
+                changed_keys.push(serde_json::Value::String(field.key.clone()));
+            }
+            values.insert(
+                field.key.clone(),
+                serde_json::Value::String(final_value.to_string()),
+            );
+        }
+
+        let mut report = serde_json::Map::new();
+        report.insert("confirmed".to_string(), serde_json::Value::Bool(true));
+        report.insert(
+            "title".to_string(),
+            serde_json::Value::String(title.to_string()),
+        );
+        report.insert("values".to_string(), serde_json::Value::Object(values));
+        if !changed_keys.is_empty() {
+            report.insert(
+                "changedKeys".to_string(),
+                serde_json::Value::Array(changed_keys),
+            );
+        }
+        if let Some(feedback) = feedback {
+            report.insert("note".to_string(), serde_json::Value::String(feedback));
+        }
+
+        ToolResult {
+            output: format!(
+                "User confirmed the sheet.\n{}",
+                serde_json::to_string_pretty(&serde_json::Value::Object(report))
+                    .unwrap_or_else(|_| "{}".to_string())
+            ),
+            is_error: false,
+        }
+    }
+
+    async fn execute_sheet(
+        &self,
+        app_handle: &AppHandle,
+        tool_call_id: &str,
+        args: &serde_json::Value,
+        run_id: &str,
+    ) -> ToolResult {
+        let (title, sheet) = match Self::parse_sheet_request(args) {
+            Ok(parsed) => parsed,
+            Err(message) => {
+                return ToolResult {
+                    output: message,
+                    is_error: true,
+                };
+            }
+        };
+
+        let question_id = uuid::Uuid::new_v4().to_string();
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+        let wait_target = self.user_wait_target(run_id);
+
+        {
+            let question_store: tauri::State<crate::QuestionStore> = app_handle.state();
+            let mut store = question_store.lock().await;
+            store.insert(
+                question_id.clone(),
+                crate::PendingQuestionResponse {
+                    session_id: wait_target.session_id.clone(),
+                    run_id: wait_target.run_id.clone(),
+                    tx,
+                },
+            );
+        }
+
+        emit_stream(
+            app_handle,
+            &wait_target.run_id,
+            crate::commands::StreamEvent::AskUser {
+                session_id: wait_target.session_id.clone(),
+                question_id: question_id.clone(),
+                tool_call_id: tool_call_id.to_string(),
+                question: title.clone(),
+                options: Vec::new(),
+                sheet: Some(sheet.clone()),
+            },
+        );
+
+        eprintln!(
+            "[Agent {}] sheet tool: waiting for user confirmation (question_id={})",
+            self.id, question_id
+        );
+
+        let mut cancel_rx = self.cancel_waiter();
+        let answer_result = tokio::select! {
+            result = rx => Some(result),
+            _ = cancel_rx.changed() => None,
+        };
+
+        match answer_result {
+            Some(Ok(answer)) => {
+                eprintln!(
+                    "[Agent {}] sheet tool: got user response ({} chars)",
+                    self.id,
+                    answer.len()
+                );
+                Self::sheet_result_from_answer(&title, &sheet, &answer)
+            }
+            Some(Err(_)) => ToolResult {
+                output: "Sheet confirmation was cancelled".to_string(),
                 is_error: true,
             },
             None => {
@@ -13134,16 +13859,18 @@ mod tests {
     use super::{
         assess_knowledge_tool_confirmation, assess_knowledge_tool_confirmation_decision,
         build_l2_full_document_section, build_l3_rule_section, build_prompt_tree,
-        build_structure_section, finalize_tool_call_record, render_tree_lines, utf8_prefix_chars,
-        AgentInstance, AgentKnowledgeDocumentContent, AgentKnowledgeDocumentContentPatch,
-        AgentKnowledgeListItem, AgentKnowledgeMutationResponse, AgentKnowledgeReadResponse,
-        AgentKnowledgeSearchHit, ExecutedToolResult, InjectedPromptItem, KnowledgeAccessMode,
-        ParentToolCall, PromptKnowledgeItem, RawContextStore, ToolConfirmDecision, ToolRunOutcome,
+        build_structure_section, compact_trigger, finalize_tool_call_record, render_tree_lines,
+        utf8_prefix_chars, AgentInstance, AgentKnowledgeDocumentContent,
+        AgentKnowledgeDocumentContentPatch, AgentKnowledgeListItem, AgentKnowledgeMutationResponse,
+        AgentKnowledgeReadResponse, AgentKnowledgeSearchHit, ExecutedToolResult,
+        InjectedPromptItem, KnowledgeAccessMode, KnowledgeFocusDoc, ParentToolCall,
+        PromptKnowledgeItem, RawContextStore, ToolConfirmDecision, ToolRunOutcome,
+        REACTIVE_COMPACT_ATTEMPT_KIND,
     };
     use crate::agent::definition::{AgentDef, AgentDefRegistry};
     use crate::commands::{
-        KnowledgeToolConfirmDirectoryMode, KnowledgeToolConfirmOperation, StreamEvent,
-        ToolCallOutcome,
+        CompactTrigger, KnowledgeToolConfirmDirectoryMode, KnowledgeToolConfirmOperation,
+        StreamEvent, ToolCallOutcome,
     };
     use crate::knowledge_store::{
         create_directory, default_directory_config_for_type, save_document,
@@ -13168,6 +13895,59 @@ mod tests {
     }
 
     #[test]
+    fn compact_trigger_classifies_manual_auto_and_reactive() {
+        assert_eq!(compact_trigger(true, "compact"), CompactTrigger::Manual);
+        assert_eq!(compact_trigger(false, "compact"), CompactTrigger::Auto);
+        assert_eq!(
+            compact_trigger(false, REACTIVE_COMPACT_ATTEMPT_KIND),
+            CompactTrigger::Reactive
+        );
+        // Manual wins even if a forced compact were recorded under another kind.
+        assert_eq!(
+            compact_trigger(true, REACTIVE_COMPACT_ATTEMPT_KIND),
+            CompactTrigger::Manual
+        );
+    }
+
+    #[test]
+    fn compact_start_event_serializes_trigger_for_frontend() {
+        let event = StreamEvent::CompactStart {
+            session_id: "session-1".to_string(),
+            context_tokens: 142_800,
+            context_limit: 258_400,
+            trigger: Some(CompactTrigger::Reactive),
+        };
+        let value = serde_json::to_value(&event).expect("serialize compact start");
+
+        assert_eq!(value["type"], "compactStart");
+        assert_eq!(value["contextTokens"], 142_800);
+        assert_eq!(value["contextLimit"], 258_400);
+        assert_eq!(value["trigger"], "reactive");
+
+        // Events persisted before the field existed still deserialize.
+        let legacy: StreamEvent = serde_json::from_value(json!({
+            "type": "compactStart",
+            "sessionId": "session-1",
+            "contextTokens": 1,
+            "contextLimit": 2
+        }))
+        .expect("deserialize legacy compact start");
+        match legacy {
+            StreamEvent::CompactStart { trigger, .. } => assert_eq!(trigger, None),
+            other => panic!("unexpected event variant: {other:?}"),
+        }
+
+        let untriggered = StreamEvent::CompactStart {
+            session_id: "session-1".to_string(),
+            context_tokens: 1,
+            context_limit: 2,
+            trigger: None,
+        };
+        let value = serde_json::to_value(&untriggered).expect("serialize compact start");
+        assert!(value.get("trigger").is_none());
+    }
+
+    #[test]
     fn preserves_interrupted_outcome_from_reserved_tool_result_text() {
         let result = ExecutedToolResult::from_tool_result(ToolResult {
             output: crate::session::history::INTERRUPTED_TOOL_RESULT.to_string(),
@@ -13175,6 +13955,122 @@ mod tests {
         });
 
         assert_eq!(result.outcome, ToolRunOutcome::Interrupted);
+    }
+
+    #[test]
+    fn parse_sheet_request_validates_title_fields_and_keys() {
+        assert!(AgentInstance::parse_sheet_request(&json!({ "fields": [] })).is_err());
+        assert!(AgentInstance::parse_sheet_request(&json!({ "title": "Publish" })).is_err());
+        assert!(AgentInstance::parse_sheet_request(&json!({
+            "title": "Publish",
+            "fields": [
+                { "key": "id", "label": "Plugin id", "value": "asset-tools" },
+                { "key": "id", "label": "Duplicate", "value": "x" },
+            ],
+        }))
+        .is_err());
+        assert!(AgentInstance::parse_sheet_request(&json!({
+            "title": "Publish",
+            "fields": [{ "key": "id", "label": "", "value": "asset-tools" }],
+        }))
+        .is_err());
+
+        let (title, sheet) = AgentInstance::parse_sheet_request(&json!({
+            "title": "Publish plugin asset-tools 0.1.0",
+            "description": "Creates the zip and installs it locally.",
+            "confirmLabel": "Publish",
+            "fields": [
+                {
+                    "key": "id",
+                    "label": "Plugin id",
+                    "value": "asset-tools",
+                    "readonly": true,
+                },
+                {
+                    "key": "version",
+                    "label": "Version",
+                    "value": 0.1,
+                    "options": ["0.1.0", "0.2.0", ""],
+                },
+                {
+                    "key": "summary",
+                    "label": "Summary",
+                    "value": "Tools",
+                    "multiline": true,
+                    "description": "  Shown in the registry.  ",
+                },
+            ],
+        }))
+        .expect("valid sheet request");
+
+        assert_eq!(title, "Publish plugin asset-tools 0.1.0");
+        assert_eq!(sheet.confirm_label.as_deref(), Some("Publish"));
+        assert_eq!(sheet.fields.len(), 3);
+        assert!(sheet.fields[0].readonly);
+        assert_eq!(sheet.fields[1].value, "0.1");
+        assert_eq!(sheet.fields[1].options, vec!["0.1.0", "0.2.0"]);
+        assert!(sheet.fields[2].multiline);
+        assert_eq!(
+            sheet.fields[2].description.as_deref(),
+            Some("Shown in the registry.")
+        );
+    }
+
+    #[test]
+    fn sheet_answer_confirm_reports_final_values_and_changed_keys() {
+        let (title, sheet) = AgentInstance::parse_sheet_request(&json!({
+            "title": "Publish",
+            "fields": [
+                { "key": "id", "label": "Plugin id", "value": "asset-tools", "readonly": true },
+                { "key": "version", "label": "Version", "value": "0.1.0" },
+                { "key": "name", "label": "Name", "value": "Asset Tools" },
+            ],
+        }))
+        .expect("valid sheet request");
+
+        let result = AgentInstance::sheet_result_from_answer(
+            &title,
+            &sheet,
+            r#"{"action":"confirm","values":{"id":"hacked","version":"0.2.0","unknown":"x"},"feedback":" ship it "}"#,
+        );
+
+        assert!(!result.is_error);
+        assert!(result.output.starts_with("User confirmed the sheet."));
+        let report: serde_json::Value =
+            serde_json::from_str(result.output.splitn(2, '\n').nth(1).expect("json body"))
+                .expect("valid report json");
+        assert_eq!(report["confirmed"], json!(true));
+        // readonly fields keep the proposed value even if the answer tries to change them
+        assert_eq!(report["values"]["id"], json!("asset-tools"));
+        assert_eq!(report["values"]["version"], json!("0.2.0"));
+        assert_eq!(report["values"]["name"], json!("Asset Tools"));
+        assert_eq!(report["values"].as_object().map(|map| map.len()), Some(3));
+        assert_eq!(report["changedKeys"], json!(["version"]));
+        assert_eq!(report["note"], json!("ship it"));
+    }
+
+    #[test]
+    fn sheet_answer_feedback_or_unknown_shape_requests_changes() {
+        let (title, sheet) = AgentInstance::parse_sheet_request(&json!({
+            "title": "Publish",
+            "fields": [{ "key": "id", "label": "Plugin id", "value": "asset-tools" }],
+        }))
+        .expect("valid sheet request");
+
+        let feedback = AgentInstance::sheet_result_from_answer(
+            &title,
+            &sheet,
+            r#"{"action":"feedback","feedback":"use a namespaced id"}"#,
+        );
+        assert!(!feedback.is_error);
+        assert!(feedback.output.contains("requested changes"));
+        assert!(feedback.output.contains("use a namespaced id"));
+        assert!(feedback.output.contains("present an updated sheet"));
+
+        let legacy = AgentInstance::sheet_result_from_answer(&title, &sheet, "plain text answer");
+        assert!(!legacy.is_error);
+        assert!(legacy.output.contains("requested changes"));
+        assert!(legacy.output.contains("plain text answer"));
     }
 
     #[test]
@@ -13330,17 +14226,45 @@ mod tests {
 
     #[test]
     fn needs_undo_tracking_includes_workspace_mutations() {
-        assert!(AgentInstance::needs_undo_tracking("bash"));
-        assert!(AgentInstance::needs_undo_tracking("write"));
-        assert!(AgentInstance::needs_undo_tracking("edit"));
-        assert!(AgentInstance::needs_undo_tracking("unity_execute"));
-        assert!(AgentInstance::needs_undo_tracking("view_create"));
-        assert!(AgentInstance::needs_undo_tracking("knowledge_create"));
-        assert!(AgentInstance::needs_undo_tracking("knowledge_edit"));
-        assert!(AgentInstance::needs_undo_tracking("knowledge_move"));
-        assert!(AgentInstance::needs_undo_tracking("knowledge_delete"));
-        assert!(!AgentInstance::needs_undo_tracking("read"));
-        assert!(!AgentInstance::needs_undo_tracking("grep"));
+        let registry = ToolRegistry::with_builtins();
+        for tool in [
+            "bash",
+            "write",
+            "edit",
+            "unity_execute",
+            "unity_run_states",
+            "view_create",
+            "knowledge_create",
+            "knowledge_edit",
+            "knowledge_move",
+            "knowledge_delete",
+            "skill_create",
+            "plugin_install",
+            "plugin_uninstall",
+            "plugin_set_enabled",
+            "plugin_export",
+        ] {
+            assert!(
+                registry.mutates_workspace(tool),
+                "{} should declare mutates_workspace",
+                tool
+            );
+        }
+        for tool in [
+            "read",
+            "grep",
+            "list",
+            "knowledge_read",
+            "plugin_list",
+            "unity_recompile",
+            "view_list",
+        ] {
+            assert!(
+                !registry.mutates_workspace(tool),
+                "{} should not declare mutates_workspace",
+                tool
+            );
+        }
     }
 
     #[test]
@@ -13989,6 +14913,7 @@ PrefabInstance:
             name: name.to_string(),
             description: format!("{} description", name),
             parameters: serde_json::json!({"type": "object"}),
+            mutates_workspace: false,
             execute: Arc::new(|_, _| {
                 Box::pin(async {
                     ToolResult {
@@ -16039,7 +16964,8 @@ Search, install, audit, and export a plugin.
         let rendered = render_tree_lines(&tree, true, 3).join("\n");
 
         assert!(
-            rendered.contains("view/ [package] :: Use for explicit Locus View UI package requests."),
+            rendered
+                .contains("view/ [package] :: Use for explicit Locus View UI package requests."),
             "{}",
             rendered
         );
@@ -16389,6 +17315,70 @@ Search, install, audit, and export a plugin.
         assert!(!prompt_parts.env_prompt.contains("## Knowledge"));
         assert!(!prompt_parts.env_prompt.contains("project-mistake-note.md"));
         assert!(!prompt_parts.env_prompt.contains("user-preference.md"));
+    }
+
+    #[test]
+    fn system_prompt_parts_inject_knowledge_focus_document_into_env() {
+        let temp = tempdir().expect("temp dir");
+        let working_dir = temp.path().to_string_lossy().to_string();
+        let mut document = sample_agent_knowledge_document("combat/core-loop.md", "Core Loop");
+        document.summary = Some("Loop summary".to_string());
+        document.maintenance_rules = Some("Keep damage tables current.".to_string());
+        document.body = "# Core Loop\nDamage remains 20.".to_string();
+        save_document(&working_dir, document).expect("save document");
+
+        // No {{#knowledge}} block in the template: the focus document must be
+        // injected regardless of the agent's knowledge placeholders.
+        let mut agent = test_agent_instance_with_prompts(
+            working_dir,
+            "You are a test agent.",
+            "# Environment\nWorking directory: <working_dir>\n",
+        );
+        agent.set_knowledge_focus(Some(KnowledgeFocusDoc {
+            doc_type: KnowledgeType::Design,
+            path: "combat/core-loop.md".to_string(),
+        }));
+
+        let prompt_parts = tokio::runtime::Runtime::new()
+            .expect("create runtime")
+            .block_on(agent.build_system_prompt_parts());
+
+        assert!(prompt_parts
+            .env_prompt
+            .contains("## Active Knowledge Document"));
+        assert!(prompt_parts
+            .env_prompt
+            .contains("- Path: design/combat/core-loop.md"));
+        assert!(prompt_parts.env_prompt.contains("- Read-only: no"));
+        assert!(prompt_parts.env_prompt.contains("Loop summary"));
+        assert!(prompt_parts.env_prompt.contains("Keep damage tables current."));
+        assert!(prompt_parts.env_prompt.contains("Damage remains 20."));
+        // Body headings are remapped below the env section headings.
+        assert!(prompt_parts.env_prompt.contains("#### Core Loop"));
+        assert!(!prompt_parts.env_prompt.contains("\n# Core Loop"));
+    }
+
+    #[test]
+    fn knowledge_focus_is_skipped_when_document_is_missing() {
+        let temp = tempdir().expect("temp dir");
+        let working_dir = temp.path().to_string_lossy().to_string();
+        let mut agent = test_agent_instance_with_prompts(
+            working_dir,
+            "You are a test agent.",
+            "# Environment\nWorking directory: <working_dir>\n",
+        );
+        agent.set_knowledge_focus(Some(KnowledgeFocusDoc {
+            doc_type: KnowledgeType::Design,
+            path: "missing/doc.md".to_string(),
+        }));
+
+        let prompt_parts = tokio::runtime::Runtime::new()
+            .expect("create runtime")
+            .block_on(agent.build_system_prompt_parts());
+
+        assert!(!prompt_parts
+            .env_prompt
+            .contains("## Active Knowledge Document"));
     }
 
     #[test]

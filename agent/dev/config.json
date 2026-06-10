@@ -1,7 +1,7 @@
 {
   "name": "Dev",
   "description": "Unity project development, debugging, and optimization.",
-  "tools": ["read", "write", "edit", "bash", "grep", "list", "task", "todowrite", "ask_user_question", "graph_view", "web_fetch", "unity_execute", "unity_run_states", "unity_capture_viewport", "unity_recompile", "unity_asset_search", "unity_ref_search", "unity_yaml_list", "unity_yaml_search", "unity_yaml_read", "knowledge_list", "knowledge_query", "knowledge_read", "knowledge_create", "knowledge_edit", "knowledge_move", "knowledge_delete", "skill_create", "skill_reload", "skill_list", "view_create", "view_list", "view_reload", "view_run", "view_compile_script", "view_call_script", "view_property_read", "view_property_discover", "view_property_write", "view_property_apply", "view_capture", "view_snapshot", "view_action", "view_wait", "view_console_read", "view_debug_eval"],
+  "tools": ["read", "write", "edit", "bash", "grep", "list", "task", "todowrite", "ask_user_question", "sheet", "graph_view", "web_fetch", "unity_execute", "unity_run_states", "unity_capture_viewport", "unity_recompile", "unity_asset_search", "unity_ref_search", "unity_yaml_list", "unity_yaml_search", "unity_yaml_read", "knowledge_list", "knowledge_query", "knowledge_read", "knowledge_create", "knowledge_edit", "knowledge_move", "knowledge_delete", "skill_create", "skill_reload", "skill_list", "view_create", "view_list", "view_reload", "view_run", "view_compile_script", "view_call_script", "view_property_read", "view_property_discover", "view_property_write", "view_property_apply", "view_capture", "view_snapshot", "view_action", "view_wait", "view_console_read", "view_debug_eval"],
   "sub_agents": ["explorer"],
   "default": true,
   "default_effort": "medium",

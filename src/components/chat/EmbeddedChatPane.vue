@@ -10,12 +10,14 @@ import type {
   AssistantRenderPart,
 } from "../../types";
 import AskUserCard from "./AskUserCard.vue";
+import SheetCard from "./SheetCard.vue";
 import ToolConfirmCard from "./ToolConfirmCard.vue";
 import ToolConfirmBatchCard from "./ToolConfirmBatchCard.vue";
 import ChatTranscript from "./ChatTranscript.vue";
 import RichChatInput from "./RichChatInput.vue";
 import BaseButton from "../ui/BaseButton.vue";
 import { forwardWheelToElement } from "../../composables/chatWheelPassthrough";
+import { useThrottledStreamingText } from "../../composables/streamingRenderThrottle";
 import {
   captureScrollAnchor,
   captureLiveScrollAnchor,
@@ -138,6 +140,9 @@ const emit = defineEmits<{
 
 const slots = useSlots();
 const transcriptRef = ref<InstanceType<typeof ChatTranscript> | null>(null);
+// Same trailing throttle ChatView applies to the session transcript, so the
+// embedded transcript repaints streamed text at the shared cadence too.
+const { text: displayedStreamingText } = useThrottledStreamingText(() => props.streamingText);
 const hasHeader = computed(() => !!props.title || !!props.subtitle || !!slots["header-actions"]);
 const hasComposerStart = computed(() => !!slots["composer-start"]);
 const hasComposerActions = computed(() => !!slots["composer-actions"]);
@@ -549,7 +554,7 @@ watch(
 );
 
 watch(() => props.messages.length, () => reconcileViewport());
-watch(() => props.streamingText, () => reconcileViewport());
+watch(displayedStreamingText, () => reconcileViewport());
 watch(() => props.thinkingText, () => reconcileViewport());
 watch(() => props.isThinking, () => reconcileViewport());
 watch(() => props.activeToolCalls, () => reconcileViewport(), { deep: true });
@@ -630,7 +635,7 @@ onUnmounted(() => {
       variant="embedded"
       :session-key="getViewportStateKey()"
       :messages="messages"
-      :streaming-text="streamingText"
+      :streaming-text="displayedStreamingText"
       :streaming-text-order="streamingTextOrder"
       :is-streaming="isStreaming"
       :is-compacting="isCompacting"
@@ -693,8 +698,13 @@ onUnmounted(() => {
             {{ t('common.delete') }}
           </BaseButton>
         </div>
+        <SheetCard
+          v-if="pendingQuestion && pendingQuestion.sheet"
+          :question="pendingQuestion"
+          @answer="emit('answerQuestion', $event)"
+        />
         <AskUserCard
-          v-if="pendingQuestion"
+          v-else-if="pendingQuestion"
           :question="pendingQuestion"
           @answer="emit('answerQuestion', $event)"
         />

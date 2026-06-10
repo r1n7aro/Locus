@@ -30,6 +30,7 @@ pub mod tools {
     pub const UNITY_RECOMPILE: &str = include_str!("../../tools/unity_recompile.json");
     pub const LIST: &str = include_str!("../../tools/list.json");
     pub const ASK: &str = include_str!("../../tools/ask.json");
+    pub const SHEET: &str = include_str!("../../tools/sheet.json");
     pub const KNOWLEDGE_LIST: &str = include_str!("../../tools/knowledge_list.json");
     pub const KNOWLEDGE_QUERY: &str = include_str!("../../tools/knowledge_query.json");
     pub const KNOWLEDGE_READ: &str = include_str!("../../tools/knowledge_read.json");
@@ -123,6 +124,7 @@ mod tests {
             ("unity_recompile", tools::UNITY_RECOMPILE),
             ("list", tools::LIST),
             ("ask", tools::ASK),
+            ("sheet", tools::SHEET),
             ("knowledge_list", tools::KNOWLEDGE_LIST),
             ("knowledge_query", tools::KNOWLEDGE_QUERY),
             ("knowledge_read", tools::KNOWLEDGE_READ),

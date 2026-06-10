@@ -452,6 +452,7 @@ fn apply_event_to_snapshot(
             tool_call_id,
             question,
             options,
+            sheet,
             ..
         } => {
             snapshot.pending_question = Some(PendingQuestion {
@@ -459,6 +460,7 @@ fn apply_event_to_snapshot(
                 tool_call_id: tool_call_id.clone(),
                 question: question.clone(),
                 options: options.clone(),
+                sheet: sheet.clone(),
             });
         }
         StreamEvent::ToolConfirm {

@@ -504,6 +504,7 @@ fn collect_permissions(app_handle: &tauri::AppHandle, out: &mut Vec<ConfigEntry>
         ("task", "Sub-agent delegation"),
         ("todowrite", "TODO list management"),
         ("ask_user_question", "Ask user a question"),
+        ("sheet", "Confirm a multi-field form"),
         ("graph_view", "Show or edit an interactive graph"),
         ("write", "File creation (new files only)"),
         ("edit", "File editing (partial)"),

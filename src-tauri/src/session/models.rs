@@ -113,6 +113,8 @@ pub struct PendingQuestion {
     pub tool_call_id: String,
     pub question: String,
     pub options: Vec<crate::commands::AskOption>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sheet: Option<crate::commands::SheetRequest>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

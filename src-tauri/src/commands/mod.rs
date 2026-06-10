@@ -71,6 +71,17 @@ pub enum ToolCallOutcome {
     Interrupted,
 }
 
+/// What initiated a context compaction. `Reactive` means the request was
+/// already sent and the server rejected it as over the context window, so the
+/// UI should warn the user instead of compacting silently.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CompactTrigger {
+    Auto,
+    Manual,
+    Reactive,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum StreamEvent {
@@ -235,6 +246,8 @@ pub enum StreamEvent {
         tool_call_id: String,
         question: String,
         options: Vec<AskOption>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sheet: Option<SheetRequest>,
     },
     #[serde(rename_all = "camelCase")]
     ToolConfirm {
@@ -258,6 +271,8 @@ pub enum StreamEvent {
         session_id: String,
         context_tokens: u32,
         context_limit: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        trigger: Option<CompactTrigger>,
     },
     #[serde(rename_all = "camelCase")]
     CompactDone {
@@ -283,6 +298,11 @@ pub enum StreamEvent {
         thinking_duration: Option<u32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         render_parts: Option<Vec<crate::session::models::AssistantRenderPart>>,
+        /// Set when the run was cancelled before producing any assistant
+        /// output: the user message was removed from the session so the
+        /// composer can take the text back as a draft.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        removed_user_message: Option<crate::session::models::ChatMessage>,
     },
     #[serde(rename_all = "camelCase")]
     Error { session_id: String, error: AppError },
@@ -301,6 +321,32 @@ pub struct StreamEventEnvelope {
 pub struct AskOption {
     pub label: String,
     pub description: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SheetField {
+    pub key: String,
+    pub label: String,
+    pub value: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub multiline: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<String>,
+    #[serde(default)]
+    pub readonly: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SheetRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirm_label: Option<String>,
+    pub fields: Vec<SheetField>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

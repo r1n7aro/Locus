@@ -22,6 +22,7 @@ pub(super) fn web_fetch() -> ToolDef {
         name: "web_fetch".to_string(),
         description: prompt.description,
         parameters: prompt.parameters,
+        mutates_workspace: false,
         execute: make_exec(|args, _ctx| {
             Box::pin(async move {
                 let url = args.get("url").and_then(|v| v.as_str()).unwrap_or("");
@@ -278,6 +279,7 @@ pub(super) fn todowrite() -> ToolDef {
         name: "todowrite".to_string(),
         description: prompt.description,
         parameters: prompt.parameters,
+        mutates_workspace: false,
         execute,
     }
 }
@@ -299,6 +301,7 @@ pub(super) fn graph_view() -> ToolDef {
         name: "graph_view".to_string(),
         description: prompt.description,
         parameters: prompt.parameters,
+        mutates_workspace: false,
         execute,
     }
 }
@@ -320,6 +323,29 @@ pub(super) fn ask() -> ToolDef {
         name: "ask_user_question".to_string(),
         description: prompt.description,
         parameters: prompt.parameters,
+        mutates_workspace: false,
+        execute,
+    }
+}
+
+// ─── sheet ───────────────────────────────────────────────────────────────────
+
+pub(super) fn sheet() -> ToolDef {
+    let execute: ToolExecuteFn = Arc::new(|_args, _ctx| {
+        Box::pin(async {
+            ToolResult {
+                output: "Error: sheet tool should be intercepted by agent loop".to_string(),
+                is_error: true,
+            }
+        })
+    });
+
+    let prompt = crate::prompt::parse_tool_prompt(crate::prompt::tools::SHEET);
+    ToolDef {
+        name: "sheet".to_string(),
+        description: prompt.description,
+        parameters: prompt.parameters,
+        mutates_workspace: false,
         execute,
     }
 }

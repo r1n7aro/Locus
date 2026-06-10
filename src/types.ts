@@ -742,6 +742,7 @@ export type StreamEvent = { runId: string } & (
       toolCallId: string;
       question: string;
       options: AskOption[];
+      sheet?: SheetRequest | null;
     }
   | {
       type: "toolConfirm";
@@ -757,6 +758,8 @@ export type StreamEvent = { runId: string } & (
       sessionId: string;
       contextTokens: number;
       contextLimit: number;
+      /** "reactive" means the server rejected the request as over the window. */
+      trigger?: "auto" | "manual" | "reactive";
     }
   | {
       type: "compactDone";
@@ -775,6 +778,8 @@ export type StreamEvent = { runId: string } & (
       thinkingContent?: string | null;
       thinkingDuration?: number | null;
       renderParts?: AssistantRenderPart[] | null;
+      /** The user message revoked by a cancel that produced no assistant output. */
+      removedUserMessage?: ChatMessage | null;
     }
   | {
       type: "done";
@@ -793,6 +798,22 @@ export interface AskOption {
   description: string;
 }
 
+export interface SheetField {
+  key: string;
+  label: string;
+  value: string;
+  description?: string | null;
+  multiline?: boolean;
+  options?: string[];
+  readonly?: boolean;
+}
+
+export interface SheetRequest {
+  description?: string | null;
+  confirmLabel?: string | null;
+  fields: SheetField[];
+}
+
 export type PluginStatus =
   | { status: "missing" }
   | { status: "outdated" }
@@ -803,6 +824,7 @@ export interface PendingQuestion {
   toolCallId: string;
   question: string;
   options: AskOption[];
+  sheet?: SheetRequest | null;
 }
 
 export interface PendingToolConfirm {
@@ -1889,6 +1911,8 @@ export interface VcsUndoEntry {
   assistantMessageId: string;
   runId?: string | null;
   checkpoint: VcsCheckpoint;
+  workingDir?: string;
+  afterStateId?: string | null;
   changedFiles: ChangedFile[];
   hasUnityExecute: boolean;
   consumed: boolean;

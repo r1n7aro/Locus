@@ -774,6 +774,7 @@ export function useSettingsState(emit: SettingsEmit) {
     { name: "task",               label: "task",               desc: t("tool.desc.task"),               defaultMode: "ask"  as const },
     { name: "todowrite",          label: "todowrite",          desc: t("tool.desc.todowrite"),          defaultMode: "auto" as const },
     { name: "ask_user_question",  label: "ask_user_question",  desc: t("tool.desc.ask_user_question"),  defaultMode: "auto" as const },
+    { name: "sheet",              label: "sheet",              desc: t("tool.desc.sheet"),              defaultMode: "auto" as const },
     { name: "graph_view",         label: "graph_view",         desc: t("tool.desc.graph_view"),         defaultMode: "auto" as const },
     { name: "write",              label: "write",              desc: t("tool.desc.write"),              defaultMode: "ask"  as const },
     { name: "edit",               label: "edit",               desc: t("tool.desc.edit"),               defaultMode: "ask"  as const },
