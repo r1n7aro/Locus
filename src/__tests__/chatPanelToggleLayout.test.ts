@@ -99,7 +99,8 @@ describe("chat panel toggle layout", () => {
     expect(composer).toContain("const showInlineAction = computed(() => props.compact && props.showAction);");
     expect(composer).toContain("const textareaDisabled = computed(() => props.disabled);");
     expect(composer).toContain("const isCancelAction = computed(() => props.isStreaming && !props.canSend);");
-    expect(composer).toContain("const actionDisabled = computed(() => props.disabled || (!isCancelAction.value && !props.canSend));");
+    expect(composer).toContain("const isCancellingAction = computed(() => isCancelAction.value && props.cancelling);");
+    expect(composer).toContain("|| (!isCancelAction.value && !props.canSend));");
     expect(composer).toContain("const COMPACT_TEXTAREA_MIN_HEIGHT = 28;");
     expect(composer).toContain("const minHeight = props.compact ? COMPACT_TEXTAREA_MIN_HEIGHT : DEFAULT_TEXTAREA_MIN_HEIGHT;");
     expect(composer).toContain("Math.max(minHeight, Math.min(contentHeight, props.maxHeight))");

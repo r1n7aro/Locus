@@ -727,7 +727,7 @@ impl AgentInstance {
 
         if self.is_cancel_requested() {
             self.clear_pending_knowledge_proposal(app_handle).await;
-            self.emit_cancelled(app_handle, store, run_id);
+            self.emit_cancelled(app_handle, store, run_id, None);
             return Ok(String::new());
         }
 

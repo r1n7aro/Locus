@@ -48,6 +48,7 @@ export type StreamMutation =
   | { type: "pushMessage"; message: ChatMessage }
   | { type: "upsertMessage"; message: ChatMessage }
   | { type: "upsertUserMessage"; message: ChatMessage }
+  | { type: "removeMessage"; messageId: string }
   | { type: "replaceMessages"; messages: ChatMessage[] }
   | { type: "pushToolResults"; toolCallIds?: string[] }
   | { type: "resetRound" }
@@ -713,6 +714,7 @@ export function reduceStreamEvent(state: StreamState, event: StreamEvent): Strea
           toolCallId: event.toolCallId,
           question: event.question,
           options: event.options,
+          sheet: event.sheet ?? null,
         },
       });
       break;
@@ -786,6 +788,11 @@ export function reduceStreamEvent(state: StreamState, event: StreamEvent): Strea
     }
 
     case "cancelled": {
+      // A cancel with no assistant output revokes the user message; drop it
+      // from the transcript so the composer can take the text back as a draft.
+      if (event.removedUserMessage) {
+        mutations.push({ type: "removeMessage", messageId: event.removedUserMessage.id });
+      }
       const hasInterruptedMessage =
         !!event.messageId
         && (

@@ -11,6 +11,7 @@ const props = withDefaults(defineProps<{
   placeholder?: string;
   disabled?: boolean;
   isStreaming?: boolean;
+  cancelling?: boolean;
   canSend?: boolean;
   sendLabel?: string;
   cancelLabel?: string;
@@ -26,6 +27,7 @@ const props = withDefaults(defineProps<{
   placeholder: "",
   disabled: false,
   isStreaming: false,
+  cancelling: false,
   canSend: false,
   sendLabel: "",
   cancelLabel: "",
@@ -71,15 +73,20 @@ const hasFooter = computed(() =>
 const showInlineAction = computed(() => props.compact && props.showAction);
 const textareaDisabled = computed(() => props.disabled);
 const isCancelAction = computed(() => props.isStreaming && !props.canSend);
-const actionDisabled = computed(() => props.disabled || (!isCancelAction.value && !props.canSend));
+const isCancellingAction = computed(() => isCancelAction.value && props.cancelling);
+const actionDisabled = computed(() =>
+  props.disabled
+  || isCancellingAction.value
+  || (!isCancelAction.value && !props.canSend));
 const textareaStyle = computed(() => ({
   maxHeight: `${props.maxHeight}px`,
 }));
-const actionLabel = computed(() => (
-  isCancelAction.value
+const actionLabel = computed(() => {
+  if (isCancellingAction.value) return t("common.cancelling");
+  return isCancelAction.value
     ? (props.cancelLabel || t("common.cancel"))
-    : (props.sendLabel || t("common.send"))
-));
+    : (props.sendLabel || t("common.send"));
+});
 
 function resizeTextarea(textarea: HTMLTextAreaElement | null = textareaRef.value) {
   if (!textarea) return;
@@ -203,7 +210,7 @@ watch(() => props.compact, () => {
       <button
         v-if="showInlineAction"
         class="chat-composer-action chat-composer-inline-action ui-select-none"
-        :class="{ 'is-cancel': isCancelAction }"
+        :class="{ 'is-cancel': isCancelAction, 'is-cancelling': isCancellingAction }"
         :disabled="actionDisabled"
         :title="actionLabel"
         :aria-label="actionLabel"
@@ -224,7 +231,7 @@ watch(() => props.compact, () => {
         <button
           v-if="showAction"
           class="chat-composer-action ui-select-none"
-          :class="{ 'is-cancel': isCancelAction }"
+          :class="{ 'is-cancel': isCancelAction, 'is-cancelling': isCancellingAction }"
           :disabled="actionDisabled"
           :title="actionLabel"
           :aria-label="actionLabel"
@@ -455,6 +462,24 @@ watch(() => props.compact, () => {
 
 .chat-composer-action.is-cancel:hover:not(:disabled) {
   filter: brightness(0.94);
+}
+
+.chat-composer-action.is-cancelling {
+  cursor: progress;
+}
+
+.chat-composer-action.is-cancelling .chat-composer-stop-icon {
+  animation: chat-composer-cancelling-pulse 0.9s ease-in-out infinite;
+}
+
+@keyframes chat-composer-cancelling-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
 }
 
 .chat-composer-send-icon {

@@ -135,6 +135,7 @@ const props = withDefaults(defineProps<{
   placeholder?: string;
   disabled?: boolean;
   isStreaming?: boolean;
+  cancelling?: boolean;
   sendLabel?: string;
   cancelLabel?: string;
   allowImages?: boolean;
@@ -149,6 +150,7 @@ const props = withDefaults(defineProps<{
   placeholder: "",
   disabled: false,
   isStreaming: false,
+  cancelling: false,
   sendLabel: "",
   cancelLabel: "",
   allowImages: true,
@@ -2417,6 +2419,7 @@ defineExpose({
       :placeholder="placeholder"
       :disabled="disabled"
       :is-streaming="isStreaming"
+      :cancelling="cancelling"
       :can-send="canSend"
       :send-label="sendLabel"
       :cancel-label="cancelLabel"

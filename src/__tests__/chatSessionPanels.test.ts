@@ -36,6 +36,7 @@ const undoServiceMocks = vi.hoisted(() => ({
   undoList: vi.fn(),
   undoPerform: vi.fn(),
   undoPerformToMessage: vi.fn(),
+  undoCheckDirty: vi.fn(),
 }));
 
 const displaySettingsState = vi.hoisted(() => ({
@@ -269,6 +270,7 @@ describe("chat session panel state", () => {
     undoServiceMocks.undoList.mockImplementation(async (sessionId: string) => undoData[sessionId] ?? []);
     undoServiceMocks.undoPerform.mockResolvedValue(undefined);
     undoServiceMocks.undoPerformToMessage.mockResolvedValue(undefined);
+    undoServiceMocks.undoCheckDirty.mockResolvedValue([]);
   });
 
   it("keeps historical todos closed on first session switch and allows manual reopen", async () => {
@@ -1642,6 +1644,165 @@ describe("chat session panel state", () => {
     expect(chatStore.messages).toEqual([]);
   });
 
+  it("restores the pending user draft when a run is cancelled before the user message is persisted", async () => {
+    const chatStore = useChatStore();
+    const uiStore = useUiStore();
+    sessionServiceMocks.chat.mockResolvedValueOnce({ sessionId: "s1", runId: "run-cancel-early" });
+    sessionServiceMocks.listSessions.mockResolvedValue([
+      {
+        id: "s1",
+        title: "Cancel session",
+        agentId: null,
+        sessionType: "chat",
+        updatedAt: 1,
+        runtimeStatus: "running",
+      },
+    ]);
+
+    await chatStore.sendMessage("cancelled before persistence");
+    expect(chatStore.messages[0]?.content).toBe("cancelled before persistence");
+
+    chatStore.handleStreamEvent({
+      runId: "run-cancel-early",
+      type: "cancelled",
+      sessionId: "s1",
+    });
+
+    await vi.waitFor(() => {
+      expect(uiStore.pendingChatPrefill?.draft?.text).toBe("cancelled before persistence");
+    });
+    expect(uiStore.pendingChatPrefill?.sessionId).toBe("s1");
+    expect(uiStore.pendingChatPrefill?.requireEmptyComposer).toBe(true);
+    expect(chatStore.messages).toEqual([]);
+    expect(chatStore.isStreaming).toBe(false);
+  });
+
+  it("keeps the persisted user message when a run is cancelled after the user message event", async () => {
+    const chatStore = useChatStore();
+    const uiStore = useUiStore();
+    sessionServiceMocks.chat.mockResolvedValueOnce({ sessionId: "s1", runId: "run-cancel-late" });
+    sessionServiceMocks.listSessions.mockResolvedValue([
+      {
+        id: "s1",
+        title: "Cancel session",
+        agentId: null,
+        sessionType: "chat",
+        updatedAt: 1,
+        runtimeStatus: "running",
+      },
+    ]);
+
+    await chatStore.sendMessage("persisted before cancel");
+    const pendingMessage = chatStore.messages.find((message) => message.role === "user");
+
+    chatStore.handleStreamEvent({
+      runId: "run-cancel-late",
+      type: "userMessage",
+      sessionId: "s1",
+      message: {
+        id: "msg-user-1",
+        role: "user",
+        content: "persisted before cancel",
+        createdAt: 1,
+        thinkingSignature: pendingMessage?.thinkingSignature,
+      },
+    });
+
+    chatStore.handleStreamEvent({
+      runId: "run-cancel-late",
+      type: "cancelled",
+      sessionId: "s1",
+    });
+    await new Promise((resolve) => globalThis.setTimeout(resolve, 0));
+
+    expect(sessionServiceMocks.loadSession).not.toHaveBeenCalled();
+    expect(uiStore.pendingChatPrefill).toBeNull();
+    expect(chatStore.messages.map((message) => message.id)).toContain("msg-user-1");
+  });
+
+  it("returns the revoked user message to the composer when cancel produced no assistant output", async () => {
+    const chatStore = useChatStore();
+    const uiStore = useUiStore();
+    sessionServiceMocks.chat.mockResolvedValueOnce({ sessionId: "s1", runId: "run-revoke" });
+    sessionServiceMocks.listSessions.mockResolvedValue([
+      {
+        id: "s1",
+        title: "Revoke session",
+        agentId: null,
+        sessionType: "chat",
+        updatedAt: 1,
+        runtimeStatus: "running",
+      },
+    ]);
+
+    await chatStore.sendMessage("revoked text");
+    const pendingMessage = chatStore.messages.find((message) => message.role === "user");
+    const persisted = {
+      id: "msg-user-1",
+      role: "user" as const,
+      content: "revoked text",
+      createdAt: 1,
+      thinkingSignature: pendingMessage?.thinkingSignature,
+    };
+
+    chatStore.handleStreamEvent({
+      runId: "run-revoke",
+      type: "userMessage",
+      sessionId: "s1",
+      message: persisted,
+    });
+    expect(chatStore.messages.map((message) => message.id)).toContain("msg-user-1");
+
+    chatStore.handleStreamEvent({
+      runId: "run-revoke",
+      type: "cancelled",
+      sessionId: "s1",
+      removedUserMessage: persisted,
+    });
+    await new Promise((resolve) => globalThis.setTimeout(resolve, 0));
+
+    expect(chatStore.messages).toEqual([]);
+    expect(uiStore.pendingChatPrefill?.draft?.text).toBe("revoked text");
+    expect(uiStore.pendingChatPrefill?.sessionId).toBe("s1");
+    expect(uiStore.pendingChatPrefill?.requireEmptyComposer).toBe(true);
+    expect(sessionServiceMocks.loadSession).not.toHaveBeenCalled();
+    expect(chatStore.isStreaming).toBe(false);
+  });
+
+  it("defers a cancel clicked while the chat launch is in flight and fires it once the run starts", async () => {
+    const chatStore = useChatStore();
+    let resolveChat: ((value: { sessionId: string; runId: string }) => void) | undefined;
+    sessionServiceMocks.chat.mockImplementationOnce(() =>
+      new Promise((resolve) => {
+        resolveChat = resolve;
+      }));
+    sessionServiceMocks.listSessions.mockResolvedValue([
+      {
+        id: "s1",
+        title: "Deferred cancel",
+        agentId: null,
+        sessionType: "chat",
+        updatedAt: 1,
+        runtimeStatus: "running",
+      },
+    ]);
+
+    const sendPromise = chatStore.sendMessage("cancel me early");
+    expect(chatStore.isStreaming).toBe(true);
+    expect(chatStore.activeSessionId).toBeNull();
+
+    await chatStore.cancelChat();
+    expect(sessionServiceMocks.cancelChat).not.toHaveBeenCalled();
+    expect(chatStore.isCancelling).toBe(true);
+
+    resolveChat!({ sessionId: "s1", runId: "run-deferred" });
+    await sendPromise;
+
+    await vi.waitFor(() => {
+      expect(sessionServiceMocks.cancelChat).toHaveBeenCalledWith("s1");
+    });
+  });
+
   it("sends a client message id that matches the local pending user message", async () => {
     const chatStore = useChatStore();
 
@@ -2344,7 +2505,7 @@ describe("chat session panel state", () => {
     const result = await chatStore.performUndo("assistant-1");
 
     expect(result).toBe(true);
-    expect(undoServiceMocks.undoPerform).toHaveBeenCalledWith("s1", "assistant-1", false);
+    expect(undoServiceMocks.undoPerform).toHaveBeenCalledWith("s1", "assistant-1", false, false);
     expect(chatStore.messages).toHaveLength(1);
     expect(chatStore.messages[0]).toMatchObject({
       id: "user-restored",
@@ -2467,6 +2628,7 @@ describe("chat session panel state", () => {
       "s1",
       "assistant-after",
       "user-target",
+      false,
       false,
     );
     expect(sessionServiceMocks.rollbackSessionToMessage).not.toHaveBeenCalled();

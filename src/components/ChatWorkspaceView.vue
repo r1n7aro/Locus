@@ -361,6 +361,7 @@ onUnmounted(() => {
       :streaming-text="chatStore.streamingText"
       :streaming-text-order="chatStore.streamingTextOrder"
       :is-streaming="chatStore.isStreaming"
+      :is-cancelling="chatStore.isCancelling"
       :is-compacting="chatStore.isCompacting"
       :is-thinking="chatStore.isThinking"
       :has-thinking="chatStore.streamingThinking.length > 0"

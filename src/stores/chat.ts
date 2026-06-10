@@ -33,6 +33,7 @@ import type {
   UserIntentMeta,
   KnowledgeProposalStatus,
   UndoConflictInfo,
+  ChangedFile,
   TodoSnapshot,
   TodoPanelMode,
   SessionRunSummary,
@@ -404,7 +405,11 @@ export const useChatStore = defineStore("chat", () => {
   const cancelRequestedRunIds = new Map<string, string>();
   let activeSessionSelectionRestoreAttempted = false;
   let activeSessionSelectionPersistSeq = 0;
+  // A cancel clicked while the chat launch is still in flight (no run id yet)
+  // is remembered here and re-fired once the run is registered.
+  const pendingLaunchCancelRequested = ref(false);
   const isCancelling = computed(() => {
+    if (pendingLaunchCancelRequested.value) return true;
     if (!activeSessionId.value || !currentRunId.value) return false;
     return cancelRequestedRunIds.get(activeSessionId.value) === currentRunId.value;
   });
@@ -1272,6 +1277,9 @@ export const useChatStore = defineStore("chat", () => {
       case "upsertUserMessage":
         messages.value = mergeUserMessage(messages.value, m.message);
         break;
+      case "removeMessage":
+        messages.value = messages.value.filter((message) => message.id !== m.messageId);
+        break;
       case "replaceMessages":
         messages.value = hydrateMessages(m.messages);
         break;
@@ -1619,7 +1627,7 @@ export const useChatStore = defineStore("chat", () => {
         if (event.type === "done") {
           void useChatChangesStore().refresh(activeSessionId.value, { allowAutoOpen: false });
         }
-        if (event.type === "error") {
+        if (event.type === "error" || event.type === "cancelled") {
           void loadSessionStatePreservingFailedUserDraft(event.sessionId);
         } else {
           void loadSessionState(event.sessionId);
@@ -1633,6 +1641,13 @@ export const useChatStore = defineStore("chat", () => {
         });
       }
       return true;
+    }
+
+    if (event.type === "compactStart" && event.trigger === "reactive") {
+      useNotificationStore().addNotice("warning", t("chat.transcript.reactiveCompactNotice"), {
+        code: "reactive_compact",
+        operation: "chat",
+      });
     }
 
     // Build current state snapshot for reducer
@@ -1757,6 +1772,23 @@ export const useChatStore = defineStore("chat", () => {
 
     if (event.type === "error" || event.type === "cancelled") {
       clearRunPendingInputs(event.sessionId, event.runId);
+    }
+
+    if (event.type === "cancelled" && event.removedUserMessage) {
+      // The backend revoked the user message because the cancel landed before
+      // any assistant output; hand the text back to the composer.
+      const removed = event.removedUserMessage;
+      messages.value = messages.value.filter((message) =>
+        !(isLocalPendingUserMessage(message) && isMatchingPendingUserMessage(message, removed)));
+      restoreDraftFromFailedUserMessage(removed, {
+        sessionId: event.sessionId,
+        requireEmptyComposer: true,
+      });
+    } else if (event.type === "cancelled" && messages.value.some(isLocalPendingUserMessage)) {
+      // A still-local pending id after a cancel means the run ended before the
+      // backend confirmed the user message; reload and hand the text back to the
+      // composer instead of leaving an orphaned message in the transcript.
+      void loadSessionStatePreservingFailedUserDraft(event.sessionId);
     }
 
     return true;
@@ -2173,6 +2205,7 @@ export const useChatStore = defineStore("chat", () => {
       return;
     }
 
+    pendingLaunchCancelRequested.value = false;
     const pendingMessageId = nextPendingMessageId();
     const userIntent = withClientMessageId(overrides?.userIntent, pendingMessageId);
     const userIntentSignature = JSON.stringify(userIntent);
@@ -2261,8 +2294,13 @@ export const useChatStore = defineStore("chat", () => {
         sessionAgentId.value = agentStore.selectedAgentId || null;
         await refreshSessions();
       }
+      if (pendingLaunchCancelRequested.value) {
+        pendingLaunchCancelRequested.value = false;
+        void cancelSession(sid);
+      }
     } catch (e) {
       console.error("chat failed:", e);
+      pendingLaunchCancelRequested.value = false;
       logChatStreamDebug("chat request failed", {
         sessionId: activeSessionId.value,
         error: e instanceof Error ? e.message : String(e),
@@ -2303,6 +2341,7 @@ export const useChatStore = defineStore("chat", () => {
       useChatChangesStore().closePanel();
     }
 
+    pendingLaunchCancelRequested.value = false;
     resetStreamRuntimeState();
     isStreaming.value = true;
     pendingManagedSessionId = sessionId;
@@ -2351,8 +2390,13 @@ export const useChatStore = defineStore("chat", () => {
       currentRunId.value = runId;
       sessionAgentId.value = agentStore.selectedAgentId || null;
       await refreshSessions();
+      if (pendingLaunchCancelRequested.value) {
+        pendingLaunchCancelRequested.value = false;
+        void cancelSession(sid);
+      }
     } catch (e) {
       console.error("compact failed:", e);
+      pendingLaunchCancelRequested.value = false;
       logChatStreamDebug("compact request failed", {
         sessionId,
         error: e instanceof Error ? e.message : String(e),
@@ -2459,6 +2503,11 @@ export const useChatStore = defineStore("chat", () => {
     if (!sessionId) return;
     const trackedRunId = sessionRunIds.value.get(sessionId)
       ?? (activeSessionId.value === sessionId ? currentRunId.value : null);
+    if (!trackedRunId && pendingManagedSessionId === sessionId) {
+      // The run is still launching; the backend has nothing to cancel yet, so
+      // remember the request and re-fire once the launch resolves.
+      pendingLaunchCancelRequested.value = true;
+    }
     if (trackedRunId && cancelRequestedRunIds.get(sessionId) === trackedRunId) return;
     if (trackedRunId) {
       cancelRequestedRunIds.set(sessionId, trackedRunId);
@@ -2486,7 +2535,13 @@ export const useChatStore = defineStore("chat", () => {
   }
 
   async function cancelChat() {
-    if (!activeSessionId.value || !isStreaming.value) return;
+    if (!isStreaming.value) return;
+    if (!activeSessionId.value) {
+      // First message of a brand-new session: no session id exists until the
+      // chat command resolves, so just flag the cancel for the launch hook.
+      pendingLaunchCancelRequested.value = true;
+      return;
+    }
     await cancelSession(activeSessionId.value);
   }
 
@@ -2571,9 +2626,14 @@ export const useChatStore = defineStore("chat", () => {
     return undoService.undoCheckConflicts(activeSessionId.value, assistantMessageId);
   }
 
+  async function checkUndoDirty(assistantMessageId: string): Promise<ChangedFile[]> {
+    if (!activeSessionId.value) return [];
+    return undoService.undoCheckDirty(activeSessionId.value, assistantMessageId);
+  }
+
   async function performUndo(
     assistantMessageId: string,
-    options?: { force?: boolean },
+    options?: { force?: boolean; acceptDirty?: boolean },
   ): Promise<boolean> {
     if (!activeSessionId.value) return false;
     try {
@@ -2581,6 +2641,7 @@ export const useChatStore = defineStore("chat", () => {
         activeSessionId.value,
         assistantMessageId,
         options?.force ?? false,
+        options?.acceptDirty ?? false,
       );
       // loadChanges returns undo entries, so we reuse it instead of calling undoList twice
       const [detail, undoEntries] = await Promise.all([
@@ -2614,7 +2675,7 @@ export const useChatStore = defineStore("chat", () => {
 
   async function rollbackToMessage(
     messageId: string,
-    options?: { includeFiles?: boolean; fileUndoTarget?: string | null },
+    options?: { includeFiles?: boolean; fileUndoTarget?: string | null; acceptDirty?: boolean },
   ): Promise<boolean> {
     if (!activeSessionId.value || !messageId) return false;
     const sessionId = activeSessionId.value;
@@ -2635,6 +2696,7 @@ export const useChatStore = defineStore("chat", () => {
           fileUndoTarget!,
           messageId,
           false,
+          options?.acceptDirty ?? false,
         );
       } else {
         await sessionService.rollbackSessionToMessage(sessionId, messageId);
@@ -2779,6 +2841,7 @@ export const useChatStore = defineStore("chat", () => {
     applyKnowledgeProposal,
     refreshSessionAfterExternalChange,
     checkUndoConflicts,
+    checkUndoDirty,
     performUndo,
     rollbackToMessage,
     undoLatestConversationTurn,
