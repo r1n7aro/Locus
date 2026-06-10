@@ -2214,7 +2214,12 @@ fn build_knowledge_focus_section(doc: &crate::knowledge_store::KnowledgeDocument
     ];
 
     if doc.summary_enabled {
-        if let Some(summary) = doc.summary.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(summary) = doc
+            .summary
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             lines.push("### Summary".to_string());
             lines.push(summary.to_string());
         }
@@ -17351,7 +17356,9 @@ Search, install, audit, and export a plugin.
             .contains("- Path: design/combat/core-loop.md"));
         assert!(prompt_parts.env_prompt.contains("- Read-only: no"));
         assert!(prompt_parts.env_prompt.contains("Loop summary"));
-        assert!(prompt_parts.env_prompt.contains("Keep damage tables current."));
+        assert!(prompt_parts
+            .env_prompt
+            .contains("Keep damage tables current."));
         assert!(prompt_parts.env_prompt.contains("Damage remains 20."));
         // Body headings are remapped below the env section headings.
         assert!(prompt_parts.env_prompt.contains("#### Core Loop"));

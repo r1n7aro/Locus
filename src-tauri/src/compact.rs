@@ -1780,11 +1780,46 @@ mod tests {
         let huge = "工具输出".repeat(40_000);
         let mut messages = vec![
             make_message("user-1", MessageRole::User, "排查", 100, None, None),
-            make_message("assistant-1", MessageRole::Assistant, "running", 101, None, None),
-            make_message("tool-old", MessageRole::Tool, &huge, 102, None, Some("tc-1")),
-            make_message("assistant-2", MessageRole::Assistant, "running", 103, None, None),
-            make_message("tool-new-1", MessageRole::Tool, &huge, 104, None, Some("tc-2")),
-            make_message("tool-new-2", MessageRole::Tool, &huge, 105, None, Some("tc-3")),
+            make_message(
+                "assistant-1",
+                MessageRole::Assistant,
+                "running",
+                101,
+                None,
+                None,
+            ),
+            make_message(
+                "tool-old",
+                MessageRole::Tool,
+                &huge,
+                102,
+                None,
+                Some("tc-1"),
+            ),
+            make_message(
+                "assistant-2",
+                MessageRole::Assistant,
+                "running",
+                103,
+                None,
+                None,
+            ),
+            make_message(
+                "tool-new-1",
+                MessageRole::Tool,
+                &huge,
+                104,
+                None,
+                Some("tc-2"),
+            ),
+            make_message(
+                "tool-new-2",
+                MessageRole::Tool,
+                &huge,
+                105,
+                None,
+                Some("tc-3"),
+            ),
         ];
 
         let rewritten =
