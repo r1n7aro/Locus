@@ -1,7 +1,4 @@
-use std::{collections::HashMap, path::Path, process::Stdio, sync::OnceLock, time::Duration};
-
-#[cfg(windows)]
-use std::ffi::c_void;
+use std::{collections::HashMap, path::Path, sync::OnceLock, time::Duration};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -29,12 +26,22 @@ pub struct UnityEditorProcessInfo {
     pub last_error: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "PascalCase")]
+#[derive(Debug, Clone)]
 struct Win32UnityProcess {
     process_id: u32,
     executable_path: Option<String>,
     command_line: Option<String>,
+}
+
+/// Manifest the Unity editor (2017.1+) writes to `Library/EditorInstance.json`
+/// while it has the project open and removes again on clean shutdown. Extra
+/// fields (`version`, `app_contents_path`) are ignored.
+#[cfg(windows)]
+#[derive(Debug, Deserialize)]
+struct EditorInstanceManifest {
+    process_id: u32,
+    #[serde(default)]
+    app_path: Option<String>,
 }
 
 fn unity_process_probe_cache() -> &'static Mutex<HashMap<String, UnityEditorProcessInfo>> {
@@ -123,54 +130,7 @@ pub(super) async fn refresh_known_project_editor_process_liveness(
 
 #[cfg(windows)]
 fn is_process_alive(process_id: u32) -> Result<bool, String> {
-    type Bool = i32;
-    type Dword = u32;
-    type Handle = *mut c_void;
-
-    const FALSE: Bool = 0;
-    const PROCESS_QUERY_LIMITED_INFORMATION: Dword = 0x1000;
-    const STILL_ACTIVE: Dword = 259;
-    const ERROR_INVALID_PARAMETER: i32 = 87;
-
-    unsafe extern "system" {
-        fn CloseHandle(hObject: Handle) -> Bool;
-        fn GetExitCodeProcess(hProcess: Handle, lpExitCode: *mut Dword) -> Bool;
-        fn OpenProcess(dwDesiredAccess: Dword, bInheritHandle: Bool, dwProcessId: Dword) -> Handle;
-    }
-
-    struct OwnedHandle(Handle);
-
-    impl Drop for OwnedHandle {
-        fn drop(&mut self) {
-            unsafe {
-                let _ = CloseHandle(self.0);
-            }
-        }
-    }
-
-    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, process_id) };
-    if handle.is_null() {
-        let error = std::io::Error::last_os_error();
-        if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER) {
-            return Ok(false);
-        }
-        return Err(format!(
-            "Failed to open Unity process {} for liveness check: {}",
-            process_id, error
-        ));
-    }
-
-    let handle = OwnedHandle(handle);
-    let mut exit_code: Dword = 0;
-    if unsafe { GetExitCodeProcess(handle.0, &mut exit_code) } == 0 {
-        return Err(format!(
-            "Failed to query Unity process {} exit code: {}",
-            process_id,
-            std::io::Error::last_os_error()
-        ));
-    }
-
-    Ok(exit_code == STILL_ACTIVE)
+    Ok(probe_native::query_process_facts(process_id)?.alive)
 }
 
 #[cfg(not(windows))]
@@ -230,11 +190,17 @@ pub async fn query_current_project_editor_process(project_path: &str) -> UnityEd
     let project_path = project_path.to_string();
     let probe = match tokio::time::timeout(
         Duration::from_secs(UNITY_PROCESS_PROBE_TIMEOUT_SECS),
-        query_current_project_editor_process_uncached(project_path),
+        tokio::task::spawn_blocking(move || {
+            query_current_project_editor_process_uncached(project_path)
+        }),
     )
     .await
     {
-        Ok(info) => info,
+        Ok(Ok(info)) => info,
+        Ok(Err(join_error)) => UnityEditorProcessInfo::unknown(
+            unix_now_ms(),
+            format!("Unity process probe task failed: {}", join_error),
+        ),
         Err(_) => UnityEditorProcessInfo::unknown(
             unix_now_ms(),
             format!(
@@ -267,9 +233,7 @@ pub(super) async fn cache_project_editor_process(
 }
 
 #[cfg(windows)]
-async fn query_current_project_editor_process_uncached(
-    project_path: String,
-) -> UnityEditorProcessInfo {
+fn query_current_project_editor_process_uncached(project_path: String) -> UnityEditorProcessInfo {
     let checked_at_ms = unix_now_ms();
     let target = match normalize_project_identity(&project_path) {
         Some(value) => value,
@@ -281,7 +245,16 @@ async fn query_current_project_editor_process_uncached(
         }
     };
 
-    let records = match query_unity_processes().await {
+    // Fast path: trust the manifest the editor itself maintains inside the
+    // project; it identifies the owning editor instance without touching any
+    // other process on the machine.
+    if let Some(info) = probe_editor_instance_manifest(&project_path, checked_at_ms) {
+        return info;
+    }
+
+    // Fallback: enumerate Unity.exe processes and match their -projectPath
+    // argument, mirroring the semantics of the previous WMI-based probe.
+    let records = match query_unity_processes() {
         Ok(records) => records,
         Err(error) => return UnityEditorProcessInfo::unknown(checked_at_ms, error),
     };
@@ -331,9 +304,7 @@ async fn query_current_project_editor_process_uncached(
 }
 
 #[cfg(not(windows))]
-async fn query_current_project_editor_process_uncached(
-    _project_path: String,
-) -> UnityEditorProcessInfo {
+fn query_current_project_editor_process_uncached(_project_path: String) -> UnityEditorProcessInfo {
     UnityEditorProcessInfo::unknown(
         unix_now_ms(),
         "Unity editor process detection is only supported on Windows",
@@ -341,49 +312,489 @@ async fn query_current_project_editor_process_uncached(
 }
 
 #[cfg(windows)]
-async fn query_unity_processes() -> Result<Vec<Win32UnityProcess>, String> {
-    let script = r#"$ErrorActionPreference = 'Stop'; $items = @(Get-CimInstance Win32_Process -Filter "Name = 'Unity.exe'" | ForEach-Object { [pscustomobject]@{ ProcessId = $_.ProcessId; ExecutablePath = $_.ExecutablePath; CommandLine = $_.CommandLine } }); ConvertTo-Json -Compress -Depth 3 -InputObject $items"#;
+fn editor_instance_manifest_path(project_path: &str) -> std::path::PathBuf {
+    Path::new(strip_extended_path_prefix(project_path))
+        .join("Library")
+        .join("EditorInstance.json")
+}
 
-    let mut command = tokio::process::Command::new("powershell.exe");
-    command
-        .arg("-NoLogo")
-        .arg("-NoProfile")
-        .arg("-NonInteractive")
-        .arg("-ExecutionPolicy")
-        .arg("Bypass")
-        .arg("-Command")
-        .arg(script)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+/// Lower-cases and backslash-normalizes an executable path for comparison;
+/// `EditorInstance.json` records forward slashes while Win32 APIs return
+/// backslashes.
+#[cfg(windows)]
+fn normalize_executable_path(path: &str) -> String {
+    strip_extended_path_prefix(path)
+        .trim()
+        .trim_matches('"')
+        .replace('/', "\\")
+        .to_ascii_lowercase()
+}
 
-    #[cfg(windows)]
-    {
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        command.creation_flags(CREATE_NO_WINDOW);
+/// Probes `Library/EditorInstance.json`. Returns `Some` only for a positively
+/// verified running editor; every inconclusive outcome (missing or malformed
+/// manifest, dead or unverifiable process) returns `None` so the caller falls
+/// back to process enumeration.
+#[cfg(windows)]
+fn probe_editor_instance_manifest(
+    project_path: &str,
+    checked_at_ms: u64,
+) -> Option<UnityEditorProcessInfo> {
+    const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
+    // FAT volumes round mtimes to 2s granularity; allow that much skew before
+    // deciding the probed process started after the manifest was written.
+    const MANIFEST_MTIME_SLACK_MS: u64 = 2_000;
+
+    let manifest_path = editor_instance_manifest_path(project_path);
+    let metadata = std::fs::metadata(&manifest_path).ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_MANIFEST_BYTES {
+        return None;
+    }
+    let manifest_modified_ms = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|elapsed| elapsed.as_millis().min(u128::from(u64::MAX)) as u64);
+
+    let raw = std::fs::read_to_string(&manifest_path).ok()?;
+    let manifest: EditorInstanceManifest = serde_json::from_str(&raw).ok()?;
+    if manifest.process_id == 0 {
+        return None;
     }
 
-    let output = command
-        .output()
-        .await
-        .map_err(|error| format!("Failed to query Unity processes: {}", error))?;
+    let facts = probe_native::query_process_facts(manifest.process_id).ok()?;
+    if !facts.alive {
+        return None;
+    }
+    let image_path = facts.image_path?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(if stderr.is_empty() {
-            format!("Unity process query failed with status {}", output.status)
-        } else {
-            format!("Unity process query failed: {}", stderr)
+    // Guard against PID reuse after a crash left a stale manifest: the process
+    // must still run the executable the editor recorded (or at least a Unity
+    // editor binary), and it must not have started after the manifest was
+    // written — the writer necessarily predates its own file.
+    let normalized_image = normalize_executable_path(&image_path);
+    match manifest
+        .app_path
+        .as_deref()
+        .map(normalize_executable_path)
+        .filter(|expected| !expected.is_empty())
+    {
+        Some(expected) if normalized_image != expected => return None,
+        Some(_) => {}
+        None if !normalized_image.ends_with("\\unity.exe") => return None,
+        None => {}
+    }
+    if let (Some(created_ms), Some(modified_ms)) = (facts.created_at_unix_ms, manifest_modified_ms)
+    {
+        if created_ms > modified_ms.saturating_add(MANIFEST_MTIME_SLACK_MS) {
+            return None;
+        }
+    }
+
+    Some(UnityEditorProcessInfo {
+        state: UnityEditorProcessState::Running,
+        process_id: Some(manifest.process_id),
+        executable_path: Some(image_path),
+        project_path: Some(strip_extended_path_prefix(project_path).trim().to_string()),
+        checked_at_ms,
+        last_error: None,
+    })
+}
+
+/// In-process replacement for the previous `powershell.exe` + WMI query.
+/// `command_line: None` (e.g. an elevated editor we cannot read) keeps the
+/// caller's "command line unavailable" accounting identical to WMI returning
+/// a NULL `CommandLine`.
+#[cfg(windows)]
+fn query_unity_processes() -> Result<Vec<Win32UnityProcess>, String> {
+    let mut records = Vec::new();
+    for process_id in probe_native::unity_editor_process_ids()? {
+        // The process may exit between the snapshot and this query; skip it
+        // then, as if it had never been enumerated.
+        let Ok(facts) = probe_native::query_process_facts(process_id) else {
+            continue;
+        };
+        if !facts.alive {
+            continue;
+        }
+        records.push(Win32UnityProcess {
+            process_id,
+            executable_path: facts.image_path,
+            command_line: probe_native::read_process_command_line(process_id).ok(),
         });
     }
+    Ok(records)
+}
 
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if stdout.is_empty() {
-        return Ok(Vec::new());
+/// Minimal hand-rolled Win32/NT bindings for the Unity process probe,
+/// following the FFI style of `unity_bridge::background_hook`.
+#[cfg(windows)]
+mod probe_native {
+    use std::ffi::c_void;
+
+    type Bool = i32;
+    type Dword = u32;
+    type Handle = *mut c_void;
+    type NtStatus = i32;
+
+    const FALSE: Bool = 0;
+    const PROCESS_QUERY_LIMITED_INFORMATION: Dword = 0x1000;
+    const PROCESS_QUERY_INFORMATION: Dword = 0x0400;
+    const PROCESS_VM_READ: Dword = 0x0010;
+    const STILL_ACTIVE: Dword = 259;
+    const ERROR_INVALID_PARAMETER: i32 = 87;
+    const ERROR_NO_MORE_FILES: i32 = 18;
+    const TH32CS_SNAPPROCESS: Dword = 0x0000_0002;
+    const PROCESS_BASIC_INFORMATION_CLASS: u32 = 0;
+    /// Sized for `\\?\`-style long paths (in UTF-16 units).
+    const IMAGE_PATH_CAPACITY: usize = 32_768;
+    /// Milliseconds between the FILETIME epoch (1601-01-01) and the Unix epoch.
+    const FILETIME_UNIX_EPOCH_DIFF_MS: u64 = 11_644_473_600_000;
+
+    #[repr(C)]
+    struct ProcessEntry32W {
+        dw_size: Dword,
+        _cnt_usage: Dword,
+        th32_process_id: Dword,
+        _th32_default_heap_id: usize,
+        _th32_module_id: Dword,
+        _cnt_threads: Dword,
+        _th32_parent_process_id: Dword,
+        _pc_pri_class_base: i32,
+        _dw_flags: Dword,
+        sz_exe_file: [u16; 260],
     }
 
-    serde_json::from_str::<Vec<Win32UnityProcess>>(&stdout)
-        .map_err(|error| format!("Failed to parse Unity process query output: {}", error))
+    #[repr(C)]
+    struct Filetime {
+        dw_low_date_time: Dword,
+        dw_high_date_time: Dword,
+    }
+
+    /// `UNICODE_STRING` (winternl.h); `length` is in bytes.
+    #[repr(C)]
+    struct UnicodeString {
+        length: u16,
+        _maximum_length: u16,
+        buffer: *mut u16,
+    }
+
+    /// `PROCESS_BASIC_INFORMATION` (winternl.h).
+    #[repr(C)]
+    struct ProcessBasicInformation {
+        _exit_status: NtStatus,
+        peb_base_address: *mut c_void,
+        _affinity_mask: usize,
+        _base_priority: i32,
+        _unique_process_id: usize,
+        _inherited_from_unique_process_id: usize,
+    }
+
+    /// Leading fields of the `PEB` as documented in winternl.h; only
+    /// `process_parameters` is read.
+    #[repr(C)]
+    struct PebPartial {
+        _reserved1: [u8; 2],
+        _being_debugged: u8,
+        _reserved2: [u8; 1],
+        _reserved3: [*mut c_void; 2],
+        _ldr: *mut c_void,
+        process_parameters: *mut c_void,
+    }
+
+    /// Leading fields of `RTL_USER_PROCESS_PARAMETERS` as documented in
+    /// winternl.h.
+    #[repr(C)]
+    struct RtlUserProcessParametersPartial {
+        _reserved1: [u8; 16],
+        _reserved2: [*mut c_void; 10],
+        _image_path_name: UnicodeString,
+        command_line: UnicodeString,
+    }
+
+    unsafe extern "system" {
+        fn CloseHandle(h_object: Handle) -> Bool;
+        fn OpenProcess(
+            dw_desired_access: Dword,
+            b_inherit_handle: Bool,
+            dw_process_id: Dword,
+        ) -> Handle;
+        fn GetExitCodeProcess(h_process: Handle, lp_exit_code: *mut Dword) -> Bool;
+        fn GetProcessTimes(
+            h_process: Handle,
+            lp_creation_time: *mut Filetime,
+            lp_exit_time: *mut Filetime,
+            lp_kernel_time: *mut Filetime,
+            lp_user_time: *mut Filetime,
+        ) -> Bool;
+        fn QueryFullProcessImageNameW(
+            h_process: Handle,
+            dw_flags: Dword,
+            lp_exe_name: *mut u16,
+            lpdw_size: *mut Dword,
+        ) -> Bool;
+        fn CreateToolhelp32Snapshot(dw_flags: Dword, th32_process_id: Dword) -> Handle;
+        fn Process32FirstW(h_snapshot: Handle, lppe: *mut ProcessEntry32W) -> Bool;
+        fn Process32NextW(h_snapshot: Handle, lppe: *mut ProcessEntry32W) -> Bool;
+        fn ReadProcessMemory(
+            h_process: Handle,
+            lp_base_address: *const c_void,
+            lp_buffer: *mut c_void,
+            n_size: usize,
+            lp_number_of_bytes_read: *mut usize,
+        ) -> Bool;
+    }
+
+    // ntdll is not linked by default; raw-dylib avoids depending on a Windows
+    // SDK import library.
+    #[link(name = "ntdll", kind = "raw-dylib")]
+    unsafe extern "system" {
+        fn NtQueryInformationProcess(
+            process_handle: Handle,
+            process_information_class: u32,
+            process_information: *mut c_void,
+            process_information_length: u32,
+            return_length: *mut u32,
+        ) -> NtStatus;
+    }
+
+    struct OwnedHandle(Handle);
+
+    impl Drop for OwnedHandle {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
+
+    pub(super) struct ProcessFacts {
+        pub(super) alive: bool,
+        pub(super) image_path: Option<String>,
+        pub(super) created_at_unix_ms: Option<u64>,
+    }
+
+    /// Queries liveness, image path and creation time through a single
+    /// `PROCESS_QUERY_LIMITED_INFORMATION` handle. A process id that no longer
+    /// exists yields `alive: false` rather than an error.
+    pub(super) fn query_process_facts(process_id: u32) -> Result<ProcessFacts, String> {
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, process_id) };
+        if handle.is_null() {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER) {
+                return Ok(ProcessFacts {
+                    alive: false,
+                    image_path: None,
+                    created_at_unix_ms: None,
+                });
+            }
+            return Err(format!(
+                "Failed to open Unity process {} for probing: {}",
+                process_id, error
+            ));
+        }
+        let handle = OwnedHandle(handle);
+
+        let mut exit_code: Dword = 0;
+        if unsafe { GetExitCodeProcess(handle.0, &mut exit_code) } == 0 {
+            return Err(format!(
+                "Failed to query Unity process {} exit code: {}",
+                process_id,
+                std::io::Error::last_os_error()
+            ));
+        }
+        if exit_code != STILL_ACTIVE {
+            return Ok(ProcessFacts {
+                alive: false,
+                image_path: None,
+                created_at_unix_ms: None,
+            });
+        }
+
+        Ok(ProcessFacts {
+            alive: true,
+            image_path: query_image_path(&handle),
+            created_at_unix_ms: query_creation_unix_ms(&handle),
+        })
+    }
+
+    fn query_image_path(handle: &OwnedHandle) -> Option<String> {
+        let mut buffer = vec![0u16; IMAGE_PATH_CAPACITY];
+        let mut size = buffer.len() as Dword;
+        if unsafe { QueryFullProcessImageNameW(handle.0, 0, buffer.as_mut_ptr(), &mut size) } == 0 {
+            return None;
+        }
+        Some(String::from_utf16_lossy(&buffer[..size as usize]))
+    }
+
+    fn query_creation_unix_ms(handle: &OwnedHandle) -> Option<u64> {
+        let mut creation: Filetime = unsafe { std::mem::zeroed() };
+        let mut exit: Filetime = unsafe { std::mem::zeroed() };
+        let mut kernel: Filetime = unsafe { std::mem::zeroed() };
+        let mut user: Filetime = unsafe { std::mem::zeroed() };
+        if unsafe { GetProcessTimes(handle.0, &mut creation, &mut exit, &mut kernel, &mut user) }
+            == 0
+        {
+            return None;
+        }
+        let ticks =
+            (u64::from(creation.dw_high_date_time) << 32) | u64::from(creation.dw_low_date_time);
+        (ticks / 10_000).checked_sub(FILETIME_UNIX_EPOCH_DIFF_MS)
+    }
+
+    /// Lists process ids whose executable name is `Unity.exe`.
+    pub(super) fn unity_editor_process_ids() -> Result<Vec<u32>, String> {
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+        if snapshot as isize == -1 {
+            return Err(format!(
+                "Failed to snapshot processes for Unity probe: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let snapshot = OwnedHandle(snapshot);
+
+        let mut entry: ProcessEntry32W = unsafe { std::mem::zeroed() };
+        entry.dw_size = std::mem::size_of::<ProcessEntry32W>() as Dword;
+
+        let mut process_ids = Vec::new();
+        if unsafe { Process32FirstW(snapshot.0, &mut entry) } == 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(ERROR_NO_MORE_FILES) {
+                return Ok(process_ids);
+            }
+            return Err(format!("Failed to enumerate processes: {}", error));
+        }
+
+        loop {
+            if wide_to_string(&entry.sz_exe_file).eq_ignore_ascii_case("unity.exe") {
+                process_ids.push(entry.th32_process_id);
+            }
+            if unsafe { Process32NextW(snapshot.0, &mut entry) } == 0 {
+                break;
+            }
+        }
+        Ok(process_ids)
+    }
+
+    /// Reads a process command line from its PEB
+    /// (`PEB -> RTL_USER_PROCESS_PARAMETERS -> CommandLine`). Fails for
+    /// processes we lack `PROCESS_VM_READ` access to, e.g. an elevated editor.
+    pub(super) fn read_process_command_line(process_id: u32) -> Result<String, String> {
+        let handle = unsafe {
+            OpenProcess(
+                PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
+                FALSE,
+                process_id,
+            )
+        };
+        if handle.is_null() {
+            return Err(format!(
+                "Failed to open Unity process {} for command line read: {}",
+                process_id,
+                std::io::Error::last_os_error()
+            ));
+        }
+        let handle = OwnedHandle(handle);
+
+        let mut info: ProcessBasicInformation = unsafe { std::mem::zeroed() };
+        let mut return_length: u32 = 0;
+        let status = unsafe {
+            NtQueryInformationProcess(
+                handle.0,
+                PROCESS_BASIC_INFORMATION_CLASS,
+                &mut info as *mut ProcessBasicInformation as *mut c_void,
+                std::mem::size_of::<ProcessBasicInformation>() as u32,
+                &mut return_length,
+            )
+        };
+        if status != 0 {
+            return Err(format!(
+                "NtQueryInformationProcess failed for Unity process {}: status 0x{:08X}",
+                process_id, status as u32
+            ));
+        }
+        if info.peb_base_address.is_null() {
+            return Err(format!("Unity process {} reported no PEB", process_id));
+        }
+
+        let peb: PebPartial = read_remote(&handle, process_id, info.peb_base_address)?;
+        if peb.process_parameters.is_null() {
+            return Err(format!(
+                "Unity process {} reported no process parameters",
+                process_id
+            ));
+        }
+        let parameters: RtlUserProcessParametersPartial =
+            read_remote(&handle, process_id, peb.process_parameters)?;
+        read_remote_unicode_string(&handle, process_id, &parameters.command_line)
+    }
+
+    fn read_remote<T>(
+        handle: &OwnedHandle,
+        process_id: u32,
+        address: *const c_void,
+    ) -> Result<T, String> {
+        let mut value: T = unsafe { std::mem::zeroed() };
+        let mut bytes_read = 0usize;
+        let ok = unsafe {
+            ReadProcessMemory(
+                handle.0,
+                address,
+                &mut value as *mut T as *mut c_void,
+                std::mem::size_of::<T>(),
+                &mut bytes_read,
+            )
+        };
+        if ok == 0 || bytes_read != std::mem::size_of::<T>() {
+            return Err(format!(
+                "Failed to read Unity process {} memory: {}",
+                process_id,
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(value)
+    }
+
+    fn read_remote_unicode_string(
+        handle: &OwnedHandle,
+        process_id: u32,
+        value: &UnicodeString,
+    ) -> Result<String, String> {
+        let byte_len = usize::from(value.length) & !1usize;
+        if byte_len == 0 {
+            return Ok(String::new());
+        }
+        if value.buffer.is_null() {
+            return Err(format!(
+                "Unity process {} command line buffer is null",
+                process_id
+            ));
+        }
+
+        let mut buffer = vec![0u16; byte_len / 2];
+        let mut bytes_read = 0usize;
+        let ok = unsafe {
+            ReadProcessMemory(
+                handle.0,
+                value.buffer as *const c_void,
+                buffer.as_mut_ptr() as *mut c_void,
+                byte_len,
+                &mut bytes_read,
+            )
+        };
+        if ok == 0 || bytes_read != byte_len {
+            return Err(format!(
+                "Failed to read Unity process {} command line: {}",
+                process_id,
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(String::from_utf16_lossy(&buffer))
+    }
+
+    fn wide_to_string(value: &[u16]) -> String {
+        let length = value.iter().position(|&c| c == 0).unwrap_or(value.len());
+        String::from_utf16_lossy(&value[..length])
+    }
 }
 
 fn project_path_from_args(args: &[String]) -> Option<&str> {
@@ -499,5 +910,100 @@ mod tests {
 
         #[cfg(not(windows))]
         assert_eq!(normalized, r#"C:\Projects\Game"#);
+    }
+
+    #[cfg(windows)]
+    mod windows_probe {
+        use super::super::{normalize_executable_path, probe_native, EditorInstanceManifest};
+
+        #[test]
+        fn parses_editor_instance_manifest_sample() {
+            let raw = r#"{
+	"process_id" : 571648,
+	"version" : "2022.3.47f1",
+	"app_path" : "E:/2022.3.47f1/Editor/Unity.exe",
+	"app_contents_path" : "E:/2022.3.47f1/Editor/Data"
+}"#;
+
+            let manifest: EditorInstanceManifest = serde_json::from_str(raw).unwrap();
+
+            assert_eq!(manifest.process_id, 571648);
+            assert_eq!(
+                manifest.app_path.as_deref(),
+                Some("E:/2022.3.47f1/Editor/Unity.exe")
+            );
+        }
+
+        #[test]
+        fn editor_instance_manifest_tolerates_missing_app_path() {
+            let manifest: EditorInstanceManifest =
+                serde_json::from_str(r#"{"process_id": 42}"#).unwrap();
+
+            assert_eq!(manifest.process_id, 42);
+            assert!(manifest.app_path.is_none());
+        }
+
+        #[test]
+        fn normalizes_executable_paths_across_slash_and_case() {
+            assert_eq!(
+                normalize_executable_path("E:/2022.3.47f1/Editor/Unity.exe"),
+                normalize_executable_path(r"e:\2022.3.47f1\editor\UNITY.EXE")
+            );
+        }
+
+        #[test]
+        fn query_process_facts_reports_current_process_alive() {
+            let facts = probe_native::query_process_facts(std::process::id()).unwrap();
+
+            assert!(facts.alive);
+
+            let image_path = facts.image_path.expect("image path should be readable");
+            let current_exe_name = std::env::current_exe()
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_ascii_lowercase();
+            assert!(
+                normalize_executable_path(&image_path).ends_with(&current_exe_name),
+                "image path {:?} should end with {:?}",
+                image_path,
+                current_exe_name
+            );
+
+            let created_at = facts
+                .created_at_unix_ms
+                .expect("creation time should be readable");
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+            assert!(created_at <= now_ms);
+        }
+
+        #[test]
+        fn reads_current_process_command_line() {
+            let command_line = probe_native::read_process_command_line(std::process::id()).unwrap();
+
+            let current_exe_name = std::env::current_exe()
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_ascii_lowercase();
+            assert!(
+                command_line
+                    .to_ascii_lowercase()
+                    .contains(&current_exe_name),
+                "command line {:?} should mention {:?}",
+                command_line,
+                current_exe_name
+            );
+        }
+
+        #[test]
+        fn enumerates_unity_process_ids_without_error() {
+            probe_native::unity_editor_process_ids().unwrap();
+        }
     }
 }
