@@ -2,6 +2,7 @@
 title: Plugin Publishing
 tools:
   - bash
+  - sheet
 ---
 
 # Plugin Publishing
@@ -40,7 +41,7 @@ Write the source entry:
 - Include standard stats definitions for GitHub-hosted plugins: `githubStars` with label `Stars` and `releaseDownloads` with label `Release downloads`. Registry CI refreshes the stat values.
 - Store `downloadSource`, never generated `download`, `latestVersion`, or release SHA fields; CI resolves `latestVersion`, `download.url`, `download.sha256`, `download.sizeBytes`, `updatedAt`, and `downloadSource.version` into `public/v1`. Use `downloadSource.type: "latestRelease"` for normal GitHub release publishing. Omit `asset` when each release has exactly one plugin zip. Use `assetPattern` such as `locus-workspace-*.zip` when asset names include the version, and never set `asset` to a versioned filename. A release with multiple zip assets must set `asset` or `assetPattern` so CI fails instead of guessing.
 - After the user confirms the plugin id, check registry duplicates on the target base branch: compute the bucket and read the entry path. If the id exists, ask whether this is a new version of that plugin, a replacement or fork under a new id, or a stop.
-- Before opening the PR, confirm: target repository, plugin id, author, release source rule, description source, license, compatibility, dependency metadata, plugin purpose, usage instructions, and stats definitions.
+- Before opening the PR, confirm the registry metadata with the `sheet` tool in one form: target repository, plugin id, author, release source rule, description source, license, compatibility, dependency metadata, plugin purpose, usage instructions, and stats definitions. Apply user edits from the confirmed sheet to the source entry. After a change request, revise and present an updated sheet before continuing.
 
 Open the PR from a fork:
 

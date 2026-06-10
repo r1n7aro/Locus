@@ -12,6 +12,7 @@ tools:
   - view_reload
   - knowledge_read
   - ask_user_question
+  - sheet
 ---
 
 # Plugin
@@ -43,6 +44,7 @@ Treat `/plugin <request>` as the only command entry. Interpret words such as sea
 
 4. Ask when a choice changes the result.
    - Use `ask_user_question` when multiple registry matches are plausible, install or uninstall scope is unclear, component selection is unclear, import mode is unclear, publish target is unclear, or GitHub authentication is missing.
+   - Use `sheet` to confirm collected multi-field metadata in one pass (export step 10, registry entry metadata in the publishing workflow) instead of asking field by field.
    - Always ask before creating, exporting, or publishing a new plugin id. The package name is the plugin id, and the user must choose or enter it before export.
    - Show any proposed id explicitly. A proposal may come from an existing plugin id, selected Skill/View slug, repository owner, or authenticated GitHub login, but none of those sources decides the final id.
    - Prefer concise package-manager style ids such as `asset-browser-tools` or `locus-workspace`. Use reverse-DNS or owner-prefixed ids only when the user chooses that naming scheme or a collision needs disambiguation.
@@ -75,10 +77,12 @@ Treat `/plugin <request>` as the only command entry. Interpret words such as sea
    - Set `compatibility.projectIndependent = true` only when the audit finds no project dependencies; otherwise set it to `false` and fill `dependencies.project`.
 
 10. Export only after approval.
-   - Present plugin id, name, version, selected Skill package ids, selected View ids, output path, dependency metadata, checked files, and remaining risks. Ask when the output path, version, package id, or publish target is missing.
-   - For new plugins, force the package name question even when a high-confidence id is available, and record the user's selected id in `userApproval`.
+   - Confirm the export metadata with the `sheet` tool: one sheet titled with the plugin id and version, with fields for plugin id, name, version, selected Skill package ids, selected View ids, output path, install scope, and dependency metadata. Summarize checked files and remaining risks in the sheet description. Mark values the user already fixed as readonly and leave the rest editable.
+   - The sheet confirms collected values; it does not collect missing ones. Ask with `ask_user_question` first when the output path, version, package id, or publish target is still unknown.
+   - For new plugins, force the package name question even when a high-confidence id is available.
+   - When the sheet returns a change request, revise the proposal and present an updated sheet. Never call `plugin_export` while the latest sheet outcome is a change request.
    - Before export, run `plugin_list` and check installed app/workspace plugins for the selected id. If it already exists, ask whether to update that plugin, choose another id, or stop.
-   - Call `plugin_export` only after the audit, structure plan, and explicit user approval are complete. Pass detailed `auditSummary`, `structurePlan`, and `userApproval`.
+   - Call `plugin_export` only after the audit, structure plan, and sheet confirmation are complete. Pass detailed `auditSummary` and `structurePlan`, and record the confirmed sheet values, including user edits, in `userApproval`.
    - For plugin creation from existing components, pass `installAfterExport: true` and `transferOwnership: true` so the created plugin installs locally and takes ownership of the components. Use `installScope: "app"` by default; use `"project"` when the plugin should stay in the current workspace.
    - After export, report the installed plugin root and the transferred Skill/View component ids. Continue future edits inside the installed plugin root.
 

@@ -1,11 +1,8 @@
-import { existsSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 
 const cwd = process.cwd();
-const pluginWord = "plugin";
-const legacyCreatePluginCommand = `/create-${pluginWord}`;
-const legacyCreatePluginPath = `knowledge/skill/builtin/create-${pluginWord}.md`;
 
 function read(relPath: string): string {
   return readFileSync(resolve(cwd, relPath), "utf8");
@@ -44,6 +41,11 @@ describe("plugin Skill package", () => {
     expect(skill).toContain('path: "skill/builtin/create-skill.md"');
     expect(skill).toContain('path: "skill/plugin/publish.md"');
     expect(skill).toContain("ask_user_question");
+    expect(skill).toContain("- sheet");
+    expect(skill).toContain("Confirm the export metadata with the `sheet` tool");
+    expect(skill).toContain("Never call `plugin_export` while the latest sheet outcome is a change request.");
+    expect(skill).toContain("record the confirmed sheet values, including user edits, in `userApproval`");
+    expect(publish).toContain("confirm the registry metadata with the `sheet` tool");
     expect(skill).toContain("Optional plugin Rules live under the plugin root");
     expect(skill).toContain("They are enabled by default while the plugin is enabled.");
     expect(skill).toContain("Disabling a plugin keeps it installed and listed");
@@ -84,7 +86,6 @@ describe("plugin Skill package", () => {
     expect(publish).toContain("GitHub raw branch URLs can lag briefly after a generated commit");
     expect(publish).toContain("Download the public entry archive URL");
     expect(publish).toContain("Do not create or update `entries/v1`");
-    expect(existsSync(resolve(cwd, legacyCreatePluginPath))).toBe(false);
   });
 
   it("keeps plugin tools aligned with the natural-language workflow", () => {
@@ -107,7 +108,6 @@ describe("plugin Skill package", () => {
     const viewListTool = read("tools/view_list.json");
 
     expect(exportTool).toContain("/plugin workflow");
-    expect(exportTool).not.toContain(legacyCreatePluginCommand);
     expect(exportTool).toContain("asset-tools");
     expect(exportTool).toContain("Prefer concise package-manager-style ids");
     expect(exportTool).toContain("installAfterExport");
