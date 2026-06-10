@@ -363,7 +363,8 @@ describe("chat sidebar layout", () => {
     expect(transcript).toContain("assertCanonicalRenderParts(item.message.renderParts, `message:${item.message.id}`);");
     expect(transcript).toContain("synthesizeLegacyRenderParts(item.message, {");
     expect(transcript).toContain("const canonicalLiveRenderParts = computed(() => {");
-    expect(transcript).toContain("props.liveRenderParts.length > 0");
+    expect(transcript).toContain("useThrottledLiveRenderParts(() => props.liveRenderParts)");
+    expect(transcript).toContain("displayedLiveRenderParts.value.length > 0");
     expect(transcript).toContain("const hasVisibleActiveThinkingBlock = computed(() =>");
     expect(transcript).toContain(":class=\"{ active: segment.active, 'is-clickable': true }\"");
     expect(transcript).toContain("data-render-part-kind=\"toolCall\"");

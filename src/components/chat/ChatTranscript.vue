@@ -33,6 +33,7 @@ import {
   compareAssistantRenderParts,
   synthesizeLegacyRenderParts,
 } from "../../composables/assistantRenderParts";
+import { useThrottledLiveRenderParts } from "../../composables/streamingRenderThrottle";
 import { useDisplaySettings } from "../../composables/useDisplaySettings";
 import { parseChatAssetRefs } from "../../composables/chatAssetRefs";
 import {
@@ -1328,10 +1329,14 @@ function onTransientToolCallsCollapseFinished() {
   }
 }
 
+// Rendering reads the throttled copy so per-delta content growth repaints at
+// the shared streaming cadence; handoff timing logic stays on the raw prop.
+const displayedLiveRenderParts = useThrottledLiveRenderParts(() => props.liveRenderParts);
+
 const canonicalLiveRenderParts = computed(() => {
-  if (props.liveRenderParts.length > 0) {
-    assertCanonicalRenderParts(props.liveRenderParts, "live");
-    return [...props.liveRenderParts].sort(compareAssistantRenderParts);
+  if (displayedLiveRenderParts.value.length > 0) {
+    assertCanonicalRenderParts(displayedLiveRenderParts.value, "live");
+    return [...displayedLiveRenderParts.value].sort(compareAssistantRenderParts);
   }
 
   const legacyToolCalls: ToolCallInfo[] = props.activeToolCalls.map((toolCall) => ({
@@ -1878,7 +1883,7 @@ const transientRenderSegments = computed<TransientRenderSegment[]>(() => {
       });
     } else if (part.kind === "text") {
       flushPendingTools();
-      const content = props.liveRenderParts.length <= 1 && props.streamingText ? props.streamingText : part.content;
+      const content = displayedLiveRenderParts.value.length <= 1 && props.streamingText ? props.streamingText : part.content;
       if (content) {
         segments.push({
           type: "content",
