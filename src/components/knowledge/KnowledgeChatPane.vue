@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
 import { t } from "../../i18n";
-import type { KnowledgeDocument, KnowledgeEditMode, KnowledgeDocumentType } from "../../types";
+import type { KnowledgeDocument } from "../../types";
 import EmbeddedChatPane from "../chat/EmbeddedChatPane.vue";
 import AgentSelector from "../AgentSelector.vue";
 import ModelEffortSelector from "../ModelEffortSelector.vue";
@@ -10,9 +10,6 @@ import { useSkills } from "../../composables/useSkills";
 import { useAgentStore } from "../../stores/agent";
 import { useModelStore } from "../../stores/model";
 import { useProjectStore } from "../../stores/project";
-import { getKnowledgeEditMode } from "./knowledgeEditMode";
-
-const BODY_CONTEXT_LIMIT = 6000;
 
 const props = defineProps<{
   document: KnowledgeDocument;
@@ -25,7 +22,6 @@ const { skillItems } = useSkills();
 
 const sessionKey = computed(() => `${projectStore.workingDir}::knowledge::${props.document.path}`);
 const sessionTitle = computed(() => `Knowledge: ${props.document.title || props.document.path}`);
-const editMode = computed<KnowledgeEditMode>(() => getKnowledgeEditMode(props.document));
 const manualKnowledgeAgentId = ref("");
 const knowledgeDefaultAgentId = computed(() => {
   if (agentStore.agents.some((agent) => agent.id === "knowledge")) return "knowledge";
@@ -66,7 +62,7 @@ const {
   pendingToolConfirms,
   queuedFollowUp,
   errorMessage,
-  send,
+  sendComposerPayload,
   insertQueuedFollowUp,
   deleteQueuedFollowUp,
   cancel,
@@ -84,68 +80,19 @@ const {
   selectedAgentId: knowledgeAgentId,
   effort: computed(() => modelStore.effort),
   effortSupported: computed(() => modelStore.effortSupported),
+  // The current document is injected into the agent env by the backend
+  // (knowledge focus), so user messages carry only what the user typed.
+  knowledgeFocus: computed(() => ({
+    docType: props.document.type,
+    path: props.document.path,
+  })),
   buildRequest(input) {
-    const summary = props.document.summaryEnabled ? props.document.summary?.trim() : "";
-    const rules = props.document.explicitMaintenanceRules ? props.document.maintenanceRules?.trim() : "";
-    const body = trimmedContext(props.document.body?.trim() ?? "", BODY_CONTEXT_LIMIT);
-    const lines = [
-      t("knowledge.chat.request.intro"),
-      t("knowledge.chat.request.title", props.document.title || props.document.path),
-      t("knowledge.chat.request.path", props.document.path),
-      t("knowledge.chat.request.type", typeLabel(props.document.type)),
-      t("knowledge.chat.request.scope", scopeLabel(props.document)),
-      t("knowledge.chat.request.editMode", editModeLabel(editMode.value)),
-    ];
-
-    if (summary) {
-      lines.push(t("knowledge.chat.request.summaryHeader"));
-      lines.push(summary);
-    }
-    if (rules) {
-      lines.push(t("knowledge.chat.request.rulesHeader"));
-      lines.push(rules);
-    }
-    if (body) {
-      lines.push(t("knowledge.chat.request.bodyHeader"));
-      lines.push(body);
-    }
-
-    lines.push(t("knowledge.chat.request.requirementsHeader"));
-    lines.push(t("knowledge.chat.request.requirementFocus"));
-    lines.push(t("knowledge.chat.request.requirementProposal"));
-    lines.push(t("knowledge.chat.request.requirementStructure"));
-    lines.push(t("knowledge.chat.request.userRequestHeader"));
-    lines.push(input);
-
     return {
-      text: lines.join("\n"),
+      text: input,
       displayText: input,
     };
   },
 });
-
-function typeLabel(type: KnowledgeDocumentType) {
-  return t(`knowledge.type.${type}`);
-}
-
-function scopeLabel(document: KnowledgeDocument) {
-  return document.storageSource === "app"
-    ? t("knowledge.scope.user")
-    : t("knowledge.scope.project");
-}
-
-function editModeLabel(mode: KnowledgeEditMode) {
-  if (mode === "inherit_parent") return t("knowledge.meta.editMode.inheritParent");
-  if (mode === "auto") return t("knowledge.meta.editMode.auto");
-  if (mode === "proposal") return t("knowledge.meta.editMode.proposal");
-  return t("knowledge.meta.editMode.readOnly");
-}
-
-function trimmedContext(value: string, limit: number) {
-  if (!value) return "";
-  if (value.length <= limit) return value;
-  return t("knowledge.chat.request.truncated", value.slice(0, limit), limit);
-}
 
 function handleSelectAgent(agentId: string) {
   manualKnowledgeAgentId.value = agentId;
@@ -189,7 +136,7 @@ function handleSelectAgent(agentId: string) {
     show-user-images
     user-content-mode="asset"
     @update:input-value="inputText = $event"
-    @send="send"
+    @send="sendComposerPayload"
     @insert-queued-follow-up="insertQueuedFollowUp"
     @delete-queued-follow-up="deleteQueuedFollowUp"
     @cancel="cancel"

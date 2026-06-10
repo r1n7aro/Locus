@@ -72,4 +72,30 @@ describe("EmbeddedChatPane contract", () => {
     expect(transcript).toContain("const isWaitingForResponse = computed(");
     expect(transcript).toContain("shouldShowAssistantContinuation");
   });
+
+  it("routes composer sends through buildRequest so pane context is injected", () => {
+    const knowledgePane = read("src/components/knowledge/KnowledgeChatPane.vue");
+    const embeddedSession = read("src/composables/useEmbeddedChatSession.ts");
+
+    // The composer payload must not be forwarded to send() as a raw request
+    // override: that bypasses buildRequest entirely.
+    expect(embeddedSession).toContain("function sendComposerPayload(");
+    expect(embeddedSession).toContain("options.buildRequest(payload.text)");
+    expect(knowledgePane).toContain('@send="sendComposerPayload"');
+    expect(knowledgePane).not.toContain('@send="send"');
+  });
+
+  it("scopes knowledge sessions to the open document via backend env injection", () => {
+    const knowledgePane = read("src/components/knowledge/KnowledgeChatPane.vue");
+    const embeddedSession = read("src/composables/useEmbeddedChatSession.ts");
+
+    // The current document rides in the agent env (knowledge focus), not in
+    // the user message text, so transcripts show only what the user typed.
+    expect(embeddedSession).toContain("knowledgeDocType: knowledgeFocus?.docType ?? null");
+    expect(embeddedSession).toContain("knowledgeDocPath: knowledgeFocus?.path ?? null");
+    expect(knowledgePane).toContain("knowledgeFocus: computed(() => ({");
+    expect(knowledgePane).toContain("docType: props.document.type");
+    expect(knowledgePane).toContain("path: props.document.path");
+    expect(knowledgePane).not.toContain("knowledge.chat.request.");
+  });
 });

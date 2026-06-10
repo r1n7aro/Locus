@@ -834,6 +834,8 @@ pub async fn chat(
     user_intent: Option<UserIntentPayload>,
     subagent_models: Option<HashMap<String, String>>,
     knowledge_mode: Option<String>,
+    knowledge_doc_type: Option<crate::knowledge_store::KnowledgeType>,
+    knowledge_doc_path: Option<String>,
     app_handle: AppHandle,
     store: State<'_, Arc<SessionStore>>,
     registry: State<'_, AgentDefRegistryState>,
@@ -1025,7 +1027,7 @@ pub async fn chat(
     let um = Some(undo_manager.inner().clone());
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
     let (done_tx, done_rx) = tokio::sync::watch::channel(false);
-    let instance = AgentInstance::new(
+    let mut instance = AgentInstance::new(
         def,
         &sid,
         backend,
@@ -1044,6 +1046,16 @@ pub async fn chat(
         subagent_models.unwrap_or_default(),
         cancel_rx,
     );
+    let knowledge_focus = match (knowledge_doc_type, knowledge_doc_path) {
+        (Some(doc_type), Some(path)) if !path.trim().is_empty() => {
+            Some(crate::agent::instance::KnowledgeFocusDoc {
+                doc_type,
+                path: path.trim().to_string(),
+            })
+        }
+        _ => None,
+    };
+    instance.set_knowledge_focus(knowledge_focus);
     let partial_assistant = instance.partial_assistant_state();
     let effective_mode = mode
         .or_else(|| user_intent.as_ref().map(|intent| intent.mode.clone()))
@@ -1740,9 +1752,11 @@ pub async fn unarchive_session(
 pub async fn delete_session(
     session_id: String,
     store: State<'_, Arc<SessionStore>>,
+    undo_manager: State<'_, crate::UndoManagerHandle>,
 ) -> Result<(), AppError> {
     store.delete_session(&session_id).map_err(AppError::from)?;
     crate::llm::codex::invalidate_cached_session(&session_id);
+    undo_manager.on_session_delete(&session_id).await;
     Ok(())
 }
 
@@ -1813,6 +1827,7 @@ fn emit_cancelled_session_run(
                 .and_then(|message| message.thinking_content.clone()),
             thinking_duration: interrupted.and_then(|message| message.thinking_duration),
             render_parts: None,
+            removed_user_message: None,
         },
     );
 }

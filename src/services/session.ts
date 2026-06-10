@@ -10,6 +10,7 @@ import type {
   AssetRefAttachment,
   UserIntentMeta,
   KnowledgeAccessMode,
+  KnowledgeDocumentType,
   PendingSessionInput,
 } from "../types";
 
@@ -27,6 +28,8 @@ export interface ChatParams {
   userIntent?: UserIntentMeta | null;
   subagentModels?: Record<string, string> | null;
   knowledgeMode?: KnowledgeAccessMode | null;
+  knowledgeDocType?: KnowledgeDocumentType | null;
+  knowledgeDocPath?: string | null;
 }
 
 export interface CreateSessionParams {
