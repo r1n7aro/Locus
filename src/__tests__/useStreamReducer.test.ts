@@ -1,5 +1,11 @@
 import { describe, it, expect } from "vitest";
-import { buildToolResultMessages, mergeUserMessage, reduceStreamEvent, type StreamState } from "../composables/useStreamReducer";
+import {
+  buildToolResultMessages,
+  isMatchingPendingUserMessage,
+  mergeUserMessage,
+  reduceStreamEvent,
+  type StreamState,
+} from "../composables/useStreamReducer";
 import type { StreamEvent, ToolCallDisplay } from "../types";
 
 function makeState(overrides?: Partial<StreamState>): StreamState {
@@ -609,6 +615,22 @@ describe("reduceStreamEvent", () => {
       expect(messages).toHaveLength(1);
       expect(messages[0]?.id).toBe("user-1");
       expect(messages[0]?.content).toContain("<locus-references>");
+    });
+
+    it("exposes the same pending match rule for failed draft restore checks", () => {
+      expect(isMatchingPendingUserMessage({
+        id: "user_pending_1",
+        role: "user",
+        content: "inspect this asset",
+        createdAt: 10,
+        assetRefs: [{ kind: "asset", path: "Assets/Foo.prefab" }],
+      }, {
+        id: "user-1",
+        role: "user",
+        content: "inspect this asset\n\n<locus-references>\n- asset: {@Assets/Foo.prefab}\n</locus-references>",
+        createdAt: 11,
+        assetRefs: [{ kind: "asset", path: "Assets/Foo.prefab" }],
+      })).toBe(true);
     });
 
     it("does not replace a pending user message with different content only because timestamps are close", () => {

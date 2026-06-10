@@ -257,6 +257,17 @@ const canSend = computed(() =>
   || consoleTextAttachments.value.length > 0
   || localFileAttachments.value.length > 0,
 );
+
+function isDraftEmpty() {
+  return !props.modelValue
+    && !pastedContent.value
+    && imageAttachments.value.length === 0
+    && assetRefAttachments.value.length === 0
+    && consoleTextAttachments.value.length === 0
+    && localFileAttachments.value.length === 0
+    && !hasComposerIntent(composerIntent.value);
+}
+
 const hasHeaderStart = computed(() =>
   !!slots["header-start"]
   || (!!props.showTopPlanBadge && !!composerPlanBadge.value)
@@ -2202,6 +2213,7 @@ defineExpose({
   resetDraft,
   applyPrefill,
   applyDraftPrefill,
+  isDraftEmpty,
 });
 </script>
 

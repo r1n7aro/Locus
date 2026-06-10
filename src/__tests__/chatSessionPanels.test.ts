@@ -1581,6 +1581,8 @@ describe("chat session panel state", () => {
     expect(chatStore.isStreaming).toBe(false);
     expect(chatStore.messages).toEqual([]);
     expect(uiStore.pendingChatPrefill?.draft?.text).toBe("will fail");
+    expect(uiStore.pendingChatPrefill?.sessionId).toBeNull();
+    expect(uiStore.pendingChatPrefill?.requireEmptyComposer).toBe(true);
   });
 
   it("restores attachments and intent to the composer draft when chat launch fails", async () => {
@@ -1609,6 +1611,7 @@ describe("chat session panel state", () => {
     expect(draft?.assetRefs[0]).toMatchObject({ kind: "asset", path: "Assets/Foo.prefab" });
     expect(draft?.intent.mode).toBe("plan");
     expect(draft?.intent.skills).toEqual([{ dirName: "view", source: "project", name: "View" }]);
+    expect(uiStore.pendingChatPrefill?.requireEmptyComposer).toBe(true);
   });
 
   it("restores the pending user draft when a run errors before the user message is persisted", async () => {
@@ -1634,6 +1637,8 @@ describe("chat session panel state", () => {
     await vi.waitFor(() => {
       expect(uiStore.pendingChatPrefill?.draft?.text).toBe("before persistence");
     });
+    expect(uiStore.pendingChatPrefill?.sessionId).toBe("s1");
+    expect(uiStore.pendingChatPrefill?.requireEmptyComposer).toBe(true);
     expect(chatStore.messages).toEqual([]);
   });
 
@@ -1773,6 +1778,8 @@ describe("chat session panel state", () => {
 
     expect(chatStore.activeQueuedFollowUp).toBeNull();
     expect(uiStore.pendingChatPrefill?.draft?.text).toBe("queued visible");
+    expect(uiStore.pendingChatPrefill?.sessionId).toBe("s1");
+    expect(uiStore.pendingChatPrefill?.requireEmptyComposer).toBe(true);
     expect(uiStore.pendingChatPrefill?.draft?.assetRefs[0]).toMatchObject({
       kind: "asset",
       path: "Assets/Queued.prefab",

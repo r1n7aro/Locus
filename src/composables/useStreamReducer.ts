@@ -95,7 +95,7 @@ function collectToolCallInfoIds(toolCalls: ToolCallInfo[] | undefined): string[]
   return ids;
 }
 
-function pendingUserMessageId(id: string): boolean {
+export function isPendingUserMessageId(id: string): boolean {
   return id.startsWith("user_pending_") || id.startsWith("embedded_user_");
 }
 
@@ -111,8 +111,8 @@ function assetRefFingerprint(assetRefs: AssetRefAttachment[] | undefined): strin
     .join("\u{1}");
 }
 
-function isMatchingPendingUserMessage(candidate: ChatMessage, message: ChatMessage): boolean {
-  if (candidate.role !== "user" || !pendingUserMessageId(candidate.id)) return false;
+export function isMatchingPendingUserMessage(candidate: ChatMessage, message: ChatMessage): boolean {
+  if (candidate.role !== "user" || !isPendingUserMessageId(candidate.id)) return false;
   if (imageFingerprint(candidate.images) !== imageFingerprint(message.images)) return false;
   if (assetRefFingerprint(candidate.assetRefs) !== assetRefFingerprint(message.assetRefs)) return false;
 

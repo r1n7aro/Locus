@@ -378,6 +378,23 @@ describe("chat sidebar layout", () => {
     expect(transcript).not.toContain("splitToolCallsByRenderOrder");
   });
 
+  it("memoizes history groups so streaming text only repaints the live region", () => {
+    const transcript = read("src/components/chat/ChatTranscript.vue");
+    const liveMemoStart = transcript.indexOf("const historyLiveLayoutMemoKey = computed(() => [");
+    const liveMemoEnd = transcript.indexOf("const historyStaticRenderMemoKey = computed(() => [");
+    const liveMemoBlock = transcript.slice(liveMemoStart, liveMemoEnd);
+
+    expect(transcript).toContain("const historyLiveLayoutMemoKey = computed(() => [");
+    expect(transcript).toContain("const historyStaticRenderMemoKey = computed(() => [");
+    expect(transcript).toContain("function historyGroupMemoKey(group: MessageGroup, index: number)");
+    expect(transcript).toContain("index === lastGroupIndex ? historyLiveLayoutMemoKey.value : \"\"");
+    expect(transcript).toContain("v-memo=\"[group, idx, historyGroupMemoKey(group, idx)]\"");
+    expect(transcript).toMatch(/<template\s+v-for="segment in transientRenderSegments"/);
+    expect(liveMemoStart).toBeGreaterThan(-1);
+    expect(liveMemoEnd).toBeGreaterThan(liveMemoStart);
+    expect(liveMemoBlock).not.toContain("streamingText");
+  });
+
   it("keeps live thinking above transient status overlays", () => {
     const transcript = read("src/components/chat/ChatTranscript.vue");
     const diagnostics = read("src/services/layoutDiagnostics.ts");

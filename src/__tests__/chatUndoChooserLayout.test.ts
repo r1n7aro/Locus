@@ -32,6 +32,7 @@ describe("chat undo chooser", () => {
   it("routes message context menu actions through exact message rollback and fork", () => {
     const chatView = read("src/components/ChatView.vue");
     const transcript = read("src/components/chat/ChatTranscript.vue");
+    const richChatInput = read("src/components/chat/RichChatInput.vue");
     const sessionService = read("src/services/session.ts");
     const undoService = read("src/services/undo.ts");
 
@@ -51,6 +52,12 @@ describe("chat undo chooser", () => {
     expect(chatView).toContain("&& !props.isStreaming");
     expect(chatView).toContain("chatStore.undoLatestConversationTurn()");
     expect(chatView).toContain("uiStore.stageChatDraftPrefill(draft)");
+    expect(chatView).toContain("prefill.sessionId !== undefined");
+    expect(chatView).toContain("prefill.requireEmptyComposer");
+    expect(chatView).toContain("composerPanelRef.value?.isDraftEmpty()");
+    expect(chatView).toContain("message.assetRefs && message.assetRefs.length > 0");
+    expect(richChatInput).toContain("function isDraftEmpty()");
+    expect(richChatInput).toContain("isDraftEmpty,");
     expect(chatView).toContain('v-if="messageContextShouldShowReEdit"');
     expect(chatView).toContain('t("chat.messageMenu.reEditUserMessage")');
     expect(transcript).toContain("selectedMessageId?: string | null");

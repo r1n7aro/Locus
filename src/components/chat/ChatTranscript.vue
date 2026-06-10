@@ -1202,6 +1202,61 @@ const shouldRenderPromotedHistoryToolCallsInTransient = computed(() =>
   && shouldKeepPromotedHistoryToolCallsInTransient.value,
 );
 
+function toolCallMatchStateMemoKey(state: ToolCallMatchState) {
+  const ids = Array.from(state.ids).sort().join(",");
+  const fingerprints = Array.from(state.fingerprintCounts.entries())
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([fingerprint, count]) => `${fingerprint}:${count}`)
+    .join(",");
+  return `${ids}|${fingerprints}`;
+}
+
+const retainedCollapsedToolCallMemoKey = computed(() =>
+  toolCallMatchStateMemoKey(retainedCollapsedToolCallMatchState.value));
+
+const historyLiveLayoutMemoKey = computed(() => [
+  isStreamingContinuation.value ? "continuation" : "separate",
+  hasTransientAssistantMessage.value ? "has-transient" : "no-transient",
+  props.isStreaming ? "streaming" : "idle",
+  props.isCompacting ? "compacting" : "normal",
+  toolCallHandoff.value ? "handoff" : "no-handoff",
+  toolCallHandoff.value?.collapseArmed ? "armed" : "unarmed",
+  toolCallHandoff.value?.collapseFinished ? "collapsed" : "open",
+  shouldHidePromotedHistoryToolCalls.value ? "hide-promoted" : "show-history",
+  retainedCollapsedToolCallMemoKey.value,
+].join("\u241e"));
+
+const historyStaticRenderMemoKey = computed(() => [
+  props.variant,
+  props.enableIntentBadges ? "intent" : "no-intent",
+  props.showUserImages ? "images" : "no-images",
+  props.userContentMode,
+  props.userLabel,
+  props.assistantLabel,
+  props.handoffLabel,
+  props.compactedLabel,
+  props.thoughtDurationLabel,
+  props.thoughtMomentLabel,
+  displaySettings.rightAlignUserMessages ? "align-user" : "left-user",
+  displaySettings.compactToolCalls ? "compact-tools" : "open-tools",
+  displaySettings.hideThinkingBlocks !== false ? "hide-thinking" : "show-thinking",
+].join("\u241e"));
+
+function historySelectionMemoKey(group: MessageGroup) {
+  const selectedMessageId = props.selectedMessageId;
+  if (!selectedMessageId) return "";
+  return group.items.some((item) => item.id === selectedMessageId) ? selectedMessageId : "";
+}
+
+function historyGroupMemoKey(group: MessageGroup, index: number) {
+  const lastGroupIndex = groupedMessages.value.length - 1;
+  return [
+    historyStaticRenderMemoKey.value,
+    historySelectionMemoKey(group),
+    index === lastGroupIndex ? historyLiveLayoutMemoKey.value : "",
+  ].join("\u241e");
+}
+
 const transientToolCalls = computed(() => {
   if (!shouldRenderPromotedHistoryToolCallsInTransient.value) {
     return transientOwnedToolCalls.value;
@@ -2336,6 +2391,7 @@ function openImage(src: string) {
         >
           <div
             v-if="isCompactMarkerGroup(group)"
+            v-memo="[group, idx, historyGroupMemoKey(group, idx)]"
             class="chat-transcript-compact-marker"
             :class="`is-${variant}`"
             :data-scroll-anchor-id="group.items[0]?.id"
@@ -2347,22 +2403,23 @@ function openImage(src: string) {
 
           <div
             v-else
-          class="chat-transcript-message"
-          :class="[
-            `is-${variant}`,
-            group.role,
-            {
-              'has-round-divider': shouldShowSessionRoundDivider(group, idx),
-              'before-continuation': isStreamingContinuation && idx === groupedMessages.length - 1,
-              'compact-handoff': group.items.some((item) => isCompactHandoffMessage(item.message)),
-              'user-align-right': shouldRightAlignUserMessageGroup(group),
-            },
-          ]"
-          :data-chat-message-id="group.items[0]?.id"
-          :data-chat-message-role="group.role"
-          :data-chat-message-group-role="group.role"
-          :data-chat-message-group-start-id="group.items[0]?.id"
-          :data-chat-message-group-end-id="group.items[group.items.length - 1]?.id"
+            v-memo="[group, idx, historyGroupMemoKey(group, idx)]"
+            class="chat-transcript-message"
+            :class="[
+              `is-${variant}`,
+              group.role,
+              {
+                'has-round-divider': shouldShowSessionRoundDivider(group, idx),
+                'before-continuation': isStreamingContinuation && idx === groupedMessages.length - 1,
+                'compact-handoff': group.items.some((item) => isCompactHandoffMessage(item.message)),
+                'user-align-right': shouldRightAlignUserMessageGroup(group),
+              },
+            ]"
+            :data-chat-message-id="group.items[0]?.id"
+            :data-chat-message-role="group.role"
+            :data-chat-message-group-role="group.role"
+            :data-chat-message-group-start-id="group.items[0]?.id"
+            :data-chat-message-group-end-id="group.items[group.items.length - 1]?.id"
           >
           <div class="chat-transcript-message-role" :class="`is-${variant}`">
             {{ messageGroupLabel(group) }}

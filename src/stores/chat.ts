@@ -8,9 +8,16 @@ import { normalizeAppError } from "../services/errors";
 import { getToolPermissionMode, saveToolPermissionMode } from "../services/permissions";
 import * as sessionService from "../services/session";
 import * as undoService from "../services/undo";
-import { buildToolResultMessages, mergeUserMessage, reduceStreamEvent, type StreamMutation } from "../composables/useStreamReducer";
+import {
+  buildToolResultMessages,
+  isMatchingPendingUserMessage,
+  isPendingUserMessageId,
+  mergeUserMessage,
+  reduceStreamEvent,
+  type StreamMutation,
+} from "../composables/useStreamReducer";
 import { resolveToolCallDisplayShape } from "../composables/toolCallBatches";
-import { hydrateChatMessagesIntent, parseUserIntentMeta, withClientMessageId } from "../composables/chatInputIntents";
+import { hydrateChatMessagesIntent, withClientMessageId } from "../composables/chatInputIntents";
 import { buildUserMessageDraft } from "../composables/chatMessageDraft";
 import type { SessionScrollState } from "../composables/chatScrollState";
 import { t } from "../i18n";
@@ -277,43 +284,7 @@ function normalizeToolPermissionMode(mode: string | null | undefined): ToolPermi
 }
 
 function isLocalPendingUserMessage(message: ChatMessage): boolean {
-  return message.role === "user"
-    && (message.id.startsWith("user_pending_") || message.id.startsWith("embedded_user_"));
-}
-
-function messageClientMessageId(message: ChatMessage): string | null {
-  return message.intentMeta?.clientMessageId
-    ?? parseUserIntentMeta(message.thinkingSignature)?.clientMessageId
-    ?? null;
-}
-
-function attachmentsMatch(left: ChatMessage, right: ChatMessage): boolean {
-  const leftImages = left.images ?? [];
-  const rightImages = right.images ?? [];
-  if (leftImages.length !== rightImages.length) return false;
-  for (let index = 0; index < leftImages.length; index += 1) {
-    if (leftImages[index]?.data !== rightImages[index]?.data) return false;
-    if (leftImages[index]?.mimeType !== rightImages[index]?.mimeType) return false;
-  }
-
-  const leftRefs = left.assetRefs ?? [];
-  const rightRefs = right.assetRefs ?? [];
-  if (leftRefs.length !== rightRefs.length) return false;
-  for (let index = 0; index < leftRefs.length; index += 1) {
-    if (leftRefs[index]?.path !== rightRefs[index]?.path) return false;
-    if (leftRefs[index]?.kind !== rightRefs[index]?.kind) return false;
-  }
-  return true;
-}
-
-function userMessageMatchesPending(candidate: ChatMessage, pending: ChatMessage): boolean {
-  if (candidate.role !== "user") return false;
-  const pendingClientMessageId = messageClientMessageId(pending);
-  const candidateClientMessageId = messageClientMessageId(candidate);
-  if (pendingClientMessageId || candidateClientMessageId) {
-    return !!pendingClientMessageId && pendingClientMessageId === candidateClientMessageId;
-  }
-  return candidate.content === pending.content && attachmentsMatch(candidate, pending);
+  return message.role === "user" && isPendingUserMessageId(message.id);
 }
 
 function logChatStreamDebug(message: string, detail?: Record<string, unknown>) {
@@ -470,8 +441,11 @@ export const useChatStore = defineStore("chat", () => {
     });
   }
 
-  function restoreDraftFromFailedUserMessage(message: ChatMessage) {
-    useUiStore().stageChatDraftPrefill(buildUserMessageDraft(message));
+  function restoreDraftFromFailedUserMessage(
+    message: ChatMessage,
+    options: { sessionId?: string | null; requireEmptyComposer?: boolean } = {},
+  ) {
+    useUiStore().stageChatDraftPrefill(buildUserMessageDraft(message), options);
   }
 
   function failedUserMessageFromPayload(
@@ -498,10 +472,14 @@ export const useChatStore = defineStore("chat", () => {
     const pendingUserMessage = pendingUserMessages[pendingUserMessages.length - 1];
     await loadSessionState(sessionId);
     if (!pendingUserMessage) return;
-    if (messages.value.some((message) => userMessageMatchesPending(message, pendingUserMessage))) {
+    if (activeSessionId.value !== sessionId) return;
+    if (messages.value.some((message) => isMatchingPendingUserMessage(pendingUserMessage, message))) {
       return;
     }
-    restoreDraftFromFailedUserMessage(pendingUserMessage);
+    restoreDraftFromFailedUserMessage(pendingUserMessage, {
+      sessionId,
+      requireEmptyComposer: true,
+    });
   }
 
   function resolveSessionType(sessionId: string | null): string | null {
@@ -2095,7 +2073,10 @@ export const useChatStore = defineStore("chat", () => {
         images,
         assetRefs,
         userIntent,
-      ));
+      ), {
+        sessionId,
+        requireEmptyComposer: true,
+      });
       return false;
     }
   }
@@ -2178,6 +2159,7 @@ export const useChatStore = defineStore("chat", () => {
       useChatChangesStore().closePanel();
     }
 
+    const requestSessionId = activeSessionId.value;
     const staleSessionId = activeSessionId.value;
     const markedStale = updateKnowledgeProposalStatuses("stale");
     if (markedStale && staleSessionId) {
@@ -2294,7 +2276,10 @@ export const useChatStore = defineStore("chat", () => {
       isStreaming.value = false;
       resetStreamAnim();
       messages.value = messages.value.filter((message) => message.id !== pendingMessageId);
-      restoreDraftFromFailedUserMessage(pendingUserMessage);
+      restoreDraftFromFailedUserMessage(pendingUserMessage, {
+        sessionId: requestSessionId,
+        requireEmptyComposer: true,
+      });
       pendingSessionId = null;
       if (activeSessionId.value) {
         managedStreamingSessionIds.delete(activeSessionId.value);

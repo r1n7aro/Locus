@@ -18,6 +18,12 @@ describe("displayUserMessageContent", () => {
     )).toBe("在项目根目录下创建文件");
   });
 
+  it("hides initial Unity editor status prefixes", () => {
+    expect(displayUserMessageContent(
+      "[Unity Editor Status] Unity Editor Status: `editing`, Active Scene: Assets/Scenes/Main.unity\n\n在项目根目录下创建文件",
+    )).toBe("在项目根目录下创建文件");
+  });
+
   it("hides combined Locus-injected text", () => {
     expect(displayUserMessageContent(
       "<system-reminder>\nEnv\n</system-reminder>\n[Unity Editor Status Changed] Unity Editor Status: `editing`\n\n继续",

@@ -17,6 +17,17 @@ interface NativeWindowClientSizeEvent {
   height: number;
 }
 
+interface ChatPrefillOptions {
+  sessionId?: string | null;
+  requireEmptyComposer?: boolean;
+}
+
+interface PendingChatPrefill extends ChatPrefillOptions {
+  id: number;
+  text: string;
+  draft?: UserMessageDraft | null;
+}
+
 export const useUiStore = defineStore("ui", () => {
   const activeTab = ref<"chat" | "collab" | "knowledge" | "asset" | "views" | "plugins" | "agent" | "settings">("chat");
   const settingsCategoryHint = ref<"api" | "models" | "permissions" | "proxy" | "general" | "display" | "notifications" | "shortcuts" | "knowledge" | "archived" | "console" | "about" | null>(null);
@@ -26,7 +37,7 @@ export const useUiStore = defineStore("ui", () => {
   const nativeWindowWidth = ref<number | null>(null);
   const nativeWindowHeight = ref<number | null>(null);
   const showOnboarding = ref(false);
-  const pendingChatPrefill = ref<{ id: number; text: string; draft?: UserMessageDraft | null } | null>(null);
+  const pendingChatPrefill = ref<PendingChatPrefill | null>(null);
   const pendingKnowledgeSelection = ref<{
     id: number;
     dashboard: "design" | "memory" | "skill" | "reference";
@@ -206,18 +217,20 @@ export const useUiStore = defineStore("ui", () => {
     settingsCategoryHint.value = null;
   }
 
-  function stageChatPrefill(text: string) {
+  function stageChatPrefill(text: string, options: ChatPrefillOptions = {}) {
     pendingChatPrefill.value = {
       id: Date.now(),
       text,
+      ...options,
     };
   }
 
-  function stageChatDraftPrefill(draft: UserMessageDraft) {
+  function stageChatDraftPrefill(draft: UserMessageDraft, options: ChatPrefillOptions = {}) {
     pendingChatPrefill.value = {
       id: Date.now(),
       text: draft.text,
       draft,
+      ...options,
     };
   }
 

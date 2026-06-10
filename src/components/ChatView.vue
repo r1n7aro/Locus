@@ -1226,13 +1226,35 @@ async function applyExternalComposerPrefill(text: string) {
   await focusComposerInput();
 }
 
+function isComposerDraftEmpty() {
+  return composerPanelRef.value?.isDraftEmpty() ?? inputText.value.length === 0;
+}
+
+function canApplyPendingChatPrefill(prefill: NonNullable<typeof uiStore.pendingChatPrefill>) {
+  if (prefill.sessionId !== undefined && prefill.sessionId !== props.activeSessionId) {
+    return false;
+  }
+  if (prefill.requireEmptyComposer && !isComposerDraftEmpty()) {
+    return false;
+  }
+  return true;
+}
+
 watch(
   () => uiStore.pendingChatPrefill?.id,
   async (prefillId) => {
     const prefill = uiStore.pendingChatPrefill;
     if (!prefillId || !prefill) return;
+    if (!canApplyPendingChatPrefill(prefill)) {
+      uiStore.clearPendingChatPrefill(prefillId);
+      return;
+    }
     if (prefill.draft) {
       await nextTick();
+      if (!canApplyPendingChatPrefill(prefill)) {
+        uiStore.clearPendingChatPrefill(prefillId);
+        return;
+      }
       if (composerPanelRef.value) {
         await composerPanelRef.value.applyDraftPrefill(prefill.draft);
       } else {
@@ -1273,6 +1295,7 @@ function hasRenderableTranscriptMessage(message: ChatMessage) {
     return !!(
       message.content
       || (message.images && message.images.length > 0)
+      || (message.assetRefs && message.assetRefs.length > 0)
       || message.intentMeta?.mode
       || (message.intentMeta?.skills && message.intentMeta.skills.length > 0)
     );
