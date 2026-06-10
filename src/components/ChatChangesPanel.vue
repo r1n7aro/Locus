@@ -116,14 +116,18 @@ type DisplayTreeFile = GitFileChange & {
 
 const currentModeItems = computed<DisplayItem[]>(() => {
   const turnRounds = changesStore.latestTurnRounds;
-  const turnFiles = changesStore.latestTurnFiles;
   if (turnRounds.length === 0) return [];
   // Use the first round's assistantMessageId so diff/undo span the whole current run.
   const msgId = turnRounds[0].assistantMessageId;
-  return turnFiles.map((f, i) => ({
-    key: `cur-${i}-${f.path}`,
-    fileChange: { path: f.path, oldPath: f.oldPath, status: f.status } as GitFileChange,
+  return (changesStore.latestTurnFiles as ChatMergedFileItem[]).map((item) => ({
+    key: `cur-${item.id}`,
+    fileChange: {
+      path: item.finalPath,
+      oldPath: item.baseOldPath,
+      status: item.status,
+    } as GitFileChange,
     assistantMessageId: msgId,
+    roundCount: item.roundCount,
   }));
 });
 

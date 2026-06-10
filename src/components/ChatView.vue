@@ -1,7 +1,7 @@
 
 <script setup lang="ts">
 import { ref, nextTick, watch, computed, onMounted, onUnmounted } from "vue";
-import { PanelTopOpen } from "lucide";
+import { FileDiff, PanelTopOpen } from "lucide";
 import {
   selectUnityAsset,
   openUnityAssetInspector,
@@ -153,7 +153,7 @@ function toggleInputControlsCollapsed() {
 const showInlineDiff = computed(() =>
   !!chatChangesStore.inlineDiffPayload || chatChangesStore.inlineDiffLoading || !!chatChangesStore.inlineDiffError,
 );
-const hasPanelToggleRow = computed(() => chatChangesStore.currentFileCount > 0);
+const hasPanelToggleRow = computed(() => chatChangesStore.hasAnyChanges);
 
 const chatDiffViewerRef = ref<InstanceType<typeof FileDiffViewer> | null>(null);
 const chatDiffTabOptions = computed(() => [
@@ -2709,9 +2709,11 @@ onUnmounted(() => {
             type="button"
             :disabled="isStreaming"
             :aria-pressed="chatChangesStore.currentPanelVisible"
+            :aria-label="t('chat.changes.toggle')"
             @click="chatChangesStore.togglePanel()"
           >
-            {{ t('chat.changes.toggle') }}
+            <LucideIcon :icon="FileDiff" :size="14" />
+            <span class="changes-toggle-label">{{ t('chat.changes.toggle') }}</span>
           </button>
         </div>
       </div>
@@ -3517,24 +3519,24 @@ onUnmounted(() => {
   min-height: 28px;
 }
 
+/* Icon button mirroring .chat-status-icon-btn so the row reads as one family. */
 .changes-toggle-btn {
+  position: relative;
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  width: 24px;
+  min-width: 24px;
+  height: 24px;
+  min-height: 24px;
+  line-height: 1;
+  padding: 0;
   border: 1px solid transparent;
   border-radius: 5px;
   background: transparent;
   color: var(--text-secondary);
-  font-size: 12px;
-  font-family: inherit;
-  font-weight: 600;
-  height: 24px;
-  min-height: 24px;
-  line-height: 1;
-  padding: 0 8px;
   cursor: pointer;
   box-shadow: none;
-  white-space: nowrap;
   transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease, opacity 0.12s ease;
 }
 
@@ -3547,6 +3549,7 @@ onUnmounted(() => {
 .changes-toggle-btn:hover:not(:disabled),
 .changes-toggle-btn:focus-visible {
   background: var(--hover-bg);
+  border-color: color-mix(in srgb, currentColor 22%, transparent);
   color: var(--text-color);
 }
 
@@ -3557,6 +3560,36 @@ onUnmounted(() => {
 .changes-toggle-btn:disabled {
   opacity: 0.48;
   cursor: not-allowed;
+}
+
+/* Hover tooltip mirroring .chat-status-icon-label, anchored right at the panel edge. */
+.changes-toggle-label {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 6px);
+  z-index: 35;
+  max-width: 180px;
+  padding: 4px 7px;
+  border: 1px solid var(--border-color);
+  border-radius: 5px;
+  background: var(--surface-elevated, var(--panel-bg));
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.16);
+  color: currentColor;
+  pointer-events: none;
+  overflow: hidden;
+  font-size: 11px;
+  line-height: 1.3;
+  opacity: 0;
+  transform: translateY(3px);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  transition: opacity 0.1s ease, transform 0.1s ease;
+}
+
+.changes-toggle-btn:not(.is-active):hover .changes-toggle-label,
+.changes-toggle-btn:not(.is-active):focus-visible .changes-toggle-label {
+  opacity: 1;
+  transform: translateY(0);
 }
 
 /* ── Ask User Card ── */

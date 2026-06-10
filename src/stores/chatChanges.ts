@@ -6,6 +6,7 @@ import * as undoService from "../services/undo";
 import {
   buildRounds,
   buildMergedFiles,
+  mergeRoundFiles,
   type ChatChangeRound,
   type ChatMergedFileItem,
 } from "../services/chatChanges";
@@ -99,19 +100,18 @@ export const useChatChangesStore = defineStore("chatChanges", () => {
     return s.rounds.filter((r) => roundTurnKey(r) === latestKey);
   });
 
-  /** Deduplicated file list for the latest conversation turn. */
-  const latestTurnFiles = computed(() => {
-    const rounds = latestTurnRounds.value;
-    if (rounds.length === 0) return [];
-    // Merge files across rounds: last occurrence per path wins
-    const map = new Map<string, import("../types").ChangedFile>();
-    for (const r of rounds) {
-      for (const f of r.files) {
-        map.set(f.path, f);
-      }
-    }
-    return Array.from(map.values());
-  });
+  /**
+   * Net-merged file list for the latest conversation turn.
+   *
+   * Uses the same identity merge as the "all changes" view so statuses are
+   * net relative to the run's first checkpoint (matching the diff anchor):
+   * a file created and deleted within the run disappears instead of showing
+   * a stale per-round letter, A→M stays A, D→A becomes M, rename chains
+   * collapse.
+   */
+  const latestTurnFiles = computed<ChatMergedFileItem[]>(() =>
+    mergeRoundFiles(latestTurnRounds.value),
+  );
 
   const currentFiles = computed(() => {
     const s = currentState();

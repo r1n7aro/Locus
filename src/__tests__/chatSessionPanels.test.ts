@@ -474,11 +474,98 @@ describe("chat session panel state", () => {
     await chatStore.selectSession("s1");
 
     expect(changesStore.latestTurnRounds).toHaveLength(2);
-    expect(changesStore.latestTurnFiles.map((file) => file.path)).toEqual([
+    expect(changesStore.latestTurnFiles.map((file) => file.finalPath)).toEqual([
       "src/gamma.ts",
       "src/delta.ts",
     ]);
     expect(changesStore.currentFileCount).toBe(2);
+  });
+
+  it("nets out files created then deleted within the same run in current mode", async () => {
+    const chatStore = useChatStore();
+    const changesStore = useChatChangesStore();
+
+    undoData.s1 = [
+      makeUndoEntry("s1", "src/temp.ts", {
+        assistantMessageId: "msg-create",
+        runId: "run-a",
+        createdAt: 1,
+        status: "A",
+      }),
+      makeUndoEntry("s1", "src/kept.ts", {
+        assistantMessageId: "msg-add-kept",
+        runId: "run-a",
+        createdAt: 2,
+        status: "A",
+      }),
+      makeUndoEntry("s1", "src/temp.ts", {
+        assistantMessageId: "msg-delete",
+        runId: "run-a",
+        createdAt: 3,
+        status: "D",
+      }),
+      makeUndoEntry("s1", "src/kept.ts", {
+        assistantMessageId: "msg-edit-kept",
+        runId: "run-a",
+        createdAt: 4,
+        status: "M",
+      }),
+    ];
+
+    await chatStore.selectSession("s1");
+
+    expect(changesStore.latestTurnRounds).toHaveLength(4);
+    // temp.ts was created and deleted within the run, so it nets out; kept.ts
+    // stays "A" because it is new relative to the run start even though the
+    // last round reported "M".
+    expect(
+      changesStore.latestTurnFiles.map((file) => [file.finalPath, file.status]),
+    ).toEqual([["src/kept.ts", "A"]]);
+    expect(changesStore.currentFileCount).toBe(1);
+
+    changesStore.setMode("all");
+    expect(
+      changesStore.currentFiles.map((file) => [file.finalPath, file.status]),
+    ).toEqual([["src/kept.ts", "A"]]);
+  });
+
+  it("keeps hasAnyChanges when the latest run's changes net out", async () => {
+    const chatStore = useChatStore();
+    const changesStore = useChatChangesStore();
+
+    undoData.s1 = [
+      makeUndoEntry("s1", "src/old.ts", {
+        assistantMessageId: "msg-old",
+        runId: "run-old",
+        createdAt: 1,
+      }),
+      makeUndoEntry("s1", "src/temp.ts", {
+        assistantMessageId: "msg-create",
+        runId: "run-new",
+        createdAt: 2,
+        status: "A",
+      }),
+      makeUndoEntry("s1", "src/temp.ts", {
+        assistantMessageId: "msg-delete",
+        runId: "run-new",
+        createdAt: 3,
+        status: "D",
+      }),
+    ];
+    latestCompletedRunIdData.s1 = "run-new";
+
+    await chatStore.selectSession("s1");
+
+    expect(changesStore.latestTurnRounds).toHaveLength(2);
+    expect(changesStore.latestTurnFiles).toEqual([]);
+    expect(changesStore.currentFileCount).toBe(0);
+    // The "all" view still has content, so the panel toggle must stay reachable.
+    expect(changesStore.hasAnyChanges).toBe(true);
+
+    changesStore.setMode("all");
+    expect(changesStore.currentFiles.map((file) => file.finalPath)).toEqual([
+      "src/old.ts",
+    ]);
   });
 
   it("shows an empty current round when the latest completed run has no undo entry", async () => {
@@ -510,7 +597,7 @@ describe("chat session panel state", () => {
 
     changesStore.setMode("all");
     expect(changesStore.currentFileCount).toBe(1);
-    expect(changesStore.currentFiles.map((file) => "finalPath" in file ? file.finalPath : file.path)).toEqual([
+    expect(changesStore.currentFiles.map((file) => file.finalPath)).toEqual([
       "src/changed.ts",
     ]);
   });
@@ -550,7 +637,7 @@ describe("chat session panel state", () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     expect(changesStore.latestTurnRounds).toHaveLength(1);
-    expect(changesStore.latestTurnFiles.map((file) => file.path)).toEqual([
+    expect(changesStore.latestTurnFiles.map((file) => file.finalPath)).toEqual([
       "src/cancelled.ts",
     ]);
     expect(changesStore.currentFileCount).toBe(1);
@@ -583,7 +670,7 @@ describe("chat session panel state", () => {
     await chatStore.selectSession("s1");
 
     expect(changesStore.latestTurnRounds).toHaveLength(2);
-    expect(changesStore.latestTurnFiles.map((file) => file.path)).toEqual([
+    expect(changesStore.latestTurnFiles.map((file) => file.finalPath)).toEqual([
       "src/alpha.ts",
       "src/beta.ts",
     ]);
@@ -634,7 +721,7 @@ describe("chat session panel state", () => {
 
     expect(changesStore.currentPanelVisible).toBe(true);
     expect(changesStore.latestTurnRounds).toHaveLength(1);
-    expect(changesStore.latestTurnFiles.map((file) => file.path)).toEqual([
+    expect(changesStore.latestTurnFiles.map((file) => file.finalPath)).toEqual([
       "src/live.ts",
     ]);
     expect(changesStore.currentFileCount).toBe(1);

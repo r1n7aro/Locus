@@ -14,7 +14,7 @@ export interface ChatMergedFileItem {
   id: number;
   /** Final path (after rename if any) */
   finalPath: string;
-  /** Old path before rename (undefined if conversationNew) */
+  /** Old path before rename (undefined if the file was introduced in the merged range) */
   baseOldPath?: string;
   /** assistantMessageId of the first round that touched this file */
   baseAssistantMessageId: string;
@@ -50,12 +50,12 @@ export function buildRounds(entries: VcsUndoEntry[]): ChatChangeRound[] {
 interface FileIdentity {
   /** Current path (updated on rename) */
   finalPath: string;
-  /** Original path before any rename in this conversation (undefined if conversationNew) */
+  /** Original path before any rename in the merged range (undefined if introduced) */
   originPath?: string;
   /** assistantMessageId of the first round that touched this file */
   baseAssistantMessageId: string;
-  /** True if the file was first introduced in this conversation (Add) */
-  conversationNew: boolean;
+  /** True if the file was first introduced within the merged rounds (Add) */
+  introduced: boolean;
   /** True if the file was renamed at least once */
   sawRename: boolean;
   /** True if the file currently exists (false after Delete) */
@@ -68,35 +68,38 @@ interface FileIdentity {
  * Derive net status from identity state bits.
  *
  * Rules:
- * - conversationNew && !existsNow → no-op (filter out)
- * - conversationNew && existsNow  → "A" (net new file)
- * - !existsNow                    → "D" (deleted)
- * - sawRename                     → "R" (renamed)
- * - else                          → "M" (modified)
+ * - introduced && !existsNow → no-op (filter out)
+ * - introduced && existsNow  → "A" (net new file)
+ * - !existsNow               → "D" (deleted)
+ * - sawRename                → "R" (renamed)
+ * - else                     → "M" (modified)
  */
 function deriveNetStatus(id: FileIdentity): string | null {
-  if (id.conversationNew && !id.existsNow) return null; // no-op
-  if (id.conversationNew) return "A";
+  if (id.introduced && !id.existsNow) return null; // no-op
+  if (id.introduced) return "A";
   if (!id.existsNow) return "D";
   if (id.sawRename) return "R";
   return "M";
 }
 
 /**
- * Merge all rounds into a deduplicated file list for "all changes" view.
+ * Merge a set of rounds into a deduplicated net-change file list.
  *
- * v2 — tracks file identity through rename chains using semantic state bits.
+ * Shared by both changes-panel tabs: "all changes" merges every round of the
+ * conversation, "current turn" merges only the latest run's rounds. Statuses
+ * are net relative to the first merged round's checkpoint, matching the
+ * chatCheckpoint diff anchor.
  *
  * Algorithm:
- * 1. Entries sorted by checkpoint.createdAt ascending.
+ * 1. Rounds sorted by checkpoint.createdAt ascending.
  * 2. Each file is tracked by an identity ID, mapped from its current path.
  * 3. Within each round, renames are processed first to avoid ordering issues.
  * 4. Rename chains are followed: a→b then b→c merges into a→c.
- * 5. Net status is derived from (conversationNew, sawRename, existsNow).
- * 6. Files added then deleted within the conversation are excluded.
+ * 5. Net status is derived from (introduced, sawRename, existsNow).
+ * 6. Files added then deleted within the merged range are excluded.
  */
-export function buildMergedFiles(entries: VcsUndoEntry[]): ChatMergedFileItem[] {
-  const sorted = [...entries].sort(
+export function mergeRoundFiles(rounds: ChatChangeRound[]): ChatMergedFileItem[] {
+  const sorted = [...rounds].sort(
     (a, b) => a.checkpoint.createdAt - b.checkpoint.createdAt,
   );
 
@@ -105,11 +108,11 @@ export function buildMergedFiles(entries: VcsUndoEntry[]): ChatMergedFileItem[] 
   // Reverse index: current file path → identity ID
   const pathToId = new Map<string, number>();
 
-  for (const entry of sorted) {
+  for (const round of sorted) {
     // Process renames first within each round to avoid ordering issues
     const renames: ChangedFile[] = [];
     const others: ChangedFile[] = [];
-    for (const f of entry.changedFiles) {
+    for (const f of round.files) {
       if (f.oldPath) {
         renames.push(f);
       } else {
@@ -124,7 +127,7 @@ export function buildMergedFiles(entries: VcsUndoEntry[]): ChatMergedFileItem[] 
         // Known file being renamed again — follow the chain
         const identity = identities.get(existingId)!;
         // Record originPath on first rename (only for pre-existing files)
-        if (!identity.conversationNew && identity.originPath === undefined) {
+        if (!identity.introduced && identity.originPath === undefined) {
           identity.originPath = f.oldPath;
         }
         identity.finalPath = f.path;
@@ -139,8 +142,8 @@ export function buildMergedFiles(entries: VcsUndoEntry[]): ChatMergedFileItem[] 
         identities.set(id, {
           finalPath: f.path,
           originPath: f.oldPath,
-          baseAssistantMessageId: entry.assistantMessageId,
-          conversationNew: false,
+          baseAssistantMessageId: round.assistantMessageId,
+          introduced: false,
           sawRename: true,
           existsNow: true,
           roundCount: 1,
@@ -168,8 +171,8 @@ export function buildMergedFiles(entries: VcsUndoEntry[]): ChatMergedFileItem[] 
         identities.set(id, {
           finalPath: f.path,
           originPath: undefined,
-          baseAssistantMessageId: entry.assistantMessageId,
-          conversationNew: f.status === "A",
+          baseAssistantMessageId: round.assistantMessageId,
+          introduced: f.status === "A",
           sawRename: false,
           existsNow: f.status !== "D",
           roundCount: 1,
@@ -188,8 +191,8 @@ export function buildMergedFiles(entries: VcsUndoEntry[]): ChatMergedFileItem[] 
     result.push({
       id,
       finalPath: identity.finalPath,
-      // conversationNew files have no "old path" since they didn't exist before
-      baseOldPath: identity.conversationNew ? undefined : identity.originPath,
+      // Introduced files have no "old path" since they didn't exist before
+      baseOldPath: identity.introduced ? undefined : identity.originPath,
       baseAssistantMessageId: identity.baseAssistantMessageId,
       status: netStatus,
       roundCount: identity.roundCount,
@@ -197,4 +200,11 @@ export function buildMergedFiles(entries: VcsUndoEntry[]): ChatMergedFileItem[] 
   }
 
   return result;
+}
+
+/**
+ * Merge all rounds into a deduplicated file list for the "all changes" view.
+ */
+export function buildMergedFiles(entries: VcsUndoEntry[]): ChatMergedFileItem[] {
+  return mergeRoundFiles(buildRounds(entries));
 }
