@@ -1,5 +1,5 @@
 {
-  "description": "Display a graph to the user in a dedicated Locus graph window. Use this when a graph is the clearest representation of nodes, ports, parameters, and links, such as shader networks, animation controllers, state machines, behavior trees, dependency graphs, or Blueprint-style flows.\n\nThe agent submits node definitions and links. Locus renders the graph with built-in styling, port connection UI, parameter controls, selectable layout modes, selectable node styles, and optional directed link arrows. Use layout.nodeStyle=state for compact Unreal/Unity-style state machine nodes. Use layout.statePortPlacement=vertical for top/bottom state-node ports. Use layout.directed=true for directed links, or link.directed for per-link overrides. Use layout.mode=manual when you want to supply and preserve explicit node x/y coordinates.\n\nUse editable=false when the graph is for inspection only. The window opens and the tool returns immediately so work can continue.\n\nUse editable=true when the user must review or edit the graph before the agent proceeds. The tool waits until the user confirms an option in the graph window, then returns the selected option and the modified graph data. Closing the window cancels the wait.\n\nOptions work like ask_user_question choices: provide up to 3 concise labels with descriptions. They are shown as confirmation actions in editable mode.",
+  "description": "Display a graph to the user in a dedicated Locus graph window. Use this when a graph is the clearest representation of nodes, ports, parameters, and links, such as shader networks, animation controllers, state machines, behavior trees, dependency graphs, or Blueprint-style flows.\n\nLocus renders submitted nodes/links with built-in styling, port connection UI, parameter controls and selectable layouts. Use layout.nodeStyle=state for compact Unreal/Unity-style state machine nodes, layout.statePortPlacement=vertical for top/bottom state ports, layout.directed=true (or per-link link.directed) for arrows, and layout.mode=manual to supply and preserve explicit node x/y coordinates.\n\nUse editable=false when the graph is for inspection only: the window opens and the tool returns immediately. Use editable=true when the user must review or edit the graph before the agent proceeds: the tool waits until the user confirms an option in the graph window, then returns the selected option and the modified graph data; closing the window cancels the wait.\n\nOptions work like ask_user_question choices: provide up to 3 concise labels with descriptions, shown as confirmation actions in editable mode.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -17,13 +17,13 @@
       },
       "nodes": {
         "type": "array",
-        "description": "Graph nodes. Coordinates are optional unless layout.mode=manual is used to preserve an agent-authored layout.",
+        "description": "Graph nodes. Coordinates are optional unless layout.mode=manual.",
         "items": {
           "type": "object",
           "properties": {
             "id": {
               "type": "string",
-              "description": "Stable unique node id."
+              "description": "Unique node id."
             },
             "type": {
               "type": "string",
@@ -40,7 +40,7 @@
             "nodeStyle": {
               "type": "string",
               "enum": ["blueprint", "state"],
-              "description": "Optional per-node visual style. Use state for compact Unreal/Unity-style state machine nodes."
+              "description": "Optional per-node visual style. Use state for compact state machine nodes."
             },
             "x": {
               "type": "number",
@@ -56,8 +56,8 @@
               "items": {
                 "type": "object",
                 "properties": {
-                  "id": { "type": "string", "description": "Stable port id." },
-                  "label": { "type": "string", "description": "Display label." },
+                  "id": { "type": "string", "description": "Port id." },
+                  "label": { "type": "string", "description": "Label." },
                   "type": { "type": "string", "description": "Optional value type." }
                 },
                 "required": ["id"]
@@ -69,8 +69,8 @@
               "items": {
                 "type": "object",
                 "properties": {
-                  "id": { "type": "string", "description": "Stable port id." },
-                  "label": { "type": "string", "description": "Display label." },
+                  "id": { "type": "string", "description": "Port id." },
+                  "label": { "type": "string", "description": "Label." },
                   "type": { "type": "string", "description": "Optional value type." }
                 },
                 "required": ["id"]
@@ -82,8 +82,8 @@
               "items": {
                 "type": "object",
                 "properties": {
-                  "id": { "type": "string", "description": "Stable parameter id." },
-                  "label": { "type": "string", "description": "Display label." },
+                  "id": { "type": "string", "description": "Parameter id." },
+                  "label": { "type": "string", "description": "Label." },
                   "type": { "type": "string", "description": "string, text, number, boolean, select, or color." },
                   "value": { "description": "Current parameter value." },
                   "options": {

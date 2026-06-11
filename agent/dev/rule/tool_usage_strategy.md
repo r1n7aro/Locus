@@ -6,7 +6,7 @@
 
 * Use `list` to determine the file system structure within the working directory.
 
-* Use `grep` to search content within code files, use `unity_asset_search` to search for asset and code names, and use `unity_ref_search` to search dependency relationships.
+* Use `code_symbol_search` / `code_find_references` to locate C# declarations and references semantically, `grep` for plain-text or regex content matches, `unity_asset_search` to search asset and code names, and `unity_ref_search` to search dependency relationships.
 
 * Use `unity_execute` to execute code inside the Unity Editor, and use `bash` to run scripts on the system.
 
