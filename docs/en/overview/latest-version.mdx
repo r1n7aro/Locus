@@ -1,9 +1,9 @@
 ---
 title: "Latest Version"
-description: "Locus v0.4.0 (2026-06-11)"
+description: "Locus v0.4.1 (2026-06-12)"
 sidebarTitle: "Latest Version"
-version: "0.4.0"
-releasedAt: "2026-06-11"
+version: "0.4.1"
+releasedAt: "2026-06-12"
 channel: "stable"
 updateTitle: "Update available"
 changelogUrl: "/en/overview/latest-version"
@@ -11,36 +11,32 @@ changelogUrl: "/en/overview/latest-version"
 
 ## Download
 
-- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.4.0/locus_0.4.0_x64-setup.exe)
-- [Windows x64 (system Python/Git)](https://github.com/r1n7aro/Locus/releases/download/v0.4.0/locus_0.4.0_x64-without_embed_python_git-setup.exe)
+- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.4.1/locus_0.4.1_x64-setup.exe)
+- [Windows x64 (system Python/Git)](https://github.com/r1n7aro/Locus/releases/download/v0.4.1/locus_0.4.1_x64-without_embed_python_git-setup.exe)
 - [GitHub Releases](https://github.com/r1n7aro/Locus/releases)
 
 ## Changes
 
 ### Added
 
-- New Plugins page with a plugin Hub: browse the plugin registry, then search, install, update, enable/disable, and uninstall plugins, installed to the app or to a single project.
-- New /plugin command: type /plugin with a request in a session and the agent walks the whole plugin workflow — scaffolding the manifest and component folders, packaging, creating the GitHub repository, and opening a registry pull request to publish.
-- Plugins can be imported from a local zip or folder, or straight from a repository, release, or zip link; multiple plugin registries can be configured.
-- GitHub sign-in on the Plugins page (browser authorization) raises release metadata rate limits, enables private repositories, and lets you star plugins; GitHub CLI now ships with Locus.
-- Built-in help panel on the Plugins page covering /plugin, Skill packages, and the publish flow; the agent also gets tools to search, install, enable/disable, and uninstall plugins.
-- New /ask-locus built-in skill: answers questions about how Locus itself works, grounded in the Locus source and docs.
-- New confirmation sheets: before multi-field actions such as exporting or publishing a plugin, the agent presents an editable confirmation sheet where you adjust individual values inline or reject with feedback.
-- New interactive terminal commands: commands that need real typing (login wizards like gh auth login, password prompts) open in a visible terminal window, with VT support on Windows.
-- Undo history persists across app restarts and detects files modified outside Locus.
-- New display settings for the main interface: toggle the welcome area and top navigation entries.
-- Knowledge explorer navigation and selection improved, with title-based fallback search.
-- Skills inject a lightweight excerpt by default and load full content on demand; long Codex sessions support remote compaction.
+- C# code analysis powered by a Roslyn language server: Locus downloads the components on demand, loads the Unity-generated solution, and adds new agent tools — code_symbol_search, code_goto_definition, code_find_references, code_hover, and code_diagnostics; code_diagnostics reports compiler and analyzer errors and warnings without recompiling in Unity, and its file scope also validates tag/layer/scene/Resources/Input string literals against project settings.
+- New unity_code_usages tool: find where a script or member is used inside scenes, prefabs, and assets — attach points, UnityEvent bindings, serialized fields, and AnimationEvents. Works without the Roslyn server.
+- New "Code Analysis" settings tab with a master switch, per-tool switches, and optional Microsoft.Unity.Analyzers (UNT*) diagnostics; the chat status bar shows the analysis server lifecycle (download, project loading, ready) with one-click restart.
+- Tools can now be enabled or disabled per agent; disabled tools are removed from the agent's context entirely, and the agent dashboard lists them.
+- Reworked asset inspector: a floating Inspector panel inside the main window, standalone Inspector windows with tabs, and an adaptive mode that picks between them by window size. Text assets get a built-in viewer.
+- Configurable click actions for Unity asset references in chat messages and in the Unity embed: open the Locus Inspector (floating / window / adaptive), open Unity's own Inspector, select in Unity, or reveal in File Explorer.
+- Curve and gradient editors: edit AnimationCurve and Gradient properties directly in Locus — draggable keys, tangent modes, presets, and wrap modes for curves; color/alpha stops and blend mode for gradients — with Apply/Cancel and live preview in Unity when available.
+- New serialized property editors: Bounds and HDR color fields, an object reference picker with search, array add/remove/drag-to-reorder, and managed type search.
+- New Claude Code CLI provider: drives the system claude command directly, shows install and login state in settings; an experimental option adds Claude Code CLI models to the model list.
+- Agent file reads now include line numbers, matching the line arguments of the code tools.
 
 ### Fixed
 
-- Message drafts are no longer lost: a failed send returns to the draft box, and cancelling a just-started run restores the draft cleanly.
-- Smoother rendering while long replies stream in.
-- The changed-files list for a turn now nets out intermediate edits.
-- Plugin-managed view trees stay stable, with stricter view id validation and host sync.
-- Unity: editor processes are detected natively with less embed probing and overlay churn, and asset search result rows align correctly.
-- Shell PATH refreshes on every call, so a CLI installed by a previous command is immediately available.
+- unity_yaml_search field matching now reaches deeply nested serialized data (for example UnityEvent persistent-call bindings) that the previous shallow depth missed.
+- Windows installers now use zlib compression and install faster.
+- Refined built-in tool descriptions and agent guidance (read/edit, bash, grep, Unity tools).
+- The serialized table view template now shares one implementation with the main app.
 
 ### Removed
 
-- The bundled Unity skills unity-editor-tooling and unity-project-setup are no longer shipped.
+- The "Claude Agent SDK" provider channel was removed; the Claude Code CLI provider replaces it.

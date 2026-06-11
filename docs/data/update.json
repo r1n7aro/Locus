@@ -1,12 +1,12 @@
 {
-  "version": "0.4.0",
-  "releasedAt": "2026-06-11",
+  "version": "0.4.1",
+  "releasedAt": "2026-06-12",
   "channel": "stable",
   "installers": [
     {
       "id": "windows-x64",
       "label": "Windows x64",
-      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.4.0/locus_0.4.0_x64-setup.exe",
+      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.4.1/locus_0.4.1_x64-setup.exe",
       "platform": "windows",
       "arch": "x64",
       "includesManagedPython": true,
@@ -17,7 +17,7 @@
     {
       "id": "windows-x64-without-embed-python-git",
       "label": "Windows x64 - system Python/Git",
-      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.4.0/locus_0.4.0_x64-without_embed_python_git-setup.exe",
+      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.4.1/locus_0.4.1_x64-without_embed_python_git-setup.exe",
       "platform": "windows",
       "arch": "x64",
       "includesManagedPython": false,
@@ -29,52 +29,48 @@
   "locales": {
     "zh": {
       "title": "发现新版本",
-      "summary": "Locus v0.4.0 (2026-06-11)",
+      "summary": "Locus v0.4.1 (2026-06-12)",
       "changelogUrl": "/overview/latest-version",
       "changes": [
         {
           "title": "新增",
           "items": [
-            "全新「插件」页面与插件 Hub：浏览插件注册表，搜索、安装、更新、启用/停用、卸载插件，可安装到 App 或单个项目。",
-            "新增 /plugin 命令：在会话中输入 /plugin 加上需求，Agent 走完整插件工作流——生成插件清单与组件目录、打包、创建 GitHub 仓库并向注册表发起 Pull Request 完成发布。",
-            "插件支持从本地 zip / 文件夹导入，也可直接粘贴仓库、release 或 zip 链接导入；支持配置多个插件注册表。",
-            "插件页内置 GitHub 登录（浏览器授权）：提升 release 元数据请求额度、支持私有仓库、可为插件点 Star；Locus 现已自带 GitHub CLI。",
-            "插件页内置帮助面板，讲解 /plugin、Skill 包与发布流程；Agent 也获得搜索、安装、启停、卸载插件的工具。",
-            "新增 /ask-locus 内置技能：回答 Locus 本身的使用与原理问题，答案基于 Locus 源码与文档。",
-            "新增确认清单：导出或发布插件等多字段操作前，Agent 弹出可编辑的确认清单，可逐项修改或整体驳回并附反馈。",
-            "新增交互式终端命令：需要真实输入的命令（如 gh auth login、密码提示）会在可见终端窗口中打开，Windows 下支持 VT 转义。",
-            "撤销历史跨重启保留，并能识别在 Locus 之外被修改过的文件。",
-            "显示设置新增主界面控制，可隐藏欢迎区与顶部导航入口。",
-            "知识浏览器改进导航与选中体验，新增按标题的兜底搜索。",
-            "技能默认注入轻量摘要，完整内容按需加载；Codex 长会话支持远程压缩。"
+            "基于 Roslyn 语言服务器的 C# 代码分析：按需下载组件、加载 Unity 生成的解决方案，新增 code_symbol_search、code_goto_definition、code_find_references、code_hover、code_diagnostics 工具；code_diagnostics 无需回 Unity 编译即可获得编译器与分析器诊断，文件范围还会校验 Tag/Layer/场景/Resources/Input 字符串。",
+            "新增 unity_code_usages 工具：查找脚本或成员在场景、Prefab 与资源中的使用位置，覆盖挂载点、UnityEvent 绑定、序列化字段与 AnimationEvent，无需启动 Roslyn 服务器。",
+            "设置新增「代码分析」页：总开关与逐工具开关，可选注入 Microsoft.Unity.Analyzers（UNT*）诊断；聊天状态栏显示分析服务器状态（下载、加载工程、就绪），支持一键重启。",
+            "工具可按 Agent 启用或禁用，禁用的工具不会注入模型上下文；Agent 面板会列出已禁用的工具。",
+            "资产检查器重做：主窗口内浮动 Inspector 面板、带标签页的独立 Inspector 窗口，以及按窗口大小自动选择的自适应模式；文本资产内置查看器。",
+            "会话消息与 Unity 嵌入中的资产引用点击行为可配置：打开 Locus Inspector（浮动/独立窗口/自适应）、打开 Unity 自带 Inspector、仅在 Unity 中选中，或在文件管理器中显示。",
+            "新增曲线与渐变编辑器：在 Locus 中直接编辑 AnimationCurve 与 Gradient，曲线支持拖拽关键帧、切线模式、预设与循环模式，渐变支持颜色/透明度色标与混合模式；带应用/取消，Unity 可用时实时预览。",
+            "序列化属性新增 Bounds 与 HDR 颜色字段、带搜索的对象引用选择器、数组增删与拖拽排序，以及托管类型搜索。",
+            "新增 Claude Code CLI 模型渠道：直接驱动系统 claude 命令，设置页显示安装与登录状态；实验性选项可将 Claude Code CLI 模型加入模型列表。",
+            "Agent 读取文件时附带行号，与 code 系列工具的行号参数一致。"
           ]
         },
         {
           "title": "修复",
           "items": [
-            "消息草稿不再丢失：发送失败会退回草稿框，刚开始的运行被取消时也能完整还原草稿。",
-            "长回复流式输出时渲染更流畅。",
-            "单轮变更文件列表会合并中间编辑，只显示净变更。",
-            "插件管理的视图树更稳定，视图 id 校验与宿主同步更严格。",
-            "Unity：原生探测编辑器进程，减少嵌入探测与遮罩闪烁；资源搜索结果行对齐正确。",
-            "每次执行 shell 命令前刷新 PATH，上一条命令安装的 CLI 可立即使用。"
+            "unity_yaml_search 字段匹配现在能搜到深层嵌套的序列化数据（如 UnityEvent 持久化调用绑定），修复浅层深度搜不到的问题。",
+            "Windows 安装包改用 zlib 压缩，安装更快。",
+            "打磨内置工具说明与 Agent 使用指引（read/edit、bash、grep、Unity 工具）。",
+            "序列化表格视图模板与主应用共用同一实现。"
           ]
         },
         {
           "title": "移除",
           "items": [
-            "不再内置 Unity 技能 unity-editor-tooling 与 unity-project-setup。"
+            "移除「Claude Agent SDK」模型渠道，由 Claude Code CLI 渠道接替。"
           ]
         }
       ],
       "downloadChannels": [
         {
           "label": "Windows x64",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.4.0/locus_0.4.0_x64-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.4.1/locus_0.4.1_x64-setup.exe"
         },
         {
           "label": "Windows x64（系统 Python/Git）",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.4.0/locus_0.4.0_x64-without_embed_python_git-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.4.1/locus_0.4.1_x64-without_embed_python_git-setup.exe"
         },
         {
           "label": "GitHub Releases",
@@ -84,52 +80,48 @@
     },
     "en": {
       "title": "Update available",
-      "summary": "Locus v0.4.0 (2026-06-11)",
+      "summary": "Locus v0.4.1 (2026-06-12)",
       "changelogUrl": "/en/overview/latest-version",
       "changes": [
         {
           "title": "Added",
           "items": [
-            "New Plugins page with a plugin Hub: browse the plugin registry, then search, install, update, enable/disable, and uninstall plugins, installed to the app or to a single project.",
-            "New /plugin command: type /plugin with a request in a session and the agent walks the whole plugin workflow — scaffolding the manifest and component folders, packaging, creating the GitHub repository, and opening a registry pull request to publish.",
-            "Plugins can be imported from a local zip or folder, or straight from a repository, release, or zip link; multiple plugin registries can be configured.",
-            "GitHub sign-in on the Plugins page (browser authorization) raises release metadata rate limits, enables private repositories, and lets you star plugins; GitHub CLI now ships with Locus.",
-            "Built-in help panel on the Plugins page covering /plugin, Skill packages, and the publish flow; the agent also gets tools to search, install, enable/disable, and uninstall plugins.",
-            "New /ask-locus built-in skill: answers questions about how Locus itself works, grounded in the Locus source and docs.",
-            "New confirmation sheets: before multi-field actions such as exporting or publishing a plugin, the agent presents an editable confirmation sheet where you adjust individual values inline or reject with feedback.",
-            "New interactive terminal commands: commands that need real typing (login wizards like gh auth login, password prompts) open in a visible terminal window, with VT support on Windows.",
-            "Undo history persists across app restarts and detects files modified outside Locus.",
-            "New display settings for the main interface: toggle the welcome area and top navigation entries.",
-            "Knowledge explorer navigation and selection improved, with title-based fallback search.",
-            "Skills inject a lightweight excerpt by default and load full content on demand; long Codex sessions support remote compaction."
+            "C# code analysis powered by a Roslyn language server: Locus downloads the components on demand, loads the Unity-generated solution, and adds new agent tools — code_symbol_search, code_goto_definition, code_find_references, code_hover, and code_diagnostics; code_diagnostics reports compiler and analyzer errors and warnings without recompiling in Unity, and its file scope also validates tag/layer/scene/Resources/Input string literals against project settings.",
+            "New unity_code_usages tool: find where a script or member is used inside scenes, prefabs, and assets — attach points, UnityEvent bindings, serialized fields, and AnimationEvents. Works without the Roslyn server.",
+            "New \"Code Analysis\" settings tab with a master switch, per-tool switches, and optional Microsoft.Unity.Analyzers (UNT*) diagnostics; the chat status bar shows the analysis server lifecycle (download, project loading, ready) with one-click restart.",
+            "Tools can now be enabled or disabled per agent; disabled tools are removed from the agent's context entirely, and the agent dashboard lists them.",
+            "Reworked asset inspector: a floating Inspector panel inside the main window, standalone Inspector windows with tabs, and an adaptive mode that picks between them by window size. Text assets get a built-in viewer.",
+            "Configurable click actions for Unity asset references in chat messages and in the Unity embed: open the Locus Inspector (floating / window / adaptive), open Unity's own Inspector, select in Unity, or reveal in File Explorer.",
+            "Curve and gradient editors: edit AnimationCurve and Gradient properties directly in Locus — draggable keys, tangent modes, presets, and wrap modes for curves; color/alpha stops and blend mode for gradients — with Apply/Cancel and live preview in Unity when available.",
+            "New serialized property editors: Bounds and HDR color fields, an object reference picker with search, array add/remove/drag-to-reorder, and managed type search.",
+            "New Claude Code CLI provider: drives the system claude command directly, shows install and login state in settings; an experimental option adds Claude Code CLI models to the model list.",
+            "Agent file reads now include line numbers, matching the line arguments of the code tools."
           ]
         },
         {
           "title": "Fixed",
           "items": [
-            "Message drafts are no longer lost: a failed send returns to the draft box, and cancelling a just-started run restores the draft cleanly.",
-            "Smoother rendering while long replies stream in.",
-            "The changed-files list for a turn now nets out intermediate edits.",
-            "Plugin-managed view trees stay stable, with stricter view id validation and host sync.",
-            "Unity: editor processes are detected natively with less embed probing and overlay churn, and asset search result rows align correctly.",
-            "Shell PATH refreshes on every call, so a CLI installed by a previous command is immediately available."
+            "unity_yaml_search field matching now reaches deeply nested serialized data (for example UnityEvent persistent-call bindings) that the previous shallow depth missed.",
+            "Windows installers now use zlib compression and install faster.",
+            "Refined built-in tool descriptions and agent guidance (read/edit, bash, grep, Unity tools).",
+            "The serialized table view template now shares one implementation with the main app."
           ]
         },
         {
           "title": "Removed",
           "items": [
-            "The bundled Unity skills unity-editor-tooling and unity-project-setup are no longer shipped."
+            "The \"Claude Agent SDK\" provider channel was removed; the Claude Code CLI provider replaces it."
           ]
         }
       ],
       "downloadChannels": [
         {
           "label": "Windows x64",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.4.0/locus_0.4.0_x64-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.4.1/locus_0.4.1_x64-setup.exe"
         },
         {
           "label": "Windows x64 (system Python/Git)",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.4.0/locus_0.4.0_x64-without_embed_python_git-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.4.1/locus_0.4.1_x64-without_embed_python_git-setup.exe"
         },
         {
           "label": "GitHub Releases",

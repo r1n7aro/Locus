@@ -297,11 +297,11 @@
     },
     {
       "path": "src/language/en.json",
-      "bytes": 206567
+      "bytes": 211032
     },
     {
       "path": "src/language/zh.json",
-      "bytes": 201127
+      "bytes": 205565
     },
     {
       "path": "src/services/asset.ts",
@@ -365,7 +365,7 @@
     },
     {
       "path": "src/types.ts",
-      "bytes": 67775
+      "bytes": 69346
     }
   ]
 }
