@@ -8,6 +8,13 @@ export type FontSlot = "ui" | "prose" | "monoInline" | "monoBlock" | "monoEditor
 export type DiffReviewTarget = "inline" | "window";
 export type ChatDiffReviewTarget = DiffReviewTarget;
 export type GitDiffReviewTarget = DiffReviewTarget;
+export type AssetRefClickAction =
+  | "unitySelect"
+  | "fileBrowser"
+  | "unityInspector"
+  | "locusInspectorAuto"
+  | "locusInspectorEmbedded"
+  | "locusInspectorWindow";
 
 export interface DisplaySettings {
   /** Show the welcome subtitle above the chat input */
@@ -36,6 +43,10 @@ export interface DisplaySettings {
   chatDiffReviewTarget: DiffReviewTarget;
   /** Default target for reviewing Git file diffs */
   gitDiffReviewTarget: DiffReviewTarget;
+  /** Default action when clicking a Unity asset reference in chat messages */
+  assetRefClickAction: AssetRefClickAction;
+  /** Click action override for chat running inside the Unity embed window */
+  unityEmbedAssetRefClickAction: AssetRefClickAction;
   /** Right-align user messages in the session transcript */
   rightAlignUserMessages: boolean;
   /** Collapse completed tool call batches in chat transcript */
@@ -108,6 +119,10 @@ const defaults: DisplaySettings = {
   fileChangePopoverEnabled: true,
   chatDiffReviewTarget: "window",
   gitDiffReviewTarget: "window",
+  assetRefClickAction: "locusInspectorAuto",
+  // Inside the Unity embed window the editor's own Inspector is one click
+  // away, so asset/GameObject refs open there by default.
+  unityEmbedAssetRefClickAction: "unityInspector",
   rightAlignUserMessages: true,
   compactToolCalls: true,
   hideThinkingBlocks: true,

@@ -130,6 +130,15 @@ function commitFromInput() {
 function blurOnEnter(event: KeyboardEvent) {
   (event.target as HTMLElement | null)?.blur();
 }
+
+function restoreTextOnEscape(event: KeyboardEvent) {
+  const input = event.target as HTMLInputElement | null;
+  const original = unitySerializedValueToEditText(props.propertyType, props.modelValue);
+  text.value = original;
+  // Sync the DOM value before blurring so the change event does not fire.
+  if (input) input.value = original;
+  input?.blur();
+}
 </script>
 
 <template>
@@ -163,6 +172,7 @@ function blurOnEnter(event: KeyboardEvent) {
       @input="updateFromInput"
       @change="commitFromInput"
       @keydown.enter.prevent="blurOnEnter"
+      @keydown.esc.prevent="restoreTextOnEscape"
     />
   </div>
   <input
@@ -179,6 +189,7 @@ function blurOnEnter(event: KeyboardEvent) {
     @input="updateFromInput"
     @change="commitFromInput"
     @keydown.enter.prevent="blurOnEnter"
+    @keydown.esc.prevent="restoreTextOnEscape"
   />
 </template>
 

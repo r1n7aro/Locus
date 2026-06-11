@@ -1,33 +1,29 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const webviewWindowMocks = vi.hoisted(() => ({
-  getByLabelMock: vi.fn(),
-  getCurrentWebviewWindowMock: vi.fn(),
-  createdWindows: [] as Array<unknown[]>,
+const viewServiceMocks = vi.hoisted(() => ({
+  viewOpenInspectorTabMock: vi.fn(),
 }));
 
-vi.mock("@tauri-apps/api/webviewWindow", () => ({
-  getCurrentWebviewWindow: webviewWindowMocks.getCurrentWebviewWindowMock,
-  WebviewWindow: class {
-    static getByLabel = webviewWindowMocks.getByLabelMock;
+const tauriRuntimeMocks = vi.hoisted(() => ({
+  hasTauriWindowRuntimeMock: vi.fn(),
+}));
 
-    constructor(...args: unknown[]) {
-      webviewWindowMocks.createdWindows.push(args);
-    }
+vi.mock("../services/view", () => ({
+  viewOpenInspectorTab: viewServiceMocks.viewOpenInspectorTabMock,
+}));
 
-    once(event: string, callback: (...args: unknown[]) => void) {
-      if (event === "tauri://created") {
-        callback();
-      }
-    }
-  },
+vi.mock("../services/tauriRuntime", () => ({
+  hasTauriWindowRuntime: tauriRuntimeMocks.hasTauriWindowRuntimeMock,
 }));
 
 import {
-  LOCUS_ASSET_INSPECTOR_WINDOW_EVENT,
-  buildLocusAssetInspectorWindowUrl,
-  getLocusAssetInspectorWindowPayload,
+  LOCUS_ASSET_INSPECTOR_TAB_ID_PREFIX,
+  buildLocusAssetInspectorTabId,
+  isLocusAssetInspectorTabId,
+  locusAssetInspectorTabTitle,
+  locusAssetInspectorTargetPath,
   openLocusAssetInspectorWindow,
+  parseLocusAssetInspectorTabId,
 } from "../services/locusAssetInspectorWindow";
 
 describe("locusAssetInspectorWindow", () => {
@@ -36,39 +32,33 @@ describe("locusAssetInspectorWindow", () => {
   const objectPath = "BardHare/DialogueShot/cm[1]";
 
   beforeEach(() => {
-    webviewWindowMocks.getByLabelMock.mockReset();
-    webviewWindowMocks.getCurrentWebviewWindowMock.mockReset();
-    webviewWindowMocks.getCurrentWebviewWindowMock.mockReturnValue({ label: "main" });
-    webviewWindowMocks.createdWindows.length = 0;
-    Object.defineProperty(globalThis, "window", {
-      configurable: true,
-      value: {
-        location: { pathname: "/", search: "" },
-        __TAURI_INTERNALS__: {
-          invoke: vi.fn(),
-          metadata: { currentWindow: { label: "main" } },
-        },
-      },
+    viewServiceMocks.viewOpenInspectorTabMock.mockReset();
+    viewServiceMocks.viewOpenInspectorTabMock.mockResolvedValue({
+      id: "",
+      windowLabel: "view-inspector-abc123",
+      hostUrl: "/view-host?id=...",
+      packageRoot: "",
     });
+    tauriRuntimeMocks.hasTauriWindowRuntimeMock.mockReset();
+    tauriRuntimeMocks.hasTauriWindowRuntimeMock.mockReturnValue(true);
   });
 
-  it("builds and parses asset URLs for the dedicated inspector window", () => {
-    const url = buildLocusAssetInspectorWindowUrl({ assetPath });
+  it("builds and parses asset tab ids", () => {
+    const tabId = buildLocusAssetInspectorTabId({ assetPath });
 
-    expect(url).toContain("/locus-asset-inspector?locusAssetInspector=1");
-    expect(getLocusAssetInspectorWindowPayload(url.slice(url.indexOf("?"))).assetPath).toBe(assetPath);
+    expect(tabId.startsWith(LOCUS_ASSET_INSPECTOR_TAB_ID_PREFIX)).toBe(true);
+    expect(isLocusAssetInspectorTabId(tabId)).toBe(true);
+    expect(parseLocusAssetInspectorTabId(tabId)).toEqual({ assetPath });
   });
 
-  it("builds and parses scene object URLs for the dedicated inspector window", () => {
-    const url = buildLocusAssetInspectorWindowUrl({
+  it("builds and parses scene object tab ids", () => {
+    const tabId = buildLocusAssetInspectorTabId({
       kind: "sceneObject",
       scenePath,
       objectPath,
     });
 
-    const payload = getLocusAssetInspectorWindowPayload(url.slice(url.indexOf("?")));
-    expect(url).toContain("kind=sceneObject");
-    expect(payload).toEqual({
+    expect(parseLocusAssetInspectorTabId(tabId)).toEqual({
       kind: "sceneObject",
       scenePath,
       objectPath,
@@ -76,75 +66,73 @@ describe("locusAssetInspectorWindow", () => {
   });
 
   it("normalizes full scene object paths passed through assetPath", () => {
-    const url = buildLocusAssetInspectorWindowUrl({
+    const tabId = buildLocusAssetInspectorTabId({
       assetPath: `${scenePath}/${objectPath}`,
     });
 
-    expect(getLocusAssetInspectorWindowPayload(url.slice(url.indexOf("?")))).toEqual({
+    expect(parseLocusAssetInspectorTabId(tabId)).toEqual({
       kind: "sceneObject",
       scenePath,
       objectPath,
     });
   });
 
-  it("focuses an existing inspector window and sends the next asset path", async () => {
-    const existingWindow = {
-      emit: vi.fn(),
-      setFocus: vi.fn(),
-    };
-    webviewWindowMocks.getByLabelMock.mockResolvedValue(existingWindow);
-
-    await openLocusAssetInspectorWindow({ assetPath });
-
-    expect(existingWindow.emit).toHaveBeenCalledWith(
-      LOCUS_ASSET_INSPECTOR_WINDOW_EVENT,
-      { assetPath },
-    );
-    expect(existingWindow.setFocus).toHaveBeenCalledTimes(1);
-    expect(webviewWindowMocks.createdWindows).toHaveLength(0);
+  it("produces identical tab ids for identical targets (dedupe key)", () => {
+    expect(buildLocusAssetInspectorTabId({ assetPath }))
+      .toBe(buildLocusAssetInspectorTabId({ assetPath: `${assetPath}/` }));
   });
 
-  it("focuses an existing inspector window and sends the next scene object target", async () => {
-    const existingWindow = {
-      emit: vi.fn(),
-      setFocus: vi.fn(),
-    };
-    webviewWindowMocks.getByLabelMock.mockResolvedValue(existingWindow);
+  it("keeps tab ids ASCII-safe for window registries and host URLs", () => {
+    const tabId = buildLocusAssetInspectorTabId({ assetPath: "Assets/特效 粒子/烟雾.prefab" });
 
-    await openLocusAssetInspectorWindow({
-      kind: "sceneObject",
-      scenePath,
-      objectPath,
-    });
-
-    expect(existingWindow.emit).toHaveBeenCalledWith(
-      LOCUS_ASSET_INSPECTOR_WINDOW_EVENT,
-      {
-        kind: "sceneObject",
-        scenePath,
-        objectPath,
-      },
-    );
-    expect(existingWindow.setFocus).toHaveBeenCalledTimes(1);
-    expect(webviewWindowMocks.createdWindows).toHaveLength(0);
+    expect([...tabId].every((ch) => ch.charCodeAt(0) > 0x20 && ch.charCodeAt(0) < 0x7f)).toBe(true);
+    expect(parseLocusAssetInspectorTabId(tabId)).toEqual({ assetPath: "Assets/特效 粒子/烟雾.prefab" });
   });
 
-  it("creates a frameless child window bound to the current parent window", async () => {
-    webviewWindowMocks.getByLabelMock.mockResolvedValue(null);
+  it("derives tab titles and target paths from the payload", () => {
+    expect(locusAssetInspectorTabTitle({ assetPath })).toBe("Gluecose.prefab");
+    expect(locusAssetInspectorTabTitle({ kind: "sceneObject", scenePath, objectPath })).toBe("cm[1]");
+    expect(locusAssetInspectorTargetPath({ kind: "sceneObject", scenePath, objectPath }))
+      .toBe(`${scenePath}/${objectPath}`);
+    expect(parseLocusAssetInspectorTabId("not-an-inspector-tab")).toBeNull();
+  });
 
+  it("opens inspector tabs through the View host tab system", async () => {
     const opened = await openLocusAssetInspectorWindow({ assetPath });
 
     expect(opened).toBe(true);
-    expect(webviewWindowMocks.createdWindows).toHaveLength(1);
-    const [label, options] = webviewWindowMocks.createdWindows[0] as [string, Record<string, unknown>];
-    expect(label).toBe("locus-asset-inspector");
-    expect(options.parent).toEqual({ label: "main" });
-    expect(options.decorations).toBe(false);
-    expect(options.center).toBe(true);
-    expect(options.shadow).toBe(true);
-    expect(options.resizable).toBe(true);
-    expect(options.closable).toBe(true);
-    expect(options.width).toBe(1040);
-    expect(options.height).toBe(720);
+    expect(viewServiceMocks.viewOpenInspectorTabMock).toHaveBeenCalledTimes(1);
+    expect(viewServiceMocks.viewOpenInspectorTabMock).toHaveBeenCalledWith({
+      tabId: buildLocusAssetInspectorTabId({ assetPath }),
+    });
+  });
+
+  it("opens scene object targets through the View host tab system", async () => {
+    const opened = await openLocusAssetInspectorWindow({
+      kind: "sceneObject",
+      scenePath,
+      objectPath,
+    });
+
+    expect(opened).toBe(true);
+    expect(viewServiceMocks.viewOpenInspectorTabMock).toHaveBeenCalledWith({
+      tabId: buildLocusAssetInspectorTabId({ kind: "sceneObject", scenePath, objectPath }),
+    });
+  });
+
+  it("rejects invalid payloads without touching the backend", async () => {
+    const opened = await openLocusAssetInspectorWindow({ assetPath: "   " });
+
+    expect(opened).toBe(false);
+    expect(viewServiceMocks.viewOpenInspectorTabMock).not.toHaveBeenCalled();
+  });
+
+  it("does nothing without a Tauri window runtime", async () => {
+    tauriRuntimeMocks.hasTauriWindowRuntimeMock.mockReturnValue(false);
+
+    const opened = await openLocusAssetInspectorWindow({ assetPath });
+
+    expect(opened).toBe(false);
+    expect(viewServiceMocks.viewOpenInspectorTabMock).not.toHaveBeenCalled();
   });
 });

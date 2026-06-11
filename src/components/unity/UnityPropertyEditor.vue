@@ -1,20 +1,27 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
 import UnityBoolField from "./UnityBoolField.vue";
+import UnityBoundsField from "./UnityBoundsField.vue";
 import UnityColorField from "./UnityColorField.vue";
+import UnityColorHdrField from "./UnityColorHdrField.vue";
+import UnityCurveField from "./UnityCurveField.vue";
 import UnityEnumField from "./UnityEnumField.vue";
 import UnityFlagsField from "./UnityFlagsField.vue";
+import UnityGradientField from "./UnityGradientField.vue";
 import UnityLayerMaskField from "./UnityLayerMaskField.vue";
 import UnityNumberField from "./UnityNumberField.vue";
 import UnityObjectReferenceField from "./UnityObjectReferenceField.vue";
 import UnityVectorField from "./UnityVectorField.vue";
 import {
+  isUnityBoundsPropertyType,
+  isUnityHdrColorValue,
   isUnityNumberPropertyType,
   isUnityVectorPropertyType,
   normalizeUnityPropertyType,
-  parseUnitySerializedEditValue,
+  tryParseUnitySerializedEditValue,
   unitySerializedValueToEditText,
   type UnitySelectOption,
+  type UnitySerializedPropertyTargetSnapshot,
 } from "./unitySerializedValue";
 
 const props = withDefaults(defineProps<{
@@ -41,6 +48,7 @@ const props = withDefaults(defineProps<{
   maxLines?: number;
   referenceTypeFullName?: string;
   referenceTypeAssembly?: string;
+  bindingTarget?: UnitySerializedPropertyTargetSnapshot | null;
 }>(), {
   propertyType: "String",
   displayValue: "",
@@ -64,6 +72,7 @@ const props = withDefaults(defineProps<{
   maxLines: 0,
   referenceTypeFullName: "",
   referenceTypeAssembly: "",
+  bindingTarget: null,
 });
 
 const emit = defineEmits<{
@@ -79,6 +88,7 @@ const propertyType = computed(() => normalizeUnityPropertyType(props.propertyTyp
 const disabled = computed(() => props.disabled || !props.editable);
 const readonly = computed(() => props.readonly || !props.editable);
 const effectiveTitle = computed(() => props.tooltip || props.title);
+const hdrColor = computed(() => propertyType.value === "Color" && isUnityHdrColorValue(props.modelValue));
 const objectReferencePlaceholder = computed(() => {
   if (props.placeholder) return props.placeholder;
   if (props.referenceTypeFullName) return props.referenceTypeFullName;
@@ -119,11 +129,22 @@ function updateText(event: Event) {
 
 function commitText() {
   if (disabled.value || readonly.value) return;
-  emitCommit(parseUnitySerializedEditValue(propertyType.value, text.value));
+  const parsed = tryParseUnitySerializedEditValue(propertyType.value, text.value);
+  if (!parsed.ok) return;
+  emitCommit(parsed.value);
 }
 
 function blurOnEnter(event: KeyboardEvent) {
   (event.target as HTMLElement | null)?.blur();
+}
+
+function restoreTextOnEscape(event: KeyboardEvent) {
+  const input = event.target as HTMLInputElement | HTMLTextAreaElement | null;
+  const original = unitySerializedValueToEditText(props.propertyType, props.modelValue, props.displayValue);
+  text.value = original;
+  // Sync the DOM value before blurring so the change event does not fire.
+  if (input) input.value = original;
+  input?.blur();
 }
 </script>
 
@@ -206,6 +227,17 @@ function blurOnEnter(event: KeyboardEvent) {
       @edit="emitEdit"
       @commit="emitCommit"
     />
+    <UnityColorHdrField
+      v-else-if="propertyType === 'Color' && hdrColor"
+      :model-value="modelValue"
+      :disabled="disabled"
+      :readonly="readonly"
+      :title="effectiveTitle"
+      :aria-label="ariaLabel"
+      @update:model-value="emitUpdate"
+      @edit="emitEdit"
+      @commit="emitCommit"
+    />
     <UnityColorField
       v-else-if="propertyType === 'Color'"
       :model-value="modelValue"
@@ -216,6 +248,38 @@ function blurOnEnter(event: KeyboardEvent) {
       @update:model-value="emitUpdate"
       @edit="emitEdit"
       @commit="emitCommit"
+    />
+    <UnityBoundsField
+      v-else-if="isUnityBoundsPropertyType(propertyType)"
+      :model-value="modelValue"
+      :property-type="propertyType"
+      :disabled="disabled"
+      :readonly="readonly"
+      :title="effectiveTitle"
+      :aria-label="ariaLabel"
+      @update:model-value="emitUpdate"
+      @edit="emitEdit"
+      @commit="emitCommit"
+    />
+    <UnityCurveField
+      v-else-if="propertyType === 'AnimationCurve'"
+      :model-value="modelValue"
+      :display-value="displayValue"
+      :title="effectiveTitle"
+      :aria-label="ariaLabel"
+      :editable="!disabled && !readonly"
+      :binding-target="bindingTarget"
+      :label="title"
+    />
+    <UnityGradientField
+      v-else-if="propertyType === 'Gradient'"
+      :model-value="modelValue"
+      :display-value="displayValue"
+      :title="effectiveTitle"
+      :aria-label="ariaLabel"
+      :editable="!disabled && !readonly"
+      :binding-target="bindingTarget"
+      :label="title"
     />
     <UnityObjectReferenceField
       v-else-if="propertyType === 'ObjectReference'"
@@ -245,6 +309,23 @@ function blurOnEnter(event: KeyboardEvent) {
       :aria-label="ariaLabel || undefined"
       @input="updateText"
       @change="commitText"
+      @keydown.esc.prevent="restoreTextOnEscape"
+    />
+    <input
+      v-else-if="propertyType === 'Character'"
+      class="unity-text-field unity-char-field"
+      type="text"
+      maxlength="1"
+      :value="text"
+      :disabled="disabled"
+      :readonly="readonly"
+      :placeholder="placeholder"
+      :title="effectiveTitle || undefined"
+      :aria-label="ariaLabel || undefined"
+      @input="updateText"
+      @change="commitText"
+      @keydown.enter.prevent="blurOnEnter"
+      @keydown.esc.prevent="restoreTextOnEscape"
     />
     <input
       v-else
@@ -259,6 +340,7 @@ function blurOnEnter(event: KeyboardEvent) {
       @input="updateText"
       @change="commitText"
       @keydown.enter.prevent="blurOnEnter"
+      @keydown.esc.prevent="restoreTextOnEscape"
     />
   </div>
 </template>
@@ -300,6 +382,10 @@ function blurOnEnter(event: KeyboardEvent) {
   padding-bottom: 5px;
   line-height: 1.4;
   resize: vertical;
+}
+
+.unity-char-field {
+  max-width: 64px;
 }
 
 .unity-text-field:disabled,

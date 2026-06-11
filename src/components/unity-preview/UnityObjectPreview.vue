@@ -188,11 +188,15 @@ import {
   writeUnitySerializedProperty,
   type UnitySerializedPropertyTarget,
 } from "../../services/unitySerializedProperty";
+import { unityPropertyObjectTarget } from "../../services/unityPropertyPath";
+import { listenUnityValueEditorCommitted } from "../../services/unityValueEditorWindow";
+import AssetTextViewer from "../asset/AssetTextViewer.vue";
 import BinaryPreviewHost from "../diff/BinaryPreviewHost.vue";
 import UnityHierarchyPane from "../diff/UnityHierarchyPane.vue";
 import UnityInspectorPane from "../diff/UnityInspectorPane.vue";
 import {
   hasEditableUnityPropertySnapshot,
+  isUnityCodeSourceAssetPath,
   isUnityExternalSourceAssetPath,
   normalizeUnityObjectPreviewModel,
   type UnityObjectPreviewInput,
@@ -413,9 +417,23 @@ const canAutoLoadThumbnail = computed(() => (
   && /^(?:Assets|Packages)(?:\/|$)/i.test(autoPreviewPath.value)
 ));
 const canAutoLoadInteractivePreview = computed(() => canAutoLoadThumbnail.value);
+// Script/shader sources show their highlighted source text in the inspector
+// instead of the serialized object panel. The live property tree only loads
+// as a fallback when the source text turns out to be unavailable.
+const prefersCodeSourcePreview = computed(() => (
+  props.level === "inspector"
+  && objectModel.value.ref.kind === "asset"
+  && objectModel.value.propertyTree == null
+  && isUnityCodeSourceAssetPath(autoPreviewPath.value)
+));
+const codeSourcePreviewUnavailable = computed(() => (
+  !!autoPreviewError.value
+  || (!!previewPayload.value && previewPayload.value.kind !== "text")
+));
 const canAutoLoadLiveProperties = computed(() => (
   props.autoLoadPreview
   && (props.level === "editor" || props.level === "inspector")
+  && (!prefersCodeSourcePreview.value || codeSourcePreviewUnavailable.value)
   && !!liveSerializedTarget.value
 ));
 const effectivePropertyTree = computed<UnityObjectPropertyTreeInput | null>(() =>
@@ -728,10 +746,15 @@ function commitFromUnityEvent(event: UnitySerializedPropertyCommitEvent): Inspec
     disabled: editorPropertyTreeBinding.value.disabled,
     readonly: editorPropertyTreeBinding.value.readonly,
   });
+  // No root fallback: committing a child value onto the root target would
+  // write the wrong property when the event no longer matches the tree.
   const property = tree.getProperty(event.propertyPath)
-    ?? tree.getProperty(event.property.propertyPath)
-    ?? tree.rootProperty;
-  return property ? property.createCommit(event.value) : null;
+    ?? tree.getProperty(event.property.propertyPath);
+  if (!property) {
+    console.warn("[UnityObjectPreview] dropped edit for unknown property path:", event.propertyPath);
+    return null;
+  }
+  return property.createCommit(event.value);
 }
 
 function editorPropertyWriteKey(targetKey: string, propertyPath: string): string {
@@ -1275,8 +1298,25 @@ watch(
   { immediate: true },
 );
 
+// The Locus value editor window owns its own write-back; when it commits to
+// the object shown here, refresh the live property tree in the background.
+let unlistenValueEditor: (() => void) | null = null;
+void listenUnityValueEditorCommitted((event) => {
+  const target = liveSerializedTarget.value;
+  if (!target) return;
+  const eventObjectKey = unitySerializedTargetKey(
+    unityPropertyObjectTarget(event.target) as UnitySerializedPropertyTarget,
+  );
+  if (eventObjectKey !== unitySerializedTargetKey(target)) return;
+  void loadLivePropertyTree(true, { background: true });
+}).then((dispose) => {
+  unlistenValueEditor = dispose;
+});
+
 onBeforeUnmount(() => {
   disposed = true;
+  unlistenValueEditor?.();
+  unlistenValueEditor = null;
   clearEditorWriteFlushFrame();
   if (pendingEditorWrites.size > 0) {
     void flushEditorWrites();
@@ -1585,7 +1625,13 @@ onBeforeUnmount(() => {
     </template>
 
     <template v-else-if="textPayload">
-      <pre v-if="level === 'inspector'" class="unity-object-text-preview">{{ textPayload.snippet }}</pre>
+      <AssetTextViewer
+        v-if="level === 'inspector'"
+        :snippet="textPayload.snippet"
+        :truncated="textPayload.truncated"
+        :total-lines="textPayload.totalLines"
+        :language="textPayload.language"
+      />
       <div v-else class="unity-object-text-summary">
         <UnityObjectIdentity :model="objectModel" mode="row" :draggable="false" />
         <pre class="unity-object-text-lines"><span
@@ -1912,19 +1958,6 @@ onBeforeUnmount(() => {
 
 .unity-object-structured-detail.full-width {
   width: 100%;
-}
-
-.unity-object-text-preview {
-  flex: 1;
-  min-height: 0;
-  margin: 0;
-  padding: 12px;
-  overflow: auto;
-  background: color-mix(in srgb, var(--panel-bg) 86%, var(--bg-color) 14%);
-  color: var(--text-color);
-  font-family: var(--font-mono-block);
-  font-size: 12px;
-  line-height: 1.45;
 }
 
 .unity-object-text-lines {

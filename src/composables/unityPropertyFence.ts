@@ -36,6 +36,7 @@ interface UnityObjectPathParts {
   assetPath: string;
   scenePath: string;
   objectPath: string;
+  fileId: number | null;
   kind: "asset" | "sceneObject" | "prefabObject";
 }
 
@@ -54,7 +55,7 @@ export function parseUnityPropertyFence(source: string): UnityPropertyFenceParse
   if (!trimmed) return { entries: [], issues: [] };
 
   const jsonResult = parseUnityPropertyFenceJson(trimmed);
-  if (jsonResult) return jsonResult;
+  if (jsonResult) return finalizeFenceResult(jsonResult);
 
   const entries: UnityPropertyFenceEntry[] = [];
   const issues: UnityPropertyFenceIssue[] = [];
@@ -80,7 +81,19 @@ export function parseUnityPropertyFence(source: string): UnityPropertyFenceParse
     }
   });
 
-  return { entries, issues };
+  return finalizeFenceResult({ entries, issues });
+}
+
+/**
+ * Prefixes each entry id with its position so duplicate targets (or JSON
+ * arrays whose synthetic line numbers collide with later physical lines)
+ * still get unique, deterministic ids.
+ */
+function finalizeFenceResult(result: UnityPropertyFenceParseResult): UnityPropertyFenceParseResult {
+  return {
+    entries: result.entries.map((entry, index) => ({ ...entry, id: `${index}:${entry.id}` })),
+    issues: result.issues,
+  };
 }
 
 export function groupUnityPropertyFenceItems<TItem>(
@@ -113,6 +126,7 @@ export function groupUnityPropertyFenceItems<TItem>(
 export function unityPropertyFenceTargetBlockKey(target: UnitySerializedPropertyTarget): string {
   return [
     target.kind ?? "",
+    target.guid ?? "",
     target.path ?? "",
     target.scenePath ?? "",
     target.objectPath ?? "",
@@ -340,7 +354,7 @@ function entryFromCompactParts(
 }
 
 function parseUnityObjectPath(source: string): UnityObjectPathParts {
-  const normalized = normalizeUnityPath(source);
+  const { path: normalized, fileId } = extractUnityPathFileId(normalizeUnityPath(source));
   const sceneMatch = normalized.match(SCENE_OBJECT_PATH_RE);
   if (sceneMatch) {
     return {
@@ -348,6 +362,7 @@ function parseUnityObjectPath(source: string): UnityObjectPathParts {
       assetPath: "",
       scenePath: sceneMatch[1],
       objectPath: (sceneMatch[2] || "").replace(/^\/+|\/+$/g, ""),
+      fileId,
       kind: "sceneObject",
     };
   }
@@ -359,6 +374,7 @@ function parseUnityObjectPath(source: string): UnityObjectPathParts {
       assetPath: prefabMatch[1],
       scenePath: "",
       objectPath: (prefabMatch[2] || "").replace(/^\/+|\/+$/g, ""),
+      fileId,
       kind: "prefabObject",
     };
   }
@@ -368,6 +384,7 @@ function parseUnityObjectPath(source: string): UnityObjectPathParts {
     assetPath: normalized,
     scenePath: "",
     objectPath: "",
+    fileId,
     kind: "asset",
   };
 }
@@ -423,11 +440,13 @@ function targetFromCompactParts(
 ): UnitySerializedPropertyTarget | null {
   const propertyPath = selector.propertyPath;
   if (!propertyPath) return null;
+  const objectFileId = objectPath.fileId ?? undefined;
 
   if (selector.targetKind === "asset") {
     return removeEmptyTargetFields({
       kind: "asset",
       path: objectPath.assetPath || objectPath.rawPath,
+      objectFileId,
       propertyPath,
     });
   }
@@ -439,6 +458,7 @@ function targetFromCompactParts(
         kind: "component",
         scenePath: objectPath.scenePath,
         objectPath: objectPath.objectPath,
+        objectFileId,
         componentType: selector.componentType,
         componentIndex: selector.componentIndex,
         propertyPath,
@@ -449,6 +469,7 @@ function targetFromCompactParts(
         kind: "component",
         path: objectPath.assetPath,
         objectPath: objectPath.objectPath,
+        objectFileId,
         componentType: selector.componentType,
         componentIndex: selector.componentIndex,
         propertyPath,
@@ -463,6 +484,7 @@ function targetFromCompactParts(
         kind: "gameObject",
         scenePath: objectPath.scenePath,
         objectPath: objectPath.objectPath,
+        objectFileId,
         propertyPath,
       });
     }
@@ -471,6 +493,7 @@ function targetFromCompactParts(
         kind: "gameObject",
         path: objectPath.assetPath,
         objectPath: objectPath.objectPath,
+        objectFileId,
         propertyPath,
       });
     }
@@ -479,6 +502,7 @@ function targetFromCompactParts(
   return removeEmptyTargetFields({
     kind: "asset",
     path: objectPath.assetPath,
+    objectFileId,
     propertyPath,
   });
 }
@@ -559,8 +583,22 @@ function normalizeUnityPath(source: string): string {
     .trim()
     .replace(/^@/, "")
     .replace(/\\/g, "/")
-    .replace(/#fileID:-?\d+$/i, "")
     .replace(/\/+$/g, "");
+}
+
+/**
+ * Splits a trailing `#fileID:<n>` marker off a compact path and keeps the id
+ * as the target's objectFileId — the most robust way to address duplicate
+ * object names — instead of silently discarding it.
+ */
+function extractUnityPathFileId(source: string): { path: string; fileId: number | null } {
+  const match = source.match(/#fileID:(-?\d+)\s*$/i);
+  if (!match || match.index === undefined) return { path: source, fileId: null };
+  const fileId = Number(match[1]);
+  return {
+    path: source.slice(0, match.index).replace(/\/+$/g, ""),
+    fileId: Number.isSafeInteger(fileId) && fileId !== 0 ? fileId : null,
+  };
 }
 
 function stringField(value: unknown): string {

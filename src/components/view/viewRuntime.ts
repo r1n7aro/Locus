@@ -34,9 +34,13 @@ import {
   type CanvasViewport,
 } from "../canvas";
 import UnityBoolField from "../unity/UnityBoolField.vue";
+import UnityBoundsField from "../unity/UnityBoundsField.vue";
 import UnityColorField from "../unity/UnityColorField.vue";
+import UnityColorHdrField from "../unity/UnityColorHdrField.vue";
+import UnityCurveField from "../unity/UnityCurveField.vue";
 import UnityEnumField from "../unity/UnityEnumField.vue";
 import UnityFlagsField from "../unity/UnityFlagsField.vue";
+import UnityGradientField from "../unity/UnityGradientField.vue";
 import UnityLayerMaskField from "../unity/UnityLayerMaskField.vue";
 import UnityNumberField from "../unity/UnityNumberField.vue";
 import UnityObjectReferenceField from "../unity/UnityObjectReferenceField.vue";
@@ -765,7 +769,7 @@ const UnityDropZone = defineComponent({
   },
 });
 
-const LOCUS_COMPONENTS = {
+export const LOCUS_COMPONENTS = {
   BaseButton,
   BaseCheckbox,
   BaseDropdown,
@@ -775,9 +779,13 @@ const LOCUS_COMPONENTS = {
   GraphView,
   SerializedTableView,
   UnityBoolField,
+  UnityBoundsField,
   UnityColorField,
+  UnityColorHdrField,
+  UnityCurveField,
   UnityEnumField,
   UnityFlagsField,
+  UnityGradientField,
   UnityLayerMaskField,
   UnityNumberField,
   UnityObjectReferenceField,
@@ -1059,7 +1067,7 @@ function createViewPropertyRuntime(api: ViewRuntimeApi, undo: ReturnType<typeof 
   };
 }
 
-const LOCUS_COMPONENT_MODULE = {
+export const LOCUS_COMPONENT_MODULE = {
   ...LOCUS_COMPONENTS,
 };
 

@@ -1085,7 +1085,16 @@ namespace Locus
             return sb.Length == 0 ? "Script" : sb.ToString();
         }
 
+        // Arbitrary view-script results may contain reference cycles, so their
+        // reflection serialization keeps a tight depth cap.
+        private const int ViewScriptResultJsonDepthLimit = 12;
+
         private static string ToJsonValue(object value, int depth)
+        {
+            return ToJsonValue(value, depth, ViewScriptResultJsonDepthLimit, false);
+        }
+
+        private static string ToJsonValue(object value, int depth, int maxDepth, bool schemaSafeTruncation)
         {
             if (value == null)
                 return "null";
@@ -1108,8 +1117,8 @@ namespace Locus
                 return number;
             }
 
-            if (depth > 12)
-                return "\"...\"";
+            if (depth > maxDepth)
+                return TruncatedJsonValue(value, schemaSafeTruncation);
 
             UnityEngine.Object unityObject = value as UnityEngine.Object;
             if (unityObject != null)
@@ -1122,13 +1131,27 @@ namespace Locus
 
             IDictionary dictionary = value as IDictionary;
             if (dictionary != null)
-                return DictionaryToJson(dictionary, depth + 1);
+                return DictionaryToJson(dictionary, depth + 1, maxDepth, schemaSafeTruncation);
 
             IEnumerable enumerable = value as IEnumerable;
             if (enumerable != null)
-                return EnumerableToJson(enumerable, depth + 1);
+                return EnumerableToJson(enumerable, depth + 1, maxDepth, schemaSafeTruncation);
 
-            return ObjectToJson(value, depth + 1);
+            return ObjectToJson(value, depth + 1, maxDepth, schemaSafeTruncation);
+        }
+
+        private static string TruncatedJsonValue(object value, bool schemaSafe)
+        {
+            // Typed consumers (the Rust bridge structs) reject a "..." string
+            // standing in for an object or array, so schema-safe callers get
+            // an empty value of the matching JSON shape instead.
+            if (!schemaSafe)
+                return "\"...\"";
+            if (value is IDictionary)
+                return "{}";
+            if (value is IEnumerable)
+                return "[]";
+            return "null";
         }
 
         private static bool IsJsonNumber(object value)
@@ -1146,7 +1169,7 @@ namespace Locus
                    value is decimal;
         }
 
-        private static string DictionaryToJson(IDictionary dictionary, int depth)
+        private static string DictionaryToJson(IDictionary dictionary, int depth, int maxDepth, bool schemaSafeTruncation)
         {
             var sb = new StringBuilder();
             sb.Append("{");
@@ -1159,13 +1182,13 @@ namespace Locus
                 sb.Append("\"");
                 sb.Append(JsonEscape(Convert.ToString(entry.Key, CultureInfo.InvariantCulture)));
                 sb.Append("\":");
-                sb.Append(ToJsonValue(entry.Value, depth));
+                sb.Append(ToJsonValue(entry.Value, depth, maxDepth, schemaSafeTruncation));
             }
             sb.Append("}");
             return sb.ToString();
         }
 
-        private static string EnumerableToJson(IEnumerable enumerable, int depth)
+        private static string EnumerableToJson(IEnumerable enumerable, int depth, int maxDepth, bool schemaSafeTruncation)
         {
             var sb = new StringBuilder();
             sb.Append("[");
@@ -1175,13 +1198,13 @@ namespace Locus
                 if (!first)
                     sb.Append(",");
                 first = false;
-                sb.Append(ToJsonValue(item, depth));
+                sb.Append(ToJsonValue(item, depth, maxDepth, schemaSafeTruncation));
             }
             sb.Append("]");
             return sb.ToString();
         }
 
-        private static string ObjectToJson(object value, int depth)
+        private static string ObjectToJson(object value, int depth, int maxDepth, bool schemaSafeTruncation)
         {
             var sb = new StringBuilder();
             sb.Append("{");
@@ -1196,7 +1219,7 @@ namespace Locus
                 sb.Append("\"");
                 sb.Append(JsonEscape(field.Name));
                 sb.Append("\":");
-                sb.Append(ToJsonValue(field.GetValue(value), depth));
+                sb.Append(ToJsonValue(field.GetValue(value), depth, maxDepth, schemaSafeTruncation));
             }
 
             foreach (PropertyInfo property in type.GetProperties(BindingFlags.Public | BindingFlags.Instance))
@@ -1219,7 +1242,7 @@ namespace Locus
                 {
                     propertyValue = null;
                 }
-                sb.Append(ToJsonValue(propertyValue, depth));
+                sb.Append(ToJsonValue(propertyValue, depth, maxDepth, schemaSafeTruncation));
             }
 
             if (first)

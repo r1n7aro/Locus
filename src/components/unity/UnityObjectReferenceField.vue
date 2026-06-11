@@ -1,8 +1,10 @@
 <script setup lang="ts">
+import { Ban, Check, X } from "lucide";
 import { computed, nextTick, onBeforeUnmount, ref, watch } from "vue";
-import { searchWorkspaceAssets } from "../../services/asset";
+import { previewWorkspaceAssetThumbnail, searchWorkspaceAssets } from "../../services/asset";
 import {
   filterUnityObjectReferenceSearchResults,
+  normalizeUnityObjectReferencePath,
   unityObjectReferenceAssetKey,
   unityObjectReferenceDisplayParts,
   unityObjectReferenceSearchQuery,
@@ -12,7 +14,12 @@ import {
   type UnityObjectReferenceFilter,
 } from "../../services/unityObjectReferencePicker";
 import type { AssetSearchResult } from "../../types";
+import LucideIcon from "../icons/LucideIcon.vue";
+import { unityAssetIconClassForPath, unityAssetIconNodeForPath } from "../icons/unityAssetIcons";
+import { t } from "../../i18n";
 import { unitySerializedValueToEditText } from "./unitySerializedValue";
+
+let objectReferenceFieldUid = 0;
 
 const props = withDefaults(defineProps<{
   modelValue: unknown;
@@ -45,6 +52,8 @@ const emit = defineEmits<{
   commit: [value: string];
 }>();
 
+const fieldUid = `unity-object-reference-${++objectReferenceFieldUid}`;
+const listboxId = `${fieldUid}-listbox`;
 const displayText = ref(unitySerializedValueToEditText("ObjectReference", props.modelValue, props.displayValue));
 const searchText = ref("");
 const open = ref(false);
@@ -52,8 +61,10 @@ const focused = ref(false);
 const searching = ref(false);
 const searchError = ref("");
 const results = ref<AssetSearchResult[]>([]);
+// Highlight index over the combined option list: 0 = None, 1..n = results.
 const highlightedIndex = ref(-1);
 const rootEl = ref<HTMLElement | null>(null);
+const displayEl = ref<HTMLButtonElement | null>(null);
 const searchInputEl = ref<HTMLInputElement | null>(null);
 let debounceTimer: number | null = null;
 let blurTimer: number | null = null;
@@ -62,6 +73,43 @@ let searchRun = 0;
 const editable = computed(() => !props.disabled && !props.readonly);
 const typeHint = computed(() => unityObjectReferenceTypeHint(props.referenceTypeFullName));
 const displayParts = computed(() => unityObjectReferenceDisplayParts(displayText.value));
+const hasCurrentValue = computed(() => normalizeUnityObjectReferencePath(displayText.value).length > 0);
+
+// Small inline thumbnail for visual asset references (textures, materials,
+// prefabs). Results are cached per path for the window's lifetime.
+const THUMBNAIL_PATH_RE =
+  /^((?:Assets|Packages)\/.+?\.(?:png|jpg|jpeg|tga|psd|gif|bmp|webp|exr|hdr|mat|prefab))(?:\/|$)/i;
+const thumbnailCache = new Map<string, Promise<string>>();
+const thumbnailUrl = ref("");
+let thumbnailRun = 0;
+
+const thumbnailPath = computed(() => {
+  const match = THUMBNAIL_PATH_RE.exec(displayText.value.trim().replace(/\\/g, "/"));
+  return match?.[1] ?? "";
+});
+
+function loadReferenceThumbnail(path: string): Promise<string> {
+  const cached = thumbnailCache.get(path);
+  if (cached) return cached;
+  const request = previewWorkspaceAssetThumbnail(path)
+    .then((thumbnail) => thumbnail.url || "")
+    .catch(() => "");
+  thumbnailCache.set(path, request);
+  return request;
+}
+
+watch(
+  thumbnailPath,
+  async (path) => {
+    const run = ++thumbnailRun;
+    thumbnailUrl.value = "";
+    if (!path) return;
+    const url = await loadReferenceThumbnail(path);
+    if (run !== thumbnailRun) return;
+    thumbnailUrl.value = url;
+  },
+  { immediate: true },
+);
 const filter = computed<UnityObjectReferenceFilter>(() => ({
   referenceTypeFullName: props.referenceTypeFullName,
   referenceTypeAssembly: props.referenceTypeAssembly,
@@ -79,13 +127,17 @@ const dropdownEl = ref<HTMLElement | null>(null);
 const dropdownPosition = ref({
   left: 0,
   top: 0,
+  bottom: 0,
   width: 0,
   maxHeight: 246,
   placement: "bottom" as "bottom" | "top",
 });
+// Top placement anchors the dropdown's bottom edge to the field so the panel
+// stays attached when the option list is shorter than maxHeight.
 const dropdownStyle = computed(() => ({
   left: `${dropdownPosition.value.left}px`,
-  top: `${dropdownPosition.value.top}px`,
+  top: dropdownPosition.value.placement === "top" ? "auto" : `${dropdownPosition.value.top}px`,
+  bottom: dropdownPosition.value.placement === "top" ? `${dropdownPosition.value.bottom}px` : "auto",
   width: `${dropdownPosition.value.width}px`,
   maxHeight: `${dropdownPosition.value.maxHeight}px`,
   "--unity-object-reference-dropdown-origin": dropdownPosition.value.placement === "top" ? "bottom left" : "top left",
@@ -176,13 +228,16 @@ function updateDropdownPosition() {
     DROPDOWN_MIN_HEIGHT,
     Math.min(DROPDOWN_MAX_HEIGHT, Math.max(DROPDOWN_MIN_HEIGHT, availableHeight)),
   );
-  const top = placement === "top"
-    ? Math.max(DROPDOWN_MARGIN, rect.top - DROPDOWN_GAP - maxHeight)
-    : Math.min(rect.bottom + DROPDOWN_GAP, viewport.height - DROPDOWN_MARGIN - maxHeight);
+  const top = Math.min(rect.bottom + DROPDOWN_GAP, viewport.height - DROPDOWN_MARGIN - maxHeight);
+  const bottom = Math.max(
+    DROPDOWN_MARGIN,
+    Math.min(viewport.height - rect.top + DROPDOWN_GAP, viewport.height - DROPDOWN_MARGIN - maxHeight),
+  );
 
   dropdownPosition.value = {
     left,
     top,
+    bottom,
     width,
     maxHeight,
     placement,
@@ -247,6 +302,12 @@ function focusSearchInput() {
   });
 }
 
+function focusDisplay() {
+  void nextTick(() => {
+    displayEl.value?.focus();
+  });
+}
+
 function scheduleBlurCheck() {
   clearBlurTimer();
   blurTimer = window.setTimeout(() => {
@@ -287,7 +348,7 @@ async function runSearch() {
     results.value = [];
     searching.value = false;
     searchError.value = "";
-    highlightedIndex.value = -1;
+    highlightedIndex.value = 0;
     return;
   }
   searching.value = true;
@@ -296,7 +357,13 @@ async function runSearch() {
     const rawResults = await searchWorkspaceAssets(query, searchRoots.value, props.searchLimit * 3);
     if (run !== searchRun) return;
     results.value = filterUnityObjectReferenceSearchResults(rawResults, filter.value);
-    highlightedIndex.value = results.value.length > 0 ? 0 : -1;
+    // Land the highlight on the current reference when browsing without a
+    // query; a typed query highlights the best match for Enter-to-select.
+    const currentIndex = searchText.value.trim() ? -1 : results.value.findIndex(isCurrentResult);
+    highlightedIndex.value = currentIndex >= 0
+      ? currentIndex + 1
+      : results.value.length > 0 ? 1 : 0;
+    scrollHighlightedIntoView();
   } catch (error) {
     if (run !== searchRun) return;
     results.value = [];
@@ -307,6 +374,32 @@ async function runSearch() {
   }
 }
 
+function isCurrentResult(result: AssetSearchResult): boolean {
+  const current = normalizeUnityObjectReferencePath(displayText.value);
+  return !!current && unityObjectReferenceValueForSearchResult(result) === current;
+}
+
+// Sub-assets render the icon of their container asset (e.g. a Mesh inside an
+// .fbx), which reads better than a generic file glyph.
+function resultIconNode(result: AssetSearchResult) {
+  return unityAssetIconNodeForPath(result.path, { isFolder: false, fallbackKind: "asset" });
+}
+
+function resultIconClass(result: AssetSearchResult): string {
+  return unityAssetIconClassForPath(result.path, { isFolder: false, fallbackKind: "asset" });
+}
+
+function optionId(index: number): string {
+  return `${fieldUid}-option-${index}`;
+}
+
+function scrollHighlightedIntoView() {
+  void nextTick(() => {
+    if (!open.value || highlightedIndex.value < 0) return;
+    document.getElementById(optionId(highlightedIndex.value))?.scrollIntoView({ block: "nearest" });
+  });
+}
+
 function selectResult(result: AssetSearchResult) {
   if (!editable.value) return;
   const value = unityObjectReferenceValueForSearchResult(result);
@@ -315,6 +408,7 @@ function selectResult(result: AssetSearchResult) {
   emit("update:modelValue", value);
   emit("commit", value);
   closeDropdown();
+  focusDisplay();
 }
 
 function clearReference() {
@@ -324,6 +418,7 @@ function clearReference() {
   emit("update:modelValue", "");
   emit("commit", "");
   closeDropdown();
+  focusDisplay();
 }
 
 function moveHighlight(delta: number) {
@@ -331,11 +426,12 @@ function moveHighlight(delta: number) {
     beginEdit();
     return;
   }
-  if (!results.value.length) return;
+  const count = results.value.length + 1;
   const next = highlightedIndex.value < 0
-    ? 0
-    : (highlightedIndex.value + delta + results.value.length) % results.value.length;
+    ? (delta > 0 ? 0 : count - 1)
+    : (highlightedIndex.value + delta + count) % count;
   highlightedIndex.value = next;
+  scrollHighlightedIntoView();
 }
 
 function handleDisplayKeydown(event: KeyboardEvent) {
@@ -365,16 +461,19 @@ function handleSearchKeydown(event: KeyboardEvent) {
   }
   if (event.key === "Escape") {
     closeDropdown();
+    focusDisplay();
     event.preventDefault();
     return;
   }
   if (event.key === "Enter") {
-    if (open.value && highlightedIndex.value >= 0 && results.value[highlightedIndex.value]) {
-      selectResult(results.value[highlightedIndex.value]);
-      event.preventDefault();
+    event.preventDefault();
+    if (!open.value) return;
+    if (highlightedIndex.value === 0) {
+      clearReference();
       return;
     }
-    event.preventDefault();
+    const result = results.value[highlightedIndex.value - 1];
+    if (result) selectResult(result);
   }
 }
 </script>
@@ -386,9 +485,12 @@ function handleSearchKeydown(event: KeyboardEvent) {
     :class="{ focused, disabled: disabled || readonly }"
   >
     <button
+      ref="displayEl"
       class="unity-object-reference-display"
       type="button"
       :disabled="disabled"
+      aria-haspopup="listbox"
+      :aria-expanded="dropdownVisible ? 'true' : 'false'"
       :aria-disabled="readonly ? 'true' : undefined"
       :title="displayText || title || undefined"
       :aria-label="ariaLabel || undefined"
@@ -398,6 +500,13 @@ function handleSearchKeydown(event: KeyboardEvent) {
       @keydown="handleDisplayKeydown"
     >
       <span v-if="displayText" class="unity-object-reference-display-content">
+        <img
+          v-if="thumbnailUrl"
+          class="unity-object-reference-thumb"
+          :src="thumbnailUrl"
+          alt=""
+          @error="thumbnailUrl = ''"
+        />
         <span class="unity-object-reference-display-name">{{ displayParts.name }}</span>
       </span>
       <span v-else class="unity-object-reference-placeholder">{{ placeholder }}</span>
@@ -406,12 +515,12 @@ function handleSearchKeydown(event: KeyboardEvent) {
       v-if="displayText && editable"
       class="unity-object-reference-clear"
       type="button"
-      title="None"
-      aria-label="None"
+      :title="t('unity.objectReference.clear')"
+      :aria-label="t('unity.objectReference.clear')"
       @mousedown.prevent
       @click="clearReference"
     >
-      x
+      <LucideIcon :icon="X" :size="12" />
     </button>
   </div>
 
@@ -422,54 +531,88 @@ function handleSearchKeydown(event: KeyboardEvent) {
       class="unity-object-reference-dropdown"
       role="dialog"
       :style="dropdownStyle"
-      :aria-label="`${typeHint} assets`"
+      :aria-label="t('unity.objectReference.dialogLabel', typeHint)"
     >
       <div class="unity-object-reference-search">
         <input
           ref="searchInputEl"
           class="unity-object-reference-search-input"
           type="text"
+          role="combobox"
+          aria-expanded="true"
+          :aria-controls="listboxId"
+          :aria-activedescendant="highlightedIndex >= 0 ? optionId(highlightedIndex) : undefined"
           :value="searchText"
-          :placeholder="`Search ${typeHint}`"
-          :aria-label="`Search ${typeHint}`"
+          :placeholder="t('unity.objectReference.search', typeHint)"
+          :aria-label="t('unity.objectReference.search', typeHint)"
           autocomplete="off"
+          spellcheck="false"
           @input="updateSearchText"
           @keydown="handleSearchKeydown"
           @blur="scheduleBlurCheck"
         />
       </div>
-      <button
-        type="button"
-        class="unity-object-reference-option unity-object-reference-none"
-        @mousedown.prevent
-        @click="clearReference"
-      >
-        <span class="unity-object-reference-option-name">None</span>
-        <span class="unity-object-reference-option-path">{{ typeHint }}</span>
-      </button>
-      <div v-if="searching" class="unity-object-reference-state">Loading...</div>
-      <div v-else-if="searchError" class="unity-object-reference-state">{{ searchError }}</div>
-      <div v-else-if="showEmpty" class="unity-object-reference-state">No matches</div>
-      <button
-        v-for="(result, index) in results"
-        :key="unityObjectReferenceAssetKey(result)"
-        type="button"
-        class="unity-object-reference-option"
-        :class="{ highlighted: highlightedIndex === index }"
-        :title="unityObjectReferenceValueForSearchResult(result)"
-        :aria-selected="highlightedIndex === index"
-        @mousedown.prevent
-        @mouseenter="highlightedIndex = index"
-        @click="selectResult(result)"
-      >
-        <span class="unity-object-reference-option-main">
-          <span class="unity-object-reference-option-name">{{ result.name }}</span>
-          <span class="unity-object-reference-option-kind">{{ result.typeLabel || result.kind }}</span>
-        </span>
-        <span class="unity-object-reference-option-path">
-          {{ unityObjectReferenceValueForSearchResult(result) }}
-        </span>
-      </button>
+      <div :id="listboxId" class="unity-object-reference-options" role="listbox">
+        <button
+          :id="optionId(0)"
+          type="button"
+          class="unity-object-reference-option unity-object-reference-none"
+          :class="{ highlighted: highlightedIndex === 0, current: !hasCurrentValue }"
+          role="option"
+          :aria-selected="!hasCurrentValue"
+          @mousedown.prevent
+          @mouseenter="highlightedIndex = 0"
+          @click="clearReference"
+        >
+          <span class="unity-object-reference-option-icon">
+            <LucideIcon :icon="Ban" :size="13" />
+          </span>
+          <span class="unity-object-reference-option-main">
+            <span class="unity-object-reference-option-name">{{ t("unity.objectReference.none") }}</span>
+            <LucideIcon
+              v-if="!hasCurrentValue"
+              class="unity-object-reference-option-check"
+              :icon="Check"
+              :size="13"
+            />
+          </span>
+          <span class="unity-object-reference-option-path">{{ typeHint }}</span>
+        </button>
+        <div v-if="searching" class="unity-object-reference-state">{{ t("unity.objectReference.loading") }}</div>
+        <div v-else-if="searchError" class="unity-object-reference-state">{{ searchError }}</div>
+        <div v-else-if="showEmpty" class="unity-object-reference-state">{{ t("unity.objectReference.noMatches") }}</div>
+        <button
+          v-for="(result, index) in results"
+          :id="optionId(index + 1)"
+          :key="unityObjectReferenceAssetKey(result)"
+          type="button"
+          class="unity-object-reference-option"
+          :class="{ highlighted: highlightedIndex === index + 1, current: isCurrentResult(result) }"
+          role="option"
+          :aria-selected="isCurrentResult(result)"
+          :title="unityObjectReferenceValueForSearchResult(result)"
+          @mousedown.prevent
+          @mouseenter="highlightedIndex = index + 1"
+          @click="selectResult(result)"
+        >
+          <span class="unity-object-reference-option-icon">
+            <LucideIcon :icon="resultIconNode(result)" :size="13" :class="resultIconClass(result)" />
+          </span>
+          <span class="unity-object-reference-option-main">
+            <span class="unity-object-reference-option-name">{{ result.name }}</span>
+            <span class="unity-object-reference-option-kind">{{ result.typeLabel || result.kind }}</span>
+            <LucideIcon
+              v-if="isCurrentResult(result)"
+              class="unity-object-reference-option-check"
+              :icon="Check"
+              :size="13"
+            />
+          </span>
+          <span class="unity-object-reference-option-path">
+            {{ unityObjectReferenceValueForSearchResult(result) }}
+          </span>
+        </button>
+      </div>
     </div>
   </Teleport>
 </template>
@@ -522,7 +665,19 @@ function handleSearchKeydown(event: KeyboardEvent) {
 .unity-object-reference-display-content {
   width: 100%;
   min-width: 0;
-  display: block;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.unity-object-reference-thumb {
+  flex-shrink: 0;
+  width: 18px;
+  height: 18px;
+  border-radius: 3px;
+  border: 1px solid color-mix(in srgb, var(--border-color) 70%, transparent);
+  object-fit: cover;
+  background: var(--panel-bg);
 }
 
 .unity-object-reference-display-name,
@@ -551,6 +706,9 @@ function handleSearchKeydown(event: KeyboardEvent) {
   height: 22px;
   margin-right: 2px;
   padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   border: 0;
   border-radius: 4px;
   background: transparent;
@@ -569,7 +727,9 @@ function handleSearchKeydown(event: KeyboardEvent) {
   position: fixed;
   z-index: 1000;
   max-height: 246px;
-  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
   border: 1px solid var(--border-strong);
   border-radius: 7px;
   background: var(--surface-elevated, var(--panel-bg));
@@ -587,6 +747,7 @@ function handleSearchKeydown(event: KeyboardEvent) {
 }
 
 .unity-object-reference-search {
+  flex-shrink: 0;
   padding: 6px;
   border-bottom: 1px solid color-mix(in srgb, var(--border-color) 72%, transparent);
 }
@@ -611,6 +772,13 @@ function handleSearchKeydown(event: KeyboardEvent) {
   border-color: var(--accent-color);
 }
 
+.unity-object-reference-options {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+
 .unity-object-reference-option,
 .unity-object-reference-state {
   width: 100%;
@@ -629,7 +797,10 @@ function handleSearchKeydown(event: KeyboardEvent) {
 
 .unity-object-reference-option {
   display: grid;
-  gap: 2px;
+  grid-template-columns: 18px minmax(0, 1fr);
+  column-gap: 6px;
+  row-gap: 2px;
+  align-items: center;
   cursor: pointer;
 }
 
@@ -642,11 +813,30 @@ function handleSearchKeydown(event: KeyboardEvent) {
   border-bottom: 0;
 }
 
+.unity-object-reference-option-icon {
+  grid-row: 1 / span 2;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-secondary);
+}
+
+.unity-object-reference-option-main,
+.unity-object-reference-option-path {
+  grid-column: 2;
+}
+
 .unity-object-reference-option-main {
   min-width: 0;
   display: flex;
   align-items: center;
   gap: 8px;
+}
+
+.unity-object-reference-option-check {
+  flex-shrink: 0;
+  margin-left: auto;
+  color: var(--accent-color);
 }
 
 .unity-object-reference-option-name,
@@ -661,6 +851,10 @@ function handleSearchKeydown(event: KeyboardEvent) {
 .unity-object-reference-option-name {
   color: var(--text-color);
   font-weight: 600;
+}
+
+.unity-object-reference-option.current .unity-object-reference-option-name {
+  color: var(--accent-color);
 }
 
 .unity-object-reference-option-kind {

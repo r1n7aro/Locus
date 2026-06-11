@@ -184,8 +184,23 @@ fn validate_property_target(target: &UnitySerializedPropertyTarget) -> Result<()
 }
 
 fn validate_object_target(target: &UnitySerializedPropertyTarget) -> Result<(), String> {
-    if target.kind.trim().is_empty() {
+    let kind = target.kind.trim();
+    if kind.is_empty() {
         return Err("Unity serialized property target kind cannot be empty.".to_string());
+    }
+    // Asset targets are meaningless without a locator; reject early instead of
+    // round-tripping to the Unity bridge. Other kinds (e.g. selection-relative
+    // component targets) may legitimately omit every path field.
+    if kind.eq_ignore_ascii_case("asset") {
+        let has_locator = [target.guid.as_deref(), target.path.as_deref()]
+            .into_iter()
+            .flatten()
+            .any(|value| !value.trim().is_empty());
+        if !has_locator {
+            return Err(
+                "Unity serialized property asset target requires a path or guid.".to_string(),
+            );
+        }
     }
     if matches!(target.component_index, Some(index) if index < 0) {
         return Err(

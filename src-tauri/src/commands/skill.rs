@@ -120,6 +120,31 @@ pub struct SkillPackageUnityCapability {
     pub api: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillPackageUnityYamlReadExtensionMatch {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub script_guids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub class_ids: Vec<i32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillPackageUnityYamlReadExtension {
+    #[serde(default)]
+    pub name: String,
+    #[serde(rename = "match", default)]
+    pub matcher: SkillPackageUnityYamlReadExtensionMatch,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+}
+
 fn default_tool_parameters() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
@@ -206,6 +231,8 @@ pub struct SkillPackageManifestFile {
     pub capabilities: SkillPackageCapabilities,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<SkillPackageToolManifest>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unity_yaml_read_extensions: Vec<SkillPackageUnityYamlReadExtension>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -917,6 +944,9 @@ fn normalize_package_manifest(
     for tool in manifest.tools.iter_mut() {
         normalize_package_tool_manifest(tool)?;
     }
+    for extension in manifest.unity_yaml_read_extensions.iter_mut() {
+        normalize_package_unity_yaml_read_extension(extension)?;
+    }
     Ok(manifest)
 }
 
@@ -1048,6 +1078,87 @@ fn normalize_package_tool_manifest(tool: &mut SkillPackageToolManifest) -> Resul
         return Err(format!(
             "Skill package tool '{}' parameters must be a JSON object schema",
             tool.name
+        ));
+    }
+
+    Ok(())
+}
+
+fn normalize_package_unity_yaml_read_extension(
+    extension: &mut SkillPackageUnityYamlReadExtension,
+) -> Result<(), String> {
+    extension.path = normalize_package_rel_path(&extension.path)?;
+    if !extension.path.to_ascii_lowercase().ends_with(".cs") {
+        return Err(format!(
+            "Skill package unityYamlReadExtensions entry '{}' requires a .cs path",
+            if extension.name.trim().is_empty() {
+                extension.path.as_str()
+            } else {
+                extension.name.trim()
+            }
+        ));
+    }
+
+    let file_stem = Path::new(&extension.path)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .map(str::to_string)
+        .filter(|value| !value.is_empty());
+
+    extension.name = extension.name.trim().to_string();
+    if extension.name.is_empty() {
+        extension.name = file_stem.clone().unwrap_or_default();
+    }
+    extension.description = extension.description.trim().to_string();
+    extension.entry_type = extension
+        .entry_type
+        .take()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or(file_stem);
+    if extension.entry_type.is_none() {
+        return Err(format!(
+            "Skill package unityYamlReadExtensions entry '{}' cannot infer entryType from path '{}'",
+            extension.name, extension.path
+        ));
+    }
+    extension.method = extension
+        .method
+        .take()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| Some("Read".to_string()));
+
+    let mut script_guids = Vec::new();
+    for guid in extension.matcher.script_guids.drain(..) {
+        let normalized = guid.trim().to_ascii_lowercase();
+        if normalized.is_empty() {
+            continue;
+        }
+        if crate::asset_db::types::parse_guid_hex(&normalized).is_none() {
+            return Err(format!(
+                "Skill package unityYamlReadExtensions entry '{}' has invalid scriptGuid '{}'",
+                extension.name, guid
+            ));
+        }
+        if !script_guids.contains(&normalized) {
+            script_guids.push(normalized);
+        }
+    }
+    extension.matcher.script_guids = script_guids;
+
+    let mut class_ids = Vec::new();
+    for class_id in extension.matcher.class_ids.drain(..) {
+        if !class_ids.contains(&class_id) {
+            class_ids.push(class_id);
+        }
+    }
+    extension.matcher.class_ids = class_ids;
+
+    if extension.matcher.script_guids.is_empty() && extension.matcher.class_ids.is_empty() {
+        return Err(format!(
+            "Skill package unityYamlReadExtensions entry '{}' requires match.scriptGuids or match.classIds",
+            extension.name
         ));
     }
 
@@ -3061,6 +3172,12 @@ fn package_unity_script_rel_paths(record: &SkillPackageRecord) -> Result<Vec<Str
         }
     }
 
+    for extension in &record.manifest.unity_yaml_read_extensions {
+        if extension.path.to_ascii_lowercase().ends_with(".cs") {
+            paths.insert(normalize_package_rel_path(&extension.path)?);
+        }
+    }
+
     let unity_editor_root = record.root.join("unity").join("Editor");
     if unity_editor_root.is_dir() {
         for entry in WalkDir::new(&unity_editor_root)
@@ -3157,6 +3274,150 @@ fn skill_package_unity_script_bundle_for_record(
             "scripts": scripts,
         }),
     }))
+}
+
+#[derive(Debug, Clone)]
+pub struct UnityYamlReadExtensionDocKey {
+    pub file_id: i64,
+    pub class_id: i32,
+    pub script_guid_hex: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedUnityYamlReadExtension {
+    pub package_id: String,
+    pub extension_name: String,
+    pub entry_type: String,
+    pub method: String,
+    pub plugin_id: Option<String>,
+    pub matched_class_id: i32,
+    pub matched_script_guid: Option<String>,
+    pub matched_file_id: i64,
+}
+
+pub(crate) fn find_unity_yaml_read_extension_for_working_dir(
+    working_dir: &str,
+    docs: &[UnityYamlReadExtensionDocKey],
+) -> Option<ResolvedUnityYamlReadExtension> {
+    if docs.is_empty() {
+        return None;
+    }
+
+    let records = list_skill_packages_sync_for_working_dir(working_dir);
+    let mut guid_index: std::collections::HashMap<&str, (usize, usize)> =
+        std::collections::HashMap::new();
+    let mut class_index: std::collections::HashMap<i32, (usize, usize)> =
+        std::collections::HashMap::new();
+    for (record_idx, record) in records.iter().enumerate() {
+        for (extension_idx, extension) in record
+            .manifest
+            .unity_yaml_read_extensions
+            .iter()
+            .enumerate()
+        {
+            for guid in &extension.matcher.script_guids {
+                guid_index
+                    .entry(guid.as_str())
+                    .or_insert((record_idx, extension_idx));
+            }
+            for class_id in &extension.matcher.class_ids {
+                class_index
+                    .entry(*class_id)
+                    .or_insert((record_idx, extension_idx));
+            }
+        }
+    }
+    if guid_index.is_empty() && class_index.is_empty() {
+        return None;
+    }
+
+    let resolve = |record_idx: usize,
+                   extension_idx: usize,
+                   doc: &UnityYamlReadExtensionDocKey|
+     -> ResolvedUnityYamlReadExtension {
+        let record = &records[record_idx];
+        let extension = &record.manifest.unity_yaml_read_extensions[extension_idx];
+        ResolvedUnityYamlReadExtension {
+            package_id: record.manifest.id.clone(),
+            extension_name: extension.name.clone(),
+            entry_type: extension
+                .entry_type
+                .clone()
+                .unwrap_or_else(|| extension.name.clone()),
+            method: extension
+                .method
+                .clone()
+                .unwrap_or_else(|| "Read".to_string()),
+            plugin_id: record.plugin_id.clone(),
+            matched_class_id: doc.class_id,
+            matched_script_guid: doc.script_guid_hex.clone(),
+            matched_file_id: doc.file_id,
+        }
+    };
+
+    // Script GUID matches are more specific than class id matches, so resolve
+    // them across all documents first.
+    for doc in docs {
+        if let Some(guid) = doc.script_guid_hex.as_deref() {
+            if let Some(&(record_idx, extension_idx)) = guid_index.get(guid) {
+                return Some(resolve(record_idx, extension_idx, doc));
+            }
+        }
+    }
+    for doc in docs {
+        if let Some(&(record_idx, extension_idx)) = class_index.get(&doc.class_id) {
+            return Some(resolve(record_idx, extension_idx, doc));
+        }
+    }
+    None
+}
+
+pub(crate) async fn run_unity_yaml_read_extension(
+    project_path: &str,
+    extension: &ResolvedUnityYamlReadExtension,
+    args: &serde_json::Value,
+) -> Result<String, String> {
+    let record = find_skill_package_for_working_dir(project_path, &extension.package_id)?;
+    let bundle = skill_package_unity_script_bundle_for_record(&record)?.ok_or_else(|| {
+        format!(
+            "Skill package '{}' has no Unity C# scripts to compile",
+            extension.package_id
+        )
+    })?;
+    let compile_raw =
+        crate::unity_bridge::compile_skill_package(project_path, &bundle.request).await?;
+    let compile_json = serde_json::from_str::<serde_json::Value>(&compile_raw)
+        .map_err(|error| format!("Failed to parse Skill C# compile response: {}", error))?;
+    crate::unity_bridge::update_unity_type_index_after_skill_package_compile(
+        project_path,
+        &compile_json,
+    )
+    .await?;
+
+    let assembly_id = compile_json
+        .get("assemblyId")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .trim();
+    if assembly_id.is_empty() {
+        return Err("Skill package compile response is missing assemblyId".to_string());
+    }
+    let payload = skill_package_invoke_payload(
+        &extension.package_id,
+        Some(assembly_id),
+        &extension.entry_type,
+        &extension.method,
+        args,
+    )?;
+    let raw = crate::unity_bridge::invoke_skill_package(project_path, &payload).await?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(format!(
+            "Skill package yaml-read extension '{}' returned empty output",
+            extension.extension_name
+        ));
+    }
+    Ok(trimmed.to_string())
 }
 
 fn package_to_list_item(
@@ -3920,6 +4181,7 @@ fn create_skill_package_in_parent_sync_with_default_namespace(
             }),
             capabilities: SkillPackageCapabilities::default(),
             tools: Vec::new(),
+            unity_yaml_read_extensions: Vec::new(),
         };
         let manifest_json = serde_json::to_string_pretty(&manifest)
             .map_err(|e| format!("Failed to render Skill package manifest: {}", e))?;
@@ -5113,6 +5375,148 @@ Create a project skill.
             super::delete_skill_package_sync(&working_dir, "com.example.plugin-asset-audit")
                 .expect_err("plugin skill package should be removed through plugin uninstall");
         assert!(delete_error.contains("managed by plugin"));
+    }
+
+    #[test]
+    fn unity_yaml_read_extension_manifest_normalizes_defaults() {
+        let manifest: SkillPackageManifestFile = serde_json::from_str(
+            r#"{
+  "schema": "locus.skill.v1",
+  "id": "yaml-readers",
+  "name": "Yaml Readers",
+  "unityYamlReadExtensions": [
+    {
+      "match": { "scriptGuids": ["0123456789ABCDEF0123456789abcdef", "0123456789abcdef0123456789abcdef"] },
+      "path": "unity/Editor/DialogueAssetReader.cs"
+    }
+  ]
+}"#,
+        )
+        .unwrap();
+        let normalized =
+            super::normalize_package_manifest(manifest, &PathBuf::from("pkg")).unwrap();
+        let extension = &normalized.unity_yaml_read_extensions[0];
+        assert_eq!(extension.name, "DialogueAssetReader");
+        assert_eq!(extension.entry_type.as_deref(), Some("DialogueAssetReader"));
+        assert_eq!(extension.method.as_deref(), Some("Read"));
+        assert_eq!(
+            extension.matcher.script_guids,
+            vec!["0123456789abcdef0123456789abcdef".to_string()]
+        );
+
+        let missing_match: SkillPackageManifestFile = serde_json::from_str(
+            r#"{
+  "schema": "locus.skill.v1",
+  "id": "yaml-readers",
+  "name": "Yaml Readers",
+  "unityYamlReadExtensions": [
+    { "match": {}, "path": "unity/Editor/Reader.cs" }
+  ]
+}"#,
+        )
+        .unwrap();
+        let error = super::normalize_package_manifest(missing_match, &PathBuf::from("pkg"))
+            .expect_err("matcher-less extension should fail validation");
+        assert!(error.contains("match.scriptGuids or match.classIds"));
+    }
+
+    #[test]
+    fn unity_yaml_read_extension_matching_prefers_script_guid_over_class_id() {
+        let temp = TempDir::new().unwrap();
+        let working_dir = temp.path().to_string_lossy().to_string();
+        let plugin_root = temp
+            .path()
+            .join("Locus")
+            .join("plugins")
+            .join("com.example.yaml-readers");
+        let skill_root = plugin_root.join("skills").join("yaml-readers");
+        std::fs::create_dir_all(&skill_root).unwrap();
+        std::fs::write(
+            plugin_root.join(crate::plugin::PLUGIN_MANIFEST_FILE_NAME),
+            r#"{
+  "schemaVersion": 1,
+  "id": "com.example.yaml-readers",
+  "name": "Yaml Readers",
+  "version": "0.1.0",
+  "components": {
+    "skills": [{ "id": "yaml-readers", "path": "skills/yaml-readers" }]
+  }
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            skill_root.join("skill.json"),
+            r#"{
+  "schema": "locus.skill.v1",
+  "id": "com.example.yaml-readers",
+  "version": "0.1.0",
+  "name": "Yaml Readers",
+  "unityYamlReadExtensions": [
+    {
+      "name": "by-class",
+      "match": { "classIds": [91] },
+      "path": "unity/Editor/ControllerReader.cs"
+    },
+    {
+      "name": "by-guid",
+      "match": { "scriptGuids": ["0123456789abcdef0123456789abcdef"] },
+      "path": "unity/Editor/DialogueReader.cs",
+      "method": "ReadAsset"
+    }
+  ]
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(skill_root.join("SKILL.md"), "# Yaml Readers\n").unwrap();
+
+        // A GUID match on a later document outranks a class id match on an
+        // earlier one.
+        let docs = vec![
+            super::UnityYamlReadExtensionDocKey {
+                file_id: 1,
+                class_id: 91,
+                script_guid_hex: None,
+            },
+            super::UnityYamlReadExtensionDocKey {
+                file_id: 2,
+                class_id: 114,
+                script_guid_hex: Some("0123456789abcdef0123456789abcdef".to_string()),
+            },
+        ];
+        let resolved = super::find_unity_yaml_read_extension_for_working_dir(&working_dir, &docs)
+            .expect("extension should match");
+        assert_eq!(resolved.extension_name, "by-guid");
+        assert_eq!(resolved.entry_type, "DialogueReader");
+        assert_eq!(resolved.method, "ReadAsset");
+        assert_eq!(resolved.matched_file_id, 2);
+        assert_eq!(
+            resolved.plugin_id.as_deref(),
+            Some("com.example.yaml-readers")
+        );
+
+        let class_only_docs = vec![super::UnityYamlReadExtensionDocKey {
+            file_id: 7,
+            class_id: 91,
+            script_guid_hex: None,
+        }];
+        let resolved_class =
+            super::find_unity_yaml_read_extension_for_working_dir(&working_dir, &class_only_docs)
+                .expect("class id extension should match");
+        assert_eq!(resolved_class.extension_name, "by-class");
+        assert_eq!(resolved_class.matched_class_id, 91);
+
+        let unmatched_docs = vec![super::UnityYamlReadExtensionDocKey {
+            file_id: 9,
+            class_id: 21,
+            script_guid_hex: None,
+        }];
+        assert!(super::find_unity_yaml_read_extension_for_working_dir(
+            &working_dir,
+            &unmatched_docs
+        )
+        .is_none());
     }
 
     #[test]

@@ -2,7 +2,7 @@
 import { computed, ref, onMounted } from "vue";
 import { t } from "../../i18n";
 import { useTheme, type ThemePreference } from "../../composables/useTheme";
-import { useDisplaySettings, type DiffReviewTarget, type FontSlot } from "../../composables/useDisplaySettings";
+import { useDisplaySettings, type AssetRefClickAction, type DiffReviewTarget, type FontSlot } from "../../composables/useDisplaySettings";
 import { normalizeAppError } from "../../services/errors";
 import { ipcInvoke } from "../../services/ipc";
 import {
@@ -12,6 +12,7 @@ import {
   setViewWindowsAboveMain,
 } from "../../services/system";
 import { useNotificationStore } from "../../stores/notification";
+import BaseDropdown from "../ui/BaseDropdown.vue";
 import BaseSegmented from "../ui/BaseSegmented.vue";
 import BaseSwitch from "../ui/BaseSwitch.vue";
 
@@ -41,6 +42,44 @@ const themeOptions = computed(() =>
 const diffReviewTargetOptions = computed(() => [
   { value: "inline", label: t("settings.display.diffReviewInline") },
   { value: "window", label: t("settings.display.diffReviewWindow") },
+]);
+
+const assetRefClickActionOptions = computed(() => [
+  {
+    value: "locusInspectorAuto",
+    label: t("settings.display.assetRefClickInspectorAuto"),
+    hint: t("settings.display.assetRefClickInspectorAutoDesc"),
+  },
+  {
+    value: "unitySelect",
+    label: t("settings.display.assetRefClickUnitySelect"),
+    hint: t("settings.display.assetRefClickUnitySelectDesc"),
+  },
+  {
+    value: "fileBrowser",
+    label: t("settings.display.assetRefClickFileBrowser"),
+    hint: t("settings.display.assetRefClickFileBrowserDesc"),
+  },
+  {
+    value: "locusInspectorEmbedded",
+    label: t("settings.display.assetRefClickInspectorEmbedded"),
+    hint: t("settings.display.assetRefClickInspectorEmbeddedDesc"),
+  },
+  {
+    value: "locusInspectorWindow",
+    label: t("settings.display.assetRefClickInspectorWindow"),
+    hint: t("settings.display.assetRefClickInspectorWindowDesc"),
+  },
+]);
+
+// Inside the Unity embed window the editor's own Inspector is also available.
+const unityEmbedAssetRefClickActionOptions = computed(() => [
+  {
+    value: "unityInspector",
+    label: t("settings.display.assetRefClickUnityInspector"),
+    hint: t("settings.display.assetRefClickUnityInspectorDesc"),
+  },
+  ...assetRefClickActionOptions.value,
 ]);
 
 const topNavigationToggles = [
@@ -317,6 +356,37 @@ async function updateViewWindowsAboveMain(value: boolean) {
   </div>
 
   <div class="settings-section">
+    <div class="section-label">{{ t("settings.display.assetRefClickTitle") }}</div>
+    <p class="section-desc">{{ t("settings.display.assetRefClickDesc") }}</p>
+
+    <div class="choice-row">
+      <span class="choice-label">{{ t("settings.display.assetRefClickTarget") }}</span>
+      <BaseDropdown
+        class="choice-dropdown"
+        :model-value="display.assetRefClickAction"
+        :options="assetRefClickActionOptions"
+        :aria-label="t('settings.display.assetRefClickTarget')"
+        size="sm"
+        menu-align="start"
+        @update:model-value="setDisplay('assetRefClickAction', $event as AssetRefClickAction)"
+      />
+    </div>
+
+    <div class="choice-row">
+      <span class="choice-label">{{ t("settings.display.assetRefClickUnityEmbedTarget") }}</span>
+      <BaseDropdown
+        class="choice-dropdown"
+        :model-value="display.unityEmbedAssetRefClickAction"
+        :options="unityEmbedAssetRefClickActionOptions"
+        :aria-label="t('settings.display.assetRefClickUnityEmbedTarget')"
+        size="sm"
+        menu-align="start"
+        @update:model-value="setDisplay('unityEmbedAssetRefClickAction', $event as AssetRefClickAction)"
+      />
+    </div>
+  </div>
+
+  <div class="settings-section">
     <div class="section-label">{{ t("settings.display.gitViewTitle") }}</div>
 
     <div class="toggle-row">
@@ -405,6 +475,13 @@ async function updateViewWindowsAboveMain(value: boolean) {
 .choice-segmented {
   justify-self: start;
   width: fit-content;
+  max-width: 100%;
+}
+
+.choice-dropdown {
+  justify-self: start;
+  width: fit-content;
+  min-width: 220px;
   max-width: 100%;
 }
 

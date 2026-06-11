@@ -36,7 +36,11 @@ import { isUnityReferenceImportWindowLocation } from "./services/unityReferenceI
 import { isReferenceExternalImportWindowLocation } from "./services/referenceExternalImportWindow";
 import { isCollabSearchWindowLocation } from "./services/collabSearchWindow";
 import { isChatDiffReviewWindowLocation } from "./services/chatDiffReviewWindow";
-import { isLocusAssetInspectorWindowLocation } from "./services/locusAssetInspectorWindow";
+import {
+  setLocusAssetInspectorPanelHostAvailable,
+  useLocusAssetInspectorPanel,
+} from "./composables/useLocusAssetInspectorPanel";
+import { isUnityValueEditorWindowLocation } from "./services/unityValueEditorWindow";
 import { isViewContentWindowLocation, isViewHostWindowLocation } from "./services/view";
 import { isAgentGraphToolWindowLocation } from "./services/agentGraphTool";
 import {
@@ -59,7 +63,7 @@ const isUnityReferenceImportWindow = isUnityReferenceImportWindowLocation();
 const isReferenceExternalImportWindow = isReferenceExternalImportWindowLocation();
 const isCollabSearchWindow = isCollabSearchWindowLocation();
 const isChatDiffReviewWindow = isChatDiffReviewWindowLocation();
-const isLocusAssetInspectorWindow = isLocusAssetInspectorWindowLocation();
+const isUnityValueEditorWindow = isUnityValueEditorWindowLocation();
 const isViewHostWindow = isViewHostWindowLocation();
 const isViewContentWindow = isViewContentWindowLocation();
 const isAgentGraphToolWindow = isAgentGraphToolWindowLocation();
@@ -72,7 +76,7 @@ const isStandaloneWindow = isUnityEmbedWindow
   || isReferenceExternalImportWindow
   || isCollabSearchWindow
   || isChatDiffReviewWindow
-  || isLocusAssetInspectorWindow
+  || isUnityValueEditorWindow
   || isViewHostWindow
   || isViewContentWindow
   || isAgentGraphToolWindow;
@@ -84,13 +88,14 @@ const UnityReferenceImportProgressWindow = defineAsyncComponent(() => import("./
 const ReferenceExternalImportWindow = defineAsyncComponent(() => import("./components/ReferenceExternalImportWindow.vue"));
 const CollabSearchWindow = defineAsyncComponent(() => import("./components/CollabSearchWindow.vue"));
 const ChatDiffReviewWindow = defineAsyncComponent(() => import("./components/ChatDiffReviewWindow.vue"));
-const LocusAssetInspectorWindow = defineAsyncComponent(() => import("./components/LocusAssetInspectorWindow.vue"));
+const UnityValueEditorWindow = defineAsyncComponent(() => import("./components/UnityValueEditorWindow.vue"));
 const ViewHostWindow = defineAsyncComponent(() => import("./components/ViewHostWindow.vue"));
 const AgentGraphToolWindow = defineAsyncComponent(() => import("./components/AgentGraphToolWindow.vue"));
 const UnityEmbeddedSessionView = defineAsyncComponent(() => import("./components/UnityEmbeddedSessionView.vue"));
 const UnityEmbedTestView = defineAsyncComponent(() => import("./components/UnityEmbedTestView.vue"));
 const OnboardingView = defineAsyncComponent(() => import("./components/OnboardingView.vue"));
 const FileDiffOverlay = defineAsyncComponent(() => import("./components/diff/FileDiffOverlay.vue"));
+const LocusAssetInspectorPanel = defineAsyncComponent(() => import("./components/LocusAssetInspectorPanel.vue"));
 const showPluginEntry = true;
 
 initTheme(isUnityEmbedWindow ? "unityEmbed" : "main");
@@ -116,6 +121,10 @@ let appCloseRequestUnlisten: UnlistenFn | null = null;
 
 // -- Diff overlay provider (must be called in App setup so all children can inject) --
 const diffOverlay = provideDiffOverlay();
+// The floating Locus inspector panel lives in the main window only; standalone
+// windows fall back to the dedicated inspector window.
+const locusAssetInspectorPanel = useLocusAssetInspectorPanel();
+setLocusAssetInspectorPanelHostAvailable(!isStandaloneWindow);
 const { bootstrapCritical, bootstrapDeferred, preloadTabsInBackground, registerListeners, cleanup, applyWorkingDir, closeSettings, onOnboardingCompleted } = useAppBootstrap();
 const {
   handleUnityAssetDrag: handleMainUnityAssetDrag,
@@ -806,7 +815,7 @@ watch(() => projectStore.workingDir, () => {
   <ReferenceExternalImportWindow v-else-if="isReferenceExternalImportWindow" />
   <CollabSearchWindow v-else-if="isCollabSearchWindow" />
   <ChatDiffReviewWindow v-else-if="isChatDiffReviewWindow" />
-  <LocusAssetInspectorWindow v-else-if="isLocusAssetInspectorWindow" />
+  <UnityValueEditorWindow v-else-if="isUnityValueEditorWindow" />
   <ViewHostWindow v-else-if="isViewContentWindow" embedded />
   <ViewHostWindow v-else-if="isViewHostWindow" />
   <AgentGraphToolWindow v-else-if="isAgentGraphToolWindow" />
@@ -1199,6 +1208,7 @@ watch(() => projectStore.workingDir, () => {
     </div>
   </Transition>
   <FileDiffOverlay v-if="diffOverlay.visible.value" />
+  <LocusAssetInspectorPanel v-if="!isStandaloneWindow && locusAssetInspectorPanel.state.open" />
 </template>
 
 <style>

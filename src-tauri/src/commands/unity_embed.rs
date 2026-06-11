@@ -1171,11 +1171,13 @@ pub async fn unity_embed_start_asset_drag(
         ));
     }
 
+    let payload = serde_json::json!({ "refs": refs }).to_string();
+    // Only show the cursor-following drag preview once Unity acknowledged the
+    // drag: starting it earlier orphans the preview window when the bridge
+    // call fails (e.g. Unity disconnected) and the command errors out.
+    crate::unity_bridge::start_asset_drag(&cwd, &payload).await?;
     #[cfg(target_os = "windows")]
     windows_impl::start_reference_drag_preview(unity_ref_drag_preview_label(&refs, refs.len()));
-
-    let payload = serde_json::json!({ "refs": refs }).to_string();
-    crate::unity_bridge::start_asset_drag(&cwd, &payload).await?;
     Ok("ok".to_string())
 }
 
@@ -2353,12 +2355,17 @@ mod windows_impl {
     const MOUSE_HOOK_SYNC_INTERVAL_MS: u64 = 250;
     const REFERENCE_DRAG_PREVIEW_INTERVAL_MS: u64 = 16;
     const REFERENCE_DRAG_PREVIEW_TIMEOUT: Duration = Duration::from_secs(120);
+    // Drag previews only make sense while a button is held; if the owner of a
+    // wedged drag never stops the preview, this keeps the ghost from chasing a
+    // released cursor.
+    const REFERENCE_DRAG_PREVIEW_RELEASE_GRACE: Duration = Duration::from_millis(300);
     const REFERENCE_DRAG_PREVIEW_OFFSET_X: i32 = 6;
     const REFERENCE_DRAG_PREVIEW_OFFSET_Y: i32 = 8;
     const Z_ORDER_SCAN_LIMIT: usize = 2048;
     const USE_CHILD_EMBED_OVERLAY: bool = true;
     const MOUSE_ACTIVATE_SUBCLASS_ID: usize = 0x4c6f637573;
     const VK_LBUTTON_CODE: i32 = 0x01;
+    const VK_RBUTTON_CODE: i32 = 0x02;
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub(super) enum UnityAssetDragReleaseTarget {
@@ -2528,12 +2535,22 @@ mod windows_impl {
         let src = POINT { x: 0, y: 0 };
         let started_at = Instant::now();
         let mut shown = false;
+        let mut released_since: Option<Instant> = None;
         let mut result = Ok(());
 
         loop {
             if stop.load(Ordering::SeqCst) || started_at.elapsed() > REFERENCE_DRAG_PREVIEW_TIMEOUT
             {
                 break;
+            }
+
+            if native_drag_button_down() {
+                released_since = None;
+            } else {
+                let released_at = *released_since.get_or_insert_with(Instant::now);
+                if released_at.elapsed() > REFERENCE_DRAG_PREVIEW_RELEASE_GRACE {
+                    break;
+                }
             }
 
             let mut cursor = POINT::default();
@@ -2582,6 +2599,23 @@ mod windows_impl {
         value.encode_utf16().chain(std::iter::once(0)).collect()
     }
 
+    static NATIVE_FILE_DRAG_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+
+    struct NativeFileDragScope;
+
+    impl Drop for NativeFileDragScope {
+        fn drop(&mut self) {
+            NATIVE_FILE_DRAG_IN_PROGRESS.store(false, Ordering::SeqCst);
+        }
+    }
+
+    fn native_drag_button_down() -> bool {
+        unsafe {
+            ((GetAsyncKeyState(VK_LBUTTON_CODE) as u16) & 0x8000) != 0
+                || ((GetAsyncKeyState(VK_RBUTTON_CODE) as u16) & 0x8000) != 0
+        }
+    }
+
     pub(super) fn start_native_file_drag(
         paths: Vec<String>,
         preview_label: String,
@@ -2589,6 +2623,21 @@ mod windows_impl {
         if paths.is_empty() {
             return Ok("no_files".to_string());
         }
+
+        // The dispatch hops from the webview gesture through IPC onto the main
+        // thread; a fast click releases the button before this point. Entering
+        // DoDragDrop with no button held leaves its modal loop without a
+        // release transition to end it, so the drag sticks to the cursor.
+        if !native_drag_button_down() {
+            return Ok("not_started:button_released".to_string());
+        }
+
+        // DoDragDrop runs a nested message pump, so a second dispatch arriving
+        // through run_on_main_thread could re-enter it; never nest drag loops.
+        if NATIVE_FILE_DRAG_IN_PROGRESS.swap(true, Ordering::SeqCst) {
+            return Ok("not_started:busy".to_string());
+        }
+        let _drag_scope = NativeFileDragScope;
 
         unsafe {
             OleInitialize(None)

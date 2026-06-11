@@ -20,9 +20,10 @@ use crate::agent::definition::AgentDefRegistry;
 use crate::error::AppError;
 use crate::plugin::{
     inspect_plugin_source_manifest_sync, install_plugin_from_path_sync,
-    list_installed_plugin_summaries, normalize_plugin_id, set_plugin_enabled_sync,
-    uninstall_plugin_sync, InstalledPluginSummary, LocusPluginProjectDependency,
-    PluginInstallScope, PLUGIN_MANIFEST_FILE_NAME,
+    installed_inspector_drawer_packages, list_installed_plugin_summaries, normalize_plugin_id,
+    set_plugin_enabled_sync, uninstall_plugin_sync, InstalledPluginSummary,
+    LocusPluginProjectDependency, PluginDrawerPackage, PluginInstallScope,
+    PLUGIN_MANIFEST_FILE_NAME,
 };
 use crate::process_util::{async_command, resolve_github_cli};
 use crate::workspace::Workspace;
@@ -3501,6 +3502,14 @@ pub async fn plugin_list_installed(
 ) -> Result<Vec<InstalledPluginSummary>, AppError> {
     let working_dir = workspace.path.read().await.clone();
     Ok(list_installed_plugin_summaries(&working_dir))
+}
+
+#[tauri::command]
+pub async fn plugin_inspector_drawer_packages(
+    workspace: State<'_, Arc<Workspace>>,
+) -> Result<Vec<PluginDrawerPackage>, AppError> {
+    let working_dir = workspace.path.read().await.clone();
+    Ok(installed_inspector_drawer_packages(&working_dir))
 }
 
 #[tauri::command]

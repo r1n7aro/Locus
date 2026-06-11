@@ -10,7 +10,8 @@ use crate::view::{
     emit_view_tree_changed, ensure_view_host_pool_window, export_view_package_sync,
     hide_view_content_window, import_view_package_sync, list_view_tree_sync, list_views_sync,
     mark_view_host_pool_ready, mark_view_host_revealed, mount_view_content_window,
-    move_view_entry_sync, open_view_frontend_log_sync, open_view_unity_embed_window,
+    move_view_entry_sync, open_inspector_tab_window, open_view_frontend_log_sync,
+    open_view_unity_embed_window,
     open_view_window, parse_view_create_request, read_view_frontend_log_sync, read_view_sync,
     reload_view_sync, rename_view_entry_sync, supported_view_templates,
     view_fs_access as view_fs_access_impl, view_fs_append_file as view_fs_append_file_impl,
@@ -27,9 +28,9 @@ use crate::view::{
     ViewFsReadFileRequest, ViewFsReadFileResult, ViewFsReaddirRequest, ViewFsReaddirResult,
     ViewFsRenameRequest, ViewFsRmRequest, ViewFsStatResult, ViewFsWriteFileRequest,
     ViewImportPackageRequest, ViewMoveEntryRequest, ViewPackageDetail, ViewPackageImportResult,
-    ViewPackageSummary, ViewRenameEntryRequest, ViewRunResult, ViewSetTabHostRequest,
-    ViewStorageGetRequest, ViewStorageRemoveRequest, ViewStorageSetRequest, ViewTemplateSummary,
-    ViewTreeSnapshot,
+    ViewOpenInspectorTabRequest, ViewPackageSummary, ViewRenameEntryRequest, ViewRunResult,
+    ViewSetTabHostRequest, ViewStorageGetRequest, ViewStorageRemoveRequest, ViewStorageSetRequest,
+    ViewTemplateSummary, ViewTreeSnapshot,
 };
 use crate::workspace::Workspace;
 
@@ -190,6 +191,25 @@ pub async fn view_run_in_unity(
 #[tauri::command]
 pub async fn view_set_tab_host(request: ViewSetTabHostRequest) -> Result<(), AppError> {
     crate::view::set_view_tab_host_sync(request).map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn view_open_inspector_tab(
+    request: ViewOpenInspectorTabRequest,
+    workspace: State<'_, Arc<Workspace>>,
+    config: State<'_, Arc<crate::config::AppConfig>>,
+    app_handle: AppHandle,
+) -> Result<ViewRunResult, AppError> {
+    let working_dir = workspace.path.read().await.clone();
+    open_inspector_tab_window(
+        &app_handle,
+        &working_dir,
+        &request.tab_id,
+        config.view_windows_above_main_enabled(),
+        config.view_open_in_existing_window_enabled(),
+    )
+    .await
+    .map_err(Into::into)
 }
 
 #[tauri::command]

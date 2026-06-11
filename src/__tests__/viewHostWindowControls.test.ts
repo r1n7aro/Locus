@@ -110,9 +110,9 @@ describe("View host window controls", () => {
     expect(displayPanel).toContain(":model-value=\"viewWindowsAboveMain\"");
     expect(displayPanel).toContain("settings.display.viewOpenInExistingWindow");
     expect(displayPanel).toContain("settings.display.viewWindowsAboveMain");
-    expect(zh).toContain('"settings.display.viewOpenInExistingWindow": "新视图在现有窗口打开"');
+    expect(zh).toContain('"settings.display.viewOpenInExistingWindow": "新视图 / Inspector 在现有窗口打开"');
     expect(zh).toContain('"settings.display.viewWindowsAboveMain": "视图窗口保持在主窗口上方"');
-    expect(en).toContain('"settings.display.viewOpenInExistingWindow": "Open new Views in existing window"');
+    expect(en).toContain('"settings.display.viewOpenInExistingWindow": "Open new Views / Inspector in existing window"');
     expect(en).toContain('"settings.display.viewWindowsAboveMain": "Keep View windows above main window"');
   });
 });

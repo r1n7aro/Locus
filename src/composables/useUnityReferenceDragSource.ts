@@ -8,17 +8,18 @@ import {
 } from "../services/unity";
 import type { AssetRefAttachment } from "../types";
 
-const POINTER_DRAG_THRESHOLD_PX = 4;
+// Crossing the threshold mid-click dispatches a native OS drag that outlives
+// the gesture, so both gates below must hold before a drag starts:
+// - distance, well above aim jitter while clicking;
+// - hold time, because a click-and-go gesture (release while flicking the
+//   mouse away) can travel a long distance yet always releases quickly.
+const POINTER_DRAG_THRESHOLD_PX = 12;
+const POINTER_DRAG_MIN_HOLD_MS = 120;
 const DRAG_PASSTHROUGH_RESET_MS = 12000;
 const NATIVE_FILE_DRAG_RESTORE_MS = 12000;
 const UNITY_ASSET_REF_ROOT_RE = /^(?:Assets|Packages|ProjectSettings)(?:\/|$)/i;
 
 let passthroughResetTimer: number | null = null;
-
-interface UnityReferenceDragWarmup {
-  promise: Promise<boolean>;
-  committed: boolean;
-}
 
 function normalizeUnityReferencePath(path: string): string {
   return path.trim().replace(/\\/g, "/").replace(/\/+$/g, "");
@@ -48,42 +49,21 @@ function scheduleDragPassthroughReset() {
   }, DRAG_PASSTHROUGH_RESET_MS);
 }
 
-function startUnityAssetDragWarmup(refs: AssetRefAttachment[]): UnityReferenceDragWarmup | null {
+function startUnityAssetDragWarmup(refs: AssetRefAttachment[]): Promise<boolean> | null {
   if (!shouldWarmupUnityDrag(refs)) return null;
 
-  const promise = startUnityEmbedAssetDrag(refs)
+  return startUnityEmbedAssetDrag(refs)
     .then(() => true)
     .catch((error) => {
       console.warn("[Locus] Failed to arm Unity asset drag", error);
       return false;
     });
-
-  return {
-    promise,
-    committed: false,
-  };
 }
 
-function cancelUnityAssetDragWarmup(warmup: UnityReferenceDragWarmup | null) {
-  if (!warmup || warmup.committed) return;
+async function beginUnityReferencePointerDrag(refs: AssetRefAttachment[]) {
+  const armPromise = startUnityAssetDragWarmup(refs);
+  if (!armPromise) return;
 
-  void warmup.promise.then((armed) => {
-    if (!armed || warmup.committed) return;
-    void cancelUnityEmbedAssetDrag().catch((error) => {
-      console.warn("[Locus] Failed to cancel Unity reference drag", error);
-    });
-  });
-}
-
-async function beginUnityReferencePointerDrag(
-  refs: AssetRefAttachment[],
-  warmup?: UnityReferenceDragWarmup | null,
-) {
-  const activeWarmup = warmup ?? startUnityAssetDragWarmup(refs);
-  if (!activeWarmup) return;
-  activeWarmup.committed = true;
-
-  const armPromise = activeWarmup.promise;
   const passthroughPromise = setUnityEmbedDragPassthrough(true)
     .then(() => true)
     .catch((error) => {
@@ -105,17 +85,9 @@ async function beginUnityReferencePointerDrag(
   void setUnityEmbedDragPassthrough(false);
 }
 
-async function beginNativeAssetFileDrag(
-  refs: AssetRefAttachment[],
-  warmup?: UnityReferenceDragWarmup | null,
-) {
+async function beginNativeAssetFileDrag(refs: AssetRefAttachment[]) {
   const shouldResetPassthrough = isUnityEmbedWindow();
-  const activeWarmup = warmup ?? startUnityAssetDragWarmup(refs);
-  if (activeWarmup) {
-    activeWarmup.committed = true;
-  }
-
-  const armPromise = activeWarmup?.promise ?? Promise.resolve(false);
+  const armPromise = startUnityAssetDragWarmup(refs) ?? Promise.resolve(false);
   let armed = false;
   try {
     if (shouldResetPassthrough) {
@@ -204,17 +176,37 @@ function suppressHtmlDraggable(event: PointerEvent): (() => void) | null {
   };
 }
 
-export function armUnityReferencePointerDrag(event: PointerEvent, refs: AssetRefAttachment[]) {
-  if (refs.length === 0 || event.button !== 0) return;
+interface ArmedPointerDragSession {
+  pointerId: number;
+  disarm: () => void;
+}
 
-  const useNativeFileDrag = shouldStartNativeAssetFileDrag(refs);
-  const warmup = shouldWarmupUnityDrag(refs) ? startUnityAssetDragWarmup(refs) : null;
-  const shouldSuppressHtmlDrag = useNativeFileDrag || (isUnityEmbedWindow() && !!warmup);
-  const restoreHtmlDraggable = shouldSuppressHtmlDrag
+// Only one pointer-drag gesture can be armed at a time. Chat chips arm twice
+// for the same pointerdown (the hydrated identity component and the markdown
+// host both observe it); without this guard each arm later dispatches its own
+// native drag, and the duplicate OS drag loop enters after the button is
+// already up, leaving the drag ghost stuck to the cursor.
+let armedPointerDragSession: ArmedPointerDragSession | null = null;
+
+function isPointerDragArmed(event: PointerEvent): boolean {
+  return armedPointerDragSession?.pointerId === event.pointerId;
+}
+
+interface PointerDragArmOptions {
+  suppressHtmlDrag: boolean;
+  onDragStart: () => Promise<unknown>;
+}
+
+function armPointerDrag(event: PointerEvent, options: PointerDragArmOptions) {
+  armedPointerDragSession?.disarm();
+
+  const restoreHtmlDraggable = options.suppressHtmlDrag
     ? suppressHtmlDraggable(event)
     : null;
+  const pointerId = event.pointerId;
   const startX = event.clientX;
   const startY = event.clientY;
+  const armedAt = performance.now();
   let started = false;
   let restored = false;
 
@@ -225,6 +217,9 @@ export function armUnityReferencePointerDrag(event: PointerEvent, refs: AssetRef
   };
 
   const cleanup = (restoreDraggable = true) => {
+    if (armedPointerDragSession === session) {
+      armedPointerDragSession = null;
+    }
     window.removeEventListener("pointermove", handlePointerMove, true);
     window.removeEventListener("pointerup", handlePointerEnd, true);
     window.removeEventListener("pointercancel", handlePointerEnd, true);
@@ -234,22 +229,30 @@ export function armUnityReferencePointerDrag(event: PointerEvent, refs: AssetRef
   };
 
   const handlePointerMove = (moveEvent: PointerEvent) => {
-    if (started) return;
+    if (started || moveEvent.pointerId !== pointerId) return;
+    // The primary button is no longer down, so the pointerup never reached
+    // this listener (or raced ahead of the move). Starting now would enter
+    // the OS drag loop with the button already released, where no release
+    // transition can ever end it.
+    if ((moveEvent.buttons & 1) === 0) {
+      cleanup();
+      return;
+    }
     const dx = moveEvent.clientX - startX;
     const dy = moveEvent.clientY - startY;
     if (Math.hypot(dx, dy) < POINTER_DRAG_THRESHOLD_PX) return;
+    // Not a disarm: keep waiting — a held pointer becomes a drag on the next
+    // move once the hold gate passes, while a click releases first.
+    if (performance.now() - armedAt < POINTER_DRAG_MIN_HOLD_MS) return;
 
     started = true;
     moveEvent.preventDefault();
     moveEvent.stopPropagation();
     cleanup(false);
-    const drag = useNativeFileDrag
-      ? beginNativeAssetFileDrag(refs, warmup)
-      : beginUnityReferencePointerDrag(refs, warmup);
     const restoreTimer = restoreHtmlDraggable
       ? window.setTimeout(restoreHtmlDraggableOnce, NATIVE_FILE_DRAG_RESTORE_MS)
       : null;
-    void drag.finally(() => {
+    void options.onDragStart().finally(() => {
       if (restoreTimer !== null) {
         window.clearTimeout(restoreTimer);
       }
@@ -257,69 +260,42 @@ export function armUnityReferencePointerDrag(event: PointerEvent, refs: AssetRef
     });
   };
 
-  const handlePointerEnd = () => {
-    if (!started) {
-      cancelUnityAssetDragWarmup(warmup);
-    }
+  const handlePointerEnd = (endEvent: PointerEvent) => {
+    if (endEvent.pointerId !== pointerId) return;
     cleanup();
   };
 
+  const session: ArmedPointerDragSession = { pointerId, disarm: cleanup };
+  armedPointerDragSession = session;
   window.addEventListener("pointermove", handlePointerMove, true);
   window.addEventListener("pointerup", handlePointerEnd, true);
   window.addEventListener("pointercancel", handlePointerEnd, true);
 }
 
+export function armUnityReferencePointerDrag(event: PointerEvent, refs: AssetRefAttachment[]) {
+  if (refs.length === 0 || event.button !== 0) return;
+  // Keep the first arm of this gesture; a second arm for the same pointer
+  // must not create another drag dispatch.
+  if (isPointerDragArmed(event)) return;
+
+  const useNativeFileDrag = shouldStartNativeAssetFileDrag(refs);
+  // The Unity drag warmup is created lazily by the begin* paths once the drag
+  // threshold passes: warming up on pointerdown would flash the native drag
+  // preview on plain clicks (and orphan it when Unity is disconnected).
+  armPointerDrag(event, {
+    suppressHtmlDrag: useNativeFileDrag || (isUnityEmbedWindow() && shouldWarmupUnityDrag(refs)),
+    onDragStart: () => useNativeFileDrag
+      ? beginNativeAssetFileDrag(refs)
+      : beginUnityReferencePointerDrag(refs),
+  });
+}
+
 export function armLocusFilePointerDrag(event: PointerEvent, files: LocusFileDropRef[]) {
   if (files.length === 0 || event.button !== 0) return;
+  if (isPointerDragArmed(event)) return;
 
-  const restoreHtmlDraggable = suppressHtmlDraggable(event);
-  const startX = event.clientX;
-  const startY = event.clientY;
-  let started = false;
-  let restored = false;
-
-  const restoreHtmlDraggableOnce = () => {
-    if (restored) return;
-    restored = true;
-    restoreHtmlDraggable?.();
-  };
-
-  const cleanup = (restoreDraggable = true) => {
-    window.removeEventListener("pointermove", handlePointerMove, true);
-    window.removeEventListener("pointerup", handlePointerEnd, true);
-    window.removeEventListener("pointercancel", handlePointerEnd, true);
-    if (restoreDraggable) {
-      restoreHtmlDraggableOnce();
-    }
-  };
-
-  const handlePointerMove = (moveEvent: PointerEvent) => {
-    if (started) return;
-    const dx = moveEvent.clientX - startX;
-    const dy = moveEvent.clientY - startY;
-    if (Math.hypot(dx, dy) < POINTER_DRAG_THRESHOLD_PX) return;
-
-    started = true;
-    moveEvent.preventDefault();
-    moveEvent.stopPropagation();
-    cleanup(false);
-    const drag = beginNativeFileDrag(files);
-    const restoreTimer = restoreHtmlDraggable
-      ? window.setTimeout(restoreHtmlDraggableOnce, NATIVE_FILE_DRAG_RESTORE_MS)
-      : null;
-    void drag.finally(() => {
-      if (restoreTimer !== null) {
-        window.clearTimeout(restoreTimer);
-      }
-      restoreHtmlDraggableOnce();
-    });
-  };
-
-  const handlePointerEnd = () => {
-    cleanup();
-  };
-
-  window.addEventListener("pointermove", handlePointerMove, true);
-  window.addEventListener("pointerup", handlePointerEnd, true);
-  window.addEventListener("pointercancel", handlePointerEnd, true);
+  armPointerDrag(event, {
+    suppressHtmlDrag: true,
+    onDragStart: () => beginNativeFileDrag(files),
+  });
 }

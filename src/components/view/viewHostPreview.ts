@@ -43,7 +43,7 @@ const DEFAULT_LOCUS_THEME: Record<(typeof LOCUS_THEME_VARIABLES)[number], string
   "--status-danger-bg": "rgba(255, 138, 138, 0.14)",
   "--status-danger-border": "rgba(255, 138, 138, 0.30)",
   "--font-ui": "Inter, ui-sans-serif, system-ui, sans-serif",
-  "--font-mono-identifier": "ui-monospace, SFMono-Regular, Cascadia Mono, Consolas, monospace",
+  "--font-mono-identifier": "SFMono-Regular, Cascadia Mono, Consolas, ui-monospace, monospace",
 };
 
 export function extractVueTemplate(source: string): string {

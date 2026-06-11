@@ -151,6 +151,8 @@ class MutableUnityObjectDrawerLibrary implements UnityObjectDrawerLibrary {
 
 export const publicUnityObjectDrawerLibrary = createUnityObjectDrawerLibrary();
 export const projectUnityObjectDrawerLibrary = publicUnityObjectDrawerLibrary;
+/** Registrations contributed by installed plugin drawer packages. */
+export const pluginUnityObjectDrawerLibrary = createUnityObjectDrawerLibrary();
 
 export function normalizeUnityObjectDrawers(
   input: UnityObjectDrawerInput,
@@ -203,8 +205,10 @@ export function resolveUnityObjectDrawer(
   context: UnityObjectDrawerContext,
   input?: UnityObjectDrawerInput,
 ): Component | null {
+  // Priority: explicit input > project/view registrations > plugin packages.
   return findUnityObjectDrawer(model, context, normalizeUnityObjectDrawers(input))
-    ?? publicUnityObjectDrawerLibrary.resolve(model, context);
+    ?? publicUnityObjectDrawerLibrary.resolve(model, context)
+    ?? pluginUnityObjectDrawerLibrary.resolve(model, context);
 }
 
 export function registerUnityObjectDrawer(
@@ -222,6 +226,7 @@ export const unityObjectDrawerService = {
   register: registerUnityObjectDrawer,
   publicLibrary: publicUnityObjectDrawerLibrary,
   projectLibrary: projectUnityObjectDrawerLibrary,
+  pluginLibrary: pluginUnityObjectDrawerLibrary,
   resolve: resolveUnityObjectDrawer,
 };
 

@@ -319,7 +319,7 @@ export interface ModelOption {
   provider:
     | "openrouter"
     | "anthropic"
-    | "anthropic_sdk"
+    | "claude_code"
     | "openai_codex"
     | "custom";
   defaultEffort?: EffortLevel | null;
@@ -364,6 +364,8 @@ export interface ModelDefaults {
   mainModel: string;
   planModel: string;
   subagentModels: Record<string, string>;
+  /** Opt-in: Claude Code CLI models only join the model list when true. */
+  claudeCodeEnabled?: boolean;
 }
 
 export type CodexTransportMode = "http" | "websocket";

@@ -37,6 +37,7 @@ export interface InstalledPluginSummary {
   rules?: PluginComponentSummary[];
   skills: PluginComponentSummary[];
   views: PluginComponentSummary[];
+  drawers?: PluginComponentSummary[];
 }
 
 export interface PluginExportRequest {

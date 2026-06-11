@@ -115,20 +115,27 @@ export interface UnityBoundPropertyDrawOptions {
 }
 
 function normalizeBindingId(target: UnitySerializedPropertyTarget, prefix = "unity-property"): string {
+  // Tag every field (including file ids) so distinct targets can never share a binding id,
+  // e.g. {path: "X"} vs {scenePath: "X"} or two sub-objects differing only by fileId.
   const parts = [
-    target.kind,
-    target.guid ?? "",
-    target.path ?? "",
-    target.scenePath ?? "",
-    target.objectPath ?? "",
-    target.componentType ?? "",
-    String(target.componentIndex ?? 0),
+    `k=${target.kind}`,
+    `g=${target.guid ?? ""}`,
+    `p=${target.path ?? ""}`,
+    `s=${target.scenePath ?? ""}`,
+    `o=${target.objectPath ?? ""}`,
+    `of=${target.objectFileId ?? 0}`,
+    `tf=${target.targetFileId ?? 0}`,
+    `c=${target.componentType ?? ""}`,
+    `ci=${target.componentIndex ?? 0}`,
   ]
-    .filter(Boolean)
     .join(":")
     .replace(/\s+/g, " ")
     .trim();
-  return `${prefix}:${parts || "target"}`;
+  return `${prefix}:${parts}`;
+}
+
+function warnUnityPropertyWriteFailure(error: unknown) {
+  console.warn("[unityPropertyBinding] serialized property write failed:", error);
 }
 
 function snapshotList(
@@ -235,11 +242,12 @@ export class UnityBoundProperty {
         if (options.writeMode === "preview") {
           event.writeMode = "preview";
           options.onPreview?.(event);
-          void this.preview(commit.value);
+          void this.preview(commit.value).catch(warnUnityPropertyWriteFailure);
           return;
         }
         options.onCommit?.(event);
-        void this.tree.writeCommit(commit, writeOptionsFromDrawOptions(options));
+        void this.tree.writeCommit(commit, writeOptionsFromDrawOptions(options))
+          .catch(warnUnityPropertyWriteFailure);
       },
     });
   }
@@ -383,6 +391,7 @@ export class UnityBoundPropertyTree {
       modelValue: property.value,
       propertyType: propertyType(property),
       displayValue: property.displayValue,
+      bindingTarget: this.targetForProperty(property),
       editable: property.editable,
       disabled: options.disabled,
       readonly: options.readonly,
@@ -405,7 +414,8 @@ export class UnityBoundPropertyTree {
         const commit = property.createCommit(value);
         const target = this.targetForProperty(property);
         options.onCommit?.(eventFromCommit(commit, target));
-        void this.writeCommit(commit, writeOptionsFromDrawOptions(options));
+        void this.writeCommit(commit, writeOptionsFromDrawOptions(options))
+          .catch(warnUnityPropertyWriteFailure);
       },
       onPreview: (value: unknown) => {
         const commit = property.createCommit(value);
@@ -413,7 +423,8 @@ export class UnityBoundPropertyTree {
         const event = eventFromCommit(commit, target);
         event.writeMode = "preview";
         options.onPreview?.(event);
-        void this.writeCommit(commit, { refresh: false, undoable: false }, "preview");
+        void this.writeCommit(commit, { refresh: false, undoable: false }, "preview")
+          .catch(warnUnityPropertyWriteFailure);
       },
     });
   }
@@ -445,18 +456,26 @@ export class UnityBoundPropertyTree {
     options: UnityBoundPropertyDrawOptions,
     mode: UnityPropertyWriteMode,
   ) {
+    // Never fall back to the root property: a stale event after refresh would
+    // otherwise commit a child value onto the root target's propertyPath.
     const property = this.raw.getProperty(event.propertyPath)
-      ?? this.raw.getProperty(event.property.propertyPath)
-      ?? this.raw.rootProperty;
-    if (!property) return;
+      ?? this.raw.getProperty(event.property.propertyPath);
+    if (!property) {
+      console.warn(
+        `[unityPropertyBinding] dropped ${mode} for unknown property path: ${event.propertyPath}`,
+      );
+      return;
+    }
     const commit = property.createCommit(event.value);
     if (mode === "preview") {
       options.onPreview?.({ ...event, writeMode: "preview" });
-      void this.writeCommit(commit, { refresh: false, undoable: false }, "preview");
+      void this.writeCommit(commit, { refresh: false, undoable: false }, "preview")
+        .catch(warnUnityPropertyWriteFailure);
       return;
     }
     options.onCommit?.({ ...event, writeMode: "commit" });
-    void this.writeCommit(commit, writeOptionsFromDrawOptions(options));
+    void this.writeCommit(commit, writeOptionsFromDrawOptions(options))
+      .catch(warnUnityPropertyWriteFailure);
   }
 }
 
@@ -521,9 +540,11 @@ export function createUnityPropertyRuntime(
       throw new Error("Unity property path target requires propertyPath.");
     }
     const tree = await readTree(target, options);
-    return tree.get(target.propertyPath) ?? tree.root ?? (() => {
+    const property = tree.get(target.propertyPath);
+    if (!property) {
       throw new Error(`Unity property not found: ${target.propertyPath}`);
-    })();
+    }
+    return property;
   }
 
   async function write(

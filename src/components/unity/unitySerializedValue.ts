@@ -122,7 +122,44 @@ const VECTOR_KEYS: Record<string, VectorKey[]> = {
   Vector4: ["x", "y", "z", "w"],
   Quaternion: ["x", "y", "z"],
   Rect: ["x", "y", "width", "height"],
+  Vector2Int: ["x", "y"],
+  Vector3Int: ["x", "y", "z"],
+  RectInt: ["x", "y", "width", "height"],
 };
+
+const INTEGER_VECTOR_TYPES = new Set(["Vector2Int", "Vector3Int", "RectInt"]);
+
+export interface UnityAnimationCurveValue {
+  keyCount: number;
+  startTime: number;
+  endTime: number;
+  minValue: number;
+  maxValue: number;
+  samples: number[];
+  keys: Array<{ time: number; value: number }>;
+}
+
+export interface UnityGradientValue {
+  mode: string;
+  colorKeys: Array<{ time: number; color: string }>;
+  alphaKeys: Array<{ time: number; alpha: number }>;
+}
+
+export interface UnityBoundsVectorValue {
+  x: number;
+  y: number;
+  z: number;
+}
+
+export interface UnityBoundsValue {
+  center: UnityBoundsVectorValue;
+  extents: UnityBoundsVectorValue;
+}
+
+export interface UnityBoundsIntValue {
+  position: UnityBoundsVectorValue;
+  size: UnityBoundsVectorValue;
+}
 
 export function normalizeUnityPropertyType(type: string | null | undefined): string {
   return (type || "String").trim() || "String";
@@ -138,6 +175,15 @@ export function isUnityNumberPropertyType(type: string | null | undefined): bool
 
 export function isUnityVectorPropertyType(type: string | null | undefined): boolean {
   return Object.prototype.hasOwnProperty.call(VECTOR_KEYS, normalizeUnityPropertyType(type));
+}
+
+export function isUnityIntegerVectorPropertyType(type: string | null | undefined): boolean {
+  return INTEGER_VECTOR_TYPES.has(normalizeUnityPropertyType(type));
+}
+
+export function isUnityBoundsPropertyType(type: string | null | undefined): boolean {
+  const normalized = normalizeUnityPropertyType(type);
+  return normalized === "Bounds" || normalized === "BoundsInt";
 }
 
 export function isUnityQuaternionPropertyType(type: string | null | undefined): boolean {
@@ -229,6 +275,12 @@ export function parseUnitySerializedEditValue(
     return rawValue;
   }
 
+  if (normalized === "Character") {
+    const text = String(rawValue ?? "");
+    if (!text.length) throw new Error("Expected character value");
+    return text[0];
+  }
+
   if (rawValue == null) return "";
   return String(rawValue);
 }
@@ -310,11 +362,13 @@ export function parseUnityVectorValue(
 
   const keys = unityVectorKeysForType(type);
   if (!keys.length) throw new Error("Expected vector type");
+  const integerVector = isUnityIntegerVectorPropertyType(type);
+  const normalizeComponent = (value: number) => (integerVector ? Math.round(value) : value);
   if (rawValue && typeof rawValue === "object") {
     const record = rawValue as Record<string, unknown>;
     const next = {} as Record<string, number>;
     for (const key of keys) {
-      next[key] = parseUnityNumber(record[key] ?? 0);
+      next[key] = normalizeComponent(parseUnityNumber(record[key] ?? 0));
     }
     return next;
   }
@@ -326,7 +380,7 @@ export function parseUnityVectorValue(
   if (parts.length !== keys.length) {
     throw new Error("Expected vector components");
   }
-  const values = parts.map((part) => parseUnityNumber(part));
+  const values = parts.map((part) => normalizeComponent(parseUnityNumber(part)));
   const next = {} as Record<string, number>;
   keys.forEach((key, index) => {
     next[key] = values[index];
@@ -408,6 +462,147 @@ export function applyUnityRgbHexToColorText(rgbHex: string, previous: unknown): 
   const previousText = formatUnityColorValue(previous);
   const alpha = /^#[0-9a-fA-F]{8}$/.test(previousText) ? previousText.slice(7, 9) : "ff";
   return `${rgbHex}${alpha}`;
+}
+
+export interface UnityColorRgba {
+  r: number;
+  g: number;
+  b: number;
+  a: number;
+}
+
+export function unityColorValueToRgba(value: unknown): UnityColorRgba | null {
+  if (value && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    const r = Number(record.r ?? 0);
+    const g = Number(record.g ?? 0);
+    const b = Number(record.b ?? 0);
+    const a = record.a == null ? 1 : Number(record.a);
+    if (![r, g, b, a].every(Number.isFinite)) return null;
+    return { r, g, b, a };
+  }
+  const text = String(value ?? "").trim();
+  const match = /^#([0-9a-fA-F]{6})([0-9a-fA-F]{2})?$/.exec(text);
+  if (!match) return null;
+  const hex = match[1];
+  const alphaHex = match[2] ?? "ff";
+  return {
+    r: parseInt(hex.slice(0, 2), 16) / 255,
+    g: parseInt(hex.slice(2, 4), 16) / 255,
+    b: parseInt(hex.slice(4, 6), 16) / 255,
+    a: parseInt(alphaHex, 16) / 255,
+  };
+}
+
+export function isUnityHdrColorValue(value: unknown): boolean {
+  const rgba = unityColorValueToRgba(value);
+  if (!rgba) return false;
+  return rgba.r > 1 || rgba.g > 1 || rgba.b > 1 || rgba.r < 0 || rgba.g < 0 || rgba.b < 0;
+}
+
+export function unityRgbaToCssColor(rgba: UnityColorRgba): string {
+  const channel = (value: number) => Math.round(Math.max(0, Math.min(1, value)) * 255);
+  const alpha = Math.max(0, Math.min(1, rgba.a));
+  return `rgba(${channel(rgba.r)}, ${channel(rgba.g)}, ${channel(rgba.b)}, ${Number(alpha.toFixed(3))})`;
+}
+
+export function unityAnimationCurveValue(value: unknown): UnityAnimationCurveValue | null {
+  if (!value || typeof value !== "object") return null;
+  const record = value as Record<string, unknown>;
+  if (!Array.isArray(record.samples) && !Array.isArray(record.keys)) return null;
+  const samples = (Array.isArray(record.samples) ? record.samples : []).map((entry) => {
+    const numeric = Number(entry);
+    return Number.isFinite(numeric) ? numeric : 0;
+  });
+  const keys = (Array.isArray(record.keys) ? record.keys : [])
+    .map((entry) => {
+      const key = entry as Record<string, unknown>;
+      return {
+        time: Number(key?.time ?? 0) || 0,
+        value: Number(key?.value ?? 0) || 0,
+      };
+    });
+  const fallbackMin = samples.length ? Math.min(...samples) : 0;
+  const fallbackMax = samples.length ? Math.max(...samples) : 1;
+  return {
+    keyCount: Number.isFinite(Number(record.keyCount)) ? Number(record.keyCount) : keys.length,
+    startTime: Number(record.startTime ?? 0) || 0,
+    endTime: Number(record.endTime ?? 1) || 1,
+    minValue: Number.isFinite(Number(record.minValue)) ? Number(record.minValue) : fallbackMin,
+    maxValue: Number.isFinite(Number(record.maxValue)) ? Number(record.maxValue) : fallbackMax,
+    samples,
+    keys,
+  };
+}
+
+export function unityGradientValue(value: unknown): UnityGradientValue | null {
+  if (!value || typeof value !== "object") return null;
+  const record = value as Record<string, unknown>;
+  if (!Array.isArray(record.colorKeys)) return null;
+  const colorKeys = record.colorKeys
+    .map((entry) => {
+      const key = entry as Record<string, unknown>;
+      const color = String(key?.color ?? "").trim();
+      return {
+        time: Math.max(0, Math.min(1, Number(key?.time ?? 0) || 0)),
+        color: /^#[0-9a-fA-F]{6}$/.test(color) ? color : "#000000",
+      };
+    })
+    .sort((left, right) => left.time - right.time);
+  const alphaKeys = (Array.isArray(record.alphaKeys) ? record.alphaKeys : [])
+    .map((entry) => {
+      const key = entry as Record<string, unknown>;
+      return {
+        time: Math.max(0, Math.min(1, Number(key?.time ?? 0) || 0)),
+        alpha: Math.max(0, Math.min(1, Number(key?.alpha ?? 1) || 0)),
+      };
+    })
+    .sort((left, right) => left.time - right.time);
+  return {
+    mode: String(record.mode ?? "Blend"),
+    colorKeys,
+    alphaKeys,
+  };
+}
+
+export function unityBoundsKeysForType(type: string | null | undefined): [string, string] {
+  return normalizeUnityPropertyType(type) === "BoundsInt"
+    ? ["position", "size"]
+    : ["center", "extents"];
+}
+
+function unityBoundsVector(value: unknown): UnityBoundsVectorValue {
+  const record = (value && typeof value === "object" ? value : {}) as Record<string, unknown>;
+  return {
+    x: Number(record.x ?? 0) || 0,
+    y: Number(record.y ?? 0) || 0,
+    z: Number(record.z ?? 0) || 0,
+  };
+}
+
+export function unityBoundsValueVectors(
+  type: string | null | undefined,
+  value: unknown,
+): [UnityBoundsVectorValue, UnityBoundsVectorValue] {
+  const [firstKey, secondKey] = unityBoundsKeysForType(type);
+  const record = (value && typeof value === "object" ? value : {}) as Record<string, unknown>;
+  return [unityBoundsVector(record[firstKey]), unityBoundsVector(record[secondKey])];
+}
+
+export function buildUnityBoundsValue(
+  type: string | null | undefined,
+  first: UnityBoundsVectorValue,
+  second: UnityBoundsVectorValue,
+): Record<string, UnityBoundsVectorValue> {
+  const integer = normalizeUnityPropertyType(type) === "BoundsInt";
+  const normalize = (vector: UnityBoundsVectorValue): UnityBoundsVectorValue => (integer
+    ? { x: Math.round(vector.x), y: Math.round(vector.y), z: Math.round(vector.z) }
+    : vector);
+  const [firstKey, secondKey] = unityBoundsKeysForType(type);
+  return {
+    [firstKey]: normalize(first),
+    [secondKey]: normalize(second),
+  };
 }
 
 function colorChannelToHex(value: number): string {

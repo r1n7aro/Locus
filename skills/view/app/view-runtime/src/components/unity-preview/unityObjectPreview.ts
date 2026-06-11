@@ -91,6 +91,15 @@ const MODEL_SOURCE_EXTENSIONS = new Set([
   ".max",
 ]);
 
+const CODE_SOURCE_EXTENSIONS = new Set([
+  ".cs",
+  ".shader",
+  ".compute",
+  ".cginc",
+  ".hlsl",
+  ".glsl",
+]);
+
 const UNITY_EDITABLE_ASSET_EXTENSIONS = new Set([
   ".prefab",
   ".unity",
@@ -186,6 +195,15 @@ export function isUnityObjectEditable(model: UnityObjectPreviewInput | UnityObje
 
 export function isUnityExternalSourceAssetPath(path: string): boolean {
   return MODEL_SOURCE_EXTENSIONS.has(extensionOf(path));
+}
+
+/**
+ * Script/shader source files read better as highlighted source text than as
+ * a serialized object panel: a MonoScript's serialized form is only importer
+ * metadata (class name, execution order, ...), not the script itself.
+ */
+export function isUnityCodeSourceAssetPath(path: string): boolean {
+  return CODE_SOURCE_EXTENSIONS.has(extensionOf(path));
 }
 
 export function hasEditableUnityPropertySnapshot(input: UnityObjectPropertyTreeInput | null | undefined): boolean {

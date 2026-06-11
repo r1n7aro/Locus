@@ -6,6 +6,7 @@ import {
   createUnityObjectDrawerLibrary,
   defineUnityObjectDrawers,
   hasEditableUnityPropertySnapshot,
+  isUnityCodeSourceAssetPath,
   isUnityExternalSourceAssetPath,
   normalizeUnityObjectPreviewModel,
   resolveUnityObjectDrawer,
@@ -35,6 +36,15 @@ describe("unityObjectPreview", () => {
     expect(model.editState).toBe("externalSource");
     expect(model.readonlyReason).toBe("External source asset");
     expect(isUnityExternalSourceAssetPath(model.ref.path)).toBe(true);
+  });
+
+  it("classifies script and shader sources as code source assets", () => {
+    expect(isUnityCodeSourceAssetPath("Assets/Scripts/Effects/FireLight.cs")).toBe(true);
+    expect(isUnityCodeSourceAssetPath("Assets/Shaders/Water.shader")).toBe(true);
+    expect(isUnityCodeSourceAssetPath("Assets/Shaders/Blur.compute")).toBe(true);
+    expect(isUnityCodeSourceAssetPath("Assets/Shaders/Common.cginc")).toBe(true);
+    expect(isUnityCodeSourceAssetPath("Assets/Prefabs/Enemy.prefab")).toBe(false);
+    expect(isUnityCodeSourceAssetPath("Assets/Data/Notes.txt")).toBe(false);
   });
 
   it("uses asset file names with extensions for default titles", () => {
@@ -250,6 +260,10 @@ describe("unityObjectPreview", () => {
     expect(preview).toContain("unity-object-preview-error.neutral");
     expect(preview).toContain("livePropertyTree");
     expect(preview).toContain("liveSerializedTarget");
+    expect(preview).toContain("AssetTextViewer");
+    expect(preview).toContain("prefersCodeSourcePreview");
+    expect(preview).toContain("isUnityCodeSourceAssetPath(autoPreviewPath.value)");
+    expect(preview).toContain("(!prefersCodeSourcePreview.value || codeSourcePreviewUnavailable.value)");
     expect(preview).toContain("target.objectFileId ??");
     expect(preview).toContain("target.targetFileId ??");
     expect(preview).toContain("objectFileId,");

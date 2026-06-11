@@ -72,6 +72,8 @@ describe("chat responsive layout", () => {
     expect(workspace).toContain(":max-side-width=\"assistantSidebarMaxSideWidth\"");
     expect(workspace).toContain("function handleWorkspaceResize(entries: ResizeObserverEntry[])");
     expect(workspace).toContain("createAnimationFrameResizeObserver(handleWorkspaceResize)");
+    expect(workspace).toContain("uiStore.beginAssistantSidebarTransition()");
+    expect(workspace).toContain("uiStore.endAssistantSidebarTransition()");
     expect(workspace).not.toContain("scheduleWorkspaceWidthUpdate");
     expect(workspace).toContain("saveRawContext");
     expect(sidebar).toContain("layout?: \"side\" | \"bottom\"");
@@ -180,6 +182,10 @@ describe("chat responsive layout", () => {
     expect(chatView).toContain("createAnimationFrameResizeObserver(handleTranscriptResize)");
     expect(chatView).toContain('flushPendingTranscriptResizeReconcile("window-resize-settled")');
     expect(chatView).toContain('flushPendingTranscriptResizeReconcile("session-drag-settled")');
+    expect(chatView).toContain('flushPendingTranscriptResizeReconcile("sidebar-transition-settled")');
+    expect(chatView).toContain("uiStore.isAssistantSidebarTransitioning");
+    expect(uiStore).toContain("function beginAssistantSidebarTransition");
+    expect(uiStore).toContain("function endAssistantSidebarTransition");
     expect(chatView).toContain("let pendingSessionPanelWidth: number | null = null;");
     expect(chatView).toContain("sessionSplitterFrame = requestViewportFrame(flushSessionSplitterWidth)");
     expect(chatView).toContain("sessionSplitterLayoutLeft = layoutRef.value?.getBoundingClientRect().left ?? 0;");

@@ -32,7 +32,8 @@ import BaseSegmented from "./ui/BaseSegmented.vue";
 import LucideIcon from "./icons/LucideIcon.vue";
 import { refetchDiffByKey } from "../services/diff";
 import { openChatDiffReviewWindow } from "../services/chatDiffReviewWindow";
-import { openLocusAssetInspectorWindow } from "../services/locusAssetInspectorWindow";
+import type { LocusAssetInspectorWindowPayload } from "../services/locusAssetInspectorWindow";
+import { openLocusAssetInspector } from "../composables/useLocusAssetInspectorPanel";
 import { normalizeAppError } from "../services/errors";
 import { knowledgeRevealTarget } from "../services/knowledge";
 import { t } from "../i18n";
@@ -708,6 +709,10 @@ function handleUnitySceneObjectInspectorClick(scenePath: string, objectPath: str
 }
 
 function handleUnitySceneObjectClick(scenePath: string, objectPath: string) {
+  runAssetRefClickAction({ kind: "sceneObject", scenePath, objectPath });
+}
+
+function selectUnitySceneObjectRef(scenePath: string, objectPath: string) {
   if (!shouldUseUnitySceneObjectRef(scenePath, objectPath)) return;
   selectUnitySceneObject(scenePath, objectPath).catch((e: unknown) => {
     console.warn("selectUnitySceneObject failed:", e);
@@ -730,23 +735,105 @@ function notifyUnitySceneObjectError(error: unknown, scenePath: string, objectPa
 }
 
 function handleFileRefClick(filePath: string) {
-  if (canOpenInEditor(filePath)) {
-    openFileExternal(filePath).catch((e: unknown) => console.warn("openFileExternal failed:", e));
-    return;
-  }
-  if (shouldSelectUnityAsset(filePath)) {
-    selectUnityAsset(filePath).catch((e: unknown) => console.warn("selectUnityAsset failed:", e));
+  if (isUnityAssetPath(filePath)) {
+    runAssetRefClickAction({ kind: "asset", assetPath: filePath, entryKind: "file" });
     return;
   }
   openFileExternal(filePath).catch((e: unknown) => console.warn("openFileExternal failed:", e));
 }
 
 function handleFolderRefClick(folderPath: string) {
-  if (shouldSelectUnityAsset(folderPath)) {
-    selectUnityAsset(folderPath).catch((e: unknown) => console.warn("selectUnityAsset failed:", e));
+  if (isUnityAssetPath(folderPath)) {
+    runAssetRefClickAction({ kind: "asset", assetPath: folderPath, entryKind: "folder" });
     return;
   }
   showInFolder(folderPath).catch((e: unknown) => console.warn("showInFolder failed:", e));
+}
+
+type AssetRefClickTarget =
+  | { kind: "asset"; assetPath: string; entryKind: "file" | "folder" }
+  | { kind: "sceneObject"; scenePath: string; objectPath: string };
+
+function assetRefInspectorPayload(target: AssetRefClickTarget): LocusAssetInspectorWindowPayload {
+  return target.kind === "sceneObject"
+    ? { kind: "sceneObject", scenePath: target.scenePath, objectPath: target.objectPath }
+    : { assetPath: target.assetPath };
+}
+
+/** Pre-inspector click behavior, also the fallback when the inspector cannot open. */
+function legacyAssetRefClick(target: AssetRefClickTarget) {
+  if (target.kind === "sceneObject") {
+    selectUnitySceneObjectRef(target.scenePath, target.objectPath);
+    return;
+  }
+  if (target.entryKind === "folder") {
+    if (shouldSelectUnityAsset(target.assetPath)) {
+      selectUnityAsset(target.assetPath).catch((e: unknown) => console.warn("selectUnityAsset failed:", e));
+      return;
+    }
+    showInFolder(target.assetPath).catch((e: unknown) => console.warn("showInFolder failed:", e));
+    return;
+  }
+  if (canOpenInEditor(target.assetPath)) {
+    openFileExternal(target.assetPath).catch((e: unknown) => console.warn("openFileExternal failed:", e));
+    return;
+  }
+  if (shouldSelectUnityAsset(target.assetPath)) {
+    selectUnityAsset(target.assetPath).catch((e: unknown) => console.warn("selectUnityAsset failed:", e));
+    return;
+  }
+  openFileExternal(target.assetPath).catch((e: unknown) => console.warn("openFileExternal failed:", e));
+}
+
+function openAssetRefInUnityInspector(target: AssetRefClickTarget) {
+  if (target.kind === "sceneObject") {
+    handleUnitySceneObjectInspectorClick(target.scenePath, target.objectPath);
+    return;
+  }
+  openUnityAssetInspector(target.assetPath).catch((e: unknown) => {
+    console.warn("openUnityAssetInspector failed:", e);
+    // Fall back to the pre-inspector behavior instead of handleFileRefClick,
+    // which would re-enter runAssetRefClickAction and loop on repeat failure.
+    legacyAssetRefClick(target);
+  });
+}
+
+function runAssetRefClickAction(target: AssetRefClickTarget) {
+  const action = isUnityEmbeddedWindow()
+    ? displaySettings.unityEmbedAssetRefClickAction
+    : displaySettings.assetRefClickAction;
+  if (action === "unityInspector") {
+    openAssetRefInUnityInspector(target);
+    return;
+  }
+  if (action === "fileBrowser") {
+    const revealPath = target.kind === "sceneObject" ? target.scenePath : target.assetPath;
+    showInFolder(revealPath).catch((e: unknown) => console.warn("showInFolder failed:", e));
+    return;
+  }
+  if (
+    action === "locusInspectorAuto"
+    || action === "locusInspectorEmbedded"
+    || action === "locusInspectorWindow"
+  ) {
+    openLocusAssetInspector(
+      assetRefInspectorPayload(target),
+      action === "locusInspectorWindow"
+        ? "window"
+        : action === "locusInspectorEmbedded"
+          ? "embedded"
+          : "auto",
+    )
+      .then((opened) => {
+        if (!opened) legacyAssetRefClick(target);
+      })
+      .catch((error: unknown) => {
+        console.warn("openLocusAssetInspector failed:", error);
+        notifyAssetRefContextMenuError(error, "assetRefOpenLocusInspector", t("asset.inspector.openFailed"));
+      });
+    return;
+  }
+  legacyAssetRefClick(target);
 }
 
 function notifyAssetRefContextMenuError(error: unknown, operation: string, fallbackMessage: string) {
@@ -798,31 +885,35 @@ async function doAssetRefOpenInEditor() {
   }
 }
 
-async function doAssetRefOpenInLocusInspector() {
+async function doAssetRefOpenInLocusInspector(mode: "embedded" | "window" = "embedded") {
   const target = assetRefCtxMenu.value?.target;
   if (!target || !assetRefContextCanOpenLocusInspector.value) return;
   closeAssetRefContextMenu();
   try {
     if (target.kind === "sceneObject") {
-      const opened = await openLocusAssetInspectorWindow({
+      const opened = await openLocusAssetInspector({
         kind: "sceneObject",
         scenePath: target.scenePath,
         objectPath: target.objectPath,
-      });
+      }, mode);
       if (!opened) {
         await openUnitySceneObjectInspector(target.scenePath, target.objectPath);
       }
       return;
     }
     if (target.kind !== "asset") return;
-    const opened = await openLocusAssetInspectorWindow({ assetPath: target.assetPath });
+    const opened = await openLocusAssetInspector({ assetPath: target.assetPath }, mode);
     if (!opened) {
       await openFileExternal(target.filePath);
     }
   } catch (error) {
-    console.warn("openLocusAssetInspectorWindow failed:", error);
+    console.warn("openLocusAssetInspector failed:", error);
     notifyAssetRefContextMenuError(error, "assetRefOpenLocusInspector", t("asset.inspector.openFailed"));
   }
+}
+
+function doAssetRefOpenInLocusInspectorWindow() {
+  return doAssetRefOpenInLocusInspector("window");
 }
 
 async function openInlineDiffInWindow() {
@@ -1988,7 +2079,7 @@ function readTranscriptViewportWidth() {
 }
 
 function isLiveResizeInProgress() {
-  return uiStore.isWindowResizing || isDraggingSession.value;
+  return uiStore.isWindowResizing || isDraggingSession.value || uiStore.isAssistantSidebarTransitioning;
 }
 
 function noteTranscriptViewportResize() {
@@ -2038,6 +2129,7 @@ function scheduleTranscriptResizeReconcile(reason: string) {
         reason,
         windowResizing: uiStore.isWindowResizing,
         sessionDragging: isDraggingSession.value,
+        sidebarTransitioning: uiStore.isAssistantSidebarTransitioning,
       });
       return;
     }
@@ -2055,6 +2147,7 @@ function handleTranscriptResize() {
     recordLayoutDiagnostic("chat.transcript.resize.defer", {
       windowResizing: uiStore.isWindowResizing,
       sessionDragging: isDraggingSession.value,
+      sidebarTransitioning: uiStore.isAssistantSidebarTransitioning,
       viewportResizing,
     });
     return;
@@ -2281,6 +2374,14 @@ watch(isDraggingSession, (dragging) => {
   if (dragging) return;
   flushPendingTranscriptResizeReconcile("session-drag-settled");
 });
+
+watch(
+  () => uiStore.isAssistantSidebarTransitioning,
+  (transitioning) => {
+    if (transitioning) return;
+    flushPendingTranscriptResizeReconcile("sidebar-transition-settled");
+  },
+);
 
 function clampSessionPanelWidth(width: number) {
   return Math.max(140, Math.min(480, Math.round(width)));
@@ -2921,9 +3022,16 @@ onUnmounted(() => {
               <button
                 type="button"
                 class="asset-ref-ctx-item"
-                @click="doAssetRefOpenInLocusInspector"
+                @click="doAssetRefOpenInLocusInspector()"
               >
                 {{ t("common.openInLocusInspector") }}
+              </button>
+              <button
+                type="button"
+                class="asset-ref-ctx-item"
+                @click="doAssetRefOpenInLocusInspectorWindow"
+              >
+                {{ t("common.openInLocusInspectorWindow") }}
               </button>
             </template>
           </template>

@@ -1785,7 +1785,7 @@ namespace Locus
                    "\"message\":\"ok\"," +
                    "\"target\":" + TargetToJson(target) + "," +
                    snapshotFields + "," +
-                   (properties != null ? "\"properties\":" + ToJsonValue(properties, 0) + "," : "") +
+                   (properties != null ? "\"properties\":" + ToJsonValue(properties, 0, SnapshotJsonDepthLimit, true) + "," : "") +
                    "\"saved\":" + (saved ? "true" : "false") +
                    "}";
         }

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch } from "vue";
+import { computed, onBeforeUnmount, ref, watch } from "vue";
 import BaseButton from "../ui/BaseButton.vue";
 import BaseContextMenu from "../ui/BaseContextMenu.vue";
 import {
@@ -24,6 +24,11 @@ import {
   writeUnitySerializedProperty,
   type UnitySerializedPropertyTarget,
 } from "../../services/unitySerializedProperty";
+import {
+  unityPropertyObjectTarget,
+  unityPropertyTargetKey,
+} from "../../services/unityPropertyPath";
+import { listenUnityValueEditorCommitted } from "../../services/unityValueEditorWindow";
 import { useNotificationStore } from "../../stores/notification";
 import UnitySerializedPropertyTree from "./UnitySerializedPropertyTree.vue";
 import type {
@@ -70,6 +75,15 @@ const rowContextUnitySelection = computed(() => {
 });
 const rowContextCanSelectInUnity = computed(() => rowContextUnitySelection.value !== null);
 let loadRun = 0;
+// Limits concurrent bridge reads so a large fence does not flood Unity.
+const LOAD_CONCURRENCY = 4;
+const PREVIEW_WRITE_INTERVAL_MS = 90;
+// Monotonic per-row write tokens: only the latest in-flight write may patch
+// the row, so rapid commits (or a commit racing a Refresh) cannot land a
+// stale snapshot.
+const rowWriteSeq = new Map<string, number>();
+const rowPreviewTimers = new Map<string, number>();
+const rowPreviewValues = new Map<string, { propertyPath: string; value: unknown }>();
 
 watch(
   () => props.source,
@@ -79,8 +93,46 @@ watch(
   { immediate: true },
 );
 
+// The Locus value editor window owns its own write-back; when it commits to
+// an object shown here, re-read the affected rows.
+let unlistenValueEditor: (() => void) | null = null;
+void listenUnityValueEditorCommitted((event) => {
+  const objectKey = unityPropertyTargetKey(unityPropertyObjectTarget(event.target));
+  rows.value.forEach((row) => {
+    if (unityPropertyTargetKey(unityPropertyObjectTarget(row.entry.target)) === objectKey) {
+      void loadProperty(row.entry);
+    }
+  });
+}).then((dispose) => {
+  unlistenValueEditor = dispose;
+});
+
+onBeforeUnmount(() => {
+  cancelAllRowPreviews();
+  unlistenValueEditor?.();
+  unlistenValueEditor = null;
+});
+
+async function mapWithConcurrency<T>(
+  items: readonly T[],
+  limit: number,
+  task: (item: T) => Promise<void>,
+): Promise<void> {
+  const queue = [...items];
+  const workers = Array.from({ length: Math.max(1, Math.min(limit, queue.length)) }, async () => {
+    let item = queue.shift();
+    while (item !== undefined) {
+      await task(item);
+      item = queue.shift();
+    }
+  });
+  await Promise.all(workers);
+}
+
 async function reloadProperties() {
   const run = ++loadRun;
+  cancelAllRowPreviews();
+  rowWriteSeq.clear();
   const parsed = parseUnityPropertyFence(props.source);
   issues.value = parsed.issues;
   rows.value = parsed.entries.map((entry) => ({
@@ -91,7 +143,7 @@ async function reloadProperties() {
     property: null,
   }));
 
-  await Promise.all(rows.value.map((row) => loadProperty(row.entry, run)));
+  await mapWithConcurrency(parsed.entries, LOAD_CONCURRENCY, (entry) => loadProperty(entry, run));
 }
 
 async function loadProperty(entry: UnityPropertyFenceEntry, run = loadRun) {
@@ -104,7 +156,7 @@ async function loadProperty(entry: UnityPropertyFenceEntry, run = loadRun) {
       maxArrayItems: 32,
     });
     if (run !== loadRun) return;
-    if (!result.ok) throw new Error(result.message || "Failed to read Unity property.");
+    if (!result.ok) throw new Error(result.message || t("unity.property.fence.readFailed"));
     patchRow(entry.id, {
       loading: false,
       property: snapshotWithTarget(result, entry.target),
@@ -117,6 +169,10 @@ async function loadProperty(entry: UnityPropertyFenceEntry, run = loadRun) {
       property: null,
     });
   }
+}
+
+function retryRow(row: PropertyRow) {
+  void loadProperty(row.entry);
 }
 
 function patchRow(id: string, patch: Partial<Omit<PropertyRow, "entry">>) {
@@ -149,27 +205,79 @@ function targetWithPropertyPath(
 async function commitProperty(row: PropertyRow, event: UnitySerializedPropertyCommitEvent) {
   const propertyPath = event.propertyPath || row.entry.target.propertyPath || row.property?.propertyPath || "";
   if (!propertyPath) return;
+  const rowId = row.entry.id;
   const target = targetWithPropertyPath(row.entry.target, propertyPath);
+  const run = loadRun;
+  const writeToken = (rowWriteSeq.get(rowId) ?? 0) + 1;
+  rowWriteSeq.set(rowId, writeToken);
+  // A queued preview must never land after the commit it belongs to.
+  cancelRowPreview(rowId);
 
-  patchRow(row.entry.id, { saving: true, error: "" });
+  patchRow(rowId, { saving: true, error: "" });
   try {
     const result = await writeUnitySerializedProperty({
-      bindingId: row.entry.id,
+      bindingId: rowId,
       target,
       value: event.value,
       writeMode: "commit",
     });
-    if (!result.ok) throw new Error(result.message || "Failed to write Unity property.");
-    patchRow(row.entry.id, {
+    if (run !== loadRun || rowWriteSeq.get(rowId) !== writeToken) return;
+    if (!result.ok) throw new Error(result.message || t("unity.property.fence.writeFailed"));
+    patchRow(rowId, {
       saving: false,
       property: snapshotWithTarget(result, target),
     });
   } catch (error) {
-    patchRow(row.entry.id, {
+    if (run !== loadRun || rowWriteSeq.get(rowId) !== writeToken) return;
+    patchRow(rowId, {
       saving: false,
       error: unityPropertyErrorMessage(error),
     });
   }
+}
+
+function previewProperty(row: PropertyRow, event: UnitySerializedPropertyCommitEvent) {
+  const propertyPath = event.propertyPath || row.entry.target.propertyPath || row.property?.propertyPath || "";
+  if (!propertyPath) return;
+  const rowId = row.entry.id;
+  rowPreviewValues.set(rowId, { propertyPath, value: event.value });
+  if (rowPreviewTimers.has(rowId)) return;
+  rowPreviewTimers.set(rowId, window.setTimeout(() => {
+    rowPreviewTimers.delete(rowId);
+    void flushRowPreview(rowId);
+  }, PREVIEW_WRITE_INTERVAL_MS));
+}
+
+async function flushRowPreview(rowId: string) {
+  const pending = rowPreviewValues.get(rowId);
+  rowPreviewValues.delete(rowId);
+  const row = rowById(rowId);
+  if (!pending || !row) return;
+  try {
+    await writeUnitySerializedProperty({
+      bindingId: rowId,
+      target: targetWithPropertyPath(row.entry.target, pending.propertyPath),
+      value: pending.value,
+      writeMode: "preview",
+    });
+  } catch (error) {
+    console.warn("[UnityPropertyFenceBlock] preview write failed:", error);
+  }
+}
+
+function cancelRowPreview(rowId: string) {
+  const timer = rowPreviewTimers.get(rowId);
+  if (timer !== undefined) {
+    window.clearTimeout(timer);
+    rowPreviewTimers.delete(rowId);
+  }
+  rowPreviewValues.delete(rowId);
+}
+
+function cancelAllRowPreviews() {
+  rowPreviewTimers.forEach((timer) => window.clearTimeout(timer));
+  rowPreviewTimers.clear();
+  rowPreviewValues.clear();
 }
 
 function unityPropertyErrorMessage(error: unknown): string {
@@ -305,18 +413,18 @@ function shortTypeName(typeName: string): string {
         :disabled="loading"
         @click="reloadProperties"
       >
-        Refresh
+        {{ t("unity.property.fence.refresh") }}
       </BaseButton>
     </header>
 
     <div v-if="issues.length" class="unity-property-issues">
       <div v-for="issue in issues" :key="`${issue.line}:${issue.source}`" class="unity-property-state error">
-        Line {{ issue.line }}: {{ issue.message }}
+        {{ t("unity.property.fence.lineIssue", issue.line, issue.message) }}
       </div>
     </div>
 
     <div v-if="!rows.length && !issues.length" class="unity-property-state">
-      No Unity properties.
+      {{ t("unity.property.fence.empty") }}
     </div>
 
     <div v-else class="unity-property-list">
@@ -352,13 +460,23 @@ function shortTypeName(typeName: string): string {
           </div>
 
           <div class="unity-property-editor-cell">
-            <div v-if="row.loading" class="unity-property-state">Loading...</div>
-            <div v-else-if="row.error" class="unity-property-state error">{{ row.error }}</div>
+            <div v-if="row.loading" class="unity-property-state">{{ t("unity.property.fence.loading") }}</div>
+            <div v-else-if="row.error" class="unity-property-state error">
+              <span class="unity-property-error-text">{{ row.error }}</span>
+              <button
+                type="button"
+                class="unity-property-retry"
+                @click="retryRow(row)"
+              >
+                {{ t("unity.property.fence.retry") }}
+              </button>
+            </div>
             <UnitySerializedPropertyTree
               v-else-if="row.property"
               :property="row.property"
               compact
               @commit="commitProperty(row, $event)"
+              @preview="previewProperty(row, $event)"
             />
           </div>
         </div>
@@ -541,7 +659,34 @@ function shortTypeName(typeName: string): string {
 }
 
 .unity-property-state.error {
+  gap: 8px;
   color: var(--status-danger-fg);
+}
+
+.unity-property-error-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.unity-property-retry {
+  flex-shrink: 0;
+  min-height: 22px;
+  padding: 0 7px;
+  border: 1px solid var(--border-color);
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.unity-property-retry:hover,
+.unity-property-retry:focus-visible {
+  border-color: var(--accent-color);
+  color: var(--text-color);
+  outline: none;
 }
 
 @media (max-width: 720px) {

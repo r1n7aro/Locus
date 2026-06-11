@@ -591,9 +591,12 @@ describe("Unity embedded session view", () => {
     expect(dragSource).toContain("setUnityEmbedDragPassthrough(true)");
     expect(dragSource).toContain("startUnityEmbedAssetDrag(refs)");
     expect(dragSource).toContain("startUnityAssetDragWarmup(refs)");
-    expect(dragSource).toContain("cancelUnityAssetDragWarmup(warmup)");
-    expect(dragSource).toContain("beginNativeAssetFileDrag(refs, warmup)");
-    expect(dragSource).toContain("beginUnityReferencePointerDrag(refs, warmup)");
+    expect(dragSource).toContain("beginNativeAssetFileDrag(refs)");
+    expect(dragSource).toContain("beginUnityReferencePointerDrag(refs)");
+    // Warmup must stay lazy (inside the begin* paths): warming up on
+    // pointerdown flashes the native drag preview on plain clicks.
+    expect(dragSource).not.toContain("cancelUnityAssetDragWarmup");
+    expect(dragSource).toContain("POINTER_DRAG_MIN_HOLD_MS");
     expect(dragSource).toContain("Promise.allSettled([armPromise, nativeDragPromise])");
     expect(dragSource).toContain("Promise.all([armPromise, passthroughPromise])");
     expect(service).toContain("unity_embed_set_drag_passthrough");

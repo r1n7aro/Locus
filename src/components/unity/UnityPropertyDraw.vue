@@ -1,5 +1,5 @@
 <script lang="ts">
-import { defineComponent, type PropType } from "vue";
+import { defineComponent, h, onErrorCaptured, ref, watch, type PropType, type VNodeChild } from "vue";
 import type {
   InspectorProperty,
   InspectorPropertyCommit,
@@ -13,6 +13,24 @@ function toUnityCommitEvent(commit: InspectorPropertyCommit): UnitySerializedPro
     value: commit.value,
     property: commit.snapshot as UnitySerializedPropertyCommitEvent["property"],
   };
+}
+
+function drawFallback(property: InspectorProperty): VNodeChild {
+  return h(
+    "div",
+    {
+      class: "unity-property-draw-error",
+      "data-property-path": property.propertyPath,
+    },
+    [
+      h("span", { class: "unity-property-draw-error-label" }, property.label),
+      h(
+        "span",
+        { class: "unity-property-draw-error-message" },
+        "Custom drawer failed; showing raw value: " + (property.displayValue || ""),
+      ),
+    ],
+  );
 }
 
 export default defineComponent({
@@ -47,15 +65,46 @@ export default defineComponent({
     commit: (_event: UnitySerializedPropertyCommitEvent) => true,
   },
   setup(props, { emit }) {
-    return () =>
-      props.property.draw({
-        drawers: props.propertyDrawers,
-        disabled: props.disabled,
-        readonly: props.readonly,
-        compact: props.compact,
-        showLabel: props.showLabel,
-        onCommit: (commit) => emit("commit", toUnityCommitEvent(commit)),
-      });
+    // Error boundary: a broken custom drawer (e.g. from a plugin) must never
+    // take down the whole inspector tree.
+    const drawFailed = ref(false);
+
+    watch(
+      () => props.property.propertyPath,
+      () => {
+        drawFailed.value = false;
+      },
+    );
+
+    onErrorCaptured((error) => {
+      console.warn(
+        `[UnityPropertyDraw] custom drawer failed for ${props.property.propertyPath}:`,
+        error,
+      );
+      drawFailed.value = true;
+      return false;
+    });
+
+    return () => {
+      if (drawFailed.value) return drawFallback(props.property);
+      try {
+        return props.property.draw({
+          drawers: props.propertyDrawers,
+          disabled: props.disabled,
+          readonly: props.readonly,
+          compact: props.compact,
+          showLabel: props.showLabel,
+          onCommit: (commit) => emit("commit", toUnityCommitEvent(commit)),
+        });
+      } catch (error) {
+        console.warn(
+          `[UnityPropertyDraw] custom drawer failed for ${props.property.propertyPath}:`,
+          error,
+        );
+        drawFailed.value = true;
+        return drawFallback(props.property);
+      }
+    };
   },
 });
 </script>
@@ -118,5 +167,29 @@ export default defineComponent({
   gap: 6px;
   padding-left: 10px;
   border-left: 1px solid var(--border-color);
+}
+
+:deep(.unity-property-draw-error) {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+  padding: 4px 7px;
+  border: 1px solid var(--status-danger-border, var(--border-color));
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--status-danger-bg, transparent) 30%, transparent);
+}
+
+:deep(.unity-property-draw-error-label) {
+  color: var(--text-color);
+  font-size: 12px;
+}
+
+:deep(.unity-property-draw-error-message) {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--status-danger-fg, var(--text-secondary));
+  font-size: 11px;
 }
 </style>

@@ -131,6 +131,57 @@ namespace Locus
             public float a = 1f;
         }
 
+        private sealed class BoundsJson
+        {
+            public Vector3Json center;
+            public Vector3Json extents;
+        }
+
+        private sealed class BoundsIntJson
+        {
+            public Vector3Json position;
+            public Vector3Json size;
+        }
+
+        private sealed class AnimationCurveKeyJson
+        {
+            public float time;
+            public float value;
+            // Newtonsoft converts the strings "Infinity"/"-Infinity" (used for
+            // constant tangents, which strict JSON cannot carry) into floats.
+            public float inTangent;
+            public float outTangent;
+            public float inWeight = 1f / 3f;
+            public float outWeight = 1f / 3f;
+            public string weightedMode;
+        }
+
+        private sealed class AnimationCurveJson
+        {
+            public AnimationCurveKeyJson[] keys;
+            public string preWrapMode;
+            public string postWrapMode;
+        }
+
+        private sealed class GradientColorKeyJson
+        {
+            public float time;
+            public string color;
+        }
+
+        private sealed class GradientAlphaKeyJson
+        {
+            public float time;
+            public float alpha = 1f;
+        }
+
+        private sealed class GradientJson
+        {
+            public string mode;
+            public GradientColorKeyJson[] colorKeys;
+            public GradientAlphaKeyJson[] alphaKeys;
+        }
+
         private sealed class SerializedArrayWriteCommand
         {
             public string action;
@@ -243,9 +294,15 @@ namespace Locus
             };
         }
 
+        // Snapshot trees are acyclic and already bounded by the read maxDepth
+        // clamp (16 property levels ≈ 2 JSON levels each, plus the aggregate
+        // wrapper and nested value objects), so the cap only guards against
+        // future unbounded shapes — it must stay above any reachable depth.
+        private const int SnapshotJsonDepthLimit = 64;
+
         public static string SerializedPropertySnapshotToJson(SerializedPropertySnapshot snapshot)
         {
-            return ToJsonValue(snapshot, 0);
+            return ToJsonValue(snapshot, 0, SnapshotJsonDepthLimit, true);
         }
 
         public static bool IsSerializedPropertyWritable(SerializedProperty prop)
@@ -272,6 +329,14 @@ namespace Locus
                 case SerializedPropertyType.Quaternion:
                 case SerializedPropertyType.Color:
                 case SerializedPropertyType.Rect:
+                case SerializedPropertyType.Vector2Int:
+                case SerializedPropertyType.Vector3Int:
+                case SerializedPropertyType.RectInt:
+                case SerializedPropertyType.Bounds:
+                case SerializedPropertyType.BoundsInt:
+                case SerializedPropertyType.Character:
+                case SerializedPropertyType.AnimationCurve:
+                case SerializedPropertyType.Gradient:
                 case SerializedPropertyType.ManagedReference:
                     return true;
                 default:
@@ -317,7 +382,9 @@ namespace Locus
                 case SerializedPropertyType.Quaternion:
                     return QuaternionValue(prop.quaternionValue);
                 case SerializedPropertyType.Color:
-                    return "#" + ColorUtility.ToHtmlStringRGBA(prop.colorValue);
+                    // Object form keeps HDR channel intensities (>1) that a hex
+                    // string cannot represent.
+                    return ColorValue(prop.colorValue);
                 case SerializedPropertyType.Rect:
                     Rect rect = prop.rectValue;
                     return new Dictionary<string, object>
@@ -327,6 +394,39 @@ namespace Locus
                         { "width", rect.width },
                         { "height", rect.height }
                     };
+                case SerializedPropertyType.Vector2Int:
+                    return VectorIntValue(prop.vector2IntValue);
+                case SerializedPropertyType.Vector3Int:
+                    return VectorIntValue(prop.vector3IntValue);
+                case SerializedPropertyType.RectInt:
+                    RectInt rectInt = prop.rectIntValue;
+                    return new Dictionary<string, object>
+                    {
+                        { "x", rectInt.x },
+                        { "y", rectInt.y },
+                        { "width", rectInt.width },
+                        { "height", rectInt.height }
+                    };
+                case SerializedPropertyType.Bounds:
+                    Bounds bounds = prop.boundsValue;
+                    return new Dictionary<string, object>
+                    {
+                        { "center", VectorValue(bounds.center) },
+                        { "extents", VectorValue(bounds.extents) }
+                    };
+                case SerializedPropertyType.BoundsInt:
+                    BoundsInt boundsInt = prop.boundsIntValue;
+                    return new Dictionary<string, object>
+                    {
+                        { "position", VectorIntValue(boundsInt.position) },
+                        { "size", VectorIntValue(boundsInt.size) }
+                    };
+                case SerializedPropertyType.Character:
+                    return CharacterValueString(prop.intValue);
+                case SerializedPropertyType.AnimationCurve:
+                    return AnimationCurveValue(prop);
+                case SerializedPropertyType.Gradient:
+                    return GradientValue(prop);
                 case SerializedPropertyType.ManagedReference:
                     return new Dictionary<string, object>
                     {
@@ -377,13 +477,35 @@ namespace Locus
                 case SerializedPropertyType.Quaternion:
                     return FormatVector(prop.quaternionValue.eulerAngles);
                 case SerializedPropertyType.Color:
-                    return "#" + ColorUtility.ToHtmlStringRGBA(prop.colorValue);
+                    return FormatColorDisplay(prop.colorValue);
                 case SerializedPropertyType.Rect:
                     Rect rect = prop.rectValue;
                     return rect.x.ToString(CultureInfo.InvariantCulture) + ", " +
                            rect.y.ToString(CultureInfo.InvariantCulture) + ", " +
                            rect.width.ToString(CultureInfo.InvariantCulture) + ", " +
                            rect.height.ToString(CultureInfo.InvariantCulture);
+                case SerializedPropertyType.Vector2Int:
+                    return FormatVectorInt(prop.vector2IntValue);
+                case SerializedPropertyType.Vector3Int:
+                    return FormatVectorInt(prop.vector3IntValue);
+                case SerializedPropertyType.RectInt:
+                    RectInt rectInt = prop.rectIntValue;
+                    return rectInt.x.ToString(CultureInfo.InvariantCulture) + ", " +
+                           rectInt.y.ToString(CultureInfo.InvariantCulture) + ", " +
+                           rectInt.width.ToString(CultureInfo.InvariantCulture) + ", " +
+                           rectInt.height.ToString(CultureInfo.InvariantCulture);
+                case SerializedPropertyType.Bounds:
+                    Bounds bounds = prop.boundsValue;
+                    return "Center " + FormatVector(bounds.center) + " Extents " + FormatVector(bounds.extents);
+                case SerializedPropertyType.BoundsInt:
+                    BoundsInt boundsInt = prop.boundsIntValue;
+                    return "Position " + FormatVectorInt(boundsInt.position) + " Size " + FormatVectorInt(boundsInt.size);
+                case SerializedPropertyType.Character:
+                    return CharacterValueString(prop.intValue);
+                case SerializedPropertyType.AnimationCurve:
+                    return AnimationCurveDisplayValue(prop);
+                case SerializedPropertyType.Gradient:
+                    return GradientDisplayValue(prop);
                 case SerializedPropertyType.ManagedReference:
                     return ManagedReferenceDisplayName(prop.managedReferenceFullTypename);
                 default:
@@ -455,6 +577,47 @@ namespace Locus
                 case SerializedPropertyType.Rect:
                     RectJson rect = DeserializeJson<RectJson>(json);
                     prop.rectValue = new Rect(rect.x, rect.y, rect.width, rect.height);
+                    break;
+                case SerializedPropertyType.Vector2Int:
+                    Vector2Json v2i = DeserializeJson<Vector2Json>(json);
+                    prop.vector2IntValue = new Vector2Int(Mathf.RoundToInt(v2i.x), Mathf.RoundToInt(v2i.y));
+                    break;
+                case SerializedPropertyType.Vector3Int:
+                    Vector3Json v3i = DeserializeJson<Vector3Json>(json);
+                    prop.vector3IntValue = new Vector3Int(
+                        Mathf.RoundToInt(v3i.x),
+                        Mathf.RoundToInt(v3i.y),
+                        Mathf.RoundToInt(v3i.z));
+                    break;
+                case SerializedPropertyType.RectInt:
+                    RectJson rectInt = DeserializeJson<RectJson>(json);
+                    prop.rectIntValue = new RectInt(
+                        Mathf.RoundToInt(rectInt.x),
+                        Mathf.RoundToInt(rectInt.y),
+                        Mathf.RoundToInt(rectInt.width),
+                        Mathf.RoundToInt(rectInt.height));
+                    break;
+                case SerializedPropertyType.Bounds:
+                    BoundsJson boundsJson = DeserializeJson<BoundsJson>(json);
+                    Bounds nextBounds = new Bounds();
+                    nextBounds.center = ToVector3(boundsJson != null ? boundsJson.center : null);
+                    nextBounds.extents = ToVector3(boundsJson != null ? boundsJson.extents : null);
+                    prop.boundsValue = nextBounds;
+                    break;
+                case SerializedPropertyType.BoundsInt:
+                    BoundsIntJson boundsIntJson = DeserializeJson<BoundsIntJson>(json);
+                    prop.boundsIntValue = new BoundsInt(
+                        ToVector3Int(boundsIntJson != null ? boundsIntJson.position : null),
+                        ToVector3Int(boundsIntJson != null ? boundsIntJson.size : null));
+                    break;
+                case SerializedPropertyType.Character:
+                    prop.intValue = ParseCharacterJson(json);
+                    break;
+                case SerializedPropertyType.AnimationCurve:
+                    prop.animationCurveValue = ParseAnimationCurveJson(json);
+                    break;
+                case SerializedPropertyType.Gradient:
+                    SetSerializedGradientValue(prop, ParseGradientJson(json));
                     break;
                 case SerializedPropertyType.ManagedReference:
                     SetManagedReferenceValue(prop, json);
@@ -1731,6 +1894,384 @@ namespace Locus
                    value.y.ToString(CultureInfo.InvariantCulture) + ", " +
                    value.z.ToString(CultureInfo.InvariantCulture) + ", " +
                    value.w.ToString(CultureInfo.InvariantCulture);
+        }
+
+        private static Dictionary<string, object> VectorIntValue(Vector2Int value)
+        {
+            return new Dictionary<string, object>
+            {
+                { "x", value.x },
+                { "y", value.y }
+            };
+        }
+
+        private static Dictionary<string, object> VectorIntValue(Vector3Int value)
+        {
+            return new Dictionary<string, object>
+            {
+                { "x", value.x },
+                { "y", value.y },
+                { "z", value.z }
+            };
+        }
+
+        private static string FormatVectorInt(Vector2Int value)
+        {
+            return value.x.ToString(CultureInfo.InvariantCulture) + ", " +
+                   value.y.ToString(CultureInfo.InvariantCulture);
+        }
+
+        private static string FormatVectorInt(Vector3Int value)
+        {
+            return value.x.ToString(CultureInfo.InvariantCulture) + ", " +
+                   value.y.ToString(CultureInfo.InvariantCulture) + ", " +
+                   value.z.ToString(CultureInfo.InvariantCulture);
+        }
+
+        private static Vector3 ToVector3(Vector3Json value)
+        {
+            return value == null ? Vector3.zero : new Vector3(value.x, value.y, value.z);
+        }
+
+        private static Vector3Int ToVector3Int(Vector3Json value)
+        {
+            return value == null
+                ? Vector3Int.zero
+                : new Vector3Int(
+                    Mathf.RoundToInt(value.x),
+                    Mathf.RoundToInt(value.y),
+                    Mathf.RoundToInt(value.z));
+        }
+
+        private static Dictionary<string, object> ColorValue(Color color)
+        {
+            return new Dictionary<string, object>
+            {
+                { "r", color.r },
+                { "g", color.g },
+                { "b", color.b },
+                { "a", color.a }
+            };
+        }
+
+        private static bool IsHdrColor(Color color)
+        {
+            return color.r > 1f || color.g > 1f || color.b > 1f ||
+                   color.r < 0f || color.g < 0f || color.b < 0f;
+        }
+
+        private static string FormatColorDisplay(Color color)
+        {
+            if (!IsHdrColor(color))
+                return "#" + ColorUtility.ToHtmlStringRGBA(color);
+            return "RGBA(" +
+                   color.r.ToString("0.###", CultureInfo.InvariantCulture) + ", " +
+                   color.g.ToString("0.###", CultureInfo.InvariantCulture) + ", " +
+                   color.b.ToString("0.###", CultureInfo.InvariantCulture) + ", " +
+                   color.a.ToString("0.###", CultureInfo.InvariantCulture) + ")";
+        }
+
+        private static string CharacterValueString(int code)
+        {
+            return code <= 0 ? "" : ((char)code).ToString();
+        }
+
+        private static int ParseCharacterJson(string json)
+        {
+            string trimmed = (json ?? "").Trim();
+            if (trimmed.StartsWith("\"", StringComparison.Ordinal))
+            {
+                string text = ParseStringJson(json);
+                if (string.IsNullOrEmpty(text))
+                    throw new Exception("Character value cannot be empty");
+                return text[0];
+            }
+            return ParseIntJson(json);
+        }
+
+        private const int AnimationCurveSampleCount = 33;
+
+        private static object AnimationCurveValue(SerializedProperty prop)
+        {
+            AnimationCurve curve = null;
+            try
+            {
+                curve = prop.animationCurveValue;
+            }
+            catch
+            {
+            }
+
+            Keyframe[] keys = curve != null && curve.keys != null ? curve.keys : new Keyframe[0];
+            float startTime = keys.Length > 0 ? keys[0].time : 0f;
+            float endTime = keys.Length > 0 ? keys[keys.Length - 1].time : 1f;
+            if (endTime - startTime < 1e-6f)
+                endTime = startTime + 1f;
+
+            var samples = new List<object>(AnimationCurveSampleCount);
+            float minValue = float.MaxValue;
+            float maxValue = float.MinValue;
+            for (int i = 0; i < AnimationCurveSampleCount; i++)
+            {
+                float time = startTime + (endTime - startTime) * i / (AnimationCurveSampleCount - 1);
+                float value = curve != null ? curve.Evaluate(time) : 0f;
+                if (float.IsNaN(value) || float.IsInfinity(value))
+                    value = 0f;
+                minValue = Math.Min(minValue, value);
+                maxValue = Math.Max(maxValue, value);
+                samples.Add(value);
+            }
+            if (keys.Length == 0)
+            {
+                minValue = 0f;
+                maxValue = 1f;
+            }
+
+            var keyList = new List<object>(keys.Length);
+            for (int i = 0; i < keys.Length; i++)
+            {
+                keyList.Add(new Dictionary<string, object>
+                {
+                    { "time", keys[i].time },
+                    { "value", keys[i].value },
+                    { "inTangent", TangentJsonValue(keys[i].inTangent) },
+                    { "outTangent", TangentJsonValue(keys[i].outTangent) },
+                    { "inWeight", keys[i].inWeight },
+                    { "outWeight", keys[i].outWeight },
+                    { "weightedMode", keys[i].weightedMode.ToString() }
+                });
+            }
+
+            return new Dictionary<string, object>
+            {
+                { "keyCount", keys.Length },
+                { "startTime", startTime },
+                { "endTime", endTime },
+                { "minValue", minValue },
+                { "maxValue", maxValue },
+                { "samples", samples },
+                { "keys", keyList },
+                { "preWrapMode", curve != null ? curve.preWrapMode.ToString() : "ClampForever" },
+                { "postWrapMode", curve != null ? curve.postWrapMode.ToString() : "ClampForever" }
+            };
+        }
+
+        private static string AnimationCurveDisplayValue(SerializedProperty prop)
+        {
+            int keyCount = 0;
+            try
+            {
+                AnimationCurve curve = prop.animationCurveValue;
+                keyCount = curve != null && curve.keys != null ? curve.keys.Length : 0;
+            }
+            catch
+            {
+            }
+            return "Curve (" + keyCount.ToString(CultureInfo.InvariantCulture) + " keys)";
+        }
+
+        private static Gradient SerializedGradientValue(SerializedProperty prop)
+        {
+            // gradientValue is internal before Unity 2022.1; reflection keeps a
+            // single code path across every supported editor version.
+            try
+            {
+                PropertyInfo info = typeof(SerializedProperty).GetProperty(
+                    "gradientValue",
+                    BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                return info != null ? info.GetValue(prop, null) as Gradient : null;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static object GradientValue(SerializedProperty prop)
+        {
+            Gradient gradient = SerializedGradientValue(prop);
+            var colorKeys = new List<object>();
+            var alphaKeys = new List<object>();
+            string mode = "Blend";
+            if (gradient != null)
+            {
+                mode = gradient.mode.ToString();
+                GradientColorKey[] colors = gradient.colorKeys ?? new GradientColorKey[0];
+                for (int i = 0; i < colors.Length; i++)
+                {
+                    colorKeys.Add(new Dictionary<string, object>
+                    {
+                        { "time", colors[i].time },
+                        { "color", "#" + ColorUtility.ToHtmlStringRGB(colors[i].color) }
+                    });
+                }
+                GradientAlphaKey[] alphas = gradient.alphaKeys ?? new GradientAlphaKey[0];
+                for (int i = 0; i < alphas.Length; i++)
+                {
+                    alphaKeys.Add(new Dictionary<string, object>
+                    {
+                        { "time", alphas[i].time },
+                        { "alpha", alphas[i].alpha }
+                    });
+                }
+            }
+
+            return new Dictionary<string, object>
+            {
+                { "mode", mode },
+                { "colorKeys", colorKeys },
+                { "alphaKeys", alphaKeys }
+            };
+        }
+
+        private static string GradientDisplayValue(SerializedProperty prop)
+        {
+            Gradient gradient = SerializedGradientValue(prop);
+            int keyCount = gradient != null && gradient.colorKeys != null ? gradient.colorKeys.Length : 0;
+            return "Gradient (" + keyCount.ToString(CultureInfo.InvariantCulture) + " keys)";
+        }
+
+        /// Constant tangents are float.Infinity, which neither strict JSON nor
+        /// the frontend bridge can carry as a number; encode them as strings.
+        private static object TangentJsonValue(float value)
+        {
+            if (float.IsPositiveInfinity(value)) return "Infinity";
+            if (float.IsNegativeInfinity(value)) return "-Infinity";
+            if (float.IsNaN(value)) return 0f;
+            return value;
+        }
+
+        private static AnimationCurve ParseAnimationCurveJson(string json)
+        {
+            AnimationCurveJson data = DeserializeJson<AnimationCurveJson>(json);
+            var keys = new List<Keyframe>();
+            if (data != null && data.keys != null)
+            {
+                foreach (AnimationCurveKeyJson key in data.keys)
+                {
+                    if (key == null)
+                        continue;
+                    var frame = new Keyframe(
+                        key.time,
+                        key.value,
+                        key.inTangent,
+                        key.outTangent,
+                        Mathf.Clamp01(key.inWeight),
+                        Mathf.Clamp01(key.outWeight));
+                    frame.weightedMode = ParseWeightedMode(key.weightedMode);
+                    keys.Add(frame);
+                }
+            }
+            keys.Sort((a, b) => a.time.CompareTo(b.time));
+
+            var curve = new AnimationCurve(keys.ToArray());
+            curve.preWrapMode = ParseCurveWrapMode(data != null ? data.preWrapMode : null, curve.preWrapMode);
+            curve.postWrapMode = ParseCurveWrapMode(data != null ? data.postWrapMode : null, curve.postWrapMode);
+            return curve;
+        }
+
+        private static WeightedMode ParseWeightedMode(string value)
+        {
+            switch ((value ?? "").Trim().ToLowerInvariant())
+            {
+                case "in":
+                    return WeightedMode.In;
+                case "out":
+                    return WeightedMode.Out;
+                case "both":
+                    return WeightedMode.Both;
+                default:
+                    return WeightedMode.None;
+            }
+        }
+
+        private static WrapMode ParseCurveWrapMode(string value, WrapMode fallback)
+        {
+            switch ((value ?? "").Trim().ToLowerInvariant())
+            {
+                case "once":
+                    return WrapMode.Once;
+                case "loop":
+                    return WrapMode.Loop;
+                case "pingpong":
+                    return WrapMode.PingPong;
+                case "clampforever":
+                    return WrapMode.ClampForever;
+                case "default":
+                    return WrapMode.Default;
+                default:
+                    return fallback;
+            }
+        }
+
+        private const int GradientMaxKeys = 8;
+
+        private static Gradient ParseGradientJson(string json)
+        {
+            GradientJson data = DeserializeJson<GradientJson>(json);
+
+            var colorKeys = new List<GradientColorKey>();
+            if (data != null && data.colorKeys != null)
+            {
+                foreach (GradientColorKeyJson key in data.colorKeys)
+                {
+                    if (key == null)
+                        continue;
+                    Color color;
+                    if (!ColorUtility.TryParseHtmlString((key.color ?? "").Trim(), out color))
+                        color = Color.white;
+                    colorKeys.Add(new GradientColorKey(color, Mathf.Clamp01(key.time)));
+                }
+            }
+            if (colorKeys.Count == 0)
+                colorKeys.Add(new GradientColorKey(Color.white, 0f));
+            colorKeys.Sort((a, b) => a.time.CompareTo(b.time));
+            if (colorKeys.Count > GradientMaxKeys)
+                colorKeys.RemoveRange(GradientMaxKeys, colorKeys.Count - GradientMaxKeys);
+
+            var alphaKeys = new List<GradientAlphaKey>();
+            if (data != null && data.alphaKeys != null)
+            {
+                foreach (GradientAlphaKeyJson key in data.alphaKeys)
+                {
+                    if (key == null)
+                        continue;
+                    alphaKeys.Add(new GradientAlphaKey(Mathf.Clamp01(key.alpha), Mathf.Clamp01(key.time)));
+                }
+            }
+            if (alphaKeys.Count == 0)
+                alphaKeys.Add(new GradientAlphaKey(1f, 0f));
+            alphaKeys.Sort((a, b) => a.time.CompareTo(b.time));
+            if (alphaKeys.Count > GradientMaxKeys)
+                alphaKeys.RemoveRange(GradientMaxKeys, alphaKeys.Count - GradientMaxKeys);
+
+            var gradient = new Gradient();
+            gradient.SetKeys(colorKeys.ToArray(), alphaKeys.ToArray());
+            gradient.mode = ParseGradientMode(data != null ? data.mode : null);
+            return gradient;
+        }
+
+        private static GradientMode ParseGradientMode(string value)
+        {
+            switch ((value ?? "").Trim().ToLowerInvariant())
+            {
+                case "fixed":
+                    return GradientMode.Fixed;
+                default:
+                    return GradientMode.Blend;
+            }
+        }
+
+        private static void SetSerializedGradientValue(SerializedProperty prop, Gradient gradient)
+        {
+            // gradientValue is internal before Unity 2022.1; reflection keeps a
+            // single code path across every supported editor version.
+            PropertyInfo info = typeof(SerializedProperty).GetProperty(
+                "gradientValue",
+                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            if (info == null || !info.CanWrite)
+                throw new Exception("Gradient writes are not supported by this Unity version.");
+            info.SetValue(prop, gradient, null);
         }
     }
 }

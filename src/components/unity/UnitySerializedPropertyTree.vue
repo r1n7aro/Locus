@@ -27,6 +27,7 @@ import {
   tryParseUnitySerializedEditValue,
 } from "./unitySerializedValue";
 import LucideIcon from "../icons/LucideIcon.vue";
+import { t } from "../../i18n";
 
 type ArrayDragEdge = "before" | "after";
 
@@ -52,10 +53,18 @@ interface ArrayRenderItem {
 
 const ARRAY_POINTER_DRAG_THRESHOLD_PX = 4;
 const ARRAY_OPTIMISTIC_MOVE_TIMEOUT_MS = 2400;
+// Mirrors the propertyTree default; larger arrays start collapsed so a
+// 128-item array does not render 128 nested subtrees up front.
+const ARRAY_AUTO_COLLAPSE_COUNT = 24;
 
 const props = withDefaults(defineProps<{
   property?: UnitySerializedPropertySnapshot | null;
   source?: InspectorPropertyTreeBindingInput | null;
+  /**
+   * Internal recursion input: reuse an InspectorProperty from the parent tree
+   * instead of rebuilding a PropertyTree for every nesting level.
+   */
+  node?: InspectorProperty | null;
   disabled?: boolean;
   readonly?: boolean;
   compact?: boolean;
@@ -64,6 +73,7 @@ const props = withDefaults(defineProps<{
 }>(), {
   property: null,
   source: null,
+  node: null,
   disabled: false,
   readonly: false,
   compact: false,
@@ -89,16 +99,17 @@ const rootSnapshot = computed<UnitySerializedPropertySnapshot | null>(() => {
   if (Array.isArray(snapshots)) return (snapshots[0] as UnitySerializedPropertySnapshot | undefined) ?? null;
   return (snapshots as UnitySerializedPropertySnapshot | null) ?? null;
 });
-const tree = computed(() =>
-  createPropertyTree(rootSnapshot.value, {
+const tree = computed(() => {
+  if (props.node) return null;
+  return createPropertyTree(rootSnapshot.value, {
     id: propertyTreeBinding.value.id,
     targetId: propertyTreeBinding.value.targetId,
     disabled: propertyTreeBinding.value.disabled,
     readonly: propertyTreeBinding.value.readonly || !propertyTreeBinding.value.editable,
     propertyDrawers: props.propertyDrawers,
-  }),
-);
-const inspectorProperty = computed(() => tree.value.rootProperty);
+  });
+});
+const inspectorProperty = computed(() => props.node ?? tree.value?.rootProperty ?? null);
 const children = computed(() => inspectorProperty.value?.children ?? []);
 const propertyType = computed(() => inspectorProperty.value?.valueType || "String");
 const canEdit = computed(() => inspectorProperty.value?.canEdit === true);
@@ -110,15 +121,23 @@ const arrayItemCount = computed(() => {
   if (!property) return children.value.length;
   return Math.max(0, property.arraySize >= 0 ? property.arraySize : children.value.length);
 });
+const arraySizeDisplay = computed(() => {
+  const property = inspectorProperty.value;
+  if (!property) return children.value.length;
+  return property.arraySize >= 0 ? property.arraySize : children.value.length;
+});
+// hideRootObjectHeader always refers to this component instance's local root
+// (inspectorProperty), so no depth check: with node-based recursion the local
+// root keeps its depth from the original tree.
 const hideObjectHeader = computed(() => {
   const property = inspectorProperty.value;
   return props.hideRootObjectHeader &&
-    property?.depth === 0 &&
+    !!property &&
     children.value.length > 0 &&
     !property.isArray &&
     !property.isManagedReference;
 });
-const hideLeafLabel = computed(() => props.hideRootObjectHeader && inspectorProperty.value?.depth === 0);
+const hideLeafLabel = computed(() => props.hideRootObjectHeader && !!inspectorProperty.value);
 const managedTypeQuery = ref("");
 const selectedManagedType = computed(() => inspectorProperty.value?.managedReferenceFullTypename || "");
 const selectedManagedTypeOption = computed(() => inspectorProperty.value?.selectedManagedReferenceType ?? null);
@@ -172,10 +191,11 @@ watch(selectedManagedType, () => {
 watch(
   () => inspectorProperty.value?.propertyPath,
   () => {
-    arrayCollapsed.value = false;
+    arrayCollapsed.value = defaultArrayCollapsed();
     clearArrayOptimisticMove();
     stopArrayItemDrag();
   },
+  { immediate: true },
 );
 
 watch(
@@ -235,6 +255,13 @@ function childSource(property: InspectorProperty): InspectorPropertyTreeBindingI
   };
 }
 
+function leafBindingTarget(property: InspectorProperty) {
+  const root = property.root.snapshot as UnitySerializedPropertySnapshot;
+  const target = root.bindingTarget ?? root.target ?? null;
+  if (!target) return null;
+  return { ...target, propertyPath: property.propertyPath };
+}
+
 function toUnityCommitEvent(
   commit: InspectorPropertyCommit,
   writeMode: UnitySerializedPropertyCommitEvent["writeMode"] = "commit",
@@ -255,13 +282,30 @@ function toUnityCommitEvent(
 
 function commitProperty(property: InspectorProperty, value: unknown) {
   const commit = property.createCommit(value);
-  void Promise.resolve(propertyTreeBinding.value.commit(commit));
+  void Promise.resolve(propertyTreeBinding.value.commit(commit)).catch((error) => {
+    console.warn("[UnitySerializedPropertyTree] commit handler failed:", error);
+  });
   emit("commit", toUnityCommitEvent(commit));
 }
 
+function findTreeProperty(propertyPath: string): InspectorProperty | null {
+  if (!propertyPath) return null;
+  if (tree.value) return tree.value.getProperty(propertyPath);
+  const root = inspectorProperty.value;
+  if (!root) return null;
+  if (root.propertyPath === propertyPath) return root;
+  return root.descendants().find((child) => child.propertyPath === propertyPath) ?? null;
+}
+
 function commitDrawEvent(event: UnitySerializedPropertyCommitEvent) {
-  const property = tree.value.getProperty(event.propertyPath) ?? inspectorProperty.value;
-  if (!property) return;
+  // Strict path lookup: falling back to the local root would commit a child
+  // value onto the wrong property when the event no longer matches the tree.
+  const property = findTreeProperty(event.propertyPath)
+    ?? findTreeProperty(event.property.propertyPath);
+  if (!property) {
+    console.warn("[UnitySerializedPropertyTree] dropped commit for unknown property path:", event.propertyPath);
+    return;
+  }
   commitProperty(property, event.value);
 }
 
@@ -355,6 +399,7 @@ function startNumberLabelDrag(property: InspectorProperty, event: PointerEvent) 
   window.addEventListener("pointermove", handleNumberLabelDragMove);
   window.addEventListener("pointerup", stopNumberLabelDrag);
   window.addEventListener("pointercancel", stopNumberLabelDrag);
+  window.addEventListener("keydown", handleNumberLabelDragKeydown, true);
 }
 
 function handleNumberLabelDragMove(event: PointerEvent) {
@@ -373,15 +418,41 @@ function handleNumberLabelDragMove(event: PointerEvent) {
 function stopNumberLabelDrag() {
   const drag = numberLabelDrag.value;
   flushNumberLabelCommit();
-  if (drag) emitCommit(drag.property, drag.latestValue);
+  if (drag && !Object.is(drag.latestValue, drag.startValue)) {
+    emitCommit(drag.property, drag.latestValue);
+  }
   numberLabelDrag.value = null;
   stopNumberLabelDragListeners();
+}
+
+function cancelNumberLabelDrag() {
+  const drag = numberLabelDrag.value;
+  if (!drag) return;
+  if (numberLabelCommitFrame) {
+    cancelAnimationFrame(numberLabelCommitFrame);
+    numberLabelCommitFrame = 0;
+  }
+  pendingNumberLabelCommit = null;
+  numberLabelDrag.value = null;
+  numberLabelDragPreview.value = null;
+  if (!Object.is(drag.latestValue, drag.startValue)) {
+    emitPreview(drag.property, drag.startValue);
+  }
+  stopNumberLabelDragListeners();
+}
+
+function handleNumberLabelDragKeydown(event: KeyboardEvent) {
+  if (event.key !== "Escape" || !numberLabelDrag.value) return;
+  event.preventDefault();
+  event.stopPropagation();
+  cancelNumberLabelDrag();
 }
 
 function stopNumberLabelDragListeners() {
   window.removeEventListener("pointermove", handleNumberLabelDragMove);
   window.removeEventListener("pointerup", stopNumberLabelDrag);
   window.removeEventListener("pointercancel", stopNumberLabelDrag);
+  window.removeEventListener("keydown", handleNumberLabelDragKeydown, true);
 }
 
 function queueNumberLabelCommit(property: InspectorProperty, value: number) {
@@ -425,10 +496,26 @@ function numberLabelTitle(property: InspectorProperty): string {
 
 function commitArraySize(event: Event) {
   const property = inspectorProperty.value;
-  if (!canEdit.value) return;
   const target = event.target as HTMLInputElement | null;
-  const size = Math.max(0, Number.parseInt(target?.value || "0", 10) || 0);
-  if (property) emitCommit(property, { action: "resize", size });
+  if (!target) return;
+  const currentSize = arraySizeDisplay.value;
+  // A cleared or invalid size input must not commit as 0 and silently drop
+  // every element; restore the current size instead.
+  const raw = target.value.trim();
+  const size = /^\d+$/.test(raw) ? Number.parseInt(raw, 10) : Number.NaN;
+  if (!canEdit.value || !property || !Number.isFinite(size) || size === currentSize) {
+    target.value = String(currentSize);
+    return;
+  }
+  emitCommit(property, { action: "resize", size });
+}
+
+function restoreArraySizeOnEscape(event: KeyboardEvent) {
+  const target = event.target as HTMLInputElement | null;
+  if (!target) return;
+  // Sync the DOM value before blurring so the change event does not fire.
+  target.value = String(arraySizeDisplay.value);
+  target.blur();
 }
 
 function addArrayElement() {
@@ -439,6 +526,8 @@ function addArrayElement() {
     action: "insert",
     index: arrayItemCount.value,
   });
+  // Reveal the appended element when a large array starts collapsed.
+  arrayCollapsed.value = false;
 }
 
 function removeArrayElement(index: number) {
@@ -469,6 +558,10 @@ function clearArrayOptimisticMove() {
     arrayOptimisticMoveTimer = 0;
   }
   arrayOptimisticMove.value = null;
+}
+
+function defaultArrayCollapsed(): boolean {
+  return inspectorProperty.value?.isArray === true && arrayItemCount.value > ARRAY_AUTO_COLLAPSE_COUNT;
 }
 
 function toggleArrayCollapsed() {
@@ -544,6 +637,7 @@ function startArrayItemDrag(index: number, event: PointerEvent) {
   window.addEventListener("pointermove", handleArrayItemDragMove);
   window.addEventListener("pointerup", stopArrayItemDrag);
   window.addEventListener("pointercancel", stopArrayItemDrag);
+  window.addEventListener("keydown", handleArrayItemDragKeydown, true);
 }
 
 function handleArrayItemDragMove(event: PointerEvent) {
@@ -579,10 +673,24 @@ function stopArrayItemDrag(event?: PointerEvent) {
   stopArrayItemDragListeners();
 }
 
+function cancelArrayItemDrag() {
+  arrayPointerDrag.value = null;
+  arrayDrag.value = null;
+  stopArrayItemDragListeners();
+}
+
+function handleArrayItemDragKeydown(event: KeyboardEvent) {
+  if (event.key !== "Escape" || !arrayPointerDrag.value) return;
+  event.preventDefault();
+  event.stopPropagation();
+  cancelArrayItemDrag();
+}
+
 function stopArrayItemDragListeners() {
   window.removeEventListener("pointermove", handleArrayItemDragMove);
   window.removeEventListener("pointerup", stopArrayItemDrag);
   window.removeEventListener("pointercancel", stopArrayItemDrag);
+  window.removeEventListener("keydown", handleArrayItemDragKeydown, true);
 }
 
 function nudgeArrayElement(index: number, direction: 1 | -1, event: KeyboardEvent) {
@@ -659,19 +767,23 @@ function commitManagedType(event: Event) {
             class="array-size-input"
             type="number"
             min="0"
-            :value="inspectorProperty.arraySize >= 0 ? inspectorProperty.arraySize : children.length"
+            :value="arraySizeDisplay"
             :disabled="!canEdit"
             :readonly="editorReadonly"
             :title="inspectorProperty.propertyPath"
             @change="commitArraySize"
+            @keydown.esc.prevent="restoreArraySizeOnEscape"
           />
           <button type="button" class="array-add-button" :disabled="!canEdit" @click="addArrayElement">
             <LucideIcon :icon="Plus" :size="13" />
-            <span>Add</span>
+            <span>{{ t("unity.property.array.add") }}</span>
           </button>
         </div>
       </div>
       <div v-if="!arrayCollapsed" class="property-children">
+        <div v-if="arrayRenderItems.length === 0" class="array-empty">
+          {{ t("unity.property.array.empty") }}
+        </div>
         <div
           v-for="item in arrayRenderItems"
           :key="item.child.propertyPath"
@@ -683,8 +795,8 @@ function commitManagedType(event: Event) {
             type="button"
             class="array-index-handle"
             :disabled="!canDragArrayItem(item.sourceIndex)"
-            :aria-label="`Move element ${item.displayIndex}`"
-            title="Drag to reorder"
+            :aria-label="t('unity.property.array.move', item.displayIndex)"
+            :title="t('unity.property.array.dragToReorder')"
             @pointerdown="startArrayItemDrag(item.sourceIndex, $event)"
             @keydown.arrow-up="nudgeArrayElement(item.sourceIndex, -1, $event)"
             @keydown.arrow-down="nudgeArrayElement(item.sourceIndex, 1, $event)"
@@ -693,6 +805,7 @@ function commitManagedType(event: Event) {
           </button>
           <div class="array-item-content">
             <UnitySerializedPropertyTree
+              :node="item.child"
               :source="childSource(item.child)"
               :disabled="editorDisabled"
               :readonly="editorReadonly"
@@ -707,8 +820,8 @@ function commitManagedType(event: Event) {
             type="button"
             class="array-icon-button array-remove-button"
             :disabled="!canEdit"
-            :aria-label="`Remove element ${item.displayIndex}`"
-            title="Remove"
+            :aria-label="t('unity.property.array.remove', item.displayIndex)"
+            :title="t('unity.property.array.remove', item.displayIndex)"
             @click="removeArrayElement(item.sourceIndex)"
           >
             <LucideIcon :icon="Trash2" :size="13" />
@@ -727,7 +840,7 @@ function commitManagedType(event: Event) {
             :value="managedTypeQuery"
             :disabled="!canEdit"
             :readonly="editorReadonly"
-            placeholder="Search type"
+            :placeholder="t('unity.property.managedType.search')"
             :title="inspectorProperty.managedReferenceFieldTypename || inspectorProperty.propertyPath"
             @input="updateManagedTypeQuery"
             @keydown.enter.prevent="commitFirstManagedType"
@@ -739,7 +852,7 @@ function commitManagedType(event: Event) {
             :title="inspectorProperty.propertyPath"
             @change="commitManagedType"
           >
-            <option value="">None</option>
+            <option value="">{{ t("unity.property.managedType.none") }}</option>
             <option v-for="option in managedTypeOptions" :key="option.value" :value="option.value">
               {{ option.label }}
             </option>
@@ -750,6 +863,7 @@ function commitManagedType(event: Event) {
         <UnitySerializedPropertyTree
           v-for="child in children"
           :key="child.propertyPath"
+          :node="child"
           :source="childSource(child)"
           :disabled="editorDisabled"
           :readonly="editorReadonly"
@@ -778,6 +892,7 @@ function commitManagedType(event: Event) {
         <UnitySerializedPropertyTree
           v-for="child in children"
           :key="child.propertyPath"
+          :node="child"
           :source="childSource(child)"
           :disabled="editorDisabled"
           :readonly="editorReadonly"
@@ -823,6 +938,7 @@ function commitManagedType(event: Event) {
         :max-lines="inspectorProperty.maxLines"
         :reference-type-full-name="inspectorProperty.referenceTypeFullName"
         :reference-type-assembly="inspectorProperty.referenceTypeAssembly"
+        :binding-target="leafBindingTarget(inspectorProperty)"
         @preview="previewLeaf"
         @commit="commitLeaf"
       />
@@ -1014,6 +1130,17 @@ function commitManagedType(event: Event) {
 .managed-type-select:focus {
   outline: none;
   border-color: var(--accent-color);
+}
+
+.array-empty {
+  min-height: var(--unity-property-row-height);
+  display: flex;
+  align-items: center;
+  padding: 0 8px;
+  border: 1px dashed color-mix(in srgb, var(--border-color) 82%, transparent);
+  border-radius: 6px;
+  color: var(--text-secondary);
+  font-size: 11px;
 }
 
 .array-item {

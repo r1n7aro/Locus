@@ -1,4 +1,4 @@
-import { ref } from "vue";
+import { computed, ref } from "vue";
 import { defineStore } from "pinia";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { Window as TauriWindow } from "@tauri-apps/api/window";
@@ -34,6 +34,8 @@ export const useUiStore = defineStore("ui", () => {
   const alwaysOnTop = ref(false);
   const isMaximized = ref(false);
   const isWindowResizing = ref(false);
+  const assistantSidebarTransitionCount = ref(0);
+  const isAssistantSidebarTransitioning = computed(() => assistantSidebarTransitionCount.value > 0);
   const nativeWindowWidth = ref<number | null>(null);
   const nativeWindowHeight = ref<number | null>(null);
   const showOnboarding = ref(false);
@@ -135,6 +137,14 @@ export const useUiStore = defineStore("ui", () => {
     }, WINDOW_RESIZE_SETTLE_DELAY_MS);
   }
 
+  function beginAssistantSidebarTransition() {
+    assistantSidebarTransitionCount.value += 1;
+  }
+
+  function endAssistantSidebarTransition() {
+    assistantSidebarTransitionCount.value = Math.max(0, assistantSidebarTransitionCount.value - 1);
+  }
+
   function scheduleWindowResizeSettle(width?: number, height?: number) {
     const observedWidth = normalizeNativeDimension(width);
     const observedHeight = normalizeNativeDimension(height);
@@ -188,6 +198,7 @@ export const useUiStore = defineStore("ui", () => {
   function cleanup() {
     clearResizeSettleTimer();
     isWindowResizing.value = false;
+    assistantSidebarTransitionCount.value = 0;
     nativeWindowWidth.value = null;
     nativeWindowHeight.value = null;
     maximizedSyncSeq += 1;
@@ -299,6 +310,7 @@ export const useUiStore = defineStore("ui", () => {
     alwaysOnTop,
     isMaximized,
     isWindowResizing,
+    isAssistantSidebarTransitioning,
     nativeWindowWidth,
     nativeWindowHeight,
     showOnboarding,
@@ -325,6 +337,8 @@ export const useUiStore = defineStore("ui", () => {
     winMinimize,
     winToggleMaximize,
     winClose,
+    beginAssistantSidebarTransition,
+    endAssistantSidebarTransition,
     completeOnboarding,
     resetOnboarding,
   };

@@ -40,6 +40,7 @@ Treat `/plugin <request>` as the only command entry. Interpret words such as sea
    - Keep `/plugin` focused on plugin lifecycle, ownership, packaging, dependency metadata, and publishing decisions.
    - To create or edit a View, load the View skill with `knowledge_read` using `path: "skill/view"` and `part: "body"`, then follow that skill.
    - To create or edit a Skill, load the Create Skill workflow with `knowledge_read` using `path: "skill/create-skill.md"` and `part: "body"`, then follow that workflow.
+   - To give `unity_yaml_read` a typed reader for custom or built-in YAML asset types, load the [extension guide](yaml-read-extensions.md) with `knowledge_read` using `path: "skill/plugin/yaml-read-extensions.md"` and `part: "body"`, then follow it. The reader is a Skill package `unityYamlReadExtensions` entry plus a C# file compiled in the connected Unity Editor.
    - Return to this workflow after the component edit is validated, then continue packaging, installation, ownership transfer, or publishing.
 
 4. Ask when a choice changes the result.

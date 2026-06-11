@@ -1589,7 +1589,7 @@ onUnmounted(() => {
                     />
                   </span>
                   <span
-                    v-else-if="entry.row.node.kind === 'folder' || entry.row.depth > 0"
+                    v-else-if="entry.row.depth > 0"
                     class="view-tree-branch-spacer"
                     aria-hidden="true"
                   ></span>

@@ -80,6 +80,16 @@ function commitVector() {
 function blurOnEnter(event: KeyboardEvent) {
   (event.target as HTMLElement | null)?.blur();
 }
+
+function restorePartOnEscape(key: string, event: KeyboardEvent) {
+  const input = event.target as HTMLInputElement | null;
+  // Other axes are already committed (change fires on blur), so re-syncing
+  // every part from the model only reverts the axis being edited.
+  syncParts();
+  // Sync the DOM value before blurring so the change event does not fire.
+  if (input) input.value = parts[key] ?? "";
+  input?.blur();
+}
 </script>
 
 <template>
@@ -100,6 +110,7 @@ function blurOnEnter(event: KeyboardEvent) {
         @input="updatePart(key, $event)"
         @change="commitVector"
         @keydown.enter.prevent="blurOnEnter"
+        @keydown.esc.prevent="restorePartOnEscape(key, $event)"
       />
     </label>
   </div>

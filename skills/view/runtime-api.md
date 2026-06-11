@@ -94,10 +94,22 @@ These are also available from `@locus/view-runtime` for custom renderers and adv
 
 - `BaseButton`, `BaseCheckbox`, `BaseDropdown`, `BaseSegmented`, `BaseSwitch`.
 - `CanvasView`, `GraphView`, `SerializedTableView`.
-- `UnityBoolField`, `UnityColorField`, `UnityEnumField`, `UnityFlagsField`, `UnityLayerMaskField`, `UnityNumberField`, `UnityObjectReferenceField`, `UnityPropertyDraw`, `UnityPropertyEditor`, `UnitySerializedPropertyTree`, `UnityVectorField`.
+- `UnityBoolField`, `UnityBoundsField`, `UnityColorField`, `UnityColorHdrField`, `UnityCurveField`, `UnityEnumField`, `UnityFlagsField`, `UnityGradientField`, `UnityLayerMaskField`, `UnityNumberField`, `UnityObjectReferenceField`, `UnityPropertyDraw`, `UnityPropertyEditor`, `UnitySerializedPropertyTree`, `UnityVectorField`.
 - `UnityObjectPreview`, `UnityReferenceChip`, `UnityDropZone`.
 
 `SerializedTableView` renders rows of Unity serialized cells with resizable persisted columns, a progress/status bar, and per-cell editors. Props: `columns`, `rows`, `loading`, `status`, `error`, `progress`, `savingCellKey`, `sourceCount`, `columnWidths` (v-model). Events: `commit` (`SerializedTableCommitEvent`), `update:columnWidths`. The `serialized-table` template shows the full wiring against a `SerializedTableApi` C# script.
+
+`UnityCurveField` and `UnityGradientField` render AnimationCurve / Gradient previews; when given `editable` plus a `bindingTarget` (the property tree passes both automatically), clicking them opens the floating Locus value editor window, which owns its own preview/commit write-back and broadcasts `locus-value-editor:committed` on apply.
+
+## Plugin Drawer Packages
+
+Locus plugins can ship `drawers/<drawer-id>/` packages that extend the in-app Inspector/property rendering (chat property fences, the Locus Inspector window, diff panes, and Views) in every Locus window — unlike per-View `propertyDrawers` props, these apply app-wide.
+
+- Manifest: `drawer.json` with `{ "id", "entry" }`; `entry` defaults to `src/index.ts`. Declared in `locus.plugin.json` under `components.drawers` (or discovered from the `drawers/` directory).
+- The entry runs once per window against `@locus/drawer-runtime`, a deliberately small runtime: `meta` (`pluginId`, `pluginName`, `drawerId`), `components` (same map as `@locus/components`), `propertyDrawer` (`register`, `registerValue`, `registerField`, `registerAttribute`, `registerPropertyPath`, `define`), `unityObjectDrawer` (`register`, `registerExtension`, `define`). No fs/session/llm surface.
+- Allowed imports: `vue`, `@locus/components`, `@locus/drawer-runtime`, and relative `.ts`/`.js`/`.vue`/`.css`/`.json` files inside the package.
+- Resolution priority: explicit `propertyDrawers` props > View/project registrations (`propertyDrawer.register*` from View code) > plugin drawer packages > built-in editors. A drawer that throws is isolated per property row and falls back to a raw value display.
+- Limits: at most 64 files and 512 KB per file per package; registrations are removed automatically when the plugin is disabled or uninstalled.
 
 ## Agent Tools
 

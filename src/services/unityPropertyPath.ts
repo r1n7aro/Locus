@@ -32,6 +32,14 @@ function findSegment(parts: string[], segment: string, start = 0): number {
   return -1;
 }
 
+function findLastSegment(parts: string[], segment: string): number {
+  const normalized = segment.toLowerCase();
+  for (let index = parts.length - 1; index >= 0; index -= 1) {
+    if (parts[index].toLowerCase() === normalized) return index;
+  }
+  return -1;
+}
+
 function parseIntegerSegment(value: string | undefined, fallback: number): number {
   if (value == null || value.trim() === "") return fallback;
   const parsed = Number(value);
@@ -58,7 +66,11 @@ function parsePropertySuffix(parts: string[]): {
   targetParts: string[];
   propertyPath: string;
 } {
-  const propertyIndex = findSegment(parts, PROPERTY_SEGMENT);
+  // Use the LAST "property" segment: the target portion is a Unity asset or
+  // object path that may legitimately contain a folder or object named
+  // "property", while serialized field segments named exactly "property"
+  // are far rarer.
+  const propertyIndex = findLastSegment(parts, PROPERTY_SEGMENT);
   if (propertyIndex < 0) {
     throw new Error("Unity property path must include /property/<propertyPath>.");
   }
@@ -76,14 +88,26 @@ function parseComponentTarget(
   base: UnitySerializedPropertyTarget,
   parts: string[],
 ): UnitySerializedPropertyTarget {
-  const componentIndex = findSegment(parts, COMPONENT_SEGMENT);
+  // The component selector sits at the tail of the object path, so match the
+  // LAST "component" segment — a GameObject ancestor named "component" must
+  // stay part of the object path.
+  const componentIndex = findLastSegment(parts, COMPONENT_SEGMENT);
   if (componentIndex < 0) return base;
 
   const componentType = parts[componentIndex + 1]?.trim();
   if (!componentType) {
     throw new Error("Unity component path requires /component/<type>.");
   }
-  const componentOrdinal = parseIntegerSegment(parts[componentIndex + 2], 0);
+  const ordinalSegment = parts[componentIndex + 2];
+  if (parts.length > componentIndex + 3) {
+    throw new Error(
+      `Unexpected segments after Unity component ordinal: ${parts.slice(componentIndex + 3).join("/")}`,
+    );
+  }
+  if (ordinalSegment != null && !/^\d+$/.test(ordinalSegment.trim())) {
+    throw new Error(`Unity component ordinal must be a non-negative integer: ${ordinalSegment}`);
+  }
+  const componentOrdinal = parseIntegerSegment(ordinalSegment, 0);
   const objectPath = parts.slice(0, componentIndex).join("/");
   return {
     ...base,
@@ -159,6 +183,15 @@ function parseSelectionTarget(targetParts: string[]): UnitySerializedPropertyTar
   return parseComponentTarget({ kind: "selection" }, targetParts);
 }
 
+/**
+ * Parses `<kind>/<target...>/property/<propertyPath...>` style paths.
+ *
+ * Reserved segments (case-insensitive): `property` (last occurrence splits
+ * target from property path), `object` (first occurrence splits asset/scene
+ * path from object path), `component` (last occurrence inside the object
+ * parts starts the component selector). Asset folders or GameObjects named
+ * exactly `object` may require the JSON target form instead.
+ */
 export function parseUnityPropertyPath(value: string): UnitySerializedPropertyTarget {
   const parts = splitPath(value);
   if (parts.length === 0) {

@@ -11,6 +11,7 @@ import {
   installTauriDevtoolsHotkeys,
   installTauriWindowDragFallback,
 } from "./services/tauriRuntime";
+import { bootstrapPluginInspectorDrawers } from "./services/inspectorDrawerExtensions";
 import { markStartupPhase, scheduleStartupPaintReport } from "./services/startupPerf";
 
 const debugConsoleReady = initDebugConsole();
@@ -30,6 +31,9 @@ markStartupPhase("frontend_pinia_ready");
 app.mount("#app");
 markStartupPhase("frontend_vue_mount_called");
 scheduleStartupPaintReport();
+// Plugin inspector drawers register per window; every Locus window shares
+// this entry, so chat, inspector, view-host, and diff windows all load them.
+bootstrapPluginInspectorDrawers();
 
 async function syncSystemLocale() {
   markStartupPhase("frontend_locale_sync_start");

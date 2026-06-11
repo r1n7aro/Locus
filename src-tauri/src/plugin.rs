@@ -52,6 +52,7 @@ pub struct InstalledPluginSummary {
     pub rules: Vec<PluginComponentSummary>,
     pub skills: Vec<PluginComponentSummary>,
     pub views: Vec<PluginComponentSummary>,
+    pub drawers: Vec<PluginComponentSummary>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -139,6 +140,8 @@ pub struct LocusPluginComponents {
     pub skills: Vec<RawPluginComponentRef>,
     #[serde(default)]
     pub views: Vec<RawPluginComponentRef>,
+    #[serde(default)]
+    pub drawers: Vec<RawPluginComponentRef>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -521,6 +524,13 @@ fn component_refs_for_kind(plugin: &InstalledPlugin, kind: &str) -> Vec<PluginCo
             .iter()
             .map(RawPluginComponentRef::normalize)
             .collect::<Vec<_>>(),
+        "drawers" => plugin
+            .manifest
+            .components
+            .drawers
+            .iter()
+            .map(RawPluginComponentRef::normalize)
+            .collect::<Vec<_>>(),
         _ => Vec::new(),
     };
     if !explicit.is_empty() {
@@ -531,6 +541,7 @@ fn component_refs_for_kind(plugin: &InstalledPlugin, kind: &str) -> Vec<PluginCo
         "rules" => fallback_rule_refs(&plugin.root),
         "skills" => fallback_component_refs(&plugin.root, "skills", "skill.json"),
         "views" => fallback_component_refs(&plugin.root, "views", "view.json"),
+        "drawers" => fallback_component_refs(&plugin.root, "drawers", PLUGIN_DRAWER_MANIFEST_FILE),
         _ => Vec::new(),
     }
 }
@@ -589,6 +600,144 @@ pub fn installed_view_sources(working_dir: &str) -> Vec<PluginComponentSource> {
     component_sources_for_kind(working_dir, "views")
 }
 
+pub const PLUGIN_DRAWER_MANIFEST_FILE: &str = "drawer.json";
+const DRAWER_PACKAGE_MAX_FILES: usize = 64;
+const DRAWER_PACKAGE_MAX_FILE_BYTES: u64 = 512 * 1024;
+const DRAWER_PACKAGE_DEFAULT_ENTRY: &str = "src/index.ts";
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PluginDrawerManifest {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    entry: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginDrawerPackageFile {
+    pub rel_path: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginDrawerPackage {
+    pub plugin_id: String,
+    pub plugin_name: String,
+    pub scope: String,
+    pub id: String,
+    pub root: String,
+    pub entry: String,
+    pub files: Vec<PluginDrawerPackageFile>,
+}
+
+/// Collects enabled plugins' inspector drawer packages with their source
+/// files so any window can compile and register them locally.
+pub fn installed_inspector_drawer_packages(working_dir: &str) -> Vec<PluginDrawerPackage> {
+    let mut packages = Vec::new();
+    for source in component_sources_for_kind(working_dir, "drawers") {
+        match load_drawer_package(&source) {
+            Ok(package) => packages.push(package),
+            Err(error) => eprintln!(
+                "[Locus] skipped plugin drawer {} in plugin {}: {}",
+                source.rel_path, source.plugin_id, error
+            ),
+        }
+    }
+    packages
+}
+
+fn load_drawer_package(source: &PluginComponentSource) -> Result<PluginDrawerPackage, String> {
+    let manifest_path = source.root.join(PLUGIN_DRAWER_MANIFEST_FILE);
+    let manifest: PluginDrawerManifest = if manifest_path.is_file() {
+        let raw = fs::read_to_string(&manifest_path)
+            .map_err(|error| format!("failed to read {}: {}", PLUGIN_DRAWER_MANIFEST_FILE, error))?;
+        serde_json::from_str(&raw)
+            .map_err(|error| format!("invalid {}: {}", PLUGIN_DRAWER_MANIFEST_FILE, error))?
+    } else {
+        PluginDrawerManifest::default()
+    };
+
+    let entry = normalize_component_rel_path(
+        manifest
+            .entry
+            .as_deref()
+            .unwrap_or(DRAWER_PACKAGE_DEFAULT_ENTRY),
+    )?;
+
+    let mut files = Vec::new();
+    for dir_entry in WalkDir::new(&source.root)
+        .follow_links(false)
+        .into_iter()
+        .flatten()
+    {
+        if !dir_entry.file_type().is_file() {
+            continue;
+        }
+        let path = dir_entry.path();
+        let ext = path
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if !matches!(ext.as_str(), "ts" | "js" | "vue" | "css" | "json") {
+            continue;
+        }
+        if dir_entry
+            .metadata()
+            .map(|metadata| metadata.len() > DRAWER_PACKAGE_MAX_FILE_BYTES)
+            .unwrap_or(true)
+        {
+            eprintln!(
+                "[Locus] skipped oversized plugin drawer file {}",
+                path.display()
+            );
+            continue;
+        }
+        let Ok(rel) = path.strip_prefix(&source.root) else {
+            continue;
+        };
+        let rel_path = rel.to_string_lossy().replace('\\', "/");
+        let Ok(content) = fs::read_to_string(path) else {
+            continue;
+        };
+        files.push(PluginDrawerPackageFile { rel_path, content });
+        if files.len() >= DRAWER_PACKAGE_MAX_FILES {
+            break;
+        }
+    }
+    files.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+
+    if !files.iter().any(|file| file.rel_path == entry) {
+        return Err(format!("drawer entry not found: {}", entry));
+    }
+
+    let id = manifest
+        .id
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| source.id.clone())
+        .unwrap_or_else(|| {
+            source
+                .rel_path
+                .rsplit('/')
+                .next()
+                .unwrap_or("drawer")
+                .to_string()
+        });
+
+    Ok(PluginDrawerPackage {
+        plugin_id: source.plugin_id.clone(),
+        plugin_name: source.plugin_name.clone(),
+        scope: source.scope.as_str().to_string(),
+        id,
+        root: source.root.display().to_string().replace('\\', "/"),
+        entry,
+        files,
+    })
+}
+
 fn component_summary(
     plugin: &InstalledPlugin,
     component: PluginComponentRef,
@@ -625,6 +774,10 @@ impl InstalledPlugin {
                 .filter_map(|component| component_summary(self, component))
                 .collect(),
             views: component_refs_for_kind(self, "views")
+                .into_iter()
+                .filter_map(|component| component_summary(self, component))
+                .collect(),
+            drawers: component_refs_for_kind(self, "drawers")
                 .into_iter()
                 .filter_map(|component| component_summary(self, component))
                 .collect(),
@@ -1030,6 +1183,7 @@ pub fn plugin_component_sources_by_plugin(working_dir: &str, plugin_id: &str) ->
         .into_iter()
         .chain(installed_skill_sources(working_dir))
         .chain(installed_view_sources(working_dir))
+        .chain(component_sources_for_kind(working_dir, "drawers"))
     {
         if source.plugin_id == plugin_id {
             sources.insert(source.scope.component_source().to_string());

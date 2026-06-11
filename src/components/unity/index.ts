@@ -1,6 +1,10 @@
 export { default as UnityBoolField } from "./UnityBoolField.vue";
+export { default as UnityBoundsField } from "./UnityBoundsField.vue";
 export { default as UnityColorField } from "./UnityColorField.vue";
+export { default as UnityColorHdrField } from "./UnityColorHdrField.vue";
+export { default as UnityCurveField } from "./UnityCurveField.vue";
 export { default as UnityEnumField } from "./UnityEnumField.vue";
+export { default as UnityGradientField } from "./UnityGradientField.vue";
 export { default as UnityFlagsField } from "./UnityFlagsField.vue";
 export { default as UnityLayerMaskField } from "./UnityLayerMaskField.vue";
 export { default as UnityNumberField } from "./UnityNumberField.vue";

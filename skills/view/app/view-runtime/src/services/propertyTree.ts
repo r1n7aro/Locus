@@ -3,9 +3,13 @@ import { h, type Component, type VNodeChild } from "vue";
 export type InspectorDrawerKind =
   | "array"
   | "boolean"
+  | "bounds"
+  | "character"
   | "color"
+  | "curve"
   | "enum"
   | "flags"
+  | "gradient"
   | "layerMask"
   | "managedReference"
   | "number"
@@ -362,8 +366,18 @@ interface NormalizedPropertyDrawerRegistry {
   libraries: InspectorPropertyDrawerLibrary[];
 }
 
-const VECTOR_TYPES = new Set(["Vector2", "Vector3", "Vector4", "Quaternion", "Rect"]);
+const VECTOR_TYPES = new Set([
+  "Vector2",
+  "Vector3",
+  "Vector4",
+  "Quaternion",
+  "Rect",
+  "Vector2Int",
+  "Vector3Int",
+  "RectInt",
+]);
 const NUMBER_TYPES = new Set(["Integer", "ArraySize", "Float"]);
+const BOUNDS_TYPES = new Set(["Bounds", "BoundsInt"]);
 const DEFAULT_AUTO_COLLAPSE_CHILD_COUNT = 24;
 const EMPTY_PROPERTY_DRAWER_REGISTRY: NormalizedPropertyDrawerRegistry = {
   entries: [],
@@ -727,7 +741,11 @@ export function resolveInspectorDrawer(property: InspectorProperty): InspectorPr
   if (valueType === "LayerMask") return drawer("layerMask", "blur", valueType);
   if (NUMBER_TYPES.has(valueType)) return drawer("number", "blur", valueType);
   if (VECTOR_TYPES.has(valueType)) return drawer("vector", "blur", valueType);
+  if (BOUNDS_TYPES.has(valueType)) return drawer("bounds", "blur", valueType);
   if (valueType === "Color") return drawer("color", "change", valueType);
+  if (valueType === "Character") return drawer("character", "blur", valueType);
+  if (valueType === "AnimationCurve") return drawer("curve", "none", valueType);
+  if (valueType === "Gradient") return drawer("gradient", "none", valueType);
   if (valueType === "ObjectReference") return drawer("objectReference", "blur", valueType);
   if (valueType === "String") return drawer("text", "blur", valueType);
   if (property.children.length > 0 || property.snapshot.hasChildren) {
@@ -841,6 +859,8 @@ class MutableInspectorPropertyDrawerLibrary implements InspectorPropertyDrawerLi
 
 export const publicInspectorPropertyDrawerLibrary = createInspectorPropertyDrawerLibrary();
 export const projectInspectorPropertyDrawerLibrary = publicInspectorPropertyDrawerLibrary;
+/** Registrations contributed by installed plugin drawer packages. */
+export const pluginInspectorPropertyDrawerLibrary = createInspectorPropertyDrawerLibrary();
 
 export function normalizeInspectorPropertyDrawers(
   input: InspectorPropertyDrawerInput,
@@ -914,6 +934,7 @@ export const propertyTreeService = {
   createPropertyDrawerLibrary: createInspectorPropertyDrawerLibrary,
   publicPropertyDrawerLibrary: publicInspectorPropertyDrawerLibrary,
   projectPropertyDrawerLibrary: projectInspectorPropertyDrawerLibrary,
+  pluginPropertyDrawerLibrary: pluginInspectorPropertyDrawerLibrary,
   normalizePropertyDrawers: normalizeInspectorPropertyDrawers,
   registerPropertyDrawer: registerInspectorPropertyDrawer,
   registerValueDrawer: registerInspectorValueDrawer,
@@ -1207,11 +1228,18 @@ function resolveInspectorPropertyDrawerComponent(
     if (resolved) return resolved;
   }
 
+  // Priority: explicit options > tree config > project/view registrations >
+  // plugin packages. Built-in editors stay the final fallback.
   return findPropertyDrawerComponent(property, config.context, config.drawers)
     ?? findPropertyDrawerComponent(
       property,
       config.context,
       normalizePropertyDrawers(publicInspectorPropertyDrawerLibrary),
+    )
+    ?? findPropertyDrawerComponent(
+      property,
+      config.context,
+      normalizePropertyDrawers(pluginInspectorPropertyDrawerLibrary),
     );
 }
 
