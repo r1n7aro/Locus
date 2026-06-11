@@ -17,6 +17,7 @@
     "build:tauri:with_embed_python_git": "bun run unity:bundle && bun run ort:bundle && bun run python:bundle && bun run git:bundle && bun run github-cli:bundle && bun run licenses:bundle && bun run view-runtime:export && bun run build",
     "build:tauri:without_embed_python_git": "bun run unity:bundle && bun run ort:bundle && bun run github-cli:bundle && bun run licenses:bundle && bun run view-runtime:export && bun run build",
     "release:installers": "bun run scripts/build-release-installers.mjs",
+    "release:installers:lzma": "bun run scripts/build-release-installers.mjs --compression=lzma",
     "unity:bundle": "bun run unity:bundle-roslyn && bun run unity:bundle-json",
     "unity:bundle-roslyn": "bun run scripts/build-locus-roslyn-bundle.mjs",
     "unity:bundle-json": "bun run scripts/build-locus-json-bundle.mjs",

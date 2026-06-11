@@ -15,6 +15,14 @@ license = "GPL-3.0-or-later"
 name = "locus_lib"
 crate-type = ["rlib"]
 
+# This app is a single ~185k-LOC crate; with cargo's release default
+# (incremental = false) every release build recompiles all of it at opt-level 3
+# even for a one-line change. Incremental trades target-dir disk space for much
+# faster warm rebuilds. Registry dependencies are never built incrementally,
+# so their artifacts and runtime performance are unaffected.
+[profile.release]
+incremental = true
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 

@@ -1,0 +1,7 @@
+# Build-speed settings shared by every cargo invocation under this repo
+# (src-tauri builds, and test runs that use a custom CARGO_TARGET_DIR).
+
+[target.x86_64-pc-windows-msvc]
+# rust-lld ships with the rustup toolchain (no extra install) and links the
+# ~80-100MB locus binaries several times faster than MSVC link.exe.
+linker = "rust-lld"

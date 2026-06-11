@@ -1,47 +1,17 @@
 fn main() {
     tauri_build::build();
 
-    if target_is_windows_msvc() {
-        embed_manifest_for_windows_link_targets();
-    }
-}
-
-fn target_is_windows_msvc() -> bool {
-    matches!(
-        (
-            std::env::var("CARGO_CFG_TARGET_OS").ok().as_deref(),
-            std::env::var("CARGO_CFG_TARGET_ENV").ok().as_deref(),
-        ),
-        (Some("windows"), Some("msvc"))
-    )
-}
-
-fn embed_manifest_for_windows_link_targets() {
-    let manifest = std::path::PathBuf::from(
-        std::env::var("CARGO_MANIFEST_DIR").expect("missing CARGO_MANIFEST_DIR"),
-    )
-    .join("comctl32-v6.manifest");
-
-    assert!(
-        manifest.is_file(),
-        "missing comctl32 v6 manifest at {}",
-        manifest.display()
-    );
-
-    println!("cargo:rerun-if-changed={}", manifest.display());
-
-    let manifest = manifest
-        .to_str()
-        .expect("comctl32-v6.manifest path is not valid UTF-8");
-
-    // `cargo test --lib` builds a unit-test harness executable for the library
-    // target. `rustc-link-arg-tests` does not reach that harness, but the
-    // generic linker args do.
-    println!("cargo:rustc-link-arg=/MANIFEST:EMBED");
-    println!("cargo:rustc-link-arg=/MANIFESTINPUT:{manifest}");
-
-    // The main Tauri binary already links `resource.lib`, which contains its
-    // own manifest resource. Disable the linker's extra manifest generation for
-    // that binary so we only inject the additional manifest into test harnesses.
-    println!("cargo:rustc-link-arg-bin=locus=/MANIFEST:NO");
+    // The main binary's Windows manifest (common-controls v6 and friends)
+    // comes from the `resource.lib` that tauri-build compiles; no manifest
+    // linker args are needed here. This build script used to inject
+    // `/MANIFEST:EMBED` + `/MANIFESTINPUT:comctl32-v6.manifest` for every link
+    // target and cancel it with `/MANIFEST:NO` for the main binary so that
+    // unit-test harnesses got a comctl32 v6 manifest. That arg dance only
+    // works on MSVC link.exe - rust-lld rejects a dangling /MANIFESTINPUT
+    // ("/manifestinput: requires /manifest:embed") - and nothing in the unit
+    // tests creates common controls, so the harness manifest was dead weight.
+    // If a future test really needs comctl32 v6, note that
+    // `cargo:rustc-link-arg-tests` only reaches integration-test targets
+    // (cargo rejects it for the lib unit-test harness); prefer activating an
+    // activation context at runtime in that test instead.
 }

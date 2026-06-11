@@ -56,7 +56,8 @@
     "windows": {
       "nsis": {
         "installerIcon": "icons/icon.ico",
-        "template": "nsis/installer.nsi"
+        "template": "nsis/installer.nsi",
+        "compression": "zlib"
       }
     }
   }

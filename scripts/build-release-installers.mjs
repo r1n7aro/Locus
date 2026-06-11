@@ -7,14 +7,24 @@ const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(scriptDir, "..");
 const srcTauriDir = path.join(repoRoot, "src-tauri");
 const nsisBundleDir = path.join(srcTauriDir, "target", "release", "bundle", "nsis");
+const withEmbedConfig = path.join(srcTauriDir, "tauri.with_embed_python_git.conf.json");
 const withoutEmbedConfig = path.join(srcTauriDir, "tauri.without_embed_python_git.conf.json");
+// NSIS compression: the base tauri.conf.json uses zlib (fast packaging, used by
+// the official release flow). Passing --compression=lzma layers this overlay on
+// top for a smaller but much slower-to-build installer.
+const nsisLzmaConfig = path.join(srcTauriDir, "tauri.nsis-lzma.conf.json");
+const compressions = new Set(["zlib", "lzma"]);
 const flavors = new Map([
   [
     "default",
     {
       label: "Windows x64",
       suffix: "",
-      buildArgs: ["build"],
+      buildArgs: [
+        "build",
+        "--config",
+        path.relative(repoRoot, withEmbedConfig),
+      ],
     },
   ],
   [
@@ -22,7 +32,11 @@ const flavors = new Map([
     {
       label: "Windows x64",
       suffix: "",
-      buildArgs: ["build"],
+      buildArgs: [
+        "build",
+        "--config",
+        path.relative(repoRoot, withEmbedConfig),
+      ],
     },
   ],
   [
@@ -46,17 +60,34 @@ function readJson(filePath) {
 function usage() {
   const names = [...flavors.keys()].join(", ");
   return [
-    "Usage: bun run release:installers [flavor...] [-- tauri args...]",
+    "Usage: bun run release:installers [--compression=zlib|lzma] [flavor...] [-- tauri args...]",
     "",
     `Flavors: ${names}`,
     "Default: without_embed_python_git default",
+    "Compression: zlib (default, fast packaging) or lzma (smaller installer, much slower)",
   ].join("\n");
 }
 
 function parseArgs(rawArgs) {
   const separatorIndex = rawArgs.indexOf("--");
-  const flavorArgs = separatorIndex >= 0 ? rawArgs.slice(0, separatorIndex) : rawArgs;
+  const ownArgs = separatorIndex >= 0 ? rawArgs.slice(0, separatorIndex) : rawArgs;
   const tauriArgs = separatorIndex >= 0 ? rawArgs.slice(separatorIndex + 1) : [];
+  const flavorArgs = [];
+  let compression = "zlib";
+
+  for (const arg of ownArgs) {
+    if (arg.startsWith("--compression=")) {
+      compression = arg.slice("--compression=".length);
+      continue;
+    }
+
+    flavorArgs.push(arg);
+  }
+
+  if (!compressions.has(compression)) {
+    throw new Error(`Unknown NSIS compression "${compression}".\n\n${usage()}`);
+  }
+
   const requestedFlavors = flavorArgs.length > 0 ? flavorArgs : ["without_embed_python_git", "default"];
 
   for (const flavor of requestedFlavors) {
@@ -65,7 +96,7 @@ function parseArgs(rawArgs) {
     }
   }
 
-  return { requestedFlavors, tauriArgs };
+  return { requestedFlavors, tauriArgs, compression };
 }
 
 function run(command, args) {
@@ -146,11 +177,15 @@ function finalizeInstaller(flavor, baseName, startedAtMs) {
   return finalPath;
 }
 
-function buildFlavor(flavorName, tauriArgs, baseName) {
+function buildFlavor(flavorName, compression, tauriArgs, baseName) {
   const flavor = flavors.get(flavorName);
   const startedAtMs = Date.now();
-  console.log(`[locus] Building release installer flavor: ${flavorName}`);
-  run("bun", ["tauri", ...flavor.buildArgs, ...tauriArgs]);
+  // Config overlays merge in order, so the compression overlay must come after
+  // the flavor config to win.
+  const compressionArgs =
+    compression === "lzma" ? ["--config", path.relative(repoRoot, nsisLzmaConfig)] : [];
+  console.log(`[locus] Building release installer flavor: ${flavorName} (nsis compression: ${compression})`);
+  run("bun", ["tauri", ...flavor.buildArgs, ...compressionArgs, ...tauriArgs]);
   const finalPath = finalizeInstaller(flavor, baseName, startedAtMs);
 
   return {
@@ -161,9 +196,11 @@ function buildFlavor(flavorName, tauriArgs, baseName) {
 }
 
 try {
-  const { requestedFlavors, tauriArgs } = parseArgs(process.argv.slice(2));
+  const { requestedFlavors, tauriArgs, compression } = parseArgs(process.argv.slice(2));
   const baseName = expectedInstallerBaseName();
-  const results = requestedFlavors.map((flavorName) => buildFlavor(flavorName, tauriArgs, baseName));
+  const results = requestedFlavors.map((flavorName) =>
+    buildFlavor(flavorName, compression, tauriArgs, baseName),
+  );
 
   console.log("[locus] Release installers ready:");
   for (const result of results) {

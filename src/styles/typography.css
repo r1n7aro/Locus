@@ -2,11 +2,14 @@
   --font-stack-sans: "Noto Sans SC", "Source Han Sans SC", "PingFang SC",
     "Hiragino Sans GB", "Microsoft YaHei UI", "Microsoft YaHei",
     "Segoe UI", "Helvetica Neue", Arial, sans-serif;
-  --font-stack-mono: ui-monospace, "SF Mono", SFMono-Regular, "Cascadia Mono",
+  /* ui-monospace must stay behind the named fonts: Chromium 128+ resolves it
+     to the browser's default fixed font (Courier New on Windows) instead of
+     skipping it, which would hijack the whole stack. */
+  --font-stack-mono: "SF Mono", SFMono-Regular, "Cascadia Mono",
     "Cascadia Code", "JetBrains Mono", "Fira Code", Menlo, Monaco, Consolas,
-    "Liberation Mono", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei UI",
-    "Microsoft YaHei", "Noto Sans Mono CJK SC", "Noto Sans CJK SC",
-    "Source Han Sans SC", monospace;
+    "Liberation Mono", ui-monospace, "PingFang SC", "Hiragino Sans GB",
+    "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans Mono CJK SC",
+    "Noto Sans CJK SC", "Source Han Sans SC", monospace;
 
   --font-ui: var(--font-stack-mono);
   --font-prose: var(--font-stack-mono);
