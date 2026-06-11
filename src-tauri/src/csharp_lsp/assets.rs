@@ -20,12 +20,17 @@ use tokio::io::AsyncWriteExt;
 pub const SERVER_VERSION: &str = "5.4.0-2.26179.14";
 const DOTNET_RUNTIME_VERSION: &str = "10.0.9";
 const DOTNET_RUNTIME_MAJOR: &str = "10.";
+/// Microsoft.Unity.Analyzers (MIT) from nuget.org — Unity-specific Roslyn
+/// diagnostics (UNT*) plus suppressors for general C# diagnostics that are
+/// wrong in Unity code (e.g. "make serialized field readonly").
+pub const UNITY_ANALYZERS_VERSION: &str = "1.26.0";
 const COMPLETE_MARKER: &str = ".locus-complete";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AssetComponent {
     Server,
     DotnetRuntime,
+    UnityAnalyzers,
 }
 
 impl AssetComponent {
@@ -33,6 +38,7 @@ impl AssetComponent {
         match self {
             AssetComponent::Server => "server",
             AssetComponent::DotnetRuntime => "dotnet",
+            AssetComponent::UnityAnalyzers => "analyzers",
         }
     }
 }
@@ -102,6 +108,19 @@ fn dotnet_download_url(rid: &str) -> String {
     format!(
         "https://builds.dotnet.microsoft.com/dotnet/Runtime/{v}/dotnet-runtime-{v}-{rid}.zip",
         v = DOTNET_RUNTIME_VERSION
+    )
+}
+
+fn unity_analyzers_dir() -> Result<PathBuf, String> {
+    Ok(root_dir()?
+        .join("unity-analyzers")
+        .join(UNITY_ANALYZERS_VERSION))
+}
+
+fn unity_analyzers_download_url() -> String {
+    format!(
+        "https://api.nuget.org/v3-flatcontainer/microsoft.unity.analyzers/{v}/microsoft.unity.analyzers.{v}.nupkg",
+        v = UNITY_ANALYZERS_VERSION
     )
 }
 
@@ -301,14 +320,55 @@ async fn ensure_dotnet_installed(rid: &str, progress: &ProgressFn) -> Result<Pat
     Ok(exe)
 }
 
+/// Single-flight across workspaces: concurrent first-time setups would
+/// otherwise race on remove_dir_all + extract in the shared install dirs.
+static INSTALL_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Ensure the Microsoft.Unity.Analyzers assembly is available, downloading
+/// the NuGet package when missing. Returns the analyzer DLL path.
+pub async fn ensure_unity_analyzers(progress: &ProgressFn) -> Result<PathBuf, String> {
+    let _install_guard = INSTALL_LOCK.lock().await;
+
+    let dir = unity_analyzers_dir()?;
+    let dll = dir.join("Microsoft.Unity.Analyzers.dll");
+    if is_complete(&dir) && dll.is_file() {
+        return Ok(dll);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create analyzers dir: {e}"))?;
+
+    let nupkg = dir.join("analyzers.nupkg");
+    download_to_file(
+        &unity_analyzers_download_url(),
+        &nupkg,
+        AssetComponent::UnityAnalyzers,
+        progress,
+    )
+    .await?;
+
+    let extract_dir = dir.clone();
+    let archive = nupkg.clone();
+    tokio::task::spawn_blocking(move || {
+        extract_zip(&archive, &extract_dir, Some("analyzers/dotnet/cs/"))
+    })
+    .await
+    .map_err(|e| format!("Extraction task failed: {e}"))??;
+    let _ = std::fs::remove_file(&nupkg);
+
+    if !dll.is_file() {
+        return Err(
+            "Analyzer package did not contain Microsoft.Unity.Analyzers.dll".to_string(),
+        );
+    }
+    mark_complete(&dir)?;
+    Ok(dll)
+}
+
 /// Ensure server + runtime are available, downloading them when missing.
 pub async fn ensure_assets(progress: &ProgressFn) -> Result<ResolvedAssets, String> {
     let rid = platform_rid()
         .ok_or_else(|| "C# code analysis is not supported on this platform yet".to_string())?;
 
-    // Single-flight across workspaces: concurrent first-time setups would
-    // otherwise race on remove_dir_all + extract in the shared install dirs.
-    static INSTALL_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     let _install_guard = INSTALL_LOCK.lock().await;
 
     let server_dll = ensure_server_installed(rid, progress).await?;
@@ -317,7 +377,12 @@ pub async fn ensure_assets(progress: &ProgressFn) -> Result<ResolvedAssets, Stri
         return Ok(ResolvedAssets {
             dotnet_program: PathBuf::from("dotnet"),
             server_dll,
-            envs: vec![("DOTNET_CLI_TELEMETRY_OPTOUT".to_string(), "1".to_string())],
+            envs: vec![
+                ("DOTNET_CLI_TELEMETRY_OPTOUT".to_string(), "1".to_string()),
+                // Belt and braces with the LSP `initialize` locale: keep
+                // .NET resource strings English on localized systems.
+                ("DOTNET_CLI_UI_LANGUAGE".to_string(), "en".to_string()),
+            ],
             dotnet_source: "system",
         });
     }
@@ -333,6 +398,7 @@ pub async fn ensure_assets(progress: &ProgressFn) -> Result<ResolvedAssets, Stri
         envs: vec![
             ("DOTNET_ROOT".to_string(), dotnet_root),
             ("DOTNET_CLI_TELEMETRY_OPTOUT".to_string(), "1".to_string()),
+            ("DOTNET_CLI_UI_LANGUAGE".to_string(), "en".to_string()),
         ],
         dotnet_source: "managed",
     })

@@ -482,6 +482,20 @@ mod tests {
     }
 
     #[test]
+    fn builtins_register_low_frequency_code_tools_as_lazy() {
+        let registry = ToolRegistry::with_builtins();
+
+        assert_eq!(
+            registry.default_load_mode("code_find_references"),
+            ToolLoadMode::Direct
+        );
+        assert_eq!(
+            registry.default_load_mode("code_diagnostics"),
+            ToolLoadMode::Direct
+        );
+    }
+
+    #[test]
     fn builtins_register_knowledge_create_as_direct() {
         let registry = ToolRegistry::with_builtins();
 

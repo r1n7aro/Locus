@@ -3316,6 +3316,8 @@ pub async fn preview_workspace_file(
 pub struct AgentToolLoadConfig {
     #[serde(default)]
     pub direct_load: HashMap<String, bool>,
+    #[serde(default)]
+    pub enabled: HashMap<String, bool>,
 }
 
 fn tool_load_config_path(working_dir: &str, agent_id: &str) -> std::path::PathBuf {
@@ -3377,6 +3379,9 @@ pub fn merged_tool_load_config_for_agent(
         for (name, direct_load) in ws_config.direct_load {
             config.direct_load.insert(name, direct_load);
         }
+        for (name, enabled) in ws_config.enabled {
+            config.enabled.insert(name, enabled);
+        }
     }
     config
 }
@@ -3398,6 +3403,63 @@ pub fn save_tool_direct_load_override(
     save_tool_load_config(working_dir, agent_id, &config)
 }
 
+pub fn save_tool_enabled_override(
+    working_dir: &str,
+    agent_id: &str,
+    tool_name: &str,
+    enabled: bool,
+) -> Result<(), String> {
+    let mut config = load_tool_load_config(working_dir, agent_id);
+    let key = tool_name.trim().to_string();
+    if enabled {
+        config.enabled.remove(&key);
+    } else {
+        config.enabled.insert(key, false);
+    }
+    save_tool_load_config(working_dir, agent_id, &config)
+}
+
+/// Validates that `tool_name` is a built-in, non-meta tool configured for the
+/// agent whose load behavior may be overridden, and returns its canonical name.
+fn resolve_configurable_agent_tool(
+    def: &crate::agent::definition::AgentDef,
+    tool_registry: &ToolRegistry,
+    agent_id: &str,
+    tool_name: &str,
+) -> Result<String, String> {
+    let canonical = tool_registry
+        .canonical_name(tool_name)
+        .ok_or_else(|| format!("Tool '{}' not found", tool_name))?;
+    if matches!(canonical.as_str(), "tool_load" | "tool_call") {
+        return Err(format!("Tool '{}' load mode is fixed", canonical));
+    }
+    if !tool_registry.is_built_in(&canonical) {
+        return Err(format!(
+            "Tool '{}' is provided by a skill and is loaded only through skills",
+            canonical
+        ));
+    }
+    if tool_registry.default_load_mode(&canonical) == crate::tool::ToolLoadMode::Skill {
+        return Err(format!(
+            "Tool '{}' load mode is controlled by the tool registry",
+            canonical
+        ));
+    }
+
+    let enabled_for_agent = def.tools.iter().any(|name| {
+        tool_registry
+            .canonical_name(name)
+            .is_some_and(|tool| tool == canonical)
+    });
+    if !enabled_for_agent {
+        return Err(format!(
+            "Tool '{}' is not enabled for agent '{}'",
+            canonical, agent_id
+        ));
+    }
+    Ok(canonical)
+}
+
 #[tauri::command]
 pub async fn set_agent_tool_direct_load(
     agent_id: String,
@@ -3417,39 +3479,7 @@ pub async fn set_agent_tool_direct_load(
         return Err("No working directory selected".to_string().into());
     }
 
-    let canonical = tool_registry
-        .canonical_name(&tool_name)
-        .ok_or_else(|| format!("Tool '{}' not found", tool_name))?;
-    if matches!(canonical.as_str(), "tool_load" | "tool_call") {
-        return Err(format!("Tool '{}' load mode is fixed", canonical).into());
-    }
-    if !tool_registry.is_built_in(&canonical) {
-        return Err(format!(
-            "Tool '{}' is provided by a skill and is loaded only through skills",
-            canonical
-        )
-        .into());
-    }
-    if tool_registry.default_load_mode(&canonical) == crate::tool::ToolLoadMode::Skill {
-        return Err(format!(
-            "Tool '{}' load mode is controlled by the tool registry",
-            canonical
-        )
-        .into());
-    }
-
-    let enabled_for_agent = def.tools.iter().any(|name| {
-        tool_registry
-            .canonical_name(name)
-            .is_some_and(|tool| tool == canonical)
-    });
-    if !enabled_for_agent {
-        return Err(format!(
-            "Tool '{}' is not enabled for agent '{}'",
-            canonical, agent_id
-        )
-        .into());
-    }
+    let canonical = resolve_configurable_agent_tool(def, &tool_registry, &agent_id, &tool_name)?;
 
     save_tool_direct_load_override(
         &working_dir,
@@ -3459,6 +3489,30 @@ pub async fn set_agent_tool_direct_load(
         tool_registry.default_load_mode(&canonical) == crate::tool::ToolLoadMode::Direct,
     )
     .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn set_agent_tool_enabled(
+    agent_id: String,
+    tool_name: String,
+    enabled: bool,
+    registry: State<'_, AgentDefRegistryState>,
+    tool_registry: State<'_, Arc<ToolRegistry>>,
+    workspace: State<'_, Arc<Workspace>>,
+) -> Result<(), AppError> {
+    let agent_id = canonical_agent_id(&agent_id).to_string();
+    let registry = registry.0.read().await;
+    let def = registry
+        .get(&agent_id)
+        .ok_or_else(|| format!("Agent '{}' not found", agent_id))?;
+    let working_dir = workspace.path.read().await.clone();
+    if working_dir.trim().is_empty() {
+        return Err("No working directory selected".to_string().into());
+    }
+
+    let canonical = resolve_configurable_agent_tool(def, &tool_registry, &agent_id, &tool_name)?;
+
+    save_tool_enabled_override(&working_dir, &agent_id, &canonical, enabled).map_err(Into::into)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

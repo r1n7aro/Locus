@@ -2787,7 +2787,8 @@ impl AgentInstance {
                 .or_else(|| require_absolute_without_workspace("project_path")),
             // Code analysis tools read arbitrary files via `file_path`; hold
             // them to the same workspace boundary as read/write/edit.
-            "code_find_references" | "code_goto_definition" => {
+            "code_find_references" | "code_goto_definition" | "code_diagnostics" | "code_hover"
+            | "unity_code_usages" => {
                 if !has_working_dir {
                     Some(format!(
                         "Tool '{}' requires a selected working directory because it operates on workspace-scoped project data.",
@@ -3004,10 +3005,15 @@ impl AgentInstance {
                 }
                 // Semantic C# tools ride on the optional Roslyn language
                 // server; keep them out of the agent context entirely while
-                // the feature toggle is off.
-                "code_find_references" | "code_goto_definition" | "code_symbol_search" => {
+                // the feature toggle (or the tool's own switch) is off.
+                "code_find_references" | "code_goto_definition" | "code_symbol_search"
+                | "code_diagnostics" | "code_hover" => {
                     crate::csharp_lsp::is_enabled()
+                        && crate::code_tools::tool_enabled(tool_name.as_str())
                 }
+                // Asset-side code analysis tools work without the language
+                // server but honor their per-tool switches.
+                "unity_code_usages" => crate::code_tools::tool_enabled(tool_name.as_str()),
                 _ => true,
             })
             .cloned()
@@ -3082,6 +3088,41 @@ impl AgentInstance {
                     .map(|canonical| (canonical, direct_load))
             })
             .collect()
+    }
+
+    fn tool_enabled_overrides(&self) -> HashMap<String, bool> {
+        let config = crate::commands::merged_tool_load_config_for_agent(
+            self.app_agent_dir.as_ref(),
+            &self.working_dir,
+            &self.def.id,
+        );
+        config
+            .enabled
+            .into_iter()
+            .filter_map(|(name, enabled)| {
+                self.canonical_tool_name(&name)
+                    .map(|canonical| (canonical, enabled))
+            })
+            .collect()
+    }
+
+    /// Whether the tool's per-agent availability may be toggled. Meta tools,
+    /// skill-provided tools, and registry skill-mode tools are managed by the
+    /// system and stay enabled.
+    fn can_toggle_enabled_tool(&self, name: &str) -> bool {
+        !Self::is_meta_tool(name)
+            && self.tool_registry.is_built_in(name)
+            && matches!(
+                self.default_tool_load_mode(name),
+                ToolLoadMode::Direct | ToolLoadMode::Lazy
+            )
+    }
+
+    fn is_tool_enabled(&self, name: &str, overrides: &HashMap<String, bool>) -> bool {
+        if !self.can_toggle_enabled_tool(name) {
+            return true;
+        }
+        overrides.get(name).copied().unwrap_or(true)
     }
 
     fn canonical_tool_name(&self, name: &str) -> Option<String> {
@@ -3161,11 +3202,23 @@ impl AgentInstance {
         self.default_tool_load_mode(name) == ToolLoadMode::Direct
     }
 
-    async fn allowed_tool_set(&self) -> HashSet<String> {
+    /// Every tool configured for this agent, including ones disabled by a
+    /// per-agent override. Disabled tools must still surface in inspection
+    /// UIs, so this set deliberately skips the enabled filter.
+    async fn configured_tool_set(&self) -> HashSet<String> {
         self.resolve_effective_tool_names()
             .await
             .into_iter()
             .filter_map(|name| self.canonical_tool_name(&name))
+            .collect()
+    }
+
+    async fn allowed_tool_set(&self) -> HashSet<String> {
+        let enabled_overrides = self.tool_enabled_overrides();
+        self.configured_tool_set()
+            .await
+            .into_iter()
+            .filter(|name| self.is_tool_enabled(name, &enabled_overrides))
             .collect()
     }
 
@@ -3432,6 +3485,7 @@ impl AgentInstance {
 
     async fn available_tool_prompt_items(&self) -> Vec<InjectedPromptItem> {
         let direct_overrides = self.tool_direct_load_overrides();
+        let enabled_overrides = self.tool_enabled_overrides();
         let request_tool_names = self.build_request_tool_names().await;
         let mut direct_tool_names = HashSet::new();
         let mut tool_names = Vec::new();
@@ -3444,10 +3498,12 @@ impl AgentInstance {
             push_unique_tool_name(&mut tool_names, &canonical);
         }
 
-        let mut allowed_tool_names: Vec<_> = self.allowed_tool_set().await.into_iter().collect();
-        let allowed_tool_set: HashSet<String> = allowed_tool_names.iter().cloned().collect();
-        allowed_tool_names.sort();
-        for name in allowed_tool_names {
+        // List from the configured set (not the enabled-filtered allowed set)
+        // so disabled tools stay visible and can be re-enabled from the UI.
+        let configured_tool_set = self.configured_tool_set().await;
+        let mut configured_tool_names: Vec<_> = configured_tool_set.iter().cloned().collect();
+        configured_tool_names.sort();
+        for name in configured_tool_names {
             push_unique_tool_name(&mut tool_names, &name);
         }
 
@@ -3463,13 +3519,16 @@ impl AgentInstance {
                 let (name, description) = extract_api_tool_name_and_description(&tool)?;
                 let direct_loaded = direct_tool_names.contains(&name);
                 let default_direct_load = self.default_direct_load_for_tool(&name);
-                let can_configure_direct_load =
-                    allowed_tool_set.contains(&name) && self.can_configure_direct_load_tool(&name);
+                let can_configure_direct_load = configured_tool_set.contains(&name)
+                    && self.can_configure_direct_load_tool(&name);
                 let direct_load_override = if can_configure_direct_load {
                     direct_overrides.get(&name).copied()
                 } else {
                     None
                 };
+                let can_toggle_enabled =
+                    configured_tool_set.contains(&name) && self.can_toggle_enabled_tool(&name);
+                let enabled = self.is_tool_enabled(&name, &enabled_overrides);
                 let configured_load_mode = self.configured_tool_load_mode(&name, &direct_overrides);
                 let load_mode = match configured_load_mode {
                     ToolLoadMode::Direct => "direct",
@@ -3509,6 +3568,8 @@ impl AgentInstance {
                         "directLoadDefault": default_direct_load,
                         "directLoadOverride": direct_load_override,
                         "canConfigureDirectLoad": can_configure_direct_load,
+                        "enabled": enabled,
+                        "canToggleEnabled": can_toggle_enabled,
                         "nativeLazy": false,
                         "toolSource": tool_source,
                     })),
@@ -8904,6 +8965,9 @@ impl AgentInstance {
                 | "code_find_references"
                 | "code_goto_definition"
                 | "code_symbol_search"
+                | "code_diagnostics"
+                | "code_hover"
+                | "unity_code_usages"
                 | "view_capture"
                 | "view_snapshot"
                 | "view_wait"

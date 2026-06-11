@@ -112,6 +112,62 @@ fn default_dynamic_tool_loading_mode() -> Arc<Mutex<DynamicToolLoadingMode>> {
     Arc::new(Mutex::new(DynamicToolLoadingMode::MetaTool))
 }
 
+/// Per-tool switches for the code-analysis tool family. Each flag controls
+/// whether the tool is offered to agents at all (disabled tools are filtered
+/// out of the request tool list, see
+/// `AgentInstance::resolve_effective_tool_names`). `unity_analyzers` is not a
+/// tool: it injects Microsoft.Unity.Analyzers into the Roslyn language server
+/// so `code_diagnostics` reports Unity-specific rules (UNT*).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct CodeAnalysisToolsConfig {
+    pub code_symbol_search: bool,
+    pub code_goto_definition: bool,
+    pub code_find_references: bool,
+    pub code_diagnostics: bool,
+    pub code_hover: bool,
+    pub unity_code_usages: bool,
+    pub unity_analyzers: bool,
+}
+
+impl Default for CodeAnalysisToolsConfig {
+    fn default() -> Self {
+        Self {
+            code_symbol_search: true,
+            code_goto_definition: true,
+            code_find_references: true,
+            code_diagnostics: true,
+            code_hover: false,
+            unity_code_usages: true,
+            unity_analyzers: true,
+        }
+    }
+}
+
+mod serde_code_analysis_tools {
+    use super::*;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(
+        v: &Arc<Mutex<CodeAnalysisToolsConfig>>,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        let value = *v.lock().map_err(serde::ser::Error::custom)?;
+        value.serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<Arc<Mutex<CodeAnalysisToolsConfig>>, D::Error> {
+        let value = CodeAnalysisToolsConfig::deserialize(d)?;
+        Ok(Arc::new(Mutex::new(value)))
+    }
+}
+
+fn default_code_analysis_tools() -> Arc<Mutex<CodeAnalysisToolsConfig>> {
+    Arc::new(Mutex::new(CodeAnalysisToolsConfig::default()))
+}
+
 mod serde_string_mutex {
     use super::*;
     use serde::{Deserialize, Deserializer, Serializer};
@@ -169,6 +225,11 @@ pub struct AppConfig {
     pub unity_background_hook_enabled: Arc<AtomicBool>,
     #[serde(default = "default_debug_flag", with = "serde_atomic_bool")]
     pub csharp_lsp_enabled: Arc<AtomicBool>,
+    #[serde(
+        default = "default_code_analysis_tools",
+        with = "serde_code_analysis_tools"
+    )]
+    pub code_analysis_tools: Arc<Mutex<CodeAnalysisToolsConfig>>,
     #[serde(skip)]
     config_path: Arc<Mutex<Option<PathBuf>>>,
 }
@@ -212,6 +273,7 @@ impl AppConfig {
             view_open_in_existing_window: default_view_open_in_existing_window(),
             unity_background_hook_enabled: default_unity_background_hook_enabled(),
             csharp_lsp_enabled: default_debug_flag(),
+            code_analysis_tools: default_code_analysis_tools(),
             config_path: Arc::new(Mutex::new(Some(primary_path.to_path_buf()))),
         };
 
@@ -371,6 +433,21 @@ impl AppConfig {
 
     pub fn set_csharp_lsp_enabled(&self, value: bool) -> Result<(), String> {
         self.csharp_lsp_enabled.store(value, Ordering::Relaxed);
+        self.persist()
+    }
+
+    pub fn code_analysis_tools(&self) -> CodeAnalysisToolsConfig {
+        self.code_analysis_tools
+            .lock()
+            .map(|guard| *guard)
+            .unwrap_or_default()
+    }
+
+    pub fn set_code_analysis_tools(&self, value: CodeAnalysisToolsConfig) -> Result<(), String> {
+        *self
+            .code_analysis_tools
+            .lock()
+            .map_err(|e| format!("code analysis tools lock poisoned: {}", e))? = value;
         self.persist()
     }
 

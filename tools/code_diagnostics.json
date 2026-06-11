@@ -1,0 +1,25 @@
+{
+  "description": "Get C# compiler and analyzer diagnostics (errors/warnings) from the Roslyn workspace — the same diagnostics an IDE shows. Use this to verify your edits to .cs files compile before applying them in Unity; checking is read-only and does not recompile or reload scripts in the Editor.\n\nScopes: 'file' (default when file_path is given) is fast; 'workspace' covers the whole solution and catches cross-file breakage (e.g. a renamed method breaking callers), but the first workspace query after project load can take minutes on large solutions.\n\nWhen Unity analyzers are enabled in settings, results include Unity-specific rules (UNT*): MonoBehaviour misuse, null-coalescing on UnityEngine.Object, incorrect event function signatures, expensive calls, and more.\n\nFile scope additionally validates the file's project string references — tags (CompareTag/.tag), layers (NameToLayer/GetMask), scene loads by name/path/index (against build settings), Resources.Load* paths, and legacy Input axes (flagged as guaranteed runtime exceptions when the project enables the new Input System only). These compile fine and only fail at runtime; problems are appended as a 'Project string refs' section with did-you-mean suggestions. Workspace scope does NOT run this string-ref validation — it covers compiler/analyzer diagnostics only.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "file_path": {
+        "type": "string",
+        "description": "Workspace-relative or absolute path to a .cs file. Omit to query the whole workspace."
+      },
+      "scope": {
+        "type": "string",
+        "description": "'file' or 'workspace'. Default: 'file' when file_path is given, otherwise 'workspace'."
+      },
+      "min_severity": {
+        "type": "string",
+        "description": "Minimum severity to report, that severity and above ('warning' = errors + warnings): 'error', 'warning' (default), 'info' or 'hint'."
+      },
+      "max_results": {
+        "type": "integer",
+        "description": "Maximum number of diagnostics to return. Default 100, max 400."
+      }
+    },
+    "required": []
+  }
+}

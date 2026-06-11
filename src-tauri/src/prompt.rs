@@ -31,6 +31,9 @@ pub mod tools {
     pub const CODE_FIND_REFERENCES: &str = include_str!("../../tools/code_find_references.json");
     pub const CODE_GOTO_DEFINITION: &str = include_str!("../../tools/code_goto_definition.json");
     pub const CODE_SYMBOL_SEARCH: &str = include_str!("../../tools/code_symbol_search.json");
+    pub const CODE_DIAGNOSTICS: &str = include_str!("../../tools/code_diagnostics.json");
+    pub const CODE_HOVER: &str = include_str!("../../tools/code_hover.json");
+    pub const UNITY_CODE_USAGES: &str = include_str!("../../tools/unity_code_usages.json");
     pub const LIST: &str = include_str!("../../tools/list.json");
     pub const ASK: &str = include_str!("../../tools/ask.json");
     pub const SHEET: &str = include_str!("../../tools/sheet.json");
@@ -125,6 +128,12 @@ mod tests {
             ("unity_yaml_search", tools::UNITY_YAML_SEARCH),
             ("unity_yaml_read", tools::UNITY_YAML_READ),
             ("unity_recompile", tools::UNITY_RECOMPILE),
+            ("code_find_references", tools::CODE_FIND_REFERENCES),
+            ("code_goto_definition", tools::CODE_GOTO_DEFINITION),
+            ("code_symbol_search", tools::CODE_SYMBOL_SEARCH),
+            ("code_diagnostics", tools::CODE_DIAGNOSTICS),
+            ("code_hover", tools::CODE_HOVER),
+            ("unity_code_usages", tools::UNITY_CODE_USAGES),
             ("list", tools::LIST),
             ("ask", tools::ASK),
             ("sheet", tools::SHEET),

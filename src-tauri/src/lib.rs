@@ -14,6 +14,7 @@ mod agent;
 pub mod asset_db;
 mod auth;
 pub mod binary_cache;
+pub mod code_tools;
 mod commands;
 mod compact;
 mod config;
@@ -396,6 +397,7 @@ pub fn run() {
             let config = Arc::new(loaded_config);
             unity_bridge::initialize_background_hook(config.unity_background_hook_enabled());
             csharp_lsp::initialize(config.csharp_lsp_enabled(), app.handle().clone());
+            code_tools::initialize(config.code_analysis_tools());
             startup_for_setup.mark("setup_config_ready");
 
             // Load OpenRouter API key from OS keychain only.
@@ -972,6 +974,7 @@ pub fn run() {
             commands::get_agent_system_prompt_stats,
             commands::list_agent_injected_items,
             commands::set_agent_tool_direct_load,
+            commands::set_agent_tool_enabled,
             commands::load_session,
             commands::list_sessions,
             commands::list_archived_sessions,
@@ -1242,6 +1245,8 @@ pub fn run() {
             commands::csharp_lsp_get_status,
             commands::csharp_lsp_set_enabled,
             commands::csharp_lsp_restart,
+            commands::code_analysis_tools_get_config,
+            commands::code_analysis_tools_set_config,
             commands::get_view_windows_above_main,
             commands::set_view_windows_above_main,
             commands::get_view_open_in_existing_window,

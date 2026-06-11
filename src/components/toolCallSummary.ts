@@ -57,7 +57,11 @@ export function buildToolCallArgsSummary(toolName: string, argumentsText: string
       return cmd.slice(0, 57) + "...";
     }
 
-    if (toolName === "code_find_references" || toolName === "code_goto_definition") {
+    if (
+      toolName === "code_find_references" ||
+      toolName === "code_goto_definition" ||
+      toolName === "code_hover"
+    ) {
       const symbol = getStringArg(args, ["symbol"]);
       const filePath = getStringArg(args, ["filePath", "file_path"]);
       if (symbol && filePath) return `${symbol} @ ${shortenPath(filePath)}`;
@@ -66,6 +70,20 @@ export function buildToolCallArgsSummary(toolName: string, argumentsText: string
 
     if (toolName === "code_symbol_search") {
       return getStringArg(args, ["query"]);
+    }
+
+    if (toolName === "code_diagnostics") {
+      const filePath = getStringArg(args, ["filePath", "file_path"]);
+      if (filePath) return shortenPath(filePath);
+      return "workspace";
+    }
+
+    if (toolName === "unity_code_usages") {
+      const member = getStringArg(args, ["member"]);
+      const filePath = getStringArg(args, ["filePath", "file_path"]);
+      if (member && filePath) return `${member} @ ${shortenPath(filePath)}`;
+      if (filePath) return shortenPath(filePath);
+      return member;
     }
 
     if (toolName === "task") {

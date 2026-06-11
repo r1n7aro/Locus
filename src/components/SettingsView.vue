@@ -21,6 +21,7 @@ import ApiProviders from "./settings/ApiProviders.vue";
 import CustomEndpointModal from "./settings/CustomEndpointModal.vue";
 import ModelDefaultsPanel from "./settings/ModelDefaults.vue";
 import ToolPermissions from "./settings/ToolPermissions.vue";
+import CodeAnalysisSettings from "./settings/CodeAnalysisSettings.vue";
 import ArchivedSessionsSettings from "./settings/ArchivedSessionsSettings.vue";
 import KnowledgeSettings from "./settings/KnowledgeSettings.vue";
 import SubscriptionDisclaimerModal from "./SubscriptionDisclaimerModal.vue";
@@ -157,6 +158,16 @@ watch(
         </button>
         <button
           class="sidebar-item"
+          :class="{ active: activeCategory === 'codeAnalysis' }"
+          @click="activeCategory = 'codeAnalysis'"
+        >
+          <svg viewBox="0 0 16 16" fill="currentColor" width="14" height="14">
+            <path d="M5.72 4.22a.75.75 0 0 1 0 1.06L2.999 8l2.72 2.72a.75.75 0 1 1-1.06 1.06l-3.25-3.25a.75.75 0 0 1 0-1.06l3.25-3.25a.75.75 0 0 1 1.06 0zm4.56 0a.75.75 0 0 1 1.06 0l3.25 3.25a.75.75 0 0 1 0 1.06l-3.25 3.25a.75.75 0 1 1-1.06-1.06L13.001 8l-2.72-2.72a.75.75 0 0 1 0-1.06zM9.262 2.07a.75.75 0 0 1 .545.91l-2.5 10a.75.75 0 0 1-1.455-.364l2.5-10a.75.75 0 0 1 .91-.546z"/>
+          </svg>
+          <span>{{ t("settings.tab.codeAnalysis") }}</span>
+        </button>
+        <button
+          class="sidebar-item"
           :class="{ active: activeCategory === 'knowledge' }"
           @click="activeCategory = 'knowledge'"
         >
@@ -288,6 +299,10 @@ watch(
           @set-permission="setToolPermission"
           @set-file-workspace-boundary="setFileToolWorkspaceBoundaryEnabled"
         />
+      </template>
+
+      <template v-if="activeCategory === 'codeAnalysis'">
+        <CodeAnalysisSettings />
       </template>
 
       <template v-if="activeCategory === 'knowledge'">

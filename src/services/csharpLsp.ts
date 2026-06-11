@@ -1,4 +1,4 @@
-import type { CsharpLspStatus } from "../types";
+import type { CodeAnalysisToolsConfig, CsharpLspStatus } from "../types";
 import { ipcInvoke } from "./ipc";
 import { getLocusRuntime, type RuntimeUnsubscribe } from "./locusRuntime";
 
@@ -24,6 +24,24 @@ export function csharpLspRestart(): Promise<CsharpLspStatus> {
     notify: false,
     throwOnError: true,
   });
+}
+
+export function codeAnalysisToolsGetConfig(): Promise<CodeAnalysisToolsConfig> {
+  return ipcInvoke<CodeAnalysisToolsConfig>("code_analysis_tools_get_config", undefined, {
+    operation: "codeAnalysisToolsGetConfig",
+    notify: false,
+    throwOnError: true,
+  });
+}
+
+export function codeAnalysisToolsSetConfig(
+  value: CodeAnalysisToolsConfig,
+): Promise<CodeAnalysisToolsConfig> {
+  return ipcInvoke<CodeAnalysisToolsConfig>(
+    "code_analysis_tools_set_config",
+    { value },
+    { operation: "codeAnalysisToolsSetConfig", notify: false, throwOnError: true },
+  );
 }
 
 export function subscribeCsharpLspStatus(

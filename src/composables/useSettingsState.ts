@@ -293,7 +293,7 @@ export function useSettingsState(emit: SettingsEmit) {
   }
 
   // ── Navigation ───────────────────────────────────────────────────────
-  const activeCategory = ref<"api" | "models" | "permissions" | "proxy" | "general" | "display" | "notifications" | "shortcuts" | "knowledge" | "archived" | "console" | "about">("general");
+  const activeCategory = ref<"api" | "models" | "permissions" | "codeAnalysis" | "proxy" | "general" | "display" | "notifications" | "shortcuts" | "knowledge" | "archived" | "console" | "about">("general");
 
   // ── Provider / API key state ─────────────────────────────────────────
   const providers = ref<ProviderStatus[]>([]);
@@ -790,6 +790,9 @@ export function useSettingsState(emit: SettingsEmit) {
     { name: "code_find_references", label: "code_find_references", desc: t("tool.desc.code_find_references"), defaultMode: "auto" as const },
     { name: "code_goto_definition", label: "code_goto_definition", desc: t("tool.desc.code_goto_definition"), defaultMode: "auto" as const },
     { name: "code_symbol_search",   label: "code_symbol_search",   desc: t("tool.desc.code_symbol_search"),   defaultMode: "auto" as const },
+    { name: "code_diagnostics",     label: "code_diagnostics",     desc: t("tool.desc.code_diagnostics"),     defaultMode: "auto" as const },
+    { name: "code_hover",           label: "code_hover",           desc: t("tool.desc.code_hover"),           defaultMode: "auto" as const },
+    { name: "unity_code_usages",    label: "unity_code_usages",    desc: t("tool.desc.unity_code_usages"),    defaultMode: "auto" as const },
     { name: "unity_asset_search", label: "unity_asset_search", desc: t("tool.desc.unity_asset_search"), defaultMode: "auto" as const },
     { name: "unity_yaml_list",    label: "unity_yaml_list",    desc: t("tool.desc.unity_yaml_list"),    defaultMode: "auto" as const },
     { name: "unity_yaml_search",  label: "unity_yaml_search",  desc: t("tool.desc.unity_yaml_search"),  defaultMode: "auto" as const },

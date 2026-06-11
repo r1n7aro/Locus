@@ -15,6 +15,8 @@
     "code_find_references",
     "code_goto_definition",
     "code_symbol_search",
+    "code_hover",
+    "unity_code_usages",
     "unity_yaml_list",
     "unity_yaml_search",
     "unity_yaml_read",

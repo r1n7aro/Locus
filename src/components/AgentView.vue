@@ -3,7 +3,7 @@
 import { ref, computed, onMounted, onUnmounted, watch } from "vue";
 import { listen } from "@tauri-apps/api/event";
 import type { UnlistenFn } from "@tauri-apps/api/event";
-import { listAgents, listSubagentDefs, getAgentEnvTemplate, getAgentRenderedEnvPrompt, getAgentSystemPrompt, getAgentSystemPromptStats, listAgentInjectedItems, setAgentToolDirectLoad, listRules, readRule, saveRule, deleteRule, setRuleEnabled, setRuleOrder } from "../services/agent";
+import { listAgents, listSubagentDefs, getAgentEnvTemplate, getAgentRenderedEnvPrompt, getAgentSystemPrompt, getAgentSystemPromptStats, listAgentInjectedItems, setAgentToolDirectLoad, setAgentToolEnabled, listRules, readRule, saveRule, deleteRule, setRuleEnabled, setRuleOrder } from "../services/agent";
 import type { AgentInfo, AgentSystemPromptStats, InjectedPromptItem, InjectedToolLoadMode, RuleItem } from "../types";
 import { getWarmup } from "../composables/warmupCache";
 import MarkdownRenderer from "./MarkdownRenderer.vue";
@@ -101,6 +101,8 @@ const injectedItems = ref<InjectedPromptItem[]>([]);
 const injectedLoading = ref(false);
 const toolLoadSaving = ref(false);
 const toolLoadConfigError = ref("");
+const toolEnabledSavingId = ref<string | null>(null);
+const toolEnabledError = ref("");
 const availableToolItems = computed(() =>
   injectedItems.value.filter((item) => item.kind === "tools"),
 );
@@ -122,6 +124,29 @@ const injectedContextEntryCount = computed(() =>
 const promptDashboard = computed(() =>
   buildAgentPromptDashboard(promptStats.value, ruleItems.value, injectedItems.value),
 );
+
+const toolGroups = computed(() => [
+  { key: "tools:direct", label: t("agent.directTools"), items: directToolItems.value },
+  { key: "tools:lazy", label: t("agent.lazyTools"), items: lazyToolItems.value },
+  { key: "tools:skill", label: t("agent.skillTools"), items: skillToolItems.value },
+].filter((group) => group.items.length > 0));
+
+// ── Collapsible sections ──
+const collapsedSections = ref<Record<string, boolean>>({
+  rules: false,
+  injected: false,
+  "tools:direct": false,
+  "tools:lazy": true,
+  "tools:skill": true,
+});
+
+function isSectionCollapsed(key: string): boolean {
+  return collapsedSections.value[key] === true;
+}
+
+function toggleSection(key: string) {
+  collapsedSections.value[key] = !isSectionCollapsed(key);
+}
 
 function toolMetaLoadMode(meta: InjectedPromptItem["meta"]): InjectedToolLoadMode {
   const record = toolMetaRecord(meta);
@@ -214,6 +239,26 @@ const selectedToolCanConfigureDirectLoad = computed(() => {
 });
 
 const selectedToolDirectLoadChecked = computed(() => selectedToolLoadMode.value === "direct");
+
+const selectedToolEnabled = computed(() => {
+  const item = selectedInjectedItem();
+  if (!item || item.kind !== "tools") return true;
+  return toolItemEnabled(item);
+});
+
+const selectedToolCanToggleEnabled = computed(() => {
+  const item = selectedInjectedItem();
+  if (!item || item.kind !== "tools") return false;
+  return canToggleToolEnabled(item);
+});
+
+function toolItemEnabled(item: InjectedPromptItem): boolean {
+  return toolMetaBoolean(item.meta, "enabled") !== false;
+}
+
+function canToggleToolEnabled(item: InjectedPromptItem): boolean {
+  return toolMetaBoolean(item.meta, "canToggleEnabled") === true;
+}
 
 const selectedToolLoadConfigSummary = computed(() => {
   const item = selectedInjectedItem();
@@ -610,6 +655,7 @@ async function loadInjectedItems() {
 function selectInjectedItem(item: InjectedPromptItem) {
   selected.value = { type: "injected", item };
   toolLoadConfigError.value = "";
+  toolEnabledError.value = "";
   closeRuleContextMenu();
   ruleEditing.value = false;
   ruleCreating.value = false;
@@ -627,12 +673,41 @@ async function setSelectedToolDirectLoadState(directLoad: boolean) {
   try {
     await setAgentToolDirectLoad(selectedAgentId.value, tool.name, directLoad);
     await loadInjectedItems();
+    void loadPromptStats();
   } catch (e) {
     console.error("set_agent_tool_direct_load failed:", e);
     toolLoadConfigError.value = t("agent.tool.loadConfigSaveFailed", normalizeAppError(e).message);
   } finally {
     toolLoadSaving.value = false;
   }
+}
+
+async function setToolEnabledState(item: InjectedPromptItem, enabled: boolean) {
+  if (!selectedAgentId.value || item.kind !== "tools") return;
+  if (!canToggleToolEnabled(item) || toolEnabledSavingId.value) return;
+
+  toolEnabledSavingId.value = item.id;
+  toolEnabledError.value = "";
+  const record = toolMetaRecord(item.meta);
+  const previous = record?.enabled;
+  if (record) record.enabled = enabled;
+  try {
+    await setAgentToolEnabled(selectedAgentId.value, item.title, enabled);
+    await loadInjectedItems();
+    void loadPromptStats();
+  } catch (e) {
+    console.error("set_agent_tool_enabled failed:", e);
+    if (record) record.enabled = previous;
+    toolEnabledError.value = t("agent.tool.enableSaveFailed", normalizeAppError(e).message);
+  } finally {
+    toolEnabledSavingId.value = null;
+  }
+}
+
+async function setSelectedToolEnabledState(enabled: boolean) {
+  const item = selectedInjectedItem();
+  if (!item) return;
+  await setToolEnabledState(item, enabled);
 }
 
 async function selectRuleItem(rule: RuleItem) {
@@ -694,6 +769,7 @@ function cancelEditRule() {
 function startCreateRule() {
   closeRuleContextMenu();
   confirmingDeleteRule.value = null;
+  collapsedSections.value.rules = false;
   ruleCreating.value = true;
   ruleNewName.value = "";
   ruleNewContent.value = "";
@@ -955,144 +1031,144 @@ watch(
           </button>
 
           <div class="rule-section" @contextmenu.prevent="onRuleListContextMenu">
-            <div class="section-label">
-              <span>Rule</span>
+            <button
+              type="button"
+              class="section-header"
+              :aria-expanded="!isSectionCollapsed('rules')"
+              @click="toggleSection('rules')"
+            >
+              <span class="section-chevron" :class="{ collapsed: isSectionCollapsed('rules') }">&#9662;</span>
+              <span class="section-name">Rule</span>
               <span v-if="ruleItems.length" class="section-count">{{ ruleItems.length }}</span>
-            </div>
-            <div v-if="ruleLoading && ruleItems.length === 0" class="dir-empty-inline">{{ t("common.loading") }}</div>
-            <div class="rule-drag-zone" @dragover.prevent>
-              <button
-                v-for="(rule, idx) in ruleItems"
-                :key="ruleKey(rule)"
-                type="button"
-                class="kb-item rule-item"
-                :class="{
-                  selected: selected?.type === 'rule' && selectedRuleKey() === ruleKey(rule),
-                  'rule-context-target': ruleKey(ruleContextMenu?.rule) === ruleKey(rule) && selectedRuleKey() !== ruleKey(rule),
-                  'rule-disabled': !rule.enabled,
-                  'rule-dragging': ruleDragIndex === idx,
-                  'rule-drag-over': ruleDragOverIndex === idx && ruleDragIndex !== idx,
-                }"
-                draggable="true"
-                @dragstart="onRuleDragStart(idx, $event)"
-                @dragover="onRuleDragOver(idx, $event)"
-                @dragleave="onRuleDragLeave"
-                @drop.prevent="onRuleDrop(idx)"
-                @dragend="onRuleDragEnd"
-                @contextmenu.prevent.stop="openRuleContextMenu($event, rule)"
-                @click.stop="selectRuleItem(rule)"
-              >
-                <span class="rule-order-num" title="Drag to reorder">{{ idx + 1 }}</span>
-                <label class="rule-toggle-label" @click.stop>
-                  <BaseCheckbox
-                    :model-value="rule.enabled"
-                    :disabled="!canToggleRule(rule)"
-                    :aria-label="rule.enabled ? t('common.enabled') : t('common.disabled')"
-                    :title="!canToggleRule(rule) ? t('agent.rulePluginEnableManagedByPlugin') : undefined"
-                    @update:model-value="setRuleEnabledState(rule, $event)"
-                  />
-                </label>
-                <span class="item-title" :class="{ 'rule-title-disabled': !rule.enabled }">{{ rule.title }}</span>
-                <span v-if="!rule.enabled" class="rule-off-badge">OFF</span>
-                <span class="item-date">{{ formatDate(rule.updatedAt) }}</span>
-              </button>
-            </div>
-            <div v-if="ruleCreating" class="kb-item inline-create-row">
-              <input
-                v-model="ruleNewName"
-                class="inline-input"
-                :placeholder="t('agent.ruleName')"
-                @keydown.enter="commitCreateRule"
-                @keydown.escape="ruleCreating = false"
-                autofocus
-              />
-            </div>
+            </button>
+            <template v-if="!isSectionCollapsed('rules')">
+              <div v-if="ruleLoading && ruleItems.length === 0" class="dir-empty-inline">{{ t("common.loading") }}</div>
+              <div class="rule-drag-zone" @dragover.prevent>
+                <button
+                  v-for="(rule, idx) in ruleItems"
+                  :key="ruleKey(rule)"
+                  type="button"
+                  class="kb-item rule-item"
+                  :class="{
+                    selected: selected?.type === 'rule' && selectedRuleKey() === ruleKey(rule),
+                    'rule-context-target': ruleKey(ruleContextMenu?.rule) === ruleKey(rule) && selectedRuleKey() !== ruleKey(rule),
+                    'rule-disabled': !rule.enabled,
+                    'rule-dragging': ruleDragIndex === idx,
+                    'rule-drag-over': ruleDragOverIndex === idx && ruleDragIndex !== idx,
+                  }"
+                  draggable="true"
+                  @dragstart="onRuleDragStart(idx, $event)"
+                  @dragover="onRuleDragOver(idx, $event)"
+                  @dragleave="onRuleDragLeave"
+                  @drop.prevent="onRuleDrop(idx)"
+                  @dragend="onRuleDragEnd"
+                  @contextmenu.prevent.stop="openRuleContextMenu($event, rule)"
+                  @click.stop="selectRuleItem(rule)"
+                >
+                  <span class="rule-order-num" title="Drag to reorder">{{ idx + 1 }}</span>
+                  <label class="rule-toggle-label" @click.stop>
+                    <BaseCheckbox
+                      :model-value="rule.enabled"
+                      :disabled="!canToggleRule(rule)"
+                      :aria-label="rule.enabled ? t('common.enabled') : t('common.disabled')"
+                      :title="!canToggleRule(rule) ? t('agent.rulePluginEnableManagedByPlugin') : undefined"
+                      @update:model-value="setRuleEnabledState(rule, $event)"
+                    />
+                  </label>
+                  <span class="item-title" :class="{ 'rule-title-disabled': !rule.enabled }">{{ rule.title }}</span>
+                  <span v-if="!rule.enabled" class="rule-off-badge">OFF</span>
+                </button>
+              </div>
+              <div v-if="ruleCreating" class="kb-item inline-create-row">
+                <input
+                  v-model="ruleNewName"
+                  class="inline-input"
+                  :placeholder="t('agent.ruleName')"
+                  @keydown.enter="commitCreateRule"
+                  @keydown.escape="ruleCreating = false"
+                  autofocus
+                />
+              </div>
+            </template>
           </div>
 
           <div class="injected-section">
-            <div class="section-label">
-              <span>{{ t("agent.injected") }}</span>
+            <button
+              type="button"
+              class="section-header"
+              :aria-expanded="!isSectionCollapsed('injected')"
+              @click="toggleSection('injected')"
+            >
+              <span class="section-chevron" :class="{ collapsed: isSectionCollapsed('injected') }">&#9662;</span>
+              <span class="section-name">{{ t("agent.injected") }}</span>
               <span class="section-count">{{ injectedContextEntryCount }}</span>
-            </div>
-            <button
-              type="button"
-              class="kb-item injected-item"
-              :class="{ selected: selected?.type === 'env' }"
-              @click="selectEnv"
-            >
-              <span class="prompt-icon injected-icon">&#9881;</span>
-              <span class="item-title">{{ t("agent.envTemplate") }}</span>
-              <span class="injected-kind-badge">{{ t("agent.injected.context") }}</span>
             </button>
-            <div v-if="injectedLoading && injectedContextItems.length === 0" class="dir-empty-inline">{{ t("common.loading") }}</div>
-            <button
-              v-for="item in injectedContextItems"
-              :key="item.id"
-              type="button"
-              class="kb-item injected-item"
-              :class="{ selected: selected?.type === 'injected' && selectedInjectedItem()?.id === item.id }"
-              @click="selectInjectedItem(item)"
-            >
-              <span class="prompt-icon injected-icon">{{ injectedItemIcon(item.kind) }}</span>
-              <span class="item-title">{{ item.title }}</span>
-              <span class="injected-kind-badge">{{ injectedItemBadge(item.kind) }}</span>
-            </button>
+            <template v-if="!isSectionCollapsed('injected')">
+              <button
+                type="button"
+                class="kb-item injected-item"
+                :class="{ selected: selected?.type === 'env' }"
+                @click="selectEnv"
+              >
+                <span class="prompt-icon injected-icon">&#9881;</span>
+                <span class="item-title">{{ t("agent.envTemplate") }}</span>
+                <span class="injected-kind-badge">{{ t("agent.injected.context") }}</span>
+              </button>
+              <div v-if="injectedLoading && injectedContextItems.length === 0" class="dir-empty-inline">{{ t("common.loading") }}</div>
+              <button
+                v-for="item in injectedContextItems"
+                :key="item.id"
+                type="button"
+                class="kb-item injected-item"
+                :class="{ selected: selected?.type === 'injected' && selectedInjectedItem()?.id === item.id }"
+                @click="selectInjectedItem(item)"
+              >
+                <span class="prompt-icon injected-icon">{{ injectedItemIcon(item.kind) }}</span>
+                <span class="item-title">{{ item.title }}</span>
+                <span class="injected-kind-badge">{{ injectedItemBadge(item.kind) }}</span>
+              </button>
+            </template>
           </div>
 
-          <template v-if="injectedLoading || directToolItems.length > 0">
-            <div class="section-label">
-              <span>{{ t("agent.directTools") }}</span>
-              <span v-if="directToolItems.length" class="section-count">{{ directToolItems.length }}</span>
-            </div>
-            <div v-if="injectedLoading && directToolItems.length === 0" class="dir-empty-inline">{{ t("common.loading") }}</div>
+          <div v-if="injectedLoading && availableToolItems.length === 0" class="dir-empty-inline">{{ t("common.loading") }}</div>
+          <div v-for="group in toolGroups" :key="group.key" class="tool-group">
             <button
-              v-for="item in directToolItems"
-              :key="item.id"
               type="button"
-              class="kb-item injected-item"
-              :class="{ selected: selected?.type === 'injected' && selectedInjectedItem()?.id === item.id }"
-              @click="selectInjectedItem(item)"
+              class="section-header"
+              :aria-expanded="!isSectionCollapsed(group.key)"
+              @click="toggleSection(group.key)"
             >
-              <span class="prompt-icon injected-icon">{{ injectedItemIcon(item.kind) }}</span>
-              <span class="item-title">{{ item.title }}</span>
+              <span class="section-chevron" :class="{ collapsed: isSectionCollapsed(group.key) }">&#9662;</span>
+              <span class="section-name">{{ group.label }}</span>
+              <span class="section-count">{{ group.items.length }}</span>
             </button>
-          </template>
-
-          <template v-if="lazyToolItems.length > 0">
-            <div class="section-label">
-              <span>{{ t("agent.lazyTools") }}</span>
-              <span class="section-count">{{ lazyToolItems.length }}</span>
-            </div>
-            <button
-              v-for="item in lazyToolItems"
-              :key="item.id"
-              type="button"
-              class="kb-item injected-item"
-              :class="{ selected: selected?.type === 'injected' && selectedInjectedItem()?.id === item.id }"
-              @click="selectInjectedItem(item)"
-            >
-              <span class="prompt-icon injected-icon">{{ injectedItemIcon(item.kind) }}</span>
-              <span class="item-title">{{ item.title }}</span>
-            </button>
-          </template>
-
-          <template v-if="skillToolItems.length > 0">
-            <div class="section-label">
-              <span>{{ t("agent.skillTools") }}</span>
-              <span class="section-count">{{ skillToolItems.length }}</span>
-            </div>
-            <button
-              v-for="item in skillToolItems"
-              :key="item.id"
-              type="button"
-              class="kb-item injected-item"
-              :class="{ selected: selected?.type === 'injected' && selectedInjectedItem()?.id === item.id }"
-              @click="selectInjectedItem(item)"
-            >
-              <span class="prompt-icon injected-icon">{{ injectedItemIcon(item.kind) }}</span>
-              <span class="item-title">{{ item.title }}</span>
-            </button>
-          </template>
+            <template v-if="!isSectionCollapsed(group.key)">
+              <button
+                v-for="(item, idx) in group.items"
+                :key="item.id"
+                type="button"
+                class="kb-item injected-item tool-item"
+                :class="{
+                  selected: selected?.type === 'injected' && selectedInjectedItem()?.id === item.id,
+                  'tool-disabled': !toolItemEnabled(item),
+                }"
+                @click="selectInjectedItem(item)"
+              >
+                <span class="tool-order-num">{{ idx + 1 }}</span>
+                <label class="rule-toggle-label" @click.stop>
+                  <BaseCheckbox
+                    :model-value="toolItemEnabled(item)"
+                    :disabled="!canToggleToolEnabled(item) || toolEnabledSavingId === item.id"
+                    :aria-label="toolItemEnabled(item) ? t('common.enabled') : t('common.disabled')"
+                    :title="!canToggleToolEnabled(item) ? t('agent.tool.enableFixed') : undefined"
+                    @update:model-value="setToolEnabledState(item, $event)"
+                  />
+                </label>
+                <span class="item-title tool-title" :class="{ 'rule-title-disabled': !toolItemEnabled(item) }">{{ item.title }}</span>
+                <span v-if="!toolItemEnabled(item)" class="rule-off-badge">OFF</span>
+              </button>
+            </template>
+          </div>
         </div>
       </div>
       <div class="resize-handle" @mousedown="onResizeStart($event, 'dir')"></div>
@@ -1201,10 +1277,22 @@ watch(
 
               <section class="tool-section tool-load-config-section">
                 <div class="tool-section-title">{{ t("agent.tool.loadConfig.title") }}</div>
+                <div class="tool-load-config-row">
+                  <BaseCheckbox
+                    :model-value="selectedToolEnabled"
+                    :disabled="!selectedToolCanToggleEnabled || toolEnabledSavingId !== null"
+                    :aria-label="t('agent.tool.loadConfig.enabled')"
+                    :title="!selectedToolCanToggleEnabled ? t('agent.tool.enableFixed') : undefined"
+                    @update:model-value="setSelectedToolEnabledState"
+                  />
+                  <span class="tool-load-config-label">{{ t("agent.tool.loadConfig.enabled") }}</span>
+                </div>
+                <div v-if="!selectedToolEnabled" class="tool-load-config-summary tool-config-disabled-note">{{ t("agent.tool.loadConfig.disabledNote") }}</div>
+                <div v-if="toolEnabledError" class="tool-config-error">{{ toolEnabledError }}</div>
                 <div v-if="selectedToolCanConfigureDirectLoad" class="tool-load-config-row">
                   <BaseCheckbox
                     :model-value="selectedToolDirectLoadChecked"
-                    :disabled="toolLoadSaving"
+                    :disabled="toolLoadSaving || !selectedToolEnabled"
                     :aria-label="t('agent.tool.loadConfig.directLoad')"
                     @update:model-value="setSelectedToolDirectLoadState"
                   />
@@ -1395,6 +1483,10 @@ watch(
                   <div class="dashboard-stat-cell">
                     <span class="dashboard-stat-label">{{ t("agent.dashboard.runtime.skillTools") }}</span>
                     <span class="dashboard-stat-value">{{ formatCount(promptDashboard.skillToolCount) }}</span>
+                  </div>
+                  <div class="dashboard-stat-cell">
+                    <span class="dashboard-stat-label">{{ t("agent.dashboard.runtime.disabledTools") }}</span>
+                    <span class="dashboard-stat-value">{{ formatCount(promptDashboard.disabledToolCount) }}</span>
                   </div>
                 </div>
                 <div v-if="promptStatsError" class="dashboard-inline-note">{{ promptStatsError }}</div>
@@ -1598,6 +1690,57 @@ watch(
   opacity: 0.7;
 }
 
+.section-header {
+  appearance: none;
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 14px 4px;
+  border: none;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  opacity: 0.7;
+  transition: opacity 0.1s;
+}
+
+.section-header:hover {
+  opacity: 1;
+}
+
+.section-chevron {
+  display: inline-block;
+  width: 10px;
+  font-size: 9px;
+  line-height: 1;
+  flex-shrink: 0;
+  text-align: center;
+  transition: transform 0.12s ease;
+}
+
+.section-chevron.collapsed {
+  transform: rotate(-90deg);
+}
+
+.section-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rule-section,
+.injected-section,
+.tool-group {
+  margin-top: 6px;
+  border-top: 1px solid color-mix(in srgb, var(--border-color) 45%, transparent);
+}
+
 .section-count {
   font-size: 10px;
   color: var(--text-secondary);
@@ -1659,13 +1802,6 @@ watch(
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.item-date {
-  font-size: 11px;
-  color: var(--text-secondary);
-  opacity: 0.4;
-  flex-shrink: 0;
 }
 
 .inline-create-row {
@@ -2341,6 +2477,43 @@ watch(
   width: 18px;
 }
 
+.tool-item {
+  padding: 4px 10px;
+}
+
+.tool-order-num {
+  flex-shrink: 0;
+  width: 18px;
+  text-align: center;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  opacity: 0.6;
+  font-variant-numeric: tabular-nums;
+}
+
+.tool-title {
+  font-family: var(--font-mono-editor);
+  font-size: 12px;
+}
+
+.tool-item.tool-disabled {
+  opacity: 0.6;
+}
+
+/* Soften the enable checkboxes in the list: dozens of solid accent squares
+   read as noise, so keep checked state as a translucent accent fill. */
+.rule-toggle-label :deep(.base-checkbox.checked .base-checkbox-box) {
+  background: color-mix(in srgb, var(--accent-color) 16%, transparent);
+  border-color: color-mix(in srgb, var(--accent-color) 42%, var(--border-strong));
+  color: color-mix(in srgb, var(--accent-color) 82%, var(--text-color) 18%);
+}
+
+.rule-toggle-label :deep(.base-checkbox:not(.checked) .base-checkbox-box) {
+  background: transparent;
+  border-color: color-mix(in srgb, var(--border-strong) 72%, transparent);
+}
+
 .injected-kind-badge {
   font-size: 9px;
   padding: 1px 6px;
@@ -2490,6 +2663,10 @@ watch(
   font-size: 12px;
   line-height: 1.5;
   color: var(--status-danger-fg);
+}
+
+.tool-config-disabled-note {
+  color: var(--status-warn-fg);
 }
 
 .tool-required-list {

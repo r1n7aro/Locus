@@ -27,6 +27,16 @@ use tokio::sync::{oneshot, watch, Mutex as AsyncMutex};
 
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// A pull-diagnostics provider the server registered dynamically via
+/// `client/registerCapability` for `textDocument/diagnostic`. Roslyn
+/// registers one provider per diagnostic source, each with its own
+/// `identifier` that must be echoed back in pull requests.
+#[derive(Debug, Clone)]
+pub struct DiagnosticRegistration {
+    pub identifier: Option<String>,
+    pub workspace_diagnostics: bool,
+}
+
 /// A single running language-server process plus the JSON-RPC plumbing.
 pub struct LspClient {
     stdin: AsyncMutex<tokio::process::ChildStdin>,
@@ -42,6 +52,9 @@ pub struct LspClient {
     last_server_error: Mutex<Option<String>>,
     /// Open document state: uri -> (version, blake3 content hash).
     open_docs: Mutex<HashMap<String, (i32, [u8; 32])>>,
+    /// Diagnostic providers registered by the server (see
+    /// `DiagnosticRegistration`).
+    diagnostic_registrations: Mutex<Vec<DiagnosticRegistration>>,
 }
 
 impl LspClient {
@@ -100,13 +113,24 @@ impl LspClient {
             project_seen: Mutex::new(std::collections::HashSet::new()),
             last_server_error: Mutex::new(None),
             open_docs: Mutex::new(HashMap::new()),
+            diagnostic_registrations: Mutex::new(Vec::new()),
         });
 
         let reader_client = std::sync::Arc::clone(&client);
         tokio::spawn(async move {
             reader_client.read_loop(stdout, loaded_tx, progress_tx).await;
             let _ = exited_tx.send(true);
-            reader_client.fail_all_pending("C# language server exited");
+            // The server has been observed dying without writing anything to
+            // stderr or its log directory; its last window/logMessage error
+            // is the only forensic breadcrumb, so surface it in the failure.
+            let reason = match reader_client.last_server_error() {
+                Some(error) => {
+                    format!("C# language server exited. Last server error: {error}")
+                }
+                None => "C# language server exited".to_string(),
+            };
+            eprintln!("[CsharpLsp] {reason}");
+            reader_client.fail_all_pending(&reason);
         });
 
         Ok(client)
@@ -125,6 +149,49 @@ impl LspClient {
 
     pub fn open_document_count(&self) -> usize {
         self.open_docs.lock().map(|docs| docs.len()).unwrap_or(0)
+    }
+
+    /// Snapshot of the pull-diagnostics providers the server has registered.
+    /// Empty when the server relies on static capabilities (then a single
+    /// identifier-less pull request is the right call shape).
+    pub fn diagnostic_registrations(&self) -> Vec<DiagnosticRegistration> {
+        self.diagnostic_registrations
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
+    }
+
+    fn record_capability_registrations(&self, params: Option<&Value>) {
+        let Some(registrations) = params
+            .and_then(|p| p.get("registrations"))
+            .and_then(|r| r.as_array())
+        else {
+            return;
+        };
+        for registration in registrations {
+            if registration.get("method").and_then(|m| m.as_str())
+                != Some("textDocument/diagnostic")
+            {
+                continue;
+            }
+            let options = registration.get("registerOptions");
+            let identifier = options
+                .and_then(|o| o.get("identifier"))
+                .and_then(|i| i.as_str())
+                .map(str::to_string);
+            let workspace_diagnostics = options
+                .and_then(|o| o.get("workspaceDiagnostics"))
+                .and_then(|w| w.as_bool())
+                .unwrap_or(false);
+            if let Ok(mut guard) = self.diagnostic_registrations.lock() {
+                if !guard.iter().any(|r| r.identifier == identifier) {
+                    guard.push(DiagnosticRegistration {
+                        identifier,
+                        workspace_diagnostics,
+                    });
+                }
+            }
+        }
     }
 
     /// Wait until the server reports `workspace/projectInitializationComplete`,
@@ -290,6 +357,15 @@ impl LspClient {
                                             Some("projects.dotnet_enable_automatic_restore") => {
                                                 Value::Bool(false)
                                             }
+                                            // Default scope is open files only;
+                                            // `workspace/diagnostic` (the
+                                            // code_diagnostics tool's workspace
+                                            // mode) needs full-solution scope to
+                                            // report anything beyond them.
+                                            Some(
+                                                "background_analysis.dotnet_analyzer_diagnostics_scope"
+                                                | "background_analysis.dotnet_compiler_diagnostics_scope",
+                                            ) => Value::String("fullSolution".to_string()),
                                             _ => Value::Null,
                                         }
                                     })
@@ -299,6 +375,7 @@ impl LspClient {
                         json!({ "jsonrpc": "2.0", "id": id, "result": values })
                     }
                     "client/registerCapability" | "client/unregisterCapability" => {
+                        self.record_capability_registrations(message.get("params"));
                         json!({ "jsonrpc": "2.0", "id": id, "result": Value::Null })
                     }
                     "window/workDoneProgress/create" => {
@@ -375,6 +452,18 @@ impl LspClient {
     /// Send a request and await its response. `params` must never be
     /// `Value::Null` (the server's JSON-RPC reader rejects it).
     pub async fn request(&self, method: &str, params: Value) -> Result<Value, String> {
+        self.request_with_timeout(method, params, REQUEST_TIMEOUT)
+            .await
+    }
+
+    /// Like `request`, with a caller-chosen timeout for known-slow requests
+    /// (e.g. `workspace/diagnostic` over a cold solution).
+    pub async fn request_with_timeout(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: std::time::Duration,
+    ) -> Result<Value, String> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
         let (tx, rx) = oneshot::channel();
         if let Ok(mut pending) = self.pending.lock() {
@@ -387,7 +476,7 @@ impl LspClient {
             }
             return Err(error);
         }
-        match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
+        match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err("C# language server dropped the request".to_string()),
             Err(_) => {
@@ -414,19 +503,24 @@ impl LspClient {
         let root_uri = path_to_uri(workspace_root)?;
         let init_params = json!({
             "processId": std::process::id(),
+            // Keep server-produced strings (symbol containers, diagnostics)
+            // English regardless of OS locale — agents consume them.
+            "locale": "en-US",
             "rootUri": root_uri,
             "capabilities": {
                 "workspace": {
                     "configuration": true,
                     "didChangeWatchedFiles": { "dynamicRegistration": true },
                     "workspaceFolders": true,
-                    "symbol": {}
+                    "symbol": {},
+                    "diagnostics": {}
                 },
                 "textDocument": {
                     "synchronization": { "didSave": true },
                     "references": {},
                     "definition": {},
-                    "hover": { "contentFormat": ["plaintext", "markdown"] }
+                    "hover": { "contentFormat": ["plaintext", "markdown"] },
+                    "diagnostic": { "dynamicRegistration": true }
                 },
                 "window": { "workDoneProgress": true }
             },
@@ -508,11 +602,26 @@ impl LspClient {
                 .await?;
             }
             SyncAction::Change(version) => {
+                // Roslyn negotiates incremental sync and dies with an NRE on
+                // a rangeless full-text didChange (ProtocolConversions
+                // .RangeToTextSpan on a null Range — observed killing the
+                // server on every edit→query cycle). Reopen the document
+                // instead: didOpen always carries full text and is valid
+                // under any negotiated sync kind.
                 self.notify(
-                    "textDocument/didChange",
+                    "textDocument/didClose",
+                    json!({ "textDocument": { "uri": uri } }),
+                )
+                .await?;
+                self.notify(
+                    "textDocument/didOpen",
                     json!({
-                        "textDocument": { "uri": uri, "version": version },
-                        "contentChanges": [{ "text": text }]
+                        "textDocument": {
+                            "uri": uri,
+                            "languageId": "csharp",
+                            "version": version,
+                            "text": text
+                        }
                     }),
                 )
                 .await?;

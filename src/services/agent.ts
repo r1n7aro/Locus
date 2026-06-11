@@ -45,6 +45,10 @@ export function setAgentToolDirectLoad(agentId: string, toolName: string, direct
   return ipcInvoke("set_agent_tool_direct_load", { agentId, toolName, directLoad });
 }
 
+export function setAgentToolEnabled(agentId: string, toolName: string, enabled: boolean): Promise<void> {
+  return ipcInvoke("set_agent_tool_enabled", { agentId, toolName, enabled });
+}
+
 export function listRules(agentId: string): Promise<RuleItem[]> {
   return ipcInvoke<RuleItem[]>("list_rules", { agentId });
 }
