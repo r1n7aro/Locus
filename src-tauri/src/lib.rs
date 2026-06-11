@@ -18,6 +18,7 @@ mod commands;
 mod compact;
 mod config;
 pub mod config_registry;
+pub mod csharp_lsp;
 pub(crate) mod diff;
 pub(crate) mod eol;
 pub mod error;
@@ -394,6 +395,7 @@ pub fn run() {
             loaded_config.debug = debug_flag_for_setup.clone();
             let config = Arc::new(loaded_config);
             unity_bridge::initialize_background_hook(config.unity_background_hook_enabled());
+            csharp_lsp::initialize(config.csharp_lsp_enabled(), app.handle().clone());
             startup_for_setup.mark("setup_config_ready");
 
             // Load OpenRouter API key from OS keychain only.
@@ -909,6 +911,9 @@ pub fn run() {
                     )
                     .await;
                     unity_bridge::emit_plugin_status(&app_handle, &wd);
+                    // Roslyn project loading takes seconds; start it now so
+                    // the first code_* tool call does not pay that latency.
+                    csharp_lsp::warm_up_in_background(wd.clone());
                 }
                 startup_for_unity.mark("unity_monitor_task_done");
             });
@@ -1160,6 +1165,7 @@ pub fn run() {
             commands::plugin_registry_fetch_plugin,
             commands::plugin_registry_fetch_description,
             commands::plugin_list_installed,
+            commands::plugin_inspector_drawer_packages,
             commands::plugin_install_from_path,
             commands::plugin_install_from_registry,
             commands::plugin_install_from_source,
@@ -1233,6 +1239,9 @@ pub fn run() {
             commands::get_unity_background_hook_enabled,
             commands::set_unity_background_hook_enabled,
             commands::get_unity_background_hook_status,
+            commands::csharp_lsp_get_status,
+            commands::csharp_lsp_set_enabled,
+            commands::csharp_lsp_restart,
             commands::get_view_windows_above_main,
             commands::set_view_windows_above_main,
             commands::get_view_open_in_existing_window,
@@ -1277,6 +1286,7 @@ pub fn run() {
             commands::view_run_in_unity,
             commands::view_set_tab_host,
             commands::view_detach_tab,
+            commands::view_open_inspector_tab,
             commands::view_host_pool_prepare,
             commands::view_host_pool_ready,
             commands::view_host_revealed,

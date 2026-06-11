@@ -57,6 +57,17 @@ export function buildToolCallArgsSummary(toolName: string, argumentsText: string
       return cmd.slice(0, 57) + "...";
     }
 
+    if (toolName === "code_find_references" || toolName === "code_goto_definition") {
+      const symbol = getStringArg(args, ["symbol"]);
+      const filePath = getStringArg(args, ["filePath", "file_path"]);
+      if (symbol && filePath) return `${symbol} @ ${shortenPath(filePath)}`;
+      return symbol;
+    }
+
+    if (toolName === "code_symbol_search") {
+      return getStringArg(args, ["query"]);
+    }
+
     if (toolName === "task") {
       const desc = getStringArg(args, ["description"]);
       if (desc.length <= 60) return desc;

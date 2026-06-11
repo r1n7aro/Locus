@@ -1,7 +1,7 @@
 {
   "name": "Runtime Debugger",
   "description": "Inspect live game state, diagnose runtime issues, and profile performance.",
-  "tools": ["read", "grep", "list", "bash", "unity_execute", "unity_run_states", "unity_capture_viewport", "unity_asset_search", "unity_ref_search", "unity_yaml_list", "unity_yaml_search", "unity_yaml_read", "todowrite", "ask_user_question", "request_update_knowledge"],
+  "tools": ["read", "grep", "list", "bash", "unity_execute", "unity_run_states", "unity_capture_viewport", "unity_asset_search", "unity_ref_search", "code_find_references", "code_goto_definition", "code_symbol_search", "unity_yaml_list", "unity_yaml_search", "unity_yaml_read", "todowrite", "ask_user_question", "request_update_knowledge"],
   "sub_agents": ["explorer"],
   "default": false,
   "default_effort": "medium",

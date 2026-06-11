@@ -1,0 +1,21 @@
+{
+  "description": "Jump to the definition of a C# symbol using Roslyn semantic analysis. Resolves the exact declaration site of a type, method, property, field or variable from any usage location — including symbols defined in other files, other asmdef assemblies, or Unity packages.\n\nPoint at the symbol by giving a file, a 1-based line number, and the identifier text on that line. Returns the definition location(s) with file path, line number and source text. Symbols defined in compiled assemblies (e.g. UnityEngine.dll) are reported as external metadata without a file path.\n\nThe C# analysis server warms up on first use; if the tool reports it is still preparing, retry after a moment.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "file_path": {
+        "type": "string",
+        "description": "Path to the .cs file containing the usage, relative to the workspace root or absolute."
+      },
+      "line": {
+        "type": "integer",
+        "description": "1-based line number where the symbol appears."
+      },
+      "symbol": {
+        "type": "string",
+        "description": "The identifier on that line to resolve (e.g. 'AudioCueEventChannelSO')."
+      }
+    },
+    "required": ["file_path", "line", "symbol"]
+  }
+}

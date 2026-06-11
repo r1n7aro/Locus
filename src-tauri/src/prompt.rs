@@ -28,6 +28,9 @@ pub mod tools {
     pub const UNITY_YAML_SEARCH: &str = include_str!("../../tools/unity_yaml_search.json");
     pub const UNITY_YAML_READ: &str = include_str!("../../tools/unity_yaml_read.json");
     pub const UNITY_RECOMPILE: &str = include_str!("../../tools/unity_recompile.json");
+    pub const CODE_FIND_REFERENCES: &str = include_str!("../../tools/code_find_references.json");
+    pub const CODE_GOTO_DEFINITION: &str = include_str!("../../tools/code_goto_definition.json");
+    pub const CODE_SYMBOL_SEARCH: &str = include_str!("../../tools/code_symbol_search.json");
     pub const LIST: &str = include_str!("../../tools/list.json");
     pub const ASK: &str = include_str!("../../tools/ask.json");
     pub const SHEET: &str = include_str!("../../tools/sheet.json");

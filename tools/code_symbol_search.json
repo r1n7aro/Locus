@@ -1,0 +1,17 @@
+{
+  "description": "Search C# symbols (classes, methods, properties, fields, ...) across the workspace by name using Roslyn. Fuzzy/camel-hump matching is supported (e.g. 'ACECSO' can match 'AudioCueEventChannelSO'). Faster and more precise than grep for locating a declaration by name when you do not know its file.\n\nReturns matching symbols with kind, containing type, file path and line number. Use code_find_references / code_goto_definition afterwards for deeper navigation.\n\nThe C# analysis server warms up on first use; if the tool reports it is still preparing, retry after a moment.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "query": {
+        "type": "string",
+        "description": "Symbol name or fragment to search for (case-insensitive, fuzzy)."
+      },
+      "max_results": {
+        "type": "integer",
+        "description": "Maximum number of symbols to return. Default 50."
+      }
+    },
+    "required": ["query"]
+  }
+}

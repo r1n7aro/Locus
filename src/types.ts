@@ -84,6 +84,37 @@ export interface AssetRefAttachment {
   source?: "unity" | "manual";
 }
 
+export type CsharpLspPhase =
+  | "disabled"
+  | "idle"
+  | "preparing"
+  | "downloading"
+  | "starting"
+  | "loading"
+  | "ready"
+  | "error";
+
+export interface CsharpLspStatus {
+  enabled: boolean;
+  supported: boolean;
+  phase: CsharpLspPhase;
+  message?: string | null;
+  downloadComponent?: string | null;
+  downloadReceived?: number | null;
+  downloadTotal?: number | null;
+  workspace?: string | null;
+  projectFile?: string | null;
+  serverVersion: string;
+  dotnetSource?: string | null;
+  projectCount?: number | null;
+  loadedProjects?: number | null;
+  openDocuments?: number | null;
+  queryReferences?: number;
+  queryDefinitions?: number;
+  querySymbols?: number;
+  uptimeSecs?: number | null;
+}
+
 export type UnityEditorProcessState = "running" | "not_running" | "unknown";
 
 export type UnityBackgroundHookState =
@@ -319,7 +350,7 @@ export interface ModelOption {
   provider:
     | "openrouter"
     | "anthropic"
-    | "anthropic_sdk"
+    | "claude_code"
     | "openai_codex"
     | "custom";
   defaultEffort?: EffortLevel | null;
@@ -364,6 +395,8 @@ export interface ModelDefaults {
   mainModel: string;
   planModel: string;
   subagentModels: Record<string, string>;
+  /** Opt-in: Claude Code CLI models only join the model list when true. */
+  claudeCodeEnabled?: boolean;
 }
 
 export type CodexTransportMode = "http" | "websocket";

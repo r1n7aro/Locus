@@ -71,10 +71,19 @@ const emit = defineEmits<{
 }>();
 
 const anthropicProvider = computed(() => props.providers.find((p) => p.id === "anthropic"));
+const claudeCodeProvider = computed(() => props.providers.find((p) => p.id === "claude_code"));
+const claudeCodeLoggedOut = computed(
+  () => claudeCodeProvider.value?.hasKey === true && claudeCodeProvider.value?.loggedIn === false,
+);
+const claudeCodeStatusLabel = computed(() => {
+  if (!claudeCodeProvider.value?.hasKey) return t("settings.claudeCode.notInstalled");
+  if (claudeCodeLoggedOut.value) return t("settings.claudeCode.notLoggedIn");
+  return t("settings.claudeCode.installed");
+});
 const isOnboardingMode = computed(() => props.mode === "onboarding");
 const thirdPartyProviders = computed(() =>
   props.providers.filter(
-    (p) => p.id !== "anthropic" && p.id !== "anthropic_sdk" && p.id !== "openrouter",
+    (p) => p.id !== "anthropic" && p.id !== "claude_code" && p.id !== "openrouter",
   ),
 );
 
@@ -101,7 +110,7 @@ function providerLabel(provider: string): string {
   const labels: Record<string, string> = {
     openrouter: "OpenRouter",
     anthropic: t("model.provider.anthropic"),
-    anthropic_sdk: t("model.provider.anthropic_sdk"),
+    claude_code: t("model.provider.claude_code"),
     openai_codex: t("model.provider.openai"),
     custom: t("model.provider.custom"),
   };
@@ -317,35 +326,39 @@ function quotaCreditsLabel() {
     </div>
   </div>
 
-  <div class="settings-section" v-if="!isOnboardingMode && providers.find(p => p.id === 'anthropic_sdk')">
-    <div class="section-label">{{ t("settings.anthropicSdk.title") }}</div>
+  <div class="settings-section" v-if="!isOnboardingMode && claudeCodeProvider">
+    <div class="section-label">{{ t("settings.claudeCode.title") }}</div>
     <div class="provider-card">
       <div class="provider-header">
         <div class="provider-info">
-          <span class="provider-name">{{ providers.find(p => p.id === 'anthropic_sdk')?.name || 'Anthropic Agent SDK' }}</span>
-          <span class="provider-desc">{{ t("settings.provider.anthropic_sdk.desc") }}</span>
+          <span class="provider-name">{{ claudeCodeProvider?.name || 'Claude Code CLI' }}</span>
+          <span class="provider-desc">{{ t("settings.provider.claude_code.desc") }}</span>
         </div>
         <span
           class="provider-status"
-          :class="{ active: providers.find(p => p.id === 'anthropic_sdk')?.hasKey }"
+          :class="{ active: claudeCodeProvider?.hasKey && !claudeCodeLoggedOut }"
         >
-          {{ providers.find(p => p.id === 'anthropic_sdk')?.hasKey ? t("settings.anthropicSdk.installed") : t("settings.anthropicSdk.notInstalled") }}
+          {{ claudeCodeStatusLabel }}
         </span>
       </div>
 
       <div class="provider-detail">
         <span
           class="key-hint"
-          :class="{ mono: providers.find(p => p.id === 'anthropic_sdk')?.hasKey }"
+          :class="{ mono: claudeCodeProvider?.hasKey }"
         >
-          {{ providers.find(p => p.id === 'anthropic_sdk')?.hasKey
-            ? (providers.find(p => p.id === 'anthropic_sdk')?.keyHint || t("settings.anthropicSdk.installed"))
-            : t("settings.anthropicSdk.installHint") }}
+          {{ claudeCodeProvider?.hasKey
+            ? (claudeCodeProvider?.keyHint || t("settings.claudeCode.installed"))
+            : t("settings.claudeCode.installHint") }}
         </span>
       </div>
 
+      <div class="provider-detail" v-if="claudeCodeLoggedOut" style="padding-top: 0;">
+        <span class="oauth-hint">{{ t("settings.claudeCode.loginHint") }}</span>
+      </div>
+
       <div class="provider-detail" style="padding-top: 0;">
-        <span class="oauth-hint">{{ t("settings.anthropicSdk.hint") }}</span>
+        <span class="oauth-hint">{{ t("settings.claudeCode.hint") }}</span>
       </div>
     </div>
   </div>

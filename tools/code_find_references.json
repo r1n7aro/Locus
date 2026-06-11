@@ -1,0 +1,25 @@
+{
+  "description": "Find all references to a C# symbol across the workspace using Roslyn semantic analysis (same engine as Visual Studio). Unlike grep, results are semantically exact: overloads, partial classes, generics and using-aliases are resolved, and comment/string mentions are excluded.\n\nPoint at the symbol by giving a file, a 1-based line number, and the identifier text on that line (e.g. the declaration line of a class/method/field, or any usage site). Returns matching locations grouped by file with line numbers and source text.\n\nNotes:\n- Code references only. Unity serialized references (UnityEvent bindings, m_Script GUIDs in scenes/prefabs) are NOT included; use unity_ref_search for asset-level references.\n- The C# analysis server warms up on first use (it may download components and load the solution). If the tool reports it is still preparing, retry after a moment.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "file_path": {
+        "type": "string",
+        "description": "Path to the .cs file containing the symbol, relative to the workspace root (e.g. 'Assets/Scripts/Player.cs') or absolute."
+      },
+      "line": {
+        "type": "integer",
+        "description": "1-based line number where the symbol appears."
+      },
+      "symbol": {
+        "type": "string",
+        "description": "The identifier on that line to query (e.g. 'PlayerController', 'TakeDamage'). Must match a whole identifier; the first whole-word occurrence on the line is used."
+      },
+      "include_declaration": {
+        "type": "boolean",
+        "description": "Include the declaration itself in results. Default false."
+      }
+    },
+    "required": ["file_path", "line", "symbol"]
+  }
+}

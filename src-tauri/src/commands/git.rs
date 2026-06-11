@@ -11,8 +11,9 @@ use super::auth::CodexAuthStateHandle;
 use crate::auth::AuthState;
 use crate::config::AppConfig;
 use crate::error::{AppError, ErrorSeverity};
-use crate::llm::anthropic_agent_sdk::{
-    self, ClaudeCodeSdkOptions, ClaudeSdkAssistantMessage, ClaudeSdkHost, ClaudeSdkHostFuture,
+use crate::llm::claude_code_cli::{
+    self, ClaudeCodeAssistantMessage, ClaudeCodeCliOptions, ClaudeCodeHost, ClaudeCodeHostFuture,
+    ClaudeCodeToolResult,
 };
 use crate::process_util::{
     async_command, augment_path_with_git, command, discover_git_runtimes, git_env_override,
@@ -4861,12 +4862,12 @@ fn normalize_commit_description(description: &str) -> String {
 }
 
 #[derive(Default)]
-struct GitClaudeSdkHost {
+struct GitClaudeCodeHost {
     streamed_text: String,
-    last_assistant: Option<ClaudeSdkAssistantMessage>,
+    last_assistant: Option<ClaudeCodeAssistantMessage>,
 }
 
-impl ClaudeSdkHost for GitClaudeSdkHost {
+impl ClaudeCodeHost for GitClaudeCodeHost {
     fn on_text_delta(&mut self, delta: String) {
         self.streamed_text.push_str(&delta);
     }
@@ -4875,7 +4876,7 @@ impl ClaudeSdkHost for GitClaudeSdkHost {
 
     fn on_tool_call_start(&mut self, _tool_call_id: String, _tool_name: String) {}
 
-    fn on_assistant_message(&mut self, message: ClaudeSdkAssistantMessage) -> Result<(), String> {
+    fn on_assistant_message(&mut self, message: ClaudeCodeAssistantMessage) -> Result<(), String> {
         self.last_assistant = Some(message);
         Ok(())
     }
@@ -4885,32 +4886,33 @@ impl ClaudeSdkHost for GitClaudeSdkHost {
         _request_id: &'a str,
         tool_name: &'a str,
         _arguments: serde_json::Value,
-    ) -> ClaudeSdkHostFuture<'a> {
+    ) -> ClaudeCodeHostFuture<'a> {
         Box::pin(async move {
-            ToolResult {
+            ClaudeCodeToolResult::from(ToolResult {
                 output: format!(
                     "Tool '{}' is not available while generating git commit messages.",
                     tool_name
                 ),
                 is_error: true,
-            }
+            })
         })
     }
 }
 
-async fn generate_commit_message_with_anthropic_sdk(
+async fn generate_commit_message_with_claude_code(
     cwd: &str,
     selected_model: &str,
     user_prompt: &str,
     debug: bool,
 ) -> Result<String, AppError> {
-    let mut host = GitClaudeSdkHost::default();
-    let turn = anthropic_agent_sdk::run_turn(
-        ClaudeCodeSdkOptions {
+    let mut host = GitClaudeCodeHost::default();
+    let turn = claude_code_cli::run_turn(
+        ClaudeCodeCliOptions {
             locus_session_id: format!("git_commit_{}", uuid::Uuid::new_v4()),
             cwd: cwd.to_string(),
             system_prompt: "You are a git commit message generator.".to_string(),
             model: selected_model.to_string(),
+            effort: None,
             resume_session_id: None,
             server_name: "locus".to_string(),
             tools: Vec::new(),
@@ -4923,7 +4925,7 @@ async fn generate_commit_message_with_anthropic_sdk(
         &mut host,
     )
     .await
-    .map_err(|e| format!("Anthropic Agent SDK failed: {}", e))?;
+    .map_err(|e| format!("Claude Code CLI failed: {}", e))?;
 
     let response_text = host
         .last_assistant
@@ -4937,11 +4939,9 @@ async fn generate_commit_message_with_anthropic_sdk(
         .unwrap_or_else(|| host.streamed_text.trim().to_string());
 
     if response_text.is_empty() {
-        return Err(
-            "Anthropic Agent SDK returned an empty commit message response"
-                .to_string()
-                .into(),
-        );
+        return Err("Claude Code CLI returned an empty commit message response"
+            .to_string()
+            .into());
     }
 
     Ok(response_text)
@@ -4951,7 +4951,7 @@ async fn generate_commit_message_with_anthropic_sdk(
 enum CommitMessageModelProvider {
     OpenRouter,
     OpenAiCodex,
-    AnthropicSdk,
+    ClaudeCode,
     AnthropicDirect,
 }
 
@@ -4971,8 +4971,8 @@ fn classify_commit_message_model_provider(
         return Some(CommitMessageModelProvider::OpenAiCodex);
     }
 
-    if selected_model.starts_with("anthropic_sdk/") {
-        return Some(CommitMessageModelProvider::AnthropicSdk);
+    if selected_model.starts_with("claude_code/") {
+        return Some(CommitMessageModelProvider::ClaudeCode);
     }
 
     if !selected_model.contains('/') {
@@ -5157,8 +5157,8 @@ pub async fn git_generate_commit_message(
             Err(error) => return Err(error.into()),
         };
         resp.text
-    } else if matches!(provider, Some(CommitMessageModelProvider::AnthropicSdk)) {
-        generate_commit_message_with_anthropic_sdk(
+    } else if matches!(provider, Some(CommitMessageModelProvider::ClaudeCode)) {
+        generate_commit_message_with_claude_code(
             &cwd,
             selected_model,
             &user_prompt,

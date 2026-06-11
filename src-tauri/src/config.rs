@@ -167,6 +167,8 @@ pub struct AppConfig {
         with = "serde_atomic_bool"
     )]
     pub unity_background_hook_enabled: Arc<AtomicBool>,
+    #[serde(default = "default_debug_flag", with = "serde_atomic_bool")]
+    pub csharp_lsp_enabled: Arc<AtomicBool>,
     #[serde(skip)]
     config_path: Arc<Mutex<Option<PathBuf>>>,
 }
@@ -209,6 +211,7 @@ impl AppConfig {
             view_windows_above_main: default_view_windows_above_main(),
             view_open_in_existing_window: default_view_open_in_existing_window(),
             unity_background_hook_enabled: default_unity_background_hook_enabled(),
+            csharp_lsp_enabled: default_debug_flag(),
             config_path: Arc::new(Mutex::new(Some(primary_path.to_path_buf()))),
         };
 
@@ -360,6 +363,15 @@ impl AppConfig {
 
     pub fn unity_background_hook_enabled(&self) -> bool {
         self.unity_background_hook_enabled.load(Ordering::Relaxed)
+    }
+
+    pub fn csharp_lsp_enabled(&self) -> bool {
+        self.csharp_lsp_enabled.load(Ordering::Relaxed)
+    }
+
+    pub fn set_csharp_lsp_enabled(&self, value: bool) -> Result<(), String> {
+        self.csharp_lsp_enabled.store(value, Ordering::Relaxed);
+        self.persist()
     }
 
     pub fn set_unity_background_hook_enabled(&self, value: bool) -> Result<(), String> {

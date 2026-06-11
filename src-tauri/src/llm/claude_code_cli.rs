@@ -13,11 +13,66 @@ use std::os::windows::process::CommandExt;
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
-use crate::session::models::ToolCallInfo;
+use crate::session::models::{ImageData, ToolCallInfo};
 use crate::tool::ToolResult;
 
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+/// Built-in Claude Code tools removed from the model's tool list so the CLI
+/// acts purely as the reasoning loop while every capability flows through the
+/// Locus SDK-MCP bridge (and therefore through Locus permission gating).
+///
+/// This is a deny list, so it must cover every builtin across CLI variants;
+/// names unknown to a given build only produce a stderr warning ("matches no
+/// known tool"), never an error — verified on claude.exe 2.1.170.
+const DISALLOWED_CLAUDE_BUILTINS: &[&str] = &[
+    // Execution / editing / search builtins replaced by Locus tools.
+    "Bash",
+    "BashOutput",
+    "KillShell",
+    "Edit",
+    "MultiEdit",
+    "Write",
+    "Read",
+    "NotebookEdit",
+    "NotebookRead",
+    "Glob",
+    "Grep",
+    "LS",
+    "WebFetch",
+    "WebSearch",
+    "Task",
+    "Agent",
+    "TodoWrite",
+    "SlashCommand",
+    // Interactive / planning / discovery builtins that would bypass the Locus
+    // UX (Locus ships its own ask_user_question and plan mode).
+    "AskUserQuestion",
+    "EnterPlanMode",
+    "ExitPlanMode",
+    "Skill",
+    "ToolSearch",
+    "ListMcpResources",
+    "ReadMcpResource",
+    // Extras observed on the desktop-bundled claude.exe 2.1.x builds.
+    "CronCreate",
+    "CronDelete",
+    "CronList",
+    "EnterWorktree",
+    "ExitWorktree",
+    "Monitor",
+    "PushNotification",
+    "RemoteTrigger",
+    "ScheduleWakeup",
+    "TaskCreate",
+    "TaskGet",
+    "TaskList",
+    "TaskUpdate",
+    "TaskOutput",
+    "TaskStop",
+    "Workflow",
+];
 
 fn claude_session_map() -> &'static tokio::sync::Mutex<HashMap<String, String>> {
     static STORE: OnceLock<tokio::sync::Mutex<HashMap<String, String>>> = OnceLock::new();
@@ -32,6 +87,14 @@ pub async fn cached_session_id(locus_session_id: &str) -> Option<String> {
         .cloned()
 }
 
+/// Drop the cached Claude session id for a Locus session. Called when the
+/// persisted store says there is no resume point (e.g. the history was rolled
+/// back past every Claude-backed turn) so the stale cache cannot resurrect a
+/// Claude session containing rolled-back content.
+pub async fn clear_session_id(locus_session_id: &str) {
+    claude_session_map().lock().await.remove(locus_session_id);
+}
+
 pub async fn store_session_id(locus_session_id: &str, claude_session_id: &str) {
     if locus_session_id.is_empty() || claude_session_id.is_empty() {
         return;
@@ -43,26 +106,27 @@ pub async fn store_session_id(locus_session_id: &str, claude_session_id: &str) {
 }
 
 #[derive(Debug, Clone)]
-pub struct ClaudeSdkToolDefinition {
+pub struct ClaudeCodeToolDefinition {
     pub name: String,
     pub description: String,
     pub input_schema: serde_json::Value,
 }
 
 #[derive(Debug, Clone)]
-pub struct ClaudeCodeSdkOptions {
+pub struct ClaudeCodeCliOptions {
     pub locus_session_id: String,
     pub cwd: String,
     pub system_prompt: String,
     pub model: String,
+    pub effort: Option<String>,
     pub resume_session_id: Option<String>,
     pub server_name: String,
-    pub tools: Vec<ClaudeSdkToolDefinition>,
+    pub tools: Vec<ClaudeCodeToolDefinition>,
     pub debug: bool,
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct ClaudeSdkAssistantMessage {
+pub struct ClaudeCodeAssistantMessage {
     pub text: String,
     pub tool_calls: Vec<ToolCallInfo>,
     pub thinking_text: String,
@@ -82,19 +146,36 @@ pub struct ClaudeCodeTurnResult {
     pub claude_session_id: Option<String>,
 }
 
-pub type ClaudeSdkHostFuture<'a> = Pin<Box<dyn Future<Output = ToolResult> + Send + 'a>>;
+#[derive(Debug, Clone)]
+pub struct ClaudeCodeToolResult {
+    pub output: String,
+    pub is_error: bool,
+    pub images: Option<Vec<ImageData>>,
+}
 
-pub trait ClaudeSdkHost {
+impl From<ToolResult> for ClaudeCodeToolResult {
+    fn from(result: ToolResult) -> Self {
+        Self {
+            output: result.output,
+            is_error: result.is_error,
+            images: None,
+        }
+    }
+}
+
+pub type ClaudeCodeHostFuture<'a> = Pin<Box<dyn Future<Output = ClaudeCodeToolResult> + Send + 'a>>;
+
+pub trait ClaudeCodeHost {
     fn on_text_delta(&mut self, delta: String);
     fn on_thinking_delta(&mut self, delta: String);
     fn on_tool_call_start(&mut self, tool_call_id: String, tool_name: String);
-    fn on_assistant_message(&mut self, message: ClaudeSdkAssistantMessage) -> Result<(), String>;
+    fn on_assistant_message(&mut self, message: ClaudeCodeAssistantMessage) -> Result<(), String>;
     fn execute_tool<'a>(
         &'a mut self,
         request_id: &'a str,
         tool_name: &'a str,
         arguments: serde_json::Value,
-    ) -> ClaudeSdkHostFuture<'a>;
+    ) -> ClaudeCodeHostFuture<'a>;
 }
 
 pub fn claude_cli_status() -> (bool, String) {
@@ -102,6 +183,96 @@ pub fn claude_cli_status() -> (bool, String) {
         Some(path) => (true, path.display().to_string()),
         None => (false, String::new()),
     }
+}
+
+/// Login state of the local Claude Code CLI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaudeCliLoginState {
+    LoggedIn,
+    LoggedOut,
+    /// Credentials could not be inspected (e.g. macOS Keychain storage);
+    /// callers should not block usage on this state.
+    Unknown,
+}
+
+/// Detect whether the Claude Code CLI has usable credentials without spawning
+/// it (a probe run would either bill a real API call when logged in or burn a
+/// subprocess startup per status refresh). Mirrors the CLI's own auth sources:
+/// explicit env vars, the OAuth credentials file under the Claude config dir,
+/// or an `apiKeyHelper` in settings.json.
+pub fn claude_cli_login_status() -> (ClaudeCliLoginState, String) {
+    for var in ["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"] {
+        if std::env::var(var)
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false)
+        {
+            return (ClaudeCliLoginState::LoggedIn, format!("{} (env)", var));
+        }
+    }
+
+    if let Some(dir) = claude_config_dir() {
+        if credentials_file_has_login(&dir.join(".credentials.json")) {
+            return (
+                ClaudeCliLoginState::LoggedIn,
+                "subscription login".to_string(),
+            );
+        }
+        if settings_has_api_key_helper(&dir.join("settings.json")) {
+            return (ClaudeCliLoginState::LoggedIn, "apiKeyHelper".to_string());
+        }
+    }
+
+    // macOS stores OAuth credentials in the Keychain, which cannot be read
+    // here without risking an interactive prompt — report Unknown instead of
+    // a false "logged out".
+    #[cfg(target_os = "macos")]
+    let fallback = (ClaudeCliLoginState::Unknown, String::new());
+    #[cfg(not(target_os = "macos"))]
+    let fallback = (ClaudeCliLoginState::LoggedOut, String::new());
+    fallback
+}
+
+fn claude_config_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR") {
+        if !dir.is_empty() {
+            return Some(PathBuf::from(dir));
+        }
+    }
+    dirs::home_dir().map(|home| home.join(".claude"))
+}
+
+fn credentials_file_has_login(path: &Path) -> bool {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return false;
+    };
+    let Some(oauth) = value.get("claudeAiOauth") else {
+        return false;
+    };
+    ["accessToken", "refreshToken"].iter().any(|key| {
+        oauth
+            .get(*key)
+            .and_then(|v| v.as_str())
+            .map(|token| !token.trim().is_empty())
+            .unwrap_or(false)
+    })
+}
+
+fn settings_has_api_key_helper(path: &Path) -> bool {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    serde_json::from_str::<serde_json::Value>(&raw)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("apiKeyHelper")
+                .and_then(|v| v.as_str())
+                .map(|helper| !helper.trim().is_empty())
+        })
+        .unwrap_or(false)
 }
 
 pub fn find_claude_cli() -> Option<PathBuf> {
@@ -113,8 +284,8 @@ pub fn find_claude_cli() -> Option<PathBuf> {
     None
 }
 
-pub async fn run_turn<H: ClaudeSdkHost>(
-    options: ClaudeCodeSdkOptions,
+pub async fn run_turn<H: ClaudeCodeHost>(
+    options: ClaudeCodeCliOptions,
     user_message: serde_json::Value,
     host: &mut H,
 ) -> Result<ClaudeCodeTurnResult, String> {
@@ -132,14 +303,14 @@ pub async fn run_turn<H: ClaudeSdkHost>(
         if let Some(layout) = try_bun_preload_layout(&cli_path) {
             if let Some(hook_path) = install_http_hook() {
                 eprintln!(
-                    "[Claude SDK debug] bun preload layout detected: bun={}, cli.js={}",
+                    "[Claude Code CLI debug] bun preload layout detected: bun={}, cli.js={}",
                     layout.bun_exe.display(),
                     layout.cli_js.display()
                 );
                 bun_preload_active = Some((layout, hook_path));
             }
         } else {
-            eprintln!("[Claude SDK debug] bun preload layout NOT detected — falling back to NODE_OPTIONS=--require (only works for node-based claude shims)");
+            eprintln!("[Claude Code CLI debug] bun preload layout NOT detected — falling back to NODE_OPTIONS=--require (only works for node-based claude shims)");
         }
     }
 
@@ -162,10 +333,20 @@ pub async fn run_turn<H: ClaudeSdkHost>(
         .arg("--include-partial-messages")
         .arg("--input-format")
         .arg("stream-json")
+        .arg("--exclude-dynamic-system-prompt-sections")
         .arg("--system-prompt")
         .arg(options.system_prompt.clone())
         .arg("--permission-mode")
-        .arg("bypassPermissions");
+        .arg("bypassPermissions")
+        // Hermetic run: tool permissioning happens on the Locus side, so the
+        // child must not pick up user/project Claude Code config — external
+        // MCP servers, hooks, skills, and plugins would otherwise auto-run
+        // under bypassPermissions outside the Locus permission UI.
+        // `--strict-mcp-config` does not affect the sdkMcpServers
+        // control-protocol server registered below (verified on 2.1.170).
+        .arg("--strict-mcp-config")
+        .arg("--setting-sources")
+        .arg("");
 
     let normalized_model = normalize_claude_model(&options.model);
     if !normalized_model.is_empty() {
@@ -178,17 +359,31 @@ pub async fn run_turn<H: ClaudeSdkHost>(
         }
     }
 
+    if let Some(effort) = options
+        .effort
+        .as_deref()
+        .map(str::trim)
+        .filter(|effort| !effort.is_empty() && *effort != "none")
+    {
+        cmd.arg("--effort").arg(effort);
+    }
+
+    cmd.arg("--disallowed-tools");
+    for tool in DISALLOWED_CLAUDE_BUILTINS {
+        cmd.arg(tool);
+    }
+
     let mut envs: HashMap<OsString, OsString> = std::env::vars_os().collect();
     envs.entry(OsString::from("CLAUDE_CODE_ENTRYPOINT"))
-        .or_insert_with(|| OsString::from("sdk-rs"));
+        .or_insert_with(|| OsString::from("locus-rs"));
     envs.entry(OsString::from("LOCUS_SESSION_ID"))
         .or_insert_with(|| OsString::from(options.locus_session_id.clone()));
     crate::network::extend_proxy_env_map(&mut envs);
 
     if options.debug {
-        let abs_dir = sdk_debug_dir();
+        let abs_dir = claude_code_debug_dir();
         eprintln!(
-            "[Claude SDK debug] LOCUS_DEBUG_DIR -> {}",
+            "[Claude Code CLI debug] LOCUS_DEBUG_DIR -> {}",
             abs_dir.display()
         );
         envs.insert(
@@ -199,14 +394,16 @@ pub async fn run_turn<H: ClaudeSdkHost>(
         if bun_preload_active.is_some() {
             // Hook is loaded via the explicit `bun --require <hook>` arg added when
             // building cmd above. Nothing more to do for the env.
-            eprintln!("[Claude SDK debug] hook injection mode = bun --require (explicit cli flag)");
+            eprintln!(
+                "[Claude Code CLI debug] hook injection mode = bun --require (explicit cli flag)"
+            );
         } else {
             // Fallback for non-bun installs: try NODE_OPTIONS=--require, which works
             // for npm/node-based shims but is silently ignored by bun.
             match install_http_hook() {
                 Some(hook_path) => {
                     eprintln!(
-                        "[Claude SDK debug] hook script written to {}",
+                        "[Claude Code CLI debug] hook script written to {}",
                         hook_path.display()
                     );
                     let hook_str = hook_path.to_string_lossy().to_string();
@@ -227,14 +424,14 @@ pub async fn run_turn<H: ClaudeSdkHost>(
                         None => require_arg,
                     };
                     eprintln!(
-                        "[Claude SDK debug] hook injection mode = NODE_OPTIONS={}",
+                        "[Claude Code CLI debug] hook injection mode = NODE_OPTIONS={}",
                         combined
                     );
                     envs.insert(OsString::from("NODE_OPTIONS"), OsString::from(combined));
                 }
                 None => {
                     eprintln!(
-                        "[Claude SDK debug] install_http_hook returned None — hook not injected"
+                        "[Claude Code CLI debug] install_http_hook returned None — hook not injected"
                     );
                 }
             }
@@ -277,13 +474,13 @@ pub async fn run_turn<H: ClaudeSdkHost>(
             loop {
                 match reader.next_line().await {
                     Ok(Some(line)) => {
-                        eprintln!("[Claude SDK stderr] {}", line);
+                        eprintln!("[Claude Code CLI stderr] {}", line);
                         buf.push_str(&line);
                         buf.push('\n');
                     }
                     Ok(None) => break,
                     Err(e) => {
-                        eprintln!("[Claude SDK stderr] read error: {}", e);
+                        eprintln!("[Claude Code CLI stderr] read error: {}", e);
                         break;
                     }
                 }
@@ -383,10 +580,10 @@ pub async fn run_turn<H: ClaudeSdkHost>(
                 .await?;
             }
             "stream_event" => {
-                handle_stream_event(&message, host, &mut thinking_started_at);
+                handle_stream_event(&message, host, &options.server_name, &mut thinking_started_at);
             }
             "assistant" => {
-                if let Some(parsed) = parse_assistant_message(&message) {
+                if let Some(parsed) = parse_assistant_message(&message, &options.server_name) {
                     host.on_assistant_message(parsed)?;
                 }
             }
@@ -402,7 +599,10 @@ pub async fn run_turn<H: ClaudeSdkHost>(
             | "tool_use_summary" | "keep_alive" => {}
             other => {
                 if options.debug {
-                    eprintln!("[Claude SDK] ignoring message type '{}': {}", other, line);
+                    eprintln!(
+                        "[Claude Code CLI] ignoring message type '{}': {}",
+                        other, line
+                    );
                 }
             }
         }
@@ -474,8 +674,21 @@ fn parse_result_message(
         .get("subtype")
         .and_then(|v| v.as_str())
         .unwrap_or_default();
+    // The CLI reports some failures (e.g. "Not logged in") with
+    // `subtype: "success"` but `is_error: true` and the error text in
+    // `result`; honor both signals so auth failures never masquerade as a
+    // normal assistant reply.
+    let is_error = message
+        .get("is_error")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
-    if subtype != "success" {
+    if subtype != "success" || is_error {
+        let result_text = message
+            .get("result")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .unwrap_or_default();
         let errors = message
             .get("errors")
             .and_then(|v| v.as_array())
@@ -485,9 +698,21 @@ fn parse_result_message(
                     .collect::<Vec<_>>()
                     .join("; ")
             })
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "Claude Code returned an error result".to_string());
-        return Err(errors);
+            .filter(|s| !s.is_empty());
+        let mut detail = if !result_text.is_empty() {
+            result_text.to_string()
+        } else if let Some(errors) = errors {
+            errors
+        } else {
+            "Claude Code returned an error result".to_string()
+        };
+        if detail.contains("Not logged in") {
+            detail = format!(
+                "{} — the Claude Code CLI has no usable login. Run `claude` in a terminal and complete /login (or set ANTHROPIC_API_KEY), then retry.",
+                detail
+            );
+        }
+        return Err(detail);
     }
 
     out.final_text = message
@@ -528,9 +753,20 @@ fn usage_u32(usage: &serde_json::Map<String, serde_json::Value>, keys: &[&str]) 
     0
 }
 
-fn handle_stream_event<H: ClaudeSdkHost>(
+/// The CLI advertises SDK-MCP server tools to the model under the namespaced
+/// form `mcp__<server>__<tool>`, while `tools/call` requests deliver the bare
+/// tool name. Normalize model-facing names back to the bare Locus tool names
+/// so round bookkeeping, undo recording, persisted history, and the UI all
+/// refer to the same tool identity.
+fn strip_mcp_tool_prefix(name: &str, server_name: &str) -> String {
+    let prefix = format!("mcp__{}__", server_name);
+    name.strip_prefix(&prefix).unwrap_or(name).to_string()
+}
+
+fn handle_stream_event<H: ClaudeCodeHost>(
     message: &serde_json::Value,
     host: &mut H,
+    server_name: &str,
     thinking_started_at: &mut Option<Instant>,
 ) {
     let Some(event) = message.get("event") else {
@@ -558,8 +794,8 @@ fn handle_stream_event<H: ClaudeSdkHost>(
                 let tool_name = block
                     .get("name")
                     .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string();
+                    .map(|name| strip_mcp_tool_prefix(name, server_name))
+                    .unwrap_or_default();
                 if !tool_call_id.is_empty() && !tool_name.is_empty() {
                     host.on_tool_call_start(tool_call_id, tool_name);
                 }
@@ -594,10 +830,13 @@ fn handle_stream_event<H: ClaudeSdkHost>(
     }
 }
 
-fn parse_assistant_message(message: &serde_json::Value) -> Option<ClaudeSdkAssistantMessage> {
+fn parse_assistant_message(
+    message: &serde_json::Value,
+    server_name: &str,
+) -> Option<ClaudeCodeAssistantMessage> {
     let payload = message.get("message")?;
     let content = payload.get("content")?;
-    let mut parsed = ClaudeSdkAssistantMessage::default();
+    let mut parsed = ClaudeCodeAssistantMessage::default();
 
     match content {
         serde_json::Value::String(text) => {
@@ -632,8 +871,8 @@ fn parse_assistant_message(message: &serde_json::Value) -> Option<ClaudeSdkAssis
                         let name = block
                             .get("name")
                             .and_then(|v| v.as_str())
-                            .unwrap_or_default()
-                            .to_string();
+                            .map(|name| strip_mcp_tool_prefix(name, server_name))
+                            .unwrap_or_default();
                         let arguments = block
                             .get("input")
                             .cloned()
@@ -667,11 +906,11 @@ fn parse_assistant_message(message: &serde_json::Value) -> Option<ClaudeSdkAssis
     }
 }
 
-async fn handle_control_request<H: ClaudeSdkHost>(
+async fn handle_control_request<H: ClaudeCodeHost>(
     stdin: &mut tokio::process::ChildStdin,
     message: &serde_json::Value,
     host: &mut H,
-    tools: &[ClaudeSdkToolDefinition],
+    tools: &[ClaudeCodeToolDefinition],
     raw_request: &mut String,
 ) -> Result<(), String> {
     let request_id = message
@@ -735,12 +974,12 @@ async fn handle_control_request<H: ClaudeSdkHost>(
     write_json_line(stdin, &response, raw_request).await
 }
 
-async fn handle_mcp_message<H: ClaudeSdkHost>(
+async fn handle_mcp_message<H: ClaudeCodeHost>(
     request_id: &str,
     _server_name: &str,
     message: &serde_json::Value,
     host: &mut H,
-    tools: &[ClaudeSdkToolDefinition],
+    tools: &[ClaudeCodeToolDefinition],
 ) -> serde_json::Value {
     let id = message
         .get("id")
@@ -800,14 +1039,12 @@ async fn handle_mcp_message<H: ClaudeSdkHost>(
                 .cloned()
                 .unwrap_or_else(|| json!({}));
             let result = host.execute_tool(request_id, tool_name, arguments).await;
+            let content = mcp_tool_result_content(&result);
             json!({
                 "jsonrpc": "2.0",
                 "id": id,
                 "result": {
-                    "content": [{
-                        "type": "text",
-                        "text": result.output,
-                    }],
+                    "content": content,
                     "isError": result.is_error,
                 }
             })
@@ -823,13 +1060,35 @@ async fn handle_mcp_message<H: ClaudeSdkHost>(
     }
 }
 
+fn mcp_tool_result_content(result: &ClaudeCodeToolResult) -> Vec<serde_json::Value> {
+    let mut content = vec![json!({
+        "type": "text",
+        "text": result.output,
+    })];
+
+    if let Some(images) = result.images.as_ref() {
+        for image in images {
+            if image.data.trim().is_empty() {
+                continue;
+            }
+            content.push(json!({
+                "type": "image",
+                "data": image.data,
+                "mimeType": image.mime_type,
+            }));
+        }
+    }
+
+    content
+}
+
 async fn write_json_line(
     stdin: &mut tokio::process::ChildStdin,
     value: &serde_json::Value,
     raw_request: &mut String,
 ) -> Result<(), String> {
     let line = serde_json::to_string(value)
-        .map_err(|e| format!("Failed to serialize Claude SDK payload: {}", e))?;
+        .map_err(|e| format!("Failed to serialize Claude Code CLI payload: {}", e))?;
     stdin
         .write_all(line.as_bytes())
         .await
@@ -853,7 +1112,7 @@ async fn write_json_line(
 /// mode is on.
 const CLAUDE_HTTP_HOOK_JS: &str = include_str!("claude_http_hook.cjs");
 
-/// When the SDK debug hook needs to be injected and the user's `claude` is installed
+/// When the Claude Code CLI debug hook needs to be injected and the user's `claude` is installed
 /// via bun, we cannot rely on `NODE_OPTIONS=--require` because bun silently ignores
 /// `--require` inside that env var. Instead we re-target the spawn at `bun.exe`
 /// directly with `--require <hook> <cli.js>` as the leading args, bypassing the
@@ -955,13 +1214,13 @@ fn find_claude_cli_js(_claude_cli_path: &Path) -> Option<PathBuf> {
     None
 }
 
-/// Provider tag used for the SDK's debug folder. Keep in sync with the value passed
+/// Provider tag used for the Claude Code CLI debug folder. Keep in sync with the value passed
 /// to [`crate::llm::debug::save_request`] for the synthesized request snapshot.
-const SDK_PROVIDER_TAG: &str = "anthropic_sdk";
+const CLAUDE_CODE_PROVIDER_TAG: &str = "claude_code";
 
-/// Resolve the absolute per-provider debug directory for the SDK backend. Anchored
-/// under the shared LLM debug root, which defaults to `<repo_root>/debug/llm/anthropic_sdk/`
-/// in dev and `<install_dir>/data/debug/llm/anthropic_sdk/` in packaged runtimes
+/// Resolve the absolute per-provider debug directory for the Claude Code CLI backend. Anchored
+/// under the shared LLM debug root, which defaults to `<repo_root>/debug/llm/claude_code/`
+/// in dev and `<install_dir>/data/debug/llm/claude_code/` in packaged runtimes
 /// (or under `LOCUS_DEBUG_DIR` if set). The dev path stays outside `src-tauri/` so
 /// `tauri dev` does not see new captures and trigger a rebuild loop.
 ///
@@ -970,8 +1229,8 @@ const SDK_PROVIDER_TAG: &str = "anthropic_sdk";
 /// form in `--require`, and bun silently swallows the failure — so the http hook
 /// never loads. We strip the prefix here to keep the path interoperable with the
 /// JS runtime that reads it back via `NODE_OPTIONS`.
-fn sdk_debug_dir() -> PathBuf {
-    let dir = crate::llm::debug::debug_dir_for(SDK_PROVIDER_TAG);
+fn claude_code_debug_dir() -> PathBuf {
+    let dir = crate::llm::debug::debug_dir_for(CLAUDE_CODE_PROVIDER_TAG);
     let canonical = std::fs::canonicalize(&dir).unwrap_or(dir);
     strip_windows_namespace_prefix(canonical)
 }
@@ -994,11 +1253,11 @@ fn strip_windows_namespace_prefix(p: PathBuf) -> PathBuf {
     p
 }
 
-/// Write the embedded JS hook to disk inside the SDK debug folder and return its
+/// Write the embedded JS hook to disk inside the Claude Code CLI debug folder and return its
 /// absolute path. Returns `None` (and logs to stderr) if the file system rejects the
 /// write — debug instrumentation must never abort the real run.
 fn install_http_hook() -> Option<PathBuf> {
-    let dir = sdk_debug_dir();
+    let dir = claude_code_debug_dir();
     let hook_path = dir.join("_locus_claude_http_hook.cjs");
     if let Err(e) = std::fs::write(&hook_path, CLAUDE_HTTP_HOOK_JS) {
         eprintln!(
@@ -1010,11 +1269,11 @@ fn install_http_hook() -> Option<PathBuf> {
     Some(hook_path)
 }
 
-/// Persist the synthesized SDK invocation as a `.http`-style file under the debug folder.
-/// Mirrors `crate::llm::debug::save_request` so SDK runs land next to the OpenRouter /
+/// Persist the synthesized Claude Code CLI invocation as a `.http`-style file under the debug folder.
+/// Mirrors `crate::llm::debug::save_request` so Claude Code CLI runs land next to the OpenRouter /
 /// Anthropic OAuth captures and can be diffed visually.
 fn save_debug_request(
-    options: &ClaudeCodeSdkOptions,
+    options: &ClaudeCodeCliOptions,
     cmd: &tokio::process::Command,
     user_message: &serde_json::Value,
 ) {
@@ -1046,6 +1305,7 @@ fn save_debug_request(
             "program": program,
             "args": args,
             "cwd": options.cwd,
+            "effort": options.effort,
             "resume_session_id": options.resume_session_id,
         },
     });
@@ -1056,18 +1316,18 @@ fn save_debug_request(
         ("x-locus-session-id", options.locus_session_id.as_str()),
         ("x-claude-model", options.model.as_str()),
     ];
-    crate::llm::debug::save_request("anthropic_sdk", &url, &headers, &body_str);
+    crate::llm::debug::save_request("claude_code", &url, &headers, &body_str);
 }
 
 /// Persist the raw stream-json output from the Claude CLI subprocess so debug runs include
 /// the response side too. Lives next to the request file under the same debug folder.
 fn save_debug_response(
-    options: &ClaudeCodeSdkOptions,
+    options: &ClaudeCodeCliOptions,
     raw_response: &str,
     stderr_output: &str,
     exit_code: Option<i32>,
 ) {
-    let dir = sdk_debug_dir();
+    let dir = claude_code_debug_dir();
 
     let ts = chrono::Local::now().format("%Y%m%d_%H%M%S%.3f");
     let filename = format!("{}_response.ndjson", ts);
@@ -1094,7 +1354,7 @@ fn save_debug_response(
 
 fn normalize_claude_model(model: &str) -> String {
     let trimmed = model.trim();
-    let short = trimmed.strip_prefix("anthropic_sdk/").unwrap_or(trimmed);
+    let short = trimmed.strip_prefix("claude_code/").unwrap_or(trimmed);
     match short {
         "claude-sonnet-4.6" => "claude-sonnet-4-6".to_string(),
         "claude-opus-4.6" => "claude-opus-4-6".to_string(),
@@ -1178,5 +1438,102 @@ fn cli_binary_names() -> &'static [&'static str] {
     #[cfg(not(target_os = "windows"))]
     {
         &["claude"]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strips_sdk_mcp_prefix_from_model_tool_names() {
+        assert_eq!(
+            strip_mcp_tool_prefix("mcp__locus__unity_execute", "locus"),
+            "unity_execute"
+        );
+        assert_eq!(
+            strip_mcp_tool_prefix("unity_execute", "locus"),
+            "unity_execute"
+        );
+        assert_eq!(
+            strip_mcp_tool_prefix("mcp__other__tool", "locus"),
+            "mcp__other__tool"
+        );
+    }
+
+    #[test]
+    fn parse_assistant_message_normalizes_namespaced_tool_names() {
+        let message = json!({
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_1",
+                        "name": "mcp__locus__read",
+                        "input": {"path": "a.txt"}
+                    }
+                ]
+            }
+        });
+
+        let parsed = parse_assistant_message(&message, "locus").expect("parsed message");
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].id, "toolu_1");
+        assert_eq!(parsed.tool_calls[0].name, "read");
+    }
+
+    #[test]
+    fn result_with_is_error_is_reported_as_failure() {
+        let message = json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": true,
+            "result": "Not logged in · Please run /login",
+        });
+
+        let mut out = ClaudeCodeTurnResult::default();
+        let error = parse_result_message(&message, &mut out).expect_err("must fail");
+        assert!(error.contains("Not logged in"));
+        assert!(error.contains("/login"));
+    }
+
+    #[test]
+    fn successful_result_parses_text_and_usage() {
+        let message = json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "result": "done",
+            "total_cost_usd": 0.5,
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        });
+
+        let mut out = ClaudeCodeTurnResult::default();
+        parse_result_message(&message, &mut out).expect("success result");
+        assert_eq!(out.final_text, "done");
+        assert_eq!(out.input_tokens, 10);
+        assert_eq!(out.output_tokens, 5);
+        assert!((out.cost_usd - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn mcp_tool_result_content_includes_images() {
+        let result = ClaudeCodeToolResult {
+            output: "captured".to_string(),
+            is_error: false,
+            images: Some(vec![ImageData {
+                data: "aW1hZ2U=".to_string(),
+                mime_type: "image/png".to_string(),
+            }]),
+        };
+
+        let content = mcp_tool_result_content(&result);
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "captured");
+        assert_eq!(content[1]["type"], "image");
+        assert_eq!(content[1]["data"], "aW1hZ2U=");
+        assert_eq!(content[1]["mimeType"], "image/png");
     }
 }

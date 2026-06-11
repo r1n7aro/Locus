@@ -1,6 +1,7 @@
 mod agent_graph;
 pub mod asset;
 mod auth;
+mod csharp_lsp;
 mod diff;
 mod fonts;
 mod git;
@@ -425,6 +426,7 @@ pub struct TokenUsage {
 pub use agent_graph::*;
 pub use asset::*;
 pub use auth::*;
+pub use csharp_lsp::*;
 pub use diff::*;
 pub use fonts::*;
 pub use git::*;

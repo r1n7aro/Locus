@@ -8,12 +8,14 @@ use super::{
     AssistantStreamState, ExecutedToolResult, StreamRenderOrderTracker,
 };
 use crate::commands::{StreamEvent, ToolCallOutcome};
-use crate::llm::anthropic_agent_sdk::{
-    self, ClaudeCodeSdkOptions, ClaudeSdkAssistantMessage, ClaudeSdkHost, ClaudeSdkHostFuture,
-    ClaudeSdkToolDefinition,
+use crate::llm::claude_code_cli::{
+    self, ClaudeCodeAssistantMessage, ClaudeCodeCliOptions, ClaudeCodeHost, ClaudeCodeHostFuture,
+    ClaudeCodeToolDefinition, ClaudeCodeToolResult,
 };
 use crate::session::models::{ImageData, MessageRole, ToolCallInfo};
 use crate::session::store::SessionStore;
+
+const CLAUDE_CODE_CLI_PROVIDER: &str = "claude_code";
 
 struct PendingAssistantRound {
     message_id: String,
@@ -24,9 +26,21 @@ struct PendingAssistantRound {
     thinking_order: Option<u32>,
     thinking_text: String,
     thinking_signature: String,
+    undo_checked: bool,
+    undo_guard: Option<crate::vcs::undo::UndoRoundGuard>,
+    has_unity_execute: bool,
+    unity_edit_session_started: bool,
+    queued_unity_asset_paths: Vec<String>,
 }
 
-struct ClaudeSdkRoundHost<'a> {
+struct CliRoundCompletion {
+    message_id: String,
+    undo_guard: Option<crate::vcs::undo::UndoRoundGuard>,
+    has_unity_execute: bool,
+    queued_unity_asset_paths: Vec<String>,
+}
+
+struct ClaudeCodeRoundHost<'a> {
     agent: &'a AgentInstance,
     app_handle: &'a AppHandle,
     store: &'a SessionStore,
@@ -39,11 +53,12 @@ struct ClaudeSdkRoundHost<'a> {
     known_tool_calls: VecDeque<ToolCallInfo>,
     completed_tool_ids: HashSet<String>,
     pending_round: Option<PendingAssistantRound>,
-    last_assistant: Option<ClaudeSdkAssistantMessage>,
+    last_assistant: Option<ClaudeCodeAssistantMessage>,
+    last_persisted_assistant_message_id: Option<String>,
     render_order: StreamRenderOrderTracker,
 }
 
-fn save_claude_sdk_tool_result(
+fn save_claude_code_tool_result(
     store: &SessionStore,
     session_id: &str,
     run_id: &str,
@@ -60,7 +75,7 @@ fn save_claude_sdk_tool_result(
     )
 }
 
-impl<'a> ClaudeSdkRoundHost<'a> {
+impl<'a> ClaudeCodeRoundHost<'a> {
     fn emit_tool_call_start(&mut self, tool_call_id: &str, tool_name: &str, arguments: &str) {
         let mark = self.render_order.mark_tool(self.run_id, tool_call_id);
         emit_stream(
@@ -145,12 +160,12 @@ impl<'a> ClaudeSdkRoundHost<'a> {
             let render_parts = super::assistant_render_parts_for_response(
                 self.run_id,
                 round.content_order.map(|seq| super::RenderPartMark {
-                    id: format!("{}:text:claude-sdk-round", self.run_id),
+                    id: format!("{}:text:claude-code-round", self.run_id),
                     seq,
                 }),
                 &round.text,
                 round.thinking_order.map(|seq| super::RenderPartMark {
-                    id: format!("{}:thinking:claude-sdk-round", self.run_id),
+                    id: format!("{}:thinking:claude-code-round", self.run_id),
                     seq,
                 }),
                 &round.thinking_text,
@@ -164,7 +179,7 @@ impl<'a> ClaudeSdkRoundHost<'a> {
                 &render_parts,
             ) {
                 eprintln!(
-                    "[Agent {}] failed to update Claude SDK tool_calls/render_parts for message {}: {}",
+                    "[Agent {}] failed to update Claude Code CLI tool_calls/render_parts for message {}: {}",
                     self.agent.id, round.message_id, err
                 );
             }
@@ -201,7 +216,7 @@ impl<'a> ClaudeSdkRoundHost<'a> {
                 .known_tool_calls
                 .remove(index)
                 .unwrap_or_else(|| ToolCallInfo {
-                    id: format!("sdk_{}", sanitize_request_id(request_id)),
+                    id: format!("claude_code_{}", sanitize_request_id(request_id)),
                     name: tool_name.to_string(),
                     arguments: raw_arguments_str.clone(),
                     server_tool: None,
@@ -222,7 +237,7 @@ impl<'a> ClaudeSdkRoundHost<'a> {
                 .known_tool_calls
                 .remove(index)
                 .unwrap_or_else(|| ToolCallInfo {
-                    id: format!("sdk_{}", sanitize_request_id(request_id)),
+                    id: format!("claude_code_{}", sanitize_request_id(request_id)),
                     name: tool_name.to_string(),
                     arguments: raw_arguments_str.clone(),
                     server_tool: None,
@@ -255,7 +270,7 @@ impl<'a> ClaudeSdkRoundHost<'a> {
         }
 
         ToolCallInfo {
-            id: format!("sdk_{}", sanitize_request_id(request_id)),
+            id: format!("claude_code_{}", sanitize_request_id(request_id)),
             name: tool_name.to_string(),
             arguments: raw_arguments_str,
             server_tool: None,
@@ -266,13 +281,228 @@ impl<'a> ClaudeSdkRoundHost<'a> {
             order: None,
         }
     }
+
+    fn emit_undo_checkpoint_warning(&self, error: &str) {
+        let lower = error.to_ascii_lowercase();
+        let message = if lower.contains("unable to index file 'nul'")
+            || lower.contains("short read while indexing nul")
+        {
+            "Undo is unavailable for this round because Git could not snapshot the workspace. Remove or rename reserved Windows file names such as NUL in the repository."
+        } else {
+            "Undo may be unavailable for this round because the workspace snapshot failed."
+        };
+        crate::error::AppError::emit_background(
+            self.app_handle,
+            &crate::error::AppError::new("undo.checkpoint_failed", message)
+                .detail(error.to_string())
+                .operation("undo")
+                .severity(crate::error::ErrorSeverity::Warning),
+        );
+    }
+
+    async fn ensure_cli_round_undo_checkpoint(
+        &mut self,
+        tool_name: &str,
+        args: &serde_json::Value,
+    ) {
+        if !self.agent.tool_call_needs_undo_tracking(tool_name, args) {
+            return;
+        }
+
+        let should_check = self
+            .pending_round
+            .as_ref()
+            .map(|round| !round.undo_checked)
+            .unwrap_or(false);
+        if !should_check {
+            return;
+        }
+        if let Some(round) = self.pending_round.as_mut() {
+            round.undo_checked = true;
+        }
+
+        let Some(undo_mgr) = self.agent.undo_manager.as_ref() else {
+            return;
+        };
+        let checkpoint = match undo_mgr
+            .before_round(&self.agent.working_dir, "cli tool round")
+            .await
+        {
+            Ok(checkpoint) => checkpoint,
+            Err(error) => {
+                eprintln!(
+                    "[Agent {}] Claude Code CLI undo checkpoint failed: {}",
+                    self.agent.id, error
+                );
+                self.emit_undo_checkpoint_warning(&error);
+                None
+            }
+        };
+
+        if let Some(round) = self.pending_round.as_mut() {
+            round.undo_guard = checkpoint;
+        }
+    }
+
+    async fn prepare_cli_unity_tool(&mut self, tool_call: &ToolCallInfo, args: &serde_json::Value) {
+        if let Some(round) = self.pending_round.as_mut() {
+            if tool_call.name == "unity_execute" || tool_call.name == "unity_run_states" {
+                round.has_unity_execute = true;
+            }
+        }
+
+        let queued_before_recompile = if tool_call.name == "unity_recompile" {
+            self.pending_round
+                .as_mut()
+                .map(|round| std::mem::take(&mut round.queued_unity_asset_paths))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        if !queued_before_recompile.is_empty() {
+            match crate::unity_bridge::import_assets(
+                &self.agent.working_dir,
+                &queued_before_recompile,
+            )
+            .await
+            {
+                Ok(message) => eprintln!(
+                    "[Agent {}] Claude Code CLI imported changed Unity assets before recompile: {}",
+                    self.agent.id, message
+                ),
+                Err(error) => eprintln!(
+                    "[Agent {}] Claude Code CLI failed to import changed Unity assets before recompile: {}",
+                    self.agent.id, error
+                ),
+            }
+        }
+
+        if !crate::unity_bridge::is_unity_project(&self.agent.working_dir)
+            || !self.agent.is_unity_asset_write_call(tool_call, args)
+        {
+            return;
+        }
+
+        let should_begin = self
+            .pending_round
+            .as_ref()
+            .map(|round| !round.unity_edit_session_started)
+            .unwrap_or(false);
+        if !should_begin {
+            return;
+        }
+        if let Some(round) = self.pending_round.as_mut() {
+            round.unity_edit_session_started = true;
+        }
+
+        match crate::unity_bridge::begin_edit_session(
+            &self.agent.working_dir,
+            &self.agent.session_id,
+        )
+        .await
+        {
+            Ok(message) => eprintln!(
+                "[Agent {}] Claude Code CLI Unity edit session active for {}: {}",
+                self.agent.id, self.agent.session_id, message
+            ),
+            Err(error) => eprintln!(
+                "[Agent {}] Claude Code CLI failed to begin Unity edit session for {}: {}",
+                self.agent.id, self.agent.session_id, error
+            ),
+        }
+    }
+
+    fn note_cli_unity_tool_result(
+        &mut self,
+        tool_call: &ToolCallInfo,
+        args: &serde_json::Value,
+        result: &ExecutedToolResult,
+    ) {
+        let Some(asset_path) = self
+            .agent
+            .unity_asset_relative_path(tool_call, args, result)
+        else {
+            return;
+        };
+        if let Some(round) = self.pending_round.as_mut() {
+            round.queued_unity_asset_paths.push(asset_path);
+        }
+    }
+
+    fn take_cli_round_completion_if_ready(&mut self) -> Option<CliRoundCompletion> {
+        let round = self.pending_round.as_mut()?;
+        if !round.remaining.is_empty() {
+            return None;
+        }
+        Some(CliRoundCompletion {
+            message_id: round.message_id.clone(),
+            undo_guard: round.undo_guard.take(),
+            has_unity_execute: round.has_unity_execute,
+            queued_unity_asset_paths: std::mem::take(&mut round.queued_unity_asset_paths),
+        })
+    }
+
+    async fn finish_cli_round_external_side_effects(&self, completion: CliRoundCompletion) {
+        if !completion.queued_unity_asset_paths.is_empty() {
+            crate::unity_bridge::import_assets_fire_and_forget(
+                &self.agent.working_dir,
+                completion.queued_unity_asset_paths,
+            );
+        }
+
+        let Some(undo_guard) = completion.undo_guard else {
+            return;
+        };
+        let Some(undo_mgr) = self.agent.undo_manager.as_ref() else {
+            return;
+        };
+        let recorded = undo_mgr
+            .after_round(
+                &self.agent.session_id,
+                &completion.message_id,
+                Some(self.run_id),
+                undo_guard,
+                completion.has_unity_execute,
+                &self.agent.working_dir,
+            )
+            .await;
+        match recorded {
+            Ok(true) => {
+                if let Some(entry) = undo_mgr
+                    .find_entry(&self.agent.session_id, &completion.message_id)
+                    .await
+                {
+                    if AgentInstance::changed_files_touch_view_tree(&entry.changed_files) {
+                        crate::view::emit_view_tree_changed(self.app_handle);
+                    }
+                }
+                eprintln!(
+                    "[Agent {}] emitting Claude Code CLI UndoAvailable for session {} run {} message {}",
+                    self.agent.id, self.agent.session_id, self.run_id, completion.message_id
+                );
+                emit_stream(
+                    self.app_handle,
+                    self.run_id,
+                    StreamEvent::UndoAvailable {
+                        session_id: self.agent.session_id.clone(),
+                        assistant_message_id: completion.message_id,
+                    },
+                );
+            }
+            Ok(false) => {}
+            Err(error) => eprintln!(
+                "[Agent {}] failed to record Claude Code CLI undo state for session {} message {}: {}",
+                self.agent.id, self.agent.session_id, completion.message_id, error
+            ),
+        }
+    }
 }
 
-impl<'a> ClaudeSdkHost for ClaudeSdkRoundHost<'a> {
+impl<'a> ClaudeCodeHost for ClaudeCodeRoundHost<'a> {
     fn on_text_delta(&mut self, delta: String) {
         let mark = self
             .render_order
-            .mark_text(self.run_id, "claude-sdk-stream-text");
+            .mark_text(self.run_id, "claude-code-stream-text");
         self.streamed_text.push_str(&delta);
         self.partial_assistant.append_text(&delta);
         emit_stream(
@@ -294,7 +524,7 @@ impl<'a> ClaudeSdkHost for ClaudeSdkRoundHost<'a> {
     fn on_thinking_delta(&mut self, delta: String) {
         let mark = self
             .render_order
-            .mark_thinking(self.run_id, "claude-sdk-stream-thinking");
+            .mark_thinking(self.run_id, "claude-code-stream-thinking");
         self.partial_assistant.append_thinking(&delta);
         emit_stream(
             self.app_handle,
@@ -314,7 +544,7 @@ impl<'a> ClaudeSdkHost for ClaudeSdkRoundHost<'a> {
         self.started_tool_calls.push_back((tool_call_id, tool_name));
     }
 
-    fn on_assistant_message(&mut self, message: ClaudeSdkAssistantMessage) -> Result<(), String> {
+    fn on_assistant_message(&mut self, message: ClaudeCodeAssistantMessage) -> Result<(), String> {
         if message.tool_calls.is_empty() {
             self.last_assistant = Some(message);
             return Ok(());
@@ -323,7 +553,7 @@ impl<'a> ClaudeSdkHost for ClaudeSdkRoundHost<'a> {
         if let Some(existing) = self.pending_round.take() {
             if !existing.remaining.is_empty() {
                 eprintln!(
-                    "[Agent {}] Claude SDK emitted a new tool round before the previous one finished",
+                    "[Agent {}] Claude Code CLI emitted a new tool round before the previous one finished",
                     self.agent.id
                 );
             }
@@ -331,11 +561,11 @@ impl<'a> ClaudeSdkHost for ClaudeSdkRoundHost<'a> {
 
         let text_part = (!message.text.is_empty()).then(|| {
             self.render_order
-                .mark_text(self.run_id, "claude-sdk-round-text")
+                .mark_text(self.run_id, "claude-code-round-text")
         });
         let thinking_part = (!message.thinking_text.is_empty()).then(|| {
             self.render_order
-                .mark_thinking(self.run_id, "claude-sdk-round-thinking")
+                .mark_thinking(self.run_id, "claude-code-round-thinking")
         });
         let content_order = text_part.as_ref().map(|part| part.seq);
         let thinking_order = thinking_part.as_ref().map(|part| part.seq);
@@ -401,7 +631,7 @@ impl<'a> ClaudeSdkHost for ClaudeSdkRoundHost<'a> {
             .collect();
 
         self.pending_round = Some(PendingAssistantRound {
-            message_id,
+            message_id: message_id.clone(),
             text: message.text,
             tool_calls: ordered_tool_calls,
             remaining,
@@ -409,7 +639,13 @@ impl<'a> ClaudeSdkHost for ClaudeSdkRoundHost<'a> {
             thinking_order,
             thinking_text: message.thinking_text,
             thinking_signature: message.thinking_signature,
+            undo_checked: false,
+            undo_guard: None,
+            has_unity_execute: false,
+            unity_edit_session_started: false,
+            queued_unity_asset_paths: Vec::new(),
         });
+        self.last_persisted_assistant_message_id = Some(message_id);
         self.streamed_text.clear();
         self.maybe_finish_pending_round();
         Ok(())
@@ -420,7 +656,7 @@ impl<'a> ClaudeSdkHost for ClaudeSdkRoundHost<'a> {
         request_id: &'b str,
         tool_name: &'b str,
         arguments: serde_json::Value,
-    ) -> ClaudeSdkHostFuture<'b> {
+    ) -> ClaudeCodeHostFuture<'b> {
         Box::pin(async move {
             let mut tool_call = self.take_matching_tool_call(request_id, tool_name, &arguments);
             let mut args_for_exec = arguments.clone();
@@ -431,11 +667,8 @@ impl<'a> ClaudeSdkHost for ClaudeSdkRoundHost<'a> {
                             .agent
                             .allowed_tool_set_for_active_skills(self.active_skill_tool_names)
                             .await;
-                        if let Some(canonical) = self
-                            .agent
-                            .tool_registry
-                            .canonical_name(&target_name)
-                            .filter(|name| {
+                        if let Some(canonical) =
+                            self.agent.canonical_tool_name(&target_name).filter(|name| {
                                 !AgentInstance::is_meta_tool(name) && allowed.contains(name)
                             })
                         {
@@ -460,7 +693,7 @@ impl<'a> ClaudeSdkHost for ClaudeSdkRoundHost<'a> {
                     }
                     Err(error) => {
                         eprintln!(
-                            "[Agent {}] invalid Claude SDK meta-call arguments for tool_call id={}: {}",
+                            "[Agent {}] invalid Claude Code CLI meta-call arguments for tool_call id={}: {}",
                             self.agent.id, tool_call.id, error
                         );
                     }
@@ -470,6 +703,11 @@ impl<'a> ClaudeSdkHost for ClaudeSdkRoundHost<'a> {
             }
             self.agent
                 .inject_working_dir(&tool_call.name, &mut args_for_exec);
+
+            self.ensure_cli_round_undo_checkpoint(&tool_call.name, &args_for_exec)
+                .await;
+            self.prepare_cli_unity_tool(&tool_call, &args_for_exec)
+                .await;
 
             let result = self
                 .agent
@@ -487,14 +725,14 @@ impl<'a> ClaudeSdkHost for ClaudeSdkRoundHost<'a> {
             if !self.agent.run_is_current_for_session(
                 self.store,
                 self.run_id,
-                "claude_sdk_tool_result",
+                "claude_code_tool_result",
                 Some(&tool_call.id),
             ) || self.agent.is_cancel_requested()
             {
-                return crate::tool::ToolResult {
+                return ClaudeCodeToolResult::from(crate::tool::ToolResult {
                     output: crate::session::history::INTERRUPTED_TOOL_RESULT.to_string(),
                     is_error: false,
-                };
+                });
             }
 
             let stored_output = match self.store.rewrite_tool_result_for_storage(
@@ -506,14 +744,14 @@ impl<'a> ClaudeSdkHost for ClaudeSdkRoundHost<'a> {
                 Ok(output) => output,
                 Err(err) => {
                     eprintln!(
-                        "[Agent {}] failed to persist Claude SDK tool result for '{}' (id={}): {}",
+                        "[Agent {}] failed to persist Claude Code CLI tool result for '{}' (id={}): {}",
                         self.agent.id, tool_call.name, tool_call.id, err
                     );
                     result.output.clone()
                 }
             };
 
-            match save_claude_sdk_tool_result(
+            match save_claude_code_tool_result(
                 self.store,
                 &self.agent.session_id,
                 self.run_id,
@@ -524,17 +762,17 @@ impl<'a> ClaudeSdkHost for ClaudeSdkRoundHost<'a> {
                 Ok(Some(_)) => {}
                 Ok(None) => {
                     eprintln!(
-                        "[Agent {}] discarding stale Claude SDK tool result before save: session={} run={} tool_call_id={}",
+                        "[Agent {}] discarding stale Claude Code CLI tool result before save: session={} run={} tool_call_id={}",
                         self.agent.id, self.agent.session_id, self.run_id, tool_call.id
                     );
-                    return crate::tool::ToolResult {
+                    return ClaudeCodeToolResult::from(crate::tool::ToolResult {
                         output: crate::session::history::INTERRUPTED_TOOL_RESULT.to_string(),
                         is_error: false,
-                    };
+                    });
                 }
                 Err(err) => {
                     eprintln!(
-                        "[Agent {}] failed to save Claude SDK tool result for '{}' (id={}): {}",
+                        "[Agent {}] failed to save Claude Code CLI tool result for '{}' (id={}): {}",
                         self.agent.id, tool_call.name, tool_call.id, err
                     );
                 }
@@ -549,6 +787,7 @@ impl<'a> ClaudeSdkHost for ClaudeSdkRoundHost<'a> {
             );
 
             self.completed_tool_ids.insert(tool_call.id.clone());
+            self.note_cli_unity_tool_result(&tool_call, &args_for_exec, &result);
             if let Some(round) = self.pending_round.as_mut() {
                 if let Some(existing) = round
                     .tool_calls
@@ -561,15 +800,54 @@ impl<'a> ClaudeSdkHost for ClaudeSdkRoundHost<'a> {
                 }
                 round.remaining.remove(&tool_call.id);
             }
+            let completed_round = self.take_cli_round_completion_if_ready();
             self.maybe_finish_pending_round();
+            if let Some(completed_round) = completed_round {
+                self.finish_cli_round_external_side_effects(completed_round)
+                    .await;
+            }
 
-            ExecutedToolResult::into_tool_result(result)
+            ClaudeCodeToolResult {
+                output: result.output,
+                is_error: result.is_error,
+                images: result.images,
+            }
         })
     }
 }
 
 impl AgentInstance {
-    pub(super) async fn run_anthropic_agent_sdk(
+    async fn build_cli_request_tool_names(
+        &self,
+        dynamic_tool_loading_mode: crate::config::DynamicToolLoadingMode,
+        active_skill_tool_names: &HashSet<String>,
+    ) -> Vec<String> {
+        if dynamic_tool_loading_mode != crate::config::DynamicToolLoadingMode::Direct {
+            return self
+                .build_request_tool_names_for_mode_and_skills(
+                    dynamic_tool_loading_mode,
+                    active_skill_tool_names,
+                )
+                .await;
+        }
+
+        let mut names = vec!["tool_load".to_string()];
+        let mut allowed: Vec<String> = self
+            .allowed_tool_set_for_active_skills(active_skill_tool_names)
+            .await
+            .into_iter()
+            .filter(|name| !Self::is_meta_tool(name))
+            .collect();
+        allowed.sort();
+        for name in allowed {
+            if !names.iter().any(|existing| existing == &name) {
+                names.push(name);
+            }
+        }
+        names
+    }
+
+    pub(super) async fn run_claude_code_cli(
         &self,
         app_handle: &AppHandle,
         store: &SessionStore,
@@ -586,25 +864,48 @@ impl AgentInstance {
             self.seed_loaded_tools_from_history(&messages).await;
         }
         let request_tools = self
-            .build_request_tool_names_for_mode_and_skills(
-                dynamic_tool_loading_mode,
-                active_skill_tool_names,
-            )
+            .build_cli_request_tool_names(dynamic_tool_loading_mode, active_skill_tool_names)
             .await;
         let api_tools = self.build_api_tools(&request_tools).await;
 
-        let resume_session_id = anthropic_agent_sdk::cached_session_id(&self.session_id).await;
+        // The persisted per-message session id is authoritative: it follows
+        // Locus history surgery (rollback, regenerate, message deletion),
+        // while the in-process cache may still point at a Claude session that
+        // contains rolled-back turns. Only fall back to the cache when the
+        // store cannot be read at all, and keep the cache mirroring the
+        // authoritative value so the degraded path stays close to correct.
+        let resume_session_id =
+            match store.latest_cli_session_id(&self.session_id, CLAUDE_CODE_CLI_PROVIDER) {
+                Ok(persisted) => {
+                    match persisted.as_deref() {
+                        Some(session_id) => {
+                            claude_code_cli::store_session_id(&self.session_id, session_id).await;
+                        }
+                        None => {
+                            claude_code_cli::clear_session_id(&self.session_id).await;
+                        }
+                    }
+                    persisted
+                }
+                Err(error) => {
+                    eprintln!(
+                        "[Agent {}] failed to load persisted Claude Code CLI session id for {}: {}",
+                        self.id, self.session_id, error
+                    );
+                    claude_code_cli::cached_session_id(&self.session_id).await
+                }
+            };
         if resume_session_id.is_none() && store.get_messages_for_prompt(&self.session_id)?.len() > 1
         {
             eprintln!(
-                "[Agent {}] Claude SDK session '{}' has no cached Claude session id; existing Locus history will not be replayed",
+                "[Agent {}] Claude Code CLI session '{}' has no cached Claude session id; existing Locus history will not be replayed",
                 self.id, self.session_id
             );
         }
 
-        let user_message = build_sdk_user_message(prompt_text, images);
-        let tools = convert_api_tools_to_sdk(&api_tools);
-        let mut host = ClaudeSdkRoundHost {
+        let user_message = build_cli_user_message(prompt_text, images);
+        let tools = convert_api_tools_to_claude_code(&api_tools);
+        let mut host = ClaudeCodeRoundHost {
             agent: self,
             app_handle,
             store,
@@ -618,33 +919,43 @@ impl AgentInstance {
             completed_tool_ids: HashSet::new(),
             pending_round: None,
             last_assistant: None,
+            last_persisted_assistant_message_id: None,
             render_order: StreamRenderOrderTracker::default(),
         };
 
-        let turn = anthropic_agent_sdk::run_turn(
-            ClaudeCodeSdkOptions {
-                locus_session_id: self.session_id.clone(),
-                cwd: if self.has_selected_working_dir() {
-                    self.working_dir.clone()
-                } else {
-                    std::env::current_dir()
-                        .map(|dir| dir.display().to_string())
-                        .unwrap_or_else(|_| ".".to_string())
-                },
-                system_prompt: system_prompt.to_string(),
-                model: self.effective_model.clone(),
-                resume_session_id,
-                server_name: "locus".to_string(),
-                tools,
-                debug: self.debug,
+        let options = ClaudeCodeCliOptions {
+            locus_session_id: self.session_id.clone(),
+            cwd: if self.has_selected_working_dir() {
+                self.working_dir.clone()
+            } else {
+                std::env::current_dir()
+                    .map(|dir| dir.display().to_string())
+                    .unwrap_or_else(|_| ".".to_string())
             },
-            user_message,
-            &mut host,
-        )
-        .await?;
+            system_prompt: system_prompt.to_string(),
+            model: self.effective_model.clone(),
+            effort: self.effort.clone(),
+            resume_session_id,
+            server_name: "locus".to_string(),
+            tools,
+            debug: self.debug,
+        };
+        let mut cancel_rx = self.cancel_waiter();
+        let turn = tokio::select! {
+            result = claude_code_cli::run_turn(options, user_message, &mut host) => result?,
+            _ = cancel_rx.changed() => {
+                eprintln!(
+                    "[Agent {}] Claude Code CLI turn cancelled before completion: session={} run={}",
+                    self.id, self.session_id, run_id
+                );
+                self.clear_pending_knowledge_proposal(app_handle).await;
+                self.emit_cancelled(app_handle, store, run_id, None);
+                return Ok(String::new());
+            }
+        };
 
         if let Some(claude_session_id) = turn.claude_session_id.as_deref() {
-            anthropic_agent_sdk::store_session_id(&self.session_id, claude_session_id).await;
+            claude_code_cli::store_session_id(&self.session_id, claude_session_id).await;
         }
 
         if turn.input_tokens > 0
@@ -691,7 +1002,7 @@ impl AgentInstance {
                 }
                 Err(err) => {
                     eprintln!(
-                        "[Agent {}] failed to record Claude SDK token usage: {}",
+                        "[Agent {}] failed to record Claude Code CLI token usage: {}",
                         self.id, err
                     );
                 }
@@ -706,7 +1017,7 @@ impl AgentInstance {
                     .unwrap_or_default()
                     .as_secs() as i64,
                 request: serde_json::json!({
-                    "backend": "anthropic_agent_sdk",
+                    "backend": "claude_code_cli",
                     "session_id": self.session_id,
                     "claude_session_id": turn.claude_session_id,
                     "raw_stdin": turn.raw_request,
@@ -721,7 +1032,7 @@ impl AgentInstance {
                 .push(round);
         }
 
-        if !self.run_is_current_for_session(store, run_id, "claude_sdk_turn_done", None) {
+        if !self.run_is_current_for_session(store, run_id, "claude_code_turn_done", None) {
             return Ok(String::new());
         }
 
@@ -762,10 +1073,12 @@ impl AgentInstance {
                 (!snapshot.thinking_signature.is_empty())
                     .then_some(snapshot.thinking_signature.as_str())
             });
-            let text_part = host.render_order.mark_text(run_id, "claude-sdk-final-text");
+            let text_part = host
+                .render_order
+                .mark_text(run_id, "claude-code-final-text");
             let thinking_part = thinking_text.map(|_| {
                 host.render_order
-                    .mark_thinking(run_id, "claude-sdk-final-thinking")
+                    .mark_thinking(run_id, "claude-code-final-thinking")
             });
             done_content_order = Some(text_part.seq);
             done_thinking_order = thinking_part.as_ref().map(|part| part.seq);
@@ -798,7 +1111,27 @@ impl AgentInstance {
                 thinking_text.map(str::to_string),
                 None,
             );
+            host.last_persisted_assistant_message_id = Some(done_message_id.clone());
         }
+
+        if let (Some(claude_session_id), Some(message_id)) = (
+            turn.claude_session_id.as_deref(),
+            host.last_persisted_assistant_message_id.as_deref(),
+        ) {
+            if let Err(error) = store.set_message_cli_session_id(
+                &self.session_id,
+                message_id,
+                CLAUDE_CODE_CLI_PROVIDER,
+                claude_session_id,
+            ) {
+                eprintln!(
+                    "[Agent {}] failed to persist Claude Code CLI session id for message {}: {}",
+                    self.id, message_id, error
+                );
+            }
+        }
+
+        store.close_run_pending_input_queue(run_id)?;
 
         if let Err(error) = store.set_latest_completed_run_id(&self.session_id, Some(run_id)) {
             eprintln!(
@@ -845,7 +1178,9 @@ impl AgentInstance {
     }
 }
 
-fn convert_api_tools_to_sdk(api_tools: &[serde_json::Value]) -> Vec<ClaudeSdkToolDefinition> {
+fn convert_api_tools_to_claude_code(
+    api_tools: &[serde_json::Value],
+) -> Vec<ClaudeCodeToolDefinition> {
     api_tools
         .iter()
         .filter_map(|tool| {
@@ -860,7 +1195,7 @@ fn convert_api_tools_to_sdk(api_tools: &[serde_json::Value]) -> Vec<ClaudeSdkToo
                 .get("parameters")
                 .cloned()
                 .unwrap_or_else(|| serde_json::json!({}));
-            Some(ClaudeSdkToolDefinition {
+            Some(ClaudeCodeToolDefinition {
                 name,
                 description,
                 input_schema,
@@ -869,7 +1204,7 @@ fn convert_api_tools_to_sdk(api_tools: &[serde_json::Value]) -> Vec<ClaudeSdkToo
         .collect()
 }
 
-fn build_sdk_user_message(text: &str, images: Option<&[ImageData]>) -> serde_json::Value {
+fn build_cli_user_message(text: &str, images: Option<&[ImageData]>) -> serde_json::Value {
     if let Some(images) = images {
         if !images.is_empty() {
             let mut blocks: Vec<serde_json::Value> = images
@@ -931,29 +1266,29 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn anthropic_sdk_tool_result_uses_stored_output() {
+    fn claude_code_tool_result_uses_stored_output() {
         let dir = tempdir().expect("create temp dir");
         let store = SessionStore::new(dir.path()).expect("initialize store");
         let session_id = store
-            .create_session("Claude SDK Tool Result", None, None, "chat", None)
+            .create_session("Claude Code CLI Tool Result", None, None, "chat", None)
             .expect("create session");
         store
-            .try_start_run(&session_id, "run-sdk")
+            .try_start_run(&session_id, "run-claude-code")
             .expect("start run");
         let full_output = "C".repeat(31_000);
         let stored_output = store
-            .rewrite_tool_result_for_storage(&session_id, "tc-sdk", "bash", &full_output)
+            .rewrite_tool_result_for_storage(&session_id, "tc-claude-code", "bash", &full_output)
             .expect("rewrite tool output");
 
-        save_claude_sdk_tool_result(
+        save_claude_code_tool_result(
             &store,
             &session_id,
-            "run-sdk",
-            "tc-sdk",
+            "run-claude-code",
+            "tc-claude-code",
             &stored_output,
             None,
         )
-        .expect("save SDK tool result")
+        .expect("save Claude Code tool result")
         .expect("current run");
 
         let prompt_messages = store

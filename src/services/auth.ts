@@ -6,6 +6,9 @@ export interface ProviderStatus {
   name: string;
   hasKey: boolean;
   keyHint: string;
+  /** Auth state for providers managing credentials outside Locus (claude_code):
+   *  false = installed but not logged in; absent = unknown / not applicable. */
+  loggedIn?: boolean;
 }
 
 export interface CodexStatus {

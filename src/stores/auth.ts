@@ -13,7 +13,7 @@ export interface AuthStatusLoadFailure {
 export const useAuthStore = defineStore("auth", () => {
   const isAuthenticated = ref(false);
   const hasApiKey = ref(false);
-  const anthropicSdkAvailable = ref(false);
+  const claudeCodeAvailable = ref(false);
   const codexAuthenticated = ref(false);
   const authChecked = ref(false);
 
@@ -51,8 +51,11 @@ export const useAuthStore = defineStore("auth", () => {
       hasApiKey.value = !!or?.hasKey;
       const an = providers.find((p) => p.id === "anthropic");
       isAuthenticated.value = !!an?.hasKey;
-      const sdk = providers.find((p) => p.id === "anthropic_sdk");
-      anthropicSdkAvailable.value = !!sdk?.hasKey;
+      const cli = providers.find((p) => p.id === "claude_code");
+      // Installed but explicitly logged out counts as unavailable; an unknown
+      // login state (loggedIn absent) stays available and fails lazily at run
+      // time with a login hint.
+      claudeCodeAvailable.value = !!cli?.hasKey && cli?.loggedIn !== false;
     } catch (e) {
       console.error("get_providers failed:", e);
       failures.push({
@@ -76,7 +79,7 @@ export const useAuthStore = defineStore("auth", () => {
   return {
     isAuthenticated,
     hasApiKey,
-    anthropicSdkAvailable,
+    claudeCodeAvailable,
     codexAuthenticated,
     authChecked,
     checkAuthLight,

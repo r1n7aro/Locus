@@ -1,6 +1,6 @@
 pub mod anthropic;
-pub mod anthropic_agent_sdk;
 pub mod chat_completions;
+pub mod claude_code_cli;
 pub mod codex;
 pub mod codex_models;
 pub mod codex_usage;

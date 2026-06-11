@@ -295,6 +295,8 @@ struct MessageMetadata {
     #[serde(skip_serializing_if = "Option::is_none")]
     response_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    cli_session_ids: Option<HashMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     response_request: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     content_order: Option<u32>,
@@ -315,6 +317,7 @@ fn message_metadata_json(
     let metadata = MessageMetadata {
         knowledge_proposal: knowledge_proposal.cloned(),
         response_id: response_id.map(|value| value.to_string()),
+        cli_session_ids: None,
         response_request: response_request.cloned(),
         content_order,
         thinking_order,
@@ -322,6 +325,7 @@ fn message_metadata_json(
     };
     if metadata.knowledge_proposal.is_none()
         && metadata.response_id.is_none()
+        && metadata.cli_session_ids.is_none()
         && metadata.response_request.is_none()
         && metadata.content_order.is_none()
         && metadata.thinking_order.is_none()
@@ -1079,6 +1083,7 @@ impl SessionStore {
             let next_metadata_json = if metadata_changed {
                 if metadata.knowledge_proposal.is_none()
                     && metadata.response_id.is_none()
+                    && metadata.cli_session_ids.is_none()
                     && metadata.response_request.is_none()
                     && metadata.content_order.is_none()
                     && metadata.thinking_order.is_none()
@@ -2596,6 +2601,105 @@ impl SessionStore {
         Ok(())
     }
 
+    pub fn set_message_cli_session_id(
+        &self,
+        session_id: &str,
+        message_id: &str,
+        cli_provider: &str,
+        cli_session_id: &str,
+    ) -> Result<(), String> {
+        let cli_provider = cli_provider.trim();
+        let cli_session_id = cli_session_id.trim();
+        if cli_provider.is_empty() || cli_session_id.is_empty() {
+            return Ok(());
+        }
+
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let metadata_json: Option<String> = conn
+            .query_row(
+                "SELECT metadata_json FROM messages WHERE session_id = ?1 AND id = ?2",
+                params![session_id, message_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| format!("Failed to load message metadata: {}", e))?
+            .flatten();
+        let mut metadata: MessageMetadata = metadata_json
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(|e| format!("Failed to parse message metadata: {}", e))?
+            .unwrap_or_default();
+        metadata
+            .cli_session_ids
+            .get_or_insert_with(HashMap::new)
+            .insert(cli_provider.to_string(), cli_session_id.to_string());
+        let metadata_json = serde_json::to_string(&metadata)
+            .map_err(|e| format!("Failed to serialize message metadata: {}", e))?;
+        let updated = conn
+            .execute(
+                "UPDATE messages SET metadata_json = ?1 WHERE session_id = ?2 AND id = ?3",
+                params![metadata_json, session_id, message_id],
+            )
+            .map_err(|e| {
+                format!(
+                    "Failed to update CLI session metadata for message '{}': {}",
+                    message_id, e
+                )
+            })?;
+        if updated == 0 {
+            return Err(format!(
+                "Message '{}' was not found in session '{}'",
+                message_id, session_id
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn latest_cli_session_id(
+        &self,
+        session_id: &str,
+        cli_provider: &str,
+    ) -> Result<Option<String>, String> {
+        let cli_provider = cli_provider.trim();
+        if cli_provider.is_empty() {
+            return Ok(None);
+        }
+
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT metadata_json FROM messages
+                 WHERE session_id = ?1 AND metadata_json IS NOT NULL
+                 ORDER BY rowid DESC",
+            )
+            .map_err(|e| format!("Failed to prepare CLI session metadata query: {}", e))?;
+        let rows = stmt
+            .query_map(params![session_id], |row| row.get::<_, Option<String>>(0))
+            .map_err(|e| format!("Failed to query CLI session metadata: {}", e))?;
+
+        for row in rows {
+            let Some(metadata_json) =
+                row.map_err(|e| format!("Failed to read CLI session metadata row: {}", e))?
+            else {
+                continue;
+            };
+            let metadata: MessageMetadata = serde_json::from_str(&metadata_json)
+                .map_err(|e| format!("Failed to parse CLI session metadata: {}", e))?;
+            if let Some(value) = metadata
+                .cli_session_ids
+                .as_ref()
+                .and_then(|items| items.get(cli_provider))
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty())
+            {
+                return Ok(Some(value.to_string()));
+            }
+        }
+
+        Ok(None)
+    }
+
     pub fn add_tool_result(
         &self,
         session_id: &str,
@@ -3903,6 +4007,72 @@ mod tests {
         );
         assert!(table_exists(&conn, "session_runs"));
         assert!(table_exists(&conn, "session_events"));
+    }
+
+    #[test]
+    fn cli_session_metadata_returns_latest_provider_session() {
+        let dir = tempdir().expect("create temp dir");
+        let store = SessionStore::new(dir.path()).expect("initialize store");
+        let session_id = store
+            .create_session("CLI Session", None, None, "chat", None)
+            .expect("create session");
+
+        assert_eq!(
+            store
+                .latest_cli_session_id(&session_id, "claude_code")
+                .expect("empty cli session metadata"),
+            None
+        );
+
+        let first_message_id = store
+            .add_message_with_thinking(
+                &session_id,
+                MessageRole::Assistant,
+                "first",
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("add first assistant");
+        store
+            .set_message_cli_session_id(
+                &session_id,
+                &first_message_id,
+                "claude_code",
+                "claude-session-1",
+            )
+            .expect("set first cli session");
+
+        let second_message_id = store
+            .add_message_with_thinking(
+                &session_id,
+                MessageRole::Assistant,
+                "second",
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("add second assistant");
+        store
+            .set_message_cli_session_id(
+                &session_id,
+                &second_message_id,
+                "claude_code",
+                "claude-session-2",
+            )
+            .expect("set second cli session");
+
+        assert_eq!(
+            store
+                .latest_cli_session_id(&session_id, "claude_code")
+                .expect("latest cli session metadata")
+                .as_deref(),
+            Some("claude-session-2")
+        );
     }
 
     #[test]

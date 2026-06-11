@@ -20,8 +20,8 @@ const builtinModels: ModelOption[] = [
   { id: "openrouter/minimax-m2.5", name: "MiniMax M2.5", provider: "openrouter" },
   { id: "claude-sonnet-4.6", name: "Claude Sonnet 4.6", provider: "anthropic" },
   { id: "claude-opus-4.6", name: "Claude Opus 4.6", provider: "anthropic" },
-  { id: "anthropic_sdk/claude-sonnet-4.6", name: "Claude Sonnet 4.6", provider: "anthropic_sdk" },
-  { id: "anthropic_sdk/claude-opus-4.6", name: "Claude Opus 4.6", provider: "anthropic_sdk" },
+  { id: "claude_code/claude-sonnet-4.6", name: "Claude Sonnet 4.6", provider: "claude_code" },
+  { id: "claude_code/claude-opus-4.6", name: "Claude Opus 4.6", provider: "claude_code" },
 ];
 
 const codexFallbackModels: ModelOption[] = [
@@ -170,14 +170,19 @@ export const useModelStore = defineStore("model", () => {
       provider: "custom" as const,
       supportedEfforts: normalizeCustomReasoningEfforts(ep.supportedReasoningEfforts),
     }));
-    return filterVisibleModels([...builtinModels, ...codexModels.value, ...customs]);
+    // Claude Code CLI models are opt-in: they only join the list after the
+    // user explicitly enables them in model configuration.
+    const models = [...builtinModels, ...codexModels.value, ...customs].filter(
+      (m) => m.provider !== "claude_code" || modelDefaults.value.claudeCodeEnabled === true,
+    );
+    return filterVisibleModels(models);
   });
 
   const availableModels = computed(() => {
     const providers = new Set<string>();
     if (authStore.hasApiKey) providers.add("openrouter");
     if (authStore.isAuthenticated) providers.add("anthropic");
-    if (authStore.anthropicSdkAvailable) providers.add("anthropic_sdk");
+    if (authStore.claudeCodeAvailable) providers.add("claude_code");
     if (authStore.codexAuthenticated) providers.add("openai_codex");
     providers.add("custom");
     return allModels.value.filter((m) => providers.has(m.provider));

@@ -37,7 +37,7 @@ const selectorRef = ref<HTMLElement | null>(null);
 const providerLabels = computed<Record<string, string>>(() => ({
   openrouter: "OpenRouter",
   anthropic: t("model.provider.anthropic"),
-  anthropic_sdk: t("model.provider.anthropic_sdk"),
+  claude_code: t("model.provider.claude_code"),
   openai_codex: t("model.provider.openai"),
   custom: t("model.provider.custom"),
 }));
@@ -45,7 +45,7 @@ const providerLabels = computed<Record<string, string>>(() => ({
 const providerShortLabels = computed<Record<string, string>>(() => ({
   openrouter: "OR",
   anthropic: t("model.provider.anthropic.short"),
-  anthropic_sdk: t("model.provider.anthropic_sdk.short"),
+  claude_code: t("model.provider.claude_code.short"),
   openai_codex: t("model.provider.openai.short"),
   custom: t("model.provider.custom"),
 }));

@@ -1,7 +1,7 @@
 // Locus debug hook for the Claude Code CLI subprocess.
 //
 // Injected via NODE_OPTIONS=--require <abs path to this file> when Locus runs the
-// Anthropic Agent SDK backend with debug mode enabled. Patches http/https/fetch
+// Claude Code CLI backend with debug mode enabled. Patches http/https/fetch
 // inside the CLI's JS runtime so every POST to api.anthropic.com/v1/messages is
 // dumped to LOCUS_DEBUG_DIR as a `.http` file. Failures here must NEVER break the
 // real request flow — every observable side effect is wrapped in try/catch.
@@ -65,7 +65,7 @@ function nextOutFile() {
     pad(now.getMilliseconds(), 3);
   return path.join(
     debugDir,
-    `${ts}_${pad(seq, 4)}_anthropic_sdk_real_pid${process.pid}.http`
+    `${ts}_${pad(seq, 4)}_claude_code_real_pid${process.pid}.http`
   );
 }
 

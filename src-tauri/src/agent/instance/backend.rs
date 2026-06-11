@@ -45,7 +45,7 @@ const OPENAI_CODEX_CONTEXT_LIMIT: u32 = 258_400;
 
 pub(super) fn model_context_limit(model: &str) -> u32 {
     let m = model.strip_prefix("openrouter/").unwrap_or(model);
-    let m = m.strip_prefix("anthropic_sdk/").unwrap_or(m);
+    let m = m.strip_prefix("claude_code/").unwrap_or(m);
     let m = m.strip_prefix("anthropic/").unwrap_or(m);
     let m = m.strip_prefix("openai/").unwrap_or(m);
     let m = m.to_ascii_lowercase();
@@ -223,8 +223,8 @@ pub enum LlmBackend {
         base_url: Option<String>,
         user_metadata: crate::auth::ClaudeCodeUserMetadata,
     },
-    /// Anthropic Agent SDK via Claude Code CLI
-    AnthropicAgentSdk,
+    /// Local Claude Code CLI process controlled through stream-json.
+    ClaudeCodeCli,
     /// OpenAI Codex
     OpenAiCodex {
         auth: crate::commands::CodexAuthStateHandle,

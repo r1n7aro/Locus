@@ -850,6 +850,10 @@ pub struct ModelDefaults {
     pub plan_model: String,
     #[serde(default)]
     pub subagent_models: std::collections::HashMap<String, String>,
+    /// Opt-in flag: Claude Code CLI models only join the model list after the
+    /// user explicitly enables them in model configuration.
+    #[serde(default)]
+    pub claude_code_enabled: bool,
 }
 
 impl Default for ModelDefaults {
@@ -858,6 +862,7 @@ impl Default for ModelDefaults {
             main_model: String::new(),
             plan_model: String::new(),
             subagent_models: std::collections::HashMap::new(),
+            claude_code_enabled: false,
         }
     }
 }

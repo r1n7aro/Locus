@@ -1,9 +1,16 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
-import { BookOpen, Box, Database, type IconNode } from "lucide";
+import { BookOpen, Box, CodeXml, Database, type IconNode } from "lucide";
 import { t } from "../../i18n";
 import { listAgentInjectedItems } from "../../services/agent";
+import {
+  csharpLspGetStatus,
+  csharpLspRestart,
+  csharpLspSetEnabled,
+  subscribeCsharpLspStatus,
+} from "../../services/csharpLsp";
 import { normalizeAppError } from "../../services/errors";
+import type { RuntimeUnsubscribe } from "../../services/locusRuntime";
 import {
   knowledgeGetEmbeddingStatus,
   knowledgeGetLexicalRebuildStatus,
@@ -11,6 +18,7 @@ import {
 } from "../../services/knowledge";
 import type {
   AssetDbScanEvent,
+  CsharpLspStatus,
   EmbeddingStatus,
   InjectedPromptItem,
   KnowledgeAccessMode,
@@ -24,9 +32,9 @@ import BaseButton from "../ui/BaseButton.vue";
 import BaseSegmented, { type SegmentedOption } from "../ui/BaseSegmented.vue";
 import { estimateKnowledgeContextCostTokens } from "./knowledgeContextCost";
 
-type StatusId = "assetDb" | "unity" | "knowledge";
+type StatusId = "assetDb" | "unity" | "knowledge" | "code";
 type StatusTone = "success" | "danger" | "accent" | "muted";
-type StatusIcon = "database" | "unity" | "knowledge";
+type StatusIcon = "database" | "unity" | "knowledge" | "code";
 type UnityPluginNotice = "missing" | "outdated";
 type UnityLaunchState = "idle" | "starting" | "waitingConnection";
 
@@ -55,6 +63,7 @@ const STATUS_ICONS: Record<StatusIcon, IconNode> = {
   database: Database,
   unity: Box,
   knowledge: BookOpen,
+  code: CodeXml,
 };
 
 const props = defineProps<{
@@ -81,6 +90,10 @@ const emit = defineEmits<{
 }>();
 
 const activePopover = ref<StatusId | null>(null);
+const csharpLsp = ref<CsharpLspStatus | null>(null);
+const csharpLspPending = ref(false);
+let csharpLspUnsubscribe: RuntimeUnsubscribe | null = null;
+let csharpLspDisposed = false;
 const knowledgeOverview = ref<KnowledgeRetrievalOverview | null>(null);
 const lexicalRebuildStatus = ref<LexicalRebuildStatus | null>(null);
 const embeddingStatus = ref<EmbeddingStatus | null>(null);
@@ -692,6 +705,193 @@ const knowledgeRows = computed<StatusDetailRow[]>(() => {
   ];
 });
 
+// Until the first status fetch succeeds, assume the platform is supported so
+// the toggle stays reachable; a failing toggle then surfaces its error below.
+const codeSupported = computed(() =>
+  csharpLsp.value ? csharpLsp.value.supported : true,
+);
+const codeEnabled = computed(() => (csharpLsp.value?.enabled ?? false) && codeSupported.value);
+const csharpLspActionError = ref("");
+const codeTransitional = computed(() =>
+  ["preparing", "downloading", "starting", "loading"].includes(csharpLsp.value?.phase ?? ""),
+);
+
+function codeDownloadText(status: CsharpLspStatus): string {
+  const component = status.downloadComponent === "dotnet" ? ".NET" : "Roslyn";
+  const received = status.downloadReceived ?? 0;
+  const total = status.downloadTotal ?? 0;
+  if (total > 0) {
+    return `${component} ${Math.round((received / total) * 100)}%`;
+  }
+  return `${component} ${(received / 1024 / 1024).toFixed(1)} MB`;
+}
+
+const codeSummary = computed(() => {
+  const status = csharpLsp.value;
+  if (!status) return t("chat.status.code.off");
+  if (!status.supported) return t("chat.status.code.unsupported");
+  switch (status.phase) {
+    case "disabled": return t("chat.status.code.off");
+    case "idle": return t("chat.status.code.idle");
+    case "preparing": return t("chat.status.code.preparing");
+    case "downloading": return t("chat.status.code.downloading", codeDownloadText(status));
+    case "starting": return t("chat.status.code.starting");
+    case "loading": {
+      const total = status.projectCount;
+      const done = status.loadedProjects;
+      if (typeof done === "number" && typeof total === "number" && total > 0) {
+        return t("chat.status.code.loadingProgress", formatCount(done), formatCount(total));
+      }
+      return t("chat.status.code.loading");
+    }
+    case "ready": return t("chat.status.code.ready");
+    case "error": return t("chat.status.code.error");
+    default: return t("chat.status.code.off");
+  }
+});
+
+const codeTone = computed<StatusTone>(() => {
+  const status = csharpLsp.value;
+  if (!status || !status.supported || !status.enabled) return "muted";
+  switch (status.phase) {
+    case "ready": return "success";
+    case "error": return "danger";
+    case "idle": return "muted";
+    default: return "accent";
+  }
+});
+
+function formatUptime(totalSecs: number): string {
+  if (totalSecs < 60) return `${totalSecs}s`;
+  const minutes = Math.floor(totalSecs / 60);
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours}h ${minutes % 60}m`;
+}
+
+const codeRows = computed<StatusDetailRow[]>(() => {
+  const rows: StatusDetailRow[] = [];
+  if (csharpLspActionError.value) {
+    rows.push({
+      label: t("chat.status.code.rows.error"),
+      value: csharpLspActionError.value,
+      mono: true,
+    });
+  }
+  const status = csharpLsp.value;
+  if (!status || !status.supported || !status.enabled) return rows;
+  rows.push({ label: t("chat.status.code.rows.state"), value: codeSummary.value });
+  if (status.projectFile) {
+    rows.push({
+      label: t("chat.status.code.rows.project"),
+      value: status.projectFile,
+      mono: true,
+    });
+  }
+  if (typeof status.projectCount === "number") {
+    rows.push({
+      label: t("chat.status.code.rows.projects"),
+      value: formatCount(status.projectCount),
+    });
+  }
+  if (typeof status.openDocuments === "number") {
+    rows.push({
+      label: t("chat.status.code.rows.openDocs"),
+      value: formatCount(status.openDocuments),
+    });
+  }
+  const references = status.queryReferences ?? 0;
+  const definitions = status.queryDefinitions ?? 0;
+  const symbols = status.querySymbols ?? 0;
+  rows.push({
+    label: t("chat.status.code.rows.queries"),
+    value: t(
+      "chat.status.code.queries.detail",
+      formatCount(references + definitions + symbols),
+      formatCount(references),
+      formatCount(definitions),
+      formatCount(symbols),
+    ),
+  });
+  if (typeof status.uptimeSecs === "number") {
+    rows.push({
+      label: t("chat.status.code.rows.uptime"),
+      value: formatUptime(status.uptimeSecs),
+    });
+  }
+  rows.push({
+    label: t("chat.status.code.rows.server"),
+    value: status.serverVersion,
+    mono: true,
+  });
+  if (status.dotnetSource) {
+    rows.push({
+      label: t("chat.status.code.rows.dotnet"),
+      value: status.dotnetSource === "system"
+        ? t("chat.status.code.rows.dotnet.system")
+        : t("chat.status.code.rows.dotnet.managed"),
+    });
+  }
+  if (status.phase === "error" && status.message) {
+    rows.push({
+      label: t("chat.status.code.rows.error"),
+      value: status.message,
+      mono: true,
+    });
+  }
+  return rows;
+});
+
+const codeModeOptions = computed<SegmentedOption[]>(() => [
+  {
+    value: "off",
+    label: t("chat.status.code.mode.off"),
+    hint: t("chat.status.code.mode.offHint"),
+  },
+  {
+    value: "on",
+    label: t("chat.status.code.mode.on"),
+    hint: t("chat.status.code.mode.onHint"),
+  },
+]);
+
+async function refreshCsharpLspStatus() {
+  try {
+    csharpLsp.value = await csharpLspGetStatus();
+  } catch {
+    // status stays stale; the event stream will refresh it
+  }
+}
+
+async function setCodeEnabled(value: boolean) {
+  if (csharpLspPending.value) return;
+  if (csharpLsp.value && csharpLsp.value.enabled === value) return;
+  csharpLspPending.value = true;
+  try {
+    csharpLsp.value = await csharpLspSetEnabled(value);
+    csharpLspActionError.value = "";
+  } catch (error) {
+    csharpLspActionError.value = normalizeAppError(error).message;
+    await refreshCsharpLspStatus();
+  } finally {
+    csharpLspPending.value = false;
+  }
+}
+
+async function restartCode() {
+  if (csharpLspPending.value) return;
+  csharpLspPending.value = true;
+  try {
+    csharpLsp.value = await csharpLspRestart();
+    csharpLspActionError.value = "";
+  } catch (error) {
+    csharpLspActionError.value = normalizeAppError(error).message;
+    await refreshCsharpLspStatus();
+  } finally {
+    csharpLspPending.value = false;
+  }
+}
+
 const statusItems = computed<StatusItem[]>(() => [
   {
     id: "assetDb",
@@ -733,6 +933,23 @@ const statusItems = computed<StatusItem[]>(() => [
     rows: knowledgeRows.value,
     modeOptions: knowledgeModeOptions.value,
   },
+  {
+    id: "code",
+    icon: "code",
+    title: t("chat.status.code.title"),
+    summary: codeSummary.value,
+    inlineLabel: codeSummary.value,
+    tone: codeTone.value,
+    rows: codeRows.value,
+    modeOptions: codeSupported.value ? codeModeOptions.value : undefined,
+    actionLabel: codeEnabled.value
+      && (csharpLsp.value?.phase === "ready" || csharpLsp.value?.phase === "error")
+      ? t("chat.status.code.restart")
+      : "",
+    actionTitle: t("chat.status.code.restartTitle"),
+    actionDisabled: csharpLspPending.value,
+    actionVariant: "neutral",
+  },
 ]);
 
 const activeItem = computed(() =>
@@ -747,6 +964,23 @@ function togglePopover(id: StatusId) {
   activePopover.value = activePopover.value === id ? null : id;
   if (activePopover.value === "knowledge") {
     void loadKnowledgeStatus();
+  }
+  if (activePopover.value === "code") {
+    void refreshCsharpLspStatus();
+  }
+}
+
+function segmentedModelFor(id: StatusId): string {
+  if (id === "knowledge") return knowledgeMode.value;
+  if (id === "code") return codeEnabled.value ? "on" : "off";
+  return "";
+}
+
+function applySegmentedMode(id: StatusId, mode: string) {
+  if (id === "knowledge") {
+    setKnowledgeMode(mode);
+  } else if (id === "code") {
+    void setCodeEnabled(mode === "on");
   }
 }
 
@@ -833,6 +1067,9 @@ function runStatusAction(item: StatusItem) {
     } else {
       emit("launchUnityProject");
     }
+  } else if (item.id === "code") {
+    void restartCode();
+    return;
   }
   closePopover();
 }
@@ -846,6 +1083,19 @@ function onDocumentKeydown(event: KeyboardEvent) {
 onMounted(() => {
   document.addEventListener("click", closePopover);
   document.addEventListener("keydown", onDocumentKeydown);
+  csharpLspDisposed = false;
+  void refreshCsharpLspStatus();
+  subscribeCsharpLspStatus((payload) => {
+    csharpLsp.value = payload;
+  })
+    .then((unsubscribe) => {
+      if (csharpLspDisposed) {
+        unsubscribe();
+      } else {
+        csharpLspUnsubscribe = unsubscribe;
+      }
+    })
+    .catch(() => {});
 });
 
 watch(
@@ -860,6 +1110,9 @@ watch(
 onUnmounted(() => {
   document.removeEventListener("click", closePopover);
   document.removeEventListener("keydown", onDocumentKeydown);
+  csharpLspDisposed = true;
+  csharpLspUnsubscribe?.();
+  csharpLspUnsubscribe = null;
 });
 </script>
 
@@ -875,7 +1128,8 @@ onUnmounted(() => {
           `tone-${item.tone}`,
           {
             active: activePopover === item.id,
-            'is-scanning': item.id === 'assetDb' && isScanning,
+            'is-scanning': (item.id === 'assetDb' && isScanning)
+              || (item.id === 'code' && codeTransitional),
           },
         ]"
         :aria-label="`${item.title}: ${item.summary}`"
@@ -935,9 +1189,9 @@ onUnmounted(() => {
           v-if="activeItem.modeOptions"
           class="chat-status-mode"
           size="sm"
-          :model-value="knowledgeMode"
+          :model-value="segmentedModelFor(activeItem.id)"
           :options="activeItem.modeOptions"
-          @update:model-value="setKnowledgeMode"
+          @update:model-value="applySegmentedMode(activeItem.id, $event)"
         />
         <dl v-if="activeItem.rows.length > 0" class="chat-status-detail-list">
           <template v-for="row in activeItem.rows" :key="`${row.label}:${row.value}`">

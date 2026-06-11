@@ -1,5 +1,5 @@
-mod anthropic_agent_sdk;
 mod backend;
+mod claude_code_cli;
 mod prompt_context;
 mod read_file;
 mod unity_capture;
@@ -2785,6 +2785,18 @@ impl AgentInstance {
                 .or_else(|| require_workspace_bound("filePath")),
             "unity_recompile" => require_non_empty("project_path", "to be set explicitly")
                 .or_else(|| require_absolute_without_workspace("project_path")),
+            // Code analysis tools read arbitrary files via `file_path`; hold
+            // them to the same workspace boundary as read/write/edit.
+            "code_find_references" | "code_goto_definition" => {
+                if !has_working_dir {
+                    Some(format!(
+                        "Tool '{}' requires a selected working directory because it operates on workspace-scoped project data.",
+                        tool_name
+                    ))
+                } else {
+                    require_workspace_bound("file_path")
+                }
+            }
             "unity_execute"
             | "unity_run_states"
             | "unity_capture_viewport"
@@ -2793,6 +2805,7 @@ impl AgentInstance {
             | "unity_yaml_list"
             | "unity_yaml_search"
             | "unity_yaml_read"
+            | "code_symbol_search"
             | "view_create"
             | "view_list"
             | "view_reload"
@@ -2988,6 +3001,12 @@ impl AgentInstance {
                 | "skill_reload" | "skill_list" => {
                     self.has_selected_working_dir()
                         && self.knowledge_access_mode.allows_tool(tool_name.as_str())
+                }
+                // Semantic C# tools ride on the optional Roslyn language
+                // server; keep them out of the agent context entirely while
+                // the feature toggle is off.
+                "code_find_references" | "code_goto_definition" | "code_symbol_search" => {
+                    crate::csharp_lsp::is_enabled()
                 }
                 _ => true,
             })
@@ -3192,9 +3211,6 @@ impl AgentInstance {
         &self,
         app_handle: &AppHandle,
     ) -> crate::config::DynamicToolLoadingMode {
-        if matches!(self.backend, LlmBackend::AnthropicAgentSdk) {
-            return crate::config::DynamicToolLoadingMode::MetaTool;
-        }
         Self::dynamic_tool_loading_mode_from_app_handle(app_handle)
     }
 
@@ -5376,8 +5392,8 @@ impl AgentInstance {
                     continuation_request: None,
                 })
             }
-            LlmBackend::AnthropicAgentSdk => {
-                Err("Anthropic Agent SDK backend uses a dedicated run path".to_string())
+            LlmBackend::ClaudeCodeCli => {
+                Err("Claude Code CLI backend uses a dedicated run path".to_string())
             }
             LlmBackend::OpenAiCodex {
                 auth,
@@ -7335,7 +7351,7 @@ impl AgentInstance {
             first_user_message_id.is_some()
         );
 
-        if matches!(&self.backend, LlmBackend::AnthropicAgentSdk) {
+        if matches!(&self.backend, LlmBackend::ClaudeCodeCli) {
             let prompt_text = crate::session::history::render_prompt_content(
                 &actual_user_text,
                 current_prompt_prefix,
@@ -7353,7 +7369,7 @@ impl AgentInstance {
             };
             let active_skill_tool_names = self.active_skill_tool_names(&selected_skill_tool_names);
             return self
-                .run_anthropic_agent_sdk(
+                .run_claude_code_cli(
                     app_handle,
                     store,
                     &prompt_text,
@@ -7390,7 +7406,7 @@ impl AgentInstance {
         let backend_name = match &self.backend {
             LlmBackend::OpenRouter { .. } => "OpenRouter",
             LlmBackend::Anthropic { .. } => "Anthropic",
-            LlmBackend::AnthropicAgentSdk => "Anthropic Agent SDK",
+            LlmBackend::ClaudeCodeCli => "Claude Code CLI",
             LlmBackend::OpenAiCodex { .. } => "OpenAI Codex",
             LlmBackend::Custom { .. } => "Custom",
         };
@@ -8885,6 +8901,9 @@ impl AgentInstance {
                 | "unity_yaml_search"
                 | "unity_yaml_read"
                 | "unity_recompile"
+                | "code_find_references"
+                | "code_goto_definition"
+                | "code_symbol_search"
                 | "view_capture"
                 | "view_snapshot"
                 | "view_wait"
@@ -12589,6 +12608,98 @@ impl AgentInstance {
         payload
     }
 
+    /// Skill packages can register typed readers for YAML asset documents
+    /// (matched by MonoBehaviour/ScriptableObject script GUID or by class id).
+    /// Returns Ok(Some) when an extension produced the tool output, Ok(None)
+    /// when no extension matches, and Err with a user-visible note when a
+    /// matching extension could not run (fall back to the default output).
+    async fn try_unity_yaml_read_extension(
+        &self,
+        file_path_arg: &str,
+        abs_path: &std::path::Path,
+        project_root: Option<&std::path::Path>,
+        docs: &[crate::unity_yaml::YamlDoc],
+        args: &serde_json::Value,
+    ) -> Result<Option<ToolResult>, String> {
+        let doc_keys: Vec<crate::commands::UnityYamlReadExtensionDocKey> = docs
+            .iter()
+            .map(|doc| crate::commands::UnityYamlReadExtensionDocKey {
+                file_id: doc.file_id,
+                class_id: doc.class_id,
+                script_guid_hex: doc
+                    .m_script_guid
+                    .as_ref()
+                    .map(crate::asset_db::types::guid_to_hex),
+            })
+            .collect();
+        let Some(extension) = crate::commands::find_unity_yaml_read_extension_for_working_dir(
+            &self.working_dir,
+            &doc_keys,
+        ) else {
+            return Ok(None);
+        };
+
+        let label = if extension.extension_name.is_empty() {
+            extension.entry_type.clone()
+        } else {
+            extension.extension_name.clone()
+        };
+        let (connected, _status, _scene) =
+            crate::unity_bridge::query_unity_status(&self.working_dir).await;
+        if !connected {
+            return Err(format!(
+                "yaml-read extension '{}' (Skill package '{}') was skipped: Unity Editor is not connected.",
+                label, extension.package_id
+            ));
+        }
+
+        let asset_path = project_root
+            .and_then(|root| abs_path.strip_prefix(root).ok())
+            .map(|rel| rel.to_string_lossy().replace('\\', "/"));
+        let max_field_depth = args
+            .get("max_field_depth")
+            .and_then(|value| value.as_u64())
+            .filter(|value| *value > 0)
+            .map(|value| value.min(6))
+            .unwrap_or(2);
+        let max_array_items = args
+            .get("max_array_items")
+            .and_then(|value| value.as_u64())
+            .filter(|value| *value > 0)
+            .map(|value| value.min(200))
+            .unwrap_or(20);
+        let invoke_args = serde_json::json!({
+            "filePath": file_path_arg,
+            "absPath": abs_path.to_string_lossy().replace('\\', "/"),
+            "assetPath": asset_path,
+            "maxFieldDepth": max_field_depth,
+            "maxArrayItems": max_array_items,
+            "matchedClassId": extension.matched_class_id,
+            "matchedScriptGuid": extension.matched_script_guid,
+            "matchedFileId": extension.matched_file_id,
+        });
+
+        match crate::commands::run_unity_yaml_read_extension(
+            &self.working_dir,
+            &extension,
+            &invoke_args,
+        )
+        .await
+        {
+            Ok(output) => Ok(Some(ToolResult {
+                output: format!(
+                    "[unity_yaml_read extension '{}' · Skill package '{}']\n{}",
+                    label, extension.package_id, output
+                ),
+                is_error: false,
+            })),
+            Err(error) => Err(format!(
+                "yaml-read extension '{}' (Skill package '{}') failed: {}",
+                label, extension.package_id, error
+            )),
+        }
+    }
+
     async fn execute_unity_yaml_list(
         &self,
         app_handle: &AppHandle,
@@ -12832,6 +12943,28 @@ impl AgentInstance {
         }
 
         let docs = yaml_parser::parse_yaml_docs(&content);
+
+        let mut yaml_read_extension_note: Option<String> = None;
+        if !is_hierarchical && (detail.is_empty() || detail == "components") {
+            match self
+                .try_unity_yaml_read_extension(
+                    &file_path_arg,
+                    &abs_path,
+                    project_root.as_deref(),
+                    &docs,
+                    args,
+                )
+                .await
+            {
+                Ok(Some(result)) => return result,
+                Ok(None) => {}
+                Err(note) => {
+                    eprintln!("[unity_yaml_read] {}", note);
+                    yaml_read_extension_note = Some(note);
+                }
+            }
+        }
+
         let text = String::from_utf8_lossy(&content);
         let lines: Vec<&str> = text.lines().collect();
         let world_transform_map = yaml_parser::build_world_transform_map(&docs, &lines);
@@ -12991,6 +13124,10 @@ impl AgentInstance {
                 skipped_fields,
             );
             output.push_str(&resolved);
+        }
+
+        if let Some(note) = yaml_read_extension_note {
+            output.push_str(&format!("\nNote: {}\n", note));
         }
 
         ToolResult {
@@ -14839,7 +14976,7 @@ PrefabInstance:
                 source: "test".to_string(),
             }),
             "session-test",
-            crate::agent::instance::LlmBackend::AnthropicAgentSdk,
+            crate::agent::instance::LlmBackend::ClaudeCodeCli,
             false,
             Arc::new(AgentDefRegistry::load(None, None)),
             Arc::new(ToolRegistry::new()),
@@ -14895,7 +15032,7 @@ PrefabInstance:
                 source: "test".to_string(),
             }),
             "session-test",
-            crate::agent::instance::LlmBackend::AnthropicAgentSdk,
+            crate::agent::instance::LlmBackend::ClaudeCodeCli,
             false,
             Arc::new(AgentDefRegistry::load(None, None)),
             Arc::new(ToolRegistry::with_builtins()),
@@ -14981,7 +15118,7 @@ PrefabInstance:
                 source: "test".to_string(),
             }),
             "session-test",
-            crate::agent::instance::LlmBackend::AnthropicAgentSdk,
+            crate::agent::instance::LlmBackend::ClaudeCodeCli,
             false,
             Arc::new(AgentDefRegistry::load(None, None)),
             Arc::new(ToolRegistry::with_builtins()),
@@ -15335,7 +15472,7 @@ PrefabInstance:
                 source: "test".to_string(),
             }),
             "session-test",
-            crate::agent::instance::LlmBackend::AnthropicAgentSdk,
+            crate::agent::instance::LlmBackend::ClaudeCodeCli,
             false,
             Arc::new(AgentDefRegistry::load(None, None)),
             Arc::new(ToolRegistry::with_builtins()),
@@ -15408,7 +15545,7 @@ PrefabInstance:
                 source: "test".to_string(),
             }),
             "session-test",
-            crate::agent::instance::LlmBackend::AnthropicAgentSdk,
+            crate::agent::instance::LlmBackend::ClaudeCodeCli,
             false,
             Arc::new(AgentDefRegistry::load(None, None)),
             Arc::new(registry),
@@ -15473,7 +15610,7 @@ PrefabInstance:
                 source: "test".to_string(),
             }),
             "session-test",
-            crate::agent::instance::LlmBackend::AnthropicAgentSdk,
+            crate::agent::instance::LlmBackend::ClaudeCodeCli,
             false,
             Arc::new(AgentDefRegistry::load(None, None)),
             Arc::new(registry),
@@ -15672,7 +15809,7 @@ PrefabInstance:
                 source: "test".to_string(),
             }),
             "session-test",
-            crate::agent::instance::LlmBackend::AnthropicAgentSdk,
+            crate::agent::instance::LlmBackend::ClaudeCodeCli,
             false,
             Arc::new(AgentDefRegistry::load(None, None)),
             Arc::new(ToolRegistry::with_builtins()),
@@ -15839,7 +15976,7 @@ Create a reusable Skill.
                 source: "test".to_string(),
             }),
             "session-test",
-            crate::agent::instance::LlmBackend::AnthropicAgentSdk,
+            crate::agent::instance::LlmBackend::ClaudeCodeCli,
             false,
             Arc::new(AgentDefRegistry::load(None, None)),
             Arc::new(ToolRegistry::with_builtins()),
@@ -15944,7 +16081,7 @@ Search, install, audit, and export a plugin.
                 source: "test".to_string(),
             }),
             "session-test",
-            crate::agent::instance::LlmBackend::AnthropicAgentSdk,
+            crate::agent::instance::LlmBackend::ClaudeCodeCli,
             false,
             Arc::new(AgentDefRegistry::load(None, None)),
             Arc::new(ToolRegistry::with_builtins()),
