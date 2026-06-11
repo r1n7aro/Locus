@@ -15,11 +15,32 @@ mod client;
 pub mod manager;
 pub mod params;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use serde_json::{json, Value};
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
+
+// Session counters for the phase-6 rollout: how often tool calls actually
+// used the sidecar, hit deterministic compile errors, or fell back to the
+// in-Unity path. Surfaced in the settings status payload.
+static SIDECAR_COMPILES: AtomicU64 = AtomicU64::new(0);
+static SIDECAR_COMPILE_ERRORS: AtomicU64 = AtomicU64::new(0);
+static SIDECAR_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+
+fn record_outcome(outcome: &Result<CompileOutcome, String>) {
+    match outcome {
+        Ok(Ok(_)) => {
+            SIDECAR_COMPILES.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(Err(_)) => {
+            SIDECAR_COMPILE_ERRORS.fetch_add(1, Ordering::Relaxed);
+        }
+        // Transport errors are counted at the fallback site (note_fallback),
+        // which also sees the non-transport reasons (disabled plugin, etc.).
+        Err(_) => {}
+    }
+}
 
 /// Called once from app setup with the persisted flag.
 pub fn initialize(enabled: bool) {
@@ -47,6 +68,7 @@ pub fn kill_active_server_for_exit() {
 /// Logged only when the reason changes so a persistent condition (sidecar
 /// missing, old Unity plugin) does not spam on every call.
 pub fn note_fallback(reason: &str) {
+    SIDECAR_FALLBACKS.fetch_add(1, Ordering::Relaxed);
     static LAST: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
     let Ok(mut guard) = LAST.lock() else { return };
     if guard.as_deref() != Some(reason) {
@@ -68,6 +90,11 @@ pub struct CsharpCompileStatusPayload {
     pub dotnet_source: Option<String>,
     pub uptime_secs: Option<u64>,
     pub last_error: Option<String>,
+    /// Session counters (rollout observability): tool compiles served by the
+    /// sidecar, deterministic compile errors, and fallbacks to Unity.
+    pub sidecar_compiles: u64,
+    pub compile_errors: u64,
+    pub fallbacks: u64,
 }
 
 pub async fn status() -> CsharpCompileStatusPayload {
@@ -81,6 +108,9 @@ pub async fn status() -> CsharpCompileStatusPayload {
         dotnet_source: running.as_ref().map(|(_, source, _)| source.to_string()),
         uptime_secs: running.as_ref().map(|(_, _, uptime)| uptime.as_secs()),
         last_error: manager::last_error_for_diagnostics(),
+        sidecar_compiles: SIDECAR_COMPILES.load(Ordering::Relaxed),
+        compile_errors: SIDECAR_COMPILE_ERRORS.load(Ordering::Relaxed),
+        fallbacks: SIDECAR_FALLBACKS.load(Ordering::Relaxed),
     }
 }
 
@@ -162,7 +192,9 @@ pub async fn compile_snippet(
         "referenceSessionImages": reference_session_images,
         "registerImage": register_image,
     });
-    request_compile("compile/snippet", request).await
+    let outcome = request_compile("compile/snippet", request).await;
+    record_outcome(&outcome);
+    outcome
 }
 
 /// Compile a unity_run_states request (also serves as the
@@ -180,7 +212,30 @@ pub async fn compile_run_states(
         "referenceSessionImages": reference_session_images,
         "registerImage": register_image,
     });
-    request_compile("compile/runStates", request).await
+    let outcome = request_compile("compile/runStates", request).await;
+    record_outcome(&outcome);
+    outcome
+}
+
+/// Compile a View Script (compile_named / invoke_named). The result rides
+/// inside the legacy pipe message as optional `assembly_b64` / `assembly_id`
+/// fields: a current Unity plugin loads the bytes on a cache miss, an older
+/// plugin ignores them and compiles from source as before.
+pub async fn compile_view_script(
+    compile_params: &CompileParams,
+    source: &str,
+    source_path: &str,
+    script_name: &str,
+) -> Result<CompileOutcome, String> {
+    let request = json!({
+        "source": source,
+        "path": source_path,
+        "scriptName": script_name,
+        "params": compile_params,
+    });
+    let outcome = request_compile("compile/viewScript", request).await;
+    record_outcome(&outcome);
+    outcome
 }
 
 /// Compile an arbitrary source set. Reserved as the future hot-reload

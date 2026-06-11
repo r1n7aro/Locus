@@ -92,6 +92,9 @@ while (true)
             case "compile/runStates":
                 result = service.HandleCompileRunStates(@params);
                 break;
+            case "compile/viewScript":
+                result = service.HandleCompileViewScript(@params);
+                break;
             default:
                 error = RpcError(-32601, $"method not found: {method}");
                 break;

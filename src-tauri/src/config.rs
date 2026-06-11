@@ -37,6 +37,10 @@ fn default_unity_background_hook_enabled() -> Arc<AtomicBool> {
     Arc::new(AtomicBool::new(true))
 }
 
+fn default_unity_sidecar_compiler() -> Arc<AtomicBool> {
+    Arc::new(AtomicBool::new(true))
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum AppCloseBehavior {
@@ -225,11 +229,12 @@ pub struct AppConfig {
     pub unity_background_hook_enabled: Arc<AtomicBool>,
     #[serde(default = "default_debug_flag", with = "serde_atomic_bool")]
     pub csharp_lsp_enabled: Arc<AtomicBool>,
-    /// Compile unity_execute / unity_run_states snippets in the CoreCLR
-    /// compile-server sidecar instead of inside the Unity Editor process.
-    /// Default off while the migration is being proven out; any sidecar
-    /// failure falls back to the in-Unity path at runtime regardless.
-    #[serde(default = "default_debug_flag", with = "serde_atomic_bool")]
+    /// Compile unity_execute / unity_run_states / View Script snippets in
+    /// the CoreCLR compile-server sidecar instead of inside the Unity Editor
+    /// process. Default on (phase 6 rollout); any sidecar failure falls back
+    /// to the in-Unity path at runtime, and the fallback path stays for at
+    /// least one release cycle.
+    #[serde(default = "default_unity_sidecar_compiler", with = "serde_atomic_bool")]
     pub unity_sidecar_compiler: Arc<AtomicBool>,
     #[serde(
         default = "default_code_analysis_tools",
@@ -279,7 +284,7 @@ impl AppConfig {
             view_open_in_existing_window: default_view_open_in_existing_window(),
             unity_background_hook_enabled: default_unity_background_hook_enabled(),
             csharp_lsp_enabled: default_debug_flag(),
-            unity_sidecar_compiler: default_debug_flag(),
+            unity_sidecar_compiler: default_unity_sidecar_compiler(),
             code_analysis_tools: default_code_analysis_tools(),
             config_path: Arc::new(Mutex::new(Some(primary_path.to_path_buf()))),
         };
@@ -705,6 +710,24 @@ mod tests {
         let config = AppConfig::load_from_path(&config_path);
 
         assert!(config.view_open_in_existing_window_enabled());
+    }
+
+    #[test]
+    fn unity_sidecar_compiler_defaults_to_enabled() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("config.json");
+        fs::write(
+            &config_path,
+            r#"{
+  "model": "legacy-model",
+  "debug": false
+}"#,
+        )
+        .expect("legacy config");
+
+        let config = AppConfig::load_from_path(&config_path);
+
+        assert!(config.unity_sidecar_compiler_enabled());
     }
 
     #[test]

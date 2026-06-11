@@ -95,6 +95,21 @@ public sealed class CompileRunStatesRequestDto
     public bool RegisterImage { get; set; }
 }
 
+public sealed class CompileViewScriptRequestDto
+{
+    [JsonPropertyName("source")]
+    public string? Source { get; set; }
+
+    [JsonPropertyName("path")]
+    public string? Path { get; set; }
+
+    [JsonPropertyName("scriptName")]
+    public string? ScriptName { get; set; }
+
+    [JsonPropertyName("params")]
+    public CompileParamsDto? Params { get; set; }
+}
+
 // ── service ──────────────────────────────────────────────────────────
 
 public sealed class CompileService
@@ -228,6 +243,49 @@ public sealed class CompileService
         return FailureResult(combined, "compile", startedAt);
     }
 
+    public JsonNode HandleCompileViewScript(JsonNode? @params)
+    {
+        var request = Deserialize<CompileViewScriptRequestDto>(@params);
+        if (string.IsNullOrWhiteSpace(request.Source))
+            throw new RpcInvalidParamsException("compile/viewScript requires source");
+
+        long startedAt = Environment.TickCount64;
+        string sourcePath = string.IsNullOrWhiteSpace(request.Path) ? "ViewScript.cs" : request.Path!;
+
+        CSharpParseOptions parseOptions = ResolveParseOptions(request.Params);
+        SyntaxTree syntaxTree;
+        try
+        {
+            syntaxTree = CSharpSyntaxTree.ParseText(
+                request.Source!,
+                parseOptions,
+                path: sourcePath,
+                encoding: Utf8NoBom);
+        }
+        catch (Exception ex)
+        {
+            // View Script error wording uses ex.Message (LocusBridge.ViewScripts.cs).
+            return FailureResult("parse failed: " + ex.Message, "compile", startedAt);
+        }
+
+        string assemblyName = NextAssemblyName(
+            "View_" + SanitizeAssemblyNamePart(request.ScriptName),
+            request.Params?.DomainGeneration);
+
+        var (bytes, error) = EmitCompilation(
+            assemblyName,
+            new[] { syntaxTree },
+            request.Params,
+            useHostBcl: false,
+            referenceSessionImages: false,
+            style: DiagnosticStyle.ViewScript);
+
+        if (bytes == null)
+            return FailureResult(error!, "compile", startedAt);
+
+        return SuccessResult(bytes, assemblyName, startedAt);
+    }
+
     public JsonNode HandleCompileRunStates(JsonNode? @params)
     {
         var request = Deserialize<CompileRunStatesRequestDto>(@params);
@@ -358,12 +416,22 @@ public sealed class CompileService
         return EmitCompilation(assemblyName, trees, compileParams, useHostBcl, referenceSessionImages);
     }
 
+    /// <summary>Which Unity-side error formatting a compile mirrors.</summary>
+    private enum DiagnosticStyle
+    {
+        /// <summary>execute/run_states: BuildDiagnosticErrorText, full exception text.</summary>
+        Snippet,
+        /// <summary>View Scripts: path-qualified diagnostics, exception .Message only.</summary>
+        ViewScript,
+    }
+
     private (byte[]? Bytes, string? Error) EmitCompilation(
         string assemblyName,
         IReadOnlyList<SyntaxTree> trees,
         CompileParamsDto? compileParams,
         bool useHostBcl,
-        bool referenceSessionImages)
+        bool referenceSessionImages,
+        DiagnosticStyle style = DiagnosticStyle.Snippet)
     {
         ImmutableArray<MetadataReference> references = ResolveReferences(compileParams, useHostBcl);
         if (referenceSessionImages)
@@ -387,11 +455,14 @@ public sealed class CompileService
         }
         catch (Exception ex)
         {
-            return (null, "emit failed: " + ex);
+            return (null, "emit failed: " + (style == DiagnosticStyle.ViewScript ? ex.Message : ex.ToString()));
         }
 
         if (!emitResult.Success)
         {
+            if (style == DiagnosticStyle.ViewScript)
+                return (null, DiagnosticText.BuildViewScriptDiagnosticErrorText(emitResult.Diagnostics));
+
             string? text = DiagnosticText.BuildDiagnosticErrorText(emitResult.Diagnostics);
             return (null, text ?? "unknown compilation failure");
         }
@@ -497,6 +568,21 @@ public sealed class CompileService
     }
 
     // ── results / misc ───────────────────────────────────────────────
+
+    /// <summary>Port of LocusBridge.ViewScripts.cs SanitizeAssemblyNamePart.</summary>
+    private static string SanitizeAssemblyNamePart(string? value)
+    {
+        if (string.IsNullOrEmpty(value))
+            return "Script";
+
+        var sb = new StringBuilder(value!.Length);
+        for (int i = 0; i < value.Length; i++)
+        {
+            char ch = value[i];
+            sb.Append(char.IsLetterOrDigit(ch) ? ch : '_');
+        }
+        return sb.Length == 0 ? "Script" : sb.ToString();
+    }
 
     private string NextAssemblyName(string kind, string? domainGeneration)
     {

@@ -91,6 +91,18 @@ const sidecarHasIssue = computed(() => {
   return !!status && status.enabled && !!status.lastError;
 });
 
+const sidecarStatsLabel = computed(() => {
+  const status = sidecarStatus.value;
+  if (!status || !status.enabled) return "";
+  const total = (status.sidecarCompiles ?? 0) + (status.fallbacks ?? 0);
+  if (total === 0) return "";
+  return t(
+    "settings.codeAnalysis.sidecarStats",
+    status.sidecarCompiles ?? 0,
+    status.fallbacks ?? 0,
+  );
+});
+
 async function refreshSidecarStatus() {
   try {
     sidecarStatus.value = await unitySidecarCompilerGetStatus();
@@ -289,6 +301,7 @@ onUnmounted(() => {
           <span class="tool-desc" :class="{ 'status-error': sidecarHasIssue }">
             {{ sidecarStatusLabel }}
           </span>
+          <span v-if="sidecarStatsLabel" class="tool-desc">{{ sidecarStatsLabel }}</span>
         </div>
         <div class="master-actions">
           <BaseSwitch

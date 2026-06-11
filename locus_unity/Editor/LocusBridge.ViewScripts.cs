@@ -44,6 +44,13 @@ namespace Locus
             public string source;
             public string sourceHash;
             public string path;
+
+            // Optional: assembly pre-compiled by the Locus compile-server
+            // sidecar. When present, a cache miss loads these bytes instead
+            // of compiling `source`; on any load failure the local compile
+            // path still runs. Older plugin builds ignore these fields.
+            public string assembly_b64;
+            public string assembly_id;
         }
 
         [Serializable]
@@ -449,10 +456,52 @@ namespace Locus
                     return cached;
                 }
 
-                CompiledViewScript compiled = CompileViewScript(request);
+                CompiledViewScript compiled = TryLoadPrecompiledViewScript(request);
+                if (compiled == null)
+                    compiled = CompileViewScript(request);
                 _viewScriptCache[cacheKey] = compiled;
                 cacheHit = false;
                 return compiled;
+            }
+        }
+
+        /// <summary>
+        /// Load a View Script assembly pre-compiled by the compile-server
+        /// sidecar (optional `assembly_b64` on the request). Returns null —
+        /// falling back to the local compile — when the request has no bytes
+        /// or the load fails for any reason; the source is always present.
+        /// </summary>
+        private static CompiledViewScript TryLoadPrecompiledViewScript(ViewCompileNamedRequest request)
+        {
+            if (string.IsNullOrEmpty(request.assembly_b64))
+                return null;
+
+            try
+            {
+                byte[] assemblyBytes = Convert.FromBase64String(request.assembly_b64);
+                Assembly assembly = Assembly.Load(assemblyBytes);
+                Type entryType = ResolveEntryType(assembly, request.entryType);
+                string assemblyId = string.IsNullOrEmpty(request.assembly_id)
+                    ? SafeAssemblyName(assembly)
+                    : request.assembly_id;
+
+                return new CompiledViewScript
+                {
+                    Name = request.scriptName,
+                    Hash = request.sourceHash,
+                    EntryTypeName = request.entryType,
+                    AssemblyId = assemblyId,
+                    Path = request.path,
+                    Assembly = assembly,
+                    EntryType = entryType
+                };
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning(
+                    "[Locus] precompiled View Script load failed; compiling in Unity instead: " +
+                    ex.Message);
+                return null;
             }
         }
 

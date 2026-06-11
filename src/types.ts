@@ -127,6 +127,11 @@ export interface CsharpCompileStatus {
   dotnetSource?: string | null;
   uptimeSecs?: number | null;
   lastError?: string | null;
+  /** Session counters: compiles served by the sidecar, deterministic
+   * compile errors, and fallbacks to the in-Unity compiler. */
+  sidecarCompiles: number;
+  compileErrors: number;
+  fallbacks: number;
 }
 
 /** Per-tool switches for the code-analysis tool family (camelCase mirror of

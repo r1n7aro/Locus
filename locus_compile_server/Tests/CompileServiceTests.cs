@@ -223,6 +223,58 @@ public class CompileServiceTests
         Assert.Equal(1, registry.CountFor("gen-2"));
     }
 
+    // ── compile/viewScript ───────────────────────────────────────────
+
+    private static JsonObject ViewScriptParams() => new()
+    {
+        ["fingerprint"] = "view-test",
+        ["domainGeneration"] = "abcdef0123456789",
+        ["langVersion"] = "9",
+        ["referencePaths"] = new JsonArray(typeof(object).Assembly.Location),
+        ["defines"] = new JsonArray(),
+    };
+
+    [Fact]
+    public void View_script_compiles_and_names_assembly_after_the_script()
+    {
+        var service = new CompileService();
+        JsonNode result = service.HandleCompileViewScript(new JsonObject
+        {
+            ["source"] = "public static class V { public static string Ping() { return \"ok\"; } }",
+            ["path"] = "ViewScript.cs",
+            ["scriptName"] = "My-Script.cs",
+            ["params"] = ViewScriptParams(),
+        });
+
+        Assert.True(result["success"]!.GetValue<bool>());
+        string name = result["assemblyName"]!.GetValue<string>();
+        // Sanitization mirrors LocusBridge.ViewScripts.cs ("My-Script.cs" -> "My_Script_cs").
+        Assert.Matches("^__LocusView_My_Script_cs_abcdef01_[0-9A-F]{8}$", name);
+        Assert.True(Convert.FromBase64String(result["assemblyB64"]!.GetValue<string>()).Length > 512);
+    }
+
+    /// <summary>
+    /// View Script diagnostics carry the (normalized) source path — the
+    /// format of LocusBridge.ViewScripts.cs BuildViewScriptDiagnosticErrorText.
+    /// </summary>
+    [Fact]
+    public void View_script_diagnostics_are_path_qualified()
+    {
+        var service = new CompileService();
+        JsonNode result = service.HandleCompileViewScript(new JsonObject
+        {
+            ["source"] = "public class V { void M() { int x = \"oops\"; } }",
+            ["path"] = "Views\\my_view\\script.cs",
+            ["scriptName"] = "script",
+            ["params"] = ViewScriptParams(),
+        });
+
+        Assert.False(result["success"]!.GetValue<bool>());
+        Assert.Equal(
+            "compilation failed:\n  CS0029 at Views/my_view/script.cs:1:37: Cannot implicitly convert type 'string' to 'int'\n",
+            result["error"]!.GetValue<string>());
+    }
+
     [Fact]
     public void Assembly_names_embed_kind_generation_and_counter()
     {

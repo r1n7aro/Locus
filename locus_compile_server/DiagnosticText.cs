@@ -59,4 +59,45 @@ public static class DiagnosticText
 
         return hasError ? sb.ToString() : null;
     }
+
+    /// <summary>
+    /// Verbatim port of LocusBridge.ViewScripts.cs
+    /// BuildViewScriptDiagnosticErrorText — the View Script variant includes
+    /// the (mapped) source path before line:column and never returns null.
+    /// </summary>
+    public static string BuildViewScriptDiagnosticErrorText(IEnumerable<Diagnostic>? diagnostics)
+    {
+        if (diagnostics == null)
+            return "compilation failed";
+
+        var sb = new StringBuilder();
+        bool hasError = false;
+
+        foreach (Diagnostic? diagnostic in diagnostics)
+        {
+            if (diagnostic == null || diagnostic.Severity != DiagnosticSeverity.Error)
+                continue;
+
+            if (!hasError)
+            {
+                hasError = true;
+                sb.Append("compilation failed:\n");
+            }
+
+            FileLinePositionSpan span = diagnostic.Location.GetMappedLineSpan();
+            sb.Append("  ");
+            sb.Append(diagnostic.Id);
+            sb.Append(" at ");
+            sb.Append(string.IsNullOrEmpty(span.Path) ? "ViewScript.cs" : span.Path.Replace('\\', '/'));
+            sb.Append(":");
+            sb.Append(span.StartLinePosition.Line + 1);
+            sb.Append(":");
+            sb.Append(span.StartLinePosition.Character + 1);
+            sb.Append(": ");
+            sb.Append(diagnostic.GetMessage());
+            sb.Append("\n");
+        }
+
+        return hasError ? sb.ToString() : "compilation failed";
+    }
 }

@@ -1502,13 +1502,86 @@ pub async fn compile_run_states(
     }
 }
 
+/// Pre-compile a View Script (compile_named / invoke_named) request in the
+/// sidecar. On success the request gains `assembly_b64` / `assembly_id`
+/// fields: a current Unity plugin loads those bytes on a cache miss instead
+/// of compiling, an older plugin ignores the extra fields and compiles from
+/// source exactly as before — so no fallback handshake is needed.
+///
+/// Returns `Ok(Some(augmented))` to send, `Ok(None)` to send the original
+/// request (sidecar unavailable), or `Err` with a deterministic compile
+/// error in the Unity-side wording (View Script errors carry no prefix).
+async fn augment_view_script_request_with_sidecar(
+    project_path: &str,
+    request: &serde_json::Value,
+) -> Result<Option<serde_json::Value>, String> {
+    if !crate::csharp_compile::is_enabled() {
+        return Ok(None);
+    }
+
+    let source = request
+        .get("source")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if source.trim().is_empty() {
+        // invoke_named without source never reaches Unity's compiler either.
+        return Ok(None);
+    }
+
+    let params = match sidecar_compile_params(project_path).await {
+        Ok(params) => params,
+        Err(reason) => {
+            crate::csharp_compile::note_fallback(&reason);
+            return Ok(None);
+        }
+    };
+
+    let source_path = request
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .filter(|path| !path.trim().is_empty())
+        .unwrap_or("ViewScript.cs");
+    let script_name = request
+        .get("scriptName")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+
+    match crate::csharp_compile::compile_view_script(&params, source, source_path, script_name)
+        .await
+    {
+        Ok(Ok(assembly)) => {
+            let mut augmented = request.clone();
+            if let Some(object) = augmented.as_object_mut() {
+                object.insert(
+                    "assembly_b64".to_string(),
+                    serde_json::Value::String(assembly.assembly_b64),
+                );
+                object.insert(
+                    "assembly_id".to_string(),
+                    serde_json::Value::String(assembly.assembly_name),
+                );
+                Ok(Some(augmented))
+            } else {
+                Ok(None)
+            }
+        }
+        Ok(Err(failure)) => Err(failure.message),
+        Err(error) => {
+            crate::csharp_compile::note_fallback(&error);
+            Ok(None)
+        }
+    }
+}
+
 pub async fn compile_named(
     project_path: &str,
     request: &serde_json::Value,
 ) -> Result<String, String> {
     let op_lock = project_unity_op_lock(project_path).await;
     let _guard = op_lock.lock().await;
-    let payload = serde_json::to_string(request)
+    let augmented = augment_view_script_request_with_sidecar(project_path, request).await?;
+    let effective_request = augmented.as_ref().unwrap_or(request);
+    let payload = serde_json::to_string(effective_request)
         .map_err(|error| format!("Failed to serialize compile_named request: {}", error))?;
     let resp = send_message_without_timeout(project_path, "compile_named", &payload).await?;
     if resp.ok {
@@ -1571,7 +1644,9 @@ pub async fn invoke_named(
 ) -> Result<String, String> {
     let op_lock = project_unity_op_lock(project_path).await;
     let _guard = op_lock.lock().await;
-    let payload = serde_json::to_string(request)
+    let augmented = augment_view_script_request_with_sidecar(project_path, request).await?;
+    let effective_request = augmented.as_ref().unwrap_or(request);
+    let payload = serde_json::to_string(effective_request)
         .map_err(|error| format!("Failed to serialize invoke_named request: {}", error))?;
     let resp = send_message_without_timeout(project_path, "invoke_named", &payload).await?;
     if resp.ok {
