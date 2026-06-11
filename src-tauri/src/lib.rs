@@ -21,6 +21,7 @@ mod config;
 pub mod config_registry;
 pub mod csharp_lsp;
 pub(crate) mod diff;
+pub mod dotnet_runtime;
 pub(crate) mod eol;
 pub mod error;
 mod feishu_docs;
