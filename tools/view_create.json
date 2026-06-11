@@ -19,7 +19,7 @@
       "template": {
         "type": "string",
         "enum": ["blank", "inspector-form", "canvas-board", "field-blocks", "node-graph", "link-board", "serialized-table"],
-        "description": "Built-in View template to copy. Supported values: blank, inspector-form, canvas-board, field-blocks, node-graph, link-board, serialized-table."
+        "description": "Built-in View template to copy. blank: minimal panel shell for custom UI and prototypes. inspector-form: selection-driven Unity inspector (onEditorUpdate + property.fromPath + drawDefaultEditor). canvas-board: freeform canvas with draggable custom blocks. field-blocks: canvas blocks bound to Unity SerializedProperty fields. node-graph: node/port graph editor with scripted Unity write-back. link-board: two-column source-to-target mapping with serialized connections. serialized-table: SerializedTableView-based table for aggregating and editing serialized properties across many assets."
       },
       "icon": {
         "type": ["string", "null"],

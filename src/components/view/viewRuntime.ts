@@ -127,6 +127,13 @@ import {
   type GraphPort,
   type GraphPortDirection,
 } from "../graph";
+import {
+  SerializedTableView,
+  dedupeSerializedTableSources,
+  normalizeSerializedTableSource,
+  resolveSerializedTableSources,
+  serializedTableSourcesFromAssets,
+} from "../table";
 import type {
   AssetRefAttachment,
   AssetRefKind,
@@ -171,6 +178,28 @@ export {
   defineGraphView,
   layoutGraphDocument,
 } from "../graph";
+export {
+  SerializedTableView,
+  dedupeSerializedTableSources,
+  normalizeSerializedTableSource,
+  resolveSerializedTableSources,
+  serializedTableSourcesFromAssets,
+} from "../table";
+export type {
+  SerializedTableCell,
+  SerializedTableColumnConfig,
+  SerializedTableCommitEvent,
+  SerializedTableEnumOption,
+  SerializedTableManagedReferenceType,
+  SerializedTableProgress,
+  SerializedTablePropertyOverride,
+  SerializedTableResolveSourcesOptions,
+  SerializedTableResolvedSources,
+  SerializedTableRow,
+  SerializedTableSourceConfig,
+  SerializedTableSourceProvider,
+  SerializedTableSourceProviderContext,
+} from "../table";
 
 export type {
   CanvasClipboardEvent,
@@ -744,6 +773,7 @@ const LOCUS_COMPONENTS = {
   BaseSwitch,
   CanvasView,
   GraphView,
+  SerializedTableView,
   UnityBoolField,
   UnityColorField,
   UnityEnumField,
@@ -1683,6 +1713,7 @@ function createViewRuntimeApiUncached(detail: ViewPackageDetail, api: ViewRuntim
     CanvasView,
     GraphView,
     GraphViewController,
+    SerializedTableView,
     UnityPropertyDraw,
     UnityPropertyEditor,
     UnitySerializedPropertyTree,
@@ -1690,6 +1721,10 @@ function createViewRuntimeApiUncached(detail: ViewPackageDetail, api: ViewRuntim
     UnityReferenceChip,
     UnityDropZone,
     layoutGraphDocument,
+    dedupeSerializedTableSources,
+    normalizeSerializedTableSource,
+    resolveSerializedTableSources,
+    serializedTableSourcesFromAssets,
     ...PropertyTreeService,
     ...UnityPropertyBinding,
     ...UnitySerializedValue,

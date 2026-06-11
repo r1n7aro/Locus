@@ -342,6 +342,7 @@ describe("unityObjectReferencePicker", () => {
     const editor = readFileSync("src/components/unity/UnityPropertyEditor.vue", "utf8");
     const viewRuntime = readFileSync("src/components/view/viewRuntime.ts", "utf8");
     const serializedTable = readFileSync("src-tauri/src/view/templates/serialized_table.rs", "utf8");
+    const serializedTableView = readFileSync("src/components/table/SerializedTableView.vue", "utf8");
     const fieldBlocks = readFileSync("src-tauri/src/view/templates/field_blocks.rs", "utf8");
     const exportScript = readFileSync("scripts/export-view-runtime-sources.mjs", "utf8");
 
@@ -377,9 +378,9 @@ describe("unityObjectReferencePicker", () => {
     expect(editor).toContain(":reference-type-full-name=\"referenceTypeFullName\"");
     expect(viewRuntime).toContain("objectReferencePicker");
     expect(viewRuntime).toContain("...UnityObjectReferencePickerService");
-    expect(serializedTable).toContain(":reference-type-full-name=\"cell.referenceTypeFullName\"");
+    expect(serializedTableView).toContain(":reference-type-full-name=\"cell.referenceTypeFullName\"");
     expect(serializedTable).toContain("referenceTypeFullName = snapshot.referenceTypeFullName");
-    expect(fieldBlocks).toContain(":reference-type-full-name=\"propertyString(field, 'referenceTypeFullName')\"");
+    expect(fieldBlocks).toContain(":reference-type-full-name=\"field.property?.referenceTypeFullName ?? ''\"");
     expect(exportScript).toContain("src/services/unityObjectReferencePicker.ts");
   });
 

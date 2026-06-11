@@ -1,134 +1,66 @@
 pub(super) fn app_vue(_name: &str) -> String {
     r##"<script setup lang="ts">
-import { GraphViewController, defineGraphView, view } from "@locus/view-runtime";
+import { defineGraphView, view } from "@locus/view-runtime";
+import type { GraphConnectionValidation, GraphController, GraphData, GraphLink } from "@locus/view-runtime";
 import { GraphView } from "@locus/components";
 
-function fallbackGraph() {
+// Shown when the GraphViewApi C# script cannot provide a graph.
+function fallbackGraph(): GraphData {
   return {
+    // layout.auto: "missing" only auto-layouts nodes without stored x/y.
+    // Other modes: true / "always" relayout every load, false / "off" never.
     layout: { auto: "missing", direction: "right" },
     nodes: [
       {
-        id: "asset-source",
+        id: "offline",
         type: "source",
-        title: "Asset Source",
-        subtitle: "Unity data",
-        outputs: [
-          { id: "object", label: "Object", type: "Unity.Object" },
-          { id: "path", label: "Path", type: "string" }
-        ],
-        parameters: [
-          { id: "mode", label: "Mode", type: "select", value: "active", options: [
-            { label: "Active", value: "active" },
-            { label: "Pinned", value: "pinned" }
-          ] }
-        ]
+        title: "Graph Unavailable",
+        subtitle: "GraphViewApi returned no graph",
       },
-      {
-        id: "process",
-        type: "processor",
-        title: "Process",
-        subtitle: "Transform",
-        inputs: [
-          { id: "input", label: "Input", type: "Unity.Object" }
-        ],
-        outputs: [
-          { id: "result", label: "Result", type: "object" }
-        ],
-        parameters: [
-          { id: "enabled", label: "Enabled", type: "boolean", value: true },
-          { id: "weight", label: "Weight", type: "number", value: 1, min: 0, max: 4, step: 0.1 }
-        ]
-      },
-      {
-        id: "apply",
-        type: "output",
-        title: "Apply",
-        subtitle: "Write back",
-        inputs: [
-          { id: "value", label: "Value", type: "object" }
-        ],
-        parameters: [
-          { id: "target", label: "Target", type: "string", value: "Configured asset" }
-        ]
-      }
     ],
-    connections: [
-      {
-        id: "asset-source-process",
-        from: { nodeId: "asset-source", portId: "object" },
-        to: { nodeId: "process", portId: "input" }
-      },
-      {
-        id: "process-apply",
-        from: { nodeId: "process", portId: "result" },
-        to: { nodeId: "apply", portId: "value" }
-      }
-    ]
+    connections: [],
   };
 }
 
-class TemplateGraphView extends GraphViewController {
-  async loadGraph() {
+const graphView = defineGraphView({
+  async loadGraph(): Promise<GraphData> {
     try {
-      const response = await view.callScript("GraphViewApi", "Read", {});
+      const response = await view.callScript("GraphViewApi", "Read", {}) as { graph?: GraphData } | null;
       return response?.graph || fallbackGraph();
     } catch (error) {
       console.error("[node-graph] Read failed", error);
       return fallbackGraph();
     }
-  }
+  },
 
-  validateConnection(connection, graph) {
-    const targetIsUsed = graph.connections.some((item) => {
+  validateConnection(connection: GraphLink, graph: GraphData): GraphConnectionValidation {
+    const targetIsUsed = (graph.connections ?? []).some((item) => {
       return item.to.nodeId === connection.to.nodeId
         && item.to.portId === connection.to.portId
         && item.id !== connection.id;
     });
     return targetIsUsed ? "Input port already has a connection." : true;
-  }
+  },
 
-  async saveGraph(graph) {
+  async saveGraph(graph: GraphData) {
     await view.callScript("GraphViewApi", "Save", { graph });
-  }
+  },
 
-  async applyGraph(graph) {
+  async applyGraph(graph: GraphData) {
     await view.callScript("GraphViewApi", "Apply", { graph });
-  }
-}
-
-const graphView = defineGraphView(new TemplateGraphView());
+  },
+} satisfies GraphController);
 </script>
 
 <template>
-  <GraphView :controller="graphView" title="" />
+  <GraphView :controller="graphView" data-locus-template="node-graph" />
 </template>
 "##
     .to_string()
 }
 
 pub(super) fn style_css() -> String {
-    r#":root {
-  color-scheme: light dark;
-  font-family: var(--font-ui);
-}
-
-body {
-  margin: 0;
-  background: var(--bg-color);
-  color: var(--text-color);
-  font-family: var(--font-ui);
-}
-
-html,
-body,
-#app {
-  width: 100%;
-  height: 100%;
-  min-width: 0;
-  min-height: 0;
-}
-"#
-    .to_string()
+    super::common::base_css().to_string()
 }
 
 pub(super) fn view_api_cs() -> String {

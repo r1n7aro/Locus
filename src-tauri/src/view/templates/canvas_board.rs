@@ -2,6 +2,7 @@ pub(super) fn app_vue(_name: &str) -> String {
     r##"<script setup lang="ts">
 import { computed, ref } from "vue";
 import { CanvasView } from "@locus/components";
+import type { CanvasViewExpose } from "@locus/components";
 
 interface CanvasBlock {
   id: string;
@@ -13,7 +14,7 @@ interface CanvasBlock {
   height: number;
 }
 
-const canvasRef = ref(null);
+const canvasRef = ref<CanvasViewExpose | null>(null);
 const selectedBlockIds = ref<string[]>(["overview"]);
 const dirty = ref(false);
 const blocks = ref<CanvasBlock[]>([
@@ -132,7 +133,7 @@ function onCanvasContextMenu(event: { itemId?: string; x: number; y: number }) {
 }
 
 function fitCanvas() {
-  canvasRef.value?.fitContent?.();
+  canvasRef.value?.fitContent();
 }
 </script>
 
@@ -180,89 +181,8 @@ function fitCanvas() {
 }
 
 pub(super) fn style_css() -> String {
-    r#":root {
-  color-scheme: light dark;
-  font-family: var(--font-ui);
-}
-
-body {
-  margin: 0;
-  background: var(--bg-color);
-  color: var(--text-color);
-  font-family: var(--font-ui);
-}
-
-html,
-body,
-#app {
-  width: 100%;
-  height: 100%;
-  min-width: 0;
-  min-height: 0;
-}
-
-.view-shell {
-  width: 100%;
-  height: 100%;
-  min-width: 0;
-  min-height: 0;
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
-  background: var(--bg-color);
-}
-
-.view-toolbar {
-  min-height: 42px;
-  flex-shrink: 0;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 0 10px 0 12px;
-  border-bottom: 1px solid var(--border-color);
-  background: color-mix(in srgb, var(--panel-bg) 88%, var(--bg-color) 12%);
-}
-
-.toolbar-title {
-  min-width: 0;
-  display: flex;
-  align-items: baseline;
-  gap: 8px;
-}
-
-.toolbar-title span {
-  font-size: 13px;
-  font-weight: 650;
-}
-
-.toolbar-title small {
-  color: var(--text-secondary);
-  font-size: 11px;
-}
-
-.toolbar-actions {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-
-button {
-  min-height: 28px;
-  padding: 0 9px;
-  border: 1px solid var(--border-color);
-  border-radius: 6px;
-  background: color-mix(in srgb, var(--panel-bg) 72%, var(--sidebar-bg) 28%);
-  color: var(--text-color);
-  font: inherit;
-  font-size: 12px;
-}
-
-button:disabled {
-  opacity: 0.58;
-}
-
-.canvas-board-view > .locus-canvas-view {
+    super::common::style_css(
+        r#".canvas-board-view > .locus-canvas-view {
   flex: 1;
   min-height: 0;
 }
@@ -319,19 +239,9 @@ button:disabled {
   font-size: 12px;
 }
 
-input {
+.canvas-block-body input {
   width: 100%;
-  min-width: 0;
-  min-height: 26px;
-  padding: 0 7px;
-  border: 1px solid var(--border-color);
-  border-radius: 6px;
-  background: var(--input-bg);
-  color: var(--text-color);
-  font: inherit;
-  font-size: 12px;
-  box-sizing: border-box;
 }
-"#
-    .to_string()
+"#,
+    )
 }

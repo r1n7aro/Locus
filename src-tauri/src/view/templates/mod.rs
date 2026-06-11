@@ -145,7 +145,6 @@ pub(super) fn template_files(id: &str, name: &str, template: &str) -> Vec<(&'sta
     let mut files = vec![
         ("README.md", readme),
         ("src/main.ts", common::main_ts()),
-        ("src/store.ts", common::store_ts()),
     ];
 
     match template {
@@ -255,4 +254,134 @@ Project-wide View frontend code for this Unity project.
 
 Import from `@locus/project-view` or `@project-view` inside View packages.
 "#
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn view_create_tool_json() -> serde_json::Value {
+        serde_json::from_str(crate::prompt::tools::VIEW_CREATE)
+            .expect("tools/view_create.json must be valid JSON")
+    }
+
+    #[test]
+    fn template_registry_matches_view_create_tool_schema() {
+        let json = view_create_tool_json();
+        let enum_values: Vec<String> = json["parameters"]["properties"]["template"]["enum"]
+            .as_array()
+            .expect("template enum must be an array")
+            .iter()
+            .map(|value| value.as_str().expect("template enum entry").to_string())
+            .collect();
+        let registry_ids: Vec<String> = supported_view_templates()
+            .iter()
+            .map(|template| template.id.clone())
+            .collect();
+
+        assert_eq!(
+            registry_ids, enum_values,
+            "supported_view_templates() and the template enum in tools/view_create.json must list the same templates in the same order",
+        );
+        for id in &registry_ids {
+            assert!(is_supported_template(id), "registry template must be supported: {id}");
+        }
+        assert!(!is_supported_template("unknown-template"));
+
+        let description = json["parameters"]["properties"]["template"]["description"]
+            .as_str()
+            .unwrap_or_default();
+        for id in &registry_ids {
+            assert!(
+                description.contains(id),
+                "template enum description must mention {id}",
+            );
+        }
+    }
+
+    #[test]
+    fn template_default_icons_are_in_tool_icon_enum() {
+        let json = view_create_tool_json();
+        let icons: Vec<&str> = json["parameters"]["properties"]["icon"]["enum"]
+            .as_array()
+            .expect("icon enum must be an array")
+            .iter()
+            .filter_map(|value| value.as_str())
+            .collect();
+        for template in supported_view_templates() {
+            let icon = default_icon_for_template(&template.id);
+            assert!(
+                icons.contains(&icon),
+                "default icon for {} must be part of the icon enum: {icon}",
+                template.id,
+            );
+        }
+    }
+
+    #[test]
+    fn template_files_share_base_layout() {
+        for template in supported_view_templates() {
+            let files = template_files("test-view", "Test View", &template.id);
+            let names: Vec<&str> = files.iter().map(|(name, _)| *name).collect();
+            for required in ["README.md", "src/main.ts", "src/App.vue", "src/style.css", ".locus-view"] {
+                assert!(
+                    names.contains(&required),
+                    "{} must generate {required}",
+                    template.id,
+                );
+            }
+
+            let style = &files
+                .iter()
+                .find(|(name, _)| *name == "src/style.css")
+                .expect("style.css")
+                .1;
+            assert!(
+                style.starts_with(common::base_css()),
+                "{} style.css must start with the shared base stylesheet",
+                template.id,
+            );
+
+            let app = &files
+                .iter()
+                .find(|(name, _)| *name == "src/App.vue")
+                .expect("App.vue")
+                .1;
+            assert!(
+                app.contains(&format!("data-locus-template=\"{}\"", template.id)),
+                "{} App.vue must tag its root with data-locus-template",
+                template.id,
+            );
+        }
+    }
+
+    #[test]
+    fn unity_templates_declare_capabilities_and_scripts() {
+        for template in supported_view_templates() {
+            let manifest = template_manifest("test-view", "Test View", &template.id, None);
+            let needs_unity = matches!(
+                template.id.as_str(),
+                "inspector-form" | "field-blocks" | "node-graph" | "serialized-table"
+            );
+            assert_eq!(
+                manifest.capabilities.unity, needs_unity,
+                "unity capability mismatch for {}",
+                template.id,
+            );
+
+            let has_script_file = template_files("test-view", "Test View", &template.id)
+                .iter()
+                .any(|(name, _)| *name == "unity/ViewApi.cs");
+            assert_eq!(
+                !manifest.scripts.is_empty(),
+                has_script_file,
+                "{} must generate unity/ViewApi.cs exactly when view.json declares scripts",
+                template.id,
+            );
+            for script in &manifest.scripts {
+                assert!(!script.entry_type.trim().is_empty());
+                assert_eq!(script.path, "unity/ViewApi.cs");
+            }
+        }
+    }
 }

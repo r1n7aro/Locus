@@ -6,61 +6,73 @@ const templateSource = readFileSync(
   resolve(process.cwd(), "src-tauri/src/view/templates/serialized_table.rs"),
   "utf8",
 );
+const componentSource = readFileSync(
+  resolve(process.cwd(), "src/components/table/SerializedTableView.vue"),
+  "utf8",
+);
 
 describe("serialized table View layout", () => {
   it("uses measured column widths and horizontal scrolling instead of compressing headers", () => {
-    expect(templateSource).toContain("const TABLE_MIN_DATA_COLUMN_WIDTH = 88;");
-    expect(templateSource).toContain("const TABLE_MAX_DATA_COLUMN_WIDTH = 220;");
-    expect(templateSource).toContain("const assetColumnWidth = computed(() =>");
-    expect(templateSource).toContain("const statusColumnWidth = computed(() =>");
-    expect(templateSource).toContain("columnWidthFromOverride(tableColumnKey(column), autoColumnWidth(column), TABLE_MIN_DATA_COLUMN_WIDTH)");
-    expect(templateSource).toContain("width: `max(100%, ${tablePixelWidth.value}px)`");
-    expect(templateSource).toContain("<colgroup>");
-    expect(templateSource).toContain(":style=\"{ width: columnWidths[index] + 'px' }\"");
-    expect(templateSource).toContain("class=\"column-label\"");
-    expect(templateSource).toContain("scrollbar-gutter: stable both-edges;");
-    expect(templateSource).toContain("overscroll-behavior: contain;");
-    expect(templateSource).toContain("touch-action: pan-x pan-y;");
-    expect(templateSource).toContain(".value-cell .unity-property-tree");
+    expect(componentSource).toContain("const MIN_DATA_COLUMN_WIDTH = 88;");
+    expect(componentSource).toContain("const MAX_DATA_COLUMN_WIDTH = 220;");
+    expect(componentSource).toContain("const assetColumnWidth = computed(() =>");
+    expect(componentSource).toContain("const statusColumnWidth = computed(() =>");
+    expect(componentSource).toContain("widthFromOverride(columnKey(column), autoColumnWidth(column), MIN_DATA_COLUMN_WIDTH)");
+    expect(componentSource).toContain("width: `max(100%, ${tablePixelWidth.value}px)`");
+    expect(componentSource).toContain("<colgroup>");
+    expect(componentSource).toContain(":style=\"{ width: columnWidths[index] + 'px' }\"");
+    expect(componentSource).toContain("class=\"column-label\"");
+    expect(componentSource).toContain("scrollbar-gutter: stable both-edges;");
+    expect(componentSource).toContain("overscroll-behavior: contain;");
+    expect(componentSource).toContain("touch-action: pan-x pan-y;");
+    expect(componentSource).toContain(".value-cell :deep(.unity-property-tree)");
   });
 
   it("supports resizable column separators with persisted widths", () => {
-    expect(templateSource).toContain("const columnWidthOverrides = ref<Record<string, number>>({});");
-    expect(templateSource).toContain("function startColumnResize(event: PointerEvent");
-    expect(templateSource).toContain("function updateColumnResize(event: PointerEvent)");
-    expect(templateSource).toContain("function persistColumnWidths()");
-    expect(templateSource).toContain("columnWidths: columnWidthOverrides.value");
-    expect(templateSource).toContain("class=\"column-resize-handle\"");
-    expect(templateSource).toContain('v-for="(column, index) in columns"');
-    expect(templateSource).toContain("@pointerdown.prevent.stop=\"startColumnResize");
-    expect(templateSource).toContain("@dblclick.prevent.stop=\"resetColumnWidth");
-    expect(templateSource).toContain("border-right: 1px solid");
-    expect(templateSource).toContain("body.serialized-table-resizing");
-    expect(templateSource).toContain("stopColumnResize(false);");
+    expect(componentSource).toContain("const columnWidthOverrides = ref<Record<string, number>>({ ...props.columnWidths });");
+    expect(componentSource).toContain("function startColumnResize(event: PointerEvent");
+    expect(componentSource).toContain("function updateColumnResize(event: PointerEvent)");
+    expect(templateSource).toContain("function persistColumnWidths(widths: Record<string, number>)");
+    expect(templateSource).toContain(":column-widths=\"columnWidths\"");
+    expect(componentSource).toContain("class=\"column-resize-handle\"");
+    expect(componentSource).toContain('v-for="(column, index) in columns"');
+    expect(componentSource).toContain("@pointerdown.prevent.stop=\"startColumnResize");
+    expect(componentSource).toContain("@dblclick.prevent.stop=\"resetColumnWidth");
+    expect(componentSource).toContain("border-right: 1px solid");
+    expect(componentSource).toContain("body.locus-serialized-table-resizing");
+    expect(componentSource).toContain("stopColumnResize(false);");
   });
 
   it("logs table layout failures when rendered columns overlap or lose scrollability", () => {
-    expect(templateSource).toContain("function checkTableLayout()");
-    expect(templateSource).toContain("header ${index + 1} overlaps previous column");
-    expect(templateSource).toContain("horizontal overflow is not scrollable");
-    expect(templateSource).toContain('console.error("[serialized-table] Layout check failed"');
-    expect(templateSource).toContain('window.addEventListener("resize", scheduleTableLayoutCheck)');
-    expect(templateSource).toContain('window.removeEventListener("resize", scheduleTableLayoutCheck)');
+    expect(componentSource).toContain("function checkTableLayout()");
+    expect(componentSource).toContain("header ${index + 1} overlaps previous column");
+    expect(componentSource).toContain("horizontal overflow is not scrollable");
+    expect(componentSource).toContain('console.error("[serialized-table] Layout check failed"');
+    expect(componentSource).toContain('window.addEventListener("resize", scheduleLayoutCheck)');
+    expect(componentSource).toContain('window.removeEventListener("resize", scheduleLayoutCheck)');
   });
 
   it("keeps mouse wheel scrolling bound to the table scroller", () => {
-    expect(templateSource).toContain("function handleTableWheel(event: WheelEvent)");
-    expect(templateSource).toContain('@wheel.capture="handleTableWheel"');
-    expect(templateSource).toContain("scroller.scrollTop += event.deltaY;");
-    expect(templateSource).toContain("scroller.scrollLeft += event.deltaX || event.deltaY;");
-    expect(templateSource).toMatch(/\.table-workspace\s*\{[\s\S]*height:\s*100%;[\s\S]*display:\s*flex;/);
-    expect(templateSource).toMatch(/\.table-pane\s*\{[\s\S]*flex:\s*1;[\s\S]*height:\s*100%;/);
+    expect(componentSource).toContain("function handleTableWheel(event: WheelEvent)");
+    expect(componentSource).toContain('@wheel.capture="handleTableWheel"');
+    expect(componentSource).toContain("scroller.scrollTop += event.deltaY;");
+    expect(componentSource).toContain("scroller.scrollLeft += event.deltaX || event.deltaY;");
+    expect(componentSource).toMatch(/\.locus-serialized-table\s*\{[\s\S]*height:\s*100%;[\s\S]*display:\s*flex;/);
+    expect(componentSource).toMatch(/\.locus-serialized-table-scroller\s*\{[\s\S]*flex:\s*1;[\s\S]*overflow:\s*auto;/);
   });
 
   it("keeps row header content vertically centered in tall rows", () => {
-    expect(templateSource).toContain('class="asset-cell-content"');
-    expect(templateSource).toContain('class="status-cell-content"');
-    expect(templateSource).toMatch(/\.asset-cell,\s*[\s\S]*\.status-cell\s*\{[\s\S]*vertical-align:\s*middle;/);
-    expect(templateSource).toMatch(/\.asset-cell-content,\s*[\s\S]*\.status-cell-content\s*\{[\s\S]*display:\s*flex;[\s\S]*flex-direction:\s*column;[\s\S]*justify-content:\s*center;/);
+    expect(componentSource).toContain('class="asset-cell-content"');
+    expect(componentSource).toContain('class="status-cell-content"');
+    expect(componentSource).toMatch(/\.asset-cell,\s*[\s\S]*\.status-cell\s*\{[\s\S]*vertical-align:\s*middle;/);
+    expect(componentSource).toMatch(/\.asset-cell-content,\s*[\s\S]*\.status-cell-content\s*\{[\s\S]*display:\s*flex;[\s\S]*flex-direction:\s*column;[\s\S]*justify-content:\s*center;/);
+  });
+
+  it("wires the generated template through the shared SerializedTableView component", () => {
+    expect(templateSource).toContain("import { SerializedTableView } from \"@locus/components\";");
+    expect(templateSource).toContain("resolveSerializedTableSources");
+    expect(templateSource).toContain("<SerializedTableView");
+    expect(templateSource).toContain("@update:column-widths=\"persistColumnWidths\"");
+    expect(templateSource).toContain("@commit=\"commitCell\"");
   });
 });

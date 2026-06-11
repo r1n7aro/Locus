@@ -1,64 +1,79 @@
 pub(super) fn app_vue(_name: &str) -> String {
     r##"<script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
-import { property } from "@locus/view-runtime";
-import { UnitySerializedPropertyTree } from "@locus/components";
+import { onBeforeUnmount, onMounted, ref, shallowRef } from "vue";
+import { onEditorUpdate, property } from "@locus/view-runtime";
+import type { UnityBoundPropertyTree } from "@locus/view-runtime";
 
-type BoundTree = Awaited<ReturnType<typeof property.fromPath>>;
-type BoundCommit = Parameters<BoundTree["writeCommit"]>[0];
+const statusText = ref("Reading");
+const selectionName = ref("");
+const boundTree = shallowRef<UnityBoundPropertyTree | null>(null);
 
-const statusText = ref("Ready");
-const boundTree = ref<BoundTree | null>(null);
+let unsubscribe: (() => void) | null = null;
+let selectionKey = "";
+let refreshToken = 0;
 
-const treeSource = computed(() => {
-  const tree = boundTree.value;
-  if (!tree) return null;
-  return {
-    id: tree.bindingId,
-    targetId: tree.bindingId,
-    snapshots: tree.snapshots,
-    commit: async (commit: BoundCommit) => {
-      statusText.value = "Saving";
-      await tree.writeCommit(commit, { refresh: true });
-      statusText.value = "Ready";
-    },
-  };
-});
+// drawDefaultEditor() renders the default inspector for the bound object and
+// writes commits back through the binding, so no commit wiring is needed here.
+// Use tree.require(path).draw() or propertyDrawers for custom field rendering.
+const SelectionEditor = () => boundTree.value?.drawDefaultEditor() ?? null;
 
-async function refreshSelectionName() {
+async function refreshSelection() {
+  const token = ++refreshToken;
   statusText.value = "Reading";
   try {
-    boundTree.value = await property.fromPath("selection/property/m_Name", {
-      maxDepth: 2,
+    const tree = await property.fromPath("selection", {
+      maxDepth: 3,
       maxArrayItems: 32,
     });
+    if (token !== refreshToken) return;
+    boundTree.value = tree;
     statusText.value = "Ready";
   } catch (error) {
+    if (token !== refreshToken) return;
+    boundTree.value = null;
     statusText.value = error instanceof Error ? error.message : String(error);
   }
 }
 
 onMounted(() => {
-  void refreshSelectionName();
+  void refreshSelection();
+  void onEditorUpdate((event) => {
+    const key = `${event.selection.instanceId}:${event.selection.path}`;
+    if (key === selectionKey) return;
+    selectionKey = key;
+    selectionName.value = event.selection.name;
+    void refreshSelection();
+  }).then((dispose) => {
+    unsubscribe = dispose;
+  });
+});
+
+onBeforeUnmount(() => {
+  unsubscribe?.();
+  unsubscribe = null;
 });
 </script>
 
 <template>
-  <main class="view-shell inspector-view">
+  <main class="view-shell inspector-view" data-locus-template="inspector-form">
     <header class="view-toolbar">
       <div class="toolbar-title">
         <span>Selection Inspector</span>
-        <small>{{ statusText }}</small>
+        <small>{{ selectionName ? `${selectionName} · ${statusText}` : statusText }}</small>
       </div>
-      <button type="button" @click="refreshSelectionName">Refresh</button>
+      <div class="toolbar-actions">
+        <button type="button" @click="refreshSelection">Refresh</button>
+      </div>
     </header>
 
     <section class="inspector-panel">
-      <UnitySerializedPropertyTree
-        v-if="treeSource"
-        :source="treeSource"
-      />
-      <div v-else class="inspector-state">{{ statusText }}</div>
+      <div v-if="boundTree" class="inspector-editor">
+        <SelectionEditor />
+      </div>
+      <div v-else class="inspector-state">
+        <span>{{ statusText }}</span>
+        <small>Select an object in the Unity Editor to inspect it here.</small>
+      </div>
     </section>
   </main>
 </template>
@@ -67,78 +82,17 @@ onMounted(() => {
 }
 
 pub(super) fn style_css() -> String {
-    r#":root {
-  color-scheme: light dark;
-  font-family: var(--font-ui);
-}
-
-body {
-  margin: 0;
-  background: var(--bg-color);
-  color: var(--text-color);
-  font-family: var(--font-ui);
-}
-
-html,
-body,
-#app {
-  width: 100%;
-  height: 100%;
+    super::common::style_css(
+        r#".inspector-panel {
+  flex: 1;
   min-width: 0;
   min-height: 0;
+  overflow: auto;
+  padding: 14px;
 }
 
-.view-shell {
-  min-height: 100%;
-  padding: 18px;
-  box-sizing: border-box;
-}
-
-.view-toolbar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  padding-bottom: 12px;
-  border-bottom: 1px solid var(--border-color);
-}
-
-.toolbar-title {
-  min-width: 0;
-  display: flex;
-  align-items: baseline;
-  gap: 8px;
-}
-
-.toolbar-title span {
-  font-size: 13px;
-  font-weight: 650;
-}
-
-.toolbar-title small {
-  min-width: 0;
-  color: var(--text-secondary);
-  font-size: 11px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-button {
-  min-height: 30px;
-  padding: 0 12px;
-  border: 1px solid var(--border-color);
-  border-radius: 6px;
-  background: color-mix(in srgb, var(--panel-bg) 72%, var(--sidebar-bg) 28%);
-  color: var(--text-color);
-  font: inherit;
-}
-
-.inspector-panel {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr);
-  max-width: 620px;
-  padding-top: 16px;
+.inspector-editor {
+  max-width: 680px;
 }
 
 .inspector-state {
@@ -146,8 +100,14 @@ button {
   color: var(--text-secondary);
   font-size: 12px;
 }
-"#
-    .to_string()
+
+.inspector-state small {
+  display: block;
+  margin-top: 4px;
+  font-size: 11px;
+}
+"#,
+    )
 }
 
 pub(super) fn view_api_cs() -> String {
@@ -155,6 +115,8 @@ pub(super) fn view_api_cs() -> String {
 using UnityEditor;
 using UnityEngine;
 
+// Optional View Script entry. Rename the class together with the
+// scripts[] entry in view.json when this package needs custom C# logic.
 public static class InspectorViewApi
 {
     public static object Read(object args)

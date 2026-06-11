@@ -97,10 +97,8 @@ const mode = "group";
     expect(srcdoc).toContain("--bg-color");
     expect(srcdoc).toContain(".locus-button");
     expect(srcdoc).toContain(".view-panel");
-    expect(srcdoc).toContain("script-src 'unsafe-inline'");
-    expect(srcdoc).toContain("data-locus-view-runtime");
-    expect(srcdoc).toContain("initNodeGraph");
-    expect(srcdoc).not.toContain("<script>alert(1)</script>");
+    expect(srcdoc).not.toContain("script-src");
+    expect(srcdoc).not.toContain("<script");
     expect(srcdoc).not.toContain("onclick");
     expect(srcdoc).not.toContain("onmouseover");
     expect(srcdoc).not.toContain("return false");
@@ -108,7 +106,7 @@ const mode = "group";
     expect(srcdoc).not.toContain("https://example.com");
   });
 
-  it("injects controlled runtime behavior for graph templates", () => {
+  it("keeps template previews static without injected runtime scripts", () => {
     const detail: ViewPackageDetail = {
       summary: {
         id: "graph-view",
@@ -159,8 +157,9 @@ const mode = "group";
     const srcdoc = buildViewPreviewSrcdoc(detail);
 
     expect(srcdoc).toContain('data-locus-template="node-graph"');
-    expect(srcdoc).toContain("data-locus-view-runtime");
     expect(srcdoc).toContain("data-node-id");
+    expect(srcdoc).not.toContain("data-locus-view-runtime");
+    expect(srcdoc).not.toContain("<script");
   });
 
   it("sanitizes css url references", () => {

@@ -1,51 +1,48 @@
 pub(super) fn app_vue(_name: &str) -> String {
-    r#"<template>
-  <main class="view-shell">
-    <section class="view-panel">
-      <div class="view-row">
-        <label>Context</label>
-        <span>Waiting for Unity data</span>
+    r##"<script setup lang="ts">
+import { ref } from "vue";
+
+const statusText = ref("Ready");
+</script>
+
+<template>
+  <main class="view-shell" data-locus-template="blank">
+    <header class="view-toolbar">
+      <div class="toolbar-title">
+        <span>View</span>
+        <small>{{ statusText }}</small>
       </div>
-      <div class="view-row">
-        <label>Status</label>
-        <span>Ready</span>
-      </div>
+    </header>
+
+    <section class="view-content">
+      <section class="view-panel">
+        <div class="view-row">
+          <label>Context</label>
+          <span>Waiting for data</span>
+        </div>
+        <div class="view-row">
+          <label>Status</label>
+          <span>{{ statusText }}</span>
+        </div>
+      </section>
     </section>
   </main>
 </template>
-"#
+"##
     .to_string()
 }
 
 pub(super) fn style_css() -> String {
-    r#":root {
-  color-scheme: light dark;
-  font-family: var(--font-ui);
-}
-
-body {
-  margin: 0;
-  background: var(--bg-color);
-  color: var(--text-color);
-  font-family: var(--font-ui);
-}
-
-html,
-body,
-#app {
-  width: 100%;
-  height: 100%;
+    super::common::style_css(
+        r#".view-content {
+  flex: 1;
   min-width: 0;
   min-height: 0;
-}
-
-.view-shell {
-  min-height: 100%;
   display: flex;
   flex-direction: column;
   gap: 14px;
-  padding: 20px;
-  box-sizing: border-box;
+  padding: 14px;
+  overflow: auto;
 }
 
 .view-panel {
@@ -70,6 +67,6 @@ body,
 label {
   color: var(--text-secondary);
 }
-"#
-    .to_string()
+"#,
+    )
 }

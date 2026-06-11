@@ -5,7 +5,7 @@
   "files": [
     {
       "path": "src/components/view/viewRuntime.ts",
-      "bytes": 81536
+      "bytes": 82581
     },
     {
       "path": "src/components/view/viewCompiler.ts",
@@ -21,7 +21,7 @@
     },
     {
       "path": "src/components/view/viewHostPreview.ts",
-      "bytes": 15790
+      "bytes": 7878
     },
     {
       "path": "src/components/canvas/index.ts",
@@ -66,6 +66,18 @@
     {
       "path": "src/components/graph/LocusGraphView.ts",
       "bytes": 44114
+    },
+    {
+      "path": "src/components/table/index.ts",
+      "bytes": 725
+    },
+    {
+      "path": "src/components/table/serializedTable.ts",
+      "bytes": 7981
+    },
+    {
+      "path": "src/components/table/SerializedTableView.vue",
+      "bytes": 22078
     },
     {
       "path": "src/components/icons/LucideIcon.vue",

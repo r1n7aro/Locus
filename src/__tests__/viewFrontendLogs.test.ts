@@ -56,10 +56,11 @@ describe("View frontend logs", () => {
 
   it("logs caught View template errors to the frontend console", () => {
     const serializedTable = read("src-tauri/src/view/templates/serialized_table.rs");
+    const serializedTableHelper = read("src/components/table/serializedTable.ts");
     const fieldBlocks = read("src-tauri/src/view/templates/field_blocks.rs");
     const nodeGraph = read("src-tauri/src/view/templates/node_graph.rs");
 
-    expect(serializedTable).toContain("console.error(`[serialized-table] Source provider failed: ${label}`, error);");
+    expect(serializedTableHelper).toContain("console.error(`[serialized-table] Source provider failed: ${label}`, error);");
     expect(serializedTable).toContain('console.error("[serialized-table] Read failed", error);');
     expect(serializedTable).toContain('console.error("[serialized-table] Write failed", error);');
     expect(fieldBlocks).toContain('console.error("[field-blocks] Read failed", error);');
@@ -72,6 +73,7 @@ describe("View frontend logs", () => {
     const runtime = read("src-tauri/src/view.rs");
     const canvas = read("src/components/canvas/LocusCanvasView.ts");
     const serializedTable = read("src-tauri/src/view/templates/serialized_table.rs");
+    const serializedTableView = read("src/components/table/SerializedTableView.vue");
 
     expect(runtime).toContain("let retry_interval = Duration::from_millis(200)");
     expect(runtime).toContain("window.emit(VIEW_AUTOMATION_REQUEST_EVENT, event.clone())");
@@ -81,6 +83,7 @@ describe("View frontend logs", () => {
     expect(host).toContain("function dispatchDragSequence");
     expect(host).toContain("new PointerEvent");
     expect(canvas).toContain("function trySetPointerCapture");
-    expect(serializedTable).toContain("Synthetic View automation pointer events");
+    expect(serializedTable).toContain("<SerializedTableView");
+    expect(serializedTableView).toContain("Synthetic View automation pointer events");
   });
 });

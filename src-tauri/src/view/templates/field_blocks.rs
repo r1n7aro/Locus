@@ -2,9 +2,11 @@ pub(super) fn app_vue(_name: &str) -> String {
     r##"<script setup lang="ts">
 import { onMounted, ref } from "vue";
 import { property } from "@locus/view-runtime";
+import type { UnitySerializedPropertySnapshot } from "@locus/view-runtime";
 import { CanvasView, UnityPropertyEditor, UnitySerializedPropertyTree } from "@locus/components";
+import type { CanvasViewExpose } from "@locus/components";
 
-type PropertyTarget = Parameters<typeof property.readProperty>[0];
+type PropertyTarget = Exclude<Parameters<typeof property.readProperty>[0], string>;
 
 interface FieldBinding {
   id: string;
@@ -13,7 +15,7 @@ interface FieldBinding {
   valueType: string;
   value: unknown;
   displayValue: string;
-  property: Record<string, unknown> | null;
+  property: UnitySerializedPropertySnapshot | null;
   editable: boolean;
   status: string;
   error: string;
@@ -30,7 +32,22 @@ interface FieldBlock {
   fields: FieldBinding[];
 }
 
-const canvasRef = ref(null);
+function selectionNameField(): FieldBinding {
+  return {
+    id: "name",
+    label: "Name",
+    target: { kind: "selection", propertyPath: "m_Name" },
+    valueType: "String",
+    value: "",
+    displayValue: "",
+    property: null,
+    editable: true,
+    status: "Idle",
+    error: "",
+  };
+}
+
+const canvasRef = ref<CanvasViewExpose | null>(null);
 const selectedBlockId = ref("selection");
 const loading = ref(false);
 const statusText = ref("Ready");
@@ -43,20 +60,7 @@ const blocks = ref<FieldBlock[]>([
     y: 80,
     width: 330,
     height: 164,
-    fields: [
-      {
-        id: "name",
-        label: "Name",
-        target: { kind: "selection", propertyPath: "m_Name" },
-        valueType: "String",
-        value: "",
-        displayValue: "",
-        property: null,
-        editable: true,
-        status: "Idle",
-        error: "",
-      },
-    ],
+    fields: [selectionNameField()],
   },
 ]);
 
@@ -65,16 +69,14 @@ function blockClass(_block: FieldBlock, selected: boolean) {
 }
 
 function fitCanvas() {
-  canvasRef.value?.fitContent?.();
+  canvasRef.value?.fitContent();
 }
 
 function fieldTarget(field: FieldBinding, propertyPath = ""): PropertyTarget {
-  return propertyPath
-    ? { ...(field.target as Record<string, unknown>), propertyPath } as PropertyTarget
-    : field.target;
+  return propertyPath ? { ...field.target, propertyPath } : field.target;
 }
 
-function applySnapshotToField(field: FieldBinding, snapshot: Record<string, unknown>) {
+function applySnapshotToField(field: FieldBinding, snapshot: UnitySerializedPropertySnapshot) {
   field.valueType = String(snapshot.valueType || field.valueType);
   field.value = snapshot.value;
   field.displayValue = String(snapshot.displayValue ?? snapshot.value ?? "");
@@ -86,10 +88,9 @@ async function readField(field: FieldBinding) {
   field.status = "Reading";
   field.error = "";
   try {
-    const result = await property.readProperty(fieldTarget(field));
-    const snapshot = result.raw.snapshot as Record<string, unknown>;
-    applySnapshotToField(field, snapshot);
-    field.status = String(snapshot.message || "Ready");
+    const bound = await property.readProperty(fieldTarget(field));
+    applySnapshotToField(field, bound.raw.snapshot as UnitySerializedPropertySnapshot);
+    field.status = "Ready";
   } catch (error) {
     field.status = "Error";
     field.error = error instanceof Error ? error.message : String(error);
@@ -118,11 +119,8 @@ async function commitField(field: FieldBinding, value: unknown, propertyPath = "
   field.error = "";
   try {
     const result = await property.write(fieldTarget(field, propertyPath), value);
-    const snapshot = propertyPath
-      ? (await property.readProperty(fieldTarget(field))).raw.snapshot as Record<string, unknown>
-      : result as unknown as Record<string, unknown>;
-    applySnapshotToField(field, snapshot);
-    field.status = result.saved ? "Saved" : result.message || "Ready";
+    await readField(field);
+    field.status = result.saved ? "Saved" : field.status;
     statusText.value = "Saved";
   } catch (error) {
     field.status = "Error";
@@ -136,28 +134,13 @@ async function commitFieldProperty(field: FieldBinding, event: { propertyPath: s
   await commitField(field, event.value, event.propertyPath);
 }
 
-function usesPropertyTree(field: FieldBinding) {
-  const property = field.property;
-  if (!property) return false;
-  return !!property.isArray
-    || !!property.isManagedReference
-    || !!property.isFlagsEnum
-    || (Array.isArray(property.children) && property.children.length > 0);
-}
-
-function propertyArray(field: FieldBinding, key: string): unknown[] {
-  const value = field.property?.[key];
-  return Array.isArray(value) ? value : [];
-}
-
-function propertyNumber(field: FieldBinding, key: string, fallback = 0): number {
-  const value = Number(field.property?.[key]);
-  return Number.isFinite(value) ? value : fallback;
-}
-
-function propertyString(field: FieldBinding, key: string, fallback = ""): string {
-  const value = field.property?.[key];
-  return typeof value === "string" ? value : fallback;
+function usesPropertyTree(field: FieldBinding): boolean {
+  const snapshot = field.property;
+  if (!snapshot) return false;
+  return !!snapshot.isArray
+    || !!snapshot.isManagedReference
+    || !!snapshot.isFlagsEnum
+    || (snapshot.children?.length ?? 0) > 0;
 }
 
 function addSelectionNameBlock() {
@@ -171,20 +154,7 @@ function addSelectionNameBlock() {
     y: 130 + index * 34,
     width: 330,
     height: 164,
-    fields: [
-      {
-        id: "name",
-        label: "Name",
-        target: { kind: "selection", propertyPath: "m_Name" },
-        valueType: "String",
-        value: "",
-        displayValue: "",
-        property: null,
-        editable: true,
-        status: "Idle",
-        error: "",
-      },
-    ],
+    fields: [selectionNameField()],
   });
   selectedBlockId.value = id;
 }
@@ -237,13 +207,13 @@ onMounted(() => {
               :display-value="field.displayValue"
               :editable="field.editable"
               :disabled="field.status === 'Saving'"
-              :enum-options="propertyArray(field, 'enumOptions')"
+              :enum-options="field.property?.enumOptions ?? []"
               :is-flags-enum="!!field.property?.isFlagsEnum"
-              :enum-value-index="propertyNumber(field, 'enumValueIndex', -1)"
-              :enum-value-flag="propertyNumber(field, 'enumValueFlag')"
-              :reference-type-full-name="propertyString(field, 'referenceTypeFullName')"
-              :reference-type-assembly="propertyString(field, 'referenceTypeAssembly')"
-              :title="String(field.target.propertyPath || '')"
+              :enum-value-index="field.property?.enumValueIndex ?? -1"
+              :enum-value-flag="field.property?.enumValueFlag ?? 0"
+              :reference-type-full-name="field.property?.referenceTypeFullName ?? ''"
+              :reference-type-assembly="field.property?.referenceTypeAssembly ?? ''"
+              :title="field.target.propertyPath || ''"
               @commit="commitField(field, $event)"
             />
             <small class="field-status" :class="{ error: !!field.error }">
@@ -260,89 +230,8 @@ onMounted(() => {
 }
 
 pub(super) fn style_css() -> String {
-    r#":root {
-  color-scheme: light dark;
-  font-family: var(--font-ui);
-}
-
-body {
-  margin: 0;
-  background: var(--bg-color);
-  color: var(--text-color);
-  font-family: var(--font-ui);
-}
-
-html,
-body,
-#app {
-  width: 100%;
-  height: 100%;
-  min-width: 0;
-  min-height: 0;
-}
-
-.view-shell {
-  width: 100%;
-  height: 100%;
-  min-width: 0;
-  min-height: 0;
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
-  background: var(--bg-color);
-}
-
-.view-toolbar {
-  min-height: 42px;
-  flex-shrink: 0;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 0 10px 0 12px;
-  border-bottom: 1px solid var(--border-color);
-  background: color-mix(in srgb, var(--panel-bg) 88%, var(--bg-color) 12%);
-}
-
-.toolbar-title {
-  min-width: 0;
-  display: flex;
-  align-items: baseline;
-  gap: 8px;
-}
-
-.toolbar-title span {
-  font-size: 13px;
-  font-weight: 650;
-}
-
-.toolbar-title small {
-  color: var(--text-secondary);
-  font-size: 11px;
-}
-
-.toolbar-actions {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-
-button {
-  min-height: 28px;
-  padding: 0 9px;
-  border: 1px solid var(--border-color);
-  border-radius: 6px;
-  background: color-mix(in srgb, var(--panel-bg) 72%, var(--sidebar-bg) 28%);
-  color: var(--text-color);
-  font: inherit;
-  font-size: 12px;
-}
-
-button:disabled {
-  opacity: 0.58;
-}
-
-.field-blocks-view > .locus-canvas-view {
+    super::common::style_css(
+        r#".field-blocks-view > .locus-canvas-view {
   flex: 1;
   min-height: 0;
 }
@@ -426,6 +315,6 @@ button:disabled {
 .field-status.error {
   color: var(--status-danger-fg);
 }
-"#
-    .to_string()
+"#,
+    )
 }

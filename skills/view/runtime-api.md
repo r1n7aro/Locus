@@ -32,6 +32,7 @@ Use this when building a Locus View package. Prefer `@locus/view-runtime` for se
 - `objectReferencePicker`: `roots`, `searchQuery`, `filterResults`, `isResult`, `typeHint`, `typeKey`, `typeRule`, `normalizePath`, `extension`.
 - Helpers: `defineView`, `useViewState`, `useViewScript`, `onEditorUpdate`, `useUnityReferenceDrag`, `useUnityAssetDropTarget`, `useLocusFileDrag`, `useLocusFileDropTarget`.
 - Graph helpers: `GraphViewController`, `defineGraphView`, `layoutGraphDocument`.
+- Serialized table helpers: `resolveSerializedTableSources`, `serializedTableSourcesFromAssets`, `normalizeSerializedTableSource`, `dedupeSerializedTableSources` (feed `SerializedTableView` from manual sources plus scripted providers).
 
 Legacy globals are still installed as `window.locus.view` and `window.locus.unity`.
 
@@ -92,9 +93,11 @@ These are also available from `@locus/view-runtime` for custom renderers and adv
 `@locus/components` exposes:
 
 - `BaseButton`, `BaseCheckbox`, `BaseDropdown`, `BaseSegmented`, `BaseSwitch`.
-- `CanvasView`, `GraphView`.
+- `CanvasView`, `GraphView`, `SerializedTableView`.
 - `UnityBoolField`, `UnityColorField`, `UnityEnumField`, `UnityFlagsField`, `UnityLayerMaskField`, `UnityNumberField`, `UnityObjectReferenceField`, `UnityPropertyDraw`, `UnityPropertyEditor`, `UnitySerializedPropertyTree`, `UnityVectorField`.
 - `UnityObjectPreview`, `UnityReferenceChip`, `UnityDropZone`.
+
+`SerializedTableView` renders rows of Unity serialized cells with resizable persisted columns, a progress/status bar, and per-cell editors. Props: `columns`, `rows`, `loading`, `status`, `error`, `progress`, `savingCellKey`, `sourceCount`, `columnWidths` (v-model). Events: `commit` (`SerializedTableCommitEvent`), `update:columnWidths`. The `serialized-table` template shows the full wiring against a `SerializedTableApi` C# script.
 
 ## Agent Tools
 

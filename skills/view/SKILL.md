@@ -40,7 +40,7 @@ Use this workflow when the user asks for a Locus View or a frontend-built Unity 
 
 3. Edit only inside the returned `packageRoot`.
    - Manifest `view.json` owns `id`, `name`, `template`, `apiVersion`, entry/style paths, scripts, capabilities, and requirements. Keep every path package-relative with forward slashes; never write absolute Unity project paths.
-   - Main UI: `src/App.vue`. Entry: `src/main.ts`. Shared state: `src/store.ts`. Styles: `src/style.css`. Optional Unity script: `unity/ViewApi.cs`. Additional modules may be created under `packageRoot` as needed.
+   - Main UI: `src/App.vue`. Entry: `src/main.ts`. Styles: `src/style.css` (template styles extend a shared base block — keep it and append rules). Optional Unity script: `unity/ViewApi.cs`. Additional modules (for example a `src/store.ts` for shared state) may be created under `packageRoot` as needed.
    - Code shared across Views in the same workspace lives in the workspace `src/` and is imported as `@locus/project-view`.
 
 4. Resolve API details through the stable View contract, in this order:
