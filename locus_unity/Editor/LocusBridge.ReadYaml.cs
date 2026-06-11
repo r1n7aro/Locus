@@ -133,6 +133,14 @@ namespace Locus
             string objectPath = string.IsNullOrEmpty(args.object_path) ? null : args.object_path;
             var options = ReadYamlOptions.FromArgs(args);
 
+            // Search-mode field matching must reach nested serialized data —
+            // UnityEvent bindings live at m_OnClick.m_PersistentCalls
+            // .m_Calls[i].m_MethodName (depth 4), which the shallow display
+            // default (2) never reaches. Matching only compares strings, so
+            // the hard cap is affordable here.
+            if (mode == UnityYamlModeSearch && args.max_field_depth <= 0)
+                options.SerializedFieldMaxDepth = HardSerializedFieldMaxDepth;
+
             if (mode == UnityYamlModeRead && string.IsNullOrEmpty(objectPath))
                 return "__ERROR__: unity_yaml_read requires object_path for .unity/.prefab files";
             if (mode == UnityYamlModeSearch && !options.HasSearchFilters)
