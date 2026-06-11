@@ -121,7 +121,7 @@ describe("View sidebar settings", () => {
     expect(viewPage).toContain(":data-view-node-kind=\"entry.row.node.kind\"");
     expect(viewPage).toContain("@contextmenu.prevent.stop=\"openTreeContextMenu($event, entry.row)\"");
     expect(viewPage).toContain("@drop=\"onTreeFolderDrop(entry.row, $event)\"");
-    expect(viewPage).toContain("v-else-if=\"entry.row.node.kind === 'folder' || entry.row.depth > 0\"");
+    expect(viewPage).toContain("v-else-if=\"entry.row.depth > 0\"");
     expect(viewPage).toContain("class=\"view-tree-row-actions\"");
     expect(viewPage).toContain("@click.stop=\"openTreeView(entry.row)\"");
     expect(viewPage).toContain(".view-tree-row-shell:hover .view-tree-row-actions");
