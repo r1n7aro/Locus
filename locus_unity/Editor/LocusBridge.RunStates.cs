@@ -2446,48 +2446,175 @@ namespace Locus
                     return ErrorResponse(requestId, "run_states compilation exception: " + ex.Message);
                 }
 
-                var completion = new TaskCompletionSource<RunStatesCompletion>();
-                PostToMainThread(delegate
-                {
-                    try
-                    {
-                        if (_activeRunStatesSession != null)
-                        {
-                            completion.TrySetResult(new RunStatesCompletion(false, "A unity_run_states session is already running."));
-                            return;
-                        }
-
-                        string statusError = ValidateRunStatesEditorStatus(request.request_editor_status);
-                        if (!string.IsNullOrEmpty(statusError))
-                        {
-                            completion.TrySetResult(new RunStatesCompletion(false, statusError));
-                            return;
-                        }
-
-                        RuntimeStateMachineDefinition definition = compiled.Builder();
-                        if (!definition.ContainsState(initialState))
-                        {
-                            completion.TrySetResult(new RunStatesCompletion(false, "Initial state not found: " + initialState));
-                            return;
-                        }
-
-                        _activeRunStatesSession = new RuntimeStateMachineSession(definition, initialState, completion);
-                    }
-                    catch (Exception ex)
-                    {
-                        completion.TrySetResult(new RunStatesCompletion(false, "run_states bootstrap failed: " + ex));
-                    }
-                });
-
-                RunStatesCompletion result = await completion.Task;
-                if (result.Ok)
-                    return OkResponse(requestId, result.Message);
-                return ErrorResponse(requestId, result.Message);
+                return await RunCompiledRunStatesAsync(
+                    requestId,
+                    compiled,
+                    request.request_editor_status,
+                    initialState);
             }
             finally
             {
                 _runStatesLock.Release();
             }
+        }
+
+        // ───────────────── run_states_loaded (compile-server sidecar) ─────────────────
+
+        [Serializable]
+        private sealed class RunStatesLoadedRequest
+        {
+            public string assembly_b64;
+            public string entry_type;
+            public string request_editor_status;
+            public string initial_state;
+        }
+
+        /// <summary>
+        /// Sidecar variant of run_states: the state machine was already
+        /// compiled by the Locus compile server; load the assembly bytes and
+        /// run the same session pipeline as the in-Unity compile path.
+        /// </summary>
+        private static async Task<PipeEnvelope> HandleRunStatesLoaded(string requestId, string requestJson)
+        {
+            if (string.IsNullOrWhiteSpace(requestJson))
+                return ErrorResponse(requestId, "empty run_states_loaded request");
+
+            RunStatesLoadedRequest request;
+            try
+            {
+                request = JsonUtility.FromJson<RunStatesLoadedRequest>(requestJson);
+            }
+            catch (Exception ex)
+            {
+                return ErrorResponse(requestId, "run_states_loaded request parse failed: " + ex.Message);
+            }
+
+            if (request == null || string.IsNullOrEmpty(request.assembly_b64))
+                return ErrorResponse(requestId, "run_states_loaded request missing assembly bytes");
+            if (string.IsNullOrWhiteSpace(request.initial_state))
+                return ErrorResponse(requestId, "initial_state is required");
+
+            byte[] assemblyBytes;
+            try
+            {
+                assemblyBytes = Convert.FromBase64String(request.assembly_b64);
+            }
+            catch (Exception ex)
+            {
+                return ErrorResponse(requestId, "run_states_loaded assembly decode failed: " + ex.Message);
+            }
+
+            string entryTypeName = string.IsNullOrEmpty(request.entry_type)
+                ? "Locus.RuntimeStateMachines.__LocusRunStatesHost"
+                : request.entry_type;
+
+            await _runStatesLock.WaitAsync();
+            try
+            {
+                CompiledRunStates compiled;
+                try
+                {
+                    compiled = LoadCompiledRunStates(assemblyBytes, entryTypeName);
+                }
+                catch (Exception ex)
+                {
+                    return ErrorResponse(requestId, "run_states compilation exception: " + ex.Message);
+                }
+
+                return await RunCompiledRunStatesAsync(
+                    requestId,
+                    compiled,
+                    request.request_editor_status,
+                    request.initial_state.Trim());
+            }
+            finally
+            {
+                _runStatesLock.Release();
+            }
+        }
+
+        /// <summary>
+        /// Load a sidecar-compiled run_states assembly and bind its Build
+        /// entry point. Mirrors the load section of CompileRunStates,
+        /// including error wording.
+        /// </summary>
+        private static CompiledRunStates LoadCompiledRunStates(byte[] assemblyBytes, string entryTypeName)
+        {
+            try
+            {
+                Assembly assembly = Assembly.Load(assemblyBytes);
+
+                Type hostType = assembly.GetType(entryTypeName, true);
+                MethodInfo buildMethod = hostType.GetMethod(
+                    "Build",
+                    BindingFlags.Public | BindingFlags.Static
+                );
+
+                if (buildMethod == null)
+                    throw new Exception("compiled state machine missing Build method");
+
+                Func<RuntimeStateMachineDefinition> builder =
+                    (Func<RuntimeStateMachineDefinition>)Delegate.CreateDelegate(
+                        typeof(Func<RuntimeStateMachineDefinition>),
+                        buildMethod
+                    );
+
+                return new CompiledRunStates(builder);
+            }
+            catch (Exception ex)
+            {
+                throw new Exception("assembly load/bootstrap failed: " + ex);
+            }
+        }
+
+        /// <summary>
+        /// Shared run_states / run_states_loaded session bootstrap: validate
+        /// editor status on the main thread, build the definition, and hand
+        /// it to a RuntimeStateMachineSession.
+        /// </summary>
+        private static async Task<PipeEnvelope> RunCompiledRunStatesAsync(
+            string requestId,
+            CompiledRunStates compiled,
+            string requestedEditorStatus,
+            string initialState)
+        {
+            var completion = new TaskCompletionSource<RunStatesCompletion>();
+            PostToMainThread(delegate
+            {
+                try
+                {
+                    if (_activeRunStatesSession != null)
+                    {
+                        completion.TrySetResult(new RunStatesCompletion(false, "A unity_run_states session is already running."));
+                        return;
+                    }
+
+                    string statusError = ValidateRunStatesEditorStatus(requestedEditorStatus);
+                    if (!string.IsNullOrEmpty(statusError))
+                    {
+                        completion.TrySetResult(new RunStatesCompletion(false, statusError));
+                        return;
+                    }
+
+                    RuntimeStateMachineDefinition definition = compiled.Builder();
+                    if (!definition.ContainsState(initialState))
+                    {
+                        completion.TrySetResult(new RunStatesCompletion(false, "Initial state not found: " + initialState));
+                        return;
+                    }
+
+                    _activeRunStatesSession = new RuntimeStateMachineSession(definition, initialState, completion);
+                }
+                catch (Exception ex)
+                {
+                    completion.TrySetResult(new RunStatesCompletion(false, "run_states bootstrap failed: " + ex));
+                }
+            });
+
+            RunStatesCompletion result = await completion.Task;
+            if (result.Ok)
+                return OkResponse(requestId, result.Message);
+            return ErrorResponse(requestId, result.Message);
         }
 
         private static string ValidateRunStatesRequest(RunStatesRequest request)

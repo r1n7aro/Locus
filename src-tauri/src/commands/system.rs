@@ -119,6 +119,7 @@ pub(crate) fn exit_app(app_handle: &AppHandle) {
         eprintln!("[Locus] failed to restore Unity background hook before exit: {error}");
     }
     crate::csharp_lsp::kill_active_server_for_exit();
+    crate::csharp_compile::kill_active_server_for_exit();
     crate::commands::destroy_unity_embed_control_window_on_main(app_handle);
     app_handle.exit(0);
 }

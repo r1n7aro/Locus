@@ -192,6 +192,11 @@ pub async fn invalidate_cached_type_index(project_path: &str) {
     let key = normalize_project_key(project_path);
     type_index_cache().lock().await.remove(&key);
 
+    // The sidecar compile params (reference paths + fingerprint) go stale at
+    // exactly the same moments as the type index: recompiles and domain
+    // reloads. Drop them together so the next sidecar compile re-syncs.
+    crate::csharp_compile::params::invalidate(project_path).await;
+
     for path in [
         type_index_cache_path(project_path),
         legacy_type_index_cache_path(project_path),

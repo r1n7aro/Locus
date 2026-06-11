@@ -1,4 +1,4 @@
-import type { CodeAnalysisToolsConfig, CsharpLspStatus } from "../types";
+import type { CodeAnalysisToolsConfig, CsharpCompileStatus, CsharpLspStatus } from "../types";
 import { ipcInvoke } from "./ipc";
 import { getLocusRuntime, type RuntimeUnsubscribe } from "./locusRuntime";
 
@@ -41,6 +41,22 @@ export function codeAnalysisToolsSetConfig(
     "code_analysis_tools_set_config",
     { value },
     { operation: "codeAnalysisToolsSetConfig", notify: false, throwOnError: true },
+  );
+}
+
+export function unitySidecarCompilerGetStatus(): Promise<CsharpCompileStatus> {
+  return ipcInvoke<CsharpCompileStatus>("unity_sidecar_compiler_get_status", undefined, {
+    operation: "unitySidecarCompilerGetStatus",
+    notify: false,
+    throwOnError: true,
+  });
+}
+
+export function unitySidecarCompilerSetEnabled(value: boolean): Promise<CsharpCompileStatus> {
+  return ipcInvoke<CsharpCompileStatus>(
+    "unity_sidecar_compiler_set_enabled",
+    { value },
+    { operation: "unitySidecarCompilerSetEnabled", notify: false, throwOnError: true },
   );
 }
 

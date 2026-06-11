@@ -1340,6 +1340,56 @@ fn rewrite_run_states_output_for_size(
     Ok(build_run_states_large_summary(&output, stats, Some(&path)))
 }
 
+/// Compile a prepared unity_run_states request in the sidecar and build the
+/// `run_states_loaded` payload. Compile-stage error wording mirrors the
+/// Unity-side `HandleRunStates`/`HandleCompileRunStates`
+/// ("run_states compilation exception: " + message); validation messages
+/// pass through verbatim, as Unity returns them unprefixed.
+async fn sidecar_compile_for_run_states(
+    project_path: &str,
+    prepared_request: &serde_json::Value,
+    register_image: bool,
+) -> SidecarCompileAttempt {
+    let params = match sidecar_compile_params(project_path).await {
+        Ok(params) => params,
+        Err(reason) => return SidecarCompileAttempt::Unavailable(reason),
+    };
+
+    match crate::csharp_compile::compile_run_states(
+        &params,
+        prepared_request,
+        false,
+        register_image,
+    )
+    .await
+    {
+        Ok(Ok(assembly)) => {
+            let payload = serde_json::json!({
+                "assembly_b64": assembly.assembly_b64,
+                "entry_type": assembly
+                    .entry_type
+                    .unwrap_or_else(|| RUN_STATES_ENTRY_TYPE_FALLBACK.to_string()),
+                "request_editor_status": prepared_request
+                    .get("request_editor_status")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(""),
+                "initial_state": prepared_request
+                    .get("initial_state")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(""),
+            })
+            .to_string();
+            SidecarCompileAttempt::Compiled { payload }
+        }
+        Ok(Err(failure)) => SidecarCompileAttempt::CompileError(if failure.stage == "validation" {
+            failure.message
+        } else {
+            format!("run_states compilation exception: {}", failure.message)
+        }),
+        Err(error) => SidecarCompileAttempt::Unavailable(error),
+    }
+}
+
 pub async fn unity_run_states(
     project_path: &str,
     request: &serde_json::Value,
@@ -1347,9 +1397,37 @@ pub async fn unity_run_states(
     requested_run_states_editor_status(request)?;
 
     let prepared = prepare_unity_run_states_request_for_send(project_path, request).await;
-    let payload = serde_json::to_string(&prepared.request)
+
+    let mut msg_type = "run_states";
+    let mut payload = serde_json::to_string(&prepared.request)
         .map_err(|error| format!("Failed to serialize unity_run_states request: {}", error))?;
-    let resp = send_message_without_timeout(project_path, "run_states", &payload).await?;
+    if crate::csharp_compile::is_enabled() {
+        match sidecar_compile_for_run_states(project_path, &prepared.request, true).await {
+            SidecarCompileAttempt::Compiled { payload: loaded } => {
+                msg_type = "run_states_loaded";
+                payload = loaded;
+            }
+            SidecarCompileAttempt::CompileError(message) => {
+                return Err(crate::unity_type_index::append_auto_using_notes(
+                    message,
+                    &prepared.prepared_code,
+                ));
+            }
+            SidecarCompileAttempt::Unavailable(reason) => {
+                crate::csharp_compile::note_fallback(&reason);
+            }
+        }
+    }
+
+    let mut resp = send_message_without_timeout(project_path, msg_type, &payload).await?;
+    if msg_type == "run_states_loaded" && unity_plugin_lacks_message(&resp) {
+        crate::csharp_compile::note_fallback(
+            "Unity plugin lacks run_states_loaded; update the Locus Unity plugin",
+        );
+        let legacy_payload = serde_json::to_string(&prepared.request)
+            .map_err(|error| format!("Failed to serialize unity_run_states request: {}", error))?;
+        resp = send_message_without_timeout(project_path, "run_states", &legacy_payload).await?;
+    }
     let output = if resp.ok {
         resp.message.unwrap_or_default()
     } else {
@@ -1384,6 +1462,28 @@ pub async fn compile_run_states(
     requested_run_states_editor_status(request)?;
 
     let prepared = prepare_unity_run_states_request_for_send(project_path, request).await;
+
+    // Pre-check in the sidecar when available: compile errors come back
+    // without occupying the Unity Editor (only the cheap params roundtrip
+    // touches it). The pre-check image is never loaded into Unity, so it
+    // must not enter the session image registry.
+    if crate::csharp_compile::is_enabled() {
+        match sidecar_compile_for_run_states(project_path, &prepared.request, false).await {
+            SidecarCompileAttempt::Compiled { .. } => {
+                return Ok("run_states compilation ok".to_string());
+            }
+            SidecarCompileAttempt::CompileError(message) => {
+                return Err(crate::unity_type_index::append_auto_using_notes(
+                    message,
+                    &prepared.prepared_code,
+                ));
+            }
+            SidecarCompileAttempt::Unavailable(reason) => {
+                crate::csharp_compile::note_fallback(&reason);
+            }
+        }
+    }
+
     let payload = serde_json::to_string(&prepared.request).map_err(|error| {
         format!(
             "Failed to serialize unity_run_states compilation request: {}",
@@ -1962,6 +2062,77 @@ async fn prepare_unity_execute_code_for_send(
     crate::unity_type_index::prepare_unity_execute_code(code, index.as_deref())
 }
 
+// ── compile-server sidecar path (unity_execute / unity_run_states) ───
+
+/// Outcome of attempting the sidecar compile for an execute/run_states call.
+enum SidecarCompileAttempt {
+    /// Compiled: ship `payload` via the `*_loaded` pipe message.
+    Compiled { payload: String },
+    /// Deterministic compile/validation failure — surface to the agent
+    /// directly (both compile paths accept the same C#9 input, so the
+    /// legacy path would fail identically).
+    CompileError(String),
+    /// Sidecar infrastructure unavailable — use the legacy in-Unity path.
+    Unavailable(String),
+}
+
+const SNIPPET_ENTRY_TYPE_FALLBACK: &str = "Locus.RuntimeSnippets.__LocusAsyncSnippetHost";
+const RUN_STATES_ENTRY_TYPE_FALLBACK: &str = "Locus.RuntimeStateMachines.__LocusRunStatesHost";
+
+fn unity_plugin_lacks_message(resp: &PipeResponse) -> bool {
+    !resp.ok
+        && resp
+            .error
+            .as_deref()
+            .map(|error| error.starts_with("unknown message type"))
+            .unwrap_or(false)
+}
+
+async fn sidecar_compile_params(
+    project_path: &str,
+) -> Result<crate::csharp_compile::CompileParams, String> {
+    if !crate::csharp_compile::is_enabled() {
+        return Err("sidecar compiler disabled".to_string());
+    }
+    // While a recompile is in flight Unity is rewriting ScriptAssemblies;
+    // let those calls take the legacy path instead of racing the file set.
+    if unity_recompile_waiting(project_path) {
+        return Err("unity recompile in progress".to_string());
+    }
+    crate::csharp_compile::params::get_params(project_path).await
+}
+
+/// Compile a prepared unity_execute snippet in the sidecar. Error texts
+/// mirror the Unity-side `HandleExecuteCode` wording exactly ("async snippet
+/// compilation exception: " + the combined two-mode compile error).
+async fn sidecar_compile_for_execute(
+    project_path: &str,
+    prepared_code: &str,
+) -> SidecarCompileAttempt {
+    let params = match sidecar_compile_params(project_path).await {
+        Ok(params) => params,
+        Err(reason) => return SidecarCompileAttempt::Unavailable(reason),
+    };
+
+    match crate::csharp_compile::compile_snippet(&params, prepared_code, false, true).await {
+        Ok(Ok(assembly)) => {
+            let payload = serde_json::json!({
+                "assembly_b64": assembly.assembly_b64,
+                "entry_type": assembly
+                    .entry_type
+                    .unwrap_or_else(|| SNIPPET_ENTRY_TYPE_FALLBACK.to_string()),
+            })
+            .to_string();
+            SidecarCompileAttempt::Compiled { payload }
+        }
+        Ok(Err(failure)) => SidecarCompileAttempt::CompileError(format!(
+            "async snippet compilation exception: {}",
+            failure.message
+        )),
+        Err(error) => SidecarCompileAttempt::Unavailable(error),
+    }
+}
+
 async fn prepare_unity_run_states_request_for_send(
     project_path: &str,
     request: &serde_json::Value,
@@ -1998,6 +2169,31 @@ where
 
     let prepared = prepare_unity_execute_code_for_send(project_path, code).await;
 
+    let mut execute_msg_type = "execute_code";
+    let mut execute_payload = prepared.code.clone();
+    if crate::csharp_compile::is_enabled() {
+        on_progress(rust_unity_execute_progress(
+            "Compiling snippet in compile server",
+            "",
+            rust_progress_revision,
+        ));
+        rust_progress_revision += 1;
+        match sidecar_compile_for_execute(project_path, &prepared.code).await {
+            SidecarCompileAttempt::Compiled { payload } => {
+                execute_msg_type = "execute_loaded";
+                execute_payload = payload;
+            }
+            SidecarCompileAttempt::CompileError(message) => {
+                return Err(crate::unity_type_index::append_auto_using_notes(
+                    message, &prepared,
+                ));
+            }
+            SidecarCompileAttempt::Unavailable(reason) => {
+                crate::csharp_compile::note_fallback(&reason);
+            }
+        }
+    }
+
     let mut send_attempt = 1u32;
     let resp = loop {
         on_progress(rust_unity_execute_progress(
@@ -2011,7 +2207,11 @@ where
         ));
         rust_progress_revision += 1;
 
-        let execute = send_message_without_timeout(project_path, "execute_code", &prepared.code);
+        // Owned per-attempt copy: the pinned send future must not borrow
+        // `execute_payload`, which the old-plugin fallback arm reassigns.
+        let attempt_payload = execute_payload.clone();
+        let execute =
+            send_message_without_timeout(project_path, execute_msg_type, &attempt_payload);
         tokio::pin!(execute);
 
         let mut progress_tick =
@@ -2066,6 +2266,17 @@ where
         };
 
         match attempt_result {
+            // An older Unity plugin without the execute_loaded handler:
+            // retry the same request through the legacy compile path.
+            Ok(resp)
+                if execute_msg_type == "execute_loaded" && unity_plugin_lacks_message(&resp) =>
+            {
+                crate::csharp_compile::note_fallback(
+                    "Unity plugin lacks execute_loaded; update the Locus Unity plugin",
+                );
+                execute_msg_type = "execute_code";
+                execute_payload = prepared.code.clone();
+            }
             Ok(resp) => break resp,
             Err(error) if !saw_unity_progress && send_attempt == 1 => {
                 on_progress(rust_unity_execute_progress(
@@ -2142,6 +2353,35 @@ where
         _ = cancel_rx.changed() => return Err(UNITY_EXECUTE_CANCELLED.to_string()),
     };
 
+    let mut execute_msg_type = "execute_code";
+    let mut execute_payload = prepared.code.clone();
+    if crate::csharp_compile::is_enabled() {
+        on_progress(rust_unity_execute_progress(
+            "Compiling snippet in compile server",
+            "",
+            rust_progress_revision,
+        ));
+        rust_progress_revision += 1;
+        let attempt = tokio::select! {
+            attempt = sidecar_compile_for_execute(project_path, &prepared.code) => attempt,
+            _ = cancel_rx.changed() => return Err(UNITY_EXECUTE_CANCELLED.to_string()),
+        };
+        match attempt {
+            SidecarCompileAttempt::Compiled { payload } => {
+                execute_msg_type = "execute_loaded";
+                execute_payload = payload;
+            }
+            SidecarCompileAttempt::CompileError(message) => {
+                return Err(crate::unity_type_index::append_auto_using_notes(
+                    message, &prepared,
+                ));
+            }
+            SidecarCompileAttempt::Unavailable(reason) => {
+                crate::csharp_compile::note_fallback(&reason);
+            }
+        }
+    }
+
     let mut send_attempt = 1u32;
     let resp = loop {
         on_progress(rust_unity_execute_progress(
@@ -2155,7 +2395,11 @@ where
         ));
         rust_progress_revision += 1;
 
-        let execute = send_message_without_timeout(project_path, "execute_code", &prepared.code);
+        // Owned per-attempt copy: the pinned send future must not borrow
+        // `execute_payload`, which the old-plugin fallback arm reassigns.
+        let attempt_payload = execute_payload.clone();
+        let execute =
+            send_message_without_timeout(project_path, execute_msg_type, &attempt_payload);
         tokio::pin!(execute);
 
         let mut progress_tick =
@@ -2262,6 +2506,17 @@ where
         };
 
         match attempt_result {
+            // An older Unity plugin without the execute_loaded handler:
+            // retry the same request through the legacy compile path.
+            Ok(resp)
+                if execute_msg_type == "execute_loaded" && unity_plugin_lacks_message(&resp) =>
+            {
+                crate::csharp_compile::note_fallback(
+                    "Unity plugin lacks execute_loaded; update the Locus Unity plugin",
+                );
+                execute_msg_type = "execute_code";
+                execute_payload = prepared.code.clone();
+            }
             Ok(resp) => break resp,
             Err(error) if !saw_unity_progress && send_attempt == 1 => {
                 on_progress(rust_unity_execute_progress(
@@ -2510,6 +2765,10 @@ pub async fn start_unity_monitor(
             if connected {
                 if last_status != Some(true) {
                     eprintln!("[Locus] Unity Editor connected! (pipe: {})", pipe_name);
+                    // Pre-start the compile-server sidecar (and JIT-warm
+                    // Roslyn) so the first unity_execute does not pay the
+                    // cold-start cost. No-op while the feature is off.
+                    crate::csharp_compile::warm_up_in_background();
                 }
                 disconnected_attempts = 0;
             } else {

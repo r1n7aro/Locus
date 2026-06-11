@@ -19,6 +19,7 @@ mod commands;
 mod compact;
 mod config;
 pub mod config_registry;
+pub mod csharp_compile;
 pub mod csharp_lsp;
 pub(crate) mod diff;
 pub mod dotnet_runtime;
@@ -398,6 +399,7 @@ pub fn run() {
             let config = Arc::new(loaded_config);
             unity_bridge::initialize_background_hook(config.unity_background_hook_enabled());
             csharp_lsp::initialize(config.csharp_lsp_enabled(), app.handle().clone());
+            csharp_compile::initialize(config.unity_sidecar_compiler_enabled());
             code_tools::initialize(config.code_analysis_tools());
             startup_for_setup.mark("setup_config_ready");
 
@@ -1246,6 +1248,8 @@ pub fn run() {
             commands::csharp_lsp_get_status,
             commands::csharp_lsp_set_enabled,
             commands::csharp_lsp_restart,
+            commands::unity_sidecar_compiler_get_status,
+            commands::unity_sidecar_compiler_set_enabled,
             commands::code_analysis_tools_get_config,
             commands::code_analysis_tools_set_config,
             commands::get_view_windows_above_main,

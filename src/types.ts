@@ -115,6 +115,20 @@ export interface CsharpLspStatus {
   uptimeSecs?: number | null;
 }
 
+/** Status of the CoreCLR compile-server sidecar that compiles unity_execute /
+ * unity_run_states snippets outside the Unity Editor (camelCase mirror of the
+ * Rust `CsharpCompileStatusPayload`). */
+export interface CsharpCompileStatus {
+  enabled: boolean;
+  platformSupported: boolean;
+  serverAvailable: boolean;
+  running: boolean;
+  roslynVersion?: string | null;
+  dotnetSource?: string | null;
+  uptimeSecs?: number | null;
+  lastError?: string | null;
+}
+
 /** Per-tool switches for the code-analysis tool family (camelCase mirror of
  * the Rust `CodeAnalysisToolsConfig`). `unityAnalyzers` is not a tool: it
  * injects Microsoft.Unity.Analyzers into the Roslyn language server. */

@@ -48,6 +48,7 @@
       "./gen/licenses-bundle": "licenses/third_party/",
       "./gen/ort-runtime": "ort-runtime/",
       "./gen/gh-runtime": "gh-runtime/",
+      "./gen/compile-server": "compile-server/",
       "../agent": "agent/",
       "../knowledge": "knowledge/",
       "../skills": "skills/",

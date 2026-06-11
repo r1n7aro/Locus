@@ -367,6 +367,121 @@ namespace Locus
             if (string.IsNullOrWhiteSpace(code))
                 return ErrorResponse(requestId, "empty code");
 
+            return await ExecuteSnippetRequestAsync(
+                requestId,
+                prepareCompiler: true,
+                compileStage: "Compiling snippet",
+                compile: delegate { return CompileAsyncSnippet(code); });
+        }
+
+        // ───────────────── execute_loaded (compile-server sidecar) ─────────────────
+
+        [Serializable]
+        private sealed class ExecuteLoadedRequest
+        {
+            public string assembly_b64;
+            public string entry_type;
+        }
+
+        /// <summary>
+        /// Sidecar variant of execute_code: the snippet was already compiled
+        /// by the Locus compile server; load the assembly bytes and run the
+        /// entry point through the same execution pipeline (progress,
+        /// heartbeat, cancellation) as the in-Unity compile path.
+        /// </summary>
+        private static async Task<PipeEnvelope> HandleExecuteLoaded(string requestId, string requestJson)
+        {
+            if (string.IsNullOrWhiteSpace(requestJson))
+                return ErrorResponse(requestId, "empty execute_loaded request");
+
+            ExecuteLoadedRequest request;
+            try
+            {
+                request = JsonUtility.FromJson<ExecuteLoadedRequest>(requestJson);
+            }
+            catch (Exception ex)
+            {
+                return ErrorResponse(requestId, "execute_loaded request parse failed: " + ex.Message);
+            }
+
+            if (request == null || string.IsNullOrEmpty(request.assembly_b64))
+                return ErrorResponse(requestId, "execute_loaded request missing assembly bytes");
+
+            byte[] assemblyBytes;
+            try
+            {
+                assemblyBytes = Convert.FromBase64String(request.assembly_b64);
+            }
+            catch (Exception ex)
+            {
+                return ErrorResponse(requestId, "execute_loaded assembly decode failed: " + ex.Message);
+            }
+
+            string entryTypeName = string.IsNullOrEmpty(request.entry_type)
+                ? "Locus.RuntimeSnippets.__LocusAsyncSnippetHost"
+                : request.entry_type;
+
+            return await ExecuteSnippetRequestAsync(
+                requestId,
+                prepareCompiler: false,
+                compileStage: "Loading compiled snippet",
+                compile: delegate { return LoadCompiledSnippet(assemblyBytes, entryTypeName); });
+        }
+
+        /// <summary>
+        /// Load a sidecar-compiled snippet assembly and bind its entry point.
+        /// Error wording mirrors TryCompileAsyncSnippet so the agent-facing
+        /// error shape stays identical across both compile paths.
+        /// </summary>
+        private static CompiledAsyncSnippet LoadCompiledSnippet(byte[] assemblyBytes, string entryTypeName)
+        {
+            Type hostType;
+            MethodInfo executeMethod;
+            try
+            {
+                Assembly assembly = Assembly.Load(assemblyBytes);
+                hostType = assembly.GetType(entryTypeName, true);
+                executeMethod = hostType.GetMethod(
+                    "ExecuteAsync",
+                    BindingFlags.Public | BindingFlags.Static
+                );
+            }
+            catch (Exception ex)
+            {
+                throw new Exception("assembly load/bootstrap failed: " + ex);
+            }
+
+            if (executeMethod == null)
+                throw new Exception("compiled async snippet missing ExecuteAsync method");
+
+            try
+            {
+                var executor =
+                    (Func<ScriptGlobals, ExecuteCodeContext, CancellationToken, Task<object>>)
+                        Delegate.CreateDelegate(
+                            typeof(Func<ScriptGlobals, ExecuteCodeContext, CancellationToken, Task<object>>),
+                            executeMethod
+                        );
+
+                return new CompiledAsyncSnippet(executor);
+            }
+            catch (Exception ex)
+            {
+                throw new Exception("assembly load/bootstrap failed: " + ex);
+            }
+        }
+
+        /// <summary>
+        /// Shared execute_code / execute_loaded pipeline: lock, request
+        /// state, heartbeat monitor, snippet acquisition via `compile`,
+        /// main-thread execution, progress and error mapping.
+        /// </summary>
+        private static async Task<PipeEnvelope> ExecuteSnippetRequestAsync(
+            string requestId,
+            bool prepareCompiler,
+            string compileStage,
+            Func<CompiledAsyncSnippet> compile)
+        {
             if (ActiveExecuteCodeRequest == null)
                 SetExecuteCodeStage("Waiting for Unity execute lock");
 
@@ -404,26 +519,30 @@ namespace Locus
                 _ = MonitorExecuteCodeClientHeartbeatAsync(requestState);
 
                 ResetExecuteCodeProgress();
-                SetExecuteCodeStage("Checking compiler cache");
 
-                string prepareError = await EnsureExecuteCodeCompilationReadyAsync(
-                    SetExecuteCodeStage,
-                    requestState.Cancellation.Token);
-                if (!string.IsNullOrEmpty(prepareError))
+                if (prepareCompiler)
                 {
-                    requestState.ThrowIfCancellationRequested();
-                    SetExecuteCodeStage("Compiler preparation failed");
-                    return ErrorResponse(requestId, prepareError);
-                }
+                    SetExecuteCodeStage("Checking compiler cache");
 
-                requestState.ThrowIfCancellationRequested();
+                    string prepareError = await EnsureExecuteCodeCompilationReadyAsync(
+                        SetExecuteCodeStage,
+                        requestState.Cancellation.Token);
+                    if (!string.IsNullOrEmpty(prepareError))
+                    {
+                        requestState.ThrowIfCancellationRequested();
+                        SetExecuteCodeStage("Compiler preparation failed");
+                        return ErrorResponse(requestId, prepareError);
+                    }
+
+                    requestState.ThrowIfCancellationRequested();
+                }
 
                 CompiledAsyncSnippet snippet;
                 try
                 {
-                    SetExecuteCodeStage("Compiling snippet");
+                    SetExecuteCodeStage(compileStage);
                     requestState.ThrowIfCancellationRequested();
-                    snippet = CompileAsyncSnippet(code);
+                    snippet = compile();
                     requestState.ThrowIfCancellationRequested();
                 }
                 catch (OperationCanceledException)

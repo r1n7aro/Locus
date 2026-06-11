@@ -25,6 +25,28 @@ pub async fn csharp_lsp_set_enabled(
 }
 
 #[tauri::command]
+pub async fn unity_sidecar_compiler_get_status(
+) -> Result<crate::csharp_compile::CsharpCompileStatusPayload, AppError> {
+    Ok(crate::csharp_compile::status().await)
+}
+
+#[tauri::command]
+pub async fn unity_sidecar_compiler_set_enabled(
+    value: bool,
+    config: State<'_, std::sync::Arc<crate::config::AppConfig>>,
+) -> Result<crate::csharp_compile::CsharpCompileStatusPayload, AppError> {
+    config
+        .set_unity_sidecar_compiler_enabled(value)
+        .map_err(|error| AppError::new("csharp_compile.persist_failed", error))?;
+
+    crate::csharp_compile::set_enabled(value).await;
+    if value {
+        crate::csharp_compile::warm_up_in_background();
+    }
+    Ok(crate::csharp_compile::status().await)
+}
+
+#[tauri::command]
 pub async fn code_analysis_tools_get_config(
     config: State<'_, std::sync::Arc<crate::config::AppConfig>>,
 ) -> Result<crate::config::CodeAnalysisToolsConfig, AppError> {

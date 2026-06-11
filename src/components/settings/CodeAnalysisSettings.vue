@@ -9,8 +9,10 @@ import {
   csharpLspRestart,
   csharpLspSetEnabled,
   subscribeCsharpLspStatus,
+  unitySidecarCompilerGetStatus,
+  unitySidecarCompilerSetEnabled,
 } from "../../services/csharpLsp";
-import type { CodeAnalysisToolsConfig, CsharpLspStatus } from "../../types";
+import type { CodeAnalysisToolsConfig, CsharpCompileStatus, CsharpLspStatus } from "../../types";
 import { defaultCodeAnalysisToolsConfig } from "../../types";
 import type { RuntimeUnsubscribe } from "../../services/locusRuntime";
 import { normalizeAppError } from "../../services/errors";
@@ -26,6 +28,10 @@ const restartBusy = ref(false);
 const codeTools = ref<CodeAnalysisToolsConfig>(defaultCodeAnalysisToolsConfig());
 const codeToolsReady = ref(false);
 const codeToolsBusy = ref(false);
+
+const sidecarStatus = ref<CsharpCompileStatus | null>(null);
+const sidecarReady = ref(false);
+const sidecarBusy = ref(false);
 
 let unsubscribeStatus: RuntimeUnsubscribe | null = null;
 
@@ -60,6 +66,62 @@ const lspStatusLabel = computed(() => {
       return t("chat.status.code.idle");
   }
 });
+
+const sidecarEnabled = computed(() => sidecarStatus.value?.enabled ?? false);
+
+const sidecarStatusLabel = computed(() => {
+  const status = sidecarStatus.value;
+  if (!status) return t("common.loading");
+  if (!status.platformSupported) return t("settings.codeAnalysis.sidecarUnsupported");
+  if (!status.serverAvailable) return t("settings.codeAnalysis.sidecarMissing");
+  if (!status.enabled) return t("settings.codeAnalysis.sidecarOff");
+  if (status.lastError) return t("settings.codeAnalysis.sidecarError", status.lastError);
+  if (status.running) {
+    return t(
+      "settings.codeAnalysis.sidecarRunning",
+      status.roslynVersion ?? "?",
+      status.dotnetSource ?? "?",
+    );
+  }
+  return t("settings.codeAnalysis.sidecarIdle");
+});
+
+const sidecarHasIssue = computed(() => {
+  const status = sidecarStatus.value;
+  return !!status && status.enabled && !!status.lastError;
+});
+
+async function refreshSidecarStatus() {
+  try {
+    sidecarStatus.value = await unitySidecarCompilerGetStatus();
+  } catch (e) {
+    const err = normalizeAppError(e);
+    notificationStore.addNotice("error", err.message, {
+      code: err.code,
+      operation: "loadUnitySidecarCompilerStatus",
+    });
+  } finally {
+    sidecarReady.value = true;
+  }
+}
+
+async function toggleSidecarEnabled() {
+  if (!sidecarReady.value || sidecarBusy.value) return;
+  sidecarBusy.value = true;
+  try {
+    sidecarStatus.value = await unitySidecarCompilerSetEnabled(!sidecarEnabled.value);
+  } catch (e) {
+    const err = normalizeAppError(e);
+    notificationStore.addNotice("error", err.message, {
+      code: err.code,
+      operation: "toggleUnitySidecarCompiler",
+      replaceOperation: true,
+    });
+    await refreshSidecarStatus();
+  } finally {
+    sidecarBusy.value = false;
+  }
+}
 
 type CodeToolKey = keyof CodeAnalysisToolsConfig;
 
@@ -168,6 +230,7 @@ async function toggleCodeTool(key: CodeToolKey) {
 onMounted(() => {
   void refreshLspStatus();
   void refreshCodeTools();
+  void refreshSidecarStatus();
   void subscribeCsharpLspStatus((payload) => {
     lspStatus.value = payload;
   }).then((unsubscribe) => {
@@ -209,6 +272,35 @@ onUnmounted(() => {
             :disabled="lspBusy || !(lspStatus?.supported ?? true)"
             :aria-label="t('chat.status.code.title')"
             @update:model-value="toggleLspEnabled"
+          />
+          <span v-else class="switch-placeholder" aria-hidden="true" />
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="settings-section">
+    <div class="section-label">{{ t("settings.codeAnalysis.sidecar") }}</div>
+    <p class="section-desc">{{ t("settings.codeAnalysis.sidecarDesc") }}</p>
+    <div class="tool-card">
+      <div class="tool-row master-row">
+        <div class="tool-info">
+          <span class="tool-name">{{ t("settings.codeAnalysis.sidecarLabel") }}</span>
+          <span class="tool-desc" :class="{ 'status-error': sidecarHasIssue }">
+            {{ sidecarStatusLabel }}
+          </span>
+        </div>
+        <div class="master-actions">
+          <BaseSwitch
+            v-if="sidecarReady"
+            :model-value="sidecarEnabled"
+            :disabled="
+              sidecarBusy ||
+              !(sidecarStatus?.platformSupported ?? true) ||
+              !(sidecarStatus?.serverAvailable ?? true)
+            "
+            :aria-label="t('settings.codeAnalysis.sidecarLabel')"
+            @update:model-value="toggleSidecarEnabled"
           />
           <span v-else class="switch-placeholder" aria-hidden="true" />
         </div>

@@ -225,6 +225,12 @@ pub struct AppConfig {
     pub unity_background_hook_enabled: Arc<AtomicBool>,
     #[serde(default = "default_debug_flag", with = "serde_atomic_bool")]
     pub csharp_lsp_enabled: Arc<AtomicBool>,
+    /// Compile unity_execute / unity_run_states snippets in the CoreCLR
+    /// compile-server sidecar instead of inside the Unity Editor process.
+    /// Default off while the migration is being proven out; any sidecar
+    /// failure falls back to the in-Unity path at runtime regardless.
+    #[serde(default = "default_debug_flag", with = "serde_atomic_bool")]
+    pub unity_sidecar_compiler: Arc<AtomicBool>,
     #[serde(
         default = "default_code_analysis_tools",
         with = "serde_code_analysis_tools"
@@ -273,6 +279,7 @@ impl AppConfig {
             view_open_in_existing_window: default_view_open_in_existing_window(),
             unity_background_hook_enabled: default_unity_background_hook_enabled(),
             csharp_lsp_enabled: default_debug_flag(),
+            unity_sidecar_compiler: default_debug_flag(),
             code_analysis_tools: default_code_analysis_tools(),
             config_path: Arc::new(Mutex::new(Some(primary_path.to_path_buf()))),
         };
@@ -433,6 +440,15 @@ impl AppConfig {
 
     pub fn set_csharp_lsp_enabled(&self, value: bool) -> Result<(), String> {
         self.csharp_lsp_enabled.store(value, Ordering::Relaxed);
+        self.persist()
+    }
+
+    pub fn unity_sidecar_compiler_enabled(&self) -> bool {
+        self.unity_sidecar_compiler.load(Ordering::Relaxed)
+    }
+
+    pub fn set_unity_sidecar_compiler_enabled(&self, value: bool) -> Result<(), String> {
+        self.unity_sidecar_compiler.store(value, Ordering::Relaxed);
         self.persist()
     }
 

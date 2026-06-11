@@ -84,6 +84,8 @@ namespace Locus
 
         private static List<MetadataReference> _cachedMetadataReferences;
         private static bool _metadataReferencesReady;
+        private static List<string> _cachedCompileReferencePaths;
+        private static bool _compileReferencePathsReady;
         private static int _snippetAssemblyCounter;
 
         // ───────────────── Agent-controlled recompile ─────────────────
@@ -561,6 +563,8 @@ namespace Locus
             {
                 _metadataReferencesReady = false;
                 _cachedMetadataReferences = null;
+                _compileReferencePathsReady = false;
+                _cachedCompileReferencePaths = null;
             }
         }
 
@@ -1337,6 +1341,9 @@ namespace Locus
                     case "execute_code":
                         return await HandleExecuteCode(reqId, msg.message);
 
+                    case "execute_loaded":
+                        return await HandleExecuteLoaded(reqId, msg.message);
+
                     case "cancel_execute_code":
                         return HandleCancelExecuteCode(reqId);
 
@@ -1378,8 +1385,14 @@ namespace Locus
                         return await tcs.Task;
                     }
 
+                    case "get_compile_params":
+                        return await HandleGetCompileParams(reqId, msg.message);
+
                     case "run_states":
                         return await HandleRunStates(reqId, msg.message);
+
+                    case "run_states_loaded":
+                        return await HandleRunStatesLoaded(reqId, msg.message);
 
                     case "compile_run_states":
                         return await HandleCompileRunStates(reqId, msg.message);
