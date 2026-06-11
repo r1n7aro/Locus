@@ -127,7 +127,7 @@ pub(super) fn read() -> ToolDef {
                             let mut truncated_by_bytes = false;
                             let mut result_lines = Vec::new();
 
-                            for line in selected.iter() {
+                            for (index, line) in selected.iter().enumerate() {
                                 let display = if line.len() > 2000 {
                                     format!(
                                         "{}... (line truncated to 2000 chars)",
@@ -136,7 +136,9 @@ pub(super) fn read() -> ToolDef {
                                 } else {
                                     line.to_string()
                                 };
-                                let line_str = display;
+                                // cat -n style absolute line numbers so agents
+                                // can feed precise positions to code tools.
+                                let line_str = format!("{:>6}\t{}", start + index + 1, display);
                                 bytes += line_str.len() + 1;
                                 if bytes > max_bytes {
                                     truncated_by_bytes = true;

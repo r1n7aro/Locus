@@ -1224,13 +1224,14 @@ fn read_current_file_excerpt(
     let mut used_chars = 0usize;
     let mut truncated = false;
 
-    for line in selected {
+    for (index, line) in selected.iter().enumerate() {
         let line_len = line.chars().count();
         if used_chars + line_len + 1 > max_chars {
             truncated = true;
             break;
         }
-        result_lines.push((*line).to_string());
+        // Same cat -n numbering as the live read tool output.
+        result_lines.push(format!("{:>6}\t{}", start + index + 1, line));
         used_chars += line_len + 1;
     }
 

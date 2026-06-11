@@ -1,5 +1,5 @@
 {
-  "description": "Read a workspace file.\n- Text files return file content (up to 2000 lines by default)\n- Use offset and limit to page through large text files\n- PNG, JPEG, GIF, and WebP images return an image attachment; offset and limit are ignored for images\n- This tool only reads files; use list for directories\n- Do not use this tool for documents under Locus/knowledge, including Memory. Use knowledge_list, knowledge_query, or knowledge_read instead",
+  "description": "Read a workspace file.\n- Text files return file content (up to 2000 lines by default), each line prefixed with its 1-based line number in cat -n format (number, tab, content). Line numbers are display metadata: never include the number prefix or the tab in edit oldString/newString, and use them as the line argument for code_* tools\n- Use offset and limit to page through large text files; line numbers stay absolute\n- PNG, JPEG, GIF, and WebP images return an image attachment; offset and limit are ignored for images\n- This tool only reads files; use list for directories\n- Do not use this tool for documents under Locus/knowledge, including Memory. Use knowledge_list, knowledge_query, or knowledge_read instead",
   "parameters": {
     "type": "object",
     "properties": {
