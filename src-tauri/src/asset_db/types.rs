@@ -73,6 +73,23 @@ impl AssetKind {
         }
     }
 
+    /// Kind for assets whose content is never YAML-parsed, derived from the
+    /// extension alone. Returns `None` for unknown extensions — callers index
+    /// those as [`AssetKind::MetaOnly`]. Single source of truth for the
+    /// full-scan initial classification and the watcher's non-YAML branch so
+    /// the two paths can't disagree about the same file.
+    pub fn non_yaml_kind_from_ext(ext: &str) -> Option<Self> {
+        match ext {
+            "cs" => Some(Self::Script),
+            "png" | "jpg" | "jpeg" | "tga" | "psd" | "tif" | "tiff" | "bmp" | "gif" | "exr"
+            | "hdr" => Some(Self::Texture),
+            "wav" | "mp3" | "ogg" | "aif" | "aiff" => Some(Self::Audio),
+            "shader" | "cginc" | "hlsl" | "glsl" | "compute" => Some(Self::Shader),
+            "fbx" | "obj" | "blend" | "dae" | "3ds" | "max" => Some(Self::Model),
+            _ => None,
+        }
+    }
+
     pub fn from_i32(v: i32) -> Self {
         match v {
             0 => Self::Scene,

@@ -8,7 +8,7 @@ pub mod watcher;
 
 pub use db::AssetSearchRowDb;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -132,6 +132,38 @@ struct ParseFailureEntry {
     kind: ParseFailureKind,
     path: String,
     detail: String,
+}
+
+/// On-disk probe of a meta's sibling content file, captured inside the
+/// parallel meta-parse phase so the materialize loop stays stat-free.
+///
+/// `mtime_ns`/`size` describe the *content* file. They are the values the
+/// watcher's mtime/size reconcile compares against, so recording the .meta
+/// file's numbers here (as older code did) made every binary asset look
+/// permanently size-changed and re-queued the whole project after each full
+/// scan. Directories (folder assets) and missing content report 0.
+#[derive(Debug, Clone, Copy, Default)]
+struct ContentProbe {
+    exists: bool,
+    mtime_ns: u64,
+    size: u64,
+}
+
+fn probe_content_file(meta_abs_path: &Path) -> ContentProbe {
+    let asset_abs = meta_abs_path.with_extension("");
+    match std::fs::metadata(&asset_abs) {
+        Ok(metadata) if metadata.is_file() => ContentProbe {
+            exists: true,
+            mtime_ns: scanner::get_mtime_ns(&metadata),
+            size: metadata.len(),
+        },
+        Ok(_) => ContentProbe {
+            exists: true,
+            mtime_ns: 0,
+            size: 0,
+        },
+        Err(_) => ContentProbe::default(),
+    }
 }
 
 impl AssetDb {
@@ -356,7 +388,8 @@ impl AssetDb {
                     };
                     let meta_hash = hash128(&content);
                     let importer_subassets = object_index::parse_importer_subassets(&content);
-                    Ok((entry.clone(), guid, meta_hash, importer_subassets))
+                    let content_probe = probe_content_file(&entry.abs_path);
+                    Ok((entry.clone(), guid, meta_hash, importer_subassets, content_probe))
                 })();
                 let completed = meta_progress.fetch_add(1, Ordering::Relaxed) + 1;
                 maybe_emit_scan_progress(
@@ -373,10 +406,13 @@ impl AssetDb {
         let t_meta_par = phase_start.elapsed();
         let mut parse_failures = Vec::new();
         let mut meta_results = Vec::with_capacity(meta_outcomes.len());
+        // Index-aligned with `meta_results`; kept separate so the duplicate
+        // GUID report helpers keep their `(entry, guid, hash)` signature.
+        let mut content_probes: Vec<ContentProbe> = Vec::with_capacity(meta_outcomes.len());
         let mut importer_subasset_results = Vec::new();
         for outcome in meta_outcomes {
             match outcome {
-                Ok((entry, guid, meta_hash, importer_subassets)) => {
+                Ok((entry, guid, meta_hash, importer_subassets, content_probe)) => {
                     if !importer_subassets.is_empty() {
                         let asset_path = entry
                             .rel_path
@@ -386,6 +422,7 @@ impl AssetDb {
                         importer_subasset_results.push((asset_path, guid, importer_subassets));
                     }
                     meta_results.push((entry, guid, meta_hash));
+                    content_probes.push(content_probe);
                 }
                 Err(failure) => {
                     eprintln!("[AssetDb] warning: {}", failure.detail);
@@ -401,7 +438,7 @@ impl AssetDb {
         let mut file_records: Vec<(String, FileRole, u64, u64, [u8; 16], Option<Guid>)> =
             Vec::with_capacity(meta_results.len() * 2);
 
-        for (entry, guid, meta_hash) in &meta_results {
+        for ((entry, guid, meta_hash), probe) in meta_results.iter().zip(&content_probes) {
             let asset_path = entry
                 .rel_path
                 .strip_suffix(".meta")
@@ -415,26 +452,18 @@ impl AssetDb {
                 .unwrap_or_default()
                 .to_string_lossy()
                 .to_lowercase();
-            let asset_exists = self.project_root.join(&asset_path).exists();
 
-            let initial_kind = match ext.as_str() {
-                "cs" => AssetKind::Script,
-                "png" | "jpg" | "jpeg" | "tga" | "psd" | "tif" | "tiff" | "bmp" | "gif" | "exr"
-                | "hdr" => AssetKind::Texture,
-                "wav" | "mp3" | "ogg" | "aif" | "aiff" => AssetKind::Audio,
-                "shader" | "cginc" | "hlsl" | "glsl" | "compute" => AssetKind::Shader,
-                "fbx" | "obj" | "blend" | "dae" | "3ds" | "max" => AssetKind::Model,
-                _ => AssetKind::MetaOnly,
-            };
+            let initial_kind =
+                AssetKind::non_yaml_kind_from_ext(&ext).unwrap_or(AssetKind::MetaOnly);
 
             asset_nodes.push(AssetNode {
                 guid: *guid,
                 path: asset_path,
                 ext,
                 kind: initial_kind,
-                exists_on_disk: asset_exists,
-                mtime_ns: entry.mtime_ns,
-                size: entry.size,
+                exists_on_disk: probe.exists,
+                mtime_ns: entry.mtime_ns.max(probe.mtime_ns),
+                size: probe.size,
                 content_hash: [0u8; 16],
                 meta_hash: *meta_hash,
                 parser_version: 1,
@@ -559,11 +588,11 @@ impl AssetDb {
                         }
                     };
 
-                    let refs = crate::unity_yaml::extract_refs_with_resolver(
-                        &content,
-                        Some(&guid_to_path),
-                    );
-                    let docs = crate::unity_yaml::parse_yaml_docs(&content);
+                    // Single pass: docs and raw refs come from one line scan,
+                    // then the refs are resolved against the docs in place.
+                    let (docs, raw_refs) = crate::unity_yaml::parse_yaml_docs_with_refs(&content);
+                    let refs =
+                        crate::unity_yaml::build_refs_from_docs(&docs, raw_refs, Some(&guid_to_path));
                     let content_hash = hash128(&content);
                     let main_script_guid = if entry.ext.eq_ignore_ascii_case("asset") {
                         docs.iter()
@@ -622,7 +651,10 @@ impl AssetDb {
                 let node = &mut asset_nodes[idx];
                 node.kind = AssetKind::from_ext(&entry.ext);
                 node.content_hash = content_hash;
-                node.mtime_ns = entry.mtime_ns;
+                // max() instead of overwrite: the node already carries
+                // max(meta mtime, content mtime) from the probe, and the
+                // watcher's resync compares against exactly that.
+                node.mtime_ns = node.mtime_ns.max(entry.mtime_ns);
                 node.size = entry.size;
                 if node.kind == AssetKind::GenericAsset {
                     if let Some(script_guid) = main_script_guid {
@@ -688,6 +720,50 @@ impl AssetDb {
                     node,
                     importer_entries,
                 ));
+            }
+        }
+
+        // Duplicate-GUID metas produce one AssetNode per path, but `assets`
+        // is keyed by guid: letting the later INSERT OR REPLACE win would
+        // strand the earlier row's FTS entry forever (REPLACE rewrites the
+        // asset_objects rowid that the FTS row is anchored to, see
+        // `insert_asset_object`). Keep only the node `guid_to_node_idx`
+        // points at — the same winner the REPLACE would have produced — so
+        // every object_key is inserted exactly once.
+        if guid_to_node_idx.len() != asset_nodes.len() {
+            let dropped = asset_nodes.len() - guid_to_node_idx.len();
+            let mut keep = vec![false; asset_nodes.len()];
+            for &idx in guid_to_node_idx.values() {
+                keep[idx] = true;
+            }
+            let mut keep_iter = keep.iter();
+            asset_nodes.retain(|_| *keep_iter.next().unwrap());
+            eprintln!(
+                "[AssetDb] dropped {} duplicate-GUID shadow nodes before insert",
+                dropped
+            );
+        }
+
+        // Same invariant for sub-asset objects: duplicate-GUID yaml files
+        // both resolve to the winning node and can emit colliding
+        // object_keys. Keep the last occurrence to match the REPLACE
+        // semantics the insert used to apply.
+        {
+            let before = asset_objects.len();
+            let mut seen_keys: HashSet<String> = HashSet::with_capacity(asset_objects.len());
+            let mut deduped: Vec<AssetObject> = Vec::with_capacity(asset_objects.len());
+            for object in asset_objects.into_iter().rev() {
+                if seen_keys.insert(object.object_key.clone()) {
+                    deduped.push(object);
+                }
+            }
+            deduped.reverse();
+            asset_objects = deduped;
+            if asset_objects.len() != before {
+                eprintln!(
+                    "[AssetDb] dropped {} duplicate object keys before insert",
+                    before - asset_objects.len()
+                );
             }
         }
 
@@ -1980,6 +2056,122 @@ mod tests {
             "blank db should be deleted after invalidation"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn write_asset_with_guid(root: &Path, rel_asset_path: &str, content: &[u8], guid_hex: &str) {
+        let abs = root.join(rel_asset_path);
+        if let Some(parent) = abs.parent() {
+            std::fs::create_dir_all(parent).expect("create asset parent");
+        }
+        std::fs::write(&abs, content).expect("write asset");
+        std::fs::write(
+            root.join(format!("{}.meta", rel_asset_path)),
+            format!("fileFormatVersion: 2\nguid: {}\n", guid_hex),
+        )
+        .expect("write asset meta");
+    }
+
+    #[test]
+    fn full_scan_indexes_build_dirs_and_skips_unity_ignored_names() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let root = temp.path().join("project");
+        std::fs::create_dir_all(root.join("Assets")).expect("create assets dir");
+        let yaml: &[u8] = b"%YAML 1.1\n--- !u!1 &1000\nGameObject:\n  m_Name: Thing\n";
+        // `Build` only has special meaning at the project root, which is
+        // never walked — inside Assets it is a regular asset folder that the
+        // old fixed ignore list silently dropped.
+        write_asset_with_guid(
+            &root,
+            "Assets/Build/Thing.prefab",
+            yaml,
+            "deadbeefdeadbeefdeadbeefdeadbe11",
+        );
+        // Unity itself ignores `~`-suffixed and hidden folders; so do we.
+        write_asset_with_guid(
+            &root,
+            "Assets/Samples~/Hidden.prefab",
+            yaml,
+            "deadbeefdeadbeefdeadbeefdeadbe12",
+        );
+        write_asset_with_guid(
+            &root,
+            "Assets/.hidden/Secret.prefab",
+            yaml,
+            "deadbeefdeadbeefdeadbeefdeadbe13",
+        );
+
+        let mut graph = AssetDb::open(&root).expect("open asset db");
+        let stats = graph.full_scan(|_| {}).expect("scan asset db");
+
+        assert_eq!(stats.meta_files_found, 1);
+        assert_eq!(
+            graph
+                .resolve_guid_by_path("Assets/Build/Thing.prefab")
+                .expect("resolve build path"),
+            parse_guid_hex("deadbeefdeadbeefdeadbeefdeadbe11")
+        );
+        assert_eq!(
+            graph
+                .resolve_guid_by_path("Assets/Samples~/Hidden.prefab")
+                .expect("resolve samples path"),
+            None
+        );
+        assert_eq!(
+            graph
+                .resolve_guid_by_path("Assets/.hidden/Secret.prefab")
+                .expect("resolve hidden path"),
+            None
+        );
+    }
+
+    #[test]
+    fn full_scan_with_duplicate_guids_keeps_fts_rows_aligned() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let root = temp.path().join("project");
+        std::fs::create_dir_all(root.join("Assets")).expect("create assets dir");
+        let yaml: &[u8] = b"%YAML 1.1\n--- !u!1 &1000\nGameObject:\n  m_Name: Dup\n";
+        let guid_hex = "deadbeefdeadbeefdeadbeefdeadbe21";
+        write_asset_with_guid(&root, "Assets/Foo/Dup.prefab", yaml, guid_hex);
+        write_asset_with_guid(&root, "Assets/Bar/Dup.prefab", yaml, guid_hex);
+
+        let mut graph = AssetDb::open(&root).expect("open asset db");
+        let stats = graph.full_scan(|_| {}).expect("scan asset db");
+
+        assert_eq!(stats.meta_files_found, 2);
+        assert_eq!(stats.duplicate_guids.group_count, 1);
+        // The shadow node is dropped before insert, so the guid produces
+        // exactly one assets row instead of an INSERT OR REPLACE pair.
+        assert_eq!(stats.nodes_added, 1);
+
+        // Every FTS row must mirror a live searchable asset_objects row via
+        // the shared rowid — the REPLACE of the duplicate used to strand the
+        // first copy's FTS row forever.
+        let misaligned: i64 = graph
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM asset_search_fts f
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM asset_objects o
+                     WHERE o.rowid = f.rowid
+                       AND o.object_key = f.object_key
+                       AND o.searchable = 1
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count misaligned fts rows");
+        assert_eq!(misaligned, 0);
+
+        let guid = parse_guid_hex(guid_hex).unwrap();
+        let main_fts_rows: i64 = graph
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM asset_search_fts WHERE object_key = ?1",
+                rusqlite::params![guid_to_hex(&guid)],
+                |row| row.get(0),
+            )
+            .expect("count main fts rows");
+        assert_eq!(main_fts_rows, 1);
     }
 
     #[test]
