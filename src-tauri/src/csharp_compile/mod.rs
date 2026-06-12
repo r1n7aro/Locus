@@ -148,6 +148,23 @@ pub async fn status() -> CsharpCompileStatusPayload {
     }
 }
 
+/// Status refresh used by UI surfaces. When the sidecar is enabled, this also
+/// probes startup after a recorded startup error so stale errors clear as soon
+/// as the published server has been repaired.
+pub async fn refresh_status() -> CsharpCompileStatusPayload {
+    if is_enabled()
+        && crate::dotnet_runtime::is_platform_supported()
+        && manager::server_dll_available()
+        && manager::last_error_for_diagnostics().is_some()
+    {
+        let running = manager::current_status().await;
+        if running.is_none() {
+            let _ = manager::ensure_client().await;
+        }
+    }
+    status().await
+}
+
 /// Pre-start the sidecar and JIT-warm Roslyn with a tiny self-contained
 /// compile so the first real snippet does not pay the cold-start cost.
 /// No-op while the feature is disabled.
@@ -349,7 +366,7 @@ pub async fn compile_hot_patch(
             .collect::<Vec<_>>(),
         "params": compile_params,
         "referenceSessionImages": true,
-        "registerImage": true,
+        "registerImage": false,
     });
 
     let client = manager::ensure_client().await?;
@@ -357,6 +374,37 @@ pub async fn compile_hot_patch(
         .request_with_timeout("compile/hotPatch", request, client::COMPILE_REQUEST_TIMEOUT)
         .await?;
     parse_hot_patch_result(value)
+}
+
+/// Register a sidecar-built hot-patch image only after Unity has accepted and
+/// loaded it. This keeps the compile server's session image registry aligned
+/// with the running AppDomain.
+pub async fn register_session_image(
+    domain_generation: &str,
+    assembly_name: &str,
+    assembly_b64: &str,
+) -> Result<(), String> {
+    let client = manager::ensure_client().await?;
+    let value = client
+        .request_with_timeout(
+            "image/register",
+            json!({
+                "domainGeneration": domain_generation,
+                "assemblyName": assembly_name,
+                "assemblyB64": assembly_b64,
+            }),
+            client::DEFAULT_REQUEST_TIMEOUT,
+        )
+        .await?;
+    let success = value
+        .get("success")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if success {
+        Ok(())
+    } else {
+        Err("compile server rejected image/register".to_string())
+    }
 }
 
 fn parse_hot_patch_result(value: Value) -> Result<HotPatchOutcome, String> {
@@ -534,7 +582,10 @@ mod tests {
         let outcome = parse_compile_result(value).expect("parse");
         let assembly = outcome.expect("success");
         assert_eq!(assembly.assembly_b64, "TVo=");
-        assert_eq!(assembly.assembly_name, "__LocusRuntimeAsync_00000000_00000001");
+        assert_eq!(
+            assembly.assembly_name,
+            "__LocusRuntimeAsync_00000000_00000001"
+        );
         assert_eq!(
             assembly.entry_type.as_deref(),
             Some("Locus.RuntimeSnippets.__LocusAsyncSnippetHost")
@@ -580,7 +631,9 @@ mod tests {
 
     #[test]
     fn parse_hot_patch_result_noop_and_error() {
-        match parse_hot_patch_result(json!({ "hot": true, "success": true, "noop": true })).expect("parse") {
+        match parse_hot_patch_result(json!({ "hot": true, "success": true, "noop": true }))
+            .expect("parse")
+        {
             HotPatchOutcome::Noop => {}
             other => panic!("expected Noop, got {other:?}"),
         }
@@ -669,7 +722,10 @@ mod tests {
             eprintln!("skip: compile server dll not built (bun run compile-server:bundle)");
             return;
         }
-        if crate::dotnet_runtime::try_resolve_cached_dotnet().await.is_none() {
+        if crate::dotnet_runtime::try_resolve_cached_dotnet()
+            .await
+            .is_none()
+        {
             eprintln!("skip: no cached/system dotnet runtime available");
             return;
         }
@@ -713,7 +769,10 @@ mod tests {
         assert!(failure.message.contains("CS0029"), "{}", failure.message);
 
         // Crash recovery: kill the process, the next call must respawn.
-        assert!(manager::kill_current_for_test().await, "server should be running");
+        assert!(
+            manager::kill_current_for_test().await,
+            "server should be running"
+        );
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         compile_class_a()
             .await

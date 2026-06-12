@@ -89,6 +89,9 @@ while (true)
             case "compile/raw":
                 result = service.HandleCompileRaw(@params);
                 break;
+            case "image/register":
+                result = service.HandleRegisterImage(@params);
+                break;
             case "compile/snippet":
                 result = service.HandleCompileSnippet(@params);
                 break;

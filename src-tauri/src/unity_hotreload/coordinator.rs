@@ -26,6 +26,10 @@ struct PendingEdit {
 struct ProjectState {
     pending: HashMap<String, PendingEdit>,
     cold_paths: BTreeSet<String>,
+    /// Last Unity AppDomain generation seen for this project — used to tell
+    /// a real domain reload (detours died) from a transient pipe drop
+    /// (detours still live) on reconnect.
+    last_domain_generation: Option<String>,
 }
 
 fn projects() -> &'static Mutex<HashMap<String, ProjectState>> {
@@ -50,6 +54,17 @@ fn file_key(file_path: &str) -> String {
         .trim()
         .replace('\\', "/")
         .to_ascii_lowercase()
+}
+
+fn normalize_project_file_path(project_path: &str, file_path: &str) -> String {
+    let path = std::path::Path::new(file_path);
+    if path.is_absolute() {
+        return file_path.to_string();
+    }
+    std::path::Path::new(project_path)
+        .join(path)
+        .to_string_lossy()
+        .to_string()
 }
 
 /// Is `file_path` a compile-relevant C# source of the Unity project at
@@ -82,7 +97,8 @@ pub async fn note_cs_written(project_path: &str, file_path: &str, prior_content:
     if !super::is_enabled() || !crate::csharp_compile::is_enabled() {
         return;
     }
-    if !is_trackable_cs_path(project_path, file_path) {
+    let absolute_path = normalize_project_file_path(project_path, file_path);
+    if !is_trackable_cs_path(project_path, &absolute_path) {
         return;
     }
 
@@ -90,9 +106,9 @@ pub async fn note_cs_written(project_path: &str, file_path: &str, prior_content:
     let state = projects.entry(project_key(project_path)).or_default();
     state
         .pending
-        .entry(file_key(file_path))
+        .entry(file_key(&absolute_path))
         .or_insert_with(|| PendingEdit {
-            absolute_path: file_path.to_string(),
+            absolute_path,
             baseline: prior_content,
         });
 }
@@ -104,10 +120,87 @@ pub async fn on_recompile_converged(project_path: &str) {
     if let Some(state) = projects.get_mut(&project_key(project_path)) {
         state.pending.clear();
         state.cold_paths.clear();
+        // The old domain died with the recompile; the next reconnect (or
+        // hot reload) re-learns the new generation.
+        state.last_domain_generation = None;
     }
     drop(projects);
-    super::reset_active_patches();
+    on_domain_reloaded(project_path).await;
     super::set_cold_queue_depth(0);
+}
+
+/// A Unity domain reload invalidates active detours and transient hot-patch
+/// type-index rows. Pending source edits stay tracked until an actual
+/// compile convergence confirms disk and loaded assemblies match.
+pub async fn on_domain_reloaded(project_path: &str) {
+    super::reset_active_patches();
+    match crate::unity_type_index::drop_hot_patch_types(project_path).await {
+        Ok(removed) if removed > 0 => {
+            eprintln!("[HotReload] dropped {removed} hot-patch type-index row(s)");
+        }
+        Ok(_) => {}
+        Err(error) => {
+            eprintln!("[HotReload] hot-patch type-index cleanup skipped: {error}");
+        }
+    }
+}
+
+/// The Unity pipe (re)connected. A reconnect does NOT always mean the domain
+/// reloaded — transient pipe drops (editor stalls, focus loss) keep detours
+/// alive. Fetch the current domain generation and only invalidate
+/// detour-derived state (active-patch counter, TI-C rows) when the
+/// generation actually moved; unknown → fail closed (treat as reloaded).
+pub async fn on_pipe_reconnected(project_path: &str) {
+    let current_generation = if super::is_enabled() && crate::csharp_compile::is_enabled() {
+        crate::csharp_compile::params::get_params(project_path)
+            .await
+            .ok()
+            .map(|params| params.domain_generation)
+    } else {
+        // Feature off: no detours/TI-C rows exist; skip the roundtrip and
+        // keep the conservative cleanup path.
+        None
+    };
+
+    if reconnect_requires_cleanup(project_path, current_generation).await {
+        on_domain_reloaded(project_path).await;
+    } else {
+        eprintln!("[HotReload] pipe reconnected within the same domain generation; active patches kept");
+    }
+}
+
+/// Decide whether a reconnect needs detour-state cleanup, recording the
+/// generation for the next comparison. Split out for testability.
+async fn reconnect_requires_cleanup(
+    project_path: &str,
+    current_generation: Option<String>,
+) -> bool {
+    let mut projects = projects().lock().await;
+    let state = projects.entry(project_key(project_path)).or_default();
+    match current_generation {
+        Some(generation) => {
+            let unchanged = state.last_domain_generation.as_deref() == Some(generation.as_str());
+            state.last_domain_generation = Some(generation);
+            !unchanged
+        }
+        None => {
+            state.last_domain_generation = None;
+            true
+        }
+    }
+}
+
+/// Queue file keys for the `unity_recompile` convergence pass and return the
+/// queue depth. Used for cold classifications AND Unity-side patch
+/// rejections — a rejected patch leaves the files un-applied, so they need a
+/// real compile exactly like cold files do.
+async fn queue_cold_paths(project_path: &str, keys: &[String]) -> usize {
+    let mut projects = projects().lock().await;
+    let state = projects.entry(project_key(project_path)).or_default();
+    for key in keys {
+        state.cold_paths.insert(key.clone());
+    }
+    state.cold_paths.len()
 }
 
 pub async fn pending_paths(project_path: &str) -> Vec<String> {
@@ -157,7 +250,9 @@ async fn run_probe(project_path: &str) -> Result<(), String> {
                     .to_string(),
             );
         }
-        return Err(format!("Unity probe failed: {error}. Use unity_recompile instead."));
+        return Err(format!(
+            "Unity probe failed: {error}. Use unity_recompile instead."
+        ));
     }
 
     let message = resp.message.unwrap_or_default();
@@ -174,7 +269,11 @@ async fn run_probe(project_path: &str) -> Result<(), String> {
     if !probe.detour_ok {
         return Err(format!(
             "The detour engine self-test failed in this editor ({}); use unity_recompile.",
-            if probe.error.is_empty() { "no detail" } else { &probe.error }
+            if probe.error.is_empty() {
+                "no detail"
+            } else {
+                &probe.error
+            }
         ));
     }
     Ok(())
@@ -184,7 +283,10 @@ async fn run_probe(project_path: &str) -> Result<(), String> {
 
 /// Outcome text for the `unity_hot_reload` tool. `Err` carries agent-facing
 /// errors (compile diagnostics, gating guidance).
-pub async fn hot_reload(project_path: &str, path_filter: Option<Vec<String>>) -> Result<String, String> {
+pub async fn hot_reload(
+    project_path: &str,
+    path_filter: Option<Vec<String>>,
+) -> Result<String, String> {
     if !super::is_enabled() {
         return Err(
             "Unity hot reload is disabled. Enable it in Settings > Code Analysis (requires the \
@@ -200,6 +302,9 @@ pub async fn hot_reload(project_path: &str, path_filter: Option<Vec<String>>) ->
         );
     }
 
+    let op_lock = crate::unity_bridge::project_unity_op_lock(project_path).await;
+    let _op_guard = op_lock.lock().await;
+
     // Snapshot the pending set for this project (filtered when asked).
     let filter: Option<BTreeSet<String>> = path_filter.map(|paths| {
         paths
@@ -208,7 +313,11 @@ pub async fn hot_reload(project_path: &str, path_filter: Option<Vec<String>>) ->
                 if std::path::Path::new(path).is_absolute() {
                     file_key(path)
                 } else {
-                    file_key(&format!("{}/{}", project_path.trim_end_matches(['/', '\\']), path))
+                    file_key(&format!(
+                        "{}/{}",
+                        project_path.trim_end_matches(['/', '\\']),
+                        path
+                    ))
                 }
             })
             .collect()
@@ -262,7 +371,10 @@ pub async fn hot_reload(project_path: &str, path_filter: Option<Vec<String>>) ->
     }
 
     if files.is_empty() {
-        return Ok("All tracked edits are back at their compiled baseline; nothing to hot reload.".to_string());
+        return Ok(
+            "All tracked edits are back at their compiled baseline; nothing to hot reload."
+                .to_string(),
+        );
     }
 
     let params = crate::csharp_compile::params::get_params(project_path)
@@ -270,6 +382,14 @@ pub async fn hot_reload(project_path: &str, path_filter: Option<Vec<String>>) ->
         .map_err(|error| {
             format!("Could not get compile params from Unity ({error}); use unity_recompile.")
         })?;
+
+    // Remember the generation so a later transient pipe reconnect is not
+    // mistaken for a domain reload (which would wrongly clear patch state).
+    {
+        let mut projects = projects().lock().await;
+        let state = projects.entry(project_key(project_path)).or_default();
+        state.last_domain_generation = Some(params.domain_generation.clone());
+    }
 
     let started = std::time::Instant::now();
     let outcome = crate::csharp_compile::compile_hot_patch(&params, &files)
@@ -289,14 +409,7 @@ pub async fn hot_reload(project_path: &str, path_filter: Option<Vec<String>>) ->
             for (path, reasons) in &cold_files {
                 lines.push(format!("  {}: {}", path, reasons.join("; ")));
             }
-            let queued = {
-                let mut projects = projects().lock().await;
-                let state = projects.entry(project_key(project_path)).or_default();
-                for key in &changed_keys {
-                    state.cold_paths.insert(key.clone());
-                }
-                state.cold_paths.len()
-            };
+            let queued = queue_cold_paths(project_path, &changed_keys).await;
             super::set_cold_queue_depth(queued as u64);
             lines.push(format!(
                 "Run unity_recompile to apply them ({queued} file(s) queued). Hot-applied edits \
@@ -305,7 +418,8 @@ pub async fn hot_reload(project_path: &str, path_filter: Option<Vec<String>>) ->
             Ok(lines.join("\n"))
         }
         crate::csharp_compile::HotPatchOutcome::Noop => Ok(
-            "No effective code change (comments/formatting only); nothing to hot reload.".to_string(),
+            "No effective code change (comments/formatting only); nothing to hot reload."
+                .to_string(),
         ),
         crate::csharp_compile::HotPatchOutcome::CompileError(message) => Err(message),
         crate::csharp_compile::HotPatchOutcome::Compiled {
@@ -343,21 +457,34 @@ pub async fn hot_reload(project_path: &str, path_filter: Option<Vec<String>>) ->
             })
             .to_string();
 
-            let resp = crate::unity_bridge::send_message_with_timeout(
+            let resp = match crate::unity_bridge::send_message_with_timeout(
                 project_path,
                 "hot_patch_loaded",
                 &payload,
                 std::time::Duration::from_secs(30),
             )
             .await
-            .map_err(|error| {
-                super::record_patch_failure();
-                format!("Unity did not accept the hot patch ({error}); use unity_recompile.")
-            })?;
+            {
+                Ok(resp) => resp,
+                Err(error) => {
+                    super::record_patch_failure();
+                    // The patch never applied: queue the files so the
+                    // convergence pass (and the status card) covers them.
+                    let queued = queue_cold_paths(project_path, &changed_keys).await;
+                    super::set_cold_queue_depth(queued as u64);
+                    return Err(format!(
+                        "Unity did not accept the hot patch ({error}); use unity_recompile."
+                    ));
+                }
+            };
 
             if !resp.ok {
                 super::record_patch_failure();
-                let error = resp.error.unwrap_or_else(|| "hot patch rejected".to_string());
+                let queued = queue_cold_paths(project_path, &changed_keys).await;
+                super::set_cold_queue_depth(queued as u64);
+                let error = resp
+                    .error
+                    .unwrap_or_else(|| "hot patch rejected".to_string());
                 if error.starts_with("unknown message type") {
                     return Err(
                         "The Unity plugin in this project predates hot reload; update the Locus \
@@ -370,13 +497,29 @@ pub async fn hot_reload(project_path: &str, path_filter: Option<Vec<String>>) ->
                 ));
             }
 
+            let image_register_error = match crate::csharp_compile::register_session_image(
+                &params.domain_generation,
+                &assembly_name,
+                &assembly_b64,
+            )
+            .await
+            {
+                Ok(()) => None,
+                Err(error) => Some(error),
+            };
+
             super::record_patch_applied();
 
             let engine = resp
                 .message
                 .as_deref()
                 .and_then(|message| serde_json::from_str::<serde_json::Value>(message).ok())
-                .and_then(|value| value.get("detour_engine").and_then(|v| v.as_str()).map(String::from))
+                .and_then(|value| {
+                    value
+                        .get("detour_engine")
+                        .and_then(|v| v.as_str())
+                        .map(String::from)
+                })
                 .unwrap_or_default();
 
             let mut summary = format!(
@@ -390,6 +533,11 @@ pub async fn hot_reload(project_path: &str, path_filter: Option<Vec<String>>) ->
             }
             if !engine.is_empty() {
                 summary.push_str(&format!(" (engine: {engine})"));
+            }
+            if let Some(error) = &image_register_error {
+                summary.push_str(&format!(
+                    ".\nSidecar image registration failed: {error}. Run unity_recompile before the next hot reload."
+                ));
             }
             summary.push_str(
                 ".\nChanges are live in the running Editor — no recompile, no domain reload, \
@@ -413,7 +561,7 @@ pub async fn hot_reload(project_path: &str, path_filter: Option<Vec<String>>) ->
                     assembly: assembly_name.clone(),
                 })
                 .collect();
-            if !index_types.is_empty() {
+            if image_register_error.is_none() && !index_types.is_empty() {
                 if let Err(error) = crate::unity_type_index::append_hot_patch_types(
                     project_path,
                     &assembly_name,
@@ -437,10 +585,22 @@ mod tests {
     #[test]
     fn trackable_paths_require_unity_source_dirs() {
         let project = r"C:\Proj\Game";
-        assert!(is_trackable_cs_path(project, r"C:\Proj\Game\Assets\Scripts\Player.cs"));
-        assert!(is_trackable_cs_path(project, "c:/proj/game/Packages/com.example/Runtime/A.cs"));
-        assert!(!is_trackable_cs_path(project, r"C:\Proj\Game\Assets\Data\table.csv"));
-        assert!(!is_trackable_cs_path(project, r"C:\Proj\Game\Library\Temp\X.cs"));
+        assert!(is_trackable_cs_path(
+            project,
+            r"C:\Proj\Game\Assets\Scripts\Player.cs"
+        ));
+        assert!(is_trackable_cs_path(
+            project,
+            "c:/proj/game/Packages/com.example/Runtime/A.cs"
+        ));
+        assert!(!is_trackable_cs_path(
+            project,
+            r"C:\Proj\Game\Assets\Data\table.csv"
+        ));
+        assert!(!is_trackable_cs_path(
+            project,
+            r"C:\Proj\Game\Library\Temp\X.cs"
+        ));
         assert!(!is_trackable_cs_path(project, r"C:\Other\Assets\X.cs"));
         assert!(!is_trackable_cs_path(
             project,
@@ -456,8 +616,18 @@ mod tests {
         super::super::initialize(true);
         crate::csharp_compile::initialize_enabled_for_tests(true);
 
-        note_cs_written(project, r"C:\HotReloadTest\Baseline\Assets\A.cs", "v1".to_string()).await;
-        note_cs_written(project, r"C:\HotReloadTest\Baseline\Assets\A.cs", "v2".to_string()).await;
+        note_cs_written(
+            project,
+            r"C:\HotReloadTest\Baseline\Assets\A.cs",
+            "v1".to_string(),
+        )
+        .await;
+        note_cs_written(
+            project,
+            r"C:\HotReloadTest\Baseline\Assets\A.cs",
+            "v2".to_string(),
+        )
+        .await;
 
         {
             let projects = projects().lock().await;
@@ -474,6 +644,74 @@ mod tests {
             assert!(state.cold_paths.is_empty());
         }
 
+        super::super::initialize(false);
+        crate::csharp_compile::initialize_enabled_for_tests(false);
+    }
+
+    #[tokio::test]
+    async fn reconnect_cleanup_tracks_domain_generation() {
+        let project = r"C:\HotReloadTest\Reconnect";
+
+        // First sighting of a generation: unknown → cleanup required.
+        assert!(reconnect_requires_cleanup(project, Some("gen-1".to_string())).await);
+        // Transient pipe drop within the same generation: keep detours.
+        assert!(!reconnect_requires_cleanup(project, Some("gen-1".to_string())).await);
+        // Real domain reload (new generation): cleanup.
+        assert!(reconnect_requires_cleanup(project, Some("gen-2".to_string())).await);
+        // Unknown generation (params fetch failed): fail closed.
+        assert!(reconnect_requires_cleanup(project, None).await);
+        assert!(reconnect_requires_cleanup(project, Some("gen-2".to_string())).await);
+
+        // Convergence forgets the generation: next reconnect cleans again.
+        {
+            let mut projects = projects().lock().await;
+            let state = projects.entry(project_key(project)).or_default();
+            state.last_domain_generation = Some("gen-3".to_string());
+        }
+        on_recompile_converged(project).await;
+        assert!(reconnect_requires_cleanup(project, Some("gen-3".to_string())).await);
+    }
+
+    #[tokio::test]
+    async fn rejected_patches_queue_for_convergence() {
+        let project = r"C:\HotReloadTest\RejectQueue";
+
+        let queued = queue_cold_paths(
+            project,
+            &["a.cs".to_string(), "b.cs".to_string()],
+        )
+        .await;
+        assert_eq!(queued, 2);
+
+        // Re-queueing the same key does not double-count.
+        let queued = queue_cold_paths(project, &["a.cs".to_string()]).await;
+        assert_eq!(queued, 2);
+
+        on_recompile_converged(project).await;
+        {
+            let projects = projects().lock().await;
+            let state = projects.get(&project_key(project)).expect("state");
+            assert!(state.cold_paths.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn relative_project_paths_are_tracked_against_project_root() {
+        let project = r"C:\HotReloadTest\Relative";
+        super::super::initialize(true);
+        crate::csharp_compile::initialize_enabled_for_tests(true);
+
+        note_cs_written(project, r"Assets\Scripts\B.cs", "old".to_string()).await;
+
+        {
+            let projects = projects().lock().await;
+            let state = projects.get(&project_key(project)).expect("state");
+            let edit = state.pending.values().next().expect("edit");
+            assert!(file_key(&edit.absolute_path).ends_with("/assets/scripts/b.cs"));
+            assert_eq!(edit.baseline, "old");
+        }
+
+        on_recompile_converged(project).await;
         super::super::initialize(false);
         crate::csharp_compile::initialize_enabled_for_tests(false);
     }

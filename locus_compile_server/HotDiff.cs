@@ -26,6 +26,25 @@ public sealed class HotDiffMethod
     public bool Added;
 }
 
+/// <summary>A member surface change that is hot only when every call site of
+/// the OLD surface lives inside the current batch — the M3 caller scan
+/// decides. While the scan is unavailable these map to cold.</summary>
+public sealed class CallerCheckMember
+{
+    public string DeclaringType = "";
+
+    /// <summary>Metadata member name ("M", "get_X"); empty for whole-type checks.</summary>
+    public string Name = "";
+
+    public string[] ParamTypeNames = Array.Empty<string>();
+
+    /// <summary>"accessibility-narrowed" | "member-removed" | "signature-changed" | "type-removed".</summary>
+    public string Kind = "";
+
+    /// <summary>Human-readable description for cold reasons / tool output.</summary>
+    public string Detail = "";
+}
+
 /// <summary>Hot/cold classification of one edited file.</summary>
 public sealed class HotDiffFileResult
 {
@@ -33,6 +52,11 @@ public sealed class HotDiffFileResult
 
     /// <summary>Cold reasons (empty when hot).</summary>
     public List<string> Reasons = new();
+
+    /// <summary>Member surfaces that must pass the call-site scan (M3)
+    /// before this file can be hot. Populated alongside a cold reason while
+    /// the scan is not wired up.</summary>
+    public List<CallerCheckMember> RequiresCallerCheck = new();
 
     /// <summary>Deterministic agent-facing error: the new text does not even
     /// parse. Not a cold reason — recompiling would fail identically.</summary>
@@ -92,6 +116,15 @@ public static class HotDiff
             result.Reasons.Add("assembly-level attributes changed");
             return result;
         }
+        // using/extern changes are NOT cold by themselves (M6): the risk is
+        // unchanged members whose patch copies would bind differently under
+        // the new directives — handled below by re-detouring the whole file.
+        bool usingChanged = UsingAndExternText(oldRoot) != UsingAndExternText(newRoot);
+        if (DelegateDeclarationsText(oldRoot) != DelegateDeclarationsText(newRoot))
+        {
+            result.Reasons.Add("delegate declarations changed");
+            return result;
+        }
 
         Dictionary<string, BaseTypeDeclarationSyntax> oldTypes = CollectTypes(oldRoot, result.Reasons);
         Dictionary<string, BaseTypeDeclarationSyntax> newTypes = CollectTypes(newRoot, result.Reasons);
@@ -117,6 +150,46 @@ public static class HotDiff
             DiffType(pair.Key, oldDecl, pair.Value, result);
             if (result.Reasons.Count > 0)
                 return result;
+        }
+
+        if (usingChanged)
+        {
+            // M6: re-detour every detourable member of every pre-existing
+            // type so the whole file switches to the new binding semantics
+            // together. Members whose compiled form cannot be re-detoured —
+            // or whose already-materialized values cannot follow the new
+            // directives — fail the file closed first.
+            foreach (var pair in newTypes)
+            {
+                if (!oldTypes.ContainsKey(pair.Key) || pair.Value is not TypeDeclarationSyntax type)
+                    continue;
+                string? gate = UsingRehookGateReason(pair.Key, type);
+                if (gate != null)
+                {
+                    result.ChangedMethods.Clear();
+                    result.PatchedTypes.Clear();
+                    result.Reasons.Add(gate);
+                    return result;
+                }
+            }
+            foreach (var pair in newTypes)
+            {
+                if (!oldTypes.ContainsKey(pair.Key) || pair.Value is not TypeDeclarationSyntax type)
+                    continue;
+                if (type is InterfaceDeclarationSyntax)
+                    continue; // gate guarantees no default implementations
+                AddRehookMembers(pair.Key, type, result);
+            }
+        }
+
+        if (result.ChangedMethods.Count > 0 &&
+            result.ChangedMethods.All(m => m.Added) &&
+            result.NewTypes.Count == 0)
+        {
+            result.ChangedMethods.Clear();
+            result.PatchedTypes.Clear();
+            result.Reasons.Add("added helper methods require a changed original method");
+            return result;
         }
 
         result.NewTypes.Sort(StringComparer.Ordinal);
@@ -209,6 +282,18 @@ public static class HotDiff
             return;
         }
 
+        // Interfaces: default-implementation bodies dispatch through the
+        // IMT, where Mono detour reliability is unverified; signature-only
+        // members are pure type surface. Any interface change stays cold.
+        if (oldDecl is InterfaceDeclarationSyntax)
+        {
+            if (TokenText(oldDecl) != TokenText(newDecl))
+                result.Reasons.Add(
+                    "interface changed: " + metadataName +
+                    " (interface dispatch cannot be hot-patched)");
+            return;
+        }
+
         var oldType = (TypeDeclarationSyntax)oldDecl;
         var newType = (TypeDeclarationSyntax)newDecl;
 
@@ -219,6 +304,7 @@ public static class HotDiff
         }
 
         bool genericContext = IsGenericContext(newType);
+        bool burstContext = HasBurstCompileAttribute(oldType) || HasBurstCompileAttribute(newType);
 
         if (!LayoutSequence(oldType).SequenceEqual(LayoutSequence(newType), StringComparer.Ordinal))
         {
@@ -259,14 +345,14 @@ public static class HotDiff
 
             if (!oldMembers.TryGetValue(pair.Key, out MemberDeclarationSyntax? oldMember))
             {
-                if (!ClassifyAddedMember(metadataName, newMember, genericContext, result))
+                if (!ClassifyAddedMember(metadataName, newMember, genericContext, burstContext, result))
                     return;
                 patched = true;
                 continue;
             }
 
             int before = result.Reasons.Count;
-            bool changed = DiffMember(metadataName, oldMember, newMember, genericContext, result);
+            bool changed = DiffMember(metadataName, oldMember, newMember, genericContext, burstContext, result);
             if (result.Reasons.Count > before)
                 return;
             patched |= changed;
@@ -351,6 +437,7 @@ public static class HotDiff
                     {
                         sequence.Add(
                             "field|" + ModifiersText(field.Modifiers) + "|" +
+                            AttributeListsText(field.AttributeLists) + "|" +
                             TokenText(field.Declaration.Type) + "|" + declarator.Identifier.Text);
                     }
                     break;
@@ -360,6 +447,7 @@ public static class HotDiff
                     {
                         sequence.Add(
                             "eventfield|" + ModifiersText(eventField.Modifiers) + "|" +
+                            AttributeListsText(eventField.AttributeLists) + "|" +
                             TokenText(eventField.Declaration.Type) + "|" + declarator.Identifier.Text);
                     }
                     break;
@@ -367,9 +455,10 @@ public static class HotDiff
                 case PropertyDeclarationSyntax property when IsAutoProperty(property):
                     sequence.Add(
                         "autoprop|" + ModifiersText(property.Modifiers) + "|" +
+                        AttributeListsText(property.AttributeLists) + "|" +
                         TokenText(property.Type) + "|" + property.Identifier.Text + "|" +
                         string.Join(",", property.AccessorList!.Accessors.Select(a =>
-                            ModifiersText(a.Modifiers) + a.Keyword.Text)));
+                            ModifiersText(a.Modifiers) + a.Keyword.Text + AttributeListsText(a.AttributeLists))));
                     break;
             }
         }
@@ -437,6 +526,257 @@ public static class HotDiff
             }
         }
         return string.Join("\n", parts);
+    }
+
+    // ── M6: using-change whole-file re-detour ────────────────────────
+
+    /// <summary>Why this type blocks the using-change re-detour path (null
+    /// when safe). The patch copy of EVERY member binds under the new
+    /// directives, so any member whose compiled body cannot be re-detoured —
+    /// or whose already-materialized value cannot follow the new bindings —
+    /// fails the file closed.</summary>
+    private static string? UsingRehookGateReason(string metadataName, TypeDeclarationSyntax type)
+    {
+        string Reason(string what) =>
+            "using directives changed and " + what + ": " + metadataName;
+
+        if (type is InterfaceDeclarationSyntax)
+        {
+            bool hasBodies = type.Members.Any(member =>
+                member.DescendantNodes().Any(n => n is BlockSyntax || n is ArrowExpressionClauseSyntax));
+            return hasBodies
+                ? Reason("the interface has default implementations that cannot be re-detoured")
+                : null;
+        }
+
+        if (HasBurstCompileAttribute(type))
+            return Reason("the type is Burst-compiled");
+
+        bool genericContext = IsGenericContext(type);
+
+        // Values frozen under the old bindings: inlined consts and
+        // already-ran static initializers cannot re-bind without a real
+        // compile, unless they are pure literals (binding-independent).
+        foreach (MemberDeclarationSyntax member in type.Members)
+        {
+            switch (member)
+            {
+                case FieldDeclarationSyntax field when field.Modifiers.Any(SyntaxKind.ConstKeyword):
+                    foreach (VariableDeclaratorSyntax declarator in field.Declaration.Variables)
+                    {
+                        if (declarator.Initializer != null && !IsLiteralInitializer(declarator.Initializer.Value))
+                            return Reason("a non-literal const value is inlined under the old bindings");
+                    }
+                    break;
+                case FieldDeclarationSyntax field when field.Modifiers.Any(SyntaxKind.StaticKeyword):
+                    foreach (VariableDeclaratorSyntax declarator in field.Declaration.Variables)
+                    {
+                        if (declarator.Initializer != null && !IsLiteralInitializer(declarator.Initializer.Value))
+                            return Reason("a non-literal static initializer already ran under the old bindings");
+                    }
+                    break;
+                case PropertyDeclarationSyntax property when
+                    IsAutoProperty(property) &&
+                    property.Modifiers.Any(SyntaxKind.StaticKeyword) &&
+                    property.Initializer != null &&
+                    !IsLiteralInitializer(property.Initializer.Value):
+                    return Reason("a non-literal static initializer already ran under the old bindings");
+            }
+        }
+
+        foreach (MemberDeclarationSyntax member in type.Members)
+        {
+            bool hasBody = member.DescendantNodes().Any(n => n is BlockSyntax || n is ArrowExpressionClauseSyntax);
+            if (!hasBody)
+                continue;
+
+            switch (member)
+            {
+                case MethodDeclarationSyntax method:
+                    if (genericContext || (method.TypeParameterList?.Parameters.Count ?? 0) > 0)
+                        return Reason("generic members cannot be re-detoured");
+                    if (HasBurstCompileAttribute(method))
+                        return Reason("a Burst-compiled member cannot be re-detoured");
+                    if (method.ExplicitInterfaceSpecifier != null)
+                        return Reason("an explicit interface implementation cannot be re-detoured");
+                    break;
+                case ConstructorDeclarationSyntax ctor:
+                    if (genericContext && !ctor.Modifiers.Any(SyntaxKind.StaticKeyword))
+                        return Reason("generic members cannot be re-detoured");
+                    break;
+                case DestructorDeclarationSyntax:
+                    return Reason("a finalizer cannot be re-detoured");
+                case OperatorDeclarationSyntax op:
+                    if (genericContext)
+                        return Reason("generic members cannot be re-detoured");
+                    if (HasBurstCompileAttribute(op))
+                        return Reason("a Burst-compiled member cannot be re-detoured");
+                    if (OperatorMetadataName(op.OperatorToken.Text, op.ParameterList.Parameters.Count) == null)
+                        return Reason("an unsupported operator cannot be re-detoured");
+                    break;
+                case ConversionOperatorDeclarationSyntax conv:
+                    if (genericContext)
+                        return Reason("generic members cannot be re-detoured");
+                    if (HasBurstCompileAttribute(conv))
+                        return Reason("a Burst-compiled member cannot be re-detoured");
+                    break;
+                case PropertyDeclarationSyntax property when !IsAutoProperty(property):
+                    if (genericContext)
+                        return Reason("generic members cannot be re-detoured");
+                    if (property.ExplicitInterfaceSpecifier != null)
+                        return Reason("an explicit interface implementation cannot be re-detoured");
+                    if (HasBurstCompileAttribute(property) ||
+                        (property.AccessorList?.Accessors.Any(HasBurstCompileAttribute) ?? false))
+                        return Reason("a Burst-compiled member cannot be re-detoured");
+                    break;
+                case IndexerDeclarationSyntax indexer:
+                    if (genericContext)
+                        return Reason("generic members cannot be re-detoured");
+                    if (indexer.ExplicitInterfaceSpecifier != null)
+                        return Reason("an explicit interface implementation cannot be re-detoured");
+                    if (HasBurstCompileAttribute(indexer) ||
+                        (indexer.AccessorList?.Accessors.Any(HasBurstCompileAttribute) ?? false))
+                        return Reason("a Burst-compiled member cannot be re-detoured");
+                    break;
+                case EventDeclarationSyntax @event:
+                    if (genericContext)
+                        return Reason("generic members cannot be re-detoured");
+                    if (@event.ExplicitInterfaceSpecifier != null)
+                        return Reason("an explicit interface event cannot be re-detoured");
+                    if (HasBurstCompileAttribute(@event) ||
+                        (@event.AccessorList?.Accessors.Any(HasBurstCompileAttribute) ?? false))
+                        return Reason("a Burst-compiled member cannot be re-detoured");
+                    break;
+                case FieldDeclarationSyntax:
+                case EventFieldDeclarationSyntax:
+                    // Initializers with lambdas: instance ones re-detour via
+                    // constructors; static ones were gated above (a lambda is
+                    // never a literal initializer).
+                    break;
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>True for initializer expressions that cannot bind
+    /// differently under changed using directives.</summary>
+    private static bool IsLiteralInitializer(ExpressionSyntax expression)
+    {
+        return expression switch
+        {
+            LiteralExpressionSyntax => true,
+            PrefixUnaryExpressionSyntax unary when
+                unary.IsKind(SyntaxKind.UnaryMinusExpression) ||
+                unary.IsKind(SyntaxKind.UnaryPlusExpression) => IsLiteralInitializer(unary.Operand),
+            _ => false,
+        };
+    }
+
+    /// <summary>Add every detourable member of a pre-existing type to the
+    /// re-detour set (deduplicated against body-diff entries).</summary>
+    private static void AddRehookMembers(string metadataName, TypeDeclarationSyntax type, HotDiffFileResult result)
+    {
+        static string Key(string declaringType, string name, string[] paramNames, bool isStatic) =>
+            declaringType + "|" + name + "|" + string.Join(",", paramNames) + (isStatic ? "|s" : "|i");
+
+        var seen = new HashSet<string>(
+            result.ChangedMethods.Select(m => Key(m.DeclaringType, m.Name, m.ParamTypeNames, m.IsStatic)),
+            StringComparer.Ordinal);
+        bool any = false;
+
+        void Add(string name, string[] paramNames, bool isStatic, bool isCtor)
+        {
+            if (!seen.Add(Key(metadataName, name, paramNames, isStatic)))
+                return;
+            AddMethod(result, metadataName, name, paramNames, isStatic, isCtor, added: false);
+            any = true;
+        }
+
+        foreach (MemberDeclarationSyntax member in type.Members)
+        {
+            switch (member)
+            {
+                case MethodDeclarationSyntax method when method.Body != null || method.ExpressionBody != null:
+                    Add(method.Identifier.Text, ParamTypeNames(method.ParameterList),
+                        method.Modifiers.Any(SyntaxKind.StaticKeyword), isCtor: false);
+                    break;
+
+                case ConstructorDeclarationSyntax ctor when
+                    !ctor.Modifiers.Any(SyntaxKind.StaticKeyword) &&
+                    (ctor.Body != null || ctor.ExpressionBody != null):
+                    Add(".ctor", ParamTypeNames(ctor.ParameterList), isStatic: false, isCtor: true);
+                    break;
+
+                case PropertyDeclarationSyntax property when !IsAutoProperty(property):
+                    if (property.ExpressionBody != null)
+                    {
+                        Add("get_" + property.Identifier.Text, Array.Empty<string>(),
+                            property.Modifiers.Any(SyntaxKind.StaticKeyword), isCtor: false);
+                        break;
+                    }
+                    foreach (AccessorDeclarationSyntax accessor in property.AccessorList?.Accessors ?? default)
+                    {
+                        if (accessor.Body == null && accessor.ExpressionBody == null)
+                            continue;
+                        Add(AccessorName(accessor, property.Identifier.Text),
+                            AccessorParams(accessor, null, TokenText(property.Type)),
+                            property.Modifiers.Any(SyntaxKind.StaticKeyword), isCtor: false);
+                    }
+                    break;
+
+                case IndexerDeclarationSyntax indexer:
+                    if (indexer.ExpressionBody != null)
+                    {
+                        Add("get_Item", ParamTypeNames(indexer.ParameterList), isStatic: false, isCtor: false);
+                        break;
+                    }
+                    foreach (AccessorDeclarationSyntax accessor in indexer.AccessorList?.Accessors ?? default)
+                    {
+                        if (accessor.Body == null && accessor.ExpressionBody == null)
+                            continue;
+                        Add(AccessorName(accessor, "Item"),
+                            AccessorParams(accessor, indexer.ParameterList, TokenText(indexer.Type)),
+                            isStatic: false, isCtor: false);
+                    }
+                    break;
+
+                case EventDeclarationSyntax @event:
+                    foreach (AccessorDeclarationSyntax accessor in @event.AccessorList?.Accessors ?? default)
+                    {
+                        if (accessor.Body == null && accessor.ExpressionBody == null)
+                            continue;
+                        string prefix = accessor.Keyword.Text == "add" ? "add_" : "remove_";
+                        Add(prefix + @event.Identifier.Text, new[] { SimpleTypeName(@event.Type) },
+                            @event.Modifiers.Any(SyntaxKind.StaticKeyword), isCtor: false);
+                    }
+                    break;
+
+                case OperatorDeclarationSyntax op when op.Body != null || op.ExpressionBody != null:
+                {
+                    string? opName = OperatorMetadataName(op.OperatorToken.Text, op.ParameterList.Parameters.Count);
+                    if (opName != null)
+                        Add(opName, ParamTypeNames(op.ParameterList), isStatic: true, isCtor: false);
+                    break;
+                }
+
+                case ConversionOperatorDeclarationSyntax conv when conv.Body != null || conv.ExpressionBody != null:
+                    Add(conv.ImplicitOrExplicitKeyword.IsKind(SyntaxKind.ImplicitKeyword) ? "op_Implicit" : "op_Explicit",
+                        ParamTypeNames(conv.ParameterList), isStatic: true, isCtor: false);
+                    break;
+            }
+        }
+
+        // Instance initializers compile into the implicit default ctor when
+        // none is declared; re-detour it so initializer bindings follow too.
+        bool hasInstanceInit = InstanceInitText(type).Length > 0;
+        bool hasExplicitInstanceCtor = type.Members.OfType<ConstructorDeclarationSyntax>()
+            .Any(c => !c.Modifiers.Any(SyntaxKind.StaticKeyword));
+        if (hasInstanceInit && !hasExplicitInstanceCtor && type is not StructDeclarationSyntax)
+            Add(".ctor", Array.Empty<string>(), isStatic: false, isCtor: true);
+
+        if (any)
+            result.PatchedTypes.Add(metadataName);
     }
 
     // ── executable member diff ───────────────────────────────────────
@@ -507,6 +847,7 @@ public static class HotDiff
         string metadataName,
         MemberDeclarationSyntax member,
         bool genericContext,
+        bool burstContext,
         HotDiffFileResult result)
     {
         if (genericContext)
@@ -528,9 +869,19 @@ public static class HotDiff
                 return false;
 
             case MethodDeclarationSyntax method:
+                if (burstContext || HasBurstCompileAttribute(method))
+                {
+                    result.Reasons.Add("Burst-compiled member added: " + metadataName + "." + method.Identifier.Text);
+                    return false;
+                }
                 if (method.ExplicitInterfaceSpecifier != null)
                 {
                     result.Reasons.Add("explicit interface implementation added: " + metadataName);
+                    return false;
+                }
+                if (!IsPrivateOrImplicitPrivate(method.Modifiers))
+                {
+                    result.Reasons.Add("non-private method added: " + metadataName + "." + method.Identifier.Text);
                     return false;
                 }
                 if (UnityMagicMethods.Contains(method.Identifier.Text))
@@ -551,22 +902,11 @@ public static class HotDiff
                 return true;
 
             case PropertyDeclarationSyntax property:
-                // Auto-properties add backing fields and are caught by the
-                // layout sequence before we get here.
-                foreach (AccessorDeclarationSyntax accessor in property.AccessorList?.Accessors ?? default)
-                {
-                    AddMethod(
-                        result, metadataName, AccessorName(accessor, property.Identifier.Text),
-                        AccessorParams(accessor, null, TokenText(property.Type)),
-                        property.Modifiers.Any(SyntaxKind.StaticKeyword), isCtor: false, added: true);
-                }
-                if (property.ExpressionBody != null)
-                {
-                    AddMethod(
-                        result, metadataName, "get_" + property.Identifier.Text, Array.Empty<string>(),
-                        property.Modifiers.Any(SyntaxKind.StaticKeyword), isCtor: false, added: true);
-                }
-                return true;
+                // Properties add metadata surface even when they are backed
+                // only by methods; external call sites cannot bind to them
+                // until the original assembly is recompiled.
+                result.Reasons.Add("property added: " + metadataName + "." + property.Identifier.Text);
+                return false;
 
             case IndexerDeclarationSyntax:
             case EventDeclarationSyntax:
@@ -589,6 +929,7 @@ public static class HotDiff
         MemberDeclarationSyntax oldMember,
         MemberDeclarationSyntax newMember,
         bool genericContext,
+        bool burstContext,
         HotDiffFileResult result)
     {
         if (HeaderText(oldMember) != HeaderText(newMember))
@@ -597,13 +938,43 @@ public static class HotDiff
             return false;
         }
 
+        // Accessibility sits outside the header: WIDENING changes nothing at
+        // runtime until a real compile (original metadata keeps the old
+        // accessibility; patched bodies bypass access checks anyway), so an
+        // unchanged body is a noop and a changed body is a plain hot edit.
+        // NARROWING can strand call sites outside this batch → caller check
+        // (cold until the M3 scan is wired up).
+        MemberAccess oldAccess = DeclaredAccess(oldMember);
+        MemberAccess newAccess = DeclaredAccess(newMember);
+        if (oldAccess != newAccess && !IsAccessWideningOrEqual(oldAccess, newAccess))
+        {
+            string detail = "member accessibility narrowed: " + metadataName + "." + DisplayName(newMember);
+            result.RequiresCallerCheck.Add(new CallerCheckMember
+            {
+                DeclaringType = metadataName,
+                Name = DisplayName(newMember),
+                ParamTypeNames = newMember is BaseMethodDeclarationSyntax m ? ParamTypeNames(m.ParameterList) : Array.Empty<string>(),
+                Kind = "accessibility-narrowed",
+                Detail = detail,
+            });
+            result.Reasons.Add(detail + " (call-site verification is not yet enabled; use unity_recompile)");
+            return false;
+        }
+
+        bool burstMember = burstContext || HasBurstCompileAttribute(oldMember) || HasBurstCompileAttribute(newMember);
+
         switch (newMember)
         {
             case MethodDeclarationSyntax newMethod:
             {
                 var oldMethod = (MethodDeclarationSyntax)oldMember;
-                if (BodyText(oldMethod.Body, oldMethod.ExpressionBody) == BodyText(newMethod.Body, newMethod.ExpressionBody))
+                if (MethodBodyText(oldMethod) == MethodBodyText(newMethod))
                     return false;
+                if (burstMember)
+                {
+                    result.Reasons.Add("Burst-compiled method body changed: " + metadataName + "." + newMethod.Identifier.Text);
+                    return false;
+                }
                 if (genericContext || (newMethod.TypeParameterList?.Parameters.Count ?? 0) > 0)
                 {
                     result.Reasons.Add("generic method body changed: " + metadataName + "." + newMethod.Identifier.Text);
@@ -633,6 +1004,11 @@ public static class HotDiff
                 string newBody = (newCtor.Initializer != null ? TokenText(newCtor.Initializer) : "") + BodyText(newCtor.Body, newCtor.ExpressionBody);
                 if (oldBody == newBody)
                     return false;
+                if (burstMember)
+                {
+                    result.Reasons.Add("Burst-compiled constructor changed: " + metadataName);
+                    return false;
+                }
                 if (newCtor.Modifiers.Any(SyntaxKind.StaticKeyword))
                 {
                     result.Reasons.Add("static constructor changed: " + metadataName);
@@ -663,6 +1039,11 @@ public static class HotDiff
                 var oldOp = (OperatorDeclarationSyntax)oldMember;
                 if (BodyText(oldOp.Body, oldOp.ExpressionBody) == BodyText(newOp.Body, newOp.ExpressionBody))
                     return false;
+                if (burstMember)
+                {
+                    result.Reasons.Add("Burst-compiled operator changed: " + metadataName);
+                    return false;
+                }
                 if (genericContext)
                 {
                     result.Reasons.Add("generic type operator changed: " + metadataName);
@@ -683,6 +1064,11 @@ public static class HotDiff
                 var oldConv = (ConversionOperatorDeclarationSyntax)oldMember;
                 if (BodyText(oldConv.Body, oldConv.ExpressionBody) == BodyText(newConv.Body, newConv.ExpressionBody))
                     return false;
+                if (burstMember)
+                {
+                    result.Reasons.Add("Burst-compiled conversion changed: " + metadataName);
+                    return false;
+                }
                 if (genericContext)
                 {
                     result.Reasons.Add("generic type conversion changed: " + metadataName);
@@ -710,6 +1096,7 @@ public static class HotDiff
                     newProperty.Modifiers.Any(SyntaxKind.StaticKeyword),
                     newProperty.ExplicitInterfaceSpecifier != null,
                     genericContext,
+                    burstMember,
                     result);
             }
 
@@ -728,6 +1115,7 @@ public static class HotDiff
                     isStatic: false,
                     newIndexer.ExplicitInterfaceSpecifier != null,
                     genericContext,
+                    burstMember,
                     result);
             }
 
@@ -742,6 +1130,13 @@ public static class HotDiff
                     if (oldAccessor == null ||
                         BodyText(oldAccessor.Body, oldAccessor.ExpressionBody) != BodyText(newAccessor.Body, newAccessor.ExpressionBody))
                     {
+                        if (burstMember ||
+                            (oldAccessor != null && HasBurstCompileAttribute(oldAccessor)) ||
+                            HasBurstCompileAttribute(newAccessor))
+                        {
+                            result.Reasons.Add("Burst-compiled event changed: " + metadataName + "." + newEvent.Identifier.Text);
+                            return false;
+                        }
                         if (genericContext)
                         {
                             result.Reasons.Add("generic type event changed: " + metadataName);
@@ -780,6 +1175,7 @@ public static class HotDiff
         bool isStatic,
         bool explicitInterface,
         bool genericContext,
+        bool burstContext,
         HotDiffFileResult result)
     {
         // `int X => expr;` is a get_X body.
@@ -789,6 +1185,11 @@ public static class HotDiff
             string newBody = newExpressionBody != null ? TokenText(newExpressionBody) : "";
             if (oldBody == newBody)
                 return false;
+            if (burstContext)
+            {
+                result.Reasons.Add("Burst-compiled property changed: " + metadataName + "." + propertyName);
+                return false;
+            }
             if (genericContext || explicitInterface)
             {
                 result.Reasons.Add(
@@ -815,6 +1216,12 @@ public static class HotDiff
 
             if (BodyText(oldAccessor.Body, oldAccessor.ExpressionBody) == BodyText(newAccessor.Body, newAccessor.ExpressionBody))
                 continue;
+
+            if (burstContext || HasBurstCompileAttribute(oldAccessor) || HasBurstCompileAttribute(newAccessor))
+            {
+                result.Reasons.Add("Burst-compiled property changed: " + metadataName + "." + propertyName);
+                return false;
+            }
 
             if (genericContext || explicitInterface)
             {
@@ -895,29 +1302,113 @@ public static class HotDiff
     }
 
     /// <summary>The member's declaration with every body removed — the
-    /// signature/modifier/attribute surface whose change forces a recompile.</summary>
+    /// signature/modifier/attribute surface whose change forces a recompile.
+    /// Accessibility modifiers are stripped (compared separately: widening
+    /// is hot/noop, narrowing needs the caller check); the async modifier is
+    /// stripped from methods (it is part of the BODY comparison — an
+    /// async↔sync flip changes the compiled body, not the signature).</summary>
     private static string HeaderText(MemberDeclarationSyntax member)
     {
         SyntaxNode stripped = member switch
         {
-            MethodDeclarationSyntax m => m.WithBody(null).WithExpressionBody(null).WithSemicolonToken(default),
-            ConstructorDeclarationSyntax c => c.WithBody(null).WithExpressionBody(null).WithInitializer(null).WithSemicolonToken(default),
+            MethodDeclarationSyntax m => m
+                .WithModifiers(StripHeaderModifiers(m.Modifiers, stripAsync: true))
+                .WithBody(null).WithExpressionBody(null).WithSemicolonToken(default),
+            ConstructorDeclarationSyntax c => c
+                .WithModifiers(StripHeaderModifiers(c.Modifiers, stripAsync: false))
+                .WithBody(null).WithExpressionBody(null).WithInitializer(null).WithSemicolonToken(default),
             DestructorDeclarationSyntax d => d.WithBody(null).WithExpressionBody(null).WithSemicolonToken(default),
             OperatorDeclarationSyntax o => o.WithBody(null).WithExpressionBody(null).WithSemicolonToken(default),
             ConversionOperatorDeclarationSyntax v => v.WithBody(null).WithExpressionBody(null).WithSemicolonToken(default),
             PropertyDeclarationSyntax p => p
+                .WithModifiers(StripHeaderModifiers(p.Modifiers, stripAsync: false))
                 .WithExpressionBody(null)
                 .WithInitializer(null)
                 .WithSemicolonToken(default)
                 .WithAccessorList(StripAccessorBodies(p.AccessorList)),
             IndexerDeclarationSyntax i => i
+                .WithModifiers(StripHeaderModifiers(i.Modifiers, stripAsync: false))
                 .WithExpressionBody(null)
                 .WithSemicolonToken(default)
                 .WithAccessorList(StripAccessorBodies(i.AccessorList)),
-            EventDeclarationSyntax e => e.WithAccessorList(StripAccessorBodies(e.AccessorList)),
+            EventDeclarationSyntax e => e
+                .WithModifiers(StripHeaderModifiers(e.Modifiers, stripAsync: false))
+                .WithAccessorList(StripAccessorBodies(e.AccessorList)),
             _ => member,
         };
         return TokenText(stripped);
+    }
+
+    private static SyntaxTokenList StripHeaderModifiers(SyntaxTokenList modifiers, bool stripAsync)
+    {
+        return SyntaxFactory.TokenList(modifiers.Where(m =>
+            !m.IsKind(SyntaxKind.PublicKeyword) &&
+            !m.IsKind(SyntaxKind.PrivateKeyword) &&
+            !m.IsKind(SyntaxKind.ProtectedKeyword) &&
+            !m.IsKind(SyntaxKind.InternalKeyword) &&
+            !(stripAsync && m.IsKind(SyntaxKind.AsyncKeyword))));
+    }
+
+    /// <summary>Async modifier folded into the body text: an async↔sync flip
+    /// with an identical token body still swaps state machine for direct
+    /// code and must re-detour.</summary>
+    private static string MethodBodyText(MethodDeclarationSyntax method)
+    {
+        return (method.Modifiers.Any(SyntaxKind.AsyncKeyword) ? "A|" : "") +
+            BodyText(method.Body, method.ExpressionBody);
+    }
+
+    // ── member accessibility (widen = hot, narrow = caller check) ────
+
+    private enum MemberAccess
+    {
+        Private,
+        PrivateProtected,
+        Protected,
+        Internal,
+        ProtectedInternal,
+        Public,
+    }
+
+    private static MemberAccess DeclaredAccess(MemberDeclarationSyntax member)
+    {
+        SyntaxTokenList modifiers = member.Modifiers;
+        bool isPublic = modifiers.Any(SyntaxKind.PublicKeyword);
+        bool isPrivate = modifiers.Any(SyntaxKind.PrivateKeyword);
+        bool isProtected = modifiers.Any(SyntaxKind.ProtectedKeyword);
+        bool isInternal = modifiers.Any(SyntaxKind.InternalKeyword);
+        if (isPublic)
+            return MemberAccess.Public;
+        if (isPrivate && isProtected)
+            return MemberAccess.PrivateProtected;
+        if (isProtected && isInternal)
+            return MemberAccess.ProtectedInternal;
+        if (isProtected)
+            return MemberAccess.Protected;
+        if (isInternal)
+            return MemberAccess.Internal;
+        // Explicit private or the class/struct member default. (Interface
+        // members never reach this: interfaces diff as a whole.)
+        return MemberAccess.Private;
+    }
+
+    /// <summary>Old ⊆ new in the accessibility-domain partial order.
+    /// protected↔internal are incomparable and count as narrowing.</summary>
+    private static bool IsAccessWideningOrEqual(MemberAccess oldAccess, MemberAccess newAccess)
+    {
+        if (oldAccess == newAccess)
+            return true;
+        return (oldAccess, newAccess) switch
+        {
+            (MemberAccess.Private, _) => true,
+            (MemberAccess.PrivateProtected,
+                MemberAccess.Protected or MemberAccess.Internal or
+                MemberAccess.ProtectedInternal or MemberAccess.Public) => true,
+            (MemberAccess.Protected, MemberAccess.ProtectedInternal or MemberAccess.Public) => true,
+            (MemberAccess.Internal, MemberAccess.ProtectedInternal or MemberAccess.Public) => true,
+            (MemberAccess.ProtectedInternal, MemberAccess.Public) => true,
+            _ => false,
+        };
     }
 
     private static AccessorListSyntax? StripAccessorBodies(AccessorListSyntax? accessors)
@@ -935,9 +1426,67 @@ public static class HotDiff
         return string.Join("\n", lists.Select(TokenText));
     }
 
+    private static string UsingAndExternText(CompilationUnitSyntax root)
+    {
+        var parts = new List<string>();
+        parts.AddRange(root.Externs.Select(TokenText));
+        parts.AddRange(root.Usings.Select(TokenText));
+        return string.Join("\n", parts);
+    }
+
+    private static string DelegateDeclarationsText(CompilationUnitSyntax root)
+    {
+        return string.Join(
+            "\n",
+            root.DescendantNodes()
+                .OfType<DelegateDeclarationSyntax>()
+                .Select(TokenText)
+                .OrderBy(text => text, StringComparer.Ordinal));
+    }
+
     private static string ModifiersText(SyntaxTokenList modifiers)
     {
         return string.Join(" ", modifiers.Select(m => m.Text));
+    }
+
+    private static bool IsPrivateOrImplicitPrivate(SyntaxTokenList modifiers)
+    {
+        bool hasPublicSurface = modifiers.Any(m =>
+            m.IsKind(SyntaxKind.PublicKeyword) ||
+            m.IsKind(SyntaxKind.ProtectedKeyword) ||
+            m.IsKind(SyntaxKind.InternalKeyword));
+        return !hasPublicSurface;
+    }
+
+    private static bool HasBurstCompileAttribute(SyntaxNode node)
+    {
+        SyntaxList<AttributeListSyntax> lists = node switch
+        {
+            BaseTypeDeclarationSyntax type => type.AttributeLists,
+            DelegateDeclarationSyntax del => del.AttributeLists,
+            MethodDeclarationSyntax method => method.AttributeLists,
+            ConstructorDeclarationSyntax ctor => ctor.AttributeLists,
+            OperatorDeclarationSyntax op => op.AttributeLists,
+            ConversionOperatorDeclarationSyntax conv => conv.AttributeLists,
+            PropertyDeclarationSyntax property => property.AttributeLists,
+            IndexerDeclarationSyntax indexer => indexer.AttributeLists,
+            EventDeclarationSyntax @event => @event.AttributeLists,
+            AccessorDeclarationSyntax accessor => accessor.AttributeLists,
+            _ => default,
+        };
+        foreach (AttributeListSyntax list in lists)
+        {
+            foreach (AttributeSyntax attribute in list.Attributes)
+            {
+                string name = TokenText(attribute.Name).Replace("\u0001", "", StringComparison.Ordinal);
+                if (name.EndsWith("BurstCompile", StringComparison.Ordinal) ||
+                    name.EndsWith("BurstCompileAttribute", StringComparison.Ordinal))
+                {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     private static string DisplayName(MemberDeclarationSyntax member)
@@ -1070,20 +1619,28 @@ public static class HotDiff
     }
 
     /// <summary>MonoBehaviour/Editor message names Unity discovers per type
-    /// at load time — adding one can never take effect through a detour.</summary>
-    private static readonly HashSet<string> UnityMagicMethods = new(StringComparer.Ordinal)
+    /// at load time — adding one can never take effect through a detour.
+    /// Curated SUPERSET across Unity versions (UI/Canvas, animation and
+    /// particle-job callbacks included): a name listed here but unused by
+    /// the project's Unity version only costs a false cold, while a missing
+    /// name would report hot success that silently never runs.</summary>
+    internal static readonly HashSet<string> UnityMagicMethods = new(StringComparer.Ordinal)
     {
         "Awake", "FixedUpdate", "LateUpdate", "OnAnimatorIK", "OnAnimatorMove",
         "OnApplicationFocus", "OnApplicationPause", "OnApplicationQuit",
         "OnAudioFilterRead", "OnBecameInvisible", "OnBecameVisible",
+        "OnBeforeTransformParentChanged", "OnCanvasGroupChanged", "OnCanvasHierarchyChanged",
         "OnCollisionEnter", "OnCollisionEnter2D", "OnCollisionExit", "OnCollisionExit2D",
         "OnCollisionStay", "OnCollisionStay2D", "OnControllerColliderHit",
-        "OnDestroy", "OnDisable", "OnDrawGizmos", "OnDrawGizmosSelected",
-        "OnEnable", "OnGUI", "OnJointBreak", "OnJointBreak2D",
+        "OnDestroy", "OnDidApplyAnimationProperties", "OnDisable",
+        "OnDrawGizmos", "OnDrawGizmosSelected",
+        "OnEnable", "OnGUI", "OnJointBreak", "OnJointBreak2D", "OnLevelWasLoaded",
         "OnMouseDown", "OnMouseDrag", "OnMouseEnter", "OnMouseExit",
         "OnMouseOver", "OnMouseUp", "OnMouseUpAsButton",
         "OnParticleCollision", "OnParticleSystemStopped", "OnParticleTrigger",
-        "OnPostRender", "OnPreCull", "OnPreRender", "OnRenderImage", "OnRenderObject",
+        "OnParticleUpdateJobScheduled",
+        "OnPostRender", "OnPreCull", "OnPreRender",
+        "OnRectTransformDimensionsChange", "OnRenderImage", "OnRenderObject",
         "OnTransformChildrenChanged", "OnTransformParentChanged",
         "OnTriggerEnter", "OnTriggerEnter2D", "OnTriggerExit", "OnTriggerExit2D",
         "OnTriggerStay", "OnTriggerStay2D", "OnValidate", "OnWillRenderObject",

@@ -14,7 +14,7 @@ use super::client::CompileClient;
 /// match `CompileService.ProtocolVersion` / `WrapperContractVersion` in
 /// `locus_compile_server` (the sidecar ships inside the same bundle, so a
 /// mismatch means a corrupted or foreign install — fall back to Unity).
-const EXPECTED_PROTOCOL_VERSION: i64 = 2;
+const EXPECTED_PROTOCOL_VERSION: i64 = 3;
 const EXPECTED_WRAPPER_CONTRACT_VERSION: i64 = 1;
 
 const SERVER_DLL_NAME: &str = "LocusCompileServer.dll";
@@ -115,7 +115,10 @@ async fn spawn_server() -> Result<Arc<ServerHandle>, String> {
     let client = CompileClient::spawn(&dotnet.program, &args, &dotnet.envs, &stderr_log).await?;
 
     let init = client
-        .request("initialize", json!({ "protocolVersion": EXPECTED_PROTOCOL_VERSION }))
+        .request(
+            "initialize",
+            json!({ "protocolVersion": EXPECTED_PROTOCOL_VERSION }),
+        )
         .await
         .map_err(|e| {
             client.kill_process();

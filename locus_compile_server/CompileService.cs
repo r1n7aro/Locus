@@ -137,6 +137,18 @@ public sealed class IndexTypesRequestDto
     public CompileParamsDto? Params { get; set; }
 }
 
+public sealed class RegisterImageRequestDto
+{
+    [JsonPropertyName("domainGeneration")]
+    public string? DomainGeneration { get; set; }
+
+    [JsonPropertyName("assemblyName")]
+    public string? AssemblyName { get; set; }
+
+    [JsonPropertyName("assemblyB64")]
+    public string? AssemblyB64 { get; set; }
+}
+
 public sealed class CompileHotPatchRequestDto
 {
     [JsonPropertyName("files")]
@@ -156,7 +168,7 @@ public sealed class CompileHotPatchRequestDto
 
 public sealed class CompileService
 {
-    public const int ProtocolVersion = 2;
+    public const int ProtocolVersion = 3;
 
     /// <summary>
     /// Version of the generated wrapper's entry-point contract with the Unity
@@ -242,6 +254,33 @@ public sealed class CompileService
             _imageRegistry.Register(request.Params!.DomainGeneration!, assemblyName, bytes);
 
         return SuccessResult(bytes, assemblyName, startedAt);
+    }
+
+    public JsonNode HandleRegisterImage(JsonNode? @params)
+    {
+        var request = Deserialize<RegisterImageRequestDto>(@params);
+        if (string.IsNullOrWhiteSpace(request.DomainGeneration))
+            throw new RpcInvalidParamsException("image/register requires domainGeneration");
+        if (string.IsNullOrWhiteSpace(request.AssemblyName))
+            throw new RpcInvalidParamsException("image/register requires assemblyName");
+        if (string.IsNullOrWhiteSpace(request.AssemblyB64))
+            throw new RpcInvalidParamsException("image/register requires assemblyB64");
+
+        byte[] bytes;
+        try
+        {
+            bytes = Convert.FromBase64String(request.AssemblyB64!);
+        }
+        catch (FormatException ex)
+        {
+            throw new RpcInvalidParamsException("image/register assemblyB64 is invalid: " + ex.Message);
+        }
+
+        _imageRegistry.Register(request.DomainGeneration!, request.AssemblyName!, bytes);
+        return new JsonObject
+        {
+            ["success"] = true,
+        };
     }
 
     public JsonNode HandleCompileSnippet(JsonNode? @params)
@@ -407,6 +446,19 @@ public sealed class CompileService
             ["newTypes"] = new JsonArray(diff.NewTypes.Select(t => (JsonNode)t).ToArray()),
             ["patchedTypes"] = new JsonArray(diff.PatchedTypes.Select(t => (JsonNode)t).ToArray()),
         };
+        if (diff.RequiresCallerCheck.Count > 0)
+        {
+            json["requiresCallerCheck"] = new JsonArray(diff.RequiresCallerCheck
+                .Select(m => (JsonNode)new JsonObject
+                {
+                    ["declaringType"] = m.DeclaringType,
+                    ["name"] = m.Name,
+                    ["paramTypeNames"] = new JsonArray(m.ParamTypeNames.Select(p => (JsonNode)p).ToArray()),
+                    ["kind"] = m.Kind,
+                    ["detail"] = m.Detail,
+                })
+                .ToArray());
+        }
         if (diff.SyntaxError != null)
             json["syntaxError"] = diff.SyntaxError;
         return json;

@@ -382,6 +382,107 @@ mod windows_impl {
         })
     }
 
+    /// Best-effort send for progress polls riding on a connection that has a
+    /// request in flight. The execute loop polls progress from the same task
+    /// that drives the in-flight send future inside a `select!` handler, so
+    /// awaiting the writer lock here deadlocks until the write timeout (the
+    /// suspended send future holds the guard and is never polled while the
+    /// handler runs) and then tears down the connection under the in-flight
+    /// request. Instead: returns `Ok(None)` when the writer is busy so the
+    /// caller skips this poll, and on response timeout drops only its own
+    /// pending entry — the connection and other pending requests stay up.
+    /// Only a write that fails after acquiring the writer (possible partial
+    /// frame) closes the connection, matching `send_message_inner`.
+    pub async fn send_message_if_writer_free(
+        project_path: &str,
+        msg_type: &str,
+        message: &str,
+        response_timeout: Duration,
+    ) -> Result<Option<PipeResponse>, String> {
+        let conn = get_or_connect(project_path).await?;
+
+        let mut writer_guard = match conn.writer.try_lock() {
+            Ok(guard) => guard,
+            Err(_) => return Ok(None),
+        };
+
+        let request_id = next_request_id();
+        let env = PipeEnvelope {
+            id: Some(request_id.clone()),
+            reply_to: None,
+            kind: msg_type.to_string(),
+            ok: None,
+            message: Some(message.to_string()),
+            error: None,
+            process_id: None,
+            process_path: None,
+        };
+
+        let mut frame =
+            serde_json::to_vec(&env).map_err(|e| format!("Serialization failed: {}", e))?;
+        frame.push(b'\n');
+
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut pending = conn.pending.lock().await;
+            pending.insert(request_id.clone(), tx);
+        }
+
+        let write_result = tokio::time::timeout(PIPE_WRITE_TIMEOUT, async {
+            let writer = writer_guard
+                .as_mut()
+                .ok_or_else(|| "Unity pipe connection is closing".to_string())?;
+            writer
+                .write_all(&frame)
+                .await
+                .map_err(|e| format!("Pipe write failed: {}", e))?;
+            writer
+                .flush()
+                .await
+                .map_err(|e| format!("Pipe flush failed: {}", e))
+        })
+        .await
+        .unwrap_or_else(|_| Err("Unity pipe write timed out".to_string()));
+
+        // Release the writer before waiting on the response so the main
+        // request's own writes are never queued behind this poll.
+        drop(writer_guard);
+
+        if let Err(err) = write_result {
+            {
+                let mut pending = conn.pending.lock().await;
+                pending.remove(&request_id);
+            }
+            remove_connection_if_same(&conn.pipe_name, &conn).await;
+            close_connection(&conn, err.clone()).await;
+            return Err(err);
+        }
+
+        let env = match tokio::time::timeout(response_timeout, rx).await {
+            Ok(Ok(Ok(env))) => env,
+            Ok(Ok(Err(e))) => return Err(e),
+            Ok(Err(_)) => {
+                return Err("Unity response failed: response channel closed".to_string())
+            }
+            Err(_) => {
+                let mut pending = conn.pending.lock().await;
+                pending.remove(&request_id);
+                return Err("Unity response timed out".to_string());
+            }
+        };
+
+        Ok(Some(PipeResponse {
+            ok: env.ok.unwrap_or(false),
+            error: env.error,
+            message: env.message,
+            process_id: env.process_id.filter(|id| *id > 0),
+            process_path: env
+                .process_path
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+        }))
+    }
+
     pub async fn send_message_with_timeout(
         project_path: &str,
         msg_type: &str,
@@ -460,6 +561,27 @@ pub async fn send_message_without_timeout(
     message: &str,
 ) -> Result<PipeResponse, String> {
     windows_impl::send_message_without_timeout(project_path, msg_type, message).await
+}
+
+#[cfg(target_os = "windows")]
+pub async fn send_message_if_writer_free(
+    project_path: &str,
+    msg_type: &str,
+    message: &str,
+    response_timeout: Duration,
+) -> Result<Option<PipeResponse>, String> {
+    windows_impl::send_message_if_writer_free(project_path, msg_type, message, response_timeout)
+        .await
+}
+
+#[cfg(not(target_os = "windows"))]
+pub async fn send_message_if_writer_free(
+    _project_path: &str,
+    _msg_type: &str,
+    _message: &str,
+    _response_timeout: Duration,
+) -> Result<Option<PipeResponse>, String> {
+    Err("Unity bridge is only supported on Windows (named pipes)".to_string())
 }
 
 #[cfg(not(target_os = "windows"))]

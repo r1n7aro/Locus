@@ -209,6 +209,49 @@ public class CompileServiceTests
     }
 
     [Fact]
+    public void Image_register_makes_a_precompiled_image_available_after_load()
+    {
+        var service = new CompileService();
+        const string generation = "aaaabbbbccccddddeeeeffff00001111";
+
+        JsonNode defined = CompileRaw(
+            service,
+            "LateA.cs",
+            "public class LateSessionType { public int Value = 9; }",
+            new JsonObject
+            {
+                ["assemblyName"] = "LateSessionA",
+                ["registerImage"] = false,
+                ["params"] = new JsonObject { ["domainGeneration"] = generation },
+            });
+        Assert.True(defined["success"]!.GetValue<bool>());
+
+        const string consumer =
+            "public class LateSessionConsumer { public int Read() { return new LateSessionType().Value; } }";
+        JsonNode beforeRegister = CompileRaw(service, "LateB.cs", consumer, new JsonObject
+        {
+            ["referenceSessionImages"] = true,
+            ["params"] = new JsonObject { ["domainGeneration"] = generation },
+        });
+        Assert.False(beforeRegister["success"]!.GetValue<bool>());
+
+        JsonNode registered = service.HandleRegisterImage(new JsonObject
+        {
+            ["domainGeneration"] = generation,
+            ["assemblyName"] = defined["assemblyName"]!.GetValue<string>(),
+            ["assemblyB64"] = defined["assemblyB64"]!.GetValue<string>(),
+        });
+        Assert.True(registered["success"]!.GetValue<bool>());
+
+        JsonNode afterRegister = CompileRaw(service, "LateC.cs", consumer, new JsonObject
+        {
+            ["referenceSessionImages"] = true,
+            ["params"] = new JsonObject { ["domainGeneration"] = generation },
+        });
+        Assert.True(afterRegister["success"]!.GetValue<bool>(), afterRegister["error"]?.GetValue<string>());
+    }
+
+    [Fact]
     public void Image_registry_isolates_generations()
     {
         var registry = new ImageRegistry();

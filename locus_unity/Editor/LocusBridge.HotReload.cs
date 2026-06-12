@@ -8,6 +8,7 @@ using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
 
 using MonoMod.RuntimeDetour;
+using Assembly = System.Reflection.Assembly;
 
 namespace Locus
 {
@@ -24,11 +25,20 @@ namespace Locus
             public IDisposable Detour;
             public string PatchId;
             public string Engine;
+            public MethodBase Original;
+            public MethodBase Patch;
+        }
+
+        private sealed class HotPatchApplyChange
+        {
+            public string MethodKey;
+            public HotPatchDetourEntry NewEntry;
+            public HotPatchDetourEntry PreviousEntry;
         }
 
         // Active detour per ORIGINAL method key. Re-patching the same method
-        // disposes the previous detour first (no chains, one redirect per
-        // method); everything dies naturally with the AppDomain.
+        // has one live redirect at a time; failed patch batches restore any
+        // detours they temporarily superseded.
         private static readonly object _hotPatchLock = new object();
         private static readonly Dictionary<string, HotPatchDetourEntry> _hotMethodDetours =
             new Dictionary<string, HotPatchDetourEntry>(StringComparer.Ordinal);
@@ -236,8 +246,8 @@ namespace Locus
 
             if (request == null || string.IsNullOrEmpty(request.assembly_b64))
                 return ErrorResponse(requestId, "hot_patch_loaded request missing assembly bytes");
-            if (request.methods == null || request.methods.Length == 0)
-                return ErrorResponse(requestId, "hot_patch_loaded request has no methods to redirect");
+            if (request.methods == null)
+                request.methods = new HotPatchMethodDto[0];
 
             if (!string.IsNullOrEmpty(request.domain_generation) &&
                 !string.Equals(request.domain_generation, _compileDomainGeneration, StringComparison.Ordinal))
@@ -299,7 +309,7 @@ namespace Locus
                 return ErrorResponse(requestId, "hot patch assembly load failed: " + ex.Message);
             }
 
-            var applied = new List<KeyValuePair<string, HotPatchDetourEntry>>(methods.Length);
+            var applied = new List<HotPatchApplyChange>(methods.Length);
             string engineSummary = null;
 
             lock (_hotPatchLock)
@@ -321,11 +331,13 @@ namespace Locus
                         return ErrorResponse(requestId, "hot patch missing patched " + DescribeMethod(dto) + ": " + error);
                     }
 
-                    string methodKey = MethodKey(dto);
+                    if (!ValidateDetourSignature(original, patch, out error))
+                    {
+                        RollbackHotPatch(applied);
+                        return ErrorResponse(requestId, "hot patch signature mismatch for " + DescribeMethod(dto) + ": " + error);
+                    }
 
-                    // One redirect per original method: a previous patch's
-                    // detour is released before the new one lands, so
-                    // NativeDetour never stacks saved prologues.
+                    string methodKey = MethodKey(dto);
                     HotPatchDetourEntry previous;
                     if (_hotMethodDetours.TryGetValue(methodKey, out previous))
                     {
@@ -338,16 +350,31 @@ namespace Locus
                     {
                         string engine;
                         IDisposable detour = CreateMethodDetour(original, patch, out engine);
-                        entry = new HotPatchDetourEntry { Detour = detour, PatchId = patchId, Engine = engine };
+                        entry = new HotPatchDetourEntry
+                        {
+                            Detour = detour,
+                            PatchId = patchId,
+                            Engine = engine,
+                            Original = original,
+                            Patch = patch,
+                        };
                     }
                     catch (Exception ex)
                     {
+                        string restoreError;
+                        if (previous != null && !RestorePreviousDetour(methodKey, previous, out restoreError))
+                            Debug.LogError("[Locus] Failed to restore superseded hot patch for " + methodKey + ": " + restoreError);
                         RollbackHotPatch(applied);
                         return ErrorResponse(requestId, "detour failed for " + DescribeMethod(dto) + ": " + ex.Message);
                     }
 
                     _hotMethodDetours[methodKey] = entry;
-                    applied.Add(new KeyValuePair<string, HotPatchDetourEntry>(methodKey, entry));
+                    applied.Add(new HotPatchApplyChange
+                    {
+                        MethodKey = methodKey,
+                        NewEntry = entry,
+                        PreviousEntry = previous,
+                    });
                     engineSummary = engineSummary == null || engineSummary == entry.Engine
                         ? entry.Engine
                         : "mixed";
@@ -358,24 +385,138 @@ namespace Locus
             {
                 patch_id = patchId,
                 method_count = applied.Count,
-                detour_engine = engineSummary ?? "",
+                detour_engine = engineSummary ?? "load_only",
             };
             Debug.Log("[Locus] Hot patch applied: " + applied.Count + " method(s), patch " + patchId);
             return OkResponse(requestId, JsonUtility.ToJson(response));
         }
 
-        private static void RollbackHotPatch(List<KeyValuePair<string, HotPatchDetourEntry>> applied)
+        private static void RollbackHotPatch(List<HotPatchApplyChange> applied)
         {
-            // Failed mid-apply: drop everything this patch installed. Some
-            // superseded detours are already gone — the original bodies run
-            // for those methods until the queued recompile converges.
-            foreach (KeyValuePair<string, HotPatchDetourEntry> pair in applied)
+            for (int i = applied.Count - 1; i >= 0; i--)
             {
-                try { pair.Value.Detour.Dispose(); } catch { }
+                HotPatchApplyChange change = applied[i];
+                try { change.NewEntry.Detour.Dispose(); } catch { }
                 HotPatchDetourEntry current;
-                if (_hotMethodDetours.TryGetValue(pair.Key, out current) && ReferenceEquals(current, pair.Value))
-                    _hotMethodDetours.Remove(pair.Key);
+                if (_hotMethodDetours.TryGetValue(change.MethodKey, out current) && ReferenceEquals(current, change.NewEntry))
+                    _hotMethodDetours.Remove(change.MethodKey);
+
+                if (change.PreviousEntry != null)
+                {
+                    string restoreError;
+                    if (!RestorePreviousDetour(change.MethodKey, change.PreviousEntry, out restoreError))
+                        Debug.LogError("[Locus] Failed to restore superseded hot patch for " + change.MethodKey + ": " + restoreError);
+                }
             }
+        }
+
+        private static bool RestorePreviousDetour(string methodKey, HotPatchDetourEntry previous, out string error)
+        {
+            error = null;
+            try
+            {
+                string engine;
+                IDisposable detour = CreateMethodDetour(previous.Original, previous.Patch, out engine);
+                previous.Detour = detour;
+                previous.Engine = engine;
+                _hotMethodDetours[methodKey] = previous;
+                return true;
+            }
+            catch (Exception ex)
+            {
+                error = ex.Message;
+                return false;
+            }
+        }
+
+        private static bool ValidateDetourSignature(MethodBase original, MethodBase patch, out string error)
+        {
+            error = null;
+            ParameterInfo[] originalParams = original.GetParameters();
+            ParameterInfo[] patchParams = patch.GetParameters();
+            if (originalParams.Length != patchParams.Length)
+            {
+                error = "parameter count differs";
+                return false;
+            }
+            for (int i = 0; i < originalParams.Length; i++)
+            {
+                if (!SameDetourType(originalParams[i].ParameterType, patchParams[i].ParameterType))
+                {
+                    error = "parameter " + i + " differs: " +
+                        DisplayType(originalParams[i].ParameterType) + " vs " +
+                        DisplayType(patchParams[i].ParameterType);
+                    return false;
+                }
+            }
+
+            MethodInfo originalMethod = original as MethodInfo;
+            MethodInfo patchMethod = patch as MethodInfo;
+            if ((originalMethod == null) != (patchMethod == null))
+            {
+                error = "method kind differs";
+                return false;
+            }
+            if (originalMethod != null &&
+                !SameDetourType(originalMethod.ReturnType, patchMethod.ReturnType))
+            {
+                error = "return type differs: " +
+                    DisplayType(originalMethod.ReturnType) + " vs " +
+                    DisplayType(patchMethod.ReturnType);
+                return false;
+            }
+
+            return true;
+        }
+
+        private static bool SameDetourType(Type left, Type right)
+        {
+            if (left == right)
+                return true;
+            if (left == null || right == null)
+                return false;
+            if (left.IsByRef || right.IsByRef)
+            {
+                return left.IsByRef == right.IsByRef &&
+                    SameDetourType(left.GetElementType(), right.GetElementType());
+            }
+            if (left.IsArray || right.IsArray)
+            {
+                return left.IsArray == right.IsArray &&
+                    left.GetArrayRank() == right.GetArrayRank() &&
+                    SameDetourType(left.GetElementType(), right.GetElementType());
+            }
+            if (left.IsGenericParameter || right.IsGenericParameter)
+            {
+                return left.IsGenericParameter == right.IsGenericParameter &&
+                    left.GenericParameterPosition == right.GenericParameterPosition;
+            }
+            if (left.IsGenericType || right.IsGenericType)
+            {
+                if (left.IsGenericType != right.IsGenericType)
+                    return false;
+                if (!SameDetourType(left.GetGenericTypeDefinition(), right.GetGenericTypeDefinition()))
+                    return false;
+                Type[] leftArgs = left.GetGenericArguments();
+                Type[] rightArgs = right.GetGenericArguments();
+                if (leftArgs.Length != rightArgs.Length)
+                    return false;
+                for (int i = 0; i < leftArgs.Length; i++)
+                {
+                    if (!SameDetourType(leftArgs[i], rightArgs[i]))
+                        return false;
+                }
+                return true;
+            }
+            return string.Equals(left.FullName, right.FullName, StringComparison.Ordinal) &&
+                string.Equals(SafeAssemblyName(left.Assembly), SafeAssemblyName(right.Assembly), StringComparison.Ordinal);
+        }
+
+        private static string DisplayType(Type type)
+        {
+            if (type == null)
+                return "<null>";
+            return type.FullName + ", " + SafeAssemblyName(type.Assembly);
         }
 
         private static string MethodKey(HotPatchMethodDto dto)

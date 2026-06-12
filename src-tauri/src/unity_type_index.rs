@@ -384,10 +384,7 @@ pub async fn append_hot_patch_types(
         return Ok(());
     }
     let Some(mut cache) = read_type_index_cache_file(project_path)? else {
-        // No base index yet — the next full export will not include patch
-        // types (Unity skips the assemblies), but resolving names through
-        // an index that does not exist is moot; skip quietly.
-        return Ok(());
+        return Err("base Unity type index cache is missing".to_string());
     };
 
     // Re-patching the same new type supersedes the previous patch's row.
@@ -405,6 +402,30 @@ pub async fn append_hot_patch_types(
     let index = write_type_index_cache_file(project_path, cache).await?;
     set_cached_type_index(project_path, index).await;
     Ok(())
+}
+
+/// Drop TI-C rows that came from transient hot-patch assemblies. Detours and
+/// hot-patch assemblies disappear on domain reload; the base Unity fingerprint
+/// may stay unchanged, so the cache needs an explicit cleanup path.
+pub async fn drop_hot_patch_types(project_path: &str) -> Result<usize, String> {
+    let Some(mut cache) = read_type_index_cache_file(project_path)? else {
+        return Ok(0);
+    };
+    let before = cache.types.len();
+    cache
+        .types
+        .retain(|entry| !entry.assembly.starts_with("__LocusHotPatch_"));
+    let removed = before.saturating_sub(cache.types.len());
+    if removed == 0 {
+        return Ok(0);
+    }
+    cache
+        .assemblies
+        .retain(|assembly, _| !assembly.starts_with("__LocusHotPatch_"));
+    cache.exported_at_unix_ms = now_unix_ms();
+    let index = write_type_index_cache_file(project_path, cache).await?;
+    set_cached_type_index(project_path, index).await;
+    Ok(removed)
 }
 
 fn read_type_index_cache_file(
