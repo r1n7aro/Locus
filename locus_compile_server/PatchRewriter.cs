@@ -21,6 +21,10 @@ public sealed class PatchMethodMap
     /// assembly (an earlier patch's shim being re-edited) instead of the
     /// project assemblies.</summary>
     public string? OriginalAssembly;
+
+    /// <summary>The patch side is a synthesized empty body (a deleted Unity
+    /// message method being silenced) — observability for the tool output.</summary>
+    public bool IsStub;
 }
 
 /// <summary>A type that only exists in the new text (TI-C / ImageRegistry).</summary>
@@ -773,6 +777,55 @@ public static class PatchRewriter
                     }
                 }
             }
+        }
+
+        // ── deletions (M5) ───────────────────────────────────────────
+        // Removed members stay untouched in the loaded original (in-flight
+        // delegates/coroutines are legitimate callers) and tombstone in the
+        // registry. Removed UNITY MESSAGE methods additionally get an
+        // empty-body stub re-materialized in the patch type + a normal
+        // detour mapping: the engine calls the original every frame, and
+        // the stub is what makes the deletion observable immediately.
+        foreach (HotDiffRemovedMember removed in diff.RemovedMembers)
+        {
+            result.ShimRegistrations.Add(new ShimRegistration
+            {
+                MemberKey = MemberSurfaceRegistry.MemberKey(
+                    removed.DeclaringType, removed.Name, removed.ParamTypeNames, removed.IsStatic),
+                Entry = new MemberSurfaceRegistry.ShimEntry { Kind = "tombstone" },
+            });
+
+            if (!removed.IsUnityMagic || removed.StubSource == null)
+                continue;
+
+            if (SyntaxFactory.ParseMemberDeclaration(removed.StubSource) is not MethodDeclarationSyntax stub)
+                continue;
+
+            string renamedMetadataName = PatchTypeName(removed.DeclaringType);
+            TypeDeclarationSyntax? host = ((CompilationUnitSyntax)rewritten)
+                .DescendantNodes()
+                .OfType<TypeDeclarationSyntax>()
+                .FirstOrDefault(t => HotDiff.MetadataName(t) == renamedMetadataName);
+            if (host == null)
+                continue;
+
+            rewritten = rewritten.ReplaceNode(
+                host,
+                host.AddMembers(stub
+                    .NormalizeWhitespace()
+                    .WithLeadingTrivia(SyntaxFactory.ElasticCarriageReturnLineFeed)
+                    .WithTrailingTrivia(SyntaxFactory.ElasticCarriageReturnLineFeed)));
+
+            result.Methods.Add(new PatchMethodMap
+            {
+                DeclaringType = removed.DeclaringType,
+                PatchDeclaringType = renamedMetadataName,
+                Name = removed.Name,
+                ParamTypeNames = removed.ParamTypeNames,
+                IsStatic = removed.IsStatic,
+                IsCtor = false,
+                IsStub = true,
+            });
         }
 
         result.Tree = CSharpSyntaxTree.Create(

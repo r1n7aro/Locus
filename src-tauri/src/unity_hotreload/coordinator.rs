@@ -353,11 +353,10 @@ pub async fn hot_reload(
         let current = match tokio::fs::read_to_string(&edit.absolute_path).await {
             Ok(text) => text,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                // Deleted since the edit — deletion is never hot.
-                return Err(format!(
-                    "{} was deleted after being edited; file deletions need unity_recompile.",
-                    edit.absolute_path
-                ));
+                // Deleted since the edit: enter the batch as an empty file —
+                // the sidecar classifies the type deletions (M5/H7e) and
+                // either hot-deletes or queues a precise cold reason.
+                String::new()
             }
             Err(error) => {
                 return Err(format!("Failed to read {}: {error}", edit.absolute_path));
@@ -417,16 +416,33 @@ pub async fn hot_reload(
             ));
             Ok(lines.join("\n"))
         }
-        crate::csharp_compile::HotPatchOutcome::Noop => Ok(
-            "No effective code change (comments/formatting only); nothing to hot reload."
-                .to_string(),
-        ),
+        crate::csharp_compile::HotPatchOutcome::Noop {
+            deletions_noted,
+            caller_scan_note,
+        } => {
+            if deletions_noted == 0 {
+                return Ok(
+                    "No effective code change (comments/formatting only); nothing to hot reload."
+                        .to_string(),
+                );
+            }
+            let mut summary = format!(
+                "Deletion applied: {deletions_noted} removed member(s) recorded. The loaded code \
+                 was already correct (the members are unreachable); later hot patches referencing \
+                 them will fail with a pointed error until unity_recompile converges."
+            );
+            if let Some(note) = caller_scan_note {
+                summary.push_str(&format!("\nCall-site check: {note}."));
+            }
+            Ok(summary)
+        }
         crate::csharp_compile::HotPatchOutcome::CompileError(message) => Err(message),
         crate::csharp_compile::HotPatchOutcome::Compiled {
             assembly_name,
             assembly_b64,
             methods,
             new_types,
+            caller_scan_note,
         } => {
             if methods.is_empty() && new_types.is_empty() {
                 return Ok(
@@ -526,6 +542,7 @@ pub async fn hot_reload(
                 })
                 .unwrap_or_default();
 
+            let stub_count = methods.iter().filter(|m| m.is_stub).count();
             let mut summary = format!(
                 "Hot reload applied in {} ms: {} method(s) redirected across {} file(s)",
                 started.elapsed().as_millis(),
@@ -537,6 +554,17 @@ pub async fn hot_reload(
             }
             if !engine.is_empty() {
                 summary.push_str(&format!(" (engine: {engine})"));
+            }
+            if stub_count > 0 {
+                summary.push_str(&format!(
+                    ".\n{stub_count} deleted Unity message method(s) now detour to empty stubs — \
+                     the behavior stops immediately; reflection/SendMessage/UnityEvent string \
+                     bindings to deleted members cannot be verified and only converge at \
+                     unity_recompile"
+                ));
+            }
+            if let Some(note) = &caller_scan_note {
+                summary.push_str(&format!(".\nCall-site check: {note}"));
             }
             if let Some(error) = &image_register_error {
                 summary.push_str(&format!(

@@ -328,6 +328,194 @@ namespace ShimE2E
         Assert.Equal(new[] { "Calc" }, detour["paramTypeNames"]!.AsArray().Select(p => p!.GetValue<string>()));
     }
 
+    /// <summary>Compile an "original" into Library/ScriptAssemblies so the
+    /// M3 caller scan treats it as a project assembly (embedded PDB carries
+    /// the source document paths).</summary>
+    private string CompileProjectAssembly(CompileService service, string assemblyName, params (string Path, string Text)[] sources)
+    {
+        var request = new JsonObject
+        {
+            ["assemblyName"] = assemblyName,
+            ["sources"] = new JsonArray(sources
+                .Select(s => (JsonNode)new JsonObject { ["path"] = s.Path, ["text"] = s.Text })
+                .ToArray()),
+            ["useHostBcl"] = true,
+        };
+        JsonNode result = service.HandleCompileRaw(request);
+        Assert.True(result["success"]!.GetValue<bool>(), result["error"]?.GetValue<string>());
+
+        string dir = Path.Combine(_tempDir, "Library", "ScriptAssemblies");
+        Directory.CreateDirectory(dir);
+        string path = Path.Combine(dir, assemblyName + ".dll");
+        File.WriteAllBytes(path, Convert.FromBase64String(result["assemblyB64"]!.GetValue<string>()));
+        return path;
+    }
+
+    private const string ScanLibSource = @"
+namespace ScanE2E
+{
+    public class Lib
+    {
+        public int M(int a) { return a; }
+    }
+}";
+
+    private const string ScanUseSource = @"
+namespace ScanE2E
+{
+    public class Use
+    {
+        public static int Go() { var l = new Lib(); return l.M(5); }
+    }
+}";
+
+    [Fact]
+    public void Removal_with_uncovered_caller_is_cold_with_exact_file_list()
+    {
+        var service = new CompileService();
+        string asmPath = CompileProjectAssembly(
+            service, "ScanE2EUncovered",
+            ("Assets/Lib.cs", ScanLibSource),
+            ("Assets/Use.cs", ScanUseSource));
+        JsonObject compileParams = ParamsFor(asmPath);
+
+        string removed = ScanLibSource.Replace("public int M(int a) { return a; }", "");
+        JsonNode result = HotPatch(service, compileParams, ("Assets/Lib.cs", ScanLibSource, removed));
+
+        Assert.False(result["hot"]!.GetValue<bool>());
+        var file = Assert.Single(result["files"]!.AsArray())!;
+        Assert.Equal("Assets/Lib.cs", file["path"]!.GetValue<string>());
+        string reason = file["reasons"]!.AsArray().Single()!.GetValue<string>();
+        Assert.Contains("Assets/Use.cs", reason);
+        Assert.Contains("unity_recompile", reason);
+    }
+
+    [Fact]
+    public void Rename_with_caller_in_batch_goes_hot_and_executes_via_shim()
+    {
+        var service = new CompileService();
+        string asmPath = CompileProjectAssembly(
+            service, "ScanE2ERename",
+            ("Assets/Lib.cs", ScanLibSource),
+            ("Assets/Use.cs", ScanUseSource));
+        JsonObject compileParams = ParamsFor(asmPath);
+
+        string renamedLib = ScanLibSource.Replace(
+            "public int M(int a) { return a; }",
+            "public int MM(int a) { return a + 100; }");
+        string updatedUse = ScanUseSource.Replace("return l.M(5);", "return l.MM(5);");
+
+        JsonNode result = HotPatch(
+            service, compileParams,
+            ("Assets/Lib.cs", ScanLibSource, renamedLib),
+            ("Assets/Use.cs", ScanUseSource, updatedUse));
+
+        Assert.True(result["hot"]!.GetValue<bool>(), result["files"]?.ToJsonString());
+        Assert.True(result["success"]!.GetValue<bool>(), result["error"]?.GetValue<string>());
+        Assert.Contains("verified", result["callerScan"]!.GetValue<string>());
+
+        // Only Use.Go detours; the renamed MM is an added shim.
+        var detour = Assert.Single(result["methods"]!.AsArray())!;
+        Assert.Equal("ScanE2E.Use", detour["declaringType"]!.GetValue<string>());
+        Assert.Equal("Go", detour["name"]!.GetValue<string>());
+
+        byte[] originalBytes = File.ReadAllBytes(asmPath);
+        byte[] patchBytes = Convert.FromBase64String(result["assemblyB64"]!.GetValue<string>());
+        var context = new AssemblyLoadContext("rename-e2e", isCollectible: true);
+        try
+        {
+            Assembly original = context.LoadFromStream(new MemoryStream(originalBytes));
+            context.Resolving += (_, name) => name.Name == "ScanE2ERename" ? original : null;
+            Assembly patch = context.LoadFromStream(new MemoryStream(patchBytes));
+
+            Type patchUse = patch.GetType("ScanE2E.Use__LocusPatch", throwOnError: true)!;
+            object? value = patchUse.GetMethod("Go")!.Invoke(null, null);
+            Assert.Equal(105, value);
+        }
+        finally
+        {
+            context.Unload();
+        }
+    }
+
+    [Fact]
+    public void Pure_removal_with_covered_callers_is_a_noop_with_tombstones()
+    {
+        var service = new CompileService();
+        string asmPath = CompileProjectAssembly(
+            service, "ScanE2EPureRemoval",
+            ("Assets/Lib.cs", ScanLibSource),
+            ("Assets/Use.cs", ScanUseSource));
+        JsonObject compileParams = ParamsFor(asmPath);
+        compileParams["domainGeneration"] = "removal-gen";
+
+        string removedLib = ScanLibSource.Replace("public int M(int a) { return a; }", "");
+        string updatedUse = ScanUseSource.Replace("return l.M(5);", "return 5;");
+
+        // Use.cs changes too (drops the call) so the scan passes; Lib.cs is
+        // a pure deletion. Both files hot → Use detours, M tombstones.
+        JsonNode result = HotPatch(
+            service, compileParams,
+            ("Assets/Lib.cs", ScanLibSource, removedLib),
+            ("Assets/Use.cs", ScanUseSource, updatedUse));
+
+        Assert.True(result["hot"]!.GetValue<bool>(), result["files"]?.ToJsonString());
+        Assert.True(result["success"]!.GetValue<bool>(), result["error"]?.GetValue<string>());
+        // Not a noop overall (Use.Go detours), but the batch carries the
+        // tombstone via the pending-shim flow.
+        Assert.Single(result["methods"]!.AsArray());
+    }
+
+    [Fact]
+    public void Removed_unity_message_method_detours_to_an_empty_stub()
+    {
+        var service = new CompileService();
+        const string playerSource = @"
+namespace StubE2E
+{
+    public class Player
+    {
+        private int _ticks;
+        public void Update() { _ticks += 1; }
+        public int Ticks() { return _ticks; }
+    }
+}";
+        string asmPath = CompileProjectAssembly(service, "StubE2EPlayer", ("Assets/Player.cs", playerSource));
+        JsonObject compileParams = ParamsFor(asmPath);
+
+        string removed = playerSource.Replace("public void Update() { _ticks += 1; }", "");
+        JsonNode result = HotPatch(service, compileParams, ("Assets/Player.cs", playerSource, removed));
+
+        Assert.True(result["hot"]!.GetValue<bool>(), result["files"]?.ToJsonString());
+        Assert.True(result["success"]!.GetValue<bool>(), result["error"]?.GetValue<string>());
+
+        var stub = Assert.Single(result["methods"]!.AsArray())!;
+        Assert.Equal("StubE2E.Player", stub["declaringType"]!.GetValue<string>());
+        Assert.Equal("StubE2E.Player__LocusPatch", stub["patchDeclaringType"]!.GetValue<string>());
+        Assert.Equal("Update", stub["name"]!.GetValue<string>());
+        Assert.True(stub["isStub"]!.GetValue<bool>());
+
+        // The stub is genuinely empty: invoking it must not touch state.
+        byte[] originalBytes = File.ReadAllBytes(asmPath);
+        byte[] patchBytes = Convert.FromBase64String(result["assemblyB64"]!.GetValue<string>());
+        var context = new AssemblyLoadContext("stub-e2e", isCollectible: true);
+        try
+        {
+            Assembly original = context.LoadFromStream(new MemoryStream(originalBytes));
+            context.Resolving += (_, name) => name.Name == "StubE2EPlayer" ? original : null;
+            Assembly patch = context.LoadFromStream(new MemoryStream(patchBytes));
+
+            Type patchPlayer = patch.GetType("StubE2E.Player__LocusPatch", throwOnError: true)!;
+            object instance = Activator.CreateInstance(patchPlayer)!;
+            patchPlayer.GetMethod("Update")!.Invoke(instance, null);
+            Assert.Equal(0, patchPlayer.GetMethod("Ticks")!.Invoke(instance, null));
+        }
+        finally
+        {
+            context.Unload();
+        }
+    }
+
     [Fact]
     public void Cold_change_reports_hot_false_with_reasons()
     {

@@ -140,19 +140,20 @@ namespace Game
     }
 
     [Fact]
-    public void Accessibility_narrowing_is_cold_with_caller_check_entry()
+    public void Accessibility_narrowing_is_conditionally_hot_with_caller_check_entry()
     {
         const string oldText = "class A { public void M() { } }";
         const string newText = "class A { private void M() { } }";
 
         var result = Analyze(oldText, newText);
 
-        Assert.False(result.Hot);
-        Assert.Contains(result.Reasons, r => r.Contains("accessibility narrowed"));
+        Assert.True(result.Hot, string.Join("; ", result.Reasons));
         var check = Assert.Single(result.RequiresCallerCheck);
         Assert.Equal("accessibility-narrowed", check.Kind);
         Assert.Equal("A", check.DeclaringType);
         Assert.Equal("M", check.Name);
+        Assert.Equal(new[] { "M" }, check.ScanMemberNames);
+        Assert.Empty(result.ChangedMethods);
     }
 
     [Fact]
@@ -163,8 +164,9 @@ namespace Game
 
         var result = Analyze(oldText, newText);
 
-        Assert.False(result.Hot);
-        Assert.Contains(result.Reasons, r => r.Contains("accessibility narrowed"));
+        Assert.True(result.Hot, string.Join("; ", result.Reasons));
+        var check = Assert.Single(result.RequiresCallerCheck);
+        Assert.Equal("accessibility-narrowed", check.Kind);
     }
 
     // ── interfaces stay cold (IMT dispatch unverified) ───────────────
@@ -418,26 +420,78 @@ namespace Game
     }
 
     [Fact]
-    public void Signature_change_is_cold()
+    public void Signature_change_decomposes_into_remove_plus_add_with_caller_check()
     {
         var result = Analyze(
             PlayerOld,
-            PlayerOld.Replace("private void Helper(string name)", "private void Helper(string name, int times)"));
+            PlayerOld
+                .Replace("private void Helper(string name) { Debug.Log(name); }",
+                         "private void Helper(string name, int times) { Debug.Log(name + times); }"));
 
-        Assert.False(result.Hot);
-        Assert.Contains(result.Reasons, r => r.Contains("member removed"));
+        Assert.True(result.Hot, string.Join("; ", result.Reasons));
+        var removed = Assert.Single(result.RemovedMembers);
+        Assert.Equal("Helper", removed.Name);
+        Assert.Equal(new[] { "String" }, removed.ParamTypeNames);
+        var added = Assert.Single(result.ChangedMethods);
+        Assert.True(added.Added);
+        Assert.Equal(new[] { "String", "Int32" }, added.ParamTypeNames);
+        var check = Assert.Single(result.RequiresCallerCheck);
+        Assert.Equal("member-removed", check.Kind);
+        Assert.Equal(new[] { "Helper" }, check.ScanMemberNames);
     }
 
     [Fact]
-    public void Return_type_change_is_cold()
+    public void Return_type_change_decomposes_into_remove_plus_add()
     {
         const string oldText = "class A { int M() { return 1; } }";
         const string newText = "class A { long M() { return 1; } }";
 
         var result = Analyze(oldText, newText);
 
+        Assert.True(result.Hot, string.Join("; ", result.Reasons));
+        Assert.Single(result.RemovedMembers);
+        var added = Assert.Single(result.ChangedMethods);
+        Assert.True(added.Added);
+        Assert.Single(result.RequiresCallerCheck);
+    }
+
+    [Fact]
+    public void Static_flip_decomposes_into_remove_plus_add()
+    {
+        const string oldText = "class A { int M() { return 1; } }";
+        const string newText = "class A { static int M() { return 1; } }";
+
+        var result = Analyze(oldText, newText);
+
+        Assert.True(result.Hot, string.Join("; ", result.Reasons));
+        var removed = Assert.Single(result.RemovedMembers);
+        Assert.False(removed.IsStatic);
+        var added = Assert.Single(result.ChangedMethods);
+        Assert.True(added.IsStatic);
+    }
+
+    [Fact]
+    public void Virtual_signature_change_is_cold()
+    {
+        const string oldText = "class A { public virtual int M() { return 1; } }";
+        const string newText = "class A { public virtual long M() { return 1; } }";
+
+        var result = Analyze(oldText, newText);
+
         Assert.False(result.Hot);
-        Assert.Contains(result.Reasons, r => r.Contains("member declaration changed"));
+        Assert.Contains(result.Reasons, r => r.Contains("virtual member removed"));
+    }
+
+    [Fact]
+    public void Magic_method_signature_change_is_cold()
+    {
+        const string oldText = "class A { void Update() { } }";
+        const string newText = "class A { int Update() { return 1; } }";
+
+        var result = Analyze(oldText, newText);
+
+        Assert.False(result.Hot);
+        Assert.Contains(result.Reasons, r => r.Contains("Unity message method signature changed"));
     }
 
     [Fact]
@@ -663,14 +717,75 @@ class C
     }
 
     [Fact]
-    public void Member_removed_is_cold()
+    public void Member_removed_is_conditionally_hot_with_caller_check()
     {
         var result = Analyze(
             PlayerOld,
             PlayerOld.Replace("private void Helper(string name) { Debug.Log(name); }", ""));
 
+        Assert.True(result.Hot, string.Join("; ", result.Reasons));
+        var removed = Assert.Single(result.RemovedMembers);
+        Assert.Equal("Helper", removed.Name);
+        Assert.False(removed.IsUnityMagic);
+        Assert.Null(removed.StubSource);
+        Assert.Single(result.RequiresCallerCheck);
+        Assert.Empty(result.ChangedMethods);
+    }
+
+    [Fact]
+    public void Removed_unity_message_method_produces_stub()
+    {
+        var result = Analyze(
+            PlayerOld,
+            PlayerOld.Replace("public void Update() { _health += 1; }", ""));
+
+        Assert.True(result.Hot, string.Join("; ", result.Reasons));
+        var removed = Assert.Single(result.RemovedMembers);
+        Assert.Equal("Update", removed.Name);
+        Assert.True(removed.IsUnityMagic);
+        Assert.NotNull(removed.StubSource);
+        Assert.Contains("Update", removed.StubSource);
+        Assert.Equal(new[] { "Game.Player" }, result.PatchedTypes);
+    }
+
+    [Fact]
+    public void Removed_virtual_member_is_cold()
+    {
+        const string oldText = "class A { public virtual void M() { } }";
+        const string newText = "class A { }";
+
+        var result = Analyze(oldText, newText);
+
         Assert.False(result.Hot);
-        Assert.Contains(result.Reasons, r => r.Contains("member removed"));
+        Assert.Contains(result.Reasons, r => r.Contains("virtual member removed"));
+    }
+
+    [Fact]
+    public void Removed_constructor_is_cold()
+    {
+        const string oldText = "class A { public A(int x) { } }";
+        const string newText = "class A { }";
+
+        var result = Analyze(oldText, newText);
+
+        Assert.False(result.Hot);
+        Assert.Contains(result.Reasons, r => r.Contains("constructor removed"));
+    }
+
+    [Fact]
+    public void Removed_property_records_accessor_removals()
+    {
+        const string oldText = "class A { int _v; public int Value { get { return _v; } set { _v = value; } } }";
+        const string newText = "class A { int _v; }";
+
+        var result = Analyze(oldText, newText);
+
+        Assert.True(result.Hot, string.Join("; ", result.Reasons));
+        Assert.Equal(2, result.RemovedMembers.Count);
+        Assert.Contains(result.RemovedMembers, m => m.Name == "get_Value");
+        Assert.Contains(result.RemovedMembers, m => m.Name == "set_Value");
+        var check = Assert.Single(result.RequiresCallerCheck);
+        Assert.Equal(new[] { "get_Value", "set_Value" }, check.ScanMemberNames);
     }
 
     [Fact]

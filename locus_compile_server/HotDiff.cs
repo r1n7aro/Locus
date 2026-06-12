@@ -43,6 +43,29 @@ public sealed class CallerCheckMember
 
     /// <summary>Human-readable description for cold reasons / tool output.</summary>
     public string Detail = "";
+
+    /// <summary>Metadata member names the IL scan must look for (accessor
+    /// pairs for properties/events); empty = scan the whole type.</summary>
+    public string[] ScanMemberNames = Array.Empty<string>();
+}
+
+/// <summary>A member that exists only in the OLD text (M5 deletion, or the
+/// "remove" half of a signature change). The original stays in place —
+/// unreachable compiled code is harmless and in-flight delegates/coroutines
+/// are legitimate callers — except Unity message methods, which the engine
+/// keeps calling every frame: those get an empty-body stub detour.</summary>
+public sealed class HotDiffRemovedMember
+{
+    public string DeclaringType = "";
+    public string Name = "";
+    public string[] ParamTypeNames = Array.Empty<string>();
+    public bool IsStatic;
+    public bool IsUnityMagic;
+
+    /// <summary>For Unity message methods: the member declaration with an
+    /// emptied body, ready to re-materialize in the patch type as the detour
+    /// target that silences the engine's per-frame calls.</summary>
+    public string? StubSource;
 }
 
 /// <summary>Hot/cold classification of one edited file.</summary>
@@ -54,9 +77,13 @@ public sealed class HotDiffFileResult
     public List<string> Reasons = new();
 
     /// <summary>Member surfaces that must pass the call-site scan (M3)
-    /// before this file can be hot. Populated alongside a cold reason while
-    /// the scan is not wired up.</summary>
+    /// before this file can be hot. `Hot` stays true for these — the
+    /// compile/hotPatch pipeline runs the scan and folds the verdict into
+    /// hot/cold; analyze/hotDiff surfaces the list for transparency.</summary>
     public List<CallerCheckMember> RequiresCallerCheck = new();
+
+    /// <summary>Members that exist only in the old text (M5).</summary>
+    public List<HotDiffRemovedMember> RemovedMembers = new();
 
     /// <summary>Deterministic agent-facing error: the new text does not even
     /// parse. Not a cold reason — recompiling would fail identically.</summary>
@@ -318,16 +345,24 @@ public static class HotDiff
         if (result.Reasons.Count > 0)
             return;
 
+        bool patched = false;
+
         foreach (var pair in oldMembers)
         {
-            if (!newMembers.ContainsKey(pair.Key))
-            {
-                result.Reasons.Add("member removed: " + metadataName + "." + DisplayName(pair.Value));
+            if (newMembers.ContainsKey(pair.Key))
+                continue;
+            int before = result.RemovedMembers.Count;
+            if (!ClassifyRemovedMember(metadataName, pair.Value, genericContext, burstContext, result))
                 return;
+            // A removed Unity message method re-materializes as an
+            // empty-body stub in the patch type (the engine keeps calling
+            // it every frame), which makes the type a patched type.
+            for (int i = before; i < result.RemovedMembers.Count; i++)
+            {
+                if (result.RemovedMembers[i].IsUnityMagic)
+                    patched = true;
             }
         }
-
-        bool patched = false;
 
         foreach (var pair in newMembers)
         {
@@ -341,9 +376,9 @@ public static class HotDiff
                 continue;
             }
 
-            int before = result.Reasons.Count;
+            int reasonsBefore = result.Reasons.Count;
             bool changed = DiffMember(metadataName, oldMember, newMember, genericContext, burstContext, result);
-            if (result.Reasons.Count > before)
+            if (result.Reasons.Count > reasonsBefore)
                 return;
             patched |= changed;
         }
@@ -929,6 +964,210 @@ public static class HotDiff
         }
     }
 
+    /// <summary>Classify a member that only exists in the OLD text (M5).
+    /// Returns false (with a reason) when it forces the cold path; otherwise
+    /// records removal entries + caller-check entries. The original member
+    /// stays in the loaded assembly (in-flight delegates/coroutines are
+    /// legitimate callers); Unity message methods additionally get an
+    /// empty-body stub detour so the engine stops reaching the old body.</summary>
+    private static bool ClassifyRemovedMember(
+        string metadataName,
+        MemberDeclarationSyntax member,
+        bool genericContext,
+        bool burstContext,
+        HotDiffFileResult result)
+    {
+        void AddRemoval(string name, string[] paramTypeNames, bool isStatic, bool isUnityMagic, string? stubSource)
+        {
+            result.RemovedMembers.Add(new HotDiffRemovedMember
+            {
+                DeclaringType = metadataName,
+                Name = name,
+                ParamTypeNames = paramTypeNames,
+                IsStatic = isStatic,
+                IsUnityMagic = isUnityMagic,
+                StubSource = stubSource,
+            });
+        }
+
+        void AddCheck(string displayName, string[] scanNames, string[] paramTypeNames)
+        {
+            string detail = "member removed (or signature changed): " + metadataName + "." + displayName;
+            result.RequiresCallerCheck.Add(new CallerCheckMember
+            {
+                DeclaringType = metadataName,
+                Name = displayName,
+                ParamTypeNames = paramTypeNames,
+                Kind = "member-removed",
+                Detail = detail,
+                ScanMemberNames = scanNames,
+            });
+        }
+
+        switch (member)
+        {
+            case MethodDeclarationSyntax method:
+            {
+                if (burstContext || HasBurstCompileAttribute(method))
+                {
+                    result.Reasons.Add("Burst-compiled member removed: " + metadataName + "." + method.Identifier.Text);
+                    return false;
+                }
+                if (method.ExplicitInterfaceSpecifier != null)
+                {
+                    result.Reasons.Add("explicit interface implementation removed: " + metadataName);
+                    return false;
+                }
+                if (method.Modifiers.Any(m =>
+                    m.IsKind(SyntaxKind.VirtualKeyword) || m.IsKind(SyntaxKind.OverrideKeyword) ||
+                    m.IsKind(SyntaxKind.AbstractKeyword) || m.IsKind(SyntaxKind.SealedKeyword)))
+                {
+                    // Override relations are metadata, not call sites: the
+                    // IL scan cannot prove no out-of-batch override exists.
+                    result.Reasons.Add("virtual member removed: " + metadataName + "." + method.Identifier.Text +
+                        " (override relations cannot be verified; use unity_recompile)");
+                    return false;
+                }
+
+                bool magic = UnityMagicMethods.Contains(method.Identifier.Text);
+                string? stub = null;
+                if (magic)
+                {
+                    if (genericContext)
+                    {
+                        result.Reasons.Add("Unity message method removed from generic type: " + metadataName);
+                        return false;
+                    }
+                    stub = method
+                        .WithAttributeLists(default)
+                        .WithBody(SyntaxFactory.Block())
+                        .WithExpressionBody(null)
+                        .WithSemicolonToken(default)
+                        .NormalizeWhitespace()
+                        .ToFullString();
+                }
+
+                AddRemoval(method.Identifier.Text, ParamTypeNames(method.ParameterList),
+                    method.Modifiers.Any(SyntaxKind.StaticKeyword), magic, stub);
+                AddCheck(method.Identifier.Text, new[] { method.Identifier.Text },
+                    ParamTypeNames(method.ParameterList));
+                return true;
+            }
+
+            case PropertyDeclarationSyntax property when !IsAutoProperty(property):
+            {
+                if (burstContext || property.ExplicitInterfaceSpecifier != null || genericContext)
+                {
+                    result.Reasons.Add("member removed: " + metadataName + "." + property.Identifier.Text);
+                    return false;
+                }
+                if (property.Modifiers.Any(m =>
+                    m.IsKind(SyntaxKind.VirtualKeyword) || m.IsKind(SyntaxKind.OverrideKeyword) ||
+                    m.IsKind(SyntaxKind.AbstractKeyword) || m.IsKind(SyntaxKind.SealedKeyword)))
+                {
+                    result.Reasons.Add("virtual member removed: " + metadataName + "." + property.Identifier.Text);
+                    return false;
+                }
+                bool isStatic = property.Modifiers.Any(SyntaxKind.StaticKeyword);
+                var scanNames = new List<string>();
+                if (property.ExpressionBody != null)
+                {
+                    scanNames.Add("get_" + property.Identifier.Text);
+                    AddRemoval("get_" + property.Identifier.Text, Array.Empty<string>(), isStatic, false, null);
+                }
+                foreach (AccessorDeclarationSyntax accessor in property.AccessorList?.Accessors ?? default)
+                {
+                    string accessorName = AccessorName(accessor, property.Identifier.Text);
+                    scanNames.Add(accessorName);
+                    AddRemoval(accessorName,
+                        AccessorParams(accessor, null, TokenText(property.Type)), isStatic, false, null);
+                }
+                AddCheck(property.Identifier.Text, scanNames.ToArray(), Array.Empty<string>());
+                return true;
+            }
+
+            case IndexerDeclarationSyntax indexer:
+            {
+                if (burstContext || indexer.ExplicitInterfaceSpecifier != null || genericContext)
+                {
+                    result.Reasons.Add("member removed: " + metadataName + ".this[]");
+                    return false;
+                }
+                var scanNames = new List<string>();
+                if (indexer.ExpressionBody != null)
+                {
+                    scanNames.Add("get_Item");
+                    AddRemoval("get_Item", ParamTypeNames(indexer.ParameterList), false, false, null);
+                }
+                foreach (AccessorDeclarationSyntax accessor in indexer.AccessorList?.Accessors ?? default)
+                {
+                    string accessorName = AccessorName(accessor, "Item");
+                    scanNames.Add(accessorName);
+                    AddRemoval(accessorName,
+                        AccessorParams(accessor, indexer.ParameterList, TokenText(indexer.Type)), false, false, null);
+                }
+                AddCheck("this[]", scanNames.ToArray(), ParamTypeNames(indexer.ParameterList));
+                return true;
+            }
+
+            case EventDeclarationSyntax @event:
+            {
+                if (burstContext || @event.ExplicitInterfaceSpecifier != null || genericContext)
+                {
+                    result.Reasons.Add("member removed: " + metadataName + "." + @event.Identifier.Text);
+                    return false;
+                }
+                bool isStatic = @event.Modifiers.Any(SyntaxKind.StaticKeyword);
+                string[] scanNames = { "add_" + @event.Identifier.Text, "remove_" + @event.Identifier.Text };
+                foreach (string accessorName in scanNames)
+                    AddRemoval(accessorName, new[] { SimpleTypeName(@event.Type) }, isStatic, false, null);
+                AddCheck(@event.Identifier.Text, scanNames, Array.Empty<string>());
+                return true;
+            }
+
+            case OperatorDeclarationSyntax op:
+            {
+                string? opName = OperatorMetadataName(op.OperatorToken.Text, op.ParameterList.Parameters.Count);
+                if (burstContext || genericContext || opName == null)
+                {
+                    result.Reasons.Add("member removed: " + metadataName + ".operator" + op.OperatorToken.Text);
+                    return false;
+                }
+                AddRemoval(opName, ParamTypeNames(op.ParameterList), true, false, null);
+                AddCheck("operator" + op.OperatorToken.Text, new[] { opName }, ParamTypeNames(op.ParameterList));
+                return true;
+            }
+
+            case ConversionOperatorDeclarationSyntax conv:
+            {
+                if (burstContext || genericContext)
+                {
+                    result.Reasons.Add("member removed: " + metadataName + ".conversion");
+                    return false;
+                }
+                string convName = conv.ImplicitOrExplicitKeyword.IsKind(SyntaxKind.ImplicitKeyword)
+                    ? "op_Implicit"
+                    : "op_Explicit";
+                AddRemoval(convName, ParamTypeNames(conv.ParameterList), true, false, null);
+                AddCheck("conversion", new[] { convName }, ParamTypeNames(conv.ParameterList));
+                return true;
+            }
+
+            case ConstructorDeclarationSyntax:
+                result.Reasons.Add("constructor removed: " + metadataName +
+                    " (constructor surface changes need a real compile)");
+                return false;
+
+            case DestructorDeclarationSyntax:
+                result.Reasons.Add("finalizer removed: " + metadataName);
+                return false;
+
+            default:
+                result.Reasons.Add("member removed: " + metadataName + "." + DisplayName(member));
+                return false;
+        }
+    }
+
     /// <summary>Diff one matched member; returns true when it contributed a
     /// hot change. Adds a reason (cold) for anything not provably safe.</summary>
     private static bool DiffMember(
@@ -941,6 +1180,30 @@ public static class HotDiff
     {
         if (HeaderText(oldMember) != HeaderText(newMember))
         {
+            // Same-key signature changes (return type, static flip,
+            // ref-kind-preserving rewrites) decompose into REMOVE(old) +
+            // ADD(new): the add side shims (M2), the remove side tombstones
+            // (M5), and the M3 caller scan verifies every call site of the
+            // old surface lives in this batch. Attribute-only differences
+            // stay cold (metadata is immutable).
+            if (oldMember is MethodDeclarationSyntax oldMethodDecl &&
+                newMember is MethodDeclarationSyntax newMethodDecl &&
+                SignatureText(oldMethodDecl) != SignatureText(newMethodDecl))
+            {
+                if (UnityMagicMethods.Contains(oldMethodDecl.Identifier.Text) ||
+                    UnityMagicMethods.Contains(newMethodDecl.Identifier.Text))
+                {
+                    result.Reasons.Add("Unity message method signature changed: " + metadataName + "." +
+                        newMethodDecl.Identifier.Text + " (Unity matches message signatures at a real compile)");
+                    return false;
+                }
+                if (!ClassifyRemovedMember(metadataName, oldMember, genericContext, burstContext, result))
+                    return false;
+                if (!ClassifyAddedMember(metadataName, newMember, genericContext, burstContext, result))
+                    return false;
+                return true;
+            }
+
             result.Reasons.Add("member declaration changed: " + metadataName + "." + DisplayName(newMember));
             return false;
         }
@@ -949,8 +1212,9 @@ public static class HotDiff
         // runtime until a real compile (original metadata keeps the old
         // accessibility; patched bodies bypass access checks anyway), so an
         // unchanged body is a noop and a changed body is a plain hot edit.
-        // NARROWING can strand call sites outside this batch → caller check
-        // (cold until the M3 scan is wired up).
+        // NARROWING can strand call sites outside this batch — the M3
+        // caller scan verifies it at compile/hotPatch time (the file stays
+        // conditionally hot here).
         MemberAccess oldAccess = DeclaredAccess(oldMember);
         MemberAccess newAccess = DeclaredAccess(newMember);
         if (oldAccess != newAccess && !IsAccessWideningOrEqual(oldAccess, newAccess))
@@ -963,9 +1227,8 @@ public static class HotDiff
                 ParamTypeNames = newMember is BaseMethodDeclarationSyntax m ? ParamTypeNames(m.ParameterList) : Array.Empty<string>(),
                 Kind = "accessibility-narrowed",
                 Detail = detail,
+                ScanMemberNames = ScanNamesFor(newMember),
             });
-            result.Reasons.Add(detail + " (call-site verification is not yet enabled; use unity_recompile)");
-            return false;
         }
 
         bool burstMember = burstContext || HasBurstCompileAttribute(oldMember) || HasBurstCompileAttribute(newMember);
@@ -1344,6 +1607,45 @@ public static class HotDiff
             _ => member,
         };
         return TokenText(stripped);
+    }
+
+    /// <summary>The method's signature surface only — header minus member
+    /// AND parameter attribute lists. When two headers differ but their
+    /// signatures match, the difference is attribute-only (stays cold);
+    /// when signatures differ, the change decomposes into remove+add.</summary>
+    private static string SignatureText(MethodDeclarationSyntax method)
+    {
+        MethodDeclarationSyntax stripped = method
+            .WithAttributeLists(default)
+            .WithModifiers(StripHeaderModifiers(method.Modifiers, stripAsync: true))
+            .WithParameterList(method.ParameterList.WithParameters(SyntaxFactory.SeparatedList(
+                method.ParameterList.Parameters.Select(p => p.WithAttributeLists(default)))))
+            .WithBody(null)
+            .WithExpressionBody(null)
+            .WithSemicolonToken(default);
+        return TokenText(stripped);
+    }
+
+    /// <summary>Metadata member names the IL caller scan should look for.</summary>
+    private static string[] ScanNamesFor(MemberDeclarationSyntax member)
+    {
+        return member switch
+        {
+            MethodDeclarationSyntax method => new[] { method.Identifier.Text },
+            ConstructorDeclarationSyntax => new[] { ".ctor" },
+            PropertyDeclarationSyntax property => new[]
+            {
+                "get_" + property.Identifier.Text,
+                "set_" + property.Identifier.Text,
+            },
+            IndexerDeclarationSyntax => new[] { "get_Item", "set_Item" },
+            EventDeclarationSyntax @event => new[]
+            {
+                "add_" + @event.Identifier.Text,
+                "remove_" + @event.Identifier.Text,
+            },
+            _ => Array.Empty<string>(),
+        };
     }
 
     private static SyntaxTokenList StripHeaderModifiers(SyntaxTokenList modifiers, bool stripAsync)

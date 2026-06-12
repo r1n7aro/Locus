@@ -584,10 +584,31 @@ public sealed class CompileService
         var batchFiles = new List<(string Path, SyntaxTree Tree, HotDiffFileResult Diff)>();
         foreach (var (file, diff) in diffs)
         {
-            if (diff.ChangedMethods.Count == 0 && diff.NewTypes.Count == 0)
+            if (diff.ChangedMethods.Count == 0 && diff.NewTypes.Count == 0 && diff.RemovedMembers.Count == 0)
                 continue; // formatting/comment-only edit: nothing to patch
             SyntaxTree tree = CSharpSyntaxTree.ParseText(file.NewText!, parseOptions, path: file.Path!);
             batchFiles.Add((file.Path!, tree, diff));
+        }
+
+        // M3: deletions / signature changes / accessibility narrowing are
+        // hot ONLY when every compiled call site of the OLD surface lives in
+        // this batch — scan the project assemblies' IL and fold the verdict
+        // into hot/cold (with the exact uncovered files in the reasons).
+        string? callerScanNote = null;
+        {
+            var checks = new List<(string File, CallerCheckMember Check)>();
+            foreach (var (filePath, _, diff) in batchFiles)
+            {
+                foreach (CallerCheckMember check in diff.RequiresCallerCheck)
+                    checks.Add((filePath, check));
+            }
+
+            if (checks.Count > 0)
+            {
+                JsonNode? coldVerdict = RunCallerScan(request, batchFiles, checks, startedAt, out callerScanNote);
+                if (coldVerdict != null)
+                    return coldVerdict;
+            }
         }
 
         string? generation = request.Params?.DomainGeneration;
@@ -639,6 +660,8 @@ public sealed class CompileService
                 };
                 if (map.OriginalAssembly != null)
                     method["originalAssembly"] = map.OriginalAssembly;
+                if (map.IsStub)
+                    method["isStub"] = true;
                 methods.Add(method);
             }
             foreach (PatchNewType newType in rewrite.NewTypes)
@@ -654,15 +677,29 @@ public sealed class CompileService
             }
         }
 
-        if (trees.Count == 0)
+        if (methods.Count == 0 && newTypes.Count == 0 &&
+            shimRegistrations.All(r => r.Entry.Kind == "tombstone"))
         {
-            return new JsonObject
+            // Nothing to detour and nothing new to load: pure deletions
+            // (non-magic member removals — the loaded code is already
+            // correct, the members are merely unreachable) and/or pure
+            // accessibility narrowing. Commit tombstones so later batches
+            // fail deterministically on references; skip the pointless
+            // assembly.
+            if (!string.IsNullOrEmpty(generation))
+                CommitShimRegistrations(generation!, shimRegistrations);
+            var verdict = new JsonObject
             {
                 ["hot"] = true,
                 ["success"] = true,
                 ["noop"] = true,
                 ["durationMs"] = Environment.TickCount64 - startedAt,
             };
+            if (shimRegistrations.Count > 0)
+                verdict["deletionsNoted"] = shimRegistrations.Count;
+            if (callerScanNote != null)
+                verdict["callerScan"] = callerScanNote;
+            return verdict;
         }
 
         // Patched bodies may touch internals of any assembly the original
@@ -740,7 +777,138 @@ public sealed class CompileService
         result["hot"] = true;
         result["methods"] = methods;
         result["newTypes"] = newTypes;
+        if (callerScanNote != null)
+            result["callerScan"] = callerScanNote;
         return result;
+    }
+
+    /// <summary>Run the M3 caller scan for the batch's pending checks.
+    /// Returns a cold/error verdict node, or null to proceed (note set).</summary>
+    private static JsonNode? RunCallerScan(
+        CompileHotPatchRequestDto request,
+        List<(string Path, SyntaxTree Tree, HotDiffFileResult Diff)> batchFiles,
+        List<(string File, CallerCheckMember Check)> checks,
+        long startedAt,
+        out string? note)
+    {
+        note = null;
+
+        var projectAssemblies = (request.Params?.ReferencePaths ?? Array.Empty<string>())
+            .Where(CallerScan.IsProjectAssemblyPath)
+            .ToList();
+        if (projectAssemblies.Count == 0)
+        {
+            return ColdVerdict(
+                checks[0].File,
+                "cannot verify call sites: no project assemblies (Library/ScriptAssemblies) in the reference set; use unity_recompile",
+                startedAt);
+        }
+
+        var targets = new List<CallerScanTarget>();
+        foreach (var (_, check) in checks)
+        {
+            if (check.ScanMemberNames.Length == 0)
+            {
+                targets.Add(new CallerScanTarget { DeclaringType = check.DeclaringType, MemberName = "" });
+                continue;
+            }
+            foreach (string scanName in check.ScanMemberNames)
+                targets.Add(new CallerScanTarget { DeclaringType = check.DeclaringType, MemberName = scanName });
+        }
+
+        CallerScanResult scan = CallerScan.Scan(projectAssemblies, targets);
+        if (scan.Error != null)
+            return ColdVerdict(checks[0].File, scan.Error, startedAt);
+
+        // A caller file is covered when it IS one of the batch files. PDB
+        // documents may be project-relative ("Assets/X.cs") while batch
+        // paths are absolute — compare by path-segment-anchored suffix.
+        bool Covered(string callerFile)
+        {
+            string caller = callerFile.Replace('\\', '/').TrimStart('/').ToLowerInvariant();
+            foreach (var (batchPath, _, _) in batchFiles)
+            {
+                string batch = batchPath.Replace('\\', '/').TrimStart('/').ToLowerInvariant();
+                if (batch == caller ||
+                    batch.EndsWith("/" + caller, StringComparison.Ordinal) ||
+                    caller.EndsWith("/" + batch, StringComparison.Ordinal))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        var coldReasonsByFile = new Dictionary<string, List<string>>(StringComparer.Ordinal);
+        foreach (var (checkFile, check) in checks)
+        {
+            var uncovered = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
+            IEnumerable<string> scanNames = check.ScanMemberNames.Length == 0
+                ? new[] { "" }
+                : check.ScanMemberNames;
+            foreach (string scanName in scanNames)
+            {
+                if (!scan.CallerFiles.TryGetValue(
+                        CallerScanTarget.Key(check.DeclaringType, scanName), out HashSet<string>? files))
+                {
+                    continue;
+                }
+                foreach (string file in files)
+                {
+                    if (!Covered(file))
+                        uncovered.Add(file);
+                }
+            }
+            if (uncovered.Count > 0)
+            {
+                if (!coldReasonsByFile.TryGetValue(checkFile, out List<string>? reasons))
+                    coldReasonsByFile[checkFile] = reasons = new List<string>();
+                reasons.Add(
+                    check.Detail + " is still referenced by " + string.Join(", ", uncovered) +
+                    " — edit those call sites in the same batch and retry, or run unity_recompile");
+            }
+        }
+
+        if (coldReasonsByFile.Count > 0)
+        {
+            var files = new JsonArray();
+            foreach (var pair in coldReasonsByFile)
+            {
+                files.Add(new JsonObject
+                {
+                    ["path"] = pair.Key,
+                    ["hot"] = false,
+                    ["reasons"] = new JsonArray(pair.Value.Select(r => (JsonNode)r).ToArray()),
+                });
+            }
+            return new JsonObject
+            {
+                ["hot"] = false,
+                ["files"] = files,
+                ["durationMs"] = Environment.TickCount64 - startedAt,
+            };
+        }
+
+        note =
+            "call sites of " + checks.Count + " changed member surface(s) verified across " +
+            projectAssemblies.Count + " project assembly(ies); reflection, SendMessage(string) and " +
+            "UnityEvent serialized bindings cannot be verified and only converge at unity_recompile";
+        return null;
+    }
+
+    private static JsonNode ColdVerdict(string path, string reason, long startedAt)
+    {
+        return new JsonObject
+        {
+            ["hot"] = false,
+            ["files"] = new JsonArray(new JsonObject
+            {
+                ["path"] = path,
+                ["hot"] = false,
+                ["reasons"] = new JsonArray(reason),
+            }),
+            ["durationMs"] = Environment.TickCount64 - startedAt,
+        };
     }
 
     private void CommitShimRegistrations(string generation, List<ShimRegistration> registrations)

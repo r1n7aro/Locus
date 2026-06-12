@@ -316,6 +316,10 @@ pub struct HotPatchMethod {
     /// assembly (an earlier patch's shim being re-edited, M2).
     #[serde(default)]
     pub original_assembly: Option<String>,
+    /// The patch side is a synthesized empty body — a deleted Unity message
+    /// method being silenced (M5).
+    #[serde(default)]
+    pub is_stub: bool,
 }
 
 /// A type that only exists in the edited text (TI-C / snippet visibility).
@@ -341,8 +345,12 @@ pub struct HotPatchNewType {
 pub enum HotPatchOutcome {
     /// At least one file needs a real compile; per-file reasons.
     Cold { files: Vec<(String, Vec<String>)> },
-    /// Only comments/formatting changed.
-    Noop,
+    /// Only comments/formatting changed — or pure deletions whose loaded
+    /// code is already correct (`deletions_noted` tombstones recorded).
+    Noop {
+        deletions_noted: u64,
+        caller_scan_note: Option<String>,
+    },
     /// Deterministic compiler diagnostics for the agent.
     CompileError(String),
     Compiled {
@@ -350,6 +358,7 @@ pub enum HotPatchOutcome {
         assembly_b64: String,
         methods: Vec<HotPatchMethod>,
         new_types: Vec<HotPatchNewType>,
+        caller_scan_note: Option<String>,
     },
 }
 
@@ -443,7 +452,16 @@ fn parse_hot_patch_result(value: Value) -> Result<HotPatchOutcome, String> {
     }
 
     if value.get("noop").and_then(|v| v.as_bool()).unwrap_or(false) {
-        return Ok(HotPatchOutcome::Noop);
+        return Ok(HotPatchOutcome::Noop {
+            deletions_noted: value
+                .get("deletionsNoted")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            caller_scan_note: value
+                .get("callerScan")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+        });
     }
 
     let success = value
@@ -481,6 +499,10 @@ fn parse_hot_patch_result(value: Value) -> Result<HotPatchOutcome, String> {
         assembly_b64,
         methods,
         new_types,
+        caller_scan_note: value
+            .get("callerScan")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
     })
 }
 
@@ -638,7 +660,9 @@ mod tests {
         match parse_hot_patch_result(json!({ "hot": true, "success": true, "noop": true }))
             .expect("parse")
         {
-            HotPatchOutcome::Noop => {}
+            HotPatchOutcome::Noop { deletions_noted, .. } => {
+                assert_eq!(deletions_noted, 0);
+            }
             other => panic!("expected Noop, got {other:?}"),
         }
         match parse_hot_patch_result(json!({
@@ -685,6 +709,7 @@ mod tests {
                 assembly_b64,
                 methods,
                 new_types,
+                ..
             } => {
                 assert_eq!(assembly_name, "__LocusHotPatch_00000000_00000001");
                 assert_eq!(assembly_b64, "TVo=");
