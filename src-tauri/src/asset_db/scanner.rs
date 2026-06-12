@@ -5,19 +5,23 @@ use walkdir::WalkDir;
 
 use super::types::LinkedAssetRoot;
 
-pub(crate) const IGNORED_DIRS: &[&str] = &[
-    "Library",
-    "Temp",
-    "Logs",
-    "Obj",
-    "Build",
-    "Builds",
-    "UserSettings",
-    ".git",
-    ".svn",
-    ".vs",
-    "node_modules",
-];
+/// Whether a path component should be skipped while scanning for assets.
+///
+/// The scanner only ever walks `Assets/` and `Packages/`, so Unity's
+/// project-root folders (`Library`, `Temp`, `Build`, ...) are never visited
+/// and must NOT be filtered by name — `Assets/Build` or `Assets/Temp` are
+/// perfectly legal asset folders that older versions of this list silently
+/// dropped. What we skip mirrors what the Unity importer itself ignores:
+/// hidden entries (leading `.` — also covers `.git`/`.svn`/`.vs`), entries
+/// ending in `~` (`Samples~`, `Documentation~`, editor backup files), and
+/// `cvs`. `node_modules` is kept as a pragmatic extra: Unity would import
+/// it, but in practice it only appears as huge vendored toolchain trees.
+pub(crate) fn is_ignored_name(name: &str) -> bool {
+    name.starts_with('.')
+        || name.ends_with('~')
+        || name.eq_ignore_ascii_case("cvs")
+        || name.eq_ignore_ascii_case("node_modules")
+}
 
 pub(crate) const P1_EXTENSIONS: &[&str] = &[
     "unity",
@@ -60,10 +64,6 @@ pub struct DirSnapshot {
     pub linked_asset_roots: Vec<LinkedAssetRoot>,
 }
 
-fn is_ignored_dir(name: &str) -> bool {
-    IGNORED_DIRS.iter().any(|d| d.eq_ignore_ascii_case(name))
-}
-
 pub(crate) fn get_mtime_ns(metadata: &std::fs::Metadata) -> u64 {
     metadata
         .modified()
@@ -101,12 +101,11 @@ pub fn scan_directory_with_cancel(project_root: &Path, cancel: &AtomicBool) -> D
             .follow_links(true)
             .into_iter()
             .filter_entry(|entry| {
-                if entry.file_type().is_dir() {
-                    let name = entry.file_name().to_string_lossy();
-                    !is_ignored_dir(&name)
-                } else {
-                    true
-                }
+                // Files use the same rule as directories: Unity ignores
+                // hidden / `~`-suffixed files too, so their orphan .meta
+                // siblings never become indexable assets.
+                let name = entry.file_name().to_string_lossy();
+                !is_ignored_name(&name)
             });
 
         for entry in walker.filter_map(|e| e.ok()) {

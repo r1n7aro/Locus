@@ -242,7 +242,29 @@ pub(crate) fn build_importer_sub_asset_objects(
         .collect()
 }
 
+/// Byte markers that must appear in a .meta file for any of the sub-asset
+/// tables below to be non-empty. The full `serde_yaml` deserialization is the
+/// dominant cost of the meta-parse phase, and most metas (NativeFormatImporter
+/// / DefaultImporter / MonoImporter — prefabs, .asset files, scripts, folders)
+/// contain none of these keys, so a substring precheck skips the parse
+/// entirely without ever producing a false negative.
+const IMPORTER_SUBASSET_MARKERS: &[&[u8]] = &[
+    b"internalIDToNameTable",
+    b"fileIDToRecycleName",
+    b"spriteSheet",
+];
+
+fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty() && haystack.windows(needle.len()).any(|window| window == needle)
+}
+
 pub(crate) fn parse_importer_subassets(content: &[u8]) -> Vec<ImporterSubAsset> {
+    if !IMPORTER_SUBASSET_MARKERS
+        .iter()
+        .any(|marker| contains_subslice(content, marker))
+    {
+        return Vec::new();
+    }
     let text = String::from_utf8_lossy(content);
     let Ok(value) = serde_yaml::from_str::<Value>(&text) else {
         return Vec::new();
@@ -567,6 +589,21 @@ mod tests {
             m_script_guid: None,
             doc_index,
         }
+    }
+
+    #[test]
+    fn parse_importer_subassets_precheck_skips_plain_metas_and_parses_tables() {
+        // No marker key anywhere → the precheck must return without ever
+        // running serde_yaml.
+        let plain: &[u8] = b"fileFormatVersion: 2\nguid: deadbeefdeadbeefdeadbeefdeadbeef\nNativeFormatImporter:\n  mainObjectFileID: 100100000\n";
+        assert!(parse_importer_subassets(plain).is_empty());
+
+        let with_table: &[u8] = b"fileFormatVersion: 2\nguid: deadbeefdeadbeefdeadbeefdeadbeef\nTextureImporter:\n  internalIDToNameTable:\n  - first:\n      213: 21300000\n    second: Button\n  spriteSheet:\n    sprites: []\n";
+        let entries = parse_importer_subassets(with_table);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].file_id, 21300000);
+        assert_eq!(entries[0].name, "Button");
+        assert_eq!(entries[0].class_id, Some(213));
     }
 
     #[test]

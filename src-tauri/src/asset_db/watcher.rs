@@ -7,7 +7,8 @@ use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::event::ModifyKind;
+use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::Serialize;
 
 use super::db;
@@ -470,18 +471,21 @@ fn is_unity_asset_path(rel_path: &str) -> bool {
     )
 }
 
-fn asset_rel_path_and_reason(rel: String) -> Option<(String, QueueEnqueueReason)> {
+/// Whether a workspace-relative path (forward slashes) lives inside the
+/// scanned roots and crosses no ignored component. Shared by the per-file
+/// event filter and the directory-subtree discovery path so both agree with
+/// the full-scan walker.
+fn rel_path_is_scannable(rel: &str) -> bool {
     if !rel.starts_with("Assets/") && !rel.starts_with("Packages/") {
-        return None;
+        return false;
     }
+    rel.split('/')
+        .all(|component| !scanner::is_ignored_name(component))
+}
 
-    for component in rel.split('/') {
-        if scanner::IGNORED_DIRS
-            .iter()
-            .any(|d| d.eq_ignore_ascii_case(component))
-        {
-            return None;
-        }
+fn asset_rel_path_and_reason(rel: String) -> Option<(String, QueueEnqueueReason)> {
+    if !rel_path_is_scannable(&rel) {
+        return None;
     }
 
     if !is_unity_asset_path(&rel) {
@@ -567,6 +571,83 @@ fn to_asset_rel_paths_and_reasons(
     }
 
     results
+}
+
+/// Directory creates and renames are the only events that move whole
+/// subtrees: on Windows, `ReadDirectoryChangesW` reports just the directory
+/// itself — none of the children fire events of their own — so without a
+/// targeted walk a renamed-in folder stays invisible until the next 10-minute
+/// discovery sweep. Plain data modifications are excluded on purpose: parent
+/// directories receive write events whenever a child changes, and walking the
+/// subtree on every file save would be pathological.
+fn is_structural_event(kind: &EventKind) -> bool {
+    matches!(kind, EventKind::Create(_) | EventKind::Modify(ModifyKind::Name(_)))
+}
+
+/// Whether an absolute directory path maps into the scanned roots (directly
+/// or through a linked asset root) without crossing an ignored component.
+fn dir_maps_into_scan_roots(
+    project_root: &Path,
+    abs_path: &Path,
+    linked_roots: &[LinkedAssetRoot],
+) -> bool {
+    if let Ok(rel) = abs_path.strip_prefix(project_root) {
+        let rel = rel.to_string_lossy().replace('\\', "/");
+        if rel_path_is_scannable(&rel) {
+            return true;
+        }
+    }
+    linked_asset_rel_paths_for_abs(abs_path, linked_roots)
+        .iter()
+        .any(|rel| rel_path_is_scannable(rel))
+}
+
+/// Walk a freshly created/renamed directory and queue every .meta found
+/// inside it. Only metas are queued — loose P1 files without a meta would
+/// just round-trip through `process_dirty_asset` as deletions — and the
+/// queue's set semantics dedupe against per-file events that may also arrive.
+fn enqueue_dir_subtree_metas(
+    dir_abs: &Path,
+    project_root: &Path,
+    linked_roots: &[LinkedAssetRoot],
+    queue: &DirtyQueue,
+    activity: &RecentQueueActivityLog,
+) -> u64 {
+    let mut enqueued = 0u64;
+    let walker = walkdir::WalkDir::new(dir_abs)
+        .follow_links(true)
+        .into_iter()
+        .filter_entry(|entry| {
+            let name = entry.file_name().to_string_lossy();
+            !scanner::is_ignored_name(&name)
+        });
+    for entry in walker.filter_map(|e| e.ok()) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let is_meta = entry
+            .path()
+            .extension()
+            .map(|ext| ext.eq_ignore_ascii_case("meta"))
+            .unwrap_or(false);
+        if !is_meta {
+            continue;
+        }
+        for (rel, _reason) in
+            to_asset_rel_paths_and_reasons(project_root, entry.path(), linked_roots)
+        {
+            if enqueue_with_activity(
+                queue,
+                activity,
+                rel,
+                QueueEnqueueReason::NewMetaDiscovered,
+                None,
+            ) {
+                enqueued += 1;
+            }
+        }
+    }
+    enqueued
 }
 
 fn file_mtime_ns(path: &Path) -> u64 {
@@ -877,26 +958,6 @@ fn sleep_interruptible(duration: Duration, stop: &AtomicBool) -> bool {
     stop.load(Ordering::Relaxed)
 }
 
-fn resolve_guid_paths_for_content(
-    content: &[u8],
-    graph_state: &Arc<Mutex<Option<AssetDb>>>,
-) -> Result<HashMap<Guid, String>, String> {
-    let text = String::from_utf8_lossy(content);
-    let lines: Vec<&str> = text.lines().collect();
-    let guids = unity_yaml::collect_guids_from_lines(&lines, 0, lines.len());
-    if guids.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    let guard = graph_state
-        .lock()
-        .map_err(|e| format!("Lock error: {}", e))?;
-    match guard.as_ref() {
-        Some(graph) => db::batch_resolve_paths(&graph.conn, &guids),
-        None => Ok(HashMap::new()),
-    }
-}
-
 fn process_dirty_asset(
     asset_rel_path: &str,
     project_root: &Path,
@@ -911,7 +972,16 @@ fn process_dirty_asset(
     let asset_abs = project_root.join(asset_rel_path);
 
     let meta_exists = meta_abs.is_file();
-    let asset_exists = asset_abs.is_file();
+    // `exists_on_disk` must count directories (folder assets) to match the
+    // full-scan probe — otherwise references to folder GUIDs flip between
+    // "resolved" and "broken" depending on which path indexed them last.
+    // Content reads and mtime/size capture still require a real file.
+    let asset_fs_meta = std::fs::metadata(&asset_abs).ok();
+    let asset_is_file = asset_fs_meta
+        .as_ref()
+        .map(|metadata| metadata.is_file())
+        .unwrap_or(false);
+    let asset_exists = asset_fs_meta.is_some();
 
     if !meta_exists {
         if stop.load(Ordering::Relaxed) {
@@ -975,12 +1045,30 @@ fn process_dirty_asset(
     let mut yaml_docs: Option<Vec<unity_yaml::YamlDoc>> = None;
     let mut script_type_by_guid: HashMap<Guid, db::StoredScriptMetadata> = HashMap::new();
 
-    if asset_exists && is_yaml_asset_ext(&ext) {
+    if asset_is_file && is_yaml_asset_ext(&ext) {
         let content = std::fs::read(&asset_abs)
             .map_err(|e| format!("Failed to read {}: {}", asset_abs.display(), e))?;
-        let guid_to_path = resolve_guid_paths_for_content(&content, graph_state)?;
-        let refs = unity_yaml::extract_refs_with_resolver(&content, Some(&guid_to_path));
-        let docs = unity_yaml::parse_yaml_docs(&content);
+        // Single parse pass produces both the docs and the raw refs; the
+        // referenced guids are then resolved with one targeted DB batch
+        // instead of a third line scan over the file.
+        let (docs, raw_refs) = unity_yaml::parse_yaml_docs_with_refs(&content);
+        let guid_to_path = {
+            let mut ref_guids: Vec<Guid> = raw_refs.iter().map(|r| r.dst_guid).collect();
+            ref_guids.sort_unstable();
+            ref_guids.dedup();
+            if ref_guids.is_empty() {
+                HashMap::new()
+            } else {
+                let guard = graph_state
+                    .lock()
+                    .map_err(|e| format!("Lock error: {}", e))?;
+                match guard.as_ref() {
+                    Some(graph) => db::batch_resolve_paths(&graph.conn, &ref_guids)?,
+                    None => HashMap::new(),
+                }
+            }
+        };
+        let refs = unity_yaml::build_refs_from_docs(&docs, raw_refs, Some(&guid_to_path));
         content_hash = hash128(&content);
         let metadata = std::fs::metadata(&asset_abs).ok();
         asset_mtime = metadata.as_ref().map(scanner::get_mtime_ns).unwrap_or(0);
@@ -1002,15 +1090,15 @@ fn process_dirty_asset(
         }
 
         edges = refs
-            .iter()
+            .into_iter()
             .map(|r| RefEdge {
                 src_guid: guid,
                 src_file_id: r.src_file_id,
                 dst_guid: r.dst_guid,
                 dst_file_id: r.dst_file_id,
                 class_id_hint: r.class_id_hint,
-                field_hint: r.field_hint.clone(),
-                ref_path: r.ref_path.clone(),
+                field_hint: r.field_hint,
+                ref_path: r.ref_path,
             })
             .collect();
 
@@ -1029,7 +1117,7 @@ fn process_dirty_asset(
             }
         }
         yaml_docs = Some(docs);
-    } else if asset_exists && ext == "cs" {
+    } else if asset_is_file && ext == "cs" {
         let snapshot = script_parser::read_script_file_snapshot(&asset_abs)
             .ok_or_else(|| format!("Failed to read script file: {}", asset_abs.display()))?;
         kind = AssetKind::Script;
@@ -1100,24 +1188,10 @@ fn process_dirty_asset(
             }
         }
     } else {
-        kind = match ext.as_str() {
-            "png" | "jpg" | "jpeg" | "tga" | "psd" | "tif" | "tiff" | "bmp" | "gif" | "exr"
-            | "hdr" => AssetKind::Texture,
-            "wav" | "mp3" | "ogg" | "aif" | "aiff" => AssetKind::Audio,
-            "shader" | "cginc" | "hlsl" | "glsl" | "compute" => AssetKind::Shader,
-            "fbx" | "obj" | "blend" | "dae" | "3ds" | "max" => AssetKind::Model,
-            _ => {
-                if asset_exists {
-                    AssetKind::OtherYaml
-                } else {
-                    AssetKind::MetaOnly
-                }
-            }
-        };
-        if asset_exists {
-            let metadata = std::fs::metadata(&asset_abs).ok();
-            asset_mtime = metadata.as_ref().map(scanner::get_mtime_ns).unwrap_or(0);
-            asset_size = metadata.map(|m| m.len()).unwrap_or(0);
+        kind = AssetKind::non_yaml_kind_from_ext(&ext).unwrap_or(AssetKind::MetaOnly);
+        if let Some(metadata) = asset_fs_meta.as_ref().filter(|m| m.is_file()) {
+            asset_mtime = scanner::get_mtime_ns(metadata);
+            asset_size = metadata.len();
         }
     }
 
@@ -1339,14 +1413,45 @@ fn event_receiver_loop(
                     .read()
                     .map(|roots| roots.clone())
                     .unwrap_or_default();
+                let structural = is_structural_event(&event.kind);
                 for path in &event.paths {
-                    for (rel, reason) in to_asset_rel_paths_and_reasons(
+                    let mapped = to_asset_rel_paths_and_reasons(
                         &project_root,
                         path,
                         linked_roots_snapshot.as_slice(),
-                    ) {
+                    );
+                    let mapped_any = !mapped.is_empty();
+                    for (rel, reason) in mapped {
                         if enqueue_with_activity(&queue, &activity, rel.clone(), reason, None) {
                             eprintln!("[AssetDb Watcher] dirty (OS/{:?}): {}", reason, rel);
+                        }
+                    }
+                    // A created or renamed-in directory arrives as a single
+                    // event with no per-child notifications; walk it now
+                    // instead of waiting for the 10-minute discovery sweep.
+                    if structural
+                        && !mapped_any
+                        && path.is_dir()
+                        && dir_maps_into_scan_roots(
+                            &project_root,
+                            path,
+                            linked_roots_snapshot.as_slice(),
+                        )
+                    {
+                        let discovered = enqueue_dir_subtree_metas(
+                            path,
+                            &project_root,
+                            linked_roots_snapshot.as_slice(),
+                            &queue,
+                            &activity,
+                        );
+                        if discovered > 0 {
+                            eprintln!(
+                                "[AssetDb Watcher] dir event ({:?}): queued {} assets under {}",
+                                event.kind,
+                                discovered,
+                                path.display()
+                            );
                         }
                     }
                 }
@@ -1669,14 +1774,8 @@ fn mtime_scan_once_with_options(
             .follow_links(true)
             .into_iter()
             .filter_entry(|entry| {
-                if entry.file_type().is_dir() {
-                    let name = entry.file_name().to_string_lossy();
-                    !scanner::IGNORED_DIRS
-                        .iter()
-                        .any(|d| d.eq_ignore_ascii_case(&name))
-                } else {
-                    true
-                }
+                let name = entry.file_name().to_string_lossy();
+                !scanner::is_ignored_name(&name)
             });
 
         for entry in walker.filter_map(|e| e.ok()) {
@@ -3049,5 +3148,155 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn full_scan_binary_assets_record_content_stats_and_stay_clean_on_resync() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let root = temp.path().join("project");
+        std::fs::create_dir_all(root.join("Assets")).expect("create assets dir");
+        let png_bytes: &[u8] = b"png-bytes-not-a-real-texture";
+        write_asset(
+            &root,
+            "Assets/Tex.png",
+            png_bytes,
+            "deadbeefdeadbeefdeadbeefdeadbe01",
+        );
+
+        let graph = scan_test_graph(&root);
+        let records = db::get_all_asset_mtime_records(&graph.conn).expect("read asset records");
+        let tex = records
+            .iter()
+            .find(|record| record.path == "Assets/Tex.png")
+            .expect("texture indexed");
+        assert_eq!(tex.kind, AssetKind::Texture);
+        assert!(tex.exists_on_disk);
+        // The content file's stats — recording the .meta's size here used to
+        // make every binary asset look size-changed and requeued the whole
+        // project on the first reconcile after each full scan.
+        assert_eq!(tex.size, png_bytes.len() as u64);
+        let meta_mtime = file_mtime_ns(&root.join("Assets/Tex.png.meta"));
+        let content_mtime = file_mtime_ns(&root.join("Assets/Tex.png"));
+        assert_eq!(tex.mtime_ns, meta_mtime.max(content_mtime));
+
+        let queue = DirtyQueue::new();
+        let stop = AtomicBool::new(false);
+        let activity = RecentQueueActivityLog::new();
+        let state = Arc::new(Mutex::new(Some(graph)));
+        mtime_scan_once(&queue, &stop, &state, &root, &activity, false);
+        assert_eq!(queue.len(), 0, "fresh scan must not requeue binary assets");
+    }
+
+    #[test]
+    fn process_dirty_asset_keeps_full_scan_kind_and_exists_semantics() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let root = temp.path().join("project");
+        std::fs::create_dir_all(root.join("Assets")).expect("create assets dir");
+        // Unknown extension: indexed as MetaOnly by the full scan; the
+        // watcher used to flip it to OtherYaml.
+        write_asset(
+            &root,
+            "Assets/Note.txt",
+            b"hello",
+            "deadbeefdeadbeefdeadbeefdeadbe02",
+        );
+        // Folder asset: exists_on_disk must survive the watcher, which used
+        // to test is_file() and mark directories as missing.
+        std::fs::create_dir_all(root.join("Assets/Folder")).expect("create folder asset");
+        std::fs::write(
+            root.join("Assets/Folder.meta"),
+            b"fileFormatVersion: 2\nguid: deadbeefdeadbeefdeadbeefdeadbe03\n",
+        )
+        .expect("write folder meta");
+
+        let graph = scan_test_graph(&root);
+        let state = Arc::new(Mutex::new(Some(graph)));
+        let stop = AtomicBool::new(false);
+
+        let snapshot = |state: &Arc<Mutex<Option<AssetDb>>>| -> HashMap<String, (AssetKind, bool)> {
+            let guard = state.lock().expect("lock state");
+            db::get_all_asset_mtime_records(&guard.as_ref().expect("graph").conn)
+                .expect("read records")
+                .into_iter()
+                .map(|record| (record.path, (record.kind, record.exists_on_disk)))
+                .collect()
+        };
+
+        let before = snapshot(&state);
+        assert_eq!(before["Assets/Note.txt"], (AssetKind::MetaOnly, true));
+        assert_eq!(before["Assets/Folder"], (AssetKind::MetaOnly, true));
+
+        process_dirty_asset("Assets/Note.txt", &root, &state, &stop).expect("process txt");
+        process_dirty_asset("Assets/Folder", &root, &state, &stop).expect("process folder");
+
+        let after = snapshot(&state);
+        assert_eq!(after["Assets/Note.txt"], (AssetKind::MetaOnly, true));
+        assert_eq!(after["Assets/Folder"], (AssetKind::MetaOnly, true));
+    }
+
+    #[test]
+    fn dir_subtree_discovery_queues_metas_and_skips_ignored_names() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let root = temp.path().join("project");
+        std::fs::create_dir_all(root.join("Assets")).expect("create assets dir");
+        write_asset(
+            &root,
+            "Assets/NewStuff/A.prefab",
+            b"%YAML 1.1\n",
+            "deadbeefdeadbeefdeadbeefdeadbe04",
+        );
+        write_asset(
+            &root,
+            "Assets/NewStuff/Sub/B.mat",
+            b"%YAML 1.1\n",
+            "deadbeefdeadbeefdeadbeefdeadbe05",
+        );
+        write_asset(
+            &root,
+            "Assets/NewStuff/Samples~/C.prefab",
+            b"%YAML 1.1\n",
+            "deadbeefdeadbeefdeadbeefdeadbe06",
+        );
+
+        let queue = DirtyQueue::new();
+        let activity = RecentQueueActivityLog::new();
+        let queued = enqueue_dir_subtree_metas(
+            &root.join("Assets/NewStuff"),
+            &root,
+            &[],
+            &queue,
+            &activity,
+        );
+        assert_eq!(queued, 2);
+
+        let mut paths = Vec::new();
+        while let Some(path) = queue.try_dequeue() {
+            paths.push(path);
+        }
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec![
+                "Assets/NewStuff/A.prefab".to_string(),
+                "Assets/NewStuff/Sub/B.mat".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn structural_event_kinds_gate_dir_discovery() {
+        use notify::event::{CreateKind, DataChange, MetadataKind, RemoveKind, RenameMode};
+
+        assert!(is_structural_event(&EventKind::Create(CreateKind::Folder)));
+        assert!(is_structural_event(&EventKind::Modify(ModifyKind::Name(
+            RenameMode::To
+        ))));
+        assert!(!is_structural_event(&EventKind::Modify(ModifyKind::Data(
+            DataChange::Any
+        ))));
+        assert!(!is_structural_event(&EventKind::Modify(
+            ModifyKind::Metadata(MetadataKind::Any)
+        )));
+        assert!(!is_structural_event(&EventKind::Remove(RemoveKind::Any)));
     }
 }
