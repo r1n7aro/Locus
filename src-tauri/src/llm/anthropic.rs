@@ -319,6 +319,7 @@ where
     let mut messages = build_anthropic_messages(history, AnthropicHistoryOptions::standard());
     let (converted_tools, tool_aliases) = convert_tools_to_oauth_sdk_like_anthropic(tools);
     rewrite_oauth_tool_use_blocks(&mut messages, &tool_aliases);
+    apply_cache_control(&mut messages, Some(CACHE_TTL));
     let anthropic_tools = converted_tools;
     let oauth_tool_aliases = Some(tool_aliases);
 
@@ -339,7 +340,7 @@ where
     });
 
     if let Some(thinking) = thinking_field {
-        body["thinking"] = thinking;
+        body["thinking"] = serde_json::json!(thinking);
     }
     if let Some(oc) = output_config {
         body["output_config"] = oc;
@@ -350,10 +351,6 @@ where
 
     if !anthropic_tools.is_empty() {
         body["tools"] = serde_json::json!(anthropic_tools);
-    }
-
-    if let Some(msgs) = body.get_mut("messages").and_then(|m| m.as_array_mut()) {
-        apply_cache_control(msgs);
     }
 
     let effective_base = base_url.unwrap_or(API_BASE);
@@ -522,6 +519,38 @@ where
     Err(last_error)
 }
 
+/// Request body for `stream_chat_native`.
+///
+/// A struct rather than `serde_json::json!` so the serialized field order is
+/// fixed at the declaration site: `serde_json` maps serialize keys
+/// alphabetically, which sinks each block's `type` below its multi-KB `text`
+/// and buries `system` after `messages`. Some Anthropic-compatible gateways
+/// (e.g. DeepSeek) rejected that shape on large requests with
+/// `system: missing field type` (issue #91). Keep `type` the first key of
+/// every block and `system` ahead of `messages` — the shape official SDKs
+/// emit.
+#[derive(Debug, serde::Serialize)]
+struct NativeChatRequest<'a> {
+    model: &'a str,
+    max_tokens: u32,
+    system: [NativeSystemBlock<'a>; 1],
+    messages: Vec<AnthropicMessage>,
+    stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<ThinkingParam>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_config: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<serde_json::Value>>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct NativeSystemBlock<'a> {
+    #[serde(rename = "type")]
+    block_type: &'static str,
+    text: &'a str,
+}
+
 pub async fn stream_chat_native<F, G, H>(
     api_key: &str,
     model: &str,
@@ -557,42 +586,33 @@ where
             .http2_keep_alive_timeout(std::time::Duration::from_secs(15)),
     )?;
 
-    let messages = build_anthropic_messages(
+    let mut messages = build_anthropic_messages(
         history,
         AnthropicHistoryOptions::custom_endpoint(replay_thinking_blocks),
     );
+    // No ttl on custom endpoints: the 1h value needs the official
+    // `extended-cache-ttl-2025-04-11` beta header, which this path does not
+    // send, and third-party gateways expect the plain ephemeral form.
+    apply_cache_control(&mut messages, None);
 
     let anthropic_tools = build_native_anthropic_tools(tools, include_web_search);
-
-    let system_blocks = serde_json::json!([{
-        "type": "text",
-        "text": system_prompt,
-    }]);
+    let tool_count = anthropic_tools.len();
 
     let (thinking_field, output_config, standard_max_tokens) =
         build_thinking_params(model, thinking_level);
-    let mut body = serde_json::json!({
-        "model": model,
-        "max_tokens": u64::from(standard_max_tokens),
-        "system": system_blocks,
-        "messages": messages,
-        "stream": true,
-    });
-
-    if let Some(thinking) = thinking_field {
-        body["thinking"] = thinking;
-    }
-    if let Some(oc) = output_config {
-        body["output_config"] = oc;
-    }
-
-    if !anthropic_tools.is_empty() {
-        body["tools"] = serde_json::json!(anthropic_tools);
-    }
-
-    if let Some(msgs) = body.get_mut("messages").and_then(|m| m.as_array_mut()) {
-        apply_cache_control(msgs);
-    }
+    let body = NativeChatRequest {
+        model,
+        max_tokens: standard_max_tokens,
+        system: [NativeSystemBlock {
+            block_type: "text",
+            text: system_prompt,
+        }],
+        messages,
+        stream: true,
+        thinking: thinking_field,
+        output_config,
+        tools: (!anthropic_tools.is_empty()).then_some(anthropic_tools),
+    };
 
     let raw_request = serde_json::to_string_pretty(&body).unwrap_or_else(|_| format!("{:?}", body));
 
@@ -601,7 +621,7 @@ where
         tag,
         model,
         history.len(),
-        anthropic_tools.len()
+        tool_count
     );
 
     let api_url = format!("{}/messages", base_url.trim_end_matches('/'));
@@ -1162,10 +1182,20 @@ where
 ///
 ///
 ///
+/// Internally tagged so serde always writes `type` as the first key — the
+/// same gateway-compat constraint as `NativeChatRequest` (issue #91).
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+enum ThinkingParam {
+    Adaptive,
+    Disabled,
+    Enabled { budget_tokens: u32 },
+}
+
 fn build_thinking_params(
     model: &str,
     thinking_level: Option<&str>,
-) -> (Option<serde_json::Value>, Option<serde_json::Value>, u32) {
+) -> (Option<ThinkingParam>, Option<serde_json::Value>, u32) {
     let is_adaptive = model.contains("sonnet-4.6")
         || model.contains("sonnet-4-6")
         || model.contains("opus-4.6")
@@ -1174,39 +1204,36 @@ fn build_thinking_params(
     let level = match thinking_level {
         Some(l) if !l.is_empty() => l,
         _ if is_adaptive => {
-            let thinking = serde_json::json!({ "type": "adaptive" });
-            return (Some(thinking), None, 32000);
+            return (Some(ThinkingParam::Adaptive), None, 32000);
         }
         _ => return (None, None, 16384),
     };
 
     if level == "none" {
-        let thinking = serde_json::json!({ "type": "disabled" });
-        return (Some(thinking), None, 8192);
+        return (Some(ThinkingParam::Disabled), None, 8192);
     }
 
     if is_adaptive {
         // https://platform.claude.com/docs/en/build-with-claude/adaptive-thinking
-        let thinking = serde_json::json!({ "type": "adaptive" });
         let output_config = match level {
             "low" | "medium" | "high" => Some(serde_json::json!({ "effort": level })),
             "max" => Some(serde_json::json!({ "effort": "high" })),
             _ => None,
         };
-        (Some(thinking), output_config, 32000)
+        (Some(ThinkingParam::Adaptive), output_config, 32000)
     } else {
-        let (budget, max_tokens) = match level {
+        let (budget_tokens, max_tokens) = match level {
             "low" => (2048, 8192),
             "medium" => (5000, 12000),
             "high" => (16000, 32000),
             "max" => (24000, 32000),
             _ => return (None, None, 16384),
         };
-        let thinking = serde_json::json!({
-            "type": "enabled",
-            "budget_tokens": budget,
-        });
-        (Some(thinking), None, max_tokens)
+        (
+            Some(ThinkingParam::Enabled { budget_tokens }),
+            None,
+            max_tokens,
+        )
     }
 }
 
@@ -1232,12 +1259,95 @@ impl AnthropicHistoryOptions {
     }
 }
 
+/// Strongly typed message history for the Anthropic Messages API. Structs and
+/// internally tagged enums serialize in declaration order with `type` leading
+/// every block — the same gateway-compat constraint as `NativeChatRequest`
+/// (issue #91); `serde_json::Value` would re-sort keys alphabetically and sink
+/// the tag below multi-KB payloads.
+#[derive(Debug, serde::Serialize)]
+struct AnthropicMessage {
+    role: &'static str,
+    content: Vec<HistoryContentBlock>,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum HistoryContentBlock {
+    Text {
+        text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
+    },
+    Image {
+        source: ImageSource,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
+    },
+    Thinking {
+        thinking: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+    },
+    ToolResult {
+        tool_use_id: String,
+        content: ToolResultContent,
+    },
+}
+
+impl HistoryContentBlock {
+    fn text(text: impl Into<String>) -> Self {
+        HistoryContentBlock::Text {
+            text: text.into(),
+            cache_control: None,
+        }
+    }
+
+    fn image(img: &ImageData) -> Self {
+        HistoryContentBlock::Image {
+            source: ImageSource {
+                source_type: "base64",
+                media_type: img.mime_type.clone(),
+                data: img.data.clone(),
+            },
+            cache_control: None,
+        }
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(untagged)]
+enum ToolResultContent {
+    Text(String),
+    Blocks(Vec<HistoryContentBlock>),
+}
+
+#[derive(Debug, serde::Serialize)]
+struct ImageSource {
+    #[serde(rename = "type")]
+    source_type: &'static str,
+    media_type: String,
+    data: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct CacheControl {
+    #[serde(rename = "type")]
+    control_type: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ttl: Option<&'static str>,
+}
+
 fn build_anthropic_messages(
     history: &[ChatMessage],
     options: AnthropicHistoryOptions,
-) -> Vec<serde_json::Value> {
+) -> Vec<AnthropicMessage> {
     let history = crate::session::history::normalize_tool_round_history(history);
-    let mut messages: Vec<serde_json::Value> = Vec::new();
+    let mut messages: Vec<AnthropicMessage> = Vec::new();
 
     let mut i = 0;
     while i < history.len() {
@@ -1246,23 +1356,16 @@ fn build_anthropic_messages(
             MessageRole::User => {
                 if let Some(ref images) = msg.images {
                     if !images.is_empty() {
-                        let mut blocks: Vec<serde_json::Value> = Vec::new();
+                        let mut blocks: Vec<HistoryContentBlock> = Vec::new();
                         for img in images {
-                            blocks.push(serde_json::json!({
-                                "type": "image",
-                                "source": {
-                                    "type": "base64",
-                                    "media_type": img.mime_type,
-                                    "data": img.data,
-                                }
-                            }));
+                            blocks.push(HistoryContentBlock::image(img));
                         }
                         blocks.extend(build_text_blocks(&msg.content));
                         if !blocks.is_empty() {
-                            messages.push(serde_json::json!({
-                                "role": "user",
-                                "content": blocks,
-                            }));
+                            messages.push(AnthropicMessage {
+                                role: "user",
+                                content: blocks,
+                            });
                         }
                         i += 1;
                         continue;
@@ -1270,10 +1373,10 @@ fn build_anthropic_messages(
                 }
                 let blocks = build_text_blocks(&msg.content);
                 if !blocks.is_empty() {
-                    messages.push(serde_json::json!({
-                        "role": "user",
-                        "content": blocks,
-                    }));
+                    messages.push(AnthropicMessage {
+                        role: "user",
+                        content: blocks,
+                    });
                 }
                 i += 1;
             }
@@ -1296,26 +1399,22 @@ fn build_anthropic_messages(
                 if !has_tool_calls && !has_thinking {
                     if has_text {
                         let text_blocks = build_text_blocks(&msg.content);
-                        messages.push(serde_json::json!({
-                            "role": "assistant",
-                            "content": text_blocks,
-                        }));
+                        messages.push(AnthropicMessage {
+                            role: "assistant",
+                            content: text_blocks,
+                        });
                     }
                     i += 1;
                     continue;
                 }
 
-                let mut content_blocks: Vec<serde_json::Value> = Vec::new();
+                let mut content_blocks: Vec<HistoryContentBlock> = Vec::new();
 
                 if has_thinking {
-                    let mut thinking_block = serde_json::json!({
-                        "type": "thinking",
-                        "thinking": thinking_text,
+                    content_blocks.push(HistoryContentBlock::Thinking {
+                        thinking: thinking_text.unwrap_or_default().to_string(),
+                        signature: thinking_signature.map(str::to_string),
                     });
-                    if let Some(sig) = thinking_signature {
-                        thinking_block["signature"] = serde_json::json!(sig);
-                    }
-                    content_blocks.push(thinking_block);
                 }
 
                 if has_text {
@@ -1330,22 +1429,21 @@ fn build_anthropic_messages(
                         if tc.is_server_tool() {
                             if tc.server_tool.as_ref() == Some(&ServerToolKind::WebSearch) {
                                 if let Some(ref output) = tc.server_tool_output {
-                                    content_blocks.push(serde_json::json!({
-                                        "type": "text",
-                                        "text": format!("[Web Search Result]\n{}", output),
-                                    }));
+                                    content_blocks.push(HistoryContentBlock::text(format!(
+                                        "[Web Search Result]\n{}",
+                                        output
+                                    )));
                                 }
                             }
                             continue;
                         }
                         let input: serde_json::Value =
                             serde_json::from_str(&tc.arguments).unwrap_or(serde_json::json!({}));
-                        content_blocks.push(serde_json::json!({
-                            "type": "tool_use",
-                            "id": tc.id,
-                            "name": tc.name,
-                            "input": input,
-                        }));
+                        content_blocks.push(HistoryContentBlock::ToolUse {
+                            id: tc.id.clone(),
+                            name: tc.name.clone(),
+                            input,
+                        });
                     }
                 }
 
@@ -1354,27 +1452,26 @@ fn build_anthropic_messages(
                     continue;
                 }
 
-                messages.push(serde_json::json!({
-                    "role": "assistant",
-                    "content": content_blocks,
-                }));
+                messages.push(AnthropicMessage {
+                    role: "assistant",
+                    content: content_blocks,
+                });
                 i += 1;
             }
             MessageRole::Tool => {
-                let mut tool_result_blocks: Vec<serde_json::Value> = Vec::new();
+                let mut tool_result_blocks: Vec<HistoryContentBlock> = Vec::new();
 
                 while i < history.len() && history[i].role == MessageRole::Tool {
                     let tool_msg = &history[i];
                     if let Some(tool_use_id) = tool_msg.tool_call_id.as_deref() {
                         if !tool_use_id.is_empty() {
-                            tool_result_blocks.push(serde_json::json!({
-                                "type": "tool_result",
-                                "tool_use_id": tool_use_id,
-                                "content": build_tool_result_content(
+                            tool_result_blocks.push(HistoryContentBlock::ToolResult {
+                                tool_use_id: tool_use_id.to_string(),
+                                content: build_tool_result_content(
                                     &tool_msg.content,
                                     tool_msg.images.as_deref(),
                                 ),
-                            }));
+                            });
                         } else {
                             eprintln!("[Anthropic] skipped tool_result with empty tool_use_id");
                         }
@@ -1385,10 +1482,10 @@ fn build_anthropic_messages(
                 }
 
                 if !tool_result_blocks.is_empty() {
-                    messages.push(serde_json::json!({
-                        "role": "user",
-                        "content": tool_result_blocks,
-                    }));
+                    messages.push(AnthropicMessage {
+                        role: "user",
+                        content: tool_result_blocks,
+                    });
                 }
             }
         }
@@ -1509,24 +1606,26 @@ fn apply_flattened_body_compat(body: &mut serde_json::Value) {
     }
 }
 
-fn apply_cache_control(messages: &mut [serde_json::Value]) {
+fn apply_cache_control(messages: &mut [AnthropicMessage], ttl: Option<&'static str>) {
     let len = messages.len();
     if len == 0 {
         return;
     }
 
+    let marker = CacheControl {
+        control_type: "ephemeral",
+        ttl,
+    };
+
     let start = if len >= 2 { len - 2 } else { 0 };
     for msg in &mut messages[start..] {
-        if let Some(content_arr) = msg.get_mut("content").and_then(|c| c.as_array_mut()) {
-            if let Some(last_block) = content_arr.iter_mut().rev().find(|b| {
-                matches!(
-                    b.get("type").and_then(|t| t.as_str()),
-                    Some("text") | Some("image")
-                )
-            }) {
-                last_block["cache_control"] =
-                    serde_json::json!({ "type": "ephemeral", "ttl": CACHE_TTL });
+        if let Some(slot) = msg.content.iter_mut().rev().find_map(|block| match block {
+            HistoryContentBlock::Text { cache_control, .. } | HistoryContentBlock::Image { cache_control, .. } => {
+                Some(cache_control)
             }
+            _ => None,
+        }) {
+            *slot = Some(marker.clone());
         }
     }
 }
@@ -1690,31 +1789,19 @@ fn convert_oauth_input_schema(
     (serde_json::Value::Object(converted), aliases)
 }
 
-fn rewrite_oauth_tool_use_blocks(messages: &mut [serde_json::Value], aliases: &OauthToolAliases) {
+fn rewrite_oauth_tool_use_blocks(messages: &mut [AnthropicMessage], aliases: &OauthToolAliases) {
     for message in messages {
-        let Some(content_blocks) = message.get_mut("content").and_then(|v| v.as_array_mut()) else {
-            continue;
-        };
-        for block in content_blocks {
-            if block.get("type").and_then(|v| v.as_str()) != Some("tool_use") {
-                continue;
-            }
-            let Some(internal_name) = block
-                .get("name")
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-            else {
+        for block in &mut message.content {
+            let HistoryContentBlock::ToolUse { name, input, .. } = block else {
                 continue;
             };
-            let Some(public_name) = aliases.public_name_for(&internal_name) else {
+            let Some(public_name) = aliases.public_name_for(name) else {
                 continue;
             };
 
-            block["name"] = serde_json::Value::String(public_name.to_string());
-            if let Some(input) = block.get_mut("input") {
-                let current = std::mem::take(input);
-                *input = aliases.public_input_for(&internal_name, current);
-            }
+            let internal_name = std::mem::replace(name, public_name.to_string());
+            let current = std::mem::take(input);
+            *input = aliases.public_input_for(&internal_name, current);
         }
     }
 }
@@ -1800,11 +1887,11 @@ fn sanitize_system_text(text: &str) -> String {
     re_oc.replace_all(&text, "Claude").to_string()
 }
 
-fn build_text_blocks(text: &str) -> Vec<serde_json::Value> {
+fn build_text_blocks(text: &str) -> Vec<HistoryContentBlock> {
     const START: &str = "<system-reminder>";
     const END: &str = "</system-reminder>";
 
-    let mut blocks: Vec<serde_json::Value> = Vec::new();
+    let mut blocks: Vec<HistoryContentBlock> = Vec::new();
     let mut remaining = text;
 
     while let Some(start_idx) = remaining.find(START) {
@@ -1833,33 +1920,23 @@ fn build_text_blocks(text: &str) -> Vec<serde_json::Value> {
     blocks
 }
 
-fn build_tool_result_content(text: &str, images: Option<&[ImageData]>) -> serde_json::Value {
+fn build_tool_result_content(text: &str, images: Option<&[ImageData]>) -> ToolResultContent {
     let Some(images) = images.filter(|images| !images.is_empty()) else {
-        return serde_json::Value::String(text.to_string());
+        return ToolResultContent::Text(text.to_string());
     };
 
     let mut blocks = build_text_blocks(text);
     for img in images {
-        blocks.push(serde_json::json!({
-            "type": "image",
-            "source": {
-                "type": "base64",
-                "media_type": img.mime_type,
-                "data": img.data,
-            }
-        }));
+        blocks.push(HistoryContentBlock::image(img));
     }
-    serde_json::Value::Array(blocks)
+    ToolResultContent::Blocks(blocks)
 }
 
-fn push_text_block(blocks: &mut Vec<serde_json::Value>, text: &str) {
+fn push_text_block(blocks: &mut Vec<HistoryContentBlock>, text: &str) {
     if text.trim().is_empty() {
         return;
     }
-    blocks.push(serde_json::json!({
-        "type": "text",
-        "text": text,
-    }));
+    blocks.push(HistoryContentBlock::text(text));
 }
 
 fn request_header_session_id(request_session_id: Option<&str>) -> String {
@@ -2053,10 +2130,84 @@ mod tests {
         apply_cache_control, build_anthropic_messages, build_native_anthropic_tools,
         build_oauth_system_blocks, build_text_blocks, convert_tools_to_oauth_sdk_like_anthropic,
         next_sse_separator, resolve_native_beta_flags, rewrite_oauth_tool_use_blocks,
-        sse_line_value, utf8_prefix_chars, AnthropicHistoryOptions, CACHE_TTL,
+        sse_line_value, utf8_prefix_chars, AnthropicHistoryOptions, AnthropicMessage,
+        HistoryContentBlock, NativeChatRequest, NativeSystemBlock, ThinkingParam, CACHE_TTL,
     };
     use crate::session::models::{ChatMessage, ImageData, MessageRole, ToolCallInfo};
     use serde_json::json;
+
+    /// Assertions below inspect the serialized request shape — the actual
+    /// wire contract — so convert the typed history back to JSON values.
+    fn to_json(messages: Vec<AnthropicMessage>) -> Vec<serde_json::Value> {
+        messages
+            .into_iter()
+            .map(|message| serde_json::to_value(message).expect("message serializes"))
+            .collect()
+    }
+
+    #[test]
+    fn native_chat_request_keeps_type_first_and_system_before_messages() {
+        let body = NativeChatRequest {
+            model: "m",
+            max_tokens: 64,
+            system: [NativeSystemBlock {
+                block_type: "text",
+                text: "sys",
+            }],
+            messages: vec![AnthropicMessage {
+                role: "user",
+                content: vec![HistoryContentBlock::text("hi")],
+            }],
+            stream: true,
+            thinking: None,
+            output_config: None,
+            tools: None,
+        };
+        let serialized = serde_json::to_string(&body).unwrap();
+        // Gateways that mis-parse alphabetized blocks (issue #91) require the
+        // tag to lead each block and system to precede the bulky messages.
+        assert!(serialized.contains(r#""system":[{"type":"text","text":"sys"}]"#));
+        assert!(serialized.contains(r#""content":[{"type":"text","text":"hi"}]"#));
+        let system_pos = serialized.find("\"system\"").unwrap();
+        let messages_pos = serialized.find("\"messages\"").unwrap();
+        assert!(system_pos < messages_pos);
+        assert!(!serialized.contains("\"thinking\""));
+        assert!(!serialized.contains("\"output_config\""));
+        assert!(!serialized.contains("\"tools\""));
+    }
+
+    #[test]
+    fn thinking_param_serializes_tag_first() {
+        assert_eq!(
+            serde_json::to_string(&ThinkingParam::Enabled {
+                budget_tokens: 5000
+            })
+            .unwrap(),
+            r#"{"type":"enabled","budget_tokens":5000}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&ThinkingParam::Adaptive).unwrap(),
+            r#"{"type":"adaptive"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&ThinkingParam::Disabled).unwrap(),
+            r#"{"type":"disabled"}"#
+        );
+    }
+
+    #[test]
+    fn apply_cache_control_without_ttl_omits_the_field() {
+        let mut messages = vec![AnthropicMessage {
+            role: "user",
+            content: vec![HistoryContentBlock::text("hi")],
+        }];
+        apply_cache_control(&mut messages, None);
+        let messages = to_json(messages);
+        assert_eq!(
+            messages[0]["content"][0]["cache_control"],
+            json!({ "type": "ephemeral" })
+        );
+    }
 
     fn assistant_message(
         content: &str,
@@ -2099,6 +2250,7 @@ mod tests {
         );
 
         assert_eq!(blocks.len(), 2);
+        let blocks = serde_json::to_value(&blocks).unwrap();
         assert_eq!(blocks[0]["type"], json!("text"));
         assert_eq!(
             blocks[0]["text"],
@@ -2177,10 +2329,11 @@ mod tests {
 
         let mut messages = build_anthropic_messages(&history, AnthropicHistoryOptions::standard());
         assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0]["content"].as_array().map(|v| v.len()), Some(2));
+        assert_eq!(messages[0].content.len(), 2);
 
-        apply_cache_control(&mut messages);
+        apply_cache_control(&mut messages, Some(CACHE_TTL));
 
+        let messages = to_json(messages);
         let blocks = messages[0]["content"]
             .as_array()
             .expect("content should be block array");
@@ -2276,8 +2429,10 @@ mod tests {
     fn custom_endpoint_history_omits_thinking_when_replay_disabled() {
         let history = vec![assistant_message("answer", Some("thinking"), Some("sig"))];
 
-        let messages =
-            build_anthropic_messages(&history, AnthropicHistoryOptions::custom_endpoint(false));
+        let messages = to_json(build_anthropic_messages(
+            &history,
+            AnthropicHistoryOptions::custom_endpoint(false),
+        ));
 
         let blocks = messages[0]["content"].as_array().unwrap();
         assert_eq!(blocks.len(), 1);
@@ -2289,8 +2444,10 @@ mod tests {
     fn custom_endpoint_history_skips_unsigned_thinking_when_replay_enabled() {
         let history = vec![assistant_message("answer", Some("thinking"), None)];
 
-        let messages =
-            build_anthropic_messages(&history, AnthropicHistoryOptions::custom_endpoint(true));
+        let messages = to_json(build_anthropic_messages(
+            &history,
+            AnthropicHistoryOptions::custom_endpoint(true),
+        ));
 
         let blocks = messages[0]["content"].as_array().unwrap();
         assert_eq!(blocks.len(), 1);
@@ -2302,8 +2459,10 @@ mod tests {
     fn custom_endpoint_history_replays_signed_thinking_when_enabled() {
         let history = vec![assistant_message("answer", Some("thinking"), Some("sig"))];
 
-        let messages =
-            build_anthropic_messages(&history, AnthropicHistoryOptions::custom_endpoint(true));
+        let messages = to_json(build_anthropic_messages(
+            &history,
+            AnthropicHistoryOptions::custom_endpoint(true),
+        ));
 
         let blocks = messages[0]["content"].as_array().unwrap();
         assert_eq!(blocks.len(), 2);
@@ -2318,7 +2477,10 @@ mod tests {
     fn standard_history_preserves_unsigned_thinking() {
         let history = vec![assistant_message("answer", Some("thinking"), None)];
 
-        let messages = build_anthropic_messages(&history, AnthropicHistoryOptions::standard());
+        let messages = to_json(build_anthropic_messages(
+            &history,
+            AnthropicHistoryOptions::standard(),
+        ));
 
         let blocks = messages[0]["content"].as_array().unwrap();
         assert_eq!(blocks.len(), 2);
@@ -2393,8 +2555,9 @@ mod tests {
         ];
 
         let mut messages = build_anthropic_messages(&history, AnthropicHistoryOptions::standard());
-        apply_cache_control(&mut messages);
+        apply_cache_control(&mut messages, Some(CACHE_TTL));
 
+        let messages = to_json(messages);
         let message_cache_blocks = messages
             .iter()
             .flat_map(|msg| {
@@ -2470,6 +2633,7 @@ mod tests {
 
         rewrite_oauth_tool_use_blocks(&mut messages, &aliases);
 
+        let messages = to_json(messages);
         let content = messages[0]["content"].as_array().unwrap();
         assert_eq!(content[0]["name"], json!("Read"));
         assert_eq!(
@@ -2549,7 +2713,10 @@ mod tests {
             },
         ];
 
-        let messages = build_anthropic_messages(&history, AnthropicHistoryOptions::standard());
+        let messages = to_json(build_anthropic_messages(
+            &history,
+            AnthropicHistoryOptions::standard(),
+        ));
 
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[0]["role"], json!("assistant"));
@@ -2631,7 +2798,10 @@ mod tests {
             },
         ];
 
-        let messages = build_anthropic_messages(&history, AnthropicHistoryOptions::standard());
+        let messages = to_json(build_anthropic_messages(
+            &history,
+            AnthropicHistoryOptions::standard(),
+        ));
         let tool_result = &messages[1]["content"][0];
         assert_eq!(tool_result["type"], json!("tool_result"));
         let content = tool_result["content"]
