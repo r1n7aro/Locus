@@ -31,6 +31,17 @@ DMD 真正消解的是**运行时可见性墙**这一类（与 B 组不相交）
 
 ## B1. 泛型方法体修改转热（remove+add 垫片分解）
 
+> **状态：已实现（2026-06-13，连同 B4）。** 实现与计划的差异/补充：
+> 1. CallerScan 补了 MethodSpec→MemberRef/MethodDef 解析链（计划第 3 点的预判成立：此前泛型调用点确实漏报 fail-open），先行测例后放行分类。
+> 2. 计划未明说的一个正确性缺口已补：**批内"未变更"调用方的强制重挂**。M3 只保证调用点文件在批内，但 kept 成员的补丁副本若不被 detour，改写后的垫片直调永远不生效（原方法体继续运行）。PatchRewriter 新增 ensure 通道：凡 kept 成员体内出现对"同签名重加成员"的引用，即把该成员并入 detour 集（含实例初始化器→全部实例 ctor）；围合成员本身不可重挂（泛型/Burst/显式接口/析构器/未变更运算符）→ 点名冷。
+> 3. 同键墓碑抑制：同签名 remove+add 时墓碑注册被跳过，否则注册表 last-write-wins 会用 tombstone 覆盖 added 条目，破坏后续批次。
+> 4. ClassifyAddedMember 放行泛型方法后新增一个冷形态：方法类型参数遮蔽声明链类型参数（CS0693 源码合法，但扁平化垫片会重复声明）→ 点名冷。
+> 5. 泛型 Unity message 名（如 `Update<T>`/泛型类型内 `Update`）在分解前显式守卫为冷（引擎派发无法被垫片直调替代）。
+> 6. 调用点显式类型实参仅在方法自身带类型参数时物化（链泛型维持推断，保持既有 golden 行为）；不可言说类型实参（匿名类型）回退推断。
+> 7. 限制（沿计划+新增）：跨程序集调用点不可改写（M3 兜底）；每次再编辑该方法都要求其编译期调用点文件再次同批（M3 无状态地每批重验）；ref struct 接收者沿 added-member 既有按值语义。
+>
+> 测试：sidecar 183/183（基线 170 + 13 新增：MethodSpec×2、HotDiff×6、HotPatch E2E/冷×4+golden×1，B4×2 见下）；自检新增 P33a/b（泛型方法体+泛型类型方法体、调用方不动靠 ensure 重挂）、N01 改为「调用点不在批内」点名形态、N15 改为泛型类型 ctor 体改。实机一轮自检待跑。
+
 **现状**：`generic method body changed` → cold（泛型方法与泛型类型内方法体一律冷，detour 不可靠是根因）。
 
 **机制**：不碰 detour。把「泛型方法体修改」按 H7c 既有路径分解：
@@ -80,6 +91,8 @@ DMD 真正消解的是**运行时可见性墙**这一类（与 B 组不相交）
 **DoD**：上述三用例自检全绿 + 同名类型消歧的 sidecar 单测。**规模**：1-2 天（若消歧缺失则 +1 天）。
 
 ## B4. unsafe / stackalloc 体修改跟随项目设置
+
+> **状态：已实现（2026-06-13）。** 链路：Unity `ComputeCompileAllowUnsafe()`（Editor+Player 程序集任一 `compilerOptions.AllowUnsafeCode`，随引用路径缓存同生命周期）→ payload `allow_unsafe` + fingerprint 掺入 → Rust `CompileParams.allow_unsafe`（serde default=false 向后兼容）→ sidecar `CompileParamsDto.AllowUnsafe` → `PatchBatch.Build` 与 hotPatch 发射 options 双处 `WithAllowUnsafe`。ProtocolVersion 未动。测试：allowUnsafe=true 下 unsafe 体改热（含补丁执行 E2E）、false 下确定性 CS0227。注意：需要 Unity 插件与 Locus 同时更新才生效（旧插件 payload 无该字段→默认 false，行为与现状一致）。
 
 **现状**：`PatchBatch.Build` 绑定编译 `allowUnsafe: false` 写死；开启 unsafe 的项目体内含 unsafe 构造→绑定/发射期确定性失败（CompileError 而非冷）。
 
@@ -149,9 +162,9 @@ original → DMD(patchMethod).Generate() → detour(original, generated)
 
 | 期 | 项 | 规模 | 解锁 |
 |---|---|---|---|
-| 1 | B4 unsafe | 0.5d | unsafe 工程体改 |
+| 1 | B4 unsafe ✅ 已实现 | 0.5d | unsafe 工程体改 |
 | 1 | A 组实机回归 | 0.5d | 基线确认 |
-| 2 | B1 泛型体 | 2-3d | 最大冷区 |
+| 2 | B1 泛型体 ✅ 已实现（实机自检待跑） | 2-3d | 最大冷区 |
 | 3 | C1 部分 DMD | 1-2d+实机 | internal 盲区 + C2 试金石 |
 | 4 | B2 属性/事件/索引器新增 | 3-5d | 第二大新增需求 |
 | 5 | B3 + B5 验证矩阵 | 2-3d | 真实工程形态 |

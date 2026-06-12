@@ -1056,27 +1056,98 @@ namespace Game
     }
 
     [Fact]
-    public void Generic_type_method_body_change_is_cold()
+    public void Generic_type_method_body_change_decomposes_to_readd()
     {
-        const string oldText = "class A<T> { void M() { } }";
-        const string newText = "class A<T> { void M() { System.Console.WriteLine(1); } }";
+        // B1: generic bodies cannot be re-detoured; the edit decomposes into
+        // tombstone + same-signature shim re-add + M3 caller check.
+        const string oldText = "class A<T> { public void M() { } }";
+        const string newText = "class A<T> { public void M() { System.Console.WriteLine(1); } }";
 
         var result = Analyze(oldText, newText);
 
-        Assert.False(result.Hot);
-        Assert.Contains(result.Reasons, r => r.Contains("generic"));
+        Assert.True(result.Hot, string.Join("; ", result.Reasons));
+        var removed = Assert.Single(result.RemovedMembers);
+        Assert.Equal("M", removed.Name);
+        Assert.False(removed.IsUnityMagic);
+        Assert.Null(removed.StubSource);
+        var added = Assert.Single(result.ChangedMethods);
+        Assert.True(added.Added);
+        Assert.Equal("M", added.Name);
+        Assert.Equal(0, added.TypeParameterCount);
+        var check = Assert.Single(result.RequiresCallerCheck);
+        Assert.Contains("generic method body changed: A`1.M", check.Detail);
+        Assert.Equal(new[] { "M" }, check.ScanMemberNames);
     }
 
     [Fact]
-    public void Generic_method_body_change_is_cold()
+    public void Generic_method_body_change_decomposes_to_readd()
     {
-        const string oldText = "class A { T M<T>(T x) { return x; } }";
-        const string newText = "class A { T M<T>(T x) { System.Console.WriteLine(1); return x; } }";
+        const string oldText = "class A { public T M<T>(T x) { return x; } }";
+        const string newText = "class A { public T M<T>(T x) { System.Console.WriteLine(1); return x; } }";
+
+        var result = Analyze(oldText, newText);
+
+        Assert.True(result.Hot, string.Join("; ", result.Reasons));
+        var removed = Assert.Single(result.RemovedMembers);
+        Assert.Equal("M", removed.Name);
+        var added = Assert.Single(result.ChangedMethods);
+        Assert.True(added.Added);
+        Assert.Equal(1, added.TypeParameterCount);
+        Assert.Equal(new[] { "T" }, added.ParamTypeNames);
+        var check = Assert.Single(result.RequiresCallerCheck);
+        Assert.Contains("generic method body changed: A.M", check.Detail);
+    }
+
+    [Fact]
+    public void Generic_method_added_is_hot_as_shim()
+    {
+        const string oldText = "class A { }";
+        const string newText = "class A { public T M<T>(T x) { return x; } }";
+
+        var result = Analyze(oldText, newText);
+
+        Assert.True(result.Hot, string.Join("; ", result.Reasons));
+        var added = Assert.Single(result.ChangedMethods);
+        Assert.True(added.Added);
+        Assert.Equal(1, added.TypeParameterCount);
+        Assert.Empty(result.RemovedMembers);
+    }
+
+    [Fact]
+    public void Generic_method_type_parameter_shadowing_is_cold()
+    {
+        // The flattened shim would declare T twice (CS0693 source).
+        const string oldText = "class A<T> { public T M<T>(T x) { return x; } }";
+        const string newText = "class A<T> { public T M<T>(T x) { System.Console.WriteLine(1); return x; } }";
 
         var result = Analyze(oldText, newText);
 
         Assert.False(result.Hot);
-        Assert.Contains(result.Reasons, r => r.Contains("generic method body changed"));
+        Assert.Contains(result.Reasons, r => r.Contains("shadows the declaring type's"));
+    }
+
+    [Fact]
+    public void Virtual_generic_context_method_body_change_stays_cold()
+    {
+        const string oldText = "class A<T> { public virtual void M() { } }";
+        const string newText = "class A<T> { public virtual void M() { System.Console.WriteLine(1); } }";
+
+        var result = Analyze(oldText, newText);
+
+        Assert.False(result.Hot);
+        Assert.Contains(result.Reasons, r => r.Contains("virtual member removed"));
+    }
+
+    [Fact]
+    public void Generic_context_unity_message_body_change_stays_cold()
+    {
+        const string oldText = "class A<T> : UnityEngine.MonoBehaviour { void Update() { } }";
+        const string newText = "class A<T> : UnityEngine.MonoBehaviour { void Update() { System.Console.WriteLine(1); } }";
+
+        var result = Analyze(oldText, newText);
+
+        Assert.False(result.Hot);
+        Assert.Contains(result.Reasons, r => r.Contains("Unity message methods cannot take the remove+add path"));
     }
 
     [Fact]

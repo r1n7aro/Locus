@@ -50,6 +50,8 @@ struct GetCompileParamsResponse {
     reference_paths: Vec<String>,
     #[serde(default)]
     defines: Vec<String>,
+    #[serde(default)]
+    allow_unsafe: bool,
 }
 
 /// Get current compile params for `project_path`, refreshing from Unity.
@@ -115,6 +117,7 @@ pub async fn get_params(project_path: &str) -> Result<CompileParams, String> {
             lang_version: response.lang_version,
             reference_paths: response.reference_paths,
             defines: response.defines,
+            allow_unsafe: response.allow_unsafe,
         }
     };
 
@@ -154,13 +157,15 @@ mod tests {
             "domain_generation": "11112222333344445555666677778888",
             "lang_version": "9",
             "reference_paths": ["C:/proj/Library/ScriptAssemblies/Assembly-CSharp.dll"],
-            "defines": ["UNITY_EDITOR", "UNITY_2022_3_OR_NEWER"]
+            "defines": ["UNITY_EDITOR", "UNITY_2022_3_OR_NEWER"],
+            "allow_unsafe": true
         }"#;
         let response: GetCompileParamsResponse = serde_json::from_str(json).expect("parse");
         assert!(!response.unchanged);
         assert_eq!(response.fingerprint, "abc");
         assert_eq!(response.reference_paths.len(), 1);
         assert_eq!(response.defines.len(), 2);
+        assert!(response.allow_unsafe);
     }
 
     #[test]

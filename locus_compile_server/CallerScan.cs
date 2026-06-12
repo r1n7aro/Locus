@@ -164,6 +164,23 @@ public static class CallerScan
             }
         }
 
+        // Generic METHOD call sites reference a MethodSpec token (the
+        // instantiation), not the underlying MemberRef/MethodDef the loops
+        // above registered: map every MethodSpec whose generic definition is
+        // a target back to the same keys, otherwise calls like `Echo<int>(x)`
+        // would scan as misses (fail-open).
+        int methodSpecRows = reader.GetTableRowCount(TableIndex.MethodSpec);
+        for (int row = 1; row <= methodSpecRows; row++)
+        {
+            MethodSpecificationHandle specHandle = MetadataTokens.MethodSpecificationHandle(row);
+            MethodSpecification spec = reader.GetMethodSpecification(specHandle);
+            if (tokenTargets.TryGetValue(MetadataTokens.GetToken(spec.Method), out List<string>? specKeys))
+            {
+                foreach (string key in specKeys)
+                    AddToken(specHandle, key);
+            }
+        }
+
         if (tokenTargets.Count == 0)
             return;
 

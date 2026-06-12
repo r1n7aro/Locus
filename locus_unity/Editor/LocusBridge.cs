@@ -86,6 +86,10 @@ namespace Locus
         private static bool _metadataReferencesReady;
         private static List<string> _cachedCompileReferencePaths;
         private static bool _compileReferencePathsReady;
+        /// <summary>Any project script assembly compiles with "Allow unsafe
+        /// code" — hot patches follow it (B4). Cached together with the
+        /// reference paths (same CompilationPipeline walk, same lifetime).</summary>
+        private static bool _cachedCompileAllowUnsafe;
         private static int _snippetAssemblyCounter;
 
         // ───────────────── Agent-controlled recompile ─────────────────
@@ -565,6 +569,7 @@ namespace Locus
                 _cachedMetadataReferences = null;
                 _compileReferencePathsReady = false;
                 _cachedCompileReferencePaths = null;
+                _cachedCompileAllowUnsafe = false;
             }
         }
 

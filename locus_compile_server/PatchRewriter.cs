@@ -169,7 +169,14 @@ public static class PatchRewriter
                     string metadataName = HotDiff.MetadataName(typeDecl);
                     if (newTypeNames.Contains(metadataName))
                     {
-                        CollectNewType(model, typeDecl, metadataName, result);
+                        // A new NESTED type inside a pre-existing container
+                        // lives inside the RENAMED patch copy: report the
+                        // runtime metadata name.
+                        int plus = metadataName.IndexOf('+');
+                        string runtimeName = plus > 0 && !newTypeNames.Contains(metadataName[..plus])
+                            ? PatchTypeName(metadataName)
+                            : metadataName;
+                        CollectNewType(model, typeDecl, runtimeName, result);
                         continue;
                     }
                     localDecls.Add(typeDecl);
@@ -221,39 +228,6 @@ public static class PatchRewriter
             }
         }
 
-        // Layout guard + original assembly names for the patched types.
-        foreach (string patchedType in diff.PatchedTypes)
-        {
-            BaseTypeDeclarationSyntax? decl = localDecls
-                .FirstOrDefault(d => HotDiff.MetadataName(d) == patchedType);
-            if (decl is not TypeDeclarationSyntax typeDecl)
-                continue;
-            if (model.GetDeclaredSymbol(typeDecl) is not INamedTypeSymbol sourceSymbol)
-                continue;
-
-            INamedTypeSymbol? original = FindOriginalType(binding, patchedType, out string? assemblyName);
-            if (original == null)
-            {
-                result.ColdReason = "original type not found in references: " + patchedType;
-                return result;
-            }
-
-            string? layoutError = fieldChangesByType.TryGetValue(patchedType, out List<HotDiffFieldChange>? typeChanges)
-                ? VerifyVirtualizedLayout(sourceSymbol, original, typeChanges)
-                : (InstanceFieldSequence(sourceSymbol).SequenceEqual(InstanceFieldSequence(original), StringComparer.Ordinal)
-                    ? null
-                    : "layout mismatch");
-            if (layoutError != null)
-            {
-                result.ColdReason =
-                    "original assembly field layout differs from the edited baseline for " + patchedType +
-                    " (the file changed outside this session?); a unity_recompile will converge";
-                return result;
-            }
-            if (assemblyName != null && !result.OriginalAssemblies.Contains(assemblyName))
-                result.OriginalAssemblies.Add(assemblyName);
-        }
-
         // ── locate ADDED members (M2) in this file ───────────────────
 
         var addedDecls = new Dictionary<MethodDeclarationSyntax, ShimTarget>();
@@ -303,6 +277,65 @@ public static class PatchRewriter
                 result.ColdReason = accessViolation;
                 return result;
             }
+        }
+
+        // ── B1: kept callers of RE-ADDED members must re-detour ──────
+        // A re-added member (generic body change) keeps its old compiled
+        // body live — nothing detours it. Its in-batch call sites rewrite
+        // to direct shim calls below, but a rewrite inside a KEPT
+        // (unchanged) member only takes effect once that member's patch
+        // copy is detoured: ensure it, or fail the file closed when the
+        // enclosing member cannot be re-detoured.
+        var ensuredDetours = new List<HotDiffMethod>();
+        if (batch.ReAddedMemberKeys.Count > 0)
+        {
+            string? ensureCold = EnsureReAddedCallerDetours(
+                root, model, batch, diff, addedDecls, newTypeNames, ensuredDetours);
+            if (ensureCold != null)
+            {
+                result.ColdReason = ensureCold;
+                return result;
+            }
+        }
+
+        // Layout guard + original assembly names for the patched types
+        // (plus types whose kept members re-detour for re-added call sites).
+        var guardTypes = new List<string>(diff.PatchedTypes);
+        foreach (HotDiffMethod ensured in ensuredDetours)
+        {
+            if (!guardTypes.Contains(ensured.DeclaringType))
+                guardTypes.Add(ensured.DeclaringType);
+        }
+        foreach (string patchedType in guardTypes)
+        {
+            BaseTypeDeclarationSyntax? decl = localDecls
+                .FirstOrDefault(d => HotDiff.MetadataName(d) == patchedType);
+            if (decl is not TypeDeclarationSyntax typeDecl)
+                continue;
+            if (model.GetDeclaredSymbol(typeDecl) is not INamedTypeSymbol sourceSymbol)
+                continue;
+
+            INamedTypeSymbol? original = FindOriginalType(binding, patchedType, out string? assemblyName);
+            if (original == null)
+            {
+                result.ColdReason = "original type not found in references: " + patchedType;
+                return result;
+            }
+
+            string? layoutError = fieldChangesByType.TryGetValue(patchedType, out List<HotDiffFieldChange>? typeChanges)
+                ? VerifyVirtualizedLayout(sourceSymbol, original, typeChanges)
+                : (InstanceFieldSequence(sourceSymbol).SequenceEqual(InstanceFieldSequence(original), StringComparer.Ordinal)
+                    ? null
+                    : "layout mismatch");
+            if (layoutError != null)
+            {
+                result.ColdReason =
+                    "original assembly field layout differs from the edited baseline for " + patchedType +
+                    " (the file changed outside this session?); a unity_recompile will converge";
+                return result;
+            }
+            if (assemblyName != null && !result.OriginalAssemblies.Contains(assemblyName))
+                result.OriginalAssemblies.Add(assemblyName);
         }
 
         // ── collect rewrites ─────────────────────────────────────────
@@ -492,6 +525,20 @@ public static class PatchRewriter
                         " was deleted by an earlier hot patch in this session; remove the reference or run unity_recompile";
                     return result;
                 }
+                if (batch.NewTypeSymbols.Contains(named.OriginalDefinition))
+                {
+                    // Brand-new types never re-qualify to ORIGINAL names.
+                    // Top-level ones keep their (unrenamed) names — lexical
+                    // binding in the patch unit resolves them. Nested ones
+                    // under a RENAMED container re-qualify to the PATCH
+                    // name: the original type has no such nested member.
+                    if (named.OriginalDefinition.ContainingType != null &&
+                        IsRenamedTypeSymbol(named, renamedSymbols))
+                    {
+                        typeRefCandidates[node] = named;
+                    }
+                    continue;
+                }
                 if (IsRenamedTypeSymbol(named, renamedSymbols))
                     typeRefCandidates[node] = named;
             }
@@ -513,7 +560,9 @@ public static class PatchRewriter
             if (nestedInCandidate || nodeReplacements.ContainsKey(node))
                 continue;
 
-            string fqn = pair.Value.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat);
+            string fqn = batch.NewTypeSymbols.Contains(pair.Value.OriginalDefinition)
+                ? PatchQualifiedDisplay(pair.Value)
+                : pair.Value.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat);
             bool expressionContext =
                 node.Parent is MemberAccessExpressionSyntax memberAccess && memberAccess.Expression == node;
             SyntaxNode replacement = expressionContext
@@ -726,7 +775,7 @@ public static class PatchRewriter
                 if (symbol is not (IFieldSymbol or IPropertySymbol or IEventSymbol or IMethodSymbol))
                     continue;
                 if (symbol is IMethodSymbol candidateMethod &&
-                    batch.AddedMembers.ContainsKey(candidateMethod.OriginalDefinition))
+                    TryGetAddedTarget(candidateMethod, batch, out _, out _))
                 {
                     continue; // the shim-call rewrite owns these
                 }
@@ -764,10 +813,12 @@ public static class PatchRewriter
         {
             if (InStrippedSpan(invocation))
                 continue;
-            if (model.GetSymbolInfo(invocation).Symbol is not IMethodSymbol invoked)
+            if (!TryResolveAddedTarget(
+                model.GetSymbolInfo(invocation), batch,
+                out ShimTarget? target, out IMethodSymbol? invoked, out bool reduced))
+            {
                 continue;
-            if (!batch.AddedMembers.TryGetValue(invoked.OriginalDefinition, out ShimTarget? target))
-                continue;
+            }
 
             if (invocation.Expression is MemberBindingExpressionSyntax)
             {
@@ -779,8 +830,14 @@ public static class PatchRewriter
 
             ShimTarget? enclosingAdded = EnclosingAddedTarget(invocation);
             ShimTarget capturedTarget = target;
+            string typeArgumentText = ShimTypeArgumentText(target, invoked);
+            string? reducedReceiverCastFqn = reduced && invoked.Parameters.Length > 0
+                ? invoked.Parameters[0].Type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat)
+                : null;
             dynamicReplacements[invocation] = rewrittenNode =>
-                BuildShimInvocation((InvocationExpressionSyntax)rewrittenNode, capturedTarget, enclosingAdded);
+                BuildShimInvocation(
+                    (InvocationExpressionSyntax)rewrittenNode, capturedTarget, enclosingAdded,
+                    typeArgumentText, reducedReceiverCastFqn);
         }
 
         // Method groups of added members (delegate conversions) → lambdas
@@ -796,22 +853,9 @@ public static class PatchRewriter
             if (node.Parent is MemberAccessExpressionSyntax outerAccess && outerAccess.Name == node)
                 continue;
 
-            SymbolInfo info = model.GetSymbolInfo(node);
-            IMethodSymbol? groupSymbol = info.Symbol as IMethodSymbol;
-            if (groupSymbol == null)
-            {
-                foreach (ISymbol candidate in info.CandidateSymbols)
-                {
-                    if (candidate is IMethodSymbol candidateMethod &&
-                        batch.AddedMembers.ContainsKey(candidateMethod.OriginalDefinition))
-                    {
-                        groupSymbol = candidateMethod;
-                        break;
-                    }
-                }
-            }
-            if (groupSymbol == null ||
-                !batch.AddedMembers.TryGetValue(groupSymbol.OriginalDefinition, out ShimTarget? groupTarget))
+            if (!TryResolveAddedTarget(
+                model.GetSymbolInfo(node), batch,
+                out ShimTarget? groupTarget, out IMethodSymbol? groupSymbol, out bool groupReduced))
             {
                 continue;
             }
@@ -841,8 +885,14 @@ public static class PatchRewriter
             ShimTarget capturedGroupTarget = groupTarget;
             IMethodSymbol invoke = delegateType.DelegateInvokeMethod;
             ShimTarget? enclosingAdded = EnclosingAddedTarget(node);
+            string groupTypeArgumentText = ShimTypeArgumentText(groupTarget, groupSymbol);
+            string? groupReceiverCastFqn = groupReduced && groupSymbol.Parameters.Length > 0
+                ? groupSymbol.Parameters[0].Type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat)
+                : null;
             dynamicReplacements[node] = rewrittenNode =>
-                BuildShimLambda(rewrittenNode, capturedGroupTarget, invoke, enclosingAdded);
+                BuildShimLambda(
+                    rewrittenNode, capturedGroupTarget, invoke, enclosingAdded,
+                    groupTypeArgumentText, groupReceiverCastFqn);
         }
 
         // ── calls to shims from EARLIER batches (registry fallback) ──
@@ -1066,12 +1116,21 @@ public static class PatchRewriter
         // the stub is what makes the deletion observable immediately.
         foreach (HotDiffRemovedMember removed in diff.RemovedMembers)
         {
-            result.ShimRegistrations.Add(new ShimRegistration
+            string removedKey = MemberSurfaceRegistry.MemberKey(
+                removed.DeclaringType, removed.Name, removed.ParamTypeNames, removed.IsStatic);
+
+            // A same-signature re-add (B1 generic body change) materialized
+            // this very member as a shim above: that "added" registration is
+            // the live surface — a tombstone would overwrite it in the
+            // registry (last write wins) and break later batches.
+            if (!batch.ReAddedMemberKeys.Contains(removedKey))
             {
-                MemberKey = MemberSurfaceRegistry.MemberKey(
-                    removed.DeclaringType, removed.Name, removed.ParamTypeNames, removed.IsStatic),
-                Entry = new MemberSurfaceRegistry.ShimEntry { Kind = "tombstone" },
-            });
+                result.ShimRegistrations.Add(new ShimRegistration
+                {
+                    MemberKey = removedKey,
+                    Entry = new MemberSurfaceRegistry.ShimEntry { Kind = "tombstone" },
+                });
+            }
 
             if (!removed.IsUnityMagic || removed.StubSource == null)
                 continue;
@@ -1186,11 +1245,10 @@ public static class PatchRewriter
             path: path,
             encoding: System.Text.Encoding.UTF8);
 
-        // Detour map: changed (non-added) members, original → patch type.
-        foreach (HotDiffMethod method in diff.ChangedMethods)
+        // Detour map: changed (non-added) members, original → patch type,
+        // plus kept members re-detoured for their re-added call sites (B1).
+        foreach (HotDiffMethod method in diff.ChangedMethods.Where(m => !m.Added).Concat(ensuredDetours))
         {
-            if (method.Added)
-                continue;
             result.Methods.Add(new PatchMethodMap
             {
                 DeclaringType = method.DeclaringType,
@@ -1318,7 +1376,7 @@ public static class PatchRewriter
         {
             switch (symbol)
             {
-                case IMethodSymbol method when batch.AddedMembers.ContainsKey(method.OriginalDefinition):
+                case IMethodSymbol method when TryGetAddedTarget(method, batch, out _, out _):
                     return true;
                 case IFieldSymbol field when
                     addedFieldSymbols.ContainsKey(field) || batch.AddedEnumMembers.ContainsKey(field):
@@ -1797,6 +1855,290 @@ public static class PatchRewriter
             .WithTriviaFrom(rewrittenNode);
     }
 
+    // ── B1: kept callers of re-added members ─────────────────────────
+
+    /// <summary>Walk every reference to a RE-ADDED member (same-signature
+    /// remove+add, i.e. a generic body change) and make sure the enclosing
+    /// member's patch copy will actually run: members already in the detour
+    /// set pass, added members pass (they ARE the shims), kept detourable
+    /// members join <paramref name="ensured"/>, and anything that cannot be
+    /// re-detoured returns a cold reason naming the exact site. Static
+    /// initializers/cctors are skipped: they never re-run by design (M5
+    /// frozen-value semantics).</summary>
+    private static string? EnsureReAddedCallerDetours(
+        CompilationUnitSyntax root,
+        SemanticModel model,
+        PatchBatchContext batch,
+        HotDiffFileResult diff,
+        Dictionary<MethodDeclarationSyntax, ShimTarget> addedDecls,
+        HashSet<string> newTypeNames,
+        List<HotDiffMethod> ensured)
+    {
+        foreach (SyntaxNode node in root.DescendantNodes())
+        {
+            SymbolInfo info;
+            switch (node)
+            {
+                case InvocationExpressionSyntax invocation:
+                    info = model.GetSymbolInfo(invocation);
+                    break;
+                case IdentifierNameSyntax or MemberAccessExpressionSyntax:
+                {
+                    // Method groups (delegate conversions): same shape the
+                    // lambda rewrite pass matches.
+                    if (node.Parent is InvocationExpressionSyntax parentInvocation && parentInvocation.Expression == node)
+                        continue;
+                    if (node.Parent is MemberAccessExpressionSyntax outerAccess && outerAccess.Name == node)
+                        continue;
+                    info = model.GetSymbolInfo(node);
+                    break;
+                }
+                default:
+                    continue;
+            }
+
+            if (!TryResolveAddedTarget(info, batch, out ShimTarget? target, out _, out _))
+                continue;
+            if (!batch.ReAddedMemberKeys.Contains(target.MemberKey))
+                continue;
+            // nameof(...) materializes as a constant — nothing to redirect.
+            if (FindEnclosingNameOf(node, model) != null)
+                continue;
+            if (addedDecls.Keys.Any(decl => decl.FullSpan.Contains(node.Span)))
+                continue; // inside an added member: the shim body itself
+
+            string? cold = EnsureSiteDetour(node, target, diff, newTypeNames, ensured);
+            if (cold != null)
+                return cold;
+        }
+        return null;
+    }
+
+    /// <summary>Classify one re-added-member reference site's enclosing
+    /// member and append the detour it needs (null = fine / handled);
+    /// returns a cold reason when the enclosure cannot be re-detoured.</summary>
+    private static string? EnsureSiteDetour(
+        SyntaxNode node,
+        ShimTarget target,
+        HotDiffFileResult diff,
+        HashSet<string> newTypeNames,
+        List<HotDiffMethod> ensured)
+    {
+        MemberDeclarationSyntax? member = null;
+        TypeDeclarationSyntax? hostType = null;
+        for (SyntaxNode? current = node.Parent; current != null; current = current.Parent)
+        {
+            if (current is MemberDeclarationSyntax candidate && current.Parent is TypeDeclarationSyntax owner)
+            {
+                member = candidate;
+                hostType = owner;
+                break;
+            }
+        }
+        if (member == null || hostType == null)
+            return null; // not executable code (attribute argument etc.)
+
+        string hostMetadataName = HotDiff.MetadataName(hostType);
+        if (newTypeNames.Contains(hostMetadataName))
+            return null; // brand-new types live wholly in the patch assembly
+
+        string reAdded = target.DeclaringTypeMetadataName + "." + target.MethodName;
+        string Cold(string memberDisplay, string why) =>
+            "a changed generic body is still reachable through " + hostMetadataName + "." + memberDisplay +
+            ", which " + why + ": it calls " + reAdded +
+            " — edit that member's body in the same batch or use unity_recompile";
+
+        bool genericHost = false;
+        for (SyntaxNode? current = hostType; current != null; current = current.Parent)
+        {
+            if (current is TypeDeclarationSyntax outer && (outer.TypeParameterList?.Parameters.Count ?? 0) > 0)
+            {
+                genericHost = true;
+                break;
+            }
+        }
+
+        void Add(string name, string[] paramNames, bool isStatic, bool isCtor)
+        {
+            bool exists =
+                diff.ChangedMethods.Any(m => !m.Added &&
+                    m.DeclaringType == hostMetadataName && m.Name == name && m.IsStatic == isStatic &&
+                    m.IsCtor == isCtor && m.ParamTypeNames.SequenceEqual(paramNames, StringComparer.Ordinal)) ||
+                ensured.Any(m =>
+                    m.DeclaringType == hostMetadataName && m.Name == name && m.IsStatic == isStatic &&
+                    m.IsCtor == isCtor && m.ParamTypeNames.SequenceEqual(paramNames, StringComparer.Ordinal));
+            if (!exists)
+            {
+                ensured.Add(new HotDiffMethod
+                {
+                    DeclaringType = hostMetadataName,
+                    Name = name,
+                    ParamTypeNames = paramNames,
+                    IsStatic = isStatic,
+                    IsCtor = isCtor,
+                });
+            }
+        }
+
+        // Instance field/auto-property initializers compile into every
+        // non-chained constructor; static ones already ran and stay frozen.
+        string? AddInstanceInitializerCtors()
+        {
+            if (genericHost)
+                return Cold("(initializer)", "is a generic type initializer that cannot be re-detoured");
+            var ctors = hostType.Members.OfType<ConstructorDeclarationSyntax>()
+                .Where(c => !c.Modifiers.Any(SyntaxKind.StaticKeyword))
+                .ToList();
+            if (ctors.Count == 0)
+            {
+                Add(".ctor", Array.Empty<string>(), isStatic: false, isCtor: true);
+            }
+            else
+            {
+                foreach (ConstructorDeclarationSyntax ctor in ctors)
+                    Add(".ctor", HotDiff.ParamTypeNames(ctor.ParameterList), isStatic: false, isCtor: true);
+            }
+            return null;
+        }
+
+        switch (member)
+        {
+            case MethodDeclarationSyntax method:
+            {
+                if (genericHost || (method.TypeParameterList?.Parameters.Count ?? 0) > 0)
+                    return Cold(method.Identifier.Text, "is generic and cannot be re-detoured");
+                if (HotDiff.HasBurstCompileAttribute(method))
+                    return Cold(method.Identifier.Text, "is Burst-compiled");
+                if (method.ExplicitInterfaceSpecifier != null)
+                    return Cold(method.Identifier.Text, "is an explicit interface implementation");
+                Add(method.Identifier.Text, HotDiff.ParamTypeNames(method.ParameterList),
+                    method.Modifiers.Any(SyntaxKind.StaticKeyword), isCtor: false);
+                return null;
+            }
+
+            case ConstructorDeclarationSyntax ctor:
+            {
+                if (ctor.Modifiers.Any(SyntaxKind.StaticKeyword))
+                    return null; // emptied in the copy; ran already (frozen)
+                if (genericHost)
+                    return Cold(".ctor", "is a generic type constructor that cannot be re-detoured");
+                Add(".ctor", HotDiff.ParamTypeNames(ctor.ParameterList), isStatic: false, isCtor: true);
+                return null;
+            }
+
+            case DestructorDeclarationSyntax:
+                return Cold("~dtor", "is a finalizer that never detours");
+
+            case OperatorDeclarationSyntax op:
+            {
+                string? opName = HotDiff.OperatorMetadataName(op.OperatorToken.Text, op.ParameterList.Parameters.Count);
+                bool changed = opName != null && diff.ChangedMethods.Any(m => !m.Added &&
+                    m.DeclaringType == hostMetadataName && m.Name == opName &&
+                    m.ParamTypeNames.SequenceEqual(HotDiff.ParamTypeNames(op.ParameterList), StringComparer.Ordinal));
+                return changed
+                    ? null // stays in the copy and detours
+                    : Cold("operator" + op.OperatorToken.Text, "is an unchanged operator (stripped from the patch copy)");
+            }
+
+            case ConversionOperatorDeclarationSyntax conv:
+            {
+                string convName = conv.ImplicitOrExplicitKeyword.IsKind(SyntaxKind.ImplicitKeyword)
+                    ? "op_Implicit"
+                    : "op_Explicit";
+                bool changed = diff.ChangedMethods.Any(m => !m.Added &&
+                    m.DeclaringType == hostMetadataName && m.Name == convName &&
+                    m.ParamTypeNames.SequenceEqual(HotDiff.ParamTypeNames(conv.ParameterList), StringComparer.Ordinal));
+                return changed
+                    ? null
+                    : Cold("conversion", "is an unchanged conversion (stripped from the patch copy)");
+            }
+
+            case PropertyDeclarationSyntax property:
+            {
+                if (property.Initializer != null && property.Initializer.FullSpan.Contains(node.Span))
+                {
+                    return property.Modifiers.Any(SyntaxKind.StaticKeyword)
+                        ? null // static initializer: frozen by design
+                        : AddInstanceInitializerCtors();
+                }
+                if (genericHost)
+                    return Cold(property.Identifier.Text, "is a generic type property that cannot be re-detoured");
+                if (property.ExplicitInterfaceSpecifier != null)
+                    return Cold(property.Identifier.Text, "is an explicit interface implementation");
+                bool isStatic = property.Modifiers.Any(SyntaxKind.StaticKeyword);
+                if (property.ExpressionBody != null && property.ExpressionBody.FullSpan.Contains(node.Span))
+                {
+                    Add("get_" + property.Identifier.Text, Array.Empty<string>(), isStatic, isCtor: false);
+                    return null;
+                }
+                foreach (AccessorDeclarationSyntax accessor in property.AccessorList?.Accessors ?? default)
+                {
+                    if (!accessor.FullSpan.Contains(node.Span))
+                        continue;
+                    Add(HotDiff.AccessorName(accessor, property.Identifier.Text),
+                        HotDiff.AccessorParams(accessor, null, HotDiff.TokenText(property.Type)),
+                        isStatic, isCtor: false);
+                    return null;
+                }
+                return null;
+            }
+
+            case IndexerDeclarationSyntax indexer:
+            {
+                if (genericHost)
+                    return Cold("this[]", "is a generic type indexer that cannot be re-detoured");
+                if (indexer.ExplicitInterfaceSpecifier != null)
+                    return Cold("this[]", "is an explicit interface implementation");
+                if (indexer.ExpressionBody != null && indexer.ExpressionBody.FullSpan.Contains(node.Span))
+                {
+                    Add("get_Item", HotDiff.ParamTypeNames(indexer.ParameterList), isStatic: false, isCtor: false);
+                    return null;
+                }
+                foreach (AccessorDeclarationSyntax accessor in indexer.AccessorList?.Accessors ?? default)
+                {
+                    if (!accessor.FullSpan.Contains(node.Span))
+                        continue;
+                    Add(HotDiff.AccessorName(accessor, "Item"),
+                        HotDiff.AccessorParams(accessor, indexer.ParameterList, HotDiff.TokenText(indexer.Type)),
+                        isStatic: false, isCtor: false);
+                    return null;
+                }
+                return null;
+            }
+
+            case EventDeclarationSyntax @event:
+            {
+                if (genericHost)
+                    return Cold(@event.Identifier.Text, "is a generic type event that cannot be re-detoured");
+                if (@event.ExplicitInterfaceSpecifier != null)
+                    return Cold(@event.Identifier.Text, "is an explicit interface event");
+                foreach (AccessorDeclarationSyntax accessor in @event.AccessorList?.Accessors ?? default)
+                {
+                    if (!accessor.FullSpan.Contains(node.Span))
+                        continue;
+                    string prefix = accessor.Keyword.Text == "add" ? "add_" : "remove_";
+                    Add(prefix + @event.Identifier.Text, new[] { HotDiff.SimpleTypeName(@event.Type) },
+                        @event.Modifiers.Any(SyntaxKind.StaticKeyword), isCtor: false);
+                    return null;
+                }
+                return null;
+            }
+
+            case FieldDeclarationSyntax field:
+                return field.Modifiers.Any(SyntaxKind.StaticKeyword) || field.Modifiers.Any(SyntaxKind.ConstKeyword)
+                    ? null // static initializer: frozen by design
+                    : AddInstanceInitializerCtors();
+
+            case EventFieldDeclarationSyntax eventField:
+                return eventField.Modifiers.Any(SyntaxKind.StaticKeyword)
+                    ? null
+                    : AddInstanceInitializerCtors();
+
+            default:
+                return null;
+        }
+    }
+
     // ── shim construction ────────────────────────────────────────────
 
     /// <summary>Build the static shim method from the (already rewritten)
@@ -1869,6 +2211,9 @@ public static class PatchRewriter
                 }
                 constraints.AddRange(typeDecl.ConstraintClauses);
             }
+            // The method's OWN constraints (B1) come from the already
+            // rewritten declaration, so type references are requalified.
+            constraints.AddRange(decl.ConstraintClauses);
             if (constraints.Count > 0)
                 shim = shim.WithConstraintClauses(SyntaxFactory.List(constraints));
         }
@@ -1902,11 +2247,126 @@ public static class PatchRewriter
         return unit.AddMembers(block);
     }
 
-    /// <summary>`expr.M(args)` / `M(args)` → `global::Ns.Foo__LocusShims.M(self, args)`.</summary>
+    /// <summary>The shim target for a method symbol, with extension-REDUCED
+    /// forms normalized back to their static declaration (the AddedMembers
+    /// key): `5.Tripled()` binds the reduced symbol whose OriginalDefinition
+    /// is NOT the declared method.</summary>
+    private static bool TryGetAddedTarget(
+        IMethodSymbol method,
+        PatchBatchContext batch,
+        out ShimTarget target,
+        out IMethodSymbol normalized)
+    {
+        normalized = method.ReducedFrom != null
+            ? method.GetConstructedReducedFrom() ?? method.ReducedFrom
+            : method;
+        return batch.AddedMembers.TryGetValue(normalized.OriginalDefinition, out target!);
+    }
+
+    /// <summary>Resolve a reference to an ADDED member from a SymbolInfo,
+    /// looking through CandidateSymbols too: once an earlier patch's image
+    /// is referenced, an extension-syntax call to a re-emitted added
+    /// extension method binds AMBIGUOUSLY between the batch source and the
+    /// image's identical shim — the source one is the live surface and the
+    /// rewrite to a direct call removes the ambiguity from the patch text.</summary>
+    private static bool TryResolveAddedTarget(
+        SymbolInfo info,
+        PatchBatchContext batch,
+        out ShimTarget target,
+        out IMethodSymbol normalized,
+        out bool reduced)
+    {
+        if (info.Symbol is IMethodSymbol direct && TryGetAddedTarget(direct, batch, out target, out normalized))
+        {
+            reduced = direct.ReducedFrom != null;
+            return true;
+        }
+        foreach (ISymbol candidate in info.CandidateSymbols)
+        {
+            if (candidate is IMethodSymbol method && TryGetAddedTarget(method, batch, out target, out normalized))
+            {
+                reduced = method.ReducedFrom != null;
+                return true;
+            }
+        }
+        target = null!;
+        normalized = null!;
+        reduced = false;
+        return false;
+    }
+
+    /// <summary>Explicit type arguments for a shim call whose target carries
+    /// METHOD type parameters (B1): the original call's explicit/inferred
+    /// arguments cannot be partially re-applied to the flattened
+    /// chain+method parameter list, so the full list materializes — unless
+    /// any argument is unspeakable (anonymous types only ever arrive via
+    /// inference, which the shim call then relies on too). Chain-only
+    /// generic shims keep relying on inference from `self`.</summary>
+    private static string ShimTypeArgumentText(ShimTarget target, IMethodSymbol invoked)
+    {
+        if (target.MethodTypeParameterCount == 0)
+            return "";
+
+        var arguments = new List<ITypeSymbol>();
+        var chain = new List<INamedTypeSymbol>();
+        for (INamedTypeSymbol? current = invoked.ContainingType; current != null; current = current.ContainingType)
+            chain.Insert(0, current);
+        foreach (INamedTypeSymbol type in chain)
+            arguments.AddRange(type.TypeArguments);
+        arguments.AddRange(invoked.TypeArguments);
+
+        if (arguments.Count != target.TypeParameters.Length)
+            return "";
+        foreach (ITypeSymbol argument in arguments)
+        {
+            if (!IsSpeakableType(argument))
+                return "";
+        }
+        return "<" + string.Join(
+            ", ",
+            arguments.Select(a => a.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat))) + ">";
+    }
+
+    private static bool IsSpeakableType(ITypeSymbol type)
+    {
+        switch (type)
+        {
+            case IErrorTypeSymbol:
+                return false;
+            case ITypeParameterSymbol:
+                return true;
+            case IArrayTypeSymbol array:
+                return IsSpeakableType(array.ElementType);
+            case IPointerTypeSymbol pointer:
+                return IsSpeakableType(pointer.PointedAtType);
+            case INamedTypeSymbol named:
+            {
+                if (named.IsAnonymousType)
+                    return false;
+                foreach (ITypeSymbol argument in named.TypeArguments)
+                {
+                    if (!IsSpeakableType(argument))
+                        return false;
+                }
+                return true;
+            }
+            default:
+                return type.TypeKind != TypeKind.Error;
+        }
+    }
+
+    /// <summary>`expr.M(args)` / `M(args)` → `global::Ns.Foo__LocusShims.M(self, args)`.
+    /// For an added EXTENSION method called in reduced form (`expr.M(args)`
+    /// where M is `static R M(this T t, ...)`), `reducedReceiverCastFqn`
+    /// (the `this`-parameter type) folds the receiver back into the first
+    /// argument of the static shim — a `this` receiver inside a kept member
+    /// is patch-typed and needs the cast to the parameter's original type.</summary>
     private static SyntaxNode BuildShimInvocation(
         InvocationExpressionSyntax rewrittenInvocation,
         ShimTarget target,
-        ShimTarget? enclosingAdded)
+        ShimTarget? enclosingAdded,
+        string typeArgumentText,
+        string? reducedReceiverCastFqn = null)
     {
         ExpressionSyntax? receiver = rewrittenInvocation.Expression switch
         {
@@ -1915,14 +2375,15 @@ public static class PatchRewriter
         };
 
         var arguments = new List<ArgumentSyntax>();
-        if (target.HasSelf)
+        if (target.HasSelf || reducedReceiverCastFqn != null)
         {
             ExpressionSyntax selfExpression;
             if (receiver == null || receiver is ThisExpressionSyntax)
             {
+                string castFqn = reducedReceiverCastFqn ?? target.DeclaringTypeFqn;
                 selfExpression = enclosingAdded != null
                     ? SyntaxFactory.IdentifierName("self")
-                    : SyntaxFactory.ParseExpression("((" + target.DeclaringTypeFqn + ")(object)this)");
+                    : SyntaxFactory.ParseExpression("((" + castFqn + ")(object)this)");
             }
             else
             {
@@ -1930,26 +2391,31 @@ public static class PatchRewriter
             }
 
             ArgumentSyntax selfArgument = SyntaxFactory.Argument(selfExpression);
-            if (target.SelfIsValueType && !target.SelfIsRefLike)
+            if (target.HasSelf && target.SelfIsValueType && !target.SelfIsRefLike)
                 selfArgument = selfArgument.WithRefKindKeyword(SyntaxFactory.Token(SyntaxKind.RefKeyword));
             arguments.Add(selfArgument);
         }
         arguments.AddRange(rewrittenInvocation.ArgumentList.Arguments);
 
         return SyntaxFactory.InvocationExpression(
-                SyntaxFactory.ParseExpression(target.ShimTypeFqn + "." + target.MethodName),
+                SyntaxFactory.ParseExpression(target.ShimTypeFqn + "." + target.MethodName + typeArgumentText),
                 SyntaxFactory.ArgumentList(SyntaxFactory.SeparatedList(arguments)))
             .WithTriviaFrom(rewrittenInvocation);
     }
 
     /// <summary>Method group `foo.M` → `(a0, ...) => Shims.M(foo, a0, ...)`.
     /// The receiver evaluates at INVOCATION time instead of delegate
-    /// creation, and delegate equality differs — both documented.</summary>
+    /// creation, and delegate equality differs — both documented. A reduced
+    /// extension group folds its receiver into the first call argument
+    /// (`reducedReceiverCastFqn` = the `this`-parameter type, see
+    /// BuildShimInvocation).</summary>
     private static SyntaxNode BuildShimLambda(
         SyntaxNode rewrittenGroup,
         ShimTarget target,
         IMethodSymbol invoke,
-        ShimTarget? enclosingAdded)
+        ShimTarget? enclosingAdded,
+        string typeArgumentText,
+        string? reducedReceiverCastFqn = null)
     {
         ExpressionSyntax? receiver = rewrittenGroup switch
         {
@@ -1960,21 +2426,22 @@ public static class PatchRewriter
         var lambdaParams = new List<ParameterSyntax>();
         var callArgs = new List<ArgumentSyntax>();
 
-        if (target.HasSelf)
+        if (target.HasSelf || reducedReceiverCastFqn != null)
         {
             ExpressionSyntax selfExpression;
             if (receiver == null || receiver is ThisExpressionSyntax)
             {
+                string castFqn = reducedReceiverCastFqn ?? target.DeclaringTypeFqn;
                 selfExpression = enclosingAdded != null
                     ? SyntaxFactory.IdentifierName("self")
-                    : SyntaxFactory.ParseExpression("((" + target.DeclaringTypeFqn + ")(object)this)");
+                    : SyntaxFactory.ParseExpression("((" + castFqn + ")(object)this)");
             }
             else
             {
                 selfExpression = receiver.WithoutTrivia();
             }
             ArgumentSyntax selfArgument = SyntaxFactory.Argument(selfExpression);
-            if (target.SelfIsValueType && !target.SelfIsRefLike)
+            if (target.HasSelf && target.SelfIsValueType && !target.SelfIsRefLike)
                 selfArgument = selfArgument.WithRefKindKeyword(SyntaxFactory.Token(SyntaxKind.RefKeyword));
             callArgs.Add(selfArgument);
         }
@@ -2008,7 +2475,7 @@ public static class PatchRewriter
         }
 
         InvocationExpressionSyntax call = SyntaxFactory.InvocationExpression(
-            SyntaxFactory.ParseExpression(target.ShimTypeFqn + "." + target.MethodName),
+            SyntaxFactory.ParseExpression(target.ShimTypeFqn + "." + target.MethodName + typeArgumentText),
             SyntaxFactory.ArgumentList(SyntaxFactory.SeparatedList(callArgs)));
 
         return SyntaxFactory.ParenthesizedLambdaExpression(
@@ -2173,6 +2640,25 @@ public static class PatchRewriter
             : "";
         string typePart = string.Join("+", nesting);
         return ns.Length == 0 ? typePart : ns + "." + typePart;
+    }
+
+    /// <summary>Fully-qualified display with the TOP-LEVEL container renamed
+    /// to its patch copy: a brand-new NESTED type lives inside the renamed
+    /// copy of its pre-existing container, so references must spell the
+    /// patch name (e.g. `global::Game.Player__LocusPatch.Inner2`).</summary>
+    private static string PatchQualifiedDisplay(INamedTypeSymbol type)
+    {
+        INamedTypeSymbol top = type;
+        while (top.ContainingType != null)
+            top = top.ContainingType;
+
+        string display = type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat);
+        string prefix = top.ContainingNamespace is { IsGlobalNamespace: false } ns
+            ? "global::" + ns.ToDisplayString() + "." + top.Name
+            : "global::" + top.Name;
+        return display.StartsWith(prefix, StringComparison.Ordinal)
+            ? prefix + TypeNameSuffix + display[prefix.Length..]
+            : display; // unexpected display shape: a deterministic compile error beats a silent wrong bind
     }
 
     /// <summary>"Ns.Outer+Inner" → "Ns.Outer__LocusPatch+Inner" (the rename

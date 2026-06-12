@@ -233,4 +233,77 @@ namespace G
         Assert.Contains("Assets/Consumer.cs", result.CallerFiles["G.Lib|M"]);
         Assert.Contains("Assets/Consumer.cs", result.CallerFiles["G.Lib|get_Value"]);
     }
+
+    // Generic METHOD calls reference a MethodSpec token (the instantiation),
+    // not the MemberRef/MethodDef itself: the scan must resolve the chain or
+    // every generic call site is a silent miss (fail-open). B1 gates on this.
+
+    private const string GenericTargetSource = @"
+namespace G
+{
+    public class Target
+    {
+        public T Echo<T>(T value) { return value; }
+        public static T Pick<T>(T value) { return value; }
+    }
+}";
+
+    [Fact]
+    public void Same_assembly_generic_method_call_is_located_via_methodspec()
+    {
+        string dll = Compile("ScanGenericSame", new[]
+        {
+            ("Assets/Target.cs", GenericTargetSource),
+            ("Assets/Neighbor.cs", @"
+namespace G
+{
+    public class Neighbor
+    {
+        public int Go() { return new Target().Echo(5); }
+        public System.Func<int, int> Grab() { return Target.Pick<int>; }
+    }
+}"),
+        });
+
+        CallerScanResult result = CallerScan.Scan(
+            new[] { dll },
+            new[]
+            {
+                new CallerScanTarget { DeclaringType = "G.Target", MemberName = "Echo" },
+                new CallerScanTarget { DeclaringType = "G.Target", MemberName = "Pick" },
+            });
+
+        Assert.Null(result.Error);
+        Assert.Contains("Assets/Neighbor.cs", result.CallerFiles["G.Target|Echo"]);
+        Assert.Contains("Assets/Neighbor.cs", result.CallerFiles["G.Target|Pick"]);
+        Assert.DoesNotContain("Assets/Target.cs", result.CallerFiles["G.Target|Echo"]);
+    }
+
+    [Fact]
+    public void Cross_assembly_generic_method_call_is_located_via_methodspec()
+    {
+        string targetDll = Compile("ScanGenericLib", new[] { ("Assets/Target.cs", GenericTargetSource) });
+        string userDll = Compile(
+            "ScanGenericUser",
+            new[]
+            {
+                ("Assets/User.cs", @"
+namespace G
+{
+    public class User
+    {
+        public int Call(Target t) { return t.Echo<int>(7); }
+    }
+}"),
+            },
+            emitPdb: true,
+            targetDll);
+
+        CallerScanResult result = CallerScan.Scan(
+            new[] { targetDll, userDll },
+            new[] { new CallerScanTarget { DeclaringType = "G.Target", MemberName = "Echo" } });
+
+        Assert.Null(result.Error);
+        Assert.Equal(new[] { "Assets/User.cs" }, result.CallerFiles["G.Target|Echo"].OrderBy(f => f));
+    }
 }

@@ -24,6 +24,11 @@ public sealed class HotDiffMethod
     /// <summary>Member exists only in the new text: compiled into the patch
     /// assembly but never detoured (only patched bodies can call it).</summary>
     public bool Added;
+
+    /// <summary>The method's OWN generic arity (added members): disambiguates
+    /// same-name-same-params generic/non-generic overloads when the shim
+    /// declaration is located. Not part of the wire protocol.</summary>
+    public int TypeParameterCount;
 }
 
 /// <summary>A member surface change that is hot only when every call site of
@@ -1433,11 +1438,20 @@ public static class HotDiff
                 }
                 if ((method.TypeParameterList?.Parameters.Count ?? 0) > 0)
                 {
-                    // A generic shim would work for direct calls but its
-                    // re-edit continuity needs a generic-method detour —
-                    // exactly the unreliable case. Keep cold.
-                    result.Reasons.Add("generic method added: " + metadataName + "." + method.Identifier.Text);
-                    return false;
+                    // Generic methods materialize as generic static shims
+                    // (B1): direct calls re-bind every batch and re-edit
+                    // detours are skipped (H7b), so the only structural
+                    // blocker is a method type parameter shadowing a
+                    // declaring-chain parameter — the shim would have to
+                    // declare the name twice.
+                    string? shadowed = FindShadowedMethodTypeParameter(method);
+                    if (shadowed != null)
+                    {
+                        result.Reasons.Add("generic method type parameter shadows the declaring type's: " +
+                            metadataName + "." + method.Identifier.Text + "<" + shadowed +
+                            "> (rename the method type parameter or use unity_recompile)");
+                        return false;
+                    }
                 }
                 if (method.Modifiers.Any(m =>
                     m.IsKind(SyntaxKind.VirtualKeyword) || m.IsKind(SyntaxKind.OverrideKeyword) ||
@@ -1460,7 +1474,8 @@ public static class HotDiff
                 }
                 AddMethod(
                     result, metadataName, method.Identifier.Text, ParamTypeNames(method.ParameterList),
-                    method.Modifiers.Any(SyntaxKind.StaticKeyword), isCtor: false, added: true);
+                    method.Modifiers.Any(SyntaxKind.StaticKeyword), isCtor: false, added: true,
+                    typeParameterCount: method.TypeParameterList?.Parameters.Count ?? 0);
                 return true;
 
             case PropertyDeclarationSyntax property:
@@ -1765,11 +1780,6 @@ public static class HotDiff
                     result.Reasons.Add("Burst-compiled method body changed: " + metadataName + "." + newMethod.Identifier.Text);
                     return false;
                 }
-                if (genericContext || (newMethod.TypeParameterList?.Parameters.Count ?? 0) > 0)
-                {
-                    result.Reasons.Add("generic method body changed: " + metadataName + "." + newMethod.Identifier.Text);
-                    return false;
-                }
                 if (newMethod.ExplicitInterfaceSpecifier != null)
                 {
                     result.Reasons.Add("explicit interface implementation changed: " + metadataName + "." + newMethod.Identifier.Text);
@@ -1780,6 +1790,11 @@ public static class HotDiff
                     // abstract/extern: no body to patch, header equality
                     // already ensured — nothing to do.
                     return false;
+                }
+                if (genericContext || (newMethod.TypeParameterList?.Parameters.Count ?? 0) > 0)
+                {
+                    return DecomposeGenericBodyChange(
+                        metadataName, oldMethod, newMethod, genericContext, burstContext, result);
                 }
                 AddMethod(
                     result, metadataName, newMethod.Identifier.Text, ParamTypeNames(newMethod.ParameterList),
@@ -1963,6 +1978,46 @@ public static class HotDiff
         }
     }
 
+    /// <summary>B1: a generic body cannot be re-detoured (Mono JITs generic
+    /// methods per instantiation), but the edit decomposes into REMOVE
+    /// (tombstone, M5 — no stub) + ADD (same-signature generic shim, M2),
+    /// with the M3 caller scan verifying every compiled call site of the old
+    /// body lives in this batch; in-batch call sites rewrite to direct shim
+    /// calls and their kept containing members re-detour (PatchRewriter).
+    /// Virtual/explicit-interface/Burst forms fall out cold through the
+    /// remove/add classifiers; Unity messages are guarded here (the engine's
+    /// dispatch cannot be replaced by a shim direct call).</summary>
+    private static bool DecomposeGenericBodyChange(
+        string metadataName,
+        MethodDeclarationSyntax oldMethod,
+        MethodDeclarationSyntax newMethod,
+        bool genericContext,
+        bool burstContext,
+        HotDiffFileResult result)
+    {
+        if (UnityMagicMethods.Contains(newMethod.Identifier.Text))
+        {
+            result.Reasons.Add("generic method body changed: " + metadataName + "." + newMethod.Identifier.Text +
+                " (Unity message methods cannot take the remove+add path; use unity_recompile)");
+            return false;
+        }
+
+        int checksBefore = result.RequiresCallerCheck.Count;
+        if (!ClassifyRemovedMember(metadataName, oldMethod, genericContext, burstContext, result))
+            return false;
+        if (!ClassifyAddedMember(metadataName, newMethod, genericContext, burstContext, result))
+            return false;
+
+        // The caller check came from the REMOVE half; relabel so a cold
+        // verdict names the actual edit instead of "member removed".
+        for (int i = checksBefore; i < result.RequiresCallerCheck.Count; i++)
+        {
+            result.RequiresCallerCheck[i].Detail =
+                "generic method body changed: " + metadataName + "." + newMethod.Identifier.Text;
+        }
+        return true;
+    }
+
     private static bool DiffAccessors(
         string metadataName,
         AccessorListSyntax? oldAccessors,
@@ -2041,14 +2096,14 @@ public static class HotDiff
         return changed;
     }
 
-    private static string AccessorName(AccessorDeclarationSyntax accessor, string propertyName)
+    internal static string AccessorName(AccessorDeclarationSyntax accessor, string propertyName)
     {
         // init-only accessors compile to set_X (with a modreq).
         string prefix = accessor.Keyword.Text == "get" ? "get_" : "set_";
         return prefix + propertyName;
     }
 
-    private static string[] AccessorParams(
+    internal static string[] AccessorParams(
         AccessorDeclarationSyntax accessor,
         BaseParameterListSyntax? indexerParams,
         string propertyTypeText)
@@ -2068,7 +2123,8 @@ public static class HotDiff
         string[] paramTypeNames,
         bool isStatic,
         bool isCtor,
-        bool added)
+        bool added,
+        int typeParameterCount = 0)
     {
         result.ChangedMethods.Add(new HotDiffMethod
         {
@@ -2078,7 +2134,32 @@ public static class HotDiff
             IsStatic = isStatic,
             IsCtor = isCtor,
             Added = added,
+            TypeParameterCount = typeParameterCount,
         });
+    }
+
+    /// <summary>The first method type parameter whose name shadows a
+    /// declaring-chain type parameter (CS0693 source — legal C#, but the
+    /// flattened generic shim would declare the name twice), or null.</summary>
+    private static string? FindShadowedMethodTypeParameter(MethodDeclarationSyntax method)
+    {
+        if (method.TypeParameterList == null)
+            return null;
+        var chainNames = new HashSet<string>(StringComparer.Ordinal);
+        for (SyntaxNode? current = method.Parent; current != null; current = current.Parent)
+        {
+            if (current is TypeDeclarationSyntax type && type.TypeParameterList != null)
+            {
+                foreach (TypeParameterSyntax parameter in type.TypeParameterList.Parameters)
+                    chainNames.Add(parameter.Identifier.Text);
+            }
+        }
+        foreach (TypeParameterSyntax parameter in method.TypeParameterList.Parameters)
+        {
+            if (chainNames.Contains(parameter.Identifier.Text))
+                return parameter.Identifier.Text;
+        }
+        return null;
     }
 
     // ── text helpers ─────────────────────────────────────────────────
@@ -2297,7 +2378,7 @@ public static class HotDiff
         return !hasPublicSurface;
     }
 
-    private static bool HasBurstCompileAttribute(SyntaxNode node)
+    internal static bool HasBurstCompileAttribute(SyntaxNode node)
     {
         SyntaxList<AttributeListSyntax> lists = node switch
         {
@@ -2437,7 +2518,7 @@ public static class HotDiff
         };
     }
 
-    private static string? OperatorMetadataName(string token, int paramCount)
+    internal static string? OperatorMetadataName(string token, int paramCount)
     {
         return token switch
         {

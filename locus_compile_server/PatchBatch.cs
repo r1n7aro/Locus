@@ -21,9 +21,16 @@ public sealed class ShimTarget
     public bool SelfIsRefLike;
     public bool GenericShim;
 
-    /// <summary>Type parameters the shim method needs (the declaring type
-    /// chain's parameters, outermost first). Empty for non-generic types.</summary>
+    /// <summary>Type parameters the shim method needs: the declaring type
+    /// chain's parameters (outermost first) followed by the method's OWN
+    /// type parameters (B1). Empty for non-generic surface.</summary>
     public string[] TypeParameters = Array.Empty<string>();
+
+    /// <summary>How many of <see cref="TypeParameters"/> (from the end) are
+    /// the method's own. Call sites of such shims materialize explicit type
+    /// arguments — explicit arguments at the original call site cannot be
+    /// partially re-applied to the flattened parameter list.</summary>
+    public int MethodTypeParameterCount;
 
     /// <summary>Reflection-style parameter names of the SHIM method
     /// (self included) — the detour identity for re-edits.</summary>
@@ -51,6 +58,18 @@ public sealed class PatchBatchContext
     /// <summary>Added (new-surface) member symbols across the batch → shim
     /// target. Keyed by the ORIGINAL DEFINITION of the method symbol.</summary>
     public Dictionary<IMethodSymbol, ShimTarget> AddedMembers = new(SymbolEqualityComparer.Default);
+
+    /// <summary>Member keys that are REMOVED and re-ADDED with the same
+    /// signature in this batch (B1 generic body changes): pre-existing
+    /// compiled call sites exist, so every in-batch reference inside a KEPT
+    /// member must drag that member into the detour set (or fail closed).</summary>
+    public HashSet<string> ReAddedMemberKeys = new(StringComparer.Ordinal);
+
+    /// <summary>Brand-new type symbols across the batch (the per-file
+    /// NewTypes): their references never re-qualify to ORIGINAL names —
+    /// nested ones under renamed containers re-qualify to the PATCH name
+    /// (the original metadata type has no such nested member).</summary>
+    public HashSet<INamedTypeSymbol> NewTypeSymbols = new(SymbolEqualityComparer.Default);
 
     /// <summary>Shims registered by earlier accepted batches of the same
     /// domain generation, keyed by member key.</summary>
@@ -86,7 +105,8 @@ public sealed class PatchBatchContext
         System.Collections.Immutable.ImmutableArray<MetadataReference> references,
         IReadOnlyDictionary<string, MemberSurfaceRegistry.ShimEntry> earlierShims,
         IReadOnlyDictionary<string, FieldStoreRegistry.StoreEntry>? earlierFieldStores = null,
-        string storeDiscriminator = "")
+        string storeDiscriminator = "",
+        bool allowUnsafe = false)
     {
         var context = new PatchBatchContext
         {
@@ -96,7 +116,7 @@ public sealed class PatchBatchContext
                 references,
                 new CSharpCompilationOptions(
                     OutputKind.DynamicallyLinkedLibrary,
-                    allowUnsafe: false,
+                    allowUnsafe: allowUnsafe,
                     metadataImportOptions: MetadataImportOptions.All,
                     assemblyIdentityComparer: DesktopAssemblyIdentityComparer.Default)),
             EarlierShims = earlierShims,
@@ -117,7 +137,11 @@ public sealed class PatchBatchContext
                 {
                     case BaseTypeDeclarationSyntax typeDecl:
                         if (newTypeNames.Contains(HotDiff.MetadataName(typeDecl)))
+                        {
+                            if (model.GetDeclaredSymbol(typeDecl) is INamedTypeSymbol newTypeSymbol)
+                                context.NewTypeSymbols.Add(newTypeSymbol);
                             continue;
+                        }
                         if (model.GetDeclaredSymbol(typeDecl) is INamedTypeSymbol typeSymbol)
                             context.RenamedSymbols.Add(typeSymbol);
                         break;
@@ -138,6 +162,16 @@ public sealed class PatchBatchContext
 
                 ShimTarget target = BuildShimTarget(symbol, added);
                 context.AddedMembers[symbol.OriginalDefinition] = target;
+
+                // Same-signature remove+add = a re-materialized member (B1):
+                // old compiled call sites exist and must be redirected.
+                if (diff.RemovedMembers.Any(removed =>
+                    MemberSurfaceRegistry.MemberKey(
+                        removed.DeclaringType, removed.Name, removed.ParamTypeNames, removed.IsStatic)
+                    == target.MemberKey))
+                {
+                    context.ReAddedMemberKeys.Add(target.MemberKey);
+                }
             }
 
             foreach (HotDiffEnumAddition addition in diff.EnumAdditions)
@@ -176,6 +210,8 @@ public sealed class PatchBatchContext
                     continue;
                 if (method.Modifiers.Any(SyntaxKind.StaticKeyword) != added.IsStatic)
                     continue;
+                if ((method.TypeParameterList?.Parameters.Count ?? 0) != added.TypeParameterCount)
+                    continue;
                 if (!HotDiff.ParamTypeNames(method.ParameterList).SequenceEqual(added.ParamTypeNames, StringComparer.Ordinal))
                     continue;
                 return method;
@@ -204,6 +240,10 @@ public sealed class PatchBatchContext
             foreach (ITypeParameterSymbol parameter in current.TypeParameters.Reverse())
                 typeParameters.Insert(0, parameter.Name);
         }
+        // The method's own type parameters follow the chain's (B1):
+        // HotDiff already failed shadowed names closed.
+        foreach (ITypeParameterSymbol parameter in symbol.TypeParameters)
+            typeParameters.Add(parameter.Name);
 
         var shimParams = new List<string>();
         if (!added.IsStatic)
@@ -223,6 +263,7 @@ public sealed class PatchBatchContext
             SelfIsRefLike = declaring.IsRefLikeType,
             GenericShim = typeParameters.Count > 0,
             TypeParameters = typeParameters.ToArray(),
+            MethodTypeParameterCount = symbol.TypeParameters.Length,
             ShimParamTypeNames = shimParams.ToArray(),
             MemberKey = MemberSurfaceRegistry.MemberKey(
                 added.DeclaringType, added.Name, added.ParamTypeNames, added.IsStatic),

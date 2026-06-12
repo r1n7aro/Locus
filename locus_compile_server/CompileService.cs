@@ -28,6 +28,12 @@ public sealed class CompileParamsDto
 
     [JsonPropertyName("defines")]
     public string[]? Defines { get; set; }
+
+    /// <summary>Project-level "Allow unsafe code" (any script assembly with
+    /// AllowUnsafeCode on). Hot patches follow it (B4); absent = false, so
+    /// older Unity plugins keep the previous behavior.</summary>
+    [JsonPropertyName("allowUnsafe")]
+    public bool AllowUnsafe { get; set; }
 }
 
 public sealed class RawSourceDto
@@ -648,7 +654,8 @@ public sealed class CompileService
             batchFiles, references,
             _memberSurfaceRegistry.SnapshotFor(generation),
             _fieldStoreRegistry.SnapshotFor(generation),
-            storeDiscriminator);
+            storeDiscriminator,
+            allowUnsafe: request.Params?.AllowUnsafe ?? false);
 
         foreach (var (filePath, tree, diff) in batchFiles)
         {
@@ -747,7 +754,8 @@ public sealed class CompileService
         trees.Add(BuildAccessChecksTree(accessAssemblies, parseOptions));
 
         CSharpCompilationOptions options = SnippetCompilationOptions
-            .WithMetadataImportOptions(MetadataImportOptions.All);
+            .WithMetadataImportOptions(MetadataImportOptions.All)
+            .WithAllowUnsafe(request.Params?.AllowUnsafe ?? false);
         ApplyIgnoreAccessibility(options);
 
         CSharpCompilation compilation = CSharpCompilation.Create(

@@ -21,9 +21,14 @@
 //!     delegates following detours, Unity message body edits, store-held
 //!     static persistence across patches, generic-typed and nested-type
 //!     field additions, #if-block edits, iterator→plain conversions,
-//!     extension-method additions and a five-file batch.
+//!     extension-method additions (with the call site surviving LATER
+//!     batches where the accepted patch image is also in scope), a
+//!     five-file batch, and generic method bodies (generic methods AND
+//!     methods of generic types) via the B1 remove+add shim path with
+//!     their untouched callers re-detoured.
 //!   • negatives (must come back COLD with the precise reason): generic
-//!     method bodies (generic methods AND generic types), constructor/
+//!     bodies whose compiled caller is OUTSIDE the batch (named caller
+//!     file), generic-type constructor bodies, constructor/
 //!     finalizer surface and finalizer bodies, virtual members, struct
 //!     field layout, enum value edits, attribute edits, const edits,
 //!     property additions, new Unity message names, interface changes,
@@ -126,6 +131,9 @@ public class LocusSelfTestSubject : MonoBehaviour
 #endif
     }
     public int Probe() { return 0; }
+    public int Spare() { return 1; }
+    public int Relay() { return new LocusSelfTestNegative().Echo(20) + 1; }
+    public int RelayVal() { return new LocusSelfTestNegGeneric<int>().Val(); }
     public int Seed() { return _seed; }
     public int Legacy() { return _legacy; }
     public int Lambda() { int basis = 1; System.Func<int> f = () => basis + 1; return f(); }
@@ -230,6 +238,10 @@ public class LocusSelfTestNegative
 
 public class LocusSelfTestNegGeneric<T>
 {
+    public int Marker;
+
+    public LocusSelfTestNegGeneric() { Marker = 1; }
+
     public int Val() { return 1; }
 }
 
@@ -1495,6 +1507,43 @@ impl SelfTest {
             }
         }
 
+        // P27c — the SAME extension call site survives the NEXT batch: the
+        // re-sent shim source and the accepted patch image both provide
+        // Tripled to extension lookup, and the call site must keep
+        // materializing as a direct shim call (a regression here is a
+        // CS0121 self-ambiguity). The body tweak proves the re-edited shim
+        // is the live one.
+        let name = "P27c extension re-batch (image in scope)";
+        self.log(format!("— {name}"));
+        let helper_snapshot = helper.clone();
+        if swap(
+            helper,
+            "public static int Tripled(this int v) { return v * 3; }",
+            "public static int Tripled(this int v) { return v * 3 + 1; }",
+        )
+        .is_ok()
+        {
+            let applied = self
+                .apply_texts(
+                    name,
+                    &[(HELPER_FILE, helper.as_str())],
+                    &[(HELPER_FILE, helper_snapshot.as_str())],
+                )
+                .await;
+            if applied.is_some() {
+                self.expect_output(
+                    name,
+                    "return LocusSelfTestSubject.Instance.Probe();",
+                    "4513", // 1500 * 3 + 1 + 12
+                )
+                .await;
+            } else {
+                *helper = helper_snapshot;
+            }
+        } else {
+            self.log("  (P27b did not land; skipping P27c)");
+        }
+
         // P28 — interface-IMPLEMENTATION body edit (the interface itself is
         // untouched; dispatch through the interface sees the patch).
         let mut iface_ledger = IFACE_BASELINE.to_string();
@@ -1573,12 +1622,19 @@ impl SelfTest {
         let struct_snapshot = struct_ledger.clone();
         let ctor_snapshot = ctor_ledger.clone();
         let iface_snapshot = iface_ledger.clone();
+        // Anchors tolerate any of P10/P26/P29/P19/P28 having failed (their
+        // edits revert, so the baseline form is the fallback).
         let p32 = (|| -> Result<(), String> {
-            swap(subject, "public int Gauge { get { return 7117; } }", "public int Gauge { get { return 7118; } }")?;
-            swap(helper, "public static int Pick() { return 3113; }", "public static int Pick() { return 3114; }")?;
-            swap(&mut struct_ledger, "public int Get() { return 6446; }", "public int Get() { return 6447; }")?;
-            swap(&mut ctor_ledger, "public LocusSelfTestCtor() { Seed = 5775; }", "public LocusSelfTestCtor() { Seed = 5776; }")?;
+            swap(subject, "public int Gauge { get { return 7117; } }", "public int Gauge { get { return 7118; } }")
+                .or_else(|_| swap(subject, "public int Gauge { get { return 17; } }", "public int Gauge { get { return 7118; } }"))?;
+            swap(helper, "public static int Pick() { return 3113; }", "public static int Pick() { return 3114; }")
+                .or_else(|_| swap(helper, "public static int Pick() { return 1; }", "public static int Pick() { return 3114; }"))?;
+            swap(&mut struct_ledger, "public int Get() { return 6446; }", "public int Get() { return 6447; }")
+                .or_else(|_| swap(&mut struct_ledger, "public int Get() { return 1; }", "public int Get() { return 6447; }"))?;
+            swap(&mut ctor_ledger, "public LocusSelfTestCtor() { Seed = 5775; }", "public LocusSelfTestCtor() { Seed = 5776; }")
+                .or_else(|_| swap(&mut ctor_ledger, "public LocusSelfTestCtor() { Seed = 1; }", "public LocusSelfTestCtor() { Seed = 5776; }"))?;
             swap(&mut iface_ledger, "public int Plan() { return 6996; }", "public int Plan() { return 6997; }")
+                .or_else(|_| swap(&mut iface_ledger, "public int Plan() { return 1; }", "public int Plan() { return 6997; }"))
         })();
         match p32 {
             Ok(()) => {
@@ -1627,6 +1683,56 @@ impl SelfTest {
             }
         }
 
+        // P33 — generic method bodies via remove+add shims (B1): Echo<T>
+        // (generic METHOD) and Val (method in a generic TYPE) change bodies;
+        // the compiled callers Relay/RelayVal in SUBJECT stay UNTOUCHED —
+        // the file joins the batch through an unrelated Spare edit and the
+        // kept callers must re-detour for the shims to take effect.
+        let name = "P33 generic body via shim";
+        self.log(format!("— {name}"));
+        let mut neg_ledger = NEG_BASELINE.to_string();
+        let subject_snapshot = subject.clone();
+        let p33 = (|| -> Result<(), String> {
+            swap(
+                &mut neg_ledger,
+                "public T Echo<T>(T value) { return value; }",
+                "public T Echo<T>(T value) { return (T)(object)(((int)(object)value) + 7000); }",
+            )?;
+            swap(&mut neg_ledger, "public int Val() { return 1; }", "public int Val() { return 4334; }")?;
+            swap(subject, "public int Spare() { return 1; }", "public int Spare() { return 2; }")
+        })();
+        match p33 {
+            Ok(()) => {
+                let applied = self
+                    .apply_texts(
+                        name,
+                        &[(NEG_FILE, neg_ledger.as_str()), (SUBJECT_FILE, subject.as_str())],
+                        &[(NEG_FILE, NEG_BASELINE), (SUBJECT_FILE, subject_snapshot.as_str())],
+                    )
+                    .await;
+                if applied.is_some() {
+                    self.expect_output(
+                        "P33a generic method body (kept caller)",
+                        "return LocusSelfTestSubject.Instance.Relay();",
+                        "7021", // (20 + 7000) + 1
+                    )
+                    .await;
+                    self.expect_output(
+                        "P33b generic type method body (kept caller)",
+                        "return LocusSelfTestSubject.Instance.RelayVal();",
+                        "4334",
+                    )
+                    .await;
+                } else {
+                    *subject = subject_snapshot;
+                }
+            }
+            Err(error) => {
+                self.fail(name, error);
+                *subject = subject_snapshot;
+            }
+        }
+
         // Hand the per-file ledgers to the negative phase: it restores files
         // to exactly these texts after each cold probe.
         self.negative_ledgers = NegativeLedgers {
@@ -1641,7 +1747,11 @@ impl SelfTest {
 
         let neg = NEG_BASELINE.to_string();
 
-        // N01 — generic method bodies stay cold (detour reliability).
+        // N01 — generic method bodies decompose into remove+add (B1), so
+        // the M3 caller scan gates them: with the compiled caller (SUBJECT's
+        // Relay) OUTSIDE the batch the verdict is cold and names that file.
+        let name = "N01 generic body uncovered caller";
+        self.log(format!("— {name}"));
         let mut text = neg.clone();
         if swap(
             &mut text,
@@ -1650,7 +1760,30 @@ impl SelfTest {
         )
         .is_ok()
         {
-            self.expect_cold("N01 generic method body", NEG_FILE, &text, "generic method body changed", &neg).await;
+            match self.write_tracked(NEG_FILE, &text).await {
+                Ok(()) => {
+                    let verdict = self.hot_reload(Some(vec![NEG_FILE.to_string()])).await;
+                    let vtext = match &verdict {
+                        Ok(summary) => summary.clone(),
+                        Err(error) => error.clone(),
+                    };
+                    if vtext.contains("Hot reload not applicable")
+                        && vtext.contains("generic method body changed")
+                        && vtext.contains("LocusSelfTestSubject.cs")
+                    {
+                        self.pass(name, "cold names the uncovered caller file");
+                    } else {
+                        self.fail(
+                            name,
+                            format!("expected cold naming the caller file, got: {}", squash(&vtext)),
+                        );
+                    }
+                    if let Err(error) = self.write_tracked(NEG_FILE, &neg).await {
+                        self.fail(name, format!("restore after {name} failed: {error}"));
+                    }
+                }
+                Err(error) => self.fail(name, error),
+            }
         }
 
         // N02 — turning a method virtual is an added virtual slot.
@@ -1782,10 +1915,17 @@ impl SelfTest {
             .await;
         }
 
-        // N15 — generic-TYPE method bodies stay cold too.
+        // N15 — generic-TYPE constructor bodies stay cold (B1 only covers
+        // plain method bodies; ctors of generic types cannot detour).
         let mut text = neg.clone();
-        if swap(&mut text, "public int Val() { return 1; }", "public int Val() { return 2; }").is_ok() {
-            self.expect_cold("N15 generic type method body", NEG_FILE, &text, "generic method body changed", &neg).await;
+        if swap(
+            &mut text,
+            "public LocusSelfTestNegGeneric() { Marker = 1; }",
+            "public LocusSelfTestNegGeneric() { Marker = 2; }",
+        )
+        .is_ok()
+        {
+            self.expect_cold("N15 generic type ctor body", NEG_FILE, &text, "generic type constructor changed", &neg).await;
         }
 
         // N16 — base-list change is type surface.
@@ -1938,11 +2078,18 @@ impl SelfTest {
         }
 
         // D04 — using REMOVAL re-detours the whole file (M6), with behavior
-        // intact afterwards.
+        // intact afterwards. D03 normally deletes the only Task user first;
+        // if it failed, drop the dangling Pulse here so the file still
+        // compiles under the removed directive (no cascade).
         let name = "D04 using removed (file rehook)";
         if self
             .step_file(name, SUBJECT_FILE, subject, |s| {
-                swap(s, "using System.Threading.Tasks;\n", "")
+                swap(s, "using System.Threading.Tasks;\n", "")?;
+                if s.contains("Task<") {
+                    swap_line(s, "    public async Task<int> Pulse()", "")
+                        .or_else(|_| swap_line(s, "    public Task<int> Pulse()", ""))?;
+                }
+                Ok(())
             })
             .await
             .is_some()

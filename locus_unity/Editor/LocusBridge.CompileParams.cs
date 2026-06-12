@@ -46,6 +46,7 @@ namespace Locus
             public string lang_version;
             public string[] defines;
             public string[] reference_paths;
+            public bool allow_unsafe;
         }
 
         private static async Task<PipeEnvelope> HandleGetCompileParams(string requestId, string requestJson)
@@ -98,7 +99,9 @@ namespace Locus
             try
             {
                 string[] defines = SnippetPreprocessorSymbols;
-                string fingerprint = ComputeCompileParamsFingerprint(paths, defines, CompileParamsLanguageVersion);
+                bool allowUnsafe = GetCachedCompileAllowUnsafe();
+                string fingerprint = ComputeCompileParamsFingerprint(
+                    paths, defines, CompileParamsLanguageVersion, allowUnsafe);
 
                 var payload = new CompileParamsPayload
                 {
@@ -107,7 +110,8 @@ namespace Locus
                     domain_generation = _compileDomainGeneration,
                     lang_version = CompileParamsLanguageVersion,
                     defines = defines,
-                    reference_paths = paths.ToArray()
+                    reference_paths = paths.ToArray(),
+                    allow_unsafe = allowUnsafe
                 };
 
                 if (string.Equals(fingerprint, knownFingerprint, StringComparison.Ordinal))
@@ -127,18 +131,20 @@ namespace Locus
 
         /// <summary>
         /// Hash of everything the compile result depends on besides the
-        /// source itself: language version, defines, and the reference path
-        /// list with each file's mtime/size (so a Unity recompile that
-        /// rewrites ScriptAssemblies changes the fingerprint even though the
-        /// path list is identical).
+        /// source itself: language version, the allow-unsafe flag, defines,
+        /// and the reference path list with each file's mtime/size (so a
+        /// Unity recompile that rewrites ScriptAssemblies changes the
+        /// fingerprint even though the path list is identical).
         /// </summary>
         private static string ComputeCompileParamsFingerprint(
             List<string> referencePaths,
             string[] defines,
-            string langVersion)
+            string langVersion,
+            bool allowUnsafe)
         {
             var sb = new StringBuilder(referencePaths.Count * 96);
             sb.Append("langver:").Append(langVersion).Append('\n');
+            sb.Append("unsafe:").Append(allowUnsafe ? "1" : "0").Append('\n');
 
             for (int i = 0; i < defines.Length; i++)
                 sb.Append("define:").Append(defines[i]).Append('\n');

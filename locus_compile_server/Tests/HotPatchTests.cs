@@ -568,6 +568,543 @@ namespace ScanE2E
         Assert.Single(result["methods"]!.AsArray());
     }
 
+    // ── B1: generic method bodies via remove+add shims ───────────────
+
+    private const string GenericLibSource = @"
+namespace GenE2E
+{
+    public class Lib
+    {
+        public T Echo<T>(T value) where T : struct { return value; }
+    }
+}";
+
+    private const string GenericUseSource = @"
+namespace GenE2E
+{
+    public class Use
+    {
+        public static int Go() { return new Lib().Echo(5); }
+        public static int Other() { return 1; }
+    }
+}";
+
+    [Fact]
+    public void Generic_body_change_with_uncovered_caller_is_cold_naming_file()
+    {
+        var service = new CompileService();
+        string asmPath = CompileProjectAssembly(
+            service, "GenE2EUncovered",
+            ("Assets/Lib.cs", GenericLibSource),
+            ("Assets/Use.cs", GenericUseSource));
+        JsonObject compileParams = ParamsFor(asmPath);
+
+        string newLib = GenericLibSource.Replace("{ return value; }", "{ return default(T); }");
+        JsonNode result = HotPatch(service, compileParams, ("Assets/Lib.cs", GenericLibSource, newLib));
+
+        Assert.False(result["hot"]!.GetValue<bool>());
+        var file = Assert.Single(result["files"]!.AsArray())!;
+        string reason = file["reasons"]!.AsArray().Single()!.GetValue<string>();
+        Assert.Contains("generic method body changed", reason);
+        Assert.Contains("Assets/Use.cs", reason);
+    }
+
+    [Fact]
+    public void Generic_body_change_executes_via_shim_and_redetours_kept_caller()
+    {
+        var service = new CompileService();
+        string asmPath = CompileProjectAssembly(
+            service, "GenE2ECovered",
+            ("Assets/Lib.cs", GenericLibSource),
+            ("Assets/Use.cs", GenericUseSource));
+        JsonObject compileParams = ParamsFor(asmPath);
+
+        // Echo's body changes; Use.cs joins the batch through an UNRELATED
+        // edit — the calling method Go itself is untouched and must be
+        // dragged into the detour set for the rewrite to take effect.
+        string newLib = GenericLibSource.Replace(
+            "{ return value; }",
+            "{ var boosted = ((int)(object)value) + 100; return (T)(object)boosted; }");
+        string newUse = GenericUseSource.Replace("public static int Other() { return 1; }", "public static int Other() { return 2; }");
+
+        JsonNode result = HotPatch(
+            service, compileParams,
+            ("Assets/Lib.cs", GenericLibSource, newLib),
+            ("Assets/Use.cs", GenericUseSource, newUse));
+
+        Assert.True(result["hot"]!.GetValue<bool>(), result["files"]?.ToJsonString());
+        Assert.True(result["success"]!.GetValue<bool>(), result["error"]?.GetValue<string>());
+        Assert.Contains("verified", result["callerScan"]!.GetValue<string>());
+
+        // Detours: the co-edited Other AND the kept caller Go; the generic
+        // Echo itself never detours (shim-only).
+        var methodNames = result["methods"]!.AsArray()
+            .Select(m => m!["declaringType"]!.GetValue<string>() + "." + m["name"]!.GetValue<string>())
+            .OrderBy(n => n)
+            .ToArray();
+        Assert.Equal(new[] { "GenE2E.Use.Go", "GenE2E.Use.Other" }, methodNames);
+
+        byte[] originalBytes = File.ReadAllBytes(asmPath);
+        byte[] patchBytes = Convert.FromBase64String(result["assemblyB64"]!.GetValue<string>());
+        var context = new AssemblyLoadContext("generic-e2e", isCollectible: true);
+        try
+        {
+            Assembly original = context.LoadFromStream(new MemoryStream(originalBytes));
+            context.Resolving += (_, name) => name.Name == "GenE2ECovered" ? original : null;
+            Assembly patch = context.LoadFromStream(new MemoryStream(patchBytes));
+
+            // The kept caller's patch copy reaches the NEW generic body.
+            Type patchUse = patch.GetType("GenE2E.Use__LocusPatch", throwOnError: true)!;
+            Assert.Equal(105, patchUse.GetMethod("Go")!.Invoke(null, null));
+
+            // The shim is a plain generic static method (direct-callable,
+            // no detour) and carries the struct constraint.
+            Type shims = patch.GetType("GenE2E.Lib__LocusShims", throwOnError: true)!;
+            MethodInfo echo = shims.GetMethod("Echo")!;
+            Assert.True(echo.IsGenericMethodDefinition);
+            Assert.True(echo.GetGenericArguments()[0].GenericParameterAttributes
+                .HasFlag(GenericParameterAttributes.NotNullableValueTypeConstraint));
+            object lib = Activator.CreateInstance(original.GetType("GenE2E.Lib")!)!;
+            Assert.Equal(107, echo.MakeGenericMethod(typeof(int)).Invoke(null, new[] { lib, (object)7 }));
+        }
+        finally
+        {
+            context.Unload();
+        }
+    }
+
+    [Fact]
+    public void Generic_type_method_body_change_executes_via_chain_shim()
+    {
+        const string source = @"
+namespace GenE2E
+{
+    public class Box<T>
+    {
+        public int Mul(int k) { return k; }
+    }
+    public class BoxUser
+    {
+        public static int Drive() { return new Box<int>().Mul(3) + 0; }
+    }
+}";
+        var service = new CompileService();
+        string asmPath = CompileProjectAssembly(service, "GenE2EBox", ("Assets/Box.cs", source));
+        JsonObject compileParams = ParamsFor(asmPath);
+
+        // Non-generic method in a generic TYPE: same remove+add path, the
+        // shim's type parameter comes from the declaring chain and call
+        // sites rely on inference from `self`. Drive is co-edited (a plain
+        // changed method) so both redirect styles appear in one batch.
+        string newText = source
+            .Replace("public int Mul(int k) { return k; }", "public int Mul(int k) { return k * 50; }")
+            .Replace("Mul(3) + 0", "Mul(3) + 1");
+
+        JsonNode result = HotPatch(service, compileParams, ("Assets/Box.cs", source, newText));
+
+        Assert.True(result["hot"]!.GetValue<bool>(), result["files"]?.ToJsonString());
+        Assert.True(result["success"]!.GetValue<bool>(), result["error"]?.GetValue<string>());
+
+        var detour = Assert.Single(result["methods"]!.AsArray())!;
+        Assert.Equal("GenE2E.BoxUser", detour["declaringType"]!.GetValue<string>());
+        Assert.Equal("Drive", detour["name"]!.GetValue<string>());
+
+        byte[] originalBytes = File.ReadAllBytes(asmPath);
+        byte[] patchBytes = Convert.FromBase64String(result["assemblyB64"]!.GetValue<string>());
+        var context = new AssemblyLoadContext("generic-box-e2e", isCollectible: true);
+        try
+        {
+            Assembly original = context.LoadFromStream(new MemoryStream(originalBytes));
+            context.Resolving += (_, name) => name.Name == "GenE2EBox" ? original : null;
+            Assembly patch = context.LoadFromStream(new MemoryStream(patchBytes));
+
+            Type patchUser = patch.GetType("GenE2E.BoxUser__LocusPatch", throwOnError: true)!;
+            Assert.Equal(151, patchUser.GetMethod("Drive")!.Invoke(null, null));
+
+            Type shims = patch.GetType("GenE2E.Box__LocusShims", throwOnError: true)!;
+            MethodInfo mul = shims.GetMethod("Mul")!;
+            object box = Activator.CreateInstance(
+                original.GetType("GenE2E.Box`1")!.MakeGenericType(typeof(int)))!;
+            Assert.Equal(350, mul.MakeGenericMethod(typeof(int)).Invoke(null, new[] { box, (object)7 }));
+        }
+        finally
+        {
+            context.Unload();
+        }
+    }
+
+    [Fact]
+    public void Generic_kept_caller_of_readded_member_fails_closed()
+    {
+        const string useSource = @"
+namespace GenE2E
+{
+    public class Use
+    {
+        public static int Relay<T>() { return new Lib().Echo(9); }
+        public static int Other() { return 1; }
+    }
+}";
+        var service = new CompileService();
+        string asmPath = CompileProjectAssembly(
+            service, "GenE2EGenericCaller",
+            ("Assets/Lib.cs", GenericLibSource),
+            ("Assets/Use.cs", useSource));
+        JsonObject compileParams = ParamsFor(asmPath);
+
+        // The only compiled call site of Echo sits inside a KEPT generic
+        // method: its patch copy cannot be re-detoured, so the rewrite
+        // fails the file closed naming the exact member.
+        string newLib = GenericLibSource.Replace("{ return value; }", "{ return default(T); }");
+        string newUse = useSource.Replace("public static int Other() { return 1; }", "public static int Other() { return 2; }");
+
+        JsonNode result = HotPatch(
+            service, compileParams,
+            ("Assets/Lib.cs", GenericLibSource, newLib),
+            ("Assets/Use.cs", useSource, newUse));
+
+        Assert.False(result["hot"]!.GetValue<bool>());
+        var file = Assert.Single(result["files"]!.AsArray())!;
+        Assert.Equal("Assets/Use.cs", file["path"]!.GetValue<string>());
+        string reason = file["reasons"]!.AsArray().Single()!.GetValue<string>();
+        Assert.Contains("GenE2E.Use.Relay", reason);
+        Assert.Contains("cannot be re-detoured", reason);
+        Assert.Contains("GenE2E.Lib.Echo", reason);
+    }
+
+    // ── added extension methods across cumulative batches ────────────
+
+    private const string ExtHelperSource = @"
+namespace ExtE2E
+{
+    public static class Helper
+    {
+        public static int Pick() { return 1; }
+    }
+}";
+
+    private const string ExtSubjectSource = @"
+namespace ExtE2E
+{
+    public class Subject
+    {
+        public int Probe() { return 0; }
+    }
+}";
+
+    [Fact]
+    public void Added_extension_method_survives_rebatch_with_session_image()
+    {
+        var service = new CompileService();
+        string helperPath = CompileOriginal(service, "ExtRebatchHelper", ExtHelperSource);
+        string subjectPath = CompileOriginal(service, "ExtRebatchSubject", ExtSubjectSource);
+        JsonObject compileParams = ParamsFor(helperPath, subjectPath);
+        compileParams["domainGeneration"] = "ext-rebatch-gen";
+
+        string helperV1 = ExtHelperSource.Replace(
+            "public static int Pick() { return 1; }",
+            "public static int Pick() { return 1; }\n        public static int Tripled(this int v) { return v * 3; }");
+        string subjectV1 = ExtSubjectSource.Replace(
+            "public int Probe() { return 0; }",
+            "public int Probe() { return 1500.Tripled() + 12; }");
+
+        JsonNode Batch(string helperText, string subjectText)
+        {
+            var request = new JsonObject
+            {
+                ["files"] = new JsonArray(
+                    new JsonObject { ["path"] = "Helper.cs", ["oldText"] = ExtHelperSource, ["newText"] = helperText },
+                    new JsonObject { ["path"] = "Subject.cs", ["oldText"] = ExtSubjectSource, ["newText"] = subjectText }),
+                ["params"] = compileParams.DeepClone(),
+                ["registerImage"] = true, // inline accept: image + shim registry commit
+            };
+            return service.HandleCompileHotPatch(request);
+        }
+
+        JsonNode resultV1 = Batch(helperV1, subjectV1);
+        Assert.True(resultV1["success"]!.GetValue<bool>(), resultV1["error"]?.GetValue<string>());
+        string assemblyV1 = resultV1["assemblyName"]!.GetValue<string>();
+
+        // Batch 2 re-sends the SAME files (cumulative coordinator batches)
+        // plus a body tweak: extension lookup now sees the batch SOURCE shim
+        // and batch 1's image shim — the call site must rewrite to a direct
+        // call instead of failing CS0121-ambiguous.
+        string helperV2 = helperV1.Replace("return v * 3;", "return v * 3 + 1;");
+        JsonNode resultV2 = Batch(helperV2, subjectV1);
+        Assert.True(resultV2["hot"]!.GetValue<bool>(), resultV2["files"]?.ToJsonString());
+        Assert.True(resultV2["success"]!.GetValue<bool>(), resultV2["error"]?.GetValue<string>());
+
+        // Probe re-detours; the re-edited shim detours old → new.
+        var methodNames = resultV2["methods"]!.AsArray()
+            .Select(m => m!["declaringType"]!.GetValue<string>() + "." + m["name"]!.GetValue<string>())
+            .OrderBy(n => n)
+            .ToArray();
+        Assert.Equal(new[] { "ExtE2E.Helper__LocusShims.Tripled", "ExtE2E.Subject.Probe" }, methodNames);
+        var shimDetour = resultV2["methods"]!.AsArray()
+            .Single(m => m!["name"]!.GetValue<string>() == "Tripled")!;
+        Assert.Equal(assemblyV1, shimDetour["originalAssembly"]!.GetValue<string>());
+
+        byte[] helperBytes = File.ReadAllBytes(helperPath);
+        byte[] subjectBytes = File.ReadAllBytes(subjectPath);
+        byte[] patchBytes = Convert.FromBase64String(resultV2["assemblyB64"]!.GetValue<string>());
+        var context = new AssemblyLoadContext("ext-rebatch", isCollectible: true);
+        try
+        {
+            Assembly helperAssembly = context.LoadFromStream(new MemoryStream(helperBytes));
+            Assembly subjectAssembly = context.LoadFromStream(new MemoryStream(subjectBytes));
+            context.Resolving += (_, name) => name.Name switch
+            {
+                "ExtRebatchHelper" => helperAssembly,
+                "ExtRebatchSubject" => subjectAssembly,
+                _ => null,
+            };
+            Assembly patch = context.LoadFromStream(new MemoryStream(patchBytes));
+
+            Type patchSubject = patch.GetType("ExtE2E.Subject__LocusPatch", throwOnError: true)!;
+            object instance = Activator.CreateInstance(patchSubject)!;
+            Assert.Equal(1500 * 3 + 1 + 12, patchSubject.GetMethod("Probe")!.Invoke(instance, null));
+        }
+        finally
+        {
+            context.Unload();
+        }
+    }
+
+    [Fact]
+    public void Reduced_extension_on_class_receiver_folds_into_first_argument()
+    {
+        const string source = @"
+namespace ExtE2E
+{
+    public class Subject
+    {
+        public int Tag = 40;
+        public int Probe() { return 0; }
+    }
+    public static class Helper
+    {
+        public static int Pick() { return 1; }
+    }
+}";
+        var service = new CompileService();
+        string originalPath = CompileOriginal(service, "ExtClassRecv", source);
+        JsonObject compileParams = ParamsFor(originalPath);
+
+        string newText = source
+            .Replace(
+                "public static int Pick() { return 1; }",
+                "public static int Pick() { return 1; }\n        public static int Boost(this Subject s) { return s.Tag + 5000; }")
+            .Replace(
+                "public int Probe() { return 0; }",
+                "public int Probe() { var s = new Subject(); return s.Boost(); }");
+
+        JsonNode result = HotPatch(service, compileParams, ("Ext.cs", source, newText));
+
+        Assert.True(result["hot"]!.GetValue<bool>(), result["files"]?.ToJsonString());
+        Assert.True(result["success"]!.GetValue<bool>(), result["error"]?.GetValue<string>());
+
+        byte[] originalBytes = File.ReadAllBytes(originalPath);
+        byte[] patchBytes = Convert.FromBase64String(result["assemblyB64"]!.GetValue<string>());
+        var context = new AssemblyLoadContext("ext-class-recv", isCollectible: true);
+        try
+        {
+            Assembly original = context.LoadFromStream(new MemoryStream(originalBytes));
+            context.Resolving += (_, name) => name.Name == "ExtClassRecv" ? original : null;
+            Assembly patch = context.LoadFromStream(new MemoryStream(patchBytes));
+
+            // The receiver folded into the shim's first argument and the
+            // constructed instance is the ORIGINAL type.
+            Type patchSubject = patch.GetType("ExtE2E.Subject__LocusPatch", throwOnError: true)!;
+            object instance = Activator.CreateInstance(patchSubject)!;
+            Assert.Equal(5040, patchSubject.GetMethod("Probe")!.Invoke(instance, null));
+        }
+        finally
+        {
+            context.Unload();
+        }
+    }
+
+    // ── new NESTED types inside pre-existing (renamed) containers ────
+
+    private const string NestedHostSource = @"
+namespace NestE2E
+{
+    public class Host
+    {
+        public int Probe() { return 0; }
+    }
+}";
+
+    [Fact]
+    public void New_nested_type_reference_requalifies_to_patch_name()
+    {
+        var service = new CompileService();
+        string originalPath = CompileOriginal(service, "NestedNew", NestedHostSource);
+        JsonObject compileParams = ParamsFor(originalPath);
+
+        string newText = NestedHostSource.Replace(
+            "public int Probe() { return 0; }",
+            "public int Probe() { return Inner2.Forty(); }\n        public class Inner2 { public static int Forty() { return 4554; } }");
+
+        JsonNode result = HotPatch(service, compileParams, ("Host.cs", NestedHostSource, newText));
+
+        Assert.True(result["hot"]!.GetValue<bool>(), result["files"]?.ToJsonString());
+        Assert.True(result["success"]!.GetValue<bool>(), result["error"]?.GetValue<string>());
+
+        // The new nested type's RUNTIME home is the renamed patch copy.
+        var newType = Assert.Single(result["newTypes"]!.AsArray())!;
+        Assert.Equal("NestE2E.Host__LocusPatch+Inner2", newType["metadataName"]!.GetValue<string>());
+        Assert.False(newType["isTopLevel"]!.GetValue<bool>());
+
+        byte[] originalBytes = File.ReadAllBytes(originalPath);
+        byte[] patchBytes = Convert.FromBase64String(result["assemblyB64"]!.GetValue<string>());
+        var context = new AssemblyLoadContext("nested-new", isCollectible: true);
+        try
+        {
+            Assembly original = context.LoadFromStream(new MemoryStream(originalBytes));
+            context.Resolving += (_, name) => name.Name == "NestedNew" ? original : null;
+            Assembly patch = context.LoadFromStream(new MemoryStream(patchBytes));
+
+            Type patchHost = patch.GetType("NestE2E.Host__LocusPatch", throwOnError: true)!;
+            object instance = Activator.CreateInstance(patchHost)!;
+            Assert.Equal(4554, patchHost.GetMethod("Probe")!.Invoke(instance, null));
+        }
+        finally
+        {
+            context.Unload();
+        }
+    }
+
+    [Fact]
+    public void New_nested_type_cross_file_reference_requalifies()
+    {
+        const string userSource = @"
+namespace NestE2E
+{
+    public class User
+    {
+        public static int Go() { return 1; }
+    }
+}";
+        var service = new CompileService();
+        string hostPath = CompileOriginal(service, "NestedNewHost", NestedHostSource);
+        string userPath = CompileOriginal(service, "NestedNewUser", userSource);
+        JsonObject compileParams = ParamsFor(hostPath, userPath);
+
+        string newHost = NestedHostSource.Replace(
+            "public int Probe() { return 0; }",
+            "public int Probe() { return 1; }\n        public class Inner2 { public static int Forty() { return 4554; } }");
+        string newUser = userSource.Replace(
+            "public static int Go() { return 1; }",
+            "public static int Go() { return Host.Inner2.Forty(); }");
+
+        JsonNode result = HotPatch(
+            service, compileParams,
+            ("Host.cs", NestedHostSource, newHost),
+            ("User.cs", userSource, newUser));
+
+        Assert.True(result["hot"]!.GetValue<bool>(), result["files"]?.ToJsonString());
+        Assert.True(result["success"]!.GetValue<bool>(), result["error"]?.GetValue<string>());
+
+        byte[] hostBytes = File.ReadAllBytes(hostPath);
+        byte[] userBytes = File.ReadAllBytes(userPath);
+        byte[] patchBytes = Convert.FromBase64String(result["assemblyB64"]!.GetValue<string>());
+        var context = new AssemblyLoadContext("nested-new-cross", isCollectible: true);
+        try
+        {
+            Assembly hostAssembly = context.LoadFromStream(new MemoryStream(hostBytes));
+            Assembly userAssembly = context.LoadFromStream(new MemoryStream(userBytes));
+            context.Resolving += (_, name) => name.Name switch
+            {
+                "NestedNewHost" => hostAssembly,
+                "NestedNewUser" => userAssembly,
+                _ => null,
+            };
+            Assembly patch = context.LoadFromStream(new MemoryStream(patchBytes));
+
+            Type patchUser = patch.GetType("NestE2E.User__LocusPatch", throwOnError: true)!;
+            Assert.Equal(4554, patchUser.GetMethod("Go")!.Invoke(null, null));
+        }
+        finally
+        {
+            context.Unload();
+        }
+    }
+
+    // ── B4: unsafe bodies follow the project's allow-unsafe setting ──
+
+    private const string UnsafeSource = @"
+public class Cursor
+{
+    public unsafe int Read()
+    {
+        int x = 3;
+        int* p = &x;
+        return *p;
+    }
+}";
+
+    /// <summary>The service's raw compile pins allowUnsafe:false (snippet
+    /// parity), so unsafe originals compile directly through Roslyn.</summary>
+    private string CompileUnsafeOriginal(string assemblyName, string text)
+    {
+        var compilation = CSharpCompilation.Create(
+            assemblyName,
+            new[] { CSharpSyntaxTree.ParseText(text, new CSharpParseOptions(LanguageVersion.CSharp9)) },
+            HostBclPaths().Select(p => (MetadataReference)MetadataReference.CreateFromFile(p)),
+            new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary, allowUnsafe: true));
+        string path = Path.Combine(_tempDir, assemblyName + ".dll");
+        Microsoft.CodeAnalysis.Emit.EmitResult emit = compilation.Emit(path);
+        Assert.True(emit.Success, string.Join("\n", emit.Diagnostics));
+        return path;
+    }
+
+    [Fact]
+    public void Unsafe_body_edit_is_hot_when_params_allow_unsafe()
+    {
+        var service = new CompileService();
+        string originalPath = CompileUnsafeOriginal("UnsafeHot", UnsafeSource);
+        JsonObject compileParams = ParamsFor(originalPath);
+        compileParams["allowUnsafe"] = true;
+
+        string newText = UnsafeSource.Replace("return *p;", "return *p + 40;");
+        JsonNode result = HotPatch(service, compileParams, ("Cursor.cs", UnsafeSource, newText));
+
+        Assert.True(result["hot"]!.GetValue<bool>(), result["files"]?.ToJsonString());
+        Assert.True(result["success"]!.GetValue<bool>(), result["error"]?.GetValue<string>());
+        var method = Assert.Single(result["methods"]!.AsArray())!;
+        Assert.Equal("Read", method["name"]!.GetValue<string>());
+
+        byte[] patchBytes = Convert.FromBase64String(result["assemblyB64"]!.GetValue<string>());
+        var context = new AssemblyLoadContext("unsafe-e2e", isCollectible: true);
+        try
+        {
+            Assembly patch = context.LoadFromStream(new MemoryStream(patchBytes));
+            Type patchType = patch.GetType("Cursor__LocusPatch", throwOnError: true)!;
+            object cursor = Activator.CreateInstance(patchType)!;
+            Assert.Equal(43, patchType.GetMethod("Read")!.Invoke(cursor, null));
+        }
+        finally
+        {
+            context.Unload();
+        }
+    }
+
+    [Fact]
+    public void Unsafe_body_edit_is_a_deterministic_diagnostic_without_allow_unsafe()
+    {
+        var service = new CompileService();
+        string originalPath = CompileUnsafeOriginal("UnsafeCold", UnsafeSource);
+        JsonObject compileParams = ParamsFor(originalPath);
+
+        string newText = UnsafeSource.Replace("return *p;", "return *p + 40;");
+        JsonNode result = HotPatch(service, compileParams, ("Cursor.cs", UnsafeSource, newText));
+
+        Assert.True(result["hot"]!.GetValue<bool>());
+        Assert.False(result["success"]!.GetValue<bool>());
+        Assert.Contains("CS0227", result["error"]!.GetValue<string>());
+    }
+
     /// <summary>Compile the REAL field-store runtime source (parity with the
     /// shipped Locus.HotReload.Runtime.dll) into a referenceable DLL.</summary>
     private string CompileFieldStoreRuntime(CompileService service)
@@ -1350,6 +1887,93 @@ public static class Player__LocusShims
         Assert.Equal("Game.Player__LocusShims", registration.Entry.ShimTypeMetadataName);
         Assert.Equal("Mana", registration.Entry.ShimMethod);
         Assert.True(registration.Entry.HasSelf);
+    }
+
+    [Fact]
+    public void Generic_body_change_rewrite_is_verbatim_stable()
+    {
+        // B1: the generic body re-materializes as a generic static shim;
+        // the KEPT caller's call site becomes a direct call with explicit
+        // type arguments and the caller joins the detour set.
+        const string oldText = @"namespace Game
+{
+    public class Player
+    {
+        public int Tick() { return Echo(7); }
+        public T Echo<T>(T value) { return value; }
+    }
+}";
+        string newText = oldText.Replace(
+            "public T Echo<T>(T value) { return value; }",
+            "public T Echo<T>(T value) { return default(T); }");
+
+        var (result, text) = RewriteWithOriginal("GoldenGenericShim", oldText, newText);
+
+        const string expected = @"namespace Game
+{
+    public class Player__LocusPatch
+    {
+        public int Tick() { return global::Game.Player__LocusShims.Echo<int>(((global::Game.Player)(object)this),7); }
+    }
+
+public static class Player__LocusShims
+{
+    public static T Echo<T>(this global::Game.Player self, T value)
+    {
+        return default(T);
+    }
+}}";
+        Assert.Equal(expected.ReplaceLineEndings("\n"), text.ReplaceLineEndings("\n"));
+
+        // Tick is a KEPT member dragged into the detour set (its call site
+        // rewrote to the shim); the generic Echo itself never detours.
+        var method = Assert.Single(result.Methods);
+        Assert.Equal("Tick", method.Name);
+        Assert.Equal("Game.Player", method.DeclaringType);
+        Assert.Equal("Game.Player__LocusPatch", method.PatchDeclaringType);
+
+        // The re-add registers the live shim; the same-key tombstone is
+        // suppressed (it would overwrite the entry in the registry).
+        var registration = Assert.Single(result.ShimRegistrations);
+        Assert.Equal("added", registration.Entry.Kind);
+        Assert.True(registration.Entry.GenericShim);
+        Assert.Equal("Echo", registration.Entry.ShimMethod);
+    }
+
+    [Fact]
+    public void Reduced_extension_this_receiver_rewrite_is_verbatim_stable()
+    {
+        // `this.Boost()` in a KEPT member: the reduced receiver folds into
+        // the static shim's first argument, cast to the extension's
+        // this-parameter type (the runtime object is an original instance;
+        // only the static type in the patch copy differs).
+        const string oldText = @"namespace Game
+{
+    public class Player
+    {
+        public int Hp = 7;
+        public int Tick() { return this.Hp; }
+    }
+    public static class PlayerOps
+    {
+        public static int Noop() { return 0; }
+    }
+}";
+        string newText = oldText
+            .Replace(
+                "public int Tick() { return this.Hp; }",
+                "public int Tick() { return this.Boost(); }")
+            .Replace(
+                "public static int Noop() { return 0; }",
+                "public static int Noop() { return 0; }\n        public static int Boost(this Player p) { return p.Hp + 9000; }");
+
+        var (result, text) = RewriteWithOriginal("GoldenReducedThis", oldText, newText);
+
+        Assert.Contains(
+            "public int Tick() { return global::Game.PlayerOps__LocusShims.Boost(((global::Game.Player)(object)this)); }",
+            text.ReplaceLineEndings("\n"));
+        var method = Assert.Single(result.Methods);
+        Assert.Equal("Tick", method.Name);
     }
 
     private string RewriteExpectingCold(string assemblyName, string oldText, string newText)

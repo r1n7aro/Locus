@@ -205,6 +205,10 @@ pub struct CompileParams {
     pub reference_paths: Vec<String>,
     #[serde(default)]
     pub defines: Vec<String>,
+    /// Project "Allow unsafe code" (any script assembly with the flag on);
+    /// hot patches follow it. Old Unity plugins omit the field → false.
+    #[serde(default)]
+    pub allow_unsafe: bool,
 }
 
 /// A successfully emitted assembly, ready to ship to Unity.
@@ -739,11 +743,13 @@ mod tests {
             lang_version: "9".to_string(),
             reference_paths: vec!["a.dll".to_string()],
             defines: vec!["UNITY_EDITOR".to_string()],
+            allow_unsafe: true,
         };
         let value = serde_json::to_value(&params).expect("serialize");
         assert_eq!(value["domainGeneration"], "gen");
         assert_eq!(value["langVersion"], "9");
         assert_eq!(value["referencePaths"][0], "a.dll");
+        assert_eq!(value["allowUnsafe"], true);
     }
 
     /// End-to-end sidecar smoke: spawn, BCL-only compile, crash recovery,

@@ -304,6 +304,8 @@ namespace Locus
             AddCompilationAssemblies(references, referencedPaths, AssembliesType.Editor, reportStage, cancellationToken);
             AddCompilationAssemblies(references, referencedPaths, AssembliesType.PlayerWithoutTestAssemblies, reportStage, cancellationToken);
 
+            _cachedCompileAllowUnsafe = ComputeCompileAllowUnsafe();
+
             ReportExecuteCodeCompilerStage(reportStage, "Adding loaded AppDomain assemblies");
             foreach (Assembly asm in AppDomain.CurrentDomain.GetAssemblies())
             {
@@ -428,6 +430,53 @@ namespace Locus
             }
             catch
             {
+            }
+        }
+
+        /// <summary>True when ANY project script assembly compiles with
+        /// "Allow unsafe code" (player setting or an asmdef flag): the
+        /// hot-patch compiler follows the superset so unsafe bodies in those
+        /// assemblies stay patchable (B4). Main thread (CompilationPipeline).</summary>
+        private static bool ComputeCompileAllowUnsafe()
+        {
+            AssembliesType[] assemblyTypes =
+            {
+                AssembliesType.Editor,
+                AssembliesType.PlayerWithoutTestAssemblies,
+            };
+            foreach (AssembliesType assembliesType in assemblyTypes)
+            {
+                UnityEditor.Compilation.Assembly[] assemblies;
+                try
+                {
+                    assemblies = CompilationPipeline.GetAssemblies(assembliesType);
+                }
+                catch
+                {
+                    continue;
+                }
+                if (assemblies == null)
+                    continue;
+                foreach (UnityEditor.Compilation.Assembly assembly in assemblies)
+                {
+                    if (assembly != null &&
+                        assembly.compilerOptions != null &&
+                        assembly.compilerOptions.AllowUnsafeCode)
+                    {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+
+        /// <summary>Cached allow-unsafe flag; only meaningful once the
+        /// reference paths are built (same cache lifetime). Any thread.</summary>
+        private static bool GetCachedCompileAllowUnsafe()
+        {
+            lock (_compileCacheLock)
+            {
+                return _compileReferencePathsReady && _cachedCompileAllowUnsafe;
             }
         }
 
