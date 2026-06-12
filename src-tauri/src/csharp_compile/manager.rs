@@ -24,6 +24,11 @@ pub struct ServerHandle {
     pub roslyn_version: String,
     pub dotnet_source: &'static str,
     pub started_at: Instant,
+    /// Which DLL this server was spawned from and its mtime at spawn time.
+    /// A newer binary on disk (dev republish) hot-swaps the sidecar on the
+    /// next idle call instead of serving stale code until the app restarts.
+    server_dll: PathBuf,
+    server_dll_mtime: Option<std::time::SystemTime>,
 }
 
 fn active_server() -> &'static tokio::sync::Mutex<Option<Arc<ServerHandle>>> {
@@ -82,10 +87,31 @@ pub fn find_server_dll() -> Option<PathBuf> {
             .join("compile-server"),
     );
 
-    candidates
-        .into_iter()
-        .map(|dir| dir.join(SERVER_DLL_NAME))
-        .find(|dll| dll.is_file())
+    pick_newest_dll(candidates.into_iter().map(|dir| dir.join(SERVER_DLL_NAME)))
+}
+
+/// Among the existing candidates, take the one with the NEWEST mtime (first
+/// wins ties). In dev the build-time resource copy next to the exe would
+/// otherwise shadow a fresher `gen/compile-server` publish until the next
+/// cargo build — three self-test rounds in a row ran a stale sidecar
+/// exactly that way.
+fn pick_newest_dll(candidates: impl Iterator<Item = PathBuf>) -> Option<PathBuf> {
+    let mut best: Option<(PathBuf, Option<std::time::SystemTime>)> = None;
+    for dll in candidates {
+        if !dll.is_file() {
+            continue;
+        }
+        let mtime = dll_mtime(&dll);
+        match &best {
+            Some((_, best_mtime)) if mtime <= *best_mtime => {}
+            _ => best = Some((dll, mtime)),
+        }
+    }
+    best.map(|(dll, _)| dll)
+}
+
+fn dll_mtime(path: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).and_then(|meta| meta.modified()).ok()
 }
 
 fn logs_dir() -> Result<PathBuf, String> {
@@ -151,12 +177,30 @@ async fn spawn_server() -> Result<Arc<ServerHandle>, String> {
         dotnet.source, roslyn_version
     );
 
+    let server_dll_mtime = dll_mtime(&server_dll);
     Ok(Arc::new(ServerHandle {
         client,
         roslyn_version,
         dotnet_source: dotnet.source,
         started_at: Instant::now(),
+        server_dll,
+        server_dll_mtime,
     }))
+}
+
+/// True when a different (or rebuilt) sidecar binary should serve the next
+/// request. Never flips mid-hot-session: the registries (shims, field
+/// stores, session images) live in the server process, and replacing it
+/// while patches are live would split state — convergence clears the
+/// counter first.
+fn server_binary_changed(server: &ServerHandle) -> bool {
+    let Some(current) = find_server_dll() else {
+        return false;
+    };
+    if current != server.server_dll || dll_mtime(&current) != server.server_dll_mtime {
+        return crate::unity_hotreload::counters().active_patches == 0;
+    }
+    false
 }
 
 /// Get a live client, spawning or respawning the sidecar when needed.
@@ -164,10 +208,18 @@ pub async fn ensure_client() -> Result<Arc<CompileClient>, String> {
     let mut guard = active_server().lock().await;
     if let Some(server) = guard.as_ref() {
         if !server.client.has_exited() {
-            return Ok(Arc::clone(&server.client));
+            if !server_binary_changed(server) {
+                return Ok(Arc::clone(&server.client));
+            }
+            eprintln!(
+                "[CsharpCompile] compile server binary changed on disk; restarting the sidecar"
+            );
+            server.client.kill_process();
+            *guard = None;
+        } else {
+            eprintln!("[CsharpCompile] compile server exited; restarting");
+            *guard = None;
         }
-        eprintln!("[CsharpCompile] compile server exited; restarting");
-        *guard = None;
     }
 
     match spawn_server().await {
@@ -247,4 +299,42 @@ pub fn last_error_for_diagnostics() -> Option<String> {
 #[allow(dead_code)]
 pub fn server_dll_dir(dll: &Path) -> Option<&Path> {
     dll.parent()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pick_newest_dll;
+    use std::time::{Duration, SystemTime};
+
+    fn set_mtime(path: &std::path::Path, time: SystemTime) {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .expect("open for mtime")
+            .set_modified(time)
+            .expect("set mtime");
+    }
+
+    #[test]
+    fn pick_newest_dll_prefers_fresher_candidates_and_first_on_ties() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let stale = dir.path().join("stale").join("LocusCompileServer.dll");
+        let fresh = dir.path().join("fresh").join("LocusCompileServer.dll");
+        for path in [&stale, &fresh] {
+            std::fs::create_dir_all(path.parent().unwrap()).expect("mkdir");
+            std::fs::write(path, b"dll").expect("write");
+        }
+        let old = SystemTime::now() - Duration::from_secs(3600);
+        set_mtime(&stale, old);
+
+        // Candidate order puts the stale shadow copy first (the dev shape);
+        // the fresher publish must still win.
+        let picked = pick_newest_dll([stale.clone(), fresh.clone()].into_iter());
+        assert_eq!(picked.as_ref(), Some(&fresh));
+
+        // Equal mtimes: the first candidate (packaged install) wins.
+        set_mtime(&fresh, old);
+        let picked = pick_newest_dll([stale.clone(), fresh].into_iter());
+        assert_eq!(picked, Some(stale));
+    }
 }
