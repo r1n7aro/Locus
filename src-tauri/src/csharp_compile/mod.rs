@@ -16,10 +16,15 @@ pub mod manager;
 pub mod params;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::OnceLock;
 
 use serde_json::{json, Value};
+use tauri::Emitter;
+
+pub const STATUS_EVENT: &str = "csharp-compile-status";
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
+static APP_HANDLE: OnceLock<tauri::AppHandle> = OnceLock::new();
 
 // Session counters for the phase-6 rollout: how often tool calls actually
 // used the sidecar, hit deterministic compile errors, or fell back to the
@@ -40,11 +45,26 @@ fn record_outcome(outcome: &Result<CompileOutcome, String>) {
         // which also sees the non-transport reasons (disabled plugin, etc.).
         Err(_) => {}
     }
+    emit_status_in_background();
+}
+
+/// Push a fresh status snapshot to the UI (settings card subscribes), so
+/// asynchronous failures — warm-up errors, runtime download problems,
+/// runtime fallbacks — are visible without re-opening the page. No-op until
+/// app setup provides the handle (tests, early startup).
+pub(crate) fn emit_status_in_background() {
+    let Some(app_handle) = APP_HANDLE.get().cloned() else {
+        return;
+    };
+    tokio::spawn(async move {
+        let _ = app_handle.emit(STATUS_EVENT, status().await);
+    });
 }
 
 /// Called once from app setup with the persisted flag.
-pub fn initialize(enabled: bool) {
+pub fn initialize(enabled: bool, app_handle: tauri::AppHandle) {
     ENABLED.store(enabled, Ordering::Relaxed);
+    let _ = APP_HANDLE.set(app_handle);
 }
 
 pub fn is_enabled() -> bool {
@@ -57,6 +77,7 @@ pub async fn set_enabled(value: bool) {
     if !value {
         manager::shutdown().await;
     }
+    emit_status_in_background();
 }
 
 /// Best-effort synchronous kill for app-exit paths.
@@ -69,6 +90,7 @@ pub fn kill_active_server_for_exit() {
 /// missing, old Unity plugin) does not spam on every call.
 pub fn note_fallback(reason: &str) {
     SIDECAR_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+    emit_status_in_background();
     static LAST: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
     let Ok(mut guard) = LAST.lock() else { return };
     if guard.as_deref() != Some(reason) {
@@ -135,6 +157,8 @@ pub fn warm_up_in_background() {
             ),
             Err(error) => eprintln!("[CsharpCompile] warm-up skipped: {error}"),
         }
+        // Surface the outcome (running / lastError) in the settings card.
+        emit_status_in_background();
     });
 }
 

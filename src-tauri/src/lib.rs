@@ -399,7 +399,10 @@ pub fn run() {
             let config = Arc::new(loaded_config);
             unity_bridge::initialize_background_hook(config.unity_background_hook_enabled());
             csharp_lsp::initialize(config.csharp_lsp_enabled(), app.handle().clone());
-            csharp_compile::initialize(config.unity_sidecar_compiler_enabled());
+            csharp_compile::initialize(
+                config.unity_sidecar_compiler_enabled(),
+                app.handle().clone(),
+            );
             code_tools::initialize(config.code_analysis_tools());
             startup_for_setup.mark("setup_config_ready");
 

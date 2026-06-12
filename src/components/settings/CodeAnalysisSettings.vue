@@ -9,6 +9,7 @@ import {
   csharpLspRestart,
   csharpLspSetEnabled,
   subscribeCsharpLspStatus,
+  subscribeUnitySidecarCompilerStatus,
   unitySidecarCompilerGetStatus,
   unitySidecarCompilerSetEnabled,
 } from "../../services/csharpLsp";
@@ -34,6 +35,7 @@ const sidecarReady = ref(false);
 const sidecarBusy = ref(false);
 
 let unsubscribeStatus: RuntimeUnsubscribe | null = null;
+let unsubscribeSidecarStatus: RuntimeUnsubscribe | null = null;
 
 const lspEnabled = computed(() => lspStatus.value?.enabled ?? false);
 
@@ -248,11 +250,19 @@ onMounted(() => {
   }).then((unsubscribe) => {
     unsubscribeStatus = unsubscribe;
   });
+  void subscribeUnitySidecarCompilerStatus((payload) => {
+    sidecarStatus.value = payload;
+    sidecarReady.value = true;
+  }).then((unsubscribe) => {
+    unsubscribeSidecarStatus = unsubscribe;
+  });
 });
 
 onUnmounted(() => {
   unsubscribeStatus?.();
   unsubscribeStatus = null;
+  unsubscribeSidecarStatus?.();
+  unsubscribeSidecarStatus = null;
 });
 </script>
 

@@ -65,3 +65,9 @@ export function subscribeCsharpLspStatus(
 ): Promise<RuntimeUnsubscribe> {
   return getLocusRuntime().subscribe<CsharpLspStatus>("csharp-lsp-status", handler);
 }
+
+export function subscribeUnitySidecarCompilerStatus(
+  handler: (payload: CsharpCompileStatus) => void,
+): Promise<RuntimeUnsubscribe> {
+  return getLocusRuntime().subscribe<CsharpCompileStatus>("csharp-compile-status", handler);
+}

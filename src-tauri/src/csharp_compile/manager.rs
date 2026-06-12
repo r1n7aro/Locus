@@ -172,10 +172,12 @@ pub async fn ensure_client() -> Result<Arc<CompileClient>, String> {
             clear_start_error();
             let client = Arc::clone(&server.client);
             *guard = Some(server);
+            super::emit_status_in_background();
             Ok(client)
         }
         Err(error) => {
             note_start_error(&error);
+            super::emit_status_in_background();
             Err(error)
         }
     }
