@@ -539,6 +539,7 @@
   "chat.status.code.idle": "代码分析已启用",
   "chat.status.code.preparing": "准备组件中",
   "chat.status.code.downloading": "下载组件 {0}",
+  "chat.status.code.generating": "调用 Unity 生成工程文件中",
   "chat.status.code.starting": "启动分析服务中",
   "chat.status.code.loading": "加载项目中",
   "chat.status.code.loadingProgress": "加载项目 {0}/{1}",
