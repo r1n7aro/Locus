@@ -2273,9 +2273,9 @@ where
     let resp = loop {
         on_progress(rust_unity_execute_progress(
             if send_attempt == 1 {
-                "Sending execute_code to Unity"
+                format!("Sending {execute_msg_type} to Unity")
             } else {
-                "Retrying execute_code after Unity pipe reconnect"
+                format!("Retrying {execute_msg_type} after Unity pipe reconnect")
             },
             "",
             rust_progress_revision,
@@ -2461,9 +2461,9 @@ where
     let resp = loop {
         on_progress(rust_unity_execute_progress(
             if send_attempt == 1 {
-                "Sending execute_code to Unity"
+                format!("Sending {execute_msg_type} to Unity")
             } else {
-                "Retrying execute_code after Unity pipe reconnect"
+                format!("Retrying {execute_msg_type} after Unity pipe reconnect")
             },
             "",
             rust_progress_revision,
