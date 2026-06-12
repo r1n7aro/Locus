@@ -131,6 +131,21 @@ public sealed class AnalyzeHotDiffRequestDto
     public CompileParamsDto? Params { get; set; }
 }
 
+public sealed class CompileHotPatchRequestDto
+{
+    [JsonPropertyName("files")]
+    public HotDiffFileDto[]? Files { get; set; }
+
+    [JsonPropertyName("params")]
+    public CompileParamsDto? Params { get; set; }
+
+    [JsonPropertyName("referenceSessionImages")]
+    public bool ReferenceSessionImages { get; set; } = true;
+
+    [JsonPropertyName("registerImage")]
+    public bool RegisterImage { get; set; } = true;
+}
+
 // ── service ──────────────────────────────────────────────────────────
 
 public sealed class CompileService
@@ -402,6 +417,273 @@ public sealed class CompileService
             ["isCtor"] = method.IsCtor,
             ["added"] = method.Added,
         };
+    }
+
+    /// <summary>
+    /// Full hot-patch pipeline: diff every file (same classification as
+    /// analyze/hotDiff), rewrite the hot ones (PatchRewriter), and compile a
+    /// single patch assembly with accessibility checks suppressed (the patch
+    /// legitimately touches the original assembly's private members).
+    ///
+    /// Response shapes:
+    ///   cold     → { hot: false, files: [{path, hot, reasons}] }
+    ///   no-op    → { hot: true, success: true, noop: true }
+    ///   compiled → { hot: true, success: true, assemblyName/B64, methods, newTypes }
+    ///   error    → { hot: true, success: false, error, errorStage } (deterministic, agent-facing)
+    /// </summary>
+    public JsonNode HandleCompileHotPatch(JsonNode? @params)
+    {
+        var request = Deserialize<CompileHotPatchRequestDto>(@params);
+        if (request.Files == null || request.Files.Length == 0)
+            throw new RpcInvalidParamsException("compile/hotPatch requires at least one file");
+
+        long startedAt = Environment.TickCount64;
+        CSharpParseOptions parseOptions = ResolveParseOptions(request.Params);
+        ImmutableArray<MetadataReference> references = ResolveReferences(request.Params, useHostBcl: false);
+        if (request.ReferenceSessionImages)
+        {
+            var images = _imageRegistry.ReferencesFor(request.Params?.DomainGeneration);
+            if (images.Count > 0)
+                references = references.AddRange(images);
+        }
+
+        var diffs = new List<(HotDiffFileDto File, HotDiffFileResult Diff)>(request.Files.Length);
+        var syntaxErrors = new StringBuilder();
+        var coldFiles = new JsonArray();
+        bool anyCold = false;
+
+        foreach (HotDiffFileDto file in request.Files)
+        {
+            if (string.IsNullOrEmpty(file.Path) || file.OldText == null || file.NewText == null)
+                throw new RpcInvalidParamsException("compile/hotPatch files require path, oldText and newText");
+
+            HotDiffFileResult diff = HotDiff.Analyze(file.OldText, file.NewText, parseOptions);
+            if (diff.SyntaxError != null)
+            {
+                if (syntaxErrors.Length > 0)
+                    syntaxErrors.Append('\n');
+                syntaxErrors.Append(diff.SyntaxError);
+                continue;
+            }
+            if (!diff.Hot)
+            {
+                anyCold = true;
+                coldFiles.Add(HotDiffFileJson(file.Path!, diff));
+                continue;
+            }
+            diffs.Add((file, diff));
+        }
+
+        if (syntaxErrors.Length > 0)
+        {
+            JsonNode failure = FailureResult(syntaxErrors.ToString(), "compile", startedAt);
+            failure["hot"] = true;
+            return failure;
+        }
+
+        if (anyCold)
+        {
+            return new JsonObject
+            {
+                ["hot"] = false,
+                ["files"] = coldFiles,
+                ["durationMs"] = Environment.TickCount64 - startedAt,
+            };
+        }
+
+        var trees = new List<SyntaxTree>();
+        var methods = new JsonArray();
+        var newTypes = new JsonArray();
+        var accessAssemblies = new HashSet<string>(StringComparer.Ordinal);
+
+        foreach (var (file, diff) in diffs)
+        {
+            if (diff.ChangedMethods.Count == 0 && diff.NewTypes.Count == 0)
+                continue; // formatting/comment-only edit: nothing to patch
+
+            PatchRewriteResult rewrite = PatchRewriter.Rewrite(
+                file.Path!, file.NewText!, diff, parseOptions, references);
+
+            if (rewrite.ColdReason != null)
+            {
+                var fileJson = new JsonObject
+                {
+                    ["path"] = file.Path,
+                    ["hot"] = false,
+                    ["reasons"] = new JsonArray(rewrite.ColdReason),
+                };
+                return new JsonObject
+                {
+                    ["hot"] = false,
+                    ["files"] = new JsonArray(fileJson),
+                    ["durationMs"] = Environment.TickCount64 - startedAt,
+                };
+            }
+
+            trees.Add(rewrite.Tree!);
+            foreach (string assembly in rewrite.OriginalAssemblies)
+                accessAssemblies.Add(assembly);
+
+            foreach (PatchMethodMap map in rewrite.Methods)
+            {
+                methods.Add(new JsonObject
+                {
+                    ["declaringType"] = map.DeclaringType,
+                    ["patchDeclaringType"] = map.PatchDeclaringType,
+                    ["name"] = map.Name,
+                    ["paramTypeNames"] = new JsonArray(map.ParamTypeNames.Select(p => (JsonNode)p).ToArray()),
+                    ["isStatic"] = map.IsStatic,
+                    ["isCtor"] = map.IsCtor,
+                });
+            }
+            foreach (PatchNewType newType in rewrite.NewTypes)
+            {
+                newTypes.Add(new JsonObject
+                {
+                    ["metadataName"] = newType.MetadataName,
+                    ["ns"] = newType.Namespace,
+                    ["simpleName"] = newType.SimpleName,
+                    ["isPublic"] = newType.IsPublic,
+                    ["isTopLevel"] = newType.IsTopLevel,
+                });
+            }
+        }
+
+        if (trees.Count == 0)
+        {
+            return new JsonObject
+            {
+                ["hot"] = true,
+                ["success"] = true,
+                ["noop"] = true,
+                ["durationMs"] = Environment.TickCount64 - startedAt,
+            };
+        }
+
+        // Patched bodies may touch internals of any assembly the original
+        // file could (its own assembly plus InternalsVisibleTo friends);
+        // suppressing checks for every reference is the safe superset.
+        foreach (string name in ReferenceAssemblyNames(references))
+            accessAssemblies.Add(name);
+        trees.Add(BuildAccessChecksTree(accessAssemblies, parseOptions));
+
+        string assemblyName = NextAssemblyName("HotPatch", request.Params?.DomainGeneration);
+
+        CSharpCompilationOptions options = SnippetCompilationOptions
+            .WithMetadataImportOptions(MetadataImportOptions.All);
+        ApplyIgnoreAccessibility(options);
+
+        CSharpCompilation compilation = CSharpCompilation.Create(
+            assemblyName: assemblyName,
+            syntaxTrees: trees,
+            references: references,
+            options: options);
+
+        using var peStream = new MemoryStream(128 * 1024);
+        EmitResult emitResult;
+        try
+        {
+            emitResult = compilation.Emit(peStream, options: SnippetEmitOptions);
+        }
+        catch (Exception ex)
+        {
+            JsonNode failure = FailureResult("emit failed: " + ex, "compile", startedAt);
+            failure["hot"] = true;
+            return failure;
+        }
+
+        if (!emitResult.Success)
+        {
+            string? text = DiagnosticText.BuildDiagnosticErrorText(emitResult.Diagnostics);
+            JsonNode failure = FailureResult(text ?? "unknown compilation failure", "compile", startedAt);
+            failure["hot"] = true;
+            return failure;
+        }
+
+        byte[] bytes = peStream.ToArray();
+        if (request.RegisterImage && !string.IsNullOrEmpty(request.Params?.DomainGeneration))
+            _imageRegistry.Register(request.Params!.DomainGeneration!, assemblyName, bytes);
+
+        JsonNode result = SuccessResult(bytes, assemblyName, startedAt);
+        result["hot"] = true;
+        result["methods"] = methods;
+        result["newTypes"] = newTypes;
+        return result;
+    }
+
+    /// <summary>Assembly definition names straight from the PE metadata (no
+    /// symbol materialization).</summary>
+    private static List<string> ReferenceAssemblyNames(ImmutableArray<MetadataReference> references)
+    {
+        var names = new List<string>(references.Length);
+        foreach (MetadataReference reference in references)
+        {
+            if (reference is not PortableExecutableReference peReference)
+                continue;
+            try
+            {
+                if (peReference.GetMetadata() is AssemblyMetadata assembly)
+                {
+                    var module = assembly.GetModules()[0];
+                    var reader = module.GetMetadataReader();
+                    names.Add(reader.GetString(reader.GetAssemblyDefinition().Name));
+                }
+            }
+            catch
+            {
+                // Modules without an assembly definition (netmodules) or
+                // unreadable metadata: skip — worst case a private access in
+                // that assembly fails the compile with a clear diagnostic.
+            }
+        }
+        return names;
+    }
+
+    private static SyntaxTree BuildAccessChecksTree(IEnumerable<string> assemblyNames, CSharpParseOptions parseOptions)
+    {
+        var sb = new StringBuilder(8 * 1024);
+        foreach (string name in assemblyNames.Distinct(StringComparer.Ordinal).OrderBy(n => n, StringComparer.Ordinal))
+        {
+            sb.Append("[assembly: System.Runtime.CompilerServices.IgnoresAccessChecksTo(\"")
+              .Append(name.Replace("\"", "\\\""))
+              .Append("\")]\n");
+        }
+        sb.Append(@"
+namespace System.Runtime.CompilerServices
+{
+    [global::System.AttributeUsage(global::System.AttributeTargets.Assembly, AllowMultiple = true)]
+    internal sealed class IgnoresAccessChecksToAttribute : global::System.Attribute
+    {
+        public IgnoresAccessChecksToAttribute(string assemblyName) { AssemblyName = assemblyName; }
+        public string AssemblyName { get; }
+    }
+}
+");
+        return CSharpSyntaxTree.ParseText(sb.ToString(), parseOptions, path: "LocusIgnoresAccessChecks.cs", encoding: Utf8NoBom);
+    }
+
+    /// <summary>
+    /// Flip Roslyn's internal TopLevelBinderFlags to IgnoreAccessibility
+    /// (1 &lt;&lt; 22): the established mechanism for compiling code that
+    /// reaches private members of referenced assemblies, paired with the
+    /// IgnoresAccessChecksTo attribute for the runtime side. When the
+    /// internal property disappears in a future Roslyn the compile falls
+    /// back to normal accessibility and private access surfaces as a
+    /// deterministic diagnostic.
+    /// </summary>
+    private static void ApplyIgnoreAccessibility(CSharpCompilationOptions options)
+    {
+        try
+        {
+            var property = typeof(CSharpCompilationOptions).GetProperty(
+                "TopLevelBinderFlags",
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+            property?.SetValue(options, (uint)1 << 22);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine("[LocusCompileServer] IgnoreAccessibility unavailable: " + ex.Message);
+        }
     }
 
     // ── snippet helpers ──────────────────────────────────────────────

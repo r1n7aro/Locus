@@ -12,6 +12,7 @@
 //   compile/snippet   -> wrap + compile a unity_execute snippet
 //   compile/runStates -> wrap + compile a unity_run_states state machine
 //   analyze/hotDiff   -> classify edited files as hot-patchable or not
+//   compile/hotPatch  -> diff + rewrite + compile a hot-patch assembly
 
 using System.Globalization;
 using System.Text.Json;
@@ -98,6 +99,9 @@ while (true)
                 break;
             case "analyze/hotDiff":
                 result = service.HandleAnalyzeHotDiff(@params);
+                break;
+            case "compile/hotPatch":
+                result = service.HandleCompileHotPatch(@params);
                 break;
             default:
                 error = RpcError(-32601, $"method not found: {method}");
