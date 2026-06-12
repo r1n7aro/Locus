@@ -68,8 +68,14 @@ export default defineConfig(async () => ({
         }
       : undefined,
     watch: {
-      // 3. tell vite to ignore watching `src-tauri`
-      ignored: ["**/src-tauri/**"],
+      // 3. tell vite to ignore native/.NET build outputs. On Windows the
+      // compile-server apphost.exe in obj/ can be locked by dotnet while
+      // Tauri dev rebuilds, and Node's fs watcher exits on EBUSY.
+      ignored: [
+        "**/src-tauri/**",
+        "**/locus_compile_server/**/bin/**",
+        "**/locus_compile_server/**/obj/**",
+      ],
     },
   },
 }));

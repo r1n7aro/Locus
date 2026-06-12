@@ -4,7 +4,7 @@
   "version": "0.4.1",
   "identifier": "com.locus.app",
   "build": {
-    "beforeDevCommand": "bun run ort:bundle && bun run github-cli:bundle && bun run dev",
+    "beforeDevCommand": "bun run compile-server:ensure && bun run ort:bundle && bun run github-cli:bundle && bun run dev",
     "devUrl": "http://localhost:14901",
     "beforeBuildCommand": "bun run build:tauri:without_embed_python_git",
     "frontendDist": "../dist"
