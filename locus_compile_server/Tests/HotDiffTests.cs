@@ -1,0 +1,516 @@
+using Microsoft.CodeAnalysis.CSharp;
+using Xunit;
+
+namespace Locus.CompileServer.Tests;
+
+/// <summary>
+/// Classification matrix for the hot-reload diff. These pin the hot/cold
+/// decision table from unity-hotreload-plan.md §3: anything that can change
+/// field layout, inlined constants, signatures, or type shape must be cold;
+/// body-level edits and additive-safe members are hot.
+/// </summary>
+public class HotDiffTests
+{
+    private static readonly CSharpParseOptions Options = new(
+        languageVersion: LanguageVersion.CSharp9,
+        preprocessorSymbols: new[] { "UNITY_EDITOR" });
+
+    private static HotDiffFileResult Analyze(string oldText, string newText, CSharpParseOptions? options = null)
+    {
+        return HotDiff.Analyze(oldText, newText, options ?? Options);
+    }
+
+    private const string PlayerOld = @"
+using UnityEngine;
+namespace Game
+{
+    public class Player : MonoBehaviour
+    {
+        private int _health = 100;
+        public void Update() { _health += 1; }
+        private void Helper(string name) { Debug.Log(name); }
+    }
+}";
+
+    // ── hot: body-level edits ────────────────────────────────────────
+
+    [Fact]
+    public void Method_body_change_is_hot()
+    {
+        var result = Analyze(PlayerOld, PlayerOld.Replace("_health += 1;", "_health += 2;"));
+
+        Assert.True(result.Hot);
+        var method = Assert.Single(result.ChangedMethods);
+        Assert.Equal("Game.Player", method.DeclaringType);
+        Assert.Equal("Update", method.Name);
+        Assert.Empty(method.ParamTypeNames);
+        Assert.False(method.IsStatic);
+        Assert.False(method.Added);
+        Assert.Equal(new[] { "Game.Player" }, result.PatchedTypes);
+        Assert.Empty(result.NewTypes);
+    }
+
+    [Fact]
+    public void Comment_and_whitespace_only_change_is_a_hot_noop()
+    {
+        var result = Analyze(
+            PlayerOld,
+            PlayerOld.Replace("_health += 1;", "_health += 1; // tick\n        "));
+
+        Assert.True(result.Hot);
+        Assert.Empty(result.ChangedMethods);
+        Assert.Empty(result.PatchedTypes);
+    }
+
+    [Fact]
+    public void Expression_bodied_method_change_is_hot()
+    {
+        const string oldText = "class A { int M() => 1; }";
+        const string newText = "class A { int M() => 2; }";
+
+        var result = Analyze(oldText, newText);
+
+        Assert.True(result.Hot);
+        Assert.Equal("M", Assert.Single(result.ChangedMethods).Name);
+    }
+
+    [Fact]
+    public void Async_method_body_change_is_hot()
+    {
+        const string oldText = "using System.Threading.Tasks; class A { async Task M() { await Task.Yield(); } }";
+        const string newText = "using System.Threading.Tasks; class A { async Task M() { await Task.Delay(1); } }";
+
+        var result = Analyze(oldText, newText);
+
+        Assert.True(result.Hot);
+        Assert.Equal("M", Assert.Single(result.ChangedMethods).Name);
+    }
+
+    [Fact]
+    public void Constructor_body_change_is_hot()
+    {
+        const string oldText = "class A { public A(int x) { } }";
+        const string newText = "class A { public A(int x) { System.Console.WriteLine(x); } }";
+
+        var result = Analyze(oldText, newText);
+
+        Assert.True(result.Hot);
+        var method = Assert.Single(result.ChangedMethods);
+        Assert.Equal(".ctor", method.Name);
+        Assert.True(method.IsCtor);
+        Assert.Equal(new[] { "Int32" }, method.ParamTypeNames);
+    }
+
+    [Fact]
+    public void Property_getter_body_change_is_hot()
+    {
+        const string oldText = "class A { int _v; public int Value { get { return _v; } set { _v = value; } } }";
+        const string newText = "class A { int _v; public int Value { get { return _v + 1; } set { _v = value; } } }";
+
+        var result = Analyze(oldText, newText);
+
+        Assert.True(result.Hot);
+        var method = Assert.Single(result.ChangedMethods);
+        Assert.Equal("get_Value", method.Name);
+        Assert.Empty(method.ParamTypeNames);
+    }
+
+    [Fact]
+    public void Indexer_setter_body_change_is_hot_with_indexer_params()
+    {
+        const string oldText = "class A { int[] _v = new int[8]; public int this[int i] { get { return _v[i]; } set { _v[i] = value; } } }";
+        const string newText = "class A { int[] _v = new int[8]; public int this[int i] { get { return _v[i]; } set { _v[i] = value + 1; } } }";
+
+        var result = Analyze(oldText, newText);
+
+        Assert.True(result.Hot);
+        var method = Assert.Single(result.ChangedMethods);
+        Assert.Equal("set_Item", method.Name);
+        Assert.Equal(new[] { "Int32", "Int32" }, method.ParamTypeNames);
+    }
+
+    [Fact]
+    public void Operator_body_change_is_hot()
+    {
+        const string oldText = "class A { public static A operator +(A a, A b) { return a; } }";
+        const string newText = "class A { public static A operator +(A a, A b) { return b; } }";
+
+        var result = Analyze(oldText, newText);
+
+        Assert.True(result.Hot);
+        var method = Assert.Single(result.ChangedMethods);
+        Assert.Equal("op_Addition", method.Name);
+        Assert.True(method.IsStatic);
+    }
+
+    [Fact]
+    public void Event_accessor_body_change_is_hot()
+    {
+        const string oldText = "using System; class A { Action _h; public event Action Tick { add { _h += value; } remove { _h -= value; } } }";
+        const string newText = "using System; class A { Action _h; public event Action Tick { add { _h += value; Console.WriteLine(1); } remove { _h -= value; } } }";
+
+        var result = Analyze(oldText, newText);
+
+        Assert.True(result.Hot);
+        var method = Assert.Single(result.ChangedMethods);
+        Assert.Equal("add_Tick", method.Name);
+        Assert.Equal(new[] { "Action" }, method.ParamTypeNames);
+    }
+
+    [Fact]
+    public void Added_private_method_is_hot_and_not_detoured()
+    {
+        var result = Analyze(
+            PlayerOld,
+            PlayerOld.Replace(
+                "private void Helper(string name) { Debug.Log(name); }",
+                "private void Helper(string name) { Debug.Log(name); }\n        private int Compute(System.Collections.Generic.List<int> xs) { return xs.Count; }"));
+
+        Assert.True(result.Hot);
+        var method = Assert.Single(result.ChangedMethods);
+        Assert.Equal("Compute", method.Name);
+        Assert.True(method.Added);
+        Assert.Equal(new[] { "List`1" }, method.ParamTypeNames);
+    }
+
+    [Fact]
+    public void Added_type_is_hot_and_reported()
+    {
+        var result = Analyze(
+            PlayerOld,
+            PlayerOld + "\nnamespace Game { public class Spawner { public int Count() { return 3; } } }");
+
+        Assert.True(result.Hot);
+        Assert.Equal(new[] { "Game.Spawner" }, result.NewTypes);
+        Assert.Empty(result.ChangedMethods);
+    }
+
+    [Fact]
+    public void Instance_field_initializer_change_redirects_constructors()
+    {
+        var result = Analyze(PlayerOld, PlayerOld.Replace("_health = 100", "_health = 50"));
+
+        Assert.True(result.Hot);
+        var method = Assert.Single(result.ChangedMethods);
+        Assert.Equal(".ctor", method.Name);
+        Assert.True(method.IsCtor);
+        Assert.Empty(method.ParamTypeNames);
+    }
+
+    [Fact]
+    public void Instance_initializer_change_with_explicit_ctors_redirects_each()
+    {
+        const string oldText = "class A { int _x = 1; public A() { } public A(string s) { } }";
+        const string newText = "class A { int _x = 2; public A() { } public A(string s) { } }";
+
+        var result = Analyze(oldText, newText);
+
+        Assert.True(result.Hot);
+        Assert.Equal(2, result.ChangedMethods.Count);
+        Assert.All(result.ChangedMethods, m => Assert.Equal(".ctor", m.Name));
+        Assert.Contains(result.ChangedMethods, m => m.ParamTypeNames.Length == 0);
+        Assert.Contains(result.ChangedMethods, m => m.ParamTypeNames.SequenceEqual(new[] { "String" }));
+    }
+
+    [Fact]
+    public void Edit_inside_inactive_preprocessor_block_is_a_hot_noop()
+    {
+        const string oldText = "class A { void M() {\n#if LOCUS_MISSING_SYMBOL\n int x = 1;\n#endif\n } }";
+        const string newText = "class A { void M() {\n#if LOCUS_MISSING_SYMBOL\n int x = 2;\n#endif\n } }";
+
+        var result = Analyze(oldText, newText);
+
+        Assert.True(result.Hot);
+        Assert.Empty(result.ChangedMethods);
+    }
+
+    [Fact]
+    public void Directive_change_that_alters_active_code_is_a_body_change()
+    {
+        const string oldText = "class A { void M() {\n#if UNITY_EDITOR\n int x = 1;\n#endif\n } }";
+        const string newText = "class A { void M() {\n#if !UNITY_EDITOR\n int x = 1;\n#endif\n } }";
+
+        var result = Analyze(oldText, newText);
+
+        Assert.True(result.Hot);
+        Assert.Equal("M", Assert.Single(result.ChangedMethods).Name);
+    }
+
+    [Fact]
+    public void Ref_and_array_and_nullable_params_use_reflection_names()
+    {
+        const string oldText = "class A { void M(ref int a, string[] b, int? c, out double d) { d = 0; } }";
+        const string newText = "class A { void M(ref int a, string[] b, int? c, out double d) { d = 1; } }";
+
+        var result = Analyze(oldText, newText);
+
+        Assert.True(result.Hot);
+        Assert.Equal(
+            new[] { "Int32&", "String[]", "Nullable`1", "Double&" },
+            Assert.Single(result.ChangedMethods).ParamTypeNames);
+    }
+
+    // ── cold: layout / signature / type shape ────────────────────────
+
+    [Fact]
+    public void Field_added_is_cold()
+    {
+        var result = Analyze(
+            PlayerOld,
+            PlayerOld.Replace("private int _health = 100;", "private int _health = 100;\n        private int _mana;"));
+
+        Assert.False(result.Hot);
+        Assert.Contains(result.Reasons, r => r.Contains("field layout changed"));
+    }
+
+    [Fact]
+    public void Field_reorder_is_cold()
+    {
+        const string oldText = "class A { int _a; int _b; }";
+        const string newText = "class A { int _b; int _a; }";
+
+        Assert.False(Analyze(oldText, newText).Hot);
+    }
+
+    [Fact]
+    public void Auto_property_added_is_cold()
+    {
+        var result = Analyze(
+            PlayerOld,
+            PlayerOld.Replace("public void Update()", "public int Mana { get; set; }\n        public void Update()"));
+
+        Assert.False(result.Hot);
+        Assert.Contains(result.Reasons, r => r.Contains("field layout changed"));
+    }
+
+    [Fact]
+    public void Auto_property_to_bodied_conversion_is_cold()
+    {
+        const string oldText = "class A { public int X { get; set; } }";
+        const string newText = "class A { int _x; public int X { get { return _x; } set { _x = value; } } }";
+
+        Assert.False(Analyze(oldText, newText).Hot);
+    }
+
+    [Fact]
+    public void Signature_change_is_cold()
+    {
+        var result = Analyze(
+            PlayerOld,
+            PlayerOld.Replace("private void Helper(string name)", "private void Helper(string name, int times)"));
+
+        Assert.False(result.Hot);
+        Assert.Contains(result.Reasons, r => r.Contains("member removed"));
+    }
+
+    [Fact]
+    public void Return_type_change_is_cold()
+    {
+        const string oldText = "class A { int M() { return 1; } }";
+        const string newText = "class A { long M() { return 1; } }";
+
+        var result = Analyze(oldText, newText);
+
+        Assert.False(result.Hot);
+        Assert.Contains(result.Reasons, r => r.Contains("member declaration changed"));
+    }
+
+    [Fact]
+    public void Method_attribute_change_is_cold()
+    {
+        const string oldText = "class A { void M() { } }";
+        const string newText = "class A { [System.Obsolete] void M() { } }";
+
+        Assert.False(Analyze(oldText, newText).Hot);
+    }
+
+    [Fact]
+    public void Member_removed_is_cold()
+    {
+        var result = Analyze(
+            PlayerOld,
+            PlayerOld.Replace("private void Helper(string name) { Debug.Log(name); }", ""));
+
+        Assert.False(result.Hot);
+        Assert.Contains(result.Reasons, r => r.Contains("member removed"));
+    }
+
+    [Fact]
+    public void Type_removed_is_cold()
+    {
+        const string oldText = "class A { } class B { }";
+        const string newText = "class A { }";
+
+        var result = Analyze(oldText, newText);
+
+        Assert.False(result.Hot);
+        Assert.Contains(result.Reasons, r => r.Contains("type removed: B"));
+    }
+
+    [Fact]
+    public void Base_list_change_is_cold()
+    {
+        const string oldText = "class A { }";
+        const string newText = "class A : System.IDisposable { public void Dispose() { } }";
+
+        var result = Analyze(oldText, newText);
+
+        Assert.False(result.Hot);
+        Assert.Contains(result.Reasons, r => r.Contains("type declaration changed"));
+    }
+
+    [Fact]
+    public void Const_value_change_is_cold()
+    {
+        const string oldText = "class A { const int Max = 10; int M() { return Max; } }";
+        const string newText = "class A { const int Max = 20; int M() { return Max; } }";
+
+        var result = Analyze(oldText, newText);
+
+        Assert.False(result.Hot);
+        Assert.Contains(result.Reasons, r => r.Contains("const or static initializer changed"));
+    }
+
+    [Fact]
+    public void Static_field_initializer_change_is_cold()
+    {
+        const string oldText = "class A { static int S = 1; }";
+        const string newText = "class A { static int S = 2; }";
+
+        Assert.False(Analyze(oldText, newText).Hot);
+    }
+
+    [Fact]
+    public void Static_constructor_body_change_is_cold()
+    {
+        const string oldText = "class A { static A() { } }";
+        const string newText = "class A { static A() { System.Console.WriteLine(1); } }";
+
+        var result = Analyze(oldText, newText);
+
+        Assert.False(result.Hot);
+        Assert.Contains(result.Reasons, r => r.Contains("static constructor changed"));
+    }
+
+    [Fact]
+    public void Constructor_added_is_cold()
+    {
+        const string oldText = "class A { }";
+        const string newText = "class A { public A(int x) { } }";
+
+        var result = Analyze(oldText, newText);
+
+        Assert.False(result.Hot);
+        Assert.Contains(result.Reasons, r => r.Contains("constructor added"));
+    }
+
+    [Fact]
+    public void Generic_type_method_body_change_is_cold()
+    {
+        const string oldText = "class A<T> { void M() { } }";
+        const string newText = "class A<T> { void M() { System.Console.WriteLine(1); } }";
+
+        var result = Analyze(oldText, newText);
+
+        Assert.False(result.Hot);
+        Assert.Contains(result.Reasons, r => r.Contains("generic"));
+    }
+
+    [Fact]
+    public void Generic_method_body_change_is_cold()
+    {
+        const string oldText = "class A { T M<T>(T x) { return x; } }";
+        const string newText = "class A { T M<T>(T x) { System.Console.WriteLine(1); return x; } }";
+
+        var result = Analyze(oldText, newText);
+
+        Assert.False(result.Hot);
+        Assert.Contains(result.Reasons, r => r.Contains("generic method body changed"));
+    }
+
+    [Fact]
+    public void Partial_type_in_file_is_cold()
+    {
+        const string oldText = "partial class A { void M() { } }";
+        const string newText = "partial class A { void M() { System.Console.WriteLine(1); } }";
+
+        var result = Analyze(oldText, newText);
+
+        Assert.False(result.Hot);
+        Assert.Contains(result.Reasons, r => r.Contains("partial type in file"));
+    }
+
+    [Fact]
+    public void Record_type_is_cold()
+    {
+        const string oldText = "record A(int X);";
+        const string newText = "record A(int X) { public int Y() { return X; } }";
+
+        var result = Analyze(oldText, newText);
+
+        Assert.False(result.Hot);
+        Assert.Contains(result.Reasons, r => r.Contains("record"));
+    }
+
+    [Fact]
+    public void Enum_member_change_is_cold()
+    {
+        const string oldText = "enum E { A = 1, B = 2 }";
+        const string newText = "enum E { A = 1, B = 3 }";
+
+        var result = Analyze(oldText, newText);
+
+        Assert.False(result.Hot);
+        Assert.Contains(result.Reasons, r => r.Contains("enum changed"));
+    }
+
+    [Fact]
+    public void New_unity_message_method_is_cold()
+    {
+        var result = Analyze(
+            PlayerOld,
+            PlayerOld.Replace(
+                "private void Helper(string name) { Debug.Log(name); }",
+                "private void Helper(string name) { Debug.Log(name); }\n        private void FixedUpdate() { }"));
+
+        Assert.False(result.Hot);
+        Assert.Contains(result.Reasons, r => r.Contains("new Unity message method"));
+    }
+
+    [Fact]
+    public void Explicit_interface_implementation_change_is_cold()
+    {
+        const string oldText = "class A : System.IDisposable { void System.IDisposable.Dispose() { } }";
+        const string newText = "class A : System.IDisposable { void System.IDisposable.Dispose() { System.Console.WriteLine(1); } }";
+
+        var result = Analyze(oldText, newText);
+
+        Assert.False(result.Hot);
+        Assert.Contains(result.Reasons, r => r.Contains("explicit interface implementation changed"));
+    }
+
+    [Fact]
+    public void Nested_type_method_uses_plus_separated_metadata_name()
+    {
+        const string oldText = "namespace N { class Outer { class Inner { void M() { } } } }";
+        const string newText = "namespace N { class Outer { class Inner { void M() { System.Console.WriteLine(1); } } } }";
+
+        var result = Analyze(oldText, newText);
+
+        Assert.True(result.Hot);
+        Assert.Equal("N.Outer+Inner", Assert.Single(result.ChangedMethods).DeclaringType);
+    }
+
+    // ── deterministic syntax errors ──────────────────────────────────
+
+    [Fact]
+    public void New_text_parse_error_reports_syntax_error_not_cold()
+    {
+        var result = Analyze(PlayerOld, PlayerOld.Replace("_health += 1;", "_health += ;"));
+
+        Assert.False(result.Hot);
+        Assert.NotNull(result.SyntaxError);
+        Assert.Empty(result.Reasons);
+        Assert.StartsWith("compilation failed:", result.SyntaxError);
+    }
+}

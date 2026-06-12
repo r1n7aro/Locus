@@ -11,6 +11,7 @@
 //   compile/raw       -> compile a set of in-memory sources to a DLL
 //   compile/snippet   -> wrap + compile a unity_execute snippet
 //   compile/runStates -> wrap + compile a unity_run_states state machine
+//   analyze/hotDiff   -> classify edited files as hot-patchable or not
 
 using System.Globalization;
 using System.Text.Json;
@@ -94,6 +95,9 @@ while (true)
                 break;
             case "compile/viewScript":
                 result = service.HandleCompileViewScript(@params);
+                break;
+            case "analyze/hotDiff":
+                result = service.HandleAnalyzeHotDiff(@params);
                 break;
             default:
                 error = RpcError(-32601, $"method not found: {method}");

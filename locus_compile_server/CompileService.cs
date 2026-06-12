@@ -110,11 +110,32 @@ public sealed class CompileViewScriptRequestDto
     public CompileParamsDto? Params { get; set; }
 }
 
+public sealed class HotDiffFileDto
+{
+    [JsonPropertyName("path")]
+    public string? Path { get; set; }
+
+    [JsonPropertyName("oldText")]
+    public string? OldText { get; set; }
+
+    [JsonPropertyName("newText")]
+    public string? NewText { get; set; }
+}
+
+public sealed class AnalyzeHotDiffRequestDto
+{
+    [JsonPropertyName("files")]
+    public HotDiffFileDto[]? Files { get; set; }
+
+    [JsonPropertyName("params")]
+    public CompileParamsDto? Params { get; set; }
+}
+
 // ── service ──────────────────────────────────────────────────────────
 
 public sealed class CompileService
 {
-    public const int ProtocolVersion = 1;
+    public const int ProtocolVersion = 2;
 
     /// <summary>
     /// Version of the generated wrapper's entry-point contract with the Unity
@@ -314,6 +335,73 @@ public sealed class CompileService
         JsonNode result = SuccessResult(bytes, assemblyName, startedAt);
         result["entryType"] = RunStatesSource.FullHostTypeName;
         return result;
+    }
+
+    // ── hot reload ───────────────────────────────────────────────────
+
+    /// <summary>
+    /// Classify edited files for the hot path. Pure analysis: parse with the
+    /// project's real defines/langversion, then a member-level diff (see
+    /// HotDiff). No compilation happens here.
+    /// </summary>
+    public JsonNode HandleAnalyzeHotDiff(JsonNode? @params)
+    {
+        var request = Deserialize<AnalyzeHotDiffRequestDto>(@params);
+        if (request.Files == null || request.Files.Length == 0)
+            throw new RpcInvalidParamsException("analyze/hotDiff requires at least one file");
+
+        CSharpParseOptions parseOptions = ResolveParseOptions(request.Params);
+
+        bool allHot = true;
+        var files = new JsonArray();
+        foreach (HotDiffFileDto file in request.Files)
+        {
+            if (string.IsNullOrEmpty(file.Path) || file.OldText == null || file.NewText == null)
+                throw new RpcInvalidParamsException("analyze/hotDiff files require path, oldText and newText");
+
+            HotDiffFileResult diff = HotDiff.Analyze(file.OldText, file.NewText, parseOptions);
+            allHot &= diff.Hot;
+            files.Add(HotDiffFileJson(file.Path!, diff));
+        }
+
+        return new JsonObject
+        {
+            ["hot"] = allHot,
+            ["files"] = files,
+        };
+    }
+
+    private static JsonObject HotDiffFileJson(string path, HotDiffFileResult diff)
+    {
+        var methods = new JsonArray();
+        foreach (HotDiffMethod method in diff.ChangedMethods)
+            methods.Add(HotDiffMethodJson(method));
+
+        var json = new JsonObject
+        {
+            ["path"] = path,
+            ["hot"] = diff.Hot,
+            ["reasons"] = new JsonArray(diff.Reasons.Select(r => (JsonNode)r).ToArray()),
+            ["changedMethods"] = methods,
+            ["newTypes"] = new JsonArray(diff.NewTypes.Select(t => (JsonNode)t).ToArray()),
+            ["patchedTypes"] = new JsonArray(diff.PatchedTypes.Select(t => (JsonNode)t).ToArray()),
+        };
+        if (diff.SyntaxError != null)
+            json["syntaxError"] = diff.SyntaxError;
+        return json;
+    }
+
+    private static JsonObject HotDiffMethodJson(HotDiffMethod method)
+    {
+        return new JsonObject
+        {
+            ["declaringType"] = method.DeclaringType,
+            ["name"] = method.Name,
+            ["paramTypeNames"] = new JsonArray(method.ParamTypeNames.Select(p => (JsonNode)p).ToArray()),
+            ["isStatic"] = method.IsStatic,
+            ["isCtor"] = method.IsCtor,
+            ["added"] = method.Added,
+        };
     }
 
     // ── snippet helpers ──────────────────────────────────────────────

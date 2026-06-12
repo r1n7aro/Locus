@@ -1375,36 +1375,30 @@ namespace Locus
 
                     case "export_type_index":
                     {
-                        var tcs = new TaskCompletionSource<PipeEnvelope>();
-                        PostToMainThread(delegate
+                        // Pure reflection + string building (no Unity API,
+                        // and JsonUtility is thread-safe for plain types):
+                        // run directly on the pipe worker so a busy or
+                        // import-blocked main thread cannot stall the export.
+                        try
                         {
-                            try
-                            {
-                                tcs.SetResult(OkResponse(reqId, ExportTypeIndexJson()));
-                            }
-                            catch (Exception ex)
-                            {
-                                tcs.SetResult(ErrorResponse(reqId, ex.ToString()));
-                            }
-                        });
-                        return await tcs.Task;
+                            return OkResponse(reqId, ExportTypeIndexJson());
+                        }
+                        catch (Exception ex)
+                        {
+                            return ErrorResponse(reqId, ex.ToString());
+                        }
                     }
 
                     case "export_type_index_fingerprint":
                     {
-                        var tcs = new TaskCompletionSource<PipeEnvelope>();
-                        PostToMainThread(delegate
+                        try
                         {
-                            try
-                            {
-                                tcs.SetResult(OkResponse(reqId, ExportTypeIndexFingerprintJson()));
-                            }
-                            catch (Exception ex)
-                            {
-                                tcs.SetResult(ErrorResponse(reqId, ex.ToString()));
-                            }
-                        });
-                        return await tcs.Task;
+                            return OkResponse(reqId, ExportTypeIndexFingerprintJson());
+                        }
+                        catch (Exception ex)
+                        {
+                            return ErrorResponse(reqId, ex.ToString());
+                        }
                     }
 
                     case "get_compile_params":
